@@ -124,6 +124,38 @@ discovers the nearest `autoresearch.config.json` / `autoresearch.jsonl`, and
 renders the experiment trace. Gray points are attempted experiments; green points
 and the green line are the kept best-so-far frontier.
 
+### Example Experiment
+
+For a test-coverage loop, a single experiment should be narrow enough to explain
+before editing and measurable enough to keep or discard after the run.
+
+```bash
+# 1. Ask the ratchet what evidence should drive the next edit.
+tamandua autoresearch next
+
+# Example returned focus:
+# Best run 1: 0.336 ratio
+# Next focus: cover pure helpers in batch_processor without touching application code
+
+# 2. Make one focused test-only change.
+# Example hypothesis:
+# "Adding unit tests for batch_processor pure helper functions will increase
+# coverage without requiring Spark or changing runtime code."
+
+# 3. Measure and log the result.
+tamandua autoresearch run
+tamandua autoresearch log --status auto \
+  --description "cover batch_processor pure helpers" \
+  --hypothesis "pure-helper tests increase coverage without Spark" \
+  --learned "coverage increased from 0.336 to 0.477; helper paths are now covered" \
+  --next-focus "cover utils.py pure helpers and runtime stubs"
+```
+
+If the metric improves in the configured direction and checks pass, the logged run
+is kept. If it regresses, crashes, or fails checks, it is logged as discarded,
+crash, or checks_failed; with `--revert-discard`, Tamandua can revert non-state
+experiment files while preserving `autoresearch.jsonl`.
+
 Project files:
 
 | File | Purpose |
