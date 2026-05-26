@@ -17,11 +17,15 @@ const allMcpTools = [
   "tamandua.skill.path",
   "tamandua.source.path",
   "tamandua.update.command",
+  "tamandua.autoresearch.init",
+  "tamandua.autoresearch.run_experiment",
+  "tamandua.autoresearch.log_experiment",
+  "tamandua.autoresearch.status",
 ];
 
 describe("README MCP tools documentation", () => {
-  it("lists all 9 MCP tools", () => {
-    assert.equal(allMcpTools.length, 9, "There should be exactly 9 MCP tools");
+  it("lists all 13 MCP tools", () => {
+    assert.equal(allMcpTools.length, 13, "There should be exactly 13 MCP tools");
     for (const tool of allMcpTools) {
       const escaped = tool.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       const pattern = new RegExp("`" + escaped + "`");

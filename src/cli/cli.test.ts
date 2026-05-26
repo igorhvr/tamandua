@@ -834,6 +834,38 @@ describe("--help infrastructure", () => {
     }
   });
 
+  it("tamandua autoresearch --help shows the native experiment-loop commands", () => {
+    const result = cli(["autoresearch", "--help"]);
+    try {
+      assert.equal(result.status, 0);
+      assert.match(result.stdout ?? "", /Run durable optimization experiment loops/);
+      assert.match(result.stdout ?? "", /init.*Create a new AutoResearch session/);
+      assert.match(result.stdout ?? "", /run.*Run the configured experiment command/);
+      assert.match(result.stdout ?? "", /log.*Log the keep\/discard decision/);
+      assert.match(result.stdout ?? "", /status.*Summarize baseline/);
+      assert.match(result.stdout ?? "", /next.*Print the ratchet prompt/);
+      assert.match(result.stdout ?? "", /autoresearch\.jsonl/);
+      assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
+    } finally {
+      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("tamandua autoresearch log --help documents the ratchet fields", () => {
+    const result = cli(["autoresearch", "log", "--help"]);
+    try {
+      assert.equal(result.status, 0);
+      assert.match(result.stdout ?? "", /Record experiment learning and decision/);
+      assert.match(result.stdout ?? "", /--status/);
+      assert.match(result.stdout ?? "", /--hypothesis/);
+      assert.match(result.stdout ?? "", /--learned/);
+      assert.match(result.stdout ?? "", /--next-focus/);
+      assert.match(result.stdout ?? "", /checks_failed/);
+    } finally {
+      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
+    }
+  });
+
   // US-008: workflow commands help
   it("tamandua workflow --help lists all subcommands with brief descriptions", () => {
     const result = cli(["workflow", "--help"]);

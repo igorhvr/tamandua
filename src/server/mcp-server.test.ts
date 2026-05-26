@@ -244,6 +244,10 @@ describe("mcp-server bootstrap", () => {
           "tamandua.skill.path",
           "tamandua.source.path",
           "tamandua.update.command",
+          "tamandua.autoresearch.init",
+          "tamandua.autoresearch.run_experiment",
+          "tamandua.autoresearch.log_experiment",
+          "tamandua.autoresearch.status",
         ],
       );
       assert.deepEqual((tools[0]?.inputSchema as { properties?: Record<string, unknown> }).properties?.limit, {

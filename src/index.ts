@@ -51,6 +51,18 @@ export {
   runUpdate,
 } from "./cli/update.js";
 
+export {
+  getAutoresearchPaths,
+  initExperiment,
+  runExperiment,
+  logExperiment,
+  summarizeAutoresearch,
+  readAutoresearchLog,
+  readSessionConfig,
+  parseMetric,
+  decideStatus,
+} from "./autoresearch/autoresearch.js";
+
 // Database
 export { getDb, nextRunNumber, getDbPath } from "./db.js";
 
@@ -86,3 +98,12 @@ export type { RunInfo, RunDetail, StepInfo, StoryInfo } from "./installer/status
 export type { WriteFileStatus, WriteWorkflowFileParams, WriteWorkflowFileResult } from "./installer/workspace-files.js";
 export type { CronJobInfo, CreateCronJobParams } from "./installer/agent-scheduler.js";
 export type { TamanduaMcpServer, TamanduaMcpServerOptions, TamanduaMcpToolServices } from "./server/mcp-server.js";
+export type {
+  AutoresearchDecision,
+  AutoresearchDirection,
+  AutoresearchLogEntry,
+  AutoresearchRunEntry,
+  AutoresearchRunResultEntry,
+  AutoresearchSessionConfig,
+  AutoresearchSummary,
+} from "./autoresearch/autoresearch.js";

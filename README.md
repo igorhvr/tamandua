@@ -37,6 +37,47 @@ That's it. Run `tamandua workflow list` to see available workflows.
 
 ---
 
+## Native AutoResearch
+
+Tamandua includes native AutoResearch primitives for measurable optimization loops.
+Unlike a normal workflow, AutoResearch stores durable project-local state so an
+agent can resume after restarts, learn from each measured run, and choose the next
+experiment from evidence.
+
+```bash
+tamandua autoresearch init \
+  --goal "reduce validation loss" \
+  --metric val_bpb \
+  --direction lower \
+  --command "uv run train.py"
+
+tamandua autoresearch run
+tamandua autoresearch log --status auto \
+  --description "try lower learning rate" \
+  --hypothesis "smaller LR improves stability" \
+  --learned "validation improved but training slowed" \
+  --next-focus "test warmup schedule"
+tamandua autoresearch next
+```
+
+Project files:
+
+| File | Purpose |
+|------|---------|
+| `autoresearch.config.json` | Session config: goal, metric, direction, command, parser, checks. |
+| `autoresearch.md` | Agent-facing objective and operating loop. |
+| `autoresearch.jsonl` | Append-only run history: measured results, decisions, learning, next focus. |
+| `autoresearch.sh` | Benchmark command. |
+| `autoresearch.checks.sh` | Optional correctness checks run after successful measurements. |
+
+The core loop is `init -> run -> log -> next`. `log --status auto` classifies a
+run as `baseline`, `keep`, `discard`, `crash`, or `checks_failed` by comparing the
+latest metric with prior accepted results. The `next` prompt carries the ratchet:
+it restates the goal, best result, last learning, and next focus before the agent
+starts another experiment.
+
+---
+
 ## What You Get: Bundled Workflows
 
 Tamandua ships with 21 bundled workflows organized into five families. Use `tamandua workflow list` to see available workflows, and `tamandua workflow install <id>` to install one.
@@ -302,7 +343,7 @@ isn't found or isn't executable, the run fails immediately with a clear error.
 
 ### Remote MCP tools
 
-The remote MCP endpoint exposes 9 tools:
+The remote MCP endpoint exposes 13 tools:
 
 #### Run Management
 
@@ -322,6 +363,15 @@ The remote MCP endpoint exposes 9 tools:
 | `tamandua.source.path` | Return the local Tamandua source checkout path. No parameters. |
 | `tamandua.skill.path` | Return the path to the bundled tamandua-agents agent skill. No parameters. |
 | `tamandua.update.command` | Return local CLI guidance for updating Tamandua safely. No parameters. |
+
+#### AutoResearch
+
+| Tool | Description |
+|------|-------------|
+| `tamandua.autoresearch.init` | Create project-local AutoResearch state. Requires `cwd`, `goal`, `metricName`, `direction`, and `command`. Optional `metricUnit`, `metricRegex`, `checksCommand`, and `overwrite`. |
+| `tamandua.autoresearch.run_experiment` | Run the configured experiment command in `cwd`, parse the metric, run optional checks, and append a `run_result`. Optional `command`, `metricRegex`, `checksCommand`, and `timeoutMs`. |
+| `tamandua.autoresearch.log_experiment` | Append the decision and learning for the latest run. Requires `cwd` and `description`; optional `status`, `metric`, `hypothesis`, `learned`, `nextFocus`, `commit`, and `revertDiscard`. |
+| `tamandua.autoresearch.status` | Summarize baseline, best result, failures, and the next ratchet prompt for `cwd`. |
 
 #### `tamandua.run.start` Parameters
 

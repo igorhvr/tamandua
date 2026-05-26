@@ -15,6 +15,14 @@ import { getRecentEvents, type TamanduaEvent } from "../installer/events.js";
 import { resolveSourcePath, resolveSkillPath, resolveWorkflowDir } from "../installer/paths.js";
 import { loadWorkflowSpec } from "../installer/workflow-spec.js";
 import { pauseRunWithDaemon, resumeRunWithDaemon } from "./control-client.js";
+import {
+  initExperiment,
+  runExperiment,
+  logExperiment,
+  summarizeAutoresearch,
+  type AutoresearchDecision,
+  type AutoresearchDirection,
+} from "../autoresearch/autoresearch.js";
 
 export const DEFAULT_MCP_PORT = 3338;
 export const MCP_ENDPOINT_PATH = "/mcp";
@@ -28,6 +36,10 @@ const MCP_TOOL_EVENTS_RECENT = "tamandua.events.recent";
 const MCP_TOOL_SKILL_PATH = "tamandua.skill.path";
 const MCP_TOOL_SOURCE_PATH = "tamandua.source.path";
 const MCP_TOOL_UPDATE_COMMAND = "tamandua.update.command";
+const MCP_TOOL_AUTORESEARCH_INIT = "tamandua.autoresearch.init";
+const MCP_TOOL_AUTORESEARCH_RUN = "tamandua.autoresearch.run_experiment";
+const MCP_TOOL_AUTORESEARCH_LOG = "tamandua.autoresearch.log_experiment";
+const MCP_TOOL_AUTORESEARCH_STATUS = "tamandua.autoresearch.status";
 
 type McpSession = {
   protocolServer: Server;
@@ -51,6 +63,10 @@ export interface TamanduaMcpToolServices {
   pauseRun: (runId: string, drain?: boolean) => Promise<{ runId: string; status: string }>;
   resumeRun: (runId: string) => Promise<{ runId: string; status: string }>;
   resolveWorkspaceMode: (workflowId: string) => Promise<"direct" | "worktree">;
+  initAutoresearch: typeof initExperiment;
+  runAutoresearchExperiment: typeof runExperiment;
+  logAutoresearchExperiment: typeof logExperiment;
+  summarizeAutoresearch: typeof summarizeAutoresearch;
 }
 
 export type TamanduaMcpServerOptions = {
@@ -88,6 +104,10 @@ const defaultToolServices: TamanduaMcpToolServices = {
     const spec = await loadWorkflowSpec(workflowDir);
     return spec.run?.workspace ?? "direct";
   },
+  initAutoresearch: initExperiment,
+  runAutoresearchExperiment: runExperiment,
+  logAutoresearchExperiment: logExperiment,
+  summarizeAutoresearch,
 };
 
 const mcpTools: Array<Record<string, unknown>> = [
@@ -382,6 +402,122 @@ const mcpTools: Array<Record<string, unknown>> = [
       },
     },
   },
+  {
+    name: MCP_TOOL_AUTORESEARCH_INIT,
+    title: "Initialize AutoResearch",
+    description: "Create project-local AutoResearch state files from a goal, metric, direction, and benchmark command.",
+    annotations: {
+      readOnlyHint: false,
+      idempotentHint: false,
+    },
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["cwd", "goal", "metricName", "direction", "command"],
+      properties: {
+        cwd: { type: "string", minLength: 1, description: "Project directory." },
+        goal: { type: "string", minLength: 1, description: "Optimization objective." },
+        metricName: { type: "string", minLength: 1, description: "Metric name to parse and optimize." },
+        metricUnit: { type: "string", description: "Optional metric unit." },
+        direction: { type: "string", enum: ["lower", "higher"], description: "Whether lower or higher metric values are better." },
+        command: { type: "string", minLength: 1, description: "Shell command that runs the experiment." },
+        metricRegex: { type: "string", description: "Optional regex with metric value in capture group 1." },
+        checksCommand: { type: "string", description: "Optional correctness checks command." },
+        overwrite: { type: "boolean", description: "Replace existing AutoResearch files." },
+      },
+    },
+    outputSchema: {
+      type: "object",
+      required: ["session"],
+      properties: {
+        session: { type: "object", description: "Created AutoResearch session entry." },
+      },
+    },
+  },
+  {
+    name: MCP_TOOL_AUTORESEARCH_RUN,
+    title: "Run AutoResearch Experiment",
+    description: "Run the configured experiment command, parse the metric, run checks, and append a run_result entry.",
+    annotations: {
+      readOnlyHint: false,
+      idempotentHint: false,
+    },
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["cwd"],
+      properties: {
+        cwd: { type: "string", minLength: 1, description: "Project directory." },
+        command: { type: "string", description: "Optional command override for this run." },
+        metricRegex: { type: "string", description: "Optional metric regex override." },
+        checksCommand: { type: "string", description: "Optional checks command override." },
+        timeoutMs: { type: "integer", minimum: 1, description: "Experiment timeout in milliseconds." },
+      },
+    },
+    outputSchema: {
+      type: "object",
+      required: ["result"],
+      properties: {
+        result: { type: "object", description: "Measured run result entry." },
+      },
+    },
+  },
+  {
+    name: MCP_TOOL_AUTORESEARCH_LOG,
+    title: "Log AutoResearch Experiment",
+    description: "Append the evidence-based experiment decision and learning that drives the next iteration.",
+    annotations: {
+      readOnlyHint: false,
+      idempotentHint: false,
+    },
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["cwd", "description"],
+      properties: {
+        cwd: { type: "string", minLength: 1, description: "Project directory." },
+        metric: { type: "number", description: "Optional metric override." },
+        status: { type: "string", enum: ["auto", "baseline", "keep", "discard", "crash", "checks_failed"], description: "Decision. Defaults to auto." },
+        description: { type: "string", minLength: 1, description: "What changed in this experiment." },
+        hypothesis: { type: "string", description: "Hypothesis tested." },
+        learned: { type: "string", description: "Evidence learned from the result." },
+        nextFocus: { type: "string", description: "Next experiment direction." },
+        commit: { type: "boolean", description: "Commit kept/baseline results with git." },
+        revertDiscard: { type: "boolean", description: "Revert non-autoresearch tracked files when decision is discard." },
+      },
+    },
+    outputSchema: {
+      type: "object",
+      required: ["entry"],
+      properties: {
+        entry: { type: "object", description: "Logged experiment decision." },
+      },
+    },
+  },
+  {
+    name: MCP_TOOL_AUTORESEARCH_STATUS,
+    title: "Get AutoResearch Status",
+    description: "Summarize baseline, best result, failures, and the next ratchet prompt for a project.",
+    annotations: {
+      readOnlyHint: true,
+      idempotentHint: true,
+    },
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["cwd"],
+      properties: {
+        cwd: { type: "string", minLength: 1, description: "Project directory." },
+      },
+    },
+    outputSchema: {
+      type: "object",
+      required: ["summary"],
+      properties: {
+        summary: { type: "object", description: "AutoResearch session summary." },
+      },
+    },
+  },
 ];
 
 function invalidParams(message: string): never {
@@ -421,6 +557,47 @@ function readRequiredStringArgument(args: Record<string, unknown>, key: string):
 
 function readRequiredQuery(args: Record<string, unknown>): string {
   return readRequiredStringArgument(args, "query");
+}
+
+function readOptionalStringArgument(args: Record<string, unknown>, key: string): string | undefined {
+  const rawValue = args[key];
+  if (rawValue === undefined) return undefined;
+  if (typeof rawValue !== "string") {
+    invalidParams(`Argument "${key}" must be a string`);
+  }
+  const trimmed = rawValue.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function readOptionalNumberArgument(args: Record<string, unknown>, key: string): number | undefined {
+  const rawValue = args[key];
+  if (rawValue === undefined) return undefined;
+  if (typeof rawValue !== "number" || !Number.isFinite(rawValue)) {
+    invalidParams(`Argument "${key}" must be a finite number`);
+  }
+  return rawValue;
+}
+
+function readOptionalIntegerArgument(args: Record<string, unknown>, key: string): number | undefined {
+  const value = readOptionalNumberArgument(args, key);
+  if (value === undefined) return undefined;
+  if (!Number.isInteger(value)) {
+    invalidParams(`Argument "${key}" must be an integer`);
+  }
+  return value;
+}
+
+function readDirectionArgument(args: Record<string, unknown>): AutoresearchDirection {
+  const value = readRequiredStringArgument(args, "direction");
+  if (value === "lower" || value === "higher") return value;
+  invalidParams('Argument "direction" must be "lower" or "higher"');
+}
+
+function readAutoresearchStatusArgument(args: Record<string, unknown>): AutoresearchDecision | "auto" | undefined {
+  const value = readOptionalStringArgument(args, "status");
+  if (!value) return undefined;
+  if (value === "auto" || value === "baseline" || value === "keep" || value === "discard" || value === "crash" || value === "checks_failed") return value;
+  invalidParams('Argument "status" must be auto, baseline, keep, discard, crash, or checks_failed');
 }
 
 function createToolResult(payload: Record<string, unknown>): { content: [{ type: "text"; text: string }]; structuredContent: Record<string, unknown> } {
@@ -566,6 +743,68 @@ function createProtocolServer(services: TamanduaMcpToolServices): Server {
         safety:
           "Run this command through the local CLI. The update process manages dashboard, MCP, and control-plane lifecycle; without --force it refuses the service reinstall/restart step while Tamandua runs are active.",
       });
+    }
+
+    if (name === MCP_TOOL_AUTORESEARCH_INIT) {
+      try {
+        const session = services.initAutoresearch({
+          cwd: readRequiredStringArgument(args, "cwd"),
+          goal: readRequiredStringArgument(args, "goal"),
+          metricName: readRequiredStringArgument(args, "metricName"),
+          metricUnit: readOptionalStringArgument(args, "metricUnit"),
+          direction: readDirectionArgument(args),
+          command: readRequiredStringArgument(args, "command"),
+          metricRegex: readOptionalStringArgument(args, "metricRegex"),
+          checksCommand: readOptionalStringArgument(args, "checksCommand"),
+          overwrite: args.overwrite === true,
+        });
+        return createToolResult({ session });
+      } catch (err) {
+        throw new McpError(ErrorCode.InvalidParams, (err as Error).message);
+      }
+    }
+
+    if (name === MCP_TOOL_AUTORESEARCH_RUN) {
+      try {
+        const result = await services.runAutoresearchExperiment({
+          cwd: readRequiredStringArgument(args, "cwd"),
+          command: readOptionalStringArgument(args, "command"),
+          metricRegex: readOptionalStringArgument(args, "metricRegex"),
+          checksCommand: readOptionalStringArgument(args, "checksCommand"),
+          timeoutMs: readOptionalIntegerArgument(args, "timeoutMs"),
+        });
+        return createToolResult({ result });
+      } catch (err) {
+        throw new McpError(ErrorCode.InvalidParams, (err as Error).message);
+      }
+    }
+
+    if (name === MCP_TOOL_AUTORESEARCH_LOG) {
+      try {
+        const entry = await services.logAutoresearchExperiment({
+          cwd: readRequiredStringArgument(args, "cwd"),
+          metric: readOptionalNumberArgument(args, "metric"),
+          status: readAutoresearchStatusArgument(args) ?? "auto",
+          description: readRequiredStringArgument(args, "description"),
+          hypothesis: readOptionalStringArgument(args, "hypothesis"),
+          learned: readOptionalStringArgument(args, "learned"),
+          nextFocus: readOptionalStringArgument(args, "nextFocus"),
+          commit: args.commit === true,
+          revertDiscard: args.revertDiscard === true,
+        });
+        return createToolResult({ entry });
+      } catch (err) {
+        throw new McpError(ErrorCode.InvalidParams, (err as Error).message);
+      }
+    }
+
+    if (name === MCP_TOOL_AUTORESEARCH_STATUS) {
+      try {
+        const summary = services.summarizeAutoresearch(readRequiredStringArgument(args, "cwd"));
+        return createToolResult({ summary });
+      } catch (err) {
+        throw new McpError(ErrorCode.InvalidParams, (err as Error).message);
+      }
     }
 
     throw new McpError(ErrorCode.InvalidParams, `Unknown tool: ${name}`);

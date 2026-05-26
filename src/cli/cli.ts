@@ -41,6 +41,14 @@ import { setTimeout as delay } from "node:timers/promises";
 import { readVersionStatus } from "../lib/version-check.js";
 import { parseWorkflowRunArgs } from "./workflow-run-args.js";
 import type { HarnessType } from "../installer/types.js";
+import {
+  initExperiment,
+  runExperiment,
+  logExperiment,
+  summarizeAutoresearch,
+  type AutoresearchDecision,
+  type AutoresearchDirection,
+} from "../autoresearch/autoresearch.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -147,6 +155,56 @@ function printHelpSubcommand(subcommands: Record<string, string>): void {
   }
   lines.push("");
   process.stdout.write(lines.join("\n"));
+}
+
+function readOption(args: string[], name: string): string | undefined {
+  const inline = `${name}=`;
+  for (let i = 0; i < args.length; i++) {
+    const token = args[i];
+    if (token === name) return args[i + 1];
+    if (token.startsWith(inline)) return token.slice(inline.length);
+  }
+  return undefined;
+}
+
+function requireOption(args: string[], name: string, usage: string): string {
+  const value = readOption(args, name)?.trim();
+  if (!value) {
+    process.stderr.write(`Missing ${name}.\nUsage: ${usage}\n`);
+    process.exit(1);
+  }
+  return value;
+}
+
+function parseDirection(value: string): AutoresearchDirection {
+  if (value === "lower" || value === "higher") return value;
+  process.stderr.write(`Invalid --direction "${value}". Use "lower" or "higher".\n`);
+  process.exit(1);
+}
+
+function parseAutoresearchDecision(value: string | undefined): AutoresearchDecision | "auto" | undefined {
+  if (!value) return undefined;
+  if (value === "auto" || value === "baseline" || value === "keep" || value === "discard" || value === "crash" || value === "checks_failed") return value;
+  process.stderr.write(`Invalid --status "${value}". Use auto, baseline, keep, discard, crash, or checks_failed.\n`);
+  process.exit(1);
+}
+
+function printAutoresearchSummary(cwd?: string): void {
+  const summary = summarizeAutoresearch(cwd);
+  if (!summary.exists) {
+    console.log(summary.nextPrompt);
+    return;
+  }
+  console.log("AutoResearch");
+  console.log(`Goal:        ${summary.goal}`);
+  console.log(`Metric:      ${summary.metricName}${summary.metricUnit ? ` (${summary.metricUnit})` : ""}`);
+  console.log(`Direction:   ${summary.direction}`);
+  console.log(`Runs:        ${summary.totalRuns} logged (${summary.keptRuns} kept, ${summary.discardedRuns} discarded)`);
+  console.log(`Failures:    ${summary.crashedRuns} crash, ${summary.checksFailedRuns} checks_failed`);
+  console.log(`Baseline:    ${summary.baselineMetric ?? "(none)"}`);
+  console.log(`Best:        ${summary.bestMetric ?? "(none)"}${summary.bestRun ? ` at run ${summary.bestRun}` : ""}`);
+  console.log("");
+  console.log(summary.nextPrompt);
 }
 
 function getTamanduaHelp(): string {
@@ -1079,6 +1137,115 @@ Examples:
   tamandua worktree prune --completed --older-than 7d`;
 }
 
+function getAutoresearchHelp(): string {
+  return `tamandua autoresearch — Run durable optimization experiment loops
+
+Usage: tamandua autoresearch <init|run|log|status|next>
+
+AutoResearch stores a project-local session in:
+  autoresearch.config.json   Session configuration
+  autoresearch.md            Agent-facing objective and loop contract
+  autoresearch.jsonl         Append-only experiment history
+  autoresearch.sh            Benchmark command
+  autoresearch.checks.sh     Optional correctness checks
+
+Subcommands:
+  init     Create a new AutoResearch session
+  run      Run the configured experiment command and append a measured result
+  log      Log the keep/discard decision, learning, and next focus
+  status   Summarize baseline, best run, failures, and next prompt
+  next     Print the ratchet prompt for the next experiment
+
+Examples:
+  tamandua autoresearch init --goal "reduce validation loss" --metric val_bpb --direction lower --command "uv run train.py"
+  tamandua autoresearch run
+  tamandua autoresearch log --status auto --description "try smaller LR" --learned "stable but slower" --next-focus "test warmup"`;
+}
+
+function getAutoresearchInitHelp(): string {
+  return `tamandua autoresearch init — Create an AutoResearch session
+
+Usage: tamandua autoresearch init --goal <text> --metric <name> --direction <lower|higher> --command <cmd> [options]
+
+Options:
+  --unit <unit>             Metric unit, such as seconds, bpb, auc, or ms
+  --metric-regex <regex>    Regex with the metric value in capture group 1
+  --checks-command <cmd>    Correctness command to run after successful benchmarks
+  --cwd <dir>               Project directory (default: current directory)
+  --overwrite               Replace existing autoresearch files
+
+Examples:
+  tamandua autoresearch init --goal "speed up tests" --metric total_ms --unit ms --direction lower --command "pnpm test --run"`;
+}
+
+function getAutoresearchRunHelp(): string {
+  return `tamandua autoresearch run — Execute the current experiment
+
+Usage: tamandua autoresearch run [options]
+
+Runs the configured command, captures stdout/stderr tails, parses the metric,
+runs optional checks, and appends a run_result entry to autoresearch.jsonl.
+
+Options:
+  --cwd <dir>               Project directory (default: current directory)
+  --command <cmd>           Override the configured command for this run
+  --metric-regex <regex>    Override metric parser for this run
+  --checks-command <cmd>    Override or provide correctness checks
+  --timeout-seconds <n>     Command timeout (default: 1800)
+
+Examples:
+  tamandua autoresearch run
+  tamandua autoresearch run --metric-regex "val_bpb=([0-9.]+)"`;
+}
+
+function getAutoresearchLogHelp(): string {
+  return `tamandua autoresearch log — Record experiment learning and decision
+
+Usage: tamandua autoresearch log --description <text> [options]
+
+By default --status auto classifies the latest measured result as baseline,
+keep, discard, crash, or checks_failed by comparing it with prior accepted
+runs in autoresearch.jsonl.
+
+Options:
+  --cwd <dir>               Project directory (default: current directory)
+  --status <status>         auto, baseline, keep, discard, crash, checks_failed
+  --metric <number>         Metric value if no latest run_result should be used
+  --description <text>      What changed in this experiment
+  --hypothesis <text>       Hypothesis tested
+  --learned <text>          Evidence learned from the result
+  --next-focus <text>       Next experiment direction
+  --commit                  Commit kept/baseline results with git
+  --revert-discard          Revert non-autoresearch tracked files on discard
+
+Examples:
+  tamandua autoresearch log --status auto --description "cache parser" --learned "faster but flaky" --next-focus "fix invalidation"`;
+}
+
+function getAutoresearchStatusHelp(): string {
+  return `tamandua autoresearch status — Summarize the experiment loop
+
+Usage: tamandua autoresearch status [--cwd <dir>]
+
+Shows baseline, best result, keep/discard counts, failure counts, and the
+ratchet prompt for the next experiment.
+
+Examples:
+  tamandua autoresearch status`;
+}
+
+function getAutoresearchNextHelp(): string {
+  return `tamandua autoresearch next — Print the next experiment prompt
+
+Usage: tamandua autoresearch next [--cwd <dir>]
+
+Prints the evidence-driven prompt that agents should read before proposing
+the next experiment. This is the ratchet: use prior results before editing.
+
+Examples:
+  tamandua autoresearch next`;
+}
+
 function getUsageText(): string {
   return [
     "Run tamandua <command> --help for detailed command help.",
@@ -1100,6 +1267,11 @@ function getUsageText(): string {
     "tamandua worktree remove <run-id>     Remove managed worktree [--force]",
     "tamandua worktree prune --completed   Remove old completed worktrees",
     "           --older-than <duration>    (e.g. 7d, 24h, 30m)",
+    "", "tamandua autoresearch init            Create durable experiment-loop state",
+    "tamandua autoresearch run             Run the configured experiment command",
+    "tamandua autoresearch log             Log keep/discard learning for the loop",
+    "tamandua autoresearch status          Summarize AutoResearch state",
+    "tamandua autoresearch next            Print the next experiment prompt",
     "tamandua workflow status <query>      Check run status",
     "tamandua workflow runs                List all workflow runs",
     "tamandua workflow pause <run-id>      Pause a running workflow",
@@ -1225,6 +1397,14 @@ async function main() {
       if (action === "remove") { printHelp(getWorktreeRemoveHelp()); }
       if (action === "prune") { printHelp(getWorktreePruneHelp()); }
       printHelp(getWorktreeGroupHelp());
+    }
+    if (group === "autoresearch") {
+      if (action === "init") { printHelp(getAutoresearchInitHelp()); }
+      if (action === "run") { printHelp(getAutoresearchRunHelp()); }
+      if (action === "log") { printHelp(getAutoresearchLogHelp()); }
+      if (action === "status") { printHelp(getAutoresearchStatusHelp()); }
+      if (action === "next") { printHelp(getAutoresearchNextHelp()); }
+      printHelp(getAutoresearchHelp());
     }
     if (group === "nudge") {
       printHelp(getNudgeHelp());
@@ -1743,6 +1923,82 @@ async function main() {
     process.stderr.write(
       `Unknown worktree action: ${action}\nUsage: tamandua worktree <list|status|remove|prune>\n`,
     );
+    process.exit(1);
+  }
+
+  if (group === "autoresearch") {
+    const cwd = readOption(args, "--cwd");
+    if (action === "init") {
+      const usage = "tamandua autoresearch init --goal <text> --metric <name> --direction <lower|higher> --command <cmd>";
+      const entry = initExperiment({
+        cwd,
+        goal: requireOption(args, "--goal", usage),
+        metricName: requireOption(args, "--metric", usage),
+        metricUnit: readOption(args, "--unit"),
+        direction: parseDirection(requireOption(args, "--direction", usage)),
+        command: requireOption(args, "--command", usage),
+        metricRegex: readOption(args, "--metric-regex"),
+        checksCommand: readOption(args, "--checks-command"),
+        overwrite: args.includes("--overwrite"),
+      });
+      console.log(`Initialized AutoResearch session for metric ${entry.metric_name} (${entry.direction}).`);
+      console.log("Next: tamandua autoresearch run");
+      return;
+    }
+
+    if (action === "run") {
+      const timeoutSecondsRaw = readOption(args, "--timeout-seconds");
+      const timeoutMs = timeoutSecondsRaw ? Math.max(1, Number(timeoutSecondsRaw)) * 1000 : undefined;
+      if (timeoutSecondsRaw && !Number.isFinite(timeoutMs)) {
+        process.stderr.write(`Invalid --timeout-seconds "${timeoutSecondsRaw}".\n`);
+        process.exit(1);
+      }
+      const result = await runExperiment({
+        cwd,
+        command: readOption(args, "--command"),
+        metricRegex: readOption(args, "--metric-regex"),
+        checksCommand: readOption(args, "--checks-command"),
+        timeoutMs,
+      });
+      console.log(JSON.stringify(result, null, 2));
+      return;
+    }
+
+    if (action === "log") {
+      const metricRaw = readOption(args, "--metric");
+      const metric = metricRaw === undefined ? undefined : Number(metricRaw);
+      if (metricRaw !== undefined && !Number.isFinite(metric)) {
+        process.stderr.write(`Invalid --metric "${metricRaw}".\n`);
+        process.exit(1);
+      }
+      const usage = "tamandua autoresearch log --description <text>";
+      const entry = await logExperiment({
+        cwd,
+        metric,
+        status: parseAutoresearchDecision(readOption(args, "--status")) ?? "auto",
+        description: requireOption(args, "--description", usage),
+        hypothesis: readOption(args, "--hypothesis"),
+        learned: readOption(args, "--learned"),
+        nextFocus: readOption(args, "--next-focus"),
+        commit: args.includes("--commit"),
+        revertDiscard: args.includes("--revert-discard"),
+      });
+      console.log(`Logged run ${entry.run}: ${entry.status}${entry.metric === null ? "" : ` (${entry.metric})`}.`);
+      console.log(`Best: ${entry.best_metric ?? "(none)"}`);
+      return;
+    }
+
+    if (action === "status") {
+      printAutoresearchSummary(cwd);
+      return;
+    }
+
+    if (action === "next") {
+      console.log(summarizeAutoresearch(cwd).nextPrompt);
+      return;
+    }
+
+    process.stderr.write(`Unknown autoresearch action: ${action}\nUsage: tamandua autoresearch <init|run|log|status|next>\n`);
     process.exit(1);
   }
 
