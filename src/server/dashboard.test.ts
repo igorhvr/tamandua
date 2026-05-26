@@ -291,6 +291,10 @@ describe("dashboard AutoResearch progress", () => {
       assert.match(html, /fetch\(`\/api\/runs\/\$\{encodeURIComponent\(runId\)\}\/autoresearch`\)/);
       assert.match(html, /id="autoresearch-timeline"/);
       assert.match(html, /id="autoresearch-metric-chart"/);
+      assert.match(html, /renderAutoresearchTraceChart/);
+      assert.match(html, /Autoresearch Progress: \$\{points\.length\} Experiments, \$\{kept\.length\} Kept Improvements/);
+      assert.match(html, /class="autoresearch-chart-line"/);
+      assert.match(html, /class="autoresearch-chart-discarded"/);
     } finally {
       await stopDashboard(server);
     }

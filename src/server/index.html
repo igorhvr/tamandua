@@ -357,27 +357,29 @@
       overflow-wrap: anywhere;
     }
     .autoresearch-chart {
-      height: 72px;
-      border: 1px solid #21262d;
+      border: 1px solid #d0d7de;
       border-radius: 6px;
-      background: #0b0f14;
-      padding: 10px;
+      background: #ffffff;
+      padding: 12px;
       margin-bottom: 12px;
-      display: flex;
-      align-items: flex-end;
-      gap: 6px;
+      overflow-x: auto;
     }
-    .autoresearch-bar {
-      flex: 1;
-      min-width: 8px;
-      max-width: 42px;
-      background: #58a6ff;
-      border-radius: 3px 3px 0 0;
-      opacity: 0.75;
+    .autoresearch-chart svg {
+      display: block;
+      width: 100%;
+      min-width: 620px;
+      height: auto;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
     }
-    .autoresearch-bar.best { background: #3fb950; opacity: 1; }
-    .autoresearch-bar.discard { background: #d29922; }
-    .autoresearch-bar.fail { background: #f85149; }
+    .autoresearch-chart-title { fill: #24292f; font-size: 15px; font-weight: 700; text-anchor: middle; }
+    .autoresearch-chart-axis { stroke: #57606a; stroke-width: 1; }
+    .autoresearch-chart-grid { stroke: #d8dee4; stroke-width: 1; opacity: 0.85; }
+    .autoresearch-chart-label { fill: #57606a; font-size: 11px; }
+    .autoresearch-chart-tick { fill: #57606a; font-size: 10px; }
+    .autoresearch-chart-kept { fill: #2ca02c; stroke: #ffffff; stroke-width: 1.5; }
+    .autoresearch-chart-discarded { fill: #808080; opacity: 0.65; }
+    .autoresearch-chart-line { fill: none; stroke: #2ca02c; stroke-width: 2.5; }
+    .autoresearch-chart-legend { fill: #57606a; font-size: 11px; }
     .autoresearch-detail {
       color: #8b949e;
       font-size: 12px;
@@ -705,22 +707,7 @@
         ["Failures", `${(summary.crashedRuns ?? 0) + (summary.checksFailedRuns ?? 0)}`],
       ].map(([label, value]) => `<div class="autoresearch-kpi"><div class="label">${esc(label)}</div><div class="value mono">${esc(String(value))}</div></div>`).join("");
 
-      const numericMetrics = experiments.filter(e => Number.isFinite(Number(e.metric)));
-      const values = numericMetrics.map(e => Number(e.metric));
-      const min = values.length ? Math.min(...values) : 0;
-      const max = values.length ? Math.max(...values) : 1;
-      const range = max === min ? 1 : max - min;
-      const chart = numericMetrics.length
-        ? numericMetrics.map(e => {
-            const normalized = summary.direction === "lower"
-              ? (max - Number(e.metric)) / range
-              : (Number(e.metric) - min) / range;
-            const height = 14 + Math.round(normalized * 46);
-            const statusClass = e.status === "discard" ? " discard" : (e.status === "crash" || e.status === "checks_failed" ? " fail" : "");
-            const bestClass = e.run === summary.bestRun ? " best" : statusClass;
-            return `<div class="autoresearch-bar${bestClass}" style="height:${height}px" title="Run ${e.run}: ${e.metric}"></div>`;
-          }).join("")
-        : '<div class="empty-state" style="padding:12px">No numeric metrics yet.</div>';
+      const chart = renderAutoresearchTraceChart(experiments, summary, metricLabel);
 
       const rows = experiments.slice(-10).reverse().map(e => {
         const badgeClass = e.status === "discard" ? "badge-paused" : (e.status === "crash" || e.status === "checks_failed" ? "badge-failed" : "badge-completed");
@@ -752,6 +739,94 @@
           <tbody>${rows || '<tr><td colspan="5"><div class="empty-state">No logged experiments yet.</div></td></tr>'}</tbody>
         </table>
       `;
+    }
+
+    function renderAutoresearchTraceChart(experiments, summary, metricLabel) {
+      const points = experiments
+        .map(e => ({ ...e, metricValue: Number(e.metric) }))
+        .filter(e => Number.isFinite(e.metricValue))
+        .sort((a, b) => Number(a.run) - Number(b.run));
+
+      if (!points.length) {
+        return '<div class="empty-state" style="padding:24px;color:#57606a">No numeric metrics yet.</div>';
+      }
+
+      const kept = [];
+      let best = null;
+      const lowerIsBetter = summary.direction === "lower";
+      for (const point of points) {
+        const improves = best === null || (lowerIsBetter ? point.metricValue < best : point.metricValue > best);
+        if (improves) {
+          kept.push(point);
+          best = point.metricValue;
+        }
+      }
+
+      const width = 900;
+      const height = 430;
+      const margin = { top: 54, right: 34, bottom: 62, left: 78 };
+      const plotW = width - margin.left - margin.right;
+      const plotH = height - margin.top - margin.bottom;
+      const values = points.map(p => p.metricValue);
+      const rawMin = Math.min(...values);
+      const rawMax = Math.max(...values);
+      const padding = rawMin === rawMax ? Math.max(Math.abs(rawMin) * 0.02, 0.001) : (rawMax - rawMin) * 0.08;
+      const yMin = rawMin - padding;
+      const yMax = rawMax + padding;
+      const xMin = points.length === 1 ? points[0].run - 0.5 : Math.min(...points.map(p => Number(p.run)));
+      const xMax = points.length === 1 ? points[0].run + 0.5 : Math.max(...points.map(p => Number(p.run)));
+      const xScale = (run) => margin.left + ((Number(run) - xMin) / Math.max(1, xMax - xMin)) * plotW;
+      const yScale = (metric) => margin.top + ((yMax - Number(metric)) / Math.max(0.000001, yMax - yMin)) * plotH;
+      const fmtMetric = (value) => Math.abs(value) >= 10 ? value.toFixed(2) : value.toFixed(3);
+      const keptRuns = new Set(kept.map(p => Number(p.run)));
+      const yTicks = Array.from({ length: 5 }, (_, i) => yMin + ((yMax - yMin) * i / 4));
+      const xTickCount = Math.min(8, points.length);
+      const xTicks = Array.from(new Set(Array.from({ length: xTickCount }, (_, i) => {
+        const run = xMin + ((xMax - xMin) * i / Math.max(1, xTickCount - 1));
+        return Math.round(run);
+      }).filter(run => points.some(p => Number(p.run) === run))));
+      const linePoints = kept.map(p => `${xScale(p.run).toFixed(1)},${yScale(p.metricValue).toFixed(1)}`).join(" ");
+      const title = `Autoresearch Progress: ${points.length} Experiments, ${kept.length} Kept Improvements`;
+      const directionText = lowerIsBetter ? "lower is better" : "higher is better";
+
+      const grid = yTicks.map(t => {
+        const y = yScale(t);
+        return `<line class="autoresearch-chart-grid" x1="${margin.left}" y1="${y.toFixed(1)}" x2="${width - margin.right}" y2="${y.toFixed(1)}"></line>
+          <text class="autoresearch-chart-tick" x="${margin.left - 10}" y="${(y + 3).toFixed(1)}" text-anchor="end">${esc(fmtMetric(t))}</text>`;
+      }).join("");
+      const xGrid = xTicks.map(t => {
+        const x = xScale(t);
+        return `<line class="autoresearch-chart-grid" x1="${x.toFixed(1)}" y1="${margin.top}" x2="${x.toFixed(1)}" y2="${height - margin.bottom}"></line>
+          <text class="autoresearch-chart-tick" x="${x.toFixed(1)}" y="${height - margin.bottom + 18}" text-anchor="middle">${esc(String(t))}</text>`;
+      }).join("");
+      const discardedDots = points.filter(p => !keptRuns.has(Number(p.run))).map(p =>
+        `<circle class="autoresearch-chart-discarded" cx="${xScale(p.run).toFixed(1)}" cy="${yScale(p.metricValue).toFixed(1)}" r="4.5">
+          <title>Experiment ${esc(String(p.run))}: ${esc(fmtMetric(p.metricValue))} - ${esc(p.description || "discarded")}</title>
+        </circle>`
+      ).join("");
+      const keptDots = kept.map(p =>
+        `<circle class="autoresearch-chart-kept" cx="${xScale(p.run).toFixed(1)}" cy="${yScale(p.metricValue).toFixed(1)}" r="6">
+          <title>Kept experiment ${esc(String(p.run))}: ${esc(fmtMetric(p.metricValue))} - ${esc(p.description || "new best")}</title>
+        </circle>`
+      ).join("");
+
+      return `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${esc(title)}">
+        <rect x="0" y="0" width="${width}" height="${height}" fill="#ffffff"></rect>
+        <text class="autoresearch-chart-title" x="${width / 2}" y="27">${esc(title)}</text>
+        ${grid}
+        ${xGrid}
+        <line class="autoresearch-chart-axis" x1="${margin.left}" y1="${height - margin.bottom}" x2="${width - margin.right}" y2="${height - margin.bottom}"></line>
+        <line class="autoresearch-chart-axis" x1="${margin.left}" y1="${margin.top}" x2="${margin.left}" y2="${height - margin.bottom}"></line>
+        ${linePoints ? `<polyline class="autoresearch-chart-line" points="${linePoints}"></polyline>` : ""}
+        ${discardedDots}
+        ${keptDots}
+        <text class="autoresearch-chart-label" x="${width / 2}" y="${height - 18}" text-anchor="middle">Experiment</text>
+        <text class="autoresearch-chart-label" transform="translate(20 ${height / 2}) rotate(-90)" text-anchor="middle">${esc(metricLabel)} (${directionText})</text>
+        <circle class="autoresearch-chart-kept" cx="${width - 210}" cy="58" r="5"></circle>
+        <text class="autoresearch-chart-legend" x="${width - 198}" y="62">Kept improvements</text>
+        <circle class="autoresearch-chart-discarded" cx="${width - 90}" cy="58" r="5"></circle>
+        <text class="autoresearch-chart-legend" x="${width - 78}" y="62">Discarded</text>
+      </svg>`;
     }
 
     function appendLogsTailLines(lines) {
