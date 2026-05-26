@@ -1,6 +1,6 @@
 # Ralph loop (https://github.com/snarktank/ralph) — fresh context per agent session
-id: skills-normalize
-name: Skills Normalize
+id: skills-normalize-audit
+name: Skills Normalize Audit
 version: 1
 description: |
   Normalize a skills directory by detecting redundancies and overlaps.
