@@ -160,6 +160,51 @@ export function getAutoresearchPaths(cwd = process.cwd()): AutoresearchPaths {
   };
 }
 
+export function findAutoresearchSessionCwd(cwd = process.cwd(), options: { maxDepth?: number; maxDirs?: number } = {}): string | undefined {
+  const root = path.resolve(cwd);
+  const maxDepth = options.maxDepth ?? 2;
+  const maxDirs = options.maxDirs ?? 200;
+  const skip = new Set([".git", "node_modules", "dist", "build", ".venv", "venv", "__pycache__"]);
+  const candidates: Array<{ cwd: string; mtimeMs: number }> = [];
+  const stack: Array<{ dir: string; depth: number }> = [{ dir: root, depth: 0 }];
+  let visited = 0;
+
+  while (stack.length > 0 && visited < maxDirs) {
+    const item = stack.shift()!;
+    visited++;
+
+    const paths = getAutoresearchPaths(item.dir);
+    if (fs.existsSync(paths.configFile)) {
+      const statPath = fs.existsSync(paths.logFile) ? paths.logFile : paths.configFile;
+      let mtimeMs = 0;
+      try {
+        mtimeMs = fs.statSync(statPath).mtimeMs;
+      } catch {
+        mtimeMs = 0;
+      }
+      candidates.push({ cwd: item.dir, mtimeMs });
+      continue;
+    }
+
+    if (item.depth >= maxDepth) continue;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(item.dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      if (skip.has(entry.name)) continue;
+      if (entry.name.startsWith(".") && entry.name !== ".workspace") continue;
+      stack.push({ dir: path.join(item.dir, entry.name), depth: item.depth + 1 });
+    }
+  }
+
+  candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  return candidates[0]?.cwd;
+}
+
 export function readSessionConfig(cwd = process.cwd()): AutoresearchSessionConfig {
   const paths = getAutoresearchPaths(cwd);
   if (!fs.existsSync(paths.configFile)) {

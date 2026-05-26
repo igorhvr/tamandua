@@ -312,6 +312,81 @@
     .controls-bar label.drain-label input[type="checkbox"] {
       accent-color: #d29922;
     }
+    .panel-toolbar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-bottom: 12px;
+    }
+    .panel-toolbar select {
+      min-width: 220px;
+      max-width: 100%;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      background: #0d1117;
+      color: #c9d1d9;
+      padding: 5px 8px;
+      font-family: inherit;
+      font-size: 12px;
+    }
+    .autoresearch-grid {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+    .autoresearch-kpi {
+      border: 1px solid #21262d;
+      border-radius: 6px;
+      background: #0b0f14;
+      padding: 10px;
+      min-height: 64px;
+    }
+    .autoresearch-kpi .label {
+      color: #8b949e;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 4px;
+    }
+    .autoresearch-kpi .value {
+      color: #e6edf3;
+      font-size: 18px;
+      font-weight: 600;
+      overflow-wrap: anywhere;
+    }
+    .autoresearch-chart {
+      height: 72px;
+      border: 1px solid #21262d;
+      border-radius: 6px;
+      background: #0b0f14;
+      padding: 10px;
+      margin-bottom: 12px;
+      display: flex;
+      align-items: flex-end;
+      gap: 6px;
+    }
+    .autoresearch-bar {
+      flex: 1;
+      min-width: 8px;
+      max-width: 42px;
+      background: #58a6ff;
+      border-radius: 3px 3px 0 0;
+      opacity: 0.75;
+    }
+    .autoresearch-bar.best { background: #3fb950; opacity: 1; }
+    .autoresearch-bar.discard { background: #d29922; }
+    .autoresearch-bar.fail { background: #f85149; }
+    .autoresearch-detail {
+      color: #8b949e;
+      font-size: 12px;
+      margin-top: 3px;
+      overflow-wrap: anywhere;
+    }
+    @media (max-width: 800px) {
+      .autoresearch-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
   </style>
 </head>
 <body>
@@ -365,6 +440,19 @@
       </div>
     </section>
 
+    <!-- AutoResearch Section -->
+    <section class="section" id="autoresearch-section">
+      <h2>AutoResearch</h2>
+      <div class="panel-toolbar">
+        <select id="autoresearch-run-select" aria-label="AutoResearch run"></select>
+        <button class="action-btn" onclick="fetchAutoresearchProgress()">Refresh</button>
+        <span id="autoresearch-feedback" style="font-size:11px;color:#8b949e;"></span>
+      </div>
+      <div id="autoresearch-content">
+        <div class="empty-state">Select a run to inspect AutoResearch progress.</div>
+      </div>
+    </section>
+
     <!-- Logs Tail Section -->
     <section class="section" id="logs-tail-section">
       <h2>Logs Tail</h2>
@@ -412,6 +500,8 @@
     };
 
     let logsTailOffset = 0;
+    let latestRuns = [];
+    let selectedAutoresearchRunId = null;
 
     async function fetchMcpStatus() {
       try {
@@ -449,7 +539,10 @@
       try {
         const res = await fetch("/api/runs");
         const data = await res.json();
-        renderRuns(data.runs || []);
+        latestRuns = data.runs || [];
+        renderRuns(latestRuns);
+        updateAutoresearchRunSelector(latestRuns);
+        if (selectedAutoresearchRunId) fetchAutoresearchProgress();
         document.getElementById("status-dot").classList.remove("error");
       } catch (err) {
         document.getElementById("status-dot").classList.add("error");
@@ -548,6 +641,117 @@
       }).join("");
 
       el.innerHTML = `<div class="events-list">${rows}</div>`;
+    }
+
+    function updateAutoresearchRunSelector(runs) {
+      const select = document.getElementById("autoresearch-run-select");
+      if (!select) return;
+
+      const previous = selectedAutoresearchRunId || select.value;
+      const preferred = runs.find(r => r.status === "running") || runs[0];
+      const nextValue = runs.some(r => r.id === previous) ? previous : (preferred ? preferred.id : "");
+
+      select.innerHTML = runs.length
+        ? runs.map(r => `<option value="${esc(r.id)}">${esc(`#${r.run_number ?? "-"} ${r.id.slice(0, 8)} ${r.workflow_id}`)}</option>`).join("")
+        : '<option value="">No runs</option>';
+      select.value = nextValue;
+      selectedAutoresearchRunId = nextValue || null;
+      select.onchange = () => {
+        selectedAutoresearchRunId = select.value || null;
+        fetchAutoresearchProgress();
+      };
+    }
+
+    async function fetchAutoresearchProgress() {
+      const runId = selectedAutoresearchRunId || document.getElementById("autoresearch-run-select")?.value;
+      const feedback = document.getElementById("autoresearch-feedback");
+      if (!runId) {
+        document.getElementById("autoresearch-content").innerHTML =
+          '<div class="empty-state">No workflow runs available.</div>';
+        return;
+      }
+
+      try {
+        if (feedback) feedback.textContent = "Loading...";
+        const res = await fetch(`/api/runs/${encodeURIComponent(runId)}/autoresearch`);
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || `Failed to load AutoResearch (${res.status})`);
+        renderAutoresearchProgress(data);
+        if (feedback) feedback.textContent = "";
+      } catch (err) {
+        if (feedback) feedback.textContent = "";
+        document.getElementById("autoresearch-content").innerHTML =
+          `<div class="empty-state">Unable to fetch AutoResearch progress: ${esc(err.message)}</div>`;
+      }
+    }
+
+    function renderAutoresearchProgress(data) {
+      const el = document.getElementById("autoresearch-content");
+      if (!data.exists) {
+        el.innerHTML = `<div class="empty-state">${esc(data.reason || "No AutoResearch session found for this run.")}</div>`;
+        return;
+      }
+
+      const summary = data.summary || {};
+      const experiments = data.experiments || [];
+      const metricLabel = `${summary.metricName || "metric"}${summary.metricUnit ? ` (${summary.metricUnit})` : ""}`;
+      const lastExperiment = experiments[experiments.length - 1];
+
+      const kpis = [
+        ["Best", summary.bestMetric ?? "(none)"],
+        ["Baseline", summary.baselineMetric ?? "(none)"],
+        ["Runs", `${summary.totalRuns ?? 0}`],
+        ["Kept", `${summary.keptRuns ?? 0}`],
+        ["Failures", `${(summary.crashedRuns ?? 0) + (summary.checksFailedRuns ?? 0)}`],
+      ].map(([label, value]) => `<div class="autoresearch-kpi"><div class="label">${esc(label)}</div><div class="value mono">${esc(String(value))}</div></div>`).join("");
+
+      const numericMetrics = experiments.filter(e => Number.isFinite(Number(e.metric)));
+      const values = numericMetrics.map(e => Number(e.metric));
+      const min = values.length ? Math.min(...values) : 0;
+      const max = values.length ? Math.max(...values) : 1;
+      const range = max === min ? 1 : max - min;
+      const chart = numericMetrics.length
+        ? numericMetrics.map(e => {
+            const normalized = summary.direction === "lower"
+              ? (max - Number(e.metric)) / range
+              : (Number(e.metric) - min) / range;
+            const height = 14 + Math.round(normalized * 46);
+            const statusClass = e.status === "discard" ? " discard" : (e.status === "crash" || e.status === "checks_failed" ? " fail" : "");
+            const bestClass = e.run === summary.bestRun ? " best" : statusClass;
+            return `<div class="autoresearch-bar${bestClass}" style="height:${height}px" title="Run ${e.run}: ${e.metric}"></div>`;
+          }).join("")
+        : '<div class="empty-state" style="padding:12px">No numeric metrics yet.</div>';
+
+      const rows = experiments.slice(-10).reverse().map(e => {
+        const badgeClass = e.status === "discard" ? "badge-paused" : (e.status === "crash" || e.status === "checks_failed" ? "badge-failed" : "badge-completed");
+        return `<tr>
+          <td class="num">#${e.run}</td>
+          <td><span class="badge ${badgeClass}">${esc(e.status)}</span></td>
+          <td class="num">${e.metric === null || e.metric === undefined ? "-" : esc(String(e.metric))}</td>
+          <td>
+            <div>${esc(e.description || "")}</div>
+            ${e.learned ? `<div class="autoresearch-detail">Learned: ${esc(e.learned)}</div>` : ""}
+            ${e.next_focus ? `<div class="autoresearch-detail">Next: ${esc(e.next_focus)}</div>` : ""}
+          </td>
+          <td class="num">${e.duration_ms ? `${Math.round(e.duration_ms / 1000)}s` : "-"}</td>
+        </tr>`;
+      }).join("");
+
+      el.innerHTML = `
+        <div class="autoresearch-detail" style="margin-bottom:8px">
+          <strong style="color:#e6edf3">Goal:</strong> ${esc(summary.goal || "")}
+          <span class="mono"> ${esc(metricLabel)} ${esc(summary.direction || "")}</span>
+        </div>
+        <div class="autoresearch-grid">${kpis}</div>
+        <div class="autoresearch-chart" id="autoresearch-metric-chart">${chart}</div>
+        <div class="autoresearch-detail" style="margin-bottom:10px">
+          ${lastExperiment?.next_focus ? `Next focus: ${esc(lastExperiment.next_focus)}` : esc(summary.nextPrompt || "")}
+        </div>
+        <table id="autoresearch-timeline">
+          <thead><tr><th>Run</th><th>Status</th><th>${esc(metricLabel)}</th><th>Learning</th><th>Time</th></tr></thead>
+          <tbody>${rows || '<tr><td colspan="5"><div class="empty-state">No logged experiments yet.</div></td></tr>'}</tbody>
+        </table>
+      `;
     }
 
     function appendLogsTailLines(lines) {

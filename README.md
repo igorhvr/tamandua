@@ -58,6 +58,9 @@ tamandua autoresearch log --status auto \
   --learned "validation improved but training slowed" \
   --next-focus "test warmup schedule"
 tamandua autoresearch next
+
+# Inspect the loop for a Tamandua workflow run
+tamandua workflow autoresearch <run-id>
 ```
 
 Project files:
@@ -69,6 +72,11 @@ Project files:
 | `autoresearch.jsonl` | Append-only run history: measured results, decisions, learning, next focus. |
 | `autoresearch.sh` | Benchmark command. |
 | `autoresearch.checks.sh` | Optional correctness checks run after successful measurements. |
+
+When a workflow run was started with `--working-directory-for-harness`, the
+dashboard includes an AutoResearch panel that reads that directory's
+`autoresearch.jsonl` and shows best/baseline metrics, kept/discarded counts,
+failures, and the recent learning timeline.
 
 The core loop is `init -> run -> log -> next`. `log --status auto` classifies a
 run as `baseline`, `keep`, `discard`, `crash`, or `checks_failed` by comparing the

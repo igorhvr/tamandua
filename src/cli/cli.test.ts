@@ -878,12 +878,25 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /uninstall.*Uninstall a workflow/);
       assert.match(result.stdout ?? "", /run.*Start a new workflow run/);
       assert.match(result.stdout ?? "", /status.*Show detailed run status/);
+      assert.match(result.stdout ?? "", /autoresearch[\s\S]*Show AutoResearch progress/);
       assert.match(result.stdout ?? "", /stop.*Cancel a running workflow/);
       assert.match(result.stdout ?? "", /pause.*Pause a running workflow/);
       assert.match(result.stdout ?? "", /resume.*Resume a paused or failed/);
       assert.match(result.stdout ?? "", /pause-all.*Pause all running/);
       assert.match(result.stdout ?? "", /resume-all.*Resume all paused/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
+    } finally {
+      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("tamandua workflow autoresearch --help documents run progress", () => {
+    const result = cli(["workflow", "autoresearch", "--help"]);
+    try {
+      assert.equal(result.status, 0);
+      assert.match(result.stdout ?? "", /Show AutoResearch progress for a workflow run/);
+      assert.match(result.stdout ?? "", /autoresearch\.jsonl/);
+      assert.match(result.stdout ?? "", /tamandua workflow autoresearch abc12345/);
     } finally {
       fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }

@@ -8,6 +8,7 @@
  *   GET /runs/:id/kanban         -> kanban.html (per-run swim-lane view)
  *   GET /api/runs                -> list all workflow runs
  *   GET /api/runs/:id            -> detail for a specific run
+ *   GET /api/runs/:id/autoresearch -> AutoResearch progress for a run's harness cwd
  *   GET /api/runs/:id/kanban     -> lane-grouped snapshot for the kanban view
  *   GET /api/events              -> recent events (global)
  *   GET /api/logs-tail           -> logs-tail formatted event lines (cursor based)
@@ -25,6 +26,14 @@ import { pauseRunWithDaemon, resumeRunWithDaemon } from "./control-client.js";
 import { runWorkflow } from "../installer/run.js";
 import { stopWorkflow } from "../installer/status.js";
 import { readVersionStatus } from "../lib/version-check.js";
+import {
+  findAutoresearchSessionCwd,
+  readAutoresearchLog,
+  summarizeAutoresearch,
+  type AutoresearchLogEntry,
+  type AutoresearchRunEntry,
+  type AutoresearchRunResultEntry,
+} from "../autoresearch/autoresearch.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const INDEX_HTML = path.join(__dirname, "index.html");
@@ -63,6 +72,72 @@ function parseBody(req: http.IncomingMessage): Promise<string> {
     req.on("end", () => resolve(body));
     req.on("error", reject);
   });
+}
+
+type RunContext = Record<string, unknown>;
+
+function parseRunContext(context: unknown): RunContext {
+  if (typeof context !== "string" || context.trim() === "") return {};
+  try {
+    const parsed = JSON.parse(context) as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as RunContext
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function stringFromContext(ctx: RunContext, key: string): string | undefined {
+  const value = ctx[key];
+  return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+function resolveRunHarnessCwd(run: { context?: string | null }): string | undefined {
+  const ctx = parseRunContext(run.context);
+  return (
+    stringFromContext(ctx, "working_directory_for_harness") ??
+    stringFromContext(ctx, "worktree_path") ??
+    stringFromContext(ctx, "cwd")
+  );
+}
+
+function buildAutoresearchExperiments(entries: AutoresearchLogEntry[]) {
+  const results = new Map<number, AutoresearchRunResultEntry>();
+  for (const entry of entries) {
+    if (entry.type === "run_result") results.set(entry.run, entry);
+  }
+
+  return entries
+    .filter((entry): entry is AutoresearchRunEntry => entry.type === "run")
+    .map((entry) => {
+      const result = results.get(entry.run);
+      return {
+        run: entry.run,
+        created_at: entry.created_at,
+        status: entry.status,
+        metric: entry.metric,
+        best_metric: entry.best_metric,
+        improvement_ratio: entry.improvement_ratio,
+        duration_ms: entry.duration_ms ?? result?.duration_ms,
+        description: entry.description,
+        hypothesis: entry.asi?.hypothesis,
+        learned: entry.asi?.learned,
+        next_focus: entry.asi?.next_focus,
+        command: entry.command ?? result?.command,
+        commit_before: entry.commit_before ?? result?.commit_before,
+        commit_after: entry.commit_after,
+        measured_status: result?.status,
+        exit_code: result?.exit_code,
+        checks: result?.checks
+          ? {
+              command: result.checks.command,
+              exit_code: result.checks.exit_code,
+              duration_ms: result.checks.duration_ms,
+            }
+          : undefined,
+      };
+    });
 }
 
 // ── API Handlers ─────────────────────────────────────────────────────
@@ -214,6 +289,64 @@ function handleRunKanban(
     jsonResponse(res, snapshot);
   } catch (err) {
     errorResponse(res, `Failed to build kanban snapshot: ${(err as Error).message}`);
+  }
+}
+
+function handleRunAutoresearch(
+  _req: http.IncomingMessage,
+  res: http.ServerResponse,
+  runId: string,
+): void {
+  try {
+    const db = getDb();
+    const run = db.prepare(`
+      SELECT id, workflow_id, task, status, context, created_at, updated_at
+      FROM runs WHERE id = ?
+    `).get(runId) as
+      | { id: string; workflow_id: string; task: string; status: string; context?: string | null; created_at: string; updated_at: string }
+      | undefined;
+
+    if (!run) {
+      errorResponse(res, `Run not found: ${runId}`, 404);
+      return;
+    }
+
+    const cwd = resolveRunHarnessCwd(run);
+    if (!cwd) {
+      jsonResponse(res, {
+        exists: false,
+        run,
+        reason: "Run has no working_directory_for_harness in its context.",
+      });
+      return;
+    }
+
+    const autoresearchCwd = findAutoresearchSessionCwd(cwd) ?? cwd;
+    const summary = summarizeAutoresearch(autoresearchCwd);
+    if (!summary.exists) {
+      jsonResponse(res, {
+        exists: false,
+        run,
+        cwd,
+        reason: summary.nextPrompt,
+      });
+      return;
+    }
+
+    const entries = readAutoresearchLog(autoresearchCwd);
+    const results = entries.filter((entry): entry is AutoresearchRunResultEntry => entry.type === "run_result");
+    jsonResponse(res, {
+      exists: true,
+      run,
+      cwd: autoresearchCwd,
+      harnessCwd: cwd,
+      summary,
+      experiments: buildAutoresearchExperiments(entries),
+      pendingResults: results.filter((result) => !entries.some((entry) => entry.type === "run" && entry.run === result.run)),
+      entries: entries.slice(-100),
+    });
+  } catch (err) {
+    errorResponse(res, `Failed to get AutoResearch progress: ${(err as Error).message}`);
   }
 }
 
@@ -600,6 +733,13 @@ function route(req: http.IncomingMessage, res: http.ServerResponse): void {
   const kanbanApiMatch = pathname.match(/^\/api\/runs\/([a-zA-Z0-9_-]+)\/kanban$/);
   if (method === "GET" && kanbanApiMatch) {
     handleRunKanban(req, res, kanbanApiMatch[1]);
+    return;
+  }
+
+  // GET /api/runs/:id/autoresearch (registered before /api/runs/:id below)
+  const autoresearchApiMatch = pathname.match(/^\/api\/runs\/([a-zA-Z0-9_-]+)\/autoresearch$/);
+  if (method === "GET" && autoresearchApiMatch) {
+    handleRunAutoresearch(req, res, autoresearchApiMatch[1]);
     return;
   }
 

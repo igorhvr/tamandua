@@ -160,6 +160,143 @@ describe("dashboard logs-tail UI", () => {
   });
 });
 
+describe("dashboard AutoResearch progress", () => {
+  it("serves run-scoped AutoResearch progress from the harness directory", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-autoresearch-"));
+    const homeDir = path.join(root, "home");
+    const projectDir = path.join(root, "project");
+    fs.mkdirSync(projectDir, { recursive: true });
+    const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
+    const previousHome = process.env.HOME;
+    const previousDbPath = process.env.TAMANDUA_DB_PATH;
+    process.env.HOME = homeDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+
+    try {
+      fs.writeFileSync(
+        path.join(projectDir, "autoresearch.config.json"),
+        JSON.stringify({
+          goal: "Increase unit test coverage",
+          metricName: "coverage",
+          direction: "higher",
+          command: "./measure-test-coverage.sh",
+        }, null, 2),
+      );
+      const entries = [
+        {
+          type: "session",
+          created_at: "2026-05-26T10:00:00.000Z",
+          goal: "Increase unit test coverage",
+          metric_name: "coverage",
+          direction: "higher",
+          command: "./measure-test-coverage.sh",
+        },
+        {
+          type: "run_result",
+          run: 1,
+          created_at: "2026-05-26T10:01:00.000Z",
+          status: "measured",
+          metric: 0.336,
+          metric_name: "coverage",
+          direction: "higher",
+          duration_ms: 1200,
+          exit_code: 0,
+          command: "./measure-test-coverage.sh",
+          output_tail: "0.336",
+          error_tail: "",
+        },
+        {
+          type: "run",
+          run: 1,
+          created_at: "2026-05-26T10:02:00.000Z",
+          status: "baseline",
+          metric: 0.336,
+          metric_name: "coverage",
+          direction: "higher",
+          duration_ms: 1200,
+          command: "./measure-test-coverage.sh",
+          description: "baseline coverage",
+          baseline_metric: 0.336,
+          best_metric: 0.336,
+          improvement_ratio: 0,
+          asi: {
+            learned: "coverage script works",
+            next_focus: "cover pure helpers",
+          },
+        },
+      ];
+      fs.writeFileSync(
+        path.join(projectDir, "autoresearch.jsonl"),
+        entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n",
+      );
+
+      const db = getDb();
+      db.prepare(`
+        INSERT INTO runs (id, run_number, workflow_id, task, status, context, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        "run-autoresearch-1",
+        1,
+        "do-now",
+        "increase coverage",
+        "running",
+        JSON.stringify({ working_directory_for_harness: root }),
+        "2026-05-26T10:00:00.000Z",
+        "2026-05-26T10:02:00.000Z",
+      );
+
+      const { server, baseUrl } = await startDashboard();
+
+      try {
+        const response = await fetch(`${baseUrl}/api/runs/run-autoresearch-1/autoresearch`);
+        assert.equal(response.status, 200);
+        const body = await response.json() as {
+          exists: boolean;
+          cwd: string;
+          summary: { bestMetric: number; bestRun: number; totalRuns: number; nextPrompt: string };
+          experiments: Array<{ run: number; metric: number; learned: string; next_focus: string }>;
+        };
+
+        assert.equal(body.exists, true);
+        assert.equal(body.cwd, projectDir);
+        assert.equal(body.summary.bestMetric, 0.336);
+        assert.equal(body.summary.bestRun, 1);
+        assert.equal(body.summary.totalRuns, 1);
+        assert.match(body.summary.nextPrompt, /cover pure helpers/i);
+        assert.equal(body.experiments.length, 1);
+        assert.equal(body.experiments[0].learned, "coverage script works");
+        assert.equal(body.experiments[0].next_focus, "cover pure helpers");
+      } finally {
+        await stopDashboard(server);
+      }
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+      else process.env.TAMANDUA_DB_PATH = previousDbPath;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("renders the AutoResearch panel and polling hook in dashboard HTML", async () => {
+    const { server, baseUrl } = await startDashboard();
+
+    try {
+      const response = await fetch(`${baseUrl}/`);
+      assert.equal(response.status, 200);
+
+      const html = await response.text();
+      assert.match(html, /<section class="section" id="autoresearch-section">/);
+      assert.match(html, /id="autoresearch-run-select"/);
+      assert.match(html, /fetch\(`\/api\/runs\/\$\{encodeURIComponent\(runId\)\}\/autoresearch`\)/);
+      assert.match(html, /id="autoresearch-timeline"/);
+      assert.match(html, /id="autoresearch-metric-chart"/);
+    } finally {
+      await stopDashboard(server);
+    }
+  });
+});
+
 describe("dashboard stats API", () => {
   it("GET /api/stats returns systemTokensSpent and totalTokensSpent on fresh DB", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-stats-"));

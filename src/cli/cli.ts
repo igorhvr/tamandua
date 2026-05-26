@@ -42,13 +42,17 @@ import { readVersionStatus } from "../lib/version-check.js";
 import { parseWorkflowRunArgs } from "./workflow-run-args.js";
 import type { HarnessType } from "../installer/types.js";
 import {
+  findAutoresearchSessionCwd,
   initExperiment,
   runExperiment,
   logExperiment,
+  readAutoresearchLog,
   summarizeAutoresearch,
   type AutoresearchDecision,
   type AutoresearchDirection,
+  type AutoresearchRunEntry,
 } from "../autoresearch/autoresearch.js";
+import { getDb } from "../db.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -205,6 +209,77 @@ function printAutoresearchSummary(cwd?: string): void {
   console.log(`Best:        ${summary.bestMetric ?? "(none)"}${summary.bestRun ? ` at run ${summary.bestRun}` : ""}`);
   console.log("");
   console.log(summary.nextPrompt);
+}
+
+function resolveAutoresearchCwdForRun(runIdOrPrefix: string): { runId: string; cwd?: string } {
+  const detail = getWorkflowStatus(runIdOrPrefix);
+  const db = getDb();
+  const row = db.prepare("SELECT context FROM runs WHERE id = ?").get(detail.id) as { context?: string | null } | undefined;
+  if (!row?.context) return { runId: detail.id };
+
+  let context: Record<string, unknown> = {};
+  try {
+    const parsed = JSON.parse(row.context) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      context = parsed as Record<string, unknown>;
+    }
+  } catch {
+    return { runId: detail.id };
+  }
+
+  const readString = (key: string): string | undefined => {
+    const value = context[key];
+    return typeof value === "string" && value.trim() ? value : undefined;
+  };
+
+  return {
+    runId: detail.id,
+    cwd: readString("working_directory_for_harness") ?? readString("worktree_path") ?? readString("cwd"),
+  };
+}
+
+function printAutoresearchTimeline(cwd: string): void {
+  const entries = readAutoresearchLog(cwd);
+  const runs = entries.filter((entry): entry is AutoresearchRunEntry => entry.type === "run");
+  if (runs.length === 0) {
+    console.log("Timeline:    No logged experiments yet.");
+    return;
+  }
+
+  console.log("Timeline:");
+  for (const run of runs.slice(-12)) {
+    const metric = run.metric === null ? "-" : String(run.metric);
+    const learned = run.asi?.learned ? ` — ${run.asi.learned}` : "";
+    const next = run.asi?.next_focus ? ` | next: ${run.asi.next_focus}` : "";
+    console.log(`  #${String(run.run).padStart(2, "0")} [${run.status.padEnd(13)}] ${metric.padEnd(8)} ${run.description}${learned}${next}`);
+  }
+}
+
+function printWorkflowAutoresearch(runIdOrPrefix: string): void {
+  let resolved: { runId: string; cwd?: string };
+  try {
+    resolved = resolveAutoresearchCwdForRun(runIdOrPrefix);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : `No run found matching "${runIdOrPrefix}".`;
+    console.log(message.startsWith("No run found matching") ? `No run found matching "${runIdOrPrefix}".` : message);
+    return;
+  }
+
+  if (!resolved.cwd) {
+    console.log(`Run ${resolved.runId.slice(0, 8)} has no harness working directory in its context.`);
+    return;
+  }
+
+  const autoresearchCwd = findAutoresearchSessionCwd(resolved.cwd) ?? resolved.cwd;
+  console.log(`Run:         ${resolved.runId.slice(0, 8)}`);
+  console.log(`Harness CWD: ${resolved.cwd}`);
+  if (autoresearchCwd !== resolved.cwd) console.log(`Session CWD: ${autoresearchCwd}`);
+  printAutoresearchSummary(autoresearchCwd);
+  const summary = summarizeAutoresearch(autoresearchCwd);
+  if (summary.exists) {
+    console.log("");
+    printAutoresearchTimeline(autoresearchCwd);
+  }
 }
 
 function getTamanduaHelp(): string {
@@ -980,6 +1055,19 @@ Examples:
   tamandua workflow status abc12345`;
 }
 
+function getWorkflowAutoresearchHelp(): string {
+  return `tamandua workflow autoresearch — Show AutoResearch progress for a workflow run
+
+Usage: tamandua workflow autoresearch <run-id>
+
+Resolves the run's harness working directory, reads its project-local
+autoresearch.config.json and autoresearch.jsonl files, then prints the
+current metric summary and recent experiment timeline.
+
+Examples:
+  tamandua workflow autoresearch abc12345`;
+}
+
 function getWorkflowStopHelp(): string {
   return `tamandua workflow stop — Cancel a running workflow
 
@@ -1075,7 +1163,7 @@ Examples:
 function getWorkflowGroupHelp(): string {
   return `tamandua workflow — Manage workflows and runs
 
-Usage: tamandua workflow <list|runs|install|uninstall|run|status|stop|pause|resume|pause-all|resume-all>
+Usage: tamandua workflow <list|runs|install|uninstall|run|status|autoresearch|stop|pause|resume|pause-all|resume-all>
 
 Commands for managing Tamandua workflows and their runs.
 
@@ -1087,6 +1175,8 @@ Subcommands:
               active-runs check)
   run         Start a new workflow run with the given task
   status      Show detailed run status with step listing
+  autoresearch
+              Show AutoResearch progress for a run
   stop        Cancel a running workflow
   pause       Pause a running workflow via the daemon
   resume      Resume a paused or failed workflow run
@@ -1099,6 +1189,7 @@ Examples:
   tamandua workflow install feature-dev-merge
   tamandua workflow run feature-dev-merge "Add a new feature"
   tamandua workflow status abc12345
+  tamandua workflow autoresearch abc12345
   tamandua workflow pause abc12345 --drain`;
 }
 
@@ -1272,6 +1363,7 @@ function getUsageText(): string {
     "tamandua autoresearch log             Log keep/discard learning for the loop",
     "tamandua autoresearch status          Summarize AutoResearch state",
     "tamandua autoresearch next            Print the next experiment prompt",
+    "tamandua workflow autoresearch <run-id> Show run AutoResearch progress",
     "tamandua workflow status <query>      Check run status",
     "tamandua workflow runs                List all workflow runs",
     "tamandua workflow pause <run-id>      Pause a running workflow",
@@ -1384,6 +1476,7 @@ async function main() {
       if (action === "uninstall") { printHelp(getWorkflowUninstallHelp()); }
       if (action === "run") { printHelp(getWorkflowRunHelp()); }
       if (action === "status") { printHelp(getWorkflowStatusHelp()); }
+      if (action === "autoresearch") { printHelp(getWorkflowAutoresearchHelp()); }
       if (action === "stop") { printHelp(getWorkflowStopHelp()); }
       if (action === "pause") { printHelp(getWorkflowPauseHelp()); }
       if (action === "resume") { printHelp(getWorkflowResumeHelp()); }
@@ -2262,6 +2355,15 @@ async function main() {
       const message = err instanceof Error ? err.message : `No run found matching "${target}".`;
       console.log(message.startsWith("No run found matching") ? `No run found matching "${target}".` : message);
     }
+    return;
+  }
+
+  if (action === "autoresearch") {
+    if (!target) {
+      process.stderr.write("Missing run-id.\nUsage: tamandua workflow autoresearch <run-id>\n");
+      process.exit(1);
+    }
+    printWorkflowAutoresearch(target);
     return;
   }
 
