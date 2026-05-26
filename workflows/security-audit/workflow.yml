@@ -241,6 +241,9 @@ steps:
       2. Read the vulnerability description carefully
       3. Implement the fix — minimal, targeted changes only
       4. Write a regression test that verifies the vulnerability is patched
+         Exception: if the fix is a dependency version bump (go.mod, package.json, pyproject.toml, etc.),
+         skip the regression test — the lock file (go.sum, package-lock.json, etc.) is the regression guard.
+         Output: REGRESSION_TEST: none (dependency lock enforces version)
       5. Run {{build_cmd}} to verify the build passes
       6. Run {{test_cmd}} to verify all tests pass
       7. Commit: fix(security): brief description

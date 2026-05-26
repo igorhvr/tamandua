@@ -78,10 +78,19 @@ CHANGES: what was fixed (files changed, what was done)
 REGRESSION_TEST: what test was added (test name, file, what it verifies)
 ```
 
+## Dependency Version Upgrade Fixes
+
+When the fix is a dependency version bump (e.g., upgrading `golang.org/x/net`, bumping a `package.json` entry, updating `pyproject.toml`):
+
+- **Do NOT write a version-pinning test.** The package manager lock file (`go.sum`, `package-lock.json`, `poetry.lock`) already enforces the version. A test that reads the manifest and checks a version string duplicates this guarantee and breaks on the next legitimate upgrade.
+- **The fix IS the proof.** `go.sum`/lock files are cryptographically verified — an attacker cannot silently downgrade the dependency without breaking the build.
+- Output `REGRESSION_TEST: none (dependency lock file is the regression guard)`.
+- Do run `{{build_cmd}}` and `{{test_cmd}}` to verify the upgrade doesn't break anything.
+
 ## What NOT To Do
 
 - Don't make unrelated changes
-- Don't skip the regression test
+- Don't skip the regression test (exception: dependency version upgrades — see above)
 - Don't weaken existing security measures
 - Don't commit if tests fail
 - Don't use `// @ts-ignore` to suppress security-related type errors
