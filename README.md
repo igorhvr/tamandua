@@ -44,6 +44,11 @@ Unlike a normal workflow, AutoResearch stores durable project-local state so an
 agent can resume after restarts, learn from each measured run, and choose the next
 experiment from evidence.
 
+Use AutoResearch when the task has a reliable numeric metric and the agent should
+run a sequence of experiments instead of one batch of edits. Typical examples are
+raising test coverage, reducing validation loss, improving latency, or lowering
+cost while preserving correctness.
+
 ```bash
 tamandua autoresearch init \
   --goal "reduce validation loss" \
@@ -62,6 +67,62 @@ tamandua autoresearch next
 # Inspect the loop for a Tamandua workflow run
 tamandua workflow autoresearch <run-id>
 ```
+
+### Triggering AutoResearch
+
+AutoResearch can be driven manually from any project directory, or delegated to a
+Tamandua workflow agent. In both cases the project needs a metric command that
+prints one parseable number. The command should be deterministic enough to compare
+experiments and should exclude generated or third-party code when measuring a
+project-owned objective.
+
+Manual loop:
+
+```bash
+cd /path/to/project
+
+tamandua autoresearch init \
+  --goal "Increase unit test coverage to 1.000 without changing application code" \
+  --metric coverage \
+  --unit ratio \
+  --direction higher \
+  --command "./measure-test-coverage.sh" \
+  --metric-regex "^([0-9]\\.[0-9]{3})$" \
+  --checks-command "./measure-test-coverage.sh"
+
+tamandua autoresearch run
+tamandua autoresearch log --status auto \
+  --description "baseline coverage" \
+  --hypothesis "establish current coverage" \
+  --learned "baseline recorded" \
+  --next-focus "cover the lowest-risk uncovered module"
+tamandua autoresearch next
+```
+
+Workflow-driven loop:
+
+```bash
+tamandua workflow install do-now
+tamandua dashboard start
+
+tamandua workflow run do-now \
+  "In the target repo, create or verify ./measure-test-coverage.sh, initialize tamandua autoresearch, then run 10 bounded experiments. Before each edit run tamandua autoresearch next. Only add or change tests/fixtures/test config. After each experiment run tamandua autoresearch run and tamandua autoresearch log --status auto with description, hypothesis, learned, and next-focus. Stop and report best metric, commits, and remaining gaps." \
+  --working-directory-for-harness /path/that/contains/or/is/the/project \
+  --pi-as-harness
+```
+
+Monitor it while the workflow runs:
+
+```bash
+tamandua workflow status <run-id>
+tamandua workflow autoresearch <run-id>
+open http://localhost:3334
+```
+
+The dashboard's AutoResearch panel reads the run's harness working directory,
+discovers the nearest `autoresearch.config.json` / `autoresearch.jsonl`, and
+renders the experiment trace. Gray points are attempted experiments; green points
+and the green line are the kept best-so-far frontier.
 
 Project files:
 
