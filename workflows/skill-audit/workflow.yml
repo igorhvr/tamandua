@@ -5,18 +5,33 @@ version: 1
 description: |
   Audit a skills directory for redundancies and overlaps.
 
-  Reads all SKILL.md files from a skills directory, analyzes names and descriptions
-  for similarity, detects redundant or overlapping skills, and produces a structured
-  consolidation report with recommendations for merging or reorganizing.
+  Scanner catalogs all SKILL.md files from a skills directory. Auditor analyzes them
+  for similarity across multiple dimensions, groups overlapping skills into clusters,
+  and produces consolidation recommendations. Reporter produces a structured markdown report.
+
+  The pipeline runs in three phases: scan → audit → report.
 polling:
   model: default
   timeoutSeconds: 120
 
 agents:
+  - id: scanner
+    name: Scanner
+    role: analysis
+    description: Scans a skills directory and extracts metadata from all SKILL.md files.
+    workspace:
+      baseDir: agents/scanner
+      skills:
+        - tamandua-agents
+      files:
+        AGENTS.md: agents/scanner/AGENTS.md
+        SOUL.md: agents/scanner/SOUL.md
+        IDENTITY.md: agents/scanner/IDENTITY.md
+
   - id: auditor
     name: Auditor
     role: analysis
-    description: Analyzes a skills directory for redundancies and consolidation opportunities.
+    description: Analyzes skill metadata for redundancies, groups overlapping skills, and produces consolidation recommendations.
     workspace:
       baseDir: agents/auditor
       skills:
@@ -26,47 +41,129 @@ agents:
         SOUL.md: agents/auditor/SOUL.md
         IDENTITY.md: agents/auditor/IDENTITY.md
 
+  - id: reporter
+    name: Reporter
+    role: analysis
+    description: Produces a structured markdown consolidation report from audit findings.
+    workspace:
+      baseDir: agents/reporter
+      skills:
+        - tamandua-agents
+      files:
+        AGENTS.md: agents/reporter/AGENTS.md
+        SOUL.md: agents/reporter/SOUL.md
+        IDENTITY.md: agents/reporter/IDENTITY.md
+
 steps:
-  - id: audit
-    agent: auditor
+  - id: scan
+    agent: scanner
     input: |
-      Audit a skills directory for redundancies and consolidation opportunities.
+      Scan a skills directory and extract metadata from every SKILL.md file.
 
       TASK:
       {{task}}
 
       Instructions:
-      1. Navigate to the skills directory and list all subdirectories
+      1. Navigate to the skills directory specified in the task and list all subdirectories
       2. For each subdirectory, read the SKILL.md file
-      3. Extract the YAML frontmatter: name, description (and any other metadata)
-      4. Build a dataset of all skills with their metadata
-      5. Analyze pairs of skills for similarity:
-         - Name similarity: exact matches, partial/substring matches, related terms
-         - Description overlap: shared keywords, overlapping use cases, related scope
-         - Functional overlap: Are they solving similar problems or serving similar purposes?
-      6. Group skills into clusters where 2+ skills show overlap
-      7. For each cluster:
-         - List the skills involved
-         - Explain the redundancy (why are they similar?)
-         - Suggest a consolidation approach:
-           * Merge into one canonical skill (recommend which to keep as the base)
-           * Create a wrapper skill that delegates to multiple implementations
-           * Keep separate but clarify distinct use cases in descriptions
-           * Sunset one skill and redirect to another
-      8. Generate metrics: total skills analyzed, clusters found, redundant count
+      3. Parse the YAML frontmatter — extract at minimum `name` and `description`
+      4. Also capture the directory name (folder name) as the skill ID
+      5. Build a structured dataset of all skills with their metadata
+      6. Read the content of each SKILL.md beyond just the frontmatter — capture key sections like "when to use", "how it works", any workflow descriptions
 
       Reply with:
       STATUS: done
-      REPORT: markdown-formatted consolidation report with sections for each cluster, explanations, and recommendations
-      SKILLS_TOTAL: <number of unique skills scanned>
-      CLUSTERS_FOUND: <number of redundancy clusters>
-      REDUNDANT_COUNT: <total number of skills involved in clusters>
+      SKILLS_COUNT: <number of skills scanned>
+      SKILLS_JSON: [{"id": "folder-name", "name": "Display Name", "description": "full description from frontmatter", "path": "/full/path/to/skill/directory"}, ...]
 
-      The REPORT must include:
-      - Executive summary (number of redundancies, severity of overlaps)
-      - Section for each cluster with: skills involved, overlap explanation, suggested action
-      - Implementation notes for consolidation efforts
-      - List of clean/non-redundant skills at the end
+      The SKILLS_JSON must be a valid JSON array with all skills included.
+    expects: "STATUS: done"
+    max_retries: 4
+    on_fail:
+      escalate_to: human
+
+  - id: audit
+    agent: auditor
+    input: |
+      Analyze the skills dataset for redundancies, overlaps, and consolidation opportunities.
+
+      REPO: {{repo}}
+      TASK:
+      {{task}}
+
+      SKILLS_COUNT: {{skills_count}}
+      SKILLS_JSON: {{skills_json}}
+
+      Instructions:
+      1. Parse SKILLS_JSON into a dataset
+      2. Compare every pair of skills across these dimensions:
+         - Name similarity: substrings, shared keywords, related terms in skill IDs or display names
+         - Description overlap: shared phrases, overlapping use cases, similar problem domain
+         - Functional scope: same tooling, same frameworks, same audience
+         - Target audience: same user persona or workflow persona
+      3. Group skills into clusters where 2+ skills overlap in 2+ dimensions
+      4. For each cluster, determine the consolidation approach:
+         - merge: combine into one skill (say which should be the base)
+         - clarify: keep separate but update descriptions to clarify when to use each
+         - sunset: deprecate one and redirect users to the other
+      5. List skills that are truly distinct as CLEAN_SKILLS
+
+      Reply with:
+      STATUS: done
+      CLUSTERS_FOUND: <number>
+      REDUNDANT_COUNT: <total skills involved in clusters>
+      CLUSTERS_JSON: [{"cluster_id": "cluster-1", "skills": ["id1", "id2"], "overlap_summary": "why they overlap — shared dimensions, specific keywords", "recommendation": {"action": "merge|clarify|sunset", "base_skill": "id-to-keep", "reason": "why this approach", "implementation": "specific steps to implement"}}, ...]
+      CLEAN_SKILLS: ["id1", "id2", ...]
+
+      Rules:
+      - Don't force clusters — only group skills that genuinely overlap
+      - For clusters, explain WHY they overlap — be specific about shared keywords or scopes
+      - Recommendations must be actionable — say exactly which skill to keep
+    expects: "STATUS: done"
+    max_retries: 4
+    on_fail:
+      escalate_to: human
+
+  - id: report
+    agent: reporter
+    input: |
+      Produce a structured markdown consolidation report from the audit findings.
+
+      REPO: {{repo}}
+      TASK: {{task}}
+
+      SKILLS_TOTAL: {{skills_count}}
+      CLUSTERS_FOUND: {{clusters_found}}
+      REDUNDANT_COUNT: {{redundant_count}}
+      CLUSTERS_JSON: {{clusters_json}}
+      CLEAN_SKILLS: {{clean_skills}}
+
+      Instructions:
+      Read SKILLS_JSON to recover the full description and name of each skill.
+      Produce a markdown consolidation report in the format:
+
+      # Skill Audit Report
+
+      ## Executive Summary
+      Overview with metrics: total skills, clusters found, skills involved in clusters, clean skills.
+      One paragraph summarizing the state of the skill directory regarding redundancy.
+
+      ## Findings
+      For each cluster, a section with:
+      - Skills involved (names, not just IDs)
+      - Quote the relevant description snippets that show the overlap
+      - Overlap analysis explaining which dimensions matched
+      - Recommended action (merge/clarify/sunset) with rationale
+
+      ## Consolidation Roadmap
+      An implementation plan section: which skills to keep, which to sunset, and how to implement.
+
+      ## Clean Skills
+      List of non-redundant skills — they are distinct and should remain as-is.
+
+      Reply with:
+      STATUS: done
+      REPORT: full markdown report
     expects: "STATUS: done"
     max_retries: 4
     on_fail:
