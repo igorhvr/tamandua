@@ -1,9 +1,9 @@
 # Ralph loop (https://github.com/snarktank/ralph) — fresh context per agent session
-id: skill-audit
-name: Skill Audit
+id: skills-normalize
+name: Skills Normalize
 version: 1
 description: |
-  Audit a skills directory for redundancies and overlaps.
+  Normalize a skills directory by detecting redundancies and overlaps.
 
   Scanner catalogs all SKILL.md files from a skills directory. Auditor analyzes them
   for similarity across multiple dimensions, groups overlapping skills into clusters,
