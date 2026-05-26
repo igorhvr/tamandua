@@ -1,0 +1,73 @@
+# Ralph loop (https://github.com/snarktank/ralph) — fresh context per agent session
+id: skill-audit
+name: Skill Audit
+version: 1
+description: |
+  Audit a skills directory for redundancies and overlaps.
+
+  Reads all SKILL.md files from a skills directory, analyzes names and descriptions
+  for similarity, detects redundant or overlapping skills, and produces a structured
+  consolidation report with recommendations for merging or reorganizing.
+polling:
+  model: default
+  timeoutSeconds: 120
+
+agents:
+  - id: auditor
+    name: Auditor
+    role: analysis
+    description: Analyzes a skills directory for redundancies and consolidation opportunities.
+    workspace:
+      baseDir: agents/auditor
+      skills:
+        - tamandua-agents
+      files:
+        AGENTS.md: agents/auditor/AGENTS.md
+        SOUL.md: agents/auditor/SOUL.md
+        IDENTITY.md: agents/auditor/IDENTITY.md
+
+steps:
+  - id: audit
+    agent: auditor
+    input: |
+      Audit a skills directory for redundancies and consolidation opportunities.
+
+      TASK:
+      {{task}}
+
+      Instructions:
+      1. Navigate to the skills directory and list all subdirectories
+      2. For each subdirectory, read the SKILL.md file
+      3. Extract the YAML frontmatter: name, description (and any other metadata)
+      4. Build a dataset of all skills with their metadata
+      5. Analyze pairs of skills for similarity:
+         - Name similarity: exact matches, partial/substring matches, related terms
+         - Description overlap: shared keywords, overlapping use cases, related scope
+         - Functional overlap: Are they solving similar problems or serving similar purposes?
+      6. Group skills into clusters where 2+ skills show overlap
+      7. For each cluster:
+         - List the skills involved
+         - Explain the redundancy (why are they similar?)
+         - Suggest a consolidation approach:
+           * Merge into one canonical skill (recommend which to keep as the base)
+           * Create a wrapper skill that delegates to multiple implementations
+           * Keep separate but clarify distinct use cases in descriptions
+           * Sunset one skill and redirect to another
+      8. Generate metrics: total skills analyzed, clusters found, redundant count
+
+      Reply with:
+      STATUS: done
+      REPORT: markdown-formatted consolidation report with sections for each cluster, explanations, and recommendations
+      SKILLS_TOTAL: <number of unique skills scanned>
+      CLUSTERS_FOUND: <number of redundancy clusters>
+      REDUNDANT_COUNT: <total number of skills involved in clusters>
+
+      The REPORT must include:
+      - Executive summary (number of redundancies, severity of overlaps)
+      - Section for each cluster with: skills involved, overlap explanation, suggested action
+      - Implementation notes for consolidation efforts
+      - List of clean/non-redundant skills at the end
+    expects: "STATUS: done"
+    max_retries: 4
+    on_fail:
+      escalate_to: human
