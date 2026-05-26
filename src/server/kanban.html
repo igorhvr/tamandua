@@ -223,17 +223,122 @@
       outline: 2px solid var(--accent);
       outline-offset: 2px;
     }
-    /* ── Card detail (expand/collapse) ── */
+    /* ── Card detail (rendered inside the modal) ── */
     .card-detail {
-      margin: 2px 0 6px;
-      padding: 8px 10px;
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 6px;
       display: flex;
       flex-direction: column;
+      gap: 14px;
+      font-size: 12.5px;
+    }
+    /* ── Card detail modal ── */
+    .card-detail-modal {
+      position: fixed;
+      inset: 0;
+      z-index: 100;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+    .card-detail-modal.open { display: flex; }
+    .card-detail-modal-overlay {
+      position: absolute;
+      inset: 0;
+      background: rgba(1, 4, 9, 0.72);
+      backdrop-filter: blur(2px);
+      animation: modal-fade 140ms ease-out;
+    }
+    .card-detail-modal-window {
+      position: relative;
+      background: var(--panel);
+      border: 1px solid var(--line-2);
+      border-radius: 12px;
+      width: min(720px, 100%);
+      max-height: 100%;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      box-shadow: 0 24px 60px rgba(0, 0, 0, 0.6);
+      animation: modal-scale 140ms ease-out;
+    }
+    @keyframes modal-fade {
+      from { opacity: 0; }
+      to   { opacity: 1; }
+    }
+    @keyframes modal-scale {
+      from { opacity: 0; transform: translateY(8px) scale(0.98); }
+      to   { opacity: 1; transform: translateY(0) scale(1); }
+    }
+    .card-detail-modal-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--line-2);
+      gap: 12px;
+      flex: 0 0 auto;
+    }
+    .card-detail-modal-id {
+      display: flex;
+      align-items: center;
       gap: 8px;
-      font-size: 11.5px;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--ink-strong);
+      letter-spacing: 0.04em;
+      font-variant-numeric: tabular-nums;
+    }
+    .card-detail-modal-id .dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: var(--todo);
+    }
+    .card-detail-modal-id.running .dot { background: var(--running); }
+    .card-detail-modal-id.done    .dot { background: var(--done); }
+    .card-detail-modal-id.failed  .dot { background: var(--failed); }
+    .card-detail-modal-status {
+      font-size: 11px;
+      color: var(--ink-soft);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    .card-detail-modal-close {
+      background: transparent;
+      border: 1px solid var(--line-2);
+      color: var(--ink-soft);
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 18px;
+      line-height: 1;
+      cursor: pointer;
+      padding: 0;
+      font-family: inherit;
+      transition: border-color 120ms ease, color 120ms ease, background 120ms ease;
+    }
+    .card-detail-modal-close:hover {
+      border-color: var(--accent);
+      color: var(--ink-strong);
+      background: var(--panel-2);
+    }
+    .card-detail-modal-close:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+    .card-detail-modal-body {
+      padding: 16px 18px 20px;
+      overflow-y: auto;
+      flex: 1 1 auto;
+      min-height: 0;
+    }
+    .card-detail-modal-body .detail-prompt-text,
+    .card-detail-modal-body .detail-task-text,
+    .card-detail-modal-body .detail-output-text,
+    .card-detail-modal-body .detail-failure-text {
+      max-height: 320px;
+      font-size: 12px;
     }
     .detail-section {
       display: flex;
@@ -247,11 +352,60 @@
       text-transform: uppercase;
       color: var(--ink-soft);
     }
+    /* ── Collapsible detail sections (Prompt / Task / Output) ── */
+    details.detail-collapsible {
+      gap: 0;
+    }
+    details.detail-collapsible > summary.detail-summary {
+      list-style: none;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      user-select: none;
+      padding: 2px 0;
+      align-self: flex-start;
+      border-radius: 4px;
+    }
+    details.detail-collapsible > summary.detail-summary::-webkit-details-marker {
+      display: none;
+    }
+    details.detail-collapsible > summary.detail-summary::marker {
+      display: none;
+    }
+    .detail-chevron {
+      display: inline-block;
+      width: 6px;
+      height: 6px;
+      border-right: 1.5px solid var(--ink-soft);
+      border-bottom: 1.5px solid var(--ink-soft);
+      transform: rotate(-45deg);
+      transition: transform 140ms ease, border-color 140ms ease;
+      flex-shrink: 0;
+      margin-right: 2px;
+    }
+    details.detail-collapsible[open] > summary.detail-summary .detail-chevron {
+      transform: rotate(45deg);
+    }
+    details.detail-collapsible > summary.detail-summary:hover .detail-label {
+      color: var(--ink-strong);
+    }
+    details.detail-collapsible > summary.detail-summary:hover .detail-chevron {
+      border-color: var(--ink-strong);
+    }
+    details.detail-collapsible > summary.detail-summary:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+    .detail-collapse-body {
+      margin-top: 6px;
+    }
     .detail-value {
       color: var(--ink);
       line-height: 1.45;
     }
     .detail-prompt-text,
+    .detail-task-text,
     .detail-output-text,
     .detail-failure-text {
       margin: 0;
@@ -389,7 +543,20 @@
 
   <main class="board" id="board"><!-- lanes injected --></main>
 
-  <template id="card-detail-tmpl"></template>
+  <div id="card-detail-modal" class="card-detail-modal" role="dialog" aria-modal="true" aria-hidden="true" aria-labelledby="card-detail-modal-title">
+    <div class="card-detail-modal-overlay" data-modal-close></div>
+    <div class="card-detail-modal-window" role="document">
+      <header class="card-detail-modal-header">
+        <div class="card-detail-modal-id" id="card-detail-modal-title">
+          <span class="dot"></span>
+          <span class="card-detail-modal-id-text">—</span>
+          <span class="card-detail-modal-status"></span>
+        </div>
+        <button type="button" class="card-detail-modal-close" aria-label="Close" data-modal-close>×</button>
+      </header>
+      <div class="card-detail-modal-body" id="card-detail-modal-body"></div>
+    </div>
+  </div>
 
   <footer class="status">
     <span id="footer-left">connecting…</span>
@@ -538,6 +705,9 @@
 
   let lastGoodAt = null;
   const expandedCardIds = new Set();
+  // Tracks which collapsible sections (by label) the user has manually
+  // collapsed; survives polling re-renders so the user's choice sticks.
+  const collapsedSections = new Set();
 
   // ── Card expansion helpers ────────────────────────────────────
 
@@ -569,23 +739,33 @@
 
     const parts = [];
 
-    // Prompt — always shown
+    // Prompt — always shown, collapsible
     parts.push(
-      '<div class="detail-section">',
-      '<div class="detail-label">Prompt</div>',
+      '<details class="detail-section detail-collapsible" open>',
+      '<summary class="detail-summary">',
+      '<span class="detail-chevron" aria-hidden="true"></span>',
+      '<span class="detail-label">Prompt</span>',
+      '</summary>',
+      '<div class="detail-collapse-body">',
       detail.input_template
         ? '<pre class="detail-prompt-text">' + escapeHtml(detail.input_template) + '</pre>'
         : '<div class="detail-placeholder detail-value">—</div>',
-      '</div>'
+      '</div>',
+      '</details>'
     );
 
-    // Task context
+    // Task context — collapsible, same formatting as Prompt
     if (detail.task) {
       parts.push(
-        '<div class="detail-section">',
-        '<div class="detail-label">Task</div>',
-        '<div class="detail-value">', escapeHtml(detail.task), '</div>',
-        '</div>'
+        '<details class="detail-section detail-collapsible" open>',
+        '<summary class="detail-summary">',
+        '<span class="detail-chevron" aria-hidden="true"></span>',
+        '<span class="detail-label">Task</span>',
+        '</summary>',
+        '<div class="detail-collapse-body">',
+        '<pre class="detail-task-text">', escapeHtml(detail.task), '</pre>',
+        '</div>',
+        '</details>'
       );
     }
 
@@ -656,13 +836,18 @@
       );
     }
 
-    // Output
+    // Output — collapsible
     if (detail.output) {
       parts.push(
-        '<div class="detail-section">',
-        '<div class="detail-label">Output</div>',
+        '<details class="detail-section detail-collapsible" open>',
+        '<summary class="detail-summary">',
+        '<span class="detail-chevron" aria-hidden="true"></span>',
+        '<span class="detail-label">Output</span>',
+        '</summary>',
+        '<div class="detail-collapse-body">',
         '<pre class="detail-output-text">', escapeHtml(detail.output), '</pre>',
-        '</div>'
+        '</div>',
+        '</details>'
       );
     }
 
@@ -677,6 +862,145 @@
     return div;
   }
 
+  // ── Modal helpers ─────────────────────────────────────────────
+
+  const modalEl = document.getElementById("card-detail-modal");
+  const modalBodyEl = document.getElementById("card-detail-modal-body");
+  const modalIdEl = modalEl.querySelector(".card-detail-modal-id");
+  const modalIdTextEl = modalEl.querySelector(".card-detail-modal-id-text");
+  const modalStatusEl = modalEl.querySelector(".card-detail-modal-status");
+  let lastFocusedToggleBtn = null;
+
+  function setToggleButtonState(cardEl, expanded) {
+    const btn = cardEl.querySelector(".card-toggle-btn");
+    if (!btn) return;
+    if (expanded) {
+      btn.textContent = "−";
+      btn.setAttribute("aria-label", "Collapse card");
+      btn.setAttribute("aria-expanded", "true");
+    } else {
+      btn.textContent = "+";
+      btn.setAttribute("aria-label", "Expand card");
+      btn.setAttribute("aria-expanded", "false");
+    }
+  }
+
+  function syncToggleButtons() {
+    const cards = document.getElementById("board").querySelectorAll(".card[data-card-id]");
+    for (const cardEl of cards) {
+      const cid = cardEl.getAttribute("data-card-id");
+      setToggleButtonState(cardEl, cid && expandedCardIds.has(cid));
+    }
+  }
+
+  function findCardEl(cardId) {
+    return document.getElementById("board").querySelector(
+      '[data-card-id="' + cardId.replace(/"/g, '\\"') + '"]'
+    );
+  }
+
+  function updateModalHeader(cardId) {
+    modalIdTextEl.textContent = cardId;
+    const cardEl = findCardEl(cardId);
+    const status = cardEl
+      ? (cardEl.classList.contains("running") ? "running"
+        : cardEl.classList.contains("done") ? "done"
+        : cardEl.classList.contains("failed") ? "failed"
+        : "todo")
+      : "todo";
+    modalIdEl.classList.remove("running", "done", "failed", "todo");
+    modalIdEl.classList.add(status);
+    modalStatusEl.textContent = status;
+  }
+
+  function showModal() {
+    modalEl.classList.add("open");
+    modalEl.setAttribute("aria-hidden", "false");
+    document.body.style.overflow = "hidden";
+  }
+
+  function hideModal() {
+    modalEl.classList.remove("open");
+    modalEl.setAttribute("aria-hidden", "true");
+    modalBodyEl.innerHTML = "";
+    document.body.style.overflow = "";
+  }
+
+  function applyCollapsedState(container) {
+    const items = container.querySelectorAll("details.detail-collapsible");
+    for (const det of items) {
+      const labelEl = det.querySelector(".detail-label");
+      const label = labelEl ? labelEl.textContent.trim() : "";
+      if (label && collapsedSections.has(label)) {
+        det.open = false;
+      }
+    }
+  }
+
+  async function loadDetailIntoModal(cardId) {
+    modalBodyEl.innerHTML = "";
+    modalBodyEl.appendChild(createDetailSection(null, true));
+    try {
+      const apiUrl = "/api/runs/" + encodeURIComponent(runId) +
+        "/kanban/card-detail?cardId=" + encodeURIComponent(cardId);
+      const r = await fetch(apiUrl, { cache: "no-store" });
+      if (!r.ok) {
+        const txt = await r.text();
+        throw new Error("HTTP " + r.status + " — " + txt.slice(0, 200));
+      }
+      const detail = await r.json();
+      modalBodyEl.innerHTML = "";
+      modalBodyEl.appendChild(createDetailSection(detail));
+      applyCollapsedState(modalBodyEl);
+      return true;
+    } catch (err) {
+      modalBodyEl.innerHTML = "";
+      modalBodyEl.appendChild(createErrorSection(err.message));
+      return false;
+    }
+  }
+
+  // The native `toggle` event does not bubble, so listen in the capture phase
+  // to track every collapsible section inside the modal.
+  modalBodyEl.addEventListener("toggle", function (e) {
+    const det = e.target;
+    if (!det || det.tagName !== "DETAILS") return;
+    if (!det.classList.contains("detail-collapsible")) return;
+    const labelEl = det.querySelector(".detail-label");
+    const label = labelEl ? labelEl.textContent.trim() : "";
+    if (!label) return;
+    if (det.open) {
+      collapsedSections.delete(label);
+    } else {
+      collapsedSections.add(label);
+    }
+  }, true);
+
+  async function openCardDetail(cardId, opts) {
+    const isRefresh = !!(opts && opts.refresh);
+    // Only one card can be expanded at a time in the modal.
+    expandedCardIds.clear();
+    expandedCardIds.add(cardId);
+    updateModalHeader(cardId);
+    if (!isRefresh) showModal();
+    syncToggleButtons();
+    const ok = await loadDetailIntoModal(cardId);
+    if (!ok && !isRefresh) {
+      // Keep the error visible; user can dismiss with Esc / overlay click.
+    }
+  }
+
+  function closeCardDetail() {
+    if (expandedCardIds.size === 0 && !modalEl.classList.contains("open")) return;
+    expandedCardIds.clear();
+    hideModal();
+    syncToggleButtons();
+    if (lastFocusedToggleBtn && document.contains(lastFocusedToggleBtn)) {
+      try { lastFocusedToggleBtn.focus(); } catch {}
+    }
+    lastFocusedToggleBtn = null;
+  }
+
   // ── Event delegation for toggle buttons ───────────────────────
 
   document.getElementById("board").addEventListener("click", async function (e) {
@@ -689,37 +1013,11 @@
     const cardId = card.getAttribute("data-card-id");
     if (!cardId) return;
 
-    if (btn.textContent.trim() === "+") {
-      // Expand
-      btn.textContent = "−";
-      btn.setAttribute("aria-label", "Collapse card");
-
-      const loadingEl = createDetailSection(null, true);
-      btn.after(loadingEl);
-
-      try {
-        const apiUrl = "/api/runs/" + encodeURIComponent(runId) +
-          "/kanban/card-detail?cardId=" + encodeURIComponent(cardId);
-        const r = await fetch(apiUrl, { cache: "no-store" });
-        if (!r.ok) {
-          const txt = await r.text();
-          throw new Error("HTTP " + r.status + " — " + txt.slice(0, 200));
-        }
-        const detail = await r.json();
-        loadingEl.replaceWith(createDetailSection(detail));
-        expandedCardIds.add(cardId);
-      } catch (err) {
-        loadingEl.replaceWith(createErrorSection(err.message));
-        btn.textContent = "+";
-        btn.setAttribute("aria-label", "Expand card");
-      }
+    if (expandedCardIds.has(cardId)) {
+      closeCardDetail();
     } else {
-      // Collapse
-      expandedCardIds.delete(cardId);
-      btn.textContent = "+";
-      btn.setAttribute("aria-label", "Expand card");
-      const detailEl = card.querySelector(".card-detail");
-      if (detailEl) detailEl.remove();
+      lastFocusedToggleBtn = btn;
+      await openCardDetail(cardId);
     }
   });
 
@@ -728,6 +1026,19 @@
     if (e.target.matches(".card-toggle-btn") && (e.key === "Enter" || e.key === " ")) {
       e.preventDefault();
       e.target.click();
+    }
+  });
+
+  // ── Modal dismissal: Esc, overlay click, close button ─────────
+  modalEl.addEventListener("click", function (e) {
+    if (e.target.closest("[data-modal-close]")) {
+      closeCardDetail();
+    }
+  });
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "Escape" && modalEl.classList.contains("open")) {
+      e.preventDefault();
+      closeCardDetail();
     }
   });
 
@@ -787,23 +1098,23 @@
       renderHeader(data);
       renderBoard(data);
 
-      // Re-expand cards that were expanded before the refresh
+      // Re-sync expanded card state after the board re-render and refresh the
+      // open modal in place (so latest tokens/timing/output show through).
       const missingCardIds = [];
       for (const cardId of expandedCardIds) {
-        const cardEl = document.getElementById("board").querySelector(
-          '[data-card-id="' + cardId + '"]'
-        );
-        if (cardEl) {
-          const btn = cardEl.querySelector(".card-toggle-btn");
-          if (btn && btn.textContent.trim() === "+") {
-            btn.click();
-          }
-        } else {
-          missingCardIds.push(cardId);
-        }
+        if (!findCardEl(cardId)) missingCardIds.push(cardId);
       }
       for (const id of missingCardIds) {
         expandedCardIds.delete(id);
+      }
+      if (expandedCardIds.size === 0 && modalEl.classList.contains("open")) {
+        // The expanded card disappeared from the snapshot — close the modal.
+        closeCardDetail();
+      } else if (expandedCardIds.size > 0) {
+        const openCardId = Array.from(expandedCardIds)[0];
+        syncToggleButtons();
+        // Refresh modal contents in place; do NOT toggle visibility.
+        openCardDetail(openCardId, { refresh: true });
       }
 
       lastGoodAt = new Date();
