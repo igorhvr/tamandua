@@ -1,0 +1,364 @@
+# AutoResearch-style ML experimentation. The loop is bounded by Tamandua's
+# story loop, but each story is an adaptive research iteration, not a fixed idea.
+id: autoresearch-ml-worktree
+name: AutoResearch ML Experiment Batch (Worktree)
+version: 1
+description: |
+  Runs a bounded AutoResearch-style ML experiment ratchet in a detached git worktree.
+  Setup validates an autoresearch repository, records a baseline, and initializes
+  local research memory. The researcher then runs adaptive experiment iterations:
+  read prior results, choose the next experiment from evidence, edit only the
+  training file, run the metric command, keep improvements, revert failures, and
+  update the research memory for the next iteration.
+
+  This workflow is designed for Karpathy-style autoresearch repositories where
+  a single training file is optimized against a clear offline metric.
+run:
+  workspace: worktree
+
+polling:
+  model: default
+  timeoutSeconds: 120
+
+context:
+  train_file: train.py
+  prepare_file: prepare.py
+  train_cmd: uv run train.py
+  prepare_cmd: uv run prepare.py
+  results_file: results.tsv
+  progress_file: autoresearch-progress.md
+  metric_name: val_bpb
+  metric_direction: lower
+  max_experiments: "20"
+
+agents:
+  - id: setup
+    name: AutoResearch Setup
+    role: coding
+    description: Validates the ML repository, prepares data, and records the baseline metric.
+    timeoutSeconds: 1800
+    workspace:
+      baseDir: agents/setup
+      skills:
+        - tamandua-agents
+      files:
+        AGENTS.md: agents/setup/AGENTS.md
+        SOUL.md: agents/setup/SOUL.md
+        IDENTITY.md: agents/setup/IDENTITY.md
+
+  - id: initializer
+    name: Research Loop Initializer
+    role: analysis
+    description: Creates generic adaptive iteration slots without pre-planning stale experiment ideas.
+    timeoutSeconds: 600
+    workspace:
+      baseDir: agents/researcher
+      skills:
+        - tamandua-agents
+      files:
+        AGENTS.md: agents/researcher/AGENTS.md
+        SOUL.md: agents/researcher/SOUL.md
+        IDENTITY.md: agents/researcher/IDENTITY.md
+
+  - id: researcher
+    name: Researcher
+    role: coding
+    description: Runs one adaptive AutoResearch iteration per loop item.
+    timeoutSeconds: 1200
+    workspace:
+      baseDir: agents/researcher
+      skills:
+        - tamandua-agents
+      files:
+        AGENTS.md: agents/researcher/AGENTS.md
+        SOUL.md: agents/researcher/SOUL.md
+        IDENTITY.md: agents/researcher/IDENTITY.md
+
+  - id: judge
+    name: Judge
+    role: verification
+    description: Verifies experiment integrity, metric parsing, and keep/revert discipline.
+    timeoutSeconds: 600
+    workspace:
+      baseDir: agents/judge
+      skills:
+        - tamandua-agents
+      files:
+        AGENTS.md: agents/judge/AGENTS.md
+        SOUL.md: agents/judge/SOUL.md
+        IDENTITY.md: agents/judge/IDENTITY.md
+
+  - id: summarizer
+    name: Summarizer
+    role: analysis
+    description: Summarizes the experiment batch and recommends the next research direction.
+    timeoutSeconds: 600
+    workspace:
+      baseDir: agents/summarizer
+      skills:
+        - tamandua-agents
+      files:
+        AGENTS.md: agents/summarizer/AGENTS.md
+        SOUL.md: agents/summarizer/SOUL.md
+        IDENTITY.md: agents/summarizer/IDENTITY.md
+
+steps:
+  - id: setup
+    agent: setup
+    input: |
+      Prepare an AutoResearch-style ML repository in a detached worktree.
+
+      TASK:
+      {{task}}
+
+      REPO: {{repo}}
+      TRAIN_FILE: {{train_file}}
+      PREPARE_FILE: {{prepare_file}}
+      TRAIN_CMD: {{train_cmd}}
+      PREPARE_CMD: {{prepare_cmd}}
+      RESULTS_FILE: {{results_file}}
+      PROGRESS_FILE: {{progress_file}}
+      METRIC: {{metric_name}} ({{metric_direction}} is better)
+
+      RETRY FEEDBACK (only present if your previous attempt was rejected - read carefully and fix specifically what it complains about):
+      {{retry_feedback}}
+
+      Instructions:
+      1. cd into {{repo}}.
+      2. Confirm README.md, {{prepare_file}}, {{train_file}}, and pyproject.toml exist.
+      3. Read README.md and program.md if present to understand the repository's AutoResearch rules.
+      4. Run dependency setup only if needed. Prefer `uv sync` for uv-based projects.
+      5. Confirm the data/cache required by the repo exists. For Karpathy autoresearch, check ~/.cache/autoresearch. If missing, run {{prepare_cmd}}.
+      6. Initialize {{results_file}} if missing with this tab-separated header:
+         commit	{{metric_name}}	memory_gb	status	description
+      7. Initialize {{progress_file}} with baseline notes and a "Research Memory" section.
+      8. Save START_COMMIT=$(git rev-parse HEAD).
+      9. Run the baseline command:
+         timeout 10m {{train_cmd}} > run.log 2>&1
+      10. Parse {{metric_name}} and peak_vram_mb from run.log.
+      11. Append a baseline row to {{results_file}}. Leave {{results_file}} and run.log untracked.
+      12. Do not modify {{prepare_file}}, pyproject.toml, uv.lock, or evaluation code.
+
+      Reply with:
+      STATUS: done
+      BASELINE_METRIC: <number>
+      BEST_METRIC: <number>
+      RESULTS_FILE: {{results_file}}
+      PROGRESS_FILE: {{progress_file}}
+      NOTES: <brief setup notes>
+    expects: "STATUS: done"
+    max_retries: 4
+    on_fail:
+      escalate_to: human
+
+  - id: initialize_research_loop
+    agent: initializer
+    input: |
+      Initialize a bounded AutoResearch ratchet. Do not pre-plan concrete experiments.
+
+      TASK:
+      {{task}}
+
+      REPO: {{repo}}
+      RESULTS_FILE: {{results_file}}
+      PROGRESS_FILE: {{progress_file}}
+      MAX_EXPERIMENTS: {{max_experiments}}
+      BASELINE_METRIC: {{baseline_metric}}
+      BEST_METRIC: {{best_metric}}
+
+      Instructions:
+      1. Create generic adaptive iteration slots, not stale experiment ideas.
+      2. Each slot must require the researcher to read current evidence before choosing the experiment.
+      3. Use at most {{max_experiments}} slots and never more than 20, because Tamandua story loops are capped at 20.
+      4. Every slot must preserve the same ratchet: learn from prior results, choose one next experiment, run it, keep only improvements, revert failures, and update memory.
+
+      Reply with:
+      STATUS: done
+      STORIES_JSON: [ ... array of adaptive iteration story objects ... ]
+
+      The STORIES_JSON line is REQUIRED and MUST be a literal JSON array. Use IDs EXP-001, EXP-002, etc.
+      Each story must have id, title, description, and acceptanceCriteria.
+      Example:
+      STORIES_JSON: [{"id":"EXP-001","title":"Adaptive research iteration 1","description":"Run one evidence-driven AutoResearch cycle. Choose the concrete experiment only at execution time after reading current results, git history, and progress notes.","acceptanceCriteria":["{{results_file}} and {{progress_file}} are read before choosing the experiment","The hypothesis is justified from prior results or baseline behavior","Only {{train_file}} is modified in kept commits","{{train_cmd}} completes or a crash is logged","{{results_file}} is updated with one row","{{progress_file}} is updated with lesson learned and next direction","The commit is kept only if {{metric_name}} improves; otherwise code is reverted"]}]
+    expects: "STATUS: done"
+    max_retries: 4
+    on_fail:
+      escalate_to: human
+
+  - id: experiment_loop
+    agent: researcher
+    type: loop
+    loop:
+      over: stories
+      completion: all_done
+      fresh_session: true
+      verify_each: true
+      verify_step: judge
+    input: |
+      Run one adaptive AutoResearch iteration.
+
+      This is not a pre-planned experiment. Choose the experiment now from the latest evidence.
+
+      TASK:
+      {{task}}
+
+      REPO: {{repo}}
+      TRAIN_FILE: {{train_file}}
+      TRAIN_CMD: {{train_cmd}}
+      RESULTS_FILE: {{results_file}}
+      PROGRESS_FILE: {{progress_file}}
+      METRIC: {{metric_name}} ({{metric_direction}} is better)
+
+      CURRENT ITERATION:
+      {{current_story}}
+
+      COMPLETED ITERATIONS:
+      {{completed_stories}}
+
+      VERIFY FEEDBACK (if retrying):
+      {{verify_feedback}}
+
+      TIMEOUT RETRY (if previous attempt timed out):
+      {{timeout_retry}}
+
+      RUNTIME STORY PLAN:
+      {{progress}}
+
+      Required ratchet process:
+      1. cd into {{repo}}.
+      2. Read {{results_file}} if it exists.
+      3. Read {{progress_file}} if it exists.
+      4. Inspect git history of kept experiments.
+      5. Identify the best metric so far, changes that helped, changes that failed, and the most promising next direction.
+      6. Choose exactly one next experiment based on that evidence.
+      7. Write a short hypothesis in {{progress_file}} before editing.
+      8. Save START_COMMIT=$(git rev-parse HEAD).
+      9. Edit only {{train_file}}.
+      10. Commit the candidate change.
+      11. Run:
+          timeout 10m {{train_cmd}} > run.log 2>&1
+      12. Parse {{metric_name}} and peak_vram_mb from run.log.
+      13. Append exactly one tab-separated row to {{results_file}}.
+      14. If {{metric_name}} improved over the best kept result, keep the commit.
+      15. If {{metric_name}} did not improve or the run crashed, git reset --hard $START_COMMIT.
+      16. Update {{progress_file}} with the hypothesis, change, metric result, keep/discard/crash decision, lesson learned, and recommended next direction.
+
+      Forbidden:
+      - Do not modify {{prepare_file}}.
+      - Do not modify pyproject.toml or uv.lock.
+      - Do not change the metric or evaluation harness.
+      - Do not choose experiments from a stale prewritten list.
+      - Do not continue a bad direction without explaining why evidence supports it.
+      - Do not commit {{results_file}}, {{progress_file}}, or run.log.
+
+      Reply with:
+      STATUS: done
+      EXPERIMENT_ID: {{current_story_id}}
+      HYPOTHESIS: <why this experiment was selected from prior results>
+      CHANGE: <what changed in {{train_file}}>
+      METRIC: <{{metric_name}} value, or 0 for crash>
+      PEAK_VRAM_MB: <number, or 0 for crash>
+      STATUS_DECISION: keep|discard|crash
+      COMMIT: <short hash for kept candidate, or none>
+      LESSON: <what should influence the next iteration>
+      NEXT_DIRECTION: <recommended next experiment family>
+    expects: "STATUS: done"
+    max_retries: 4
+    on_fail:
+      escalate_to: human
+
+  - id: judge
+    agent: judge
+    input: |
+      Verify the AutoResearch ratchet for the latest iteration.
+
+      REPO: {{repo}}
+      TRAIN_FILE: {{train_file}}
+      PREPARE_FILE: {{prepare_file}}
+      RESULTS_FILE: {{results_file}}
+      PROGRESS_FILE: {{progress_file}}
+      METRIC: {{metric_name}} ({{metric_direction}} is better)
+
+      ITERATION:
+      {{current_story}}
+
+      HYPOTHESIS:
+      {{hypothesis}}
+
+      CHANGE:
+      {{change}}
+
+      METRIC_RESULT:
+      {{metric}}
+
+      DECISION:
+      {{status_decision}}
+
+      COMMIT:
+      {{commit}}
+
+      LESSON:
+      {{lesson}}
+
+      NEXT_DIRECTION:
+      {{next_direction}}
+
+      Checks:
+      1. The hypothesis references prior results, {{progress_file}}, baseline behavior, or git history.
+      2. The experiment was selected adaptively, not from a fixed stale list.
+      3. Only {{train_file}} changed in kept commits.
+      4. {{prepare_file}}, pyproject.toml, uv.lock, and evaluation code were untouched.
+      5. {{results_file}} has exactly one new row for this iteration.
+      6. {{progress_file}} was updated with the lesson and next direction.
+      7. The keep/discard/crash decision matches {{metric_name}} improvement.
+      8. If discarded or crashed, the worktree returned to the pre-experiment code state.
+
+      Reply with:
+      STATUS: done
+      VERIFIED: <checks performed>
+
+      If invalid:
+      STATUS: retry
+      ISSUES: <specific corrections>
+    expects: "regex:^STATUS: (done|retry)$"
+    max_retries: 4
+    on_fail:
+      retry_step: experiment_loop
+      on_exhausted:
+        escalate_to: human
+
+  - id: summarize
+    agent: summarizer
+    input: |
+      Summarize the AutoResearch batch.
+
+      TASK:
+      {{task}}
+
+      REPO: {{repo}}
+      RESULTS_FILE: {{results_file}}
+      PROGRESS_FILE: {{progress_file}}
+      BASELINE_METRIC: {{baseline_metric}}
+      BEST_METRIC_FROM_SETUP: {{best_metric}}
+      METRIC: {{metric_name}} ({{metric_direction}} is better)
+
+      Instructions:
+      1. Read {{results_file}} and {{progress_file}}.
+      2. Identify the best kept commit and metric.
+      3. Summarize what experiment families helped, failed, or crashed.
+      4. Recommend the next bounded batch direction.
+      5. Do not modify files.
+
+      Reply with:
+      STATUS: done
+      BEST_METRIC: <best {{metric_name}}>
+      BEST_COMMIT: <hash or none>
+      EXPERIMENTS_RUN: <count>
+      KEPT: <count>
+      DISCARDED: <count>
+      CRASHED: <count>
+      RECOMMENDATION: <next batch direction>
+    expects: "STATUS: done"
+    max_retries: 2
+    on_fail:
+      escalate_to: human

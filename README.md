@@ -39,7 +39,7 @@ That's it. Run `tamandua workflow list` to see available workflows.
 
 ## What You Get: Bundled Workflows
 
-Tamandua ships with 21 bundled workflows organized into five families. Use `tamandua workflow list` to see available workflows, and `tamandua workflow install <id>` to install one.
+Tamandua ships with 22 bundled workflows organized into six families. Use `tamandua workflow list` to see available workflows, and `tamandua workflow install <id>` to install one.
 
 ### Worktree Variants
 
@@ -114,6 +114,18 @@ passes. Useful for establishing a clean baseline on a branch with known test fai
 | Local-only | `quarantine-broken-tests` | 3 | setup → quarantine → verify |
 | + Merge | `quarantine-broken-tests-merge` | 4 | setup → quarantine → verify → finalize_merge |
 | Worktree + Merge | `quarantine-broken-tests-merge-worktree` | 4 | setup → quarantine → verify → finalize_merge |
+
+### ML AutoResearch
+
+Bounded AutoResearch-style ML experimentation. Runs in a detached worktree, records
+a baseline, then executes adaptive experiment iterations. Each iteration reads
+current results and progress notes before choosing the next experiment, edits only
+the training file, runs the metric command, keeps improvements, reverts failures,
+and updates research memory for the next iteration.
+
+| Variant | Workflow ID | Agents | Pipeline |
+|---------|------------|--------|----------|
+| Worktree | `autoresearch-ml-worktree` | 5 | setup → initialize_research_loop → experiment_loop → judge → summarize |
 
 ### Quick Tasks
 

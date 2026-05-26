@@ -14,8 +14,8 @@ const readmePath = resolve(workflowsDir, "..", "README.md");
 const readmeContent = readFileSync(readmePath, "utf-8");
 
 describe("README workflow documentation", () => {
-  it("documents all 21 bundled workflows in the README", () => {
-    assert.equal(bundledIds.length, 21);
+  it("documents all 22 bundled workflows in the README", () => {
+    assert.equal(bundledIds.length, 22);
     for (const id of bundledIds) {
       // Each workflow ID should appear in the README, wrapped in backtick code spans
       // like `feature-dev` or `bug-fix-merge-worktree`
@@ -54,6 +54,10 @@ describe("README workflow documentation", () => {
     assert.ok(
       readmeContent.includes("### Quarantine Broken Tests"),
       "Must have Quarantine Broken Tests family section"
+    );
+    assert.ok(
+      readmeContent.includes("### ML AutoResearch"),
+      "Must have ML AutoResearch family section"
     );
     assert.ok(
       readmeContent.includes("### Quick Tasks"),

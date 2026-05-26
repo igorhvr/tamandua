@@ -1340,3 +1340,64 @@ describe("US-003: just-do-it dispatch step dynamic workflow selection", () => {
     assert.match(justDoItYml, /do-review-do-verify.*standalone/);
   });
 });
+
+describe("AutoResearch ML workflow", () => {
+  it("runs in a detached worktree with adaptive ratchet steps", async () => {
+    const spec = await loadWorkflowSpec(wfDir("autoresearch-ml-worktree"));
+
+    assert.equal(spec.run?.workspace, "worktree");
+    assert.deepEqual(
+      spec.steps.map((step) => step.id),
+      ["setup", "initialize_research_loop", "experiment_loop", "judge", "summarize"],
+    );
+
+    const loop = spec.steps.find((step) => step.id === "experiment_loop");
+    assert.ok(loop, "experiment_loop step should exist");
+    assert.equal(loop!.type, "loop");
+    assert.equal(loop!.loop?.over, "stories");
+    assert.equal(loop!.loop?.verify_each, true);
+    assert.equal(loop!.loop?.verify_step, "judge");
+  });
+
+  it("creates generic iteration slots instead of pre-planned experiments", async () => {
+    const spec = await loadWorkflowSpec(wfDir("autoresearch-ml-worktree"));
+    const init = spec.steps.find((step) => step.id === "initialize_research_loop");
+
+    assert.ok(init, "initialize_research_loop step should exist");
+    assert.match(init!.input, /Do not pre-plan concrete experiments/);
+    assert.match(init!.input, /generic adaptive iteration slots/);
+    assert.match(init!.input, /STORIES_JSON:/);
+    assert.match(init!.input, /EXP-001/);
+    assert.match(init!.input, /read current evidence before choosing the experiment/);
+  });
+
+  it("researcher prompt enforces evidence-driven keep-or-revert behavior", async () => {
+    const spec = await loadWorkflowSpec(wfDir("autoresearch-ml-worktree"));
+    const loop = spec.steps.find((step) => step.id === "experiment_loop");
+
+    assert.ok(loop, "experiment_loop step should exist");
+    assert.match(loop!.input, /Choose the experiment now from the latest evidence/);
+    assert.match(loop!.input, /Read \{\{results_file\}\}/);
+    assert.match(loop!.input, /Read \{\{progress_file\}\}/);
+    assert.match(loop!.input, /Inspect git history of kept experiments/);
+    assert.match(loop!.input, /Save START_COMMIT=\$\(git rev-parse HEAD\)/);
+    assert.match(loop!.input, /Edit only \{\{train_file\}\}/);
+    assert.match(loop!.input, /timeout 10m \{\{train_cmd\}\} > run\.log 2>&1/);
+    assert.match(loop!.input, /If \{\{metric_name\}\} improved over the best kept result, keep the commit/);
+    assert.match(loop!.input, /git reset --hard \$START_COMMIT/);
+    assert.match(loop!.input, /Do not choose experiments from a stale prewritten list/);
+  });
+
+  it("judge prompt verifies ratchet integrity and forbidden file changes", async () => {
+    const spec = await loadWorkflowSpec(wfDir("autoresearch-ml-worktree"));
+    const judge = spec.steps.find((step) => step.id === "judge");
+
+    assert.ok(judge, "judge step should exist");
+    assert.equal(judge!.expects, "regex:^STATUS: (done|retry)$");
+    assert.match(judge!.input, /hypothesis references prior results/);
+    assert.match(judge!.input, /selected adaptively/);
+    assert.match(judge!.input, /Only \{\{train_file\}\} changed in kept commits/);
+    assert.match(judge!.input, /\{\{prepare_file\}\}, pyproject\.toml, uv\.lock, and evaluation code were untouched/);
+    assert.match(judge!.input, /keep\/discard\/crash decision matches \{\{metric_name\}\} improvement/);
+  });
+});
