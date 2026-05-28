@@ -248,6 +248,11 @@ nav {
   transition: color var(--transition);
 }
 
+.logo img {
+  vertical-align: middle;
+  margin-right: var(--space-1);
+}
+
 .logo:hover {
   color: var(--color-accent);
   text-decoration: none;

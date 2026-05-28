@@ -1,5 +1,7 @@
 # Tamandua
 
+<p align="center"><img src="www/assets/tamandua.png" alt="Tamandua logo" width="180"></p>
+
 Build your agent team in [pi](https://github.com/mariozechner/pi-coding-agent) with one command.
 
 You don't need to hire a dev team. You need to define one. Tamandua gives you a team of specialized AI agents — planner, developer, verifier, tester, reviewer — that work together in reliable, repeatable workflows. One install. Zero infrastructure.

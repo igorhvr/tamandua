@@ -598,10 +598,14 @@ describe("www/index.html structure", () => {
 
   // ── US-010: Accessibility ────────────────────────────────────────────
 
-  it("logo emoji has role='img' with aria-label", () => {
+  it("logo is an img tag pointing to tamandua.png with alt text", () => {
     assert.ok(
-      /<span[^>]*role="img"[^>]*aria-label="Tamandua ant logo"[^>]*>/.test(html),
-      "logo emoji should be wrapped in <span role='img' aria-label='Tamandua ant logo'>"
+      /<img[^>]*src="assets\/tamandua\.png"[^>]*alt="Tamandua logo"[^>]*>/.test(html),
+      "logo should be <img src='assets/tamandua.png' alt='Tamandua logo'>"
+    );
+    assert.ok(
+      /<img[^>]*width="32"[^>]*height="32"[^>]*>/.test(html),
+      "tamandua.png img should have width='32' height='32'"
     );
   });
 
