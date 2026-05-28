@@ -1,22 +1,26 @@
-# Dependencies
-node_modules/
-
-# Build output
-dist/
-
 # Environment
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
 
 # Secrets
 *.key
 *.pem
 *.secret
 
-# Coverage
+# Node.js
+node_modules/
+
+# Build output
+dist/
+
+# Test coverage
 coverage/
 .nyc_output/
+
+# IDE
+.vscode/
+.idea/
 
 # OS
 .DS_Store
@@ -24,12 +28,3 @@ Thumbs.db
 
 # Logs
 *.log
-npm-debug.log*
-
-# Editor
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-PROMPT.md
