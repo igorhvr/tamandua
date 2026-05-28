@@ -723,10 +723,14 @@
       const experiments = data.experiments || [];
       const metricLabel = `${summary.metricName || "metric"}${summary.metricUnit ? ` (${summary.metricUnit})` : ""}`;
       const lastExperiment = experiments[experiments.length - 1];
+      const confidenceValue = summary.confidence_score === null || summary.confidence_score === undefined
+        ? `${summary.confidence_band === "high" ? "high" : "unknown"} (${summary.confidence_sample_count || 0})`
+        : `${summary.confidence_band} (${summary.confidence_score === Infinity ? "Infinity" : Number(summary.confidence_score).toFixed(2)})`;
 
       const kpis = [
         ["Best", summary.bestMetric ?? "(none)"],
         ["Baseline", summary.baselineMetric ?? "(none)"],
+        ["Confidence", confidenceValue],
         ["Runs", `${summary.totalRuns ?? 0}`],
         ["Kept", `${summary.keptRuns ?? 0}`],
         ["Failures", `${(summary.crashedRuns ?? 0) + (summary.checksFailedRuns ?? 0)}`],
@@ -742,6 +746,7 @@
           <td class="num">${e.metric === null || e.metric === undefined ? "-" : esc(String(e.metric))}</td>
           <td>
             <div>${esc(e.description || "")}</div>
+            ${e.confidence_score !== null && e.confidence_score !== undefined ? `<div class="autoresearch-detail">Confidence: ${esc(e.confidence_band || "unknown")} (${esc(e.confidence_score === Infinity ? "Infinity" : Number(e.confidence_score).toFixed(2))})</div>` : (e.confidence_band === "high" ? `<div class="autoresearch-detail">Confidence: high</div>` : "")}
             ${e.learned ? `<div class="autoresearch-detail">Learned: ${esc(e.learned)}</div>` : ""}
             ${e.next_focus ? `<div class="autoresearch-detail">Next: ${esc(e.next_focus)}</div>` : ""}
           </td>

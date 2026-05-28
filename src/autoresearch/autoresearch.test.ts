@@ -10,6 +10,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const CLI_SCRIPT = path.resolve(__dirname, "..", "..", "dist", "cli", "cli.js");
 import {
+  calculateAutoresearchConfidence,
   commitAutoresearchResult,
   decideStatus,
   hasDirtyNonAutoresearchFiles,
@@ -37,6 +38,135 @@ function git(cwd: string, args: string[]): void {
   const result = spawnSync("git", args, { cwd, encoding: "utf-8" });
   assert.equal(result.status, 0, `git ${args.join(" ")} failed: ${result.stderr || result.stdout}`);
 }
+
+function confidenceRun(
+  run: number,
+  status: "baseline" | "keep" | "discard" | "crash" | "checks_failed",
+  metric: number | null,
+  direction: "lower" | "higher" = "lower",
+) {
+  return {
+    type: "run" as const,
+    run,
+    created_at: `2026-01-01T00:0${run}:00.000Z`,
+    status,
+    metric,
+    metric_name: "score",
+    direction,
+    description: `run ${run}`,
+    baseline_metric: run === 1 ? metric : 10,
+    best_metric: metric,
+    improvement_ratio: null,
+    confidence_score: null,
+    confidence_band: "unknown" as const,
+    noise_floor_mad: null,
+    confidence_sample_count: 0,
+  };
+}
+
+describe("autoresearch confidence", () => {
+  it("returns unknown for fewer than 3 numeric metrics", () => {
+    const confidence = calculateAutoresearchConfidence([
+      confidenceRun(1, "baseline", 10),
+      confidenceRun(2, "keep", 9),
+    ]);
+
+    assert.equal(confidence.confidence_score, null);
+    assert.equal(confidence.confidence_band, "unknown");
+    assert.equal(confidence.confidence_sample_count, 2);
+  });
+
+  it("scores lower-is-better and higher-is-better improvements", () => {
+    const lower = calculateAutoresearchConfidence([
+      confidenceRun(1, "baseline", 10),
+      confidenceRun(2, "discard", 11),
+      confidenceRun(3, "keep", 8),
+    ], "lower");
+    assert.equal(lower.confidence_score, 2);
+    assert.equal(lower.confidence_band, "high");
+
+    const higher = calculateAutoresearchConfidence([
+      confidenceRun(1, "baseline", 0.7, "higher"),
+      confidenceRun(2, "discard", 0.6, "higher"),
+      confidenceRun(3, "keep", 0.8, "higher"),
+    ], "higher");
+    assert.ok(Math.abs((higher.confidence_score ?? 0) - 1) < 1e-12);
+    assert.equal(higher.confidence_band, "medium");
+  });
+
+  it("treats the first numeric experiment as baseline for pi-style logs", () => {
+    const confidence = calculateAutoresearchConfidence([
+      confidenceRun(1, "keep", 10),
+      confidenceRun(2, "discard", 11),
+      confidenceRun(3, "keep", 8),
+    ]);
+
+    assert.equal(confidence.confidence_score, 2);
+    assert.equal(confidence.confidence_band, "high");
+  });
+
+  it("produces low, medium, and high bands from noisy metrics", () => {
+    const low = calculateAutoresearchConfidence([
+      confidenceRun(1, "baseline", 10),
+      confidenceRun(2, "discard", 12),
+      confidenceRun(3, "discard", 13),
+      confidenceRun(4, "keep", 9.5),
+    ]);
+    assert.equal(low.confidence_band, "low");
+
+    const medium = calculateAutoresearchConfidence([
+      confidenceRun(1, "baseline", 10),
+      confidenceRun(2, "discard", 12),
+      confidenceRun(3, "discard", 13),
+      confidenceRun(4, "keep", 8.5),
+    ]);
+    assert.equal(medium.confidence_band, "medium");
+
+    const high = calculateAutoresearchConfidence([
+      confidenceRun(1, "baseline", 10),
+      confidenceRun(2, "discard", 12),
+      confidenceRun(3, "discard", 13),
+      confidenceRun(4, "keep", 7),
+    ]);
+    assert.equal(high.confidence_band, "high");
+  });
+
+  it("uses positive numeric metrics and ignores null or zero crash metrics", () => {
+    const confidence = calculateAutoresearchConfidence([
+      confidenceRun(1, "baseline", 10),
+      confidenceRun(2, "crash", 0),
+      confidenceRun(3, "checks_failed", 11),
+      confidenceRun(4, "discard", null),
+      confidenceRun(5, "discard", 12),
+      confidenceRun(6, "keep", 8.5),
+    ]);
+
+    assert.equal(confidence.confidence_sample_count, 4);
+    assert.equal(confidence.confidence_band, "medium");
+  });
+
+  it("handles zero MAD with zero and nonzero improvements", () => {
+    const unchanged = calculateAutoresearchConfidence([
+      confidenceRun(1, "baseline", 10),
+      confidenceRun(2, "discard", 10),
+      confidenceRun(3, "keep", 10),
+    ]);
+    assert.equal(unchanged.confidence_score, null);
+    assert.equal(unchanged.confidence_band, "unknown");
+    assert.equal(unchanged.noise_floor_mad, null);
+
+    const improved = calculateAutoresearchConfidence([
+      confidenceRun(1, "baseline", 10),
+      confidenceRun(2, "discard", 10),
+      confidenceRun(3, "keep", 9),
+      confidenceRun(4, "discard", 10),
+      confidenceRun(5, "discard", 10),
+    ]);
+    assert.equal(improved.confidence_score, null);
+    assert.equal(improved.confidence_band, "unknown");
+    assert.equal(improved.noise_floor_mad, 0);
+  });
+});
 
 describe("autoresearch state model", () => {
   it("initializes durable session files", () => {
@@ -110,6 +240,69 @@ describe("autoresearch state model", () => {
     const entries = readAutoresearchLog(cwd);
     assert.equal(entries.filter((entry) => entry.type === "run").length, 2);
     assert.equal(entries.filter((entry) => entry.type === "run_result").length, 2);
+  });
+
+  it("persists confidence fields on logged experiments", async () => {
+    const cwd = makeTempDir();
+    initExperiment({
+      cwd,
+      goal: "reduce validation loss",
+      metricName: "loss",
+      direction: "lower",
+      command: nodeMetricCommand("loss", 10),
+    });
+
+    await logExperiment({ cwd, status: "baseline", metric: 10, description: "baseline" });
+    await logExperiment({ cwd, status: "discard", metric: 11, description: "noisy regression" });
+    const third = await logExperiment({ cwd, status: "keep", metric: 8, description: "improvement" });
+
+    assert.equal(third.confidence_band, "high");
+    assert.equal(third.confidence_score, 2);
+    assert.equal(third.noise_floor_mad, 1);
+    assert.equal(third.confidence_sample_count, 3);
+
+    const loggedRuns = readAutoresearchLog(cwd).filter((entry): entry is Awaited<ReturnType<typeof logExperiment>> => entry.type === "run");
+    assert.equal(loggedRuns.at(-1)?.confidence_band, "high");
+    assert.equal(loggedRuns.at(-1)?.confidence_score, 2);
+  });
+
+  it("summarizes confidence from old logs without stored confidence fields", () => {
+    const cwd = makeTempDir();
+    initExperiment({
+      cwd,
+      goal: "reduce validation loss",
+      metricName: "loss",
+      direction: "lower",
+      command: nodeMetricCommand("loss", 10),
+    });
+
+    const logPath = path.join(cwd, "autoresearch.jsonl");
+    const session = fs.readFileSync(logPath, "utf-8").trim();
+    fs.writeFileSync(logPath, [
+      session,
+      JSON.stringify({
+        type: "run", run: 1, created_at: "2026-01-01T00:00:00.000Z",
+        status: "baseline", metric: 10, metric_name: "loss", direction: "lower",
+        description: "baseline", baseline_metric: 10, best_metric: 10, improvement_ratio: null,
+      }),
+      JSON.stringify({
+        type: "run", run: 2, created_at: "2026-01-01T00:01:00.000Z",
+        status: "discard", metric: 11, metric_name: "loss", direction: "lower",
+        description: "noise", baseline_metric: 10, best_metric: 10, improvement_ratio: null,
+      }),
+      JSON.stringify({
+        type: "run", run: 3, created_at: "2026-01-01T00:02:00.000Z",
+        status: "keep", metric: 8, metric_name: "loss", direction: "lower",
+        description: "better", baseline_metric: 10, best_metric: 8, improvement_ratio: null,
+      }),
+    ].join("\n") + "\n");
+
+    const summary = summarizeAutoresearch(cwd);
+    assert.equal(summary.confidence_band, "high");
+    assert.equal(summary.confidence_score, 2);
+    assert.equal(summary.noise_floor_mad, 1);
+    assert.equal(summary.confidence_sample_count, 3);
+    assert.match(summary.nextPrompt, /Confidence: high/);
   });
 
   it("classifies improvements according to direction", () => {

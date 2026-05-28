@@ -325,13 +325,7 @@ function readLogFromFiles(cwd: string): AutoresearchLogRunEntry[] {
 
 export function upsertAutoresearchSession(cwd: string): AutoresearchSessionRow | null {
   const db = getDb();
-  let resolvedCwd: string;
-  try {
-    resolvedCwd = fs.realpathSync(cwd);
-  } catch {
-    // cwd doesn't exist, use the raw path
-    resolvedCwd = path.resolve(cwd);
-  }
+  const resolvedCwd = resolveSessionCwd(cwd);
   const id = resolvedCwd;
 
   const { config, missing } = readSessionConfigFromFiles(resolvedCwd);
@@ -411,6 +405,28 @@ export function upsertAutoresearchSession(cwd: string): AutoresearchSessionRow |
     best_run: bestRun,
     files_missing: filesMissing,
   };
+}
+
+function resolveSessionCwd(cwd: string): string {
+  const absolute = path.resolve(cwd);
+  try {
+    return fs.realpathSync(absolute);
+  } catch {
+    let current = absolute;
+    const missingParts: string[] = [];
+    while (true) {
+      const parent = path.dirname(current);
+      if (parent === current) return absolute;
+      missingParts.unshift(path.basename(current));
+      current = parent;
+      try {
+        const realParent = fs.realpathSync(current);
+        return path.join(realParent, ...missingParts);
+      } catch {
+        // Continue walking up until an existing parent can be canonicalized.
+      }
+    }
+  }
 }
 
 export function getAutoresearchSessions(opts?: { includeMissing?: boolean }): AutoresearchSessionRow[] {

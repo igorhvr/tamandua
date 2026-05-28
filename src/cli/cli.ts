@@ -54,6 +54,7 @@ import {
   type AutoresearchDecision,
   type AutoresearchDirection,
   type AutoresearchRunEntry,
+  type AutoresearchSummary,
   type RunLoopIterationOptions,
   type RunLoopIterationResult,
 } from "../autoresearch/autoresearch.js";
@@ -202,6 +203,15 @@ function parseAutoresearchDecision(value: string | undefined): AutoresearchDecis
   process.exit(1);
 }
 
+function formatAutoresearchConfidence(value: Pick<AutoresearchSummary, "confidence_score" | "confidence_band" | "noise_floor_mad" | "confidence_sample_count">): string {
+  if (value.confidence_score === null) {
+    return `unknown (${value.confidence_sample_count} sample${value.confidence_sample_count === 1 ? "" : "s"})`;
+  }
+  const score = value.confidence_score === Infinity ? "Infinity" : value.confidence_score.toFixed(2);
+  const mad = value.noise_floor_mad === null ? "unknown" : String(value.noise_floor_mad);
+  return `${value.confidence_band} (score=${score}, MAD=${mad}, n=${value.confidence_sample_count})`;
+}
+
 function printAutoresearchSummary(cwd?: string): void {
   const summary = summarizeAutoresearch(cwd);
   if (!summary.exists) {
@@ -216,6 +226,7 @@ function printAutoresearchSummary(cwd?: string): void {
   console.log(`Failures:    ${summary.crashedRuns} crash, ${summary.checksFailedRuns} checks_failed`);
   console.log(`Baseline:    ${summary.baselineMetric ?? "(none)"}`);
   console.log(`Best:        ${summary.bestMetric ?? "(none)"}${summary.bestRun ? ` at run ${summary.bestRun}` : ""}`);
+  console.log(`Confidence:  ${formatAutoresearchConfidence(summary)}`);
   console.log("");
   console.log(summary.nextPrompt);
 }
@@ -258,9 +269,10 @@ function printAutoresearchTimeline(cwd: string): void {
   console.log("Timeline:");
   for (const run of runs.slice(-12)) {
     const metric = run.metric === null ? "-" : String(run.metric);
+    const confidence = run.confidence_score === null || run.confidence_score === undefined ? "" : ` confidence=${run.confidence_band}`;
     const learned = run.asi?.learned ? ` — ${run.asi.learned}` : "";
     const next = run.asi?.next_focus ? ` | next: ${run.asi.next_focus}` : "";
-    console.log(`  #${String(run.run).padStart(2, "0")} [${run.status.padEnd(13)}] ${metric.padEnd(8)} ${run.description}${learned}${next}`);
+    console.log(`  #${String(run.run).padStart(2, "0")} [${run.status.padEnd(13)}] ${metric.padEnd(8)} ${run.description}${confidence}${learned}${next}`);
   }
 }
 
@@ -2230,6 +2242,7 @@ async function main() {
       });
       console.log(`Logged run ${entry.run}: ${entry.status}${entry.metric === null ? "" : ` (${entry.metric})`}.`);
       console.log(`Best: ${entry.best_metric ?? "(none)"}`);
+      console.log(`Confidence: ${formatAutoresearchConfidence(entry)}`);
       upsertAutoresearchSession(cwd ?? process.cwd());
       return;
     }

@@ -1177,6 +1177,44 @@ describe("--help infrastructure", () => {
     }
   });
 
+  it("tamandua autoresearch status and log-experiment show confidence", () => {
+    const testEnv = makeTestEnv();
+    try {
+      const initResult = cli(["autoresearch", "init",
+        "--goal", "test confidence",
+        "--metric", "loss",
+        "--direction", "lower",
+        "--command", "echo METRIC loss=10",
+        "--cwd", testEnv.tmpDir,
+      ]);
+      try {
+        assert.equal(initResult.status, 0);
+        cli(["autoresearch", "log-experiment", "--cwd", testEnv.tmpDir, "--status", "baseline", "--metric", "10", "--description", "baseline"]);
+        cli(["autoresearch", "log-experiment", "--cwd", testEnv.tmpDir, "--status", "discard", "--metric", "11", "--description", "noise"]);
+        const logResult = cli(["autoresearch", "log-experiment", "--cwd", testEnv.tmpDir, "--status", "keep", "--metric", "8", "--description", "better"]);
+        try {
+          assert.equal(logResult.status, 0);
+          assert.match(logResult.stdout ?? "", /Confidence: high \(score=2\.00, MAD=1, n=3\)/);
+
+          const statusResult = cli(["autoresearch", "status", "--cwd", testEnv.tmpDir]);
+          try {
+            assert.equal(statusResult.status, 0);
+            assert.match(statusResult.stdout ?? "", /Confidence:\s+high \(score=2\.00, MAD=1, n=3\)/);
+            assert.match(statusResult.stdout ?? "", /Confidence: high\. The current best is likely above the measured noise floor\./);
+          } finally {
+            fs.rmSync(statusResult.testEnv.tmpDir, { recursive: true, force: true });
+          }
+        } finally {
+          fs.rmSync(logResult.testEnv.tmpDir, { recursive: true, force: true });
+        }
+      } finally {
+        fs.rmSync(initResult.testEnv.tmpDir, { recursive: true, force: true });
+      }
+    } finally {
+      fs.rmSync(testEnv.tmpDir, { recursive: true, force: true });
+    }
+  });
+
   it("tamandua autoresearch loop preserves jsonl after completion", () => {
     const testEnv = makeTestEnv();
     try {
@@ -2825,7 +2863,7 @@ describe("autoresearch prune CLI", () => {
         try {
           const rows = db.prepare("SELECT * FROM autoresearch_sessions").all() as Array<Record<string, unknown>>;
           assert.equal(rows.length, 1, "only one session should remain in DB");
-          assert.equal(rows[0].cwd, presentCwd, "present session should remain");
+          assert.equal(rows[0].cwd, fs.realpathSync(presentCwd), "present session should remain");
         } finally {
           db.close();
         }

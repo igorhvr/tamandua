@@ -30,6 +30,7 @@ import { readVersionStatus } from "../lib/version-check.js";
 import { getBuildVersion } from "../lib/version.js";
 import {
   findAutoresearchSessionCwd,
+  calculateAutoresearchConfidence,
   readAutoresearchLog,
   summarizeAutoresearch,
   type AutoresearchLogEntry,
@@ -110,10 +111,21 @@ function buildAutoresearchExperiments(entries: AutoresearchLogEntry[]) {
     if (entry.type === "run_result") results.set(entry.run, entry);
   }
 
+  const cumulativeEntries: AutoresearchLogEntry[] = entries.filter((entry) => entry.type === "session");
   return entries
     .filter((entry): entry is AutoresearchRunEntry => entry.type === "run")
     .map((entry) => {
       const result = results.get(entry.run);
+      cumulativeEntries.push(entry);
+      const hasStoredConfidence = Object.prototype.hasOwnProperty.call(entry, "confidence_band");
+      const confidence = !hasStoredConfidence
+        ? calculateAutoresearchConfidence(cumulativeEntries, entry.direction)
+        : {
+            confidence_score: entry.confidence_score,
+            confidence_band: entry.confidence_band,
+            noise_floor_mad: entry.noise_floor_mad,
+            confidence_sample_count: entry.confidence_sample_count,
+          };
       return {
         run: entry.run,
         created_at: entry.created_at,
@@ -121,6 +133,10 @@ function buildAutoresearchExperiments(entries: AutoresearchLogEntry[]) {
         metric: entry.metric,
         best_metric: entry.best_metric,
         improvement_ratio: entry.improvement_ratio,
+        confidence_score: confidence.confidence_score,
+        confidence_band: confidence.confidence_band,
+        noise_floor_mad: confidence.noise_floor_mad,
+        confidence_sample_count: confidence.confidence_sample_count,
         duration_ms: entry.duration_ms ?? result?.duration_ms,
         description: entry.description,
         hypothesis: entry.asi?.hypothesis,

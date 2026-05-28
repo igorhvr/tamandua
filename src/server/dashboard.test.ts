@@ -3017,7 +3017,7 @@ describe("dashboard AutoResearch session API", () => {
         assert.equal(body.sessions.length, 1);
 
         const session = body.sessions[0];
-        assert.equal(session.cwd, projectDir);
+        assert.equal(session.cwd, fs.realpathSync(projectDir));
         assert.equal(session.goal, "Optimize latency");
         assert.equal(session.metric_name, "p95_ms");
         assert.equal(session.best_metric, 38.0);
@@ -3069,6 +3069,13 @@ describe("dashboard AutoResearch session API", () => {
           }),
           JSON.stringify({
             type: "run", run: 2, created_at: "2026-05-26T10:05:00.000Z",
+            status: "discard", metric: 520.0, metric_name: "bundle_kb", direction: "lower",
+            description: "inline assets", baseline_metric: 512.0, best_metric: 512.0, improvement_ratio: 0.9846,
+            duration_ms: 2800,
+            asi: { hypothesis: "inline assets", learned: "bundle got larger", next_focus: "tree shake" },
+          }),
+          JSON.stringify({
+            type: "run", run: 3, created_at: "2026-05-26T10:10:00.000Z",
             status: "keep", metric: 480.0, metric_name: "bundle_kb", direction: "lower",
             description: "tree shake", baseline_metric: 512.0, best_metric: 480.0, improvement_ratio: 0.0625,
             duration_ms: 3200, commit_before: "abc1234", commit_after: "def5678",
@@ -3092,22 +3099,26 @@ describe("dashboard AutoResearch session API", () => {
         const body = await response.json() as {
           session: { id: string; cwd: string; goal: string; best_metric: number; total_runs: number };
           exists: boolean;
-          summary: { bestMetric: number; bestRun: number; totalRuns: number };
-          experiments: Array<{ run: number; status: string; metric: number; description: string; hypothesis: string; learned: string; next_focus: string }>;
+          summary: { bestMetric: number; bestRun: number; totalRuns: number; confidence_band: string; confidence_score: number; noise_floor_mad: number; confidence_sample_count: number };
+          experiments: Array<{ run: number; status: string; metric: number; description: string; hypothesis: string; learned: string; next_focus: string; confidence_band: string; confidence_score: number | null }>;
         };
 
         assert.equal(body.exists, true);
-        assert.equal(body.session.cwd, projectDir);
+        assert.equal(body.session.cwd, fs.realpathSync(projectDir));
         assert.equal(body.session.goal, "Reduce bundle size");
         assert.equal(body.session.best_metric, 480.0);
-        assert.equal(body.session.total_runs, 2);
+        assert.equal(body.session.total_runs, 3);
 
         assert.ok(body.summary);
         assert.equal(body.summary.bestMetric, 480.0);
-        assert.equal(body.summary.bestRun, 2);
-        assert.equal(body.summary.totalRuns, 2);
+        assert.equal(body.summary.bestRun, 3);
+        assert.equal(body.summary.totalRuns, 3);
+        assert.equal(body.summary.confidence_band, "high");
+        assert.equal(body.summary.confidence_score, 4);
+        assert.equal(body.summary.noise_floor_mad, 8);
+        assert.equal(body.summary.confidence_sample_count, 3);
 
-        assert.equal(body.experiments.length, 2);
+        assert.equal(body.experiments.length, 3);
         assert.equal(body.experiments[0].run, 1);
         assert.equal(body.experiments[0].status, "baseline");
         assert.equal(body.experiments[0].metric, 512.0);
@@ -3116,10 +3127,15 @@ describe("dashboard AutoResearch session API", () => {
         assert.equal(body.experiments[0].next_focus, "tree shake");
 
         assert.equal(body.experiments[1].run, 2);
-        assert.equal(body.experiments[1].status, "keep");
-        assert.equal(body.experiments[1].hypothesis, "enable tree shaking");
-        assert.equal(body.experiments[1].learned, "tree shaking saves 32kb");
-        assert.equal(body.experiments[1].next_focus, "minify css");
+        assert.equal(body.experiments[1].status, "discard");
+
+        assert.equal(body.experiments[2].run, 3);
+        assert.equal(body.experiments[2].status, "keep");
+        assert.equal(body.experiments[2].hypothesis, "enable tree shaking");
+        assert.equal(body.experiments[2].confidence_band, "high");
+        assert.equal(body.experiments[2].confidence_score, 4);
+        assert.equal(body.experiments[2].learned, "tree shaking saves 32kb");
+        assert.equal(body.experiments[2].next_focus, "minify css");
       } finally {
         await stopDashboard(server);
       }
@@ -3216,7 +3232,7 @@ describe("dashboard AutoResearch session API", () => {
       // Verify session was created
       const sessionsAfter = getAutoresearchSessions();
       assert.equal(sessionsAfter.length, 1);
-      assert.equal(sessionsAfter[0].cwd, projectDir);
+      assert.equal(sessionsAfter[0].cwd, fs.realpathSync(projectDir));
       assert.equal(sessionsAfter[0].goal, "Backfill test");
       assert.equal(sessionsAfter[0].metric_name, "coverage");
       assert.equal(sessionsAfter[0].baseline_metric, 0.55);
@@ -3433,8 +3449,8 @@ describe("dashboard AutoResearch session API", () => {
         const body = await response.json() as { sessions: Array<{ cwd: string }> };
         assert.equal(body.sessions.length, 2);
         // Most recently updated first
-        assert.equal(body.sessions[0].cwd, projectDir2);
-        assert.equal(body.sessions[1].cwd, projectDir1);
+        assert.equal(body.sessions[0].cwd, fs.realpathSync(projectDir2));
+        assert.equal(body.sessions[1].cwd, fs.realpathSync(projectDir1));
       } finally {
         await stopDashboard(server);
       }

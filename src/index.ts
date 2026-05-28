@@ -64,6 +64,7 @@ export {
   readSessionConfig,
   parseMetric,
   decideStatus,
+  calculateAutoresearchConfidence,
   commitAutoresearchResult,
   runLoopIteration,
 } from "./autoresearch/autoresearch.js";
@@ -105,6 +106,8 @@ export type { CronJobInfo, CreateCronJobParams } from "./installer/agent-schedul
 export type { TamanduaMcpServer, TamanduaMcpServerOptions, TamanduaMcpToolServices } from "./server/mcp-server.js";
 export type {
   AutoresearchDecision,
+  AutoresearchConfidence,
+  AutoresearchConfidenceBand,
   AutoresearchDirection,
   AutoresearchLogEntry,
   AutoresearchRunEntry,

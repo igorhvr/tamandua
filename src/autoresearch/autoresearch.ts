@@ -6,6 +6,7 @@ import { parsePiOutputStream } from "../installer/pi-stream-parser.js";
 export type AutoresearchDirection = "lower" | "higher";
 export type AutoresearchDecision = "baseline" | "keep" | "discard" | "crash" | "checks_failed";
 export type AutoresearchRunStatus = "measured" | "crash" | "checks_failed";
+export type AutoresearchConfidenceBand = "high" | "medium" | "low" | "unknown";
 
 export type AutoresearchSessionConfig = {
   goal: string;
@@ -45,6 +46,10 @@ export type AutoresearchRunEntry = {
   baseline_metric: number | null;
   best_metric: number | null;
   improvement_ratio: number | null;
+  confidence_score: number | null;
+  confidence_band: AutoresearchConfidenceBand;
+  noise_floor_mad: number | null;
+  confidence_sample_count: number;
   output_tail?: string;
   error_tail?: string;
   asi?: {
@@ -108,6 +113,10 @@ export type AutoresearchSummary = {
   baselineMetric: number | null;
   bestMetric: number | null;
   bestRun: number | null;
+  confidence_score: number | null;
+  confidence_band: AutoresearchConfidenceBand;
+  noise_floor_mad: number | null;
+  confidence_sample_count: number;
   lastRun?: AutoresearchRunEntry | AutoresearchRunResultEntry;
   nextPrompt: string;
 };
@@ -481,6 +490,10 @@ export async function logExperiment(options: LogExperimentOptions): Promise<Auto
     baseline_metric: baselineMetric,
     best_metric: nextBestMetric,
     improvement_ratio: calculateImprovementRatio(baselineMetric, metric, config.direction),
+    confidence_score: null,
+    confidence_band: "unknown",
+    noise_floor_mad: null,
+    confidence_sample_count: 0,
     output_tail: latestResult?.output_tail,
     error_tail: latestResult?.error_tail,
     asi: {
@@ -489,6 +502,11 @@ export async function logExperiment(options: LogExperimentOptions): Promise<Auto
       next_focus: options.nextFocus,
     },
   };
+  const confidence = calculateAutoresearchConfidence([...entries, entry], config.direction);
+  entry.confidence_score = confidence.confidence_score;
+  entry.confidence_band = confidence.confidence_band;
+  entry.noise_floor_mad = confidence.noise_floor_mad;
+  entry.confidence_sample_count = confidence.confidence_sample_count;
   appendLogEntry(paths, entry);
   await runHook(paths, "after", buildHookPayload("after", cwd, [...entries, entry], entry));
   await runHook(paths, "before", buildHookPayload("before", cwd, [...entries, entry], undefined));
@@ -509,6 +527,10 @@ export function summarizeAutoresearch(cwd = process.cwd()): AutoresearchSummary 
       baselineMetric: null,
       bestMetric: null,
       bestRun: null,
+      confidence_score: null,
+      confidence_band: "unknown",
+      noise_floor_mad: null,
+      confidence_sample_count: 0,
       nextPrompt: "No AutoResearch session found. Run `tamandua autoresearch init` first.",
     };
   }
@@ -520,6 +542,7 @@ export function summarizeAutoresearch(cwd = process.cwd()): AutoresearchSummary 
   const baselineMetric = findBaselineMetric(runs);
   const best = findBestRun(runs, config.direction);
   const lastRun = [...entries].reverse().find((entry): entry is AutoresearchRunEntry | AutoresearchRunResultEntry => entry.type === "run" || entry.type === "run_result");
+  const confidence = calculateAutoresearchConfidence(entries, config.direction);
 
   return {
     exists: true,
@@ -537,8 +560,12 @@ export function summarizeAutoresearch(cwd = process.cwd()): AutoresearchSummary 
     baselineMetric,
     bestMetric: best?.metric ?? null,
     bestRun: best?.run ?? null,
+    confidence_score: confidence.confidence_score,
+    confidence_band: confidence.confidence_band,
+    noise_floor_mad: confidence.noise_floor_mad,
+    confidence_sample_count: confidence.confidence_sample_count,
     lastRun,
-    nextPrompt: buildNextPrompt(config, runs, best),
+    nextPrompt: buildNextPrompt(config, runs, best, confidence),
   };
 }
 
@@ -573,6 +600,56 @@ export function decideStatus(
   const bestMetric = findBestMetric(priorRuns, direction);
   if (bestMetric === null) return "keep";
   return isImprovement(metric, bestMetric, direction) ? "keep" : "discard";
+}
+
+export type AutoresearchConfidence = Pick<
+  AutoresearchRunEntry,
+  "confidence_score" | "confidence_band" | "noise_floor_mad" | "confidence_sample_count"
+>;
+
+export function calculateAutoresearchConfidence(
+  entries: AutoresearchLogEntry[],
+  direction?: AutoresearchDirection,
+): AutoresearchConfidence {
+  const configEntry = entries.find((entry): entry is AutoresearchSessionEntry => entry.type === "session");
+  const resolvedDirection = direction ?? configEntry?.direction ?? "lower";
+  const runs = entries.filter((entry): entry is AutoresearchRunEntry => entry.type === "run");
+  const numericRuns = runs.filter((entry) =>
+    typeof entry.metric === "number" &&
+    Number.isFinite(entry.metric) &&
+    entry.metric > 0,
+  );
+  const sampleCount = numericRuns.length;
+  if (sampleCount < 3) return unknownConfidence(sampleCount);
+
+  const baseline = numericRuns[0];
+  if (!baseline || baseline.metric === null) return unknownConfidence(sampleCount);
+
+  const kept = numericRuns.filter((entry) => entry.status === "keep");
+  const best = kept.reduce<AutoresearchRunEntry | undefined>((currentBest, entry) => {
+    if (!currentBest || isImprovement(entry.metric as number, currentBest.metric as number, resolvedDirection)) return entry;
+    return currentBest;
+  }, undefined);
+  if (!best || best.metric === null || best.metric === baseline.metric) return unknownConfidence(sampleCount);
+
+  const values = numericRuns.map((entry) => entry.metric as number);
+  const valueMedian = median(values);
+  const mad = median(values.map((value) => Math.abs(value - valueMedian)));
+  const improvement = Math.abs(
+    resolvedDirection === "lower"
+      ? (baseline.metric as number) - (best.metric as number)
+      : (best.metric as number) - (baseline.metric as number),
+  );
+
+  if (mad === 0) return unknownConfidence(sampleCount, 0);
+
+  const score = improvement / mad;
+  return {
+    confidence_score: score,
+    confidence_band: confidenceBand(score),
+    noise_floor_mad: mad,
+    confidence_sample_count: sampleCount,
+  };
 }
 
 function appendLogEntry(paths: AutoresearchPaths, entry: AutoresearchLogEntry): void {
@@ -681,7 +758,7 @@ export function commitAutoresearchResult(cwd: string, run: number, description: 
   const message = `autoresearch: keep run ${run}\n\n${description}`;
   const commit = spawnSync("git", ["commit", "-m", message], { cwd, encoding: "utf-8" });
   if (commit.status !== 0) {
-    const err = commit.stderr || commit.stdout;
+    const err = `${commit.stderr ?? ""}${commit.stdout ?? ""}`;
     // No non-autoresearch changes to commit — this is not an error
     if (err.includes("nothing to commit") || err.includes("nothing added to commit")) return undefined;
     throw new Error(`git commit failed: ${err}`);
@@ -717,18 +794,55 @@ function revertExperimentChanges(cwd: string): void {
   }
 }
 
-function buildNextPrompt(config: AutoresearchSessionConfig, runs: AutoresearchRunEntry[], best: AutoresearchRunEntry | undefined): string {
+function buildNextPrompt(
+  config: AutoresearchSessionConfig,
+  runs: AutoresearchRunEntry[],
+  best: AutoresearchRunEntry | undefined,
+  confidence: AutoresearchConfidence = calculateAutoresearchConfidence(runs, config.direction),
+): string {
   const last = runs.at(-1);
   const learned = last?.asi?.learned || last?.description || "No completed experiments yet.";
   const nextFocus = last?.asi?.next_focus || "Choose the smallest experiment that can improve the target metric.";
   const bestText = best ? `Best run ${best.run}: ${best.metric} ${config.metricUnit ?? ""} (${best.description})` : "No accepted best run yet.";
-  return [
+  const lines = [
     `Goal: ${config.goal}`,
     bestText,
     `Last learning: ${learned}`,
     `Next focus: ${nextFocus}`,
-    "Before editing, state one hypothesis. After measuring, log what changed, what was learned, and the next focus.",
-  ].join("\n");
+  ];
+  if (confidence.confidence_score !== null) {
+    if (confidence.confidence_band === "low") {
+      lines.push("Confidence: low. Rerun or confirm the current best change before stacking more changes.");
+    } else if (confidence.confidence_band === "medium") {
+      lines.push("Confidence: medium. Validate the current best or narrow benchmark noise before making a larger change.");
+    } else if (confidence.confidence_band === "high") {
+      lines.push("Confidence: high. The current best is likely above the measured noise floor.");
+    }
+  }
+  lines.push("Before editing, state one hypothesis. After measuring, log what changed, what was learned, and the next focus.");
+  return lines.join("\n");
+}
+
+function median(values: number[]): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+function unknownConfidence(sampleCount: number, noiseFloorMad: number | null = null): AutoresearchConfidence {
+  return {
+    confidence_score: null,
+    confidence_band: "unknown",
+    noise_floor_mad: noiseFloorMad,
+    confidence_sample_count: sampleCount,
+  };
+}
+
+function confidenceBand(score: number): AutoresearchConfidenceBand {
+  if (score >= 2) return "high";
+  if (score >= 1) return "medium";
+  return "low";
 }
 
 function buildHookPayload(
@@ -740,6 +854,7 @@ function buildHookPayload(
   const config = entries.find((entry): entry is AutoresearchSessionEntry => entry.type === "session");
   const runs = entries.filter((entry): entry is AutoresearchRunEntry => entry.type === "run");
   const best = config ? findBestRun(runs, config.direction) : undefined;
+  const confidence = calculateAutoresearchConfidence(entries, config?.direction);
   return {
     event,
     cwd,
@@ -753,6 +868,10 @@ function buildHookPayload(
           direction: config.direction,
           baseline_metric: findBaselineMetric(runs),
           best_metric: best?.metric ?? null,
+          confidence_score: confidence.confidence_score,
+          confidence_band: confidence.confidence_band,
+          noise_floor_mad: confidence.noise_floor_mad,
+          confidence_sample_count: confidence.confidence_sample_count,
           run_count: runs.length,
           goal: config.goal,
         }
@@ -1095,7 +1214,7 @@ export async function loopAutoresearch(options: LoopAutoresearchOptions = {}): P
       const loopBestStr = bestMetric !== null ? String(bestMetric) : "-";
       const allTimeStr = allTimeBestMetric !== null ? `${allTimeBestMetric}${allTimeBestRun ? ` (run ${allTimeBestRun})` : ""}` : "-";
       const transactionLabel = iterationResult.committed ? "committed" : (iterationResult.reverted ? "reverted" : "unchanged");
-      process.stdout.write(`${modeLabel} [${iterations}/${maxIterations}] ${config.metricName}=${metricStr} decision=${logEntry.status} best=${loopBestStr} (loop) | ${allTimeStr} (all-time) failures=${consecutiveFailures} ${transactionLabel}\n`);
+      process.stdout.write(`${modeLabel} [${iterations}/${maxIterations}] ${config.metricName}=${metricStr} decision=${logEntry.status} best=${loopBestStr} (loop) | ${allTimeStr} (all-time) confidence=${formatConfidenceLabel(logEntry)} failures=${consecutiveFailures} ${transactionLabel}\n`);
 
       if (options.targetMetric !== undefined && iterationResult.metric !== null) {
         const targetReached = config.direction === "lower"
@@ -1121,6 +1240,7 @@ export async function loopAutoresearch(options: LoopAutoresearchOptions = {}): P
     process.stdout.write(`Iterations: ${iterations}\n`);
     process.stdout.write(`Best (this loop): ${bestMetric !== null ? `${config.metricName}=${bestMetric}` : "(none)"}${bestRun ? ` (run ${bestRun})` : ""}\n`);
     process.stdout.write(`Best (all-time): ${allTimeBestMetric !== null ? `${config.metricName}=${allTimeBestMetric}` : "(none)"}${allTimeBestRun ? ` (run ${allTimeBestRun})` : ""}\n`);
+    process.stdout.write(`Confidence: ${formatConfidenceLabel(summarizeAutoresearch(cwd))}\n`);
     process.stdout.write(`Kept: ${kept}  Discarded: ${discarded}  Crashed: ${crashed}  Checks failed: ${checksFailed}\n`);
 
     return {
@@ -1143,4 +1263,10 @@ export async function loopAutoresearch(options: LoopAutoresearchOptions = {}): P
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function formatConfidenceLabel(confidence: AutoresearchConfidence): string {
+  if (confidence.confidence_score === null) return "unknown";
+  const score = confidence.confidence_score === Infinity ? "Infinity" : confidence.confidence_score.toFixed(2);
+  return `${confidence.confidence_band}(${score})`;
 }
