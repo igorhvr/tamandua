@@ -23,7 +23,65 @@ function initDb(dbPath: string, runs: Array<{ id: string; status: string; workfl
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now')),
       run_number INTEGER NOT NULL DEFAULT 0,
-      tokens_spent INTEGER NOT NULL DEFAULT 0
+      tokens_spent INTEGER NOT NULL DEFAULT 0,
+      scheduling_status TEXT
+    )
+  `);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS steps (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      step_id TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      step_index INTEGER NOT NULL DEFAULT 0,
+      input_template TEXT NOT NULL DEFAULT '',
+      expects TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'waiting',
+      output TEXT,
+      retry_count INTEGER DEFAULT 0,
+      max_retries INTEGER DEFAULT 4,
+      type TEXT NOT NULL DEFAULT 'single',
+      loop_config TEXT,
+      current_story_id TEXT,
+      abandoned_count INTEGER DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS stories (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      story_index INTEGER NOT NULL,
+      story_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      acceptance_criteria TEXT NOT NULL DEFAULT '[]',
+      status TEXT NOT NULL DEFAULT 'pending',
+      output TEXT,
+      retry_count INTEGER DEFAULT 0,
+      max_retries INTEGER DEFAULT 4,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS run_worktrees (
+      run_id TEXT PRIMARY KEY,
+      worktree_origin_repository TEXT NOT NULL,
+      worktree_origin_git_common_dir TEXT NOT NULL,
+      worktree_path TEXT NOT NULL,
+      worktree_origin_ref TEXT,
+      worktree_origin_sha TEXT,
+      original_branch TEXT,
+      status TEXT NOT NULL DEFAULT 'creating',
+      cleanup_policy TEXT NOT NULL DEFAULT 'remove_on_success',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      removed_at TEXT,
+      error TEXT
     )
   `);
 
@@ -363,6 +421,56 @@ describe("dashboard pause/resume API", () => {
         method: "POST",
       });
       assert.equal(response.status, 404);
+    } finally {
+      await stopDashboard(server);
+      delete process.env.TAMANDUA_DB_PATH;
+    }
+  });
+
+  it("DELETE /api/runs/:id deletes a terminal run", async () => {
+    process.env.TAMANDUA_DB_PATH = dbPath;
+    initDb(dbPath, [
+      { id: "run-delete-done", workflow_id: "wf-a", task: "test", status: "completed" },
+    ]);
+
+    const { server, baseUrl } = await startDashboardOnPort(0);
+
+    try {
+      const response = await fetch(`${baseUrl}/api/runs/run-delete-done`, {
+        method: "DELETE",
+      });
+      assert.equal(response.status, 200);
+      const body = await response.json() as { ok: boolean; runId: string; status: string };
+      assert.deepEqual(body, { ok: true, runId: "run-delete-done", status: "deleted" });
+
+      const db = new DatabaseSync(dbPath);
+      try {
+        const row = db.prepare("SELECT COUNT(*) AS count FROM runs WHERE id = ?").get("run-delete-done") as { count: number };
+        assert.equal(row.count, 0);
+      } finally {
+        db.close();
+      }
+    } finally {
+      await stopDashboard(server);
+      delete process.env.TAMANDUA_DB_PATH;
+    }
+  });
+
+  it("DELETE /api/runs/:id returns 409 for active runs without force", async () => {
+    process.env.TAMANDUA_DB_PATH = dbPath;
+    initDb(dbPath, [
+      { id: "run-delete-active", workflow_id: "wf-a", task: "test", status: "running" },
+    ]);
+
+    const { server, baseUrl } = await startDashboardOnPort(0);
+
+    try {
+      const response = await fetch(`${baseUrl}/api/runs/run-delete-active`, {
+        method: "DELETE",
+      });
+      assert.equal(response.status, 409);
+      const body = await response.json() as { error: string };
+      assert.match(body.error, /Use --force/);
     } finally {
       await stopDashboard(server);
       delete process.env.TAMANDUA_DB_PATH;

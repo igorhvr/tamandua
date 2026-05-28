@@ -241,6 +241,7 @@ describe("mcp-server bootstrap", () => {
           "tamandua.events.recent",
           "tamandua.run.pause",
           "tamandua.run.resume",
+          "tamandua.run.delete",
           "tamandua.skill.path",
           "tamandua.source.path",
           "tamandua.update.command",
@@ -432,6 +433,37 @@ describe("mcp-server bootstrap", () => {
     }
   });
 
+  it("supports tamandua.run.delete tool", async () => {
+    const deleteCalls: Array<{ runId: string; force: boolean }> = [];
+
+    const server = await startTamanduaMcpServer(0, {
+      services: {
+        listRuns: () => [],
+        getWorkflowStatus: () => ({} as any),
+        runWorkflow: async () => ({ runId: "x", runNumber: 1, workflowId: "x", taskTitle: "x", status: "running", stepCount: 0, workingDirectoryForHarness: "/x" }),
+        getRecentEvents: () => [],
+        getSourcePath: () => "/x",
+        deleteRun: async (runId, force = false) => {
+          deleteCalls.push({ runId, force });
+          return { ok: true, runId, status: "deleted" };
+        },
+        resolveWorkspaceMode: async () => "direct",
+      },
+    });
+
+    try {
+      const sessionId = await initializeSession(server.port);
+
+      const deleteResult = await callTool(server.port, sessionId, 23, "tamandua.run.delete", { runId: "run-abc", force: true });
+      assert.equal(deleteResult.status, 200);
+      assert.equal(deleteResult.body?.error, undefined);
+      assert.deepEqual(deleteResult.body?.result?.structuredContent, { ok: true, runId: "run-abc", status: "deleted" });
+      assert.deepEqual(deleteCalls, [{ runId: "run-abc", force: true }]);
+    } finally {
+      await stopTamanduaMcpServer(server);
+    }
+  });
+
   it("pause run rejects terminal runs with MCP error", async () => {
     const server = await startTamanduaMcpServer(0, {
       services: {
@@ -495,6 +527,12 @@ describe("mcp-server bootstrap", () => {
       assert.equal(missingRunIdResume.body?.result, undefined);
       assert.equal(missingRunIdResume.body?.error?.code, -32602);
       assert.match(missingRunIdResume.body?.error?.message ?? "", /runId/);
+
+      const missingRunIdDelete = await callTool(server.port, sessionId, 42, "tamandua.run.delete", {});
+      assert.equal(missingRunIdDelete.status, 200);
+      assert.equal(missingRunIdDelete.body?.result, undefined);
+      assert.equal(missingRunIdDelete.body?.error?.code, -32602);
+      assert.match(missingRunIdDelete.body?.error?.message ?? "", /runId/);
     } finally {
       await stopTamanduaMcpServer(server);
     }

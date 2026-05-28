@@ -418,6 +418,7 @@ You're installing agent teams that run code on your machine. We take that seriou
 | `tamandua workflow status <query>` | Check run status |
 | `tamandua workflow runs` | List all runs |
 | `tamandua workflow resume <run-id>` | Resume a failed run |
+| `tamandua workflow delete <run-id> [--force]` | Permanently delete a workflow run and associated data |
 | `tamandua workflow list` | List available workflows |
 | `tamandua workflow install <id> [--all]` | Install one or all workflows |
 | `tamandua workflow uninstall <id>` | Remove a single workflow |
@@ -481,7 +482,7 @@ isn't found or isn't executable, the run fails immediately with a clear error.
 
 ### Remote MCP tools
 
-The remote MCP endpoint exposes 13 tools:
+The remote MCP endpoint exposes 14 tools:
 
 #### Run Management
 
@@ -492,6 +493,7 @@ The remote MCP endpoint exposes 13 tools:
 | `tamandua.run.start` | Start a workflow run. Requires `workflowId` and `taskTitle`. |
 | `tamandua.run.pause` | Pause a running workflow run. Requires `runId`. Optional `drain` (boolean) to wait for in-flight work before pausing. |
 | `tamandua.run.resume` | Resume a paused workflow run. Requires `runId`. |
+| `tamandua.run.delete` | Permanently delete a workflow run and associated steps, stories, and worktree metadata. Requires `runId`. Optional `force` (boolean) cancels and deletes running or paused runs. |
 
 #### Events & Metadata
 

@@ -12,6 +12,7 @@
  *   GET /api/runs/:id/autoresearch -> AutoResearch progress for a run's harness cwd
  *   GET /api/runs/:id/kanban     -> lane-grouped snapshot for the kanban view
  *   GET /api/events              -> recent events (global)
+ *   DELETE /api/runs/:id         -> permanently delete a run and all associated data
  *   GET /api/logs-tail           -> logs-tail formatted event lines (cursor based)
  */
 import http from "node:http";
@@ -25,7 +26,7 @@ import { getMcpStatus } from "./daemonctl.js";
 import { buildKanbanSnapshot, buildKanbanCardDetail } from "./kanban-data.js";
 import { pauseRunWithDaemon, resumeRunWithDaemon } from "./control-client.js";
 import { runWorkflow } from "../installer/run.js";
-import { stopWorkflow } from "../installer/status.js";
+import { stopWorkflow, deleteWorkflow, getWorkflowStatus } from "../installer/status.js";
 import { readVersionStatus } from "../lib/version-check.js";
 import { getBuildVersion } from "../lib/version.js";
 import {
@@ -749,6 +750,33 @@ async function handleCancelRun(
   }
 }
 
+async function handleDeleteRun(
+  _req: http.IncomingMessage,
+  res: http.ServerResponse,
+  runId: string,
+): Promise<void> {
+  try {
+    const url = new URL(_req.url ?? "/", "http://localhost");
+    const force = url.searchParams.get("force") === "true";
+
+    // Resolve prefix/id to full run ID
+    let fullRunId: string;
+    try {
+      fullRunId = getWorkflowStatus(runId).id;
+    } catch {
+      errorResponse(res, `Run not found: ${runId}`, 404);
+      return;
+    }
+
+    const result = await deleteWorkflow(fullRunId, { force });
+    jsonResponse(res, result);
+  } catch (err) {
+    const message = (err as Error).message;
+    const status = message.includes("Use --force") ? 409 : 500;
+    errorResponse(res, message, status);
+  }
+}
+
 async function handleRelaunchRun(
   req: http.IncomingMessage,
   res: http.ServerResponse,
@@ -1032,6 +1060,13 @@ function route(req: http.IncomingMessage, res: http.ServerResponse): void {
   const cancelMatch = pathname.match(/^\/api\/runs\/([a-zA-Z0-9_-]+)\/cancel$/);
   if (method === "POST" && cancelMatch) {
     handleCancelRun(req, res, cancelMatch[1]);
+    return;
+  }
+
+  // DELETE /api/runs/:id (registered before POST /api/runs/:id/* to avoid prefix conflict)
+  const deleteMatch = pathname.match(/^\/api\/runs\/([a-zA-Z0-9_-]+)$/);
+  if (method === "DELETE" && deleteMatch) {
+    handleDeleteRun(req, res, deleteMatch[1]);
     return;
   }
 

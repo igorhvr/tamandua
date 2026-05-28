@@ -9,7 +9,7 @@ import {
   McpError,
   isInitializeRequest,
 } from "@modelcontextprotocol/sdk/types.js";
-import { getWorkflowStatus, listRuns, type RunDetail, type RunInfo } from "../installer/status.js";
+import { getWorkflowStatus, listRuns, deleteWorkflow, type RunDetail, type RunInfo } from "../installer/status.js";
 import { runWorkflow, type RunWorkflowResult } from "../installer/run.js";
 import { getRecentEvents, type TamanduaEvent } from "../installer/events.js";
 import { resolveSourcePath, resolveSkillPath, resolveWorkflowDir } from "../installer/paths.js";
@@ -32,6 +32,7 @@ const MCP_TOOL_RUN_STATUS = "tamandua.run.status";
 const MCP_TOOL_RUN_START = "tamandua.run.start";
 const MCP_TOOL_RUN_PAUSE = "tamandua.run.pause";
 const MCP_TOOL_RUN_RESUME = "tamandua.run.resume";
+const MCP_TOOL_RUN_DELETE = "tamandua.run.delete";
 const MCP_TOOL_EVENTS_RECENT = "tamandua.events.recent";
 const MCP_TOOL_SKILL_PATH = "tamandua.skill.path";
 const MCP_TOOL_SOURCE_PATH = "tamandua.source.path";
@@ -62,6 +63,7 @@ export interface TamanduaMcpToolServices {
   getSkillPath: () => string;
   pauseRun: (runId: string, drain?: boolean) => Promise<{ runId: string; status: string }>;
   resumeRun: (runId: string) => Promise<{ runId: string; status: string }>;
+  deleteRun: (runId: string, force?: boolean) => Promise<{ ok: boolean; runId: string; status: string }>;
   resolveWorkspaceMode: (workflowId: string) => Promise<"direct" | "worktree">;
   initAutoresearch: typeof initExperiment;
   runAutoresearchExperiment: typeof runExperiment;
@@ -98,6 +100,9 @@ const defaultToolServices: TamanduaMcpToolServices = {
     if (!r) throw new Error("Daemon control plane unreachable");
     if (r.body.error) throw new Error(String(r.body.error));
     return { runId, status: String(r.body.state ?? r.status) };
+  },
+  async deleteRun(runId, force = false) {
+    return deleteWorkflow(runId, { force });
   },
   async resolveWorkspaceMode(workflowId) {
     const workflowDir = resolveWorkflowDir(workflowId);
@@ -319,6 +324,40 @@ const mcpTools: Array<Record<string, unknown>> = [
       properties: {
         runId: { type: "string", description: "Run id that was resumed." },
         status: { type: "string", description: "New run status after resume." },
+      },
+    },
+  },
+  {
+    name: MCP_TOOL_RUN_DELETE,
+    title: "Delete Tamandua Run",
+    description: "Permanently delete a Tamandua workflow run and all associated data (steps, stories, worktrees). Active runs can be force-deleted.",
+    annotations: {
+      readOnlyHint: false,
+      idempotentHint: false,
+    },
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["runId"],
+      properties: {
+        runId: {
+          type: "string",
+          minLength: 1,
+          description: "Run id to delete.",
+        },
+        force: {
+          type: "boolean",
+          description: "If true, cancel and delete even if the run is currently running or paused (default false).",
+        },
+      },
+    },
+    outputSchema: {
+      type: "object",
+      required: ["ok", "runId", "status"],
+      properties: {
+        ok: { type: "boolean", description: "Whether the deletion succeeded." },
+        runId: { type: "string", description: "Run id that was deleted." },
+        status: { type: "string", description: "Final status (deleted)." },
       },
     },
   },
@@ -722,6 +761,17 @@ function createProtocolServer(services: TamanduaMcpToolServices): Server {
       try {
         const result = await services.resumeRun(runId);
         return createToolResult({ runId: result.runId, status: result.status });
+      } catch (err) {
+        throw new McpError(ErrorCode.InvalidParams, (err as Error).message);
+      }
+    }
+
+    if (name === MCP_TOOL_RUN_DELETE) {
+      const runId = readRequiredStringArgument(args, "runId");
+      const force = args.force === true;
+      try {
+        const result = await services.deleteRun(runId, force);
+        return createToolResult({ ok: result.ok, runId: result.runId, status: result.status });
       } catch (err) {
         throw new McpError(ErrorCode.InvalidParams, (err as Error).message);
       }

@@ -55,6 +55,7 @@ tamandua workflow resume <run-id>
 tamandua workflow resume-all
 tamandua workflow stop <run-id>
 tamandua workflow autoresearch <run-id>
+tamandua workflow delete <run-id> [--force]
 tamandua nudge
 ```
 
@@ -65,6 +66,10 @@ timers. Does not resume paused runs or interrupt in-flight agents.
 `resume` works for both paused runs (restarted via the daemon) and failed
 runs (resumed directly). `pause-all --drain` lets in-progress steps finish
 before pausing.
+
+`delete` permanently removes a workflow run and associated steps, stories,
+and managed worktree data. Active runs are refused by default; use `--force`
+to cancel and delete a running or paused run in one step.
 
 `install` fetches workflow files, provisions agent workspaces, and registers
 agents in `~/.tamandua/agents.json`. Use `--all` (or `all`) to install every
@@ -566,6 +571,11 @@ Optional MCP args:
   save tokens, same as the CLI `--no-hurry-please-save-tokens-mode` flag.
   When `true`, the scheduler uses a 15-minute floor and 15-minute default
   instead of the normal 1-minute floor and 5-minute default.
+
+Additional MCP tools:
+
+- `tamandua.run.delete` — permanently delete a run. Requires `runId`. Optional
+  `force` (boolean) to cancel and delete active runs.
 
 Recovery pattern for tool-calling models:
 

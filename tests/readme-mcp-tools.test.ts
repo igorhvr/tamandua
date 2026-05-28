@@ -13,6 +13,7 @@ const allMcpTools = [
   "tamandua.run.start",
   "tamandua.run.pause",
   "tamandua.run.resume",
+  "tamandua.run.delete",
   "tamandua.events.recent",
   "tamandua.skill.path",
   "tamandua.source.path",
@@ -24,8 +25,8 @@ const allMcpTools = [
 ];
 
 describe("README MCP tools documentation", () => {
-  it("lists all 13 MCP tools", () => {
-    assert.equal(allMcpTools.length, 13, "There should be exactly 13 MCP tools");
+  it("lists all 14 MCP tools", () => {
+    assert.equal(allMcpTools.length, 14, "There should be exactly 14 MCP tools");
     for (const tool of allMcpTools) {
       const escaped = tool.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       const pattern = new RegExp("`" + escaped + "`");
@@ -59,6 +60,17 @@ describe("README MCP tools documentation", () => {
     assert.ok(
       readmeContent.includes("runId"),
       "tamandua.run.resume documentation must mention runId parameter"
+    );
+  });
+
+  it("documents tamandua.run.delete with its parameters", () => {
+    assert.ok(
+      readmeContent.includes("tamandua.run.delete"),
+      "README must document tamandua.run.delete"
+    );
+    assert.ok(
+      readmeContent.includes("force"),
+      "tamandua.run.delete documentation must mention force parameter"
     );
   });
 

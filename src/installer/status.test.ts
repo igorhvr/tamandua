@@ -379,6 +379,35 @@ describe("stopWorkflow", () => {
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     )`);
+    db.exec(`CREATE TABLE IF NOT EXISTS stories (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      story_index INTEGER NOT NULL,
+      story_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      acceptance_criteria TEXT NOT NULL DEFAULT '[]',
+      status TEXT NOT NULL DEFAULT 'pending',
+      output TEXT,
+      retry_count INTEGER DEFAULT 0,
+      max_retries INTEGER DEFAULT 4,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )`);
+    db.exec(`CREATE TABLE IF NOT EXISTS run_worktrees (
+      run_id TEXT PRIMARY KEY,
+      worktree_origin_repository TEXT NOT NULL,
+      worktree_origin_git_common_dir TEXT NOT NULL,
+      worktree_path TEXT NOT NULL,
+      worktree_origin_ref TEXT,
+      worktree_origin_sha TEXT,
+      original_branch TEXT,
+      status TEXT NOT NULL DEFAULT 'creating',
+      cleanup_policy TEXT NOT NULL DEFAULT 'remove_on_success',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      removed_at TEXT,
+      error TEXT
+    )`);
   });
 
   afterEach(() => {
@@ -421,5 +450,41 @@ describe("stopWorkflow", () => {
     const { stopWorkflow } = await import("../../dist/installer/status.js");
     db.prepare("INSERT INTO runs (id, workflow_id, task, status) VALUES (?, ?, ?, ?)").run("run-done", "wf", "test", "completed");
     await assert.rejects(() => stopWorkflow("run-done"), /already completed/i);
+  });
+
+  it("deletes a terminal workflow and its associated records", async () => {
+    const { deleteWorkflow } = await import("../../dist/installer/status.js");
+
+    db.prepare("INSERT INTO runs (id, workflow_id, task, status) VALUES (?, ?, ?, ?)").run("run-delete", "wf", "test", "completed");
+    db.prepare("INSERT INTO steps (id, run_id, step_id, agent_id, step_index, status) VALUES (?, ?, ?, ?, ?, ?)").run("s-delete", "run-delete", "implement", "dev", 0, "done");
+    db.prepare("INSERT INTO stories (id, run_id, story_index, story_id, title, status) VALUES (?, ?, ?, ?, ?, ?)").run("story-delete", "run-delete", 0, "story-1", "Delete run", "done");
+    db.prepare(
+      `INSERT INTO run_worktrees (run_id, worktree_origin_repository, worktree_origin_git_common_dir, worktree_path, status)
+       VALUES (?, ?, ?, ?, ?)`,
+    ).run("run-delete", tempRoot, path.join(tempRoot, ".git"), path.join(tempRoot, "worktree"), "removed");
+
+    const result = await deleteWorkflow("run-delete");
+
+    assert.deepEqual(result, { ok: true, runId: "run-delete", status: "deleted" });
+    assert.equal((db.prepare("SELECT COUNT(*) AS count FROM runs WHERE id = ?").get("run-delete") as { count: number }).count, 0);
+    assert.equal((db.prepare("SELECT COUNT(*) AS count FROM steps WHERE run_id = ?").get("run-delete") as { count: number }).count, 0);
+    assert.equal((db.prepare("SELECT COUNT(*) AS count FROM stories WHERE run_id = ?").get("run-delete") as { count: number }).count, 0);
+    assert.equal((db.prepare("SELECT COUNT(*) AS count FROM run_worktrees WHERE run_id = ?").get("run-delete") as { count: number }).count, 0);
+  });
+
+  it("requires force before deleting active workflows", async () => {
+    const { deleteWorkflow } = await import("../../dist/installer/status.js");
+
+    db.prepare("INSERT INTO runs (id, workflow_id, task, status) VALUES (?, ?, ?, ?)").run("run-active", "wf", "test", "running");
+    db.prepare("INSERT INTO steps (id, run_id, step_id, agent_id, step_index, status) VALUES (?, ?, ?, ?, ?, ?)").run("s-active", "run-active", "implement", "dev", 0, "running");
+
+    await assert.rejects(() => deleteWorkflow("run-active"), /Use --force/);
+    assert.equal((db.prepare("SELECT status FROM runs WHERE id = ?").get("run-active") as { status: string }).status, "running");
+
+    const result = await deleteWorkflow("run-active", { force: true });
+
+    assert.deepEqual(result, { ok: true, runId: "run-active", status: "deleted" });
+    assert.equal((db.prepare("SELECT COUNT(*) AS count FROM runs WHERE id = ?").get("run-active") as { count: number }).count, 0);
+    assert.equal((db.prepare("SELECT COUNT(*) AS count FROM steps WHERE run_id = ?").get("run-active") as { count: number }).count, 0);
   });
 });

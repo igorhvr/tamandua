@@ -10,7 +10,7 @@ try {
 
 import { installWorkflow } from "../installer/install.js";
 import { uninstallAllWorkflows, uninstallWorkflow, checkActiveRuns } from "../installer/uninstall.js";
-import { getWorkflowStatus, listRuns, stopWorkflow, type RunInfo, type RunDetail } from "../installer/status.js";
+import { getWorkflowStatus, listRuns, stopWorkflow, deleteWorkflow, type RunInfo, type RunDetail } from "../installer/status.js";
 import { runWorkflow, resumeWorkflow, type RunWorkflowResult } from "../installer/run.js";
 import { listBundledWorkflows, getWorkflowShortDescription } from "../installer/workflow-fetch.js";
 import { loadWorkflowSpec } from "../installer/workflow-spec.js";
@@ -1092,6 +1092,25 @@ Examples:
   tamandua workflow autoresearch abc12345`;
 }
 
+function getWorkflowDeleteHelp(): string {
+  return `tamandua workflow delete — Permanently delete a workflow run
+
+Usage: tamandua workflow delete <run-id> [--force]
+
+Permanently deletes a workflow run and all associated data, including steps,
+stories, and managed worktrees. The run-id accepts prefix matching.
+
+By default, active runs (running or paused) cannot be deleted — they must
+be canceled first. Use --force to cancel and delete an active run in one step.
+
+Options:
+  --force    Cancel and delete even if the run is currently running or paused.
+
+Examples:
+  tamandua workflow delete abc12345
+  tamandua workflow delete abc12345 --force`;
+}
+
 function getWorkflowStopHelp(): string {
   return `tamandua workflow stop — Cancel a running workflow
 
@@ -1187,7 +1206,7 @@ Examples:
 function getWorkflowGroupHelp(): string {
   return `tamandua workflow — Manage workflows and runs
 
-Usage: tamandua workflow <list|runs|install|uninstall|run|status|autoresearch|stop|pause|resume|pause-all|resume-all>
+Usage: tamandua workflow <list|runs|install|uninstall|run|status|autoresearch|stop|delete|pause|resume|pause-all|resume-all>
 
 Commands for managing Tamandua workflows and their runs.
 
@@ -1202,6 +1221,7 @@ Subcommands:
   autoresearch
               Show AutoResearch progress for a run
   stop        Cancel a running workflow
+  delete      Permanently delete a run and all its data (--force for active runs)
   pause       Pause a running workflow via the daemon
   resume      Resume a paused or failed workflow run
   pause-all   Pause all running workflows
@@ -1538,6 +1558,7 @@ function getUsageText(): string {
     "tamandua workflow resume <run-id>     Resume a paused or failed run",
     "tamandua workflow resume-all           Resume all paused workflows",
     "tamandua workflow stop <run-id>       Stop/cancel a running workflow",
+    "tamandua workflow delete <run-id>     Permanently delete a run [--force]",
     "tamandua mcp start [--port N]         Start MCP server (default: 3338)",
     "tamandua mcp stop                     Stop MCP server",
     "tamandua mcp status                   Check MCP server status",
@@ -1644,6 +1665,7 @@ async function main() {
       if (action === "run") { printHelp(getWorkflowRunHelp()); }
       if (action === "status") { printHelp(getWorkflowStatusHelp()); }
       if (action === "autoresearch") { printHelp(getWorkflowAutoresearchHelp()); }
+      if (action === "delete") { printHelp(getWorkflowDeleteHelp()); }
       if (action === "stop") { printHelp(getWorkflowStopHelp()); }
       if (action === "pause") { printHelp(getWorkflowPauseHelp()); }
       if (action === "resume") { printHelp(getWorkflowResumeHelp()); }
@@ -2692,6 +2714,27 @@ async function main() {
       process.exit(1);
     }
     printWorkflowAutoresearch(target);
+    return;
+  }
+
+  if (action === "delete") {
+    if (!target) { process.stderr.write("Missing run-id.\nUsage: tamandua workflow delete <run-id> [--force]\n"); process.exit(1); }
+    const force = args.includes("--force");
+    try {
+      let fullId: string;
+      try {
+        fullId = getWorkflowStatus(target).id;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : `No run found matching "${target}".`;
+        process.stderr.write(message.startsWith("No run found matching") ? `No run found matching "${target}".\n` : `${message}\n`);
+        process.exit(1);
+      }
+      const result = await deleteWorkflow(fullId, { force });
+      console.log(`Deleted run ${result.runId.slice(0, 8)}.`);
+    } catch (err) {
+      process.stderr.write(`${err instanceof Error ? err.message : String(err)}\n`);
+      process.exit(1);
+    }
     return;
   }
 

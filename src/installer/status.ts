@@ -2,6 +2,8 @@ import { getDb } from "../db.js";
 import { scheduleRunCronTeardown } from "./step-ops.js";
 import { removeRunCrons } from "./agent-scheduler.js";
 import { terminateRunWithDaemon } from "../server/control-client.js";
+import { getRunWorktree, removeRunWorktree } from "./worktree-manager.js";
+import { emitEvent } from "./events.js";
 
 export interface RunInfo {
   id: string;
@@ -118,6 +120,79 @@ export function listRuns(limit = 50): RunInfo[] {
       tokensSpent: r.tokens_spent,
     };
   });
+}
+
+/**
+ * Delete a workflow run and all associated data (steps, stories, worktree).
+ * Running or paused runs are canceled first.
+ * If --force is not provided and the run is running/paused, the deletion is refused.
+ */
+export async function deleteWorkflow(
+  runId: string,
+  opts: { force?: boolean } = {},
+): Promise<{ ok: boolean; runId: string; status: string }> {
+  const db = getDb();
+
+  const run = db
+    .prepare("SELECT id, status FROM runs WHERE id = ?")
+    .get(runId) as { id: string; status: string } | undefined;
+
+  if (!run) {
+    throw new Error(`Run not found: ${runId}`);
+  }
+
+  const isActive = run.status === "running" || run.status === "paused";
+  if (isActive && !opts.force) {
+    throw new Error(
+      `Run ${runId.slice(0, 8)} is ${run.status}. Use --force to delete an active run (it will be canceled first).`,
+    );
+  }
+
+  // Cancel any active run first
+  if (isActive) {
+    // Cancel pending/running steps
+    db.prepare(
+      "UPDATE steps SET status = 'canceled', updated_at = datetime('now') WHERE run_id = ? AND status IN ('waiting', 'pending', 'running')",
+    ).run(runId);
+
+    // Mark run as canceled and clear scheduling
+    db.prepare(
+      "UPDATE runs SET status = 'canceled', scheduling_status = NULL, updated_at = datetime('now') WHERE id = ?",
+    ).run(runId);
+
+    // Tear down cron jobs and notify daemon
+    await Promise.allSettled([
+      removeRunCrons(runId),
+      terminateRunWithDaemon(runId),
+    ]);
+    scheduleRunCronTeardown(runId);
+  }
+
+  // Remove managed worktree if present
+  const wt = getRunWorktree(runId);
+  if (wt && wt.status !== "removed") {
+    try {
+      removeRunWorktree({ runId, force: true });
+    } catch {
+      // Best-effort worktree removal — proceed with DB cleanup
+    }
+  }
+
+  // Delete associated records in dependency order
+  db.prepare("DELETE FROM stories WHERE run_id = ?").run(runId);
+  db.prepare("DELETE FROM steps WHERE run_id = ?").run(runId);
+  db.prepare("DELETE FROM run_worktrees WHERE run_id = ?").run(runId);
+  db.prepare("DELETE FROM runs WHERE id = ?").run(runId);
+
+  // Emit deletion event to logs tail and recent events
+  emitEvent({
+    ts: new Date().toISOString(),
+    event: "run.deleted",
+    runId,
+    detail: isActive ? "Force-deleted while active" : "Deleted by user",
+  });
+
+  return { ok: true, runId, status: "deleted" };
 }
 
 /**

@@ -198,6 +198,7 @@
     .action-btn.resume-btn:hover { border-color: #3fb950; color: #3fb950; }
     .action-btn.relaunch-btn:hover { border-color: #f0883e; color: #f0883e; }
     .action-btn.cancel-btn:hover { border-color: #f85149; color: #f85149; }
+    .action-btn.delete-btn:hover { border-color: #f85149; color: #f85149; background: #f8514911; }
     .modal-overlay {
       display: none;
       position: fixed; top: 0; left: 0; width: 100%; height: 100%;
@@ -483,6 +484,28 @@
     </p>
   </div>
 
+  <!-- Delete Confirmation Modal -->
+  <div class="modal-overlay" id="delete-modal-overlay">
+    <div class="modal-dialog">
+      <h3>&#x1F5D1; Delete Run</h3>
+      <p style="margin-bottom:12px;color:#c9d1d9;font-size:13px;">
+        Are you sure you want to permanently delete this run? This will remove all associated steps, stories, and worktree data. This action cannot be undone.
+      </p>
+      <div class="modal-field">
+        <label for="delete-run-id-display">Run:</label>
+        <textarea id="delete-run-id-display" readonly rows="1" style="min-height:30px"></textarea>
+      </div>
+      <div class="modal-field">
+        <label for="delete-status-display">Status:</label>
+        <textarea id="delete-status-display" readonly rows="1" style="min-height:30px"></textarea>
+      </div>
+      <div class="modal-buttons">
+        <button class="modal-btn" onclick="closeDeleteModal()">Cancel</button>
+        <button class="modal-btn primary" id="delete-submit-btn" onclick="handleDeleteSubmit()" style="background:#f85149;border-color:#f85149;">Delete Permanently</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Relaunch Modal -->
   <div class="modal-overlay" id="relaunch-modal-overlay">
     <div class="modal-dialog">
@@ -631,6 +654,7 @@
             ${r.status === 'running' ? `<button class="action-btn pause-btn" onclick="event.preventDefault(); handlePause('${r.id}')">⏸ Pause</button>` : ''}
             ${r.status === 'paused' ? `<button class="action-btn resume-btn" onclick="event.preventDefault(); handleResume('${r.id}')">▶ Resume</button> <button class="action-btn cancel-btn" onclick="event.preventDefault(); handleCancel('${r.id}')">✕ Cancel</button>` : ''}
             ${(r.status === 'failed' || r.status === 'canceled') ? `<button class="action-btn relaunch-btn" onclick="event.preventDefault(); openRelaunchModal('${r.id}')">🔄 Relaunch</button>` : ''}
+            <button class="action-btn delete-btn" onclick="event.preventDefault(); openDeleteModal('${r.id}', '${esc(r.status)}')" title="Delete this run">🗑</button>
           </td>
           <td><a class="kanban-link" href="/runs/${encodeURIComponent(r.id)}/kanban" aria-label="Open kanban for run ${esc(r.id)}">Kanban &rarr;</a></td>
         </tr>`;
@@ -1038,6 +1062,45 @@
       } finally {
         setTimeout(() => { if (el) el.textContent = ''; }, 4000);
         refreshAll();
+      }
+    }
+
+    // ── Delete Modal Functions ──────────────────────────────────────
+
+    let deleteRunId = null;
+
+    function openDeleteModal(runId, status) {
+      deleteRunId = runId;
+      document.getElementById('delete-run-id-display').value = runId;
+      document.getElementById('delete-status-display').value = status;
+      document.getElementById('delete-modal-overlay').classList.add('active');
+    }
+
+    function closeDeleteModal() {
+      document.getElementById('delete-modal-overlay').classList.remove('active');
+      deleteRunId = null;
+    }
+
+    async function handleDeleteSubmit() {
+      if (!deleteRunId) return;
+      const submitBtn = document.getElementById('delete-submit-btn');
+      submitBtn.disabled = true;
+      submitBtn.textContent = 'Deleting...';
+      try {
+        const res = await fetch(`/api/runs/${encodeURIComponent(deleteRunId)}?force=true`, {
+          method: 'DELETE'
+        });
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}));
+          throw new Error(body.error || `Delete failed (${res.status})`);
+        }
+        closeDeleteModal();
+        refreshAll();
+      } catch (err) {
+        alert('Delete failed: ' + err.message);
+      } finally {
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Delete Permanently';
       }
     }
 
