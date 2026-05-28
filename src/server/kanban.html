@@ -460,31 +460,43 @@
 
     .lane-foot {
       border-top: 1px solid var(--line-2);
-      padding: 10px 14px;
+      padding: 12px 14px;
       display: flex;
-      justify-content: space-between;
-      align-items: center;
+      flex-direction: column;
+      gap: 8px;
       font-size: 11.5px;
       color: var(--ink);
       font-variant-numeric: tabular-nums;
-      gap: 12px;
     }
-    .lane-foot .progress {
+    .lane-progress-stacked {
       flex: 1 1 auto;
-      height: 4px;
+      height: 6px;
       background: var(--line);
-      border-radius: 2px;
-      position: relative;
+      border-radius: 3px;
       overflow: hidden;
+      display: flex;
+      transition: background 200ms ease;
     }
-    .lane-foot .progress .fill {
-      position: absolute; inset: 0 auto 0 0;
-      background: var(--done);
-      width: 0%;
-      transition: width 200ms ease;
+    .lane-progress-stacked .seg {
+      flex: 0 0 auto;
+      height: 100%;
+      transition: width 400ms ease;
     }
-    .lane-foot .progress.failed .fill { background: var(--failed); }
-    .lane-foot .progress.running .fill { background: var(--running); }
+    .lane-progress-stacked .seg.todo    { background: var(--todo); }
+    .lane-progress-stacked .seg.running { background: var(--running); }
+    .lane-progress-stacked .seg.done    { background: var(--done); }
+    .lane-progress-stacked .seg.failed { background: var(--failed); }
+    .lane-progress-labels {
+      display: flex;
+      gap: 8px;
+      font-size: 10px;
+      font-weight: 500;
+    }
+    .lane-progress-labels .l { color: var(--ink-soft); }
+    .lane-progress-labels .l.done    { color: var(--done); }
+    .lane-progress-labels .l.running { color: var(--running); }
+    .lane-progress-labels .l.failed  { color: var(--failed); }
+    .lane-progress-labels .l.todo    { color: var(--todo); }
 
     footer.status {
       border-top: 1px solid var(--line-2);
@@ -636,6 +648,40 @@
     return "todo";
   }
 
+  function buildLaneFootHTML(summary) {
+    const total = summary.total;
+    const done = summary.done;
+    const failed = summary.failed;
+    const running = summary.running;
+    const todo = summary.total - done - failed - running;
+    const pct = total ? Math.round((done / total) * 100) : 0;
+
+    function w(n) {
+      return total ? Math.round((n / total) * 100) : 0;
+    }
+
+    let labels = [];
+    if (done > 0) labels.push('<span class="l done">' + done + ' done</span>');
+    if (running > 0) labels.push('<span class="l running">' + running + ' running</span>');
+    if (failed > 0) labels.push('<span class="l failed">' + failed + ' failed</span>');
+    if (todo > 0) labels.push('<span class="l todo">' + todo + ' todo</span>');
+    if (labels.length === 0) labels.push('<span class="l">—</span>');
+
+    return {
+      labels: labels.join('<span class="l" style="margin:0 4px;">·</span>'),
+      stacked:
+        '<div class="lane-progress-stacked">' +
+        (done > 0 ? '<div class="seg done" style="width:' + w(done) + '%"></div>' : '') +
+        (running > 0 ? '<div class="seg running" style="width:' + w(running) + '%"></div>' : '') +
+        (failed > 0 ? '<div class="seg failed" style="width:' + w(failed) + '%"></div>' : '') +
+        (todo > 0 ? '<div class="seg todo" style="width:' + w(todo) + '%"></div>' : '') +
+        '</div>',
+      pct: pct,
+    };
+  }
+
+  // ── Full rebuild (first load or structural reset) ───────────────
+
   function renderBoard(snapshot) {
     const board = document.getElementById("board");
     board.style.setProperty("--lanes", String(Math.max(1, snapshot.lanes.length)));
@@ -643,31 +689,154 @@
     for (const lane of snapshot.lanes) {
       const laneEl = document.createElement("section");
       laneEl.className = "lane";
+      laneEl.setAttribute("data-step-id", lane.stepId);
 
-      const head = document.createElement("div");
-      head.className = "lane-head";
-      const itemWord = lane.summary.total === 1 ? "item" : "items";
-      head.innerHTML =
-        '<div class="lane-name ' + lane.status + '">' +
-        '<span class="dot"></span>' + escapeHtml(lane.label) +
-        '</div>' +
-        '<div class="lane-sub">' + lane.summary.total + ' ' + itemWord +
-        ' · ' + escapeHtml(lane.stepType) + '</div>';
-      laneEl.appendChild(head);
+      laneEl.appendChild(buildLaneHead(lane));
+      laneEl.appendChild(buildCardsContainer(lane));
+      laneEl.appendChild(buildLaneFoot(lane));
 
-      const cardsEl = document.createElement("div");
-      cardsEl.className = "cards";
-      if (lane.cards.length === 0) {
-        const empty = document.createElement("div");
-        empty.className = "card";
-        empty.innerHTML = '<div class="title" style="color:var(--ink-soft)">—</div>';
-        cardsEl.appendChild(empty);
+      board.appendChild(laneEl);
+    }
+  }
+
+  function buildLaneHead(lane) {
+    const head = document.createElement("div");
+    head.className = "lane-head";
+    const itemWord = lane.summary.total === 1 ? "item" : "items";
+    head.innerHTML =
+      '<div class="lane-name ' + lane.status + '">' +
+      '<span class="dot"></span>' + escapeHtml(lane.label) +
+      '</div>' +
+      '<div class="lane-sub">' + lane.summary.total + ' ' + itemWord +
+      ' · ' + escapeHtml(lane.stepType) + '</div>';
+    return head;
+  }
+
+  function buildCardsContainer(lane) {
+    const cardsEl = document.createElement("div");
+    cardsEl.className = "cards";
+    if (lane.cards.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "card";
+      empty.innerHTML = '<div class="title" style="color:var(--ink-soft)">—</div>';
+      cardsEl.appendChild(empty);
+    } else {
+      for (const c of lane.cards) {
+        cardsEl.appendChild(buildCardEl(c));
+      }
+    }
+    return cardsEl;
+  }
+
+  function buildCardEl(c) {
+    const cardEl = document.createElement("div");
+    cardEl.className = "card " + c.status;
+    cardEl.setAttribute("data-card-id", c.id);
+    cardEl.innerHTML =
+      '<div class="id-row">' +
+        '<span><span class="dot"></span>' + escapeHtml(c.id) + '</span>' +
+        '<span>' + escapeHtml(c.status) + '</span>' +
+      '</div>' +
+      '<button class="card-toggle-btn" aria-label="Expand card">+</button>' +
+      '<div class="title">' + escapeHtml(c.title) + '</div>' +
+      '<div class="meta-row">' + escapeHtml(c.sub) + '</div>';
+    return cardEl;
+  }
+
+  function buildLaneFoot(lane) {
+    const foot = document.createElement("div");
+    foot.className = "lane-foot";
+    const part = buildLaneFootHTML(lane.summary);
+    foot.innerHTML =
+      '<div class="lane-progress-labels">' + part.labels + '</div>' +
+      part.stacked +
+      '<span style="font-size:11px;font-weight:600;color:var(--ink-soft);">' + part.pct + '%</span>';
+    return foot;
+  }
+
+  // ── Incremental patch (preserves scroll, focus, expanded cards) ──
+
+  function updateBoard(snapshot, prevSnapshot) {
+    const board = document.getElementById("board");
+    board.style.setProperty("--lanes", String(Math.max(1, snapshot.lanes.length)));
+
+    const prevLanes = new Map();
+    if (prevSnapshot && prevSnapshot.lanes) {
+      for (const l of prevSnapshot.lanes) prevLanes.set(l.stepId, l);
+    }
+    const nextLanes = new Map();
+    for (const l of snapshot.lanes) nextLanes.set(l.stepId, l);
+
+    // Remove lanes that disappeared
+    for (const el of board.querySelectorAll('.lane')) {
+      const sid = el.getAttribute('data-step-id');
+      if (sid && !nextLanes.has(sid)) el.remove();
+    }
+
+    // Build/Update lanes in order (lanes don't reorder within a run)
+    for (let i = 0; i < snapshot.lanes.length; i++) {
+      const lane = snapshot.lanes[i];
+      const existing = board.querySelector('.lane[data-step-id="' + lane.stepId + '"]');
+      let laneEl;
+      if (existing) {
+        laneEl = existing;
+        patchLaneHead(laneEl, lane, prevLanes.get(lane.stepId));
+        patchCards(laneEl, lane, prevLanes.get(lane.stepId));
+        patchLaneFoot(laneEl, lane, prevLanes.get(lane.stepId));
       } else {
-        for (const c of lane.cards) {
-          const cardEl = document.createElement("div");
-          cardEl.className = "card " + c.status;
-          cardEl.setAttribute("data-card-id", c.id);
-          cardEl.innerHTML =
+        laneEl = document.createElement("section");
+        laneEl.className = "lane";
+        laneEl.setAttribute("data-step-id", lane.stepId);
+        laneEl.appendChild(buildLaneHead(lane));
+        laneEl.appendChild(buildCardsContainer(lane));
+        laneEl.appendChild(buildLaneFoot(lane));
+        board.appendChild(laneEl);
+      }
+    }
+  }
+
+  function patchLaneHead(laneEl, lane, prevLane) {
+    if (prevLane && prevLane.status === lane.status && prevLane.label === lane.label && prevLane.summary.total === lane.summary.total && prevLane.stepType === lane.stepType) return;
+    const head = laneEl.querySelector('.lane-head');
+    if (!head) return;
+    const itemWord = lane.summary.total === 1 ? "item" : "items";
+    const nameEl = head.querySelector('.lane-name');
+    if (nameEl) {
+      nameEl.className = 'lane-name ' + lane.status;
+      nameEl.innerHTML = '<span class="dot"></span>' + escapeHtml(lane.label);
+    }
+    const subEl = head.querySelector('.lane-sub');
+    if (subEl) {
+      subEl.textContent = lane.summary.total + ' ' + itemWord + ' · ' + lane.stepType;
+    }
+  }
+
+  function patchCards(laneEl, lane, prevLane) {
+    const container = laneEl.querySelector('.cards');
+    if (!container) return;
+
+    const prevCards = new Map();
+    if (prevLane && prevLane.cards) {
+      for (const c of prevLane.cards) prevCards.set(c.id, c);
+    }
+    const nextCards = new Map();
+    for (const c of lane.cards) nextCards.set(c.id, c);
+
+    // Remove cards that disappeared
+    for (const el of container.querySelectorAll('.card')) {
+      const cid = el.getAttribute('data-card-id');
+      if (cid && !nextCards.has(cid)) el.remove();
+      if (!cid) el.remove();
+    }
+
+    // Update / insert cards in order
+    for (const c of lane.cards) {
+      const existing = container.querySelector('.card[data-card-id="' + c.id.replace(/"/g, '\\"') + '"]');
+      if (existing) {
+        const p = prevCards.get(c.id);
+        if (!p || p.status !== c.status || p.title !== c.title || p.sub !== c.sub) {
+          existing.className = 'card ' + c.status;
+          existing.innerHTML =
             '<div class="id-row">' +
               '<span><span class="dot"></span>' + escapeHtml(c.id) + '</span>' +
               '<span>' + escapeHtml(c.status) + '</span>' +
@@ -675,32 +844,35 @@
             '<button class="card-toggle-btn" aria-label="Expand card">+</button>' +
             '<div class="title">' + escapeHtml(c.title) + '</div>' +
             '<div class="meta-row">' + escapeHtml(c.sub) + '</div>';
-          cardsEl.appendChild(cardEl);
         }
+      } else {
+        // Append new card; order doesn't change within a lane at runtime.
+        container.appendChild(buildCardEl(c));
       }
-      laneEl.appendChild(cardsEl);
-
-      const total = lane.summary.total;
-      const done = lane.summary.done;
-      const failed = lane.summary.failed;
-      const running = lane.summary.running;
-      const pct = total ? Math.round((done / total) * 100) : 0;
-      const progressClass = failed > 0 ? "failed" : (running > 0 ? "running" : "");
-      const progressWidth = failed > 0 ? 100 : pct;
-
-      const foot = document.createElement("div");
-      foot.className = "lane-foot";
-      foot.innerHTML =
-        '<span>' + done + '/' + total + ' done' +
-        (failed ? ' · ' + failed + ' failed' : '') + '</span>' +
-        '<div class="progress ' + progressClass + '">' +
-          '<div class="fill" style="width:' + progressWidth + '%"></div>' +
-        '</div>' +
-        '<span>' + pct + '%</span>';
-      laneEl.appendChild(foot);
-
-      board.appendChild(laneEl);
     }
+
+    if (lane.cards.length === 0 && container.querySelectorAll('.card').length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "card";
+      empty.innerHTML = '<div class="title" style="color:var(--ink-soft)">—</div>';
+      container.appendChild(empty);
+    }
+  }
+
+  function patchLaneFoot(laneEl, lane, prevLane) {
+    if (prevLane && prevLane.summary &&
+        prevLane.summary.done === lane.summary.done &&
+        prevLane.summary.failed === lane.summary.failed &&
+        prevLane.summary.running === lane.summary.running &&
+        prevLane.summary.total === lane.summary.total) return;
+
+    const foot = laneEl.querySelector('.lane-foot');
+    if (!foot) return;
+    const part = buildLaneFootHTML(lane.summary);
+    foot.innerHTML =
+      '<div class="lane-progress-labels">' + part.labels + '</div>' +
+      part.stacked +
+      '<span style="font-size:11px;font-weight:600;color:var(--ink-soft);">' + part.pct + '%</span>';
   }
 
   let lastGoodAt = null;
@@ -1080,6 +1252,8 @@
     }
   });
 
+  let previousSnapshot = null;
+
   async function tick() {
     if (!runId) {
       document.getElementById("footer-left").innerHTML =
@@ -1096,7 +1270,13 @@
       }
       const data = await r.json();
       renderHeader(data);
-      renderBoard(data);
+
+      if (previousSnapshot) {
+        updateBoard(data, previousSnapshot);
+      } else {
+        renderBoard(data);
+      }
+      previousSnapshot = data;
 
       // Re-sync expanded card state after the board re-render and refresh the
       // open modal in place (so latest tokens/timing/output show through).
