@@ -1,0 +1,67 @@
+# Frontend Test Workflow — Tests the Tamandua dashboard without starting a second daemon.
+id: frontend-test
+name: Frontend Test
+version: 1
+description: |
+  Builds the project and validates the dashboard frontend: HTML structure,
+  required elements, API endpoint definitions, and dashboard test coverage.
+  Does NOT start a second dashboard daemon (avoids killing the parent daemon).
+polling:
+  model: default
+  timeoutSeconds: 120
+
+agents:
+  - id: tester
+    name: Frontend Tester
+    role: testing
+    description: Builds and validates the Tamandua dashboard frontend source.
+    workspace:
+      baseDir: agents/tester
+      skills:
+        - tamandua-agents
+      files:
+        AGENTS.md: agents/tester/AGENTS.md
+        SOUL.md: agents/tester/SOUL.md
+
+steps:
+  - id: test
+    agent: tester
+    input: |
+      Validate the Tamandua dashboard frontend.
+
+      {{task}}
+
+      Instructions:
+      1. Build the project: `./build` — this must succeed.
+         If it fails, report STATUS: failed with the build error.
+      2. Verify the dashboard HTML file exists and is valid:
+         - Check `src/server/index.html` exists
+         - Verify it contains required elements:
+           - `<title>Tamandua Dashboard</title>`
+           - `<header>` with `<h1>`
+           - `<style>` block (CSS is inline)
+           - `<script>` block (JS is inline)
+         - Verify HTML structure is well-formed (no unclosed tags)
+      3. Check the kanban page: `src/server/kanban.html` exists and has valid HTML
+      4. Verify dashboard route definitions in `src/server/dashboard.ts`:
+         - GET `/` → index.html
+         - GET `/api/runs` → JSON
+         - GET `/api/events` → JSON
+         - GET `/runs/:id/kanban` → kanban.html
+      5. Check dashboard test coverage:
+         - Run `npx c8 report --reporter=text --include='dist/server/dashboard.js' 2>/dev/null` or
+         - Check that `src/server/dashboard.test.ts` exists and has test cases
+      6. Report results
+
+      ⚠️ DO NOT run `tamandua dashboard start` — the agent runs inside the
+      Tamandua daemon and starting a second daemon would kill this process.
+
+      Reply with:
+      STATUS: done|failed
+      REPORT: detailed results of each check (pass/fail)
+      CHECKS_PASSED: <N>
+      CHECKS_TOTAL: <M>
+    expects: "STATUS: done"
+    max_retries: 2
+    on_fail:
+      escalate_to: human
