@@ -622,9 +622,13 @@
     const pulse = document.getElementById("run-pulse");
     pulse.className = "pulse " + statusBucket(run.status);
 
-    const createdMs = parseTimestamp(run.created_at);
+    // Prefer server frozen elapsed for finished runs (avoids timer running forever after workflow ends).
     document.getElementById("elapsed").textContent =
-      Number.isFinite(createdMs) ? fmtElapsed((Date.now() - createdMs) / 1000) : "—";
+      run.elapsed_seconds != null
+        ? fmtElapsed(run.elapsed_seconds)
+        : Number.isFinite(parseTimestamp(run.created_at))
+          ? fmtElapsed((Date.now() - parseTimestamp(run.created_at)) / 1000)
+          : "—";
     document.getElementById("tokens").textContent = fmtTokens(run.tokens_spent);
   }
 

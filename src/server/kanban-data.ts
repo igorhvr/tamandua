@@ -58,6 +58,12 @@ export interface KanbanRunMeta {
   tokens_spent: number;
   created_at: string;
   updated_at: string;
+  /**
+   * Pre-computed elapsed seconds (frozen when run is terminal).
+   * Fixes the kanban header showing elapsed time that kept increasing after the workflow finished
+   * (the UI previously used Date.now() - created_at on every poll).
+   */
+  elapsed_seconds: number | null;
 }
 
 export interface KanbanSnapshot {
@@ -141,6 +147,7 @@ interface RunRow {
 const RUNNING_STATUSES = new Set(["running"]);
 const DONE_STATUSES = new Set(["done", "completed"]);
 const FAILED_STATUSES = new Set(["failed", "canceled", "cancelled"]);
+const TERMINAL_STATUSES = new Set(["done", "completed", "failed", "canceled", "cancelled"]);
 
 export function normaliseStatus(raw: string | null | undefined): VisualStatus {
   if (!raw) return "todo";
@@ -205,8 +212,23 @@ function stepCardSub(step: StepRow): string {
 
 function parseEventIsoMs(ts: string | undefined): number {
   if (!ts) return 0;
-  const d = new Date(ts);
+  // SQLite datetime('now') returns space-separated UTC without timezone.
+  // Normalize to ISO-8601 so JS parses as UTC, not local time.
+  // Matches parseTimestamp logic in kanban.html.
+  const iso = /Z$/.test(ts) ? ts : ts.replace(" ", "T") + "Z";
+  const d = new Date(iso);
   return Number.isFinite(d.getTime()) ? d.getTime() : 0;
+}
+
+function computeElapsed(status: string, created_at: string, updated_at: string): number | null {
+  const createdMs = parseEventIsoMs(created_at);
+  const updatedMs = parseEventIsoMs(updated_at);
+  if (!createdMs || !updatedMs) return null;
+  const statusKey = String(status).toLowerCase();
+  // Terminal runs: freeze duration so the dashboard does not keep counting after completion.
+  // Active runs: return null so the client uses its own clock between polls.
+  if (TERMINAL_STATUSES.has(statusKey)) return Math.max(0, (updatedMs - createdMs) / 1000);
+  return null;
 }
 
 function extractFailureDetail(events: TamanduaEvent[]): string | undefined {
@@ -455,6 +477,7 @@ export function buildKanbanSnapshot(
       tokens_spent: run.tokens_spent ?? 0,
       created_at: run.created_at,
       updated_at: run.updated_at,
+      elapsed_seconds: computeElapsed(run.status, run.created_at, run.updated_at),
     },
     lanes,
     currentStoryId,
