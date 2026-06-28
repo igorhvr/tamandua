@@ -110,6 +110,10 @@ export interface AgentInfo {
   description: string;
   tools: string[];
   model: string;
+  /** Logical ML phase this agent belongs to */
+  phase: PipelinePhase;
+  /** Step ID in the steps table */
+  stepId: string;
 }
 
 export interface AgentDetail {
@@ -173,6 +177,8 @@ export const AGENT_INFO_REGISTRY: Record<string, AgentInfo> = {
     description: "Performs exploratory data analysis: distributions, correlations, missing values, outlier detection, and generates hypotheses.",
     tools: ["Read", "Write", "Bash", "Glob", "Grep"],
     model: "sonnet",
+    phase: "data_analysis",
+    stepId: "eda",
   },
   "feature-engineer": {
     name: "feature-engineer",
@@ -180,6 +186,8 @@ export const AGENT_INFO_REGISTRY: Record<string, AgentInfo> = {
     description: "Engineers features, creates train/test split, trains a baseline model. Ensures zero data leakage and deterministic splits.",
     tools: ["Read", "Write", "Bash", "Glob", "Grep"],
     model: "sonnet",
+    phase: "feature_engineering",
+    stepId: "features",
   },
   "modeler-classic": {
     name: "modeler-classic",
@@ -187,6 +195,8 @@ export const AGENT_INFO_REGISTRY: Record<string, AgentInfo> = {
     description: "Trains classical ML models: GBM, Linear, RF, SVM, Stacking. Minimum 4 model families, 50+ trials. Plan mode on first round.",
     tools: ["Read", "Write", "Bash", "Glob", "Grep"],
     model: "sonnet",
+    phase: "modeling",
+    stepId: "model-classic",
   },
   "modeler-advanced": {
     name: "modeler-advanced",
@@ -194,6 +204,8 @@ export const AGENT_INFO_REGISTRY: Record<string, AgentInfo> = {
     description: "Trains advanced models: Neural Networks, TabNet, FT-Transformer, AutoML. CUDA detection, early stopping, torch seed determinism.",
     tools: ["Read", "Write", "Bash", "Glob", "Grep"],
     model: "sonnet",
+    phase: "modeling",
+    stepId: "model-advanced",
   },
   "ml-critic": {
     name: "ml-critic",
@@ -201,6 +213,8 @@ export const AGENT_INFO_REGISTRY: Record<string, AgentInfo> = {
     description: "Adversarial auditor: validates model outputs with 8 audit checks. Read-only access — no Write tool. Can reject models from leaderboard.",
     tools: ["Read", "Bash", "Glob", "Grep"],
     model: "sonnet",
+    phase: "audit",
+    stepId: "audit",
   },
 };
 
@@ -234,6 +248,7 @@ export interface ChecklistState {
   items: ChecklistItem[];
   updatedAt: string;
 }
+
 
 export interface DiffHunk {
   type: "added" | "removed" | "unchanged";
