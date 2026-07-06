@@ -69,7 +69,7 @@ import {
 import { reserveDistinctRandomPorts } from "../tests/helpers/test-env.ts";
 import type { ChildProcess } from "node:child_process";
 
-const fixtureDir = path.join(process.cwd(), "e2e-tests", "fixtures", "sample-project");
+const fixtureDir = path.join(process.cwd(), "e2e-tests", "fixtures", "sample-project-review");
 
 /**
  * Self-contained task for the do-review-do-verify workflow.
