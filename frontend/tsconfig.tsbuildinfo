@@ -1,0 +1,1 @@
+{"root":["./src/App.tsx","./src/main.tsx","./src/theme.ts","./src/api/client.ts","./src/components/Layout.tsx","./src/components/MarkdownRenderer.tsx","./src/pages/Dashboard.tsx","./src/pages/Kanban.tsx"],"version":"5.9.3"}

@@ -4,7 +4,7 @@
  * Runs the dashboard server, optionally alongside the MCP server.
  *
  * - Reads dashboard port from ~/.tamandua/port
- * - Dashboard listens on configured port (default fallback 3333)
+ * - Dashboard listens on configured port (default fallback 3334)
  * - MCP is only started when --with-mcp is passed (default port 3338)
  * - Writes PID file on start (~/.tamandua/tamandua.pid)
  * - Cleans up PID file on exit
@@ -89,7 +89,7 @@ function readPort(cliPort: number): number {
   } catch {
     // Fallback: use CLI arg, then default
     if (cliPort > 0) return cliPort;
-    return 3333;
+    return 3334;
   }
 }
 

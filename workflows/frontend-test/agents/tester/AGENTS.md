@@ -8,13 +8,18 @@ agent would kill the daemon that spawned you.
 
 1. **Build** — Run `./build`. This must succeed before anything else.
 
-2. **Validate HTML** — Check source files directly:
-   - `src/server/index.html` — must exist, contain `<title>Tamandua Dashboard</title>`,
-     `<header>`, `<h1>`, `<style>`, `<script>`
-   - `src/server/kanban.html` — must exist and be valid HTML
+2. **Validate React SPA** — Check source files directly:
+   - `frontend/index.html` — must exist, contain `<div id="root">` and a `<script>` tag
+   - `frontend/src/main.tsx` — must exist, be valid React entry point
+   - `frontend/src/App.tsx` — must exist, define routes for `/` and `/runs/:id/kanban`
+   - `frontend/src/pages/Dashboard.tsx` — must exist
+   - `frontend/src/pages/Kanban.tsx` — must exist
+   - `frontend/vite.config.ts` — must exist, proxy `/api` to `http://localhost:3334`
+   - `frontend/dist/index.html` — must exist (built output)
 
 3. **Verify Routes** — Check `src/server/dashboard.ts` for route definitions:
-   - `GET /` serves index.html
+   - `GET /` serves the React SPA from `frontend/dist/index.html`
+   - `GET /runs/:id/kanban` serves the React SPA (client-side routing)
    - `GET /api/runs` returns JSON
    - `GET /api/events` returns JSON
 
@@ -35,12 +40,13 @@ If neither marker is present, the scheduler treats the step as **lost/abandoned*
 STATUS: done
 REPORT:
 - Build: PASS/FAIL
-- index.html exists: PASS/FAIL
-- index.html has <title>: PASS/FAIL
-- index.html has <header>/<h1>: PASS/FAIL
-- index.html has <style>: PASS/FAIL
-- index.html has <script>: PASS/FAIL
-- kanban.html exists: PASS/FAIL
+- frontend/index.html exists: PASS/FAIL
+- frontend/src/main.tsx exists: PASS/FAIL
+- frontend/src/App.tsx exists: PASS/FAIL
+- frontend/src/pages/Dashboard.tsx exists: PASS/FAIL
+- frontend/src/pages/Kanban.tsx exists: PASS/FAIL
+- frontend/vite.config.ts exists: PASS/FAIL
+- frontend/dist/index.html exists: PASS/FAIL
 - Route definitions: PASS/FAIL
 - Dashboard tests: PASS/FAIL
 CHECKS_PASSED: <N>

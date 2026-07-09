@@ -86,11 +86,11 @@ describe("AGENTS.md artifact review section (US-001)", () => {
   });
 
   // AC 5: The new section covers docs, MCP, CLI, dashboard, and README artifacts
-  it("lists docs, MCP, CLI, dashboard, and README as artifacts to review", () => {
+  it("lists docs, MCP, CLI, frontend, and README as artifacts to review", () => {
     assert.match(agentsMd, /docs\/creating-workflows\.md/);
     assert.match(agentsMd, /src\/server\/mcp-server\.ts/);
     assert.match(agentsMd, /src\/cli\/cli\.ts/);
-    assert.match(agentsMd, /src\/server\/index\.html/);
+    assert.match(agentsMd, /frontend\//);
     assert.match(agentsMd, /README\.md/);
   });
 

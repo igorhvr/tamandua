@@ -4,8 +4,8 @@
  * Creates an HTTP server that serves the dashboard UI and API endpoints.
  *
  * Routes:
- *   GET /                        -> index.html (dashboard UI)
- *   GET /runs/:id/kanban         -> kanban.html (per-run swim-lane view)
+ *   GET /                        -> React SPA (frontend/dist/index.html)
+ *   GET /runs/:id/kanban         -> React SPA (client-side routing)
  *   GET /api/autoresearch/runs   -> list workflow runs with AutoResearch state
  *   GET /api/runs                -> list all workflow runs
  *   GET /api/runs/:id            -> detail for a specific run
@@ -41,8 +41,34 @@ import {
 } from "../autoresearch/autoresearch.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const INDEX_HTML = path.join(__dirname, "index.html");
-const KANBAN_HTML = path.join(__dirname, "kanban.html");
+
+// Serve the React SPA from frontend/dist
+const FRONTEND_DIST = path.resolve(__dirname, "..", "..", "frontend", "dist");
+const FRONTEND_INDEX = path.join(FRONTEND_DIST, "index.html");
+
+function getFrontendAsset(assetPath: string): string | null {
+  const fullPath = path.join(FRONTEND_DIST, assetPath);
+  if (fullPath.startsWith(FRONTEND_DIST) && fs.existsSync(fullPath) && fs.statSync(fullPath).isFile()) {
+    return fullPath;
+  }
+  return null;
+}
+
+const MIME_TYPES: Record<string, string> = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "application/javascript",
+  ".css": "text/css",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
+  ".ico": "image/x-icon",
+  ".json": "application/json",
+  ".woff": "font/woff",
+  ".woff2": "font/woff2",
+  ".ttf": "font/ttf",
+};
 
 // ── Runs List Cache ────────────────────────────────────────────────
 
@@ -452,6 +478,19 @@ function handleAutoresearchRuns(_req: http.IncomingMessage, res: http.ServerResp
     jsonResponse(res, { runs });
   } catch (err) {
     errorResponse(res, `Failed to list AutoResearch runs: ${(err as Error).message}`);
+  }
+}
+
+function handleRunEvents(
+  _req: http.IncomingMessage,
+  res: http.ServerResponse,
+  runId: string,
+): void {
+  try {
+    const events = getRunEvents(runId);
+    jsonResponse(res, { events });
+  } catch (err) {
+    errorResponse(res, `Failed to get run events: ${(err as Error).message}`);
   }
 }
 
@@ -952,34 +991,54 @@ function route(req: http.IncomingMessage, res: http.ServerResponse): void {
   // Parse URL path (strip query string)
   const pathname = url.split("?")[0];
 
-  // GET /
+  // GET / — serve React SPA
   if (method === "GET" && pathname === "/") {
     try {
-      const html = fs.readFileSync(INDEX_HTML, "utf-8");
+      const html = fs.readFileSync(FRONTEND_INDEX, "utf-8");
       htmlResponse(res, html);
     } catch {
       htmlResponse(res, `<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="UTF-8"><title>Tamandua Dashboard</title></head>
-<body><h1>Tamandua Dashboard</h1><p>Dashboard HTML not found. Rebuild tamandua or check dist/server/index.html.</p></body>
+<body><h1>Tamandua Dashboard</h1><p>Frontend build not found. Run the frontend build first.</p></body>
 </html>`, 200);
     }
     return;
   }
 
-  // GET /runs/:id/kanban
+  // GET /runs/:id/kanban — serve React SPA (client-side routing)
   const kanbanHtmlMatch = pathname.match(/^\/runs\/([a-zA-Z0-9_-]+)\/kanban$/);
   if (method === "GET" && kanbanHtmlMatch) {
     try {
-      const html = fs.readFileSync(KANBAN_HTML, "utf-8");
+      const html = fs.readFileSync(FRONTEND_INDEX, "utf-8");
       htmlResponse(res, html);
     } catch {
       htmlResponse(res, `<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="UTF-8"><title>Tamandua Kanban</title></head>
-<body><h1>Tamandua Kanban</h1><p>Kanban HTML not found. Rebuild tamandua or check dist/server/kanban.html.</p></body>
+<body><h1>Tamandua Kanban</h1><p>Frontend build not found. Run the frontend build first.</p></body>
 </html>`, 200);
     }
+    return;
+  }
+
+  // GET /assets/* — serve frontend static assets
+  if (method === "GET" && pathname.startsWith("/assets/")) {
+    const assetPath = getFrontendAsset(pathname.slice(1));
+    if (assetPath) {
+      const ext = path.extname(assetPath);
+      const contentType = MIME_TYPES[ext] || "application/octet-stream";
+      try {
+        const content = fs.readFileSync(assetPath);
+        res.writeHead(200, { "Content-Type": contentType });
+        res.end(content);
+      } catch {
+        errorResponse(res, "Asset not found", 404);
+      }
+      return;
+    }
+    // Asset not found on disk — return 404 instead of falling through to API routes
+    errorResponse(res, "Asset not found", 404);
     return;
   }
 
@@ -1038,6 +1097,13 @@ function route(req: http.IncomingMessage, res: http.ServerResponse): void {
   // GET /api/runs
   if (method === "GET" && pathname === "/api/runs") {
     handleListRuns(req, res);
+    return;
+  }
+
+  // GET /api/runs/:id/events (registered before /api/runs/:id to avoid prefix conflict)
+  const runEventsMatch = pathname.match(/^\/api\/runs\/([a-zA-Z0-9_-]+)\/events$/);
+  if (method === "GET" && runEventsMatch) {
+    handleRunEvents(req, res, runEventsMatch[1]);
     return;
   }
 

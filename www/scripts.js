@@ -271,85 +271,9 @@ document.addEventListener('DOMContentLoaded', function () {
     });
   })();
 
-  // ── 8. Animated Terminal Replay (Quick Example) ────────────────────
-
-  (function () {
-    var reduceMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-    var terminals = document.querySelectorAll('[data-terminal-animate]');
-    if (!terminals.length) return;
-
-    function highlightStatic(codeEl) {
-      codeEl.innerHTML = highlightedLines(codeEl).map(function (l) { return l.html; }).join('\n');
-    }
-
-    if (reduceMotion || !('IntersectionObserver' in window)) {
-      terminals.forEach(function (t) {
-        var codeEl = t.querySelector('pre > code');
-        if (codeEl) highlightStatic(codeEl);
-      });
-      return;
-    }
-
-    function replay(codeEl) {
-      var lines = highlightedLines(codeEl);
-      codeEl.__fullText = codeEl.textContent;
-      codeEl.innerHTML = '';
-      var cursor = document.createElement('span');
-      cursor.className = 'terminal-cursor';
-      cursor.setAttribute('aria-hidden', 'true');
-      codeEl.appendChild(cursor);
-      var lineIdx = 0;
-
-      function appendLineHtml(html, done) {
-        var span = document.createElement('span');
-        span.innerHTML = html + '\n';
-        codeEl.insertBefore(span, cursor);
-        done();
-      }
-
-      function typeCommand(line, done) {
-        var span = document.createElement('span');
-        codeEl.insertBefore(span, cursor);
-        var i = 0;
-        (function tick() {
-          if (i <= line.raw.length) {
-            span.textContent = line.raw.slice(0, i);
-            i += 2;
-            setTimeout(tick, 16);
-          } else {
-            span.innerHTML = line.html + '\n';
-            done();
-          }
-        })();
-      }
-
-      (function next() {
-        if (lineIdx >= lines.length) {
-          cursor.classList.add('terminal-cursor-idle');
-          return;
-        }
-        var line = lines[lineIdx++];
-        if (/^\$\s/.test(line.raw)) {
-          setTimeout(function () { typeCommand(line, next); }, 260);
-        } else {
-          setTimeout(function () { appendLineHtml(line.html, next); }, line.raw.trim() === '' ? 40 : 90);
-        }
-      })();
-    }
-
-    var seen = new WeakSet();
-    var observer = new IntersectionObserver(function (entries) {
-      entries.forEach(function (entry) {
-        if (!entry.isIntersecting || seen.has(entry.target)) return;
-        seen.add(entry.target);
-        observer.unobserve(entry.target);
-        var codeEl = entry.target.querySelector('pre > code');
-        if (codeEl) replay(codeEl);
-      });
-    }, { threshold: 0.35 });
-
-    terminals.forEach(function (t) { observer.observe(t); });
-  })();
+  // ── 8. Hero Terminal Cursor Blink ──────────────────────────────────
+  // The hero terminal has a static cursor that blinks via CSS animation.
+  // No JS replay needed — the terminal content is pre-rendered in HTML.
 
   // ── 6. Mobile Nav Toggle (JS enhancement over CSS checkbox) ────────
 

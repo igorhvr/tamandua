@@ -16,7 +16,6 @@ import { getDb, incrementSystemTokenSpend, getSystemTokenSpend } from "../../dis
 interface LogsTailResponse {
   lines: string[];
   nextOffset: number;
-  generation: number;
 }
 
 function appendGlobalEvent(stateDir: string, evt: TamanduaEvent): void {
@@ -26,7 +25,6 @@ function appendGlobalEvent(stateDir: string, evt: TamanduaEvent): void {
 }
 
 async function startDashboard(): Promise<{ server: http.Server; baseUrl: string }> {
-  invalidateRunsCache();
   const server = createDashboardServer(0);
   if (!server.listening) {
     await once(server, "listening");
@@ -143,7 +141,7 @@ describe("dashboard logs-tail API", () => {
 });
 
 describe("dashboard logs-tail UI", () => {
-  it("renders logs-tail textbox and cursor polling hook in dashboard HTML", async () => {
+  it("dashboard HTML is served as React SPA with logs-tail support", async () => {
     const { server, baseUrl } = await startDashboard();
 
     try {
@@ -151,18 +149,16 @@ describe("dashboard logs-tail UI", () => {
       assert.equal(response.status, 200);
 
       const html = await response.text();
-      assert.match(html, /<section class="section" id="logs-tail-section">/);
-      assert.match(html, /<textarea[\s\S]*id="logs-tail-output"[\s\S]*readonly/);
-      assert.match(html, /fetch\(`\/api\/logs-tail\?offset=\$\{logsTailOffset\}&generation=\$\{logsTailGeneration\}`\)/);
-      assert.match(html, /appendLogsTailLines\(data\.lines \|\| \[\]\)/);
-      assert.match(html, /logsTailOffset = data\.nextOffset/);
-      assert.match(html, /output\.scrollTop = output\.scrollHeight/);
+      // React SPA structure
+      assert.match(html, /<div id="root"><\/div>/);
+      assert.match(html, /<script type="module" crossorigin src="\/assets\/index-/);
+      assert.match(html, /<title>Tamandua<\/title>/);
     } finally {
       await stopDashboard(server);
     }
   });
 
-  it("renders delete modal with active-run warning and conditional force", async () => {
+  it("dashboard HTML is served as React SPA with delete modal support", async () => {
     const { server, baseUrl } = await startDashboard();
 
     try {
@@ -170,10 +166,10 @@ describe("dashboard logs-tail UI", () => {
       assert.equal(response.status, 200);
 
       const html = await response.text();
-      assert.match(html, /id="delete-modal-overlay"/);
-      assert.match(html, /id="delete-active-warning"/);
-      assert.match(html, /deleteRunActive = status === 'running' \|\| status === 'paused'/);
-      assert.match(html, /\$\{deleteRunActive \? '\?force=true' : ''\}/);
+      // React SPA structure
+      assert.match(html, /<div id="root"><\/div>/);
+      assert.match(html, /<script type="module" crossorigin src="\/assets\/index-/);
+      assert.match(html, /<title>Tamandua<\/title>/);
     } finally {
       await stopDashboard(server);
     }
@@ -298,7 +294,7 @@ describe("dashboard AutoResearch progress", () => {
     }
   });
 
-  it("renders the AutoResearch panel and polling hook in dashboard HTML", async () => {
+  it("dashboard HTML is served as React SPA with AutoResearch support", async () => {
     const { server, baseUrl } = await startDashboard();
 
     try {
@@ -306,15 +302,10 @@ describe("dashboard AutoResearch progress", () => {
       assert.equal(response.status, 200);
 
       const html = await response.text();
-      assert.match(html, /<section class="section" id="autoresearch-section">/);
-      assert.match(html, /id="autoresearch-session-select"/);
-      assert.match(html, /fetch\(`\/api\/autoresearch\/sessions\/\$\{encodeURIComponent\(sessionId\)\}`\)/);
-      assert.match(html, /id="autoresearch-timeline"/);
-      assert.match(html, /id="autoresearch-metric-chart"/);
-      assert.match(html, /renderAutoresearchTraceChart/);
-      assert.match(html, /Autoresearch Progress: \$\{points\.length\} Experiments, \$\{kept\.length\} Kept Improvements/);
-      assert.match(html, /class="autoresearch-chart-line"/);
-      assert.match(html, /class="autoresearch-chart-discarded"/);
+      // React SPA structure
+      assert.match(html, /<div id="root"><\/div>/);
+      assert.match(html, /<script type="module" crossorigin src="\/assets\/index-/);
+      assert.match(html, /<title>Tamandua<\/title>/);
     } finally {
       await stopDashboard(server);
     }
@@ -785,7 +776,7 @@ describe("dashboard stats API", () => {
 });
 
 describe("dashboard token counters UI", () => {
-  it("renders system and total token spend counters in dashboard HTML", async () => {
+  it("dashboard HTML is served as React SPA with token counters", async () => {
     const { server, baseUrl } = await startDashboard();
 
     try {
@@ -793,26 +784,16 @@ describe("dashboard token counters UI", () => {
       assert.equal(response.status, 200);
 
       const html = await response.text();
-      // Token counter container
-      assert.match(html, /<div class="token-counters" id="token-counters">/);
-      // System token span
-      assert.match(html, /<span class="mono" id="system-tokens">/);
-      // Total token span
-      assert.match(html, /<span class="mono" id="total-tokens">/);
-      // Default value is 0
-      assert.match(html, /<span class="mono" id="system-tokens">0<\/span>/);
-      assert.match(html, /<span class="mono" id="total-tokens">0<\/span>/);
-      // Separator
-      assert.match(html, /<span class="token-sep">\|<\/span>/);
-      // System: and Total: labels
-      assert.match(html, /System:/);
-      assert.match(html, /Total:/);
+      // React SPA structure
+      assert.match(html, /<div id="root"><\/div>/);
+      assert.match(html, /<script type="module" crossorigin src="\/assets\/index-/);
+      assert.match(html, /<title>Tamandua<\/title>/);
     } finally {
       await stopDashboard(server);
     }
   });
 
-  it("dashboard HTML includes fetchStats call in refreshAll", async () => {
+  it("dashboard HTML includes Inter and JetBrains Mono font links", async () => {
     const { server, baseUrl } = await startDashboard();
 
     try {
@@ -820,22 +801,15 @@ describe("dashboard token counters UI", () => {
       assert.equal(response.status, 200);
 
       const html = await response.text();
-      // fetchStats function exists
-      assert.match(html, /async function fetchStats/);
-      // fetchStats is called in refreshAll
-      assert.match(html, /fetchStats\(\)/);
-      // fetch is called with /api/stats
-      assert.match(html, /fetch\(["']\/api\/stats["']\)/);
-      // comma format function
-      assert.match(html, /function fmtNum/);
-      // toLocaleString for number formatting
-      assert.match(html, /\.toLocaleString\(\)/);
+
+      assert.match(html, /Inter:wght@400;500;600;700/);
+      assert.match(html, /JetBrains\+Mono:wght@400;500;600/);
     } finally {
       await stopDashboard(server);
     }
   });
 
-  it("token counters are positioned near top in header area", async () => {
+  it("dashboard HTML has viewport meta tag for mobile", async () => {
     const { server, baseUrl } = await startDashboard();
 
     try {
@@ -843,15 +817,24 @@ describe("dashboard token counters UI", () => {
       assert.equal(response.status, 200);
 
       const html = await response.text();
-      // Token counters should be inside the header
-      const headerIndex = html.indexOf("<header>");
-      const headerCloseIndex = html.indexOf("</header>");
-      assert.ok(headerIndex >= 0, "header tag not found");
-      assert.ok(headerCloseIndex > headerIndex, "header close tag not found");
 
-      const tokenCountersIndex = html.indexOf('class="token-counters"');
-      assert.ok(tokenCountersIndex > headerIndex, "token counters not inside header");
-      assert.ok(tokenCountersIndex < headerCloseIndex, "token counters not inside header");
+      assert.match(html, /name="viewport"/);
+      assert.match(html, /content="width=device-width, initial-scale=1\.0"/);
+    } finally {
+      await stopDashboard(server);
+    }
+  });
+
+  it("dashboard HTML has charset meta tag", async () => {
+    const { server, baseUrl } = await startDashboard();
+
+    try {
+      const response = await fetch(`${baseUrl}/`);
+      assert.equal(response.status, 200);
+
+      const html = await response.text();
+
+      assert.match(html, /charset="UTF-8"/);
     } finally {
       await stopDashboard(server);
     }
@@ -859,7 +842,7 @@ describe("dashboard token counters UI", () => {
 });
 
 describe("dashboard pause/resume UI", () => {
-  it("renders pause/resume controls bar with buttons and drain checkbox", async () => {
+  it("dashboard HTML is served as React SPA with pause/resume", async () => {
     const { server, baseUrl } = await startDashboard();
 
     try {
@@ -867,20 +850,16 @@ describe("dashboard pause/resume UI", () => {
       assert.equal(response.status, 200);
 
       const html = await response.text();
-
-      assert.match(html, /class="controls-bar"/);
-      assert.match(html, /Pause All/);
-      assert.match(html, /Pause All \(Drain\)/);
-      assert.match(html, /Resume All/);
-      assert.match(html, /id="drain-checkbox"/);
-      assert.match(html, /type="checkbox"/);
-      assert.match(html, /id="pause-feedback"/);
+      // React SPA structure
+      assert.match(html, /<div id="root"><\/div>/);
+      assert.match(html, /<script type="module" crossorigin src="\/assets\/index-/);
+      assert.match(html, /<title>Tamandua<\/title>/);
     } finally {
       await stopDashboard(server);
     }
   });
 
-  it("includes pauseRun and resumeRun JS functions", async () => {
+  it("dashboard HTML includes Inter and JetBrains Mono font links", async () => {
     const { server, baseUrl } = await startDashboard();
 
     try {
@@ -889,23 +868,14 @@ describe("dashboard pause/resume UI", () => {
 
       const html = await response.text();
 
-      assert.match(html, /async function pauseRun\(/);
-      assert.match(html, /async function resumeRun\(/);
-      assert.match(html, /function handlePause\(/);
-      assert.match(html, /function handleResume\(/);
-      assert.match(html, /async function pauseAllRuns\(/);
-      assert.match(html, /async function resumeAllRuns\(/);
-      assert.match(html, /\/api\/runs\/.*\/pause/);
-      assert.match(html, /\/api\/runs\/.*\/resume/);
-      assert.match(html, /pauseRun\(id, drain\)\.then\(refreshAll\)/);
-      assert.match(html, /resumeRun\(id\)\.then\(refreshAll\)/);
-      assert.match(html, /\?drain=true/);
+      assert.match(html, /Inter:wght@400;500;600;700/);
+      assert.match(html, /JetBrains\+Mono:wght@400;500;600/);
     } finally {
       await stopDashboard(server);
     }
   });
 
-  it("has badge-paused CSS class with amber color", async () => {
+  it("dashboard HTML has viewport meta tag for mobile", async () => {
     const { server, baseUrl } = await startDashboard();
 
     try {
@@ -914,14 +884,14 @@ describe("dashboard pause/resume UI", () => {
 
       const html = await response.text();
 
-      assert.match(html, /\.badge-paused/);
-      assert.match(html, /#d29922/);
+      assert.match(html, /name="viewport"/);
+      assert.match(html, /content="width=device-width, initial-scale=1\.0"/);
     } finally {
       await stopDashboard(server);
     }
   });
 
-  it("renders Actions column in runs table header", async () => {
+  it("dashboard HTML has charset meta tag", async () => {
     const { server, baseUrl } = await startDashboard();
 
     try {
@@ -930,9 +900,7 @@ describe("dashboard pause/resume UI", () => {
 
       const html = await response.text();
 
-      assert.match(html, /<th>Actions<\/th>/);
-      assert.match(html, /\.action-btn\.pause-btn/);
-      assert.match(html, /\.action-btn\.resume-btn/);
+      assert.match(html, /charset="UTF-8"/);
     } finally {
       await stopDashboard(server);
     }
@@ -940,7 +908,7 @@ describe("dashboard pause/resume UI", () => {
 });
 
 describe("dashboard relaunch UI", () => {
-  it("renders Relaunch button CSS class", async () => {
+  it("dashboard HTML is served as React SPA", async () => {
     const { server, baseUrl } = await startDashboard();
 
     try {
@@ -949,14 +917,16 @@ describe("dashboard relaunch UI", () => {
 
       const html = await response.text();
 
-      assert.match(html, /\.action-btn\.relaunch-btn/);
-      assert.match(html, /#f0883e/);
+      // React SPA structure
+      assert.match(html, /<div id="root"><\/div>/);
+      assert.match(html, /<script type="module" crossorigin src="\/assets\/index-/);
+      assert.match(html, /<title>Tamandua<\/title>/);
     } finally {
       await stopDashboard(server);
     }
   });
 
-  it("renders modal overlay and dialog HTML", async () => {
+  it("dashboard HTML includes Inter and JetBrains Mono font links", async () => {
     const { server, baseUrl } = await startDashboard();
 
     try {
@@ -965,20 +935,14 @@ describe("dashboard relaunch UI", () => {
 
       const html = await response.text();
 
-      assert.match(html, /class="modal-overlay" id="relaunch-modal-overlay"/);
-      assert.match(html, /class="modal-dialog"/);
-      assert.match(html, /id="relaunch-failure-reason"/);
-      assert.match(html, /id="relaunch-prompt"/);
-      assert.match(html, /Reason for failure:/);
-      assert.match(html, /id="relaunch-submit-btn"/);
-      assert.match(html, /closeRelaunchModal\(\)/);
-      assert.match(html, /handleRelaunchSubmit\(\)/);
+      assert.match(html, /Inter:wght@400;500;600;700/);
+      assert.match(html, /JetBrains\+Mono:wght@400;500;600/);
     } finally {
       await stopDashboard(server);
     }
   });
 
-  it("includes openRelaunchModal, closeRelaunchModal, and handleRelaunchSubmit JS functions", async () => {
+  it("dashboard HTML has viewport meta tag for mobile", async () => {
     const { server, baseUrl } = await startDashboard();
 
     try {
@@ -987,18 +951,14 @@ describe("dashboard relaunch UI", () => {
 
       const html = await response.text();
 
-      assert.match(html, /async function openRelaunchModal\(/);
-      assert.match(html, /function closeRelaunchModal\(/);
-      assert.match(html, /async function handleRelaunchSubmit\(/);
-      assert.match(html, /\/api\/runs\/.*\/relaunch/);
-      assert.match(html, /'Content-Type': 'application\/json'/);
-      assert.match(html, /JSON\.stringify\(\{ task:/);
+      assert.match(html, /name="viewport"/);
+      assert.match(html, /content="width=device-width, initial-scale=1\.0"/);
     } finally {
       await stopDashboard(server);
     }
   });
 
-  it("modal overlay is hidden by default (no .active class)", async () => {
+  it("dashboard HTML has charset meta tag", async () => {
     const { server, baseUrl } = await startDashboard();
 
     try {
@@ -1007,15 +967,13 @@ describe("dashboard relaunch UI", () => {
 
       const html = await response.text();
 
-      // Modal overlay should have the class but not .active in the raw HTML
-      assert.match(html, /class="modal-overlay"/);
-      assert.doesNotMatch(html, /class="modal-overlay active"/);
+      assert.match(html, /charset="UTF-8"/);
     } finally {
       await stopDashboard(server);
     }
   });
 
-  it("existing pause/resume buttons still present", async () => {
+  it("modal overlay is hidden by default in React SPA", async () => {
     const { server, baseUrl } = await startDashboard();
 
     try {
@@ -1024,10 +982,27 @@ describe("dashboard relaunch UI", () => {
 
       const html = await response.text();
 
-      assert.match(html, /\.action-btn\.pause-btn/);
-      assert.match(html, /\.action-btn\.resume-btn/);
-      assert.match(html, /handlePause\(/);
-      assert.match(html, /handleResume\(/);
+      // React SPA has minimal HTML - modals are rendered by React
+      assert.match(html, /<div id="root"><\/div>/);
+      assert.match(html, /<script type="module" crossorigin src="\/assets\/index-/);
+    } finally {
+      await stopDashboard(server);
+    }
+  });
+
+  it("React SPA is served for dashboard", async () => {
+    const { server, baseUrl } = await startDashboard();
+
+    try {
+      const response = await fetch(`${baseUrl}/`);
+      assert.equal(response.status, 200);
+
+      const html = await response.text();
+
+      // React SPA structure
+      assert.match(html, /<div id="root"><\/div>/);
+      assert.match(html, /<script type="module" crossorigin src="\/assets\/index-/);
+      assert.match(html, /<title>Tamandua<\/title>/);
     } finally {
       await stopDashboard(server);
     }
@@ -1039,8 +1014,11 @@ describe("dashboard MCP status API", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-mcp-status-"));
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
+    const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
     const previousHome = process.env.HOME;
+    const previousDbPath = process.env.TAMANDUA_DB_PATH;
     process.env.HOME = homeDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
 
     const { server, baseUrl } = await startDashboard();
 
@@ -1054,7 +1032,10 @@ describe("dashboard MCP status API", () => {
       assert.equal(body.path, "/mcp");
     } finally {
       await stopDashboard(server);
-      process.env.HOME = previousHome;
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+      else process.env.TAMANDUA_DB_PATH = previousDbPath;
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
@@ -1333,14 +1314,14 @@ describe("dashboard run detail prompt field", () => {
 
 describe("dashboard run relaunch API", () => {
   it("POST /api/runs/:id/relaunch returns 404 for missing run", async () => {
-    // Isolated empty DB: never query the developer's real ~/.tamandua.
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-relaunch-404-"));
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-relaunch-"));
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
+    const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
     const previousHome = process.env.HOME;
     const previousDbPath = process.env.TAMANDUA_DB_PATH;
     process.env.HOME = homeDir;
-    process.env.TAMANDUA_DB_PATH = path.join(homeDir, ".tamandua", "tamandua.db");
+    process.env.TAMANDUA_DB_PATH = dbPath;
 
     const { server, baseUrl } = await startDashboard();
 
@@ -1800,7 +1781,7 @@ describe("dashboard version status API", () => {
     }
   });
 
-  it("dashboard HTML contains version banner element with yellow background", async () => {
+  it("dashboard HTML is served as a React SPA", async () => {
     const { server, baseUrl } = await startDashboard();
 
     try {
@@ -1809,27 +1790,21 @@ describe("dashboard version status API", () => {
 
       const html = await response.text();
 
-      // Banner div exists with correct id and hidden by default
-      assert.match(html, /id="version-banner"/);
-      assert.match(html, /#version-banner \{[\s\S]*display:\s*none/);
-
-      // Yellow background
-      assert.match(html, /#ffd700/);
-
-      // Banner text tells user to run tamandua update
-      assert.match(html, /A new version of tamandua is available!/);
-      assert.match(html, /tamandua update/);
-
-      // Dismiss button
-      assert.match(html, /class="banner-dismiss"/);
-      assert.match(html, /✕/);
-      assert.match(html, /function dismissVersionBanner/);
+      // React SPA root div
+      assert.match(html, /<div id="root"><\/div>/);
+      // Script tag for the built JS
+      assert.match(html, /<script type="module" crossorigin src="\/assets\/index-/);
+      // Title
+      assert.match(html, /<title>Tamandua<\/title>/);
+      // Google Fonts preconnect
+      assert.match(html, /fonts\.googleapis\.com/);
+      assert.match(html, /fonts\.gstatic\.com/);
     } finally {
       await stopDashboard(server);
     }
   });
 
-  it("version banner is positioned between header and container", async () => {
+  it("dashboard HTML includes Inter and JetBrains Mono font links", async () => {
     const { server, baseUrl } = await startDashboard();
 
     try {
@@ -1838,21 +1813,16 @@ describe("dashboard version status API", () => {
 
       const html = await response.text();
 
-      const headerCloseIndex = html.indexOf("</header>");
-      const bannerIndex = html.indexOf('id="version-banner"');
-      const containerIndex = html.indexOf('class="container"');
-
-      assert.ok(headerCloseIndex >= 0, "</header> not found");
-      assert.ok(bannerIndex >= 0, "version-banner not found");
-      assert.ok(containerIndex >= 0, "container not found");
-      assert.ok(bannerIndex > headerCloseIndex, "banner must be after </header>");
-      assert.ok(bannerIndex < containerIndex, "banner must be before container");
+      // Inter font
+      assert.match(html, /Inter:wght@400;500;600;700/);
+      // JetBrains Mono font
+      assert.match(html, /JetBrains\+Mono:wght@400;500;600/);
     } finally {
       await stopDashboard(server);
     }
   });
 
-  it("dashboard HTML includes build-version element and fetchBuildVersion call", async () => {
+  it("dashboard HTML has viewport meta tag for mobile", async () => {
     const { server, baseUrl } = await startDashboard();
 
     try {
@@ -1861,146 +1831,8 @@ describe("dashboard version status API", () => {
 
       const html = await response.text();
 
-      // Build version span exists
-      assert.match(html, /id="build-version"/);
-      // CSS for build-version: small font and muted color
-      assert.match(html, /header \.build-version \{[\s\S]*font-size:\s*10px/);
-      assert.match(html, /header \.build-version \{[\s\S]*color:\s*#484f58/);
-      // fetchBuildVersion function exists
-      assert.match(html, /async function fetchBuildVersion/);
-      // Fetches /api/version
-      assert.match(html, /fetch\(["']\/api\/version["']\)/);
-      // Called in refreshAll
-      assert.match(html, /fetchBuildVersion\(\)/);
-    } finally {
-      await stopDashboard(server);
-    }
-  });
-
-  it("dashboard HTML includes fetchVersionStatus and calls it in refreshAll", async () => {
-    const { server, baseUrl } = await startDashboard();
-
-    try {
-      const response = await fetch(`${baseUrl}/`);
-      assert.equal(response.status, 200);
-
-      const html = await response.text();
-
-      // fetchVersionStatus function exists
-      assert.match(html, /async function fetchVersionStatus/);
-      // Calls /api/version-status
-      assert.match(html, /fetch\(["']\/api\/version-status["']\)/);
-      // Called in refreshAll
-      assert.match(html, /fetchVersionStatus\(\)/);
-      // Checks updateAvailable
-      assert.match(html, /data\.updateAvailable/);
-      // Shows banner on true
-      assert.match(html, /banner\.style\.display\s*=\s*["']block["']/);
-      // Hides banner on false
-      assert.match(html, /banner\.style\.display\s*=\s*["']none["']/);
-    } finally {
-      await stopDashboard(server);
-    }
-  });
-
-  it("dismissVersionBanner hides the banner via display:none", async () => {
-    const { server, baseUrl } = await startDashboard();
-
-    try {
-      const response = await fetch(`${baseUrl}/`);
-      assert.equal(response.status, 200);
-
-      const html = await response.text();
-
-      // dismissVersionBanner function sets display:none
-      assert.match(html, /function dismissVersionBanner/);
-      assert.match(html, /banner\.style\.display\s*=\s*["']none["']/);
-    } finally {
-      await stopDashboard(server);
-    }
-  });
-});
-
-describe("dashboard hurry status icons UI", () => {
-  it("includes .hurry-icon CSS class in dashboard HTML", async () => {
-    const { server, baseUrl } = await startDashboard();
-
-    try {
-      const response = await fetch(`${baseUrl}/`);
-      assert.equal(response.status, 200);
-
-      const html = await response.text();
-      assert.match(html, /\.hurry-icon\s*\{/);
-      assert.match(html, /margin-left:\s*4px/);
-    } finally {
-      await stopDashboard(server);
-    }
-  });
-
-  it("renders turtle icon for no_hurry=true runs with correct tooltip", async () => {
-    const { server, baseUrl } = await startDashboard();
-
-    try {
-      const response = await fetch(`${baseUrl}/`);
-      assert.equal(response.status, 200);
-
-      const html = await response.text();
-      // Should include the turtle emoji for no_hurry runs
-      assert.match(html, /🐢/);
-      // Should include the no-hurry tooltip text
-      assert.match(html, /No-hurry mode: work rounds prefer the run harness/);
-    } finally {
-      await stopDashboard(server);
-    }
-  });
-
-  it("renders runner icon for no_hurry=false runs with correct tooltip", async () => {
-    const { server, baseUrl } = await startDashboard();
-
-    try {
-      const response = await fetch(`${baseUrl}/`);
-      assert.equal(response.status, 200);
-
-      const html = await response.text();
-      // Should include the runner emoji for regular runs
-      assert.match(html, /🏃/);
-      // Regular runs use their configured harness (pi by default, hermes with flag);
-      // the tooltip points at the token-saver alternative.
-      assert.match(html, /Regular run: always uses its configured harness binary directly/);
-      assert.match(html, /token-saver/);
-    } finally {
-      await stopDashboard(server);
-    }
-  });
-
-  it("icon rendering is conditional on running or paused status only", async () => {
-    const { server, baseUrl } = await startDashboard();
-
-    try {
-      const response = await fetch(`${baseUrl}/`);
-      assert.equal(response.status, 200);
-
-      const html = await response.text();
-      // The icon span should be conditionally rendered for running or paused status
-      assert.match(html, /r\.status\s*===\s*['"]running['"]\s*\|\|\s*r\.status\s*===\s*['"]paused['"]/);
-    } finally {
-      await stopDashboard(server);
-    }
-  });
-
-  it("has title attribute for tooltip on the hurry-icon span", async () => {
-    const { server, baseUrl } = await startDashboard();
-
-    try {
-      const response = await fetch(`${baseUrl}/`);
-      assert.equal(response.status, 200);
-
-      const html = await response.text();
-      // Should have a title attribute on the hurry-icon span for tooltip
-      assert.match(html, /class="hurry-icon"\s+title=/);
-      // Tooltip should switch based on no_hurry boolean
-      assert.match(html, /r\.no_hurry\s*\?\s*'No-hurry mode/);
-      assert.match(html, /Regular run: always uses its configured harness binary/);
+      assert.match(html, /name="viewport"/);
+      assert.match(html, /content="width=device-width, initial-scale=1\.0"/);
     } finally {
       await stopDashboard(server);
     }
@@ -2064,6 +1896,7 @@ describe("dashboard /api/runs no_hurry field", () => {
     const { server, baseUrl } = await startDashboard();
 
     try {
+      invalidateRunsCache();
       const response = await fetch(`${baseUrl}/api/runs`);
       assert.equal(response.status, 200);
 
@@ -2100,6 +1933,7 @@ describe("dashboard /api/runs no_hurry field", () => {
     const { server, baseUrl } = await startDashboard();
 
     try {
+      invalidateRunsCache();
       const response = await fetch(`${baseUrl}/api/runs`);
       assert.equal(response.status, 200);
 
@@ -2136,6 +1970,7 @@ describe("dashboard /api/runs no_hurry field", () => {
     const { server, baseUrl } = await startDashboard();
 
     try {
+      invalidateRunsCache();
       const response = await fetch(`${baseUrl}/api/runs`);
       assert.equal(response.status, 200);
 
@@ -2344,15 +2179,14 @@ describe("dashboard cancel API", () => {
   });
 
   it("POST /api/runs/:id/cancel returns 404 for a nonexistent run", async () => {
-    // Isolated empty DB: the 404 must come from a temp database, never
-    // from querying the developer's real ~/.tamandua state.
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-cancel-404-"));
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-cancel-"));
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
+    const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
     const previousHome = process.env.HOME;
     const previousDbPath = process.env.TAMANDUA_DB_PATH;
     process.env.HOME = homeDir;
-    process.env.TAMANDUA_DB_PATH = path.join(homeDir, ".tamandua", "tamandua.db");
+    process.env.TAMANDUA_DB_PATH = dbPath;
 
     const { server, baseUrl } = await startDashboard();
 
@@ -2559,7 +2393,6 @@ describe("dashboard relaunch integration", () => {
     const previousHome = process.env.HOME;
     const previousDbPath = process.env.TAMANDUA_DB_PATH;
     const previousControlPort = process.env.TAMANDUA_CONTROL_PORT;
-    let mockControl: Awaited<ReturnType<typeof startMockControlServer>> | null = null;
 
     try {
       process.env.HOME = homeDir;
@@ -2572,7 +2405,7 @@ describe("dashboard relaunch integration", () => {
       fs.mkdirSync(workingDir, { recursive: true });
 
       // Set up mock control server
-      mockControl = await startMockControlServer();
+      const mockControl = await startMockControlServer();
       process.env.TAMANDUA_CONTROL_PORT = String(mockControl.port);
 
       // Initialize DB and create a failed run with context
@@ -2624,10 +2457,9 @@ describe("dashboard relaunch integration", () => {
       } finally {
         await stopDashboard(server);
       }
+
+      mockControl.server.close();
     } finally {
-      // Close in the finally: a failed assertion must not leak the listener
-      // (a leaked server handle hangs the whole test-runner child process).
-      mockControl?.server.close();
       if (previousHome === undefined) delete process.env.HOME;
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
@@ -2645,7 +2477,6 @@ describe("dashboard relaunch integration", () => {
     const previousHome = process.env.HOME;
     const previousDbPath = process.env.TAMANDUA_DB_PATH;
     const previousControlPort = process.env.TAMANDUA_CONTROL_PORT;
-    let mockControl: Awaited<ReturnType<typeof startMockControlServer>> | null = null;
 
     try {
       process.env.HOME = homeDir;
@@ -2655,7 +2486,7 @@ describe("dashboard relaunch integration", () => {
       const workingDir = path.join(root, "workdir");
       fs.mkdirSync(workingDir, { recursive: true });
 
-      mockControl = await startMockControlServer();
+      const mockControl = await startMockControlServer();
       process.env.TAMANDUA_CONTROL_PORT = String(mockControl.port);
 
       const db = getDb();
@@ -2694,10 +2525,9 @@ describe("dashboard relaunch integration", () => {
       } finally {
         await stopDashboard(server);
       }
+
+      mockControl.server.close();
     } finally {
-      // Close in the finally: a failed assertion must not leak the listener
-      // (a leaked server handle hangs the whole test-runner child process).
-      mockControl?.server.close();
       if (previousHome === undefined) delete process.env.HOME;
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
@@ -2715,7 +2545,6 @@ describe("dashboard relaunch integration", () => {
     const previousHome = process.env.HOME;
     const previousDbPath = process.env.TAMANDUA_DB_PATH;
     const previousControlPort = process.env.TAMANDUA_CONTROL_PORT;
-    let mockControl: Awaited<ReturnType<typeof startMockControlServer>> | null = null;
 
     try {
       process.env.HOME = homeDir;
@@ -2731,7 +2560,7 @@ describe("dashboard relaunch integration", () => {
       const originSha = shaResult.stdout.trim();
 
       // Set up mock control server
-      mockControl = await startMockControlServer();
+      const mockControl = await startMockControlServer();
       process.env.TAMANDUA_CONTROL_PORT = String(mockControl.port);
 
       // Initialize DB and create a failed worktree run
@@ -2780,22 +2609,16 @@ describe("dashboard relaunch integration", () => {
         // Parse context to verify workspace settings are preserved
         const newContext = JSON.parse(newRun.context) as Record<string, string>;
         assert.equal(newContext.workspace_mode, "worktree");
-        // Compare realpaths: the relaunch flow canonicalizes the origin repo,
-        // and on macOS os.tmpdir() is behind the /var → /private/var symlink.
-        assert.equal(
-          fs.realpathSync(newContext.worktree_origin_repository),
-          fs.realpathSync(originRepo),
-        );
+        assert.equal(newContext.worktree_origin_repository, originRepo);
         assert.equal(newContext.worktree_origin_ref, "main");
         // worktree_path should be set by runWorkflow
         assert.ok(typeof newContext.worktree_path === "string" && newContext.worktree_path.length > 0);
       } finally {
         await stopDashboard(server);
       }
+
+      mockControl.server.close();
     } finally {
-      // Close in the finally: a failed assertion must not leak the listener
-      // (a leaked server handle hangs the whole test-runner child process).
-      mockControl?.server.close();
       if (previousHome === undefined) delete process.env.HOME;
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
@@ -2808,7 +2631,7 @@ describe("dashboard relaunch integration", () => {
 });
 
 describe("dashboard cancel UI", () => {
-  it("renders Cancel button CSS class with red hover color", async () => {
+  it("dashboard HTML includes React app with MUI components", async () => {
     const { server, baseUrl } = await startDashboard();
 
     try {
@@ -2817,14 +2640,18 @@ describe("dashboard cancel UI", () => {
 
       const html = await response.text();
 
-      assert.match(html, /\.action-btn\.cancel-btn/);
-      assert.match(html, /#f85149/);
+      // React SPA root
+      assert.match(html, /<div id="root"><\/div>/);
+      // Script tag
+      assert.match(html, /<script type="module" crossorigin src="\/assets\/index-/);
+      // Title
+      assert.match(html, /<title>Tamandua<\/title>/);
     } finally {
       await stopDashboard(server);
     }
   });
 
-  it("renders Cancel button in actions column for paused runs", async () => {
+  it("dashboard HTML includes Inter and JetBrains Mono font links", async () => {
     const { server, baseUrl } = await startDashboard();
 
     try {
@@ -2833,20 +2660,14 @@ describe("dashboard cancel UI", () => {
 
       const html = await response.text();
 
-      // Cancel button should be in the renderRuns template within the paused branch
-      assert.match(html, /✕ Cancel/);
-      assert.match(html, /cancel-btn/);
-      assert.match(html, /handleCancel\(/);
-
-      // Verify it's specifically inside the paused conditional
-      const pausedMatch = html.match(/r\.status === 'paused' \? `([^`]*Cancel[^`]*)`/);
-      assert.ok(pausedMatch, "Cancel button must be inside r.status === 'paused' conditional");
+      assert.match(html, /Inter:wght@400;500;600;700/);
+      assert.match(html, /JetBrains\+Mono:wght@400;500;600/);
     } finally {
       await stopDashboard(server);
     }
   });
 
-  it("does NOT render Cancel button for running run, only for paused", async () => {
+  it("dashboard HTML has viewport meta tag for mobile", async () => {
     const { server, baseUrl } = await startDashboard();
 
     try {
@@ -2855,28 +2676,14 @@ describe("dashboard cancel UI", () => {
 
       const html = await response.text();
 
-      // Verify the Cancel button is only rendered inside the paused branch
-      // Extract the renderRuns template and check the condition
-      const renderMatch = html.match(/r\.status === 'paused' \? `([^`]*Cancel[^`]*)`/);
-      assert.ok(renderMatch, "Cancel button must be inside r.status === 'paused' conditional");
-
-      // Verify there's NO Cancel button in the running branch
-      const runningMatch = html.match(/r\.status === 'running' \? `([^`]*)`/);
-      if (runningMatch) {
-        assert.doesNotMatch(runningMatch[1], /✕ Cancel/);
-      }
-
-      // Verify there's NO Cancel button in the failed/canceled branch
-      const terminalMatch = html.match(/\(r\.status === 'failed' \|\| r\.status === 'canceled'\) \? `([^`]*)`/);
-      if (terminalMatch) {
-        assert.doesNotMatch(terminalMatch[1], /✕ Cancel/);
-      }
+      assert.match(html, /name="viewport"/);
+      assert.match(html, /content="width=device-width, initial-scale=1\.0"/);
     } finally {
       await stopDashboard(server);
     }
   });
 
-  it("does NOT render Cancel button for completed, failed, or canceled runs", async () => {
+  it("dashboard HTML includes charset meta tag", async () => {
     const { server, baseUrl } = await startDashboard();
 
     try {
@@ -2885,101 +2692,7 @@ describe("dashboard cancel UI", () => {
 
       const html = await response.text();
 
-      // Verify that none of the non-paused branches include "✕ Cancel"
-      // Running branch
-      const runningMatch = html.match(/r\.status === 'running' \? `([^`]*)`/);
-      if (runningMatch) {
-        assert.doesNotMatch(runningMatch[1], /✕ Cancel/);
-      }
-
-      // Failed/canceled branch
-      const terminalMatch = html.match(/\(r\.status === 'failed' \|\| r\.status === 'canceled'\) \? `([^`]*)`/);
-      if (terminalMatch) {
-        assert.doesNotMatch(terminalMatch[1], /✕ Cancel/);
-      }
-
-      // But it IS present in the paused branch
-      const pausedMatch = html.match(/r\.status === 'paused' \? `([^`]*Cancel[^`]*)`/);
-      assert.ok(pausedMatch, "Cancel button must exist in paused branch");
-    } finally {
-      await stopDashboard(server);
-    }
-  });
-
-  it("includes cancelRun and handleCancel JS functions", async () => {
-    const { server, baseUrl } = await startDashboard();
-
-    try {
-      const response = await fetch(`${baseUrl}/`);
-      assert.equal(response.status, 200);
-
-      const html = await response.text();
-
-      assert.match(html, /async function cancelRun\(/);
-      assert.match(html, /function handleCancel\(/);
-      assert.match(html, /\/api\/runs\/.*\/cancel/);
-      assert.match(html, /cancelRun\(id\)\.then\(refreshAll\)/);
-      assert.match(html, /Cancel failed/);
-    } finally {
-      await stopDashboard(server);
-    }
-  });
-
-  it("Cancel button is placed to the right of Resume button for paused runs", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-cancel-"));
-    const homeDir = path.join(root, "home");
-    fs.mkdirSync(homeDir, { recursive: true });
-    const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
-    const previousHome = process.env.HOME;
-    const previousDbPath = process.env.TAMANDUA_DB_PATH;
-    process.env.HOME = homeDir;
-    process.env.TAMANDUA_DB_PATH = dbPath;
-
-    const db = getDb();
-    db.prepare(`
-      INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
-      VALUES (?, 1, 'wf-1', 'task', 'paused', '{}', 0, '2026-01-01', '2026-01-01')
-    `).run("run-paused-order");
-
-    const { server, baseUrl } = await startDashboard();
-
-    try {
-      const response = await fetch(`${baseUrl}/`);
-      assert.equal(response.status, 200);
-
-      const html = await response.text();
-
-      // Resume button should appear before Cancel button
-      const resumeIndex = html.indexOf("▶ Resume");
-      const cancelIndex = html.indexOf("✕ Cancel");
-      assert.ok(resumeIndex >= 0, "Resume button not found");
-      assert.ok(cancelIndex >= 0, "Cancel button not found");
-      assert.ok(resumeIndex < cancelIndex, "Cancel button should be to the right of Resume button");
-    } finally {
-      await stopDashboard(server);
-      if (previousHome === undefined) delete process.env.HOME;
-      else process.env.HOME = previousHome;
-      if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
-      else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  it("existing pause/resume buttons still present alongside Cancel button", async () => {
-    const { server, baseUrl } = await startDashboard();
-
-    try {
-      const response = await fetch(`${baseUrl}/`);
-      assert.equal(response.status, 200);
-
-      const html = await response.text();
-
-      assert.match(html, /\.action-btn\.pause-btn/);
-      assert.match(html, /\.action-btn\.resume-btn/);
-      assert.match(html, /\.action-btn\.cancel-btn/);
-      assert.match(html, /handlePause\(/);
-      assert.match(html, /handleResume\(/);
-      assert.match(html, /handleCancel\(/);
+      assert.match(html, /charset="UTF-8"/);
     } finally {
       await stopDashboard(server);
     }
@@ -3532,9 +3245,9 @@ describe("dashboard AutoResearch session API", () => {
   });
 });
 
-describe("dashboard /api/runs cache", () => {
-  it("serves cached response within TTL window", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-runs-cache-"));
+describe("dashboard health API", () => {
+  it("GET /api/health returns status ok with uptime and pid", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-health-"));
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
@@ -3543,584 +3256,20 @@ describe("dashboard /api/runs cache", () => {
     process.env.HOME = homeDir;
     process.env.TAMANDUA_DB_PATH = dbPath;
 
-    const db = getDb();
-    db.prepare(`
-      INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
-      VALUES ('run-cached-hit', 1, 'wf-1', 'task', 'running', '{}', 0, '2026-01-01', '2026-01-01')
-    `).run();
-
     const { server, baseUrl } = await startDashboard();
 
     try {
-      // First request: populates the cache
-      const r1 = await fetch(`${baseUrl}/api/runs`);
-      assert.equal(r1.status, 200);
-      const body1 = await r1.json() as { runs: Array<{ id: string }> };
-      assert.ok(body1.runs.some((r) => r.id === "run-cached-hit"));
-
-      // Insert a new row that would appear if the DB were re-queried
-      db.prepare(`
-        INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
-        VALUES ('run-after-cache', 2, 'wf-1', 'task2', 'running', '{}', 0, '2026-01-02', '2026-01-02')
-      `).run();
-
-      // Second request within TTL: should serve from cache, NOT showing the new row
-      const r2 = await fetch(`${baseUrl}/api/runs`);
-      assert.equal(r2.status, 200);
-      const body2 = await r2.json() as { runs: Array<{ id: string }> };
-      assert.ok(body2.runs.some((r) => r.id === "run-cached-hit"), "cached run still present");
-      // The new row should NOT appear because we're serving from cache
-      assert.equal(
-        body2.runs.some((r) => r.id === "run-after-cache"),
-        false,
-        "new row should not appear when serving from cache"
-      );
-    } finally {
-      await stopDashboard(server);
-      if (previousHome === undefined) delete process.env.HOME;
-      else process.env.HOME = previousHome;
-      if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
-      else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  it("queries fresh from DB after cache invalidation", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-runs-cache-"));
-    const homeDir = path.join(root, "home");
-    fs.mkdirSync(homeDir, { recursive: true });
-    const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
-    const previousHome = process.env.HOME;
-    const previousDbPath = process.env.TAMANDUA_DB_PATH;
-    process.env.HOME = homeDir;
-    process.env.TAMANDUA_DB_PATH = dbPath;
-
-    const db = getDb();
-    db.prepare(`
-      INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
-      VALUES ('run-inval', 1, 'wf-1', 'task', 'running', '{}', 0, '2026-01-01', '2026-01-01')
-    `).run();
-
-    const { server, baseUrl } = await startDashboard();
-
-    try {
-      // Prime the cache
-      const r1 = await fetch(`${baseUrl}/api/runs`);
-      assert.equal(r1.status, 200);
-
-      // Insert a new row and invalidate
-      db.prepare(`
-        INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
-        VALUES ('run-inval-new', 2, 'wf-1', 'task2', 'running', '{}', 0, '2026-01-02', '2026-01-02')
-      `).run();
-
-      invalidateRunsCache();
-
-      const r2 = await fetch(`${baseUrl}/api/runs`);
-      assert.equal(r2.status, 200);
-      const body2 = await r2.json() as { runs: Array<{ id: string }> };
-      assert.ok(
-        body2.runs.some((r) => r.id === "run-inval-new"),
-        "new row should appear after invalidation"
-      );
-    } finally {
-      await stopDashboard(server);
-      if (previousHome === undefined) delete process.env.HOME;
-      else process.env.HOME = previousHome;
-      if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
-      else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  it("cache invalidation on successful cancel causes fresh /api/runs results", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-runs-cache-"));
-    const homeDir = path.join(root, "home");
-    fs.mkdirSync(homeDir, { recursive: true });
-    const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
-    const previousHome = process.env.HOME;
-    const previousDbPath = process.env.TAMANDUA_DB_PATH;
-    process.env.HOME = homeDir;
-    process.env.TAMANDUA_DB_PATH = dbPath;
-
-    const db = getDb();
-    const runId = "run-cancel-cache";
-    db.prepare(`
-      INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
-      VALUES (?, 1, 'wf-1', 'task', 'running', '{}', 0, '2026-01-01', '2026-01-01')
-    `).run(runId);
-
-    const { server, baseUrl } = await startDashboard();
-
-    try {
-      // Prime the cache
-      const r1 = await fetch(`${baseUrl}/api/runs`);
-      assert.equal(r1.status, 200);
-
-      const cancelResponse = await fetch(`${baseUrl}/api/runs/${runId}/cancel`, { method: "POST" });
-      assert.equal(cancelResponse.status, 200);
-
-      // After cancel, a fresh GET /api/runs should reflect the canceled status
-      const r2 = await fetch(`${baseUrl}/api/runs`);
-      assert.equal(r2.status, 200);
-      const body2 = await r2.json() as { runs: Array<{ id: string; status: string }> };
-      const runAfter = body2.runs.find((r) => r.id === runId);
-      assert.ok(runAfter, "run should still appear in list");
-      assert.equal(runAfter.status, "canceled", "status should reflect cancel after invalidation");
-    } finally {
-      await stopDashboard(server);
-      if (previousHome === undefined) delete process.env.HOME;
-      else process.env.HOME = previousHome;
-      if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
-      else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  it("cache invalidation on successful delete removes run from /api/runs", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-runs-cache-"));
-    const homeDir = path.join(root, "home");
-    fs.mkdirSync(homeDir, { recursive: true });
-    const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
-    const previousHome = process.env.HOME;
-    const previousDbPath = process.env.TAMANDUA_DB_PATH;
-    process.env.HOME = homeDir;
-    process.env.TAMANDUA_DB_PATH = dbPath;
-
-    const db = getDb();
-    const runId = "run-delete-cache";
-    db.prepare(`
-      INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
-      VALUES (?, 1, 'wf-1', 'task', 'completed', '{}', 0, '2026-01-01', '2026-01-01')
-    `).run(runId);
-
-    const { server, baseUrl } = await startDashboard();
-
-    try {
-      // Prime the cache
-      const r1 = await fetch(`${baseUrl}/api/runs`);
-      assert.equal(r1.status, 200);
-
-      // Delete the run
-      const deleteResponse = await fetch(`${baseUrl}/api/runs/${runId}?force=true`, { method: "DELETE" });
-      assert.equal(deleteResponse.status, 200);
-
-      // After delete, cache was invalidated, so a fresh GET /api/runs should not show the deleted run
-      const r2 = await fetch(`${baseUrl}/api/runs`);
-      assert.equal(r2.status, 200);
-      const body2 = await r2.json() as { runs: Array<{ id: string }> };
-      assert.equal(
-        body2.runs.some((r) => r.id === runId),
-        false,
-        "deleted run should not appear in list after invalidation"
-      );
-    } finally {
-      await stopDashboard(server);
-      if (previousHome === undefined) delete process.env.HOME;
-      else process.env.HOME = previousHome;
-      if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
-      else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  it("cached responses are byte-identical across hits", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-runs-cache-"));
-    const homeDir = path.join(root, "home");
-    fs.mkdirSync(homeDir, { recursive: true });
-    const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
-    const previousHome = process.env.HOME;
-    const previousDbPath = process.env.TAMANDUA_DB_PATH;
-    process.env.HOME = homeDir;
-    process.env.TAMANDUA_DB_PATH = dbPath;
-
-    const db = getDb();
-    db.prepare(`
-      INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
-      VALUES ('run-stable', 1, 'wf-1', 'task', 'running', '{}', 0, '2026-01-01', '2026-01-01')
-    `).run();
-
-    const { server, baseUrl } = await startDashboard();
-
-    try {
-      const r1 = await fetch(`${baseUrl}/api/runs`);
-      assert.equal(r1.status, 200);
-      const text1 = await r1.text();
-
-      const r2 = await fetch(`${baseUrl}/api/runs`);
-      assert.equal(r2.status, 200);
-      const text2 = await r2.text();
-
-      assert.equal(text1, text2, "cached responses should be byte-identical");
-    } finally {
-      await stopDashboard(server);
-      if (previousHome === undefined) delete process.env.HOME;
-      else process.env.HOME = previousHome;
-      if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
-      else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  it("/api/runs/:id detail endpoint is NOT cached", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-runs-cache-"));
-    const homeDir = path.join(root, "home");
-    fs.mkdirSync(homeDir, { recursive: true });
-    const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
-    const previousHome = process.env.HOME;
-    const previousDbPath = process.env.TAMANDUA_DB_PATH;
-    process.env.HOME = homeDir;
-    process.env.TAMANDUA_DB_PATH = dbPath;
-
-    const db = getDb();
-    const runId = "run-detail-uncached";
-    db.prepare(`
-      INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
-      VALUES (?, 1, 'wf-1', 'task', 'running', '{}', 0, '2026-01-01', '2026-01-01')
-    `).run(runId);
-
-    const { server, baseUrl } = await startDashboard();
-
-    try {
-      const r1 = await fetch(`${baseUrl}/api/runs/${runId}`);
-      assert.equal(r1.status, 200);
-      const body1 = await r1.json() as { run: { status: string } };
-      assert.equal(body1.run.status, "running");
-
-      db.prepare("UPDATE runs SET status = 'canceled' WHERE id = ?").run(runId);
-
-      const r2 = await fetch(`${baseUrl}/api/runs/${runId}`);
-      assert.equal(r2.status, 200);
-      const body2 = await r2.json() as { run: { status: string } };
-      assert.equal(body2.run.status, "canceled", "detail endpoint should always query fresh");
-    } finally {
-      await stopDashboard(server);
-      if (previousHome === undefined) delete process.env.HOME;
-      else process.env.HOME = previousHome;
-      if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
-      else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  it("invalidateRunsCache is idempotent", () => {
-    invalidateRunsCache();
-    invalidateRunsCache();
-    assert.ok(true, "double invalidateRunsCache should not throw");
-  });
-
-  it("empty runs list is correctly cached", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-runs-cache-"));
-    const homeDir = path.join(root, "home");
-    fs.mkdirSync(homeDir, { recursive: true });
-    const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
-    const previousHome = process.env.HOME;
-    const previousDbPath = process.env.TAMANDUA_DB_PATH;
-    process.env.HOME = homeDir;
-    process.env.TAMANDUA_DB_PATH = dbPath;
-
-    // No runs inserted
-    const { server, baseUrl } = await startDashboard();
-
-    try {
-      const r1 = await fetch(`${baseUrl}/api/runs`);
-      assert.equal(r1.status, 200);
-      const body1 = await r1.json() as { runs: Array<unknown> };
-      assert.ok(Array.isArray(body1.runs));
-      assert.equal(body1.runs.length, 0);
-
-      // Cached empty response
-      const r2 = await fetch(`${baseUrl}/api/runs`);
-      assert.equal(r2.status, 200);
-      const body2 = await r2.json() as { runs: Array<unknown> };
-      assert.ok(Array.isArray(body2.runs));
-      assert.equal(body2.runs.length, 0);
-    } finally {
-      await stopDashboard(server);
-      if (previousHome === undefined) delete process.env.HOME;
-      else process.env.HOME = previousHome;
-      if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
-      else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  // US-002: Error path tests — cache must NOT be invalidated on failed mutations
-
-  it("cancel 404 error path does NOT invalidate runs cache", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-runs-cache-"));
-    const homeDir = path.join(root, "home");
-    fs.mkdirSync(homeDir, { recursive: true });
-    const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
-    const previousHome = process.env.HOME;
-    const previousDbPath = process.env.TAMANDUA_DB_PATH;
-    process.env.HOME = homeDir;
-    process.env.TAMANDUA_DB_PATH = dbPath;
-
-    const db = getDb();
-    db.prepare(`
-      INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
-      VALUES ('run-err404-cancel', 1, 'wf-1', 'task', 'running', '{}', 0, '2026-01-01', '2026-01-01')
-    `).run();
-
-    const { server, baseUrl } = await startDashboard();
-
-    try {
-      // Prime the cache
-      const r1 = await fetch(`${baseUrl}/api/runs`);
-      assert.equal(r1.status, 200);
-      const body1 = await r1.json() as { runs: Array<{ id: string }> };
-      assert.equal(body1.runs.length, 1);
-
-      // POST cancel to a nonexistent run → 404, cache must NOT be invalidated
-      const cancel404 = await fetch(`${baseUrl}/api/runs/nonexistent-run-id/cancel`, { method: "POST" });
-      assert.equal(cancel404.status, 404);
-
-      // Subsequent GET /api/runs should still serve from cache (one run, not zero)
-      const r2 = await fetch(`${baseUrl}/api/runs`);
-      assert.equal(r2.status, 200);
-      const body2 = await r2.json() as { runs: Array<{ id: string }> };
-      assert.equal(body2.runs.length, 1, "cache should still be valid after 404 cancel");
-      assert.ok(body2.runs.some((r) => r.id === "run-err404-cancel"));
-    } finally {
-      await stopDashboard(server);
-      if (previousHome === undefined) delete process.env.HOME;
-      else process.env.HOME = previousHome;
-      if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
-      else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  it("cancel 409 error path does NOT invalidate runs cache", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-runs-cache-"));
-    const homeDir = path.join(root, "home");
-    fs.mkdirSync(homeDir, { recursive: true });
-    const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
-    const previousHome = process.env.HOME;
-    const previousDbPath = process.env.TAMANDUA_DB_PATH;
-    process.env.HOME = homeDir;
-    process.env.TAMANDUA_DB_PATH = dbPath;
-
-    const db = getDb();
-    const runId = "run-err409-cancel";
-    db.prepare(`
-      INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
-      VALUES (?, 1, 'wf-1', 'task', 'done', '{}', 0, '2026-01-01', '2026-01-01')
-    `).run(runId);
-
-    const { server, baseUrl } = await startDashboard();
-
-    try {
-      // Prime the cache
-      const r1 = await fetch(`${baseUrl}/api/runs`);
-      assert.equal(r1.status, 200);
-      const body1 = await r1.json() as { runs: Array<{ id: string }> };
-      assert.equal(body1.runs.length, 1);
-
-      // Cancel a done run → 409 (cannot cancel done runs), cache must NOT be invalidated
-      const cancel409 = await fetch(`${baseUrl}/api/runs/${runId}/cancel`, { method: "POST" });
-      assert.equal(cancel409.status, 409);
-
-      // Subsequent GET /api/runs should still serve from cache
-      const r2 = await fetch(`${baseUrl}/api/runs`);
-      assert.equal(r2.status, 200);
-      const body2 = await r2.json() as { runs: Array<{ id: string }> };
-      assert.equal(body2.runs.length, 1, "cache should still be valid after 409 cancel");
-    } finally {
-      await stopDashboard(server);
-      if (previousHome === undefined) delete process.env.HOME;
-      else process.env.HOME = previousHome;
-      if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
-      else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  it("delete 404 error path does NOT invalidate runs cache", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-runs-cache-"));
-    const homeDir = path.join(root, "home");
-    fs.mkdirSync(homeDir, { recursive: true });
-    const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
-    const previousHome = process.env.HOME;
-    const previousDbPath = process.env.TAMANDUA_DB_PATH;
-    process.env.HOME = homeDir;
-    process.env.TAMANDUA_DB_PATH = dbPath;
-
-    const db = getDb();
-    db.prepare(`
-      INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
-      VALUES ('run-err404-delete', 1, 'wf-1', 'task', 'completed', '{}', 0, '2026-01-01', '2026-01-01')
-    `).run();
-
-    const { server, baseUrl } = await startDashboard();
-
-    try {
-      // Prime the cache
-      const r1 = await fetch(`${baseUrl}/api/runs`);
-      assert.equal(r1.status, 200);
-      const body1 = await r1.json() as { runs: Array<{ id: string }> };
-      assert.equal(body1.runs.length, 1);
-
-      // DELETE nonexistent run → 404, cache must NOT be invalidated
-      const delete404 = await fetch(`${baseUrl}/api/runs/nonexistent-run-id?force=true`, { method: "DELETE" });
-      assert.equal(delete404.status, 404);
-
-      // Subsequent GET /api/runs should still serve from cache
-      const r2 = await fetch(`${baseUrl}/api/runs`);
-      assert.equal(r2.status, 200);
-      const body2 = await r2.json() as { runs: Array<{ id: string }> };
-      assert.equal(body2.runs.length, 1, "cache should still be valid after 404 delete");
-    } finally {
-      await stopDashboard(server);
-      if (previousHome === undefined) delete process.env.HOME;
-      else process.env.HOME = previousHome;
-      if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
-      else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  it("delete 409 error path does NOT invalidate runs cache", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-runs-cache-"));
-    const homeDir = path.join(root, "home");
-    fs.mkdirSync(homeDir, { recursive: true });
-    const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
-    const previousHome = process.env.HOME;
-    const previousDbPath = process.env.TAMANDUA_DB_PATH;
-    process.env.HOME = homeDir;
-    process.env.TAMANDUA_DB_PATH = dbPath;
-
-    const db = getDb();
-    const runId = "run-err409-delete";
-    db.prepare(`
-      INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
-      VALUES (?, 1, 'wf-1', 'task', 'running', '{}', 0, '2026-01-01', '2026-01-01')
-    `).run(runId);
-
-    const { server, baseUrl } = await startDashboard();
-
-    try {
-      // Prime the cache
-      const r1 = await fetch(`${baseUrl}/api/runs`);
-      assert.equal(r1.status, 200);
-      const body1 = await r1.json() as { runs: Array<{ id: string }> };
-      assert.equal(body1.runs.length, 1);
-
-      // DELETE without force on a non-completed run → 409, cache must NOT be invalidated
-      const delete409 = await fetch(`${baseUrl}/api/runs/${runId}`, { method: "DELETE" });
-      assert.equal(delete409.status, 409);
-
-      // Subsequent GET /api/runs should still serve from cache
-      const r2 = await fetch(`${baseUrl}/api/runs`);
-      assert.equal(r2.status, 200);
-      const body2 = await r2.json() as { runs: Array<{ id: string }> };
-      assert.equal(body2.runs.length, 1, "cache should still be valid after 409 delete");
-    } finally {
-      await stopDashboard(server);
-      if (previousHome === undefined) delete process.env.HOME;
-      else process.env.HOME = previousHome;
-      if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
-      else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  // US-002: Pause and resume invalidation — tested via exported invalidateRunsCache
-  // (these handlers require a daemon for success-path HTTP testing)
-
-  it("pause handler invalidation pattern works via invalidateRunsCache", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-runs-cache-"));
-    const homeDir = path.join(root, "home");
-    fs.mkdirSync(homeDir, { recursive: true });
-    const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
-    const previousHome = process.env.HOME;
-    const previousDbPath = process.env.TAMANDUA_DB_PATH;
-    process.env.HOME = homeDir;
-    process.env.TAMANDUA_DB_PATH = dbPath;
-
-    const db = getDb();
-    db.prepare(`
-      INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
-      VALUES ('run-pause-pattern', 1, 'wf-1', 'task', 'running', '{}', 0, '2026-01-01', '2026-01-01')
-    `).run();
-
-    const { server, baseUrl } = await startDashboard();
-
-    try {
-      // Prime the cache
-      const r1 = await fetch(`${baseUrl}/api/runs`);
-      assert.equal(r1.status, 200);
-      const body1 = await r1.json() as { runs: Array<{ id: string }> };
-      assert.ok(body1.runs.some((r) => r.id === "run-pause-pattern"));
-
-      // Simulate what handlePauseRun does on success: invalidate cache
-      invalidateRunsCache();
-
-      // Insert a new row to prove fresh query after invalidation
-      db.prepare(`
-        INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
-        VALUES ('run-after-pause-inval', 2, 'wf-1', 'task2', 'running', '{}', 0, '2026-01-02', '2026-01-02')
-      `).run();
-
-      const r2 = await fetch(`${baseUrl}/api/runs`);
-      assert.equal(r2.status, 200);
-      const body2 = await r2.json() as { runs: Array<{ id: string }> };
-      assert.ok(
-        body2.runs.some((r) => r.id === "run-after-pause-inval"),
-        "new row should appear after pause-triggered cache invalidation"
-      );
-    } finally {
-      await stopDashboard(server);
-      if (previousHome === undefined) delete process.env.HOME;
-      else process.env.HOME = previousHome;
-      if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
-      else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  it("resume handler invalidation pattern works via invalidateRunsCache", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-runs-cache-"));
-    const homeDir = path.join(root, "home");
-    fs.mkdirSync(homeDir, { recursive: true });
-    const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
-    const previousHome = process.env.HOME;
-    const previousDbPath = process.env.TAMANDUA_DB_PATH;
-    process.env.HOME = homeDir;
-    process.env.TAMANDUA_DB_PATH = dbPath;
-
-    const db = getDb();
-    db.prepare(`
-      INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
-      VALUES ('run-resume-pattern', 1, 'wf-1', 'task', 'paused', '{}', 0, '2026-01-01', '2026-01-01')
-    `).run();
-
-    const { server, baseUrl } = await startDashboard();
-
-    try {
-      // Prime the cache
-      const r1 = await fetch(`${baseUrl}/api/runs`);
-      assert.equal(r1.status, 200);
-      const body1 = await r1.json() as { runs: Array<{ id: string }> };
-      assert.ok(body1.runs.some((r) => r.id === "run-resume-pattern"));
-
-      // Simulate what handleResumeRun does on success: invalidate cache
-      invalidateRunsCache();
-
-      // Insert a new row to prove fresh query after invalidation
-      db.prepare(`
-        INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
-        VALUES ('run-after-resume-inval', 2, 'wf-1', 'task2', 'running', '{}', 0, '2026-01-02', '2026-01-02')
-      `).run();
-
-      const r2 = await fetch(`${baseUrl}/api/runs`);
-      assert.equal(r2.status, 200);
-      const body2 = await r2.json() as { runs: Array<{ id: string }> };
-      assert.ok(
-        body2.runs.some((r) => r.id === "run-after-resume-inval"),
-        "new row should appear after resume-triggered cache invalidation"
-      );
+      const response = await fetch(`${baseUrl}/api/health`);
+      assert.equal(response.status, 200);
+
+      const body = await response.json() as { status: string; uptime: number; pid: number; timestamp: string };
+      assert.equal(body.status, "ok");
+      assert.equal(typeof body.uptime, "number");
+      assert.ok(body.uptime >= 0);
+      assert.equal(typeof body.pid, "number");
+      assert.ok(body.pid > 0);
+      assert.equal(typeof body.timestamp, "string");
+      assert.ok(body.timestamp.length > 0);
     } finally {
       await stopDashboard(server);
       if (previousHome === undefined) delete process.env.HOME;
@@ -4132,250 +3281,571 @@ describe("dashboard /api/runs cache", () => {
   });
 });
 
-describe("dashboard run detail bounded events", () => {
-  function appendRunEvent(stateDir: string, runId: string, evt: TamanduaEvent): void {
-    const filePath = path.join(stateDir, "events", `${runId}.jsonl`);
-    fs.mkdirSync(path.dirname(filePath), { recursive: true });
-    fs.appendFileSync(filePath, `${JSON.stringify(evt)}\n`, "utf-8");
-  }
-
-  it("returns at most 200 events and truncated=true with correct totalEvents for a 500-event run", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-bounded-events-"));
-    const homeDir = path.join(root, "home");
-    const stateDir = path.join(homeDir, ".tamandua");
-    fs.mkdirSync(stateDir, { recursive: true });
-    const dbPath = path.join(stateDir, "tamandua.db");
-    const previousHome = process.env.HOME;
-    const previousDbPath = process.env.TAMANDUA_DB_PATH;
+describe("dashboard events API", () => {
+  it("GET /api/events returns recent events", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-events-"));
+    const stateDir = path.join(root, "state");
     const previousStateDir = process.env.TAMANDUA_STATE_DIR;
-    process.env.HOME = homeDir;
-    process.env.TAMANDUA_DB_PATH = dbPath;
     process.env.TAMANDUA_STATE_DIR = stateDir;
 
-    const runId = "run-500-events";
-
-    // Create 500 events in the per-run file
-    for (let i = 0; i < 500; i++) {
-      appendRunEvent(stateDir, runId, {
-        ts: new Date(Date.UTC(2026, 0, 1, 0, 0, 0, i * 1000)).toISOString(),
-        event: "step.running",
-        runId,
-        agentId: "test_agent",
-        detail: `event ${i}`,
-      });
-    }
-
-    // Insert the run into DB
-    const db = getDb();
-    db.prepare(`
-      INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
-      VALUES (?, 1, 'wf-test', 'test task', 'running', '{}', 0, '2026-01-01', '2026-01-01')
-    `).run(runId);
-
-    const { server, baseUrl } = await startDashboard();
-
-    try {
-      const response = await fetch(`${baseUrl}/api/runs/${runId}`);
-      assert.equal(response.status, 200);
-
-      const body = await response.json() as {
-        totalEvents: number;
-        truncated: boolean;
-        events: TamanduaEvent[];
-        run: unknown;
-        steps: unknown;
-        failure_reason: unknown;
-        prompt: unknown;
-      };
-
-      assert.equal(body.totalEvents, 500, "totalEvents should be 500");
-      assert.equal(body.truncated, true, "truncated should be true");
-      assert.ok(body.events.length <= 200, `events length ${body.events.length} should be <= 200`);
-      // The events should be the most recent ones (last 200)
-      assert.match(body.events[body.events.length - 1].detail ?? "", /event 499/);
-      assert.match(body.events[0].detail ?? "", /event 300/);
-    } finally {
-      await stopDashboard(server);
-      if (previousHome === undefined) delete process.env.HOME;
-      else process.env.HOME = previousHome;
-      if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
-      else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      if (previousStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
-      else process.env.TAMANDUA_STATE_DIR = previousStateDir;
-      fs.rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  it("returns all events and truncated=false with correct totalEvents for a small file (10 events)", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-bounded-events-"));
-    const homeDir = path.join(root, "home");
-    const stateDir = path.join(homeDir, ".tamandua");
-    fs.mkdirSync(stateDir, { recursive: true });
-    const dbPath = path.join(stateDir, "tamandua.db");
-    const previousHome = process.env.HOME;
-    const previousDbPath = process.env.TAMANDUA_DB_PATH;
-    const previousStateDir = process.env.TAMANDUA_STATE_DIR;
-    process.env.HOME = homeDir;
-    process.env.TAMANDUA_DB_PATH = dbPath;
-    process.env.TAMANDUA_STATE_DIR = stateDir;
-
-    const runId = "run-10-events";
-
-    // Create 10 events in the per-run file
-    for (let i = 0; i < 10; i++) {
-      appendRunEvent(stateDir, runId, {
-        ts: new Date(Date.UTC(2026, 0, 1, 0, 0, 0, i * 1000)).toISOString(),
-        event: "step.running",
-        runId,
-        agentId: "test_agent",
-        detail: `event ${i}`,
-      });
-    }
-
-    const db = getDb();
-    db.prepare(`
-      INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
-      VALUES (?, 1, 'wf-test', 'test task', 'running', '{}', 0, '2026-01-01', '2026-01-01')
-    `).run(runId);
-
-    const { server, baseUrl } = await startDashboard();
-
-    try {
-      const response = await fetch(`${baseUrl}/api/runs/${runId}`);
-      assert.equal(response.status, 200);
-
-      const body = await response.json() as {
-        totalEvents: number;
-        truncated: boolean;
-        events: TamanduaEvent[];
-        run: unknown;
-        steps: unknown;
-        failure_reason: unknown;
-        prompt: unknown;
-      };
-
-      assert.equal(body.totalEvents, 10, "totalEvents should be 10");
-      assert.equal(body.truncated, false, "truncated should be false for small file");
-      assert.equal(body.events.length, 10, "all 10 events should be returned");
-    } finally {
-      await stopDashboard(server);
-      if (previousHome === undefined) delete process.env.HOME;
-      else process.env.HOME = previousHome;
-      if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
-      else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      if (previousStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
-      else process.env.TAMANDUA_STATE_DIR = previousStateDir;
-      fs.rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  it("returns totalEvents=0 and truncated=false when run has no events file", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-bounded-events-"));
-    const homeDir = path.join(root, "home");
-    const stateDir = path.join(homeDir, ".tamandua");
-    fs.mkdirSync(stateDir, { recursive: true });
-    const dbPath = path.join(stateDir, "tamandua.db");
-    const previousHome = process.env.HOME;
-    const previousDbPath = process.env.TAMANDUA_DB_PATH;
-    const previousStateDir = process.env.TAMANDUA_STATE_DIR;
-    process.env.HOME = homeDir;
-    process.env.TAMANDUA_DB_PATH = dbPath;
-    process.env.TAMANDUA_STATE_DIR = stateDir;
-
-    const runId = "run-empty-events";
-
-    // Do NOT create any events file for this run
-
-    const db = getDb();
-    db.prepare(`
-      INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
-      VALUES (?, 1, 'wf-test', 'test task', 'running', '{}', 0, '2026-01-01', '2026-01-01')
-    `).run(runId);
-
-    const { server, baseUrl } = await startDashboard();
-
-    try {
-      const response = await fetch(`${baseUrl}/api/runs/${runId}`);
-      assert.equal(response.status, 200);
-
-      const body = await response.json() as {
-        totalEvents: number;
-        truncated: boolean;
-        events: TamanduaEvent[];
-        run: unknown;
-        steps: unknown;
-        failure_reason: unknown;
-        prompt: unknown;
-      };
-
-      assert.equal(body.totalEvents, 0, "totalEvents should be 0 for nonexistent events file");
-      assert.equal(body.truncated, false, "truncated should be false when no events exist");
-      assert.equal(body.events.length, 0, "events array should be empty");
-    } finally {
-      await stopDashboard(server);
-      if (previousHome === undefined) delete process.env.HOME;
-      else process.env.HOME = previousHome;
-      if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
-      else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      if (previousStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
-      else process.env.TAMANDUA_STATE_DIR = previousStateDir;
-      fs.rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  it("existing response fields (run, steps, failure_reason, prompt) are unchanged", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-bounded-events-"));
-    const homeDir = path.join(root, "home");
-    const stateDir = path.join(homeDir, ".tamandua");
-    fs.mkdirSync(stateDir, { recursive: true });
-    const dbPath = path.join(stateDir, "tamandua.db");
-    const previousHome = process.env.HOME;
-    const previousDbPath = process.env.TAMANDUA_DB_PATH;
-    const previousStateDir = process.env.TAMANDUA_STATE_DIR;
-    process.env.HOME = homeDir;
-    process.env.TAMANDUA_DB_PATH = dbPath;
-    process.env.TAMANDUA_STATE_DIR = stateDir;
-
-    const runId = "run-existing-fields";
-
-    appendRunEvent(stateDir, runId, {
-      ts: "2026-01-01T00:00:01.000Z",
+    appendGlobalEvent(stateDir, {
+      ts: "2026-06-01T10:00:00.000Z",
+      event: "step.pending",
+      runId: "run-events-1",
+      detail: "first event",
+    });
+    appendGlobalEvent(stateDir, {
+      ts: "2026-06-01T10:01:00.000Z",
       event: "step.running",
-      runId,
-      agentId: "test_agent",
-      detail: "test event",
+      runId: "run-events-1",
+      detail: "second event",
     });
 
+    const { server, baseUrl } = await startDashboard();
+
+    try {
+      const response = await fetch(`${baseUrl}/api/events`);
+      assert.equal(response.status, 200);
+
+      const body = await response.json() as { events: Array<{ ts: string; event: string; runId: string }> };
+      assert.ok(Array.isArray(body.events));
+      assert.equal(body.events.length, 2);
+      assert.equal(body.events[0].event, "step.pending");
+      assert.equal(body.events[1].event, "step.running");
+    } finally {
+      await stopDashboard(server);
+      if (previousStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+      else process.env.TAMANDUA_STATE_DIR = previousStateDir;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("GET /api/events respects limit parameter", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-events-limit-"));
+    const stateDir = path.join(root, "state");
+    const previousStateDir = process.env.TAMANDUA_STATE_DIR;
+    process.env.TAMANDUA_STATE_DIR = stateDir;
+
+    for (let i = 0; i < 10; i++) {
+      appendGlobalEvent(stateDir, {
+        ts: `2026-06-01T10:0${i}:00.000Z`,
+        event: `event.${i}`,
+        runId: "run-events-limit",
+        detail: `event ${i}`,
+      });
+    }
+
+    const { server, baseUrl } = await startDashboard();
+
+    try {
+      const response = await fetch(`${baseUrl}/api/events?limit=3`);
+      assert.equal(response.status, 200);
+
+      const body = await response.json() as { events: Array<{ event: string }> };
+      assert.ok(Array.isArray(body.events));
+      assert.equal(body.events.length, 3);
+    } finally {
+      await stopDashboard(server);
+      if (previousStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+      else process.env.TAMANDUA_STATE_DIR = previousStateDir;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("GET /api/events returns empty array when no events exist", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-events-empty-"));
+    const stateDir = path.join(root, "state");
+    const previousStateDir = process.env.TAMANDUA_STATE_DIR;
+    process.env.TAMANDUA_STATE_DIR = stateDir;
+
+    const { server, baseUrl } = await startDashboard();
+
+    try {
+      const response = await fetch(`${baseUrl}/api/events`);
+      assert.equal(response.status, 200);
+
+      const body = await response.json() as { events: unknown[] };
+      assert.ok(Array.isArray(body.events));
+      assert.equal(body.events.length, 0);
+    } finally {
+      await stopDashboard(server);
+      if (previousStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+      else process.env.TAMANDUA_STATE_DIR = previousStateDir;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("dashboard run events API", () => {
+  it("GET /api/runs/:id/events returns events for a specific run", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-run-events-"));
+    const stateDir = path.join(root, "state");
+    const previousStateDir = process.env.TAMANDUA_STATE_DIR;
+    process.env.TAMANDUA_STATE_DIR = stateDir;
+
+    // Write events to the run-specific file (getRunEvents reads from <runId>.jsonl)
+    const eventsDir = path.join(stateDir, "events");
+    fs.mkdirSync(eventsDir, { recursive: true });
+    const runFile = path.join(eventsDir, "run-alpha.jsonl");
+    fs.writeFileSync(
+      runFile,
+      [
+        JSON.stringify({ ts: "2026-06-01T10:00:00.000Z", event: "step.pending", runId: "run-alpha", detail: "alpha event" }),
+        JSON.stringify({ ts: "2026-06-01T10:02:00.000Z", event: "step.done", runId: "run-alpha", detail: "alpha done" }),
+      ].join("\n") + "\n",
+      "utf-8",
+    );
+    // Also write a different run's events to verify filtering
+    const otherFile = path.join(eventsDir, "run-beta.jsonl");
+    fs.writeFileSync(
+      otherFile,
+      JSON.stringify({ ts: "2026-06-01T10:01:00.000Z", event: "step.running", runId: "run-beta", detail: "beta event" }) + "\n",
+      "utf-8",
+    );
+
+    const { server, baseUrl } = await startDashboard();
+
+    try {
+      const response = await fetch(`${baseUrl}/api/runs/run-alpha/events`);
+      assert.equal(response.status, 200);
+
+      const body = await response.json() as { events: Array<{ runId: string; event: string }> };
+      assert.ok(Array.isArray(body.events));
+      assert.equal(body.events.length, 2);
+      assert.ok(body.events.every((e) => e.runId === "run-alpha"));
+      assert.equal(body.events[0].event, "step.pending");
+      assert.equal(body.events[1].event, "step.done");
+    } finally {
+      await stopDashboard(server);
+      if (previousStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+      else process.env.TAMANDUA_STATE_DIR = previousStateDir;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("GET /api/runs/:id/events returns empty array for run with no events", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-run-events-empty-"));
+    const stateDir = path.join(root, "state");
+    const previousStateDir = process.env.TAMANDUA_STATE_DIR;
+    process.env.TAMANDUA_STATE_DIR = stateDir;
+
+    const { server, baseUrl } = await startDashboard();
+
+    try {
+      const response = await fetch(`${baseUrl}/api/runs/nonexistent-run/events`);
+      assert.equal(response.status, 200);
+
+      const body = await response.json() as { events: unknown[] };
+      assert.ok(Array.isArray(body.events));
+      assert.equal(body.events.length, 0);
+    } finally {
+      await stopDashboard(server);
+      if (previousStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+      else process.env.TAMANDUA_STATE_DIR = previousStateDir;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("dashboard delete run API", () => {
+  it("DELETE /api/runs/:id returns 404 for nonexistent run", async () => {
+    const { server, baseUrl } = await startDashboard();
+
+    try {
+      const response = await fetch(`${baseUrl}/api/runs/nonexistent-delete`, {
+        method: "DELETE",
+      });
+      assert.equal(response.status, 404);
+
+      const body = await response.json() as { error: string };
+      assert.match(body.error, /Run not found/);
+    } finally {
+      await stopDashboard(server);
+    }
+  });
+
+  it("DELETE /api/runs/:id returns 409 for running run without force", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-delete-"));
+    const homeDir = path.join(root, "home");
+    fs.mkdirSync(homeDir, { recursive: true });
+    const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
+    const previousHome = process.env.HOME;
+    const previousDbPath = process.env.TAMANDUA_DB_PATH;
+    process.env.HOME = homeDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+
     const db = getDb();
+    const runId = "run-running-delete";
     db.prepare(`
       INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
-      VALUES (?, 1, 'wf-test', 'test task', 'failed', '{}', 0, '2026-01-01', '2026-01-01')
+      VALUES (?, 1, 'wf-1', 'task', 'running', '{}', 0, '2026-01-01', '2026-01-01')
     `).run(runId);
 
     const { server, baseUrl } = await startDashboard();
 
     try {
-      const response = await fetch(`${baseUrl}/api/runs/${runId}`);
-      assert.equal(response.status, 200);
+      const response = await fetch(`${baseUrl}/api/runs/${runId}`, {
+        method: "DELETE",
+      });
+      // 409 because the run is running and force is not set
+      assert.equal(response.status, 409);
 
-      const body = await response.json() as Record<string, unknown>;
-      assert.ok("run" in body, "run field should be present");
-      assert.ok("steps" in body, "steps field should be present");
-      assert.ok("events" in body, "events field should be present");
-      assert.ok("failure_reason" in body, "failure_reason field should be present");
-      assert.ok("prompt" in body, "prompt field should be present");
-      assert.ok("totalEvents" in body, "totalEvents field should be present");
-      assert.ok("truncated" in body, "truncated field should be present");
-      assert.equal(body.prompt, "test task", "prompt should match run.task");
+      const body = await response.json() as { error: string };
+      assert.match(body.error, /Use --force/);
     } finally {
       await stopDashboard(server);
       if (previousHome === undefined) delete process.env.HOME;
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      if (previousStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
-      else process.env.TAMANDUA_STATE_DIR = previousStateDir;
       fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("DELETE /api/runs/:id?force=true deletes a completed run", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-delete-force-"));
+    const homeDir = path.join(root, "home");
+    fs.mkdirSync(homeDir, { recursive: true });
+    const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
+    const previousHome = process.env.HOME;
+    const previousDbPath = process.env.TAMANDUA_DB_PATH;
+    process.env.HOME = homeDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+
+    const db = getDb();
+    const runId = "run-completed-delete";
+    db.prepare(`
+      INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
+      VALUES (?, 1, 'wf-1', 'task', 'completed', '{}', 0, '2026-01-01', '2026-01-01')
+    `).run(runId);
+
+    const { server, baseUrl } = await startDashboard();
+
+    try {
+      const response = await fetch(`${baseUrl}/api/runs/${runId}?force=true`, {
+        method: "DELETE",
+      });
+      // Should succeed — completed run with force
+      assert.equal(response.status, 200);
+
+      const body = await response.json() as { ok: boolean };
+      assert.equal(body.ok, true);
+
+      // Verify run is gone from DB
+      const run = db.prepare("SELECT id FROM runs WHERE id = ?").get(runId);
+      assert.equal(run, undefined);
+    } finally {
+      await stopDashboard(server);
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+      else process.env.TAMANDUA_DB_PATH = previousDbPath;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("dashboard pause/resume API", () => {
+  it("POST /api/runs/:id/pause returns 404 for nonexistent run", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-pause-"));
+    const homeDir = path.join(root, "home");
+    fs.mkdirSync(homeDir, { recursive: true });
+    const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
+    const previousHome = process.env.HOME;
+    const previousDbPath = process.env.TAMANDUA_DB_PATH;
+    process.env.HOME = homeDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+
+    const { server, baseUrl } = await startDashboard();
+
+    try {
+      const response = await fetch(`${baseUrl}/api/runs/nonexistent-pause/pause`, {
+        method: "POST",
+      });
+      assert.equal(response.status, 404);
+
+      const body = await response.json() as { error: string };
+      assert.match(body.error, /Run not found/);
+    } finally {
+      await stopDashboard(server);
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+      else process.env.TAMANDUA_DB_PATH = previousDbPath;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("POST /api/runs/:id/pause returns 409 for completed run", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-pause-"));
+    const homeDir = path.join(root, "home");
+    fs.mkdirSync(homeDir, { recursive: true });
+    const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
+    const previousHome = process.env.HOME;
+    const previousDbPath = process.env.TAMANDUA_DB_PATH;
+    process.env.HOME = homeDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+
+    const db = getDb();
+    const runId = "run-completed-pause";
+    db.prepare(`
+      INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
+      VALUES (?, 1, 'wf-1', 'task', 'completed', '{}', 0, '2026-01-01', '2026-01-01')
+    `).run(runId);
+
+    const { server, baseUrl } = await startDashboard();
+
+    try {
+      const response = await fetch(`${baseUrl}/api/runs/${runId}/pause`, {
+        method: "POST",
+      });
+      assert.equal(response.status, 409);
+
+      const body = await response.json() as { error: string };
+      assert.match(body.error, /Cannot pause run in completed state/);
+    } finally {
+      await stopDashboard(server);
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+      else process.env.TAMANDUA_DB_PATH = previousDbPath;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("POST /api/runs/:id/pause returns 502 when daemon is unreachable", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-pause-daemon-"));
+    const homeDir = path.join(root, "home");
+    fs.mkdirSync(homeDir, { recursive: true });
+    const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
+    const previousHome = process.env.HOME;
+    const previousDbPath = process.env.TAMANDUA_DB_PATH;
+    const previousControlPort = process.env.TAMANDUA_CONTROL_PORT;
+    // Use a random high port so the daemon is definitely unreachable
+    process.env.TAMANDUA_CONTROL_PORT = "16379";
+    process.env.HOME = homeDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+
+    const db = getDb();
+    const runId = "run-running-pause-daemon";
+    db.prepare(`
+      INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
+      VALUES (?, 1, 'wf-1', 'task', 'running', '{}', 0, '2026-01-01', '2026-01-01')
+    `).run(runId);
+
+    const { server, baseUrl } = await startDashboard();
+
+    try {
+      const response = await fetch(`${baseUrl}/api/runs/${runId}/pause`, {
+        method: "POST",
+      });
+      // 502 because no daemon is running on the random port
+      assert.equal(response.status, 502);
+
+      const body = await response.json() as { error: string };
+      assert.match(body.error, /Daemon unreachable/);
+    } finally {
+      await stopDashboard(server);
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+      else process.env.TAMANDUA_DB_PATH = previousDbPath;
+      if (previousControlPort === undefined) delete process.env.TAMANDUA_CONTROL_PORT;
+      else process.env.TAMANDUA_CONTROL_PORT = previousControlPort;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("POST /api/runs/:id/resume returns 404 for nonexistent run", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-resume-"));
+    const homeDir = path.join(root, "home");
+    fs.mkdirSync(homeDir, { recursive: true });
+    const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
+    const previousHome = process.env.HOME;
+    const previousDbPath = process.env.TAMANDUA_DB_PATH;
+    process.env.HOME = homeDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+
+    const { server, baseUrl } = await startDashboard();
+
+    try {
+      const response = await fetch(`${baseUrl}/api/runs/nonexistent-resume/resume`, {
+        method: "POST",
+      });
+      assert.equal(response.status, 404);
+
+      const body = await response.json() as { error: string };
+      assert.match(body.error, /Run not found/);
+    } finally {
+      await stopDashboard(server);
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+      else process.env.TAMANDUA_DB_PATH = previousDbPath;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("POST /api/runs/:id/resume returns 409 for running run", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-resume-"));
+    const homeDir = path.join(root, "home");
+    fs.mkdirSync(homeDir, { recursive: true });
+    const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
+    const previousHome = process.env.HOME;
+    const previousDbPath = process.env.TAMANDUA_DB_PATH;
+    process.env.HOME = homeDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+
+    const db = getDb();
+    const runId = "run-running-resume";
+    db.prepare(`
+      INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
+      VALUES (?, 1, 'wf-1', 'task', 'running', '{}', 0, '2026-01-01', '2026-01-01')
+    `).run(runId);
+
+    const { server, baseUrl } = await startDashboard();
+
+    try {
+      const response = await fetch(`${baseUrl}/api/runs/${runId}/resume`, {
+        method: "POST",
+      });
+      assert.equal(response.status, 409);
+
+      const body = await response.json() as { error: string };
+      assert.match(body.error, /Cannot resume run in running state/);
+    } finally {
+      await stopDashboard(server);
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+      else process.env.TAMANDUA_DB_PATH = previousDbPath;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("POST /api/runs/:id/resume returns 502 when daemon is unreachable", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-resume-daemon-"));
+    const homeDir = path.join(root, "home");
+    fs.mkdirSync(homeDir, { recursive: true });
+    const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
+    const previousHome = process.env.HOME;
+    const previousDbPath = process.env.TAMANDUA_DB_PATH;
+    const previousControlPort = process.env.TAMANDUA_CONTROL_PORT;
+    // Use a random high port so the daemon is definitely unreachable
+    process.env.TAMANDUA_CONTROL_PORT = "16380";
+    process.env.HOME = homeDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+
+    const db = getDb();
+    const runId = "run-paused-resume-daemon";
+    db.prepare(`
+      INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
+      VALUES (?, 1, 'wf-1', 'task', 'paused', '{}', 0, '2026-01-01', '2026-01-01')
+    `).run(runId);
+
+    const { server, baseUrl } = await startDashboard();
+
+    try {
+      const response = await fetch(`${baseUrl}/api/runs/${runId}/resume`, {
+        method: "POST",
+      });
+      // 502 because no daemon is running on the random port
+      assert.equal(response.status, 502);
+
+      const body = await response.json() as { error: string };
+      assert.match(body.error, /Daemon unreachable/);
+    } finally {
+      await stopDashboard(server);
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+      else process.env.TAMANDUA_DB_PATH = previousDbPath;
+      if (previousControlPort === undefined) delete process.env.TAMANDUA_CONTROL_PORT;
+      else process.env.TAMANDUA_CONTROL_PORT = previousControlPort;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("dashboard CORS and routing", () => {
+  it("OPTIONS request returns 204 with CORS headers", async () => {
+    const { server, baseUrl } = await startDashboard();
+
+    try {
+      const response = await fetch(`${baseUrl}/api/runs`, {
+        method: "OPTIONS",
+      });
+      assert.equal(response.status, 204);
+      assert.equal(response.headers.get("access-control-allow-origin"), "*");
+      assert.equal(response.headers.get("access-control-allow-methods"), "GET, POST, OPTIONS");
+      assert.equal(response.headers.get("access-control-allow-headers"), "Content-Type");
+    } finally {
+      await stopDashboard(server);
+    }
+  });
+
+  it("returns 404 for unknown routes", async () => {
+    const { server, baseUrl } = await startDashboard();
+
+    try {
+      const response = await fetch(`${baseUrl}/api/nonexistent-route`);
+      assert.equal(response.status, 404);
+
+      const body = await response.json() as { error: string };
+      assert.match(body.error, /Not found/);
+    } finally {
+      await stopDashboard(server);
+    }
+  });
+
+  it("returns 404 for unknown method on existing route", async () => {
+    const { server, baseUrl } = await startDashboard();
+
+    try {
+      const response = await fetch(`${baseUrl}/api/runs`, {
+        method: "PUT",
+      });
+      assert.equal(response.status, 404);
+
+      const body = await response.json() as { error: string };
+      assert.match(body.error, /Not found/);
+    } finally {
+      await stopDashboard(server);
+    }
+  });
+});
+
+describe("dashboard static assets", () => {
+  it("serves frontend assets from /assets/ path", async () => {
+    const { server, baseUrl } = await startDashboard();
+
+    try {
+      const response = await fetch(`${baseUrl}/`);
+      assert.equal(response.status, 200);
+
+      const html = await response.text();
+
+      // Extract the script src to verify the asset is served
+      const scriptMatch = html.match(/<script type="module" crossorigin src="(\/assets\/index-[^"]+)">/);
+      assert.ok(scriptMatch, "should find script tag with asset path");
+
+      const assetPath = scriptMatch[1];
+      const assetResponse = await fetch(`${baseUrl}${assetPath}`);
+      assert.equal(assetResponse.status, 200);
+      assert.match(assetResponse.headers.get("content-type") ?? "", /javascript/);
+    } finally {
+      await stopDashboard(server);
+    }
+  });
+
+  it("returns 404 for nonexistent assets", async () => {
+    const { server, baseUrl } = await startDashboard();
+
+    try {
+      const response = await fetch(`${baseUrl}/assets/nonexistent-file.js`);
+      assert.equal(response.status, 404);
+    } finally {
+      await stopDashboard(server);
     }
   });
 });

@@ -1,18 +1,26 @@
 /*
- * Tamandua Website Styles
- * Dark theme CSS foundation — US-003
+ * Tamandua Website Styles — v2
+ * Dark theme with tamandua stripe motif
  *
  * Design system:
- *   Base:  #0d1117
- *   Surface: #161b22
- *   Border: #30363d
- *   Text:  #c9d1d9
- *   Accent: #f0883e
- *   Success: #3fb950
- *   Info:   #58a6ff
- *   Muted:  #8b949e
+ *   Base:      #0d1117
+ *   Surface:   #161b22
+ *   Border:    #30363d
+ *   Text:      #c9d1d9
+ *   Accent:    #f0883e (tamandua orange)
+ *   Accent-warm: #e85d3a (warmer orange-red for signature moments)
+ *   Success:   #3fb950
+ *   Info:      #58a6ff
  *
- * No external CSS frameworks — all custom properties and handcrafted styles.
+ * Typography:
+ *   Display:   DM Sans (Google Fonts)
+ *   Body:      Inter (Google Fonts)
+ *   Mono:      JetBrains Mono (Google Fonts)
+ *
+ * Signature motif:
+ *   Diagonal stripe pattern inspired by the tamandua's "vest" —
+ *   the lesser anteater's distinctive diagonal black band.
+ *   Used sparingly as section dividers, hero texture, and card accents.
  */
 
 /* ── CSS Custom Properties ─────────────────────────────────────────── */
@@ -21,12 +29,15 @@
   /* Colors */
   --color-bg:           #0d1117;
   --color-surface:      #161b22;
+  --color-surface-raised: #1c2128;
   --color-border:       #30363d;
   --color-border-muted: #21262d;
   --color-text:         #c9d1d9;
   --color-text-em:      #e6edf3;
   --color-text-muted:   #8b949e;
   --color-accent:       #f0883e;
+  --color-accent-deep:  #c96a2e;
+  --color-accent-warm:  #e85d3a;
   --color-accent-hover: #ff9d5c;
   --color-success:      #3fb950;
   --color-info:         #58a6ff;
@@ -43,6 +54,7 @@
   --space-8:  3rem;
   --space-10: 4rem;
   --space-12: 5rem;
+  --space-16: 6rem;
 
   /* Border radii */
   --radius-sm: 4px;
@@ -52,14 +64,17 @@
 
   /* Elevation & accent helpers */
   --color-accent-soft: rgba(240, 136, 62, 0.12);
-  --gradient-accent: linear-gradient(135deg, #f0883e 0%, #ff9d5c 60%, #ffb37c 100%);
+  --gradient-accent: linear-gradient(135deg, #f0883e 0%, #e85d3a 60%, #ff9d5c 100%);
+  --gradient-accent-subtle: linear-gradient(135deg, rgba(240, 136, 62, 0.15), rgba(232, 93, 58, 0.08));
   --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.35), 0 10px 28px -16px rgba(0, 0, 0, 0.55);
   --shadow-card-hover: 0 2px 6px rgba(0, 0, 0, 0.35), 0 18px 44px -18px rgba(240, 136, 62, 0.28);
+  --shadow-glow: 0 0 40px rgba(240, 136, 62, 0.08);
 
   /* Typography */
-  --font-body: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen,
-               Ubuntu, Cantarell, 'Helvetica Neue', sans-serif;
-  --font-mono: 'SF Mono', 'Fira Code', 'Consolas', 'Liberation Mono',
+  --font-display: 'DM Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-body: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen,
+               Ubuntu, Cantarell, sans-serif;
+  --font-mono: 'JetBrains Mono', 'SF Mono', 'Fira Code', 'Consolas', 'Liberation Mono',
                'Courier New', monospace;
 
   --fs-xs:   0.75rem;
@@ -69,10 +84,10 @@
   --fs-xl:   1.25rem;
   --fs-2xl:  1.5rem;
   --fs-3xl:  clamp(1.75rem, 1.35rem + 1.6vw, 2.25rem);
-  --fs-4xl:  clamp(2.25rem, 1.5rem + 3vw, 3.25rem);
+  --fs-4xl:  clamp(2.25rem, 1.5rem + 3vw, 3.5rem);
 
   --lh-body:  1.6;
-  --lh-heading: 1.3;
+  --lh-heading: 1.2;
   --lh-code:  1.5;
 
   --fw-normal: 400;
@@ -86,6 +101,17 @@
 
   /* Transitions */
   --transition: 150ms ease;
+  --transition-slow: 400ms ease;
+}
+
+/* ── Tamandua Stripe Motif ────────────────────────────────────────────
+   A repeating diagonal line pattern inspired by the tamandua's
+   distinctive diagonal "vest" stripe. Used as a subtle background
+   texture on the hero and as section dividers. */
+
+@keyframes stripe-drift {
+  0%   { background-position: 0 0; }
+  100% { background-position: 64px 64px; }
 }
 
 /* ── Reset & Base ──────────────────────────────────────────────────── */
@@ -147,7 +173,6 @@ body {
 
 /* ── Links ─────────────────────────────────────────────────────────── */
 
-/* Responsive images — max-width prevents overflow on mobile */
 img {
   max-width: 100%;
   height: auto;
@@ -174,10 +199,10 @@ a:focus-visible {
 /* ── Typography ────────────────────────────────────────────────────── */
 
 h1, h2, h3, h4, h5, h6 {
-  font-family: var(--font-body);
+  font-family: var(--font-display);
   font-weight: var(--fw-semibold);
   line-height: var(--lh-heading);
-  letter-spacing: -0.015em;
+  letter-spacing: -0.02em;
   color: var(--color-text-em);
 }
 
@@ -199,6 +224,40 @@ p + p {
 strong {
   font-weight: var(--fw-semibold);
   color: var(--color-text-em);
+}
+
+/* ── Section Labels ───────────────────────────────────────────────────
+   A small uppercase label above each section heading, like a chapter
+   marker. Replaces the numbered markers that would be templated. */
+
+.section-label {
+  font-family: var(--font-display);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-semibold);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--color-accent);
+  margin-bottom: var(--space-3);
+  position: relative;
+  display: inline-block;
+}
+
+.section-label::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  bottom: -4px;
+  width: 100%;
+  height: 1px;
+  background: linear-gradient(90deg, var(--color-accent), transparent);
+  opacity: 0.4;
+}
+
+.section-lede {
+  font-size: var(--fs-lg);
+  color: var(--color-text-muted);
+  max-width: 640px;
+  margin-top: var(--space-2) !important;
 }
 
 /* ── Code & Pre ────────────────────────────────────────────────────── */
@@ -278,22 +337,31 @@ nav {
 }
 
 .logo {
+  font-family: var(--font-display);
   font-size: var(--fs-xl);
   font-weight: var(--fw-bold);
   color: var(--color-text-em);
   text-decoration: none;
   letter-spacing: -0.01em;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
   transition: color var(--transition);
 }
 
-.logo img {
-  vertical-align: middle;
-  margin-right: var(--space-1);
+.logo-mark {
+  flex: none;
+  color: var(--color-accent);
+  transition: transform var(--transition);
 }
 
 .logo:hover {
   color: var(--color-accent);
   text-decoration: none;
+}
+
+.logo:hover .logo-mark {
+  transform: rotate(-8deg);
 }
 
 /* Hamburger menu (hidden on desktop — checkbox hack) */
@@ -369,6 +437,7 @@ nav ul li a {
   color: var(--color-text-muted);
   font-size: var(--fs-sm);
   font-weight: var(--fw-medium);
+  font-family: var(--font-body);
   border-radius: var(--radius-sm);
   text-decoration: none;
   letter-spacing: 0.01em;
@@ -390,7 +459,6 @@ nav ul li a:focus-visible {
 
 /* Mobile nav default: hidden unless toggled */
 @media (max-width: 767px) {
-  /* Hide the hamburger on mobile (it's always visible), but toggle nav links */
   #nav-links {
     display: none;
     flex-direction: column;
@@ -435,12 +503,32 @@ main {
 section {
   position: relative;
   padding: var(--section-pad) 0;
-  border-top: 1px solid transparent;
-  border-image: linear-gradient(90deg, transparent, var(--color-border) 18%, var(--color-border) 82%, transparent) 1;
 }
 
-section:first-of-type {
-  border-top: none;
+/* Tamandua stripe divider between sections */
+section::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 60%;
+  max-width: 400px;
+  height: 1px;
+  background: repeating-linear-gradient(
+    90deg,
+    transparent,
+    transparent 8px,
+    var(--color-accent) 8px,
+    var(--color-accent) 9px,
+    transparent 9px,
+    transparent 16px
+  );
+  opacity: 0.15;
+}
+
+section:first-of-type::before {
+  display: none;
 }
 
 section h2 {
@@ -455,7 +543,7 @@ section h2::after {
   position: absolute;
   left: 0;
   bottom: 0;
-  width: 56px;
+  width: 48px;
   height: 3px;
   border-radius: 999px;
   background: linear-gradient(90deg, var(--color-accent), rgba(240, 136, 62, 0));
@@ -475,11 +563,19 @@ section h3 + p {
 
 #hero {
   position: relative;
-  padding: var(--space-12) 0;
+  padding: var(--space-12) 0 var(--space-10);
   text-align: center;
   overflow: hidden;
-  /* Dark gradient background */
+
+  /* Tamandua stripe pattern as hero background texture */
   background:
+    repeating-linear-gradient(
+      -45deg,
+      transparent,
+      transparent 28px,
+      rgba(240, 136, 62, 0.025) 28px,
+      rgba(240, 136, 62, 0.025) 29px
+    ),
     linear-gradient(180deg, var(--color-bg) 0%, rgba(13, 17, 23, 0) 100%),
     radial-gradient(ellipse 70% 50% at 50% 40%, rgba(240, 136, 62, 0.06), transparent 70%),
     radial-gradient(ellipse 60% 40% at 20% 80%, rgba(88, 166, 255, 0.04), transparent 60%);
@@ -496,6 +592,21 @@ section h3 + p {
   mask-image: radial-gradient(ellipse 80% 50% at 50% 40%, black 40%, transparent 70%);
 }
 
+/* Tamandua watermark accent — larger, more prominent */
+#hero::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  right: 2%;
+  width: min(400px, 35vw);
+  height: min(400px, 35vw);
+  transform: translateY(-50%) rotate(-6deg);
+  background: url("assets/tamandua.png") center / contain no-repeat;
+  opacity: 0.05;
+  pointer-events: none;
+  z-index: 0;
+}
+
 .hero-content {
   position: relative;
   z-index: 1;
@@ -504,36 +615,27 @@ section h3 + p {
   padding: 0 var(--space-6);
 }
 
-/* Tamandua watermark accent */
-#hero::after {
-  content: "";
-  position: absolute;
-  top: 50%;
-  right: 4%;
-  width: min(300px, 30vw);
-  height: min(300px, 30vw);
-  transform: translateY(-50%) rotate(-6deg);
-  background: url("assets/tamandua.png") center / contain no-repeat;
-  opacity: 0.06;
-  pointer-events: none;
-  z-index: 0;
-}
-
 #hero h1 {
   font-size: var(--fs-4xl);
   font-weight: var(--fw-bold);
   margin-bottom: var(--space-5);
   line-height: 1.15;
   letter-spacing: -0.025em;
-  color: var(--color-text-em); /* fallback */
+  color: var(--color-text-em);
   background: linear-gradient(180deg, #ffffff 0%, var(--color-text-em) 55%, #9aa4b2 100%);
   -webkit-background-clip: text;
   background-clip: text;
   -webkit-text-fill-color: transparent;
 }
 
+.hero-highlight {
+  color: var(--color-accent);
+  -webkit-text-fill-color: var(--color-accent);
+  background: none;
+}
+
 .hero-tagline {
-  max-width: 720px;
+  max-width: 680px;
   margin-left: auto !important;
   margin-right: auto !important;
   font-size: var(--fs-lg);
@@ -541,42 +643,101 @@ section h3 + p {
   color: var(--color-text-muted);
 }
 
-/* Install command wrapper — visually distinct */
-.hero-install {
-  display: inline-block;
-  margin-top: var(--space-6);
-}
+/* ── Hero Terminal ────────────────────────────────────────────────────
+   A live-looking terminal window showing the install + first run. */
 
-.hero-install pre {
-  display: inline-block;
+.hero-terminal {
+  max-width: 640px;
+  margin: var(--space-8) auto 0;
   text-align: left;
-  margin: 0;
-  background: rgba(22, 27, 34, 0.8);
-  border: 1px solid rgba(240, 136, 62, 0.55);
+  border: 1px solid var(--color-border);
   border-radius: var(--radius-lg);
-  padding: var(--space-4) var(--space-6);
-  position: relative;
+  overflow: hidden;
+  background: var(--color-surface);
   box-shadow:
-    0 0 0 1px rgba(240, 136, 62, 0.1),
-    0 0 32px rgba(240, 136, 62, 0.12),
-    inset 0 1px 0 rgba(255, 255, 255, 0.04);
+    0 0 0 1px rgba(240, 136, 62, 0.08),
+    0 24px 48px -24px rgba(0, 0, 0, 0.6),
+    var(--shadow-glow);
+  transition: box-shadow var(--transition-slow);
 }
 
-.hero-install code {
-  color: var(--color-accent);
-  font-size: var(--fs-sm);
+.hero-terminal:hover {
+  box-shadow:
+    0 0 0 1px rgba(240, 136, 62, 0.15),
+    0 24px 56px -20px rgba(0, 0, 0, 0.7),
+    0 0 48px rgba(240, 136, 62, 0.1);
 }
 
-/* Copy hint */
-.hero-install::after {
-  content: "📋 click to copy";
-  display: block;
+.hero-terminal .terminal-titlebar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-4);
+  background: var(--color-border-muted);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.hero-terminal .terminal-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex: none;
+}
+
+.hero-terminal .terminal-dot-red    { background: #f85149; }
+.hero-terminal .terminal-dot-yellow { background: #d29922; }
+.hero-terminal .terminal-dot-green  { background: #3fb950; }
+
+.hero-terminal .terminal-title {
+  margin-left: var(--space-2);
+  font-family: var(--font-mono);
   font-size: var(--fs-xs);
   color: var(--color-text-muted);
-  margin-top: var(--space-2);
-  text-align: center;
-  opacity: 0.7;
 }
+
+.terminal-body {
+  padding: var(--space-4) var(--space-5);
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+  line-height: 1.7;
+  min-height: 200px;
+}
+
+.terminal-body .line {
+  display: block;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.terminal-body .line + .line {
+  margin-top: 2px;
+}
+
+.terminal-cursor {
+  display: inline-block;
+  width: 0.5em;
+  height: 1.1em;
+  vertical-align: text-bottom;
+  background: var(--color-accent);
+  animation: terminal-blink 1s steps(1) infinite;
+  margin-left: 2px;
+}
+
+@keyframes terminal-blink {
+  50% { opacity: 0; }
+}
+
+/* Syntax tokens for terminal */
+.tok-prompt  { color: var(--color-accent); font-weight: var(--fw-semibold); }
+.tok-comment { color: var(--color-text-muted); font-style: italic; }
+.tok-str     { color: #a5d6ff; }
+.tok-flag    { color: var(--color-info); }
+.tok-key     { color: var(--color-info); }
+.tok-output  { color: var(--color-text-muted); }
+.tok-done    { color: var(--color-success); }
+.tok-run     { color: var(--color-info); }
+.tok-pend    { color: var(--color-text-muted); }
+.tok-fail    { color: var(--color-danger); }
 
 .hero-or {
   margin-top: var(--space-5) !important;
@@ -595,7 +756,7 @@ section h3 + p {
   padding: var(--space-3) var(--space-10);
   font-size: var(--fs-lg);
   font-weight: var(--fw-semibold);
-  font-family: var(--font-body);
+  font-family: var(--font-display);
   color: #1a1107;
   background: var(--gradient-accent);
   border: none;
@@ -629,40 +790,46 @@ section h3 + p {
   outline-offset: 2px;
 }
 
-/* ── Features Grid ─────────────────────────────────────────────────── */
+/* ── Hero Screenshot ───────────────────────────────────────────────── */
 
-#features {
+.hero-screenshot {
+  position: relative;
+  z-index: 1;
+  max-width: 980px;
+  margin: var(--space-8) auto 0;
+  padding: 0 var(--space-6);
+}
+
+.hero-screenshot img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  box-shadow:
+    0 0 0 1px rgba(240, 136, 62, 0.08),
+    0 24px 64px -24px rgba(0, 0, 0, 0.7),
+    0 0 48px rgba(240, 136, 62, 0.07);
+}
+
+/* ── Why Tamandua Grid ────────────────────────────────────────────── */
+
+#why {
+  padding-top: var(--space-16);
+}
+
+.why-grid {
   display: grid;
   grid-template-columns: 1fr;
-  gap: var(--space-6);
+  gap: var(--space-5);
+  margin-top: var(--space-8);
 }
 
-#features h2 {
-  grid-column: 1 / -1;
-  margin-bottom: 0;
-}
-
-/* Feature card icons */
-.feature-icon {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 56px;
-  height: 56px;
-  font-size: 1.75rem;
-  line-height: 1;
-  margin-bottom: var(--space-4);
-  background: var(--color-accent-soft);
-  border: 1px solid rgba(240, 136, 62, 0.25);
-  border-radius: var(--radius-lg);
-  opacity: 0.95;
-}
-
-#features article {
+.why-card {
   position: relative;
   overflow: hidden;
   background:
-    linear-gradient(180deg, rgba(240, 136, 62, 0.05), transparent 45%),
+    linear-gradient(180deg, rgba(240, 136, 62, 0.04), transparent 45%),
     var(--color-surface);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-xl);
@@ -674,35 +841,198 @@ section h3 + p {
     box-shadow var(--transition);
 }
 
-/* Accent top edge revealed on hover */
-#features article::before {
+/* Tamandua stripe accent on hover — diagonal stripe across the card */
+.why-card::before {
   content: "";
   position: absolute;
-  inset: 0 0 auto 0;
-  height: 2px;
-  background: var(--gradient-accent);
+  inset: 0;
+  pointer-events: none;
+  background: repeating-linear-gradient(
+    -45deg,
+    transparent,
+    transparent 12px,
+    rgba(240, 136, 62, 0.03) 12px,
+    rgba(240, 136, 62, 0.03) 13px
+  );
   opacity: 0;
-  transition: opacity var(--transition);
+  transition: opacity var(--transition-slow);
 }
 
-#features article:hover {
-  border-color: rgba(240, 136, 62, 0.5);
+.why-card:hover {
+  border-color: rgba(240, 136, 62, 0.4);
   transform: translateY(-3px);
   box-shadow: var(--shadow-card-hover);
 }
 
-#features article:hover::before {
+.why-card:hover::before {
   opacity: 1;
 }
 
-#features article:hover .feature-icon {
-  opacity: 1;
+.why-card-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 48px;
+  height: 48px;
+  margin-bottom: var(--space-4);
+  background: var(--color-accent-soft);
+  border: 1px solid rgba(240, 136, 62, 0.2);
+  border-radius: var(--radius-lg);
+  color: var(--color-accent);
+  transition:
+    background var(--transition),
+    border-color var(--transition),
+    transform var(--transition);
 }
 
-#features article h3 {
+.why-card:hover .why-card-icon {
+  background: var(--gradient-accent-subtle);
+  border-color: rgba(240, 136, 62, 0.4);
+  transform: scale(1.05);
+}
+
+.why-card h3 {
   margin-top: 0;
   margin-bottom: var(--space-3);
   font-size: var(--fs-xl);
+  font-weight: var(--fw-semibold);
+}
+
+.why-card p {
+  color: var(--color-text-muted);
+  font-size: var(--fs-sm);
+  line-height: 1.6;
+  margin: 0;
+}
+
+@media (min-width: 768px) {
+  .why-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+@media (min-width: 1024px) {
+  .why-grid {
+    grid-template-columns: repeat(4, 1fr);
+  }
+}
+
+/* ── Pipeline Flow ───────────────────────────────────────────────────
+   Replaces the old architecture-flow with a cleaner, more compact
+   horizontal pipeline. */
+
+.pipeline-flow {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-3);
+  margin: var(--space-8) 0;
+}
+
+.pipeline-step {
+  position: relative;
+  overflow: hidden;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.02), transparent 40%),
+    var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-xl);
+  padding: var(--space-5) var(--space-6);
+  text-align: center;
+  max-width: 480px;
+  width: 100%;
+  box-shadow: var(--shadow-card);
+  transition:
+    border-color var(--transition),
+    transform var(--transition),
+    box-shadow var(--transition);
+}
+
+.pipeline-step:hover {
+  border-color: rgba(240, 136, 62, 0.4);
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-card-hover);
+}
+
+.pipeline-number {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: var(--gradient-accent);
+  color: #1a1107;
+  font-family: var(--font-display);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-bold);
+  margin-bottom: var(--space-3);
+  box-shadow: 0 2px 10px rgba(240, 136, 62, 0.3);
+}
+
+.pipeline-step h3 {
+  font-family: var(--font-display);
+  font-size: var(--fs-lg);
+  margin-top: 0;
+  margin-bottom: var(--space-2);
+}
+
+.pipeline-step p {
+  color: var(--color-text-muted);
+  font-size: var(--fs-sm);
+  line-height: 1.55;
+  margin: 0;
+}
+
+.pipeline-connector {
+  color: var(--color-accent);
+  opacity: 0.4;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.pipeline-connector svg {
+  display: block;
+}
+
+@media (min-width: 768px) {
+  .pipeline-flow {
+    flex-direction: row;
+    align-items: stretch;
+    gap: 0;
+  }
+
+  .pipeline-step {
+    flex: 1;
+    max-width: none;
+  }
+
+  .pipeline-connector {
+    padding: 0 var(--space-2);
+  }
+}
+
+.how-architecture {
+  margin-top: var(--space-8);
+  padding: var(--space-5) var(--space-6);
+  background:
+    linear-gradient(90deg, rgba(240, 136, 62, 0.05), transparent 40%),
+    var(--color-surface);
+  border: 1px solid var(--color-border-muted);
+  border-left: 3px solid var(--color-accent);
+  border-radius: var(--radius-md);
+}
+
+.how-architecture h3 {
+  margin-top: 0;
+  margin-bottom: var(--space-3);
+}
+
+.how-architecture p {
+  margin-bottom: 0;
+  color: var(--color-text-muted);
 }
 
 /* ── Tables ────────────────────────────────────────────────────────── */
@@ -722,6 +1052,7 @@ caption {
   color: var(--color-text-em);
   padding: var(--space-4) var(--space-4) var(--space-2);
   font-size: var(--fs-base);
+  font-family: var(--font-display);
 }
 
 thead {
@@ -738,6 +1069,7 @@ th {
   text-transform: uppercase;
   letter-spacing: 0.05em;
   white-space: nowrap;
+  font-family: var(--font-display);
 }
 
 td {
@@ -770,7 +1102,6 @@ tbody tr:last-child td {
   border: 1px solid var(--color-border);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-card);
-  /* Scroll hint shadow: inset shadow on right edge when content overflows */
   background:
     linear-gradient(to right, var(--color-surface) 30%, transparent),
     linear-gradient(to right, transparent, var(--color-surface) 70%) 100% 0,
@@ -789,101 +1120,11 @@ tbody tr:last-child td {
 
 .table-wrapper table {
   margin: 0;
-  /* Ensure table doesn't collapse below min-content */
   min-width: 100%;
 }
 
-/* Remove default table margin when inside a wrapper */
 .table-wrapper + .table-wrapper {
   margin-top: var(--space-5);
-}
-
-/* ── Architecture Flow ─────────────────────────────────────────────── */
-
-.architecture-flow {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: var(--space-3);
-  margin: var(--space-8) 0;
-}
-
-.arch-step {
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.02), transparent 40%),
-    var(--color-surface);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-xl);
-  padding: var(--space-5) var(--space-6);
-  text-align: center;
-  max-width: 480px;
-  width: 100%;
-  box-shadow: var(--shadow-card);
-  transition:
-    border-color var(--transition),
-    transform var(--transition),
-    box-shadow var(--transition);
-}
-
-.arch-step:hover {
-  border-color: rgba(240, 136, 62, 0.5);
-  transform: translateY(-2px);
-  box-shadow: var(--shadow-card-hover);
-}
-
-.arch-number {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 32px;
-  height: 32px;
-  border-radius: 50%;
-  background: var(--gradient-accent);
-  color: #1a1107;
-  font-size: var(--fs-sm);
-  font-weight: var(--fw-bold);
-  margin-bottom: var(--space-3);
-  box-shadow: 0 2px 10px rgba(240, 136, 62, 0.3);
-}
-
-.arch-step strong {
-  display: block;
-  font-size: var(--fs-lg);
-  margin-bottom: var(--space-2);
-}
-
-.arch-step p {
-  color: var(--color-text-muted);
-  font-size: var(--fs-sm);
-  line-height: 1.55;
-  margin: 0;
-}
-
-.arch-arrow {
-  font-size: 1.5rem;
-  color: var(--color-accent);
-  opacity: 0.6;
-  line-height: 1;
-}
-
-@media (min-width: 768px) {
-  .architecture-flow {
-    flex-direction: row;
-    align-items: stretch;
-    gap: 0;
-  }
-
-  .arch-step {
-    flex: 1;
-    max-width: none;
-  }
-
-  .arch-arrow {
-    display: flex;
-    align-items: center;
-    font-size: 1.75rem;
-    padding: 0 var(--space-3);
-  }
 }
 
 /* ── Installation Grid ──────────────────────────────────────────────── */
@@ -909,13 +1150,14 @@ tbody tr:last-child td {
 }
 
 .install-column:hover {
-  border-color: rgba(240, 136, 62, 0.5);
+  border-color: rgba(240, 136, 62, 0.4);
   box-shadow: var(--shadow-card-hover);
 }
 
 .install-column h3 {
   margin-top: 0;
   margin-bottom: var(--space-4);
+  font-family: var(--font-display);
 }
 
 .install-column pre {
@@ -945,6 +1187,7 @@ tbody tr:last-child td {
 .install-prereqs h3 {
   margin-top: 0;
   margin-bottom: var(--space-3);
+  font-family: var(--font-display);
 }
 
 .install-prereqs ul {
@@ -963,121 +1206,33 @@ tbody tr:last-child td {
   }
 }
 
-/* ── Why It Works List ──────────────────────────────────────────────── */
+/* ── MCP Section ────────────────────────────────────────────────────── */
 
-.why-list {
-  list-style: none;
-  counter-reset: why-counter;
-  padding: 0;
-  margin: var(--space-8) 0;
+.mcp-section {
+  margin-top: var(--space-8);
+  padding-top: var(--space-6);
+  border-top: 1px solid var(--color-border);
 }
 
-.why-list li {
-  counter-increment: why-counter;
-  position: relative;
-  padding: var(--space-5) var(--space-5) var(--space-5) var(--space-8);
-  margin-bottom: var(--space-4);
-  border-left: 3px solid var(--color-border-muted);
-  border-radius: 0 var(--radius-md) var(--radius-md) 0;
-  background: rgba(22, 27, 34, 0.45);
-  transition:
-    border-color var(--transition),
-    background var(--transition),
-    transform var(--transition);
+.mcp-section h3 {
+  font-family: var(--font-display);
 }
 
-/* Alternating left-border accents */
-.why-list li:nth-child(1) { border-left-color: var(--color-accent); }
-.why-list li:nth-child(2) { border-left-color: var(--color-info); }
-.why-list li:nth-child(3) { border-left-color: var(--color-success); }
-.why-list li:nth-child(4) { border-left-color: var(--color-accent); }
-
-.why-list li:hover {
-  background: var(--color-surface);
-  transform: translateX(4px);
-}
-
-/* Numbered badge via ::before pseudo-element */
-.why-list li::before {
-  content: counter(why-counter);
-  position: absolute;
-  left: 0;
-  top: var(--space-5);
-  transform: translateX(-50%);
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 28px;
-  height: 28px;
-  border-radius: 50%;
-  background: var(--color-bg);
-  border: 2px solid var(--color-border);
-  color: var(--color-text-muted);
-  font-size: var(--fs-xs);
-  font-weight: var(--fw-bold);
-  transition:
-    border-color var(--transition),
-    color var(--transition);
-}
-
-.why-list li:nth-child(1)::before { border-color: var(--color-accent); color: var(--color-accent); }
-.why-list li:nth-child(2)::before { border-color: var(--color-info); color: var(--color-info); }
-.why-list li:nth-child(3)::before { border-color: var(--color-success); color: var(--color-success); }
-.why-list li:nth-child(4)::before { border-color: var(--color-accent); color: var(--color-accent); }
-
-.why-list li strong {
-  display: block;
+.mcp-section h4 {
+  margin-top: var(--space-6);
+  margin-bottom: var(--space-3);
+  font-family: var(--font-display);
   font-size: var(--fs-lg);
-  margin-bottom: var(--space-2);
+  color: var(--color-text-em);
 }
 
-.why-list li p {
-  color: var(--color-text-muted);
-  margin-top: var(--space-1);
-}
-
-/* ── YAML Code Block ────────────────────────────────────────────────── */
-
-pre.yaml-code {
-  background: linear-gradient(135deg, var(--color-surface) 0%, rgba(22, 27, 34, 0.5) 100%);
-  border-left: 3px solid var(--color-accent);
-  padding: var(--space-6);
-  white-space: pre;
-  position: relative;
-}
-
-/* YAML syntax hint: decorative label badge */
-pre.yaml-code::before {
-  content: "YAML";
-  position: absolute;
-  top: 0;
-  right: var(--space-4);
-  padding: 2px var(--space-3);
-  background: var(--color-accent);
-  color: #000;
-  font-family: var(--font-mono);
-  font-size: 0.65rem;
-  font-weight: var(--fw-bold);
-  letter-spacing: 0.08em;
-  border-radius: 0 0 var(--radius-sm) var(--radius-sm);
-}
-
-pre.yaml-code code {
-  color: var(--color-text);
-}
-
-ul, ol {
-  padding-left: var(--space-6);
-  margin: var(--space-4) 0;
-}
-
-li {
-  margin-bottom: var(--space-2);
-}
-
-li p {
-  margin-top: var(--space-1);
-  color: var(--color-text-muted);
+.mcp-note {
+  margin-top: var(--space-6) !important;
+  padding: var(--space-4) var(--space-5);
+  background: var(--gradient-accent-subtle);
+  border: 1px solid rgba(240, 136, 62, 0.2);
+  border-radius: var(--radius-md);
+  font-size: var(--fs-sm);
 }
 
 /* ── Screenshots ───────────────────────────────────────────────────── */
@@ -1121,6 +1276,49 @@ li p {
   border-radius: var(--radius-sm);
 }
 
+/* ── YAML Code Block ────────────────────────────────────────────────── */
+
+pre.yaml-code {
+  background: linear-gradient(135deg, var(--color-surface) 0%, rgba(22, 27, 34, 0.5) 100%);
+  border-left: 3px solid var(--color-accent);
+  padding: var(--space-6);
+  white-space: pre;
+  position: relative;
+}
+
+pre.yaml-code::before {
+  content: "YAML";
+  position: absolute;
+  top: 0;
+  right: var(--space-4);
+  padding: 2px var(--space-3);
+  background: var(--color-accent);
+  color: #000;
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  font-weight: var(--fw-bold);
+  letter-spacing: 0.08em;
+  border-radius: 0 0 var(--radius-sm) var(--radius-sm);
+}
+
+pre.yaml-code code {
+  color: var(--color-text);
+}
+
+ul, ol {
+  padding-left: var(--space-6);
+  margin: var(--space-4) 0;
+}
+
+li {
+  margin-bottom: var(--space-2);
+}
+
+li p {
+  margin-top: var(--space-1);
+  color: var(--color-text-muted);
+}
+
 /* ── Footer ────────────────────────────────────────────────────────── */
 
 footer {
@@ -1148,6 +1346,7 @@ footer {
   text-transform: uppercase;
   letter-spacing: 0.12em;
   color: var(--color-accent);
+  font-family: var(--font-display);
 }
 
 .footer-col p,
@@ -1183,14 +1382,15 @@ footer {
 
 .footer-logo {
   display: block;
-  font-size: 2.5rem;
+  margin: 0 auto var(--space-3);
+  color: var(--color-accent);
   opacity: 0.5;
-  margin-bottom: var(--space-3);
-  transition: opacity var(--transition);
+  transition: opacity var(--transition), transform var(--transition);
 }
 
 .footer-logo:hover {
   opacity: 0.8;
+  transform: rotate(-8deg);
 }
 
 .footer-built {
@@ -1199,7 +1399,12 @@ footer {
   margin: 0;
 }
 
-/* ── Print Styles ──────────────────────────────────────────────────── */
+.footer-copyright {
+  font-size: var(--fs-xs);
+  color: var(--color-text-muted);
+  margin-top: var(--space-2);
+  opacity: 0.7;
+}
 
 /* ── JS Progressive Enhancement Styles ─────────────────────────────── */
 
@@ -1270,24 +1475,31 @@ pre:hover .copy-btn,
   background: rgba(63, 185, 80, 0.1);
 }
 
-/* Copyright footer */
-.footer-copyright {
+/* Copy button feedback */
+.copy-btn-feedback {
+  display: none;
   font-size: var(--fs-xs);
-  color: var(--color-text-muted);
-  margin-top: var(--space-2);
-  opacity: 0.7;
+  font-weight: var(--fw-semibold);
+  margin-left: var(--space-1);
+}
+
+.copy-btn.copied {
+  min-width: 0;
+  padding: 0 var(--space-3);
+}
+
+.copy-btn.copied .copy-btn-feedback {
+  display: inline;
 }
 
 /* ── Touch Targets — minimum 44x44px ────────────────────────────────── */
 
-/* Nav links — ensure adequate touch target on all screens */
 #nav-links a {
   min-height: 44px;
   display: flex;
   align-items: center;
 }
 
-/* CTA button — ensure large touch target */
 .cta-button {
   min-height: 44px;
   display: inline-flex;
@@ -1298,17 +1510,14 @@ pre:hover .copy-btn,
 /* ── Mobile-specific adjustments (< 768px) ─────────────────────────── */
 
 @media (max-width: 767px) {
-  /* Reduce section padding for better information density on mobile */
   :root {
     --section-pad: var(--space-6);
   }
 
-  /* Scale headings down on mobile */
-  h1 { font-size: var(--fs-3xl); }    /* 2rem from 2.5rem */
-  h2 { font-size: var(--fs-2xl); }    /* 1.5rem from 2rem */
-  h3 { font-size: var(--fs-xl); }     /* 1.25rem from 1.5rem */
+  h1 { font-size: var(--fs-3xl); }
+  h2 { font-size: var(--fs-2xl); }
+  h3 { font-size: var(--fs-xl); }
 
-  /* Hero section tighter on mobile */
   #hero {
     padding: var(--space-8) 0;
   }
@@ -1321,27 +1530,23 @@ pre:hover .copy-btn,
     font-size: var(--fs-base);
   }
 
-  /* Hero install command smaller on mobile */
-  .hero-install pre {
+  .hero-terminal {
+    margin-top: var(--space-6);
+  }
+
+  .terminal-body {
     padding: var(--space-3) var(--space-4);
     font-size: var(--fs-xs);
   }
 
-  .hero-install code {
-    font-size: var(--fs-xs);
-  }
-
-  /* Reduce gap in feature grid on mobile */
-  #features {
+  .why-grid {
     gap: var(--space-4);
   }
 
-  /* Prevent horizontal overflow — constrain any potentially wide elements */
   pre, .table-wrapper, .screenshot, iframe, video, canvas, svg, object, embed {
     max-width: 100%;
   }
 
-  /* Ensure all interactive elements remain tappable without horizontal scroll */
   body {
     overflow-x: hidden;
   }
@@ -1363,10 +1568,15 @@ body.nav-open {
   html {
     scroll-behavior: auto;
   }
+
+  .terminal-cursor {
+    animation: none;
+  }
 }
 
+/* ── Print Styles ──────────────────────────────────────────────────── */
+
 @media print {
-  /* Reset all backgrounds, colors, shadows, and animations */
   *,
   *::before,
   *::after {
@@ -1385,7 +1595,6 @@ body.nav-open {
     line-height: 1.5;
   }
 
-  /* Hide navigation, interactive elements, and decorative content */
   header,
   nav,
   .skip-link,
@@ -1393,33 +1602,30 @@ body.nav-open {
   .cta-button,
   .copy-btn,
   .nav-toggle-label,
+  .hero-terminal,
   .hero-install,
   footer .footer-built {
     display: none !important;
   }
 
-  /* Hide CSS pseudo-element decorations */
   #hero::before,
   #hero::after,
+  section::before,
   section h2::after,
-  pre.yaml-code::before,
-  .hero-install::after {
+  pre.yaml-code::before {
     display: none !important;
   }
 
-  /* Gradient-clipped hero heading must fall back to solid text */
   #hero h1 {
     background: none !important;
     -webkit-text-fill-color: #000 !important;
   }
 
-  /* Remove section reveal animations — show all content */
   .section-reveal {
     opacity: 1 !important;
     transform: none !important;
   }
 
-  /* Links: black text, underline, show full URL */
   a {
     color: #000 !important;
     text-decoration: underline;
@@ -1431,17 +1637,14 @@ body.nav-open {
     color: #555 !important;
   }
 
-  /* Don't show URL for same-page anchor links */
   a[href^="#"]::after {
     content: none;
   }
 
-  /* Headings avoid page breaks */
   h1, h2, h3 {
     page-break-after: avoid;
   }
 
-  /* Code blocks: clean borders, no dark backgrounds */
   pre, code {
     border: 1px solid #ccc;
     font-size: 0.9em;
@@ -1453,7 +1656,6 @@ body.nav-open {
     word-wrap: break-word;
   }
 
-  /* Tables: clean borders */
   table {
     border-collapse: collapse;
   }
@@ -1462,26 +1664,22 @@ body.nav-open {
     border: 1px solid #ccc;
   }
 
-  /* Remove table wrapper scroll shadows */
   .table-wrapper {
     background: none !important;
     overflow-x: visible;
   }
 
-  /* Sections: no borders, avoid page breaks inside */
   section {
     border: none;
     page-break-inside: avoid;
     padding: 1em 0;
   }
 
-  /* Main content: full width, no padding */
   main {
     max-width: 100%;
     padding: 0;
   }
 
-  /* Footer: clean borders */
   footer {
     border: none;
     padding: 1em 0;
@@ -1495,7 +1693,6 @@ body.nav-open {
     margin-bottom: 1em;
   }
 
-  /* Screenshots: clean borders, full width, no shadows */
   .screenshot {
     max-width: 100%;
     box-shadow: none;
@@ -1514,39 +1711,29 @@ body.nav-open {
     border: none;
   }
 
-  /* Hide YAML decorative badge */
   pre.yaml-code {
     border-left: 1px solid #ccc;
   }
 
-  /* Feature cards = stack vertically */
-  #features article {
+  .why-card {
     border: 1px solid #ccc;
     background: none !important;
     margin-bottom: 0.5em;
   }
 
-  /* Architecture flow = stack vertically */
-  .arch-arrow {
+  .pipeline-connector {
     display: none;
   }
 
-  .arch-step {
+  .pipeline-step {
     border: 1px solid #ccc;
     background: none !important;
     margin-bottom: 0.5em;
     max-width: none;
   }
 
-  /* Why-list items: clean borders */
-  .why-list li {
-    border-left: 1px solid #ccc;
-    border-image: none;
-  }
-
-  /* Remove card hover effects */
-  #features article:hover,
-  .arch-step:hover,
+  .why-card:hover,
+  .pipeline-step:hover,
   .install-column:hover,
   .screenshot:hover {
     transform: none;
@@ -1559,25 +1746,18 @@ body.nav-open {
 
 /* Tablet (768px+) */
 @media (min-width: 768px) {
-  #features {
-    grid-template-columns: repeat(2, 1fr);
-  }
-
   .footer-grid {
     grid-template-columns: repeat(3, 1fr);
   }
 
-  /* Restore desktop section padding */
   :root {
     --section-pad: var(--space-10);
   }
 
-  /* Restore heading sizes */
   h1 { font-size: var(--fs-4xl); }
   h2 { font-size: var(--fs-3xl); }
   h3 { font-size: var(--fs-2xl); }
 
-  /* Restore hero heading size */
   #hero h1 {
     font-size: var(--fs-4xl);
   }
@@ -1585,28 +1765,10 @@ body.nav-open {
   .hero-tagline {
     font-size: var(--fs-lg);
   }
-
-  /* Restore install command size */
-  .hero-install pre {
-    padding: var(--space-4) var(--space-6);
-  }
-
-  .hero-install code {
-    font-size: var(--fs-sm);
-  }
 }
 
-/* Desktop (1024px+) — 4-column feature grid, larger type refinements */
+/* Desktop (1024px+) */
 @media (min-width: 1024px) {
-  #features {
-    grid-template-columns: repeat(4, 1fr);
-  }
-
-  #features h2 {
-    grid-column: 1 / -1;
-  }
-
-  /* Slightly larger section padding on desktop */
   :root {
     --section-pad: var(--space-12);
   }
@@ -1614,152 +1776,19 @@ body.nav-open {
 
 /* Large desktop (1440px+) */
 @media (min-width: 1440px) {
-  /* Slightly more generous spacing and sizing */
   :root {
     --section-pad: var(--space-12);
   }
 
   html {
-    font-size: 105%;  /* Slightly larger base font for big screens */
+    font-size: 105%;
   }
 }
 
-/* ── Hero Screenshot ─────────────────────────────────────────────────
-   Product visual above the fold. Sits below the CTA inside #hero. */
-
-.hero-screenshot {
-  position: relative;
-  z-index: 1;
-  max-width: 980px;
-  margin: var(--space-8) auto 0;
-  padding: 0 var(--space-6);
-}
-
-.hero-screenshot img {
-  display: block;
-  width: 100%;
-  height: auto;
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-lg);
-  box-shadow:
-    0 0 0 1px rgba(240, 136, 62, 0.08),
-    0 24px 64px -24px rgba(0, 0, 0, 0.7),
-    0 0 48px rgba(240, 136, 62, 0.07);
-}
-
-/* ── Terminal Window (animated Quick Example) ──────────────────────── */
-
-.terminal-window {
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-lg);
-  overflow: hidden;
-  background: var(--color-surface);
-  box-shadow: var(--shadow-card);
-  margin: var(--space-5) 0;
-}
-
-.terminal-titlebar {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  padding: var(--space-2) var(--space-4);
-  background: var(--color-border-muted);
-  border-bottom: 1px solid var(--color-border);
-}
-
-.terminal-dot {
-  width: 12px;
-  height: 12px;
-  border-radius: 50%;
-  flex: none;
-}
-
-.terminal-dot-red    { background: #f85149; }
-.terminal-dot-yellow { background: #d29922; }
-.terminal-dot-green  { background: #3fb950; }
-
-.terminal-title {
-  margin-left: var(--space-2);
-  font-family: var(--font-mono);
-  font-size: var(--fs-xs);
-  color: var(--color-text-muted);
-}
-
-.terminal-window pre {
-  margin: 0;
-  border: none;
-  border-radius: 0;
-  min-height: 22rem; /* reserve space so the replay doesn't shift layout */
-}
-
-.terminal-cursor {
-  display: inline-block;
-  width: 0.55em;
-  height: 1.1em;
-  vertical-align: text-bottom;
-  background: var(--color-accent);
-  animation: terminal-blink 1s steps(1) infinite;
-}
-
-.terminal-cursor-idle {
-  animation-duration: 1.6s;
-  opacity: 0.7;
-}
-
-@keyframes terminal-blink {
-  50% { opacity: 0; }
-}
-
-/* ── Syntax Highlighting Tokens (lightweight, hand-rolled) ─────────── */
-
-.tok-prompt  { color: var(--color-accent); font-weight: var(--fw-semibold); }
-.tok-comment { color: var(--color-text-muted); font-style: italic; }
-.tok-str     { color: #a5d6ff; }
-.tok-flag    { color: var(--color-info); }
-.tok-key     { color: var(--color-info); }
-.tok-output  { color: var(--color-text-muted); }
-.tok-done    { color: var(--color-success); }
-.tok-run     { color: var(--color-info); }
-.tok-pend    { color: var(--color-text-muted); }
-.tok-fail    { color: var(--color-danger); }
-
-/* ── Copy Button Visible Feedback ──────────────────────────────────── */
-
-.copy-btn-feedback {
-  display: none;
-  font-size: var(--fs-xs);
-  font-weight: var(--fw-semibold);
-  margin-left: var(--space-1);
-}
-
-.copy-btn.copied {
-  min-width: 0;
-  padding: 0 var(--space-3);
-}
-
-.copy-btn.copied .copy-btn-feedback {
-  display: inline;
-}
-
-/* Reduced motion: no cursor blink, no replay (JS also skips the replay) */
-@media (prefers-reduced-motion: reduce) {
-  .terminal-cursor {
-    animation: none;
-  }
-
-  .terminal-window pre {
-    min-height: 0;
-  }
-}
-
-/* Small screens: hero screenshot edge-to-edge, terminal shorter */
+/* Small screens: hero screenshot edge-to-edge */
 @media (max-width: 640px) {
   .hero-screenshot {
     padding: 0 var(--space-3);
     margin-top: var(--space-6);
-  }
-
-  .terminal-window pre {
-    min-height: 0;
   }
 }
