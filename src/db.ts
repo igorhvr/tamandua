@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { assertStatePathIsolation } from "./lib/test-guard.js";
+import { LEDGER_RETENTION_MS } from "./suite/config.js";
 
 let _db: DatabaseSync | null = null;
 let _dbPath: string | null = null;
@@ -263,6 +264,29 @@ function migrate(db: DatabaseSync): void {
   db.exec(
     "CREATE INDEX IF NOT EXISTS idx_autoresearch_sessions_last_seen_at ON autoresearch_sessions(last_seen_at)",
   );
+
+  // ── TSTX suite results ledger ──
+  // Append-only: every test execution inserts a row; replays do not.
+  // Rows older than LEDGER_RETENTION (14d) are pruned by the reconciler.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS suite_results (
+      id INTEGER PRIMARY KEY,
+      origin_repo TEXT NOT NULL,
+      tree_hash TEXT NOT NULL,
+      cmd_hash TEXT NOT NULL,
+      cmd_display TEXT NOT NULL,
+      exit_code INTEGER NOT NULL,
+      duration_ms INTEGER NOT NULL,
+      log_tail TEXT,
+      run_id TEXT,
+      step_id TEXT,
+      created_at TEXT NOT NULL
+    );
+  `);
+
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS idx_suite_results_lookup ON suite_results(origin_repo, tree_hash, cmd_hash, created_at)",
+  );
 }
 
 export function nextRunNumber(): number {
@@ -486,4 +510,15 @@ export function deleteAutoresearchSession(id: string): boolean {
   const db = getDb();
   const result = db.prepare("DELETE FROM autoresearch_sessions WHERE id = ?").run(id);
   return result.changes > 0;
+}
+
+// ── TSTX suite results pruning ──
+
+export function pruneOldSuiteResults(): number {
+  const db = getDb();
+  const cutoff = new Date(Date.now() - LEDGER_RETENTION_MS).toISOString();
+  const before = (db.prepare("SELECT COUNT(*) as cnt FROM suite_results").get() as { cnt: number }).cnt;
+  db.prepare("DELETE FROM suite_results WHERE created_at < ?").run(cutoff);
+  const after = (db.prepare("SELECT COUNT(*) as cnt FROM suite_results").get() as { cnt: number }).cnt;
+  return before - after;
 }

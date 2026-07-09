@@ -8,7 +8,7 @@ import { DatabaseSync } from "node:sqlite";
 // We test the migration by directly importing getDb, which calls migrate().
 // But since getDb() uses a cached connection and resolves DB path from
 // env/home, we test the migration logic directly with an isolated DB.
-import { getDb, getDbPath, getSystemTokenSpend, incrementSystemTokenSpend, upsertAutoresearchSession, getAutoresearchSessions, getAutoresearchSessionById, deleteAutoresearchSession } from "../dist/db.js";
+import { getDb, getDbPath, getSystemTokenSpend, incrementSystemTokenSpend, upsertAutoresearchSession, getAutoresearchSessions, getAutoresearchSessionById, deleteAutoresearchSession, pruneOldSuiteResults } from "../dist/db.js";
 
 describe("PRAGMA synchronous", () => {
   let tempHome: string;
@@ -1157,5 +1157,437 @@ describe("deleteAutoresearchSession", () => {
   it("returns false for nonexistent id", () => {
     const result = deleteAutoresearchSession("/nonexistent/id");
     assert.equal(result, false, "should return false for nonexistent id");
+  });
+});
+
+// ── TSTX suite_results table ──
+
+describe("suite_results table migration", () => {
+  let tempHome: string;
+  let origHome: string | undefined;
+  let origDbPath: string | undefined;
+
+  before(() => {
+    tempHome = mkdtempSync(path.join(os.tmpdir(), "tamandua-suite-results-test-"));
+    origHome = process.env.HOME;
+    origDbPath = process.env.TAMANDUA_DB_PATH;
+    process.env.HOME = tempHome;
+    delete process.env.TAMANDUA_DB_PATH;
+  });
+
+  after(() => {
+    if (origHome) {
+      process.env.HOME = origHome;
+    } else {
+      delete process.env.HOME;
+    }
+    if (origDbPath) {
+      process.env.TAMANDUA_DB_PATH = origDbPath;
+    } else {
+      delete process.env.TAMANDUA_DB_PATH;
+    }
+    rmSync(tempHome, { recursive: true, force: true });
+  });
+
+  function tableExists(db: DatabaseSync, table: string): boolean {
+    const row = db.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+    ).get(table);
+    return row !== undefined;
+  }
+
+  it("creates suite_results table on first migration", () => {
+    const db = getDb();
+    assert.ok(tableExists(db, "suite_results"), "suite_results table should exist");
+  });
+
+  it("all required columns present with correct types and constraints", () => {
+    const db = getDb();
+    const cols = db.prepare("PRAGMA table_info(suite_results)").all() as Array<{
+      name: string;
+      type: string;
+      notnull: number;
+      pk: number;
+    }>;
+
+    const colMap = new Map(cols.map((c) => [c.name, c]));
+
+    // id: INTEGER PRIMARY KEY
+    const idCol = colMap.get("id");
+    assert.ok(idCol, "id column should exist");
+    assert.equal(idCol.type, "INTEGER", "id should be INTEGER");
+    assert.equal(idCol.pk, 1, "id should be PRIMARY KEY");
+
+    // origin_repo: TEXT NOT NULL
+    const originRepoCol = colMap.get("origin_repo");
+    assert.ok(originRepoCol, "origin_repo column should exist");
+    assert.equal(originRepoCol.type, "TEXT", "origin_repo should be TEXT");
+    assert.equal(originRepoCol.notnull, 1, "origin_repo should be NOT NULL");
+
+    // tree_hash: TEXT NOT NULL
+    const treeHashCol = colMap.get("tree_hash");
+    assert.ok(treeHashCol, "tree_hash column should exist");
+    assert.equal(treeHashCol.type, "TEXT", "tree_hash should be TEXT");
+    assert.equal(treeHashCol.notnull, 1, "tree_hash should be NOT NULL");
+
+    // cmd_hash: TEXT NOT NULL
+    const cmdHashCol = colMap.get("cmd_hash");
+    assert.ok(cmdHashCol, "cmd_hash column should exist");
+    assert.equal(cmdHashCol.type, "TEXT", "cmd_hash should be TEXT");
+    assert.equal(cmdHashCol.notnull, 1, "cmd_hash should be NOT NULL");
+
+    // cmd_display: TEXT NOT NULL
+    const cmdDisplayCol = colMap.get("cmd_display");
+    assert.ok(cmdDisplayCol, "cmd_display column should exist");
+    assert.equal(cmdDisplayCol.type, "TEXT", "cmd_display should be TEXT");
+    assert.equal(cmdDisplayCol.notnull, 1, "cmd_display should be NOT NULL");
+
+    // exit_code: INTEGER NOT NULL
+    const exitCodeCol = colMap.get("exit_code");
+    assert.ok(exitCodeCol, "exit_code column should exist");
+    assert.equal(exitCodeCol.type, "INTEGER", "exit_code should be INTEGER");
+    assert.equal(exitCodeCol.notnull, 1, "exit_code should be NOT NULL");
+
+    // duration_ms: INTEGER NOT NULL
+    const durationMsCol = colMap.get("duration_ms");
+    assert.ok(durationMsCol, "duration_ms column should exist");
+    assert.equal(durationMsCol.type, "INTEGER", "duration_ms should be INTEGER");
+    assert.equal(durationMsCol.notnull, 1, "duration_ms should be NOT NULL");
+
+    // log_tail: TEXT (nullable)
+    const logTailCol = colMap.get("log_tail");
+    assert.ok(logTailCol, "log_tail column should exist");
+    assert.equal(logTailCol.type, "TEXT", "log_tail should be TEXT");
+    assert.equal(logTailCol.notnull, 0, "log_tail should be nullable");
+
+    // run_id: TEXT (nullable)
+    const runIdCol = colMap.get("run_id");
+    assert.ok(runIdCol, "run_id column should exist");
+    assert.equal(runIdCol.type, "TEXT", "run_id should be TEXT");
+    assert.equal(runIdCol.notnull, 0, "run_id should be nullable");
+
+    // step_id: TEXT (nullable)
+    const stepIdCol = colMap.get("step_id");
+    assert.ok(stepIdCol, "step_id column should exist");
+    assert.equal(stepIdCol.type, "TEXT", "step_id should be TEXT");
+    assert.equal(stepIdCol.notnull, 0, "step_id should be nullable");
+
+    // created_at: TEXT NOT NULL
+    const createdAtCol = colMap.get("created_at");
+    assert.ok(createdAtCol, "created_at column should exist");
+    assert.equal(createdAtCol.type, "TEXT", "created_at should be TEXT");
+    assert.equal(createdAtCol.notnull, 1, "created_at should be NOT NULL");
+  });
+
+  it("has lookup index on (origin_repo, tree_hash, cmd_hash, created_at)", () => {
+    const db = getDb();
+    const indexes = db.prepare(
+      "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='suite_results'",
+    ).all() as Array<{ name: string }>;
+
+    const hasLookupIndex = indexes.some((idx) => idx.name === "idx_suite_results_lookup");
+    assert.ok(hasLookupIndex, "should have idx_suite_results_lookup index");
+  });
+
+  it("migration is idempotent (second call does nothing harmful)", () => {
+    const db = getDb();
+
+    // Table should still exist with no error
+    assert.ok(tableExists(db, "suite_results"), "suite_results should still exist after second migration");
+
+    // Columns should be unchanged
+    const cols = db.prepare("PRAGMA table_info(suite_results)").all() as Array<{ name: string }>;
+    const colNames = cols.map((c) => c.name).sort();
+    const expectedCols = [
+      "id", "origin_repo", "tree_hash", "cmd_hash", "cmd_display",
+      "exit_code", "duration_ms", "log_tail", "run_id", "step_id", "created_at",
+    ];
+    assert.deepEqual(colNames, expectedCols.sort(), "columns should match expected after idempotent migrate");
+  });
+
+  it("existing DB tables unaffected by migration", () => {
+    const db = getDb();
+    // All existing tables should still be present
+    assert.ok(tableExists(db, "runs"), "runs table should exist");
+    assert.ok(tableExists(db, "steps"), "steps table should exist");
+    assert.ok(tableExists(db, "stories"), "stories table should exist");
+    assert.ok(tableExists(db, "tamandua_stats"), "tamandua_stats table should exist");
+    assert.ok(tableExists(db, "run_worktrees"), "run_worktrees table should exist");
+    assert.ok(tableExists(db, "autoresearch_sessions"), "autoresearch_sessions table should exist");
+
+    // Core runs columns should still be present
+    const runCols = db.prepare("PRAGMA table_info(runs)").all() as Array<{ name: string }>;
+    const runColNames = new Set(runCols.map((c) => c.name));
+    assert.ok(runColNames.has("id"), "runs.id should exist");
+    assert.ok(runColNames.has("workflow_id"), "runs.workflow_id should exist");
+    assert.ok(runColNames.has("status"), "runs.status should exist");
+  });
+
+  it("can insert and query a suite result row", () => {
+    const db = getDb();
+    const now = new Date().toISOString();
+
+    db.prepare(`
+      INSERT INTO suite_results
+        (origin_repo, tree_hash, cmd_hash, cmd_display,
+         exit_code, duration_ms, log_tail, run_id, step_id, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      "/home/user/repo",
+      "abc123def456789012345678901234567890abcd",
+      "sha256:def456",
+      "npm test",
+      0,
+      5432,
+      "All tests passed!\n42 tests, 0 failures",
+      "run-001",
+      "step-001",
+      now,
+    );
+
+    const row = db.prepare("SELECT * FROM suite_results WHERE run_id = ?").get("run-001") as {
+      id: number;
+      origin_repo: string;
+      tree_hash: string;
+      cmd_hash: string;
+      cmd_display: string;
+      exit_code: number;
+      duration_ms: number;
+      log_tail: string;
+      run_id: string;
+      step_id: string;
+      created_at: string;
+    };
+
+    assert.ok(row, "should retrieve inserted row");
+    assert.ok(typeof row.id === "number", "id should be auto-generated");
+    assert.equal(row.origin_repo, "/home/user/repo");
+    assert.equal(row.tree_hash, "abc123def456789012345678901234567890abcd");
+    assert.equal(row.cmd_hash, "sha256:def456");
+    assert.equal(row.cmd_display, "npm test");
+    assert.equal(row.exit_code, 0);
+    assert.equal(row.duration_ms, 5432);
+    assert.equal(row.log_tail, "All tests passed!\n42 tests, 0 failures");
+    assert.equal(row.run_id, "run-001");
+    assert.equal(row.step_id, "step-001");
+    assert.equal(row.created_at, now);
+  });
+
+  it("table is append-only: multiple inserts for same key produce distinct rows", () => {
+    const db = getDb();
+    const now1 = new Date("2026-01-01T00:00:00Z").toISOString();
+    const now2 = new Date("2026-01-01T01:00:00Z").toISOString();
+
+    db.prepare(`
+      INSERT INTO suite_results
+        (origin_repo, tree_hash, cmd_hash, cmd_display,
+         exit_code, duration_ms, log_tail, run_id, step_id, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      "/home/user/repo",
+      "tree-aaa",
+      "cmd-aaa",
+      "npm test",
+      0,
+      5000,
+      "pass",
+      "run-a",
+      "step-a",
+      now1,
+    );
+
+    db.prepare(`
+      INSERT INTO suite_results
+        (origin_repo, tree_hash, cmd_hash, cmd_display,
+         exit_code, duration_ms, log_tail, run_id, step_id, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      "/home/user/repo",
+      "tree-aaa",
+      "cmd-aaa",
+      "npm test",
+      1,
+      3000,
+      "fail",
+      "run-b",
+      "step-b",
+      now2,
+    );
+
+    const count = db.prepare(
+      "SELECT COUNT(*) as cnt FROM suite_results WHERE origin_repo = ? AND tree_hash = ? AND cmd_hash = ?",
+    ).get("/home/user/repo", "tree-aaa", "cmd-aaa") as { cnt: number };
+
+    assert.equal(count.cnt, 2, "same key should produce two distinct rows (append-only)");
+  });
+
+  it("handles null log_tail, run_id, and step_id", () => {
+    const db = getDb();
+    const now = new Date().toISOString();
+
+    db.prepare(`
+      INSERT INTO suite_results
+        (origin_repo, tree_hash, cmd_hash, cmd_display,
+         exit_code, duration_ms, log_tail, run_id, step_id, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?)
+    `).run(
+      "/home/user/repo",
+      "tree-nullable",
+      "cmd-nullable",
+      "npm test",
+      0,
+      100,
+      now,
+    );
+
+    const row = db.prepare(
+      "SELECT log_tail, run_id, step_id FROM suite_results WHERE tree_hash = ?",
+    ).get("tree-nullable") as { log_tail: string | null; run_id: string | null; step_id: string | null };
+
+    assert.equal(row.log_tail, null, "log_tail should be null");
+    assert.equal(row.run_id, null, "run_id should be null");
+    assert.equal(row.step_id, null, "step_id should be null");
+  });
+});
+
+describe("suite_results pruneOldSuiteResults", () => {
+  let tempHome: string;
+  let origHome: string | undefined;
+  let origDbPath: string | undefined;
+
+  before(() => {
+    tempHome = mkdtempSync(path.join(os.tmpdir(), "tamandua-suite-prune-test-"));
+    origHome = process.env.HOME;
+    origDbPath = process.env.TAMANDUA_DB_PATH;
+    process.env.HOME = tempHome;
+    delete process.env.TAMANDUA_DB_PATH;
+  });
+
+  after(() => {
+    if (origHome) {
+      process.env.HOME = origHome;
+    } else {
+      delete process.env.HOME;
+    }
+    if (origDbPath) {
+      process.env.TAMANDUA_DB_PATH = origDbPath;
+    } else {
+      delete process.env.TAMANDUA_DB_PATH;
+    }
+    rmSync(tempHome, { recursive: true, force: true });
+  });
+
+  it("removes rows older than 14 days", () => {
+    const db = getDb();
+
+    // Insert a row older than 14 days
+    const oldDate = new Date(Date.now() - 20 * 24 * 60 * 60 * 1000).toISOString();
+    db.prepare(`
+      INSERT INTO suite_results
+        (origin_repo, tree_hash, cmd_hash, cmd_display,
+         exit_code, duration_ms, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run("/home/user/repo", "old-tree", "old-cmd", "npm test", 0, 1000, oldDate);
+
+    // Insert a recent row (less than 14 days)
+    const recentDate = new Date(Date.now() - 5 * 24 * 60 * 60 * 1000).toISOString();
+    db.prepare(`
+      INSERT INTO suite_results
+        (origin_repo, tree_hash, cmd_hash, cmd_display,
+         exit_code, duration_ms, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run("/home/user/repo", "recent-tree", "recent-cmd", "npm test", 0, 2000, recentDate);
+
+    // Verify both rows exist before pruning
+    const countBefore = db.prepare("SELECT COUNT(*) as cnt FROM suite_results").get() as { cnt: number };
+    assert.equal(countBefore.cnt, 2, "should have 2 rows before pruning");
+
+    // Prune
+    const pruned = pruneOldSuiteResults();
+    assert.equal(pruned, 1, "should prune exactly the old row");
+
+    // Verify old row is gone
+    const oldRow = db.prepare(
+      "SELECT id FROM suite_results WHERE tree_hash = ?",
+    ).get("old-tree");
+    assert.equal(oldRow, undefined, "old row should be gone");
+
+    // Verify recent row remains
+    const recentRow = db.prepare(
+      "SELECT tree_hash FROM suite_results WHERE tree_hash = ?",
+    ).get("recent-tree") as { tree_hash: string };
+    assert.ok(recentRow, "recent row should remain");
+    assert.equal(recentRow.tree_hash, "recent-tree");
+  });
+
+  it("returns 0 when no rows to prune", () => {
+    const db = getDb();
+    // Clean up any leftover rows from previous tests
+    db.exec("DELETE FROM suite_results");
+
+    // Insert only a recent row
+    const recentDate = new Date().toISOString();
+    db.prepare(`
+      INSERT INTO suite_results
+        (origin_repo, tree_hash, cmd_hash, cmd_display,
+         exit_code, duration_ms, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run("/repo", "tree", "cmd", "echo hi", 0, 100, recentDate);
+
+    const pruned = pruneOldSuiteResults();
+    assert.equal(pruned, 0, "should prune 0 rows when all are recent");
+
+    const count = db.prepare("SELECT COUNT(*) as cnt FROM suite_results").get() as { cnt: number };
+    assert.equal(count.cnt, 1, "row should remain");
+  });
+
+  it("returns 0 on empty table (no crash)", () => {
+    const db = getDb();
+    // Empty table is the initial state
+    db.exec("DELETE FROM suite_results");
+
+    const pruned = pruneOldSuiteResults();
+    assert.equal(pruned, 0, "should return 0 on empty table");
+
+    const count = db.prepare("SELECT COUNT(*) as cnt FROM suite_results").get() as { cnt: number };
+    assert.equal(count.cnt, 0, "table should still be empty");
+  });
+
+  it("respects the exact 14-day cutoff", () => {
+    const db = getDb();
+    db.exec("DELETE FROM suite_results");
+
+    // Insert a row exactly 14d minus 1 second ago — should NOT be pruned
+    const almostExpired = new Date(Date.now() - (14 * 24 * 60 * 60 * 1000) + 1000).toISOString();
+    db.prepare(`
+      INSERT INTO suite_results
+        (origin_repo, tree_hash, cmd_hash, cmd_display,
+         exit_code, duration_ms, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run("/repo", "almost-old", "cmd", "echo test", 0, 500, almostExpired);
+
+    // Insert a row exactly 14d + 1 second ago — should be pruned
+    const justExpired = new Date(Date.now() - (14 * 24 * 60 * 60 * 1000) - 1000).toISOString();
+    db.prepare(`
+      INSERT INTO suite_results
+        (origin_repo, tree_hash, cmd_hash, cmd_display,
+         exit_code, duration_ms, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run("/repo", "just-old", "cmd", "echo test", 0, 600, justExpired);
+
+    const pruned = pruneOldSuiteResults();
+    assert.equal(pruned, 1, "should prune exactly the row older than 14d");
+
+    // almostExpired should remain
+    const almostRow = db.prepare(
+      "SELECT tree_hash FROM suite_results WHERE tree_hash = ?",
+    ).get("almost-old");
+    assert.ok(almostRow, "row < 14d old should remain");
+
+    // justExpired should be gone
+    const justRow = db.prepare(
+      "SELECT tree_hash FROM suite_results WHERE tree_hash = ?",
+    ).get("just-old");
+    assert.equal(justRow, undefined, "row > 14d old should be pruned");
   });
 });

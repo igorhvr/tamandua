@@ -457,6 +457,17 @@
       </div>
     </section>
 
+    <!-- Suite Ledger Section -->
+    <section class="section" id="suite-ledger-section">
+      <h2>Suite Ledger</h2>
+      <div class="panel-toolbar">
+        <span style="font-size:12px;color:#8b949e;">Flaky keys (last 24h):</span>
+      </div>
+      <div id="suite-flaky-content">
+        <div class="empty-state">No flaky keys detected</div>
+      </div>
+    </section>
+
     <!-- AutoResearch Section -->
     <section class="section" id="autoresearch-section">
       <h2>AutoResearch</h2>
@@ -612,6 +623,42 @@
       }
     }
 
+    async function fetchSuiteFlaky() {
+      try {
+        const res = await fetch("/api/suite/flaky");
+        const data = await res.json();
+        renderSuiteFlaky(data.flaky_keys || []);
+      } catch (err) {
+        console.error("Failed to fetch flaky keys:", err);
+      }
+    }
+
+    function renderSuiteFlaky(flakyKeys) {
+      const el = document.getElementById("suite-flaky-content");
+      if (!flakyKeys.length) {
+        el.innerHTML = '<div class="empty-state">No flaky keys detected</div>';
+        return;
+      }
+
+      const rows = flakyKeys.map(k => {
+        const total = k.pass_count + k.fail_count;
+        return `<tr>
+          <td class="mono" style="font-size:11px">${esc(k.tree_hash.slice(0, 12))}</td>
+          <td class="mono" style="font-size:11px">${esc(k.cmd_display)}</td>
+          <td class="num" style="color:#3fb950">${k.pass_count} pass</td>
+          <td class="num" style="color:#f85149">${k.fail_count} fail</td>
+          <td class="num">${total} total</td>
+        </tr>`;
+      }).join("");
+
+      el.innerHTML = `<table>
+        <thead><tr>
+          <th>Tree Hash</th><th>Command</th><th>Passes</th><th>Failures</th><th>Total</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+    }
+
     async function fetchLogsTail() {
       try {
         const res = await fetch(`/api/logs-tail?offset=${logsTailOffset}&generation=${logsTailGeneration}`);
@@ -659,6 +706,7 @@
             </div>
           </td>
           <td class="num">${tokensSpent}</td>
+          <td class="num" title="Suite test executions for this run">${Number(r.suite_executed) || 0}</td>
           <td class="num" style="font-size:11px">${timeAgo(r.updated_at)}</td>
           <td class="actions">
             ${r.status === 'running' ? `<button class="action-btn pause-btn" onclick="event.preventDefault(); handlePause('${r.id}')">⏸ Pause</button>` : ''}
@@ -672,7 +720,7 @@
 
       el.innerHTML = `<table>
         <thead><tr>
-          <th>#</th><th>Run ID</th><th>Workflow</th><th>Task</th><th>Status</th><th>Progress</th><th>Tokens</th><th>Updated</th><th>Actions</th><th>View</th>
+          <th>#</th><th>Run ID</th><th>Workflow</th><th>Task</th><th>Status</th><th>Progress</th><th>Tokens</th><th title="Suite test executions">Suite</th><th>Updated</th><th>Actions</th><th>View</th>
         </tr></thead>
         <tbody>${rows}</tbody>
       </table>`;
@@ -960,6 +1008,7 @@
       fetchRuns();
       fetchAutoresearchSessions();
       fetchEvents();
+      fetchSuiteFlaky();
       fetchLogsTail();
       fetchStats();
       fetchBuildVersion();

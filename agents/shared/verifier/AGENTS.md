@@ -69,6 +69,7 @@ ISSUES:
 
 ## Important
 
+- If you suspect flakiness or environment dependence, rerun with `--force`.
 - Don't fix the code yourself — send it back with clear, specific issues
 - Don't approve if tests fail — even one failure means retry
 - Don't be vague in issues — tell the implementer exactly what's wrong

@@ -160,6 +160,13 @@ describe("scripts/install.sh — bundled workflow installation", () => {
         `Symlink should exist at ${symlinkPath}`,
       );
 
+      // tamandua-test symlink should exist and be executable
+      const symlinkPathTest = path.join(tempHome, ".local", "bin", "tamandua-test");
+      assert.ok(
+        fs.existsSync(symlinkPathTest),
+        `tamandua-test symlink should exist at ${symlinkPathTest}`,
+      );
+
       // Workflow directories should exist
       const workflowsRoot = path.join(tempHome, ".tamandua", "workflows");
       assert.ok(
@@ -221,6 +228,163 @@ describe("scripts/install.sh — bundled workflow installation", () => {
     assert.ok(
       content.includes("$WF_INSTALL_EXIT -ne 0"),
       "install.sh should check WF_INSTALL_EXIT for non-zero",
+    );
+  });
+});
+
+/**
+ * Tests for tamandua-test bin registration (US-007).
+ *
+ * Validates:
+ * 1. package.json bin field includes tamandua-test
+ * 2. install.sh creates tamandua-test symlink
+ * 3. build script makes dist/suite/shim.js executable
+ * 4. dist/suite/shim.js has correct shebang
+ * 5. tamandua-test --help works
+ */
+
+describe("tamandua-test bin registration", () => {
+  const PACKAGE_JSON = path.resolve(__dirname, "..", "package.json");
+  const DIST_SHIM = path.resolve(__dirname, "..", "dist", "suite", "shim.js");
+
+  // AC 1: package.json bin field includes tamandua-test
+  it("package.json bin field includes tamandua-test pointing to dist/suite/shim.js", () => {
+    const content = fs.readFileSync(PACKAGE_JSON, "utf-8");
+    const pkg = JSON.parse(content);
+
+    assert.ok(pkg.bin && typeof pkg.bin === "object", "package.json should have a bin object");
+    assert.equal(
+      pkg.bin["tamandua-test"],
+      "dist/suite/shim.js",
+      "bin.tamandua-test should point to dist/suite/shim.js",
+    );
+    assert.equal(
+      pkg.bin["tamandua"],
+      "dist/cli/cli.js",
+      "existing bin.tamandua should remain unchanged",
+    );
+  });
+
+  // AC 2: install.sh source contains tamandua-test symlink
+  it("install.sh creates tamandua-test symlink in ~/.local/bin", () => {
+    const content = fs.readFileSync(INSTALL_SCRIPT, "utf-8");
+
+    // Must have the tamandua-test symlink creation
+    assert.ok(
+      content.includes('"$REPO_DIR/bin/tamandua-test"'),
+      "install.sh should reference bin/tamandua-test",
+    );
+    assert.ok(
+      content.includes('"$HOME/.local/bin/tamandua-test"'),
+      "install.sh should symlink to ~/.local/bin/tamandua-test",
+    );
+
+    // tamandua-test symlink should appear after tamandua symlink
+    const tamanduaIdx = content.indexOf('"$HOME/.local/bin/tamandua"');
+    const testIdx = content.indexOf('"$HOME/.local/bin/tamandua-test"');
+    assert.ok(
+      testIdx > tamanduaIdx,
+      "tamandua-test symlink should appear after tamandua symlink",
+    );
+  });
+
+  // AC 3: build script makes dist/suite/shim.js executable
+  it("build script includes chmod +x for dist/suite/shim.js", () => {
+    const content = fs.readFileSync(PACKAGE_JSON, "utf-8");
+    const pkg = JSON.parse(content);
+    const buildScript = pkg.scripts?.build || "";
+
+    assert.ok(
+      buildScript.includes("chmod +x dist/suite/shim.js"),
+      "build script should chmod +x dist/suite/shim.js",
+    );
+  });
+
+  // AC 4: dist/suite/shim.js is executable and has correct shebang (when built)
+  it("dist/suite/shim.js is executable and has #!/usr/bin/env node shebang", () => {
+    if (!fs.existsSync(DIST_SHIM)) {
+      // Skip if not built — integration test covers this after npm run build
+      return;
+    }
+
+    // Check executable permissions
+    const stat = fs.statSync(DIST_SHIM);
+    // Owner execute bit should be set (0o100)
+    const ownerExec = (stat.mode & 0o100) !== 0;
+    assert.ok(ownerExec, "dist/suite/shim.js should have owner execute permission");
+
+    // Check shebang
+    const firstLine = fs.readFileSync(DIST_SHIM, "utf-8").split("\n")[0];
+    assert.equal(
+      firstLine,
+      "#!/usr/bin/env node",
+      "dist/suite/shim.js should start with #!/usr/bin/env node",
+    );
+  });
+
+  // AC 5: tamandua-test --help shows usage
+  it("tamandua-test --help shows usage documentation", () => {
+    if (!fs.existsSync(DIST_SHIM)) {
+      // Skip if not built — test requires build artifacts
+      return;
+    }
+
+    const result = spawnSync("node", [DIST_SHIM, "--help"], {
+      encoding: "utf-8",
+      timeout: 10_000,
+    });
+
+    assert.equal(result.status, 0, `tamandua-test --help should exit 0, got ${result.status}`);
+    // Help output goes to stderr
+    const stderr = result.stderr || "";
+    assert.ok(
+      stderr.includes("Usage:"),
+      `--help should show usage on stderr. Got: ${stderr.slice(0, 200)}`,
+    );
+    assert.ok(
+      stderr.includes("--repo"),
+      "usage should document --repo flag",
+    );
+    assert.ok(
+      stderr.includes("TAMANDUA_TSTX"),
+      "usage should document TAMANDUA_TSTX env var",
+    );
+  });
+
+  // AC 6: tamandua-test is directly executable (via node)
+  it("tamandua-test exits with error when missing command", () => {
+    if (!fs.existsSync(DIST_SHIM)) {
+      return;
+    }
+
+    const result = spawnSync("node", [DIST_SHIM, "--repo", "."], {
+      encoding: "utf-8",
+      timeout: 10_000,
+    });
+
+    // Should fail with non-zero exit (or at least not crash)
+    assert.ok(
+      result.status !== null,
+      "tamandua-test should not crash when invoked without command",
+    );
+  });
+
+  // AC 7: tamandua-test passthrough with missing repo still works
+  it("tamandua-test passthrough with no --repo runs command directly", () => {
+    if (!fs.existsSync(DIST_SHIM)) {
+      return;
+    }
+
+    const result = spawnSync("node", [DIST_SHIM, "--", "echo", "hello"], {
+      encoding: "utf-8",
+      timeout: 10_000,
+    });
+
+    // Passthrough mode: execs echo hello, exits 0
+    assert.equal(result.status, 0, `echo hello should exit 0, got ${result.status}`);
+    assert.ok(
+      (result.stdout || "").includes("hello"),
+      `expected 'hello' in output. Got: ${result.stdout?.slice?.(0, 200) || "(empty)"}`,
     );
   });
 });

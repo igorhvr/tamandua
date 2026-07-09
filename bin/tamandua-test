@@ -1,0 +1,4 @@
+#!/bin/sh
+# tamandua-test — Content-Addressed Test-Suite Ledger Shim entry point
+# Resolves the dist/suite/shim.js relative to the repo root and executes it.
+exec node --disable-warning=ExperimentalWarning "$(dirname "$(dirname "$(readlink -f "$0")")")"/dist/suite/shim.js "$@"

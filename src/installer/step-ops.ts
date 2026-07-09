@@ -1508,6 +1508,30 @@ let lastCleanupTime = 0;
 const CLEANUP_THROTTLE_MS = 5 * 60 * 1000;
 
 /**
+ * Wrap test_cmd with the tamandua-test shim invocation if present in context.
+ * Saves the original command as test_cmd_raw and replaces test_cmd with the
+ * wrapped shim invocation (R18, R19).
+ *
+ * Example: if test_cmd = "npm test", replaces it with:
+ *   tamandua-test --repo <repo> --run <run_id> --step <step_id> -- npm test
+ *
+ * Does nothing if test_cmd is missing, empty, or whitespace-only.
+ */
+function wrapTestCmdInContext(
+  context: Record<string, string>,
+  repo: string | undefined,
+  runId: string,
+  stepId: string,
+): void {
+  const testCmd = context["test_cmd"];
+  if (!testCmd || testCmd.trim().length === 0) return;
+  if (!repo) return;
+
+  context["test_cmd_raw"] = testCmd;
+  context["test_cmd"] = `tamandua-test --repo ${repo} --run ${runId} --step ${stepId} -- ${testCmd}`;
+}
+
+/**
  * Find and claim a pending step for an agent, returning the resolved input.
  */
 export function claimStep(agentId: string, runId: string, workerOwnership?: WorkerOwnership): ClaimResult {
@@ -1724,6 +1748,9 @@ export function claimStep(agentId: string, runId: string, workerOwnership?: Work
         context["timeout_retry"] = "";
       }
 
+      // Wrap test_cmd with tamandua-test shim (R18-R19)
+      wrapTestCmdInContext(context, context["repo"], step.run_id, step.step_id);
+
       const missingKeys = findMissingTemplateKeys(step.input_template, context);
       const blockResult = resolveMissingKeys(
         step.run_id, step.step_index, step.step_id, step.id, agentId, missingKeys
@@ -1795,6 +1822,9 @@ export function claimStep(agentId: string, runId: string, workerOwnership?: Work
   if (!context["timeout_retry"]) {
     context["timeout_retry"] = "";
   }
+
+  // Wrap test_cmd with tamandua-test shim (R18-R19)
+  wrapTestCmdInContext(context, context["repo"], step.run_id, step.step_id);
 
   const missingKeys = findMissingTemplateKeys(step.input_template, context);
   const blockResult = resolveMissingKeys(

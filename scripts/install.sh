@@ -57,10 +57,12 @@ npm install
 echo "Building..."
 npm run build
 
-# Create symlink
+# Create symlinks
 mkdir -p "$HOME/.local/bin"
 ln -sf "$REPO_DIR/bin/tamandua" "$HOME/.local/bin/tamandua"
 chmod +x "$HOME/.local/bin/tamandua"
+ln -sf "$REPO_DIR/bin/tamandua-test" "$HOME/.local/bin/tamandua-test"
+chmod +x "$HOME/.local/bin/tamandua-test"
 
 # Install bundled workflows
 set +e

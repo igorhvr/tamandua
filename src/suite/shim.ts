@@ -1,0 +1,510 @@
+#!/usr/bin/env node
+/**
+ * tamandua-test — Content-Addressed Test-Suite Ledger Shim
+ *
+ * Intercepts test commands and implements lookup, decision, execute/replay
+ * logic with passthrough degradation. Must be STRICTLY MONOTONE: it may
+ * only skip work that is provably redundant. On any doubt, error, or
+ * unexpected condition it degrades to running the real command unchanged.
+ *
+ * CLI: tamandua-test --repo <path> --run <runId> --step <stepId> [--force] -- <cmd...>
+ */
+
+import { spawn, type ChildProcess } from "node:child_process";
+import { realpathSync, existsSync } from "node:fs";
+import {
+  TTL_GREEN_MS,
+  RED_CONTEXT_WINDOW_MS,
+  CLAIM_TIMEOUT_MS,
+  LOG_TAIL_KB,
+  isTstxEnabled,
+} from "./config.js";
+
+const SINGLEFLIGHT_POLL_INTERVAL_MS = 1000; // 1s
+
+// ── CLI argument parsing ──────────────────────────────────────────────
+
+interface ParsedArgs {
+  repo: string;
+  runId: string;
+  stepId: string;
+  force: boolean;
+  cmdArgs: string[];
+  cmdString: string;
+}
+
+function parseArgs(argv: string[]): ParsedArgs {
+  let repo = "";
+  let runId = "";
+  let stepId = "";
+  let force = false;
+  let separatorIdx = -1;
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === "--") {
+      separatorIdx = i;
+      break;
+    }
+    if ((arg === "--repo" || arg === "-r") && i + 1 < argv.length) {
+      repo = argv[++i];
+      continue;
+    }
+    if ((arg === "--run" || arg === "-R") && i + 1 < argv.length) {
+      runId = argv[++i];
+      continue;
+    }
+    if ((arg === "--step" || arg === "-s") && i + 1 < argv.length) {
+      stepId = argv[++i];
+      continue;
+    }
+    if (arg === "--force" || arg === "-f") {
+      force = true;
+      continue;
+    }
+    if (arg === "--help" || arg === "-h") {
+      printHelp();
+      process.exit(0);
+    }
+  }
+
+  const cmdArgs = separatorIdx >= 0 ? argv.slice(separatorIdx + 1) : [];
+  const cmdString = cmdArgs.join(" ");
+
+  return { repo, runId, stepId, force, cmdArgs, cmdString };
+}
+
+function printHelp(): void {
+  process.stderr.write(`Usage: tamandua-test --repo <path> --run <id> --step <id> [--force] -- <command...>
+
+Options:
+  --repo, -r   Path to the git repository (required for caching)
+  --run, -R    Run ID for ledger attribution
+  --step, -s   Step ID for ledger attribution
+  --force, -f  Force execution even when a fresh green cache entry exists
+  --help, -h   Show this help
+
+Environment:
+  TAMANDUA_TSTX=0   Disable caching entirely (full passthrough)
+
+A content-addressed test-suite ledger that skips re-execution of test
+commands against byte-identical working trees, replaying the recorded
+result instead. Strictly monotone: degrades to passthrough on any doubt.
+`);
+}
+
+// ── Passthrough ───────────────────────────────────────────────────────
+
+function passthroughNotice(reason: string): void {
+  process.stderr.write(`tamandua-test: passthrough mode — ${reason}\n`);
+}
+
+/**
+ * Execute the command directly with inherited stdio (R14-R15).
+ * Passthrough MUST be indistinguishable from running the raw command
+ * except for the single stderr notice already emitted.
+ */
+function passthroughExec(cmdArgs: string[]): void {
+  if (cmdArgs.length === 0) {
+    process.stderr.write("tamandua-test: error: no command to run\n");
+    process.exit(1);
+  }
+
+  const child = spawn(cmdArgs[0], cmdArgs.slice(1), {
+    stdio: "inherit",
+  });
+
+  child.on("close", (code: number | null) => {
+    process.exit(code ?? 1);
+  });
+
+  child.on("error", (err: Error) => {
+    process.stderr.write(`tamandua-test: failed to spawn command: ${err.message}\n`);
+    process.exit(1);
+  });
+}
+
+// ── Execute & capture ─────────────────────────────────────────────────
+
+interface ExecuteResult {
+  exitCode: number;
+  durationMs: number;
+  output: string; // combined stdout + stderr
+}
+
+/**
+ * Spawn the command, stream stdout/stderr through unmodified, and capture
+ * the complete output for ledger recording (R9).
+ */
+function executeAndCapture(cmdArgs: string[]): Promise<ExecuteResult> {
+  return new Promise((resolve) => {
+    const startTime = Date.now();
+    const child: ChildProcess = spawn(cmdArgs[0], cmdArgs.slice(1), {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let captured = "";
+
+    child.stdout!.on("data", (chunk: Buffer) => {
+      const text = chunk.toString();
+      process.stdout.write(text);
+      captured += text;
+    });
+
+    child.stderr!.on("data", (chunk: Buffer) => {
+      const text = chunk.toString();
+      process.stderr.write(text);
+      captured += text;
+    });
+
+    child.on("error", (err: Error) => {
+      // If the command itself can't be spawned, treat as passthrough-ish failure.
+      process.stderr.write(`tamandua-test: failed to spawn command: ${err.message}\n`);
+      resolve({
+        exitCode: 1,
+        durationMs: Date.now() - startTime,
+        output: `tamandua-test: failed to spawn command: ${err.message}`,
+      });
+    });
+
+    child.on("close", (code: number | null) => {
+      const durationMs = Date.now() - startTime;
+      resolve({
+        exitCode: code ?? 1,
+        durationMs,
+        output: captured,
+      });
+    });
+  });
+}
+
+// ── Replay ────────────────────────────────────────────────────────────
+
+function formatAge(ms: number): string {
+  if (ms < 60_000) return `${Math.round(ms / 1000)}s`;
+  if (ms < 3_600_000) return `${Math.round(ms / 60_000)}m`;
+  if (ms < 86_400_000) return `${Math.round(ms / 3_600_000)}h`;
+  return `${Math.round(ms / 86_400_000)}d`;
+}
+
+/**
+ * Print the replay banner and recorded log tail, then exit 0 (R12-R13).
+ */
+function replay(
+  latest: Record<string, unknown>,
+  cmdDisplay: string,
+  ageMs: number,
+): void {
+  const treeHashShort = String(latest.tree_hash ?? "").slice(0, 12);
+  const runId = latest.run_id ?? "?";
+  const stepId = latest.step_id ?? "?";
+  const duration = typeof latest.duration_ms === "number"
+    ? (latest.duration_ms / 1000).toFixed(1)
+    : "?";
+  const logTail = typeof latest.log_tail === "string" ? latest.log_tail : "";
+
+  // R12: Replay banner (greppable).
+  process.stdout.write(
+    `TAMANDUA-TEST CACHED: tree ${treeHashShort} passed ${cmdDisplay} ${formatAge(ageMs)} ago (run #${runId}, step ${stepId}, exit 0, ${duration}s)\n`,
+  );
+
+  const tailKB = logTail.length > 0
+    ? Math.ceil(logTail.length / 1024)
+    : 0;
+  process.stdout.write(`--- recorded output (last ${tailKB}KB) ---\n`);
+  if (logTail) {
+    process.stdout.write(logTail);
+  }
+
+  // R13: Replay exits 0.
+  process.exit(0);
+}
+
+// ── Red context note ──────────────────────────────────────────────────
+
+function printRedContextNote(
+  latest: Record<string, unknown>,
+  cmdDisplay: string,
+  ageMs: number,
+): void {
+  const minutesAgo = Math.max(1, Math.round(ageMs / 60_000));
+  const runId = latest.run_id ?? "?";
+  const stepId = latest.step_id ?? "?";
+  process.stderr.write(
+    `note: this tree failed ${cmdDisplay} ${minutesAgo}m ago (run #${runId}, step ${stepId}) — rerunning\n`,
+  );
+}
+
+// ── Flaky banner ──────────────────────────────────────────────────────
+
+function printFlakyBanner(
+  passCount: number,
+  failCount: number,
+): void {
+  const total = passCount + failCount;
+  process.stderr.write(
+    `⚠ FLAKY: identical tree produced ${passCount} passes / ${failCount} failures in last 24h (${total} total runs)\n`,
+  );
+}
+
+// ── Sleep (setTimeout-based with unref) ────────────────────────────
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+// ── Single-flight poll (R16-R17) ────────────────────────────────────
+
+interface PollResult {
+  action: "replay" | "execute";
+  latest?: Record<string, unknown>;
+  ageMs?: number;
+}
+
+/**
+ * Poll the lookup endpoint until the claim owner records a result or
+ * CLAIM_TIMEOUT elapses. Returns "replay" with the green result data
+ * when a green record appears, or "execute" when a red record appears,
+ * the control plane becomes unreachable, or the poll times out.
+ */
+async function pollForResult(
+  originRepo: string,
+  treeHash: string,
+  cmdHash: string,
+): Promise<PollResult> {
+  const startTime = Date.now();
+  // Dynamic import inside poll — by the time we reach here, the module
+  // is already loaded via the earlier lookup import.
+  const { lookupSuiteRecord } = await import("../server/control-client.js");
+
+  while (Date.now() - startTime < CLAIM_TIMEOUT_MS) {
+    await sleep(SINGLEFLIGHT_POLL_INTERVAL_MS);
+
+    const lookup = await lookupSuiteRecord(originRepo, treeHash, cmdHash);
+    if (lookup === null) {
+      // Control plane unreachable during poll → execute.
+      process.stderr.write(
+        "tamandua-test: warning: control plane unreachable during single-flight poll — executing\n",
+      );
+      return { action: "execute" };
+    }
+
+    const latest = lookup.latest as Record<string, unknown> | null;
+    if (latest && typeof latest.exit_code === "number") {
+      if (latest.exit_code === 0) {
+        // Green result recorded by the claim owner → replay it.
+        const createdAt = String(latest.created_at ?? "");
+        const ageMs = Date.now() - new Date(createdAt).getTime();
+        return { action: "replay", latest, ageMs };
+      }
+      // Red result recorded → do not replay; execute ourselves.
+      return { action: "execute" };
+    }
+  }
+
+  // CLAIM_TIMEOUT elapsed → execute (R17).
+  process.stderr.write(
+    "tamandua-test: single-flight claim poll timed out — executing\n",
+  );
+  return { action: "execute" };
+}
+
+// ── Main ──────────────────────────────────────────────────────────────
+
+async function main(): Promise<void> {
+  const { repo, runId, stepId, force, cmdArgs, cmdString } = parseArgs(process.argv.slice(2));
+
+  // R14: TAMANDUA_TSTX=0 — full passthrough.
+  if (!isTstxEnabled()) {
+    passthroughNotice("TAMANDUA_TSTX=0 kill switch active");
+    passthroughExec(cmdArgs);
+    return;
+  }
+
+  // No command → error.
+  if (cmdArgs.length === 0) {
+    process.stderr.write("tamandua-test: error: no test command provided (use -- to separate args)\n");
+    process.exit(1);
+  }
+
+  // No repo → passthrough.
+  if (!repo) {
+    passthroughNotice("no --repo specified");
+    passthroughExec(cmdArgs);
+    return;
+  }
+
+  // Resolve repo to realpath; if it doesn't exist, passthrough.
+  let repoReal: string;
+  try {
+    repoReal = realpathSync(repo);
+  } catch {
+    passthroughNotice(`--repo path not found: ${repo}`);
+    passthroughExec(cmdArgs);
+    return;
+  }
+
+  // ── Dynamic imports for heavy modules (fast startup) ──────────────
+
+  const { computeTreeHash, computeCmdHash, getOriginRepo } = await import("./tree-hash.js");
+
+  // R3: Tree hash failure → passthrough.
+  const treeHash = computeTreeHash(repoReal);
+  if (treeHash === null) {
+    passthroughNotice("git tree hash failed (non-git directory or git error)");
+    passthroughExec(cmdArgs);
+    return;
+  }
+
+  const cmdHash = computeCmdHash(cmdString);
+  const originRepo = getOriginRepo(repoReal);
+
+  const { lookupSuiteRecord, recordSuiteResult, claimSuiteKey, emitSuiteEvent } = await import("../server/control-client.js");
+
+  // R14: Control plane unreachable → passthrough.
+  const lookup = await lookupSuiteRecord(originRepo, treeHash, cmdHash);
+  if (lookup === null) {
+    passthroughNotice("control plane unreachable at lookup time");
+    passthroughExec(cmdArgs);
+    return;
+  }
+
+  // R8: Flaky banner — print before anything else on both replay and execute paths.
+  if (lookup.flaky) {
+    printFlakyBanner(lookup.passCount, lookup.failCount);
+    // US-009: Emit suite.flaky_detected event (best-effort).
+    emitSuiteEvent({
+      event: "suite.flaky_detected",
+      run_id: runId,
+      step_id: stepId,
+      tree_hash: treeHash,
+      cmd_hash: cmdHash,
+      pass_count: lookup.passCount,
+      fail_count: lookup.failCount,
+      window: "24h",
+    }).catch(() => {
+      // Best-effort — event emission failure must not affect the test flow.
+    });
+  }
+
+  const latest = lookup.latest as Record<string, unknown> | null;
+
+  // R5: Green within TTL and --force absent → replay.
+  if (latest && typeof latest.exit_code === "number" && latest.exit_code === 0 && !force) {
+    const createdAt = String(latest.created_at ?? "");
+    const ageMs = Date.now() - new Date(createdAt).getTime();
+    if (ageMs <= TTL_GREEN_MS) {
+      // US-009: Emit suite.cache_hit event (best-effort, awaited so it
+      // completes before process exit).
+      await emitSuiteEvent({
+        event: "suite.cache_hit",
+        run_id: runId,
+        step_id: stepId,
+        tree_hash: treeHash.slice(0, 12),
+        cmd_display: cmdString.slice(0, 200),
+        saved_duration_ms: typeof latest.duration_ms === "number"
+          ? latest.duration_ms
+          : undefined,
+      }).catch(() => {
+        // Best-effort — event emission failure must not block replay.
+      });
+      replay(latest, cmdString.slice(0, 200) || cmdString, ageMs);
+      // replay() calls process.exit(0) — never returns.
+    }
+  }
+
+  // R6: Red entry → execute (with context note if recent).
+  if (latest && typeof latest.exit_code === "number" && latest.exit_code !== 0) {
+    const createdAt = String(latest.created_at ?? "");
+    const ageMs = Date.now() - new Date(createdAt).getTime();
+    if (ageMs <= RED_CONTEXT_WINDOW_MS) {
+      printRedContextNote(latest, cmdString.slice(0, 200) || cmdString, ageMs);
+    }
+  }
+
+  // R7: Miss, expired green, red, or --force → execute.
+  // R16-R17: Before executing, claim the key for single-flight.
+  const claim = await claimSuiteKey(originRepo, treeHash, cmdHash);
+
+  if (claim && claim.action === "wait") {
+    // US-009: Emit suite.singleflight_wait event (best-effort).
+    emitSuiteEvent({
+      event: "suite.singleflight_wait",
+      run_id: runId,
+      step_id: stepId,
+      tree_hash: treeHash,
+      cmd_hash: cmdHash,
+      waited_ms: 0,
+    }).catch(() => {
+      // Best-effort — event emission failure must not block the wait loop.
+    });
+    // Another caller owns the claim — poll until a result is recorded or
+    // CLAIM_TIMEOUT elapses.
+    const pollResult = await pollForResult(originRepo, treeHash, cmdHash);
+    if (pollResult.action === "replay" && pollResult.latest) {
+      // US-009: Emit suite.cache_hit event on poll-based replay (best-effort).
+      await emitSuiteEvent({
+        event: "suite.cache_hit",
+        run_id: runId,
+        step_id: stepId,
+        tree_hash: treeHash.slice(0, 12),
+        cmd_display: cmdString.slice(0, 200),
+        saved_duration_ms: typeof pollResult.latest.duration_ms === "number"
+          ? pollResult.latest.duration_ms
+          : undefined,
+      }).catch(() => {
+        // Best-effort.
+      });
+      replay(
+        pollResult.latest,
+        cmdString.slice(0, 200) || cmdString,
+        pollResult.ageMs ?? 0,
+      );
+      // replay() calls process.exit(0) — never returns.
+    }
+    // Poll returned "execute" — fall through to execute below.
+  }
+  // If claim is null (control plane down after lookup) or action is "run",
+  // proceed to execute below.
+
+  // R9: Execute the command verbatim, streaming stdout/stderr through,
+  //     preserving the exit code.
+  const { exitCode, durationMs, output } = await executeAndCapture(cmdArgs);
+
+  // R10: Record via control plane. R11: Recording failure MUST NOT affect
+  //      exit code or output — log a warning line to stderr and continue.
+  try {
+    const logTail = output.length > LOG_TAIL_KB * 1024
+      ? output.slice(-LOG_TAIL_KB * 1024)
+      : output || null;
+
+    await recordSuiteResult({
+      origin_repo: originRepo,
+      tree_hash: treeHash,
+      cmd_hash: cmdHash,
+      cmd_display: cmdString.slice(0, 200),
+      exit_code: exitCode,
+      duration_ms: durationMs,
+      log_tail: logTail,
+      run_id: runId || null,
+      step_id: stepId || null,
+    });
+  } catch {
+    // R11: Recording failure — warn and continue.
+    process.stderr.write("tamandua-test: warning: failed to record suite result to control plane\n");
+  }
+
+  process.exit(exitCode);
+}
+
+// ── Entry point ───────────────────────────────────────────────────────
+
+main().catch((err: unknown) => {
+  // Unexpected error — passthrough.
+  process.stderr.write(
+    `tamandua-test: passthrough mode — unexpected error: ${err instanceof Error ? err.message : String(err)}\n`,
+  );
+  passthroughExec([]);
+});

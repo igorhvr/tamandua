@@ -165,3 +165,170 @@ export async function resumeRunWithDaemon(runId: string): Promise<ControlPlaneRe
 export async function nudgeWithDaemon(timeoutMs?: number): Promise<ControlPlaneResponse | null> {
   return controlRequest("POST", "/control/nudge", {}, timeoutMs);
 }
+
+// ── Suite ledger client functions ──────────────────────────────────────
+
+/** Result of a suite lookup: the latest execution entry + pass/fail/flaky stats. */
+export interface SuiteLookupResult {
+  latest: Record<string, unknown> | null;
+  passCount: number;
+  failCount: number;
+  flaky: boolean;
+}
+
+/** Parameters for recording a suite execution result. */
+export interface SuiteRecordParams {
+  origin_repo: string;
+  tree_hash: string;
+  cmd_hash: string;
+  cmd_display: string;
+  exit_code: number;
+  duration_ms: number;
+  log_tail?: string | null;
+  run_id?: string | null;
+  step_id?: string | null;
+}
+
+/** Result of a suite record operation. */
+export interface SuiteRecordResult {
+  id: number;
+  created_at: string;
+}
+
+/** Result of a suite claim operation. */
+export interface SuiteClaimResult {
+  action: "run" | "wait";
+  claimedAt?: string;
+}
+
+/** A single flaky key entry. */
+export interface SuiteFlakyKey {
+  tree_hash: string;
+  cmd_hash: string;
+  cmd_display: string;
+  pass_count: number;
+  fail_count: number;
+}
+
+/**
+ * Look up the latest suite execution record for a given key.
+ * Returns typed result on success, null when the daemon is unreachable.
+ */
+export async function lookupSuiteRecord(
+  originRepo: string,
+  treeHash: string,
+  cmdHash: string,
+  timeoutMs: number = DEFAULT_TIMEOUT_MS,
+): Promise<SuiteLookupResult | null> {
+  const qs = new URLSearchParams({ origin_repo: originRepo, tree_hash: treeHash, cmd_hash: cmdHash });
+  const r = await controlRequest("GET", `/suite/lookup?${qs.toString()}`, undefined, timeoutMs);
+  if (!r || r.status !== 200) return null;
+  return r.body as unknown as SuiteLookupResult;
+}
+
+/**
+ * Record a suite execution result.
+ * Returns typed result on success, null when the daemon is unreachable.
+ */
+export async function recordSuiteResult(
+  params: SuiteRecordParams,
+  timeoutMs: number = DEFAULT_TIMEOUT_MS,
+): Promise<SuiteRecordResult | null> {
+  const body: Record<string, unknown> = {
+    origin_repo: params.origin_repo,
+    tree_hash: params.tree_hash,
+    cmd_hash: params.cmd_hash,
+    cmd_display: params.cmd_display,
+    exit_code: params.exit_code,
+    duration_ms: params.duration_ms,
+  };
+  if (params.log_tail != null) body.log_tail = params.log_tail;
+  if (params.run_id != null) body.run_id = params.run_id;
+  if (params.step_id != null) body.step_id = params.step_id;
+  const r = await controlRequest("POST", "/suite/record", body, timeoutMs);
+  if (!r || r.status !== 200) return null;
+  return r.body as unknown as SuiteRecordResult;
+}
+
+/**
+ * Claim a suite key for single-flight execution.
+ * Returns { action: "run" } when the caller should execute,
+ * { action: "wait" } when another caller is already executing.
+ * Returns null when the daemon is unreachable.
+ */
+export async function claimSuiteKey(
+  originRepo: string,
+  treeHash: string,
+  cmdHash: string,
+  timeoutMs: number = DEFAULT_TIMEOUT_MS,
+): Promise<SuiteClaimResult | null> {
+  const r = await controlRequest(
+    "POST",
+    "/suite/claim",
+    { origin_repo: originRepo, tree_hash: treeHash, cmd_hash: cmdHash },
+    timeoutMs,
+  );
+  if (!r || r.status !== 200) return null;
+  return r.body as unknown as SuiteClaimResult;
+}
+
+/** Parameters for emitting a suite event via the control plane. */
+export interface SuiteEventParams {
+  event: string;
+  run_id: string;
+  step_id?: string;
+  tree_hash?: string;
+  cmd_display?: string;
+  cmd_hash?: string;
+  saved_duration_ms?: number;
+  duration_ms?: number;
+  exit_code?: number;
+  pass_count?: number;
+  fail_count?: number;
+  window?: string;
+  waited_ms?: number;
+}
+
+/**
+ * Emit a suite.* event to the event log via the control plane.
+ * Best-effort: resolves successfully when the event was emitted,
+ * rejects when the daemon is unreachable or returns an error.
+ */
+export async function emitSuiteEvent(
+  params: SuiteEventParams,
+  timeoutMs: number = DEFAULT_TIMEOUT_MS,
+): Promise<boolean> {
+  const body: Record<string, unknown> = {
+    event: params.event,
+    run_id: params.run_id,
+  };
+  if (params.step_id) body.step_id = params.step_id;
+  if (params.tree_hash) body.tree_hash = params.tree_hash;
+  if (params.cmd_display) body.cmd_display = params.cmd_display;
+  if (params.cmd_hash) body.cmd_hash = params.cmd_hash;
+  if (params.saved_duration_ms != null) body.saved_duration_ms = params.saved_duration_ms;
+  if (params.duration_ms != null) body.duration_ms = params.duration_ms;
+  if (params.exit_code != null) body.exit_code = params.exit_code;
+  if (params.pass_count != null) body.pass_count = params.pass_count;
+  if (params.fail_count != null) body.fail_count = params.fail_count;
+  if (params.window) body.window = params.window;
+  if (params.waited_ms != null) body.waited_ms = params.waited_ms;
+
+  const r = await controlRequest("POST", "/suite/event", body, timeoutMs);
+  return r !== null && r.status === 200;
+}
+
+/**
+ * Query flaky keys for a given origin repository.
+ * Returns array of flaky key entries, null when the daemon is unreachable.
+ */
+export async function getFlakyKeys(
+  originRepo: string,
+  timeoutMs: number = DEFAULT_TIMEOUT_MS,
+): Promise<SuiteFlakyKey[] | null> {
+  const qs = new URLSearchParams({ origin_repo: originRepo });
+  const r = await controlRequest("GET", `/suite/flaky?${qs.toString()}`, undefined, timeoutMs);
+  if (!r || r.status !== 200) return null;
+  const body = r.body as { flaky_keys?: SuiteFlakyKey[] };
+  return body.flaky_keys ?? [];
+}

@@ -35,6 +35,17 @@ export interface TamanduaEvent {
   detail?: string;
   tokenDelta?: number;
   tokensSpent?: number;
+  // Suite-specific fields (US-009)
+  treeHash?: string;
+  cmdDisplay?: string;
+  cmdHash?: string;
+  savedDurationMs?: number;
+  durationMs?: number;
+  exitCode?: number;
+  passCount?: number;
+  failCount?: number;
+  window?: string;
+  waitedMs?: number;
 }
 
 export type EventCursorSource =

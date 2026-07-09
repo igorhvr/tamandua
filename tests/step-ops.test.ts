@@ -4386,6 +4386,400 @@ describe("handleVerifyEachCompletion — US-002 VBUD (story-scoped verify retry 
   });
 });
 
+// ══════════════════════════════════════════════════════════════════════
+// US-008: Motor template rewrite for test_cmd wrapping
+// ══════════════════════════════════════════════════════════════════════
+
+describe("claimStep test_cmd wrapping (US-008)", () => {
+  const _savedStateDir = process.env.TAMANDUA_STATE_DIR;
+  const _savedDbPath = process.env.TAMANDUA_DB_PATH;
+  let _testIsolationDir: string;
+
+  before(() => {
+    _testIsolationDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-testcmd-wrap-test-"));
+    process.env.TAMANDUA_STATE_DIR = _testIsolationDir;
+    process.env.TAMANDUA_DB_PATH = path.join(_testIsolationDir, "tamandua.db");
+  });
+
+  after(() => {
+    if (_savedStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+    else process.env.TAMANDUA_STATE_DIR = _savedStateDir;
+    if (_savedDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+    else process.env.TAMANDUA_DB_PATH = _savedDbPath;
+    try { fs.rmSync(_testIsolationDir, { recursive: true, force: true }); } catch { /* best effort */ }
+  });
+
+  function ts(): string {
+    return new Date().toISOString();
+  }
+
+  it("wraps {{test_cmd}} with tamandua-test shim invocation (single step)", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const developerStepId = crypto.randomUUID();
+    const now = ts();
+
+    const seededContext = JSON.stringify({
+      task: "implement feature X",
+      repo: "/tmp/test-repo",
+      test_cmd: "npm test",
+      build_cmd: "npm run build",
+    });
+
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 1, 'test-wf', 'implement feature X', 'running', ?, 0, ?, ?)"
+    ).run(runId, seededContext, now, now);
+
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, created_at, updated_at) VALUES (?, ?, 'developer', 'test-wf_developer', 0, 'Build with {{build_cmd}}, test with {{test_cmd}}. Raw: {{test_cmd_raw}}', '', 'pending', 0, 4, 'single', ?, ?)"
+    ).run(developerStepId, runId, now, now);
+
+    const result = claimStep("test-wf_developer", runId);
+
+    assert.ok(result.found, "claimStep should find the pending developer step");
+    assert.equal(result!.stepId, developerStepId);
+
+    const input = result!.resolvedInput!;
+
+    // {{test_cmd}} should be wrapped with shim invocation
+    assert.ok(
+      input.includes("tamandua-test --repo"),
+      `resolved input should contain tamandua-test shim, got: ${input}`
+    );
+    assert.ok(
+      input.includes(`--repo /tmp/test-repo`),
+      `wrapper should include --repo flag, got: ${input}`
+    );
+    assert.ok(
+      input.includes(`--run ${runId}`),
+      `wrapper should include --run flag with run ID, got: ${input}`
+    );
+    assert.ok(
+      input.includes(`--step developer`),
+      `wrapper should include --step flag with step ID, got: ${input}`
+    );
+    assert.ok(
+      input.includes("-- npm test"),
+      `wrapper should include original command after --, got: ${input}`
+    );
+
+    // {{test_cmd_raw}} should be the original unwrapped command
+    assert.ok(
+      input.includes("Raw: npm test"),
+      `test_cmd_raw should be the original command, got: ${input}`
+    );
+
+    // {{build_cmd}} should NOT be wrapped (only test_cmd gets wrapped)
+    assert.ok(
+      input.includes("Build with npm run build"),
+      `build_cmd should NOT be wrapped, got: ${input}`
+    );
+  });
+
+  it("does not wrap test_cmd when it is missing from context", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const stepId = crypto.randomUUID();
+    const now = ts();
+
+    const seededContext = JSON.stringify({
+      task: "implement feature X",
+      repo: "/tmp/test-repo",
+      build_cmd: "npm run build",
+    });
+
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 1, 'test-wf', 'implement feature X', 'running', ?, 0, ?, ?)"
+    ).run(runId, seededContext, now, now);
+
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, created_at, updated_at) VALUES (?, ?, 'scanner', 'test-wf_scanner', 0, 'Task: {{task}}. Build: {{build_cmd}}', '', 'pending', 0, 4, 'single', ?, ?)"
+    ).run(stepId, runId, now, now);
+
+    const result = claimStep("test-wf_scanner", runId);
+
+    assert.ok(result.found, "claimStep should find the step even without test_cmd");
+    assert.ok(!result!.resolvedInput!.includes("tamandua-test"),
+      `resolved input should NOT contain tamandua-test when test_cmd is absent: ${result!.resolvedInput}`);
+    assert.ok(!result!.resolvedInput!.includes("[missing: test_cmd"),
+      `resolved input should NOT have missing placeholder when test_cmd is not in template: ${result!.resolvedInput}`);
+  });
+
+  it("does not wrap test_cmd when it is empty string", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const stepId = crypto.randomUUID();
+    const now = ts();
+
+    const seededContext = JSON.stringify({
+      task: "implement feature X",
+      repo: "/tmp/test-repo",
+      test_cmd: "",
+    });
+
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 1, 'test-wf', 'implement feature X', 'running', ?, 0, ?, ?)"
+    ).run(runId, seededContext, now, now);
+
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, created_at, updated_at) VALUES (?, ?, 'test', 'test-wf_test', 0, 'Test: {{test_cmd}}', '', 'pending', 0, 4, 'single', ?, ?)"
+    ).run(stepId, runId, now, now);
+
+    const result = claimStep("test-wf_test", runId);
+
+    assert.ok(result.found, "claimStep should find step when test_cmd is empty");
+    const input = result!.resolvedInput!;
+    assert.ok(!input.includes("tamandua-test"),
+      `should not wrap empty test_cmd, got: ${input}`);
+  });
+
+  it("does not wrap test_cmd when repo is missing", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const stepId = crypto.randomUUID();
+    const now = ts();
+
+    const seededContext = JSON.stringify({
+      task: "implement feature X",
+      test_cmd: "npm test",
+    });
+
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 1, 'test-wf', 'implement feature X', 'running', ?, 0, ?, ?)"
+    ).run(runId, seededContext, now, now);
+
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, created_at, updated_at) VALUES (?, ?, 'test', 'test-wf_test', 0, 'Test: {{test_cmd}}', '', 'pending', 0, 4, 'single', ?, ?)"
+    ).run(stepId, runId, now, now);
+
+    const result = claimStep("test-wf_test", runId);
+
+    assert.ok(result.found, "claimStep should find step even without repo");
+    assert.ok(
+      result!.resolvedInput!.includes("Test: npm test"),
+      `should leave test_cmd unwrapped when repo is missing, got: ${result!.resolvedInput}`
+    );
+    assert.ok(
+      !result!.resolvedInput!.includes("tamandua-test"),
+      `should not contain tamandua-test when repo is missing, got: ${result!.resolvedInput}`
+    );
+  });
+
+  it("test_cmd_raw is overwritten on subsequent claims (idempotent)", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const now = ts();
+
+    const seededContext = JSON.stringify({
+      task: "implement feature X",
+      repo: "/tmp/test-repo",
+      test_cmd: "npm test",
+      test_cmd_raw: "old value should be overwritten",
+    });
+
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 1, 'test-wf', 'implement feature X', 'running', ?, 0, ?, ?)"
+    ).run(runId, seededContext, now, now);
+
+    const stepId = crypto.randomUUID();
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, created_at, updated_at) VALUES (?, ?, 'test', 'test-wf_test', 0, 'Test: {{test_cmd}}', '', 'pending', 0, 4, 'single', ?, ?)"
+    ).run(stepId, runId, now, now);
+
+    const result = claimStep("test-wf_test", runId);
+
+    assert.ok(result.found, "claimStep should find the step");
+    assert.ok(
+      result!.resolvedInput!.includes("tamandua-test --repo"),
+      `should contain wrapper even with pre-existing test_cmd_raw, got: ${result!.resolvedInput}`
+    );
+  });
+
+  it("wrapping preserves the original test_cmd in test_cmd_raw", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const developerStepId = crypto.randomUUID();
+    const now = ts();
+
+    const seededContext = JSON.stringify({
+      task: "implement feature X",
+      repo: "/tmp/my project with spaces",
+      test_cmd: "npm run test -- --coverage --reporter=json",
+    });
+
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 1, 'test-wf', 'implement feature X', 'running', ?, 0, ?, ?)"
+    ).run(runId, seededContext, now, now);
+
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, created_at, updated_at) VALUES (?, ?, 'developer', 'test-wf_developer', 0, 'Run: {{test_cmd}}  Raw: {{test_cmd_raw}}', '', 'pending', 0, 4, 'single', ?, ?)"
+    ).run(developerStepId, runId, now, now);
+
+    const result = claimStep("test-wf_developer", runId);
+
+    assert.ok(result.found, "claimStep should find the pending developer step");
+    const input = result!.resolvedInput!;
+
+    assert.ok(
+      input.includes("tamandua-test --repo"),
+      `should wrap test_cmd, got: ${input}`
+    );
+    assert.ok(
+      input.includes("-- npm run test -- --coverage --reporter=json"),
+      `should preserve multi-word command, got: ${input}`
+    );
+
+    assert.ok(
+      input.includes("Raw: npm run test -- --coverage --reporter=json"),
+      `test_cmd_raw should be the exact original, got: ${input}`
+    );
+  });
+
+  it("wrapping works for loop steps (story-based workflows)", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const loopStepId = crypto.randomUUID();
+    const now = ts();
+
+    const seededContext = JSON.stringify({
+      task: "implement feature X",
+      repo: "/tmp/test-repo",
+      test_cmd: "mvn test",
+      build_cmd: "mvn compile",
+    });
+
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 1, 'test-wf', 'implement feature X', 'running', ?, 0, ?, ?)"
+    ).run(runId, seededContext, now, now);
+
+    const story1Id = crypto.randomUUID();
+    const story2Id = crypto.randomUUID();
+    db.prepare(
+      "INSERT INTO stories (id, run_id, story_index, story_id, title, description, acceptance_criteria, status, retry_count, max_retries, created_at, updated_at) VALUES (?, ?, 0, 'US-001', 'Story 1', 'desc', '[]', 'pending', 0, 4, ?, ?)"
+    ).run(story1Id, runId, now, now);
+    db.prepare(
+      "INSERT INTO stories (id, run_id, story_index, story_id, title, description, acceptance_criteria, status, retry_count, max_retries, created_at, updated_at) VALUES (?, ?, 1, 'US-002', 'Story 2', 'desc', '[]', 'pending', 0, 4, ?, ?)"
+    ).run(story2Id, runId, now, now);
+
+    const loopConfig = JSON.stringify({ over: "stories" });
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, loop_config, created_at, updated_at) VALUES (?, ?, 'developer', 'test-wf_developer', 0, 'Build with {{build_cmd}}, test with {{test_cmd}}. Raw: {{test_cmd_raw}}', '', 'pending', 0, 4, 'loop', ?, ?, ?)"
+    ).run(loopStepId, runId, loopConfig, now, now);
+
+    const result = claimStep("test-wf_developer", runId);
+
+    assert.ok(result.found, "claimStep should find the pending loop step");
+    const input = result!.resolvedInput!;
+
+    assert.ok(
+      input.includes("tamandua-test --repo"),
+      `loop step should have wrapped test_cmd, got: ${input}`
+    );
+    assert.ok(
+      input.includes("-- mvn test"),
+      `should include original command after --, got: ${input}`
+    );
+
+    assert.ok(
+      input.includes("Raw: mvn test"),
+      `test_cmd_raw should be original in loop step, got: ${input}`
+    );
+
+    assert.ok(
+      input.includes("Build with mvn compile"),
+      `build_cmd should not be wrapped, got: ${input}`
+    );
+  });
+
+  it("expects contracts are unaffected (they match STATUS lines, not test output)", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const stepId = crypto.randomUUID();
+    const now = ts();
+
+    const seededContext = JSON.stringify({
+      task: "implement feature X",
+      repo: "/tmp/test-repo",
+      test_cmd: "pytest",
+    });
+
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 1, 'test-wf', 'implement feature X', 'running', ?, 0, ?, ?)"
+    ).run(runId, seededContext, now, now);
+
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, created_at, updated_at) VALUES (?, ?, 'test', 'test-wf_test', 0, 'Test with {{test_cmd}}\n\nReply with:\nSTATUS: done\nregex:^STATUS:\\s*done\nCHANGES: <what changed>', 'STATUS: done', 'pending', 0, 4, 'single', ?, ?)"
+    ).run(stepId, runId, now, now);
+
+    const result = claimStep("test-wf_test", runId);
+
+    assert.ok(result.found, "claimStep should find the step");
+    const step = db.prepare("SELECT expects FROM steps WHERE id = ?").get(stepId) as { expects: string };
+    assert.equal(step.expects, "STATUS: done", "expects is still STATUS: done, unaffected by test_cmd wrapping");
+  });
+
+  it("concurrent claims produce consistent test_cmd wrapping", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const now = ts();
+
+    const seededContext = JSON.stringify({
+      task: "implement feature X",
+      repo: "/tmp/test-repo",
+      test_cmd: "npm test",
+    });
+
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 1, 'test-wf', 'implement feature X', 'running', ?, 0, ?, ?)"
+    ).run(runId, seededContext, now, now);
+
+    const devStepId = crypto.randomUUID();
+    const verifierStepId = crypto.randomUUID();
+
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, created_at, updated_at) VALUES (?, ?, 'developer', 'test-wf_developer', 0, 'Dev: {{test_cmd}}', '', 'pending', 0, 4, 'single', ?, ?)"
+    ).run(devStepId, runId, now, now);
+
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, created_at, updated_at) VALUES (?, ?, 'verifier', 'test-wf_verifier', 1, 'Verify: {{test_cmd}} | Raw: {{test_cmd_raw}}', '', 'pending', 0, 4, 'single', ?, ?)"
+    ).run(verifierStepId, runId, now, now);
+
+    const devResult = claimStep("test-wf_developer", runId);
+    assert.ok(devResult.found, "should claim developer step");
+    assert.ok(
+      devResult!.resolvedInput!.includes("--step developer"),
+      `developer wrapper should have --step developer, got: ${devResult!.resolvedInput}`
+    );
+
+    const devStep = db.prepare("SELECT id FROM steps WHERE id = ? AND status = 'running'").get(devStepId) as { id: string } | undefined;
+    assert.ok(devStep, "developer step should be running after claim");
+
+    db.prepare(
+      "UPDATE steps SET status = 'done', output = 'STATUS: done\nCHANGES: implemented\nTESTS: all pass', updated_at = datetime('now') WHERE id = ?"
+    ).run(devStepId);
+
+    const verifierResult = claimStep("test-wf_verifier", runId);
+    assert.ok(verifierResult.found, "should claim verifier step after developer completed");
+    assert.ok(
+      verifierResult!.resolvedInput!.includes("--step verifier"),
+      `verifier wrapper should have --step verifier, got: ${verifierResult!.resolvedInput}`
+    );
+    assert.ok(
+      verifierResult!.resolvedInput!.includes("Raw: npm test"),
+      `verifier should have test_cmd_raw, got: ${verifierResult!.resolvedInput}`
+    );
+  });
+});
+
 describe("RETRY VERDICT ROUTING — completeStepInternal STATUS: retry guard (CATP phantom-success fix)", () => {
   const _savedStateDir = process.env.TAMANDUA_STATE_DIR;
   const _savedDbPath = process.env.TAMANDUA_DB_PATH;
@@ -4726,7 +5120,6 @@ steps:
     assert.equal(consumeStep.status, "waiting", "consume must be reset to waiting");
     assert.equal(consumeStep.retry_count, 0, "consume retry_count reset to 0");
   });
-
   it("coexistence: verify_each story-reset and non-verify_each C22 retry guard work together in the same workflow", async () => {
     // A single workflow with both:
     //   - verify_each loop (implement + verify) — verify step handles STATUS: retry via handleVerifyEachCompletion

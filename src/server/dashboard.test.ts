@@ -4379,3 +4379,642 @@ describe("dashboard run detail bounded events", () => {
     }
   });
 });
+
+describe("dashboard suite stats and flaky keys", () => {
+  it("GET /api/runs/:id/suite-stats returns zero when no suite data", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-suite-stats-"));
+    const homeDir = path.join(root, "home");
+    const stateDir = path.join(homeDir, ".tamandua");
+    fs.mkdirSync(stateDir, { recursive: true });
+    const dbPath = path.join(stateDir, "tamandua.db");
+    const previousHome = process.env.HOME;
+    const previousDbPath = process.env.TAMANDUA_DB_PATH;
+    const previousStateDir = process.env.TAMANDUA_STATE_DIR;
+    process.env.HOME = homeDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+    process.env.TAMANDUA_STATE_DIR = stateDir;
+
+    const runId = "run-no-suite-data";
+    const db = getDb();
+    db.prepare(`
+      INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
+      VALUES (?, 1, 'wf-test', 'test task', 'running', '{}', 0, '2026-01-01', '2026-01-01')
+    `).run(runId);
+
+    const { server, baseUrl } = await startDashboard();
+
+    try {
+      const response = await fetch(`${baseUrl}/api/runs/${runId}/suite-stats`);
+      assert.equal(response.status, 200);
+
+      const body = await response.json() as {
+        runId: string;
+        executed: number;
+        replayed: number;
+        savedMinutes: number;
+      };
+
+      assert.equal(body.runId, runId);
+      assert.equal(body.executed, 0);
+      assert.equal(body.replayed, 0);
+      assert.equal(body.savedMinutes, 0);
+    } finally {
+      await stopDashboard(server);
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+      else process.env.TAMANDUA_DB_PATH = previousDbPath;
+      if (previousStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+      else process.env.TAMANDUA_STATE_DIR = previousStateDir;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("GET /api/runs/:id/suite-stats returns executed count from suite_results", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-suite-stats-"));
+    const homeDir = path.join(root, "home");
+    const stateDir = path.join(homeDir, ".tamandua");
+    fs.mkdirSync(stateDir, { recursive: true });
+    const dbPath = path.join(stateDir, "tamandua.db");
+    const previousHome = process.env.HOME;
+    const previousDbPath = process.env.TAMANDUA_DB_PATH;
+    const previousStateDir = process.env.TAMANDUA_STATE_DIR;
+    process.env.HOME = homeDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+    process.env.TAMANDUA_STATE_DIR = stateDir;
+
+    const runId = "run-with-suite-data";
+    const db = getDb();
+    db.prepare(`
+      INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
+      VALUES (?, 1, 'wf-test', 'test task', 'running', '{}', 0, '2026-01-01', '2026-01-01')
+    `).run(runId);
+
+    const now = new Date().toISOString();
+    db.prepare(`
+      INSERT INTO suite_results (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, run_id, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run("/repo", "aaa111", "hash1", "npm test", 0, 5000, runId, now);
+    db.prepare(`
+      INSERT INTO suite_results (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, run_id, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run("/repo", "bbb222", "hash2", "npm test", 0, 3000, runId, now);
+    db.prepare(`
+      INSERT INTO suite_results (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, run_id, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run("/repo", "ccc333", "hash3", "npm test", 1, 2000, runId, now);
+
+    const { server, baseUrl } = await startDashboard();
+
+    try {
+      const response = await fetch(`${baseUrl}/api/runs/${runId}/suite-stats`);
+      assert.equal(response.status, 200);
+
+      const body = await response.json() as {
+        runId: string;
+        executed: number;
+        replayed: number;
+        savedMinutes: number;
+      };
+
+      assert.equal(body.runId, runId);
+      assert.equal(body.executed, 3);
+      assert.equal(body.replayed, 0);
+      assert.equal(body.savedMinutes, 0);
+    } finally {
+      await stopDashboard(server);
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+      else process.env.TAMANDUA_DB_PATH = previousDbPath;
+      if (previousStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+      else process.env.TAMANDUA_STATE_DIR = previousStateDir;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("GET /api/runs/:id/suite-stats counts replayed from cache_hit events", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-suite-stats-"));
+    const homeDir = path.join(root, "home");
+    const stateDir = path.join(homeDir, ".tamandua");
+    fs.mkdirSync(stateDir, { recursive: true });
+    const dbPath = path.join(stateDir, "tamandua.db");
+    const previousHome = process.env.HOME;
+    const previousDbPath = process.env.TAMANDUA_DB_PATH;
+    const previousStateDir = process.env.TAMANDUA_STATE_DIR;
+    process.env.HOME = homeDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+    process.env.TAMANDUA_STATE_DIR = stateDir;
+
+    const runId = "run-with-replays";
+    const db = getDb();
+    db.prepare(`
+      INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
+      VALUES (?, 1, 'wf-test', 'test task', 'running', '{}', 0, '2026-01-01', '2026-01-01')
+    `).run(runId);
+
+    const now = new Date().toISOString();
+    db.prepare(`
+      INSERT INTO suite_results (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, run_id, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run("/repo", "aaa111", "hash1", "npm test", 0, 5000, runId, now);
+
+    const eventsDir = path.join(stateDir, "events");
+    fs.mkdirSync(eventsDir, { recursive: true });
+    const runEventsFile = path.join(eventsDir, `${runId}.jsonl`);
+    fs.appendFileSync(runEventsFile, JSON.stringify({
+      ts: now, event: "suite.cache_hit", runId, treeHash: "aaa111", cmdDisplay: "npm test", savedDurationMs: 5000,
+    }) + "\n");
+    fs.appendFileSync(runEventsFile, JSON.stringify({
+      ts: now, event: "suite.cache_hit", runId, treeHash: "bbb222", cmdDisplay: "npm test", savedDurationMs: 3000,
+    }) + "\n");
+
+    const { server, baseUrl } = await startDashboard();
+
+    try {
+      const response = await fetch(`${baseUrl}/api/runs/${runId}/suite-stats`);
+      assert.equal(response.status, 200);
+
+      const body = await response.json() as { runId: string; executed: number; replayed: number; savedMinutes: number };
+      assert.equal(body.runId, runId);
+      assert.equal(body.executed, 1);
+      assert.equal(body.replayed, 2);
+      assert.equal(body.savedMinutes, 0); // 8000ms rounds to 0
+    } finally {
+      await stopDashboard(server);
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+      else process.env.TAMANDUA_DB_PATH = previousDbPath;
+      if (previousStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+      else process.env.TAMANDUA_STATE_DIR = previousStateDir;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("GET /api/runs/:id/suite-stats rounds saved minutes correctly", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-suite-stats-"));
+    const homeDir = path.join(root, "home");
+    const stateDir = path.join(homeDir, ".tamandua");
+    fs.mkdirSync(stateDir, { recursive: true });
+    const dbPath = path.join(stateDir, "tamandua.db");
+    const previousHome = process.env.HOME;
+    const previousDbPath = process.env.TAMANDUA_DB_PATH;
+    const previousStateDir = process.env.TAMANDUA_STATE_DIR;
+    process.env.HOME = homeDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+    process.env.TAMANDUA_STATE_DIR = stateDir;
+
+    const runId = "run-saved-minutes";
+    const db = getDb();
+    db.prepare(`
+      INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
+      VALUES (?, 1, 'wf-test', 'test task', 'running', '{}', 0, '2026-01-01', '2026-01-01')
+    `).run(runId);
+
+    const now = new Date().toISOString();
+    const eventsDir = path.join(stateDir, "events");
+    fs.mkdirSync(eventsDir, { recursive: true });
+    const runEventsFile = path.join(eventsDir, `${runId}.jsonl`);
+    fs.appendFileSync(runEventsFile, JSON.stringify({
+      ts: now, event: "suite.cache_hit", runId, treeHash: "aaa111", savedDurationMs: 120000,
+    }) + "\n");
+
+    const { server, baseUrl } = await startDashboard();
+
+    try {
+      const response = await fetch(`${baseUrl}/api/runs/${runId}/suite-stats`);
+      assert.equal(response.status, 200);
+      const body = await response.json() as { runId: string; executed: number; replayed: number; savedMinutes: number };
+      assert.equal(body.replayed, 1);
+      assert.equal(body.savedMinutes, 2);
+    } finally {
+      await stopDashboard(server);
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+      else process.env.TAMANDUA_DB_PATH = previousDbPath;
+      if (previousStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+      else process.env.TAMANDUA_STATE_DIR = previousStateDir;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("GET /api/suite/flaky returns empty when no flaky keys", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-flaky-"));
+    const homeDir = path.join(root, "home");
+    const stateDir = path.join(homeDir, ".tamandua");
+    fs.mkdirSync(stateDir, { recursive: true });
+    const dbPath = path.join(stateDir, "tamandua.db");
+    const previousHome = process.env.HOME;
+    const previousDbPath = process.env.TAMANDUA_DB_PATH;
+    const previousStateDir = process.env.TAMANDUA_STATE_DIR;
+    process.env.HOME = homeDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+    process.env.TAMANDUA_STATE_DIR = stateDir;
+
+    const db = getDb();
+    const runId = "flaky-empty-run";
+    db.prepare(`
+      INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
+      VALUES (?, 1, 'wf-test', 'test task', 'running', '{}', 0, '2026-01-01', '2026-01-01')
+    `).run(runId);
+
+    const { server, baseUrl } = await startDashboard();
+
+    try {
+      const response = await fetch(`${baseUrl}/api/suite/flaky`);
+      assert.equal(response.status, 200);
+      const body = await response.json() as { flaky_keys: Array<unknown> };
+      assert.deepEqual(body.flaky_keys, []);
+    } finally {
+      await stopDashboard(server);
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+      else process.env.TAMANDUA_DB_PATH = previousDbPath;
+      if (previousStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+      else process.env.TAMANDUA_STATE_DIR = previousStateDir;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("GET /api/suite/flaky returns flaky keys when both green and red exist", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-flaky-"));
+    const homeDir = path.join(root, "home");
+    const stateDir = path.join(homeDir, ".tamandua");
+    fs.mkdirSync(stateDir, { recursive: true });
+    const dbPath = path.join(stateDir, "tamandua.db");
+    const previousHome = process.env.HOME;
+    const previousDbPath = process.env.TAMANDUA_DB_PATH;
+    const previousStateDir = process.env.TAMANDUA_STATE_DIR;
+    process.env.HOME = homeDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+    process.env.TAMANDUA_STATE_DIR = stateDir;
+
+    const db = getDb();
+    const runId = "flaky-run";
+    db.prepare(`
+      INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
+      VALUES (?, 1, 'wf-test', 'test task', 'running', '{}', 0, '2026-01-01', '2026-01-01')
+    `).run(runId);
+
+    const now = new Date().toISOString();
+    db.prepare(`
+      INSERT INTO suite_results (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, run_id, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run("/repo", "flakyTree", "cmdFlaky", "npm test", 0, 5000, runId, now);
+    db.prepare(`
+      INSERT INTO suite_results (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, run_id, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run("/repo", "flakyTree", "cmdFlaky", "npm test", 0, 3000, runId, now);
+    db.prepare(`
+      INSERT INTO suite_results (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, run_id, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run("/repo", "flakyTree", "cmdFlaky", "npm test", 1, 2000, runId, now);
+
+    const { server, baseUrl } = await startDashboard();
+
+    try {
+      const response = await fetch(`${baseUrl}/api/suite/flaky`);
+      assert.equal(response.status, 200);
+      const body = await response.json() as { flaky_keys: Array<{ tree_hash: string; cmd_hash: string; cmd_display: string; pass_count: number; fail_count: number }> };
+      assert.equal(body.flaky_keys.length, 1);
+      assert.equal(body.flaky_keys[0].tree_hash, "flakyTree");
+      assert.equal(body.flaky_keys[0].cmd_hash, "cmdFlaky");
+      assert.equal(body.flaky_keys[0].pass_count, 2);
+      assert.equal(body.flaky_keys[0].fail_count, 1);
+    } finally {
+      await stopDashboard(server);
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+      else process.env.TAMANDUA_DB_PATH = previousDbPath;
+      if (previousStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+      else process.env.TAMANDUA_STATE_DIR = previousStateDir;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("GET /api/suite/flaky excludes keys with only green runs", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-flaky-"));
+    const homeDir = path.join(root, "home");
+    const stateDir = path.join(homeDir, ".tamandua");
+    fs.mkdirSync(stateDir, { recursive: true });
+    const dbPath = path.join(stateDir, "tamandua.db");
+    const previousHome = process.env.HOME;
+    const previousDbPath = process.env.TAMANDUA_DB_PATH;
+    const previousStateDir = process.env.TAMANDUA_STATE_DIR;
+    process.env.HOME = homeDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+    process.env.TAMANDUA_STATE_DIR = stateDir;
+
+    const db = getDb();
+    const runId = "green-only-run";
+    db.prepare(`
+      INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
+      VALUES (?, 1, 'wf-test', 'test task', 'running', '{}', 0, '2026-01-01', '2026-01-01')
+    `).run(runId);
+
+    const now = new Date().toISOString();
+    db.prepare(`
+      INSERT INTO suite_results (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, run_id, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run("/repo", "stableTree", "cmdStable", "npm test", 0, 5000, runId, now);
+
+    const { server, baseUrl } = await startDashboard();
+
+    try {
+      const response = await fetch(`${baseUrl}/api/suite/flaky`);
+      assert.equal(response.status, 200);
+      const body = await response.json() as { flaky_keys: Array<unknown> };
+      assert.equal(body.flaky_keys.length, 0);
+    } finally {
+      await stopDashboard(server);
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+      else process.env.TAMANDUA_DB_PATH = previousDbPath;
+      if (previousStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+      else process.env.TAMANDUA_STATE_DIR = previousStateDir;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("GET /api/suite/flaky respects FLAKE_WINDOW (24h)", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-flaky-"));
+    const homeDir = path.join(root, "home");
+    const stateDir = path.join(homeDir, ".tamandua");
+    fs.mkdirSync(stateDir, { recursive: true });
+    const dbPath = path.join(stateDir, "tamandua.db");
+    const previousHome = process.env.HOME;
+    const previousDbPath = process.env.TAMANDUA_DB_PATH;
+    const previousStateDir = process.env.TAMANDUA_STATE_DIR;
+    process.env.HOME = homeDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+    process.env.TAMANDUA_STATE_DIR = stateDir;
+
+    const db = getDb();
+    const runId = "old-flaky-run";
+    db.prepare(`
+      INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
+      VALUES (?, 1, 'wf-test', 'test task', 'running', '{}', 0, '2026-01-01', '2026-01-01')
+    `).run(runId);
+
+    const oldDate = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();
+    db.prepare(`
+      INSERT INTO suite_results (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, run_id, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run("/repo", "oldTree", "oldCmd", "npm test", 0, 5000, runId, oldDate);
+    db.prepare(`
+      INSERT INTO suite_results (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, run_id, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run("/repo", "oldTree", "oldCmd", "npm test", 1, 3000, runId, oldDate);
+
+    const { server, baseUrl } = await startDashboard();
+
+    try {
+      const response = await fetch(`${baseUrl}/api/suite/flaky`);
+      assert.equal(response.status, 200);
+      const body = await response.json() as { flaky_keys: Array<unknown> };
+      assert.equal(body.flaky_keys.length, 0);
+    } finally {
+      await stopDashboard(server);
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+      else process.env.TAMANDUA_DB_PATH = previousDbPath;
+      if (previousStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+      else process.env.TAMANDUA_STATE_DIR = previousStateDir;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("GET /api/runs includes suite_executed in run list", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-suite-exec-"));
+    const homeDir = path.join(root, "home");
+    const stateDir = path.join(homeDir, ".tamandua");
+    fs.mkdirSync(stateDir, { recursive: true });
+    const dbPath = path.join(stateDir, "tamandua.db");
+    const previousHome = process.env.HOME;
+    const previousDbPath = process.env.TAMANDUA_DB_PATH;
+    const previousStateDir = process.env.TAMANDUA_STATE_DIR;
+    process.env.HOME = homeDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+    process.env.TAMANDUA_STATE_DIR = stateDir;
+
+    const db = getDb();
+    const runId = "run-suite-count";
+    db.prepare(`
+      INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
+      VALUES (?, 1, 'wf-test', 'test task', 'done', '{}', 0, '2026-01-01', '2026-01-01')
+    `).run(runId);
+
+    const now = new Date().toISOString();
+    db.prepare(`
+      INSERT INTO suite_results (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, run_id, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run("/repo", "aaa111", "hash1", "npm test", 0, 5000, runId, now);
+    db.prepare(`
+      INSERT INTO suite_results (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, run_id, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run("/repo", "bbb222", "hash2", "npm test", 0, 3000, runId, now);
+
+    const runId2 = "run-no-suite";
+    db.prepare(`
+      INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
+      VALUES (?, 2, 'wf-test', 'other task', 'running', '{}', 0, '2026-01-01', '2026-01-01')
+    `).run(runId2);
+
+    invalidateRunsCache();
+    const { server, baseUrl } = await startDashboard();
+
+    try {
+      const response = await fetch(`${baseUrl}/api/runs`);
+      assert.equal(response.status, 200);
+      const body = await response.json() as { runs: Array<{ id: string; suite_executed: number }> };
+      const run1 = body.runs.find((r) => r.id === runId);
+      assert.ok(run1);
+      assert.equal(run1.suite_executed, 2);
+      const run2 = body.runs.find((r) => r.id === runId2);
+      assert.ok(run2);
+      assert.equal(run2.suite_executed, 0);
+    } finally {
+      await stopDashboard(server);
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+      else process.env.TAMANDUA_DB_PATH = previousDbPath;
+      if (previousStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+      else process.env.TAMANDUA_STATE_DIR = previousStateDir;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("suite flaky query does not create runs, workflows, or tasks", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-flaky-"));
+    const homeDir = path.join(root, "home");
+    const stateDir = path.join(homeDir, ".tamandua");
+    fs.mkdirSync(stateDir, { recursive: true });
+    const dbPath = path.join(stateDir, "tamandua.db");
+    const previousHome = process.env.HOME;
+    const previousDbPath = process.env.TAMANDUA_DB_PATH;
+    const previousStateDir = process.env.TAMANDUA_STATE_DIR;
+    process.env.HOME = homeDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+    process.env.TAMANDUA_STATE_DIR = stateDir;
+
+    const db = getDb();
+    const runsBefore = (db.prepare("SELECT COUNT(*) AS cnt FROM runs").get() as { cnt: number }).cnt;
+    const stepsBefore = (db.prepare("SELECT COUNT(*) AS cnt FROM steps").get() as { cnt: number }).cnt;
+
+    const { server, baseUrl } = await startDashboard();
+
+    try {
+      await fetch(`${baseUrl}/api/suite/flaky`);
+      const runsAfter = (db.prepare("SELECT COUNT(*) AS cnt FROM runs").get() as { cnt: number }).cnt;
+      const stepsAfter = (db.prepare("SELECT COUNT(*) AS cnt FROM steps").get() as { cnt: number }).cnt;
+      assert.equal(runsAfter, runsBefore);
+      assert.equal(stepsAfter, stepsBefore);
+    } finally {
+      await stopDashboard(server);
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+      else process.env.TAMANDUA_DB_PATH = previousDbPath;
+      if (previousStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+      else process.env.TAMANDUA_STATE_DIR = previousStateDir;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("existing response fields unchanged when suite columns present", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-suite-fields-"));
+    const homeDir = path.join(root, "home");
+    const stateDir = path.join(homeDir, ".tamandua");
+    fs.mkdirSync(stateDir, { recursive: true });
+    const dbPath = path.join(stateDir, "tamandua.db");
+    const previousHome = process.env.HOME;
+    const previousDbPath = process.env.TAMANDUA_DB_PATH;
+    const previousStateDir = process.env.TAMANDUA_STATE_DIR;
+    process.env.HOME = homeDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+    process.env.TAMANDUA_STATE_DIR = stateDir;
+
+    const runId = "run-existing-fields-suite";
+    const db = getDb();
+    db.prepare(`
+      INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
+      VALUES (?, 1, 'wf-test', 'test task', 'failed', '{}', 0, '2026-01-01', '2026-01-01')
+    `).run(runId);
+
+    const now = new Date().toISOString();
+    db.prepare(`
+      INSERT INTO suite_results (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, run_id, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run("/repo", "aaa111", "hash1", "npm test", 0, 5000, runId, now);
+
+    invalidateRunsCache();
+    const { server, baseUrl } = await startDashboard();
+
+    try {
+      const detailRes = await fetch(`${baseUrl}/api/runs/${runId}`);
+      assert.equal(detailRes.status, 200);
+      const detailBody = await detailRes.json() as Record<string, unknown>;
+      assert.ok("run" in detailBody);
+      assert.ok("steps" in detailBody);
+      assert.ok("events" in detailBody);
+      assert.ok("failure_reason" in detailBody);
+      assert.ok("prompt" in detailBody);
+      assert.equal(detailBody.prompt, "test task");
+
+      const listRes = await fetch(`${baseUrl}/api/runs`);
+      assert.equal(listRes.status, 200);
+      const listBody = await listRes.json() as { runs: Array<Record<string, unknown>> };
+      const runInList = listBody.runs.find((r) => r.id === runId);
+      assert.ok(runInList);
+      assert.ok("suite_executed" in runInList);
+      assert.equal(runInList.suite_executed, 1);
+    } finally {
+      await stopDashboard(server);
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+      else process.env.TAMANDUA_DB_PATH = previousDbPath;
+      if (previousStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+      else process.env.TAMANDUA_STATE_DIR = previousStateDir;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("GET /api/suite/flaky sorted by total runs descending", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-flaky-"));
+    const homeDir = path.join(root, "home");
+    const stateDir = path.join(homeDir, ".tamandua");
+    fs.mkdirSync(stateDir, { recursive: true });
+    const dbPath = path.join(stateDir, "tamandua.db");
+    const previousHome = process.env.HOME;
+    const previousDbPath = process.env.TAMANDUA_DB_PATH;
+    const previousStateDir = process.env.TAMANDUA_STATE_DIR;
+    process.env.HOME = homeDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+    process.env.TAMANDUA_STATE_DIR = stateDir;
+
+    const db = getDb();
+    const runId = "flaky-sort-run";
+    db.prepare(`
+      INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
+      VALUES (?, 1, 'wf-test', 'test task', 'running', '{}', 0, '2026-01-01', '2026-01-01')
+    `).run(runId);
+
+    const now = new Date().toISOString();
+    db.prepare(`
+      INSERT INTO suite_results (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, run_id, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run("/repo", "treeA", "cmdA", "npm run a", 0, 1000, runId, now);
+    db.prepare(`
+      INSERT INTO suite_results (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, run_id, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run("/repo", "treeA", "cmdA", "npm run a", 1, 1000, runId, now);
+    db.prepare(`
+      INSERT INTO suite_results (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, run_id, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run("/repo", "treeB", "cmdB", "npm run b", 0, 1000, runId, now);
+    db.prepare(`
+      INSERT INTO suite_results (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, run_id, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run("/repo", "treeB", "cmdB", "npm run b", 0, 1000, runId, now);
+    db.prepare(`
+      INSERT INTO suite_results (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, run_id, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run("/repo", "treeB", "cmdB", "npm run b", 1, 1000, runId, now);
+    db.prepare(`
+      INSERT INTO suite_results (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, run_id, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run("/repo", "treeB", "cmdB", "npm run b", 1, 1000, runId, now);
+
+    const { server, baseUrl } = await startDashboard();
+
+    try {
+      const response = await fetch(`${baseUrl}/api/suite/flaky`);
+      assert.equal(response.status, 200);
+      const body = await response.json() as { flaky_keys: Array<{ tree_hash: string; pass_count: number; fail_count: number }> };
+      assert.equal(body.flaky_keys.length, 2);
+      assert.equal(body.flaky_keys[0].tree_hash, "treeB");
+      assert.equal(body.flaky_keys[0].pass_count, 2);
+      assert.equal(body.flaky_keys[0].fail_count, 2);
+      assert.equal(body.flaky_keys[1].tree_hash, "treeA");
+      assert.equal(body.flaky_keys[1].pass_count, 1);
+      assert.equal(body.flaky_keys[1].fail_count, 1);
+    } finally {
+      await stopDashboard(server);
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+      else process.env.TAMANDUA_DB_PATH = previousDbPath;
+      if (previousStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+      else process.env.TAMANDUA_STATE_DIR = previousStateDir;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});

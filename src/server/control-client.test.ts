@@ -385,3 +385,467 @@ describe("control-client test-isolation guard", { concurrency: 1 }, () => {
     }
   });
 });
+
+describe("suite control-plane client", { concurrency: 1 }, () => {
+  let tempHome: string;
+  let stateDir: string;
+  let dbPath: string;
+  let secret: string;
+  let controlPort: number;
+  let server: http.Server | undefined;
+  let savedHome: string | undefined;
+  let savedStateDir: string | undefined;
+  let savedDbPath: string | undefined;
+  let savedControlPort: string | undefined;
+
+  before(async () => {
+    savedHome = process.env.HOME;
+    savedStateDir = process.env.TAMANDUA_STATE_DIR;
+    savedDbPath = process.env.TAMANDUA_DB_PATH;
+    savedControlPort = process.env.TAMANDUA_CONTROL_PORT;
+
+    tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-suitecc-"));
+    stateDir = path.join(tempHome, ".tamandua");
+    fs.mkdirSync(stateDir, { recursive: true });
+    dbPath = path.join(stateDir, "tamandua.db");
+
+    process.env.HOME = tempHome;
+    process.env.TAMANDUA_STATE_DIR = stateDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+
+    secret = crypto.randomBytes(16).toString("hex");
+    fs.writeFileSync(path.join(stateDir, "daemon-secret"), secret, "utf-8");
+
+    [controlPort] = await reserveDistinctRandomPorts(1);
+    process.env.TAMANDUA_CONTROL_PORT = String(controlPort);
+
+    const { createControlServer } = await import("../../dist/server/control-server.js");
+    server = createControlServer({ port: controlPort, secret });
+    await new Promise<void>((resolve) => {
+      server!.once("listening", resolve);
+    });
+  });
+
+  after(async () => {
+    if (server) {
+      await new Promise<void>((resolve) => server!.close(() => resolve()));
+    }
+    if (savedHome !== undefined) process.env.HOME = savedHome;
+    else delete process.env.HOME;
+    if (savedStateDir !== undefined) process.env.TAMANDUA_STATE_DIR = savedStateDir;
+    else delete process.env.TAMANDUA_STATE_DIR;
+    if (savedDbPath !== undefined) process.env.TAMANDUA_DB_PATH = savedDbPath;
+    else delete process.env.TAMANDUA_DB_PATH;
+    if (savedControlPort !== undefined) process.env.TAMANDUA_CONTROL_PORT = savedControlPort;
+    else delete process.env.TAMANDUA_CONTROL_PORT;
+    if (tempHome) fs.rmSync(tempHome, { recursive: true, force: true });
+  });
+
+  /** Helper to insert a suite_results row directly for setup. */
+  async function insertSuiteRow(overrides: Record<string, unknown> = {}): Promise<number> {
+    // Ensure the DB is migrated so suite_results exists. getDb() runs migrate().
+    const { getDb } = await import("../../dist/db.js");
+    getDb(); // triggers migration if needed
+
+    // Use a direct connection for the insert — WAL mode allows concurrent connections.
+    const { DatabaseSync } = await import("node:sqlite");
+    const db = new DatabaseSync(dbPath);
+    const result = db.prepare(
+      `INSERT INTO suite_results (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, log_tail, run_id, step_id, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      String(overrides.origin_repo ?? "/tmp/test-repo"),
+      String(overrides.tree_hash ?? crypto.createHash("sha1").update("abc").digest("hex")),
+      String(overrides.cmd_hash ?? crypto.createHash("sha256").update("cmd").digest("hex")),
+      String(overrides.cmd_display ?? "npm test"),
+      Number(overrides.exit_code ?? 0),
+      Number(overrides.duration_ms ?? 500),
+      (overrides.log_tail as string) ?? "test output",
+      (overrides.run_id as string) ?? null,
+      (overrides.step_id as string) ?? null,
+      String(overrides.created_at ?? new Date().toISOString()),
+    );
+    db.close();
+    return Number(result.lastInsertRowid);
+  }
+
+  it("lookupSuiteRecord returns lookup result for an existing key", async () => {
+    const treeHash = crypto.createHash("sha1").update("tree1").digest("hex");
+    const cmdHash = crypto.createHash("sha256").update("cmd1").digest("hex");
+    const now = new Date().toISOString();
+    await insertSuiteRow({
+      origin_repo: "/tmp/test-repo",
+      tree_hash: treeHash,
+      cmd_hash: cmdHash,
+      cmd_display: "npm test",
+      exit_code: 0,
+      duration_ms: 1234,
+      created_at: now,
+    });
+
+    const { lookupSuiteRecord } = await import("../../dist/server/control-client.js");
+    const result = await lookupSuiteRecord("/tmp/test-repo", treeHash, cmdHash);
+
+    assert.ok(result !== null, "should return a result");
+    assert.ok(result!.latest !== null, "should return latest entry");
+    assert.equal(result!.latest!.exit_code, 0);
+    assert.equal(result!.latest!.duration_ms, 1234);
+    assert.equal(typeof result!.passCount, "number");
+    assert.equal(typeof result!.failCount, "number");
+  });
+
+  it("lookupSuiteRecord returns null with latest=null for unknown key", async () => {
+    const treeHash = crypto.createHash("sha1").update("nonexistent").digest("hex");
+    const cmdHash = crypto.createHash("sha256").update("nonexistent").digest("hex");
+
+    const { lookupSuiteRecord } = await import("../../dist/server/control-client.js");
+    const result = await lookupSuiteRecord("/tmp/test-repo", treeHash, cmdHash);
+
+    assert.ok(result !== null, "should return a result");
+    assert.equal(result!.latest, null);
+    assert.equal(result!.passCount, 0);
+    assert.equal(result!.failCount, 0);
+    assert.equal(result!.flaky, false);
+  });
+
+  it("lookupSuiteRecord returns null when daemon is unreachable", async () => {
+    // Set control port to a port where nothing is listening.
+    const savedPort = process.env.TAMANDUA_CONTROL_PORT;
+    process.env.TAMANDUA_CONTROL_PORT = "65530";
+    try {
+      const { lookupSuiteRecord } = await import("../../dist/server/control-client.js");
+      const result = await lookupSuiteRecord("/x", "hash1", "hash2", 500);
+      assert.equal(result, null);
+    } finally {
+      process.env.TAMANDUA_CONTROL_PORT = savedPort;
+    }
+  });
+
+  it("recordSuiteResult inserts a row and returns id+created_at", async () => {
+    const treeHash = crypto.createHash("sha1").update("tree-r").digest("hex");
+    const cmdHash = crypto.createHash("sha256").update("cmd-r").digest("hex");
+
+    const { recordSuiteResult } = await import("../../dist/server/control-client.js");
+    const result = await recordSuiteResult({
+      origin_repo: "/tmp/test-repo",
+      tree_hash: treeHash,
+      cmd_hash: cmdHash,
+      cmd_display: "npm run lint",
+      exit_code: 1,
+      duration_ms: 8765,
+      log_tail: "some error",
+      run_id: "run-1",
+      step_id: "step-1",
+    });
+
+    assert.ok(result !== null, "should return a result");
+    assert.equal(typeof result!.id, "number");
+    assert.equal(typeof result!.created_at, "string");
+    assert.ok(result!.id > 0);
+
+    // Verify it was actually inserted.
+    const { DatabaseSync } = await import("node:sqlite");
+    const db = new DatabaseSync(dbPath);
+    const row = db.prepare(
+      "SELECT * FROM suite_results WHERE id = ?",
+    ).get(result!.id) as Record<string, unknown> | undefined;
+    db.close();
+    assert.ok(row !== undefined, "row should exist in db");
+    assert.equal(row!.exit_code, 1);
+    assert.equal(row!.duration_ms, 8765);
+    assert.equal(row!.log_tail, "some error");
+    assert.equal(row!.run_id, "run-1");
+    assert.equal(row!.step_id, "step-1");
+  });
+
+  it("recordSuiteResult returns null when daemon is unreachable", async () => {
+    const savedPort = process.env.TAMANDUA_CONTROL_PORT;
+    process.env.TAMANDUA_CONTROL_PORT = "65530";
+    try {
+      const { recordSuiteResult } = await import("../../dist/server/control-client.js");
+      const result = await recordSuiteResult({
+        origin_repo: "/x",
+        tree_hash: "h1",
+        cmd_hash: "h2",
+        cmd_display: "test",
+        exit_code: 0,
+        duration_ms: 100,
+      }, 500);
+      assert.equal(result, null);
+    } finally {
+      process.env.TAMANDUA_CONTROL_PORT = savedPort;
+    }
+  });
+
+  it("claimSuiteKey returns 'run' on first claim, 'wait' on second", async () => {
+    const treeHash = crypto.createHash("sha1").update("tree-claim").digest("hex");
+    const cmdHash = crypto.createHash("sha256").update("cmd-claim").digest("hex");
+
+    const { claimSuiteKey } = await import("../../dist/server/control-client.js");
+    const claim1 = await claimSuiteKey("/tmp/test-repo", treeHash, cmdHash);
+    assert.ok(claim1 !== null, "first claim should succeed");
+    assert.equal(claim1!.action, "run");
+
+    const claim2 = await claimSuiteKey("/tmp/test-repo", treeHash, cmdHash);
+    assert.ok(claim2 !== null, "second claim should succeed");
+    assert.equal(claim2!.action, "wait");
+    assert.ok(typeof claim2!.claimedAt === "string");
+  });
+
+  it("claimSuiteKey clears after record so third claim gets 'run'", async () => {
+    const treeHash = crypto.createHash("sha1").update("tree-claim2").digest("hex");
+    const cmdHash = crypto.createHash("sha256").update("cmd-claim2").digest("hex");
+
+    const { claimSuiteKey, recordSuiteResult } = await import("../../dist/server/control-client.js");
+
+    // First claim → run
+    const claim1 = await claimSuiteKey("/tmp/test-repo", treeHash, cmdHash);
+    assert.equal(claim1!.action, "run");
+
+    // Second claim → wait
+    const claim2 = await claimSuiteKey("/tmp/test-repo", treeHash, cmdHash);
+    assert.equal(claim2!.action, "wait");
+
+    // Record result → clears claim
+    await recordSuiteResult({
+      origin_repo: "/tmp/test-repo",
+      tree_hash: treeHash,
+      cmd_hash: cmdHash,
+      cmd_display: "test",
+      exit_code: 0,
+      duration_ms: 100,
+    });
+
+    // Third claim → run (claim was cleared by record)
+    const claim3 = await claimSuiteKey("/tmp/test-repo", treeHash, cmdHash);
+    assert.ok(claim3 !== null, "third claim should succeed");
+    assert.equal(claim3!.action, "run");
+  });
+
+  it("claimSuiteKey returns null when daemon is unreachable", async () => {
+    const savedPort = process.env.TAMANDUA_CONTROL_PORT;
+    process.env.TAMANDUA_CONTROL_PORT = "65530";
+    try {
+      const { claimSuiteKey } = await import("../../dist/server/control-client.js");
+      const result = await claimSuiteKey("/x", "h1", "h2", 500);
+      assert.equal(result, null);
+    } finally {
+      process.env.TAMANDUA_CONTROL_PORT = savedPort;
+    }
+  });
+
+  it("getFlakyKeys returns empty array when no flaky keys", async () => {
+    const { getFlakyKeys } = await import("../../dist/server/control-client.js");
+    const result = await getFlakyKeys("/tmp/test-repo");
+    assert.ok(result !== null, "should return a result");
+    assert.equal(result!.length, 0);
+  });
+
+  it("getFlakyKeys returns keys with both pass and fail within window", async () => {
+    const treeHash = crypto.createHash("sha1").update("flaky-tree").digest("hex");
+    const cmdHash = crypto.createHash("sha256").update("flaky-cmd").digest("hex");
+    const now = new Date();
+
+    // Insert a pass.
+    await insertSuiteRow({
+      origin_repo: "/tmp/test-repo",
+      tree_hash: treeHash,
+      cmd_hash: cmdHash,
+      cmd_display: "flaky test",
+      exit_code: 0,
+      duration_ms: 100,
+      created_at: now.toISOString(),
+    });
+    // Insert a fail.
+    await insertSuiteRow({
+      origin_repo: "/tmp/test-repo",
+      tree_hash: treeHash,
+      cmd_hash: cmdHash,
+      cmd_display: "flaky test",
+      exit_code: 1,
+      duration_ms: 200,
+      created_at: new Date(now.getTime() - 1000).toISOString(),
+    });
+
+    const { getFlakyKeys } = await import("../../dist/server/control-client.js");
+    const result = await getFlakyKeys("/tmp/test-repo");
+    assert.ok(result !== null, "should return a result");
+    assert.ok(result!.length >= 1, "should have at least one flaky key");
+
+    const flaky = result!.find((k) => k.tree_hash === treeHash && k.cmd_hash === cmdHash);
+    assert.ok(flaky !== undefined, "our key should be in the flaky list");
+    assert.equal(flaky!.pass_count, 1);
+    assert.equal(flaky!.fail_count, 1);
+    assert.equal(flaky!.cmd_display, "flaky test");
+  });
+
+  it("getFlakyKeys returns null when daemon is unreachable", async () => {
+    const savedPort = process.env.TAMANDUA_CONTROL_PORT;
+    process.env.TAMANDUA_CONTROL_PORT = "65530";
+    try {
+      const { getFlakyKeys } = await import("../../dist/server/control-client.js");
+      const result = await getFlakyKeys("/x", 500);
+      assert.equal(result, null);
+    } finally {
+      process.env.TAMANDUA_CONTROL_PORT = savedPort;
+    }
+  });
+
+  it("all suite client functions respect timeout", async () => {
+    // Point at a port with nothing listening; use short timeout.
+    const savedPort = process.env.TAMANDUA_CONTROL_PORT;
+    process.env.TAMANDUA_CONTROL_PORT = "65530";
+    try {
+      const { lookupSuiteRecord, recordSuiteResult, claimSuiteKey, getFlakyKeys } =
+        await import("../../dist/server/control-client.js");
+
+      const start = Date.now();
+      const r1 = await lookupSuiteRecord("/x", "h1", "h2", 200);
+      const r2 = await recordSuiteResult({
+        origin_repo: "/x", tree_hash: "h1", cmd_hash: "h2",
+        cmd_display: "test", exit_code: 0, duration_ms: 100,
+      }, 200);
+      const r3 = await claimSuiteKey("/x", "h1", "h2", 200);
+      const r4 = await getFlakyKeys("/x", 200);
+      const elapsed = Date.now() - start;
+
+      assert.equal(r1, null);
+      assert.equal(r2, null);
+      assert.equal(r3, null);
+      assert.equal(r4, null);
+      // Each call times out within ~200ms; total should be < 3s (allowing for overhead).
+      assert.ok(elapsed < 3000, `elapsed ${elapsed}ms should be < 3000ms`);
+    } finally {
+      process.env.TAMANDUA_CONTROL_PORT = savedPort;
+    }
+  });
+
+  it("lookupSuiteRecord detects flaky when pass+exist-fail", async () => {
+    // Use a fresh key pair.
+    const treeHash = crypto.createHash("sha1").update("tree-flaky-l").digest("hex");
+    const cmdHash = crypto.createHash("sha256").update("cmd-flaky-l").digest("hex");
+    const now = new Date();
+
+    await insertSuiteRow({
+      origin_repo: "/tmp/test-repo",
+      tree_hash: treeHash,
+      cmd_hash: cmdHash,
+      cmd_display: "flaky look",
+      exit_code: 0,
+      duration_ms: 100,
+      created_at: now.toISOString(),
+    });
+    await insertSuiteRow({
+      origin_repo: "/tmp/test-repo",
+      tree_hash: treeHash,
+      cmd_hash: cmdHash,
+      cmd_display: "flaky look",
+      exit_code: 1,
+      duration_ms: 200,
+      created_at: new Date(now.getTime() - 5000).toISOString(),
+    });
+
+    const { lookupSuiteRecord } = await import("../../dist/server/control-client.js");
+    const result = await lookupSuiteRecord("/tmp/test-repo", treeHash, cmdHash);
+
+    assert.ok(result !== null);
+    assert.equal(result!.flaky, true, "should detect flaky");
+    assert.ok(result!.passCount >= 1);
+    assert.ok(result!.failCount >= 1);
+  });
+
+  it("emitSuiteEvent returns true on success and writes event to file", async () => {
+    const { emitSuiteEvent } = await import("../../dist/server/control-client.js");
+    const runId = "cc-evt-cache-hit";
+    const ok = await emitSuiteEvent({
+      event: "suite.cache_hit",
+      run_id: runId,
+      step_id: "step-1",
+      tree_hash: "abc123def456",
+      cmd_display: "npm test",
+      saved_duration_ms: 1234,
+    });
+    assert.equal(ok, true);
+
+    // Verify event was written.
+    const eventsPath = path.join(stateDir, "events", `${runId}.jsonl`);
+    assert.ok(fs.existsSync(eventsPath));
+    const content = fs.readFileSync(eventsPath, "utf-8").trim();
+    const evt = JSON.parse(content);
+    assert.equal(evt.event, "suite.cache_hit");
+    assert.equal(evt.runId, runId);
+    assert.equal(evt.stepId, "step-1");
+    assert.equal(evt.treeHash, "abc123def456");
+    assert.equal(evt.savedDurationMs, 1234);
+  });
+
+  it("emitSuiteEvent writes suite.flaky_detected event", async () => {
+    const { emitSuiteEvent } = await import("../../dist/server/control-client.js");
+    const runId = "cc-evt-flaky";
+    const ok = await emitSuiteEvent({
+      event: "suite.flaky_detected",
+      run_id: runId,
+      tree_hash: "flaky-hash",
+      cmd_hash: "flaky-cmd",
+      pass_count: 3,
+      fail_count: 2,
+      window: "24h",
+    });
+    assert.equal(ok, true);
+
+    const eventsPath = path.join(stateDir, "events", `${runId}.jsonl`);
+    const content = fs.readFileSync(eventsPath, "utf-8").trim();
+    const evt = JSON.parse(content);
+    assert.equal(evt.event, "suite.flaky_detected");
+    assert.equal(evt.passCount, 3);
+    assert.equal(evt.failCount, 2);
+    assert.equal(evt.window, "24h");
+  });
+
+  it("emitSuiteEvent writes suite.singleflight_wait event", async () => {
+    const { emitSuiteEvent } = await import("../../dist/server/control-client.js");
+    const runId = "cc-evt-sf-wait";
+    const ok = await emitSuiteEvent({
+      event: "suite.singleflight_wait",
+      run_id: runId,
+      tree_hash: "sf-hash",
+      cmd_hash: "sf-cmd",
+      waited_ms: 0,
+    });
+    assert.equal(ok, true);
+
+    const eventsPath = path.join(stateDir, "events", `${runId}.jsonl`);
+    const content = fs.readFileSync(eventsPath, "utf-8").trim();
+    const evt = JSON.parse(content);
+    assert.equal(evt.event, "suite.singleflight_wait");
+    assert.equal(evt.treeHash, "sf-hash");
+    assert.equal(evt.cmdHash, "sf-cmd");
+    assert.equal(evt.waitedMs, 0);
+  });
+
+  it("emitSuiteEvent returns false when daemon is unreachable", async () => {
+    const savedPort = process.env.TAMANDUA_CONTROL_PORT;
+    process.env.TAMANDUA_CONTROL_PORT = "65530";
+    try {
+      const { emitSuiteEvent } = await import("../../dist/server/control-client.js");
+      const ok = await emitSuiteEvent({ event: "suite.cache_hit", run_id: "r-none", tree_hash: "x" }, 200);
+      assert.equal(ok, false);
+    } finally {
+      process.env.TAMANDUA_CONTROL_PORT = savedPort;
+    }
+  });
+
+  it("emitSuiteEvent is idempotent — each call appends", async () => {
+    const { emitSuiteEvent } = await import("../../dist/server/control-client.js");
+    const runId = "cc-evt-idem";
+    await emitSuiteEvent({ event: "suite.executed", run_id: runId, tree_hash: "t1", cmd_display: "c1", duration_ms: 100, exit_code: 0 });
+    await emitSuiteEvent({ event: "suite.executed", run_id: runId, tree_hash: "t2", cmd_display: "c2", duration_ms: 200, exit_code: 1 });
+
+    const eventsPath = path.join(stateDir, "events", `${runId}.jsonl`);
+    const content = fs.readFileSync(eventsPath, "utf-8").trim();
+    const lines = content.split("\n");
+    assert.equal(lines.length, 2, "should have 2 events");
+    assert.ok(lines[0]!.includes("t1"));
+    assert.ok(lines[1]!.includes("t2"));
+  });
+});

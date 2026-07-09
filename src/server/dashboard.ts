@@ -200,9 +200,11 @@ function handleListRuns(_req: http.IncomingMessage, res: http.ServerResponse): v
         SUM(CASE WHEN s.status = 'done' THEN 1 ELSE 0 END) AS completed_steps,
         SUM(CASE WHEN s.status = 'failed' THEN 1 ELSE 0 END) AS failed_steps,
         SUM(CASE WHEN s.status = 'running' THEN 1 ELSE 0 END) AS running_steps,
-        SUM(CASE WHEN s.status = 'waiting' THEN 1 ELSE 0 END) AS waiting_steps
+        SUM(CASE WHEN s.status = 'waiting' THEN 1 ELSE 0 END) AS waiting_steps,
+        COUNT(sr.id) AS suite_executed
       FROM runs r
       LEFT JOIN steps s ON s.run_id = r.id
+      LEFT JOIN suite_results sr ON sr.run_id = r.id
       GROUP BY r.id
       ORDER BY r.created_at DESC
       LIMIT 100
@@ -919,6 +921,94 @@ function handleVersionStatus(_req: http.IncomingMessage, res: http.ServerRespons
   }
 }
 
+// ── Suite Stats ────────────────────────────────────────────────────
+
+const FLAKE_WINDOW_MS = 24 * 60 * 60 * 1000; // 24h
+
+function handleRunSuiteStats(
+  _req: http.IncomingMessage,
+  res: http.ServerResponse,
+  runId: string,
+): void {
+  try {
+    const db = getDb();
+
+    // Executed count: rows in suite_results for this run
+    const executedRow = db.prepare(
+      "SELECT COUNT(*) AS cnt FROM suite_results WHERE run_id = ?",
+    ).get(runId) as { cnt: number };
+    const executed = executedRow.cnt;
+
+    // Replayed count and saved minutes: scan run events for suite.cache_hit
+    let replayed = 0;
+    let savedMs = 0;
+    try {
+      const runEvents = getRunEvents(runId);
+      for (const evt of runEvents) {
+        if (evt.event === "suite.cache_hit") {
+          replayed++;
+          if (typeof evt.savedDurationMs === "number" && evt.savedDurationMs > 0) {
+            savedMs += evt.savedDurationMs;
+          }
+        }
+      }
+    } catch {
+      // Events file may not exist — that's fine
+    }
+
+    const savedMinutes = Math.round(savedMs / 60000);
+
+    jsonResponse(res, {
+      runId,
+      executed,
+      replayed,
+      savedMinutes,
+    });
+  } catch (err) {
+    errorResponse(res, `Failed to get suite stats: ${(err as Error).message}`);
+  }
+}
+
+function handleSuiteFlaky(_req: http.IncomingMessage, res: http.ServerResponse): void {
+  try {
+    const db = getDb();
+    const cutoff = new Date(Date.now() - FLAKE_WINDOW_MS).toISOString();
+
+    // Find keys that have both green (exit_code=0) and red (exit_code!=0) within FLAKE_WINDOW
+    const rows = db.prepare(`
+      SELECT
+        tree_hash,
+        cmd_hash,
+        cmd_display,
+        SUM(CASE WHEN exit_code = 0 THEN 1 ELSE 0 END) AS pass_count,
+        SUM(CASE WHEN exit_code != 0 THEN 1 ELSE 0 END) AS fail_count
+      FROM suite_results
+      WHERE created_at >= ?
+      GROUP BY tree_hash, cmd_hash
+      HAVING pass_count > 0 AND fail_count > 0
+      ORDER BY (pass_count + fail_count) DESC
+    `).all(cutoff) as Array<{
+      tree_hash: string;
+      cmd_hash: string;
+      cmd_display: string;
+      pass_count: number;
+      fail_count: number;
+    }>;
+
+    const flakyKeys = rows.map((row) => ({
+      tree_hash: row.tree_hash,
+      cmd_hash: row.cmd_hash,
+      cmd_display: row.cmd_display,
+      pass_count: row.pass_count,
+      fail_count: row.fail_count,
+    }));
+
+    jsonResponse(res, { flaky_keys: flakyKeys });
+  } catch (err) {
+    errorResponse(res, `Failed to get flaky keys: ${(err as Error).message}`);
+  }
+}
+
 function handleMcpStatus(_req: http.IncomingMessage, res: http.ServerResponse): void {
   try {
     const status = getMcpStatus();
@@ -983,6 +1073,13 @@ function route(req: http.IncomingMessage, res: http.ServerResponse): void {
     return;
   }
 
+  // GET /api/runs/:id/suite-stats (registered before /api/runs/:id/*)
+  const suiteStatsMatch = pathname.match(/^\/api\/runs\/([a-zA-Z0-9_-]+)\/suite-stats$/);
+  if (method === "GET" && suiteStatsMatch) {
+    handleRunSuiteStats(req, res, suiteStatsMatch[1]);
+    return;
+  }
+
   // GET /api/runs/:id/kanban/card-detail (registered before /api/runs/:id/kanban and /api/runs/:id)
   const cardDetailMatch = pathname.match(/^\/api\/runs\/([a-zA-Z0-9_-]+)\/kanban\/card-detail$/);
   if (method === "GET" && cardDetailMatch) {
@@ -1032,6 +1129,12 @@ function route(req: http.IncomingMessage, res: http.ServerResponse): void {
   // GET /api/autoresearch/runs (registered before /api/runs to avoid route conflict)
   if (method === "GET" && pathname === "/api/autoresearch/runs") {
     handleAutoresearchRuns(req, res);
+    return;
+  }
+
+  // GET /api/suite/flaky (registered before /api/runs to avoid route conflict)
+  if (method === "GET" && pathname === "/api/suite/flaky") {
+    handleSuiteFlaky(req, res);
     return;
   }
 

@@ -22,6 +22,7 @@ You don't need to hire a dev team. You need to define one. Tamandua gives you a 
 - [What You Get: Bundled Workflows](#what-you-get-bundled-workflows)
 - [Why It Works](#why-it-works)
 - [How It Works](#how-it-works)
+  - [Test-Suite Ledger (TSTX)](#test-suite-ledger-tstx)
 - [Build Your Own](#build-your-own)
 - [Native AutoResearch](#native-autoresearch)
 - [Security](#security)
@@ -270,6 +271,38 @@ The motor's invariants are pinned by an engineering contract with acceptance tes
 ### Minimal by design
 
 YAML + SQLite + deterministic dispatch. That's it. No Redis, no Kafka, no container orchestrator. Tamandua is a TypeScript CLI with zero external dependencies. It runs wherever pi runs. Checking for work never invokes a model — idle runs cost zero tokens.
+
+### Test-Suite Ledger (TSTX)
+
+Tamandua ships with a content-addressed test-suite ledger that skips redundant
+test re-execution across workflow runs. When the same working tree with the
+same test command has already passed, TSTX replays the recorded result instead
+of re-running the suite.
+
+**How it works:**
+- `tamandua-test` wraps every test command (via `{{test_cmd}}`) and computes a
+  content-hash of the working tree using `git write-tree` on a temporary index —
+  the repository's real index is never touched
+- On a cache hit (same tree + same command, green within 24h), the result is
+  replayed with exit 0 — no re-execution needed; a `TAMANDUA-TEST CACHED`
+  banner identifies the replay
+- On a cache miss or any doubt, the command runs normally — the shim passes
+  through stdout/stderr and exit code unchanged
+
+**Safety:** TSTX is **strictly monotone** — it may only skip work that is
+provably redundant (a green result for the byte-identical tree and command).
+On any doubt, error, or unexpected condition, it degrades to running the real
+command unchanged (passthrough). It is impossible for TSTX to make a task
+slower, wrong, or uncompletable compared to not having TSTX at all. Passthrough
+is byte-identical to the raw command except for a single stderr notice.
+
+**Kill switch:** Set `TAMANDUA_TSTX=0` to disable TSTX entirely — all test
+commands bypass the ledger and execute directly.
+
+**Submodule caveat:** `git write-tree` records submodule pointers (commits),
+not their dirty working tree contents. If your repository uses submodules,
+changes inside a submodule won't be reflected in the tree hash until they're
+committed and the pointer is updated in the parent repository.
 
 ---
 

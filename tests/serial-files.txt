@@ -30,6 +30,9 @@ src/server/daemonctl-restart.test.ts
 src/server/daemonctl-self-stop-guard.test.ts
 src/server/daemonctl.test.ts
 src/server/dashboard.test.ts
+src/suite/shim-acceptance.test.ts
+src/suite/shim.test.ts
+src/suite/tree-hash.test.ts
 tests/agent-scheduler.test.ts
 tests/claim-invalidated-by-migration.test.ts
 tests/cli-pause-all-resume-all-integration.test.ts

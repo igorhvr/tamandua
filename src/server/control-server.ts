@@ -28,6 +28,7 @@ import { getBuildVersion } from "../lib/version.js";
 import { assertPortIsolation, assertStatePathIsolation, testGuardActive } from "../lib/test-guard.js";
 import { getDb } from "../db.js";
 import { emitEvent } from "../installer/events.js";
+import type { TamanduaEvent } from "../installer/events.js";
 import { validateRunHarnessForScheduling } from "../installer/run-harness.js";
 
 export const DEFAULT_CONTROL_PORT = 3339;
@@ -301,6 +302,211 @@ async function admitQueuedRuns(): Promise<void> {
     if (result.body.state === "queued") break;
   }
 }
+
+// ── TSTX suite endpoints ──────────────────────────────────────────────
+
+import { FLAKE_WINDOW_MS, CLAIM_TIMEOUT_MS } from "../suite/config.js";
+
+interface SuiteClaim {
+  claimedAt: number;
+}
+
+const suiteClaims = new Map<string, SuiteClaim>();
+
+function suiteClaimKey(originRepo: string, treeHash: string, cmdHash: string): string {
+  return `${originRepo}:${treeHash}:${cmdHash}`;
+}
+
+function cleanStaleClaims(): void {
+  const now = Date.now();
+  for (const [key, claim] of suiteClaims) {
+    if (now - claim.claimedAt > CLAIM_TIMEOUT_MS) {
+      suiteClaims.delete(key);
+    }
+  }
+}
+
+async function handleSuiteLookup(url: string): Promise<JsonResponse> {
+  const parsed = new URL(url, "http://localhost");
+  const originRepo = parsed.searchParams.get("origin_repo");
+  const treeHash = parsed.searchParams.get("tree_hash");
+  const cmdHash = parsed.searchParams.get("cmd_hash");
+
+  if (!originRepo || !treeHash || !cmdHash) {
+    return { status: 400, body: { error: "Missing required query params: origin_repo, tree_hash, cmd_hash" } };
+  }
+
+  try {
+    const db = getDb();
+    const flakeCutoff = new Date(Date.now() - FLAKE_WINDOW_MS).toISOString();
+
+    const latest = db.prepare(
+      `SELECT id, origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, log_tail, run_id, step_id, created_at
+       FROM suite_results
+       WHERE origin_repo = ? AND tree_hash = ? AND cmd_hash = ?
+       ORDER BY created_at DESC
+       LIMIT 1`,
+    ).get(originRepo, treeHash, cmdHash) as Record<string, unknown> | undefined;
+
+    const passCount = (db.prepare(
+      `SELECT COUNT(*) as cnt FROM suite_results
+       WHERE origin_repo = ? AND tree_hash = ? AND cmd_hash = ? AND exit_code = 0 AND created_at >= ?`,
+    ).get(originRepo, treeHash, cmdHash, flakeCutoff) as { cnt: number }).cnt;
+
+    const failCount = (db.prepare(
+      `SELECT COUNT(*) as cnt FROM suite_results
+       WHERE origin_repo = ? AND tree_hash = ? AND cmd_hash = ? AND exit_code != 0 AND created_at >= ?`,
+    ).get(originRepo, treeHash, cmdHash, flakeCutoff) as { cnt: number }).cnt;
+
+    return ok({
+      latest: latest ?? null,
+      passCount,
+      failCount,
+      flaky: passCount > 0 && failCount > 0,
+    });
+  } catch (err) {
+    logger.warn("control-server: suite lookup failed", { error: String(err) });
+    return { status: 500, body: { error: err instanceof Error ? err.message : String(err) } };
+  }
+}
+
+async function handleSuiteRecord(body: Record<string, unknown>): Promise<JsonResponse> {
+  const originRepo = typeof body.origin_repo === "string" ? body.origin_repo : "";
+  const treeHash = typeof body.tree_hash === "string" ? body.tree_hash : "";
+  const cmdHash = typeof body.cmd_hash === "string" ? body.cmd_hash : "";
+  const cmdDisplay = typeof body.cmd_display === "string" ? body.cmd_display : "";
+  const exitCode = typeof body.exit_code === "number" ? body.exit_code : null;
+  const durationMs = typeof body.duration_ms === "number" ? body.duration_ms : null;
+  const logTail = typeof body.log_tail === "string" ? body.log_tail : null;
+  const runId = typeof body.run_id === "string" ? body.run_id : null;
+  const stepId = typeof body.step_id === "string" ? body.step_id : null;
+
+  if (!originRepo || !treeHash || !cmdHash || !cmdDisplay || exitCode === null || durationMs === null) {
+    return { status: 400, body: { error: "Missing required fields: origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms" } };
+  }
+
+  try {
+    const db = getDb();
+    const created_at = new Date().toISOString();
+    const result = db.prepare(
+      `INSERT INTO suite_results (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, log_tail, run_id, step_id, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(originRepo, treeHash, cmdHash, cmdDisplay, exitCode, durationMs, logTail, runId, stepId, created_at);
+
+    // Emit suite.executed event for observability (US-009).
+    const eventRunId = runId || "";
+    emitEvent({
+      ts: created_at,
+      event: "suite.executed",
+      runId: eventRunId,
+      stepId: stepId || undefined,
+      treeHash,
+      cmdDisplay,
+      durationMs,
+      exitCode,
+    });
+
+    // Clear any pending claim so waiters can pick up the result.
+    const claimKey = suiteClaimKey(originRepo, treeHash, cmdHash);
+    suiteClaims.delete(claimKey);
+
+    return ok({ id: Number(result.lastInsertRowid), created_at });
+  } catch (err) {
+    logger.warn("control-server: suite record failed", { error: String(err) });
+    return { status: 500, body: { error: err instanceof Error ? err.message : String(err) } };
+  }
+}
+
+async function handleSuiteClaim(body: Record<string, unknown>): Promise<JsonResponse> {
+  const originRepo = typeof body.origin_repo === "string" ? body.origin_repo : "";
+  const treeHash = typeof body.tree_hash === "string" ? body.tree_hash : "";
+  const cmdHash = typeof body.cmd_hash === "string" ? body.cmd_hash : "";
+
+  if (!originRepo || !treeHash || !cmdHash) {
+    return { status: 400, body: { error: "Missing required fields: origin_repo, tree_hash, cmd_hash" } };
+  }
+
+  cleanStaleClaims();
+
+  const key = suiteClaimKey(originRepo, treeHash, cmdHash);
+  const existing = suiteClaims.get(key);
+
+  if (existing) {
+    return ok({ action: "wait", claimedAt: new Date(existing.claimedAt).toISOString() });
+  }
+
+  suiteClaims.set(key, { claimedAt: Date.now() });
+  return ok({ action: "run" });
+}
+
+async function handleSuiteEvent(body: Record<string, unknown>): Promise<JsonResponse> {
+  const event = typeof body.event === "string" ? body.event : "";
+  if (!event) {
+    return { status: 400, body: { error: "Missing required field: event" } };
+  }
+
+  const runId = typeof body.run_id === "string" ? body.run_id : "";
+  const stepId = typeof body.step_id === "string" ? body.step_id : undefined;
+
+  // Build a TamanduaEvent with only the fields that are present.
+  const evt: Record<string, unknown> = {
+    ts: new Date().toISOString(),
+    event,
+    runId,
+  };
+  if (stepId) evt.stepId = stepId;
+  if (typeof body.tree_hash === "string") evt.treeHash = body.tree_hash;
+  if (typeof body.cmd_display === "string") evt.cmdDisplay = body.cmd_display;
+  if (typeof body.cmd_hash === "string") evt.cmdHash = body.cmd_hash;
+  if (typeof body.saved_duration_ms === "number") evt.savedDurationMs = body.saved_duration_ms;
+  if (typeof body.duration_ms === "number") evt.durationMs = body.duration_ms;
+  if (typeof body.exit_code === "number") evt.exitCode = body.exit_code;
+  if (typeof body.pass_count === "number") evt.passCount = body.pass_count;
+  if (typeof body.fail_count === "number") evt.failCount = body.fail_count;
+  if (typeof body.window === "string") evt.window = body.window;
+  if (typeof body.waited_ms === "number") evt.waitedMs = body.waited_ms;
+
+  try {
+    emitEvent(evt as unknown as TamanduaEvent);
+    return ok({});
+  } catch (err) {
+    logger.warn("control-server: suite event emission failed", { event, error: String(err) });
+    return { status: 500, body: { error: err instanceof Error ? err.message : String(err) } };
+  }
+}
+
+async function handleSuiteFlaky(url: string): Promise<JsonResponse> {
+  const parsed = new URL(url, "http://localhost");
+  const originRepo = parsed.searchParams.get("origin_repo");
+
+  if (!originRepo) {
+    return { status: 400, body: { error: "Missing required query param: origin_repo" } };
+  }
+
+  try {
+    const db = getDb();
+    const flakeCutoff = new Date(Date.now() - FLAKE_WINDOW_MS).toISOString();
+
+    // Find keys that have both pass (exit_code=0) and fail (exit_code!=0) within the window.
+    const rows = db.prepare(
+      `SELECT tree_hash, cmd_hash, cmd_display,
+              SUM(CASE WHEN exit_code = 0 THEN 1 ELSE 0 END) as pass_count,
+              SUM(CASE WHEN exit_code != 0 THEN 1 ELSE 0 END) as fail_count
+       FROM suite_results
+       WHERE origin_repo = ? AND created_at >= ?
+       GROUP BY tree_hash, cmd_hash
+       HAVING pass_count > 0 AND fail_count > 0
+       ORDER BY (pass_count + fail_count) DESC`,
+    ).all(originRepo, flakeCutoff) as Array<Record<string, unknown>>;
+
+    return ok({ flaky_keys: rows });
+  } catch (err) {
+    logger.warn("control-server: suite flaky query failed", { error: String(err) });
+    return { status: 500, body: { error: err instanceof Error ? err.message : String(err) } };
+  }
+}
+
+// ── Run scheduling handlers ──────────────────────────────────────────
 
 async function handleRegisterRun(runId: string): Promise<JsonResponse> {
   const run = getRun(runId);
@@ -699,9 +905,35 @@ export function createControlServer(options: ControlServerOptions = {}): http.Se
         respond(r.status, r.body);
         return;
       }
+      if (pathname === "/suite/lookup" && method === "GET") {
+        const r = await handleSuiteLookup(url);
+        respond(r.status, r.body);
+        return;
+      }
+      if (pathname === "/suite/flaky" && method === "GET") {
+        const r = await handleSuiteFlaky(url);
+        respond(r.status, r.body);
+        return;
+      }
       if (method === "POST") {
         const body = await parseRequestBody(req);
         const runId = typeof body.runId === "string" ? body.runId.trim() : "";
+
+        if (pathname === "/suite/event") {
+          const r = await handleSuiteEvent(body);
+          respond(r.status, r.body);
+          return;
+        }
+        if (pathname === "/suite/record") {
+          const r = await handleSuiteRecord(body);
+          respond(r.status, r.body);
+          return;
+        }
+        if (pathname === "/suite/claim") {
+          const r = await handleSuiteClaim(body);
+          respond(r.status, r.body);
+          return;
+        }
         if (
           (pathname === "/control/register-run"
             || pathname === "/control/terminate-run"
@@ -868,6 +1100,18 @@ export function startReconciler(): { stop: () => void } {
         if (!row || row.status !== "running") {
           await removeRunCrons(runId);
         }
+      }
+
+      // ── TSTX ledger retention pruning ──
+      // Remove suite_results rows older than LEDGER_RETENTION (14d).
+      try {
+        const { pruneOldSuiteResults } = await import("../db.js");
+        const pruned = pruneOldSuiteResults();
+        if (pruned > 0) {
+          logger.info("control-server: pruned old suite_results rows", { pruned });
+        }
+      } catch (err) {
+        logger.warn("control-server: suite_results pruning failed", { error: String(err) });
       }
 
       await admitQueuedRuns();

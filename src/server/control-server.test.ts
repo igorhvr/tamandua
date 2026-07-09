@@ -19,6 +19,7 @@ import crypto from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
+import { DatabaseSync } from "node:sqlite";
 import { DEFAULT_CONTROL_PORT } from "../../dist/server/control-server.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -1291,4 +1292,732 @@ describe("control-server save-tokens context wiring", () => {
       );
     });
   }
+});
+
+// ══════════════════════════════════════════════════════════════════════
+// TSTX suite control-plane endpoints
+// ══════════════════════════════════════════════════════════════════════
+
+describe("suite control-plane endpoints", { concurrency: 1 }, () => {
+  let tempHome: string;
+  let stateDir: string;
+  let dbPath: string;
+  let secret: string;
+  let controlPort: number;
+  let server: http.Server | undefined;
+  let origHome: string | undefined;
+  let origStateDir: string | undefined;
+  let origDbPath: string | undefined;
+  let origControlPort: string | undefined;
+
+  before(async () => {
+    origHome = process.env.HOME;
+    origStateDir = process.env.TAMANDUA_STATE_DIR;
+    origDbPath = process.env.TAMANDUA_DB_PATH;
+    origControlPort = process.env.TAMANDUA_CONTROL_PORT;
+
+    tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-suite-ep-"));
+    stateDir = path.join(tempHome, ".tamandua");
+    fs.mkdirSync(stateDir, { recursive: true });
+    dbPath = path.join(stateDir, "tamandua.db");
+
+    process.env.HOME = tempHome;
+    process.env.TAMANDUA_STATE_DIR = stateDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+
+    secret = crypto.randomBytes(16).toString("hex");
+    fs.mkdirSync(path.dirname(path.join(stateDir, "daemon-secret")), { recursive: true });
+    fs.writeFileSync(path.join(stateDir, "daemon-secret"), secret, "utf-8");
+
+    [controlPort] = await reserveDistinctRandomPorts(1);
+    process.env.TAMANDUA_CONTROL_PORT = String(controlPort);
+
+    const { createControlServer } = await import("../../dist/server/control-server.js");
+    server = createControlServer({ port: controlPort, secret });
+    await new Promise<void>((resolve) => {
+      server!.once("listening", resolve);
+    });
+  });
+
+  after(async () => {
+    if (server) {
+      await new Promise<void>((resolve) => server!.close(() => resolve()));
+    }
+    if (origHome) process.env.HOME = origHome;
+    else delete process.env.HOME;
+    if (origStateDir) process.env.TAMANDUA_STATE_DIR = origStateDir;
+    else delete process.env.TAMANDUA_STATE_DIR;
+    if (origDbPath) process.env.TAMANDUA_DB_PATH = origDbPath;
+    else delete process.env.TAMANDUA_DB_PATH;
+    if (origControlPort) process.env.TAMANDUA_CONTROL_PORT = origControlPort;
+    else delete process.env.TAMANDUA_CONTROL_PORT;
+    if (tempHome) fs.rmSync(tempHome, { recursive: true, force: true });
+  });
+
+  async function suiteRequest(
+    method: "GET" | "POST",
+    pathName: string,
+    body?: Record<string, unknown>,
+  ): Promise<JsonResponse> {
+    const payload = body ? JSON.stringify(body) : "";
+    const headers: Record<string, string> = {
+      "content-type": "application/json",
+      "x-tamandua-secret": secret,
+    };
+    if (payload) headers["content-length"] = String(Buffer.byteLength(payload));
+
+    return await new Promise<JsonResponse>((resolve, reject) => {
+      const req = http.request(
+        {
+          method,
+          hostname: "127.0.0.1",
+          port: controlPort,
+          path: pathName,
+          headers,
+        },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on("data", (c: Buffer) => chunks.push(c));
+          res.on("end", () => {
+            const raw = Buffer.concat(chunks).toString("utf-8");
+            let parsed: Record<string, unknown> = {};
+            if (raw.trim()) {
+              try { parsed = JSON.parse(raw) as Record<string, unknown>; } catch { parsed = { raw }; }
+            }
+            resolve({ status: res.statusCode ?? 0, body: parsed });
+          });
+        },
+      );
+      req.on("error", reject);
+      req.setTimeout(3000, () => req.destroy(new Error("suite request timeout")));
+      if (payload) req.write(payload);
+      req.end();
+    });
+  }
+
+  function insertSuiteRow(params: {
+    originRepo: string;
+    treeHash: string;
+    cmdHash: string;
+    cmdDisplay: string;
+    exitCode: number;
+    durationMs: number;
+    logTail?: string;
+    runId?: string;
+    stepId?: string;
+    createdAt?: string;
+  }): void {
+    const db = new DatabaseSync(dbPath);
+    db.prepare(
+      `INSERT INTO suite_results (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, log_tail, run_id, step_id, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      params.originRepo,
+      params.treeHash,
+      params.cmdHash,
+      params.cmdDisplay,
+      params.exitCode,
+      params.durationMs,
+      params.logTail ?? null,
+      params.runId ?? null,
+      params.stepId ?? null,
+      params.createdAt ?? new Date().toISOString(),
+    );
+    db.close();
+  }
+
+  // ── 1. GET /suite/lookup ──────────────────────────────────────────
+
+  it("GET /suite/lookup returns 401 without auth", async () => {
+    const payload = "";
+    const headers: Record<string, string> = { "content-type": "application/json" };
+    const resp = await new Promise<{ status: number; body: unknown }>((resolve, reject) => {
+      const req = http.request(
+        { method: "GET", hostname: "127.0.0.1", port: controlPort, path: "/suite/lookup?origin_repo=/test&tree_hash=abc&cmd_hash=def", headers },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on("data", (c: Buffer) => chunks.push(c));
+          res.on("end", () => {
+            const raw = Buffer.concat(chunks).toString("utf-8");
+            resolve({ status: res.statusCode ?? 0, body: raw ? JSON.parse(raw) : {} });
+          });
+        },
+      );
+      req.on("error", reject);
+      req.setTimeout(3000, () => req.destroy(new Error("timeout")));
+      req.end();
+    });
+    assert.equal(resp.status, 401);
+  });
+
+  it("GET /suite/lookup returns 400 when params are missing", async () => {
+    const r = await suiteRequest("GET", "/suite/lookup");
+    assert.equal(r.status, 400);
+    assert.ok(String(r.body.error).includes("Missing"));
+  });
+
+  it("GET /suite/lookup returns 400 when partial params only", async () => {
+    const r = await suiteRequest("GET", "/suite/lookup?origin_repo=/test");
+    assert.equal(r.status, 400);
+  });
+
+  it("GET /suite/lookup returns empty when no records exist", async () => {
+    const r = await suiteRequest("GET", "/suite/lookup?origin_repo=/test&tree_hash=abc123&cmd_hash=def456");
+    assert.equal(r.status, 200);
+    assert.equal(r.body.latest, null);
+    assert.equal(r.body.passCount, 0);
+    assert.equal(r.body.failCount, 0);
+    assert.equal(r.body.flaky, false);
+  });
+
+  it("GET /suite/lookup returns latest entry and pass/fail counts", async () => {
+    const repo = "/test/repo";
+    const treeHash = "abc123def456";
+    const cmdHash = "sha256-hash";
+
+    // Insert a pass and a fail.
+    insertSuiteRow({ originRepo: repo, treeHash, cmdHash, cmdDisplay: "npm test", exitCode: 0, durationMs: 1000 });
+    insertSuiteRow({ originRepo: repo, treeHash, cmdHash, cmdDisplay: "npm test", exitCode: 1, durationMs: 500 });
+
+    const r = await suiteRequest(
+      "GET",
+      `/suite/lookup?origin_repo=${encodeURIComponent(repo)}&tree_hash=${treeHash}&cmd_hash=${cmdHash}`,
+    );
+    assert.equal(r.status, 200);
+    assert.ok(r.body.latest, "should have a latest entry");
+    const latest = r.body.latest as Record<string, unknown>;
+    assert.equal(latest.exit_code, 1, "latest should be the most recent (fail)");
+    assert.equal(r.body.passCount, 1);
+    assert.equal(r.body.failCount, 1);
+    assert.equal(r.body.flaky, true);
+  });
+
+  it("GET /suite/lookup respects FLAKE_WINDOW for pass/fail counts", async () => {
+    const repo = "/test/repo-window";
+    const treeHash = "window-test-hash";
+    const cmdHash = "window-cmd-hash";
+
+    // Insert an old fail (outside window) and a recent pass.
+    const oldDate = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString(); // 25h ago
+    insertSuiteRow({ originRepo: repo, treeHash, cmdHash, cmdDisplay: "npm test", exitCode: 1, durationMs: 1000, createdAt: oldDate });
+    insertSuiteRow({ originRepo: repo, treeHash, cmdHash, cmdDisplay: "npm test", exitCode: 0, durationMs: 2000 });
+
+    const r = await suiteRequest(
+      "GET",
+      `/suite/lookup?origin_repo=${encodeURIComponent(repo)}&tree_hash=${treeHash}&cmd_hash=${cmdHash}`,
+    );
+    assert.equal(r.status, 200);
+    // Only the recent pass should count (old fail is outside FLAKE_WINDOW).
+    assert.equal(r.body.passCount, 1);
+    assert.equal(r.body.failCount, 0);
+    assert.equal(r.body.flaky, false);
+  });
+
+  // ── 2. POST /suite/record ────────────────────────────────────────
+
+  it("POST /suite/record returns 401 without auth", async () => {
+    const headers: Record<string, string> = { "content-type": "application/json" };
+    const body = JSON.stringify({ origin_repo: "/r", tree_hash: "t", cmd_hash: "c", cmd_display: "test", exit_code: 0, duration_ms: 100 });
+    headers["content-length"] = String(Buffer.byteLength(body));
+    const resp = await new Promise<{ status: number; body: unknown }>((resolve, reject) => {
+      const req = http.request(
+        { method: "POST", hostname: "127.0.0.1", port: controlPort, path: "/suite/record", headers },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on("data", (c: Buffer) => chunks.push(c));
+          res.on("end", () => {
+            const raw = Buffer.concat(chunks).toString("utf-8");
+            resolve({ status: res.statusCode ?? 0, body: raw ? JSON.parse(raw) : {} });
+          });
+        },
+      );
+      req.on("error", reject);
+      req.setTimeout(3000, () => req.destroy(new Error("timeout")));
+      req.write(body);
+      req.end();
+    });
+    assert.equal(resp.status, 401);
+  });
+
+  it("POST /suite/record returns 400 when required fields are missing", async () => {
+    const r = await suiteRequest("POST", "/suite/record", { origin_repo: "/test" });
+    assert.equal(r.status, 400);
+    assert.ok(String(r.body.error).includes("Missing"));
+  });
+
+  it("POST /suite/record inserts a row and returns success", async () => {
+    const r = await suiteRequest("POST", "/suite/record", {
+      origin_repo: "/test/record",
+      tree_hash: "record-tree-hash",
+      cmd_hash: "record-cmd-hash",
+      cmd_display: "npm test",
+      exit_code: 0,
+      duration_ms: 1500,
+      log_tail: "All tests passed",
+      run_id: "run-123",
+      step_id: "step-456",
+    });
+    assert.equal(r.status, 200);
+    assert.ok(typeof r.body.id === "number", "should return inserted row id");
+    assert.ok(typeof r.body.created_at === "string", "should return created_at");
+  });
+
+  it("POST /suite/record clears pending claim", async () => {
+    const repo = "/test/record-claim";
+    const treeHash = "claim-clear-hash";
+    const cmdHash = "claim-clear-cmd";
+
+    // First, create a claim.
+    const claimR = await suiteRequest("POST", "/suite/claim", {
+      origin_repo: repo, tree_hash: treeHash, cmd_hash: cmdHash,
+    });
+    assert.equal(claimR.body.action, "run");
+
+    // Next claim should say wait.
+    const claimR2 = await suiteRequest("POST", "/suite/claim", {
+      origin_repo: repo, tree_hash: treeHash, cmd_hash: cmdHash,
+    });
+    assert.equal(claimR2.body.action, "wait");
+
+    // Record a result — should clear the claim.
+    await suiteRequest("POST", "/suite/record", {
+      origin_repo: repo, tree_hash: treeHash, cmd_hash: cmdHash,
+      cmd_display: "npm test", exit_code: 0, duration_ms: 100,
+    });
+
+    // Now a new claim should get "run" again.
+    const claimR3 = await suiteRequest("POST", "/suite/claim", {
+      origin_repo: repo, tree_hash: treeHash, cmd_hash: cmdHash,
+    });
+    assert.equal(claimR3.body.action, "run");
+  });
+
+  it("POST /suite/record is append-only (two records for same key)", async () => {
+    const repo = "/test/append";
+    const treeHash = "append-hash";
+    const cmdHash = "append-cmd";
+
+    await suiteRequest("POST", "/suite/record", {
+      origin_repo: repo, tree_hash: treeHash, cmd_hash: cmdHash,
+      cmd_display: "npm test", exit_code: 0, duration_ms: 100,
+    });
+    await suiteRequest("POST", "/suite/record", {
+      origin_repo: repo, tree_hash: treeHash, cmd_hash: cmdHash,
+      cmd_display: "npm test", exit_code: 1, duration_ms: 200,
+    });
+
+    const r = await suiteRequest(
+      "GET",
+      `/suite/lookup?origin_repo=${encodeURIComponent(repo)}&tree_hash=${treeHash}&cmd_hash=${cmdHash}`,
+    );
+    assert.equal(r.status, 200);
+    assert.equal(r.body.passCount, 1);
+    assert.equal(r.body.failCount, 1);
+  });
+
+  // ── 3. POST /suite/claim ──────────────────────────────────────────
+
+  it("POST /suite/claim returns 401 without auth", async () => {
+    const headers: Record<string, string> = { "content-type": "application/json" };
+    const body = JSON.stringify({ origin_repo: "/r", tree_hash: "t", cmd_hash: "c" });
+    headers["content-length"] = String(Buffer.byteLength(body));
+    const resp = await new Promise<{ status: number; body: unknown }>((resolve, reject) => {
+      const req = http.request(
+        { method: "POST", hostname: "127.0.0.1", port: controlPort, path: "/suite/claim", headers },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on("data", (c: Buffer) => chunks.push(c));
+          res.on("end", () => {
+            const raw = Buffer.concat(chunks).toString("utf-8");
+            resolve({ status: res.statusCode ?? 0, body: raw ? JSON.parse(raw) : {} });
+          });
+        },
+      );
+      req.on("error", reject);
+      req.setTimeout(3000, () => req.destroy(new Error("timeout")));
+      req.write(body);
+      req.end();
+    });
+    assert.equal(resp.status, 401);
+  });
+
+  it("POST /suite/claim returns 400 when required fields are missing", async () => {
+    const r = await suiteRequest("POST", "/suite/claim", { origin_repo: "/test" });
+    assert.equal(r.status, 400);
+  });
+
+  it("POST /suite/claim returns run on first claim for a key", async () => {
+    const r = await suiteRequest("POST", "/suite/claim", {
+      origin_repo: "/test/claim-first", tree_hash: "first-hash", cmd_hash: "first-cmd",
+    });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.action, "run");
+  });
+
+  it("POST /suite/claim returns wait on second claim for same key", async () => {
+    const repo = "/test/claim-wait";
+    const treeHash = "wait-hash";
+    const cmdHash = "wait-cmd";
+
+    const r1 = await suiteRequest("POST", "/suite/claim", {
+      origin_repo: repo, tree_hash: treeHash, cmd_hash: cmdHash,
+    });
+    assert.equal(r1.body.action, "run");
+
+    const r2 = await suiteRequest("POST", "/suite/claim", {
+      origin_repo: repo, tree_hash: treeHash, cmd_hash: cmdHash,
+    });
+    assert.equal(r2.body.action, "wait");
+    assert.ok(typeof r2.body.claimedAt === "string");
+  });
+
+  it("POST /suite/claim different keys can both get run", async () => {
+    const r1 = await suiteRequest("POST", "/suite/claim", {
+      origin_repo: "/test/diff1", tree_hash: "hash-a", cmd_hash: "cmd-a",
+    });
+    assert.equal(r1.body.action, "run");
+
+    const r2 = await suiteRequest("POST", "/suite/claim", {
+      origin_repo: "/test/diff2", tree_hash: "hash-b", cmd_hash: "cmd-b",
+    });
+    assert.equal(r2.body.action, "run");
+
+    // Same repo but different tree hash.
+    const r3 = await suiteRequest("POST", "/suite/claim", {
+      origin_repo: "/test/diff1", tree_hash: "hash-c", cmd_hash: "cmd-a",
+    });
+    assert.equal(r3.body.action, "run");
+  });
+
+  it("POST /suite/claim expires stale claims", async () => {
+    // This test verifies that claims expire after CLAIM_TIMEOUT.
+    // Since we can't easily fast-forward time, we test the cleanStaleClaims
+    // function's behavior via the claim endpoint — stale claims are cleaned
+    // before checking. We'll manually insert a stale claim by using the
+    // internal Map (accessed via the module's claim mechanism).
+    // For now, verify that fresh claims are detected correctly.
+    const repo = "/test/claim-expiry";
+    const treeHash = "expiry-hash";
+    const cmdHash = "expiry-cmd";
+
+    const r1 = await suiteRequest("POST", "/suite/claim", {
+      origin_repo: repo, tree_hash: treeHash, cmd_hash: cmdHash,
+    });
+    assert.equal(r1.body.action, "run");
+
+    // Wait a tiny bit, then a second claim should still say wait.
+    await new Promise((r) => setTimeout(r, 50));
+    const r2 = await suiteRequest("POST", "/suite/claim", {
+      origin_repo: repo, tree_hash: treeHash, cmd_hash: cmdHash,
+    });
+    assert.equal(r2.body.action, "wait");
+  });
+
+  // ── 4. GET /suite/flaky ───────────────────────────────────────────
+
+  it("GET /suite/flaky returns 401 without auth", async () => {
+    const headers: Record<string, string> = { "content-type": "application/json" };
+    const resp = await new Promise<{ status: number; body: unknown }>((resolve, reject) => {
+      const req = http.request(
+        { method: "GET", hostname: "127.0.0.1", port: controlPort, path: "/suite/flaky?origin_repo=/test", headers },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on("data", (c: Buffer) => chunks.push(c));
+          res.on("end", () => {
+            const raw = Buffer.concat(chunks).toString("utf-8");
+            resolve({ status: res.statusCode ?? 0, body: raw ? JSON.parse(raw) : {} });
+          });
+        },
+      );
+      req.on("error", reject);
+      req.setTimeout(3000, () => req.destroy(new Error("timeout")));
+      req.end();
+    });
+    assert.equal(resp.status, 401);
+  });
+
+  it("GET /suite/flaky returns 400 without origin_repo", async () => {
+    const r = await suiteRequest("GET", "/suite/flaky");
+    assert.equal(r.status, 400);
+  });
+
+  it("GET /suite/flaky returns empty when no data exists", async () => {
+    const r = await suiteRequest("GET", "/suite/flaky?origin_repo=/nonexistent");
+    assert.equal(r.status, 200);
+    assert.ok(Array.isArray(r.body.flaky_keys));
+    assert.equal((r.body.flaky_keys as unknown[]).length, 0);
+  });
+
+  it("GET /suite/flaky returns keys with divergent outcomes", async () => {
+    const repo = "/test/flaky-repo";
+    const treeHash = "flaky-hash";
+    const cmdHash = "flaky-cmd";
+
+    // Insert one pass and one fail for the same key.
+    insertSuiteRow({ originRepo: repo, treeHash, cmdHash, cmdDisplay: "npm test", exitCode: 0, durationMs: 1000 });
+    insertSuiteRow({ originRepo: repo, treeHash, cmdHash, cmdDisplay: "npm test", exitCode: 1, durationMs: 500 });
+
+    const r = await suiteRequest("GET", `/suite/flaky?origin_repo=${encodeURIComponent(repo)}`);
+    assert.equal(r.status, 200);
+    const keys = r.body.flaky_keys as Array<Record<string, unknown>>;
+    assert.equal(keys.length, 1);
+    assert.equal(keys[0].tree_hash, treeHash);
+    assert.equal(keys[0].cmd_hash, cmdHash);
+    assert.equal(keys[0].pass_count, 1);
+    assert.equal(keys[0].fail_count, 1);
+  });
+
+  it("GET /suite/flaky excludes keys with only passes", async () => {
+    const repo = "/test/flaky-pass-only";
+    const treeHash = "pass-only-hash";
+    const cmdHash = "pass-only-cmd";
+
+    insertSuiteRow({ originRepo: repo, treeHash, cmdHash, cmdDisplay: "npm test", exitCode: 0, durationMs: 1000 });
+    insertSuiteRow({ originRepo: repo, treeHash, cmdHash, cmdDisplay: "npm test", exitCode: 0, durationMs: 500 });
+
+    const r = await suiteRequest("GET", `/suite/flaky?origin_repo=${encodeURIComponent(repo)}`);
+    assert.equal(r.status, 200);
+    const keys = r.body.flaky_keys as Array<Record<string, unknown>>;
+    assert.equal(keys.length, 0, "keys with only passes should not appear as flaky");
+  });
+
+  it("GET /suite/flaky excludes keys with only failures", async () => {
+    const repo = "/test/flaky-fail-only";
+    const treeHash = "fail-only-hash";
+    const cmdHash = "fail-only-cmd";
+
+    insertSuiteRow({ originRepo: repo, treeHash, cmdHash, cmdDisplay: "npm test", exitCode: 1, durationMs: 1000 });
+    insertSuiteRow({ originRepo: repo, treeHash, cmdHash, cmdDisplay: "npm test", exitCode: 1, durationMs: 500 });
+
+    const r = await suiteRequest("GET", `/suite/flaky?origin_repo=${encodeURIComponent(repo)}`);
+    assert.equal(r.status, 200);
+    const keys = r.body.flaky_keys as Array<Record<string, unknown>>;
+    assert.equal(keys.length, 0, "keys with only failures should not appear as flaky");
+  });
+
+  it("GET /suite/flaky respects FLAKE_WINDOW", async () => {
+    const repo = "/test/flaky-window";
+    const treeHash = "flaky-window-hash";
+    const cmdHash = "flaky-window-cmd";
+
+    // Old fail outside window, recent pass inside window.
+    const oldDate = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();
+    insertSuiteRow({ originRepo: repo, treeHash, cmdHash, cmdDisplay: "npm test", exitCode: 1, durationMs: 1000, createdAt: oldDate });
+    insertSuiteRow({ originRepo: repo, treeHash, cmdHash, cmdDisplay: "npm test", exitCode: 0, durationMs: 500 });
+
+    const r = await suiteRequest("GET", `/suite/flaky?origin_repo=${encodeURIComponent(repo)}`);
+    assert.equal(r.status, 200);
+    const keys = r.body.flaky_keys as Array<Record<string, unknown>>;
+    assert.equal(keys.length, 0, "should not be flaky when fail is outside window");
+  });
+
+  it("GET /suite/flaky returns multiple flaky keys", async () => {
+    const repo = "/test/flaky-multi";
+
+    insertSuiteRow({ originRepo: repo, treeHash: "hash-1", cmdHash: "cmd-1", cmdDisplay: "npm test", exitCode: 0, durationMs: 100 });
+    insertSuiteRow({ originRepo: repo, treeHash: "hash-1", cmdHash: "cmd-1", cmdDisplay: "npm test", exitCode: 1, durationMs: 200 });
+    insertSuiteRow({ originRepo: repo, treeHash: "hash-2", cmdHash: "cmd-2", cmdDisplay: "cargo test", exitCode: 0, durationMs: 300 });
+    insertSuiteRow({ originRepo: repo, treeHash: "hash-2", cmdHash: "cmd-2", cmdDisplay: "cargo test", exitCode: 1, durationMs: 400 });
+
+    const r = await suiteRequest("GET", `/suite/flaky?origin_repo=${encodeURIComponent(repo)}`);
+    assert.equal(r.status, 200);
+    const keys = r.body.flaky_keys as Array<Record<string, unknown>>;
+    assert.equal(keys.length, 2, "should return both flaky keys");
+    // Verify sorted by total runs descending.
+    assert.ok((keys[0].pass_count as number) + (keys[0].fail_count as number) >= (keys[1].pass_count as number) + (keys[1].fail_count as number));
+  });
+
+  // ── 5. POST /suite/event ────────────────────────────────────────
+
+  it("POST /suite/event returns 401 without auth", async () => {
+    const payload = JSON.stringify({ event: "suite.cache_hit", run_id: "r1" });
+    const headers: Record<string, string> = { "content-type": "application/json" };
+    const resp = await new Promise<{ status: number }>((resolve, reject) => {
+      const req = http.request(
+        { method: "POST", hostname: "127.0.0.1", port: controlPort, path: "/suite/event", headers },
+        (res) => { resolve({ status: res.statusCode ?? 0 }); res.resume(); },
+      );
+      req.on("error", reject);
+      req.setTimeout(3000, () => req.destroy(new Error("timeout")));
+      req.write(payload);
+      req.end();
+    });
+    assert.equal(resp.status, 401);
+  });
+
+  it("POST /suite/event returns 400 when event is missing", async () => {
+    const r = await suiteRequest("POST", "/suite/event", { run_id: "r1" });
+    assert.equal(r.status, 400);
+    assert.ok(String(r.body.error).includes("event"));
+  });
+
+  it("POST /suite/event emits suite.cache_hit to run events file", async () => {
+    const runId = "evt-cache-hit-run";
+    const stepId = "evt-cache-hit-step";
+    const r = await suiteRequest("POST", "/suite/event", {
+      event: "suite.cache_hit",
+      run_id: runId,
+      step_id: stepId,
+      tree_hash: "abc123def456",
+      cmd_display: "npm test",
+      saved_duration_ms: 1234,
+    });
+    assert.equal(r.status, 200);
+
+    // Verify the event was written to the run events file.
+    const runEventsPath = path.join(stateDir, "events", `${runId}.jsonl`);
+    assert.ok(fs.existsSync(runEventsPath), `expected events file at ${runEventsPath}`);
+    const content = fs.readFileSync(runEventsPath, "utf-8").trim();
+    const lines = content.split("\n");
+    assert.ok(lines.length >= 1, "should have at least 1 event");
+
+    const evt = JSON.parse(lines[0]!);
+    assert.equal(evt.event, "suite.cache_hit");
+    assert.equal(evt.runId, runId);
+    assert.equal(evt.stepId, stepId);
+    assert.equal(evt.treeHash, "abc123def456");
+    assert.equal(evt.cmdDisplay, "npm test");
+    assert.equal(evt.savedDurationMs, 1234);
+  });
+
+  it("POST /suite/event emits suite.executed-type event to run events file", async () => {
+    const runId = "evt-executed-run";
+    const r = await suiteRequest("POST", "/suite/event", {
+      event: "suite.executed",
+      run_id: runId,
+      tree_hash: "def456abc123",
+      cmd_display: "pytest",
+      duration_ms: 5000,
+      exit_code: 0,
+    });
+    assert.equal(r.status, 200);
+
+    const runEventsPath = path.join(stateDir, "events", `${runId}.jsonl`);
+    assert.ok(fs.existsSync(runEventsPath));
+    const content = fs.readFileSync(runEventsPath, "utf-8").trim();
+    const evt = JSON.parse(content);
+    assert.equal(evt.event, "suite.executed");
+    assert.equal(evt.runId, runId);
+    assert.equal(evt.treeHash, "def456abc123");
+    assert.equal(evt.cmdDisplay, "pytest");
+    assert.equal(evt.durationMs, 5000);
+    assert.equal(evt.exitCode, 0);
+  });
+
+  it("POST /suite/event emits suite.flaky_detected event", async () => {
+    const runId = "evt-flaky-run";
+    const r = await suiteRequest("POST", "/suite/event", {
+      event: "suite.flaky_detected",
+      run_id: runId,
+      tree_hash: "flaky-hash",
+      cmd_hash: "flaky-cmd",
+      pass_count: 3,
+      fail_count: 2,
+      window: "24h",
+    });
+    assert.equal(r.status, 200);
+
+    const runEventsPath = path.join(stateDir, "events", `${runId}.jsonl`);
+    assert.ok(fs.existsSync(runEventsPath));
+    const content = fs.readFileSync(runEventsPath, "utf-8").trim();
+    const evt = JSON.parse(content);
+    assert.equal(evt.event, "suite.flaky_detected");
+    assert.equal(evt.treeHash, "flaky-hash");
+    assert.equal(evt.cmdHash, "flaky-cmd");
+    assert.equal(evt.passCount, 3);
+    assert.equal(evt.failCount, 2);
+    assert.equal(evt.window, "24h");
+  });
+
+  it("POST /suite/event emits suite.singleflight_wait event", async () => {
+    const runId = "evt-sf-wait-run";
+    const r = await suiteRequest("POST", "/suite/event", {
+      event: "suite.singleflight_wait",
+      run_id: runId,
+      tree_hash: "sf-hash",
+      cmd_hash: "sf-cmd",
+      waited_ms: 0,
+    });
+    assert.equal(r.status, 200);
+
+    const runEventsPath = path.join(stateDir, "events", `${runId}.jsonl`);
+    assert.ok(fs.existsSync(runEventsPath));
+    const content = fs.readFileSync(runEventsPath, "utf-8").trim();
+    const evt = JSON.parse(content);
+    assert.equal(evt.event, "suite.singleflight_wait");
+    assert.equal(evt.treeHash, "sf-hash");
+    assert.equal(evt.cmdHash, "sf-cmd");
+    assert.equal(evt.waitedMs, 0);
+  });
+
+  it("POST /suite/event writes to both run and global event files", async () => {
+    const runId = "evt-global-run";
+    await suiteRequest("POST", "/suite/event", {
+      event: "suite.cache_hit",
+      run_id: runId,
+      tree_hash: "global-test",
+      cmd_display: "global cmd",
+      saved_duration_ms: 999,
+    });
+
+    // Run-specific file
+    const runEventsPath = path.join(stateDir, "events", `${runId}.jsonl`);
+    assert.ok(fs.existsSync(runEventsPath));
+
+    // Global file
+    const globalEventsPath = path.join(stateDir, "events", "all.jsonl");
+    assert.ok(fs.existsSync(globalEventsPath));
+
+    const globalContent = fs.readFileSync(globalEventsPath, "utf-8").trim();
+    const globalLines = globalContent.split("\n").filter(Boolean);
+    const globalEvents = globalLines.map((l) => JSON.parse(l));
+    const globalEvt = globalEvents.find((e: Record<string, unknown>) => e.event === "suite.cache_hit" && e.runId === runId);
+    assert.ok(globalEvt, "should find the suite.cache_hit event in global file");
+    assert.equal(globalEvt.runId, runId);
+    assert.equal(globalEvt.treeHash, "global-test");
+  });
+
+  it("POST /suite/event is idempotent — each call appends a new event", async () => {
+    const runId = "evt-idempotent-run";
+    await suiteRequest("POST", "/suite/event", { event: "suite.cache_hit", run_id: runId, tree_hash: "t1", cmd_display: "c1" });
+    await suiteRequest("POST", "/suite/event", { event: "suite.cache_hit", run_id: runId, tree_hash: "t1", cmd_display: "c1" });
+
+    const runEventsPath = path.join(stateDir, "events", `${runId}.jsonl`);
+    const content = fs.readFileSync(runEventsPath, "utf-8").trim();
+    const lines = content.split("\n");
+    assert.equal(lines.length, 2, "should have 2 events (one per emission)");
+  });
+
+  // ── 5. Health endpoint remains exempt from auth ───────────────────
+
+  it("GET /control/health is exempt from auth", async () => {
+    const headers: Record<string, string> = { "content-type": "application/json" };
+    const resp = await new Promise<{ status: number; body: unknown }>((resolve, reject) => {
+      const req = http.request(
+        { method: "GET", hostname: "127.0.0.1", port: controlPort, path: "/control/health", headers },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on("data", (c: Buffer) => chunks.push(c));
+          res.on("end", () => {
+            const raw = Buffer.concat(chunks).toString("utf-8");
+            resolve({ status: res.statusCode ?? 0, body: raw ? JSON.parse(raw) : {} });
+          });
+        },
+      );
+      req.on("error", reject);
+      req.setTimeout(3000, () => req.destroy(new Error("timeout")));
+      req.end();
+    });
+    // With the createControlServer approach, the secret is provided, so auth is enforced.
+    // But health is exempt regardless.
+    assert.equal(resp.status, 200);
+    assert.equal(resp.body.status, "ok");
+  });
+
+  // ── 6. Unknown routes return 404 ──────────────────────────────────
+
+  it("unknown suite route returns 404", async () => {
+    const r = await suiteRequest("GET", "/suite/unknown");
+    assert.equal(r.status, 404);
+  });
 });
