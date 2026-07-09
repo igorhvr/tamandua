@@ -166,7 +166,7 @@ function checkPiOnPath(): DoctorCheckResult {
     status: "fail",
     message: "pi not found on PATH",
     remedy:
-      "Install pi: https://github.com/igorhvr/pi or clone and ./install",
+      "Install pi: https://pi.dev or clone and ./install",
   };
 }
 

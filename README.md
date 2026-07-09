@@ -7,10 +7,10 @@
   <img src="https://img.shields.io/badge/node-%3E%3D22-brightgreen.svg" alt="Node.js >= 22">
   <img src="https://img.shields.io/badge/install-from%20source-orange.svg" alt="Install from source (not on npm)">
   <img src="https://img.shields.io/badge/workflows-23%20bundled-8a2be2.svg" alt="23 bundled workflows">
-  <a href="https://igorhvr.github.io/tamandua/"><img src="https://img.shields.io/badge/website-tamandua-1f6feb.svg" alt="Website"></a>
+  <a href="https://tamandua.tetradactyla.org/"><img src="https://img.shields.io/badge/website-tamandua-1f6feb.svg" alt="Website"></a>
 </p>
 
-Build your agent team in [pi](https://github.com/mariozechner/pi-coding-agent) with one command.
+Build your agent team in [pi](https://pi.dev) with one command.
 
 You don't need to hire a dev team. You need to define one. Tamandua gives you a team of specialized AI agents — planner, developer, verifier, tester, reviewer — that work together in reliable, repeatable workflows. One install. Zero infrastructure.
 
@@ -566,7 +566,7 @@ override this with the harness selection flags on `tamandua workflow run`:
 | Flag | Description |
 |------|-------------|
 | `--pi-as-harness` | Use pi as the agent harness. **This is the default.** |
-| `--hermes-as-harness` | Use [Hermes](https://github.com/nicholasgasior/hermes) as the agent harness instead of pi. |
+| `--hermes-as-harness` | Use [Hermes](https://hermes-agent.nousresearch.com) as the agent harness instead of pi. |
 
 These flags are **mutually exclusive** — specifying both is an error.
 
@@ -680,7 +680,7 @@ The remote MCP endpoint exposes 14 tools:
 ## Requirements
 
 - Node.js >= 22
-- [pi](https://github.com/mariozechner/pi-coding-agent) installed on the host
+- [pi](https://pi.dev) installed on the host
   - Tamandua uses pi for AI agent execution. Agents run via `pi --print` in non-interactive mode.
 - `gh` CLI for PR creation steps
 
@@ -694,7 +694,7 @@ The remote MCP endpoint exposes 14 tools:
 
 ## Origins
 
-Tamandua began as a fork of [antfarm](https://github.com/snarktank/antfarm) and pursues the same goal — orchestrating teams of AI agents through deterministic, repeatable workflows — but is built on top of [pi](https://github.com/mariozechner/pi-coding-agent) instead of OpenClaw. Credit to the original authors for the design and inspiration.
+Tamandua began as a fork of [antfarm](https://github.com/snarktank/antfarm) and pursues the same goal — orchestrating teams of AI agents through deterministic, repeatable workflows — but is built on top of [pi](https://pi.dev) instead of OpenClaw. Credit to the original authors for the design and inspiration.
 
 ---
 
