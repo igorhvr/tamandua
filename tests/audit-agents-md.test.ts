@@ -39,7 +39,7 @@ describe('US-001: AGENTS.md audit document', () => {
 
   it('lists all missing artifact types', () => {
     const content = readAudit();
-    const artifacts = ['docs/creating-workflows.md', 'mcp-server.ts', 'cli.ts', 'index.html', 'README'];
+    const artifacts = ['docs/creating-workflows.md', 'mcp-server.ts', 'cli.ts', 'README'];
     for (const artifact of artifacts) {
       assert.ok(
         content.includes(artifact),

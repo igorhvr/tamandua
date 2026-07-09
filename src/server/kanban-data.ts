@@ -194,29 +194,46 @@ function laneStatusFromStepAndCards(
   return "todo";
 }
 
+function normalizeSqliteDate(ts: string): string {
+  // SQLite datetime('now') returns space-separated UTC without timezone.
+  // Normalize to ISO-8601 so JS parses as UTC, not local time.
+  if (!ts) return ts;
+  return /Z$/.test(ts) ? ts : ts.replace(" ", "T") + "Z";
+}
+
+function fmtSqliteDate(raw: string): string {
+  if (!raw) return "";
+  const d = new Date(normalizeSqliteDate(raw));
+  if (isNaN(d.getTime())) return raw;
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${pad(d.getDate())}/${pad(d.getMonth() + 1)} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
 function storyCardSub(story: StoryRow): string {
   if ((story.retry_count ?? 0) > 0) {
+    if ((story.retry_count ?? 0) >= (story.max_retries ?? 4) && story.status === "failed") {
+      return `retries exhausted (${story.retry_count}/${story.max_retries ?? "?"})`;
+    }
     return `retry ${story.retry_count}/${story.max_retries ?? "?"}`;
   }
-  return `updated ${story.updated_at}`;
+  return `updated ${fmtSqliteDate(story.updated_at)}`;
 }
 
 function stepCardSub(step: StepRow): string {
   if ((step.retry_count ?? 0) > 0) {
+    if ((step.retry_count ?? 0) >= (step.max_retries ?? 4) && step.status === "failed") {
+      return `retries exhausted (${step.retry_count}/${step.max_retries ?? "?"})`;
+    }
     return `retry ${step.retry_count}/${step.max_retries ?? "?"}`;
   }
-  return `updated ${step.updated_at}`;
+  return `updated ${fmtSqliteDate(step.updated_at)}`;
 }
 
 // ── Helpers for buildKanbanCardDetail ──────────────────────────────
 
 function parseEventIsoMs(ts: string | undefined): number {
   if (!ts) return 0;
-  // SQLite datetime('now') returns space-separated UTC without timezone.
-  // Normalize to ISO-8601 so JS parses as UTC, not local time.
-  // Matches parseTimestamp logic in kanban.html.
-  const iso = /Z$/.test(ts) ? ts : ts.replace(" ", "T") + "Z";
-  const d = new Date(iso);
+  const d = new Date(normalizeSqliteDate(ts));
   return Number.isFinite(d.getTime()) ? d.getTime() : 0;
 }
 

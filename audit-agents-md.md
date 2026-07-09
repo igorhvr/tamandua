@@ -21,7 +21,7 @@ The **"Skills and Agent Instructions"** section (line 126) currently only tells 
 | **Documentation** | `docs/creating-workflows.md` | User-facing docs must stay consistent with workflow YAML structure and commands |
 | **MCP Server** | `src/server/mcp-server.ts` | MCP tools/responses may need updates when CLI commands or step lifecycle changes |
 | **CLI** | `src/cli/cli.ts` | The CLI entry point may need new commands or modified help text |
-| **Dashboard UI** | `src/server/index.html` | UI changes may be needed when new observability data is exposed |
+| **Dashboard UI** | `frontend/` (Vite + React SPA) | UI changes may be needed when new observability data is exposed |
 | **README** | `README.md` | Project README should reflect current workflow catalog and features |
 
 None of these artifacts are mentioned in the "Skills and Agent Instructions" section (or anywhere else as a review obligation).

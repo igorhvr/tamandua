@@ -778,7 +778,7 @@ When making code changes, review whether these artifacts need updating:
 - `docs/creating-workflows.md` — user-facing workflow documentation
 - `src/server/mcp-server.ts` — MCP tools registered for agent use
 - `src/cli/cli.ts` — CLI commands that agents invoke
-- `src/server/index.html` — dashboard UI
+- `frontend/` — Vite + React SPA (dashboard UI, served by `dashboard.ts` from `frontend/dist/`)
 - `README.md` — project overview
 
 Changes that typically cascade to multiple artifacts:

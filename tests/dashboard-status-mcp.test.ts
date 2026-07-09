@@ -232,7 +232,7 @@ describe("tamandua dashboard status MCP visibility", () => {
   });
 
   // AC 2 & 3: Dashboard HTML shows MCP status section and /api/mcp-status endpoint works
-  it("dashboard HTML shows MCP status section with running/stopped state", async (t) => {
+  it("dashboard HTML is served as React SPA and /api/mcp-status endpoint works", async (t) => {
     const dashboardPort = await reserveRandomPort();
     const controlPort = await reserveRandomPort();
     const tempEnv = createTempEnv();
@@ -247,14 +247,14 @@ describe("tamandua dashboard status MCP visibility", () => {
       const start = await runCliOnce(["dashboard", "start", "--port", String(dashboardPort)], cliEnv);
       assert.equal(start.code, 0, start.stderr || start.stdout);
 
-      // AC 2: Check that index.html contains MCP status section
+      // AC 2: Check that index.html is served as React SPA
       const htmlRes = await fetch(`http://localhost:${dashboardPort}/`);
       assert.equal(htmlRes.status, 200);
       const html = await htmlRes.text();
-      assert.match(html, /MCP Server/);
-      assert.match(html, /mcp-status-content/);
-      assert.match(html, /fetchMcpStatus/);
-      assert.match(html, /fetch\("\/api\/mcp-status"\)/);
+      // React SPA structure
+      assert.match(html, /<div id="root"><\/div>/);
+      assert.match(html, /<script type="module" crossorigin src="\/assets\/index-/);
+      assert.match(html, /<title>Tamandua<\/title>/);
 
       // AC 3: /api/mcp-status returns { running, port, path }
       const apiRes = await fetch(`http://localhost:${dashboardPort}/api/mcp-status`);

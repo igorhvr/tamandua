@@ -19,8 +19,8 @@ async function stopDashboard(server: http.Server): Promise<void> {
   await new Promise<void>((resolve) => server.close(() => resolve()));
 }
 
-describe("kanban poll toggle HTML", () => {
-  it("contains poll toggle checkbox with default checked state", async () => {
+describe("kanban page HTML (React SPA)", () => {
+  it("serves React SPA for kanban route", async () => {
     const { server, baseUrl } = await startDashboard();
 
     try {
@@ -29,20 +29,18 @@ describe("kanban poll toggle HTML", () => {
 
       const html = await response.text();
 
-      // Checkbox element exists with id poll-toggle
-      assert.match(html, /id="poll-toggle"/);
-      // Checkbox is checked by default
-      assert.match(html, /<input[^>]*type="checkbox"[^>]*checked/);
-      // Checkbox is inside footer-right
-      const footerRightStart = html.indexOf('id="footer-right"');
-      const pollToggleStart = html.indexOf('id="poll-toggle"');
-      assert.ok(pollToggleStart > footerRightStart, "poll toggle not inside footer-right");
+      // React SPA root div
+      assert.match(html, /<div id="root"><\/div>/);
+      // Script tag for the built JS
+      assert.match(html, /<script type="module" crossorigin src="\/assets\/index-/);
+      // Title
+      assert.match(html, /<title>Tamandua<\/title>/);
     } finally {
       await stopDashboard(server);
     }
   });
 
-  it("contains poll label span inside footer-right", async () => {
+  it("kanban page includes Inter and JetBrains Mono font links", async () => {
     const { server, baseUrl } = await startDashboard();
 
     try {
@@ -51,16 +49,14 @@ describe("kanban poll toggle HTML", () => {
 
       const html = await response.text();
 
-      // Poll label span exists
-      assert.match(html, /id="poll-label"/);
-      // Default text is "poll 3s"
-      assert.match(html, /poll 3s/);
+      assert.match(html, /Inter:wght@400;500;600;700/);
+      assert.match(html, /JetBrains\+Mono:wght@400;500;600/);
     } finally {
       await stopDashboard(server);
     }
   });
 
-  it("contains setInterval/clearInterval toggle logic", async () => {
+  it("kanban page has viewport meta tag for mobile", async () => {
     const { server, baseUrl } = await startDashboard();
 
     try {
@@ -69,20 +65,14 @@ describe("kanban poll toggle HTML", () => {
 
       const html = await response.text();
 
-      // startPolling function exists and calls setInterval
-      assert.match(html, /function startPolling/);
-      assert.match(html, /pollInterval = setInterval\(tick, REFRESH_MS\)/);
-      // stopPolling function exists and calls clearInterval
-      assert.match(html, /function stopPolling/);
-      assert.match(html, /clearInterval\(pollInterval\)/);
-      // updatePollLabel function exists
-      assert.match(html, /function updatePollLabel/);
+      assert.match(html, /name="viewport"/);
+      assert.match(html, /content="width=device-width, initial-scale=1\.0"/);
     } finally {
       await stopDashboard(server);
     }
   });
 
-  it("REFRESH_MS constant is unchanged at 3000", async () => {
+  it("kanban page has charset meta tag", async () => {
     const { server, baseUrl } = await startDashboard();
 
     try {
@@ -91,71 +81,7 @@ describe("kanban poll toggle HTML", () => {
 
       const html = await response.text();
 
-      assert.match(html, /const REFRESH_MS = 3000;/);
-    } finally {
-      await stopDashboard(server);
-    }
-  });
-
-  it("checkbox change event listener calls startPolling and stopPolling", async () => {
-    const { server, baseUrl } = await startDashboard();
-
-    try {
-      const response = await fetch(`${baseUrl}/runs/test-run-id/kanban`);
-      assert.equal(response.status, 200);
-
-      const html = await response.text();
-
-      // Event listener for checkbox change
-      assert.match(html, /addEventListener\("change"/);
-      // startPolling called when checked
-      assert.match(html, /if \(chk\.checked\)/);
-      assert.match(html, /startPolling\(\)/);
-      // stopPolling called when unchecked
-      assert.match(html, /stopPolling\(\)/);
-    } finally {
-      await stopDashboard(server);
-    }
-  });
-
-  it("footer-right contains poll toggle label structure", async () => {
-    const { server, baseUrl } = await startDashboard();
-
-    try {
-      const response = await fetch(`${baseUrl}/runs/test-run-id/kanban`);
-      assert.equal(response.status, 200);
-
-      const html = await response.text();
-
-      // footer-right span exists
-      assert.match(html, /id="footer-right"/);
-      // Contains a label element wrapping the checkbox and text
-      assert.match(html, /<label>/);
-      // The poll label and checkbox are inside the same footer-right area
-      const footerRightStart = html.indexOf('id="footer-right"');
-      const footerRightEnd = html.indexOf("</footer>", footerRightStart);
-      const footerRightContent = html.slice(footerRightStart, footerRightEnd);
-
-      assert.match(footerRightContent, /id="poll-toggle"/);
-      assert.match(footerRightContent, /id="poll-label"/);
-    } finally {
-      await stopDashboard(server);
-    }
-  });
-
-  it("poll label text updates for paused state", async () => {
-    const { server, baseUrl } = await startDashboard();
-
-    try {
-      const response = await fetch(`${baseUrl}/runs/test-run-id/kanban`);
-      assert.equal(response.status, 200);
-
-      const html = await response.text();
-
-      // updatePollLabel sets "poll paused" when unchecked
-      assert.match(html, /"poll paused"/);
-      // and "poll " + seconds when checked
-      assert.match(html, /"poll " \+ \(REFRESH_MS \/ 1000\) \+ "s"/);
+      assert.match(html, /charset="UTF-8"/);
     } finally {
       await stopDashboard(server);
     }

@@ -38,7 +38,16 @@ tamandua/
 │   ├── cli/
 │   │   ├── cli.ts                # Main CLI entry point
 │   │   ├── ant.ts                # ASCII art easter egg
-│   │   └── ant.test.ts           # Easter egg tests
+│   │   ├── ant.test.ts           # Easter egg tests
+│   │   ├── logs-selector.ts      # Logs selector (CLI + dashboard API)
+│   │   ├── status-format.ts      # Run status formatting
+│   │   ├── update.ts              # Self-update logic
+│   │   ├── wizard-commands.ts    # Wizard command definitions
+│   │   ├── wizard-evaluator.ts   # Wizard step evaluator
+│   │   ├── wizard-orchestrator.ts# Wizard orchestration
+│   │   ├── wizard-prompt.ts      # Wizard prompt builder
+│   │   ├── wizard-types.ts       # Wizard type definitions
+│   │   └── workflow-run-args.ts  # Workflow run argument parsing
 │   ├── installer/
 │   │   ├── install.ts            # Workflow installer
 │   │   ├── uninstall.ts          # Workflow uninstaller
@@ -63,21 +72,34 @@ tamandua/
 │   ├── server/
 │   │   ├── daemon.ts             # Dashboard daemon process (co-manages dashboard + MCP listeners)
 │   │   ├── daemonctl.ts          # Daemon lifecycle control
-│   │   ├── dashboard.ts          # Dashboard HTTP server
+│   │   ├── dashboard.ts          # Dashboard HTTP server (serves React SPA from frontend/dist)
 │   │   ├── control-server.ts     # Daemon control plane (pause/resume/terminate runs)
 │   │   ├── control-client.ts     # Client for the daemon control plane
+│   │   ├── control-standalone.ts # Standalone control plane server (outside daemon)
 │   │   ├── kanban-data.ts        # Kanban snapshot/card-detail builders
 │   │   ├── mcp-server.ts         # Remote MCP HTTP server bootstrap (streamable transport)
-│   │   ├── index.html            # Dashboard UI
-│   │   └── kanban.html           # Kanban board UI (per-run)
+│   │   └── mcp-standalone.ts     # Standalone MCP server (outside daemon)
 │   ├── medic/
 │   │   ├── medic.ts              # Health check orchestration
 │   │   ├── checks.ts             # Individual health checks
 │   │   └── medic-cron.ts         # Cron setup for medic
 │   └── lib/
+│       ├── frontend-detect.ts    # Frontend file detection
 │       ├── logger.ts             # File logging
-│       ├── logger.test.ts        # Logger tests
-│       └── frontend-detect.ts    # Frontend file detection
+│       ├── version.ts            # Version info
+│       └── version-check.ts      # Version update checking
+├── frontend/                     # Vite + React SPA (dashboard UI)
+│   ├── src/
+│   │   ├── App.tsx               # Main app component
+│   │   ├── main.tsx              # Entry point
+│   │   ├── api/client.ts         # API client
+│   │   ├── components/           # Shared React components
+│   │   ├── pages/Dashboard.tsx   # Dashboard page
+│   │   ├── pages/Kanban.tsx      # Kanban board page (per-run)
+│   │   └── theme.ts              # MUI theme
+│   ├── index.html                # Vite entry HTML
+│   ├── vite.config.ts            # Vite config (proxies /api to dashboard)
+│   └── dist/                     # Built output (served by dashboard.ts)
 ├── workflows/                    # Bundled workflow definitions (worktree variants symlink agent dirs)
 ├── agents/shared/                # Shared agent personas (setup, pr, verifier — symlinked into workflows)
 ├── skills/                       # Bundled skills
@@ -219,8 +241,7 @@ When making changes, review whether these artifacts need updating:
 - `skills/tamandua-agents/SKILL.md` — provisioned to agents as AGENTS.md/IDENTITY.md/SOUL.md
 - `src/server/mcp-server.ts` — MCP tools registered for agent use
 - `src/cli/cli.ts` — CLI commands that agents invoke, and per-command help functions (`get<Thing>Help()`)
-- `src/server/index.html` — dashboard UI
-- `src/server/kanban.html` — kanban board UI
+- `frontend/` — Vite + React SPA (dashboard UI, served by `dashboard.ts` from `frontend/dist/`)
 - `README.md` — project overview
 
 Output format contract: agent output is classified by exact STATUS markers

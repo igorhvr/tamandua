@@ -171,7 +171,6 @@ describe("www/styles.css", () => {
   });
 
   it("CTA button uses accent orange (#f0883e)", () => {
-    // Accepts the flat accent color or the accent gradient (built from #f0883e).
     assert.ok(
       /\.cta-button[^}]*background[^}]*var\(--color-accent\)/.test(css) ||
       /\.cta-button[^}]*background-color[^}]*var\(--color-accent\)/.test(css) ||
@@ -242,59 +241,70 @@ describe("www/styles.css", () => {
     );
   });
 
-  it("feature icons use .feature-icon class with styling", () => {
+  // ── Why cards with SVG icons ─────────────────────────────────────
+
+  it("why cards use .why-card class with styling", () => {
     assert.ok(
-      /\.feature-icon/.test(css),
-      "should have .feature-icon styling"
+      /\.why-card/.test(css),
+      "should have .why-card styling"
     );
   });
 
-  it("feature cards have hover elevation transition", () => {
+  it("why cards have hover elevation transition", () => {
     assert.ok(
-      /#features\s+article:hover/.test(css),
-      "feature cards should have hover state"
+      /\.why-card:hover/.test(css),
+      "why cards should have hover state"
     );
   });
 
-  it("feature cards use 2x2 responsive grid on desktop", () => {
+  it("why cards use 2x2 responsive grid on desktop", () => {
     assert.ok(
       /repeat\(2,\s*1fr\)/.test(css),
       "should use 2-column grid on desktop"
     );
   });
 
-  it("architecture flow uses flex layout", () => {
+  it("why card icons use .why-card-icon class", () => {
     assert.ok(
-      /\.architecture-flow[^}]*display\s*:\s*flex/.test(css),
-      "architecture flow should use flex"
+      /\.why-card-icon/.test(css),
+      "should have .why-card-icon styling"
     );
   });
 
-  it("arch-steps have surface background with border", () => {
+  // ── Pipeline Flow ────────────────────────────────────────────────
+
+  it("pipeline flow uses flex layout", () => {
     assert.ok(
-      /\.arch-step[^}]*background[^}]*var\(--color-surface\)/.test(css),
-      "arch steps should use surface background"
+      /\.pipeline-flow[^}]*display\s*:\s*flex/.test(css),
+      "pipeline flow should use flex"
     );
   });
 
-  it("arch-number uses circular badge with accent color", () => {
+  it("pipeline-steps have surface background with border", () => {
     assert.ok(
-      /\.arch-number[^}]*border-radius\s*:\s*50%/.test(css),
-      "arch number badge should be circular"
+      /\.pipeline-step[^}]*background[^}]*var\(--color-surface\)/.test(css),
+      "pipeline steps should use surface background"
     );
   });
 
-  it("arch-arrows use accent color opacity", () => {
+  it("pipeline-number uses circular badge with accent color", () => {
     assert.ok(
-      /\.arch-arrow[^}]*color\s*:\s*var\(--color-accent\)/.test(css),
-      "arch arrows should use accent color"
+      /\.pipeline-number[^}]*border-radius\s*:\s*50%/.test(css),
+      "pipeline number badge should be circular"
     );
   });
 
-  it("architecture flow switches to horizontal on desktop", () => {
+  it("pipeline-connectors use accent color opacity", () => {
+    assert.ok(
+      /\.pipeline-connector[^}]*color\s*:\s*var\(--color-accent\)/.test(css),
+      "pipeline connectors should use accent color"
+    );
+  });
+
+  it("pipeline flow switches to horizontal on desktop", () => {
     assert.ok(
       /flex-direction\s*:\s*row/.test(css),
-      "architecture should go horizontal on desktop"
+      "pipeline should go horizontal on desktop"
     );
   });
 
@@ -320,7 +330,6 @@ describe("www/styles.css", () => {
   });
 
   it("code blocks use monospace font with dark background", () => {
-    // The dark surface may be layered under decorative gradients.
     assert.ok(
       /pre[^}]*background\s*:[^};]*var\(--color-surface\)/.test(css),
       "code blocks should have dark surface background"
@@ -355,55 +364,6 @@ describe("www/styles.css", () => {
     );
   });
 
-  it("why-list uses custom counter numbering", () => {
-    assert.ok(
-      /counter-reset\s*:\s*why-counter/.test(css) || /counter-increment\s*:\s*why-counter/.test(css),
-      "why-list should use CSS counter"
-    );
-  });
-
-  it("why-list items have left-border accents", () => {
-    assert.ok(
-      /\.why-list\s+li[^}]*border-left/.test(css),
-      "why-list items should have left border"
-    );
-  });
-
-  it("why-list items have colored left borders", () => {
-    assert.ok(
-      /\.why-list\s+li:nth-child\([1-4]\)[^}]*border-left-color/.test(css),
-      "why-list items should have colored borders"
-    );
-  });
-
-  it("why-list items have numbered badges via ::before", () => {
-    assert.ok(
-      /\.why-list\s+li::before/.test(css),
-      "why-list should have ::before badges"
-    );
-  });
-
-  it("why-list title text is bold and prominent", () => {
-    assert.ok(
-      /\.why-list\s+li\s+strong/.test(css),
-      "why-list titles should be styled"
-    );
-  });
-
-  it("yaml-code block has left accent border", () => {
-    assert.ok(
-      /pre\.yaml-code[^}]*border-left/.test(css),
-      "yaml-code should have left accent border"
-    );
-  });
-
-  it("yaml-code has decorative YAML badge via ::before", () => {
-    assert.ok(
-      /pre\.yaml-code::before[^}]*content\s*:\s*"YAML"/.test(css),
-      "yaml-code should have 'YAML' badge via ::before"
-    );
-  });
-
   it("footer has dark background with gradient", () => {
     assert.ok(
       /footer[^}]*background[^}]*gradient/.test(css) || /footer[^}]*radial-gradient/.test(css),
@@ -425,7 +385,7 @@ describe("www/styles.css", () => {
     );
   });
 
-  it("footer logo uses tamandua emoji with subdued opacity", () => {
+  it("footer logo has styling", () => {
     assert.ok(
       /\.footer-logo/.test(css),
       "footer logo should have styling"
@@ -557,34 +517,20 @@ describe("www/styles.css", () => {
     );
   });
 
-  it("feature cards are 1 column by default (mobile-first)", () => {
-    const featuresBlock = css.match(/#features\s*\{[^}]*\}/s)?.[0] || "";
+  it("why cards are 1 column by default (mobile-first)", () => {
+    const whyGridBlock = css.match(/\.why-grid\s*\{[^}]*\}/s)?.[0] || "";
     assert.ok(
-      /grid-template-columns\s*:\s*1fr/.test(featuresBlock),
-      "features should default to 1 column (1fr) mobile-first"
+      /grid-template-columns\s*:\s*1fr/.test(whyGridBlock),
+      "why-grid should default to 1 column (1fr) mobile-first"
     );
   });
 
-  it("feature cards switch to 2 columns at 768px breakpoint", () => {
-    const tabletFeaturesMatch = css.match(/@media\s*\(min-width\s*:\s*768px\)[\s\S]*?#features\s*\{[\s\S]*?repeat\(2,\s*1fr\)[\s\S]*?\n\s*\}/);
+  it("why cards switch to 2 columns at 768px breakpoint", () => {
+    const tabletMatch = css.match(/@media\s*\(min-width\s*:\s*768px\)[\s\S]*?\.why-grid\s*\{[\s\S]*?repeat\(2,\s*1fr\)[\s\S]*?\n\s*\}/);
     assert.ok(
-      tabletFeaturesMatch !== null ||
+      tabletMatch !== null ||
         css.includes("repeat(2, 1fr)"),
-      "features should be 2 columns at 768px"
-    );
-  });
-
-  it("feature cards switch to 4 columns at 1024px breakpoint", () => {
-    assert.ok(
-      /@media\s*\(min-width\s*:\s*1024px\)/.test(css),
-      "should have a 1024px breakpoint"
-    );
-    const mediaBlocks = css.match(/@media[\s\S]*?\n\}/g) || [];
-    const desktopBlock = mediaBlocks.find(b => /min-width\s*:\s*1024px/.test(b)) || "";
-    assert.ok(
-      /#features\s*\{[^}]*grid-template-columns\s*:\s*repeat\(4,\s*1fr\)/.test(desktopBlock) ||
-        /#features[\s\S]*?repeat\(4,\s*1fr\)/.test(desktopBlock),
-      "features should be 4 columns at 1024px breakpoint"
+      "why-grid should be 2 columns at 768px"
     );
   });
 
@@ -609,7 +555,7 @@ describe("www/styles.css", () => {
     );
   });
 
-  // ── US-010: Focus Indicators ─────────────────────────────────────────
+  // ── Focus Indicators ─────────────────────────────────────────────
 
   it("has global :focus-visible outline style", () => {
     assert.ok(
@@ -640,7 +586,7 @@ describe("www/styles.css", () => {
     );
   });
 
-  // ── US-010: aria-current Support ─────────────────────────────────────
+  // ── aria-current Support ─────────────────────────────────────────
 
   it("active nav link also matches [aria-current='page']", () => {
     assert.ok(
@@ -649,7 +595,7 @@ describe("www/styles.css", () => {
     );
   });
 
-  // ── US-010: Improved Print Styles ────────────────────────────────────
+  // ── Improved Print Styles ────────────────────────────────────────
 
   it("print styles hide CTA button", () => {
     const printBlock = css.match(/@media\s+print\s*\{[\s\S]*?\n\}/)?.[0] || "";

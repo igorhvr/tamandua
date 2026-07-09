@@ -19,6 +19,9 @@
   <link rel="icon" type="image/png" sizes="32x32" href="assets/favicon-32x32.png">
   <link rel="icon" type="image/png" sizes="16x16" href="assets/favicon-16x16.png">
   <link rel="apple-touch-icon" sizes="180x180" href="assets/apple-touch-icon.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="styles.css">
   <script type="application/ld+json">
   {
@@ -43,87 +46,162 @@
 
   <header>
     <nav aria-label="Main navigation">
-      <a href="#" class="logo" aria-label="Tamandua home"><img src="assets/tamandua.png" alt="Tamandua logo" width="32" height="32"> Tamandua</a>
+      <a href="#" class="logo" aria-label="Tamandua home">
+        <svg class="logo-mark" width="28" height="28" viewBox="0 0 28 28" fill="none" aria-hidden="true">
+          <path d="M14 2C7.373 2 2 7.373 2 14s5.373 12 12 12 12-5.373 12-12S20.627 2 14 2z" fill="none" stroke="currentColor" stroke-width="1.5"/>
+          <path d="M8 16c0-3.314 2.686-6 6-6s6 2.686 6 6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          <path d="M10 16.5c0-2.21 1.79-4 4-4s4 1.79 4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          <path d="M12 17c0-1.105.895-2 2-2s2 .895 2 2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          <path d="M6 10l3-1M22 10l-3-1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+        </svg>
+        Tamandua
+      </a>
       <input type="checkbox" id="nav-toggle" class="nav-toggle" aria-hidden="true">
       <label for="nav-toggle" class="nav-toggle-label" aria-label="Toggle navigation menu">
         <span class="nav-hamburger"></span>
       </label>
       <ul id="nav-links">
-        <li><a href="#features">Features</a></li>
+        <li><a href="#why">Why Tamandua</a></li>
+        <li><a href="#how-it-works">How It Works</a></li>
         <li><a href="#workflows">Workflows</a></li>
         <li><a href="#install">Install</a></li>
-        <li><a href="#why-it-works">Why It Works</a></li>
-        <li><a href="#how-it-works">How It Works</a></li>
-        <li><a href="#dashboard">Dashboard &amp; Kanban</a></li>
+        <li><a href="#dashboard">Dashboard</a></li>
         <li><a href="#autoresearch">AutoResearch</a></li>
-        <li><a href="#build-your-own">Build Your Own</a></li>
-        <li><a href="#skills-and-mcp">Usable by Agents</a></li>
+        <li><a href="#build">Build Your Own</a></li>
       </ul>
     </nav>
   </header>
 
   <main id="main-content">
 
-    <!-- Hero -->
+    <!-- ── Hero ────────────────────────────────────────────────────── -->
     <section id="hero" aria-labelledby="hero-heading">
       <div class="hero-content">
-        <h1 id="hero-heading">Build your agent team in pi with one command.</h1>
-        <p class="hero-tagline">You don't need to hire a dev team. You need to define one. Tamandua gives you a team of specialized AI agents — planner, developer, verifier, tester, reviewer — that work together in reliable, repeatable workflows. One install. Zero infrastructure.</p>
-        <div class="hero-install">
-          <pre><code>curl -fsSL https://raw.githubusercontent.com/igorhvr/tamandua/main/scripts/install.sh | bash</code></pre>
+        <h1 id="hero-heading">
+          Build your agent team<br>
+          <span class="hero-highlight">in pi with one command.</span>
+        </h1>
+        <p class="hero-tagline">You don't need to hire a dev team. You need to define one. Tamandua gives you a team of specialized AI agents that work together in reliable, repeatable workflows. One install. Zero infrastructure.</p>
+
+        <div class="hero-terminal">
+          <div class="terminal-titlebar" aria-hidden="true">
+            <span class="terminal-dot terminal-dot-red"></span>
+            <span class="terminal-dot terminal-dot-yellow"></span>
+            <span class="terminal-dot terminal-dot-green"></span>
+            <span class="terminal-title">~ — zsh</span>
+          </div>
+          <div class="terminal-body">
+            <span class="line"><span class="tok-prompt">$</span> <span class="tok-flag">curl -fsSL</span> https://raw.githubusercontent.com/igorhvr/tamandua/main/scripts/install.sh <span class="tok-prompt">|</span> bash</span>
+            <span class="line tok-output">✓ Installed tamandua</span>
+            <span class="line"><span class="tok-prompt">$</span> tamandua workflow install feature-dev</span>
+            <span class="line tok-output">✓ Installed workflow: feature-dev</span>
+            <span class="line"><span class="tok-prompt">$</span> tamandua workflow run feature-dev <span class="tok-str">"Add user auth"</span></span>
+            <span class="line tok-output">Run: a1fdf573 &nbsp; Status: running</span>
+            <span class="line tok-output">  <span class="tok-done">[done]</span> plan</span>
+            <span class="line tok-output">  <span class="tok-done">[done]</span> setup</span>
+            <span class="line tok-output">  <span class="tok-run">[running]</span> implement</span>
+            <span class="line tok-output">  <span class="tok-pend">[pending]</span> verify</span>
+            <span class="line tok-output">  <span class="tok-pend">[pending]</span> test</span>
+            <span class="terminal-cursor" aria-hidden="true"></span>
+          </div>
         </div>
-        <p class="hero-or">Or just tell your pi agent: <strong>“Clone github.com/igorhvr/tamandua to my home dir, install it and learn the skill included inside it.”</strong></p>
+
+        <p class="hero-or">Or just tell your pi agent: <strong>"Clone github.com/igorhvr/tamandua to my home dir, install it and learn the skill included inside it."</strong></p>
+
         <a href="#install" class="cta-button">Get Started</a>
       </div>
+
       <div class="hero-screenshot">
         <img src="assets/dashboard-hero.png" alt="Tamandua dashboard with live workflow runs, step progress, and token usage" width="1440" height="900" fetchpriority="high">
       </div>
     </section>
 
-    <!-- Features -->
-    <section id="features" class="section-reveal" aria-labelledby="features-heading">
-      <h2 id="features-heading">Features</h2>
+    <!-- ── Why Tamandua ───────────────────────────────────────────── -->
+    <section id="why" class="section-reveal" aria-labelledby="why-heading">
+      <div class="section-label">Why Tamandua</div>
+      <h2 id="why-heading">Deterministic workflows.<br>Agents that verify each other.</h2>
 
-      <article>
-        <span class="feature-icon" aria-hidden="true">📋</span>
-        <h3>Deterministic Workflows</h3>
-        <p>Same workflow, same steps, same order. Not "hopefully the agent remembers to test."</p>
-      </article>
+      <div class="why-grid">
+        <article class="why-card">
+          <div class="why-card-icon" aria-hidden="true">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+          </div>
+          <h3>Deterministic by design</h3>
+          <p>Same workflow, same steps, same order. Not "hopefully the agent remembers to test." Every run follows the exact pipeline you defined.</p>
+        </article>
 
-      <article>
-        <span class="feature-icon" aria-hidden="true">✅</span>
-        <h3>Agents Verify Each Other</h3>
-        <p>The developer doesn't mark their own homework. A separate verifier checks every story against acceptance criteria.</p>
-      </article>
+        <article class="why-card">
+          <div class="why-card-icon" aria-hidden="true">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 12l2 2 4-4"/><path d="M12 2a10 10 0 1 0 10 10"/></svg>
+          </div>
+          <h3>Agents verify each other</h3>
+          <p>The developer doesn't mark their own homework. A separate verifier checks every story against acceptance criteria before the next step begins.</p>
+        </article>
 
-      <article>
-        <span class="feature-icon" aria-hidden="true">🧹</span>
-        <h3>Fresh Context, Every Step</h3>
-        <p>Each agent gets a clean session. No context window bloat. No hallucinated state from 50 messages ago.</p>
-      </article>
+        <article class="why-card">
+          <div class="why-card-icon" aria-hidden="true">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v20M2 12h20"/><path d="M5 5l14 14"/></svg>
+          </div>
+          <h3>Fresh context, every step</h3>
+          <p>Each agent gets a clean session. No context window bloat. No hallucinated state from 50 messages ago. Just the prompt and the task.</p>
+        </article>
 
-      <article>
-        <span class="feature-icon" aria-hidden="true">🔄</span>
-        <h3>Retry and Reroute</h3>
-        <p>Failed steps retry automatically. Steps can reroute back to upstream producers for correction via <code>on_fail.retry_step</code> (bounded by a <code>max_reroutes</code> budget, default 2). When the budget exhausts, the run fails permanently. Nothing fails silently.</p>
-      </article>
-
-      <article>
-        <span class="feature-icon" aria-hidden="true">⚡</span>
-        <h3>Zero Tokens When Idle</h3>
-        <p>Checking for work is a database peek, not a model call. Agents spawn only when a step is ready, and completion nudges make step-to-step latency near zero.</p>
-      </article>
+        <article class="why-card">
+          <div class="why-card-icon" aria-hidden="true">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M16 8h-6a2 2 0 1 0 0 4h4a2 2 0 1 1 0 4H8"/><path d="M12 18V6"/></svg>
+          </div>
+          <h3>Retry and escalate</h3>
+          <p>Failed steps retry automatically. If retries exhaust, it escalates to you. Nothing fails silently. No lost work, no ghost runs.</p>
+        </article>
+      </div>
     </section>
 
-    <!-- Workflow Families -->
+    <!-- ── How It Works ───────────────────────────────────────────── -->
+    <section id="how-it-works" class="section-reveal" aria-labelledby="how-heading">
+      <div class="section-label">How It Works</div>
+      <h2 id="how-heading">Define. Install. Run.</h2>
+      <p class="section-lede">Three commands. No Docker. No queues. No external services.</p>
+
+      <div class="pipeline-flow" aria-label="Pipeline flow: Define, Install, Run">
+        <div class="pipeline-step">
+          <span class="pipeline-number" aria-hidden="true">1</span>
+          <h3>Define</h3>
+          <p>Agents and steps in YAML. Each agent gets a persona, workspace, and strict acceptance criteria. No ambiguity about who does what.</p>
+        </div>
+        <div class="pipeline-connector" aria-hidden="true">
+          <svg width="40" height="24" viewBox="0 0 40 24" fill="none"><path d="M2 12h34M28 4l8 8-8 8" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </div>
+        <div class="pipeline-step">
+          <span class="pipeline-number" aria-hidden="true">2</span>
+          <h3>Install</h3>
+          <p>One command provisions everything: agent workspaces, polling, subagent permissions. No Docker, no queues, no external services.</p>
+        </div>
+        <div class="pipeline-connector" aria-hidden="true">
+          <svg width="40" height="24" viewBox="0 0 40 24" fill="none"><path d="M2 12h34M28 4l8 8-8 8" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </div>
+        <div class="pipeline-step">
+          <span class="pipeline-number" aria-hidden="true">3</span>
+          <h3>Run</h3>
+          <p>Agents poll for work independently. Claim a step, do the work, pass context to the next agent. SQLite tracks state. The scheduler keeps it moving.</p>
+        </div>
+      </div>
+
+      <div class="how-architecture">
+        <h3>Minimal by Design</h3>
+        <p>YAML + SQLite + polling. That's it. No Redis, no Kafka, no container orchestrator. Tamandua is a TypeScript CLI with zero external dependencies. It runs wherever pi runs.</p>
+      </div>
+    </section>
+
+    <!-- ── Workflows ──────────────────────────────────────────────── -->
     <section id="workflows" class="section-reveal" aria-labelledby="workflows-heading">
-      <h2 id="workflows-heading">Bundled Workflows</h2>
+      <div class="section-label">Bundled Workflows</div>
+      <h2 id="workflows-heading">23 workflows, six families</h2>
       <p>Tamandua ships with 23 bundled workflows organized into six families. Use <code>tamandua workflow list</code> to see available workflows, and <code>tamandua workflow install &lt;id&gt;</code> to install one.</p>
 
       <p>Worktree variants (<code>*-worktree</code>, <code>*-merge-worktree</code>) run in a detached git worktree created from your origin repository. Your main working copy stays untouched until the workflow completes. This gives you full isolation — continue working while agents iterate — and a clean abort path: delete the worktree and nothing in your origin repo has changed.</p>
 
       <h3>Rugpull Handling</h3>
-      <p>When a merge workflow (<code>-merge</code>, <code>-merge-worktree</code>) fails at the <code>finalize_merge</code> step and the base branch tip has moved since the run started, Tamandua automatically launches a fresh replacement run with the same parameters. This &quot;rugpull&quot; detection runs after the final merge failure &mdash; if the base branch stayed put, no replacement is triggered. Pass <code>--no-relaunch-upon-rugpull</code> to <code>workflow run</code> to suppress the automatic replacement.</p>
+      <p>When a merge workflow (<code>-merge</code>, <code>-merge-worktree</code>) fails at the <code>finalize_merge</code> step and the base branch tip has moved since the run started, Tamandua automatically launches a fresh replacement run with the same parameters. This "rugpull" detection runs after the final merge failure — if the base branch stayed put, no replacement is triggered. Pass <code>--no-relaunch-upon-rugpull</code> to <code>workflow run</code> to suppress the automatic replacement.</p>
 
       <h3>Feature Development</h3>
       <p>Story-based feature development. The planner decomposes your task into ordered user stories. Each story goes through implement → verify → test before the next one starts.</p>
@@ -375,9 +453,10 @@
       <pre><code>$ tamandua workflow install --all</code></pre>
     </section>
 
-    <!-- Installation -->
+    <!-- ── Install ────────────────────────────────────────────────── -->
     <section id="install" class="section-reveal" aria-labelledby="install-heading">
-      <h2 id="install-heading">Installation</h2>
+      <div class="section-label">Installation</div>
+      <h2 id="install-heading">One command. Zero config.</h2>
 
       <div class="install-grid">
         <div class="install-column">
@@ -409,95 +488,10 @@ cd tamandua
       </div>
     </section>
 
-    <!-- Why It Works -->
-    <section id="why-it-works" class="section-reveal" aria-labelledby="why-heading">
-      <h2 id="why-heading">Why It Works</h2>
-
-      <ol class="why-list">
-        <li>
-          <strong>Deterministic workflows</strong>
-          <p>Same workflow, same steps, same order. Not "hopefully the agent remembers to test."</p>
-        </li>
-        <li>
-          <strong>Agents verify each other</strong>
-          <p>The developer doesn't mark their own homework. A separate verifier checks every story against acceptance criteria.</p>
-        </li>
-        <li>
-          <strong>Fresh context, every step</strong>
-          <p>Each agent gets a clean session. No context window bloat. No hallucinated state from 50 messages ago.</p>
-        </li>
-        <li>
-          <strong>Retry and reroute</strong>
-          <p>Failed steps retry automatically. Steps can reroute back to upstream producers for correction via <code>on_fail.retry_step</code> (bounded by a <code>max_reroutes</code> budget, default 2). When the budget exhausts, the run fails permanently. Nothing fails silently.</p>
-        </li>
-        <li>
-          <strong>Zero tokens when idle</strong>
-          <p>Checking for work is a database peek, not a model call — agents spawn only when a step is ready. Idle runs cost zero tokens.</p>
-        </li>
-      </ol>
-    </section>
-
-    <!-- How It Works -->
-    <section id="how-it-works" class="section-reveal" aria-labelledby="how-heading">
-      <h2 id="how-heading">How It Works</h2>
-
-      <div class="architecture-flow" aria-label="Architecture flow: Define, Install, Run">
-        <div class="arch-step">
-          <span class="arch-number">1</span>
-          <strong>Define</strong>
-          <p>Agents and steps in YAML. Each agent gets a persona, workspace, and strict acceptance criteria. No ambiguity about who does what.</p>
-        </div>
-        <div class="arch-arrow" aria-hidden="true">→</div>
-        <div class="arch-step">
-          <span class="arch-number">2</span>
-          <strong>Install</strong>
-          <p>One command provisions everything: agent workspaces, scheduling, subagent permissions. No Docker, no queues, no external services.</p>
-        </div>
-        <div class="arch-arrow" aria-hidden="true">→</div>
-        <div class="arch-step">
-          <span class="arch-number">3</span>
-          <strong>Run</strong>
-          <p>The scheduler checks for work deterministically — a database peek, not a model call — and spawns an agent the moment a step is ready. Claim, work, pass context to the next agent. SQLite tracks state.</p>
-        </div>
-      </div>
-
-      <h3>Minimal by Design</h3>
-      <p>YAML + SQLite + deterministic dispatch. That's it. No Redis, no Kafka, no container orchestrator. Tamandua is a TypeScript CLI with zero external dependencies. It runs wherever pi runs. And because checking for work never invokes a model, <strong>idle runs cost zero tokens</strong> — you pay for the work your agents do, not for the waiting.</p>
-
-      <h3>Quick Example</h3>
-      <div class="terminal-window" data-terminal-animate>
-        <div class="terminal-titlebar" aria-hidden="true">
-          <span class="terminal-dot terminal-dot-red"></span>
-          <span class="terminal-dot terminal-dot-yellow"></span>
-          <span class="terminal-dot terminal-dot-green"></span>
-          <span class="terminal-title">tamandua — zsh</span>
-        </div>
-      <pre><code>$ tamandua workflow install feature-dev
-
-# Or install all bundled workflows at once
-$ tamandua workflow install --all
-✓ Installed workflow: feature-dev
-
-$ tamandua workflow run feature-dev "Add user authentication with OAuth"
-Run: a1fdf573
-Workflow: feature-dev
-Status: running
-
-$ tamandua workflow status "OAuth"
-Run: a1fdf573
-Workflow: feature-dev
-Steps:
-  [done   ] plan (planner)
-  [done   ] setup (setup)
-  [running] implement (developer)  Stories: 3/7 done
-  [pending] verify (verifier)
-  [pending] test (tester)</code></pre>
-      </div>
-    </section>
-
-    <!-- Dashboard -->
+    <!-- ── Dashboard & MCP ────────────────────────────────────────── -->
     <section id="dashboard" class="section-reveal" aria-labelledby="dashboard-heading">
-      <h2 id="dashboard-heading">Dashboard &amp; Kanban</h2>
+      <div class="section-label">Dashboard &amp; MCP</div>
+      <h2 id="dashboard-heading">See everything. Control everything.</h2>
       <p>When you start the management dashboard (<code>tamandua dashboard</code>), Tamandua automatically starts the remote MCP server too.</p>
       <ul>
         <li>Dashboard: <code>http://localhost:3334</code></li>
@@ -516,11 +510,120 @@ Steps:
         <img src="assets/dashboard-kanban.png" alt="Tamandua kanban board showing swim-lane workflow step cards colour-coded by status" width="1440" height="900" loading="lazy">
         <figcaption>Kanban swim-lane view — one card per step or story, colour-coded by status: todo, running, done, failed.</figcaption>
       </figure>
+
+      <div class="mcp-section">
+        <h3>Remote MCP Tools</h3>
+        <p>The remote MCP endpoint exposes 14 tools at <code>http://localhost:3338/mcp</code> so agents can query runs, start workflows, and check status autonomously.</p>
+
+        <h4>Run Management</h4>
+        <div class="table-wrapper" aria-label="Run Management MCP tools — horizontally scrollable" tabindex="0">
+        <table>
+          <caption>Run Management MCP tools</caption>
+          <thead>
+            <tr>
+              <th scope="col">Tool</th>
+              <th scope="col">Description</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>tamandua.runs.list</code></td>
+              <td>List recent Tamandua workflow runs. Accepts optional <code>limit</code> (integer, 1–200, default 50).</td>
+            </tr>
+            <tr>
+              <td><code>tamandua.run.status</code></td>
+              <td>Fetch detailed status for a run. Requires <code>query</code> (run id, prefix, or task substring).</td>
+            </tr>
+            <tr>
+              <td><code>tamandua.run.start</code></td>
+              <td>Start a workflow run. Requires <code>workflowId</code> and <code>taskTitle</code>.</td>
+            </tr>
+            <tr>
+              <td><code>tamandua.run.pause</code></td>
+              <td>Pause a running workflow run. Requires <code>runId</code>. Optional <code>drain</code> (boolean) to wait for in-flight work before pausing.</td>
+            </tr>
+            <tr>
+              <td><code>tamandua.run.resume</code></td>
+              <td>Resume a paused workflow run. Requires <code>runId</code>.</td>
+            </tr>
+            <tr>
+              <td><code>tamandua.run.delete</code></td>
+              <td>Permanently delete a workflow run and associated steps, stories, and worktree metadata. Requires <code>runId</code>. Optional <code>force</code> (boolean) cancels and deletes running or paused runs.</td>
+            </tr>
+          </tbody>
+        </table>
+        </div>
+
+        <h4>Events &amp; Metadata</h4>
+        <div class="table-wrapper" aria-label="Events and Metadata MCP tools — horizontally scrollable" tabindex="0">
+        <table>
+          <caption>Events and Metadata MCP tools</caption>
+          <thead>
+            <tr>
+              <th scope="col">Tool</th>
+              <th scope="col">Description</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>tamandua.events.recent</code></td>
+              <td>List recent global Tamandua events. Accepts optional <code>limit</code> (integer, 1–500, default 50).</td>
+            </tr>
+            <tr>
+              <td><code>tamandua.source.path</code></td>
+              <td>Return the local Tamandua source checkout path. No parameters.</td>
+            </tr>
+            <tr>
+              <td><code>tamandua.skill.path</code></td>
+              <td>Return the path to the bundled tamandua-agents agent skill. No parameters.</td>
+            </tr>
+            <tr>
+              <td><code>tamandua.update.command</code></td>
+              <td>Return local CLI guidance for updating Tamandua safely. No parameters.</td>
+            </tr>
+          </tbody>
+        </table>
+        </div>
+
+        <h4>AutoResearch</h4>
+        <div class="table-wrapper" aria-label="AutoResearch MCP tools — horizontally scrollable" tabindex="0">
+        <table>
+          <caption>AutoResearch MCP tools</caption>
+          <thead>
+            <tr>
+              <th scope="col">Tool</th>
+              <th scope="col">Description</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>tamandua.autoresearch.init</code></td>
+              <td>Create project-local AutoResearch state. Requires <code>cwd</code>, <code>goal</code>, <code>metricName</code>, <code>direction</code>, and <code>command</code>. Optional <code>metricUnit</code>, <code>metricRegex</code>, <code>checksCommand</code>, and <code>overwrite</code>.</td>
+            </tr>
+            <tr>
+              <td><code>tamandua.autoresearch.run_experiment</code></td>
+              <td>Run the configured experiment command in <code>cwd</code>, parse the metric, run optional checks, and append a <code>run_result</code>. Optional <code>command</code>, <code>metricRegex</code>, <code>checksCommand</code>, and <code>timeoutMs</code>.</td>
+            </tr>
+            <tr>
+              <td><code>tamandua.autoresearch.log_experiment</code></td>
+              <td>Append the decision and learning for the latest run. Requires <code>cwd</code> and <code>description</code>; optional <code>status</code>, <code>metric</code>, <code>hypothesis</code>, <code>learned</code>, <code>nextFocus</code>, <code>commit</code>, and <code>revertDiscard</code>.</td>
+            </tr>
+            <tr>
+              <td><code>tamandua.autoresearch.status</code></td>
+              <td>Summarize baseline, best result, failures, and the next ratchet prompt for <code>cwd</code>.</td>
+            </tr>
+          </tbody>
+        </table>
+        </div>
+
+        <p class="mcp-note"><strong>Skill included.</strong> The tamandua-agents skill is bundled and is excellent at allowing your agents to build-and-forget with tamandua. The CLI itself is also designed in a way that is easy for agents in general to grasp.</p>
+      </div>
     </section>
 
-    <!-- AutoResearch -->
+    <!-- ── AutoResearch ────────────────────────────────────────────── -->
     <section id="autoresearch" class="section-reveal" aria-labelledby="autoresearch-heading">
-      <h2 id="autoresearch-heading">Native AutoResearch</h2>
+      <div class="section-label">AutoResearch</div>
+      <h2 id="autoresearch-heading">Native optimization loops</h2>
       <p>Tamandua includes native AutoResearch primitives for measurable optimization loops. Unlike a normal workflow, AutoResearch stores durable project-local state so an agent can resume after restarts, learn from each measured run, and choose the next experiment from evidence.</p>
       <p>Use AutoResearch when the task has a reliable numeric metric and the agent should run a sequence of experiments instead of one batch of edits — raising test coverage, reducing validation loss, improving latency, or lowering cost while preserving correctness.</p>
 
@@ -578,11 +681,38 @@ tamandua autoresearch next</code></pre>
       <p>The dashboard's AutoResearch panel reads the run's harness working directory, discovers the nearest <code>autoresearch.config.json</code> / <code>autoresearch.jsonl</code>, and renders the experiment trace — gray points are attempted experiments; green points and the green line are the kept best-so-far frontier. A SQLite session registry makes every AutoResearch project discoverable from the dashboard, and <code>tamandua autoresearch prune</code> cleans up stale registry entries without touching project files.</p>
     </section>
 
-    <!-- Commands & Harness -->
-    <section id="commands" class="section-reveal" aria-labelledby="commands-heading">
-      <h2 id="commands-heading">Commands &amp; Harness Selection</h2>
+    <!-- ── Build Your Own ──────────────────────────────────────────── -->
+    <section id="build" class="section-reveal" aria-labelledby="build-heading">
+      <div class="section-label">Build Your Own</div>
+      <h2 id="build-heading">If you can write a prompt,<br>you can build a workflow.</h2>
 
-      <h3>Everyday Commands</h3>
+      <p>The bundled workflows are starting points. Define your own agents, steps, retry logic, and verification gates in plain YAML and Markdown. If you can write a prompt, you can build a workflow.</p>
+
+      <pre><code class="language-yaml">id: my-workflow
+name: My Custom Workflow
+agents:
+  - id: researcher
+    name: Researcher
+    workspace:
+      files:
+        AGENTS.md: agents/researcher/AGENTS.md
+
+steps:
+  - id: research
+    agent: researcher
+    input: |
+      Research {{task}} and report findings.
+      Reply with STATUS: done and FINDINGS: ...
+    expects: "STATUS: done"</code></pre>
+
+      <p><a href="https://raw.githubusercontent.com/igorhvr/tamandua/refs/heads/main/docs/creating-workflows.md">Full guide →</a></p>
+    </section>
+
+    <!-- ── Commands & Harness ──────────────────────────────────────── -->
+    <section id="commands" class="section-reveal" aria-labelledby="commands-heading">
+      <div class="section-label">Commands</div>
+      <h2 id="commands-heading">Everyday CLI</h2>
+
       <div class="table-wrapper" aria-label="Everyday CLI commands — horizontally scrollable" tabindex="0">
       <table>
         <caption>Everyday CLI commands</caption>
@@ -618,28 +748,12 @@ tamandua autoresearch next</code></pre>
             <td>Start the web dashboard (also starts remote MCP on port 3338).</td>
           </tr>
           <tr>
-            <td><code>tamandua dashboard start|stop|restart|status [--port N]</code></td>
-            <td>Manage the dashboard daemon.</td>
-          </tr>
-          <tr>
-            <td><code>tamandua mcp start|stop|restart|status [--port N]</code></td>
-            <td>Manage the standalone MCP server.</td>
-          </tr>
-          <tr>
-            <td><code>tamandua control-plane start|stop|restart|status [--port N]</code></td>
-            <td>Manage the standalone control plane.</td>
-          </tr>
-          <tr>
             <td><code>tamandua logs-tail</code></td>
             <td>Follow recent activity as new events arrive.</td>
           </tr>
           <tr>
             <td><code>tamandua nudge</code></td>
-            <td>Trigger an immediate dispatch round for all running runs.</td>
-          </tr>
-          <tr>
-            <td><code>tamandua doctor</code></td>
-            <td>One-shot diagnostic with per-check remedies (environment, services, database, prompt adherence).</td>
+            <td>Wake all scheduled agents for running runs to poll immediately.</td>
           </tr>
           <tr>
             <td><code>tamandua update</code></td>
@@ -675,190 +789,10 @@ tamandua autoresearch next</code></pre>
       <p>To use a custom Hermes binary, set <code>TAMANDUA_HERMES_BINARY</code>; otherwise Tamandua searches for <code>hermes</code> on your <code>PATH</code>. Harness validation runs at scheduling time — a missing or non-executable binary fails the run immediately with a clear error.</p>
     </section>
 
-    <!-- Build Your Own -->
-    <section id="build-your-own" class="section-reveal" aria-labelledby="build-heading">
-      <h2 id="build-heading">Build Your Own</h2>
-
-      <p>The bundled workflows are starting points. Define your own agents, steps, retry logic, and verification gates in plain YAML and Markdown. If you can write a prompt, you can build a workflow.</p>
-
-      <pre><code class="language-yaml">id: my-workflow
-name: My Custom Workflow
-agents:
-  - id: researcher
-    name: Researcher
-    workspace:
-      files:
-        AGENTS.md: agents/researcher/AGENTS.md
-
-steps:
-  - id: research
-    agent: researcher
-    input: |
-      Research {{task}} and report findings.
-      Reply with STATUS: done and FINDINGS: ...
-    expects: "STATUS: done"</code></pre>
-
-      <p><a href="https://raw.githubusercontent.com/igorhvr/tamandua/refs/heads/main/docs/creating-workflows.md">Full guide.</a></p>
-    </section>
-
-    <!-- Remote MCP -->
-    <section id="skills-and-mcp" class="section-reveal" aria-labelledby="mcp-heading">
-      <p><strong>Skill included.</strong> The tamandua-agents skill is bundled and is excellent at allowing your agents to build-and-forget with tamandua. The CLI itself is also designed in a way that is easy for agents in general to grasp. Remote MCP tools are exposed so agents can query runs, start workflows, and check status autonomously.</p>
-      <h2 id="mcp-heading">Remote MCP Tools</h2>
-      <p>The remote MCP endpoint exposes 14 tools at <code>http://localhost:3338/mcp</code>:</p>
-
-      <h3>Run Management</h3>
-      <div class="table-wrapper" aria-label="Run Management MCP tools — horizontally scrollable" tabindex="0">
-      <table>
-        <caption>Run Management MCP tools</caption>
-        <thead>
-          <tr>
-            <th scope="col">Tool</th>
-            <th scope="col">Description</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr>
-            <td><code>tamandua.runs.list</code></td>
-            <td>List recent Tamandua workflow runs. Accepts optional <code>limit</code> (integer, 1–200, default 50).</td>
-          </tr>
-          <tr>
-            <td><code>tamandua.run.status</code></td>
-            <td>Fetch detailed status for a run. Requires <code>query</code> (run id, prefix, or task substring).</td>
-          </tr>
-          <tr>
-            <td><code>tamandua.run.start</code></td>
-            <td>Start a workflow run. Requires <code>workflowId</code> and <code>taskTitle</code>.</td>
-          </tr>
-          <tr>
-            <td><code>tamandua.run.pause</code></td>
-            <td>Pause a running workflow run. Requires <code>runId</code>. Optional <code>drain</code> (boolean) to wait for in-flight work before pausing.</td>
-          </tr>
-          <tr>
-            <td><code>tamandua.run.resume</code></td>
-            <td>Resume a paused workflow run. Requires <code>runId</code>.</td>
-          </tr>
-          <tr>
-            <td><code>tamandua.run.delete</code></td>
-            <td>Permanently delete a workflow run and associated steps, stories, and worktree metadata. Requires <code>runId</code>. Optional <code>force</code> (boolean) cancels and deletes running or paused runs.</td>
-          </tr>
-        </tbody>
-      </table>
-      </div>
-
-      <h4>tamandua.run.start parameters</h4>
-      <div class="table-wrapper" aria-label="tamandua.run.start parameters — horizontally scrollable" tabindex="0">
-      <table>
-        <caption>tamandua.run.start parameters</caption>
-        <thead>
-          <tr>
-            <th scope="col">Parameter</th>
-            <th scope="col">Required</th>
-            <th scope="col">Description</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr>
-            <td><code>workflowId</code></td>
-            <td>Yes</td>
-            <td>Workflow id to run.</td>
-          </tr>
-          <tr>
-            <td><code>taskTitle</code></td>
-            <td>Yes</td>
-            <td>Task description for the workflow run.</td>
-          </tr>
-          <tr>
-            <td><code>workingDirectoryForHarness</code></td>
-            <td>For direct workflows</td>
-            <td>Harness working directory for remote MCP runs. Required for direct workflows, invalid for worktree workflows.</td>
-          </tr>
-          <tr>
-            <td><code>worktreeOriginRepository</code></td>
-            <td>For worktree workflows</td>
-            <td>Repository path to create the worktree from. Required for worktree workflows, invalid for direct workflows.</td>
-          </tr>
-          <tr>
-            <td><code>worktreeOriginRef</code></td>
-            <td>No</td>
-            <td>Git ref (branch, tag, SHA) for the worktree. Only valid for worktree workflows.</td>
-          </tr>
-          <tr>
-            <td><code>noHurrySaveTokensMode</code></td>
-            <td>No</td>
-            <td>When <code>true</code>, work spawns prefer the harness's token-saver command from <code>PATH</code> (<code>pi-token-saver</code> for pi runs, <code>hermes-token-saver</code> for hermes runs), looked up per invocation; falls back to the plain harness command when absent. Idle dispatch is free either way. Defaults to <code>false</code>.</td>
-          </tr>
-        </tbody>
-      </table>
-      </div>
-      <p><code>workingDirectoryForHarness</code> and <code>worktreeOriginRepository</code> are <strong>mutually exclusive</strong>: direct workflows require the former, worktree workflows require the latter.</p>
-
-      <h3>Events &amp; Metadata</h3>
-      <div class="table-wrapper" aria-label="Events and Metadata MCP tools — horizontally scrollable" tabindex="0">
-      <table>
-        <caption>Events and Metadata MCP tools</caption>
-        <thead>
-          <tr>
-            <th scope="col">Tool</th>
-            <th scope="col">Description</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr>
-            <td><code>tamandua.events.recent</code></td>
-            <td>List recent global Tamandua events. Accepts optional <code>limit</code> (integer, 1–500, default 50).</td>
-          </tr>
-          <tr>
-            <td><code>tamandua.source.path</code></td>
-            <td>Return the local Tamandua source checkout path. No parameters.</td>
-          </tr>
-          <tr>
-            <td><code>tamandua.skill.path</code></td>
-            <td>Return the path to the bundled tamandua-agents agent skill. No parameters.</td>
-          </tr>
-          <tr>
-            <td><code>tamandua.update.command</code></td>
-            <td>Return local CLI guidance for updating Tamandua safely. No parameters.</td>
-          </tr>
-        </tbody>
-      </table>
-      </div>
-
-      <h3>AutoResearch</h3>
-      <div class="table-wrapper" aria-label="AutoResearch MCP tools — horizontally scrollable" tabindex="0">
-      <table>
-        <caption>AutoResearch MCP tools</caption>
-        <thead>
-          <tr>
-            <th scope="col">Tool</th>
-            <th scope="col">Description</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr>
-            <td><code>tamandua.autoresearch.init</code></td>
-            <td>Create project-local AutoResearch state. Requires <code>cwd</code>, <code>goal</code>, <code>metricName</code>, <code>direction</code>, and <code>command</code>. Optional <code>metricUnit</code>, <code>metricRegex</code>, <code>checksCommand</code>, and <code>overwrite</code>.</td>
-          </tr>
-          <tr>
-            <td><code>tamandua.autoresearch.run_experiment</code></td>
-            <td>Run the configured experiment command in <code>cwd</code>, parse the metric, run optional checks, and append a <code>run_result</code>. Optional <code>command</code>, <code>metricRegex</code>, <code>checksCommand</code>, and <code>timeoutMs</code>.</td>
-          </tr>
-          <tr>
-            <td><code>tamandua.autoresearch.log_experiment</code></td>
-            <td>Append the decision and learning for the latest run. Requires <code>cwd</code> and <code>description</code>; optional <code>status</code>, <code>metric</code>, <code>hypothesis</code>, <code>learned</code>, <code>nextFocus</code>, <code>commit</code>, and <code>revertDiscard</code>.</td>
-          </tr>
-          <tr>
-            <td><code>tamandua.autoresearch.status</code></td>
-            <td>Summarize baseline, best result, failures, and the next ratchet prompt for <code>cwd</code>.</td>
-          </tr>
-        </tbody>
-      </table>
-      </div>
-    </section>
-
-    <!-- Security -->
+    <!-- ── Security ───────────────────────────────────────────────── -->
     <section id="security" class="section-reveal" aria-labelledby="security-heading">
-      <h2 id="security-heading">Security</h2>
+      <div class="section-label">Security</div>
+      <h2 id="security-heading">We take agent safety seriously</h2>
       <p>You're installing agent teams that run code on your machine. We take that seriously.</p>
       <ul>
         <li><strong>Curated repo only</strong> — Tamandua only installs workflows from the official repository. No arbitrary remote sources.</li>
@@ -889,7 +823,13 @@ steps:
       </div>
     </div>
     <div class="footer-branding">
-      <img class="footer-logo" src="assets/tamandua.png" alt="" aria-hidden="true" width="24" height="24">
+      <svg class="footer-logo" width="24" height="24" viewBox="0 0 28 28" fill="none" aria-hidden="true">
+        <path d="M14 2C7.373 2 2 7.373 2 14s5.373 12 12 12 12-5.373 12-12S20.627 2 14 2z" fill="none" stroke="currentColor" stroke-width="1.5"/>
+        <path d="M8 16c0-3.314 2.686-6 6-6s6 2.686 6 6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+        <path d="M10 16.5c0-2.21 1.79-4 4-4s4 1.79 4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+        <path d="M12 17c0-1.105.895-2 2-2s2 .895 2 2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+        <path d="M6 10l3-1M22 10l-3-1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+      </svg>
       <p class="footer-built">Built with Tamanduás in mind.</p>
       <p class="footer-copyright">&copy; <span id="copyright-year">2026</span> Tamandua</p>
     </div>

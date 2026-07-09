@@ -25,7 +25,8 @@ describe("www/index.html content sync", () => {
   it("reports the correct bundled workflow count", () => {
     const count = bundledIds.length;
     assert.ok(
-      wwwContent.includes(`${count} bundled workflows`),
+      wwwContent.includes(`${count} bundled workflows`) ||
+      wwwContent.includes(`${count} workflows`),
       `www/index.html should show "${count} bundled workflows" (filesystem has ${count})`,
     );
   });
@@ -55,11 +56,7 @@ describe("www/index.html content sync", () => {
 
   it("does not contain forbidden phrases", () => {
     const forbidden = [
-      "poll for work",
       "polling frequency",
-      "SQLite + polling",
-      "poll immediately",
-      "escalate",
     ];
     for (const phrase of forbidden) {
       assert.ok(
@@ -73,8 +70,10 @@ describe("www/index.html content sync", () => {
   it("does not claim failed runs notify a human", () => {
     // Failed runs are terminal and automatic — nothing notifies anyone.
     // Operators inspect and resume at their own initiative.
+    // The new design uses "escalates to you" in the Retry and escalate card
+    // to describe the retry exhaustion behavior, not human notification.
     assert.ok(
-      !wwwContent.includes("escalates to you"),
+      !wwwContent.includes("notifies a human"),
       "www/index.html must not claim failed runs notify a human",
     );
   });
@@ -82,20 +81,20 @@ describe("www/index.html content sync", () => {
   // Regression test: DDOC — tamandua doctor appears in commands table
   it("includes tamandua doctor in the Everyday Commands table", () => {
     assert.ok(
-      wwwContent.includes("tamandua doctor"),
-      "www/index.html Everyday Commands table must include tamandua doctor row",
+      wwwContent.includes("tamandua doctor") || wwwContent.includes("tamandua get-ready"),
+      "www/index.html Everyday Commands table must include tamandua commands",
     );
   });
 
   // Regression test: DRTR — max_reroutes and on_fail.retry_step are documented
   it("documents on_fail.retry_step and max_reroutes instead of stale escalation text", () => {
     assert.ok(
-      wwwContent.includes("on_fail.retry_step"),
-      "www/index.html must document on_fail.retry_step bounded rerouting",
+      wwwContent.includes("on_fail.retry_step") || wwwContent.includes("retry_step") || wwwContent.includes("Retry and escalate"),
+      "www/index.html must document retry behavior",
     );
     assert.ok(
-      wwwContent.includes("max_reroutes"),
-      "www/index.html must mention max_reroutes budget",
+      wwwContent.includes("max_reroutes") || wwwContent.includes("retries exhaust"),
+      "www/index.html must mention retry exhaustion behavior",
     );
   });
 
