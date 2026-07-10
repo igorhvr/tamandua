@@ -12,6 +12,47 @@ const B = "/" + "bin" + "/" + "false";
 const U = "/" + "usr" + B;
 const N = "--" + "no-headers";
 
+// ── Banned find flag fragments (composed so this file doesn't trigger itself) ─
+//
+// Each flag is stored as a { raw, label } pair, both composed by
+// concatenation so no literal "-flag" string appears in this file.
+// The raw form is used for substring scanning; the label form is used
+// for exception-map lookups and violation messages.
+
+const FN = "-" + "newermt";
+const FP = "-" + "printf";
+const FR = "-" + "regextype";
+const FM = "-" + "mindepth";
+const FD = "-" + "daystart";
+const FA = "-" + "amin";
+const FC = "-" + "cmin";
+const FU = "-" + "used";
+const FF = "-" + "fstype";
+const FW = "-" + "wholename";
+
+/** Individual banned find flags, each stored with raw and label forms. */
+const BANNED_FIND_FLAGS: { raw: string; label: string }[] = [
+  { raw: FN, label: FN },
+  { raw: FP, label: FP },
+  { raw: FR, label: FR },
+  { raw: FM, label: FM },
+  { raw: FD, label: FD },
+  { raw: FA, label: FA },
+  { raw: FC, label: FC },
+  { raw: FU, label: FU },
+  { raw: FF, label: FF },
+  { raw: FW, label: FW },
+];
+
+/** Set of all banned flag labels (for exception-map initialization). */
+const ALL_FIND_FLAGS = new Set([FN, FP, FR, FM, FD, FA, FC, FU, FF, FW]);
+
+/** Files allowed to use specific banned find flags (keyed by file, value = set of allowed flags). */
+const FIND_FLAG_ALLOWED: Map<string, Set<string>> = new Map([
+  // The portability-lint test file itself contains banned flag literals in its test content strings.
+  ["tests/portability-lint.test.ts", ALL_FIND_FLAGS],
+]);
+
 const REPO_ROOT = process.cwd();
 
 // ── Types ─────────────────────────────────────────────────────────────
@@ -124,6 +165,23 @@ export function scanFileContent(
           `use a platform branch (src/cli/status-format.ts pattern) ` +
           `or portable ps flags.`,
       });
+    }
+
+    // ── Banned find flags ────────────────────────────────────────────
+    for (const flag of BANNED_FIND_FLAGS) {
+      if (line.includes(flag.raw)) {
+        const allowed = FIND_FLAG_ALLOWED.get(relativePath);
+        if (allowed?.has(flag.label)) continue;
+        violations.push({
+          relativePath,
+          line: lno,
+          message:
+            `${relativePath}:${lno}: ${flag.label} is not portable across GNU find, BSD/macOS find, and bfs. ` +
+            `Use portable alternatives: -mmin/-mtime for age filtering, ` +
+            `touch -t + -newer for reference timestamps, -exec for formatting, ` +
+            `-path instead of -wholename.`,
+        });
+      }
     }
   }
 
@@ -241,6 +299,120 @@ describe("portability lint - unit", () => {
       'execSync("ps -eo pid,etime,args ' + N + '")',
     );
     assert.equal(v.length, 0);
+  });
+
+  // ── Banned find flag tests ─────────────────────────────────────────
+
+  it("flags -newermt in shell scripts", () => {
+    const v = scanFileContent(
+      "scripts/cleanup.sh",
+      'find . -newermt "3 hours ago" -delete',
+    );
+    assert.equal(v.length, 1);
+    assert.match(v[0].message, /-newermt/);
+    assert.match(v[0].message, /not portable/);
+  });
+
+  it("flags -printf in shell scripts", () => {
+    const v = scanFileContent(
+      "scripts/list.sh",
+      "find . -name '*.ts' -printf '%p\\n'",
+    );
+    assert.equal(v.length, 1);
+    assert.match(v[0].message, /-printf/);
+  });
+
+  it("flags -regextype in shell scripts", () => {
+    const v = scanFileContent(
+      "scripts/search.sh",
+      "find . -regextype posix-extended -regex '.*\\.ts'",
+    );
+    assert.equal(v.length, 1);
+    assert.match(v[0].message, /-regextype/);
+  });
+
+  it("flags -mindepth in shell scripts", () => {
+    const v = scanFileContent(
+      "scripts/tree.sh",
+      "find . -mindepth 2 -name '*.js'",
+    );
+    assert.equal(v.length, 1);
+    assert.match(v[0].message, /-mindepth/);
+  });
+
+  it("flags -daystart in shell scripts", () => {
+    const v = scanFileContent(
+      "scripts/recent.sh",
+      "find . -daystart -mtime 0",
+    );
+    assert.equal(v.length, 1);
+    assert.match(v[0].message, /-daystart/);
+  });
+
+  it("flags -amin in shell scripts", () => {
+    const v = scanFileContent(
+      "scripts/recent.sh",
+      "find . -amin -10",
+    );
+    assert.equal(v.length, 1);
+    assert.match(v[0].message, /-amin/);
+  });
+
+  it("flags -cmin in shell scripts", () => {
+    const v = scanFileContent(
+      "scripts/recent.sh",
+      "find . -cmin -30",
+    );
+    assert.equal(v.length, 1);
+    assert.match(v[0].message, /-cmin/);
+  });
+
+  it("flags -used in shell scripts", () => {
+    const v = scanFileContent(
+      "scripts/stale.sh",
+      "find . -used 7 -delete",
+    );
+    assert.equal(v.length, 1);
+    assert.match(v[0].message, /-used/);
+  });
+
+  it("flags -fstype in shell scripts", () => {
+    const v = scanFileContent(
+      "scripts/fs.sh",
+      "find /mnt -fstype nfs -prune -o -print",
+    );
+    assert.equal(v.length, 1);
+    assert.match(v[0].message, /-fstype/);
+  });
+
+  it("flags -wholename in shell scripts", () => {
+    const v = scanFileContent(
+      "scripts/match.sh",
+      "find . -wholename '*/node_modules/*' -prune",
+    );
+    assert.equal(v.length, 1);
+    assert.match(v[0].message, /-wholename/);
+  });
+
+  it("allows portable find invocations with -name, -type, -maxdepth, -print0, -path, !", () => {
+    const v = scanFileContent(
+      "scripts/ok.sh",
+      'find src tests -name "*.test.ts" ! -path "*/e2e-tests/*" -maxdepth 3 -type f -print0',
+    );
+    assert.equal(v.length, 0);
+  });
+
+  it("allows banned find flag in an explicitly allowed file", () => {
+    FIND_FLAG_ALLOWED.set("scripts/legacy.sh", new Set(["-newermt"]));
+    try {
+      const v = scanFileContent(
+        "scripts/legacy.sh",
+        'find . -newermt "3 hours ago"',
+      );
+      assert.equal(v.length, 0);
+    } finally {
+      FIND_FLAG_ALLOWED.delete("scripts/legacy.sh");
+    }
   });
 
   it("messages name the offending file:line and the portable alternative", () => {
