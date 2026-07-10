@@ -792,13 +792,12 @@ describe(
           assert.ok(
             !(/require\(\s*["'](node:)?child_process["']\s*\)/i.test(strippedPostServerTs) &&
               /\bexec(Sync)?\b/i.test(strippedPostServerTs)) &&
-              !/import.*\{.*exec.*\}.*from.*child_process/i.test(strippedPostServerTs),
+              !/import[^;]*\{[^}]*\b(exec|execSync)\b[^}]*\}[^;]*from[^;]*["'](node:)?child_process/i.test(strippedPostServerTs),
             `src/server.ts should not import exec/execSync from child_process after fix. Content:\n${postServerTs.substring(0, 800)}`,
           );
           // (b) Assert no exec( or execSync( call exists outside comments
           assert.ok(
-            !strippedPostServerTs.includes("exec(") &&
-              !strippedPostServerTs.includes("execSync("),
+            !(/(?<![A-Za-z0-9_])exec(Sync)?\s*\(/.test(strippedPostServerTs)),
             `src/server.ts should no longer call exec()/execSync() after fix. Content:\n${postServerTs.substring(0, 800)}`,
           );
 
@@ -1139,7 +1138,7 @@ describe("comment-blind exec() assertions", () => {
     const hasRequireExec =
       /require\(\s*["'](node:)?child_process["']\s*\)/i.test(stripped) &&
       /\bexec(Sync)?\b/i.test(stripped);
-    const hasImportExec = /import.*\{.*exec.*\}.*from.*child_process/i.test(stripped);
+    const hasImportExec = /import[^;]*\{[^}]*\b(exec|execSync)\b[^}]*\}[^;]*from[^;]*["'](node:)?child_process/i.test(stripped);
     if (hasRequireExec || hasImportExec) {
       failures.push(
         `should not import exec/execSync from child_process (require=${hasRequireExec}, import=${hasImportExec})`,
@@ -1147,9 +1146,10 @@ describe("comment-blind exec() assertions", () => {
     }
 
     // (b) Assert no exec( or execSync( call exists outside comments
-    if (stripped.includes("exec(") || stripped.includes("execSync(")) {
+    const hasExecCall = /(?<![A-Za-z0-9_])exec(Sync)?\s*\(/.test(stripped);
+    if (hasExecCall) {
       failures.push(
-        `should not call exec()/execSync() (exec(=${stripped.includes("exec(")}, execSync(=${stripped.includes("execSync(")})`,
+        `should not call exec()/execSync()`,
       );
     }
 
@@ -1269,5 +1269,68 @@ describe("comment-blind exec() assertions", () => {
       result.failures.length >= 1,
       `Expected failures when real exec() is present alongside comment, got: ${JSON.stringify(result.failures)}`,
     );
+  });
+
+  // ── execFile/execFileSync must NOT false-positive (they bypass the shell) ──
+
+  it("passes when using execFile (safe, bypasses shell) as a legitimate fix", () => {
+    const source = [
+      'import { execFile } from "node:child_process";',
+      'export function catFile(filename: string): string {',
+      '  return new Promise((resolve, reject) => {',
+      '    execFile("cat", [filename], (err, stdout) => {',
+      '      if (err) reject(err);',
+      '      else resolve(stdout);',
+      '    });',
+      '  });',
+      '}',
+    ].join("\n");
+    const result = assertNoExecInFixedFile(source);
+    assert.ok(result.passed, `Expected pass for safe execFile fix but got failures: ${result.failures.join("; ")}`);
+  });
+
+  it("passes when importing execFile from child_process without a call", () => {
+    const source = 'import { execFile } from "child_process";\nconst x = 1;';
+    const result = assertNoExecInFixedFile(source);
+    assert.ok(result.passed, `Expected pass for execFile import without call but got failures: ${result.failures.join("; ")}`);
+  });
+
+  it("fails when BOTH execFile and execSync are imported (execSync remains dangerous)", () => {
+    const source = [
+      'import { execFile, execSync } from "node:child_process";',
+      'export function catFile(filename: string): string {',
+      '  return execSync(`cat ${filename}`);',
+      '}',
+    ].join("\n");
+    const result = assertNoExecInFixedFile(source);
+    assert.ok(!result.passed, "Expected failure when both execFile and execSync imported");
+    assert.ok(
+      result.failures.some((f) => f.includes("import")),
+      `Expected import failure for execSync, got: ${JSON.stringify(result.failures)}`,
+    );
+  });
+
+  it("fails when execSync is imported and called (regression guard)", () => {
+    const source = [
+      'import { execSync } from "child_process";',
+      'export function catFile(filename: string): string {',
+      '  return execSync(`cat ${filename}`);',
+      '}',
+    ].join("\n");
+    const result = assertNoExecInFixedFile(source);
+    assert.ok(!result.passed, "Expected failure for execSync import/call");
+    assert.ok(result.failures.length >= 2, `Expected at least 2 failures (import + execSync call), got: ${JSON.stringify(result.failures)}`);
+  });
+
+  it("fails when exec is imported and called (regression guard)", () => {
+    const source = [
+      'import { exec } from "child_process";',
+      'export function catFile(filename: string): string {',
+      '  return exec(`cat ${filename}`);',
+      '}',
+    ].join("\n");
+    const result = assertNoExecInFixedFile(source);
+    assert.ok(!result.passed, "Expected failure for exec import/call");
+    assert.ok(result.failures.length >= 2, `Expected at least 2 failures (import + exec call), got: ${JSON.stringify(result.failures)}`);
   });
 });
