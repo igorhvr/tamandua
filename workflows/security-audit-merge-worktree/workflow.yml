@@ -142,6 +142,7 @@ steps:
       6. Review auth/session handling (token expiry, session fixation, cookie flags)
       7. Check security headers (CORS, CSP, HSTS, X-Frame-Options)
       8. Document every finding with severity, file, line, and description
+      9. Findings must be SECURITY issues only (injection, authz, secrets, crypto, headers, dependencies, etc.). Functional/logic bugs with no security impact must NOT be listed as findings; they may be noted in a separate notes section of the report.
 
       Reply with:
       STATUS: done
@@ -174,6 +175,7 @@ steps:
       4. Create a prioritized fix plan — max 20 fixes
       5. If more than 20 issues, pick the top 20 by severity; note deferred items
       6. Output each fix as a story in STORIES_JSON format
+      7. Only include SECURITY vulnerabilities in the fix plan. Non-security functional/logic bugs must not become fix stories.
 
       Each story object must have:
       - id: "fix-001", "fix-002", etc.
@@ -239,6 +241,16 @@ steps:
       verify_step: verify
     input: |
       Implement a security fix. You are working on ONE fix in a fresh session.
+
+      ## SCOPE CONTRACT — READ THIS FIRST
+
+      You fix SECURITY vulnerabilities ONLY. NEVER fix, refactor, or "improve" non-security code you happen to notice — no logic bugs, no style issues, no typos, no dead code, no performance tweaks.
+
+      NEVER modify existing tests to make them pass. If an existing test asserts behavior that looks wrong, it is OUT OF SCOPE — leave both the code and the test exactly as they are.
+
+      Adding NEW tests that cover the security fix is allowed and encouraged; changing or deleting existing ones is not (unless the existing test itself directly exercises the vulnerable behavior being fixed — e.g. it asserts the shell-injection path — in which case update only that test and say so in CHANGES).
+
+      If you notice out-of-scope problems, report them in a dedicated OUT_OF_SCOPE_NOTES section of your output instead of fixing them. This gives the "I found a bug!" impulse a safe outlet.
 
       TASK (overall):
       {{task}}
@@ -312,6 +324,7 @@ steps:
       TEST_CMD is the exact test command to use. Copy it verbatim — do NOT substitute `npm test` or any other command you infer from the project. TEST_CMD may be wrapped in a caching shim (`tamandua-test ...`); this is intentional. If the output starts with `TAMANDUA-TEST CACHED`, the suite already passed for this exact tree — treat that as a passing test run. Only add flags through the wrapper's `--force` option when you suspect a flaky or environment-dependent result.
 
       Instructions:
+      0. Mechanical scope check — run `git diff --stat` (and `git diff`) between the security branch and its base. Every changed file must be justified by the security fix story being verified (the fixed source, new security tests, necessary config). If ANY change is unrelated to the security fix — especially modifications to existing tests or to code with no security relevance — respond STATUS: retry with feedback telling the fixer exactly which files/hunks to revert. Modified-existing-test is an automatic retry unless the test directly exercised the vulnerability.
       1. Run the full test suite with {{test_cmd}}
       2. Confirm the regression test exists and tests the right thing
       3. Review the fix — does it actually address the vulnerability?
@@ -364,6 +377,7 @@ steps:
       TEST_CMD is the exact test command to use. Copy it verbatim — do NOT substitute `npm test` or any other command you infer from the project. TEST_CMD may be wrapped in a caching shim (`tamandua-test ...`); this is intentional. If the output starts with `TAMANDUA-TEST CACHED`, the suite already passed for this exact tree — treat that as a passing test run. Only add flags through the wrapper's `--force` option when you suspect a flaky or environment-dependent result.
 
       Instructions:
+      0. You validate only — never edit code or tests. If the suite fails, report honestly rather than adapting tests.
       1. Run the full test suite ({{test_cmd}}) — all tests must pass
       2. Run the build ({{build_cmd}}) — must succeed
       3. Run `npm audit` (or equivalent) again — compare before/after
