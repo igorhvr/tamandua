@@ -385,14 +385,23 @@ describe("ENVIRONMENT checks (US-003)", () => {
   });
 
   it("pi on PATH check passes when pi is available", async () => {
-    const groups = await runDoctorChecks();
-    const env = groups.find((g) => g.label === "ENVIRONMENT");
-    assert.ok(env);
-    const piCheck = env!.checks.find((c) => c.name === "pi present on PATH");
-    assert.ok(piCheck, "Expected pi check to exist");
-    // pi should be available in this test environment (it's how we were launched)
-    assert.strictEqual(piCheck!.status, "pass",
-      `pi check should pass on PATH, got: ${piCheck!.status} (${piCheck!.message})`);
+    const savedPath = process.env.PATH;
+    const stubDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-doctor-pi-stub-"));
+    try {
+      // Create a stub pi binary so commandIsOnPath finds it regardless of host
+      fs.writeFileSync(path.join(stubDir, "pi"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      process.env.PATH = `${stubDir}:${savedPath}`;
+      const groups = await runDoctorChecks();
+      const env = groups.find((g) => g.label === "ENVIRONMENT");
+      assert.ok(env);
+      const piCheck = env!.checks.find((c) => c.name === "pi present on PATH");
+      assert.ok(piCheck, "Expected pi check to exist");
+      assert.strictEqual(piCheck!.status, "pass",
+        `pi check should pass on PATH, got: ${piCheck!.status} (${piCheck!.message})`);
+    } finally {
+      process.env.PATH = savedPath;
+      try { fs.rmSync(stubDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
   });
 
   it("gh check returns pass or fail (not info)", async () => {
@@ -431,24 +440,35 @@ describe("ENVIRONMENT checks (US-003)", () => {
   });
 
   it("hermes-token-saver check returns pass when found on PATH with optional token-saving tool message", async () => {
-    const groups = await runDoctorChecks();
-    const env = groups.find((g) => g.label === "ENVIRONMENT");
-    assert.ok(env);
-    const saverCheck = env!.checks.find((c) => c.name === "hermes-token-saver detection");
-    assert.ok(saverCheck, "Expected hermes-token-saver check to exist");
-    assert.strictEqual(saverCheck!.status, "pass",
-      `hermes-token-saver check should pass when found, got: ${saverCheck!.status} (${saverCheck!.message})`);
-    assert.ok(
-      saverCheck!.message.toLowerCase().includes("optional token-saving tool"),
-      `Message should mention 'optional token-saving tool', got: ${saverCheck!.message}`,
-    );
+    const savedPath = process.env.PATH;
+    const stubDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-doctor-hts-stub-"));
+    try {
+      // Create a stub hermes-token-saver binary so commandIsOnPath finds it regardless of host
+      fs.writeFileSync(path.join(stubDir, "hermes-token-saver"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      process.env.PATH = `${stubDir}:${savedPath}`;
+      const groups = await runDoctorChecks();
+      const env = groups.find((g) => g.label === "ENVIRONMENT");
+      assert.ok(env);
+      const saverCheck = env!.checks.find((c) => c.name === "hermes-token-saver detection");
+      assert.ok(saverCheck, "Expected hermes-token-saver check to exist");
+      assert.strictEqual(saverCheck!.status, "pass",
+        `hermes-token-saver check should pass when found, got: ${saverCheck!.status} (${saverCheck!.message})`);
+      assert.ok(
+        saverCheck!.message.toLowerCase().includes("optional token-saving tool"),
+        `Message should mention 'optional token-saving tool', got: ${saverCheck!.message}`,
+      );
+    } finally {
+      process.env.PATH = savedPath;
+      try { fs.rmSync(stubDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
   });
 
   it("hermes-token-saver check returns info with no-hurry reference when absent from PATH", async () => {
     const savedPath = process.env.PATH;
-    // Exclude user-local bin so hermes-token-saver is not found
-    process.env.PATH = "/usr/bin:/bin";
+    // Use a controlled empty temp dir that explicitly excludes hermes-token-saver
+    const stubDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-doctor-hts-absent-"));
     try {
+      process.env.PATH = stubDir;
       const groups = await runDoctorChecks();
       const env = groups.find((g) => g.label === "ENVIRONMENT");
       assert.ok(env);
@@ -463,6 +483,36 @@ describe("ENVIRONMENT checks (US-003)", () => {
       );
     } finally {
       process.env.PATH = savedPath;
+      try { fs.rmSync(stubDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
+  });
+
+  it("DOCP: ENVIRONMENT checks are hermetic — pi check responds to PATH, not host binaries", async () => {
+    const savedPath = process.env.PATH;
+    const stubDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-doctor-pi-hermetic-"));
+    try {
+      // Phase 1: pi absent from PATH → check reports fail
+      process.env.PATH = stubDir;
+      const groups1 = await runDoctorChecks();
+      const env1 = groups1.find((g) => g.label === "ENVIRONMENT");
+      assert.ok(env1);
+      const piCheck1 = env1!.checks.find((c) => c.name === "pi present on PATH");
+      assert.ok(piCheck1, "Expected pi check to exist");
+      assert.strictEqual(piCheck1!.status, "fail",
+        `pi check should fail when absent, got: ${piCheck1!.status}`);
+
+      // Phase 2: add stub pi → check reports pass
+      fs.writeFileSync(path.join(stubDir, "pi"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      const groups2 = await runDoctorChecks();
+      const env2 = groups2.find((g) => g.label === "ENVIRONMENT");
+      assert.ok(env2);
+      const piCheck2 = env2!.checks.find((c) => c.name === "pi present on PATH");
+      assert.ok(piCheck2, "Expected pi check to exist");
+      assert.strictEqual(piCheck2!.status, "pass",
+        `pi check should pass when stub is on PATH, got: ${piCheck2!.status}`);
+    } finally {
+      process.env.PATH = savedPath;
+      try { fs.rmSync(stubDir, { recursive: true, force: true }); } catch { /* best-effort */ }
     }
   });
 
