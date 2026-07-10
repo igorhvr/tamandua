@@ -106,6 +106,83 @@ function assertRepoClean(repoDir: string, context: string): void {
   assert.equal(status.trim(), "", `${context} left origin repository dirty:\n${status}`);
 }
 
+/**
+ * stripComments removes // line comments and /* */ block comments from
+ * source code, while preserving // and /* inside string literals.
+ *
+ * This allows assertions on source content (e.g. checking for exec()
+ * calls) without being tripped by comment mentions like
+ * "// FIX: use fs.readFile() instead of shell exec()".
+ */
+function stripComments(source: string): string {
+  const result: string[] = [];
+  let i = 0;
+
+  while (i < source.length) {
+    // ── Check for the start of a string literal ─────────────────
+    const quote = source[i];
+    if (quote === "'" || quote === '"' || quote === "`") {
+      result.push(quote);
+      i++;
+      // Consume until matching closing quote (handling escapes)
+      while (i < source.length) {
+        const ch = source[i];
+        if (ch === "\\") {
+          result.push(ch);
+          i++;
+          if (i < source.length) {
+            result.push(source[i]);
+            i++;
+          }
+        } else if (ch === quote) {
+          result.push(ch);
+          i++;
+          break;
+        } else {
+          result.push(ch);
+          i++;
+        }
+      }
+      continue;
+    }
+
+    // ── Check for // line comment ──────────────────────────────
+    if (source[i] === "/" && i + 1 < source.length && source[i + 1] === "/") {
+      // Skip to end of line
+      while (i < source.length && source[i] !== "\n") {
+        i++;
+      }
+      continue;
+    }
+
+    // ── Check for /* block comment ─────────────────────────────
+    if (source[i] === "/" && i + 1 < source.length && source[i + 1] === "*") {
+      i += 2; // skip /*
+      let depth = 1;
+      // Scan for matching */, handling nested /* (increment depth)
+      // and unclosed comments (strip to end of source)
+      while (i < source.length && depth > 0) {
+        if (source[i] === "/" && i + 1 < source.length && source[i + 1] === "*") {
+          i += 2;
+          depth++;
+        } else if (source[i] === "*" && i + 1 < source.length && source[i + 1] === "/") {
+          i += 2;
+          depth--;
+        } else {
+          i++;
+        }
+      }
+      continue;
+    }
+
+    // ── Regular code character ─────────────────────────────────
+    result.push(source[i]);
+    i++;
+  }
+
+  return result.join("");
+}
+
 // ── Shared state across both sequential tests ────────────────────────────
 let env: Awaited<ReturnType<typeof createTempHome>>;
 let repoDir: string;
@@ -622,7 +699,7 @@ describe(
             "utf-8",
           );
           assert.ok(
-            preServerTs.includes("exec("),
+            stripComments(preServerTs).includes("exec("),
             `Precondition: server.ts should contain exec() vulnerability. Content:\n${preServerTs}`,
           );
 
@@ -708,9 +785,18 @@ describe(
             path.join(vulnRepoDir, "src", "server.ts"),
             "utf-8",
           );
+          const strippedPostServerTs = stripComments(postServerTs);
+          // (a) Assert no import/require of exec/execSync from child_process
           assert.ok(
-            !postServerTs.includes("exec("),
-            `src/server.ts should no longer contain exec() after fix. Content:\n${postServerTs.substring(0, 800)}`,
+            !/require\(.*exec/i.test(strippedPostServerTs) &&
+              !/import.*\{.*exec.*\}.*from.*child_process/i.test(strippedPostServerTs),
+            `src/server.ts should not import exec/execSync from child_process after fix. Content:\n${postServerTs.substring(0, 800)}`,
+          );
+          // (b) Assert no exec( or execSync( call exists outside comments
+          assert.ok(
+            !strippedPostServerTs.includes("exec(") &&
+              !strippedPostServerTs.includes("execSync("),
+            `src/server.ts should no longer call exec()/execSync() after fix. Content:\n${postServerTs.substring(0, 800)}`,
           );
 
           // ── Verify non-security code survives unchanged ──────
@@ -919,4 +1005,262 @@ describe("real e2e do-now workflow (LIVE agent, daemon, scheduler)", () => {
       }
     },
   );
+
+// ── stripComments unit tests ────────────────────────────────────────────
+describe("stripComments helper", () => {
+  it("removes // line comments", () => {
+    const result = stripComments("const x = 1; // inline comment\nconst y = 2;");
+    assert.equal(result, "const x = 1; \nconst y = 2;");
+  });
+
+  it("removes single-line /* */ block comments", () => {
+    const result = stripComments("const x = /* value */ 1;");
+    assert.equal(result, "const x =  1;");
+  });
+
+  it("removes multiline /* */ block comments", () => {
+    const result = stripComments("before\n/* multi\nline\ncomment */\nafter");
+    assert.equal(result, "before\n\nafter");
+  });
+
+  it("does NOT remove // inside string literals", () => {
+    const result = stripComments('const url = "https://example.com";');
+    assert.ok(result.includes("https://example.com"), `Expected // in string to be preserved, got: ${result}`);
+    assert.ok(result.includes("//"), `// inside string should survive`);
+  });
+
+  it("does NOT remove /* inside string literals", () => {
+    const result = stripComments('const pattern = "/*comment*/";');
+    assert.ok(result.includes("/*comment*/"), `/* inside string should survive, got: ${result}`);
+  });
+
+  it("preserves // inside backtick template literals", () => {
+    const result = stripComments("const s = `url: //path`;");
+    assert.ok(result.includes("//path"), `// inside template literal should survive, got: ${result}`);
+  });
+
+  it("preserves /* inside backtick template literals", () => {
+    const result = stripComments("const s = `/* not a comment */`;");
+    assert.ok(result.includes("/* not a comment */"), `/* inside template literal should survive, got: ${result}`);
+  });
+
+  it("handles escaped quotes inside strings", () => {
+    const result = stripComments('const s = "she said \\"hello\\""; // comment');
+    // stripComments preserves source-level escapes: \" stays \"
+    assert.ok(result.includes('she said \\"hello\\"'), `escaped quotes should be preserved, got: ${result}`);
+    assert.ok(!result.includes("comment"), `line comment should be stripped`);
+  });
+
+  it("handles escaped backslash before quote", () => {
+    const result = stripComments('const s = "path\\\\" + x;');
+    assert.ok(result.includes('path\\\\'), `escaped backslash should be preserved`);
+  });
+
+  it("handles unclosed block comment — strips to end of source", () => {
+    const result = stripComments("before /* open but no close");
+    assert.equal(result, "before ");
+  });
+
+  it("handles nested /* — treats as part of outer block comment", () => {
+    const result = stripComments("before /* outer /* inner */ still outer */ after");
+    assert.equal(result, "before  after");
+  });
+
+  it("exact real-failure comment: exec() only in comment → absent after stripping", () => {
+    const source = '// FIX: use fs.readFile() instead of shell exec() to prevent command injection.\nimport fs from "fs";\nfs.readFile(filename, "utf-8");';
+    const stripped = stripComments(source);
+    assert.ok(!stripped.includes("exec("), `exec() in comment should be stripped, got: ${stripped}`);
+    assert.ok(stripped.includes("import fs"), `code after comment should survive`);
+    assert.ok(stripped.includes("readFile"), `readFile call should survive`);
+  });
+
+  it("preserves exec() calls in actual code (not in comments)", () => {
+    const source = 'exec("ls -la");';
+    const stripped = stripComments(source);
+    assert.ok(stripped.includes("exec(\""), `exec() call should survive, got: ${stripped}`);
+  });
+
+  it("block comment containing exec(", () => {
+    const source = "/* this used exec() for shell commands */\nconst x = 1;";
+    const stripped = stripComments(source);
+    assert.ok(!stripped.includes("exec("), `exec() in block comment should be stripped, got: ${stripped}`);
+    assert.ok(stripped.includes("const x = 1;"), `code after block comment should survive`);
+  });
+
+  it("mixed comments and code", () => {
+    const source = [
+      "// line comment",
+      'const x = "// not a comment";',
+      "/* block */ const y = 1; // trailing",
+      "const z = 2;",
+    ].join("\n");
+    const stripped = stripComments(source);
+    assert.ok(stripped.includes('const x = "// not a comment";'), `string with // should survive`);
+    assert.ok(!stripped.includes("trailing"), `trailing comment should be stripped`);
+    assert.ok(stripped.includes("const y = 1;"), `code around block comment should survive`);
+    assert.ok(stripped.includes("const z = 2;"), `uncommented line should survive`);
+  });
+
+  it("comment-like patterns in double-quoted string are preserved", () => {
+    const result = stripComments('const a = "/*"; const b = "*/";');
+    assert.equal(result, 'const a = "/*"; const b = "*/";');
+  });
+
+  it("comment-like patterns in single-quoted string are preserved", () => {
+    const result = stripComments("const a = '/*'; const b = '*/';");
+    assert.equal(result, "const a = '/*'; const b = '*/';");
+  });
+
+  it("standalone // inside a string literal is not a comment start", () => {
+    const source = 'const url = "https://example.com/path";\nconst next = 1;';
+    const stripped = stripComments(source);
+    assert.ok(stripped.includes('const url = "https://example.com/path";'), `full line should survive`);
+  });
+
+  it("mixed quotes: single-quoted // does not start comment", () => {
+    const result = stripComments("const x = '//'; const y = 1; // real comment");
+    assert.ok(result.includes("'//'"), `// inside single-quoted string should survive, got: ${result}`);
+    assert.ok(!result.includes("real comment"), `real comment should be stripped`);
+  });
+});
+
+describe("comment-blind exec() assertions", () => {
+  /** Replicates the post-fix assertion pattern from the security-audit e2e test. */
+  function assertNoExecInFixedFile(source: string): { passed: boolean; failures: string[] } {
+    const failures: string[] = [];
+    const stripped = stripComments(source);
+
+    // (a) Assert no import/require of exec/execSync from child_process
+    const hasRequireExec = /require\(.*exec/i.test(stripped);
+    const hasImportExec = /import.*\{.*exec.*\}.*from.*child_process/i.test(stripped);
+    if (hasRequireExec || hasImportExec) {
+      failures.push(
+        `should not import exec/execSync from child_process (require=${hasRequireExec}, import=${hasImportExec})`,
+      );
+    }
+
+    // (b) Assert no exec( or execSync( call exists outside comments
+    if (stripped.includes("exec(") || stripped.includes("execSync(")) {
+      failures.push(
+        `should not call exec()/execSync() (exec(=${stripped.includes("exec(")}, execSync(=${stripped.includes("execSync(")})`,
+      );
+    }
+
+    return { passed: failures.length === 0, failures };
+  }
+
+  it("passes when exec() is only mentioned in a comment (the real-failure scenario)", () => {
+    const source = [
+      '// FIX: use fs.readFile() instead of shell exec() to prevent command injection.',
+      'import fs from "fs";',
+      'export function catFile(filename: string): string {',
+      '  return fs.readFileSync(filename, "utf-8");',
+      '}',
+    ].join("\n");
+    const result = assertNoExecInFixedFile(source);
+    assert.ok(result.passed, `Expected pass but got failures: ${result.failures.join("; ")}`);
+  });
+
+  it("fails when exec() is called in actual non-comment code", () => {
+    const source = [
+      'import { exec } from "child_process";',
+      'export function catFile(filename: string): string {',
+      '  return exec(`cat ${filename}`);',
+      '}',
+    ].join("\n");
+    const result = assertNoExecInFixedFile(source);
+    assert.ok(!result.passed, "Expected failure but got pass");
+    assert.ok(result.failures.length >= 2, `Expected at least 2 failures (import + exec call), got: ${JSON.stringify(result.failures)}`);
+  });
+
+  it("fails when execSync() is called in actual code", () => {
+    const source = [
+      'import { execSync } from "child_process";',
+      'export function catFile(filename: string): string {',
+      '  return execSync(`cat ${filename}`);',
+      '}',
+    ].join("\n");
+    const result = assertNoExecInFixedFile(source);
+    assert.ok(!result.passed, "Expected failure but got pass");
+    assert.ok(result.failures.length >= 2, `Expected at least 2 failures (import + execSync call), got: ${JSON.stringify(result.failures)}`);
+  });
+
+  it("fails when exec is imported from child_process even without a call", () => {
+    const source = 'import { exec } from "child_process";\nconst x = 1;';
+    const result = assertNoExecInFixedFile(source);
+    assert.ok(!result.passed, "Expected failure for exec import but got pass");
+    assert.ok(
+      result.failures.some((f) => f.includes("import")),
+      `Expected import-related failure, got: ${JSON.stringify(result.failures)}`,
+    );
+  });
+
+  it("fails when exec is required from child_process even without a call", () => {
+    const source = 'const { exec } = require("child_process");\nconst x = 1;';
+    const result = assertNoExecInFixedFile(source);
+    assert.ok(!result.passed, "Expected failure for exec require but got pass");
+    assert.ok(
+      result.failures.some((f) => f.includes("import")),
+      `Expected import-related failure covering require, got: ${JSON.stringify(result.failures)}`,
+    );
+  });
+
+  it("passes for a correctly fixed file using fs.readFileSync", () => {
+    const source = [
+      'import fs from "fs";',
+      'export function catFile(filename: string): string {',
+      '  return fs.readFileSync(filename, "utf-8");',
+      '}',
+    ].join("\n");
+    const result = assertNoExecInFixedFile(source);
+    assert.ok(result.passed, `Expected pass but got failures: ${result.failures.join("; ")}`);
+  });
+
+  it("precondition check with stripComments still detects exec() in fixture code", () => {
+    // The fixture has exec() in actual code, not just in a comment
+    const fixtureSource = [
+      'import { exec } from "child_process";',
+      'export function catFile(filename: string): string {',
+      '  return exec(`cat ${filename}`);',
+      '}',
+    ].join("\n");
+    assert.ok(
+      stripComments(fixtureSource).includes("exec("),
+      "stripComments should preserve exec() in actual code",
+    );
+  });
+
+  it("post-fix assertion with import of unrelated 'exec' named function does not false-positive", () => {
+    const source = [
+      'import { exec } from "./utils";',
+      'export function catFile(filename: string): string {',
+      '  return exec(filename);',
+      '}',
+    ].join("\n");
+    // The import regex requires "from child_process" — importing exec from a local module should pass
+    const stripped = stripComments(source);
+    const hasImportExec = /import.*\{.*exec.*\}.*from.*child_process/i.test(stripped);
+    assert.ok(!hasImportExec, "exec import from non-child_process module should not match");
+    // But the exec() call check should still flag it
+    assert.ok(
+      stripped.includes("exec("),
+      "exec() call should still be detected regardless of import source",
+    );
+  });
+
+  it("block comment referencing exec() next to real exec() call → call is detected", () => {
+    const source = [
+      '// FIX: use fs.readFile() instead of shell exec() to prevent command injection.',
+      'import { exec } from "child_process";',
+      'export function catFile(filename: string): string {',
+      '  return exec(`cat ${filename}`);',
+      '}',
+    ].join("\n");
+    const result = assertNoExecInFixedFile(source);
+    assert.ok(!result.passed, "Expected failure even though comment also mentions exec()");
+    assert.ok(
+      result.failures.length >= 1,
+      `Expected failures when real exec() is present alongside comment, got: ${JSON.stringify(result.failures)}`,
+    );
+  });
 });

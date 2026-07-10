@@ -57,6 +57,10 @@ Read the feedback. Fix what the verifier flagged. Don't start over — iterate.
 // GOOD: const safe = path.basename(userFilename); fs.readFile(path.join(uploadDir, safe))
 ```
 
+## Scope Discipline
+
+Fix ONLY the security vulnerability identified in the current story. Do NOT fix, refactor, reformat, or improve any other code, even if you spot obvious bugs or broken logic — those are OUT OF SCOPE for this security audit. If you notice unrelated defects during your work, mention them in the NOTES section of your CHANGES output rather than fixing them.
+
 ## Commit Format
 
 `fix(security): brief description`
@@ -94,3 +98,4 @@ REGRESSION_TEST: what test was added (test name, file, what it verifies)
 - Don't weaken existing security measures
 - Don't commit if tests fail
 - Don't use `// @ts-ignore` to suppress security-related type errors
+- Don't fix bugs outside the security vulnerability scope — report them, don't fix them
