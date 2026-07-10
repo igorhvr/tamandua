@@ -2172,7 +2172,13 @@ async function main() {
       const workerOwnership = (jobId && pidStr)
         ? { jobId, pid: Number(pidStr), ...(pgid ? { pgid } : {}) }
         : undefined;
-      const r = claimStep(target, runIdArg, workerOwnership);
+      let r: ReturnType<typeof claimStep>;
+      try {
+        r = claimStep(target, runIdArg, workerOwnership);
+      } catch (err) {
+        process.stderr.write(`Claim failed: ${(err as Error).message}\n`);
+        process.exit(1);
+      }
       console.log(r.found ? JSON.stringify({ stepId: r.stepId, runId: r.runId, input: r.resolvedInput }) : "NO_WORK");
       return;
     }

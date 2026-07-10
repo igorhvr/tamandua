@@ -22,6 +22,12 @@ import {
 
 const SINGLEFLIGHT_POLL_INTERVAL_MS = 1000; // 1s
 
+// Module-level variables so the catch handler at the bottom can reach the
+// parsed command even when main() throws after parsing (SHCA fix).
+// savedCmdString is used by the SHSH fix (shell semantics via sh -c).
+let savedCmdArgs: string[] = [];
+let savedCmdString: string = "";
+
 // ── CLI argument parsing ──────────────────────────────────────────────
 
 interface ParsedArgs {
@@ -100,17 +106,20 @@ function passthroughNotice(reason: string): void {
 }
 
 /**
- * Execute the command directly with inherited stdio (R14-R15).
+ * Execute the command via a subshell with inherited stdio (R14-R15).
  * Passthrough MUST be indistinguishable from running the raw command
  * except for the single stderr notice already emitted.
+ *
+ * SHSH: Runs the command string through /bin/sh -c to preserve env
+ * prefixes, &&, pipes, quoting — everything the agent's shell would do.
  */
-function passthroughExec(cmdArgs: string[]): void {
-  if (cmdArgs.length === 0) {
+function passthroughExec(cmdString: string): void {
+  if (cmdString.length === 0) {
     process.stderr.write("tamandua-test: error: no command to run\n");
     process.exit(1);
   }
 
-  const child = spawn(cmdArgs[0], cmdArgs.slice(1), {
+  const child = spawn("/bin/sh", ["-c", cmdString], {
     stdio: "inherit",
   });
 
@@ -133,13 +142,16 @@ interface ExecuteResult {
 }
 
 /**
- * Spawn the command, stream stdout/stderr through unmodified, and capture
- * the complete output for ledger recording (R9).
+ * Spawn the command via a subshell, stream stdout/stderr through
+ * unmodified, and capture the complete output for ledger recording (R9).
+ *
+ * SHSH: Runs the command string through /bin/sh -c to preserve env
+ * prefixes, &&, pipes, quoting — everything the agent's shell would do.
  */
-function executeAndCapture(cmdArgs: string[]): Promise<ExecuteResult> {
+function executeAndCapture(cmdString: string): Promise<ExecuteResult> {
   return new Promise((resolve) => {
     const startTime = Date.now();
-    const child: ChildProcess = spawn(cmdArgs[0], cmdArgs.slice(1), {
+    const child: ChildProcess = spawn("/bin/sh", ["-c", cmdString], {
       stdio: ["ignore", "pipe", "pipe"],
     });
 
@@ -316,10 +328,20 @@ async function pollForResult(
 async function main(): Promise<void> {
   const { repo, runId, stepId, force, cmdArgs, cmdString } = parseArgs(process.argv.slice(2));
 
+  // Save parsed command for the catch handler (SHCA fix + SHSH).
+  savedCmdArgs = cmdArgs;
+  savedCmdString = cmdString;
+
+  // Test-only hook: force an unexpected error after parsing so the
+  // SHCA catch-to-passthrough path is exercisable from tests.
+  if (process.env.TAMANDUA_SHIM_TEST_THROW === "1") {
+    throw new Error("TAMANDUA_SHIM_TEST_THROW: forced unexpected error after parsing");
+  }
+
   // R14: TAMANDUA_TSTX=0 — full passthrough.
   if (!isTstxEnabled()) {
     passthroughNotice("TAMANDUA_TSTX=0 kill switch active");
-    passthroughExec(cmdArgs);
+    passthroughExec(cmdString);
     return;
   }
 
@@ -332,7 +354,7 @@ async function main(): Promise<void> {
   // No repo → passthrough.
   if (!repo) {
     passthroughNotice("no --repo specified");
-    passthroughExec(cmdArgs);
+    passthroughExec(cmdString);
     return;
   }
 
@@ -342,7 +364,7 @@ async function main(): Promise<void> {
     repoReal = realpathSync(repo);
   } catch {
     passthroughNotice(`--repo path not found: ${repo}`);
-    passthroughExec(cmdArgs);
+    passthroughExec(cmdString);
     return;
   }
 
@@ -354,7 +376,7 @@ async function main(): Promise<void> {
   const treeHash = computeTreeHash(repoReal);
   if (treeHash === null) {
     passthroughNotice("git tree hash failed (non-git directory or git error)");
-    passthroughExec(cmdArgs);
+    passthroughExec(cmdString);
     return;
   }
 
@@ -367,7 +389,7 @@ async function main(): Promise<void> {
   const lookup = await lookupSuiteRecord(originRepo, treeHash, cmdHash);
   if (lookup === null) {
     passthroughNotice("control plane unreachable at lookup time");
-    passthroughExec(cmdArgs);
+    passthroughExec(cmdString);
     return;
   }
 
@@ -471,7 +493,7 @@ async function main(): Promise<void> {
 
   // R9: Execute the command verbatim, streaming stdout/stderr through,
   //     preserving the exit code.
-  const { exitCode, durationMs, output } = await executeAndCapture(cmdArgs);
+  const { exitCode, durationMs, output } = await executeAndCapture(cmdString);
 
   // R10: Record via control plane. R11: Recording failure MUST NOT affect
   //      exit code or output — log a warning line to stderr and continue.
@@ -502,9 +524,9 @@ async function main(): Promise<void> {
 // ── Entry point ───────────────────────────────────────────────────────
 
 main().catch((err: unknown) => {
-  // Unexpected error — passthrough.
+  // Unexpected error — passthrough with the real command (SHCA fix).
   process.stderr.write(
     `tamandua-test: passthrough mode — unexpected error: ${err instanceof Error ? err.message : String(err)}\n`,
   );
-  passthroughExec([]);
+  passthroughExec(savedCmdString);
 });

@@ -1199,6 +1199,39 @@ export async function executeDispatchRound(
           error: recoveryErr instanceof Error ? recoveryErr.message : String(recoveryErr),
         });
       }
+    } else if (outputSummary.outcome === "no_work") {
+      // The round replied NO_WORK_AVAILABLE — the agent may have left a
+      // dangling claim (e.g. CLTX-type claimStep failure) that blocks its
+      // own step. Check and immediately release any step still held by
+      // this job's claim_job_id. staleThresholdMs=0 means immediate
+      // release (no waiting). Recovery is jobId-scoped so it only touches
+      // steps claimed by THIS round's worker.
+      try {
+        const { recoverOrphanedStepsForAgent } = await import("./step-ops.js");
+        const recoveryResult = recoverOrphanedStepsForAgent(
+          job.agentId,
+          job.runId,
+          0, // staleThresholdMs=0: immediate release, no wait
+          undefined, // no timeout retry reason (not a timeout)
+          undefined, // no failure reason
+          job.id, // workerJobId scoping
+        );
+        if (recoveryResult.recovered > 0 || recoveryResult.failed > 0) {
+          logger.info("Immediate claim release after no_work round (dangling claim detected)", {
+            ...context,
+            outcome: outputSummary.outcome,
+            recovered: recoveryResult.recovered,
+            failed: recoveryResult.failed,
+            skipped: recoveryResult.skipped,
+            reason: "dangling_claim_no_work",
+          });
+        }
+      } catch (recoveryErr) {
+        logger.error("Immediate claim release after no_work round failed", {
+          ...context,
+          error: recoveryErr instanceof Error ? recoveryErr.message : String(recoveryErr),
+        });
+      }
     }
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);

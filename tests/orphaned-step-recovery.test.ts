@@ -1255,3 +1255,286 @@ describe("US-004: Worker-lifecycle recovery regression tests", () => {
     }
   });
 });
+
+// ══════════════════════════════════════════════════════════════════════
+// US-004: CLMR — Immediate dangling claim recovery on no_work rounds
+// ══════════════════════════════════════════════════════════════════════
+
+describe("US-004 CLMR: immediate recovery on no_work", () => {
+  // AC 1: no_work round with dangling claim owned by this job → released
+  it("recovers dangling claim when no_work round owns the step", () => {
+    const db = getDb();
+    const agent = "test_clmr-dangling-own";
+    const runId = crypto.randomUUID();
+    const stepUuid = crypto.randomUUID();
+    const workerJobId = "job-clmr-001";
+    const now = ts();
+
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at) VALUES (?, 'test-wf', 'implement feature', 'running', '{}', ?, ?)"
+    ).run(runId, now, now);
+
+    // Simulate a CLTX-type failure: the claim UPDATE succeeded but the
+    // agent never received the payload — step sits at running with a
+    // claim_job_id from this worker.
+    db.prepare(
+      `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects,
+        status, retry_count, max_retries, type, claim_job_id, created_at, updated_at)
+       VALUES (?, ?, 'dev-step', ?, 0, '', '', 'running', 0, 3, 'single', ?, ?, ?)`
+    ).run(stepUuid, runId, agent, workerJobId, now, now);
+
+    try {
+      // Simulate what executeDispatchRound does on no_work outcome:
+      // recoverOrphanedStepsForAgent with staleThresholdMs=0 and workerJobId
+      const result = recoverOrphanedStepsForAgent(agent, runId, 0, undefined, undefined, workerJobId);
+
+      assert.equal(result.recovered, 1, "should recover 1 dangling step");
+      assert.equal(result.failed, 0, "should not fail any steps");
+
+      // Step is reset to pending (claim_job_id is not cleared by the
+      // recovery code; that's existing sweeper behavior)
+      const step = db.prepare(
+        "SELECT status, retry_count FROM steps WHERE id = ?"
+      ).get(stepUuid) as { status: string; retry_count: number };
+      assert.equal(step.status, "pending", "step should be reset to pending");
+      assert.equal(step.retry_count, 1, "retry_count should be bumped to 1");
+
+      // Run should still be running
+      const run = db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string };
+      assert.equal(run.status, "running");
+
+      // step.worker_lost event emitted
+      const events = getRunEvents(runId);
+      const workerLostEvents = events.filter((e) => e.event === "step.worker_lost");
+      assert.equal(workerLostEvents.length, 1, "should emit exactly 1 step.worker_lost event");
+      assert.match(
+        workerLostEvents[0].detail as string,
+        new RegExp(`Worker ${workerJobId} exited`),
+        "event detail must mention the worker job id",
+      );
+    } finally {
+      db.prepare("DELETE FROM steps WHERE id = ?").run(stepUuid);
+      db.prepare("DELETE FROM runs WHERE id = ?").run(runId);
+    }
+  });
+
+  // AC 2: Dangling claim for a DIFFERENT job's step is NOT touched
+  it("does NOT touch steps claimed by a different worker", () => {
+    const db = getDb();
+    const agent = "test_clmr-dangling-other";
+    const runId = crypto.randomUUID();
+    const stepUuid = crypto.randomUUID();
+    const otherWorkerJobId = "job-clmr-other-worker";
+    const thisWorkerJobId = "job-clmr-this-worker";
+    const now = ts();
+
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at) VALUES (?, 'test-wf', 'implement feature', 'running', '{}', ?, ?)"
+    ).run(runId, now, now);
+
+    // Step claimed by a DIFFERENT worker
+    db.prepare(
+      `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects,
+        status, retry_count, max_retries, type, claim_job_id, created_at, updated_at)
+       VALUES (?, ?, 'dev-step', ?, 0, '', '', 'running', 0, 3, 'single', ?, ?, ?)`
+    ).run(stepUuid, runId, agent, otherWorkerJobId, now, now);
+
+    try {
+      // Recover with a DIFFERENT workerJobId — should skip this step
+      const result = recoverOrphanedStepsForAgent(agent, runId, 0, undefined, undefined, thisWorkerJobId);
+
+      assert.equal(result.recovered, 0, "should recover 0 steps (different worker)");
+      assert.equal(result.skipped, 0, "should skip 0 steps");
+
+      // Step is still running, untouched
+      const step = db.prepare(
+        "SELECT status, retry_count, claim_job_id FROM steps WHERE id = ?"
+      ).get(stepUuid) as { status: string; retry_count: number; claim_job_id: string | null };
+      assert.equal(step.status, "running", "step from other worker must remain running");
+      assert.equal(step.retry_count, 0, "retry_count must be unchanged");
+      assert.equal(step.claim_job_id, otherWorkerJobId, "claim_job_id must be unchanged");
+    } finally {
+      db.prepare("DELETE FROM steps WHERE id = ?").run(stepUuid);
+      db.prepare("DELETE FROM runs WHERE id = ?").run(runId);
+    }
+  });
+
+  // AC 3: Healthy round (no dangling step) — no-op, no events
+  it("is a no-op when no dangling claims exist (healthy round)", () => {
+    const db = getDb();
+    const agent = "test_clmr-healthy";
+    const runId = crypto.randomUUID();
+    const workerJobId = "job-clmr-healthy";
+    const now = ts();
+
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at) VALUES (?, 'test-wf', 'implement feature', 'running', '{}', ?, ?)"
+    ).run(runId, now, now);
+
+    try {
+      const result = recoverOrphanedStepsForAgent(agent, runId, 0, undefined, undefined, workerJobId);
+
+      assert.equal(result.recovered, 0, "should recover 0 steps (nothing dangling)");
+      assert.equal(result.failed, 0, "should fail 0 steps");
+      assert.equal(result.skipped, 0, "should skip 0 steps");
+
+      // No worker_lost events (nothing to recover)
+      const events = getRunEvents(runId);
+      const workerLostEvents = events.filter((e) => e.event === "step.worker_lost");
+      assert.equal(workerLostEvents.length, 0, "should NOT emit step.worker_lost for healthy round");
+    } finally {
+      db.prepare("DELETE FROM runs WHERE id = ?").run(runId);
+    }
+  });
+
+  // AC 4: Story-level recovery with workerJobId → step.worker_lost event
+  it("emits step.worker_lost (not step.timeout) for story-level recovery on no_work", () => {
+    const db = getDb();
+    const agent = "test_clmr-story-no-work";
+    const runId = crypto.randomUUID();
+    const stepUuid = crypto.randomUUID();
+    const storyUuid = crypto.randomUUID();
+    const workerJobId = "job-clmr-story";
+    const now = ts();
+
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at) VALUES (?, 'test-wf', 'implement feature', 'running', '{}', ?, ?)"
+    ).run(runId, now, now);
+
+    // Loop step with a story in progress
+    db.prepare(
+      `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects,
+        status, retry_count, max_retries, type, current_story_id, loop_config, claim_job_id, created_at, updated_at)
+       VALUES (?, ?, 'dev-loop', ?, 0, '', '', 'running', 0, 3, 'loop', ?, '{}', ?, ?, ?)`
+    ).run(stepUuid, runId, agent, storyUuid, workerJobId, now, now);
+
+    db.prepare(
+      `INSERT INTO stories (id, run_id, story_id, story_index, title, description, acceptance_criteria, status, retry_count, max_retries, created_at, updated_at)
+       VALUES (?, ?, 'US-004', 1, 'CLMR story', 'desc', 'ac', 'running', 0, 3, ?, ?)`
+    ).run(storyUuid, runId, now, now);
+
+    try {
+      const result = recoverOrphanedStepsForAgent(agent, runId, 0, undefined, undefined, workerJobId);
+
+      assert.equal(result.recovered, 1, "should recover 1 story");
+
+      // Story is reset to pending, abandon_count incremented
+      const story = db.prepare(
+        "SELECT status, abandoned_count FROM stories WHERE id = ?"
+      ).get(storyUuid) as { status: string; abandoned_count: number };
+      assert.equal(story.status, "pending", "story should be reset to pending");
+      assert.equal(story.abandoned_count, 1, "abandoned_count should be bumped");
+
+      const events = getRunEvents(runId);
+      const workerLostEvents = events.filter((e) => e.event === "step.worker_lost");
+      assert.equal(workerLostEvents.length, 1, "should emit step.worker_lost for story recovery");
+      assert.match(
+        workerLostEvents[0].detail as string,
+        /Worker.*exited without completing story/,
+        "detail should indicate worker exited",
+      );
+    } finally {
+      db.prepare("DELETE FROM steps WHERE id = ?").run(stepUuid);
+      db.prepare("DELETE FROM stories WHERE id = ?").run(storyUuid);
+      db.prepare("DELETE FROM runs WHERE id = ?").run(runId);
+    }
+  });
+
+  // AC 5: no_work with no stale threshold still matches (staleThresholdMs=0)
+  it("matches immediately with staleThresholdMs=0 (no waiting)", () => {
+    const db = getDb();
+    const agent = "test_clmr-no-wait";
+    const runId = crypto.randomUUID();
+    const stepUuid = crypto.randomUUID();
+    const workerJobId = "job-clmr-nowait";
+    const now = ts();
+
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at) VALUES (?, 'test-wf', 'implement feature', 'running', '{}', ?, ?)"
+    ).run(runId, now, now);
+
+    // Step just claimed — updated_at is now (very fresh)
+    db.prepare(
+      `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects,
+        status, retry_count, max_retries, type, claim_job_id, created_at, updated_at)
+       VALUES (?, ?, 'dev-step', ?, 0, '', '', 'running', 0, 3, 'single', ?, ?, ?)`
+    ).run(stepUuid, runId, agent, workerJobId, now, now);
+
+    try {
+      // staleThresholdMs=0 means the step must be recovered even though
+      // updated_at is essentially now — zero wait, immediate release.
+      const result = recoverOrphanedStepsForAgent(agent, runId, 0, undefined, undefined, workerJobId);
+
+      assert.equal(result.recovered, 1, "fresh step must be recovered with staleThresholdMs=0");
+
+      const step = db.prepare(
+        "SELECT status, retry_count FROM steps WHERE id = ?"
+      ).get(stepUuid) as { status: string; retry_count: number };
+      assert.equal(step.status, "pending", "fresh step must be reset to pending immediately");
+      assert.equal(step.retry_count, 1, "retry_count must be bumped");
+    } finally {
+      db.prepare("DELETE FROM steps WHERE id = ?").run(stepUuid);
+      db.prepare("DELETE FROM runs WHERE id = ?").run(runId);
+    }
+  });
+
+  // AC 6: Abandon budget tracking — each no_work recovery increments abandon
+  it("increments abandon_count on each no_work story recovery", () => {
+    const db = getDb();
+    const agent = "test_clmr-abandon-budget";
+    const runId = crypto.randomUUID();
+    const stepUuid = crypto.randomUUID();
+    const storyUuid = crypto.randomUUID();
+    const workerJobId = "job-clmr-abandon";
+    const now = ts();
+
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at) VALUES (?, 'test-wf', 'implement feature', 'running', '{}', ?, ?)"
+    ).run(runId, now, now);
+
+    db.prepare(
+      `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects,
+        status, retry_count, max_retries, type, current_story_id, loop_config, claim_job_id, created_at, updated_at)
+       VALUES (?, ?, 'dev-loop', ?, 0, '', '', 'running', 0, 3, 'loop', ?, '{}', ?, ?, ?)`
+    ).run(stepUuid, runId, agent, storyUuid, workerJobId, now, now);
+
+    db.prepare(
+      `INSERT INTO stories (id, run_id, story_id, story_index, title, description, acceptance_criteria, status, retry_count, max_retries, created_at, updated_at)
+       VALUES (?, ?, 'US-004', 1, 'CLMR story', 'desc', 'ac', 'running', 0, 3, ?, ?)`
+    ).run(storyUuid, runId, now, now);
+
+    try {
+      // First no_work recovery → abandon_count = 1
+      let result = recoverOrphanedStepsForAgent(agent, runId, 0, undefined, undefined, workerJobId);
+      assert.equal(result.recovered, 1);
+
+      let story = db.prepare(
+        "SELECT status, abandoned_count FROM stories WHERE id = ?"
+      ).get(storyUuid) as { status: string; abandoned_count: number };
+      assert.equal(story.status, "pending");
+      assert.equal(story.abandoned_count, 1);
+
+      // Re-claim the story (set it running again with same claim_job_id)
+      db.prepare(
+        "UPDATE steps SET status = 'running', current_story_id = ?, claim_job_id = ?, updated_at = datetime('now') WHERE id = ?"
+      ).run(storyUuid, workerJobId, stepUuid);
+      db.prepare(
+        "UPDATE stories SET status = 'running', updated_at = datetime('now') WHERE id = ?"
+      ).run(storyUuid);
+
+      // Second no_work recovery → abandon_count = 2
+      result = recoverOrphanedStepsForAgent(agent, runId, 0, undefined, undefined, workerJobId);
+      assert.equal(result.recovered, 1);
+
+      story = db.prepare(
+        "SELECT status, abandoned_count FROM stories WHERE id = ?"
+      ).get(storyUuid) as { status: string; abandoned_count: number };
+      assert.equal(story.status, "pending");
+      assert.equal(story.abandoned_count, 2);
+    } finally {
+      db.prepare("DELETE FROM steps WHERE id = ?").run(stepUuid);
+      db.prepare("DELETE FROM stories WHERE id = ?").run(storyUuid);
+      db.prepare("DELETE FROM runs WHERE id = ?").run(runId);
+    }
+  });
+});

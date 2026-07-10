@@ -1,4 +1,4 @@
-import { describe, it, before, after } from "node:test";
+import { describe, it, before, after, mock } from "node:test";
 import assert from "node:assert/strict";
 import { parseOutputKeyValues, parseExpectedKeys, findProducerForMissingKey, resolveTemplate, buildStoryPlanSection, mergeStoryPlanIntoProgress, validateExpects, completeStep, resolveStepContext, failStep, claimStep, getWorkflowId, advancePipeline, recoverOrphanedStepsForAgent } from "../dist/installer/step-ops.js";
 import { getRunEvents } from "../dist/installer/events.js";
@@ -3249,7 +3249,7 @@ describe("getRunProgressPath canonical path resolution", () => {
     assert.ok("progress_file" in context, "context should contain progress_file key");
     assert.equal(context["progress_file"], canonicalPath, "progress_file should be the canonical path");
     assert.ok("progress" in context, "context should still contain progress key");
-    assert.equal(context["progress"], "# Progress Log\n\n## Codebase Patterns\n- Test", "progress should contain file contents");
+    assert.equal(context["progress"], `stored in the file ${canonicalPath} — read only what you need (grep for story ids; the Codebase Patterns section is at the top)`, "progress should be a pointer string, not the full file contents");
 
     fs.unlinkSync(canonicalPath);
   });
@@ -4460,8 +4460,8 @@ describe("claimStep test_cmd wrapping (US-008)", () => {
       `wrapper should include --step flag with step ID, got: ${input}`
     );
     assert.ok(
-      input.includes("-- npm test"),
-      `wrapper should include original command after --, got: ${input}`
+      input.includes("-- 'npm test'"),
+      `wrapper should include quoted command after --, got: ${input}`
     );
 
     // {{test_cmd_raw}} should be the original unwrapped command
@@ -4631,7 +4631,7 @@ describe("claimStep test_cmd wrapping (US-008)", () => {
       `should wrap test_cmd, got: ${input}`
     );
     assert.ok(
-      input.includes("-- npm run test -- --coverage --reporter=json"),
+      input.includes("-- 'npm run test -- --coverage --reporter=json'"),
       `should preserve multi-word command, got: ${input}`
     );
 
@@ -4683,8 +4683,8 @@ describe("claimStep test_cmd wrapping (US-008)", () => {
       `loop step should have wrapped test_cmd, got: ${input}`
     );
     assert.ok(
-      input.includes("-- mvn test"),
-      `should include original command after --, got: ${input}`
+      input.includes("-- 'mvn test'"),
+      `should include quoted command after --, got: ${input}`
     );
 
     assert.ok(
@@ -5209,5 +5209,172 @@ steps:
     // Run must still be running
     const run = db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string };
     assert.equal(run.status, "running", "coexistence: run must still be running after both retry paths");
+  });
+});
+
+describe("claimStep atomic undo on post-claim failure (CLTX)", () => {
+  const _savedStateDir = process.env.TAMANDUA_STATE_DIR;
+  const _savedDbPath = process.env.TAMANDUA_DB_PATH;
+  let _testIsolationDir: string;
+
+  before(() => {
+    _testIsolationDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-cltx-test-"));
+    process.env.TAMANDUA_STATE_DIR = _testIsolationDir;
+    process.env.TAMANDUA_DB_PATH = path.join(_testIsolationDir, "tamandua.db");
+  });
+
+  after(() => {
+    mock.reset();
+    if (_savedStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+    else process.env.TAMANDUA_STATE_DIR = _savedStateDir;
+    if (_savedDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+    else process.env.TAMANDUA_DB_PATH = _savedDbPath;
+    try { fs.rmSync(_testIsolationDir, { recursive: true, force: true }); } catch { /* best effort */ }
+  });
+
+  function ts(): string {
+    return new Date().toISOString();
+  }
+
+  it("single-step: post-claim throw resets step to pending with NULL claim fields and retry_count unchanged", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const stepId = crypto.randomUUID();
+    const now = ts();
+
+    const seededContext = JSON.stringify({ task: "fix bug", repo: "/tmp/repo", branch: "bugfix/x" });
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 1, 'test-wf', 'fix bug', 'running', ?, 0, ?, ?)"
+    ).run(runId, seededContext, now, now);
+
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, created_at, updated_at) VALUES (?, ?, 'fix', 'test-wf_fixer', 0, 'Fix {{task}}\nRETRY FEEDBACK: {{retry_feedback}}', '', 'pending', 0, 4, 'single', ?, ?)"
+    ).run(stepId, runId, now, now);
+
+    // Force post-claim throw by mocking Date.prototype.toISOString.
+    // The first call after the claim UPDATE is in the emitEvent call
+    // inside the try block: new Date().toISOString().
+    mock.method(Date.prototype, 'toISOString', () => { throw new Error("forced post-claim failure"); });
+
+    try {
+      const result = claimStep("test-wf_fixer", runId);
+      assert.equal(result.found, false, "claimStep should return found:false on post-claim failure");
+    } finally {
+      mock.reset();
+    }
+
+    // Verify step was reset to pending with NULL claim fields
+    const step = db.prepare("SELECT status, claim_job_id, claim_pid, claim_pgid, retry_count FROM steps WHERE id = ?").get(stepId) as any;
+    assert.equal(step.status, "pending", "step should be reset to pending");
+    assert.equal(step.claim_job_id, null, "claim_job_id should be NULL");
+    assert.equal(step.claim_pid, null, "claim_pid should be NULL");
+    assert.equal(step.claim_pgid, null, "claim_pgid should be NULL");
+    assert.equal(step.retry_count, 0, "retry_count should be unchanged (0)");
+
+    // Run should still be running
+    const run = db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as any;
+    assert.equal(run.status, "running", "run should still be running");
+
+    // Step should be claimable again (the undo worked)
+    const retryResult = claimStep("test-wf_fixer", runId);
+    assert.equal(retryResult.found, true, "step should be claimable again after undo");
+    assert.equal(retryResult.stepId, stepId, "should claim the same step");
+  });
+
+  it("loop-step: post-claim throw resets step AND story to pending", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const loopStepId = crypto.randomUUID();
+    const storyId = crypto.randomUUID();
+    const setupStepId = crypto.randomUUID();
+    const now = ts();
+
+    const loopConfig = JSON.stringify({ over: "stories" });
+    const seededContext = JSON.stringify({
+      task: "implement feature",
+      repo: "/tmp/repo",
+      branch: "feature/x",
+      verify_feedback: "",
+      timeout_retry: "",
+    });
+
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 1, 'test-wf', 'implement feature', 'running', ?, 0, ?, ?)"
+    ).run(runId, seededContext, now, now);
+
+    // Setup step (index 0): DONE, with REPO and BRANCH in output
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, output, retry_count, max_retries, type, created_at, updated_at) VALUES (?, ?, 'setup', 'test-wf_setup', 0, 'Setup REPO: {{repo}} BRANCH: {{branch}}', '', 'done', 'STATUS: done\nREPO: /tmp/repo\nBRANCH: feature/x', 0, 4, 'single', ?, ?)"
+    ).run(setupStepId, runId, now, now);
+
+    // Loop step (index 1): pending, over stories
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, loop_config, created_at, updated_at) VALUES (?, ?, 'develop', 'test-wf_developer', 1, 'Implement story {{current_story}}', '', 'pending', 0, 4, 'loop', ?, ?, ?)"
+    ).run(loopStepId, runId, loopConfig, now, now);
+
+    // Pre-create a pending story so the loop can claim it
+    db.prepare(
+      "INSERT INTO stories (id, run_id, story_index, story_id, title, description, acceptance_criteria, status, retry_count, max_retries, created_at, updated_at) VALUES (?, ?, 0, 'US-001', 'Test Story', 'A test story', '[]', 'pending', 0, 4, ?, ?)"
+    ).run(storyId, runId, now, now);
+
+    // Force post-claim throw after story claim
+    mock.method(Date.prototype, 'toISOString', () => { throw new Error("forced post-claim failure"); });
+
+    try {
+      const result = claimStep("test-wf_developer", runId);
+      assert.equal(result.found, false, "claimStep should return found:false on post-claim failure");
+    } finally {
+      mock.reset();
+    }
+
+    // Verify loop step was reset to pending with NULL claim fields
+    const step = db.prepare("SELECT status, claim_job_id, claim_pid, claim_pgid, current_story_id, retry_count FROM steps WHERE id = ?").get(loopStepId) as any;
+    assert.equal(step.status, "pending", "loop step should be reset to pending");
+    assert.equal(step.claim_job_id, null, "claim_job_id should be NULL");
+    assert.equal(step.claim_pid, null, "claim_pid should be NULL");
+    assert.equal(step.claim_pgid, null, "claim_pgid should be NULL");
+    assert.equal(step.current_story_id, null, "current_story_id should be NULL");
+    assert.equal(step.retry_count, 0, "retry_count should be unchanged (0)");
+
+    // Verify story was reset to pending
+    const story = db.prepare("SELECT status FROM stories WHERE id = ?").get(storyId) as any;
+    assert.equal(story.status, "pending", "story should be reset to pending");
+
+    // Run should still be running
+    const run = db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as any;
+    assert.equal(run.status, "running", "run should still be running");
+  });
+
+  it("single-step: successful claim with workerOwnership is NOT affected", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const stepId = crypto.randomUUID();
+    const now = ts();
+
+    const seededContext = JSON.stringify({ task: "fix bug", repo: "/tmp/repo", branch: "bugfix/x" });
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 1, 'test-wf', 'fix bug', 'running', ?, 0, ?, ?)"
+    ).run(runId, seededContext, now, now);
+
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, created_at, updated_at) VALUES (?, ?, 'fix', 'test-wf_fixer', 0, 'Fix {{task}}\nRETRY FEEDBACK: {{retry_feedback}}', '', 'pending', 0, 4, 'single', ?, ?)"
+    ).run(stepId, runId, now, now);
+
+    // Normal claim should succeed and record ownership
+    const workerOwnership = { jobId: "test-job-cltx", pid: 99999 };
+    const result = claimStep("test-wf_fixer", runId, workerOwnership);
+
+    assert.equal(result.found, true, "claimStep should succeed with worker ownership");
+    assert.equal(result.stepId, stepId, "should claim the correct step");
+    assert.ok(result.resolvedInput, "resolvedInput should be present");
+
+    // Verify ownership was recorded
+    const step = db.prepare("SELECT status, claim_job_id, claim_pid FROM steps WHERE id = ?").get(stepId) as any;
+    assert.equal(step.status, "running", "step should be running");
+    assert.equal(step.claim_job_id, "test-job-cltx", "claim_job_id should be recorded");
+    assert.equal(step.claim_pid, 99999, "claim_pid should be recorded");
   });
 });

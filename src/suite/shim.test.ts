@@ -1019,4 +1019,240 @@ describe("tamandua-test shim", { concurrency: 1 }, () => {
     // Cleanup: wait for shim to finish.
     await shimPromise.catch(() => {});
   });
+
+  // ════════════════════════════════════════════════════════════════════
+  // US-001: SHCA — Catch handler uses saved command on unexpected error
+  // ════════════════════════════════════════════════════════════════════
+
+  it("SHCA: catch handler executes real command when main throws after parsing", async () => {
+    const env = shimChildEnv(controlEnv, {
+      TAMANDUA_SHIM_TEST_THROW: "1",
+    });
+    const r = await runShim(
+      ["--repo", repoDir, "--run", "r-shca", "--step", "s1", "--", passScript],
+      env,
+    );
+    // The command must still execute despite the forced error in main().
+    assert.equal(r.exitCode, 0, "command should execute and exit 0 on pass");
+    assert.ok(
+      r.stdout.includes("PASS: all tests passed"),
+      "should see test command output",
+    );
+    // The catch handler log must appear on stderr.
+    assert.ok(
+      r.stderr.includes("passthrough mode — unexpected error"),
+      "catch handler should log the passthrough notice",
+    );
+    assert.ok(
+      r.stderr.includes("TAMANDUA_SHIM_TEST_THROW"),
+      "should include the forced error message",
+    );
+  });
+
+  it("SHCA: catch handler exits with error when no command is parseable", async () => {
+    // When no command is provided at all, savedCmdArgs stays empty and the
+    // catch must exit 1 with a clear message (not silently succeed).
+    const env = shimChildEnv(controlEnv, {
+      TAMANDUA_SHIM_TEST_THROW: "1",
+    });
+    // No -- separator → no command args.
+    const r = await runShim(
+      ["--repo", repoDir, "--run", "r-shca-nocmd", "--step", "s1"],
+      env,
+    );
+    assert.notEqual(r.exitCode, 0, "should exit non-zero when no command is available");
+    assert.ok(
+      r.stderr.includes("passthrough mode — unexpected error"),
+      "catch handler should log the error",
+    );
+    assert.ok(
+      r.stderr.includes("no command to run"),
+      "should report no command to run",
+    );
+  });
+
+  it("SHCA: catch handler propagates exit code of failing command", async () => {
+    // When the saved command fails, the catch handler must propagate the
+    // non-zero exit code (not mask it with a shim error exit).
+    const env = shimChildEnv(controlEnv, {
+      TAMANDUA_SHIM_TEST_THROW: "1",
+    });
+    const r = await runShim(
+      ["--repo", repoDir, "--run", "r-shca-fail", "--step", "s1", "--", failScript],
+      env,
+    );
+    assert.equal(r.exitCode, 1, "should propagate exit code 1 from failing command");
+    assert.ok(
+      r.stderr.includes("passthrough mode — unexpected error"),
+      "catch handler should log the error",
+    );
+    assert.ok(
+      r.stderr.includes("FAIL: something broke"),
+      "should see failure output from command",
+    );
+  });
+
+  // ════════════════════════════════════════════════════════════════════
+  // US-002: SHSH — Shell semantics for non-trivial test commands
+  // ════════════════════════════════════════════════════════════════════
+
+  // Create helper scripts for SHSH tests.
+  let echoArgScript: string;
+  let envCheckScript: string;
+
+  before(async () => {
+    // Script that echoes its first argument.
+    echoArgScript = join(repoDir, "echo-arg.sh");
+    writeFileSync(echoArgScript, "#!/bin/sh\necho \"ARG:$1\"\nexit 0\n");
+    chmodSync(echoArgScript, 0o755);
+
+    // Script that checks an env var.
+    envCheckScript = join(repoDir, "env-check.sh");
+    writeFileSync(envCheckScript, "#!/bin/sh\necho \"MYVAR=$MYVAR\"\nexit 0\n");
+    chmodSync(envCheckScript, 0o755);
+  });
+
+  // ── SHSH AC4: Env-prefixed command executes correctly ─────────────
+
+  it("SHSH: env-prefixed command executes correctly through the shim", async () => {
+    const env = shimChildEnv(controlEnv);
+    const r = await runShim(
+      ["--repo", repoDir, "--run", "r-shsh-env", "--step", "s1", "--", `MYVAR=hello ${envCheckScript}`],
+      env,
+    );
+    assert.equal(r.exitCode, 0, "should exit 0");
+    assert.ok(
+      r.stdout.includes("MYVAR=hello"),
+      "should see the env var value in output",
+    );
+    assert.ok(
+      !r.stdout.includes("TAMANDUA-TEST CACHED"),
+      "first run should execute, not replay",
+    );
+  });
+
+  // ── SHSH AC5: Compound command with && produces one ledger entry ──
+
+  it("SHSH: compound command with && executes both parts and replays correctly", async () => {
+    const env = shimChildEnv(controlEnv);
+
+    // Build a compound command: pass script && counter script.
+    const cmd = `${passScript} && ${counterScript}`;
+
+    // First invocation: must execute.
+    const r1 = await runShim(
+      ["--repo", repoDir, "--run", "r-shsh-and", "--step", "s1", "--", cmd],
+      env,
+    );
+    assert.equal(r1.exitCode, 0, "first execution should pass");
+    assert.ok(r1.stdout.includes("PASS: all tests passed"), "should see pass script output");
+    assert.ok(r1.stdout.includes("run 1"), "should see counter increment");
+    assert.ok(!r1.stdout.includes("TAMANDUA-TEST CACHED"), "first run must NOT be a replay");
+
+    // Reset counter for replay verification.
+    writeFileSync(counterFile, "0");
+
+    // Second invocation: should replay with CACHED banner.
+    const r2 = await runShim(
+      ["--repo", repoDir, "--run", "r-shsh-and", "--step", "s2", "--", cmd],
+      env,
+    );
+    assert.equal(r2.exitCode, 0, "replay should exit 0");
+    assert.ok(r2.stdout.includes("TAMANDUA-TEST CACHED"), "second run should replay");
+
+    // Counter should NOT have incremented (replay, not real execution).
+    const count = parseInt(readFileSync(counterFile, "utf-8").trim(), 10);
+    assert.equal(count, 0, "counter should not increment on replay");
+
+    // Verify the replay output contains recorded output.
+    assert.ok(
+      r2.stdout.includes("PASS: all tests passed") || r2.stdout.includes("run 1"),
+      "replay should include recorded output",
+    );
+
+    // Only one ledger entry for the full compound string.
+    const db2 = new DatabaseSync(controlEnv.dbPath);
+    const rows = db2
+      .prepare("SELECT COUNT(*) as cnt FROM suite_results WHERE run_id = ?")
+      .get("r-shsh-and") as { cnt: number };
+    assert.equal(rows.cnt, 1, "should have exactly one ledger entry for compound command");
+    db2.close();
+  });
+
+  // ── SHSH AC6: Command with embedded quotes survives round-trip ────
+
+  it("SHSH: command with embedded single quotes survives shell round-trip", async () => {
+    const env = shimChildEnv(controlEnv);
+
+    // Use echo-arg.sh with an argument containing single quotes.
+    // The arg it's a test needs to survive the shell round-trip.
+    const cmd = `${echoArgScript} "it's a test"`;
+    const r = await runShim(
+      ["--repo", repoDir, "--run", "r-shsh-quote", "--step", "s1", "--", cmd],
+      env,
+    );
+    assert.equal(r.exitCode, 0, "should exit 0");
+    assert.ok(
+      r.stdout.includes("ARG:it's a test"),
+      `should echo the argument with single quote preserved, got: ${r.stdout}`,
+    );
+  });
+
+  // ── SHSH AC7: Simple command still works unchanged ────────────────
+
+  it("SHSH: simple command still works unchanged", async () => {
+    // Clear any cached result from previous tests on the same tree.
+    await clearSuiteResults();
+
+    const env = shimChildEnv(controlEnv);
+    const r = await runShim(
+      ["--repo", repoDir, "--run", "r-shsh-simple", "--step", "s1", "--", passScript],
+      env,
+    );
+    assert.equal(r.exitCode, 0, "should execute and exit 0");
+    assert.ok(r.stdout.includes("PASS: all tests passed"), "should see command output");
+    assert.ok(!r.stdout.includes("TAMANDUA-TEST CACHED"), "fresh cache should execute, not replay");
+  });
+
+  // ── SHSH: Pipe semantics work through the shell ───────────────────
+
+  it("SHSH: command with pipe executes correctly", async () => {
+    const env = shimChildEnv(controlEnv);
+
+    // echo "hello" | cat — exercises pipe through sh -c.
+    const r = await runShim(
+      ["--repo", repoDir, "--run", "r-shsh-pipe", "--step", "s1", "--", `echo "hello from pipe" | cat`],
+      env,
+    );
+    assert.equal(r.exitCode, 0, "should exit 0");
+    assert.ok(
+      r.stdout.includes("hello from pipe"),
+      `should see piped output, got: ${r.stdout}`,
+    );
+  });
+
+  // ── SHSH: wrapTestCmdInContext escaping — single-quote round-trip ─
+
+  it("SHSH: command flows through step-ops wrapping and executes via sh -c", async () => {
+    // Simulate what wrapTestCmdInContext produces: a single-quoted command
+    // after --. The quoting ensures the full command reaches the shim as
+    // one argv element, then sh -c executes it with shell semantics.
+    //
+    // Example: tamandua-test --repo X --run Y --step Z -- 'npm run build && npm test'
+    //                     argv → ['npm run build && npm test'] (one element)
+    //                     cmdString → 'npm run build && npm test'
+    //                     sh -c 'npm run build && npm test' → correct
+    const env = shimChildEnv(controlEnv);
+
+    // Pass the full compound command as a single argv element (simulating
+    // how wrapTestCmdInContext single-quotes it for the agent's shell).
+    const cmd = `${passScript} && ${counterScript}`;
+    const r = await runShim(
+      ["--repo", repoDir, "--run", "r-shsh-wrap", "--step", "s1", "--", cmd],
+      env,
+    );
+    assert.equal(r.exitCode, 0, "should execute and exit 0");
+    assert.ok(r.stdout.includes("PASS: all tests passed"), "should see pass output");
+    assert.ok(r.stdout.includes("run 1"), "counter should increment");
+  });
 });

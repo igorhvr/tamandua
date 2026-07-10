@@ -1157,7 +1157,7 @@ export function recoverOrphanedStepsForAgent(
   const clauses: string[] = ["agent_id = ?", "status = 'running'", "run_id = ?"];
   const params: (string | number)[] = [agentId, runId];
   if (staleThresholdMs !== undefined) {
-    clauses.push("(julianday('now') - julianday(updated_at)) * 86400000 > ?");
+    clauses.push("(julianday('now') - julianday(updated_at)) * 86400000 >= ?");
     params.push(staleThresholdMs);
   }
   // Ownership-aware filter: when workerJobId is provided, skip steps
@@ -1513,7 +1513,11 @@ const CLEANUP_THROTTLE_MS = 5 * 60 * 1000;
  * wrapped shim invocation (R18, R19).
  *
  * Example: if test_cmd = "npm test", replaces it with:
- *   tamandua-test --repo <repo> --run <run_id> --step <step_id> -- npm test
+ *   tamandua-test --repo <repo> --run <run_id> --step <step_id> -- 'npm test'
+ *
+ * SHSH: The command is single-quoted (with embedded single quotes
+ * properly escaped) so that shell operators (&&, |, env prefixes, etc.)
+ * survive the agent's shell and reach the shim as a single argv element.
  *
  * Does nothing if test_cmd is missing, empty, or whitespace-only.
  */
@@ -1528,7 +1532,11 @@ function wrapTestCmdInContext(
   if (!repo) return;
 
   context["test_cmd_raw"] = testCmd;
-  context["test_cmd"] = `tamandua-test --repo ${repo} --run ${runId} --step ${stepId} -- ${testCmd}`;
+  // SHSH: single-quote the command with proper escaping of embedded
+  // single quotes so it arrives as a single argv element when the
+  // agent's shell parses the wrapped line.
+  const escaped = testCmd.replace(/'/g, "'\\''");
+  context["test_cmd"] = `tamandua-test --repo ${repo} --run ${runId} --step ${stepId} -- '${escaped}'`;
 }
 
 /**
@@ -1619,10 +1627,11 @@ export function claimStep(agentId: string, runId: string, workerOwnership?: Work
       );
       if ((claim.changes ?? 0) <= 0) return { found: false };
 
-      // C19a: capture whether this step was rerouted BEFORE the claim
-      // UPDATE clears claim_invalidated_by, so we can detect no-op bounces
-      // in the auto-complete path below (all stories done → no agent runs).
-      const wasRerouted = step.claim_invalidated_by === "reroute";
+      try {
+        // C19a: capture whether this step was rerouted BEFORE the claim
+        // UPDATE clears claim_invalidated_by, so we can detect no-op bounces
+        // in the auto-complete path below (all stories done → no agent runs).
+        const wasRerouted = step.claim_invalidated_by === "reroute";
 
       if (!runHasStories(step.run_id)) {
         const message = "Loop cannot run because planning did not produce STORIES_JSON.";
@@ -1737,7 +1746,7 @@ export function claimStep(agentId: string, runId: string, workerOwnership?: Work
       context["current_story_title"] = story.title;
       context["completed_stories"] = formatCompletedStories(allStories);
       context["stories_remaining"] = String(pendingCount);
-      context["progress"] = readProgressFile(step.run_id);
+      context["progress"] = `stored in the file ${getRunProgressPath(step.run_id)} — read only what you need (grep for story ids; the Codebase Patterns section is at the top)`;
       context["progress_file"] = getRunProgressPath(step.run_id);
 
       if (!context["verify_feedback"]) {
@@ -1785,7 +1794,24 @@ export function claimStep(agentId: string, runId: string, workerOwnership?: Work
         db.prepare("UPDATE runs SET context = ?, updated_at = datetime('now') WHERE id = ?").run(JSON.stringify(context), step.run_id);
       }
 
-      return { found: true, stepId: step.id, runId: step.run_id, resolvedInput };
+        return { found: true, stepId: step.id, runId: step.run_id, resolvedInput };
+      } catch (err) {
+        // CLTX: post-claim work threw — undo the claim atomically.
+        // Don't increment retry_count because the agent never saw the work.
+        db.prepare(
+          "UPDATE steps SET status = 'pending', claim_job_id = NULL, claim_pid = NULL, claim_pgid = NULL, current_story_id = NULL, updated_at = datetime('now') WHERE id = ?"
+        ).run(step.id);
+        // Reset any running story for this run back to pending
+        db.prepare(
+          "UPDATE stories SET status = 'pending', updated_at = datetime('now') WHERE run_id = ? AND status = 'running'"
+        ).run(step.run_id);
+        logger.warn(`Post-claim work failed for loop step, resetting step to pending: ${(err as Error).message}`, {
+          runId: step.run_id,
+          stepId: step.step_id,
+          error: (err as Error).message,
+        });
+        return { found: false };
+      }
     }
   }
 
@@ -1798,63 +1824,77 @@ export function claimStep(agentId: string, runId: string, workerOwnership?: Work
     ...(workerOwnership ? [workerOwnership.jobId, workerOwnership.pid, workerOwnership.pgid ?? null, step.id] : [step.id])
   );
   if ((claim.changes ?? 0) <= 0) return { found: false };
-  emitEvent({ ts: new Date().toISOString(), event: "step.running", runId: step.run_id, workflowId: getWorkflowId(step.run_id), stepId: step.step_id, agentId });
-  logger.info(`Step claimed by ${agentId}`, { runId: step.run_id, stepId: step.step_id });
+  try {
+    emitEvent({ ts: new Date().toISOString(), event: "step.running", runId: step.run_id, workflowId: getWorkflowId(step.run_id), stepId: step.step_id, agentId });
+    logger.info(`Step claimed by ${agentId}`, { runId: step.run_id, stepId: step.step_id });
 
-  // Inject progress for any step in a run that has stories
-  const hasStories = db.prepare(
-    "SELECT COUNT(*) as cnt FROM stories WHERE run_id = ?"
-  ).get(step.run_id) as { cnt: number };
-  if (hasStories.cnt > 0) {
-    context["progress"] = readProgressFile(step.run_id);
-    context["progress_file"] = getRunProgressPath(step.run_id);
-  }
-
-  // Clear one-shot timeout_retry after the template has captured it.
-  // For single (non-loop) steps the context isn't persisted here, so
-  // remove the key from the DB explicitly to prevent it from leaking
-  // into downstream steps.
-  const hasTimeoutRetry = Boolean(context["timeout_retry"]);
-
-  if (!context["verify_feedback"]) {
-    context["verify_feedback"] = "";
-  }
-  if (!context["timeout_retry"]) {
-    context["timeout_retry"] = "";
-  }
-
-  // Wrap test_cmd with tamandua-test shim (R18-R19)
-  wrapTestCmdInContext(context, context["repo"], step.run_id, step.step_id);
-
-  const missingKeys = findMissingTemplateKeys(step.input_template, context);
-  const blockResult = resolveMissingKeys(
-    step.run_id, step.step_index, step.step_id, step.id, agentId, missingKeys
-  );
-  if (blockResult !== 'proceed') {
-    if (blockResult === 'rejected') {
-      // Unclaim the step: reset to pending so the scheduler re-evaluates
-      db.prepare(
-        "UPDATE steps SET status = 'pending', claim_job_id = NULL, claim_pid = NULL, claim_pgid = NULL, updated_at = datetime('now') WHERE id = ?"
-      ).run(step.id);
+    // Inject progress for any step in a run that has stories
+    const hasStories = db.prepare(
+      "SELECT COUNT(*) as cnt FROM stories WHERE run_id = ?"
+    ).get(step.run_id) as { cnt: number };
+    if (hasStories.cnt > 0) {
+      context["progress"] = `stored in the file ${getRunProgressPath(step.run_id)} — read only what you need (grep for story ids; the Codebase Patterns section is at the top)`;
+      context["progress_file"] = getRunProgressPath(step.run_id);
     }
-    // blockResult is a string (fail message): failRunForMissingTemplateKeys
-    // already marked step + run as failed; just bail.
+
+    // Clear one-shot timeout_retry after the template has captured it.
+    // For single (non-loop) steps the context isn't persisted here, so
+    // remove the key from the DB explicitly to prevent it from leaking
+    // into downstream steps.
+    const hasTimeoutRetry = Boolean(context["timeout_retry"]);
+
+    if (!context["verify_feedback"]) {
+      context["verify_feedback"] = "";
+    }
+    if (!context["timeout_retry"]) {
+      context["timeout_retry"] = "";
+    }
+
+    // Wrap test_cmd with tamandua-test shim (R18-R19)
+    wrapTestCmdInContext(context, context["repo"], step.run_id, step.step_id);
+
+    const missingKeys = findMissingTemplateKeys(step.input_template, context);
+    const blockResult = resolveMissingKeys(
+      step.run_id, step.step_index, step.step_id, step.id, agentId, missingKeys
+    );
+    if (blockResult !== 'proceed') {
+      if (blockResult === 'rejected') {
+        // Unclaim the step: reset to pending so the scheduler re-evaluates
+        db.prepare(
+          "UPDATE steps SET status = 'pending', claim_job_id = NULL, claim_pid = NULL, claim_pgid = NULL, updated_at = datetime('now') WHERE id = ?"
+        ).run(step.id);
+      }
+      // blockResult is a string (fail message): failRunForMissingTemplateKeys
+      // already marked step + run as failed; just bail.
+      return { found: false };
+    }
+
+    const resolvedInput = resolveTemplate(step.input_template, context);
+
+    if (hasTimeoutRetry) {
+      delete context["timeout_retry"];
+      setRunContextKey(step.run_id, "timeout_retry", "");
+    }
+
+    return {
+      found: true,
+      stepId: step.id,
+      runId: step.run_id,
+      resolvedInput,
+    };
+  } catch (err) {
+    // CLTX: post-claim work threw — undo the claim atomically.
+    // Don't increment retry_count because the agent never saw the work.
+    db.prepare(
+      "UPDATE steps SET status = 'pending', claim_job_id = NULL, claim_pid = NULL, claim_pgid = NULL, updated_at = datetime('now') WHERE id = ?"
+    ).run(step.id);
+    logger.warn(`Post-claim work failed for single step, resetting step to pending: ${(err as Error).message}`, {
+      runId: step.run_id,
+      stepId: step.step_id,
+      error: (err as Error).message,
+    });
     return { found: false };
   }
-
-  const resolvedInput = resolveTemplate(step.input_template, context);
-
-  if (hasTimeoutRetry) {
-    delete context["timeout_retry"];
-    setRunContextKey(step.run_id, "timeout_retry", "");
-  }
-
-  return {
-    found: true,
-    stepId: step.id,
-    runId: step.run_id,
-    resolvedInput,
-  };
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -3238,7 +3278,7 @@ export function resolveStepContext(
     context["completed_stories"] = formatCompletedStories(allStories);
     const pendingCount = allStories.filter((s) => s.status === "pending" || s.status === "running").length;
     context["stories_remaining"] = String(pendingCount);
-    context["progress"] = readProgressFile(runId);
+    context["progress"] = `stored in the file ${getRunProgressPath(runId)} — read only what you need (grep for story ids; the Codebase Patterns section is at the top)`;
     context["progress_file"] = getRunProgressPath(runId);
 
     if (!context["verify_feedback"]) {
