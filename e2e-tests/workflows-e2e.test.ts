@@ -107,8 +107,9 @@ function assertRepoClean(repoDir: string, context: string): void {
 }
 
 /**
- * stripComments removes // line comments and /* */ block comments from
- * source code, while preserving // and /* inside string literals.
+ * stripComments removes line comments (double-slash) and block comments
+ * (slash-star to star-slash) from source code, while preserving those
+ * character sequences inside string literals.
  *
  * This allows assertions on source content (e.g. checking for exec()
  * calls) without being tripped by comment mentions like
@@ -787,8 +788,10 @@ describe(
           );
           const strippedPostServerTs = stripComments(postServerTs);
           // (a) Assert no import/require of exec/execSync from child_process
+          // (covers both ESM imports and CommonJS requires, incl. destructuring)
           assert.ok(
-            !/require\(.*exec/i.test(strippedPostServerTs) &&
+            !(/require\(\s*["'](node:)?child_process["']\s*\)/i.test(strippedPostServerTs) &&
+              /\bexec(Sync)?\b/i.test(strippedPostServerTs)) &&
               !/import.*\{.*exec.*\}.*from.*child_process/i.test(strippedPostServerTs),
             `src/server.ts should not import exec/execSync from child_process after fix. Content:\n${postServerTs.substring(0, 800)}`,
           );
@@ -1005,6 +1008,7 @@ describe("real e2e do-now workflow (LIVE agent, daemon, scheduler)", () => {
       }
     },
   );
+});
 
 // ── stripComments unit tests ────────────────────────────────────────────
 describe("stripComments helper", () => {
@@ -1131,7 +1135,10 @@ describe("comment-blind exec() assertions", () => {
     const stripped = stripComments(source);
 
     // (a) Assert no import/require of exec/execSync from child_process
-    const hasRequireExec = /require\(.*exec/i.test(stripped);
+    // (covers both ESM imports and CommonJS requires, incl. destructuring)
+    const hasRequireExec =
+      /require\(\s*["'](node:)?child_process["']\s*\)/i.test(stripped) &&
+      /\bexec(Sync)?\b/i.test(stripped);
     const hasImportExec = /import.*\{.*exec.*\}.*from.*child_process/i.test(stripped);
     if (hasRequireExec || hasImportExec) {
       failures.push(
