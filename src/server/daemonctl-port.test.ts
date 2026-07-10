@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createTempHome } from "../../tests/helpers/test-env.ts";
 import assert from "node:assert/strict";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import {
@@ -17,14 +18,14 @@ describe("daemonctl port helpers", () => {
 
   beforeEach(() => {
     originalHome = process.env.HOME;
-    tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-daemonctl-"));
+    const { homeDir } = createTempHome("tamandua-daemonctl-");
+    tempHome = homeDir;
     process.env.HOME = tempHome;
   });
 
   afterEach(() => {
     if (originalHome) process.env.HOME = originalHome;
     else delete process.env.HOME;
-    fs.rmSync(tempHome, { recursive: true, force: true });
   });
 
   const opts = () => ({ homeDir: tempHome });

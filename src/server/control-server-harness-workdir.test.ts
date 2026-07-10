@@ -5,6 +5,7 @@ import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
+import { createTempHome } from "../../tests/helpers/test-env.ts";
 import crypto from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { createControlServer } from "../../dist/server/control-server.js";
@@ -31,7 +32,6 @@ beforeEach(() => {
 afterEach(async () => {
   shutdownAllCrons();
   for (const dir of cleanupDirs) {
-    fs.rmSync(dir, { recursive: true, force: true });
   }
   cleanupDirs = [];
   if (originalStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
@@ -43,7 +43,7 @@ afterEach(async () => {
 });
 
 function makeTempRoot(): string {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-harness-workdir-"));
+  const { root: root } = createTempHome("tamandua-harness-workdir-");
   cleanupDirs.push(root);
   return root;
 }

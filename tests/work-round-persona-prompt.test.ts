@@ -7,21 +7,20 @@
  */
 
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { describe, it } from "node:test";
-import { cleanChildEnv } from "./helpers/test-env.ts";
+import { cleanChildEnv, createTempHome } from "./helpers/test-env.ts";
 
 const repoRoot = process.cwd();
 
 function runRoundAndCapturePrompt(opts: { personaFiles?: Record<string, string> }): string {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-work-persona-"));
-  const homeDir = path.join(root, "home");
-  const stateDir = path.join(homeDir, ".tamandua");
-  fs.mkdirSync(stateDir, { recursive: true });
+  const th = createTempHome("tamandua-work-persona-");
+  const root = th.root;
+  const homeDir = th.homeDir;
+  const stateDir = th.tamanduaDir;
 
   const agentId = "wf-persona_dev";
   const workspaceDir = path.join(stateDir, "workspaces", "workflows", agentId);
@@ -43,45 +42,41 @@ function runRoundAndCapturePrompt(opts: { personaFiles?: Record<string, string> 
   const runId = crypto.randomUUID();
   const stepId = crypto.randomUUID();
 
-  try {
-    const script = `
-      import { executeDispatchRound } from "./dist/installer/agent-scheduler.js";
-      import { getDb } from "./dist/db.js";
+  const script = `
+    import { executeDispatchRound } from "./dist/installer/agent-scheduler.js";
+    import { getDb } from "./dist/db.js";
 
-      const db = getDb();
-      const now = new Date().toISOString();
-      db.prepare(
-        "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 'wf-persona', 'persona test', 'running', '{}', 0, ?, ?)"
-      ).run(${JSON.stringify(runId)}, now, now);
-      db.prepare(
-        "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, created_at, updated_at) VALUES (?, ?, 'work', ?, 0, 'work', '', 'pending', ?, ?)"
-      ).run(${JSON.stringify(stepId)}, ${JSON.stringify(runId)}, ${JSON.stringify(agentId)}, now, now);
+    const db = getDb();
+    const now = new Date().toISOString();
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 'wf-persona', 'persona test', 'running', '{}', 0, ?, ?)"
+    ).run(${JSON.stringify(runId)}, now, now);
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, created_at, updated_at) VALUES (?, ?, 'work', ?, 0, 'work', '', 'pending', ?, ?)"
+    ).run(${JSON.stringify(stepId)}, ${JSON.stringify(runId)}, ${JSON.stringify(agentId)}, now, now);
 
-      const job = {
-        id: "job-persona",
-        workflowId: "wf-persona",
-        agentId: ${JSON.stringify(agentId)},
-        runId: ${JSON.stringify(runId)},
-        timeoutSeconds: 30,
-        workingDirectoryForHarness: process.cwd(),
-        createdAt: now,
-      };
-      await executeDispatchRound(job, { id: "dev", role: "coding", workspace: { baseDir: process.cwd(), files: {} } });
-      console.log(JSON.stringify({ done: true }));
-    `;
-    const result = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
-      cwd: repoRoot,
-      env: cleanChildEnv({ HOME: homeDir, TAMANDUA_PI_BINARY: fakePi, TAMANDUA_STATE_DIR: stateDir }),
-      encoding: "utf-8",
-      maxBuffer: 16 * 1024 * 1024,
-    });
-    if (result.status !== 0) {
-      throw new Error(`script failed (${result.status})\nSTDOUT:\n${result.stdout}\nSTDERR:\n${result.stderr}`);
-    }
-    return fs.existsSync(promptPath) ? fs.readFileSync(promptPath, "utf-8") : "";
-  } finally {
-    fs.rmSync(root, { recursive: true, force: true });
+    const job = {
+      id: "job-persona",
+      workflowId: "wf-persona",
+      agentId: ${JSON.stringify(agentId)},
+      runId: ${JSON.stringify(runId)},
+      timeoutSeconds: 30,
+      workingDirectoryForHarness: process.cwd(),
+      createdAt: now,
+    };
+    await executeDispatchRound(job, { id: "dev", role: "coding", workspace: { baseDir: process.cwd(), files: {} } });
+    console.log(JSON.stringify({ done: true }));
+  `;
+  const result = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+    cwd: repoRoot,
+    env: cleanChildEnv({ HOME: homeDir, TAMANDUA_PI_BINARY: fakePi, TAMANDUA_STATE_DIR: stateDir }),
+    encoding: "utf-8",
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  if (result.status !== 0) {
+    throw new Error(`script failed (${result.status})\nSTDOUT:\n${result.stdout}\nSTDERR:\n${result.stderr}`);
   }
+  return fs.existsSync(promptPath) ? fs.readFileSync(promptPath, "utf-8") : "";
 }
 
 describe("work-round persona prompt injection", () => {

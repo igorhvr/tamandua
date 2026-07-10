@@ -12,7 +12,7 @@ import { EventEmitter } from "node:events";
 import { PassThrough, Readable } from "node:stream";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import * as os from "node:os";
+import { createTempHome } from "../../tests/helpers/test-env.ts";
 
 import type { PiSpawnFn } from "../../dist/cli/wizard-evaluator.js";
 import {
@@ -157,7 +157,7 @@ function createFakeCommandSpawn(exitCodes: number[]): FakeCommandSpawn {
 // ── Isolated temp dir for cwd ──────────────────────────────────────
 
 function makeTempDir(): string {
-  return fs.mkdtempSync(path.join(os.tmpdir(), "wizard-test-"));
+  return createTempHome("wizard-test-").root;
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -220,7 +220,6 @@ describe("runWizard", () => {
         commandSpawn: cmdSpawn,
       });
     } finally {
-      fs.rmSync(tempDir, { recursive: true, force: true });
     }
 
     // Should have asked 3 questions (first + 2 follow-up)
@@ -275,7 +274,6 @@ describe("runWizard", () => {
         commandSpawn: cmdSpawn,
       });
     } finally {
-      fs.rmSync(tempDir, { recursive: true, force: true });
     }
 
     // Display should show single loop command (no init)
@@ -345,7 +343,6 @@ describe("runWizard", () => {
         commandSpawn: cmdSpawn,
       });
     } finally {
-      fs.rmSync(tempDir, { recursive: true, force: true });
     }
 
     assert.ok(terminal.output.some(l => l.includes(ready.commentary)));
@@ -408,7 +405,6 @@ describe("runWizard", () => {
         commandSpawn: cmdSpawn,
       });
     } finally {
-      fs.rmSync(tempDir, { recursive: true, force: true });
     }
 
     // Should have ONLY spawned init (not loop)
@@ -467,7 +463,6 @@ describe("runWizard", () => {
         commandSpawn: cmdSpawn,
       });
     } finally {
-      fs.rmSync(tempDir, { recursive: true, force: true });
     }
 
     assert.equal(cmdSpawn.spawnedCommands.length, 0);
@@ -527,7 +522,6 @@ describe("runWizard", () => {
         commandSpawn: cmdSpawn,
       });
     } finally {
-      fs.rmSync(tempDir, { recursive: true, force: true });
     }
 
     // Should have spawned the adjusted loop command
@@ -594,7 +588,6 @@ describe("runWizard", () => {
         commandSpawn: cmdSpawn,
       });
     } finally {
-      fs.rmSync(tempDir, { recursive: true, force: true });
     }
 
     // Should have printed error about invalid commands
@@ -655,7 +648,6 @@ describe("runWizard", () => {
         commandSpawn: cmdSpawn,
       });
     } finally {
-      fs.rmSync(tempDir, { recursive: true, force: true });
     }
 
     // Should show error recovery message
@@ -699,7 +691,6 @@ describe("runWizard", () => {
         commandSpawn: cmdSpawn,
       });
     } finally {
-      fs.rmSync(tempDir, { recursive: true, force: true });
     }
 
     // First output lines should contain the explanation
@@ -741,7 +732,6 @@ describe("runWizard", () => {
         commandSpawn: cmdSpawn,
       });
     } finally {
-      fs.rmSync(tempDir, { recursive: true, force: true });
     }
 
     // Should show "no response received" message
@@ -804,7 +794,6 @@ describe("runWizard", () => {
         commandSpawn: cmdSpawn,
       });
     } finally {
-      fs.rmSync(tempDir, { recursive: true, force: true });
     }
 
     // Should show "No changes specified" message
@@ -855,7 +844,6 @@ describe("runWizard", () => {
         commandSpawn: cmdSpawn,
       });
     } finally {
-      fs.rmSync(tempDir, { recursive: true, force: true });
     }
 
     // Should show init failure from error (not exit code)
@@ -896,7 +884,6 @@ describe("runWizard", () => {
         commandSpawn: cmdSpawn,
       });
     } finally {
-      fs.rmSync(tempDir, { recursive: true, force: true });
     }
 
     // Should show loop exit code message
@@ -946,7 +933,6 @@ describe("runWizard", () => {
         commandSpawn: cmdSpawn,
       });
     } finally {
-      fs.rmSync(tempDir, { recursive: true, force: true });
     }
 
     // Should show loop failure message
@@ -987,7 +973,6 @@ describe("runWizard", () => {
         commandSpawn: cmdSpawn,
       });
     } finally {
-      fs.rmSync(tempDir, { recursive: true, force: true });
     }
 
     // Spawned command should use custom binary name

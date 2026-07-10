@@ -13,39 +13,25 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
-import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+import { createTempHome } from "./helpers/test-env.ts";
 import { recoverOrphanedStepsForAgent, claimStep, completeStep, resolveStepContext, type WorkerOwnership } from "../dist/installer/step-ops.js";
 import { getDb } from "../dist/db.js";
 import { getRunEvents } from "../dist/installer/events.js";
+import { classifyWorkRoundOutcome } from "../dist/installer/agent-scheduler.js";
+import { autoCompleteStepIfRunning, type PollingRoundMetadata } from "../dist/installer/agent-scheduler.js";
 
 // ── Environment isolation ──────────────────────────────────────────────
 // Production modules imported at file scope (getDb, recoverOrphanedStepsForAgent,
 // claimStep) call emitEvent() and logger.info/warn which write to
 // ~/.tamandua/ by default. Without isolation, test runs pollute the real
 // events/all.jsonl and tamandua.log with realistic-looking events.
-// TAMANDUA_STATE_DIR controls events/log paths; TAMANDUA_DB_PATH controls
-// the DB path. Both must be set because the DB-path resolver is independent
-// of the events/log resolver.
+// createTempHome sets up an isolated temp home with automatic after() cleanup.
 
-const _savedStateDir = process.env.TAMANDUA_STATE_DIR;
-const _savedDbPath = process.env.TAMANDUA_DB_PATH;
-const _testIsolationDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-orphaned-test-"));
-process.env.TAMANDUA_STATE_DIR = _testIsolationDir;
-process.env.TAMANDUA_DB_PATH = path.join(_testIsolationDir, "tamandua.db");
-
-// Restore original env vars and clean up temp dir when the process exits.
-// Node test runner processes exit after all tests complete, so an exit
-// handler is the safest way to clean up file-wide setup that has no
-// corresponding file-wide teardown hook.
-process.on("exit", () => {
-  if (_savedStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
-  else process.env.TAMANDUA_STATE_DIR = _savedStateDir;
-  if (_savedDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
-  else process.env.TAMANDUA_DB_PATH = _savedDbPath;
-  try { fs.rmSync(_testIsolationDir, { recursive: true, force: true }); } catch { /* best effort */ }
-});
+describe("orphaned-step-recovery", () => {
+  const { tamanduaDir } = createTempHome("tamandua-orphaned-test-");
+  process.env.TAMANDUA_STATE_DIR = tamanduaDir;
+  process.env.TAMANDUA_DB_PATH = path.join(tamanduaDir, "tamandua.db");
 
 const TEST_AGENT_1 = "test_sigkill-recovery-agent-1";
 const TEST_AGENT_2 = "test_sigkill-recovery-agent-2";
@@ -333,8 +319,6 @@ describe("recoverOrphanedStepsForAgent", () => {
 // Regression: other_output (clean pi exit without STATUS line)
 // ══════════════════════════════════════════════════════════════════════
 
-import { classifyWorkRoundOutcome } from "../dist/installer/agent-scheduler.js";
-
 describe("other_output recovery (clean pi exit without STATUS)", () => {
   // ── AC 1: other_output triggers recovery of running step ───────
   it("resets running step to pending when other_output occurs (recoverOrphanedStepsForAgent)", () => {
@@ -446,8 +430,6 @@ describe("other_output recovery (clean pi exit without STATUS)", () => {
 // (autoCompleteStepIfRunning swallowed completeStep throws and left the
 //  step in 'running' forever — wedging the run until the 45-min sweeper.)
 // ══════════════════════════════════════════════════════════════════════
-
-import { autoCompleteStepIfRunning, type PollingRoundMetadata } from "../dist/installer/agent-scheduler.js";
 
 describe("autoCompleteStepIfRunning recovers wedged step on completeStep throw", () => {
 // ══════════════════════════════════════════════════════════════════════
@@ -1537,4 +1519,5 @@ describe("US-004 CLMR: immediate recovery on no_work", () => {
       db.prepare("DELETE FROM runs WHERE id = ?").run(runId);
     }
   });
+});
 });

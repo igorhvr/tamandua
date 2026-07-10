@@ -1,14 +1,13 @@
 import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { runVersionCheck, readVersionStatus } from "../../dist/lib/version-check.js";
+import { createTempHome } from "../../tests/helpers/test-env.ts";
 
 const originalStateDir = process.env.TAMANDUA_STATE_DIR;
-const testStateDir = fs.mkdtempSync(
-  path.join(os.tmpdir(), "tamandua-version-check-"),
-);
+const th = createTempHome("tamandua-version-check-");
+const testStateDir = th.tamanduaDir;
 process.env.TAMANDUA_STATE_DIR = testStateDir;
 
 after(() => {
@@ -17,7 +16,6 @@ after(() => {
   } else {
     process.env.TAMANDUA_STATE_DIR = originalStateDir;
   }
-  fs.rmSync(testStateDir, { recursive: true, force: true });
 });
 
 describe("version-check", () => {

@@ -9,6 +9,7 @@ import { describe, it, before, after, beforeEach, afterEach } from "node:test";
 import {
   cleanChildEnv,
   reserveDistinctRandomPorts,
+  createTempHome,
 } from "../../tests/helpers/test-env.ts";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -1002,12 +1003,12 @@ describe("control-server unit exports", () => {
     let tempHome: string;
 
     beforeEach(() => {
-      tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-secret-unit-"));
+      const { root } = createTempHome("tamandua-secret-unit-");
+      tempHome = root;
       process.env.HOME = tempHome;
     });
 
     afterEach(() => {
-      fs.rmSync(tempHome, { recursive: true, force: true });
     });
 
     it("creates a secret file and returns the token", () => {
@@ -1074,21 +1075,17 @@ describe("control-server unit exports", () => {
     });
 
     it("readDaemonSecret works normally when explicit secretPath is provided (isolated dir)", () => {
-      const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-secret-guard-"));
-      try {
-        process.env.HOME = os.userInfo().homedir; // guard would fire without explicit path
-        delete process.env.TAMANDUA_STATE_DIR;
+      const { root: tempHome } = createTempHome("tamandua-secret-guard-");
+      process.env.HOME = os.userInfo().homedir; // guard would fire without explicit path
+      delete process.env.TAMANDUA_STATE_DIR;
 
-        const secretPath = path.join(tempHome, ".tamandua", "daemon-secret");
-        fs.mkdirSync(path.dirname(secretPath), { recursive: true });
-        const token = crypto.randomBytes(16).toString("hex");
-        fs.writeFileSync(secretPath, token, "utf-8");
+      const secretPath = path.join(tempHome, ".tamandua", "daemon-secret");
+      fs.mkdirSync(path.dirname(secretPath), { recursive: true });
+      const token = crypto.randomBytes(16).toString("hex");
+      fs.writeFileSync(secretPath, token, "utf-8");
 
-        const result = readDaemonSecret(secretPath);
-        assert.equal(result, token, "should read secret from isolated dir when explicit path is provided");
-      } finally {
-        fs.rmSync(tempHome, { recursive: true, force: true });
-      }
+      const result = readDaemonSecret(secretPath);
+      assert.equal(result, token, "should read secret from isolated dir when explicit path is provided");
     });
 
     it("readDaemonSecret works normally when guard is inactive", () => {
@@ -1115,18 +1112,14 @@ describe("control-server unit exports", () => {
     });
 
     it("ensureDaemonSecret works normally when explicit secretPath is provided (isolated dir)", () => {
-      const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-secret-guard-"));
-      try {
-        process.env.HOME = os.userInfo().homedir;
-        delete process.env.TAMANDUA_STATE_DIR;
+      const { root: tempHome } = createTempHome("tamandua-secret-guard-");
+      process.env.HOME = os.userInfo().homedir;
+      delete process.env.TAMANDUA_STATE_DIR;
 
-        const secretPath = path.join(tempHome, ".tamandua", "daemon-secret");
-        const token = ensureDaemonSecret(secretPath);
-        assert.ok(token.length > 0, "should create secret in isolated dir when explicit path is provided");
-        assert.ok(fs.existsSync(secretPath), "secret file should exist");
-      } finally {
-        fs.rmSync(tempHome, { recursive: true, force: true });
-      }
+      const secretPath = path.join(tempHome, ".tamandua", "daemon-secret");
+      const token = ensureDaemonSecret(secretPath);
+      assert.ok(token.length > 0, "should create secret in isolated dir when explicit path is provided");
+      assert.ok(fs.existsSync(secretPath), "secret file should exist");
     });
 
     it("ensureDaemonSecret works normally when guard is inactive", () => {

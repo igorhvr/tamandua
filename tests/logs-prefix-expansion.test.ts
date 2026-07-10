@@ -1,6 +1,5 @@
 import fs from "node:fs";
-import { cleanChildEnv } from "./helpers/test-env.ts";
-import os from "node:os";
+import { cleanChildEnv, createTempHome } from "./helpers/test-env.ts";
 import path from "node:path";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
@@ -25,11 +24,11 @@ function appendEvent(filePath: string, event: ReturnType<typeof makeEvent>): voi
 }
 
 function createTempEnv() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-logs-prefix-"));
+  const th = createTempHome("tamandua-logs-prefix-");
+  const root = th.root;
   const stateDir = path.join(root, "state");
-  const homeDir = path.join(root, "home");
+  const homeDir = th.homeDir;
   fs.mkdirSync(stateDir, { recursive: true });
-  fs.mkdirSync(homeDir, { recursive: true });
   return { root, stateDir, homeDir };
 }
 

@@ -8,8 +8,7 @@
  *  - Kanban snapshot reflects paused status
  */
 import fs from "node:fs";
-import { cleanChildEnv } from "./helpers/test-env.ts";
-import os from "node:os";
+import { cleanChildEnv, createTempHome } from "./helpers/test-env.ts";
 import path from "node:path";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -24,12 +23,6 @@ import { startTamanduaMcpServer, stopTamanduaMcpServer, type TamanduaMcpServer }
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-function createTempHome(): { root: string; homeDir: string } {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-mcp-pause-resume-"));
-  const homeDir = path.join(root, "home");
-  fs.mkdirSync(homeDir, { recursive: true });
-  return { root, homeDir };
-}
 
 function runNodeScript(script: string, env: Record<string, string>): Record<string, unknown> {
   const result = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
@@ -199,9 +192,8 @@ async function stopDashboard(server: http.Server): Promise<void> {
 
 describe("dashboard API terminal run rejection", () => {
   it("rejects pause for failed runs with 409", () => {
-    const temp = createTempHome();
-    try {
-      const result = runNodeScript(
+    const temp = createTempHome("tamandua-dashboard-mcp-pause-resume-");
+    const result = runNodeScript(
         `
           import { createDashboardServer } from "./dist/server/dashboard.js";
           import { getDb } from "./dist/db.js";
@@ -234,17 +226,13 @@ describe("dashboard API terminal run rejection", () => {
         { HOME: temp.homeDir },
       );
 
-      assert.equal(result.status, 409);
-      assert.match(result.error as string, /Cannot pause run in failed state/);
-    } finally {
-      fs.rmSync(temp.root, { recursive: true, force: true });
-    }
+    assert.equal(result.status, 409);
+    assert.match(result.error as string, /Cannot pause run in failed state/);
   });
 
   it("rejects pause for canceled runs with 409", () => {
-    const temp = createTempHome();
-    try {
-      const result = runNodeScript(
+    const temp = createTempHome("tamandua-dashboard-mcp-pause-resume-");
+    const result = runNodeScript(
         `
           import { createDashboardServer } from "./dist/server/dashboard.js";
           import { getDb } from "./dist/db.js";
@@ -277,17 +265,13 @@ describe("dashboard API terminal run rejection", () => {
         { HOME: temp.homeDir },
       );
 
-      assert.equal(result.status, 409);
-      assert.match(result.error as string, /Cannot pause run in canceled state/);
-    } finally {
-      fs.rmSync(temp.root, { recursive: true, force: true });
-    }
+    assert.equal(result.status, 409);
+    assert.match(result.error as string, /Cannot pause run in canceled state/);
   });
 
   it("rejects resume for failed runs with 409", () => {
-    const temp = createTempHome();
-    try {
-      const result = runNodeScript(
+    const temp = createTempHome("tamandua-dashboard-mcp-pause-resume-");
+    const result = runNodeScript(
         `
           import { createDashboardServer } from "./dist/server/dashboard.js";
           import { getDb } from "./dist/db.js";
@@ -320,17 +304,13 @@ describe("dashboard API terminal run rejection", () => {
         { HOME: temp.homeDir },
       );
 
-      assert.equal(result.status, 409);
-      assert.match(result.error as string, /Cannot resume run in failed state/);
-    } finally {
-      fs.rmSync(temp.root, { recursive: true, force: true });
-    }
+    assert.equal(result.status, 409);
+    assert.match(result.error as string, /Cannot resume run in failed state/);
   });
 
   it("rejects resume for canceled runs with 409", () => {
-    const temp = createTempHome();
-    try {
-      const result = runNodeScript(
+    const temp = createTempHome("tamandua-dashboard-mcp-pause-resume-");
+    const result = runNodeScript(
         `
           import { createDashboardServer } from "./dist/server/dashboard.js";
           import { getDb } from "./dist/db.js";
@@ -363,19 +343,15 @@ describe("dashboard API terminal run rejection", () => {
         { HOME: temp.homeDir },
       );
 
-      assert.equal(result.status, 409);
-      assert.match(result.error as string, /Cannot resume run in canceled state/);
-    } finally {
-      fs.rmSync(temp.root, { recursive: true, force: true });
-    }
+    assert.equal(result.status, 409);
+    assert.match(result.error as string, /Cannot resume run in canceled state/);
   });
 });
 
 describe("dashboard /api/runs includes paused runs with correct status", () => {
   it("lists paused runs alongside running and completed runs", () => {
-    const temp = createTempHome();
-    try {
-      const result = runNodeScript(
+    const temp = createTempHome("tamandua-dashboard-mcp-pause-resume-");
+    const result = runNodeScript(
         `
           import { createDashboardServer } from "./dist/server/dashboard.js";
           import { getDb } from "./dist/db.js";
@@ -424,17 +400,14 @@ describe("dashboard /api/runs includes paused runs with correct status", () => {
         { HOME: temp.homeDir },
       );
 
-      assert.equal(result.status, 200);
-      assert.equal(result.runCount, 3);
-      assert.equal(result.pausedStatus, "paused");
-      assert.equal(result.runningStatus, "running");
-      assert.equal(result.completedStatus, "completed");
-      assert.equal(result.hasPausedRun, true);
-      assert.equal(result.hasRunningRun, true);
-      assert.equal(result.hasCompletedRun, true);
-    } finally {
-      fs.rmSync(temp.root, { recursive: true, force: true });
-    }
+    assert.equal(result.status, 200);
+    assert.equal(result.runCount, 3);
+    assert.equal(result.pausedStatus, "paused");
+    assert.equal(result.runningStatus, "running");
+    assert.equal(result.completedStatus, "completed");
+    assert.equal(result.hasPausedRun, true);
+    assert.equal(result.hasRunningRun, true);
+    assert.equal(result.hasCompletedRun, true);
   });
 });
 
@@ -444,9 +417,8 @@ describe("dashboard /api/runs includes paused runs with correct status", () => {
 
 describe("kanban snapshot paused status", () => {
   it("reflects paused run status in the kanban API snapshot", () => {
-    const temp = createTempHome();
-    try {
-      const result = runNodeScript(
+    const temp = createTempHome("tamandua-dashboard-mcp-pause-resume-");
+    const result = runNodeScript(
         `
           import { createDashboardServer } from "./dist/server/dashboard.js";
           import { getDb } from "./dist/db.js";
@@ -498,16 +470,13 @@ describe("kanban snapshot paused status", () => {
         { HOME: temp.homeDir },
       );
 
-      assert.equal(result.status, 200);
-      assert.equal(result.runStatus, "paused");
-      assert.equal(result.runId, "run-kanban-paused");
-      assert.equal(result.runNumber, 42);
-      assert.equal(result.tokensSpent, 777);
-      assert.equal(result.laneCount, 2);
-      assert.deepEqual(result.laneAgents, ["planner", "developer"]);
-    } finally {
-      fs.rmSync(temp.root, { recursive: true, force: true });
-    }
+    assert.equal(result.status, 200);
+    assert.equal(result.runStatus, "paused");
+    assert.equal(result.runId, "run-kanban-paused");
+    assert.equal(result.runNumber, 42);
+    assert.equal(result.tokensSpent, 777);
+    assert.equal(result.laneCount, 2);
+    assert.deepEqual(result.laneAgents, ["planner", "developer"]);
   });
 });
 
@@ -553,10 +522,10 @@ describe("MCP pause/resume terminal run rejection", () => {
 
     try {
       const result = await callTool(port, sessionId, 10, "tamandua.run.pause", { runId: "run-a" });
-      assert.equal(result.status, 200);
-      assert.equal(result.body?.result, undefined);
-      assert.equal(result.body?.error?.code, -32602);
-      assert.match(result.body?.error?.message ?? "", /terminal/);
+    assert.equal(result.status, 200);
+    assert.equal(result.body?.result, undefined);
+    assert.equal(result.body?.error?.code, -32602);
+    assert.match(result.body?.error?.message ?? "", /terminal/);
     } finally {
       await stopTamanduaMcpServer(server);
     }
@@ -569,10 +538,10 @@ describe("MCP pause/resume terminal run rejection", () => {
 
     try {
       const result = await callTool(port, sessionId, 11, "tamandua.run.pause", { runId: "run-b" });
-      assert.equal(result.status, 200);
-      assert.equal(result.body?.result, undefined);
-      assert.equal(result.body?.error?.code, -32602);
-      assert.match(result.body?.error?.message ?? "", /terminal/);
+    assert.equal(result.status, 200);
+    assert.equal(result.body?.result, undefined);
+    assert.equal(result.body?.error?.code, -32602);
+    assert.match(result.body?.error?.message ?? "", /terminal/);
     } finally {
       await stopTamanduaMcpServer(server);
     }
@@ -585,10 +554,10 @@ describe("MCP pause/resume terminal run rejection", () => {
 
     try {
       const result = await callTool(port, sessionId, 12, "tamandua.run.pause", { runId: "run-c" });
-      assert.equal(result.status, 200);
-      assert.equal(result.body?.result, undefined);
-      assert.equal(result.body?.error?.code, -32602);
-      assert.match(result.body?.error?.message ?? "", /terminal/);
+    assert.equal(result.status, 200);
+    assert.equal(result.body?.result, undefined);
+    assert.equal(result.body?.error?.code, -32602);
+    assert.match(result.body?.error?.message ?? "", /terminal/);
     } finally {
       await stopTamanduaMcpServer(server);
     }
@@ -601,10 +570,10 @@ describe("MCP pause/resume terminal run rejection", () => {
 
     try {
       const result = await callTool(port, sessionId, 13, "tamandua.run.resume", { runId: "run-d" });
-      assert.equal(result.status, 200);
-      assert.equal(result.body?.result, undefined);
-      assert.equal(result.body?.error?.code, -32602);
-      assert.match(result.body?.error?.message ?? "", /terminal/);
+    assert.equal(result.status, 200);
+    assert.equal(result.body?.result, undefined);
+    assert.equal(result.body?.error?.code, -32602);
+    assert.match(result.body?.error?.message ?? "", /terminal/);
     } finally {
       await stopTamanduaMcpServer(server);
     }
@@ -617,10 +586,10 @@ describe("MCP pause/resume terminal run rejection", () => {
 
     try {
       const result = await callTool(port, sessionId, 14, "tamandua.run.resume", { runId: "run-e" });
-      assert.equal(result.status, 200);
-      assert.equal(result.body?.result, undefined);
-      assert.equal(result.body?.error?.code, -32602);
-      assert.match(result.body?.error?.message ?? "", /terminal/);
+    assert.equal(result.status, 200);
+    assert.equal(result.body?.result, undefined);
+    assert.equal(result.body?.error?.code, -32602);
+    assert.match(result.body?.error?.message ?? "", /terminal/);
     } finally {
       await stopTamanduaMcpServer(server);
     }
@@ -633,10 +602,10 @@ describe("MCP pause/resume terminal run rejection", () => {
 
     try {
       const result = await callTool(port, sessionId, 15, "tamandua.run.resume", { runId: "run-f" });
-      assert.equal(result.status, 200);
-      assert.equal(result.body?.result, undefined);
-      assert.equal(result.body?.error?.code, -32602);
-      assert.match(result.body?.error?.message ?? "", /terminal/);
+    assert.equal(result.status, 200);
+    assert.equal(result.body?.result, undefined);
+    assert.equal(result.body?.error?.code, -32602);
+    assert.match(result.body?.error?.message ?? "", /terminal/);
     } finally {
       await stopTamanduaMcpServer(server);
     }

@@ -14,10 +14,10 @@
 import fs from "node:fs";
 import {
   cleanChildEnv,
+  createTempHome,
   reserveDistinctRandomPorts,
   reserveRandomPort,
 } from "./helpers/test-env.ts";
-import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import assert from "node:assert/strict";
@@ -48,14 +48,11 @@ async function createTempEnv(): Promise<{
   dashboardPort: number;
 }> {
   const [controlPort, dashboardPort] = await reserveDistinctRandomPorts(2);
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-mcp-lifecycle-"));
-  const stateDir = path.join(root, "state");
-  const homeDir = path.join(root, "home");
-  const tamanduaDir = path.join(homeDir, ".tamandua");
+  const th = createTempHome("tamandua-mcp-lifecycle-");
+  const stateDir = path.join(th.root, "state");
   fs.mkdirSync(stateDir, { recursive: true });
-  fs.mkdirSync(tamanduaDir, { recursive: true });
-  fs.writeFileSync(path.join(tamanduaDir, "port"), String(dashboardPort), "utf-8");
-  return { root, stateDir, homeDir, controlPort, dashboardPort };
+  fs.writeFileSync(path.join(th.tamanduaDir, "port"), String(dashboardPort), "utf-8");
+  return { root: th.root, stateDir, homeDir: th.homeDir, controlPort, dashboardPort };
 }
 
 function writeMinimalWorkflow(stateDir: string, workflowId: string): void {
@@ -390,7 +387,6 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
 
     } finally {
       await runCli(["mcp", "stop"], cliEnv);
-      fs.rmSync(tempEnv.root, { recursive: true, force: true });
     }
   });
 
@@ -469,7 +465,6 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
       assert.equal(startResult.structuredContent!.run!.workingDirectoryForHarness, path.resolve(harnessDir));
     } finally {
       await runCli(["mcp", "stop"], cliEnv);
-      fs.rmSync(tempEnv.root, { recursive: true, force: true });
     }
   });
 
@@ -542,7 +537,6 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
 
     } finally {
       await runCli(["mcp", "stop"], cliEnv);
-      fs.rmSync(tempEnv.root, { recursive: true, force: true });
     }
   });
 
@@ -590,7 +584,6 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
 
     } finally {
       await runCli(["mcp", "stop"], cliEnv);
-      fs.rmSync(tempEnv.root, { recursive: true, force: true });
     }
   });
 
@@ -661,7 +654,6 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
     } finally {
       await runCli(["dashboard", "stop"], cliEnv);
       await runCli(["mcp", "stop"], cliEnv);
-      fs.rmSync(tempEnv.root, { recursive: true, force: true });
     }
   });
 
@@ -711,7 +703,6 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
 
     } finally {
       await runCli(["mcp", "stop"], cliEnv);
-      fs.rmSync(tempEnv.root, { recursive: true, force: true });
     }
   });
 
@@ -812,7 +803,6 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
 
     } finally {
       await runCli(["mcp", "stop"], cliEnv);
-      fs.rmSync(tempEnv.root, { recursive: true, force: true });
     }
   });
 
@@ -892,7 +882,6 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
 
     } finally {
       await runCli(["mcp", "stop"], cliEnv);
-      fs.rmSync(tempEnv.root, { recursive: true, force: true });
     }
   });
 
@@ -917,7 +906,6 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
       assert.equal(stop.code, 0);
       assert.match(stop.stdout, /not running/);
     } finally {
-      fs.rmSync(tempEnv.root, { recursive: true, force: true });
     }
   });
 
@@ -990,7 +978,6 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
           TAMANDUA_STATE_DIR: tempEnv.stateDir,
         });
       } catch { /* best effort */ }
-      fs.rmSync(tempEnv.root, { recursive: true, force: true });
     }
   });
 });

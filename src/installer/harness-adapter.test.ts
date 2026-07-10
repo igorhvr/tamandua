@@ -1,8 +1,8 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+import { createTempHome } from "../../tests/helpers/test-env.ts";
 
 import {
   getHarnessAdapter,
@@ -111,9 +111,7 @@ describe("PiHarnessAdapter implementation", () => {
     });
 
     it("respects TAMANDUA_PI_BINARY env var when set and executable", async () => {
-      const tmpDir = fs.mkdtempSync(
-        path.join(os.tmpdir(), "tamandua-test-harness-adapter-pi-")
-      );
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-pi-");
       const piPath = path.join(tmpDir, "pi");
       fs.writeFileSync(piPath, "#!/bin/sh\necho pi\n", { mode: 0o755 });
 
@@ -122,13 +120,11 @@ describe("PiHarnessAdapter implementation", () => {
       const result = await adapter.findBinary();
       assert.equal(result, piPath);
 
-      fs.rmSync(tmpDir, { recursive: true, force: true });
+
     });
 
     it("throws when TAMANDUA_PI_BINARY is set but not executable", async () => {
-      const tmpDir = fs.mkdtempSync(
-        path.join(os.tmpdir(), "tamandua-test-harness-adapter-pi-")
-      );
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-pi-");
       const piPath = path.join(tmpDir, "pi-broken");
       fs.writeFileSync(piPath, "#!/bin/sh\necho nope\n", { mode: 0o644 });
 
@@ -139,15 +135,13 @@ describe("PiHarnessAdapter implementation", () => {
         /TAMANDUA_PI_BINARY set but not executable/
       );
 
-      fs.rmSync(tmpDir, { recursive: true, force: true });
+
     });
 
     it("throws clear error when pi not found in PATH and no env var set", async () => {
       delete process.env.TAMANDUA_PI_BINARY;
 
-      const tmpDir = fs.mkdtempSync(
-        path.join(os.tmpdir(), "tamandua-test-harness-adapter-pi-")
-      );
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-pi-");
       process.env.PATH = tmpDir;
 
       await assert.rejects(
@@ -155,15 +149,13 @@ describe("PiHarnessAdapter implementation", () => {
         /pi binary not found in PATH/
       );
 
-      fs.rmSync(tmpDir, { recursive: true, force: true });
+
     });
 
     it("prefers pi-token-saver over pi when preferTokenSaver is true and both exist", async () => {
       delete process.env.TAMANDUA_PI_BINARY;
 
-      const binDir = fs.mkdtempSync(
-        path.join(os.tmpdir(), "tamandua-test-harness-adapter-ts-")
-      );
+      const { root: binDir } = createTempHome("tamandua-test-harness-adapter-ts-");
       const piPath = path.join(binDir, "pi");
       const saverPath = path.join(binDir, "pi-token-saver");
       fs.writeFileSync(piPath, "#!/bin/sh\necho pi\n", { mode: 0o755 });
@@ -175,15 +167,13 @@ describe("PiHarnessAdapter implementation", () => {
       assert.equal(await adapter.findBinary({ preferTokenSaver: false }), piPath);
       assert.equal(await adapter.findBinary(), piPath);
 
-      fs.rmSync(binDir, { recursive: true, force: true });
+
     });
 
     it("falls back to pi when pi-token-saver is not installed", async () => {
       delete process.env.TAMANDUA_PI_BINARY;
 
-      const binDir = fs.mkdtempSync(
-        path.join(os.tmpdir(), "tamandua-test-harness-adapter-ts-")
-      );
+      const { root: binDir } = createTempHome("tamandua-test-harness-adapter-ts-");
       const piPath = path.join(binDir, "pi");
       fs.writeFileSync(piPath, "#!/bin/sh\necho pi\n", { mode: 0o755 });
 
@@ -191,13 +181,11 @@ describe("PiHarnessAdapter implementation", () => {
 
       assert.equal(await adapter.findBinary({ preferTokenSaver: true }), piPath);
 
-      fs.rmSync(binDir, { recursive: true, force: true });
+
     });
 
     it("TAMANDUA_PI_BINARY overrides pi-token-saver preference", async () => {
-      const binDir = fs.mkdtempSync(
-        path.join(os.tmpdir(), "tamandua-test-harness-adapter-ts-")
-      );
+      const { root: binDir } = createTempHome("tamandua-test-harness-adapter-ts-");
       const piPath = path.join(binDir, "pi");
       const saverPath = path.join(binDir, "pi-token-saver");
       const pinnedPath = path.join(binDir, "pinned-pi");
@@ -210,15 +198,13 @@ describe("PiHarnessAdapter implementation", () => {
 
       assert.equal(await adapter.findBinary({ preferTokenSaver: true }), pinnedPath);
 
-      fs.rmSync(binDir, { recursive: true, force: true });
+
     });
   });
 
   describe("runRound", () => {
     it("spawns pi with correct argv and returns HarnessRoundResult", async () => {
-      const tmpDir = fs.mkdtempSync(
-        path.join(os.tmpdir(), "tamandua-test-harness-adapter-runround-")
-      );
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-runround-");
       const fakePi = path.join(tmpDir, "pi");
       fs.writeFileSync(
         fakePi,
@@ -244,14 +230,12 @@ describe("PiHarnessAdapter implementation", () => {
         } else {
           process.env.TAMANDUA_PI_BINARY = originalPiBinary;
         }
-        fs.rmSync(tmpDir, { recursive: true, force: true });
+
       }
     });
 
     it("rejects on non-zero exit code", async () => {
-      const tmpDir = fs.mkdtempSync(
-        path.join(os.tmpdir(), "tamandua-test-harness-adapter-runround-")
-      );
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-runround-");
       const fakePi = path.join(tmpDir, "pi");
       fs.writeFileSync(
         fakePi,
@@ -274,7 +258,7 @@ describe("PiHarnessAdapter implementation", () => {
         } else {
           process.env.TAMANDUA_PI_BINARY = originalPiBinary;
         }
-        fs.rmSync(tmpDir, { recursive: true, force: true });
+
       }
     });
   });
@@ -308,9 +292,7 @@ describe("HermesHarnessAdapter implementation", () => {
     });
 
     it("respects TAMANDUA_HERMES_BINARY env var when set and executable", async () => {
-      const tmpDir = fs.mkdtempSync(
-        path.join(os.tmpdir(), "tamandua-test-harness-adapter-hermes-")
-      );
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-hermes-");
       const hermesPath = path.join(tmpDir, "hermes-custom");
       fs.writeFileSync(hermesPath, "#!/bin/sh\necho hello\n", { mode: 0o755 });
 
@@ -319,13 +301,11 @@ describe("HermesHarnessAdapter implementation", () => {
       const result = await adapter.findBinary();
       assert.equal(result, hermesPath);
 
-      fs.rmSync(tmpDir, { recursive: true, force: true });
+
     });
 
     it("throws when TAMANDUA_HERMES_BINARY is set but not executable", async () => {
-      const tmpDir = fs.mkdtempSync(
-        path.join(os.tmpdir(), "tamandua-test-harness-adapter-hermes-")
-      );
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-hermes-");
       const hermesPath = path.join(tmpDir, "hermes-broken");
       fs.writeFileSync(hermesPath, "#!/bin/sh\necho hi\n", { mode: 0o644 });
 
@@ -336,15 +316,13 @@ describe("HermesHarnessAdapter implementation", () => {
         /TAMANDUA_HERMES_BINARY set but not executable/,
       );
 
-      fs.rmSync(tmpDir, { recursive: true, force: true });
+
     });
 
     it("searches PATH for hermes executable", async () => {
       delete process.env.TAMANDUA_HERMES_BINARY;
 
-      const tmpDir = fs.mkdtempSync(
-        path.join(os.tmpdir(), "tamandua-test-harness-adapter-hermes-")
-      );
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-hermes-");
       const hermesPath = path.join(tmpDir, "hermes");
       fs.writeFileSync(hermesPath, "#!/bin/sh\necho hermes\n", { mode: 0o755 });
 
@@ -353,15 +331,13 @@ describe("HermesHarnessAdapter implementation", () => {
       const result = await adapter.findBinary();
       assert.equal(result, hermesPath);
 
-      fs.rmSync(tmpDir, { recursive: true, force: true });
+
     });
 
     it("throws clear error when hermes not found in PATH and no env var set", async () => {
       delete process.env.TAMANDUA_HERMES_BINARY;
 
-      const tmpDir = fs.mkdtempSync(
-        path.join(os.tmpdir(), "tamandua-test-harness-adapter-hermes-")
-      );
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-hermes-");
       process.env.PATH = tmpDir;
 
       await assert.rejects(
@@ -369,21 +345,17 @@ describe("HermesHarnessAdapter implementation", () => {
         /hermes binary not found in PATH/,
       );
 
-      fs.rmSync(tmpDir, { recursive: true, force: true });
+
     });
 
     it("env var wins over PATH hermes", async () => {
-      const tmpDir = fs.mkdtempSync(
-        path.join(os.tmpdir(), "tamandua-test-harness-adapter-hermes-")
-      );
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-hermes-");
       const envHermesPath = path.join(tmpDir, "hermes-env");
       fs.writeFileSync(envHermesPath, "#!/bin/sh\necho env-hermes\n", {
         mode: 0o755,
       });
 
-      const tmpDir2 = fs.mkdtempSync(
-        path.join(os.tmpdir(), "tamandua-test-harness-adapter-hermes-")
-      );
+      const { root: tmpDir2 } = createTempHome("tamandua-test-harness-adapter-hermes-");
       const pathHermesPath = path.join(tmpDir2, "hermes");
       fs.writeFileSync(pathHermesPath, "#!/bin/sh\necho path-hermes\n", {
         mode: 0o755,
@@ -395,8 +367,8 @@ describe("HermesHarnessAdapter implementation", () => {
       const result = await adapter.findBinary();
       assert.equal(result, envHermesPath);
 
-      fs.rmSync(tmpDir, { recursive: true, force: true });
-      fs.rmSync(tmpDir2, { recursive: true, force: true });
+
+
     });
 
     // ── preferTokenSaver (hermes-token-saver) ──────────────────────
@@ -404,9 +376,7 @@ describe("HermesHarnessAdapter implementation", () => {
     it("prefers hermes-token-saver over hermes when preferTokenSaver is true and both exist", async () => {
       delete process.env.TAMANDUA_HERMES_BINARY;
 
-      const binDir = fs.mkdtempSync(
-        path.join(os.tmpdir(), "tamandua-test-harness-adapter-hts-")
-      );
+      const { root: binDir } = createTempHome("tamandua-test-harness-adapter-hts-");
       const hermesPath = path.join(binDir, "hermes");
       const saverPath = path.join(binDir, "hermes-token-saver");
       fs.writeFileSync(hermesPath, "#!/bin/sh\necho hermes\n", { mode: 0o755 });
@@ -418,15 +388,13 @@ describe("HermesHarnessAdapter implementation", () => {
       assert.equal(await adapter.findBinary({ preferTokenSaver: false }), hermesPath);
       assert.equal(await adapter.findBinary(), hermesPath);
 
-      fs.rmSync(binDir, { recursive: true, force: true });
+
     });
 
     it("falls back to hermes when hermes-token-saver is not installed", async () => {
       delete process.env.TAMANDUA_HERMES_BINARY;
 
-      const binDir = fs.mkdtempSync(
-        path.join(os.tmpdir(), "tamandua-test-harness-adapter-hts-")
-      );
+      const { root: binDir } = createTempHome("tamandua-test-harness-adapter-hts-");
       const hermesPath = path.join(binDir, "hermes");
       fs.writeFileSync(hermesPath, "#!/bin/sh\necho hermes\n", { mode: 0o755 });
 
@@ -434,13 +402,11 @@ describe("HermesHarnessAdapter implementation", () => {
 
       assert.equal(await adapter.findBinary({ preferTokenSaver: true }), hermesPath);
 
-      fs.rmSync(binDir, { recursive: true, force: true });
+
     });
 
     it("TAMANDUA_HERMES_BINARY overrides hermes-token-saver preference", async () => {
-      const binDir = fs.mkdtempSync(
-        path.join(os.tmpdir(), "tamandua-test-harness-adapter-hts-")
-      );
+      const { root: binDir } = createTempHome("tamandua-test-harness-adapter-hts-");
       const hermesPath = path.join(binDir, "hermes");
       const saverPath = path.join(binDir, "hermes-token-saver");
       const pinnedPath = path.join(binDir, "pinned-hermes");
@@ -453,15 +419,13 @@ describe("HermesHarnessAdapter implementation", () => {
 
       assert.equal(await adapter.findBinary({ preferTokenSaver: true }), pinnedPath);
 
-      fs.rmSync(binDir, { recursive: true, force: true });
+
     });
 
     it("per-invocation resolution: hermes-token-saver appearing on PATH between calls takes effect", async () => {
       delete process.env.TAMANDUA_HERMES_BINARY;
 
-      const binDir = fs.mkdtempSync(
-        path.join(os.tmpdir(), "tamandua-test-harness-adapter-hts-")
-      );
+      const { root: binDir } = createTempHome("tamandua-test-harness-adapter-hts-");
       const hermesPath = path.join(binDir, "hermes");
       fs.writeFileSync(hermesPath, "#!/bin/sh\necho hermes\n", { mode: 0o755 });
 
@@ -475,15 +439,13 @@ describe("HermesHarnessAdapter implementation", () => {
       fs.writeFileSync(saverPath, "#!/bin/sh\necho saver\n", { mode: 0o755 });
       assert.equal(await adapter.findBinary({ preferTokenSaver: true }), saverPath);
 
-      fs.rmSync(binDir, { recursive: true, force: true });
+
     });
   });
 
   describe("runRound", () => {
     it("returns stdout with session_id lines filtered out", async () => {
-      const tmpDir = fs.mkdtempSync(
-        path.join(os.tmpdir(), "tamandua-test-harness-adapter-hermes-")
-      );
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-hermes-");
       const hermesPath = path.join(tmpDir, "hermes");
       fs.writeFileSync(
         hermesPath,
@@ -510,14 +472,12 @@ echo "session_id: 20260518_103004_cdae11"`,
         } else {
           process.env.TAMANDUA_HERMES_BINARY = originalHermesBinary;
         }
-        fs.rmSync(tmpDir, { recursive: true, force: true });
+
       }
     });
 
     it("filters all session_id lines", async () => {
-      const tmpDir = fs.mkdtempSync(
-        path.join(os.tmpdir(), "tamandua-test-harness-adapter-hermes-")
-      );
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-hermes-");
       const hermesPath = path.join(tmpDir, "hermes");
       fs.writeFileSync(
         hermesPath,
@@ -542,14 +502,12 @@ echo "session_id: late"`,
         } else {
           process.env.TAMANDUA_HERMES_BINARY = originalHermesBinary;
         }
-        fs.rmSync(tmpDir, { recursive: true, force: true });
+
       }
     });
 
     it("returns empty string when output is only session_id", async () => {
-      const tmpDir = fs.mkdtempSync(
-        path.join(os.tmpdir(), "tamandua-test-harness-adapter-hermes-")
-      );
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-hermes-");
       const hermesPath = path.join(tmpDir, "hermes");
       fs.writeFileSync(
         hermesPath,
@@ -570,14 +528,12 @@ echo "session_id: 20260518_103004_cdae11"`,
         } else {
           process.env.TAMANDUA_HERMES_BINARY = originalHermesBinary;
         }
-        fs.rmSync(tmpDir, { recursive: true, force: true });
+
       }
     });
 
     it("resolves on timeout — returns partial output and sessionRef from stderr", async () => {
-      const tmpDir = fs.mkdtempSync(
-        path.join(os.tmpdir(), "tamandua-test-harness-adapter-hermes-")
-      );
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-hermes-");
       const hermesPath = path.join(tmpDir, "hermes");
       fs.writeFileSync(
         hermesPath,
@@ -605,14 +561,12 @@ sleep 10`,
         } else {
           process.env.TAMANDUA_HERMES_BINARY = originalHermesBinary;
         }
-        fs.rmSync(tmpDir, { recursive: true, force: true });
+
       }
     });
 
     it("resolves on non-zero exit — returns output with exitCode and sessionRef from stderr", async () => {
-      const tmpDir = fs.mkdtempSync(
-        path.join(os.tmpdir(), "tamandua-test-harness-adapter-hermes-")
-      );
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-hermes-");
       const hermesPath = path.join(tmpDir, "hermes");
       fs.writeFileSync(
         hermesPath,
@@ -641,14 +595,12 @@ exit 1`,
         } else {
           process.env.TAMANDUA_HERMES_BINARY = originalHermesBinary;
         }
-        fs.rmSync(tmpDir, { recursive: true, force: true });
+
       }
     });
 
     it("extracts sessionRef from stderr on exit 0 — primary real-hermes path", async () => {
-      const tmpDir = fs.mkdtempSync(
-        path.join(os.tmpdir(), "tamandua-test-harness-adapter-hermes-")
-      );
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-hermes-");
       const hermesPath = path.join(tmpDir, "hermes");
       // Real hermes prints session_id to stderr, not stdout.
       // Exit 0 is the normal completion path.
@@ -680,14 +632,12 @@ echo "session_id: 20260706_stderr_zero" >&2`,
         } else {
           process.env.TAMANDUA_HERMES_BINARY = originalHermesBinary;
         }
-        fs.rmSync(tmpDir, { recursive: true, force: true });
+
       }
     });
 
     it("extracts sessionRef from stderr on exit 130 — teardown-kill survival", async () => {
-      const tmpDir = fs.mkdtempSync(
-        path.join(os.tmpdir(), "tamandua-test-harness-adapter-hermes-")
-      );
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-hermes-");
       const hermesPath = path.join(tmpDir, "hermes");
       // Exit 130 is real hermes' KeyboardInterrupt signal (teardown kill).
       // The adapter must resolve (not reject) and still extract sessionRef
@@ -723,14 +673,12 @@ exit 130`,
         } else {
           process.env.TAMANDUA_HERMES_BINARY = originalHermesBinary;
         }
-        fs.rmSync(tmpDir, { recursive: true, force: true });
+
       }
     });
 
     it("stderr data does not appear in returned stdout", async () => {
-      const tmpDir = fs.mkdtempSync(
-        path.join(os.tmpdir(), "tamandua-test-harness-adapter-hermes-")
-      );
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-hermes-");
       const hermesPath = path.join(tmpDir, "hermes");
       fs.writeFileSync(
         hermesPath,
@@ -752,14 +700,12 @@ echo "debug stderr" 1>&2`,
         } else {
           process.env.TAMANDUA_HERMES_BINARY = originalHermesBinary;
         }
-        fs.rmSync(tmpDir, { recursive: true, force: true });
+
       }
     });
 
     it("preserves multi-line output with mixed content", async () => {
-      const tmpDir = fs.mkdtempSync(
-        path.join(os.tmpdir(), "tamandua-test-harness-adapter-hermes-")
-      );
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-hermes-");
       const hermesPath = path.join(tmpDir, "hermes");
       fs.writeFileSync(
         hermesPath,
@@ -790,14 +736,12 @@ echo "session_id: 20260518_103004_cdae11"`,
         } else {
           process.env.TAMANDUA_HERMES_BINARY = originalHermesBinary;
         }
-        fs.rmSync(tmpDir, { recursive: true, force: true });
+
       }
     });
 
     it("sets truncated flag and inserts marker when stdout exceeds 10MB budget", async () => {
-      const tmpDir = fs.mkdtempSync(
-        path.join(os.tmpdir(), "tamandua-test-harness-adapter-hermes-")
-      );
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-hermes-");
       const hermesPath = path.join(tmpDir, "hermes");
       // Generate ~11.5MB of stdout to ensure truncation triggers.
       // The head window is 1MB, tail window is 9MB — total budget 10MB.
@@ -835,14 +779,12 @@ echo "session_id: 20260518_trunc_test" >&2`,
         } else {
           process.env.TAMANDUA_HERMES_BINARY = originalHermesBinary;
         }
-        fs.rmSync(tmpDir, { recursive: true, force: true });
+
       }
     });
 
     it("not truncated when output is under 10MB budget", async () => {
-      const tmpDir = fs.mkdtempSync(
-        path.join(os.tmpdir(), "tamandua-test-harness-adapter-hermes-")
-      );
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-hermes-");
       const hermesPath = path.join(tmpDir, "hermes");
       // A few hundred bytes — well under 10MB
       fs.writeFileSync(
@@ -873,14 +815,12 @@ echo "session_id: 20260518_normal" >&2`,
         } else {
           process.env.TAMANDUA_HERMES_BINARY = originalHermesBinary;
         }
-        fs.rmSync(tmpDir, { recursive: true, force: true });
+
       }
     });
 
     it("session_id on stderr survives even when stdout is truncated", async () => {
-      const tmpDir = fs.mkdtempSync(
-        path.join(os.tmpdir(), "tamandua-test-harness-adapter-hermes-")
-      );
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-hermes-");
       const hermesPath = path.join(tmpDir, "hermes");
       // Write ~11MB stdout noise, but the session_id is on stderr (which is
       // tiny). Both streams have independent head+tail windows.
@@ -908,14 +848,12 @@ echo "session_id: 20260518_stderr_survives" >&2`,
         } else {
           process.env.TAMANDUA_HERMES_BINARY = originalHermesBinary;
         }
-        fs.rmSync(tmpDir, { recursive: true, force: true });
+
       }
     });
 
     it("truncation preserves session_id on stderr when stderr itself exceeds budget", async () => {
-      const tmpDir = fs.mkdtempSync(
-        path.join(os.tmpdir(), "tamandua-test-harness-adapter-hermes-")
-      );
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-hermes-");
       const hermesPath = path.join(tmpDir, "hermes");
       // Write ~11MB stderr (lines of "A" = 2 bytes each, 5.5M lines) with
       // session_id at the very END. The session_id must survive in the stderr
@@ -948,23 +886,19 @@ echo "stdout is tiny"`,
         } else {
           process.env.TAMANDUA_HERMES_BINARY = originalHermesBinary;
         }
-        fs.rmSync(tmpDir, { recursive: true, force: true });
+
       }
     });
 
     it("warns when no session_id trailer found on either stream", async () => {
-      const tmpStateDir = fs.mkdtempSync(
-        path.join(os.tmpdir(), "tamandua-test-adapter-notrailer-")
-      );
+      const { root: tmpStateDir } = createTempHome("tamandua-test-adapter-notrailer-");
       const savedStateDir = process.env.TAMANDUA_STATE_DIR;
       const savedJobId = process.env.TAMANDUA_WORKER_JOB_ID;
       process.env.TAMANDUA_STATE_DIR = tmpStateDir;
       process.env.TAMANDUA_WORKER_JOB_ID =
         "tamandua-test-wf-6d379894-4a5e-4dad-92fb-da66e1093e94-devagent";
 
-      const tmpDir = fs.mkdtempSync(
-        path.join(os.tmpdir(), "tamandua-test-harness-adapter-hermes-")
-      );
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-hermes-");
       const hermesPath = path.join(tmpDir, "hermes");
       // No session_id on either stdout or stderr
       fs.writeFileSync(
@@ -1035,21 +969,17 @@ echo "debug info" >&2`,
         } else {
           process.env.TAMANDUA_HERMES_BINARY = originalHermesBinary;
         }
-        fs.rmSync(tmpDir, { recursive: true, force: true });
-        fs.rmSync(tmpStateDir, { recursive: true, force: true });
+
+
       }
     });
 
     it("does not warn when session_id is present", async () => {
-      const tmpStateDir = fs.mkdtempSync(
-        path.join(os.tmpdir(), "tamandua-test-adapter-hastrailer-")
-      );
+      const { root: tmpStateDir } = createTempHome("tamandua-test-adapter-hastrailer-");
       const savedStateDir = process.env.TAMANDUA_STATE_DIR;
       process.env.TAMANDUA_STATE_DIR = tmpStateDir;
 
-      const tmpDir = fs.mkdtempSync(
-        path.join(os.tmpdir(), "tamandua-test-harness-adapter-hermes-")
-      );
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-hermes-");
       const hermesPath = path.join(tmpDir, "hermes");
       fs.writeFileSync(
         hermesPath,
@@ -1085,21 +1015,17 @@ echo "session_id: 20260518_103004_cdae11" >&2`,
         } else {
           process.env.TAMANDUA_HERMES_BINARY = originalHermesBinary;
         }
-        fs.rmSync(tmpDir, { recursive: true, force: true });
-        fs.rmSync(tmpStateDir, { recursive: true, force: true });
+
+
       }
     });
 
     it("hermes pre-launch log redacts -q prompt payload with commandPreview parity", async () => {
-      const tmpStateDir = fs.mkdtempSync(
-        path.join(os.tmpdir(), "tamandua-test-adapter-cmdpreview-")
-      );
+      const { root: tmpStateDir } = createTempHome("tamandua-test-adapter-cmdpreview-");
       const savedStateDir = process.env.TAMANDUA_STATE_DIR;
       process.env.TAMANDUA_STATE_DIR = tmpStateDir;
 
-      const tmpDir = fs.mkdtempSync(
-        path.join(os.tmpdir(), "tamandua-test-harness-adapter-hermes-")
-      );
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-hermes-");
       const hermesPath = path.join(tmpDir, "hermes");
       fs.writeFileSync(
         hermesPath,
@@ -1178,21 +1104,17 @@ echo "session_id: 20260518_103004_cdae11" >&2`,
         } else {
           process.env.TAMANDUA_HERMES_BINARY = originalHermesBinary;
         }
-        fs.rmSync(tmpDir, { recursive: true, force: true });
-        fs.rmSync(tmpStateDir, { recursive: true, force: true });
+
+
       }
     });
 
     it("hermes pre-launch log shows promptElided: true for empty prompt", async () => {
-      const tmpStateDir = fs.mkdtempSync(
-        path.join(os.tmpdir(), "tamandua-test-adapter-cmdpreview-empty-")
-      );
+      const { root: tmpStateDir } = createTempHome("tamandua-test-adapter-cmdpreview-empty-");
       const savedStateDir = process.env.TAMANDUA_STATE_DIR;
       process.env.TAMANDUA_STATE_DIR = tmpStateDir;
 
-      const tmpDir = fs.mkdtempSync(
-        path.join(os.tmpdir(), "tamandua-test-harness-adapter-hermes-")
-      );
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-hermes-");
       const hermesPath = path.join(tmpDir, "hermes");
       fs.writeFileSync(
         hermesPath,
@@ -1248,8 +1170,8 @@ echo "session_id: 20260518_103004_cdae11" >&2`,
         } else {
           process.env.TAMANDUA_HERMES_BINARY = originalHermesBinary;
         }
-        fs.rmSync(tmpDir, { recursive: true, force: true });
-        fs.rmSync(tmpStateDir, { recursive: true, force: true });
+
+
       }
     });
   });

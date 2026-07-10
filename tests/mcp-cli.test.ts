@@ -15,11 +15,10 @@
  */
 
 import { describe, it } from "node:test";
-import { cleanChildEnv, reserveRandomPort } from "./helpers/test-env.ts";
+import { cleanChildEnv, createTempHome, reserveRandomPort } from "./helpers/test-env.ts";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import http from "node:http";
-import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -70,7 +69,7 @@ async function waitForHttpUp(url: string, timeoutMs = 7000): Promise<Response> {
   let lastError: unknown;
 
   while (Date.now() - startedAt < timeoutMs) {
-    try {
+      try {
       return await fetch(url);
     } catch (err) {
       lastError = err;
@@ -85,7 +84,7 @@ async function waitForHttpDown(url: string, timeoutMs = 7000): Promise<void> {
   const startedAt = Date.now();
 
   while (Date.now() - startedAt < timeoutMs) {
-    try {
+      try {
       await fetch(url);
       await new Promise<void>((resolve) => setTimeout(resolve, 100));
     } catch {
@@ -146,9 +145,7 @@ function cleanStderr(stderr: string): string {
 // Isolated MCP helpers (mirror daemonctl API but resolve against temp HOME)
 // ═══════════════════════════════════════════════════════════════════
 
-function createTempHome(): string {
-  return fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-mcp-cli-"));
-}
+const TMP_PREFIX = "tamandua-mcp-cli-";
 
 function getIsolatedMcpPidFile(homeDir: string): string {
   return path.join(homeDir, ".tamandua", "mcp.pid");
@@ -206,23 +203,22 @@ describe("tamandua mcp CLI", { concurrency: 1 }, () => {
   // AC 5: tamandua mcp status shows not running when MCP is down
   it("mcp status shows not running when MCP is down", async () => {
     const unusedPort = await reserveRandomPort();
-    const tempHome = createTempHome();
+    const tempHome = createTempHome(TMP_PREFIX).homeDir;
+    cleanupIsolatedMcpFiles(tempHome);
     try {
-      cleanupIsolatedMcpFiles(tempHome);
-      // Write an isolated port file pointing to an unused port so the
-      // async status probe doesn't detect a production MCP on the default 3338.
-      const tamanduaDir = path.join(tempHome, ".tamandua");
-      fs.mkdirSync(tamanduaDir, { recursive: true });
-      fs.writeFileSync(getIsolatedMcpPortFile(tempHome), String(unusedPort), "utf-8");
+    // Write an isolated port file pointing to an unused port so the
+    // async status probe doesn't detect a production MCP on the default 3338.
+    const tamanduaDir = path.join(tempHome, ".tamandua");
+    fs.mkdirSync(tamanduaDir, { recursive: true });
+    fs.writeFileSync(getIsolatedMcpPortFile(tempHome), String(unusedPort), "utf-8");
 
-      const { stdout, stderr, exitCode } = await runCli(["mcp", "status"], tempHome);
+    const { stdout, stderr, exitCode } = await runCli(["mcp", "status"], tempHome);
 
-      assert.equal(exitCode, 0);
-      assert.ok(stdout.includes("not running"), `Expected "not running" in output, got: ${stdout}`);
-      assert.equal(cleanStderr(stderr), "");
+    assert.equal(exitCode, 0);
+    assert.ok(stdout.includes("not running"), `Expected "not running" in output, got: ${stdout}`);
+    assert.equal(cleanStderr(stderr), "");
     } finally {
       stopIsolatedMcp(tempHome);
-      fs.rmSync(tempHome, { recursive: true, force: true });
     }
   });
 
@@ -239,30 +235,29 @@ describe("tamandua mcp CLI", { concurrency: 1 }, () => {
       return;
     }
 
-    const tempHome = createTempHome();
+    const tempHome = createTempHome(TMP_PREFIX).homeDir;
+    cleanupIsolatedMcpFiles(tempHome);
     try {
-      cleanupIsolatedMcpFiles(tempHome);
 
-      const { stdout, stderr, exitCode } = await runCli(["mcp", "start", "--port", String(mcpPort)], tempHome);
+    const { stdout, stderr, exitCode } = await runCli(["mcp", "start", "--port", String(mcpPort)], tempHome);
 
-      assert.equal(exitCode, 0, `CLI exited with code ${exitCode}, stderr: ${cleanStderr(stderr)}`);
-      assert.ok(stdout.includes("started"), `Expected "started" in output, got: ${stdout}`);
-      assert.ok(stdout.includes("PID"), `Expected "PID" in output, got: ${stdout}`);
-      assert.ok(stdout.includes(`localhost:${mcpPort}`), `Expected port ${mcpPort} in output, got: ${stdout}`);
-      assert.ok(stdout.includes("/mcp"), `Expected /mcp endpoint in output, got: ${stdout}`);
+    assert.equal(exitCode, 0, `CLI exited with code ${exitCode}, stderr: ${cleanStderr(stderr)}`);
+    assert.ok(stdout.includes("started"), `Expected "started" in output, got: ${stdout}`);
+    assert.ok(stdout.includes("PID"), `Expected "PID" in output, got: ${stdout}`);
+    assert.ok(stdout.includes(`localhost:${mcpPort}`), `Expected port ${mcpPort} in output, got: ${stdout}`);
+    assert.ok(stdout.includes("/mcp"), `Expected /mcp endpoint in output, got: ${stdout}`);
 
-      // Verify it actually started via isolated PID file
-      const status = isIsolatedMcpRunning(tempHome);
-      assert.equal(status.running, true);
-      assert.notEqual(status.pid, null);
+    // Verify it actually started via isolated PID file
+    const status = isIsolatedMcpRunning(tempHome);
+    assert.equal(status.running, true);
+    assert.notEqual(status.pid, null);
 
-      // Verify endpoint reachable
-      const res = await waitForHttpUp(`http://127.0.0.1:${mcpPort}/mcp`);
-      assert.ok(res.status >= 200 && res.status < 500);
+    // Verify endpoint reachable
+    const res = await waitForHttpUp(`http://127.0.0.1:${mcpPort}/mcp`);
+    assert.ok(res.status >= 200 && res.status < 500);
 
     } finally {
       stopIsolatedMcp(tempHome);
-      fs.rmSync(tempHome, { recursive: true, force: true });
     }
   });
 
@@ -279,25 +274,24 @@ describe("tamandua mcp CLI", { concurrency: 1 }, () => {
       return;
     }
 
-    const tempHome = createTempHome();
+    const tempHome = createTempHome(TMP_PREFIX).homeDir;
+    cleanupIsolatedMcpFiles(tempHome);
     try {
-      cleanupIsolatedMcpFiles(tempHome);
 
-      const { stdout, stderr, exitCode } = await runCli(["mcp", "start", "--port", String(customPort)], tempHome);
+    const { stdout, stderr, exitCode } = await runCli(["mcp", "start", "--port", String(customPort)], tempHome);
 
-      assert.equal(exitCode, 0, `CLI exited with code ${exitCode}, stderr: ${cleanStderr(stderr)}`);
-      assert.ok(stdout.includes("started"), `Expected "started" in output, got: ${stdout}`);
-      assert.ok(stdout.includes(`localhost:${customPort}`), `Expected port ${customPort} in output, got: ${stdout}`);
+    assert.equal(exitCode, 0, `CLI exited with code ${exitCode}, stderr: ${cleanStderr(stderr)}`);
+    assert.ok(stdout.includes("started"), `Expected "started" in output, got: ${stdout}`);
+    assert.ok(stdout.includes(`localhost:${customPort}`), `Expected port ${customPort} in output, got: ${stdout}`);
 
-      // Verify on custom port
-      const res = await waitForHttpUp(`http://127.0.0.1:${customPort}/mcp`);
-      assert.ok(res.status >= 200 && res.status < 500);
+    // Verify on custom port
+    const res = await waitForHttpUp(`http://127.0.0.1:${customPort}/mcp`);
+    assert.ok(res.status >= 200 && res.status < 500);
 
-      assert.equal(readIsolatedMcpPort(tempHome), customPort);
+    assert.equal(readIsolatedMcpPort(tempHome), customPort);
 
     } finally {
       stopIsolatedMcp(tempHome);
-      fs.rmSync(tempHome, { recursive: true, force: true });
     }
   });
 
@@ -314,33 +308,32 @@ describe("tamandua mcp CLI", { concurrency: 1 }, () => {
       return;
     }
 
-    const tempHome = createTempHome();
+    const tempHome = createTempHome(TMP_PREFIX).homeDir;
+    cleanupIsolatedMcpFiles(tempHome);
     try {
-      cleanupIsolatedMcpFiles(tempHome);
 
-      // First start
-      const first = await runCli(["mcp", "start", "--port", String(mcpPort)], tempHome);
-      assert.equal(first.exitCode, 0);
-      assert.ok(first.stdout.includes("started"));
+    // First start
+    const first = await runCli(["mcp", "start", "--port", String(mcpPort)], tempHome);
+    assert.equal(first.exitCode, 0);
+    assert.ok(first.stdout.includes("started"));
 
-      // Capture the PID from first start via isolated helper
-      const runningStatus = isIsolatedMcpRunning(tempHome);
-      assert.equal(runningStatus.running, true);
-      const firstPid = runningStatus.pid;
+    // Capture the PID from first start via isolated helper
+    const runningStatus = isIsolatedMcpRunning(tempHome);
+    assert.equal(runningStatus.running, true);
+    const firstPid = runningStatus.pid;
 
-      // Second start - should show "already running" with the same PID
-      const second = await runCli(["mcp", "start", "--port", String(mcpPort)], tempHome);
-      assert.equal(second.exitCode, 0);
-      assert.ok(second.stdout.includes("already running"), `Expected "already running", got: ${second.stdout}`);
-      assert.ok(second.stdout.includes(`PID ${firstPid}`), `Expected PID ${firstPid}, got: ${second.stdout}`);
-      assert.ok(second.stdout.includes(`localhost:${mcpPort}`));
-      assert.ok(second.stdout.includes("/mcp"));
-      // Should NOT show "started" (second attempt didn't restart)
-      assert.ok(!second.stdout.includes("MCP server started"));
+    // Second start - should show "already running" with the same PID
+    const second = await runCli(["mcp", "start", "--port", String(mcpPort)], tempHome);
+    assert.equal(second.exitCode, 0);
+    assert.ok(second.stdout.includes("already running"), `Expected "already running", got: ${second.stdout}`);
+    assert.ok(second.stdout.includes(`PID ${firstPid}`), `Expected PID ${firstPid}, got: ${second.stdout}`);
+    assert.ok(second.stdout.includes(`localhost:${mcpPort}`));
+    assert.ok(second.stdout.includes("/mcp"));
+    // Should NOT show "started" (second attempt didn't restart)
+    assert.ok(!second.stdout.includes("MCP server started"));
 
     } finally {
       stopIsolatedMcp(tempHome);
-      fs.rmSync(tempHome, { recursive: true, force: true });
     }
   });
 
@@ -357,34 +350,33 @@ describe("tamandua mcp CLI", { concurrency: 1 }, () => {
       return;
     }
 
-    const tempHome = createTempHome();
+    const tempHome = createTempHome(TMP_PREFIX).homeDir;
+    cleanupIsolatedMcpFiles(tempHome);
     try {
-      cleanupIsolatedMcpFiles(tempHome);
 
-      // Start MCP
-      const start = await runCli(["mcp", "start", "--port", String(mcpPort)], tempHome);
-      assert.equal(start.exitCode, 0);
+    // Start MCP
+    const start = await runCli(["mcp", "start", "--port", String(mcpPort)], tempHome);
+    assert.equal(start.exitCode, 0);
 
-      const runningStatus = isIsolatedMcpRunning(tempHome);
-      assert.equal(runningStatus.running, true);
+    const runningStatus = isIsolatedMcpRunning(tempHome);
+    assert.equal(runningStatus.running, true);
 
-      const port = readIsolatedMcpPort(tempHome);
-      assert.equal(port, mcpPort);
+    const port = readIsolatedMcpPort(tempHome);
+    assert.equal(port, mcpPort);
 
-      // Check status via CLI with same isolated HOME
-      const { stdout, stderr, exitCode } = await runCli(["mcp", "status"], tempHome);
+    // Check status via CLI with same isolated HOME
+    const { stdout, stderr, exitCode } = await runCli(["mcp", "status"], tempHome);
 
-      assert.equal(exitCode, 0);
-      assert.ok(stdout.includes("running"), `Expected "running", got: ${stdout}`);
-      assert.ok(stdout.includes(`PID ${runningStatus.pid}`), `Expected PID ${runningStatus.pid}, got: ${stdout}`);
-      assert.ok(stdout.includes(`Port: ${port}`), `Expected Port: ${port}, got: ${stdout}`);
-      assert.ok(stdout.includes(`localhost:${port}`), `Expected localhost, got: ${stdout}`);
-      assert.ok(stdout.includes("/mcp"), `Expected /mcp endpoint, got: ${stdout}`);
-      assert.equal(cleanStderr(stderr), "");
+    assert.equal(exitCode, 0);
+    assert.ok(stdout.includes("running"), `Expected "running", got: ${stdout}`);
+    assert.ok(stdout.includes(`PID ${runningStatus.pid}`), `Expected PID ${runningStatus.pid}, got: ${stdout}`);
+    assert.ok(stdout.includes(`Port: ${port}`), `Expected Port: ${port}, got: ${stdout}`);
+    assert.ok(stdout.includes(`localhost:${port}`), `Expected localhost, got: ${stdout}`);
+    assert.ok(stdout.includes("/mcp"), `Expected /mcp endpoint, got: ${stdout}`);
+    assert.equal(cleanStderr(stderr), "");
 
     } finally {
       stopIsolatedMcp(tempHome);
-      fs.rmSync(tempHome, { recursive: true, force: true });
     }
   });
 
@@ -401,55 +393,53 @@ describe("tamandua mcp CLI", { concurrency: 1 }, () => {
       return;
     }
 
-    const tempHome = createTempHome();
+    const tempHome = createTempHome(TMP_PREFIX).homeDir;
+    cleanupIsolatedMcpFiles(tempHome);
     try {
-      cleanupIsolatedMcpFiles(tempHome);
 
-      // Start MCP
-      const start = await runCli(["mcp", "start", "--port", String(mcpPort)], tempHome);
-      assert.equal(start.exitCode, 0);
+    // Start MCP
+    const start = await runCli(["mcp", "start", "--port", String(mcpPort)], tempHome);
+    assert.equal(start.exitCode, 0);
 
-      // Verify it's running via isolated helper
-      let status = isIsolatedMcpRunning(tempHome);
-      assert.equal(status.running, true);
+    // Verify it's running via isolated helper
+    let status = isIsolatedMcpRunning(tempHome);
+    assert.equal(status.running, true);
 
-      // Stop via CLI with same isolated HOME
-      const { stdout, stderr, exitCode } = await runCli(["mcp", "stop"], tempHome);
+    // Stop via CLI with same isolated HOME
+    const { stdout, stderr, exitCode } = await runCli(["mcp", "stop"], tempHome);
 
-      assert.equal(exitCode, 0);
-      assert.ok(stdout.includes("stopped"), `Expected "stopped", got: ${stdout}`);
-      assert.equal(cleanStderr(stderr), "");
+    assert.equal(exitCode, 0);
+    assert.ok(stdout.includes("stopped"), `Expected "stopped", got: ${stdout}`);
+    assert.equal(cleanStderr(stderr), "");
 
-      // Wait for process to fully exit
-      await new Promise<void>((resolve) => setTimeout(resolve, 500));
+    // Wait for process to fully exit
+    await new Promise<void>((resolve) => setTimeout(resolve, 500));
 
-      // Verify it's actually stopped via isolated helper
-      status = isIsolatedMcpRunning(tempHome);
-      assert.equal(status.running, false, "MCP should not be running after stop");
+    // Verify it's actually stopped via isolated helper
+    status = isIsolatedMcpRunning(tempHome);
+    assert.equal(status.running, false, "MCP should not be running after stop");
 
-      // Verify PID file is cleaned up on isolated HOME
-      assert.equal(fs.existsSync(getIsolatedMcpPidFile(tempHome)), false, "PID file should be removed after stop");
+    // Verify PID file is cleaned up on isolated HOME
+    assert.equal(fs.existsSync(getIsolatedMcpPidFile(tempHome)), false, "PID file should be removed after stop");
 
     } finally {
       stopIsolatedMcp(tempHome);
-      fs.rmSync(tempHome, { recursive: true, force: true });
     }
   });
 
   // AC 7: tamandua mcp stop when not running prints not running message
   it("mcp stop when not running prints not running", async () => {
-    const tempHome = createTempHome();
+    const tempHome = createTempHome(TMP_PREFIX).homeDir;
+    cleanupIsolatedMcpFiles(tempHome);
     try {
-      cleanupIsolatedMcpFiles(tempHome);
 
-      const { stdout, stderr, exitCode } = await runCli(["mcp", "stop"], tempHome);
+    const { stdout, stderr, exitCode } = await runCli(["mcp", "stop"], tempHome);
 
-      assert.equal(exitCode, 0);
-      assert.ok(stdout.includes("not running"), `Expected "not running", got: ${stdout}`);
-      assert.equal(cleanStderr(stderr), "");
+    assert.equal(exitCode, 0);
+    assert.ok(stdout.includes("not running"), `Expected "not running", got: ${stdout}`);
+    assert.equal(cleanStderr(stderr), "");
     } finally {
       stopIsolatedMcp(tempHome);
-      fs.rmSync(tempHome, { recursive: true, force: true });
     }
   });
 
@@ -466,23 +456,22 @@ describe("tamandua mcp CLI", { concurrency: 1 }, () => {
       return;
     }
 
-    const tempHome = createTempHome();
+    const tempHome = createTempHome(TMP_PREFIX).homeDir;
+    cleanupIsolatedMcpFiles(tempHome);
     try {
-      cleanupIsolatedMcpFiles(tempHome);
 
-      // --port flag placed after the start subcommand
-      const { stdout, exitCode } = await runCli(["mcp", "start", "--port", String(customPort)], tempHome);
+    // --port flag placed after the start subcommand
+    const { stdout, exitCode } = await runCli(["mcp", "start", "--port", String(customPort)], tempHome);
 
-      assert.equal(exitCode, 0);
-      assert.ok(stdout.includes(`localhost:${customPort}`), `Expected port ${customPort} in output, got: ${stdout}`);
+    assert.equal(exitCode, 0);
+    assert.ok(stdout.includes(`localhost:${customPort}`), `Expected port ${customPort} in output, got: ${stdout}`);
 
-      // Verify endpoint
-      const res = await waitForHttpUp(`http://127.0.0.1:${customPort}/mcp`);
-      assert.ok(res.status >= 200 && res.status < 500);
+    // Verify endpoint
+    const res = await waitForHttpUp(`http://127.0.0.1:${customPort}/mcp`);
+    assert.ok(res.status >= 200 && res.status < 500);
 
     } finally {
       stopIsolatedMcp(tempHome);
-      fs.rmSync(tempHome, { recursive: true, force: true });
     }
   });
 });

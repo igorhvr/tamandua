@@ -8,10 +8,9 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import os from "node:os";
 import { execSync, execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { cleanChildEnv } from "./helpers/test-env.ts";
+import { cleanChildEnv, createTempHome } from "./helpers/test-env.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "..");
@@ -19,7 +18,7 @@ const SERIAL_SCRIPT = path.join(REPO_ROOT, "scripts", "run-serial-tests.sh");
 const PARALLEL_SCRIPT = path.join(REPO_ROOT, "scripts", "run-parallel-tests.sh");
 
 function makeTmpDir() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-runner-test-"));
+  return createTempHome("tamandua-runner-test-").root;
 }
 
 function writeText(filePath, text) {

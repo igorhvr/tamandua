@@ -1,19 +1,12 @@
 import fs from "node:fs";
-import { cleanChildEnv } from "./helpers/test-env.ts";
-import os from "node:os";
+import { cleanChildEnv, createTempHome } from "./helpers/test-env.ts";
 import path from "node:path";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { describe, it } from "node:test";
 
+const TMP_PREFIX = "tamandua-dashboard-run-tokens-";
 const repoRoot = process.cwd();
-
-function createTempHome() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-run-tokens-"));
-  const homeDir = path.join(root, "home");
-  fs.mkdirSync(homeDir, { recursive: true });
-  return { root, homeDir };
-}
 
 function runNodeScript(script: string, env: Record<string, string>) {
   const result = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
@@ -40,11 +33,9 @@ function runNodeScript(script: string, env: Record<string, string>) {
 
 describe("dashboard run token spend surfaces", () => {
   it("includes tokens_spent in /api/runs and /api/runs/:id payloads", () => {
-    const temp = createTempHome();
-
-    try {
-      const result = runNodeScript(
-        `
+    const temp = createTempHome(TMP_PREFIX);
+    const result = runNodeScript(
+      `
           import { once } from "node:events";
           import { getDb } from "./dist/db.js";
           import { createDashboardServer } from "./dist/server/dashboard.js";
@@ -99,17 +90,14 @@ describe("dashboard run token spend surfaces", () => {
             await new Promise((resolve) => server.close(() => resolve()));
           }
         `,
-        { HOME: temp.homeDir },
-      );
+      { HOME: temp.homeDir },
+    );
 
-      assert.equal(result.listStatus, 200);
-      assert.equal(result.detailStatus, 200);
-      assert.equal(result.hasTokensOnEveryRun, true);
-      assert.equal(result.listTokens, 144);
-      assert.equal(result.detailTokens, 144);
-    } finally {
-      fs.rmSync(temp.root, { recursive: true, force: true });
-    }
+    assert.equal(result.listStatus, 200);
+    assert.equal(result.detailStatus, 200);
+    assert.equal(result.hasTokensOnEveryRun, true);
+    assert.equal(result.listTokens, 144);
+    assert.equal(result.detailTokens, 144);
   });
 
   it("renders a Tokens column with safe defaulting logic in the runs table", () => {

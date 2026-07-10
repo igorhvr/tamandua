@@ -9,22 +9,15 @@
  */
 
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { describe, it } from "node:test";
-import { cleanChildEnv } from "./helpers/test-env.ts";
+import { cleanChildEnv, createTempHome } from "./helpers/test-env.ts";
 
 const repoRoot = process.cwd();
 
-function createTempHome() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-work-attribution-"));
-  const homeDir = path.join(root, "home");
-  fs.mkdirSync(homeDir, { recursive: true });
-  return { root, homeDir };
-}
 
 /** Fake pi emitting a message_end with usage but configurable tool events. */
 function createFakePi(rootDir: string, opts: { toolEventText?: string; totalTokens: number }): string {
@@ -127,7 +120,7 @@ function runDispatchRound(homeDir: string, fakePi: string, runId: string, stepId
 
 describe("work-round token attribution (C14)", () => {
   it("attributes usage via run/step ids from tool events", () => {
-    const temp = createTempHome();
+    const temp = createTempHome("tamandua-work-attribution-");
     const runId = crypto.randomUUID();
     const stepId = crypto.randomUUID();
     try {
@@ -145,7 +138,7 @@ describe("work-round token attribution (C14)", () => {
   });
 
   it("falls back to the dispatch job's runId when the stream has no ids", () => {
-    const temp = createTempHome();
+    const temp = createTempHome("tamandua-work-attribution-");
     const runId = crypto.randomUUID();
     const stepId = crypto.randomUUID();
     try {

@@ -20,6 +20,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createTempHome } from "../../tests/helpers/test-env.ts";
 
 // Save/restore env vars that affect path resolution and the guard itself.
 let savedHome: string | undefined;
@@ -75,18 +76,14 @@ describe("daemonctl readPort guard", { concurrency: 1 }, () => {
   });
 
   it("works normally when opts.homeDir is provided (explicit isolation)", async () => {
-    const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dc-guard-"));
-    try {
-      process.env.HOME = os.userInfo().homedir; // guard would fire without opts
+    const { root: tempHome } = createTempHome("tamandua-dc-guard-");
+    process.env.HOME = os.userInfo().homedir; // guard would fire without opts
 
-      const { readPort, writePort } = await importDaemonctl();
-      const opts = { homeDir: tempHome };
+    const { readPort, writePort } = await importDaemonctl();
+    const opts = { homeDir: tempHome };
 
-      writePort(4567, opts);
-      assert.equal(readPort(opts), 4567, "should read port from isolated dir");
-    } finally {
-      fs.rmSync(tempHome, { recursive: true, force: true });
-    }
+    writePort(4567, opts);
+    assert.equal(readPort(opts), 4567, "should read port from isolated dir");
   });
 
   it("returns default port when guard is inactive (production unaffected)", async () => {
@@ -121,18 +118,14 @@ describe("daemonctl readMcpPort guard", { concurrency: 1 }, () => {
   });
 
   it("works normally when opts.homeDir is provided", async () => {
-    const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dc-guard-"));
-    try {
-      process.env.HOME = os.userInfo().homedir;
+    const { root: tempHome } = createTempHome("tamandua-dc-guard-");
+    process.env.HOME = os.userInfo().homedir;
 
-      const { readMcpPort, writeMcpPort } = await importDaemonctl();
-      const opts = { homeDir: tempHome };
+    const { readMcpPort, writeMcpPort } = await importDaemonctl();
+    const opts = { homeDir: tempHome };
 
-      writeMcpPort(5678, opts);
-      assert.equal(readMcpPort(opts), 5678, "should read MCP port from isolated dir");
-    } finally {
-      fs.rmSync(tempHome, { recursive: true, force: true });
-    }
+    writeMcpPort(5678, opts);
+    assert.equal(readMcpPort(opts), 5678, "should read MCP port from isolated dir");
   });
 });
 
@@ -153,18 +146,14 @@ describe("daemonctl readControlPlanePort guard", { concurrency: 1 }, () => {
   });
 
   it("works normally when opts.homeDir is provided", async () => {
-    const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dc-guard-"));
-    try {
-      process.env.HOME = os.userInfo().homedir;
+    const { root: tempHome } = createTempHome("tamandua-dc-guard-");
+    process.env.HOME = os.userInfo().homedir;
 
-      const { readControlPlanePort, writeControlPlanePort } = await importDaemonctl();
-      const opts = { homeDir: tempHome };
+    const { readControlPlanePort, writeControlPlanePort } = await importDaemonctl();
+    const opts = { homeDir: tempHome };
 
-      writeControlPlanePort(6789, opts);
-      assert.equal(readControlPlanePort(opts), 6789, "should read control plane port from isolated dir");
-    } finally {
-      fs.rmSync(tempHome, { recursive: true, force: true });
-    }
+    writeControlPlanePort(6789, opts);
+    assert.equal(readControlPlanePort(opts), 6789, "should read control plane port from isolated dir");
   });
 });
 
@@ -185,18 +174,14 @@ describe("daemonctl writePort guard", { concurrency: 1 }, () => {
   });
 
   it("works normally when opts.homeDir is provided", async () => {
-    const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dc-guard-"));
-    try {
-      process.env.HOME = os.userInfo().homedir;
+    const { root: tempHome } = createTempHome("tamandua-dc-guard-");
+    process.env.HOME = os.userInfo().homedir;
 
-      const { writePort, readPort } = await importDaemonctl();
-      const opts = { homeDir: tempHome };
+    const { writePort, readPort } = await importDaemonctl();
+    const opts = { homeDir: tempHome };
 
-      assert.doesNotThrow(() => writePort(9999, opts));
-      assert.equal(readPort(opts), 9999, "write + read round-trip should work");
-    } finally {
-      fs.rmSync(tempHome, { recursive: true, force: true });
-    }
+    assert.doesNotThrow(() => writePort(9999, opts));
+    assert.equal(readPort(opts), 9999, "write + read round-trip should work");
   });
 });
 
@@ -217,16 +202,12 @@ describe("daemonctl writeMcpPort guard", { concurrency: 1 }, () => {
   });
 
   it("works normally when opts.homeDir is provided", async () => {
-    const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dc-guard-"));
-    try {
-      const { writeMcpPort, readMcpPort } = await importDaemonctl();
-      const opts = { homeDir: tempHome };
+    const { root: tempHome } = createTempHome("tamandua-dc-guard-");
+    const { writeMcpPort, readMcpPort } = await importDaemonctl();
+    const opts = { homeDir: tempHome };
 
-      assert.doesNotThrow(() => writeMcpPort(8888, opts));
-      assert.equal(readMcpPort(opts), 8888);
-    } finally {
-      fs.rmSync(tempHome, { recursive: true, force: true });
-    }
+    assert.doesNotThrow(() => writeMcpPort(8888, opts));
+    assert.equal(readMcpPort(opts), 8888);
   });
 });
 
@@ -247,16 +228,12 @@ describe("daemonctl writeControlPlanePort guard", { concurrency: 1 }, () => {
   });
 
   it("works normally when opts.homeDir is provided", async () => {
-    const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dc-guard-"));
-    try {
-      const { writeControlPlanePort, readControlPlanePort } = await importDaemonctl();
-      const opts = { homeDir: tempHome };
+    const { root: tempHome } = createTempHome("tamandua-dc-guard-");
+    const { writeControlPlanePort, readControlPlanePort } = await importDaemonctl();
+    const opts = { homeDir: tempHome };
 
-      assert.doesNotThrow(() => writeControlPlanePort(7777, opts));
-      assert.equal(readControlPlanePort(opts), 7777);
-    } finally {
-      fs.rmSync(tempHome, { recursive: true, force: true });
-    }
+    assert.doesNotThrow(() => writeControlPlanePort(7777, opts));
+    assert.equal(readControlPlanePort(opts), 7777);
   });
 });
 
@@ -342,24 +319,20 @@ describe("daemonctl path file guards", { concurrency: 1 }, () => {
   });
 
   it("path functions work normally when opts.homeDir is provided", async () => {
-    const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dc-guard-"));
-    try {
-      process.env.HOME = os.userInfo().homedir;
-      const opts = { homeDir: tempHome };
+    const { root: tempHome } = createTempHome("tamandua-dc-guard-");
+    process.env.HOME = os.userInfo().homedir;
+    const opts = { homeDir: tempHome };
 
-      const { getPidFile, getMcpPidFile, getControlPlanePidFile,
-              getPortFile, getMcpPortFile, getControlPlanePortFile } = await importDaemonctl();
+    const { getPidFile, getMcpPidFile, getControlPlanePidFile,
+            getPortFile, getMcpPortFile, getControlPlanePortFile } = await importDaemonctl();
 
-      const tamanduaDir = path.join(tempHome, ".tamandua");
-      assert.ok(getPidFile(opts).startsWith(tamanduaDir));
-      assert.ok(getMcpPidFile(opts).startsWith(tamanduaDir));
-      assert.ok(getControlPlanePidFile(opts).startsWith(tamanduaDir));
-      assert.ok(getPortFile(opts).startsWith(tamanduaDir));
-      assert.ok(getMcpPortFile(opts).startsWith(tamanduaDir));
-      assert.ok(getControlPlanePortFile(opts).startsWith(tamanduaDir));
-    } finally {
-      fs.rmSync(tempHome, { recursive: true, force: true });
-    }
+    const tamanduaDir = path.join(tempHome, ".tamandua");
+    assert.ok(getPidFile(opts).startsWith(tamanduaDir));
+    assert.ok(getMcpPidFile(opts).startsWith(tamanduaDir));
+    assert.ok(getControlPlanePidFile(opts).startsWith(tamanduaDir));
+    assert.ok(getPortFile(opts).startsWith(tamanduaDir));
+    assert.ok(getMcpPortFile(opts).startsWith(tamanduaDir));
+    assert.ok(getControlPlanePortFile(opts).startsWith(tamanduaDir));
   });
 
   it("path functions work normally when guard is inactive", async () => {
@@ -396,21 +369,17 @@ describe("daemonctl HOME-spoof resistance", { concurrency: 1 }, () => {
     // state dir. So with spoofed HOME, readPort() resolves to a
     // different path and the guard should NOT fire. That's correct:
     // if HOME is spoofed, the port file path doesn't hit production.
-    const spoofedHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-spoof-"));
-    try {
-      process.env.HOME = spoofedHome;
-      delete process.env.TAMANDUA_STATE_DIR;
+    const { root: spoofedHome } = createTempHome("tamandua-spoof-");
+    process.env.HOME = spoofedHome;
+    delete process.env.TAMANDUA_STATE_DIR;
 
-      const { readPort } = await importDaemonctl();
+    const { readPort } = await importDaemonctl();
 
-      // With spoofed HOME, the resolved port file is under spoofedHome,
-      // not under real ~/.tamandua, so the guard does NOT fire.
-      const port = readPort();
-      assert.ok(typeof port === "number" && port > 0 && port < 65536,
-        "should not be blocked — sporofed HOME resolves to different path");
-    } finally {
-      fs.rmSync(spoofedHome, { recursive: true, force: true });
-    }
+    // With spoofed HOME, the resolved port file is under spoofedHome,
+    // not under real ~/.tamandua, so the guard does NOT fire.
+    const port = readPort();
+    assert.ok(typeof port === "number" && port > 0 && port < 65536,
+      "should not be blocked — sporofed HOME resolves to different path");
   });
 });
 
@@ -429,23 +398,19 @@ describe("daemonctl isRunning guard", { concurrency: 1 }, () => {
   });
 
   it("works normally when opts.homeDir is provided", async () => {
-    const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dc-guard-"));
-    try {
-      process.env.HOME = os.userInfo().homedir;
-      const opts = { homeDir: tempHome };
+    const { root: tempHome } = createTempHome("tamandua-dc-guard-");
+    process.env.HOME = os.userInfo().homedir;
+    const opts = { homeDir: tempHome };
 
-      // Create a fake PID file in the temp dir with a PID that doesn't exist
-      const pidFile = path.join(tempHome, ".tamandua", "tamandua.pid");
-      fs.mkdirSync(path.dirname(pidFile), { recursive: true });
-      fs.writeFileSync(pidFile, String(999999), "utf-8");
+    // Create a fake PID file in the temp dir with a PID that doesn't exist
+    const pidFile = path.join(tempHome, ".tamandua", "tamandua.pid");
+    fs.mkdirSync(path.dirname(pidFile), { recursive: true });
+    fs.writeFileSync(pidFile, String(999999), "utf-8");
 
-      const { isRunning } = await importDaemonctl();
-      const result = isRunning(opts);
-      assert.equal(result.running, false,
-        "should check PID file in isolated dir (fake PID is not a real process)");
-    } finally {
-      fs.rmSync(tempHome, { recursive: true, force: true });
-    }
+    const { isRunning } = await importDaemonctl();
+    const result = isRunning(opts);
+    assert.equal(result.running, false,
+      "should check PID file in isolated dir (fake PID is not a real process)");
   });
 
   it("works normally when guard is inactive", async () => {
@@ -479,21 +444,17 @@ describe("daemonctl isMcpRunning guard", { concurrency: 1 }, () => {
   });
 
   it("works normally when opts.homeDir is provided", async () => {
-    const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dc-guard-"));
-    try {
-      process.env.HOME = os.userInfo().homedir;
-      const opts = { homeDir: tempHome };
+    const { root: tempHome } = createTempHome("tamandua-dc-guard-");
+    process.env.HOME = os.userInfo().homedir;
+    const opts = { homeDir: tempHome };
 
-      const pidFile = path.join(tempHome, ".tamandua", "mcp.pid");
-      fs.mkdirSync(path.dirname(pidFile), { recursive: true });
-      fs.writeFileSync(pidFile, String(999999), "utf-8");
+    const pidFile = path.join(tempHome, ".tamandua", "mcp.pid");
+    fs.mkdirSync(path.dirname(pidFile), { recursive: true });
+    fs.writeFileSync(pidFile, String(999999), "utf-8");
 
-      const { isMcpRunning } = await importDaemonctl();
-      const result = isMcpRunning(opts);
-      assert.equal(result.running, false);
-    } finally {
-      fs.rmSync(tempHome, { recursive: true, force: true });
-    }
+    const { isMcpRunning } = await importDaemonctl();
+    const result = isMcpRunning(opts);
+    assert.equal(result.running, false);
   });
 });
 
@@ -510,21 +471,17 @@ describe("daemonctl isControlPlaneRunning guard", { concurrency: 1 }, () => {
   });
 
   it("works normally when opts.homeDir is provided", async () => {
-    const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dc-guard-"));
-    try {
-      process.env.HOME = os.userInfo().homedir;
-      const opts = { homeDir: tempHome };
+    const { root: tempHome } = createTempHome("tamandua-dc-guard-");
+    process.env.HOME = os.userInfo().homedir;
+    const opts = { homeDir: tempHome };
 
-      const pidFile = path.join(tempHome, ".tamandua", "control-plane.pid");
-      fs.mkdirSync(path.dirname(pidFile), { recursive: true });
-      fs.writeFileSync(pidFile, String(999999), "utf-8");
+    const pidFile = path.join(tempHome, ".tamandua", "control-plane.pid");
+    fs.mkdirSync(path.dirname(pidFile), { recursive: true });
+    fs.writeFileSync(pidFile, String(999999), "utf-8");
 
-      const { isControlPlaneRunning } = await importDaemonctl();
-      const result = isControlPlaneRunning(opts);
-      assert.equal(result.running, false);
-    } finally {
-      fs.rmSync(tempHome, { recursive: true, force: true });
-    }
+    const { isControlPlaneRunning } = await importDaemonctl();
+    const result = isControlPlaneRunning(opts);
+    assert.equal(result.running, false);
   });
 });
 
@@ -545,18 +502,14 @@ describe("daemonctl stopDaemon guard", { concurrency: 1 }, () => {
   });
 
   it("works normally when opts.homeDir is provided", async () => {
-    const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dc-guard-"));
-    try {
-      process.env.HOME = os.userInfo().homedir;
-      const opts = { homeDir: tempHome };
+    const { root: tempHome } = createTempHome("tamandua-dc-guard-");
+    process.env.HOME = os.userInfo().homedir;
+    const opts = { homeDir: tempHome };
 
-      // No daemon running in isolated dir — stopDaemon should return false.
-      const { stopDaemon } = await importDaemonctl();
-      const result = stopDaemon(opts);
-      assert.equal(result, false, "stopDaemon should return false when no daemon running");
-    } finally {
-      fs.rmSync(tempHome, { recursive: true, force: true });
-    }
+    // No daemon running in isolated dir — stopDaemon should return false.
+    const { stopDaemon } = await importDaemonctl();
+    const result = stopDaemon(opts);
+    assert.equal(result, false, "stopDaemon should return false when no daemon running");
   });
 });
 
@@ -575,17 +528,13 @@ describe("daemonctl stopMcp guard", { concurrency: 1 }, () => {
   });
 
   it("works normally when opts.homeDir is provided", async () => {
-    const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dc-guard-"));
-    try {
-      process.env.HOME = os.userInfo().homedir;
-      const opts = { homeDir: tempHome };
+    const { root: tempHome } = createTempHome("tamandua-dc-guard-");
+    process.env.HOME = os.userInfo().homedir;
+    const opts = { homeDir: tempHome };
 
-      const { stopMcp } = await importDaemonctl();
-      const result = stopMcp(opts);
-      assert.equal(result, false, "stopMcp should return false when no MCP running");
-    } finally {
-      fs.rmSync(tempHome, { recursive: true, force: true });
-    }
+    const { stopMcp } = await importDaemonctl();
+    const result = stopMcp(opts);
+    assert.equal(result, false, "stopMcp should return false when no MCP running");
   });
 });
 
@@ -604,17 +553,13 @@ describe("daemonctl stopControlPlane guard", { concurrency: 1 }, () => {
   });
 
   it("works normally when opts.homeDir is provided", async () => {
-    const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dc-guard-"));
-    try {
-      process.env.HOME = os.userInfo().homedir;
-      const opts = { homeDir: tempHome };
+    const { root: tempHome } = createTempHome("tamandua-dc-guard-");
+    process.env.HOME = os.userInfo().homedir;
+    const opts = { homeDir: tempHome };
 
-      const { stopControlPlane } = await importDaemonctl();
-      const result = stopControlPlane(opts);
-      assert.equal(result, false, "stopControlPlane should return false when no control plane running");
-    } finally {
-      fs.rmSync(tempHome, { recursive: true, force: true });
-    }
+    const { stopControlPlane } = await importDaemonctl();
+    const result = stopControlPlane(opts);
+    assert.equal(result, false, "stopControlPlane should return false when no control plane running");
   });
 });
 
@@ -632,52 +577,40 @@ describe("daemonctl stopControlPlane guard", { concurrency: 1 }, () => {
 
 describe("daemonctl isolation via HOME env (no opts.homeDir)", { concurrency: 1 }, () => {
   it("readMcpPort works when HOME is isolated temp dir", async () => {
-    const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dc-home-iso-"));
-    try {
-      process.env.HOME = tempHome;
-      delete process.env.TAMANDUA_STATE_DIR;
+    const { root: tempHome } = createTempHome("tamandua-dc-home-iso-");
+    process.env.HOME = tempHome;
+    delete process.env.TAMANDUA_STATE_DIR;
 
-      const { readMcpPort, writeMcpPort } = await importDaemonctl();
+    const { readMcpPort, writeMcpPort } = await importDaemonctl();
 
-      // Write a port file in the isolated HOME (no opts)
-      writeMcpPort(9191);
-      const port = readMcpPort();
-      assert.equal(port, 9191, "should read MCP port from isolated HOME dir without opts");
-    } finally {
-      fs.rmSync(tempHome, { recursive: true, force: true });
-    }
+    // Write a port file in the isolated HOME (no opts)
+    writeMcpPort(9191);
+    const port = readMcpPort();
+    assert.equal(port, 9191, "should read MCP port from isolated HOME dir without opts");
   });
 
   it("readControlPlanePort works when HOME is isolated temp dir", async () => {
-    const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dc-home-iso-"));
-    try {
-      process.env.HOME = tempHome;
-      delete process.env.TAMANDUA_STATE_DIR;
+    const { root: tempHome } = createTempHome("tamandua-dc-home-iso-");
+    process.env.HOME = tempHome;
+    delete process.env.TAMANDUA_STATE_DIR;
 
-      const { readControlPlanePort, writeControlPlanePort } = await importDaemonctl();
+    const { readControlPlanePort, writeControlPlanePort } = await importDaemonctl();
 
-      writeControlPlanePort(9292);
-      const port = readControlPlanePort();
-      assert.equal(port, 9292, "should read control plane port from isolated HOME dir without opts");
-    } finally {
-      fs.rmSync(tempHome, { recursive: true, force: true });
-    }
+    writeControlPlanePort(9292);
+    const port = readControlPlanePort();
+    assert.equal(port, 9292, "should read control plane port from isolated HOME dir without opts");
   });
 
   it("readPort works when HOME is isolated temp dir", async () => {
-    const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dc-home-iso-"));
-    try {
-      process.env.HOME = tempHome;
-      delete process.env.TAMANDUA_STATE_DIR;
+    const { root: tempHome } = createTempHome("tamandua-dc-home-iso-");
+    process.env.HOME = tempHome;
+    delete process.env.TAMANDUA_STATE_DIR;
 
-      const { readPort, writePort } = await importDaemonctl();
+    const { readPort, writePort } = await importDaemonctl();
 
-      writePort(9393);
-      const port = readPort();
-      assert.equal(port, 9393, "should read port from isolated HOME dir without opts");
-    } finally {
-      fs.rmSync(tempHome, { recursive: true, force: true });
-    }
+    writePort(9393);
+    const port = readPort();
+    assert.equal(port, 9393, "should read port from isolated HOME dir without opts");
   });
 
   it("type guard smoke: readPort throws when HOME is NOT isolated", async () => {

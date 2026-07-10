@@ -8,6 +8,7 @@ import {
   getWorkflowShortDescription,
   fetchWorkflow,
 } from "../../dist/installer/workflow-fetch.js";
+import { createTempHome } from "../../tests/helpers/test-env.ts";
 
 describe("workflow-fetch", () => {
   describe("getWorkflowShortDescription", () => {
@@ -209,20 +210,18 @@ describe("workflow-fetch", () => {
 
   describe("fetchWorkflow refresh semantics", () => {
     it("refreshes symlink-sharing worktree variants without EINVAL (regression)", async () => {
-      const os = await import("node:os");
-      const fsSync = await import("node:fs");
-      const path = await import("node:path");
-      const { fetchWorkflow } = await import("../../dist/installer/workflow-fetch.js");
-
-      const tempHome = fsSync.mkdtempSync(path.join(os.tmpdir(), "tamandua-fetch-symlink-"));
+      const { tamanduaDir } = createTempHome("tamandua-fetch-symlink-");
       const savedStateDir = process.env.TAMANDUA_STATE_DIR;
-      process.env.TAMANDUA_STATE_DIR = path.join(tempHome, ".tamandua");
+      process.env.TAMANDUA_STATE_DIR = tamanduaDir;
+      const { fetchWorkflow } = await import("../../dist/installer/workflow-fetch.js");
+      const path = await import("node:path");
+      const fsSync = await import("node:fs");
+      const assert = (await import("node:assert/strict")).default;
       try {
         // bug-fix-worktree ships symlinked agent dirs (shared personas).
         const { workflowDir } = await fetchWorkflow("bug-fix-worktree");
         const fixerLink = path.join(workflowDir, "agents", "fixer");
         const first = fsSync.lstatSync(fixerLink);
-        const assert = (await import("node:assert/strict")).default;
         assert.ok(first.isSymbolicLink(), "installed agent dir should be a symlink (shared persona)");
 
         // Second install (update path) must refresh in place — the old
@@ -237,19 +236,17 @@ describe("workflow-fetch", () => {
       } finally {
         if (savedStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
         else process.env.TAMANDUA_STATE_DIR = savedStateDir;
-        fsSync.rmSync(tempHome, { recursive: true, force: true });
       }
     });
 
     it("overwrites a stale installed workflow definition (update delivers current YAML)", async () => {
-      const os = await import("node:os");
-      const fsSync = await import("node:fs");
-      const path = await import("node:path");
-      const { fetchWorkflow } = await import("../../dist/installer/workflow-fetch.js");
-
-      const tempHome = fsSync.mkdtempSync(path.join(os.tmpdir(), "tamandua-fetch-refresh-"));
+      const { tamanduaDir } = createTempHome("tamandua-fetch-refresh-");
       const savedStateDir = process.env.TAMANDUA_STATE_DIR;
-      process.env.TAMANDUA_STATE_DIR = path.join(tempHome, ".tamandua");
+      process.env.TAMANDUA_STATE_DIR = tamanduaDir;
+      const { fetchWorkflow } = await import("../../dist/installer/workflow-fetch.js");
+      const path = await import("node:path");
+      const fsSync = await import("node:fs");
+      const assert = (await import("node:assert/strict")).default;
       try {
         // First install
         const { workflowDir } = await fetchWorkflow("do-now");
@@ -262,13 +259,11 @@ describe("workflow-fetch", () => {
         // Re-install (what tamandua update does) must refresh to current
         await fetchWorkflow("do-now");
         const refreshed = fsSync.readFileSync(ymlPath, "utf-8");
-        const assert = (await import("node:assert/strict")).default;
         assert.equal(refreshed, original, "reinstall must overwrite the installed definition with the bundled one");
         assert.ok(!refreshed.includes("STALE INSTALLED COPY"));
       } finally {
         if (savedStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
         else process.env.TAMANDUA_STATE_DIR = savedStateDir;
-        fsSync.rmSync(tempHome, { recursive: true, force: true });
       }
     });
   });

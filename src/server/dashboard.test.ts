@@ -12,6 +12,7 @@ import { type TamanduaEvent } from "../../dist/installer/events.js";
 import { assertStatePathIsolation } from "../../dist/lib/test-guard.js";
 import { DEFAULT_MCP_PORT } from "../../dist/server/mcp-server.js";
 import { getDb, incrementSystemTokenSpend, getSystemTokenSpend } from "../../dist/db.js";
+import { createTempHome } from "../../tests/helpers/test-env.ts";
 
 interface LogsTailResponse {
   lines: string[];
@@ -43,7 +44,7 @@ async function stopDashboard(server: http.Server): Promise<void> {
 
 describe("dashboard logs-tail API", () => {
   it("returns initial logs-tail lines and cursor", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-logs-tail-"));
+    const { root } = createTempHome("tamandua-dashboard-logs-tail-");
     const stateDir = path.join(root, "state");
     const previousStateDir = process.env.TAMANDUA_STATE_DIR;
     process.env.TAMANDUA_STATE_DIR = stateDir;
@@ -83,12 +84,11 @@ describe("dashboard logs-tail API", () => {
       await stopDashboard(server);
       if (previousStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
       else process.env.TAMANDUA_STATE_DIR = previousStateDir;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("supports incremental cursor polling", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-logs-tail-"));
+    const { root } = createTempHome("tamandua-dashboard-logs-tail-");
     const stateDir = path.join(root, "state");
     const previousStateDir = process.env.TAMANDUA_STATE_DIR;
     process.env.TAMANDUA_STATE_DIR = stateDir;
@@ -137,7 +137,6 @@ describe("dashboard logs-tail API", () => {
       await stopDashboard(server);
       if (previousStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
       else process.env.TAMANDUA_STATE_DIR = previousStateDir;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 });
@@ -182,7 +181,7 @@ describe("dashboard logs-tail UI", () => {
 
 describe("dashboard AutoResearch progress", () => {
   it("serves run-scoped AutoResearch progress from the harness directory", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-autoresearch-"));
+    const { root } = createTempHome("tamandua-dashboard-autoresearch-");
     const homeDir = path.join(root, "home");
     const projectDir = path.join(root, "project");
     fs.mkdirSync(projectDir, { recursive: true });
@@ -294,7 +293,6 @@ describe("dashboard AutoResearch progress", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
@@ -321,7 +319,7 @@ describe("dashboard AutoResearch progress", () => {
   });
 
   it("GET /api/autoresearch/runs returns empty array when no runs have AutoResearch state", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-autoresearch-runs-empty-"));
+    const { root } = createTempHome("tamandua-dashboard-autoresearch-runs-empty-");
     const homeDir = path.join(root, "home");
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
     const previousHome = process.env.HOME;
@@ -362,12 +360,11 @@ describe("dashboard AutoResearch progress", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("GET /api/autoresearch/runs returns only runs with autoresearch.config.json in harness cwd", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-autoresearch-runs-filtered-"));
+    const { root } = createTempHome("tamandua-dashboard-autoresearch-runs-filtered-");
     const homeDir = path.join(root, "home");
     const projectDirWithAr = path.join(root, "project-with-ar");
     const projectDirNoAr = path.join(root, "project-no-ar");
@@ -439,12 +436,11 @@ describe("dashboard AutoResearch progress", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("GET /api/autoresearch/runs excludes runs without working_directory_for_harness", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-autoresearch-runs-no-cwd-"));
+    const { root } = createTempHome("tamandua-dashboard-autoresearch-runs-no-cwd-");
     const homeDir = path.join(root, "home");
     const projectDir = path.join(root, "project");
     fs.mkdirSync(projectDir, { recursive: true });
@@ -512,12 +508,11 @@ describe("dashboard AutoResearch progress", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("GET /api/autoresearch/runs excludes runs with harness cwd but no config file", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-autoresearch-runs-cwd-no-config-"));
+    const { root } = createTempHome("tamandua-dashboard-autoresearch-runs-cwd-no-config-");
     const homeDir = path.join(root, "home");
     const projectDir = path.join(root, "project");
     fs.mkdirSync(projectDir, { recursive: true });
@@ -563,12 +558,11 @@ describe("dashboard AutoResearch progress", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("GET /api/autoresearch/runs response shape matches expected { runs: [...] } format", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-autoresearch-runs-shape-"));
+    const { root } = createTempHome("tamandua-dashboard-autoresearch-runs-shape-");
     const homeDir = path.join(root, "home");
     const projectDir = path.join(root, "project");
     fs.mkdirSync(projectDir, { recursive: true });
@@ -637,14 +631,13 @@ describe("dashboard AutoResearch progress", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 });
 
 describe("dashboard stats API", () => {
   it("GET /api/stats returns systemTokensSpent and totalTokensSpent on fresh DB", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-stats-"));
+    const { root } = createTempHome("tamandua-dashboard-stats-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
@@ -676,12 +669,11 @@ describe("dashboard stats API", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("GET /api/stats totalTokensSpent equals system + run tokens", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-stats-"));
+    const { root } = createTempHome("tamandua-dashboard-stats-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
@@ -723,12 +715,11 @@ describe("dashboard stats API", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("GET /api/stats handles DB without tamandua_stats gracefully", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-stats-"));
+    const { root } = createTempHome("tamandua-dashboard-stats-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
@@ -779,7 +770,6 @@ describe("dashboard stats API", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 });
@@ -1036,7 +1026,7 @@ describe("dashboard relaunch UI", () => {
 
 describe("dashboard MCP status API", () => {
   it("GET /api/mcp-status returns { running, port, path }", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-mcp-status-"));
+    const { root } = createTempHome("tamandua-dashboard-mcp-status-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const previousHome = process.env.HOME;
@@ -1055,14 +1045,13 @@ describe("dashboard MCP status API", () => {
     } finally {
       await stopDashboard(server);
       process.env.HOME = previousHome;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 });
 
 describe("dashboard run detail failure_reason", () => {
   it("returns failure_reason=null for running run", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-failure-reason-"));
+    const { root } = createTempHome("tamandua-dashboard-failure-reason-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
@@ -1092,12 +1081,11 @@ describe("dashboard run detail failure_reason", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("returns failure_reason=null for completed run", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-failure-reason-"));
+    const { root } = createTempHome("tamandua-dashboard-failure-reason-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
@@ -1127,12 +1115,11 @@ describe("dashboard run detail failure_reason", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("returns failure_reason=null for paused run", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-failure-reason-"));
+    const { root } = createTempHome("tamandua-dashboard-failure-reason-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
@@ -1162,12 +1149,11 @@ describe("dashboard run detail failure_reason", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("returns 'Canceled' for canceled run", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-failure-reason-"));
+    const { root } = createTempHome("tamandua-dashboard-failure-reason-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
@@ -1197,12 +1183,11 @@ describe("dashboard run detail failure_reason", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("returns first failed step output for failed run", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-failure-reason-"));
+    const { root } = createTempHome("tamandua-dashboard-failure-reason-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
@@ -1241,12 +1226,11 @@ describe("dashboard run detail failure_reason", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("returns 'Run failed' for failed run with no failed-step output", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-failure-reason-"));
+    const { root } = createTempHome("tamandua-dashboard-failure-reason-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
@@ -1277,14 +1261,13 @@ describe("dashboard run detail failure_reason", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 });
 
 describe("dashboard run detail prompt field", () => {
   it("returns prompt field from run.task for all statuses", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-prompt-"));
+    const { root } = createTempHome("tamandua-dashboard-prompt-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
@@ -1326,7 +1309,6 @@ describe("dashboard run detail prompt field", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 });
@@ -1334,7 +1316,7 @@ describe("dashboard run detail prompt field", () => {
 describe("dashboard run relaunch API", () => {
   it("POST /api/runs/:id/relaunch returns 404 for missing run", async () => {
     // Isolated empty DB: never query the developer's real ~/.tamandua.
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-relaunch-404-"));
+    const { root } = createTempHome("tamandua-dashboard-relaunch-404-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const previousHome = process.env.HOME;
@@ -1359,12 +1341,11 @@ describe("dashboard run relaunch API", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("POST /api/runs/:id/relaunch returns 409 for running run", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-relaunch-"));
+    const { root } = createTempHome("tamandua-dashboard-relaunch-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
@@ -1397,12 +1378,11 @@ describe("dashboard run relaunch API", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("POST /api/runs/:id/relaunch returns 409 for completed run", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-relaunch-"));
+    const { root } = createTempHome("tamandua-dashboard-relaunch-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
@@ -1435,12 +1415,11 @@ describe("dashboard run relaunch API", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("POST /api/runs/:id/relaunch returns 409 for paused run", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-relaunch-"));
+    const { root } = createTempHome("tamandua-dashboard-relaunch-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
@@ -1473,12 +1452,11 @@ describe("dashboard run relaunch API", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("POST /api/runs/:id/relaunch returns 400 for invalid JSON body", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-relaunch-"));
+    const { root } = createTempHome("tamandua-dashboard-relaunch-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
@@ -1512,12 +1490,11 @@ describe("dashboard run relaunch API", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("POST /api/runs/:id/relaunch handles canceled run (routes correctly through handler)", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-relaunch-"));
+    const { root } = createTempHome("tamandua-dashboard-relaunch-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
@@ -1555,12 +1532,11 @@ describe("dashboard run relaunch API", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("POST /api/runs/:id/relaunch with empty body uses original task", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-relaunch-"));
+    const { root } = createTempHome("tamandua-dashboard-relaunch-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
@@ -1595,12 +1571,11 @@ describe("dashboard run relaunch API", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("POST /api/runs/:id/relaunch with whitespace-only task uses original task", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-relaunch-"));
+    const { root } = createTempHome("tamandua-dashboard-relaunch-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
@@ -1635,12 +1610,11 @@ describe("dashboard run relaunch API", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("POST /api/runs/:id/relaunch preserves notify_url from original run", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-relaunch-"));
+    const { root } = createTempHome("tamandua-dashboard-relaunch-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
@@ -1676,7 +1650,6 @@ describe("dashboard run relaunch API", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 });
@@ -1704,7 +1677,7 @@ describe("dashboard build version API", () => {
 
 describe("dashboard version status API", () => {
   it("GET /api/version-status returns { updateAvailable, currentHead, remoteHead, checkedAt } when no file exists", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-version-"));
+    const { root } = createTempHome("tamandua-dashboard-version-");
     const stateDir = path.join(root, "state");
     const previousStateDir = process.env.TAMANDUA_STATE_DIR;
     process.env.TAMANDUA_STATE_DIR = stateDir;
@@ -1724,12 +1697,11 @@ describe("dashboard version status API", () => {
       await stopDashboard(server);
       if (previousStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
       else process.env.TAMANDUA_STATE_DIR = previousStateDir;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("GET /api/version-status returns updateAvailable: true when file says so", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-version-"));
+    const { root } = createTempHome("tamandua-dashboard-version-");
     const stateDir = path.join(root, "state");
     const previousStateDir = process.env.TAMANDUA_STATE_DIR;
     process.env.TAMANDUA_STATE_DIR = stateDir;
@@ -1762,12 +1734,11 @@ describe("dashboard version status API", () => {
       await stopDashboard(server);
       if (previousStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
       else process.env.TAMANDUA_STATE_DIR = previousStateDir;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("GET /api/version-status returns updateAvailable: false when file says so", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-version-"));
+    const { root } = createTempHome("tamandua-dashboard-version-");
     const stateDir = path.join(root, "state");
     const previousStateDir = process.env.TAMANDUA_STATE_DIR;
     process.env.TAMANDUA_STATE_DIR = stateDir;
@@ -1796,7 +1767,6 @@ describe("dashboard version status API", () => {
       await stopDashboard(server);
       if (previousStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
       else process.env.TAMANDUA_STATE_DIR = previousStateDir;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
@@ -2009,7 +1979,7 @@ describe("dashboard hurry status icons UI", () => {
 
 describe("dashboard /api/runs no_hurry field", () => {
   it("no_hurry is true when context.no_hurry_save_tokens_mode === 'true'", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-nohurry-"));
+    const { root } = createTempHome("tamandua-dashboard-nohurry-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
@@ -2041,12 +2011,11 @@ describe("dashboard /api/runs no_hurry field", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("no_hurry is false when context.no_hurry_save_tokens_mode === 'false'", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-nohurry-"));
+    const { root } = createTempHome("tamandua-dashboard-nohurry-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
@@ -2077,12 +2046,11 @@ describe("dashboard /api/runs no_hurry field", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("no_hurry is false when context is missing no_hurry_save_tokens_mode", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-nohurry-"));
+    const { root } = createTempHome("tamandua-dashboard-nohurry-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
@@ -2113,12 +2081,11 @@ describe("dashboard /api/runs no_hurry field", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("no_hurry is false when context JSON is malformed", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-nohurry-"));
+    const { root } = createTempHome("tamandua-dashboard-nohurry-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
@@ -2149,12 +2116,11 @@ describe("dashboard /api/runs no_hurry field", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("no_hurry is never undefined — always a boolean", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-nohurry-"));
+    const { root } = createTempHome("tamandua-dashboard-nohurry-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
@@ -2194,7 +2160,6 @@ describe("dashboard /api/runs no_hurry field", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 });
@@ -2240,7 +2205,7 @@ function installWorkflowInHome(homeDir: string, workflowId: string): void {
 
 describe("dashboard cancel API", () => {
   it("POST /api/runs/:id/cancel returns 200 for a paused run", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-cancel-"));
+    const { root } = createTempHome("tamandua-dashboard-cancel-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
@@ -2284,12 +2249,11 @@ describe("dashboard cancel API", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("POST /api/runs/:id/cancel returns 200 for a running run", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-cancel-"));
+    const { root } = createTempHome("tamandua-dashboard-cancel-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
@@ -2339,14 +2303,13 @@ describe("dashboard cancel API", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("POST /api/runs/:id/cancel returns 404 for a nonexistent run", async () => {
     // Isolated empty DB: the 404 must come from a temp database, never
     // from querying the developer's real ~/.tamandua state.
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-cancel-404-"));
+    const { root } = createTempHome("tamandua-dashboard-cancel-404-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const previousHome = process.env.HOME;
@@ -2368,12 +2331,11 @@ describe("dashboard cancel API", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("POST /api/runs/:id/cancel returns 409 for a completed run", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-cancel-"));
+    const { root } = createTempHome("tamandua-dashboard-cancel-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
@@ -2403,12 +2365,11 @@ describe("dashboard cancel API", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("POST /api/runs/:id/cancel returns 409 for a failed run", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-cancel-"));
+    const { root } = createTempHome("tamandua-dashboard-cancel-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
@@ -2438,12 +2399,11 @@ describe("dashboard cancel API", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("POST /api/runs/:id/cancel returns 409 for an already canceled run", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-cancel-"));
+    const { root } = createTempHome("tamandua-dashboard-cancel-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
@@ -2473,12 +2433,11 @@ describe("dashboard cancel API", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("POST /api/runs/:id/cancel cancels only waiting/pending/running steps, leaves done/failed untouched", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-cancel-"));
+    const { root } = createTempHome("tamandua-dashboard-cancel-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
@@ -2546,14 +2505,13 @@ describe("dashboard cancel API", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 });
 
 describe("dashboard relaunch integration", () => {
   it("relaunches a failed run and preserves workflow_id, task, workspace settings, notify_url (direct mode, with task override)", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-relaunch-integration-"));
+    const { root } = createTempHome("tamandua-relaunch-integration-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const previousHome = process.env.HOME;
@@ -2634,12 +2592,11 @@ describe("dashboard relaunch integration", () => {
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
       if (previousControlPort === undefined) delete process.env.TAMANDUA_CONTROL_PORT;
       else process.env.TAMANDUA_CONTROL_PORT = previousControlPort;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("relaunches without task override uses original task (direct mode)", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-relaunch-integration-"));
+    const { root } = createTempHome("tamandua-relaunch-integration-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const previousHome = process.env.HOME;
@@ -2704,12 +2661,11 @@ describe("dashboard relaunch integration", () => {
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
       if (previousControlPort === undefined) delete process.env.TAMANDUA_CONTROL_PORT;
       else process.env.TAMANDUA_CONTROL_PORT = previousControlPort;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("relaunches a failed run in worktree mode preserving workflow_id, task, workspace settings, notify_url", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-relaunch-integration-"));
+    const { root } = createTempHome("tamandua-relaunch-integration-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const previousHome = process.env.HOME;
@@ -2802,7 +2758,6 @@ describe("dashboard relaunch integration", () => {
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
       if (previousControlPort === undefined) delete process.env.TAMANDUA_CONTROL_PORT;
       else process.env.TAMANDUA_CONTROL_PORT = previousControlPort;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 });
@@ -2926,7 +2881,7 @@ describe("dashboard cancel UI", () => {
   });
 
   it("Cancel button is placed to the right of Resume button for paused runs", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-cancel-"));
+    const { root } = createTempHome("tamandua-dashboard-cancel-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
@@ -2961,7 +2916,6 @@ describe("dashboard cancel UI", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
@@ -2990,7 +2944,7 @@ describe("dashboard cancel UI", () => {
 
 describe("dashboard AutoResearch session API", () => {
   it("GET /api/autoresearch/sessions returns empty array when no sessions registered", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-ar-sessions-empty-"));
+    const { root } = createTempHome("tamandua-dashboard-ar-sessions-empty-");
     const homeDir = path.join(root, "home");
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
     const previousHome = process.env.HOME;
@@ -3015,12 +2969,11 @@ describe("dashboard AutoResearch session API", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("GET /api/autoresearch/sessions returns registered sessions with required fields", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-ar-sessions-fields-"));
+    const { root } = createTempHome("tamandua-dashboard-ar-sessions-fields-");
     const homeDir = path.join(root, "home");
     const projectDir = path.join(root, "project");
     fs.mkdirSync(projectDir, { recursive: true });
@@ -3101,12 +3054,11 @@ describe("dashboard AutoResearch session API", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("GET /api/autoresearch/sessions/:id returns full session detail with experiments", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-ar-session-by-id-"));
+    const { root } = createTempHome("tamandua-dashboard-ar-session-by-id-");
     const homeDir = path.join(root, "home");
     const projectDir = path.join(root, "project");
     fs.mkdirSync(projectDir, { recursive: true });
@@ -3212,12 +3164,11 @@ describe("dashboard AutoResearch session API", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("GET /api/autoresearch/sessions/:id returns 404 for unknown session", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-ar-session-404-"));
+    const { root } = createTempHome("tamandua-dashboard-ar-session-404-");
     const homeDir = path.join(root, "home");
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
     const previousHome = process.env.HOME;
@@ -3241,12 +3192,11 @@ describe("dashboard AutoResearch session API", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("backfillAutoresearchSessions inserts missing sessions from recent runs", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-ar-backfill-"));
+    const { root } = createTempHome("tamandua-dashboard-ar-backfill-");
     const homeDir = path.join(root, "home");
     const projectDir = path.join(root, "project");
     fs.mkdirSync(projectDir, { recursive: true });
@@ -3309,12 +3259,11 @@ describe("dashboard AutoResearch session API", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("backfillAutoresearchSessions does not duplicate existing sessions", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-ar-backfill-no-dup-"));
+    const { root } = createTempHome("tamandua-dashboard-ar-backfill-no-dup-");
     const homeDir = path.join(root, "home");
     const projectDir = path.join(root, "project");
     fs.mkdirSync(projectDir, { recursive: true });
@@ -3372,12 +3321,11 @@ describe("dashboard AutoResearch session API", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("backfillAutoresearchSessions handles runs without harness cwd gracefully", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-ar-backfill-no-cwd-"));
+    const { root } = createTempHome("tamandua-dashboard-ar-backfill-no-cwd-");
     const homeDir = path.join(root, "home");
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
     const previousHome = process.env.HOME;
@@ -3402,12 +3350,11 @@ describe("dashboard AutoResearch session API", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("existing /api/autoresearch/runs still works after session API added", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-ar-runs-backcompat-"));
+    const { root } = createTempHome("tamandua-dashboard-ar-runs-backcompat-");
     const homeDir = path.join(root, "home");
     const projectDir = path.join(root, "project");
     fs.mkdirSync(projectDir, { recursive: true });
@@ -3461,12 +3408,11 @@ describe("dashboard AutoResearch session API", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("multiple sessions are ordered by updated_at DESC", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-ar-sessions-order-"));
+    const { root } = createTempHome("tamandua-dashboard-ar-sessions-order-");
     const homeDir = path.join(root, "home");
     const projectDir1 = path.join(root, "project1");
     const projectDir2 = path.join(root, "project2");
@@ -3527,14 +3473,13 @@ describe("dashboard AutoResearch session API", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 });
 
 describe("dashboard /api/runs cache", () => {
   it("serves cached response within TTL window", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-runs-cache-"));
+    const { root } = createTempHome("tamandua-dashboard-runs-cache-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
@@ -3581,12 +3526,11 @@ describe("dashboard /api/runs cache", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("queries fresh from DB after cache invalidation", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-runs-cache-"));
+    const { root } = createTempHome("tamandua-dashboard-runs-cache-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
@@ -3629,12 +3573,11 @@ describe("dashboard /api/runs cache", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("cache invalidation on successful cancel causes fresh /api/runs results", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-runs-cache-"));
+    const { root } = createTempHome("tamandua-dashboard-runs-cache-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
@@ -3673,12 +3616,11 @@ describe("dashboard /api/runs cache", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("cache invalidation on successful delete removes run from /api/runs", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-runs-cache-"));
+    const { root } = createTempHome("tamandua-dashboard-runs-cache-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
@@ -3720,12 +3662,11 @@ describe("dashboard /api/runs cache", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("cached responses are byte-identical across hits", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-runs-cache-"));
+    const { root } = createTempHome("tamandua-dashboard-runs-cache-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
@@ -3758,12 +3699,11 @@ describe("dashboard /api/runs cache", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("/api/runs/:id detail endpoint is NOT cached", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-runs-cache-"));
+    const { root } = createTempHome("tamandua-dashboard-runs-cache-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
@@ -3799,7 +3739,6 @@ describe("dashboard /api/runs cache", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
@@ -3810,7 +3749,7 @@ describe("dashboard /api/runs cache", () => {
   });
 
   it("empty runs list is correctly cached", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-runs-cache-"));
+    const { root } = createTempHome("tamandua-dashboard-runs-cache-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
@@ -3841,14 +3780,13 @@ describe("dashboard /api/runs cache", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   // US-002: Error path tests — cache must NOT be invalidated on failed mutations
 
   it("cancel 404 error path does NOT invalidate runs cache", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-runs-cache-"));
+    const { root } = createTempHome("tamandua-dashboard-runs-cache-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
@@ -3888,12 +3826,11 @@ describe("dashboard /api/runs cache", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("cancel 409 error path does NOT invalidate runs cache", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-runs-cache-"));
+    const { root } = createTempHome("tamandua-dashboard-runs-cache-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
@@ -3933,12 +3870,11 @@ describe("dashboard /api/runs cache", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("delete 404 error path does NOT invalidate runs cache", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-runs-cache-"));
+    const { root } = createTempHome("tamandua-dashboard-runs-cache-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
@@ -3977,12 +3913,11 @@ describe("dashboard /api/runs cache", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("delete 409 error path does NOT invalidate runs cache", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-runs-cache-"));
+    const { root } = createTempHome("tamandua-dashboard-runs-cache-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
@@ -4022,7 +3957,6 @@ describe("dashboard /api/runs cache", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
@@ -4030,7 +3964,7 @@ describe("dashboard /api/runs cache", () => {
   // (these handlers require a daemon for success-path HTTP testing)
 
   it("pause handler invalidation pattern works via invalidateRunsCache", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-runs-cache-"));
+    const { root } = createTempHome("tamandua-dashboard-runs-cache-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
@@ -4076,12 +4010,11 @@ describe("dashboard /api/runs cache", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("resume handler invalidation pattern works via invalidateRunsCache", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-runs-cache-"));
+    const { root } = createTempHome("tamandua-dashboard-runs-cache-");
     const homeDir = path.join(root, "home");
     fs.mkdirSync(homeDir, { recursive: true });
     const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
@@ -4127,7 +4060,6 @@ describe("dashboard /api/runs cache", () => {
       else process.env.HOME = previousHome;
       if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 });
@@ -4140,7 +4072,7 @@ describe("dashboard run detail bounded events", () => {
   }
 
   it("returns at most 200 events and truncated=true with correct totalEvents for a 500-event run", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-bounded-events-"));
+    const { root } = createTempHome("tamandua-dashboard-bounded-events-");
     const homeDir = path.join(root, "home");
     const stateDir = path.join(homeDir, ".tamandua");
     fs.mkdirSync(stateDir, { recursive: true });
@@ -4202,12 +4134,11 @@ describe("dashboard run detail bounded events", () => {
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
       if (previousStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
       else process.env.TAMANDUA_STATE_DIR = previousStateDir;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("returns all events and truncated=false with correct totalEvents for a small file (10 events)", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-bounded-events-"));
+    const { root } = createTempHome("tamandua-dashboard-bounded-events-");
     const homeDir = path.join(root, "home");
     const stateDir = path.join(homeDir, ".tamandua");
     fs.mkdirSync(stateDir, { recursive: true });
@@ -4265,12 +4196,11 @@ describe("dashboard run detail bounded events", () => {
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
       if (previousStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
       else process.env.TAMANDUA_STATE_DIR = previousStateDir;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("returns totalEvents=0 and truncated=false when run has no events file", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-bounded-events-"));
+    const { root } = createTempHome("tamandua-dashboard-bounded-events-");
     const homeDir = path.join(root, "home");
     const stateDir = path.join(homeDir, ".tamandua");
     fs.mkdirSync(stateDir, { recursive: true });
@@ -4319,12 +4249,11 @@ describe("dashboard run detail bounded events", () => {
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
       if (previousStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
       else process.env.TAMANDUA_STATE_DIR = previousStateDir;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("existing response fields (run, steps, failure_reason, prompt) are unchanged", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-bounded-events-"));
+    const { root } = createTempHome("tamandua-dashboard-bounded-events-");
     const homeDir = path.join(root, "home");
     const stateDir = path.join(homeDir, ".tamandua");
     fs.mkdirSync(stateDir, { recursive: true });
@@ -4375,14 +4304,13 @@ describe("dashboard run detail bounded events", () => {
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
       if (previousStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
       else process.env.TAMANDUA_STATE_DIR = previousStateDir;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 });
 
 describe("dashboard suite stats and flaky keys", () => {
   it("GET /api/runs/:id/suite-stats returns zero when no suite data", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-suite-stats-"));
+    const { root } = createTempHome("tamandua-dashboard-suite-stats-");
     const homeDir = path.join(root, "home");
     const stateDir = path.join(homeDir, ".tamandua");
     fs.mkdirSync(stateDir, { recursive: true });
@@ -4426,12 +4354,11 @@ describe("dashboard suite stats and flaky keys", () => {
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
       if (previousStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
       else process.env.TAMANDUA_STATE_DIR = previousStateDir;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("GET /api/runs/:id/suite-stats returns executed count from suite_results", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-suite-stats-"));
+    const { root } = createTempHome("tamandua-dashboard-suite-stats-");
     const homeDir = path.join(root, "home");
     const stateDir = path.join(homeDir, ".tamandua");
     fs.mkdirSync(stateDir, { recursive: true });
@@ -4489,12 +4416,11 @@ describe("dashboard suite stats and flaky keys", () => {
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
       if (previousStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
       else process.env.TAMANDUA_STATE_DIR = previousStateDir;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("GET /api/runs/:id/suite-stats counts replayed from cache_hit events", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-suite-stats-"));
+    const { root } = createTempHome("tamandua-dashboard-suite-stats-");
     const homeDir = path.join(root, "home");
     const stateDir = path.join(homeDir, ".tamandua");
     fs.mkdirSync(stateDir, { recursive: true });
@@ -4548,12 +4474,11 @@ describe("dashboard suite stats and flaky keys", () => {
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
       if (previousStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
       else process.env.TAMANDUA_STATE_DIR = previousStateDir;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("GET /api/runs/:id/suite-stats rounds saved minutes correctly", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-suite-stats-"));
+    const { root } = createTempHome("tamandua-dashboard-suite-stats-");
     const homeDir = path.join(root, "home");
     const stateDir = path.join(homeDir, ".tamandua");
     fs.mkdirSync(stateDir, { recursive: true });
@@ -4596,12 +4521,11 @@ describe("dashboard suite stats and flaky keys", () => {
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
       if (previousStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
       else process.env.TAMANDUA_STATE_DIR = previousStateDir;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("GET /api/suite/flaky returns empty when no flaky keys", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-flaky-"));
+    const { root } = createTempHome("tamandua-dashboard-flaky-");
     const homeDir = path.join(root, "home");
     const stateDir = path.join(homeDir, ".tamandua");
     fs.mkdirSync(stateDir, { recursive: true });
@@ -4635,12 +4559,11 @@ describe("dashboard suite stats and flaky keys", () => {
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
       if (previousStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
       else process.env.TAMANDUA_STATE_DIR = previousStateDir;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("GET /api/suite/flaky returns flaky keys when both green and red exist", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-flaky-"));
+    const { root } = createTempHome("tamandua-dashboard-flaky-");
     const homeDir = path.join(root, "home");
     const stateDir = path.join(homeDir, ".tamandua");
     fs.mkdirSync(stateDir, { recursive: true });
@@ -4692,12 +4615,11 @@ describe("dashboard suite stats and flaky keys", () => {
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
       if (previousStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
       else process.env.TAMANDUA_STATE_DIR = previousStateDir;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("GET /api/suite/flaky excludes keys with only green runs", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-flaky-"));
+    const { root } = createTempHome("tamandua-dashboard-flaky-");
     const homeDir = path.join(root, "home");
     const stateDir = path.join(homeDir, ".tamandua");
     fs.mkdirSync(stateDir, { recursive: true });
@@ -4737,12 +4659,11 @@ describe("dashboard suite stats and flaky keys", () => {
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
       if (previousStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
       else process.env.TAMANDUA_STATE_DIR = previousStateDir;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("GET /api/suite/flaky respects FLAKE_WINDOW (24h)", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-flaky-"));
+    const { root } = createTempHome("tamandua-dashboard-flaky-");
     const homeDir = path.join(root, "home");
     const stateDir = path.join(homeDir, ".tamandua");
     fs.mkdirSync(stateDir, { recursive: true });
@@ -4786,12 +4707,11 @@ describe("dashboard suite stats and flaky keys", () => {
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
       if (previousStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
       else process.env.TAMANDUA_STATE_DIR = previousStateDir;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("GET /api/runs includes suite_executed in run list", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-suite-exec-"));
+    const { root } = createTempHome("tamandua-dashboard-suite-exec-");
     const homeDir = path.join(root, "home");
     const stateDir = path.join(homeDir, ".tamandua");
     fs.mkdirSync(stateDir, { recursive: true });
@@ -4847,12 +4767,11 @@ describe("dashboard suite stats and flaky keys", () => {
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
       if (previousStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
       else process.env.TAMANDUA_STATE_DIR = previousStateDir;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("suite flaky query does not create runs, workflows, or tasks", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-flaky-"));
+    const { root } = createTempHome("tamandua-dashboard-flaky-");
     const homeDir = path.join(root, "home");
     const stateDir = path.join(homeDir, ".tamandua");
     fs.mkdirSync(stateDir, { recursive: true });
@@ -4884,12 +4803,11 @@ describe("dashboard suite stats and flaky keys", () => {
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
       if (previousStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
       else process.env.TAMANDUA_STATE_DIR = previousStateDir;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("existing response fields unchanged when suite columns present", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-suite-fields-"));
+    const { root } = createTempHome("tamandua-dashboard-suite-fields-");
     const homeDir = path.join(root, "home");
     const stateDir = path.join(homeDir, ".tamandua");
     fs.mkdirSync(stateDir, { recursive: true });
@@ -4943,12 +4861,11 @@ describe("dashboard suite stats and flaky keys", () => {
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
       if (previousStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
       else process.env.TAMANDUA_STATE_DIR = previousStateDir;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("GET /api/suite/flaky sorted by total runs descending", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-flaky-"));
+    const { root } = createTempHome("tamandua-dashboard-flaky-");
     const homeDir = path.join(root, "home");
     const stateDir = path.join(homeDir, ".tamandua");
     fs.mkdirSync(stateDir, { recursive: true });
@@ -5014,7 +4931,6 @@ describe("dashboard suite stats and flaky keys", () => {
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
       if (previousStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
       else process.env.TAMANDUA_STATE_DIR = previousStateDir;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 });

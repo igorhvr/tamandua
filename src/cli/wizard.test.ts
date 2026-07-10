@@ -9,8 +9,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import type {
   WizardTranscriptEntry,
@@ -19,7 +17,7 @@ import type {
   WizardEvaluatorReady,
 } from "../../dist/cli/wizard-types.js";
 import { buildEvaluatorPrompt } from "../../dist/cli/wizard-prompt.js";
-import { cleanChildEnv } from "../../tests/helpers/test-env.ts";
+import { cleanChildEnv, createTempHome } from "../../tests/helpers/test-env.ts";
 
 describe("wizard-types", () => {
   it("exports WizardEvaluatorInput type", () => {
@@ -459,23 +457,15 @@ describe("buildEvaluatorPrompt", () => {
 describe("tamandua autoresearch wizard --help", () => {
   function cli(args: string[], envOverrides?: Record<string, string>) {
     const wrapperPath = path.resolve("bin/tamandua");
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "wizard-help-test-"));
-    const stateDir = path.join(tmpDir, "state");
-    const homeDir = path.join(tmpDir, "home");
-    fs.mkdirSync(stateDir);
-    fs.mkdirSync(homeDir);
-    try {
-      return spawnSync("/bin/sh", [wrapperPath, ...args], {
-        encoding: "utf8",
-        env: cleanChildEnv({
-          HOME: homeDir,
-          TAMANDUA_STATE_DIR: stateDir,
-          ...envOverrides,
-        }),
-      });
-    } finally {
-      fs.rmSync(tmpDir, { recursive: true, force: true });
-    }
+    const th = createTempHome("wizard-help-test-");
+    return spawnSync("/bin/sh", [wrapperPath, ...args], {
+      encoding: "utf8",
+      env: cleanChildEnv({
+        HOME: th.homeDir,
+        TAMANDUA_STATE_DIR: th.tamanduaDir,
+        ...envOverrides,
+      }),
+    });
   }
 
   it("prints help and exits 0", () => {

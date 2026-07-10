@@ -116,15 +116,22 @@ describe("peekStep - lightweight work check", () => {
   });
 
   after(async () => {
+    // Close the DatabaseSync handle opened by getDb() (via step-ops import)
+    // so that WAL sidecar files (-shm, -wal) are released
+    const { closeDb } = await import("../dist/db.js");
+    closeDb();
+
     // Restore original DB path
     if (originalDbPath !== undefined) {
       process.env.TAMANDUA_DB_PATH = originalDbPath;
     } else {
       delete process.env.TAMANDUA_DB_PATH;
     }
-    // Clean up temp file
+    // Clean up temp DB file and WAL sidecars
     const fs = await import("node:fs");
     try { fs.unlinkSync(tmpDbPath); } catch {}
+    try { fs.unlinkSync(`${tmpDbPath}-shm`); } catch {}
+    try { fs.unlinkSync(`${tmpDbPath}-wal`); } catch {}
   });
 
   it("returns NO_WORK when agent has no steps at all", async () => {

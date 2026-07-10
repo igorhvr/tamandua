@@ -14,10 +14,9 @@
  */
 
 import { describe, it } from "node:test";
-import { cleanChildEnv } from "./helpers/test-env.ts";
+import { cleanChildEnv, createTempHome } from "./helpers/test-env.ts";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
@@ -248,18 +247,15 @@ describe("CLI pause/resume one run (integration)", { concurrency: 1 }, () => {
     const dashboardPort = await getAvailablePort();
     const controlPort = await getAvailablePort();
 
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-integration-test-"));
-    const homeDir = path.join(root, "home");
-    const tamanduaDir = path.join(homeDir, ".tamandua");
-    fs.mkdirSync(tamanduaDir, { recursive: true });
+    const th = createTempHome("tamandua-integration-test-");
 
     // Copy workflow directory so daemon can load the workflow spec
     const srcWorkflowDir = path.resolve(__dirname, "..", "workflows", "feature-dev-merge");
-    const dstWorkflowDir = path.join(tamanduaDir, "workflows", "feature-dev-merge");
+    const dstWorkflowDir = path.join(th.tamanduaDir, "workflows", "feature-dev-merge");
     fs.mkdirSync(path.dirname(dstWorkflowDir), { recursive: true });
     fs.cpSync(srcWorkflowDir, dstWorkflowDir, { recursive: true });
 
-    const dbPath = path.join(tamanduaDir, "tamandua.db");
+    const dbPath = path.join(th.tamanduaDir, "tamandua.db");
 
     const runId = crypto.randomUUID();
     // Create a run with all 6 agent steps from the feature-dev-merge workflow
@@ -278,7 +274,7 @@ describe("CLI pause/resume one run (integration)", { concurrency: 1 }, () => {
     try {
       // Start daemon
       daemon = spawn("node", [DAEMON_SCRIPT, String(dashboardPort)], {
-        env: cleanChildEnv({ HOME: homeDir,
+        env: cleanChildEnv({ HOME: th.homeDir,
           TAMANDUA_CONTROL_PORT: String(controlPort), }),
         stdio: ["ignore", "pipe", "pipe"],
       });
@@ -288,7 +284,7 @@ describe("CLI pause/resume one run (integration)", { concurrency: 1 }, () => {
       await waitForControlUp(controlPort);
 
       // Register the run with the daemon to create scheduler timers
-      const secret = readDaemonSecret(homeDir);
+      const secret = readDaemonSecret(th.homeDir);
       const regResp = await controlFetch(controlPort, "/control/register-run", "POST", { runId }, secret);
       assert.ok(
         regResp.status === 200 || regResp.status === 202,
@@ -301,7 +297,7 @@ describe("CLI pause/resume one run (integration)", { concurrency: 1 }, () => {
       // Pause the run via CLI
       const pauseResult = await runCli(
         ["workflow", "pause", runId],
-        { HOME: homeDir, TAMANDUA_CONTROL_PORT: String(controlPort) },
+        { HOME: th.homeDir, TAMANDUA_CONTROL_PORT: String(controlPort) },
       );
 
       assert.equal(
@@ -319,7 +315,7 @@ describe("CLI pause/resume one run (integration)", { concurrency: 1 }, () => {
       // AC 1: Verify status shows paused
       const statusAfterPause = await runCli(
         ["workflow", "status", runId.slice(0, 8)],
-        { HOME: homeDir, TAMANDUA_CONTROL_PORT: String(controlPort) },
+        { HOME: th.homeDir, TAMANDUA_CONTROL_PORT: String(controlPort) },
       );
       assert.ok(
         /Status:\s+paused/i.test(statusAfterPause.stdout),
@@ -329,7 +325,7 @@ describe("CLI pause/resume one run (integration)", { concurrency: 1 }, () => {
       // Resume the run via CLI
       const resumeResult = await runCli(
         ["workflow", "resume", runId],
-        { HOME: homeDir, TAMANDUA_CONTROL_PORT: String(controlPort) },
+        { HOME: th.homeDir, TAMANDUA_CONTROL_PORT: String(controlPort) },
       );
 
       assert.equal(
@@ -347,7 +343,7 @@ describe("CLI pause/resume one run (integration)", { concurrency: 1 }, () => {
       // AC 2: Verify status shows running after resume
       const statusAfterResume = await runCli(
         ["workflow", "status", runId.slice(0, 8)],
-        { HOME: homeDir, TAMANDUA_CONTROL_PORT: String(controlPort) },
+        { HOME: th.homeDir, TAMANDUA_CONTROL_PORT: String(controlPort) },
       );
       assert.ok(
         /Status:\s+running/i.test(statusAfterResume.stdout),
@@ -357,7 +353,6 @@ describe("CLI pause/resume one run (integration)", { concurrency: 1 }, () => {
       if (daemon && daemon.exitCode === null && daemon.pid) {
         try { process.kill(daemon.pid, "SIGTERM"); } catch { /* ignore */ }
       }
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
@@ -368,12 +363,9 @@ describe("CLI pause/resume one run (integration)", { concurrency: 1 }, () => {
       return;
     }
 
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-integration-test-"));
-    const homeDir = path.join(root, "home");
-    const tamanduaDir = path.join(homeDir, ".tamandua");
-    fs.mkdirSync(tamanduaDir, { recursive: true });
+    const th = createTempHome("tamandua-integration-test-");
 
-    const dbPath = path.join(tamanduaDir, "tamandua.db");
+    const dbPath = path.join(th.tamanduaDir, "tamandua.db");
     const completedRunId = crypto.randomUUID();
 
     const steps: SeedStep[] = [
@@ -381,24 +373,20 @@ describe("CLI pause/resume one run (integration)", { concurrency: 1 }, () => {
     ];
     seedRunAndSteps(dbPath, completedRunId, "feature-dev-merge", "completed", null, steps);
 
-    try {
-      const { stderr, exitCode } = await runCli(
-        ["workflow", "pause", completedRunId.slice(0, 8)],
-        { HOME: homeDir },
-      );
+    const { stderr, exitCode } = await runCli(
+      ["workflow", "pause", completedRunId.slice(0, 8)],
+      { HOME: th.homeDir },
+    );
 
-      assert.notEqual(exitCode, 0, "Should exit with non-zero code for completed run");
-      assert.ok(
-        stderr.includes("Cannot pause run") || stderr.includes("only running runs"),
-        `Expected terminal-run rejection error, got: ${stderr}`,
-      );
-      assert.ok(
-        stderr.includes("completed"),
-        `Expected "completed" status in error, got: ${stderr}`,
-      );
-    } finally {
-      fs.rmSync(root, { recursive: true, force: true });
-    }
+    assert.notEqual(exitCode, 0, "Should exit with non-zero code for completed run");
+    assert.ok(
+      stderr.includes("Cannot pause run") || stderr.includes("only running runs"),
+      `Expected terminal-run rejection error, got: ${stderr}`,
+    );
+    assert.ok(
+      stderr.includes("completed"),
+      `Expected "completed" status in error, got: ${stderr}`,
+    );
   });
 
   it("pause failed run via CLI is rejected", async (t) => {
@@ -407,12 +395,9 @@ describe("CLI pause/resume one run (integration)", { concurrency: 1 }, () => {
       return;
     }
 
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-integration-test-"));
-    const homeDir = path.join(root, "home");
-    const tamanduaDir = path.join(homeDir, ".tamandua");
-    fs.mkdirSync(tamanduaDir, { recursive: true });
+    const th = createTempHome("tamandua-integration-test-");
 
-    const dbPath = path.join(tamanduaDir, "tamandua.db");
+    const dbPath = path.join(th.tamanduaDir, "tamandua.db");
     const failedRunId = crypto.randomUUID();
 
     const steps: SeedStep[] = [
@@ -420,24 +405,20 @@ describe("CLI pause/resume one run (integration)", { concurrency: 1 }, () => {
     ];
     seedRunAndSteps(dbPath, failedRunId, "feature-dev-merge", "failed", null, steps);
 
-    try {
-      const { stderr, exitCode } = await runCli(
-        ["workflow", "pause", failedRunId.slice(0, 8)],
-        { HOME: homeDir },
-      );
+    const { stderr, exitCode } = await runCli(
+      ["workflow", "pause", failedRunId.slice(0, 8)],
+      { HOME: th.homeDir },
+    );
 
-      assert.notEqual(exitCode, 0, "Should exit with non-zero code for failed run");
-      assert.ok(
-        stderr.includes("Cannot pause run") || stderr.includes("only running runs"),
-        `Expected terminal-run rejection error, got: ${stderr}`,
-      );
-      assert.ok(
-        stderr.includes("failed"),
-        `Expected "failed" status in error, got: ${stderr}`,
-      );
-    } finally {
-      fs.rmSync(root, { recursive: true, force: true });
-    }
+    assert.notEqual(exitCode, 0, "Should exit with non-zero code for failed run");
+    assert.ok(
+      stderr.includes("Cannot pause run") || stderr.includes("only running runs"),
+      `Expected terminal-run rejection error, got: ${stderr}`,
+    );
+    assert.ok(
+      stderr.includes("failed"),
+      `Expected "failed" status in error, got: ${stderr}`,
+    );
   });
 
   // ── AC 6: Non-paused run resume is rejected ──
@@ -447,12 +428,9 @@ describe("CLI pause/resume one run (integration)", { concurrency: 1 }, () => {
       return;
     }
 
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-integration-test-"));
-    const homeDir = path.join(root, "home");
-    const tamanduaDir = path.join(homeDir, ".tamandua");
-    fs.mkdirSync(tamanduaDir, { recursive: true });
+    const th = createTempHome("tamandua-integration-test-");
 
-    const dbPath = path.join(tamanduaDir, "tamandua.db");
+    const dbPath = path.join(th.tamanduaDir, "tamandua.db");
     const runningRunId = crypto.randomUUID();
 
     const steps: SeedStep[] = [
@@ -460,20 +438,16 @@ describe("CLI pause/resume one run (integration)", { concurrency: 1 }, () => {
     ];
     seedRunAndSteps(dbPath, runningRunId, "feature-dev-merge", "running", null, steps);
 
-    try {
-      const { stderr, exitCode } = await runCli(
-        ["workflow", "resume", runningRunId],
-        { HOME: homeDir },
-      );
+    const { stderr, exitCode } = await runCli(
+      ["workflow", "resume", runningRunId],
+      { HOME: th.homeDir },
+    );
 
-      assert.notEqual(exitCode, 0, "Should exit with non-zero code for running run");
-      assert.ok(
-        stderr.includes("Cannot resume run") || stderr.includes("only paused or failed"),
-        `Expected non-paused resume rejection, got: ${stderr}`,
-      );
-    } finally {
-      fs.rmSync(root, { recursive: true, force: true });
-    }
+    assert.notEqual(exitCode, 0, "Should exit with non-zero code for running run");
+    assert.ok(
+      stderr.includes("Cannot resume run") || stderr.includes("only paused or failed"),
+      `Expected non-paused resume rejection, got: ${stderr}`,
+    );
   });
 
   it("resume completed (terminal) run is rejected", async (t) => {
@@ -482,12 +456,9 @@ describe("CLI pause/resume one run (integration)", { concurrency: 1 }, () => {
       return;
     }
 
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-integration-test-"));
-    const homeDir = path.join(root, "home");
-    const tamanduaDir = path.join(homeDir, ".tamandua");
-    fs.mkdirSync(tamanduaDir, { recursive: true });
+    const th = createTempHome("tamandua-integration-test-");
 
-    const dbPath = path.join(tamanduaDir, "tamandua.db");
+    const dbPath = path.join(th.tamanduaDir, "tamandua.db");
     const completedRunId = crypto.randomUUID();
 
     const steps: SeedStep[] = [
@@ -495,24 +466,20 @@ describe("CLI pause/resume one run (integration)", { concurrency: 1 }, () => {
     ];
     seedRunAndSteps(dbPath, completedRunId, "feature-dev-merge", "completed", null, steps);
 
-    try {
-      const { stderr, exitCode } = await runCli(
-        ["workflow", "resume", completedRunId],
-        { HOME: homeDir },
-      );
+    const { stderr, exitCode } = await runCli(
+      ["workflow", "resume", completedRunId],
+      { HOME: th.homeDir },
+    );
 
-      assert.notEqual(exitCode, 0, "Should exit with non-zero code for completed run");
-      assert.ok(
-        stderr.includes("Cannot resume run") || stderr.includes("cannot be resumed"),
-        `Expected terminal-run resume rejection, got: ${stderr}`,
-      );
-      assert.ok(
-        stderr.includes("completed"),
-        `Expected "completed" in error, got: ${stderr}`,
-      );
-    } finally {
-      fs.rmSync(root, { recursive: true, force: true });
-    }
+    assert.notEqual(exitCode, 0, "Should exit with non-zero code for completed run");
+    assert.ok(
+      stderr.includes("Cannot resume run") || stderr.includes("cannot be resumed"),
+      `Expected terminal-run resume rejection, got: ${stderr}`,
+    );
+    assert.ok(
+      stderr.includes("completed"),
+      `Expected "completed" in error, got: ${stderr}`,
+    );
   });
 
   // ── AC 7: Step state preserved across pause/resume ──
@@ -525,18 +492,15 @@ describe("CLI pause/resume one run (integration)", { concurrency: 1 }, () => {
     const dashboardPort = await getAvailablePort();
     const controlPort = await getAvailablePort();
 
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-integration-test-"));
-    const homeDir = path.join(root, "home");
-    const tamanduaDir = path.join(homeDir, ".tamandua");
-    fs.mkdirSync(tamanduaDir, { recursive: true });
+    const th = createTempHome("tamandua-integration-test-");
 
     // Copy workflow directory
     const srcWorkflowDir = path.resolve(__dirname, "..", "workflows", "feature-dev-merge");
-    const dstWorkflowDir = path.join(tamanduaDir, "workflows", "feature-dev-merge");
+    const dstWorkflowDir = path.join(th.tamanduaDir, "workflows", "feature-dev-merge");
     fs.mkdirSync(path.dirname(dstWorkflowDir), { recursive: true });
     fs.cpSync(srcWorkflowDir, dstWorkflowDir, { recursive: true });
 
-    const dbPath = path.join(tamanduaDir, "tamandua.db");
+    const dbPath = path.join(th.tamanduaDir, "tamandua.db");
 
     const runId = crypto.randomUUID();
     const steps: SeedStep[] = [
@@ -551,7 +515,7 @@ describe("CLI pause/resume one run (integration)", { concurrency: 1 }, () => {
     try {
       // Start daemon
       daemon = spawn("node", [DAEMON_SCRIPT, String(dashboardPort)], {
-        env: cleanChildEnv({ HOME: homeDir,
+        env: cleanChildEnv({ HOME: th.homeDir,
           TAMANDUA_CONTROL_PORT: String(controlPort), }),
         stdio: ["ignore", "pipe", "pipe"],
       });
@@ -561,7 +525,7 @@ describe("CLI pause/resume one run (integration)", { concurrency: 1 }, () => {
       await waitForControlUp(controlPort);
 
       // Register the run to create scheduler timers
-      const secret = readDaemonSecret(homeDir);
+      const secret = readDaemonSecret(th.homeDir);
       const regResp = await controlFetch(controlPort, "/control/register-run", "POST", { runId }, secret);
       assert.ok(
         regResp.status === 200 || regResp.status === 202,
@@ -575,7 +539,7 @@ describe("CLI pause/resume one run (integration)", { concurrency: 1 }, () => {
       // Pause
       const pauseResult = await runCli(
         ["workflow", "pause", runId],
-        { HOME: homeDir, TAMANDUA_CONTROL_PORT: String(controlPort) },
+        { HOME: th.homeDir, TAMANDUA_CONTROL_PORT: String(controlPort) },
       );
       assert.equal(pauseResult.exitCode, 0, `Pause should succeed, got exit ${pauseResult.exitCode}`);
 
@@ -595,7 +559,7 @@ describe("CLI pause/resume one run (integration)", { concurrency: 1 }, () => {
       // Resume
       const resumeResult = await runCli(
         ["workflow", "resume", runId],
-        { HOME: homeDir, TAMANDUA_CONTROL_PORT: String(controlPort) },
+        { HOME: th.homeDir, TAMANDUA_CONTROL_PORT: String(controlPort) },
       );
       assert.equal(resumeResult.exitCode, 0, `Resume should succeed, got exit ${resumeResult.exitCode}`);
 
@@ -613,7 +577,6 @@ describe("CLI pause/resume one run (integration)", { concurrency: 1 }, () => {
       if (daemon && daemon.exitCode === null && daemon.pid) {
         try { process.kill(daemon.pid, "SIGTERM"); } catch { /* ignore */ }
       }
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 });
@@ -628,18 +591,15 @@ describe("CLI pause/resume one run (integration)", { concurrency: 1 }, () => {
     const dashboardPort = await getAvailablePort();
     const controlPort = await getAvailablePort();
 
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-integration-orphan-"));
-    const homeDir = path.join(root, "home");
-    const tamanduaDir = path.join(homeDir, ".tamandua");
-    fs.mkdirSync(tamanduaDir, { recursive: true });
+    const th = createTempHome("tamandua-integration-orphan-");
 
     // Copy workflow directory so daemon can load the workflow spec
     const srcWorkflowDir = path.resolve(__dirname, "..", "workflows", "feature-dev-merge");
-    const dstWorkflowDir = path.join(tamanduaDir, "workflows", "feature-dev-merge");
+    const dstWorkflowDir = path.join(th.tamanduaDir, "workflows", "feature-dev-merge");
     fs.mkdirSync(path.dirname(dstWorkflowDir), { recursive: true });
     fs.cpSync(srcWorkflowDir, dstWorkflowDir, { recursive: true });
 
-    const dbPath = path.join(tamanduaDir, "tamandua.db");
+    const dbPath = path.join(th.tamanduaDir, "tamandua.db");
 
     const runId = crypto.randomUUID();
     // Seed a run with one step set to status='running' to simulate
@@ -662,7 +622,7 @@ describe("CLI pause/resume one run (integration)", { concurrency: 1 }, () => {
     try {
       // Start daemon
       daemon = spawn("node", [DAEMON_SCRIPT, String(dashboardPort)], {
-        env: cleanChildEnv({ HOME: homeDir,
+        env: cleanChildEnv({ HOME: th.homeDir,
           TAMANDUA_CONTROL_PORT: String(controlPort), }),
         stdio: ["ignore", "pipe", "pipe"],
       });
@@ -672,7 +632,7 @@ describe("CLI pause/resume one run (integration)", { concurrency: 1 }, () => {
       await waitForControlUp(controlPort);
 
       // Register the run with the daemon to create scheduler timers
-      const secret = readDaemonSecret(homeDir);
+      const secret = readDaemonSecret(th.homeDir);
       const regResp = await controlFetch(controlPort, "/control/register-run", "POST", { runId }, secret);
       assert.ok(
         regResp.status === 200 || regResp.status === 202,
@@ -687,7 +647,7 @@ describe("CLI pause/resume one run (integration)", { concurrency: 1 }, () => {
       // Pause the run via CLI
       const pauseResult = await runCli(
         ["workflow", "pause", runId],
-        { HOME: homeDir, TAMANDUA_CONTROL_PORT: String(controlPort) },
+        { HOME: th.homeDir, TAMANDUA_CONTROL_PORT: String(controlPort) },
       );
       assert.equal(
         pauseResult.exitCode, 0,
@@ -701,7 +661,7 @@ describe("CLI pause/resume one run (integration)", { concurrency: 1 }, () => {
       // Resume the run via CLI
       const resumeResult = await runCli(
         ["workflow", "resume", runId],
-        { HOME: homeDir, TAMANDUA_CONTROL_PORT: String(controlPort) },
+        { HOME: th.homeDir, TAMANDUA_CONTROL_PORT: String(controlPort) },
       );
       assert.equal(
         resumeResult.exitCode, 0,
@@ -734,7 +694,6 @@ describe("CLI pause/resume one run (integration)", { concurrency: 1 }, () => {
       if (daemon && daemon.exitCode === null && daemon.pid) {
         try { process.kill(daemon.pid, "SIGTERM"); } catch { /* ignore */ }
       }
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 

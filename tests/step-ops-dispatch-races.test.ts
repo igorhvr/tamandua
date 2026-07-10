@@ -19,9 +19,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
-import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+import { createTempHome } from "./helpers/test-env.ts";
 import { getDb } from "../dist/db.js";
 import {
   peekStep,
@@ -33,23 +32,13 @@ import {
 } from "../dist/installer/step-ops.js";
 
 // ── Environment isolation (see orphaned-step-recovery.test.ts) ──────
-const _savedStateDir = process.env.TAMANDUA_STATE_DIR;
-const _savedDbPath = process.env.TAMANDUA_DB_PATH;
-const _savedControlPort = process.env.TAMANDUA_CONTROL_PORT;
-const _isolationDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-races-"));
-process.env.TAMANDUA_STATE_DIR = _isolationDir;
-process.env.TAMANDUA_DB_PATH = path.join(_isolationDir, "tamandua.db");
-process.env.TAMANDUA_CONTROL_PORT = "1"; // nothing listens; control-plane calls fail fast
+// createTempHome sets up an isolated temp home with automatic after() cleanup.
 
-process.on("exit", () => {
-  if (_savedStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
-  else process.env.TAMANDUA_STATE_DIR = _savedStateDir;
-  if (_savedDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
-  else process.env.TAMANDUA_DB_PATH = _savedDbPath;
-  if (_savedControlPort === undefined) delete process.env.TAMANDUA_CONTROL_PORT;
-  else process.env.TAMANDUA_CONTROL_PORT = _savedControlPort;
-  try { fs.rmSync(_isolationDir, { recursive: true, force: true }); } catch { /* best effort */ }
-});
+describe("step-ops-dispatch-races", () => {
+  const { tamanduaDir } = createTempHome("tamandua-races-");
+  process.env.TAMANDUA_STATE_DIR = tamanduaDir;
+  process.env.TAMANDUA_DB_PATH = path.join(tamanduaDir, "tamandua.db");
+  process.env.TAMANDUA_CONTROL_PORT = "1"; // nothing listens; control-plane calls fail fast
 
 // ── Fixtures: a minimal synthetic two-step run ──────────────────────
 
@@ -182,4 +171,5 @@ describe("dispatch races (motor contract C5)", () => {
     assert.equal(zombie.status, "blocked", "completion of a permanently failed step must be blocked");
     assert.equal(stepStatus(fx.step1DbId), "failed", "zombie completion must not resurrect the step");
   });
+});
 });

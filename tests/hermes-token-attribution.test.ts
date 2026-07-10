@@ -10,23 +10,16 @@
  */
 
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { describe, it } from "node:test";
-import { cleanChildEnv } from "./helpers/test-env.ts";
+import { cleanChildEnv, createTempHome } from "./helpers/test-env.ts";
 
 const repoRoot = process.cwd();
 
-function createTempHome() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-hermes-attribution-"));
-  const homeDir = path.join(root, "home");
-  fs.mkdirSync(homeDir, { recursive: true });
-  return { root, homeDir };
-}
 
 function seedHermesStateDb(
   hermesHome: string,
@@ -133,13 +126,12 @@ function runHermesDispatchRound(
 
 describe("hermes token attribution", () => {
   it("attributes hermes tokens via state.db lookup", () => {
-    const temp = createTempHome();
+    const temp = createTempHome("tamandua-hermes-attribution-");
     const runId = crypto.randomUUID();
     const stepId = crypto.randomUUID();
     const sessionId = "test-session-123";
     const hermesHome = path.join(temp.root, "hermes-data");
     fs.mkdirSync(hermesHome, { recursive: true });
-    try {
       // Seed hermes state.db with a completed session worth 375 tokens
       seedHermesStateDb(hermesHome, sessionId, {
         input: 100,
@@ -153,18 +145,14 @@ describe("hermes token attribution", () => {
 
       assert.equal(result.tokensSpent, 325, "tokens_spent should be 325 (100+200+25 — cache_read excluded)");
       assert.equal(result.tokenEventDelta, 325, "tokenEventDelta should match token total (cache_read excluded)");
-    } finally {
-      fs.rmSync(temp.root, { recursive: true, force: true });
-    }
   });
 
   it("leaves tokens_spent untouched when session not found in state.db", () => {
-    const temp = createTempHome();
+    const temp = createTempHome("tamandua-hermes-attribution-");
     const runId = crypto.randomUUID();
     const stepId = crypto.randomUUID();
     const hermesHome = path.join(temp.root, "hermes-data");
     fs.mkdirSync(hermesHome, { recursive: true });
-    try {
       // Seed state.db but with a DIFFERENT session — the fake hermes
       // will report a session that doesn't exist in the DB.
       seedHermesStateDb(hermesHome, "some-other-session", {
@@ -176,40 +164,32 @@ describe("hermes token attribution", () => {
 
       assert.equal(result.tokensSpent, 0, "tokens_spent must remain 0 when session not found");
       assert.equal(result.tokenEventDelta, null, "no token event should be emitted");
-    } finally {
-      fs.rmSync(temp.root, { recursive: true, force: true });
-    }
   });
 
   it("leaves tokens_spent untouched when state.db is missing entirely", () => {
-    const temp = createTempHome();
+    const temp = createTempHome("tamandua-hermes-attribution-");
     const runId = crypto.randomUUID();
     const stepId = crypto.randomUUID();
     const sessionId = "test-session-no-db";
     // hermesHome is an empty dir with NO state.db
     const hermesHome = path.join(temp.root, "hermes-data");
     fs.mkdirSync(hermesHome, { recursive: true });
-    try {
       const fakeHermes = createFakeHermes(temp.root, sessionId);
       const result = runHermesDispatchRound(temp.homeDir, fakeHermes, runId, stepId, hermesHome);
 
       assert.equal(result.tokensSpent, 0, "tokens_spent must remain 0 when state.db is missing");
       assert.equal(result.tokenEventDelta, null, "no token event should be emitted");
-    } finally {
-      fs.rmSync(temp.root, { recursive: true, force: true });
-    }
   });
 
   it("does not affect pi token path", () => {
     // Verify that the pi token path is untouched — a pi round with JSON
     // output still attributes tokens via parseWorkRoundMetadata, not
     // the hermes lookup path.
-    const temp = createTempHome();
+    const temp = createTempHome("tamandua-hermes-attribution-");
     const runId = crypto.randomUUID();
     const stepId = crypto.randomUUID();
     const hermesHome = path.join(temp.root, "hermes-data");
     fs.mkdirSync(hermesHome, { recursive: true });
-    try {
       // Seed a hermes state.db — but the round uses pi, so it should
       // NOT be consulted.
       seedHermesStateDb(hermesHome, "some-session", {
@@ -298,22 +278,18 @@ describe("hermes token attribution", () => {
       // Pi token path should attribute 42 tokens from JSON parsing,
       // NOT 3996 from the hermes state.db.
       assert.equal(piData.tokensSpent, 42, "pi round must attribute tokens from JSON, not hermes state.db");
-    } finally {
-      fs.rmSync(temp.root, { recursive: true, force: true });
-    }
   });
 
   it("does not double count when hermes stdout carries pi-style JSON", () => {
     // Regression: hermes stdout carries no token usage by contract.
     // If an agent echoes pi-style JSON with totalTokens 99999 on stdout,
     // that must NOT be attributed — only the state.db-derived total counts.
-    const temp = createTempHome();
+    const temp = createTempHome("tamandua-hermes-attribution-");
     const runId = crypto.randomUUID();
     const stepId = crypto.randomUUID();
     const sessionId = "test-session-contaminated";
     const hermesHome = path.join(temp.root, "hermes-data");
     fs.mkdirSync(hermesHome, { recursive: true });
-    try {
       // Seed state.db — tokens total = 100 + 200 + 25 = 325 (cache_read excluded)
       seedHermesStateDb(hermesHome, sessionId, {
         input: 100,
@@ -355,8 +331,5 @@ echo "session_id: ${sessionId}" >&2
       assert.equal(result.tokensSpent, 325, "tokens_spent must come from state.db (325), not stdout JSON (99999)");
       assert.equal(result.tokenEventDelta, 325, "tokenEventDelta must come from state.db (325)");
       assert.equal(result.tokenEventCount, 1, "exactly one run.tokens.updated event");
-    } finally {
-      fs.rmSync(temp.root, { recursive: true, force: true });
-    }
   });
 });

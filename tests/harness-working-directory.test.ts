@@ -1,9 +1,9 @@
 import fs from "node:fs";
 import {
   cleanChildEnv,
+  createTempHome,
   reserveDistinctRandomPorts,
 } from "./helpers/test-env.ts";
-import os from "node:os";
 import path from "node:path";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -11,14 +11,11 @@ import { describe, it } from "node:test";
 
 const repoRoot = process.cwd();
 
-async function createTempHome() {
+async function setupHarnessTempHome() {
   const [controlPort, dashboardPort] = await reserveDistinctRandomPorts(2);
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-harness-cwd-"));
-  const homeDir = path.join(root, "home");
-  const tamanduaDir = path.join(homeDir, ".tamandua");
-  fs.mkdirSync(tamanduaDir, { recursive: true });
-  fs.writeFileSync(path.join(tamanduaDir, "port"), String(dashboardPort), "utf-8");
-  return { root, homeDir, controlPort, dashboardPort };
+  const th = createTempHome("tamandua-harness-cwd-");
+  fs.writeFileSync(path.join(th.tamanduaDir, "port"), String(dashboardPort), "utf-8");
+  return { root: th.root, homeDir: th.homeDir, controlPort, dashboardPort };
 }
 
 function writeMinimalWorkflow(homeDir: string, workflowId: string): void {
@@ -73,7 +70,7 @@ function runNodeScript(script: string, env: Record<string, string>) {
 
 describe("working-directory-for-harness", () => {
   it("runWorkflow persists explicit workingDirectoryForHarness in run context and scheduler job metadata", async () => {
-    const temp = await createTempHome();
+    const temp = await setupHarnessTempHome();
 
     try {
       const workflowId = "harness-explicit";
@@ -155,7 +152,7 @@ describe("working-directory-for-harness", () => {
   });
 
   it("defaults workingDirectoryForHarness to the current cwd", async () => {
-    const temp = await createTempHome();
+    const temp = await setupHarnessTempHome();
 
     try {
       const workflowId = "harness-default";

@@ -18,7 +18,9 @@ describe("medic", () => {
     originalDbPath = process.env.TAMANDUA_DB_PATH;
     originalHome = process.env.HOME;
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-medic-"));
-    dbPath = path.join(tempDir, ".tamandua", "tamandua.db");
+    const tamanduaDir = path.join(tempDir, ".tamandua");
+    fs.mkdirSync(tamanduaDir, { recursive: true });
+    dbPath = path.join(tamanduaDir, "tamandua.db");
     process.env.TAMANDUA_DB_PATH = dbPath;
     // medic checks uses os.homedir() to find cron-jobs.json
     process.env.HOME = tempDir;

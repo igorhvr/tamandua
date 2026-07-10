@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createTempHome } from "../../tests/helpers/test-env.ts";
 import assert from "node:assert/strict";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import {
@@ -16,13 +17,13 @@ describe("daemonctl dashboard helpers", () => {
   let tempHome: string;
 
   beforeEach(() => {
-    tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dctl-"));
+    const { homeDir } = createTempHome("tamandua-dctl-");
+    tempHome = homeDir;
     fs.mkdirSync(path.join(tempHome, ".tamandua"), { recursive: true });
   });
 
   afterEach(() => {
     try { stopDaemon({ homeDir: tempHome }); } catch {}
-    fs.rmSync(tempHome, { recursive: true, force: true });
   });
 
   describe("path helpers", () => {

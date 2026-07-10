@@ -1,5 +1,5 @@
+import { createTempHome } from "./helpers/test-env.ts";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
@@ -21,11 +21,10 @@ function withStateDir<T>(stateDir: string, run: () => Promise<T>): Promise<T> {
 
 describe("agent skill provisioning", () => {
   it("copies workflow-local agent skills into the provisioned agent directory", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-local-skill-"));
+    const root = createTempHome("tamandua-local-skill-").root;
     const stateDir = path.join(root, "state");
     const workflowDir = path.join(root, "workflow");
 
-    try {
       writeText(
         path.join(workflowDir, "agents", "developer", "skills", "local-helper", "SKILL.md"),
         "# local skill\n",
@@ -69,18 +68,14 @@ describe("agent skill provisioning", () => {
         fs.readFileSync(path.join(copiedSkillDir, "examples", "example.md"), "utf-8"),
         "example",
       );
-    } finally {
-      fs.rmSync(root, { recursive: true, force: true });
-    }
   });
 
   it("copies shared bundled skills from repository-level skills directories", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-shared-skill-"));
+    const root = createTempHome("tamandua-shared-skill-").root;
     const stateDir = path.join(root, "state");
     const workflowDir = path.join(root, "installed", "workflows", "workflow-shared");
     const bundledSourceDir = path.join(root, "bundled", "workflows", "workflow-shared");
 
-    try {
       writeText(path.join(workflowDir, "agents", "developer", ".keep"), "");
       writeText(path.join(bundledSourceDir, "agents", "developer", ".keep"), "");
       writeText(
@@ -127,8 +122,5 @@ describe("agent skill provisioning", () => {
         fs.readFileSync(path.join(copiedSkillDir, "examples", "usage.md"), "utf-8"),
         "shared usage",
       );
-    } finally {
-      fs.rmSync(root, { recursive: true, force: true });
-    }
   });
 });

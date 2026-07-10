@@ -295,6 +295,18 @@ export function nextRunNumber(): number {
   return row.next;
 }
 
+export function closeDb(): void {
+  if (_db) {
+    try {
+      _db.close();
+    } catch {
+      // ignore double-close errors
+    }
+    _db = null;
+    _dbPath = null;
+  }
+}
+
 export function getDbPath(): string {
   return resolveDbPath();
 }

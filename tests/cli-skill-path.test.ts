@@ -10,10 +10,9 @@
  */
 
 import { describe, it, before, after } from "node:test";
-import { cleanChildEnv } from "./helpers/test-env.ts";
+import { cleanChildEnv, createTempHome } from "./helpers/test-env.ts";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -70,9 +69,7 @@ function cleanStderr(stderr: string): string {
     .trim();
 }
 
-function createTempHome(): string {
-  return fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-skill-path-"));
-}
+const TMP_PREFIX = "tamandua-skill-path-";
 
 // ═══════════════════════════════════════════════════════════════════
 // Tests
@@ -88,22 +85,18 @@ describe("tamandua skill-path CLI", () => {
       return;
     }
 
-    const tempHome = createTempHome();
-    try {
-      const { stdout, stderr, exitCode } = await runCli(["skill-path"], tempHome);
+    const tempHome = createTempHome(TMP_PREFIX).homeDir;
+    const { stdout, stderr, exitCode } = await runCli(["skill-path"], tempHome);
 
-      const cleanOut = stdout.trim();
-      const cleanErr = cleanStderr(stderr);
+    const cleanOut = stdout.trim();
+    const cleanErr = cleanStderr(stderr);
 
-      assert.equal(exitCode, 0, `CLI exited with code ${exitCode}, stderr: ${cleanErr}`);
-      assert.equal(cleanErr, "");
-      assert.ok(
-        cleanOut.endsWith(EXPECTED_SKILL_SUFFIX),
-        `Expected path ending with "${EXPECTED_SKILL_SUFFIX}", got: "${cleanOut}"`,
-      );
-    } finally {
-      fs.rmSync(tempHome, { recursive: true, force: true });
-    }
+    assert.equal(exitCode, 0, `CLI exited with code ${exitCode}, stderr: ${cleanErr}`);
+    assert.equal(cleanErr, "");
+    assert.ok(
+      cleanOut.endsWith(EXPECTED_SKILL_SUFFIX),
+      `Expected path ending with "${EXPECTED_SKILL_SUFFIX}", got: "${cleanOut}"`,
+    );
   });
 
   // AC 2: tamandua skill-path output is an absolute path that exists on disk
@@ -113,30 +106,26 @@ describe("tamandua skill-path CLI", () => {
       return;
     }
 
-    const tempHome = createTempHome();
-    try {
-      const { stdout, stderr, exitCode } = await runCli(["skill-path"], tempHome);
+    const tempHome = createTempHome(TMP_PREFIX).homeDir;
+    const { stdout, stderr, exitCode } = await runCli(["skill-path"], tempHome);
 
-      const cleanOut = stdout.trim();
-      const cleanErr = cleanStderr(stderr);
+    const cleanOut = stdout.trim();
+    const cleanErr = cleanStderr(stderr);
 
-      assert.equal(exitCode, 0, `CLI exited with code ${exitCode}, stderr: ${cleanErr}`);
-      assert.equal(cleanErr, "");
+    assert.equal(exitCode, 0, `CLI exited with code ${exitCode}, stderr: ${cleanErr}`);
+    assert.equal(cleanErr, "");
 
-      // Must be absolute
-      assert.ok(
-        path.isAbsolute(cleanOut),
-        `Expected absolute path, got: "${cleanOut}"`,
-      );
+    // Must be absolute
+    assert.ok(
+      path.isAbsolute(cleanOut),
+      `Expected absolute path, got: "${cleanOut}"`,
+    );
 
-      // Must exist on disk
-      assert.ok(
-        fs.existsSync(cleanOut),
-        `Path does not exist on disk: "${cleanOut}"`,
-      );
-    } finally {
-      fs.rmSync(tempHome, { recursive: true, force: true });
-    }
+    // Must exist on disk
+    assert.ok(
+      fs.existsSync(cleanOut),
+      `Path does not exist on disk: "${cleanOut}"`,
+    );
   });
 
   // AC 3: tamandua with no arguments lists skill-path before source-path in help output
@@ -146,22 +135,18 @@ describe("tamandua skill-path CLI", () => {
       return;
     }
 
-    const tempHome = createTempHome();
-    try {
-      const { stdout, stderr, exitCode } = await runCli([], tempHome);
+    const tempHome = createTempHome(TMP_PREFIX).homeDir;
+    const { stdout, stderr, exitCode } = await runCli([], tempHome);
 
-      // No-arg CLI exits with code 1 (prints usage then exits)
-      assert.equal(exitCode, 1, `Expected exit code 1, got ${exitCode}`);
-      assert.equal(cleanStderr(stderr), "");
+    // No-arg CLI exits with code 1 (prints usage then exits)
+    assert.equal(exitCode, 1, `Expected exit code 1, got ${exitCode}`);
+    assert.equal(cleanStderr(stderr), "");
 
-      const skillPathIdx = stdout.indexOf("tamandua skill-path");
-      const sourcePathIdx = stdout.indexOf("tamandua source-path");
+    const skillPathIdx = stdout.indexOf("tamandua skill-path");
+    const sourcePathIdx = stdout.indexOf("tamandua source-path");
 
-      assert.ok(skillPathIdx >= 0, "skill-path not found in help output");
-      assert.ok(sourcePathIdx >= 0, "source-path not found in help output");
-      assert.ok(skillPathIdx < sourcePathIdx, "skill-path must appear before source-path in help output");
-    } finally {
-      fs.rmSync(tempHome, { recursive: true, force: true });
-    }
+    assert.ok(skillPathIdx >= 0, "skill-path not found in help output");
+    assert.ok(sourcePathIdx >= 0, "source-path not found in help output");
+    assert.ok(skillPathIdx < sourcePathIdx, "skill-path must appear before source-path in help output");
   });
 });

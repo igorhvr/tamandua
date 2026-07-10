@@ -11,10 +11,9 @@
  */
 
 import { describe, it, after } from "node:test";
-import { cleanChildEnv } from "./helpers/test-env.ts";
+import { cleanChildEnv, createTempHome } from "./helpers/test-env.ts";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -75,11 +74,7 @@ function cleanStderr(stderr: string): string {
     .trim();
 }
 
-function createTempHome(): string {
-  return fs.mkdtempSync(
-    path.join(os.tmpdir(), "tamandua-version-warning-"),
-  );
-}
+const TMP_PREFIX = "tamandua-version-warning-";
 
 function writeVersionStatus(
   stateDir: string,
@@ -112,8 +107,7 @@ describe("CLI version warning", () => {
       return;
     }
 
-    const tempHome = createTempHome();
-    try {
+    const tempHome = createTempHome(TMP_PREFIX).homeDir;
       writeVersionStatus(
         path.join(tempHome, ".tamandua"),
         { updateAvailable: true },
@@ -131,9 +125,6 @@ describe("CLI version warning", () => {
         cleaned.includes(UPDATE_WARNING),
         `Expected stderr to contain "${UPDATE_WARNING}", got: "${cleaned}"`,
       );
-    } finally {
-      fs.rmSync(tempHome, { recursive: true, force: true });
-    }
   });
 
   // AC 1b: CLI does not print warning when updateAvailable is false
@@ -143,8 +134,7 @@ describe("CLI version warning", () => {
       return;
     }
 
-    const tempHome = createTempHome();
-    try {
+    const tempHome = createTempHome(TMP_PREFIX).homeDir;
       writeVersionStatus(
         path.join(tempHome, ".tamandua"),
         { updateAvailable: false },
@@ -162,9 +152,6 @@ describe("CLI version warning", () => {
         false,
         `Expected no warning, got: "${cleaned}"`,
       );
-    } finally {
-      fs.rmSync(tempHome, { recursive: true, force: true });
-    }
   });
 
   // AC 1c: CLI does not print warning when no version-status.json exists
@@ -174,8 +161,7 @@ describe("CLI version warning", () => {
       return;
     }
 
-    const tempHome = createTempHome();
-    try {
+    const tempHome = createTempHome(TMP_PREFIX).homeDir;
       // Do not create version-status.json at all
       const { stderr, exitCode } = await runCli(["workflow", "list"], {
         HOME: tempHome,
@@ -189,9 +175,6 @@ describe("CLI version warning", () => {
         false,
         `Expected no warning, got: "${cleaned}"`,
       );
-    } finally {
-      fs.rmSync(tempHome, { recursive: true, force: true });
-    }
   });
 
   // AC 2: Warning suppressed for 'update' subcommand
@@ -201,8 +184,7 @@ describe("CLI version warning", () => {
       return;
     }
 
-    const tempHome = createTempHome();
-    try {
+    const tempHome = createTempHome(TMP_PREFIX).homeDir;
       writeVersionStatus(
         path.join(tempHome, ".tamandua"),
         { updateAvailable: true },
@@ -220,9 +202,6 @@ describe("CLI version warning", () => {
         false,
         `Expected no warning for update, got: "${cleaned}"`,
       );
-    } finally {
-      fs.rmSync(tempHome, { recursive: true, force: true });
-    }
   });
 
   // AC 2: Warning suppressed for 'version' subcommand
@@ -232,8 +211,7 @@ describe("CLI version warning", () => {
       return;
     }
 
-    const tempHome = createTempHome();
-    try {
+    const tempHome = createTempHome(TMP_PREFIX).homeDir;
       writeVersionStatus(
         path.join(tempHome, ".tamandua"),
         { updateAvailable: true },
@@ -254,9 +232,6 @@ describe("CLI version warning", () => {
       // Should still output the version
       const versionRegex = /\d{8}T\d{6}Z_[0-9a-f]{40}/;
       assert.ok(versionRegex.test(stdout.trim()), `Expected version output, got: "${stdout}"`);
-    } finally {
-      fs.rmSync(tempHome, { recursive: true, force: true });
-    }
   });
 
   // AC 2: Warning suppressed for '--version' flag
@@ -266,8 +241,7 @@ describe("CLI version warning", () => {
       return;
     }
 
-    const tempHome = createTempHome();
-    try {
+    const tempHome = createTempHome(TMP_PREFIX).homeDir;
       writeVersionStatus(
         path.join(tempHome, ".tamandua"),
         { updateAvailable: true },
@@ -287,9 +261,6 @@ describe("CLI version warning", () => {
       );
       const versionRegex = /\d{8}T\d{6}Z_[0-9a-f]{40}/;
       assert.ok(versionRegex.test(stdout.trim()), `Expected version output, got: "${stdout}"`);
-    } finally {
-      fs.rmSync(tempHome, { recursive: true, force: true });
-    }
   });
 
   // AC 2: Warning suppressed for '-v' flag
@@ -299,8 +270,7 @@ describe("CLI version warning", () => {
       return;
     }
 
-    const tempHome = createTempHome();
-    try {
+    const tempHome = createTempHome(TMP_PREFIX).homeDir;
       writeVersionStatus(
         path.join(tempHome, ".tamandua"),
         { updateAvailable: true },
@@ -320,9 +290,6 @@ describe("CLI version warning", () => {
       );
       const versionRegex = /\d{8}T\d{6}Z_[0-9a-f]{40}/;
       assert.ok(versionRegex.test(stdout.trim()), `Expected version output, got: "${stdout}"`);
-    } finally {
-      fs.rmSync(tempHome, { recursive: true, force: true });
-    }
   });
 
   // AC 2: Warning suppressed for 'step peek' subcommand
@@ -332,8 +299,7 @@ describe("CLI version warning", () => {
       return;
     }
 
-    const tempHome = createTempHome();
-    try {
+    const tempHome = createTempHome(TMP_PREFIX).homeDir;
       writeVersionStatus(
         path.join(tempHome, ".tamandua"),
         { updateAvailable: true },
@@ -354,9 +320,6 @@ describe("CLI version warning", () => {
         `Expected no warning for step peek, got: "${cleaned}"`,
       );
       // May exit 0 or non-zero depending on system state; either is fine
-    } finally {
-      fs.rmSync(tempHome, { recursive: true, force: true });
-    }
   });
 
   // AC 2: Warning suppressed for 'step claim' subcommand
@@ -366,8 +329,7 @@ describe("CLI version warning", () => {
       return;
     }
 
-    const tempHome = createTempHome();
-    try {
+    const tempHome = createTempHome(TMP_PREFIX).homeDir;
       writeVersionStatus(
         path.join(tempHome, ".tamandua"),
         { updateAvailable: true },
@@ -385,9 +347,6 @@ describe("CLI version warning", () => {
         false,
         `Expected no warning for step claim, got: "${cleaned}"`,
       );
-    } finally {
-      fs.rmSync(tempHome, { recursive: true, force: true });
-    }
   });
 
   // AC 3: 'step peek' output is not corrupted by warning text
@@ -397,8 +356,7 @@ describe("CLI version warning", () => {
       return;
     }
 
-    const tempHome = createTempHome();
-    try {
+    const tempHome = createTempHome(TMP_PREFIX).homeDir;
       writeVersionStatus(
         path.join(tempHome, ".tamandua"),
         { updateAvailable: true },
@@ -424,9 +382,6 @@ describe("CLI version warning", () => {
         false,
         `step peek stdout should not contain update warning, got: "${stdout}"`,
       );
-    } finally {
-      fs.rmSync(tempHome, { recursive: true, force: true });
-    }
   });
 
   // Verify source-path and skill-path commands (non-update commands) still show warning
@@ -436,8 +391,7 @@ describe("CLI version warning", () => {
       return;
     }
 
-    const tempHome = createTempHome();
-    try {
+    const tempHome = createTempHome(TMP_PREFIX).homeDir;
       writeVersionStatus(
         path.join(tempHome, ".tamandua"),
         { updateAvailable: true },
@@ -454,8 +408,5 @@ describe("CLI version warning", () => {
         cleaned.includes(UPDATE_WARNING),
         `Expected warning for skill-path, got: "${cleaned}"`,
       );
-    } finally {
-      fs.rmSync(tempHome, { recursive: true, force: true });
-    }
   });
 });

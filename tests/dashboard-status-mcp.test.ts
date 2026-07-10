@@ -1,12 +1,11 @@
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import assert from "node:assert/strict";
 import { spawn, execSync } from "node:child_process";
 import { once } from "node:events";
 import { describe, it, after } from "node:test";
-import { cleanChildEnv, reserveRandomPort } from "./helpers/test-env.ts";
+import { cleanChildEnv, createTempHome, reserveRandomPort } from "./helpers/test-env.ts";
 
 const cliPath = path.resolve(process.cwd(), "dist", "cli", "cli.js");
 const DEFAULT_MCP_PORT = 3338;
@@ -18,11 +17,11 @@ type CliResult = {
 };
 
 function createTempEnv(): { root: string; stateDir: string; homeDir: string } {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-status-"));
+  const th = createTempHome("tamandua-dashboard-status-");
+  const root = th.root;
   const stateDir = path.join(root, "state");
-  const homeDir = path.join(root, "home");
+  const homeDir = th.homeDir;
   fs.mkdirSync(stateDir, { recursive: true });
-  fs.mkdirSync(homeDir, { recursive: true });
   return { root, stateDir, homeDir };
 }
 

@@ -1,10 +1,9 @@
 import assert from "node:assert/strict";
 import { execSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { describe, it } from "node:test";
-import { cleanChildEnv } from "./helpers/test-env.ts";
+import { cleanChildEnv, createTempHome } from "./helpers/test-env.ts";
 
 const repoRoot = process.cwd();
 const fixtureDir = path.join(repoRoot, "e2e-tests", "fixtures", "sample-project");
@@ -73,11 +72,11 @@ describe("sample project fixture", () => {
 
   it("fixture compiles and shows test failure when run", () => {
     // Copy fixture to temp dir to verify it actually works without polluting
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sample-project-test-"));
-    const homeDir = path.join(tmpDir, "home");
+    const th = createTempHome("sample-project-test-");
+    const tmpDir = th.root;
+    const homeDir = th.homeDir;
     const testEnv = cleanChildEnv({ HOME: homeDir });
-    try {
-      fs.mkdirSync(homeDir, { recursive: true });
+    fs.mkdirSync(homeDir, { recursive: true });
       // Copy fixture files
       execSync(`cp -r ${fixtureDir}/. ${tmpDir}/`, {
         encoding: "utf-8",
@@ -118,9 +117,6 @@ describe("sample project fixture", () => {
         0,
         `npm test should exit with non-zero (test failure). Output: ${testResult.stdout} ${testResult.stderr}`,
       );
-    } finally {
-      fs.rmSync(tmpDir, { recursive: true, force: true });
-    }
   });
 
   it("fixture has all four required files", () => {

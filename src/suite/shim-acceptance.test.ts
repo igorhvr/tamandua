@@ -11,8 +11,6 @@
 import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import {
-  mkdtempSync,
-  rmSync,
   writeFileSync,
   mkdirSync,
   chmodSync,
@@ -21,7 +19,6 @@ import {
   existsSync,
 } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
 import { execSync, spawn, type ChildProcess } from "node:child_process";
 import crypto from "node:crypto";
 import http from "node:http";
@@ -31,6 +28,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import { DatabaseSync } from "node:sqlite";
 import {
   cleanChildEnv,
+  createTempHome,
   reserveDistinctRandomPorts,
 } from "../../tests/helpers/test-env.ts";
 
@@ -334,6 +332,8 @@ interface TestState {
 // ══════════════════════════════════════════════════════════════════════
 
 describe("TSTX Acceptance Criteria & Monotonicity", { concurrency: 1 }, () => {
+  const tb = createTempHome("tamandua-accept-base-");
+  const th = createTempHome("tamandua-accept-home-");
   let s: TestState;
   let origEnv: Record<string, string | undefined>;
 
@@ -347,10 +347,9 @@ describe("TSTX Acceptance Criteria & Monotonicity", { concurrency: 1 }, () => {
     };
 
     // Set up temp directories and fixture repo.
-    const tempBase = mkdtempSync(join(tmpdir(), "tamandua-accept-base-"));
-    const tempHome = mkdtempSync(join(tmpdir(), "tamandua-accept-home-"));
-    const stateDir = join(tempHome, ".tamandua");
-    mkdirSync(stateDir, { recursive: true });
+    const tempBase = tb.root;
+    const tempHome = th.homeDir;
+    const stateDir = th.tamanduaDir;
     const dbPath = join(stateDir, "tamandua.db");
     const secret = crypto.randomBytes(16).toString("hex");
     writeFileSync(join(stateDir, "daemon-secret"), secret);
@@ -402,8 +401,7 @@ describe("TSTX Acceptance Criteria & Monotonicity", { concurrency: 1 }, () => {
     // Clean up server and temp dirs.
     if (s) {
       await new Promise<void>((resolve) => s.server.close(() => resolve()));
-      rmSync(s.tempHome, { recursive: true, force: true });
-      rmSync(s.tempBase, { recursive: true, force: true });
+      // createTempHome handles cleanup via after() hook
     }
   });
 
@@ -879,11 +877,12 @@ describe("TSTX Acceptance Criteria & Monotonicity", { concurrency: 1 }, () => {
   // ────────────────────────────────────────────────────────────────────
 
   describe("AC 9: project-type agnostic", () => {
+    const ecoTh = createTempHome("eco-");
     let eco: ReturnType<typeof createEcosystemFixtureRepo>;
 
     before(() => {
       eco = createEcosystemFixtureRepo(
-        mkdtempSync(join(s.tempBase, "eco-")),
+        ecoTh.root,
         "eco",
       );
     });

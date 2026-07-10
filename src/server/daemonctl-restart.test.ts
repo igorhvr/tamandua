@@ -12,6 +12,7 @@ import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
+import { createTempHome as sharedCreateTempHome } from "../../tests/helpers/test-env.ts";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -30,7 +31,8 @@ import {
 // ── Helpers ────────────────────────────────────────────────────────
 
 function createTempHome(): string {
-  return fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-restart-"));
+  const { root } = sharedCreateTempHome("tamandua-restart-");
+  return root;
 }
 
 async function getAvailablePort(): Promise<number> {
@@ -92,7 +94,6 @@ describe("daemonctl restartDaemon", { concurrency: 1 }, () => {
       await waitForHttpUp(`http://127.0.0.1:${port}/`);
     } finally {
       try { stopDaemon({ homeDir: tempHome }); } catch {}
-      fs.rmSync(tempHome, { recursive: true, force: true });
     }
   });
 
@@ -124,7 +125,6 @@ describe("daemonctl restartDaemon", { concurrency: 1 }, () => {
       assert.equal((after as { running: true; pid: number }).pid, result.pid);
     } finally {
       try { stopDaemon({ homeDir: tempHome }); } catch {}
-      fs.rmSync(tempHome, { recursive: true, force: true });
     }
   });
 
@@ -145,7 +145,6 @@ describe("daemonctl restartDaemon", { concurrency: 1 }, () => {
       assert.ok(result.pid > 0);
     } finally {
       try { stopDaemon({ homeDir: tempHome }); } catch {}
-      fs.rmSync(tempHome, { recursive: true, force: true });
     }
   });
 
@@ -166,7 +165,6 @@ describe("daemonctl restartDaemon", { concurrency: 1 }, () => {
       assert.ok(result.pid > 0);
     } finally {
       try { stopDaemon({ homeDir: tempHome }); } catch {}
-      fs.rmSync(tempHome, { recursive: true, force: true });
     }
   });
 
@@ -193,7 +191,6 @@ describe("daemonctl restartDaemon", { concurrency: 1 }, () => {
       assert.notEqual(Number(pidFileContents), first.pid);
     } finally {
       try { stopDaemon({ homeDir: tempHome }); } catch {}
-      fs.rmSync(tempHome, { recursive: true, force: true });
     }
   });
 

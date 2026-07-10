@@ -1,9 +1,9 @@
 import { describe, it, before, after, mock } from "node:test";
 import assert from "node:assert/strict";
+import { createTempHome } from "./helpers/test-env.ts";
 import { parseOutputKeyValues, parseExpectedKeys, findProducerForMissingKey, resolveTemplate, buildStoryPlanSection, mergeStoryPlanIntoProgress, validateExpects, completeStep, resolveStepContext, failStep, claimStep, getWorkflowId, advancePipeline, recoverOrphanedStepsForAgent } from "../dist/installer/step-ops.js";
 import { getRunEvents } from "../dist/installer/events.js";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
@@ -437,12 +437,12 @@ describe("Workflow YAML PR step expects validation", () => {
 describe("Reserved context key protection", () => {
   const _savedStateDir = process.env.TAMANDUA_STATE_DIR;
   const _savedDbPath = process.env.TAMANDUA_DB_PATH;
-  let _testIsolationDir: string;
+  const th = createTempHome("tamandua-reserved-keys-test-");
 
   before(() => {
-    _testIsolationDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-reserved-keys-test-"));
-    process.env.TAMANDUA_STATE_DIR = _testIsolationDir;
-    process.env.TAMANDUA_DB_PATH = path.join(_testIsolationDir, "tamandua.db");
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_DB_PATH = path.join(th.tamanduaDir, "tamandua.db");
   });
 
   after(() => {
@@ -450,7 +450,6 @@ describe("Reserved context key protection", () => {
     else process.env.TAMANDUA_STATE_DIR = _savedStateDir;
     if (_savedDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
     else process.env.TAMANDUA_DB_PATH = _savedDbPath;
-    try { fs.rmSync(_testIsolationDir, { recursive: true, force: true }); } catch { /* best effort */ }
   });
 
   function ts(): string {
@@ -546,12 +545,12 @@ describe("Reserved context key protection", () => {
 describe("completeStep STORIES_JSON guard — only blocks when loop-step is immediately next", () => {
   const _savedStateDir = process.env.TAMANDUA_STATE_DIR;
   const _savedDbPath = process.env.TAMANDUA_DB_PATH;
-  let _testIsolationDir: string;
+  const th = createTempHome("tamandua-stories-guard-test-");
 
   before(() => {
-    _testIsolationDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-stories-guard-test-"));
-    process.env.TAMANDUA_STATE_DIR = _testIsolationDir;
-    process.env.TAMANDUA_DB_PATH = path.join(_testIsolationDir, "tamandua.db");
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_DB_PATH = path.join(th.tamanduaDir, "tamandua.db");
   });
 
   after(() => {
@@ -559,7 +558,6 @@ describe("completeStep STORIES_JSON guard — only blocks when loop-step is imme
     else process.env.TAMANDUA_STATE_DIR = _savedStateDir;
     if (_savedDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
     else process.env.TAMANDUA_DB_PATH = _savedDbPath;
-    try { fs.rmSync(_testIsolationDir, { recursive: true, force: true }); } catch { /* best effort */ }
   });
 
   function ts(): string {
@@ -703,12 +701,12 @@ describe("completeStep STORIES_JSON guard — only blocks when loop-step is imme
 describe("completeStep STORIES_JSON guard — story-producer blamed across intermediate steps", () => {
   const _savedStateDir = process.env.TAMANDUA_STATE_DIR;
   const _savedDbPath = process.env.TAMANDUA_DB_PATH;
-  let _testIsolationDir: string;
+  const th = createTempHome("tamandua-stories-guard-intermediate-test-");
 
   before(() => {
-    _testIsolationDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-stories-guard-intermediate-test-"));
-    process.env.TAMANDUA_STATE_DIR = _testIsolationDir;
-    process.env.TAMANDUA_DB_PATH = path.join(_testIsolationDir, "tamandua.db");
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_DB_PATH = path.join(th.tamanduaDir, "tamandua.db");
   });
 
   after(() => {
@@ -716,7 +714,6 @@ describe("completeStep STORIES_JSON guard — story-producer blamed across inter
     else process.env.TAMANDUA_STATE_DIR = _savedStateDir;
     if (_savedDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
     else process.env.TAMANDUA_DB_PATH = _savedDbPath;
-    try { fs.rmSync(_testIsolationDir, { recursive: true, force: true }); } catch { /* best effort */ }
   });
 
   function ts(): string {
@@ -836,12 +833,12 @@ STORIES_JSON: [...]', 'STATUS: done', 'running', 1, 4, 'single', ?, ?)"
 describe("failStep retry feedback persistence", () => {
   const _savedStateDir = process.env.TAMANDUA_STATE_DIR;
   const _savedDbPath = process.env.TAMANDUA_DB_PATH;
-  let _testIsolationDir: string;
+  const th = createTempHome("tamandua-failstep-retry-test-");
 
   before(() => {
-    _testIsolationDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-failstep-retry-test-"));
-    process.env.TAMANDUA_STATE_DIR = _testIsolationDir;
-    process.env.TAMANDUA_DB_PATH = path.join(_testIsolationDir, "tamandua.db");
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_DB_PATH = path.join(th.tamanduaDir, "tamandua.db");
   });
 
   after(() => {
@@ -849,7 +846,6 @@ describe("failStep retry feedback persistence", () => {
     else process.env.TAMANDUA_STATE_DIR = _savedStateDir;
     if (_savedDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
     else process.env.TAMANDUA_DB_PATH = _savedDbPath;
-    try { fs.rmSync(_testIsolationDir, { recursive: true, force: true }); } catch { /* best effort */ }
   });
 
   function ts(): string {
@@ -987,12 +983,12 @@ describe("failStep retry feedback persistence", () => {
 describe("setup-specific retry_feedback rendering", () => {
   const _savedStateDir = process.env.TAMANDUA_STATE_DIR;
   const _savedDbPath = process.env.TAMANDUA_DB_PATH;
-  let _testIsolationDir: string;
+  const th = createTempHome("tamandua-setup-retry-test-");
 
   before(() => {
-    _testIsolationDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-setup-retry-test-"));
-    process.env.TAMANDUA_STATE_DIR = _testIsolationDir;
-    process.env.TAMANDUA_DB_PATH = path.join(_testIsolationDir, "tamandua.db");
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_DB_PATH = path.join(th.tamanduaDir, "tamandua.db");
   });
 
   after(() => {
@@ -1000,7 +996,6 @@ describe("setup-specific retry_feedback rendering", () => {
     else process.env.TAMANDUA_STATE_DIR = _savedStateDir;
     if (_savedDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
     else process.env.TAMANDUA_DB_PATH = _savedDbPath;
-    try { fs.rmSync(_testIsolationDir, { recursive: true, force: true }); } catch { /* best effort */ }
   });
 
   function ts(): string {
@@ -1076,12 +1071,12 @@ Instructions:', 'STATUS: done', 'pending', 0, 4, 'single', ?, ?)"
 describe("completeStep retry response includes detail field", () => {
   const _savedStateDir = process.env.TAMANDUA_STATE_DIR;
   const _savedDbPath = process.env.TAMANDUA_DB_PATH;
-  let _testIsolationDir: string;
+  const th = createTempHome("tamandua-completestep-detail-test-");
 
   before(() => {
-    _testIsolationDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-completestep-detail-test-"));
-    process.env.TAMANDUA_STATE_DIR = _testIsolationDir;
-    process.env.TAMANDUA_DB_PATH = path.join(_testIsolationDir, "tamandua.db");
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_DB_PATH = path.join(th.tamanduaDir, "tamandua.db");
   });
 
   after(() => {
@@ -1089,7 +1084,6 @@ describe("completeStep retry response includes detail field", () => {
     else process.env.TAMANDUA_STATE_DIR = _savedStateDir;
     if (_savedDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
     else process.env.TAMANDUA_DB_PATH = _savedDbPath;
-    try { fs.rmSync(_testIsolationDir, { recursive: true, force: true }); } catch { /* best effort */ }
   });
 
   function ts(): string {
@@ -1191,12 +1185,12 @@ describe("completeStep retry response includes detail field", () => {
 describe("findProducerForMissingKey", () => {
   const _savedStateDir = process.env.TAMANDUA_STATE_DIR;
   const _savedDbPath = process.env.TAMANDUA_DB_PATH;
-  let _testIsolationDir: string;
+  const th = createTempHome("tamandua-find-producer-test-");
 
   before(() => {
-    _testIsolationDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-find-producer-test-"));
-    process.env.TAMANDUA_STATE_DIR = _testIsolationDir;
-    process.env.TAMANDUA_DB_PATH = path.join(_testIsolationDir, "tamandua.db");
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_DB_PATH = path.join(th.tamanduaDir, "tamandua.db");
   });
 
   after(() => {
@@ -1204,7 +1198,6 @@ describe("findProducerForMissingKey", () => {
     else process.env.TAMANDUA_STATE_DIR = _savedStateDir;
     if (_savedDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
     else process.env.TAMANDUA_DB_PATH = _savedDbPath;
-    try { fs.rmSync(_testIsolationDir, { recursive: true, force: true }); } catch { /* best effort */ }
   });
 
   function ts(): string {
@@ -1425,12 +1418,12 @@ describe("findProducerForMissingKey", () => {
 describe("claimStep missing-template-key blocking (US-003)", () => {
   const _savedStateDir = process.env.TAMANDUA_STATE_DIR;
   const _savedDbPath = process.env.TAMANDUA_DB_PATH;
-  let _testIsolationDir: string;
+  const th = createTempHome("tamandua-missingkey-block-test-");
 
   before(() => {
-    _testIsolationDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-missingkey-block-test-"));
-    process.env.TAMANDUA_STATE_DIR = _testIsolationDir;
-    process.env.TAMANDUA_DB_PATH = path.join(_testIsolationDir, "tamandua.db");
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_DB_PATH = path.join(th.tamanduaDir, "tamandua.db");
   });
 
   after(() => {
@@ -1438,7 +1431,6 @@ describe("claimStep missing-template-key blocking (US-003)", () => {
     else process.env.TAMANDUA_STATE_DIR = _savedStateDir;
     if (_savedDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
     else process.env.TAMANDUA_DB_PATH = _savedDbPath;
-    try { fs.rmSync(_testIsolationDir, { recursive: true, force: true }); } catch { /* best effort */ }
   });
 
   function ts(): string {
@@ -1850,12 +1842,12 @@ RETRY FEEDBACK: {{retry_feedback}}', '', 'pending', 0, 4, 'single', ?, ?)"
 describe("claimStep missing-template-key blocking — loop claim path (US-004)", () => {
   const _savedStateDir = process.env.TAMANDUA_STATE_DIR;
   const _savedDbPath = process.env.TAMANDUA_DB_PATH;
-  let _testIsolationDir: string;
+  const th = createTempHome("tamandua-missingkey-loop-test-");
 
   before(() => {
-    _testIsolationDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-missingkey-loop-test-"));
-    process.env.TAMANDUA_STATE_DIR = _testIsolationDir;
-    process.env.TAMANDUA_DB_PATH = path.join(_testIsolationDir, "tamandua.db");
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_DB_PATH = path.join(th.tamanduaDir, "tamandua.db");
   });
 
   after(() => {
@@ -1863,7 +1855,6 @@ describe("claimStep missing-template-key blocking — loop claim path (US-004)",
     else process.env.TAMANDUA_STATE_DIR = _savedStateDir;
     if (_savedDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
     else process.env.TAMANDUA_DB_PATH = _savedDbPath;
-    try { fs.rmSync(_testIsolationDir, { recursive: true, force: true }); } catch { /* best effort */ }
   });
 
   function ts(): string {
@@ -2194,7 +2185,7 @@ describe("claimStep missing-template-key blocking — loop claim path (US-004)",
 describe("RETR: rerouteStep and failStep exhaustion reroute", () => {
   let _savedStateDir: string | undefined;
   let _savedDbPath: string | undefined;
-  let _testIsolationDir: string;
+  const th = createTempHome("tamandua-retr-test-");
   let workflowsDir: string;
 
   // Simple two-step workflow: produce(upstream) -> consume(downstream)
@@ -2308,12 +2299,12 @@ steps:
     // This matters when nested inside an outer describe that sets isolation.
     _savedStateDir = process.env.TAMANDUA_STATE_DIR;
     _savedDbPath = process.env.TAMANDUA_DB_PATH;
-    _testIsolationDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-retr-test-"));
-    process.env.TAMANDUA_STATE_DIR = _testIsolationDir;
-    process.env.TAMANDUA_DB_PATH = path.join(_testIsolationDir, "tamandua.db");
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_DB_PATH = path.join(th.tamanduaDir, "tamandua.db");
 
     // Create workflow dirs with the test workflows
-    workflowsDir = path.join(_testIsolationDir, "workflows");
+    workflowsDir = path.join(th.tamanduaDir, "workflows");
     const retryDir = path.join(workflowsDir, "test-reroute");
     const downstreamDir = path.join(workflowsDir, "test-reroute-downstream");
     const unknownDir = path.join(workflowsDir, "test-reroute-unknown");
@@ -2333,7 +2324,6 @@ steps:
     else process.env.TAMANDUA_STATE_DIR = _savedStateDir;
     if (_savedDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
     else process.env.TAMANDUA_DB_PATH = _savedDbPath;
-    try { fs.rmSync(_testIsolationDir, { recursive: true, force: true }); } catch { /* best effort */ }
   });
 
   function ts(): string {
@@ -3082,18 +3072,18 @@ steps:
 describe("getRunProgressPath canonical path resolution", () => {
   const _savedStateDir = process.env.TAMANDUA_STATE_DIR;
   const _savedDbPath = process.env.TAMANDUA_DB_PATH;
-  let _testIsolationDir: string;
+  const th = createTempHome("tamandua-progress-path-test-");
 
   before(() => {
-    _testIsolationDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-progress-path-test-"));
-    process.env.TAMANDUA_STATE_DIR = _testIsolationDir;
-    process.env.TAMANDUA_DB_PATH = path.join(_testIsolationDir, "tamandua.db");
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_DB_PATH = path.join(th.tamanduaDir, "tamandua.db");
     // Write agents.json so getAgentWorkspacePath can resolve workspace paths
     const agentsConfig = [
-      { id: "test-wf_dev", workspace: path.join(_testIsolationDir, "workspaces", "workflows", "test-wf") }
+      { id: "test-wf_dev", workspace: path.join(th.tamanduaDir, "workspaces", "workflows", "test-wf") }
     ];
-    fs.mkdirSync(_testIsolationDir, { recursive: true });
-    fs.writeFileSync(path.join(_testIsolationDir, "agents.json"), JSON.stringify(agentsConfig), "utf-8");
+    fs.mkdirSync(th.tamanduaDir, { recursive: true });
+    fs.writeFileSync(path.join(th.tamanduaDir, "agents.json"), JSON.stringify(agentsConfig), "utf-8");
   });
 
   after(() => {
@@ -3101,7 +3091,6 @@ describe("getRunProgressPath canonical path resolution", () => {
     else process.env.TAMANDUA_STATE_DIR = _savedStateDir;
     if (_savedDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
     else process.env.TAMANDUA_DB_PATH = _savedDbPath;
-    try { fs.rmSync(_testIsolationDir, { recursive: true, force: true }); } catch { /* best effort */ }
   });
 
   it("getRunProgressPath returns canonical path under runs/<runId>/progress.txt", async () => {
@@ -3109,7 +3098,7 @@ describe("getRunProgressPath canonical path resolution", () => {
     const runId = crypto.randomUUID();
     const progressPath = getRunProgressPath(runId);
     assert.ok(progressPath.endsWith(`runs/${runId}/progress.txt`), `expected path ending with runs/${runId}/progress.txt, got: ${progressPath}`);
-    assert.ok(progressPath.startsWith(_testIsolationDir), `expected path under test isolation dir, got: ${progressPath}`);
+    assert.ok(progressPath.startsWith(th.tamanduaDir), `expected path under test isolation dir, got: ${progressPath}`);
   });
 
   it("readProgressFile reads from canonical path with fallback to workspace-scoped", async () => {
@@ -3129,7 +3118,7 @@ describe("getRunProgressPath canonical path resolution", () => {
       "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, loop_config, created_at, updated_at) VALUES (?, ?, 'loop', ?, 0, '{{task}}', '', 'done', 0, 4, 'loop', ?, ?, ?)"
     ).run(crypto.randomUUID(), runId, agentId, JSON.stringify({ over: "stories" }), now, now);
 
-    const workspaceDir = path.join(_testIsolationDir, "workspaces", "workflows", "test-wf");
+    const workspaceDir = path.join(th.tamanduaDir, "workspaces", "workflows", "test-wf");
     const workspaceScopedPath = path.join(workspaceDir, `progress-${runId}.txt`);
     fs.mkdirSync(path.dirname(workspaceScopedPath), { recursive: true });
     fs.writeFileSync(workspaceScopedPath, "workspace-scoped content", "utf-8");
@@ -3166,7 +3155,7 @@ describe("getRunProgressPath canonical path resolution", () => {
       "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, loop_config, created_at, updated_at) VALUES (?, ?, 'loop', ?, 0, '{{task}}', '', 'done', 0, 4, 'loop', ?, ?, ?)"
     ).run(crypto.randomUUID(), runId, agentId, JSON.stringify({ over: "stories" }), now, now);
 
-    const workspaceDir = path.join(_testIsolationDir, "workspaces", "workflows", "test-wf");
+    const workspaceDir = path.join(th.tamanduaDir, "workspaces", "workflows", "test-wf");
     const scopedPath = path.join(workspaceDir, `progress-${runId}.txt`);
     fs.mkdirSync(path.dirname(scopedPath), { recursive: true });
     fs.writeFileSync(scopedPath, "fallback content", "utf-8");
@@ -3194,7 +3183,7 @@ describe("getRunProgressPath canonical path resolution", () => {
       "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, loop_config, created_at, updated_at) VALUES (?, ?, 'loop', ?, 0, '{{task}}', '', 'done', 0, 4, 'loop', ?, ?, ?)"
     ).run(crypto.randomUUID(), runId, agentId, JSON.stringify({ over: "stories" }), now, now);
 
-    const workspaceDir = path.join(_testIsolationDir, "workspaces", "workflows", "test-wf");
+    const workspaceDir = path.join(th.tamanduaDir, "workspaces", "workflows", "test-wf");
     const legacyPath = path.join(workspaceDir, "progress.txt");
     fs.mkdirSync(path.dirname(legacyPath), { recursive: true });
     fs.writeFileSync(legacyPath, "legacy fallback", "utf-8");
@@ -3323,12 +3312,12 @@ describe("getRunProgressPath canonical path resolution", () => {
 describe("handleVerifyEachCompletion — honest retry verdict path (US-002)", () => {
   const _savedStateDir = process.env.TAMANDUA_STATE_DIR;
   const _savedDbPath = process.env.TAMANDUA_DB_PATH;
-  let _testIsolationDir: string;
+  const th = createTempHome("tamandua-verify-each-retry-test-");
 
   before(() => {
-    _testIsolationDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-verify-each-retry-test-"));
-    process.env.TAMANDUA_STATE_DIR = _testIsolationDir;
-    process.env.TAMANDUA_DB_PATH = path.join(_testIsolationDir, "tamandua.db");
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_DB_PATH = path.join(th.tamanduaDir, "tamandua.db");
   });
 
   after(() => {
@@ -3336,7 +3325,6 @@ describe("handleVerifyEachCompletion — honest retry verdict path (US-002)", ()
     else process.env.TAMANDUA_STATE_DIR = _savedStateDir;
     if (_savedDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
     else process.env.TAMANDUA_DB_PATH = _savedDbPath;
-    try { fs.rmSync(_testIsolationDir, { recursive: true, force: true }); } catch { /* best effort */ }
   });
 
   function ts(): string {
@@ -3676,12 +3664,12 @@ describe("handleVerifyEachCompletion — honest retry verdict path (US-002)", ()
 describe("handleVerifyEachCompletion — US-001 VRST investigation (2026-07-05 incident)", () => {
   const _savedStateDir = process.env.TAMANDUA_STATE_DIR;
   const _savedDbPath = process.env.TAMANDUA_DB_PATH;
-  let _testIsolationDir: string;
+  const th = createTempHome("tamandua-vrst-test-");
 
   before(() => {
-    _testIsolationDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-vrst-test-"));
-    process.env.TAMANDUA_STATE_DIR = _testIsolationDir;
-    process.env.TAMANDUA_DB_PATH = path.join(_testIsolationDir, "tamandua.db");
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_DB_PATH = path.join(th.tamanduaDir, "tamandua.db");
   });
 
   after(() => {
@@ -3689,7 +3677,6 @@ describe("handleVerifyEachCompletion — US-001 VRST investigation (2026-07-05 i
     else process.env.TAMANDUA_STATE_DIR = _savedStateDir;
     if (_savedDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
     else process.env.TAMANDUA_DB_PATH = _savedDbPath;
-    try { fs.rmSync(_testIsolationDir, { recursive: true, force: true }); } catch { /* best effort */ }
   });
 
   function ts(): string {
@@ -4054,12 +4041,12 @@ describe("handleVerifyEachCompletion — US-001 VRST investigation (2026-07-05 i
 describe("handleVerifyEachCompletion — US-002 VBUD (story-scoped verify retry budget)", () => {
   const _savedStateDir = process.env.TAMANDUA_STATE_DIR;
   const _savedDbPath = process.env.TAMANDUA_DB_PATH;
-  let _testIsolationDir: string;
+  const th = createTempHome("tamandua-vbud-test-");
 
   before(() => {
-    _testIsolationDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-vbud-test-"));
-    process.env.TAMANDUA_STATE_DIR = _testIsolationDir;
-    process.env.TAMANDUA_DB_PATH = path.join(_testIsolationDir, "tamandua.db");
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_DB_PATH = path.join(th.tamanduaDir, "tamandua.db");
   });
 
   after(() => {
@@ -4067,7 +4054,6 @@ describe("handleVerifyEachCompletion — US-002 VBUD (story-scoped verify retry 
     else process.env.TAMANDUA_STATE_DIR = _savedStateDir;
     if (_savedDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
     else process.env.TAMANDUA_DB_PATH = _savedDbPath;
-    try { fs.rmSync(_testIsolationDir, { recursive: true, force: true }); } catch { /* best effort */ }
   });
 
   function ts(): string {
@@ -4393,12 +4379,12 @@ describe("handleVerifyEachCompletion — US-002 VBUD (story-scoped verify retry 
 describe("claimStep test_cmd wrapping (US-008)", () => {
   const _savedStateDir = process.env.TAMANDUA_STATE_DIR;
   const _savedDbPath = process.env.TAMANDUA_DB_PATH;
-  let _testIsolationDir: string;
+  const th = createTempHome("tamandua-testcmd-wrap-test-");
 
   before(() => {
-    _testIsolationDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-testcmd-wrap-test-"));
-    process.env.TAMANDUA_STATE_DIR = _testIsolationDir;
-    process.env.TAMANDUA_DB_PATH = path.join(_testIsolationDir, "tamandua.db");
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_DB_PATH = path.join(th.tamanduaDir, "tamandua.db");
   });
 
   after(() => {
@@ -4406,7 +4392,6 @@ describe("claimStep test_cmd wrapping (US-008)", () => {
     else process.env.TAMANDUA_STATE_DIR = _savedStateDir;
     if (_savedDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
     else process.env.TAMANDUA_DB_PATH = _savedDbPath;
-    try { fs.rmSync(_testIsolationDir, { recursive: true, force: true }); } catch { /* best effort */ }
   });
 
   function ts(): string {
@@ -4783,7 +4768,7 @@ describe("claimStep test_cmd wrapping (US-008)", () => {
 describe("RETRY VERDICT ROUTING — completeStepInternal STATUS: retry guard (CATP phantom-success fix)", () => {
   const _savedStateDir = process.env.TAMANDUA_STATE_DIR;
   const _savedDbPath = process.env.TAMANDUA_DB_PATH;
-  let _testIsolationDir: string;
+  const th = createTempHome("tamandua-retry-verdict-test-");
   let _workflowsDir: string;
 
   // Plain string constant for merge-family expects (regex accepts done|retry).
@@ -4861,11 +4846,11 @@ steps:
 `;
 
   before(() => {
-    _testIsolationDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-retry-verdict-test-"));
-    process.env.TAMANDUA_STATE_DIR = _testIsolationDir;
-    process.env.TAMANDUA_DB_PATH = path.join(_testIsolationDir, "tamandua.db");
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_DB_PATH = path.join(th.tamanduaDir, "tamandua.db");
 
-    _workflowsDir = path.join(_testIsolationDir, "workflows");
+    _workflowsDir = path.join(th.tamanduaDir, "workflows");
     const workflows: Record<string, string> = {
       "test-retry-verdict-merge": mergeFamilyYaml,
       "test-retry-verdict-no-onfail": noOnFailYaml,
@@ -4883,7 +4868,6 @@ steps:
     else process.env.TAMANDUA_STATE_DIR = _savedStateDir;
     if (_savedDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
     else process.env.TAMANDUA_DB_PATH = _savedDbPath;
-    try { fs.rmSync(_testIsolationDir, { recursive: true, force: true }); } catch { /* best effort */ }
   });
 
   function ts(): string {
@@ -5215,12 +5199,12 @@ steps:
 describe("claimStep atomic undo on post-claim failure (CLTX)", () => {
   const _savedStateDir = process.env.TAMANDUA_STATE_DIR;
   const _savedDbPath = process.env.TAMANDUA_DB_PATH;
-  let _testIsolationDir: string;
+  const th = createTempHome("tamandua-cltx-test-");
 
   before(() => {
-    _testIsolationDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-cltx-test-"));
-    process.env.TAMANDUA_STATE_DIR = _testIsolationDir;
-    process.env.TAMANDUA_DB_PATH = path.join(_testIsolationDir, "tamandua.db");
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_DB_PATH = path.join(th.tamanduaDir, "tamandua.db");
   });
 
   after(() => {
@@ -5229,7 +5213,6 @@ describe("claimStep atomic undo on post-claim failure (CLTX)", () => {
     else process.env.TAMANDUA_STATE_DIR = _savedStateDir;
     if (_savedDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
     else process.env.TAMANDUA_DB_PATH = _savedDbPath;
-    try { fs.rmSync(_testIsolationDir, { recursive: true, force: true }); } catch { /* best effort */ }
   });
 
   function ts(): string {

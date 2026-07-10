@@ -4,30 +4,30 @@
  * the dispatch motor still spawns pi for work rounds and parses its stream.
  */
 import assert from "node:assert/strict";
-import { after, describe, it } from "node:test";
+import { describe, it } from "node:test";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import os from "node:os";
 
 import {
   runPi,
   parseWorkRoundMetadata,
   extractTokenUsage,
 } from "../dist/installer/agent-scheduler.js";
+import { createTempHome } from "./helpers/test-env.ts";
 
 // Isolate log output to a temp directory so tests don't write to ~/.tamandua/tamandua.log
 const originalStateDir = process.env.TAMANDUA_STATE_DIR;
-const testStateDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-agent-scheduler-"));
-process.env.TAMANDUA_STATE_DIR = testStateDir;
+const { homeDir: isolHome, tamanduaDir: isolTd } = createTempHome("tamandua-agent-scheduler-");
+process.env.TAMANDUA_STATE_DIR = isolTd;
 
-after(() => {
+// Restore env at process exit (createTempHome handles dir cleanup)
+process.on("exit", () => {
   if (originalStateDir === undefined) {
     delete process.env.TAMANDUA_STATE_DIR;
   } else {
     process.env.TAMANDUA_STATE_DIR = originalStateDir;
   }
-  fs.rmSync(testStateDir, { recursive: true, force: true });
 });
 
 // ── Probe for real pi availability (synchronous, module-load time) ─
@@ -51,8 +51,8 @@ if (process.env.TAMANDUA_REAL_PI_TESTS === "1") {
 
 /** Create a fake pi shell script in a temp directory. Returns the script path. */
 function createFakePiScript(scriptContent: string): string {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-test-pi-"));
-  const scriptPath = path.join(dir, "fake-pi");
+  const th = createTempHome("tamandua-test-pi-");
+  const scriptPath = path.join(th.root, "fake-pi");
 
   const fullScript = `#!/usr/bin/env bash
 set -e

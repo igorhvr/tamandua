@@ -13,27 +13,19 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
-import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+import { createTempHome } from "./helpers/test-env.ts";
 import { claimStep } from "../dist/installer/step-ops.js";
 import type { WorkerOwnership } from "../dist/installer/step-ops.js";
 import { getDb } from "../dist/db.js";
 
 // ── Environment isolation ──────────────────────────────────────────────
-const _savedStateDir = process.env.TAMANDUA_STATE_DIR;
-const _savedDbPath = process.env.TAMANDUA_DB_PATH;
-const _testIsolationDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-claim-ownership-"));
-process.env.TAMANDUA_STATE_DIR = _testIsolationDir;
-process.env.TAMANDUA_DB_PATH = path.join(_testIsolationDir, "tamandua.db");
+// createTempHome sets up an isolated temp home with automatic after() cleanup.
 
-process.on("exit", () => {
-  if (_savedStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
-  else process.env.TAMANDUA_STATE_DIR = _savedStateDir;
-  if (_savedDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
-  else process.env.TAMANDUA_DB_PATH = _savedDbPath;
-  try { fs.rmSync(_testIsolationDir, { recursive: true, force: true }); } catch { /* best effort */ }
-});
+describe("claim-ownership-recording", () => {
+  const { tamanduaDir } = createTempHome("tamandua-claim-ownership-");
+  process.env.TAMANDUA_STATE_DIR = tamanduaDir;
+  process.env.TAMANDUA_DB_PATH = path.join(tamanduaDir, "tamandua.db");
 
 const TEST_AGENT = "test_claim-ownership-agent";
 const TEST_LOOP_AGENT = "test_claim-ownership-loop-agent";
@@ -223,4 +215,5 @@ describe("claimStep ownership recording", () => {
     const r2 = claimStep(TEST_AGENT, legacyRunId);
     assert.equal(r2.found, false, "already-claimed legacy step should not be re-claimed");
   });
+});
 });

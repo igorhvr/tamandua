@@ -6,16 +6,15 @@
  */
 import { describe, it, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, chmodSync, readFileSync } from "node:fs";
+import { writeFileSync, mkdirSync, chmodSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
 import { execSync, spawn, type ChildProcess } from "node:child_process";
 import crypto from "node:crypto";
 import http from "node:http";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { cleanChildEnv, reserveDistinctRandomPorts } from "../../tests/helpers/test-env.ts";
+import { cleanChildEnv, createTempHome, reserveDistinctRandomPorts } from "../../tests/helpers/test-env.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SHIM_PATH = path.resolve(__dirname, "..", "..", "dist", "suite", "shim.js");
@@ -117,7 +116,7 @@ function createFixtureRepo(
 }
 
 /** Set up a temp HOME with control server, daemon-secret, and a test DB. */
-async function setupControlEnv(): Promise<{
+async function setupControlEnv(th: { homeDir: string; tamanduaDir: string }): Promise<{
   tempHome: string;
   stateDir: string;
   dbPath: string;
@@ -125,9 +124,8 @@ async function setupControlEnv(): Promise<{
   secret: string;
   server: http.Server;
 }> {
-  const tempHome = mkdtempSync(join(tmpdir(), "tamandua-shim-test-"));
-  const stateDir = join(tempHome, ".tamandua");
-  mkdirSync(stateDir, { recursive: true });
+  const tempHome = th.homeDir;
+  const stateDir = th.tamanduaDir;
   const dbPath = join(stateDir, "tamandua.db");
   const secret = crypto.randomBytes(16).toString("hex");
 
@@ -175,6 +173,8 @@ function shimChildEnv(
 // ══════════════════════════════════════════════════════════════════════
 
 describe("tamandua-test shim", { concurrency: 1 }, () => {
+  const shimTh = createTempHome("tamandua-shim-test-");
+  const shimBaseTh = createTempHome("tamandua-shim-base-");
   let tempBase: string;
   let repoDir: string;
   let passScript: string;
@@ -194,7 +194,7 @@ describe("tamandua-test shim", { concurrency: 1 }, () => {
     origDbPath = process.env.TAMANDUA_DB_PATH;
     origControlPort = process.env.TAMANDUA_CONTROL_PORT;
 
-    tempBase = mkdtempSync(join(tmpdir(), "tamandua-shim-base-"));
+    tempBase = shimBaseTh.root;
     const fixture = createFixtureRepo(tempBase, "myproject");
     repoDir = fixture.repoDir;
     passScript = fixture.passScript;
@@ -202,7 +202,7 @@ describe("tamandua-test shim", { concurrency: 1 }, () => {
     counterScript = fixture.counterScript;
     counterFile = join(repoDir, ".counter");
 
-    controlEnv = await setupControlEnv();
+    controlEnv = await setupControlEnv(shimTh);
   });
 
   after(async () => {
@@ -218,8 +218,7 @@ describe("tamandua-test shim", { concurrency: 1 }, () => {
 
     // Clean up.
     await new Promise<void>((resolve) => controlEnv.server.close(() => resolve()));
-    rmSync(controlEnv.tempHome, { recursive: true, force: true });
-    rmSync(tempBase, { recursive: true, force: true });
+    // createTempHome handles cleanup via after() hook
   });
 
   beforeEach(() => {
@@ -254,7 +253,7 @@ describe("tamandua-test shim", { concurrency: 1 }, () => {
   // ── AC 5: Non-git directory → passthrough ──────────────────────────
 
   it("non-git directory triggers passthrough (AC 5)", async () => {
-    const nonGitDir = mkdtempSync(join(tmpdir(), "no-git-"));
+    const nonGitDir = createTempHome("no-git-").root;
     // Create a simple executable script in non-git dir.
     const script = join(nonGitDir, "echo.sh");
     writeFileSync(script, "#!/bin/sh\necho 'hello from non-git'\nexit 0\n");
@@ -273,7 +272,7 @@ describe("tamandua-test shim", { concurrency: 1 }, () => {
         "should include passthrough notice",
       );
     } finally {
-      rmSync(nonGitDir, { recursive: true, force: true });
+      // createTempHome handles cleanup via after() hook
     }
   });
 

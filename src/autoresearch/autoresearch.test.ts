@@ -1,7 +1,6 @@
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -24,10 +23,11 @@ import {
   summarizeAutoresearch,
   runLoopIteration,
 } from "../../dist/autoresearch/autoresearch.js";
+import { createTempHome } from "../../tests/helpers/test-env.ts";
 import { parsePiOutputStream } from "../../dist/installer/pi-stream-parser.js";
 
 function makeTempDir(): string {
-  return fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-autoresearch-"));
+  return createTempHome("tamandua-autoresearch-").root;
 }
 
 function nodeMetricCommand(metricName: string, value: number): string {
@@ -883,7 +883,7 @@ describe("autoresearch loop", () => {
     git(cwd, ["commit", "-m", "initial"]);
 
     // Fake pi in a separate directory (outside the repo) so it does not dirty the working tree
-    const piDir = fs.mkdtempSync(path.join(os.tmpdir(), "fake-pi-"));
+    const piDir = createTempHome("fake-pi-").root;
     const fakePi = path.join(piDir, "pi");
     fs.writeFileSync(fakePi, [
       `#!/usr/bin/env -S ${process.execPath}`,
@@ -1915,10 +1915,12 @@ describe("runLoopIteration", () => {
 
 describe("autoresearch run-loop-iteration CLI", () => {
   function cli(cwd: string, args: string[]): { status: number | null; stdout: string; stderr: string } {
+    const homeTh = createTempHome("tamandua-cli-");
+    const stateTh = createTempHome("tamandua-state-");
     const env = {
       PATH: process.env.PATH,
-      HOME: fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-cli-")),
-      TAMANDUA_STATE_DIR: fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-state-")),
+      HOME: homeTh.homeDir,
+      TAMANDUA_STATE_DIR: stateTh.tamanduaDir,
     };
     const result = spawnSync(process.execPath, [CLI_SCRIPT, ...args], {
       cwd,

@@ -1,10 +1,10 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { once } from "node:events";
 import http from "node:http";
+import { createTempHome } from "../../tests/helpers/test-env.ts";
 import { DatabaseSync } from "node:sqlite";
 
 import type { TamanduaEvent } from "../../dist/installer/events.js";
@@ -618,10 +618,8 @@ function appendRunEvent(stateDir: string, runId: string, evt: TamanduaEvent): vo
 
 describe("kanban-data: kanban-card-detail bounded events handler", () => {
   it("response includes totalEvents and truncated fields", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-kanban-bounded-"));
-    const homeDir = path.join(root, "home");
-    const stateDir = path.join(homeDir, ".tamandua");
-    fs.mkdirSync(stateDir, { recursive: true });
+    const { homeDir, tamanduaDir } = createTempHome("tamandua-kanban-bounded-");
+    const stateDir = tamanduaDir;
     const dbPath = path.join(stateDir, "tamandua.db");
     const previousHome = process.env.HOME;
     const previousDbPath = process.env.TAMANDUA_DB_PATH;
@@ -681,15 +679,12 @@ describe("kanban-data: kanban-card-detail bounded events handler", () => {
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
       if (previousStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
       else process.env.TAMANDUA_STATE_DIR = previousStateDir;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
   it("response has truncated=true when totalEvents > bounded count", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-kanban-bounded-"));
-    const homeDir = path.join(root, "home");
-    const stateDir = path.join(homeDir, ".tamandua");
-    fs.mkdirSync(stateDir, { recursive: true });
+    const { homeDir, tamanduaDir } = createTempHome("tamandua-kanban-bounded-");
+    const stateDir = tamanduaDir;
     const dbPath = path.join(stateDir, "tamandua.db");
     const previousHome = process.env.HOME;
     const previousDbPath = process.env.TAMANDUA_DB_PATH;
@@ -746,7 +741,6 @@ describe("kanban-data: kanban-card-detail bounded events handler", () => {
       else process.env.TAMANDUA_DB_PATH = previousDbPath;
       if (previousStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
       else process.env.TAMANDUA_STATE_DIR = previousStateDir;
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 });

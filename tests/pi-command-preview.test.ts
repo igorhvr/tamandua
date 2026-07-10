@@ -1,8 +1,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+import { createTempHome } from "./helpers/test-env.ts";
 import { formatPiCommandPreview } from "../dist/installer/pi-command-preview.js";
 import { runPi } from "../dist/installer/agent-scheduler.js";
 import { logger } from "../dist/lib/logger.js";
@@ -101,7 +101,7 @@ describe("formatPiCommandPreview", () => {
 
 describe("runPi logging", () => {
   it("logs pi pre-launch, launch, and completion metadata", async () => {
-    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-pi-preview-"));
+    const tempDir = createTempHome("tamandua-pi-preview-").root;
     const fakePi = path.join(tempDir, "pi");
     fs.writeFileSync(fakePi, "#!/usr/bin/env node\nprocess.stdout.write('ok-from-fake-pi');\n", "utf-8");
     fs.chmodSync(fakePi, 0o755);
@@ -162,12 +162,11 @@ describe("runPi logging", () => {
       } else {
         process.env.TAMANDUA_PI_BINARY = originalPiBinary;
       }
-      fs.rmSync(tempDir, { recursive: true, force: true });
     }
   });
 
   it("logs bounded failure metadata with pid and exit outcome", async () => {
-    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-pi-failure-"));
+    const tempDir = createTempHome("tamandua-pi-failure-").root;
     const fakePi = path.join(tempDir, "pi");
     const longStderr = "E".repeat(800);
     fs.writeFileSync(
@@ -228,7 +227,6 @@ describe("runPi logging", () => {
       } else {
         process.env.TAMANDUA_PI_BINARY = originalPiBinary;
       }
-      fs.rmSync(tempDir, { recursive: true, force: true });
     }
   });
 });

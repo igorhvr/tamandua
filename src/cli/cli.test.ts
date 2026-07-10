@@ -4,39 +4,29 @@ import { execFileSync, spawnSync, spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
-import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseWorkflowRunArgs } from "../../dist/cli/workflow-run-args.js";
-import { cleanChildEnv } from "../../tests/helpers/test-env.ts";
+import { cleanChildEnv, createTempHome } from "../../tests/helpers/test-env.ts";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 function makeTestEnv() {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-cli-test-"));
-  const stateDir = path.join(tmpDir, "state");
-  const homeDir = path.join(tmpDir, "home");
-  fs.mkdirSync(stateDir);
-  fs.mkdirSync(homeDir);
-  return { tmpDir, stateDir, homeDir };
+  const th = createTempHome("tamandua-cli-test-");
+  return { tmpDir: th.root, stateDir: th.tamanduaDir, homeDir: th.homeDir };
 }
 
 function cli(args: string[], env?: Record<string, string>) {
   const wrapperPath = path.resolve("bin/tamandua");
   const testEnv = makeTestEnv();
-  try {
-    const result = spawnSync("/bin/sh", [wrapperPath, ...args], {
-      encoding: "utf8",
-      env: cleanChildEnv({ HOME: testEnv.homeDir,
-        TAMANDUA_STATE_DIR: testEnv.stateDir,
-        ...env, }),
-    });
-    return { ...result, testEnv };
-  } catch (err) {
-    fs.rmSync(testEnv.tmpDir, { recursive: true, force: true });
-    throw err;
-  }
+  const result = spawnSync("/bin/sh", [wrapperPath, ...args], {
+    encoding: "utf8",
+    env: cleanChildEnv({ HOME: testEnv.homeDir,
+      TAMANDUA_STATE_DIR: testEnv.stateDir,
+      ...env, }),
+  });
+  return { ...result, testEnv };
 }
 
 describe("parseWorkflowRunArgs", () => {
@@ -275,18 +265,16 @@ describe("CLI entrypoint regression: no ExperimentalWarning", () => {
       const versionRegex = /^\d{8}T\d{6}Z_[0-9a-f]{40}$/;
       assert.match(stdout.trim(), versionRegex);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 });
 
 describe("CLI entrypoint", () => {
   it("runs when invoked through a symlink", () => {
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-cli-test-"));
-    const stateDir = path.join(tmpDir, "state");
-    const homeDir = path.join(tmpDir, "home");
-    fs.mkdirSync(stateDir);
-    fs.mkdirSync(homeDir);
+    const th = createTempHome("tamandua-cli-test-");
+    const tmpDir = th.root;
+    const stateDir = th.tamanduaDir;
+    const homeDir = th.homeDir;
 
     try {
       const cliPath = path.resolve("dist/cli/cli.js");
@@ -302,7 +290,6 @@ describe("CLI entrypoint", () => {
       const versionRegex = /^\d{8}T\d{6}Z_[0-9a-f]{40}$/;
       assert.match(output.trim(), versionRegex);
     } finally {
-      fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
 });
@@ -315,7 +302,6 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /tamandua get-ready/);
       assert.match(result.stdout ?? "", /tamandua update/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -325,7 +311,6 @@ describe("--help infrastructure", () => {
       assert.equal(result.status, 0);
       assert.match(result.stdout ?? "", /tamandua get-ready/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -335,7 +320,6 @@ describe("--help infrastructure", () => {
       assert.equal(result.status, 0);
       assert.match(result.stdout ?? "", /tamandua get-ready/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -345,7 +329,6 @@ describe("--help infrastructure", () => {
       assert.equal(result.status, 0);
       assert.doesNotMatch(result.stderr ?? "", /WARNING: A new version/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -358,7 +341,6 @@ describe("--help infrastructure", () => {
       // Should not produce error about missing workflow name
       assert.doesNotMatch(result.stderr ?? "", /Missing workflow name/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -368,7 +350,6 @@ describe("--help infrastructure", () => {
       assert.equal(result.status, 0);
       assert.match(result.stdout ?? "", /tamandua get-ready/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -382,7 +363,6 @@ describe("--help infrastructure", () => {
       // Should NOT contain global usage
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -397,7 +377,6 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /tamandua -v/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -407,7 +386,6 @@ describe("--help infrastructure", () => {
       assert.equal(result.status, 0);
       assert.match(result.stdout ?? "", /Display build version/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -417,7 +395,6 @@ describe("--help infrastructure", () => {
       assert.equal(result.status, 0);
       assert.match(result.stdout ?? "", /Display build version/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -432,7 +409,6 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /provisioned to workflow agents/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -446,7 +422,6 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /build-and-install/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -457,7 +432,6 @@ describe("--help infrastructure", () => {
       const versionRegex = /^\d{8}T\d{6}Z_[0-9a-f]{40}$/;
       assert.match((result.stdout ?? "").trim(), versionRegex);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -485,7 +459,6 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /--force/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -500,7 +473,6 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /MCP server/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua update/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -517,7 +489,6 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /--force/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua update/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -527,7 +498,6 @@ describe("--help infrastructure", () => {
       assert.equal(result.status, 0);
       assert.match(result.stdout ?? "", /--force\s+Continue update despite active runs/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -542,7 +512,6 @@ describe("--help infrastructure", () => {
         "tamandua update --help must warn that local edits are overwritten when reinstalling workflows",
       );
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -564,7 +533,6 @@ describe("--help infrastructure", () => {
         "tamandua workflow install --help must advise copying under a new workflow id to customize",
       );
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -574,7 +542,6 @@ describe("--help infrastructure", () => {
       assert.equal(result.status, 0);
       assert.match(result.stdout ?? "", /--force\s+Skip the active-runs check/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -590,7 +557,6 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /agent-id/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -606,7 +572,6 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /NO_WORK/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -622,7 +587,6 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /EOF/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -636,7 +600,6 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /Unknown error/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -651,7 +614,6 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /retry/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -661,7 +623,6 @@ describe("--help infrastructure", () => {
       assert.equal(result.status, 0);
       assert.match(result.stdout ?? "", /tamandua get-ready/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -678,7 +639,6 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /\/mcp/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -695,7 +655,6 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /monitoring workflow runs/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -711,7 +670,6 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /scheduling API/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -725,7 +683,6 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /already running/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -735,7 +692,6 @@ describe("--help infrastructure", () => {
       assert.equal(result.status, 0);
       assert.match(result.stdout ?? "", /--port N\s+Port to listen on \(default: 3338\)/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -753,7 +709,6 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /tamandua logs #3/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -770,7 +725,6 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /tamandua logs-tail #3/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -790,7 +744,6 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /tamandua worktree prune --completed --older-than 7d/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -808,7 +761,6 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /30m.*30 minutes/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -822,7 +774,6 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /non-ready/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -838,7 +789,6 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /Origin/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -855,7 +805,6 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /Cleanup/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -872,7 +821,6 @@ describe("--help infrastructure", () => {
       // run number
       assert.match(result.stdout ?? "", /Show events for run #3/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -890,7 +838,6 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /autoresearch\.jsonl/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -905,7 +852,6 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /--next-focus/);
       assert.match(result.stdout ?? "", /checks_failed/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -921,7 +867,6 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /--timeout-seconds/);
       assert.match(result.stdout ?? "", /run_result/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -933,7 +878,6 @@ describe("--help infrastructure", () => {
       assert.match(result.stderr ?? "", /init\|run-experiment\|log-experiment\|status\|next\|loop/);
       assert.doesNotMatch(result.stderr ?? "", /run\|/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -945,7 +889,6 @@ describe("--help infrastructure", () => {
       assert.match(result.stderr ?? "", /init\|run-experiment\|log-experiment\|status\|next\|loop/);
       assert.doesNotMatch(result.stderr ?? "", /\|log\|/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -975,15 +918,12 @@ describe("--help infrastructure", () => {
           assert.match(loopResult.stdout ?? "", /Iterations: 1/);
           assert.match(loopResult.stdout ?? "", /Best/);
         } finally {
-          fs.rmSync(loopResult.testEnv.tmpDir, { recursive: true, force: true });
         }
       } finally {
         if (initResult.testEnv.tmpDir !== testEnv.tmpDir) {
-          fs.rmSync(initResult.testEnv.tmpDir, { recursive: true, force: true });
         }
       }
     } finally {
-      fs.rmSync(testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -1007,7 +947,6 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /resume-all.*Resume all paused/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -1019,7 +958,6 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /autoresearch\.jsonl/);
       assert.match(result.stdout ?? "", /tamandua workflow autoresearch abc12345/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -1039,7 +977,6 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /Max iterations reached/);
       assert.match(result.stdout ?? "", /Too many consecutive failures/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -1051,7 +988,6 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /autoresearch run-experiment/);
       assert.match(result.stdout ?? "", /autoresearch log-experiment/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -1062,7 +998,6 @@ describe("--help infrastructure", () => {
       assert.match(result.stderr ?? "", /Unknown autoresearch action/);
       assert.match(result.stderr ?? "", /init\|run-experiment\|log-experiment\|status\|next\|loop/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -1093,15 +1028,12 @@ describe("--help infrastructure", () => {
           assert.match(loopResult.stdout ?? "", /Best/);
           assert.match(loopResult.stdout ?? "", /Iterations: 2/);
         } finally {
-          fs.rmSync(loopResult.testEnv.tmpDir, { recursive: true, force: true });
         }
       } finally {
         if (initResult.testEnv.tmpDir !== testEnv.tmpDir) {
-          fs.rmSync(initResult.testEnv.tmpDir, { recursive: true, force: true });
         }
       }
     } finally {
-      fs.rmSync(testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -1128,15 +1060,12 @@ describe("--help infrastructure", () => {
           assert.match(loopResult.stdout ?? "", /Target metric reached/);
           assert.match(loopResult.stdout ?? "", /Iterations: 1/);
         } finally {
-          fs.rmSync(loopResult.testEnv.tmpDir, { recursive: true, force: true });
         }
       } finally {
         if (initResult.testEnv.tmpDir !== testEnv.tmpDir) {
-          fs.rmSync(initResult.testEnv.tmpDir, { recursive: true, force: true });
         }
       }
     } finally {
-      fs.rmSync(testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -1163,15 +1092,12 @@ describe("--help infrastructure", () => {
           assert.match(loopResult.stdout ?? "", /Too many consecutive failures/);
           assert.match(loopResult.stdout ?? "", /Iterations: 2/);
         } finally {
-          fs.rmSync(loopResult.testEnv.tmpDir, { recursive: true, force: true });
         }
       } finally {
         if (initResult.testEnv.tmpDir !== testEnv.tmpDir) {
-          fs.rmSync(initResult.testEnv.tmpDir, { recursive: true, force: true });
         }
       }
     } finally {
-      fs.rmSync(testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -1203,15 +1129,12 @@ describe("--help infrastructure", () => {
           assert.match(loopResult.stdout ?? "", /failures=0/);
           assert.match(loopResult.stdout ?? "", /Kept: 1/);
         } finally {
-          fs.rmSync(loopResult.testEnv.tmpDir, { recursive: true, force: true });
         }
       } finally {
         if (initResult.testEnv.tmpDir !== testEnv.tmpDir) {
-          fs.rmSync(initResult.testEnv.tmpDir, { recursive: true, force: true });
         }
       }
     } finally {
-      fs.rmSync(testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -1240,16 +1163,12 @@ describe("--help infrastructure", () => {
             assert.match(statusResult.stdout ?? "", /Confidence:\s+high \(score=2\.00, MAD=1, n=3\)/);
             assert.match(statusResult.stdout ?? "", /Confidence: high\. The current best is likely above the measured noise floor\./);
           } finally {
-            fs.rmSync(statusResult.testEnv.tmpDir, { recursive: true, force: true });
           }
         } finally {
-          fs.rmSync(logResult.testEnv.tmpDir, { recursive: true, force: true });
         }
       } finally {
-        fs.rmSync(initResult.testEnv.tmpDir, { recursive: true, force: true });
       }
     } finally {
-      fs.rmSync(testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -1280,15 +1199,12 @@ describe("--help infrastructure", () => {
             JSON.parse(line);
           }
         } finally {
-          fs.rmSync(loopResult.testEnv.tmpDir, { recursive: true, force: true });
         }
       } finally {
         if (initResult.testEnv.tmpDir !== testEnv.tmpDir) {
-          fs.rmSync(initResult.testEnv.tmpDir, { recursive: true, force: true });
         }
       }
     } finally {
-      fs.rmSync(testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -1312,7 +1228,6 @@ describe("--help infrastructure", () => {
       assert.match(loopResult.stderr ?? "", /--measure-only/);
       assert.match(loopResult.stderr ?? "", /--prompt/);
     } finally {
-      fs.rmSync(testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -1335,7 +1250,6 @@ describe("--help infrastructure", () => {
       assert.equal(loopResult.status, 0);
       assert.match(loopResult.stdout ?? "", /\[measure-only\]/);
     } finally {
-      fs.rmSync(testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -1359,7 +1273,6 @@ describe("--help infrastructure", () => {
       // Prompt mode will try to invoke pi, which may not be available.
       // The important thing is that it was accepted and ran.
     } finally {
-      fs.rmSync(testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -1383,7 +1296,6 @@ describe("--help infrastructure", () => {
       assert.notEqual(loopResult.status, 0);
       assert.match(loopResult.stderr ?? "", /one action mode at a time/);
     } finally {
-      fs.rmSync(testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -1403,7 +1315,6 @@ describe("--help infrastructure", () => {
       // Should NOT contain invalid timeout error
       assert.ok(!(result.stderr ?? "").includes("Invalid --timeout"), `should not contain invalid timeout: ${result.stderr}`);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -1413,7 +1324,6 @@ describe("--help infrastructure", () => {
       assert.notEqual(result.status, 0);
       assert.match(result.stderr ?? "", /Invalid --timeout/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -1424,7 +1334,6 @@ describe("--help infrastructure", () => {
       assert.notEqual(result.status, 0);
       assert.ok(!(result.stderr ?? "").includes("Invalid --timeout"), `should not contain invalid timeout: ${result.stderr}`);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -1437,7 +1346,6 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /Action mode/);
       assert.match(result.stdout ?? "", /REQUIRED/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -1456,7 +1364,6 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /Add dark mode toggle/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -1470,7 +1377,6 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /dashboard daemon/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -1484,7 +1390,6 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /active runs.*running or paused/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -1498,7 +1403,6 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /completed.*cannot be resumed/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -1510,7 +1414,6 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /workflows\/ directory/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -1522,7 +1425,6 @@ describe("--help infrastructure", () => {
       // Each line should have format "  <id> - <description>"
       assert.match(result.stdout ?? "", /^  \S+ - \S/m);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -1535,7 +1437,6 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /Tokens.*Total tokens spent/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -1548,7 +1449,6 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /agent workspaces/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -1563,7 +1463,6 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /pending.*Step waiting/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -1575,7 +1474,6 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /prefix matching/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -1588,7 +1486,6 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /in-flight agent sessions/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -1599,7 +1496,6 @@ describe("--help infrastructure", () => {
       assert.equal(result.status, 0);
       assert.match(result.stdout ?? "", /Run tamandua <command> --help for detailed command help/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -1612,7 +1508,6 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /failed runs are not resumed/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -1624,7 +1519,6 @@ describe("--help infrastructure", () => {
       // Should not perform old workflow installation behavior
       assert.doesNotMatch(result.stdout ?? "", /Installing.*workflow/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 });
@@ -1642,7 +1536,6 @@ describe("status command", () => {
       assert.match(result.stdout ?? "", /tamandua status/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -1697,8 +1590,6 @@ describe("status command", () => {
       // Should NOT show placeholder text
       assert.doesNotMatch(out, /Full status output coming in future stories/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
-      fs.rmSync(testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -1709,7 +1600,6 @@ describe("status command", () => {
       assert.match(result.stdout ?? "", /tamandua status/);
       assert.match(result.stdout ?? "", /Show detailed system status/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 });
@@ -2371,7 +2261,6 @@ describe("nudge command", { concurrency: 1 }, () => {
       assert.equal(result.status, 0);
       assert.match(result.stdout ?? "", /tamandua nudge.*Trigger an immediate dispatch round for running runs/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -2385,7 +2274,6 @@ describe("nudge command", { concurrency: 1 }, () => {
       assert.match(result.stdout ?? "", /Does not resume paused runs or\ninterrupt in-flight agents/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -2397,7 +2285,6 @@ describe("nudge command", { concurrency: 1 }, () => {
       assert.match(stderr, /Unknown nudge option: extra-arg/);
       assert.match(stderr, /Usage: tamandua nudge/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -2409,7 +2296,6 @@ describe("nudge command", { concurrency: 1 }, () => {
       const stderr = result.stderr ?? "";
       assert.match(stderr, /Failed to nudge: control plane is not reachable/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -2426,12 +2312,12 @@ describe("nudge command", { concurrency: 1 }, () => {
       const portFile = path.join(result.testEnv.homeDir, ".tamandua", "port");
       assert.equal(fs.existsSync(portFile), false, "daemon port file should not exist");
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
   it("tamandua nudge with daemon running and no runs prints zero-runs message", async (t) => {
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-nudge-test-"));
+    const th_nudge = createTempHome("tamandua-nudge-test-");
+    const tmpDir = th_nudge.homeDir;
     const { reserveDistinctRandomPorts, cleanChildEnv: testCleanChildEnv } = await import("../../tests/helpers/test-env.ts");
     const [dp, cp] = await reserveDistinctRandomPorts(2);
     const daemonScript = path.resolve(__dirname, "..", "..", "dist", "server", "daemon.js");
@@ -2480,19 +2366,18 @@ describe("nudge command", { concurrency: 1 }, () => {
         assert.equal(result.status, 0);
         assert.match(result.stdout ?? "", /No running Tamandua runs to nudge/);
       } finally {
-        fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
       }
     } finally {
       if (daemon && daemon.exitCode === null && daemon.pid) {
         try { process.kill(daemon.pid, "SIGTERM"); } catch { /* gone */ }
       }
       await new Promise<void>((resolve) => setTimeout(resolve, 500));
-      fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
 
   it("tamandua nudge with daemon running and active runs prints summary", async (t) => {
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-nudge-test-"));
+    const th_nudge = createTempHome("tamandua-nudge-test-");
+    const tmpDir = th_nudge.homeDir;
     const { reserveDistinctRandomPorts, cleanChildEnv: testCleanChildEnv2 } = await import("../../tests/helpers/test-env.ts");
     const [dp, cp] = await reserveDistinctRandomPorts(2);
     const daemonScript = path.resolve(__dirname, "..", "..", "dist", "server", "daemon.js");
@@ -2558,7 +2443,6 @@ describe("nudge command", { concurrency: 1 }, () => {
         // so launched should be 0.
         assert.match(result.stdout ?? "", /Nudged \d+ running run\(s\): launched \d+ agent\(s\), skipped \d+ in-flight\./);
       } finally {
-        fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
       }
 
       // Cleanup DB
@@ -2570,7 +2454,6 @@ describe("nudge command", { concurrency: 1 }, () => {
         try { process.kill(daemon.pid, "SIGTERM"); } catch { /* gone */ }
       }
       await new Promise<void>((resolve) => setTimeout(resolve, 500));
-      fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
 });
@@ -2578,11 +2461,10 @@ describe("nudge command", { concurrency: 1 }, () => {
 describe("autoresearch CLI session registration", () => {
   /** Create a shared HOME/state directory for all CLI calls in a test, so they share the same DB. */
   function makeSharedEnv() {
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-cli-shared-"));
-    const homeDir = path.join(tmpDir, "home");
-    const stateDir = path.join(tmpDir, "state");
-    fs.mkdirSync(homeDir, { recursive: true });
-    fs.mkdirSync(stateDir, { recursive: true });
+    const th = createTempHome("tamandua-cli-shared-");
+    const tmpDir = th.root;
+    const homeDir = th.homeDir;
+    const stateDir = th.tamanduaDir;
     const dbPath = path.join(stateDir, "tamandua.db");
     return { tmpDir, homeDir, stateDir, dbPath };
   }
@@ -2607,7 +2489,6 @@ describe("autoresearch CLI session registration", () => {
     ]);
     if (result.status !== 0) throw new Error(`init failed: ${result.stderr}`);
     // Clean up the init's testEnv (we only needed the shared env)
-    fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
   }
 
   function openDb(dbPath: string) {
@@ -2647,10 +2528,8 @@ describe("autoresearch CLI session registration", () => {
           db.close();
         }
       } finally {
-        fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
       }
     } finally {
-      fs.rmSync(env.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -2675,10 +2554,8 @@ describe("autoresearch CLI session registration", () => {
           db.close();
         }
       } finally {
-        fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
       }
     } finally {
-      fs.rmSync(env.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -2694,7 +2571,6 @@ describe("autoresearch CLI session registration", () => {
       try {
         assert.equal(runResult.status, 0);
       } finally {
-        fs.rmSync(runResult.testEnv.tmpDir, { recursive: true, force: true });
       }
 
       // Now log-experiment to mark as keep
@@ -2718,10 +2594,8 @@ describe("autoresearch CLI session registration", () => {
           db.close();
         }
       } finally {
-        fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
       }
     } finally {
-      fs.rmSync(env.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -2746,10 +2620,8 @@ describe("autoresearch CLI session registration", () => {
           db.close();
         }
       } finally {
-        fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
       }
     } finally {
-      fs.rmSync(env.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -2774,10 +2646,8 @@ describe("autoresearch CLI session registration", () => {
           db.close();
         }
       } finally {
-        fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
       }
     } finally {
-      fs.rmSync(env.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -2806,10 +2676,8 @@ describe("autoresearch CLI session registration", () => {
           db.close();
         }
       } finally {
-        fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
       }
     } finally {
-      fs.rmSync(env.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -2833,7 +2701,6 @@ describe("autoresearch CLI session registration", () => {
         try {
           assert.equal(r.status, 0);
         } finally {
-          fs.rmSync(r.testEnv.tmpDir, { recursive: true, force: true });
         }
       }
 
@@ -2843,7 +2710,6 @@ describe("autoresearch CLI session registration", () => {
       assert.equal(configAfter, configBefore, "config.json should not be modified");
       assert.equal(logAfter, logBefore, "log.jsonl mtime should not change");
     } finally {
-      fs.rmSync(env.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -2867,7 +2733,6 @@ describe("autoresearch CLI session registration", () => {
         try {
           assert.equal(r.status, 0);
         } finally {
-          fs.rmSync(r.testEnv.tmpDir, { recursive: true, force: true });
         }
       }
 
@@ -2883,7 +2748,6 @@ describe("autoresearch CLI session registration", () => {
         db.close();
       }
     } finally {
-      fs.rmSync(env.tmpDir, { recursive: true, force: true });
     }
   });
 });
@@ -2891,11 +2755,10 @@ describe("autoresearch CLI session registration", () => {
 describe("autoresearch prune CLI", () => {
   /** Create a shared HOME/state directory for all CLI calls in a test, so they share the same DB. */
   function makeSharedEnv() {
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-cli-shared-"));
-    const homeDir = path.join(tmpDir, "home");
-    const stateDir = path.join(tmpDir, "state");
-    fs.mkdirSync(homeDir, { recursive: true });
-    fs.mkdirSync(stateDir, { recursive: true });
+    const th = createTempHome("tamandua-cli-shared-");
+    const tmpDir = th.root;
+    const homeDir = th.homeDir;
+    const stateDir = th.tamanduaDir;
     const dbPath = path.join(stateDir, "tamandua.db");
     return { tmpDir, homeDir, stateDir, dbPath };
   }
@@ -2917,7 +2780,6 @@ describe("autoresearch prune CLI", () => {
       "--cwd", cwd,
     ]);
     if (result.status !== 0) throw new Error(`init failed: ${result.stderr}`);
-    fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
   }
 
   it("tamandua autoresearch prune --help shows prune-specific help", () => {
@@ -2929,7 +2791,6 @@ describe("autoresearch prune CLI", () => {
       assert.match(result.stdout ?? "", /--missing/);
       assert.match(result.stdout ?? "", /--dry-run/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -2939,7 +2800,6 @@ describe("autoresearch prune CLI", () => {
       assert.notEqual(result.status, 0);
       assert.match(result.stderr ?? "", /Missing --older-than/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -2951,10 +2811,8 @@ describe("autoresearch prune CLI", () => {
         assert.equal(result.status, 0);
         assert.match(result.stdout ?? "", /No sessions to prune/);
       } finally {
-        fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
       }
     } finally {
-      fs.rmSync(env.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -2985,10 +2843,8 @@ describe("autoresearch prune CLI", () => {
         assert.ok(fs.existsSync(path.join(cwd, "autoresearch.config.json")), "config file should still exist");
         assert.ok(fs.existsSync(path.join(cwd, "autoresearch.jsonl")), "log file should still exist");
       } finally {
-        fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
       }
     } finally {
-      fs.rmSync(env.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -3018,10 +2874,8 @@ describe("autoresearch prune CLI", () => {
         assert.ok(fs.existsSync(path.join(cwd, "autoresearch.config.json")), "config file should still exist");
         assert.ok(fs.existsSync(path.join(cwd, "autoresearch.jsonl")), "log file should still exist");
       } finally {
-        fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
       }
     } finally {
-      fs.rmSync(env.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -3046,7 +2900,6 @@ describe("autoresearch prune CLI", () => {
         // status will fail because the dir doesn't exist, but the upsert still happens
         // (upsertAutoresearchSession handles missing dirs gracefully)
       } finally {
-        fs.rmSync(statusResult.testEnv.tmpDir, { recursive: true, force: true });
       }
 
       // Prune with --older-than 0m --missing
@@ -3070,10 +2923,8 @@ describe("autoresearch prune CLI", () => {
         assert.ok(fs.existsSync(path.join(presentCwd, "autoresearch.config.json")), "config file should still exist");
         assert.ok(fs.existsSync(path.join(presentCwd, "autoresearch.jsonl")), "log file should still exist");
       } finally {
-        fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
       }
     } finally {
-      fs.rmSync(env.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -3094,10 +2945,8 @@ describe("autoresearch prune CLI", () => {
         assert.match(stdout, /score/);
         assert.match(stdout, /last seen/);
       } finally {
-        fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
       }
     } finally {
-      fs.rmSync(env.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -3108,7 +2957,6 @@ describe("autoresearch prune CLI", () => {
       assert.match(result.stdout ?? "", /prune/);
       assert.match(result.stdout ?? "", /Remove stale AutoResearch registry rows/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -3118,7 +2966,6 @@ describe("autoresearch prune CLI", () => {
       assert.notEqual(result.status, 0);
       assert.match(result.stderr ?? "", /Invalid duration/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 });
@@ -3135,7 +2982,6 @@ describe("tamandua doctor", () => {
       assert.match(result.stdout ?? "", /node:sqlite/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -3147,7 +2993,6 @@ describe("tamandua doctor", () => {
       assert.match(result.stdout ?? "", /0.*all checks passed/);
       assert.match(result.stdout ?? "", /1.*at least one check failed/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -3157,7 +3002,6 @@ describe("tamandua doctor", () => {
       assert.equal(result.status, 0);
       assert.match(result.stdout ?? "", /tamandua doctor.*Run one-shot diagnostic/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -3177,7 +3021,6 @@ describe("tamandua doctor", () => {
       // Exit code should be 0 or 1 (0 if all pass, 1 if failures)
       assert.ok(result.status === 0 || result.status === 1, `unexpected exit code: ${result.status}`);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 
@@ -3187,7 +3030,6 @@ describe("tamandua doctor", () => {
       assert.notEqual(result.status, 0);
       assert.match(result.stderr ?? "", /Unknown doctor option/);
     } finally {
-      fs.rmSync(result.testEnv.tmpDir, { recursive: true, force: true });
     }
   });
 });

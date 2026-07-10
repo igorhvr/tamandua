@@ -9,6 +9,7 @@ import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
+import { createTempHome as sharedCreateTempHome } from "../../tests/helpers/test-env.ts";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -29,7 +30,8 @@ import { DEFAULT_MCP_PORT } from "../../dist/server/mcp-server.js";
 // ── Helpers ────────────────────────────────────────────────────────
 
 function createTempHome(): string {
-  return fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-mcp-restart-"));
+  const { root } = sharedCreateTempHome("tamandua-mcp-restart-");
+  return root;
 }
 
 async function getAvailablePort(): Promise<number> {
@@ -67,7 +69,6 @@ describe("daemonctl restartMcp", { concurrency: 1 }, () => {
       assert.equal(result.port, port, "port should match the requested port");
     } finally {
       try { stopMcp({ homeDir: tempHome }); } catch {}
-      fs.rmSync(tempHome, { recursive: true, force: true });
     }
   });
 
@@ -99,7 +100,6 @@ describe("daemonctl restartMcp", { concurrency: 1 }, () => {
       assert.equal(after.pid, result.pid);
     } finally {
       try { stopMcp({ homeDir: tempHome }); } catch {}
-      fs.rmSync(tempHome, { recursive: true, force: true });
     }
   });
 
@@ -124,7 +124,6 @@ describe("daemonctl restartMcp", { concurrency: 1 }, () => {
       assert.ok(result.pid > 0);
     } finally {
       try { stopMcp({ homeDir: tempHome }); } catch {}
-      fs.rmSync(tempHome, { recursive: true, force: true });
     }
   });
 
@@ -155,7 +154,6 @@ describe("daemonctl restartMcp", { concurrency: 1 }, () => {
       assert.ok(result.pid > 0);
     } finally {
       try { stopMcp({ homeDir: tempHome }); } catch {}
-      fs.rmSync(tempHome, { recursive: true, force: true });
     }
   });
 
@@ -187,7 +185,6 @@ describe("daemonctl restartMcp", { concurrency: 1 }, () => {
       assert.notEqual(result.pid, firstPid);
     } finally {
       try { stopMcp({ homeDir: tempHome }); } catch {}
-      fs.rmSync(tempHome, { recursive: true, force: true });
     }
   });
 
@@ -217,7 +214,6 @@ describe("daemonctl restartMcp", { concurrency: 1 }, () => {
       assert.equal(after.pid, result.pid);
     } finally {
       try { stopMcp({ homeDir: tempHome }); } catch {}
-      fs.rmSync(tempHome, { recursive: true, force: true });
     }
   });
 

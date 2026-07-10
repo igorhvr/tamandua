@@ -7,7 +7,7 @@
  * cases.
  */
 import { describe, it, before, after, beforeEach, afterEach } from "node:test";
-import { cleanChildEnv, reserveDistinctRandomPorts } from "../../tests/helpers/test-env.ts";
+import { cleanChildEnv, reserveDistinctRandomPorts, createTempHome } from "../../tests/helpers/test-env.ts";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import http from "node:http";
@@ -293,7 +293,7 @@ describe("control-client test-isolation guard", { concurrency: 1 }, () => {
     // With TAMANDUA_CONTROL_PORT set to a random port and HOME pointed
     // at a temp dir, the guard should NOT block. Start a simple HTTP
     // server on the random port to confirm the request reaches it.
-    const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-gcc-home-"));
+    const { root: tempHome } = createTempHome("tamandua-gcc-home-");
     const secretDir = path.join(tempHome, ".tamandua");
     fs.mkdirSync(secretDir, { recursive: true });
     fs.writeFileSync(path.join(secretDir, "daemon-secret"), "test-secret-isolated", "utf-8");
@@ -323,7 +323,6 @@ describe("control-client test-isolation guard", { concurrency: 1 }, () => {
       assert.equal(response.status, 200);
     } finally {
       await new Promise<void>((r) => server.close(() => r()));
-      fs.rmSync(tempHome, { recursive: true, force: true });
     }
   });
 
@@ -360,29 +359,25 @@ describe("control-client test-isolation guard", { concurrency: 1 }, () => {
     // The guard should still detect production because it uses
     // os.userInfo().homedir to resolve the real user home.
     const realHome = os.userInfo().homedir;
-    const spoofedHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-spoof-home-"));
+    const { root: spoofedHome } = createTempHome("tamandua-spoof-home-");
     process.env.HOME = spoofedHome;
     process.env.TAMANDUA_CONTROL_PORT = "65530";
 
-    try {
-      // The guard's assertStatePathIsolation compares against
-      // realUserHome() which uses os.userInfo().homedir.
-      // defaultDaemonSecretFile() uses HOME (spoofed) for the path.
-      // Since spoofed !== real, the guard does NOT trip.
-      // That's correct — with HOME spoofed to a temp dir, the daemon
-      // secret won't be the production one anyway. But the guard
-      // still correctly resolves to real home for comparison.
-      const { nudgeWithDaemon } = await import("../../dist/server/control-client.js");
-      const response = await nudgeWithDaemon(500);
+    // The guard's assertStatePathIsolation compares against
+    // realUserHome() which uses os.userInfo().homedir.
+    // defaultDaemonSecretFile() uses HOME (spoofed) for the path.
+    // Since spoofed !== real, the guard does NOT trip.
+    // That's correct — with HOME spoofed to a temp dir, the daemon
+    // secret won't be the production one anyway. But the guard
+    // still correctly resolves to real home for comparison.
+    const { nudgeWithDaemon } = await import("../../dist/server/control-client.js");
+    const response = await nudgeWithDaemon(500);
 
-      // Guard should NOT block here: HOME points at a temp dir,
-      // so defaultDaemonSecretFile() resolves to spoofedHome/.tamandua/daemon-secret,
-      // which is NOT under realHome/.tamandua. The request proceeds
-      // (and fails to connect since nothing is on port 65530).
-      assert.equal(response, null, "should not be blocked by guard (spoofed HOME)");
-    } finally {
-      fs.rmSync(spoofedHome, { recursive: true, force: true });
-    }
+    // Guard should NOT block here: HOME points at a temp dir,
+    // so defaultDaemonSecretFile() resolves to spoofedHome/.tamandua/daemon-secret,
+    // which is NOT under realHome/.tamandua. The request proceeds
+    // (and fails to connect since nothing is on port 65530).
+    assert.equal(response, null, "should not be blocked by guard (spoofed HOME)");
   });
 });
 

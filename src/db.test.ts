@@ -1,9 +1,9 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync, realpathSync } from "node:fs";
-import os from "node:os";
+import { writeFileSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { createTempHome } from "../tests/helpers/test-env.ts";
 
 // We test the migration by directly importing getDb, which calls migrate().
 // But since getDb() uses a cached connection and resolves DB path from
@@ -15,11 +15,12 @@ describe("PRAGMA synchronous", () => {
   let origHome: string | undefined;
   let origDbPath: string | undefined;
 
+  const th = createTempHome("tamandua-db-sync-test-");
   before(() => {
-    tempHome = mkdtempSync(path.join(os.tmpdir(), "tamandua-db-sync-test-"));
+    tempHome = th.root;
     origHome = process.env.HOME;
     origDbPath = process.env.TAMANDUA_DB_PATH;
-    process.env.HOME = tempHome;
+    process.env.HOME = th.homeDir;
     delete process.env.TAMANDUA_DB_PATH;
   });
 
@@ -34,7 +35,6 @@ describe("PRAGMA synchronous", () => {
     } else {
       delete process.env.TAMANDUA_DB_PATH;
     }
-    rmSync(tempHome, { recursive: true, force: true });
   });
 
   it("reports synchronous=NORMAL (1) after getDb() opens a connection", () => {
@@ -49,12 +49,13 @@ describe("run_worktrees table migration", () => {
   let origHome: string | undefined;
   let origDbPath: string | undefined;
 
+  const th = createTempHome("tamandua-db-test-");
   before(() => {
-    tempHome = mkdtempSync(path.join(os.tmpdir(), "tamandua-db-test-"));
+    tempHome = th.root;
     origHome = process.env.HOME;
     origDbPath = process.env.TAMANDUA_DB_PATH;
     // Isolate DB to temp directory by changing HOME
-    process.env.HOME = tempHome;
+    process.env.HOME = th.homeDir;
     delete process.env.TAMANDUA_DB_PATH;
   });
 
@@ -69,7 +70,6 @@ describe("run_worktrees table migration", () => {
     } else {
       delete process.env.TAMANDUA_DB_PATH;
     }
-    rmSync(tempHome, { recursive: true, force: true });
   });
 
   function columnNames(db: DatabaseSync, table: string): Set<string> {
@@ -344,11 +344,12 @@ describe("stories abandoned_count migration", () => {
   let origHome: string | undefined;
   let origDbPath: string | undefined;
 
+  const th = createTempHome("tamandua-stories-migration-test-");
   before(() => {
-    tempHome = mkdtempSync(path.join(os.tmpdir(), "tamandua-stories-migration-test-"));
+    tempHome = th.root;
     origHome = process.env.HOME;
     origDbPath = process.env.TAMANDUA_DB_PATH;
-    process.env.HOME = tempHome;
+    process.env.HOME = th.homeDir;
     delete process.env.TAMANDUA_DB_PATH;
   });
 
@@ -363,7 +364,6 @@ describe("stories abandoned_count migration", () => {
     } else {
       delete process.env.TAMANDUA_DB_PATH;
     }
-    rmSync(tempHome, { recursive: true, force: true });
   });
 
   function columnNames(db: DatabaseSync, table: string): Set<string> {
@@ -473,15 +473,16 @@ describe("getSystemTokenSpend", () => {
   let origHome: string | undefined;
   let origDbPath: string | undefined;
 
+  const th = createTempHome("tamandua-db-token-test-");
   before(() => {
     // Isolate into a temp HOME — this suite mutates tamandua_stats and must
     // never touch the real DB (it used to zero the production token counter
     // before the isolation guard existed; the file was invisible to npm test
     // until the find-based lanes picked it up).
-    tempHome = mkdtempSync(path.join(os.tmpdir(), "tamandua-db-token-test-"));
+    tempHome = th.root;
     origHome = process.env.HOME;
     origDbPath = process.env.TAMANDUA_DB_PATH;
-    process.env.HOME = tempHome;
+    process.env.HOME = th.homeDir;
     delete process.env.TAMANDUA_DB_PATH;
 
     // Reset tamandua_stats to a known baseline
@@ -520,7 +521,6 @@ describe("getSystemTokenSpend", () => {
     } else {
       delete process.env.TAMANDUA_DB_PATH;
     }
-    rmSync(tempHome, { recursive: true, force: true });
   });
 });
 
@@ -539,11 +539,12 @@ describe("autoresearch_sessions table migration", () => {
   let origHome: string | undefined;
   let origDbPath: string | undefined;
 
+  const th = createTempHome("tamandua-ar-sessions-test-");
   before(() => {
-    tempHome = mkdtempSync(path.join(os.tmpdir(), "tamandua-ar-sessions-test-"));
+    tempHome = th.root;
     origHome = process.env.HOME;
     origDbPath = process.env.TAMANDUA_DB_PATH;
-    process.env.HOME = tempHome;
+    process.env.HOME = th.homeDir;
     delete process.env.TAMANDUA_DB_PATH;
   });
 
@@ -558,7 +559,6 @@ describe("autoresearch_sessions table migration", () => {
     } else {
       delete process.env.TAMANDUA_DB_PATH;
     }
-    rmSync(tempHome, { recursive: true, force: true });
   });
 
   function tableExists(db: DatabaseSync, table: string): boolean {
@@ -699,12 +699,14 @@ describe("upsertAutoresearchSession", () => {
   let origHome: string | undefined;
   let origDbPath: string | undefined;
 
+  const th = createTempHome("tamandua-ar-upsert-test-");
+  const ssth = createTempHome("tamandua-ar-session-");
   before(() => {
-    tempHome = mkdtempSync(path.join(os.tmpdir(), "tamandua-ar-upsert-test-"));
-    tempSessionDir = mkdtempSync(path.join(os.tmpdir(), "tamandua-ar-session-"));
+    tempHome = th.root;
+    tempSessionDir = ssth.root;
     origHome = process.env.HOME;
     origDbPath = process.env.TAMANDUA_DB_PATH;
-    process.env.HOME = tempHome;
+    process.env.HOME = th.homeDir;
     delete process.env.TAMANDUA_DB_PATH;
   });
 
@@ -719,8 +721,6 @@ describe("upsertAutoresearchSession", () => {
     } else {
       delete process.env.TAMANDUA_DB_PATH;
     }
-    rmSync(tempHome, { recursive: true, force: true });
-    rmSync(tempSessionDir, { recursive: true, force: true });
   });
 
   it("inserts a new row when cwd has valid autoresearch.config.json", () => {
@@ -896,12 +896,14 @@ describe("getAutoresearchSessions", () => {
   let origHome: string | undefined;
   let origDbPath: string | undefined;
 
+  const th = createTempHome("tamandua-ar-list-test-");
+  const ssth = createTempHome("tamandua-ar-session2-");
   before(() => {
-    tempHome = mkdtempSync(path.join(os.tmpdir(), "tamandua-ar-list-test-"));
-    tempSessionDir = mkdtempSync(path.join(os.tmpdir(), "tamandua-ar-session2-"));
+    tempHome = th.root;
+    tempSessionDir = ssth.root;
     origHome = process.env.HOME;
     origDbPath = process.env.TAMANDUA_DB_PATH;
-    process.env.HOME = tempHome;
+    process.env.HOME = th.homeDir;
     delete process.env.TAMANDUA_DB_PATH;
   });
 
@@ -916,8 +918,6 @@ describe("getAutoresearchSessions", () => {
     } else {
       delete process.env.TAMANDUA_DB_PATH;
     }
-    rmSync(tempHome, { recursive: true, force: true });
-    rmSync(tempSessionDir, { recursive: true, force: true });
   });
 
   it("returns empty array when no sessions exist", () => {
@@ -927,8 +927,8 @@ describe("getAutoresearchSessions", () => {
 
   it("returns all non-missing sessions ordered by updated_at DESC", () => {
     // Create two sessions
-    const dir1 = mkdtempSync(path.join(os.tmpdir(), "tamandua-ar-a-"));
-    const dir2 = mkdtempSync(path.join(os.tmpdir(), "tamandua-ar-b-"));
+    const dir1 = createTempHome("tamandua-ar-a-").root;
+    const dir2 = createTempHome("tamandua-ar-b-").root;
 
     try {
       writeSessionConfig(dir1, {
@@ -960,8 +960,7 @@ describe("getAutoresearchSessions", () => {
       assert.equal(sessions[0].goal, "session A");
       assert.equal(sessions[1].goal, "session B");
     } finally {
-      rmSync(dir1, { recursive: true, force: true });
-      rmSync(dir2, { recursive: true, force: true });
+      // createTempHome handles cleanup via after()
     }
   });
 
@@ -991,12 +990,14 @@ describe("getAutoresearchSessionById", () => {
   let origHome: string | undefined;
   let origDbPath: string | undefined;
 
+  const th = createTempHome("tamandua-ar-getbyid-test-");
+  const ssth = createTempHome("tamandua-ar-session3-");
   before(() => {
-    tempHome = mkdtempSync(path.join(os.tmpdir(), "tamandua-ar-getbyid-test-"));
-    tempSessionDir = mkdtempSync(path.join(os.tmpdir(), "tamandua-ar-session3-"));
+    tempHome = th.root;
+    tempSessionDir = ssth.root;
     origHome = process.env.HOME;
     origDbPath = process.env.TAMANDUA_DB_PATH;
-    process.env.HOME = tempHome;
+    process.env.HOME = th.homeDir;
     delete process.env.TAMANDUA_DB_PATH;
   });
 
@@ -1011,8 +1012,6 @@ describe("getAutoresearchSessionById", () => {
     } else {
       delete process.env.TAMANDUA_DB_PATH;
     }
-    rmSync(tempHome, { recursive: true, force: true });
-    rmSync(tempSessionDir, { recursive: true, force: true });
   });
 
   it("returns a session by id", () => {
@@ -1045,11 +1044,12 @@ describe("getDb handle stability", () => {
   let origHome: string | undefined;
   let origDbPath: string | undefined;
 
+  const th = createTempHome("tamandua-db-handle-test-");
   before(() => {
-    tempHome = mkdtempSync(path.join(os.tmpdir(), "tamandua-db-handle-test-"));
+    tempHome = th.root;
     origHome = process.env.HOME;
     origDbPath = process.env.TAMANDUA_DB_PATH;
-    process.env.HOME = tempHome;
+    process.env.HOME = th.homeDir;
     delete process.env.TAMANDUA_DB_PATH;
   });
 
@@ -1064,7 +1064,6 @@ describe("getDb handle stability", () => {
     } else {
       delete process.env.TAMANDUA_DB_PATH;
     }
-    rmSync(tempHome, { recursive: true, force: true });
   });
 
   it("returns the identical handle for same path across multiple calls", () => {
@@ -1110,12 +1109,14 @@ describe("deleteAutoresearchSession", () => {
   let origHome: string | undefined;
   let origDbPath: string | undefined;
 
+  const th = createTempHome("tamandua-ar-delete-test-");
+  const ssth = createTempHome("tamandua-ar-session4-");
   before(() => {
-    tempHome = mkdtempSync(path.join(os.tmpdir(), "tamandua-ar-delete-test-"));
-    tempSessionDir = mkdtempSync(path.join(os.tmpdir(), "tamandua-ar-session4-"));
+    tempHome = th.root;
+    tempSessionDir = ssth.root;
     origHome = process.env.HOME;
     origDbPath = process.env.TAMANDUA_DB_PATH;
-    process.env.HOME = tempHome;
+    process.env.HOME = th.homeDir;
     delete process.env.TAMANDUA_DB_PATH;
   });
 
@@ -1130,8 +1131,6 @@ describe("deleteAutoresearchSession", () => {
     } else {
       delete process.env.TAMANDUA_DB_PATH;
     }
-    rmSync(tempHome, { recursive: true, force: true });
-    rmSync(tempSessionDir, { recursive: true, force: true });
   });
 
   it("removes a row by id and returns true", () => {
@@ -1167,11 +1166,12 @@ describe("suite_results table migration", () => {
   let origHome: string | undefined;
   let origDbPath: string | undefined;
 
+  const th = createTempHome("tamandua-suite-results-test-");
   before(() => {
-    tempHome = mkdtempSync(path.join(os.tmpdir(), "tamandua-suite-results-test-"));
+    tempHome = th.root;
     origHome = process.env.HOME;
     origDbPath = process.env.TAMANDUA_DB_PATH;
-    process.env.HOME = tempHome;
+    process.env.HOME = th.homeDir;
     delete process.env.TAMANDUA_DB_PATH;
   });
 
@@ -1186,7 +1186,6 @@ describe("suite_results table migration", () => {
     } else {
       delete process.env.TAMANDUA_DB_PATH;
     }
-    rmSync(tempHome, { recursive: true, force: true });
   });
 
   function tableExists(db: DatabaseSync, table: string): boolean {
@@ -1455,11 +1454,12 @@ describe("suite_results pruneOldSuiteResults", () => {
   let origHome: string | undefined;
   let origDbPath: string | undefined;
 
+  const th = createTempHome("tamandua-suite-prune-test-");
   before(() => {
-    tempHome = mkdtempSync(path.join(os.tmpdir(), "tamandua-suite-prune-test-"));
+    tempHome = th.root;
     origHome = process.env.HOME;
     origDbPath = process.env.TAMANDUA_DB_PATH;
-    process.env.HOME = tempHome;
+    process.env.HOME = th.homeDir;
     delete process.env.TAMANDUA_DB_PATH;
   });
 
@@ -1474,7 +1474,6 @@ describe("suite_results pruneOldSuiteResults", () => {
     } else {
       delete process.env.TAMANDUA_DB_PATH;
     }
-    rmSync(tempHome, { recursive: true, force: true });
   });
 
   it("removes rows older than 14 days", () => {

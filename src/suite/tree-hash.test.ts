@@ -4,17 +4,18 @@
  */
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, symlinkSync } from "node:fs";
+import { rmSync, writeFileSync, mkdirSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
 import { execSync } from "node:child_process";
+import { createTempHome } from "../../tests/helpers/test-env.ts";
 
 describe("computeTreeHash", () => {
+  const th = createTempHome("tamandua-tree-hash-test-");
   let repoDir: string;
 
   before(() => {
     // Create a temporary git repository.
-    repoDir = mkdtempSync(join(tmpdir(), "tamandua-tree-hash-test-"));
+    repoDir = th.root;
     execSync("git init", { cwd: repoDir });
     execSync("git config user.email test@test.com", { cwd: repoDir });
     execSync("git config user.name Test", { cwd: repoDir });
@@ -31,7 +32,7 @@ describe("computeTreeHash", () => {
   });
 
   after(() => {
-    rmSync(repoDir, { recursive: true, force: true });
+    // createTempHome handles cleanup via after()
   });
 
   it("returns a 40-char hex string for a valid repo", async () => {
@@ -122,12 +123,12 @@ describe("computeTreeHash", () => {
     const { computeTreeHash } = await import(
       "../../dist/suite/tree-hash.js"
     );
-    const nonGitDir = mkdtempSync(join(tmpdir(), "tamandua-no-git-"));
+    const nonGitDir = createTempHome("tamandua-no-git-").root;
     try {
       const hash = computeTreeHash(nonGitDir);
       assert.equal(hash, null, "non-git directory should return null");
     } finally {
-      rmSync(nonGitDir, { recursive: true, force: true });
+      // createTempHome handles cleanup via after()
     }
   });
 
@@ -240,10 +241,11 @@ describe("computeCmdHash", () => {
 });
 
 describe("getOriginRepo", () => {
+  const th2 = createTempHome("tamandua-origin-test-");
   let repoDir: string;
 
   before(() => {
-    repoDir = mkdtempSync(join(tmpdir(), "tamandua-origin-test-"));
+    repoDir = th2.root;
     execSync("git init", { cwd: repoDir });
     execSync("git config user.email test@test.com", { cwd: repoDir });
     execSync("git config user.name Test", { cwd: repoDir });
@@ -253,7 +255,7 @@ describe("getOriginRepo", () => {
   });
 
   after(() => {
-    rmSync(repoDir, { recursive: true, force: true });
+    // createTempHome handles cleanup via after()
   });
 
   it("returns the repo realpath for a non-worktree repo", async () => {
@@ -267,7 +269,10 @@ describe("getOriginRepo", () => {
 
   it("returns the origin repo path for a worktree", async () => {
     // Create a worktree from the main repo.
-    const wtDir = mkdtempSync(join(tmpdir(), "tamandua-wt-test-"));
+    const wtTh = createTempHome("tamandua-wt-test-");
+    const wtDir = wtTh.root;
+    // Remove the home dir created by createTempHome so git worktree add can use an empty dir
+    rmSync(wtTh.homeDir, { recursive: true, force: true });
     execSync(`git worktree add "${wtDir}" HEAD`, { cwd: repoDir });
 
     try {
@@ -283,7 +288,7 @@ describe("getOriginRepo", () => {
       );
     } finally {
       execSync(`git worktree remove "${wtDir}" --force`, { cwd: repoDir });
-      rmSync(wtDir, { recursive: true, force: true });
+      // createTempHome handles cleanup via after()
     }
   });
 
@@ -292,13 +297,13 @@ describe("getOriginRepo", () => {
       "../../dist/suite/tree-hash.js"
     );
     // A non-git directory → should fall back.
-    const nonGitDir = mkdtempSync(join(tmpdir(), "tamandua-no-git-origin-"));
+    const nonGitDir = createTempHome("tamandua-no-git-origin-").root;
     try {
       const { realpathSync } = await import("node:fs");
       const origin = getOriginRepo(nonGitDir);
       assert.equal(origin, realpathSync(nonGitDir), "should fall back to realpath");
     } finally {
-      rmSync(nonGitDir, { recursive: true, force: true });
+      // createTempHome handles cleanup via after()
     }
   });
 });

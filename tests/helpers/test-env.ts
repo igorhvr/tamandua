@@ -1,5 +1,69 @@
 import http from "node:http";
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
+
+export interface TempHome {
+  /** Top-level temp directory (e.g. /tmp/tamandua-test-XXXXX).  rmSync this to clean up. */
+  root: string;
+  /** HOME directory inside root (root/home). */
+  homeDir: string;
+  /** .tamandua config directory inside homeDir (homeDir/.tamandua). */
+  tamanduaDir: string;
+}
+
+// Module-level registry: all temp dirs created by createTempHome.
+// Process-level cleanup fires at exit (also on SIGINT/SIGTERM) so
+// the helper works from any context — module top, describe body,
+// beforeEach, or it() — without leaking /tmp entries.
+const _cleanupDirs = new Set<string>();
+let _cleanupRegistered = false;
+
+function _registerProcessCleanup() {
+  if (_cleanupRegistered) return;
+  _cleanupRegistered = true;
+
+  const cleanup = () => {
+    for (const dir of _cleanupDirs) {
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
+    _cleanupDirs.clear();
+  };
+
+  // clean exit (process.exit, normal termination)
+  process.on("exit", cleanup);
+
+  // kill signals — Node won't run 'exit' for these, so we handle them explicitly
+  for (const sig of ["SIGINT", "SIGTERM"]) {
+    process.on(sig, () => {
+      cleanup();
+      process.exit(1);
+    });
+  }
+}
+
+/**
+ * Create an isolated temp HOME directory under /tmp.  Cleanup is automatic
+ * via process-level handlers (exit + SIGINT/SIGTERM), so this helper works
+ * from any context — module top, describe body, beforeEach, or it().
+ *
+ * The returned object follows the same shape as the e2e smoke-helpers
+ * createTempHome, making it easy to share patterns between the two tiers.
+ */
+export function createTempHome(prefix?: string): TempHome {
+  _registerProcessCleanup();
+
+  const root = fs.mkdtempSync(
+    path.join(os.tmpdir(), prefix ?? "tamandua-test-"),
+  );
+  _cleanupDirs.add(root);
+
+  const homeDir = path.join(root, "home");
+  const tamanduaDir = path.join(homeDir, ".tamandua");
+  fs.mkdirSync(tamanduaDir, { recursive: true });
+
+  return { root, homeDir, tamanduaDir };
+}
 
 const BASE_ENV_KEYS = [
   "PATH",

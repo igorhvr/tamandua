@@ -29,8 +29,8 @@ import { describe, it, before } from "node:test";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+import { createTempHome } from "./helpers/test-env.ts";
 import { loadWorkflowSpec } from "../dist/installer/workflow-spec.js";
 import { resolveBundledWorkflowsDir } from "../dist/installer/paths.js";
 import { AUTO_CONTEXT_KEYS } from "../dist/installer/workflow-contract.js";
@@ -50,24 +50,13 @@ import type { WorkflowSpec } from "../dist/installer/types.js";
 // runs — isolates all state. TAMANDUA_CONTROL_PORT points at port 1
 // (nothing listens there) so completion-triggered control-plane
 // notifications fail fast instead of reaching a live daemon.
+// createTempHome sets up an isolated temp home with automatic after() cleanup.
 
-const _savedStateDir = process.env.TAMANDUA_STATE_DIR;
-const _savedDbPath = process.env.TAMANDUA_DB_PATH;
-const _savedControlPort = process.env.TAMANDUA_CONTROL_PORT;
-const _isolationDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-graph-sim-"));
-process.env.TAMANDUA_STATE_DIR = _isolationDir;
-process.env.TAMANDUA_DB_PATH = path.join(_isolationDir, "tamandua.db");
-process.env.TAMANDUA_CONTROL_PORT = "1";
-
-process.on("exit", () => {
-  if (_savedStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
-  else process.env.TAMANDUA_STATE_DIR = _savedStateDir;
-  if (_savedDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
-  else process.env.TAMANDUA_DB_PATH = _savedDbPath;
-  if (_savedControlPort === undefined) delete process.env.TAMANDUA_CONTROL_PORT;
-  else process.env.TAMANDUA_CONTROL_PORT = _savedControlPort;
-  try { fs.rmSync(_isolationDir, { recursive: true, force: true }); } catch { /* best effort */ }
-});
+describe("workflow-graph-simulation", () => {
+  const { tamanduaDir } = createTempHome("tamandua-graph-sim-");
+  process.env.TAMANDUA_STATE_DIR = tamanduaDir;
+  process.env.TAMANDUA_DB_PATH = path.join(tamanduaDir, "tamandua.db");
+  process.env.TAMANDUA_CONTROL_PORT = "1";
 
 // ── Run creation (mirrors the DB work of runWorkflow in run.ts, minus
 //    daemon registration, worktree creation, and cron setup) ─────────
@@ -466,4 +455,5 @@ describe("workflow graph simulation (all bundled workflows, pure step-ops)", () 
       });
     });
   }
+});
 });

@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { after, describe, it } from "node:test";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import {
   createDefaultUpdateServices,
@@ -9,6 +8,7 @@ import {
   installAllBundledWorkflowsForUpdate,
   runUpdate,
 } from "../../dist/cli/update.js";
+import { createTempHome } from "../../tests/helpers/test-env.ts";
 
 describe("update exports", () => {
   describe("createDefaultUpdateServices", () => {
@@ -115,7 +115,8 @@ describe("update exports", () => {
 
   describe("runUpdate refreshes version status", () => {
     const originalStateDir = process.env.TAMANDUA_STATE_DIR;
-    const testStateDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-update-version-status-"));
+    const th = createTempHome("tamandua-update-version-status-");
+    const testStateDir = th.tamanduaDir;
     process.env.TAMANDUA_STATE_DIR = testStateDir;
 
     after(() => {
@@ -124,7 +125,6 @@ describe("update exports", () => {
       } else {
         process.env.TAMANDUA_STATE_DIR = originalStateDir;
       }
-      fs.rmSync(testStateDir, { recursive: true, force: true });
     });
 
     it("writes version-status.json after no_change update", async () => {

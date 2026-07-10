@@ -1,19 +1,12 @@
 import fs from "node:fs";
-import { cleanChildEnv } from "./helpers/test-env.ts";
-import os from "node:os";
+import { cleanChildEnv, createTempHome } from "./helpers/test-env.ts";
 import path from "node:path";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { describe, it } from "node:test";
 
+const TMP_PREFIX = "tamandua-dashboard-kanban-";
 const repoRoot = process.cwd();
-
-function createTempHome(): { root: string; homeDir: string } {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-kanban-"));
-  const homeDir = path.join(root, "home");
-  fs.mkdirSync(homeDir, { recursive: true });
-  return { root, homeDir };
-}
 
 function runNodeScript(script: string, env: Record<string, string>): Record<string, unknown> {
   const result = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
@@ -39,10 +32,9 @@ function runNodeScript(script: string, env: Record<string, string>): Record<stri
 
 describe("dashboard kanban view", () => {
   it("serves a lane-grouped snapshot at /api/runs/:id/kanban", () => {
-    const temp = createTempHome();
-    try {
-      const result = runNodeScript(
-        `
+    const temp = createTempHome(TMP_PREFIX);
+    const result = runNodeScript(
+      `
           import { once } from "node:events";
           import { getDb } from "./dist/db.js";
           import { createDashboardServer } from "./dist/server/dashboard.js";
@@ -117,35 +109,31 @@ describe("dashboard kanban view", () => {
             await new Promise((resolve) => server.close(() => resolve()));
           }
         `,
-        { HOME: temp.homeDir },
-      );
+      { HOME: temp.homeDir },
+    );
 
-      assert.equal(result.apiStatus, 200);
-      assert.equal(result.htmlStatus, 200);
-      assert.equal(result.htmlIsKanban, true);
-      assert.equal(result.missingStatus, 404);
-      assert.equal(result.laneCount, 3);
-      assert.deepEqual(result.laneAgents, ["planner", "developer", "verifier"]);
-      assert.equal(result.tokensSpent, 1234);
-      assert.equal(result.currentStoryId, "US-002");
-      assert.deepEqual(result.devCardIds, ["US-001", "US-002"]);
-      // US-001 done, US-002 promoted from pending → running because the loop step
-      // is alive and current_story_id matches.
-      assert.deepEqual(result.devCardStatuses, ["done", "running"]);
-      assert.equal(result.verLaneStatus, "todo");
-      assert.equal(result.verLaneStepType, "single");
-      assert.ok(result.toggleCount > 0, "kanban cards should contain toggle buttons");
-      assert.ok(result.hasPlusOnButton, "toggle buttons should show + by default");
-    } finally {
-      fs.rmSync(temp.root, { recursive: true, force: true });
-    }
+    assert.equal(result.apiStatus, 200);
+    assert.equal(result.htmlStatus, 200);
+    assert.equal(result.htmlIsKanban, true);
+    assert.equal(result.missingStatus, 404);
+    assert.equal(result.laneCount, 3);
+    assert.deepEqual(result.laneAgents, ["planner", "developer", "verifier"]);
+    assert.equal(result.tokensSpent, 1234);
+    assert.equal(result.currentStoryId, "US-002");
+    assert.deepEqual(result.devCardIds, ["US-001", "US-002"]);
+    // US-001 done, US-002 promoted from pending → running because the loop step
+    // is alive and current_story_id matches.
+    assert.deepEqual(result.devCardStatuses, ["done", "running"]);
+    assert.equal(result.verLaneStatus, "todo");
+    assert.equal(result.verLaneStepType, "single");
+    assert.ok(result.toggleCount > 0, "kanban cards should contain toggle buttons");
+    assert.ok(result.hasPlusOnButton, "toggle buttons should show + by default");
   });
 
   it("kanban cards have data-card-id attributes for expansion wiring", () => {
-    const temp = createTempHome();
-    try {
-      const result = runNodeScript(
-        `
+    const temp = createTempHome(TMP_PREFIX);
+    const result = runNodeScript(
+      `
           import { once } from "node:events";
           import { getDb } from "./dist/db.js";
           import { createDashboardServer } from "./dist/server/dashboard.js";
@@ -203,26 +191,22 @@ describe("dashboard kanban view", () => {
             await new Promise((resolve) => server.close(() => resolve()));
           }
         `,
-        { HOME: temp.homeDir },
-      );
+      { HOME: temp.homeDir },
+    );
 
-      assert.ok(result.hasSetCardId, "cards should set data-card-id attribute");
-      assert.ok(result.hasDelegateHandler, "should have event delegation for toggle buttons");
-      assert.ok(result.hasCreateDetail, "should have createDetailSection function");
-      assert.ok(result.hasCreateError, "should have createErrorSection function for fetch errors");
-      assert.ok(result.hasDetailCss, "should have card-detail CSS styles");
-      assert.ok(result.hasToggleMinus, "should have minus sign for toggle");
-      assert.ok(result.hasDetailFailureCss, "should have failure detail CSS styling");
-    } finally {
-      fs.rmSync(temp.root, { recursive: true, force: true });
-    }
+    assert.ok(result.hasSetCardId, "cards should set data-card-id attribute");
+    assert.ok(result.hasDelegateHandler, "should have event delegation for toggle buttons");
+    assert.ok(result.hasCreateDetail, "should have createDetailSection function");
+    assert.ok(result.hasCreateError, "should have createErrorSection function for fetch errors");
+    assert.ok(result.hasDetailCss, "should have card-detail CSS styles");
+    assert.ok(result.hasToggleMinus, "should have minus sign for toggle");
+    assert.ok(result.hasDetailFailureCss, "should have failure detail CSS styling");
   });
 
   it("US-005: styles detail section, handles missing data, preserves expanded state", () => {
-    const temp = createTempHome();
-    try {
-      const result = runNodeScript(
-        `
+    const temp = createTempHome(TMP_PREFIX);
+    const result = runNodeScript(
+      `
           import { once } from "node:events";
           import { getDb } from "./dist/db.js";
           import { createDashboardServer } from "./dist/server/dashboard.js";
@@ -307,38 +291,35 @@ describe("dashboard kanban view", () => {
             await new Promise((resolve) => server.close(() => resolve()));
           }
         `,
-        { HOME: temp.homeDir },
-      );
+      { HOME: temp.homeDir },
+    );
 
-      // Missing data placeholders
-      assert.ok(result.hasDetailPlaceholder, "should have detail-placeholder CSS class for missing data");
-      assert.ok(result.hasEmDash, "should have em-dash placeholder text");
+    // Missing data placeholders
+    assert.ok(result.hasDetailPlaceholder, "should have detail-placeholder CSS class for missing data");
+    assert.ok(result.hasEmDash, "should have em-dash placeholder text");
 
-      // Expanded state persistence
-      assert.ok(result.hasExpandedSet, "should have expandedCardIds Set for state persistence");
-      assert.ok(result.hasExpandedDelete, "should remove from expandedCardIds on collapse");
-      assert.ok(result.hasExpandedAdd, "should add to expandedCardIds on successful expand");
+    // Expanded state persistence
+    assert.ok(result.hasExpandedSet, "should have expandedCardIds Set for state persistence");
+    assert.ok(result.hasExpandedDelete, "should remove from expandedCardIds on collapse");
+    assert.ok(result.hasExpandedAdd, "should add to expandedCardIds on successful expand");
 
-      // Keyboard accessibility
-      assert.ok(result.hasKeydownHandler, "should have keydown handler for Enter/Space on toggle buttons");
+    // Keyboard accessibility
+    assert.ok(result.hasKeydownHandler, "should have keydown handler for Enter/Space on toggle buttons");
 
-      // Loading animation
-      assert.ok(result.hasLoadingBlink, "should have loading-blink CSS animation");
+    // Loading animation
+    assert.ok(result.hasLoadingBlink, "should have loading-blink CSS animation");
 
-      // Monospace font for prompts
-      assert.ok(result.hasMonoPrompt, "should have detail-prompt-text CSS for monospace prompts");
+    // Monospace font for prompts
+    assert.ok(result.hasMonoPrompt, "should have detail-prompt-text CSS for monospace prompts");
 
-      // Human-readable timing format
-      assert.ok(result.hasFmtDuration, "should have fmtDuration for human-readable timing");
+    // Human-readable timing format
+    assert.ok(result.hasFmtDuration, "should have fmtDuration for human-readable timing");
 
-      // Token k/M formatting
-      assert.ok(result.hasFmtTokens, "should have fmtTokens for k/M formatting");
+    // Token k/M formatting
+    assert.ok(result.hasFmtTokens, "should have fmtTokens for k/M formatting");
 
-      // Failure visual treatment
-      assert.ok(result.hasDetailFailure, "should have detail-failure-text for failure styling");
-    } finally {
-      fs.rmSync(temp.root, { recursive: true, force: true });
-    }
+    // Failure visual treatment
+    assert.ok(result.hasDetailFailure, "should have detail-failure-text for failure styling");
   });
 
   it("links the kanban view from each run row in index.html", () => {

@@ -58,6 +58,9 @@ afterEach(() => {
 // ── Helpers ──────────────────────────────────────────────────────
 
 function createTempHome(): string {
+  // Use mkdtempSync directly because this function is called from
+  // beforeEach(), and createTempHome's after() hook would fire
+  // immediately after beforeEach() instead of after the tests.
   return fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-doctor-svc-"));
 }
 

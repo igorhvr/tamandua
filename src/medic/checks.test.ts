@@ -17,7 +17,9 @@ describe("medic checks", () => {
     originalDbPath = process.env.TAMANDUA_DB_PATH;
     originalHome = process.env.HOME;
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-medic-checks-"));
-    dbPath = path.join(tempDir, ".tamandua", "tamandua.db");
+    const tamanduaDir = path.join(tempDir, ".tamandua");
+    fs.mkdirSync(tamanduaDir, { recursive: true });
+    dbPath = path.join(tamanduaDir, "tamandua.db");
     process.env.TAMANDUA_DB_PATH = dbPath;
     process.env.HOME = tempDir;
 

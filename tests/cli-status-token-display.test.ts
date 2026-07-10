@@ -1,6 +1,5 @@
 import fs from "node:fs";
-import { cleanChildEnv } from "./helpers/test-env.ts";
-import os from "node:os";
+import { cleanChildEnv, createTempHome } from "./helpers/test-env.ts";
 import path from "node:path";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
@@ -10,9 +9,10 @@ import { describe, it } from "node:test";
 const cliPath = path.resolve(process.cwd(), "dist", "cli", "cli.js");
 
 function createTempEnv() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-token-status-"));
-  const homeDir = path.join(root, "home");
-  const tamanduaDir = path.join(homeDir, ".tamandua");
+  const th = createTempHome("tamandua-token-status-");
+  const root = th.root;
+  const homeDir = th.homeDir;
+  const tamanduaDir = th.tamanduaDir;
   fs.mkdirSync(tamanduaDir, { recursive: true });
   return { root, homeDir, tamanduaDir };
 }

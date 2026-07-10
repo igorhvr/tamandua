@@ -11,10 +11,9 @@
  */
 
 import { describe, it } from "node:test";
-import { cleanChildEnv } from "./helpers/test-env.ts";
+import { cleanChildEnv, createTempHome } from "./helpers/test-env.ts";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -70,9 +69,7 @@ function cleanStderr(stderr: string): string {
     .trim();
 }
 
-function createTempHome(): string {
-  return fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-wfl-json-"));
-}
+const TMP_PREFIX = "tamandua-wfl-json-";
 
 // ═══════════════════════════════════════════════════════════════════
 // Tests
@@ -86,8 +83,7 @@ describe("tamandua workflow list --json", () => {
       return;
     }
 
-    const tempHome = createTempHome();
-    try {
+    const tempHome = createTempHome(TMP_PREFIX).homeDir;
       const { stdout, stderr, exitCode } = await runCli(["workflow", "list", "--json"], tempHome);
 
       assert.equal(exitCode, 0, `CLI exited with code ${exitCode}, stderr: ${stderr}`);
@@ -102,9 +98,6 @@ describe("tamandua workflow list --json", () => {
         assert.ok(typeof entry.name === "string" && entry.name.length > 0, `Entry missing or empty name: ${JSON.stringify(entry)}`);
         assert.ok(typeof entry.description === "string", `Entry missing description field: ${JSON.stringify(entry)}`);
       }
-    } finally {
-      fs.rmSync(tempHome, { recursive: true, force: true });
-    }
   });
 
   // AC 2: tamandua workflow list (without --json) still outputs human-readable format
@@ -114,8 +107,7 @@ describe("tamandua workflow list --json", () => {
       return;
     }
 
-    const tempHome = createTempHome();
-    try {
+    const tempHome = createTempHome(TMP_PREFIX).homeDir;
       const { stdout, stderr, exitCode } = await runCli(["workflow", "list"], tempHome);
 
       assert.equal(exitCode, 0, `CLI exited with code ${exitCode}, stderr: ${stderr}`);
@@ -129,9 +121,6 @@ describe("tamandua workflow list --json", () => {
         lines.some((l) => l.includes(" - ")),
         "Expected at least one line with ' - ' workflow description format",
       );
-    } finally {
-      fs.rmSync(tempHome, { recursive: true, force: true });
-    }
   });
 
   // AC 3: tamandua workflow list --help documents --json flag
@@ -141,8 +130,7 @@ describe("tamandua workflow list --json", () => {
       return;
     }
 
-    const tempHome = createTempHome();
-    try {
+    const tempHome = createTempHome(TMP_PREFIX).homeDir;
       const { stdout, stderr, exitCode } = await runCli(["workflow", "list", "--help"], tempHome);
 
       assert.equal(exitCode, 0, `CLI exited with code ${exitCode}, stderr: ${stderr}`);
@@ -156,9 +144,6 @@ describe("tamandua workflow list --json", () => {
         stdout.includes("JSON array"),
         `Help output should describe JSON array output:\n${stdout}`,
       );
-    } finally {
-      fs.rmSync(tempHome, { recursive: true, force: true });
-    }
   });
 
   // AC 4: Reasonable output even when something goes wrong
@@ -168,8 +153,7 @@ describe("tamandua workflow list --json", () => {
       return;
     }
 
-    const tempHome = createTempHome();
-    try {
+    const tempHome = createTempHome(TMP_PREFIX).homeDir;
       const { stdout, stderr, exitCode } = await runCli(["workflow", "list", "--json"], tempHome);
 
       assert.equal(exitCode, 0, `CLI exited with code ${exitCode}`);
@@ -181,8 +165,5 @@ describe("tamandua workflow list --json", () => {
       for (const entry of parsed) {
         assert.ok(typeof entry.description === "string", `description must be a string, got ${typeof entry.description} for ${entry.id}`);
       }
-    } finally {
-      fs.rmSync(tempHome, { recursive: true, force: true });
-    }
   });
 });

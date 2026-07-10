@@ -4,9 +4,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { logger, readRecentLogs, getLogPath, log, formatEntry } from "../../dist/lib/logger.js";
+import { createTempHome } from "../../tests/helpers/test-env.ts";
 
 const originalStateDir = process.env.TAMANDUA_STATE_DIR;
-const testStateDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-logger-"));
+const th = createTempHome("tamandua-logger-");
+const testStateDir = th.tamanduaDir;
 process.env.TAMANDUA_STATE_DIR = testStateDir;
 
 after(() => {
@@ -15,7 +17,6 @@ after(() => {
   } else {
     process.env.TAMANDUA_STATE_DIR = originalStateDir;
   }
-  fs.rmSync(testStateDir, { recursive: true, force: true });
 });
 
 describe("logger", () => {
@@ -266,14 +267,13 @@ describe("logger", () => {
 
   it("readRecentLogs returns empty array for non-existent log file", async () => {
     // Create a fresh temp dir with no log file yet
-    const emptyDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-logger-empty-"));
+    const th2 = createTempHome("tamandua-logger-empty-");
     try {
-      process.env.TAMANDUA_STATE_DIR = emptyDir;
+      process.env.TAMANDUA_STATE_DIR = th2.tamanduaDir;
       const lines = await readRecentLogs(10);
       assert.deepEqual(lines, []);
     } finally {
       process.env.TAMANDUA_STATE_DIR = testStateDir;
-      fs.rmSync(emptyDir, { recursive: true, force: true });
     }
   });
 });

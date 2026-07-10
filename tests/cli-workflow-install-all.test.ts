@@ -12,10 +12,9 @@
  */
 
 import { describe, it, before, after } from "node:test";
-import { cleanChildEnv } from "./helpers/test-env.ts";
+import { cleanChildEnv, createTempHome } from "./helpers/test-env.ts";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -72,17 +71,20 @@ function cleanStderr(stderr: string): string {
     .trim();
 }
 
-function createTempHome(): string {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-wfi-all-"));
+const TMP_PREFIX = "tamandua-wf-install-all-";
+
+function setupTempHome(): string {
+  const th = createTempHome(TMP_PREFIX);
+  const homeDir = th.homeDir;
   // Seed a minimal pi settings.json so installWorkflow's readPiConfig() succeeds
-  const piAgentDir = path.join(dir, ".pi", "agent");
+  const piAgentDir = path.join(homeDir, ".pi", "agent");
   fs.mkdirSync(piAgentDir, { recursive: true });
   fs.writeFileSync(
     path.join(piAgentDir, "settings.json"),
     JSON.stringify({ defaultProvider: "openai", defaultModel: "gpt-4o" }),
     "utf-8",
   );
-  return dir;
+  return homeDir;
 }
 
 /**
@@ -122,8 +124,7 @@ describe("tamandua workflow install --all", () => {
       return;
     }
 
-    const tempHome = createTempHome();
-    try {
+    const tempHome = setupTempHome();
       const { stdout, stderr, exitCode } = await runCli(
         ["workflow", "install", "--all"],
         tempHome,
@@ -164,9 +165,6 @@ describe("tamandua workflow install --all", () => {
         workflowAgents.length > 0,
         `Expected workflow-prefixed agents in agents.json, got: ${agents.map((a) => a.id).join(", ")}`,
       );
-    } finally {
-      fs.rmSync(tempHome, { recursive: true, force: true });
-    }
   });
 
   // AC 2: workflow install all (positional) also works
@@ -176,8 +174,7 @@ describe("tamandua workflow install --all", () => {
       return;
     }
 
-    const tempHome = createTempHome();
-    try {
+    const tempHome = setupTempHome();
       const { stdout, stderr, exitCode } = await runCli(
         ["workflow", "install", "all"],
         tempHome,
@@ -206,9 +203,6 @@ describe("tamandua workflow install --all", () => {
         stdout.includes("Done. Start with:"),
         "Expected 'Done. Start with:' message in output",
       );
-    } finally {
-      fs.rmSync(tempHome, { recursive: true, force: true });
-    }
   });
 
   // AC 3: workflow install <name> still installs a single workflow
@@ -218,8 +212,7 @@ describe("tamandua workflow install --all", () => {
       return;
     }
 
-    const tempHome = createTempHome();
-    try {
+    const tempHome = setupTempHome();
       const { stdout, stderr, exitCode } = await runCli(
         ["workflow", "install", "feature-dev"],
         tempHome,
@@ -268,9 +261,6 @@ describe("tamandua workflow install --all", () => {
         0,
         `Should not have agents from other workflows, got: ${otherAgents.map((a) => a.id).join(", ")}`,
       );
-    } finally {
-      fs.rmSync(tempHome, { recursive: true, force: true });
-    }
   });
 
   // AC 4: installed workflow directories exist on disk
@@ -280,8 +270,7 @@ describe("tamandua workflow install --all", () => {
       return;
     }
 
-    const tempHome = createTempHome();
-    try {
+    const tempHome = setupTempHome();
       const { stdout, stderr, exitCode } = await runCli(
         ["workflow", "install", "--all"],
         tempHome,
@@ -313,9 +302,6 @@ describe("tamandua workflow install --all", () => {
           `Expected workflow.yml in ${wfDir}`,
         );
       }
-    } finally {
-      fs.rmSync(tempHome, { recursive: true, force: true });
-    }
   });
 
   // Additional: verify metadata.json is written for each installed workflow
@@ -325,8 +311,7 @@ describe("tamandua workflow install --all", () => {
       return;
     }
 
-    const tempHome = createTempHome();
-    try {
+    const tempHome = setupTempHome();
       await runCli(["workflow", "install", "--all"], tempHome);
 
       const workflowsRoot = path.join(tempHome, ".tamandua", "workflows");
@@ -345,9 +330,6 @@ describe("tamandua workflow install --all", () => {
         assert.ok(metadata.source, "metadata.json should have source");
         assert.ok(metadata.installedAt, "metadata.json should have installedAt");
       }
-    } finally {
-      fs.rmSync(tempHome, { recursive: true, force: true });
-    }
   });
 
   // Additional: agents.json entries have workspace and agentDir paths
@@ -357,8 +339,7 @@ describe("tamandua workflow install --all", () => {
       return;
     }
 
-    const tempHome = createTempHome();
-    try {
+    const tempHome = setupTempHome();
       await runCli(["workflow", "install", "--all"], tempHome);
 
       const agents = readAgentsList(tempHome);
@@ -390,8 +371,5 @@ describe("tamandua workflow install --all", () => {
         assert.ok(config, `Agent ${agent.id} should have config`);
         assert.ok(typeof config?.role === "string", `Agent ${agent.id} config should have role`);
       }
-    } finally {
-      fs.rmSync(tempHome, { recursive: true, force: true });
-    }
   });
 });

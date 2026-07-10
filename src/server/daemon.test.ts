@@ -7,7 +7,7 @@ import path from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
-import { cleanChildEnv, reserveRandomPort } from "../../tests/helpers/test-env.ts";
+import { cleanChildEnv, reserveRandomPort, createTempHome } from "../../tests/helpers/test-env.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DAEMON_SCRIPT = path.resolve(__dirname, "..", "..", "dist", "server", "daemon.js");
@@ -142,7 +142,7 @@ describe("version check integration", () => {
     }
     const controlPort = await reserveRandomPort();
 
-    const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-daemon-home-"));
+    const { homeDir: tempHome } = createTempHome("tamandua-daemon-home-");
     const { child } = spawnDaemon(dashboardPort, tempHome, controlPort);
 
     try {
@@ -177,7 +177,6 @@ describe("version check integration", () => {
       await waitForHttpDown(`http://127.0.0.1:${dashboardPort}/api/health`);
     } finally {
       await forceKillIfAlive(child);
-      fs.rmSync(tempHome, { recursive: true, force: true });
     }
   });
 
@@ -189,7 +188,7 @@ describe("version check integration", () => {
     }
     const controlPort = await reserveRandomPort();
 
-    const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-daemon-home-"));
+    const { homeDir: tempHome } = createTempHome("tamandua-daemon-home-");
 
     const startTime = Date.now();
     const { child } = spawnDaemon(dashboardPort, tempHome, controlPort);
@@ -211,7 +210,6 @@ describe("version check integration", () => {
       await waitForHttpDown(`http://127.0.0.1:${dashboardPort}/api/health`);
     } finally {
       await forceKillIfAlive(child);
-      fs.rmSync(tempHome, { recursive: true, force: true });
     }
   });
 
@@ -223,7 +221,7 @@ describe("version check integration", () => {
     }
     const controlPort = await reserveRandomPort();
 
-    const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-daemon-home-"));
+    const { homeDir: tempHome } = createTempHome("tamandua-daemon-home-");
     const { child } = spawnDaemon(dashboardPort, tempHome, controlPort);
 
     try {
@@ -242,7 +240,6 @@ describe("version check integration", () => {
       assert.equal(fs.existsSync(pidFile), false);
     } finally {
       await forceKillIfAlive(child);
-      fs.rmSync(tempHome, { recursive: true, force: true });
     }
   });
 });
@@ -257,7 +254,7 @@ describe("dashboard daemon (MCP decoupled)", { concurrency: 1 }, () => {
 
     const controlPort = await reserveRandomPort();
 
-    const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-daemon-home-"));
+    const { homeDir: tempHome } = createTempHome("tamandua-daemon-home-");
     const { child } = spawnDaemon(dashboardPort, tempHome, controlPort);
 
     try {
@@ -277,7 +274,6 @@ describe("dashboard daemon (MCP decoupled)", { concurrency: 1 }, () => {
       assert.equal(fs.existsSync(pidFile), false);
     } finally {
       await forceKillIfAlive(child);
-      fs.rmSync(tempHome, { recursive: true, force: true });
     }
   });
 
@@ -295,7 +291,7 @@ describe("dashboard daemon (MCP decoupled)", { concurrency: 1 }, () => {
 
     const controlPort = await reserveRandomPort();
 
-    const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-daemon-home-"));
+    const { homeDir: tempHome } = createTempHome("tamandua-daemon-home-");
     const { child } = spawnDaemon(dashboardPort, tempHome, controlPort, ["--with-mcp", "--mcp-port", String(mcpPort)]);
 
     try {
@@ -316,7 +312,6 @@ describe("dashboard daemon (MCP decoupled)", { concurrency: 1 }, () => {
       assert.equal(fs.existsSync(pidFile), false);
     } finally {
       await forceKillIfAlive(child);
-      fs.rmSync(tempHome, { recursive: true, force: true });
     }
   });
 
@@ -331,7 +326,7 @@ describe("dashboard daemon (MCP decoupled)", { concurrency: 1 }, () => {
 
     const controlPort = await reserveRandomPort();
 
-    const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-daemon-home-"));
+    const { homeDir: tempHome } = createTempHome("tamandua-daemon-home-");
     const { child } = spawnDaemon(dashboardPort, tempHome, controlPort, [
       "--with-mcp",
       "--mcp-port",
@@ -353,7 +348,6 @@ describe("dashboard daemon (MCP decoupled)", { concurrency: 1 }, () => {
       await waitForHttpDown(`http://127.0.0.1:${customMcpPort}/mcp`);
     } finally {
       await forceKillIfAlive(child);
-      fs.rmSync(tempHome, { recursive: true, force: true });
     }
   });
 
@@ -376,7 +370,7 @@ describe("dashboard daemon (MCP decoupled)", { concurrency: 1 }, () => {
 
     const controlPort = await reserveRandomPort();
 
-    const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-daemon-home-"));
+    const { homeDir: tempHome } = createTempHome("tamandua-daemon-home-");
     const { child, getOutput } = spawnDaemon(dashboardPort, tempHome, controlPort, ["--with-mcp", "--mcp-port", String(blockerPort)]);
 
     try {
@@ -394,7 +388,6 @@ describe("dashboard daemon (MCP decoupled)", { concurrency: 1 }, () => {
     } finally {
       await forceKillIfAlive(child);
       await closeServer(blocker);
-      fs.rmSync(tempHome, { recursive: true, force: true });
     }
   });
 });
