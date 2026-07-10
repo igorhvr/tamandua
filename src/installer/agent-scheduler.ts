@@ -1031,6 +1031,39 @@ export async function executeDispatchRound(
       });
     }
 
+    // ── PGID liveness watchdog (global sweep) ───────────────────
+    // Runs BEFORE the stale-claim sweeper so liveness detection fires first.
+    // A worker that dies without the round tracker noticing (kill -9, daemon
+    // restart orphan, machine sleep) leaves its claim held until the slow
+    // timeout×1.5 sweeper; this check recovers it within one tick (~15s).
+    try {
+      const { checkRunningWorkersLiveness } = await import("./step-ops.js");
+      const livenessResult = checkRunningWorkersLiveness();
+      if (livenessResult.recovered > 0 || livenessResult.failed > 0 || livenessResult.skipped > 0) {
+        logger.info("PGID liveness watchdog sweep completed", {
+          ...context,
+          recovered: livenessResult.recovered,
+          failed: livenessResult.failed,
+          skipped: livenessResult.skipped,
+        });
+      }
+      // Nudge affected runs so recovered steps are dispatched immediately.
+      if (livenessResult.runIds.length > 0) {
+        nudgeScheduledRuns(livenessResult.runIds).catch((nudgeErr) => {
+          logger.warn("Liveness watchdog nudge failed", {
+            ...context,
+            runIds: livenessResult.runIds,
+            error: nudgeErr instanceof Error ? nudgeErr.message : String(nudgeErr),
+          });
+        });
+      }
+    } catch (livenessErr) {
+      logger.warn("PGID liveness watchdog sweep failed", {
+        ...context,
+        error: livenessErr instanceof Error ? livenessErr.message : String(livenessErr),
+      });
+    }
+
     // ── Stale-claim sweeper (run-scoped) ───────────────────────────
     try {
       const staleThresholdMs = timeout * 1.5 * 1000;

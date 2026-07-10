@@ -352,6 +352,59 @@ baseline assertions.
   refuse to signal the daemon named by TAMANDUA_WORKER_PID — an agent can
   no longer stop the very daemon scheduling it
   (`src/server/daemonctl-self-stop-guard.test.ts`).
+- **C23 (WDOG — per-tick PGID liveness watchdog)** Every dispatch round
+  tick (`executeDispatchRound`) runs a PGID-based liveness check
+  (`checkRunningWorkersLiveness` in `src/installer/step-ops.ts`) BEFORE the
+  stale-claim sweeper, providing minutes-to-seconds recovery for steps
+  claimed by workers whose process group has died.
+
+  **How it works:** For every step in `status='running'` with a `claim_pgid`
+  set, the watchdog probes `process.kill(-pgid, 0)` — works on both Linux
+  and macOS (no `/proc` dependency).  ESRCH means the process group is dead;
+  EPERM means it exists but belongs to another user (treated as alive).
+  Steps WITHOUT a `claim_pgid` (legacy/manual claims) are SKIPPED — they
+  fall back to the existing timeout × 1.5 sweeper (C18).
+
+  **Grace period:** Claims younger than `LIVENESS_GRACE_PERIOD_MS` (30 s)
+  are skipped to avoid racing a round that just finished and is
+  mid-report.  Claims with a NULL `claim_updated_at` are also skipped
+  conservatively (cannot determine freshness).
+
+  **Recovery:** Dead-PGID claims are recovered via
+  `recoverOrphanedStepsForAgent` with `detailPrefix: "liveness-detected"`,
+  so dashboards/logs can distinguish liveness-triggered recovery from
+  timeout-based sweeper recovery and CLMR round-completion release.
+  Story-level recovery uses the `abandoned_count` budget (C22/WLST
+  semantics), not `retry_count`.  After recovery, affected runIds are
+  nudged for immediate dispatch.
+
+  **Safety:** The watchdog NEVER kills processes — it only releases
+  claims of already-dead workers.  PID reuse is safe: if a pgid happens
+  to be reused (alive again), the claim is left untouched; a dead
+  detection on a reused-then-again-dead pgid causes at worst a delayed
+  recovery (falls back to the timeout sweeper), never a false kill.
+
+  **Relationship to other recovery paths:**
+  - **Stale-claim sweeper (C18):** Blunt timeout × 1.5 (up to 45 min)
+    for steps with stale claims — covers legacy/ownerless claims and
+    serves as the safety net when liveness detection misses.
+  - **CLMR (round-completion immediate release):** Fires when a dispatch
+    round's work round tracker sees the round END with outcome `no_work`
+    — fast but only triggers when the round tracker is aware of the
+    round.
+  - **WDOG (this clause):** Covers the gap — a worker that dies WITHOUT
+    the round tracker noticing (daemon restart orphans, kill -9, machine
+    sleep, harness crash mid-round) is detected within one tick (~15 s)
+    via process-group liveness, recovering the step in seconds.
+
+  **Zero tokens:** The check is pure process/DB inspection — no model
+  calls, no extra polling loops (piggybacks on the existing dispatch
+  tick).  Idle rounds produce no log noise.
+
+  Pinned by `tests/dead-worker-recovery.test.ts` (C23 PGID liveness
+  watchdog tests covering dead-pgid recovery, live-pgid untouched,
+  ownerless skipped, grace period respected, event detail prefix,
+  and story-level abandon accounting).
 
 ### Post-grace process cleanup sweep
 

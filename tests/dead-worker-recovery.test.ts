@@ -578,3 +578,601 @@ describe("recoverOrphanedStepsForAgent — timeout_retry feedback (story-level)"
       `feedback should include actionable guidance: ${ctx.timeout_retry}`);
   });
 });
+
+// ══════════════════════════════════════════════════════════════════════
+// US-001 PGID Liveness Watchdog — checkRunningWorkersLiveness
+// ══════════════════════════════════════════════════════════════════════
+
+/**
+ * Seed a step with claim_pgid and claim_updated_at for liveness testing.
+ */
+function seedRunWithPgidStep(opts: {
+  claimPgid: number | null;
+  claimJobId?: string | null;
+  runStatus?: string;
+  maxRetries?: number;
+  retryCount?: number;
+  backdateClaimMs?: number; // milliseconds to subtract from claim_updated_at
+}): { runId: string; stepId: string; agentId: string } {
+  const db = getDb();
+  const runId = crypto.randomUUID();
+  const stepId = crypto.randomUUID();
+  const agentId = "wf-dead_dev";
+  const now = new Date().toISOString();
+  const claimUpdatedAt = opts.backdateClaimMs != null
+    ? new Date(Date.now() - opts.backdateClaimMs).toISOString()
+    : now;
+  db.prepare(
+    "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 'wf-dead', 'task', ?, '{}', 0, ?, ?)",
+  ).run(runId, opts.runStatus ?? "running", now, now);
+  db.prepare(
+    `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status,
+       retry_count, max_retries, claim_pid, claim_pgid, claim_job_id, claim_updated_at, created_at, updated_at)
+     VALUES (?, ?, 'work', ?, 0, 'work', '', 'running', ?, ?, 999999, ?, ?, ?, ?, ?)`,
+  ).run(
+    stepId, runId, agentId,
+    opts.retryCount ?? 0, opts.maxRetries ?? 3,
+    opts.claimPgid, opts.claimJobId ?? "tamandua-wf-dead-job",
+    claimUpdatedAt, now, now,
+  );
+  return { runId, stepId, agentId };
+}
+
+describe("checkRunningWorkersLiveness (US-001)", () => {
+  it("recovers a step whose claim_pgid is dead", async () => {
+    const { spawnSync } = await import("node:child_process");
+    const { checkRunningWorkersLiveness } = await import("../dist/installer/step-ops.js");
+    const deadPgid = spawnSync("true").pid ?? 999997;
+    const { runId, stepId } = seedRunWithPgidStep({
+      claimPgid: deadPgid,
+      backdateClaimMs: 60_000, // 60s old, well past grace period
+    });
+
+    const result = checkRunningWorkersLiveness();
+
+    assert.equal(result.recovered, 1, "dead-pgid step should be recovered");
+    assert.deepEqual(result.runIds, [runId]);
+    const step = stepStatus(stepId);
+    assert.equal(step.status, "pending", "step should be requeued for retry");
+    assert.equal(step.retry_count, 1, "a retry slot is consumed");
+  });
+
+  it("leaves steps with a live process group alone", async () => {
+    const { checkRunningWorkersLiveness } = await import("../dist/installer/step-ops.js");
+    const { getOwnProcessGroupId } = await import("../dist/installer/step-ops.js");
+    // Use our own process GROUP id — it's definitely alive.
+    const ownPgid = getOwnProcessGroupId();
+    assert.ok(ownPgid && ownPgid > 0, "must self-detect a positive pgid");
+    const { stepId } = seedRunWithPgidStep({
+      claimPgid: ownPgid,
+      backdateClaimMs: 60_000,
+    });
+
+    const result = checkRunningWorkersLiveness();
+
+    assert.equal(result.recovered, 0, "live pgid must NOT be recovered");
+    assert.equal(result.skipped, 0);
+    assert.equal(stepStatus(stepId).status, "running");
+  });
+
+  it("skips steps without claim_pgid (ownerless/legacy)", async () => {
+    const { checkRunningWorkersLiveness } = await import("../dist/installer/step-ops.js");
+    // claim_pgid = null, claim_updated_at = null — legacy claim
+    const { stepId } = seedRunWithPgidStep({
+      claimPgid: null,
+      backdateClaimMs: 60_000,
+    });
+
+    const result = checkRunningWorkersLiveness();
+
+    assert.equal(result.recovered, 0, "ownerless claims must be skipped");
+    assert.equal(result.skipped, 0);
+    assert.equal(stepStatus(stepId).status, "running", "left for timeout sweeper");
+  });
+
+  it("respects grace period: skips claims younger than 30s", async () => {
+    const { spawnSync } = await import("node:child_process");
+    const { checkRunningWorkersLiveness } = await import("../dist/installer/step-ops.js");
+    const deadPgid = spawnSync("true").pid ?? 999996;
+    // Only 10s old — within grace period
+    const { stepId } = seedRunWithPgidStep({
+      claimPgid: deadPgid,
+      backdateClaimMs: 10_000,
+    });
+
+    const result = checkRunningWorkersLiveness();
+
+    assert.equal(result.skipped, 1, "claim within grace period must be skipped");
+    assert.equal(result.recovered, 0);
+    assert.equal(stepStatus(stepId).status, "running", "step left alone during grace period");
+  });
+
+  it("does not skip claims just past the grace period (31s old)", async () => {
+    const { spawnSync } = await import("node:child_process");
+    const { checkRunningWorkersLiveness } = await import("../dist/installer/step-ops.js");
+    const deadPgid = spawnSync("true").pid ?? 999995;
+    // 31s old — just past the 30s grace period boundary
+    const { runId, stepId } = seedRunWithPgidStep({
+      claimPgid: deadPgid,
+      backdateClaimMs: 31_000,
+    });
+
+    const result = checkRunningWorkersLiveness();
+
+    assert.equal(result.recovered, 1, "step just past grace period should be recovered");
+    assert.deepEqual(result.runIds, [runId]);
+    assert.equal(stepStatus(stepId).status, "pending");
+  });
+
+  it("skips steps with NULL claim_updated_at (conservative fallback)", async () => {
+    const { spawnSync } = await import("node:child_process");
+    const { checkRunningWorkersLiveness } = await import("../dist/installer/step-ops.js");
+    const deadPgid = spawnSync("true").pid ?? 999994;
+    // claim_updated_at not backdated — it's set in the seed function to now
+    // So we NULL it out after seeding
+    const { stepId } = seedRunWithPgidStep({
+      claimPgid: deadPgid,
+      backdateClaimMs: 60_000,
+    });
+    // Manually set claim_updated_at to NULL
+    getDb().prepare("UPDATE steps SET claim_updated_at = NULL WHERE id = ?").run(stepId);
+
+    const result = checkRunningWorkersLiveness();
+
+    assert.equal(result.skipped, 1, "NULL claim_updated_at — can't determine age, skip");
+    assert.equal(result.recovered, 0);
+    assert.equal(stepStatus(stepId).status, "running", "left for timeout sweeper");
+  });
+
+  it("emits step.worker_lost event with [liveness-detected] detail prefix", async () => {
+    const { spawnSync } = await import("node:child_process");
+    const { checkRunningWorkersLiveness } = await import("../dist/installer/step-ops.js");
+    const deadPgid = spawnSync("true").pid ?? 999993;
+    const { stepId } = seedRunWithPgidStep({
+      claimPgid: deadPgid,
+      backdateClaimMs: 60_000,
+    });
+
+    // Verify the step was recovered before checking events
+    const result = checkRunningWorkersLiveness();
+    assert.equal(result.recovered, 1, "step must be recovered for event to exist");
+
+    // Read the events file and check the detail
+    const eventsPath = path.join(process.env.TAMANDUA_STATE_DIR!, "events", "all.jsonl");
+    let foundLivenessEvent = false;
+    try {
+      const events = fs.readFileSync(eventsPath, "utf-8");
+      for (const line of events.split("\n")) {
+        if (!line.trim()) continue;
+        try {
+          const evt = JSON.parse(line);
+          if (evt.event === "step.worker_lost" && evt.detail && evt.detail.includes("[liveness-detected]")) {
+            foundLivenessEvent = true;
+            assert.ok(evt.detail.includes("exited"), "detail should describe worker exit");
+            break;
+          }
+        } catch {
+          // skip malformed JSON lines
+        }
+      }
+    } catch {
+      // events file may not exist — that's also a test failure
+    }
+    assert.ok(foundLivenessEvent,
+      "must emit step.worker_lost with [liveness-detected] in detail");
+  });
+
+  it("does NOT emit liveness-detected events when no dead workers exist", async () => {
+    const { checkRunningWorkersLiveness, getOwnProcessGroupId } = await import("../dist/installer/step-ops.js");
+    const ownPgid = getOwnProcessGroupId();
+    assert.ok(ownPgid && ownPgid > 0, "must self-detect a positive pgid");
+    // Live pgid only
+    seedRunWithPgidStep({
+      claimPgid: ownPgid,
+      backdateClaimMs: 60_000,
+    });
+
+    checkRunningWorkersLiveness();
+
+    const eventsPath = path.join(process.env.TAMANDUA_STATE_DIR!, "events", "all.jsonl");
+    let foundLivenessEvent = false;
+    try {
+      const events = fs.readFileSync(eventsPath, "utf-8");
+      for (const line of events.split("\n")) {
+        if (!line.trim()) continue;
+        try {
+          const evt = JSON.parse(line);
+          if (evt.event === "step.worker_lost" && evt.detail && evt.detail.includes("[liveness-detected]")) {
+            foundLivenessEvent = true;
+          }
+        } catch {
+          // skip
+        }
+      }
+    } catch {
+      // no events file means no events — good
+    }
+    assert.equal(foundLivenessEvent, false,
+      "must NOT emit liveness-detected events when all workers are alive");
+  });
+
+  it("recovers multiple dead-pgid steps across runs in one sweep", async () => {
+    const { spawnSync } = await import("node:child_process");
+    const { checkRunningWorkersLiveness } = await import("../dist/installer/step-ops.js");
+    const deadPgidA = spawnSync("true").pid ?? 999992;
+    const deadPgidB = spawnSync("true").pid ?? 999991;
+    const { runId: runA, stepId: stepA } = seedRunWithPgidStep({
+      claimPgid: deadPgidA,
+      backdateClaimMs: 60_000,
+    });
+    const { runId: runB, stepId: stepB } = seedRunWithPgidStep({
+      claimPgid: deadPgidB,
+      backdateClaimMs: 60_000,
+    });
+
+    const result = checkRunningWorkersLiveness();
+
+    assert.equal(result.recovered, 2, "both dead-pgid steps should be recovered");
+    assert.equal(new Set(result.runIds).size, 2);
+    assert.equal(stepStatus(stepA).status, "pending");
+    assert.equal(stepStatus(stepB).status, "pending");
+  });
+
+  it("exhausts retries and fails the run when the dead worker burned the last retry", async () => {
+    const { spawnSync } = await import("node:child_process");
+    const { checkRunningWorkersLiveness } = await import("../dist/installer/step-ops.js");
+    const deadPgid = spawnSync("true").pid ?? 999990;
+    const { runId, stepId } = seedRunWithPgidStep({
+      claimPgid: deadPgid,
+      backdateClaimMs: 60_000,
+      retryCount: 3,
+      maxRetries: 3,
+    });
+
+    const result = checkRunningWorkersLiveness();
+
+    assert.equal(result.failed, 1, "step should fail when retries exhausted");
+    assert.equal(stepStatus(stepId).status, "failed");
+    const run = getDb().prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string };
+    assert.equal(run.status, "failed");
+  });
+
+  it("ignores steps with claim_pgid = 0 (not a valid pgid)", async () => {
+    const { checkRunningWorkersLiveness } = await import("../dist/installer/step-ops.js");
+    const { stepId } = seedRunWithPgidStep({
+      claimPgid: 0,
+      backdateClaimMs: 60_000,
+    });
+
+    const result = checkRunningWorkersLiveness();
+
+    assert.equal(result.recovered, 0, "claim_pgid=0 must be skipped (query uses > 0)");
+    assert.equal(stepStatus(stepId).status, "running");
+  });
+
+  // ═══════════════════════════════════════════════════════════════════
+  // US-003: Story-level abandon accounting via liveness watchdog
+  // ═══════════════════════════════════════════════════════════════════
+
+  it("increments story.abandoned_count (not retry_count) for dead-pgid story-level recovery", async () => {
+    const { spawnSync } = await import("node:child_process");
+    const { checkRunningWorkersLiveness } = await import("../dist/installer/step-ops.js");
+    const deadPgid = spawnSync("true").pid ?? 999989;
+
+    // Seed a story+loop step, then assign a dead PGID with backdated claim
+    const { runId, storyRowId, stepRowId } = seedStoryRun({
+      agentId: "wf-dead_dev",
+      abandonedCount: 0,
+      retryCount: 2,
+      backdateSeconds: 60,
+    });
+
+    const db = getDb();
+    const backdatedClaim = new Date(Date.now() - 60_000).toISOString();
+    db.prepare(
+      "UPDATE steps SET claim_pgid = ?, claim_pid = 999999, claim_job_id = 'job-liveness-story', claim_updated_at = ? WHERE id = ?"
+    ).run(deadPgid, backdatedClaim, stepRowId);
+
+    const result = checkRunningWorkersLiveness();
+
+    assert.equal(result.recovered, 1, "dead-pgid story step should be recovered");
+    assert.deepEqual(result.runIds, [runId]);
+
+    const story = storyState(storyRowId);
+    assert.equal(story.status, "pending", "story should be reset to pending");
+    assert.equal(story.abandoned_count, 1, "abandoned_count should increment from 0 to 1");
+    assert.equal(story.retry_count, 2, "retry_count should be UNCHANGED (not mixed with infra failures)");
+
+    // Step should be reset to pending with current_story_id cleared
+    const step = getDb().prepare(
+      "SELECT status, current_story_id FROM steps WHERE id = ?"
+    ).get(stepRowId) as { status: string; current_story_id: string | null };
+    assert.equal(step.status, "pending", "step should be reset to pending");
+    assert.equal(step.current_story_id, null, "current_story_id should be cleared");
+  });
+
+  it("emits step.worker_lost with [liveness-detected] and story info for story-level recovery", async () => {
+    const { spawnSync } = await import("node:child_process");
+    const { checkRunningWorkersLiveness } = await import("../dist/installer/step-ops.js");
+    const deadPgid = spawnSync("true").pid ?? 999988;
+
+    const { storyRowId, stepRowId } = seedStoryRun({
+      agentId: "wf-dead_dev",
+      abandonedCount: 0,
+      retryCount: 0,
+      backdateSeconds: 60,
+    });
+
+    const db = getDb();
+    const backdatedClaim = new Date(Date.now() - 60_000).toISOString();
+    db.prepare(
+      "UPDATE steps SET claim_pgid = ?, claim_pid = 999999, claim_job_id = 'job-liveness-story2', claim_updated_at = ? WHERE id = ?"
+    ).run(deadPgid, backdatedClaim, stepRowId);
+
+    const result = checkRunningWorkersLiveness();
+    assert.equal(result.recovered, 1, "step must be recovered for event to exist");
+
+    // Read the events file and verify the detail
+    const eventsPath = path.join(process.env.TAMANDUA_STATE_DIR!, "events", "all.jsonl");
+    let foundLivenessStoryEvent = false;
+    try {
+      const events = fs.readFileSync(eventsPath, "utf-8");
+      for (const line of events.split("\n")) {
+        if (!line.trim()) continue;
+        try {
+          const evt = JSON.parse(line);
+          if (evt.event === "step.worker_lost" && evt.detail) {
+            if (evt.detail.includes("[liveness-detected]") && evt.detail.includes("story")) {
+              foundLivenessStoryEvent = true;
+              assert.ok(
+                evt.detail.includes("exited without completing story"),
+                `detail should mention incomplete story: ${evt.detail}`
+              );
+              assert.ok(
+                evt.detail.includes("reset to pending"),
+                `detail should mention reset to pending: ${evt.detail}`
+              );
+              assert.ok(
+                evt.detail.includes("story abandon 1/8"),
+                `detail should include abandon count (1/8): ${evt.detail}`
+              );
+              break;
+            }
+          }
+        } catch {
+          // skip malformed JSON lines
+        }
+      }
+    } catch {
+      // events file may not exist
+    }
+    assert.ok(foundLivenessStoryEvent,
+      "must emit step.worker_lost with [liveness-detected] and story abandon info");
+  });
+
+  it("exhausts story abandon budget via liveness watchdog and fails story/run", async () => {
+    const { spawnSync } = await import("node:child_process");
+    const { checkRunningWorkersLiveness } = await import("../dist/installer/step-ops.js");
+    const deadPgid = spawnSync("true").pid ?? 999987;
+
+    // Seed a story already at ABANDON_STORY_MAX (8) abandon count
+    const { runId, storyRowId, stepRowId } = seedStoryRun({
+      agentId: "wf-dead_dev",
+      abandonedCount: 8,
+      retryCount: 0,
+      backdateSeconds: 60,
+    });
+
+    const db = getDb();
+    const backdatedClaim = new Date(Date.now() - 60_000).toISOString();
+    db.prepare(
+      "UPDATE steps SET claim_pgid = ?, claim_pid = 999999, claim_job_id = 'job-liveness-story3', claim_updated_at = ? WHERE id = ?"
+    ).run(deadPgid, backdatedClaim, stepRowId);
+
+    const result = checkRunningWorkersLiveness();
+
+    assert.equal(result.failed, 1, "story should be failed on abandon exhaustion");
+    assert.equal(result.recovered, 0, "story should not be recovered when exhausted");
+
+    const story = storyState(storyRowId);
+    assert.equal(story.status, "failed", "story should be failed");
+    assert.equal(story.abandoned_count, 9, "abandoned_count should be 9 (exhausted)");
+
+    const run = getDb().prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string };
+    assert.equal(run.status, "failed", "run should be failed");
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════
+// US-002 Liveness Watchdog Integration — executeDispatchRound wiring
+// ══════════════════════════════════════════════════════════════════════
+
+describe("liveness watchdog in executeDispatchRound (US-002)", () => {
+  it("recovers dead-pgid steps during dispatch round tick", async () => {
+    const deadPgid = spawnSync("true").pid ?? 999980;
+    const deadWorkerRunId = crypto.randomUUID();
+    const deadWorkerStepId = crypto.randomUUID();
+    const dispatchRunId = crypto.randomUUID();
+    const claimUpdatedAt = new Date(Date.now() - 60_000).toISOString();
+    const now = new Date().toISOString();
+    const db = getDb();
+
+    // Seed a step with a dead PGID (simulating worker that died)
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 'wf-live-int', 'task', 'running', '{}', 0, ?, ?)",
+    ).run(deadWorkerRunId, now, now);
+    db.prepare(
+      `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status,
+         retry_count, max_retries, claim_pid, claim_pgid, claim_job_id, claim_updated_at, created_at, updated_at)
+       VALUES (?, ?, 'work', 'wf-live-int_dev', 0, 'work', '', 'running', 0, 5, 999999, ?, 'job-dead', ?, ?, ?)`,
+    ).run(deadWorkerStepId, deadWorkerRunId, deadPgid, claimUpdatedAt, now, now);
+
+    // Seed an EMPTY dispatch run (different agent with no steps — peek returns NO_WORK)
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 'wf-live-int', 'task', 'running', '{}', 0, ?, ?)",
+    ).run(dispatchRunId, now, now);
+
+    const { executeDispatchRound } = await import("../dist/installer/agent-scheduler.js");
+    const { nudgeScheduledRuns } = await import("../dist/installer/agent-scheduler.js");
+
+    // Track nudge calls to verify the integration
+    const nudgedRunIds: string[][] = [];
+    const origNudge = nudgeScheduledRuns;
+    // We can't easily mock dynamic imports, so instead we verify the outcome
+    // by calling executeDispatchRound and checking the step was recovered.
+    const job: import("../dist/installer/agent-scheduler.js").CronJobInfo = {
+      id: "job-live-int",
+      workflowId: "wf-live-int",
+      agentId: "wf-live-int_other",
+      runId: dispatchRunId,
+      timeoutSeconds: 30,
+      workingDirectoryForHarness: process.cwd(),
+      harnessType: "pi",
+      createdAt: now,
+    };
+
+    const agent: import("../dist/installer/types.js").WorkflowAgent = {
+      id: "other",
+      role: "coding",
+      workspace: { baseDir: process.cwd(), files: {} },
+    };
+
+    try {
+      await executeDispatchRound(job, agent);
+    } catch {
+      // executeDispatchRound may throw if workspace / persona resolution fails
+      // in the test env — that's fine, the liveness check already ran
+    }
+
+    // The dead-PGID step should have been recovered by the liveness watchdog
+    const step = stepStatus(deadWorkerStepId);
+    assert.equal(
+      step.status,
+      "pending",
+      `dead-pgid step should be recovered to pending during dispatch round, got ${step.status}`,
+    );
+
+    // Verify a retry slot was consumed
+    assert.equal(step.retry_count, 1, "recovery should consume a retry slot");
+  });
+
+  it("leaves live-pgid steps untouched during dispatch round", async () => {
+    const { getOwnProcessGroupId } = await import("../dist/installer/step-ops.js");
+    const ownPgid = getOwnProcessGroupId();
+    assert.ok(ownPgid && ownPgid > 0, "must self-detect a positive pgid");
+
+    const liveRunId = crypto.randomUUID();
+    const liveStepId = crypto.randomUUID();
+    const dispatchRunId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    const db = getDb();
+
+    // Seed a step with our own (live) PGID
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 'wf-live-int', 'task', 'running', '{}', 0, ?, ?)",
+    ).run(liveRunId, now, now);
+    db.prepare(
+      `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status,
+         retry_count, max_retries, claim_pid, claim_pgid, claim_job_id, claim_updated_at, created_at, updated_at)
+       VALUES (?, ?, 'work', 'wf-live-int_dev', 0, 'work', '', 'running', 0, 3, 999999, ?, 'job-live', ?, ?, ?)`,
+    ).run(liveStepId, liveRunId, ownPgid, now, now, now);
+
+    // Empty dispatch run
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 'wf-live-int', 'task', 'running', '{}', 0, ?, ?)",
+    ).run(dispatchRunId, now, now);
+
+    const { executeDispatchRound } = await import("../dist/installer/agent-scheduler.js");
+
+    const job: import("../dist/installer/agent-scheduler.js").CronJobInfo = {
+      id: "job-live-int2",
+      workflowId: "wf-live-int",
+      agentId: "wf-live-int_other",
+      runId: dispatchRunId,
+      timeoutSeconds: 30,
+      workingDirectoryForHarness: process.cwd(),
+      harnessType: "pi",
+      createdAt: now,
+    };
+
+    const agent: import("../dist/installer/types.js").WorkflowAgent = {
+      id: "other",
+      role: "coding",
+      workspace: { baseDir: process.cwd(), files: {} },
+    };
+
+    try {
+      await executeDispatchRound(job, agent);
+    } catch {
+      // ignore workspace resolution errors — liveness check already ran
+    }
+
+    // The live-PGID step should NOT have been touched
+    const step = stepStatus(liveStepId);
+    assert.equal(
+      step.status,
+      "running",
+      `live-pgid step must remain running, got ${step.status}`,
+    );
+  });
+
+  it("does not produce log noise when no dead workers exist (idle round)", async () => {
+    // This test verifies that idle rounds don't emit liveness-detected events.
+    // Seed an empty dispatch run — no steps with claim_pgid at all.
+    const dispatchRunId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    const db = getDb();
+
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 'wf-live-int', 'task', 'running', '{}', 0, ?, ?)",
+    ).run(dispatchRunId, now, now);
+
+    const { executeDispatchRound } = await import("../dist/installer/agent-scheduler.js");
+
+    const job: import("../dist/installer/agent-scheduler.js").CronJobInfo = {
+      id: "job-live-int3",
+      workflowId: "wf-live-int",
+      agentId: "wf-live-int_other",
+      runId: dispatchRunId,
+      timeoutSeconds: 30,
+      workingDirectoryForHarness: process.cwd(),
+      harnessType: "pi",
+      createdAt: now,
+    };
+
+    const agent: import("../dist/installer/types.js").WorkflowAgent = {
+      id: "other",
+      role: "coding",
+      workspace: { baseDir: process.cwd(), files: {} },
+    };
+
+    try {
+      await executeDispatchRound(job, agent);
+    } catch {
+      // ignore workspace resolution errors
+    }
+
+    // Verify no liveness-detected events were emitted
+    const eventsPath = path.join(process.env.TAMANDUA_STATE_DIR!, "events", "all.jsonl");
+    let foundLivenessEvent = false;
+    try {
+      const events = fs.readFileSync(eventsPath, "utf-8");
+      for (const line of events.split("\n")) {
+        if (!line.trim()) continue;
+        try {
+          const evt = JSON.parse(line);
+          if (evt.event === "step.worker_lost" && evt.detail && evt.detail.includes("[liveness-detected]")) {
+            foundLivenessEvent = true;
+            break;
+          }
+        } catch {
+          // skip malformed JSON lines
+        }
+      }
+    } catch {
+      // no events file — also fine
+    }
+    assert.equal(foundLivenessEvent, false,
+      "idle rounds must not produce liveness-detected events");
+  });
+});

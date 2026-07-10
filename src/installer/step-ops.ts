@@ -1140,6 +1140,9 @@ export function cleanupAbandonedSteps(): void {
  *   recovered step's run context is augmented with `timeout_retry` so the
  *   retry prompt includes a signal that the prior attempt was interrupted
  *   and uncommitted work may exist on disk.
+ * @param detailPrefix - Optional: prefix prepended to the event detail
+ *   (e.g. "liveness-detected") so dashboards can distinguish recovery
+ *   causes without parsing the event name alone.
  */
 export function recoverOrphanedStepsForAgent(
   agentId: string,
@@ -1148,6 +1151,7 @@ export function recoverOrphanedStepsForAgent(
   timeoutRetryReason?: string,
   failureReason?: string,
   workerJobId?: string,
+  detailPrefix?: string,
 ): { recovered: number; failed: number; skipped: number } {
   const db = getDb();
 
@@ -1228,7 +1232,8 @@ export function recoverOrphanedStepsForAgent(
           const storyRecoveryDetail = workerJobId !== undefined
             ? `Worker ${workerJobId} exited without completing story ${story.story_id}; reset to pending (story abandon ${newAbandoned}/${ABANDON_STORY_MAX})`
             : `Agent terminated; story ${story.story_id} reset to pending (story abandon ${newAbandoned}/${ABANDON_STORY_MAX})`;
-          emitEvent({ ts: new Date().toISOString(), event: storyRecoveryEvent, runId: step.run_id, workflowId: wfId, stepId: step.step_id, detail: storyRecoveryDetail });
+          const storyPrefix = detailPrefix ? `[${detailPrefix}] ` : "";
+          emitEvent({ ts: new Date().toISOString(), event: storyRecoveryEvent, runId: step.run_id, workflowId: wfId, stepId: step.step_id, detail: storyPrefix + storyRecoveryDetail });
           logger.info(`Orphaned step recovery: story ${story.story_id} reset to pending (abandon ${newAbandoned}/${ABANDON_STORY_MAX})`, { runId: step.run_id, stepId: step.step_id, agentId });
           if (timeoutRetryReason) {
             setRunContextKey(step.run_id, "timeout_retry", timeoutRetryReason);
@@ -1292,7 +1297,8 @@ export function recoverOrphanedStepsForAgent(
       const stepRecoveryDetail = workerJobId !== undefined
         ? `Worker ${workerJobId} exited without completing step; reset to pending (retry ${newRetry}/${step.max_retries})`
         : `Agent terminated without completing step; reset to pending (retry ${newRetry}/${step.max_retries})`;
-      emitEvent({ ts: new Date().toISOString(), event: stepRecoveryEvent, runId: step.run_id, workflowId: wfId, stepId: step.step_id, detail: stepRecoveryDetail });
+      const stepPrefix = detailPrefix ? `[${detailPrefix}] ` : "";
+      emitEvent({ ts: new Date().toISOString(), event: stepRecoveryEvent, runId: step.run_id, workflowId: wfId, stepId: step.step_id, detail: stepPrefix + stepRecoveryDetail });
       logger.info(`Orphaned step reset to pending (retry ${newRetry}/${step.max_retries})`, { runId: step.run_id, stepId: step.step_id, agentId });
       if (timeoutRetryReason) {
         setRunContextKey(step.run_id, "timeout_retry", timeoutRetryReason);
@@ -1404,6 +1410,120 @@ export function recoverStepsWithDeadWorkers(): {
     totals.recovered += result.recovered;
     totals.failed += result.failed;
     totals.skipped += result.skipped;
+    if ((result.recovered > 0 || result.failed > 0) && !totals.runIds.includes(step.run_id)) {
+      totals.runIds.push(step.run_id);
+    }
+  }
+
+  return totals;
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// PGID Liveness Watchdog
+// ══════════════════════════════════════════════════════════════════════
+
+const LIVENESS_GRACE_PERIOD_MS = 30_000;
+
+/**
+ * Liveness watchdog: detect steps whose claiming worker process group is
+ * dead and recover them immediately.
+ *
+ * The stale-claim sweeper (executeDispatchRound) waits timeout×1.5 — up to
+ * 60-90 minutes. This watchdog runs per-tick (piggybacks on the existing
+ * dispatch interval), uses the saved claim_pgid to check process-group
+ * liveness directly with kill(-pgid, 0), and recovers dead-worker steps
+ * within seconds-to-minutes (up to the tick interval + grace period).
+ *
+ * Design (per spec):
+ * - Only checks steps with claim_pgid > 0 (worker-ownership-aware claims).
+ * - Steps without claim_pgid (legacy/manual) fall through to the
+ *   timeout×1.5 sweeper — do not guess.
+ * - Never kills or signals any process — only releases claims of
+ *   already-dead workers.
+ * - Safe against PID reuse: a reused pgid causes at worst a delayed
+ *   recovery (falls back to timeout sweeper), never a false kill.
+ * - Works on Linux and macOS (no /proc dependence — uses signal-0).
+ * - Grace period (30s from claim_updated_at): skips claims younger than
+ *   30s to avoid racing a round that just finished and is mid-report.
+ *
+ * Events: recovered steps emit step.worker_lost with a detail prefix of
+ * "liveness-detected" so dashboards/logs can distinguish PGID-liveness
+ * recovery from timeout-based and CLMR recovery.
+ *
+ * Returns { recovered, failed, skipped, runIds } for callers that need
+ * to nudge dispatch or log results (e.g. the daemon reconciler).
+ */
+export function checkRunningWorkersLiveness(): {
+  recovered: number;
+  failed: number;
+  skipped: number;
+  runIds: string[];
+} {
+  const db = getDb();
+
+  const steps = db.prepare(
+    `SELECT s.id, s.agent_id, s.run_id, s.claim_pgid, s.claim_job_id
+     FROM steps s
+     JOIN runs r ON r.id = s.run_id
+     WHERE s.status = 'running'
+       AND s.claim_pgid > 0
+       AND r.status = 'running'`,
+  ).all() as {
+    id: string;
+    agent_id: string;
+    run_id: string;
+    claim_pgid: number;
+    claim_job_id: string | null;
+  }[];
+
+  const totals = { recovered: 0, failed: 0, skipped: 0, runIds: [] as string[] };
+
+  const pgidAlive = (pgid: number): boolean => {
+    try {
+      process.kill(-pgid, 0);
+      return true;
+    } catch (err) {
+      // ESRCH → dead. EPERM → alive but not ours (treat as alive).
+      return (err as NodeJS.ErrnoException).code !== "ESRCH";
+    }
+  };
+
+  for (const step of steps) {
+    // Process group still exists → worker is alive, leave step alone.
+    if (pgidAlive(step.claim_pgid)) continue;
+
+    // Grace period: skip claims younger than 30s to avoid racing a
+    // round that just finished and is mid-report.
+    const claimAge = db.prepare(
+      `SELECT (julianday('now') - julianday(claim_updated_at)) * 86400000 AS age_ms
+       FROM steps WHERE id = ?`
+    ).get(step.id) as { age_ms: number | null } | undefined;
+    if (!claimAge || claimAge.age_ms === null) {
+      // No claim timestamp available — can't determine freshness.
+      // Be conservative: leave it for the timeout sweeper.
+      totals.skipped += 1;
+      continue;
+    }
+    if (claimAge.age_ms < LIVENESS_GRACE_PERIOD_MS) {
+      totals.skipped += 1;
+      continue;
+    }
+
+    // Dead worker process group detected — recover the step immediately.
+    const failureReason =
+      `Worker process group ${step.claim_pgid} detected as dead by liveness watchdog; step requeued.`;
+
+    const result = recoverOrphanedStepsForAgent(
+      step.agent_id,
+      step.run_id,
+      undefined, // no stale threshold — liveness check is authoritative
+      undefined, // no timeout retry reason
+      failureReason,
+      step.claim_job_id ?? undefined,
+      "liveness-detected", // detailPrefix for event differentiation
+    );
+    totals.recovered += result.recovered;
+    totals.failed += result.failed;
     if ((result.recovered > 0 || result.failed > 0) && !totals.runIds.includes(step.run_id)) {
       totals.runIds.push(step.run_id);
     }
