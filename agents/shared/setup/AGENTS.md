@@ -49,6 +49,21 @@ steps reference these as `{{original_branch}}`, `{{build_cmd}}`, `{{test_cmd}}`,
 example, don't put `ORIGINAL_BRANCH:` inside a `CHANGES:` value — there is no
 `CHANGES` key for setup).
 
+## TEST_CMD Reporting Rules
+
+`TEST_CMD` must be the **raw underlying test command** (e.g., `npm test`, `cargo test`, `pytest`).
+The harness wraps the command with a caching shim (`tamandua-test ...`) before agents run it.
+**Never report an already-wrapped command** — this causes double-wrapping on reruns.
+
+- ✅ Correct: `TEST_CMD: npm test`
+- ❌ Wrong: `TEST_CMD: tamandua-test --repo ... -- 'npm test'`
+
+### TSTX Caching Shim
+
+When a tamandua-test wrapped command runs and its output starts with
+`TAMANDUA-TEST CACHED`, the test suite already passed for this exact tree.
+Treat that as a passing test run — no need to re-execute.
+
 ## Important Notes
 
 - If the build or tests fail on main, note it in BASELINE — downstream agents need to know what's pre-existing

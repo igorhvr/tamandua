@@ -61,6 +61,17 @@ After disabling failures:
 - **Max 5 iterations without progress** → STATUS: failed (report what couldn't be fixed)
 - **Build is broken and can't be fixed by disabling tests** → STATUS: failed
 
+## TEST_CMD Usage
+
+Run the test suite with **EXACTLY** the command given in `{{test_cmd}}` — copy it verbatim, do not substitute `npm test` or any other command you infer from the project. `{{test_cmd}}` may be wrapped in a caching shim (`tamandua-test ...`): that wrapper is intentional.
+
+### TSTX Caching Shim
+
+If the output starts with `TAMANDUA-TEST CACHED`, the test suite already passed for this exact tree. Treat that as a passing test run — no re-execute needed.
+
+- ✅ Correct: run `{{test_cmd}}` exactly as provided
+- ❌ Wrong: substituting `npm test` because you saw it in package.json
+
 ## Parsing Test Output
 
 ### node:test output patterns:

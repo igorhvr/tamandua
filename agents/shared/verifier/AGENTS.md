@@ -77,6 +77,23 @@ ISSUES:
 
 The step input will provide workflow-specific verification instructions. Follow those in addition to the general checks above.
 
+## TEST_CMD Usage
+
+Run the test suite with **EXACTLY** the command given in `{{test_cmd}}` — copy it verbatim, do not substitute `npm test` or any other command you infer from the project. `{{test_cmd}}` may be wrapped in a caching shim (`tamandua-test ...`): that wrapper is intentional.
+
+### TSTX Caching Shim
+
+If the output starts with `TAMANDUA-TEST CACHED`, the test suite already passed for this exact tree. Treat that as a passing test run — no re-execute needed.
+
+- ✅ Correct: run `{{test_cmd}}` exactly as provided
+- ❌ Wrong: substituting `npm test` because you saw it in package.json
+
+Only add flags through the wrapper's `--force` option when you suspect a flaky or environment-dependent result, e.g.:
+
+```
+{{test_cmd}} --force
+```
+
 ## Visual/Browser-Based Verification (Conditional)
 
 > **Only perform visual verification when the step prompt explicitly requests it** (e.g., when frontend changes are detected). If the step prompt does not mention visual verification, skip this section entirely.

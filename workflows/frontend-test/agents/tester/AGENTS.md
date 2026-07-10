@@ -20,6 +20,19 @@ agent would kill the daemon that spawned you.
 
 4. **Check Tests** — Verify `src/server/dashboard.test.ts` exists and has tests
 
+## TEST_CMD Usage
+
+When running the test suite, use **EXACTLY** the command given in `{{test_cmd}}` — copy it verbatim, do not substitute `npm test` or any other command you infer from the project. `{{test_cmd}}` may be wrapped in a caching shim (`tamandua-test ...`): that wrapper is intentional.
+
+### TSTX Caching Shim
+
+If the output starts with `TAMANDUA-TEST CACHED`, the test suite already passed for this exact tree. Treat that as a passing test run — no re-execute needed.
+
+- ✅ Correct: run `{{test_cmd}}` exactly as provided
+- ❌ Wrong: substituting `npm test` because you saw it in package.json
+
+Only add flags through the wrapper's `--force` option when you suspect a flaky or environment-dependent result.
+
 ## CRITICAL — STATUS Line Requirement
 
 Your output is parsed by an automated scheduler. It looks for **exact markers** to determine step outcome:

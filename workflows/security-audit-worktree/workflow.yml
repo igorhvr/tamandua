@@ -253,6 +253,9 @@ steps:
 
       RETRY FEEDBACK (only present if your previous attempt was rejected — read carefully and fix specifically what it complains about):
       {{retry_feedback}}
+      ## IMPORTANT — Test Command
+
+      TEST_CMD is the exact test command to use. Copy it verbatim — do NOT substitute `npm test` or any other command you infer from the project. TEST_CMD may be wrapped in a caching shim (`tamandua-test ...`); this is intentional. If the output starts with `TAMANDUA-TEST CACHED`, the suite already passed for this exact tree — treat that as a passing test run. Only add flags through the wrapper's `--force` option when you suspect a flaky or environment-dependent result.
 
       Instructions:
       1. cd into the repo, pull latest on the branch
@@ -290,6 +293,9 @@ steps:
 
       RETRY FEEDBACK (only present if your previous attempt was rejected — read carefully and fix specifically what it complains about):
       {{retry_feedback}}
+      ## IMPORTANT — Test Command
+
+      TEST_CMD is the exact test command to use. Copy it verbatim — do NOT substitute `npm test` or any other command you infer from the project. TEST_CMD may be wrapped in a caching shim (`tamandua-test ...`); this is intentional. If the output starts with `TAMANDUA-TEST CACHED`, the suite already passed for this exact tree — treat that as a passing test run. Only add flags through the wrapper's `--force` option when you suspect a flaky or environment-dependent result.
 
       Instructions:
       1. Run the full test suite with {{test_cmd}}
@@ -339,6 +345,9 @@ steps:
 
       RETRY FEEDBACK (only present if your previous attempt was rejected — read carefully and fix specifically what it complains about):
       {{retry_feedback}}
+      ## IMPORTANT — Test Command
+
+      TEST_CMD is the exact test command to use. Copy it verbatim — do NOT substitute `npm test` or any other command you infer from the project. TEST_CMD may be wrapped in a caching shim (`tamandua-test ...`); this is intentional. If the output starts with `TAMANDUA-TEST CACHED`, the suite already passed for this exact tree — treat that as a passing test run. Only add flags through the wrapper's `--force` option when you suspect a flaky or environment-dependent result.
 
       Instructions:
       1. Run the full test suite ({{test_cmd}}) — all tests must pass
