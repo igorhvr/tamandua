@@ -63,6 +63,7 @@ import {
   prepareGitRepo,
   resolveFullRunId,
   cleanupTempHome,
+  preserveE2eTestHome,
 } from "./helpers/smoke-helpers.ts";
 import {
   startIsolatedDaemon,
@@ -197,6 +198,7 @@ describe(
     concurrency: 1,
   },
   () => {
+    let testFailed = false;
     // ── before: shared environment setup ──────────────────────────────
     before(async () => {
       // Create isolated temp HOME (symlinks real ~/.pi for auth)
@@ -237,6 +239,9 @@ describe(
       } catch {
         // best-effort
       }
+      if (testFailed) {
+        preserveE2eTestHome(env.root, "workflows-e2e");
+      }
       cleanupTempHome(env);
     });
 
@@ -245,6 +250,7 @@ describe(
       "bug-fix-merge-worktree: fixes broken add function",
       { timeout: 60 * 60_000 }, // 60 minutes
       async () => {
+        try {
         // ── Start daemon ────────────────────────────────────────────
         daemon = await startIsolatedDaemon(
           env.dashboardPort,
@@ -382,6 +388,10 @@ describe(
           // ── Stop daemon between workflows for clean scheduler state ─
           await stopIsolatedDaemon(daemon);
         }
+        } catch (e) {
+          testFailed = true;
+          throw e;
+        }
       },
     );
 
@@ -390,6 +400,7 @@ describe(
       "feature-dev-merge-worktree: adds multiply function (sequential, same repo)",
       { timeout: 60 * 60_000 }, // 60 minutes
       async () => {
+        try {
         // ── Restart daemon for clean scheduler state ────────────────
         daemon = await startIsolatedDaemon(
           env.dashboardPort,
@@ -540,6 +551,10 @@ describe(
           // ── Stop daemon ─────────────────────────────────────────
           await stopIsolatedDaemon(daemon);
         }
+        } catch (e) {
+          testFailed = true;
+          throw e;
+        }
       },
     );
 
@@ -548,6 +563,7 @@ describe(
       "quarantine-broken-tests-merge-worktree: quarantines failing test",
       { timeout: 60 * 60_000 }, // 60 minutes
       async () => {
+        try {
         // Prepare a separate repo from the fixture (not the shared repoDir
         // — tests 1/2 modified their repo; quarantine gets a fresh copy).
         const quarantineRepoDir = path.join(env.root, "quarantine-repo");
@@ -668,6 +684,10 @@ describe(
           // ── Stop daemon ─────────────────────────────────────────
           await stopIsolatedDaemon(daemon);
         }
+        } catch (e) {
+          testFailed = true;
+          throw e;
+        }
       },
     );
 
@@ -676,6 +696,7 @@ describe(
       "security-audit-merge-worktree: fixes command injection in server.ts",
       { timeout: 60 * 60_000 }, // 60 minutes
       async () => {
+        try {
         // ── Prepare a git repo from the vulnerable fixture ──────
         const vulnFixtureDir = path.join(
           process.cwd(),
@@ -848,6 +869,10 @@ describe(
         } finally {
           // ── Stop daemon ─────────────────────────────────────
           await stopIsolatedDaemon(daemon);
+        }
+        } catch (e) {
+          testFailed = true;
+          throw e;
         }
       },
     );

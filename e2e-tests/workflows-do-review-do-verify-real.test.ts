@@ -58,6 +58,7 @@ import {
   prepareGitRepo,
   resolveFullRunId,
   cleanupTempHome,
+  preserveE2eTestHome,
 } from "./helpers/smoke-helpers.ts";
 import {
   startIsolatedDaemon,
@@ -116,6 +117,7 @@ describe(
     concurrency: 1,
   },
   () => {
+    let testFailed = false;
     // ── before: isolated environment setup ──────────────────────────────
     before(async () => {
       // Create isolated temp HOME (symlinks real ~/.pi for auth)
@@ -140,6 +142,9 @@ describe(
       } catch {
         // best-effort
       }
+      if (testFailed) {
+        preserveE2eTestHome(env.root, "do-review-do-verify");
+      }
       cleanupTempHome(env);
     });
 
@@ -148,6 +153,7 @@ describe(
       "do-review-do-verify: palindrome function with review/verify pipeline",
       { timeout: 60 * 60_000 }, // 60 minutes
       async () => {
+        try {
         // ── Start daemon ────────────────────────────────────────────
         daemon = await startIsolatedDaemon(
           env.dashboardPort,
@@ -338,6 +344,10 @@ ${testOutput.substring(0, 500)}`,
         } finally {
           // ── Stop daemon ─────────────────────────────────────────
           await stopIsolatedDaemon(daemon);
+        }
+        } catch (e) {
+          testFailed = true;
+          throw e;
         }
       },
     );

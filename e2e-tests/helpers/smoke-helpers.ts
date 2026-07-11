@@ -248,6 +248,79 @@ export function resolveFullRunId(prefix: string, tamanduaDir: string): string {
   }
 }
 
+/**
+ * Archive an isolated temp home directory to a preserved location when an e2e
+ * test fails. Uses fs.cpSync for cross-platform copy (macOS + Linux).
+ *
+ * Archive path: /tmp/tamandua-e2e-failures/<YYYY-MM-DDTHHmmss>-<sanitizedSlug>/
+ *
+ * Failure-proof: the entire function body is wrapped in try/catch. If archiving
+ * or pruning throws, the error is logged to stderr and null is returned. This
+ * function must never throw — a failed archive must not prevent test teardown
+ * from completing.
+ *
+ * Pruning: keeps at most `maxArchives` (default 5) most recent archives sorted
+ * by mtime. Older archives beyond the limit are removed.
+ *
+ * @returns the archive path on success, null on failure
+ */
+export function preserveE2eTestHome(
+  rootDir: string,
+  testSlug: string,
+  maxArchives: number = 5,
+): string | null {
+  try {
+    // Sanitize the slug: replace path-unsafe chars with hyphens
+    const sanitizedSlug = testSlug.replace(/[\/\\:*?"<>|]/g, "-");
+
+    // Build timestamp in YYYY-MM-DDTHHmmss format
+    const now = new Date();
+    const pad = (n: number) => n.toString().padStart(2, "0");
+    const timestamp =
+      `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}` +
+      `T${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+
+    const archivesDir = path.join(os.tmpdir(), "tamandua-e2e-failures");
+    const archivePath = path.join(archivesDir, `${timestamp}-${sanitizedSlug}`);
+
+    // Create parent dir (no-op if exists)
+    fs.mkdirSync(archivesDir, { recursive: true });
+
+    // Copy the temp home directory into the archive
+    fs.cpSync(rootDir, archivePath, { recursive: true, force: true });
+
+    // Prune oldest archives beyond the limit
+    _pruneArchives(archivesDir, maxArchives);
+
+    const msg = `[tamandua e2e] FAILURE FORENSICS PRESERVED: ${archivePath}`;
+    console.error(msg);
+
+    return archivePath;
+  } catch (err) {
+    console.error(
+      `[tamandua e2e] Failed to preserve e2e test forensics: ${err}`,
+    );
+    return null;
+  }
+}
+
+/** Internal: keep at most `max` most recent archive dirs in `archivesDir`. */
+function _pruneArchives(archivesDir: string, max: number) {
+  const entries = fs
+    .readdirSync(archivesDir, { withFileTypes: true })
+    .filter((e) => e.isDirectory())
+    .map((e) => ({
+      name: e.name,
+      path: path.join(archivesDir, e.name),
+      mtime: fs.statSync(path.join(archivesDir, e.name)).mtimeMs,
+    }))
+    .sort((a, b) => b.mtime - a.mtime); // newest first
+
+  for (let i = max; i < entries.length; i++) {
+    fs.rmSync(entries[i].path, { recursive: true, force: true });
+  }
+}
+
 export function cleanupTempHome(
   env: { root: string; homeDir: string; controlPort: number },
 ) {

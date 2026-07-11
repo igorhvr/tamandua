@@ -38,6 +38,7 @@ import {
   spawnWorkflowRun,
   resolveFullRunId,
   cleanupTempHome,
+  preserveE2eTestHome,
 } from "./helpers/smoke-helpers.ts";
 import {
   startIsolatedDaemon,
@@ -54,6 +55,7 @@ const CANARY_TASK =
   "Reply with STATUS: done and REPORT: canary ok.";
 
 describe("real e2e canary (LIVE model, single do-now run)", () => {
+  let testFailed = false;
   it(
     "do-now completes through the real pipeline and accounts its tokens",
     { timeout: 15 * 60_000 }, // 15 minutes
@@ -61,6 +63,7 @@ describe("real e2e canary (LIVE model, single do-now run)", () => {
       const env = await createTempHome();
       let daemon: ChildProcess | undefined;
       try {
+        try {
         cliMustSucceed(
           ["workflow", "install", "do-now"],
           baseEnv(env.homeDir, env.controlPort),
@@ -125,6 +128,10 @@ describe("real e2e canary (LIVE model, single do-now run)", () => {
             `systemTokens=${audit.systemTokens} tokenUpdateEvents=${audit.tokenUpdateEvents} ` +
             `terminalTokensSpent=${audit.terminalTokensSpent}`,
         );
+        } catch (e) {
+          testFailed = true;
+          throw e;
+        }
       } finally {
         if (daemon) {
           try {
@@ -132,6 +139,9 @@ describe("real e2e canary (LIVE model, single do-now run)", () => {
           } catch {
             // best-effort
           }
+        }
+        if (testFailed) {
+          preserveE2eTestHome(env.root, "canary");
         }
         cleanupTempHome(env);
       }
