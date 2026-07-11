@@ -15,6 +15,7 @@ import { spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import { recoverStepsWithDeadWorkers } from "../dist/installer/step-ops.js";
 import { getDb } from "../dist/db.js";
+import { getRunEvents } from "../dist/installer/events.js";
 import { createTempHome } from "./helpers/test-env.ts";
 
 describe("dead-worker-recovery", () => {
@@ -771,4 +772,331 @@ describe("checkRunningWorkersLiveness — WDGM defense-in-depth", () => {
     }
   });
 });
+
+describe("recoverOrphanedStepsForAgent — US-004 exit diagnostics in step.worker_lost", () => {
+  it("step.worker_lost includes exitCode, signal, stderrTail when provided (single step)", async () => {
+    const { recoverOrphanedStepsForAgent } = await import("../dist/installer/step-ops.js");
+    const db = getDb();
+
+    const runId = crypto.randomUUID();
+    const stepRowId = crypto.randomUUID();
+    const now = new Date().toISOString();
+
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 'wf-dead', 'task', 'running', '{}', 0, ?, ?)",
+    ).run(runId, now, now);
+    db.prepare(
+      `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status,
+        retry_count, max_retries, claim_job_id, created_at, updated_at)
+       VALUES (?, ?, 'work', 'wf-dead_dev', 0, 'work', '', 'running', 0, 3, 'job-us004', ?, ?)`,
+    ).run(stepRowId, runId, now, now);
+
+    const result = recoverOrphanedStepsForAgent(
+      "wf-dead_dev",
+      runId,
+      0,
+      undefined,
+      undefined,
+      "job-us004",
+      undefined,
+      1,           // exitCode
+      "SIGTERM",   // signal
+      "stderr: out of memory",  // stderrTail
+    );
+
+    assert.equal(result.recovered, 1);
+
+    const events = getRunEvents(runId);
+    const workerLost = events.filter((e) => e.event === "step.worker_lost");
+    assert.equal(workerLost.length, 1, "should emit one step.worker_lost event");
+
+    const evt = workerLost[0];
+    assert.equal(evt.exitCode, 1, "exitCode should be 1");
+    assert.equal(evt.signal, "SIGTERM", "signal should be SIGTERM");
+    assert.equal(evt.stderrTail, "stderr: out of memory", "stderrTail should be preserved");
+  });
+
+  it("step.worker_lost includes exit diagnostics when exitCode is 0 and stderrTail is undefined", async () => {
+    const { recoverOrphanedStepsForAgent } = await import("../dist/installer/step-ops.js");
+    const db = getDb();
+
+    const runId = crypto.randomUUID();
+    const stepRowId = crypto.randomUUID();
+    const now = new Date().toISOString();
+
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 'wf-dead', 'task', 'running', '{}', 0, ?, ?)",
+    ).run(runId, now, now);
+    db.prepare(
+      `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status,
+        retry_count, max_retries, claim_job_id, created_at, updated_at)
+       VALUES (?, ?, 'work', 'wf-dead_dev', 0, 'work', '', 'running', 0, 3, 'job-us004b', ?, ?)`,
+    ).run(stepRowId, runId, now, now);
+
+    const result = recoverOrphanedStepsForAgent(
+      "wf-dead_dev",
+      runId,
+      0,
+      undefined,
+      undefined,
+      "job-us004b",
+      undefined,
+      0,           // exitCode = 0
+      null,        // no signal
+      undefined,   // no stderr
+    );
+
+    assert.equal(result.recovered, 1);
+
+    const events = getRunEvents(runId);
+    const workerLost = events.filter((e) => e.event === "step.worker_lost");
+    assert.equal(workerLost.length, 1);
+
+    const evt = workerLost[0];
+    assert.equal(evt.exitCode, 0, "exitCode should be 0");
+    assert.equal(evt.signal, undefined, "signal should be undefined");
+    assert.equal(evt.stderrTail, undefined, "stderrTail should be undefined");
+  });
+
+  it("step.timeout events do NOT include exit diagnostics (only worker_lost)", async () => {
+    const { recoverOrphanedStepsForAgent } = await import("../dist/installer/step-ops.js");
+    const db = getDb();
+
+    const runId = crypto.randomUUID();
+    const stepRowId = crypto.randomUUID();
+    const now = new Date().toISOString();
+
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 'wf-dead', 'task', 'running', '{}', 0, ?, ?)",
+    ).run(runId, now, now);
+    // No claim_job_id → recovery event is step.timeout, not step.worker_lost
+    db.prepare(
+      `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status,
+        retry_count, max_retries, created_at, updated_at)
+       VALUES (?, ?, 'work', 'wf-dead_dev', 0, 'work', '', 'running', 0, 3, ?, ?)`,
+    ).run(stepRowId, runId, now, now);
+
+    const result = recoverOrphanedStepsForAgent(
+      "wf-dead_dev",
+      runId,
+      0,
+      undefined,
+      undefined,
+      undefined,  // no workerJobId → step.timeout event
+      undefined,
+      1,
+      "SIGKILL",
+      "some stderr",
+    );
+
+    assert.equal(result.recovered, 1);
+
+    const events = getRunEvents(runId);
+    const timeouts = events.filter((e) => e.event === "step.timeout");
+    assert.equal(timeouts.length, 1, "should emit step.timeout, not step.worker_lost");
+
+    const evt = timeouts[0];
+    assert.equal(evt.exitCode, undefined, "step.timeout should not have exitCode");
+    assert.equal(evt.signal, undefined, "step.timeout should not have signal");
+    assert.equal(evt.stderrTail, undefined, "step.timeout should not have stderrTail");
+  });
+
+  it("step.worker_lost for story-level recovery includes exit diagnostics", async () => {
+    const { recoverOrphanedStepsForAgent } = await import("../dist/installer/step-ops.js");
+    const db = getDb();
+
+    const runId = crypto.randomUUID();
+    const storyRowId = crypto.randomUUID();
+    const stepRowId = crypto.randomUUID();
+    const now = new Date().toISOString();
+
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 'wf-dead', 'task', 'running', '{}', 0, ?, ?)",
+    ).run(runId, now, now);
+    db.prepare(
+      "INSERT INTO stories (id, run_id, story_index, story_id, title, description, acceptance_criteria, status, retry_count, max_retries, abandoned_count, created_at, updated_at) VALUES (?, ?, 0, 'US-001', 'test', 'desc', '[]', 'running', 0, 4, 0, ?, ?)",
+    ).run(storyRowId, runId, now, now);
+    db.prepare(
+      `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status,
+        type, current_story_id, retry_count, max_retries, claim_job_id, created_at, updated_at)
+       VALUES (?, ?, 'loop', 'wf-dead_dev', 0, 'loop', '', 'running', 'loop', ?, 0, 3, 'job-us004-story', ?, ?)`,
+    ).run(stepRowId, runId, storyRowId, now, now);
+
+    const result = recoverOrphanedStepsForAgent(
+      "wf-dead_dev",
+      runId,
+      0,
+      undefined,
+      undefined,
+      "job-us004-story",
+      undefined,
+      137,        // exitCode
+      "SIGKILL",  // signal
+      "Killed: 9", // stderrTail
+    );
+
+    assert.equal(result.recovered, 1);
+
+    const events = getRunEvents(runId);
+    const workerLost = events.filter((e) => e.event === "step.worker_lost");
+    assert.equal(workerLost.length, 1, "should emit step.worker_lost for story-level");
+
+    const evt = workerLost[0];
+    assert.equal(evt.exitCode, 137);
+    assert.equal(evt.signal, "SIGKILL");
+    assert.equal(evt.stderrTail, "Killed: 9");
+  });
+});
+
+describe("recoverOrphanedStepsForAgent — US-005 worker_lost_count aggregation", () => {
+  it("increments worker_lost_count when step.worker_lost is emitted (single step)", async () => {
+    const { recoverOrphanedStepsForAgent } = await import("../dist/installer/step-ops.js");
+    const db = getDb();
+
+    const runId = crypto.randomUUID();
+    const stepRowId = crypto.randomUUID();
+    const now = new Date().toISOString();
+
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, worker_lost_count, created_at, updated_at) VALUES (?, 'wf-dead', 'task', 'running', '{}', 0, 0, ?, ?)",
+    ).run(runId, now, now);
+    db.prepare(
+      `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status,
+        retry_count, max_retries, claim_job_id, created_at, updated_at)
+       VALUES (?, ?, 'work', 'wf-dead_dev', 0, 'work', '', 'running', 0, 3, 'job-us005-r1', ?, ?)`,
+    ).run(stepRowId, runId, now, now);
+
+    // Initial count should be 0
+    const before = db.prepare("SELECT worker_lost_count FROM runs WHERE id = ?").get(runId) as { worker_lost_count: number };
+    assert.equal(before.worker_lost_count, 0);
+
+    // Trigger a worker_lost event
+    const result = recoverOrphanedStepsForAgent(
+      "wf-dead_dev", runId, 0, undefined, undefined,
+      "job-us005-r1", undefined, 1, "SIGTERM", "stderr: oom",
+    );
+    assert.equal(result.recovered, 1);
+
+    // Count should now be 1
+    const after = db.prepare("SELECT worker_lost_count FROM runs WHERE id = ?").get(runId) as { worker_lost_count: number };
+    assert.equal(after.worker_lost_count, 1, "worker_lost_count should increment to 1");
+
+    // Event should NOT contain workerLostCount (only terminal events have it)
+    const events = getRunEvents(runId);
+    const workerLost = events.filter((e) => e.event === "step.worker_lost");
+    assert.equal(workerLost.length, 1);
+    assert.equal(workerLost[0].workerLostCount, undefined, "step.worker_lost events should not carry workerLostCount");
+  });
+
+  it("increments worker_lost_count when step.worker_lost is emitted (story-level)", async () => {
+    const { recoverOrphanedStepsForAgent } = await import("../dist/installer/step-ops.js");
+    const db = getDb();
+
+    const runId = crypto.randomUUID();
+    const stepRowId = crypto.randomUUID();
+    const storyId = crypto.randomUUID();
+    const now = new Date().toISOString();
+
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, worker_lost_count, created_at, updated_at) VALUES (?, 'wf-dead', 'task', 'running', '{}', 0, 0, ?, ?)",
+    ).run(runId, now, now);
+    db.prepare(
+      `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status,
+        retry_count, max_retries, type, current_story_id, claim_job_id, created_at, updated_at)
+       VALUES (?, ?, 'work', 'wf-dead_dev', 0, 'work', '', 'running', 0, 3, 'loop', ?, 'job-us005-r2', ?, ?)`,
+    ).run(stepRowId, runId, storyId, now, now);
+    db.prepare(
+      `INSERT INTO stories (id, run_id, story_index, story_id, title, description, acceptance_criteria,
+        status, retry_count, max_retries, abandoned_count, created_at, updated_at)
+       VALUES (?, ?, 0, 'US-001', 'Test story', '', '[]', 'pending', 0, 3, 0, ?, ?)`,
+    ).run(storyId, runId, now, now);
+
+    // Trigger a worker_lost event for story-level recovery
+    const result = recoverOrphanedStepsForAgent(
+      "wf-dead_dev", runId, 0, undefined, undefined,
+      "job-us005-r2", undefined, 137, "SIGKILL", undefined,
+    );
+    assert.equal(result.recovered, 1);
+
+    // Count should be 1
+    const row = db.prepare("SELECT worker_lost_count FROM runs WHERE id = ?").get(runId) as { worker_lost_count: number };
+    assert.equal(row.worker_lost_count, 1, "worker_lost_count should increment to 1 for story-level");
+  });
+
+  it("does NOT increment worker_lost_count for step.timeout events", async () => {
+    const { recoverOrphanedStepsForAgent } = await import("../dist/installer/step-ops.js");
+    const db = getDb();
+
+    const runId = crypto.randomUUID();
+    const stepRowId = crypto.randomUUID();
+    const now = new Date().toISOString();
+
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, worker_lost_count, created_at, updated_at) VALUES (?, 'wf-dead', 'task', 'running', '{}', 0, 0, ?, ?)",
+    ).run(runId, now, now);
+    db.prepare(
+      `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status,
+        retry_count, max_retries, created_at, updated_at)
+       VALUES (?, ?, 'work', 'wf-dead_dev', 0, 'work', '', 'running', 0, 3, ?, ?)`,
+    ).run(stepRowId, runId, now, now);
+    // No claim_job_id → recovery event is step.timeout, not step.worker_lost
+
+    const result = recoverOrphanedStepsForAgent(
+      "wf-dead_dev", runId, 0, undefined, undefined,
+      undefined, // no workerJobId = timeout
+      undefined, undefined, undefined, undefined,
+    );
+    assert.equal(result.recovered, 1);
+
+    // Count should still be 0
+    const row = db.prepare("SELECT worker_lost_count FROM runs WHERE id = ?").get(runId) as { worker_lost_count: number };
+    assert.equal(row.worker_lost_count, 0, "worker_lost_count should not increment for timeout");
+  });
+
+  it("worker_lost_count has default 0 on new runs", () => {
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const now = new Date().toISOString();
+
+    // Insert without explicit worker_lost_count
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 'wf-dead', 'task', 'running', '{}', 0, ?, ?)",
+    ).run(runId, now, now);
+
+    const row = db.prepare("SELECT worker_lost_count FROM runs WHERE id = ?").get(runId) as { worker_lost_count: number };
+    assert.equal(row.worker_lost_count, 0, "should default to 0");
+  });
+
+  it("multiple worker_lost events accumulate", async () => {
+    const { recoverOrphanedStepsForAgent } = await import("../dist/installer/step-ops.js");
+    const db = getDb();
+
+    const runId = crypto.randomUUID();
+    const now = new Date().toISOString();
+
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, worker_lost_count, created_at, updated_at) VALUES (?, 'wf-dead', 'task', 'running', '{}', 0, 0, ?, ?)",
+    ).run(runId, now, now);
+
+    // Create and lose 3 steps
+    for (let i = 0; i < 3; i++) {
+      const stepRowId = crypto.randomUUID();
+      db.prepare(
+        `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status,
+          retry_count, max_retries, claim_job_id, created_at, updated_at)
+         VALUES (?, ?, 'work', 'wf-dead_dev', ?, 'work', '', 'running', ?, 3, 'job-acc', ?, ?)`,
+      ).run(stepRowId, runId, i, i, now, now);
+
+      const result = recoverOrphanedStepsForAgent(
+        "wf-dead_dev", runId, 0, undefined, undefined,
+        "job-acc", undefined, 1, undefined, undefined,
+      );
+      assert.equal(result.recovered, 1);
+    }
+
+    const row = db.prepare("SELECT worker_lost_count FROM runs WHERE id = ?").get(runId) as { worker_lost_count: number };
+    assert.equal(row.worker_lost_count, 3, "should accumulate to 3");
+  });
+});
+
 });

@@ -9,7 +9,7 @@ import { getRoleTimeoutSeconds, inferRole } from "./install.js";
 import { formatPiCommandPreview } from "./pi-command-preview.js";
 import { emitEvent } from "./events.js";
 import { parsePiOutputStream } from "./pi-stream-parser.js";
-import { getHarnessAdapter } from "./harness-adapter.js";
+import { getHarnessAdapter, type HarnessRoundResult } from "./harness-adapter.js";
 import { lookupHermesSessionTokens } from "./hermes-usage.js";
 
 // ──────────────────────────────────────────────────────────────────────
@@ -986,6 +986,9 @@ export async function executeDispatchRound(
   // access it for error-path token attribution.
   const harnessType = job.harnessType ?? "pi";
 
+  // Declared outside try so catch/post-round handlers can access exit diagnostics
+  let result: HarnessRoundResult | undefined;
+
   try {
     // ── Run-scoped status check ────────────────────────────────────
     // If this run is no longer 'running' (terminal/paused) tear down the
@@ -1147,7 +1150,7 @@ export async function executeDispatchRound(
     if (harnessType === "hermes") {
       harnessEnv.TAMANDUA_HERMES_BINARY = binaryPath;
     }
-    const result = await adapter.runRound(workPrompt, {
+    result = await adapter.runRound(workPrompt, {
       timeout,
       workdir: workingDirectoryForHarness,
       env: harnessEnv,
@@ -1216,6 +1219,10 @@ export async function executeDispatchRound(
           undefined,
           undefined,
           job.id,
+          undefined, // detailPrefix
+          result?.exitCode,
+          result?.signal,
+          result?.stderrTail,
         );
         if (recoveryResult.recovered > 0 || recoveryResult.failed > 0) {
           logger.info("Orphaned step recovery after clean harness exit without STATUS", {
@@ -1248,6 +1255,10 @@ export async function executeDispatchRound(
           undefined, // no timeout retry reason (not a timeout)
           undefined, // no failure reason
           job.id, // workerJobId scoping
+          undefined, // detailPrefix
+          result?.exitCode,
+          result?.signal,
+          result?.stderrTail,
         );
         if (recoveryResult.recovered > 0 || recoveryResult.failed > 0) {
           logger.info("Immediate claim release after no_work round (dangling claim detected)", {
@@ -1291,6 +1302,10 @@ export async function executeDispatchRound(
         timeoutRetryReason,
         undefined,
         job.id,
+        undefined, // detailPrefix
+        result?.exitCode,
+        result?.signal,
+        result?.stderrTail,
       );
       if (recoveryResult.recovered > 0 || recoveryResult.failed > 0) {
         logger.info("Orphaned step recovery after harness failure", {

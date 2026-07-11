@@ -14,6 +14,7 @@ export interface RunInfo {
   updatedAt: string;
   stepSummary?: string;
   tokensSpent: number;
+  workerLostCount: number;
 }
 
 export interface RunDetail extends RunInfo {
@@ -53,7 +54,7 @@ export function getWorkflowStatus(query: string): RunDetail {
   // Try exact id match first
   let row = db
     .prepare(
-      "SELECT id, workflow_id, task, status, context, created_at, updated_at, tokens_spent FROM runs WHERE id = ?",
+      "SELECT id, workflow_id, task, status, context, created_at, updated_at, tokens_spent, worker_lost_count FROM runs WHERE id = ?",
     )
     .get(query) as unknown as RunRow | undefined;
 
@@ -61,7 +62,7 @@ export function getWorkflowStatus(query: string): RunDetail {
   if (!row) {
     const prefixRows = db
       .prepare(
-        "SELECT id, workflow_id, task, status, context, created_at, updated_at, tokens_spent FROM runs WHERE id LIKE ?",
+        "SELECT id, workflow_id, task, status, context, created_at, updated_at, tokens_spent, worker_lost_count FROM runs WHERE id LIKE ?",
       )
       .all(`${query}%`) as unknown as RunRow[];
     if (prefixRows.length === 1) {
@@ -77,7 +78,7 @@ export function getWorkflowStatus(query: string): RunDetail {
   if (!row) {
     const taskRows = db
       .prepare(
-        "SELECT id, workflow_id, task, status, context, created_at, updated_at, tokens_spent FROM runs WHERE task LIKE ?",
+        "SELECT id, workflow_id, task, status, context, created_at, updated_at, tokens_spent, worker_lost_count FROM runs WHERE task LIKE ?",
       )
       .all(`%${query}%`) as unknown as RunRow[];
     if (taskRows.length === 1) {
@@ -103,7 +104,7 @@ export function listRuns(limit = 50): RunInfo[] {
   const db = getDb();
   const rows = db
     .prepare(
-      "SELECT id, workflow_id, task, status, created_at, updated_at, tokens_spent FROM runs ORDER BY created_at DESC LIMIT ?",
+      "SELECT id, workflow_id, task, status, created_at, updated_at, tokens_spent, worker_lost_count FROM runs ORDER BY created_at DESC LIMIT ?",
     )
     .all(limit) as unknown as RunRow[];
 
@@ -118,6 +119,7 @@ export function listRuns(limit = 50): RunInfo[] {
       updatedAt: r.updated_at,
       stepSummary,
       tokensSpent: r.tokens_spent,
+      workerLostCount: r.worker_lost_count,
     };
   });
 }
@@ -252,6 +254,7 @@ interface RunRow {
   created_at: string;
   updated_at: string;
   tokens_spent: number;
+  worker_lost_count: number;
 }
 
 function getStepSummary(db: ReturnType<typeof getDb>, runId: string): string {
@@ -354,6 +357,7 @@ function buildRunDetail(
     updatedAt: row.updated_at,
     stepSummary,
     tokensSpent: row.tokens_spent,
+    workerLostCount: row.worker_lost_count,
     steps: stepInfos,
     stories: storyInfos.length > 0 ? storyInfos : undefined,
     workspace_mode: workspaceMode,

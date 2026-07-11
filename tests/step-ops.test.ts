@@ -1,7 +1,7 @@
 import { describe, it, before, after, mock } from "node:test";
 import assert from "node:assert/strict";
 import { createTempHome } from "./helpers/test-env.ts";
-import { parseOutputKeyValues, parseExpectedKeys, findProducerForMissingKey, resolveTemplate, buildStoryPlanSection, mergeStoryPlanIntoProgress, validateExpects, completeStep, resolveStepContext, failStep, claimStep, getWorkflowId, advancePipeline, recoverOrphanedStepsForAgent } from "../dist/installer/step-ops.js";
+import { parseOutputKeyValues, parseExpectedKeys, findProducerForMissingKey, resolveTemplate, buildStoryPlanSection, mergeStoryPlanIntoProgress, validateExpects, completeStep, resolveStepContext, failStep, claimStep, getWorkflowId, advancePipeline, recoverOrphanedStepsForAgent, sanitizeStderrTail } from "../dist/installer/step-ops.js";
 import { getRunEvents } from "../dist/installer/events.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -47,6 +47,100 @@ describe("parseOutputKeyValues", () => {
     const result = parseOutputKeyValues("STATUS:\nCHANGES: something");
     assert.equal(result.status, "");
     assert.equal(result.changes, "something");
+  });
+});
+
+describe("sanitizeStderrTail", () => {
+  it("returns empty string for empty input", () => {
+    assert.equal(sanitizeStderrTail(""), "");
+  });
+
+  it("strips ANSI CSI escape sequences (colors, cursor, etc.)", () => {
+    const input = "\u001b[31mHello\u001b[0m\n\u001b[1;32mWorld\u001b[0m\n";
+    const result = sanitizeStderrTail(input);
+    assert.equal(result, "Hello\nWorld\n");
+  });
+
+  it("returns empty string when input is all ANSI sequences", () => {
+    const input = "\u001b[31m\u001b[1mA\u001b[0m\u001b[K";
+    const result = sanitizeStderrTail(input);
+    assert.equal(result, "A");
+  });
+
+  it("truncates lines longer than 512 chars with marker", () => {
+    const longLine = "x".repeat(600);
+    const result = sanitizeStderrTail(longLine);
+    assert.ok(result.length <= 512, `Expected <= 512 but got ${result.length}`);
+    assert.ok(result.includes("… [truncated]"), "Should include truncation marker");
+    // The truncated line + marker should fit within 512 chars
+    assert.ok(result.startsWith("x"), "Should keep the beginning of the line");
+  });
+
+  it("does not truncate lines at exactly 512 chars", () => {
+    const line = "y".repeat(512);
+    const result = sanitizeStderrTail(line);
+    assert.equal(result, line);
+  });
+
+  it("bounded to 8KB last bytes by default", () => {
+    // Create content that is > 8KB
+    const line = "a".repeat(100) + "\n";
+    const manyLines = line.repeat(100); // ~10KB (100 * 101 bytes)
+    const result = sanitizeStderrTail(manyLines);
+    assert.ok(Buffer.byteLength(result) <= 8192, `Expected <= 8192 bytes but got ${Buffer.byteLength(result)}`);
+    // The output should contain the tail content (last lines)
+    assert.ok(result.includes("a"), "Should contain content from tail");
+  });
+
+  it("respects custom maxBytes parameter", () => {
+    const content = "b".repeat(50) + "\n";
+    const manyLines = content.repeat(100); // ~5KB
+    const result = sanitizeStderrTail(manyLines, 100);
+    assert.ok(Buffer.byteLength(result) <= 100, `Expected <= 100 bytes but got ${Buffer.byteLength(result)}`);
+  });
+
+  it("handles content shorter than maxBytes without trimming", () => {
+    const input = "short\noutput\n";
+    const result = sanitizeStderrTail(input);
+    assert.equal(result, input);
+  });
+
+  it("handles multi-byte UTF-8 boundary safely", () => {
+    // Emoji are multi-byte: 🎉 is 4 bytes (F0 9F 8E 89)
+    const multiByteLine = "🎉".repeat(100); // 400 bytes of emoji
+    const result = sanitizeStderrTail(multiByteLine, 200);
+    assert.ok(Buffer.byteLength(result) <= 200, `Expected <= 200 bytes but got ${Buffer.byteLength(result)}`);
+    // Each character should still be valid (no replacement chars from splitting)
+    assert.ok(!result.includes("\uFFFD"), "Should not contain replacement character");
+  });
+
+  it("preserves non-ANSI content through multi-step pipeline", () => {
+    const input = [
+      "\u001b[33mWARNING\u001b[0m: something happened",
+      "at line 42",
+      "\u001b[1mError\u001b[0m: connection refused",
+    ].join("\n");
+    const result = sanitizeStderrTail(input);
+    assert.ok(result.includes("WARNING"), "Should keep WARNING text");
+    assert.ok(result.includes("Error"), "Should keep Error text");
+    assert.ok(result.includes("line 42"), "Should keep line 42");
+    assert.ok(result.includes("connection refused"), "Should keep connection refused");
+    assert.ok(!result.includes("\u001b"), "Should not contain escape sequences");
+  });
+
+  it("truncates long lines independently (each line checked)", () => {
+    const input = [
+      "short line",
+      "x".repeat(600),  // long line, gets truncated
+      "another short line",
+      "y".repeat(500),  // under 512, stays intact
+    ].join("\n");
+    const result = sanitizeStderrTail(input);
+    const resultLines = result.split("\n");
+    assert.equal(resultLines[0], "short line");
+    assert.ok(resultLines[1].includes("… [truncated]"));
+    assert.equal(resultLines[2], "another short line");
+    assert.equal(resultLines[3], "y".repeat(500));
   });
 });
 

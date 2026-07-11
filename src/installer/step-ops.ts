@@ -15,6 +15,85 @@ import { detectRugpull, relaunchRunAfterRugpull } from "./rugpull.js";
 import { getPgid } from "../lib/proc-info.js";
 
 // ══════════════════════════════════════════════════════════════════════
+// Stderr Sanitization
+// ══════════════════════════════════════════════════════════════════════
+
+/**
+ * Regex matching CSI (Control Sequence Introducer) ANSI escape sequences.
+ * Covers: SGR (graphic rendition: colors, bold, etc.), cursor movement,
+ * erase, and other common terminal control sequences.
+ */
+const ANSI_CSI_RE = /\x1B\[[0-?]*[ -/]*[@-~]/g;
+
+/**
+ * Max line length before truncation. Lines longer than this get a
+ * `… [truncated]` marker appended.
+ */
+const MAX_LINE_LENGTH = 512;
+
+/**
+ * Default maximum output size in bytes (8 KB). The sanitized output is
+ * trimmed from the front to stay within this bound.
+ */
+const DEFAULT_MAX_BYTES = 8192;
+
+/**
+ * Sanitize stderr output for inclusion in event payloads.
+ *
+ * Processing steps:
+ * 1. Strip ANSI CSI escape sequences (colors, cursor movement, etc.)
+ * 2. Truncate individual lines longer than `maxLineLength` characters,
+ *    appending `… [truncated]` as a marker
+ * 3. Keep only the last `maxBytes` bytes of the sanitized output (trim from
+ *    front) so the payload never exceeds a known bound
+ *
+ * Multi-byte boundary safety: byte slicing for the tail window is done
+ * post-string-conversion (Buffer.byteLength), so no split code points.
+ *
+ * @param raw - Raw stderr string (may contain ANSI escape sequences)
+ * @param maxBytes - Maximum output size in bytes (default 8192 = 8 KB)
+ * @param maxLineLength - Characters before line truncation (default 512)
+ * @returns Sanitized string suitable for JSONL event payloads
+ */
+export function sanitizeStderrTail(
+  raw: string,
+  maxBytes: number = DEFAULT_MAX_BYTES,
+  maxLineLength: number = MAX_LINE_LENGTH,
+): string {
+  // Step 1: strip ANSI escape sequences
+  let cleaned = raw.replace(ANSI_CSI_RE, "");
+
+  // Step 2: truncate long lines
+  const lines = cleaned.split("\n");
+  const truncatedMarker = "… [truncated]";
+  const lineBudget = maxLineLength - truncatedMarker.length;
+
+  const processed = lines.map((line) => {
+    if (line.length <= maxLineLength) return line;
+    // Truncate at the char boundary budget, then append marker
+    return line.slice(0, lineBudget) + truncatedMarker;
+  });
+
+  cleaned = processed.join("\n");
+
+  // Step 3: keep only last maxBytes bytes (trim from front)
+  const buf = Buffer.from(cleaned, "utf-8");
+  if (buf.length > maxBytes) {
+    // Find a safe UTF-8 boundary to avoid splitting a multi-byte character.
+    // Scan forward from the cut point until we find a byte that is not a
+    // continuation byte (0x80-0xBF).
+    let start = buf.length - maxBytes;
+    // A continuation byte has bits 10xxxxxx, i.e. (byte & 0xC0) === 0x80.
+    while (start < buf.length && (buf[start] & 0xC0) === 0x80) {
+      start++;
+    }
+    return buf.toString("utf-8", start);
+  }
+
+  return cleaned;
+}
+
+// ══════════════════════════════════════════════════════════════════════
 // Key-Value Parsing
 // ══════════════════════════════════════════════════════════════════════
 
@@ -403,6 +482,16 @@ function getRunTokenSpend(runId: string): number | undefined {
   }
 }
 
+function getRunWorkerLostCount(runId: string): number | undefined {
+  try {
+    const db = getDb();
+    const row = db.prepare("SELECT worker_lost_count FROM runs WHERE id = ?").get(runId) as { worker_lost_count: number } | undefined;
+    return row?.worker_lost_count;
+  } catch {
+    return undefined;
+  }
+}
+
 function emitRunTerminalEvent(params: {
   event: "run.completed" | "run.failed";
   runId: string;
@@ -416,6 +505,7 @@ function emitRunTerminalEvent(params: {
     workflowId: params.workflowId,
     detail: params.detail,
     tokensSpent: getRunTokenSpend(params.runId),
+    workerLostCount: getRunWorkerLostCount(params.runId),
   });
 }
 
@@ -1152,6 +1242,9 @@ export function recoverOrphanedStepsForAgent(
   failureReason?: string,
   workerJobId?: string,
   detailPrefix?: string,
+  exitCode?: number | null,
+  signal?: string | null,
+  stderrTail?: string,
 ): { recovered: number; failed: number; skipped: number } {
   const db = getDb();
 
@@ -1233,7 +1326,18 @@ export function recoverOrphanedStepsForAgent(
             ? `Worker ${workerJobId} exited without completing story ${story.story_id}; reset to pending (story abandon ${newAbandoned}/${ABANDON_STORY_MAX})`
             : `Agent terminated; story ${story.story_id} reset to pending (story abandon ${newAbandoned}/${ABANDON_STORY_MAX})`;
           const storyPrefix = detailPrefix ? `[${detailPrefix}] ` : "";
-          emitEvent({ ts: new Date().toISOString(), event: storyRecoveryEvent, runId: step.run_id, workflowId: wfId, stepId: step.step_id, detail: storyPrefix + storyRecoveryDetail });
+          if (storyRecoveryEvent === "step.worker_lost") {
+            db.prepare("UPDATE runs SET worker_lost_count = worker_lost_count + 1 WHERE id = ?").run(step.run_id);
+          }
+          emitEvent({
+            ts: new Date().toISOString(),
+            event: storyRecoveryEvent,
+            runId: step.run_id,
+            workflowId: wfId,
+            stepId: step.step_id,
+            detail: storyPrefix + storyRecoveryDetail,
+            ...(storyRecoveryEvent === "step.worker_lost" ? { exitCode: exitCode ?? undefined, signal: signal ?? undefined, stderrTail } : {}),
+          });
           logger.info(`Orphaned step recovery: story ${story.story_id} reset to pending (abandon ${newAbandoned}/${ABANDON_STORY_MAX})`, { runId: step.run_id, stepId: step.step_id, agentId });
           if (timeoutRetryReason) {
             setRunContextKey(step.run_id, "timeout_retry", timeoutRetryReason);
@@ -1298,7 +1402,18 @@ export function recoverOrphanedStepsForAgent(
         ? `Worker ${workerJobId} exited without completing step; reset to pending (retry ${newRetry}/${step.max_retries})`
         : `Agent terminated without completing step; reset to pending (retry ${newRetry}/${step.max_retries})`;
       const stepPrefix = detailPrefix ? `[${detailPrefix}] ` : "";
-      emitEvent({ ts: new Date().toISOString(), event: stepRecoveryEvent, runId: step.run_id, workflowId: wfId, stepId: step.step_id, detail: stepPrefix + stepRecoveryDetail });
+      if (stepRecoveryEvent === "step.worker_lost") {
+        db.prepare("UPDATE runs SET worker_lost_count = worker_lost_count + 1 WHERE id = ?").run(step.run_id);
+      }
+      emitEvent({
+        ts: new Date().toISOString(),
+        event: stepRecoveryEvent,
+        runId: step.run_id,
+        workflowId: wfId,
+        stepId: step.step_id,
+        detail: stepPrefix + stepRecoveryDetail,
+        ...(stepRecoveryEvent === "step.worker_lost" ? { exitCode: exitCode ?? undefined, signal: signal ?? undefined, stderrTail } : {}),
+      });
       logger.info(`Orphaned step reset to pending (retry ${newRetry}/${step.max_retries})`, { runId: step.run_id, stepId: step.step_id, agentId });
       if (timeoutRetryReason) {
         setRunContextKey(step.run_id, "timeout_retry", timeoutRetryReason);

@@ -42,6 +42,9 @@ export interface TamanduaEvent {
   savedDurationMs?: number;
   durationMs?: number;
   exitCode?: number;
+  signal?: string;
+  stderrTail?: string;
+  workerLostCount?: number;
   passCount?: number;
   failCount?: number;
   window?: string;

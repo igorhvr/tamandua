@@ -6,6 +6,7 @@ import type { HarnessType } from "./types.js";
 import { logger } from "../lib/logger.js";
 import { formatPiCommandPreview, findPromptArgvIndices, formatCommandPreview } from "./pi-command-preview.js";
 import { parsePiOutputStream } from "./pi-stream-parser.js";
+import { sanitizeStderrTail } from "./step-ops.js";
 
 // ── Harness round result ───────────────────────────────────────────
 
@@ -30,6 +31,8 @@ export interface HarnessRoundResult {
   redactedIndices?: number[];
   /** True when the command preview had prompt arguments elided. */
   promptElided?: boolean;
+  /** Sanitized tail of stderr output (last ~8KB, ANSI-stripped, lines truncated). */
+  stderrTail?: string;
 }
 
 // ── Run options shared across harnesses ────────────────────────────
@@ -347,7 +350,14 @@ class PiHarnessAdapter implements HarnessAdapter {
       hasStderr: stderrMeta.bytes > 0,
     });
 
-    return { output: filteredStdout.trim() };
+    const stderrTail = sanitizeStderrTail(stderrOut);
+
+    return {
+      output: filteredStdout.trim(),
+      exitCode: child.exitCode,
+      signal: child.signalCode ?? undefined,
+      stderrTail: stderrTail || undefined,
+    };
   }
 }
 
@@ -750,6 +760,8 @@ class HermesHarnessAdapter implements HarnessAdapter {
       });
     }
 
+    const stderrTail = sanitizeStderrTail(stderrOut);
+
     return {
       output: filteredStdout,
       sessionRef,
@@ -759,6 +771,7 @@ class HermesHarnessAdapter implements HarnessAdapter {
       commandPreview: preview.commandPreview,
       redactedIndices: preview.redactedIndices,
       promptElided: preview.promptElided,
+      stderrTail: stderrTail || undefined,
     };
   }
 }

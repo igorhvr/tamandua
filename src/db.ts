@@ -185,6 +185,14 @@ function migrate(db: DatabaseSync): void {
     db.exec("ALTER TABLE stories ADD COLUMN abandoned_count INTEGER DEFAULT 0");
   }
 
+  // ── WLOG worker_lost_count for runs ──
+  // Tracks how many times a worker vanished (step.worker_lost emitted)
+  // during the run. Surfaced in terminal events and CLI status output.
+  const addWorkerLost = db.prepare("SELECT name FROM pragma_table_info('runs') WHERE name = 'worker_lost_count'").all();
+  if (addWorkerLost.length === 0) {
+    db.exec("ALTER TABLE runs ADD COLUMN worker_lost_count INTEGER NOT NULL DEFAULT 0");
+  }
+
   // Indexes for run-scoped scheduling and step claim queries.
   db.exec(
     "CREATE INDEX IF NOT EXISTS idx_steps_agent_run_status ON steps(agent_id, run_id, status)",

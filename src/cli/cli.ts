@@ -2699,7 +2699,7 @@ async function main() {
     const runs = listRuns();
     if (runs.length === 0) { console.log("No workflow runs found."); return; }
     console.log("Workflow runs:");
-    for (const r of runs) console.log(`  [${r.status.padEnd(9)}] ${r.id.slice(0, 8).padEnd(10)} ${r.workflowId.padEnd(14)} ${r.tokensSpent.toLocaleString().padStart(8)} tokens  ${r.task.slice(0, 50)}${r.task.length > 50 ? "..." : ""}`);
+    for (const r of runs) console.log(`  [${r.status.padEnd(9)}] ${r.id.slice(0, 8).padEnd(10)} ${r.workflowId.padEnd(14)}${r.workerLostCount > 0 ? ` wl:${r.workerLostCount}`.padEnd(6) : "      "}${r.tokensSpent.toLocaleString().padStart(8)} tokens  ${r.task.slice(0, 50)}${r.task.length > 50 ? "..." : ""}`);
     return;
   }
 
@@ -2936,6 +2936,7 @@ async function main() {
     try {
       const result = getWorkflowStatus(target);
       console.log(`Run: ${result.id.slice(0, 8)}\nWorkflow: ${result.workflowId}\nTask: ${result.task}\nStatus: ${result.status}\nTokens: ${result.tokensSpent.toLocaleString()}`);
+      if (result.workerLostCount > 0) console.log(`Worker lost: ${result.workerLostCount}`);
       if (result.workspace_mode === "worktree") {
         console.log(`Workspace: ${result.workspace_mode}`);
         if (result.worktree_path) console.log(`Worktree: ${result.worktree_path}`);

@@ -56,6 +56,7 @@ tests/dead-worker-recovery.test.ts
 tests/deterministic-motor-acceptance.test.ts
 tests/e2e-infrastructure.test.ts
 tests/frontend-context.test.ts
+tests/harness-stderr-tail.test.ts
 tests/harness-working-directory.test.ts
 tests/hermes-token-attribution.test.ts
 tests/inject-version.test.ts
