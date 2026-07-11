@@ -187,9 +187,17 @@ class PiHarnessAdapter implements HarnessAdapter {
       workdir: options?.workdir,
     });
 
-    // Spawn pi in its own process group so termination paths can kill the
-    // whole subtree (pi spawns its own child processes for tools/sessions).
-    const child = spawn(piPath, args, {
+    // Spawn pi via a POSIX shell wrapper so the true harness PGID flows
+    // through to every tool subshell. With detached:true the shell becomes
+    // its own process group leader; exec preserves the pid so pgid == $$.
+    // The claim CLI prefers TAMANDUA_WORKER_PGID over self-detected PGID,
+    // which on macOS would otherwise pick up the transient tool-call subshell.
+    const child = spawn("/bin/sh", [
+      "-c",
+      `export TAMANDUA_WORKER_PGID="$$"; exec "$0" "$@"`,
+      piPath,
+      ...args,
+    ], {
       cwd: options?.workdir ?? process.cwd(),
       env: childEnv,
       stdio: ["pipe", "pipe", "pipe"],
@@ -428,8 +436,17 @@ class HermesHarnessAdapter implements HarnessAdapter {
       workdir: options?.workdir,
     });
 
-    // Spawn hermes in its own process group for clean termination.
-    const child = spawn(hermesPath, args, {
+    // Spawn hermes via a POSIX shell wrapper so the true harness PGID flows
+    // through to every tool subshell. With detached:true the shell becomes
+    // its own process group leader; exec preserves the pid so pgid == $$.
+    // The claim CLI prefers TAMANDUA_WORKER_PGID over self-detected PGID,
+    // which on macOS would otherwise pick up the transient tool-call subshell.
+    const child = spawn("/bin/sh", [
+      "-c",
+      `export TAMANDUA_WORKER_PGID="$$"; exec "$0" "$@"`,
+      hermesPath,
+      ...args,
+    ], {
       cwd: options?.workdir ?? process.cwd(),
       env: childEnv,
       stdio: ["pipe", "pipe", "pipe"],

@@ -574,4 +574,196 @@ describe("recoverOrphanedStepsForAgent — timeout_retry feedback (story-level)"
       `feedback should include actionable guidance: ${ctx.timeout_retry}`);
   });
 });
+
+// ══════════════════════════════════════════════════════════════════════
+// WDGM: PGID Liveness Watchdog Defense-in-Depth
+// ══════════════════════════════════════════════════════════════════════
+
+/** Seed a running step with a backdated claim for watchdog testing. */
+function seedWatchdogStep(opts: {
+  claimPgid: number;
+  claimJobId: string | null;
+  backdateSeconds?: number;
+}): { runId: string; stepId: string } {
+  const db = getDb();
+  const runId = crypto.randomUUID();
+  const stepId = crypto.randomUUID();
+  const ago = new Date(Date.now() - (opts.backdateSeconds ?? 60) * 1000).toISOString();
+
+  db.prepare(
+    "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 'wf-dead', 'task', 'running', '{}', 0, ?, ?)",
+  ).run(runId, ago, ago);
+
+  db.prepare(
+    `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status,
+       retry_count, max_retries, claim_pid, claim_pgid, claim_job_id, claim_updated_at, created_at, updated_at)
+     VALUES (?, ?, 'work', 'wf-dead_dev', 0, 'work', '', 'running', 0, 3, 99999, ?, ?, ?, ?, ?)`,
+  ).run(stepId, runId, opts.claimPgid, opts.claimJobId, ago, ago, ago);
+
+  return { runId, stepId };
+}
+
+describe("checkRunningWorkersLiveness — WDGM defense-in-depth", () => {
+  // Unique dead pgid per test to avoid collisions across tests sharing a DB.
+  let deadPgidSeq = 90000;
+  function nextDeadPgid(): number { return deadPgidSeq++; }
+
+  it("skips recovery when claim_pgid is dead but a live inFlightChild exists for claim_job_id (WDGM)", async () => {
+    const { checkRunningWorkersLiveness } = await import("../dist/installer/step-ops.js");
+
+    // Seed: running step past the 30s grace period, with a dead claim_pgid
+    // and a claim_job_id that matches a live inFlightChild.
+    const { stepId } = seedWatchdogStep({
+      claimPgid: nextDeadPgid(),
+      claimJobId: "job-wdgm-alive",
+      backdateSeconds: 60, // past 30s grace
+    });
+
+    // Create an inFlightChildren map with a live entry for this job.
+    // Process.pid is always alive (this test process).
+    const inFlightChildren = new Map<string, { pid: number; pgid: number; killed: boolean }>();
+    inFlightChildren.set("job-wdgm-alive", { pid: process.pid, pgid: process.pid, killed: false });
+
+    const result = checkRunningWorkersLiveness(inFlightChildren);
+
+    assert.equal(result.recovered, 0, "must NOT recover — inFlightChild proves worker is alive");
+    assert.equal(result.skipped, 1, "should skip this step (defense-in-depth)");
+    const step = getDb().prepare("SELECT status FROM steps WHERE id = ?").get(stepId) as { status: string };
+    assert.equal(step.status, "running", "step must remain running");
+  });
+
+  it("recovers when claim_pgid is dead AND no inFlightChild exists (existing behavior preserved)", async () => {
+    const { checkRunningWorkersLiveness } = await import("../dist/installer/step-ops.js");
+
+    // Seed: running step past the 30s grace period, with a dead claim_pgid
+    // and NO matching inFlightChild entry. Use a unique pgid to avoid
+    // collisions with previous test fixtures that share the same temp DB.
+    const myPgid = nextDeadPgid();
+    const { stepId } = seedWatchdogStep({
+      claimPgid: myPgid,
+      claimJobId: "job-wdgm-unknown",
+      backdateSeconds: 60, // past 30s grace
+    });
+
+    // Empty inFlightChildren — no job entry for this claim_job_id.
+    const inFlightChildren = new Map<string, { pid: number; pgid: number; killed: boolean }>();
+
+    const result = checkRunningWorkersLiveness(inFlightChildren);
+
+    // Previous tests may have left running steps with dead pgids in the DB.
+    // Assert that at least our step was recovered (recovered count >= 1).
+    assert.ok(result.recovered >= 1, `must recover at least our step — got ${result.recovered}`);
+    const step = getDb().prepare("SELECT status FROM steps WHERE id = ?").get(stepId) as { status: string };
+    assert.equal(step.status, "pending", "our step should be requeued");
+  });
+
+  it("recovers when claim_pgid is dead and inFlightChild exists but is dead", async () => {
+    const { checkRunningWorkersLiveness } = await import("../dist/installer/step-ops.js");
+
+    // Seed: running step past the 30s grace period, with a dead claim_pgid.
+    const { stepId } = seedWatchdogStep({
+      claimPgid: nextDeadPgid(),
+      claimJobId: "job-wdgm-dead-child",
+      backdateSeconds: 60,
+    });
+
+    // inFlightChildren has the job entry but the child is dead — use a pid
+    // that's guaranteed dead (similar to deadPid()).
+    const inFlightChildren = new Map<string, { pid: number; pgid: number; killed: boolean }>();
+    inFlightChildren.set("job-wdgm-dead-child", { pid: deadPid(), pgid: deadPid(), killed: false });
+
+    const result = checkRunningWorkersLiveness(inFlightChildren);
+
+    assert.equal(result.recovered, 1, "must recover — inFlightChild pid is dead");
+    const step = getDb().prepare("SELECT status FROM steps WHERE id = ?").get(stepId) as { status: string };
+    assert.equal(step.status, "pending", "step should be requeued");
+  });
+
+  it("recovers when claim_pgid is dead and inFlightChild exists but killed=true", async () => {
+    const { checkRunningWorkersLiveness } = await import("../dist/installer/step-ops.js");
+
+    // Seed: running step past the 30s grace period, with a dead claim_pgid.
+    const { stepId } = seedWatchdogStep({
+      claimPgid: nextDeadPgid(),
+      claimJobId: "job-wdgm-killed",
+      backdateSeconds: 60,
+    });
+
+    // inFlightChildren has the job entry but killed=true — defense skips.
+    const inFlightChildren = new Map<string, { pid: number; pgid: number; killed: boolean }>();
+    inFlightChildren.set("job-wdgm-killed", { pid: process.pid, pgid: process.pid, killed: true });
+
+    const result = checkRunningWorkersLiveness(inFlightChildren);
+
+    assert.equal(result.recovered, 1, "must recover — killed=true, defense-in-depth does not apply");
+    const step = getDb().prepare("SELECT status FROM steps WHERE id = ?").get(stepId) as { status: string };
+    assert.equal(step.status, "pending", "step should be requeued");
+  });
+
+  it("skips steps within the 30s grace period even when claim_pgid is dead", async () => {
+    const { checkRunningWorkersLiveness } = await import("../dist/installer/step-ops.js");
+
+    // Seed: running step claimed JUST NOW (within grace period), dead claim_pgid.
+    const { stepId } = seedWatchdogStep({
+      claimPgid: nextDeadPgid(),
+      claimJobId: "job-wdgm-fresh",
+      backdateSeconds: 5, // well within 30s grace
+    });
+
+    const result = checkRunningWorkersLiveness();
+
+    assert.equal(result.recovered, 0, "must NOT recover — within grace period");
+    assert.equal(result.skipped, 1, "should skip due to grace period");
+    const step = getDb().prepare("SELECT status FROM steps WHERE id = ?").get(stepId) as { status: string };
+    assert.equal(step.status, "running", "step must remain running");
+  });
+
+  it("works correctly without inFlightChildren (backward-compatible — daemon restart)", async () => {
+    const { checkRunningWorkersLiveness } = await import("../dist/installer/step-ops.js");
+
+    // Seed: running step past the grace period, dead claim_pgid.
+    const { stepId } = seedWatchdogStep({
+      claimPgid: nextDeadPgid(),
+      claimJobId: "job-wdgm-restart",
+      backdateSeconds: 60,
+    });
+
+    // No inFlightChildren passed — simulates daemon restart where the map
+    // was discarded. Should still recover based on claim_pgid alone.
+    const result = checkRunningWorkersLiveness();
+
+    assert.equal(result.recovered, 1, "must recover — no inFlightChildren available");
+    const step = getDb().prepare("SELECT status FROM steps WHERE id = ?").get(stepId) as { status: string };
+    assert.equal(step.status, "pending");
+  });
+
+  it("skips when claim_pgid is alive (worker process group still exists)", async () => {
+    const { checkRunningWorkersLiveness } = await import("../dist/installer/step-ops.js");
+    const { spawn } = await import("node:child_process");
+
+    // Spawn a detached process that becomes its own group leader.
+    // Its pid IS its pgid, and kill(-pgid, 0) will find it alive.
+    const survivor = spawn(process.execPath, ["-e", "setInterval(() => {}, 1 << 30)"], {
+      detached: true,
+      stdio: "ignore",
+    });
+
+    try {
+      const { stepId } = seedWatchdogStep({
+        claimPgid: survivor.pid!, // alive group leader
+        claimJobId: "job-wdgm-self",
+        backdateSeconds: 60,
+      });
+
+      const result = checkRunningWorkersLiveness();
+
+      // Previous tests may have left dead-pgid steps that will be recovered.
+      // Assert that OUR specific step (with alive pgid) was NOT recovered.
+      const step = getDb().prepare("SELECT status FROM steps WHERE id = ?").get(stepId) as { status: string };
+      assert.equal(step.status, "running", "our step must remain running — claim_pgid is alive");
+    } finally {
+      try { process.kill(-survivor.pid!, "SIGKILL"); } catch { /* gone */ }
+    }
+  });
+});
 });

@@ -1446,14 +1446,28 @@ const LIVENESS_GRACE_PERIOD_MS = 30_000;
  * - Grace period (30s from claim_updated_at): skips claims younger than
  *   30s to avoid racing a round that just finished and is mid-report.
  *
+ * Defense-in-depth (Layer 2): before recovering a step, cross-checks
+ * the daemon's inFlightChildren map. If claim_job_id has a live in-flight
+ * child in this daemon, the worker is provably alive regardless of what
+ * the claim_pgid probe says — skip recovery. This prevents mass-misfires
+ * on macOS where claim_pgid may record a transient tool-call subshell's
+ * PGID instead of the true harness group. Only when the job is unknown
+ * (daemon restarted) or its child is truly dead may the claim_pgid
+ * probe decide.
+ *
  * Events: recovered steps emit step.worker_lost with a detail prefix of
  * "liveness-detected" so dashboards/logs can distinguish PGID-liveness
  * recovery from timeout-based and CLMR recovery.
  *
+ * @param inFlightChildren  Optional map of live jobId → {pid, pgid, killed}
+ *   held by the daemon. Passed from executeDispatchRound for defense-in-depth.
+ *
  * Returns { recovered, failed, skipped, runIds } for callers that need
  * to nudge dispatch or log results (e.g. the daemon reconciler).
  */
-export function checkRunningWorkersLiveness(): {
+export function checkRunningWorkersLiveness(
+  inFlightChildren?: Map<string, { pid: number; pgid: number; killed: boolean }>,
+): {
   recovered: number;
   failed: number;
   skipped: number;
@@ -1507,6 +1521,26 @@ export function checkRunningWorkersLiveness(): {
     if (claimAge.age_ms < LIVENESS_GRACE_PERIOD_MS) {
       totals.skipped += 1;
       continue;
+    }
+
+    // Defense-in-depth: if the daemon holds a live in-flight child for this
+    // step's claim_job_id, the worker is provably alive regardless of what
+    // the claim_pgid probe says. On macOS the claim_pgid can record a
+    // transient tool-call subshell's PGID instead of the harness group,
+    // causing the watchdog to falsely declare ALIVE workers dead. This
+    // cross-check alone prevents all such misfires.
+    if (step.claim_job_id && inFlightChildren) {
+      const inflight = inFlightChildren.get(step.claim_job_id);
+      if (inflight && !inflight.killed) {
+        try {
+          process.kill(inflight.pid, 0);
+          // Worker is alive — skip recovery.
+          totals.skipped += 1;
+          continue;
+        } catch {
+          // Child is dead — fall through to normal recovery path.
+        }
+      }
     }
 
     // Dead worker process group detected — recover the step immediately.

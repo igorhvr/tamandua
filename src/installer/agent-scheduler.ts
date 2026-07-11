@@ -1038,7 +1038,7 @@ export async function executeDispatchRound(
     // timeout×1.5 sweeper; this check recovers it within one tick (~15s).
     try {
       const { checkRunningWorkersLiveness } = await import("./step-ops.js");
-      const livenessResult = checkRunningWorkersLiveness();
+      const livenessResult = checkRunningWorkersLiveness(inFlightChildren);
       if (livenessResult.recovered > 0 || livenessResult.failed > 0 || livenessResult.skipped > 0) {
         logger.info("PGID liveness watchdog sweep completed", {
           ...context,
