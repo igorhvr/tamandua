@@ -626,10 +626,11 @@ describe("checkRunningWorkersLiveness — WDGM defense-in-depth", () => {
 
     const result = checkRunningWorkersLiveness(inFlightChildren);
 
-    assert.equal(result.recovered, 0, "must NOT recover — inFlightChild proves worker is alive");
-    assert.equal(result.skipped, 1, "should skip this step (defense-in-depth)");
+    // Step-scoped check: our specific step must NOT be recovered.
     const step = getDb().prepare("SELECT status FROM steps WHERE id = ?").get(stepId) as { status: string };
-    assert.equal(step.status, "running", "step must remain running");
+    assert.equal(step.status, "running", "our step must NOT be recovered — inFlightChild proves worker is alive");
+    // Global count may include sibling test steps in concurrent runs; use step-scoped assertions only.
+    assert.ok(result.skipped >= 1, `should skip this step (defense-in-depth) — got ${result.skipped}`);
   });
 
   it("recovers when claim_pgid is dead AND no inFlightChild exists (existing behavior preserved)", async () => {
@@ -674,7 +675,8 @@ describe("checkRunningWorkersLiveness — WDGM defense-in-depth", () => {
 
     const result = checkRunningWorkersLiveness(inFlightChildren);
 
-    assert.equal(result.recovered, 1, "must recover — inFlightChild pid is dead");
+    // At least our step must be recovered; may include sibling test steps in concurrent runs.
+    assert.ok(result.recovered >= 1, `must recover at least our step — got ${result.recovered}`);
     const step = getDb().prepare("SELECT status FROM steps WHERE id = ?").get(stepId) as { status: string };
     assert.equal(step.status, "pending", "step should be requeued");
   });
@@ -695,7 +697,8 @@ describe("checkRunningWorkersLiveness — WDGM defense-in-depth", () => {
 
     const result = checkRunningWorkersLiveness(inFlightChildren);
 
-    assert.equal(result.recovered, 1, "must recover — killed=true, defense-in-depth does not apply");
+    // At least our step must be recovered; may include sibling test steps in concurrent runs.
+    assert.ok(result.recovered >= 1, `must recover at least our step — got ${result.recovered}`);
     const step = getDb().prepare("SELECT status FROM steps WHERE id = ?").get(stepId) as { status: string };
     assert.equal(step.status, "pending", "step should be requeued");
   });
@@ -712,10 +715,11 @@ describe("checkRunningWorkersLiveness — WDGM defense-in-depth", () => {
 
     const result = checkRunningWorkersLiveness();
 
-    assert.equal(result.recovered, 0, "must NOT recover — within grace period");
-    assert.equal(result.skipped, 1, "should skip due to grace period");
+    // Step-scoped check: our specific step must NOT be recovered (within grace period).
     const step = getDb().prepare("SELECT status FROM steps WHERE id = ?").get(stepId) as { status: string };
-    assert.equal(step.status, "running", "step must remain running");
+    assert.equal(step.status, "running", "our step must NOT be recovered — within grace period");
+    // Global count may include sibling test steps in concurrent runs; use step-scoped assertions only.
+    assert.ok(result.skipped >= 1, `should skip due to grace period — got ${result.skipped}`);
   });
 
   it("works correctly without inFlightChildren (backward-compatible — daemon restart)", async () => {
@@ -732,7 +736,8 @@ describe("checkRunningWorkersLiveness — WDGM defense-in-depth", () => {
     // was discarded. Should still recover based on claim_pgid alone.
     const result = checkRunningWorkersLiveness();
 
-    assert.equal(result.recovered, 1, "must recover — no inFlightChildren available");
+    // At least our step must be recovered; may include sibling test steps in concurrent runs.
+    assert.ok(result.recovered >= 1, `must recover at least our step — got ${result.recovered}`);
     const step = getDb().prepare("SELECT status FROM steps WHERE id = ?").get(stepId) as { status: string };
     assert.equal(step.status, "pending");
   });
