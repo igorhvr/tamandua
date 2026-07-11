@@ -1590,3 +1590,140 @@ describe("suite_results pruneOldSuiteResults", () => {
     assert.equal(justRow, undefined, "row > 14d old should be pruned");
   });
 });
+
+describe("story_abandonments table migration", () => {
+  let tempHome: string;
+  let origHome: string | undefined;
+  let origDbPath: string | undefined;
+
+  const th = createTempHome("tamandua-story-abandonments-test-");
+  before(() => {
+    tempHome = th.root;
+    origHome = process.env.HOME;
+    origDbPath = process.env.TAMANDUA_DB_PATH;
+    process.env.HOME = th.homeDir;
+    delete process.env.TAMANDUA_DB_PATH;
+  });
+
+  after(() => {
+    if (origHome) {
+      process.env.HOME = origHome;
+    } else {
+      delete process.env.HOME;
+    }
+    if (origDbPath) {
+      process.env.TAMANDUA_DB_PATH = origDbPath;
+    } else {
+      delete process.env.TAMANDUA_DB_PATH;
+    }
+  });
+
+  function tableExists(db: DatabaseSync, table: string): boolean {
+    const row = db.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+    ).get(table);
+    return row !== undefined;
+  }
+
+  it("creates story_abandonments table on first migration", () => {
+    const db = getDb();
+    assert.ok(tableExists(db, "story_abandonments"), "story_abandonments table should exist");
+  });
+
+  it("all required columns present with correct types", () => {
+    const db = getDb();
+    const cols = db.prepare("PRAGMA table_info(story_abandonments)").all() as Array<{
+      name: string;
+      type: string;
+      notnull: number;
+      pk: number;
+    }>;
+
+    const colMap = new Map(cols.map((c) => [c.name, c]));
+
+    // id: TEXT PRIMARY KEY
+    const idCol = colMap.get("id");
+    assert.ok(idCol, "id column should exist");
+    assert.equal(idCol.type, "TEXT", "id should be TEXT");
+    assert.equal(idCol.pk, 1, "id should be PRIMARY KEY");
+
+    // story_id: TEXT NOT NULL
+    const storyIdCol = colMap.get("story_id");
+    assert.ok(storyIdCol, "story_id column should exist");
+    assert.equal(storyIdCol.type, "TEXT", "story_id should be TEXT");
+    assert.equal(storyIdCol.notnull, 1, "story_id should be NOT NULL");
+
+    // run_id: TEXT NOT NULL
+    const runIdCol = colMap.get("run_id");
+    assert.ok(runIdCol, "run_id column should exist");
+    assert.equal(runIdCol.type, "TEXT", "run_id should be TEXT");
+    assert.equal(runIdCol.notnull, 1, "run_id should be NOT NULL");
+
+    // reason: TEXT NOT NULL
+    const reasonCol = colMap.get("reason");
+    assert.ok(reasonCol, "reason column should exist");
+    assert.equal(reasonCol.type, "TEXT", "reason should be TEXT");
+    assert.equal(reasonCol.notnull, 1, "reason should be NOT NULL");
+
+    // abandoned_count: INTEGER NOT NULL
+    const abandonedCountCol = colMap.get("abandoned_count");
+    assert.ok(abandonedCountCol, "abandoned_count column should exist");
+    assert.equal(abandonedCountCol.type, "INTEGER", "abandoned_count should be INTEGER");
+    assert.equal(abandonedCountCol.notnull, 1, "abandoned_count should be NOT NULL");
+
+    // created_at: TEXT NOT NULL
+    const createdAtCol = colMap.get("created_at");
+    assert.ok(createdAtCol, "created_at column should exist");
+    assert.equal(createdAtCol.type, "TEXT", "created_at should be TEXT");
+    assert.equal(createdAtCol.notnull, 1, "created_at should be NOT NULL");
+  });
+
+  it("has index on (run_id, story_id)", () => {
+    const db = getDb();
+    const indexes = db.prepare(
+      "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='story_abandonments'",
+    ).all() as Array<{ name: string }>;
+
+    const hasLookupIndex = indexes.some(
+      (idx) => idx.name === "idx_story_abandonments_run_story",
+    );
+    assert.ok(
+      hasLookupIndex,
+      "should have idx_story_abandonments_run_story index",
+    );
+  });
+
+  it("migration is idempotent (second call does nothing harmful)", () => {
+    const db = getDb();
+
+    // Table should still exist with no error
+    assert.ok(
+      tableExists(db, "story_abandonments"),
+      "story_abandonments should still exist after second migration",
+    );
+
+    // Columns should be unchanged
+    const cols = db.prepare("PRAGMA table_info(story_abandonments)").all() as Array<{ name: string }>;
+    const colNames = cols.map((c) => c.name).sort();
+    const expectedCols = [
+      "id", "story_id", "run_id", "reason", "abandoned_count", "created_at",
+    ];
+    assert.deepEqual(colNames, expectedCols.sort(), "columns should match expected after idempotent migrate");
+  });
+
+  it("existing DB tables unaffected by migration", () => {
+    const db = getDb();
+    // All existing tables should still be present
+    assert.ok(tableExists(db, "runs"), "runs table should exist");
+    assert.ok(tableExists(db, "steps"), "steps table should exist");
+    assert.ok(tableExists(db, "stories"), "stories table should exist");
+    assert.ok(tableExists(db, "tamandua_stats"), "tamandua_stats table should exist");
+
+    // Can still read core runs columns
+    const runCols = db.prepare("PRAGMA table_info(runs)").all() as Array<{ name: string }>;
+    const runColNames = new Set(runCols.map((c) => c.name));
+    assert.ok(runColNames.has("id"), "runs.id should exist");
+    assert.ok(runColNames.has("workflow_id"), "runs.workflow_id should exist");
+    assert.ok(runColNames.has("status"), "runs.status should exist");
+  });
+});

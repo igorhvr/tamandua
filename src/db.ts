@@ -185,6 +185,23 @@ function migrate(db: DatabaseSync): void {
     db.exec("ALTER TABLE stories ADD COLUMN abandoned_count INTEGER DEFAULT 0");
   }
 
+  // ── ABND story_abandonments table ──
+  // Per-story abandonment history with reason tracking.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS story_abandonments (
+      id TEXT PRIMARY KEY,
+      story_id TEXT NOT NULL,
+      run_id TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      abandoned_count INTEGER NOT NULL,
+      created_at TEXT NOT NULL
+    );
+  `);
+
+  db.exec(
+    "CREATE INDEX IF NOT EXISTS idx_story_abandonments_run_story ON story_abandonments(run_id, story_id)",
+  );
+
   // ── WLOG worker_lost_count for runs ──
   // Tracks how many times a worker vanished (step.worker_lost emitted)
   // during the run. Surfaced in terminal events and CLI status output.

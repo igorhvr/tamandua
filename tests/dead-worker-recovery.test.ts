@@ -798,6 +798,7 @@ describe("recoverOrphanedStepsForAgent — US-004 exit diagnostics in step.worke
       undefined,
       undefined,
       "job-us004",
+      undefined, // abandonReason
       undefined,
       1,           // exitCode
       "SIGTERM",   // signal
@@ -840,6 +841,7 @@ describe("recoverOrphanedStepsForAgent — US-004 exit diagnostics in step.worke
       undefined,
       undefined,
       "job-us004b",
+      undefined, // abandonReason
       undefined,
       0,           // exitCode = 0
       null,        // no signal
@@ -883,6 +885,7 @@ describe("recoverOrphanedStepsForAgent — US-004 exit diagnostics in step.worke
       undefined,
       undefined,
       undefined,  // no workerJobId → step.timeout event
+      undefined, // abandonReason
       undefined,
       1,
       "SIGKILL",
@@ -929,6 +932,7 @@ describe("recoverOrphanedStepsForAgent — US-004 exit diagnostics in step.worke
       undefined,
       undefined,
       "job-us004-story",
+      undefined, // abandonReason
       undefined,
       137,        // exitCode
       "SIGKILL",  // signal
@@ -973,7 +977,8 @@ describe("recoverOrphanedStepsForAgent — US-005 worker_lost_count aggregation"
     // Trigger a worker_lost event
     const result = recoverOrphanedStepsForAgent(
       "wf-dead_dev", runId, 0, undefined, undefined,
-      "job-us005-r1", undefined, 1, "SIGTERM", "stderr: oom",
+      "job-us005-r1", undefined, // abandonReason
+      undefined, 1, "SIGTERM", "stderr: oom",
     );
     assert.equal(result.recovered, 1);
 
@@ -1014,7 +1019,8 @@ describe("recoverOrphanedStepsForAgent — US-005 worker_lost_count aggregation"
     // Trigger a worker_lost event for story-level recovery
     const result = recoverOrphanedStepsForAgent(
       "wf-dead_dev", runId, 0, undefined, undefined,
-      "job-us005-r2", undefined, 137, "SIGKILL", undefined,
+      "job-us005-r2", undefined, // abandonReason
+      undefined, 137, "SIGKILL", undefined,
     );
     assert.equal(result.recovered, 1);
 
@@ -1044,6 +1050,7 @@ describe("recoverOrphanedStepsForAgent — US-005 worker_lost_count aggregation"
     const result = recoverOrphanedStepsForAgent(
       "wf-dead_dev", runId, 0, undefined, undefined,
       undefined, // no workerJobId = timeout
+      undefined, // abandonReason
       undefined, undefined, undefined, undefined,
     );
     assert.equal(result.recovered, 1);
@@ -1089,13 +1096,764 @@ describe("recoverOrphanedStepsForAgent — US-005 worker_lost_count aggregation"
 
       const result = recoverOrphanedStepsForAgent(
         "wf-dead_dev", runId, 0, undefined, undefined,
-        "job-acc", undefined, 1, undefined, undefined,
+        "job-acc", undefined, // abandonReason
+        undefined, 1, undefined, undefined,
       );
       assert.equal(result.recovered, 1);
     }
 
     const row = db.prepare("SELECT worker_lost_count FROM runs WHERE id = ?").get(runId) as { worker_lost_count: number };
     assert.equal(row.worker_lost_count, 3, "should accumulate to 3");
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════
+// ABND: Reason threading through story_abandonments
+// ══════════════════════════════════════════════════════════════════════
+
+describe("ABND story_abandonments — reason threading", () => {
+  it("cleanupAbandonedSteps records reason=worker_timeout in story_abandonments", async () => {
+    const { cleanupAbandonedSteps } = await import("../dist/installer/step-ops.js");
+    const { runId, storyRowId } = seedStoryRun({
+      agentId: "wf-abnd_dev",
+      abandonedCount: 0,
+      retryCount: 0,
+      backdateSeconds: 7200, // 2 hours, exceeds ABANDONED_THRESHOLD_MS
+    });
+
+    cleanupAbandonedSteps();
+
+    // Verify story_abandonments table has the record
+    const rows = getDb().prepare(
+      "SELECT * FROM story_abandonments WHERE story_id = ? AND run_id = ? ORDER BY created_at DESC"
+    ).all(storyRowId, runId) as Array<{ reason: string; abandoned_count: number }>;
+
+    assert.equal(rows.length, 1, "should have one abandonment record");
+    assert.equal(rows[0].reason, "worker_timeout", "reason should be worker_timeout");
+    assert.equal(rows[0].abandoned_count, 1, "abandoned_count should be 1");
+  });
+
+  it("recoverOrphanedStepsForAgent records reason=worker_lost when abandonReason omitted", async () => {
+    const { recoverOrphanedStepsForAgent } = await import("../dist/installer/step-ops.js");
+    const { runId, storyRowId } = seedStoryRun({
+      agentId: "wf-abnd_fixer",
+      abandonedCount: 0,
+      retryCount: 0,
+      backdateSeconds: 5,
+    });
+
+    // Call WITHOUT explicit abandonReason — should default to "worker_lost"
+    const result = recoverOrphanedStepsForAgent("wf-abnd_fixer", runId, 0);
+    assert.equal(result.recovered, 1);
+
+    const rows = getDb().prepare(
+      "SELECT reason, abandoned_count FROM story_abandonments WHERE story_id = ? AND run_id = ?"
+    ).all(storyRowId, runId) as Array<{ reason: string; abandoned_count: number }>;
+
+    assert.equal(rows.length, 1, "should have one abandonment record");
+    assert.equal(rows[0].reason, "worker_lost", "default reason should be worker_lost");
+    assert.equal(rows[0].abandoned_count, 1, "abandoned_count should be 1");
+  });
+
+  it("recoverOrphanedStepsForAgent records explicit abandonReason", async () => {
+    const { recoverOrphanedStepsForAgent } = await import("../dist/installer/step-ops.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const storyRowId = crypto.randomUUID();
+    const stepRowId = crypto.randomUUID();
+    const ago = new Date(Date.now() - 5000).toISOString();
+
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 'wf-dead', 'task', 'running', '{}', 0, ?, ?)",
+    ).run(runId, ago, ago);
+    db.prepare(
+      "INSERT INTO stories (id, run_id, story_index, story_id, title, description, acceptance_criteria, status, retry_count, max_retries, abandoned_count, created_at, updated_at) VALUES (?, ?, 0, 'S1', 'Test', 'desc', '[]', 'running', 0, 4, 2, ?, ?)",
+    ).run(storyRowId, runId, ago, ago);
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, current_story_id, loop_config, created_at, updated_at) VALUES (?, ?, 'implement', 'wf-abnd_fixer', 0, 'Implement', '', 'running', 0, 4, 'loop', ?, ?, ?, ?)",
+    ).run(stepRowId, runId, storyRowId, JSON.stringify({ over: "stories" }), ago, ago);
+
+    // Call WITH explicit abandonReason = "no_work_release"
+    const result = recoverOrphanedStepsForAgent(
+      "wf-abnd_fixer", runId, 0,
+      undefined, undefined, undefined,
+      "no_work_release",
+      undefined, undefined, undefined, undefined,
+    );
+    assert.equal(result.recovered, 1);
+
+    const rows = db.prepare(
+      "SELECT reason, abandoned_count FROM story_abandonments WHERE story_id = ? AND run_id = ?"
+    ).all(storyRowId, runId) as Array<{ reason: string; abandoned_count: number }>;
+
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].reason, "no_work_release", "reason should be no_work_release");
+    assert.equal(rows[0].abandoned_count, 3, "abandoned_count should be 2 + 1 = 3");
+  });
+
+  it("recoverOrphanedStepsForAgent records different reasons for different call sites", async () => {
+    const { recoverOrphanedStepsForAgent } = await import("../dist/installer/step-ops.js");
+
+    // Seed two separate runs
+    const run1 = seedStoryRun({
+      agentId: "wf-abnd_fixer",
+      abandonedCount: 0,
+      retryCount: 0,
+      backdateSeconds: 5,
+    });
+    const run2 = seedStoryRun({
+      agentId: "wf-abnd_fixer",
+      abandonedCount: 0,
+      retryCount: 0,
+      backdateSeconds: 5,
+    });
+
+    // Recover run1 with liveness_detected
+    recoverOrphanedStepsForAgent("wf-abnd_fixer", run1.runId, 0,
+      undefined, undefined, undefined,
+      "liveness_detected",
+      "liveness-detected", undefined, undefined, undefined,
+    );
+
+    // Recover run2 with worker_died
+    recoverOrphanedStepsForAgent("wf-abnd_fixer", run2.runId, 0,
+      undefined, undefined, undefined,
+      "worker_died",
+      undefined, undefined, undefined, undefined,
+    );
+
+    const rows1 = getDb().prepare(
+      "SELECT reason FROM story_abandonments WHERE story_id = ? AND run_id = ?"
+    ).all(run1.storyRowId, run1.runId) as Array<{ reason: string }>;
+    const rows2 = getDb().prepare(
+      "SELECT reason FROM story_abandonments WHERE story_id = ? AND run_id = ?"
+    ).all(run2.storyRowId, run2.runId) as Array<{ reason: string }>;
+
+    assert.equal(rows1[0].reason, "liveness_detected");
+    assert.equal(rows2[0].reason, "worker_died");
+  });
+
+  it("story.abandoned event emitted with reason and abandonedCount", async () => {
+    const { recoverOrphanedStepsForAgent } = await import("../dist/installer/step-ops.js");
+    const { runId } = seedStoryRun({
+      agentId: "wf-abnd_fixer",
+      abandonedCount: 0,
+      retryCount: 0,
+      backdateSeconds: 5,
+    });
+
+    recoverOrphanedStepsForAgent("wf-abnd_fixer", runId, 0,
+      undefined, undefined, undefined,
+      "worker_timeout",
+      undefined, undefined, undefined, undefined,
+    );
+
+    const events = getRunEvents(runId);
+    const abandonedEvents = events.filter((e) => e.event === "story.abandoned");
+
+    assert.equal(abandonedEvents.length, 1, "should emit exactly one story.abandoned event");
+    assert.equal(abandonedEvents[0].reason, "worker_timeout", "reason should be worker_timeout");
+    assert.equal(abandonedEvents[0].abandonedCount, 1, "abandonedCount should be 1");
+    assert.equal(abandonedEvents[0].storyId, "S1", "storyId should be S1");
+    assert.ok(abandonedEvents[0].detail!.includes("worker_timeout"), "detail should include reason");
+  });
+
+  it("story.abandoned event emitted by cleanupAbandonedSteps with reason=worker_timeout", async () => {
+    const { cleanupAbandonedSteps } = await import("../dist/installer/step-ops.js");
+    const { runId } = seedStoryRun({
+      agentId: "wf-abnd_dev",
+      abandonedCount: 0,
+      retryCount: 0,
+      backdateSeconds: 7200,
+    });
+
+    cleanupAbandonedSteps();
+
+    const events = getRunEvents(runId);
+    const abandonedEvents = events.filter((e) => e.event === "story.abandoned");
+
+    assert.equal(abandonedEvents.length, 1, "should emit exactly one story.abandoned event");
+    assert.equal(abandonedEvents[0].reason, "worker_timeout", "reason should be worker_timeout");
+    assert.equal(abandonedEvents[0].abandonedCount, 1, "abandonedCount should be 1");
+  });
+
+  it("story_abandonments accumulates multiple abandonments for the same story", async () => {
+    const { recoverOrphanedStepsForAgent } = await import("../dist/installer/step-ops.js");
+    const db = getDb();
+    const { runId, storyRowId } = seedStoryRun({
+      agentId: "wf-abnd_fixer",
+      abandonedCount: 0,
+      retryCount: 0,
+      backdateSeconds: 5,
+    });
+
+    // First abandonment
+    recoverOrphanedStepsForAgent("wf-abnd_fixer", runId, 0,
+      undefined, undefined, undefined,
+      "worker_lost",
+      undefined, undefined, undefined, undefined,
+    );
+
+    // Reset story for second abandonment
+    const ago = new Date(Date.now() - 5000).toISOString();
+    db.prepare("UPDATE steps SET status = 'running', current_story_id = ?, updated_at = ? WHERE run_id = ?").run(storyRowId, ago, runId);
+    db.prepare("UPDATE stories SET status = 'running', updated_at = ? WHERE id = ?").run(ago, storyRowId);
+
+    // Second abandonment
+    recoverOrphanedStepsForAgent("wf-abnd_fixer", runId, 0,
+      undefined, undefined, undefined,
+      "worker_timeout",
+      undefined, undefined, undefined, undefined,
+    );
+
+    const rows = getDb().prepare(
+      "SELECT reason, abandoned_count FROM story_abandonments WHERE story_id = ? AND run_id = ? ORDER BY created_at ASC"
+    ).all(storyRowId, runId) as Array<{ reason: string; abandoned_count: number }>;
+
+    assert.equal(rows.length, 2, "should have two abandonments");
+    assert.equal(rows[0].reason, "worker_lost");
+    assert.equal(rows[0].abandoned_count, 1);
+    assert.equal(rows[1].reason, "worker_timeout");
+    assert.equal(rows[1].abandoned_count, 2);
+  });
+
+  it("story_abandonments records abandonment on budget exhaustion (failed path)", async () => {
+    const { recoverOrphanedStepsForAgent } = await import("../dist/installer/step-ops.js");
+    const { runId, storyRowId } = seedStoryRun({
+      agentId: "wf-abnd_fixer",
+      abandonedCount: 8,
+      retryCount: 0,
+      backdateSeconds: 5,
+    });
+
+    const result = recoverOrphanedStepsForAgent("wf-abnd_fixer", runId, 0,
+      undefined, undefined, undefined,
+      "worker_lost",
+      undefined, undefined, undefined, undefined,
+    );
+    assert.equal(result.failed, 1, "story should be failed on abandon exhaustion");
+
+    // The story_abandonments should still record the abandonment (even though it exhausted)
+    const rows = getDb().prepare(
+      "SELECT reason, abandoned_count FROM story_abandonments WHERE story_id = ? AND run_id = ?"
+    ).all(storyRowId, runId) as Array<{ reason: string; abandoned_count: number }>;
+
+    assert.equal(rows.length, 1, "should record abandonment even on exhaustion");
+    assert.equal(rows[0].reason, "worker_lost");
+    assert.equal(rows[0].abandoned_count, 9, "abandoned_count should be 8 + 1 = 9");
+  });
+
+  it("existing abandoned_count assertions still pass with reason threading", async () => {
+    const { recoverOrphanedStepsForAgent } = await import("../dist/installer/step-ops.js");
+    const { runId, storyRowId } = seedStoryRun({
+      agentId: "wf-abnd_fixer",
+      abandonedCount: 3,
+      retryCount: 1,
+      backdateSeconds: 5,
+    });
+
+    // First recovery
+    let result = recoverOrphanedStepsForAgent("wf-abnd_fixer", runId, 0,
+      undefined, undefined, undefined,
+      "worker_lost",
+      undefined, undefined, undefined, undefined,
+    );
+    assert.equal(result.recovered, 1);
+
+    // Reset for second recovery
+    const db = getDb();
+    const ago = new Date(Date.now() - 5000).toISOString();
+    db.prepare("UPDATE steps SET status = 'running', current_story_id = ?, updated_at = ? WHERE run_id = ?").run(storyRowId, ago, runId);
+    db.prepare("UPDATE stories SET status = 'running', updated_at = ? WHERE id = ?").run(ago, storyRowId);
+
+    // Second recovery
+    result = recoverOrphanedStepsForAgent("wf-abnd_fixer", runId, 0,
+      undefined, undefined, undefined,
+      "worker_timeout",
+      undefined, undefined, undefined, undefined,
+    );
+    assert.equal(result.recovered, 1);
+
+    const story = storyState(storyRowId);
+    assert.equal(story.abandoned_count, 5, "abandoned_count should be 3 + 1 + 1 = 5");
+    assert.equal(story.retry_count, 1, "retry_count should be unchanged");
+    assert.equal(story.status, "pending");
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════
+// ABND: Aggregate abandon reasons in event detail
+// ══════════════════════════════════════════════════════════════════════
+
+describe("ABND — abandon reason aggregate", () => {
+  it("buildAbandonReasonAggregate returns correct aggregate for multiple reasons", async () => {
+    const { buildAbandonReasonAggregate } = await import("../dist/installer/step-ops.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+
+    // Insert multiple abandonments with different reasons
+    const rows = [
+      { story_id: crypto.randomUUID(), reason: "worker_lost", cnt: 5 },
+      { story_id: crypto.randomUUID(), reason: "no_work_release", cnt: 3 },
+      { story_id: crypto.randomUUID(), reason: "worker_timeout", cnt: 1 },
+    ];
+    for (const r of rows) {
+      for (let i = 0; i < r.cnt; i++) {
+        db.prepare(
+          "INSERT INTO story_abandonments (id, story_id, run_id, reason, abandoned_count, created_at) VALUES (?, ?, ?, ?, ?, datetime('now'))"
+        ).run(crypto.randomUUID(), r.story_id, runId, r.reason, 1);
+      }
+    }
+
+    const aggregate = buildAbandonReasonAggregate(runId);
+    assert.ok(aggregate.startsWith("abandon budget exhausted (9/8)"), `should have correct total, got: ${aggregate}`);
+    assert.ok(aggregate.includes("5x worker_lost"), `should include worker_lost count, got: ${aggregate}`);
+    assert.ok(aggregate.includes("3x no_work_release"), `should include no_work_release count, got: ${aggregate}`);
+    assert.ok(aggregate.includes("1x worker_timeout"), `should include worker_timeout count, got: ${aggregate}`);
+    // Reasons should be ordered by count DESC
+    const reasonsIdx = aggregate.indexOf("reasons: ");
+    const reasonsPart = aggregate.slice(reasonsIdx);
+    const lostIdx = reasonsPart.indexOf("worker_lost");
+    const noWorkIdx = reasonsPart.indexOf("no_work_release");
+    const timeoutIdx = reasonsPart.indexOf("worker_timeout");
+    assert.ok(lostIdx < noWorkIdx, "worker_lost should come before no_work_release");
+    assert.ok(noWorkIdx < timeoutIdx, "no_work_release should come before worker_timeout");
+  });
+
+  it("buildAbandonReasonAggregate handles single reason", async () => {
+    const { buildAbandonReasonAggregate } = await import("../dist/installer/step-ops.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+
+    db.prepare(
+      "INSERT INTO story_abandonments (id, story_id, run_id, reason, abandoned_count, created_at) VALUES (?, ?, ?, ?, ?, datetime('now'))"
+    ).run(crypto.randomUUID(), crypto.randomUUID(), runId, "worker_lost", 1);
+
+    const aggregate = buildAbandonReasonAggregate(runId);
+    assert.ok(aggregate.startsWith("abandon budget exhausted (1/8)"), `got: ${aggregate}`);
+    assert.ok(aggregate.includes("1x worker_lost"), `got: ${aggregate}`);
+  });
+
+  it("buildAbandonReasonAggregate produces sensible fallback for empty table", async () => {
+    const { buildAbandonReasonAggregate } = await import("../dist/installer/step-ops.js");
+    const runId = crypto.randomUUID();
+    // No inserts into story_abandonments — table is empty for this run
+
+    const aggregate = buildAbandonReasonAggregate(runId);
+    assert.ok(aggregate.includes("no per-story abandonment records found"), `got: ${aggregate}`);
+    assert.ok(aggregate.includes("abandon budget exhausted"), `got: ${aggregate}`);
+  });
+
+  it("cleanupAbandonedSteps includes aggregate in budget-exhaustion events", async () => {
+    const { cleanupAbandonedSteps } = await import("../dist/installer/step-ops.js");
+    const db = getDb();
+
+    // Seed a run with a story that already has ABANDON_STORY_MAX abandonments
+    const { runId } = seedStoryRun({
+      agentId: "wf-abnd_dev",
+      abandonedCount: 8, // exactly at max, so +1 triggers exhaustion
+      retryCount: 0,
+      backdateSeconds: 7200, // 2 hours back to trigger timeout sweeper
+    });
+
+    // Insert a prior abandonment to get an aggregate with actual data
+    // Note: cleanupAbandonedSteps itself also inserts a worker_timeout record
+    // (before it checks the budget threshold), so total will be 2.
+    const storyRows = db.prepare(
+      "SELECT id, story_id FROM stories WHERE run_id = ?"
+    ).all(runId) as { id: string; story_id: string }[];
+    const storyId = storyRows[0];
+    db.prepare(
+      "INSERT INTO story_abandonments (id, story_id, run_id, reason, abandoned_count, created_at) VALUES (?, ?, ?, ?, ?, datetime('now'))"
+    ).run(crypto.randomUUID(), storyId.id, runId, "worker_timeout", 1);
+
+    cleanupAbandonedSteps();
+
+    const events = getRunEvents(runId);
+
+    // Check story.failed event
+    const storyFailed = events.filter((e) => e.event === "story.failed");
+    assert.equal(storyFailed.length, 1, "should have one story.failed event");
+    assert.ok(
+      storyFailed[0].detail!.includes("abandon budget exhausted"),
+      `story.failed detail should contain aggregate, got: ${storyFailed[0].detail}`
+    );
+    assert.ok(
+      storyFailed[0].detail!.includes("2x worker_timeout"),
+      `story.failed detail should include reason breakdown (cleanupAbandonedSteps inserts + our pre-seed), got: ${storyFailed[0].detail}`
+    );
+
+    // Check step.failed event
+    const stepFailed = events.filter((e) => e.event === "step.failed");
+    assert.equal(stepFailed.length, 1, "should have one step.failed event");
+    assert.ok(
+      stepFailed[0].detail!.includes("abandon budget exhausted"),
+      `step.failed detail should contain aggregate, got: ${stepFailed[0].detail}`
+    );
+    assert.ok(
+      stepFailed[0].detail!.includes("2x worker_timeout"),
+      `step.failed detail should include reason breakdown, got: ${stepFailed[0].detail}`
+    );
+
+    // Check run.failed event
+    const runFailed = events.filter((e) => e.event === "run.failed");
+    assert.equal(runFailed.length, 1, "should have one run.failed event");
+    assert.ok(
+      runFailed[0].detail!.includes("abandon budget exhausted"),
+      `run.failed detail should contain aggregate, got: ${runFailed[0].detail}`
+    );
+    assert.ok(
+      runFailed[0].detail!.includes("2x worker_timeout"),
+      `run.failed detail should include reason breakdown, got: ${runFailed[0].detail}`
+    );
+  });
+
+  it("recoverOrphanedStepsForAgent includes aggregate in budget-exhaustion events", async () => {
+    const { recoverOrphanedStepsForAgent } = await import("../dist/installer/step-ops.js");
+    const db = getDb();
+
+    // Seed a run with a story at abandon limit
+    const { runId } = seedStoryRun({
+      agentId: "wf-abnd_fixer",
+      abandonedCount: 8,
+      retryCount: 0,
+      backdateSeconds: 5,
+    });
+
+    // Insert prior abandonments with different reasons
+    db.prepare(
+      "INSERT INTO story_abandonments (id, story_id, run_id, reason, abandoned_count, created_at) VALUES (?, ?, ?, ?, ?, datetime('now'))"
+    ).run(crypto.randomUUID(), crypto.randomUUID(), runId, "worker_lost", 1);
+    db.prepare(
+      "INSERT INTO story_abandonments (id, story_id, run_id, reason, abandoned_count, created_at) VALUES (?, ?, ?, ?, ?, datetime('now'))"
+    ).run(crypto.randomUUID(), crypto.randomUUID(), runId, "no_work_release", 1);
+
+    const result = recoverOrphanedStepsForAgent("wf-abnd_fixer", runId, 0,
+      undefined, undefined, undefined,
+      "worker_timeout",
+      undefined, undefined, undefined, undefined,
+    );
+    assert.equal(result.failed, 1, "story should be failed on abandon exhaustion");
+
+    const events = getRunEvents(runId);
+
+    // Check story.failed event
+    const storyFailed = events.filter((e) => e.event === "story.failed");
+    assert.equal(storyFailed.length, 1, "should have one story.failed event");
+    assert.ok(
+      storyFailed[0].detail!.includes("abandon budget exhausted"),
+      `story.failed detail should contain aggregate, got: ${storyFailed[0].detail}`
+    );
+    assert.ok(
+      storyFailed[0].detail!.includes("worker_lost") ||
+      storyFailed[0].detail!.includes("worker_timeout"),
+      `story.failed detail should include reasons, got: ${storyFailed[0].detail}`
+    );
+
+    // Check step.failed event
+    const stepFailed = events.filter((e) => e.event === "step.failed");
+    assert.equal(stepFailed.length, 1, "should have one step.failed event");
+    assert.ok(
+      stepFailed[0].detail!.includes("abandon budget exhausted"),
+      `step.failed detail should contain aggregate, got: ${stepFailed[0].detail}`
+    );
+
+    // Check run.failed event
+    const runFailed = events.filter((e) => e.event === "run.failed");
+    assert.equal(runFailed.length, 1, "should have one run.failed event");
+    assert.ok(
+      runFailed[0].detail!.includes("abandon budget exhausted"),
+      `run.failed detail should contain aggregate, got: ${runFailed[0].detail}`
+    );
+  });
+
+  it("aggregate includes total abandonments and budget cap", async () => {
+    const { buildAbandonReasonAggregate } = await import("../dist/installer/step-ops.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+
+    // Insert 2 abandonments
+    for (let i = 0; i < 2; i++) {
+      db.prepare(
+        "INSERT INTO story_abandonments (id, story_id, run_id, reason, abandoned_count, created_at) VALUES (?, ?, ?, ?, ?, datetime('now'))"
+      ).run(crypto.randomUUID(), crypto.randomUUID(), runId, "worker_lost", 1);
+    }
+
+    const aggregate = buildAbandonReasonAggregate(runId);
+    assert.ok(aggregate.startsWith("abandon budget exhausted (2/8)"), `got: ${aggregate}`);
+    assert.ok(aggregate.includes("2x worker_lost"), `got: ${aggregate}`);
+  });
+
+  it("buildAbandonReasonAggregate handles many distinct reasons ordered by count DESC", async () => {
+    const { buildAbandonReasonAggregate } = await import("../dist/installer/step-ops.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+
+    // Insert 6+ different reasons with varying counts
+    const specs: Array<{ reason: string; cnt: number }> = [
+      { reason: "worker_timeout", cnt: 7 },
+      { reason: "worker_lost", cnt: 4 },
+      { reason: "no_work_release", cnt: 2 },
+      { reason: "liveness_detected", cnt: 2 },
+      { reason: "worker_died", cnt: 1 },
+      { reason: "run_paused", cnt: 1 },
+      { reason: "daemon_restart", cnt: 1 },
+    ];
+    for (const s of specs) {
+      for (let i = 0; i < s.cnt; i++) {
+        db.prepare(
+          "INSERT INTO story_abandonments (id, story_id, run_id, reason, abandoned_count, created_at) VALUES (?, ?, ?, ?, ?, datetime('now'))"
+        ).run(crypto.randomUUID(), crypto.randomUUID(), runId, s.reason, 1);
+      }
+    }
+
+    const aggregate = buildAbandonReasonAggregate(runId);
+
+    // Total: 7+4+2+2+1+1+1 = 18
+    assert.ok(aggregate.startsWith("abandon budget exhausted (18/8)"), `got: ${aggregate}`);
+
+    // Reasons must appear in count-descending order
+    const reasonsIdx = aggregate.indexOf("reasons: ");
+    const reasonsPart = aggregate.slice(reasonsIdx);
+    const idx: Record<string, number> = {};
+    for (const s of specs) {
+      idx[s.reason] = reasonsPart.indexOf(s.reason);
+      assert.ok(idx[s.reason] > -1, `should contain ${s.reason}`);
+    }
+    // worker_timeout (7) must come before worker_lost (4)
+    assert.ok(idx.worker_timeout < idx.worker_lost, "worker_timeout should precede worker_lost");
+    // worker_lost (4) must come before no_work_release/liveness_detected (2)
+    assert.ok(idx.worker_lost < idx.no_work_release, "worker_lost should precede no_work_release");
+    assert.ok(idx.worker_lost < idx.liveness_detected, "worker_lost should precede liveness_detected");
+    // worker_died and run_paused (1) should come last (after 2-count items)
+    assert.ok(idx.no_work_release < idx.worker_died || idx.liveness_detected < idx.worker_died,
+      "1-count reasons should come after 2-count reasons");
+  });
+
+  it("buildAbandonReasonAggregate handles high per-reason counts", async () => {
+    const { buildAbandonReasonAggregate } = await import("../dist/installer/step-ops.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+
+    // 25 abandonments of the same reason
+    for (let i = 0; i < 25; i++) {
+      db.prepare(
+        "INSERT INTO story_abandonments (id, story_id, run_id, reason, abandoned_count, created_at) VALUES (?, ?, ?, ?, ?, datetime('now'))"
+      ).run(crypto.randomUUID(), crypto.randomUUID(), runId, "worker_lost", 1);
+    }
+
+    const aggregate = buildAbandonReasonAggregate(runId);
+    assert.ok(aggregate.startsWith("abandon budget exhausted (25/8)"), `got: ${aggregate}`);
+    assert.ok(aggregate.includes("25x worker_lost"), `got: ${aggregate}`);
+  });
+
+  it("buildAbandonReasonAggregate for run with multi-story abandonments", async () => {
+    const { buildAbandonReasonAggregate } = await import("../dist/installer/step-ops.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+
+    // Simulate 3 different stories being abandoned, some multiple times
+    const storyA = crypto.randomUUID();
+    const storyB = crypto.randomUUID();
+    const storyC = crypto.randomUUID();
+    // Story A: abandoned 3x (worker_lost)
+    for (let i = 0; i < 3; i++) {
+      db.prepare(
+        "INSERT INTO story_abandonments (id, story_id, run_id, reason, abandoned_count, created_at) VALUES (?, ?, ?, ?, ?, datetime('now'))"
+      ).run(crypto.randomUUID(), storyA, runId, "worker_lost", i + 1);
+    }
+    // Story B: abandoned 2x (worker_timeout)
+    for (let i = 0; i < 2; i++) {
+      db.prepare(
+        "INSERT INTO story_abandonments (id, story_id, run_id, reason, abandoned_count, created_at) VALUES (?, ?, ?, ?, ?, datetime('now'))"
+      ).run(crypto.randomUUID(), storyB, runId, "worker_timeout", i + 1);
+    }
+    // Story C: abandoned 1x (no_work_release)
+    db.prepare(
+      "INSERT INTO story_abandonments (id, story_id, run_id, reason, abandoned_count, created_at) VALUES (?, ?, ?, ?, ?, datetime('now'))"
+    ).run(crypto.randomUUID(), storyC, runId, "no_work_release", 1);
+
+    const aggregate = buildAbandonReasonAggregate(runId);
+    // Total abandonments = 3 + 2 + 1 = 6
+    assert.ok(aggregate.startsWith("abandon budget exhausted (6/8)"), `got: ${aggregate}`);
+    assert.ok(aggregate.includes("3x worker_lost"), `got: ${aggregate}`);
+    assert.ok(aggregate.includes("2x worker_timeout"), `got: ${aggregate}`);
+    assert.ok(aggregate.includes("1x no_work_release"), `got: ${aggregate}`);
+  });
+
+  it("cleanupAbandonedSteps step-level (non-loop) does NOT write story_abandonments", async () => {
+    const { cleanupAbandonedSteps } = await import("../dist/installer/step-ops.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const stepRowId = crypto.randomUUID();
+    const ago = new Date(Date.now() - 7200 * 1000).toISOString();
+
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 'wf-dead', 'task', 'running', '{}', 0, ?, ?)"
+    ).run(runId, ago, ago);
+    // Single step (type = 'single', NOT loop, no current_story_id)
+    db.prepare(
+      `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects,
+         status, retry_count, max_retries, abandoned_count, type, created_at, updated_at)
+       VALUES (?, ?, 'work', 'wf-dead_dev', 0, 'work', '', 'running', 0, 3, 0, 'single', ?, ?)`
+    ).run(stepRowId, runId, ago, ago);
+
+    cleanupAbandonedSteps();
+
+    // story_abandonments should be empty — step-level abandonment is NOT story-level
+    const abandonRows = db.prepare(
+      "SELECT COUNT(*) as cnt FROM story_abandonments WHERE run_id = ?"
+    ).get(runId) as { cnt: number };
+    assert.equal(abandonRows.cnt, 0, "story_abandonments should not have step-level records");
+
+    // Step should be reset to pending with abandoned_count incremented
+    const step = db.prepare("SELECT status, abandoned_count FROM steps WHERE id = ?").get(stepRowId) as {
+      status: string;
+      abandoned_count: number;
+    };
+    assert.equal(step.status, "pending", "step should be reset to pending");
+    assert.equal(step.abandoned_count, 1, "step abandoned_count should increment");
+  });
+
+  it("cleanupAbandonedSteps step-level exhausts MAX_ABANDON_RESETS without touching story_abandonments", async () => {
+    const { cleanupAbandonedSteps } = await import("../dist/installer/step-ops.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const stepRowId = crypto.randomUUID();
+    const ago = new Date(Date.now() - 7200 * 1000).toISOString();
+
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 'wf-dead', 'task', 'running', '{}', 0, ?, ?)"
+    ).run(runId, ago, ago);
+    // Single step at MAX_ABANDON_RESETS - 1 (4), so one more triggers exhaustion at 5
+    db.prepare(
+      `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects,
+         status, retry_count, max_retries, abandoned_count, type, created_at, updated_at)
+       VALUES (?, ?, 'work', 'wf-dead_dev', 0, 'work', '', 'running', 0, 3, 4, 'single', ?, ?)`
+    ).run(stepRowId, runId, ago, ago);
+
+    cleanupAbandonedSteps();
+
+    // story_abandonments should be empty
+    const abandonRows = db.prepare(
+      "SELECT COUNT(*) as cnt FROM story_abandonments WHERE run_id = ?"
+    ).get(runId) as { cnt: number };
+    assert.equal(abandonRows.cnt, 0, "story_abandonments must not have step-level records");
+
+    // Step should be failed (exhausted), run failed
+    const step = db.prepare("SELECT status, abandoned_count FROM steps WHERE id = ?").get(stepRowId) as {
+      status: string;
+      abandoned_count: number;
+    };
+    assert.equal(step.status, "failed", "step should be failed on abandon exhaustion");
+    assert.equal(step.abandoned_count, 5, "abandoned_count should be 5");
+
+    const run = db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string };
+    assert.equal(run.status, "failed", "run should be failed on step abandon exhaustion");
+  });
+
+  it("recoverOrphanedStepsForAgent step-level (non-loop) does NOT write story_abandonments", async () => {
+    const { recoverOrphanedStepsForAgent } = await import("../dist/installer/step-ops.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const stepRowId = crypto.randomUUID();
+    const ago = new Date(Date.now() - 5000).toISOString();
+
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 'wf-dead', 'task', 'running', '{}', 0, ?, ?)"
+    ).run(runId, ago, ago);
+    // Single step (type = 'single', NOT loop, no current_story_id)
+    db.prepare(
+      `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects,
+         status, retry_count, max_retries, type, created_at, updated_at)
+       VALUES (?, ?, 'work', 'wf-dead_dev', 0, 'work', '', 'running', 0, 3, 'single', ?, ?)`
+    ).run(stepRowId, runId, ago, ago);
+
+    const result = recoverOrphanedStepsForAgent("wf-dead_dev", runId, 0,
+      undefined, undefined, undefined,
+      "worker_lost",
+      undefined, undefined, undefined, undefined,
+    );
+    assert.equal(result.recovered, 1, "step should be recovered");
+
+    // story_abandonments should be empty
+    const abandonRows = db.prepare(
+      "SELECT COUNT(*) as cnt FROM story_abandonments WHERE run_id = ?"
+    ).get(runId) as { cnt: number };
+    assert.equal(abandonRows.cnt, 0, "story_abandonments must not have step-level records");
+  });
+
+  it("story.abandoned event detail includes ABANDON_STORY_MAX budget cap", async () => {
+    const { recoverOrphanedStepsForAgent } = await import("../dist/installer/step-ops.js");
+    const { runId } = seedStoryRun({
+      agentId: "wf-abnd_fixer",
+      abandonedCount: 0,
+      retryCount: 0,
+      backdateSeconds: 5,
+    });
+
+    recoverOrphanedStepsForAgent("wf-abnd_fixer", runId, 0,
+      undefined, undefined, undefined,
+      "no_work_release",
+      undefined, undefined, undefined, undefined,
+    );
+
+    const events = getRunEvents(runId);
+    const abandonedEvents = events.filter((e) => e.event === "story.abandoned");
+    assert.equal(abandonedEvents.length, 1);
+    assert.ok(
+      abandonedEvents[0].detail!.includes("(1/8)"),
+      `detail should include abandon budget display, got: ${abandonedEvents[0].detail}`
+    );
+    assert.ok(
+      abandonedEvents[0].detail!.includes("reason: no_work_release"),
+      `detail should include reason, got: ${abandonedEvents[0].detail}`
+    );
+  });
+
+  it("run.failed detail includes full aggregate with reasons on budget exhaustion", async () => {
+    const { recoverOrphanedStepsForAgent } = await import("../dist/installer/step-ops.js");
+    const db = getDb();
+
+    const { runId } = seedStoryRun({
+      agentId: "wf-abnd_fixer",
+      abandonedCount: 8,
+      retryCount: 0,
+      backdateSeconds: 5,
+    });
+
+    // Pre-seed 3 reasons for richer aggregate
+    const storyIds = db.prepare(
+      "SELECT id FROM stories WHERE run_id = ?"
+    ).all(runId) as { id: string }[];
+    db.prepare(
+      "INSERT INTO story_abandonments (id, story_id, run_id, reason, abandoned_count, created_at) VALUES (?, ?, ?, ?, ?, datetime('now'))"
+    ).run(crypto.randomUUID(), storyIds[0].id, runId, "worker_lost", 1);
+    db.prepare(
+      "INSERT INTO story_abandonments (id, story_id, run_id, reason, abandoned_count, created_at) VALUES (?, ?, ?, ?, ?, datetime('now'))"
+    ).run(crypto.randomUUID(), storyIds[0].id, runId, "worker_lost", 1);
+    db.prepare(
+      "INSERT INTO story_abandonments (id, story_id, run_id, reason, abandoned_count, created_at) VALUES (?, ?, ?, ?, ?, datetime('now'))"
+    ).run(crypto.randomUUID(), storyIds[0].id, runId, "worker_timeout", 1);
+
+    const result = recoverOrphanedStepsForAgent("wf-abnd_fixer", runId, 0,
+      undefined, undefined, undefined,
+      "no_work_release",
+      undefined, undefined, undefined, undefined,
+    );
+    assert.equal(result.failed, 1, "story should be failed on abandon exhaustion");
+
+    const events = getRunEvents(runId);
+    const runFailed = events.filter((e) => e.event === "run.failed");
+    assert.equal(runFailed.length, 1, "should have one run.failed event");
+    const detail = runFailed[0].detail!;
+    assert.ok(detail.includes("abandon budget exhausted"), `run.failed detail: ${detail}`);
+    // After the 9th abandonment (no_work_release), aggregate should include all 4 records
+    assert.ok(detail.includes("2x worker_lost"), `should include worker_lost: ${detail}`);
+    assert.ok(detail.includes("worker_timeout"), `should include worker_timeout: ${detail}`);
+    assert.ok(detail.includes("no_work_release"), `should include no_work_release: ${detail}`);
+    // Total: 2 worker_lost + 1 worker_timeout + 1 no_work_release = 4
+    assert.ok(detail.includes("(4/8)"), `should show 4/8, got: ${detail}`);
   });
 });
 

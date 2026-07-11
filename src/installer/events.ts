@@ -33,6 +33,8 @@ export interface TamanduaEvent {
   storyTitle?: string;
   agentId?: string;
   detail?: string;
+  reason?: string;
+  abandonedCount?: number;
   tokenDelta?: number;
   tokensSpent?: number;
   // Suite-specific fields (US-009)

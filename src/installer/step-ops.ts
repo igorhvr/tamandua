@@ -1087,6 +1087,33 @@ export function parseAndInsertStories(output: string, runId: string): void {
 // ══════════════════════════════════════════════════════════════════════
 
 const ABANDONED_THRESHOLD_MS = (getMaxRoleTimeoutSeconds() + 5 * 60) * 1000;
+
+/**
+ * Build an aggregate abandon-reason string for a run from the
+ * story_abandonments table. Queries GROUP BY reason and produces a
+ * human-readable summary like:
+ *
+ *   "abandon budget exhausted (9/8); reasons: 5x worker_lost, 3x no_work_release, 1x worker_timeout"
+ *
+ * When the table has no rows for the run (should not happen when
+ * budget is actually exhausted, but guard anyway), returns a
+ * sensible fallback that still mentions the budget cap.
+ */
+export function buildAbandonReasonAggregate(runId: string): string {
+  const db = getDb();
+  const rows = db.prepare(
+    "SELECT reason, COUNT(*) as cnt FROM story_abandonments WHERE run_id = ? GROUP BY reason ORDER BY cnt DESC"
+  ).all(runId) as { reason: string; cnt: number }[];
+
+  if (rows.length === 0) {
+    return `abandon budget exhausted (>${ABANDON_STORY_MAX}); reasons: (no per-story abandonment records found)`;
+  }
+
+  const total = rows.reduce((sum, r) => sum + r.cnt, 0);
+  const reasons = rows.map(r => `${r.cnt}x ${r.reason}`).join(", ");
+  return `abandon budget exhausted (${total}/${ABANDON_STORY_MAX}); reasons: ${reasons}`;
+}
+
 const MAX_ABANDON_RESETS = 5;
 const ABANDON_STORY_MAX = 8;
 
@@ -1137,13 +1164,35 @@ export function cleanupAbandonedSteps(): void {
       if (story) {
         const newAbandoned = (story.abandoned_count ?? 0) + 1;
         const wfId = getWorkflowId(step.run_id);
+        const abandonReason = "worker_timeout";
+
+        // Persist abandonment into story_abandonments table
+        db.prepare(
+          "INSERT INTO story_abandonments (id, story_id, run_id, reason, abandoned_count, created_at) VALUES (?, ?, ?, ?, ?, datetime('now'))"
+        ).run(crypto.randomUUID(), story.id, step.run_id, abandonReason, newAbandoned);
+
+        // Emit story.abandoned event with reason and abandoned_count
+        emitEvent({
+          ts: new Date().toISOString(),
+          event: "story.abandoned",
+          runId: step.run_id,
+          workflowId: wfId,
+          stepId: step.step_id,
+          storyId: story.story_id,
+          storyTitle: story.title,
+          reason: abandonReason,
+          abandonedCount: newAbandoned,
+          detail: `Story ${story.story_id} abandoned (${newAbandoned}/${ABANDON_STORY_MAX}); reason: ${abandonReason}`,
+        });
+
         if (newAbandoned > ABANDON_STORY_MAX) {
           db.prepare("UPDATE stories SET status = 'failed', abandoned_count = ?, updated_at = datetime('now') WHERE id = ?").run(newAbandoned, story.id);
           db.prepare("UPDATE steps SET status = 'failed', output = 'Story abandoned — abandon budget exhausted', current_story_id = NULL, updated_at = datetime('now') WHERE id = ?").run(step.id);
           db.prepare("UPDATE runs SET status = 'failed', updated_at = datetime('now') WHERE id = ?").run(step.run_id);
-          emitEvent({ ts: new Date().toISOString(), event: "story.failed", runId: step.run_id, workflowId: wfId, stepId: step.step_id, storyId: story.story_id, storyTitle: story.title, detail: `Abandoned — abandon budget exhausted (${newAbandoned}/${ABANDON_STORY_MAX})` });
-          emitEvent({ ts: new Date().toISOString(), event: "step.failed", runId: step.run_id, workflowId: wfId, stepId: step.step_id, detail: "Story abandoned — abandon budget exhausted" });
-          emitRunTerminalEvent({ event: "run.failed", runId: step.run_id, workflowId: wfId, detail: "Story abandoned — abandon budget exhausted" });
+          const aggregate = buildAbandonReasonAggregate(step.run_id);
+          emitEvent({ ts: new Date().toISOString(), event: "story.failed", runId: step.run_id, workflowId: wfId, stepId: step.step_id, storyId: story.story_id, storyTitle: story.title, detail: `Abandoned — ${aggregate}` });
+          emitEvent({ ts: new Date().toISOString(), event: "step.failed", runId: step.run_id, workflowId: wfId, stepId: step.step_id, detail: `Story abandoned — ${aggregate}` });
+          emitRunTerminalEvent({ event: "run.failed", runId: step.run_id, workflowId: wfId, detail: `Story abandoned — ${aggregate}` });
           scheduleRunCronTeardown(step.run_id);
         } else {
           db.prepare("UPDATE stories SET status = 'pending', abandoned_count = ?, updated_at = datetime('now') WHERE id = ?").run(newAbandoned, story.id);
@@ -1241,6 +1290,7 @@ export function recoverOrphanedStepsForAgent(
   timeoutRetryReason?: string,
   failureReason?: string,
   workerJobId?: string,
+  abandonReason?: string,
   detailPrefix?: string,
   exitCode?: number | null,
   signal?: string | null,
@@ -1309,13 +1359,36 @@ export function recoverOrphanedStepsForAgent(
       if (story) {
         const newAbandoned = (story.abandoned_count ?? 0) + 1;
         const wfId = getWorkflowId(step.run_id);
+        const effectiveReason = abandonReason ?? "worker_lost";
+
+        // Persist abandonment into story_abandonments table
+        db.prepare(
+          "INSERT INTO story_abandonments (id, story_id, run_id, reason, abandoned_count, created_at) VALUES (?, ?, ?, ?, ?, datetime('now'))"
+        ).run(crypto.randomUUID(), story.id, step.run_id, effectiveReason, newAbandoned);
+
+        // Emit story.abandoned event with reason and abandoned_count
+        emitEvent({
+          ts: new Date().toISOString(),
+          event: "story.abandoned",
+          runId: step.run_id,
+          workflowId: wfId,
+          stepId: step.step_id,
+          agentId,
+          storyId: story.story_id,
+          storyTitle: story.title,
+          reason: effectiveReason,
+          abandonedCount: newAbandoned,
+          detail: `Story ${story.story_id} abandoned (${newAbandoned}/${ABANDON_STORY_MAX}); reason: ${effectiveReason}`,
+        });
+
         if (newAbandoned > ABANDON_STORY_MAX) {
           db.prepare("UPDATE stories SET status = 'failed', abandoned_count = ?, updated_at = datetime('now') WHERE id = ?").run(newAbandoned, story.id);
           db.prepare("UPDATE steps SET status = 'failed', output = 'Agent terminated without completing story; abandon budget exhausted', current_story_id = NULL, updated_at = datetime('now') WHERE id = ?").run(step.id);
           db.prepare("UPDATE runs SET status = 'failed', updated_at = datetime('now') WHERE id = ?").run(step.run_id);
-          emitEvent({ ts: new Date().toISOString(), event: "story.failed", runId: step.run_id, workflowId: wfId, stepId: step.step_id, storyId: story.story_id, storyTitle: story.title, detail: `Agent terminated — abandon budget exhausted (${newAbandoned}/${ABANDON_STORY_MAX})` });
-          emitEvent({ ts: new Date().toISOString(), event: "step.failed", runId: step.run_id, workflowId: wfId, stepId: step.step_id, detail: "Agent terminated without completing story; abandon budget exhausted" });
-          emitRunTerminalEvent({ event: "run.failed", runId: step.run_id, workflowId: wfId, detail: "Agent terminated without completing story; abandon budget exhausted" });
+          const aggregate = buildAbandonReasonAggregate(step.run_id);
+          emitEvent({ ts: new Date().toISOString(), event: "story.failed", runId: step.run_id, workflowId: wfId, stepId: step.step_id, storyId: story.story_id, storyTitle: story.title, detail: `Agent terminated — ${aggregate}` });
+          emitEvent({ ts: new Date().toISOString(), event: "step.failed", runId: step.run_id, workflowId: wfId, stepId: step.step_id, detail: `Agent terminated without completing story; ${aggregate}` });
+          emitRunTerminalEvent({ event: "run.failed", runId: step.run_id, workflowId: wfId, detail: `Agent terminated without completing story; ${aggregate}` });
           scheduleRunCronTeardown(step.run_id);
           failed++;
         } else {
@@ -1521,6 +1594,11 @@ export function recoverStepsWithDeadWorkers(): {
       undefined,
       `Worker process ${step.claim_pid} died without reporting (daemon restart or crash); step requeued.`,
       step.claim_job_id ?? undefined,
+      "worker_died",
+      undefined, // detailPrefix
+      undefined, // exitCode
+      undefined, // signal
+      undefined, // stderrTail
     );
     totals.recovered += result.recovered;
     totals.failed += result.failed;
@@ -1669,7 +1747,11 @@ export function checkRunningWorkersLiveness(
       undefined, // no timeout retry reason
       failureReason,
       step.claim_job_id ?? undefined,
+      "liveness_detected",
       "liveness-detected", // detailPrefix for event differentiation
+      undefined, // exitCode
+      undefined, // signal
+      undefined, // stderrTail
     );
     totals.recovered += result.recovered;
     totals.failed += result.failed;

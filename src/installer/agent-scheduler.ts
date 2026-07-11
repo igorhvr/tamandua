@@ -803,6 +803,11 @@ export async function autoCompleteStepIfRunning(
         undefined,
         failureReason,
         workerJobId,
+        "worker_lost",
+        undefined, // detailPrefix
+        undefined, // exitCode
+        undefined, // signal
+        undefined, // stderrTail
       );
       if (recoveryResult.recovered > 0 || recoveryResult.failed > 0) {
         logger.info("Orphaned step recovery after auto-complete throw", {
@@ -1075,6 +1080,14 @@ export async function executeDispatchRound(
         job.agentId,
         job.runId,
         staleThresholdMs,
+        undefined, // timeoutRetryReason
+        undefined, // failureReason
+        undefined, // workerJobId
+        "worker_timeout",
+        undefined, // detailPrefix
+        undefined, // exitCode
+        undefined, // signal
+        undefined, // stderrTail
       );
       if (staleResult.recovered > 0 || staleResult.failed > 0) {
         logger.info("Stale-claim sweeper ran", {
@@ -1219,6 +1232,7 @@ export async function executeDispatchRound(
           undefined,
           undefined,
           job.id,
+          "worker_lost",
           undefined, // detailPrefix
           result?.exitCode,
           result?.signal,
@@ -1255,6 +1269,7 @@ export async function executeDispatchRound(
           undefined, // no timeout retry reason (not a timeout)
           undefined, // no failure reason
           job.id, // workerJobId scoping
+          "no_work_release",
           undefined, // detailPrefix
           result?.exitCode,
           result?.signal,
@@ -1302,6 +1317,7 @@ export async function executeDispatchRound(
         timeoutRetryReason,
         undefined,
         job.id,
+        "worker_lost",
         undefined, // detailPrefix
         result?.exitCode,
         result?.signal,

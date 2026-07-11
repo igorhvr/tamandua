@@ -22,7 +22,7 @@ import { startDaemon, stopDaemon, restartDaemon, getDaemonStatus, isRunning, rea
 import { DEFAULT_MCP_PORT, MCP_ENDPOINT_PATH } from "../server/mcp-server.js";
 import { DEFAULT_CONTROL_PORT } from "../server/control-server.js";
 import { pauseRunWithDaemon, resumeRunWithDaemon, nudgeWithDaemon } from "../server/control-client.js";
-import { claimStep, completeStep, failStep, getStories, getOwnProcessGroupId, peekStep } from "../installer/step-ops.js";
+import { claimStep, completeStep, failStep, getStories, getOwnProcessGroupId, peekStep, buildAbandonReasonAggregate } from "../installer/step-ops.js";
 import { ensureCliSymlink } from "../installer/symlink.js";
 import { checkCatalogStalenessWarning } from "../installer/catalog-version.js";
 import { resolveSourcePath, resolveSkillPath } from "../installer/paths.js";
@@ -2942,10 +2942,21 @@ async function main() {
         if (result.worktree_path) console.log(`Worktree: ${result.worktree_path}`);
         if (result.worktree_origin_ref) console.log(`Origin ref: ${result.worktree_origin_ref}`);
       }
+      // Surface abandon reasons for failed runs
+      if (result.status === "failed") {
+        const aggregate = buildAbandonReasonAggregate(result.id);
+        const hasRecords = !aggregate.includes("no per-story abandonment records found");
+        if (hasRecords) {
+          console.log(`Abandon reasons: ${aggregate}`);
+        }
+      }
       console.log(`Steps:`);
       for (const step of result.steps) {
         const icon = step.status === "done" ? "  [done   ]" : step.status === "running" ? "  [running]" : step.status === "failed" ? "  [failed ]" : step.status === "pending" ? "  [pending]" : `  [${step.status.padEnd(7)}]`;
         console.log(`${icon} ${step.stepId} (${step.agentId.split("_").slice(-1)[0]})`);
+        if (step.status === "failed" && step.output) {
+          console.log(`         ${step.output}`);
+        }
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : `No run found matching "${target}".`;

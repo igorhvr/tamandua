@@ -41,6 +41,7 @@ tests/cli-pause-command.test.ts
 tests/cli-pause-resume-integration.test.ts
 tests/cli-resume-command.test.ts
 tests/cli-skill-path.test.ts
+tests/cli-status-abandon-reasons.test.ts
 tests/cli-status-token-display.test.ts
 tests/cli-version-warning.test.ts
 tests/cli-workflow-install-all.test.ts
