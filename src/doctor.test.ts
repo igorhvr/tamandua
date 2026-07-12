@@ -331,11 +331,11 @@ describe("runDoctorChecks", () => {
     }
   });
 
-  it("ENVIRONMENT group has at least 8 checks", async () => {
+  it("ENVIRONMENT group has at least 5 checks", async () => {
     const groups = await runDoctorChecks();
     const env = groups.find((g) => g.label === "ENVIRONMENT");
     assert.ok(env);
-    assert.ok(env!.checks.length >= 8, `Expected at least 8 ENVIRONMENT checks, got ${env!.checks.length}`);
+    assert.ok(env!.checks.length >= 5, `Expected at least 5 ENVIRONMENT checks, got ${env!.checks.length}`);
   });
 
   it("SERVICES group has 4 checks", async () => {
@@ -516,31 +516,17 @@ describe("ENVIRONMENT checks (US-003)", () => {
     }
   });
 
-  it("Hermes binary discovery is always info (never fail)", async () => {
+  it("Hermes check is always info (never fail)", async () => {
     const groups = await runDoctorChecks();
     const env = groups.find((g) => g.label === "ENVIRONMENT");
     assert.ok(env);
-    const hermesCheck = env!.checks.find((c) => c.name === "Hermes binary discovery");
-    assert.ok(hermesCheck, "Expected Hermes binary discovery check to exist");
+    const hermesCheck = env!.checks.find((c) => c.name === "TAMANDUA_HERMES_BINARY / hermes");
+    assert.ok(hermesCheck, "Expected Hermes check to exist");
     assert.strictEqual(hermesCheck!.status, "info",
       `Hermes check should be info-only, got: ${hermesCheck!.status} (${hermesCheck!.message})`);
     assert.ok(
       hermesCheck!.message.length > 0,
       "Hermes check message should not be empty",
-    );
-  });
-
-  it("Hermes symlink check is always info (never fail)", async () => {
-    const groups = await runDoctorChecks();
-    const env = groups.find((g) => g.label === "ENVIRONMENT");
-    assert.ok(env);
-    const symlinkCheck = env!.checks.find((c) => c.name === "Hermes ~/.local/bin symlink");
-    assert.ok(symlinkCheck, "Expected Hermes symlink check to exist");
-    assert.strictEqual(symlinkCheck!.status, "info",
-      `Hermes symlink check should be info-only, got: ${symlinkCheck!.status} (${symlinkCheck!.message})`);
-    assert.ok(
-      symlinkCheck!.message.length > 0,
-      "Hermes symlink check message should not be empty",
     );
   });
 
@@ -656,20 +642,12 @@ describe("ENVIRONMENT hermes contract check (US-004)", () => {
     }
   });
 
-  it("when no hermes binary, ENVIRONMENT group has exactly 7 checks (no contract check)", async () => {
+  it("when no hermes binary, ENVIRONMENT group has exactly 5 checks (no contract check)", async () => {
     savedHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
     delete process.env.TAMANDUA_HERMES_BINARY;
     // Remove hermes from PATH to ensure commandIsOnPath('hermes') returns false
     savedPath = process.env.PATH;
-
-    // Create a fake zsh that won't find hermes via login shell
-    // (the real zsh on this machine may have hermes on its login PATH)
-    fixtureDir = createTempHome();
-    const fakeZsh = path.join(fixtureDir, "zsh");
-    fs.writeFileSync(fakeZsh, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
-
-    // PATH has fake zsh but no hermes
-    process.env.PATH = `${fixtureDir}:/usr/bin:/bin`;
+    process.env.PATH = "/usr/bin:/bin";
 
     const groups = await runDoctorChecks();
     const env = groups.find((g) => g.label === "ENVIRONMENT");
@@ -680,9 +658,8 @@ describe("ENVIRONMENT hermes contract check (US-004)", () => {
     assert.strictEqual(contractCheck, undefined,
       "Should NOT have hermes contract check when hermes binary is absent");
 
-    // Discovery + symlink checks always present; contract absent when no hermes
-    assert.strictEqual(env!.checks.length, 7,
-      `Expected exactly 7 ENVIRONMENT checks when no hermes, got ${env!.checks.length}: ${env!.checks.map((c: DoctorCheckResult) => c.name).join(", ")}`);
+    assert.strictEqual(env!.checks.length, 6,
+      `Expected exactly 6 ENVIRONMENT checks when no hermes, got ${env!.checks.length}: ${env!.checks.map((c: DoctorCheckResult) => c.name).join(", ")}`);
   });
 
   it("hermes contract check shows info with 'contract OK' when state.db is valid", async () => {
@@ -693,11 +670,9 @@ describe("ENVIRONMENT hermes contract check (US-004)", () => {
     fixtureDir = createTempHome();
     seedHermesFixtureDb(fixtureDir);
 
-    // Set TAMANDUA_HERMES_BINARY to a stub — the doctor's discovery chain
-    // will report it as the found binary and use it in the contract check message.
-    const stubPath = path.join(fixtureDir, "stub-hermes");
-    fs.writeFileSync(stubPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
-    process.env.TAMANDUA_HERMES_BINARY = stubPath;
+    // Point TAMANDUA_HERMES_BINARY to any truthy value — the probe only
+    // checks presence, not whether the binary actually exists or works.
+    process.env.TAMANDUA_HERMES_BINARY = "/usr/bin/true";
     process.env.HERMES_HOME = fixtureDir;
 
     const groups = await runDoctorChecks();
@@ -712,14 +687,9 @@ describe("ENVIRONMENT hermes contract check (US-004)", () => {
       `Message should say 'contract OK', got: ${contractCheck!.message}`);
     assert.ok(contractCheck!.message.includes("token accounting available"),
       `Message should mention token accounting, got: ${contractCheck!.message}`);
-    // Contract check should reference the discovered binary
-    assert.ok(contractCheck!.message.includes("probed against"),
-      `Message should include 'probed against' with binary path, got: ${contractCheck!.message}`);
-    assert.ok(contractCheck!.message.includes(stubPath),
-      `Message should include the resolved binary path, got: ${contractCheck!.message}`);
 
-    assert.strictEqual(env!.checks.length, 8,
-      `Expected exactly 8 ENVIRONMENT checks with hermes available, got ${env!.checks.length}`);
+    assert.strictEqual(env!.checks.length, 7,
+      `Expected exactly 7 ENVIRONMENT checks with hermes available, got ${env!.checks.length}`);
   });
 
   it("hermes contract check shows warn when state.db has no sessions table", async () => {
@@ -747,9 +717,6 @@ describe("ENVIRONMENT hermes contract check (US-004)", () => {
       `Reason should mention no sessions table, got: ${contractCheck!.message}`);
     assert.ok(contractCheck!.message.includes("Hermes runs will report 0 tokens"),
       `Message should mention impact, got: ${contractCheck!.message}`);
-    // Contract check should reference the discovered binary
-    assert.ok(contractCheck!.message.includes("probed against"),
-      `Message should include 'probed against' with binary path, got: ${contractCheck!.message}`);
   });
 
   it("hermes contract check shows warn when state.db has missing column", async () => {
@@ -806,332 +773,6 @@ describe("ENVIRONMENT hermes contract check (US-004)", () => {
       `Reason should mention state.db not found, got: ${contractCheck!.message}`);
     assert.ok(contractCheck!.message.includes("Hermes runs will report 0 tokens"),
       `Message should mention impact, got: ${contractCheck!.message}`);
-  });
-});
-
-// ── Hermes discovery chain and symlink tests (US-003) ────────────
-
-describe("ENVIRONMENT hermes discovery chain (US-003)", () => {
-  let savedHermesBinary: string | undefined;
-  let savedPath: string | undefined;
-  let savedHome: string | undefined;
-  let savedHermesHome: string | undefined;
-  let fixtureDir: string | null = null;
-
-  afterEach(() => {
-    if (savedHermesBinary !== undefined) {
-      process.env.TAMANDUA_HERMES_BINARY = savedHermesBinary;
-    } else {
-      delete process.env.TAMANDUA_HERMES_BINARY;
-    }
-    if (savedPath !== undefined) {
-      process.env.PATH = savedPath;
-    }
-    if (savedHome !== undefined) {
-      process.env.HOME = savedHome;
-    } else {
-      delete process.env.HOME;
-    }
-    if (fixtureDir) {
-      try { fs.rmSync(fixtureDir, { recursive: true, force: true }); } catch {}
-      fixtureDir = null;
-    }
-    if (savedHermesHome !== undefined) {
-      process.env.HERMES_HOME = savedHermesHome;
-    } else {
-      delete process.env.HERMES_HOME;
-    }
-  });
-
-  it("discovery chain reports 'Found via TAMANDUA_HERMES_BINARY' when env var is set and executable", async () => {
-    savedHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
-    fixtureDir = createTempHome();
-    const stubPath = path.join(fixtureDir, "stub-hermes");
-    fs.writeFileSync(stubPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
-    process.env.TAMANDUA_HERMES_BINARY = stubPath;
-
-    const groups = await runDoctorChecks();
-    const env = groups.find((g) => g.label === "ENVIRONMENT");
-    assert.ok(env);
-
-    const discoveryCheck = env!.checks.find((c) => c.name === "Hermes binary discovery");
-    assert.ok(discoveryCheck, "Expected Hermes binary discovery check");
-    assert.strictEqual(discoveryCheck!.status, "info");
-    assert.ok(
-      discoveryCheck!.message.includes("Found via TAMANDUA_HERMES_BINARY"),
-      `Message should say 'Found via TAMANDUA_HERMES_BINARY', got: ${discoveryCheck!.message}`,
-    );
-    assert.ok(
-      discoveryCheck!.message.includes(stubPath),
-      `Message should include the binary path, got: ${discoveryCheck!.message}`,
-    );
-  });
-
-  it("discovery chain reports 'TAMANDUA_HERMES_BINARY set but not executable' when env var points to missing file", async () => {
-    savedHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
-    process.env.TAMANDUA_HERMES_BINARY = "/nonexistent/path/hermes";
-
-    // Make sure PATH doesn't have hermes either
-    savedPath = process.env.PATH;
-    process.env.PATH = "/usr/bin:/bin";
-
-    const groups = await runDoctorChecks();
-    const env = groups.find((g) => g.label === "ENVIRONMENT");
-    assert.ok(env);
-
-    const discoveryCheck = env!.checks.find((c) => c.name === "Hermes binary discovery");
-    assert.ok(discoveryCheck, "Expected Hermes binary discovery check");
-    assert.strictEqual(discoveryCheck!.status, "info");
-    assert.ok(
-      discoveryCheck!.message.includes("not executable"),
-      `Message should mention 'not executable', got: ${discoveryCheck!.message}`,
-    );
-  });
-
-  it("discovery chain reports 'Found on PATH' when hermes is on PATH", async () => {
-    savedHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
-    delete process.env.TAMANDUA_HERMES_BINARY;
-
-    savedPath = process.env.PATH;
-    fixtureDir = createTempHome();
-    const hermesStub = path.join(fixtureDir, "hermes");
-    fs.writeFileSync(hermesStub, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
-    process.env.PATH = `${fixtureDir}:${savedPath}`;
-
-    const groups = await runDoctorChecks();
-    const env = groups.find((g) => g.label === "ENVIRONMENT");
-    assert.ok(env);
-
-    const discoveryCheck = env!.checks.find((c) => c.name === "Hermes binary discovery");
-    assert.ok(discoveryCheck, "Expected Hermes binary discovery check");
-    assert.strictEqual(discoveryCheck!.status, "info");
-    assert.ok(
-      discoveryCheck!.message.includes("Found on PATH"),
-      `Message should say 'Found on PATH', got: ${discoveryCheck!.message}`,
-    );
-    assert.ok(
-      discoveryCheck!.message.includes(hermesStub),
-      `Message should include the resolved PATH, got: ${discoveryCheck!.message}`,
-    );
-  });
-
-  it("discovery chain reports 'Found via login shell' when hermes is only on login-shell PATH", async () => {
-    savedHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
-    delete process.env.TAMANDUA_HERMES_BINARY;
-
-    // Remove hermes from PATH but put a fake zsh that reports hermes
-    savedPath = process.env.PATH;
-    fixtureDir = createTempHome();
-    const hermesPath = path.join(fixtureDir, "real-hermes");
-    fs.writeFileSync(hermesPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
-
-    // Create a fake zsh that just echoes the hermes path
-    const fakeZsh = path.join(fixtureDir, "zsh");
-    fs.writeFileSync(fakeZsh, `#!/bin/sh\necho "${hermesPath}"\n`, { mode: 0o755 });
-
-    // PATH has fake zsh but no hermes
-    process.env.PATH = `${fixtureDir}:/usr/bin:/bin`;
-
-    // Isolate HOME so ensureHermesSymlink doesn't touch real filesystem
-    savedHome = process.env.HOME;
-    process.env.HOME = fixtureDir;
-
-    const groups = await runDoctorChecks();
-    const env = groups.find((g) => g.label === "ENVIRONMENT");
-    assert.ok(env);
-
-    const discoveryCheck = env!.checks.find((c) => c.name === "Hermes binary discovery");
-    assert.ok(discoveryCheck, "Expected Hermes binary discovery check");
-    assert.strictEqual(discoveryCheck!.status, "info");
-    assert.ok(
-      discoveryCheck!.message.includes("Found via login shell"),
-      `Message should say 'Found via login shell', got: ${discoveryCheck!.message}`,
-    );
-  });
-
-  it("discovery chain reports not found when hermes is absent from all tiers", async () => {
-    savedHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
-    delete process.env.TAMANDUA_HERMES_BINARY;
-
-    savedPath = process.env.PATH;
-    fixtureDir = createTempHome();
-
-    // Create a fake zsh that won't find hermes — echoes nothing
-    const fakeZsh = path.join(fixtureDir, "zsh");
-    fs.writeFileSync(fakeZsh, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
-
-    // PATH has our fake zsh (no hermes anywhere)
-    process.env.PATH = `${fixtureDir}:/usr/bin:/bin`;
-
-    // Isolate HOME so the login-shell fallback doesn't touch real fs
-    savedHome = process.env.HOME;
-    process.env.HOME = fixtureDir;
-
-    const groups = await runDoctorChecks();
-    const env = groups.find((g) => g.label === "ENVIRONMENT");
-    assert.ok(env);
-
-    const discoveryCheck = env!.checks.find((c) => c.name === "Hermes binary discovery");
-    assert.ok(discoveryCheck, "Expected Hermes binary discovery check");
-    assert.strictEqual(discoveryCheck!.status, "info");
-    assert.ok(
-      discoveryCheck!.message.includes("not found") || discoveryCheck!.message.includes("not set"),
-      `Message should indicate hermes not found, got: ${discoveryCheck!.message}`,
-    );
-    assert.ok(
-      discoveryCheck!.message.includes("optional"),
-      `Message should mention optional, got: ${discoveryCheck!.message}`,
-    );
-  });
-
-  it("symlink check reports correct target when symlink points to the discovered hermes", async () => {
-    savedHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
-
-    fixtureDir = createTempHome();
-    const hermesPath = path.join(fixtureDir, "hermes");
-    fs.writeFileSync(hermesPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
-    process.env.TAMANDUA_HERMES_BINARY = hermesPath;
-
-    // Create the symlink pointing to the right target
-    savedHome = process.env.HOME;
-    process.env.HOME = fixtureDir;
-    const binDir = path.join(fixtureDir, ".local", "bin");
-    fs.mkdirSync(binDir, { recursive: true });
-    fs.symlinkSync(hermesPath, path.join(binDir, "hermes"));
-
-    const groups = await runDoctorChecks();
-    const env = groups.find((g) => g.label === "ENVIRONMENT");
-    assert.ok(env);
-
-    const symlinkCheck = env!.checks.find((c) => c.name === "Hermes ~/.local/bin symlink");
-    assert.ok(symlinkCheck, "Expected Hermes symlink check");
-    assert.strictEqual(symlinkCheck!.status, "info");
-    assert.ok(
-      symlinkCheck!.message.includes("correct target"),
-      `Message should say 'correct target', got: ${symlinkCheck!.message}`,
-    );
-  });
-
-  it("symlink check reports wrong target when symlink points elsewhere", async () => {
-    savedHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
-
-    fixtureDir = createTempHome();
-    const hermesPath = path.join(fixtureDir, "hermes");
-    fs.writeFileSync(hermesPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
-    process.env.TAMANDUA_HERMES_BINARY = hermesPath;
-
-    // Create the symlink pointing to a DIFFERENT target
-    savedHome = process.env.HOME;
-    process.env.HOME = fixtureDir;
-    const binDir = path.join(fixtureDir, ".local", "bin");
-    fs.mkdirSync(binDir, { recursive: true });
-    const wrongTarget = path.join(fixtureDir, "other-hermes");
-    fs.writeFileSync(wrongTarget, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
-    fs.symlinkSync(wrongTarget, path.join(binDir, "hermes"));
-
-    const groups = await runDoctorChecks();
-    const env = groups.find((g) => g.label === "ENVIRONMENT");
-    assert.ok(env);
-
-    const symlinkCheck = env!.checks.find((c) => c.name === "Hermes ~/.local/bin symlink");
-    assert.ok(symlinkCheck, "Expected Hermes symlink check");
-    assert.strictEqual(symlinkCheck!.status, "info");
-    assert.ok(
-      symlinkCheck!.message.includes("wrong target"),
-      `Message should say 'wrong target', got: ${symlinkCheck!.message}`,
-    );
-    assert.ok(
-      symlinkCheck!.message.includes(hermesPath),
-      `Message should include expected path, got: ${symlinkCheck!.message}`,
-    );
-  });
-
-  it("symlink check reports absent when no symlink exists", async () => {
-    savedHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
-    delete process.env.TAMANDUA_HERMES_BINARY;
-
-    // No hermes available → symlink check still runs with no path info
-    savedPath = process.env.PATH;
-    process.env.PATH = "/usr/bin:/bin";
-
-    fixtureDir = createTempHome();
-    savedHome = process.env.HOME;
-    process.env.HOME = fixtureDir;
-    // Don't create ~/.local/bin/hermes — should report absent
-
-    const groups = await runDoctorChecks();
-    const env = groups.find((g) => g.label === "ENVIRONMENT");
-    assert.ok(env);
-
-    const symlinkCheck = env!.checks.find((c) => c.name === "Hermes ~/.local/bin symlink");
-    assert.ok(symlinkCheck, "Expected Hermes symlink check");
-    assert.strictEqual(symlinkCheck!.status, "info");
-    assert.ok(
-      symlinkCheck!.message.includes("No symlink"),
-      `Message should say 'No symlink', got: ${symlinkCheck!.message}`,
-    );
-    assert.ok(
-      symlinkCheck!.message.includes("daemon PATH"),
-      `Message should mention daemon PATH, got: ${symlinkCheck!.message}`,
-    );
-  });
-
-  it("symlink check reports regular file when path exists but is not a symlink", async () => {
-    savedHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
-    delete process.env.TAMANDUA_HERMES_BINARY;
-
-    savedPath = process.env.PATH;
-    process.env.PATH = "/usr/bin:/bin";
-
-    fixtureDir = createTempHome();
-    savedHome = process.env.HOME;
-    process.env.HOME = fixtureDir;
-
-    // Create a regular file at ~/.local/bin/hermes instead of a symlink
-    const binDir = path.join(fixtureDir, ".local", "bin");
-    fs.mkdirSync(binDir, { recursive: true });
-    fs.writeFileSync(path.join(binDir, "hermes"), "regular file content", "utf-8");
-
-    const groups = await runDoctorChecks();
-    const env = groups.find((g) => g.label === "ENVIRONMENT");
-    assert.ok(env);
-
-    const symlinkCheck = env!.checks.find((c) => c.name === "Hermes ~/.local/bin symlink");
-    assert.ok(symlinkCheck, "Expected Hermes symlink check");
-    assert.strictEqual(symlinkCheck!.status, "info");
-    assert.ok(
-      symlinkCheck!.message.includes("regular file"),
-      `Message should say 'regular file', got: ${symlinkCheck!.message}`,
-    );
-  });
-
-  it("contract check references the discovered binary path", async () => {
-    savedHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
-    savedHermesHome = process.env.HERMES_HOME;
-
-    fixtureDir = createTempHome();
-    const hermesPath = path.join(fixtureDir, "hermes");
-    fs.writeFileSync(hermesPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
-    process.env.TAMANDUA_HERMES_BINARY = hermesPath;
-
-    // Create a valid hermes state.db fixture
-    seedHermesFixtureDb(fixtureDir);
-    process.env.HERMES_HOME = fixtureDir;
-
-    const groups = await runDoctorChecks();
-    const env = groups.find((g) => g.label === "ENVIRONMENT");
-    assert.ok(env);
-
-    const contractCheck = env!.checks.find((c) => c.name === "Hermes state.db contract");
-    assert.ok(contractCheck, "Expected Hermes state.db contract check");
-    assert.ok(
-      contractCheck!.message.includes("probed against"),
-      `Contract message should mention 'probed against', got: ${contractCheck!.message}`,
-    );
-    assert.ok(
-      contractCheck!.message.includes(hermesPath),
-      `Contract message should reference the hermes binary path, got: ${contractCheck!.message}`,
-    );
   });
 });
 
