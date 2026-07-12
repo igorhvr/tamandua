@@ -4784,6 +4784,10 @@ describe("dashboard suite stats and flaky keys", () => {
     process.env.TAMANDUA_STATE_DIR = stateDir;
 
     const db = getDb();
+    // Bare COUNT(*) is safe here because this test creates its own isolated DB
+    // via createTempHome() and this file runs in the serial lane (tests/serial-files.txt).
+    // A future refactor that adds concurrent siblings or shares the DB across tests
+    // MUST scope these COUNT queries with WHERE clauses keyed to test-specific rows.
     const runsBefore = (db.prepare("SELECT COUNT(*) AS cnt FROM runs").get() as { cnt: number }).cnt;
     const stepsBefore = (db.prepare("SELECT COUNT(*) AS cnt FROM steps").get() as { cnt: number }).cnt;
 
@@ -4791,6 +4795,7 @@ describe("dashboard suite stats and flaky keys", () => {
 
     try {
       await fetch(`${baseUrl}/api/suite/flaky`);
+      // Same isolation assumption as above: per-test tempHome + serial lane = safe.
       const runsAfter = (db.prepare("SELECT COUNT(*) AS cnt FROM runs").get() as { cnt: number }).cnt;
       const stepsAfter = (db.prepare("SELECT COUNT(*) AS cnt FROM steps").get() as { cnt: number }).cnt;
       assert.equal(runsAfter, runsBefore);

@@ -263,7 +263,7 @@ describe("recoverOrphanedStepsForAgent — story-level WLST", () => {
       agentId: "wf-dead_fixer",
       abandonedCount: 0,
       retryCount: 2,
-      backdateSeconds: 5,
+      backdateSeconds: 30,
     });
 
     const { recoverOrphanedStepsForAgent } = await import("../dist/installer/step-ops.js");
@@ -283,7 +283,7 @@ describe("recoverOrphanedStepsForAgent — story-level WLST", () => {
       agentId: "wf-dead_fixer",
       abandonedCount: 3,
       retryCount: 1,
-      backdateSeconds: 5,
+      backdateSeconds: 30,
     });
 
     const { recoverOrphanedStepsForAgent } = await import("../dist/installer/step-ops.js");
@@ -295,7 +295,7 @@ describe("recoverOrphanedStepsForAgent — story-level WLST", () => {
     // Reset step back to running for next recovery
     const db = getDb();
     // Backdate again after first recovery
-    const ago = new Date(Date.now() - 5 * 1000).toISOString();
+    const ago = new Date(Date.now() - 30 * 1000).toISOString();
     db.prepare("UPDATE steps SET status = 'running', current_story_id = ?, updated_at = ? WHERE run_id = ?").run(storyRowId, ago, runId);
     db.prepare("UPDATE stories SET status = 'running', updated_at = ? WHERE id = ?").run(ago, storyRowId);
 
@@ -313,7 +313,7 @@ describe("recoverOrphanedStepsForAgent — story-level WLST", () => {
       agentId: "wf-dead_fixer",
       abandonedCount: 8,
       retryCount: 0,
-      backdateSeconds: 5,
+      backdateSeconds: 30,
     });
 
     const { recoverOrphanedStepsForAgent } = await import("../dist/installer/step-ops.js");
@@ -338,7 +338,7 @@ describe("recoverOrphanedStepsForAgent — story-level WLST", () => {
       abandonedCount: 0,
       retryCount: 3,
       maxRetries: 4,
-      backdateSeconds: 5,
+      backdateSeconds: 30,
     });
 
     const { recoverOrphanedStepsForAgent } = await import("../dist/installer/step-ops.js");
@@ -449,7 +449,7 @@ describe("recoverOrphanedStepsForAgent — timeout_retry feedback (story-level)"
       agentId: "wf-dead_fixer",
       abandonedCount: 0,
       retryCount: 2,
-      backdateSeconds: 5,
+      backdateSeconds: 30,
     });
 
     const timeoutReason = "previous attempt was killed by the 30-minute harness timeout — plan the work to fit, or split it.";
@@ -477,7 +477,7 @@ describe("recoverOrphanedStepsForAgent — timeout_retry feedback (story-level)"
       agentId: "wf-dead_fixer",
       abandonedCount: 0,
       retryCount: 2,
-      backdateSeconds: 5,
+      backdateSeconds: 30,
       // The input_template must include {{timeout_retry}} so the resolver
       // injects the timeout message — just like real workflow YAML templates.
       inputTemplate: "Story: {{current_story}}\nID: {{current_story_id}}\nTitle: {{current_story_title}}\nTIMEOUT RETRY: {{timeout_retry}}\nRETRY FEEDBACK: {{retry_feedback}}",
@@ -504,7 +504,7 @@ describe("recoverOrphanedStepsForAgent — timeout_retry feedback (story-level)"
       agentId: "wf-dead_fixer",
       abandonedCount: 0,
       retryCount: 2,
-      backdateSeconds: 5,
+      backdateSeconds: 30,
       inputTemplate: "Story: {{current_story}}\nTIMEOUT RETRY: {{timeout_retry}}",
     });
 
@@ -532,7 +532,7 @@ describe("recoverOrphanedStepsForAgent — timeout_retry feedback (story-level)"
       agentId: "wf-dead_fixer",
       abandonedCount: 0,
       retryCount: 0,
-      backdateSeconds: 5,
+      backdateSeconds: 30,
     });
 
     // Recovery WITHOUT timeout reason (non-timeout worker loss, e.g. crash)
@@ -557,7 +557,7 @@ describe("recoverOrphanedStepsForAgent — timeout_retry feedback (story-level)"
       agentId: "wf-dead_fixer",
       abandonedCount: 0,
       retryCount: 0,
-      backdateSeconds: 5,
+      backdateSeconds: 30,
     });
 
     // Simulate the formatted feedback that agent-scheduler would produce
@@ -1139,7 +1139,7 @@ describe("ABND story_abandonments — reason threading", () => {
       agentId: "wf-abnd_fixer",
       abandonedCount: 0,
       retryCount: 0,
-      backdateSeconds: 5,
+      backdateSeconds: 30,
     });
 
     // Call WITHOUT explicit abandonReason — should default to "worker_lost"
@@ -1161,7 +1161,7 @@ describe("ABND story_abandonments — reason threading", () => {
     const runId = crypto.randomUUID();
     const storyRowId = crypto.randomUUID();
     const stepRowId = crypto.randomUUID();
-    const ago = new Date(Date.now() - 5000).toISOString();
+    const ago = new Date(Date.now() - 30000).toISOString();
 
     db.prepare(
       "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 'wf-dead', 'task', 'running', '{}', 0, ?, ?)",
@@ -1199,13 +1199,13 @@ describe("ABND story_abandonments — reason threading", () => {
       agentId: "wf-abnd_fixer",
       abandonedCount: 0,
       retryCount: 0,
-      backdateSeconds: 5,
+      backdateSeconds: 30,
     });
     const run2 = seedStoryRun({
       agentId: "wf-abnd_fixer",
       abandonedCount: 0,
       retryCount: 0,
-      backdateSeconds: 5,
+      backdateSeconds: 30,
     });
 
     // Recover run1 with liveness_detected
@@ -1239,7 +1239,7 @@ describe("ABND story_abandonments — reason threading", () => {
       agentId: "wf-abnd_fixer",
       abandonedCount: 0,
       retryCount: 0,
-      backdateSeconds: 5,
+      backdateSeconds: 30,
     });
 
     recoverOrphanedStepsForAgent("wf-abnd_fixer", runId, 0,
@@ -1284,7 +1284,7 @@ describe("ABND story_abandonments — reason threading", () => {
       agentId: "wf-abnd_fixer",
       abandonedCount: 0,
       retryCount: 0,
-      backdateSeconds: 5,
+      backdateSeconds: 30,
     });
 
     // First abandonment
@@ -1295,7 +1295,7 @@ describe("ABND story_abandonments — reason threading", () => {
     );
 
     // Reset story for second abandonment
-    const ago = new Date(Date.now() - 5000).toISOString();
+    const ago = new Date(Date.now() - 30000).toISOString();
     db.prepare("UPDATE steps SET status = 'running', current_story_id = ?, updated_at = ? WHERE run_id = ?").run(storyRowId, ago, runId);
     db.prepare("UPDATE stories SET status = 'running', updated_at = ? WHERE id = ?").run(ago, storyRowId);
 
@@ -1323,7 +1323,7 @@ describe("ABND story_abandonments — reason threading", () => {
       agentId: "wf-abnd_fixer",
       abandonedCount: 8,
       retryCount: 0,
-      backdateSeconds: 5,
+      backdateSeconds: 30,
     });
 
     const result = recoverOrphanedStepsForAgent("wf-abnd_fixer", runId, 0,
@@ -1349,7 +1349,7 @@ describe("ABND story_abandonments — reason threading", () => {
       agentId: "wf-abnd_fixer",
       abandonedCount: 3,
       retryCount: 1,
-      backdateSeconds: 5,
+      backdateSeconds: 30,
     });
 
     // First recovery
@@ -1362,7 +1362,7 @@ describe("ABND story_abandonments — reason threading", () => {
 
     // Reset for second recovery
     const db = getDb();
-    const ago = new Date(Date.now() - 5000).toISOString();
+    const ago = new Date(Date.now() - 30000).toISOString();
     db.prepare("UPDATE steps SET status = 'running', current_story_id = ?, updated_at = ? WHERE run_id = ?").run(storyRowId, ago, runId);
     db.prepare("UPDATE stories SET status = 'running', updated_at = ? WHERE id = ?").run(ago, storyRowId);
 
@@ -1517,7 +1517,7 @@ describe("ABND — abandon reason aggregate", () => {
       agentId: "wf-abnd_fixer",
       abandonedCount: 8,
       retryCount: 0,
-      backdateSeconds: 5,
+      backdateSeconds: 30,
     });
 
     // Insert prior abandonments with different reasons
@@ -1757,7 +1757,7 @@ describe("ABND — abandon reason aggregate", () => {
     const db = getDb();
     const runId = crypto.randomUUID();
     const stepRowId = crypto.randomUUID();
-    const ago = new Date(Date.now() - 5000).toISOString();
+    const ago = new Date(Date.now() - 30000).toISOString();
 
     db.prepare(
       "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 'wf-dead', 'task', 'running', '{}', 0, ?, ?)"
@@ -1789,7 +1789,7 @@ describe("ABND — abandon reason aggregate", () => {
       agentId: "wf-abnd_fixer",
       abandonedCount: 0,
       retryCount: 0,
-      backdateSeconds: 5,
+      backdateSeconds: 30,
     });
 
     recoverOrphanedStepsForAgent("wf-abnd_fixer", runId, 0,
@@ -1819,7 +1819,7 @@ describe("ABND — abandon reason aggregate", () => {
       agentId: "wf-abnd_fixer",
       abandonedCount: 8,
       retryCount: 0,
-      backdateSeconds: 5,
+      backdateSeconds: 30,
     });
 
     // Pre-seed 3 reasons for richer aggregate

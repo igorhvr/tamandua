@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { resolveSourcePath } from "../dist/installer/paths.js";
 import {
@@ -139,12 +140,13 @@ describe("tamandua update command helpers", () => {
     const sourcePath = createSourceRoot();
     const commands: string[] = [];
     const { output, logs } = createOutput();
+    const sha = crypto.randomBytes(8).toString('hex');
 
     try {
       const result = await runUpdate({
         sourcePath,
         output,
-        runCommand: createRunCommand(["aaaaaaaaaaaaaaaa", "aaaaaaaaaaaaaaaa"], commands),
+        runCommand: createRunCommand([sha, sha], commands),
         services: {
           ...createServices({
             dashboard: { running: false, pid: null, port: 4101 },
@@ -178,12 +180,14 @@ describe("tamandua update command helpers", () => {
     const commands: string[] = [];
     const serviceCalls: string[] = [];
     const { output, warnings } = createOutput();
+    const sha1 = crypto.randomBytes(8).toString('hex');
+    const sha2 = crypto.randomBytes(8).toString('hex');
 
     try {
       const result = await runUpdate({
         sourcePath,
         output,
-        runCommand: createRunCommand(["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"], commands),
+        runCommand: createRunCommand([sha1, sha2], commands),
         services: createServices({
           dashboard: { running: true, pid: 111111, port: 4201 },
           mcp: { running: true, pid: 222222, port: 4202 },
@@ -225,13 +229,15 @@ describe("tamandua update command helpers", () => {
     const waitedPids: number[] = [];
     const installed: string[] = [];
     const { output, warnings } = createOutput();
+    const sha1 = crypto.randomBytes(8).toString('hex');
+    const sha2 = crypto.randomBytes(8).toString('hex');
 
     try {
       const result = await runUpdate({
         force: true,
         sourcePath,
         output,
-        runCommand: createRunCommand(["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"], commands),
+        runCommand: createRunCommand([sha1, sha2], commands),
         services: createServices({
           dashboard: { running: true, pid: 111111, port: 4301 },
           mcp: { running: false, pid: null, port: 4302 },
@@ -271,13 +277,15 @@ describe("tamandua update command helpers", () => {
   it("restarts previously running services if workflow install fails", async () => {
     const sourcePath = createSourceRoot();
     const serviceCalls: string[] = [];
+    const sha1 = crypto.randomBytes(8).toString('hex');
+    const sha2 = crypto.randomBytes(8).toString('hex');
 
     try {
       await assert.rejects(
         () => runUpdate({
           sourcePath,
           output: createOutput().output,
-          runCommand: createRunCommand(["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"], []),
+          runCommand: createRunCommand([sha1, sha2], []),
           services: createServices({
             dashboard: { running: false, pid: null, port: 4401 },
             mcp: { running: true, pid: 222222, port: 4402 },
@@ -310,13 +318,14 @@ describe("tamandua update command helpers", () => {
     const waitedPids: number[] = [];
     const installed: string[] = [];
     const { output, logs } = createOutput();
+    const sha = crypto.randomBytes(8).toString('hex');
 
     try {
       const result = await runUpdate({
         force: true,
         sourcePath,
         output,
-        runCommand: createRunCommand(["aaaaaaaaaaaaaaaa", "aaaaaaaaaaaaaaaa"], commands),
+        runCommand: createRunCommand([sha, sha], commands),
         services: createServices({
           dashboard: { running: true, pid: 111111, port: 4401 },
           mcp: { running: false, pid: null, port: 4402 },
@@ -359,13 +368,14 @@ describe("tamandua update command helpers", () => {
     const sourcePath = createSourceRoot();
     const commands: string[] = [];
     const { output } = createOutput();
+    const sha = crypto.randomBytes(8).toString('hex');
 
     try {
       const result = await runUpdate({
         force: true,
         sourcePath,
         output,
-        runCommand: createRunCommand(["aaaaaaaaaaaaaaaa", "aaaaaaaaaaaaaaaa"], commands),
+        runCommand: createRunCommand([sha, sha], commands),
         services: createServices({
           dashboard: { running: false, pid: null, port: 4501 },
           mcp: { running: false, pid: null, port: 4502 },

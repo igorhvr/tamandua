@@ -18,6 +18,7 @@ import path from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { setTimeout as sleep } from "node:timers/promises";
+import crypto from "node:crypto";
 import http from "node:http";
 import { fileURLToPath } from "node:url";
 
@@ -167,7 +168,7 @@ describe("tamandua workflow resume CLI", { concurrency: 1 }, () => {
 
     const dbPath = path.join(th.tamanduaDir, "tamandua.db");
 
-    const pausedRunId = "cccccccc-1111-2222-3333-444455556666";
+    const pausedRunId = crypto.randomUUID();
     seedRunDb(dbPath, [
       {
         id: pausedRunId,
@@ -243,7 +244,7 @@ describe("tamandua workflow resume CLI", { concurrency: 1 }, () => {
 
     const dbPath = path.join(th.tamanduaDir, "tamandua.db");
 
-    const completedRunId = "dddddddd-1111-2222-3333-444455556666";
+    const completedRunId = crypto.randomUUID();
     seedRunDb(dbPath, [
       {
         id: completedRunId,
@@ -280,7 +281,7 @@ describe("tamandua workflow resume CLI", { concurrency: 1 }, () => {
 
     const dbPath = path.join(th.tamanduaDir, "tamandua.db");
 
-    const canceledRunId = "eeeeeeee-1111-2222-3333-444455556666";
+    const canceledRunId = crypto.randomUUID();
     seedRunDb(dbPath, [
       {
         id: canceledRunId,
@@ -326,8 +327,8 @@ describe("tamandua workflow resume CLI", { concurrency: 1 }, () => {
 
     const dbPath = path.join(th.tamanduaDir, "tamandua.db");
 
-    const failedRunId = "ffffffff-1111-2222-3333-444455556666";
-    const stepId = "00000000-aaaa-bbbb-cccc-ddddeeee0001";
+    const failedRunId = crypto.randomUUID();
+    const stepId = crypto.randomUUID();
     seedRunDb(dbPath, [
       {
         id: failedRunId,
@@ -397,7 +398,7 @@ describe("tamandua workflow resume CLI", { concurrency: 1 }, () => {
 
     const dbPath = path.join(th.tamanduaDir, "tamandua.db");
 
-    const runningRunId = "99999999-aaaa-bbbb-cccc-ddddeeee0000";
+    const runningRunId = crypto.randomUUID();
     seedRunDb(dbPath, [
       {
         id: runningRunId,
@@ -432,7 +433,7 @@ describe("tamandua workflow resume CLI", { concurrency: 1 }, () => {
 
     const dbPath = path.join(th.tamanduaDir, "tamandua.db");
 
-    const pausedRunId = "bbbbbbbb-aaaa-cccc-dddd-eeeeffff0000";
+    const pausedRunId = crypto.randomUUID();
     seedRunDb(dbPath, [
       {
         id: pausedRunId,
