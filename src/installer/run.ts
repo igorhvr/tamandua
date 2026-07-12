@@ -374,7 +374,7 @@ export async function resumeWorkflow(runId: string): Promise<ResumeResult> {
   if (!run) return { status: "not_found" };
 
   await ensureDaemonControlAvailable();
-  validateRunHarnessForScheduling(run.id, run.context);
+  await validateRunHarnessForScheduling(run.id, run.context);
 
   // Reset the run to running and request fresh scheduling admission.
   const resumeNow = new Date().toISOString();
