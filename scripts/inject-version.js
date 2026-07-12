@@ -15,8 +15,13 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, "..");
 
 const pkgPath = path.join(repoRoot, "package.json");
-const cliPath = path.join(repoRoot, "dist", "cli", "cli.js");
 const versionPath = path.join(repoRoot, "dist", "version");
+
+// Files that may contain __VERSION__ placeholders to inject into
+const injectTargets = [
+  path.join(repoRoot, "dist", "cli", "cli.js"),
+  path.join(repoRoot, "dist", "cli", "commands", "standalone.js"),
+];
 
 /**
  * Compute build version from git state.
@@ -71,18 +76,20 @@ fs.mkdirSync(path.dirname(versionPath), { recursive: true });
 fs.writeFileSync(versionPath, version + "\n", "utf-8");
 console.log(`Build version: ${version}`);
 
-// Inject version into dist/cli/cli.js, replacing __VERSION__ placeholder
-if (!fs.existsSync(cliPath)) {
-  console.error("dist/cli/cli.js not found — run 'npm run build' first");
-  process.exit(1);
+// Inject version into built files, replacing __VERSION__ placeholder
+for (const targetPath of injectTargets) {
+  if (!fs.existsSync(targetPath)) continue;
+
+  let source = fs.readFileSync(targetPath, "utf-8");
+
+  if (source.includes("__VERSION__")) {
+    source = source.replace(/"__VERSION__"/g, JSON.stringify(version));
+    fs.writeFileSync(targetPath, source, "utf-8");
+    console.log(`Injected version into ${path.relative(repoRoot, targetPath)}`);
+  }
 }
 
-let cliSource = fs.readFileSync(cliPath, "utf-8");
-
-if (cliSource.includes("__VERSION__")) {
-  cliSource = cliSource.replace(/"__VERSION__"/g, JSON.stringify(version));
-  fs.writeFileSync(cliPath, cliSource, "utf-8");
-  console.log(`Injected version into dist/cli/cli.js`);
-} else {
-  console.log("No __VERSION__ placeholder found — skipping injection");
+if (injectTargets.every(p => !fs.existsSync(p))) {
+  console.error("No dist CLI files found — run 'npm run build' first");
+  process.exit(1);
 }
