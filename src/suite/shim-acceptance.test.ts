@@ -455,6 +455,19 @@ describe("TSTX Acceptance Criteria & Monotonicity", { concurrency: 1 }, () => {
     ).run(originRepo, treeHash, cmdHash, s.failScript.slice(0, 200), new Date().toISOString());
     db.close();
 
+    // Seed a sentinel run so the runs-table side-effect assertion is scoped
+    // to before/after count comparison rather than relying on an empty table
+    // (which a future refactor adding concurrent test siblings could perturb).
+    const sentinelRunId = "r-ac4-sentinel-" + crypto.randomBytes(4).toString("hex");
+    const sentinelNow = new Date().toISOString();
+    const preDb = new DatabaseSync(s.dbPath);
+    preDb.prepare(
+      `INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
+       VALUES (?, 0, 'noop', 'sentinel', 'done', '{}', 0, ?, ?)`,
+    ).run(sentinelRunId, sentinelNow, sentinelNow);
+    const runsBefore = (preDb.prepare("SELECT COUNT(*) as cnt FROM runs").get() as { cnt: number }).cnt;
+    preDb.close();
+
     // Query flaky endpoint.
     const flakyResp = await controlGet(
       s.controlPort,
@@ -473,9 +486,14 @@ describe("TSTX Acceptance Criteria & Monotonicity", { concurrency: 1 }, () => {
     assert.ok((key.fail_count as number) >= 1, "should count failures");
 
     // Verify no side effects: flaky query creates no runs.
+    // Scoped: compare before/after count (with a sentinel seeded above)
+    // rather than assuming an empty table.
     const db2 = new DatabaseSync(s.dbPath);
-    const runCount = (db2.prepare("SELECT COUNT(*) as cnt FROM runs").get() as { cnt: number }).cnt;
-    assert.equal(runCount, 0, "flaky query should not create runs");
+    const runsAfter = (db2.prepare("SELECT COUNT(*) as cnt FROM runs").get() as { cnt: number }).cnt;
+    assert.equal(runsAfter, runsBefore, "flaky query should not create runs");
+    // Verify sentinel is still intact.
+    const sentinel = db2.prepare("SELECT id FROM runs WHERE id = ?").get(sentinelRunId);
+    assert.ok(sentinel, "sentinel run should still exist after flaky query");
     db2.close();
   });
 

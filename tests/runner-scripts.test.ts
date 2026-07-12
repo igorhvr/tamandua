@@ -324,8 +324,12 @@ describe("run-parallel-tests.sh", () => {
 describe("run-all-lanes.sh", () => {
   const ALL_LANES_SCRIPT = path.join(REPO_ROOT, "scripts", "run-all-lanes.sh");
 
-  function setupTempRepo(tmpDir, { serialFiles, parallelFiles }) {
+  function setupTempRepo(tmpDir, { serialFiles, parallelFiles, pkgOverrides }) {
     copyChildScripts(tmpDir);
+
+    // Create package.json with a working build script (build step added by TBLD fix)
+    const pkg = { name: "test", scripts: { build: "echo 'build ok'" }, ...pkgOverrides };
+    writeText(path.join(tmpDir, "package.json"), JSON.stringify(pkg));
 
     // Create serial-files.txt with entries
     writeText(path.join(tmpDir, "tests", "serial-files.txt"), serialFiles.join("\n") + "\n");
@@ -456,6 +460,7 @@ describe("run-all-lanes.sh", () => {
     const tmpDir = makeTmpDir();
     try {
       copyChildScripts(tmpDir);
+      writeText(path.join(tmpDir, "package.json"), JSON.stringify({ name: "test", scripts: { build: "echo 'build ok'" } }));
       writeText(path.join(tmpDir, "tests", "serial-files.txt"), "src/serial-fail.test.ts\n");
       writeText(path.join(tmpDir, "src", "serial-fail.test.ts"), failTestContent());
       writeText(path.join(tmpDir, "src", "parallel-ok.test.ts"), passTestContent());
@@ -491,6 +496,7 @@ describe("run-all-lanes.sh", () => {
     const tmpDir = makeTmpDir();
     try {
       copyChildScripts(tmpDir);
+      writeText(path.join(tmpDir, "package.json"), JSON.stringify({ name: "test", scripts: { build: "echo 'build ok'" } }));
       writeText(path.join(tmpDir, "tests", "serial-files.txt"), "src/serial-ok.test.ts\n");
       writeText(path.join(tmpDir, "src", "serial-ok.test.ts"), passTestContent());
       writeText(path.join(tmpDir, "src", "parallel-fail.test.ts"), failTestContent());
@@ -525,6 +531,7 @@ describe("run-all-lanes.sh", () => {
     const tmpDir = makeTmpDir();
     try {
       copyChildScripts(tmpDir);
+      writeText(path.join(tmpDir, "package.json"), JSON.stringify({ name: "test", scripts: { build: "echo 'build ok'" } }));
       writeText(path.join(tmpDir, "tests", "serial-files.txt"), "src/serial-fail.test.ts\n");
       writeText(path.join(tmpDir, "src", "serial-fail.test.ts"), failTestContent());
       writeText(path.join(tmpDir, "src", "parallel-fail.test.ts"), failTestContent());
@@ -581,6 +588,99 @@ describe("run-all-lanes.sh", () => {
       assert.ok(
         result.includes("Parallel lane:"),
         "summary must mention parallel lane",
+      );
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  // TBLD: Regression tests for https://github.com/tamandua/issues/TBLD-stale-dist
+  it("TBLD: includes build step before lane execution", () => {
+    const content = fs.readFileSync(ALL_LANES_SCRIPT, "utf-8");
+    assert.ok(
+      content.includes("npm run build"),
+      "run-all-lanes.sh must contain 'npm run build' for TBLD fix",
+    );
+    // Build must come before the TAMANDUA_TEST_GUARD export
+    const buildIdx = content.indexOf("npm run build");
+    const guardIdx = content.indexOf('TAMANDUA_TEST_GUARD="${TAMANDUA_TEST_GUARD:-1}"');
+    assert.ok(buildIdx >= 0, "npm run build must be present");
+    assert.ok(guardIdx >= 0, "TAMANDUA_TEST_GUARD export must be present");
+    assert.ok(
+      buildIdx < guardIdx,
+      "npm run build must appear before TAMANDUA_TEST_GUARD export (build runs before lanes)",
+    );
+  });
+
+  it("TBLD: exits non-zero on build failure without running lanes", () => {
+    const tmpDir = makeTmpDir();
+    try {
+      copyChildScripts(tmpDir);
+      // Create a package.json with a failing build script
+      writeText(path.join(tmpDir, "package.json"), JSON.stringify({
+        name: "test",
+        scripts: { build: "echo 'BUILD FAILED' >&2 && exit 1" },
+      }));
+      writeText(path.join(tmpDir, "tests", "serial-files.txt"), "src/serial.test.ts\n");
+      writeText(path.join(tmpDir, "src", "serial.test.ts"), passTestContent());
+      writeText(path.join(tmpDir, "src", "parallel.test.ts"), passTestContent());
+
+      try {
+        execFileSync("bash", [ALL_LANES_SCRIPT], {
+          cwd: tmpDir,
+          env: cleanChildEnv({ HOME: tmpDir, TAMANDUA_REPO_ROOT: tmpDir, TAMANDUA_TEST_GUARD: "0" }),
+          stdio: "pipe",
+          encoding: "utf-8",
+        });
+        assert.fail("Should have exited non-zero on build failure");
+      } catch (e) {
+        assert.notEqual(e.status, 0, "exit code must be non-zero on build failure");
+        const stderr = e.stderr || "";
+        assert.ok(
+          stderr.includes("Build failed"),
+          "stderr must contain 'Build failed': " + stderr.slice(0, 500),
+        );
+        assert.ok(
+          stderr.includes("Last 20 lines"),
+          "stderr must contain 'Last 20 lines': " + stderr.slice(0, 500),
+        );
+        // Lanes must NOT have run
+        const stdout = e.stdout || "";
+        assert.ok(
+          !stdout.includes("SERIAL lane"),
+          "serial lane must NOT run on build failure",
+        );
+        assert.ok(
+          !stdout.includes("PARALLEL lane"),
+          "parallel lane must NOT run on build failure",
+        );
+      }
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("TBLD: build log cleaned up on successful build", () => {
+    const tmpDir = makeTmpDir();
+    try {
+      setupTempRepo(tmpDir, {
+        serialFiles: ["src/serial.test.ts"],
+        parallelFiles: ["src/parallel.test.ts"],
+      });
+
+      execFileSync("bash", [ALL_LANES_SCRIPT], {
+        cwd: tmpDir,
+        env: cleanChildEnv({ HOME: tmpDir, TAMANDUA_REPO_ROOT: tmpDir, TAMANDUA_TEST_GUARD: "0" }),
+        stdio: "pipe",
+        encoding: "utf-8",
+      });
+
+      // Check that no build log files were left behind in TMPDIR or /tmp
+      const tmpContents = fs.readdirSync("/tmp");
+      const leakedLogs = tmpContents.filter(f => f.startsWith("tamandua-build-"));
+      assert.equal(
+        leakedLogs.length, 0,
+        "no tamandua-build log files should be left in /tmp after a successful build. Found: " + leakedLogs.join(", "),
       );
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -657,7 +757,7 @@ describe("prll-verify.sh", () => {
       // package.json with npm test pointing to run-all-lanes.sh
       writeText(path.join(tmpDir, "package.json"), JSON.stringify({
         name: "test",
-        scripts: { test: "bash scripts/run-all-lanes.sh" },
+        scripts: { build: "echo 'build ok'", test: "bash scripts/run-all-lanes.sh" },
       }));
 
       // Create passing test files
@@ -705,7 +805,7 @@ describe("prll-verify.sh", () => {
 
       writeText(path.join(tmpDir, "package.json"), JSON.stringify({
         name: "test",
-        scripts: { test: "bash scripts/run-all-lanes.sh" },
+        scripts: { build: "echo 'build ok'", test: "bash scripts/run-all-lanes.sh" },
       }));
       writeText(path.join(tmpDir, "tests", "serial-files.txt"), "src/serial.test.ts\n");
       writeText(path.join(tmpDir, "src", "serial.test.ts"), passTestContent());
@@ -747,7 +847,7 @@ describe("prll-verify.sh", () => {
 
       writeText(path.join(tmpDir, "package.json"), JSON.stringify({
         name: "test",
-        scripts: { test: "bash scripts/run-all-lanes.sh" },
+        scripts: { build: "echo 'build ok'", test: "bash scripts/run-all-lanes.sh" },
       }));
       writeText(path.join(tmpDir, "tests", "serial-files.txt"), "src/serial.test.ts\n");
       writeText(path.join(tmpDir, "src", "serial.test.ts"), passTestContent());
@@ -777,7 +877,7 @@ describe("prll-verify.sh", () => {
 
       writeText(path.join(tmpDir, "package.json"), JSON.stringify({
         name: "test",
-        scripts: { test: "bash scripts/run-all-lanes.sh" },
+        scripts: { build: "echo 'build ok'", test: "bash scripts/run-all-lanes.sh" },
       }));
       // A failing serial test to trigger failure reporting
       writeText(path.join(tmpDir, "tests", "serial-files.txt"), "src/broken.test.ts\n");
@@ -817,7 +917,7 @@ describe("prll-verify.sh", () => {
 
       writeText(path.join(tmpDir, "package.json"), JSON.stringify({
         name: "test",
-        scripts: { test: "bash scripts/run-all-lanes.sh" },
+        scripts: { build: "echo 'build ok'", test: "bash scripts/run-all-lanes.sh" },
       }));
       writeText(path.join(tmpDir, "tests", "serial-files.txt"), "src/serial.test.ts\n");
       writeText(path.join(tmpDir, "src", "serial.test.ts"), passTestContent());

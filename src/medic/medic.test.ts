@@ -107,7 +107,9 @@ describe("medic", () => {
     });
   });
 
-  describe("runMedicCheck", () => {
+  // concurrency:1 — subtests race on process.env.TAMANDUA_DB_PATH via the getDb()
+  // singleton, which reads the env at call time (not at hook time).
+  describe("runMedicCheck", { concurrency: 1 }, () => {
     it("runs without errors on clean DB", async () => {
       ensureMedicTables();
       const result = await runMedicCheck();
@@ -137,14 +139,17 @@ describe("medic", () => {
 
     it("populates medic_checks table after check", async () => {
       ensureMedicTables();
-      await runMedicCheck();
+      const result = await runMedicCheck();
 
-      const row = db.prepare("SELECT COUNT(*) as cnt FROM medic_checks").get() as { cnt: number };
-      assert.ok(row.cnt >= 1, "medic_checks should have at least one entry");
+      // Scope COUNT to the specific check ID, not global medic_checks
+      const row = db.prepare("SELECT COUNT(*) as cnt FROM medic_checks WHERE id = ?").get(result.id) as { cnt: number } | undefined;
+      assert.equal(row?.cnt, 1, "medic_checks should have exactly one entry for this check ID");
     });
   });
 
-  describe("getRecentMedicChecks", () => {
+  // concurrency:1 — subtests race on process.env.TAMANDUA_DB_PATH via the getDb()
+  // singleton, which reads the env at call time (not at hook time).
+  describe("getRecentMedicChecks", { concurrency: 1 }, () => {
     it("returns empty array when no checks exist", () => {
       ensureMedicTables();
       const checks = getRecentMedicChecks(5);
@@ -153,30 +158,35 @@ describe("medic", () => {
 
     it("returns recent checks after runMedicCheck", async () => {
       ensureMedicTables();
-      await runMedicCheck();
+      const result = await runMedicCheck();
 
       const checks = getRecentMedicChecks(5);
-      assert.ok(checks.length >= 1, "should have at least one check");
-      assert.ok("id" in checks[0]!);
-      assert.ok("checkedAt" in checks[0]!);
-      assert.ok("issuesFound" in checks[0]!);
-      assert.ok("summary" in checks[0]!);
+      // Verify this test's own check is present, not just a global count
+      const own = checks.find(c => c.id === result.id);
+      assert.ok(own, "should include our check");
+      assert.ok("checkedAt" in own!);
+      assert.ok("issuesFound" in own!);
+      assert.ok("summary" in own!);
     });
 
     it("respects limit parameter", async () => {
       ensureMedicTables();
-      await runMedicCheck();
-      await runMedicCheck();
+      const r1 = await runMedicCheck();
+      const r2 = await runMedicCheck();
 
       const checks = getRecentMedicChecks(1);
-      assert.ok(checks.length <= 1, "should respect limit");
+      assert.ok(checks.length === 1, "should return exactly 1 check with limit 1");
+      // The returned check should be one of ours
+      assert.ok(checks[0]?.id === r2.id || checks[0]?.id === r1.id);
     });
   });
 
-  describe("getMedicStatus", () => {
+  // concurrency:1 — subtests race on process.env.TAMANDUA_DB_PATH via the getDb()
+  // singleton, which reads the env at call time (not at hook time).
+  describe("getMedicStatus", { concurrency: 1 }, () => {
     it("reports recent stats after checks", async () => {
       ensureMedicTables();
-      await runMedicCheck();
+      const firstCheck = await runMedicCheck();
 
       // Add a zombie run so we get non-zero stats
       db.prepare(
@@ -186,11 +196,13 @@ describe("medic", () => {
         "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now', '-3 hours'), datetime('now', '-3 hours'))"
       ).run("stats-step", "stats-run", "implement", "dev-agent", 0, "Do", "done", "done");
 
-      await runMedicCheck();
+      const secondCheck = await runMedicCheck();
 
       const status = getMedicStatus();
       assert.equal(status.installed, true);
       assert.ok(status.lastCheck !== null, "should have last check");
+      // Verify the last check matches our second run
+      assert.equal(status.lastCheck?.checkedAt, secondCheck.checkedAt);
       assert.ok(status.recentChecks >= 1);
     });
   });

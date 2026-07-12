@@ -1,4 +1,4 @@
-import { describe, it, before, after } from "node:test";
+import { describe, it, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { writeFileSync, realpathSync } from "node:fs";
 import path from "node:path";
@@ -1454,8 +1454,8 @@ describe("suite_results pruneOldSuiteResults", () => {
   let origHome: string | undefined;
   let origDbPath: string | undefined;
 
-  const th = createTempHome("tamandua-suite-prune-test-");
-  before(() => {
+  beforeEach(() => {
+    const th = createTempHome("tamandua-suite-prune-test-");
     tempHome = th.root;
     origHome = process.env.HOME;
     origDbPath = process.env.TAMANDUA_DB_PATH;
@@ -1463,7 +1463,7 @@ describe("suite_results pruneOldSuiteResults", () => {
     delete process.env.TAMANDUA_DB_PATH;
   });
 
-  after(() => {
+  afterEach(() => {
     if (origHome) {
       process.env.HOME = origHome;
     } else {
@@ -1478,6 +1478,7 @@ describe("suite_results pruneOldSuiteResults", () => {
 
   it("removes rows older than 14 days", () => {
     const db = getDb();
+    const prefix = "us001-older";
 
     // Insert a row older than 14 days
     const oldDate = new Date(Date.now() - 20 * 24 * 60 * 60 * 1000).toISOString();
@@ -1486,7 +1487,7 @@ describe("suite_results pruneOldSuiteResults", () => {
         (origin_repo, tree_hash, cmd_hash, cmd_display,
          exit_code, duration_ms, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run("/home/user/repo", "old-tree", "old-cmd", "npm test", 0, 1000, oldDate);
+    `).run("/home/user/repo", prefix + "-old", prefix + "-cmd-old", "npm test", 0, 1000, oldDate);
 
     // Insert a recent row (less than 14 days)
     const recentDate = new Date(Date.now() - 5 * 24 * 60 * 60 * 1000).toISOString();
@@ -1495,10 +1496,12 @@ describe("suite_results pruneOldSuiteResults", () => {
         (origin_repo, tree_hash, cmd_hash, cmd_display,
          exit_code, duration_ms, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run("/home/user/repo", "recent-tree", "recent-cmd", "npm test", 0, 2000, recentDate);
+    `).run("/home/user/repo", prefix + "-recent", prefix + "-cmd-recent", "npm test", 0, 2000, recentDate);
 
-    // Verify both rows exist before pruning
-    const countBefore = db.prepare("SELECT COUNT(*) as cnt FROM suite_results").get() as { cnt: number };
+    // Verify both rows exist before pruning — scoped to test's own prefix
+    const countBefore = db.prepare(
+      "SELECT COUNT(*) as cnt FROM suite_results WHERE tree_hash IN (?, ?)"
+    ).get(prefix + "-old", prefix + "-recent") as { cnt: number };
     assert.equal(countBefore.cnt, 2, "should have 2 rows before pruning");
 
     // Prune
@@ -1508,21 +1511,20 @@ describe("suite_results pruneOldSuiteResults", () => {
     // Verify old row is gone
     const oldRow = db.prepare(
       "SELECT id FROM suite_results WHERE tree_hash = ?",
-    ).get("old-tree");
+    ).get(prefix + "-old");
     assert.equal(oldRow, undefined, "old row should be gone");
 
     // Verify recent row remains
     const recentRow = db.prepare(
       "SELECT tree_hash FROM suite_results WHERE tree_hash = ?",
-    ).get("recent-tree") as { tree_hash: string };
+    ).get(prefix + "-recent") as { tree_hash: string };
     assert.ok(recentRow, "recent row should remain");
-    assert.equal(recentRow.tree_hash, "recent-tree");
+    assert.equal(recentRow.tree_hash, prefix + "-recent");
   });
 
   it("returns 0 when no rows to prune", () => {
     const db = getDb();
-    // Clean up any leftover rows from previous tests
-    db.exec("DELETE FROM suite_results");
+    const prefix = "us001-none";
 
     // Insert only a recent row
     const recentDate = new Date().toISOString();
@@ -1531,19 +1533,20 @@ describe("suite_results pruneOldSuiteResults", () => {
         (origin_repo, tree_hash, cmd_hash, cmd_display,
          exit_code, duration_ms, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run("/repo", "tree", "cmd", "echo hi", 0, 100, recentDate);
+    `).run("/repo", prefix + "-recent", prefix + "-cmd", "echo hi", 0, 100, recentDate);
 
     const pruned = pruneOldSuiteResults();
     assert.equal(pruned, 0, "should prune 0 rows when all are recent");
 
-    const count = db.prepare("SELECT COUNT(*) as cnt FROM suite_results").get() as { cnt: number };
+    const count = db.prepare(
+      "SELECT COUNT(*) as cnt FROM suite_results WHERE tree_hash = ?"
+    ).get(prefix + "-recent") as { cnt: number };
     assert.equal(count.cnt, 1, "row should remain");
   });
 
   it("returns 0 on empty table (no crash)", () => {
     const db = getDb();
-    // Empty table is the initial state
-    db.exec("DELETE FROM suite_results");
+    // Fresh per-test DB is empty — no DELETE needed
 
     const pruned = pruneOldSuiteResults();
     assert.equal(pruned, 0, "should return 0 on empty table");
@@ -1554,7 +1557,7 @@ describe("suite_results pruneOldSuiteResults", () => {
 
   it("respects the exact 14-day cutoff", () => {
     const db = getDb();
-    db.exec("DELETE FROM suite_results");
+    const prefix = "us001-cutoff";
 
     // Insert a row exactly 14d minus 1 second ago — should NOT be pruned
     const almostExpired = new Date(Date.now() - (14 * 24 * 60 * 60 * 1000) + 1000).toISOString();
@@ -1563,7 +1566,7 @@ describe("suite_results pruneOldSuiteResults", () => {
         (origin_repo, tree_hash, cmd_hash, cmd_display,
          exit_code, duration_ms, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run("/repo", "almost-old", "cmd", "echo test", 0, 500, almostExpired);
+    `).run("/repo", prefix + "-almost", prefix + "-cmd-almost", "echo test", 0, 500, almostExpired);
 
     // Insert a row exactly 14d + 1 second ago — should be pruned
     const justExpired = new Date(Date.now() - (14 * 24 * 60 * 60 * 1000) - 1000).toISOString();
@@ -1572,7 +1575,7 @@ describe("suite_results pruneOldSuiteResults", () => {
         (origin_repo, tree_hash, cmd_hash, cmd_display,
          exit_code, duration_ms, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run("/repo", "just-old", "cmd", "echo test", 0, 600, justExpired);
+    `).run("/repo", prefix + "-just", prefix + "-cmd-just", "echo test", 0, 600, justExpired);
 
     const pruned = pruneOldSuiteResults();
     assert.equal(pruned, 1, "should prune exactly the row older than 14d");
@@ -1580,13 +1583,13 @@ describe("suite_results pruneOldSuiteResults", () => {
     // almostExpired should remain
     const almostRow = db.prepare(
       "SELECT tree_hash FROM suite_results WHERE tree_hash = ?",
-    ).get("almost-old");
+    ).get(prefix + "-almost");
     assert.ok(almostRow, "row < 14d old should remain");
 
     // justExpired should be gone
     const justRow = db.prepare(
       "SELECT tree_hash FROM suite_results WHERE tree_hash = ?",
-    ).get("just-old");
+    ).get(prefix + "-just");
     assert.equal(justRow, undefined, "row > 14d old should be pruned");
   });
 });

@@ -646,25 +646,46 @@ describe("tamandua-test shim", { concurrency: 1 }, () => {
     });
   }
 
-  let _clearSuiteResultsReady = false;
+  // ── US-003: Per-test scoped suite_results cleanup ──────────────
+  // Track commands used by each test so afterEach can scope cleanup
+  // to the exact cache key (origin_repo, tree_hash, cmd_hash).
+  let _testCleanupKeys: Array<{ repo: string; cmd: string }> = [];
 
-  /** Helper: clear all suite_results rows for clean single-flight tests. */
-  async function clearSuiteResults(): Promise<void> {
-    // Ensure migration has run (getDb triggers migrate internally).
-    if (!_clearSuiteResultsReady) {
+  let _suiteMigrationDone = false;
+
+  /** Clear suite_results scoped to a specific cache key (origin_repo, tree_hash, cmd_hash). */
+  async function clearSuiteResultsForCmd(repoDir: string, cmd: string): Promise<void> {
+    // Ensure migration has run so the suite_results table exists.
+    if (!_suiteMigrationDone) {
       const { getDb } = await import("../../dist/db.js");
       getDb();
-      _clearSuiteResultsReady = true;
+      _suiteMigrationDone = true;
     }
+    const { computeTreeHash, computeCmdHash, getOriginRepo } = await import(
+      "../../dist/suite/tree-hash.js"
+    );
+    const originRepo = getOriginRepo(repoDir);
+    const treeHash = computeTreeHash(repoDir);
+    if (!treeHash) return;
+    const cmdHash = computeCmdHash(cmd);
     const db = new DatabaseSync(controlEnv.dbPath);
-    db.exec("DELETE FROM suite_results");
+    db.prepare(
+      "DELETE FROM suite_results WHERE origin_repo = ? AND tree_hash = ? AND cmd_hash = ?"
+    ).run(originRepo, treeHash, cmdHash);
     db.close();
   }
+
+  afterEach(async () => {
+    for (const key of _testCleanupKeys) {
+      await clearSuiteResultsForCmd(key.repo, key.cmd);
+    }
+    _testCleanupKeys = [];
+  });
 
   // ── US-006 AC1: Concurrent cold cache → exactly one execution ─────
 
   it("single-flight: concurrent invocations on cold cache result in exactly one execution (AC1)", async () => {
-    await clearSuiteResults();
+    await clearSuiteResultsForCmd(repoDir, counterScript);
     const env = shimChildEnv(controlEnv);
 
     // Spawn 5 concurrent shim invocations with the same key.
@@ -705,7 +726,7 @@ describe("tamandua-test shim", { concurrency: 1 }, () => {
   // ── US-006 AC2: Poll picks up green result → replay ───────────────
 
   it("single-flight: waiter polls and replays when green result is recorded (AC2)", async () => {
-    await clearSuiteResults();
+    await clearSuiteResultsForCmd(repoDir, counterScript);
     const env = shimChildEnv(controlEnv);
 
     // Compute the key that the shim will use.
@@ -768,7 +789,7 @@ describe("tamandua-test shim", { concurrency: 1 }, () => {
   // ── US-006 AC2: Poll picks up red result → execute ────────────────
 
   it("single-flight: waiter executes when red result is recorded during poll (AC2)", async () => {
-    await clearSuiteResults();
+    await clearSuiteResultsForCmd(repoDir, counterScript);
     const env = shimChildEnv(controlEnv);
 
     const { computeTreeHash, computeCmdHash, getOriginRepo } = await import(
@@ -823,7 +844,7 @@ describe("tamandua-test shim", { concurrency: 1 }, () => {
   // ── US-006: Claim "run" response proceeds to execute ─────────────
 
   it("single-flight: claim 'run' response proceeds to execute and record", async () => {
-    await clearSuiteResults();
+    await clearSuiteResultsForCmd(repoDir, counterScript);
     const env = shimChildEnv(controlEnv);
 
     // Fresh cache (counter cleared in beforeEach) — claim should return "run".
@@ -981,8 +1002,8 @@ describe("tamandua-test shim", { concurrency: 1 }, () => {
       req.end();
     });
 
-    // Clear suite_results so we get a miss (to trigger single-flight claim).
-    db.exec("DELETE FROM suite_results");
+    // Clear suite_results for our key so we get a miss (to trigger single-flight claim).
+    await clearSuiteResultsForCmd(repoDir, passScript);
     db.close();
 
     // Spawn the shim with a fresh runId for the second invocation.
@@ -1201,7 +1222,7 @@ describe("tamandua-test shim", { concurrency: 1 }, () => {
 
   it("SHSH: simple command still works unchanged", async () => {
     // Clear any cached result from previous tests on the same tree.
-    await clearSuiteResults();
+    await clearSuiteResultsForCmd(repoDir, passScript);
 
     const env = shimChildEnv(controlEnv);
     const r = await runShim(

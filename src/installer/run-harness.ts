@@ -48,10 +48,10 @@ function readCurrentGitBranch(workdir: string): string {
   return result.stdout.trim();
 }
 
-export function validateRunHarnessForScheduling(
+export async function validateRunHarnessForScheduling(
   runId: string,
   contextRaw: string,
-): HarnessValidationResult {
+): Promise<HarnessValidationResult> {
   const context = parseRunContext(contextRaw);
   const workspaceMode = readNonEmptyString(context, "workspace_mode") ?? "direct";
 
@@ -115,7 +115,7 @@ export function validateRunHarnessForScheduling(
   const harnessType = readNonEmptyString(context, "harness_type");
   if (harnessType === "hermes") {
     try {
-      findHermesBinary();
+      await findHermesBinary();
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       throw new Error(
