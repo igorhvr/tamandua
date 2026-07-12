@@ -1674,6 +1674,12 @@ describe("story_abandonments table migration", () => {
     assert.equal(abandonedCountCol.type, "INTEGER", "abandoned_count should be INTEGER");
     assert.equal(abandonedCountCol.notnull, 1, "abandoned_count should be NOT NULL");
 
+    // step_id: TEXT (nullable — no NOT NULL constraint)
+    const stepIdCol = colMap.get("step_id");
+    assert.ok(stepIdCol, "step_id column should exist");
+    assert.equal(stepIdCol.type, "TEXT", "step_id should be TEXT");
+    assert.equal(stepIdCol.notnull, 0, "step_id should be nullable (no NOT NULL constraint)");
+
     // created_at: TEXT NOT NULL
     const createdAtCol = colMap.get("created_at");
     assert.ok(createdAtCol, "created_at column should exist");
@@ -1709,7 +1715,7 @@ describe("story_abandonments table migration", () => {
     const cols = db.prepare("PRAGMA table_info(story_abandonments)").all() as Array<{ name: string }>;
     const colNames = cols.map((c) => c.name).sort();
     const expectedCols = [
-      "id", "story_id", "run_id", "reason", "abandoned_count", "created_at",
+      "id", "story_id", "run_id", "reason", "abandoned_count", "step_id", "created_at",
     ];
     assert.deepEqual(colNames, expectedCols.sort(), "columns should match expected after idempotent migrate");
   });

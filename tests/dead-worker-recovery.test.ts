@@ -1857,4 +1857,685 @@ describe("ABND — abandon reason aggregate", () => {
   });
 });
 
+// ══════════════════════════════════════════════════════════════════════
+// ABN2: Recovery resilience — telemetry failures must not block recovery
+// ══════════════════════════════════════════════════════════════════════
+
+describe("ABN2 recovery resilience — telemetry failures do not block recovery", () => {
+  it("story recovery completes when story_abandonments INSERT fails (table dropped)", async () => {
+    const { recoverOrphanedStepsForAgent } = await import("../dist/installer/step-ops.js");
+    const db = getDb();
+    const { runId, storyRowId } = seedStoryRun({
+      agentId: "wf-resil_fixer",
+      abandonedCount: 0,
+      retryCount: 0,
+      backdateSeconds: 5,
+    });
+
+    // Corrupt the story_abandonments table to make INSERT fail
+    db.prepare("DROP TABLE IF EXISTS story_abandonments").run();
+
+    // Recovery must still complete — story/step should be reset even without telemetry
+    const result = recoverOrphanedStepsForAgent("wf-resil_fixer", runId, 0);
+    assert.equal(result.recovered, 1, "story should be recovered despite telemetry INSERT failure");
+    assert.equal(result.failed, 0, "story should not be failed");
+
+    // Step is reset to pending, current_story_id is cleared
+    const step = db.prepare(
+      "SELECT status, current_story_id FROM steps WHERE run_id = ?"
+    ).get(runId) as { status: string; current_story_id: string | null };
+    assert.equal(step.status, "pending", "step should be reset to pending");
+    assert.equal(step.current_story_id, null, "current_story_id should be cleared");
+
+    // Story is reset to pending with abandoned_count incremented
+    const story = storyState(storyRowId);
+    assert.equal(story.status, "pending", "story should be reset to pending");
+    assert.equal(story.abandoned_count, 1, "abandoned_count should be incremented despite telemetry failure");
+  });
+
+  it("story recovery completes with higher abandoned_count when table is missing", async () => {
+    const { recoverOrphanedStepsForAgent } = await import("../dist/installer/step-ops.js");
+    const db = getDb();
+    const { runId, storyRowId, stepRowId } = seedStoryRun({
+      agentId: "wf-resil2_fixer",
+      abandonedCount: 2,
+      retryCount: 0,
+      backdateSeconds: 5,
+    });
+
+    db.prepare("DROP TABLE IF EXISTS story_abandonments").run();
+
+    const result = recoverOrphanedStepsForAgent("wf-resil2_fixer", runId, 0);
+    assert.equal(result.recovered, 1, "step should be recovered");
+
+    const step = db.prepare(
+      "SELECT status FROM steps WHERE id = ?"
+    ).get(stepRowId) as { status: string };
+    assert.equal(step.status, "pending", "step should be reset");
+
+    const story = storyState(storyRowId);
+    assert.equal(story.status, "pending", "story should be pending");
+    assert.equal(story.abandoned_count, 3, "abandoned_count should be 2 + 1 = 3");
+  });
+
+  it("step retry_count path also works when telemetry table is broken (non-loop step)", async () => {
+    const { recoverOrphanedStepsForAgent } = await import("../dist/installer/step-ops.js");
+    const db = getDb();
+
+    // Seed a non-loop (single) running step
+    const { runId } = seedRunWithRunningStep({
+      claimPid: null,
+      retryCount: 0,
+      maxRetries: 4,
+    });
+
+    db.prepare("DROP TABLE IF EXISTS story_abandonments").run();
+
+    // A non-loop step (no current_story_id) takes the retry-count path, not the story-abandonment path.
+    // This exercises that the function handles steps without stories (no INSERT needed).
+    const result = recoverOrphanedStepsForAgent("wf-dead_dev", runId, 0);
+    assert.equal(result.recovered, 1, "non-loop step should be recovered");
+
+    const step = db.prepare(
+      "SELECT status, retry_count FROM steps WHERE run_id = ?"
+    ).get(runId) as { status: string; retry_count: number };
+    assert.equal(step.status, "pending", "step should be reset to pending");
+    assert.equal(step.retry_count, 1, "retry_count should increment");
+  });
+
+  it("recovery reports correct counts despite telemetry failure", async () => {
+    const { recoverOrphanedStepsForAgent } = await import("../dist/installer/step-ops.js");
+    const db = getDb();
+    const { runId } = seedStoryRun({
+      agentId: "wf-resil4_fixer",
+      abandonedCount: 0,
+      retryCount: 0,
+      backdateSeconds: 5,
+    });
+
+    db.prepare("DROP TABLE IF EXISTS story_abandonments").run();
+
+    const result = recoverOrphanedStepsForAgent("wf-resil4_fixer", runId, 0);
+    assert.equal(result.recovered, 1);
+    assert.equal(result.failed, 0);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════
+// ABN2: cleanupAbandonedSteps resilience — telemetry failures must not block recovery
+// ══════════════════════════════════════════════════════════════════════
+
+describe("ABN2 cleanupAbandonedSteps resilience — telemetry failures do not block recovery", () => {
+  it("cleanupAbandonedSteps story recovery completes when story_abandonments INSERT fails (table dropped)", async () => {
+    const { cleanupAbandonedSteps } = await import("../dist/installer/step-ops.js");
+    const db = getDb();
+    const { runId, storyRowId } = seedStoryRun({
+      agentId: "wf-cleanup-resil_dev",
+      abandonedCount: 0,
+      retryCount: 0,
+      backdateSeconds: 7200,
+    });
+
+    // Corrupt the story_abandonments table to make INSERT fail
+    db.prepare("DROP TABLE IF EXISTS story_abandonments").run();
+
+    // cleanupAbandonedSteps must still complete — story/step should be recovered without aborting
+    cleanupAbandonedSteps();
+
+    // Step is reset to pending, current_story_id is cleared
+    const step = db.prepare(
+      "SELECT status, current_story_id FROM steps WHERE run_id = ?"
+    ).get(runId) as { status: string; current_story_id: string | null };
+    assert.equal(step.status, "pending", "step should be reset to pending despite telemetry INSERT failure");
+    assert.equal(step.current_story_id, null, "current_story_id should be cleared");
+
+    // Story is reset to pending with abandoned_count incremented
+    const story = storyState(storyRowId);
+    assert.equal(story.status, "pending", "story should be reset to pending");
+    assert.equal(story.abandoned_count, 1, "abandoned_count should be incremented despite telemetry failure");
+  });
+
+  it("cleanupAbandonedSteps increments abandoned_count correctly when telemetry INSERT fails", async () => {
+    const { cleanupAbandonedSteps } = await import("../dist/installer/step-ops.js");
+    const db = getDb();
+    const { runId, storyRowId } = seedStoryRun({
+      agentId: "wf-cleanup-resil2_dev",
+      abandonedCount: 3,
+      retryCount: 0,
+      backdateSeconds: 7200,
+    });
+
+    db.prepare("DROP TABLE IF EXISTS story_abandonments").run();
+
+    cleanupAbandonedSteps();
+
+    const step = db.prepare(
+      "SELECT status FROM steps WHERE run_id = ?"
+    ).get(runId) as { status: string };
+    assert.equal(step.status, "pending", "step should be reset to pending");
+
+    const story = storyState(storyRowId);
+    assert.equal(story.status, "pending", "story should be pending");
+    assert.equal(story.abandoned_count, 4, "abandoned_count should be 3 + 1 = 4");
+  });
+
+  it("cleanupAbandonedSteps non-loop step recovery works when telemetry table is broken", async () => {
+    const { cleanupAbandonedSteps } = await import("../dist/installer/step-ops.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const stepId = crypto.randomUUID();
+    const ago = new Date(Date.now() - 7200 * 1000).toISOString();
+
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 'wf-dead', 'task', 'running', '{}', 0, ?, ?)",
+    ).run(runId, ago, ago);
+    db.prepare(
+      `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status,
+         retry_count, max_retries, abandoned_count, claim_pid, created_at, updated_at)
+       VALUES (?, ?, 'work', 'wf-dead_dev', 0, 'work', '', 'running', 0, 4, 0, NULL, ?, ?)`,
+    ).run(stepId, runId, ago, ago);
+
+    db.prepare("DROP TABLE IF EXISTS story_abandonments").run();
+
+    cleanupAbandonedSteps();
+
+    const step = db.prepare(
+      "SELECT status, abandoned_count FROM steps WHERE id = ?"
+    ).get(stepId) as { status: string; abandoned_count: number };
+    assert.equal(step.status, "pending", "non-loop step should be reset to pending");
+    assert.equal(step.abandoned_count, 1, "abandoned_count should be incremented");
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════
+// ABN2: sweep-level per-step try/catch — one step exception must not abort the sweep
+// ══════════════════════════════════════════════════════════════════════
+
+describe("ABN2 sweep-level resilience — per-step try/catch", () => {
+  it("recoverStepsWithDeadWorkers: one step's exception does not prevent other steps from being processed", async () => {
+    const { recoverStepsWithDeadWorkers: r2 } = await import("../dist/installer/step-ops.js");
+    const db = getDb();
+
+    // Seed two steps with dead workers
+    const a = seedRunWithRunningStep({ claimPid: deadPid() });
+    const b = seedRunWithRunningStep({ claimPid: deadPid() });
+
+    // Rename a column that recoverOrphanedStepsForAgent selects but
+    // recoverStepsWithDeadWorkers's initial query does not, so the
+    // sweep finds steps but per-step recovery throws.
+    db.prepare("ALTER TABLE steps RENAME COLUMN retry_count TO retry_count_old").run();
+    try {
+      const result = r2();
+
+      // Both of our steps threw inside recoverOrphanedStepsForAgent.
+      // At least 2 must be counted as failed (may include leftover
+      // dead-worker steps from earlier tests sharing this DB).
+      assert.ok(result.failed >= 2, `must count at least 2 as failed — got ${result.failed}`);
+      assert.equal(result.recovered, 0, "no steps recovered since recoverOrphanedStepsForAgent threw");
+    } finally {
+      db.prepare("ALTER TABLE steps RENAME COLUMN retry_count_old TO retry_count").run();
+    }
+
+    // Our specific steps remain running because recovery could not complete
+    assert.equal(stepStatus(a.stepId).status, "running", "step A unchanged - recovery threw");
+    assert.equal(stepStatus(b.stepId).status, "running", "step B unchanged - recovery threw");
+  });
+
+  it("recoverStepsWithDeadWorkers: sweep completes (totals accumulated) even when all steps throw", async () => {
+    const { recoverStepsWithDeadWorkers: r2 } = await import("../dist/installer/step-ops.js");
+    const db = getDb();
+
+    seedRunWithRunningStep({ claimPid: deadPid() });
+    seedRunWithRunningStep({ claimPid: deadPid() });
+    seedRunWithRunningStep({ claimPid: deadPid() });
+
+    db.prepare("ALTER TABLE steps RENAME COLUMN retry_count TO retry_count_old").run();
+    try {
+      const result = r2();
+
+      // At least our 3 steps are counted as failed. Previous tests may have
+      // left running steps in this DB that also fail, so use >= 3.
+      assert.ok(result.failed >= 3, `must count at least 3 as failed — got ${result.failed}`);
+      assert.equal(result.recovered, 0);
+    } finally {
+      db.prepare("ALTER TABLE steps RENAME COLUMN retry_count_old TO retry_count").run();
+    }
+  });
+
+  it("checkRunningWorkersLiveness: one step's exception does not prevent other steps from being processed", async () => {
+    const { checkRunningWorkersLiveness } = await import("../dist/installer/step-ops.js");
+    const db = getDb();
+
+    // Use unique dead pgids to avoid collisions
+    let pgidSeq = 95000;
+    const nextPgid = () => pgidSeq++;
+
+    seedWatchdogStep({ claimPgid: nextPgid(), claimJobId: "job-sweep-a", backdateSeconds: 60 });
+    seedWatchdogStep({ claimPgid: nextPgid(), claimJobId: "job-sweep-b", backdateSeconds: 60 });
+
+    db.prepare("ALTER TABLE steps RENAME COLUMN retry_count TO retry_count_old").run();
+    try {
+      const result = checkRunningWorkersLiveness();
+
+      // At least 2 must be counted as failed (may include leftover
+      // watchdog steps from earlier tests sharing this DB).
+      assert.ok(result.failed >= 2, `must count at least 2 as failed — got ${result.failed}`);
+      assert.equal(result.recovered, 0, "no steps recovered since recoverOrphanedStepsForAgent threw");
+    } finally {
+      db.prepare("ALTER TABLE steps RENAME COLUMN retry_count_old TO retry_count").run();
+    }
+  });
+
+  it("checkRunningWorkersLiveness: sweep completes even when all watchdog steps throw", async () => {
+    const { checkRunningWorkersLiveness } = await import("../dist/installer/step-ops.js");
+    const db = getDb();
+
+    let pgidSeq = 95100;
+    const nextPgid = () => pgidSeq++;
+
+    seedWatchdogStep({ claimPgid: nextPgid(), claimJobId: "job-sweep-c", backdateSeconds: 60 });
+    seedWatchdogStep({ claimPgid: nextPgid(), claimJobId: "job-sweep-d", backdateSeconds: 60 });
+    seedWatchdogStep({ claimPgid: nextPgid(), claimJobId: "job-sweep-e", backdateSeconds: 60 });
+
+    db.prepare("ALTER TABLE steps RENAME COLUMN retry_count TO retry_count_old").run();
+    try {
+      const result = checkRunningWorkersLiveness();
+
+      // All 3 steps threw → counted as failed. Note: skipped may be > 0 due to
+      // watchdog steps from previous tests sharing this DB, so only assert >= 3.
+      assert.ok(result.failed >= 3, `must count at least 3 as failed — got ${result.failed}`);
+      assert.equal(result.recovered, 0);
+    } finally {
+      db.prepare("ALTER TABLE steps RENAME COLUMN retry_count_old TO retry_count").run();
+    }
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════
+// ABN2 US-006: Incident shape reproduction — dead PGID + story recovery
+// via the liveness watchdog (checkRunningWorkersLiveness).
+// ══════════════════════════════════════════════════════════════════════
+
+/**
+ * Seed a run + story + loop step with a claim_pgid for watchdog testing.
+ * Combines seedStoryRun (story-level loop step) with seedWatchdogStep
+ * (claim_pgid, claim_updated_at). The step has current_story_id set,
+ * type='loop', a dead claim_pgid, and claim_updated_at backdated past
+ * the 30s LIVENESS_GRACE_PERIOD_MS.
+ */
+function seedWatchdogStoryRun(opts: {
+  claimPgid: number;
+  claimJobId?: string | null;
+  abandonedCount?: number;
+  retryCount?: number;
+  maxRetries?: number;
+  agentId?: string;
+  backdateSeconds?: number;
+}): { runId: string; storyRowId: string; stepRowId: string } {
+  const db = getDb();
+  const runId = crypto.randomUUID();
+  const storyRowId = crypto.randomUUID();
+  const stepRowId = crypto.randomUUID();
+  const backdate = opts.backdateSeconds ?? 60;
+  const ago = new Date(Date.now() - backdate * 1000).toISOString();
+
+  db.prepare(
+    "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 'wf-dead', 'task', 'running', '{}', 0, ?, ?)",
+  ).run(runId, ago, ago);
+
+  db.prepare(
+    `INSERT INTO stories (id, run_id, story_index, story_id, title, description, acceptance_criteria,
+       status, retry_count, max_retries, abandoned_count, created_at, updated_at)
+     VALUES (?, ?, 0, 'S1', 'Test', 'desc', '[]', 'running', ?, ?, ?, ?, ?)`,
+  ).run(storyRowId, runId, opts.retryCount ?? 0, opts.maxRetries ?? 4, opts.abandonedCount ?? 0, ago, ago);
+
+  db.prepare(
+    `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects,
+       status, retry_count, max_retries, type, current_story_id, loop_config,
+       claim_pid, claim_pgid, claim_job_id, claim_updated_at, created_at, updated_at)
+     VALUES (?, ?, 'implement', ?, 0, 'Implement', '', 'running', 0, 4, 'loop', ?, ?,
+             99999, ?, ?, ?, ?, ?)`,
+  ).run(
+    stepRowId, runId, opts.agentId ?? "wf-dead_dev",
+    storyRowId, JSON.stringify({ over: "stories" }),
+    opts.claimPgid, opts.claimJobId ?? "job-wdgm-story", ago, ago, ago,
+  );
+
+  return { runId, storyRowId, stepRowId };
+}
+
+describe("ABN2 US-006 — Incident shape: dead PGID, story recovers via liveness watchdog", () => {
+  // Unique dead pgid per test to avoid collisions across tests sharing a DB.
+  let deadPgidSeq2 = 98000;
+  function nextDeadPgid2(): number { return deadPgidSeq2++; }
+
+  // Ensure story_abandonments table exists (a previous ABN2 resilience
+  // test may have dropped it via "DROP TABLE IF EXISTS").
+  beforeEach(() => {
+    getDb().prepare(`
+      CREATE TABLE IF NOT EXISTS story_abandonments (
+        id TEXT PRIMARY KEY,
+        story_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        abandoned_count INTEGER NOT NULL,
+        step_id TEXT,
+        created_at TEXT NOT NULL
+      )
+    `).run();
+  });
+
+  it("recovers a loop-step story via liveness watchdog — step reset, story reset, abandonment recorded with step_id", async () => {
+    const { checkRunningWorkersLiveness } = await import("../dist/installer/step-ops.js");
+
+    // Seed: loop step with a running story, dead claim_pgid, backdated > 30s.
+    // No inFlightChildren provided → watchdog falls through to recovery.
+    const { runId, storyRowId, stepRowId } = seedWatchdogStoryRun({
+      claimPgid: nextDeadPgid2(),
+      claimJobId: "job-us006-story",
+      abandonedCount: 0,
+      backdateSeconds: 60,
+    });
+
+    const result = checkRunningWorkersLiveness();
+
+    // Sweep must complete with at least our step recovered
+    assert.ok(result.recovered >= 1, `must recover at least our step — got ${result.recovered}`);
+    assert.equal(result.failed, 0, "no steps should fail");
+
+    // Step must be reset to pending, current_story_id cleared
+    const step = getDb().prepare(
+      "SELECT status, current_story_id FROM steps WHERE id = ?"
+    ).get(stepRowId) as { status: string; current_story_id: string | null };
+    assert.equal(step.status, "pending", "loop step must be reset to pending");
+    assert.equal(step.current_story_id, null, "current_story_id must be cleared after recovery");
+
+    // Story must be reset to pending with abandoned_count incremented
+    const story = storyState(storyRowId);
+    assert.equal(story.status, "pending", "story must be reset to pending");
+    assert.equal(story.abandoned_count, 1, "abandoned_count must increment from 0 to 1");
+    assert.equal(story.retry_count, 0, "retry_count must be unchanged (not mixed with infra failures)");
+
+    // Abandonment row must be recorded in story_abandonments
+    const abandonRows = getDb().prepare(
+      "SELECT * FROM story_abandonments WHERE story_id = ? AND run_id = ?"
+    ).all(storyRowId, runId) as Array<{
+      reason: string;
+      abandoned_count: number;
+      step_id: string | null;
+    }>;
+    assert.equal(abandonRows.length, 1, "must have exactly one abandonment record");
+    assert.equal(abandonRows[0].reason, "liveness_detected", "reason must be liveness_detected");
+    assert.equal(abandonRows[0].abandoned_count, 1, "abandoned_count in record must be 1");
+
+    // step_id in abandonment row must match the parent step UUID
+    assert.ok(abandonRows[0].step_id !== null && abandonRows[0].step_id !== undefined,
+      "step_id must not be null — must be populated with parent step UUID");
+    assert.equal(abandonRows[0].step_id, stepRowId,
+      `step_id ${abandonRows[0].step_id} must equal parent step UUID ${stepRowId}`);
+  });
+
+  it("recovers story with non-zero abandoned_count — abandoned_count increments correctly via watchdog", async () => {
+    const { checkRunningWorkersLiveness } = await import("../dist/installer/step-ops.js");
+
+    const { runId, storyRowId, stepRowId } = seedWatchdogStoryRun({
+      claimPgid: nextDeadPgid2(),
+      claimJobId: "job-us006-b",
+      abandonedCount: 3,
+      backdateSeconds: 60,
+    });
+
+    const result = checkRunningWorkersLiveness();
+
+    assert.ok(result.recovered >= 1, `must recover at least our step — got ${result.recovered}`);
+
+    const step = getDb().prepare(
+      "SELECT status FROM steps WHERE id = ?"
+    ).get(stepRowId) as { status: string };
+    assert.equal(step.status, "pending", "loop step must be reset to pending");
+
+    const story = storyState(storyRowId);
+    assert.equal(story.abandoned_count, 4, "abandoned_count must be 3 + 1 = 4");
+
+    const abandonRows = getDb().prepare(
+      "SELECT reason, abandoned_count, step_id FROM story_abandonments WHERE story_id = ? AND run_id = ?"
+    ).all(storyRowId, runId) as Array<{
+      reason: string;
+      abandoned_count: number;
+      step_id: string | null;
+    }>;
+    assert.equal(abandonRows.length, 1, "must have exactly one abandonment record");
+    assert.equal(abandonRows[0].reason, "liveness_detected");
+    assert.equal(abandonRows[0].abandoned_count, 4, "abandoned_count in record must be 4");
+    assert.equal(abandonRows[0].step_id, stepRowId, "step_id must match parent step UUID");
+  });
+
+  it("emits story.abandoned event with liveness_detected reason", async () => {
+    const { checkRunningWorkersLiveness } = await import("../dist/installer/step-ops.js");
+
+    const { runId } = seedWatchdogStoryRun({
+      claimPgid: nextDeadPgid2(),
+      claimJobId: "job-us006-c",
+      abandonedCount: 0,
+      backdateSeconds: 60,
+    });
+
+    checkRunningWorkersLiveness();
+
+    const events = getRunEvents(runId);
+    const abandonedEvents = events.filter((e) => e.event === "story.abandoned");
+    assert.equal(abandonedEvents.length, 1, "must emit one story.abandoned event");
+    assert.equal(abandonedEvents[0].reason, "liveness_detected", "event reason must be liveness_detected");
+    assert.equal(abandonedEvents[0].abandonedCount, 1, "event abandonedCount must be 1");
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════
+// ABN2 US-007: Telemetry-write failure does not prevent recovery
+// ══════════════════════════════════════════════════════════════════════
+
+describe("ABN2 US-007 — Telemetry-write failure does not prevent recovery", () => {
+  let deadPgidSeq3 = 99000;
+  function nextDeadPgid3(): number { return deadPgidSeq3++; }
+
+  // Ensure story_abandonments table is recreated for subsequent tests
+  // (the US-006 describe block also has a beforeEach, but inter-describe
+  // ordering is not guaranteed — be self-sufficient).
+  beforeEach(() => {
+    getDb().prepare(`
+      CREATE TABLE IF NOT EXISTS story_abandonments (
+        id TEXT PRIMARY KEY,
+        story_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        abandoned_count INTEGER NOT NULL,
+        step_id TEXT,
+        created_at TEXT NOT NULL
+      )
+    `).run();
+  });
+
+  it("checkRunningWorkersLiveness sweep completes story recovery despite telemetry INSERT failure (table dropped)", async () => {
+    const { checkRunningWorkersLiveness } = await import("../dist/installer/step-ops.js");
+
+    // Seed a loop step with story, dead claim_pgid, backdated > 30s
+    const { runId, storyRowId, stepRowId } = seedWatchdogStoryRun({
+      claimPgid: nextDeadPgid3(),
+      claimJobId: "job-us007-watchdog",
+      abandonedCount: 0,
+      backdateSeconds: 60,
+    });
+
+    // Corrupt the story_abandonments table to make telemetry INSERT fail
+    getDb().prepare("DROP TABLE IF EXISTS story_abandonments").run();
+
+    // Sweep must complete without throwing — no run-wedging
+    const result = checkRunningWorkersLiveness();
+
+    // Recovery completes despite telemetry failure
+    assert.ok(result.recovered >= 1, `must recover at least our step — got ${result.recovered}`);
+    assert.equal(result.failed, 0, "no steps should fail despite telemetry failure");
+
+    // Step must be reset to pending, current_story_id cleared
+    const step = getDb().prepare(
+      "SELECT status, current_story_id FROM steps WHERE id = ?"
+    ).get(stepRowId) as { status: string; current_story_id: string | null };
+    assert.equal(step.status, "pending", "step must be reset to pending despite telemetry failure");
+    assert.equal(step.current_story_id, null, "current_story_id must be cleared");
+
+    // Story must be reset to pending with abandoned_count incremented
+    const story = storyState(storyRowId);
+    assert.equal(story.status, "pending", "story must be reset to pending despite telemetry failure");
+    assert.equal(story.abandoned_count, 1, "abandoned_count must increment from 0 to 1");
+    assert.equal(story.retry_count, 0, "retry_count must be unchanged");
+  });
+
+  it("recoverStepsWithDeadWorkers sweep completes story recovery despite telemetry INSERT failure (table dropped)", async () => {
+    const { recoverStepsWithDeadWorkers: r2 } = await import("../dist/installer/step-ops.js");
+    const db = getDb();
+
+    // Seed a loop step with story and dead claim_pid.
+    // recoverStepsWithDeadWorkers checks claim_pid liveness.
+    const runId = crypto.randomUUID();
+    const storyRowId = crypto.randomUUID();
+    const stepRowId = crypto.randomUUID();
+    const ago = new Date(Date.now() - 5000).toISOString();
+
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 'wf-dead', 'task', 'running', '{}', 0, ?, ?)",
+    ).run(runId, ago, ago);
+
+    db.prepare(
+      "INSERT INTO stories (id, run_id, story_index, story_id, title, description, acceptance_criteria, status, retry_count, max_retries, abandoned_count, created_at, updated_at) VALUES (?, ?, 0, 'US-007', 'test', 'desc', '[]', 'running', 0, 4, 0, ?, ?)",
+    ).run(storyRowId, runId, ago, ago);
+
+    // Loop step with dead claim_pid — recoverStepsWithDeadWorkers will pick it up
+    db.prepare(
+      `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects,
+         status, retry_count, max_retries, type, current_story_id, loop_config,
+         claim_pid, claim_job_id, created_at, updated_at)
+       VALUES (?, ?, 'implement', 'wf-dead_dev', 0, 'Implement', '', 'running', 0, 4,
+               'loop', ?, '{}', ?, 'job-us007-r2', ?, ?)`,
+    ).run(stepRowId, runId, storyRowId, deadPid(), ago, ago);
+
+    // Corrupt the story_abandonments table
+    db.prepare("DROP TABLE IF EXISTS story_abandonments").run();
+
+    // Sweep must complete without throwing
+    const result = r2();
+
+    // Recovery completes despite telemetry failure
+    assert.ok(result.recovered >= 1,
+      `must recover at least our step — got recovered=${result.recovered} failed=${result.failed}`);
+
+    // Step must be reset to pending
+    const step = db.prepare(
+      "SELECT status, current_story_id FROM steps WHERE id = ?"
+    ).get(stepRowId) as { status: string; current_story_id: string | null };
+    assert.equal(step.status, "pending", "step must be reset to pending despite telemetry failure");
+    assert.equal(step.current_story_id, null, "current_story_id must be cleared");
+
+    // Story must be reset to pending with abandoned_count incremented
+    const story = storyState(storyRowId);
+    assert.equal(story.status, "pending", "story must be reset to pending despite telemetry failure");
+    assert.equal(story.abandoned_count, 1, "abandoned_count must increment from 0 to 1");
+  });
+
+  it("recoverStepsWithDeadWorkers sweep handles mixed recovery — non-loop step succeeds when telemetry table is broken", async () => {
+    const { recoverStepsWithDeadWorkers: r2 } = await import("../dist/installer/step-ops.js");
+    const db = getDb();
+
+    // Seed a non-loop running step with dead claim_pid.
+    // Non-loop steps don't use story_abandonments — they use retry_count.
+    const { stepId } = seedRunWithRunningStep({ claimPid: deadPid() });
+
+    db.prepare("DROP TABLE IF EXISTS story_abandonments").run();
+
+    const result = r2();
+
+    // Non-loop step recovery should complete normally — no telemetry table needed
+    assert.equal(result.recovered, 1, "non-loop step should be recovered");
+
+    const step = stepStatus(stepId);
+    assert.equal(step.status, "pending", "step should be reset to pending");
+    assert.equal(step.retry_count, 1, "retry_count should increment");
+  });
+
+  it("recoverOrphanedStepsForAgent directly — abandoned_count increments correctly when telemetry table is missing", async () => {
+    const { recoverOrphanedStepsForAgent } = await import("../dist/installer/step-ops.js");
+
+    const { runId, storyRowId, stepRowId } = seedStoryRun({
+      agentId: "wf-us007_fixer",
+      abandonedCount: 2,
+      retryCount: 0,
+      backdateSeconds: 5,
+    });
+
+    // Drop the table to simulate telemetry failure
+    getDb().prepare("DROP TABLE IF EXISTS story_abandonments").run();
+
+    const result = recoverOrphanedStepsForAgent("wf-us007_fixer", runId, 0,
+      undefined, undefined, undefined,
+      "no_work_release",
+      undefined, undefined, undefined, undefined,
+    );
+
+    // Recovery must complete despite telemetry failure
+    assert.equal(result.recovered, 1, "story should be recovered despite telemetry failure");
+    assert.equal(result.failed, 0);
+
+    // Step is reset
+    const step = getDb().prepare(
+      "SELECT status, current_story_id FROM steps WHERE id = ?"
+    ).get(stepRowId) as { status: string; current_story_id: string | null };
+    assert.equal(step.status, "pending", "step must be reset to pending");
+    assert.equal(step.current_story_id, null);
+
+    // abandoned_count must still increment (the UPDATE runs regardless of telemetry failure)
+    const story = storyState(storyRowId);
+    assert.equal(story.status, "pending", "story must be reset to pending");
+    assert.equal(story.abandoned_count, 3, "abandoned_count must be 2 + 1 = 3");
+  });
+
+  it("checkRunningWorkersLiveness sweep does not abort early — multiple steps, telemetry broken", async () => {
+    const { checkRunningWorkersLiveness } = await import("../dist/installer/step-ops.js");
+
+    // Seed two watchdog story runs with distinct dead pgids
+    const a = seedWatchdogStoryRun({
+      claimPgid: nextDeadPgid3(),
+      claimJobId: "job-us007-multi-a",
+      abandonedCount: 0,
+      backdateSeconds: 60,
+    });
+    const b = seedWatchdogStoryRun({
+      claimPgid: nextDeadPgid3(),
+      claimJobId: "job-us007-multi-b",
+      abandonedCount: 0,
+      backdateSeconds: 60,
+    });
+
+    // Corrupt telemetry table — BOTH steps will hit telemetry failure
+    getDb().prepare("DROP TABLE IF EXISTS story_abandonments").run();
+
+    // Sweep must complete without throwing — must recover both steps
+    const result = checkRunningWorkersLiveness();
+
+    assert.ok(result.recovered >= 2,
+      `must recover at least 2 steps — got recovered=${result.recovered} failed=${result.failed}`);
+    assert.equal(result.failed, 0, "no steps should fail");
+
+    // Both steps must be reset to pending
+    for (const { stepRowId, storyRowId } of [a, b]) {
+      const step = getDb().prepare(
+        "SELECT status FROM steps WHERE id = ?"
+      ).get(stepRowId) as { status: string };
+      assert.equal(step.status, "pending", "each step must be reset to pending");
+
+      const story = storyState(storyRowId);
+      assert.equal(story.status, "pending", "each story must be reset to pending");
+      assert.equal(story.abandoned_count, 1, "each story abandoned_count must be 1");
+    }
+  });
+});
+
 });

@@ -194,6 +194,7 @@ function migrate(db: DatabaseSync): void {
       run_id TEXT NOT NULL,
       reason TEXT NOT NULL,
       abandoned_count INTEGER NOT NULL,
+      step_id TEXT,
       created_at TEXT NOT NULL
     );
   `);
@@ -201,6 +202,16 @@ function migrate(db: DatabaseSync): void {
   db.exec(
     "CREATE INDEX IF NOT EXISTS idx_story_abandonments_run_story ON story_abandonments(run_id, story_id)",
   );
+
+  // ── ABND step_id column ──
+  // step_id is nullable — when a step association is unresolvable (e.g.
+  // dead-pgid claim after a daemon restart), we still record the abandonment
+  // with NULL step_id rather than losing forensic data.
+  const abandonCols = db.prepare("PRAGMA table_info(story_abandonments)").all() as Array<{ name: string }>;
+  const abandonColNames = new Set(abandonCols.map((c) => c.name));
+  if (!abandonColNames.has("step_id")) {
+    db.exec("ALTER TABLE story_abandonments ADD COLUMN step_id TEXT");
+  }
 
   // ── WLOG worker_lost_count for runs ──
   // Tracks how many times a worker vanished (step.worker_lost emitted)

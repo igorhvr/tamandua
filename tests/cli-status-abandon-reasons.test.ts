@@ -95,6 +95,7 @@ function seedDb(dbPath: string, runs: Array<{
       run_id TEXT NOT NULL,
       reason TEXT NOT NULL,
       abandoned_count INTEGER NOT NULL,
+      step_id TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     )
   `);

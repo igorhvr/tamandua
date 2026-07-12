@@ -1166,24 +1166,32 @@ export function cleanupAbandonedSteps(): void {
         const wfId = getWorkflowId(step.run_id);
         const abandonReason = "worker_timeout";
 
-        // Persist abandonment into story_abandonments table
-        db.prepare(
-          "INSERT INTO story_abandonments (id, story_id, run_id, reason, abandoned_count, created_at) VALUES (?, ?, ?, ?, ?, datetime('now'))"
-        ).run(crypto.randomUUID(), story.id, step.run_id, abandonReason, newAbandoned);
+        // Persist abandonment into story_abandonments table (telemetry — must not block recovery)
+        try {
+          db.prepare(
+            "INSERT INTO story_abandonments (id, story_id, run_id, reason, abandoned_count, step_id, created_at) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))"
+          ).run(crypto.randomUUID(), story.id, step.run_id, abandonReason, newAbandoned, step.id);
 
-        // Emit story.abandoned event with reason and abandoned_count
-        emitEvent({
-          ts: new Date().toISOString(),
-          event: "story.abandoned",
-          runId: step.run_id,
-          workflowId: wfId,
-          stepId: step.step_id,
-          storyId: story.story_id,
-          storyTitle: story.title,
-          reason: abandonReason,
-          abandonedCount: newAbandoned,
-          detail: `Story ${story.story_id} abandoned (${newAbandoned}/${ABANDON_STORY_MAX}); reason: ${abandonReason}`,
-        });
+          // Emit story.abandoned event with reason and abandoned_count
+          emitEvent({
+            ts: new Date().toISOString(),
+            event: "story.abandoned",
+            runId: step.run_id,
+            workflowId: wfId,
+            stepId: step.step_id,
+            storyId: story.story_id,
+            storyTitle: story.title,
+            reason: abandonReason,
+            abandonedCount: newAbandoned,
+            detail: `Story ${story.story_id} abandoned (${newAbandoned}/${ABANDON_STORY_MAX}); reason: ${abandonReason}`,
+          });
+        } catch (err) {
+          logger.warn(`Abandonment accounting failed for story ${story.story_id} (run ${step.run_id}, step ${step.step_id}): ${err instanceof Error ? err.message : String(err)}; continuing recovery regardless`, {
+            runId: step.run_id,
+            stepId: step.step_id,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
 
         if (newAbandoned > ABANDON_STORY_MAX) {
           db.prepare("UPDATE stories SET status = 'failed', abandoned_count = ?, updated_at = datetime('now') WHERE id = ?").run(newAbandoned, story.id);
@@ -1361,25 +1369,34 @@ export function recoverOrphanedStepsForAgent(
         const wfId = getWorkflowId(step.run_id);
         const effectiveReason = abandonReason ?? "worker_lost";
 
-        // Persist abandonment into story_abandonments table
-        db.prepare(
-          "INSERT INTO story_abandonments (id, story_id, run_id, reason, abandoned_count, created_at) VALUES (?, ?, ?, ?, ?, datetime('now'))"
-        ).run(crypto.randomUUID(), story.id, step.run_id, effectiveReason, newAbandoned);
+        // Persist abandonment into story_abandonments table (telemetry — must not block recovery)
+        try {
+          db.prepare(
+            "INSERT INTO story_abandonments (id, story_id, run_id, reason, abandoned_count, step_id, created_at) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))"
+          ).run(crypto.randomUUID(), story.id, step.run_id, effectiveReason, newAbandoned, step.id);
 
-        // Emit story.abandoned event with reason and abandoned_count
-        emitEvent({
-          ts: new Date().toISOString(),
-          event: "story.abandoned",
-          runId: step.run_id,
-          workflowId: wfId,
-          stepId: step.step_id,
-          agentId,
-          storyId: story.story_id,
-          storyTitle: story.title,
-          reason: effectiveReason,
-          abandonedCount: newAbandoned,
-          detail: `Story ${story.story_id} abandoned (${newAbandoned}/${ABANDON_STORY_MAX}); reason: ${effectiveReason}`,
-        });
+          // Emit story.abandoned event with reason and abandoned_count
+          emitEvent({
+            ts: new Date().toISOString(),
+            event: "story.abandoned",
+            runId: step.run_id,
+            workflowId: wfId,
+            stepId: step.step_id,
+            agentId,
+            storyId: story.story_id,
+            storyTitle: story.title,
+            reason: effectiveReason,
+            abandonedCount: newAbandoned,
+            detail: `Story ${story.story_id} abandoned (${newAbandoned}/${ABANDON_STORY_MAX}); reason: ${effectiveReason}`,
+          });
+        } catch (err) {
+          logger.warn(`Abandonment accounting failed for story ${story.story_id} (run ${step.run_id}, step ${step.step_id}): ${err instanceof Error ? err.message : String(err)}; continuing recovery regardless`, {
+            runId: step.run_id,
+            stepId: step.step_id,
+            agentId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
 
         if (newAbandoned > ABANDON_STORY_MAX) {
           db.prepare("UPDATE stories SET status = 'failed', abandoned_count = ?, updated_at = datetime('now') WHERE id = ?").run(newAbandoned, story.id);
@@ -1402,18 +1419,36 @@ export function recoverOrphanedStepsForAgent(
           if (storyRecoveryEvent === "step.worker_lost") {
             db.prepare("UPDATE runs SET worker_lost_count = worker_lost_count + 1 WHERE id = ?").run(step.run_id);
           }
-          emitEvent({
-            ts: new Date().toISOString(),
-            event: storyRecoveryEvent,
-            runId: step.run_id,
-            workflowId: wfId,
-            stepId: step.step_id,
-            detail: storyPrefix + storyRecoveryDetail,
-            ...(storyRecoveryEvent === "step.worker_lost" ? { exitCode: exitCode ?? undefined, signal: signal ?? undefined, stderrTail } : {}),
-          });
+          try {
+            emitEvent({
+              ts: new Date().toISOString(),
+              event: storyRecoveryEvent,
+              runId: step.run_id,
+              workflowId: wfId,
+              stepId: step.step_id,
+              detail: storyPrefix + storyRecoveryDetail,
+              ...(storyRecoveryEvent === "step.worker_lost" ? { exitCode: exitCode ?? undefined, signal: signal ?? undefined, stderrTail } : {}),
+            });
+          } catch (err) {
+            logger.warn(`Recovery event emit failed for story ${story.story_id} (run ${step.run_id}, step ${step.step_id}): ${err instanceof Error ? err.message : String(err)}`, {
+              runId: step.run_id,
+              stepId: step.step_id,
+              agentId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
           logger.info(`Orphaned step recovery: story ${story.story_id} reset to pending (abandon ${newAbandoned}/${ABANDON_STORY_MAX})`, { runId: step.run_id, stepId: step.step_id, agentId });
           if (timeoutRetryReason) {
-            setRunContextKey(step.run_id, "timeout_retry", timeoutRetryReason);
+            try {
+              setRunContextKey(step.run_id, "timeout_retry", timeoutRetryReason);
+            } catch (err) {
+              logger.warn(`setRunContextKey timeout_retry failed for run ${step.run_id}: ${err instanceof Error ? err.message : String(err)}`, {
+                runId: step.run_id,
+                stepId: step.step_id,
+                agentId,
+                error: err instanceof Error ? err.message : String(err),
+              });
+            }
           }
           recovered++;
         }
@@ -1587,24 +1622,32 @@ export function recoverStepsWithDeadWorkers(): {
       continue;
     }
 
-    const result = recoverOrphanedStepsForAgent(
-      step.agent_id,
-      step.run_id,
-      undefined,
-      undefined,
-      `Worker process ${step.claim_pid} died without reporting (daemon restart or crash); step requeued.`,
-      step.claim_job_id ?? undefined,
-      "worker_died",
-      undefined, // detailPrefix
-      undefined, // exitCode
-      undefined, // signal
-      undefined, // stderrTail
-    );
-    totals.recovered += result.recovered;
-    totals.failed += result.failed;
-    totals.skipped += result.skipped;
-    if ((result.recovered > 0 || result.failed > 0) && !totals.runIds.includes(step.run_id)) {
-      totals.runIds.push(step.run_id);
+    try {
+      const result = recoverOrphanedStepsForAgent(
+        step.agent_id,
+        step.run_id,
+        undefined,
+        undefined,
+        `Worker process ${step.claim_pid} died without reporting (daemon restart or crash); step requeued.`,
+        step.claim_job_id ?? undefined,
+        "worker_died",
+        undefined, // detailPrefix
+        undefined, // exitCode
+        undefined, // signal
+        undefined, // stderrTail
+      );
+      totals.recovered += result.recovered;
+      totals.failed += result.failed;
+      totals.skipped += result.skipped;
+      if ((result.recovered > 0 || result.failed > 0) && !totals.runIds.includes(step.run_id)) {
+        totals.runIds.push(step.run_id);
+      }
+    } catch (err) {
+      totals.failed += 1;
+      logger.error(
+        `recoverStepsWithDeadWorkers: per-step recovery failed for run ${step.run_id}, step ${step.id}, agent ${step.agent_id}: ${err instanceof Error ? err.message : String(err)}; continuing sweep`,
+        { runId: step.run_id, stepId: step.id, agentId: step.agent_id },
+      );
     }
   }
 
@@ -1740,23 +1783,31 @@ export function checkRunningWorkersLiveness(
     const failureReason =
       `Worker process group ${step.claim_pgid} detected as dead by liveness watchdog; step requeued.`;
 
-    const result = recoverOrphanedStepsForAgent(
-      step.agent_id,
-      step.run_id,
-      undefined, // no stale threshold — liveness check is authoritative
-      undefined, // no timeout retry reason
-      failureReason,
-      step.claim_job_id ?? undefined,
-      "liveness_detected",
-      "liveness-detected", // detailPrefix for event differentiation
-      undefined, // exitCode
-      undefined, // signal
-      undefined, // stderrTail
-    );
-    totals.recovered += result.recovered;
-    totals.failed += result.failed;
-    if ((result.recovered > 0 || result.failed > 0) && !totals.runIds.includes(step.run_id)) {
-      totals.runIds.push(step.run_id);
+    try {
+      const result = recoverOrphanedStepsForAgent(
+        step.agent_id,
+        step.run_id,
+        undefined, // no stale threshold — liveness check is authoritative
+        undefined, // no timeout retry reason
+        failureReason,
+        step.claim_job_id ?? undefined,
+        "liveness_detected",
+        "liveness-detected", // detailPrefix for event differentiation
+        undefined, // exitCode
+        undefined, // signal
+        undefined, // stderrTail
+      );
+      totals.recovered += result.recovered;
+      totals.failed += result.failed;
+      if ((result.recovered > 0 || result.failed > 0) && !totals.runIds.includes(step.run_id)) {
+        totals.runIds.push(step.run_id);
+      }
+    } catch (err) {
+      totals.failed += 1;
+      logger.error(
+        `checkRunningWorkersLiveness: per-step recovery failed for run ${step.run_id}, step ${step.id}, agent ${step.agent_id}: ${err instanceof Error ? err.message : String(err)}; continuing sweep`,
+        { runId: step.run_id, stepId: step.id, agentId: step.agent_id },
+      );
     }
   }
 
