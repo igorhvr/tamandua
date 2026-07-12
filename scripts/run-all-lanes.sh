@@ -8,6 +8,20 @@ set -uo pipefail
 REPO_ROOT="${TAMANDUA_REPO_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 cd "$REPO_ROOT"
 
+# --- Build ---
+# Build dist/ so tests always run against the current source.
+# TBLD: Prevents silent stale-dist false alarms (2026-07-11 incident).
+BUILD_LOG=$(mktemp "${TMPDIR:-/tmp}/tamandua-build-$$.log" 2>/dev/null || echo "/tmp/tamandua-build-$$.log")
+if npm run build > "$BUILD_LOG" 2>&1; then
+  rm -f "$BUILD_LOG"
+else
+  echo "Build failed. Full log: $BUILD_LOG" >&2
+  echo "--- Last 20 lines ---" >&2
+  tail -n 20 "$BUILD_LOG" >&2
+  echo "---" >&2
+  exit 1
+fi
+
 export TAMANDUA_TEST_GUARD="${TAMANDUA_TEST_GUARD:-1}"
 export TAMANDUA_PI_BINARY="${TAMANDUA_PI_BINARY:-/usr/bin/false}"
 
