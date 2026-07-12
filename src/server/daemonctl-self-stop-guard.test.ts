@@ -9,8 +9,8 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
 import { spawn } from "node:child_process";
 import { stopDaemon, stopMcp, stopControlPlane } from "../../dist/server/daemonctl.js";
 
@@ -18,7 +18,7 @@ let tempHome: string;
 let savedWorkerPid: string | undefined;
 
 beforeEach(() => {
-  tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-self-stop-"));
+  tempHome = tamanduaTempDir("tamandua-self-stop-");
   fs.mkdirSync(path.join(tempHome, ".tamandua"), { recursive: true });
   savedWorkerPid = process.env.TAMANDUA_WORKER_PID;
 });

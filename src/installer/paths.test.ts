@@ -1,6 +1,7 @@
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+
+import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
 import assert from "node:assert/strict";
 import { after, describe, it } from "node:test";
 import {
@@ -13,7 +14,7 @@ import {
 } from "../../dist/installer/paths.js";
 
 const originalStateDir = process.env.TAMANDUA_STATE_DIR;
-const testStateDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-paths-"));
+const testStateDir = tamanduaTempDir("tamandua-paths-");
 process.env.TAMANDUA_STATE_DIR = testStateDir;
 
 after(() => {

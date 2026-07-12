@@ -10,7 +10,7 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import os from "node:os";
+import { tamanduaTempDir } from "../src/lib/temp-dir.ts";
 import path from "node:path";
 import { findPiBinary, executeDispatchRound } from "../dist/installer/agent-scheduler.js";
 
@@ -28,7 +28,7 @@ function makeExecutable(dir: string, name: string, body = "#!/bin/sh\nexit 0\n")
 }
 
 beforeEach(() => {
-  tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-token-saver-"));
+  tempDir = tamanduaTempDir("tamandua-token-saver-");
   savedPath = process.env.PATH;
   savedPiBinary = process.env.TAMANDUA_PI_BINARY;
   savedHome = process.env.HOME;

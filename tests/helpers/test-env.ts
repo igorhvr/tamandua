@@ -1,7 +1,7 @@
 import http from "node:http";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+import { tamanduaTempDir } from "../../src/lib/temp-dir.ts";
 
 export interface TempHome {
   /** Top-level temp directory (e.g. /tmp/tamandua-test-XXXXX).  rmSync this to clean up. */
@@ -53,9 +53,7 @@ function _registerProcessCleanup() {
 export function createTempHome(prefix?: string): TempHome {
   _registerProcessCleanup();
 
-  const root = fs.mkdtempSync(
-    path.join(os.tmpdir(), prefix ?? "tamandua-test-"),
-  );
+  const root = tamanduaTempDir(prefix ?? "tamandua-test-");
   _cleanupDirs.add(root);
 
   const homeDir = path.join(root, "home");

@@ -4,13 +4,13 @@ import { computeHasFrontendChanges } from "../dist/installer/step-ops.js";
 import { execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import os from "node:os";
+import { tamanduaTempDir } from "../src/lib/temp-dir.ts";
 
 describe("computeHasFrontendChanges", () => {
   let tmpDir: string;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-test-"));
+    tmpDir = tamanduaTempDir("tamandua-test-");
     // Init a git repo with a main branch
     execSync("git init && git checkout -b main", { cwd: tmpDir });
     fs.writeFileSync(path.join(tmpDir, "README.md"), "# test");

@@ -23,6 +23,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import type { ScriptedAgentConfig } from "../../e2e-tests/helpers/scripted-agent.js";
+import { tamanduaTempDir } from "../../src/lib/temp-dir.ts";
 
 // Dynamic import since the factory is ESM and tests use tsx
 const { createScriptedHermes } = await import(
@@ -38,9 +39,7 @@ interface TestDirs {
 }
 
 function makeTempDirs(): TestDirs {
-  const tmp = fs.mkdtempSync(
-    path.join(os.tmpdir(), "hermes-factory-test-"),
-  );
+  const tmp = tamanduaTempDir("hermes-factory-test-");
   const mockCliPath = path.join(tmp, "mock-tamandua");
   return { tmp, mockCliPath };
 }

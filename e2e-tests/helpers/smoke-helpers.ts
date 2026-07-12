@@ -15,6 +15,7 @@ import { spawnSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { tamanduaTempDir, tamanduaTempRoot } from "../../src/lib/temp-dir.ts";
 import { DatabaseSync } from "node:sqlite";
 
 const repoRoot = process.cwd();
@@ -22,9 +23,7 @@ const cliPath = path.resolve(repoRoot, "dist", "cli", "cli.js");
 
 export async function createTempHome() {
   const [controlPort, dashboardPort] = await reserveDistinctRandomPorts(2);
-  const root = fs.mkdtempSync(
-    path.join(os.tmpdir(), "tamandua-e2e-workflows-"),
-  );
+  const root = tamanduaTempDir("tamandua-e2e-workflows-");
   const homeDir = path.join(root, "home");
   const tamanduaDir = path.join(homeDir, ".tamandua");
   fs.mkdirSync(tamanduaDir, { recursive: true });
@@ -252,7 +251,7 @@ export function resolveFullRunId(prefix: string, tamanduaDir: string): string {
  * Archive an isolated temp home directory to a preserved location when an e2e
  * test fails. Uses fs.cpSync for cross-platform copy (macOS + Linux).
  *
- * Archive path: /tmp/tamandua-e2e-failures/<YYYY-MM-DDTHHmmss>-<sanitizedSlug>/
+ * Archive path: <tamanduaTempRoot>/e2e-failures/<YYYY-MM-DDTHHmmss>-<sanitizedSlug>/
  *
  * Failure-proof: the entire function body is wrapped in try/catch. If archiving
  * or pruning throws, the error is logged to stderr and null is returned. This
@@ -280,7 +279,7 @@ export function preserveE2eTestHome(
       `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}` +
       `T${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
 
-    const archivesDir = path.join(os.tmpdir(), "tamandua-e2e-failures");
+    const archivesDir = path.join(tamanduaTempRoot(), "e2e-failures");
     const archivePath = path.join(archivesDir, `${timestamp}-${sanitizedSlug}`);
 
     // Create parent dir (no-op if exists)

@@ -177,7 +177,7 @@ async function admitOrQueueRun(run: RunRow): Promise<JsonResponse> {
     setupAgentCrons,
   } = await import("../installer/agent-scheduler.js");
 
-  const harness = await validateRunHarnessForScheduling(run.id, run.context);
+  const harness = validateRunHarnessForScheduling(run.id, run.context);
 
   let isSaveTokensMode = false;
   try {
@@ -646,7 +646,7 @@ async function handleResumeRun(runId: string): Promise<JsonResponse> {
     return ok({ state: "active" });
   }
   try {
-    await validateRunHarnessForScheduling(run.id, run.context);
+    validateRunHarnessForScheduling(run.id, run.context);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     try {

@@ -1,12 +1,12 @@
 import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+import { tamanduaTempDir } from "../src/lib/temp-dir.ts";
 import { logger, readRecentLogs, log, formatEntry } from "../dist/lib/logger.js";
 
 const originalStateDir = process.env.TAMANDUA_STATE_DIR;
-const testStateDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-logger-callers-"));
+const testStateDir = tamanduaTempDir("tamandua-logger-callers-");
 process.env.TAMANDUA_STATE_DIR = testStateDir;
 
 after(() => {

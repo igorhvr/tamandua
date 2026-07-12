@@ -1,4 +1,3 @@
-import crypto from "node:crypto";
 import fs from "node:fs";
 import { cleanChildEnv, createTempHome } from "./helpers/test-env.ts";
 import path from "node:path";
@@ -117,7 +116,7 @@ describe("CLI token display", () => {
   it("workflow status shows Tokens line with formatted number", async () => {
     const env = createTempEnv();
     const dbPath = path.join(env.tamanduaDir, "tamandua.db");
-    const runId = crypto.randomUUID();
+    const runId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
 
     seedDb(dbPath, [
       {
@@ -145,7 +144,7 @@ describe("CLI token display", () => {
     const stdout = getStdout();
     const stderr = getStderr();
 
-    assert.match(stdout, new RegExp(`Run: ${runId.substring(0, 8)}`));
+    assert.match(stdout, /Run: aaaaaaaa/);
     assert.match(stdout, /Tokens: 4,242/);
     assert.match(stdout, /Steps:/);
 
@@ -155,7 +154,7 @@ describe("CLI token display", () => {
   it("workflow status shows Tokens: 0 for zero tokens", async () => {
     const env = createTempEnv();
     const dbPath = path.join(env.tamanduaDir, "tamandua.db");
-    const runId = crypto.randomUUID();
+    const runId = "bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee";
 
     seedDb(dbPath, [
       {
@@ -182,7 +181,7 @@ describe("CLI token display", () => {
     const stdout = getStdout();
     const stderr = getStderr();
 
-    assert.match(stdout, new RegExp(`Run: ${runId.substring(0, 8)}`));
+    assert.match(stdout, /Run: bbbbbbbb/);
     assert.match(stdout, /Tokens: 0/);
 
     try { fs.rmSync(env.root, { recursive: true }); } catch { /* cleanup */ }
@@ -191,12 +190,10 @@ describe("CLI token display", () => {
   it("workflow runs shows token count per run", async () => {
     const env = createTempEnv();
     const dbPath = path.join(env.tamanduaDir, "tamandua.db");
-    const runId1 = crypto.randomUUID();
-    const runId2 = crypto.randomUUID();
 
     seedDb(dbPath, [
       {
-        id: runId1,
+        id: "cccccccc-cccc-4ccc-8ddd-eeeeeeeeeeee",
         workflowId: "feature-dev",
         task: "Add token display to CLI",
         status: "running",
@@ -206,7 +203,7 @@ describe("CLI token display", () => {
         ],
       },
       {
-        id: runId2,
+        id: "dddddddd-dddd-4ddd-8ddd-eeeeeeeeeeee",
         workflowId: "code-review",
         task: "Review token tracking PR",
         status: "completed",
@@ -230,11 +227,11 @@ describe("CLI token display", () => {
     const stderr = getStderr();
 
     assert.match(stdout, /Workflow runs:/);
-    // First run with 1,234 tokens
-    assert.match(stdout, new RegExp(runId1.substring(0, 8)));
+    // First run: cccccccc with 1,234 tokens
+    assert.match(stdout, /cccccccc/);
     assert.match(stdout, /1,234/);
-    // Second run with 567,890 tokens (formatted)
-    assert.match(stdout, new RegExp(runId2.substring(0, 8)));
+    // Second run: dddddddd with 567,890 tokens (formatted)
+    assert.match(stdout, /dddddddd/);
     assert.match(stdout, /567,890/);
     // Runs sorted by created_at DESC (most recent first), both were inserted around same time
 
@@ -244,7 +241,7 @@ describe("CLI token display", () => {
   it("workflow status queries tokens_spent from DB (not hardcoded)", async () => {
     const env = createTempEnv();
     const dbPath = path.join(env.tamanduaDir, "tamandua.db");
-    const runId = crypto.randomUUID();
+    const runId = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
 
     // Seed with a specific non-zero value
     seedDb(dbPath, [
@@ -280,7 +277,7 @@ describe("CLI token display", () => {
   it("workflow status with task substring match shows Tokens line", async () => {
     const env = createTempEnv();
     const dbPath = path.join(env.tamanduaDir, "tamandua.db");
-    const runId = crypto.randomUUID();
+    const runId = "ffffffff-ffff-4fff-8fff-ffffffffffff";
 
     seedDb(dbPath, [
       {
@@ -304,7 +301,7 @@ describe("CLI token display", () => {
 
     const stdout = getStdout();
 
-    assert.match(stdout, new RegExp(`Run: ${runId.substring(0, 8)}`));
+    assert.match(stdout, /Run: ffffffff/);
     assert.match(stdout, /Tokens: 500/);
 
     try { fs.rmSync(env.root, { recursive: true }); } catch { /* cleanup */ }

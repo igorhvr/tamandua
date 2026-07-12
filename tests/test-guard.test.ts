@@ -9,6 +9,7 @@ import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import os from "node:os";
 import path from "node:path";
+import { tamanduaTempRoot } from "../src/lib/temp-dir.ts";
 import {
   assertPortIsolation,
   assertStatePathIsolation,
@@ -66,7 +67,7 @@ describe("test-isolation guard", () => {
   it("allows temp-dir state when active", () => {
     process.env.TAMANDUA_TEST_GUARD = "1";
     assert.doesNotThrow(() =>
-      assertStatePathIsolation(path.join(os.tmpdir(), "tamandua-x", ".tamandua", "tamandua.db"), "unit test"),
+      assertStatePathIsolation(path.join(tamanduaTempRoot(), "tamandua-x", ".tamandua", "tamandua.db"), "unit test"),
     );
   });
 

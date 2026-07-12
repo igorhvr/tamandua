@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import { cleanChildEnv, reserveRandomPort } from "./helpers/test-env.ts";
-import os from "node:os";
 import path from "node:path";
+import { tamanduaTempDir } from "../src/lib/temp-dir.ts";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { spawnSync } from "node:child_process";
@@ -11,7 +11,7 @@ import { describe, it } from "node:test";
 const repoRoot = process.cwd();
 
 function createTempHome() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-run-tokens-"));
+  const root = tamanduaTempDir("tamandua-run-tokens-");
   const homeDir = path.join(root, "home");
   fs.mkdirSync(homeDir, { recursive: true });
   return { root, homeDir };

@@ -1,6 +1,7 @@
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+
+import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
 import assert from "node:assert/strict";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { readPiConfig, writePiConfig, readPiAuth } from "../../dist/installer/pi-config.js";
@@ -16,7 +17,7 @@ describe("pi-config", () => {
     originalHome = process.env.HOME;
     originalPiSettings = process.env.PI_SETTINGS_PATH;
     originalPiAuth = process.env.PI_AUTH_PATH;
-    tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-pi-config-"));
+    tempHome = tamanduaTempDir("tamandua-pi-config-");
     tempPiAgent = path.join(tempHome, ".pi", "agent");
     fs.mkdirSync(tempPiAgent, { recursive: true });
     process.env.HOME = tempHome;

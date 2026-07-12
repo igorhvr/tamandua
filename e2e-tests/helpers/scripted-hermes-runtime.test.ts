@@ -20,6 +20,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { DatabaseSync } from "node:sqlite";
+import { tamanduaTempDir } from "../../src/lib/temp-dir.ts";
 
 const runtimePath = path.resolve(
   process.cwd(),
@@ -38,7 +39,7 @@ interface TestDirs {
 }
 
 function makeTempDirs(): TestDirs {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-runtime-test-"));
+  const tmp = tamanduaTempDir("hermes-runtime-test-");
   const stateDir = path.join(tmp, "scripted-state");
   const hermesHome = path.join(tmp, "hermes-home");
   const behaviorsPath = path.join(tmp, "behaviors.json");

@@ -14,7 +14,7 @@ import { describe, it, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import http from "node:http";
-import os from "node:os";
+import { tamanduaTempRoot } from "../../src/lib/temp-dir.ts";
 import {
   createTempHome,
   reservePortHandle,
@@ -143,9 +143,9 @@ describe("withReservedPorts", () => {
 });
 
 describe("createTempHome", () => {
-  it("creates a directory under /tmp with default prefix tamandua-test-", () => {
+  it("creates a directory under tamandua temp root with default prefix tamandua-test-", () => {
     const th = createTempHome();
-    assert.ok(th.root.startsWith(os.tmpdir()), "root should be under tmpdir");
+    assert.ok(th.root.startsWith(tamanduaTempRoot()), "root should be under tamandua temp root");
     assert.ok(
       th.root.includes("tamandua-test-"),
       "root should include default prefix",

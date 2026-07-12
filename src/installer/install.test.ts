@@ -1,6 +1,7 @@
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+
+import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
 import assert from "node:assert/strict";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import {
@@ -123,7 +124,7 @@ describe("installWorkflow", () => {
   beforeEach(() => {
     originalHome = process.env.HOME;
     originalStateDir = process.env.TAMANDUA_STATE_DIR;
-    tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-install-"));
+    tempHome = tamanduaTempDir("tamandua-install-");
     process.env.HOME = tempHome;
     delete process.env.TAMANDUA_STATE_DIR;
 

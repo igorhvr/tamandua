@@ -2,10 +2,11 @@ import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import os from "node:os";
 import http from "node:http";
 import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
+
+import { tamanduaTempDir, tamanduaTempRoot } from "../../dist/lib/temp-dir.js";
 
 // ── Event helper ──
 
@@ -150,7 +151,7 @@ describe("detectRugpull", () => {
   let origStateDir: string | undefined;
 
   before(() => {
-    tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-rugpull-"));
+    tempHome = tamanduaTempDir("tamandua-rugpull-");
     origHome = process.env.HOME;
     origDbPath = process.env.TAMANDUA_DB_PATH;
     origStateDir = process.env.TAMANDUA_STATE_DIR;
@@ -751,7 +752,7 @@ describe("relaunchRunAfterRugpull", () => {
   let origWorktreeRoot: string | undefined;
 
   before(async () => {
-    tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-relaunch-"));
+    tempHome = tamanduaTempDir("tamandua-relaunch-");
     origHome = process.env.HOME;
     origControlPort = process.env.TAMANDUA_CONTROL_PORT;
     origDbPath = process.env.TAMANDUA_DB_PATH;
@@ -1241,7 +1242,7 @@ describe("failStep rugpull integration", () => {
 
   before(async () => {
     tempHome = fs.mkdtempSync(
-      path.join(os.tmpdir(), "tamandua-failstep-rugpull-"),
+      path.join(tamanduaTempRoot(), "tamandua-failstep-rugpull-"),
     );
     origHome = process.env.HOME;
     origControlPort = process.env.TAMANDUA_CONTROL_PORT;

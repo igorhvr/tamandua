@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { tamanduaTempRoot } from "../../dist/lib/temp-dir.js";
 import { logger, readRecentLogs, getLogPath, log, formatEntry } from "../../dist/lib/logger.js";
 import { createTempHome } from "../../tests/helpers/test-env.ts";
 
@@ -241,7 +242,7 @@ describe("logger", () => {
     const prevHome = process.env.HOME;
     try {
       process.env.TAMANDUA_TEST_GUARD = "1";
-      process.env.HOME = path.join(os.tmpdir(), "spoofed-home-" + Date.now());
+      process.env.HOME = path.join(tamanduaTempRoot(), "spoofed-home-" + Date.now());
       const realStateRoot = path.join(os.userInfo().homedir, ".tamandua");
       const spoofDir = path.join(realStateRoot, "spoofed-leak");
       process.env.TAMANDUA_STATE_DIR = spoofDir;

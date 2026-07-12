@@ -2,6 +2,8 @@ import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
+
+import { tamanduaTempDir, tamanduaTempRoot } from "../../dist/lib/temp-dir.js";
 import assert from "node:assert/strict";
 import { after, afterEach, beforeEach, describe, it } from "node:test";
 import { DatabaseSync } from "node:sqlite";
@@ -34,7 +36,7 @@ describe("events", () => {
 
   beforeEach(() => {
     originalStateDir = process.env.TAMANDUA_STATE_DIR;
-    stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-events-"));
+    stateDir = tamanduaTempDir("tamandua-events-");
     process.env.TAMANDUA_STATE_DIR = stateDir;
   });
 
@@ -249,7 +251,7 @@ describe("events", () => {
         const prevHome = process.env.HOME;
         try {
           process.env.TAMANDUA_TEST_GUARD = "1";
-          process.env.HOME = path.join(os.tmpdir(), "spoofed-home-" + Date.now());
+          process.env.HOME = path.join(tamanduaTempRoot(), "spoofed-home-" + Date.now());
           const realStateRoot = path.join(os.userInfo().homedir, ".tamandua");
           const spoofDir = path.join(realStateRoot, "spoofed-leak-events");
           process.env.TAMANDUA_STATE_DIR = spoofDir;
@@ -755,7 +757,7 @@ describe("emitEvent", () => {
 
   beforeEach(() => {
     originalStateDir = process.env.TAMANDUA_STATE_DIR;
-    stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-emit-"));
+    stateDir = tamanduaTempDir("tamandua-emit-");
     process.env.TAMANDUA_STATE_DIR = stateDir;
   });
 
@@ -797,7 +799,7 @@ describe("getRecentEvents", () => {
 
   beforeEach(() => {
     originalStateDir = process.env.TAMANDUA_STATE_DIR;
-    stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-recent-"));
+    stateDir = tamanduaTempDir("tamandua-recent-");
     process.env.TAMANDUA_STATE_DIR = stateDir;
   });
 
@@ -916,7 +918,7 @@ describe("getRunEvents", () => {
 
   beforeEach(() => {
     originalStateDir = process.env.TAMANDUA_STATE_DIR;
-    stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-runevents-"));
+    stateDir = tamanduaTempDir("tamandua-runevents-");
     process.env.TAMANDUA_STATE_DIR = stateDir;
   });
 
@@ -1066,7 +1068,7 @@ describe("countRunEvents", () => {
 
   beforeEach(() => {
     originalStateDir = process.env.TAMANDUA_STATE_DIR;
-    stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-count-"));
+    stateDir = tamanduaTempDir("tamandua-count-");
     process.env.TAMANDUA_STATE_DIR = stateDir;
   });
 
@@ -1153,7 +1155,7 @@ describe("emitEvent rotation integration", () => {
 
   beforeEach(() => {
     originalStateDir = process.env.TAMANDUA_STATE_DIR;
-    stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-emit-rotate-"));
+    stateDir = tamanduaTempDir("tamandua-emit-rotate-");
     process.env.TAMANDUA_STATE_DIR = stateDir;
   });
 
@@ -1379,7 +1381,7 @@ describe("rotation infrastructure", () => {
 
   beforeEach(() => {
     originalStateDir = process.env.TAMANDUA_STATE_DIR;
-    stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-rotate-"));
+    stateDir = tamanduaTempDir("tamandua-rotate-");
     process.env.TAMANDUA_STATE_DIR = stateDir;
   });
 
@@ -1589,7 +1591,7 @@ describe("getRecentEvents after rotation", () => {
 
   beforeEach(() => {
     originalStateDir = process.env.TAMANDUA_STATE_DIR;
-    stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-recent-rot-"));
+    stateDir = tamanduaTempDir("tamandua-recent-rot-");
     process.env.TAMANDUA_STATE_DIR = stateDir;
   });
 

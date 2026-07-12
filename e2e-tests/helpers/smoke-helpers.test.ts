@@ -7,14 +7,14 @@
 import { describe, it, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+import { tamanduaTempRoot, tamanduaTempDir } from "../../src/lib/temp-dir.ts";
 import { preserveE2eTestHome } from "./smoke-helpers.ts";
 
-const ARCHIVES_DIR = path.join(os.tmpdir(), "tamandua-e2e-failures");
+const ARCHIVES_DIR = path.join(tamanduaTempRoot(), "e2e-failures");
 
 function makeTempDir(prefix: string): string {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  return tamanduaTempDir(prefix);
 }
 
 /** Recursively compare two directories: same file names and contents. */

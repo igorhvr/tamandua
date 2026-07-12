@@ -11,8 +11,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+import { tamanduaTempDir } from "../src/lib/temp-dir.ts";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { cleanChildEnv } from "./helpers/test-env.ts";
@@ -23,7 +23,7 @@ const INSTALL_SCRIPT = path.resolve(__dirname, "..", "scripts", "install.sh");
 const REPO_ROOT = path.resolve(__dirname, "..");
 
 function createTempHome(): string {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-inst-sh-"));
+  const dir = tamanduaTempDir("tamandua-inst-sh-");
   const piAgentDir = path.join(dir, ".pi", "agent");
   fs.mkdirSync(piAgentDir, { recursive: true });
   fs.writeFileSync(

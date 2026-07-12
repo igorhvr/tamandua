@@ -10,7 +10,7 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import os from "node:os";
+import { tamanduaTempDir } from "../src/lib/temp-dir.ts";
 import path from "node:path";
 import { getHarnessAdapter } from "../dist/installer/harness-adapter.js";
 import { executeDispatchRound } from "../dist/installer/agent-scheduler.js";
@@ -29,7 +29,7 @@ function makeExecutable(dir: string, name: string, body = "#!/bin/sh\nexit 0\n")
 }
 
 beforeEach(() => {
-  tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-hermes-token-saver-"));
+  tempDir = tamanduaTempDir("tamandua-hermes-token-saver-");
   savedPath = process.env.PATH;
   savedHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
   savedHome = process.env.HOME;

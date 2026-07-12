@@ -6,13 +6,14 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+
+import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
 import { DatabaseSync } from "node:sqlite";
 import { lookupHermesSessionTokens, probeHermesStateContract } from "../../dist/installer/hermes-usage.js";
 
 function createTempHome(): string {
-  return fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-test-hermes-usage-"));
+  return tamanduaTempDir("tamandua-test-hermes-usage-");
 }
 
 function seedStateDb(hermesHome: string, rows: Array<Record<string, unknown>>): string {

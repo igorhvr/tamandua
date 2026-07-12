@@ -19,7 +19,6 @@ import path from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { setTimeout as sleep } from "node:timers/promises";
-import crypto from "node:crypto";
 import http from "node:http";
 import { fileURLToPath } from "node:url";
 
@@ -225,13 +224,10 @@ describe("tamandua workflow pause-all CLI", { concurrency: 1 }, () => {
     const dbPath = path.join(th.tamanduaDir, "tamandua.db");
 
     // Only terminal runs, no running runs
-    const completedId = crypto.randomUUID();
-    const failedId = crypto.randomUUID();
-    const pausedId = crypto.randomUUID();
     seedRunDb(dbPath, [
-      { id: completedId, workflowId: "feature-dev-merge", task: "Completed run", status: "completed" },
-      { id: failedId, workflowId: "feature-dev-merge", task: "Failed run", status: "failed" },
-      { id: pausedId, workflowId: "feature-dev-merge", task: "Paused run", status: "paused" },
+      { id: "aaaa1111-1111-1111-1111-111111111111", workflowId: "feature-dev-merge", task: "Completed run", status: "completed" },
+      { id: "bbbb2222-2222-2222-2222-222222222222", workflowId: "feature-dev-merge", task: "Failed run", status: "failed" },
+      { id: "cccc3333-3333-3333-3333-333333333333", workflowId: "feature-dev-merge", task: "Paused run", status: "paused" },
     ]);
 
     const { stdout, stderr, exitCode } = await runCli(
@@ -260,10 +256,10 @@ describe("tamandua workflow pause-all CLI", { concurrency: 1 }, () => {
 
     const dbPath = path.join(th.tamanduaDir, "tamandua.db");
 
-    const running1 = crypto.randomUUID();
-    const running2 = crypto.randomUUID();
-    const running3 = crypto.randomUUID();
-    const completedRun = crypto.randomUUID();
+    const running1 = "rrrr1111-1111-1111-1111-111111111111";
+    const running2 = "rrrr2222-2222-2222-2222-222222222222";
+    const running3 = "rrrr3333-3333-3333-3333-333333333333";
+    const completedRun = "cccc1111-cccc-cccc-cccc-cccccccccccc";
 
     seedRunDb(dbPath, [
       { id: running1, workflowId: "feature-dev-merge", task: "Running 1", status: "running" },
@@ -326,8 +322,8 @@ describe("tamandua workflow pause-all CLI", { concurrency: 1 }, () => {
 
     const dbPath = path.join(th.tamanduaDir, "tamandua.db");
 
-    const running1 = crypto.randomUUID();
-    const running2 = crypto.randomUUID();
+    const running1 = "drrr1111-1111-1111-1111-111111111111";
+    const running2 = "drrr2222-2222-2222-2222-222222222222";
 
     seedRunDb(dbPath, [
       { id: running1, workflowId: "feature-dev-merge", task: "Drainable 1", status: "running" },
@@ -395,11 +391,9 @@ describe("tamandua workflow resume-all CLI", { concurrency: 1 }, () => {
 
     const dbPath = path.join(th.tamanduaDir, "tamandua.db");
 
-    const runningId = crypto.randomUUID();
-    const completedId = crypto.randomUUID();
     seedRunDb(dbPath, [
-      { id: runningId, workflowId: "feature-dev-merge", task: "Running run", status: "running" },
-      { id: completedId, workflowId: "feature-dev-merge", task: "Completed run", status: "completed" },
+      { id: "xxxx1111-1111-1111-1111-111111111111", workflowId: "feature-dev-merge", task: "Running run", status: "running" },
+      { id: "xxxx2222-2222-2222-2222-222222222222", workflowId: "feature-dev-merge", task: "Completed run", status: "completed" },
     ]);
 
     const { stdout, stderr, exitCode } = await runCli(
@@ -428,9 +422,9 @@ describe("tamandua workflow resume-all CLI", { concurrency: 1 }, () => {
 
     const dbPath = path.join(th.tamanduaDir, "tamandua.db");
 
-    const paused1 = crypto.randomUUID();
-    const paused2 = crypto.randomUUID();
-    const completedRun = crypto.randomUUID();
+    const paused1 = "paus1111-1111-1111-1111-111111111111";
+    const paused2 = "paus2222-2222-2222-2222-222222222222";
+    const completedRun = "comp3333-3333-3333-3333-333333333333";
 
     // Need steps table too for resume (admitOrQueueRun checks steps)
     seedRunWithStepsDb(dbPath, [
@@ -497,11 +491,9 @@ describe("tamandua workflow resume-all CLI", { concurrency: 1 }, () => {
 
     const dbPath = path.join(th.tamanduaDir, "tamandua.db");
 
-    const paused1 = crypto.randomUUID();
-    const paused2 = crypto.randomUUID();
     seedRunDb(dbPath, [
-      { id: paused1, workflowId: "feature-dev-merge", task: "Paused no daemon", status: "paused" },
-      { id: paused2, workflowId: "feature-dev-merge", task: "Another paused", status: "paused" },
+      { id: "noda1111-1111-1111-1111-111111111111", workflowId: "feature-dev-merge", task: "Paused no daemon", status: "paused" },
+      { id: "noda2222-2222-2222-2222-222222222222", workflowId: "feature-dev-merge", task: "Another paused", status: "paused" },
     ]);
 
     const { stdout, stderr, exitCode } = await runCli(
@@ -536,10 +528,10 @@ describe("tamandua workflow pause-all / resume-all terminal protection", { concu
 
     const dbPath = path.join(th.tamanduaDir, "tamandua.db");
 
-    const running = crypto.randomUUID();
-    const completed = crypto.randomUUID();
-    const failed = crypto.randomUUID();
-    const canceled = crypto.randomUUID();
+    const running = "term1111-1111-1111-1111-111111111111";
+    const completed = "term2222-2222-2222-2222-222222222222";
+    const failed = "term3333-3333-3333-3333-333333333333";
+    const canceled = "term4444-4444-4444-4444-444444444444";
 
     seedRunDb(dbPath, [
       { id: running, workflowId: "feature-dev-merge", task: "Running", status: "running" },
@@ -601,10 +593,10 @@ describe("tamandua workflow pause-all / resume-all terminal protection", { concu
 
     const dbPath = path.join(th.tamanduaDir, "tamandua.db");
 
-    const paused = crypto.randomUUID();
-    const completed = crypto.randomUUID();
-    const failed = crypto.randomUUID();
-    const canceled = crypto.randomUUID();
+    const paused = "rtm1111-1111-1111-1111-111111111111";
+    const completed = "rtm2222-2222-2222-2222-222222222222";
+    const failed = "rtm3333-3333-3333-3333-333333333333";
+    const canceled = "rtm4444-4444-4444-4444-444444444444";
 
     // Need steps table for resume
     seedRunWithStepsDb(dbPath, [

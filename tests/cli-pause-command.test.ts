@@ -17,7 +17,6 @@ import path from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { setTimeout as sleep } from "node:timers/promises";
-import crypto from "node:crypto";
 import http from "node:http";
 import { fileURLToPath } from "node:url";
 
@@ -202,7 +201,7 @@ describe("tamandua workflow pause CLI", { concurrency: 1 }, () => {
 
     const dbPath = path.join(th.tamanduaDir, "tamandua.db");
 
-    const completedRunId = crypto.randomUUID();
+    const completedRunId = "e5fa8fcf-1408-4b8a-a5d8-b2fefa7bedf4";
     seedRunDb(dbPath, [
       {
         id: completedRunId,
@@ -239,7 +238,7 @@ describe("tamandua workflow pause CLI", { concurrency: 1 }, () => {
 
     const dbPath = path.join(th.tamanduaDir, "tamandua.db");
 
-    const failedRunId = crypto.randomUUID();
+    const failedRunId = "a1b2c3d4-5678-90ab-cdef-1234567890ab";
     seedRunDb(dbPath, [
       {
         id: failedRunId,
@@ -276,7 +275,7 @@ describe("tamandua workflow pause CLI", { concurrency: 1 }, () => {
 
     const dbPath = path.join(th.tamanduaDir, "tamandua.db");
 
-    const canceledRunId = crypto.randomUUID();
+    const canceledRunId = "deadbeef-1111-2222-3333-444455556666";
     seedRunDb(dbPath, [
       {
         id: canceledRunId,
@@ -316,7 +315,7 @@ describe("tamandua workflow pause CLI", { concurrency: 1 }, () => {
 
     const dbPath = path.join(th.tamanduaDir, "tamandua.db");
 
-    const runningRunId = crypto.randomUUID();
+    const runningRunId = "99999999-aaaa-bbbb-cccc-ddddeeee0000";
     seedRunDb(dbPath, [
       {
         id: runningRunId,
@@ -352,7 +351,7 @@ describe("tamandua workflow pause CLI", { concurrency: 1 }, () => {
 
     const dbPath = path.join(th.tamanduaDir, "tamandua.db");
 
-    const runningRunId = crypto.randomUUID();
+    const runningRunId = "bbbbbbbb-1111-2222-3333-444455556666";
     seedRunDb(dbPath, [
       {
         id: runningRunId,

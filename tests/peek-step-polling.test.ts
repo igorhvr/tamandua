@@ -12,6 +12,7 @@
 
 import { DatabaseSync } from "node:sqlite";
 import crypto from "node:crypto";
+import { tamanduaTempRoot } from "../src/lib/temp-dir.ts";
 import { describe, it, before, beforeEach, after } from "node:test";
 import assert from "node:assert/strict";
 
@@ -107,10 +108,9 @@ describe("peekStep - lightweight work check", () => {
 
   before(async () => {
     // Create a temp DB file for testing
-    const os = await import("node:os");
-    const path = await import("node:path");
-    const fs = await import("node:fs");
-    tmpDbPath = path.join(os.tmpdir(), `tamandua-test-peek-${crypto.randomUUID()}.db`);
+    const pathMod = await import("node:path");
+    const fsMod = await import("node:fs");
+    tmpDbPath = pathMod.join(tamanduaTempRoot(), `tamandua-test-peek-${crypto.randomUUID()}.db`);
     originalDbPath = process.env.TAMANDUA_DB_PATH;
     process.env.TAMANDUA_DB_PATH = tmpDbPath;
   });

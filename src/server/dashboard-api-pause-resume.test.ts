@@ -1,8 +1,8 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
 import { once } from "node:events";
 import http from "node:http";
 import { DatabaseSync } from "node:sqlite";
@@ -164,7 +164,7 @@ describe("dashboard pause/resume API", () => {
   let controlPort: number;
 
   before(async () => {
-    root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-dashboard-pause-"));
+    root = tamanduaTempDir("tamandua-dashboard-pause-");
     dbPath = path.join(root, "tamandua.db");
 
     // Start mock control plane on a random port

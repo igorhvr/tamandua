@@ -2,7 +2,8 @@ import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import os from "node:os";
+
+import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
 
 import { runWorkflow, type RunWorkflowParams } from "../../dist/installer/run.js";
 import { getRunHarnessType } from "../../dist/installer/run-harness.js";
@@ -54,7 +55,7 @@ describe("HarnessType flow (US-001)", () => {
   let origHome: string | undefined;
 
   before(() => {
-    tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-harness-type-"));
+    tempHome = tamanduaTempDir("tamandua-harness-type-");
     origHome = process.env.HOME;
     process.env.HOME = tempHome;
     delete process.env.TAMANDUA_DB_PATH;

@@ -10,7 +10,8 @@ import assert from "node:assert/strict";
 import { describe, it, beforeEach, afterEach } from "node:test";
 import fs from "node:fs";
 import path from "node:path";
-import os from "node:os";
+
+import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
 import {
   buildDispatchRoundContext,
   createAgentCronJob,
@@ -104,7 +105,7 @@ describe("executeDispatchRound harness dispatch", () => {
   let savedHermesBinary: string | undefined;
 
   beforeEach(() => {
-    tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-test-routing-"));
+    tempHome = tamanduaTempDir("tamandua-test-routing-");
     savedPiBinary = process.env.TAMANDUA_PI_BINARY;
     savedHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
 
@@ -316,7 +317,7 @@ describe("createAgentCronJob harnessType from run context", () => {
   let savedPiBinary: string | undefined;
 
   beforeEach(() => {
-    tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-test-cron-harness-"));
+    tempHome = tamanduaTempDir("tamandua-test-cron-harness-");
     savedPiBinary = process.env.TAMANDUA_PI_BINARY;
 
     const homeDir = path.join(tempHome, "home");

@@ -1,7 +1,8 @@
 import fs from "node:fs";
 import { cleanChildEnv } from "../../tests/helpers/test-env.ts";
-import os from "node:os";
 import path from "node:path";
+
+import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
@@ -13,7 +14,7 @@ const cliPath = path.resolve(process.cwd(), "dist", "cli", "cli.js");
 // ── Helpers ──
 
 function createTempEnv() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-status-test-"));
+  const root = tamanduaTempDir("tamandua-status-test-");
   const homeDir = path.join(root, "home");
   const tamanduaDir = path.join(homeDir, ".tamandua");
   fs.mkdirSync(tamanduaDir, { recursive: true });
@@ -341,7 +342,7 @@ describe("stopWorkflow", () => {
   beforeEach(() => {
     originalDbPath = process.env.TAMANDUA_DB_PATH;
     originalHome = process.env.HOME;
-    tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-stopwf-"));
+    tempRoot = tamanduaTempDir("tamandua-stopwf-");
     const dbPath = path.join(tempRoot, ".tamandua", "tamandua.db");
     process.env.TAMANDUA_DB_PATH = dbPath;
     process.env.HOME = tempRoot;

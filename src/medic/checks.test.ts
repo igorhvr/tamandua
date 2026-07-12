@@ -1,6 +1,6 @@
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
 import assert from "node:assert/strict";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { DatabaseSync } from "node:sqlite";
@@ -16,7 +16,7 @@ describe("medic checks", () => {
   beforeEach(() => {
     originalDbPath = process.env.TAMANDUA_DB_PATH;
     originalHome = process.env.HOME;
-    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-medic-checks-"));
+    tempDir = tamanduaTempDir("tamandua-medic-checks-");
     const tamanduaDir = path.join(tempDir, ".tamandua");
     fs.mkdirSync(tamanduaDir, { recursive: true });
     dbPath = path.join(tamanduaDir, "tamandua.db");

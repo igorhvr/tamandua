@@ -8,8 +8,8 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+import { tamanduaTempDir } from "../../src/lib/temp-dir.ts";
 import {
   reserveDistinctRandomPorts,
 } from "../../tests/helpers/test-env.ts";
@@ -30,9 +30,7 @@ let controlPort: number;
 let dashboardPort: number;
 
 function createTempHome() {
-  tempRoot = fs.mkdtempSync(
-    path.join(os.tmpdir(), "tamandua-e2e-helpers-test-"),
-  );
+  tempRoot = tamanduaTempDir("tamandua-e2e-helpers-test-");
   homeDir = path.join(tempRoot, "home");
   tamanduaDir = path.join(homeDir, ".tamandua");
   fs.mkdirSync(tamanduaDir, { recursive: true });

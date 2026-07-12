@@ -10,8 +10,8 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+import { tamanduaTempDir } from "../src/lib/temp-dir.ts";
 import { getHarnessAdapter } from "../dist/installer/harness-adapter.js";
 import type { HarnessRoundResult } from "../dist/installer/harness-adapter.js";
 
@@ -30,7 +30,7 @@ function makeExecutable(dir: string, name: string, body: string): string {
 }
 
 beforeEach(() => {
-  tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-harness-stderr-tail-"));
+  tempDir = tamanduaTempDir("tamandua-harness-stderr-tail-");
   savedPath = process.env.PATH;
   savedPiBinary = process.env.TAMANDUA_PI_BINARY;
   savedHermesBinary = process.env.TAMANDUA_HERMES_BINARY;

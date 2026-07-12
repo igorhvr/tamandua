@@ -20,8 +20,8 @@
 import { describe, it, before } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+import { tamanduaTempRoot } from "../src/lib/temp-dir.ts";
 import { loadWorkflowSpec } from "../dist/installer/workflow-spec.js";
 import { resolveBundledWorkflowsDir } from "../dist/installer/paths.js";
 import {
@@ -1092,7 +1092,7 @@ describe("verifier-diff lint rule — two-dot diffs prohibited in verifiers", ()
   it("synthetic: verifier persona file scan detects two-dot", () => {
     // Create a temp persona file with two-dot diff instruction
     const tmpDir = fs.mkdtempSync(
-      path.join(os.tmpdir(), "tamandua-lint-"),
+      path.join(tamanduaTempRoot(), "tamandua-lint-"),
     );
     try {
       const personaPath = path.join(tmpDir, "AGENTS.md");
@@ -1113,7 +1113,7 @@ describe("verifier-diff lint rule — two-dot diffs prohibited in verifiers", ()
 
   it("synthetic: verifier persona file with three-dot passes", () => {
     const tmpDir = fs.mkdtempSync(
-      path.join(os.tmpdir(), "tamandua-lint-"),
+      path.join(tamanduaTempRoot(), "tamandua-lint-"),
     );
     try {
       const personaPath = path.join(tmpDir, "AGENTS.md");

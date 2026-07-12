@@ -1,6 +1,7 @@
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+
+import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
 import assert from "node:assert/strict";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import {
@@ -54,7 +55,7 @@ describe("writeCatalogStamp", () => {
   beforeEach(() => {
     originalHome = process.env.HOME;
     originalStateDir = process.env.TAMANDUA_STATE_DIR;
-    tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-catstamp-"));
+    tempHome = tamanduaTempDir("tamandua-catstamp-");
     process.env.HOME = tempHome;
     delete process.env.TAMANDUA_STATE_DIR;
   });
@@ -101,7 +102,7 @@ describe("readInstalledCatalogStamp", () => {
   beforeEach(() => {
     originalHome = process.env.HOME;
     originalStateDir = process.env.TAMANDUA_STATE_DIR;
-    tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-rstamp-"));
+    tempHome = tamanduaTempDir("tamandua-rstamp-");
     process.env.HOME = tempHome;
     delete process.env.TAMANDUA_STATE_DIR;
   });
@@ -173,7 +174,7 @@ describe("checkCatalogStalenessWarning (US-003)", () => {
   beforeEach(() => {
     originalHome = process.env.HOME;
     originalStateDir = process.env.TAMANDUA_STATE_DIR;
-    tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-cswarn-"));
+    tempHome = tamanduaTempDir("tamandua-cswarn-");
     process.env.HOME = tempHome;
     delete process.env.TAMANDUA_STATE_DIR;
   });

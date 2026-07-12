@@ -1,9 +1,8 @@
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
-import crypto from "node:crypto";
+import { tamanduaTempDir } from "../src/lib/temp-dir.ts";
 import { fileURLToPath } from "node:url";
 import { resolveSourcePath } from "../dist/installer/paths.js";
 import {
@@ -27,7 +26,7 @@ beforeEach(() => {
   previousStateDir = process.env.TAMANDUA_STATE_DIR;
   previousDbPath = process.env.TAMANDUA_DB_PATH;
 
-  envRoot = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-update-env-"));
+  envRoot = tamanduaTempDir("tamandua-update-env-");
   const home = path.join(envRoot, "home");
   const state = path.join(envRoot, "state");
   fs.mkdirSync(home, { recursive: true });
@@ -53,7 +52,7 @@ afterEach(() => {
 });
 
 function createSourceRoot(): string {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-update-source-"));
+  const root = tamanduaTempDir("tamandua-update-source-");
   fs.writeFileSync(path.join(root, "package.json"), "{\"name\":\"tamandua-test\"}\n", "utf-8");
   fs.writeFileSync(path.join(root, "build-and-install"), "#!/bin/sh\nexit 0\n", { encoding: "utf-8", mode: 0o755 });
   return root;
@@ -140,13 +139,12 @@ describe("tamandua update command helpers", () => {
     const sourcePath = createSourceRoot();
     const commands: string[] = [];
     const { output, logs } = createOutput();
-    const sha = crypto.randomBytes(8).toString('hex');
 
     try {
       const result = await runUpdate({
         sourcePath,
         output,
-        runCommand: createRunCommand([sha, sha], commands),
+        runCommand: createRunCommand(["aaaaaaaaaaaaaaaa", "aaaaaaaaaaaaaaaa"], commands),
         services: {
           ...createServices({
             dashboard: { running: false, pid: null, port: 4101 },
@@ -180,14 +178,12 @@ describe("tamandua update command helpers", () => {
     const commands: string[] = [];
     const serviceCalls: string[] = [];
     const { output, warnings } = createOutput();
-    const sha1 = crypto.randomBytes(8).toString('hex');
-    const sha2 = crypto.randomBytes(8).toString('hex');
 
     try {
       const result = await runUpdate({
         sourcePath,
         output,
-        runCommand: createRunCommand([sha1, sha2], commands),
+        runCommand: createRunCommand(["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"], commands),
         services: createServices({
           dashboard: { running: true, pid: 111111, port: 4201 },
           mcp: { running: true, pid: 222222, port: 4202 },
@@ -229,15 +225,13 @@ describe("tamandua update command helpers", () => {
     const waitedPids: number[] = [];
     const installed: string[] = [];
     const { output, warnings } = createOutput();
-    const sha1 = crypto.randomBytes(8).toString('hex');
-    const sha2 = crypto.randomBytes(8).toString('hex');
 
     try {
       const result = await runUpdate({
         force: true,
         sourcePath,
         output,
-        runCommand: createRunCommand([sha1, sha2], commands),
+        runCommand: createRunCommand(["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"], commands),
         services: createServices({
           dashboard: { running: true, pid: 111111, port: 4301 },
           mcp: { running: false, pid: null, port: 4302 },
@@ -277,15 +271,13 @@ describe("tamandua update command helpers", () => {
   it("restarts previously running services if workflow install fails", async () => {
     const sourcePath = createSourceRoot();
     const serviceCalls: string[] = [];
-    const sha1 = crypto.randomBytes(8).toString('hex');
-    const sha2 = crypto.randomBytes(8).toString('hex');
 
     try {
       await assert.rejects(
         () => runUpdate({
           sourcePath,
           output: createOutput().output,
-          runCommand: createRunCommand([sha1, sha2], []),
+          runCommand: createRunCommand(["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"], []),
           services: createServices({
             dashboard: { running: false, pid: null, port: 4401 },
             mcp: { running: true, pid: 222222, port: 4402 },
@@ -318,14 +310,13 @@ describe("tamandua update command helpers", () => {
     const waitedPids: number[] = [];
     const installed: string[] = [];
     const { output, logs } = createOutput();
-    const sha = crypto.randomBytes(8).toString('hex');
 
     try {
       const result = await runUpdate({
         force: true,
         sourcePath,
         output,
-        runCommand: createRunCommand([sha, sha], commands),
+        runCommand: createRunCommand(["aaaaaaaaaaaaaaaa", "aaaaaaaaaaaaaaaa"], commands),
         services: createServices({
           dashboard: { running: true, pid: 111111, port: 4401 },
           mcp: { running: false, pid: null, port: 4402 },
@@ -368,14 +359,13 @@ describe("tamandua update command helpers", () => {
     const sourcePath = createSourceRoot();
     const commands: string[] = [];
     const { output } = createOutput();
-    const sha = crypto.randomBytes(8).toString('hex');
 
     try {
       const result = await runUpdate({
         force: true,
         sourcePath,
         output,
-        runCommand: createRunCommand([sha, sha], commands),
+        runCommand: createRunCommand(["aaaaaaaaaaaaaaaa", "aaaaaaaaaaaaaaaa"], commands),
         services: createServices({
           dashboard: { running: false, pid: null, port: 4501 },
           mcp: { running: false, pid: null, port: 4502 },

@@ -1,4 +1,3 @@
-import crypto from "node:crypto";
 import fs from "node:fs";
 import { cleanChildEnv, createTempHome } from "./helpers/test-env.ts";
 import path from "node:path";
@@ -165,7 +164,7 @@ describe("ABND — CLI abandon reason display", () => {
   it("workflow status shows abandon reasons for failed run with abandonments", async () => {
     const env = createTempEnv();
     const dbPath = path.join(env.tamanduaDir, "tamandua.db");
-    const runId = crypto.randomUUID();
+    const runId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
 
     seedDb(dbPath, [
       {
@@ -205,7 +204,7 @@ describe("ABND — CLI abandon reason display", () => {
     const stdout = getStdout();
 
     // Run info should be displayed
-    assert.match(stdout, new RegExp(`Run: ${runId.substring(0, 8)}`));
+    assert.match(stdout, /Run: aaaaaaaa/);
     assert.match(stdout, /Status: failed/);
 
     // Abandon reasons should be displayed with the aggregate
@@ -221,7 +220,7 @@ describe("ABND — CLI abandon reason display", () => {
   it("workflow status does NOT show abandon reasons for failed run without abandonments", async () => {
     const env = createTempEnv();
     const dbPath = path.join(env.tamanduaDir, "tamandua.db");
-    const runId = crypto.randomUUID();
+    const runId = "bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee";
 
     seedDb(dbPath, [
       {
@@ -264,7 +263,7 @@ describe("ABND — CLI abandon reason display", () => {
   it("workflow status shows step output for failed steps", async () => {
     const env = createTempEnv();
     const dbPath = path.join(env.tamanduaDir, "tamandua.db");
-    const runId = crypto.randomUUID();
+    const runId = "cccccccc-cccc-4ccc-8ddd-eeeeeeeeeeee";
 
     seedDb(dbPath, [
       {
@@ -315,7 +314,7 @@ describe("ABND — CLI abandon reason display", () => {
   it("workflow status does NOT regress for normal running run", async () => {
     const env = createTempEnv();
     const dbPath = path.join(env.tamanduaDir, "tamandua.db");
-    const runId = crypto.randomUUID();
+    const runId = "dddddddd-dddd-4ddd-8ddd-eeeeeeeeeeee";
 
     seedDb(dbPath, [
       {
@@ -345,7 +344,7 @@ describe("ABND — CLI abandon reason display", () => {
     const stdout = getStdout();
 
     // Normal run info
-    assert.match(stdout, new RegExp(`Run: ${runId.substring(0, 8)}`));
+    assert.match(stdout, /Run: dddddddd/);
     assert.match(stdout, /Status: running/);
     assert.match(stdout, /Tokens: 300/);
 
@@ -363,7 +362,7 @@ describe("ABND — CLI abandon reason display", () => {
   it("workflow status shows single abandon reason correctly", async () => {
     const env = createTempEnv();
     const dbPath = path.join(env.tamanduaDir, "tamandua.db");
-    const runId = crypto.randomUUID();
+    const runId = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
 
     seedDb(dbPath, [
       {

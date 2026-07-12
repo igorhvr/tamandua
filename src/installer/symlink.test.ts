@@ -1,6 +1,7 @@
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+
+import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
 import assert from "node:assert/strict";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import {
@@ -20,7 +21,7 @@ describe("symlink", () => {
     originalHome = process.env.HOME;
     originalBinDir = process.env.TAMANDUA_BIN_DIR;
     originalStateDir = process.env.TAMANDUA_STATE_DIR;
-    tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-symlink-"));
+    tempHome = tamanduaTempDir("tamandua-symlink-");
     localBin = path.join(tempHome, ".local", "bin");
     fs.mkdirSync(localBin, { recursive: true });
     process.env.HOME = tempHome;
@@ -153,7 +154,7 @@ describe("symlink", () => {
   describe("resolveBinDir fallback", () => {
     it("falls back to .tamandua/bin when .local/bin is inaccessible", () => {
       // Create a temp home WITHOUT write permissions to .local
-      const noLocalHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-nolocal-"));
+      const noLocalHome = tamanduaTempDir("tamandua-nolocal-");
       const origHome = process.env.HOME;
 
       try {

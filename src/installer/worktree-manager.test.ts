@@ -1,9 +1,10 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
-import os from "node:os";
+
+import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
 
 import {
   resolveWorktreeRoot,
@@ -57,7 +58,7 @@ describe("worktree-manager", () => {
   let origWorktreeRoot: string | undefined;
 
   before(() => {
-    tempHome = mkdtempSync(path.join(os.tmpdir(), "tamandua-worktree-mgr-"));
+    tempHome = tamanduaTempDir("tamandua-worktree-mgr-");
     origHome = process.env.HOME;
     origDbPath = process.env.TAMANDUA_DB_PATH;
     origWorktreeRoot = process.env.TAMANDUA_WORKTREE_ROOT;
@@ -148,7 +149,7 @@ describe("worktree-manager", () => {
     let originRepo: string;
 
     before(() => {
-      originRepo = mkdtempSync(path.join(os.tmpdir(), "tamandua-origin-"));
+      originRepo = tamanduaTempDir("tamandua-origin-");
       initGitRepo(originRepo);
     });
 
@@ -187,7 +188,7 @@ describe("worktree-manager", () => {
     });
 
     it("rejects non-git origin repos with clear error", () => {
-      const nonGitDir = mkdtempSync(path.join(os.tmpdir(), "tamandua-non-git-"));
+      const nonGitDir = tamanduaTempDir("tamandua-non-git-");
       try {
         assert.throws(
           () =>
@@ -206,7 +207,7 @@ describe("worktree-manager", () => {
 
     it("rejects detached origin with no ref and no original branch", () => {
       // Create a repo, then detach HEAD
-      const detachedRepo = mkdtempSync(path.join(os.tmpdir(), "tamandua-detached-"));
+      const detachedRepo = tamanduaTempDir("tamandua-detached-");
       try {
         initGitRepo(detachedRepo);
         // Detach HEAD by checking out a SHA
@@ -229,7 +230,7 @@ describe("worktree-manager", () => {
     });
 
     it("works with detached origin when explicit origin ref is provided", () => {
-      const detachedRepo = mkdtempSync(path.join(os.tmpdir(), "tamandua-detached2-"));
+      const detachedRepo = tamanduaTempDir("tamandua-detached2-");
       try {
         initGitRepo(detachedRepo);
         const sha = getHeadSha(detachedRepo);
@@ -254,7 +255,7 @@ describe("worktree-manager", () => {
     });
 
     it("rejects dirty origin repositories", () => {
-      const dirtyRepo = mkdtempSync(path.join(os.tmpdir(), "tamandua-dirty-origin-"));
+      const dirtyRepo = tamanduaTempDir("tamandua-dirty-origin-");
       try {
         initGitRepo(dirtyRepo);
         writeFileSync(path.join(dirtyRepo, "dirty.txt"), "unstaged change", "utf-8");
@@ -313,7 +314,7 @@ describe("worktree-manager", () => {
     let originRepo: string;
 
     before(() => {
-      originRepo = mkdtempSync(path.join(os.tmpdir(), "tamandua-get-"));
+      originRepo = tamanduaTempDir("tamandua-get-");
       initGitRepo(originRepo);
     });
 
@@ -352,7 +353,7 @@ describe("worktree-manager", () => {
     let originRepo: string;
 
     before(() => {
-      originRepo = mkdtempSync(path.join(os.tmpdir(), "tamandua-validate-"));
+      originRepo = tamanduaTempDir("tamandua-validate-");
       initGitRepo(originRepo);
     });
 
@@ -456,7 +457,7 @@ describe("worktree-manager", () => {
     let originRepo: string;
 
     before(() => {
-      originRepo = mkdtempSync(path.join(os.tmpdir(), "tamandua-remove-"));
+      originRepo = tamanduaTempDir("tamandua-remove-");
       initGitRepo(originRepo);
     });
 
@@ -532,7 +533,7 @@ describe("worktree-manager", () => {
     let originRepo: string;
 
     before(() => {
-      originRepo = mkdtempSync(path.join(os.tmpdir(), "tamandua-list-"));
+      originRepo = tamanduaTempDir("tamandua-list-");
       initGitRepo(originRepo);
     });
 

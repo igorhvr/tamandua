@@ -9,7 +9,8 @@ import assert from "node:assert/strict";
 import { describe, it, afterEach, beforeEach } from "node:test";
 import fs from "node:fs";
 import path from "node:path";
-import os from "node:os";
+
+import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
 import {
   setupAgentCrons,
   createAgentCronJob,
@@ -198,7 +199,7 @@ describe("nudgeScheduledRuns", () => {
   let tempHome: string;
 
   beforeEach(() => {
-    tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-nudge-"));
+    tempHome = tamanduaTempDir("tamandua-nudge-");
     process.env.TAMANDUA_STATE_DIR = path.join(tempHome, ".tamandua");
   });
 

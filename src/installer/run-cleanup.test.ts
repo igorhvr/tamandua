@@ -1,6 +1,7 @@
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+
+import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
 import { after, afterEach, beforeEach, describe, it } from "node:test";
@@ -67,7 +68,7 @@ describe("run-cleanup", () => {
     originalTestGuard = process.env.TAMANDUA_TEST_GUARD;
     originalWorktreeRoot = process.env.TAMANDUA_WORKTREE_ROOT;
 
-    stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-cleanup-"));
+    stateDir = tamanduaTempDir("tamandua-cleanup-");
     process.env.TAMANDUA_STATE_DIR = stateDir;
     process.env.TAMANDUA_DB_PATH = path.join(stateDir, "tamandua.db");
     process.env.TAMANDUA_TEST_GUARD = "1";

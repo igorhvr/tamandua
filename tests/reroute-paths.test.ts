@@ -19,8 +19,8 @@ import {
 } from "../dist/installer/step-ops.js";
 import { getRunEvents } from "../dist/installer/events.js";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+import { tamanduaTempDir } from "../src/lib/temp-dir.ts";
 import crypto from "node:crypto";
 
 // ══════════════════════════════════════════════════════════════════════
@@ -188,7 +188,7 @@ describe("RETR: Comprehensive Reroute Paths", () => {
   before(() => {
     _savedStateDir = process.env.TAMANDUA_STATE_DIR;
     _savedDbPath = process.env.TAMANDUA_DB_PATH;
-    _isolationDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-reroute-paths-"));
+    _isolationDir = tamanduaTempDir("tamandua-reroute-paths-");
     process.env.TAMANDUA_STATE_DIR = _isolationDir;
     process.env.TAMANDUA_DB_PATH = path.join(_isolationDir, "tamandua.db");
 

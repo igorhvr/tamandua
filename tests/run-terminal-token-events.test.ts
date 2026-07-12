@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import { cleanChildEnv } from "./helpers/test-env.ts";
-import os from "node:os";
 import path from "node:path";
+import { tamanduaTempDir } from "../src/lib/temp-dir.ts";
 import crypto from "node:crypto";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -10,7 +10,7 @@ import { describe, it } from "node:test";
 const repoRoot = process.cwd();
 
 function createTempHome() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-run-terminal-token-events-"));
+  const root = tamanduaTempDir("tamandua-run-terminal-token-events-");
   const homeDir = path.join(root, "home");
   fs.mkdirSync(homeDir, { recursive: true });
   return { root, homeDir };

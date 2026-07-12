@@ -1,6 +1,6 @@
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
 import assert from "node:assert/strict";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import {
@@ -16,7 +16,7 @@ describe("medic-cron", () => {
 
   beforeEach(() => {
     originalHome = process.env.HOME;
-    tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-medic-cron-"));
+    tempHome = tamanduaTempDir("tamandua-medic-cron-");
     process.env.HOME = tempHome;
   });
 

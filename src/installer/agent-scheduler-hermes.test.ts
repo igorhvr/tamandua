@@ -7,7 +7,8 @@ import assert from "node:assert/strict";
 import { describe, it, beforeEach, afterEach } from "node:test";
 import fs from "node:fs";
 import path from "node:path";
-import os from "node:os";
+
+import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
 import { runHermes } from "../../dist/installer/agent-scheduler.js";
 
 /**
@@ -31,7 +32,7 @@ describe("runHermes", () => {
   let savedHermesBinary: string | undefined;
 
   beforeEach(() => {
-    tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-test-hermes-"));
+    tempHome = tamanduaTempDir("tamandua-test-hermes-");
     savedHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
   });
 

@@ -3,8 +3,8 @@ import {
   cleanChildEnv,
   reserveDistinctRandomPorts,
 } from "./helpers/test-env.ts";
-import os from "node:os";
 import path from "node:path";
+import { tamanduaTempDir } from "../src/lib/temp-dir.ts";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
@@ -14,7 +14,7 @@ const cliPath = path.resolve(process.cwd(), "dist", "cli", "cli.js");
 
 async function createTempEnv() {
   const [controlPort, dashboardPort] = await reserveDistinctRandomPorts(2);
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-cli-run-cwd-"));
+  const root = tamanduaTempDir("tamandua-cli-run-cwd-");
   const homeDir = path.join(root, "home");
   const tamanduaDir = path.join(homeDir, ".tamandua");
   fs.mkdirSync(tamanduaDir, { recursive: true });

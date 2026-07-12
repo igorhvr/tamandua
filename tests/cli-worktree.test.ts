@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import { cleanChildEnv, reserveRandomPort } from "./helpers/test-env.ts";
-import os from "node:os";
 import path from "node:path";
+import { tamanduaTempDir } from "../src/lib/temp-dir.ts";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
@@ -21,7 +21,7 @@ function runGit(args: string[], cwd: string): string | null {
 }
 
 async function createTempEnv() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-cli-wt-"));
+  const root = tamanduaTempDir("tamandua-cli-wt-");
   const homeDir = path.join(root, "home");
   const tamanduaDir = path.join(homeDir, ".tamandua");
   const dbPath = path.join(tamanduaDir, "tamandua.db");
@@ -211,8 +211,7 @@ describe("CLI worktree run arguments", () => {
       db.close();
       assert.ok(row, "expected a run row in DB");
       const context = JSON.parse(row!.context) as Record<string, string>;
-      // Compare realpaths: the CLI canonicalizes the origin repo, and on
-      // macOS os.tmpdir() is behind the /var → /private/var symlink.
+      // Compare realpaths: macOS /tmp is a symlink to /private/tmp — realpath handles it.
       assert.equal(
         fs.realpathSync(context.worktree_origin_repository),
         fs.realpathSync(originRepo),
@@ -246,8 +245,7 @@ describe("CLI worktree run arguments", () => {
       db.close();
       assert.ok(row);
       const context = JSON.parse(row!.context) as Record<string, string>;
-      // Compare realpaths: the CLI canonicalizes the origin repo, and on
-      // macOS os.tmpdir() is behind the /var → /private/var symlink.
+      // Compare realpaths: macOS /tmp is a symlink to /private/tmp — realpath handles it.
       assert.equal(
         fs.realpathSync(context.worktree_origin_repository),
         fs.realpathSync(originRepo),
@@ -279,8 +277,7 @@ describe("CLI worktree run arguments", () => {
       db.close();
       assert.ok(row, "expected a run row in DB");
       const context = JSON.parse(row!.context) as Record<string, string>;
-      // Compare realpaths: the CLI canonicalizes the origin repo, and on
-      // macOS os.tmpdir() is behind the /var → /private/var symlink.
+      // Compare realpaths: macOS /tmp is a symlink to /private/tmp — realpath handles it.
       assert.equal(
         fs.realpathSync(context.worktree_origin_repository),
         fs.realpathSync(originRepo),

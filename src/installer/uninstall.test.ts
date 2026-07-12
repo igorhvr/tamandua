@@ -1,6 +1,7 @@
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+
+import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
 import assert from "node:assert/strict";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { DatabaseSync } from "node:sqlite";
@@ -18,7 +19,7 @@ describe("uninstall", () => {
     originalDbPath = process.env.TAMANDUA_DB_PATH;
     originalHome = process.env.HOME;
     originalStateDir = process.env.TAMANDUA_STATE_DIR;
-    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-uninstall-"));
+    tempDir = tamanduaTempDir("tamandua-uninstall-");
     dbPath = path.join(tempDir, ".tamandua", "tamandua.db");
     process.env.TAMANDUA_DB_PATH = dbPath;
     process.env.HOME = tempDir;

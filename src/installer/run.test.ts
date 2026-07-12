@@ -2,13 +2,13 @@ import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import os from "node:os";
 import http from "node:http";
 import { spawnSync } from "node:child_process";
 
 import { runWorkflow } from "../../dist/installer/run.js";
 import { getPidFile, getPortFile, stopDaemon } from "../../dist/server/daemonctl.js";
 import { reserveRandomPort } from "../../tests/helpers/test-env.ts";
+import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
 
 // ── Helpers ──
 
@@ -89,7 +89,7 @@ describe("runWorkflow", () => {
   let origWorktreeRoot: string | undefined;
 
   before(async () => {
-    tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-run-"));
+    tempHome = tamanduaTempDir("tamandua-run-");
     origHome = process.env.HOME;
     origControlPort = process.env.TAMANDUA_CONTROL_PORT;
     origDbPath = process.env.TAMANDUA_DB_PATH;
@@ -317,7 +317,7 @@ describe("runWorkflow", () => {
     it("fails with clear error when origin is not a git repo", async () => {
       const workflowId = "test-wt-non-git";
       writeMinimalWorkflow(tempHome, workflowId, "worktree");
-      const nonGitDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-non-git-"));
+      const nonGitDir = tamanduaTempDir("tamandua-non-git-");
       try {
         await assert.rejects(
           runWorkflow({
@@ -565,7 +565,7 @@ describe("runWorkflow", () => {
     it("stores base_branch_sha as empty string when git rev-parse fails in direct mode", async () => {
       const workflowId = "test-ctx-bbsha-empty";
       writeMinimalWorkflow(tempHome, workflowId, "direct");
-      const nonGitDir = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-non-git-sha-"));
+      const nonGitDir = tamanduaTempDir("tamandua-non-git-sha-");
 
       try {
         try {

@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
+
+import { tamanduaTempRoot } from "../../dist/lib/temp-dir.js";
 import assert from "node:assert/strict";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import {
@@ -13,7 +14,7 @@ describe("workspace-files", () => {
   let tempDir: string;
 
   beforeEach(async () => {
-    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "tamandua-workspace-files-"));
+    tempDir = await fs.mkdtemp(path.join(tamanduaTempRoot(), "tamandua-workspace-files-"));
   });
 
   afterEach(async () => {

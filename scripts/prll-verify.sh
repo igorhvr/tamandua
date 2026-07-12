@@ -16,7 +16,8 @@
 
 REPO_ROOT="${TAMANDUA_REPO_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 RUN_COUNT="${PRLL_RUN_COUNT:-5}"
-RESULT_DIR="/tmp/prll-verify-$$"
+TAMANDUA_TMP="${TAMANDUA_TEST_TMPDIR:-/tmp/tamandua-test}"
+RESULT_DIR="${TAMANDUA_TMP}/prll-verify-$$"
 mkdir -p "$RESULT_DIR"
 
 # ----- helpers -----

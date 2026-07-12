@@ -17,8 +17,8 @@
  */
 
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+import { tamanduaTempDir } from "../src/lib/temp-dir.ts";
 import crypto from "node:crypto";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -28,7 +28,7 @@ import { cleanChildEnv } from "./helpers/test-env.ts";
 const repoRoot = process.cwd();
 
 function createTempHome() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-motor-acceptance-"));
+  const root = tamanduaTempDir("tamandua-motor-acceptance-");
   const homeDir = path.join(root, "home");
   fs.mkdirSync(homeDir, { recursive: true });
   return { root, homeDir };

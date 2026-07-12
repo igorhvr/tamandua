@@ -13,6 +13,7 @@ import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
+import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
 import crypto from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -137,7 +138,7 @@ describe("control client", { concurrency: 1 }, () => {
       return;
     }
 
-    tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-cc-home-"));
+    tempHome = tamanduaTempDir("tamandua-cc-home-");
     daemon = spawn("node", [DAEMON_SCRIPT, String(dashboardPort)], {
       env: cleanChildEnv({ HOME: tempHome, TAMANDUA_CONTROL_PORT: String(controlPort) }),
       stdio: ["ignore", "pipe", "pipe"],
@@ -399,7 +400,7 @@ describe("suite control-plane client", { concurrency: 1 }, () => {
     savedDbPath = process.env.TAMANDUA_DB_PATH;
     savedControlPort = process.env.TAMANDUA_CONTROL_PORT;
 
-    tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-suitecc-"));
+    tempHome = tamanduaTempDir("tamandua-suitecc-");
     stateDir = path.join(tempHome, ".tamandua");
     fs.mkdirSync(stateDir, { recursive: true });
     dbPath = path.join(stateDir, "tamandua.db");
