@@ -13,7 +13,6 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DAEMON_SCRIPT = path.resolve(__dirname, "..", "..", "dist", "server", "daemon.js");
 
 function spawnDaemon(
-  port: number,
   homeDir: string,
   controlPort: number,
   extraArgs: string[] = [],
@@ -22,7 +21,7 @@ function spawnDaemon(
   getOutput: () => string;
 } {
   let output = "";
-  const child = spawn("node", [DAEMON_SCRIPT, String(port), ...extraArgs], {
+  const child = spawn("node", [DAEMON_SCRIPT, ...extraArgs], {
     env: cleanChildEnv({ HOME: homeDir,
       TAMANDUA_CONTROL_PORT: String(controlPort), }),
     stdio: ["ignore", "pipe", "pipe"],
@@ -135,19 +134,18 @@ async function canBind(port: number): Promise<boolean> {
 
 describe("version check integration", () => {
   it("daemon bootstrap triggers version check and writes version-status.json", async (t) => {
-    const dashboardPort = await reserveRandomPort();
-    if (!(await canBind(dashboardPort))) {
-      t.skip(`Port ${dashboardPort} is already in use`);
+    const controlPort = await reserveRandomPort();
+    if (!(await canBind(controlPort))) {
+      t.skip(`Port ${controlPort} is already in use`);
       return;
     }
-    const controlPort = await reserveRandomPort();
 
     const { homeDir: tempHome } = createTempHome("tamandua-daemon-home-");
-    const { child } = spawnDaemon(dashboardPort, tempHome, controlPort);
+    const { child } = spawnDaemon(tempHome, controlPort);
 
     try {
-      // Wait for dashboard to be reachable
-      const health = await waitForHttpUp(`http://127.0.0.1:${dashboardPort}/api/health`);
+      // Wait for daemon control plane to be reachable
+      const health = await waitForHttpUp(`http://127.0.0.1:${controlPort}/control/health`);
       assert.equal(health.status, 200);
 
       // Poll for version-status.json — the fire-and-forget version check may
@@ -174,32 +172,31 @@ describe("version check integration", () => {
       const exitCode = await waitForExit(child);
       assert.equal(exitCode, 0);
 
-      await waitForHttpDown(`http://127.0.0.1:${dashboardPort}/api/health`);
+      await waitForHttpDown(`http://127.0.0.1:${controlPort}/control/health`);
     } finally {
       await forceKillIfAlive(child);
     }
   });
 
   it("daemon startup not delayed by version check", async (t) => {
-    const dashboardPort = await reserveRandomPort();
-    if (!(await canBind(dashboardPort))) {
-      t.skip(`Port ${dashboardPort} is already in use`);
+    const controlPort = await reserveRandomPort();
+    if (!(await canBind(controlPort))) {
+      t.skip(`Port ${controlPort} is already in use`);
       return;
     }
-    const controlPort = await reserveRandomPort();
 
     const { homeDir: tempHome } = createTempHome("tamandua-daemon-home-");
 
     const startTime = Date.now();
-    const { child } = spawnDaemon(dashboardPort, tempHome, controlPort);
+    const { child } = spawnDaemon(tempHome, controlPort);
 
     try {
-      // Dashboard should be reachable quickly — version check is fire-and-forget
-      const health = await waitForHttpUp(`http://127.0.0.1:${dashboardPort}/api/health`);
+      // Daemon control plane should be reachable quickly — version check is fire-and-forget
+      const health = await waitForHttpUp(`http://127.0.0.1:${controlPort}/control/health`);
       assert.equal(health.status, 200);
 
       const elapsedMs = Date.now() - startTime;
-      // Daemon startup (including control plane) should finish well under 30s
+      // Daemon startup (including control plane) should finish well under 15s
       // (the git fetch timeout is 30s, but we fire-and-forget so it shouldn't block)
       assert.ok(elapsedMs < 15000, `Daemon startup took ${elapsedMs}ms, expected < 15000ms`);
 
@@ -207,33 +204,32 @@ describe("version check integration", () => {
       const exitCode = await waitForExit(child);
       assert.equal(exitCode, 0);
 
-      await waitForHttpDown(`http://127.0.0.1:${dashboardPort}/api/health`);
+      await waitForHttpDown(`http://127.0.0.1:${controlPort}/control/health`);
     } finally {
       await forceKillIfAlive(child);
     }
   });
 
   it("daemon shuts down cleanly even when version check interval is active", async (t) => {
-    const dashboardPort = await reserveRandomPort();
-    if (!(await canBind(dashboardPort))) {
-      t.skip(`Port ${dashboardPort} is already in use`);
+    const controlPort = await reserveRandomPort();
+    if (!(await canBind(controlPort))) {
+      t.skip(`Port ${controlPort} is already in use`);
       return;
     }
-    const controlPort = await reserveRandomPort();
 
     const { homeDir: tempHome } = createTempHome("tamandua-daemon-home-");
-    const { child } = spawnDaemon(dashboardPort, tempHome, controlPort);
+    const { child } = spawnDaemon(tempHome, controlPort);
 
     try {
-      const health = await waitForHttpUp(`http://127.0.0.1:${dashboardPort}/api/health`);
+      const health = await waitForHttpUp(`http://127.0.0.1:${controlPort}/control/health`);
       assert.equal(health.status, 200);
 
-      // Send SIGTERM — daemon should shut down cleanly within 5s
+      // Send SIGTERM — daemon should shut down cleanly within 7s
       process.kill(child.pid!, "SIGTERM");
       const exitCode = await waitForExit(child, 7000);
       assert.equal(exitCode, 0);
 
-      await waitForHttpDown(`http://127.0.0.1:${dashboardPort}/api/health`);
+      await waitForHttpDown(`http://127.0.0.1:${controlPort}/control/health`);
 
       // PID file should be cleaned up
       const pidFile = path.join(tempHome, ".tamandua", "tamandua.pid");
@@ -244,21 +240,19 @@ describe("version check integration", () => {
   });
 });
 
-describe("dashboard daemon (MCP decoupled)", { concurrency: 1 }, () => {
-  it("starts only dashboard by default (no --with-mcp), MCP port is NOT reachable", async (t) => {
-    const dashboardPort = await reserveRandomPort();
-    if (!(await canBind(dashboardPort))) {
-      t.skip(`Port ${dashboardPort} is already in use`);
+describe("daemon (MCP decoupled)", { concurrency: 1 }, () => {
+  it("starts daemon control plane by default (no --with-mcp), MCP port is NOT reachable", async (t) => {
+    const controlPort = await reserveRandomPort();
+    if (!(await canBind(controlPort))) {
+      t.skip(`Port ${controlPort} is already in use`);
       return;
     }
 
-    const controlPort = await reserveRandomPort();
-
     const { homeDir: tempHome } = createTempHome("tamandua-daemon-home-");
-    const { child } = spawnDaemon(dashboardPort, tempHome, controlPort);
+    const { child } = spawnDaemon(tempHome, controlPort);
 
     try {
-      const health = await waitForHttpUp(`http://127.0.0.1:${dashboardPort}/api/health`);
+      const health = await waitForHttpUp(`http://127.0.0.1:${controlPort}/control/health`);
       assert.equal(health.status, 200);
 
       const mcpPidFile = path.join(tempHome, ".tamandua", "mcp.pid");
@@ -268,7 +262,7 @@ describe("dashboard daemon (MCP decoupled)", { concurrency: 1 }, () => {
       const exitCode = await waitForExit(child);
       assert.equal(exitCode, 0);
 
-      await waitForHttpDown(`http://127.0.0.1:${dashboardPort}/api/health`);
+      await waitForHttpDown(`http://127.0.0.1:${controlPort}/control/health`);
 
       const pidFile = path.join(tempHome, ".tamandua", "tamandua.pid");
       assert.equal(fs.existsSync(pidFile), false);
@@ -277,10 +271,10 @@ describe("dashboard daemon (MCP decoupled)", { concurrency: 1 }, () => {
     }
   });
 
-  it("starts dashboard + MCP with --with-mcp flag and shuts down both on SIGTERM", async (t) => {
-    const dashboardPort = await reserveRandomPort();
-    if (!(await canBind(dashboardPort))) {
-      t.skip(`Port ${dashboardPort} is already in use`);
+  it("starts daemon + MCP with --with-mcp flag and shuts down both on SIGTERM", async (t) => {
+    const controlPort = await reserveRandomPort();
+    if (!(await canBind(controlPort))) {
+      t.skip(`Port ${controlPort} is already in use`);
       return;
     }
     const mcpPort = await reserveRandomPort();
@@ -289,13 +283,11 @@ describe("dashboard daemon (MCP decoupled)", { concurrency: 1 }, () => {
       return;
     }
 
-    const controlPort = await reserveRandomPort();
-
     const { homeDir: tempHome } = createTempHome("tamandua-daemon-home-");
-    const { child } = spawnDaemon(dashboardPort, tempHome, controlPort, ["--with-mcp", "--mcp-port", String(mcpPort)]);
+    const { child } = spawnDaemon(tempHome, controlPort, ["--with-mcp", "--mcp-port", String(mcpPort)]);
 
     try {
-      const health = await waitForHttpUp(`http://127.0.0.1:${dashboardPort}/api/health`);
+      const health = await waitForHttpUp(`http://127.0.0.1:${controlPort}/control/health`);
       assert.equal(health.status, 200);
 
       const mcp = await waitForHttpUp(`http://127.0.0.1:${mcpPort}/mcp`);
@@ -305,7 +297,7 @@ describe("dashboard daemon (MCP decoupled)", { concurrency: 1 }, () => {
       const exitCode = await waitForExit(child);
       assert.equal(exitCode, 0);
 
-      await waitForHttpDown(`http://127.0.0.1:${dashboardPort}/api/health`);
+      await waitForHttpDown(`http://127.0.0.1:${controlPort}/control/health`);
       await waitForHttpDown(`http://127.0.0.1:${mcpPort}/mcp`);
 
       const pidFile = path.join(tempHome, ".tamandua", "tamandua.pid");
@@ -317,24 +309,22 @@ describe("dashboard daemon (MCP decoupled)", { concurrency: 1 }, () => {
 
   it("--with-mcp --mcp-port N starts MCP on custom port", async (t) => {
     const customMcpPort = await reserveRandomPort();
-    const dashboardPort = await reserveRandomPort();
+    const controlPort = await reserveRandomPort();
 
-    if (!(await canBind(dashboardPort))) {
-      t.skip(`Port ${dashboardPort} is already in use`);
+    if (!(await canBind(controlPort))) {
+      t.skip(`Port ${controlPort} is already in use`);
       return;
     }
 
-    const controlPort = await reserveRandomPort();
-
     const { homeDir: tempHome } = createTempHome("tamandua-daemon-home-");
-    const { child } = spawnDaemon(dashboardPort, tempHome, controlPort, [
+    const { child } = spawnDaemon(tempHome, controlPort, [
       "--with-mcp",
       "--mcp-port",
       String(customMcpPort),
     ]);
 
     try {
-      const health = await waitForHttpUp(`http://127.0.0.1:${dashboardPort}/api/health`);
+      const health = await waitForHttpUp(`http://127.0.0.1:${controlPort}/control/health`);
       assert.equal(health.status, 200);
 
       const mcp = await waitForHttpUp(`http://127.0.0.1:${customMcpPort}/mcp`);
@@ -344,19 +334,14 @@ describe("dashboard daemon (MCP decoupled)", { concurrency: 1 }, () => {
       const exitCode = await waitForExit(child);
       assert.equal(exitCode, 0);
 
-      await waitForHttpDown(`http://127.0.0.1:${dashboardPort}/api/health`);
+      await waitForHttpDown(`http://127.0.0.1:${controlPort}/control/health`);
       await waitForHttpDown(`http://127.0.0.1:${customMcpPort}/mcp`);
     } finally {
       await forceKillIfAlive(child);
     }
   });
 
-  it("fails startup when MCP port is occupied and --with-mcp is used, dashboard is also stopped", async (t) => {
-    const dashboardPort = await reserveRandomPort();
-    if (!(await canBind(dashboardPort))) {
-      t.skip(`Port ${dashboardPort} is already in use`);
-      return;
-    }
+  it("fails startup when MCP port is occupied and --with-mcp is used, daemon is also stopped", async (t) => {
     const blockerPort = await reserveRandomPort();
     const blocker = http.createServer((_req, res) => {
       res.writeHead(200, { "content-type": "text/plain" });
@@ -371,7 +356,7 @@ describe("dashboard daemon (MCP decoupled)", { concurrency: 1 }, () => {
     const controlPort = await reserveRandomPort();
 
     const { homeDir: tempHome } = createTempHome("tamandua-daemon-home-");
-    const { child, getOutput } = spawnDaemon(dashboardPort, tempHome, controlPort, ["--with-mcp", "--mcp-port", String(blockerPort)]);
+    const { child, getOutput } = spawnDaemon(tempHome, controlPort, ["--with-mcp", "--mcp-port", String(blockerPort)]);
 
     try {
       const exitCode = await waitForExit(child);
@@ -381,7 +366,7 @@ describe("dashboard daemon (MCP decoupled)", { concurrency: 1 }, () => {
       assert.match(output, /MCP server on port/i);
       assert.match(output, /already in use|in use/i);
 
-      await waitForHttpDown(`http://127.0.0.1:${dashboardPort}/api/health`);
+      await waitForHttpDown(`http://127.0.0.1:${controlPort}/control/health`);
 
       const pidFile = path.join(tempHome, ".tamandua", "tamandua.pid");
       assert.equal(fs.existsSync(pidFile), false);

@@ -1,7 +1,7 @@
 # Serial test lane files - classified by process-spawning / deadline-sensitive criteria.
 # Classification rule: a test file belongs here if it (a) directly imports from
 # node:child_process, or (b) calls daemonctl functions that spawn OS processes
-# (startDaemon, startMcp, startControlPlane, and their restart/stop counterparts).
+# (startDaemon, startMcp, startControlPlane, startDashboardStandalone, and their restart/stop counterparts).
 # In-process servers (createDashboardServer, createTamanduaMcpServer) are NOT serial candidates.
 # Lines starting with # are comments, empty lines ignored. Sorted alphabetically.
 #
@@ -49,6 +49,7 @@ tests/cli-workflow-list-json.test.ts
 tests/cli-workflow-run-working-directory.test.ts
 tests/cli-worktree.test.ts
 tests/control-plane-cli.test.ts
+tests/dashboard-crash-isolation.test.ts
 tests/dashboard-kanban.test.ts
 tests/dashboard-mcp-pause-resume-integration.test.ts
 tests/dashboard-run-token-spend.test.ts

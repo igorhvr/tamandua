@@ -93,7 +93,6 @@ describe("real hermes e2e canary (LIVE hermes, single do-now run)", () => {
         fs.mkdirSync(workdir, { recursive: true });
 
         daemon = await startIsolatedDaemon(
-          env.dashboardPort,
           env.homeDir,
           env.controlPort,
         );

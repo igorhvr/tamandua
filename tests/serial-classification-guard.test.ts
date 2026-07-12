@@ -64,7 +64,7 @@ function fileImportsChildProcess(filePath: string): boolean {
 }
 
 const DAEMONCTL_SPAWNER_REGEX =
-  /\b(startDaemon|stopDaemon|restartDaemon|startMcp|stopMcp|restartMcp|startControlPlane|stopControlPlane|restartControlPlane)\s*\(/;
+  /\b(startDaemon|stopDaemon|restartDaemon|startMcp|stopMcp|restartMcp|startControlPlane|stopControlPlane|restartControlPlane|startDashboardStandalone|stopDashboardStandalone|restartDashboardStandalone)\s*\(/;
 
 function fileCallsDaemonSpawner(filePath: string): boolean {
   try {

@@ -72,7 +72,7 @@ describe("e2e-helpers (real e2e test helpers)", () => {
 
   describe("startIsolatedDaemon / stopIsolatedDaemon", () => {
     it("starts a daemon in an isolated HOME", async () => {
-      const child = await startIsolatedDaemon(dashboardPort, homeDir, controlPort);
+      const child = await startIsolatedDaemon(homeDir, controlPort);
 
       assert.ok(child.pid, "daemon should have a PID");
       assert.equal(child.exitCode, null, "daemon should be running");
@@ -87,14 +87,14 @@ describe("e2e-helpers (real e2e test helpers)", () => {
     });
 
     it("stopIsolatedDaemon is idempotent on already-exited process", async () => {
-      const child = await startIsolatedDaemon(dashboardPort, homeDir, controlPort);
+      const child = await startIsolatedDaemon(homeDir, controlPort);
       await stopIsolatedDaemon(child);
       // Second stop should not throw
       await stopIsolatedDaemon(child);
     });
 
     it("creates expected files in the isolated HOME", async () => {
-      const child = await startIsolatedDaemon(dashboardPort, homeDir, controlPort);
+      const child = await startIsolatedDaemon(homeDir, controlPort);
 
       // Give the daemon a moment to write its files
       await new Promise((resolve) => setTimeout(resolve, 1000));

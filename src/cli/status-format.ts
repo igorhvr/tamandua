@@ -7,7 +7,7 @@
  * Accepts optional dependency injection for unit testing.
  */
 import { execSync } from "node:child_process";
-import { getDaemonStatus, getMcpStatus, getControlPlaneStatus, getMcpStatusAsync, getControlPlaneStatusAsync, isRunning } from "../server/daemonctl.js";
+import { getDaemonStatus, getDashboardStatus, getMcpStatus, getControlPlaneStatus, getMcpStatusAsync, getControlPlaneStatusAsync, isRunning } from "../server/daemonctl.js";
 
 /**
  * Platform-aware process-listing helper for `tamandua status`.
@@ -46,11 +46,13 @@ import { readVersionStatus, type VersionStatus } from "../lib/version-check.js";
 import { listRuns as defaultListRuns, type RunInfo } from "../installer/status.js";
 
 export function formatServiceStatus(opts?: {
+  getDashboardStatus?: typeof getDashboardStatus;
   getDaemonStatus?: typeof getDaemonStatus;
   getMcpStatus?: typeof getMcpStatus;
   getControlPlaneStatus?: typeof getControlPlaneStatus;
 }): string {
-  const dashboard = (opts?.getDaemonStatus ?? getDaemonStatus)();
+  const dashboard = (opts?.getDashboardStatus ?? getDashboardStatus)();
+  const daemon = (opts?.getDaemonStatus ?? getDaemonStatus)();
   const mcp = (opts?.getMcpStatus ?? getMcpStatus)();
   const controlPlane = (opts?.getControlPlaneStatus ?? getControlPlaneStatus)();
 
@@ -58,11 +60,18 @@ export function formatServiceStatus(opts?: {
   lines.push("Services");
   lines.push("--------");
 
-  // Dashboard
+  // Dashboard (standalone UI process)
   if (dashboard.running) {
     lines.push(`Dashboard:      UP   (pid ${dashboard.pid}, port ${dashboard.port}, http://localhost:${dashboard.port})`);
   } else {
     lines.push(`Dashboard:      DOWN (port ${dashboard.port})`);
+  }
+
+  // Daemon (control-plane + motor)
+  if (daemon.running) {
+    lines.push(`Daemon:         UP   (pid ${daemon.pid})`);
+  } else {
+    lines.push(`Daemon:         DOWN (port ${daemon.port})`);
   }
 
   // MCP
@@ -93,11 +102,13 @@ export function formatServiceStatus(opts?: {
  * Accepts the same dependency-injection pattern as formatServiceStatus.
  */
 export async function formatServiceStatusAsync(opts?: {
+  getDashboardStatus?: typeof getDashboardStatus;
   getDaemonStatus?: typeof getDaemonStatus;
   getMcpStatusAsync?: typeof getMcpStatusAsync;
   getControlPlaneStatusAsync?: typeof getControlPlaneStatusAsync;
 }): Promise<string> {
-  const dashboard = (opts?.getDaemonStatus ?? getDaemonStatus)();
+  const dashboard = (opts?.getDashboardStatus ?? getDashboardStatus)();
+  const daemon = (opts?.getDaemonStatus ?? getDaemonStatus)();
   const mcp = await (opts?.getMcpStatusAsync ?? getMcpStatusAsync)();
   const controlPlane = await (opts?.getControlPlaneStatusAsync ?? getControlPlaneStatusAsync)();
 
@@ -105,11 +116,18 @@ export async function formatServiceStatusAsync(opts?: {
   lines.push("Services");
   lines.push("--------");
 
-  // Dashboard
+  // Dashboard (standalone UI process)
   if (dashboard.running) {
     lines.push(`Dashboard:      UP   (pid ${dashboard.pid}, port ${dashboard.port}, http://localhost:${dashboard.port})`);
   } else {
     lines.push(`Dashboard:      DOWN (port ${dashboard.port})`);
+  }
+
+  // Daemon (control-plane + motor)
+  if (daemon.running) {
+    lines.push(`Daemon:         UP   (pid ${daemon.pid})`);
+  } else {
+    lines.push(`Daemon:         DOWN (port ${daemon.port})`);
   }
 
   // MCP

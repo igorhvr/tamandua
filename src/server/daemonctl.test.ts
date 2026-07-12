@@ -11,6 +11,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // In dev (tsx), compiled output is in dist/server/
 const MCP_STANDALONE_SCRIPT = path.resolve(__dirname, "..", "..", "dist", "server", "mcp-standalone.js");
+const DASHBOARD_STANDALONE_SCRIPT = path.resolve(__dirname, "..", "..", "dist", "server", "dashboard-standalone.js");
 
 // Import the module under test.
 // tsx resolves .js extensions to .ts at runtime, so we import the source as .js
@@ -31,6 +32,14 @@ import {
   stopControlPlane,
   getControlPlanePidFile,
   getControlPlanePortFile,
+  getDashboardPidFile,
+  getDashboardPortFile,
+  getDashboardLogFile,
+  isDashboardRunning,
+  getDashboardStatus,
+  startDashboardStandalone,
+  stopDashboardStandalone,
+  restartDashboardStandalone,
   recordLifecycleEvent,
 } from "../../dist/server/daemonctl.js";
 import { DEFAULT_MCP_PORT } from "../../dist/server/mcp-server.js";
@@ -848,6 +857,405 @@ describe("daemonctl control plane lifecycle", { concurrency: 1 }, () => {
     cleanupIsolatedControlPlaneFiles(tempHome);
     const result = stopControlPlane({ homeDir: tempHome });
     assert.equal(result, false);
+  });
+});
+
+// ── Isolated dashboard standalone helpers ───────────────────────────
+
+function createDashboardTempHome(): string {
+  const { root } = createTempHome("tamandua-daemonctl-dashboard-");
+  return root;
+}
+
+function getIsolatedDashboardPidFile(homeDir: string): string {
+  return path.join(homeDir, ".tamandua", "dashboard.pid");
+}
+
+function getIsolatedDashboardPortFile(homeDir: string): string {
+  return path.join(homeDir, ".tamandua", "port");
+}
+
+function readIsolatedDashboardPort(homeDir: string): number {
+  const portFile = getIsolatedDashboardPortFile(homeDir);
+  try {
+    const raw = fs.readFileSync(portFile, "utf-8").trim();
+    const port = parseInt(raw, 10);
+    if (!isNaN(port) && port > 0 && port < 65536) return port;
+  } catch {}
+  return 3334; // default dashboard port
+}
+
+function writeIsolatedDashboardPort(homeDir: string, port: number): void {
+  const portFile = getIsolatedDashboardPortFile(homeDir);
+  fs.mkdirSync(path.dirname(portFile), { recursive: true });
+  fs.writeFileSync(portFile, String(port), "utf-8");
+}
+
+function isIsolatedDashboardRunning(homeDir: string): { running: true; pid: number } | { running: false } {
+  const pidFile = getIsolatedDashboardPidFile(homeDir);
+  if (!fs.existsSync(pidFile)) return { running: false };
+
+  let pid: number;
+  try {
+    pid = parseInt(fs.readFileSync(pidFile, "utf-8").trim(), 10);
+    if (isNaN(pid)) return { running: false };
+  } catch {
+    return { running: false };
+  }
+
+  try {
+    process.kill(pid, 0);
+    return { running: true, pid };
+  } catch {
+    try { fs.unlinkSync(pidFile); } catch {}
+    return { running: false };
+  }
+}
+
+function stopIsolatedDashboard(homeDir: string): boolean {
+  return stopDashboardStandalone({ homeDir });
+}
+
+function cleanupIsolatedDashboardFiles(homeDir: string): void {
+  try { fs.unlinkSync(getIsolatedDashboardPidFile(homeDir)); } catch {}
+  try { fs.unlinkSync(getIsolatedDashboardPortFile(homeDir)); } catch {}
+}
+
+// ── Dashboard standalone lifecycle tests ──────────────────────────
+
+describe("daemonctl dashboard standalone lifecycle", { concurrency: 1 }, () => {
+  // AC: isDashboardRunning() returns false when no PID file exists — isolated
+  it("isDashboardRunning() returns false when no PID file exists on isolated HOME", () => {
+    const tempHome = createDashboardTempHome();
+    cleanupIsolatedDashboardFiles(tempHome);
+    const status = isDashboardRunning({ homeDir: tempHome });
+    assert.equal(status.running, false);
+  });
+
+  // AC: isDashboardRunning() returns false for stale PID files — isolated
+  it("isDashboardRunning() returns false when PID file exists but process is dead on isolated HOME", () => {
+    const tempHome = createDashboardTempHome();
+    cleanupIsolatedDashboardFiles(tempHome);
+
+    // Write a PID file with a PID that almost certainly doesn't exist
+    const fakePid = 999999;
+    const pidFile = getIsolatedDashboardPidFile(tempHome);
+    fs.mkdirSync(path.dirname(pidFile), { recursive: true });
+    fs.writeFileSync(pidFile, String(fakePid), "utf-8");
+
+    const status = isDashboardRunning({ homeDir: tempHome });
+    assert.equal(status.running, false);
+
+    // Verify it cleaned up the stale PID file
+    assert.equal(fs.existsSync(pidFile), false);
+  });
+
+  // AC: getDashboardStatus() returns correct state before start — isolated
+  it("getDashboardStatus() returns correct state before start on isolated HOME", () => {
+    const tempHome = createDashboardTempHome();
+    cleanupIsolatedDashboardFiles(tempHome);
+
+    const status = getDashboardStatus({ homeDir: tempHome });
+    assert.equal(status.running, false);
+    assert.equal(status.pid, null);
+    assert.equal(status.port, 3334);
+  });
+
+  // AC: getDashboardPidFile/getDashboardPortFile/getDashboardLogFile return correct paths
+  it("getDashboardPidFile/getDashboardPortFile/getDashboardLogFile return correct paths with homeDir", () => {
+    const tempHome = createDashboardTempHome();
+
+    const pidFile = getDashboardPidFile({ homeDir: tempHome });
+    assert.ok(pidFile.includes(".tamandua"));
+    assert.ok(pidFile.includes("dashboard.pid"));
+    assert.ok(pidFile.startsWith(tempHome));
+
+    const portFile = getDashboardPortFile({ homeDir: tempHome });
+    assert.ok(portFile.includes(".tamandua"));
+    assert.ok(portFile.includes("port"));
+    assert.ok(portFile.startsWith(tempHome));
+
+    const logFile = getDashboardLogFile({ homeDir: tempHome });
+    assert.ok(logFile.includes(".tamandua"));
+    assert.ok(logFile.includes("dashboard.log"));
+    assert.ok(logFile.startsWith(tempHome));
+  });
+
+  // AC: startDashboardStandalone() spawns server and writes PID/port files — isolated
+  it("startDashboardStandalone() spawns server and writes PID/port files on isolated HOME", async (t) => {
+    if (!fs.existsSync(DASHBOARD_STANDALONE_SCRIPT)) {
+      t.skip("dashboard-standalone.js not found — run npm run build first");
+      return;
+    }
+
+    const dashPort = await getAvailablePort();
+    if (!(await canBind(dashPort))) {
+      t.skip(`Port ${dashPort} is already in use`);
+      return;
+    }
+
+    const tempHome = createDashboardTempHome();
+    try {
+      cleanupIsolatedDashboardFiles(tempHome);
+
+      const result = await startDashboardStandalone(dashPort, { homeDir: tempHome });
+      assert.ok(result.pid > 0, "startDashboardStandalone should return a valid PID");
+      assert.equal(result.port, dashPort);
+
+      // Verify isolated PID file exists and contains a valid PID
+      const pidFile = getIsolatedDashboardPidFile(tempHome);
+      assert.ok(fs.existsSync(pidFile), "Dashboard PID file should exist after start on isolated HOME");
+      const savedPid = parseInt(fs.readFileSync(pidFile, "utf-8").trim(), 10);
+      assert.equal(savedPid, result.pid);
+
+      // Verify isolated port file exists
+      const portFile = getIsolatedDashboardPortFile(tempHome);
+      assert.ok(fs.existsSync(portFile), "Dashboard port file should exist after start on isolated HOME");
+
+      // Verify health endpoint is reachable
+      const res = await fetch(`http://127.0.0.1:${dashPort}/api/health`);
+      assert.equal(res.status, 200);
+    } finally {
+      stopIsolatedDashboard(tempHome);
+    }
+  });
+
+  // AC: stopDashboardStandalone() kills dashboard process and cleans up PID file — isolated
+  it("stopDashboardStandalone() kills dashboard process and cleans up PID file on isolated HOME", async (t) => {
+    if (!fs.existsSync(DASHBOARD_STANDALONE_SCRIPT)) {
+      t.skip("dashboard-standalone.js not found — run npm run build first");
+      return;
+    }
+
+    const dashPort = await getAvailablePort();
+    if (!(await canBind(dashPort))) {
+      t.skip(`Port ${dashPort} is already in use`);
+      return;
+    }
+
+    const tempHome = createDashboardTempHome();
+    try {
+      cleanupIsolatedDashboardFiles(tempHome);
+
+      // Start the dashboard on isolated HOME
+      const { pid } = await startDashboardStandalone(dashPort, { homeDir: tempHome });
+      assert.ok(pid > 0);
+
+      // Verify it's running via isolated PID file check
+      let status = isDashboardRunning({ homeDir: tempHome });
+      assert.equal(status.running, true);
+
+      // Stop using isolated stop helper
+      const stopped = stopDashboardStandalone({ homeDir: tempHome });
+      assert.equal(stopped, true);
+
+      // Verify isolated PID file is cleaned up
+      const pidFile = getIsolatedDashboardPidFile(tempHome);
+      assert.equal(fs.existsSync(pidFile), false, "Dashboard PID file should be cleaned up after stop on isolated HOME");
+
+      // Wait briefly for process to fully exit
+      await new Promise<void>((resolve) => setTimeout(resolve, 500));
+
+      // Verify process is gone via isolated check
+      status = isDashboardRunning({ homeDir: tempHome });
+      assert.equal(status.running, false, "isDashboardRunning should return false after stop on isolated HOME");
+
+      // Verify endpoint is down
+      await waitForHttpDown(`http://127.0.0.1:${dashPort}/api/health`);
+    } finally {
+      try { stopIsolatedDashboard(tempHome); } catch {}
+    }
+  });
+
+  // AC: Round-trip test with custom port — isolated
+  it("startDashboardStandalone/stopDashboardStandalone round-trip with custom port on isolated HOME", async (t) => {
+    if (!fs.existsSync(DASHBOARD_STANDALONE_SCRIPT)) {
+      t.skip("dashboard-standalone.js not found — run npm run build first");
+      return;
+    }
+
+    const customPort = await getAvailablePort();
+    if (!(await canBind(customPort))) {
+      t.skip(`Port ${customPort} is already in use`);
+      return;
+    }
+
+    const tempHome = createDashboardTempHome();
+    try {
+      cleanupIsolatedDashboardFiles(tempHome);
+
+      const { pid, port } = await startDashboardStandalone(customPort, { homeDir: tempHome });
+      assert.ok(pid > 0);
+      assert.equal(port, customPort);
+
+      // Verify port file was written with custom port on isolated HOME
+      assert.equal(readIsolatedDashboardPort(tempHome), customPort);
+
+      // Verify health endpoint on custom port
+      const res = await fetch(`http://127.0.0.1:${customPort}/api/health`);
+      assert.equal(res.status, 200);
+
+      // Stop using isolated helper
+      const stopped = stopDashboardStandalone({ homeDir: tempHome });
+      assert.equal(stopped, true);
+
+      // Stop attribution: the stop must leave a breadcrumb in lifecycle.log
+      const lifecyclePath = path.join(tempHome, ".tamandua", "lifecycle.log");
+      assert.ok(fs.existsSync(lifecyclePath), "stopDashboardStandalone should write a lifecycle.log breadcrumb");
+      const breadcrumb = JSON.parse(fs.readFileSync(lifecyclePath, "utf-8").trim().split("\n").at(-1)!);
+      assert.equal(breadcrumb.action, "stop.dashboard");
+      assert.equal(breadcrumb.targetPid, pid);
+      assert.equal(breadcrumb.callerPid, process.pid);
+
+      // Verify down
+      await waitForHttpDown(`http://127.0.0.1:${customPort}/api/health`);
+
+      // PID file cleaned up on isolated HOME
+      assert.equal(fs.existsSync(getIsolatedDashboardPidFile(tempHome)), false);
+
+      // Status reflects not running after stop
+      const status = isDashboardRunning({ homeDir: tempHome });
+      assert.equal(status.running, false);
+    } finally {
+      try { stopIsolatedDashboard(tempHome); } catch {}
+    }
+  });
+
+  // AC: startDashboardStandalone() returns already-running info when already up — isolated
+  it("startDashboardStandalone() returns existing info when already running on isolated HOME", async (t) => {
+    if (!fs.existsSync(DASHBOARD_STANDALONE_SCRIPT)) {
+      t.skip("dashboard-standalone.js not found — run npm run build first");
+      return;
+    }
+
+    const dashPort = await getAvailablePort();
+    if (!(await canBind(dashPort))) {
+      t.skip(`Port ${dashPort} is already in use`);
+      return;
+    }
+
+    const tempHome = createDashboardTempHome();
+    try {
+      cleanupIsolatedDashboardFiles(tempHome);
+
+      const first = await startDashboardStandalone(dashPort, { homeDir: tempHome });
+      assert.ok(first.pid > 0);
+
+      // Second call should detect already running
+      const second = await startDashboardStandalone(dashPort, { homeDir: tempHome });
+      assert.equal(second.pid, first.pid);
+      assert.equal(second.port, first.port);
+    } finally {
+      try { stopIsolatedDashboard(tempHome); } catch {}
+    }
+  });
+
+  // AC: stopDashboardStandalone() returns false when dashboard is not running — isolated
+  it("stopDashboardStandalone() returns false when dashboard is not running on isolated HOME", () => {
+    const tempHome = createDashboardTempHome();
+    cleanupIsolatedDashboardFiles(tempHome);
+    const result = stopDashboardStandalone({ homeDir: tempHome });
+    assert.equal(result, false);
+  });
+
+  // AC: restartDashboardStandalone() restarts the dashboard
+  it("restartDashboardStandalone() stops then starts on isolated HOME", async (t) => {
+    if (!fs.existsSync(DASHBOARD_STANDALONE_SCRIPT)) {
+      t.skip("dashboard-standalone.js not found — run npm run build first");
+      return;
+    }
+
+    const dashPort = await getAvailablePort();
+    if (!(await canBind(dashPort))) {
+      t.skip(`Port ${dashPort} is already in use`);
+      return;
+    }
+
+    const tempHome = createDashboardTempHome();
+    try {
+      cleanupIsolatedDashboardFiles(tempHome);
+
+      // Start first instance
+      const first = await startDashboardStandalone(dashPort, { homeDir: tempHome });
+      assert.ok(first.pid > 0);
+
+      // Restart
+      const restarted = await restartDashboardStandalone(dashPort, { homeDir: tempHome });
+      assert.ok(restarted.pid > 0);
+      assert.equal(restarted.port, dashPort);
+
+      // Should have a different PID (new process)
+      assert.notEqual(restarted.pid, first.pid);
+
+      // Health endpoint reachable
+      const res = await fetch(`http://127.0.0.1:${dashPort}/api/health`);
+      assert.equal(res.status, 200);
+    } finally {
+      try { stopIsolatedDashboard(tempHome); } catch {}
+    }
+  });
+
+  // AC: restartDashboardStandalone() starts fresh when nothing is running
+  it("restartDashboardStandalone() starts fresh when nothing is running on isolated HOME", async (t) => {
+    if (!fs.existsSync(DASHBOARD_STANDALONE_SCRIPT)) {
+      t.skip("dashboard-standalone.js not found — run npm run build first");
+      return;
+    }
+
+    const dashPort = await getAvailablePort();
+    if (!(await canBind(dashPort))) {
+      t.skip(`Port ${dashPort} is already in use`);
+      return;
+    }
+
+    const tempHome = createDashboardTempHome();
+    try {
+      cleanupIsolatedDashboardFiles(tempHome);
+
+      const result = await restartDashboardStandalone(dashPort, { homeDir: tempHome });
+      assert.ok(result.pid > 0);
+      assert.equal(result.port, dashPort);
+
+      // Health endpoint reachable
+      const res = await fetch(`http://127.0.0.1:${dashPort}/api/health`);
+      assert.equal(res.status, 200);
+    } finally {
+      try { stopIsolatedDashboard(tempHome); } catch {}
+    }
+  });
+
+  // AC: startDashboardStandalone() reports failure with log tail when dashboard exits early
+  it("startDashboardStandalone() reports failure with log tail when port is already occupied", async (t) => {
+    if (!fs.existsSync(DASHBOARD_STANDALONE_SCRIPT)) {
+      t.skip("dashboard-standalone.js not found — run npm run build first");
+      return;
+    }
+
+    const dashPort = await getAvailablePort();
+    if (!(await canBind(dashPort))) {
+      t.skip(`Port ${dashPort} is already in use`);
+      return;
+    }
+
+    // Occupy the port so dashboard-standalone.js fails to bind
+    const blocker = http.createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "text/plain" });
+      res.end("blocker");
+    });
+    await new Promise<void>((resolve) => blocker.listen(dashPort, () => resolve()));
+
+    const tempHome = createDashboardTempHome();
+    try {
+      cleanupIsolatedDashboardFiles(tempHome);
+
+      await assert.rejects(
+        () => startDashboardStandalone(dashPort, { homeDir: tempHome }),
+        /Dashboard server failed to start/,
+      );
+    } finally {
+      await new Promise<void>((resolve) => blocker.close(() => resolve()));
+      try { stopIsolatedDashboard(tempHome); } catch {}
+    }
   });
 });
 

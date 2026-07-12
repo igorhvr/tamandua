@@ -253,7 +253,6 @@ describe("tamandua workflow pause-all CLI", { concurrency: 1 }, () => {
       return;
     }
 
-    const dashboardPort = await getAvailablePort();
     const controlPort = await getAvailablePort();
 
     const th = createTempHome("tamandua-pause-all-test-");
@@ -275,7 +274,7 @@ describe("tamandua workflow pause-all CLI", { concurrency: 1 }, () => {
     let daemon: ChildProcess | undefined;
 
     try {
-      daemon = spawn("node", [DAEMON_SCRIPT, String(dashboardPort)], {
+      daemon = spawn("node", [DAEMON_SCRIPT], {
         env: cleanChildEnv({ HOME: th.homeDir,
           TAMANDUA_CONTROL_PORT: String(controlPort), }),
         stdio: ["ignore", "pipe", "pipe"],
@@ -319,7 +318,6 @@ describe("tamandua workflow pause-all CLI", { concurrency: 1 }, () => {
       return;
     }
 
-    const dashboardPort = await getAvailablePort();
     const controlPort = await getAvailablePort();
 
     const th = createTempHome("tamandua-pause-all-test-");
@@ -348,7 +346,7 @@ describe("tamandua workflow pause-all CLI", { concurrency: 1 }, () => {
     let daemon: ChildProcess | undefined;
 
     try {
-      daemon = spawn("node", [DAEMON_SCRIPT, String(dashboardPort)], {
+      daemon = spawn("node", [DAEMON_SCRIPT], {
         env: cleanChildEnv({ HOME: th.homeDir,
           TAMANDUA_CONTROL_PORT: String(controlPort), }),
         stdio: ["ignore", "pipe", "pipe"],
@@ -421,7 +419,6 @@ describe("tamandua workflow resume-all CLI", { concurrency: 1 }, () => {
       return;
     }
 
-    const dashboardPort = await getAvailablePort();
     const controlPort = await getAvailablePort();
 
     const th = createTempHome("tamandua-resume-all-test-");
@@ -448,7 +445,7 @@ describe("tamandua workflow resume-all CLI", { concurrency: 1 }, () => {
     let daemon: ChildProcess | undefined;
 
     try {
-      daemon = spawn("node", [DAEMON_SCRIPT, String(dashboardPort)], {
+      daemon = spawn("node", [DAEMON_SCRIPT], {
         env: cleanChildEnv({ HOME: th.homeDir,
           TAMANDUA_CONTROL_PORT: String(controlPort), }),
         stdio: ["ignore", "pipe", "pipe"],
@@ -529,7 +526,6 @@ describe("tamandua workflow pause-all / resume-all terminal protection", { concu
       return;
     }
 
-    const dashboardPort = await getAvailablePort();
     const controlPort = await getAvailablePort();
 
     const th = createTempHome("tamandua-term-test-");
@@ -551,7 +547,7 @@ describe("tamandua workflow pause-all / resume-all terminal protection", { concu
     let daemon: ChildProcess | undefined;
 
     try {
-      daemon = spawn("node", [DAEMON_SCRIPT, String(dashboardPort)], {
+      daemon = spawn("node", [DAEMON_SCRIPT], {
         env: cleanChildEnv({ HOME: th.homeDir,
           TAMANDUA_CONTROL_PORT: String(controlPort), }),
         stdio: ["ignore", "pipe", "pipe"],
@@ -594,7 +590,6 @@ describe("tamandua workflow pause-all / resume-all terminal protection", { concu
       return;
     }
 
-    const dashboardPort = await getAvailablePort();
     const controlPort = await getAvailablePort();
 
     const th = createTempHome("tamandua-term-test-");
@@ -623,7 +618,7 @@ describe("tamandua workflow pause-all / resume-all terminal protection", { concu
     let daemon: ChildProcess | undefined;
 
     try {
-      daemon = spawn("node", [DAEMON_SCRIPT, String(dashboardPort)], {
+      daemon = spawn("node", [DAEMON_SCRIPT], {
         env: cleanChildEnv({ HOME: th.homeDir,
           TAMANDUA_CONTROL_PORT: String(controlPort), }),
         stdio: ["ignore", "pipe", "pipe"],

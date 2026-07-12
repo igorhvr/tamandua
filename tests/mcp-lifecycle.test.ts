@@ -646,10 +646,12 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
       const toolsAfter = await mcpRpc(mcpBaseUrl, "tools/list", {}, sessionId);
       assert.ok(toolsAfter.body.result, `MCP should still serve tools/list after dashboard stops: ${JSON.stringify(toolsAfter.body.error)}`);
 
-      // 6. Dashboard should show not running, MCP should show running
-      const fullStatus = await runCli(["dashboard", "status"], cliEnv);
-      assert.match(fullStatus.stdout, /Dashboard is not running/);
-      assert.match(fullStatus.stdout, /MCP server running/);
+      // 6. Dashboard should show not running
+      const dashStatusAfter = await runCli(["dashboard", "status"], cliEnv);
+      assert.match(dashStatusAfter.stdout, /Dashboard is not running/);
+      // MCP should still show running independently
+      const mcpStatusAfter = await runCli(["mcp", "status"], cliEnv);
+      assert.match(mcpStatusAfter.stdout, /MCP server running/);
 
     } finally {
       await runCli(["dashboard", "stop"], cliEnv);

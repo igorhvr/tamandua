@@ -104,6 +104,10 @@ function createServices(snapshot: UpdateServiceSnapshot, calls: string[] = []): 
       calls.push("snapshot");
       return snapshot;
     },
+    stopDaemon: () => {
+      calls.push("stopDaemon");
+      return true;
+    },
     stopDashboard: () => {
       calls.push("stopDashboard");
       return true;
@@ -112,20 +116,16 @@ function createServices(snapshot: UpdateServiceSnapshot, calls: string[] = []): 
       calls.push("stopMcp");
       return true;
     },
-    stopControlPlane: () => {
-      calls.push("stopControlPlane");
-      return true;
+    startDaemon: async (port) => {
+      calls.push(`startDaemon:${port}`);
+      return { pid: 901, port };
     },
     startDashboard: async (port) => {
       calls.push(`startDashboard:${port}`);
-      return { pid: 901, port };
+      return { pid: 902, port };
     },
     startMcp: async (port) => {
       calls.push(`startMcp:${port}`);
-      return { pid: 902, port };
-    },
-    startControlPlane: async (port) => {
-      calls.push(`startControlPlane:${port}`);
       return { pid: 903, port };
     },
   };
@@ -149,9 +149,9 @@ describe("tamandua update command helpers", () => {
         runCommand: createRunCommand([sha, sha], commands),
         services: {
           ...createServices({
-            dashboard: { running: false, pid: null, port: 4101 },
-            mcp: { running: false, pid: null, port: 4102 },
-            controlPlane: { running: false, pid: null, port: 4103 },
+            daemon: { running: false, pid: null, port: 4101 },
+            dashboard: { running: false, pid: null, port: 4102 },
+            mcp: { running: false, pid: null, port: 4103 },
           }),
           snapshot: () => {
             throw new Error("service snapshot should not run for no-change updates");
@@ -189,9 +189,9 @@ describe("tamandua update command helpers", () => {
         output,
         runCommand: createRunCommand([sha1, sha2], commands),
         services: createServices({
-          dashboard: { running: true, pid: 111111, port: 4201 },
-          mcp: { running: true, pid: 222222, port: 4202 },
-          controlPlane: { running: false, pid: null, port: 4203 },
+          daemon: { running: true, pid: 111111, port: 4201 },
+          dashboard: { running: true, pid: 222222, port: 4202 },
+          mcp: { running: false, pid: null, port: 4203 },
         }, serviceCalls),
         checkActiveRuns: async () => [{
           id: "run-active",
@@ -239,9 +239,9 @@ describe("tamandua update command helpers", () => {
         output,
         runCommand: createRunCommand([sha1, sha2], commands),
         services: createServices({
-          dashboard: { running: true, pid: 111111, port: 4301 },
-          mcp: { running: false, pid: null, port: 4302 },
-          controlPlane: { running: true, pid: 333333, port: 4303 },
+          daemon: { running: true, pid: 111111, port: 4301 },
+          dashboard: { running: true, pid: 222222, port: 4302 },
+          mcp: { running: false, pid: null, port: 4303 },
         }, serviceCalls),
         checkActiveRuns: async () => [{
           id: "run-active",
@@ -260,13 +260,13 @@ describe("tamandua update command helpers", () => {
 
       assert.equal(result.status, "updated");
       assert.deepEqual(installed, ["bug-fix", "feature-dev"]);
-      assert.deepEqual(waitedPids, [111111, 333333]);
+      assert.deepEqual(waitedPids, [111111, 222222]);
       assert.deepEqual(serviceCalls, [
         "snapshot",
+        "stopDaemon",
         "stopDashboard",
-        "stopControlPlane",
-        "startDashboard:4301",
-        "startControlPlane:4303",
+        "startDaemon:4301",
+        "startDashboard:4302",
       ]);
       assert.match(warnings.join("\n"), /--force set, continuing/);
     } finally {
@@ -287,9 +287,9 @@ describe("tamandua update command helpers", () => {
           output: createOutput().output,
           runCommand: createRunCommand([sha1, sha2], []),
           services: createServices({
-            dashboard: { running: false, pid: null, port: 4401 },
-            mcp: { running: true, pid: 222222, port: 4402 },
-            controlPlane: { running: false, pid: null, port: 4403 },
+            daemon: { running: false, pid: null, port: 4401 },
+            dashboard: { running: false, pid: null, port: 4402 },
+            mcp: { running: true, pid: 333333, port: 4403 },
           }, serviceCalls),
           checkActiveRuns: async () => [],
           listWorkflows: async () => ["feature-dev"],
@@ -304,7 +304,7 @@ describe("tamandua update command helpers", () => {
       assert.deepEqual(serviceCalls, [
         "snapshot",
         "stopMcp",
-        "startMcp:4402",
+        "startMcp:4403",
       ]);
     } finally {
       fs.rmSync(sourcePath, { recursive: true, force: true });
@@ -327,9 +327,9 @@ describe("tamandua update command helpers", () => {
         output,
         runCommand: createRunCommand([sha, sha], commands),
         services: createServices({
-          dashboard: { running: true, pid: 111111, port: 4401 },
-          mcp: { running: false, pid: null, port: 4402 },
-          controlPlane: { running: true, pid: 333333, port: 4403 },
+          daemon: { running: true, pid: 111111, port: 4401 },
+          dashboard: { running: true, pid: 222222, port: 4402 },
+          mcp: { running: false, pid: null, port: 4403 },
         }, serviceCalls),
         checkActiveRuns: async () => [],
         listWorkflows: async () => ["bug-fix", "feature-dev"],
@@ -349,13 +349,13 @@ describe("tamandua update command helpers", () => {
         "./build-and-install",
       ]);
       assert.deepEqual(installed, ["bug-fix", "feature-dev"]);
-      assert.deepEqual(waitedPids, [111111, 333333]);
+      assert.deepEqual(waitedPids, [111111, 222222]);
       assert.deepEqual(serviceCalls, [
         "snapshot",
+        "stopDaemon",
         "stopDashboard",
-        "stopControlPlane",
-        "startDashboard:4401",
-        "startControlPlane:4403",
+        "startDaemon:4401",
+        "startDashboard:4402",
       ]);
       assert.match(logs.join("\n"), /--force set; rebuilding/);
       assert.match(logs.join("\n"), /Running \.\/build-and-install/);
@@ -377,9 +377,9 @@ describe("tamandua update command helpers", () => {
         output,
         runCommand: createRunCommand([sha, sha], commands),
         services: createServices({
-          dashboard: { running: false, pid: null, port: 4501 },
-          mcp: { running: false, pid: null, port: 4502 },
-          controlPlane: { running: false, pid: null, port: 4503 },
+          daemon: { running: false, pid: null, port: 4501 },
+          dashboard: { running: false, pid: null, port: 4502 },
+          mcp: { running: false, pid: null, port: 4503 },
         }),
         checkActiveRuns: async () => [],
         listWorkflows: async () => ["feature-dev"],

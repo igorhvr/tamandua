@@ -71,7 +71,6 @@ async function startHermesScriptedEnvironment(
     `install ${workflowId}`,
   );
   const daemon = await startIsolatedDaemon(
-    env.dashboardPort,
     env.homeDir,
     env.controlPort,
     scripted.env,
@@ -97,7 +96,6 @@ async function startHermesScriptedEnvironmentWithEnv(
     `install ${workflowId}`,
   );
   const daemon = await startIsolatedDaemon(
-    env.dashboardPort,
     env.homeDir,
     env.controlPort,
     daemonExtraEnv,
@@ -561,7 +559,6 @@ describe("scripted-hermes full pipeline (real daemon/scheduler, zero tokens)", {
           "install do-now",
         );
         const daemon = await startIsolatedDaemon(
-          env.dashboardPort,
           env.homeDir,
           env.controlPort,
           daemonEnv,

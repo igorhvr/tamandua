@@ -27,6 +27,7 @@ const repoRoot = path.resolve(
 );
 const cliPath = path.resolve(repoRoot, "dist", "cli", "cli.js");
 const daemonScript = path.resolve(repoRoot, "dist", "server", "daemon.js");
+const dashboardStandaloneScript = path.resolve(repoRoot, "dist", "server", "dashboard-standalone.js");
 
 export const DEFAULT_POLL_INTERVAL_MS = 5_000;
 export const DEFAULT_RUN_TIMEOUT_MS = 30 * 60_000; // 30 minutes
@@ -221,8 +222,9 @@ export async function pollForRunCompletion(
  * Spawns the daemon.js script with an isolated HOME directory (so all
  * PID, port, DB, and log files go to the temp ~/.tamandua directory).
  *
- * The ~/.tamandua/port file in the isolated HOME must already exist
- * before calling this (createTempHome from smoke-helpers handles this).
+ * The daemon hosts ONLY the control plane + reconciler/motor (no
+ * dashboard). The control port is passed via TAMANDUA_CONTROL_PORT
+ * in the environment (set by baseEnv).
  *
  * Waits for the daemon to print its "control plane listening" message
  * before resolving.  Throws if the daemon fails to start or exits
@@ -231,7 +233,6 @@ export async function pollForRunCompletion(
  * Returns the ChildProcess handle for cleanup via stopIsolatedDaemon.
  */
 export function startIsolatedDaemon(
-  port: number,
   homeDir: string,
   controlPort: number,
   extraEnv: Record<string, string> = {},
@@ -239,7 +240,7 @@ export function startIsolatedDaemon(
   return new Promise((resolve, reject) => {
     const child = spawn(
       "node",
-      ["--disable-warning=ExperimentalWarning", daemonScript, String(port)],
+      ["--disable-warning=ExperimentalWarning", daemonScript],
       {
         env: cleanChildEnv({ ...baseEnv(homeDir, controlPort), ...extraEnv }),
         stdio: ["ignore", "pipe", "pipe"],
@@ -301,6 +302,120 @@ export function startIsolatedDaemon(
  * SIGKILL after 5 s if the process does not exit gracefully.
  */
 export async function stopIsolatedDaemon(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null) return;
+  if (!child.pid) return;
+
+  // Check if the process is still alive
+  try {
+    process.kill(child.pid, 0);
+  } catch {
+    return; // already dead
+  }
+
+  child.kill("SIGTERM");
+
+  await new Promise<void>((resolve) => {
+    const forceTimeout = setTimeout(() => {
+      if (child.exitCode === null && child.pid) {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // process may have already exited
+        }
+      }
+      resolve();
+    }, 5000);
+
+    child.once("exit", () => {
+      clearTimeout(forceTimeout);
+      resolve();
+    });
+  });
+}
+
+/**
+ * Start an isolated dashboard standalone process.
+ *
+ * Spawns dashboard-standalone.js with an isolated HOME directory.
+ * The dashboard is the UI process only — it has no coupling to the
+ * motor or scheduling.
+ *
+ * Waits for the dashboard to print its "started on port" message
+ * before resolving.  Throws if the dashboard fails to start or
+ * exits before becoming ready.
+ *
+ * Returns the ChildProcess handle for cleanup via stopIsolatedDashboard.
+ */
+export function startIsolatedDashboard(
+  port: number,
+  homeDir: string,
+  extraEnv: Record<string, string> = {},
+): Promise<ChildProcess> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      "node",
+      ["--disable-warning=ExperimentalWarning", dashboardStandaloneScript, String(port)],
+      {
+        env: cleanChildEnv({ HOME: homeDir, ...extraEnv }),
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+
+    let output = "";
+    let resolved = false;
+
+    const timeout = setTimeout(() => {
+      if (resolved) return;
+      resolved = true;
+      child.kill("SIGKILL");
+      reject(
+        new Error(
+          `Dashboard failed to start within ${DAEMON_START_TIMEOUT_MS}ms.\n` +
+            `Output:\n${output || "(no output)"}`,
+        ),
+      );
+    }, DAEMON_START_TIMEOUT_MS);
+
+    const onData = (chunk: Buffer) => {
+      output += chunk.toString("utf-8");
+      if (!resolved && output.includes("Tamandua dashboard server started")) {
+        resolved = true;
+        clearTimeout(timeout);
+        resolve(child);
+      }
+    };
+
+    child.stdout?.on("data", onData);
+    child.stderr?.on("data", onData);
+
+    child.on("error", (err) => {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(timeout);
+      reject(err);
+    });
+
+    child.on("close", (code) => {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(timeout);
+      reject(
+        new Error(
+          `Dashboard exited with code ${code} before becoming ready.\n` +
+            `Output:\n${output || "(no output)"}`,
+        ),
+      );
+    });
+  });
+}
+
+/**
+ * Stop an isolated dashboard process.
+ *
+ * Sends SIGTERM to the dashboard and waits for it to exit.  Falls back
+ * to SIGKILL after 5 s if the process does not exit gracefully.
+ */
+export async function stopIsolatedDashboard(child: ChildProcess): Promise<void> {
   if (child.exitCode !== null) return;
   if (!child.pid) return;
 

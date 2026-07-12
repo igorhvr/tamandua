@@ -15,15 +15,15 @@ describe("update exports", () => {
     it("returns an object with snapshot, stop, and start functions", () => {
       const services = createDefaultUpdateServices();
       assert.equal(typeof services.snapshot, "function");
+      assert.equal(typeof services.stopDaemon, "function");
       assert.equal(typeof services.stopDashboard, "function");
       assert.equal(typeof services.stopMcp, "function");
-      assert.equal(typeof services.stopControlPlane, "function");
+      assert.equal(typeof services.startDaemon, "function");
       assert.equal(typeof services.startDashboard, "function");
       assert.equal(typeof services.startMcp, "function");
-      assert.equal(typeof services.startControlPlane, "function");
     });
 
-    it("snapshot returns an object with dashboard, mcp, and controlPlane", () => {
+    it("snapshot returns an object with daemon, dashboard, and mcp", () => {
       const prevGuard = process.env.TAMANDUA_TEST_GUARD;
       process.env.TAMANDUA_TEST_GUARD = "0";
       let snap: ReturnType<ReturnType<typeof createDefaultUpdateServices>["snapshot"]>;
@@ -34,12 +34,12 @@ describe("update exports", () => {
         if (prevGuard === undefined) delete process.env.TAMANDUA_TEST_GUARD;
         else process.env.TAMANDUA_TEST_GUARD = prevGuard;
       }
+      assert.ok("daemon" in snap);
       assert.ok("dashboard" in snap);
       assert.ok("mcp" in snap);
-      assert.ok("controlPlane" in snap);
+      assert.equal(typeof snap.daemon.running, "boolean");
       assert.equal(typeof snap.dashboard.running, "boolean");
       assert.equal(typeof snap.mcp.running, "boolean");
-      assert.equal(typeof snap.controlPlane.running, "boolean");
     });
   });
 
@@ -151,16 +151,16 @@ describe("update exports", () => {
         output: { log: () => {}, warn: () => {} },
         services: {
           snapshot: () => ({
-            dashboard: { running: false, pid: null, port: 3334 },
-            mcp: { running: false, pid: null, port: 3338 },
-            controlPlane: { running: false, pid: null, port: 3339 },
+            daemon: { running: false, pid: null, port: 3334 },
+            dashboard: { running: false, pid: null, port: 3338 },
+            mcp: { running: false, pid: null, port: 3339 },
           }),
+          stopDaemon: () => false,
           stopDashboard: () => false,
           stopMcp: () => false,
-          stopControlPlane: () => false,
-          startDashboard: async () => ({ pid: 1, port: 3334 }),
-          startMcp: async () => ({ pid: 2, port: 3338 }),
-          startControlPlane: async () => ({ pid: 3, port: 3339 }),
+          startDaemon: async () => ({ pid: 1, port: 3334 }),
+          startDashboard: async () => ({ pid: 2, port: 3338 }),
+          startMcp: async () => ({ pid: 3, port: 3339 }),
         },
       });
 

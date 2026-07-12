@@ -161,7 +161,6 @@ describe("tamandua workflow resume CLI", { concurrency: 1 }, () => {
       return;
     }
 
-    const dashboardPort = await getAvailablePort();
     const controlPort = await getAvailablePort();
 
     const th = createTempHome("tamandua-resume-test-");
@@ -189,7 +188,7 @@ describe("tamandua workflow resume CLI", { concurrency: 1 }, () => {
 
     try {
       // Start daemon
-      daemon = spawn("node", [DAEMON_SCRIPT, String(dashboardPort)], {
+      daemon = spawn("node", [DAEMON_SCRIPT], {
         env: cleanChildEnv({ HOME: th.homeDir,
           TAMANDUA_CONTROL_PORT: String(controlPort), }),
         stdio: ["ignore", "pipe", "pipe"],
@@ -314,7 +313,6 @@ describe("tamandua workflow resume CLI", { concurrency: 1 }, () => {
       return;
     }
 
-    const dashboardPort = await getAvailablePort();
     const controlPort = await getAvailablePort();
 
     const th = createTempHome("tamandua-resume-test-");
@@ -355,7 +353,7 @@ describe("tamandua workflow resume CLI", { concurrency: 1 }, () => {
 
     try {
       // Start daemon so resumeWorkflow can register with it
-      daemon = spawn("node", [DAEMON_SCRIPT, String(dashboardPort)], {
+      daemon = spawn("node", [DAEMON_SCRIPT], {
         env: cleanChildEnv({ HOME: th.homeDir,
           TAMANDUA_CONTROL_PORT: String(controlPort), }),
         stdio: ["ignore", "pipe", "pipe"],

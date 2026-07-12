@@ -228,7 +228,7 @@ Workflows for auditing and validating the project itself.
 
 | Workflow ID | Agents | Pipeline | Description |
 |------------|--------|----------|-------------|
-| `frontend-test` | 1 | test | Builds the project and validates the dashboard frontend: HTML structure, route definitions, and test coverage. Does not start a second dashboard daemon. |
+| `frontend-test` | 1 | test | Builds the project and validates the dashboard frontend: HTML structure, route definitions, and test coverage. Does not start a second dashboard server. |
 | `skills-normalize-audit` | 3 | scan → audit → report | Scans a skills directory, analyzes the skills for overlaps and redundancies, and produces consolidation recommendations in a structured report. |
 
 Install all bundled workflows at once with:
@@ -527,10 +527,10 @@ You're installing agent teams that run code on your machine. We take that seriou
 
 If something isn't working as expected, start with the built-in diagnostic:
 
-- **Run `tamandua doctor`** — One-shot diagnostic that checks environment (Node.js >= 22, pi on PATH, gh on PATH), services (dashboard daemon, control plane, MCP), daemon staleness (running daemon matches installed build), database state (run-level anomalies), and LLM prompt adherence (per-step key-emission rates from workflow runs, measuring how often agents deliver expected output keys). Each check prints **pass/fail** status and on failure prints the **exact remedy command** to run.
-- **Check dashboard status** — Run `tamandua dashboard status` to verify the daemon and control plane are running on their expected ports.
+- **Run `tamandua doctor`** — One-shot diagnostic that checks environment (Node.js >= 22, pi on PATH, gh on PATH), services (dashboard, daemon, MCP), daemon staleness (running daemon matches installed build), database state (run-level anomalies), and LLM prompt adherence (per-step key-emission rates from workflow runs, measuring how often agents deliver expected output keys). Each check prints **pass/fail** status and on failure prints the **exact remedy command** to run.
+- **Check service status** — Run `tamandua status` to verify dashboard, daemon, and MCP are running on their expected ports.
 - **Check logs** — Run `tamandua logs` to see recent daemon events. For live tailing: `tamandua logs-tail`.
-- **Restart the daemon** — If the dashboard or control plane is unresponsive, run `tamandua dashboard restart`. This stops the daemon, rebuilds, and restarts it.
+- **Restart the daemon** — If the daemon (control plane + motor) is unresponsive, run `tamandua daemon restart`. The dashboard UI can be restarted independently with `tamandua dashboard restart` (safe — never touches the motor).
 
 ---
 
@@ -563,10 +563,10 @@ If something isn't working as expected, start with the built-in diagnostic:
 
 | Command | Description |
 |---------|-------------|
-| `tamandua dashboard` | Start the web dashboard (also starts remote MCP on `http://localhost:3338/mcp`) |
-| `tamandua dashboard start\|stop\|restart\|status [--port N]` | Manage the dashboard daemon |
+| `tamandua dashboard start\|stop\|restart\|status [--port N]` | Manage the standalone dashboard UI server (safe anytime) |
+| `tamandua daemon start\|stop\|restart\|status` | Manage the daemon (control plane + scheduling motor) |
 | `tamandua mcp start\|stop\|restart\|status [--port N]` | Manage the standalone MCP server |
-| `tamandua control-plane start\|stop\|restart\|status [--port N]` | Manage the standalone control plane |
+| `tamandua control-plane start\|stop\|restart\|status [--port N]` | Alias for daemon commands (control plane is hosted by daemon) |
 | `tamandua logs [<lines>|<run-id>|#<run-number>]` | View recent log entries |
 | `tamandua logs-tail [<lines>|<run-id>|#<run-number>]` | Follow recent activity as new events arrive |
 | `tamandua nudge` | Trigger an immediate dispatch round for all running runs |

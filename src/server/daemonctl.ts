@@ -1,11 +1,14 @@
 /**
- * Tamandua Dashboard Daemon Lifecycle Controller
+ * Tamandua Daemon Lifecycle Controller
  *
- * Manages the lifecycle of the tamandua dashboard daemon process.
+ * Manages the lifecycle of the tamandua daemon process (control-plane+motor)
+ * and the standalone dashboard UI process.
  *
- * - PID file:    ~/.tamandua/tamandua.pid
- * - Port file:   ~/.tamandua/port
- * - Log file:    ~/.tamandua/dashboard.log
+ * - PID file:         ~/.tamandua/tamandua.pid
+ * - Control port file: ~/.tamandua/control-plane-port
+ * - Dashboard PID:     ~/.tamandua/dashboard.pid
+ * - Dashboard port:    ~/.tamandua/port
+ * - Log file:          ~/.tamandua/dashboard.log
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -258,7 +261,7 @@ function processHomeMatches(pid: number, homeDir: string): boolean {
   //      (services keep their log fd open for life) — kernel-verified via
   //      lsof, and covers healthy services whose pidfile was lost.
   const dir = path.join(homeDir, ".tamandua");
-  for (const name of ["tamandua.pid", "mcp.pid", "control-plane.pid"]) {
+  for (const name of ["tamandua.pid", "mcp.pid", "control-plane.pid", "dashboard.pid"]) {
     try {
       const pidFile = path.join(dir, name);
       const recorded = parseInt(fs.readFileSync(pidFile, "utf-8").trim(), 10);
@@ -387,14 +390,15 @@ export function isRunning(opts?: DaemonctlPathOptions): { running: true; pid: nu
  */
 export function getDaemonStatus(opts?: DaemonctlPathOptions): { running: false; pid: null; port: number } | { running: true; pid: number; port: number } {
   const status = isRunning(opts);
+  const port = readControlPlanePort(opts);
   if (!status.running) {
-    return { running: false, pid: null, port: readPort(opts) };
+    return { running: false, pid: null, port };
   }
 
   return {
     running: true,
     pid: status.pid,
-    port: readPort(opts),
+    port,
   };
 }
 
@@ -420,30 +424,33 @@ export type StartControlPlaneResult = {
 };
 
 /**
- * Start the dashboard daemon.
+ * Start the daemon (control-plane+motor).
  *
  * Spawns a detached node process running dist/server/daemon.js.
- * Writes the port to ~/.tamandua/port before spawning.
+ * Writes the control plane port to ~/.tamandua/control-plane-port before spawning.
  *
  * If the daemon is already running, returns its info without restarting.
  *
- * @param port  Dashboard port (default 3334).
+ * @param port  Control plane port (default: TAMANDUA_CONTROL_PORT env or 3339).
  * @param opts  When keepHandle is true, returns the ChildProcess handle.
  */
 export async function startDaemon(port?: number): Promise<{ pid: number; port: number }>;
 export async function startDaemon(port: number, opts: StartOptions): Promise<{ pid: number; port: number }>;
 export async function startDaemon(port: number, opts: StartOptions & { keepHandle: true }): Promise<{ pid: number; port: number; child: ChildProcess }>;
-export async function startDaemon(port = 3334, opts?: StartOptions): Promise<{ pid: number; port: number } | { pid: number; port: number; child: ChildProcess }> {
+export async function startDaemon(port?: number, opts?: StartOptions): Promise<{ pid: number; port: number } | { pid: number; port: number; child: ChildProcess }> {
+  // Resolve the control plane port (env → arg → default 3339).
+  const controlPort = port ?? (parseInt(process.env.TAMANDUA_CONTROL_PORT ?? "", 10) || DEFAULT_CONTROL_PORT);
+
   // When homeDir is set, compute isolated paths for all filesystem operations.
   const tamanduaDir = getTamanduaDir(opts);
   const pidFile = getPidFile(opts);
-  const portFile = getPortFile(opts);
+  const portFile = getControlPlanePortFile(opts);
   const logFile = getLogFile(opts);
   const lockFile = getStartLockFile(opts);
 
   const status = checkPidFile(pidFile);
   if (status.running) {
-    let existingPort = port;
+    let existingPort = controlPort;
     try {
       const raw = fs.readFileSync(portFile, "utf-8").trim();
       const p = parseInt(raw, 10);
@@ -457,7 +464,7 @@ export async function startDaemon(port = 3334, opts?: StartOptions): Promise<{ p
   fs.mkdirSync(tamanduaDir, { recursive: true });
   const lockFd = acquireStartLock(lockFile);
   if (lockFd === null) {
-    const existing = await waitForDaemonPid(pidFile, portFile, port);
+    const existing = await waitForDaemonPid(pidFile, portFile, controlPort);
     if (existing) return existing;
     throw new Error("Timed out waiting for another daemon start attempt to finish.");
   }
@@ -465,7 +472,7 @@ export async function startDaemon(port = 3334, opts?: StartOptions): Promise<{ p
   try {
     const recheck = checkPidFile(pidFile);
     if (recheck.running) {
-      let existingPort = port;
+      let existingPort = controlPort;
       try {
         const raw = fs.readFileSync(portFile, "utf-8").trim();
         const p = parseInt(raw, 10);
@@ -476,7 +483,7 @@ export async function startDaemon(port = 3334, opts?: StartOptions): Promise<{ p
       return { pid: recheck.pid, port: existingPort };
     }
 
-    fs.writeFileSync(portFile, String(port), "utf-8");
+    fs.writeFileSync(portFile, String(controlPort), "utf-8");
 
     const out = fs.openSync(logFile, "a");
     const errFd = fs.openSync(logFile, "a");
@@ -485,11 +492,12 @@ export async function startDaemon(port = 3334, opts?: StartOptions): Promise<{ p
     const spawnOpts: Parameters<typeof spawn>[2] = {
       detached: true,
       stdio: ["ignore", out, errFd],
+      env: { ...process.env, TAMANDUA_CONTROL_PORT: String(controlPort) },
     };
     if (opts?.homeDir) {
-      spawnOpts.env = { ...process.env, HOME: opts.homeDir };
+      spawnOpts.env = { ...spawnOpts.env, HOME: opts.homeDir };
     }
-    const child = spawn(process.execPath, ["--disable-warning=ExperimentalWarning", daemonScript, String(port)], spawnOpts);
+    const child = spawn(process.execPath, ["--disable-warning=ExperimentalWarning", daemonScript], spawnOpts);
 
     if (opts?.keepHandle) {
       // Caller wants the ChildProcess handle for direct cleanup (e.g. tests).
@@ -516,23 +524,23 @@ export async function startDaemon(port = 3334, opts?: StartOptions): Promise<{ p
       throw new Error("Daemon failed to start. Check " + logFile);
     }
 
-    // Verify the daemon responds to its health endpoint before returning.
+    // Verify the daemon responds to its control plane health endpoint before returning.
     // A PID file write followed by an immediate crash leaves update --force
     // thinking the service restarted successfully (2026-07-05 incident).
-    await waitForHealthEndpoint(`http://127.0.0.1:${port}/api/health`);
+    await waitForHealthEndpoint(`http://127.0.0.1:${controlPort}${CONTROL_PLANE_HEALTH_ENDPOINT}`);
 
     if (opts?.keepHandle) {
-      return { pid: check.pid, port, child };
+      return { pid: check.pid, port: controlPort, child };
     }
 
-    return { pid: check.pid, port };
+    return { pid: check.pid, port: controlPort };
   } finally {
     releaseStartLock(lockFd, lockFile);
   }
 }
 
 /**
- * Stop the dashboard daemon.
+ * Stop the daemon (control-plane+motor).
  *
  * Sends SIGTERM to the daemon process and cleans up the PID file.
  * Returns true if a daemon was stopped, false if none was running.
@@ -544,7 +552,7 @@ export function stopDaemon(opts?: DaemonctlPathOptions): boolean {
   const status = isRunning(opts);
   if (!status.running) return false;
   if (!canSignalPid(status.pid, opts)) return false;
-  assertNotSchedulingDaemon(status.pid, "dashboard daemon");
+  assertNotSchedulingDaemon(status.pid, "daemon");
 
   recordLifecycleEvent("stop.daemon", status.pid, opts);
   try {
@@ -561,20 +569,27 @@ export function stopDaemon(opts?: DaemonctlPathOptions): boolean {
     // Best effort
   }
 
+  // Clean up control plane port file so a fresh start can pick a different port
+  try {
+    fs.unlinkSync(getControlPlanePortFile(opts));
+  } catch {
+    // Best effort
+  }
+
   return true;
 }
 
 /**
- * Restart the dashboard daemon.
+ * Restart the daemon (control-plane+motor).
  *
  * If the daemon is currently running, stops it first, then starts a new
- * daemon on the previously configured port (or the port argument).
- * If no daemon is running, starts one on the given port (default 3334).
+ * daemon on the previously configured control plane port (or the port argument).
+ * If no daemon is running, starts one on the given port (default from env or 3339).
  *
  * Returns { pid, port } like startDaemon.
  */
 export async function restartDaemon(port?: number, opts?: StartOptions): Promise<{ pid: number; port: number }> {
-  const currentPort = port ?? readPort(opts);
+  const currentPort = port ?? readControlPlanePort(opts);
 
   const runningStatus = isRunning(opts);
   if (runningStatus.running) {
@@ -1280,4 +1295,239 @@ export async function restartControlPlane(port?: number, opts?: StartOptions): P
     return startControlPlane(currentPort, opts);
   }
   return startControlPlane(currentPort);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Dashboard standalone lifecycle management
+// ═══════════════════════════════════════════════════════════════════
+
+const DASHBOARD_HEALTH_ENDPOINT = "/api/health";
+const DEFAULT_DASHBOARD_PORT = 3334;
+
+/**
+ * Resolve the dashboard-standalone.js path.
+ * In production (compiled JS), the file lives alongside daemonctl.js in dist/server/.
+ * In development (tsx on-the-fly transpilation), the compiled output is in dist/server/.
+ */
+function resolveDashboardStandaloneScript(): string {
+  // Production: same directory as daemonctl.js (dist/server/)
+  const prodPath = path.resolve(__dirname, "dashboard-standalone.js");
+  if (fs.existsSync(prodPath)) return prodPath;
+
+  // Development (tsx): compiled output lives in dist/server/
+  const devPath = path.resolve(__dirname, "..", "..", "dist", "server", "dashboard-standalone.js");
+  if (fs.existsSync(devPath)) return devPath;
+
+  // Fallback: return prodPath so the caller gets a clear error
+  return prodPath;
+}
+
+/**
+ * Get the dashboard PID file path.
+ * Returns ~/.tamandua/dashboard.pid (or isolated path when homeDir is set).
+ */
+export function getDashboardPidFile(opts?: DaemonctlPathOptions): string {
+  const filePath = path.join(getTamanduaDir(opts), "dashboard.pid");
+  if (!opts?.homeDir) {
+    assertStatePathIsolation(filePath, "getDashboardPidFile()");
+  }
+  return filePath;
+}
+
+/**
+ * Get the dashboard port file path.
+ * Same as getPortFile() — the dashboard writes ~/.tamandua/port (existing tooling).
+ */
+export function getDashboardPortFile(opts?: DaemonctlPathOptions): string {
+  return getPortFile(opts);
+}
+
+/**
+ * Get the dashboard log file path.
+ * Returns ~/.tamandua/dashboard.log (or isolated path when homeDir is set).
+ */
+export function getDashboardLogFile(opts?: DaemonctlPathOptions): string {
+  return path.join(getTamanduaDir(opts), "dashboard.log");
+}
+
+/**
+ * Check if the standalone dashboard server is running.
+ * Uses the dashboard PID file and kill(0) for existence check.
+ */
+export function isDashboardRunning(opts?: DaemonctlPathOptions): { running: true; pid: number } | { running: false } {
+  if (!opts?.homeDir) {
+    try {
+      return checkPidFile(getDashboardPidFile(opts));
+    } catch (err) {
+      if (err instanceof Error && err.message.includes("TEST ISOLATION VIOLATION")) {
+        return { running: false };
+      }
+      throw err;
+    }
+  }
+  return checkPidFile(getDashboardPidFile(opts));
+}
+
+/**
+ * Get full dashboard standalone status.
+ */
+export function getDashboardStatus(opts?: DaemonctlPathOptions): {
+  running: boolean;
+  pid: number | null;
+  port: number;
+} {
+  const status = isDashboardRunning(opts);
+  const port = readPort(opts);
+  return {
+    running: status.running,
+    pid: status.running ? status.pid : null,
+    port,
+  };
+}
+
+/**
+ * Start the standalone dashboard server.
+ *
+ * Spawns a detached node process running dist/server/dashboard-standalone.js.
+ * Writes PID and port files that the spawned process also updates.
+ * Waits for startup and checks health endpoint (/api/health).
+ *
+ * If the dashboard server is already running, returns its info without restarting.
+ */
+export async function startDashboardStandalone(port?: number): Promise<{ pid: number; port: number }>;
+export async function startDashboardStandalone(port: number, opts: StartOptions): Promise<{ pid: number; port: number }>;
+export async function startDashboardStandalone(port: number, opts: StartOptions & { keepHandle: true }): Promise<{ pid: number; port: number; child: ChildProcess }>;
+export async function startDashboardStandalone(port?: number, opts?: StartOptions): Promise<{ pid: number; port: number } | { pid: number; port: number; child: ChildProcess }> {
+  const tamanduaDir = getTamanduaDir(opts);
+  const dashPidFile = getDashboardPidFile(opts);
+  const dashPortFile = getDashboardPortFile(opts);
+  const dashLogFile = getDashboardLogFile(opts);
+
+  const status = checkPidFile(dashPidFile);
+  if (status.running) {
+    let existingPort: number = DEFAULT_DASHBOARD_PORT;
+    try {
+      const raw = fs.readFileSync(dashPortFile, "utf-8").trim();
+      const p = parseInt(raw, 10);
+      if (!isNaN(p) && p > 0 && p < 65536) existingPort = p;
+    } catch {
+      // File missing or unreadable — use default
+    }
+    return { pid: status.pid, port: existingPort };
+  }
+
+  const dashPort = port ?? DEFAULT_DASHBOARD_PORT;
+
+  fs.mkdirSync(tamanduaDir, { recursive: true });
+  fs.writeFileSync(dashPortFile, String(dashPort), "utf-8");
+
+  const out = fs.openSync(dashLogFile, "a");
+  const errFd = fs.openSync(dashLogFile, "a");
+
+  const standaloneScript = resolveDashboardStandaloneScript();
+  const spawnOpts: Parameters<typeof spawn>[2] = {
+    detached: true,
+    stdio: ["ignore", out, errFd],
+  };
+  if (opts?.homeDir) {
+    spawnOpts.env = { ...process.env, HOME: opts.homeDir };
+  }
+  const child = spawn(process.execPath, ["--disable-warning=ExperimentalWarning", standaloneScript, String(dashPort)], spawnOpts);
+
+  if (opts?.keepHandle) {
+    // Caller wants the ChildProcess handle for direct cleanup (e.g. tests).
+    // Don't unref — the handle keeps the event loop alive, which is fine
+    // because the caller is responsible for killing the child.
+  } else {
+    child.unref();
+  }
+
+  // Wait for the dashboard to start and write its PID file. Poll instead
+  // of a single fixed sleep: under heavy load node startup can exceed a second.
+  const deadline = Date.now() + 10_000;
+  let check = checkPidFile(dashPidFile);
+  while (!check.running && Date.now() < deadline) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 250));
+    check = checkPidFile(dashPidFile);
+  }
+  if (!check.running) {
+    const logTail = readLogTail(dashLogFile);
+    if (logTail) {
+      throw new Error(`Dashboard server failed to start. Recent dashboard log:\n${logTail}`);
+    }
+    throw new Error("Dashboard server failed to start. Check " + dashLogFile);
+  }
+
+  // Wait for health endpoint to be reachable
+  await waitForHealthEndpoint(`http://127.0.0.1:${dashPort}${DASHBOARD_HEALTH_ENDPOINT}`);
+
+  if (opts?.keepHandle) {
+    return { pid: check.pid, port: dashPort, child };
+  }
+
+  return { pid: check.pid, port: dashPort };
+}
+
+/**
+ * Stop the standalone dashboard server.
+ *
+ * Sends SIGTERM to the dashboard process and cleans up the PID file.
+ * Returns true if a dashboard was stopped, false if none was running.
+ */
+export function stopDashboardStandalone(opts?: DaemonctlPathOptions): boolean {
+  if (!opts?.homeDir) {
+    assertStatePathIsolation(getDashboardPidFile(opts), "stopDashboardStandalone()");
+  }
+  const status = isDashboardRunning(opts);
+  if (!status.running) return false;
+  if (!canSignalPid(status.pid, opts)) return false;
+  assertNotSchedulingDaemon(status.pid, "dashboard server");
+
+  recordLifecycleEvent("stop.dashboard", status.pid, opts);
+  try {
+    process.kill(status.pid, "SIGTERM");
+  } catch {
+    // Process may have already exited
+  }
+
+  // Clean up PID file — the dashboard also cleans up on exit,
+  // but we do it here as a safety measure
+  try {
+    fs.unlinkSync(getDashboardPidFile(opts));
+  } catch {
+    // Best effort
+  }
+
+  // Clean up port file so a fresh start can pick a different port
+  try {
+    fs.unlinkSync(getDashboardPortFile(opts));
+  } catch {
+    // Best effort
+  }
+
+  return true;
+}
+
+/**
+ * Restart the standalone dashboard server.
+ *
+ * If the dashboard is currently running, stops it first, then starts a new
+ * server on the previously configured port (or the port argument).
+ * If no dashboard is running, starts one on the given port (default 3334).
+ *
+ * Returns { pid, port } like startDashboardStandalone.
+ */
+export async function restartDashboardStandalone(port?: number, opts?: StartOptions): Promise<{ pid: number; port: number }> {
+  const currentPort = port ?? readPort(opts);
+
+  if (isDashboardRunning(opts).running) {
+    stopDashboardStandalone(opts);
+    // Brief pause to let the port be released and process fully exit
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+
+  if (opts) {
+    return startDashboardStandalone(currentPort, opts);
+  }
+  return startDashboardStandalone(currentPort);
 }

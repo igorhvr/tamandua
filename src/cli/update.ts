@@ -7,14 +7,14 @@ import { listBundledWorkflows } from "../installer/workflow-fetch.js";
 import { resolveSourcePath } from "../installer/paths.js";
 import { writeCatalogStamp } from "../installer/catalog-version.js";
 import {
-  getControlPlaneStatus,
   getDaemonStatus,
+  getDashboardStatus,
   getMcpStatus,
-  startControlPlane,
   startDaemon,
+  startDashboardStandalone,
   startMcp,
-  stopControlPlane,
   stopDaemon,
+  stopDashboardStandalone,
   stopMcp,
 } from "../server/daemonctl.js";
 import { runVersionCheck } from "../lib/version-check.js";
@@ -24,19 +24,19 @@ export type UpdateServiceStatus =
   | { running: false; pid: null; port: number };
 
 export interface UpdateServiceSnapshot {
+  daemon: UpdateServiceStatus;
   dashboard: UpdateServiceStatus;
   mcp: UpdateServiceStatus;
-  controlPlane: UpdateServiceStatus;
 }
 
 export interface UpdateServices {
   snapshot: () => UpdateServiceSnapshot;
+  stopDaemon: () => boolean;
   stopDashboard: () => boolean;
   stopMcp: () => boolean;
-  stopControlPlane: () => boolean;
+  startDaemon: (port: number) => Promise<{ pid: number; port: number }>;
   startDashboard: (port: number) => Promise<{ pid: number; port: number }>;
   startMcp: (port: number) => Promise<{ pid: number; port: number }>;
-  startControlPlane: (port: number) => Promise<{ pid: number; port: number }>;
 }
 
 export interface UpdateOutput {
@@ -100,16 +100,16 @@ function assertSourceCheckout(sourcePath: string): void {
 export function createDefaultUpdateServices(): UpdateServices {
   return {
     snapshot: () => ({
-      dashboard: normalizeServiceStatus(getDaemonStatus()),
+      daemon: normalizeServiceStatus(getDaemonStatus()),
+      dashboard: normalizeServiceStatus(getDashboardStatus()),
       mcp: normalizeServiceStatus(getMcpStatus()),
-      controlPlane: normalizeServiceStatus(getControlPlaneStatus()),
     }),
-    stopDashboard: stopDaemon,
+    stopDaemon,
+    stopDashboard: stopDashboardStandalone,
     stopMcp,
-    stopControlPlane,
-    startDashboard: (port) => startDaemon(port),
+    startDaemon: (port) => startDaemon(port),
+    startDashboard: (port) => startDashboardStandalone(port),
     startMcp: (port) => startMcp(port),
-    startControlPlane: (port) => startControlPlane(port),
   };
 }
 
@@ -186,8 +186,14 @@ async function stopRunningServices(
 ): Promise<void> {
   const stoppedPids: number[] = [];
 
+  // Stop daemon first (control-plane+motor), then dashboard, then MCP
+  if (snapshot.daemon.running) {
+    output.log(`Stopping daemon (PID ${snapshot.daemon.pid})...`);
+    services.stopDaemon();
+    stoppedPids.push(snapshot.daemon.pid);
+  }
   if (snapshot.dashboard.running) {
-    output.log(`Stopping dashboard daemon (PID ${snapshot.dashboard.pid})...`);
+    output.log(`Stopping dashboard (PID ${snapshot.dashboard.pid})...`);
     services.stopDashboard();
     stoppedPids.push(snapshot.dashboard.pid);
   }
@@ -195,11 +201,6 @@ async function stopRunningServices(
     output.log(`Stopping standalone MCP server (PID ${snapshot.mcp.pid})...`);
     services.stopMcp();
     stoppedPids.push(snapshot.mcp.pid);
-  }
-  if (snapshot.controlPlane.running) {
-    output.log(`Stopping standalone control plane (PID ${snapshot.controlPlane.pid})...`);
-    services.stopControlPlane();
-    stoppedPids.push(snapshot.controlPlane.pid);
   }
 
   if (stoppedPids.length === 0) {
@@ -217,6 +218,16 @@ async function restartPreviouslyRunningServices(
 ): Promise<void> {
   const failures: string[] = [];
 
+  // Start daemon first (control-plane+motor), then dashboard, then MCP
+  if (snapshot.daemon.running) {
+    try {
+      const started = await services.startDaemon(snapshot.daemon.port);
+      output.log(`Daemon (control-plane+motor) restarted on port ${started.port} (PID ${started.pid}).`);
+    } catch (err) {
+      failures.push(`daemon: ${err instanceof Error ? err.message : String(err)} (recover: tamandua daemon restart)`);
+    }
+  }
+
   if (snapshot.dashboard.running) {
     try {
       const started = await services.startDashboard(snapshot.dashboard.port);
@@ -232,15 +243,6 @@ async function restartPreviouslyRunningServices(
       output.log(`Standalone MCP restarted on port ${started.port} (PID ${started.pid}).`);
     } catch (err) {
       failures.push(`mcp: ${err instanceof Error ? err.message : String(err)} (recover: tamandua mcp restart)`);
-    }
-  }
-
-  if (snapshot.controlPlane.running) {
-    try {
-      const started = await services.startControlPlane(snapshot.controlPlane.port);
-      output.log(`Standalone control plane restarted on port ${started.port} (PID ${started.pid}).`);
-    } catch (err) {
-      failures.push(`control-plane: ${err instanceof Error ? err.message : String(err)} (recover: tamandua control-plane restart)`);
     }
   }
 

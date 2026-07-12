@@ -12,10 +12,9 @@ import { describe, it } from "node:test";
 const repoRoot = process.cwd();
 
 async function setupHarnessTempHome() {
-  const [controlPort, dashboardPort] = await reserveDistinctRandomPorts(2);
+  const [controlPort] = await reserveDistinctRandomPorts(1);
   const th = createTempHome("tamandua-harness-cwd-");
-  fs.writeFileSync(path.join(th.tamanduaDir, "port"), String(dashboardPort), "utf-8");
-  return { root: th.root, homeDir: th.homeDir, controlPort, dashboardPort };
+  return { root: th.root, homeDir: th.homeDir, controlPort };
 }
 
 function writeMinimalWorkflow(homeDir: string, workflowId: string): void {

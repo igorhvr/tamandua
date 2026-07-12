@@ -156,7 +156,6 @@ describe(
         try {
         // ── Start daemon ────────────────────────────────────────────
         daemon = await startIsolatedDaemon(
-          env.dashboardPort,
           env.homeDir,
           env.controlPort,
         );

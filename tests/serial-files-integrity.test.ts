@@ -63,7 +63,7 @@ function fileCallsDaemonSpawner(filePath: string): boolean {
   try {
     const content = fs.readFileSync(filePath, "utf-8");
     // Match calls to daemonctl functions that spawn OS processes
-    return /\b(startDaemon|stopDaemon|restartDaemon|startMcp|stopMcp|restartMcp|startControlPlane|stopControlPlane|restartControlPlane)\s*\(/.test(
+    return /\b(startDaemon|stopDaemon|restartDaemon|startMcp|stopMcp|restartMcp|startControlPlane|stopControlPlane|restartControlPlane|startDashboardStandalone|stopDashboardStandalone|restartDashboardStandalone)\s*\(/.test(
       content,
     );
   } catch {

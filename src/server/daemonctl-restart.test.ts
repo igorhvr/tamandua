@@ -25,8 +25,15 @@ import {
   isRunning,
   readPort,
   writePort,
+  readControlPlanePort,
+  writeControlPlanePort,
   getPidFile,
+  startDashboardStandalone,
+  stopDashboardStandalone,
+  isDashboardRunning,
 } from "../../dist/server/daemonctl.js";
+
+const DASHBOARD_STANDALONE_SCRIPT = path.resolve(__dirname, "..", "..", "dist", "server", "dashboard-standalone.js");
 
 // ── Helpers ────────────────────────────────────────────────────────
 
@@ -91,7 +98,7 @@ describe("daemonctl restartDaemon", { concurrency: 1 }, () => {
       assert.equal(typeof result.port, "number");
       assert.equal(result.port, port, "port should match the requested port");
 
-      await waitForHttpUp(`http://127.0.0.1:${port}/`);
+      await waitForHttpUp(`http://127.0.0.1:${port}/control/health`);
     } finally {
       try { stopDaemon({ homeDir: tempHome }); } catch {}
     }
@@ -109,15 +116,15 @@ describe("daemonctl restartDaemon", { concurrency: 1 }, () => {
       const first = await startDaemon(port, { homeDir: tempHome });
       assert.ok(first.pid > 0);
 
-      await waitForHttpUp(`http://127.0.0.1:${port}/`);
+      await waitForHttpUp(`http://127.0.0.1:${port}/control/health`);
 
       const result = await restartDaemon(port, { homeDir: tempHome });
       assert.ok(result.pid > 0, "restartDaemon should return a valid PID");
       assert.equal(result.port, port);
       assert.notEqual(result.pid, first.pid, "restartDaemon should spawn a new process with a different PID");
 
-      // Dashboard should be reachable on the same port
-      await waitForHttpUp(`http://127.0.0.1:${port}/`);
+      // Control plane should be reachable on the same port
+      await waitForHttpUp(`http://127.0.0.1:${port}/control/health`);
 
       // Verify the pid file has the new PID
       const after = isRunning({ homeDir: tempHome });
@@ -137,11 +144,11 @@ describe("daemonctl restartDaemon", { concurrency: 1 }, () => {
     const port = await getAvailablePort();
     const tempHome = createTempHome();
     try {
-      writePort(port, { homeDir: tempHome });
-      assert.equal(readPort({ homeDir: tempHome }), port);
+      writeControlPlanePort(port, { homeDir: tempHome });
+      assert.equal(readControlPlanePort({ homeDir: tempHome }), port);
 
       const result = await restartDaemon(undefined, { homeDir: tempHome });
-      assert.equal(result.port, port, "should use the stored port when no port arg given");
+      assert.equal(result.port, port, "should use the stored control plane port when no port arg given");
       assert.ok(result.pid > 0);
     } finally {
       try { stopDaemon({ homeDir: tempHome }); } catch {}
@@ -158,7 +165,7 @@ describe("daemonctl restartDaemon", { concurrency: 1 }, () => {
     const explicitPort = await getAvailablePort();
     const tempHome = createTempHome();
     try {
-      writePort(storedPort, { homeDir: tempHome });
+      writeControlPlanePort(storedPort, { homeDir: tempHome });
 
       const result = await restartDaemon(explicitPort, { homeDir: tempHome });
       assert.equal(result.port, explicitPort, "explicit port should override stored port file");
@@ -178,7 +185,7 @@ describe("daemonctl restartDaemon", { concurrency: 1 }, () => {
     const tempHome = createTempHome();
     try {
       const first = await startDaemon(port, { homeDir: tempHome });
-      await waitForHttpUp(`http://127.0.0.1:${port}/`);
+      await waitForHttpUp(`http://127.0.0.1:${port}/control/health`);
 
       const result = await restartDaemon(port, { homeDir: tempHome });
 
@@ -196,5 +203,52 @@ describe("daemonctl restartDaemon", { concurrency: 1 }, () => {
 
   it("restartDaemon return type is Promise<{ pid: number; port: number }>", () => {
     assert.equal(typeof restartDaemon, "function");
+  });
+
+  it("restartDaemon does NOT restart or affect a running dashboard standalone process", async (t) => {
+    if (!fs.existsSync(DAEMON_SCRIPT)) {
+      t.skip("daemon.js not found — run npm run build first");
+      return;
+    }
+    if (!fs.existsSync(DASHBOARD_STANDALONE_SCRIPT)) {
+      t.skip("dashboard-standalone.js not found — run npm run build first");
+      return;
+    }
+
+    const daemonPort = await getAvailablePort();
+    const dashPort = await getAvailablePort();
+    if (dashPort === daemonPort) {
+      t.skip("ports collided — retry");
+      return;
+    }
+
+    const tempHome = createTempHome();
+    try {
+      // Start dashboard standalone first
+      const dashStart = await startDashboardStandalone(dashPort, { homeDir: tempHome });
+      assert.ok(dashStart.pid > 0);
+
+      // Then start daemon
+      const daemonStart = await startDaemon(daemonPort, { homeDir: tempHome });
+      assert.ok(daemonStart.pid > 0);
+      await waitForHttpUp(`http://127.0.0.1:${daemonPort}/control/health`);
+
+      // Restart daemon
+      const restarted = await restartDaemon(daemonPort, { homeDir: tempHome });
+      assert.ok(restarted.pid > 0);
+      assert.notEqual(restarted.pid, daemonStart.pid, "daemon PID should change after restart");
+
+      // Dashboard standalone should STILL be running with the SAME PID
+      const dashStatus = isDashboardRunning({ homeDir: tempHome });
+      assert.equal(dashStatus.running, true, "dashboard should still be running after daemon restart");
+      assert.equal(dashStatus.pid, dashStart.pid, "dashboard PID should be unchanged after daemon restart");
+
+      // Dashboard health endpoint still reachable
+      const dashHealth = await fetch(`http://127.0.0.1:${dashPort}/api/health`);
+      assert.equal(dashHealth.status, 200);
+    } finally {
+      try { stopDashboardStandalone({ homeDir: tempHome }); } catch {}
+      try { stopDaemon({ homeDir: tempHome }); } catch {}
+    }
   });
 });

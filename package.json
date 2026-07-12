@@ -11,7 +11,7 @@
     "tamandua-test": "dist/suite/shim.js"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json && cp src/server/index.html dist/server/index.html && cp src/server/kanban.html dist/server/kanban.html && chmod +x dist/cli/cli.js && chmod +x dist/server/mcp-standalone.js && chmod +x dist/suite/shim.js && node scripts/inject-version.js && rm -rf dist/www && cp -r www dist/www",
+    "build": "tsc -p tsconfig.json && cp src/server/index.html dist/server/index.html && cp src/server/kanban.html dist/server/kanban.html && chmod +x dist/cli/cli.js && chmod +x dist/server/mcp-standalone.js && chmod +x dist/server/dashboard-standalone.js && chmod +x dist/suite/shim.js && node scripts/inject-version.js && rm -rf dist/www && cp -r www dist/www",
     "start": "node dist/cli/cli.js",
     "test": "TAMANDUA_TEST_GUARD=1 TAMANDUA_PI_BINARY=/usr/bin/false bash scripts/run-all-lanes.sh",
     "//": "Tests run in two lanes via PRLL: serial lane (concurrency 1, process-spawning/daemon-lifecycle tests) runs first, parallel lane (pure-logic tests, default concurrency) runs after. Both lanes always run regardless of the other's outcome; exit code is 0 only when both pass. Contributors do not need to know about lanes — just run npm test. See scripts/run-all-lanes.sh and tests/serial-files.txt. TAMANDUA_PI_BINARY=/usr/bin/false guarantees no unit test can ever spawn a real model. Tests that need a harness set their own fake TAMANDUA_PI_BINARY (the key passes through cleanChildEnv)."

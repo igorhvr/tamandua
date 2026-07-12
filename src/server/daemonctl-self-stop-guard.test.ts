@@ -12,7 +12,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
 import { spawn } from "node:child_process";
-import { stopDaemon, stopMcp, stopControlPlane } from "../../dist/server/daemonctl.js";
+import { stopDaemon, stopMcp, stopControlPlane, stopDashboardStandalone } from "../../dist/server/daemonctl.js";
 
 let tempHome: string;
 let savedWorkerPid: string | undefined;
@@ -58,7 +58,7 @@ describe("daemonctl self-stop guard", () => {
       process.env.TAMANDUA_WORKER_PID = String(fake.pid);
       assert.throws(
         () => stopDaemon({ homeDir: tempHome }),
-        /Refusing to stop the dashboard daemon .*scheduling\s+.*the current tamandua agent run/s,
+        /Refusing to stop the daemon .*scheduling\s+.*the current tamandua agent run/s,
       );
       // The daemon must still be alive.
       assert.doesNotThrow(() => process.kill(fake.pid, 0));
@@ -79,6 +79,32 @@ describe("daemonctl self-stop guard", () => {
     } finally {
       fakeMcp.kill();
       fakeCp.kill();
+    }
+  });
+
+  it("stopDashboardStandalone refuses when the target is the scheduling daemon", () => {
+    const fake = spawnFakeDaemon("dashboard.pid");
+    try {
+      process.env.TAMANDUA_WORKER_PID = String(fake.pid);
+      assert.throws(
+        () => stopDashboardStandalone({ homeDir: tempHome }),
+        /Refusing to stop the dashboard server/,
+      );
+      // The dashboard must still be alive.
+      assert.doesNotThrow(() => process.kill(fake.pid, 0));
+    } finally {
+      fake.kill();
+    }
+  });
+
+  it("stopDashboardStandalone still stops dashboards that are NOT the scheduling daemon", () => {
+    const fake = spawnFakeDaemon("dashboard.pid");
+    try {
+      process.env.TAMANDUA_WORKER_PID = String(process.pid);
+      const stopped = stopDashboardStandalone({ homeDir: tempHome });
+      assert.equal(stopped, true, "non-scheduling dashboard should be stoppable");
+    } finally {
+      fake.kill();
     }
   });
 

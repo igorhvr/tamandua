@@ -73,7 +73,7 @@ describe("real e2e canary (LIVE model, single do-now run)", () => {
         const workdir = path.join(env.root, "canary-workdir");
         fs.mkdirSync(workdir, { recursive: true });
 
-        daemon = await startIsolatedDaemon(env.dashboardPort, env.homeDir, env.controlPort);
+        daemon = await startIsolatedDaemon(env.homeDir, env.controlPort);
 
         const runIdPrefix = await spawnWorkflowRun(
           ["workflow", "run", "do-now", CANARY_TASK, "--working-directory-for-harness", workdir],

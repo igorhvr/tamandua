@@ -143,8 +143,10 @@ describe("runWorkflow", () => {
       delete process.env.TAMANDUA_WORKTREE_ROOT;
     }
     // Retries absorb stragglers still writing into the temp home during
-    // teardown (ENOTEMPTY otherwise, seen on macOS).
-    fs.rmSync(tempHome, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    // teardown (ENOTEMPTY otherwise, seen on macOS). Give the daemon's
+    // log/SQLite WAL stragglers a moment to finish writing.
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    fs.rmSync(tempHome, { recursive: true, force: true, maxRetries: 15, retryDelay: 200 });
   });
 
   it("daemonctl paths honor HOME assigned after module import", () => {

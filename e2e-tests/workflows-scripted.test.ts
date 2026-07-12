@@ -78,7 +78,6 @@ async function startScriptedEnvironment(
     `install ${workflowId}`,
   );
   const daemon = await startIsolatedDaemon(
-    env.dashboardPort,
     env.homeDir,
     env.controlPort,
     scripted.env,
@@ -542,7 +541,6 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
         // must requeue the step within seconds — NOT the 45-minute
         // age-based threshold — and the run must complete.
         daemon2 = await startIsolatedDaemon(
-          ctx.env.dashboardPort,
           ctx.env.homeDir,
           ctx.env.controlPort,
           ctx.scripted.env,

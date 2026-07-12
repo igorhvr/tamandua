@@ -345,7 +345,6 @@ describe("tamandua workflow pause CLI", { concurrency: 1 }, () => {
       return;
     }
 
-    const dashboardPort = await getAvailablePort();
     const controlPort = await getAvailablePort();
 
     const th = createTempHome("tamandua-pause-test-");
@@ -366,7 +365,7 @@ describe("tamandua workflow pause CLI", { concurrency: 1 }, () => {
 
     try {
       // Start daemon
-      daemon = spawn("node", [DAEMON_SCRIPT, String(dashboardPort)], {
+      daemon = spawn("node", [DAEMON_SCRIPT], {
         env: cleanChildEnv({ HOME: th.homeDir,
           TAMANDUA_CONTROL_PORT: String(controlPort), }),
         stdio: ["ignore", "pipe", "pipe"],

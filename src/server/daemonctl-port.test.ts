@@ -10,6 +10,9 @@ import {
   getPidFile,
   getPortFile,
   getLogFile,
+  getDashboardPidFile,
+  getDashboardPortFile,
+  getDashboardLogFile,
 } from "../../dist/server/daemonctl.js";
 
 describe("daemonctl port helpers", () => {
@@ -70,5 +73,41 @@ describe("daemonctl port helpers", () => {
 
   it("getLogFile is a .log file", () => {
     assert.ok(getLogFile(opts()).endsWith(".log"));
+  });
+
+  // ── Dashboard standalone port / path helpers ───────────────────
+
+  it("getDashboardPortFile returns same as getPortFile", () => {
+    assert.equal(getDashboardPortFile(opts()), getPortFile(opts()));
+  });
+
+  it("getDashboardPidFile ends with dashboard.pid", () => {
+    const p = getDashboardPidFile(opts());
+    assert.ok(p.endsWith("dashboard.pid"));
+  });
+
+  it("getDashboardLogFile ends with dashboard.log", () => {
+    const p = getDashboardLogFile(opts());
+    assert.ok(p.endsWith("dashboard.log"));
+  });
+
+  it("dashboard PidFile is distinct from daemon PidFile", () => {
+    const dashPid = getDashboardPidFile(opts());
+    const daemonPid = getPidFile(opts());
+    assert.notEqual(dashPid, daemonPid);
+  });
+
+  it("dashboard standalone paths live under .tamandua", () => {
+    const dashPid = getDashboardPidFile(opts());
+    const dashPort = getDashboardPortFile(opts());
+    const dashLog = getDashboardLogFile(opts());
+
+    assert.ok(dashPid.includes(".tamandua"));
+    assert.ok(dashPort.includes(".tamandua"));
+    assert.ok(dashLog.includes(".tamandua"));
+
+    assert.ok(dashPid.startsWith(tempHome));
+    assert.ok(dashPort.startsWith(tempHome));
+    assert.ok(dashLog.startsWith(tempHome));
   });
 });

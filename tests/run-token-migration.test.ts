@@ -103,7 +103,6 @@ describe("run token spend persistence", () => {
     const temp = createTempHome();
 
     try {
-      const dashboardPort = await reserveRandomPort();
       const controlPort = await reserveRandomPort();
       const workflowDir = path.join(temp.homeDir, ".tamandua", "workflows", "token-workflow");
       fs.mkdirSync(workflowDir, { recursive: true });
@@ -134,7 +133,7 @@ describe("run token spend persistence", () => {
           import { startDaemon, stopDaemon } from "./dist/server/daemonctl.js";
 
           try {
-            await startDaemon(Number(process.env.TEST_DASHBOARD_PORT));
+            await startDaemon(Number(process.env.TAMANDUA_CONTROL_PORT));
             const started = await runWorkflow({ workflowId: "token-workflow", taskTitle: "Track token spend" });
             const db = getDb();
             const row = db.prepare("SELECT tokens_spent FROM runs WHERE id = ?").get(started.runId);
@@ -147,7 +146,6 @@ describe("run token spend persistence", () => {
         {
           HOME: temp.homeDir,
           TAMANDUA_CONTROL_PORT: String(controlPort),
-          TEST_DASHBOARD_PORT: String(dashboardPort),
         },
       );
 

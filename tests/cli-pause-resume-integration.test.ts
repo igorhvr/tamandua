@@ -244,7 +244,6 @@ describe("CLI pause/resume one run (integration)", { concurrency: 1 }, () => {
       return;
     }
 
-    const dashboardPort = await getAvailablePort();
     const controlPort = await getAvailablePort();
 
     const th = createTempHome("tamandua-integration-test-");
@@ -273,7 +272,7 @@ describe("CLI pause/resume one run (integration)", { concurrency: 1 }, () => {
 
     try {
       // Start daemon
-      daemon = spawn("node", [DAEMON_SCRIPT, String(dashboardPort)], {
+      daemon = spawn("node", [DAEMON_SCRIPT], {
         env: cleanChildEnv({ HOME: th.homeDir,
           TAMANDUA_CONTROL_PORT: String(controlPort), }),
         stdio: ["ignore", "pipe", "pipe"],
@@ -489,7 +488,6 @@ describe("CLI pause/resume one run (integration)", { concurrency: 1 }, () => {
       return;
     }
 
-    const dashboardPort = await getAvailablePort();
     const controlPort = await getAvailablePort();
 
     const th = createTempHome("tamandua-integration-test-");
@@ -513,8 +511,8 @@ describe("CLI pause/resume one run (integration)", { concurrency: 1 }, () => {
     let daemon: ChildProcess | undefined;
 
     try {
-      // Start daemon
-      daemon = spawn("node", [DAEMON_SCRIPT, String(dashboardPort)], {
+      // Start daemon (reads TAMANDUA_CONTROL_PORT from env, no CLI port arg)
+      daemon = spawn("node", [DAEMON_SCRIPT], {
         env: cleanChildEnv({ HOME: th.homeDir,
           TAMANDUA_CONTROL_PORT: String(controlPort), }),
         stdio: ["ignore", "pipe", "pipe"],
@@ -588,7 +586,6 @@ describe("CLI pause/resume one run (integration)", { concurrency: 1 }, () => {
       return;
     }
 
-    const dashboardPort = await getAvailablePort();
     const controlPort = await getAvailablePort();
 
     const th = createTempHome("tamandua-integration-orphan-");
@@ -620,8 +617,8 @@ describe("CLI pause/resume one run (integration)", { concurrency: 1 }, () => {
     let daemon: ChildProcess | undefined;
 
     try {
-      // Start daemon
-      daemon = spawn("node", [DAEMON_SCRIPT, String(dashboardPort)], {
+      // Start daemon (reads TAMANDUA_CONTROL_PORT from env, no CLI port arg)
+      daemon = spawn("node", [DAEMON_SCRIPT], {
         env: cleanChildEnv({ HOME: th.homeDir,
           TAMANDUA_CONTROL_PORT: String(controlPort), }),
         stdio: ["ignore", "pipe", "pipe"],

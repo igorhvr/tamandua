@@ -28,12 +28,13 @@ describe("test isolation guard", () => {
       /\bstopDaemon\(\s*\);/,
       /\bstopMcp\(\s*\);/,
       /\bstopControlPlane\(\s*\);/,
+      /\bstopDashboardStandalone\(\s*\);/,
       /fs\.unlinkSync\(\s*(?:PID_FILE|MCP_PID_FILE|MCP_PORT_FILE|CONTROL_PLANE_PID_FILE|CONTROL_PLANE_PORT_FILE)\s*\)/,
       /\.{3}process\.env/,
       /env\s*\?\s*\{\s*\.{3}process\.env/,
       /:\s*process\.env\s*[,}]/,
       /\b(?:canBind|fetch)\(\s*(?:`[^`]*(?:3334|3338|3339)|["'][^"']*(?:3334|3338|3339)|3334|3338|3339)/,
-      /\b(?:startDaemon|startMcp|startControlPlane)\(\s*(?:3334|3338|3339|DEFAULT_MCP_PORT|DEFAULT_CONTROL_PORT)/,
+      /\b(?:startDaemon|startMcp|startControlPlane|startDashboardStandalone)\(\s*(?:3334|3338|3339|DEFAULT_MCP_PORT|DEFAULT_CONTROL_PORT)/,
     ];
 
     const violations: string[] = [];

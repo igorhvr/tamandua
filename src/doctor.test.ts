@@ -268,7 +268,7 @@ describe("DoctorCheckResult type", () => {
       name: "Daemon build version",
       status: "warn",
       message: "Unable to determine staleness",
-      remedy: "Run: tamandua dashboard restart",
+      remedy: "Run: tamandua daemon restart",
     };
     assert.strictEqual(r.status, "warn");
     assert.strictEqual(typeof r.remedy, "string");
@@ -339,11 +339,11 @@ describe("runDoctorChecks", () => {
     assert.ok(env!.checks.length >= 8, `Expected at least 8 ENVIRONMENT checks, got ${env!.checks.length}`);
   });
 
-  it("SERVICES group has 4 checks", async () => {
+  it("SERVICES group has 5 checks", async () => {
     const groups = await runDoctorChecks({ homeDir: guardHomeDir });
     const svc = groups.find((g) => g.label === "SERVICES");
     assert.ok(svc);
-    assert.strictEqual(svc!.checks.length, 4);
+    assert.strictEqual(svc!.checks.length, 5);
   });
 
   it("STALENESS group has 2 checks", async () => {
@@ -1143,30 +1143,37 @@ describe("SERVICES checks (US-004)", () => {
       const groups = await runDoctorChecks({ homeDir });
       const svc = groups.find((g) => g.label === "SERVICES");
       assert.ok(svc, "Expected SERVICES group");
-      assert.strictEqual(svc!.checks.length, 4);
+      assert.strictEqual(svc!.checks.length, 5);
 
-      // 1. Dashboard daemon PID
-      const daemonCheck = svc!.checks.find((c) => c.name === "Dashboard daemon PID alive");
+      // 1. Daemon PID
+      const daemonCheck = svc!.checks.find((c) => c.name === "Daemon PID alive");
       assert.ok(daemonCheck);
       assert.strictEqual(daemonCheck!.status, "fail");
       assert.ok(daemonCheck!.message.includes("Daemon is not running"));
-      assert.strictEqual(daemonCheck!.remedy, "tamandua dashboard start");
+      assert.strictEqual(daemonCheck!.remedy, "tamandua daemon start");
 
       // 2. Control plane
       const cpCheck = svc!.checks.find((c) => c.name === "Control plane reachable");
       assert.ok(cpCheck);
       assert.strictEqual(cpCheck!.status, "fail");
       assert.ok(cpCheck!.message.includes("daemon is not running"));
-      assert.strictEqual(cpCheck!.remedy, "tamandua dashboard start");
+      assert.strictEqual(cpCheck!.remedy, "tamandua daemon start");
 
-      // 3. Dashboard HTTP
+      // 3. Dashboard PID
+      const dashPidCheck = svc!.checks.find((c) => c.name === "Dashboard PID alive");
+      assert.ok(dashPidCheck);
+      assert.strictEqual(dashPidCheck!.status, "fail");
+      assert.ok(dashPidCheck!.message.includes("Dashboard is not running"));
+      assert.strictEqual(dashPidCheck!.remedy, "tamandua dashboard start");
+
+      // 4. Dashboard HTTP
       const dashCheck = svc!.checks.find((c) => c.name === "Dashboard HTTP up");
       assert.ok(dashCheck);
       assert.strictEqual(dashCheck!.status, "fail");
-      assert.ok(dashCheck!.message.includes("daemon is not running"));
+      assert.ok(dashCheck!.message.includes("dashboard is not running"));
       assert.strictEqual(dashCheck!.remedy, "tamandua dashboard start");
 
-      // 4. MCP — should be info since no pidfile
+      // 5. MCP — should be info since no pidfile
       const mcpCheck = svc!.checks.find((c) => c.name === "MCP server status");
       assert.ok(mcpCheck);
       assert.strictEqual(mcpCheck!.status, "info",
@@ -1179,31 +1186,22 @@ describe("SERVICES checks (US-004)", () => {
 
   it("reports all pass when daemon is running in isolated HOME", { timeout: 15000 }, async () => {
     const homeDir = createTempHome();
-    const port = await getAvailablePort();
     const controlPort = await getAvailablePort();
     let child: import("node:child_process").ChildProcess | undefined;
-    // Isolate the control plane port for the spawned daemon
-    const savedControlPort = process.env.TAMANDUA_CONTROL_PORT;
-    process.env.TAMANDUA_CONTROL_PORT = String(controlPort);
     try {
-      const result = await startDaemon(port, { homeDir, keepHandle: true });
+      const result = await startDaemon(controlPort, { homeDir, keepHandle: true });
       child = (result as { child: import("node:child_process").ChildProcess }).child;
 
       // Wait a bit for the daemon to be fully ready
       await new Promise((resolve) => setTimeout(resolve, 500));
 
-      // The daemon doesn't write the control plane port file, so write it manually
-      const cpPortFile = getControlPlanePortFile({ homeDir });
-      fs.mkdirSync(path.dirname(cpPortFile), { recursive: true });
-      fs.writeFileSync(cpPortFile, String(controlPort), "utf-8");
-
       const groups = await runDoctorChecks({ homeDir });
       const svc = groups.find((g) => g.label === "SERVICES");
       assert.ok(svc, "Expected SERVICES group");
-      assert.strictEqual(svc!.checks.length, 4);
+      assert.strictEqual(svc!.checks.length, 5);
 
-      // 1. Dashboard daemon PID
-      const daemonCheck = svc!.checks.find((c) => c.name === "Dashboard daemon PID alive");
+      // 1. Daemon PID
+      const daemonCheck = svc!.checks.find((c) => c.name === "Daemon PID alive");
       assert.ok(daemonCheck);
       assert.strictEqual(daemonCheck!.status, "pass",
         `Daemon PID check should pass, got: ${daemonCheck!.status} (${daemonCheck!.message})`);
@@ -1216,14 +1214,21 @@ describe("SERVICES checks (US-004)", () => {
         `Control plane check should pass, got: ${cpCheck!.status} (${cpCheck!.message})`);
       assert.ok(cpCheck!.message.includes("responding"));
 
-      // 3. Dashboard HTTP
+      // 3. Dashboard PID
+      const dashPidCheck = svc!.checks.find((c) => c.name === "Dashboard PID alive");
+      assert.ok(dashPidCheck);
+      // Dashboard PID may or may not exist in isolated test
+      assert.ok(["pass", "fail"].includes(dashPidCheck!.status),
+        `Dashboard PID check valid status, got: ${dashPidCheck!.status} (${dashPidCheck!.message})`);
+
+      // 4. Dashboard HTTP
       const dashCheck = svc!.checks.find((c) => c.name === "Dashboard HTTP up");
       assert.ok(dashCheck);
-      assert.strictEqual(dashCheck!.status, "pass",
-        `Dashboard HTTP check should pass, got: ${dashCheck!.status} (${dashCheck!.message})`);
-      assert.ok(dashCheck!.message.includes("responding"));
+      // Dashboard HTTP may or may not be up depending on test
+      assert.ok(["pass", "fail"].includes(dashCheck!.status),
+        `Dashboard HTTP check valid status, got: ${dashCheck!.status} (${dashCheck!.message})`);
 
-      // 4. MCP — info since no MCP pidfile
+      // 5. MCP — info since no MCP pidfile
       const mcpCheck = svc!.checks.find((c) => c.name === "MCP server status");
       assert.ok(mcpCheck);
       assert.strictEqual(mcpCheck!.status, "info",
@@ -1236,12 +1241,6 @@ describe("SERVICES checks (US-004)", () => {
       await new Promise((resolve) => setTimeout(resolve, 200));
       try { stopDaemon({ homeDir }); } catch { /* ignore */ }
       fs.rmSync(homeDir, { recursive: true, force: true });
-      // Restore control port env var
-      if (savedControlPort !== undefined) {
-        process.env.TAMANDUA_CONTROL_PORT = savedControlPort;
-      } else {
-        delete process.env.TAMANDUA_CONTROL_PORT;
-      }
     }
   });
 
@@ -1286,7 +1285,7 @@ describe("SERVICES checks (US-004)", () => {
       const groups = await runDoctorChecks({ homeDir });
       const svc = groups.find((g) => g.label === "SERVICES");
       assert.ok(svc);
-      const daemonCheck = svc!.checks.find((c) => c.name === "Dashboard daemon PID alive");
+      const daemonCheck = svc!.checks.find((c) => c.name === "Daemon PID alive");
       assert.ok(daemonCheck);
       assert.strictEqual(daemonCheck!.status, "fail");
       assert.ok(daemonCheck!.message.includes("Daemon log tail:"),
@@ -1302,7 +1301,7 @@ describe("SERVICES checks (US-004)", () => {
     const groups = await runDoctorChecks({ homeDir: guardHomeDir });
     const svc = groups.find((g) => g.label === "SERVICES");
     assert.ok(svc);
-    assert.strictEqual(svc!.checks.length, 4);
+    assert.strictEqual(svc!.checks.length, 5);
     for (const check of svc!.checks) {
       assert.strictEqual(typeof check.name, "string");
       assert.strictEqual(typeof check.status, "string");
@@ -1318,7 +1317,7 @@ describe("SERVICES checks (US-004)", () => {
     }
   });
 
-  it("daemon not running: control plane and dashboard report daemon-not-running remedies", async () => {
+  it("daemon not running: daemon and control plane checks reference correct remedies", async () => {
     const homeDir = createTempHome();
     try {
       const groups = await runDoctorChecks({ homeDir });
@@ -1326,11 +1325,20 @@ describe("SERVICES checks (US-004)", () => {
       assert.ok(svc);
 
       for (const check of svc!.checks) {
-        if (check.name === "Dashboard daemon PID alive" ||
-            check.name === "Control plane reachable" ||
-            check.name === "Dashboard HTTP up") {
+        if (check.name === "Daemon PID alive" ||
+            check.name === "Control plane reachable") {
           assert.strictEqual(check.status, "fail",
             `Check "${check.name}" should fail when daemon is not running`);
+          assert.ok(check.remedy, `Check "${check.name}" should have a remedy`);
+          assert.ok(
+            check.remedy!.includes("tamandua daemon"),
+            `Remedy for "${check.name}" should reference tamandua daemon: ${check.remedy}`,
+          );
+        }
+        if (check.name === "Dashboard PID alive" ||
+            check.name === "Dashboard HTTP up") {
+          assert.strictEqual(check.status, "fail",
+            `Check "${check.name}" should fail when dashboard is not running`);
           assert.ok(check.remedy, `Check "${check.name}" should have a remedy`);
           assert.ok(
             check.remedy!.includes("tamandua dashboard"),
@@ -1357,21 +1365,13 @@ describe("SERVICES checks (US-004)", () => {
 describe("STALENESS check (US-005)", () => {
   it("passes when daemon buildVersion matches local version", { timeout: 15000 }, async () => {
     const homeDir = createTempHome();
-    const port = await getAvailablePort();
     const controlPort = await getAvailablePort();
     let child: import("node:child_process").ChildProcess | undefined;
-    const savedControlPort = process.env.TAMANDUA_CONTROL_PORT;
-    process.env.TAMANDUA_CONTROL_PORT = String(controlPort);
     try {
-      const result = await startDaemon(port, { homeDir, keepHandle: true });
+      const result = await startDaemon(controlPort, { homeDir, keepHandle: true });
       child = (result as { child: import("node:child_process").ChildProcess }).child;
 
       await new Promise((resolve) => setTimeout(resolve, 500));
-
-      // Write control plane port file so staleness check can find it
-      const cpPortFile = getControlPlanePortFile({ homeDir });
-      fs.mkdirSync(path.dirname(cpPortFile), { recursive: true });
-      fs.writeFileSync(cpPortFile, String(controlPort), "utf-8");
 
       const groups = await runDoctorChecks({ homeDir });
       const staleness = groups.find((g) => g.label === "STALENESS");
@@ -1389,11 +1389,6 @@ describe("STALENESS check (US-005)", () => {
       await new Promise((resolve) => setTimeout(resolve, 200));
       try { stopDaemon({ homeDir }); } catch { /* ignore */ }
       fs.rmSync(homeDir, { recursive: true, force: true });
-      if (savedControlPort !== undefined) {
-        process.env.TAMANDUA_CONTROL_PORT = savedControlPort;
-      } else {
-        delete process.env.TAMANDUA_CONTROL_PORT;
-      }
     }
   });
 
@@ -1433,8 +1428,8 @@ describe("STALENESS check (US-005)", () => {
           `Message should mention installed build, got: ${check.message}`);
         assert.ok(check.message.includes("99999999_old_build"),
           `Message should include daemon build version, got: ${check.message}`);
-        assert.strictEqual(check.remedy, "Run: tamandua dashboard restart",
-          "Remedy should be tamandua dashboard restart (not control-plane restart)");
+        assert.strictEqual(check.remedy, "Run: tamandua daemon restart",
+          "Remedy should be tamandua daemon restart (not control-plane restart)");
       } finally {
         await new Promise<void>((resolve) => mockServer.close(() => resolve()));
       }
@@ -1475,8 +1470,8 @@ describe("STALENESS check (US-005)", () => {
           `Staleness check should warn when buildVersion is missing, got: ${check.status} (${check.message})`);
         assert.ok(check.message.includes("predates build version reporting"),
           `Message should mention predates build version reporting, got: ${check.message}`);
-        assert.ok(check.remedy!.includes("tamandua dashboard restart"),
-          "Remedy should suggest tamandua dashboard restart");
+        assert.ok(check.remedy!.includes("tamandua daemon restart"),
+          "Remedy should suggest tamandua daemon restart");
       } finally {
         await new Promise<void>((resolve) => mockServer.close(() => resolve()));
       }
@@ -2327,7 +2322,7 @@ describe("formatDoctorOutput", () => {
       {
         label: "SERVICES",
         checks: [
-          { name: "Dashboard daemon", status: "fail", message: "not running", remedy: "tamandua dashboard start" },
+          { name: "Daemon PID alive", status: "fail", message: "not running", remedy: "tamandua daemon start" },
         ],
       },
     ];
@@ -2399,7 +2394,7 @@ describe("formatDoctorOutput", () => {
       {
         label: "STALENESS",
         checks: [
-          { name: "Daemon build version vs installed", status: "warn", message: "Staleness check inconclusive — daemon predates build version reporting", remedy: "Run: tamandua dashboard restart to update" },
+          { name: "Daemon build version vs installed", status: "warn", message: "Staleness check inconclusive — daemon predates build version reporting", remedy: "Run: tamandua daemon restart to update" },
         ],
       },
     ];

@@ -253,7 +253,6 @@ describe(
         try {
         // ── Start daemon ────────────────────────────────────────────
         daemon = await startIsolatedDaemon(
-          env.dashboardPort,
           env.homeDir,
           env.controlPort,
         );
@@ -403,7 +402,6 @@ describe(
         try {
         // ── Restart daemon for clean scheduler state ────────────────
         daemon = await startIsolatedDaemon(
-          env.dashboardPort,
           env.homeDir,
           env.controlPort,
         );
@@ -571,7 +569,6 @@ describe(
 
         // ── Start daemon ──────────────────────────────────────────
         daemon = await startIsolatedDaemon(
-          env.dashboardPort,
           env.homeDir,
           env.controlPort,
         );
@@ -709,7 +706,6 @@ describe(
 
         // ── Restart daemon for clean scheduler state ────────────
         daemon = await startIsolatedDaemon(
-          env.dashboardPort,
           env.homeDir,
           env.controlPort,
         );
@@ -927,7 +923,6 @@ describe("real e2e do-now workflow (LIVE agent, daemon, scheduler)", () => {
         fs.mkdirSync(workdir, { recursive: true });
 
         daemon = await startIsolatedDaemon(
-          env.dashboardPort,
           env.homeDir,
           env.controlPort,
         );

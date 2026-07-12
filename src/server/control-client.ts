@@ -13,7 +13,7 @@ import os from "node:os";
 import pathModule from "node:path";
 import { testGuardActive, assertStatePathIsolation } from "../lib/test-guard.js";
 import { getControlPort, readDaemonSecret } from "./control-server.js";
-import { readPort, startDaemon } from "./daemonctl.js";
+import { startDaemon } from "./daemonctl.js";
 
 export interface ControlPlaneResponse {
   status: number;
@@ -128,7 +128,7 @@ export async function ensureDaemonControlAvailable(timeoutMs: number = 30_000): 
   const effectiveTimeout = resolveProbeTimeout(timeoutMs);
   if (await isDaemonControlReachable(500)) return;
 
-  await startDaemon(readPort());
+  await startDaemon();
 
   if (!(await waitForDaemonControl(effectiveTimeout))) {
     throw new Error(

@@ -117,7 +117,7 @@ describe("tamandua dashboard status MCP visibility", () => {
     }
   });
 
-  // AC 1: Dashboard status shows MCP as independently managed
+  // AC 1: tamandua status reports Dashboard and MCP as separate services
   it("shows MCP as not running when dashboard is started without MCP", async (t) => {
     const dashboardPort = await reserveRandomPort();
     const controlPort = await reserveRandomPort();
@@ -141,12 +141,18 @@ describe("tamandua dashboard status MCP visibility", () => {
       const start = await runCliOnce(["dashboard", "start", "--port", String(dashboardPort)], cliEnv);
       assert.equal(start.code, 0, start.stderr || start.stdout);
 
-      // Check status — MCP should be independently reported as not running
-      const status = await runCliOnce(["dashboard", "status"], cliEnv);
+      // Dashboard status shows only dashboard info (not MCP — it's standalone)
+      const dashStatus = await runCliOnce(["dashboard", "status"], cliEnv);
+      assert.equal(dashStatus.code, 0, dashStatus.stderr || dashStatus.stdout);
+      assert.match(dashStatus.stdout, /Dashboard running \(PID \d+\)/);
+      assert.match(dashStatus.stdout, new RegExp(`Dashboard endpoint: http://localhost:${dashboardPort}`));
+      assert.doesNotMatch(dashStatus.stdout, /MCP/);
+
+      // tamandua status shows all services independently
+      const status = await runCliOnce(["status"], cliEnv);
       assert.equal(status.code, 0, status.stderr || status.stdout);
-      assert.match(status.stdout, /Dashboard running \(PID \d+\)/);
-      assert.match(status.stdout, new RegExp(`Dashboard endpoint: http://localhost:${dashboardPort}`));
-      assert.match(status.stdout, /MCP server is not running/);
+      assert.match(status.stdout, /Dashboard: +UP/);
+      assert.match(status.stdout, /MCP: +DOWN/);
 
       const stop = await runCliOnce(["dashboard", "stop"], cliEnv);
       assert.equal(stop.code, 0, stop.stderr || stop.stdout);
@@ -157,7 +163,7 @@ describe("tamandua dashboard status MCP visibility", () => {
     }
   });
 
-  // AC 1: Dashboard status shows MCP running independently when started via mcp start
+  // AC 1: tamandua status reports MCP running independently when started via mcp start
   it("shows MCP as independently running after tamandua mcp start", async (t) => {
     const mcpPort = await reserveRandomPort();
     if (!(await canBind(mcpPort))) {
@@ -188,41 +194,48 @@ describe("tamandua dashboard status MCP visibility", () => {
       const start = await runCliOnce(["dashboard", "start", "--port", String(dashboardPort)], cliEnv);
       assert.equal(start.code, 0, start.stderr || start.stdout);
 
-      // Dashboard status should show MCP not running (isolate from production MCP)
+      // tamandua status should show MCP not running (isolate from production MCP)
       writeUnusedMcpPort();
-      const beforeMcp = await runCliOnce(["dashboard", "status"], cliEnv);
+      const beforeMcp = await runCliOnce(["status"], cliEnv);
       assert.equal(beforeMcp.code, 0, beforeMcp.stderr || beforeMcp.stdout);
-      assert.match(beforeMcp.stdout, /MCP server is not running/);
+      assert.match(beforeMcp.stdout, /MCP: +DOWN/);
 
       // Start MCP independently (mcp start writes the correct port file itself)
       const mcpStart = await runCliOnce(["mcp", "start", "--port", String(mcpPort)], cliEnv);
       assert.equal(mcpStart.code, 0, mcpStart.stderr || mcpStart.stdout);
       assert.match(mcpStart.stdout, /MCP server started/);
 
-      // Dashboard status should now show MCP as running independently
-      const afterMcp = await runCliOnce(["dashboard", "status"], cliEnv);
+      // tamandua status should now show MCP as running independently
+      const afterMcp = await runCliOnce(["status"], cliEnv);
       assert.equal(afterMcp.code, 0, afterMcp.stderr || afterMcp.stdout);
-      assert.match(afterMcp.stdout, /Dashboard running \(PID \d+\)/);
-      assert.match(afterMcp.stdout, /MCP server running \(PID \d+\)/);
-      assert.match(afterMcp.stdout, new RegExp(`MCP endpoint: http://localhost:${mcpPort}/mcp`));
+      assert.match(afterMcp.stdout, /Dashboard: +UP/);
+      assert.match(afterMcp.stdout, /MCP: +UP/);
+      assert.match(afterMcp.stdout, new RegExp(`port ${mcpPort}, http://localhost:${mcpPort}/mcp`));
 
       // MCP should still be running after dashboard stop
       const dashStop = await runCliOnce(["dashboard", "stop"], cliEnv);
       assert.equal(dashStop.code, 0, dashStop.stderr || dashStop.stdout);
 
-      const afterDashStop = await runCliOnce(["dashboard", "status"], cliEnv);
-      assert.match(afterDashStop.stdout, /Dashboard is not running/);
-      assert.match(afterDashStop.stdout, /MCP server running \(PID \d+\)/);
+      // Dashboard status shows not running, MCP status shows still running
+      const dashAfterStatus = await runCliOnce(["dashboard", "status"], cliEnv);
+      assert.equal(dashAfterStatus.code, 0, dashAfterStatus.stderr || dashAfterStatus.stdout);
+      assert.match(dashAfterStatus.stdout, /Dashboard is not running/);
+
+      const mcpAfterStatus = await runCliOnce(["mcp", "status"], cliEnv);
+      assert.equal(mcpAfterStatus.code, 0, mcpAfterStatus.stderr || mcpAfterStatus.stdout);
+      assert.match(mcpAfterStatus.stdout, /MCP server running/);
 
       // Stop MCP (cleans up PID and port files)
       const mcpStop = await runCliOnce(["mcp", "stop"], cliEnv);
       assert.equal(mcpStop.code, 0, mcpStop.stderr || mcpStop.stdout);
 
-      // Both should show not running (isolate from production MCP again)
+      // Both should show not running
+      const finalDashStatus = await runCliOnce(["dashboard", "status"], cliEnv);
+      assert.match(finalDashStatus.stdout, /Dashboard is not running/);
+
       writeUnusedMcpPort();
-      const finalStatus = await runCliOnce(["dashboard", "status"], cliEnv);
-      assert.match(finalStatus.stdout, /Dashboard is not running/);
-      assert.match(finalStatus.stdout, /MCP server is not running/);
+      const finalMcpStatus = await runCliOnce(["mcp", "status"], cliEnv);
+      assert.match(finalMcpStatus.stdout, /MCP server is not running/);
     } finally {
       await runCliOnce(["dashboard", "stop"], cliEnv);
       await runCliOnce(["mcp", "stop"], cliEnv);

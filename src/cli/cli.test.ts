@@ -462,15 +462,17 @@ describe("--help infrastructure", () => {
     }
   });
 
-  it("tamandua get-ready --help explains workflow installation and dashboard startup", () => {
+  it("tamandua get-ready --help explains workflow installation and three-process startup", () => {
     const result = cli(["get-ready", "--help"]);
     try {
       assert.equal(result.status, 0);
       assert.match(result.stdout ?? "", /Install all bundled workflows/);
       assert.match(result.stdout ?? "", /CLI symlink/);
-      assert.match(result.stdout ?? "", /starts it on the default port/);
       assert.match(result.stdout ?? "", /registers agents/);
+      assert.match(result.stdout ?? "", /daemon.*control-plane\+motor/);
+      assert.match(result.stdout ?? "", /dashboard standalone/);
       assert.match(result.stdout ?? "", /MCP server/);
+      assert.match(result.stdout ?? "", /three processes are started independently/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua update/);
     } finally {
     }
@@ -481,8 +483,9 @@ describe("--help infrastructure", () => {
     try {
       assert.equal(result.status, 0);
       assert.match(result.stdout ?? "", /Fully remove Tamandua workflows/);
-      assert.match(result.stdout ?? "", /Stops the dashboard daemon/);
-      assert.match(result.stdout ?? "", /Stops the standalone MCP/);
+      assert.match(result.stdout ?? "", /Stops the daemon/);
+      assert.match(result.stdout ?? "", /standalone dashboard UI process/);
+      assert.match(result.stdout ?? "", /standalone MCP/);
       assert.match(result.stdout ?? "", /removes every installed/);
       assert.match(result.stdout ?? "", /agent workspaces/);
       assert.match(result.stdout ?? "", /cron jobs/);
@@ -646,28 +649,44 @@ describe("--help infrastructure", () => {
     const result = cli(["dashboard", "--help"]);
     try {
       assert.equal(result.status, 0);
-      assert.match(result.stdout ?? "", /Manage the web dashboard daemon/);
+      assert.match(result.stdout ?? "", /Manage the standalone web dashboard/);
       assert.match(result.stdout ?? "", /start.*--port/);
       assert.match(result.stdout ?? "", /stop/);
+      assert.match(result.stdout ?? "", /restart/);
       assert.match(result.stdout ?? "", /status/);
       assert.match(result.stdout ?? "", /3334/);
-      assert.match(result.stdout ?? "", /MCP server/);
-      assert.match(result.stdout ?? "", /monitoring workflow runs/);
+      assert.match(result.stdout ?? "", /standalone UI process/);
+      assert.match(result.stdout ?? "", /never affects in-flight runs/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
     } finally {
     }
   });
 
-  it("tamandua control-plane --help shows help for all control-plane subcommands", () => {
+  it("tamandua control-plane --help documents control-plane as alias for daemon", () => {
     const result = cli(["control-plane", "--help"]);
     try {
       assert.equal(result.status, 0);
-      assert.match(result.stdout ?? "", /Manage the control plane server/);
+      assert.match(result.stdout ?? "", /Alias for tamandua daemon/);
       assert.match(result.stdout ?? "", /start.*--port/);
       assert.match(result.stdout ?? "", /stop/);
+      assert.match(result.stdout ?? "", /restart/);
       assert.match(result.stdout ?? "", /status/);
-      assert.match(result.stdout ?? "", /3339/);
-      assert.match(result.stdout ?? "", /scheduling API/);
+      assert.match(result.stdout ?? "", /hosted by the daemon/);
+      assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
+    } finally {
+    }
+  });
+
+  it("tamandua daemon --help shows help for all daemon subcommands", () => {
+    const result = cli(["daemon", "--help"]);
+    try {
+      assert.equal(result.status, 0);
+      assert.match(result.stdout ?? "", /Manage the daemon.*control plane.*scheduling motor/);
+      assert.match(result.stdout ?? "", /start.*--port/);
+      assert.match(result.stdout ?? "", /stop/);
+      assert.match(result.stdout ?? "", /restart/);
+      assert.match(result.stdout ?? "", /status/);
+      assert.match(result.stdout ?? "", /running for workflows to progress/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
     } finally {
     }
@@ -1374,7 +1393,7 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /Pause a running workflow/);
       assert.match(result.stdout ?? "", /--drain/);
       assert.match(result.stdout ?? "", /in-flight agent sessions/);
-      assert.match(result.stdout ?? "", /dashboard daemon/);
+      assert.match(result.stdout ?? "", /The daemon must be running/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
     } finally {
     }
@@ -1398,7 +1417,7 @@ describe("--help infrastructure", () => {
     try {
       assert.equal(result.status, 0);
       assert.match(result.stdout ?? "", /Resume a paused or failed workflow/);
-      assert.match(result.stdout ?? "", /paused.*Connects to the dashboard daemon/);
+      assert.match(result.stdout ?? "", /paused.*Connects to the daemon/);
       assert.match(result.stdout ?? "", /failed.*Restarts the run/);
       assert.match(result.stdout ?? "", /completed.*cannot be resumed/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
@@ -1529,7 +1548,7 @@ describe("status command", () => {
     try {
       assert.equal(result.status, 0);
       assert.match(result.stdout ?? "", /Show detailed Tamandua system status/);
-      assert.match(result.stdout ?? "", /Services.*Dashboard, MCP, and control-plane/);
+      assert.match(result.stdout ?? "", /Services.*Dashboard, daemon.*control-plane\+motor.*MCP/);
       assert.match(result.stdout ?? "", /Tamandua Info.*Source path, skill path, version/);
       assert.match(result.stdout ?? "", /Workflow Runs.*Summary of all runs/);
       assert.match(result.stdout ?? "", /Running Processes.*Active pi\/hermes/);
@@ -1611,7 +1630,8 @@ describe("formatServiceStatus", () => {
     const { formatServiceStatus } = await import("../../dist/cli/status-format.js");
 
     const result = formatServiceStatus({
-      getDaemonStatus: () => ({ running: true, pid: 12345, port: 3334 }),
+      getDashboardStatus: () => ({ running: true, pid: 12345, port: 3334 }),
+      getDaemonStatus: () => ({ running: true, pid: 99999, port: 3334 }),
       getMcpStatus: () => ({
         running: true,
         pid: 12346,
@@ -1628,6 +1648,7 @@ describe("formatServiceStatus", () => {
 
     assert.match(result, /Services/);
     assert.match(result, /Dashboard: +UP +\(pid 12345, port 3334, http:\/\/localhost:3334\)/);
+    assert.match(result, /Daemon: +UP +\(pid 99999\)/);
     assert.match(result, /MCP: +UP +\(pid 12346, port 3338, http:\/\/localhost:3338\/mcp\)/);
     assert.match(result, /Control-plane: +UP +\(pid 12347, port 3339, http:\/\/localhost:3339\/control\/health\)/);
   });
@@ -1636,6 +1657,7 @@ describe("formatServiceStatus", () => {
     const { formatServiceStatus } = await import("../../dist/cli/status-format.js");
 
     const result = formatServiceStatus({
+      getDashboardStatus: () => ({ running: false, pid: null, port: 3334 }),
       getDaemonStatus: () => ({ running: false, pid: null, port: 3334 }),
       getMcpStatus: () => ({
         running: false,
@@ -1653,15 +1675,17 @@ describe("formatServiceStatus", () => {
 
     assert.match(result, /Services/);
     assert.match(result, /Dashboard: +DOWN \(port 3334\)/);
+    assert.match(result, /Daemon: +DOWN \(port 3334\)/);
     assert.match(result, /MCP: +DOWN \(port 3338, endpoint \/mcp\)/);
     assert.match(result, /Control-plane: +DOWN \(port 3339, endpoint \/control\/health\)/);
   });
 
-  it("shows mixed state: dashboard up, MCP and control-plane down", async () => {
+  it("shows mixed state: dashboard up, daemon and MCP and control-plane down", async () => {
     const { formatServiceStatus } = await import("../../dist/cli/status-format.js");
 
     const result = formatServiceStatus({
-      getDaemonStatus: () => ({ running: true, pid: 42, port: 3334 }),
+      getDashboardStatus: () => ({ running: true, pid: 42, port: 3334 }),
+      getDaemonStatus: () => ({ running: false, pid: null, port: 3334 }),
       getMcpStatus: () => ({
         running: false,
         pid: null,
@@ -1678,6 +1702,7 @@ describe("formatServiceStatus", () => {
 
     assert.match(result, /Services/);
     assert.match(result, /Dashboard: +UP +\(pid 42, port 3334, http:\/\/localhost:3334\)/);
+    assert.match(result, /Daemon: +DOWN/);
     assert.match(result, /MCP: +DOWN/);
     assert.match(result, /Control-plane: +DOWN/);
   });
@@ -1686,6 +1711,7 @@ describe("formatServiceStatus", () => {
     const { formatServiceStatus } = await import("../../dist/cli/status-format.js");
 
     const result = formatServiceStatus({
+      getDashboardStatus: () => ({ running: false, pid: null, port: 3334 }),
       getDaemonStatus: () => ({ running: false, pid: null, port: 3334 }),
       getMcpStatus: () => ({
         running: false,
@@ -1720,6 +1746,7 @@ describe("formatServiceStatus", () => {
     }
     assert.match(result, /Services/);
     assert.match(result, /Dashboard:/);
+    assert.match(result, /Daemon:/);
     assert.match(result, /MCP:/);
     assert.match(result, /Control-plane:/);
   });
@@ -1732,7 +1759,8 @@ describe("formatServiceStatusAsync", () => {
     const { formatServiceStatusAsync } = await import("../../dist/cli/status-format.js");
 
     const result = await formatServiceStatusAsync({
-      getDaemonStatus: () => ({ running: true, pid: 12345, port: 3334 }),
+      getDashboardStatus: () => ({ running: true, pid: 12345, port: 3334 }),
+      getDaemonStatus: () => ({ running: true, pid: 99999, port: 3334 }),
       getMcpStatusAsync: async () => ({
         running: true,
         pid: 12346,
@@ -1749,6 +1777,7 @@ describe("formatServiceStatusAsync", () => {
 
     assert.match(result, /Services/);
     assert.match(result, /Dashboard: +UP +\(pid 12345, port 3334, http:\/\/localhost:3334\)/);
+    assert.match(result, /Daemon: +UP +\(pid 99999\)/);
     assert.match(result, /MCP: +UP +\(pid 12346, port 3338, http:\/\/localhost:3338\/mcp\)/);
     assert.match(result, /Control-plane: +UP +\(pid 12347, port 3339, http:\/\/localhost:3339\/control\/health\)/);
   });
@@ -1757,6 +1786,7 @@ describe("formatServiceStatusAsync", () => {
     const { formatServiceStatusAsync } = await import("../../dist/cli/status-format.js");
 
     const result = await formatServiceStatusAsync({
+      getDashboardStatus: () => ({ running: false, pid: null, port: 3334 }),
       getDaemonStatus: () => ({ running: false, pid: null, port: 3334 }),
       getMcpStatusAsync: async () => ({
         running: false,
@@ -1774,15 +1804,17 @@ describe("formatServiceStatusAsync", () => {
 
     assert.match(result, /Services/);
     assert.match(result, /Dashboard: +DOWN \(port 3334\)/);
+    assert.match(result, /Daemon: +DOWN \(port 3334\)/);
     assert.match(result, /MCP: +DOWN \(port 3338, endpoint \/mcp\)/);
     assert.match(result, /Control-plane: +DOWN \(port 3339, endpoint \/control\/health\)/);
   });
 
-  it("shows mixed state: dashboard and MCP up, control-plane down", async () => {
+  it("shows mixed state: dashboard and MCP up, daemon and control-plane down", async () => {
     const { formatServiceStatusAsync } = await import("../../dist/cli/status-format.js");
 
     const result = await formatServiceStatusAsync({
-      getDaemonStatus: () => ({ running: true, pid: 42, port: 3334 }),
+      getDashboardStatus: () => ({ running: true, pid: 42, port: 3334 }),
+      getDaemonStatus: () => ({ running: false, pid: null, port: 3334 }),
       getMcpStatusAsync: async () => ({
         running: true,
         pid: 42,
@@ -1799,6 +1831,7 @@ describe("formatServiceStatusAsync", () => {
 
     assert.match(result, /Services/);
     assert.match(result, /Dashboard: +UP +\(pid 42, port 3334, http:\/\/localhost:3334\)/);
+    assert.match(result, /Daemon: +DOWN/);
     assert.match(result, /MCP: +UP +\(pid 42, port 3338, http:\/\/localhost:3338\/mcp\)/);
     assert.match(result, /Control-plane: +DOWN/);
   });
@@ -1810,6 +1843,7 @@ describe("formatServiceStatusAsync", () => {
     // so there's no control-plane.pid. The async probe hits the health endpoint
     // and discovers the control plane IS actually up.
     const result = await formatServiceStatusAsync({
+      getDashboardStatus: () => ({ running: true, pid: 100, port: 3334 }),
       getDaemonStatus: () => ({ running: true, pid: 100, port: 3334 }),
       getMcpStatusAsync: async () => ({
         running: false,
@@ -1833,6 +1867,7 @@ describe("formatServiceStatusAsync", () => {
 
     // MCP running in-process with daemon — no mcp.pid but port is open.
     const result = await formatServiceStatusAsync({
+      getDashboardStatus: () => ({ running: true, pid: 200, port: 3334 }),
       getDaemonStatus: () => ({ running: true, pid: 200, port: 3334 }),
       getMcpStatusAsync: async () => ({
         running: true,

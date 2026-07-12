@@ -171,8 +171,8 @@ duration (e.g. `7d`, `24h`, `30m`). Requires both `--completed` and
 
 ### 2.9) Control plane management
 
-The control plane provides run-scoped scheduling that the dashboard daemon
-uses to manage deterministic work dispatch.
+The control plane provides run-scoped scheduling for deterministic work
+dispatch (hosted by the daemon process alongside the reconciler/motor).
 
 **Live-instance isolation (for agents running INSIDE a tamandua run):** the
 `tamandua step` reporting commands (claim / complete / fail, documented
@@ -182,7 +182,7 @@ exercise lifecycle behavior, spin up an ISOLATED instance instead: point
 `HOME`/`TAMANDUA_STATE_DIR` at a temp directory and use non-default ports
 (`TAMANDUA_CONTROL_PORT` plus explicit `--port` values). As a backstop,
 `stop`/`restart` refuse to signal the daemon that scheduled you
-("Refusing to stop the dashboard daemon…"): that error means you targeted
+("Refusing to stop the daemon…"): that error means you targeted
 the live instance — switch to an isolated one.
 
 ```bash
@@ -703,9 +703,10 @@ tamandua get-ready
 
 1. Installs all bundled workflows into your Tamandua state directory
 2. Ensures the CLI launcher symlink exists at `~/.local/bin/tamandua`
-3. Starts the dashboard daemon if it is not already running
-   (the daemon co-manages the dashboard HTTP server and the in-process control plane)
-4. Reports dashboard and MCP server status
+3. Starts the daemon (control plane + motor), dashboard standalone, and
+   MCP server if they are not already running (each service runs as an
+   independent process)
+4. Reports dashboard, daemon, and MCP server status
 
 Run `get-ready` after pulling a new Tamandua checkout or after
 `tamandua update` if workflows or services need reinstallation.
@@ -759,8 +760,7 @@ not executable, the run fails at startup.
 ### 2.6) Troubleshooting with tamandua doctor
 
 `tamandua doctor` is a one-shot diagnostic that checks environment
-(Node.js >= 22, pi on PATH, gh on PATH), services (dashboard daemon,
-control plane, MCP), daemon staleness (running daemon matches installed
+(Node.js >= 22, pi on PATH, gh on PATH), services (dashboard, daemon, MCP), daemon staleness (running daemon matches installed
 build), database state (run-level anomalies), and LLM prompt adherence
 (per-step key-emission rates from workflow runs, measuring how often
 agents deliver expected output keys). Each check prints **pass/fail**

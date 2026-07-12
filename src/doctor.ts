@@ -18,8 +18,10 @@ import {
   readPort,
   readMcpPort,
   isMcpRunning,
+  isDashboardRunning,
   readLogTail,
   getLogFile,
+  getDashboardLogFile,
   getMcpPidFile,
 } from "./server/daemonctl.js";
 import type { DaemonctlPathOptions } from "./server/daemonctl.js";
@@ -503,7 +505,7 @@ async function runStalenessCheck(opts?: DoctorOpts): Promise<DoctorCheckResult[]
         name: "Daemon build version vs installed",
         status: "warn",
         message: "Staleness check inconclusive — daemon predates build version reporting",
-        remedy: "Run: tamandua dashboard restart to update",
+        remedy: "Run: tamandua daemon restart to update",
       }];
     }
 
@@ -512,7 +514,7 @@ async function runStalenessCheck(opts?: DoctorOpts): Promise<DoctorCheckResult[]
         name: "Daemon build version vs installed",
         status: "fail",
         message: `Daemon running build ${daemonVersion} but installed build is ${localVersion}`,
-        remedy: "Run: tamandua dashboard restart",
+        remedy: "Run: tamandua daemon restart",
       }];
     }
 
@@ -538,31 +540,44 @@ async function runServicesChecks(opts?: DoctorOpts): Promise<DoctorCheckResult[]
   const daemonStatus = isRunning(dctlOpts);
 
   // Lazily read daemon log tail on first failure
-  let logTail: string | null = null;
-  function getLogTailOnce(): string {
-    if (logTail === null) {
-      logTail = readLogTail(getLogFile(dctlOpts), 20);
+  let daemonLogTail: string | null = null;
+  function getDaemonLogTailOnce(): string {
+    if (daemonLogTail === null) {
+      daemonLogTail = readLogTail(getLogFile(dctlOpts), 20);
     }
-    return logTail;
+    return daemonLogTail;
   }
-  function withLogTail(msg: string): string {
-    const tail = getLogTailOnce();
+  function withDaemonLogTail(msg: string): string {
+    const tail = getDaemonLogTailOnce();
     return tail ? `${msg}\n\nDaemon log tail:\n${tail}` : msg;
   }
 
-  // 1. Dashboard daemon PID
+  // Lazily read dashboard log tail on first failure
+  let dashboardLogTail: string | null = null;
+  function getDashboardLogTailOnce(): string {
+    if (dashboardLogTail === null) {
+      dashboardLogTail = readLogTail(getDashboardLogFile(dctlOpts), 20);
+    }
+    return dashboardLogTail;
+  }
+  function withDashboardLogTail(msg: string): string {
+    const tail = getDashboardLogTailOnce();
+    return tail ? `${msg}\n\nDashboard log tail:\n${tail}` : msg;
+  }
+
+  // 1. Daemon PID alive
   if (daemonStatus.running) {
     results.push({
-      name: "Dashboard daemon PID alive",
+      name: "Daemon PID alive",
       status: "pass",
       message: `Daemon running (PID ${daemonStatus.pid})`,
     });
   } else {
     results.push({
-      name: "Dashboard daemon PID alive",
+      name: "Daemon PID alive",
       status: "fail",
-      message: withLogTail("Daemon is not running"),
-      remedy: "tamandua dashboard start",
+      message: withDaemonLogTail("Daemon is not running"),
+      remedy: "tamandua daemon start",
     });
   }
 
@@ -584,16 +599,16 @@ async function runServicesChecks(opts?: DoctorOpts): Promise<DoctorCheckResult[]
         results.push({
           name: "Control plane reachable",
           status: "fail",
-          message: withLogTail(`Control plane returned HTTP ${res.status} on port ${cpPort}`),
-          remedy: "tamandua dashboard restart",
+          message: withDaemonLogTail(`Control plane returned HTTP ${res.status} on port ${cpPort}`),
+          remedy: "tamandua daemon restart",
         });
       }
     } catch {
       results.push({
         name: "Control plane reachable",
         status: "fail",
-        message: withLogTail(`Control plane unreachable on port ${readControlPlanePort(dctlOpts)}`),
-        remedy: "tamandua dashboard restart",
+        message: withDaemonLogTail(`Control plane unreachable on port ${readControlPlanePort(dctlOpts)}`),
+        remedy: "tamandua daemon restart",
       });
     }
   } else {
@@ -601,12 +616,29 @@ async function runServicesChecks(opts?: DoctorOpts): Promise<DoctorCheckResult[]
       name: "Control plane reachable",
       status: "fail",
       message: "Control plane unreachable (daemon is not running)",
+      remedy: "tamandua daemon start",
+    });
+  }
+
+  // 3. Dashboard PID alive
+  const dashboardStatus = isDashboardRunning(dctlOpts);
+  if (dashboardStatus.running) {
+    results.push({
+      name: "Dashboard PID alive",
+      status: "pass",
+      message: `Dashboard running (PID ${dashboardStatus.pid})`,
+    });
+  } else {
+    results.push({
+      name: "Dashboard PID alive",
+      status: "fail",
+      message: withDashboardLogTail("Dashboard is not running"),
       remedy: "tamandua dashboard start",
     });
   }
 
-  // 3. Dashboard HTTP
-  if (daemonStatus.running) {
+  // 4. Dashboard HTTP
+  if (dashboardStatus.running) {
     try {
       const dashPort = readPort(dctlOpts);
       const controller = new AbortController();
@@ -623,7 +655,7 @@ async function runServicesChecks(opts?: DoctorOpts): Promise<DoctorCheckResult[]
         results.push({
           name: "Dashboard HTTP up",
           status: "fail",
-          message: withLogTail(`Dashboard returned HTTP ${res.status} on port ${dashPort}`),
+          message: withDashboardLogTail(`Dashboard returned HTTP ${res.status} on port ${dashPort}`),
           remedy: "tamandua dashboard restart",
         });
       }
@@ -631,7 +663,7 @@ async function runServicesChecks(opts?: DoctorOpts): Promise<DoctorCheckResult[]
       results.push({
         name: "Dashboard HTTP up",
         status: "fail",
-        message: withLogTail(`Dashboard unreachable on port ${readPort(dctlOpts)}`),
+        message: withDashboardLogTail(`Dashboard unreachable on port ${readPort(dctlOpts)}`),
         remedy: "tamandua dashboard restart",
       });
     }
@@ -639,12 +671,12 @@ async function runServicesChecks(opts?: DoctorOpts): Promise<DoctorCheckResult[]
     results.push({
       name: "Dashboard HTTP up",
       status: "fail",
-      message: "Dashboard unreachable (daemon is not running)",
+      message: "Dashboard unreachable (dashboard is not running)",
       remedy: "tamandua dashboard start",
     });
   }
 
-  // 4. MCP server status
+  // 5. MCP server status
   const mcpPidFile = getMcpPidFile(dctlOpts);
   const mcpPidFileExists = fs.existsSync(mcpPidFile);
   if (mcpPidFileExists) {
@@ -660,7 +692,7 @@ async function runServicesChecks(opts?: DoctorOpts): Promise<DoctorCheckResult[]
       results.push({
         name: "MCP server status",
         status: "fail",
-        message: withLogTail(`MCP pidfile exists but process not running (pidfile: ${mcpPidFile})`),
+        message: withDaemonLogTail(`MCP pidfile exists but process not running (pidfile: ${mcpPidFile})`),
         remedy: "tamandua mcp restart",
       });
     }
