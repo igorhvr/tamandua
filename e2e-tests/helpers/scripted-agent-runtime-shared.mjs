@@ -130,18 +130,64 @@ export function behaviorForInvocation(config, agentId, shortAgent, index) {
 /**
  * Increment and return the invocation count for a keyed agent.
  * The count is persisted in stateDir/<key>.workcount.
+ *
+ * Uses a file-based mutex (mkdirSync) to serialize access across
+ * concurrent harness processes, so 8 simultaneous runs each get
+ * a unique behavior index without races. The lock directory is
+ * removed after each increment — no leaked .lock files in normal
+ * operation.
  */
 export function nextWorkIndex(stateDir, key) {
   const countFile = path.join(stateDir, `${key}.workcount`);
-  let count = 0;
-  try {
-    count = parseInt(fs.readFileSync(countFile, "utf-8"), 10) || 0;
-  } catch {
-    // first invocation
+  const lockDir = path.join(stateDir, `${key}.workcount.lock`);
+
+  // Exponential-backoff file-system mutex.
+  // mkdirSync without {recursive:true} throws EEXIST if the
+  // directory already exists — atomic on both macOS and Linux.
+  const maxRetries = 50;
+  const baseDelayMs = 2;
+  const maxDelayMs = 10;
+
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      fs.mkdirSync(lockDir);
+      break; // lock acquired
+    } catch (err) {
+      if (err.code !== "EEXIST") throw err;
+      if (attempt === maxRetries - 1) {
+        throw new Error(
+          `Could not acquire lock for ${key} after ${maxRetries} attempts`,
+        );
+      }
+      // Exponential backoff with 10 % jitter to avoid thundering herd.
+      const delay = Math.min(baseDelayMs * Math.pow(2, attempt), maxDelayMs);
+      const jittered = delay + Math.random() * delay * 0.1;
+      const start = Date.now();
+      while (Date.now() - start < jittered) {
+        // busy-wait
+      }
+    }
   }
-  fs.mkdirSync(stateDir, { recursive: true });
-  fs.writeFileSync(countFile, String(count + 1), "utf-8");
-  return count;
+
+  try {
+    // Read + write inside the lock — both operations serialized.
+    fs.mkdirSync(stateDir, { recursive: true });
+    let count = 0;
+    try {
+      count = parseInt(fs.readFileSync(countFile, "utf-8"), 10) || 0;
+    } catch {
+      // first invocation
+    }
+    fs.writeFileSync(countFile, String(count + 1), "utf-8");
+    return count;
+  } finally {
+    // Release lock: remove the lock directory.
+    try {
+      fs.rmdirSync(lockDir);
+    } catch (err) {
+      if (err.code !== "ENOENT") throw err;
+    }
+  }
 }
 
 // ── Placeholder substitution ────────────────────────────────────────
