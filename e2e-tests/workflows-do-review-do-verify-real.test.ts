@@ -67,7 +67,6 @@ import {
   auditRunTokens,
   collectRunDiagnostics,
 } from "./helpers/e2e-helpers.ts";
-import { reserveDistinctRandomPorts } from "../tests/helpers/test-env.ts";
 import type { ChildProcess } from "node:child_process";
 
 const fixtureDir = path.join(process.cwd(), "e2e-tests", "fixtures", "sample-project-review");

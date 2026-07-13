@@ -2,7 +2,7 @@ import fs from "node:fs";
 import {
   cleanChildEnv,
   createTempHome,
-  reserveDistinctRandomPorts,
+  reservePortHandles,
 } from "./helpers/test-env.ts";
 import path from "node:path";
 import assert from "node:assert/strict";
@@ -12,9 +12,10 @@ import { describe, it } from "node:test";
 const repoRoot = process.cwd();
 
 async function setupHarnessTempHome() {
-  const [controlPort] = await reserveDistinctRandomPorts(1);
+  const [controlHandle] = await reservePortHandles(1);
+  const controlPort = controlHandle.port;
   const th = createTempHome("tamandua-harness-cwd-");
-  return { root: th.root, homeDir: th.homeDir, controlPort };
+  return { root: th.root, homeDir: th.homeDir, controlPort, controlHandle };
 }
 
 function writeMinimalWorkflow(homeDir: string, workflowId: string): void {
@@ -78,6 +79,7 @@ describe("working-directory-for-harness", () => {
       const harnessDir = path.join(temp.root, "project");
       fs.mkdirSync(harnessDir, { recursive: true });
 
+      await temp.controlHandle.close();
       const result = runNodeScript(
         `
           import { runWorkflow } from "./dist/installer/run.js";
@@ -146,6 +148,7 @@ describe("working-directory-for-harness", () => {
       assert.equal(result.hasJob, true);
       assert.equal(result.jobAgentId, `${"harness-explicit"}_dev`);
     } finally {
+      try { await temp.controlHandle.close(); } catch {}
       fs.rmSync(temp.root, { recursive: true, force: true });
     }
   });
@@ -157,6 +160,7 @@ describe("working-directory-for-harness", () => {
       const workflowId = "harness-default";
       writeMinimalWorkflow(temp.homeDir, workflowId);
 
+      await temp.controlHandle.close();
       const result = runNodeScript(
         `
           import { runWorkflow } from "./dist/installer/run.js";
@@ -195,6 +199,7 @@ describe("working-directory-for-harness", () => {
       assert.equal(result.resultDir, expected);
       assert.equal(result.contextDir, expected);
     } finally {
+      try { await temp.controlHandle.close(); } catch {}
       fs.rmSync(temp.root, { recursive: true, force: true });
     }
   });

@@ -28,7 +28,7 @@
  *
  * TEST ISOLATION:
  *   - Uses temp HOME isolation via createTempHome()
- *   - Uses reserveDistinctRandomPorts() — no default ports (3334/3338/3339)
+ *   - Uses port handle reservation via createTempHome() — no default ports (3334/3338/3339)
  *   - Daemon runs in isolated HOME/TAMANDUA_STATE_DIR
  *   - Worktree directories are created under the isolated HOME (os.homedir()
  *     respects HOME env var), so cleanupTempHome() removes them
@@ -75,7 +75,6 @@ import {
   isSuccessfulRunTerminalStatus,
   collectRunDiagnostics,
 } from "./helpers/e2e-helpers.ts";
-import { reserveDistinctRandomPorts } from "../tests/helpers/test-env.ts";
 import type { ChildProcess } from "node:child_process";
 
 const fixtureDir = path.join(process.cwd(), "e2e-tests", "fixtures", "sample-project");

@@ -70,6 +70,8 @@ async function startHermesScriptedEnvironment(
     baseEnv(env.homeDir, env.controlPort),
     `install ${workflowId}`,
   );
+  // Release port handles so the daemon can bind to the control port.
+  await Promise.all(env.portHandles.map((h) => h.close()));
   const daemon = await startIsolatedDaemon(
     env.homeDir,
     env.controlPort,
@@ -95,6 +97,8 @@ async function startHermesScriptedEnvironmentWithEnv(
     baseEnv(env.homeDir, env.controlPort),
     `install ${workflowId}`,
   );
+  // Release port handles so the daemon can bind to the control port.
+  await Promise.all(env.portHandles.map((h) => h.close()));
   const daemon = await startIsolatedDaemon(
     env.homeDir,
     env.controlPort,
@@ -558,6 +562,8 @@ describe("scripted-hermes full pipeline (real daemon/scheduler, zero tokens)", {
           baseEnv(env.homeDir, env.controlPort),
           "install do-now",
         );
+        // Release port handles so the daemon can bind to the control port.
+        await Promise.all(env.portHandles.map((h) => h.close()));
         const daemon = await startIsolatedDaemon(
           env.homeDir,
           env.controlPort,

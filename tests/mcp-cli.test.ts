@@ -15,10 +15,9 @@
  */
 
 import { describe, it } from "node:test";
-import { cleanChildEnv, createTempHome, reserveRandomPort } from "./helpers/test-env.ts";
+import { cleanChildEnv, createTempHome, reservePortHandle } from "./helpers/test-env.ts";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import http from "node:http";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -34,35 +33,6 @@ import { DEFAULT_MCP_PORT } from "../dist/server/mcp-server.js";
 // ═══════════════════════════════════════════════════════════════════
 // Helpers
 // ═══════════════════════════════════════════════════════════════════
-
-async function canBind(port: number): Promise<boolean> {
-  const server = http.createServer();
-
-  try {
-    await new Promise<void>((resolve, reject) => {
-      const onError = (err: Error) => {
-        server.off("listening", onListening);
-        reject(err);
-      };
-      const onListening = () => {
-        server.off("error", onError);
-        resolve();
-      };
-
-      server.once("error", onError);
-      server.once("listening", onListening);
-      server.listen(port, "127.0.0.1");
-    });
-
-    return true;
-  } catch {
-    return false;
-  } finally {
-    if (server.listening) {
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-    }
-  }
-}
 
 async function waitForHttpUp(url: string, timeoutMs = 7000): Promise<Response> {
   const startedAt = Date.now();
@@ -202,7 +172,8 @@ function cleanupIsolatedMcpFiles(homeDir: string): void {
 describe("tamandua mcp CLI", { concurrency: 1 }, () => {
   // AC 5: tamandua mcp status shows not running when MCP is down
   it("mcp status shows not running when MCP is down", async () => {
-    const unusedPort = await reserveRandomPort();
+    const portHandle = await reservePortHandle();
+    const unusedPort = portHandle.port;
     const tempHome = createTempHome(TMP_PREFIX).homeDir;
     cleanupIsolatedMcpFiles(tempHome);
     try {
@@ -218,6 +189,7 @@ describe("tamandua mcp CLI", { concurrency: 1 }, () => {
     assert.ok(stdout.includes("not running"), `Expected "not running" in output, got: ${stdout}`);
     assert.equal(cleanStderr(stderr), "");
     } finally {
+      portHandle.close().catch(() => {});
       stopIsolatedMcp(tempHome);
     }
   });
@@ -229,15 +201,13 @@ describe("tamandua mcp CLI", { concurrency: 1 }, () => {
       return;
     }
 
-    const mcpPort = await reserveRandomPort();
-    if (!(await canBind(mcpPort))) {
-      t.skip(`Port ${mcpPort} is already in use`);
-      return;
-    }
+    const portHandle = await reservePortHandle();
+    const mcpPort = portHandle.port;
 
     const tempHome = createTempHome(TMP_PREFIX).homeDir;
     cleanupIsolatedMcpFiles(tempHome);
     try {
+    await portHandle.close();
 
     const { stdout, stderr, exitCode } = await runCli(["mcp", "start", "--port", String(mcpPort)], tempHome);
 
@@ -257,6 +227,7 @@ describe("tamandua mcp CLI", { concurrency: 1 }, () => {
     assert.ok(res.status >= 200 && res.status < 500);
 
     } finally {
+      portHandle.close().catch(() => {});
       stopIsolatedMcp(tempHome);
     }
   });
@@ -268,15 +239,13 @@ describe("tamandua mcp CLI", { concurrency: 1 }, () => {
       return;
     }
 
-    const customPort = await reserveRandomPort();
-    if (!(await canBind(customPort))) {
-      t.skip(`Port ${customPort} is already in use`);
-      return;
-    }
+    const portHandle = await reservePortHandle();
+    const customPort = portHandle.port;
 
     const tempHome = createTempHome(TMP_PREFIX).homeDir;
     cleanupIsolatedMcpFiles(tempHome);
     try {
+    await portHandle.close();
 
     const { stdout, stderr, exitCode } = await runCli(["mcp", "start", "--port", String(customPort)], tempHome);
 
@@ -291,6 +260,7 @@ describe("tamandua mcp CLI", { concurrency: 1 }, () => {
     assert.equal(readIsolatedMcpPort(tempHome), customPort);
 
     } finally {
+      portHandle.close().catch(() => {});
       stopIsolatedMcp(tempHome);
     }
   });
@@ -302,15 +272,13 @@ describe("tamandua mcp CLI", { concurrency: 1 }, () => {
       return;
     }
 
-    const mcpPort = await reserveRandomPort();
-    if (!(await canBind(mcpPort))) {
-      t.skip(`Port ${mcpPort} is already in use`);
-      return;
-    }
+    const portHandle = await reservePortHandle();
+    const mcpPort = portHandle.port;
 
     const tempHome = createTempHome(TMP_PREFIX).homeDir;
     cleanupIsolatedMcpFiles(tempHome);
     try {
+    await portHandle.close();
 
     // First start
     const first = await runCli(["mcp", "start", "--port", String(mcpPort)], tempHome);
@@ -333,6 +301,7 @@ describe("tamandua mcp CLI", { concurrency: 1 }, () => {
     assert.ok(!second.stdout.includes("MCP server started"));
 
     } finally {
+      portHandle.close().catch(() => {});
       stopIsolatedMcp(tempHome);
     }
   });
@@ -344,15 +313,13 @@ describe("tamandua mcp CLI", { concurrency: 1 }, () => {
       return;
     }
 
-    const mcpPort = await reserveRandomPort();
-    if (!(await canBind(mcpPort))) {
-      t.skip(`Port ${mcpPort} is already in use`);
-      return;
-    }
+    const portHandle = await reservePortHandle();
+    const mcpPort = portHandle.port;
 
     const tempHome = createTempHome(TMP_PREFIX).homeDir;
     cleanupIsolatedMcpFiles(tempHome);
     try {
+    await portHandle.close();
 
     // Start MCP
     const start = await runCli(["mcp", "start", "--port", String(mcpPort)], tempHome);
@@ -376,6 +343,7 @@ describe("tamandua mcp CLI", { concurrency: 1 }, () => {
     assert.equal(cleanStderr(stderr), "");
 
     } finally {
+      portHandle.close().catch(() => {});
       stopIsolatedMcp(tempHome);
     }
   });
@@ -387,15 +355,13 @@ describe("tamandua mcp CLI", { concurrency: 1 }, () => {
       return;
     }
 
-    const mcpPort = await reserveRandomPort();
-    if (!(await canBind(mcpPort))) {
-      t.skip(`Port ${mcpPort} is already in use`);
-      return;
-    }
+    const portHandle = await reservePortHandle();
+    const mcpPort = portHandle.port;
 
     const tempHome = createTempHome(TMP_PREFIX).homeDir;
     cleanupIsolatedMcpFiles(tempHome);
     try {
+    await portHandle.close();
 
     // Start MCP
     const start = await runCli(["mcp", "start", "--port", String(mcpPort)], tempHome);
@@ -423,6 +389,7 @@ describe("tamandua mcp CLI", { concurrency: 1 }, () => {
     assert.equal(fs.existsSync(getIsolatedMcpPidFile(tempHome)), false, "PID file should be removed after stop");
 
     } finally {
+      portHandle.close().catch(() => {});
       stopIsolatedMcp(tempHome);
     }
   });
@@ -450,15 +417,13 @@ describe("tamandua mcp CLI", { concurrency: 1 }, () => {
       return;
     }
 
-    const customPort = await reserveRandomPort();
-    if (!(await canBind(customPort))) {
-      t.skip(`Port ${customPort} is already in use`);
-      return;
-    }
+    const portHandle = await reservePortHandle();
+    const customPort = portHandle.port;
 
     const tempHome = createTempHome(TMP_PREFIX).homeDir;
     cleanupIsolatedMcpFiles(tempHome);
     try {
+    await portHandle.close();
 
     // --port flag placed after the start subcommand
     const { stdout, exitCode } = await runCli(["mcp", "start", "--port", String(customPort)], tempHome);
@@ -471,6 +436,7 @@ describe("tamandua mcp CLI", { concurrency: 1 }, () => {
     assert.ok(res.status >= 200 && res.status < 500);
 
     } finally {
+      portHandle.close().catch(() => {});
       stopIsolatedMcp(tempHome);
     }
   });

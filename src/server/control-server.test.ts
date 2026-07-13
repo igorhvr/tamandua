@@ -8,7 +8,7 @@
 import { describe, it, before, after, beforeEach, afterEach } from "node:test";
 import {
   cleanChildEnv,
-  reserveDistinctRandomPorts,
+  reservePortHandles,
   createTempHome,
 } from "../../tests/helpers/test-env.ts";
 import assert from "node:assert/strict";
@@ -107,39 +107,18 @@ async function waitForExit(child: ChildProcess, timeoutMs = 7000): Promise<numbe
   });
 }
 
-async function canBind(port: number): Promise<boolean> {
-  const server = http.createServer();
-  try {
-    await new Promise<void>((resolve, reject) => {
-      server.once("error", reject);
-      server.once("listening", () => resolve());
-      server.listen(port, "127.0.0.1");
-    });
-    return true;
-  } catch {
-    return false;
-  } finally {
-    if (server.listening) {
-      await new Promise<void>((r) => server.close(() => r()));
-    }
-  }
-}
-
 describe("daemon control plane", { concurrency: 1 }, () => {
   let tempHome: string;
   let daemon: ChildProcess | undefined;
   let secret: string | undefined;
 
   before(async (t) => {
-    [dashboardPort, controlPort] = await reserveDistinctRandomPorts(2);
-    if (!(await canBind(dashboardPort))) {
-      console.warn(`Port ${dashboardPort} is in use; skipping control plane tests`);
-      return;
-    }
-    if (!(await canBind(controlPort))) {
-      console.warn(`Port ${controlPort} is in use; skipping control plane tests`);
-      return;
-    }
+    const handles = await reservePortHandles(2);
+    dashboardPort = handles[0].port;
+    controlPort = handles[1].port;
+
+    // Close handles just before daemon spawn so the daemon can bind.
+    await Promise.all(handles.map(h => h.close()));
 
     tempHome = tamanduaTempDir("tamandua-control-home-");
     daemon = spawn("node", [DAEMON_SCRIPT, String(dashboardPort)], {
@@ -1323,7 +1302,12 @@ describe("suite control-plane endpoints", { concurrency: 1 }, () => {
     fs.mkdirSync(path.dirname(path.join(stateDir, "daemon-secret")), { recursive: true });
     fs.writeFileSync(path.join(stateDir, "daemon-secret"), secret, "utf-8");
 
-    [controlPort] = await reserveDistinctRandomPorts(1);
+    const [ctrlHandle] = await reservePortHandles(1);
+    controlPort = ctrlHandle.port;
+
+    // Close handle just before createControlServer binds.
+    await ctrlHandle.close();
+
     process.env.TAMANDUA_CONTROL_PORT = String(controlPort);
 
     const { createControlServer } = await import("../../dist/server/control-server.js");

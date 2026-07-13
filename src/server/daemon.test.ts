@@ -7,7 +7,7 @@ import path from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
-import { cleanChildEnv, reserveRandomPort, createTempHome } from "../../tests/helpers/test-env.ts";
+import { cleanChildEnv, reservePortHandle, createTempHome } from "../../tests/helpers/test-env.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DAEMON_SCRIPT = path.resolve(__dirname, "..", "..", "dist", "server", "daemon.js");
@@ -102,45 +102,14 @@ async function waitForHttpDown(url: string, timeoutMs = 30000): Promise<void> {
   throw new Error(`Timed out waiting for ${url} to become unreachable`);
 }
 
-async function canBind(port: number): Promise<boolean> {
-  const server = http.createServer();
-
-  try {
-    await new Promise<void>((resolve, reject) => {
-      const onError = (err: Error) => {
-        server.off("listening", onListening);
-        reject(err);
-      };
-      const onListening = () => {
-        server.off("error", onError);
-        resolve();
-      };
-
-      server.once("error", onError);
-      server.once("listening", onListening);
-      server.listen(port, "127.0.0.1");
-    });
-
-    return true;
-  } catch {
-    return false;
-  } finally {
-    if (server.listening) {
-      await closeServer(server);
-    }
-  }
-}
-
 
 describe("version check integration", () => {
   it("daemon bootstrap triggers version check and writes version-status.json", async (t) => {
-    const controlPort = await reserveRandomPort();
-    if (!(await canBind(controlPort))) {
-      t.skip(`Port ${controlPort} is already in use`);
-      return;
-    }
+    const controlPortHandle = await reservePortHandle();
+    const controlPort = controlPortHandle.port;
 
     const { homeDir: tempHome } = createTempHome("tamandua-daemon-home-");
+    await controlPortHandle.close();
     const { child } = spawnDaemon(tempHome, controlPort);
 
     try {
@@ -179,13 +148,11 @@ describe("version check integration", () => {
   });
 
   it("daemon startup not delayed by version check", async (t) => {
-    const controlPort = await reserveRandomPort();
-    if (!(await canBind(controlPort))) {
-      t.skip(`Port ${controlPort} is already in use`);
-      return;
-    }
+    const controlPortHandle = await reservePortHandle();
+    const controlPort = controlPortHandle.port;
 
     const { homeDir: tempHome } = createTempHome("tamandua-daemon-home-");
+    await controlPortHandle.close();
 
     const startTime = Date.now();
     const { child } = spawnDaemon(tempHome, controlPort);
@@ -211,13 +178,11 @@ describe("version check integration", () => {
   });
 
   it("daemon shuts down cleanly even when version check interval is active", async (t) => {
-    const controlPort = await reserveRandomPort();
-    if (!(await canBind(controlPort))) {
-      t.skip(`Port ${controlPort} is already in use`);
-      return;
-    }
+    const controlPortHandle = await reservePortHandle();
+    const controlPort = controlPortHandle.port;
 
     const { homeDir: tempHome } = createTempHome("tamandua-daemon-home-");
+    await controlPortHandle.close();
     const { child } = spawnDaemon(tempHome, controlPort);
 
     try {
@@ -242,13 +207,11 @@ describe("version check integration", () => {
 
 describe("daemon (MCP decoupled)", { concurrency: 1 }, () => {
   it("starts daemon control plane by default (no --with-mcp), MCP port is NOT reachable", async (t) => {
-    const controlPort = await reserveRandomPort();
-    if (!(await canBind(controlPort))) {
-      t.skip(`Port ${controlPort} is already in use`);
-      return;
-    }
+    const controlPortHandle = await reservePortHandle();
+    const controlPort = controlPortHandle.port;
 
     const { homeDir: tempHome } = createTempHome("tamandua-daemon-home-");
+    await controlPortHandle.close();
     const { child } = spawnDaemon(tempHome, controlPort);
 
     try {
@@ -272,18 +235,14 @@ describe("daemon (MCP decoupled)", { concurrency: 1 }, () => {
   });
 
   it("starts daemon + MCP with --with-mcp flag and shuts down both on SIGTERM", async (t) => {
-    const controlPort = await reserveRandomPort();
-    if (!(await canBind(controlPort))) {
-      t.skip(`Port ${controlPort} is already in use`);
-      return;
-    }
-    const mcpPort = await reserveRandomPort();
-    if (!(await canBind(mcpPort))) {
-      t.skip(`Port ${mcpPort} is already in use`);
-      return;
-    }
+    const controlPortHandle = await reservePortHandle();
+    const controlPort = controlPortHandle.port;
+    const mcpPortHandle = await reservePortHandle();
+    const mcpPort = mcpPortHandle.port;
 
     const { homeDir: tempHome } = createTempHome("tamandua-daemon-home-");
+    await controlPortHandle.close();
+    await mcpPortHandle.close();
     const { child } = spawnDaemon(tempHome, controlPort, ["--with-mcp", "--mcp-port", String(mcpPort)]);
 
     try {
@@ -308,15 +267,14 @@ describe("daemon (MCP decoupled)", { concurrency: 1 }, () => {
   });
 
   it("--with-mcp --mcp-port N starts MCP on custom port", async (t) => {
-    const customMcpPort = await reserveRandomPort();
-    const controlPort = await reserveRandomPort();
-
-    if (!(await canBind(controlPort))) {
-      t.skip(`Port ${controlPort} is already in use`);
-      return;
-    }
+    const customMcpPortHandle = await reservePortHandle();
+    const customMcpPort = customMcpPortHandle.port;
+    const controlPortHandle = await reservePortHandle();
+    const controlPort = controlPortHandle.port;
 
     const { homeDir: tempHome } = createTempHome("tamandua-daemon-home-");
+    await controlPortHandle.close();
+    await customMcpPortHandle.close();
     const { child } = spawnDaemon(tempHome, controlPort, [
       "--with-mcp",
       "--mcp-port",
@@ -342,7 +300,8 @@ describe("daemon (MCP decoupled)", { concurrency: 1 }, () => {
   });
 
   it("fails startup when MCP port is occupied and --with-mcp is used, daemon is also stopped", async (t) => {
-    const blockerPort = await reserveRandomPort();
+    const blockerPortHandle = await reservePortHandle();
+    const blockerPort = blockerPortHandle.port;
     const blocker = http.createServer((_req, res) => {
       res.writeHead(200, { "content-type": "text/plain" });
       res.end("occupied");
@@ -351,11 +310,14 @@ describe("daemon (MCP decoupled)", { concurrency: 1 }, () => {
     // Bind the wildcard address like the MCP server does: macOS (unlike
     // Linux) lets a wildcard bind coexist with a 127.0.0.1-specific one,
     // so a localhost-only blocker would not produce EADDRINUSE there.
+    await blockerPortHandle.close();
     await new Promise<void>((resolve) => blocker.listen(blockerPort, () => resolve()));
 
-    const controlPort = await reserveRandomPort();
+    const controlPortHandle = await reservePortHandle();
+    const controlPort = controlPortHandle.port;
 
     const { homeDir: tempHome } = createTempHome("tamandua-daemon-home-");
+    await controlPortHandle.close();
     const { child, getOutput } = spawnDaemon(tempHome, controlPort, ["--with-mcp", "--mcp-port", String(blockerPort)]);
 
     try {

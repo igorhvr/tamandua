@@ -7,7 +7,7 @@ import { spawnSync } from "node:child_process";
 
 import { runWorkflow } from "../../dist/installer/run.js";
 import { getPidFile, getPortFile, stopDaemon } from "../../dist/server/daemonctl.js";
-import { reserveRandomPort } from "../../tests/helpers/test-env.ts";
+import { reservePortHandles, reservePortHandle, type PortHandle } from "../../tests/helpers/test-env.ts";
 import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
 import { getRunEvents } from "../../dist/installer/events.js";
 
@@ -88,6 +88,7 @@ describe("runWorkflow", () => {
   let origDbPath: string | undefined;
   let origStateDir: string | undefined;
   let origWorktreeRoot: string | undefined;
+  let portHandles: PortHandle[] = [];
 
   before(async () => {
     tempHome = tamanduaTempDir("tamandua-run-");
@@ -98,11 +99,9 @@ describe("runWorkflow", () => {
     origWorktreeRoot = process.env.TAMANDUA_WORKTREE_ROOT;
 
     const tamanduaDir = path.join(tempHome, ".tamandua");
-    const dashboardPort = await reserveRandomPort();
-    let controlPort = await reserveRandomPort();
-    while (controlPort === dashboardPort) {
-      controlPort = await reserveRandomPort();
-    }
+    portHandles = await reservePortHandles(2);
+    const dashboardPort = portHandles[0].port;
+    const controlPort = portHandles[1].port;
     fs.mkdirSync(tamanduaDir, { recursive: true });
     fs.writeFileSync(path.join(tamanduaDir, "port"), String(dashboardPort), "utf-8");
 
@@ -111,6 +110,11 @@ describe("runWorkflow", () => {
     process.env.TAMANDUA_DB_PATH = path.join(tamanduaDir, "tamandua.db");
     process.env.TAMANDUA_STATE_DIR = tamanduaDir;
     process.env.TAMANDUA_WORKTREE_ROOT = path.join(tamanduaDir, "worktrees");
+
+    // Release port handles so the daemon can bind to these ports.
+    // The handles protected the ports during setup.
+    await Promise.all(portHandles.map((h) => h.close()));
+    portHandles = [];
   });
 
   after(async () => {
@@ -146,6 +150,7 @@ describe("runWorkflow", () => {
     // Retries absorb stragglers still writing into the temp home during
     // teardown (ENOTEMPTY otherwise, seen on macOS). Give the daemon's
     // log/SQLite WAL stragglers a moment to finish writing.
+    await Promise.all(portHandles.map((h) => h.close()));
     await new Promise((resolve) => setTimeout(resolve, 250));
     fs.rmSync(tempHome, { recursive: true, force: true, maxRetries: 15, retryDelay: 200 });
   });
@@ -812,7 +817,8 @@ describe("runWorkflow", () => {
       writeMinimalWorkflow(tempHome, workflowId, "direct");
 
       // Point to a dead control port and set a short probe timeout
-      const deadPort = await reserveRandomPort();
+      const deadPortHandle = await reservePortHandle();
+      const deadPort = deadPortHandle.port;
       const prevControlPort = process.env.TAMANDUA_CONTROL_PORT;
       const prevProbeOverride = process.env.TAMANDUA_CONTROL_PROBE_TIMEOUT_OVERRIDE;
       process.env.TAMANDUA_CONTROL_PORT = String(deadPort);
@@ -844,6 +850,7 @@ describe("runWorkflow", () => {
         } else {
           delete process.env.TAMANDUA_CONTROL_PROBE_TIMEOUT_OVERRIDE;
         }
+        await deadPortHandle.close();
       }
 
       // Must not throw — result returned normally

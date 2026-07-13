@@ -7,7 +7,7 @@
  * cases.
  */
 import { describe, it, before, after, beforeEach, afterEach } from "node:test";
-import { cleanChildEnv, reserveDistinctRandomPorts, createTempHome } from "../../tests/helpers/test-env.ts";
+import { cleanChildEnv, reservePortHandles, createTempHome } from "../../tests/helpers/test-env.ts";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import http from "node:http";
@@ -104,39 +104,20 @@ async function waitForExit(child: ChildProcess, timeoutMs = 7000): Promise<numbe
   });
 }
 
-async function canBind(port: number): Promise<boolean> {
-  const server = http.createServer();
-  try {
-    await new Promise<void>((resolve, reject) => {
-      server.once("error", reject);
-      server.once("listening", () => resolve());
-      server.listen(port, "127.0.0.1");
-    });
-    return true;
-  } catch {
-    return false;
-  } finally {
-    if (server.listening) {
-      await new Promise<void>((r) => server.close(() => r()));
-    }
-  }
-}
-
 describe("control client", { concurrency: 1 }, () => {
   let tempHome: string;
   let daemon: ChildProcess | undefined;
   let secret: string | undefined;
+  let portHandles: any[] = [];
 
   before(async (t) => {
-    [dashboardPort, controlPort] = await reserveDistinctRandomPorts(2);
-    if (!(await canBind(dashboardPort))) {
-      console.warn(`Port ${dashboardPort} is in use; skipping control client tests`);
-      return;
-    }
-    if (!(await canBind(controlPort))) {
-      console.warn(`Port ${controlPort} is in use; skipping control client tests`);
-      return;
-    }
+    portHandles = await reservePortHandles(2);
+    dashboardPort = portHandles[0].port;
+    controlPort = portHandles[1].port;
+
+    // Close handles just before daemon spawn so the daemon can bind.
+    await Promise.all(portHandles.map(h => h.close()));
+    portHandles = [];
 
     tempHome = tamanduaTempDir("tamandua-cc-home-");
     daemon = spawn("node", [DAEMON_SCRIPT, String(dashboardPort)], {
@@ -165,6 +146,10 @@ describe("control client", { concurrency: 1 }, () => {
           try { process.kill(daemon.pid, "SIGKILL"); } catch { /* ignore */ }
         }
       }
+    }
+    if (portHandles.length > 0) {
+      await Promise.all(portHandles.map(h => h.close()));
+      portHandles = [];
     }
     if (tempHome) {
       fs.rmSync(tempHome, { recursive: true, force: true });
@@ -412,7 +397,12 @@ describe("suite control-plane client", { concurrency: 1 }, () => {
     secret = crypto.randomBytes(16).toString("hex");
     fs.writeFileSync(path.join(stateDir, "daemon-secret"), secret, "utf-8");
 
-    [controlPort] = await reserveDistinctRandomPorts(1);
+    const [ctrlHandle] = await reservePortHandles(1);
+    controlPort = ctrlHandle.port;
+
+    // Close handle just before createControlServer binds.
+    await ctrlHandle.close();
+
     process.env.TAMANDUA_CONTROL_PORT = String(controlPort);
 
     const { createControlServer } = await import("../../dist/server/control-server.js");

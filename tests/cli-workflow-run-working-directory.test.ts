@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import {
   cleanChildEnv,
-  reserveDistinctRandomPorts,
+  reservePortHandles,
 } from "./helpers/test-env.ts";
 import path from "node:path";
 import { tamanduaTempDir } from "../src/lib/temp-dir.ts";
@@ -13,13 +13,15 @@ import { describe, it } from "node:test";
 const cliPath = path.resolve(process.cwd(), "dist", "cli", "cli.js");
 
 async function createTempEnv() {
-  const [controlPort, dashboardPort] = await reserveDistinctRandomPorts(2);
+  const handles = await reservePortHandles(2);
+  const controlPort = handles[0].port;
+  const dashboardPort = handles[1].port;
   const root = tamanduaTempDir("tamandua-cli-run-cwd-");
   const homeDir = path.join(root, "home");
   const tamanduaDir = path.join(homeDir, ".tamandua");
   fs.mkdirSync(tamanduaDir, { recursive: true });
   fs.writeFileSync(path.join(tamanduaDir, "port"), String(dashboardPort), "utf-8");
-  return { root, homeDir, tamanduaDir, controlPort, dashboardPort };
+  return { root, homeDir, tamanduaDir, controlPort, dashboardPort, portHandles: handles };
 }
 
 function writeMinimalWorkflow(homeDir: string, workflowId: string): void {
@@ -135,6 +137,7 @@ describe("CLI workflow run working-directory-for-harness", () => {
       const harnessDir = path.join(env.root, "remote-workdir");
       fs.mkdirSync(harnessDir, { recursive: true });
 
+      await Promise.all(env.portHandles.map(h => h.close()));
       const { stdout, stderr } = await runCliUntilOutput(
         [
           "workflow",
@@ -181,6 +184,7 @@ describe("CLI workflow run working-directory-for-harness", () => {
       );
       assert.ok(row!.scheduling_requested_at, "expected scheduling_requested_at to be set");
     } finally {
+      try { await Promise.all(env.portHandles.map(h => h.close())); } catch {}
       await runCliToExit(["dashboard", "stop"], {
         HOME: env.homeDir,
         TAMANDUA_CONTROL_PORT: String(env.controlPort),
@@ -197,6 +201,7 @@ describe("CLI workflow run working-directory-for-harness", () => {
       writeMinimalWorkflow(env.homeDir, workflowId);
 
       const missingDir = path.join(env.root, "missing-dir");
+      await Promise.all(env.portHandles.map(h => h.close()));
       const result = await runCliToExit(
         [
           "workflow",
@@ -213,6 +218,7 @@ describe("CLI workflow run working-directory-for-harness", () => {
       assert.match(result.stderr, /working-directory-for-harness does not exist/i);
       assert.ok(!result.stdout.includes("Run:"), "should not print successful run output");
     } finally {
+      try { await Promise.all(env.portHandles.map(h => h.close())); } catch {}
       await runCliToExit(["dashboard", "stop"], {
         HOME: env.homeDir,
         TAMANDUA_CONTROL_PORT: String(env.controlPort),
@@ -231,10 +237,11 @@ describe("CLI workflow run working-directory-for-harness", () => {
     // Reserve a fresh port and bind a dummy listener to it so the
     // daemon cannot bind its control plane there. The probe will
     // always time out because our listener doesn't respond with 200.
-    const { reserveRandomPort } = await import(
+    const { reservePortHandle } = await import(
       "./helpers/test-env.ts"
     );
-    const blockerPort = await reserveRandomPort();
+    const blockerPortHandle = await reservePortHandle();
+    const blockerPort = blockerPortHandle.port;
     // Start a dummy server that accepts but returns 503 — keeps
     // the port occupied so the daemon cannot bind.
     const http = await import("node:http");
@@ -242,6 +249,7 @@ describe("CLI workflow run working-directory-for-harness", () => {
       res.writeHead(503);
       res.end("blocked");
     });
+    await blockerPortHandle.close();
     await new Promise<void>((resolve, reject) => {
       dummyServer.listen(blockerPort, "127.0.0.1", resolve);
       dummyServer.on("error", reject);
@@ -301,6 +309,8 @@ describe("CLI workflow run working-directory-for-harness", () => {
       assert.ok(row, "run row should exist in DB");
       assert.equal(row!.status, "running", "run status should be 'running'");
     } finally {
+      try { await blockerPortHandle.close(); } catch {}
+      try { await Promise.all(env.portHandles.map(h => h.close())); } catch {}
       dummyServer.close();
       await runCliToExit(["dashboard", "stop"], {
         HOME: env.homeDir,
@@ -318,6 +328,7 @@ describe("CLI workflow run working-directory-for-harness", () => {
     const env = await createTempEnv();
 
     try {
+      await Promise.all(env.portHandles.map(h => h.close()));
       const result = await runCliToExit(
         ["workflow", "run", "nonexistent-workflow-id", "Should fail"],
         { HOME: env.homeDir, TAMANDUA_CONTROL_PORT: String(env.controlPort) },
@@ -334,6 +345,7 @@ describe("CLI workflow run working-directory-for-harness", () => {
         "should not print successful run output for invalid workflow",
       );
     } finally {
+      try { await Promise.all(env.portHandles.map(h => h.close())); } catch {}
       await runCliToExit(["dashboard", "stop"], {
         HOME: env.homeDir,
         TAMANDUA_CONTROL_PORT: String(env.controlPort),

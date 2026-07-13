@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import { cleanChildEnv, reserveRandomPort } from "./helpers/test-env.ts";
+import { cleanChildEnv, reservePortHandles } from "./helpers/test-env.ts";
 import path from "node:path";
 import { tamanduaTempDir } from "../src/lib/temp-dir.ts";
 import assert from "node:assert/strict";
@@ -27,11 +27,10 @@ async function createTempEnv() {
   const dbPath = path.join(tamanduaDir, "tamandua.db");
   const worktreeRoot = path.join(tamanduaDir, "worktrees");
   fs.mkdirSync(tamanduaDir, { recursive: true });
-  const dashboardPort = await reserveRandomPort();
-  let controlPort = await reserveRandomPort();
-  while (controlPort === dashboardPort) {
-    controlPort = await reserveRandomPort();
-  }
+  const handles = await reservePortHandles(2);
+  const dashboardPort = handles[0].port;
+  const controlPort = handles[1].port;
+  await Promise.all(handles.map(h => h.close()));
   fs.writeFileSync(path.join(tamanduaDir, "port"), String(dashboardPort), "utf-8");
   return { root, homeDir, tamanduaDir, dbPath, worktreeRoot, controlPort, dashboardPort };
 }

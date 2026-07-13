@@ -14,7 +14,7 @@ import http from "node:http";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { cleanChildEnv, createTempHome, reserveDistinctRandomPorts } from "../../tests/helpers/test-env.ts";
+import { cleanChildEnv, createTempHome, reservePortHandles } from "../../tests/helpers/test-env.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SHIM_PATH = path.resolve(__dirname, "..", "..", "dist", "suite", "shim.js");
@@ -131,7 +131,11 @@ async function setupControlEnv(th: { homeDir: string; tamanduaDir: string }): Pr
 
   writeFileSync(join(stateDir, "daemon-secret"), secret);
 
-  const [controlPort] = await reserveDistinctRandomPorts(1);
+  const [ctrlHandle] = await reservePortHandles(1);
+  const controlPort = ctrlHandle.port;
+
+  // Close handle just before control server binds.
+  await ctrlHandle.close();
 
   const { createControlServer } = await import(
     "../../dist/server/control-server.js"

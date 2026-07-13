@@ -15,11 +15,10 @@ import fs from "node:fs";
 import {
   cleanChildEnv,
   createTempHome,
-  reserveDistinctRandomPorts,
-  reserveRandomPort,
+  reservePortHandles,
+  reservePortHandle,
 } from "./helpers/test-env.ts";
 import path from "node:path";
-import http from "node:http";
 import assert from "node:assert/strict";
 import { spawn, execSync } from "node:child_process";
 import { once } from "node:events";
@@ -46,13 +45,16 @@ async function createTempEnv(): Promise<{
   homeDir: string;
   controlPort: number;
   dashboardPort: number;
+  portHandles: Awaited<ReturnType<typeof reservePortHandles>>;
 }> {
-  const [controlPort, dashboardPort] = await reserveDistinctRandomPorts(2);
+  const portHandles = await reservePortHandles(2);
+  const controlPort = portHandles[0].port;
+  const dashboardPort = portHandles[1].port;
   const th = createTempHome("tamandua-mcp-lifecycle-");
   const stateDir = path.join(th.root, "state");
   fs.mkdirSync(stateDir, { recursive: true });
   fs.writeFileSync(path.join(th.tamanduaDir, "port"), String(dashboardPort), "utf-8");
-  return { root: th.root, stateDir, homeDir: th.homeDir, controlPort, dashboardPort };
+  return { root: th.root, stateDir, homeDir: th.homeDir, controlPort, dashboardPort, portHandles };
 }
 
 function writeMinimalWorkflow(stateDir: string, workflowId: string): void {
@@ -99,32 +101,6 @@ async function runCli(args: string[], env: Record<string, string>): Promise<CliR
 
   const [code] = (await once(child, "exit")) as [number | null, NodeJS.Signals | null];
   return { code, stdout, stderr };
-}
-
-async function canBind(port: number): Promise<boolean> {
-  const server = http.createServer();
-  try {
-    await new Promise<void>((resolve, reject) => {
-      const onError = (err: Error) => {
-        server.off("listening", onListening);
-        reject(err);
-      };
-      const onListening = () => {
-        server.off("error", onError);
-        resolve();
-      };
-      server.once("error", onError);
-      server.once("listening", onListening);
-      server.listen(port, "127.0.0.1");
-    });
-    return true;
-  } catch {
-    return false;
-  } finally {
-    if (server.listening) {
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-    }
-  }
 }
 
 async function waitForHttpUp(
@@ -327,11 +303,8 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
       return;
     }
 
-    const mcpPort = await reserveRandomPort();
-
-    if (!(await canBind(mcpPort))) {
-      assert.fail(`Port ${mcpPort} is already in use — likely a leaked test process from a prior run. Check: lsof -i :${mcpPort}`);
-    }
+    const portHandle = await reservePortHandle();
+    const mcpPort = portHandle.port;
 
     const tempEnv = await createTempEnv();
     const cliEnv = {
@@ -341,6 +314,9 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
     };
 
     try {
+      // Release the port handle so MCP can bind
+      await portHandle.close();
+
       // Start MCP on the reserved random port
       const start = await runCli(["mcp", "start", "--port", String(mcpPort)], cliEnv);
       assert.equal(start.code, 0, `MCP start failed: ${cleanStderr(start.stderr) || start.stdout}`);
@@ -387,6 +363,9 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
 
     } finally {
       await runCli(["mcp", "stop"], cliEnv);
+      await Promise.all(tempEnv.portHandles.map((h: any) => h.close()));
+      // portHandle already closed before MCP start; safety close
+      try { await portHandle.close(); } catch {}
     }
   });
 
@@ -396,7 +375,8 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
       return;
     }
 
-    const mcpPort = await reserveRandomPort();
+    const portHandle = await reservePortHandle();
+    const mcpPort = portHandle.port;
     const tempEnv = await createTempEnv();
     const cliEnv = {
       HOME: tempEnv.homeDir,
@@ -406,6 +386,9 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
 
     try {
       writeMinimalWorkflow(tempEnv.stateDir, "mcp-run-start");
+
+      // Release the port handle so MCP can bind
+      await portHandle.close();
 
       const start = await runCli(["mcp", "start", "--port", String(mcpPort)], cliEnv);
       assert.equal(start.code, 0, `MCP start failed: ${cleanStderr(start.stderr) || start.stdout}`);
@@ -465,6 +448,9 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
       assert.equal(startResult.structuredContent!.run!.workingDirectoryForHarness, path.resolve(harnessDir));
     } finally {
       await runCli(["mcp", "stop"], cliEnv);
+      await Promise.all(tempEnv.portHandles.map((h: any) => h.close()));
+      // portHandle already closed before MCP start; safety close
+      try { await portHandle.close(); } catch {}
     }
   });
 
@@ -477,11 +463,8 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
       return;
     }
 
-    const mcpPort = await reserveRandomPort();
-
-    if (!(await canBind(mcpPort))) {
-      assert.fail(`Port ${mcpPort} is already in use — likely a leaked test process from a prior run. Check: lsof -i :${mcpPort}`);
-    }
+    const portHandle = await reservePortHandle();
+    const mcpPort = portHandle.port;
 
     const tempEnv = await createTempEnv();
     const cliEnv = {
@@ -490,7 +473,13 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
       TAMANDUA_CONTROL_PORT: String(tempEnv.controlPort),
     };
 
+    const unusedPortHandle = await reservePortHandle();
+    const unusedPort = unusedPortHandle.port;
+
     try {
+      // Release the mcp port handle so MCP can bind
+      await portHandle.close();
+
       // Start MCP
       const start = await runCli(["mcp", "start", "--port", String(mcpPort)], cliEnv);
       assert.equal(start.code, 0);
@@ -515,7 +504,6 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
       // After stop cleans up the port file, readMcpPort falls back to the default
       // port (3338), which may have a production MCP. Write an unused port so the
       // probe correctly reports DOWN.
-      const unusedPort = await reserveRandomPort();
       const portDir = path.join(tempEnv.homeDir, ".tamandua");
       fs.mkdirSync(portDir, { recursive: true });
       fs.writeFileSync(path.join(portDir, "mcp-port"), String(unusedPort), "utf-8");
@@ -537,6 +525,10 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
 
     } finally {
       await runCli(["mcp", "stop"], cliEnv);
+      await Promise.all(tempEnv.portHandles.map((h: any) => h.close()));
+      // portHandle already closed before MCP start; safety close
+      try { await portHandle.close(); } catch {}
+      await unusedPortHandle.close();
     }
   });
 
@@ -549,11 +541,8 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
       return;
     }
 
-    const customPort = await reserveRandomPort();
-
-    if (!(await canBind(customPort))) {
-      assert.fail(`Port ${customPort} is already in use — likely a leaked test process from a prior run. Check: lsof -i :${customPort}`);
-    }
+    const portHandle = await reservePortHandle();
+    const customPort = portHandle.port;
 
     const tempEnv = await createTempEnv();
     const cliEnv = {
@@ -563,6 +552,9 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
     };
 
     try {
+      // Release the port handle so MCP can bind
+      await portHandle.close();
+
       // Start MCP on a custom port
       const start = await runCli(["mcp", "start", "--port", String(customPort)], cliEnv);
       assert.equal(start.code, 0, `MCP start on custom port failed: ${cleanStderr(start.stderr) || start.stdout}`);
@@ -584,6 +576,9 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
 
     } finally {
       await runCli(["mcp", "stop"], cliEnv);
+      await Promise.all(tempEnv.portHandles.map((h: any) => h.close()));
+      // portHandle already closed before MCP start; safety close
+      try { await portHandle.close(); } catch {}
     }
   });
 
@@ -596,15 +591,10 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
       return;
     }
 
-    const mcpPort = await reserveRandomPort();
-    const dashboardPort = await reserveRandomPort();
-
-    if (!(await canBind(mcpPort))) {
-      assert.fail(`MCP port ${mcpPort} is already in use — likely a leaked test process from a prior run. Check: lsof -i :${mcpPort}`);
-    }
-    if (!(await canBind(dashboardPort))) {
-      assert.fail(`Dashboard port ${dashboardPort} is already in use — likely a leaked test process from a prior run. Check: lsof -i :${dashboardPort}`);
-    }
+    const mcpPortHandle = await reservePortHandle();
+    const mcpPort = mcpPortHandle.port;
+    const dashboardPortHandle = await reservePortHandle();
+    const dashboardPort = dashboardPortHandle.port;
 
     const tempEnv = await createTempEnv();
     const cliEnv = {
@@ -614,6 +604,9 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
     };
 
     try {
+      // Release the MCP port handle so MCP can bind
+      await mcpPortHandle.close();
+
       // 1. Start MCP first
       const mcpStart = await runCli(["mcp", "start", "--port", String(mcpPort)], cliEnv);
       assert.equal(mcpStart.code, 0, `MCP start failed: ${cleanStderr(mcpStart.stderr) || mcpStart.stdout}`);
@@ -622,6 +615,9 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
 
       // Verify MCP is reachable
       const { sessionId } = await mcpInitialize(mcpBaseUrl);
+
+      // Release the dashboard port handle so dashboard can bind
+      await dashboardPortHandle.close();
 
       // 2. Start dashboard while MCP is already running
       const dashStart = await runCli(["dashboard", "start", "--port", String(dashboardPort)], cliEnv);
@@ -656,6 +652,10 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
     } finally {
       await runCli(["dashboard", "stop"], cliEnv);
       await runCli(["mcp", "stop"], cliEnv);
+      await Promise.all(tempEnv.portHandles.map((h: any) => h.close()));
+      // handles already closed before spawns; safety close
+      try { await mcpPortHandle.close(); } catch {}
+      try { await dashboardPortHandle.close(); } catch {}
     }
   });
 
@@ -668,11 +668,8 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
       return;
     }
 
-    const mcpPort = await reserveRandomPort();
-
-    if (!(await canBind(mcpPort))) {
-      assert.fail(`Port ${mcpPort} is already in use — likely a leaked test process from a prior run. Check: lsof -i :${mcpPort}`);
-    }
+    const portHandle = await reservePortHandle();
+    const mcpPort = portHandle.port;
 
     const tempEnv = await createTempEnv();
     const cliEnv = {
@@ -682,6 +679,9 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
     };
 
     try {
+      // Release the port handle so MCP can bind
+      await portHandle.close();
+
       // Start MCP WITHOUT starting the dashboard
       const mcpStart = await runCli(["mcp", "start", "--port", String(mcpPort)], cliEnv);
       assert.equal(mcpStart.code, 0, `MCP start failed: ${cleanStderr(mcpStart.stderr) || mcpStart.stdout}`);
@@ -705,6 +705,9 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
 
     } finally {
       await runCli(["mcp", "stop"], cliEnv);
+      await Promise.all(tempEnv.portHandles.map((h: any) => h.close()));
+      // portHandle already closed before MCP start; safety close
+      try { await portHandle.close(); } catch {}
     }
   });
 
@@ -717,11 +720,8 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
       return;
     }
 
-    const mcpPort = await reserveRandomPort();
-
-    if (!(await canBind(mcpPort))) {
-      assert.fail(`Port ${mcpPort} is already in use — likely a leaked test process from a prior run. Check: lsof -i :${mcpPort}`);
-    }
+    const portHandle = await reservePortHandle();
+    const mcpPort = portHandle.port;
 
     const tempEnv = await createTempEnv();
     const cliEnv = {
@@ -733,7 +733,13 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
     // The MCP port file path in the isolated environment
     const isolatedPortFile = path.join(tempEnv.homeDir, ".tamandua", "mcp-port");
 
+    const secondPortHandle = await reservePortHandle();
+    const secondPort = secondPortHandle.port;
+
     try {
+      // Release the port handle so MCP can bind
+      await portHandle.close();
+
       // ── First cycle: start → verify port file → stop → verify cleanup ──
 
       // Start MCP
@@ -770,13 +776,10 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
 
       // ── Second cycle: restart → verify port file is recreated ──
 
-      const secondPort = await reserveRandomPort();
-      if (!(await canBind(secondPort))) {
-        t.skip(`Second port ${secondPort} is already in use`);
-        return;
-      }
+      // reservePortHandle already holds the port until this point — no need for extra check.
+      // Close the handle so the daemon can bind.
+      await secondPortHandle.close();
 
-      // Restart MCP on a different port
       // Need to ensure port file is gone first (already verified above, but be explicit)
       try { fs.unlinkSync(isolatedPortFile); } catch {}
 
@@ -805,6 +808,11 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
 
     } finally {
       await runCli(["mcp", "stop"], cliEnv);
+      await Promise.all(tempEnv.portHandles.map((h: any) => h.close()));
+      // portHandle already closed before MCP start; safety close
+      try { await portHandle.close(); } catch {}
+      // secondPortHandle already closed above; safety close (no-op if already closed)
+      try { await secondPortHandle.close(); } catch {}
     }
   });
 
@@ -817,11 +825,8 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
       return;
     }
 
-    const mcpPort = await reserveRandomPort();
-
-    if (!(await canBind(mcpPort))) {
-      assert.fail(`Port ${mcpPort} is already in use — likely a leaked test process from a prior run. Check: lsof -i :${mcpPort}`);
-    }
+    const portHandle = await reservePortHandle();
+    const mcpPort = portHandle.port;
 
     const tempEnv = await createTempEnv();
     const cliEnv = {
@@ -831,6 +836,9 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
     };
 
     try {
+      // Release the port handle so MCP can bind
+      await portHandle.close();
+
       // Start MCP via CLI
       const startCmd = await runCli(["mcp", "start", "--port", String(mcpPort)], cliEnv);
       assert.equal(startCmd.code, 0);
@@ -884,6 +892,9 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
 
     } finally {
       await runCli(["mcp", "stop"], cliEnv);
+      await Promise.all(tempEnv.portHandles.map((h: any) => h.close()));
+      // portHandle already closed before MCP start; safety close
+      try { await portHandle.close(); } catch {}
     }
   });
 
@@ -908,6 +919,7 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
       assert.equal(stop.code, 0);
       assert.match(stop.stdout, /not running/);
     } finally {
+      await Promise.all(tempEnv.portHandles.map((h: any) => h.close()));
     }
   });
 
@@ -920,17 +932,17 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
       return;
     }
 
-    const mcpPort = await reserveRandomPort();
-
-    if (!(await canBind(mcpPort))) {
-      assert.fail(`Port ${mcpPort} is already in use — likely a leaked test process from a prior run. Check: lsof -i :${mcpPort}`);
-    }
+    const portHandle = await reservePortHandle();
+    const mcpPort = portHandle.port;
 
     const tempEnv = await createTempEnv();
 
     let result: { pid: number; port: number; child: ReturnType<typeof spawn> } | undefined;
 
     try {
+      // Release the port handle so MCP can bind
+      await portHandle.close();
+
       // Call the direct API with keepHandle: true and homeDir so the
       // spawned child writes its PID/port files into the isolated temp
       // directory, and the parent's PID-file checks target the same path.
@@ -980,6 +992,9 @@ describe("MCP lifecycle integration", { concurrency: 1 }, () => {
           TAMANDUA_STATE_DIR: tempEnv.stateDir,
         });
       } catch { /* best effort */ }
+      await Promise.all(tempEnv.portHandles.map((h: any) => h.close()));
+      // portHandle already closed before startMcp; safety close
+      try { await portHandle.close(); } catch {}
     }
   });
 });

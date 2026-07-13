@@ -9,7 +9,8 @@
 import assert from "node:assert/strict";
 import {
   cleanChildEnv,
-  reserveDistinctRandomPorts,
+  reservePortHandles,
+  type PortHandle,
 } from "../../tests/helpers/test-env.ts";
 import { spawnSync, spawn } from "node:child_process";
 import fs from "node:fs";
@@ -69,7 +70,8 @@ export async function createTempHome(options?: CreateTempHomeOptions) {
 
   const linkRealAgentDirs = options?.linkRealAgentDirs ?? false;
 
-  const [controlPort, dashboardPort] = await reserveDistinctRandomPorts(2);
+  const portHandles = await reservePortHandles(2);
+  const [controlPort, dashboardPort] = portHandles.map((h) => h.port);
   const root = tamanduaTempDir("tamandua-e2e-workflows-");
   _cleanupDirs.add(root);
 
@@ -121,7 +123,7 @@ export async function createTempHome(options?: CreateTempHomeOptions) {
     );
   }
 
-  return { root, homeDir, tamanduaDir, controlPort, dashboardPort };
+  return { root, homeDir, tamanduaDir, controlPort, dashboardPort, portHandles };
 }
 
 export function inheritedProcessEnv(): Record<string, string> {
@@ -386,13 +388,21 @@ function _pruneArchives(archivesDir: string, max: number) {
   }
 }
 
-export function cleanupTempHome(
-  env: { root: string; homeDir: string; controlPort: number },
+export async function cleanupTempHome(
+  env: { root: string; homeDir: string; controlPort: number; portHandles?: PortHandle[] },
 ) {
   try {
     cli(["dashboard", "stop"], baseEnv(env.homeDir, env.controlPort));
   } catch {
     // best-effort
+  }
+  // Release port handles before removing the temp directory.
+  // Handles may already be closed (e.g., by scripted e2e tests that
+  // close them before daemon spawn); suppress ERR_SERVER_NOT_RUNNING.
+  if (env.portHandles) {
+    await Promise.all(
+      env.portHandles.map((h) => h.close().catch(() => {}))
+    );
   }
   try {
     fs.rmSync(env.root, { recursive: true, force: true });

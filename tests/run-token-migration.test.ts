@@ -1,9 +1,8 @@
 import fs from "node:fs";
-import { cleanChildEnv, reserveRandomPort } from "./helpers/test-env.ts";
+import { cleanChildEnv, reservePortHandle } from "./helpers/test-env.ts";
 import path from "node:path";
 import { tamanduaTempDir } from "../src/lib/temp-dir.ts";
 import assert from "node:assert/strict";
-import http from "node:http";
 import { spawnSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { describe, it } from "node:test";
@@ -101,9 +100,10 @@ describe("run token spend persistence", () => {
 
   it("runWorkflow persists new runs with tokens_spent=0", async () => {
     const temp = createTempHome();
+    const portHandle = await reservePortHandle();
+    const controlPort = portHandle.port;
 
     try {
-      const controlPort = await reserveRandomPort();
       const workflowDir = path.join(temp.homeDir, ".tamandua", "workflows", "token-workflow");
       fs.mkdirSync(workflowDir, { recursive: true });
       fs.writeFileSync(
@@ -125,6 +125,7 @@ describe("run token spend persistence", () => {
         "utf-8",
       );
 
+      await portHandle.close();
       const result = runNodeScript(
         `
           import { runWorkflow } from "./dist/installer/run.js";
@@ -151,6 +152,7 @@ describe("run token spend persistence", () => {
 
       assert.equal(result.tokensSpent, 0, "new runs should start with tokens_spent=0");
     } finally {
+      try { await portHandle.close(); } catch {}
       fs.rmSync(temp.root, { recursive: true, force: true });
     }
   });

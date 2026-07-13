@@ -184,27 +184,3 @@ export async function withReservedPorts<T>(
     await Promise.all(handles.map((h) => h.close()));
   }
 }
-
-/**
- * @deprecated Use reservePortHandle() or withReservedPorts() instead.
- * This function releases the port immediately, creating a TOCTOU race in
- * parallel test environments. It is kept for backward compatibility.
- */
-export async function reserveRandomPort(): Promise<number> {
-  const handle = await reservePortHandle();
-  await handle.close();
-  return handle.port;
-}
-
-/**
- * @deprecated Use reservePortHandles() or withReservedPorts() instead.
- * These ports are released immediately, creating a TOCTOU race in parallel
- * test environments. Kept for backward compatibility.
- */
-export async function reserveDistinctRandomPorts(count: number): Promise<number[]> {
-  const ports = new Set<number>();
-  while (ports.size < count) {
-    ports.add(await reserveRandomPort());
-  }
-  return [...ports];
-}

@@ -1,14 +1,12 @@
 /**
  * Regression tests for port reservation helpers.
  *
- * The original reserveRandomPort() / reserveDistinctRandomPorts() used a
- * bind-close-return pattern that created a TOCTOU race: the port was released
- * before the caller could use it.  Parallel tests could bind the same port.
+ * The deprecated TOCTOU port helpers (reserveRandomPort, reserveDistinctRandomPorts)
+ * have been removed. All call sites now use the handle-based API.
  *
  * These tests verify that:
  * 1. reservePortHandle() keeps the port bound (no TOCTOU)
  * 2. withReservedPorts() holds ports for the test body duration
- * 3. The deprecated helpers exhibit the leak (documented, not a fix target)
  */
 import { describe, it, after } from "node:test";
 import assert from "node:assert/strict";
@@ -20,8 +18,6 @@ import {
   reservePortHandle,
   reservePortHandles,
   withReservedPorts,
-  reserveRandomPort,
-  reserveDistinctRandomPorts,
 } from "./test-env.ts";
 
 /** Returns true if we can bind to `port`, false if EADDRINUSE. */
@@ -199,30 +195,4 @@ describe("createTempHome", () => {
   });
 });
 
-describe("deprecated reserveRandomPort", () => {
-  it("exposes the TOCTOU race — port is freeable immediately after return", async () => {
-    // This test documents the known limitation of reserveRandomPort().
-    // The port has been released by the time reserveRandomPort() returns,
-    // so another bind should succeed.
-    const port = await reserveRandomPort();
-    const bindable = await canBind(port);
-    assert.strictEqual(
-      bindable,
-      true,
-      "Port should be free after reserveRandomPort() returns (TOCTOU, known limitation)",
-    );
-  });
-});
 
-describe("deprecated reserveDistinctRandomPorts", () => {
-  it("returns correct count of ports but they are already released", async () => {
-    const ports = await reserveDistinctRandomPorts(3);
-    assert.strictEqual(ports.length, 3);
-    assert.strictEqual(new Set(ports).size, 3, "All ports should be distinct");
-    // All ports should be freeable (known TOCTOU limitation)
-    for (const port of ports) {
-      const bindable = await canBind(port);
-      assert.strictEqual(bindable, true, `Port ${port} should be free (TOCTOU, known limitation)`);
-    }
-  });
-});

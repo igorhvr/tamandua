@@ -16,7 +16,7 @@
  */
 
 import { describe, it } from "node:test";
-import { cleanChildEnv, createTempHome, reserveRandomPort } from "./helpers/test-env.ts";
+import { cleanChildEnv, createTempHome, reservePortHandle } from "./helpers/test-env.ts";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import http from "node:http";
@@ -35,35 +35,6 @@ import { DEFAULT_CONTROL_PORT } from "../dist/server/control-server.js";
 // ═══════════════════════════════════════════════════════════════════
 // Helpers
 // ═══════════════════════════════════════════════════════════════════
-
-async function canBind(port: number): Promise<boolean> {
-  const server = http.createServer();
-
-  try {
-    await new Promise<void>((resolve, reject) => {
-      const onError = (err: Error) => {
-        server.off("listening", onListening);
-        reject(err);
-      };
-      const onListening = () => {
-        server.off("error", onError);
-        resolve();
-      };
-
-      server.once("error", onError);
-      server.once("listening", onListening);
-      server.listen(port, "127.0.0.1");
-    });
-
-    return true;
-  } catch {
-    return false;
-  } finally {
-    if (server.listening) {
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-    }
-  }
-}
 
 async function getAvailablePort(): Promise<number> {
   const server = http.createServer();
@@ -203,6 +174,8 @@ describe("tamandua control-plane CLI", { concurrency: 1 }, () => {
   // AC 6 (partial): tamandua control-plane status shows not running when down
   it("control-plane status shows not running when down", async () => {
     const tempHome = createTempHome(TMP_PREFIX).homeDir;
+    const portHandle = await reservePortHandle();
+    const unusedPort = portHandle.port;
     cleanupIsolatedControlPlaneFiles(tempHome);
     try {
 
@@ -211,7 +184,6 @@ describe("tamandua control-plane CLI", { concurrency: 1 }, () => {
     // status-control-plane-false-down fix) queries the health endpoint on the
     // configured port, so without this isolation the test would report "running"
     // if a production daemon happens to be listening on the default port 3339.
-    const unusedPort = await reserveRandomPort();
     fs.mkdirSync(path.join(tempHome, ".tamandua"), { recursive: true });
     fs.writeFileSync(getIsolatedControlPlanePortFile(tempHome), String(unusedPort), "utf-8");
 
@@ -221,6 +193,7 @@ describe("tamandua control-plane CLI", { concurrency: 1 }, () => {
     assert.ok(stdout.includes("not running"), `Expected "not running" in output, got: ${stdout}`);
     assert.equal(cleanStderr(stderr), "");
     } finally {
+      portHandle.close().catch(() => {});
       stopIsolatedControlPlane(tempHome);
     }
   });
@@ -231,15 +204,13 @@ describe("tamandua control-plane CLI", { concurrency: 1 }, () => {
       t.skip("CLI script not built — run npm run build first");
       return;
     }
-    const controlPort = await reserveRandomPort();
-    if (!(await canBind(controlPort))) {
-      t.skip(`Port ${controlPort} is already in use`);
-      return;
-    }
+    const portHandle = await reservePortHandle();
+    const controlPort = portHandle.port;
 
     const tempHome = createTempHome(TMP_PREFIX).homeDir;
     cleanupIsolatedControlPlaneFiles(tempHome);
     try {
+    await portHandle.close();
 
     const { stdout, stderr, exitCode } = await runCli(["control-plane", "start", "--port", String(controlPort)], tempHome);
 
@@ -259,6 +230,7 @@ describe("tamandua control-plane CLI", { concurrency: 1 }, () => {
     assert.ok(res.status >= 200 && res.status < 500);
 
     } finally {
+      portHandle.close().catch(() => {});
       stopIsolatedControlPlane(tempHome);
     }
   });
@@ -270,15 +242,13 @@ describe("tamandua control-plane CLI", { concurrency: 1 }, () => {
       return;
     }
 
-    const customPort = await reserveRandomPort();
-    if (!(await canBind(customPort))) {
-      t.skip(`Port ${customPort} is already in use`);
-      return;
-    }
+    const portHandle = await reservePortHandle();
+    const customPort = portHandle.port;
 
     const tempHome = createTempHome(TMP_PREFIX).homeDir;
     cleanupIsolatedControlPlaneFiles(tempHome);
     try {
+    await portHandle.close();
 
     const { stdout, stderr, exitCode } = await runCli(["control-plane", "start", "--port", String(customPort)], tempHome);
 
@@ -292,26 +262,25 @@ describe("tamandua control-plane CLI", { concurrency: 1 }, () => {
     assert.equal(readIsolatedControlPlanePort(tempHome), customPort);
 
     } finally {
+      portHandle.close().catch(() => {});
       stopIsolatedControlPlane(tempHome);
     }
   });
 
-  // AC 3: tamandua control-plane start <random> (positional) starts on custom port
+  // AC 3: tamandua control-plane start <random> (positional) starts on a custom port
   it("control-plane start <random> (positional) starts on a custom port", async (t) => {
     if (!fs.existsSync(CLI_SCRIPT)) {
       t.skip("CLI script not built — run npm run build first");
       return;
     }
 
-    const customPort = await reserveRandomPort();
-    if (!(await canBind(customPort))) {
-      t.skip(`Port ${customPort} is already in use`);
-      return;
-    }
+    const portHandle = await reservePortHandle();
+    const customPort = portHandle.port;
 
     const tempHome = createTempHome(TMP_PREFIX).homeDir;
     cleanupIsolatedControlPlaneFiles(tempHome);
     try {
+    await portHandle.close();
 
     const { stdout, stderr, exitCode } = await runCli(["control-plane", "start", "--port", String(customPort)], tempHome);
 
@@ -323,6 +292,7 @@ describe("tamandua control-plane CLI", { concurrency: 1 }, () => {
     assert.ok(res.status >= 200 && res.status < 500);
 
     } finally {
+      portHandle.close().catch(() => {});
       stopIsolatedControlPlane(tempHome);
     }
   });
@@ -333,15 +303,13 @@ describe("tamandua control-plane CLI", { concurrency: 1 }, () => {
       t.skip("CLI script not built — run npm run build first");
       return;
     }
-    const controlPort = await reserveRandomPort();
-    if (!(await canBind(controlPort))) {
-      t.skip(`Port ${controlPort} is already in use`);
-      return;
-    }
+    const portHandle = await reservePortHandle();
+    const controlPort = portHandle.port;
 
     const tempHome = createTempHome(TMP_PREFIX).homeDir;
     cleanupIsolatedControlPlaneFiles(tempHome);
     try {
+    await portHandle.close();
 
     // First start
     const first = await runCli(["control-plane", "start", "--port", String(controlPort)], tempHome);
@@ -362,6 +330,7 @@ describe("tamandua control-plane CLI", { concurrency: 1 }, () => {
     assert.ok(!second.stdout.includes("Control plane started"));
 
     } finally {
+      portHandle.close().catch(() => {});
       stopIsolatedControlPlane(tempHome);
     }
   });
@@ -409,15 +378,13 @@ describe("tamandua control-plane CLI", { concurrency: 1 }, () => {
       t.skip("CLI script not built — run npm run build first");
       return;
     }
-    const controlPort = await reserveRandomPort();
-    if (!(await canBind(controlPort))) {
-      t.skip(`Port ${controlPort} is already in use`);
-      return;
-    }
+    const portHandle = await reservePortHandle();
+    const controlPort = portHandle.port;
 
     const tempHome = createTempHome(TMP_PREFIX).homeDir;
     cleanupIsolatedControlPlaneFiles(tempHome);
     try {
+    await portHandle.close();
 
     // Start control plane
     const start = await runCli(["control-plane", "start", "--port", String(controlPort)], tempHome);
@@ -438,6 +405,7 @@ describe("tamandua control-plane CLI", { concurrency: 1 }, () => {
     assert.equal(cleanStderr(stderr), "");
 
     } finally {
+      portHandle.close().catch(() => {});
       stopIsolatedControlPlane(tempHome);
     }
   });
@@ -448,15 +416,13 @@ describe("tamandua control-plane CLI", { concurrency: 1 }, () => {
       t.skip("CLI script not built — run npm run build first");
       return;
     }
-    const controlPort = await reserveRandomPort();
-    if (!(await canBind(controlPort))) {
-      t.skip(`Port ${controlPort} is already in use`);
-      return;
-    }
+    const portHandle = await reservePortHandle();
+    const controlPort = portHandle.port;
 
     const tempHome = createTempHome(TMP_PREFIX).homeDir;
     cleanupIsolatedControlPlaneFiles(tempHome);
     try {
+    await portHandle.close();
 
     // Start control plane
     const start = await runCli(["control-plane", "start", "--port", String(controlPort)], tempHome);
@@ -484,6 +450,7 @@ describe("tamandua control-plane CLI", { concurrency: 1 }, () => {
     assert.equal(fs.existsSync(getIsolatedControlPlanePidFile(tempHome)), false, "PID file should be removed after stop");
 
     } finally {
+      portHandle.close().catch(() => {});
       stopIsolatedControlPlane(tempHome);
     }
   });

@@ -29,7 +29,7 @@ import { DatabaseSync } from "node:sqlite";
 import {
   cleanChildEnv,
   createTempHome,
-  reserveDistinctRandomPorts,
+  reservePortHandles,
 } from "../../tests/helpers/test-env.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -354,7 +354,11 @@ describe("TSTX Acceptance Criteria & Monotonicity", { concurrency: 1 }, () => {
     const secret = crypto.randomBytes(16).toString("hex");
     writeFileSync(join(stateDir, "daemon-secret"), secret);
 
-    const [controlPort] = await reserveDistinctRandomPorts(1);
+    const [ctrlHandle] = await reservePortHandles(1);
+    const controlPort = ctrlHandle.port;
+
+    // Close handle just before control server binds.
+    await ctrlHandle.close();
 
     // Set env vars so control server and shim use the test state.
     process.env.HOME = tempHome;

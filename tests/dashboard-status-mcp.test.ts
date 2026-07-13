@@ -1,14 +1,13 @@
 import fs from "node:fs";
 import path from "node:path";
-import http from "node:http";
 import assert from "node:assert/strict";
 import { spawn, execSync } from "node:child_process";
 import { once } from "node:events";
 import { describe, it, after } from "node:test";
-import { cleanChildEnv, createTempHome, reserveRandomPort } from "./helpers/test-env.ts";
+import { cleanChildEnv, createTempHome, reservePortHandle } from "./helpers/test-env.ts";
+import type { PortHandle } from "./helpers/test-env.ts";
 
 const cliPath = path.resolve(process.cwd(), "dist", "cli", "cli.js");
-const DEFAULT_MCP_PORT = 3338;
 
 type CliResult = {
   code: number | null;
@@ -44,33 +43,10 @@ async function runCliOnce(args: string[], env: Record<string, string>): Promise<
   return { code, stdout, stderr };
 }
 
-async function canBind(port: number): Promise<boolean> {
-  const server = http.createServer();
-
-  try {
-    await new Promise<void>((resolve, reject) => {
-      const onError = (err: Error) => {
-        server.off("listening", onListening);
-        reject(err);
-      };
-      const onListening = () => {
-        server.off("error", onError);
-        resolve();
-      };
-
-      server.once("error", onError);
-      server.once("listening", onListening);
-      server.listen(port, "127.0.0.1");
-    });
-
-    return true;
-  } catch {
-    return false;
-  } finally {
-    if (server.listening) {
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-    }
-  }
+/** Safety-close a port handle, ignoring errors if already closed. */
+async function safeClose(h: PortHandle | undefined): Promise<void> {
+  if (!h) return;
+  try { await h.close(); } catch { /* already closed */ }
 }
 
 
@@ -119,9 +95,12 @@ describe("tamandua dashboard status MCP visibility", () => {
 
   // AC 1: tamandua status reports Dashboard and MCP as separate services
   it("shows MCP as not running when dashboard is started without MCP", async (t) => {
-    const dashboardPort = await reserveRandomPort();
-    const controlPort = await reserveRandomPort();
-    const mcpPort = await reserveRandomPort(); // unused port to isolate from production MCP on 3338
+    const dashboardPortHandle = await reservePortHandle();
+    const controlPortHandle = await reservePortHandle();
+    const mcpPortHandle = await reservePortHandle();
+    const dashboardPort = dashboardPortHandle.port;
+    const controlPort = controlPortHandle.port;
+    const mcpPort = mcpPortHandle.port;
     const tempEnv = createTempEnv();
     const cliEnv = {
       HOME: tempEnv.homeDir,
@@ -135,7 +114,12 @@ describe("tamandua dashboard status MCP visibility", () => {
       // production MCP on the default port 3338.
       const mcpPortDir = path.join(tempEnv.homeDir, ".tamandua");
       fs.mkdirSync(mcpPortDir, { recursive: true });
+      await mcpPortHandle.close();
       fs.writeFileSync(path.join(mcpPortDir, "mcp-port"), String(mcpPort), "utf-8");
+
+      // Close port handles just before daemon bind
+      await dashboardPortHandle.close();
+      await controlPortHandle.close();
 
       // Start dashboard only (without MCP)
       const start = await runCliOnce(["dashboard", "start", "--port", String(dashboardPort)], cliEnv);
@@ -157,6 +141,9 @@ describe("tamandua dashboard status MCP visibility", () => {
       const stop = await runCliOnce(["dashboard", "stop"], cliEnv);
       assert.equal(stop.code, 0, stop.stderr || stop.stdout);
     } finally {
+      await safeClose(dashboardPortHandle);
+      await safeClose(controlPortHandle);
+      await safeClose(mcpPortHandle);
       await runCliOnce(["dashboard", "stop"], cliEnv);
       await runCliOnce(["mcp", "stop"], cliEnv);
       fs.rmSync(tempEnv.root, { recursive: true, force: true });
@@ -165,15 +152,14 @@ describe("tamandua dashboard status MCP visibility", () => {
 
   // AC 1: tamandua status reports MCP running independently when started via mcp start
   it("shows MCP as independently running after tamandua mcp start", async (t) => {
-    const mcpPort = await reserveRandomPort();
-    if (!(await canBind(mcpPort))) {
-      t.skip(`Port ${mcpPort} is already in use — another test may be using it`);
-      return;
-    }
-
-    const dashboardPort = await reserveRandomPort();
-    const controlPort = await reserveRandomPort();
-    const unusedMcpPort = await reserveRandomPort(); // isolates from production MCP on 3338
+    const mcpPortHandle = await reservePortHandle();
+    const dashboardPortHandle = await reservePortHandle();
+    const controlPortHandle = await reservePortHandle();
+    const unusedMcpPortHandle = await reservePortHandle();
+    const mcpPort = mcpPortHandle.port;
+    const dashboardPort = dashboardPortHandle.port;
+    const controlPort = controlPortHandle.port;
+    const unusedMcpPort = unusedMcpPortHandle.port;
     const tempEnv = createTempEnv();
     const cliEnv = {
       HOME: tempEnv.homeDir,
@@ -190,6 +176,10 @@ describe("tamandua dashboard status MCP visibility", () => {
     };
 
     try {
+      // Close port handles just before daemon bind
+      await dashboardPortHandle.close();
+      await controlPortHandle.close();
+
       // Start dashboard first
       const start = await runCliOnce(["dashboard", "start", "--port", String(dashboardPort)], cliEnv);
       assert.equal(start.code, 0, start.stderr || start.stdout);
@@ -201,6 +191,7 @@ describe("tamandua dashboard status MCP visibility", () => {
       assert.match(beforeMcp.stdout, /MCP: +DOWN/);
 
       // Start MCP independently (mcp start writes the correct port file itself)
+      await mcpPortHandle.close();
       const mcpStart = await runCliOnce(["mcp", "start", "--port", String(mcpPort)], cliEnv);
       assert.equal(mcpStart.code, 0, mcpStart.stderr || mcpStart.stdout);
       assert.match(mcpStart.stdout, /MCP server started/);
@@ -237,6 +228,10 @@ describe("tamandua dashboard status MCP visibility", () => {
       const finalMcpStatus = await runCliOnce(["mcp", "status"], cliEnv);
       assert.match(finalMcpStatus.stdout, /MCP server is not running/);
     } finally {
+      await safeClose(dashboardPortHandle);
+      await safeClose(controlPortHandle);
+      await safeClose(mcpPortHandle);
+      await safeClose(unusedMcpPortHandle);
       await runCliOnce(["dashboard", "stop"], cliEnv);
       await runCliOnce(["mcp", "stop"], cliEnv);
       fs.rmSync(tempEnv.root, { recursive: true, force: true });
@@ -245,8 +240,12 @@ describe("tamandua dashboard status MCP visibility", () => {
 
   // AC 2 & 3: Dashboard HTML shows MCP status section and /api/mcp-status endpoint works
   it("dashboard HTML shows MCP status section with running/stopped state", async (t) => {
-    const dashboardPort = await reserveRandomPort();
-    const controlPort = await reserveRandomPort();
+    const dashboardPortHandle = await reservePortHandle();
+    const controlPortHandle = await reservePortHandle();
+    const mcpConfigPortHandle = await reservePortHandle();
+    const dashboardPort = dashboardPortHandle.port;
+    const controlPort = controlPortHandle.port;
+    const mcpConfigPort = mcpConfigPortHandle.port;
     const tempEnv = createTempEnv();
     const cliEnv = {
       HOME: tempEnv.homeDir,
@@ -255,6 +254,17 @@ describe("tamandua dashboard status MCP visibility", () => {
     };
 
     try {
+      // Write the test's own MCP port into the config so the /api/mcp-status
+      // endpoint reports the injected port instead of the hardcoded default.
+      const mcpPortDir = path.join(tempEnv.homeDir, ".tamandua");
+      fs.mkdirSync(mcpPortDir, { recursive: true });
+      await mcpConfigPortHandle.close();
+      fs.writeFileSync(path.join(mcpPortDir, "mcp-port"), String(mcpConfigPort), "utf-8");
+
+      // Close port handles just before daemon bind
+      await dashboardPortHandle.close();
+      await controlPortHandle.close();
+
       // Start dashboard
       const start = await runCliOnce(["dashboard", "start", "--port", String(dashboardPort)], cliEnv);
       assert.equal(start.code, 0, start.stderr || start.stdout);
@@ -274,15 +284,13 @@ describe("tamandua dashboard status MCP visibility", () => {
       const apiBody = await apiRes.json() as { running: boolean; port: number; path: string };
       assert.equal(typeof apiBody.running, "boolean");
       assert.equal(apiBody.running, false); // MCP not started
-      assert.equal(apiBody.port, DEFAULT_MCP_PORT);
+      assert.equal(apiBody.port, mcpConfigPort);
       assert.equal(apiBody.path, "/mcp");
 
       // Start MCP and verify endpoint updates
-      const mcpPort = await reserveRandomPort();
-      if (!(await canBind(mcpPort))) {
-        t.skip(`Port ${mcpPort} is already in use — another test may be using it`);
-        return;
-      }
+      const mcpPortHandle = await reservePortHandle();
+      const mcpPort = mcpPortHandle.port;
+      await mcpPortHandle.close();
 
       const mcpStart = await runCliOnce(["mcp", "start", "--port", String(mcpPort)], cliEnv);
       assert.equal(mcpStart.code, 0, mcpStart.stderr || mcpStart.stdout);
@@ -294,7 +302,11 @@ describe("tamandua dashboard status MCP visibility", () => {
       assert.equal(apiBodyRunning.port, mcpPort);
       assert.equal(apiBodyRunning.path, "/mcp");
 
+      await safeClose(mcpPortHandle);
     } finally {
+      await safeClose(dashboardPortHandle);
+      await safeClose(controlPortHandle);
+      await safeClose(mcpConfigPortHandle);
       await runCliOnce(["dashboard", "stop"], cliEnv);
       await runCliOnce(["mcp", "stop"], cliEnv);
       fs.rmSync(tempEnv.root, { recursive: true, force: true });
@@ -304,7 +316,8 @@ describe("tamandua dashboard status MCP visibility", () => {
   // AC 4: get-ready tries to start MCP when not running
   it("tamandua get-ready starts MCP when MCP is not running", async () => {
     const tempEnv = createTempEnv();
-    const controlPort = await reserveRandomPort();
+    const controlPortHandle = await reservePortHandle();
+    const controlPort = controlPortHandle.port;
     const cliEnv = {
       HOME: tempEnv.homeDir,
       TAMANDUA_STATE_DIR: tempEnv.stateDir,
@@ -312,6 +325,8 @@ describe("tamandua dashboard status MCP visibility", () => {
     };
 
     try {
+      await controlPortHandle.close();
+
       const install = await runCliOnce(["get-ready"], cliEnv);
       assert.equal(install.code, 0, install.stderr || install.stdout);
       // get-ready now actively attempts to start MCP (and control plane);
@@ -319,6 +334,7 @@ describe("tamandua dashboard status MCP visibility", () => {
       // a Note with the recovery command instead of the old passive message.
       assert.match(install.stdout, /MCP server already running\.|MCP server started|Note: MCP server not started[\s\S]*recover: tamandua mcp start/);
     } finally {
+      await safeClose(controlPortHandle);
       await runCliOnce(["uninstall", "--force"], cliEnv);
       fs.rmSync(tempEnv.root, { recursive: true, force: true });
     }
@@ -326,15 +342,13 @@ describe("tamandua dashboard status MCP visibility", () => {
 
   // AC 5: uninstall stops MCP if running
   it("tamandua uninstall stops MCP if it was running", async (t) => {
-    const mcpPort = await reserveRandomPort();
-    if (!(await canBind(mcpPort))) {
-      t.skip(`Port ${mcpPort} is already in use — another test may be using it`);
-      return;
-    }
-
-    const unusedMcpPort = await reserveRandomPort();
+    const mcpPortHandle = await reservePortHandle();
+    const unusedMcpPortHandle = await reservePortHandle();
+    const controlPortHandle = await reservePortHandle();
+    const mcpPort = mcpPortHandle.port;
+    const unusedMcpPort = unusedMcpPortHandle.port;
+    const controlPort = controlPortHandle.port;
     const tempEnv = createTempEnv();
-    const controlPort = await reserveRandomPort();
     const cliEnv = {
       HOME: tempEnv.homeDir,
       TAMANDUA_STATE_DIR: tempEnv.stateDir,
@@ -342,6 +356,10 @@ describe("tamandua dashboard status MCP visibility", () => {
     };
 
     try {
+      // Close port handles just before daemon/MCP bind
+      await controlPortHandle.close();
+      await mcpPortHandle.close();
+
       // Start MCP
       const mcpStart = await runCliOnce(["mcp", "start", "--port", String(mcpPort)], cliEnv);
       assert.equal(mcpStart.code, 0, mcpStart.stderr || mcpStart.stdout);
@@ -357,6 +375,7 @@ describe("tamandua dashboard status MCP visibility", () => {
 
       // After uninstall cleans up the MCP port file, write an unused port
       // so the async status probe doesn't detect a production MCP on 3338.
+      await unusedMcpPortHandle.close();
       const mcpPortDir = path.join(tempEnv.homeDir, ".tamandua");
       fs.mkdirSync(mcpPortDir, { recursive: true });
       fs.writeFileSync(path.join(mcpPortDir, "mcp-port"), String(unusedMcpPort), "utf-8");
@@ -365,6 +384,9 @@ describe("tamandua dashboard status MCP visibility", () => {
       const mcpStatusAfter = await runCliOnce(["mcp", "status"], cliEnv);
       assert.match(mcpStatusAfter.stdout, /MCP server is not running/);
     } finally {
+      await safeClose(mcpPortHandle);
+      await safeClose(unusedMcpPortHandle);
+      await safeClose(controlPortHandle);
       await runCliOnce(["mcp", "stop"], cliEnv);
       fs.rmSync(tempEnv.root, { recursive: true, force: true });
     }

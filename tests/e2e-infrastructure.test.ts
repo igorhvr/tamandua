@@ -471,14 +471,15 @@ describe("e2e test infrastructure", () => {
 
   // ── US-007: test isolation verification ─────────────────────────────
 
-  it("e2e-tests/workflows-e2e.test.ts uses reserveDistinctRandomPorts for daemon port", () => {
-    const content = fs.readFileSync(
-      path.join(repoRoot, "e2e-tests", "workflows-e2e.test.ts"),
+  it("e2e-tests/workflows-e2e.test.ts uses port handle reservation via createTempHome", () => {
+    const smokeHelpers = fs.readFileSync(
+      path.join(repoRoot, "e2e-tests", "helpers", "smoke-helpers.ts"),
       "utf-8",
     );
+    // createTempHome must use reservePortHandles (not the deprecated reserveDistinctRandomPorts)
     assert.ok(
-      content.includes("reserveDistinctRandomPorts"),
-      "real e2e test must use reserveDistinctRandomPorts to avoid default ports 3334/3338/3339",
+      smokeHelpers.includes("reservePortHandles"),
+      "createTempHome must use reservePortHandles to avoid TOCTOU port race",
     );
   });
 

@@ -11,7 +11,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { tamanduaTempDir } from "../../src/lib/temp-dir.ts";
 import {
-  reserveDistinctRandomPorts,
+  reservePortHandles,
+  type PortHandle,
 } from "../../tests/helpers/test-env.ts";
 import {
   pollForRunCompletion,
@@ -28,6 +29,7 @@ let homeDir: string;
 let tamanduaDir: string;
 let controlPort: number;
 let dashboardPort: number;
+let portHandles: PortHandle[];
 
 function createTempHome() {
   tempRoot = tamanduaTempDir("tamandua-e2e-helpers-test-");
@@ -52,7 +54,11 @@ function createTempHome() {
   );
 }
 
-function cleanupTempHome() {
+async function cleanupTempHome() {
+  // Release port handles before removing the temp directory
+  if (portHandles) {
+    await Promise.all(portHandles.map((h) => h.close()));
+  }
   try {
     fs.rmSync(tempRoot, { recursive: true, force: true });
   } catch {
@@ -62,12 +68,13 @@ function cleanupTempHome() {
 
 describe("e2e-helpers (real e2e test helpers)", () => {
   before(async () => {
-    [controlPort, dashboardPort] = await reserveDistinctRandomPorts(2);
+    portHandles = await reservePortHandles(2);
+    [controlPort, dashboardPort] = portHandles.map((h) => h.port);
     createTempHome();
   });
 
-  after(() => {
-    cleanupTempHome();
+  after(async () => {
+    await cleanupTempHome();
   });
 
   describe("startIsolatedDaemon / stopIsolatedDaemon", () => {

@@ -77,6 +77,8 @@ async function startScriptedEnvironment(
     baseEnv(env.homeDir, env.controlPort),
     `install ${workflowId}`,
   );
+  // Release port handles so the daemon can bind to the control port.
+  await Promise.all(env.portHandles.map((h) => h.close()));
   const daemon = await startIsolatedDaemon(
     env.homeDir,
     env.controlPort,
@@ -540,6 +542,9 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
         // Fresh daemon, same state: its reconciler's dead-worker sweep
         // must requeue the step within seconds — NOT the 45-minute
         // age-based threshold — and the run must complete.
+        // Port handles were already closed before the first daemon spawn
+        // (startScriptedEnvironment). The killed daemon already released
+        // its port bindings, so daemon2 can bind directly.
         daemon2 = await startIsolatedDaemon(
           ctx.env.homeDir,
           ctx.env.controlPort,

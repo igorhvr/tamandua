@@ -2353,8 +2353,14 @@ describe("nudge command", { concurrency: 1 }, () => {
   it("tamandua nudge with daemon running and no runs prints zero-runs message", async (t) => {
     const th_nudge = createTempHome("tamandua-nudge-test-");
     const tmpDir = th_nudge.homeDir;
-    const { reserveDistinctRandomPorts, cleanChildEnv: testCleanChildEnv } = await import("../../tests/helpers/test-env.ts");
-    const [dp, cp] = await reserveDistinctRandomPorts(2);
+    const { reservePortHandles, cleanChildEnv: testCleanChildEnv } = await import("../../tests/helpers/test-env.ts");
+    const handles = await reservePortHandles(2);
+    const dp = handles[0].port;
+    const cp = handles[1].port;
+
+    // Close handles just before daemon spawn so the daemon can bind.
+    await Promise.all(handles.map(h => h.close()));
+
     const daemonScript = path.resolve(__dirname, "..", "..", "dist", "server", "daemon.js");
 
     let daemon: ChildProcess | undefined;
@@ -2413,8 +2419,14 @@ describe("nudge command", { concurrency: 1 }, () => {
   it("tamandua nudge with daemon running and active runs prints summary", async (t) => {
     const th_nudge = createTempHome("tamandua-nudge-test-");
     const tmpDir = th_nudge.homeDir;
-    const { reserveDistinctRandomPorts, cleanChildEnv: testCleanChildEnv2 } = await import("../../tests/helpers/test-env.ts");
-    const [dp, cp] = await reserveDistinctRandomPorts(2);
+    const { reservePortHandles, cleanChildEnv: testCleanChildEnv2 } = await import("../../tests/helpers/test-env.ts");
+    const handles = await reservePortHandles(2);
+    const dp = handles[0].port;
+    const cp = handles[1].port;
+
+    // Close handles just before daemon spawn so the daemon can bind.
+    await Promise.all(handles.map(h => h.close()));
+
     const daemonScript = path.resolve(__dirname, "..", "..", "dist", "server", "daemon.js");
 
     let daemon: ChildProcess | undefined;
