@@ -36,6 +36,7 @@ src/suite/shim.test.ts
 src/suite/tree-hash.test.ts
 tests/agent-scheduler.test.ts
 tests/claim-invalidated-by-migration.test.ts
+tests/cli-get-ready-partial-failure.test.ts
 tests/cli-pause-all-resume-all-integration.test.ts
 tests/cli-pause-all-resume-all.test.ts
 tests/cli-pause-command.test.ts
@@ -49,6 +50,7 @@ tests/cli-workflow-install-all.test.ts
 tests/cli-workflow-list-json.test.ts
 tests/cli-workflow-run-working-directory.test.ts
 tests/cli-worktree.test.ts
+tests/cli/install-partial-failure.test.ts
 tests/control-plane-cli.test.ts
 tests/dashboard-crash-isolation.test.ts
 tests/dashboard-kanban.test.ts

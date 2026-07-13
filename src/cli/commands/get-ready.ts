@@ -103,7 +103,9 @@ export async function handleGetReady(group: string, args: string[]): Promise<boo
     const workflows = await listBundledWorkflows();
     if (workflows.length === 0) { console.log("No bundled workflows found."); return true; }
     console.log(`Installing ${workflows.length} workflow(s)...`);
-    for (const wf of workflows) { try { await installWorkflow({ workflowId: wf }); console.log(`  ✓ ${wf}`); } catch (err) { console.log(`  ✗ ${wf}: ${err instanceof Error ? err.message : String(err)}`); } }
+    let failures = 0;
+    for (const wf of workflows) { try { await installWorkflow({ workflowId: wf }); console.log(`  ✓ ${wf}`); } catch (err) { failures++; console.log(`  ✗ ${wf}: ${err instanceof Error ? err.message : String(err)}`); } }
+    if (failures > 0) { console.log(`\n${failures} of ${workflows.length} workflows failed to install`); process.exitCode = 1; }
     ensureCliSymlink();
     console.log(`\nDone. Start with: tamandua workflow run <name> "your task"`);
     if (!isRunning().running) { try { const r = await startDaemon(3334); console.log(`\nDashboard started (PID ${r.pid}): http://localhost:${r.port}`); } catch (err) { console.log(`\nNote: dashboard not started: ${err instanceof Error ? err.message : String(err)} (recover: tamandua dashboard restart)`); } }

@@ -1974,7 +1974,9 @@ async function main() {
     const workflows = await listBundledWorkflows();
     if (workflows.length === 0) { console.log("No bundled workflows found."); return; }
     console.log(`Installing ${workflows.length} workflow(s)...`);
-    for (const wf of workflows) { try { await installWorkflow({ workflowId: wf }); console.log(`  ✓ ${wf}`); } catch (err) { console.log(`  ✗ ${wf}: ${err instanceof Error ? err.message : String(err)}`); } }
+    let failures = 0;
+    for (const wf of workflows) { try { await installWorkflow({ workflowId: wf }); console.log(`  ✓ ${wf}`); } catch (err) { failures++; console.log(`  ✗ ${wf}: ${err instanceof Error ? err.message : String(err)}`); } }
+    if (failures > 0) { console.log(`\n${failures} of ${workflows.length} workflows failed to install`); process.exitCode = 1; }
     ensureCliSymlink();
     console.log(`\nDone. Start with: tamandua workflow run <name> "your task"`);
     // Start daemon (control-plane+motor) first
@@ -2975,7 +2977,12 @@ async function main() {
       const workflows = await listBundledWorkflows();
       if (workflows.length === 0) { console.log("No bundled workflows found."); return; }
       console.log(`Installing ${workflows.length} workflow(s)...`);
-      for (const wf of workflows) { try { await installWorkflow({ workflowId: wf }); console.log(`  ✓ ${wf}`); } catch (err) { console.log(`  ✗ ${wf}: ${err instanceof Error ? err.message : String(err)}`); } }
+      let failures = 0;
+      for (const wf of workflows) { try { await installWorkflow({ workflowId: wf }); console.log(`  ✓ ${wf}`); } catch (err) { console.log(`  ✗ ${wf}: ${err instanceof Error ? err.message : String(err)}`); failures++; } }
+      if (failures > 0) {
+        console.log(`${failures} of ${workflows.length} workflows failed to install`);
+        process.exitCode = 1;
+      }
       console.log(`\nDone. Start with: tamandua workflow run <name> "your task"`);
       return;
     }
