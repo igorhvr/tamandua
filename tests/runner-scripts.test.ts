@@ -11,6 +11,7 @@ import path from "node:path";
 import { execSync, execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { cleanChildEnv, createTempHome } from "./helpers/test-env.ts";
+import { tamanduaTempDir } from "../src/lib/temp-dir.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "..");
@@ -662,6 +663,7 @@ describe("run-all-lanes.sh", () => {
 
   it("TBLD: build log cleaned up on successful build", () => {
     const tmpDir = makeTmpDir();
+    const scopedTmpDir = tamanduaTempDir("tamandua-runner-tmpdir-");
     try {
       setupTempRepo(tmpDir, {
         serialFiles: ["src/serial.test.ts"],
@@ -670,20 +672,21 @@ describe("run-all-lanes.sh", () => {
 
       execFileSync("bash", [ALL_LANES_SCRIPT], {
         cwd: tmpDir,
-        env: cleanChildEnv({ HOME: tmpDir, TAMANDUA_REPO_ROOT: tmpDir, TAMANDUA_TEST_GUARD: "0" }),
+        env: cleanChildEnv({ HOME: tmpDir, TAMANDUA_REPO_ROOT: tmpDir, TAMANDUA_TEST_GUARD: "0", TMPDIR: scopedTmpDir }),
         stdio: "pipe",
         encoding: "utf-8",
       });
 
-      // Check that no build log files were left behind in TMPDIR or /tmp
-      const tmpContents = fs.readdirSync("/tmp");
-      const leakedLogs = tmpContents.filter(f => f.startsWith("tamandua-build-"));
+      // Check that no build log files were left behind in the scoped TMPDIR
+      const scopedContents = fs.readdirSync(scopedTmpDir);
+      const leakedLogs = scopedContents.filter(f => f.startsWith("tamandua-build-"));
       assert.equal(
         leakedLogs.length, 0,
-        "no tamandua-build log files should be left in /tmp after a successful build. Found: " + leakedLogs.join(", "),
+        "no tamandua-build log files should be left in scoped TMPDIR after a successful build. Found: " + leakedLogs.join(", "),
       );
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
+      fs.rmSync(scopedTmpDir, { recursive: true, force: true });
     }
   });
 });

@@ -23,8 +23,8 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+import { tamanduaTempDir } from "../../src/lib/temp-dir.ts";
 import { DatabaseSync } from "node:sqlite";
 import type { ChildProcess } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -434,7 +434,7 @@ describe("concurrent-runs stress test", { concurrency: 1 }, () => {
 
       try {
         // ── Prepare shared origin repo ─────────────────────────────
-        const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "tamandua-e2e-concurrent-"));
+        const tempRoot = tamanduaTempDir("tamandua-e2e-concurrent-");
         const repoDir = prepareGitRepo(fixtureDir, path.join(tempRoot, "origin-repo"));
 
         // ── Create 8 isolated daemon environments ──────────────────

@@ -17,7 +17,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import os from "node:os";
+import { tamanduaTempDir } from "../../src/lib/temp-dir.ts";
 
 const sharedModulePath = path.resolve(
   process.cwd(),
@@ -25,9 +25,7 @@ const sharedModulePath = path.resolve(
 );
 
 function makeTempStateDir(): string {
-  return fs.mkdtempSync(
-    path.join(os.tmpdir(), "scripted-shared-test-"),
-  );
+  return tamanduaTempDir("scripted-shared-test-");
 }
 
 function cleanup(dir: string) {
