@@ -1,14 +1,16 @@
 import { describe, it, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { writeFileSync, realpathSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { createTempHome } from "../tests/helpers/test-env.ts";
 
 // We test the migration by directly importing getDb, which calls migrate().
 // But since getDb() uses a cached connection and resolves DB path from
 // env/home, we test the migration logic directly with an isolated DB.
-import { getDb, getDbPath, getSystemTokenSpend, incrementSystemTokenSpend, upsertAutoresearchSession, getAutoresearchSessions, getAutoresearchSessionById, deleteAutoresearchSession, pruneOldSuiteResults } from "../dist/db.js";
+import { getDb, getDbPath, SCHEMA_VERSION, _migrateFullRuns, getSystemTokenSpend, incrementSystemTokenSpend, upsertAutoresearchSession, getAutoresearchSessions, getAutoresearchSessionById, deleteAutoresearchSession, pruneOldSuiteResults } from "../dist/db.js";
 
 describe("PRAGMA synchronous", () => {
   let tempHome: string;
@@ -1995,10 +1997,11 @@ describe("MIGV schema version short-circuit", () => {
   let baselineRuns: number;
 
 
+
   const th = createTempHome("tamandua-migv-");
 
   before(() => {
-
+    baselineRuns = _migrateFullRuns;
     tempHome = th.root;
     origHome = process.env.HOME;
     origDbPath = process.env.TAMANDUA_DB_PATH;
