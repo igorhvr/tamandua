@@ -21,9 +21,58 @@ import { DatabaseSync } from "node:sqlite";
 const repoRoot = process.cwd();
 const cliPath = path.resolve(repoRoot, "dist", "cli", "cli.js");
 
-export async function createTempHome() {
+// Module-level registry for process-exit cleanup of temp homes.
+// Follows the same pattern as tests/helpers/test-env.ts so aborted
+// e2e runs stop leaking /tmp directories.
+const _cleanupDirs = new Set<string>();
+let _cleanupRegistered = false;
+
+function _registerProcessCleanup() {
+  if (_cleanupRegistered) return;
+  _cleanupRegistered = true;
+
+  const cleanup = () => {
+    for (const dir of _cleanupDirs) {
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
+    _cleanupDirs.clear();
+  };
+
+  // clean exit (process.exit, normal termination)
+  process.on("exit", cleanup);
+
+  // kill signals — Node won't run 'exit' for these, so we handle them explicitly
+  for (const sig of ["SIGINT", "SIGTERM"]) {
+    process.on(sig, () => {
+      cleanup();
+      process.exit(1);
+    });
+  }
+}
+
+export interface CreateTempHomeOptions {
+  /**
+   * When true, symlink the real ~/.pi and ~/.hermes directories into the
+   * isolated test HOME so the test environment reuses working auth
+   * configuration. Required by real-token e2e tiers that need live provider
+   * credentials.
+   *
+   * When false (default), create an empty stub ~/.pi directory instead.
+   * Zero-token tiers (smoke, scripted) don't need real auth and can run on
+   * machines without configured pi auth.
+   */
+  linkRealAgentDirs?: boolean;
+}
+
+export async function createTempHome(options?: CreateTempHomeOptions) {
+  _registerProcessCleanup();
+
+  const linkRealAgentDirs = options?.linkRealAgentDirs ?? false;
+
   const [controlPort, dashboardPort] = await reserveDistinctRandomPorts(2);
   const root = tamanduaTempDir("tamandua-e2e-workflows-");
+  _cleanupDirs.add(root);
+
   const homeDir = path.join(root, "home");
   const tamanduaDir = path.join(homeDir, ".tamandua");
   fs.mkdirSync(tamanduaDir, { recursive: true });
@@ -33,28 +82,45 @@ export async function createTempHome() {
     String(dashboardPort),
     "utf-8",
   );
-  // Symlink the real developer ~/.pi so the isolated test environment
-  // reuses the working pi auth configuration (provider, API key, model).
-  // This avoids the auth isolation mismatch where a synthesized
-  // settings.json points at providers.openai.apiKey but pi --print
-  // cannot resolve it (especially when cleanChildEnv strips env-based
-  // auth like OPENAI_API_KEY).
-  const realPiDir = path.join(os.homedir(), ".pi");
-  const isolatedPiLink = path.join(homeDir, ".pi");
-  assert.ok(
-    fs.existsSync(realPiDir),
-    `Real ~/.pi directory must exist at ${realPiDir} for e2e tests to reuse pi auth configuration.`,
-  );
-  fs.symlinkSync(realPiDir, isolatedPiLink, "dir");
-  // Also symlink real ~/.hermes for hermes-based e2e tests (e.g., hermes
-  // canary). Hermes reads its credentials and config from ~/.hermes, the
-  // same isolation pattern as ~/.pi above. Skip silently if ~/.hermes
-  // doesn't exist (most dev machines won't have hermes installed).
-  const realHermesDir = path.join(os.homedir(), ".hermes");
-  const isolatedHermesLink = path.join(homeDir, ".hermes");
-  if (fs.existsSync(realHermesDir)) {
-    fs.symlinkSync(realHermesDir, isolatedHermesLink, "dir");
+
+  if (linkRealAgentDirs) {
+    // Symlink the real developer ~/.pi so the isolated test environment
+    // reuses the working pi auth configuration (provider, API key, model).
+    // This avoids the auth isolation mismatch where a synthesized
+    // settings.json points at providers.openai.apiKey but pi --print
+    // cannot resolve it (especially when cleanChildEnv strips env-based
+    // auth like OPENAI_API_KEY).
+    const realPiDir = path.join(os.homedir(), ".pi");
+    const isolatedPiLink = path.join(homeDir, ".pi");
+    assert.ok(
+      fs.existsSync(realPiDir),
+      `Real ~/.pi directory must exist at ${realPiDir} for e2e tests to reuse pi auth configuration.`,
+    );
+    fs.symlinkSync(realPiDir, isolatedPiLink, "dir");
+
+    // Also symlink real ~/.hermes for hermes-based e2e tests (e.g., hermes
+    // canary). Hermes reads its credentials and config from ~/.hermes, the
+    // same isolation pattern as ~/.pi above. Skip silently if ~/.hermes
+    // doesn't exist (most dev machines won't have hermes installed).
+    const realHermesDir = path.join(os.homedir(), ".hermes");
+    const isolatedHermesLink = path.join(homeDir, ".hermes");
+    if (fs.existsSync(realHermesDir)) {
+      fs.symlinkSync(realHermesDir, isolatedHermesLink, "dir");
+    }
+  } else {
+    // Zero-token tiers: create a stub ~/.pi directory with a minimal
+    // settings.json so harness spawns and workflow install don't fail
+    // on missing config. Scripted/smoke agents use canned outputs, so
+    // the stub config content doesn't matter — it just needs to exist.
+    const stubPiAgentDir = path.join(homeDir, ".pi", "agent");
+    fs.mkdirSync(stubPiAgentDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(stubPiAgentDir, "settings.json"),
+      JSON.stringify({ defaultProvider: "stub", defaultModel: "stub" }),
+      "utf-8",
+    );
   }
+
   return { root, homeDir, tamanduaDir, controlPort, dashboardPort };
 }
 

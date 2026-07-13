@@ -30,26 +30,41 @@ import {
 
 const fixtureDir = path.join(process.cwd(), "e2e-tests", "fixtures", "sample-project");
 
-describe("createTempHome pi auth symlink (regression: auth isolation mismatch)", () => {
-  it("symlinks isolated HOME .pi → real ~/.pi instead of synthesizing settings.json", async () => {
+describe("createTempHome pi auth isolation", () => {
+  it("default createTempHome() creates a stub .pi directory (not a symlink)", async () => {
+    const env = await createTempHome();
+    try {
+      const piDir = path.join(env.homeDir, ".pi");
+      assert.ok(fs.existsSync(piDir), ".pi directory should exist");
+      const stat = fs.lstatSync(piDir);
+      assert.ok(stat.isDirectory(), ".pi should be a directory");
+      assert.ok(!stat.isSymbolicLink(), ".pi should NOT be a symlink in default mode");
+
+      // Should have a stub settings.json so workflow install/harness don't fail
+      const settingsPath = path.join(piDir, "agent", "settings.json");
+      assert.ok(fs.existsSync(settingsPath), "stub settings.json should exist");
+    } finally {
+      cleanupTempHome(env);
+    }
+  });
+
+  it("createTempHome({ linkRealAgentDirs: true }) symlinks real ~/.pi", async () => {
     const realPiDir = path.join(os.homedir(), ".pi");
     assert.ok(
       fs.existsSync(realPiDir),
-      `Real ~/.pi must exist at ${realPiDir} for this regression test`,
+      `Real ~/.pi must exist at ${realPiDir} for this test`,
     );
 
-    const env = await createTempHome();
+    const env = await createTempHome({ linkRealAgentDirs: true });
     try {
       const isolatedPiLink = path.join(env.homeDir, ".pi");
       const stat = fs.lstatSync(isolatedPiLink);
 
-      // Must be a symlink, not a regular directory with a synthetic settings.json
       assert.ok(
         stat.isSymbolicLink(),
-        `Expected ${isolatedPiLink} to be a symlink to the real ~/.pi, but it is not a symlink.`,
+        `Expected ${isolatedPiLink} to be a symlink to the real ~/.pi.`,
       );
 
-      // The symlink must resolve to the real ~/.pi directory
       const resolved = fs.realpathSync(isolatedPiLink);
       assert.equal(
         resolved,
@@ -57,7 +72,6 @@ describe("createTempHome pi auth symlink (regression: auth isolation mismatch)",
         `Symlink ${isolatedPiLink} must resolve to ${realPiDir}, got ${resolved}`,
       );
 
-      // The target must be a valid pi directory with agent/settings.json
       const settingsPath = path.join(resolved, "agent", "settings.json");
       assert.ok(
         fs.existsSync(settingsPath),

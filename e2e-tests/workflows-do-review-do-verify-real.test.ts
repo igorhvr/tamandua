@@ -121,7 +121,7 @@ describe(
     // ── before: isolated environment setup ──────────────────────────────
     before(async () => {
       // Create isolated temp HOME (symlinks real ~/.pi for auth)
-      env = await createTempHome();
+      env = await createTempHome({ linkRealAgentDirs: true });
 
       // Install the do-review-do-verify workflow
       cliMustSucceed(

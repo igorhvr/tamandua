@@ -202,7 +202,7 @@ describe(
     // ── before: shared environment setup ──────────────────────────────
     before(async () => {
       // Create isolated temp HOME (symlinks real ~/.pi for auth)
-      env = await createTempHome();
+      env = await createTempHome({ linkRealAgentDirs: true });
 
       // Install both workflows
       cliMustSucceed(
@@ -910,7 +910,7 @@ describe("real e2e do-now workflow (LIVE agent, daemon, scheduler)", () => {
     "do-now creates a file in the working directory through the real pipeline",
     { timeout: 15 * 60_000 }, // 15 minutes
     async () => {
-      const env = await createTempHome();
+      const env = await createTempHome({ linkRealAgentDirs: true });
       let daemon: ChildProcess | undefined;
       try {
         cliMustSucceed(

@@ -60,7 +60,7 @@ describe("real e2e canary (LIVE model, single do-now run)", () => {
     "do-now completes through the real pipeline and accounts its tokens",
     { timeout: 15 * 60_000 }, // 15 minutes
     async () => {
-      const env = await createTempHome();
+      const env = await createTempHome({ linkRealAgentDirs: true });
       let daemon: ChildProcess | undefined;
       try {
         try {

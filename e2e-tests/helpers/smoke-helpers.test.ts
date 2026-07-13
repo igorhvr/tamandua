@@ -1,5 +1,5 @@
 /**
- * Unit tests for preserveE2eTestHome in smoke-helpers.ts.
+ * Unit tests for smoke-helpers.ts (createTempHome + preserveE2eTestHome).
  *
  * These tests create isolated temp directories and clean up after themselves.
  */
@@ -7,9 +7,10 @@
 import { describe, it, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { tamanduaTempRoot, tamanduaTempDir } from "../../src/lib/temp-dir.ts";
-import { preserveE2eTestHome } from "./smoke-helpers.ts";
+import { createTempHome, preserveE2eTestHome } from "./smoke-helpers.ts";
 
 const ARCHIVES_DIR = path.join(tamanduaTempRoot(), "e2e-failures");
 
@@ -38,6 +39,85 @@ function dirsEqual(a: string, b: string): boolean {
   }
   return true;
 }
+
+describe("createTempHome", () => {
+  it("without arguments creates a stub .pi directory (not a symlink)", async () => {
+    const env = await createTempHome();
+    const piDir = path.join(env.homeDir, ".pi");
+    assert.ok(fs.existsSync(piDir), ".pi directory should exist");
+    const stat = fs.lstatSync(piDir);
+    assert.ok(stat.isDirectory(), ".pi should be a directory");
+    assert.ok(!stat.isSymbolicLink(), ".pi should not be a symlink");
+
+    // Minimal settings.json should exist so workflow install and harness spawns work
+    const settingsJson = path.join(piDir, "agent", "settings.json");
+    assert.ok(fs.existsSync(settingsJson), "agent/settings.json should exist");
+
+    // No .hermes should be created in stub mode
+    const hermesDir = path.join(env.homeDir, ".hermes");
+    assert.ok(!fs.existsSync(hermesDir), ".hermes should not exist in stub mode");
+  });
+
+  it("with linkRealAgentDirs: true symlinks real ~/.pi and asserts it exists", async () => {
+    const realPiDir = path.join(os.homedir(), ".pi");
+    if (!fs.existsSync(realPiDir)) {
+      // Skip if real ~/.pi doesn't exist on this machine
+      return;
+    }
+    const env = await createTempHome({ linkRealAgentDirs: true });
+    const piLink = path.join(env.homeDir, ".pi");
+    assert.ok(fs.existsSync(piLink), ".pi symlink should exist");
+    const stat = fs.lstatSync(piLink);
+    assert.ok(stat.isSymbolicLink(), ".pi should be a symlink");
+    assert.equal(fs.readlinkSync(piLink), realPiDir, "symlink should point to real ~/.pi");
+  });
+
+  it("with linkRealAgentDirs: true symlinks real ~/.hermes when it exists", async () => {
+    const realHermesDir = path.join(os.homedir(), ".hermes");
+    if (!fs.existsSync(realHermesDir)) {
+      // Skip if real ~/.hermes doesn't exist on this machine
+      return;
+    }
+    const env = await createTempHome({ linkRealAgentDirs: true });
+    const hermesLink = path.join(env.homeDir, ".hermes");
+    assert.ok(fs.existsSync(hermesLink), ".hermes symlink should exist");
+    const stat = fs.lstatSync(hermesLink);
+    assert.ok(stat.isSymbolicLink(), ".hermes should be a symlink");
+    assert.equal(fs.readlinkSync(hermesLink), realHermesDir, "symlink should point to real ~/.hermes");
+  });
+
+  it("registers process-exit cleanup — temp root exists during test", async () => {
+    // createTempHome registers cleanup via process.on('exit') + SIGINT/SIGTERM.
+    // Actual cleanup is verified by checking the clean-exit directory
+    // is removed after a child process that calls createTempHome exits.
+    const env = await createTempHome();
+    assert.ok(fs.existsSync(env.root), "temp root should exist during test");
+  });
+
+  it("returns { root, homeDir, tamanduaDir, controlPort, dashboardPort }", async () => {
+    const env = await createTempHome();
+    assert.ok(fs.existsSync(env.root), "root exists");
+    assert.ok(fs.existsSync(env.homeDir), "homeDir exists");
+    assert.ok(fs.existsSync(env.tamanduaDir), "tamanduaDir exists");
+    assert.ok(env.tamanduaDir.endsWith(".tamandua"), "tamanduaDir should end with .tamandua");
+    assert.ok(
+      env.tamanduaDir.startsWith(env.homeDir),
+      "tamanduaDir should be inside homeDir",
+    );
+    assert.ok(typeof env.controlPort === "number", "controlPort should be a number");
+    assert.ok(typeof env.dashboardPort === "number", "dashboardPort should be a number");
+    assert.ok(env.controlPort > 0, "controlPort should be positive");
+    assert.ok(env.dashboardPort > 0, "dashboardPort should be positive");
+  });
+
+  it("port file is written inside tamanduaDir", async () => {
+    const env = await createTempHome();
+    const portFile = path.join(env.tamanduaDir, "port");
+    assert.ok(fs.existsSync(portFile), "port file should exist");
+    const portContent = fs.readFileSync(portFile, "utf-8");
+    assert.equal(portContent, String(env.dashboardPort), "port file should contain dashboardPort");
+  });
+});
 
 describe("preserveE2eTestHome", () => {
   const createdArchives: string[] = [];

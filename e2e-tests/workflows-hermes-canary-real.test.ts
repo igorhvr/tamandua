@@ -80,7 +80,7 @@ describe("real hermes e2e canary (LIVE hermes, single do-now run)", () => {
         return;
       }
 
-      const env = await createTempHome();
+      const env = await createTempHome({ linkRealAgentDirs: true });
       let daemon: ChildProcess | undefined;
       try {
         cliMustSucceed(
