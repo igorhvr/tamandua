@@ -4,6 +4,12 @@ import os from "node:os";
 import { assertStatePathIsolation } from "./lib/test-guard.js";
 import { LEDGER_RETENTION_MS } from "./suite/config.js";
 
+// Any change to migrate() MUST bump SCHEMA_VERSION. Missing a bump causes broken DBs.
+export const SCHEMA_VERSION = 1;
+
+// Counter for tests — increments each time migrate() runs the full DDL path.
+export let _migrateFullRuns = 0;
+
 let _db: DatabaseSync | null = null;
 let _dbPath: string | null = null;
 
@@ -55,6 +61,11 @@ export function getDb(): DatabaseSync {
 }
 
 function migrate(db: DatabaseSync): void {
+  const currentVersion = db.prepare("PRAGMA user_version").get() as { user_version: number };
+  if (currentVersion.user_version === SCHEMA_VERSION) {
+    return;
+  }
+
   db.exec(`
     CREATE TABLE IF NOT EXISTS runs (
       id TEXT PRIMARY KEY,
@@ -323,6 +334,9 @@ function migrate(db: DatabaseSync): void {
   db.exec(
     "CREATE INDEX IF NOT EXISTS idx_suite_results_lookup ON suite_results(origin_repo, tree_hash, cmd_hash, created_at)",
   );
+
+  db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+  _migrateFullRuns++;
 }
 
 export function closeDb(): void {

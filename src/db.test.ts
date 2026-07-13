@@ -1987,3 +1987,113 @@ describe("RNUM: atomic run_number allocation under interleaved connections", () 
     }
   });
 });
+
+describe("MIGV schema version short-circuit", () => {
+  let tempHome: string;
+  let origHome: string | undefined;
+  let origDbPath: string | undefined;
+  let baselineRuns: number;
+
+  const th = createTempHome("tamandua-migv-");
+
+  before(() => {
+    baselineRuns = _migrateFullRuns;
+    tempHome = th.root;
+    origHome = process.env.HOME;
+    origDbPath = process.env.TAMANDUA_DB_PATH;
+    process.env.HOME = th.homeDir;
+    delete process.env.TAMANDUA_DB_PATH;
+  });
+
+  after(() => {
+    if (origHome) {
+      process.env.HOME = origHome;
+    } else {
+      delete process.env.HOME;
+    }
+    if (origDbPath) {
+      process.env.TAMANDUA_DB_PATH = origDbPath;
+    } else {
+      delete process.env.TAMANDUA_DB_PATH;
+    }
+  });
+
+  function tableExists(db: DatabaseSync, table: string): boolean {
+    const row = db.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+    ).get(table);
+    return row !== undefined;
+  }
+
+  const EXPECTED_TABLES = [
+    "runs", "steps", "stories", "story_abandonments",
+    "run_worktrees", "autoresearch_sessions", "suite_results",
+  ];
+
+  it("fresh DB migration stamps user_version and runs full path once", () => {
+    const db = getDb();
+    const ver = db.prepare("PRAGMA user_version").get() as { user_version: number };
+    assert.equal(ver.user_version, SCHEMA_VERSION,
+      `user_version should be ${SCHEMA_VERSION} after fresh migration`);
+    assert.equal(_migrateFullRuns - baselineRuns, 1,
+      "_migrateFullRuns should have incremented by exactly 1 after first migration");
+  });
+
+  it("second getDb() returns early without re-running full migration", () => {
+    const beforeRuns = _migrateFullRuns;
+    const db = getDb();
+    const ver = db.prepare("PRAGMA user_version").get() as { user_version: number };
+    assert.equal(ver.user_version, SCHEMA_VERSION,
+      `user_version should still be ${SCHEMA_VERSION} after second getDb()`);
+    assert.equal(_migrateFullRuns, beforeRuns,
+      "_migrateFullRuns should not increment when early-return triggers");
+  });
+
+  it("DB stamped with older version runs full path and re-stamps in fresh process", () => {
+    // Downgrade user_version on the fully-migrated DB
+    const db = getDb();
+    db.exec(`PRAGMA user_version = ${SCHEMA_VERSION - 1}`);
+
+    // Verify downgrade took effect in-process
+    let ver = db.prepare("PRAGMA user_version").get() as { user_version: number };
+    assert.equal(ver.user_version, SCHEMA_VERSION - 1,
+      "user_version should be downgraded");
+
+    // Spawn a fresh Node process that opens the DB from scratch.
+    // Since user_version is stale, migrate() should run the full path
+    // and re-stamp to SCHEMA_VERSION.
+    const dbPath = getDbPath();
+    const distDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "dist");
+    const importPath = JSON.stringify(path.join(distDir, "db.js"));
+    const script = [
+      `import { getDb, SCHEMA_VERSION, _migrateFullRuns } from ${importPath};`,
+      `const db = getDb();`,
+      `const ver = db.prepare("PRAGMA user_version").get();`,
+      `console.log(JSON.stringify({ user_version: ver.user_version, fullRuns: _migrateFullRuns }));`,
+    ].join("\n");
+
+    const result = execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+      cwd: distDir,
+      env: {
+        HOME: th.homeDir,
+        TAMANDUA_DB_PATH: dbPath,
+        PATH: process.env.PATH ?? '',
+      },
+      encoding: "utf-8",
+    });
+
+    const parsed = JSON.parse(result.trim());
+    assert.equal(parsed.user_version, SCHEMA_VERSION,
+      `subprocess user_version should be ${SCHEMA_VERSION} after re-migration`);
+    assert.equal(parsed.fullRuns, 1,
+      "subprocess should have run full migration exactly once");
+  });
+
+  it("all expected tables exist after early-return; no corruption", () => {
+    const db = getDb();
+    for (const table of EXPECTED_TABLES) {
+      assert.ok(tableExists(db, table),
+        `table '${table}' should exist after early-return`);
+    }
+  });
+});

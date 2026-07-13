@@ -11,6 +11,7 @@ src/autoresearch/autoresearch.test.ts
 src/cli/cli.test.ts
 src/cli/wizard-evaluator.test.ts
 src/cli/wizard.test.ts
+src/db.test.ts
 src/doctor.test.ts
 src/installer/rugpull.test.ts
 src/installer/run-cleanup.test.ts
