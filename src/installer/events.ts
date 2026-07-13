@@ -240,18 +240,55 @@ export function _refreshSizeEstimate(): void {
 
 let isolationViolationReported = false;
 
+// ── Event Buffering ──────────────────────────────────────────────────
+
 /**
- * Emit a Tamandua event.
- *
- * Writes:
- * 1. To the run-specific JSONL file (~/.tamandua/events/<runId>.jsonl)
- * 2. To the global JSONL file (~/.tamandua/events/all.jsonl)
- * 3. Fires a webhook if a notify URL is configured for the run (fire-and-forget)
- *
- * High-volume nudge bookkeeping events (NOISE_EVENTS) are dropped unless
- * TAMANDUA_DEBUG_EVENTS is set.
+ * Module-level in-memory event buffer. When non-null, emitEvent
+ * redirects events into this array instead of writing to disk.
+ * Used to defer event emission inside a database transaction so that
+ * events are only written after commit (or discarded on rollback).
  */
-export function emitEvent(evt: TamanduaEvent): void {
+let eventBuffer: TamanduaEvent[] | null = null;
+
+/**
+ * Activate event buffering. After this call, all emitEvent calls
+ * append to an in-memory array instead of writing to disk.
+ */
+export function beginEventBuffering(): void {
+  eventBuffer = [];
+}
+
+/**
+ * Write all buffered events to disk in order, then deactivate
+ * buffering. Must only be called when eventBuffer is non-null.
+ * Each buffered event is written via emitEventCore (the raw disk
+ * path), bypassing the buffer.
+ */
+export function flushEventBuffer(): void {
+  const buf = eventBuffer;
+  eventBuffer = null;
+  if (buf) {
+    for (const evt of buf) {
+      emitEventCore(evt);
+    }
+  }
+}
+
+/**
+ * Discard all buffered events without writing them and deactivate
+ * buffering. Call on transaction rollback so no phantom events are
+ * emitted for an aborted attempt.
+ */
+export function discardEventBuffer(): void {
+  eventBuffer = null;
+}
+
+/**
+ * Core event emission logic — writes to files and fires webhook.
+ * This is the raw path that bypasses buffer checks; callers that
+ * already decided NOT to buffer (or are flushing) use this directly.
+ */
+function emitEventCore(evt: TamanduaEvent): void {
   if (NOISE_EVENTS.has(evt.event) && !isEnvFlagEnabled(process.env.TAMANDUA_DEBUG_EVENTS)) {
     return;
   }
@@ -317,6 +354,29 @@ export function emitEvent(evt: TamanduaEvent): void {
       error: String(err),
     });
   });
+}
+
+/**
+ * Emit a Tamandua event.
+ *
+ * Writes:
+ * 1. To the run-specific JSONL file (~/.tamandua/events/<runId>.jsonl)
+ * 2. To the global JSONL file (~/.tamandua/events/all.jsonl)
+ * 3. Fires a webhook if a notify URL is configured for the run (fire-and-forget)
+ *
+ * High-volume nudge bookkeeping events (NOISE_EVENTS) are dropped unless
+ * TAMANDUA_DEBUG_EVENTS is set.
+ *
+ * When buffering is active (eventBuffer !== null), events are appended to
+ * the in-memory buffer and no disk I/O occurs. Callers must flush or discard
+ * the buffer after the transaction boundary.
+ */
+export function emitEvent(evt: TamanduaEvent): void {
+  if (eventBuffer !== null) {
+    eventBuffer.push(evt);
+    return;
+  }
+  emitEventCore(evt);
 }
 
 // ── Tail-window reading constants ───────────────────────────────────

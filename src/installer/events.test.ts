@@ -10,6 +10,9 @@ import { DatabaseSync } from "node:sqlite";
 import {
   readEventsFromCursor,
   emitEvent,
+  beginEventBuffering,
+  flushEventBuffer,
+  discardEventBuffer,
   getRecentEvents,
   getRunEvents,
   countRunEvents,
@@ -1697,5 +1700,227 @@ describe("getRecentEvents after rotation", () => {
 
     // Must not contain archive events
     assert.ok(!events.includes("rotation.trigger"), "limit must not include archive events");
+  });
+});
+
+describe("event buffering", () => {
+  let stateDir: string;
+  let originalStateDir: string | undefined;
+
+  beforeEach(() => {
+    originalStateDir = process.env.TAMANDUA_STATE_DIR;
+    stateDir = tamanduaTempDir("tamandua-buffer-");
+    process.env.TAMANDUA_STATE_DIR = stateDir;
+  });
+
+  afterEach(() => {
+    if (originalStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+    else process.env.TAMANDUA_STATE_DIR = originalStateDir;
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  it("emitEvent redirects to buffer when buffering is active", () => {
+    beginEventBuffering();
+
+    emitEvent(makeEvent("run-buf", "run.started"));
+    emitEvent(makeEvent("run-buf", "step.running"));
+    emitEvent(makeEvent("run-buf", "step.done"));
+
+    // No files should be written yet
+    const runFile = path.join(stateDir, "events", "run-buf.jsonl");
+    const globalFile = path.join(stateDir, "events", "all.jsonl");
+    assert.ok(!fs.existsSync(runFile), "run events file must not exist while buffering");
+    assert.ok(!fs.existsSync(globalFile), "global events file must not exist while buffering");
+
+    discardEventBuffer();
+  });
+
+  it("flushEventBuffer writes all buffered events to disk in order", () => {
+    beginEventBuffering();
+
+    emitEvent(makeEvent("run-buf2", "run.started"));
+    emitEvent(makeEvent("run-buf2", "step.running"));
+    emitEvent(makeEvent("run-buf2", "step.done"));
+
+    flushEventBuffer();
+
+    // Files should now exist with all three events
+    const runFile = path.join(stateDir, "events", "run-buf2.jsonl");
+    const globalFile = path.join(stateDir, "events", "all.jsonl");
+    assert.ok(fs.existsSync(runFile), "run events file must exist after flush");
+    assert.ok(fs.existsSync(globalFile), "global events file must exist after flush");
+
+    const runContent = fs.readFileSync(runFile, "utf-8");
+    const lines = runContent.trim().split("\n");
+    assert.equal(lines.length, 3, "must have 3 events");
+
+    const events = lines.map((l: string) => JSON.parse(l));
+    assert.equal(events[0].event, "run.started");
+    assert.equal(events[1].event, "step.running");
+    assert.equal(events[2].event, "step.done");
+  });
+
+  it("flushEventBuffer clears the buffer after writing", () => {
+    beginEventBuffering();
+    emitEvent(makeEvent("run-buf3", "run.started"));
+    flushEventBuffer();
+
+    // After flush, new emitEvent calls should go directly to disk
+    emitEvent(makeEvent("run-buf3", "step.running"));
+
+    const runFile = path.join(stateDir, "events", "run-buf3.jsonl");
+    const content = fs.readFileSync(runFile, "utf-8");
+    const lines = content.trim().split("\n");
+    assert.equal(lines.length, 2, "must have 2 events (1 buffered + 1 direct)");
+  });
+
+  it("discardEventBuffer drops events without writing to disk", () => {
+    beginEventBuffering();
+
+    emitEvent(makeEvent("run-discard", "run.started"));
+    emitEvent(makeEvent("run-discard", "step.running"));
+
+    discardEventBuffer();
+
+    // No files should be written
+    const runFile = path.join(stateDir, "events", "run-discard.jsonl");
+    const globalFile = path.join(stateDir, "events", "all.jsonl");
+    assert.ok(!fs.existsSync(runFile), "run events file must not exist after discard");
+    assert.ok(!fs.existsSync(globalFile), "global events file must not exist after discard");
+  });
+
+  it("discardEventBuffer deactivates buffering so subsequent emits go to disk", () => {
+    beginEventBuffering();
+    emitEvent(makeEvent("run-d2", "dropped"));
+    discardEventBuffer();
+
+    // Now emit normally — should go to disk
+    emitEvent(makeEvent("run-d2", "kept"));
+
+    const runFile = path.join(stateDir, "events", "run-d2.jsonl");
+    const content = fs.readFileSync(runFile, "utf-8");
+    assert.ok(content.includes("kept"), "post-discard event must be written");
+    assert.ok(!content.includes("dropped"), "discarded event must not be written");
+  });
+
+  it("flushEventBuffer writes to both run and global files", () => {
+    beginEventBuffering();
+    emitEvent(makeEvent("run-both", "run.completed"));
+    flushEventBuffer();
+
+    const runFile = path.join(stateDir, "events", "run-both.jsonl");
+    const globalFile = path.join(stateDir, "events", "all.jsonl");
+    assert.ok(fs.existsSync(runFile), "run events file must exist");
+    assert.ok(fs.existsSync(globalFile), "global events file must exist");
+
+    const runContent = fs.readFileSync(runFile, "utf-8").trim();
+    const globalContent = fs.readFileSync(globalFile, "utf-8").trim();
+    assert.equal(runContent, globalContent, "run and global files must have same content");
+  });
+
+  it("flushEventBuffer replays events in insertion order", () => {
+    beginEventBuffering();
+
+    const expected: string[] = [];
+    for (let i = 0; i < 20; i++) {
+      const evt = makeEvent("run-order", `event.${i}`);
+      emitEvent(evt);
+      expected.push(evt.event);
+    }
+
+    flushEventBuffer();
+
+    const runFile = path.join(stateDir, "events", "run-order.jsonl");
+    const content = fs.readFileSync(runFile, "utf-8");
+    const lines = content.trim().split("\n");
+    assert.equal(lines.length, 20);
+
+    for (let i = 0; i < lines.length; i++) {
+      const parsed = JSON.parse(lines[i]!);
+      assert.equal(parsed.event, expected[i]);
+    }
+  });
+
+  it("emitEvent still writes directly when buffer is null (normal mode)", () => {
+    // No buffering active — should write directly
+    emitEvent(makeEvent("run-normal", "run.started"));
+
+    const runFile = path.join(stateDir, "events", "run-normal.jsonl");
+    assert.ok(fs.existsSync(runFile), "event must be written directly when buffer is null");
+  });
+
+  it("noise events are still suppressed during buffering", () => {
+    const prev = process.env.TAMANDUA_DEBUG_EVENTS;
+    delete process.env.TAMANDUA_DEBUG_EVENTS;
+    try {
+      beginEventBuffering();
+      emitEvent(makeEvent("run-noise", "run.nudged"));
+      emitEvent(makeEvent("run-noise", "agent.nudged"));
+      emitEvent(makeEvent("run-noise", "step.completed"));
+      flushEventBuffer();
+
+      // Only step.completed should be written
+      const runFile = path.join(stateDir, "events", "run-noise.jsonl");
+      const content = fs.readFileSync(runFile, "utf-8");
+      assert.ok(content.includes("step.completed"), "real event must be written");
+      assert.ok(!content.includes("run.nudged"), "noise event must be suppressed");
+      assert.ok(!content.includes("agent.nudged"), "noise event must be suppressed");
+    } finally {
+      if (prev !== undefined) process.env.TAMANDUA_DEBUG_EVENTS = prev;
+    }
+  });
+
+  it("discardEventBuffer is safe to call when not buffering", () => {
+    assert.doesNotThrow(() => discardEventBuffer());
+    // emitEvent should still work normally
+    emitEvent(makeEvent("run-safe", "run.started"));
+    const runFile = path.join(stateDir, "events", "run-safe.jsonl");
+    assert.ok(fs.existsSync(runFile));
+  });
+
+  it("flushEventBuffer is safe to call when not buffering (empty buffer)", () => {
+    // Should not throw — eventBuffer is null
+    assert.doesNotThrow(() => flushEventBuffer());
+  });
+
+  it("multiple begin/flush cycles work correctly", () => {
+    // First cycle
+    beginEventBuffering();
+    emitEvent(makeEvent("run-multi", "batch.1.1"));
+    emitEvent(makeEvent("run-multi", "batch.1.2"));
+    flushEventBuffer();
+
+    // Second cycle
+    beginEventBuffering();
+    emitEvent(makeEvent("run-multi", "batch.2.1"));
+    emitEvent(makeEvent("run-multi", "batch.2.2"));
+    flushEventBuffer();
+
+    // All 4 events should be written, in order
+    const runFile = path.join(stateDir, "events", "run-multi.jsonl");
+    const content = fs.readFileSync(runFile, "utf-8");
+    const lines = content.trim().split("\n");
+    assert.equal(lines.length, 4);
+
+    const events = lines.map((l: string) => JSON.parse(l).event);
+    assert.deepEqual(events, ["batch.1.1", "batch.1.2", "batch.2.1", "batch.2.2"]);
+  });
+
+  it("multiple begin/discard cycles work correctly", () => {
+    // First cycle — discard
+    beginEventBuffering();
+    emitEvent(makeEvent("run-drop", "should.be.dropped.1"));
+    discardEventBuffer();
+
+    // Second cycle — flush
+    beginEventBuffering();
+    emitEvent(makeEvent("run-drop", "should.be.kept"));
+    flushEventBuffer();
+
+    const runFile = path.join(stateDir, "events", "run-drop.jsonl");
+    const content = fs.readFileSync(runFile, "utf-8");
+    assert.ok(content.includes("should.be.kept"), "kept event must be written");
+    assert.ok(!content.includes("should.be.dropped.1"), "dropped event must not be written");
+    assert.equal(content.trim().split("\n").length, 1, "only one event written");
   });
 });

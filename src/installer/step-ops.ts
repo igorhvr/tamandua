@@ -5,7 +5,7 @@ import { execSync, execFileSync } from "node:child_process";
 import { getDb } from "../db.js";
 import { resolvePiStateDir, resolveWorkflowDir, resolveTamanduaCli, resolveRunRoot } from "./paths.js";
 import { teardownWorkflowCronsIfIdle } from "./agent-scheduler.js";
-import { emitEvent } from "./events.js";
+import { emitEvent, beginEventBuffering, flushEventBuffer, discardEventBuffer } from "./events.js";
 import { logger } from "../lib/logger.js";
 import { getMaxRoleTimeoutSeconds } from "./install.js";
 import { loadWorkflowSpec, loadWorkflowSpecSync } from "./workflow-spec.js";
@@ -2404,6 +2404,19 @@ export function finalizeDrainingPause(runId: string): void {
  */
 export function completeStep(stepId: string, output: string): { status: string; detail?: string } {
   const result = completeStepInternal(stepId, output);
+
+  // Write story plan to progress log after successful completion.
+  // Hoisted out of completeStepInternal so that no file I/O executes
+  // inside the upcoming database transaction (US-003).
+  // writeStoryPlanToProgress is idempotent: it checks runHasStories()
+  // and returns early if no stories exist.
+  if (result.status === "advanced" || result.status === "completed" || result.status === "rerouted") {
+    const runIdRow = getDb().prepare("SELECT run_id FROM steps WHERE id = ?").get(stepId) as { run_id: string } | undefined;
+    if (runIdRow) {
+      writeStoryPlanToProgress(runIdRow.run_id);
+    }
+  }
+
   // The pipeline just moved: a downstream step may have been promoted to
   // 'pending' (advanced) or this step was re-pended for retry. Nudge the
   // daemon so the dispatch motor picks it up immediately.
@@ -2416,7 +2429,8 @@ export function completeStep(stepId: string, output: string): { status: string; 
 function completeStepInternal(stepId: string, output: string): { status: string; detail?: string } {
   const db = getDb();
 
-  const step = db.prepare(
+  const body = (): { status: string; detail?: string } => {
+    const step = db.prepare(
     "SELECT id, run_id, step_id, step_index, type, loop_config, current_story_id, expects, input_template, status, claim_invalidated_by, claim_updated_at, updated_at FROM steps WHERE id = ?"
   ).get(stepId) as {
     id: string; run_id: string; step_id: string; step_index: number; type: string;
@@ -2584,9 +2598,6 @@ function completeStepInternal(stepId: string, output: string): { status: string;
     finalizeDrainingPause(step.run_id);
     return { status: "retrying", detail: errorDetail };
   }
-
-  // Write story plan to progress log after STORIES_JSON is parsed
-  writeStoryPlanToProgress(runId);
 
   // Robustness: if there is a downstream loop-over-stories and this run still
   // has no stories, the story-producing step's output is incomplete. For steps
@@ -2780,7 +2791,21 @@ function completeStepInternal(stepId: string, output: string): { status: string;
 
   const pipelineResult = advancePipeline(step.run_id);
   finalizeDrainingPause(step.run_id);
-  return { status: pipelineResult.runCompleted ? "completed" : "advanced" };
+      return { status: pipelineResult.runCompleted ? "completed" : "advanced" };
+  };
+
+  beginEventBuffering();
+  try {
+    db.exec("BEGIN IMMEDIATE");
+    const result = body();
+    db.exec("COMMIT");
+    flushEventBuffer();
+    return result;
+  } catch (e) {
+    try { db.exec("ROLLBACK"); } catch { /* ignore rollback errors */ }
+    discardEventBuffer();
+    throw e;
+  }
 }
 
 /**

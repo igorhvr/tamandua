@@ -5455,3 +5455,528 @@ describe("claimStep atomic undo on post-claim failure (CLTX)", () => {
     assert.equal(step.claim_pid, 99999, "claim_pid should be recorded");
   });
 });
+
+describe("completeStepInternal IMMEDIATE transaction (US-003 ATOM)", () => {
+  const _savedStateDir = process.env.TAMANDUA_STATE_DIR;
+  const _savedDbPath = process.env.TAMANDUA_DB_PATH;
+  const th = createTempHome("tamandua-atom-txn-test-");
+
+  before(async () => {
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_DB_PATH = path.join(th.tamanduaDir, "tamandua.db");
+  });
+
+  after(() => {
+    if (_savedStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+    else process.env.TAMANDUA_STATE_DIR = _savedStateDir;
+    if (_savedDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+    else process.env.TAMANDUA_DB_PATH = _savedDbPath;
+  });
+
+  function ts(): string {
+    return new Date().toISOString().replace("T", " ").slice(0, 19);
+  }
+
+  it("happy path: step completed, context merged, pipeline advanced, events emitted", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const stepId1 = crypto.randomUUID();
+    const stepId2 = crypto.randomUUID();
+    const seedNow = ts();
+
+    const seededContext = JSON.stringify({ task: "test task", repo: "/tmp/repo", branch: "test-branch" });
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 1, 'test-atom-wf', 'test task', 'running', ?, 0, ?, ?)"
+    ).run(runId, seededContext, seedNow, seedNow);
+
+    // Step 1: running, ready to complete
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, output, loop_config, current_story_id, abandoned_count, created_at, updated_at) VALUES (?, ?, 'step1', 'test-wf_agent', 0, 'Do work', 'STATUS: done', 'running', 0, 3, 'single', NULL, NULL, NULL, 0, ?, ?)"
+    ).run(stepId1, runId, seedNow, seedNow);
+
+    // Step 2: waiting (downstream)
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, output, loop_config, current_story_id, abandoned_count, created_at, updated_at) VALUES (?, ?, 'step2', 'test-wf_agent2', 1, 'Continue', 'STATUS: done', 'waiting', 0, 3, 'single', NULL, NULL, NULL, 0, ?, ?)"
+    ).run(stepId2, runId, seedNow, seedNow);
+
+    const output = "STATUS: done\nCHANGES: implemented feature\nTESTS: all pass\nCUSTOM_KEY: custom-value";
+    const result = completeStep(stepId1, output);
+
+    assert.equal(result.status, "advanced", "step should advance pipeline");
+
+    // Verify step status is done
+    const step = db.prepare("SELECT status, output FROM steps WHERE id = ?").get(stepId1) as any;
+    assert.equal(step.status, "done", "step should be done");
+    assert.equal(step.output, output, "step output should be saved");
+
+    // Verify context was merged
+    const run = db.prepare("SELECT context FROM runs WHERE id = ?").get(runId) as any;
+    const context = JSON.parse(run.context);
+    assert.equal(context.changes, "implemented feature", "CHANGES key should be in context");
+    assert.equal(context.tests, "all pass", "TESTS key should be in context");
+    assert.equal(context.custom_key, "custom-value", "CUSTOM_KEY should be in context");
+    assert.equal(context.status, "done", "STATUS key should be in context");
+
+    // Verify pipeline advanced — step2 should now be pending
+    const step2 = db.prepare("SELECT status FROM steps WHERE id = ?").get(stepId2) as any;
+    assert.equal(step2.status, "pending", "downstream step should be advanced to pending");
+
+    // Verify events were emitted (buffered then flushed)
+    const events = getRunEvents(runId);
+    assert.ok(events.some(e => e.event === "step.done"), "step.done event should be emitted");
+    assert.ok(events.some(e => e.event === "pipeline.advanced"), "pipeline.advanced event should be emitted");
+  });
+
+  it("already-done guard: second completion returns blocked, no double apply", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const stepId = crypto.randomUUID();
+    const seedNow = ts();
+
+    const seededContext = JSON.stringify({ task: "test", repo: "/tmp/repo", branch: "test-branch" });
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 1, 'test-atom-guard', 'test', 'running', ?, 0, ?, ?)"
+    ).run(runId, seededContext, seedNow, seedNow);
+
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, output, loop_config, current_story_id, abandoned_count, created_at, updated_at) VALUES (?, ?, 'the-step', 'test-wf_agent', 0, 'Work', 'STATUS: done', 'running', 0, 3, 'single', NULL, NULL, NULL, 0, ?, ?)"
+    ).run(stepId, runId, seedNow, seedNow);
+
+    // First completion — should succeed (single step: returns 'completed')
+    const result1 = completeStep(stepId, "STATUS: done\nCHANGES: first");
+    assert.ok(["advanced", "completed"].includes(result1.status),
+      `first completion should succeed, got: ${result1.status}`);
+
+    // Second completion — should return blocked
+    const result2 = completeStep(stepId, "STATUS: done\nCHANGES: second");
+    assert.equal(result2.status, "blocked", "second completion should be blocked");
+    assert.ok(result2.detail?.includes("already done"), "block detail should mention already done");
+
+    // Verify step output was NOT overwritten by second attempt
+    const step = db.prepare("SELECT status, output FROM steps WHERE id = ?").get(stepId) as any;
+    assert.equal(step.status, "done", "step should still be done");
+    assert.equal(step.output, "STATUS: done\nCHANGES: first", "output should be from first completion");
+
+    // Verify context was NOT overwritten
+    const run = db.prepare("SELECT context FROM runs WHERE id = ?").get(runId) as any;
+    const context = JSON.parse(run.context);
+    assert.equal(context.changes, "first", "context should have first CHANGES, not second");
+  });
+
+  it("retry path: events are emitted via buffer when retrying", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const stepId = crypto.randomUUID();
+    const seedNow = ts();
+
+    const seededContext = JSON.stringify({ task: "test", repo: "/tmp/repo", branch: "test-branch" });
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 1, 'test-atom-retry', 'test', 'running', ?, 0, ?, ?)"
+    ).run(runId, seededContext, seedNow, seedNow);
+
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, output, loop_config, current_story_id, abandoned_count, created_at, updated_at) VALUES (?, ?, 'the-step', 'test-wf_agent', 0, 'Work', 'STATUS: done', 'running', 0, 3, 'single', NULL, NULL, NULL, 0, ?, ?)"
+    ).run(stepId, runId, seedNow, seedNow);
+
+    // Output that doesn't match STATUS: done expects → should retry
+    const result = completeStep(stepId, "MISSING: status line");
+
+    assert.equal(result.status, "retrying", "should trigger retry on validation failure");
+    assert.ok(result.detail?.includes("STATUS: done"), "detail should mention missing STATUS");
+
+    // Verify step status is pending (retry re-pended)
+    const step = db.prepare("SELECT status, retry_count FROM steps WHERE id = ?").get(stepId) as any;
+    assert.equal(step.status, "pending", "step should be pending for retry");
+    assert.equal(step.retry_count, 1, "retry_count should be 1");
+
+    // Verify step.retry event was emitted
+    const events = getRunEvents(runId);
+    assert.ok(events.some(e => e.event === "step.retry"), "step.retry event should be emitted");
+  });
+
+  it("no new step status introduced — step states are only done/failed/pending/running/waiting", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const stepId = crypto.randomUUID();
+    const seedNow = ts();
+
+    const seededContext = JSON.stringify({ task: "test", repo: "/tmp/repo", branch: "test-branch" });
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 1, 'test-atom-no-new-status', 'test', 'running', ?, 0, ?, ?)"
+    ).run(runId, seededContext, seedNow, seedNow);
+
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, output, loop_config, current_story_id, abandoned_count, created_at, updated_at) VALUES (?, ?, 'the-step', 'test-wf_agent', 0, 'Work', 'STATUS: done', 'running', 0, 3, 'single', NULL, NULL, NULL, 0, ?, ?)"
+    ).run(stepId, runId, seedNow, seedNow);
+
+    // Step starts as 'running'
+    const stepBefore = db.prepare("SELECT status FROM steps WHERE id = ?").get(stepId) as any;
+    assert.equal(stepBefore.status, "running");
+
+    completeStep(stepId, "STATUS: done\nCHANGES: done");
+
+    // Step ends as 'done' — no 'completing' or other intermediate status
+    const stepAfter = db.prepare("SELECT status FROM steps WHERE id = ?").get(stepId) as any;
+    assert.equal(stepAfter.status, "done");
+
+    // Verify steps table only has known statuses
+    const statuses = db.prepare("SELECT DISTINCT status FROM steps WHERE run_id = ?").all(runId) as any[];
+    const allowed = new Set(["running", "done", "failed", "pending", "waiting", "skipped"]);
+    for (const row of statuses) {
+      assert.ok(allowed.has(row.status), `unexpected step status: ${row.status}`);
+    }
+  });
+
+  it("context not merged on duplicate (blocked) completion", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const stepId = crypto.randomUUID();
+    const seedNow = ts();
+
+    const seededContext = JSON.stringify({ task: "test", repo: "/tmp/repo", branch: "test-branch" });
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 1, 'test-atom-ctx-guard', 'test', 'running', ?, 0, ?, ?)"
+    ).run(runId, seededContext, seedNow, seedNow);
+
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, output, loop_config, current_story_id, abandoned_count, created_at, updated_at) VALUES (?, ?, 'the-step', 'test-wf_agent', 0, 'Work', 'STATUS: done', 'running', 0, 3, 'single', NULL, NULL, NULL, 0, ?, ?)"
+    ).run(stepId, runId, seedNow, seedNow);
+
+    // First completion merges FIRST_KEY
+    completeStep(stepId, "STATUS: done\nFIRST_KEY: first-value");
+
+    // Second completion tries to merge SECOND_KEY
+    completeStep(stepId, "STATUS: done\nSECOND_KEY: second-value");
+
+    // Only FIRST_KEY should be in context
+    const run = db.prepare("SELECT context FROM runs WHERE id = ?").get(runId) as any;
+    const context = JSON.parse(run.context);
+    assert.equal(context.first_key, "first-value", "first_key should be present");
+    assert.equal(context.second_key, undefined, "second_key should NOT be present — blocked completion");
+    assert.equal(context.status, "done");
+  });
+});
+
+describe("completeStepInternal crash recovery and concurrent completion (US-004 ATOM)", () => {
+  const _savedStateDir = process.env.TAMANDUA_STATE_DIR;
+  const _savedDbPath = process.env.TAMANDUA_DB_PATH;
+  const th = createTempHome("tamandua-us004-test-");
+
+  before(async () => {
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_DB_PATH = path.join(th.tamanduaDir, "tamandua.db");
+  });
+
+  after(() => {
+    if (_savedStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+    else process.env.TAMANDUA_STATE_DIR = _savedStateDir;
+    if (_savedDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+    else process.env.TAMANDUA_DB_PATH = _savedDbPath;
+  });
+
+  function ts(): string {
+    return new Date().toISOString().replace("T", " ").slice(0, 19);
+  }
+
+  // ── Test 1: Concurrent completions from separate DB connections ──
+
+  it("concurrent completions: exactly one applies, the other returns blocked", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const stepId1 = crypto.randomUUID();
+    const stepId2 = crypto.randomUUID();
+    const seedNow = ts();
+
+    const seededContext = JSON.stringify({ task: "test concurrent", repo: "/tmp/repo", branch: "test-branch" });
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 1, 'us004-concurrent', 'test concurrent', 'running', ?, 0, ?, ?)"
+    ).run(runId, seededContext, seedNow, seedNow);
+
+    // Step 1: running, ready to complete
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, output, loop_config, current_story_id, abandoned_count, created_at, updated_at) VALUES (?, ?, 'step1', 'us004_agent', 0, 'Do work', 'STATUS: done', 'running', 0, 3, 'single', NULL, NULL, NULL, 0, ?, ?)"
+    ).run(stepId1, runId, seedNow, seedNow);
+
+    // Step 2: waiting (downstream — will be advanced by first completion)
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, output, loop_config, current_story_id, abandoned_count, created_at, updated_at) VALUES (?, ?, 'step2', 'us004_agent2', 1, 'Continue', 'STATUS: done', 'waiting', 0, 3, 'single', NULL, NULL, NULL, 0, ?, ?)"
+    ).run(stepId2, runId, seedNow, seedNow);
+
+    const storyJson = JSON.stringify([
+      { id: "US-001", title: "Test Story", description: "A test story for concurrent test", acceptanceCriteria: ["Test passes"] }
+    ]);
+    const output = `STATUS: done\nCHANGES: implemented feature\nTESTS: all pass\nSTORIES_JSON: ${storyJson}`;
+
+    // First completion — should succeed
+    const result1 = completeStep(stepId1, output);
+    assert.ok(["advanced", "completed"].includes(result1.status),
+      `first completion should succeed, got: ${result1.status}`);
+
+    // Second completion (simulating concurrent process) — should return blocked
+    const result2 = completeStep(stepId1, "STATUS: done\nCHANGES: second-attempt");
+    assert.equal(result2.status, "blocked", "second completion must be blocked");
+    assert.ok(result2.detail?.includes("already done"),
+      `block detail must mention 'already done', got: ${result2.detail}`);
+
+    // Verify step is done with first output
+    const step = db.prepare("SELECT status, output FROM steps WHERE id = ?").get(stepId1) as any;
+    assert.equal(step.status, "done", "step must be done");
+    assert.equal(step.output, output, "output must be from first completion");
+
+    // Verify context merged exactly once (only first values)
+    const run = db.prepare("SELECT context FROM runs WHERE id = ?").get(runId) as any;
+    const context = JSON.parse(run.context);
+    assert.equal(context.changes, "implemented feature", "CHANGES must be from first completion");
+    assert.equal(context.second_key, undefined, "second attempt keys must not be in context");
+
+    // Verify stories inserted exactly once
+    const stories = db.prepare("SELECT id, story_id, title, status FROM stories WHERE run_id = ?").all(runId) as any[];
+    assert.equal(stories.length, 1, "exactly one story must be inserted");
+    assert.equal(stories[0].story_id, "US-001", "story_id must match");
+    assert.equal(stories[0].status, "pending", "story must be pending");
+
+    // Verify pipeline advanced exactly once — step2 must be pending
+    const step2 = db.prepare("SELECT status FROM steps WHERE id = ?").get(stepId2) as any;
+    assert.equal(step2.status, "pending", "downstream step must be pending (advanced exactly once)");
+
+    // Verify events: step.done and pipeline.advanced emitted exactly once
+    const events = getRunEvents(runId);
+    const doneEvents = events.filter(e => e.event === "step.done");
+    assert.equal(doneEvents.length, 1, "exactly one step.done event must be emitted");
+    const advancedEvents = events.filter(e => e.event === "pipeline.advanced");
+    assert.equal(advancedEvents.length, 1, "exactly one pipeline.advanced event must be emitted");
+
+    // Verify no blocked events or duplicate events exist
+    const totalEvents = events.length;
+    assert.ok(totalEvents >= 2, `expected at least 2 events, got ${totalEvents}`);
+  });
+
+  it("concurrent completions: verify from separate DB connection that state is committed", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const stepId1 = crypto.randomUUID();
+    const stepId2 = crypto.randomUUID();
+    const seedNow = ts();
+
+    const seededContext = JSON.stringify({ task: "test separate conn", repo: "/tmp/repo", branch: "test-branch" });
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 1, 'us004-separate-conn', 'test separate conn', 'running', ?, 0, ?, ?)"
+    ).run(runId, seededContext, seedNow, seedNow);
+
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, output, loop_config, current_story_id, abandoned_count, created_at, updated_at) VALUES (?, ?, 'step1', 'us004_agent', 0, 'Work', 'STATUS: done', 'running', 0, 3, 'single', NULL, NULL, NULL, 0, ?, ?)"
+    ).run(stepId1, runId, seedNow, seedNow);
+
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, output, loop_config, current_story_id, abandoned_count, created_at, updated_at) VALUES (?, ?, 'step2', 'us004_agent2', 1, 'Continue', 'STATUS: done', 'waiting', 0, 3, 'single', NULL, NULL, NULL, 0, ?, ?)"
+    ).run(stepId2, runId, seedNow, seedNow);
+
+    const output = "STATUS: done\nCHANGES: from-first-connection\nCUSTOM_KEY: custom-value";
+
+    // First completion succeeds
+    const result1 = completeStep(stepId1, output);
+    assert.ok(["advanced", "completed"].includes(result1.status),
+      `first completion must succeed, got: ${result1.status}`);
+
+    // Open a second, independent DatabaseSync connection to the same file
+    const dbPath = process.env.TAMANDUA_DB_PATH!;
+    const { DatabaseSync } = await import("node:sqlite");
+    const db2 = new DatabaseSync(dbPath);
+
+    try {
+      // Second connection sees committed state immediately
+      const step2FromDb2 = db2.prepare("SELECT status FROM steps WHERE id = ?").get(stepId1) as any;
+      assert.equal(step2FromDb2.status, "done", "second connection must see step as done");
+
+      // Second connection sees downstream step advanced
+      const step2FromDb2Down = db2.prepare("SELECT status FROM steps WHERE id = ?").get(stepId2) as any;
+      assert.equal(step2FromDb2Down.status, "pending", "second connection must see downstream step as pending");
+
+      // Second connection sees context merged
+      const runFromDb2 = db2.prepare("SELECT context FROM runs WHERE id = ?").get(runId) as any;
+      const context = JSON.parse(runFromDb2.context);
+      assert.equal(context.changes, "from-first-connection", "second connection must see merged context");
+    } finally {
+      db2.close();
+    }
+
+    // Now call completeStep again — must be blocked
+    const result2 = completeStep(stepId1, "STATUS: done\nCHANGES: second-attempt");
+    assert.equal(result2.status, "blocked", "second completion must be blocked");
+  });
+
+  // ── Test 2: Simulated crash — transaction rollback on throw ──
+
+  it("simulated crash: injected throw rolls back all writes, step stays running", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const stepId1 = crypto.randomUUID();
+    const stepId2 = crypto.randomUUID();
+    const seedNow = ts();
+
+    const seededContext = JSON.stringify({ task: "test crash", repo: "/tmp/repo", branch: "test-branch" });
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 1, 'us004-crash', 'test crash', 'running', ?, 0, ?, ?)"
+    ).run(runId, seededContext, seedNow, seedNow);
+
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, output, loop_config, current_story_id, abandoned_count, created_at, updated_at) VALUES (?, ?, 'step1', 'us004_agent', 0, 'Work', 'STATUS: done', 'running', 0, 3, 'single', NULL, NULL, NULL, 0, ?, ?)"
+    ).run(stepId1, runId, seedNow, seedNow);
+
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, output, loop_config, current_story_id, abandoned_count, created_at, updated_at) VALUES (?, ?, 'step2', 'us004_agent2', 1, 'Continue', 'STATUS: done', 'waiting', 0, 3, 'single', NULL, NULL, NULL, 0, ?, ?)"
+    ).run(stepId2, runId, seedNow, seedNow);
+
+    // Mock db.exec to simulate a crash during COMMIT (injected throw mid-transaction)
+    // The body() closure completes all its DB writes, but COMMIT throws,
+    // causing the transaction to rollback and all writes to be undone.
+    const origExec = db.exec.bind(db);
+    mock.method(db, "exec", (sql: string) => {
+      if (sql === "COMMIT") {
+        throw new Error("Simulated crash during commit");
+      }
+      return origExec(sql);
+    });
+
+    const output = "STATUS: done\nCHANGES: should-be-rolled-back\nCRASH_KEY: rolled-back";
+
+    // completeStep should throw because completeStepInternal re-throws after rollback
+    assert.throws(
+      () => completeStep(stepId1, output),
+      /Simulated crash during commit/,
+      "completeStep must throw on simulated crash"
+    );
+
+    // Restore the mock so subsequent calls use the real exec
+    mock.restoreAll();
+
+    // Verify step status remains 'running' (was rolled back from 'done')
+    const step = db.prepare("SELECT status, output FROM steps WHERE id = ?").get(stepId1) as any;
+    assert.equal(step.status, "running", "step must still be running after rollback");
+
+    // Verify context was NOT modified (rolled back)
+    const run = db.prepare("SELECT context FROM runs WHERE id = ?").get(runId) as any;
+    const context = JSON.parse(run.context);
+    assert.equal(context.changes, undefined, "CHANGES must NOT be in context after rollback");
+    assert.equal(context.crash_key, undefined, "CRASH_KEY must NOT be in context after rollback");
+
+    // Verify no stories inserted
+    const stories = db.prepare("SELECT COUNT(*) as cnt FROM stories WHERE run_id = ?").get(runId) as any;
+    assert.equal(stories.cnt, 0, "no stories must be inserted after rollback");
+
+    // Verify pipeline was NOT advanced — step2 must still be waiting
+    const step2 = db.prepare("SELECT status FROM steps WHERE id = ?").get(stepId2) as any;
+    assert.equal(step2.status, "waiting", "downstream step must still be waiting after rollback");
+
+    // Verify NO events were emitted for the aborted attempt
+    const events = getRunEvents(runId);
+    assert.equal(events.length, 0, "no events must be emitted for aborted attempt");
+
+    // ── Retry: completeStep must succeed cleanly after crash recovery ──
+    const retryOutput = "STATUS: done\nCHANGES: retry-after-crash\nRETRY_KEY: success";
+    const result = completeStep(stepId1, retryOutput);
+    assert.ok(["advanced", "completed"].includes(result.status),
+      `retry after crash must succeed, got: ${result.status}`);
+
+    // Verify step is now done with retry output
+    const stepAfter = db.prepare("SELECT status, output FROM steps WHERE id = ?").get(stepId1) as any;
+    assert.equal(stepAfter.status, "done", "step must be done after retry");
+    assert.equal(stepAfter.output, retryOutput, "output must be from retry");
+
+    // Verify context has retry values
+    const runAfter = db.prepare("SELECT context FROM runs WHERE id = ?").get(runId) as any;
+    const ctxAfter = JSON.parse(runAfter.context);
+    assert.equal(ctxAfter.changes, "retry-after-crash", "context must have retry CHANGES");
+    assert.equal(ctxAfter.retry_key, "success", "context must have retry RETRY_KEY");
+
+    // Verify pipeline advanced on retry
+    const step2After = db.prepare("SELECT status FROM steps WHERE id = ?").get(stepId2) as any;
+    assert.equal(step2After.status, "pending", "downstream step must be pending after retry");
+
+    // Verify events now emitted for the retry
+    const eventsAfter = getRunEvents(runId);
+    assert.ok(eventsAfter.some(e => e.event === "step.done"), "step.done must be emitted on retry");
+    assert.ok(eventsAfter.some(e => e.event === "pipeline.advanced"), "pipeline.advanced must be emitted on retry");
+  });
+
+  it("simulated crash: rollback preserves step state for complex step with stories", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const stepId1 = crypto.randomUUID();
+    const stepId2 = crypto.randomUUID();
+    const seedNow = ts();
+
+    const seededContext = JSON.stringify({ task: "test crash stories", repo: "/tmp/repo", branch: "test-branch" });
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 1, 'us004-crash-stories', 'test crash stories', 'running', ?, 0, ?, ?)"
+    ).run(runId, seededContext, seedNow, seedNow);
+
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, output, loop_config, current_story_id, abandoned_count, created_at, updated_at) VALUES (?, ?, 'step1', 'us004_agent', 0, 'Work', 'STATUS: done', 'running', 0, 3, 'single', NULL, NULL, NULL, 0, ?, ?)"
+    ).run(stepId1, runId, seedNow, seedNow);
+
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, output, loop_config, current_story_id, abandoned_count, created_at, updated_at) VALUES (?, ?, 'step2', 'us004_agent2', 1, 'Continue', 'STATUS: done', 'waiting', 0, 3, 'single', NULL, NULL, NULL, 0, ?, ?)"
+    ).run(stepId2, runId, seedNow, seedNow);
+
+    // Mock db.exec to crash on COMMIT
+    const origExec = db.exec.bind(db);
+    mock.method(db, "exec", (sql: string) => {
+      if (sql === "COMMIT") {
+        throw new Error("Simulated crash during commit — stories");
+      }
+      return origExec(sql);
+    });
+
+    const storyJson = JSON.stringify([
+      { id: "US-001", title: "Story One", description: "Should be rolled back", acceptanceCriteria: ["Pass"] },
+      { id: "US-002", title: "Story Two", description: "Should also be rolled back", acceptanceCriteria: ["Pass"] }
+    ]);
+    const output = `STATUS: done\nCHANGES: feature-work\nSTORIES_JSON: ${storyJson}`;
+
+    assert.throws(
+      () => completeStep(stepId1, output),
+      /Simulated crash during commit — stories/,
+      "completeStep must throw on simulated crash (stories variant)"
+    );
+
+    mock.restoreAll();
+
+    // Verify zero stories persisted
+    const stories = db.prepare("SELECT COUNT(*) as cnt FROM stories WHERE run_id = ?").get(runId) as any;
+    assert.equal(stories.cnt, 0, "all stories must be rolled back");
+
+    // Verify step still running
+    const step = db.prepare("SELECT status FROM steps WHERE id = ?").get(stepId1) as any;
+    assert.equal(step.status, "running", "step must be running after rollback");
+
+    // Verify context unchanged
+    const run = db.prepare("SELECT context FROM runs WHERE id = ?").get(runId) as any;
+    const context = JSON.parse(run.context);
+    assert.equal(context.changes, undefined, "CHANGES must be rolled back");
+
+    // Verify no events
+    const events = getRunEvents(runId);
+    assert.equal(events.length, 0, "no events must be emitted");
+
+    // Retry succeeds
+    const retryResult = completeStep(stepId1, "STATUS: done\nCHANGES: retry-success\nRETRY_KEY: works");
+    assert.ok(["advanced", "completed"].includes(retryResult.status),
+      `retry must succeed, got: ${retryResult.status}`);
+
+    // Verify retry values persisted
+    const runAfter = db.prepare("SELECT context FROM runs WHERE id = ?").get(runId) as any;
+    const ctxAfter = JSON.parse(runAfter.context);
+    assert.equal(ctxAfter.changes, "retry-success");
+    assert.equal(ctxAfter.retry_key, "works");
+  });
+});
