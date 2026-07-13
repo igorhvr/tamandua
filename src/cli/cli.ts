@@ -3015,6 +3015,11 @@ async function main() {
     if (stalenessWarning) {
       process.stderr.write(stalenessWarning + "\n");
     }
+    if (result.captureWarnings) {
+      for (const warning of result.captureWarnings) {
+        process.stderr.write(warning + "\n");
+      }
+    }
     if (result.daemonWarning) {
       let dashboardLine = "";
       try {

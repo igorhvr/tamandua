@@ -3068,3 +3068,143 @@ describe("tamandua doctor", () => {
     }
   });
 });
+
+describe("BSHA CLI capture warnings", () => {
+  function writeMinimalWorkflow(homeDir: string, workflowId: string, workspaceMode: string): void {
+    const workflowDir = path.join(homeDir, ".tamandua", "workflows", workflowId);
+    fs.mkdirSync(workflowDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(workflowDir, "workflow.yml"),
+      `id: ${workflowId}\nrun:\n  workspace: ${workspaceMode}\nagents:\n  - id: dev\n    model: fake\n    workspace:\n      baseDir: .\nsteps:\n  - id: implement\n    agent: dev\n    input: Implement the task\n    expects: STATUS, CHANGES, TESTS\n`,
+      "utf-8",
+    );
+  }
+
+  it("prints capture warnings to stderr when git probes fail at launch", () => {
+    const th = createTempHome("tamandua-cli-bsha-");
+    const homeDir = th.homeDir;
+    const stateDir = th.tamanduaDir;
+    const workflowId = "test-bsha-cli-warn";
+
+    // Install a minimal direct-mode workflow
+    writeMinimalWorkflow(homeDir, workflowId, "direct");
+
+    // Create a non-git directory as the working directory
+    const nonGitDir = path.join(th.root, "non-git-dir");
+    fs.mkdirSync(nonGitDir, { recursive: true });
+
+    const wrapperPath = path.resolve("bin/tamandua");
+    const result = spawnSync("/bin/sh", [
+      wrapperPath,
+      "workflow", "run", workflowId,
+      "--working-directory-for-harness", nonGitDir,
+      "Test BSHA capture warning",
+    ], {
+      encoding: "utf8",
+      env: cleanChildEnv({
+        HOME: homeDir,
+        TAMANDUA_STATE_DIR: stateDir,
+        // Use an isolated random port so the real daemon on 3339 is not contacted.
+        // The spawned daemon (started by ensureDaemonControlAvailable) will use
+        // this port; cleanup is handled by killing the daemon below.
+        TAMANDUA_CONTROL_PORT: "21999",
+      }),
+    });
+
+    // Clean up the daemon process started during the test
+    const daemonPidFile = path.join(stateDir, "tamandua.pid");
+    try {
+      const raw = fs.readFileSync(daemonPidFile, "utf-8").trim();
+      const pid = parseInt(raw, 10);
+      if (pid > 0) {
+        try { process.kill(pid, "SIGKILL"); } catch { /* already dead */ }
+        // Wait for daemon to release file handles
+        const start = Date.now();
+        while (Date.now() - start < 500) { /* brief busy-wait */ }
+        try { fs.unlinkSync(daemonPidFile); } catch { /* best effort */ }
+        try { fs.unlinkSync(path.join(stateDir, "control-plane-port")); } catch { /* best effort */ }
+      }
+    } catch { /* no pid file */ }
+
+    try {
+      // Launch should succeed (exit code 0) even with capture failures
+      assert.equal(result.status, 0,
+        `Expected exit code 0, got ${result.status}. stderr: ${result.stderr}`);
+
+      // stderr should contain capture warnings for both original_branch and base_branch_sha
+      const stderr = result.stderr ?? "";
+      assert.match(stderr, /Unable to capture original branch at launch/,
+        `Expected original_branch warning in stderr. Got: ${stderr}`);
+      assert.match(stderr, /Unable to capture base branch SHA at launch/,
+        `Expected base_branch_sha warning in stderr. Got: ${stderr}`);
+      assert.match(stderr, /rugpull detection degraded/,
+        `Expected rugpull degradation notice in stderr. Got: ${stderr}`);
+    } finally {
+      fs.rmSync(th.root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not print capture warnings when git probes succeed", () => {
+    const th = createTempHome("tamandua-cli-bsha-ok-");
+    const homeDir = th.homeDir;
+    const stateDir = th.tamanduaDir;
+    const workflowId = "test-bsha-cli-ok";
+
+    // Install a minimal direct-mode workflow
+    writeMinimalWorkflow(homeDir, workflowId, "direct");
+
+    // Create a git repo directory as the working directory
+    const repoDir = path.join(th.root, "repo-dir");
+    fs.mkdirSync(repoDir, { recursive: true });
+    spawnSync("git", ["init", "--initial-branch=main"], { cwd: repoDir, encoding: "utf8" });
+    spawnSync("git", ["config", "user.email", "test@tamandua.local"], { cwd: repoDir, encoding: "utf8" });
+    spawnSync("git", ["config", "user.name", "Tamandua Test"], { cwd: repoDir, encoding: "utf8" });
+    fs.writeFileSync(path.join(repoDir, "README.md"), "# Test Repo\n", "utf-8");
+    spawnSync("git", ["add", "README.md"], { cwd: repoDir, encoding: "utf8" });
+    spawnSync("git", ["commit", "-m", "initial commit"], { cwd: repoDir, encoding: "utf8" });
+
+    const wrapperPath = path.resolve("bin/tamandua");
+    const result = spawnSync("/bin/sh", [
+      wrapperPath,
+      "workflow", "run", workflowId,
+      "--working-directory-for-harness", repoDir,
+      "Test BSHA no warning on success",
+    ], {
+      encoding: "utf8",
+      env: cleanChildEnv({
+        HOME: homeDir,
+        TAMANDUA_STATE_DIR: stateDir,
+        TAMANDUA_CONTROL_PORT: "21998",
+      }),
+    });
+
+    // Clean up the daemon process started during the test
+    const daemonPidFile2 = path.join(stateDir, "tamandua.pid");
+    try {
+      const raw = fs.readFileSync(daemonPidFile2, "utf-8").trim();
+      const pid = parseInt(raw, 10);
+      if (pid > 0) {
+        try { process.kill(pid, "SIGKILL"); } catch { /* already dead */ }
+        const start2 = Date.now();
+        while (Date.now() - start2 < 500) { /* brief busy-wait */ }
+        try { fs.unlinkSync(daemonPidFile2); } catch { /* best effort */ }
+        try { fs.unlinkSync(path.join(stateDir, "control-plane-port")); } catch { /* best effort */ }
+      }
+    } catch { /* no pid file */ }
+
+    try {
+      // Launch should succeed
+      assert.equal(result.status, 0,
+        `Expected exit code 0, got ${result.status}. stderr: ${result.stderr}`);
+
+      // stderr should NOT contain capture warnings when git succeeds
+      const stderr = result.stderr ?? "";
+      assert.doesNotMatch(stderr, /Unable to capture/,
+        `Expected no capture warnings in stderr. Got: ${stderr}`);
+      assert.doesNotMatch(stderr, /rugpull detection degraded/,
+        `Expected no rugpull degradation in stderr. Got: ${stderr}`);
+    } finally {
+      fs.rmSync(th.root, { recursive: true, force: true });
+    }
+  });
+});

@@ -9,6 +9,7 @@ import { runWorkflow } from "../../dist/installer/run.js";
 import { getPidFile, getPortFile, stopDaemon } from "../../dist/server/daemonctl.js";
 import { reserveRandomPort } from "../../tests/helpers/test-env.ts";
 import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
+import { getRunEvents } from "../../dist/installer/events.js";
 
 // ── Helpers ──
 
@@ -891,6 +892,329 @@ describe("runWorkflow", () => {
         /No workflow\.yml found in/,
         "should reject with workflow-not-found error before run row is inserted",
       );
+    });
+  });
+
+  describe("BSHA - capture failure events and warnings", () => {
+    it("emits run.base_capture_failed event when git capture fails in non-git directory", async () => {
+      const workflowId = "test-bsha-capture-event";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      const nonGitDir = tamanduaTempDir("tamandua-bsha-non-git-");
+
+      let result: Awaited<ReturnType<typeof runWorkflow>>;
+      try {
+        result = await runWorkflow({
+          workflowId,
+          taskTitle: "Test BSHA capture failure events",
+          workingDirectoryForHarness: nonGitDir,
+        });
+      } catch {
+        // Daemon registration may fail after persisting the run; assertions below only need persisted state.
+        // Re-fetch result by querying the run.
+        const { getDb } = await import("../../dist/db.js");
+        const db = getDb();
+        const rows = db.prepare(
+          "SELECT id FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1"
+        ).all(workflowId) as { id: string }[];
+        assert.ok(rows.length > 0, "run record should exist even when daemon registration fails");
+        const runId = rows[0].id;
+
+        // Verify events were emitted
+        const events = getRunEvents(runId);
+        const captureEvents = events.filter((e) => e.event === "run.base_capture_failed");
+
+        // Should have two capture_failed events: original_branch and base_branch_sha
+        assert.equal(captureEvents.length, 2,
+          `Expected 2 capture_failed events, got ${captureEvents.length}`);
+
+        const originalBranchEvent = captureEvents.find((e) => e.detail?.startsWith("original_branch:"));
+        const baseBranchShaEvent = captureEvents.find((e) => e.detail?.startsWith("base_branch_sha:"));
+
+        assert.ok(originalBranchEvent, "Should have original_branch capture_failed event");
+        assert.ok(baseBranchShaEvent, "Should have base_branch_sha capture_failed event");
+
+        // Verify event detail includes probe name, git command
+        assert.ok(originalBranchEvent!.detail?.includes("original_branch:"),
+          `original_branch event detail should include probe name: ${originalBranchEvent!.detail}`);
+        assert.ok(originalBranchEvent!.detail?.includes("git rev-parse --abbrev-ref HEAD"),
+          `original_branch event detail should include git command: ${originalBranchEvent!.detail}`);
+        assert.ok(baseBranchShaEvent!.detail?.includes("base_branch_sha:"),
+          `base_branch_sha event detail should include probe name: ${baseBranchShaEvent!.detail}`);
+        assert.ok(baseBranchShaEvent!.detail?.includes("git rev-parse HEAD"),
+          `base_branch_sha event detail should include git command: ${baseBranchShaEvent!.detail}`);
+
+        // Verify the event includes stderr (non-git dir should produce "not a git repository" stderr)
+        assert.ok(
+          originalBranchEvent!.detail!.includes("not a git repository") ||
+            originalBranchEvent!.detail!.includes("fatal:"),
+          `original_branch event detail should include git stderr: ${originalBranchEvent!.detail}`,
+        );
+      } finally {
+        fs.rmSync(nonGitDir, { recursive: true, force: true });
+      }
+    });
+
+    it("returns captureWarnings with warning messages when captures fail", async () => {
+      const workflowId = "test-bsha-capture-warnings";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      const nonGitDir = tamanduaTempDir("tamandua-bsha-warn-");
+
+      let result: Awaited<ReturnType<typeof runWorkflow>>;
+      try {
+        result = await runWorkflow({
+          workflowId,
+          taskTitle: "Test BSHA capture warnings in result",
+          workingDirectoryForHarness: nonGitDir,
+        });
+      } catch {
+        // Daemon may fail to start — the run row is still there. Query it.
+        const { getDb } = await import("../../dist/db.js");
+        const db = getDb();
+        const rows = db.prepare(
+          "SELECT id, context FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1"
+        ).all(workflowId) as { id: string; context: string }[];
+        assert.ok(rows.length > 0, "run record should exist");
+
+        // Verify empty-string fallback behavior is preserved
+        const ctx = JSON.parse(rows[0].context);
+        assert.equal(ctx.original_branch, "",
+          "original_branch should fall back to empty string on git failure");
+        assert.equal(ctx.base_branch_sha, "",
+          "base_branch_sha should fall back to empty string on git failure");
+
+        // Verify warnings were collected
+        const events = getRunEvents(rows[0].id);
+        const captureEvents = events.filter((e) => e.event === "run.base_capture_failed");
+        assert.equal(captureEvents.length, 2,
+          `Expected 2 capture_failed events, got ${captureEvents.length}`);
+      } finally {
+        fs.rmSync(nonGitDir, { recursive: true, force: true });
+      }
+    });
+
+    it("preserves empty-string fallback and emits events for original_branch failure", async () => {
+      const workflowId = "test-bsha-original-fallback";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      const nonGitDir = tamanduaTempDir("tamandua-bsha-orig-");
+
+      try {
+        await runWorkflow({
+          workflowId,
+          taskTitle: "Test original_branch fallback",
+          workingDirectoryForHarness: nonGitDir,
+        });
+      } catch {
+        // Expected — daemon may not be reachable
+      }
+
+      const { getDb } = await import("../../dist/db.js");
+      const db = getDb();
+      const rows = db.prepare(
+        "SELECT id, context FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1"
+      ).all(workflowId) as { id: string; context: string }[];
+      assert.ok(rows.length > 0, "run record should exist");
+
+      // Verify empty string fallback
+      const ctx = JSON.parse(rows[0].context);
+      assert.equal(ctx.original_branch, "", "original_branch should be empty string");
+      assert.equal(ctx.base_branch_sha, "", "base_branch_sha should be empty string");
+
+      // Verify events were emitted
+      const events = getRunEvents(rows[0].id);
+      const captureEvents = events.filter((e) => e.event === "run.base_capture_failed");
+      assert.equal(captureEvents.length, 2,
+        `Expected 2 capture_failed events, got ${captureEvents.length}`);
+
+      // Both events should have the runId
+      for (const evt of captureEvents) {
+        assert.equal(evt.runId, rows[0].id, "capture_failed event runId should match");
+      }
+
+      fs.rmSync(nonGitDir, { recursive: true, force: true });
+    });
+
+    it("does not emit capture failure events when git succeeds in a real repo", async () => {
+      const workflowId = "test-bsha-no-event-on-success";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      const repoDir = tamanduaTempDir("tamandua-bsha-success-");
+      try {
+        initGitRepo(repoDir);
+
+        try {
+          await runWorkflow({
+            workflowId,
+            taskTitle: "Test no capture events on success",
+            workingDirectoryForHarness: repoDir,
+          });
+        } catch {
+          // Daemon registration may fail
+        }
+
+        const { getDb } = await import("../../dist/db.js");
+        const db = getDb();
+        const rows = db.prepare(
+          "SELECT id, context FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1"
+        ).all(workflowId) as { id: string; context: string }[];
+        assert.ok(rows.length > 0, "run record should exist");
+
+        // Verify SHAs were captured
+        const ctx = JSON.parse(rows[0].context);
+        assert.ok(ctx.original_branch, "original_branch should be set");
+        assert.ok(ctx.base_branch_sha, "base_branch_sha should be set");
+        assert.ok(ctx.base_branch_sha.length === 40, "base_branch_sha should be full SHA");
+
+        // Verify no capture_failed events
+        const events = getRunEvents(rows[0].id);
+        const captureEvents = events.filter((e) => e.event === "run.base_capture_failed");
+        assert.equal(captureEvents.length, 0,
+          `Expected 0 capture_failed events on success, got ${captureEvents.length}`);
+      } finally {
+        fs.rmSync(repoDir, { recursive: true, force: true });
+      }
+    });
+
+    it("emits event only for original_branch when that probe alone fails (mocked git)", async () => {
+      const workflowId = "test-bsha-original-only";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+
+      // Set up a real git repo so base_branch_sha probe will succeed
+      const repoDir = tamanduaTempDir("tamandua-bsha-orig-only-");
+      let mockBinDir: string;
+      try {
+        initGitRepo(repoDir);
+
+        // Create a fake git wrapper that fails only on the original_branch probe
+        mockBinDir = tamanduaTempDir("tamandua-mock-git-orig-");
+        const fakeGitScript = `#!/bin/bash
+# Mock git: fails original_branch probe (rev-parse --abbrev-ref HEAD), delegates everything else
+if [ "$1" = "rev-parse" ] && [ "$2" = "--abbrev-ref" ] && [ "$3" = "HEAD" ] && [ "$#" = "3" ]; then
+  echo "fatal: simulated original_branch capture failure" >&2
+  exit 128
+fi
+/usr/bin/git "$@"
+`;
+        const fakeGitPath = path.join(mockBinDir, "git");
+        fs.writeFileSync(fakeGitPath, fakeGitScript, { mode: 0o755 });
+
+        // Prepend mock dir to PATH so execFileSync finds the fake git first
+        const origPath = process.env.PATH;
+        process.env.PATH = `${mockBinDir}:${origPath}`;
+
+        try {
+          await runWorkflow({
+            workflowId,
+            taskTitle: "Test original_branch alone fails",
+            workingDirectoryForHarness: repoDir,
+          });
+        } catch {
+          // Daemon registration may fail
+        }
+
+        // Restore PATH before any other git calls
+        process.env.PATH = origPath;
+
+        const { getDb } = await import("../../dist/db.js");
+        const db = getDb();
+        const rows = db.prepare(
+          "SELECT id, context FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1"
+        ).all(workflowId) as { id: string; context: string }[];
+        assert.ok(rows.length > 0, "run record should exist");
+
+        // Verify only the original_branch probe failed
+        const events = getRunEvents(rows[0].id);
+        const captureEvents = events.filter((e) => e.event === "run.base_capture_failed");
+        assert.equal(captureEvents.length, 1,
+          `Expected 1 capture_failed event, got ${captureEvents.length}`);
+
+        // The single event should be for original_branch
+        const event = captureEvents[0];
+        assert.match(event.detail ?? "", /original_branch:/,
+          `Expected original_branch event, got: ${event.detail}`);
+        assert.match(event.detail ?? "", /simulated original_branch capture failure/,
+          `Expected simulated stderr in event, got: ${event.detail}`);
+
+        // Verify context: original_branch empty, base_branch_sha captured
+        const ctx = JSON.parse(rows[0].context);
+        assert.equal(ctx.original_branch, "",
+          "original_branch should be empty string when probe fails");
+        assert.ok(ctx.base_branch_sha && ctx.base_branch_sha.length === 40,
+          `base_branch_sha should be a full SHA, got: ${ctx.base_branch_sha}`);
+      } finally {
+        fs.rmSync(repoDir, { recursive: true, force: true });
+        fs.rmSync(mockBinDir, { recursive: true, force: true });
+      }
+    });
+
+    it("emits event only for base_branch_sha when that probe alone fails (mocked git)", async () => {
+      const workflowId = "test-bsha-sha-only";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+
+      // Set up a real git repo so original_branch probe will succeed
+      const repoDir = tamanduaTempDir("tamandua-bsha-sha-only-");
+      let mockBinDir: string;
+      try {
+        initGitRepo(repoDir);
+
+        // Create a fake git wrapper that fails only on the base_branch_sha probe
+        mockBinDir = tamanduaTempDir("tamandua-mock-git-sha-");
+        const fakeGitScript = `#!/bin/bash
+# Mock git: fails base_branch_sha probe (rev-parse HEAD with exactly 3 args), delegates everything else
+if [ "$1" = "rev-parse" ] && [ "$2" = "HEAD" ] && [ "$#" = "2" ]; then
+  echo "fatal: simulated base_branch_sha capture failure" >&2
+  exit 128
+fi
+/usr/bin/git "$@"
+`;
+        const fakeGitPath = path.join(mockBinDir, "git");
+        fs.writeFileSync(fakeGitPath, fakeGitScript, { mode: 0o755 });
+
+        // Prepend mock dir to PATH so execFileSync finds the fake git first
+        const origPath = process.env.PATH;
+        process.env.PATH = `${mockBinDir}:${origPath}`;
+
+        try {
+          await runWorkflow({
+            workflowId,
+            taskTitle: "Test base_branch_sha alone fails",
+            workingDirectoryForHarness: repoDir,
+          });
+        } catch {
+          // Daemon registration may fail
+        }
+
+        // Restore PATH before any other git calls
+        process.env.PATH = origPath;
+
+        const { getDb } = await import("../../dist/db.js");
+        const db = getDb();
+        const rows = db.prepare(
+          "SELECT id, context FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1"
+        ).all(workflowId) as { id: string; context: string }[];
+        assert.ok(rows.length > 0, "run record should exist");
+
+        // Verify only the base_branch_sha probe failed
+        const events = getRunEvents(rows[0].id);
+        const captureEvents = events.filter((e) => e.event === "run.base_capture_failed");
+        assert.equal(captureEvents.length, 1,
+          `Expected 1 capture_failed event, got ${captureEvents.length}`);
+
+        // The single event should be for base_branch_sha
+        const event = captureEvents[0];
+        assert.match(event.detail ?? "", /base_branch_sha:/,
+          `Expected base_branch_sha event, got: ${event.detail}`);
+        assert.match(event.detail ?? "", /simulated base_branch_sha capture failure/,
+          `Expected simulated stderr in event, got: ${event.detail}`);
+
+        // Verify context: base_branch_sha empty, original_branch captured
+        const ctx = JSON.parse(rows[0].context);
+        assert.equal(ctx.base_branch_sha, "",
+          "base_branch_sha should be empty string when probe fails");
+        assert.ok(ctx.original_branch && ctx.original_branch !== "",
+          `original_branch should be set, got: ${ctx.original_branch}`);
+      } finally {
+        fs.rmSync(repoDir, { recursive: true, force: true });
+        fs.rmSync(mockBinDir, { recursive: true, force: true });
+      }
     });
   });
 });

@@ -49,6 +49,8 @@ export interface RunWorkflowResult {
   workingDirectoryForHarness: string;
   /** Set when the run row was created but the daemon control plane didn't become reachable in time. */
   daemonWarning?: string;
+  /** Warnings collected during run creation (e.g. base capture failures degrading rugpull detection). */
+  captureWarnings?: string[];
 }
 
 /**
@@ -86,6 +88,7 @@ export async function runWorkflow(
   const runNumber = nextRunNumber();
 
   const workspaceMode = workflow.run?.workspace ?? "direct";
+  const warnings: string[] = [];
 
   let workingDirectoryForHarness: string;
 
@@ -158,7 +161,18 @@ export async function runWorkflow(
       // HEAD is not a branch name (detached HEAD), so fall back to empty.
       seededContext.original_branch =
         branchName !== "HEAD" ? branchName : "";
-    } catch {
+    } catch (err) {
+      const stderr = (err as { stderr?: Buffer }).stderr?.toString("utf-8")?.trim() ?? "";
+      emitEvent({
+        ts: new Date().toISOString(),
+        event: "run.base_capture_failed",
+        runId,
+        workflowId,
+        detail: `original_branch: git rev-parse --abbrev-ref HEAD — ${stderr || "git command failed"}`,
+      });
+      warnings.push(
+        `Unable to capture original branch at launch — rugpull detection degraded for this run (git error: ${stderr || "unknown"})`,
+      );
       seededContext.original_branch = "";
     }
   } else if (workspaceMode === "worktree") {
@@ -213,7 +227,18 @@ export async function runWorkflow(
         ["rev-parse", "HEAD"],
         { cwd: workingDirectoryForHarness, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
       ).trim();
-    } catch {
+    } catch (err) {
+      const stderr = (err as { stderr?: Buffer }).stderr?.toString("utf-8")?.trim() ?? "";
+      emitEvent({
+        ts: new Date().toISOString(),
+        event: "run.base_capture_failed",
+        runId,
+        workflowId,
+        detail: `base_branch_sha: git rev-parse HEAD — ${stderr || "git command failed"}`,
+      });
+      warnings.push(
+        `Unable to capture base branch SHA at launch — rugpull detection degraded for this run (git error: ${stderr || "unknown"})`,
+      );
       seededContext.base_branch_sha = "";
     }
   }
@@ -392,6 +417,7 @@ export async function runWorkflow(
     stepCount: workflow.steps.length,
     workingDirectoryForHarness,
     daemonWarning,
+    captureWarnings: warnings.length > 0 ? warnings : undefined,
   };
 }
 
