@@ -578,8 +578,7 @@ export async function handleWorkflow(group: string, args: string[]): Promise<boo
       } catch {
         // can't read dashboard port
       }
-      console.log(`Run: ${result.runId.slice(0, 8)}\nWorkflow: ${result.workflowId}\nTask: ${result.taskTitle}\nRun created and admitted — control plane slow to respond.`);
-      console.log(`The run is live and the reconciler sweep will admit it when ready.`);
+      console.log(`Run: ${result.runId.slice(0, 8)}\nWorkflow: ${result.workflowId}\nTask: ${result.taskTitle}\nRun created (pending admission); the reconciler will admit it when the control plane responds.`);
       console.log(`Check: tamandua workflow status ${result.runId.slice(0, 8)}${dashboardLine}`);
     } else {
       console.log(`Run: ${result.runId.slice(0, 8)}\nWorkflow: ${result.workflowId}\nTask: ${result.taskTitle}\nStatus: ${result.status}\nHarness CWD: ${result.workingDirectoryForHarness}`);

@@ -1086,7 +1086,7 @@ export function parseAndInsertStories(output: string, runId: string): void {
 // Abandoned Step Cleanup
 // ══════════════════════════════════════════════════════════════════════
 
-const ABANDONED_THRESHOLD_MS = (getMaxRoleTimeoutSeconds() + 5 * 60) * 1000;
+export const ABANDONED_THRESHOLD_MS = (getMaxRoleTimeoutSeconds() + 5 * 60) * 1000;
 
 /**
  * Build an aggregate abandon-reason string for a run from the

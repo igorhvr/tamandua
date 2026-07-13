@@ -8,6 +8,7 @@
  */
 import { execSync } from "node:child_process";
 import { getDaemonStatus, getDashboardStatus, getMcpStatus, getControlPlaneStatus, getMcpStatusAsync, getControlPlaneStatusAsync, isRunning } from "../server/daemonctl.js";
+import { ABANDONED_THRESHOLD_MS } from "../installer/step-ops.js";
 
 /**
  * Platform-aware process-listing helper for `tamandua status`.
@@ -189,8 +190,10 @@ export function formatTamanduaInfo(opts?: {
 
 export function formatRunsSummary(opts?: {
   listRuns?: () => RunInfo[];
+  isDaemonRunning?: () => boolean;
 }): string {
   const runsFn = opts?.listRuns ?? defaultListRuns;
+  const daemonCheck = opts?.isDaemonRunning ?? (() => isRunning().running);
   let runs: RunInfo[];
   try {
     runs = runsFn();
@@ -220,6 +223,8 @@ export function formatRunsSummary(opts?: {
   lines.push(`${runs.length} total (${breakdownParts.join(", ")})`);
 
   // List running and paused runs with details
+  const now = Date.now();
+  const daemonRunning = daemonCheck();
   const activeRuns = runs.filter(
     (r) => r.status === "running" || r.status === "paused",
   );
@@ -228,18 +233,25 @@ export function formatRunsSummary(opts?: {
       const idShort = r.id.slice(0, 8);
       const taskPreview =
         r.task.length > 60 ? r.task.slice(0, 57) + "..." : r.task;
+      // Staleness annotation: if updatedAt is older than the abandon threshold
+      // AND the daemon is not running, annotate the status as stale.
+      let displayStatus = r.status;
+      const updatedAtMs = r.updatedAt ? new Date(r.updatedAt).getTime() : 0;
+      if (!daemonRunning && (now - updatedAtMs) > ABANDONED_THRESHOLD_MS) {
+        displayStatus = `${r.status} (stale — daemon down?)`;
+      }
       lines.push(
-        `  [${r.status.padEnd(7)}] ${idShort}  ${r.workflowId.padEnd(14)} ${r.tokensSpent.toLocaleString().padStart(8)} tokens  ${taskPreview}`,
+        `  [${displayStatus.padEnd(7)}] ${idShort}  ${r.workflowId.padEnd(14)} ${r.tokensSpent.toLocaleString().padStart(8)} tokens  ${taskPreview}`,
       );
     }
   }
 
-  // Show completed/done count line
-  const doneCount = counts["done"] || 0;
+  // Show completed/failed count line
+  const completedCount = counts["completed"] || 0;
   const failedCount = counts["failed"] || 0;
-  if (doneCount > 0 || failedCount > 0) {
+  if (completedCount > 0 || failedCount > 0) {
     const parts: string[] = [];
-    if (doneCount > 0) parts.push(`${doneCount} done`);
+    if (completedCount > 0) parts.push(`${completedCount} completed`);
     if (failedCount > 0) parts.push(`${failedCount} failed`);
     lines.push(`  (${parts.join(", ")} runs not shown)`);
   }

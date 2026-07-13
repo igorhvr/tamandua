@@ -288,8 +288,8 @@ describe("CLI workflow run working-directory-for-harness", () => {
       );
       assert.match(
         result.stdout,
-        /Run created and admitted/,
-        "output should indicate run was created",
+        /Run created \(pending admission\)/,
+        "output should indicate run was created (pending admission)",
       );
       assert.match(
         result.stdout,

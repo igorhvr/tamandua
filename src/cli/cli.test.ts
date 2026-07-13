@@ -2003,14 +2003,15 @@ describe("formatRunsSummary", () => {
     const result = formatRunsSummary({
       listRuns: () => [
         { id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", workflowId: "wf1", task: "Fix login bug", status: "running", createdAt: "", updatedAt: "", tokensSpent: 1500 },
-        { id: "bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee", workflowId: "wf1", task: "Add dashboard", status: "done", createdAt: "", updatedAt: "", tokensSpent: 3000 },
+        { id: "bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee", workflowId: "wf1", task: "Add dashboard", status: "completed", createdAt: "", updatedAt: "", tokensSpent: 3000 },
         { id: "cccccccc-bbbb-cccc-dddd-eeeeeeeeeeee", workflowId: "wf2", task: "Refactor auth", status: "failed", createdAt: "", updatedAt: "", tokensSpent: 500 },
         { id: "dddddddd-bbbb-cccc-dddd-eeeeeeeeeeee", workflowId: "wf3", task: "Update deps", status: "paused", createdAt: "", updatedAt: "", tokensSpent: 200 },
       ],
+      isDaemonRunning: () => true,
     });
     assert.match(result, /Workflow Runs/);
     assert.match(result, /4 total/);
-    assert.match(result, /1 done/);
+    assert.match(result, /1 completed/);
     assert.match(result, /1 failed/);
     assert.match(result, /1 paused/);
     assert.match(result, /1 running/);
@@ -2023,6 +2024,7 @@ describe("formatRunsSummary", () => {
         { id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", workflowId: "feature-dev", task: "Implement login page with validation and error handling", status: "running", createdAt: "", updatedAt: "", tokensSpent: 4200 },
         { id: "bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee", workflowId: "bug-fix", task: "Fix navbar", status: "paused", createdAt: "", updatedAt: "", tokensSpent: 800 },
       ],
+      isDaemonRunning: () => true,
     });
     // Running run
     assert.match(result, /\[running\] aaaaaaaa/);
@@ -2043,12 +2045,13 @@ describe("formatRunsSummary", () => {
     const result = formatRunsSummary({
       listRuns: () => [
         { id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", workflowId: "wf1", task: "Current task", status: "running", createdAt: "", updatedAt: "", tokensSpent: 100 },
-        { id: "bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee", workflowId: "wf1", task: "Old task", status: "done", createdAt: "", updatedAt: "", tokensSpent: 2000 },
+        { id: "bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee", workflowId: "wf1", task: "Old task", status: "completed", createdAt: "", updatedAt: "", tokensSpent: 2000 },
         { id: "cccccccc-bbbb-cccc-dddd-eeeeeeeeeeee", workflowId: "wf2", task: "Broken task", status: "failed", createdAt: "", updatedAt: "", tokensSpent: 0 },
       ],
+      isDaemonRunning: () => true,
     });
     assert.match(result, /3 total/);
-    assert.match(result, /\(1 done, 1 failed runs not shown\)/);
+    assert.match(result, /\(1 completed, 1 failed runs not shown\)/);
     // Running run still listed
     assert.match(result, /\[running\] aaaaaaaa/);
   });
@@ -2060,6 +2063,7 @@ describe("formatRunsSummary", () => {
       listRuns: () => [
         { id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", workflowId: "wf1", task: longTask, status: "running", createdAt: "", updatedAt: "", tokensSpent: 0 },
       ],
+      isDaemonRunning: () => true,
     });
     // Should be truncated to 60 chars with "..."
     const expectedPreview = "A".repeat(57) + "...";
@@ -2075,6 +2079,74 @@ describe("formatRunsSummary", () => {
     });
     assert.match(result, /Workflow Runs/);
     assert.match(result, /No workflow runs/);
+  });
+
+  it("shows normal [running] for recent run even when daemon is down", async () => {
+    const { formatRunsSummary } = await import("../../dist/cli/status-format.js");
+    const now = new Date().toISOString();
+    const result = formatRunsSummary({
+      listRuns: () => [
+        { id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", workflowId: "wf1", task: "Fix bug", status: "running", createdAt: now, updatedAt: now, tokensSpent: 100 },
+      ],
+      isDaemonRunning: () => false,
+    });
+    // Recent run: should NOT be annotated as stale
+    assert.match(result, /\[running\] aaaaaaaa/);
+    assert.doesNotMatch(result, /stale/);
+  });
+
+  it("annotates stale running runs when daemon is down", async () => {
+    const { formatRunsSummary } = await import("../../dist/cli/status-format.js");
+    // updatedAt far in the past (older than abandon threshold)
+    const staleDate = new Date(0).toISOString();
+    const result = formatRunsSummary({
+      listRuns: () => [
+        { id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", workflowId: "wf1", task: "Fix bug", status: "running", createdAt: staleDate, updatedAt: staleDate, tokensSpent: 100 },
+      ],
+      isDaemonRunning: () => false,
+    });
+    assert.match(result, /\[running \(stale — daemon down\?\)\] aaaaaaaa/);
+  });
+
+  it("annotates stale paused runs when daemon is down", async () => {
+    const { formatRunsSummary } = await import("../../dist/cli/status-format.js");
+    const staleDate = new Date(0).toISOString();
+    const result = formatRunsSummary({
+      listRuns: () => [
+        { id: "bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee", workflowId: "wf2", task: "Refactor", status: "paused", createdAt: staleDate, updatedAt: staleDate, tokensSpent: 200 },
+      ],
+      isDaemonRunning: () => false,
+    });
+    assert.match(result, /\[paused \(stale — daemon down\?\)\] bbbbbbbb/);
+  });
+
+  it("shows normal [running] for stale runs when daemon is healthy", async () => {
+    const { formatRunsSummary } = await import("../../dist/cli/status-format.js");
+    const staleDate = new Date(0).toISOString();
+    const result = formatRunsSummary({
+      listRuns: () => [
+        { id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", workflowId: "wf1", task: "Fix bug", status: "running", createdAt: staleDate, updatedAt: staleDate, tokensSpent: 100 },
+      ],
+      isDaemonRunning: () => true,
+    });
+    // Stale run but daemon is healthy: no annotation
+    assert.match(result, /\[running\] aaaaaaaa/);
+    assert.doesNotMatch(result, /stale/);
+  });
+
+  it("does not annotate completed or failed runs regardless of staleness or daemon health", async () => {
+    const { formatRunsSummary } = await import("../../dist/cli/status-format.js");
+    const staleDate = new Date(0).toISOString();
+    const result = formatRunsSummary({
+      listRuns: () => [
+        { id: "cccccccc-bbbb-cccc-dddd-eeeeeeeeeeee", workflowId: "wf1", task: "Old done", status: "completed", createdAt: staleDate, updatedAt: staleDate, tokensSpent: 500 },
+        { id: "dddddddd-bbbb-cccc-dddd-eeeeeeeeeeee", workflowId: "wf2", task: "Old fail", status: "failed", createdAt: staleDate, updatedAt: staleDate, tokensSpent: 0 },
+      ],
+      isDaemonRunning: () => false,
+    });
+    // Terminal runs are listed in "not shown" line, never annotated as stale
+    assert.doesNotMatch(result, /stale/);
+    assert.match(result, /\(1 completed, 1 failed runs not shown\)/);
   });
 
   it("defaults to real listRuns when no override provided (accepts any output)", async () => {
