@@ -11,7 +11,7 @@ cd "$REPO_ROOT"
 # --- Build ---
 # Build dist/ so tests always run against the current source.
 # TBLD: Prevents silent stale-dist false alarms (2026-07-11 incident).
-BUILD_LOG=$(mktemp "${TMPDIR:-/tmp}/tamandua-build-$$.log" 2>/dev/null || echo "/tmp/tamandua-build-$$.log")
+BUILD_LOG=$(mktemp -t "tamandua-build-$$.log" 2>/dev/null || mktemp)
 if npm run build > "$BUILD_LOG" 2>&1; then
   rm -f "$BUILD_LOG"
 else

@@ -55,6 +55,8 @@ const OS_TMPDIR_ALLOWLIST: Record<string, string> = {
   // test assertions/allowlist data.  Self-reference is unavoidable.
   "src/lib/temp-dir.guard.test.ts":
     "the guard test itself — detection regex and test data",
+
+
 };
 
 /**
@@ -138,6 +140,7 @@ const TMP_PATH_ALLOWLIST: Record<string, string> = {
   // scripts in the project.
   "scripts/prll-verify.sh":
     "uses TAMANDUA_TEST_TMPDIR with /tmp/tamandua-test default (correct pattern)",
+
 };
 
 // -------------------------------------------------------------------
