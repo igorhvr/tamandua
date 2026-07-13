@@ -265,6 +265,7 @@ export function fatal(stateDir, label, note, exitCode = 1) {
  * turn the error into a step fail report.
  */
 export function applyBehaviorActions(behavior, cwd, inputVars) {
+  const commandOutputs = [];
   for (const edit of behavior.edits ?? []) {
     const filePath = path.resolve(cwd, substitute(edit.file, cwd, inputVars));
     const content = fs.readFileSync(filePath, "utf-8");
@@ -302,5 +303,8 @@ export function applyBehaviorActions(behavior, cwd, inputVars) {
         `scripted command failed (exit ${r.status}): ${rendered}\n${r.stderr}`,
       );
     }
+    const stdout = r.stdout.trimEnd();
+    if (stdout) commandOutputs.push(stdout);
   }
+  return { commandOutput: commandOutputs.join("\n") };
 }

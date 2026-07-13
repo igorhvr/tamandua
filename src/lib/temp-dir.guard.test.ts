@@ -112,6 +112,8 @@ const TMP_PATH_ALLOWLIST: Record<string, string> = {
     `test fixture — "/tmp/work" harness working directory`,
   "src/installer/catalog-version.test.ts":
     `test fixture — "/tmp/test", "/tmp/test-source" stamp paths`,
+  "src/installer/rugpull.test.ts":
+    "test fixture — fake internal context paths used to verify key filtering",
   "src/installer/status.test.ts":
     "test fixture — fake /tmp/tamandua-worktrees/*, /tmp/wt/* worktree paths",
   "src/server/control-client.test.ts":

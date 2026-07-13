@@ -58,9 +58,10 @@ describe("merger AGENTS.md commit message generation", () => {
     assert.match(content, /Individual changes from the git log/);
   });
 
-  it("instructs writing message to temp file and using git commit -F", () => {
-    assert.match(content, /git commit -F/);
+  it("instructs writing the message to a temp file and passing it to merge-branch", () => {
+    assert.match(content, /--message "\$\(cat "\$MESSAGE_FILE"\)"/);
     assert.match(content, /\/tmp\/merge-commit-msg\.txt/);
+    assert.doesNotMatch(content, /git commit -F/);
   });
 
   it("provides an example commit message", () => {
@@ -101,18 +102,17 @@ describe("merger AGENTS.md commit message generation", () => {
 });
 
 describe("merger AGENTS.md fast-forward-first merge process", () => {
-  it("includes Phase 1 fast-forward check as first Required Process step", () => {
-    assert.match(content, /Phase 1: Fast-Forward Check/);
-    assert.match(content, /git merge-base --is-ancestor \{\{original_branch\}\} \{\{branch\}\}/);
-    // The fast-forward check must appear before squash merge instructions
-    const phase1Index = content.indexOf("Phase 1: Fast-Forward Check");
-    const squashMergeIndex = content.indexOf("Phase 3: Squash Merge");
-    assert.ok(phase1Index < squashMergeIndex, "Fast-Forward Check must come before Squash Merge");
+  it("captures the target tip and checks fast-forward safety before atomic landing", () => {
+    assert.match(content, /Phase 1: Capture Target Tip and Check Fast-Forward Safety/);
+    assert.match(content, /merge-base --is-ancestor "\$EXPECT_TIP" refs\/heads\/\{\{branch\}\}/);
+    const phase1Index = content.indexOf("Phase 1: Capture Target Tip");
+    const landingIndex = content.indexOf("Phase 3: Atomic Landing");
+    assert.ok(phase1Index < landingIndex, "Fast-Forward Check must come before Atomic Landing");
   });
 
   it("includes Phase 2 rebase-on-non-FF path with conflict resolution instructions", () => {
     assert.match(content, /Phase 2: Rebase/);
-    assert.match(content, /git rebase \{\{original_branch\}\}/);
+    assert.match(content, /git -C \{\{repo\}\} rebase "\$EXPECT_TIP"/);
     assert.match(content, /git rebase --continue/);
     assert.match(content, /fix them carefully|resolve each conflict|If conflicts arise/i);
   });
@@ -121,17 +121,16 @@ describe("merger AGENTS.md fast-forward-first merge process", () => {
     assert.match(content, /STATUS: retry/);
     assert.match(content, /CONFLICT_NOTES:/);
     assert.match(content, /RETRY_STEP: test/);
-    // Do NOT merge when retrying
-    assert.match(content, /do NOT merge/);
+    assert.match(content, /NEVER land in this invocation/);
   });
 
-  it("guardrails forbid squash merge when not FF-safe", () => {
-    assert.match(content, /NEVER squash-merge when the branch is not fast-forward-safe/);
-    assert.match(content, /IF YOU REBASED, YOU NEVER MERGE IN THIS INVOCATION/);
+  it("guardrails forbid landing when not FF-safe", () => {
+    assert.match(content, /NEVER land when the branch is not fast-forward-safe against `EXPECT_TIP`/);
+    assert.match(content, /IF YOU REBASED, YOU NEVER LAND IN THIS INVOCATION/);
   });
 
   it("output format includes REBASED field", () => {
-    assert.match(content, /On successful merge[\s\S]*REBASED:\s*false/);
+    assert.match(content, /On successful landing[\s\S]*REBASED:\s*false/);
   });
 
   it("no contradictory FF + unrelated squash instructions coexist (US-004 guardrail)", () => {
@@ -159,21 +158,21 @@ describe("merger AGENTS.md fast-forward-first merge process", () => {
     }
   });
 
-  it("workflow.yml finalize_merge step input places FF check before squash merge", async () => {
+  it("workflow.yml finalize_merge step input places FF check before atomic landing", async () => {
     const wfDir = resolve(resolveBundledWorkflowsDir(), "feature-dev-merge");
     const spec = await loadWorkflowSpec(wfDir);
     const finalStep = spec.steps.find((s) => s.id === "finalize_merge");
     assert.ok(finalStep, "finalize_merge step must exist");
 
     const input = finalStep!.input;
-    const ffIdx = input.search(/git merge-base --is-ancestor/);
-    const squashIdx = input.search(/git merge --squash/);
+    const ffIdx = input.search(/merge-base --is-ancestor/);
+    const landingIdx = input.search(/MERGE_OUTPUT=\$\(tamandua merge-branch/);
 
-    assert.ok(ffIdx >= 0, "must contain git merge-base --is-ancestor");
-    assert.ok(squashIdx >= 0, "must contain git merge --squash");
+    assert.ok(ffIdx >= 0, "must contain merge-base --is-ancestor");
+    assert.ok(landingIdx >= 0, "must contain tamandua merge-branch invocation");
     assert.ok(
-      ffIdx < squashIdx,
-      `FF check (pos ${ffIdx}) must appear before squash merge (pos ${squashIdx})`,
+      ffIdx < landingIdx,
+      `FF check (pos ${ffIdx}) must appear before atomic landing (pos ${landingIdx})`,
     );
   });
 });

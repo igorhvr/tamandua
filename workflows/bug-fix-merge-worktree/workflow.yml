@@ -358,6 +358,7 @@ steps:
       regex:^STATUS:\s*(done|retry)\s*$
       regex:^REBASED:\s*(true|false)\s*$
       regex:^(STATUS:\s*retry|REBASED:\s*false)\s*$
+    max_retries: 0
     on_fail:
       retry_step: verify
-      max_reroutes: 4
+      max_reroutes: 8

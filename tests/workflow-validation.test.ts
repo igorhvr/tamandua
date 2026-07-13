@@ -207,7 +207,7 @@ describe("workflow structure", () => {
     }
   });
 
-  it("feature-dev-merge preserves implement loop wiring and ends with squash-merge finalization", async () => {
+  it("feature-dev-merge preserves implement loop wiring and ends with atomic finalization", async () => {
     const spec = await loadWorkflowSpec(wfDir("feature-dev-merge"));
 
     const stepIds = spec.steps.map((step) => step.id);
@@ -227,17 +227,16 @@ describe("workflow structure", () => {
     assert.match(finalStep!.input, /RUN_ID:\s*\{\{run_id\}\}/);
     assert.match(finalStep!.input, /ORIGINAL_BRANCH:\s*\{\{original_branch\}\}/);
     assert.match(finalStep!.input, /PROGRESS LOG:\s*\{\{progress\}\}/);
-    // Fast-forward-first merge process
     assert.match(finalStep!.input, /Fast-Forward Check/);
-    assert.match(finalStep!.input, /git merge-base --is-ancestor \{\{original_branch\}\} \{\{branch\}\}/);
-    assert.match(finalStep!.input, /git rebase \{\{original_branch\}\}/);
+    assert.match(finalStep!.input, /merge-base --is-ancestor "\$EXPECT_TIP" refs\/heads\/\{\{branch\}\}/);
+    assert.match(finalStep!.input, /git -C \{\{repo\}\} rebase "\$EXPECT_TIP"/);
     assert.match(finalStep!.input, /CONFLICT_NOTES/);
     assert.match(finalStep!.input, /RETRY_STEP: test/);
-    assert.match(finalStep!.input, /git checkout \{\{original_branch\}\}/);
-    assert.match(finalStep!.input, /git merge --squash \{\{branch\}\}/);
+    assert.match(finalStep!.input, /tamandua merge-branch/);
+    assert.match(finalStep!.input, /--expect-tip "\$EXPECT_TIP"/);
     assert.match(finalStep!.input, /Build a descriptive commit message/);
-    assert.match(finalStep!.input, /git commit -F <tempfile>/);
-    assert.doesNotMatch(finalStep!.input, /git commit -m/);
+    assert.match(finalStep!.input, /--message "\$\(cat "\$MESSAGE_FILE"\)"/);
+    assert.doesNotMatch(finalStep!.input, /git commit -F|git commit -m/);
     assert.match(finalStep!.input, /MERGE_COMMIT:/);
     assert.match(finalStep!.input, /MERGED_INTO:/);
   });
@@ -269,11 +268,11 @@ describe("workflow structure", () => {
 
     assert.match(content, /## Commit Message Generation/);
     assert.match(content, /Build a descriptive commit message/);
-    assert.match(content, /git commit -F/);
+    assert.match(content, /--message "\$\(cat "\$MESSAGE_FILE"\)"/);
     assert.match(content, /conventional commit format/);
     assert.match(content, /imperative mood/);
     assert.match(content, /Under 72 characters/);
-    assert.doesNotMatch(content, /git commit -m/);
+    assert.doesNotMatch(content, /git commit -F|git commit -m/);
     assert.match(content, /Write the full message to a temp file/);
     assert.match(content, /### Gathering Information/);
   });
@@ -591,10 +590,13 @@ describe("US-004: fast-forward-first merge contradiction prevention and ordering
     it(`${wfId} merger AGENTS.md forbids simultaneous contradictory FF + unrelated squash`, () => {
       const mergerMd = readFileSync(resolve(wfDir(wfId), "agents", "merger", "AGENTS.md"), "utf-8");
 
-      // Guardrail must exist — MRGV rebase-loopback rule supersedes the old
-      // "NEVER combine FF + unrelated squash" guardrail with a structural
-      // guarantee: rebase always ends the invocation, merge only on FF-safe.
-      assert.match(mergerMd, /IF YOU REBASED, YOU NEVER MERGE IN THIS INVOCATION/);
+      // Guardrail must structurally guarantee that rebase always ends the
+      // invocation and landing happens only on a tested, FF-safe tree.
+      if (wfId === "feature-dev-merge") {
+        assert.match(mergerMd, /IF YOU REBASED, YOU NEVER LAND IN THIS INVOCATION/);
+      } else {
+        assert.match(mergerMd, /IF YOU REBASED, YOU NEVER MERGE IN THIS INVOCATION/);
+      }
 
       // Every squash-merge mention must be in a FF-safe or guardrails context
       const squashRe = /squash[ -]?merge/gi;
@@ -622,22 +624,24 @@ describe("US-004: fast-forward-first merge contradiction prevention and ordering
     });
   }
 
-  // AC 5: All three workflow.yml finalize_merge step inputs place FF check before squash merge
+  // AC 5: All three workflow.yml finalize_merge step inputs place the FF check before landing
   for (const wfId of mergeWorkflows) {
-    it(`${wfId} workflow.yml finalize_merge step input places FF check before squash merge (US-004 ordering)`, async () => {
+    it(`${wfId} workflow.yml finalize_merge step input places FF check before landing (US-004 ordering)`, async () => {
       const spec = await loadWorkflowSpec(wfDir(wfId));
       const finalStep = spec.steps.find((s) => s.id === "finalize_merge");
       assert.ok(finalStep, `${wfId}: finalize_merge step must exist`);
 
       const input = finalStep!.input;
-      const ffIdx = input.search(/git merge-base --is-ancestor/);
-      const squashIdx = input.search(/git merge --squash/);
+      const ffIdx = input.search(/merge-base --is-ancestor/);
+      const landingIdx = wfId === "feature-dev-merge"
+        ? input.search(/MERGE_OUTPUT=\$\(tamandua merge-branch/)
+        : input.search(/git merge --squash/);
 
-      assert.ok(ffIdx >= 0, `${wfId}: must contain git merge-base --is-ancestor`);
-      assert.ok(squashIdx >= 0, `${wfId}: must contain git merge --squash`);
+      assert.ok(ffIdx >= 0, `${wfId}: must contain merge-base --is-ancestor`);
+      assert.ok(landingIdx >= 0, `${wfId}: must contain its landing command`);
       assert.ok(
-        ffIdx < squashIdx,
-        `${wfId}: FF check (pos ${ffIdx}) must appear before squash merge (pos ${squashIdx})`,
+        ffIdx < landingIdx,
+        `${wfId}: FF check (pos ${ffIdx}) must appear before landing (pos ${landingIdx})`,
       );
     });
   }
@@ -894,24 +898,25 @@ describe("US-009: feature-dev-merge-worktree workflow variant", () => {
     // Should include worktree mode instructions
     assert.match(finalStep!.input, /Worktree Mode/);
 
-    // Should direct Phase 1 and Phase 3 to the origin repository
-    assert.match(finalStep!.input, /cd \{\{worktree_origin_repository\}\}/);
+    // Should read the target tip from the origin without mutating its worktree
+    assert.match(finalStep!.input, /ORIGIN_REPOSITORY=\{\{worktree_origin_repository\}\}/);
+    assert.match(finalStep!.input, /git -C "\$ORIGIN_REPOSITORY" rev-parse "\$TARGET_REF"/);
   });
 
-  it("preserves fast-forward-first merge ordering (FF check before squash)", async () => {
+  it("preserves fast-forward-first ordering before atomic landing", async () => {
     const spec = await loadWorkflowSpec(wfDir("feature-dev-merge-worktree"));
     const finalStep = spec.steps.find((s) => s.id === "finalize_merge");
     assert.ok(finalStep);
 
     const input = finalStep!.input;
-    const ffIdx = input.search(/git merge-base --is-ancestor/);
-    const squashIdx = input.search(/git merge --squash/);
+    const ffIdx = input.search(/merge-base --is-ancestor/);
+    const landingIdx = input.search(/MERGE_OUTPUT=\$\(tamandua merge-branch/);
 
-    assert.ok(ffIdx >= 0, "must contain git merge-base --is-ancestor");
-    assert.ok(squashIdx >= 0, "must contain git merge --squash");
+    assert.ok(ffIdx >= 0, "must contain merge-base --is-ancestor");
+    assert.ok(landingIdx >= 0, "must contain tamandua merge-branch");
     assert.ok(
-      ffIdx < squashIdx,
-      `FF check (pos ${ffIdx}) must appear before squash merge (pos ${squashIdx})`,
+      ffIdx < landingIdx,
+      `FF check (pos ${ffIdx}) must appear before atomic landing (pos ${landingIdx})`,
     );
   });
 

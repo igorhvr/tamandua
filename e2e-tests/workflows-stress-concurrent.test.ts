@@ -68,6 +68,18 @@ interface FeatureInfo {
   fixReplace: string;
 }
 
+interface MergeEvent {
+  event: "merge.landed" | "merge.target_moved" | "merge.conflicts";
+  runId: string;
+  origin: string;
+  branch: string;
+  target: string;
+  expectedTip: string;
+  actualTip?: string;
+  mergedTree?: string;
+  mergedCommit?: string;
+}
+
 const FEATURE_COUNT = 8;
 
 function featureInfo(n: number): FeatureInfo {
@@ -181,14 +193,12 @@ function buildFeatureBehaviors(fi: FeatureInfo): ScriptedAgentConfig {
       },
       merger: {
         commands: [
-          'git -C "{{input.WORKTREE_ORIGIN_REPOSITORY}}" checkout "{{input.ORIGINAL_BRANCH}}"',
-          `git -C "{{input.WORKTREE_ORIGIN_REPOSITORY}}" merge --squash ${branch}`,
-          `git -C "{{input.WORKTREE_ORIGIN_REPOSITORY}}" commit -m "fix: correct ${fi.funcName}() (squash of ${branch})"`,
+          `expected_tip=$(git -C "{{input.WORKTREE_ORIGIN_REPOSITORY}}" rev-parse "refs/heads/{{input.ORIGINAL_BRANCH}}") && TAMANDUA_RUN_ID="{{input.RUN_ID}}" "${process.execPath}" "${cliPath}" merge-branch --origin "{{input.WORKTREE_ORIGIN_REPOSITORY}}" --branch "${branch}" --into "{{input.ORIGINAL_BRANCH}}" --expect-tip "$expected_tip" --message "fix: correct ${fi.funcName}() (squash of ${branch})"`,
         ],
+        includeCommandOutput: true,
         output: [
           "STATUS: done",
           "REBASED: false",
-          "MERGE_COMMIT: scripted",
           "MERGED_INTO: {{input.ORIGINAL_BRANCH}}",
         ].join("\n"),
       },
@@ -436,6 +446,15 @@ describe("concurrent-runs stress test", { concurrency: 1 }, () => {
         // ── Prepare shared origin repo ─────────────────────────────
         const tempRoot = tamanduaTempDir("tamandua-e2e-concurrent-");
         const repoDir = prepareGitRepo(fixtureDir, path.join(tempRoot, "origin-repo"));
+        const originalBranch = execSync("git symbolic-ref --short HEAD", { cwd: repoDir, encoding: "utf-8" }).trim();
+        const initialTip = execSync(`git rev-parse "refs/heads/${originalBranch}"`, { cwd: repoDir, encoding: "utf-8" }).trim();
+        const originIndexBefore = execSync("git write-tree", { cwd: repoDir, encoding: "utf-8" }).trim();
+        const originFilesBefore = new Map(
+          Array.from({ length: FEATURE_COUNT }, (_, i) => featureInfo(i + 1)).map((fi) => [
+            fi.file,
+            fs.readFileSync(path.join(repoDir, fi.file), "utf-8"),
+          ]),
+        );
 
         // ── Create 8 isolated daemon environments ──────────────────
         for (let i = 1; i <= FEATURE_COUNT; i++) {
@@ -510,22 +529,31 @@ describe("concurrent-runs stress test", { concurrency: 1 }, () => {
           );
         }
 
-        // ── Assert: all 8 changes present in origin main ──────────
+        // ── Assert: all 8 changes present in the target ref ──────
         for (let i = 1; i <= FEATURE_COUNT; i++) {
           const fi = featureInfo(i);
-          const fileContent = fs.readFileSync(path.join(repoDir, fi.file), "utf-8");
+          const fileContent = execSync(`git show "refs/heads/${originalBranch}:${fi.file}"`, {
+            cwd: repoDir,
+            encoding: "utf-8",
+          });
           assert.ok(
             !fileContent.includes(fi.fixFind),
-            `${fi.file} in origin repo still contains bug:\n${fileContent.slice(0, 200)}`,
+            `${fi.file} in target ref still contains bug:\n${fileContent.slice(0, 200)}`,
+          );
+          assert.equal(
+            fs.readFileSync(path.join(repoDir, fi.file), "utf-8"),
+            originFilesBefore.get(fi.file),
+            `plumbing landing rewrote origin working-tree file ${fi.file}`,
           );
         }
 
-        // ── Assert: origin repo clean ─────────────────────────────
-        const porcelain = execSync("git status --porcelain", {
-          cwd: repoDir,
-          encoding: "utf-8",
-        });
-        assert.equal(porcelain.trim(), "", `origin repo left dirty:\n${porcelain}`);
+        // A moved checked-out ref makes porcelain compare stale worktree bytes
+        // with the new commit. Assert the actual non-mutation invariant instead.
+        assert.equal(
+          execSync("git write-tree", { cwd: repoDir, encoding: "utf-8" }).trim(),
+          originIndexBefore,
+          "plumbing landing rewrote the origin index",
+        );
 
         const fsckResult = spawnSync("git", ["fsck", "--no-dangling"], {
           cwd: repoDir,
@@ -541,13 +569,29 @@ describe("concurrent-runs stress test", { concurrency: 1 }, () => {
           `git fsck found errors in origin repo`,
         );
 
-        // ── Assert: origin has at least 1 (initial) + 8 (merges) commits ─
-        const gitLog = execSync("git log --oneline", { cwd: repoDir, encoding: "utf-8" });
-        const commitCount = gitLog.trim().split("\n").length;
-        assert.ok(
-          commitCount >= 1 + FEATURE_COUNT,
-          `expected at least ${1 + FEATURE_COUNT} commits, got ${commitCount}`,
-        );
+        // ── Assert: target history is exactly 8 single-parent squash commits ─
+        const targetHistory = execSync(`git rev-list --first-parent "refs/heads/${originalBranch}"`, {
+          cwd: repoDir,
+          encoding: "utf-8",
+        }).trim().split("\n");
+        assert.equal(targetHistory.length, 1 + FEATURE_COUNT);
+        assert.equal(targetHistory.at(-1), initialTip);
+        const targetLandingCommits = new Set(targetHistory.slice(0, FEATURE_COUNT));
+        for (const commit of targetLandingCommits) {
+          const commitWithParents = execSync(`git rev-list --parents -n 1 "${commit}"`, {
+            cwd: repoDir,
+            encoding: "utf-8",
+          }).trim().split(/\s+/);
+          assert.equal(
+            commitWithParents.length,
+            2,
+            `squash commit ${commit} must have exactly one parent`,
+          );
+          assert.match(
+            execSync(`git show -s --format=%s "${commit}"`, { cwd: repoDir, encoding: "utf-8" }),
+            /^fix: correct /,
+          );
+        }
 
         // ── Assert: no progress-* files leaked into origin repo ──
         const progressFiles = fs.readdirSync(repoDir).filter((f) => f.startsWith("progress-"));
@@ -580,24 +624,34 @@ describe("concurrent-runs stress test", { concurrency: 1 }, () => {
           `idle dispatch must spend zero system tokens (N1) — got ${totalSystemTokens}`,
         );
 
-        // ── Per-run work rounds: each agent type ran exactly once per run ─
+        // ── Per-run work rounds: CAS losers may loop through verify + merge ─
         const AGENTS = ["triager", "investigator", "setup", "fixer", "verifier", "merger"];
         for (const agent of AGENTS) {
           let total = 0;
           for (const runEnv of runEnvs) {
             total += runEnv.scripted.workInvocations(agent).length;
           }
-          assert.equal(
-            total,
-            FEATURE_COUNT,
-            `agent ${agent} should have exactly ${FEATURE_COUNT} work rounds across all runs, got ${total}`,
-          );
+          if (agent === "verifier" || agent === "merger") {
+            assert.ok(
+              total >= FEATURE_COUNT,
+              `agent ${agent} should have at least ${FEATURE_COUNT} work rounds across all runs, got ${total}`,
+            );
+          } else {
+            assert.equal(
+              total,
+              FEATURE_COUNT,
+              `agent ${agent} should have exactly ${FEATURE_COUNT} work rounds across all runs, got ${total}`,
+            );
+          }
         }
 
         // ── Assert: every step in every run is 'done' ─────────────
+        let targetMovedEvents = 0;
+        const eventLandingCommits = new Set<string>();
         for (let i = 0; i < runEnvs.length; i++) {
           const runEnv = runEnvs[i];
           const rid = runIds[i];
+          const fi = featureInfo(i + 1);
           const steps = dbRows<{ step_id: string; status: string }>(
             runEnv.env.tamanduaDir,
             "SELECT step_id, status FROM steps WHERE run_id = ? ORDER BY step_index",
@@ -615,7 +669,56 @@ describe("concurrent-runs stress test", { concurrency: 1 }, () => {
               `feature-${i + 1} step ${step.step_id} should be done, got ${step.status}`,
             );
           }
+          const mergeOutput = dbRow<{ output: string }>(
+            runEnv.env.tamanduaDir,
+            "SELECT output FROM steps WHERE run_id = ? AND step_id = 'finalize_merge'",
+            rid,
+          ).output;
+          assert.match(mergeOutput, /^STATUS: landed$/m);
+          const mergedCommit = mergeOutput.match(/^MERGED_COMMIT: ([0-9a-f]+)$/m)?.[1];
+          const mergedTree = mergeOutput.match(/^MERGED_TREE: ([0-9a-f]+)$/m)?.[1];
+          assert.ok(mergedCommit, `feature-${i + 1}: missing MERGED_COMMIT`);
+          assert.ok(mergedTree, `feature-${i + 1}: missing MERGED_TREE`);
+          assert.match(mergeOutput, new RegExp(`^TARGET: refs/heads/${originalBranch}$`, "m"));
+          const mergeEvents = fs
+            .readFileSync(path.join(runEnv.env.tamanduaDir, "events", `${rid}.jsonl`), "utf-8")
+            .trim()
+            .split("\n")
+            .map((line) => JSON.parse(line) as MergeEvent)
+            .filter((event) => event.event.startsWith("merge."));
+          for (const event of mergeEvents) {
+            assert.equal(event.runId, rid);
+            assert.equal(event.origin, repoDir);
+            assert.equal(event.branch, fi.branch);
+            assert.equal(event.target, `refs/heads/${originalBranch}`);
+            assert.match(event.expectedTip, /^[0-9a-f]+$/);
+          }
+          const landedEvents = mergeEvents.filter((event) => event.event === "merge.landed");
+          const movedEvents = mergeEvents.filter((event) => event.event === "merge.target_moved");
+          assert.equal(landedEvents.length, 1);
+          assert.equal(mergeEvents.filter((event) => event.event === "merge.conflicts").length, 0);
+          assert.equal(landedEvents[0].mergedCommit, mergedCommit);
+          assert.equal(landedEvents[0].mergedTree, mergedTree);
+          assert.ok(targetLandingCommits.has(mergedCommit));
+          eventLandingCommits.add(mergedCommit);
+          for (const event of movedEvents) {
+            assert.match(event.actualTip ?? "", /^[0-9a-f]+$/);
+            assert.notEqual(event.actualTip, event.expectedTip);
+          }
+          assert.equal(
+            runEnv.scripted.workInvocations("merger").length,
+            movedEvents.length + 1,
+            `feature-${i + 1}: every target_moved must lead to one merger retry`,
+          );
+          assert.equal(
+            runEnv.scripted.workInvocations("verifier").length,
+            movedEvents.length + 1,
+            `feature-${i + 1}: every target_moved must loop through verifier before retry`,
+          );
+          targetMovedEvents += movedEvents.length;
         }
+        assert.ok(targetMovedEvents > 0, "concurrent landing should exercise at least one target-moved CAS retry");
+        assert.deepEqual([...eventLandingCommits].sort(), [...targetLandingCommits].sort());
 
         // ── Diagnostics report ────────────────────────────────────
         const report = collectDiagnostics(runEnvs, runIds, wallMs);

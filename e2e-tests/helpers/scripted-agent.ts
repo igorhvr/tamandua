@@ -53,6 +53,8 @@ export interface ScriptedBehavior {
   writes?: ScriptedWrite[];
   /** Shell commands run in the harness workdir; non-zero exit → step fail. */
   commands?: string[];
+  /** Prefix the report with command stdout (used for machine-readable CLI metadata). */
+  includeCommandOutput?: boolean;
   /**
    * Text piped to `step complete` and emitted as the assistant message.
    * Supports {{cwd}} and {{input.KEY}} placeholders (KEY: value lines parsed

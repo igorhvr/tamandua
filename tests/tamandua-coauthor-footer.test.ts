@@ -14,9 +14,9 @@ const workflowIds = readdirSync(workflowsDir, { withFileTypes: true })
 
 /**
  * Collect all persona AGENTS.md files under workflows/<id>/agents/ that
- * mention `git commit` (the commit instruction guidance).
+ * construct commits, either through porcelain or the atomic landing command.
  */
-function findPersonaFilesWithGitCommit(): { workflowId: string; path: string }[] {
+function findPersonaFilesWithCommitInstructions(): { workflowId: string; path: string }[] {
   const results: { workflowId: string; path: string }[] = [];
   for (const wfId of workflowIds) {
     const agentsDir = join(workflowsDir, wfId, "agents");
@@ -27,7 +27,7 @@ function findPersonaFilesWithGitCommit(): { workflowId: string; path: string }[]
       const agentsMdPath = join(agentsDir, agentDir.name, "AGENTS.md");
       if (!existsSync(agentsMdPath)) continue;
       const content = readFileSync(agentsMdPath, "utf-8");
-      if (content.includes("git commit")) {
+      if (content.includes("git commit") || content.includes("tamandua merge-branch")) {
         results.push({ workflowId: wfId, path: agentsMdPath });
       }
     }
@@ -36,9 +36,9 @@ function findPersonaFilesWithGitCommit(): { workflowId: string; path: string }[]
 }
 
 describe("Tamandua co-author footer", () => {
-  const personaFiles = findPersonaFilesWithGitCommit();
+  const personaFiles = findPersonaFilesWithCommitInstructions();
 
-  it("finds at least the known merger persona files mentioning git commit", () => {
+  it("finds at least the known merger personas with commit instructions", () => {
     const paths = personaFiles.map((f) => f.path);
     assert.ok(
       paths.some((p) => p.includes("feature-dev-merge")),
@@ -50,10 +50,10 @@ describe("Tamandua co-author footer", () => {
     );
   });
 
-  it("every bundled persona file mentioning git commit contains the Tamandua co-author footer", () => {
+  it("every bundled persona with commit instructions contains the Tamandua co-author footer", () => {
     assert.ok(
       personaFiles.length > 0,
-      "expected at least one persona file mentioning git commit",
+      "expected at least one persona file with commit instructions",
     );
     for (const { workflowId, path } of personaFiles) {
       const content = readFileSync(path, "utf-8");
@@ -64,7 +64,7 @@ describe("Tamandua co-author footer", () => {
     }
   });
 
-  it("the Claude co-author footer is NOT present in any bundled persona file mentioning git commit", () => {
+  it("the Claude co-author footer is NOT present in any bundled persona with commit instructions", () => {
     for (const { workflowId, path } of personaFiles) {
       const content = readFileSync(path, "utf-8");
       assert.ok(

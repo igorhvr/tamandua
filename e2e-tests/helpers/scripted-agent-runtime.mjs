@@ -213,6 +213,7 @@ function runWorkRound() {
   const claimed = JSON.parse(claimRaw);
   const stepId = claimed.stepId;
   const inputVars = parseInputVars(claimed.input ?? "");
+  inputVars.RUN_ID = claimed.runId;
 
   // Log the work round NOW: once the final `step complete` of a run lands,
   // the daemon tears down crons and SIGTERMs this process group, so any
@@ -235,8 +236,9 @@ function runWorkRound() {
     process.exit(0);
   };
 
+  let actionResult;
   try {
-    applyBehaviorActions(behavior, process.cwd(), inputVars);
+    actionResult = applyBehaviorActions(behavior, process.cwd(), inputVars);
   } catch (err) {
     return failThisStep(`scripted behavior error: ${err instanceof Error ? err.message : String(err)}`);
   }
@@ -246,7 +248,10 @@ function runWorkRound() {
     process.exit(behavior.exitCode ?? 1);
   }
 
-  const outputText = substitute(behavior.output ?? "STATUS: done", inputVars);
+  const configuredOutput = substitute(behavior.output ?? "STATUS: done", inputVars);
+  const outputText = behavior.includeCommandOutput && actionResult.commandOutput
+    ? `${actionResult.commandOutput}\n${configuredOutput}`
+    : configuredOutput;
 
   if (mode === "no-status") {
     // Did the work (maybe) but never reported — the lost-step case.

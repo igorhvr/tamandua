@@ -8,6 +8,7 @@ export { uninstallWorkflow, uninstallAllWorkflows, checkActiveRuns } from "./ins
 export { getWorkflowStatus, listRuns, stopWorkflow } from "./installer/status.js";
 export { runWorkflow } from "./installer/run.js";
 export { emitEvent, getRecentEvents, getRunEvents, getEventsPath, countRunEvents } from "./installer/events.js";
+export { MERGE_BRANCH_EXIT_CODES, runPlumbingMerge } from "./installer/merge-branch.js";
 export { ensureCliSymlink, isCliSymlinked, removeCliSymlink } from "./installer/symlink.js";
 
 // Agent scheduler
@@ -97,6 +98,12 @@ export type {
 
 export type { ProvisionedAgent, ProvisionAgentsParams } from "./installer/agent-provision.js";
 export type { TamanduaEvent } from "./installer/events.js";
+export type {
+  MergeBranchEvent,
+  PlumbingMergeDependencies,
+  PlumbingMergeParams,
+  PlumbingMergeResult,
+} from "./installer/merge-branch.js";
 export type { UninstallResult, ActiveRunInfo } from "./installer/uninstall.js";
 export type { RunWorkflowParams, RunWorkflowResult } from "./installer/run.js";
 export type { RunInfo, RunDetail, StepInfo, StoryInfo } from "./installer/status.js";

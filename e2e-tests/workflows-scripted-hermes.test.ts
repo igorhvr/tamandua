@@ -50,6 +50,7 @@ import type {
 } from "./helpers/scripted-agent.ts";
 
 const fixtureDir = path.join(process.cwd(), "e2e-tests", "fixtures", "sample-project");
+const cliPath = path.resolve(process.cwd(), "dist", "cli", "cli.js");
 
 // ── Shared plumbing ─────────────────────────────────────────────────
 
@@ -258,14 +259,12 @@ const bugFixBehaviors: ScriptedAgentConfig = {
     },
     merger: {
       commands: [
-        'git -C "{{input.WORKTREE_ORIGIN_REPOSITORY}}" checkout "{{input.ORIGINAL_BRANCH}}"',
-        `git -C "{{input.WORKTREE_ORIGIN_REPOSITORY}}" merge --squash ${BRANCH}`,
-        `git -C "{{input.WORKTREE_ORIGIN_REPOSITORY}}" commit -m "fix: correct add implementation (squash of ${BRANCH})"`,
+        `expected_tip=$(git -C "{{input.WORKTREE_ORIGIN_REPOSITORY}}" rev-parse "refs/heads/{{input.ORIGINAL_BRANCH}}") && TAMANDUA_RUN_ID="{{input.RUN_ID}}" "${process.execPath}" "${cliPath}" merge-branch --origin "{{input.WORKTREE_ORIGIN_REPOSITORY}}" --branch "${BRANCH}" --into "{{input.ORIGINAL_BRANCH}}" --expect-tip "$expected_tip" --message "fix: correct add implementation (squash of ${BRANCH})"`,
       ],
+      includeCommandOutput: true,
       output: [
         "STATUS: done",
         "REBASED: false",
-        "MERGE_COMMIT: scripted",
         "MERGED_INTO: {{input.ORIGINAL_BRANCH}}",
       ].join("\n"),
     },
@@ -286,6 +285,9 @@ describe("scripted-hermes full pipeline (real daemon/scheduler, zero tokens)", {
       try {
         ctx = await startHermesScriptedEnvironment("bug-fix-merge-worktree", bugFixBehaviors);
         const repoDir = prepareGitRepo(fixtureDir, path.join(ctx.env.root, "origin-repo"));
+        const originalBranch = execSync("git symbolic-ref --short HEAD", { cwd: repoDir, encoding: "utf-8" }).trim();
+        const originMathBefore = fs.readFileSync(path.join(repoDir, "src", "math.ts"), "utf-8");
+        const originIndexBefore = execSync("git write-tree", { cwd: repoDir, encoding: "utf-8" }).trim();
 
         // Pass --hermes-as-harness AND the hermes env (so validateRunHarnessForScheduling
         // can find the fake hermes binary).
@@ -321,19 +323,39 @@ describe("scripted-hermes full pipeline (real daemon/scheduler, zero tokens)", {
           assert.equal(step.status, "done", `step ${step.step_id} should be done, got ${step.status}`);
         }
 
-        // ── Repository outcome: real git merge landed the fix ─────
-        const mathTs = fs.readFileSync(path.join(repoDir, "src", "math.ts"), "utf-8");
-        assert.ok(mathTs.includes("a + b"), `origin math.ts should be fixed:\n${mathTs}`);
-        assert.ok(!mathTs.includes("a - b"), `origin math.ts should not keep the bug:\n${mathTs}`);
+        // ── Repository outcome: the target ref landed the fix without touching origin state ──
+        const targetMath = execSync(`git show "refs/heads/${originalBranch}:src/math.ts"`, {
+          cwd: repoDir,
+          encoding: "utf-8",
+        });
+        assert.ok(targetMath.includes("a + b"), `target ref math.ts should be fixed:\n${targetMath}`);
+        assert.ok(!targetMath.includes("a - b"), `target ref math.ts should not keep the bug:\n${targetMath}`);
+        assert.equal(fs.readFileSync(path.join(repoDir, "src", "math.ts"), "utf-8"), originMathBefore);
+        assert.equal(execSync("git write-tree", { cwd: repoDir, encoding: "utf-8" }).trim(), originIndexBefore);
+        const mergedTree = execSync(`git rev-parse "refs/heads/${originalBranch}^{tree}"`, {
+          cwd: repoDir,
+          encoding: "utf-8",
+        }).trim();
+        const mergeStep = dbRow<{ output: string }>(
+          ctx.env.tamanduaDir,
+          "SELECT output FROM steps WHERE run_id = ? AND step_id = 'finalize_merge'",
+          runId,
+        );
+        assert.match(mergeStep.output, /^STATUS: landed$/m);
+        assert.match(mergeStep.output, new RegExp(`^MERGED_TREE: ${mergedTree}$`, "m"));
+        const mergeEvents = fs
+          .readFileSync(path.join(ctx.env.tamanduaDir, "events", `${runId}.jsonl`), "utf-8")
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line) as { event: string })
+          .filter((event) => event.event.startsWith("merge."));
+        assert.deepEqual(mergeEvents.map((event) => event.event), ["merge.landed"]);
 
         const gitLog = execSync("git log --oneline -5", { cwd: repoDir, encoding: "utf-8" });
         assert.ok(
           gitLog.trim().split("\n").length >= 2,
           `expected initial + squash-merge commits, got:\n${gitLog}`,
         );
-        const porcelain = execSync("git status --porcelain", { cwd: repoDir, encoding: "utf-8" });
-        assert.equal(porcelain.trim(), "", `origin repo left dirty:\n${porcelain}`);
-
         // ── Regression: no progress-* files leaked into the repo working tree ─
         const progressFiles = fs.readdirSync(repoDir).filter((f) => f.startsWith("progress-"));
         assert.equal(progressFiles.length, 0, `origin repo contains leaked progress files: ${progressFiles.join(", ")}`);

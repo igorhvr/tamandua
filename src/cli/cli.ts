@@ -61,6 +61,7 @@ import {
   type RunLoopIterationResult,
 } from "../autoresearch/autoresearch.js";
 import { getDb, upsertAutoresearchSession } from "../db.js";
+import { runPlumbingMerge } from "../installer/merge-branch.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -192,6 +193,45 @@ function requireOption(args: string[], name: string, usage: string): string {
     process.exit(1);
   }
   return value;
+}
+
+const MERGE_BRANCH_OPTIONS = ["--origin", "--branch", "--into", "--expect-tip", "--message"] as const;
+type MergeBranchOption = typeof MERGE_BRANCH_OPTIONS[number];
+
+function parseMergeBranchOptions(args: string[]): Record<MergeBranchOption, string> {
+  const allowed = new Set<string>(MERGE_BRANCH_OPTIONS);
+  const parsed = new Map<MergeBranchOption, string>();
+
+  for (let index = 0; index < args.length; index++) {
+    const token = args[index]!;
+    if (!token.startsWith("--")) {
+      throw new Error(`Unexpected argument ${token}. All merge-branch inputs must use named options.`);
+    }
+
+    const equalsIndex = token.indexOf("=");
+    const name = (equalsIndex === -1 ? token : token.slice(0, equalsIndex)) as MergeBranchOption;
+    if (!allowed.has(name)) throw new Error(`Unknown option ${name}.`);
+    if (parsed.has(name)) throw new Error(`Duplicate option ${name}.`);
+
+    let value: string | undefined;
+    if (equalsIndex !== -1) {
+      value = token.slice(equalsIndex + 1);
+    } else {
+      const next = args[index + 1];
+      if (next !== undefined && !next.startsWith("--")) {
+        value = next;
+        index++;
+      }
+    }
+    if (!value?.trim()) throw new Error(`Missing value for ${name}.`);
+    parsed.set(name, value);
+  }
+
+  for (const name of MERGE_BRANCH_OPTIONS) {
+    if (!parsed.has(name)) throw new Error(`Missing required option ${name}.`);
+  }
+
+  return Object.fromEntries(parsed) as Record<MergeBranchOption, string>;
 }
 
 function parseDirection(value: string): AutoresearchDirection {
@@ -504,6 +544,36 @@ Displays a comprehensive status overview of the Tamandua system, including:
 Examples:
   tamandua status             # Full system status overview
   tamandua status --help      # This help text`;
+}
+
+function getMergeBranchHelp(): string {
+  return `tamandua merge-branch — Atomically land a squash merge with Git plumbing
+
+Usage: tamandua merge-branch --origin <repo-path> --branch <feature-branch> --into <target-ref> --expect-tip <sha> --message <commit-message>
+
+All options are required and must be specified exactly once:
+  --origin <repo-path>       Origin Git repository whose target ref is updated
+  --branch <feature-branch>  Feature branch to squash
+  --into <target-ref>        Explicit target branch name (never defaults to main)
+  --expect-tip <sha>         Required current target commit for atomic compare-and-swap
+  --message <message>        Commit message for the squash commit
+
+Machine-readable results:
+  STATUS: landed
+  MERGED_COMMIT: <sha>
+  MERGED_TREE: <tree-sha>
+  TARGET: refs/heads/<target-ref>
+
+  STATUS: target_moved
+
+  STATUS: conflicts
+  <Git conflict listing>
+
+Exit codes:
+  0  Merge landed
+  1  Invalid invocation or operational Git error
+  2  Target moved before atomic landing
+  3  Merge conflicts`;
 }
 
 function getStepPeekHelp(): string {
@@ -1723,6 +1793,8 @@ function getUsageText(): string {
     "tamandua get-ready                    Install bundled workflows and start daemon/dashboard/MCP",
     "tamandua uninstall [--force]          Full uninstall",
     "tamandua status                       Show detailed system status (services, paths, runs, processes)",
+    "tamandua merge-branch --origin <repo> --branch <branch> --into <target> --expect-tip <sha> --message <message>",
+    "                                      Atomically land a plumbing-based squash merge",
     "", "tamandua workflow list                List available workflows",
     "tamandua workflow install <name|--all>  Install a workflow (or all)",
     "tamandua workflow run <name> <task> [--no-hurry-please-save-tokens-mode]",
@@ -1798,6 +1870,7 @@ function shouldSkipUpdateWarning(group: string, action: string): boolean {
   if (group === "version" || group === "--version" || group === "-v") return true;
   if (group === "step" && (action === "peek" || action === "claim")) return true;
   if (group === "nudge") return true;
+  if (group === "merge-branch") return true;
   return false;
 }
 
@@ -1831,6 +1904,9 @@ async function main() {
     }
     if (group === "status") {
       printHelp(getStatusHelp());
+    }
+    if (group === "merge-branch") {
+      printHelp(getMergeBranchHelp());
     }
     if (group === "mcp") {
       if (action === "start") { printHelp(getMcpStartHelp()); }
@@ -1939,6 +2015,37 @@ async function main() {
 
   if (group === "source-path") {
     console.log(resolveSourcePath()); return;
+  }
+
+  if (group === "merge-branch") {
+    let options: Record<MergeBranchOption, string>;
+    try {
+      options = parseMergeBranchOptions(args.slice(1));
+    } catch (err) {
+      process.stderr.write(`Error: ${err instanceof Error ? err.message : String(err)}\nRun tamandua merge-branch --help for usage.\n`);
+      process.exitCode = 1;
+      return;
+    }
+
+    const result = runPlumbingMerge({
+      origin: options["--origin"],
+      branch: options["--branch"],
+      into: options["--into"],
+      expectTip: options["--expect-tip"],
+      message: options["--message"],
+    });
+    if (result.status === "landed") {
+      process.stdout.write(`STATUS: landed\nMERGED_COMMIT: ${result.mergedCommit}\nMERGED_TREE: ${result.mergedTree}\nTARGET: ${result.target}\n`);
+    } else if (result.status === "target_moved") {
+      process.stdout.write("STATUS: target_moved\n");
+      process.stderr.write(`${result.detail}\n`);
+    } else if (result.status === "conflicts") {
+      process.stdout.write(`STATUS: conflicts\n${result.conflicts}${result.conflicts.endsWith("\n") ? "" : "\n"}`);
+    } else {
+      process.stderr.write(`Error: ${result.detail}\n`);
+    }
+    process.exitCode = result.exitCode;
+    return;
   }
 
   if (group === "update") {

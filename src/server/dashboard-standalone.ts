@@ -136,6 +136,14 @@ async function bootstrap(): Promise<void> {
     process.exit(1);
   }
 
+  // Do not advertise readiness until the socket is actually accepting requests.
+  // createDashboardServer starts listening asynchronously before it returns.
+  if (!dashboardServer.listening) {
+    await new Promise<void>((resolve) => {
+      dashboardServer!.once("listening", resolve);
+    });
+  }
+
   console.log(`Tamandua dashboard server started on port ${port} (pid ${process.pid})`);
 }
 

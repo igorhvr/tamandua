@@ -10,6 +10,7 @@ import { getPidFile, getPortFile, stopDaemon } from "../../dist/server/daemonctl
 import { reservePortHandles, reservePortHandle, type PortHandle } from "../../tests/helpers/test-env.ts";
 import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
 import { getRunEvents } from "../../dist/installer/events.js";
+import { assertStatePathIsolation } from "../../dist/lib/test-guard.js";
 
 // ── Helpers ──
 

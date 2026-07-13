@@ -51,6 +51,14 @@ export interface TamanduaEvent {
   failCount?: number;
   window?: string;
   waitedMs?: number;
+  // Plumbing merge fields
+  origin?: string;
+  branch?: string;
+  target?: string;
+  expectedTip?: string;
+  actualTip?: string;
+  mergedTree?: string;
+  mergedCommit?: string;
 }
 
 export type EventCursorSource =

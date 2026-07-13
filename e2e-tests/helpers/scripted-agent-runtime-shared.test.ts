@@ -312,6 +312,21 @@ describe("scripted-agent-runtime-shared", () => {
       assert.equal(result, "cd /some/repo && git checkout feature-branch");
     });
 
+    it("applyBehaviorActions returns command stdout for verbatim fixture reporting", async () => {
+      const workdir = makeTempStateDir();
+      try {
+        const mod = await import(sharedModulePath);
+        const result = mod.applyBehaviorActions(
+          { commands: ["printf 'STATUS: landed\\nMERGED_TREE: abc123\\n'"] },
+          workdir,
+          {},
+        );
+        assert.equal(result.commandOutput, "STATUS: landed\nMERGED_TREE: abc123");
+      } finally {
+        cleanup(workdir);
+      }
+    });
+
     it("loadBehaviors returns defaults when file is missing", async () => {
       const mod = await import(sharedModulePath);
       const config = mod.loadBehaviors("/nonexistent/behaviors.json");
