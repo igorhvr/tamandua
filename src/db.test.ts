@@ -1994,10 +1994,11 @@ describe("MIGV schema version short-circuit", () => {
   let origDbPath: string | undefined;
   let baselineRuns: number;
 
+
   const th = createTempHome("tamandua-migv-");
 
   before(() => {
-    baselineRuns = _migrateFullRuns;
+
     tempHome = th.root;
     origHome = process.env.HOME;
     origDbPath = process.env.TAMANDUA_DB_PATH;
