@@ -25,6 +25,21 @@ fi
 export TAMANDUA_TEST_GUARD="${TAMANDUA_TEST_GUARD:-1}"
 export TAMANDUA_PI_BINARY="${TAMANDUA_PI_BINARY:-/usr/bin/false}"
 
+# --- Syntax Gate ---
+# Catch merge-artifact syntax errors (unbalanced braces, etc.) that
+# lenient Node 22 parsers tolerate but stricter Node 24 rejects.
+# Guard set -e: if the script is missing (isolated test env), skip silently.
+SYNTAX_CHECK="$REPO_ROOT/scripts/syntax-check-tests.ts"
+if [ -f "$SYNTAX_CHECK" ]; then
+  echo ">>> Running syntax gate on .test.ts files..."
+  if ! npx tsx "$SYNTAX_CHECK"; then
+    echo ""
+    echo ">>> Syntax gate FAILED — test files have parse errors. Fix before running tests." >&2
+    exit 1
+  fi
+  echo ""
+fi
+
 SERIAL_EXIT=0
 PARALLEL_EXIT=0
 

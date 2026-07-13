@@ -77,6 +77,7 @@ tests/run-token-migration.test.ts
 tests/runner-scripts.test.ts
 tests/sample-project-fixture.test.ts
 tests/step-ownership-columns-migration.test.ts
+tests/syntax-check.test.ts
 tests/system-token-spend-migration.test.ts
 tests/token-log-formatting.test.ts
 tests/work-round-persona-prompt.test.ts
