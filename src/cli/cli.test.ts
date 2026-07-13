@@ -770,10 +770,10 @@ describe("--help infrastructure", () => {
     const result = cli(["worktree", "prune", "--help"]);
     try {
       assert.equal(result.status, 0);
-      assert.match(result.stdout ?? "", /Remove old completed worktrees/);
+      assert.match(result.stdout ?? "", /Remove old completed, failed, or orphaned worktrees/);
       assert.match(result.stdout ?? "", /--completed/);
       assert.match(result.stdout ?? "", /--older-than/);
-      assert.match(result.stdout ?? "", /completed or canceled/);
+      assert.match(result.stdout ?? "", /completed, canceled, or failed/);
       assert.match(result.stdout ?? "", /Duration format/);
       assert.match(result.stdout ?? "", /7d.*7 days/);
       assert.match(result.stdout ?? "", /24h.*24 hours/);

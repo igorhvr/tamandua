@@ -729,6 +729,149 @@ describe("CLI worktree prune", () => {
       try { fs.rmSync(env.root, { recursive: true, force: true }); } catch {}
     }
   });
+
+  it("prunes orphaned worktree (no runs row) when older than threshold", async () => {
+    const env = await createTempEnv();
+    try {
+      const dbPath = path.join(env.tamanduaDir, "tamandua.db");
+      initDb(dbPath);
+      const originRepo = path.join(env.root, "origin");
+      createGitRepo(originRepo);
+      const worktreePath = path.join(env.root, "orphan-old-wt");
+      runGit(["worktree", "add", "--detach", worktreePath, "main"], originRepo);
+      const runId = crypto.randomUUID();
+      // Seed worktree row but NO runs row — simulating orphaned row
+      seedWorktreeRow(dbPath, runId, { worktreePath, originRepo, originRef: "main" });
+      const db = new DatabaseSync(dbPath);
+      db.prepare("UPDATE run_worktrees SET created_at = datetime('now', '-30 days') WHERE run_id = ?").run(runId);
+      db.close();
+      const { stdout, code } = await runCliToExit(
+        ["worktree", "prune", "--completed", "--older-than", "7d"], cliEnv(env));
+      assert.equal(code, 0);
+      assert.match(stdout, /Pruned orphaned worktree/);
+      assert.match(stdout, /no runs row/);
+    } finally {
+      try { fs.rmSync(env.root, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  it("skips orphaned worktree newer than threshold", async () => {
+    const env = await createTempEnv();
+    try {
+      const dbPath = path.join(env.tamanduaDir, "tamandua.db");
+      initDb(dbPath);
+      const originRepo = path.join(env.root, "origin");
+      createGitRepo(originRepo);
+      const worktreePath = path.join(env.root, "orphan-new-wt");
+      runGit(["worktree", "add", "--detach", worktreePath, "main"], originRepo);
+      const runId = crypto.randomUUID();
+      // Seed worktree row but NO runs row — simulating orphaned row
+      seedWorktreeRow(dbPath, runId, { worktreePath, originRepo, originRef: "main" });
+      const { stdout, code } = await runCliToExit(
+        ["worktree", "prune", "--completed", "--older-than", "7d"], cliEnv(env));
+      assert.equal(code, 0);
+      assert.match(stdout, /No worktrees to prune/);
+    } finally {
+      try { fs.rmSync(env.root, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  it("prunes orphaned worktree with very short --older-than", async () => {
+    const env = await createTempEnv();
+    try {
+      const dbPath = path.join(env.tamanduaDir, "tamandua.db");
+      initDb(dbPath);
+      const originRepo = path.join(env.root, "origin");
+      createGitRepo(originRepo);
+      const worktreePath = path.join(env.root, "orphan-recent-wt");
+      runGit(["worktree", "add", "--detach", worktreePath, "main"], originRepo);
+      const runId = crypto.randomUUID();
+      // Seed worktree row but NO runs row — set created_at to 2 days ago
+      seedWorktreeRow(dbPath, runId, { worktreePath, originRepo, originRef: "main" });
+      const db = new DatabaseSync(dbPath);
+      db.prepare("UPDATE run_worktrees SET created_at = datetime('now', '-2 days') WHERE run_id = ?").run(runId);
+      db.close();
+      // Use 1m threshold — 2-day-old worktree will definitely pass
+      const { stdout, code } = await runCliToExit(
+        ["worktree", "prune", "--completed", "--older-than", "1m"], cliEnv(env));
+      assert.equal(code, 0);
+      assert.match(stdout, /Pruned orphaned worktree/);
+      assert.match(stdout, /no runs row/);
+    } finally {
+      try { fs.rmSync(env.root, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  it("prunes failed-run worktree older than threshold", async () => {
+    const env = await createTempEnv();
+    try {
+      const dbPath = path.join(env.tamanduaDir, "tamandua.db");
+      initDb(dbPath);
+      const originRepo = path.join(env.root, "origin");
+      createGitRepo(originRepo);
+      const worktreePath = path.join(env.root, "failed-old-wt");
+      runGit(["worktree", "add", "--detach", worktreePath, "main"], originRepo);
+      const runId = crypto.randomUUID();
+      seedRunRow(dbPath, runId, { status: "failed" });
+      seedWorktreeRow(dbPath, runId, { worktreePath, originRepo, originRef: "main" });
+      const db = new DatabaseSync(dbPath);
+      db.prepare("UPDATE run_worktrees SET created_at = datetime('now', '-30 days') WHERE run_id = ?").run(runId);
+      db.close();
+      const { stdout, code } = await runCliToExit(
+        ["worktree", "prune", "--completed", "--older-than", "7d"], cliEnv(env));
+      assert.equal(code, 0);
+      assert.match(stdout, /Pruned worktree/);
+      assert.match(stdout, /\(failed\)/);
+    } finally {
+      try { fs.rmSync(env.root, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  it("skips failed-run worktree newer than threshold (rugpull safety)", async () => {
+    const env = await createTempEnv();
+    try {
+      const dbPath = path.join(env.tamanduaDir, "tamandua.db");
+      initDb(dbPath);
+      const originRepo = path.join(env.root, "origin");
+      createGitRepo(originRepo);
+      const worktreePath = path.join(env.root, "failed-new-wt");
+      runGit(["worktree", "add", "--detach", worktreePath, "main"], originRepo);
+      const runId = crypto.randomUUID();
+      seedRunRow(dbPath, runId, { status: "failed" });
+      seedWorktreeRow(dbPath, runId, { worktreePath, originRepo, originRef: "main" });
+      const { stdout, code } = await runCliToExit(
+        ["worktree", "prune", "--completed", "--older-than", "7d"], cliEnv(env));
+      assert.equal(code, 0);
+      assert.match(stdout, /No worktrees to prune/);
+    } finally {
+      try { fs.rmSync(env.root, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  it("prunes failed-run worktree with short --older-than", async () => {
+    const env = await createTempEnv();
+    try {
+      const dbPath = path.join(env.tamanduaDir, "tamandua.db");
+      initDb(dbPath);
+      const originRepo = path.join(env.root, "origin");
+      createGitRepo(originRepo);
+      const worktreePath = path.join(env.root, "failed-short-wt");
+      runGit(["worktree", "add", "--detach", worktreePath, "main"], originRepo);
+      const runId = crypto.randomUUID();
+      seedRunRow(dbPath, runId, { status: "failed" });
+      seedWorktreeRow(dbPath, runId, { worktreePath, originRepo, originRef: "main" });
+      const db = new DatabaseSync(dbPath);
+      db.prepare("UPDATE run_worktrees SET created_at = datetime('now', '-2 days') WHERE run_id = ?").run(runId);
+      db.close();
+      const { stdout, code } = await runCliToExit(
+        ["worktree", "prune", "--completed", "--older-than", "1m"], cliEnv(env));
+      assert.equal(code, 0);
+      assert.match(stdout, /Pruned worktree/);
+      assert.match(stdout, /\(failed\)/);
+    } finally {
+      try { fs.rmSync(env.root, { recursive: true, force: true }); } catch {}
+    }
+  });
 });
 
 describe("CLI parseDuration", () => {

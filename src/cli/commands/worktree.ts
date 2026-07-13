@@ -86,16 +86,18 @@ Examples:
 }
 
 export function getWorktreePruneHelp(): string {
-  return `tamandua worktree prune — Remove old completed worktrees
+  return `tamandua worktree prune — Remove old completed, failed, or orphaned worktrees
 
 Usage: tamandua worktree prune --completed --older-than <duration>
 
-Prunes (removes) managed git worktrees that are associated with completed
-or canceled workflow runs and are older than the specified duration.
-This is a cleanup command that helps reclaim disk space from old worktrees.
+Prunes (removes) managed git worktrees that are associated with completed,
+failed, or canceled workflow runs, and orphaned rows (run_worktrees rows
+whose corresponding runs row is missing), when they are older than the
+specified duration. This is a cleanup command that helps reclaim disk
+space from old worktrees.
 
 Options (both required):
-  --completed        Only prune worktrees for completed or canceled runs.
+  --completed        Prune worktrees for completed, canceled, or failed runs, and orphaned rows (run_worktrees rows whose runs row is missing).
   --older-than <d>   Only prune worktrees older than the given duration.
 
 Duration format:
@@ -249,6 +251,9 @@ export async function handleWorktree(group: string, args: string[]): Promise<boo
     const worktrees = listRunWorktrees();
     let pruned = 0;
 
+    const { getDb } = await import("../../db.js");
+    const db = getDb();
+
     for (const wt of worktrees) {
       if (wt.status === "removed") continue;
 
@@ -266,21 +271,19 @@ export async function handleWorktree(group: string, args: string[]): Promise<boo
         continue;
       }
 
-      // Check if the associated run is completed/canceled
+      // Check if the associated run is completed/canceled (or orphaned)
       let runStatus: string;
       try {
         runStatus = getWorkflowStatusFn(wt.runId).status;
       } catch {
-        // Run not found, skip
-        continue;
+        // Run not found — orphaned row; fall through to age check
+        runStatus = "__orphaned__";
       }
 
-      if (runStatus !== "completed" && runStatus !== "canceled") continue;
+      if (runStatus !== "completed" && runStatus !== "canceled" && runStatus !== "failed" && runStatus !== "__orphaned__") continue;
 
       // Check age: we need the worktree created_at from DB
       // getRunWorktree() doesn't expose created_at, so query DB directly
-      const { getDb } = await import("../../db.js");
-      const db = getDb();
       const row = db
         .prepare(
           "SELECT created_at FROM run_worktrees WHERE run_id = ?",
@@ -296,9 +299,15 @@ export async function handleWorktree(group: string, args: string[]): Promise<boo
       try {
         removeRunWorktree({ runId: wt.runId, force: true });
         pruned++;
-        console.log(
-          `Pruned worktree for run ${wt.runId.slice(0, 8)} (${runStatus}).`,
-        );
+        if (runStatus === "__orphaned__") {
+          console.log(
+            `Pruned orphaned worktree for run ${wt.runId.slice(0, 8)} (no runs row).`,
+          );
+        } else {
+          console.log(
+            `Pruned worktree for run ${wt.runId.slice(0, 8)} (${runStatus}).`,
+          );
+        }
       } catch (err) {
         console.warn(
           `Warning: failed to prune run ${wt.runId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`,
