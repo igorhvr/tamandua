@@ -147,9 +147,13 @@ export function rotateGlobalEventsFile(): void {
   const globalFile = getGlobalEventsFile();
   try {
     const stats = fs.statSync(globalFile);
-    if (stats.size <= MAX_EVENTS_FILE_SIZE) return; // below cap
+    if (stats.size <= MAX_EVENTS_FILE_SIZE) {
+      globalFileSizeEstimate = stats.size;
+      return; // below cap
+    }
   } catch {
     // File doesn't exist yet — nothing to rotate
+    globalFileSizeEstimate = 0;
     return;
   }
 
@@ -177,6 +181,9 @@ export function rotateGlobalEventsFile(): void {
 
   // Increment the rotation generation so cursor consumers can detect staleness
   incrementGeneration();
+
+  // No live file remains after rotation — reset the size estimate
+  globalFileSizeEstimate = 0;
 }
 
 // ── Event Emission ───────────────────────────────────────────────────
@@ -335,9 +342,9 @@ function emitEventCore(evt: TamanduaEvent): void {
     globalFileSizeEstimate += Buffer.byteLength(line);
     if (globalFileSizeEstimate > MAX_EVENTS_FILE_SIZE) {
       rotateGlobalEventsFile();
-      // After rotation the live file is empty (or will be created by
-      // future appends).  Reset the estimate.
-      globalFileSizeEstimate = 0;
+      // rotateGlobalEventsFile now correctly updates the estimate on
+      // all branches (no-op: sets to actual stat size; rotated: 0;
+      // ENOENT: 0). No need to reset here.
     }
   } catch (err) {
     logger.warn("Failed to write global event", {

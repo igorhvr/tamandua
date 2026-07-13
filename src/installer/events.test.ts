@@ -1585,6 +1585,63 @@ describe("rotation infrastructure", () => {
       rotateGlobalEventsFile();
       assert.equal(getGlobalEventsGeneration(), 1); // unchanged
     });
+
+    it("does not double-shift archives when re-invoked with a small live file", () => {
+      const globalFile = path.join(stateDir, "events", "all.jsonl");
+      const eventsDir = path.dirname(globalFile);
+      fs.mkdirSync(eventsDir, { recursive: true });
+
+      // Pre-seed archives .1 and .2 with distinct markers so we can detect
+      // any unwanted shift on the second rotation attempt.
+      fs.writeFileSync(`${globalFile}.1`, "ARCHIVE_1_ORIGINAL_CONTENT\n", "utf-8");
+      fs.writeFileSync(`${globalFile}.2`, "ARCHIVE_2_ORIGINAL_CONTENT\n", "utf-8");
+
+      // Write a large live file that exceeds the cap.
+      const chunkSize = 1024 * 1024; // 1 MB
+      const chunks = Math.ceil((MAX_EVENTS_FILE_SIZE + 1) / chunkSize);
+      const fd = fs.openSync(globalFile, "w");
+      const pad = "x".repeat(chunkSize - 1);
+      for (let i = 0; i < chunks; i++) {
+        fs.appendFileSync(fd, `LIVE_BEFORE_ROTATION_${pad}\n`, "utf-8");
+      }
+      fs.closeSync(fd);
+
+      // First rotation — shifts archives and renames live → .1.
+      rotateGlobalEventsFile();
+      assert.equal(getGlobalEventsGeneration(), 1, "generation should be 1 after first rotation");
+
+      // After rotation: .1 = old live file, .2 = ARCHIVE_1_ORIGINAL, .3 = ARCHIVE_2_ORIGINAL.
+      assert.ok(!fs.existsSync(globalFile), "live file should be gone after rotation");
+      assert.ok(archiveExists(1), "archive .1 must exist");
+      assert.ok(archiveExists(2), "archive .2 must exist");
+      assert.ok(archiveExists(3), "archive .3 must exist");
+      assert.ok(readArchive(1).includes("LIVE_BEFORE_ROTATION"), ".1 should have live file content");
+      assert.ok(readArchive(2).includes("ARCHIVE_1_ORIGINAL_CONTENT"), ".2 should have pre-seeded content");
+      assert.ok(readArchive(3).includes("ARCHIVE_2_ORIGINAL_CONTENT"), ".3 should have pre-seeded content");
+
+      // Snapshot the archive contents after the first rotation.
+      const snap1 = readArchive(1);
+      const snap2 = readArchive(2);
+      const snap3 = readArchive(3);
+
+      // Simulate the other process: create a small live file (well below cap).
+      writeGlobalFile("post-rotation event written by another process\n");
+
+      // Second rotation attempt — must no-op because statSync shows file is below cap.
+      rotateGlobalEventsFile();
+      assert.equal(getGlobalEventsGeneration(), 1, "generation must NOT increment on second no-op call");
+
+      // Archives must NOT have been shifted a second time.
+      assert.equal(readArchive(1), snap1, "archive .1 must be unchanged");
+      assert.equal(readArchive(2), snap2, "archive .2 must be unchanged");
+      assert.equal(readArchive(3), snap3, "archive .3 must be unchanged");
+
+      // No new archive (.4) should have been created.
+      assert.ok(!archiveExists(4), "archive .4 must not exist");
+
+      // Live file must still be the small file (not deleted/renamed).
+      assert.ok(fs.existsSync(globalFile), "small live file must still exist");
+    });
   });
 });
 
