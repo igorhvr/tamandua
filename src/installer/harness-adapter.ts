@@ -33,6 +33,8 @@ export interface HarnessRoundResult {
   promptElided?: boolean;
   /** Sanitized tail of stderr output (last ~8KB, ANSI-stripped, lines truncated). */
   stderrTail?: string;
+  /** True when the round was terminated by a timeout guard (exitCode will be null, signal SIGTERM). */
+  timedOut?: boolean;
 }
 
 // ── Run options shared across harnesses ────────────────────────────
@@ -249,8 +251,12 @@ class PiHarnessAdapter implements HarnessAdapter {
     });
     const parseResultPromise = parsePiOutputStream(rl);
 
-    // Wait for child exit. Apply timeout guard.
-    await new Promise<void>((resolve, reject) => {
+    // Wait for child exit, with timeout guard.
+    // The adapter resolves on ALL outcomes (success, non-zero exit, timeout)
+    // so the scheduler can attribute tokens and populate worker_lost events
+    // with real exit/signal/stderr forensics. Only fatal spawn errors
+    // (child.on("error")) still reject.
+    const exitInfo = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
       let settled = false;
       const timer = setTimeout(() => {
         if (settled) return;
@@ -266,7 +272,10 @@ class PiHarnessAdapter implements HarnessAdapter {
             /* best effort */
           }
         }
-        reject(new Error(`pi timed out after ${timeoutMs}ms`));
+        // Resolve with timeout signal info — the scheduler and dispatch-round
+        // failure path can now populate worker_lost events with real forensics
+        // instead of undefined.
+        resolve({ code: null, signal: "SIGTERM" });
       }, timeoutMs);
 
       child.on("error", (err) => {
@@ -279,33 +288,40 @@ class PiHarnessAdapter implements HarnessAdapter {
         clearTimeout(timer);
         if (settled) return;
         settled = true;
-        if (code === 0 || code === null) {
-          resolve();
-        } else {
-          const failureDurationMs = Date.now() - startedAt;
-          const failureStderr = stderrPieces.join("");
-          const failureStderrMeta = buildStreamLogMetadata(failureStderr);
-          logger.error("pi execution failed", {
-            pid: childPid ?? null,
-            pgid,
-            exitCode: code,
-            signal,
-            durationMs: failureDurationMs,
-            stderrBytes: failureStderrMeta.bytes,
-            stderrPreview: failureStderrMeta.preview,
-            stderrTruncated: failureStderrMeta.truncated,
-          });
-          const stderrSuffix = failureStderr
-            ? `\nstderr: ${failureStderr}`
-            : "";
-          reject(
-            new Error(
-              `pi failed: exited with code ${code}${signal ? ` (signal ${signal})` : ""}${stderrSuffix}`,
-            ),
-          );
-        }
+        // Always resolve — the scheduler decides what to do with non-zero
+        // exits. Worker-lost events now carry exitCode/signal/stderrTail
+        // instead of undefined.
+        resolve({ code, signal: signal as NodeJS.Signals | null });
       });
     });
+
+    const exitCode = exitInfo.code;
+    const exitSignal = exitInfo.signal;
+    const timedOut = exitCode === null && exitSignal === "SIGTERM";
+
+    // Log non-zero exit failures (but don't reject — resolve like hermes)
+    if (exitCode !== null && exitCode !== 0) {
+      const failureDurationMs = Date.now() - startedAt;
+      const failureStderr = stderrPieces.join("");
+      const failureStderrMeta = buildStreamLogMetadata(failureStderr);
+      logger.error("pi execution failed", {
+        pid: childPid ?? null,
+        pgid,
+        exitCode,
+        signal: exitSignal,
+        durationMs: failureDurationMs,
+        stderrBytes: failureStderrMeta.bytes,
+        stderrPreview: failureStderrMeta.preview,
+        stderrTruncated: failureStderrMeta.truncated,
+      });
+    } else if (exitSignal) {
+      logger.warn("pi terminated by signal", {
+        pid: childPid ?? null,
+        pgid,
+        signal: exitSignal,
+        durationMs: Date.now() - startedAt,
+      });
+    }
 
     // Wait for stdout parsing to finish (it will complete once stdout closes)
     const parseResult = await parseResultPromise;
@@ -341,8 +357,8 @@ class PiHarnessAdapter implements HarnessAdapter {
       pid: childPid ?? null,
       pgid,
       durationMs,
-      exitCode: child.exitCode,
-      signal: child.signalCode,
+      exitCode,
+      signal: exitSignal,
       stdoutBytes: stdoutMeta.bytes,
       stdoutPreview: stdoutMeta.preview,
       stdoutTruncated: stdoutMeta.truncated,
@@ -354,9 +370,10 @@ class PiHarnessAdapter implements HarnessAdapter {
 
     return {
       output: filteredStdout.trim(),
-      exitCode: child.exitCode,
-      signal: child.signalCode ?? undefined,
+      exitCode: exitCode,
+      signal: exitSignal ?? undefined,
       stderrTail: stderrTail || undefined,
+      timedOut: timedOut || undefined,
     };
   }
 }

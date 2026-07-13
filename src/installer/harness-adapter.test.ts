@@ -234,7 +234,7 @@ describe("PiHarnessAdapter implementation", () => {
       }
     });
 
-    it("rejects on non-zero exit code", async () => {
+    it("resolves on non-zero exit — returns output with exitCode populated", async () => {
       const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-runround-");
       const fakePi = path.join(tmpDir, "pi");
       fs.writeFileSync(
@@ -248,10 +248,43 @@ describe("PiHarnessAdapter implementation", () => {
       process.env.TAMANDUA_PI_BINARY = fakePi;
 
       try {
-        await assert.rejects(
-          () => adapter.runRound("prompt", { timeout: 3, workdir: tmpDir }),
-          /pi failed: exited with code 7/
-        );
+        // Adapter now resolves on non-zero exit (like hermes) so the scheduler
+        // can populate worker_lost events with real exitCode/signal/stderrTail.
+        const result = await adapter.runRound("prompt", { timeout: 3, workdir: tmpDir });
+        assert.equal(result.exitCode, 7);
+        assert.equal(result.signal, undefined);
+        assert.equal(result.timedOut, undefined);
+      } finally {
+        if (originalPiBinary === undefined) {
+          delete process.env.TAMANDUA_PI_BINARY;
+        } else {
+          process.env.TAMANDUA_PI_BINARY = originalPiBinary;
+        }
+
+      }
+    });
+
+    it("resolves on timeout — returns exitCode: null, signal: SIGTERM, timedOut: true, stderrTail populated", async () => {
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-runround-");
+      const fakePi = path.join(tmpDir, "pi");
+      fs.writeFileSync(
+        fakePi,
+        "#!/bin/sh\necho 'stderr output' >&2\nsleep 10",
+        "utf-8"
+      );
+      fs.chmodSync(fakePi, 0o755);
+
+      const originalPiBinary = process.env.TAMANDUA_PI_BINARY;
+      process.env.TAMANDUA_PI_BINARY = fakePi;
+
+      try {
+        const result = await adapter.runRound("prompt", { timeout: 2, workdir: tmpDir });
+        assert.equal(result.exitCode, null);
+        assert.equal(result.signal, "SIGTERM");
+        assert.equal(result.timedOut, true);
+        // stderrTail should be populated from the stderr written before timeout
+        assert.ok(typeof result.stderrTail === "string");
+        assert.ok(result.stderrTail!.includes("stderr output"));
       } finally {
         if (originalPiBinary === undefined) {
           delete process.env.TAMANDUA_PI_BINARY;

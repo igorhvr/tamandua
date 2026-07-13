@@ -238,7 +238,9 @@ echo "ok"
   });
 
   // ── Error propagation ────────────────────────────────────────────
-  it("throws on non-zero exit code", async () => {
+  // After US-001/US-002 the adapter resolves on non-zero exit (like hermes)
+  // so runPi returns output instead of throwing.
+  it("resolves on non-zero exit — returns output without throwing", async () => {
     const fakeScript = createFakePiScript(`
 echo "some output before failure" >&2
 exit 1
@@ -246,32 +248,27 @@ exit 1
     process.env.TAMANDUA_PI_BINARY = fakeScript;
 
     try {
-      await runPi([], { timeout: 10 });
-      assert.fail("Expected runPi to throw");
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      assert.ok(msg.includes("exited with code 1"));
+      const result = await runPi([], { timeout: 10 });
+      // Adapter resolves on non-zero exit — runPi returns output (possibly empty)
+      assert.ok(typeof result === "string");
     } finally {
       restoreEnv();
     }
   });
 
   // ── Timeout handling ─────────────────────────────────────────────
-  it("throws on timeout", async () => {
+  // After US-001/US-002 the adapter resolves on timeout (like hermes)
+  // with exitCode: null, signal: "SIGTERM", timedOut: true — runPi returns output.
+  it("resolves on timeout — returns output without throwing", async () => {
     const fakeScript = createFakePiScript(`
 sleep 30
 `);
     process.env.TAMANDUA_PI_BINARY = fakeScript;
 
     try {
-      await runPi([], { timeout: 2 }); // 2 second timeout
-      assert.fail("Expected runPi to throw on timeout");
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      assert.ok(
-        msg.includes("timed out") || msg.includes("SIGKILL"),
-        `Expected timeout error, got: ${msg}`,
-      );
+      const result = await runPi([], { timeout: 2 }); // 2 second timeout
+      // Adapter resolves on timeout — runPi returns output (possibly empty from stderr)
+      assert.ok(typeof result === "string");
     } finally {
       restoreEnv();
     }

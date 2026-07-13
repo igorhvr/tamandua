@@ -199,7 +199,11 @@ describe("runPi logging", () => {
     };
 
     try {
-      await assert.rejects(() => runPi(["--print", "--no-session", "work"], { timeout: 3, workdir: tempDir }), /pi failed:/);
+      // After US-001/US-002 the adapter resolves on non-zero exit (like hermes)
+      // instead of rejecting, so runPi returns output rather than throwing.
+      const output = await runPi(["--print", "--no-session", "work"], { timeout: 3, workdir: tempDir });
+      // runPi resolves with whatever filtered stdout was produced (likely empty here)
+      assert.ok(typeof output === "string");
 
       const launchedLog = calls.find((entry) => entry.level === "info" && entry.message === "pi launched");
       const failureLog = calls.find((entry) => entry.level === "error" && entry.message === "pi execution failed");
