@@ -70,7 +70,7 @@ export {
 } from "./autoresearch/autoresearch.js";
 
 // Database
-export { getDb, nextRunNumber, getDbPath } from "./db.js";
+export { getDb, getDbPath } from "./db.js";
 
 // MCP server
 export {

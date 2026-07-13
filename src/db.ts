@@ -325,12 +325,6 @@ function migrate(db: DatabaseSync): void {
   );
 }
 
-export function nextRunNumber(): number {
-  const db = getDb();
-  const row = db.prepare("SELECT COALESCE(MAX(run_number), 0) + 1 AS next FROM runs").get() as { next: number };
-  return row.next;
-}
-
 export function closeDb(): void {
   if (_db) {
     try {

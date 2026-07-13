@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { getDb, nextRunNumber } from "../db.js";
+import { getDb } from "../db.js";
 import { loadWorkflowSpec } from "./workflow-spec.js";
 import { resolveWorkflowDir, resolvePiStateDir } from "./paths.js";
 import {
@@ -85,7 +85,7 @@ export async function runWorkflow(
   const db = getDb();
   const now = new Date().toISOString();
   const runId = crypto.randomUUID();
-  const runNumber = nextRunNumber();
+  let runNumber: number;
 
   const workspaceMode = workflow.run?.workspace ?? "direct";
   const warnings: string[] = [];
@@ -175,6 +175,54 @@ export async function runWorkflow(
       );
       seededContext.original_branch = "";
     }
+
+    // Store base branch SHA for rugpull detection in direct mode.
+    try {
+      seededContext.base_branch_sha = execFileSync(
+        "git",
+        ["rev-parse", "HEAD"],
+        { cwd: workingDirectoryForHarness, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+      ).trim();
+    } catch {
+      seededContext.base_branch_sha = "";
+    }
+
+    let workingDirectoryStats;
+    try {
+      workingDirectoryStats = await fs.stat(workingDirectoryForHarness);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code === "ENOENT") {
+        throw new Error(
+          `working-directory-for-harness does not exist: ${workingDirectoryForHarness}`,
+        );
+      }
+      throw err;
+    }
+
+    if (!workingDirectoryStats.isDirectory()) {
+      throw new Error(
+        `working-directory-for-harness must be a directory: ${workingDirectoryForHarness}`,
+      );
+    }
+
+    const contextJson = JSON.stringify(seededContext);
+
+    // Insert the run record. New runs start with
+    // scheduling_status='pending_register' so the daemon control plane
+    // (and/or reconciler) can admit them.
+    // run_number is allocated atomically via subquery to prevent duplicate
+    // numbers under concurrent launches.
+    db.prepare(
+      `INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent,
+                         scheduling_status, scheduling_requested_at, notify_url,
+                         created_at, updated_at)
+       VALUES (?, (SELECT COALESCE(MAX(run_number), 0) + 1 FROM runs), ?, ?, 'running', ?, 0, 'pending_register', ?, ?, ?, ?)`,
+    ).run(runId, workflowId, taskTitle, contextJson, now, notifyUrl ?? null, now, now);
+
+    // Read back the atomically allocated run_number.
+    const runRow = db.prepare("SELECT run_number FROM runs WHERE id = ?").get(runId) as { run_number: number };
+    runNumber = runRow.run_number;
   } else if (workspaceMode === "worktree") {
     if (requestedWorkingDirectoryForHarness) {
       throw new Error(
@@ -183,6 +231,33 @@ export async function runWorkflow(
     }
 
     const originRepo = worktreeOriginRepository ?? process.cwd();
+
+    // Stash origin fields into context early (before INSERT) so the initial
+    // run row captures them. The INSERT uses an atomic subquery to allocate
+    // run_number, which we then read back and pass to createRunWorktree.
+    seededContext.worktree_origin_repository = path.resolve(originRepo);
+    if (worktreeOriginRef) {
+      seededContext.worktree_origin_ref = worktreeOriginRef;
+    }
+
+    // INSERT the run row first — the atomic subquery allocates run_number.
+    // Worktree-specific context fields (worktree_path, repo, worktree_origin_sha,
+    // original_branch, base_branch_sha) are populated after the worktree is created
+    // and the context row is updated.
+    const initialContextJson = JSON.stringify(seededContext);
+
+    db.prepare(
+      `INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent,
+                         scheduling_status, scheduling_requested_at, notify_url,
+                         created_at, updated_at)
+       VALUES (?, (SELECT COALESCE(MAX(run_number), 0) + 1 FROM runs), ?, ?, 'running', ?, 0, 'pending_register', ?, ?, ?, ?)`,
+    ).run(runId, workflowId, taskTitle, initialContextJson, now, notifyUrl ?? null, now, now);
+
+    // Read back the atomically allocated run_number.
+    const runRow = db.prepare("SELECT run_number FROM runs WHERE id = ?").get(runId) as { run_number: number };
+    runNumber = runRow.run_number;
+
+    // Now create the managed worktree using the allocated run_number.
     let managedWorktree: ManagedRunWorktree;
     try {
       managedWorktree = createRunWorktree({
@@ -210,6 +285,11 @@ export async function runWorkflow(
     seededContext.worktree_origin_ref = managedWorktree.worktreeOriginRef;
     seededContext.worktree_origin_sha = managedWorktree.worktreeOriginSha;
     seededContext.original_branch = managedWorktree.originalBranch ?? "";
+    seededContext.base_branch_sha = managedWorktree.worktreeOriginSha;
+
+    // Update the run's context with the now-available worktree-specific fields.
+    const fullContextJson = JSON.stringify(seededContext);
+    db.prepare("UPDATE runs SET context = ? WHERE id = ?").run(fullContextJson, runId);
   } else {
     throw new Error(
       `Invalid run.workspace value: "${workspaceMode}". Expected "direct" or "worktree".`,
@@ -279,38 +359,6 @@ export async function runWorkflow(
       seededContext.tested_tree = "";
     }
   }
-
-  let workingDirectoryStats;
-  try {
-    workingDirectoryStats = await fs.stat(workingDirectoryForHarness);
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException)?.code;
-    if (code === "ENOENT") {
-      throw new Error(
-        `working-directory-for-harness does not exist: ${workingDirectoryForHarness}`,
-      );
-    }
-    throw err;
-  }
-
-  if (!workingDirectoryStats.isDirectory()) {
-    throw new Error(
-      `working-directory-for-harness must be a directory: ${workingDirectoryForHarness}`,
-    );
-  }
-
-  const contextJson = JSON.stringify(seededContext);
-
-  // Insert the run record. New runs start with
-  // scheduling_status='pending_register' so the daemon control plane
-  // (and/or reconciler) can admit them.
-  db.prepare(
-    `INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent,
-                       scheduling_status, scheduling_requested_at, notify_url,
-                       created_at, updated_at)
-     VALUES (?, ?, ?, ?, 'running', ?, 0, 'pending_register', ?, ?, ?, ?)`,
-  ).run(runId, runNumber, workflowId, taskTitle, contextJson, now, notifyUrl ?? null, now, now);
-
   // Insert step records for each workflow step
   const insertStep = db.prepare(
     `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, loop_config, created_at, updated_at)

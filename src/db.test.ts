@@ -1736,3 +1736,254 @@ describe("story_abandonments table migration", () => {
     assert.ok(runColNames.has("status"), "runs.status should exist");
   });
 });
+
+// ── RNUM: atomic run_number allocation concurrency test ──
+
+describe("RNUM: atomic run_number allocation under interleaved connections", () => {
+  let tempHome: string;
+  let origHome: string | undefined;
+  let origDbPath: string | undefined;
+  let dbPath: string;
+
+  const th = createTempHome("tamandua-rnum-concurrency-test-");
+  before(() => {
+    tempHome = th.root;
+    origHome = process.env.HOME;
+    origDbPath = process.env.TAMANDUA_DB_PATH;
+    process.env.HOME = th.homeDir;
+    delete process.env.TAMANDUA_DB_PATH;
+
+    // Determine what getDb() would use as its path so we can open
+    // independent connections to the same file
+    dbPath = path.join(th.homeDir, ".tamandua", "tamandua.db");
+  });
+
+  after(() => {
+    if (origHome) {
+      process.env.HOME = origHome;
+    } else {
+      delete process.env.HOME;
+    }
+    if (origDbPath) {
+      process.env.TAMANDUA_DB_PATH = origDbPath;
+    } else {
+      delete process.env.TAMANDUA_DB_PATH;
+    }
+  });
+
+  function schemaForRunsTable(): string {
+    return `
+      CREATE TABLE IF NOT EXISTS runs (
+        id TEXT PRIMARY KEY,
+        run_number INTEGER,
+        workflow_id TEXT NOT NULL,
+        task TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'running',
+        context TEXT NOT NULL DEFAULT '{}',
+        tokens_spent INTEGER NOT NULL DEFAULT 0,
+        notify_url TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )
+    `;
+  }
+
+  /**
+   * Insert a single run using the atomic subquery approach.
+   * Matches the production pattern in src/installer/run.ts after US-001.
+   */
+  function insertRun(db: DatabaseSync, id: string, workflowId: string, task: string, tokensSpent: number): void {
+    const now = new Date().toISOString();
+    db.prepare(`
+      INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
+      VALUES (?, (SELECT COALESCE(MAX(run_number), 0) + 1 FROM runs), ?, ?, 'running', '{}', ?, ?, ?)
+    `).run(id, workflowId, task, tokensSpent, now, now);
+  }
+
+  it("produces distinct run_numbers with interleaved inserts across two connections", () => {
+    // Open two independent SQLite connections to the same DB file
+    const connA = new DatabaseSync(dbPath);
+    const connB = new DatabaseSync(dbPath);
+
+    try {
+      // Enable WAL mode on both connections
+      connA.exec("PRAGMA journal_mode=WAL");
+      connB.exec("PRAGMA journal_mode=WAL");
+
+      // Create the runs table via one connection
+      connA.exec(schemaForRunsTable());
+
+      const TOTAL = 20;
+
+      // Interleaved inserts: A, B, A, B, ...
+      for (let i = 0; i < TOTAL; i++) {
+        const id = `rnum-concurrency-test-${String(i).padStart(3, "0")}`;
+        const workflowId = i % 2 === 0 ? "wf-alpha" : "wf-beta";
+        const task = `Task for run ${i}`;
+        const tokensSpent = i * 10;
+
+        if (i % 2 === 0) {
+          insertRun(connA, id, workflowId, task, tokensSpent);
+        } else {
+          insertRun(connB, id, workflowId, task, tokensSpent);
+        }
+      }
+
+      // Read all run_numbers back from either connection
+      const rows = connA.prepare(
+        "SELECT run_number FROM runs WHERE id LIKE 'rnum-concurrency-test-%' ORDER BY run_number"
+      ).all() as Array<{ run_number: number }>;
+
+      // Assert the right number of rows
+      assert.equal(rows.length, TOTAL, `should have inserted ${TOTAL} runs`);
+
+      // Extract run_numbers
+      const runNumbers = rows.map((r) => r.run_number);
+
+      // Assert all run_numbers are distinct
+      const uniqueRunNumbers = new Set(runNumbers);
+      assert.equal(
+        uniqueRunNumbers.size,
+        TOTAL,
+        `all ${TOTAL} run_numbers should be distinct, but found ${uniqueRunNumbers.size} unique values`
+      );
+
+      // Assert count of unique run_numbers equals total count of inserted runs
+      assert.equal(
+        uniqueRunNumbers.size,
+        rows.length,
+        "unique run_number count must equal total inserted rows"
+      );
+
+      // SA-001: run_numbers should be a contiguous sequence starting from 1
+      const sorted = [...runNumbers].sort((a, b) => a - b);
+      for (let i = 0; i < sorted.length; i++) {
+        assert.equal(
+          sorted[i],
+          i + 1,
+          `run_numbers should be contiguous starting at 1; expected ${i + 1} at index ${i}, got ${sorted[i]}`
+        );
+      }
+    } finally {
+      connA.close();
+      connB.close();
+    }
+  });
+
+  it("no duplicate run_numbers when connections alternate single inserts", () => {
+    // Second scenario: smaller set, different interleaving pattern
+    const connA = new DatabaseSync(dbPath);
+    const connB = new DatabaseSync(dbPath);
+
+    try {
+      connA.exec("PRAGMA journal_mode=WAL");
+      connB.exec("PRAGMA journal_mode=WAL");
+      connA.exec(schemaForRunsTable());
+
+      const TOTAL = 10;
+
+      // Pattern: A, A, B, B, A, A, B, B, ...
+      for (let i = 0; i < TOTAL; i++) {
+        const id = `rnum-pair-test-${String(i).padStart(3, "0")}`;
+        const conn = Math.floor(i / 2) % 2 === 0 ? connA : connB;
+        insertRun(conn, id, "wf-test", `Task ${i}`, 0);
+      }
+
+      const rows = connA.prepare(
+        "SELECT run_number FROM runs WHERE id LIKE 'rnum-pair-test-%' ORDER BY run_number"
+      ).all() as Array<{ run_number: number }>;
+
+      assert.equal(rows.length, TOTAL);
+
+      const runNumbers = rows.map((r) => r.run_number);
+      const uniqueRunNumbers = new Set(runNumbers);
+
+      assert.equal(uniqueRunNumbers.size, TOTAL, "all run_numbers must be distinct");
+      assert.equal(uniqueRunNumbers.size, rows.length, "unique count equals total count");
+    } finally {
+      connA.close();
+      connB.close();
+    }
+  });
+
+  it("staggered interleaving with three connections produces no duplicates", () => {
+    // Three connections, round-robin pattern
+    const connA = new DatabaseSync(dbPath);
+    const connB = new DatabaseSync(dbPath);
+    const connC = new DatabaseSync(dbPath);
+
+    try {
+      connA.exec("PRAGMA journal_mode=WAL");
+      connB.exec("PRAGMA journal_mode=WAL");
+      connC.exec("PRAGMA journal_mode=WAL");
+      connA.exec(schemaForRunsTable());
+
+      const TOTAL = 15;
+      const connections = [connA, connB, connC];
+
+      for (let i = 0; i < TOTAL; i++) {
+        const id = `rnum-triple-test-${String(i).padStart(3, "0")}`;
+        const conn = connections[i % 3];
+        insertRun(conn, id, "wf-triple", `Task ${i}`, 0);
+      }
+
+      const rows = connA.prepare(
+        "SELECT run_number FROM runs WHERE id LIKE 'rnum-triple-test-%' ORDER BY run_number"
+      ).all() as Array<{ run_number: number }>;
+
+      assert.equal(rows.length, TOTAL);
+
+      const runNumbers = rows.map((r) => r.run_number);
+      const uniqueRunNumbers = new Set(runNumbers);
+
+      assert.equal(uniqueRunNumbers.size, TOTAL, "all run_numbers across three connections must be distinct");
+      assert.equal(uniqueRunNumbers.size, rows.length);
+    } finally {
+      connA.close();
+      connB.close();
+      connC.close();
+    }
+  });
+
+  it("run_numbers are assigned in insertion order regardless of connection", () => {
+    const connA = new DatabaseSync(dbPath);
+    const connB = new DatabaseSync(dbPath);
+
+    try {
+      connA.exec("PRAGMA journal_mode=WAL");
+      connB.exec("PRAGMA journal_mode=WAL");
+      connA.exec(schemaForRunsTable());
+
+      const prefix = "order-";
+
+      // Insert in known order: A, A, B, B, B, A
+      const ids = [prefix + "a", prefix + "b", prefix + "c", prefix + "d", prefix + "e", prefix + "f"];
+      const connectors = [connA, connA, connB, connB, connB, connA];
+
+      for (let i = 0; i < ids.length; i++) {
+        insertRun(connectors[i], ids[i], "wf-order", `Task ${i}`, 0);
+      }
+
+      // Read back with ORDER BY run_number — should match insertion order
+      const rows = connA.prepare(
+        "SELECT id, run_number FROM runs WHERE id IN (?, ?, ?, ?, ?, ?) ORDER BY run_number"
+      ).all(...ids) as Array<{ id: string; run_number: number }>;
+
+      assert.equal(rows.length, ids.length);
+
+      // run_number should be monotonically increasing and match insertion order
+      for (let i = 0; i < ids.length; i++) {
+        assert.equal(rows[i].id, ids[i], `row ${i} should be ${ids[i]} (insertion order preserved)`);
+        if (i > 0) {
+          assert.ok(
+            rows[i].run_number > rows[i - 1].run_number,
+            `run_number should increase: ${rows[i].run_number} > ${rows[i - 1].run_number}`
+          );
+        }
+      }
+    } finally {
+      connA.close();
+      connB.close();
+    }
+  });
+});
