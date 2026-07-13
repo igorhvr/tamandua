@@ -187,6 +187,27 @@ export async function runWorkflow(
       seededContext.base_branch_sha = "";
     }
 
+    // Store tree hash of the base commit for self-merge detection — resolved at
+    // run creation time so rugpull detection can compare the current tip's tree
+    // against the tree that was tested (prevents relaunch when own merge landed).
+    if (seededContext.base_branch_sha) {
+      try {
+        seededContext.tested_tree = execFileSync(
+          "git",
+          ["rev-parse", `${seededContext.base_branch_sha}^{tree}`],
+          {
+            cwd: workingDirectoryForHarness,
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "pipe"],
+          },
+        ).trim();
+      } catch {
+        seededContext.tested_tree = "";
+      }
+    } else {
+      seededContext.tested_tree = "";
+    }
+
     let workingDirectoryStats;
     try {
       workingDirectoryStats = await fs.stat(workingDirectoryForHarness);
@@ -287,6 +308,23 @@ export async function runWorkflow(
     seededContext.original_branch = managedWorktree.originalBranch ?? "";
     seededContext.base_branch_sha = managedWorktree.worktreeOriginSha;
 
+    // Store tree hash of the base commit for self-merge detection — resolved at
+    // run creation time so rugpull detection can compare the current tip's tree
+    // against the tree that was tested (prevents relaunch when own merge landed).
+    try {
+      seededContext.tested_tree = execFileSync(
+        "git",
+        ["rev-parse", `${seededContext.worktree_origin_sha}^{tree}`],
+        {
+          cwd: seededContext.worktree_origin_repository,
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+        },
+      ).trim();
+    } catch {
+      seededContext.tested_tree = "";
+    }
+
     // Update the run's context with the now-available worktree-specific fields.
     const fullContextJson = JSON.stringify(seededContext);
     db.prepare("UPDATE runs SET context = ? WHERE id = ?").run(fullContextJson, runId);
@@ -323,42 +361,6 @@ export async function runWorkflow(
     }
   }
 
-  // Store tree hash of the base commit for self-merge detection — resolved at
-  // run creation time so rugpull detection can compare the current tip's tree
-  // against the tree that was tested (prevents relaunch when own merge landed).
-  if (workspaceMode === "worktree") {
-    try {
-      seededContext.tested_tree = execFileSync(
-        "git",
-        ["rev-parse", `${seededContext.worktree_origin_sha}^{tree}`],
-        {
-          cwd: seededContext.worktree_origin_repository,
-          encoding: "utf8",
-          stdio: ["ignore", "pipe", "pipe"],
-        },
-      ).trim();
-    } catch {
-      seededContext.tested_tree = "";
-    }
-  } else {
-    if (seededContext.base_branch_sha) {
-      try {
-        seededContext.tested_tree = execFileSync(
-          "git",
-          ["rev-parse", `${seededContext.base_branch_sha}^{tree}`],
-          {
-            cwd: workingDirectoryForHarness,
-            encoding: "utf8",
-            stdio: ["ignore", "pipe", "pipe"],
-          },
-        ).trim();
-      } catch {
-        seededContext.tested_tree = "";
-      }
-    } else {
-      seededContext.tested_tree = "";
-    }
-  }
   // Insert step records for each workflow step
   const insertStep = db.prepare(
     `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, loop_config, created_at, updated_at)
