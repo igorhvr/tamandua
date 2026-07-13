@@ -1,0 +1,13 @@
+{
+  "name": "sample-project",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "test": "node --test test/*.test.ts"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  }
+}

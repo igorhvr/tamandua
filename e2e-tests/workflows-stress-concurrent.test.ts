@@ -51,7 +51,7 @@ import { cleanChildEnv } from "../tests/helpers/test-env.ts";
 
 const repoRoot = process.cwd();
 const cliPath = path.resolve(repoRoot, "dist", "cli", "cli.js");
-const fixtureDir = path.join(process.cwd(), "e2e-tests", "fixtures", "sample-project");
+const fixtureDir = path.join(process.cwd(), "e2e-tests", "fixtures", "sample-project-concurrent");
 
 // ── Terminal statuses ──────────────────────────────────────────────
 
@@ -214,7 +214,6 @@ async function createRunEnv(fi: FeatureInfo): Promise<RunEnv> {
     `install bug-fix-merge-worktree for feature-${fi.n}`,
   );
   const daemon = await startIsolatedDaemon(
-    env.dashboardPort,
     env.homeDir,
     env.controlPort,
     scripted.env,
