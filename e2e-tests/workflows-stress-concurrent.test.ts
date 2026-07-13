@@ -24,7 +24,7 @@ import assert from "node:assert/strict";
 import { execSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { tamanduaTempDir } from "../../src/lib/temp-dir.ts";
+import { tamanduaTempDir } from "../src/lib/temp-dir.ts";
 import { DatabaseSync } from "node:sqlite";
 import type { ChildProcess } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
