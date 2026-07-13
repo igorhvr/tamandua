@@ -1478,7 +1478,11 @@ export function recoverOrphanedStepsForAgent(
           logger.error(`Run failed: step "${step.step_id}" declares on_fail.retry_step "${policy?.retry_step ?? "?"}" which is not a valid upstream step (must have lower step_index).`, { runId: step.run_id, stepId: step.step_id, agentId });
         }
         // budget_exhausted / not_found falls through to normal failure below
-      } catch { /* fall through to normal failure */ }
+      } catch (e) {
+        logger.error("reroute failed", { runId: step.run_id, stepId: step.step_id, error: e });
+        emitEvent({ ts: new Date().toISOString(), event: "step.reroute_error", runId: step.run_id, workflowId: wfId, stepId: step.step_id, detail: String(e) });
+        /* fall through to normal failure */
+      }
 
       db.prepare(
         "UPDATE steps SET status = 'failed', retry_count = ?, output = 'Agent terminated without completing step; retries exhausted', updated_at = datetime('now') WHERE id = ?"
@@ -2538,7 +2542,11 @@ function completeStepInternal(stepId: string, output: string): { status: string;
           logger.error(`Run failed: step "${step.step_id}" declares on_fail.retry_step "${policy?.retry_step ?? "?"}" which is not a valid upstream step (must have lower step_index).`, { runId: step.run_id, stepId: step.step_id });
         }
         // budget_exhausted / not_found falls through to normal failure below
-      } catch { /* fall through to normal failure */ }
+      } catch (e) {
+        logger.error("reroute failed", { runId: step.run_id, stepId: step.step_id, error: e });
+        emitEvent({ ts: new Date().toISOString(), event: "step.reroute_error", runId: step.run_id, workflowId: wfId, stepId: step.step_id, detail: String(e) });
+        /* fall through to normal failure */
+      }
 
       db.prepare(
         "UPDATE steps SET status = 'failed', output = ?, retry_count = ?, updated_at = datetime('now') WHERE id = ?"
@@ -2781,7 +2789,11 @@ function completeStepInternal(stepId: string, output: string): { status: string;
           logger.error(`Run failed: step "${step.step_id}" returned STATUS: retry, retries exhausted, declares on_fail.retry_step "${policy?.retry_step ?? "?"}" which is not a valid upstream step.`, { runId: step.run_id, stepId: step.step_id });
         }
         // budget_exhausted / not_found falls through to normal failure below
-      } catch { /* fall through to normal failure */ }
+      } catch (e) {
+        logger.error("reroute failed", { runId: step.run_id, stepId: step.step_id, error: e });
+        emitEvent({ ts: new Date().toISOString(), event: "step.reroute_error", runId: step.run_id, workflowId: wfId, stepId: step.step_id, detail: String(e) });
+        /* fall through to normal failure */
+      }
 
       db.prepare(
         "UPDATE steps SET status = 'failed', output = ?, retry_count = ?, updated_at = datetime('now') WHERE id = ?"
@@ -3097,6 +3109,129 @@ function getOnFailPolicySync(runId: string, stepId: string): WorkflowStepFailure
 }
 
 /**
+ * Shared core of rerouteStep and rerouteStepSync.
+ * Takes a pre-resolved policy object and performs all reroute logic:
+ * validation, budget check, DB updates, story reset, event emission.
+ *
+ * Returns "rerouted" on success, "budget_exhausted" when max_reroutes
+ * is reached, "invalid_target" when the declared retry_step target
+ * doesn't exist or isn't upstream, or "not_found" when the consumer
+ * step isn't found in the database.
+ */
+function rerouteWithPolicy(
+  policy: WorkflowStepFailure,
+  runId: string,
+  consumerStepId: string,
+  consumerRowId: string,
+  error: string,
+): "rerouted" | "budget_exhausted" | "invalid_target" | "not_found" {
+  const db = getDb();
+  const targetStepId = policy.retry_step!;
+
+  // Look up the consumer step metadata
+  const consumerStep = db.prepare(
+    "SELECT step_id, step_index, reroute_count FROM steps WHERE id = ?"
+  ).get(consumerRowId) as
+    { step_id: string; step_index: number; reroute_count: number | null } | undefined;
+  if (!consumerStep) return "not_found";
+
+  // Look up the target (producer) step in the same run (include type + loop_config for story reset)
+  const targetStep = db.prepare(
+    "SELECT id, step_id, step_index, type, loop_config FROM steps WHERE run_id = ? AND step_id = ?"
+  ).get(runId, targetStepId) as
+    { id: string; step_id: string; step_index: number; type: string; loop_config: string | null } | undefined;
+
+  // Validate: target must exist and have a lower step_index than consumer
+  if (!targetStep) return "invalid_target";
+  if (targetStep.step_index >= consumerStep.step_index) return "invalid_target";
+
+  // Check reroute budget (default 2 when not declared in YAML)
+  const maxReroutes = policy.max_reroutes ?? 2;
+  const currentReroutes = consumerStep.reroute_count ?? 0;
+  if (currentReroutes >= maxReroutes) {
+    const boundedReasonPre =
+      error.length > 200 ? error.slice(0, 197) + "..." : error;
+    emitEvent({
+      ts: new Date().toISOString(),
+      event: "step.reroute_budget_exhausted",
+      runId,
+      workflowId: getWorkflowId(runId),
+      stepId: consumerStepId,
+      detail: `Reroute budget exhausted: ${currentReroutes}/${maxReroutes} to ${targetStepId}. Consumer failure: ${boundedReasonPre}`,
+    });
+    logger.warn("Reroute budget exhausted", {
+      runId, fromStep: consumerStepId, toStep: targetStepId,
+      rerouteCount: currentReroutes, budget: maxReroutes, reason: boundedReasonPre,
+    });
+    return "budget_exhausted";
+  }
+
+  const newRerouteCount = currentReroutes + 1;
+
+  // Build bounded feedback for the producer
+  const boundedReason =
+    error.length > 200 ? error.slice(0, 197) + "..." : error;
+  const feedback =
+    `Reroute from "${consumerStep.step_id}" (reroute ${newRerouteCount}/${maxReroutes}). ` +
+    `Consumer failure: ${boundedReason}`;
+
+  // (a) Re-pend producer: status=pending, retry_count UNCHANGED.
+  //     Write retry_feedback into output so claimStep surfaces it.
+  //     Clear claim ownership and set invalidation marker to prevent
+  //     stale completions from re-completing the producer with old output.
+  //     Also NULL claim_updated_at so the no-op bounce guard (C19a) can
+  //     detect that no agent claimed this step after the reroute.
+  db.prepare(
+    "UPDATE steps SET status = 'pending', output = ?, claim_job_id = NULL, claim_pid = NULL, claim_pgid = NULL, claim_updated_at = NULL, claim_invalidated_by = 'reroute', updated_at = datetime('now') WHERE id = ?"
+  ).run(feedback, targetStep.id);
+
+  // (a.2) Story reset on reroute: when the reroute target is a loop-over-stories step,
+  //        reset the story/stories cited in the consumer's failure text to pending.
+  resetStoriesOnReroute(db, runId, targetStep, error, getWorkflowId(runId));
+
+  // (a.3) Write verify_feedback into run context when reroute target is a
+  //        loop-over-stories step, so the developer agent sees the feedback
+  //        on the next claim (unconditional — even when no stories were reset).
+  writeRerouteFeedbackContext(db, runId, targetStep, error);
+
+  // (b) Reset consumer: status=waiting, retry_count=0, increment reroute_count.
+  //     Clear output and ownership so it looks like a fresh step.
+  db.prepare(
+    "UPDATE steps SET status = 'waiting', retry_count = 0, reroute_count = ?, output = NULL, claim_job_id = NULL, claim_pid = NULL, claim_pgid = NULL, updated_at = datetime('now') WHERE id = ?"
+  ).run(newRerouteCount, consumerRowId);
+
+  // (c) Intermediate done steps are left untouched — advancePipeline will
+  //     naturally re-pend the consumer after the producer completes.
+
+  // Emit event
+  const wfId = getWorkflowId(runId);
+  emitEvent({
+    ts: new Date().toISOString(),
+    event: "step.rerouted",
+    runId,
+    workflowId: wfId,
+    stepId: consumerStepId,
+    detail:
+      `Rerouted to ${targetStepId} (${newRerouteCount}/${maxReroutes}). ` +
+      `Consumer failure: ${boundedReason}`,
+  });
+
+  logger.info(
+    `Step rerouted: ${consumerStepId} → ${targetStepId} (${newRerouteCount}/${maxReroutes})`,
+    {
+      runId,
+      fromStep: consumerStepId,
+      toStep: targetStepId,
+      rerouteCount: newRerouteCount,
+      budget: maxReroutes,
+      reason: boundedReason,
+    },
+  );
+
+  return "rerouted";
+}
+
+/**
  * Fail a step, with retry logic. For loop steps, applies per-story retry.
  */
 export async function failStep(stepId: string, error: string): Promise<{ status: string }> {
@@ -3180,7 +3315,10 @@ async function failStepInternal(stepId: string, error: string): Promise<{ status
         logger.error(error, { runId: step.run_id, stepId: step.step_id });
       }
       // budget_exhausted falls through to normal failure below
-    } catch {
+    } catch (e) {
+      logger.error("reroute failed", { runId: step.run_id, stepId, error: e });
+      const wfIdCatch = getWorkflowId(step.run_id);
+      emitEvent({ ts: new Date().toISOString(), event: "step.reroute_error", runId: step.run_id, workflowId: wfIdCatch, stepId, detail: String(e) });
       // Best-effort: fall through to normal failure
     }
 
@@ -3374,16 +3512,8 @@ function resetStoriesOnReroute(
 }
 
 /**
- * Attempt to reroute a failing step to an upstream producer step declared
- * via on_fail.retry_step in the workflow spec.
- *
- * Validates the target is an upstream step (lower step_index) in the same
- * workflow. On valid reroute:
- * - Re-pends the producer (status=pending, retry_count UNCHANGED)
- * - Writes retry_feedback into producer output so claimStep surfaces it
- * - If target is a loop-over-stories step, resets cited stories to pending
- * - Resets consumer to waiting with retry_count=0, increments reroute_count
- * - Leaves intermediate done steps untouched (advancePipeline handles re-pend)
+ * Async wrapper around rerouteWithPolicy. Resolves the on_fail policy
+ * asynchronously via getOnFailPolicy, then delegates to the shared core.
  *
  * Returns:
  * - "rerouted" on success
@@ -3397,113 +3527,9 @@ async function rerouteStep(
   consumerRowId: string,
   error: string,
 ): Promise<"rerouted" | "budget_exhausted" | "invalid_target" | "not_found"> {
-  const db = getDb();
   const policy = await getOnFailPolicy(runId, consumerStepId);
   if (!policy?.retry_step) return "not_found";
-
-  const targetStepId = policy.retry_step;
-
-  // Look up the consumer step metadata
-  const consumerStep = db.prepare(
-    "SELECT step_id, step_index, reroute_count FROM steps WHERE id = ?"
-  ).get(consumerRowId) as
-    { step_id: string; step_index: number; reroute_count: number | null } | undefined;
-  if (!consumerStep) return "not_found";
-
-  // Look up the target (producer) step in the same run (include type + loop_config for story reset)
-  const targetStep = db.prepare(
-    "SELECT id, step_id, step_index, type, loop_config FROM steps WHERE run_id = ? AND step_id = ?"
-  ).get(runId, targetStepId) as
-    { id: string; step_id: string; step_index: number; type: string; loop_config: string | null } | undefined;
-
-  // Validate: target must exist and have a lower step_index than consumer
-  if (!targetStep) return "invalid_target";
-  if (targetStep.step_index >= consumerStep.step_index) return "invalid_target";
-
-  // Check reroute budget (default 2 when not declared in YAML)
-  const maxReroutes = policy.max_reroutes ?? 2;
-  const currentReroutes = consumerStep.reroute_count ?? 0;
-  if (currentReroutes >= maxReroutes) {
-    const boundedReasonPre =
-      error.length > 200 ? error.slice(0, 197) + "..." : error;
-    emitEvent({
-      ts: new Date().toISOString(),
-      event: "step.reroute_budget_exhausted",
-      runId,
-      workflowId: getWorkflowId(runId),
-      stepId: consumerStepId,
-      detail: `Reroute budget exhausted: ${currentReroutes}/${maxReroutes} to ${targetStepId}. Consumer failure: ${boundedReasonPre}`,
-    });
-    logger.warn("Reroute budget exhausted", {
-      runId, fromStep: consumerStepId, toStep: targetStepId,
-      rerouteCount: currentReroutes, budget: maxReroutes, reason: boundedReasonPre,
-    });
-    return "budget_exhausted";
-  }
-
-  const newRerouteCount = currentReroutes + 1;
-
-  // Build bounded feedback for the producer
-  const boundedReason =
-    error.length > 200 ? error.slice(0, 197) + "..." : error;
-  const feedback =
-    `Reroute from "${consumerStep.step_id}" (reroute ${newRerouteCount}/${maxReroutes}). ` +
-    `Consumer failure: ${boundedReason}`;
-
-  // (a) Re-pend producer: status=pending, retry_count UNCHANGED.
-  //     Write retry_feedback into output so claimStep surfaces it.
-  //     Clear claim ownership and set invalidation marker to prevent
-  //     stale completions from re-completing the producer with old output.
-  //     Also NULL claim_updated_at so the no-op bounce guard (C19a) can
-  //     detect that no agent claimed this step after the reroute.
-  db.prepare(
-    "UPDATE steps SET status = 'pending', output = ?, claim_job_id = NULL, claim_pid = NULL, claim_pgid = NULL, claim_updated_at = NULL, claim_invalidated_by = 'reroute', updated_at = datetime('now') WHERE id = ?"
-  ).run(feedback, targetStep.id);
-
-  // (a.2) Story reset on reroute: when the reroute target is a loop-over-stories step,
-  //        reset the story/stories cited in the consumer's failure text to pending.
-  resetStoriesOnReroute(db, runId, targetStep, error, getWorkflowId(runId));
-
-  // (a.3) Write verify_feedback into run context when reroute target is a
-  //        loop-over-stories step, so the developer agent sees the feedback
-  //        on the next claim (unconditional — even when no stories were reset).
-  writeRerouteFeedbackContext(db, runId, targetStep, error);
-
-  // (b) Reset consumer: status=waiting, retry_count=0, increment reroute_count.
-  //     Clear output and ownership so it looks like a fresh step.
-  db.prepare(
-    "UPDATE steps SET status = 'waiting', retry_count = 0, reroute_count = ?, output = NULL, claim_job_id = NULL, claim_pid = NULL, claim_pgid = NULL, updated_at = datetime('now') WHERE id = ?"
-  ).run(newRerouteCount, consumerRowId);
-
-  // (c) Intermediate done steps are left untouched — advancePipeline will
-  //     naturally re-pend the consumer after the producer completes.
-
-  // Emit event
-  const wfId = getWorkflowId(runId);
-  emitEvent({
-    ts: new Date().toISOString(),
-    event: "step.rerouted",
-    runId,
-    workflowId: wfId,
-    stepId: consumerStepId,
-    detail:
-      `Rerouted to ${targetStepId} (${newRerouteCount}/${maxReroutes}). ` +
-      `Consumer failure: ${boundedReason}`,
-  });
-
-  logger.info(
-    `Step rerouted: ${consumerStepId} → ${targetStepId} (${newRerouteCount}/${maxReroutes})`,
-    {
-      runId,
-      fromStep: consumerStepId,
-      toStep: targetStepId,
-      rerouteCount: newRerouteCount,
-      budget: maxReroutes,
-      reason: boundedReason,
-    },
-  );
-
-  return "rerouted";
+  return rerouteWithPolicy(policy, runId, consumerStepId, consumerRowId, error);
 }
 
 /**
@@ -3511,7 +3537,7 @@ async function rerouteStep(
  * when a reroute targets a loop-over-stories step. The developer agent's
  * next claim then surfaces this feedback for story remediation.
  *
- * Call from rerouteStep / rerouteStepSync after story reset logic, so
+ * Call from rerouteWithPolicy after story reset logic, so
  * verify_feedback is always available even when no stories were reset
  * (e.g. all cited stories were already pending).
  */
@@ -3545,9 +3571,8 @@ function writeRerouteFeedbackContext(
 }
 
 /**
- * Synchronous variant of rerouteStep. Used in sync contexts (completeStep
- * expects-validation, orphan recovery) where the async workflow spec read is
- * replaced with loadWorkflowSpecSync.
+ * Sync wrapper around rerouteWithPolicy. Resolves the on_fail policy
+ * synchronously via getOnFailPolicySync, then delegates to the shared core.
  */
 function rerouteStepSync(
   runId: string,
@@ -3555,112 +3580,9 @@ function rerouteStepSync(
   consumerRowId: string,
   error: string,
 ): "rerouted" | "budget_exhausted" | "invalid_target" | "not_found" {
-  const db = getDb();
   const policy = getOnFailPolicySync(runId, consumerStepId);
   if (!policy?.retry_step) return "not_found";
-
-  const targetStepId = policy.retry_step;
-
-  // Look up the consumer step metadata
-  const consumerStep = db.prepare(
-    "SELECT step_id, step_index, reroute_count FROM steps WHERE id = ?"
-  ).get(consumerRowId) as
-    { step_id: string; step_index: number; reroute_count: number | null } | undefined;
-  if (!consumerStep) return "not_found";
-
-  // Look up the target (producer) step in the same run (include type + loop_config for story reset)
-  const targetStep = db.prepare(
-    "SELECT id, step_id, step_index, type, loop_config FROM steps WHERE run_id = ? AND step_id = ?"
-  ).get(runId, targetStepId) as
-    { id: string; step_id: string; step_index: number; type: string; loop_config: string | null } | undefined;
-
-  // Validate: target must exist and have a lower step_index than consumer
-  if (!targetStep) return "invalid_target";
-  if (targetStep.step_index >= consumerStep.step_index) return "invalid_target";
-
-  // Check reroute budget (default 2 when not declared in YAML)
-  const maxReroutes = policy.max_reroutes ?? 2;
-  const currentReroutes = consumerStep.reroute_count ?? 0;
-  if (currentReroutes >= maxReroutes) {
-    const boundedReasonPre =
-      error.length > 200 ? error.slice(0, 197) + "..." : error;
-    emitEvent({
-      ts: new Date().toISOString(),
-      event: "step.reroute_budget_exhausted",
-      runId,
-      workflowId: getWorkflowId(runId),
-      stepId: consumerStepId,
-      detail: `Reroute budget exhausted: ${currentReroutes}/${maxReroutes} to ${targetStepId}. Consumer failure: ${boundedReasonPre}`,
-    });
-    logger.warn("Reroute budget exhausted", {
-      runId, fromStep: consumerStepId, toStep: targetStepId,
-      rerouteCount: currentReroutes, budget: maxReroutes, reason: boundedReasonPre,
-    });
-    return "budget_exhausted";
-  }
-
-  const newRerouteCount = currentReroutes + 1;
-
-  // Build bounded feedback for the producer
-  const boundedReason =
-    error.length > 200 ? error.slice(0, 197) + "..." : error;
-  const feedback =
-    `Reroute from "${consumerStep.step_id}" (reroute ${newRerouteCount}/${maxReroutes}). ` +
-    `Consumer failure: ${boundedReason}`;
-
-  // (a) Re-pend producer: status=pending, retry_count UNCHANGED.
-  //     Write retry_feedback into output so claimStep surfaces it.
-  //     Clear claim ownership and set invalidation marker to prevent
-  //     stale completions from re-completing the producer with old output.
-  //     Also NULL claim_updated_at so the no-op bounce guard (C19a) can
-  //     detect that no agent claimed this step after the reroute.
-  db.prepare(
-    "UPDATE steps SET status = 'pending', output = ?, claim_job_id = NULL, claim_pid = NULL, claim_pgid = NULL, claim_updated_at = NULL, claim_invalidated_by = 'reroute', updated_at = datetime('now') WHERE id = ?"
-  ).run(feedback, targetStep.id);
-
-  // (a.2) Story reset on reroute: when the reroute target is a loop-over-stories step,
-  //        reset the story/stories cited in the consumer's failure text to pending.
-  resetStoriesOnReroute(db, runId, targetStep, error, getWorkflowId(runId));
-
-  // (a.3) Write verify_feedback into run context when reroute target is a
-  //        loop-over-stories step (unconditional — even when no stories were reset).
-  writeRerouteFeedbackContext(db, runId, targetStep, error);
-
-  // (b) Reset consumer: status=waiting, retry_count=0, increment reroute_count.
-  //     Clear output and ownership so it looks like a fresh step.
-  db.prepare(
-    "UPDATE steps SET status = 'waiting', retry_count = 0, reroute_count = ?, output = NULL, claim_job_id = NULL, claim_pid = NULL, claim_pgid = NULL, updated_at = datetime('now') WHERE id = ?"
-  ).run(newRerouteCount, consumerRowId);
-
-  // (c) Intermediate done steps are left untouched — advancePipeline will
-  //     naturally re-pend the consumer after the producer completes.
-
-  // Emit event
-  const wfId = getWorkflowId(runId);
-  emitEvent({
-    ts: new Date().toISOString(),
-    event: "step.rerouted",
-    runId,
-    workflowId: wfId,
-    stepId: consumerStepId,
-    detail:
-      `Rerouted to ${targetStepId} (${newRerouteCount}/${maxReroutes}). ` +
-      `Consumer failure: ${boundedReason}`,
-  });
-
-  logger.info(
-    `Step rerouted: ${consumerStepId} → ${targetStepId} (${newRerouteCount}/${maxReroutes})`,
-    {
-      runId,
-      fromStep: consumerStepId,
-      toStep: targetStepId,
-      rerouteCount: newRerouteCount,
-      budget: maxReroutes,
-      reason: boundedReason,
-    },
-  );
-
-  return "rerouted";
+  return rerouteWithPolicy(policy, runId, consumerStepId, consumerRowId, error);
 }
 
 // ══════════════════════════════════════════════════════════════════════
