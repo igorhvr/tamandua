@@ -1100,4 +1100,44 @@ describe("mcp-server bootstrap", () => {
       await stopTamanduaMcpServer(server);
     }
   });
+
+  describe("mcp-server bind host", () => {
+    it("binds to 127.0.0.1 by default", async () => {
+      const previousBindHost = process.env.TAMANDUA_BIND_HOST;
+      delete process.env.TAMANDUA_BIND_HOST;
+
+      const server = createTamanduaMcpServer(0);
+      await server.start();
+
+      try {
+        const addr = server.server.address();
+        assert.ok(addr && typeof addr !== "string");
+        assert.equal(addr.address, "127.0.0.1");
+      } finally {
+        await server.stop();
+        if (previousBindHost === undefined) delete process.env.TAMANDUA_BIND_HOST;
+        else process.env.TAMANDUA_BIND_HOST = previousBindHost;
+      }
+    });
+
+    it("honors TAMANDUA_BIND_HOST override", async () => {
+      const previousBindHost = process.env.TAMANDUA_BIND_HOST;
+      process.env.TAMANDUA_BIND_HOST = "0.0.0.0";
+
+      const server = createTamanduaMcpServer(0);
+      await server.start();
+
+      try {
+        const addr = server.server.address();
+        assert.ok(addr && typeof addr !== "string");
+        // On macOS/iOS, binding to 0.0.0.0 may report as '::' (IPv6 dual-stack)
+        const allowed = ["0.0.0.0", "::"];
+        assert.ok(allowed.includes(addr.address as string), `expected 0.0.0.0 or ::, got ${addr.address}`);
+      } finally {
+        await server.stop();
+        if (previousBindHost === undefined) delete process.env.TAMANDUA_BIND_HOST;
+        else process.env.TAMANDUA_BIND_HOST = previousBindHost;
+      }
+    });
+  });
 });

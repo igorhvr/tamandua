@@ -1024,7 +1024,8 @@ export function createTamanduaMcpServer(port = DEFAULT_MCP_PORT, options: Tamand
       httpServer.once("error", onError);
       httpServer.once("listening", onListening);
       assertPortIsolation(port, "MCP server");
-      httpServer.listen(port);
+      const bindHost = process.env.TAMANDUA_BIND_HOST || "127.0.0.1";
+      httpServer.listen(port, bindHost);
     });
 
     const address = httpServer.address();

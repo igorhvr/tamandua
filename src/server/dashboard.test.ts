@@ -4939,3 +4939,49 @@ describe("dashboard suite stats and flaky keys", () => {
     }
   });
 });
+
+describe("dashboard bind host", () => {
+  it("binds to 127.0.0.1 by default", async () => {
+    const previousBindHost = process.env.TAMANDUA_BIND_HOST;
+    delete process.env.TAMANDUA_BIND_HOST;
+
+    invalidateRunsCache();
+    const server = createDashboardServer(0);
+    if (!server.listening) {
+      await once(server, "listening");
+    }
+
+    try {
+      const addr = server.address();
+      assert.ok(addr && typeof addr !== "string");
+      assert.equal(addr.address, "127.0.0.1");
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      if (previousBindHost === undefined) delete process.env.TAMANDUA_BIND_HOST;
+      else process.env.TAMANDUA_BIND_HOST = previousBindHost;
+    }
+  });
+
+  it("honors TAMANDUA_BIND_HOST override", async () => {
+    const previousBindHost = process.env.TAMANDUA_BIND_HOST;
+    process.env.TAMANDUA_BIND_HOST = "0.0.0.0";
+
+    invalidateRunsCache();
+    const server = createDashboardServer(0);
+    if (!server.listening) {
+      await once(server, "listening");
+    }
+
+    try {
+      const addr = server.address();
+      assert.ok(addr && typeof addr !== "string");
+      // On macOS/iOS, binding to 0.0.0.0 may report as '::' (IPv6 dual-stack)
+      const allowed = ["0.0.0.0", "::"];
+      assert.ok(allowed.includes(addr.address as string), `expected 0.0.0.0 or ::, got ${addr.address}`);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      if (previousBindHost === undefined) delete process.env.TAMANDUA_BIND_HOST;
+      else process.env.TAMANDUA_BIND_HOST = previousBindHost;
+    }
+  });
+});

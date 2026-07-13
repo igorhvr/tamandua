@@ -578,6 +578,14 @@ When you start the management dashboard (`tamandua dashboard`), Tamandua automat
 
 Use `tamandua dashboard status` to verify both endpoints are up.
 
+By default, the dashboard and MCP servers bind to `127.0.0.1` (localhost only), so they are not reachable from other machines on the network. If you need remote access, set `TAMANDUA_BIND_HOST=0.0.0.0` (or a specific IP) before starting the dashboard:
+
+```bash
+TAMANDUA_BIND_HOST=0.0.0.0 tamandua dashboard --port 3334
+```
+
+This environment variable applies to both the dashboard HTTP server and the MCP HTTP server. The control plane already binds independently to `127.0.0.1` and is not affected by this setting.
+
 #### Kanban view
 
 Each run also has a swim-lane view at `http://localhost:3334/runs/<run-id>/kanban`

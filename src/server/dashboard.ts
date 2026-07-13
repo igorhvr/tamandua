@@ -1214,8 +1214,9 @@ export function createDashboardServer(port: number, options: DashboardServerOpti
   });
 
   assertPortIsolation(port, "dashboard");
-  server.listen(port, () => {
-    console.log(`Tamandua dashboard listening on http://localhost:${port}`);
+  const bindHost = process.env.TAMANDUA_BIND_HOST || "127.0.0.1";
+  server.listen(port, bindHost, () => {
+    console.log(`Tamandua dashboard listening on http://${bindHost}:${port}`);
     // Backfill AutoResearch sessions from recent workflow runs
     backfillAutoresearchSessions();
   });
