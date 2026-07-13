@@ -620,6 +620,104 @@ describe("CLI worktree prune", () => {
     }
   });
 
+  it("prunes cleanup_failed worktree successfully", async () => {
+    const env = await createTempEnv();
+    try {
+      const dbPath = path.join(env.tamanduaDir, "tamandua.db");
+      initDb(dbPath);
+      const originRepo = path.join(env.root, "origin");
+      createGitRepo(originRepo);
+      const worktreePath = path.join(env.root, "cleanup-failed-wt");
+      runGit(["worktree", "add", "--detach", worktreePath, "main"], originRepo);
+      const runId = crypto.randomUUID();
+      seedRunRow(dbPath, runId, { status: "completed" });
+      seedWorktreeRow(dbPath, runId, { worktreePath, originRepo, originRef: "main", status: "cleanup_failed" });
+      const db = new DatabaseSync(dbPath);
+      db.prepare("UPDATE run_worktrees SET created_at = datetime('now', '-30 days'), error = 'prior failure' WHERE run_id = ?").run(runId);
+      db.close();
+      const { stdout, code } = await runCliToExit(
+        ["worktree", "prune", "--completed", "--older-than", "7d"], cliEnv(env));
+      assert.equal(code, 0);
+      assert.match(stdout, /Pruned cleanup_failed worktree for run/);
+      assert.match(stdout, /Pruned 1 worktree/);
+      // Verify the worktree row is now removed
+      const db2 = new DatabaseSync(dbPath);
+      const row = db2.prepare("SELECT status FROM run_worktrees WHERE run_id = ?").get(runId) as { status: string } | undefined;
+      db2.close();
+      assert.ok(row, "row should still exist");
+      assert.equal(row!.status, "removed");
+    } finally {
+      try { fs.rmSync(env.root, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  it("logs warning when cleanup_failed worktree removal fails", async () => {
+    const env = await createTempEnv();
+    try {
+      const dbPath = path.join(env.tamanduaDir, "tamandua.db");
+      initDb(dbPath);
+      const runId = crypto.randomUUID();
+      // Create a dir at the worktree path so fs.statSync finds it, but
+      // make the origin repo point to a non-git directory so git worktree
+      // remove fails.
+      const wtPath = path.join(env.root, "stale-wt");
+      fs.mkdirSync(wtPath, { recursive: true });
+      const nonGitOrigin = path.join(env.root, "non-git-origin");
+      fs.mkdirSync(nonGitOrigin, { recursive: true });
+      seedRunRow(dbPath, runId, { status: "completed" });
+      seedWorktreeRow(dbPath, runId, { worktreePath: wtPath, originRepo: nonGitOrigin, status: "cleanup_failed" });
+      const db = new DatabaseSync(dbPath);
+      db.prepare("UPDATE run_worktrees SET created_at = datetime('now', '-30 days'), error = 'prior failure' WHERE run_id = ?").run(runId);
+      db.close();
+      const { stdout, stderr, code } = await runCliToExit(
+        ["worktree", "prune", "--completed", "--older-than", "7d"], cliEnv(env));
+      assert.equal(code, 0);
+      // The warning goes to stderr via console.warn in the CLI process
+      assert.match(stderr, /Warning: failed to prune cleanup_failed worktree for run/);
+      // Should report no worktrees pruned
+      assert.match(stdout, /No worktrees to prune/);
+      // Verify the row still exists with cleanup_failed status
+      const db2 = new DatabaseSync(dbPath);
+      const row = db2.prepare("SELECT status FROM run_worktrees WHERE run_id = ?").get(runId) as { status: string } | undefined;
+      db2.close();
+      assert.ok(row, "row should still exist after failed prune");
+      assert.equal(row!.status, "cleanup_failed");
+    } finally {
+      try { fs.rmSync(env.root, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  it("prunes cleanup_failed worktree even when associated run does not exist", async () => {
+    const env = await createTempEnv();
+    try {
+      const dbPath = path.join(env.tamanduaDir, "tamandua.db");
+      initDb(dbPath);
+      const originRepo = path.join(env.root, "origin");
+      createGitRepo(originRepo);
+      const worktreePath = path.join(env.root, "orphan-wt");
+      runGit(["worktree", "add", "--detach", worktreePath, "main"], originRepo);
+      const runId = crypto.randomUUID();
+      // Seed the worktree row but NOT the run row — simulating deleteWorkflow having deleted the run
+      seedWorktreeRow(dbPath, runId, { worktreePath, originRepo, originRef: "main", status: "cleanup_failed" });
+      const db = new DatabaseSync(dbPath);
+      db.prepare("UPDATE run_worktrees SET created_at = datetime('now', '-30 days'), error = 'prior failure' WHERE run_id = ?").run(runId);
+      db.close();
+      const { stdout, code } = await runCliToExit(
+        ["worktree", "prune", "--completed", "--older-than", "7d"], cliEnv(env));
+      assert.equal(code, 0);
+      assert.match(stdout, /Pruned cleanup_failed worktree for run/);
+      assert.match(stdout, /Pruned 1 worktree/);
+      // Verify the worktree row is now removed
+      const db2 = new DatabaseSync(dbPath);
+      const row = db2.prepare("SELECT status FROM run_worktrees WHERE run_id = ?").get(runId) as { status: string } | undefined;
+      db2.close();
+      assert.ok(row, "row should still exist");
+      assert.equal(row!.status, "removed");
+    } finally {
+      try { fs.rmSync(env.root, { recursive: true, force: true }); } catch {}
+    }
+  });
+
   it("errors without --older-than value", async () => {
     const env = await createTempEnv();
     try {

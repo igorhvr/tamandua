@@ -568,4 +568,47 @@ describe("stopWorkflow", () => {
     assert.equal((db.prepare("SELECT COUNT(*) AS count FROM runs WHERE id = ?").get("run-active") as { count: number }).count, 0);
     assert.equal((db.prepare("SELECT COUNT(*) AS count FROM steps WHERE run_id = ?").get("run-active") as { count: number }).count, 0);
   });
+
+  it("preserves run_worktrees row with cleanup_failed when worktree removal fails", async () => {
+    const { deleteWorkflow } = await import("../../dist/installer/status.js");
+
+    const runId = "run-wt-fail";
+    const wtPath = path.join(tempRoot, "nonexistent-worktree");
+    // Create the directory so fs.statSync finds it, but it's not a git
+    // worktree so `git worktree remove` will fail.
+    fs.mkdirSync(wtPath, { recursive: true });
+
+    db.prepare("INSERT INTO runs (id, workflow_id, task, status) VALUES (?, ?, ?, ?)").run(runId, "wf", "test", "completed");
+    db.prepare("INSERT INTO steps (id, run_id, step_id, agent_id, step_index, status) VALUES (?, ?, ?, ?, ?, ?)").run("s-wtf", runId, "implement", "dev", 0, "done");
+    db.prepare("INSERT INTO stories (id, run_id, story_index, story_id, title, status) VALUES (?, ?, ?, ?, ?, ?)").run("story-wtf", runId, 0, "story-1", "Test story", "done");
+    db.prepare(
+      `INSERT INTO run_worktrees (run_id, worktree_origin_repository, worktree_origin_git_common_dir, worktree_path, status)
+       VALUES (?, ?, ?, ?, ?)`,
+    ).run(runId, tempRoot, path.join(tempRoot, ".git"), wtPath, "ready");
+
+    const result = await deleteWorkflow(runId);
+
+    // Should still return ok with a warning
+    assert.equal(result.ok, true);
+    assert.equal(result.runId, runId);
+    assert.equal(result.status, "deleted");
+    assert.ok(result.warning, "should include a warning");
+    assert.match(result.warning!, /Worktree removal failed/);
+    assert.match(result.warning!, /tamandua worktree prune/);
+
+    // Run, steps, and stories should be deleted
+    assert.equal((db.prepare("SELECT COUNT(*) AS count FROM runs WHERE id = ?").get(runId) as { count: number }).count, 0);
+    assert.equal((db.prepare("SELECT COUNT(*) AS count FROM steps WHERE run_id = ?").get(runId) as { count: number }).count, 0);
+    assert.equal((db.prepare("SELECT COUNT(*) AS count FROM stories WHERE run_id = ?").get(runId) as { count: number }).count, 0);
+
+    // run_worktrees row should SURVIVE with cleanup_failed status
+    assert.equal((db.prepare("SELECT COUNT(*) AS count FROM run_worktrees WHERE run_id = ?").get(runId) as { count: number }).count, 1);
+    const wtRow = db.prepare("SELECT status, error FROM run_worktrees WHERE run_id = ?").get(runId) as { status: string; error: string | null };
+    assert.equal(wtRow.status, "cleanup_failed");
+    assert.ok(wtRow.error, "error message should be set");
+    assert.ok(wtRow.error!.length > 0, "error message should be non-empty");
+
+    // Clean up the directory we created
+    try { fs.rmSync(wtPath, { recursive: true, force: true }); } catch { /* cleanup */ }
+  });
 });

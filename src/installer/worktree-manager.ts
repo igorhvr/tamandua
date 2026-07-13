@@ -28,7 +28,7 @@ export interface ManagedRunWorktree {
   worktreeOriginRef: string;
   worktreeOriginSha: string;
   originalBranch?: string;
-  status: "creating" | "ready" | "removing" | "removed" | "error";
+  status: "creating" | "ready" | "removing" | "removed" | "error" | "cleanup_failed";
   cleanupPolicy: "keep" | "remove_on_success" | "remove_on_terminal";
 }
 

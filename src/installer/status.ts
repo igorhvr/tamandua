@@ -133,7 +133,7 @@ export function listRuns(limit = 50): RunInfo[] {
 export async function deleteWorkflow(
   runId: string,
   opts: { force?: boolean } = {},
-): Promise<{ ok: boolean; runId: string; status: string }> {
+): Promise<{ ok: boolean; runId: string; status: string; warning?: string }> {
   const db = getDb();
 
   const run = db
@@ -173,18 +173,27 @@ export async function deleteWorkflow(
 
   // Remove managed worktree if present
   const wt = getRunWorktree(runId);
+  let worktreeWarning: string | undefined;
   if (wt && wt.status !== "removed") {
     try {
       removeRunWorktree({ runId, force: true });
-    } catch {
-      // Best-effort worktree removal — proceed with DB cleanup
+    } catch (err) {
+      // Track the failure instead of silently swallowing it
+      const errMsg = err instanceof Error ? err.message : String(err);
+      db.prepare(
+        "UPDATE run_worktrees SET status = 'cleanup_failed', error = ? WHERE run_id = ?",
+      ).run(errMsg, runId);
+      worktreeWarning = `Worktree removal failed for run ${runId.slice(0, 8)}: ${errMsg}. Use 'tamandua worktree prune' or manually remove the path.`;
     }
   }
 
   // Delete associated records in dependency order
   db.prepare("DELETE FROM stories WHERE run_id = ?").run(runId);
   db.prepare("DELETE FROM steps WHERE run_id = ?").run(runId);
-  db.prepare("DELETE FROM run_worktrees WHERE run_id = ?").run(runId);
+  // Only delete the run_worktrees row if worktree removal succeeded
+  if (!worktreeWarning) {
+    db.prepare("DELETE FROM run_worktrees WHERE run_id = ?").run(runId);
+  }
   db.prepare("DELETE FROM runs WHERE id = ?").run(runId);
 
   // Emit deletion event to logs tail and recent events
@@ -195,7 +204,7 @@ export async function deleteWorkflow(
     detail: isActive ? "Force-deleted while active" : "Deleted by user",
   });
 
-  return { ok: true, runId, status: "deleted" };
+  return { ok: true, runId, status: "deleted", ...(worktreeWarning ? { warning: worktreeWarning } : {}) };
 }
 
 /**

@@ -2464,6 +2464,20 @@ async function main() {
       for (const wt of worktrees) {
         if (wt.status === "removed") continue;
 
+        // Handle cleanup_failed worktrees: retry removal regardless of run existence
+        if (wt.status === "cleanup_failed") {
+          try {
+            removeRunWorktree({ runId: wt.runId, force: true });
+            pruned++;
+            console.log(`Pruned cleanup_failed worktree for run ${wt.runId.slice(0, 8)}.`);
+          } catch (err) {
+            console.warn(
+              `Warning: failed to prune cleanup_failed worktree for run ${wt.runId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+          continue;
+        }
+
         // Check if the associated run is completed/canceled
         let runStatus: string;
         try {

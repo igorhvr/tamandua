@@ -644,6 +644,9 @@ export async function handleWorkflow(group: string, args: string[]): Promise<boo
       }
       const result = await deleteWorkflow(fullId, { force });
       console.log(`Deleted run ${result.runId.slice(0, 8)}.`);
+      if (result.warning) {
+        console.warn(result.warning);
+      }
     } catch (err) {
       process.stderr.write(`${err instanceof Error ? err.message : String(err)}\n`);
       process.exit(1);
