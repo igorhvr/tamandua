@@ -151,6 +151,47 @@ export function detectRugpull(runId: string): RugpullResult {
 }
 
 /**
+ * Extract user-provided context keys from a run context record,
+ * stripping all internally-managed keys that Tamandua seeds during
+ * run creation. Returns only the keys originally provided by the
+ * caller via --context.
+ *
+ * Internally-managed keys are removed by exact match against a
+ * fixed denylist, plus a catch-all for any key starting with
+ * "worktree_" for defense in depth.
+ */
+export function extractUserContext(
+  parsedContext: Record<string, string>,
+): Record<string, string> {
+  const denylist = new Set([
+    "task",
+    "workspace_mode",
+    "base_branch_sha",
+    "working_directory_for_harness",
+    "harness_type",
+    "no_hurry_save_tokens_mode",
+    "no_relaunch_upon_rugpull",
+    "repo",
+    "original_branch",
+    "worktree_path",
+    "worktree_origin_repository",
+    "worktree_origin_ref",
+    "worktree_origin_sha",
+    "target_working_directory_for_harness",
+  ]);
+
+  const result: Record<string, string> = {};
+
+  for (const [key, value] of Object.entries(parsedContext)) {
+    if (!denylist.has(key) && !key.startsWith("worktree_")) {
+      result[key] = value;
+    }
+  }
+
+  return result;
+}
+
+/**
  * Result of a rugpull relaunch attempt.
  */
 export interface RelaunchResult {
@@ -213,6 +254,10 @@ export async function relaunchRunAfterRugpull(
     return { relaunched: false };
   }
 
+  // Extract user-provided context keys (strip internal keys that runWorkflow regenerates).
+  // This ensures template references like {{branch}} resolve correctly in the replacement run.
+  const userContext = extractUserContext(context);
+
   // Reconstruct original parameters from context
   const harnessType = (context.harness_type as HarnessType) || "pi";
   const noHurry = context.no_hurry_save_tokens_mode === "true";
@@ -248,6 +293,7 @@ export async function relaunchRunAfterRugpull(
         noHurrySaveTokensMode: noHurry,
         worktreeOriginRepository: worktreeOriginRepo,
         worktreeOriginRef,
+        context: userContext,
       });
     } else {
       const workingDir =
@@ -272,6 +318,7 @@ export async function relaunchRunAfterRugpull(
         harnessType,
         noHurrySaveTokensMode: noHurry,
         workingDirectoryForHarness: workingDir,
+        context: userContext,
       });
     }
   } catch (err) {
