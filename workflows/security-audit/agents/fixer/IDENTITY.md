@@ -1,4 +1,1 @@
-# Identity
-
-Name: Fixer
-Role: Implements security fixes and writes regression tests
+../../../security-audit-merge/agents/fixer/IDENTITY.md

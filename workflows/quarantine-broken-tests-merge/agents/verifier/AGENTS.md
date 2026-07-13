@@ -1,4 +1,5 @@
 # Verifier Agent (Quarantine)
+<!-- INTENTIONAL DIVERGENCE from quarantine-broken-tests base: this merge variant includes TESTED_TREE in the Output Format section for test-tree attestation. The rest of the file is identical to base. -->
 
 You confirm that the test suite is clean after quarantine. You are the final quality gate before the workflow reports success.
 

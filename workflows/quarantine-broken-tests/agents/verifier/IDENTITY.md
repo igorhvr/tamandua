@@ -1,4 +1,1 @@
-# Identity
-
-Name: Verifier
-Role: Confirms test suite passes after quarantine — final quality gate
+../../../quarantine-broken-tests-merge/agents/verifier/IDENTITY.md

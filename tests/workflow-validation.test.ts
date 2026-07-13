@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { readdirSync, existsSync, readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { resolve, join } from "node:path";
 import { loadWorkflowSpec } from "../dist/installer/workflow-spec.js";
 import { resolveBundledWorkflowsDir } from "../dist/installer/paths.js";
@@ -1482,5 +1483,260 @@ describe("US-006: VTSC — Verifier persona: run targeted tests, not full suite"
       // Merge-family YAMLs should NOT contain the verifier-specific persona guidance
       assert.doesNotMatch(content, /Run targeted tests/);
     }
+  });
+});
+
+describe("agent file divergence detection", () => {
+  const repoRoot = resolve(workflowsDir, "..");
+
+  function sha256(filePath: string): string {
+    return createHash("sha256").update(readFileSync(filePath)).digest("hex");
+  }
+
+  function assertIdenticalGroup(files: string[]) {
+    const hashes = files.map((p) => ({
+      path: p,
+      hash: sha256(resolve(repoRoot, p)),
+    }));
+    const first = hashes[0];
+    const mismatches = hashes.filter((h) => h.hash !== first.hash);
+    if (mismatches.length > 0) {
+      const msg = [
+        `${mismatches.length} of ${hashes.length} files diverged:`,
+        ...hashes.map((h) => `  ${h.hash}  ${h.path}`),
+      ].join("\n");
+      assert.fail(msg);
+    }
+    // No explicit assertion if all match — test passes silently.
+    // Force at least one assertion so the test doesn't look empty.
+    assert.ok(true);
+  }
+
+  // ─── bug-fix family ───
+  // fixer, investigator, triager directories are byte-identical (all 3 files each)
+  // and symlinked from bug-fix + bug-fix-github-pr → bug-fix-merge.
+
+  describe("bug-fix family", () => {
+    const variants = ["bug-fix", "bug-fix-merge", "bug-fix-github-pr"];
+    const roles = ["fixer", "investigator", "triager"];
+    const files = ["AGENTS.md", "IDENTITY.md", "SOUL.md"];
+
+    for (const role of roles) {
+      for (const f of files) {
+        it(`${role}/${f} identical across bug-fix variants`, () => {
+          assertIdenticalGroup(
+            variants.map((v) => `workflows/${v}/agents/${role}/${f}`)
+          );
+        });
+      }
+    }
+  });
+
+  // ─── feature-dev family ───
+
+  describe("feature-dev family", () => {
+    const variants = ["feature-dev", "feature-dev-merge", "feature-dev-github-pr"];
+
+    describe("developer (all files identical across all 3)", () => {
+      const files = ["AGENTS.md", "IDENTITY.md", "SOUL.md"];
+      for (const f of files) {
+        it(`developer/${f} identical`, () => {
+          assertIdenticalGroup(
+            variants.map((v) => `workflows/${v}/agents/developer/${f}`)
+          );
+        });
+      }
+    });
+
+    describe("planner", () => {
+      // IDENTITY.md and SOUL.md are identical across all 3 variants.
+      for (const f of ["IDENTITY.md", "SOUL.md"]) {
+        it(`planner/${f} identical across all 3`, () => {
+          assertIdenticalGroup(
+            variants.map((v) => `workflows/${v}/agents/planner/${f}`)
+          );
+        });
+      }
+
+      // planner/AGENTS.md: feature-dev and feature-dev-github-pr are identical;
+      // feature-dev-merge differs (intentional — merge-specific instructions).
+      it("planner/AGENTS.md: base == github-pr (merge differs intentionally)", () => {
+        // This is NOT an identical-group assertion — it documents the intentional split.
+        // We verify the two non-merge copies are in fact identical, and all three exist.
+        const baseHash = sha256(resolve(repoRoot, "workflows/feature-dev/agents/planner/AGENTS.md"));
+        const ghprHash = sha256(resolve(repoRoot, "workflows/feature-dev-github-pr/agents/planner/AGENTS.md"));
+        const mergeHash = sha256(resolve(repoRoot, "workflows/feature-dev-merge/agents/planner/AGENTS.md"));
+        assert.equal(baseHash, ghprHash,
+          `feature-dev base & github-pr planner/AGENTS.md must match:\n  base: ${baseHash}\n  ghpr: ${ghprHash}`);
+        // Merge is intentionally different — just verify it exists and is different.
+        assert.notEqual(mergeHash, baseHash,
+          "merge planner/AGENTS.md expected to differ from base (intentional divergence)");
+      });
+    });
+
+    describe("tester", () => {
+      // IDENTITY.md and SOUL.md are identical across all 3 variants.
+      for (const f of ["IDENTITY.md", "SOUL.md"]) {
+        it(`tester/${f} identical across all 3`, () => {
+          assertIdenticalGroup(
+            variants.map((v) => `workflows/${v}/agents/tester/${f}`)
+          );
+        });
+      }
+
+      // tester/AGENTS.md: feature-dev and feature-dev-github-pr are identical;
+      // feature-dev-merge differs (intentional — TESTED_TREE reply format).
+      it("tester/AGENTS.md: base == github-pr (merge differs intentionally)", () => {
+        const baseHash = sha256(resolve(repoRoot, "workflows/feature-dev/agents/tester/AGENTS.md"));
+        const ghprHash = sha256(resolve(repoRoot, "workflows/feature-dev-github-pr/agents/tester/AGENTS.md"));
+        const mergeHash = sha256(resolve(repoRoot, "workflows/feature-dev-merge/agents/tester/AGENTS.md"));
+        assert.equal(baseHash, ghprHash,
+          `feature-dev base & github-pr tester/AGENTS.md must match:\n  base: ${baseHash}\n  ghpr: ${ghprHash}`);
+        assert.notEqual(mergeHash, baseHash,
+          "merge tester/AGENTS.md expected to differ from base (intentional divergence)");
+      });
+    });
+  });
+
+  // ─── security-audit family ───
+
+  describe("security-audit family", () => {
+    const variants = ["security-audit", "security-audit-merge", "security-audit-github-pr"];
+
+    describe("prioritizer (all files identical across all 3)", () => {
+      const files = ["AGENTS.md", "IDENTITY.md", "SOUL.md"];
+      for (const f of files) {
+        it(`prioritizer/${f} identical`, () => {
+          assertIdenticalGroup(
+            variants.map((v) => `workflows/${v}/agents/prioritizer/${f}`)
+          );
+        });
+      }
+    });
+
+    describe("scanner (all files identical across all 3)", () => {
+      const files = ["AGENTS.md", "IDENTITY.md", "SOUL.md"];
+      for (const f of files) {
+        it(`scanner/${f} identical`, () => {
+          assertIdenticalGroup(
+            variants.map((v) => `workflows/${v}/agents/scanner/${f}`)
+          );
+        });
+      }
+    });
+
+    describe("fixer", () => {
+      // fixer/IDENTITY.md is identical across all 3.
+      it("fixer/IDENTITY.md identical across all 3", () => {
+        assertIdenticalGroup(
+          variants.map((v) => `workflows/${v}/agents/fixer/IDENTITY.md`)
+        );
+      });
+
+      // fixer/AGENTS.md: audit differs (base-only version); merge == github-pr.
+      it("fixer/AGENTS.md: merge == github-pr (audit differs intentionally)", () => {
+        const auditHash = sha256(resolve(repoRoot, "workflows/security-audit/agents/fixer/AGENTS.md"));
+        const mergeHash = sha256(resolve(repoRoot, "workflows/security-audit-merge/agents/fixer/AGENTS.md"));
+        const ghprHash = sha256(resolve(repoRoot, "workflows/security-audit-github-pr/agents/fixer/AGENTS.md"));
+        assert.equal(mergeHash, ghprHash,
+          `merge & github-pr fixer/AGENTS.md must match:\n  merge: ${mergeHash}\n  ghpr: ${ghprHash}`);
+        assert.notEqual(auditHash, mergeHash,
+          "audit fixer/AGENTS.md expected to differ from merge (intentional divergence)");
+      });
+
+      // fixer/SOUL.md: audit differs (base-only version); merge == github-pr.
+      it("fixer/SOUL.md: merge == github-pr (audit differs intentionally)", () => {
+        const auditHash = sha256(resolve(repoRoot, "workflows/security-audit/agents/fixer/SOUL.md"));
+        const mergeHash = sha256(resolve(repoRoot, "workflows/security-audit-merge/agents/fixer/SOUL.md"));
+        const ghprHash = sha256(resolve(repoRoot, "workflows/security-audit-github-pr/agents/fixer/SOUL.md"));
+        assert.equal(mergeHash, ghprHash,
+          `merge & github-pr fixer/SOUL.md must match:\n  merge: ${mergeHash}\n  ghpr: ${ghprHash}`);
+        assert.notEqual(auditHash, mergeHash,
+          "audit fixer/SOUL.md expected to differ from merge (intentional divergence)");
+      });
+    });
+
+    describe("tester", () => {
+      // IDENTITY.md and SOUL.md are identical across all 3.
+      it("tester/IDENTITY.md identical across all 3", () => {
+        assertIdenticalGroup(
+          variants.map((v) => `workflows/${v}/agents/tester/IDENTITY.md`)
+        );
+      });
+      it("tester/SOUL.md identical across all 3", () => {
+        assertIdenticalGroup(
+          variants.map((v) => `workflows/${v}/agents/tester/SOUL.md`)
+        );
+      });
+
+      // tester/AGENTS.md: audit == github-pr; merge differs (intentional — TESTED_TREE).
+      it("tester/AGENTS.md: audit == github-pr (merge differs intentionally)", () => {
+        const auditHash = sha256(resolve(repoRoot, "workflows/security-audit/agents/tester/AGENTS.md"));
+        const ghprHash = sha256(resolve(repoRoot, "workflows/security-audit-github-pr/agents/tester/AGENTS.md"));
+        const mergeHash = sha256(resolve(repoRoot, "workflows/security-audit-merge/agents/tester/AGENTS.md"));
+        assert.equal(auditHash, ghprHash,
+          `audit & github-pr tester/AGENTS.md must match:\n  audit: ${auditHash}\n  ghpr: ${ghprHash}`);
+        assert.notEqual(mergeHash, auditHash,
+          "merge tester/AGENTS.md expected to differ from audit (intentional divergence)");
+      });
+    });
+  });
+
+  // ─── quarantine family ───
+
+  describe("quarantine family", () => {
+    const qt = "quarantine-broken-tests";
+    const qtMerge = "quarantine-broken-tests-merge";
+
+    describe("quarantiner (all files identical across both)", () => {
+      const files = ["AGENTS.md", "IDENTITY.md", "SOUL.md"];
+      for (const f of files) {
+        it(`quarantiner/${f} identical`, () => {
+          assertIdenticalGroup([
+            `workflows/${qt}/agents/quarantiner/${f}`,
+            `workflows/${qtMerge}/agents/quarantiner/${f}`,
+          ]);
+        });
+      }
+    });
+
+    describe("verifier", () => {
+      // IDENTITY.md and SOUL.md are identical across both variants.
+      it("verifier/IDENTITY.md identical across both", () => {
+        assertIdenticalGroup([
+          `workflows/${qt}/agents/verifier/IDENTITY.md`,
+          `workflows/${qtMerge}/agents/verifier/IDENTITY.md`,
+        ]);
+      });
+      it("verifier/SOUL.md identical across both", () => {
+        assertIdenticalGroup([
+          `workflows/${qt}/agents/verifier/SOUL.md`,
+          `workflows/${qtMerge}/agents/verifier/SOUL.md`,
+        ]);
+      });
+
+      // verifier/AGENTS.md intentionally differs: merge has TESTED_TREE divergence.
+      it("verifier/AGENTS.md: intentionally divergent between base and merge", () => {
+        const baseHash = sha256(resolve(repoRoot, `workflows/${qt}/agents/verifier/AGENTS.md`));
+        const mergeHash = sha256(resolve(repoRoot, `workflows/${qtMerge}/agents/verifier/AGENTS.md`));
+        assert.notEqual(baseHash, mergeHash,
+          `quarantine verifier/AGENTS.md expected to differ (intentional TESTED_TREE divergence):\n  base: ${baseHash}\n  merge: ${mergeHash}`);
+      });
+    });
+  });
+
+  // ─── cross-family ───
+
+  describe("cross-family", () => {
+    // merger/SOUL.md is byte-identical across all 4 merge variants
+    // (bug-fix-merge, feature-dev-merge, security-audit-merge, quarantine-broken-tests-merge).
+    it("merger/SOUL.md identical across all 4 merge variants", () => {
+      assertIdenticalGroup([
+        "workflows/bug-fix-merge/agents/merger/SOUL.md",
+        "workflows/feature-dev-merge/agents/merger/SOUL.md",
+        "workflows/security-audit-merge/agents/merger/SOUL.md",
+        "workflows/quarantine-broken-tests-merge/agents/merger/SOUL.md",
+      ]);
+    });
   });
 });

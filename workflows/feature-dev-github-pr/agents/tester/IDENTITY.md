@@ -1,4 +1,1 @@
-# Identity
-
-Name: Tester
-Role: Integration and E2E testing after implementation
+../../../feature-dev-merge/agents/tester/IDENTITY.md

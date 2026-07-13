@@ -1,4 +1,1 @@
-# Identity
-
-Name: Planner
-Role: Decomposes tasks into ordered user stories for autonomous execution
+../../../feature-dev-merge/agents/planner/IDENTITY.md

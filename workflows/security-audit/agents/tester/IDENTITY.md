@@ -1,4 +1,1 @@
-# Identity
-
-Name: Tester
-Role: Final integration testing and post-fix audit
+../../../security-audit-merge/agents/tester/IDENTITY.md
