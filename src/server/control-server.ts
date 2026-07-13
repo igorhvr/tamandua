@@ -30,6 +30,7 @@ import { getDb } from "../db.js";
 import { emitEvent } from "../installer/events.js";
 import type { TamanduaEvent } from "../installer/events.js";
 import { validateRunHarnessForScheduling } from "../installer/run-harness.js";
+import { parseRunContext } from "../installer/step-ops.js";
 
 export const DEFAULT_CONTROL_PORT = 3339;
 const DEFAULT_MAX_ACTIVE_TIMERS = 50;
@@ -179,13 +180,8 @@ async function admitOrQueueRun(run: RunRow): Promise<JsonResponse> {
 
   const harness = await validateRunHarnessForScheduling(run.id, run.context);
 
-  let isSaveTokensMode = false;
-  try {
-    const contextParsed = JSON.parse(run.context) as Record<string, unknown>;
-    isSaveTokensMode = contextParsed.no_hurry_save_tokens_mode === 'true';
-  } catch {
-    // context might be malformed; default to false
-  }
+  const contextParsed = parseRunContext(run.id, run.context);
+  const isSaveTokensMode = contextParsed.no_hurry_save_tokens_mode === 'true';
 
   const duplicateRunId = _runIdForScheduledHarnessWorkdir(
     harness.workingDirectoryForHarness,

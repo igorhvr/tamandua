@@ -4,8 +4,8 @@ import path from "node:path";
 import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { afterEach, beforeEach, describe, it } from "node:test";
-import { validateRunHarnessForScheduling } from "../../dist/installer/run-harness.js";
+import { after, afterEach, before, beforeEach, describe, it } from "node:test";
+import { validateRunHarnessForScheduling, getRunHarnessType } from "../../dist/installer/run-harness.js";
 import {
   createRunWorktree,
   removeRunWorktree,
@@ -356,6 +356,56 @@ describe("validateRunHarnessForScheduling", () => {
         branch: "nonexistent-branch",
       })),
       /branch mismatch/,
+    );
+  });
+});
+
+describe("getRunHarnessType with corrupt context (US-005)", () => {
+  let tempDir: string;
+  let _savedStateDir: string | undefined;
+  let _savedDbPath: string | undefined;
+
+  before(() => {
+    tempDir = tamanduaTempDir("tamandua-us005-harness-");
+    const tamanduaDir = path.join(tempDir, ".tamandua");
+    fs.mkdirSync(tamanduaDir, { recursive: true });
+    _savedStateDir = process.env.TAMANDUA_STATE_DIR;
+    _savedDbPath = process.env.TAMANDUA_DB_PATH;
+    process.env.TAMANDUA_STATE_DIR = tamanduaDir;
+    process.env.TAMANDUA_DB_PATH = path.join(tamanduaDir, "tamandua.db");
+  });
+
+  after(() => {
+    if (_savedStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+    else process.env.TAMANDUA_STATE_DIR = _savedStateDir;
+    if (_savedDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+    else process.env.TAMANDUA_DB_PATH = _savedDbPath;
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it("returns 'pi' on corrupt context and emits run.context_corrupt event", async () => {
+    const db = getDb();
+    const runId = "run-us005-harness-01";
+    const now = new Date().toISOString().replace("T", " ").slice(0, 19);
+
+    // Insert a run with corrupt JSON context
+    db.prepare(
+      `INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
+       VALUES (?, 1, 'us005-harness-test', 'test harness corrupt', 'running', ?, 0, ?, ?)`
+    ).run(runId, "{not valid json << }  ", now, now);
+
+    // getRunHarnessType should NOT crash on corrupt context
+    const harnessType = getRunHarnessType(runId);
+    assert.equal(harnessType, "pi", "should fall back to pi on corrupt context");
+
+    // Verify run.context_corrupt event was emitted
+    const { getRunEvents } = await import("../../dist/installer/events.js");
+    const events = getRunEvents(runId);
+    const corruptEvents = events.filter((e: { event: string }) => e.event === "run.context_corrupt");
+    assert.equal(corruptEvents.length, 1, "should emit one run.context_corrupt event");
+    assert.ok(
+      typeof corruptEvents[0].detail === "string" && corruptEvents[0].detail!.length <= 200,
+      "detail should be a bounded prefix of the raw context"
     );
   });
 });

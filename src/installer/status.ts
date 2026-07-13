@@ -4,6 +4,7 @@ import { removeRunCrons } from "./agent-scheduler.js";
 import { terminateRunWithDaemon } from "../server/control-client.js";
 import { getRunWorktree, removeRunWorktree } from "./worktree-manager.js";
 import { emitEvent } from "./events.js";
+import { parseRunContext } from "./step-ops.js";
 
 export interface RunInfo {
   id: string;
@@ -321,31 +322,27 @@ function buildRunDetail(
   let wtOriginRepo: string | undefined;
   let wtOriginRef: string | undefined;
   let wtOriginSha: string | undefined;
-  try {
-    const ctx = JSON.parse(row.context || "{}") as Record<string, string>;
-    if (ctx.workspace_mode === "worktree") {
-      workspaceMode = ctx.workspace_mode;
-      const wtRow = db
-        .prepare(
-          "SELECT worktree_path, worktree_origin_repository, worktree_origin_ref, worktree_origin_sha FROM run_worktrees WHERE run_id = ?",
-        )
-        .get(row.id) as
-        | {
-            worktree_path: string;
-            worktree_origin_repository: string;
-            worktree_origin_ref: string | null;
-            worktree_origin_sha: string | null;
-          }
-        | undefined;
-      if (wtRow) {
-        wtPath = wtRow.worktree_path;
-        wtOriginRepo = wtRow.worktree_origin_repository;
-        wtOriginRef = wtRow.worktree_origin_ref ?? undefined;
-        wtOriginSha = wtRow.worktree_origin_sha ?? undefined;
-      }
+  const ctx = parseRunContext(row.id, row.context || "{}");
+  if (ctx.workspace_mode === "worktree") {
+    workspaceMode = ctx.workspace_mode;
+    const wtRow = db
+      .prepare(
+        "SELECT worktree_path, worktree_origin_repository, worktree_origin_ref, worktree_origin_sha FROM run_worktrees WHERE run_id = ?",
+      )
+      .get(row.id) as
+      | {
+          worktree_path: string;
+          worktree_origin_repository: string;
+          worktree_origin_ref: string | null;
+          worktree_origin_sha: string | null;
+        }
+      | undefined;
+    if (wtRow) {
+      wtPath = wtRow.worktree_path;
+      wtOriginRepo = wtRow.worktree_origin_repository;
+      wtOriginRef = wtRow.worktree_origin_ref ?? undefined;
+      wtOriginSha = wtRow.worktree_origin_sha ?? undefined;
     }
-  } catch {
-    // context may be malformed; leave worktree fields unset
   }
 
   return {

@@ -236,6 +236,86 @@ describe("CLI workflow status worktree display", () => {
 
     try { fs.rmSync(env.root, { recursive: true, force: true }); } catch { /* cleanup */ }
   });
+
+  it("handles corrupt context gracefully in workflow status", async () => {
+    const env = createTempEnv();
+    const dbPath = path.join(env.tamanduaDir, "tamandua.db");
+    const runId = "7777aaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+
+    // Seed a run with corrupt JSON context directly
+    const db = new DatabaseSync(dbPath);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS runs (
+        id TEXT PRIMARY KEY,
+        workflow_id TEXT NOT NULL,
+        task TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        context TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        run_number INTEGER,
+        tokens_spent INTEGER NOT NULL DEFAULT 0,
+        notify_url TEXT
+      )
+    `);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS steps (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL,
+        step_id TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        step_index INTEGER NOT NULL,
+        input_template TEXT NOT NULL DEFAULT '',
+        expects TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'waiting',
+        output TEXT,
+        retry_count INTEGER DEFAULT 0,
+        max_retries INTEGER DEFAULT 4,
+        type TEXT NOT NULL DEFAULT 'single',
+        loop_config TEXT,
+        current_story_id TEXT,
+        abandoned_count INTEGER DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS stories (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL,
+        story_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        status TEXT NOT NULL,
+        retry_count INTEGER DEFAULT 0,
+        story_index INTEGER NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `);
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 0, datetime('now'), datetime('now'))"
+    ).run(runId, "feature-dev", "Build something", "running", "{broken json!!! corrupted!!!");
+    db.close();
+
+    const { child, getStdout, getStderr } = spawnCli(
+      ["workflow", "status", runId],
+      { HOME: env.homeDir }
+    );
+
+    await new Promise<void>((resolve) => {
+      child.on("close", () => resolve());
+    });
+
+    const stdout = getStdout();
+    const stderr = getStderr();
+    // Should not crash — the run should still be displayed (status truncates runId to first 8 chars)
+    assert.match(stdout, /Run: 7777aaaa/, "should show the run ID prefix");
+    assert.match(stdout, /Status: running/, "should show the run status");
+    // Verify no crash traceback in stderr
+    assert.doesNotMatch(stderr, /Error|TypeError|SyntaxError/, "stderr should not contain crash error");
+
+    try { fs.rmSync(env.root, { recursive: true, force: true }); } catch { /* cleanup */ }
+  });
 });
 
 describe("dashboard run detail worktree enrichment", () => {

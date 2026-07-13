@@ -28,6 +28,7 @@ import { buildKanbanSnapshot, buildKanbanCardDetail } from "./kanban-data.js";
 import { pauseRunWithDaemon, resumeRunWithDaemon } from "./control-client.js";
 import { runWorkflow } from "../installer/run.js";
 import { stopWorkflow, deleteWorkflow, getWorkflowStatus } from "../installer/status.js";
+import { parseRunContext } from "../installer/step-ops.js";
 import { readVersionStatus } from "../lib/version-check.js";
 import { getBuildVersion } from "../lib/version.js";
 import {
@@ -88,32 +89,11 @@ function parseBody(req: http.IncomingMessage): Promise<string> {
   });
 }
 
-type RunContext = Record<string, unknown>;
-
-function parseRunContext(context: unknown): RunContext {
-  if (typeof context !== "string" || context.trim() === "") return {};
-  try {
-    const parsed = JSON.parse(context) as unknown;
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
-      ? parsed as RunContext
-      : {};
-  } catch {
-    return {};
-  }
-}
-
-function stringFromContext(ctx: RunContext, key: string): string | undefined {
-  const value = ctx[key];
-  return typeof value === "string" && value.trim() ? value : undefined;
-}
-
-function resolveRunHarnessCwd(run: { context?: string | null }): string | undefined {
-  const ctx = parseRunContext(run.context);
-  return (
-    stringFromContext(ctx, "working_directory_for_harness") ??
-    stringFromContext(ctx, "worktree_path") ??
-    stringFromContext(ctx, "cwd")
-  );
+function resolveRunHarnessCwd(runId: string | null, context?: string | null): string | undefined {
+  if (!context) return undefined;
+  const ctx = parseRunContext(runId ?? "unknown", context);
+  const value = ctx.working_directory_for_harness?.trim() || ctx.worktree_path?.trim() || ctx.cwd?.trim();
+  return value || undefined;
 }
 
 function buildAutoresearchExperiments(entries: AutoresearchLogEntry[]) {
@@ -213,7 +193,7 @@ function handleListRuns(_req: http.IncomingMessage, res: http.ServerResponse): v
     const runs = rawRuns.map((row) => {
       let no_hurry = false;
       try {
-        const ctx = JSON.parse(String(row.context ?? "{}"));
+        const ctx = parseRunContext(row.id as string, String(row.context ?? "{}"));
         no_hurry = ctx.no_hurry_save_tokens_mode === "true";
       } catch {
         // malformed context → no_hurry stays false
@@ -274,7 +254,7 @@ function handleRunDetail(
     // Enrich with worktree information
     let worktree: unknown = null;
     try {
-      const ctx = JSON.parse((run as { context?: string }).context ?? "{}") as Record<string, string>;
+      const ctx = parseRunContext(runId, (run as { context?: string }).context ?? "{}");
       if (ctx.workspace_mode === "worktree") {
         worktree = db
           .prepare(
@@ -362,7 +342,7 @@ function handleRunAutoresearch(
       return;
     }
 
-    const cwd = resolveRunHarnessCwd(run);
+    const cwd = resolveRunHarnessCwd(run.id, run.context);
     if (!cwd) {
       jsonResponse(res, {
         exists: false,
@@ -429,7 +409,7 @@ function handleAutoresearchRuns(_req: http.IncomingMessage, res: http.ServerResp
     `).all() as Array<Record<string, unknown>>;
 
     const filtered = rawRuns.filter((row) => {
-      const cwd = resolveRunHarnessCwd({ context: row.context as string | null | undefined });
+      const cwd = resolveRunHarnessCwd(row.id as string, row.context as string | null | undefined);
       if (!cwd) return false;
       try {
         const sessionCwd = findAutoresearchSessionCwd(cwd);
@@ -442,7 +422,7 @@ function handleAutoresearchRuns(_req: http.IncomingMessage, res: http.ServerResp
     const runs = filtered.map((row) => {
       let no_hurry = false;
       try {
-        const ctx = JSON.parse(String(row.context ?? "{}"));
+        const ctx = parseRunContext(row.id as string, String(row.context ?? "{}"));
         no_hurry = ctx.no_hurry_save_tokens_mode === "true";
       } catch {
         // malformed context → no_hurry stays false
@@ -605,16 +585,16 @@ export function backfillAutoresearchSessions(): void {
   try {
     const db = getDb();
     const rows = db.prepare(`
-      SELECT context FROM runs
+      SELECT id, context FROM runs
       ORDER BY created_at DESC
       LIMIT 100
-    `).all() as Array<{ context: string }>;
+    `).all() as Array<{ id: string; context: string }>;
 
     const seen = new Set<string>();
     let backfilled = 0;
 
     for (const row of rows) {
-      const cwd = resolveRunHarnessCwd({ context: row.context });
+      const cwd = resolveRunHarnessCwd(row.id, row.context);
       if (!cwd) continue;
       try {
         const sessionCwd = findAutoresearchSessionCwd(cwd);
@@ -859,12 +839,7 @@ async function handleRelaunchRun(
     const taskTitle = taskOverride ?? run.task;
 
     // Parse original context to extract workspace settings
-    let originalContext: Record<string, string> = {};
-    try {
-      originalContext = JSON.parse(run.context) as Record<string, string>;
-    } catch {
-      // context may be malformed — proceed with empty context
-    }
+    const originalContext = parseRunContext(run.id, run.context);
 
     const workspaceMode = originalContext.workspace_mode ?? "direct";
 

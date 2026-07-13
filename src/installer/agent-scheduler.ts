@@ -9,6 +9,7 @@ import { logger } from "../lib/logger.js";
 import { getRoleTimeoutSeconds, inferRole } from "./install.js";
 import { formatPiCommandPreview } from "./pi-command-preview.js";
 import { emitEvent } from "./events.js";
+import { parseRunContext } from "./step-ops.js";
 import { parsePiOutputStream } from "./pi-stream-parser.js";
 import { getHarnessAdapter, type HarnessRoundResult } from "./harness-adapter.js";
 import { lookupHermesSessionTokens } from "./hermes-usage.js";
@@ -1145,12 +1146,8 @@ export async function executeDispatchRound(
         .prepare("SELECT status, scheduling_status, context FROM runs WHERE id = ?")
         .get(job.runId) as { status: string; scheduling_status: string | null; context: string } | undefined;
       if (row?.context) {
-        try {
-          const runContext = JSON.parse(row.context) as Record<string, unknown>;
-          preferTokenSaver = runContext.no_hurry_save_tokens_mode === "true";
-        } catch {
-          // malformed context — treat as normal mode
-        }
+        const runContext = parseRunContext(job.runId, row.context);
+        preferTokenSaver = runContext.no_hurry_save_tokens_mode === "true";
       }
       if (!row || (row.status !== "running" && row.status !== "paused")) {
         logger.info("Dispatch round skipped — run no longer running; tearing down job", {
@@ -1563,7 +1560,7 @@ export async function createAgentCronJob(
     const db = getDb();
     const runRow = db.prepare("SELECT context FROM runs WHERE id = ?").get(runId) as { context: string } | undefined;
     if (runRow) {
-      const ctx = JSON.parse(runRow.context) as Record<string, unknown>;
+      const ctx = parseRunContext(runId, runRow.context);
       if (ctx.harness_type === "hermes") {
         harnessType = "hermes";
       }

@@ -1,7 +1,7 @@
 import { describe, it, before, after, mock } from "node:test";
 import assert from "node:assert/strict";
 import { createTempHome } from "./helpers/test-env.ts";
-import { parseOutputKeyValues, parseExpectedKeys, findProducerForMissingKey, resolveTemplate, buildStoryPlanSection, mergeStoryPlanIntoProgress, validateExpects, completeStep, resolveStepContext, failStep, claimStep, getWorkflowId, advancePipeline, recoverOrphanedStepsForAgent, sanitizeStderrTail } from "../dist/installer/step-ops.js";
+import { parseRunContext, parseOutputKeyValues, parseExpectedKeys, findProducerForMissingKey, resolveTemplate, buildStoryPlanSection, mergeStoryPlanIntoProgress, validateExpects, completeStep, resolveStepContext, failStep, claimStep, getWorkflowId, advancePipeline, recoverOrphanedStepsForAgent, sanitizeStderrTail } from "../dist/installer/step-ops.js";
 import { getRunEvents } from "../dist/installer/events.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -141,6 +141,65 @@ describe("sanitizeStderrTail", () => {
     assert.ok(resultLines[1].includes("… [truncated]"));
     assert.equal(resultLines[2], "another short line");
     assert.equal(resultLines[3], "y".repeat(500));
+  });
+});
+
+describe("parseRunContext", () => {
+  let th: ReturnType<typeof createTempHome>;
+  let _savedStateDir: string | undefined;
+
+  before(() => {
+    _savedStateDir = process.env.TAMANDUA_STATE_DIR;
+    th = createTempHome("tamandua-parse-run-context-test-");
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+  });
+
+  after(() => {
+    if (_savedStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+    else process.env.TAMANDUA_STATE_DIR = _savedStateDir;
+  });
+
+  it("returns parsed object for valid JSON", () => {
+    const result = parseRunContext("test-run-id", JSON.stringify({ repo: "/tmp/test", branch: "feature/x" }));
+    assert.equal(result.repo, "/tmp/test");
+    assert.equal(result.branch, "feature/x");
+  });
+
+  it("returns {} for invalid JSON and emits run.context_corrupt event", () => {
+    const raw = "not-valid-json{{{xyz";
+    const result = parseRunContext("test-run-id", raw);
+    assert.deepEqual(result, {});
+    // Verify event was emitted
+    const events = getRunEvents("test-run-id");
+    const corruptEvents = events.filter((e: { event: string }) => e.event === "run.context_corrupt");
+    assert.equal(corruptEvents.length, 1, "Should emit one run.context_corrupt event");
+    assert.ok(typeof corruptEvents[0].detail === "string", "Detail should be a string");
+    assert.ok(corruptEvents[0].detail!.length <= 200, "Detail should be bounded to 200 chars");
+    assert.ok(corruptEvents[0].detail!.includes("not-valid-json"), "Detail should contain prefix of raw value");
+  });
+
+  it("bounds detail to 200 chars for long raw values", () => {
+    const raw = "x".repeat(500);
+    const result = parseRunContext("test-run-id-2", raw);
+    assert.deepEqual(result, {});
+    const events = getRunEvents("test-run-id-2");
+    const corruptEvents = events.filter((e: { event: string }) => e.event === "run.context_corrupt");
+    assert.equal(corruptEvents.length, 1);
+    assert.ok(corruptEvents[0].detail!.length <= 200);
+  });
+
+  it("returns {} for empty string", () => {
+    const result = parseRunContext("test-run-id-empty", "");
+    assert.deepEqual(result, {});
+    const events = getRunEvents("test-run-id-empty");
+    const corruptEvents = events.filter((e: { event: string }) => e.event === "run.context_corrupt");
+    assert.equal(corruptEvents.length, 1, "Empty string is not valid JSON and should emit event");
+    assert.equal(corruptEvents[0].detail, "");
+  });
+
+  it("handles valid JSON that is not an object (returns whatever JSON.parse produces)", () => {
+    const result = parseRunContext("run-arr", "[1,2,3]");
+    assert.ok(Array.isArray(result));
   });
 });
 
@@ -5978,5 +6037,104 @@ describe("completeStepInternal crash recovery and concurrent completion (US-004 
     const ctxAfter = JSON.parse(runAfter.context);
     assert.equal(ctxAfter.changes, "retry-success");
     assert.equal(ctxAfter.retry_key, "works");
+  });
+});
+
+describe("US-005: Integration tests for context corruption guard", () => {
+  const _savedStateDir = process.env.TAMANDUA_STATE_DIR;
+  const _savedDbPath = process.env.TAMANDUA_DB_PATH;
+  const th = createTempHome("tamandua-us005-test-");
+
+  before(() => {
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_DB_PATH = path.join(th.tamanduaDir, "tamandua.db");
+  });
+
+  after(() => {
+    if (_savedStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+    else process.env.TAMANDUA_STATE_DIR = _savedStateDir;
+    if (_savedDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+    else process.env.TAMANDUA_DB_PATH = _savedDbPath;
+  });
+
+  function ts(): string {
+    return new Date().toISOString().replace("T", " ").slice(0, 19);
+  }
+
+  it("resolveStepContext with corrupt context returns empty context and emits event", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const now = ts();
+
+    // Insert a run with corrupt JSON context
+    const corruptCtx = "{not-valid-json!!!::}";
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 1, 'us005-test', 'test corrupt', 'running', ?, 0, ?, ?)"
+    ).run(runId, corruptCtx, now, now);
+
+    // resolveStepContext should NOT crash on corrupt context
+    const ctx = resolveStepContext(runId, 0);
+    assert.equal(typeof ctx, "object", "should return an object");
+    assert.equal(ctx.run_id, runId, "should contain run_id");
+    // Corrupt context degrades to empty — no repo, branch, etc.
+    assert.equal(ctx.repo, undefined, "repo should be undefined on corrupt context");
+    assert.equal(ctx.branch, undefined, "branch should be undefined on corrupt context");
+
+    // Verify run.context_corrupt event was emitted
+    const events = getRunEvents(runId);
+    const corruptEvents = events.filter((e: { event: string }) => e.event === "run.context_corrupt");
+    assert.equal(corruptEvents.length, 1, "should emit one run.context_corrupt event");
+    assert.ok(
+      typeof corruptEvents[0].detail === "string" && corruptEvents[0].detail!.length <= 200,
+      "detail should be a bounded prefix of the raw context"
+    );
+    assert.ok(corruptEvents[0].detail!.includes("not-valid-json"), "detail should contain prefix of raw value");
+  });
+
+  it("completeStep with corrupt context succeeds without crash and emits event", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const stepId = crypto.randomUUID();
+    const stepId2 = crypto.randomUUID();
+    const now = ts();
+
+    // Insert a run with corrupt JSON context
+    const corruptCtx = "{broken<<<<context!!!!";
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 1, 'us005-test2', 'test complete corrupt', 'running', ?, 0, ?, ?)"
+    ).run(runId, corruptCtx, now, now);
+
+    // Insert a running step
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, created_at, updated_at) VALUES (?, ?, 'implement', 'dev', 0, 'Do work', 'STATUS: done', 'running', 0, 3, 'single', ?, ?)"
+    ).run(stepId, runId, now, now);
+
+    // Insert a downstream waiting step
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, created_at, updated_at) VALUES (?, ?, 'verify', 'verify_agent', 1, 'Verify', '', 'waiting', 0, 3, 'single', ?, ?)"
+    ).run(stepId2, runId, now, now);
+
+    // completeStep should NOT crash on corrupt context
+    const result = completeStep(stepId, "STATUS: done\nCHANGES: implemented with corrupt context\nTESTS: no crash");
+    assert.ok(result.status !== "retrying", "completeStep should not retry");
+
+    // Verify step was marked done
+    const step = db.prepare("SELECT status FROM steps WHERE id = ?").get(stepId) as { status: string };
+    assert.equal(step.status, "done", "step should be marked done");
+
+    // Verify downstream step advanced
+    const step2 = db.prepare("SELECT status FROM steps WHERE id = ?").get(stepId2) as { status: string };
+    assert.equal(step2.status, "pending", "downstream step should be pending");
+
+    // Verify run.context_corrupt event was emitted
+    const events = getRunEvents(runId);
+    const corruptEvents = events.filter((e: { event: string }) => e.event === "run.context_corrupt");
+    assert.ok(corruptEvents.length >= 1, "should emit at least one run.context_corrupt event");
+    assert.ok(
+      typeof corruptEvents[0].detail === "string" && corruptEvents[0].detail!.length <= 200,
+      "detail should be a bounded prefix"
+    );
   });
 });

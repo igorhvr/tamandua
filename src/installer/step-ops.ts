@@ -1836,6 +1836,30 @@ export function computeHasFrontendChanges(repo: string, branch: string): string 
   }
 }
 
+/**
+ * Parse a run's context JSON safely. Returns {} on parse failure after
+ * emitting a run.context_corrupt event with a bounded 200-char prefix
+ * of the raw value and logging a warning.
+ */
+export function parseRunContext(runId: string, raw: string): Record<string, string> {
+  try {
+    return JSON.parse(raw) as Record<string, string>;
+  } catch {
+    const boundedPrefix = raw.slice(0, 200);
+    emitEvent({
+      ts: new Date().toISOString(),
+      event: "run.context_corrupt",
+      runId,
+      detail: boundedPrefix,
+    });
+    logger.warn(`run.context_corrupt: invalid JSON in runs.context, using empty context`, {
+      runId,
+      contextPrefix: boundedPrefix,
+    });
+    return {};
+  }
+}
+
 // ══════════════════════════════════════════════════════════════════════
 // Internal Helpers
 // ══════════════════════════════════════════════════════════════════════
@@ -1848,7 +1872,7 @@ function setRunContextKey(runId: string, key: string, value: string): void {
   const db = getDb();
   const run = db.prepare("SELECT context FROM runs WHERE id = ?").get(runId) as { context: string } | undefined;
   if (!run) return;
-  const context: Record<string, string> = JSON.parse(run.context);
+  const context: Record<string, string> = parseRunContext(runId, run.context);
   context[key] = value;
   db.prepare("UPDATE runs SET context = ?, updated_at = datetime('now') WHERE id = ?").run(JSON.stringify(context), runId);
 }
@@ -2540,7 +2564,7 @@ function completeStepInternal(stepId: string, output: string): { status: string;
 
   // Merge KEY: value lines into run context
   const run = db.prepare("SELECT context FROM runs WHERE id = ?").get(runId) as { context: string };
-  const context: Record<string, string> = JSON.parse(run.context);
+  const context: Record<string, string> = parseRunContext(runId, run.context);
 
   const parsed = parseOutputKeyValues(output);
   for (const [key, value] of Object.entries(parsed)) {
@@ -3511,12 +3535,7 @@ function writeRerouteFeedbackContext(
   const run = db.prepare("SELECT context FROM runs WHERE id = ?").get(runId) as { context: string } | undefined;
   if (!run) return;
 
-  let context: Record<string, string> = {};
-  try {
-    context = JSON.parse(run.context) as Record<string, string>;
-  } catch {
-    // keep empty context
-  }
+  const context: Record<string, string> = parseRunContext(runId, run.context);
   context["verify_feedback"] = failureText;
   context["retry_feedback"] = failureText;
   db.prepare("UPDATE runs SET context = ?, updated_at = datetime('now') WHERE id = ?").run(
@@ -3664,7 +3683,7 @@ export function resolveStepContext(
 
   // Start with the run's stored context
   const run = db.prepare("SELECT context FROM runs WHERE id = ?").get(runId) as { context: string } | undefined;
-  const context: Record<string, string> = run ? JSON.parse(run.context) : {};
+  const context: Record<string, string> = run ? parseRunContext(runId, run.context) : {};
 
   // Always inject run_id so templates can use {{run_id}}
   context["run_id"] = runId;

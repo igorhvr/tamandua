@@ -6,6 +6,7 @@
 
 import { getWorkflowStatus } from "../../installer/status.js";
 import { getDb, upsertAutoresearchSession } from "../../db.js";
+import { parseRunContext } from "../../installer/step-ops.js";
 import { readOption, requireOption, parseDuration } from "../shared.js";
 import {
   findAutoresearchSessionCwd,
@@ -69,24 +70,11 @@ export function resolveAutoresearchCwdForRun(runIdOrPrefix: string): { runId: st
   const row = db.prepare("SELECT context FROM runs WHERE id = ?").get(detail.id) as { context?: string | null } | undefined;
   if (!row?.context) return { runId: detail.id };
 
-  let context: Record<string, unknown> = {};
-  try {
-    const parsed = JSON.parse(row.context) as unknown;
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      context = parsed as Record<string, unknown>;
-    }
-  } catch {
-    return { runId: detail.id };
-  }
-
-  const readString = (key: string): string | undefined => {
-    const value = context[key];
-    return typeof value === "string" && value.trim() ? value : undefined;
-  };
+  const context = parseRunContext(detail.id, row.context);
 
   return {
     runId: detail.id,
-    cwd: readString("working_directory_for_harness") ?? readString("worktree_path") ?? readString("cwd"),
+    cwd: context.working_directory_for_harness?.trim() || context.worktree_path?.trim() || context.cwd?.trim() || undefined,
   };
 }
 

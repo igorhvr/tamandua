@@ -22,7 +22,7 @@ import { startDaemon, stopDaemon, restartDaemon, getDaemonStatus, isRunning, rea
 import { DEFAULT_MCP_PORT, MCP_ENDPOINT_PATH } from "../server/mcp-server.js";
 import { DEFAULT_CONTROL_PORT } from "../server/control-server.js";
 import { pauseRunWithDaemon, resumeRunWithDaemon, nudgeWithDaemon } from "../server/control-client.js";
-import { claimStep, completeStep, failStep, getStories, getOwnProcessGroupId, peekStep, buildAbandonReasonAggregate } from "../installer/step-ops.js";
+import { claimStep, completeStep, failStep, getStories, getOwnProcessGroupId, peekStep, buildAbandonReasonAggregate, parseRunContext } from "../installer/step-ops.js";
 import { ensureCliSymlink } from "../installer/symlink.js";
 import { checkCatalogStalenessWarning } from "../installer/catalog-version.js";
 import { resolveSourcePath, resolveSkillPath } from "../installer/paths.js";
@@ -241,24 +241,11 @@ function resolveAutoresearchCwdForRun(runIdOrPrefix: string): { runId: string; c
   const row = db.prepare("SELECT context FROM runs WHERE id = ?").get(detail.id) as { context?: string | null } | undefined;
   if (!row?.context) return { runId: detail.id };
 
-  let context: Record<string, unknown> = {};
-  try {
-    const parsed = JSON.parse(row.context) as unknown;
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      context = parsed as Record<string, unknown>;
-    }
-  } catch {
-    return { runId: detail.id };
-  }
-
-  const readString = (key: string): string | undefined => {
-    const value = context[key];
-    return typeof value === "string" && value.trim() ? value : undefined;
-  };
+  const context = parseRunContext(detail.id, row.context);
 
   return {
     runId: detail.id,
-    cwd: readString("working_directory_for_harness") ?? readString("worktree_path") ?? readString("cwd"),
+    cwd: context.working_directory_for_harness?.trim() || context.worktree_path?.trim() || context.cwd?.trim() || undefined,
   };
 }
 

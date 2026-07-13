@@ -916,6 +916,35 @@ describe("detectRugpull", () => {
       "event detail should mention Own merge",
     );
   });
+
+  it("returns isRugpull=false on corrupt context and emits run.context_corrupt event", async () => {
+    const { detectRugpull } = await import(
+      "../../dist/installer/rugpull.js"
+    );
+    const { getDb } = await import("../../dist/db.js");
+    const db = getDb();
+
+    const runId = "run-corrupt-ctx-01";
+    // Insert a run with a corrupt JSON context
+    db.prepare(
+      `INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
+       VALUES (?, 1, ?, 'test', ?, ?, 0, ?, ?)`,
+    ).run(runId, "feature-dev-merge", "failed", "{not valid json!!!", new Date().toISOString(), new Date().toISOString());
+    insertStep(db, "step-cctx-01", runId, "finalize_merge", "failed", 0, "single");
+
+    const result = detectRugpull(runId);
+    assert.equal(result.isRugpull, false, "corrupt context should not be a rugpull");
+    assert.ok(result.reason?.includes("Missing base_branch_sha"), "reason should explain");
+
+    // Verify run.context_corrupt event was emitted
+    const events = readEventsForRun(process.env.TAMANDUA_STATE_DIR!, runId);
+    const corruptEvents = events.filter((e) => e.event === "run.context_corrupt");
+    assert.equal(corruptEvents.length, 1, "should emit one run.context_corrupt event");
+    assert.ok(
+      typeof corruptEvents[0].detail === "string" && corruptEvents[0].detail.length <= 200,
+      "detail should be a bounded prefix of the raw context",
+    );
+  });
 });
 
 // ── Helpers for relaunch tests ──
@@ -1532,6 +1561,33 @@ describe("relaunchRunAfterRugpull", () => {
       undefined,
       "worktree_path should not leak from original context",
     );
+  });
+
+  it("returns relaunched=false on corrupt context and emits run.context_corrupt event", async () => {
+    const workflowId = "test-corrupt-context";
+    writeWorkflowYml(tempHome, workflowId, "direct");
+
+    const { relaunchRunAfterRugpull } = await import(
+      "../../dist/installer/rugpull.js"
+    );
+    const { getDb } = await import("../../dist/db.js");
+    const db = getDb();
+
+    const failedRunId = crypto.randomUUID();
+    // Insert a run with corrupt JSON context
+    db.prepare(
+      `INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
+       VALUES (?, 1, ?, 'test', ?, ?, 0, ?, ?)`,
+    ).run(failedRunId, workflowId, "failed", "{broken json!!!", new Date().toISOString(), new Date().toISOString());
+
+    const result = await relaunchRunAfterRugpull(failedRunId);
+    assert.equal(result.relaunched, false, "corrupt context should not produce a relaunch");
+
+    // Verify run.context_corrupt event was emitted
+    const events = readEventsForRun(process.env.TAMANDUA_STATE_DIR!, failedRunId);
+    const corruptEvents = events.filter((e) => e.event === "run.context_corrupt");
+    assert.equal(corruptEvents.length, 1, "should emit one run.context_corrupt event");
+  });
   });
 });
 

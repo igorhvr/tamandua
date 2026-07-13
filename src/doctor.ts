@@ -27,7 +27,7 @@ import {
 import type { DaemonctlPathOptions } from "./server/daemonctl.js";
 import { getBuildVersion } from "./lib/version.js";
 import { readInstalledCatalogStamp } from "./installer/catalog-version.js";
-import { parseExpectedKeys } from "./installer/step-ops.js";
+import { parseExpectedKeys, parseRunContext } from "./installer/step-ops.js";
 import { getDb } from "./db.js";
 import { runMedicCheck } from "./medic/medic.js";
 import type { MedicFinding } from "./medic/medic.js";
@@ -1045,12 +1045,7 @@ export async function runLlmPromptAdherenceChecks(opts?: DoctorOpts): Promise<Do
     let totalKeyPresence = 0;
 
     for (const run of runs) {
-      let runContext: Record<string, unknown> = {};
-      try {
-        runContext = JSON.parse(run.context);
-      } catch {
-        // Legacy / corrupt context — treat as empty
-      }
+      const runContext = parseRunContext(run.id, run.context);
 
       const steps = db.prepare(
         `SELECT step_id, input_template

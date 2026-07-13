@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { getDb } from "../db.js";
 import { emitEvent } from "./events.js";
+import { parseRunContext } from "./step-ops.js";
 import type { HarnessType } from "./types.js";
 
 /**
@@ -63,7 +64,7 @@ export function detectRugpull(runId: string): RugpullResult {
   }
 
   // 4. Get the base_branch_sha captured at run creation time
-  const context: Record<string, string> = JSON.parse(run.context);
+  const context: Record<string, string> = parseRunContext(runId, run.context);
   const baseBranchSha = context.base_branch_sha;
 
   if (!baseBranchSha) {
@@ -306,7 +307,7 @@ export async function relaunchRunAfterRugpull(
     return { relaunched: false };
   }
 
-  const context: Record<string, string> = JSON.parse(run.context);
+  const context: Record<string, string> = parseRunContext(failedRunId, run.context);
 
   // Check no_relaunch_upon_rugpull suppression flag
   if (context.no_relaunch_upon_rugpull === "true") {

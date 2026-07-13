@@ -5,6 +5,7 @@ import { validateRunWorktree } from "./worktree-manager.js";
 import type { HarnessType } from "./types.js";
 import { getDb } from "../db.js";
 import { findHermesBinary } from "./agent-scheduler.js";
+import { parseRunContext as safeParseRunContext } from "./step-ops.js";
 
 export const RUN_CONTEXT_WORKING_DIRECTORY_FOR_HARNESS_KEY = "working_directory_for_harness";
 
@@ -13,14 +14,17 @@ export interface HarnessValidationResult {
   expectedBranch?: string;
 }
 
-function parseRunContext(contextRaw: string): Record<string, unknown> {
+function parseRunContext(runId: string, contextRaw: string): Record<string, unknown> {
+  let parsed: unknown;
   try {
-    const parsed = JSON.parse(contextRaw) as unknown;
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      return parsed as Record<string, unknown>;
-    }
+    parsed = JSON.parse(contextRaw);
   } catch {
-    /* fall through */
+    // Emit event via safeParseRunContext, then throw
+    safeParseRunContext(runId, contextRaw);
+    throw new Error("run context is not valid JSON");
+  }
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    return parsed as Record<string, unknown>;
   }
   throw new Error("run context is not valid JSON");
 }
@@ -52,7 +56,7 @@ export async function validateRunHarnessForScheduling(
   runId: string,
   contextRaw: string,
 ): Promise<HarnessValidationResult> {
-  const context = parseRunContext(contextRaw);
+  const context = parseRunContext(runId, contextRaw);
   const workspaceMode = readNonEmptyString(context, "workspace_mode") ?? "direct";
 
   // Worktree mode: delegate validation to the worktree manager, which checks
@@ -145,11 +149,7 @@ export function getRunHarnessType(runId: string): HarnessType {
   const db = getDb();
   const row = db.prepare("SELECT context FROM runs WHERE id = ?").get(runId) as { context: string } | undefined;
   if (!row) return "pi";
-  try {
-    const ctx = JSON.parse(row.context) as Record<string, unknown>;
-    if (ctx.harness_type === "hermes") return "hermes";
-    return "pi";
-  } catch {
-    return "pi";
-  }
+  const ctx = safeParseRunContext(runId, row.context);
+  if (ctx.harness_type === "hermes") return "hermes";
+  return "pi";
 }
