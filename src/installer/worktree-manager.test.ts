@@ -292,6 +292,30 @@ describe("worktree-manager", () => {
       removeRunWorktree({ runId: "run-create-005", force: true });
     });
 
+    it("captures original_branch from non-default branch when origin is on a different branch", () => {
+      // Create a non-default branch on originRepo and switch to it
+      runGit(["checkout", "-b", "release-v2"], originRepo);
+      writeFileSync(path.join(originRepo, "v2.txt"), "v2 content\n", "utf-8");
+      runGit(["add", "v2.txt"], originRepo);
+      runGit(["commit", "-m", "release v2 commit"], originRepo);
+
+      const result = createRunWorktree({
+        runId: "run-create-005b",
+        runNumber: 55,
+        workflowId: "test-workflow",
+        worktreeOriginRepository: originRepo,
+      });
+
+      assert.equal(result.originalBranch, "release-v2",
+        "originalBranch should capture the non-default checked-out branch");
+      assert.equal(result.worktreeOriginRef, "release-v2",
+        "worktreeOriginRef should fall back to the checked-out branch when no explicit ref");
+
+      // Clean up: switch back to main so other tests don't break
+      runGit(["checkout", "main"], originRepo);
+      removeRunWorktree({ runId: "run-create-005b", force: true });
+    });
+
     it("uses custom cleanupPolicy when provided", () => {
       const result = createRunWorktree({
         runId: "run-create-006",

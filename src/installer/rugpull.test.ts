@@ -337,6 +337,99 @@ describe("detectRugpull", () => {
     assert.ok(result.reason?.includes("moved"), "reason should mention base moved");
   });
 
+  it("worktree mode: resolves sha against explicit worktree_origin_ref when HEAD points elsewhere (OREF)", async () => {
+    // Test that detectRugpull uses the explicit worktree_origin_ref for
+    // current sha resolution, not HEAD. When the explicit ref moved but
+    // HEAD did not, rugpull should still be detected.
+    const { detectRugpull } = await import(
+      "../../dist/installer/rugpull.js"
+    );
+    const { getDb } = await import("../../dist/db.js");
+    const db = getDb();
+
+    // Create origin repo with main (HEAD) at commit A.
+    const originDir = path.join(tempHome, "test-origin-wt-explicit-ref");
+    const commitA = initGitRepo(originDir);
+
+    // Create feature branch at commit A, then move it forward.
+    runGit(["branch", "feature"], originDir);
+    runGit(["checkout", "feature"], originDir);
+    fs.writeFileSync(path.join(originDir, "feature-work.txt"), "work");
+    runGit(["add", "feature-work.txt"], originDir);
+    runGit(["commit", "-m", "work on feature"], originDir);
+    const commitB = runGit(["rev-parse", "HEAD"], originDir);
+    assert.notEqual(commitB, commitA);
+
+    // Switch HEAD back to main at commit A.
+    runGit(["checkout", "main"], originDir);
+    const headNow = runGit(["rev-parse", "HEAD"], originDir);
+    assert.equal(headNow, commitA, "HEAD is back on main at commit A");
+
+    // Verify feature is at commit B.
+    const featureNow = runGit(["rev-parse", "feature"], originDir);
+    assert.equal(featureNow, commitB, "feature is at commit B");
+
+    // Run context: base was at commit A, explicit ref is feature → moved to B.
+    const runId = "run-wt-explicit-ref-01";
+    insertRun(db, runId, "bug-fix-merge-worktree", {
+      repo: path.join(originDir, "wt"),
+      working_directory_for_harness: path.join(originDir, "wt"),
+      base_branch_sha: commitA!,
+      workspace_mode: "worktree",
+      worktree_path: path.join(originDir, "wt"),
+      worktree_origin_repository: originDir,
+      worktree_origin_ref: "feature",
+      worktree_origin_sha: commitA!,
+    }, "failed");
+    insertStep(db, "step-wt-er-01", runId, "finalize_merge", "failed", 0, "single");
+    insertWorktree(db, runId, originDir, { worktreeOriginRef: "feature" });
+
+    const result = detectRugpull(runId);
+    assert.equal(result.isRugpull, true,
+      "should detect rugpull when explicit worktree_origin_ref moved even though HEAD did not");
+    assert.ok(result.reason?.includes("moved"), "reason should mention base moved");
+  });
+
+  it("worktree mode: falls back to HEAD when worktree_origin_ref is not in context (OREF)", async () => {
+    // Test that when worktree_origin_ref is absent from the run context,
+    // detectRugpull falls back to HEAD in the origin repo for sha resolution.
+    const { detectRugpull } = await import(
+      "../../dist/installer/rugpull.js"
+    );
+    const { getDb } = await import("../../dist/db.js");
+    const db = getDb();
+
+    // Create origin repo at commit A, then move HEAD forward to commit B.
+    const originDir = path.join(tempHome, "test-origin-wt-head-fallback");
+    const commitA = initGitRepo(originDir);
+    const commitB = makeCommit(originDir, "HEAD moves forward");
+    assert.notEqual(commitB, commitA);
+
+    // HEAD is at commit B now.
+    const headNow = runGit(["rev-parse", "HEAD"], originDir);
+    assert.equal(headNow, commitB);
+
+    // Run context: no worktree_origin_ref key → must fall back to HEAD.
+    const runId = "run-wt-head-fallback-01";
+    insertRun(db, runId, "bug-fix-merge-worktree", {
+      repo: path.join(originDir, "wt"),
+      working_directory_for_harness: path.join(originDir, "wt"),
+      base_branch_sha: commitA!,
+      workspace_mode: "worktree",
+      worktree_path: path.join(originDir, "wt"),
+      worktree_origin_repository: originDir,
+      worktree_origin_sha: commitA!,
+      // Deliberately omit worktree_origin_ref — should fall back to HEAD
+    }, "failed");
+    insertStep(db, "step-wt-hf-01", runId, "finalize_merge", "failed", 0, "single");
+    insertWorktree(db, runId, originDir);
+
+    const result = detectRugpull(runId);
+    assert.equal(result.isRugpull, true,
+      "should detect rugpull via HEAD fallback when worktree_origin_ref is absent");
+    assert.ok(result.reason?.includes("moved"), "reason should mention base moved");
+  });
+
   it("direct mode: does NOT false-rugpull when HEAD is on feature branch but base branch is unchanged", async () => {
     // Regression: after a final-merge failure, HEAD may be on the feature
     // branch, but the base branch (original_branch) did not move.
@@ -1587,7 +1680,6 @@ describe("relaunchRunAfterRugpull", () => {
     const events = readEventsForRun(process.env.TAMANDUA_STATE_DIR!, failedRunId);
     const corruptEvents = events.filter((e) => e.event === "run.context_corrupt");
     assert.equal(corruptEvents.length, 1, "should emit one run.context_corrupt event");
-  });
   });
 });
 

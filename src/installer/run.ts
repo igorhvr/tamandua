@@ -305,7 +305,7 @@ export async function runWorkflow(
       managedWorktree.worktreeOriginRepository;
     seededContext.worktree_origin_ref = managedWorktree.worktreeOriginRef;
     seededContext.worktree_origin_sha = managedWorktree.worktreeOriginSha;
-    seededContext.original_branch = managedWorktree.originalBranch ?? "";
+    seededContext.original_branch = worktreeOriginRef ?? managedWorktree.originalBranch ?? "";
     seededContext.base_branch_sha = managedWorktree.worktreeOriginSha;
 
     // Store tree hash of the base commit for self-merge detection — resolved at

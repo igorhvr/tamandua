@@ -826,4 +826,240 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
       }
     },
   );
+
+  // ── feature-dev-merge-worktree: non-default branch via --worktree-origin-ref ──
+
+  const OREF_BRANCH = "feature/scripted-oref-test";
+  const OREF_MERGE_TARGET = "alt-branch";
+
+  const OREF_WORK_TOKENS = 111;
+  const FEATURE_DEV_AGENTS = ["planner", "setup", "developer", "verifier", "tester", "merger"];
+
+  const featureDevOrefBehaviors: ScriptedAgentConfig = {
+    agents: {
+      planner: {
+        output: [
+          "STATUS: done",
+          "REPO: {{cwd}}",
+          `BRANCH: ${OREF_BRANCH}`,
+          `STORIES_JSON: [{"id":"US-001","title":"OREF non-default branch merge test","description":"Add a test marker file to verify the merge lands on the correct branch when --worktree-origin-ref targets a non-default branch","acceptanceCriteria":["Test marker file exists","Build passes","Typecheck passes"]}]`,
+        ].join("\n"),
+      },
+      setup: {
+        commands: [`git checkout -b ${OREF_BRANCH}`],
+        output: [
+          "STATUS: done",
+          "ORIGINAL_BRANCH: {{input.ORIGINAL_BRANCH}}",
+          "BUILD_CMD: npm run build",
+          "TEST_CMD: npm test",
+          "BASELINE: fixture project ready",
+        ].join("\n"),
+      },
+      developer: {
+        writes: [{ file: "src/oref-marker.ts", content: "// OREF non-default branch merge test marker\n" }],
+        commands: [
+          "git add -A",
+          `git commit -m "feat: US-001 - OREF non-default branch merge test marker"`,
+        ],
+        output: [
+          "STATUS: done",
+          "CHANGES: Added src/oref-marker.ts test marker file",
+          "TESTS: Verified build passes",
+        ].join("\n"),
+      },
+      verifier: {
+        output: ["STATUS: done", "VERIFIED: src/oref-marker.ts exists, build passes"].join("\n"),
+      },
+      tester: {
+        output: [
+          "STATUS: done",
+          "RESULTS: Full test suite passes, oref-marker.ts verified",
+          "TESTED_TREE: scripted-oref-tree",
+        ].join("\n"),
+      },
+      merger: {
+        commands: [
+          `git -C "{{input.WORKTREE_ORIGIN_REPOSITORY}}" checkout "{{input.ORIGINAL_BRANCH}}"`,
+          `git -C "{{input.WORKTREE_ORIGIN_REPOSITORY}}" merge --squash ${OREF_BRANCH}`,
+          `git -C "{{input.WORKTREE_ORIGIN_REPOSITORY}}" commit -m "feat: OREF non-default branch merge test (squash of ${OREF_BRANCH})"`,
+        ],
+        output: [
+          "STATUS: done",
+          "REBASED: false",
+          "MERGE_COMMIT: scripted-oref",
+          "MERGED_INTO: {{input.ORIGINAL_BRANCH}}",
+        ].join("\n"),
+      },
+    },
+  };
+
+  it(
+    "feature-dev-merge-worktree: --worktree-origin-ref targets non-default branch — merge lands on that branch, not the checkout (OREF)",
+    { timeout: 240_000 },
+    async () => {
+      let ctx: ScriptedRunContext | undefined;
+      try {
+        ctx = await startScriptedEnvironment("feature-dev-merge-worktree", featureDevOrefBehaviors);
+        const repoDir = prepareGitRepo(fixtureDir, path.join(ctx.env.root, "origin-repo"));
+
+        // Create alt-branch at the same commit, add a marker, then switch back to main.
+        // main is checked out in the origin repo — if the OREF fix works, the merger
+        // will target alt-branch (not main) because --worktree-origin-ref overrides
+        // the checked-out branch.
+        execSync(`git checkout -b ${OREF_MERGE_TARGET}`, { cwd: repoDir });
+        execSync(`git commit --allow-empty -m "marker: alt-branch exists"`, { cwd: repoDir });
+        execSync("git checkout main", { cwd: repoDir });
+
+        const runIdPrefix = await spawnWorkflowRun(
+          [
+            "workflow",
+            "run",
+            "feature-dev-merge-worktree",
+            "Test OREF non-default branch merge target",
+            "--worktree-origin-repository",
+            repoDir,
+            "--worktree-origin-ref",
+            OREF_MERGE_TARGET,
+          ],
+          baseEnv(ctx.env.homeDir, ctx.env.controlPort),
+        );
+        const runId = resolveFullRunId(runIdPrefix, ctx.env.tamanduaDir);
+
+        const status = await waitForRun(ctx, runId, 180_000);
+        assert.ok(
+          status === "completed" || status === "done",
+          `run should complete, got "${status}"\n${diagnostics(ctx)}`,
+        );
+
+        // ── Pipeline state: every step done, none failed ──
+        const steps = dbRows<{ step_id: string; status: string }>(
+          ctx.env.tamanduaDir,
+          "SELECT step_id, status FROM steps WHERE run_id = ? ORDER BY step_index",
+          runId,
+        );
+        assert.equal(
+          steps.length,
+          6,
+          `expected 6 steps (plan, setup, implement, verify, test, finalize_merge), got ${JSON.stringify(steps)}`,
+        );
+        for (const step of steps) {
+          assert.equal(
+            step.status,
+            "done",
+            `step ${step.step_id} should be done, got ${step.status}\n${diagnostics(ctx)}`,
+          );
+        }
+
+        // ── Repository outcome: merge landed on alt-branch, NOT main ──
+        // alt-branch should have the oref-marker.ts from the squash merge
+        execSync(`git checkout ${OREF_MERGE_TARGET}`, { cwd: repoDir });
+        const altMarker = fs.readFileSync(path.join(repoDir, "src", "oref-marker.ts"), "utf-8");
+        assert.ok(
+          altMarker.includes("OREF non-default branch merge test marker"),
+          `alt-branch should contain oref-marker.ts from the merge:\n${altMarker}`,
+        );
+
+        // alt-branch git log should show: marker commit + squash merge (= 2 commits past initial)
+        const altLog = execSync("git log --oneline", { cwd: repoDir, encoding: "utf-8" }).trim();
+        const altLogLines = altLog.split("\n");
+        assert.ok(
+          altLogLines.length >= 3,
+          `alt-branch should have at least 3 commits (initial + marker + squash), got ${altLogLines.length}:\n${altLog}`,
+        );
+        assert.ok(
+          altLogLines.some((l) => l.includes("OREF non-default branch merge test")),
+          `alt-branch log should contain the squash merge commit:\n${altLog}`,
+        );
+
+        // main should NOT have oref-marker.ts
+        execSync("git checkout main", { cwd: repoDir });
+        assert.ok(
+          !fs.existsSync(path.join(repoDir, "src", "oref-marker.ts")),
+          "main should NOT contain oref-marker.ts — merge should have landed on alt-branch, not main",
+        );
+
+        // main should have only the initial commit (no squash merge)
+        const mainLog = execSync("git log --oneline", { cwd: repoDir, encoding: "utf-8" }).trim();
+        const mainLogLines = mainLog.split("\n");
+        assert.equal(
+          mainLogLines.length,
+          1,
+          `main should have exactly 1 commit (initial), got ${mainLogLines.length}:\n${mainLog}`,
+        );
+
+        // ── Origin repo not left dirty ──
+        const porcelain = execSync("git status --porcelain", { cwd: repoDir, encoding: "utf-8" });
+        assert.equal(porcelain.trim(), "", `origin repo left dirty:\n${porcelain}`);
+
+        // ── No progress-* files leaked into the origin repo ──
+        const progressFiles = fs.readdirSync(repoDir).filter((f) => f.startsWith("progress-"));
+        assert.equal(
+          progressFiles.length,
+          0,
+          `origin repo contains leaked progress files: ${progressFiles.join(", ")}`,
+        );
+
+        // ── Motor contract: each agent did exactly one work round ──
+        for (const agent of FEATURE_DEV_AGENTS) {
+          const workRounds = ctx.scripted.workInvocations(agent);
+          assert.equal(
+            workRounds.length,
+            1,
+            `agent ${agent} should do exactly 1 work round, got ${workRounds.length}\n${diagnostics(ctx)}`,
+          );
+        }
+
+        // ── Token accounting: work usage attributed to the run ──
+        const run = dbRow<{ tokens_spent: number }>(
+          ctx.env.tamanduaDir,
+          "SELECT tokens_spent FROM runs WHERE id = ?",
+          runId,
+        );
+        assert.ok(
+          run.tokens_spent >= FEATURE_DEV_AGENTS.length * OREF_WORK_TOKENS,
+          `tokens_spent should include ${FEATURE_DEV_AGENTS.length} work rounds ` +
+            `(≥${FEATURE_DEV_AGENTS.length * OREF_WORK_TOKENS}), got ${run.tokens_spent}`,
+        );
+
+        // ── Terminal event carries token spend ──
+        const events = readRunEvents(ctx.env.tamanduaDir, runId);
+        const completed = events.find((e) => e.event === "run.completed");
+        assert.ok(completed, `run.completed event missing; events: ${events.map((e) => e.event).join(", ")}`);
+        assert.equal(typeof completed.tokensSpent, "number", "run.completed should carry tokensSpent");
+
+        // ── Deterministic motor: zero heartbeats, zero system tokens ──
+        const heartbeats = ctx.scripted.heartbeats();
+        const stats = dbRow<{ system_tokens_spent: number }>(
+          ctx.env.tamanduaDir,
+          "SELECT system_tokens_spent FROM tamandua_stats WHERE id = 1",
+        );
+        assert.equal(
+          heartbeats.length,
+          0,
+          `deterministic motor must never spawn a harness without pending work (N2) — ` +
+            `got ${heartbeats.length} heartbeat invocations\n${diagnostics(ctx)}`,
+        );
+        assert.equal(
+          stats.system_tokens_spent,
+          0,
+          `idle dispatch must spend zero system tokens (N1) — got ${stats.system_tokens_spent}\n${diagnostics(ctx)}`,
+        );
+        assert.equal(
+          ctx.scripted.readInvocations().filter((inv) => inv.phase === "work").length,
+          FEATURE_DEV_AGENTS.length,
+          `harness invocations should equal executed work rounds (N2)`,
+        );
+
+        console.log(
+          `[scripted-e2e OREF] feature-dev-merge-worktree with --worktree-origin-ref ${OREF_MERGE_TARGET}: ` +
+            `${ctx.scripted.workInvocations().length} work rounds, ` +
+            `${heartbeats.length} heartbeat rounds, ` +
+            `${run.tokens_spent} work tokens, ` +
+            `${stats.system_tokens_spent} system tokens`,
+        );
+      } finally {
+        await teardown(ctx);
+      }
+    },
+  );
 });

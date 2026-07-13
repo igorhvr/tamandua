@@ -809,6 +809,124 @@ describe("runWorkflow", () => {
       assert.equal(ctx.no_relaunch_upon_rugpull, "false",
         "no_relaunch_upon_rugpull should default to 'false' when flag is not set");
     });
+
+    // ── original_branch context tests for worktree mode (OREF) ──
+
+    it("sets original_branch to explicit worktreeOriginRef when provided", async () => {
+      const workflowId = "test-ctx-ob-wt-explicit";
+      writeMinimalWorkflow(tempHome, workflowId, "worktree");
+      const originDir = path.join(tempHome, "test-origin-ob-explicit");
+      initGitRepo(originDir);
+
+      // Create a second branch and commit on it so we have a different ref
+      runGit(["checkout", "-b", "feature-branch"], originDir);
+      fs.writeFileSync(path.join(originDir, "feature.txt"), "feature work\n", "utf-8");
+      runGit(["add", "feature.txt"], originDir);
+      runGit(["commit", "-m", "feature commit"], originDir);
+      const featureSha = runGit(["rev-parse", "HEAD"], originDir)!;
+
+      // Switch origin back to main — explicit worktreeOriginRef should override
+      runGit(["checkout", "main"], originDir);
+
+      try {
+        await runWorkflow({
+          workflowId,
+          taskTitle: "Test original_branch with explicit worktreeOriginRef",
+          worktreeOriginRepository: originDir,
+          worktreeOriginRef: "feature-branch",
+        });
+      } catch {
+        // Daemon registration may fail after persisting the run
+      }
+
+      const { getDb } = await import("../../dist/db.js");
+      const db = getDb();
+      const rows = db.prepare(
+        "SELECT context FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1"
+      ).all(workflowId) as { context: string }[];
+      assert.ok(rows.length > 0, "run record should exist");
+      const ctx = JSON.parse(rows[0].context);
+      assert.equal(ctx.original_branch, "feature-branch",
+        "original_branch should equal explicit worktreeOriginRef, not the checkout branch");
+      assert.equal(ctx.worktree_origin_ref, "feature-branch",
+        "worktree_origin_ref should equal the explicit ref");
+      assert.equal(ctx.worktree_origin_sha, featureSha,
+        "worktree_origin_sha should resolve the explicit ref's SHA");
+      assert.equal(ctx.base_branch_sha, featureSha,
+        "base_branch_sha should resolve the explicit ref's SHA");
+    });
+
+    it("sets original_branch from origin checkout when no worktreeOriginRef", async () => {
+      const workflowId = "test-ctx-ob-wt-fallback";
+      writeMinimalWorkflow(tempHome, workflowId, "worktree");
+      const originDir = path.join(tempHome, "test-origin-ob-fallback");
+      initGitRepo(originDir);
+
+      // Create a second branch and switch to it — original_branch should capture it
+      runGit(["checkout", "-b", "alt-branch"], originDir);
+      fs.writeFileSync(path.join(originDir, "alt.txt"), "alt content\n", "utf-8");
+      runGit(["add", "alt.txt"], originDir);
+      runGit(["commit", "-m", "alt branch commit"], originDir);
+      const altSha = runGit(["rev-parse", "HEAD"], originDir)!;
+
+      try {
+        await runWorkflow({
+          workflowId,
+          taskTitle: "Test original_branch fallback to checkout",
+          worktreeOriginRepository: originDir,
+          // No worktreeOriginRef — should fall back to checked-out branch
+        });
+      } catch {
+        // Daemon registration may fail after persisting the run
+      }
+
+      const { getDb } = await import("../../dist/db.js");
+      const db = getDb();
+      const rows = db.prepare(
+        "SELECT context FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1"
+      ).all(workflowId) as { context: string }[];
+      assert.ok(rows.length > 0, "run record should exist");
+      const ctx = JSON.parse(rows[0].context);
+      assert.equal(ctx.original_branch, "alt-branch",
+        "original_branch should match the origin repo's checked-out branch when no worktreeOriginRef");
+      assert.equal(ctx.worktree_origin_ref, "alt-branch",
+        "worktree_origin_ref should fall back to checkout branch");
+      assert.equal(ctx.worktree_origin_sha, altSha,
+        "worktree_origin_sha should resolve the checkout branch's SHA");
+    });
+
+    it("preserves direct mode original_branch behavior unchanged", async () => {
+      const workflowId = "test-ctx-ob-direct-unchanged";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      const repoDir = path.join(tempHome, "test-repo-ob-direct");
+      initGitRepo(repoDir);
+
+      // Check out a different branch so we can verify it's captured
+      runGit(["checkout", "-b", "dev-branch"], repoDir);
+      const devSha = runGit(["rev-parse", "HEAD"], repoDir)!;
+
+      try {
+        await runWorkflow({
+          workflowId,
+          taskTitle: "Test direct mode original_branch unchanged",
+          workingDirectoryForHarness: repoDir,
+        });
+      } catch {
+        // Daemon registration may fail after persisting the run
+      }
+
+      const { getDb } = await import("../../dist/db.js");
+      const db = getDb();
+      const rows = db.prepare(
+        "SELECT context FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1"
+      ).all(workflowId) as { context: string }[];
+      assert.ok(rows.length > 0, "run record should exist");
+      const ctx = JSON.parse(rows[0].context);
+      assert.equal(ctx.original_branch, "dev-branch",
+        "direct mode original_branch should be the checked-out branch");
+      assert.equal(ctx.base_branch_sha, devSha,
+        "direct mode base_branch_sha should be HEAD");
+    });
   });
 
   describe("LNCH false failure after run creation (regression)", () => {
