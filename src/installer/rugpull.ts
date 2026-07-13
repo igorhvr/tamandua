@@ -19,7 +19,9 @@ export interface RugpullResult {
  * the finalize_merge step, and the base branch tip has moved since
  * the run started.
  *
- * Does NOT emit events — callers are responsible for event emission.
+ * May emit rugpull.self_merge_detected events when tree comparison reveals
+ * an own-merge-already-landed scenario. Callers are responsible for all other
+ * event emission.
  */
 export function detectRugpull(runId: string): RugpullResult {
   const db = getDb();
@@ -142,6 +144,70 @@ export function detectRugpull(runId: string): RugpullResult {
       isRugpull: false,
       reason: "Base branch SHA has not changed since run started",
     };
+  }
+
+  // 7. Self-merge detection: when tested_tree is available and the base
+  //    branch has moved, compare the current tip's tree with the tree
+  //    captured at run creation. If they match, the run's own merge
+  //    already landed — suppress the rugpull.
+  const testedTree = context.tested_tree;
+  if (testedTree && testedTree.length > 0) {
+    let currentTree: string;
+    try {
+      if (workspaceMode === "worktree") {
+        // Re-query for cwd (validated in step 5)
+        const wt = db
+          .prepare(
+            "SELECT worktree_origin_repository FROM run_worktrees WHERE run_id = ? LIMIT 1",
+          )
+          .get(runId) as
+          | { worktree_origin_repository: string }
+          | undefined;
+        if (!wt) throw new Error("Worktree record not found");
+        currentTree = execFileSync(
+          "git",
+          ["rev-parse", `${currentSha}^{tree}`],
+          {
+            cwd: wt.worktree_origin_repository,
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "pipe"],
+          },
+        ).trim();
+      } else {
+        const repo =
+          context.repo || context.working_directory_for_harness;
+        if (!repo) throw new Error("No repository path available in run context");
+        currentTree = execFileSync(
+          "git",
+          ["rev-parse", `${currentSha}^{tree}`],
+          {
+            cwd: repo,
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "pipe"],
+          },
+        ).trim();
+      }
+    } catch {
+      // Tree resolution failed — fall back to existing rugpull behavior
+      return {
+        isRugpull: true,
+        reason: `Base branch moved from ${baseBranchSha.slice(0, 7)} to ${currentSha.slice(0, 7)}`,
+      };
+    }
+
+    if (currentTree === testedTree) {
+      emitEvent({
+        ts: new Date().toISOString(),
+        event: "rugpull.self_merge_detected",
+        runId,
+        workflowId: run.workflow_id,
+        detail: `Own merge already landed — tested_tree matches current tip tree (base_branch_sha: ${baseBranchSha}, currentSha: ${currentSha})`,
+      });
+      return {
+        isRugpull: false,
+        reason: "own merge already landed",
+      };
+    }
   }
 
   return {

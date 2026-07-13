@@ -722,6 +722,200 @@ describe("detectRugpull", () => {
     assert.ok(result.reason.includes(shaBefore!.slice(0, 7)), "reason should include old SHA prefix");
     assert.ok(result.reason.includes(newSha.slice(0, 7)), "reason should include new SHA prefix");
   });
+
+  // ── Self-merge detection (US-002) ──
+
+  it("returns isRugpull=false and emits self_merge_detected when tested_tree matches current tip tree (direct mode)", async () => {
+    const { detectRugpull } = await import(
+      "../../dist/installer/rugpull.js"
+    );
+    const { getDb } = await import("../../dist/db.js");
+    const db = getDb();
+
+    // Create a repo with initial commit, then a second commit.
+    const dir = path.join(tempHome, "test-self-merge-direct");
+    const initialSha = initGitRepo(dir);
+    const newSha = makeCommit(dir, "second commit");
+    assert.notEqual(newSha, initialSha);
+
+    // Resolve the tree hash of the second commit (the current tip)
+    const newTree = runGit(["rev-parse", `${newSha}^{tree}`], dir)!;
+    assert.ok(newTree, "should resolve tree hash");
+    assert.equal(newTree.length, 40, "tree hash should be 40 chars");
+    assert.notEqual(newTree, newSha, "tree hash should differ from commit hash");
+
+    const runId = "run-self-merge-direct-01";
+    insertRun(db, runId, "feature-dev-merge", {
+      repo: dir,
+      working_directory_for_harness: dir,
+      base_branch_sha: initialSha,
+      tested_tree: newTree,
+      workspace_mode: "direct",
+    }, "failed");
+    insertStep(db, "step-sm-01", runId, "finalize_merge", "failed", 0, "single");
+
+    const result = detectRugpull(runId);
+    assert.equal(result.isRugpull, false, "should suppress rugpull when tree matches");
+    assert.equal(result.reason, "own merge already landed");
+
+    // Verify event was emitted
+    const events = readEventsForRun(
+      process.env.TAMANDUA_STATE_DIR!,
+      runId,
+    );
+    const selfMergeEvents = events.filter(
+      (e) => e.event === "rugpull.self_merge_detected",
+    );
+    assert.equal(selfMergeEvents.length, 1, "should emit one self_merge_detected event");
+    assert.equal(selfMergeEvents[0].runId, runId);
+    assert.ok(
+      String(selfMergeEvents[0].detail).includes("Own merge"),
+      "event detail should mention Own merge",
+    );
+    // Verify no rugpull_detected event was emitted
+    const rugpullEvents = events.filter(
+      (e) => e.event === "run.rugpull_detected",
+    );
+    assert.equal(rugpullEvents.length, 0, "should NOT emit rugpull_detected when tree matches");
+  });
+
+  it("returns isRugpull=true when tested_tree is present but differs from current tip tree (direct mode)", async () => {
+    const { detectRugpull } = await import(
+      "../../dist/installer/rugpull.js"
+    );
+    const { getDb } = await import("../../dist/db.js");
+    const db = getDb();
+
+    // Create a repo with initial commit and second commit.
+    const dir = path.join(tempHome, "test-tree-differs-direct");
+    const initialSha = initGitRepo(dir);
+    const newSha = makeCommit(dir, "second commit");
+    assert.notEqual(newSha, initialSha);
+
+    // Get the tree of the initial commit (different from newSha's tree)
+    const initialTree = runGit(["rev-parse", `${initialSha}^{tree}`], dir)!;
+    assert.ok(initialTree, "should resolve initial tree hash");
+    const newTree = runGit(["rev-parse", `${newSha}^{tree}`], dir)!;
+    assert.notEqual(initialTree, newTree, "trees should differ");
+
+    // Run has tested_tree = initial commit's tree, but current tip is newSha
+    // with a different tree → rugpull should still be detected.
+    const runId = "run-tree-differs-01";
+    insertRun(db, runId, "feature-dev-merge", {
+      repo: dir,
+      working_directory_for_harness: dir,
+      base_branch_sha: initialSha,
+      tested_tree: initialTree,
+      workspace_mode: "direct",
+    }, "failed");
+    insertStep(db, "step-td-01", runId, "finalize_merge", "failed", 0, "single");
+
+    const result = detectRugpull(runId);
+    assert.equal(result.isRugpull, true, "should detect rugpull when trees differ");
+    assert.ok(result.reason?.includes("moved"), "reason should mention base moved");
+
+    // Verify no self_merge_detected event was emitted
+    const events = readEventsForRun(
+      process.env.TAMANDUA_STATE_DIR!,
+      runId,
+    );
+    const selfMergeEvents = events.filter(
+      (e) => e.event === "rugpull.self_merge_detected",
+    );
+    assert.equal(selfMergeEvents.length, 0, "should NOT emit self_merge_detected when trees differ");
+  });
+
+  it("returns isRugpull=true when tested_tree is present but empty/absent from context (direct mode)", async () => {
+    const { detectRugpull } = await import(
+      "../../dist/installer/rugpull.js"
+    );
+    const { getDb } = await import("../../dist/db.js");
+    const db = getDb();
+
+    const shaBefore = runGit(["rev-parse", "HEAD"], repoDir);
+    const newSha = makeCommit(repoDir, "empty tested_tree test");
+    assert.notEqual(newSha, shaBefore);
+
+    // tested_tree is empty string — should behave as absent
+    const runId = "run-empty-tree-01";
+    insertRun(db, runId, "feature-dev-merge", {
+      repo: repoDir,
+      working_directory_for_harness: repoDir,
+      base_branch_sha: shaBefore!,
+      tested_tree: "",
+      workspace_mode: "direct",
+    }, "failed");
+    insertStep(db, "step-et-01", runId, "finalize_merge", "failed", 0, "single");
+
+    const result = detectRugpull(runId);
+    assert.equal(result.isRugpull, true, "empty tested_tree should behave as absent");
+    assert.ok(result.reason?.includes("moved"), "reason should mention base moved");
+
+    // Also test: tested_tree key missing entirely — should still detect rugpull
+    const runId2 = "run-no-tree-key-01";
+    insertRun(db, runId2, "feature-dev-merge", {
+      repo: repoDir,
+      working_directory_for_harness: repoDir,
+      base_branch_sha: shaBefore!,
+      workspace_mode: "direct",
+    }, "failed");
+    insertStep(db, "step-ntk-01", runId2, "finalize_merge", "failed", 0, "single");
+
+    const result2 = detectRugpull(runId2);
+    assert.equal(result2.isRugpull, true, "missing tested_tree should still detect rugpull");
+    assert.ok(result2.reason?.includes("moved"), "reason should mention base moved");
+  });
+
+  it("returns isRugpull=false and emits self_merge_detected for worktree mode when tree matches", async () => {
+    const { detectRugpull } = await import(
+      "../../dist/installer/rugpull.js"
+    );
+    const { getDb } = await import("../../dist/db.js");
+    const db = getDb();
+
+    // Create an origin repo with initial commit, then move it forward.
+    const originDir = path.join(tempHome, "test-self-merge-worktree");
+    const originInitialSha = initGitRepo(originDir);
+    const newSha = makeCommit(originDir, "second commit in origin");
+    assert.notEqual(newSha, originInitialSha);
+
+    // Resolve the tree of the new tip
+    const newTree = runGit(["rev-parse", `${newSha}^{tree}`], originDir)!;
+    assert.ok(newTree, "should resolve tree hash");
+
+    const runId = "run-self-merge-wt-01";
+    insertRun(db, runId, "bug-fix-merge-worktree", {
+      repo: path.join(originDir, "wt"),
+      working_directory_for_harness: path.join(originDir, "wt"),
+      base_branch_sha: originInitialSha,
+      tested_tree: newTree,
+      workspace_mode: "worktree",
+      worktree_path: path.join(originDir, "wt"),
+      worktree_origin_repository: originDir,
+      worktree_origin_sha: originInitialSha,
+    }, "failed");
+    insertStep(db, "step-sm-wt-01", runId, "finalize_merge", "failed", 0, "single");
+    insertWorktree(db, runId, originDir);
+
+    const result = detectRugpull(runId);
+    assert.equal(result.isRugpull, false, "should suppress rugpull when tree matches in worktree mode");
+    assert.equal(result.reason, "own merge already landed");
+
+    // Verify event
+    const events = readEventsForRun(
+      process.env.TAMANDUA_STATE_DIR!,
+      runId,
+    );
+    const selfMergeEvents = events.filter(
+      (e) => e.event === "rugpull.self_merge_detected",
+    );
+    assert.equal(selfMergeEvents.length, 1, "should emit one self_merge_detected event");
+    assert.equal(selfMergeEvents[0].runId, runId);
+    assert.ok(
+      String(selfMergeEvents[0].detail).includes("Own merge"),
+      "event detail should mention Own merge",
+    );
+  });
 });
 
 // ── Helpers for relaunch tests ──

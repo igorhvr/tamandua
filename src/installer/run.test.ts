@@ -594,6 +594,139 @@ describe("runWorkflow", () => {
       }
     });
 
+    // ── tested_tree context tests ──
+
+    it("stores tested_tree from git rev-parse for direct mode", async () => {
+      const workflowId = "test-ctx-ttree-direct";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      const repoDir = path.join(tempHome, "test-repo-ttree-direct");
+      initGitRepo(repoDir);
+
+      try {
+        await runWorkflow({
+          workflowId,
+          taskTitle: "Test tested_tree in direct mode",
+          workingDirectoryForHarness: repoDir,
+        });
+      } catch {
+        // Daemon registration may fail after persisting the run; the assertion below only needs the stored context.
+      }
+
+      const { getDb } = await import("../../dist/db.js");
+      const db = getDb();
+      const rows = db.prepare(
+        "SELECT context FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1"
+      ).all(workflowId) as { context: string }[];
+      assert.ok(rows.length > 0, "run record should exist");
+      const ctx = JSON.parse(rows[0].context);
+      assert.ok(ctx.tested_tree, "tested_tree should be present");
+      assert.equal(typeof ctx.tested_tree, "string");
+      assert.ok(ctx.tested_tree.length === 40, "tested_tree should be a full 40-char SHA");
+      assert.match(ctx.tested_tree, /^[0-9a-f]{40}$/);
+    });
+
+    it("stores tested_tree from worktree origin for worktree mode", async () => {
+      const workflowId = "test-ctx-ttree-wt";
+      writeMinimalWorkflow(tempHome, workflowId, "worktree");
+      const originDir = path.join(tempHome, "test-origin-ttree-wt");
+      initGitRepo(originDir);
+
+      try {
+        await runWorkflow({
+          workflowId,
+          taskTitle: "Test tested_tree in worktree mode",
+          worktreeOriginRepository: originDir,
+        });
+      } catch {
+        // Daemon registration may fail after persisting the run; the assertion below only needs the stored context.
+      }
+
+      const { getDb } = await import("../../dist/db.js");
+      const db = getDb();
+      const rows = db.prepare(
+        "SELECT context FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1"
+      ).all(workflowId) as { context: string }[];
+      assert.ok(rows.length > 0, "run record should exist");
+      const ctx = JSON.parse(rows[0].context);
+      assert.ok(ctx.tested_tree, "tested_tree should be present");
+      assert.equal(typeof ctx.tested_tree, "string");
+      assert.ok(ctx.tested_tree.length === 40, "tested_tree should be a full 40-char SHA");
+      assert.match(ctx.tested_tree, /^[0-9a-f]{40}$/);
+      // Verify tested_tree matches the tree of the worktree origin SHA
+      const expectedTree = spawnSync("git", ["rev-parse", `${ctx.worktree_origin_sha}^{tree}`], {
+        cwd: originDir,
+        encoding: "utf-8",
+        stdio: ["ignore", "pipe", "pipe"],
+      }).stdout.trim();
+      assert.equal(ctx.tested_tree, expectedTree, "tested_tree must match the tree hash of worktree_origin_sha");
+    });
+
+    it("stores tested_tree as empty string when base_branch_sha is empty in direct mode", async () => {
+      const workflowId = "test-ctx-ttree-empty";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      const nonGitDir = tamanduaTempDir("tamandua-non-git-ttree-");
+
+      try {
+        try {
+          await runWorkflow({
+            workflowId,
+            taskTitle: "Test tested_tree empty on git failure",
+            workingDirectoryForHarness: nonGitDir,
+          });
+        } catch {
+          // Daemon registration may fail after persisting the run; the assertion below only needs the stored context.
+        }
+
+        const { getDb } = await import("../../dist/db.js");
+        const db = getDb();
+        const rows = db.prepare(
+          "SELECT context FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1"
+        ).all(workflowId) as { context: string }[];
+        assert.ok(rows.length > 0, "run record should exist");
+        const ctx = JSON.parse(rows[0].context);
+        assert.equal(ctx.tested_tree, "",
+          "tested_tree should be empty string when base_branch_sha is empty");
+        assert.equal(ctx.base_branch_sha, "",
+          "base_branch_sha should also be empty in non-git directory");
+      } finally {
+        fs.rmSync(nonGitDir, { recursive: true, force: true });
+      }
+    });
+
+    it("stores tested_tree alongside base_branch_sha and other keys", async () => {
+      const workflowId = "test-ctx-ttree-combined";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      const repoDir = path.join(tempHome, "test-repo-ttree-combined");
+      initGitRepo(repoDir);
+
+      try {
+        await runWorkflow({
+          workflowId,
+          taskTitle: "Test tested_tree with other context",
+          workingDirectoryForHarness: repoDir,
+          noHurrySaveTokensMode: true,
+          harnessType: "hermes",
+        });
+      } catch {
+        // Daemon registration may fail after persisting the run; the assertion below only needs the stored context.
+      }
+
+      const { getDb } = await import("../../dist/db.js");
+      const db = getDb();
+      const rows = db.prepare(
+        "SELECT context FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1"
+      ).all(workflowId) as { context: string }[];
+      assert.ok(rows.length > 0, "run record should exist");
+      const ctx = JSON.parse(rows[0].context);
+      assert.ok(ctx.tested_tree, "tested_tree should be present");
+      assert.ok(ctx.base_branch_sha, "base_branch_sha should be present");
+      assert.equal(ctx.harness_type, "hermes");
+      assert.equal(ctx.no_hurry_save_tokens_mode, "true");
+      assert.equal(ctx.workspace_mode, "direct");
+      assert.notEqual(ctx.tested_tree, ctx.base_branch_sha,
+        "tested_tree (tree hash) should differ from base_branch_sha (commit hash)");
+    });
+
     it("stores harness_type alongside other context fields", async () => {
       const workflowId = "test-ctx-harness-combined";
       writeMinimalWorkflow(tempHome, workflowId, "direct");
