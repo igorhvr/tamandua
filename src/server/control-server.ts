@@ -1037,6 +1037,22 @@ export function startReconciler(): { stop: () => void } {
     try {
       const db = getDb();
 
+      // ── Stale launch-phantom sweep (LNCZ) ────────────────────────
+      // Recover legacy/crash-left runs only after a conservative 30-minute
+      // grace period and only while both launch artifacts remain absent.
+      try {
+        const { recoverStaleLaunchPhantoms } = await import("../installer/run-recovery.js");
+        const sweep = recoverStaleLaunchPhantoms();
+        if (sweep.recovered > 0) {
+          logger.info("control-server: recovered stale launch phantom runs", {
+            recovered: sweep.recovered,
+            runIds: sweep.runIds,
+          });
+        }
+      } catch (err) {
+        logger.warn("control-server: stale launch phantom sweep failed", { error: String(err) });
+      }
+
       // ── Dead-worker sweep (MOTOR-CONTRACT.md C18) ────────────────
       // A previous daemon may have died (crash, reboot, kill) with work
       // rounds in flight, leaving steps 'running' under dead workers.

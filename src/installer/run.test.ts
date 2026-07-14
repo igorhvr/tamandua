@@ -323,6 +323,50 @@ describe("runWorkflow", () => {
   });
 
   describe("worktree mode: creation error handling", () => {
+    it("LNCZ fails a persisted run when a dirty origin aborts worktree creation", async () => {
+      const workflowId = "test-lncz-dirty-origin";
+      writeMinimalWorkflow(tempHome, workflowId, "worktree");
+      const originDir = path.join(tempHome, "test-lncz-dirty-origin");
+      initGitRepo(originDir);
+      fs.writeFileSync(path.join(originDir, "dirty.txt"), "uncommitted\n", "utf-8");
+
+      await assert.rejects(
+        runWorkflow({
+          workflowId,
+          taskTitle: "LNCZ dirty origin launch",
+          worktreeOriginRepository: originDir,
+        }),
+        /Failed to create managed worktree for run: origin repository has uncommitted changes/,
+      );
+
+      const { getDb } = await import("../../dist/db.js");
+      const db = getDb();
+      const row = db.prepare(
+        `SELECT id, status, context, scheduling_status, scheduling_error,
+                (SELECT COUNT(*) FROM steps WHERE run_id = runs.id) AS step_count
+         FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1`,
+      ).get(workflowId) as {
+        id: string;
+        status: string;
+        context: string;
+        scheduling_status: string | null;
+        scheduling_error: string | null;
+        step_count: number;
+      } | undefined;
+
+      assert.ok(row, "failed launch should retain an inspectable run row");
+      assert.equal(row.status, "failed");
+      assert.equal(row.scheduling_status, null);
+      assert.match(row.scheduling_error ?? "", /origin repository has uncommitted changes/);
+      assert.equal(row.step_count, 0);
+      const context = JSON.parse(row.context) as Record<string, string>;
+      assert.match(context.launch_error ?? "", /origin repository has uncommitted changes/);
+
+      const failedEvent = getRunEvents(row.id).find((event) => event.event === "run.failed");
+      assert.ok(failedEvent, "failed launch should emit run.failed");
+      assert.match(failedEvent.detail ?? "", /origin repository has uncommitted changes/);
+    });
+
     it("fails with clear error when origin is not a git repo", async () => {
       const workflowId = "test-wt-non-git";
       writeMinimalWorkflow(tempHome, workflowId, "worktree");

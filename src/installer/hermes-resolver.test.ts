@@ -531,6 +531,8 @@ describe("resolveHermesBinary", () => {
   });
 
   it("handles login-shell returning path with spaces", async () => {
+    delete process.env.TAMANDUA_HERMES_BINARY;
+
     const { root: tmpDir } = createTempHome("tamandua-test-hermes-space-login-");
 
     process.env.HOME = tmpDir;

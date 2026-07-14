@@ -53,6 +53,44 @@ export interface RunWorkflowResult {
   captureWarnings?: string[];
 }
 
+function failPersistedRunLaunch(params: {
+  runId: string;
+  workflowId: string;
+  context: Record<string, string>;
+  error: unknown;
+}): void {
+  const db = getDb();
+  const message = params.error instanceof Error
+    ? params.error.message
+    : String(params.error);
+  params.context.launch_error = message;
+
+  // Do not let secondary bookkeeping errors mask the original launch error.
+  try {
+    db.prepare(
+      `UPDATE runs
+       SET status = 'failed', context = ?, scheduling_status = NULL,
+           scheduling_requested_at = NULL, scheduling_error = ?,
+           updated_at = datetime('now')
+       WHERE id = ?`,
+    ).run(JSON.stringify(params.context), message, params.runId);
+  } catch {
+    // Best effort only; the caller rethrows the original setup failure.
+  }
+
+  try {
+    emitEvent({
+      ts: new Date().toISOString(),
+      event: "run.failed",
+      runId: params.runId,
+      workflowId: params.workflowId,
+      detail: `Launch setup failed: ${message}`,
+    });
+  } catch {
+    // Best effort only; the caller rethrows the original setup failure.
+  }
+}
+
 /**
  * Start a new workflow run.
  *
@@ -86,6 +124,7 @@ export async function runWorkflow(
   const now = new Date().toISOString();
   const runId = crypto.randomUUID();
   let runNumber: number;
+  let runPersisted = false;
 
   const workspaceMode = workflow.run?.workspace ?? "direct";
   const warnings: string[] = [];
@@ -105,6 +144,7 @@ export async function runWorkflow(
     no_relaunch_upon_rugpull: String(noRelaunchUponRugpull ?? false),
   };
 
+  try {
   if (workspaceMode === "direct") {
     if (worktreeOriginRepository) {
       throw new Error(
@@ -240,6 +280,7 @@ export async function runWorkflow(
                          created_at, updated_at)
        VALUES (?, (SELECT COALESCE(MAX(run_number), 0) + 1 FROM runs), ?, ?, 'running', ?, 0, 'pending_register', ?, ?, ?, ?)`,
     ).run(runId, workflowId, taskTitle, contextJson, now, notifyUrl ?? null, now, now);
+    runPersisted = true;
 
     // Read back the atomically allocated run_number.
     const runRow = db.prepare("SELECT run_number FROM runs WHERE id = ?").get(runId) as { run_number: number };
@@ -273,6 +314,7 @@ export async function runWorkflow(
                          created_at, updated_at)
        VALUES (?, (SELECT COALESCE(MAX(run_number), 0) + 1 FROM runs), ?, ?, 'running', ?, 0, 'pending_register', ?, ?, ?, ?)`,
     ).run(runId, workflowId, taskTitle, initialContextJson, now, notifyUrl ?? null, now, now);
+    runPersisted = true;
 
     // Read back the atomically allocated run_number.
     const runRow = db.prepare("SELECT run_number FROM runs WHERE id = ?").get(runId) as { run_number: number };
@@ -406,6 +448,17 @@ export async function runWorkflow(
   // Without this kickoff, claimStep (which only matches 'pending') would never find
   // the first step and the run would loop forever on peek=HAS_WORK / claim=NO_WORK.
   advancePipeline(runId);
+  } catch (err) {
+    if (runPersisted) {
+      failPersistedRunLaunch({
+        runId,
+        workflowId,
+        context: seededContext,
+        error: err,
+      });
+    }
+    throw err;
+  }
 
   // Once the run row exists and the pipeline is advanced, the run is live.
   // Subsequent daemon operations may fail transiently (DBLK event-loop
