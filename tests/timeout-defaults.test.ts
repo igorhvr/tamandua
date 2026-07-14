@@ -119,8 +119,8 @@ describe("CLI help text timeout default", () => {
   let content: string;
 
   before(() => {
-    const srcPath = path.join(PROJECT_ROOT, "src", "cli", "cli.ts");
-    assert.ok(fs.existsSync(srcPath), `cli.ts must exist at ${srcPath}`);
+    const srcPath = path.join(PROJECT_ROOT, "src", "cli", "commands", "autoresearch.ts");
+    assert.ok(fs.existsSync(srcPath), `autoresearch command module must exist at ${srcPath}`);
     content = fs.readFileSync(srcPath, "utf-8");
   });
 

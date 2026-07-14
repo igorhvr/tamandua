@@ -17,9 +17,8 @@ const repoRoot = path.resolve(__dirname, "..");
 const pkgPath = path.join(repoRoot, "package.json");
 const versionPath = path.join(repoRoot, "dist", "version");
 
-// Files that may contain __VERSION__ placeholders to inject into
+// The standalone command module owns BUILT_VERSION after the SPL2 extraction.
 const injectTargets = [
-  path.join(repoRoot, "dist", "cli", "cli.js"),
   path.join(repoRoot, "dist", "cli", "commands", "standalone.js"),
 ];
 

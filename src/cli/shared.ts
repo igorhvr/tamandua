@@ -76,5 +76,6 @@ export function shouldSkipUpdateWarning(group: string, action: string): boolean 
   if (group === "version" || group === "--version" || group === "-v") return true;
   if (group === "step" && (action === "peek" || action === "claim")) return true;
   if (group === "nudge") return true;
+  if (group === "merge-branch") return true;
   return false;
 }
