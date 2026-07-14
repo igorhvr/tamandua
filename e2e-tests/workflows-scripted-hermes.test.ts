@@ -286,8 +286,6 @@ describe("scripted-hermes full pipeline (real daemon/scheduler, zero tokens)", {
         ctx = await startHermesScriptedEnvironment("bug-fix-merge-worktree", bugFixBehaviors);
         const repoDir = prepareGitRepo(fixtureDir, path.join(ctx.env.root, "origin-repo"));
         const originalBranch = execSync("git symbolic-ref --short HEAD", { cwd: repoDir, encoding: "utf-8" }).trim();
-        const originMathBefore = fs.readFileSync(path.join(repoDir, "src", "math.ts"), "utf-8");
-        const originIndexBefore = execSync("git write-tree", { cwd: repoDir, encoding: "utf-8" }).trim();
 
         // Pass --hermes-as-harness AND the hermes env (so validateRunHarnessForScheduling
         // can find the fake hermes binary).
@@ -323,19 +321,20 @@ describe("scripted-hermes full pipeline (real daemon/scheduler, zero tokens)", {
           assert.equal(step.status, "done", `step ${step.step_id} should be done, got ${step.status}`);
         }
 
-        // ── Repository outcome: the target ref landed the fix without touching origin state ──
+        // ── Repository outcome: the target ref and checked-out origin landed the fix ──
         const targetMath = execSync(`git show "refs/heads/${originalBranch}:src/math.ts"`, {
           cwd: repoDir,
           encoding: "utf-8",
         });
         assert.ok(targetMath.includes("a + b"), `target ref math.ts should be fixed:\n${targetMath}`);
         assert.ok(!targetMath.includes("a - b"), `target ref math.ts should not keep the bug:\n${targetMath}`);
-        assert.equal(fs.readFileSync(path.join(repoDir, "src", "math.ts"), "utf-8"), originMathBefore);
-        assert.equal(execSync("git write-tree", { cwd: repoDir, encoding: "utf-8" }).trim(), originIndexBefore);
+        assert.equal(fs.readFileSync(path.join(repoDir, "src", "math.ts"), "utf-8"), targetMath);
         const mergedTree = execSync(`git rev-parse "refs/heads/${originalBranch}^{tree}"`, {
           cwd: repoDir,
           encoding: "utf-8",
         }).trim();
+        assert.equal(execSync("git write-tree", { cwd: repoDir, encoding: "utf-8" }).trim(), mergedTree);
+        assert.equal(execSync("git status --porcelain", { cwd: repoDir, encoding: "utf-8" }), "");
         const mergeStep = dbRow<{ output: string }>(
           ctx.env.tamanduaDir,
           "SELECT output FROM steps WHERE run_id = ? AND step_id = 'finalize_merge'",

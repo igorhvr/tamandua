@@ -61,6 +61,13 @@ function createFeature(repo: string, start: string, contents = "feature\n"): voi
   git(repo, ["switch", "main"]);
 }
 
+function createFeatureChangingBase(repo: string, start: string): void {
+  git(repo, ["switch", "-c", "feature", start]);
+  fs.writeFileSync(path.join(repo, "base.txt"), "feature change\n", "utf-8");
+  git(repo, ["commit", "-am", "feature changes base"]);
+  git(repo, ["switch", "main"]);
+}
+
 function validArgs(repo: string, expectTip: string, into = "scratch"): string[] {
   return [
     "merge-branch",
@@ -88,6 +95,8 @@ describe("tamandua merge-branch CLI", () => {
     assert.match(result.stdout, /STATUS: landed/);
     assert.match(result.stdout, /STATUS: target_moved/);
     assert.match(result.stdout, /STATUS: conflicts/);
+    assert.match(result.stdout, /CHECKOUT_REFRESH: <refreshed \| skipped:<reason> \| not-applicable>/);
+    assert.match(result.stdout, /refreshed[\s\S]*skipped:<reason>[\s\S]*not-applicable/);
     assert.match(result.stdout, /Exit codes:[\s\S]*0[\s\S]*2[\s\S]*3/);
     assert.equal(result.stderr, "");
     assert.equal(globalHelp.status, 0);
@@ -145,12 +154,61 @@ describe("tamandua merge-branch CLI", () => {
     assert.match(result.stdout, /^MERGED_COMMIT: [0-9a-f]{40}$/m);
     assert.match(result.stdout, /^MERGED_TREE: [0-9a-f]{40}$/m);
     assert.match(result.stdout, /^TARGET: refs\/heads\/scratch$/m);
+    assert.match(result.stdout, /^CHECKOUT_REFRESH: not-applicable$/m);
     assert.equal(git(repo, ["symbolic-ref", "--short", "HEAD"]), branchBefore);
     assert.equal(git(repo, ["write-tree"]), indexTreeBefore);
     assert.equal(fs.readFileSync(path.join(repo, "base.txt"), "utf-8"), baseBefore);
     assert.equal(fs.existsSync(path.join(repo, "feature.txt")), false);
     assert.equal(git(repo, ["show", "refs/heads/scratch:feature.txt"]), "feature");
     assert.equal(git(repo, ["rev-parse", "refs/heads/main"]), initial);
+  });
+
+  it("STCK reports refreshed and synchronizes a clean checked-out target", () => {
+    const { repo, initial } = createRepo();
+    createFeature(repo, initial);
+
+    const result = runCli(validArgs(repo, initial, "main"));
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /^STATUS: landed$/m);
+    assert.match(result.stdout, /^CHECKOUT_REFRESH: refreshed$/m);
+    assert.equal(fs.readFileSync(path.join(repo, "feature.txt"), "utf-8"), "feature\n");
+    assert.equal(git(repo, ["status", "--porcelain"]), "");
+    assert.equal(git(repo, ["diff", "--cached", "--name-only"]), "");
+  });
+
+  it("STCK reports skipped while preserving a touched local change", () => {
+    const { repo, initial } = createRepo();
+    createFeatureChangingBase(repo, initial);
+    const localContents = "local change\n";
+    fs.writeFileSync(path.join(repo, "base.txt"), localContents, "utf-8");
+
+    const result = runCli(validArgs(repo, initial, "main"));
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /^STATUS: landed$/m);
+    assert.match(result.stdout, /^CHECKOUT_REFRESH: skipped:.+$/m);
+    assert.equal(fs.readFileSync(path.join(repo, "base.txt"), "utf-8"), localContents);
+    assert.notEqual(git(repo, ["rev-parse", "refs/heads/main"]), initial);
+    assert.equal(git(repo, ["show", "refs/heads/main:base.txt"]), "feature change");
+  });
+
+  it("STCK reports not-applicable for a bare origin", () => {
+    const { repo, initial } = createRepo();
+    createFeature(repo, initial);
+    const cloneRoot = tamanduaTempDir("tamandua-merge-branch-cli-bare-");
+    cleanup.push(cloneRoot);
+    const bareRepo = path.join(cloneRoot, "origin.git");
+    git(repo, ["clone", "--bare", repo, bareRepo]);
+    git(bareRepo, ["config", "user.email", "test@tamandua.local"]);
+    git(bareRepo, ["config", "user.name", "Tamandua Test"]);
+
+    const result = runCli(validArgs(bareRepo, initial, "main"));
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /^STATUS: landed$/m);
+    assert.match(result.stdout, /^CHECKOUT_REFRESH: not-applicable$/m);
+    assert.notEqual(git(bareRepo, ["rev-parse", "refs/heads/main"]), initial);
   });
 
   it("prints target_moved with exit code 2", () => {

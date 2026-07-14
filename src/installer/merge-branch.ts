@@ -1,5 +1,9 @@
 import { spawnSync } from "node:child_process";
-import { emitEvent as emitTamanduaEvent, type TamanduaEvent } from "./events.js";
+import {
+  emitEvent as emitTamanduaEvent,
+  type CheckoutRefreshOutcome,
+  type TamanduaEvent,
+} from "./events.js";
 
 export const MERGE_BRANCH_EXIT_CODES = {
   landed: 0,
@@ -35,6 +39,7 @@ export type PlumbingMergeResult =
       mergedCommit: string;
       mergedTree: string;
       target: string;
+      checkoutRefresh: CheckoutRefreshOutcome;
     }
   | {
       status: "target_moved";
@@ -83,6 +88,54 @@ function runGit(origin: string, args: string[]): GitResult {
 function commandError(args: string[], result: GitResult): string {
   const diagnostics = result.stderr || result.stdout;
   return `git ${args.join(" ")} failed (exit ${result.status})${diagnostics ? `: ${diagnostics}` : ""}`;
+}
+
+function skippedRefresh(reason: string, result?: GitResult): CheckoutRefreshOutcome {
+  const diagnostics = result ? result.stderr || result.stdout : "";
+  const detail = diagnostics.replace(/\s+/g, " ").trim();
+  const suffix = detail ? `:${detail}` : "";
+  return `skipped:${reason}${suffix}`.slice(0, 512) as CheckoutRefreshOutcome;
+}
+
+function refreshCheckedOutTarget(
+  origin: string,
+  target: string,
+  expectedTip: string,
+  mergedTree: string,
+  git: (origin: string, args: string[]) => GitResult,
+): CheckoutRefreshOutcome {
+  const bareResult = git(origin, ["rev-parse", "--is-bare-repository"]);
+  if (bareResult.status !== 0) {
+    return skippedRefresh("bare-detection-failed", bareResult);
+  }
+  if (bareResult.stdout === "true") {
+    return "not-applicable";
+  }
+  if (bareResult.stdout !== "false") {
+    return skippedRefresh("bare-detection-invalid", bareResult);
+  }
+
+  const headResult = git(origin, ["symbolic-ref", "-q", "HEAD"]);
+  if (headResult.status === 1) {
+    return "not-applicable";
+  }
+  if (headResult.status !== 0) {
+    return skippedRefresh("head-detection-failed", headResult);
+  }
+  if (headResult.stdout !== target) {
+    return "not-applicable";
+  }
+
+  const oldTreeResult = git(origin, ["rev-parse", "--verify", `${expectedTip}^{tree}`]);
+  if (oldTreeResult.status !== 0 || !oldTreeResult.stdout) {
+    return skippedRefresh("old-tree-resolution-failed", oldTreeResult);
+  }
+
+  const refreshResult = git(origin, ["read-tree", "-m", "-u", oldTreeResult.stdout, mergedTree]);
+  if (refreshResult.status !== 0) {
+    return skippedRefresh("refresh-failed", refreshResult);
+  }
+  return "refreshed";
 }
 
 export function runPlumbingMerge(
@@ -202,11 +255,20 @@ export function runPlumbingMerge(
     };
   }
 
+  const checkoutRefresh = refreshCheckedOutTarget(
+    params.origin,
+    target,
+    params.expectTip,
+    mergedTree,
+    git,
+  );
+
   emit({
     ...eventBase,
     event: "merge.landed",
     mergedTree,
     mergedCommit,
+    checkoutRefresh,
   });
   return {
     status: "landed",
@@ -214,5 +276,6 @@ export function runPlumbingMerge(
     mergedCommit,
     mergedTree,
     target,
+    checkoutRefresh,
   };
 }

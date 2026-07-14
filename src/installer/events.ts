@@ -23,6 +23,8 @@ export const MAX_ROTATED_EVENTS_FILES = 3;
 
 // ── Types ────────────────────────────────────────────────────────────
 
+export type CheckoutRefreshOutcome = "refreshed" | "not-applicable" | `skipped:${string}`;
+
 export interface TamanduaEvent {
   ts: string;
   event: string;
@@ -59,6 +61,7 @@ export interface TamanduaEvent {
   actualTip?: string;
   mergedTree?: string;
   mergedCommit?: string;
+  checkoutRefresh?: CheckoutRefreshOutcome;
 }
 
 export type EventCursorSource =

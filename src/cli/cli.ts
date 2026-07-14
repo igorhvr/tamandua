@@ -563,6 +563,12 @@ Machine-readable results:
   MERGED_COMMIT: <sha>
   MERGED_TREE: <tree-sha>
   TARGET: refs/heads/<target-ref>
+  CHECKOUT_REFRESH: <refreshed | skipped:<reason> | not-applicable>
+
+Checkout refresh outcomes:
+  refreshed          Checked-out target index and worktree were synchronized
+  skipped:<reason>   Refresh was safely skipped; the merge still landed
+  not-applicable     Origin is bare or the target branch is not checked out
 
   STATUS: target_moved
 
@@ -2035,7 +2041,7 @@ async function main() {
       message: options["--message"],
     });
     if (result.status === "landed") {
-      process.stdout.write(`STATUS: landed\nMERGED_COMMIT: ${result.mergedCommit}\nMERGED_TREE: ${result.mergedTree}\nTARGET: ${result.target}\n`);
+      process.stdout.write(`STATUS: landed\nMERGED_COMMIT: ${result.mergedCommit}\nMERGED_TREE: ${result.mergedTree}\nTARGET: ${result.target}\nCHECKOUT_REFRESH: ${result.checkoutRefresh}\n`);
     } else if (result.status === "target_moved") {
       process.stdout.write("STATUS: target_moved\n");
       process.stderr.write(`${result.detail}\n`);

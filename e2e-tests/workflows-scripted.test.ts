@@ -264,8 +264,6 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
         ctx = await startScriptedEnvironment("bug-fix-merge-worktree", bugFixBehaviors);
         const repoDir = prepareGitRepo(fixtureDir, path.join(ctx.env.root, "origin-repo"));
         const originalBranch = execSync("git symbolic-ref --short HEAD", { cwd: repoDir, encoding: "utf-8" }).trim();
-        const originMathBefore = fs.readFileSync(path.join(repoDir, "src", "math.ts"), "utf-8");
-        const originIndexBefore = execSync("git write-tree", { cwd: repoDir, encoding: "utf-8" }).trim();
 
         const runIdPrefix = await spawnWorkflowRun(
           [
@@ -297,7 +295,7 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
           assert.equal(step.status, "done", `step ${step.step_id} should be done, got ${step.status}`);
         }
 
-        // ── Repository outcome: the target ref landed the fix without touching origin state ──
+        // ── Repository outcome: the target ref and checked-out origin landed the fix ──
         const targetMath = execSync(`git show "refs/heads/${originalBranch}:src/math.ts"`, {
           cwd: repoDir,
           encoding: "utf-8",
@@ -305,20 +303,30 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
         assert.ok(targetMath.includes("a + b"), `target ref math.ts should be fixed:\n${targetMath}`);
         assert.ok(!targetMath.includes("a - b"), `target ref math.ts should not keep the bug:\n${targetMath}`);
         assert.equal(
-          fs.readFileSync(path.join(repoDir, "src", "math.ts"), "utf-8"),
-          originMathBefore,
-          "plumbing landing must not rewrite the origin working-tree file",
+          execSync("git symbolic-ref --short HEAD", { cwd: repoDir, encoding: "utf-8" }).trim(),
+          originalBranch,
+          "origin should remain on its original checked-out branch",
         );
         assert.equal(
-          execSync("git write-tree", { cwd: repoDir, encoding: "utf-8" }).trim(),
-          originIndexBefore,
-          "plumbing landing must not rewrite the origin index",
+          fs.readFileSync(path.join(repoDir, "src", "math.ts"), "utf-8"),
+          targetMath,
+          "checked-out origin should contain the landed fix",
         );
 
         const mergedTree = execSync(`git rev-parse "refs/heads/${originalBranch}^{tree}"`, {
           cwd: repoDir,
           encoding: "utf-8",
         }).trim();
+        assert.equal(
+          execSync("git write-tree", { cwd: repoDir, encoding: "utf-8" }).trim(),
+          mergedTree,
+          "origin index should match the checked-out target commit tree",
+        );
+        assert.equal(
+          execSync("git status --porcelain", { cwd: repoDir, encoding: "utf-8" }),
+          "",
+          "origin checkout should be clean after the merge",
+        );
         const mergeStep = dbRow<{ output: string }>(
           ctx.env.tamanduaDir,
           "SELECT output FROM steps WHERE run_id = ? AND step_id = 'finalize_merge'",
@@ -326,13 +334,15 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
         );
         assert.match(mergeStep.output, /^STATUS: landed$/m);
         assert.match(mergeStep.output, new RegExp(`^MERGED_TREE: ${mergedTree}$`, "m"));
+        assert.match(mergeStep.output, /^CHECKOUT_REFRESH: refreshed$/m);
         const mergeEvents = fs
           .readFileSync(path.join(ctx.env.tamanduaDir, "events", `${runId}.jsonl`), "utf-8")
           .trim()
           .split("\n")
-          .map((line) => JSON.parse(line) as { event: string })
+          .map((line) => JSON.parse(line) as { event: string; checkoutRefresh?: string })
           .filter((event) => event.event.startsWith("merge."));
         assert.deepEqual(mergeEvents.map((event) => event.event), ["merge.landed"]);
+        assert.equal(mergeEvents[0]?.checkoutRefresh, "refreshed");
 
         const gitLog = execSync("git log --oneline -5", { cwd: repoDir, encoding: "utf-8" });
         assert.ok(
@@ -697,8 +707,6 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
         ctx = await startScriptedEnvironment("bug-fix-merge-worktree", rerouteBehaviors);
         const repoDir = prepareGitRepo(fixtureDir, path.join(ctx.env.root, "origin-repo"));
         const originalBranch = execSync("git symbolic-ref --short HEAD", { cwd: repoDir, encoding: "utf-8" }).trim();
-        const originMathBefore = fs.readFileSync(path.join(repoDir, "src", "math.ts"), "utf-8");
-        const originIndexBefore = execSync("git write-tree", { cwd: repoDir, encoding: "utf-8" }).trim();
 
         const runIdPrefix = await spawnWorkflowRun(
           [
@@ -793,18 +801,19 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
           `expected 0 heartbeats, got ${heartbeats.length}\n${diagnostics(ctx)}`,
         );
 
-        // ── Repository outcome: the corrected fix landed without origin state mutation ──
+        // ── Repository outcome: the corrected fix landed and refreshed the checkout ──
         const targetMath = execSync(`git show "refs/heads/${originalBranch}:src/math.ts"`, {
           cwd: repoDir,
           encoding: "utf-8",
         });
         assert.ok(targetMath.includes("a + b"), `target ref math.ts should use addition:\n${targetMath}`);
-        assert.equal(fs.readFileSync(path.join(repoDir, "src", "math.ts"), "utf-8"), originMathBefore);
-        assert.equal(execSync("git write-tree", { cwd: repoDir, encoding: "utf-8" }).trim(), originIndexBefore);
+        assert.equal(fs.readFileSync(path.join(repoDir, "src", "math.ts"), "utf-8"), targetMath);
         const mergedTree = execSync(`git rev-parse "refs/heads/${originalBranch}^{tree}"`, {
           cwd: repoDir,
           encoding: "utf-8",
         }).trim();
+        assert.equal(execSync("git write-tree", { cwd: repoDir, encoding: "utf-8" }).trim(), mergedTree);
+        assert.equal(execSync("git status --porcelain", { cwd: repoDir, encoding: "utf-8" }), "");
         const mergeStep = dbRow<{ output: string }>(
           ctx.env.tamanduaDir,
           "SELECT output FROM steps WHERE run_id = ? AND step_id = 'finalize_merge'",

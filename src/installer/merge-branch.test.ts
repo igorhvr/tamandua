@@ -57,6 +57,15 @@ function createFeature(repo: string, branch = "feature"): string {
   return featureTip;
 }
 
+function createTouchedFeature(repo: string, branch = "feature"): string {
+  git(repo, ["switch", "-c", branch]);
+  fs.writeFileSync(path.join(repo, "base.txt"), "feature version\n", "utf-8");
+  git(repo, ["commit", "-am", "feature touches base"]);
+  const featureTip = git(repo, ["rev-parse", "HEAD"]);
+  git(repo, ["switch", "main"]);
+  return featureTip;
+}
+
 afterEach(() => {
   for (const dir of cleanup.splice(0)) {
     fs.rmSync(dir, { recursive: true, force: true });
@@ -64,12 +73,10 @@ afterEach(() => {
 });
 
 describe("runPlumbingMerge", () => {
-  it("lands a squash result without changing the working tree or index", () => {
+  it("STCK refreshes a clean checked-out target after landing", () => {
     const { repo, initial } = createRepo();
     createFeature(repo);
     const events: MergeBranchEvent[] = [];
-    const indexTreeBefore = git(repo, ["write-tree"]);
-    const worktreeBaseBefore = fs.readFileSync(path.join(repo, "base.txt"), "utf-8");
     const headRefBefore = git(repo, ["symbolic-ref", "HEAD"]);
 
     const result = runPlumbingMerge(
@@ -91,9 +98,11 @@ describe("runPlumbingMerge", () => {
     assert.equal(git(repo, ["rev-parse", `${result.mergedCommit}^`]), initial);
     assert.equal(git(repo, ["rev-parse", `${result.mergedCommit}^{tree}`]), result.mergedTree);
     assert.equal(git(repo, ["show", `${result.mergedCommit}:feature.txt`]), "feature");
-    assert.equal(git(repo, ["write-tree"]), indexTreeBefore);
-    assert.equal(fs.readFileSync(path.join(repo, "base.txt"), "utf-8"), worktreeBaseBefore);
-    assert.equal(fs.existsSync(path.join(repo, "feature.txt")), false);
+    assert.equal(result.checkoutRefresh, "refreshed");
+    assert.equal(git(repo, ["write-tree"]), result.mergedTree);
+    assert.equal(fs.readFileSync(path.join(repo, "feature.txt"), "utf-8"), "feature\n");
+    assert.equal(git(repo, ["status", "--porcelain"]), "");
+    assert.equal(git(repo, ["diff", "--cached", "--name-only"]), "");
     assert.equal(git(repo, ["symbolic-ref", "HEAD"]), headRefBefore);
     assert.deepEqual(events, [
       {
@@ -106,8 +115,98 @@ describe("runPlumbingMerge", () => {
         expectedTip: initial,
         mergedTree: result.mergedTree,
         mergedCommit: result.mergedCommit,
+        checkoutRefresh: "refreshed",
       },
     ]);
+  });
+
+  it("STCK leaves the checkout untouched when landing into a non-checked-out branch", () => {
+    const { repo, initial } = createRepo();
+    createFeature(repo);
+    git(repo, ["branch", "release", initial]);
+    const events: MergeBranchEvent[] = [];
+    const indexTreeBefore = git(repo, ["write-tree"]);
+    const baseBefore = fs.readFileSync(path.join(repo, "base.txt"), "utf-8");
+
+    const result = runPlumbingMerge(
+      { origin: repo, branch: "feature", into: "release", expectTip: initial, message: "Land feature", runId: "run-other" },
+      { emitEvent: (event) => events.push(event) },
+    );
+
+    assert.equal(result.status, "landed");
+    if (result.status !== "landed") return;
+    assert.equal(result.checkoutRefresh, "not-applicable");
+    assert.equal(git(repo, ["write-tree"]), indexTreeBefore);
+    assert.equal(fs.readFileSync(path.join(repo, "base.txt"), "utf-8"), baseBefore);
+    assert.equal(fs.existsSync(path.join(repo, "feature.txt")), false);
+    assert.equal(events[0]?.checkoutRefresh, "not-applicable");
+  });
+
+  it("STCK preserves touched local changes and records a skipped refresh", () => {
+    const { repo, initial } = createRepo();
+    createTouchedFeature(repo);
+    const localBytes = "uncommitted user change\n";
+    fs.writeFileSync(path.join(repo, "base.txt"), localBytes, "utf-8");
+    const events: MergeBranchEvent[] = [];
+
+    const result = runPlumbingMerge(
+      { origin: repo, branch: "feature", into: "main", expectTip: initial, message: "Land feature", runId: "run-local" },
+      { emitEvent: (event) => events.push(event) },
+    );
+
+    assert.equal(result.status, "landed");
+    assert.equal(result.exitCode, 0);
+    if (result.status !== "landed") return;
+    assert.match(result.checkoutRefresh, /^skipped:/);
+    assert.equal(git(repo, ["rev-parse", "refs/heads/main"]), result.mergedCommit);
+    assert.equal(fs.readFileSync(path.join(repo, "base.txt"), "utf-8"), localBytes);
+    assert.equal(events[0]?.checkoutRefresh, result.checkoutRefresh);
+  });
+
+  it("STCK reports checkout refresh as not applicable for a bare origin", () => {
+    const { repo, initial } = createRepo();
+    createFeature(repo);
+    const bare = tamanduaTempDir("tamandua-merge-branch-bare-");
+    cleanup.push(bare);
+    git(bare, ["clone", "--bare", repo, "."]);
+    const events: MergeBranchEvent[] = [];
+
+    const result = runPlumbingMerge(
+      { origin: bare, branch: "feature", into: "main", expectTip: initial, message: "Land feature", runId: "run-bare" },
+      { emitEvent: (event) => events.push(event) },
+    );
+
+    assert.equal(result.status, "landed");
+    if (result.status !== "landed") return;
+    assert.equal(result.checkoutRefresh, "not-applicable");
+    assert.equal(events[0]?.checkoutRefresh, "not-applicable");
+  });
+
+  it("STCK treats an injected checkout refresh failure as a non-fatal skip", () => {
+    const { repo, initial } = createRepo();
+    createFeature(repo);
+    const events: MergeBranchEvent[] = [];
+
+    const result = runPlumbingMerge(
+      { origin: repo, branch: "feature", into: "main", expectTip: initial, message: "Land feature", runId: "run-lock" },
+      {
+        runGit: (origin, args) => {
+          if (args[0] === "read-tree") {
+            return { status: 128, stdout: "", stderr: "fatal: Unable to create '.git/index.lock': File exists." };
+          }
+          return rawGit(origin, args);
+        },
+        emitEvent: (event) => events.push(event),
+      },
+    );
+
+    assert.equal(result.status, "landed");
+    assert.equal(result.exitCode, 0);
+    if (result.status !== "landed") return;
+    assert.match(result.checkoutRefresh, /^skipped:/);
+    assert.match(result.checkoutRefresh, /index\.lock|File exists/i);
+    assert.equal(git(repo, ["rev-parse", "refs/heads/main"]), result.mergedCommit);
+    assert.equal(events[0]?.checkoutRefresh, result.checkoutRefresh);
   });
 
   it("reports preflight target movement before creating merge objects", () => {
@@ -202,7 +301,7 @@ describe("runPlumbingMerge", () => {
     assert.equal(git(repo, ["rev-parse", "refs/heads/main"]), initial);
   });
 
-  it("uses only plumbing commands against the origin", () => {
+  it("uses only guarded plumbing commands against the origin", () => {
     const commands: string[][] = [];
     const expected = "1".repeat(40);
     const tree = "2".repeat(40);
@@ -213,6 +312,7 @@ describe("runPlumbingMerge", () => {
       { status: 0, stdout: tree, stderr: "" },
       { status: 0, stdout: commit, stderr: "" },
       { status: 0, stdout: "", stderr: "" },
+      { status: 0, stdout: "true", stderr: "" },
     ];
 
     const result = runPlumbingMerge(
@@ -233,8 +333,9 @@ describe("runPlumbingMerge", () => {
       ["merge-tree", "--write-tree", expected, "refs/heads/feature"],
       ["commit-tree", tree, "-p", expected, "-m", "plumbing only"],
       ["update-ref", "refs/heads/release", commit, expected],
+      ["rev-parse", "--is-bare-repository"],
     ]);
-    assert.equal(commands.some((args) => ["checkout", "switch", "merge", "commit", "read-tree"].includes(args[0]!)), false);
+    assert.equal(commands.some((args) => ["checkout", "switch", "merge", "commit", "reset"].includes(args[0]!)), false);
   });
 
   it("does not misclassify a non-CAS update-ref failure as target movement", () => {

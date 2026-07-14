@@ -79,6 +79,7 @@ interface MergeEvent {
   actualTip?: string;
   mergedTree?: string;
   mergedCommit?: string;
+  checkoutRefresh?: string;
 }
 
 const FEATURE_COUNT = 8;
@@ -376,12 +377,14 @@ async function pollAllRunsWithNudge(
   runIds: string[],
   timeoutMs: number,
   nudgeIntervalMs = 1_500,
+  onPoll?: () => void,
 ): Promise<Map<string, string>> {
   const startedAt = Date.now();
   const statuses = new Map<string, string>();
   const pending = new Set(runIds.map((_, i) => i));
 
   while (Date.now() - startedAt < timeoutMs && pending.size > 0) {
+    onPoll?.();
     for (const i of [...pending]) {
       const runEnv = runEnvs[i];
       const runId = runIds[i];
@@ -451,12 +454,7 @@ describe("concurrent-runs stress test", { concurrency: 1 }, () => {
         const originalBranch = execSync("git symbolic-ref --short HEAD", { cwd: repoDir, encoding: "utf-8" }).trim();
         const initialTip = execSync(`git rev-parse "refs/heads/${originalBranch}"`, { cwd: repoDir, encoding: "utf-8" }).trim();
         const originIndexBefore = execSync("git write-tree", { cwd: repoDir, encoding: "utf-8" }).trim();
-        const originFilesBefore = new Map(
-          Array.from({ length: FEATURE_COUNT }, (_, i) => featureInfo(i + 1)).map((fi) => [
-            fi.file,
-            fs.readFileSync(path.join(repoDir, fi.file), "utf-8"),
-          ]),
-        );
+        const sampledOriginIndexTrees = new Set([originIndexBefore]);
 
         // ── Create 8 isolated daemon environments ──────────────────
         for (let i = 1; i <= FEATURE_COUNT; i++) {
@@ -504,6 +502,10 @@ describe("concurrent-runs stress test", { concurrency: 1 }, () => {
           runIds,
           540_000, // 9-minute poll timeout (test timeout is 600s)
           1_500,
+          () => {
+            const sample = spawnSync("git", ["write-tree"], { cwd: repoDir, encoding: "utf-8" });
+            if (sample.status === 0) sampledOriginIndexTrees.add(sample.stdout.trim());
+          },
         );
         const wallMs = Date.now() - wallStartedAt;
 
@@ -542,20 +544,7 @@ describe("concurrent-runs stress test", { concurrency: 1 }, () => {
             !fileContent.includes(fi.fixFind),
             `${fi.file} in target ref still contains bug:\n${fileContent.slice(0, 200)}`,
           );
-          assert.equal(
-            fs.readFileSync(path.join(repoDir, fi.file), "utf-8"),
-            originFilesBefore.get(fi.file),
-            `plumbing landing rewrote origin working-tree file ${fi.file}`,
-          );
         }
-
-        // A moved checked-out ref makes porcelain compare stale worktree bytes
-        // with the new commit. Assert the actual non-mutation invariant instead.
-        assert.equal(
-          execSync("git write-tree", { cwd: repoDir, encoding: "utf-8" }).trim(),
-          originIndexBefore,
-          "plumbing landing rewrote the origin index",
-        );
 
         const fsckResult = spawnSync("git", ["fsck", "--no-dangling"], {
           cwd: repoDir,
@@ -579,6 +568,21 @@ describe("concurrent-runs stress test", { concurrency: 1 }, () => {
         assert.equal(targetHistory.length, 1 + FEATURE_COUNT);
         assert.equal(targetHistory.at(-1), initialTip);
         const targetLandingCommits = new Set(targetHistory.slice(0, FEATURE_COUNT));
+        const targetHistoryTrees = new Set(
+          targetHistory.map((commit) =>
+            execSync(`git rev-parse "${commit}^{tree}"`, { cwd: repoDir, encoding: "utf-8" }).trim(),
+          ),
+        );
+        targetHistoryTrees.add(originIndexBefore);
+        sampledOriginIndexTrees.add(
+          execSync("git write-tree", { cwd: repoDir, encoding: "utf-8" }).trim(),
+        );
+        for (const sampledTree of sampledOriginIndexTrees) {
+          assert.ok(
+            targetHistoryTrees.has(sampledTree),
+            `origin index sample ${sampledTree} is not the pre-merge tree or a committed target-history tree`,
+          );
+        }
         for (const commit of targetLandingCommits) {
           const commitWithParents = execSync(`git rev-list --parents -n 1 "${commit}"`, {
             cwd: repoDir,
@@ -650,6 +654,7 @@ describe("concurrent-runs stress test", { concurrency: 1 }, () => {
         // ── Assert: every step in every run is 'done' ─────────────
         let targetMovedEvents = 0;
         const eventLandingCommits = new Set<string>();
+        const checkoutRefreshOutcomes: string[] = [];
         for (let i = 0; i < runEnvs.length; i++) {
           const runEnv = runEnvs[i];
           const rid = runIds[i];
@@ -682,6 +687,12 @@ describe("concurrent-runs stress test", { concurrency: 1 }, () => {
           assert.ok(mergedCommit, `feature-${i + 1}: missing MERGED_COMMIT`);
           assert.ok(mergedTree, `feature-${i + 1}: missing MERGED_TREE`);
           assert.match(mergeOutput, new RegExp(`^TARGET: refs/heads/${originalBranch}$`, "m"));
+          const outputRefresh = mergeOutput.match(/^CHECKOUT_REFRESH: (.+)$/m)?.[1];
+          assert.match(
+            outputRefresh ?? "",
+            /^(?:refreshed|not-applicable|skipped:.+)$/,
+            `feature-${i + 1}: missing or invalid CHECKOUT_REFRESH`,
+          );
           const mergeEvents = fs
             .readFileSync(path.join(runEnv.env.tamanduaDir, "events", `${rid}.jsonl`), "utf-8")
             .trim()
@@ -701,6 +712,8 @@ describe("concurrent-runs stress test", { concurrency: 1 }, () => {
           assert.equal(mergeEvents.filter((event) => event.event === "merge.conflicts").length, 0);
           assert.equal(landedEvents[0].mergedCommit, mergedCommit);
           assert.equal(landedEvents[0].mergedTree, mergedTree);
+          assert.equal(landedEvents[0].checkoutRefresh, outputRefresh);
+          checkoutRefreshOutcomes.push(landedEvents[0].checkoutRefresh ?? "");
           assert.ok(targetLandingCommits.has(mergedCommit));
           eventLandingCommits.add(mergedCommit);
           for (const event of movedEvents) {
@@ -721,6 +734,19 @@ describe("concurrent-runs stress test", { concurrency: 1 }, () => {
         }
         assert.ok(targetMovedEvents > 0, "concurrent landing should exercise at least one target-moved CAS retry");
         assert.deepEqual([...eventLandingCommits].sort(), [...targetLandingCommits].sort());
+
+        // Once all mergers are quiescent, the checked-out origin should be
+        // synchronized. Under contention a guarded refresh may skip instead;
+        // in that case the landed event must make the stale checkout explicit.
+        assert.equal(
+          execSync("git symbolic-ref --short HEAD", { cwd: repoDir, encoding: "utf-8" }).trim(),
+          originalBranch,
+        );
+        const finalStatus = execSync("git status --porcelain", { cwd: repoDir, encoding: "utf-8" });
+        assert.ok(
+          finalStatus === "" || checkoutRefreshOutcomes.some((outcome) => outcome.startsWith("skipped:")),
+          `origin checkout is stale without a refresh skip event:\n${finalStatus}`,
+        );
 
         // ── Diagnostics report ────────────────────────────────────
         const report = collectDiagnostics(runEnvs, runIds, wallMs);
