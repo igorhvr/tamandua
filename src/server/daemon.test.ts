@@ -307,11 +307,10 @@ describe("daemon (MCP decoupled)", { concurrency: 1 }, () => {
       res.end("occupied");
     });
 
-    // Bind the wildcard address like the MCP server does: macOS (unlike
-    // Linux) lets a wildcard bind coexist with a 127.0.0.1-specific one,
-    // so a localhost-only blocker would not produce EADDRINUSE there.
+    // Bind the same loopback address as the MCP server so the occupied-port
+    // collision is deterministic across platforms.
     await blockerPortHandle.close();
-    await new Promise<void>((resolve) => blocker.listen(blockerPort, () => resolve()));
+    await new Promise<void>((resolve) => blocker.listen(blockerPort, "127.0.0.1", () => resolve()));
 
     const controlPortHandle = await reservePortHandle();
     const controlPort = controlPortHandle.port;

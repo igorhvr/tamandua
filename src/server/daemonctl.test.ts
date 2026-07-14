@@ -1242,7 +1242,7 @@ describe("daemonctl dashboard standalone lifecycle", { concurrency: 1 }, () => {
       res.writeHead(200, { "content-type": "text/plain" });
       res.end("blocker");
     });
-    await new Promise<void>((resolve) => blocker.listen(dashPort, () => resolve()));
+    await new Promise<void>((resolve) => blocker.listen(dashPort, "127.0.0.1", () => resolve()));
 
     const tempHome = createDashboardTempHome();
     try {
