@@ -32,13 +32,14 @@ function git(repo: string, args: string[]): string {
 function runCli(args: string[]) {
   const testHome = createTempHome("tamandua-merge-branch-cli-home-");
   cleanup.push(testHome.root);
-  return spawnSync("/bin/sh", [path.resolve("bin/tamandua"), ...args], {
+  const result = spawnSync("/bin/sh", [path.resolve("bin/tamandua"), ...args], {
     encoding: "utf-8",
     env: cleanChildEnv({
       HOME: testHome.homeDir,
       TAMANDUA_STATE_DIR: testHome.tamanduaDir,
     }),
   });
+  return { ...result, testHome };
 }
 
 function createRepo(): { repo: string; initial: string } {
@@ -93,11 +94,13 @@ describe("tamandua merge-branch CLI", () => {
     assert.equal(result.status, 0);
     for (const option of requiredOptions) assert.match(result.stdout, new RegExp(option));
     assert.match(result.stdout, /STATUS: landed/);
+    assert.match(result.stdout, /NOOP: <true \| false>/);
+    assert.match(result.stdout, /true[\s\S]*already landed[\s\S]*false[\s\S]*new squash commit/i);
     assert.match(result.stdout, /STATUS: target_moved/);
     assert.match(result.stdout, /STATUS: conflicts/);
     assert.match(result.stdout, /CHECKOUT_REFRESH: <refreshed \| skipped:<reason> \| not-applicable>/);
     assert.match(result.stdout, /refreshed[\s\S]*skipped:<reason>[\s\S]*not-applicable/);
-    assert.match(result.stdout, /Exit codes:[\s\S]*0[\s\S]*2[\s\S]*3/);
+    assert.match(result.stdout, /Exit codes:[\s\S]*0\s+Newly landed or already landed \(no-op\)[\s\S]*2[\s\S]*3/);
     assert.equal(result.stderr, "");
     assert.equal(globalHelp.status, 0);
     assert.match(globalHelp.stdout, /tamandua merge-branch/);
@@ -151,6 +154,7 @@ describe("tamandua merge-branch CLI", () => {
 
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, /^STATUS: landed$/m);
+    assert.match(result.stdout, /^NOOP: false$/m);
     assert.match(result.stdout, /^MERGED_COMMIT: [0-9a-f]{40}$/m);
     assert.match(result.stdout, /^MERGED_TREE: [0-9a-f]{40}$/m);
     assert.match(result.stdout, /^TARGET: refs\/heads\/scratch$/m);
@@ -161,6 +165,43 @@ describe("tamandua merge-branch CLI", () => {
     assert.equal(fs.existsSync(path.join(repo, "feature.txt")), false);
     assert.equal(git(repo, ["show", "refs/heads/scratch:feature.txt"]), "feature");
     assert.equal(git(repo, ["rev-parse", "refs/heads/main"]), initial);
+  });
+
+  it("IDEM reports an already-landed branch without changing target history", () => {
+    const { repo, initial } = createRepo();
+    createFeature(repo, initial);
+    git(repo, ["merge", "--ff-only", "feature"]);
+    const targetBefore = git(repo, ["rev-parse", "refs/heads/main"]);
+    const treeBefore = git(repo, ["rev-parse", "refs/heads/main^{tree}"]);
+    const commitCountBefore = git(repo, ["rev-list", "--count", "refs/heads/main"]);
+
+    const result = runCli(validArgs(repo, targetBefore, "main"));
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /^STATUS: landed$/m);
+    assert.match(result.stdout, /^NOOP: true$/m);
+    assert.match(result.stdout, new RegExp(`^MERGED_COMMIT: ${targetBefore}$`, "m"));
+    assert.match(result.stdout, new RegExp(`^MERGED_TREE: ${treeBefore}$`, "m"));
+    assert.match(result.stdout, /^TARGET: refs\/heads\/main$/m);
+    assert.match(result.stdout, /^CHECKOUT_REFRESH: not-applicable$/m);
+    assert.equal(git(repo, ["rev-parse", "refs/heads/main"]), targetBefore);
+    assert.equal(git(repo, ["rev-list", "--count", "refs/heads/main"]), commitCountBefore);
+
+    const eventsPath = path.join(result.testHome.tamanduaDir, "events", "all.jsonl");
+    const events = fs.readFileSync(eventsPath, "utf-8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as {
+        event: string;
+        noop?: boolean;
+        mergedCommit?: string;
+        mergedTree?: string;
+      });
+    assert.equal(events.length, 1);
+    assert.equal(events[0]?.event, "merge.landed");
+    assert.equal(events[0]?.noop, true);
+    assert.equal(events[0]?.mergedCommit, targetBefore);
+    assert.equal(events[0]?.mergedTree, treeBefore);
   });
 
   it("STCK reports refreshed and synchronizes a clean checked-out target", () => {

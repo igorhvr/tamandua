@@ -30,6 +30,7 @@ export interface MergeBranchEvent extends TamanduaEvent {
   actualTip?: string;
   mergedTree?: string;
   mergedCommit?: string;
+  noop?: boolean;
 }
 
 export type PlumbingMergeResult =
@@ -39,6 +40,7 @@ export type PlumbingMergeResult =
       mergedCommit: string;
       mergedTree: string;
       target: string;
+      noop: boolean;
       checkoutRefresh: CheckoutRefreshOutcome;
     }
   | {
@@ -189,6 +191,51 @@ export function runPlumbingMerge(
     };
   }
 
+  const targetTreeArgs = ["rev-parse", "--verify", `${target}^{tree}`];
+  const targetTreeResult = git(params.origin, targetTreeArgs);
+  if (targetTreeResult.status !== 0 || !targetTreeResult.stdout) {
+    return {
+      status: "operational_error",
+      exitCode: MERGE_BRANCH_EXIT_CODES.operationalError,
+      detail: commandError(targetTreeArgs, targetTreeResult),
+    };
+  }
+  const targetTree = targetTreeResult.stdout;
+
+  const noOpLanding = (): PlumbingMergeResult => {
+    const checkoutRefresh = "not-applicable";
+    emit({
+      ...eventBase,
+      event: "merge.landed",
+      mergedTree: targetTree,
+      mergedCommit: actualTip,
+      noop: true,
+      checkoutRefresh,
+    });
+    return {
+      status: "landed",
+      exitCode: MERGE_BRANCH_EXIT_CODES.landed,
+      mergedCommit: actualTip,
+      mergedTree: targetTree,
+      target,
+      noop: true,
+      checkoutRefresh,
+    };
+  };
+
+  const ancestorArgs = ["merge-base", "--is-ancestor", branchResult.stdout, actualTip];
+  const ancestorResult = git(params.origin, ancestorArgs);
+  if (ancestorResult.status === 0) {
+    return noOpLanding();
+  }
+  if (ancestorResult.status !== 1) {
+    return {
+      status: "operational_error",
+      exitCode: MERGE_BRANCH_EXIT_CODES.operationalError,
+      detail: commandError(ancestorArgs, ancestorResult),
+    };
+  }
+
   const mergeArgs = ["merge-tree", "--write-tree", params.expectTip, branchRef];
   const mergeResult = git(params.origin, mergeArgs);
   const mergedTree = mergeResult.stdout.split(/\r?\n/, 1)[0]?.trim() || undefined;
@@ -212,6 +259,10 @@ export function runPlumbingMerge(
       exitCode: MERGE_BRANCH_EXIT_CODES.operationalError,
       detail: commandError(mergeArgs, mergeResult),
     };
+  }
+
+  if (mergedTree === targetTree) {
+    return noOpLanding();
   }
 
   const commitArgs = ["commit-tree", mergedTree, "-p", params.expectTip, "-m", params.message];
@@ -268,6 +319,7 @@ export function runPlumbingMerge(
     event: "merge.landed",
     mergedTree,
     mergedCommit,
+    noop: false,
     checkoutRefresh,
   });
   return {
@@ -276,6 +328,7 @@ export function runPlumbingMerge(
     mergedCommit,
     mergedTree,
     target,
+    noop: false,
     checkoutRefresh,
   };
 }

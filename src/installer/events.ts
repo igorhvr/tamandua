@@ -61,6 +61,7 @@ export interface TamanduaEvent {
   actualTip?: string;
   mergedTree?: string;
   mergedCommit?: string;
+  noop?: boolean;
   checkoutRefresh?: CheckoutRefreshOutcome;
 }
 

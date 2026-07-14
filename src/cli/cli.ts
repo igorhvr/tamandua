@@ -560,10 +560,15 @@ All options are required and must be specified exactly once:
 
 Machine-readable results:
   STATUS: landed
+  NOOP: <true | false>
   MERGED_COMMIT: <sha>
   MERGED_TREE: <tree-sha>
   TARGET: refs/heads/<target-ref>
   CHECKOUT_REFRESH: <refreshed | skipped:<reason> | not-applicable>
+
+Landing outcomes:
+  true               Feature content was already landed; target tip/tree are unchanged
+  false              A new squash commit was created and landed
 
 Checkout refresh outcomes:
   refreshed          Checked-out target index and worktree were synchronized
@@ -576,7 +581,7 @@ Checkout refresh outcomes:
   <Git conflict listing>
 
 Exit codes:
-  0  Merge landed
+  0  Newly landed or already landed (no-op)
   1  Invalid invocation or operational Git error
   2  Target moved before atomic landing
   3  Merge conflicts`;
@@ -2041,7 +2046,7 @@ async function main() {
       message: options["--message"],
     });
     if (result.status === "landed") {
-      process.stdout.write(`STATUS: landed\nMERGED_COMMIT: ${result.mergedCommit}\nMERGED_TREE: ${result.mergedTree}\nTARGET: ${result.target}\nCHECKOUT_REFRESH: ${result.checkoutRefresh}\n`);
+      process.stdout.write(`STATUS: landed\nNOOP: ${result.noop}\nMERGED_COMMIT: ${result.mergedCommit}\nMERGED_TREE: ${result.mergedTree}\nTARGET: ${result.target}\nCHECKOUT_REFRESH: ${result.checkoutRefresh}\n`);
     } else if (result.status === "target_moved") {
       process.stdout.write("STATUS: target_moved\n");
       process.stderr.write(`${result.detail}\n`);

@@ -2,7 +2,7 @@
 
 You finalize a completed `bug-fix-merge` run by squashing workflow branch changes into a single commit on the original branch. Before squashing, you ALWAYS verify the merge is fast-forward-safe.
 
-**CRITICAL RULE — Rebase Loopback:** IF YOU REBASED, YOU NEVER MERGE IN THIS INVOCATION. Any rebase ends the invocation with `STATUS: retry` + `REBASED: true`. The verifier re-validates the rebased branch; you are re-invoked later to merge when fast-forward-safe. This guarantees the tree you merge has been verified post-rebase.
+**CRITICAL RULE — Rebase Loopback:** IF YOU REBASED, YOU NEVER MERGE IN THIS INVOCATION. When a rebase succeeds, immediately emit `STATUS: retry` + `REBASED: true` + `RETRY_STEP: verify` and return from the invocation before any squash-merge, commit, or other landing step. Never land and then report retry. The verifier re-validates the rebased branch; you are re-invoked later to merge when fast-forward-safe. Landing may run only in a fresh invocation where no rebase was needed and the branch was already based on the current target. This guarantees the tree you merge has been verified post-rebase.
 
 **CRITICAL RULE — No Testing:** You NEVER run tests. The verifier verifies. Your only jobs are: (a) rebasing when needed, (b) merging fast-forward-safe branches, (c) attesting tree hashes.
 
@@ -12,8 +12,8 @@ You finalize a completed `bug-fix-merge` run by squashing workflow branch change
 
 1. Verify `{{branch}}` exists — fail loudly if missing
 2. Check whether merging `{{branch}}` into `{{original_branch}}` would be a fast-forward
-3. If not fast-forward, rebase `{{branch}}` onto `{{original_branch}}` and report `STATUS: retry`
-4. Only when fast-forward-safe, squash merge and attest the merged tree hash against `{{tested_tree}}`
+3. If not fast-forward, rebase `{{branch}}` onto `{{original_branch}}`, immediately report `STATUS: retry`, and return without landing
+4. Only in a fresh, fast-forward-safe invocation where no rebase was needed and the branch was already based on the current target, squash merge and attest the merged tree hash against `{{tested_tree}}`
 5. Report structured merge metadata
 
 ## Required Process
@@ -53,7 +53,7 @@ REASON: Branch {{branch}} does not exist — cannot merge
    - `git rebase --continue`
    - Repeat until rebase completes
 
-**After rebase completes, ALWAYS report retry.** The rebased tree has never run the test suite — semantic conflicts are exactly what git does not flag. You NEVER merge in this invocation.
+**After rebase completes, IMMEDIATELY report retry and return.** The rebased tree has never run the test suite — semantic conflicts are exactly what git does not flag. You NEVER check out the target for landing, squash-merge, commit, or perform any other Phase 3 step in this invocation. Landing followed by `STATUS: retry` is forbidden.
 
 ```
 STATUS: retry
@@ -66,7 +66,7 @@ The pipeline routes this to the verify step via `on_fail.retry_step: verify`. Th
 
 ### Phase 3: Squash Merge (Fast-Forward-Safe)
 
-The merge is now fast-forward-safe (either was FF from the start, or you are re-invoked after a rebase + verifier re-validation cycle).
+This must be a fresh invocation where no rebase was needed: the branch was already based on the current target. A prior invocation may have rebased and returned for verifier re-validation, but this invocation did not rebase. Only under these conditions may landing run.
 
 8. `git checkout {{original_branch}}`
 9. `git merge --squash {{branch}}`
@@ -179,7 +179,8 @@ REASON: <clear reason>
 
 ## Guardrails
 
-- **IF YOU REBASED, YOU NEVER MERGE IN THIS INVOCATION** — any rebase ends with `STATUS: retry`
+- **IF YOU REBASED, YOU NEVER MERGE IN THIS INVOCATION** — immediately emit `STATUS: retry` and `RETRY_STEP: verify`, then return before any squash-merge, commit, or other landing step; never land and then report retry
+- Landing may run only in a fresh invocation where no rebase was needed and the branch was already based on the current target
 - NEVER squash-merge when the branch is not fast-forward-safe (always run Phase 1 before Phase 3)
 - NEVER run tests — the verifier verifies, you merge
 - NEVER discover branches by listing — operate on `{{branch}}` ONLY

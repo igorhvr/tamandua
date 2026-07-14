@@ -73,6 +73,134 @@ afterEach(() => {
 });
 
 describe("runPlumbingMerge", () => {
+  it("IDEM returns a no-op landing when the branch is already ancestral to the target", () => {
+    const { repo } = createRepo();
+    const featureTip = createFeature(repo);
+    git(repo, ["merge", "--ff-only", "feature"]);
+    const targetTip = git(repo, ["rev-parse", "refs/heads/main"]);
+    const targetTree = git(repo, ["rev-parse", `${targetTip}^{tree}`]);
+    const events: MergeBranchEvent[] = [];
+    const commands: string[][] = [];
+
+    const result = runPlumbingMerge(
+      { origin: repo, branch: "feature", into: "main", expectTip: targetTip, message: "must not duplicate", runId: "run-noop-ancestor" },
+      {
+        runGit: (origin, args) => {
+          commands.push(args);
+          return rawGit(origin, args);
+        },
+        emitEvent: (event) => events.push(event),
+      },
+    );
+
+    assert.equal(featureTip, targetTip);
+    assert.equal(result.status, "landed");
+    assert.equal(result.exitCode, 0);
+    if (result.status !== "landed") return;
+    assert.equal(result.noop, true);
+    assert.equal(result.mergedCommit, targetTip);
+    assert.equal(result.mergedTree, targetTree);
+    assert.equal(result.checkoutRefresh, "not-applicable");
+    assert.equal(git(repo, ["rev-parse", "refs/heads/main"]), targetTip);
+    assert.equal(commands.some((args) => args[0] === "commit-tree"), false);
+    assert.equal(commands.some((args) => args[0] === "update-ref"), false);
+    assert.deepEqual(events, [
+      {
+        ts: events[0]?.ts,
+        event: "merge.landed",
+        runId: "run-noop-ancestor",
+        origin: repo,
+        branch: "feature",
+        target: "refs/heads/main",
+        expectedTip: targetTip,
+        mergedTree: targetTree,
+        mergedCommit: targetTip,
+        checkoutRefresh: "not-applicable",
+        noop: true,
+      },
+    ]);
+  });
+
+  it("IDEM returns a no-op landing when a non-ancestral branch produces the target tree", () => {
+    const { repo, initial } = createRepo();
+    const featureTip = createFeature(repo);
+    const targetTree = git(repo, ["rev-parse", `${featureTip}^{tree}`]);
+    const equivalentTarget = git(repo, ["commit-tree", targetTree, "-p", initial, "-m", "equivalent upstream change"]);
+    git(repo, ["update-ref", "refs/heads/main", equivalentTarget, initial]);
+    git(repo, ["reset", "--hard", equivalentTarget]);
+    const events: MergeBranchEvent[] = [];
+    const commands: string[][] = [];
+
+    const result = runPlumbingMerge(
+      { origin: repo, branch: "feature", into: "main", expectTip: equivalentTarget, message: "must not duplicate", runId: "run-noop-tree" },
+      {
+        runGit: (origin, args) => {
+          commands.push(args);
+          return rawGit(origin, args);
+        },
+        emitEvent: (event) => events.push(event),
+      },
+    );
+
+    assert.notEqual(featureTip, equivalentTarget);
+    assert.equal(result.status, "landed");
+    assert.equal(result.exitCode, 0);
+    if (result.status !== "landed") return;
+    assert.equal(result.noop, true);
+    assert.equal(result.mergedCommit, equivalentTarget);
+    assert.equal(result.mergedTree, targetTree);
+    assert.equal(result.checkoutRefresh, "not-applicable");
+    assert.equal(git(repo, ["rev-parse", "refs/heads/main"]), equivalentTarget);
+    assert.equal(commands.some((args) => args[0] === "commit-tree"), false);
+    assert.equal(commands.some((args) => args[0] === "update-ref"), false);
+    assert.equal(events.length, 1);
+    assert.equal(events[0]?.event, "merge.landed");
+    assert.equal(events[0]?.noop, true);
+    assert.equal(events[0]?.mergedCommit, equivalentTarget);
+    assert.equal(events[0]?.mergedTree, targetTree);
+  });
+
+  it("IDEM lands remaining changes from a partially pre-applied branch", () => {
+    const { repo } = createRepo();
+    git(repo, ["switch", "-c", "feature"]);
+    fs.writeFileSync(path.join(repo, "shared.txt"), "shared\n", "utf-8");
+    git(repo, ["add", "shared.txt"]);
+    git(repo, ["commit", "-m", "shared change"]);
+    const sharedCommit = git(repo, ["rev-parse", "HEAD"]);
+    fs.writeFileSync(path.join(repo, "remaining.txt"), "remaining\n", "utf-8");
+    git(repo, ["add", "remaining.txt"]);
+    git(repo, ["commit", "-m", "remaining change"]);
+    git(repo, ["switch", "main"]);
+    git(repo, ["cherry-pick", sharedCommit]);
+    const targetTip = git(repo, ["rev-parse", "HEAD"]);
+    const events: MergeBranchEvent[] = [];
+    const commands: string[][] = [];
+
+    const result = runPlumbingMerge(
+      { origin: repo, branch: "feature", into: "main", expectTip: targetTip, message: "land remaining", runId: "run-partial" },
+      {
+        runGit: (origin, args) => {
+          commands.push(args);
+          return rawGit(origin, args);
+        },
+        emitEvent: (event) => events.push(event),
+      },
+    );
+
+    assert.equal(result.status, "landed");
+    if (result.status !== "landed") return;
+    assert.equal(result.noop, false);
+    assert.notEqual(result.mergedCommit, targetTip);
+    assert.equal(git(repo, ["rev-parse", `${result.mergedCommit}^`]), targetTip);
+    assert.equal(git(repo, ["show", `${result.mergedCommit}:shared.txt`]), "shared");
+    assert.equal(git(repo, ["show", `${result.mergedCommit}:remaining.txt`]), "remaining");
+    assert.equal(commands.filter((args) => args[0] === "commit-tree").length, 1);
+    assert.equal(commands.filter((args) => args[0] === "update-ref").length, 1);
+    assert.equal(events.length, 1);
+    assert.equal(events[0]?.event, "merge.landed");
+    assert.equal(events[0]?.noop, false);
+  });
+
   it("STCK refreshes a clean checked-out target after landing", () => {
     const { repo, initial } = createRepo();
     createFeature(repo);
@@ -94,6 +222,7 @@ describe("runPlumbingMerge", () => {
     assert.equal(result.status, "landed");
     assert.equal(result.exitCode, 0);
     if (result.status !== "landed") return;
+    assert.equal(result.noop, false);
     assert.equal(git(repo, ["rev-parse", "refs/heads/main"]), result.mergedCommit);
     assert.equal(git(repo, ["rev-parse", `${result.mergedCommit}^`]), initial);
     assert.equal(git(repo, ["rev-parse", `${result.mergedCommit}^{tree}`]), result.mergedTree);
@@ -115,6 +244,7 @@ describe("runPlumbingMerge", () => {
         expectedTip: initial,
         mergedTree: result.mergedTree,
         mergedCommit: result.mergedCommit,
+        noop: false,
         checkoutRefresh: "refreshed",
       },
     ]);
@@ -306,9 +436,12 @@ describe("runPlumbingMerge", () => {
     const expected = "1".repeat(40);
     const tree = "2".repeat(40);
     const commit = "3".repeat(40);
+    const targetTree = "5".repeat(40);
     const scripted = [
       { status: 0, stdout: expected, stderr: "" },
       { status: 0, stdout: "4".repeat(40), stderr: "" },
+      { status: 0, stdout: targetTree, stderr: "" },
+      { status: 1, stdout: "", stderr: "" },
       { status: 0, stdout: tree, stderr: "" },
       { status: 0, stdout: commit, stderr: "" },
       { status: 0, stdout: "", stderr: "" },
@@ -330,6 +463,8 @@ describe("runPlumbingMerge", () => {
     assert.deepEqual(commands, [
       ["rev-parse", "--verify", "refs/heads/release"],
       ["rev-parse", "--verify", "refs/heads/feature^{commit}"],
+      ["rev-parse", "--verify", "refs/heads/release^{tree}"],
+      ["merge-base", "--is-ancestor", "4".repeat(40), expected],
       ["merge-tree", "--write-tree", expected, "refs/heads/feature"],
       ["commit-tree", tree, "-p", expected, "-m", "plumbing only"],
       ["update-ref", "refs/heads/release", commit, expected],
@@ -346,6 +481,8 @@ describe("runPlumbingMerge", () => {
     const scripted = [
       { status: 0, stdout: expected, stderr: "" },
       { status: 0, stdout: "4".repeat(40), stderr: "" },
+      { status: 0, stdout: "5".repeat(40), stderr: "" },
+      { status: 1, stdout: "", stderr: "" },
       { status: 0, stdout: tree, stderr: "" },
       { status: 0, stdout: commit, stderr: "" },
       { status: 128, stdout: "", stderr: "permission denied" },

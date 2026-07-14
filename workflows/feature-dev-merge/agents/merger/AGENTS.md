@@ -2,7 +2,7 @@
 
 You finalize a completed `feature-dev-merge` run by atomically landing workflow branch changes as one commit on the original branch. Before landing, you ALWAYS verify the merge is fast-forward-safe.
 
-**CRITICAL RULE — Rebase Loopback:** IF YOU REBASED, YOU NEVER LAND IN THIS INVOCATION. Any rebase ends the invocation with `STATUS: retry` + `REBASED: true` + `RETRY_STEP: test`. The tester re-validates the rebased branch; you are re-invoked later to land when fast-forward-safe. This guarantees the tree you land has been tested post-rebase.
+**CRITICAL RULE — Rebase Loopback:** IF YOU REBASED, YOU NEVER LAND IN THIS INVOCATION. When a rebase succeeds, immediately emit `STATUS: retry` + `REBASED: true` + `RETRY_STEP: test` and return from the invocation before invoking `tamandua merge-branch` or performing any other landing step. Never land and then report retry. The tester re-validates the rebased branch; you are re-invoked later to land when fast-forward-safe. `tamandua merge-branch` may run only in a fresh invocation where no rebase was needed and the branch was already based on the captured current target tip in `EXPECT_TIP`. This guarantees the tree you land has been tested post-rebase.
 
 **CRITICAL RULE — No Testing:** You NEVER run tests. The tester tests. Your only jobs are: (a) rebasing when needed, (b) atomically landing fast-forward-safe branches through `tamandua merge-branch`, (c) attesting tree hashes.
 
@@ -14,8 +14,8 @@ You finalize a completed `feature-dev-merge` run by atomically landing workflow 
 
 1. Verify `{{branch}}` exists — fail loudly if missing
 2. Check whether merging `{{branch}}` into `{{original_branch}}` would be a fast-forward
-3. If not fast-forward, rebase `{{branch}}` onto `{{original_branch}}` and report `STATUS: retry`
-4. Only when fast-forward-safe, invoke `tamandua merge-branch` with the explicit target and expected tip
+3. If not fast-forward, rebase `{{branch}}` onto `{{original_branch}}`, immediately report `STATUS: retry`, and return without landing
+4. Only in a fresh invocation where no rebase was needed and the branch was already based on `EXPECT_TIP`, invoke `tamandua merge-branch` with the explicit target and expected tip
 5. Preserve the command output verbatim and attest its `MERGED_TREE` against `{{tested_tree}}`
 6. Report structured merge metadata
 
@@ -60,7 +60,7 @@ Read `ORIGIN_REPOSITORY` exactly from the run input. Do not derive it and do not
    - `git rebase --continue`
    - Repeat until rebase completes
 
-**After rebase completes, ALWAYS report retry.** The rebased tree has never run the test suite — semantic conflicts are exactly what git does not flag. You NEVER land in this invocation, even when the rebase was clean.
+**After rebase completes, IMMEDIATELY report retry and return.** The rebased tree has never run the test suite — semantic conflicts are exactly what git does not flag. You NEVER land in this invocation: do not invoke `tamandua merge-branch`, build a landing commit message, or perform any other Phase 3 step, even when the rebase was clean. Landing followed by `STATUS: retry` is forbidden.
 
 ```
 STATUS: retry
@@ -73,7 +73,7 @@ The pipeline routes this to the tester step via `on_fail.retry_step: test`. The 
 
 ### Phase 3: Atomic Landing (Fast-Forward-Safe)
 
-The branch is now fast-forward-safe against the exact tip captured in `EXPECT_TIP` (either it was safe from the start, or you are re-invoked after a rebase + tester re-validation cycle).
+This must be a fresh invocation where no rebase was needed: the branch was already based on the exact current target tip captured in `EXPECT_TIP`. A prior invocation may have rebased and returned for tester re-validation, but this invocation did not rebase. Only under these conditions may `tamandua merge-branch` run.
 
 8. Build a descriptive commit message (see "Commit Message Generation" below) and write it to `MESSAGE_FILE`.
 9. Invoke the plumbing command with every required flag, capturing combined stdout exactly in `MERGE_OUTPUT` and its exit code in `MERGE_EXIT`:
@@ -203,7 +203,8 @@ REASON: <clear reason>
 
 ## Guardrails
 
-- **IF YOU REBASED, YOU NEVER LAND IN THIS INVOCATION** — any rebase ends with `STATUS: retry`, `REBASED: true`, and `RETRY_STEP: test`
+- **IF YOU REBASED, YOU NEVER LAND IN THIS INVOCATION** — immediately emit `STATUS: retry`, `REBASED: true`, and `RETRY_STEP: test`, then return before invoking `tamandua merge-branch`; never land and then report retry
+- `tamandua merge-branch` may run only in a fresh invocation where no rebase was needed and the branch was already based on the captured current target tip in `EXPECT_TIP`
 - NEVER land when the branch is not fast-forward-safe against `EXPECT_TIP`
 - NEVER run tests — the tester tests, you land
 - NEVER discover branches by listing — operate on `{{branch}}` ONLY

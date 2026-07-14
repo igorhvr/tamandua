@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { loadWorkflowSpec } from "../dist/installer/workflow-spec.js";
 
@@ -20,7 +20,63 @@ const worktreePersonaPath = resolve(
   "merger",
   "AGENTS.md",
 );
+const bugFixPersonaPath = resolve(
+  workflowsRoot,
+  "bug-fix-merge",
+  "agents",
+  "merger",
+  "AGENTS.md",
+);
+const bugFixWorktreePersonaPath = resolve(
+  workflowsRoot,
+  "bug-fix-merge-worktree",
+  "agents",
+  "merger",
+  "AGENTS.md",
+);
 const persona = readFileSync(sharedPersonaPath, "utf8");
+
+interface MergerPersonaConsumer {
+  workflowId: string;
+  path: string;
+  realpath: string;
+  content: string;
+}
+
+function mergeBranchPersonaConsumers(): MergerPersonaConsumer[] {
+  return readdirSync(workflowsRoot, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => ({
+      workflowId: entry.name,
+      path: resolve(workflowsRoot, entry.name, "agents", "merger", "AGENTS.md"),
+    }))
+    .filter((candidate) => existsSync(candidate.path))
+    .map((candidate) => ({
+      ...candidate,
+      realpath: realpathSync(candidate.path),
+      content: readFileSync(candidate.path, "utf8"),
+    }))
+    .filter((candidate) => candidate.content.includes("tamandua merge-branch"))
+    .sort((left, right) => left.workflowId.localeCompare(right.workflowId));
+}
+
+function assertRetryBeforeMergeBranch(content: string, label: string): void {
+  assert.match(
+    content,
+    /rebase succeeds[\s\S]{0,300}immediately emit `STATUS: retry`[\s\S]{0,300}return from the invocation before invoking `tamandua merge-branch`/i,
+    `${label} must return a retry verdict immediately after a successful rebase and before merge-branch`,
+  );
+  assert.match(
+    content,
+    /Never land and then report retry/i,
+    `${label} must explicitly forbid land-then-retry ordering`,
+  );
+  assert.match(
+    content,
+    /`tamandua merge-branch` may run only in a fresh invocation where no rebase was needed and the branch was already based on the captured current target tip in `EXPECT_TIP`/,
+    `${label} must permit merge-branch only on a fresh, already-based invocation`,
+  );
+}
 
 async function finalizeMergeInput(workflowId: string): Promise<string> {
   const spec = await loadWorkflowSpec(resolve(workflowsRoot, workflowId));
@@ -70,7 +126,7 @@ describe("US-003 PLMB feature merger prompt contracts", () => {
     assertCompleteMergeBranchInvocation(persona);
   });
 
-  it("preserves rebase loopback in the feature workspace before landing", () => {
+  it("requires rebase loopback to return before landing", () => {
     const rebaseIndex = persona.indexOf('git -C {{repo}} rebase "$EXPECT_TIP"');
     const landingIndex = persona.indexOf("MERGE_OUTPUT=$(tamandua merge-branch");
 
@@ -78,6 +134,38 @@ describe("US-003 PLMB feature merger prompt contracts", () => {
     assert.ok(rebaseIndex < landingIndex, "rebase path must precede landing");
     assert.match(persona, /STATUS: retry[\s\S]*REBASED: true[\s\S]*RETRY_STEP: test/);
     assert.match(persona, /IF YOU REBASED, YOU NEVER LAND IN THIS INVOCATION/);
+    assertRetryBeforeMergeBranch(persona, "shared feature merger persona");
+  });
+
+  it("discovers every merge-branch merger consumer and enforces retry-before-landing", () => {
+    const consumers = mergeBranchPersonaConsumers();
+    assert.deepEqual(
+      consumers.map((consumer) => consumer.workflowId),
+      ["feature-dev-merge", "feature-dev-merge-worktree"],
+    );
+
+    const uniquePersonas = new Map<string, MergerPersonaConsumer>();
+    for (const consumer of consumers) {
+      assertRetryBeforeMergeBranch(consumer.content, consumer.workflowId);
+      uniquePersonas.set(consumer.realpath, consumer);
+    }
+
+    assert.equal(uniquePersonas.size, 1, "feature merge variants must share one merger persona");
+    assert.equal(consumers[0]?.realpath, consumers[1]?.realpath);
+  });
+
+  it("explicitly audits bug-fix merge variants for immediate retry before landing", () => {
+    assert.equal(realpathSync(bugFixWorktreePersonaPath), realpathSync(bugFixPersonaPath));
+    const bugFixPersona = readFileSync(bugFixPersonaPath, "utf8");
+    assert.match(
+      bugFixPersona,
+      /rebase succeeds[\s\S]{0,300}immediately emit `STATUS: retry`[\s\S]{0,300}return from the invocation before any squash-merge, commit, or other landing step/i,
+    );
+    assert.match(bugFixPersona, /Never land and then report retry/i);
+    assert.match(
+      bugFixPersona,
+      /Landing may run only in a fresh invocation where no rebase was needed and the branch was already based on the current target/,
+    );
   });
 
   it("maps conflicts and target movement to tester revalidation and fails other errors", () => {
