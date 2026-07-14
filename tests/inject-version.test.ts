@@ -4,7 +4,6 @@
  * Run with: node --test tests/inject-version.test.ts
  */
 
-import { execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { describe, it } from "node:test";
@@ -13,7 +12,6 @@ import assert from "node:assert/strict";
 const repoRoot = path.resolve(import.meta.dirname, "..");
 const distVersion = path.join(repoRoot, "dist", "version");
 const distCli = path.join(repoRoot, "dist", "cli", "cli.js");
-const distStandalone = path.join(repoRoot, "dist", "cli", "commands", "standalone.js");
 
 describe("inject-version.js", () => {
   it("creates dist/version with ISO8601_refhash format", () => {
@@ -28,8 +26,7 @@ describe("inject-version.js", () => {
   });
 
   it("cli.js contains no __VERSION__ placeholder", () => {
-    // After SPLC refactoring, BUILT_VERSION moved to standalone.js;
-    // cli.js should not contain the __VERSION__ placeholder.
+    assert.ok(fs.existsSync(distCli), "dist/cli/cli.js should exist");
     const cliSource = fs.readFileSync(distCli, "utf-8");
     assert.ok(
       !cliSource.includes("__VERSION__"),
@@ -37,29 +34,29 @@ describe("inject-version.js", () => {
     );
   });
 
-  it("injects version into dist/cli/commands/standalone.js", () => {
-    assert.ok(fs.existsSync(distStandalone), "dist/cli/commands/standalone.js should exist");
-    const standaloneSource = fs.readFileSync(distStandalone, "utf-8");
+  it("injects version into dist/cli/cli.js", () => {
+    assert.ok(fs.existsSync(distCli), "dist/cli/cli.js should exist");
+    const cliSource = fs.readFileSync(distCli, "utf-8");
 
     // __VERSION__ placeholder should be replaced
     assert.ok(
-      !standaloneSource.includes("__VERSION__"),
-      "dist/cli/commands/standalone.js should not contain __VERSION__ placeholder"
+      !cliSource.includes("__VERSION__"),
+      "dist/cli/cli.js should not contain __VERSION__ placeholder"
     );
 
     // Should contain the actual version string (ISO8601_refhash)
     const versionPattern = /\d{8}T\d{6}Z_[0-9a-f]{40}/;
-    assert.match(standaloneSource, versionPattern, "standalone.js should contain injected version string");
+    assert.match(cliSource, versionPattern, "cli.js should contain injected version string");
   });
 
-  it("dist/version and standalone.js BUILT_VERSION match", () => {
+  it("dist/version and cli.js BUILT_VERSION match", () => {
     const versionContent = fs.readFileSync(distVersion, "utf-8").trim();
-    const standaloneSource = fs.readFileSync(distStandalone, "utf-8");
+    const cliSource = fs.readFileSync(distCli, "utf-8");
 
-    // Extract the version from standalone.js - it's assigned to BUILT_VERSION constant
-    const match = standaloneSource.match(/BUILT_VERSION\s*=\s*"([^"]+)"/);
-    assert.ok(match, "BUILT_VERSION assignment should be found in standalone.js");
-    assert.equal(match[1], versionContent, "dist/version and BUILT_VERSION in standalone.js should match");
+    // Extract the version from cli.js - it's assigned to the BUILT_VERSION constant.
+    const match = cliSource.match(/BUILT_VERSION\s*=\s*"([^"]+)"/);
+    assert.ok(match, "BUILT_VERSION assignment should be found in cli.js");
+    assert.equal(match[1], versionContent, "dist/version and BUILT_VERSION in cli.js should match");
   });
 
   it("version format components are valid", () => {

@@ -111,11 +111,11 @@ describe("www/index.html content sync", () => {
 
   // Regression test: DOVW — CLI help warns about overwrite on workflow install
   it("CLI workflow install help warns about overwrite semantics", () => {
-    const cliPath = join(sourcePath, "src", "cli", "commands", "workflow.ts");
+    const cliPath = join(sourcePath, "src", "cli", "cli.ts");
     const cliSource = readFileSync(cliPath, "utf-8");
     assert.ok(
       cliSource.includes("edits are overwritten"),
-      "src/cli/commands/workflow.ts getWorkflowInstallHelp must warn that local edits are overwritten",
+      "src/cli/cli.ts getWorkflowInstallHelp must warn that local edits are overwritten",
     );
   });
 
