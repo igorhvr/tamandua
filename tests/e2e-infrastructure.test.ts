@@ -503,6 +503,23 @@ describe("e2e test infrastructure", () => {
     assert.deepEqual(closeCounts, [1, 1]);
   });
 
+  it("daemon-spawning e2e tests release reserved ports", () => {
+    const e2eDir = path.join(repoRoot, "e2e-tests");
+    const testFileNames = fs.readdirSync(e2eDir, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && entry.name.endsWith(".test.ts"))
+      .map((entry) => entry.name);
+
+    for (const fileName of testFileNames) {
+      const content = fs.readFileSync(path.join(e2eDir, fileName), "utf-8");
+      if (!content.includes("startIsolatedDaemon(")) continue;
+
+      assert.ok(
+        content.includes("releasePortReservations("),
+        `${fileName} starts an isolated daemon but does not release reserved ports`,
+      );
+    }
+  });
+
   for (const fileName of [
     "workflows-stress-concurrent.test.ts",
     "workflows-e2e.test.ts",

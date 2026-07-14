@@ -39,6 +39,7 @@ import {
   resolveFullRunId,
   cleanupTempHome,
   preserveE2eTestHome,
+  releasePortReservations,
 } from "./helpers/smoke-helpers.ts";
 import {
   startIsolatedDaemon,
@@ -73,6 +74,7 @@ describe("real e2e canary (LIVE model, single do-now run)", () => {
         const workdir = path.join(env.root, "canary-workdir");
         fs.mkdirSync(workdir, { recursive: true });
 
+        await releasePortReservations(env);
         daemon = await startIsolatedDaemon(env.homeDir, env.controlPort);
 
         const runIdPrefix = await spawnWorkflowRun(

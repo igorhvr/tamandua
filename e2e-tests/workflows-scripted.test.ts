@@ -44,6 +44,7 @@ import {
   prepareGitRepo,
   resolveFullRunId,
   cleanupTempHome,
+  releasePortReservations,
 } from "./helpers/smoke-helpers.ts";
 import {
   startIsolatedDaemon,
@@ -78,8 +79,7 @@ async function startScriptedEnvironment(
     baseEnv(env.homeDir, env.controlPort),
     `install ${workflowId}`,
   );
-  // Release port handles so the daemon can bind to the control port.
-  await Promise.all(env.portHandles.map((h) => h.close()));
+  await releasePortReservations(env);
   const daemon = await startIsolatedDaemon(
     env.homeDir,
     env.controlPort,

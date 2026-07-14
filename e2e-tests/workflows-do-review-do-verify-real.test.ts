@@ -59,6 +59,7 @@ import {
   resolveFullRunId,
   cleanupTempHome,
   preserveE2eTestHome,
+  releasePortReservations,
 } from "./helpers/smoke-helpers.ts";
 import {
   startIsolatedDaemon,
@@ -154,6 +155,7 @@ describe(
       async () => {
         try {
         // ── Start daemon ────────────────────────────────────────────
+        await releasePortReservations(env);
         daemon = await startIsolatedDaemon(
           env.homeDir,
           env.controlPort,

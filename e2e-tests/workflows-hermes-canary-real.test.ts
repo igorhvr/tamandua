@@ -37,6 +37,7 @@ import {
   spawnWorkflowRun,
   resolveFullRunId,
   cleanupTempHome,
+  releasePortReservations,
 } from "./helpers/smoke-helpers.ts";
 import {
   startIsolatedDaemon,
@@ -92,6 +93,7 @@ describe("real hermes e2e canary (LIVE hermes, single do-now run)", () => {
         const workdir = path.join(env.root, "canary-hermes-workdir");
         fs.mkdirSync(workdir, { recursive: true });
 
+        await releasePortReservations(env);
         daemon = await startIsolatedDaemon(
           env.homeDir,
           env.controlPort,
