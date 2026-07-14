@@ -7,6 +7,7 @@ import { logger } from "../lib/logger.js";
 import { formatPiCommandPreview, findPromptArgvIndices, formatCommandPreview } from "./pi-command-preview.js";
 import { parsePiOutputStream } from "./pi-stream-parser.js";
 import { sanitizeStderrTail } from "./step-ops.js";
+import { resolveHermesBinary } from "./hermes-resolver.js";
 
 // ── Harness round result ───────────────────────────────────────────
 
@@ -54,6 +55,13 @@ export interface RunHarnessOptions {
    * for hermes). Falls back silently when the wrapper is absent.
    */
   preferTokenSaver?: boolean;
+  /**
+   * Pre-resolved absolute path to the harness binary. When provided,
+   * runRound skips its own findBinary() call and uses this path directly.
+   * This guarantees that admission validation and actual dispatch use the
+   * same resolved binary — no re-resolution, no disagreement.
+   */
+  binaryPath?: string;
 }
 
 // ── Adapter interface ──────────────────────────────────────────────
@@ -386,32 +394,9 @@ class HermesHarnessAdapter implements HarnessAdapter {
   async findBinary(
     options?: { preferTokenSaver?: boolean },
   ): Promise<string> {
-    // Prefer explicit env override
-    const envHermes = process.env.TAMANDUA_HERMES_BINARY?.trim();
-    if (envHermes) {
-      try {
-        fs.accessSync(envHermes, fs.constants.X_OK);
-        return envHermes;
-      } catch {
-        throw new Error(
-          `TAMANDUA_HERMES_BINARY set but not executable: ${envHermes}`,
-        );
-      }
-    }
-
-    if (options?.preferTokenSaver) {
-      const tokenSaver = searchPathForExecutable("hermes-token-saver");
-      if (tokenSaver) return tokenSaver;
-      // Not installed (yet) — fall through to normal hermes resolution.
-    }
-
-    // Search PATH
-    const hermes = searchPathForExecutable("hermes");
-    if (hermes) return hermes;
-
-    throw new Error(
-      "hermes binary not found in PATH. Install hermes or set TAMANDUA_HERMES_BINARY.",
-    );
+    return resolveHermesBinary({
+      preferTokenSaver: options?.preferTokenSaver,
+    });
   }
 
   async runRound(
@@ -419,9 +404,11 @@ class HermesHarnessAdapter implements HarnessAdapter {
     options?: RunHarnessOptions,
   ): Promise<HarnessRoundResult> {
     const timeoutMs = ((options?.timeout) ?? 600) * 1000;
-    const hermesPath = await this.findBinary({
-      preferTokenSaver: options?.preferTokenSaver,
-    });
+    const hermesPath =
+      options?.binaryPath ??
+      (await this.findBinary({
+        preferTokenSaver: options?.preferTokenSaver,
+      }));
 
     const childEnv: Record<string, string | undefined> = {
       ...(process.env as Record<string, string | undefined>),

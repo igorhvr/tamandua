@@ -474,6 +474,32 @@ describe("HermesHarnessAdapter implementation", () => {
 
 
     });
+
+    it("discovers hermes via login shell when not on regular PATH", async () => {
+      delete process.env.TAMANDUA_HERMES_BINARY;
+
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-hermes-");
+      const hermesPath = path.join(tmpDir, "hermes");
+      fs.writeFileSync(hermesPath, "#!/bin/sh\necho hermes\n", { mode: 0o755 });
+
+      // Create a fake zsh that echoes the hermes path.
+      const fakeZshDir = path.join(tmpDir, "fake-zsh");
+      fs.mkdirSync(fakeZshDir, { recursive: true });
+      const fakeZsh = path.join(fakeZshDir, "zsh");
+      fs.writeFileSync(
+        fakeZsh,
+        `#!/bin/sh\n# Simulate zsh -lic 'command -v hermes'\necho ${hermesPath}\n`,
+        { mode: 0o755 },
+      );
+
+      // PATH has the fake zsh but NOT the hermes dir.
+      process.env.PATH = fakeZshDir;
+
+      const result = await adapter.findBinary();
+      assert.equal(fs.realpathSync(result), fs.realpathSync(hermesPath));
+
+
+    });
   });
 
   describe("runRound", () => {
@@ -1205,6 +1231,48 @@ echo "session_id: 20260518_103004_cdae11" >&2`,
         }
 
 
+      }
+    });
+
+    it("uses pre-resolved binaryPath without PATH access to hermes", async () => {
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-hermes-");
+      const hermesPath = path.join(tmpDir, "hermes");
+      fs.writeFileSync(
+        hermesPath,
+        `#!/bin/sh
+echo "work done"
+echo "session_id: 20260518_103004_cdae11" >&2`,
+        { mode: 0o755 },
+      );
+
+      // Ensure PATH does NOT contain the hermes directory.
+      const originalPath = process.env.PATH;
+      process.env.PATH = tmpDir;
+      // Clear env var so no other resolution path exists.
+      const originalHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
+      delete process.env.TAMANDUA_HERMES_BINARY;
+
+      try {
+        // Pass binaryPath directly — runRound must use it, skipping findBinary().
+        const result = await adapter.runRound("do the work", {
+          timeout: 5,
+          binaryPath: hermesPath,
+        });
+
+        assert.ok(result.output.includes("work done"));
+        assert.equal(result.sessionRef, "20260518_103004_cdae11");
+        assert.equal(result.exitCode, 0);
+      } finally {
+        if (originalHermesBinary === undefined) {
+          delete process.env.TAMANDUA_HERMES_BINARY;
+        } else {
+          process.env.TAMANDUA_HERMES_BINARY = originalHermesBinary;
+        }
+        if (originalPath === undefined) {
+          delete process.env.PATH;
+        } else {
+          process.env.PATH = originalPath;
+        }
       }
     });
   });

@@ -36,7 +36,7 @@ import { collectProcessSnapshot, matchRunEvidence } from "./installer/run-cleanu
 import { getRecentEvents } from "./installer/events.js";
 import type { TamanduaEvent } from "./installer/events.js";
 import { probeHermesStateContract } from "./installer/hermes-usage.js";
-import { resolveHermesViaLoginShell } from "./installer/agent-scheduler.js";
+import { resolveHermesViaLoginShell } from "./installer/hermes-resolver.js";
 
 // ── Types ──────────────────────────────────────────────────────────
 

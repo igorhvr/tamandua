@@ -4,7 +4,7 @@ import path from "node:path";
 import { validateRunWorktree } from "./worktree-manager.js";
 import type { HarnessType } from "./types.js";
 import { getDb } from "../db.js";
-import { findHermesBinary } from "./agent-scheduler.js";
+import { resolveHermesBinary } from "./hermes-resolver.js";
 import { parseRunContext as safeParseRunContext } from "./step-ops.js";
 
 export const RUN_CONTEXT_WORKING_DIRECTORY_FOR_HARNESS_KEY = "working_directory_for_harness";
@@ -119,7 +119,7 @@ export async function validateRunHarnessForScheduling(
   const harnessType = readNonEmptyString(context, "harness_type");
   if (harnessType === "hermes") {
     try {
-      await findHermesBinary();
+      await resolveHermesBinary();
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       throw new Error(

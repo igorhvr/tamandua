@@ -933,7 +933,7 @@ describe("ENVIRONMENT hermes discovery chain (US-003)", () => {
     // PATH has fake zsh but no hermes
     process.env.PATH = `${fixtureDir}:/usr/bin:/bin`;
 
-    // Isolate HOME so ensureHermesSymlink doesn't touch real filesystem
+    // Isolate HOME to keep test self-contained
     savedHome = process.env.HOME;
     process.env.HOME = fixtureDir;
 

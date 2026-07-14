@@ -1,12 +1,10 @@
 import assert from "node:assert/strict";
 import { describe, it, beforeEach, afterEach } from "node:test";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import {
   findHermesBinary,
   findPiBinary,
-  ensureHermesSymlink,
 } from "../../dist/installer/agent-scheduler.js";
 import { createTempHome } from "../../tests/helpers/test-env.ts";
 
@@ -131,7 +129,6 @@ describe("findHermesBinary", () => {
       // point PATH at a script that simulates zsh -lic output.
       const { root: tmpDir } = createTempHome("tamandua-test-hermes-login-");
 
-      // Isolate HOME to prevent ensureHermesSymlink from touching real ~/.local/bin
       process.env.HOME = tmpDir;
 
       const hermesDir = path.join(tmpDir, "hermes-bin");
@@ -162,17 +159,13 @@ describe("findHermesBinary", () => {
       const expected = fs.realpathSync(hermesPath);
       assert.equal(result, expected);
       
-      // Also verify the symlink was created at test HOME's ~/.local/bin
-      const linkPath = path.join(tmpDir, ".local", "bin", "hermes");
-      assert.ok(fs.existsSync(linkPath), "symlink should be created");
-      assert.equal(fs.readlinkSync(linkPath), expected);
+
     });
 
     it("resolves realpath to handle macOS /var → /private/var symlinks", async () => {
       // Create hermes inside a symlinked directory structure
       const { root: tmpDir } = createTempHome("tamandua-test-hermes-symlink-");
 
-      // Isolate HOME to prevent ensureHermesSymlink from touching real ~/.local/bin
       process.env.HOME = tmpDir;
 
       const realDir = path.join(tmpDir, "real-bin");
@@ -213,7 +206,6 @@ describe("findHermesBinary", () => {
       // realpath form.
       const { root: tmpDir } = createTempHome("tamandua-test-hermes-realpath-");
 
-      // Isolate HOME to prevent ensureHermesSymlink from touching real ~/.local/bin
       process.env.HOME = tmpDir;
 
       const hermesDir = path.join(tmpDir, "hermes-bin");
@@ -248,7 +240,6 @@ describe("findHermesBinary", () => {
       // then the error is thrown).
       const { root: tmpDir } = createTempHome("tamandua-test-hermes-nozsh-");
 
-      // Isolate HOME to prevent ensureHermesSymlink from touching real ~/.local/bin
       process.env.HOME = tmpDir;
 
       // Empty PATH — no zsh, no hermes
@@ -264,7 +255,6 @@ describe("findHermesBinary", () => {
       // Fake zsh returns a path, but the file is not executable
       const { root: tmpDir } = createTempHome("tamandua-test-hermes-notexec-");
 
-      // Isolate HOME to prevent ensureHermesSymlink from touching real ~/.local/bin
       process.env.HOME = tmpDir;
 
       const hermesDir = path.join(tmpDir, "hermes-bin");
@@ -296,7 +286,6 @@ describe("findHermesBinary", () => {
       // Fake zsh produces no output (hermes not in login shell PATH)
       const { root: tmpDir } = createTempHome("tamandua-test-hermes-empty-");
 
-      // Isolate HOME to prevent ensureHermesSymlink from touching real ~/.local/bin
       process.env.HOME = tmpDir;
 
       const fakeZshDir = path.join(tmpDir, "fake-zsh");
@@ -319,7 +308,6 @@ describe("findHermesBinary", () => {
       // PATH should win.
       const { root: tmpDir } = createTempHome("tamandua-test-hermes-pathfirst-");
 
-      // Isolate HOME to prevent ensureHermesSymlink from touching real ~/.local/bin
       process.env.HOME = tmpDir;
 
       const pathHermesDir = path.join(tmpDir, "path-hermes");
@@ -408,236 +396,132 @@ describe("findPiBinary", () => {
   });
 });
 
-describe("ensureHermesSymlink", () => {
-  let savedHome: string | undefined;
+  // ── Regression: destructive same-path scenario ─────────────────
+  // When ~/.local/bin/hermes is a regular executable, the process
+  // PATH excludes it, and login-shell discovery returns that exact path,
+  // resolution must NOT mutate the file.
 
-  beforeEach(() => {
-    savedHome = process.env.HOME;
-  });
+  it("does NOT destroy regular executable at ~/.local/bin/hermes when login shell discovers same path", async () => {
+    const savedHermes = process.env.TAMANDUA_HERMES_BINARY;
+    const savedPath = process.env.PATH;
+    const savedHome = process.env.HOME;
+    delete process.env.TAMANDUA_HERMES_BINARY;
+    try {
+    const { root: tmpDir } = createTempHome("tamandua-test-regfile-samepath-");
 
-  afterEach(() => {
-    if (savedHome !== undefined) {
-      process.env.HOME = savedHome;
-    } else {
-      delete process.env.HOME;
-    }
-  });
-
-  it("creates a symlink at ~/.local/bin/hermes when none exists", () => {
-    const { root: tmpDir } = createTempHome("tamandua-test-hermes-sl-");
-    const localBin = path.join(tmpDir, ".local", "bin");
-
-    // Point HOME at tmpDir so ~/.local/bin/hermes resolves there
     process.env.HOME = tmpDir;
 
-    // Create a hermes binary to symlink to
-    const hermesPath = path.join(tmpDir, "hermes-bin", "hermes");
-    fs.mkdirSync(path.dirname(hermesPath), { recursive: true });
-    fs.writeFileSync(hermesPath, "#!/bin/sh\necho hermes\n", { mode: 0o755 });
-
-    const linkPath = path.join(localBin, "hermes");
-    // Should not exist yet
-    assert.equal(fs.existsSync(linkPath), false);
-
-    const result = ensureHermesSymlink(hermesPath);
-
-    assert.equal(result, linkPath);
-    assert.ok(fs.existsSync(linkPath), "symlink should be created");
-    assert.ok(fs.lstatSync(linkPath).isSymbolicLink(), "should be a symlink");
-    assert.equal(fs.readlinkSync(linkPath), hermesPath, "should point to hermes binary");
-  });
-
-  it("is a no-op when symlink already points to the correct target", () => {
-    const { root: tmpDir } = createTempHome("tamandua-test-hermes-noop-");
+    // Create ~/.local/bin/hermes as a regular executable
     const localBin = path.join(tmpDir, ".local", "bin");
     fs.mkdirSync(localBin, { recursive: true });
+    const existingHermes = path.join(localBin, "hermes");
+    const originalContent = "#!/bin/sh\necho i am real hermes\n";
+    fs.writeFileSync(existingHermes, originalContent, { mode: 0o755 });
+    const originalMode = fs.statSync(existingHermes).mode;
+    const originalSize = fs.statSync(existingHermes).size;
 
-    process.env.HOME = tmpDir;
+    // Fake zsh that returns the ~/.local/bin/hermes path
+    const fakeZshDir = path.join(tmpDir, "fake-zsh");
+    fs.mkdirSync(fakeZshDir, { recursive: true });
+    const fakeZsh = path.join(fakeZshDir, "zsh");
+    fs.writeFileSync(
+      fakeZsh,
+      `#!/bin/sh\necho ${existingHermes}\n`,
+      { mode: 0o755 },
+    );
 
-    const hermesPath = path.join(tmpDir, "hermes-bin", "hermes");
-    fs.mkdirSync(path.dirname(hermesPath), { recursive: true });
-    fs.writeFileSync(hermesPath, "#!/bin/sh\necho hermes\n", { mode: 0o755 });
+    // PATH has the fake zsh but NOT ~/.local/bin
+    process.env.PATH = fakeZshDir;
 
-    // Create the symlink first
-    const linkPath = path.join(localBin, "hermes");
-    fs.symlinkSync(hermesPath, linkPath);
-    const originalMtime = fs.lstatSync(linkPath).mtimeMs;
+    const result = await findHermesBinary();
+    const expected = fs.realpathSync(existingHermes);
+    assert.equal(result, expected);
 
-    // Call ensureHermesSymlink — should be a no-op
-    const result = ensureHermesSymlink(hermesPath);
-
-    assert.equal(result, linkPath);
-    assert.equal(fs.readlinkSync(linkPath), hermesPath, "should still point to the same target");
-    assert.equal(fs.lstatSync(linkPath).mtimeMs, originalMtime, "symlink should not be touched");
-  });
-
-  it("replaces symlink pointing to wrong target", () => {
-    const { root: tmpDir } = createTempHome("tamandua-test-hermes-wrong-");
-    const localBin = path.join(tmpDir, ".local", "bin");
-    fs.mkdirSync(localBin, { recursive: true });
-
-    process.env.HOME = tmpDir;
-
-    const wrongPath = path.join(tmpDir, "old-hermes", "hermes");
-    fs.mkdirSync(path.dirname(wrongPath), { recursive: true });
-    fs.writeFileSync(wrongPath, "#!/bin/sh\necho old\n", { mode: 0o755 });
-
-    const correctPath = path.join(tmpDir, "new-hermes", "hermes");
-    fs.mkdirSync(path.dirname(correctPath), { recursive: true });
-    fs.writeFileSync(correctPath, "#!/bin/sh\necho new\n", { mode: 0o755 });
-
-    // Create symlink pointing to wrong target
-    const linkPath = path.join(localBin, "hermes");
-    fs.symlinkSync(wrongPath, linkPath);
-    assert.equal(fs.readlinkSync(linkPath), wrongPath);
-
-    // ensureHermesSymlink should replace it
-    const result = ensureHermesSymlink(correctPath);
-
-    assert.equal(result, linkPath);
-    assert.equal(fs.readlinkSync(linkPath), correctPath, "should now point to correct target");
-  });
-
-  it("replaces regular file at symlink path (EINVAL)", () => {
-    const { root: tmpDir } = createTempHome("tamandua-test-hermes-einval-");
-    const localBin = path.join(tmpDir, ".local", "bin");
-    fs.mkdirSync(localBin, { recursive: true });
-
-    process.env.HOME = tmpDir;
-
-    const hermesPath = path.join(tmpDir, "hermes-bin", "hermes");
-    fs.mkdirSync(path.dirname(hermesPath), { recursive: true });
-    fs.writeFileSync(hermesPath, "#!/bin/sh\necho hermes\n", { mode: 0o755 });
-
-    // Create a regular file at the symlink path
-    const linkPath = path.join(localBin, "hermes");
-    fs.writeFileSync(linkPath, "regular file, not a symlink");
-    assert.ok(!fs.lstatSync(linkPath).isSymbolicLink(), "should be a regular file");
-
-    // ensureHermesSymlink should replace it with a symlink
-    const result = ensureHermesSymlink(hermesPath);
-
-    assert.equal(result, linkPath);
-    assert.ok(fs.lstatSync(linkPath).isSymbolicLink(), "should now be a symlink");
-    assert.equal(fs.readlinkSync(linkPath), hermesPath);
-  });
-
-  it("creates .local/bin directory if it does not exist", () => {
-    const { root: tmpDir } = createTempHome("tamandua-test-hermes-mkdir-");
-
-    process.env.HOME = tmpDir;
-
-    // .local/bin should NOT exist
-    const localBin = path.join(tmpDir, ".local", "bin");
-    assert.equal(fs.existsSync(localBin), false);
-
-    const hermesPath = path.join(tmpDir, "hermes-bin", "hermes");
-    fs.mkdirSync(path.dirname(hermesPath), { recursive: true });
-    fs.writeFileSync(hermesPath, "#!/bin/sh\necho hermes\n", { mode: 0o755 });
-
-    const result = ensureHermesSymlink(hermesPath);
-
-    const linkPath = path.join(localBin, "hermes");
-    assert.equal(result, linkPath);
-    assert.ok(fs.existsSync(localBin), ".local/bin should be created");
-    assert.ok(fs.lstatSync(linkPath).isSymbolicLink());
-  });
-
-  // ── Integration: symlink created during hermes discovery ──────────
-
-  describe("integration with findHermesBinary", () => {
-    let savedHome: string | undefined;
-    let savedPath: string | undefined;
-
-    beforeEach(() => {
-      savedHome = process.env.HOME;
-      savedPath = process.env.PATH;
-      delete process.env.TAMANDUA_HERMES_BINARY;
-    });
-
-    afterEach(() => {
-      if (savedHome !== undefined) {
-        process.env.HOME = savedHome;
+    // The file MUST remain a regular executable with identical bytes
+    assert.ok(fs.existsSync(existingHermes), "file must still exist");
+    assert.ok(!fs.lstatSync(existingHermes).isSymbolicLink(), "must remain a regular file, not a symlink");
+    assert.equal(fs.readFileSync(existingHermes, "utf-8"), originalContent, "file content must be unchanged");
+    assert.equal(fs.statSync(existingHermes).size, originalSize, "file size must be unchanged");
+    assert.equal(fs.statSync(existingHermes).mode, originalMode, "file mode must be unchanged");
+    } finally {
+      if (savedHermes === undefined) {
+        delete process.env.TAMANDUA_HERMES_BINARY;
       } else {
-        delete process.env.HOME;
+        process.env.TAMANDUA_HERMES_BINARY = savedHermes;
       }
       if (savedPath !== undefined) {
         process.env.PATH = savedPath;
       }
-      delete process.env.TAMANDUA_HERMES_BINARY;
-    });
-
-    it("creates symlink when hermes is resolved via login shell", async () => {
-      const { root: tmpDir } = createTempHome("tamandua-test-hs-integration-");
-      process.env.HOME = tmpDir;
-
-      // Place hermes in a dir not on PATH
-      const hermesDir = path.join(tmpDir, "hermes-bin");
-      fs.mkdirSync(hermesDir, { recursive: true });
-      const hermesPath = path.join(hermesDir, "hermes");
-      fs.writeFileSync(hermesPath, "#!/bin/sh\necho hermes\n", { mode: 0o755 });
-
-      // Fake zsh that outputs the hermes path
-      const fakeZshDir = path.join(tmpDir, "fake-zsh");
-      fs.mkdirSync(fakeZshDir, { recursive: true });
-      const fakeZsh = path.join(fakeZshDir, "zsh");
-      fs.writeFileSync(
-        fakeZsh,
-        `#!/bin/sh\necho ${hermesPath}\n`,
-        { mode: 0o755 },
-      );
-
-      // PATH has the fake zsh but NOT the hermes dir.
-      // Do NOT append savedPath — the real ~/.local/bin/hermes would
-      // be found before the login-shell fallback.
-      process.env.PATH = fakeZshDir;
-
-      const result = await findHermesBinary();
-      const expected = fs.realpathSync(hermesPath);
-      assert.equal(result, expected);
-
-      // Verify symlink was created
-      const linkPath = path.join(tmpDir, ".local", "bin", "hermes");
-      assert.ok(fs.existsSync(linkPath), "symlink should be created by findHermesBinary");
-      assert.ok(fs.lstatSync(linkPath).isSymbolicLink());
-      assert.equal(fs.readlinkSync(linkPath), expected);
-    });
-
-    it("idempotent: repeated discovery does not touch existing correct symlink", async () => {
-      const { root: tmpDir } = createTempHome("tamandua-test-hs-idem-");
-      process.env.HOME = tmpDir;
-
-      // Place hermes in a dir not on PATH
-      const hermesDir = path.join(tmpDir, "hermes-bin");
-      fs.mkdirSync(hermesDir, { recursive: true });
-      const hermesPath = path.join(hermesDir, "hermes");
-      fs.writeFileSync(hermesPath, "#!/bin/sh\necho hermes\n", { mode: 0o755 });
-
-      // Fake zsh
-      const fakeZshDir = path.join(tmpDir, "fake-zsh");
-      fs.mkdirSync(fakeZshDir, { recursive: true });
-      const fakeZsh = path.join(fakeZshDir, "zsh");
-      fs.writeFileSync(
-        fakeZsh,
-        `#!/bin/sh\necho ${hermesPath}\n`,
-        { mode: 0o755 },
-      );
-
-      // Do NOT append savedPath — the real ~/.local/bin/hermes would
-      // be found before the login-shell fallback.
-      process.env.PATH = fakeZshDir;
-
-      // First discovery
-      await findHermesBinary();
-      const linkPath = path.join(tmpDir, ".local", "bin", "hermes");
-      assert.ok(fs.existsSync(linkPath));
-      const mtimeAfterFirst = fs.lstatSync(linkPath).mtimeMs;
-
-      // Second discovery — should be no-op
-      await findHermesBinary();
-      assert.equal(fs.lstatSync(linkPath).mtimeMs, mtimeAfterFirst, "symlink should not be touched");
-      const expected = fs.realpathSync(hermesPath);
-      assert.equal(fs.readlinkSync(linkPath), expected);
-    });
+      if (savedHome !== undefined) {
+        process.env.HOME = savedHome;
+      }
+    }
   });
-});
+
+  // ── Regression: unrelated ~/.local/bin/hermes stays untouched ──
+  // When ~/.local/bin/hermes is a user regular file and login discovery
+  // returns a DIFFERENT hermes elsewhere, the existing path must remain
+  // untouched.
+
+  it("does NOT touch regular file at ~/.local/bin/hermes when login shell discovers a different hermes", async () => {
+    const savedHermes = process.env.TAMANDUA_HERMES_BINARY;
+    const savedPath = process.env.PATH;
+    const savedHome = process.env.HOME;
+    delete process.env.TAMANDUA_HERMES_BINARY;
+    try {
+    const { root: tmpDir } = createTempHome("tamandua-test-regfile-otherpath-");
+
+    process.env.HOME = tmpDir;
+
+    // Create ~/.local/bin/hermes as a regular file (NOT symlink-replaced)
+    const localBin = path.join(tmpDir, ".local", "bin");
+    fs.mkdirSync(localBin, { recursive: true });
+    const existingHermes = path.join(localBin, "hermes");
+    const originalContent = "regular user file — should not be touched";
+    fs.writeFileSync(existingHermes, originalContent);
+    const originalMode = fs.statSync(existingHermes).mode;
+    const originalSize = fs.statSync(existingHermes).size;
+
+    // Create hermes in a DIFFERENT location (not ~/.local/bin)
+    const hermesDir = path.join(tmpDir, "other-hermes-dir");
+    fs.mkdirSync(hermesDir, { recursive: true });
+    const discoveredHermes = path.join(hermesDir, "hermes");
+    fs.writeFileSync(discoveredHermes, "#!/bin/sh\necho discovered hermes\n", { mode: 0o755 });
+
+    // Fake zsh that returns the DIFFERENT hermes path
+    const fakeZshDir = path.join(tmpDir, "fake-zsh");
+    fs.mkdirSync(fakeZshDir, { recursive: true });
+    const fakeZsh = path.join(fakeZshDir, "zsh");
+    fs.writeFileSync(
+      fakeZsh,
+      `#!/bin/sh\necho ${discoveredHermes}\n`,
+      { mode: 0o755 },
+    );
+
+    // PATH has fake zsh but NOT ~/.local/bin and NOT the other hermes dir
+    process.env.PATH = fakeZshDir;
+
+    const result = await findHermesBinary();
+    const expected = fs.realpathSync(discoveredHermes);
+    assert.equal(result, expected);
+
+    // ~/.local/bin/hermes must be untouched
+    assert.ok(fs.existsSync(existingHermes), "existing file must still exist");
+    assert.ok(!fs.lstatSync(existingHermes).isSymbolicLink(), "must remain a regular file");
+    assert.equal(fs.readFileSync(existingHermes, "utf-8"), originalContent, "file content must be unchanged");
+    assert.equal(fs.statSync(existingHermes).size, originalSize, "file size must be unchanged");
+    assert.equal(fs.statSync(existingHermes).mode, originalMode, "file mode must be unchanged");
+    } finally {
+      if (savedHermes === undefined) {
+        delete process.env.TAMANDUA_HERMES_BINARY;
+      } else {
+        process.env.TAMANDUA_HERMES_BINARY = savedHermes;
+      }
+      if (savedPath !== undefined) {
+        process.env.PATH = savedPath;
+      }
+      if (savedHome !== undefined) {
+        process.env.HOME = savedHome;
+      }
+    }
+  });

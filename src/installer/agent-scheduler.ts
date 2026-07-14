@@ -1,7 +1,5 @@
-import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { resolveTamanduaCli, resolveWorkflowDir, resolveWorkflowWorkspaceDir } from "./paths.js";
 import type { WorkflowSpec, WorkflowAgent, HarnessType } from "./types.js";
@@ -174,20 +172,6 @@ export interface FindPiBinaryOptions {
   preferTokenSaver?: boolean;
 }
 
-function searchPathForExecutable(name: string): string | null {
-  const pathDirs = (process.env.PATH ?? "").split(path.delimiter);
-  for (const dir of pathDirs) {
-    const candidate = path.join(dir, name);
-    try {
-      fs.accessSync(candidate, fs.constants.X_OK);
-      return candidate;
-    } catch {
-      // not found in this dir, keep looking
-    }
-  }
-  return null;
-}
-
 /**
  * Thin wrapper around {@link PiHarnessAdapter.findBinary} so existing
  * imports from this module stay unbroken.
@@ -199,173 +183,24 @@ export async function findPiBinary(options: FindPiBinaryOptions = {}): Promise<s
 
 // ── hermes binary discovery ───────────────────────────────────────
 
+import { resolveHermesBinary, resolveHermesViaLoginShell } from "./hermes-resolver.js";
+
+// Re-export for backward compat (doctor.ts uses this; US-004 will move
+// doctor.ts to import directly from hermes-resolver.js).
+export { resolveHermesViaLoginShell };
+
 /**
- * Resolve path to hermes binary through three-tier discovery:
+ * Thin async wrapper around {@link resolveHermesBinary} from the shared
+ * Hermes resolver module. Discovery is entirely side-effect-free — no
+ * filesystem mutation (no symlink creation, no file deletion, no chmod).
  *
- *   1. TAMANDUA_HERMES_BINARY env var (explicit config — always wins)
- *   2. process.env.PATH lookup (daemon's own PATH)
- *   3. Login-shell fallback: spawns `zsh -lic 'command -v hermes'` so
- *      hermes installed via nix/homebrew/npm in shell-specific paths
- *      is discoverable even when it is not on the daemon's PATH.
- *
- * The login-shell path is resolved with fs.realpathSync to handle
- * /var → /private/var symlinks on macOS. If zsh is not available or
- * the command fails, the fallback is skipped gracefully.
+ * Resolution precedence:
+ *   1. TAMANDUA_HERMES_BINARY env var (must be X_OK)
+ *   2. Process PATH lookup
+ *   3. Login-shell fallback (zsh -lic 'command -v hermes')
  */
 export async function findHermesBinary(): Promise<string> {
-  // Prefer explicit env override
-  const envHermes = process.env.TAMANDUA_HERMES_BINARY?.trim();
-  if (envHermes) {
-    try {
-      fs.accessSync(envHermes, fs.constants.X_OK);
-      return envHermes;
-    } catch {
-      throw new Error(
-        `TAMANDUA_HERMES_BINARY set but not executable: ${envHermes}`
-      );
-    }
-  }
-
-  // Search PATH
-  const pathDirs = (process.env.PATH ?? "").split(path.delimiter);
-  for (const dir of pathDirs) {
-    const candidate = path.join(dir, "hermes");
-    try {
-      fs.accessSync(candidate, fs.constants.X_OK);
-      return candidate;
-    } catch {
-      // not found in this dir, keep looking
-    }
-  }
-
-  // Login-shell fallback: spawn `zsh -lic 'command -v hermes'`
-  const loginShellPath = await resolveHermesViaLoginShell();
-  if (loginShellPath) {
-    // Ensure the daemon can find hermes on its PATH even when
-    // hermes was discovered through login-shell directories that
-    // are not on the daemon's own PATH.
-    ensureHermesSymlink(loginShellPath);
-    return loginShellPath;
-  }
-
-  throw new Error(
-    "hermes binary not found in PATH. Install hermes or set TAMANDUA_HERMES_BINARY."
-  );
-}
-
-/**
- * Resolve hermes through the login shell PATH by spawning
- * `zsh -lic 'command -v hermes'`. Handles macOS symlinks via
- * fs.realpathSync and validates the resolved path is executable.
- *
- * Returns the resolved realpath, or `null` when zsh is unavailable or
- * hermes is not found on the login-shell PATH.
- */
-export async function resolveHermesViaLoginShell(): Promise<string | null> {
-  try {
-    const output = await spawnLoginShellCommand("command -v hermes");
-    if (!output) return null;
-
-    // Resolve symlinks (handles /var → /private/var on macOS)
-    let resolved: string;
-    try {
-      resolved = fs.realpathSync(output);
-    } catch {
-      // realpathSync fails if path doesn't exist — fall back to raw path
-      resolved = output;
-    }
-
-    // Validate executable
-    try {
-      fs.accessSync(resolved, fs.constants.X_OK);
-    } catch {
-      // Resolved path is not executable — treat as not found
-      return null;
-    }
-
-    return resolved;
-  } catch {
-    // zsh not available or spawn failed — graceful fallback
-    return null;
-  }
-}
-
-/**
- * Ensure a ~/.local/bin/hermes symlink exists pointing to the resolved
- * hermes binary. Follows the ensureCliSymlink pattern: no-op if correct,
- * replace if wrong target, create if missing.
- *
- * This makes hermes visible to the tamandua daemon on its PATH when
- * hermes was discovered via login shell and may not be on the daemon's
- * own PATH.
- *
- * @param hermesPath - Resolved absolute path to the hermes binary
- * @returns The symlink path
- * @internal Exported for test visibility; not part of the public dispatch API.
- */
-export function ensureHermesSymlink(hermesPath: string): string {
-  const binDir = path.join(os.homedir(), ".local", "bin");
-  const linkPath = path.join(binDir, "hermes");
-
-  // Guard: if symlink exists and points to the correct target, no-op
-  try {
-    const existingTarget = fs.readlinkSync(linkPath);
-    if (existingTarget === hermesPath) {
-      return linkPath;
-    }
-    // Wrong target — remove and recreate
-    fs.unlinkSync(linkPath);
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException)?.code;
-    if (code === "EINVAL") {
-      // Exists but is a regular file — remove it
-      fs.unlinkSync(linkPath);
-    }
-    // ENOENT is fine — we'll create it
-  }
-
-  // Ensure the bin directory exists
-  fs.mkdirSync(binDir, { recursive: true });
-
-  // Create the symlink
-  fs.symlinkSync(hermesPath, linkPath);
-
-  return linkPath;
-}
-
-/**
- * Spawn `zsh -lic` with the given command string. Returns the trimmed
- * stdout, or `null` when zsh is not available or the command fails.
- *
- * The timeout is capped at 5 seconds — login shell init should never
- * hang longer than that on a healthy system.
- */
-function spawnLoginShellCommand(cmd: string): Promise<string | null> {
-  return new Promise((resolve) => {
-    const child = spawn("zsh", ["-lic", cmd], {
-      stdio: ["ignore", "pipe", "ignore"],
-      timeout: 5_000,
-    });
-
-    let stdout = "";
-    child.stdout?.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString("utf-8");
-    });
-
-    child.on("error", () => {
-      // zsh not available (ENOENT) — resolve null
-      resolve(null);
-    });
-
-    child.on("close", (code) => {
-      const trimmed = stdout.trim();
-      if (code === 0 && trimmed.length > 0) {
-        resolve(trimmed);
-      } else {
-        resolve(null);
-      }
-    });
-  });
+  return resolveHermesBinary();
 }
 
 // ── Low-level pi execution ─────────────────────────────────────────
@@ -1288,9 +1123,11 @@ export async function executeDispatchRound(
 
     let output: string;
     const adapter = getHarnessAdapter(harnessType);
-    // Pre-resolve the binary path so we can pass TAMANDUA_HERMES_BINARY
-    // to the child env for hermes dispatch (the old if/else did this
-    // via findHermesBinary() before calling runHermes).
+    // Pre-resolve the binary path. For hermes, this goes through the
+    // same shared resolver that admission validation uses, guaranteeing
+    // single-source dispatch — no disagreement between validation and
+    // invocation. The resolved path is passed in options.binaryPath so
+    // runRound skips its own redundant findBinary() call.
     const binaryPath = await adapter.findBinary({ preferTokenSaver });
     const harnessEnv: Record<string, string> = {
       TAMANDUA_WORKER_JOB_ID: job.id,
@@ -1299,12 +1136,23 @@ export async function executeDispatchRound(
     if (harnessType === "hermes") {
       harnessEnv.TAMANDUA_HERMES_BINARY = binaryPath;
     }
+    // Prepend the binary's directory to the child PATH so nested
+    // hermes/pi invocations within the agent session can find the
+    // same binary, even when the daemon's own PATH lacked it (e.g.
+    // login-shell-discovered hermes). The original PATH is preserved
+    // as a suffix so standard system tools remain reachable.
+    const binaryDir = path.dirname(binaryPath);
+    const currentPathDirs = (process.env.PATH ?? "").split(path.delimiter);
+    if (!currentPathDirs.includes(binaryDir)) {
+      harnessEnv.PATH = `${binaryDir}${path.delimiter}${process.env.PATH ?? ""}`;
+    }
     result = await adapter.runRound(workPrompt, {
       timeout,
       workdir: workingDirectoryForHarness,
       env: harnessEnv,
       onSpawn,
       preferTokenSaver,
+      binaryPath,
     });
     output = result.output;
 
