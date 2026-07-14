@@ -27,6 +27,7 @@ const cliPath = path.resolve(repoRoot, "dist", "cli", "cli.js");
 // e2e runs stop leaking /tmp directories.
 const _cleanupDirs = new Set<string>();
 let _cleanupRegistered = false;
+const _releasedPortHandles = new WeakSet<object>();
 
 function _registerProcessCleanup() {
   if (_cleanupRegistered) return;
@@ -124,6 +125,18 @@ export async function createTempHome(options?: CreateTempHomeOptions) {
   }
 
   return { root, homeDir, tamanduaDir, controlPort, dashboardPort, portHandles };
+}
+
+/** Release reserved ports immediately before handing them to a daemon bind. */
+export async function releasePortReservations(env: {
+  portHandles?: Array<{ close(): Promise<void> }>;
+}): Promise<void> {
+  const handlesToClose = (env.portHandles ?? []).filter((handle) => {
+    if (_releasedPortHandles.has(handle)) return false;
+    _releasedPortHandles.add(handle);
+    return true;
+  });
+  await Promise.all(handlesToClose.map((handle) => handle.close()));
 }
 
 export function inheritedProcessEnv(): Record<string, string> {
@@ -396,14 +409,9 @@ export async function cleanupTempHome(
   } catch {
     // best-effort
   }
-  // Release port handles before removing the temp directory.
-  // Handles may already be closed (e.g., by scripted e2e tests that
-  // close them before daemon spawn); suppress ERR_SERVER_NOT_RUNNING.
-  if (env.portHandles) {
-    await Promise.all(
-      env.portHandles.map((h) => h.close().catch(() => {}))
-    );
-  }
+  // Release port handles before removing the temp directory. Handles may
+  // already have been released at daemon handoff.
+  await releasePortReservations(env).catch(() => {});
   try {
     fs.rmSync(env.root, { recursive: true, force: true });
   } catch {

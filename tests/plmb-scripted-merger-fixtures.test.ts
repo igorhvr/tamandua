@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 const fixtureFiles = [
-  { file: "e2e-tests/workflows-scripted.test.ts", mergers: 2 },
+  { file: "e2e-tests/workflows-scripted.test.ts", mergers: 3 },
   { file: "e2e-tests/workflows-scripted-hermes.test.ts", mergers: 1 },
   { file: "e2e-tests/workflows-stress-concurrent.test.ts", mergers: 1 },
 ];

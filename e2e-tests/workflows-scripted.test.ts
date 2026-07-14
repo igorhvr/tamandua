@@ -934,14 +934,12 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
       },
       merger: {
         commands: [
-          `git -C "{{input.WORKTREE_ORIGIN_REPOSITORY}}" checkout "{{input.ORIGINAL_BRANCH}}"`,
-          `git -C "{{input.WORKTREE_ORIGIN_REPOSITORY}}" merge --squash ${OREF_BRANCH}`,
-          `git -C "{{input.WORKTREE_ORIGIN_REPOSITORY}}" commit -m "feat: OREF non-default branch merge test (squash of ${OREF_BRANCH})"`,
+          `expected_tip=$(git -C "{{input.WORKTREE_ORIGIN_REPOSITORY}}" rev-parse "refs/heads/{{input.ORIGINAL_BRANCH}}") && TAMANDUA_RUN_ID="{{input.RUN_ID}}" "${process.execPath}" "${cliPath}" merge-branch --origin "{{input.WORKTREE_ORIGIN_REPOSITORY}}" --branch "${OREF_BRANCH}" --into "{{input.ORIGINAL_BRANCH}}" --expect-tip "$expected_tip" --message "feat: OREF non-default branch merge test (squash of ${OREF_BRANCH})"`,
         ],
+        includeCommandOutput: true,
         output: [
           "STATUS: done",
           "REBASED: false",
-          "MERGE_COMMIT: scripted-oref",
           "MERGED_INTO: {{input.ORIGINAL_BRANCH}}",
         ].join("\n"),
       },
@@ -956,14 +954,18 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
       try {
         ctx = await startScriptedEnvironment("feature-dev-merge-worktree", featureDevOrefBehaviors);
         const repoDir = prepareGitRepo(fixtureDir, path.join(ctx.env.root, "origin-repo"));
+        const originalBranch = execSync("git symbolic-ref --short HEAD", {
+          cwd: repoDir,
+          encoding: "utf-8",
+        }).trim();
 
-        // Create alt-branch at the same commit, add a marker, then switch back to main.
-        // main is checked out in the origin repo — if the OREF fix works, the merger
-        // will target alt-branch (not main) because --worktree-origin-ref overrides
+        // Create alt-branch at the same commit, add a marker, then switch back to the original branch.
+        // The original branch is checked out in the origin repo — if the OREF fix works, the merger
+        // will target alt-branch (not the original branch) because --worktree-origin-ref overrides
         // the checked-out branch.
         execSync(`git checkout -b ${OREF_MERGE_TARGET}`, { cwd: repoDir });
         execSync(`git commit --allow-empty -m "marker: alt-branch exists"`, { cwd: repoDir });
-        execSync("git checkout main", { cwd: repoDir });
+        execSync(`git checkout ${originalBranch}`, { cwd: repoDir });
 
         const runIdPrefix = await spawnWorkflowRun(
           [
@@ -1005,7 +1007,7 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
           );
         }
 
-        // ── Repository outcome: merge landed on alt-branch, NOT main ──
+        // ── Repository outcome: merge landed on alt-branch, NOT the original branch ──
         // alt-branch should have the oref-marker.ts from the squash merge
         execSync(`git checkout ${OREF_MERGE_TARGET}`, { cwd: repoDir });
         const altMarker = fs.readFileSync(path.join(repoDir, "src", "oref-marker.ts"), "utf-8");
@@ -1026,20 +1028,20 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
           `alt-branch log should contain the squash merge commit:\n${altLog}`,
         );
 
-        // main should NOT have oref-marker.ts
-        execSync("git checkout main", { cwd: repoDir });
+        // The original branch should NOT have oref-marker.ts
+        execSync(`git checkout ${originalBranch}`, { cwd: repoDir });
         assert.ok(
           !fs.existsSync(path.join(repoDir, "src", "oref-marker.ts")),
-          "main should NOT contain oref-marker.ts — merge should have landed on alt-branch, not main",
+          `${originalBranch} should NOT contain oref-marker.ts — merge should have landed on alt-branch, not ${originalBranch}`,
         );
 
-        // main should have only the initial commit (no squash merge)
-        const mainLog = execSync("git log --oneline", { cwd: repoDir, encoding: "utf-8" }).trim();
-        const mainLogLines = mainLog.split("\n");
+        // The original branch should have only the initial commit (no squash merge)
+        const originalBranchLog = execSync("git log --oneline", { cwd: repoDir, encoding: "utf-8" }).trim();
+        const originalBranchLogLines = originalBranchLog.split("\n");
         assert.equal(
-          mainLogLines.length,
+          originalBranchLogLines.length,
           1,
-          `main should have exactly 1 commit (initial), got ${mainLogLines.length}:\n${mainLog}`,
+          `${originalBranch} should have exactly 1 commit (initial), got ${originalBranchLogLines.length}:\n${originalBranchLog}`,
         );
 
         // ── Origin repo not left dirty ──

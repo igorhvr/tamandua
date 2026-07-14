@@ -3,6 +3,7 @@ import { execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { describe, it } from "node:test";
+import { releasePortReservations } from "../e2e-tests/helpers/smoke-helpers.ts";
 
 const repoRoot = process.cwd();
 
@@ -482,6 +483,55 @@ describe("e2e test infrastructure", () => {
       "createTempHome must use reservePortHandles to avoid TOCTOU port race",
     );
   });
+
+  it("port reservation handoff closes each handle at most once", async () => {
+    const closeCounts = [0, 0];
+    const env = {
+      portHandles: closeCounts.map((_, index) => ({
+        async close() {
+          closeCounts[index] += 1;
+        },
+      })),
+    };
+
+    await Promise.all([
+      releasePortReservations(env),
+      releasePortReservations(env),
+    ]);
+    await releasePortReservations(env);
+
+    assert.deepEqual(closeCounts, [1, 1]);
+  });
+
+  for (const fileName of [
+    "workflows-stress-concurrent.test.ts",
+    "workflows-e2e.test.ts",
+  ]) {
+    it(`${fileName} releases reserved ports before every daemon start`, () => {
+      const content = fs.readFileSync(
+        path.join(repoRoot, "e2e-tests", fileName),
+        "utf-8",
+      );
+      const startOffsets = Array.from(
+        content.matchAll(/\bstartIsolatedDaemon\s*\(/g),
+        (match) => match.index,
+      );
+      assert.ok(startOffsets.length > 0, `${fileName} should start an isolated daemon`);
+
+      let previousStart = -1;
+      for (const startOffset of startOffsets) {
+        const releaseOffset = content.lastIndexOf(
+          "await releasePortReservations(env);",
+          startOffset,
+        );
+        assert.ok(
+          releaseOffset > previousStart,
+          `${fileName} must release env port reservations before daemon start at offset ${startOffset}`,
+        );
+        previousStart = startOffset;
+      }
+    });
+  }
 
   it("e2e-tests/workflows-e2e.test.ts documents worktree cleanup", () => {
     const content = fs.readFileSync(

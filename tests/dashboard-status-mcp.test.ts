@@ -316,7 +316,11 @@ describe("tamandua dashboard status MCP visibility", () => {
   // AC 4: get-ready tries to start MCP when not running
   it("tamandua get-ready starts MCP when MCP is not running", async () => {
     const tempEnv = createTempEnv();
+    const dashboardPortHandle = await reservePortHandle();
+    const mcpPortHandle = await reservePortHandle();
     const controlPortHandle = await reservePortHandle();
+    const dashboardPort = dashboardPortHandle.port;
+    const mcpPort = mcpPortHandle.port;
     const controlPort = controlPortHandle.port;
     const cliEnv = {
       HOME: tempEnv.homeDir,
@@ -325,6 +329,40 @@ describe("tamandua dashboard status MCP visibility", () => {
     };
 
     try {
+      const piConfigDir = path.join(tempEnv.homeDir, ".pi", "agent");
+      fs.mkdirSync(piConfigDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(piConfigDir, "settings.json"),
+        JSON.stringify({ defaultProvider: "stub", defaultModel: "stub" }),
+        "utf-8",
+      );
+      assert.deepEqual(
+        JSON.parse(fs.readFileSync(path.join(piConfigDir, "settings.json"), "utf-8")),
+        { defaultProvider: "stub", defaultModel: "stub" },
+      );
+
+      // get-ready currently starts services on their defaults when they are
+      // absent. Start this test's isolated services first so get-ready never
+      // probes or binds a developer's dashboard/MCP ports.
+      await dashboardPortHandle.close();
+      const dashboardStart = await runCliOnce(
+        ["dashboard", "start", "--port", String(dashboardPort)],
+        cliEnv,
+      );
+      assert.equal(dashboardStart.code, 0, dashboardStart.stderr || dashboardStart.stdout);
+
+      await mcpPortHandle.close();
+      const mcpStart = await runCliOnce(["mcp", "start", "--port", String(mcpPort)], cliEnv);
+      assert.equal(mcpStart.code, 0, mcpStart.stderr || mcpStart.stdout);
+      assert.equal(
+        fs.readFileSync(path.join(tempEnv.homeDir, ".tamandua", "port"), "utf-8"),
+        String(dashboardPort),
+      );
+      assert.equal(
+        fs.readFileSync(path.join(tempEnv.homeDir, ".tamandua", "mcp-port"), "utf-8"),
+        String(mcpPort),
+      );
+
       await controlPortHandle.close();
 
       const install = await runCliOnce(["get-ready"], cliEnv);
@@ -334,8 +372,12 @@ describe("tamandua dashboard status MCP visibility", () => {
       // a Note with the recovery command instead of the old passive message.
       assert.match(install.stdout, /MCP server already running\.|MCP server started|Note: MCP server not started[\s\S]*recover: tamandua mcp start/);
     } finally {
+      await safeClose(dashboardPortHandle);
+      await safeClose(mcpPortHandle);
       await safeClose(controlPortHandle);
       await runCliOnce(["uninstall", "--force"], cliEnv);
+      await runCliOnce(["dashboard", "stop"], cliEnv);
+      await runCliOnce(["mcp", "stop"], cliEnv);
       fs.rmSync(tempEnv.root, { recursive: true, force: true });
     }
   });

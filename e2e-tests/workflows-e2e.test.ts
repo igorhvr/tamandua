@@ -64,6 +64,7 @@ import {
   resolveFullRunId,
   cleanupTempHome,
   preserveE2eTestHome,
+  releasePortReservations,
 } from "./helpers/smoke-helpers.ts";
 import {
   startIsolatedDaemon,
@@ -251,6 +252,7 @@ describe(
       async () => {
         try {
         // ── Start daemon ────────────────────────────────────────────
+        await releasePortReservations(env);
         daemon = await startIsolatedDaemon(
           env.homeDir,
           env.controlPort,
@@ -400,6 +402,7 @@ describe(
       async () => {
         try {
         // ── Restart daemon for clean scheduler state ────────────────
+        await releasePortReservations(env);
         daemon = await startIsolatedDaemon(
           env.homeDir,
           env.controlPort,
@@ -567,6 +570,7 @@ describe(
         prepareGitRepo(fixtureDir, quarantineRepoDir);
 
         // ── Start daemon ──────────────────────────────────────────
+        await releasePortReservations(env);
         daemon = await startIsolatedDaemon(
           env.homeDir,
           env.controlPort,
@@ -704,6 +708,7 @@ describe(
         prepareGitRepo(vulnFixtureDir, vulnRepoDir);
 
         // ── Restart daemon for clean scheduler state ────────────
+        await releasePortReservations(env);
         daemon = await startIsolatedDaemon(
           env.homeDir,
           env.controlPort,
@@ -921,6 +926,7 @@ describe("real e2e do-now workflow (LIVE agent, daemon, scheduler)", () => {
         const workdir = path.join(env.root, "do-now-workdir");
         fs.mkdirSync(workdir, { recursive: true });
 
+        await releasePortReservations(env);
         daemon = await startIsolatedDaemon(
           env.homeDir,
           env.controlPort,

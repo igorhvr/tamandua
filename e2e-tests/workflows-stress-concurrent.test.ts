@@ -37,6 +37,7 @@ import {
   resolveFullRunId,
   cleanupTempHome,
   preserveE2eTestHome,
+  releasePortReservations,
 } from "./helpers/smoke-helpers.ts";
 import {
   startIsolatedDaemon,
@@ -223,6 +224,7 @@ async function createRunEnv(fi: FeatureInfo): Promise<RunEnv> {
     baseEnv(env.homeDir, env.controlPort),
     `install bug-fix-merge-worktree for feature-${fi.n}`,
   );
+  await releasePortReservations(env);
   const daemon = await startIsolatedDaemon(
     env.homeDir,
     env.controlPort,
