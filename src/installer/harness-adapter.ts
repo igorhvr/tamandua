@@ -32,8 +32,8 @@ export interface HarnessRoundResult {
   redactedIndices?: number[];
   /** True when the command preview had prompt arguments elided. */
   promptElided?: boolean;
-  /** Sanitized tail of stderr output (last ~8KB, ANSI-stripped, lines truncated). */
-  stderrTail?: string;
+  /** Sanitized tail of stderr output (last ~8KB, ANSI-stripped, lines truncated), or an empty string. */
+  stderrTail: string;
   /** True when the round was terminated by a timeout guard (exitCode will be null, signal SIGTERM). */
   timedOut?: boolean;
 }
@@ -380,7 +380,7 @@ class PiHarnessAdapter implements HarnessAdapter {
       output: filteredStdout.trim(),
       exitCode: exitCode,
       signal: exitSignal ?? undefined,
-      stderrTail: stderrTail || undefined,
+      stderrTail,
       timedOut: timedOut || undefined,
     };
   }
@@ -775,7 +775,7 @@ class HermesHarnessAdapter implements HarnessAdapter {
       commandPreview: preview.commandPreview,
       redactedIndices: preview.redactedIndices,
       promptElided: preview.promptElided,
-      stderrTail: stderrTail || undefined,
+      stderrTail,
     };
   }
 }

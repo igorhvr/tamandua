@@ -102,7 +102,7 @@ describe("PiHarnessAdapter stderrTail", () => {
     assert.ok(result.stderrTail!.includes("red error"), "stderrTail should contain the message without ANSI codes");
   });
 
-  it("pi runRound stderrTail is undefined when stderr is empty", async () => {
+  it("pi runRound stderrTail is an empty string when stderr is empty", async () => {
     const binDir = path.join(tempDir, "bin");
     fs.mkdirSync(binDir, { recursive: true });
     const fakePi = makeExecutable(binDir, "pi", [
@@ -116,7 +116,7 @@ describe("PiHarnessAdapter stderrTail", () => {
     const adapter = getHarnessAdapter("pi");
     const result = await adapter.runRound("do work");
 
-    assert.equal(result.stderrTail, undefined, "stderrTail should be undefined for empty stderr");
+    assert.equal(result.stderrTail, "", "stderrTail should be an empty string for empty stderr");
   });
 });
 
@@ -170,7 +170,7 @@ describe("HermesHarnessAdapter stderrTail", () => {
     // strips ANSI codes, truncates lines, and bounds size.
   });
 
-  it("hermes runRound stderrTail is undefined when stderr is empty", async () => {
+  it("hermes runRound stderrTail is an empty string when stderr is empty", async () => {
     const binDir = path.join(tempDir, "bin");
     fs.mkdirSync(binDir, { recursive: true });
     const fakeHermes = makeExecutable(binDir, "hermes", [
@@ -184,7 +184,7 @@ describe("HermesHarnessAdapter stderrTail", () => {
     const adapter = getHarnessAdapter("hermes");
     const result = await adapter.runRound("do work");
 
-    assert.equal(result.stderrTail, undefined, "stderrTail should be undefined for empty stderr");
+    assert.equal(result.stderrTail, "", "stderrTail should be an empty string for empty stderr");
   });
 
   it("hermes runRound stderrTail is bounded to ~8KB even with large stderr", async () => {
@@ -218,7 +218,7 @@ describe("HermesHarnessAdapter stderrTail", () => {
 });
 
 describe("stderrTail event payload shape", () => {
-  // Verify that HarnessRoundResult type includes stderrTail as optional string
+  // Verify that HarnessRoundResult requires stderrTail as a string.
   it("HarnessRoundResult.stderrTail accepts a string value", () => {
     const result: HarnessRoundResult = {
       output: "test",
@@ -227,9 +227,8 @@ describe("stderrTail event payload shape", () => {
     assert.equal(result.stderrTail, "sanitized stderr here");
   });
 
-  it("HarnessRoundResult.stderrTail is optional and can be undefined", () => {
-    const result: HarnessRoundResult = { output: "test" };
-    // Access without error — field is optional
-    assert.equal(result.stderrTail, undefined);
+  it("HarnessRoundResult.stderrTail accepts an empty string", () => {
+    const result: HarnessRoundResult = { output: "test", stderrTail: "" };
+    assert.equal(result.stderrTail, "");
   });
 });

@@ -21,11 +21,12 @@ describe("HarnessAdapter interface", () => {
   });
 
   it("exports HarnessRoundResult type", () => {
-    const r: HarnessRoundResult = { output: "test" };
+    const r: HarnessRoundResult = { output: "test", stderrTail: "" };
     assert.equal(r.output, "test");
     assert.equal(r.sessionRef, undefined);
     const rWithSession: HarnessRoundResult = {
       output: "test",
+      stderrTail: "",
       sessionRef: "sess-123",
     };
     assert.equal(rWithSession.sessionRef, "sess-123");
@@ -223,6 +224,7 @@ describe("PiHarnessAdapter implementation", () => {
         });
 
         assert.equal(result.output, "hello-from-adapter");
+        assert.equal(result.stderrTail, "");
         assert.equal(result.sessionRef, undefined);
       } finally {
         if (originalPiBinary === undefined) {
@@ -254,6 +256,7 @@ describe("PiHarnessAdapter implementation", () => {
         assert.equal(result.exitCode, 7);
         assert.equal(result.signal, undefined);
         assert.equal(result.timedOut, undefined);
+        assert.equal(result.stderrTail, "");
       } finally {
         if (originalPiBinary === undefined) {
           delete process.env.TAMANDUA_PI_BINARY;
@@ -264,7 +267,32 @@ describe("PiHarnessAdapter implementation", () => {
       }
     });
 
-    it("resolves on timeout — returns exitCode: null, signal: SIGTERM, timedOut: true, stderrTail populated", async () => {
+    it("resolves on timeout with an empty string stderrTail when the child writes no stderr", async () => {
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-runround-");
+      const fakePi = path.join(tmpDir, "pi");
+      fs.writeFileSync(fakePi, "#!/bin/sh\nsleep 10", "utf-8");
+      fs.chmodSync(fakePi, 0o755);
+
+      const originalPiBinary = process.env.TAMANDUA_PI_BINARY;
+      process.env.TAMANDUA_PI_BINARY = fakePi;
+
+      try {
+        const result = await adapter.runRound("prompt", { timeout: 0.05, workdir: tmpDir });
+        assert.equal(result.exitCode, null);
+        assert.equal(result.signal, "SIGTERM");
+        assert.equal(result.timedOut, true);
+        assert.equal(typeof result.stderrTail, "string");
+        assert.equal(result.stderrTail, "");
+      } finally {
+        if (originalPiBinary === undefined) {
+          delete process.env.TAMANDUA_PI_BINARY;
+        } else {
+          process.env.TAMANDUA_PI_BINARY = originalPiBinary;
+        }
+      }
+    });
+
+    it("resolves on timeout with stderrTail populated from pre-timeout stderr", async () => {
       const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-runround-");
       const fakePi = path.join(tmpDir, "pi");
       fs.writeFileSync(
@@ -278,13 +306,11 @@ describe("PiHarnessAdapter implementation", () => {
       process.env.TAMANDUA_PI_BINARY = fakePi;
 
       try {
-        const result = await adapter.runRound("prompt", { timeout: 2, workdir: tmpDir });
+        const result = await adapter.runRound("prompt", { timeout: 5, workdir: tmpDir });
         assert.equal(result.exitCode, null);
         assert.equal(result.signal, "SIGTERM");
         assert.equal(result.timedOut, true);
-        // stderrTail should be populated from the stderr written before timeout
-        assert.ok(typeof result.stderrTail === "string");
-        assert.ok(result.stderrTail!.includes("stderr output"));
+        assert.ok(result.stderrTail.includes("stderr output"));
       } finally {
         if (originalPiBinary === undefined) {
           delete process.env.TAMANDUA_PI_BINARY;
@@ -581,6 +607,7 @@ echo "session_id: 20260518_103004_cdae11"`,
       try {
         const result = await adapter.runRound("do something", { timeout: 5 });
         assert.equal(result.output, "");
+        assert.equal(result.stderrTail, "");
       } finally {
         if (originalHermesBinary === undefined) {
           delete process.env.TAMANDUA_HERMES_BINARY;
@@ -1281,13 +1308,14 @@ echo "session_id: 20260518_103004_cdae11" >&2`,
 // ── Type-level checks that the implement types work ────────────────
 
 describe("HarnessRoundResult shape", () => {
-  it("output is required, sessionRef is optional", () => {
-    const minimal: HarnessRoundResult = { output: "hello" };
+  it("output and stderrTail are required, sessionRef is optional", () => {
+    const minimal: HarnessRoundResult = { output: "hello", stderrTail: "" };
     assert.equal(minimal.output, "hello");
     assert.equal(minimal.sessionRef, undefined);
 
     const full: HarnessRoundResult = {
       output: "hello",
+      stderrTail: "stderr",
       sessionRef: "sess-abc",
     };
     assert.equal(full.output, "hello");
