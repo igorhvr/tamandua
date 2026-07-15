@@ -117,6 +117,7 @@ tests/syntax-check.test.ts
 tests/system-token-spend-migration.test.ts
 tests/token-log-formatting.test.ts
 tests/update-command.test.ts
+tests/update-protocol.test.ts
 tests/work-round-persona-prompt.test.ts
 tests/work-round-token-attribution.test.ts
 tests/workflow-contract.test.ts
