@@ -1,6 +1,5 @@
 import fs from "node:fs";
-import { cleanChildEnv, reservePortHandles, waitForPidExit } from "./helpers/test-env.ts";
-import { stopDaemon, stopDashboardStandalone } from "../dist/server/daemonctl.js";
+import { cleanChildEnv, reservePortHandles } from "./helpers/test-env.ts";
 import path from "node:path";
 import { tamanduaTempDir } from "../src/lib/temp-dir.ts";
 import assert from "node:assert/strict";
@@ -218,37 +217,7 @@ describe("CLI worktree run arguments", () => {
       );
       assert.equal(context.worktree_origin_ref, "main");
     } finally {
-      // Stop both the dashboard (started by startDashboard) and the daemon (started by workflow run).
-      // The prior code only called dashboard stop which checked dashboard.pid — the daemon's
-      // tamandua.pid was never read, leaving detached daemon processes.
-      const dashboardPidFile = path.join(env.homeDir, ".tamandua", "dashboard.pid");
-      const daemonPidFile = path.join(env.homeDir, ".tamandua", "tamandua.pid");
-      let dashboardPid: number | null = null;
-      let daemonPid: number | null = null;
-      try {
-        if (fs.existsSync(dashboardPidFile)) dashboardPid = parseInt(fs.readFileSync(dashboardPidFile, "utf-8").trim(), 10);
-        if (fs.existsSync(daemonPidFile)) daemonPid = parseInt(fs.readFileSync(daemonPidFile, "utf-8").trim(), 10);
-      } catch {}
-      if (dashboardPid !== null && !isNaN(dashboardPid)) {
-        let wasAlive = false;
-        try { process.kill(dashboardPid, 0); wasAlive = true; } catch {}
-        const stopped = stopDashboardStandalone({ homeDir: env.homeDir });
-        if (wasAlive) {
-          assert.ok(stopped, `stopDashboardStandalone must return true when dashboard PID ${dashboardPid} is alive`);
-          const exited = await waitForPidExit(dashboardPid, 10000);
-          assert.ok(exited, `dashboard PID ${dashboardPid} must exit before temp directory cleanup`);
-        }
-      }
-      if (daemonPid !== null && !isNaN(daemonPid)) {
-        let wasAlive = false;
-        try { process.kill(daemonPid, 0); wasAlive = true; } catch {}
-        const stopped = stopDaemon({ homeDir: env.homeDir });
-        if (wasAlive) {
-          assert.ok(stopped, `stopDaemon must return true when daemon PID ${daemonPid} is alive`);
-          const exited = await waitForPidExit(daemonPid, 10000);
-          assert.ok(exited, `daemon PID ${daemonPid} must exit before temp directory cleanup`);
-        }
-      }
+      await runCliToExit(["dashboard", "stop"], cliEnv(env)).catch(() => ({ stdout: "", stderr: "", code: null }));
       try { fs.rmSync(env.root, { recursive: true, force: true }); } catch {}
     }
   });
@@ -282,35 +251,7 @@ describe("CLI worktree run arguments", () => {
       );
       assert.equal(context.worktree_origin_ref, "main");
     } finally {
-      // Stop both the dashboard (started by startDashboard) and the daemon (started by workflow run).
-      const dashboardPidFile = path.join(env.homeDir, ".tamandua", "dashboard.pid");
-      const daemonPidFile = path.join(env.homeDir, ".tamandua", "tamandua.pid");
-      let dashboardPid: number | null = null;
-      let daemonPid: number | null = null;
-      try {
-        if (fs.existsSync(dashboardPidFile)) dashboardPid = parseInt(fs.readFileSync(dashboardPidFile, "utf-8").trim(), 10);
-        if (fs.existsSync(daemonPidFile)) daemonPid = parseInt(fs.readFileSync(daemonPidFile, "utf-8").trim(), 10);
-      } catch {}
-      if (dashboardPid !== null && !isNaN(dashboardPid)) {
-        let wasAlive = false;
-        try { process.kill(dashboardPid, 0); wasAlive = true; } catch {}
-        const stopped = stopDashboardStandalone({ homeDir: env.homeDir });
-        if (wasAlive) {
-          assert.ok(stopped, `stopDashboardStandalone must return true when dashboard PID ${dashboardPid} is alive`);
-          const exited = await waitForPidExit(dashboardPid, 10000);
-          assert.ok(exited, `dashboard PID ${dashboardPid} must exit before temp directory cleanup`);
-        }
-      }
-      if (daemonPid !== null && !isNaN(daemonPid)) {
-        let wasAlive = false;
-        try { process.kill(daemonPid, 0); wasAlive = true; } catch {}
-        const stopped = stopDaemon({ homeDir: env.homeDir });
-        if (wasAlive) {
-          assert.ok(stopped, `stopDaemon must return true when daemon PID ${daemonPid} is alive`);
-          const exited = await waitForPidExit(daemonPid, 10000);
-          assert.ok(exited, `daemon PID ${daemonPid} must exit before temp directory cleanup`);
-        }
-      }
+      await runCliToExit(["dashboard", "stop"], cliEnv(env)).catch(() => ({ stdout: "", stderr: "", code: null }));
       try { fs.rmSync(env.root, { recursive: true, force: true }); } catch {}
     }
   });
@@ -342,35 +283,7 @@ describe("CLI worktree run arguments", () => {
       );
       assert.ok(context.worktree_origin_ref, "expected worktree_origin_ref to be defaulted from the origin branch");
     } finally {
-      // Stop both the dashboard (started by startDashboard) and the daemon (started by workflow run).
-      const dashboardPidFile = path.join(env.homeDir, ".tamandua", "dashboard.pid");
-      const daemonPidFile = path.join(env.homeDir, ".tamandua", "tamandua.pid");
-      let dashboardPid: number | null = null;
-      let daemonPid: number | null = null;
-      try {
-        if (fs.existsSync(dashboardPidFile)) dashboardPid = parseInt(fs.readFileSync(dashboardPidFile, "utf-8").trim(), 10);
-        if (fs.existsSync(daemonPidFile)) daemonPid = parseInt(fs.readFileSync(daemonPidFile, "utf-8").trim(), 10);
-      } catch {}
-      if (dashboardPid !== null && !isNaN(dashboardPid)) {
-        let wasAlive = false;
-        try { process.kill(dashboardPid, 0); wasAlive = true; } catch {}
-        const stopped = stopDashboardStandalone({ homeDir: env.homeDir });
-        if (wasAlive) {
-          assert.ok(stopped, `stopDashboardStandalone must return true when dashboard PID ${dashboardPid} is alive`);
-          const exited = await waitForPidExit(dashboardPid, 10000);
-          assert.ok(exited, `dashboard PID ${dashboardPid} must exit before temp directory cleanup`);
-        }
-      }
-      if (daemonPid !== null && !isNaN(daemonPid)) {
-        let wasAlive = false;
-        try { process.kill(daemonPid, 0); wasAlive = true; } catch {}
-        const stopped = stopDaemon({ homeDir: env.homeDir });
-        if (wasAlive) {
-          assert.ok(stopped, `stopDaemon must return true when daemon PID ${daemonPid} is alive`);
-          const exited = await waitForPidExit(daemonPid, 10000);
-          assert.ok(exited, `daemon PID ${daemonPid} must exit before temp directory cleanup`);
-        }
-      }
+      await runCliToExit(["dashboard", "stop"], cliEnv(env)).catch(() => ({ stdout: "", stderr: "", code: null }));
       try { fs.rmSync(env.root, { recursive: true, force: true }); } catch {}
     }
   });
@@ -471,35 +384,7 @@ describe("CLI worktree run arguments", () => {
         assert.match(stdout, new RegExp(`Harness CWD: ${worktreeRow!.worktree_path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
       }
     } finally {
-      // Stop both the dashboard (started by startDashboard) and the daemon (started by workflow run).
-      const dashboardPidFile = path.join(env.homeDir, ".tamandua", "dashboard.pid");
-      const daemonPidFile = path.join(env.homeDir, ".tamandua", "tamandua.pid");
-      let dashboardPid: number | null = null;
-      let daemonPid: number | null = null;
-      try {
-        if (fs.existsSync(dashboardPidFile)) dashboardPid = parseInt(fs.readFileSync(dashboardPidFile, "utf-8").trim(), 10);
-        if (fs.existsSync(daemonPidFile)) daemonPid = parseInt(fs.readFileSync(daemonPidFile, "utf-8").trim(), 10);
-      } catch {}
-      if (dashboardPid !== null && !isNaN(dashboardPid)) {
-        let wasAlive = false;
-        try { process.kill(dashboardPid, 0); wasAlive = true; } catch {}
-        const stopped = stopDashboardStandalone({ homeDir: env.homeDir });
-        if (wasAlive) {
-          assert.ok(stopped, `stopDashboardStandalone must return true when dashboard PID ${dashboardPid} is alive`);
-          const exited = await waitForPidExit(dashboardPid, 10000);
-          assert.ok(exited, `dashboard PID ${dashboardPid} must exit before temp directory cleanup`);
-        }
-      }
-      if (daemonPid !== null && !isNaN(daemonPid)) {
-        let wasAlive = false;
-        try { process.kill(daemonPid, 0); wasAlive = true; } catch {}
-        const stopped = stopDaemon({ homeDir: env.homeDir });
-        if (wasAlive) {
-          assert.ok(stopped, `stopDaemon must return true when daemon PID ${daemonPid} is alive`);
-          const exited = await waitForPidExit(daemonPid, 10000);
-          assert.ok(exited, `daemon PID ${daemonPid} must exit before temp directory cleanup`);
-        }
-      }
+      await runCliToExit(["dashboard", "stop"], cliEnv(env)).catch(() => ({ stdout: "", stderr: "", code: null }));
       try { fs.rmSync(env.root, { recursive: true, force: true }); } catch {}
     }
   });

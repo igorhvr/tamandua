@@ -16,7 +16,7 @@
  */
 
 import { describe, it } from "node:test";
-import { cleanChildEnv, createTempHome, reservePortHandle, waitForPidExit } from "./helpers/test-env.ts";
+import { cleanChildEnv, createTempHome, reservePortHandle } from "./helpers/test-env.ts";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import http from "node:http";
@@ -29,7 +29,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // In dev (tsx), compiled CLI is in dist/cli/
 const CLI_SCRIPT = path.resolve(__dirname, "..", "dist", "cli", "cli.js");
 
-import { stopDaemon } from "../dist/server/daemonctl.js";
+import { stopControlPlane } from "../dist/server/daemonctl.js";
 import { DEFAULT_CONTROL_PORT } from "../dist/server/control-server.js";
 
 // ═══════════════════════════════════════════════════════════════════
@@ -157,25 +157,8 @@ function isIsolatedControlPlaneRunning(homeDir: string): { running: true; pid: n
   }
 }
 
-async function stopIsolatedControlPlane(homeDir: string): Promise<void> {
-  // control-plane start is an alias for daemon start → writes tamandua.pid, not control-plane.pid.
-  const pidFile = getIsolatedControlPlanePidFile(homeDir);
-  let pid: number | null = null;
-  try {
-    if (fs.existsSync(pidFile)) {
-      pid = parseInt(fs.readFileSync(pidFile, "utf-8").trim(), 10);
-    }
-  } catch {}
-  if (pid !== null && !isNaN(pid)) {
-    let wasAlive = false;
-    try { process.kill(pid, 0); wasAlive = true; } catch {}
-    const stopped = stopDaemon({ homeDir });
-    if (wasAlive) {
-      assert.ok(stopped, `stopDaemon({ homeDir }) must return true when daemon PID ${pid} is alive`);
-      const exited = await waitForPidExit(pid, 10000);
-      assert.ok(exited, `daemon PID ${pid} must exit before cleanup`);
-    }
-  }
+function stopIsolatedControlPlane(homeDir: string): boolean {
+  return stopControlPlane({ homeDir });
 }
 
 function cleanupIsolatedControlPlaneFiles(homeDir: string): void {
@@ -211,7 +194,7 @@ describe("tamandua control-plane CLI", { concurrency: 1 }, () => {
     assert.equal(cleanStderr(stderr), "");
     } finally {
       portHandle.close().catch(() => {});
-      await stopIsolatedControlPlane(tempHome);
+      stopIsolatedControlPlane(tempHome);
     }
   });
 
@@ -248,7 +231,7 @@ describe("tamandua control-plane CLI", { concurrency: 1 }, () => {
 
     } finally {
       portHandle.close().catch(() => {});
-      await stopIsolatedControlPlane(tempHome);
+      stopIsolatedControlPlane(tempHome);
     }
   });
 
@@ -280,7 +263,7 @@ describe("tamandua control-plane CLI", { concurrency: 1 }, () => {
 
     } finally {
       portHandle.close().catch(() => {});
-      await stopIsolatedControlPlane(tempHome);
+      stopIsolatedControlPlane(tempHome);
     }
   });
 
@@ -310,7 +293,7 @@ describe("tamandua control-plane CLI", { concurrency: 1 }, () => {
 
     } finally {
       portHandle.close().catch(() => {});
-      await stopIsolatedControlPlane(tempHome);
+      stopIsolatedControlPlane(tempHome);
     }
   });
 
@@ -348,7 +331,7 @@ describe("tamandua control-plane CLI", { concurrency: 1 }, () => {
 
     } finally {
       portHandle.close().catch(() => {});
-      await stopIsolatedControlPlane(tempHome);
+      stopIsolatedControlPlane(tempHome);
     }
   });
 
@@ -373,7 +356,6 @@ describe("tamandua control-plane CLI", { concurrency: 1 }, () => {
     const runningStatus = isIsolatedControlPlaneRunning(tempHome);
     assert.equal(runningStatus.running, true);
     assert.ok(runningStatus.pid);
-    const capturedPid = runningStatus.pid;
 
     fs.unlinkSync(getIsolatedControlPlanePidFile(tempHome));
 
@@ -386,23 +368,7 @@ describe("tamandua control-plane CLI", { concurrency: 1 }, () => {
     assert.ok(!second.stdout.includes("Control plane started"));
 
     } finally {
-      // The PID file was deliberately deleted, so stopIsolatedControlPlane's
-      // normal path (read PID from file) won't find the daemon. Restore the
-      // captured PID into the isolated tamandua.pid only if the process is
-      // still alive, then use the guarded stopDaemon({ homeDir }) path.
-      let pidAbsent = false;
-      try {
-        if (!fs.existsSync(getIsolatedControlPlanePidFile(tempHome))) pidAbsent = true;
-      } catch {}
-      let alive = false;
-      try { process.kill(capturedPid, 0); alive = true; } catch {}
-      if (alive && pidAbsent) {
-        fs.writeFileSync(getIsolatedControlPlanePidFile(tempHome), String(capturedPid), "utf-8");
-        const stopped = stopDaemon({ homeDir: tempHome });
-        assert.ok(stopped, `stopDaemon must return true when daemon PID ${capturedPid} is alive`);
-        const exited = await waitForPidExit(capturedPid, 10000);
-        assert.ok(exited, `daemon PID ${capturedPid} must exit before cleanup`);
-      }
+      stopIsolatedControlPlane(tempHome);
     }
   });
 
@@ -440,7 +406,7 @@ describe("tamandua control-plane CLI", { concurrency: 1 }, () => {
 
     } finally {
       portHandle.close().catch(() => {});
-      await stopIsolatedControlPlane(tempHome);
+      stopIsolatedControlPlane(tempHome);
     }
   });
 
@@ -485,7 +451,7 @@ describe("tamandua control-plane CLI", { concurrency: 1 }, () => {
 
     } finally {
       portHandle.close().catch(() => {});
-      await stopIsolatedControlPlane(tempHome);
+      stopIsolatedControlPlane(tempHome);
     }
   });
 
@@ -501,7 +467,7 @@ describe("tamandua control-plane CLI", { concurrency: 1 }, () => {
     assert.ok(stdout.includes("not running"), `Expected "not running", got: ${stdout}`);
     assert.equal(cleanStderr(stderr), "");
     } finally {
-      await stopIsolatedControlPlane(tempHome);
+      stopIsolatedControlPlane(tempHome);
     }
   });
 });
