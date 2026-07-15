@@ -36,7 +36,8 @@ import { collectProcessSnapshot, matchRunEvidence } from "./installer/run-cleanu
 import { getRecentEvents } from "./installer/events.js";
 import type { TamanduaEvent } from "./installer/events.js";
 import { probeHermesStateContract } from "./installer/hermes-usage.js";
-import { resolveHermesBinary, resolveHermesViaLoginShell } from "./installer/hermes-resolver.js";
+import { resolveHermesBinaryDetailed, HermesResolverError } from "./installer/hermes-resolver.js";
+import type { HermesSource } from "./installer/hermes-resolver.js";
 
 // ── Types ──────────────────────────────────────────────────────────
 
@@ -216,71 +217,58 @@ function checkPiTokenSaver(): DoctorCheckResult {
 
 /**
  * Discover hermes binary via the three-tier chain.
- * Returns availability plus the resolved path for use by sub-checks.
+ * Returns availability plus the resolved path and source for use by sub-checks.
  */
-async function discoverHermesBinary(): Promise<{ available: boolean; path?: string }> {
-  // Use the shared resolver (resolveHermesBinary) so doctor discovery
-  // semantics cannot drift from scheduler dispatch semantics.
-  // Tiers: TAMANDUA_HERMES_BINARY → PATH → login shell.
+async function discoverHermesBinary(): Promise<HermesDiscoveryResult> {
   try {
-    const result = await resolveHermesBinary();
-    return { available: true, path: result };
-  } catch {
+    const result = await resolveHermesBinaryDetailed();
+    return { available: true, path: result.path, source: result.source };
+  } catch (err) {
+    if (err instanceof HermesResolverError) {
+      if (err.code === "invalid_env_binary") {
+        return { available: false, rawEnvValue: err.rawConfiguredValue, invalidEnv: true };
+      }
+    }
     return { available: false };
   }
 }
 
 /**
- * Detect Hermes binary availability and report the full discovery chain.
- * Checks TAMANDUA_HERMES_BINARY → PATH → login shell.
- * Hermes support is alpha — always informational.
+ * Report the Hermes binary discovery diagnostic.
+ *
+ * Consumes the SINGLE shared resolver result from `discoverHermesBinary()`
+ * — no duplicate PATH scanning, no inline accessSync, no direct login-shell
+ * call. The same one result controls both the discovery message and the
+ * contract check gate.
  */
-async function checkHermesBinary(): Promise<DoctorCheckResult> {
-  const envBinary = process.env.TAMANDUA_HERMES_BINARY?.trim();
-  if (envBinary) {
-    try {
-      fs.accessSync(envBinary, fs.constants.X_OK);
-      return {
-        name: "Hermes binary discovery",
-        status: "info",
-        message: `Found via TAMANDUA_HERMES_BINARY: ${envBinary}`,
-      };
-    } catch {
-      return {
-        name: "Hermes binary discovery",
-        status: "info",
-        message: `TAMANDUA_HERMES_BINARY set to ${envBinary} but not executable (alpha support)`,
-      };
-    }
+function buildHermesBinaryDiscoveryCheck(
+  hermes: HermesDiscoveryResult,
+): DoctorCheckResult {
+  if (hermes.invalidEnv) {
+    return {
+      name: "Hermes binary discovery",
+      status: "info",
+      message: `TAMANDUA_HERMES_BINARY set to ${hermes.rawEnvValue} but not executable (alpha support)`,
+    };
   }
 
-  const pathDirs = (process.env.PATH ?? "").split(path.delimiter);
-  for (const dir of pathDirs) {
-    const candidate = path.join(dir, "hermes");
-    try {
-      fs.accessSync(candidate, fs.constants.X_OK);
-      return {
-        name: "Hermes binary discovery",
-        status: "info",
-        message: `Found on PATH: ${candidate} (alpha support)`,
-      };
-    } catch {
-      // not found in this dir
+  if (hermes.available && hermes.path) {
+    let sourceMessage: string;
+    if (hermes.source === "env") {
+      sourceMessage = `Found via TAMANDUA_HERMES_BINARY: ${hermes.path}`;
+    } else if (hermes.source === "token-saver") {
+      sourceMessage = `Found on PATH (hermes-token-saver): ${hermes.path}`;
+    } else if (hermes.source === "login-shell") {
+      sourceMessage = `Found via login shell: ${hermes.path}`;
+    } else {
+      sourceMessage = `Found on PATH: ${hermes.path}`;
     }
-  }
 
-  // Tier 3: Login shell
-  try {
-    const loginShellPath = await resolveHermesViaLoginShell();
-    if (loginShellPath) {
-      return {
-        name: "Hermes binary discovery",
-        status: "info",
-        message: `Found via login shell: ${loginShellPath} (alpha support)`,
-      };
-    }
-  } catch {
-    // login shell not available or hermes not found
+    return {
+      name: "Hermes binary discovery",
+      status: "info",
+      message: `${sourceMessage} (alpha support)`,
+    };
   }
 
   return {
@@ -912,12 +900,23 @@ function runProcessLeakChecks(opts?: DoctorOpts): DoctorCheckResult[] {
   }
 }
 
+// ── Shared Hermes discovery result type ───────────────────────────
+
+/** Result from the shared discoverHermesBinary call — used by both the discovery check and contract check. */
+interface HermesDiscoveryResult {
+  available: boolean;
+  path?: string;
+  source?: HermesSource;
+  rawEnvValue?: string;
+  invalidEnv?: boolean;
+}
+
 // ── Check Runner ───────────────────────────────────────────────────
 
 /**
  * Run all doctor check groups.
  *
- * Orchestrates the four check categories:
+ * Orchestrates the check categories:
  *   1. ENVIRONMENT — runtime environment checks (Node.js, pi, gh, etc.)
  *   2. SERVICES    — daemon, control plane, dashboard, MCP liveness
  *   3. STALENESS   — running daemon build vs. installed build
@@ -1084,8 +1083,8 @@ async function guardedChecks(
 
 export async function runDoctorChecks(opts?: DoctorOpts): Promise<CheckGroup[]> {
   // ENVIRONMENT — wired in US-003
-  // Discover hermes once to share the resolved path across chain / symlink / contract checks.
-  const hermesAvailable = await discoverHermesBinary();
+  // Discover hermes once to share the resolved path across discovery message and contract check.
+  const hermesAvailable: HermesDiscoveryResult = await discoverHermesBinary();
 
   const envPromises: Array<DoctorCheckResult | Promise<DoctorCheckResult>> = [
     checkNodeVersion(),
@@ -1093,8 +1092,7 @@ export async function runDoctorChecks(opts?: DoctorOpts): Promise<CheckGroup[]> 
     checkGhOnPath(),
     checkPiTokenSaver(),
     checkHermesTokenSaver(),
-    checkHermesBinary(),
-
+    buildHermesBinaryDiscoveryCheck(hermesAvailable),
   ];
 
   // Hermes contract check: only included when a hermes binary is available.

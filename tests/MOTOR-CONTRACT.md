@@ -93,11 +93,11 @@ token overhead on real runs (see the historical baselines at the bottom).
   `src/installer/hermes-resolver.test.ts` (absolute-path tests).
 
 - **C0-paths** **Child-only PATH adjustment.** Before invoking the harness
-  process, `HermesHarnessAdapter.runRound` prepends `path.dirname(binaryPath)`
-  to the child `PATH` (when the directory isn't already on PATH), so nested
-  harness invocations find the same binary.  This adjustment is *child-only* —
-  the daemon's own PATH is never modified.  Pinned by
-  `src/installer/harness-adapter.test.ts` (dispatch-from-different-cwd tests).
+  process, `executeDispatchRound` in `src/installer/agent-scheduler.ts` prepends
+  `path.dirname(binaryPath)` to the child `PATH` (when the directory isn't
+  already on PATH), so nested harness invocations find the same binary.  This
+  adjustment is *child-only* — the daemon's own PATH is never modified.  Pinned
+  by `src/installer/harness-adapter.test.ts` (dispatch-from-different-cwd tests).
 
 - **C0-no-mutation** **Zero filesystem mutation.** Automatic Hermes
   discovery must never create, delete, replace, chmod, or otherwise mutate

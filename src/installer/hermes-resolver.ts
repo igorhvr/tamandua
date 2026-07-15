@@ -31,28 +31,58 @@ export interface ResolveHermesBinaryOptions {
   preferTokenSaver?: boolean;
 }
 
+/** Discovery source for the resolved Hermes binary. */
+export type HermesSource = "env" | "token-saver" | "path" | "login-shell";
+
+/** Structured result from the detailed resolver. */
+export interface HermesBinaryResult {
+  path: string;
+  source: HermesSource;
+}
+
 /**
- * Resolve the Hermes binary through three-tier discovery.
- *
- * Throws a clear actionable error when no valid Hermes is found.
+ * Typed error for invalid TAMANDUA_HERMES_BINARY configuration.
+ * Carries a stable code and the raw configured value so callers
+ * (e.g. doctor.ts) can format an invalid-env diagnostic without
+ * rechecking the filesystem.
  */
-export async function resolveHermesBinary(
+export class HermesResolverError extends Error {
+  public readonly code: "invalid_env_binary" | "not_found";
+  public readonly rawConfiguredValue?: string;
+
+  constructor(
+    code: "invalid_env_binary" | "not_found",
+    message: string,
+    rawConfiguredValue?: string,
+  ) {
+    super(message);
+    this.name = "HermesResolverError";
+    this.code = code;
+    this.rawConfiguredValue = rawConfiguredValue;
+  }
+}
+
+/**
+ * Resolve the Hermes binary through three-tier discovery, returning
+ * structured path + source information.
+ *
+ * Throws `HermesResolverError` on failure.
+ */
+export async function resolveHermesBinaryDetailed(
   options: ResolveHermesBinaryOptions = {},
-): Promise<string> {
+): Promise<HermesBinaryResult> {
   // Tier 1: Explicit env override
   const envHermes = process.env.TAMANDUA_HERMES_BINARY?.trim();
   if (envHermes) {
-    // Resolve relative paths against process.cwd() so dispatch from a
-    // different working directory doesn't fail with "./hermes: not found".
     const resolved = path.resolve(envHermes);
-    try {
-      fs.accessSync(resolved, fs.constants.X_OK);
-      return resolved;
-    } catch {
-      throw new Error(
-        `TAMANDUA_HERMES_BINARY set but not executable: ${envHermes}`,
-      );
+    if (isExecutable(resolved)) {
+      return { path: resolved, source: "env" };
     }
+    throw new HermesResolverError(
+      "invalid_env_binary",
+      `TAMANDUA_HERMES_BINARY set but not executable: ${envHermes}`,
+      envHermes,
+    );
   }
 
   // Tier 2: PATH search (optionally preferring token-saver)
@@ -60,14 +90,9 @@ export async function resolveHermesBinary(
 
   if (options.preferTokenSaver) {
     for (const dir of pathDirs) {
-      // Resolve against process.cwd() so relative/empty PATH entries
-      // produce absolute paths — dispatch from a different cwd won't break.
       const candidate = path.resolve(dir, "hermes-token-saver");
-      try {
-        fs.accessSync(candidate, fs.constants.X_OK);
-        return candidate;
-      } catch {
-        // not found in this dir
+      if (isExecutable(candidate)) {
+        return { path: candidate, source: "token-saver" };
       }
     }
     // Fall through to normal hermes search
@@ -75,23 +100,46 @@ export async function resolveHermesBinary(
 
   for (const dir of pathDirs) {
     const candidate = path.resolve(dir, "hermes");
-    try {
-      fs.accessSync(candidate, fs.constants.X_OK);
-      return candidate;
-    } catch {
-      // not found in this dir
+    if (isExecutable(candidate)) {
+      return { path: candidate, source: "path" };
     }
   }
 
   // Tier 3: Login-shell fallback
   const loginShellPath = await resolveHermesViaLoginShell();
   if (loginShellPath) {
-    return loginShellPath;
+    return { path: loginShellPath, source: "login-shell" };
   }
 
-  throw new Error(
+  throw new HermesResolverError(
+    "not_found",
     "hermes binary not found in PATH. Install hermes or set TAMANDUA_HERMES_BINARY.",
   );
+}
+
+/**
+ * Resolve the Hermes binary through three-tier discovery.
+ *
+ * Thin wrapper around `resolveHermesBinaryDetailed` — returns only
+ * the resolved absolute path. Kept API-compatible for existing callers.
+ *
+ * Throws a clear actionable error when no valid Hermes is found.
+ */
+export async function resolveHermesBinary(
+  options: ResolveHermesBinaryOptions = {},
+): Promise<string> {
+  const result = await resolveHermesBinaryDetailed(options);
+  return result.path;
+}
+
+/** Synchronous single-file X_OK check to avoid try/catch churn. */
+function isExecutable(candidate: string): boolean {
+  try {
+    fs.accessSync(candidate, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // ── Login-shell fallback ───────────────────────────────────────────

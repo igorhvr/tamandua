@@ -271,14 +271,31 @@ describe("validateRunHarnessForScheduling", () => {
     });
 
     const savedPath = process.env.PATH;
-    delete process.env.TAMANDUA_HERMES_BINARY;
+    const savedHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
     try {
-      // Find git's directory so we can construct a PATH that has git but NOT
-      // hermes. This ensures the resolver can't find hermes via tier 2 (PATH)
-      // and the login-shell fallback (tier 3) also doesn't find it.
+      // Determine the absolute real git executable BEFORE any PATH mutation.
       const gitWhich = spawnSync("which", ["git"], { encoding: "utf-8" });
-      const gitDir = path.dirname(gitWhich.stdout.trim());
-      process.env.PATH = gitDir;
+      const realGit = fs.realpathSync(gitWhich.stdout.trim());
+      // Validate setup: real git must be absolute and executable.
+      assert.ok(path.isAbsolute(realGit), "real git must be absolute");
+      fs.accessSync(realGit, fs.constants.X_OK);
+
+      // Create an isolated tool dir with ONLY a symlink named git → real git.
+      const toolDir = path.join(tempDir, "tools");
+      fs.mkdirSync(toolDir, { recursive: true });
+      fs.symlinkSync(realGit, path.join(toolDir, "git"));
+
+      // Verify no hermes exists in the isolated tool dir.
+      assert.equal(
+        fs.existsSync(path.join(toolDir, "hermes")),
+        false,
+        "isolated tool dir must not contain hermes",
+      );
+
+      // PATH = isolated git only; no hermes, no zsh, no savedPath.
+      delete process.env.TAMANDUA_HERMES_BINARY;
+      process.env.PATH = toolDir;
+
       await assert.rejects(
         validateRunHarnessForScheduling("run-wt-hermes-reject", JSON.stringify({
           workspace_mode: "worktree",
@@ -289,7 +306,16 @@ describe("validateRunHarnessForScheduling", () => {
         /hermes is not available/,
       );
     } finally {
-      process.env.PATH = savedPath;
+      if (savedPath !== undefined) {
+        process.env.PATH = savedPath;
+      } else {
+        delete process.env.PATH;
+      }
+      if (savedHermesBinary !== undefined) {
+        process.env.TAMANDUA_HERMES_BINARY = savedHermesBinary;
+      } else {
+        delete process.env.TAMANDUA_HERMES_BINARY;
+      }
       removeRunWorktree({ runId: "run-wt-hermes-reject", force: true });
     }
   });
@@ -355,6 +381,7 @@ describe("validateRunHarnessForScheduling", () => {
     fs.writeFileSync(path.join(hermesDir, "hermes"), "#!/bin/sh\necho ok\n", { mode: 0o755 });
 
     const savedPath = process.env.PATH;
+    const savedHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
     delete process.env.TAMANDUA_HERMES_BINARY;
     try {
       // Prepend hermes bin dir to saved PATH so hermes is found via tier 2
@@ -368,7 +395,16 @@ describe("validateRunHarnessForScheduling", () => {
       assert.equal(result.workingDirectoryForHarness, worktree.worktreePath);
       assert.equal(result.expectedBranch, undefined);
     } finally {
-      process.env.PATH = savedPath;
+      if (savedPath !== undefined) {
+        process.env.PATH = savedPath;
+      } else {
+        delete process.env.PATH;
+      }
+      if (savedHermesBinary !== undefined) {
+        process.env.TAMANDUA_HERMES_BINARY = savedHermesBinary;
+      } else {
+        delete process.env.TAMANDUA_HERMES_BINARY;
+      }
       removeRunWorktree({ runId: "run-wt-hermes-path", force: true });
     }
   });
@@ -390,24 +426,45 @@ describe("validateRunHarnessForScheduling", () => {
       worktreeOriginRepository: originRepo,
     });
 
-    // Create a mock hermes binary that the mock zsh will report
-    const hermesPath = path.join(tempDir, "login-shell-hermes");
+    // Determine the absolute real git binary BEFORE any PATH mutation.
+    const gitWhich = spawnSync("which", ["git"], { encoding: "utf-8" });
+    const realGit = fs.realpathSync(gitWhich.stdout.trim());
+    assert.ok(path.isAbsolute(realGit), "real git must be absolute");
+    fs.accessSync(realGit, fs.constants.X_OK);
+
+    // Create isolated tool dir with ONLY a symlink named git.
+    const toolDir = path.join(tempDir, "tools");
+    fs.mkdirSync(toolDir, { recursive: true });
+    fs.symlinkSync(realGit, path.join(toolDir, "git"));
+    // Verify no hermes in the tool dir.
+    assert.equal(
+      fs.existsSync(path.join(toolDir, "hermes")),
+      false,
+      "isolated tool dir must not contain hermes",
+    );
+
+    // Create a mock hermes binary that the mock zsh will report.
+    // It lives OUTSIDE PATH so only login-shell fallback can reach it.
+    const hermesDir = path.join(tempDir, "hermes-bin");
+    fs.mkdirSync(hermesDir, { recursive: true });
+    const hermesPath = path.join(hermesDir, "hermes");
     fs.writeFileSync(hermesPath, "#!/bin/sh\necho ok\n", { mode: 0o755 });
 
     // Create a mock zsh that reports the hermes path via login shell discovery.
-    // The resolver spawns `zsh -lic 'command -v hermes'`; our mock simply echoes
-    // the path regardless of input so tier 3 (login-shell fallback) succeeds.
     const mockZshDir = path.join(tempDir, "mock-zsh-dir");
     fs.mkdirSync(mockZshDir, { recursive: true });
     const mockZshPath = path.join(mockZshDir, "zsh");
     fs.writeFileSync(mockZshPath, `#!/bin/sh\necho "${hermesPath}"\n`, { mode: 0o755 });
 
     const savedPath = process.env.PATH;
-    delete process.env.TAMANDUA_HERMES_BINARY;
+    const savedHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
     try {
-      // Prepend mock zsh dir to saved PATH. Hermes is NOT on PATH, so tier 2
+      // PATH = isolated git dir + fake zsh dir only. NO savedPath append.
+      // Hermes is NOT on PATH (neither in toolDir nor mockZshDir), so tier 2
       // fails and the resolver falls through to tier 3 (login-shell fallback).
-      process.env.PATH = `${mockZshDir}${path.delimiter}${savedPath}`;
+      delete process.env.TAMANDUA_HERMES_BINARY;
+      process.env.PATH = `${toolDir}${path.delimiter}${mockZshDir}`;
+
       const result = await validateRunHarnessForScheduling("run-wt-hermes-login", JSON.stringify({
         workspace_mode: "worktree",
         repo: worktree.worktreePath,
@@ -417,7 +474,16 @@ describe("validateRunHarnessForScheduling", () => {
       assert.equal(result.workingDirectoryForHarness, worktree.worktreePath);
       assert.equal(result.expectedBranch, undefined);
     } finally {
-      process.env.PATH = savedPath;
+      if (savedPath !== undefined) {
+        process.env.PATH = savedPath;
+      } else {
+        delete process.env.PATH;
+      }
+      if (savedHermesBinary !== undefined) {
+        process.env.TAMANDUA_HERMES_BINARY = savedHermesBinary;
+      } else {
+        delete process.env.TAMANDUA_HERMES_BINARY;
+      }
       removeRunWorktree({ runId: "run-wt-hermes-login", force: true });
     }
   });
@@ -426,6 +492,7 @@ describe("validateRunHarnessForScheduling", () => {
     const workdir = path.join(tempDir, "work");
     fs.mkdirSync(workdir, { recursive: true });
     // Unset TAMANDUA_HERMES_BINARY so PATH search fails
+    const savedHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
     delete process.env.TAMANDUA_HERMES_BINARY;
     // Save and clear PATH to guarantee hermes not found
     const savedPath = process.env.PATH;
@@ -439,7 +506,16 @@ describe("validateRunHarnessForScheduling", () => {
         /hermes is not available/,
       );
     } finally {
-      process.env.PATH = savedPath;
+      if (savedPath !== undefined) {
+        process.env.PATH = savedPath;
+      } else {
+        delete process.env.PATH;
+      }
+      if (savedHermesBinary !== undefined) {
+        process.env.TAMANDUA_HERMES_BINARY = savedHermesBinary;
+      } else {
+        delete process.env.TAMANDUA_HERMES_BINARY;
+      }
     }
   });
 
@@ -467,6 +543,7 @@ describe("validateRunHarnessForScheduling", () => {
     const workdir = path.join(tempDir, "work");
     fs.mkdirSync(workdir, { recursive: true });
     // Even with hermes missing, "pi" harness should succeed
+    const savedHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
     delete process.env.TAMANDUA_HERMES_BINARY;
     const savedPath = process.env.PATH;
     try {
@@ -477,7 +554,16 @@ describe("validateRunHarnessForScheduling", () => {
       }));
       assert.equal(result.workingDirectoryForHarness, workdir);
     } finally {
-      process.env.PATH = savedPath;
+      if (savedPath !== undefined) {
+        process.env.PATH = savedPath;
+      } else {
+        delete process.env.PATH;
+      }
+      if (savedHermesBinary !== undefined) {
+        process.env.TAMANDUA_HERMES_BINARY = savedHermesBinary;
+      } else {
+        delete process.env.TAMANDUA_HERMES_BINARY;
+      }
     }
   });
 
@@ -485,6 +571,7 @@ describe("validateRunHarnessForScheduling", () => {
     const workdir = path.join(tempDir, "work");
     fs.mkdirSync(workdir, { recursive: true });
     // No harness_type — should default to pi, no hermes check
+    const savedHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
     delete process.env.TAMANDUA_HERMES_BINARY;
     const savedPath = process.env.PATH;
     try {
@@ -494,7 +581,16 @@ describe("validateRunHarnessForScheduling", () => {
       }));
       assert.equal(result.workingDirectoryForHarness, workdir);
     } finally {
-      process.env.PATH = savedPath;
+      if (savedPath !== undefined) {
+        process.env.PATH = savedPath;
+      } else {
+        delete process.env.PATH;
+      }
+      if (savedHermesBinary !== undefined) {
+        process.env.TAMANDUA_HERMES_BINARY = savedHermesBinary;
+      } else {
+        delete process.env.TAMANDUA_HERMES_BINARY;
+      }
     }
   });
 

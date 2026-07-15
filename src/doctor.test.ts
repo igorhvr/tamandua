@@ -624,6 +624,12 @@ describe("ENVIRONMENT hermes contract check (US-004)", () => {
   let savedPath: string | undefined;
   let fixtureDir: string | null = null;
 
+  beforeEach(() => {
+    savedHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
+    savedHermesHome = process.env.HERMES_HOME;
+    savedPath = process.env.PATH;
+  });
+
   afterEach(() => {
     if (savedHermesBinary !== undefined) {
       process.env.TAMANDUA_HERMES_BINARY = savedHermesBinary;
@@ -637,6 +643,8 @@ describe("ENVIRONMENT hermes contract check (US-004)", () => {
     }
     if (savedPath !== undefined) {
       process.env.PATH = savedPath;
+    } else {
+      delete process.env.PATH;
     }
     if (fixtureDir) {
       try { fs.rmSync(fixtureDir, { recursive: true, force: true }); } catch {}
@@ -645,19 +653,23 @@ describe("ENVIRONMENT hermes contract check (US-004)", () => {
   });
 
   it("when no hermes binary, ENVIRONMENT group has exactly 6 checks (no contract check)", async () => {
-    savedHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
     delete process.env.TAMANDUA_HERMES_BINARY;
-    // Remove hermes from PATH to ensure commandIsOnPath('hermes') returns false
-    savedPath = process.env.PATH;
 
     // Create a fake zsh that won't find hermes via login shell
-    // (the real zsh on this machine may have hermes on its login PATH)
     fixtureDir = createTempHome();
+
+    // Assert no hermes exists in the fixture dir
+    assert.strictEqual(
+      fs.existsSync(path.join(fixtureDir, "hermes")),
+      false,
+      "fixture dir must not contain hermes",
+    );
+
     const fakeZsh = path.join(fixtureDir, "zsh");
     fs.writeFileSync(fakeZsh, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
 
-    // PATH has fake zsh but no hermes
-    process.env.PATH = `${fixtureDir}:/usr/bin:/bin`;
+    // PATH has fake zsh only — isolated, no /usr/bin:/bin
+    process.env.PATH = fixtureDir;
 
     const groups = await runDoctorChecks();
     const env = groups.find((g) => g.label === "ENVIRONMENT");
@@ -674,15 +686,11 @@ describe("ENVIRONMENT hermes contract check (US-004)", () => {
   });
 
   it("hermes contract check shows info with 'contract OK' when state.db is valid", async () => {
-    savedHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
-    savedHermesHome = process.env.HERMES_HOME;
-
     // Create a fixture HERMES_HOME with a valid state.db
     fixtureDir = createTempHome();
     seedHermesFixtureDb(fixtureDir);
 
-    // Set TAMANDUA_HERMES_BINARY to a stub — the doctor's discovery chain
-    // will report it as the found binary and use it in the contract check message.
+    // Set TAMANDUA_HERMES_BINARY to a stub
     const stubPath = path.join(fixtureDir, "stub-hermes");
     fs.writeFileSync(stubPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
     process.env.TAMANDUA_HERMES_BINARY = stubPath;
@@ -711,9 +719,6 @@ describe("ENVIRONMENT hermes contract check (US-004)", () => {
   });
 
   it("hermes contract check shows warn when state.db has no sessions table", async () => {
-    savedHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
-    savedHermesHome = process.env.HERMES_HOME;
-
     // Create a fixture with state.db but no sessions table
     fixtureDir = createTempHome();
     seedHermesFixtureDb(fixtureDir, { noSessionsTable: true });
@@ -741,9 +746,6 @@ describe("ENVIRONMENT hermes contract check (US-004)", () => {
   });
 
   it("hermes contract check shows warn when state.db has missing column", async () => {
-    savedHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
-    savedHermesHome = process.env.HERMES_HOME;
-
     // Create a fixture with sessions table but missing cache_write_tokens column
     fixtureDir = createTempHome();
     seedHermesFixtureDb(fixtureDir, { missingColumns: ["cache_write_tokens"] });
@@ -770,9 +772,6 @@ describe("ENVIRONMENT hermes contract check (US-004)", () => {
   });
 
   it("hermes contract check shows warn with reason when state.db is missing", async () => {
-    savedHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
-    savedHermesHome = process.env.HERMES_HOME;
-
     // Create a fixture HERMES_HOME without state.db
     fixtureDir = createTempHome();
     seedHermesFixtureDb(fixtureDir, { noDb: true });
@@ -806,6 +805,13 @@ describe("ENVIRONMENT hermes discovery chain (US-003)", () => {
   let savedHermesHome: string | undefined;
   let fixtureDir: string | null = null;
 
+  beforeEach(() => {
+    savedHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
+    savedPath = process.env.PATH;
+    savedHome = process.env.HOME;
+    savedHermesHome = process.env.HERMES_HOME;
+  });
+
   afterEach(() => {
     if (savedHermesBinary !== undefined) {
       process.env.TAMANDUA_HERMES_BINARY = savedHermesBinary;
@@ -814,25 +820,26 @@ describe("ENVIRONMENT hermes discovery chain (US-003)", () => {
     }
     if (savedPath !== undefined) {
       process.env.PATH = savedPath;
+    } else {
+      delete process.env.PATH;
     }
     if (savedHome !== undefined) {
       process.env.HOME = savedHome;
     } else {
       delete process.env.HOME;
     }
-    if (fixtureDir) {
-      try { fs.rmSync(fixtureDir, { recursive: true, force: true }); } catch {}
-      fixtureDir = null;
-    }
     if (savedHermesHome !== undefined) {
       process.env.HERMES_HOME = savedHermesHome;
     } else {
       delete process.env.HERMES_HOME;
     }
+    if (fixtureDir) {
+      try { fs.rmSync(fixtureDir, { recursive: true, force: true }); } catch {}
+      fixtureDir = null;
+    }
   });
 
   it("discovery chain reports 'Found via TAMANDUA_HERMES_BINARY' when env var is set and executable", async () => {
-    savedHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
     fixtureDir = createTempHome();
     const stubPath = path.join(fixtureDir, "stub-hermes");
     fs.writeFileSync(stubPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
@@ -856,12 +863,12 @@ describe("ENVIRONMENT hermes discovery chain (US-003)", () => {
   });
 
   it("discovery chain reports 'TAMANDUA_HERMES_BINARY set but not executable' when env var points to missing file", async () => {
-    savedHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
     process.env.TAMANDUA_HERMES_BINARY = "/nonexistent/path/hermes";
 
     // Make sure PATH doesn't have hermes either
-    savedPath = process.env.PATH;
-    process.env.PATH = "/usr/bin:/bin";
+    const emptyDir = tamanduaTempDir("tamandua-doctor-empty-");
+    fixtureDir = emptyDir;
+    process.env.PATH = emptyDir;
 
     const groups = await runDoctorChecks();
     const env = groups.find((g) => g.label === "ENVIRONMENT");
@@ -877,14 +884,13 @@ describe("ENVIRONMENT hermes discovery chain (US-003)", () => {
   });
 
   it("discovery chain reports 'Found on PATH' when hermes is on PATH", async () => {
-    savedHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
     delete process.env.TAMANDUA_HERMES_BINARY;
 
-    savedPath = process.env.PATH;
     fixtureDir = createTempHome();
     const hermesStub = path.join(fixtureDir, "hermes");
     fs.writeFileSync(hermesStub, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
-    process.env.PATH = `${fixtureDir}:${savedPath}`;
+    // Prepend fixture dir to saved PATH
+    process.env.PATH = `${fixtureDir}:${savedPath ?? ""}`;
 
     const groups = await runDoctorChecks();
     const env = groups.find((g) => g.label === "ENVIRONMENT");
@@ -904,24 +910,28 @@ describe("ENVIRONMENT hermes discovery chain (US-003)", () => {
   });
 
   it("discovery chain reports 'Found via login shell' when hermes is only on login-shell PATH", async () => {
-    savedHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
     delete process.env.TAMANDUA_HERMES_BINARY;
 
     // Remove hermes from PATH but put a fake zsh that reports hermes
-    savedPath = process.env.PATH;
     fixtureDir = createTempHome();
     const hermesPath = path.join(fixtureDir, "real-hermes");
     fs.writeFileSync(hermesPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+
+    // Assert no hermes exists in fixtureDir (PATH tier must not satisfy)
+    assert.strictEqual(
+      fs.existsSync(path.join(fixtureDir, "hermes")),
+      false,
+      "fixture dir must not contain a hermes binary",
+    );
 
     // Create a fake zsh that just echoes the hermes path
     const fakeZsh = path.join(fixtureDir, "zsh");
     fs.writeFileSync(fakeZsh, `#!/bin/sh\necho "${hermesPath}"\n`, { mode: 0o755 });
 
-    // PATH has fake zsh but no hermes
-    process.env.PATH = `${fixtureDir}:/usr/bin:/bin`;
+    // PATH has fake zsh but no hermes — isolated fixture dir only, no /usr/bin:/bin
+    process.env.PATH = fixtureDir;
 
     // Isolate HOME to keep test self-contained
-    savedHome = process.env.HOME;
     process.env.HOME = fixtureDir;
 
     const groups = await runDoctorChecks();
@@ -938,21 +948,25 @@ describe("ENVIRONMENT hermes discovery chain (US-003)", () => {
   });
 
   it("discovery chain reports not found when hermes is absent from all tiers", async () => {
-    savedHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
     delete process.env.TAMANDUA_HERMES_BINARY;
 
-    savedPath = process.env.PATH;
     fixtureDir = createTempHome();
+
+    // Assert no hermes exists in fixtureDir
+    assert.strictEqual(
+      fs.existsSync(path.join(fixtureDir, "hermes")),
+      false,
+      "fixture dir must not contain a hermes binary",
+    );
 
     // Create a fake zsh that won't find hermes — echoes nothing
     const fakeZsh = path.join(fixtureDir, "zsh");
     fs.writeFileSync(fakeZsh, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
 
-    // PATH has our fake zsh (no hermes anywhere)
-    process.env.PATH = `${fixtureDir}:/usr/bin:/bin`;
+    // PATH has our fake zsh only (no hermes anywhere, no /usr/bin:/bin)
+    process.env.PATH = fixtureDir;
 
     // Isolate HOME so the login-shell fallback doesn't touch real fs
-    savedHome = process.env.HOME;
     process.env.HOME = fixtureDir;
 
     const groups = await runDoctorChecks();
@@ -974,9 +988,6 @@ describe("ENVIRONMENT hermes discovery chain (US-003)", () => {
 
 
   it("contract check references the discovered binary path", async () => {
-    savedHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
-    savedHermesHome = process.env.HERMES_HOME;
-
     fixtureDir = createTempHome();
     const hermesPath = path.join(fixtureDir, "hermes");
     fs.writeFileSync(hermesPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
@@ -1000,6 +1011,202 @@ describe("ENVIRONMENT hermes discovery chain (US-003)", () => {
       contractCheck!.message.includes(hermesPath),
       `Contract message should reference the hermes binary path, got: ${contractCheck!.message}`,
     );
+  });
+});
+
+// ── DSRC: Unified shared resolver in doctor (HRM3) ────────────────
+
+describe("ENVIRONMENT hermes shared resolver (DSRC)", () => {
+  let savedHermesBinary: string | undefined;
+  let savedPath: string | undefined;
+  let savedHome: string | undefined;
+  let savedHermesHome: string | undefined;
+  let fixtureDir: string | null = null;
+
+  beforeEach(() => {
+    savedHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
+    savedPath = process.env.PATH;
+    savedHome = process.env.HOME;
+    savedHermesHome = process.env.HERMES_HOME;
+  });
+
+  afterEach(() => {
+    if (savedHermesBinary !== undefined) {
+      process.env.TAMANDUA_HERMES_BINARY = savedHermesBinary;
+    } else {
+      delete process.env.TAMANDUA_HERMES_BINARY;
+    }
+    if (savedPath !== undefined) {
+      process.env.PATH = savedPath;
+    } else {
+      delete process.env.PATH;
+    }
+    if (savedHome !== undefined) {
+      process.env.HOME = savedHome;
+    } else {
+      delete process.env.HOME;
+    }
+    if (savedHermesHome !== undefined) {
+      process.env.HERMES_HOME = savedHermesHome;
+    } else {
+      delete process.env.HERMES_HOME;
+    }
+    if (fixtureDir) {
+      try { fs.rmSync(fixtureDir, { recursive: true, force: true }); } catch {}
+      fixtureDir = null;
+    }
+  });
+
+  it("discovery message and contract check reference the exact same absolute path", async () => {
+    fixtureDir = createTempHome();
+    const hermesPath = path.join(fixtureDir, "hermes");
+    fs.writeFileSync(hermesPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    process.env.TAMANDUA_HERMES_BINARY = hermesPath;
+
+    // Create a valid hermes state.db fixture
+    seedHermesFixtureDb(fixtureDir);
+    process.env.HERMES_HOME = fixtureDir;
+
+    const groups = await runDoctorChecks();
+    const env = groups.find((g) => g.label === "ENVIRONMENT");
+    assert.ok(env);
+
+    const discoveryCheck = env!.checks.find((c) => c.name === "Hermes binary discovery");
+    const contractCheck = env!.checks.find((c) => c.name === "Hermes state.db contract");
+    assert.ok(discoveryCheck, "Expected discovery check");
+    assert.ok(contractCheck, "Expected contract check");
+
+    // Both checks reference the exact same absolute path
+    assert.ok(discoveryCheck!.message.includes(hermesPath),
+      `Discovery message should include path: ${discoveryCheck!.message}`);
+    assert.ok(contractCheck!.message.includes(hermesPath),
+      `Contract message should include same path: ${contractCheck!.message}`);
+    assert.ok(contractCheck!.message.includes("probed against"),
+      `Contract message should mention 'probed against': ${contractCheck!.message}`);
+  });
+
+  it("invalid explicit override proves no fallthrough — executable hermes on PATH, invalid env wins", async () => {
+    fixtureDir = createTempHome();
+
+    // Set an explicit but non-executable binary
+    const brokenPath = path.join(fixtureDir, "hermes-broken");
+    fs.writeFileSync(brokenPath, "#!/bin/sh\nexit 1\n", { mode: 0o644 });
+    process.env.TAMANDUA_HERMES_BINARY = brokenPath;
+
+    // Place an executable fallback hermes on isolated PATH to prove no fallthrough
+    const fallbackPath = path.join(fixtureDir, "hermes");
+    fs.writeFileSync(fallbackPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    process.env.PATH = fixtureDir;
+
+    const groups = await runDoctorChecks();
+    const env = groups.find((g) => g.label === "ENVIRONMENT");
+    assert.ok(env);
+
+    const discoveryCheck = env!.checks.find((c) => c.name === "Hermes binary discovery");
+    assert.ok(discoveryCheck, "Expected discovery check");
+    assert.strictEqual(discoveryCheck!.status, "info");
+    // Must report "not executable", NOT fall through to PATH or login-shell
+    assert.ok(
+      discoveryCheck!.message.includes("not executable"),
+      `Message should say 'not executable', got: ${discoveryCheck!.message}`,
+    );
+    // Must NOT fall through to PATH even though an executable hermes exists there
+    assert.ok(
+      !discoveryCheck!.message.includes("Found on PATH"),
+      `Must not fall through to PATH: ${discoveryCheck!.message}`,
+    );
+    assert.ok(
+      !discoveryCheck!.message.includes("login shell"),
+      `Must not fall through to login shell: ${discoveryCheck!.message}`,
+    );
+    // Contract check must not appear when invalid env overrides discovery
+    const contractCheck = env!.checks.find((c) => c.name === "Hermes state.db contract");
+    assert.strictEqual(contractCheck, undefined,
+      "Contract check should be absent when TAMANDUA_HERMES_BINARY is invalid");
+  });
+
+  it("unavailable Hermes suppresses contract check", async () => {
+    // No hermes available anywhere — PATH is isolated and contains no hermes
+    delete process.env.TAMANDUA_HERMES_BINARY;
+    fixtureDir = createTempHome();
+
+    // Assert no file named hermes exists in the fixture dir
+    assert.strictEqual(
+      fs.existsSync(path.join(fixtureDir, "hermes")),
+      false,
+      "fixture dir must not contain hermes",
+    );
+
+    // Create fake zsh that returns nothing — PATH is fixture dir only, no /usr/bin:/bin
+    const fakeZsh = path.join(fixtureDir, "zsh");
+    fs.writeFileSync(fakeZsh, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+
+    process.env.PATH = fixtureDir;
+    process.env.HOME = fixtureDir;
+
+    const groups = await runDoctorChecks();
+    const env = groups.find((g) => g.label === "ENVIRONMENT");
+    assert.ok(env);
+
+    // Contract check must not exist when hermes is unavailable
+    const contractCheck = env!.checks.find((c) => c.name === "Hermes state.db contract");
+    assert.strictEqual(contractCheck, undefined,
+      "Contract check should be absent when hermes is unavailable");
+
+    // Discovery check still present (info)
+    const discoveryCheck = env!.checks.find((c) => c.name === "Hermes binary discovery");
+    assert.ok(discoveryCheck, "Discovery check should be present");
+    assert.strictEqual(discoveryCheck!.status, "info");
+  });
+
+  it("fake-zsh test proves exactly one login-shell probe during one runDoctorChecks call", async () => {
+    delete process.env.TAMANDUA_HERMES_BINARY;
+    fixtureDir = createTempHome();
+
+    // Assert no file named hermes exists in the fixture dir
+    assert.strictEqual(
+      fs.existsSync(path.join(fixtureDir, "hermes")),
+      false,
+      "fixture dir must not contain hermes (PATH tier must not find anything)",
+    );
+
+    // Create a real hermes binary that the fake zsh will report (OUTSIDE PATH)
+    const hermesDir = path.join(fixtureDir, "hermes-bin");
+    fs.mkdirSync(hermesDir, { recursive: true });
+    const hermesPath = path.join(hermesDir, "hermes");
+    fs.writeFileSync(hermesPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+
+    // Create an isolated invocation counter file (starts empty)
+    const counterFile = path.join(fixtureDir, "counter");
+    fs.writeFileSync(counterFile, "", "utf-8");
+
+    // Create a fake zsh that appends a marker line and reports hermes
+    // Uses shell builtins only (printf) — no cat, no host tools
+    const fakeZsh = path.join(fixtureDir, "zsh");
+    fs.writeFileSync(
+      fakeZsh,
+      `#!/bin/sh\n# Append a marker line using only shell builtins\nprintf 'marker\n' >> "${counterFile}"\n# Report hermes path (simulating login shell)\necho "${hermesPath}"\n`,
+      { mode: 0o755 },
+    );
+
+    // PATH is isolated — fixture dir only (contains fake zsh, no hermes, no /usr/bin:/bin)
+    process.env.PATH = fixtureDir;
+    process.env.HOME = fixtureDir;
+
+    const groups = await runDoctorChecks();
+    const env = groups.find((g) => g.label === "ENVIRONMENT");
+    assert.ok(env);
+
+    const discoveryCheck = env!.checks.find((c) => c.name === "Hermes binary discovery");
+    assert.ok(discoveryCheck, "Expected discovery check");
+    assert.ok(discoveryCheck!.message.includes("Found via login shell"),
+      `Message should say 'Found via login shell', got: ${discoveryCheck!.message}`);
+
+    // Exactly one login-shell probe: count exact newline-delimited lines
+    const content = fs.readFileSync(counterFile, "utf-8");
+    const lines = content.split("\n").filter(line => line.length > 0);
+    assert.strictEqual(lines.length, 1,
+      `Expected exactly 1 login-shell probe, got ${lines.length}`);
   });
 });
 

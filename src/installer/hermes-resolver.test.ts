@@ -142,29 +142,32 @@ describe("resolveHermesBinary", () => {
     const hermesPath = path.join(tmpDir, "hermes");
     fs.writeFileSync(hermesPath, "#!/bin/sh\necho hermes\n", { mode: 0o755 });
 
-    // An empty PATH entry resolves to current working directory
     const originalCwd = process.cwd();
-    process.chdir(tmpDir);
+    const savedPath = process.env.PATH;
+    const savedHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
     try {
-      // Trailing colon creates an empty entry at the end (resolves to cwd)
-      process.env.PATH = `${savedPath ?? ""}:`;
-      // The trailing empty entry resolves against cwd
-      // But we also need hermes there — we already created it in tmpDir
+      // cwd must be the temp dir so empty PATH entries resolve there
+      process.chdir(tmpDir);
+      // Exactly one empty entry — no colon, no host PATH, no savedPath
+      process.env.PATH = "";
+      delete process.env.TAMANDUA_HERMES_BINARY;
+
+      const result = await resolveHermesBinary();
+      // Must resolve against cwd (tmpDir), giving the absolute path
+      assert.ok(path.isAbsolute(result), `expected absolute path, got ${result}`);
+      assert.equal(result, hermesPath);
     } finally {
       process.chdir(originalCwd);
-    }
-
-    // Note: this depends on hermes NOT being in savedPath
-    // If it is, we'd just return savedPath's hermes. The test validates
-    // that empty PATH entries are resolved by checking that the result
-    // is absolute regardless of which tier wins.
-    try {
-      const result = await resolveHermesBinary();
-      assert.ok(path.isAbsolute(result), `expected absolute path, got ${result}`);
-    } catch {
-      // If hermes is not found at all (not in savedPath, not in tmpDir
-      // since we changed back), that's fine — the point is that any
-      // PATH candidate we touched was absolute-resolved.
+      if (savedPath !== undefined) {
+        process.env.PATH = savedPath;
+      } else {
+        delete process.env.PATH;
+      }
+      if (savedHermesBinary !== undefined) {
+        process.env.TAMANDUA_HERMES_BINARY = savedHermesBinary;
+      } else {
+        delete process.env.TAMANDUA_HERMES_BINARY;
+      }
     }
   });
 
@@ -709,6 +712,210 @@ describe("resolveHermesBinary", () => {
 
     const result = await resolveHermesBinary();
     assert.equal(result, hermesPath);
+  });
+});
+
+// ── resolveHermesBinaryDetailed tests ────────────────────────────
+
+describe("resolveHermesBinaryDetailed", () => {
+  let savedHermesBinary: string | undefined;
+  let savedPath: string | undefined;
+
+  beforeEach(() => {
+    savedHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
+    savedPath = process.env.PATH;
+  });
+
+  afterEach(() => {
+    if (savedHermesBinary === undefined) {
+      delete process.env.TAMANDUA_HERMES_BINARY;
+    } else {
+      process.env.TAMANDUA_HERMES_BINARY = savedHermesBinary;
+    }
+    if (savedPath !== undefined) {
+      process.env.PATH = savedPath;
+    } else {
+      delete process.env.PATH;
+    }
+  });
+
+  it("returns source='env' for TAMANDUA_HERMES_BINARY override", async () => {
+    const { root: tmpDir } = createTempHome("tamandua-test-hrm3-detailed-env-");
+    const hermesPath = path.join(tmpDir, "hermes-custom");
+    fs.writeFileSync(hermesPath, "#!/bin/sh\necho hello\n", { mode: 0o755 });
+
+    process.env.TAMANDUA_HERMES_BINARY = hermesPath;
+
+    const { resolveHermesBinaryDetailed } = await import(
+      "../../dist/installer/hermes-resolver.js"
+    );
+    const result = await resolveHermesBinaryDetailed();
+    assert.equal(result.path, hermesPath);
+    assert.equal(result.source, "env");
+  });
+
+  it("returns source='path' for PATH discovery", async () => {
+    delete process.env.TAMANDUA_HERMES_BINARY;
+
+    const { root: tmpDir } = createTempHome("tamandua-test-hrm3-detailed-path-");
+    const hermesPath = path.join(tmpDir, "hermes");
+    fs.writeFileSync(hermesPath, "#!/bin/sh\necho hermes\n", { mode: 0o755 });
+
+    process.env.PATH = `${tmpDir}:${savedPath ?? ""}`;
+
+    const { resolveHermesBinaryDetailed } = await import(
+      "../../dist/installer/hermes-resolver.js"
+    );
+    const result = await resolveHermesBinaryDetailed();
+    assert.equal(result.path, hermesPath);
+    assert.equal(result.source, "path");
+  });
+
+  it("returns source='token-saver' when preferTokenSaver finds hermes-token-saver", async () => {
+    delete process.env.TAMANDUA_HERMES_BINARY;
+
+    const { root: tmpDir } = createTempHome("tamandua-test-hrm3-detailed-ts-");
+    const hermesPath = path.join(tmpDir, "hermes");
+    fs.writeFileSync(hermesPath, "#!/bin/sh\necho hermes\n", { mode: 0o755 });
+    const tokenSaverPath = path.join(tmpDir, "hermes-token-saver");
+    fs.writeFileSync(tokenSaverPath, "#!/bin/sh\necho token-saver\n", {
+      mode: 0o755,
+    });
+
+    process.env.PATH = tmpDir;
+
+    const { resolveHermesBinaryDetailed } = await import(
+      "../../dist/installer/hermes-resolver.js"
+    );
+    const result = await resolveHermesBinaryDetailed({ preferTokenSaver: true });
+    assert.equal(result.path, tokenSaverPath);
+    assert.equal(result.source, "token-saver");
+  });
+
+  it("returns source='login-shell' for login-shell fallback", async () => {
+    delete process.env.TAMANDUA_HERMES_BINARY;
+
+    const { root: tmpDir } = createTempHome("tamandua-test-hrm3-detailed-login-");
+
+    const hermesDir = path.join(tmpDir, "hermes-bin");
+    fs.mkdirSync(hermesDir, { recursive: true });
+    const hermesPath = path.join(hermesDir, "hermes");
+    fs.writeFileSync(hermesPath, "#!/bin/sh\necho real-hermes\n", {
+      mode: 0o755,
+    });
+
+    const fakeZshDir = path.join(tmpDir, "fake-zsh");
+    fs.mkdirSync(fakeZshDir, { recursive: true });
+    const fakeZsh = path.join(fakeZshDir, "zsh");
+    fs.writeFileSync(
+      fakeZsh,
+      `#!/bin/sh\n# Simulate zsh -lic 'command -v hermes'\necho ${hermesPath}\n`,
+      { mode: 0o755 },
+    );
+
+    const savedHome = process.env.HOME;
+    process.env.HOME = tmpDir;
+    process.env.PATH = fakeZshDir;
+
+    try {
+      const { resolveHermesBinaryDetailed } = await import(
+        "../../dist/installer/hermes-resolver.js"
+      );
+      const result = await resolveHermesBinaryDetailed();
+      assert.equal(result.path, fs.realpathSync(hermesPath));
+      assert.equal(result.source, "login-shell");
+    } finally {
+      if (savedHome !== undefined) {
+        process.env.HOME = savedHome;
+      } else {
+        delete process.env.HOME;
+      }
+    }
+  });
+
+  it("throws HermesResolverError with code='invalid_env_binary' for non-executable env", async () => {
+    const { root: tmpDir } = createTempHome("tamandua-test-hrm3-detailed-invalid-");
+    const hermesPath = path.join(tmpDir, "hermes-broken");
+    fs.writeFileSync(hermesPath, "#!/bin/sh\necho hi\n", { mode: 0o644 });
+
+    process.env.TAMANDUA_HERMES_BINARY = hermesPath;
+
+    const { resolveHermesBinaryDetailed, HermesResolverError } = await import(
+      "../../dist/installer/hermes-resolver.js"
+    );
+    await assert.rejects(
+      () => resolveHermesBinaryDetailed(),
+      (err: unknown) => {
+        assert.ok(err instanceof HermesResolverError);
+        assert.equal((err as HermesResolverError).code, "invalid_env_binary");
+        assert.equal((err as HermesResolverError).rawConfiguredValue, hermesPath);
+        return true;
+      },
+    );
+  });
+
+  it("throws HermesResolverError with code='not_found' when hermes absent", async () => {
+    delete process.env.TAMANDUA_HERMES_BINARY;
+
+    const { root: tmpDir } = createTempHome("tamandua-test-hrm3-detailed-notfound-");
+    process.env.PATH = tmpDir;
+
+    const { resolveHermesBinaryDetailed, HermesResolverError } = await import(
+      "../../dist/installer/hermes-resolver.js"
+    );
+    await assert.rejects(
+      () => resolveHermesBinaryDetailed(),
+      (err: unknown) => {
+        assert.ok(err instanceof HermesResolverError);
+        assert.equal((err as HermesResolverError).code, "not_found");
+        return true;
+      },
+    );
+  });
+
+  it("old resolveHermesBinary callers remain compatible", async () => {
+    delete process.env.TAMANDUA_HERMES_BINARY;
+
+    const { root: tmpDir } = createTempHome("tamandua-test-hrm3-compat-");
+    const hermesPath = path.join(tmpDir, "hermes");
+    fs.writeFileSync(hermesPath, "#!/bin/sh\necho hermes\n", { mode: 0o755 });
+
+    process.env.PATH = tmpDir;
+
+    // Old API still returns a plain string
+    const { resolveHermesBinary } = await import(
+      "../../dist/installer/hermes-resolver.js"
+    );
+    const result = await resolveHermesBinary();
+    assert.equal(typeof result, "string");
+    assert.equal(result, hermesPath);
+  });
+
+  it("detailed resolver returns source='path' and absolute path for relative PATH entry with isolated cwd", async () => {
+    delete process.env.TAMANDUA_HERMES_BINARY;
+
+    const { root: tmpDir } = createTempHome("tamandua-test-hrm3-detailed-relpath-");
+    const subDir = path.join(tmpDir, "bin");
+    fs.mkdirSync(subDir, { recursive: true });
+    const hermesPath = path.join(subDir, "hermes");
+    fs.writeFileSync(hermesPath, "#!/bin/sh\necho hermes\n", { mode: 0o755 });
+
+    const originalCwd = process.cwd();
+    try {
+      process.chdir(tmpDir);
+      // Relative PATH entry — must resolve against cwd and return absolute path
+      process.env.PATH = "bin";
+
+      const { resolveHermesBinaryDetailed } = await import(
+        "../../dist/installer/hermes-resolver.js"
+      );
+      const result = await resolveHermesBinaryDetailed();
+      assert.equal(result.source, "path");
+      assert.ok(path.isAbsolute(result.path), `expected absolute path, got ${result.path}`);
+      assert.equal(result.path, hermesPath);
+    } finally {
+      process.chdir(originalCwd);
+    }
   });
 });
 
