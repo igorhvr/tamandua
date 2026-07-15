@@ -1,7 +1,7 @@
 # Serial test lane files - classified by process-spawning / deadline-sensitive criteria.
 # Classification rule: a test file belongs here if it (a) directly imports from
-# node:child_process, or (b) calls daemonctl functions that spawn OS processes
-# (startDaemon, startMcp, startControlPlane, startDashboardStandalone, and their restart/stop counterparts).
+# node:child_process, (b) calls a daemonctl process spawner, or (c) imports a
+# source export that directly reaches a child_process-owning source dependency.
 # In-process servers (createDashboardServer, createTamanduaMcpServer) are NOT serial candidates.
 # Lines starting with # are comments, empty lines ignored. Sorted alphabetically.
 #
@@ -9,18 +9,42 @@
 # and tests/serial-files-integrity.test.ts.
 src/autoresearch/autoresearch.test.ts
 src/cli/cli.test.ts
+src/cli/commands/autoresearch.test.ts
+src/cli/commands/daemon.test.ts
+src/cli/commands/dashboard.test.ts
+src/cli/commands/get-ready.test.ts
+src/cli/commands/mcp.test.ts
+src/cli/commands/merge-branch.test.ts
+src/cli/commands/standalone.test.ts
+src/cli/commands/status.test.ts
+src/cli/commands/step.test.ts
+src/cli/commands/workflow.test.ts
+src/cli/commands/worktree.test.ts
 src/cli/merge-branch-cli.test.ts
+src/cli/update.test.ts
 src/cli/wizard-evaluator.test.ts
+src/cli/wizard-orchestrator.test.ts
 src/cli/wizard.test.ts
 src/db.test.ts
 src/doctor.test.ts
+src/installer/agent-scheduler-binary-discovery.test.ts
+src/installer/agent-scheduler-harness-routing.test.ts
+src/installer/agent-scheduler-hermes.test.ts
+src/installer/agent-scheduler.test.ts
+src/installer/harness-adapter.test.ts
+src/installer/harness-type.test.ts
+src/installer/hermes-resolver.test.ts
 src/installer/merge-branch.test.ts
 src/installer/rugpull.test.ts
 src/installer/run-cleanup.test.ts
 src/installer/run-harness.test.ts
 src/installer/run.test.ts
 src/installer/status.test.ts
+src/installer/step-ops-complete.test.ts
+src/installer/step-ops-pure.test.ts
+src/installer/step-ops-stories.test.ts
 src/installer/worktree-manager.test.ts
+src/lib/version-check.test.ts
 src/server/control-client.test.ts
 src/server/control-server-harness-workdir.test.ts
 src/server/control-server.test.ts
@@ -29,6 +53,7 @@ src/server/daemonctl-controlplane-restart.test.ts
 src/server/daemonctl-dashboard.test.ts
 src/server/daemonctl-guard.test.ts
 src/server/daemonctl-mcp-restart.test.ts
+src/server/daemonctl-port.test.ts
 src/server/daemonctl-restart.test.ts
 src/server/daemonctl-self-stop-guard.test.ts
 src/server/daemonctl.test.ts
@@ -38,6 +63,7 @@ src/suite/shim.test.ts
 src/suite/tree-hash.test.ts
 tests/agent-scheduler.test.ts
 tests/claim-invalidated-by-migration.test.ts
+tests/claim-ownership-recording.test.ts
 tests/cli-get-ready-partial-failure.test.ts
 tests/cli-pause-all-resume-all-integration.test.ts
 tests/cli-pause-all-resume-all.test.ts
@@ -66,21 +92,32 @@ tests/frontend-context.test.ts
 tests/harness-stderr-tail.test.ts
 tests/harness-working-directory.test.ts
 tests/hermes-token-attribution.test.ts
-tests/inject-version.test.ts
+tests/hermes-token-saver.test.ts
 tests/install-script-workflows.test.ts
 tests/logs-prefix-expansion.test.ts
 tests/logs-tail-command.test.ts
 tests/mcp-cli.test.ts
 tests/mcp-lifecycle.test.ts
+tests/multiline-output-parsing.test.ts
+tests/orphaned-step-recovery.test.ts
+tests/pi-command-preview.test.ts
+tests/pi-token-saver.test.ts
 tests/portability-lint.test.ts
 tests/reroute-count-column-migration.test.ts
+tests/reroute-paths.test.ts
 tests/run-terminal-token-events.test.ts
 tests/run-token-migration.test.ts
 tests/runner-scripts.test.ts
 tests/sample-project-fixture.test.ts
+tests/step-ops-dispatch-races.test.ts
+tests/step-ops.test.ts
 tests/step-ownership-columns-migration.test.ts
+tests/stories-json-validation.test.ts
 tests/syntax-check.test.ts
 tests/system-token-spend-migration.test.ts
 tests/token-log-formatting.test.ts
+tests/update-command.test.ts
 tests/work-round-persona-prompt.test.ts
 tests/work-round-token-attribution.test.ts
+tests/workflow-contract.test.ts
+tests/workflow-graph-simulation.test.ts
