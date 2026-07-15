@@ -4,9 +4,9 @@ import fs from "node:fs";
 import path from "node:path";
 
 const fixtureFiles = [
-  { file: "e2e-tests/workflows-scripted.test.ts", mergers: 3 },
-  { file: "e2e-tests/workflows-scripted-hermes.test.ts", mergers: 1 },
-  { file: "e2e-tests/workflows-stress-concurrent.test.ts", mergers: 1 },
+  { file: "e2e-tests/workflows-scripted.test.ts", mergerBehaviors: 5, invocations: 6 },
+  { file: "e2e-tests/workflows-scripted-hermes.test.ts", mergerBehaviors: 1, invocations: 1 },
+  { file: "e2e-tests/workflows-stress-concurrent.test.ts", mergerBehaviors: 1, invocations: 1 },
 ];
 
 function source(file: string): string {
@@ -19,7 +19,7 @@ describe("PLMB scripted merger fixtures", () => {
       const text = source(fixture.file);
       const invocations = text.match(/merge-branch[^\n]*/g) ?? [];
 
-      assert.equal(invocations.length, fixture.mergers, "every scripted merger should invoke merge-branch once");
+      assert.equal(invocations.length, fixture.invocations, "every scripted landing should invoke merge-branch");
       for (const invocation of invocations) {
         assert.match(invocation, /--origin/);
         assert.match(invocation, /--branch/);
@@ -31,7 +31,7 @@ describe("PLMB scripted merger fixtures", () => {
       }
       assert.equal(
         (text.match(/includeCommandOutput:\s*true/g) ?? []).length,
-        fixture.mergers,
+        fixture.mergerBehaviors,
         "scripted mergers should report merge-branch landed metadata",
       );
     });

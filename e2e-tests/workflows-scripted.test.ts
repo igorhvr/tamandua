@@ -422,6 +422,168 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
   );
 
   it(
+    "CDET bug-fix-merge-worktree: target movement reroutes through verifier before a successful landing",
+    { timeout: 240_000 },
+    async () => {
+      let ctx: ScriptedRunContext | undefined;
+      try {
+        const firstMergerCommand = [
+          "set -e",
+          'origin="{{input.WORKTREE_ORIGIN_REPOSITORY}}"',
+          'target="refs/heads/{{input.ORIGINAL_BRANCH}}"',
+          'expected_tip=$(git -C "$origin" rev-parse "$target")',
+          `"${process.execPath}" "${cliPath}" merge-branch --origin "$origin" --branch "cdet-target-marker" --into "{{input.ORIGINAL_BRANCH}}" --expect-tip "$expected_tip" --message "test: advance target during scripted merge"`,
+          "set +e",
+          `merge_output=$(TAMANDUA_RUN_ID="{{input.RUN_ID}}" "${process.execPath}" "${cliPath}" merge-branch --origin "$origin" --branch "${BRANCH}" --into "{{input.ORIGINAL_BRANCH}}" --expect-tip "$expected_tip" --message "fix: deterministic target-moved retry (squash of ${BRANCH})" 2>&1)`,
+          "merge_exit=$?",
+          "set -e",
+          'printf "%s\\n" "$merge_output"',
+          'printf "CLI_EXIT_CODE: %s\\n" "$merge_exit"',
+          'printf "%s\\n" "$merge_exit" > "$origin/.git/cdet-target-moved-exit"',
+          'test "$merge_exit" -eq 2',
+        ].join("; ");
+        const secondMergerCommand = [
+          'expected_tip=$(git -C "{{input.WORKTREE_ORIGIN_REPOSITORY}}" rev-parse "refs/heads/{{input.ORIGINAL_BRANCH}}")',
+          `TAMANDUA_RUN_ID="{{input.RUN_ID}}" "${process.execPath}" "${cliPath}" merge-branch --origin "{{input.WORKTREE_ORIGIN_REPOSITORY}}" --branch "${BRANCH}" --into "{{input.ORIGINAL_BRANCH}}" --expect-tip "$expected_tip" --message "fix: deterministic target-moved retry (squash of ${BRANCH})"`,
+        ].join(" && ");
+        const targetMovedBehaviors: ScriptedAgentConfig = {
+          agents: {
+            ...bugFixBehaviors.agents,
+            verifier: {
+              output: [
+                "STATUS: done",
+                "VERIFIED: feature tree revalidated after target movement",
+                "TESTED_TREE: scripted-tree-after-target-move",
+              ].join("\n"),
+            },
+            merger: [
+              {
+                commands: [firstMergerCommand],
+                includeCommandOutput: true,
+                output: "REBASED: false",
+              },
+              {
+                commands: [secondMergerCommand],
+                includeCommandOutput: true,
+                output: [
+                  "STATUS: done",
+                  "REBASED: false",
+                  "MERGED_INTO: {{input.ORIGINAL_BRANCH}}",
+                ].join("\n"),
+              },
+            ],
+          },
+        };
+
+        ctx = await startScriptedEnvironment("bug-fix-merge-worktree", targetMovedBehaviors);
+        const repoDir = prepareGitRepo(fixtureDir, path.join(ctx.env.root, "origin-repo"));
+        const originalBranch = execSync("git symbolic-ref --short HEAD", { cwd: repoDir, encoding: "utf-8" }).trim();
+        const initialTip = execSync(`git rev-parse "refs/heads/${originalBranch}"`, {
+          cwd: repoDir,
+          encoding: "utf-8",
+        }).trim();
+        execSync("git switch -c cdet-target-marker", { cwd: repoDir, encoding: "utf-8" });
+        fs.writeFileSync(path.join(repoDir, "contention-marker.txt"), "independent target update\n", "utf-8");
+        execSync("git add contention-marker.txt && git commit -m 'test: prepare independent target update'", {
+          cwd: repoDir,
+          encoding: "utf-8",
+        });
+        execSync(`git switch "${originalBranch}"`, { cwd: repoDir, encoding: "utf-8" });
+
+        const runIdPrefix = await spawnWorkflowRun(
+          [
+            "workflow",
+            "run",
+            "bug-fix-merge-worktree",
+            "The add function in src/math.ts returns a - b instead of a + b",
+            "--worktree-origin-repository",
+            repoDir,
+          ],
+          baseEnv(ctx.env.homeDir, ctx.env.controlPort),
+        );
+        const runId = resolveFullRunId(runIdPrefix, ctx.env.tamanduaDir);
+
+        const status = await waitForRun(ctx, runId, 200_000);
+        assert.ok(
+          status === "completed" || status === "done",
+          `run should complete after target-moved reroute, got "${status}"\n${diagnostics(ctx)}`,
+        );
+
+        assert.equal(
+          fs.readFileSync(path.join(repoDir, ".git", "cdet-target-moved-exit"), "utf-8").trim(),
+          "2",
+          "the first feature landing CLI invocation should exit 2",
+        );
+        assert.equal(ctx.scripted.workInvocations("verifier").length, 2, "target_moved should reroute through verifier");
+        assert.equal(ctx.scripted.workInvocations("merger").length, 2, "merger should retry once after revalidation");
+
+        const steps = dbRows<{ step_id: string; status: string; reroute_count: number | null }>(
+          ctx.env.tamanduaDir,
+          "SELECT step_id, status, reroute_count FROM steps WHERE run_id = ? ORDER BY step_index",
+          runId,
+        );
+        assert.equal(steps.length, 6);
+        for (const step of steps) assert.equal(step.status, "done", `${step.step_id} should finish done`);
+        assert.equal(steps.find((step) => step.step_id === "finalize_merge")?.reroute_count, 1);
+
+        const events = readRunEvents(ctx.env.tamanduaDir, runId);
+        const rerouted = events.find((event) => event.event === "step.rerouted");
+        assert.equal(rerouted?.stepId, "finalize_merge");
+        assert.match(String(rerouted?.detail), /verify/);
+        const mergeEvents = events.filter((event) => String(event.event).startsWith("merge."));
+        assert.deepEqual(mergeEvents.map((event) => event.event), ["merge.target_moved", "merge.landed"]);
+
+        const moved = mergeEvents[0];
+        const landed = mergeEvents[1];
+        const markerTip = execSync(`git rev-parse "refs/heads/${originalBranch}^"`, {
+          cwd: repoDir,
+          encoding: "utf-8",
+        }).trim();
+        const mergedCommit = execSync(`git rev-parse "refs/heads/${originalBranch}"`, {
+          cwd: repoDir,
+          encoding: "utf-8",
+        }).trim();
+        const mergedTree = execSync(`git rev-parse "refs/heads/${originalBranch}^{tree}"`, {
+          cwd: repoDir,
+          encoding: "utf-8",
+        }).trim();
+        for (const event of mergeEvents) {
+          assert.equal(event.runId, runId);
+          assert.equal(event.origin, repoDir);
+          assert.equal(event.branch, BRANCH);
+          assert.equal(event.target, `refs/heads/${originalBranch}`);
+        }
+        assert.equal(moved.expectedTip, initialTip);
+        assert.equal(moved.actualTip, markerTip);
+        assert.notEqual(moved.actualTip, moved.expectedTip);
+        assert.equal(landed.expectedTip, markerTip);
+        assert.equal(landed.mergedCommit, mergedCommit);
+        assert.equal(landed.mergedTree, mergedTree);
+        assert.equal(landed.checkoutRefresh, "refreshed");
+
+        assert.equal(
+          execSync(`git show "refs/heads/${originalBranch}:contention-marker.txt"`, {
+            cwd: repoDir,
+            encoding: "utf-8",
+          }),
+          "independent target update\n",
+        );
+        const targetMath = execSync(`git show "refs/heads/${originalBranch}:src/math.ts"`, {
+          cwd: repoDir,
+          encoding: "utf-8",
+        });
+        assert.ok(targetMath.includes("a + b"), `target should contain the feature fix:\n${targetMath}`);
+        assert.equal(fs.readFileSync(path.join(repoDir, "contention-marker.txt"), "utf-8"), "independent target update\n");
+        assert.equal(fs.readFileSync(path.join(repoDir, "src", "math.ts"), "utf-8"), targetMath);
+        assert.equal(execSync("git write-tree", { cwd: repoDir, encoding: "utf-8" }).trim(), mergedTree);
+        assert.equal(execSync("git status --porcelain", { cwd: repoDir, encoding: "utf-8" }), "");
+      } finally {
+        await teardown(ctx);
+      }
+    },
+  );
+
+  it(
     "do-now: lost step (agent finishes without STATUS report) is recovered and retried",
     { timeout: 120_000 },
     async () => {
