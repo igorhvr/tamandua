@@ -745,17 +745,60 @@ default, so the flag is rarely needed unless a previous run used
 
 These flags are mutually exclusive — you cannot specify both in the same run.
 
-To use a custom Hermes binary, set the `TAMANDUA_HERMES_BINARY` environment
-variable:
+#### Hermes Binary Resolution
+
+Tamandua resolves the Hermes binary through a **three-tier chain**. The
+binary is validated at scheduling time — if no Hermes binary is found or
+the resolved binary is not executable, the run fails at startup with a
+clear actionable error.
+
+**Tier 1 — Explicit environment variable:**
 
 ```bash
 export TAMANDUA_HERMES_BINARY=/path/to/hermes
-tamandua workflow run <workflow-id> "<task>" --hermes-as-harness
 ```
 
-If `TAMANDUA_HERMES_BINARY` is not set, Tamandua searches for `hermes` on
-`PATH`. The binary is validated at scheduling time — if it is not found or
-not executable, the run fails at startup.
+Set `TAMANDUA_HERMES_BINARY` to an absolute or relative path. Relative paths
+are resolved against the daemon's working directory at validation time.
+
+**Tier 2 — Process PATH (with optional token-saver):**
+
+If `TAMANDUA_HERMES_BINARY` is not set, Tamandua searches the daemon's own
+`PATH` for `hermes`. When `noHurrySaveTokensMode` is enabled, Tier 2 first
+searches for `hermes-token-saver` (a token-saving wrapper) before falling back
+to a bare `hermes` binary.
+
+**Tier 3 — Bounded zsh login-shell fallback:**
+
+If neither the env var nor the process `PATH` yields a working Hermes,
+Tamandua spawns `zsh -lic 'command -v hermes'` so Hermes installed via
+login-shell startup files (e.g. `~/.zshrc`, `~/.zprofile`) can be discovered.
+This is a bounded, best-effort fallback — if zsh is not available or returns
+nothing, resolution fails.
+
+#### Absolute-Path Invocation
+
+Every resolved Hermes binary path is **always absolute**. Relative
+`TAMANDUA_HERMES_BINARY` values and relative/empty `PATH` entries are resolved
+against the daemon process cwd at validation time before the result is stored.
+This prevents `./hermes: not found` errors when the dispatcher invokes the binary
+from a different working directory.
+
+#### Child-Only PATH Adjustment
+
+When dispatching a Hermes agent session, the resolved binary's directory is
+prepended to the child's `PATH` so nested Hermes invocations within the agent
+session find the same binary — even if it lives outside the original `PATH`
+(e.g. login-shell-discovered Hermes). The original `PATH` is preserved as a
+suffix; this adjustment applies only to the child process.
+
+#### Zero Filesystem Mutation
+
+Tamandua's Hermes discovery is **entirely side-effect-free**: it never
+creates, deletes, replaces, chmods, or otherwise mutates `~/.local/bin/hermes`
+or any user executable or symlink. Tamandua does not own or manage a
+`~/.local/bin/hermes` symlink. The only Hermes-related operation is resolving
+and running an existing binary.
 
 ### 2.6) Troubleshooting with tamandua doctor
 

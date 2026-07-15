@@ -36,7 +36,7 @@ import { collectProcessSnapshot, matchRunEvidence } from "./installer/run-cleanu
 import { getRecentEvents } from "./installer/events.js";
 import type { TamanduaEvent } from "./installer/events.js";
 import { probeHermesStateContract } from "./installer/hermes-usage.js";
-import { resolveHermesViaLoginShell } from "./installer/hermes-resolver.js";
+import { resolveHermesBinary, resolveHermesViaLoginShell } from "./installer/hermes-resolver.js";
 
 // ── Types ──────────────────────────────────────────────────────────
 
@@ -219,38 +219,15 @@ function checkPiTokenSaver(): DoctorCheckResult {
  * Returns availability plus the resolved path for use by sub-checks.
  */
 async function discoverHermesBinary(): Promise<{ available: boolean; path?: string }> {
-  // Tier 1: TAMANDUA_HERMES_BINARY env var
-  const envBinary = process.env.TAMANDUA_HERMES_BINARY?.trim();
-  if (envBinary) {
-    try {
-      fs.accessSync(envBinary, fs.constants.X_OK);
-      return { available: true, path: envBinary };
-    } catch {
-      // env var set but not executable — still report below
-    }
-  }
-
-  // Tier 2: PATH
-  const pathDirs = (process.env.PATH ?? "").split(path.delimiter);
-  for (const dir of pathDirs) {
-    const candidate = path.join(dir, "hermes");
-    try {
-      fs.accessSync(candidate, fs.constants.X_OK);
-      return { available: true, path: candidate };
-    } catch {
-      // not found in this dir
-    }
-  }
-
-  // Tier 3: Login shell
+  // Use the shared resolver (resolveHermesBinary) so doctor discovery
+  // semantics cannot drift from scheduler dispatch semantics.
+  // Tiers: TAMANDUA_HERMES_BINARY → PATH → login shell.
   try {
-    const loginPath = await resolveHermesViaLoginShell();
-    if (loginPath) return { available: true, path: loginPath };
+    const result = await resolveHermesBinary();
+    return { available: true, path: result };
   } catch {
-    // login shell not available
+    return { available: false };
   }
-
-  return { available: false };
 }
 
 /**
@@ -311,58 +288,6 @@ async function checkHermesBinary(): Promise<DoctorCheckResult> {
     status: "info",
     message: "TAMANDUA_HERMES_BINARY not set and hermes not found on PATH or via login shell (alpha support — optional)",
   };
-}
-
-/**
- * Report ~/.local/bin/hermes symlink status.
- * Shows whether the symlink exists and points to the correct target.
- * Always informational — hermes is alpha.
- */
-function checkHermesSymlink(hermesPath?: string): DoctorCheckResult {
-  const linkPath = path.join(os.homedir(), ".local", "bin", "hermes");
-  try {
-    const target = fs.readlinkSync(linkPath);
-    if (hermesPath && target === hermesPath) {
-      return {
-        name: "Hermes ~/.local/bin symlink",
-        status: "info",
-        message: `Symlink ${linkPath} → ${target} (correct target)`,
-      };
-    }
-    if (hermesPath) {
-      return {
-        name: "Hermes ~/.local/bin symlink",
-        status: "info",
-        message: `Symlink ${linkPath} → ${target} (wrong target — expected ${hermesPath})`,
-      };
-    }
-    return {
-      name: "Hermes ~/.local/bin symlink",
-      status: "info",
-      message: `Symlink ${linkPath} → ${target}`,
-    };
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException)?.code;
-    if (code === "ENOENT") {
-      return {
-        name: "Hermes ~/.local/bin symlink",
-        status: "info",
-        message: `No symlink at ${linkPath} — hermes may not be on daemon PATH`,
-      };
-    }
-    if (code === "EINVAL") {
-      return {
-        name: "Hermes ~/.local/bin symlink",
-        status: "info",
-        message: `${linkPath} exists but is not a symlink (regular file)`,
-      };
-    }
-    return {
-      name: "Hermes ~/.local/bin symlink",
-      status: "info",
-      message: `Cannot read ${linkPath}: ${(err as Error).message}`,
-    };
-  }
 }
 
 /**
@@ -1169,7 +1094,7 @@ export async function runDoctorChecks(opts?: DoctorOpts): Promise<CheckGroup[]> 
     checkPiTokenSaver(),
     checkHermesTokenSaver(),
     checkHermesBinary(),
-    checkHermesSymlink(hermesAvailable.path),
+
   ];
 
   // Hermes contract check: only included when a hermes binary is available.

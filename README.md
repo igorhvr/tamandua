@@ -619,16 +619,63 @@ These flags are **mutually exclusive** — specifying both is an error.
 > warning if the hermes schema is unavailable or changed).
 > Use pi (`--pi-as-harness`) for production workflows.
 
-To use a custom Hermes binary path, set the `TAMANDUA_HERMES_BINARY`
-environment variable:
+##### Hermes Binary Resolution
+
+Tamandua resolves the Hermes binary through a **three-tier chain**. The
+resolver never creates, deletes, replaces, chmods, or otherwise mutates any
+user executable or symlink — discovery is entirely side-effect-free.
+
+**Tier 1 — Explicit environment variable (always wins):**
 
 ```bash
 export TAMANDUA_HERMES_BINARY=/path/to/hermes
 ```
 
-If `TAMANDUA_HERMES_BINARY` is not set, Tamandua searches for `hermes` on your
-`PATH`. The harness validation runs at scheduling time — if the Hermes binary
-isn't found or isn't executable, the run fails immediately with a clear error.
+Set `TAMANDUA_HERMES_BINARY` to an absolute or relative path. Relative paths
+are resolved against the daemon's working directory at scheduling time. If the
+path is not executable, the run fails immediately with a clear actionable
+error.
+
+**Tier 2 — Current process PATH:**
+
+If `TAMANDUA_HERMES_BINARY` is not set, Tamandua searches the daemon's own
+`PATH` for `hermes`. When `noHurrySaveTokensMode` is enabled, Tier 2 first
+searches for `hermes-token-saver` (a token-saving wrapper) before falling back
+to a bare `hermes` binary.
+
+**Tier 3 — Login-shell fallback (bounded):**
+
+If neither the env var nor the process `PATH` yields a working Hermes,
+Tamandua spawns `zsh -lic 'command -v hermes'` so Hermes installed via
+nix/homebrew/npm in shell-specific paths is discoverable even when not on the
+daemon's `PATH`. The returned path is `realpath`-resolved and validated with
+`X_OK`. This fallback is bounded and only runs when the first two tiers fail.
+
+##### Absolute-Path Invocation
+
+Every resolved binary path is **guaranteed to be absolute**. Relative
+`TAMANDUA_HERMES_BINARY` values and relative/empty `PATH` entries are resolved
+against the daemon process's current working directory at validation time. This
+prevents `./hermes: not found` errors when the dispatcher invokes the binary
+from a different working directory.
+
+##### Child-Only PATH Adjustment
+
+When dispatching a Hermes agent session, the resolved binary's directory is
+prepended to the child's `PATH` so nested Hermes invocations within the agent
+session find the same binary, even when the daemon's own `PATH` lacked it
+(e.g. login-shell-discovered Hermes). The original `PATH` is preserved as a
+suffix so standard system tools remain reachable.
+
+##### Zero Filesystem Mutation
+
+Tamandua's Hermes discovery is **entirely side-effect-free**: it never
+creates, deletes, replaces, chmods, or otherwise mutates `~/.local/bin/hermes`
+or any other user executable or symlink. The old behavior of automatically
+managing a `~/.local/bin/hermes` symlink has been removed.
+
+The harness validation runs at scheduling time — if no Hermes binary is found
+through any tier, the run fails immediately with a clear error.
 
 ##### Hermes E2E Canary
 

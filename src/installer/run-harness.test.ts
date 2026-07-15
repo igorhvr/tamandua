@@ -251,6 +251,177 @@ describe("validateRunHarnessForScheduling", () => {
     }
   });
 
+  // ── HRM2/WADM: worktree hermes admission tests ──
+
+  it("rejects worktree run with harness_type=hermes when hermes is unavailable", async () => {
+    const originRepo = path.join(tempDir, "origin-wt-hermes-reject");
+    fs.mkdirSync(originRepo, { recursive: true });
+    spawnSync("git", ["init", "--initial-branch=main"], { cwd: originRepo, encoding: "utf-8" });
+    spawnSync("git", ["config", "user.email", "test@test"], { cwd: originRepo, encoding: "utf-8" });
+    spawnSync("git", ["config", "user.name", "Test"], { cwd: originRepo, encoding: "utf-8" });
+    fs.writeFileSync(path.join(originRepo, "README.md"), "# test\n", "utf-8");
+    spawnSync("git", ["add", "."], { cwd: originRepo, encoding: "utf-8" });
+    spawnSync("git", ["commit", "-m", "initial"], { cwd: originRepo, encoding: "utf-8" });
+
+    const worktree = createRunWorktree({
+      runId: "run-wt-hermes-reject",
+      runNumber: 1,
+      workflowId: "test-workflow",
+      worktreeOriginRepository: originRepo,
+    });
+
+    const savedPath = process.env.PATH;
+    delete process.env.TAMANDUA_HERMES_BINARY;
+    try {
+      // Find git's directory so we can construct a PATH that has git but NOT
+      // hermes. This ensures the resolver can't find hermes via tier 2 (PATH)
+      // and the login-shell fallback (tier 3) also doesn't find it.
+      const gitWhich = spawnSync("which", ["git"], { encoding: "utf-8" });
+      const gitDir = path.dirname(gitWhich.stdout.trim());
+      process.env.PATH = gitDir;
+      await assert.rejects(
+        validateRunHarnessForScheduling("run-wt-hermes-reject", JSON.stringify({
+          workspace_mode: "worktree",
+          repo: worktree.worktreePath,
+          working_directory_for_harness: worktree.worktreePath,
+          harness_type: "hermes",
+        })),
+        /hermes is not available/,
+      );
+    } finally {
+      process.env.PATH = savedPath;
+      removeRunWorktree({ runId: "run-wt-hermes-reject", force: true });
+    }
+  });
+
+  it("accepts worktree run with harness_type=hermes when hermes is found via env var", async () => {
+    const originRepo = path.join(tempDir, "origin-wt-hermes-env");
+    fs.mkdirSync(originRepo, { recursive: true });
+    spawnSync("git", ["init", "--initial-branch=main"], { cwd: originRepo, encoding: "utf-8" });
+    spawnSync("git", ["config", "user.email", "test@test"], { cwd: originRepo, encoding: "utf-8" });
+    spawnSync("git", ["config", "user.name", "Test"], { cwd: originRepo, encoding: "utf-8" });
+    fs.writeFileSync(path.join(originRepo, "README.md"), "# test\n", "utf-8");
+    spawnSync("git", ["add", "."], { cwd: originRepo, encoding: "utf-8" });
+    spawnSync("git", ["commit", "-m", "initial"], { cwd: originRepo, encoding: "utf-8" });
+
+    const worktree = createRunWorktree({
+      runId: "run-wt-hermes-env",
+      runNumber: 1,
+      workflowId: "test-workflow",
+      worktreeOriginRepository: originRepo,
+    });
+
+    const hermesPath = path.join(tempDir, "hermes-mock-wt-env");
+    fs.writeFileSync(hermesPath, "#!/bin/sh\necho ok\n", { mode: 0o755 });
+
+    const saved = process.env.TAMANDUA_HERMES_BINARY;
+    try {
+      process.env.TAMANDUA_HERMES_BINARY = hermesPath;
+      const result = await validateRunHarnessForScheduling("run-wt-hermes-env", JSON.stringify({
+        workspace_mode: "worktree",
+        repo: worktree.worktreePath,
+        working_directory_for_harness: worktree.worktreePath,
+        harness_type: "hermes",
+      }));
+      assert.equal(result.workingDirectoryForHarness, worktree.worktreePath);
+      assert.equal(result.expectedBranch, undefined);
+    } finally {
+      if (saved === undefined) delete process.env.TAMANDUA_HERMES_BINARY;
+      else process.env.TAMANDUA_HERMES_BINARY = saved;
+      removeRunWorktree({ runId: "run-wt-hermes-env", force: true });
+    }
+  });
+
+  it("accepts worktree run with harness_type=hermes when hermes is found via PATH", async () => {
+    const originRepo = path.join(tempDir, "origin-wt-hermes-path");
+    fs.mkdirSync(originRepo, { recursive: true });
+    spawnSync("git", ["init", "--initial-branch=main"], { cwd: originRepo, encoding: "utf-8" });
+    spawnSync("git", ["config", "user.email", "test@test"], { cwd: originRepo, encoding: "utf-8" });
+    spawnSync("git", ["config", "user.name", "Test"], { cwd: originRepo, encoding: "utf-8" });
+    fs.writeFileSync(path.join(originRepo, "README.md"), "# test\n", "utf-8");
+    spawnSync("git", ["add", "."], { cwd: originRepo, encoding: "utf-8" });
+    spawnSync("git", ["commit", "-m", "initial"], { cwd: originRepo, encoding: "utf-8" });
+
+    const worktree = createRunWorktree({
+      runId: "run-wt-hermes-path",
+      runNumber: 1,
+      workflowId: "test-workflow",
+      worktreeOriginRepository: originRepo,
+    });
+
+    // Create a hermes binary in a dir that will be on PATH
+    const hermesDir = path.join(tempDir, "hermes-bin");
+    fs.mkdirSync(hermesDir, { recursive: true });
+    fs.writeFileSync(path.join(hermesDir, "hermes"), "#!/bin/sh\necho ok\n", { mode: 0o755 });
+
+    const savedPath = process.env.PATH;
+    delete process.env.TAMANDUA_HERMES_BINARY;
+    try {
+      // Prepend hermes bin dir to saved PATH so hermes is found via tier 2
+      process.env.PATH = `${hermesDir}${path.delimiter}${savedPath}`;
+      const result = await validateRunHarnessForScheduling("run-wt-hermes-path", JSON.stringify({
+        workspace_mode: "worktree",
+        repo: worktree.worktreePath,
+        working_directory_for_harness: worktree.worktreePath,
+        harness_type: "hermes",
+      }));
+      assert.equal(result.workingDirectoryForHarness, worktree.worktreePath);
+      assert.equal(result.expectedBranch, undefined);
+    } finally {
+      process.env.PATH = savedPath;
+      removeRunWorktree({ runId: "run-wt-hermes-path", force: true });
+    }
+  });
+
+  it("accepts worktree run with harness_type=hermes via login-shell fallback", async () => {
+    const originRepo = path.join(tempDir, "origin-wt-hermes-login");
+    fs.mkdirSync(originRepo, { recursive: true });
+    spawnSync("git", ["init", "--initial-branch=main"], { cwd: originRepo, encoding: "utf-8" });
+    spawnSync("git", ["config", "user.email", "test@test"], { cwd: originRepo, encoding: "utf-8" });
+    spawnSync("git", ["config", "user.name", "Test"], { cwd: originRepo, encoding: "utf-8" });
+    fs.writeFileSync(path.join(originRepo, "README.md"), "# test\n", "utf-8");
+    spawnSync("git", ["add", "."], { cwd: originRepo, encoding: "utf-8" });
+    spawnSync("git", ["commit", "-m", "initial"], { cwd: originRepo, encoding: "utf-8" });
+
+    const worktree = createRunWorktree({
+      runId: "run-wt-hermes-login",
+      runNumber: 1,
+      workflowId: "test-workflow",
+      worktreeOriginRepository: originRepo,
+    });
+
+    // Create a mock hermes binary that the mock zsh will report
+    const hermesPath = path.join(tempDir, "login-shell-hermes");
+    fs.writeFileSync(hermesPath, "#!/bin/sh\necho ok\n", { mode: 0o755 });
+
+    // Create a mock zsh that reports the hermes path via login shell discovery.
+    // The resolver spawns `zsh -lic 'command -v hermes'`; our mock simply echoes
+    // the path regardless of input so tier 3 (login-shell fallback) succeeds.
+    const mockZshDir = path.join(tempDir, "mock-zsh-dir");
+    fs.mkdirSync(mockZshDir, { recursive: true });
+    const mockZshPath = path.join(mockZshDir, "zsh");
+    fs.writeFileSync(mockZshPath, `#!/bin/sh\necho "${hermesPath}"\n`, { mode: 0o755 });
+
+    const savedPath = process.env.PATH;
+    delete process.env.TAMANDUA_HERMES_BINARY;
+    try {
+      // Prepend mock zsh dir to saved PATH. Hermes is NOT on PATH, so tier 2
+      // fails and the resolver falls through to tier 3 (login-shell fallback).
+      process.env.PATH = `${mockZshDir}${path.delimiter}${savedPath}`;
+      const result = await validateRunHarnessForScheduling("run-wt-hermes-login", JSON.stringify({
+        workspace_mode: "worktree",
+        repo: worktree.worktreePath,
+        working_directory_for_harness: worktree.worktreePath,
+        harness_type: "hermes",
+      }));
+      assert.equal(result.workingDirectoryForHarness, worktree.worktreePath);
+      assert.equal(result.expectedBranch, undefined);
+    } finally {
+      process.env.PATH = savedPath;
+      removeRunWorktree({ runId: "run-wt-hermes-login", force: true });
+    }
+  });
+
   it("throws when harness_type is 'hermes' and hermes binary not found", async () => {
     const workdir = path.join(tempDir, "work");
     fs.mkdirSync(workdir, { recursive: true });

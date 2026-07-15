@@ -185,8 +185,9 @@ export async function findPiBinary(options: FindPiBinaryOptions = {}): Promise<s
 
 import { resolveHermesBinary, resolveHermesViaLoginShell } from "./hermes-resolver.js";
 
-// Re-export for backward compat (doctor.ts uses this; US-004 will move
-// doctor.ts to import directly from hermes-resolver.js).
+// Re-export resolveHermesViaLoginShell from the shared resolver module.
+// Doctor, run-harness, and harness-adapter all import from hermes-resolver.js
+// directly; kept here for any external consumers that resolve via agent-scheduler.
 export { resolveHermesViaLoginShell };
 
 /**

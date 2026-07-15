@@ -42,9 +42,12 @@ export async function resolveHermesBinary(
   // Tier 1: Explicit env override
   const envHermes = process.env.TAMANDUA_HERMES_BINARY?.trim();
   if (envHermes) {
+    // Resolve relative paths against process.cwd() so dispatch from a
+    // different working directory doesn't fail with "./hermes: not found".
+    const resolved = path.resolve(envHermes);
     try {
-      fs.accessSync(envHermes, fs.constants.X_OK);
-      return envHermes;
+      fs.accessSync(resolved, fs.constants.X_OK);
+      return resolved;
     } catch {
       throw new Error(
         `TAMANDUA_HERMES_BINARY set but not executable: ${envHermes}`,
@@ -57,7 +60,9 @@ export async function resolveHermesBinary(
 
   if (options.preferTokenSaver) {
     for (const dir of pathDirs) {
-      const candidate = path.join(dir, "hermes-token-saver");
+      // Resolve against process.cwd() so relative/empty PATH entries
+      // produce absolute paths — dispatch from a different cwd won't break.
+      const candidate = path.resolve(dir, "hermes-token-saver");
       try {
         fs.accessSync(candidate, fs.constants.X_OK);
         return candidate;
@@ -69,7 +74,7 @@ export async function resolveHermesBinary(
   }
 
   for (const dir of pathDirs) {
-    const candidate = path.join(dir, "hermes");
+    const candidate = path.resolve(dir, "hermes");
     try {
       fs.accessSync(candidate, fs.constants.X_OK);
       return candidate;

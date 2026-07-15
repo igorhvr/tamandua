@@ -67,8 +67,46 @@ token overhead on real runs (see the historical baselines at the bottom).
   per-harness env override (`TAMANDUA_PI_BINARY` / `TAMANDUA_HERMES_BINARY`,
   the config/test seam) → `<harness>-token-saver` from PATH when the run
   is no-hurry (`--no-hurry-please-save-tokens-mode`) → plain harness binary
-  from PATH. Installing the wrapper mid-run takes effect on the next round.
-  Pinned by `tests/pi-token-saver.test.ts` and `tests/hermes-token-saver.test.ts`.
+  from PATH. For Hermes, a fourth tier exists: bounded `zsh -lic 'command -v
+  hermes'` login-shell fallback, which runs ONLY when explicit env, token-saver,
+  and plain PATH searches all fail to find Hermes; it probes the user's zsh
+  login environment for path manager setups (homebrew, mise, asdf, etc.) that
+  expose Hermes only in interactive shells.  The login-shell check is
+  side-effect-free — no dotfile side effects are relied upon beyond `command -v`
+  resolution, and the probe has a timeout guard.  The full Hermes resolution
+  precedence is: (1) explicit `TAMANDUA_HERMES_BINARY` env, (2)
+  `<hermes>-token-saver` on current process PATH when the run is no-hurry,
+  (3) plain `hermes` on current process PATH, (4) bounded zsh login-shell
+  fallback.  Installing the wrapper mid-run takes effect on the next round.
+  Pinned by `tests/pi-token-saver.test.ts`, `tests/hermes-token-saver.test.ts`,
+  and `src/installer/hermes-resolver.test.ts`.
+
+- **C0-abs** **Absolute-path guarantee.** Every successful
+  `resolveHermesBinary` result is an absolute executable path, regardless of
+  which tier resolved it.  Relative `TAMANDUA_HERMES_BINARY` values (e.g.
+  `./hermes`) and relative/empty PATH entries are resolved against the
+  resolver process cwd at validation time, before the access check.  The
+  login-shell tier already returns absolute via `realpathSync`.  This
+  guarantees that `HermesHarnessAdapter.runRound` — which runs from a
+  different workflow cwd — never receives a relative path that would fail
+  with "not found".  Pinned by
+  `src/installer/hermes-resolver.test.ts` (absolute-path tests).
+
+- **C0-paths** **Child-only PATH adjustment.** Before invoking the harness
+  process, `HermesHarnessAdapter.runRound` prepends `path.dirname(binaryPath)`
+  to the child `PATH` (when the directory isn't already on PATH), so nested
+  harness invocations find the same binary.  This adjustment is *child-only* —
+  the daemon's own PATH is never modified.  Pinned by
+  `src/installer/harness-adapter.test.ts` (dispatch-from-different-cwd tests).
+
+- **C0-no-mutation** **Zero filesystem mutation.** Automatic Hermes
+  discovery must never create, delete, replace, chmod, or otherwise mutate
+  `~/.local/bin/hermes` or any user executable or symlink.  Tamandua does not
+  own or manage a `~/.local/bin/hermes` symlink.  All discovery tiers are
+  read-only: env lookup, PATH scan, and login-shell probe are pure
+  inspection with zero side effects.  Pinned by
+  `src/installer/harness-adapter.test.ts` (isolated-HOME inode/mode/size
+  pre/post resolution comparison).
 - **C5** Each pending step is executed exactly once at a time: concurrent
   dispatch attempts (timer tick + nudge, two claimants) must not double-run a
   step (in-flight guards, claim atomicity), and duplicate completions

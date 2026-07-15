@@ -1263,7 +1263,10 @@ echo "session_id: 20260518_103004_cdae11" >&2`,
 
     it("uses pre-resolved binaryPath without PATH access to hermes", async () => {
       const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-hermes-");
-      const hermesPath = path.join(tmpDir, "hermes");
+      // Hermes lives in a subdirectory that is NOT on PATH.
+      const hermesDir = path.join(tmpDir, "hermes-dir");
+      fs.mkdirSync(hermesDir, { recursive: true });
+      const hermesPath = path.join(hermesDir, "hermes");
       fs.writeFileSync(
         hermesPath,
         `#!/bin/sh
@@ -1272,7 +1275,7 @@ echo "session_id: 20260518_103004_cdae11" >&2`,
         { mode: 0o755 },
       );
 
-      // Ensure PATH does NOT contain the hermes directory.
+      // Set PATH to tmpDir itself — NOT hermesDir — so hermes is NOT on PATH.
       const originalPath = process.env.PATH;
       process.env.PATH = tmpDir;
       // Clear env var so no other resolution path exists.
@@ -1300,6 +1303,160 @@ echo "session_id: 20260518_103004_cdae11" >&2`,
         } else {
           process.env.PATH = originalPath;
         }
+      }
+    });
+
+    it("pre-resolved binaryPath from login-shell resolution survives dispatch from different cwd", async () => {
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-bp-");
+
+      // Step 1: Set up a hermes binary somewhere not on PATH.
+      const hermesDir = path.join(tmpDir, "hermes-real");
+      fs.mkdirSync(hermesDir, { recursive: true });
+      const hermesPath = path.join(hermesDir, "hermes");
+      fs.writeFileSync(
+        hermesPath,
+        `#!/bin/sh
+echo "hermes resolved via login shell"
+echo "session_id: 20260714_bp_login" >&2`,
+        { mode: 0o755 },
+      );
+
+      // Step 2: Create a fake zsh that returns the hermes path (simulating login shell discovery).
+      const fakeZshDir = path.join(tmpDir, "fake-zsh");
+      fs.mkdirSync(fakeZshDir, { recursive: true });
+      const fakeZsh = path.join(fakeZshDir, "zsh");
+      fs.writeFileSync(
+        fakeZsh,
+        `#!/bin/sh
+# Simulate zsh -lic 'command -v hermes'
+echo ${hermesPath}
+`,
+        { mode: 0o755 },
+      );
+
+      // Step 3: Resolve via login shell (only fake zsh on PATH, no hermes on PATH).
+      const savedPath = process.env.PATH;
+      const savedHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
+      delete process.env.TAMANDUA_HERMES_BINARY;
+      process.env.PATH = fakeZshDir;
+
+      try {
+        // Resolve Hermes via login shell — the fake zsh returns the absolute path.
+        const resolvedPath = await adapter.findBinary();
+        assert.ok(path.isAbsolute(resolvedPath), "resolved path must be absolute");
+        assert.ok(resolvedPath.endsWith("hermes"), "resolved path must point to hermes");
+
+        // Step 4: Now run from a completely DIFFERENT cwd with an empty PATH.
+        // The pre-resolved binaryPath must be used, and dispatch must succeed.
+        const workdir = path.join(tmpDir, "work");
+        fs.mkdirSync(workdir, { recursive: true });
+
+        // Set PATH to an empty directory (not containing hermes or zsh) so
+        // findBinary() would fail — this proves binaryPath is used directly.
+        process.env.PATH = workdir;
+
+        const result = await adapter.runRound("do the work", {
+          timeout: 5,
+          binaryPath: resolvedPath,
+          workdir,
+        });
+
+        assert.ok(result.output.includes("hermes resolved via login shell"));
+        assert.equal(result.sessionRef, "20260714_bp_login");
+        assert.equal(result.exitCode, 0);
+      } finally {
+        process.env.PATH = savedPath ?? "";
+        if (savedHermesBinary === undefined) {
+          delete process.env.TAMANDUA_HERMES_BINARY;
+        } else {
+          process.env.TAMANDUA_HERMES_BINARY = savedHermesBinary;
+        }
+      }
+    });
+
+    it("isolated ~/.local/bin/hermes via login shell does not mutate the filesystem", async () => {
+      const { homeDir } = createTempHome("tamandua-test-harness-adapter-bp-");
+
+      // Create an isolated ~/.local/bin/hermes inside the temp HOME.
+      const localBinDir = path.join(homeDir, ".local", "bin");
+      fs.mkdirSync(localBinDir, { recursive: true });
+      const isolatedHermes = path.join(localBinDir, "hermes");
+      fs.writeFileSync(
+        isolatedHermes,
+        `#!/bin/sh
+echo "hermes from isolated home"
+echo "session_id: 20260714_isolated" >&2`,
+        { mode: 0o755 },
+      );
+
+      // Record pre-resolution state of the isolated hermes binary.
+      const beforeStat = fs.statSync(isolatedHermes);
+      const beforeInode = beforeStat.ino;
+      const beforeMode = beforeStat.mode;
+      const beforeSize = beforeStat.size;
+
+      // Create a fake zsh that returns the isolated hermes path.
+      const fakeZshDir = path.join(homeDir, "fake-zsh");
+      fs.mkdirSync(fakeZshDir, { recursive: true });
+      const fakeZsh = path.join(fakeZshDir, "zsh");
+      fs.writeFileSync(
+        fakeZsh,
+        `#!/bin/sh
+# Simulate zsh -lic 'command -v hermes'
+echo ${isolatedHermes}
+`,
+        { mode: 0o755 },
+      );
+
+      // Set HOME to the isolated temp so ~/.local/bin/hermes is the isolated one.
+      const savedHome = process.env.HOME;
+      const savedPath = process.env.PATH;
+      const savedHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
+      process.env.HOME = homeDir;
+      delete process.env.TAMANDUA_HERMES_BINARY;
+      // PATH must NOT include ~/.local/bin — only the fake zsh.
+      process.env.PATH = fakeZshDir;
+
+      try {
+        // Resolve via login shell (tier 3). The fake zsh returns the isolated
+        // ~/.local/bin/hermes path. This exercises the same code path the real
+        // daemon uses when hermes is only discoverable via login shell.
+        const resolvedPath = await adapter.findBinary();
+        assert.ok(resolvedPath.endsWith("hermes"), "resolved path must point to hermes");
+
+        // Verify the isolated hermes binary has NOT been mutated.
+        const afterStat = fs.statSync(isolatedHermes);
+        assert.equal(afterStat.ino, beforeInode, "inode must be unchanged");
+        assert.equal(afterStat.mode, beforeMode, "mode must be unchanged");
+        assert.equal(afterStat.size, beforeSize, "size must be unchanged");
+
+        // Verify the resolved path is executable and dispatchable.
+        const result = await adapter.runRound("do the work", {
+          timeout: 5,
+          binaryPath: resolvedPath,
+        });
+
+        assert.ok(result.output.includes("hermes from isolated home"));
+        assert.equal(result.sessionRef, "20260714_isolated");
+        assert.equal(result.exitCode, 0);
+
+        // Final check: the isolated hermes is still unchanged after dispatch.
+        const finalStat = fs.statSync(isolatedHermes);
+        assert.equal(finalStat.ino, beforeInode, "inode must be unchanged after dispatch");
+        assert.equal(finalStat.mode, beforeMode, "mode must be unchanged after dispatch");
+        assert.equal(finalStat.size, beforeSize, "size must be unchanged after dispatch");
+      } finally {
+        if (savedHome === undefined) {
+          delete process.env.HOME;
+        } else {
+          process.env.HOME = savedHome;
+        }
+        if (savedHermesBinary === undefined) {
+          delete process.env.TAMANDUA_HERMES_BINARY;
+        } else {
+          process.env.TAMANDUA_HERMES_BINARY = savedHermesBinary;
+        }
+        process.env.PATH = savedPath ?? "";
       }
     });
   });
