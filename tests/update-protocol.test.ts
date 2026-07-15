@@ -31,10 +31,11 @@ const DIST_DB = path.join(REPO_ROOT, "dist", "db.js");
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
-function runNode(args, env) {
+function runNode(args, extraEnv) {
+  const env = cleanChildEnv(extraEnv);
   const result = spawnSync(process.execPath, args, {
     encoding: "utf-8",
-    env: { ...process.env, ...env },
+    env,
     timeout: 30000,
   });
   return result;
