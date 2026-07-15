@@ -2,8 +2,10 @@ import fs from "node:fs";
 import {
   cleanChildEnv,
   reservePortHandles,
+  waitForPidExit,
 } from "./helpers/test-env.ts";
 import path from "node:path";
+import { stopDaemon } from "../dist/server/daemonctl.js";
 import { tamanduaTempDir } from "../src/lib/temp-dir.ts";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
@@ -186,10 +188,25 @@ describe("CLI workflow run working-directory-for-harness", () => {
       assert.ok(row!.scheduling_requested_at, "expected scheduling_requested_at to be set");
     } finally {
       try { await Promise.all(env.portHandles.map(h => h.close())); } catch {}
-      await runCliToExit(["dashboard", "stop"], {
-        HOME: env.homeDir,
-        TAMANDUA_CONTROL_PORT: String(env.controlPort),
-      }).catch(() => ({ stdout: "", stderr: "", code: null }));
+      // Stop the daemon that workflow run started (writes tamandua.pid).
+      // dashboard stop checks dashboard.pid which never exists for daemon processes.
+      const daemonPidFile = path.join(env.homeDir, ".tamandua", "tamandua.pid");
+      let daemonPid: number | null = null;
+      try {
+        if (fs.existsSync(daemonPidFile)) {
+          daemonPid = parseInt(fs.readFileSync(daemonPidFile, "utf-8").trim(), 10);
+        }
+      } catch {}
+      if (daemonPid !== null && !isNaN(daemonPid)) {
+        let wasAlive = false;
+        try { process.kill(daemonPid, 0); wasAlive = true; } catch {}
+        const stopped = stopDaemon({ homeDir: env.homeDir });
+        if (wasAlive) {
+          assert.ok(stopped, `stopDaemon({ homeDir }) must return true when daemon PID ${daemonPid} is alive`);
+          const exited = await waitForPidExit(daemonPid, 10000);
+          assert.ok(exited, `daemon PID ${daemonPid} must exit before temp directory cleanup`);
+        }
+      }
       try { fs.rmSync(env.root, { recursive: true, force: true }); } catch { /* cleanup */ }
     }
   });
@@ -220,10 +237,25 @@ describe("CLI workflow run working-directory-for-harness", () => {
       assert.ok(!result.stdout.includes("Run:"), "should not print successful run output");
     } finally {
       try { await Promise.all(env.portHandles.map(h => h.close())); } catch {}
-      await runCliToExit(["dashboard", "stop"], {
-        HOME: env.homeDir,
-        TAMANDUA_CONTROL_PORT: String(env.controlPort),
-      }).catch(() => ({ stdout: "", stderr: "", code: null }));
+      // Stop the daemon that workflow run started (writes tamandua.pid).
+      // No-op when the PID file never existed because the command failed before launch.
+      const daemonPidFile = path.join(env.homeDir, ".tamandua", "tamandua.pid");
+      let daemonPid: number | null = null;
+      try {
+        if (fs.existsSync(daemonPidFile)) {
+          daemonPid = parseInt(fs.readFileSync(daemonPidFile, "utf-8").trim(), 10);
+        }
+      } catch {}
+      if (daemonPid !== null && !isNaN(daemonPid)) {
+        let wasAlive = false;
+        try { process.kill(daemonPid, 0); wasAlive = true; } catch {}
+        const stopped = stopDaemon({ homeDir: env.homeDir });
+        if (wasAlive) {
+          assert.ok(stopped, `stopDaemon({ homeDir }) must return true when daemon PID ${daemonPid} is alive`);
+          const exited = await waitForPidExit(daemonPid, 10000);
+          assert.ok(exited, `daemon PID ${daemonPid} must exit before temp directory cleanup`);
+        }
+      }
       try { fs.rmSync(env.root, { recursive: true, force: true }); } catch { /* cleanup */ }
     }
   });
@@ -313,10 +345,24 @@ describe("CLI workflow run working-directory-for-harness", () => {
       try { await blockerPortHandle.close(); } catch {}
       try { await Promise.all(env.portHandles.map(h => h.close())); } catch {}
       dummyServer.close();
-      await runCliToExit(["dashboard", "stop"], {
-        HOME: env.homeDir,
-        TAMANDUA_CONTROL_PORT: String(blockerPort),
-      }).catch(() => ({ stdout: "", stderr: "", code: null }));
+      // Stop the daemon that workflow run started (writes tamandua.pid).
+      const daemonPidFile = path.join(env.homeDir, ".tamandua", "tamandua.pid");
+      let daemonPid: number | null = null;
+      try {
+        if (fs.existsSync(daemonPidFile)) {
+          daemonPid = parseInt(fs.readFileSync(daemonPidFile, "utf-8").trim(), 10);
+        }
+      } catch {}
+      if (daemonPid !== null && !isNaN(daemonPid)) {
+        let wasAlive = false;
+        try { process.kill(daemonPid, 0); wasAlive = true; } catch {}
+        const stopped = stopDaemon({ homeDir: env.homeDir });
+        if (wasAlive) {
+          assert.ok(stopped, `stopDaemon({ homeDir }) must return true when daemon PID ${daemonPid} is alive`);
+          const exited = await waitForPidExit(daemonPid, 10000);
+          assert.ok(exited, `daemon PID ${daemonPid} must exit before temp directory cleanup`);
+        }
+      }
       try {
         fs.rmSync(env.root, { recursive: true, force: true });
       } catch {

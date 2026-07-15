@@ -169,6 +169,26 @@ export async function reservePortHandles(count: number): Promise<PortHandle[]> {
 }
 
 /**
+ * Wait for a process to exit by polling process.kill(pid, 0).
+ * Returns true if the process exited before the deadline, false otherwise.
+ *
+ * This helper performs non-mutating observation only — it never kills,
+ * never scans by name, never signals arbitrary PIDs.
+ */
+export async function waitForPidExit(pid: number, deadlineMs: number = 10000): Promise<boolean> {
+  const deadline = Date.now() + deadlineMs;
+  while (Date.now() < deadline) {
+    try {
+      process.kill(pid, 0);
+    } catch {
+      return true; // process is gone
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return false; // still alive after deadline
+}
+
+/**
  * Reserve `count` distinct ports, call `fn(ports)`, then release all ports
  * in a finally block. This is the preferred pattern for daemon/control-plane
  * tests that need guaranteed port ownership for their duration.
