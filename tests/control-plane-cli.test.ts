@@ -16,7 +16,7 @@
  */
 
 import { describe, it } from "node:test";
-import { cleanChildEnv, createTempHome, reservePortHandle } from "./helpers/test-env.ts";
+import { cleanChildEnv, createTempHome, stopPidfileServiceAndWait, reservePortHandle } from "./helpers/test-env.ts";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import http from "node:http";
@@ -29,7 +29,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // In dev (tsx), compiled CLI is in dist/cli/
 const CLI_SCRIPT = path.resolve(__dirname, "..", "dist", "cli", "cli.js");
 
-import { stopControlPlane } from "../dist/server/daemonctl.js";
+import { stopDaemon } from "../dist/server/daemonctl.js";
 import { DEFAULT_CONTROL_PORT } from "../dist/server/control-server.js";
 
 // ═══════════════════════════════════════════════════════════════════
@@ -157,10 +157,6 @@ function isIsolatedControlPlaneRunning(homeDir: string): { running: true; pid: n
   }
 }
 
-function stopIsolatedControlPlane(homeDir: string): boolean {
-  return stopControlPlane({ homeDir });
-}
-
 function cleanupIsolatedControlPlaneFiles(homeDir: string): void {
   try { fs.unlinkSync(getIsolatedControlPlanePidFile(homeDir)); } catch {}
   try { fs.unlinkSync(getIsolatedControlPlanePortFile(homeDir)); } catch {}
@@ -194,7 +190,7 @@ describe("tamandua control-plane CLI", { concurrency: 1 }, () => {
     assert.equal(cleanStderr(stderr), "");
     } finally {
       portHandle.close().catch(() => {});
-      stopIsolatedControlPlane(tempHome);
+      await stopPidfileServiceAndWait({ pidFile: getIsolatedControlPlanePidFile(tempHome), stop: stopDaemon, label: "daemon", homeDir: tempHome });
     }
   });
 
@@ -231,7 +227,7 @@ describe("tamandua control-plane CLI", { concurrency: 1 }, () => {
 
     } finally {
       portHandle.close().catch(() => {});
-      stopIsolatedControlPlane(tempHome);
+      await stopPidfileServiceAndWait({ pidFile: getIsolatedControlPlanePidFile(tempHome), stop: stopDaemon, label: "daemon", homeDir: tempHome });
     }
   });
 
@@ -263,7 +259,7 @@ describe("tamandua control-plane CLI", { concurrency: 1 }, () => {
 
     } finally {
       portHandle.close().catch(() => {});
-      stopIsolatedControlPlane(tempHome);
+      await stopPidfileServiceAndWait({ pidFile: getIsolatedControlPlanePidFile(tempHome), stop: stopDaemon, label: "daemon", homeDir: tempHome });
     }
   });
 
@@ -293,7 +289,7 @@ describe("tamandua control-plane CLI", { concurrency: 1 }, () => {
 
     } finally {
       portHandle.close().catch(() => {});
-      stopIsolatedControlPlane(tempHome);
+      await stopPidfileServiceAndWait({ pidFile: getIsolatedControlPlanePidFile(tempHome), stop: stopDaemon, label: "daemon", homeDir: tempHome });
     }
   });
 
@@ -331,7 +327,7 @@ describe("tamandua control-plane CLI", { concurrency: 1 }, () => {
 
     } finally {
       portHandle.close().catch(() => {});
-      stopIsolatedControlPlane(tempHome);
+      await stopPidfileServiceAndWait({ pidFile: getIsolatedControlPlanePidFile(tempHome), stop: stopDaemon, label: "daemon", homeDir: tempHome });
     }
   });
 
@@ -342,6 +338,7 @@ describe("tamandua control-plane CLI", { concurrency: 1 }, () => {
     }
     const tempHome = createTempHome(TMP_PREFIX).homeDir;
     const port = await getAvailablePort();
+    let capturedPid: number | null = null;
     cleanupIsolatedControlPlaneFiles(tempHome);
     try {
 
@@ -356,6 +353,7 @@ describe("tamandua control-plane CLI", { concurrency: 1 }, () => {
     const runningStatus = isIsolatedControlPlaneRunning(tempHome);
     assert.equal(runningStatus.running, true);
     assert.ok(runningStatus.pid);
+    capturedPid = runningStatus.pid;
 
     fs.unlinkSync(getIsolatedControlPlanePidFile(tempHome));
 
@@ -368,7 +366,16 @@ describe("tamandua control-plane CLI", { concurrency: 1 }, () => {
     assert.ok(!second.stdout.includes("Control plane started"));
 
     } finally {
-      stopIsolatedControlPlane(tempHome);
+      const pidFile = getIsolatedControlPlanePidFile(tempHome);
+      if (capturedPid !== null && !fs.existsSync(pidFile)) {
+        // Restore PID file for identity-safe cleanup via the guarded daemon stop path
+        let alive = false;
+        try { process.kill(capturedPid, 0); alive = true; } catch { /* not live */ }
+        if (alive) {
+          fs.writeFileSync(pidFile, String(capturedPid), "utf-8");
+        }
+      }
+      await stopPidfileServiceAndWait({ pidFile, stop: stopDaemon, label: "daemon", homeDir: tempHome });
     }
   });
 
@@ -406,7 +413,7 @@ describe("tamandua control-plane CLI", { concurrency: 1 }, () => {
 
     } finally {
       portHandle.close().catch(() => {});
-      stopIsolatedControlPlane(tempHome);
+      await stopPidfileServiceAndWait({ pidFile: getIsolatedControlPlanePidFile(tempHome), stop: stopDaemon, label: "daemon", homeDir: tempHome });
     }
   });
 
@@ -451,7 +458,7 @@ describe("tamandua control-plane CLI", { concurrency: 1 }, () => {
 
     } finally {
       portHandle.close().catch(() => {});
-      stopIsolatedControlPlane(tempHome);
+      await stopPidfileServiceAndWait({ pidFile: getIsolatedControlPlanePidFile(tempHome), stop: stopDaemon, label: "daemon", homeDir: tempHome });
     }
   });
 
@@ -467,7 +474,29 @@ describe("tamandua control-plane CLI", { concurrency: 1 }, () => {
     assert.ok(stdout.includes("not running"), `Expected "not running", got: ${stdout}`);
     assert.equal(cleanStderr(stderr), "");
     } finally {
-      stopIsolatedControlPlane(tempHome);
+      await stopPidfileServiceAndWait({ pidFile: getIsolatedControlPlanePidFile(tempHome), stop: stopDaemon, label: "daemon", homeDir: tempHome });
+    }
+  });
+
+  // Regression: stopPidfileServiceAndWait rejects malformed PID strings
+  // (e.g., trailing junk, decimals, signed) and never reaches the guarded stop callback.
+  it("stopPidfileServiceAndWait rejects malformed PID with trailing junk", async () => {
+    const tempHome = createTempHome(TMP_PREFIX).homeDir;
+    const pidFile = path.join(tempHome, ".tamandua", "tamandua.pid");
+    fs.mkdirSync(path.dirname(pidFile), { recursive: true });
+    let stopCalled = false;
+    const guardedStop = (_opts: { homeDir: string }) => { stopCalled = true; return true; };
+
+    try {
+      fs.writeFileSync(pidFile, "123junk", "utf-8");
+      await assert.rejects(
+        () => stopPidfileServiceAndWait({ pidFile, stop: guardedStop, label: "test-service", homeDir: tempHome }),
+        /Invalid PID/,
+        "should reject malformed PID with trailing junk",
+      );
+      assert.equal(stopCalled, false, "guarded stop callback must not be reached for malformed PID");
+    } finally {
+      try { fs.rmSync(path.join(tempHome, ".tamandua"), { recursive: true, force: true }); } catch {}
     }
   });
 });

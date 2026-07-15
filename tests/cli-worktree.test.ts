@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import { cleanChildEnv, reservePortHandles } from "./helpers/test-env.ts";
+import { cleanChildEnv, reservePortHandles, stopPidfileServiceAndWait } from "./helpers/test-env.ts";
 import path from "node:path";
 import { tamanduaTempDir } from "../src/lib/temp-dir.ts";
 import assert from "node:assert/strict";
@@ -7,6 +7,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { describe, it } from "node:test";
 import crypto from "node:crypto";
+import { stopDaemon, stopDashboardStandalone } from "../dist/server/daemonctl.js";
 
 const cliPath = path.resolve(process.cwd(), "dist", "cli", "cli.js");
 
@@ -217,7 +218,8 @@ describe("CLI worktree run arguments", () => {
       );
       assert.equal(context.worktree_origin_ref, "main");
     } finally {
-      await runCliToExit(["dashboard", "stop"], cliEnv(env)).catch(() => ({ stdout: "", stderr: "", code: null }));
+      await stopPidfileServiceAndWait({ pidFile: path.join(env.tamanduaDir, "tamandua.pid"), stop: stopDaemon, label: "daemon", homeDir: env.homeDir });
+      await stopPidfileServiceAndWait({ pidFile: path.join(env.tamanduaDir, "dashboard.pid"), stop: stopDashboardStandalone, label: "dashboard", homeDir: env.homeDir });
       try { fs.rmSync(env.root, { recursive: true, force: true }); } catch {}
     }
   });
@@ -251,7 +253,8 @@ describe("CLI worktree run arguments", () => {
       );
       assert.equal(context.worktree_origin_ref, "main");
     } finally {
-      await runCliToExit(["dashboard", "stop"], cliEnv(env)).catch(() => ({ stdout: "", stderr: "", code: null }));
+      await stopPidfileServiceAndWait({ pidFile: path.join(env.tamanduaDir, "tamandua.pid"), stop: stopDaemon, label: "daemon", homeDir: env.homeDir });
+      await stopPidfileServiceAndWait({ pidFile: path.join(env.tamanduaDir, "dashboard.pid"), stop: stopDashboardStandalone, label: "dashboard", homeDir: env.homeDir });
       try { fs.rmSync(env.root, { recursive: true, force: true }); } catch {}
     }
   });
@@ -283,7 +286,8 @@ describe("CLI worktree run arguments", () => {
       );
       assert.ok(context.worktree_origin_ref, "expected worktree_origin_ref to be defaulted from the origin branch");
     } finally {
-      await runCliToExit(["dashboard", "stop"], cliEnv(env)).catch(() => ({ stdout: "", stderr: "", code: null }));
+      await stopPidfileServiceAndWait({ pidFile: path.join(env.tamanduaDir, "tamandua.pid"), stop: stopDaemon, label: "daemon", homeDir: env.homeDir });
+      await stopPidfileServiceAndWait({ pidFile: path.join(env.tamanduaDir, "dashboard.pid"), stop: stopDashboardStandalone, label: "dashboard", homeDir: env.homeDir });
       try { fs.rmSync(env.root, { recursive: true, force: true }); } catch {}
     }
   });
@@ -384,7 +388,8 @@ describe("CLI worktree run arguments", () => {
         assert.match(stdout, new RegExp(`Harness CWD: ${worktreeRow!.worktree_path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
       }
     } finally {
-      await runCliToExit(["dashboard", "stop"], cliEnv(env)).catch(() => ({ stdout: "", stderr: "", code: null }));
+      await stopPidfileServiceAndWait({ pidFile: path.join(env.tamanduaDir, "tamandua.pid"), stop: stopDaemon, label: "daemon", homeDir: env.homeDir });
+      await stopPidfileServiceAndWait({ pidFile: path.join(env.tamanduaDir, "dashboard.pid"), stop: stopDashboardStandalone, label: "dashboard", homeDir: env.homeDir });
       try { fs.rmSync(env.root, { recursive: true, force: true }); } catch {}
     }
   });

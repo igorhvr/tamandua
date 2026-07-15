@@ -1,7 +1,70 @@
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
+import assert from "node:assert/strict";
 import { tamanduaTempDir } from "../../src/lib/temp-dir.ts";
+
+/**
+ * Stop a service identified by a PID file and wait for its process to exit.
+ *
+ * - Reads PID from pidFile; treats only ENOENT as "service never started" (no-op).
+ *   Other read failures and invalid/non-positive PIDs fail loudly.
+ * - Uses process.kill(pid, 0) only for observation — never calls process.kill
+ *   with a mutating signal.
+ * - If PID is alive, invokes the caller-supplied stop({ homeDir }), asserts it
+ *   returned true, then polls (bounded, ~5s default) until process.kill(pid, 0)
+ *   throws ESRCH. Times out and fails the test if the process does not exit.
+ */
+export async function stopPidfileServiceAndWait(opts: {
+  pidFile: string;
+  stop: (opts: { homeDir: string }) => boolean;
+  label: string;
+  homeDir: string;
+  deadlineMs?: number;
+}): Promise<void> {
+  let pidStr: string;
+  try {
+    pidStr = fs.readFileSync(opts.pidFile, "utf-8").trim();
+  } catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return; // Service never started
+    throw err;
+  }
+
+  // Accept only canonical positive decimal PID: /^[1-9][0-9]*$/, then Number and SafeInteger.
+  // Rejects empty, zero, negative, signed (+/-), decimal, whitespace-internal, or trailing-junk.
+  if (!/^[1-9][0-9]*$/.test(pidStr)) {
+    throw new Error(`Invalid PID in ${opts.pidFile}: ${pidStr}`);
+  }
+  const pid = Number(pidStr);
+  if (!Number.isSafeInteger(pid)) {
+    throw new Error(`Invalid PID in ${opts.pidFile}: ${pidStr}`);
+  }
+
+  // Observe liveness (signal 0 is non-mutating)
+  try {
+    process.kill(pid, 0);
+  } catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException).code === "ESRCH") return; // Already exited
+    throw err;
+  }
+
+  // Process is alive — invoke the guarded stop
+  const stopped = opts.stop({ homeDir: opts.homeDir });
+  assert.ok(stopped, `stop callback returned false for ${opts.label} (PID ${pid})`);
+
+  // Poll for the exact child to exit
+  const deadline = Date.now() + (opts.deadlineMs ?? 5000);
+  while (Date.now() < deadline) {
+    try {
+      process.kill(pid, 0);
+      await new Promise((r) => setTimeout(r, 50));
+    } catch (err: unknown) {
+      if ((err as NodeJS.ErrnoException).code === "ESRCH") return;
+      throw err;
+    }
+  }
+  throw new Error(`${opts.label} (PID ${pid}) did not exit within ${opts.deadlineMs ?? 5000}ms`);
+}
 
 export interface TempHome {
   /** Top-level temp directory (e.g. /tmp/tamandua-test-XXXXX).  rmSync this to clean up. */

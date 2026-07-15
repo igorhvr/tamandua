@@ -2,6 +2,7 @@ import fs from "node:fs";
 import {
   cleanChildEnv,
   reservePortHandles,
+  stopPidfileServiceAndWait,
 } from "./helpers/test-env.ts";
 import path from "node:path";
 import { tamanduaTempDir } from "../src/lib/temp-dir.ts";
@@ -9,6 +10,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { describe, it } from "node:test";
+import { stopDaemon } from "../dist/server/daemonctl.js";
 
 const cliPath = path.resolve(process.cwd(), "dist", "cli", "cli.js");
 
@@ -186,10 +188,7 @@ describe("CLI workflow run working-directory-for-harness", () => {
       assert.ok(row!.scheduling_requested_at, "expected scheduling_requested_at to be set");
     } finally {
       try { await Promise.all(env.portHandles.map(h => h.close())); } catch {}
-      await runCliToExit(["dashboard", "stop"], {
-        HOME: env.homeDir,
-        TAMANDUA_CONTROL_PORT: String(env.controlPort),
-      }).catch(() => ({ stdout: "", stderr: "", code: null }));
+      await stopPidfileServiceAndWait({ pidFile: path.join(env.tamanduaDir, "tamandua.pid"), stop: stopDaemon, label: "daemon", homeDir: env.homeDir });
       try { fs.rmSync(env.root, { recursive: true, force: true }); } catch { /* cleanup */ }
     }
   });
@@ -220,10 +219,7 @@ describe("CLI workflow run working-directory-for-harness", () => {
       assert.ok(!result.stdout.includes("Run:"), "should not print successful run output");
     } finally {
       try { await Promise.all(env.portHandles.map(h => h.close())); } catch {}
-      await runCliToExit(["dashboard", "stop"], {
-        HOME: env.homeDir,
-        TAMANDUA_CONTROL_PORT: String(env.controlPort),
-      }).catch(() => ({ stdout: "", stderr: "", code: null }));
+      await stopPidfileServiceAndWait({ pidFile: path.join(env.tamanduaDir, "tamandua.pid"), stop: stopDaemon, label: "daemon", homeDir: env.homeDir });
       try { fs.rmSync(env.root, { recursive: true, force: true }); } catch { /* cleanup */ }
     }
   });
@@ -313,10 +309,7 @@ describe("CLI workflow run working-directory-for-harness", () => {
       try { await blockerPortHandle.close(); } catch {}
       try { await Promise.all(env.portHandles.map(h => h.close())); } catch {}
       dummyServer.close();
-      await runCliToExit(["dashboard", "stop"], {
-        HOME: env.homeDir,
-        TAMANDUA_CONTROL_PORT: String(blockerPort),
-      }).catch(() => ({ stdout: "", stderr: "", code: null }));
+      await stopPidfileServiceAndWait({ pidFile: path.join(env.tamanduaDir, "tamandua.pid"), stop: stopDaemon, label: "daemon", homeDir: env.homeDir });
       try {
         fs.rmSync(env.root, { recursive: true, force: true });
       } catch {
@@ -347,10 +340,7 @@ describe("CLI workflow run working-directory-for-harness", () => {
       );
     } finally {
       try { await Promise.all(env.portHandles.map(h => h.close())); } catch {}
-      await runCliToExit(["dashboard", "stop"], {
-        HOME: env.homeDir,
-        TAMANDUA_CONTROL_PORT: String(env.controlPort),
-      }).catch(() => ({ stdout: "", stderr: "", code: null }));
+      await stopPidfileServiceAndWait({ pidFile: path.join(env.tamanduaDir, "tamandua.pid"), stop: stopDaemon, label: "daemon", homeDir: env.homeDir });
       try {
         fs.rmSync(env.root, { recursive: true, force: true });
       } catch {
