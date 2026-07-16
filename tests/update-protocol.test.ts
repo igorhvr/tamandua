@@ -1538,6 +1538,178 @@ describe("COORDINATOR phase-cas removal", () => {
   });
 });
 
+// ── ACQUIRE: direct-input contract ───────────────────────────────────────
+
+describe("acquire direct-input contract", () => {
+  const INVALID = "Invalid argument";
+  const BOUND = 4096;
+
+  function withEnv(temp, fn) {
+    const save = { HOME: process.env.HOME, TAMANDUA_STATE_DIR: process.env.TAMANDUA_STATE_DIR, TAMANDUA_DB_PATH: process.env.TAMANDUA_DB_PATH };
+    try {
+      process.env.HOME = temp.homeDir;
+      process.env.TAMANDUA_STATE_DIR = temp.tamanduaDir;
+      process.env.TAMANDUA_DB_PATH = path.join(temp.root, "test.db");
+      return fn();
+    } finally {
+      for (const [k, v] of Object.entries(save)) {
+        if (v === undefined) delete process.env[k]; else process.env[k] = v;
+      }
+    }
+  }
+
+  async function loadAcquire() {
+    return (await import(PROTOCOL_MODULE)).acquire;
+  }
+
+  it("rejects all invalid direct inputs before I/O with bounded generic diagnostics", async () => {
+    const acquire = await loadAcquire();
+
+    // 4097-byte valid JSON: "{}" padded with spaces; first 4096 bytes also valid JSON (old bust would pass)
+    const OVER = "{}" + " ".repeat(BOUND - 1);
+    // multibyte: 1366 × U+20AC (€, 3 UTF-8 bytes each) = 4098 bytes, JS .length = 1366 < 4096
+    const MB = JSON.stringify("\u20AC".repeat(1366));
+    // huge sentinel-bearing strings for no-echo diagnostics
+    const HUGE_MODE = "MODE_SENTINEL_" + "m".repeat(5000);
+    const HUGE_PID = "PID_SENTINEL_" + "9".repeat(5000);
+    // poison object that throws on coercion — proves production never invokes String()
+    const POISON = { [Symbol.toPrimitive]: () => { throw new Error("coerced"); } };
+
+    // pre-assert OVER properties: valid JSON, 4097 bytes, first 4096 bytes also parse
+    assert.equal(Buffer.byteLength(OVER, "utf8"), BOUND + 1);
+    assert.doesNotThrow(() => JSON.parse(OVER));
+    assert.doesNotThrow(() => JSON.parse(OVER.slice(0, BOUND)));
+
+    const cases: Array<[unknown, unknown, unknown, unknown, unknown, string]> = [
+      // invalid/non-string mode
+      [null, 1, "{}", "{}", "{}", "Invalid mode"],
+      ["bogus", 1, "{}", "{}", "{}", "Invalid mode"],
+      [42, 1, "{}", "{}", "{}", "Invalid mode"],
+      [true, 1, "{}", "{}", "{}", "Invalid mode"],
+      [POISON, 1, "{}", "{}", "{}", "Invalid mode"],
+      [HUGE_MODE, 1, "{}", "{}", "{}", "Invalid mode"],
+      // invalid PID shapes
+      ["current", 0, "{}", "{}", "{}", "Invalid updater PID"],
+      ["current", -1, "{}", "{}", "{}", "Invalid updater PID"],
+      ["current", 1.5, "{}", "{}", "{}", "Invalid updater PID"],
+      ["current", null, "{}", "{}", "{}", "Invalid updater PID"],
+      ["current", "99999", "{}", "{}", "{}", "Invalid updater PID"],
+      ["current", POISON, "{}", "{}", "{}", "Invalid updater PID"],
+      ["current", HUGE_PID, "{}", "{}", "{}", "Invalid updater PID"],
+      // non-string topology
+      ["current", 1, null, "{}", "{}", INVALID],
+      ["current", 1, 42, "{}", "{}", INVALID],
+      ["current", 1, true, "{}", "{}", INVALID],
+      ["current", 1, { a: 1 }, "{}", "{}", INVALID],
+      // non-string artifacts
+      ["current", 1, "{}", undefined, "{}", INVALID],
+      ["current", 1, "{}", [], "{}", INVALID],
+      // non-string readiness
+      ["current", 1, "{}", "{}", null, INVALID],
+      // invalid JSON
+      ["current", 1, "{bad", "{}", "{}", "topology is not valid JSON"],
+      ["current", 1, "{}", "nope", "{}", "artifacts is not valid JSON"],
+      ["current", 1, "{}", "{}", "[}", "readiness is not valid JSON"],
+      // oversized: 4097 valid JSON bytes (old bust would NOT reject — truncation bypass proof)
+      ["current", 1, OVER, "{}", "{}", INVALID],
+      ["current", 1, "{}", OVER, "{}", INVALID],
+      ["current", 1, "{}", "{}", OVER, INVALID],
+      // multibyte: JS .length < 4096 but UTF-8 size > 4096 (old truncation bypass)
+      ["current", 1, MB, "{}", "{}", INVALID],
+      ["current", 1, "{}", MB, "{}", INVALID],
+      ["current", 1, "{}", "{}", MB, INVALID],
+    ];
+
+    for (let i = 0; i < cases.length; i++) {
+      const [mode, pid, topo, art, ready, expected] = cases[i];
+      const temp = createTempHome("upgx-dic-");
+      const dbPath = path.join(temp.root, "test.db");
+      try {
+        let threw = false, errMsg = "";
+        try {
+          withEnv(temp, () => acquire(mode, pid, topo, art, ready));
+        } catch (e: any) {
+          threw = true;
+          errMsg = e.message;
+        }
+        assert.ok(threw, `Expected rejection for case #${i}`);
+        assert.equal(errMsg, expected, `Expected "${expected}", got "${errMsg}"`);
+        // fixed diagnostics must not echo caller values — verify no payload leaks
+        if (typeof mode === "string" && mode.length > 100) {
+          assert.ok(!errMsg.includes(mode), `mode echoed: ${errMsg.slice(0, 80)}`);
+        }
+        if (typeof pid === "string" && pid.length > 100) {
+          assert.ok(!errMsg.includes(pid), `pid echoed: ${errMsg.slice(0, 80)}`);
+        }
+        for (const val of [topo, art, ready]) {
+          if (typeof val === "string" && val.length > 100) {
+            assert.ok(!errMsg.includes(val.slice(0, 10)), `payload echoed: ${errMsg.slice(0, 80)}`);
+          }
+        }
+        // DB must not exist after pre-I/O rejection
+        assert.ok(!fs.existsSync(dbPath), `DB created after pre-I/O rejection`);
+      } finally {
+        try { fs.rmSync(temp.root, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
+    }
+  });
+
+  it("persists exact 4096-byte JSON strings with correct five-field authority", async () => {
+    const acquire = await loadAcquire();
+
+    const make4096 = (key: string): string => {
+      const prefix = `{"${key}":"`;
+      const suffix = '"}';
+      const overhead = Buffer.byteLength(prefix, "utf8") + Buffer.byteLength(suffix, "utf8");
+      return prefix + "x".repeat(BOUND - overhead) + suffix;
+    };
+    const topo4096 = make4096("t");
+    const art4096 = make4096("a");
+    const ready4096 = make4096("r");
+
+    assert.equal(Buffer.byteLength(topo4096, "utf8"), BOUND, "topology not exactly 4096 bytes");
+    assert.equal(Buffer.byteLength(art4096, "utf8"), BOUND, "artifacts not exactly 4096 bytes");
+    assert.equal(Buffer.byteLength(ready4096, "utf8"), BOUND, "readiness not exactly 4096 bytes");
+    assert.ok(typeof JSON.parse(topo4096).t === "string");
+    assert.ok(typeof JSON.parse(art4096).a === "string");
+    assert.ok(typeof JSON.parse(ready4096).r === "string");
+    assert.notEqual(topo4096, art4096);
+    assert.notEqual(art4096, ready4096);
+
+    const temp = createTempHome("upgx-dic-valid-");
+    const dbPath = path.join(temp.root, "test.db");
+    try {
+      const result = withEnv(temp, () =>
+        acquire("current", process.ppid, topo4096, art4096, ready4096),
+      );
+
+      assert.deepEqual(Object.keys(result).sort(), ["mode", "ownerIdentity", "ownerPid", "phase", "token"]);
+      assert.equal(result.phase, "ACQUIRED");
+      assert.equal(result.mode, "current");
+      assert.equal(typeof result.token, "string");
+      assert.ok(/^[A-Za-z0-9_-]{43}$/.test(result.token));
+
+      const db = new DatabaseSync(dbPath);
+      try {
+        const row = db.prepare(
+          "SELECT topology, artifacts, readiness FROM update_gate WHERE id = 1",
+        ).get() as { topology: string; artifacts: string; readiness: string };
+        // per-field byte-length assertions
+        assert.equal(Buffer.byteLength(row.topology, "utf8"), BOUND, "persisted topology wrong byte length");
+        assert.equal(Buffer.byteLength(row.artifacts, "utf8"), BOUND, "persisted artifacts wrong byte length");
+        assert.equal(Buffer.byteLength(row.readiness, "utf8"), BOUND, "persisted readiness wrong byte length");
+        // whole-row deep equality on normalized plain-object three-field row
+        const normalized = { topology: row.topology, artifacts: row.artifacts, readiness: row.readiness };
+        assert.deepEqual(normalized, { topology: topo4096, artifacts: art4096, readiness: ready4096 });
+      } finally {
+        db.close();
+      }
+    } finally {
+      try { fs.rmSync(temp.root, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
+  });
+});
+
 // ── COORDINATOR CONTRACT: strict parser, authority, UTF-8, output caps ──
 
 describe("coordinator-contract", () => {

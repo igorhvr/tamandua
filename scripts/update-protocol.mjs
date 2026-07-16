@@ -33,15 +33,9 @@ const VALID_MODES = Object.freeze(["legacy", "current"]);
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-function bust(limit, label, value) {
-  return typeof value === "string" && value.length <= limit
-    ? value
-    : `${value}`.slice(0, limit);
-}
-
 function validateMode(name) {
-  if (!VALID_MODES.includes(name)) {
-    throw new Error(`Invalid mode: ${name}`);
+  if (typeof name !== "string" || !VALID_MODES.includes(name)) {
+    throw new Error("Invalid mode");
   }
 }
 
@@ -396,19 +390,21 @@ function gateExists(db) {
 export function acquire(mode, updaterPid, topology, artifacts, readiness) {
   validateMode(mode);
 
-  // Validate / bound inputs
-  const boundedTopology = bust(BOUND, "topology", topology);
-  const boundedArtifacts = bust(BOUND, "artifacts", artifacts);
-  const boundedReadiness = bust(BOUND, "readiness", readiness);
-
-  validateJSON("topology", boundedTopology);
-  validateJSON("artifacts", boundedArtifacts);
-  validateJSON("readiness", boundedReadiness);
-
-  // Validate updater PID
   if (!Number.isSafeInteger(updaterPid) || updaterPid < 1) {
-    throw new Error(`Invalid updater PID: ${updaterPid}`);
+    throw new Error("Invalid updater PID");
   }
+
+  if (typeof topology !== "string") throw new Error("Invalid argument");
+  if (typeof artifacts !== "string") throw new Error("Invalid argument");
+  if (typeof readiness !== "string") throw new Error("Invalid argument");
+
+  if (Buffer.byteLength(topology, "utf8") > BOUND) throw new Error("Invalid argument");
+  if (Buffer.byteLength(artifacts, "utf8") > BOUND) throw new Error("Invalid argument");
+  if (Buffer.byteLength(readiness, "utf8") > BOUND) throw new Error("Invalid argument");
+
+  validateJSON("topology", topology);
+  validateJSON("artifacts", artifacts);
+  validateJSON("readiness", readiness);
 
   // Validate ancestry
   const coordinatorPid = process.pid;
@@ -467,9 +463,9 @@ export function acquire(mode, updaterPid, topology, artifacts, readiness) {
         mode,
         updaterPid,
         ownerIdentity,
-        boundedTopology,
-        boundedArtifacts,
-        boundedReadiness,
+        topology,
+        artifacts,
+        readiness,
         now,
         now,
       );
