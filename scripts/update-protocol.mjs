@@ -8,7 +8,6 @@
  * Exported functions:
  *   acquire(mode, updaterPid, topology, artifacts, readiness)
  *   inspect()
- *   casPhase(token, expectedPhase, newPhase, expectedOwnerPid, expectedOwnerIdentity)
  *   recordGuardian(token, expectedPhase, expectedOwnerPid, expectedOwnerIdentity, guardianPid, expectedGuardianIdentity)
  *   fail(token, expectedPhase, expectedOwnerPid, expectedOwnerIdentity, reason, details)
  *   isGateActive()
@@ -30,15 +29,7 @@ const GATE_TABLE = "update_gate";
 const SINGLETON_ID = 1;
 const BOUND = 4096; // Max length for externally-supplied strings
 
-const VALID_PHASES = Object.freeze(["ACQUIRED", "GUARDIAN_RECORDED", "FAILED"]);
 const VALID_MODES = Object.freeze(["legacy", "current"]);
-
-// Legal transition edges for PROT scope
-const LEGAL_TRANSITIONS = Object.freeze({
-  ACQUIRED: new Set(["GUARDIAN_RECORDED", "FAILED"]),
-  "GUARDIAN_RECORDED": new Set(["FAILED"]),
-  FAILED: new Set(), // terminal
-});
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -48,24 +39,9 @@ function bust(limit, label, value) {
     : `${value}`.slice(0, limit);
 }
 
-function validatePhase(name) {
-  if (!VALID_PHASES.includes(name)) {
-    throw new Error(`Invalid phase: ${name}`);
-  }
-}
-
 function validateMode(name) {
   if (!VALID_MODES.includes(name)) {
     throw new Error(`Invalid mode: ${name}`);
-  }
-}
-
-function validateLegalTransition(expected, desired) {
-  validatePhase(expected);
-  validatePhase(desired);
-  const allowed = LEGAL_TRANSITIONS[expected];
-  if (!allowed || !allowed.has(desired)) {
-    throw new Error(`Illegal transition: ${expected} -> ${desired}`);
   }
 }
 
@@ -529,87 +505,6 @@ export function inspect() {
     return row ?? null;
   } finally {
     db.close();
-  }
-}
-
-/**
- * Strict CAS phase transition. All predicates must match or zero rows change.
- *
- * @param {string} token - capability token from acquisition
- * @param {string} expectedPhase - caller must explicitly supply this
- * @param {string} newPhase - target phase
- * @param {number} expectedOwnerPid - expected owner PID
- * @param {string} expectedOwnerIdentity - expected serialized identity
- * @returns {{ changed: boolean, phase: string }}
- */
-export function casPhase(
-  token,
-  expectedPhase,
-  newPhase,
-  expectedOwnerPid,
-  expectedOwnerIdentity,
-) {
-  validatePhase(expectedPhase);
-  validatePhase(newPhase);
-  validateLegalTransition(expectedPhase, newPhase);
-
-  if (!Number.isSafeInteger(expectedOwnerPid) || expectedOwnerPid < 1) {
-    throw new Error(`Invalid expected owner PID: ${expectedOwnerPid}`);
-  }
-
-  const dbPath = resolveDbPath();
-  const db = new DatabaseSync(dbPath);
-
-  try {
-    db.exec("BEGIN IMMEDIATE");
-
-    const now = new Date().toISOString();
-    const result = db
-      .prepare(
-        `UPDATE ${GATE_TABLE}
-         SET phase = ?, updated_at = ?
-         WHERE id = ?
-           AND token = ?
-           AND phase = ?
-           AND owner_pid = ?
-           AND owner_identity = ?`,
-      )
-      .run(
-        newPhase,
-        now,
-        SINGLETON_ID,
-        token,
-        expectedPhase,
-        expectedOwnerPid,
-        expectedOwnerIdentity,
-      );
-
-    if (result.changes === 0) {
-      db.exec("ROLLBACK");
-      // Return unchanged — the row did not match all predicates
-      const current = getGateRow(db);
-      db.close();
-      return {
-        changed: false,
-        phase: current?.phase ?? null,
-      };
-    }
-
-    db.exec("COMMIT");
-    return { changed: true, phase: newPhase };
-  } catch (e) {
-    try {
-      db.exec("ROLLBACK");
-    } catch {
-      // ignore
-    }
-    throw e;
-  } finally {
-    try {
-      db.close();
-    } catch {
-      // ignore
-    }
   }
 }
 

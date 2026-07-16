@@ -7,7 +7,6 @@
  * Usage:
  *   node scripts/update-coordinator.mjs acquire <mode> <updaterPid> <topology> <artifacts> <readiness>
  *   node scripts/update-coordinator.mjs inspect
- *   node scripts/update-coordinator.mjs phase-cas <token> <expectedPhase> <newPhase> <expectedOwnerPid> <expectedOwnerIdentity>
  *   node scripts/update-coordinator.mjs record-guardian-cas <token> <guardianPid> <guardianIdentity>
  *   node scripts/update-coordinator.mjs fail <token> <reason> <details>
  */
@@ -15,7 +14,6 @@
 import {
   acquire,
   inspect,
-  casPhase,
   recordGuardian,
   fail,
 } from "./update-protocol.mjs";
@@ -60,7 +58,7 @@ async function main() {
 
   if (!command) {
     emitError(
-      "Usage: update-coordinator.mjs <acquire|inspect|phase-cas|record-guardian-cas|fail> [args...]",
+      "Usage: update-coordinator.mjs <acquire|inspect|record-guardian-cas|fail> [args...]",
     );
   }
 
@@ -87,34 +85,6 @@ async function main() {
       case "inspect": {
         const result = inspect();
         emit({ gate: result });
-        break;
-      }
-
-      case "phase-cas": {
-        const token = safeGetArg(args, 1);
-        const expectedPhase = safeGetArg(args, 2);
-        const newPhase = safeGetArg(args, 3);
-        const expectedOwnerPid = safeGetIntArg(
-          args,
-          4,
-          "expectedOwnerPid",
-        );
-        const expectedOwnerIdentity = safeGetArg(args, 5);
-
-        const result = casPhase(
-          token,
-          expectedPhase,
-          newPhase,
-          expectedOwnerPid,
-          expectedOwnerIdentity,
-        );
-        if (result.changed) {
-          emit(result);
-        } else {
-          emitError(
-            `CAS failed: expected ${expectedPhase} but current is ${result.phase}`,
-          );
-        }
         break;
       }
 
@@ -152,7 +122,7 @@ async function main() {
 
       default:
         emitError(
-          `Unknown command: ${command}. Use acquire, inspect, phase-cas, record-guardian-cas, or fail.`,
+          `Unknown command: ${command}. Use acquire, inspect, record-guardian-cas, or fail.`,
         );
     }
   } catch (e) {

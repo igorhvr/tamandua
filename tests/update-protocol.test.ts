@@ -933,161 +933,6 @@ console.log("OK:" + r.token);`,
     }
   });
 
-  it("wrong token, wrong expected phase, wrong owner PID/identity all change zero rows", () => {
-    const temp = createTempHome("update-protocol-owner-wrong-");
-    const dbPath = path.join(temp.root, "owner-wrong.db");
-
-    // Acquire first
-    const homeDir = temp.homeDir;
-    const env = cleanChildEnv({
-      HOME: homeDir,
-      TAMANDUA_STATE_DIR: path.join(homeDir, ".tamandua"),
-      TAMANDUA_DB_PATH: dbPath,
-    });
-
-    const acquireResult = spawnSync(
-      process.execPath,
-      [
-        "--input-type=module",
-        "-e",
-        `import { acquire } from ${JSON.stringify(PROTOCOL_MODULE)};
-const r = acquire("current", process.ppid, "{}", "{}", "{}");
-console.log(JSON.stringify(r));`,
-      ],
-      { encoding: "utf-8", env, timeout: 30000 },
-    );
-    assert.equal(acquireResult.status, 0, `Acquire failed: ${acquireResult.stderr}`);
-    const gateData = JSON.parse(acquireResult.stdout.trim());
-    const token = gateData.token;
-    const ownerIdentity = getGateOwnerIdentity(dbPath);
-    const ownerPid = process.ppid;
-
-    // Wrong token
-    const wrongTokenResult = spawnSync(
-      process.execPath,
-      [
-        "--input-type=module",
-        "-e",
-        `import { casPhase } from ${JSON.stringify(PROTOCOL_MODULE)};
-const r = casPhase("wrong-token", "ACQUIRED", "FAILED", ${ownerPid}, ${JSON.stringify(ownerIdentity)});
-console.log(JSON.stringify(r));`,
-      ],
-      { encoding: "utf-8", env, timeout: 30000 },
-    );
-    const wt = JSON.parse(wrongTokenResult.stdout.trim());
-    assert.equal(wt.changed, false);
-    assert.equal(wt.phase, "ACQUIRED");
-
-    // Wrong expected phase (say GUARDIAN_RECORDED but we're at ACQUIRED)
-    const wrongPhaseResult = spawnSync(
-      process.execPath,
-      [
-        "--input-type=module",
-        "-e",
-        `import { casPhase } from ${JSON.stringify(PROTOCOL_MODULE)};
-const r = casPhase(${JSON.stringify(token)}, "GUARDIAN_RECORDED", "FAILED", ${ownerPid}, ${JSON.stringify(ownerIdentity)});
-console.log(JSON.stringify(r));`,
-      ],
-      { encoding: "utf-8", env, timeout: 30000 },
-    );
-    const wp = JSON.parse(wrongPhaseResult.stdout.trim());
-    assert.equal(wp.changed, false);
-
-    // Wrong owner PID
-    const wrongPidResult = spawnSync(
-      process.execPath,
-      [
-        "--input-type=module",
-        "-e",
-        `import { casPhase } from ${JSON.stringify(PROTOCOL_MODULE)};
-const r = casPhase(${JSON.stringify(token)}, "ACQUIRED", "FAILED", 1, ${JSON.stringify(ownerIdentity)});
-console.log(JSON.stringify(r));`,
-      ],
-      { encoding: "utf-8", env, timeout: 30000 },
-    );
-    const wpid = JSON.parse(wrongPidResult.stdout.trim());
-    assert.equal(wpid.changed, false);
-
-    // Wrong identity
-    const wrongIdentResult = spawnSync(
-      process.execPath,
-      [
-        "--input-type=module",
-        "-e",
-        `import { casPhase } from ${JSON.stringify(PROTOCOL_MODULE)};
-const r = casPhase(${JSON.stringify(token)}, "ACQUIRED", "FAILED", ${ownerPid}, "wrong-identity");
-console.log(JSON.stringify(r));`,
-      ],
-      { encoding: "utf-8", env, timeout: 30000 },
-    );
-    const wid = JSON.parse(wrongIdentResult.stdout.trim());
-    assert.equal(wid.changed, false);
-
-    // Phase should still be ACQUIRED
-    const db = new DatabaseSync(dbPath);
-    const gate = db.prepare("SELECT phase FROM update_gate WHERE id = 1").get();
-    db.close();
-    assert.equal(gate.phase, "ACQUIRED", "Gate phase should still be ACQUIRED after all failed CAS");
-
-    try {
-      fs.rmSync(temp.root, { recursive: true, force: true });
-    } catch {
-      /* ignore */
-    }
-  });
-
-  it("PID-reuse protection: same live PID with deliberately mismatched identity changes zero rows", () => {
-    const temp = createTempHome("update-protocol-pidreuse-");
-    const dbPath = path.join(temp.root, "pidreuse.db");
-
-    const homeDir = temp.homeDir;
-    const env = cleanChildEnv({
-      HOME: homeDir,
-      TAMANDUA_STATE_DIR: path.join(homeDir, ".tamandua"),
-      TAMANDUA_DB_PATH: dbPath,
-    });
-
-    // Acquire using actual parent
-    const acquireResult = spawnSync(
-      process.execPath,
-      [
-        "--input-type=module",
-        "-e",
-        `import { acquire } from ${JSON.stringify(PROTOCOL_MODULE)};
-const r = acquire("current", process.ppid, "{}", "{}", "{}");
-console.log(JSON.stringify(r));`,
-      ],
-      { encoding: "utf-8", env, timeout: 30000 },
-    );
-    assert.equal(acquireResult.status, 0, `Acquire failed: ${acquireResult.stderr}`);
-    const gateData = JSON.parse(acquireResult.stdout.trim());
-    const token = gateData.token;
-    const ownerPid = process.ppid;
-    // Create a deliberately mismatched identity (same PID, different boot_id / ticks)
-    const fakeIdentity = JSON.stringify({ boot_id: "00000000-0000-0000-0000-000000000000", start_ticks: "0" });
-
-    const casResult = spawnSync(
-      process.execPath,
-      [
-        "--input-type=module",
-        "-e",
-        `import { casPhase } from ${JSON.stringify(PROTOCOL_MODULE)};
-const r = casPhase(${JSON.stringify(token)}, "ACQUIRED", "FAILED", ${ownerPid}, ${JSON.stringify(fakeIdentity)});
-console.log(JSON.stringify(r));`,
-      ],
-      { encoding: "utf-8", env, timeout: 30000 },
-    );
-    const cr = JSON.parse(casResult.stdout.trim());
-    assert.equal(cr.changed, false, "CAS with mismatched identity should change 0 rows");
-    assert.equal(cr.phase, "ACQUIRED", "Phase should still be ACQUIRED");
-
-    try {
-      fs.rmSync(temp.root, { recursive: true, force: true });
-    } catch {
-      /* ignore */
-    }
-  });
-
   it("second updater is refused (gate already exists)", () => {
     const temp = createTempHome("update-protocol-second-");
     const dbPath = path.join(temp.root, "second.db");
@@ -1325,25 +1170,6 @@ console.log(JSON.stringify(r));`,
     // Cleanup handled by createTempHome process-level handlers
   });
 
-  function runCas(token, env, ownerPid, ownerIdentity, expectedPhase, newPhase) {
-    const result = spawnSync(
-      process.execPath,
-      [
-        "--input-type=module",
-        "-e",
-        `import { casPhase } from ${JSON.stringify(PROTOCOL_MODULE)};
-try {
-  const r = casPhase(${JSON.stringify(token)}, ${JSON.stringify(expectedPhase)}, ${JSON.stringify(newPhase)}, ${ownerPid}, ${JSON.stringify(ownerIdentity)});
-  console.log(JSON.stringify(r));
-} catch(e) {
-  console.log("ILLEGAL:" + e.message);
-}`,
-      ],
-      { encoding: "utf-8", env, timeout: 30000 },
-    );
-    return result;
-  }
-
   it("ACQUIRED -> GUARDIAN_RECORDED is legal (via recordGuardian)", () => {
     const { token, env, ownerPid, ownerIdentity } = setupAndAcquire();
 
@@ -1419,38 +1245,6 @@ console.log(JSON.stringify(r));`,
     const fr = JSON.parse(result.stdout.trim());
     assert.equal(fr.changed, true);
     assert.equal(fr.phase, "FAILED");
-  });
-
-  it("FAILED -> anything is illegal (terminal)", () => {
-    const { token, env, dbPath, ownerPid, ownerIdentity } = setupAndAcquire();
-
-    // First fail
-    spawnSync(
-      process.execPath,
-      [
-        "--input-type=module",
-        "-e",
-        `import { fail } from ${JSON.stringify(PROTOCOL_MODULE)};
-fail(${JSON.stringify(token)}, "ACQUIRED", ${ownerPid}, ${JSON.stringify(ownerIdentity)}, "reason", "details");`,
-      ],
-      { encoding: "utf-8", env, timeout: 30000 },
-    );
-
-    // Try transitioning away from FAILED
-    const result = runCas(token, env, ownerPid, ownerIdentity, "FAILED", "ACQUIRED");
-    assert.ok(
-      result.stdout.includes("ILLEGAL"),
-      `Expected illegal transition, got: ${result.stdout}`,
-    );
-  });
-
-  it("self-transition (ACQUIRED -> ACQUIRED) is illegal", () => {
-    const { token, env, ownerPid, ownerIdentity } = setupAndAcquire();
-    const result = runCas(token, env, ownerPid, ownerIdentity, "ACQUIRED", "ACQUIRED");
-    assert.ok(
-      result.stdout.includes("ILLEGAL"),
-      `Expected illegal self-transition, got: ${result.stdout}`,
-    );
   });
 
   it("FAILED row still blocks writers", () => {
@@ -1621,6 +1415,60 @@ describe("TOKEN contract and five-field return", () => {
     } finally {
       try { fs.rmSync(tempA.root, { recursive: true, force: true }); } catch { /* ignore */ }
       try { fs.rmSync(tempB.root, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
+  });
+});
+
+// ── COORDINATOR: phase-cas is removed, inspect survives ──────────────────
+
+describe("COORDINATOR phase-cas removal", () => {
+  it("phase-cas rejected as unknown; inspect still loads and returns null gate", () => {
+    const temp = createTempHome("update-protocol-cas-removed-");
+    const dbPath = path.join(temp.root, "no-db-create.db");
+    assert.ok(!fs.existsSync(dbPath), "DB should not exist before test");
+
+    // phase-cas should be rejected as unknown command
+    const phaseCasResult = spawnSync(
+      process.execPath,
+      [COORDINATOR_CLI, "phase-cas", "token", "ACQUIRED", "FAILED", "1", "ident"],
+      {
+        encoding: "utf-8",
+        timeout: 30000,
+        env: cleanChildEnv({
+          HOME: temp.homeDir,
+          TAMANDUA_STATE_DIR: path.join(temp.homeDir, ".tamandua"),
+          TAMANDUA_DB_PATH: dbPath,
+        }),
+      },
+    );
+    assert.equal(phaseCasResult.status, 2, `phase-cas exit: ${phaseCasResult.status}`);
+    assert.equal(phaseCasResult.stdout.trim(), "", "phase-cas should not emit JSON");
+    assert.ok(phaseCasResult.stderr.includes("Unknown command"), `Expected 'Unknown command' in: ${phaseCasResult.stderr}`);
+    assert.ok(!fs.existsSync(dbPath), "DB should NOT be created by phase-cas unknown-command rejection");
+
+    // inspect should still work and return null gate
+    const inspectResult = spawnSync(
+      process.execPath,
+      [COORDINATOR_CLI, "inspect"],
+      {
+        encoding: "utf-8",
+        timeout: 30000,
+        env: cleanChildEnv({
+          HOME: temp.homeDir,
+          TAMANDUA_STATE_DIR: path.join(temp.homeDir, ".tamandua"),
+          TAMANDUA_DB_PATH: dbPath,
+        }),
+      },
+    );
+    assert.equal(inspectResult.status, 0, `inspect exit: ${inspectResult.status}`);
+    const inspectOutput = JSON.parse(inspectResult.stdout.trim());
+    assert.equal(inspectOutput.gate, null, "inspect should return null gate on absent DB");
+    assert.ok(!fs.existsSync(dbPath), "inspect should not create DB on absent DB");
+
+    try {
+      fs.rmSync(temp.root, { recursive: true, force: true });
+    } catch {
+      /* ignore */
     }
   });
 });
