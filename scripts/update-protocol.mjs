@@ -12,6 +12,7 @@
  *   recordGuardian(token, guardianPid, guardianIdentity)
  *   fail(token, reason, details)
  *   isGateActive()
+ *   validateProcessIdentity(identity)
  */
 
 import fs from "node:fs";
@@ -152,6 +153,46 @@ function hasRunsTable(dbPath) {
   } finally {
     db.close();
   }
+}
+
+// ── Identity validation ─────────────────────────────────────────────────────
+
+const E = "Invalid process identity";
+
+/** Validate a serialized process identity. Returns the input string when valid. */
+export function validateProcessIdentity(identity) {
+  if (typeof identity !== "string") throw new Error(E);
+  if (Buffer.byteLength(identity, "utf-8") > 256) throw new Error(E);
+  let parsed;
+  try { parsed = JSON.parse(identity); } catch { throw new Error(E); }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed))
+    throw new Error(E);
+  if (JSON.stringify(parsed) !== identity) throw new Error(E);
+  if (process.platform === "linux") return _vLI(parsed, identity);
+  if (process.platform === "darwin") return _vMI(parsed, identity);
+  throw new Error(E);
+}
+
+function _vLI(parsed, identity) {
+  const keys = Object.keys(parsed);
+  if (keys.length !== 2 || keys[0] !== "boot_id" || keys[1] !== "start_ticks")
+    throw new Error(E);
+  if (typeof parsed.boot_id !== "string" ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(parsed.boot_id))
+    throw new Error(E);
+  if (typeof parsed.start_ticks !== "string" ||
+      !/^(?:0|[1-9][0-9]{0,19})$/.test(parsed.start_ticks))
+    throw new Error(E);
+  return identity;
+}
+
+function _vMI(parsed, identity) {
+  const keys = Object.keys(parsed);
+  if (keys.length !== 1 || keys[0] !== "lstart") throw new Error(E);
+  if (typeof parsed.lstart !== "string" ||
+      !/^(Sun|Mon|Tue|Wed|Thu|Fri|Sat) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) (?: [1-9]|[12][0-9]|3[01]) (?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9] [0-9]{4}$/.test(parsed.lstart))
+    throw new Error(E);
+  return identity;
 }
 
 // ── Identity capture ─────────────────────────────────────────────────────────
