@@ -1537,3 +1537,303 @@ describe("COORDINATOR phase-cas removal", () => {
     }
   });
 });
+
+// ── COORDINATOR CONTRACT: strict parser, authority, UTF-8, output caps ──
+
+describe("coordinator-contract", () => {
+  const DUMB_TOKEN = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+  const DUMB_ID = '{"boot_id":"00000000-0000-0000-0000-000000000000","start_ticks":"1"}';
+  const LONG_CMD = "x".repeat(4100);
+  const LONG_DIGITS = "1".repeat(4100);
+  const LONG_STR = "y".repeat(5000);
+
+  function envFor(temp) {
+    return cleanChildEnv({
+      HOME: temp.homeDir,
+      TAMANDUA_STATE_DIR: path.join(temp.homeDir, ".tamandua"),
+      TAMANDUA_DB_PATH: path.join(temp.root, "test.db"),
+    });
+  }
+
+  // exact-failure assertion: status 2, stdout exactly "", DB absent, stderr match
+  function assertRej(r, expectedStderr) {
+    assert.equal(r.status, 2);
+    assert.equal(r.stdout, "");
+    assert.equal(r.stderr, expectedStderr);
+    assert.ok(Buffer.byteLength(r.stderr, "utf-8") <= 4096);
+  }
+
+  function snap(dbPath) {
+    const d = new DatabaseSync(dbPath);
+    try { return d.prepare("SELECT * FROM update_gate WHERE id = 1").get(); }
+    finally { d.close(); }
+  }
+
+  function pubView(row) {
+    const { token, ...rest } = row;
+    return rest;
+  }
+
+  // ── Case 1: strict parser and all pre-I/O rejection boundaries ─────────
+
+  it("strict parser and all pre-I/O rejection boundaries", () => {
+    const temp = createTempHome("upgx-cc-bdy-");
+    const e = envFor(temp);
+    const dbPath = path.join(temp.root, "test.db");
+    try {
+      // No command → usage
+      {
+        const r = runNode([COORDINATOR_CLI], e);
+        assert.equal(r.status, 2);
+        assert.equal(r.stdout, "");
+        assert.equal(r.stderr, "Usage: update-coordinator.mjs <acquire|inspect|record-guardian-cas|fail> [args...]\n");
+      }
+
+      // Unknown commands (ordinary-unknown, inherited-property, >4096-byte) → exact "Unknown command\n"
+      for (const cmd of ["ordinary-unknown", "toString", "constructor", "__proto__", LONG_CMD]) {
+        const r = runNode([COORDINATOR_CLI, cmd], e);
+        assert.equal(r.status, 2);
+        assert.equal(r.stdout, "");
+        assert.equal(r.stderr, "Unknown command\n");
+        assert.ok(!r.stderr.includes(cmd.slice(0, 4)), `command echoed for ${cmd}`);
+        assert.ok(!fs.existsSync(dbPath));
+      }
+
+      // ── Arity boundaries for all four commands ──
+      const arityTests = [
+        { cmd: "acquire", payload: 5 },
+        { cmd: "inspect", payload: 0 },
+        { cmd: "record-guardian-cas", payload: 6 },
+        { cmd: "fail", payload: 6 },
+      ];
+      for (const { cmd, payload } of arityTests) {
+        const err = `Invalid argument count for ${cmd}\n`;
+        // too few (skip when payload is 0 — no too-few for inspect)
+        if (payload > 0) {
+          assertRej(runNode([COORDINATOR_CLI, cmd, ...Array(payload - 1).fill("x")], e), err);
+        }
+        // too many — ordinary extra
+        assertRej(runNode([COORDINATOR_CLI, cmd, ...Array(payload + 1).fill("x")], e), err);
+        // too many — >4096-byte extra → byte-identical stderr (for acquire + inspect explicitly;
+        // the other two are covered implicitly by the generic loop; we still verify identity for all)
+        const rOrd = runNode([COORDINATOR_CLI, cmd, ...Array(payload).fill("x"), "extra"], e);
+        const rBig = runNode([COORDINATOR_CLI, cmd, ...Array(payload).fill("x"), LONG_STR], e);
+        assert.equal(rOrd.stderr, rBig.stderr, `extra-arg identity mismatch for ${cmd}`);
+        assert.equal(rOrd.stderr, err);
+      }
+
+      // obsolete three-field guardian / fail → arity error
+      assertRej(runNode([COORDINATOR_CLI, "record-guardian-cas", "tok", "1", "id"], e),
+        "Invalid argument count for record-guardian-cas\n");
+      assertRej(runNode([COORDINATOR_CLI, "fail", "tok", "r", "d"], e),
+        "Invalid argument count for fail\n");
+
+      // ── Bound checks after valid arity (oversized safeBoundArg fields) ──
+      // acquire mode
+      assertRej(runNode([COORDINATOR_CLI, "acquire", LONG_STR, "1", "{}", "{}", "{}"], e), "Invalid argument\n");
+      // guardian token
+      assertRej(runNode([COORDINATOR_CLI, "record-guardian-cas", LONG_STR, "ACQUIRED", "1", DUMB_ID, "1", DUMB_ID], e), "Invalid argument\n");
+      // guardian expected-owner identity
+      assertRej(runNode([COORDINATOR_CLI, "record-guardian-cas", DUMB_TOKEN, "ACQUIRED", "1", LONG_STR, "1", DUMB_ID], e), "Invalid argument\n");
+      // guardian expected-guardian identity
+      assertRej(runNode([COORDINATOR_CLI, "record-guardian-cas", DUMB_TOKEN, "ACQUIRED", "1", DUMB_ID, "1", LONG_STR], e), "Invalid argument\n");
+      // fail details
+      assertRej(runNode([COORDINATOR_CLI, "fail", DUMB_TOKEN, "ACQUIRED", "1", DUMB_ID, "r", LONG_STR], e), "Invalid argument\n");
+      assert.ok(!fs.existsSync(dbPath));
+
+      // ── PID spelling/value: 11 bad values × 4 positions = 44 rejections ──
+      const badPids = [
+        "0", "-1", "+1", "01", " 1", "1 ", "1junk", "1.0", "1e0",
+        "9007199254740992", LONG_DIGITS,
+      ];
+      // position helper: args array builder for each of the 4 PID slots
+      function pidArgs(pos, badPid) {
+        switch (pos) {
+          case "acquire-updater":
+            return [COORDINATOR_CLI, "acquire", "current", badPid, "{}", "{}", "{}"];
+          case "guardian-expected-owner":
+            return [COORDINATOR_CLI, "record-guardian-cas", DUMB_TOKEN, "ACQUIRED", badPid, DUMB_ID, "1", DUMB_ID];
+          case "guardian-pid":
+            return [COORDINATOR_CLI, "record-guardian-cas", DUMB_TOKEN, "ACQUIRED", "1", DUMB_ID, badPid, DUMB_ID];
+          case "fail-expected-owner":
+            return [COORDINATOR_CLI, "fail", DUMB_TOKEN, "ACQUIRED", badPid, DUMB_ID, "r", "d"];
+          default:
+            throw new Error(`unknown position: ${pos}`);
+        }
+      }
+      const positions = ["acquire-updater", "guardian-expected-owner", "guardian-pid", "fail-expected-owner"];
+      for (const pos of positions) {
+        for (const bp of badPids) {
+          assertRej(runNode(pidArgs(pos, bp), e), "Invalid argument\n");
+          assert.ok(!fs.existsSync(dbPath), `DB created for bad PID ${JSON.stringify(bp)} at ${pos}`);
+        }
+      }
+    } finally {
+      try { fs.rmSync(temp.root, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
+  });
+
+  // ── Case 2: real six-field authority flow and compatibility ────────────
+
+  it("real six-field authority flow and compatibility", () => {
+    const temp = createTempHome("upgx-cc-auth-");
+    const e = envFor(temp);
+    const dbPath = path.join(temp.root, "test.db");
+    try {
+      // (1) Acquire — deep-equal the entire result object
+      const rAcq = runNode([COORDINATOR_CLI, "acquire", "current", String(process.pid), "{}", "{}", "{}"], e);
+      assert.equal(rAcq.status, 0, rAcq.stderr);
+      const ad = JSON.parse(rAcq.stdout);
+      assert.equal(ad.phase, "ACQUIRED");
+      assert.equal(ad.mode, "current");
+      assert.equal(ad.ownerPid, process.pid);
+      assert.equal(typeof ad.ownerIdentity, "string");
+      assert.equal(typeof ad.token, "string");
+      // validate 43-char base64url token
+      assert.ok(/^[A-Za-z0-9_-]{43}$/.test(ad.token), `bad token format: ${ad.token}`);
+      assert.deepEqual(ad, {
+        token: ad.token,
+        phase: "ACQUIRED",
+        mode: "current",
+        ownerPid: process.pid,
+        ownerIdentity: ad.ownerIdentity,
+      });
+      // DB parity
+      {
+        const row = snap(dbPath);
+        assert.equal(row.token, ad.token);
+        assert.equal(row.owner_pid, process.pid);
+        assert.equal(row.owner_identity, ad.ownerIdentity);
+        assert.equal(row.phase, "ACQUIRED");
+        assert.equal(row.mode, "current");
+      }
+
+      // (2) Capture the still-live test parent process identity via helper child
+      const capOut = runNode(["--input-type=module", "-e",
+        `import { captureProcessIdentity } from ${JSON.stringify(PROTOCOL_MODULE)}; console.log(captureProcessIdentity(${process.pid}));`], e);
+      assert.equal(capOut.status, 0, capOut.stderr);
+      const gid = capOut.stdout.trim();
+      assert.ok(gid.length > 0);
+      const ps = String(process.pid);
+
+      // (3) Full SELECT * snapshot → syntactically-valid six-field guardian with wrong authority
+      const preGuard = snap(dbPath);
+      assertRej(runNode([COORDINATOR_CLI, "record-guardian-cas", ad.token, "ACQUIRED", "99999", ad.ownerIdentity, ps, gid], e),
+        "Record-guardian refused\n");
+      assert.deepEqual(snap(dbPath), preGuard, "row changed on refused guardian");
+
+      // (4) Correct six-field guardian — deep-equal result, no token in stdout/stderr
+      const rGok = runNode([COORDINATOR_CLI, "record-guardian-cas", ad.token, "ACQUIRED", ps, ad.ownerIdentity, ps, gid], e);
+      assert.equal(rGok.status, 0, rGok.stderr);
+      const gr = JSON.parse(rGok.stdout);
+      assert.deepEqual(gr, { changed: true, phase: "GUARDIAN_RECORDED" });
+      assert.ok(!rGok.stdout.includes(ad.token) && !rGok.stderr.includes(ad.token), "token leaked in guardian output");
+      {
+        const row = snap(dbPath);
+        assert.equal(row.guardian_pid, process.pid);
+        assert.equal(row.guardian_identity, gid);
+        assert.equal(row.phase, "GUARDIAN_RECORDED");
+        // unrelated fields unchanged (except updated_at)
+        for (const k of Object.keys(preGuard)) {
+          if (k === "guardian_pid" || k === "guardian_identity" || k === "phase" || k === "updated_at") continue;
+          assert.deepEqual(row[k], preGuard[k], `field ${k} changed unexpectedly on guardian success`);
+        }
+      }
+
+      // (5) Full snapshot → stale-phase fail → refusal + full-row equality
+      const postGuard = snap(dbPath);
+      assertRej(runNode([COORDINATOR_CLI, "fail", ad.token, "ACQUIRED", ps, ad.ownerIdentity, "r", "d"], e),
+        "Fail refused\n");
+      assert.deepEqual(snap(dbPath), postGuard, "row changed on refused fail");
+
+      // (6) Correct six-field fail — deep-equal result, no token, exact persisted phase/reason/details
+      const rFok = runNode([COORDINATOR_CLI, "fail", ad.token, "GUARDIAN_RECORDED", ps, ad.ownerIdentity, "r1", "d1"], e);
+      assert.equal(rFok.status, 0, rFok.stderr);
+      const fr = JSON.parse(rFok.stdout);
+      assert.deepEqual(fr, { changed: true, phase: "FAILED" });
+      assert.ok(!rFok.stdout.includes(ad.token) && !rFok.stderr.includes(ad.token), "token leaked in fail output");
+      {
+        const row = snap(dbPath);
+        assert.equal(row.phase, "FAILED");
+        assert.equal(row.failure_reason, "r1");
+        assert.equal(row.failure_details, "d1");
+        for (const k of Object.keys(postGuard)) {
+          if (k === "phase" || k === "failure_reason" || k === "failure_details" || k === "updated_at") continue;
+          assert.deepEqual(row[k], postGuard[k], `field ${k} changed unexpectedly on fail`);
+        }
+      }
+
+      // (7) Inspect: query 14-column public view, deep-equal to { gate: publicRow }, no token leaked
+      const preInspRow = snap(dbPath);
+      const publicRow = pubView(preInspRow);
+      const rInsp = runNode([COORDINATOR_CLI, "inspect"], e);
+      assert.equal(rInsp.status, 0, rInsp.stderr);
+      const inspParsed = JSON.parse(rInsp.stdout);
+      assert.deepEqual(inspParsed, { gate: publicRow });
+      assert.ok(!rInsp.stdout.includes(ad.token) && !rInsp.stderr.includes(ad.token), "token leaked in inspect output");
+      assert.deepEqual(snap(dbPath), preInspRow, "inspect mutated the row");
+    } finally {
+      try { fs.rmSync(temp.root, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
+  });
+
+  // ── Case 3: UTF-8 diagnostic and success-output caps ──────────────────
+
+  it("UTF-8 diagnostic and success-output caps", () => {
+    // 3a: invalid mode at truncation boundary — 4080 ASCII + 2-byte UTF-8 é
+    {
+      const temp = createTempHome("upgx-cc-u8-");
+      const e = envFor(temp);
+      const dbPath = path.join(temp.root, "test.db");
+      try {
+        const badMode = "x".repeat(4080) + "\u00E9"; // 4082 UTF-8 bytes
+        const r = runNode([COORDINATOR_CLI, "acquire", badMode, "1", "{}", "{}", "{}"], e);
+        assert.equal(r.status, 2);
+        assert.equal(r.stdout, "");
+        const n = Buffer.byteLength(r.stderr, "utf-8");
+        assert.ok(n <= 4096, `stderr byte length ${n} > 4096`);
+        assert.ok(r.stderr.endsWith("\n"), "missing final newline");
+        assert.ok(!r.stderr.includes("\uFFFD"), "U+FFFD introduced by bad truncation");
+        assert.ok(!fs.existsSync(dbPath));
+      } finally {
+        try { fs.rmSync(temp.root, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
+    }
+
+    // 3b: inspect output exceeds 65536-byte cap — snapshot AFTER enlargement, BEFORE inspect
+    {
+      const temp = createTempHome("upgx-cc-oc-");
+      const e = envFor(temp);
+      const dbPath = path.join(temp.root, "test.db");
+      try {
+        // acquire normally in a fresh DB
+        const rAcq = runNode([COORDINATOR_CLI, "acquire", "current", String(process.pid), "{}", "{}", "{}"], e);
+        assert.equal(rAcq.status, 0, rAcq.stderr);
+
+        // enlarge one inspect-visible field with multibyte data so { gate: inspect() } + newline > 65536
+        const bigVal = JSON.stringify("\u20AC".repeat(22000));
+        {
+          const d = new DatabaseSync(dbPath);
+          try { d.prepare("UPDATE update_gate SET topology = ? WHERE id = 1").run(bigVal); }
+          finally { d.close(); }
+        }
+
+        // take full SELECT * snapshot AFTER enlargement and BEFORE inspect
+        const preInsp = snap(dbPath);
+        assert.equal(preInsp.topology, bigVal, "topology not enlarged as expected");
+
+        // assert inspect exits 2, empty stdout, exact stderr
+        const rInsp = runNode([COORDINATOR_CLI, "inspect"], e);
+        assert.equal(rInsp.status, 2);
+        assert.equal(rInsp.stdout, "");
+        assert.equal(rInsp.stderr, "Output exceeds maximum length\n");
+
+        // deep-equal post-inspect row to the post-enlargement pre-inspect snapshot (all columns)
+        const postInsp = snap(dbPath);
+        assert.deepEqual(postInsp, preInsp, "inspect mutated the row on cap failure");
+      } finally {
+        try { fs.rmSync(temp.root, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
+    }
+  });
+});
