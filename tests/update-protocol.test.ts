@@ -12,7 +12,7 @@ import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
 import assert from "node:assert/strict";
-import { describe, it, before, after } from "node:test";
+import { describe, it, before, after, afterEach } from "node:test";
 import { spawn, spawnSync, execFileSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { createTempHome, cleanChildEnv } from "./helpers/test-env.ts";
@@ -1578,9 +1578,11 @@ try {
 // ── PHASES: legal and illegal transitions ────────────────────────────────
 
 describe("PHASE transitions", () => {
+  const roots = new Set<string>();
   // Each test gets its own isolated gate to avoid state leakage
   function setupAndAcquire() {
     const temp = createTempHome("update-protocol-phases-");
+    roots.add(temp.root);
     const dbPath = path.join(temp.root, "phases.db");
     const homeDir = temp.homeDir;
     const env = cleanChildEnv({
@@ -1609,8 +1611,25 @@ console.log(JSON.stringify(r));`,
     return { temp, dbPath, env, token, ownerPid, ownerIdentity };
   }
 
-  after(async () => {
-    // Cleanup handled by createTempHome process-level handlers
+  afterEach(() => {
+    const captured = [...roots];
+    const failures: Error[] = [];
+    try {
+      for (const root of captured) {
+        try {
+          fs.rmSync(root, { recursive: true, force: true });
+          assert.ok(!fs.existsSync(root), `temp root still exists after removal: ${root}`);
+        } catch (e) {
+          failures.push(e instanceof Error ? e : new Error(String(e)));
+        }
+      }
+      if (failures.length > 0) {
+        if (failures.length === 1) throw failures[0];
+        throw new AggregateError(failures, `${failures.length} temp root removal failures`);
+      }
+    } finally {
+      roots.clear();
+    }
   });
 
   it("ACQUIRED -> GUARDIAN_RECORDED is legal (via recordGuardian)", () => {
@@ -1750,10 +1769,9 @@ console.log(isGateActive() ? "ACTIVE" : "INACTIVE");`,
 // ── CLEANUP: no surviving child processes ────────────────────────────────
 
 describe("Cold/active cleanup", () => {
-  it("exact child identities are retained and terminated in finally", async () => {
+  it("exact child identities are retained and terminated in finally", { timeout: 30000 }, async () => {
     const temp = createTempHome("update-protocol-cleanup-");
     const dbPath = path.join(temp.root, "cleanup.db");
-
     const homeDir = temp.homeDir;
     const env = cleanChildEnv({
       HOME: homeDir,
@@ -1761,38 +1779,199 @@ describe("Cold/active cleanup", () => {
       TAMANDUA_DB_PATH: dbPath,
     });
 
-    // Spawn a process that acquires and check it doesn't leave orphans
-    const child = spawn(
-      process.execPath,
-      [
-        "--input-type=module",
-        "-e",
-        `import { acquire } from ${JSON.stringify(PROTOCOL_MODULE)};
-const r = acquire("current", process.ppid, "{}", "{}", "{}");
-console.log("ACQUIRED:" + r.token);
-// Process should exit cleanly
-`,
-      ],
-      { env, stdio: ["ignore", "pipe", "pipe"] },
-    );
-
-    const childPromise = new Promise((resolve) => {
-      let out = "";
-      child.stdout.on("data", (d) => { out += d.toString(); });
-      child.on("close", (code) => resolve({ code, out }));
-    });
-
-    const result = await childPromise as { code: number; out: string };
-    child.kill("SIGKILL");
-
-    assert.equal(result.code, 0, `Child failed: ${result.out}`);
-    assert.ok(result.out.includes("ACQUIRED:"));
+    let child: ReturnType<typeof spawn> | null = null;
+    let childPid: number | null = null;
+    let stdout = "";
+    let stderr = "";
+    let closePromise: Promise<{ code: number | null; signal: NodeJS.Signals | null }> | null = null;
+    let childError: Error | null = null;
+    let closeResult: { code: number | null; signal: NodeJS.Signals | null } | null = null;
+    let bodyError: Error | null = null;
+    let readinessReject: ((err: Error) => void) | null = null;
+    const cleanupErrors: Error[] = [];
 
     try {
-      fs.rmSync(temp.root, { recursive: true, force: true });
-    } catch {
-      /* ignore */
+      child = spawn(
+        process.execPath,
+        [
+          "--input-type=module",
+          "-e",
+          `import fs from "node:fs";
+import { acquire } from ${JSON.stringify(PROTOCOL_MODULE)};
+const r = acquire("current", process.ppid, "{}", "{}", "{}");
+fs.writeSync(1, JSON.stringify({ phase: r.phase, mode: r.mode }) + "\\n");
+// Stay alive with a referenced handle to prove live-child cleanup
+const keepalive = setInterval(() => {}, 10000);`,
+        ],
+        { env, stdio: ["ignore", "pipe", "pipe"] },
+      );
+
+      childPid = child.pid!;
+
+      // Permanent capture listeners — never removed
+      child.stdout!.on("data", (d: Buffer) => { stdout += d.toString(); });
+      child.stderr!.on("data", (d: Buffer) => { stderr += d.toString(); });
+
+      // Single error handler — retains error for diagnostics, rejects readiness
+      child.on("error", (err: Error) => {
+        childError = err;
+        if (readinessReject) readinessReject(err);
+      });
+
+      // Register close promise immediately for reaping in finally
+      closePromise = new Promise<{
+        code: number | null;
+        signal: NodeJS.Signals | null;
+      }>((resolve) => {
+        child!.on("close", (code, signal) => resolve({ code, signal }));
+      });
+
+      // Readiness: wait for first newline-delimited record with bounded deadline
+      let readinessDeadline: ReturnType<typeof setTimeout> | undefined;
+      let onReadyData: ((d: Buffer) => void) | null = null;
+      let jsonLine: unknown;
+      try {
+        jsonLine = await new Promise<unknown>((resolve, reject) => {
+          readinessReject = reject;
+          onReadyData = () => {
+            const nl = stdout.indexOf("\n");
+            if (nl >= 0) {
+              child!.stdout!.removeListener("data", onReadyData!);
+              const line = stdout.slice(0, nl);
+              try {
+                resolve(JSON.parse(line));
+              } catch (e) {
+                reject(
+                  new Error(
+                    `Failed to parse child JSON: ${(e as Error).message}`,
+                  ),
+                );
+              }
+            }
+          };
+          child!.stdout!.on("data", onReadyData);
+          readinessDeadline = setTimeout(() => {
+            child!.stdout!.removeListener("data", onReadyData!);
+            reject(new Error("Child output readiness timed out"));
+          }, 8000);
+        });
+      } finally {
+        clearTimeout(readinessDeadline);
+        readinessReject = null;
+        if (onReadyData) child!.stdout!.removeListener("data", onReadyData);
+      }
+
+      // Before cleanup: prove child is genuinely live with valid acquisition
+      assert.equal(
+        childError,
+        null,
+        "child should have no error before cleanup",
+      );
+      assert.ok(
+        typeof childPid === "number" &&
+          Number.isSafeInteger(childPid) &&
+          childPid > 0,
+        `childPid must be canonical positive safe integer, got ${childPid}`,
+      );
+      assert.equal(
+        childPid,
+        child!.pid,
+        "childPid must match retained handle PID",
+      );
+      assert.deepStrictEqual(jsonLine, {
+        phase: "ACQUIRED",
+        mode: "current",
+      });
+      assert.equal(
+        child!.exitCode,
+        null,
+        "child must be live before cleanup",
+      );
+    } catch (e) {
+      bodyError = e instanceof Error ? e : new Error(String(e));
+    } finally {
+      // Signal only the retained handle and only if child is live
+      if (child && child.exitCode === null) {
+        try {
+          const killed = child.kill("SIGKILL");
+          if (!killed) {
+            cleanupErrors.push(
+              new Error("cleanup: kill signal not delivered"),
+            );
+          }
+        } catch (e) {
+          cleanupErrors.push(
+            e instanceof Error ? e : new Error(String(e)),
+          );
+        }
+      }
+      // Await reaping of the exact child with bounded safety deadline
+      if (closePromise) {
+        let closeDeadline: ReturnType<typeof setTimeout> | undefined;
+        try {
+          closeResult = await Promise.race([
+            closePromise,
+            new Promise<never>((_, reject) => {
+              closeDeadline = setTimeout(
+                () => reject(new Error("cleanup: close timed out")),
+                5000,
+              );
+            }),
+          ]);
+        } catch (e) {
+          cleanupErrors.push(
+            e instanceof Error ? e : new Error(String(e)),
+          );
+        } finally {
+          clearTimeout(closeDeadline);
+        }
+      }
+      // Un-suppressed recursive temp removal — always attempted
+      try {
+        fs.rmSync(temp.root, { recursive: true, force: true });
+      } catch (e) {
+        cleanupErrors.push(
+          e instanceof Error ? e : new Error(String(e)),
+        );
+      }
     }
+
+    // Combine body and cleanup errors so neither class is silently discarded
+    const allErrors: Error[] = [];
+    if (bodyError) allErrors.push(bodyError);
+    allErrors.push(...cleanupErrors);
+
+    if (allErrors.length === 1) throw allErrors[0];
+    if (allErrors.length > 1) {
+      throw new AggregateError(
+        allErrors,
+        `${allErrors.length} errors (body + cleanup)`,
+      );
+    }
+
+    // Success-path assertions
+    assert.strictEqual(
+      closeResult!.code,
+      null,
+      "child close code must be null (killed by signal)",
+    );
+    assert.strictEqual(
+      closeResult!.signal,
+      "SIGKILL",
+      "child must be killed by SIGKILL",
+    );
+    assert.equal(childError, null, "child should have no retained error");
+    // Byte-for-byte: single non-secret JSON line plus newline
+    assert.equal(
+      stdout,
+      JSON.stringify({ phase: "ACQUIRED", mode: "current" }) + "\n",
+      "stdout must be exactly the non-secret JSON line plus newline",
+    );
+    assert.equal(stderr, "", "stderr must be empty");
+    assert.ok(
+      !fs.existsSync(temp.root),
+      "temp root must be absent after cleanup",
+    );
   });
 });
 
