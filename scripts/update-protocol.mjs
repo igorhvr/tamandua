@@ -491,7 +491,33 @@ export function acquire(mode, updaterPid, topology, artifacts, readiness) {
 }
 
 /**
+ * Project a gate row to a public diagnostic allowlist.
+ * Returns exactly 14 non-token columns; never mutates the database.
+ * Not exported — internal to inspect().
+ */
+function toPublicGateView(row) {
+  return {
+    artifacts: row.artifacts,
+    created_at: row.created_at,
+    failure_details: row.failure_details,
+    failure_reason: row.failure_reason,
+    guardian_identity: row.guardian_identity,
+    guardian_pid: row.guardian_pid,
+    id: row.id,
+    mode: row.mode,
+    owner_identity: row.owner_identity,
+    owner_pid: row.owner_pid,
+    phase: row.phase,
+    readiness: row.readiness,
+    topology: row.topology,
+    updated_at: row.updated_at,
+  };
+}
+
+/**
  * Inspect the current gate state. Returns null if no gate exists.
+ * The token column is redacted from the public view; the persisted row
+ * retains it unchanged.
  * @returns {object|null}
  */
 export function inspect() {
@@ -502,7 +528,7 @@ export function inspect() {
   const db = new DatabaseSync(dbPath);
   try {
     const row = getGateRow(db);
-    return row ?? null;
+    return row ? toPublicGateView(row) : null;
   } finally {
     db.close();
   }

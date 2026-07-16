@@ -1419,6 +1419,71 @@ describe("TOKEN contract and five-field return", () => {
   });
 });
 
+// ── INSPECT REDACTION: token is never disclosed via inspect() ────────────
+
+describe("inspect redaction", () => {
+  const ALLOWLIST = ["artifacts","created_at","failure_details","failure_reason",
+    "guardian_identity","guardian_pid","id","mode","owner_identity",
+    "owner_pid","phase","readiness","topology","updated_at"].sort();
+
+  it("inspect() returns 14-key view without token; token persists in DB; stdout/stderr clean", () => {
+    const temp = createTempHome("upgx-inspect-redaction-");
+    try {
+      const hd = temp.homeDir;
+      const sd = path.join(hd, ".tamandua");
+      const dp = path.join(temp.root, "redaction.db");
+      fs.mkdirSync(sd, { recursive: true });
+      const env = { HOME: hd, TAMANDUA_STATE_DIR: sd, TAMANDUA_DB_PATH: dp };
+
+      // 1. Acquire through real coordinator CLI
+      const aq = runNode([COORDINATOR_CLI, "acquire", "current", String(process.pid), "{}", "{}", "{}"], env);
+      assert.equal(aq.status, 0, `Acquire failed: ${aq.stderr}`);
+      const ad = JSON.parse(aq.stdout.trim());
+      assert.ok(ad.token);
+      const tok = ad.token;
+
+      // 2. Read persisted gate row, prove token matches
+      let pre;
+      { const db = new DatabaseSync(dp);
+        try { pre = db.prepare("SELECT * FROM update_gate WHERE id = 1").get();
+          assert.ok(pre); assert.equal(pre.token, tok); }
+        finally { db.close(); } }
+
+      // 3a. Module inspect
+      const mr = runNode(["--input-type=module", "-e",
+        `import { inspect } from ${JSON.stringify(PROTOCOL_MODULE)};
+console.log(JSON.stringify(inspect()));`], env);
+      assert.equal(mr.status, 0, `Module inspect: ${mr.stderr || ""}`);
+
+      // 3b. Coordinator inspect
+      const cr = runNode([COORDINATOR_CLI, "inspect"], env);
+      assert.equal(cr.status, 0, `Coord inspect: ${cr.stderr}`);
+
+      const mg = JSON.parse(mr.stdout.trim());
+      const cg = JSON.parse(cr.stdout.trim()).gate;
+
+      // 4. Assert non-null, 14-key allowlist, no token, field parity, clean stdout/stderr
+      assert.ok(mg !== null); assert.ok(cg !== null);
+      for (const [l, g] of [["mod", mg], ["cli", cg]] as const) {
+        assert.deepEqual(Object.keys(g).sort(), ALLOWLIST, `${l}: allowlist mismatch`);
+        assert.ok(!("token" in g), `${l}: token present`);
+        for (const k of ALLOWLIST) assert.deepEqual(g[k], pre[k], `${l}: ${k} mismatch`);
+      }
+      assert.ok(!mr.stdout.includes(tok) && !mr.stderr.includes(tok), "module output leaked token");
+      assert.ok(!cr.stdout.includes(tok) && !cr.stderr.includes(tok), "coordinator output leaked token");
+
+      // 5. Re-read DB row; prove deep equality and token persistence
+      { const db2 = new DatabaseSync(dp);
+        try { const post = db2.prepare("SELECT * FROM update_gate WHERE id = 1").get();
+          assert.deepEqual(post, pre, "post-inspect should equal pre-inspect");
+          assert.equal(post.token, tok); }
+        finally { db2.close(); } }
+    } finally {
+      try { fs.rmSync(temp.root, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
+  });
+});
+
 // ── COORDINATOR: phase-cas is removed, inspect survives ──────────────────
 
 describe("COORDINATOR phase-cas removal", () => {
