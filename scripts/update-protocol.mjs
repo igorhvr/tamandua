@@ -9,7 +9,7 @@
  *   acquire(mode, updaterPid, topology, artifacts, readiness)
  *   inspect()
  *   casPhase(token, expectedPhase, newPhase, expectedOwnerPid, expectedOwnerIdentity)
- *   recordGuardian(token, guardianPid, guardianIdentity)
+ *   recordGuardian(token, expectedPhase, expectedOwnerPid, expectedOwnerIdentity, guardianPid, expectedGuardianIdentity)
  *   fail(token, expectedPhase, expectedOwnerPid, expectedOwnerIdentity, reason, details)
  *   isGateActive()
  *   validateProcessIdentity(identity)
@@ -616,21 +616,72 @@ export function casPhase(
 /**
  * Record guardian identity. Only ACQUIRED -> GUARDIAN_RECORDED.
  *
- * @param {string} token
- * @param {number} guardianPid
- * @param {string} guardianIdentity - captured live guardian identity
- * @returns {{ changed: boolean, phase: string }}
+ * @param {string} token - capability token from acquisition
+ * @param {string} expectedPhase - exactly "ACQUIRED"
+ * @param {number} expectedOwnerPid - expected owner PID
+ * @param {string} expectedOwnerIdentity - expected serialized identity
+ * @param {number} guardianPid - PID of the live guardian process
+ * @param {string} expectedGuardianIdentity - expected canonical guardian identity
+ * @returns {{ changed: boolean, phase?: string }}
  */
-export function recordGuardian(token, guardianPid, guardianIdentity) {
-  if (!Number.isSafeInteger(guardianPid) || guardianPid < 1) {
-    throw new Error(`Invalid guardian PID: ${guardianPid}`);
+export function recordGuardian(
+  token,
+  expectedPhase,
+  expectedOwnerPid,
+  expectedOwnerIdentity,
+  guardianPid,
+  expectedGuardianIdentity,
+) {
+  // ── Input-only validation (before any DB work) ──────────────────────────
+  validateCanonicalToken(token);
+
+  if (expectedPhase !== "ACQUIRED") {
+    throw new Error("Invalid guardian source phase");
   }
 
-  const dbPath = resolveDbPath();
-  const db = new DatabaseSync(dbPath);
+  if (!Number.isSafeInteger(expectedOwnerPid) || expectedOwnerPid < 1) {
+    throw new Error("Invalid expected owner PID");
+  }
 
+  validateProcessIdentity(expectedOwnerIdentity);
+
+  if (!Number.isSafeInteger(guardianPid) || guardianPid < 1) {
+    throw new Error("Invalid guardian PID");
+  }
+
+  validateProcessIdentity(expectedGuardianIdentity);
+
+  // ── No-create DB open ──────────────────────────────────────────────────
+  const dbPath = resolveDbPath();
+  let db;
+  try {
+    const dbUrl = pathToFileURL(dbPath);
+    dbUrl.searchParams.set("mode", "rw");
+    db = new DatabaseSync(dbUrl.href);
+  } catch {
+    return { changed: false };
+  }
+
+  let inTransaction = false;
   try {
     db.exec("BEGIN IMMEDIATE");
+    inTransaction = true;
+
+    // Live guardian proof — capture identity after BEGIN
+    let liveIdentity;
+    try {
+      liveIdentity = captureProcessIdentity(guardianPid);
+    } catch {
+      db.exec("ROLLBACK");
+      inTransaction = false;
+      return { changed: false };
+    }
+
+    if (liveIdentity !== expectedGuardianIdentity) {
+      db.exec("ROLLBACK");
+      inTransaction = false;
+      return { changed: false };
+    }
 
     const now = new Date().toISOString();
     const result = db
@@ -642,29 +693,41 @@ export function recordGuardian(token, guardianPid, guardianIdentity) {
              updated_at = ?
          WHERE id = ?
            AND token = ?
-           AND phase = 'ACQUIRED'`,
+           AND phase = ?
+           AND owner_pid = ?
+           AND owner_identity = ?`,
       )
-      .run(guardianPid, bust(BOUND, "guardian_identity", guardianIdentity), now, SINGLETON_ID, token);
+      .run(
+        guardianPid,
+        expectedGuardianIdentity,
+        now,
+        SINGLETON_ID,
+        token,
+        expectedPhase,
+        expectedOwnerPid,
+        expectedOwnerIdentity,
+      );
 
-    if (result.changes === 0) {
+    if (result.changes !== 1) {
       db.exec("ROLLBACK");
-      const current = getGateRow(db);
-      db.close();
-      return {
-        changed: false,
-        phase: current?.phase ?? null,
-      };
+      inTransaction = false;
+      return { changed: false };
     }
 
     db.exec("COMMIT");
+    inTransaction = false;
     return { changed: true, phase: "GUARDIAN_RECORDED" };
   } catch (e) {
-    try {
-      db.exec("ROLLBACK");
-    } catch {
-      // ignore
+    if (inTransaction) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {
+        // ignore
+      }
+      inTransaction = false;
     }
-    throw e;
+    // Generic refusal for absent gate table, corrupt DB, or any SQL error
+    return { changed: false };
   } finally {
     try {
       db.close();

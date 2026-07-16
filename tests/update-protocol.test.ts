@@ -1345,15 +1345,16 @@ try {
   }
 
   it("ACQUIRED -> GUARDIAN_RECORDED is legal (via recordGuardian)", () => {
-    const { token, env } = setupAndAcquire();
+    const { token, env, ownerPid, ownerIdentity } = setupAndAcquire();
 
     const result = spawnSync(
       process.execPath,
       [
         "--input-type=module",
         "-e",
-        `import { recordGuardian } from ${JSON.stringify(PROTOCOL_MODULE)};
-const r = recordGuardian(${JSON.stringify(token)}, 12345, "guardian-identity");
+        `import { recordGuardian, captureProcessIdentity } from ${JSON.stringify(PROTOCOL_MODULE)};
+const gid = captureProcessIdentity(process.pid);
+const r = recordGuardian(${JSON.stringify(token)}, "ACQUIRED", ${ownerPid}, ${JSON.stringify(ownerIdentity)}, process.pid, gid);
 console.log(JSON.stringify(r));`,
       ],
       { encoding: "utf-8", env, timeout: 30000 },
@@ -1393,8 +1394,9 @@ console.log(JSON.stringify(r));`,
       [
         "--input-type=module",
         "-e",
-        `import { recordGuardian } from ${JSON.stringify(PROTOCOL_MODULE)};
-const r = recordGuardian(${JSON.stringify(token)}, 12345, "guardian-identity");
+        `import { recordGuardian, captureProcessIdentity } from ${JSON.stringify(PROTOCOL_MODULE)};
+const gid = captureProcessIdentity(process.pid);
+const r = recordGuardian(${JSON.stringify(token)}, "ACQUIRED", ${ownerPid}, ${JSON.stringify(ownerIdentity)}, process.pid, gid);
 console.log(JSON.stringify(r));`,
       ],
       { encoding: "utf-8", env, timeout: 30000 },
