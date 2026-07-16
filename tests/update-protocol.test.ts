@@ -210,8 +210,30 @@ function fileHash(filePath) {
 // ── DB-PATH: explicit TAMANDUA_DB_PATH wins ──────────────────────────────
 
 describe("DB-PATH resolution", () => {
+  /** @type {Set<string>} */
+  const roots = new Set();
+
+  afterEach(() => {
+    const errors = [];
+    for (const r of roots) {
+      try {
+        fs.rmSync(r, { recursive: true, force: true });
+      } catch (e) {
+        errors.push(e);
+      }
+    }
+    roots.clear();
+    if (errors.length > 0) {
+      throw new Error(
+        `Cleanup errors: ${errors.map((e) => e.message).join("; ")}`,
+      );
+    }
+  });
+
   it("explicit TAMANDUA_DB_PATH wins over default HOME path", () => {
     const temp = createTempHome("update-protocol-dbpath-");
+    roots.add(temp.root);
+
     const explicitDb = path.join(temp.root, "explicit.db");
     const defaultDb = path.join(temp.homeDir, ".tamandua", "tamandua.db");
 
@@ -225,26 +247,26 @@ describe("DB-PATH resolution", () => {
       !fs.existsSync(defaultDb),
       "Default DB should NOT exist when TAMANDUA_DB_PATH is explicit",
     );
-
-    // Cleanup
-    try {
-      fs.rmSync(temp.root, { recursive: true, force: true });
-    } catch {
-      /* ignore */
-    }
   });
 
-  it("TAMANDUA_STATE_DIR does not redirect the DB", () => {
+  it("falls back to HOME/.tamandua/tamandua.db when TAMANDUA_DB_PATH is absent", () => {
     const temp = createTempHome("update-protocol-dbpath2-");
+    roots.add(temp.root);
+
     const stateDir = path.join(temp.root, "custom-state");
     fs.mkdirSync(stateDir, { recursive: true });
 
     const env = cleanChildEnv({
       HOME: temp.homeDir,
       TAMANDUA_STATE_DIR: stateDir,
-      // Explicit TAMANDUA_DB_PATH overrides
-      TAMANDUA_DB_PATH: path.join(temp.root, "my-db.db"),
     });
+    // cleanChildEnv synthesizes TAMANDUA_DB_PATH — delete it so the true
+    // HOME fallback path is exercised.
+    delete env.TAMANDUA_DB_PATH;
+    assert.ok(
+      !("TAMANDUA_DB_PATH" in env),
+      "TAMANDUA_DB_PATH must be absent before spawn",
+    );
 
     const result = spawnSync(
       process.execPath,
@@ -252,41 +274,61 @@ describe("DB-PATH resolution", () => {
         "--input-type=module",
         "-e",
         `import { acquire } from ${JSON.stringify(PROTOCOL_MODULE)};
-try {
-  const r = acquire("current", process.ppid, "{}", "{}", "{}");
-  console.log(JSON.stringify(r));
-} catch(e) {
-  console.log("ERROR:" + e.message);
-  process.exit(1);
-}`,
+import { writeSync } from "node:fs";
+const r = acquire("current", process.ppid, "{}", "{}", "{}");
+writeSync(1, JSON.stringify({ phase: r.phase, mode: r.mode }) + "\\n");`,
       ],
       { encoding: "utf-8", env, timeout: 30000 },
     );
 
     assert.equal(result.status, 0, `Acquire failed: ${result.stderr}`);
-    // DB should be at my-db.db, NOT under custom-state
-    assert.ok(
-      fs.existsSync(path.join(temp.root, "my-db.db")),
-      "DB should be at explicit TAMANDUA_DB_PATH",
-    );
+    assert.equal(result.signal, null, `Acquire signaled: ${result.signal}`);
+    assert.ok(result.error === undefined, `Spawn error: ${result.error}`);
+    assert.equal(result.stderr, "", "stderr must be empty");
+
+    const expected = JSON.stringify({ phase: "ACQUIRED", mode: "current" }) + "\n";
+    assert.equal(result.stdout, expected, `stdout mismatch, got: ${result.stdout}`);
+
+    const parsed = JSON.parse(result.stdout);
+    assert.deepEqual(parsed, { phase: "ACQUIRED", mode: "current" });
+
+    // HOME default DB should exist, custom-state DB should not
+    const homeDb = path.join(temp.homeDir, ".tamandua", "tamandua.db");
+    assert.ok(fs.existsSync(homeDb), "HOME/.tamandua/tamandua.db should exist");
     assert.ok(
       !fs.existsSync(path.join(stateDir, "tamandua.db")),
-      "DB should NOT be under TAMANDUA_STATE_DIR",
+      "custom-state/tamandua.db should NOT exist",
     );
-
-    try {
-      fs.rmSync(temp.root, { recursive: true, force: true });
-    } catch {
-      /* ignore */
-    }
   });
 });
 
 // ── COLD: absent DB initialization through real built dist/db.js ─────────
 
 describe("COLD initialization", () => {
+  /** @type {Set<string>} */
+  const roots = new Set();
+
+  afterEach(() => {
+    const errors = [];
+    for (const r of roots) {
+      try {
+        fs.rmSync(r, { recursive: true, force: true });
+      } catch (e) {
+        errors.push(e);
+      }
+    }
+    roots.clear();
+    if (errors.length > 0) {
+      throw new Error(
+        `Cleanup errors: ${errors.map((e) => e.message).join("; ")}`,
+      );
+    }
+  });
+
   it("absent DB is initialized through real built dist/db.js", () => {
     const temp = createTempHome("update-protocol-cold-");
+    roots.add(temp.root);
+
     const dbPath = path.join(temp.root, "cold.db");
 
     // DB should not exist
@@ -330,26 +372,25 @@ describe("COLD initialization", () => {
       "UPDATE trigger should exist",
     );
 
-    // Verify gate row inserted
+    // Verify gate row inserted (manual handle with try/finally for close)
     const db = new DatabaseSync(dbPath);
-    const gate = db
-      .prepare("SELECT * FROM update_gate WHERE id = 1")
-      .get();
-    db.close();
-    assert.ok(gate, "Gate row should exist");
-    assert.equal(gate.phase, "ACQUIRED");
-    assert.equal(gate.mode, "current");
-    assert.equal(gate.topology, JSON.stringify({ test: true }));
-
     try {
-      fs.rmSync(temp.root, { recursive: true, force: true });
-    } catch {
-      /* ignore */
+      const gate = db
+        .prepare("SELECT * FROM update_gate WHERE id = 1")
+        .get();
+      assert.ok(gate, "Gate row should exist");
+      assert.equal(gate.phase, "ACQUIRED");
+      assert.equal(gate.mode, "current");
+      assert.equal(gate.topology, JSON.stringify({ test: true }));
+    } finally {
+      db.close();
     }
   });
 
   it("cold init does not copy or duplicate the runs schema in the coordinator", () => {
     const temp = createTempHome("update-protocol-cold2-");
+    roots.add(temp.root);
+
     const dbPath = path.join(temp.root, "cold2.db");
 
     const result = runColdInit(temp, dbPath);
@@ -367,138 +408,175 @@ describe("COLD initialization", () => {
     assert.ok(tables.includes("tamandua_stats"));
     assert.ok(tables.includes("suite_results"));
     assert.ok(tables.includes("story_abandonments"));
-
-    try {
-      fs.rmSync(temp.root, { recursive: true, force: true });
-    } catch {
-      /* ignore */
-    }
   });
 });
 
 // ── ACTIVE-RUNNING / ACTIVE-PAUSED refusal ───────────────────────────────
 
 describe("Active work refusal", () => {
-  it("acquisition exits nonzero when a running run exists", () => {
-    const temp = createTempHome("update-protocol-activerun-");
-    const dbPath = path.join(temp.root, "activerun.db");
+  function snapshotDb(dbPath) {
+    const db = new DatabaseSync(dbPath);
+    let tables;
+    let userVersion;
+    let runCount;
+    let runRow;
+    try {
+      tables = db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
+        )
+        .all()
+        .map((r) => r.name);
+      userVersion = db.prepare("PRAGMA user_version").get().user_version;
+      runCount = db.prepare("SELECT COUNT(*) AS cnt FROM runs").get().cnt;
+      const row = db.prepare("SELECT * FROM runs").get();
+      runRow = row ? JSON.parse(JSON.stringify(row)) : null;
+    } finally {
+      db.close();
+    }
 
-    // Cold-init and insert a running run
-    const env = cleanChildEnv({
-      HOME: temp.homeDir,
-      TAMANDUA_STATE_DIR: path.join(temp.homeDir, ".tamandua"),
-      TAMANDUA_DB_PATH: dbPath,
-    });
+    const rawBytes = fs.existsSync(dbPath)
+      ? fs.readFileSync(dbPath)
+      : null;
+    const hash = rawBytes
+      ? crypto.createHash("sha256").update(rawBytes).digest("hex")
+      : null;
 
-    const setupResult = spawnSync(
-      process.execPath,
-      [
-        "--input-type=module",
-        "-e",
-        `import { getDb, closeDb } from ${JSON.stringify(DIST_DB)};
+    function sidecar(name) {
+      const p = dbPath + name;
+      const exists = fs.existsSync(p);
+      return { exists, content: exists ? fs.readFileSync(p) : null };
+    }
+
+    return {
+      tables,
+      userVersion,
+      runCount,
+      runRow,
+      rawBytes,
+      hash,
+      journal: sidecar("-journal"),
+      wal: sidecar("-wal"),
+      shm: sidecar("-shm"),
+    };
+  }
+
+  function proveActiveRefusal(status) {
+    const temp = createTempHome(`update-protocol-active-${status}-`);
+    try {
+      const dbPath = path.join(temp.root, `active-${status}.db`);
+
+      const env = cleanChildEnv({
+        HOME: temp.homeDir,
+        TAMANDUA_STATE_DIR: path.join(temp.homeDir, ".tamandua"),
+        TAMANDUA_DB_PATH: dbPath,
+      });
+
+      const setupResult = spawnSync(
+        process.execPath,
+        [
+          "--input-type=module",
+          "-e",
+          `import { getDb, closeDb } from ${JSON.stringify(DIST_DB)};
+import { writeSync } from "node:fs";
 process.env.TAMANDUA_DB_PATH = ${JSON.stringify(dbPath)};
 process.env.HOME = ${JSON.stringify(temp.homeDir)};
 const db = getDb();
-db.prepare("INSERT INTO runs (id, workflow_id, task, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)")
-   .run("run-1", "wf-1", "task", "running", new Date().toISOString(), new Date().toISOString());
-closeDb();
-console.log("setup done");`,
-      ],
-      { encoding: "utf-8", env, timeout: 30000 },
-    );
-    assert.equal(
-      setupResult.status,
-      0,
-      `Setup failed: ${setupResult.stderr}`,
-    );
+try {
+  db.prepare("INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, notify_url, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+     .run("run-1", 1, "wf-1", "Fix the thing", ${JSON.stringify(status)}, "{}", 0, null, "2025-01-01T00:00:00.000Z", "2025-01-01T00:00:00.000Z");
+  db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+} finally {
+  closeDb();
+}
+writeSync(1, "READY\\n");`,
+        ],
+        { encoding: "utf-8", env, timeout: 30000 },
+      );
+      assert.equal(setupResult.status, 0, `Setup failed: ${setupResult.stderr}`);
+      assert.equal(setupResult.signal, null);
+      assert.ok(setupResult.error === undefined);
+      assert.equal(setupResult.stderr, "");
+      assert.equal(setupResult.stdout, "READY\n");
 
-    // Snapshot before acquisition
-    const beforeTables = getTableNames(dbPath);
-    const beforeVersion = getUserVersion(dbPath);
-    const beforeRunCount = countRuns(dbPath);
-    const beforeHash = fileHash(dbPath);
+      const before = snapshotDb(dbPath);
+      assert.equal(before.runCount, 1, "Expected exactly one run row");
+      assert.ok(before.runRow, "Expected a run row");
+      assert.equal(before.runRow.status, status, `Run status must be ${status}`);
+      assert.ok(!before.journal.exists, "-journal must not exist");
+      assert.ok(!before.wal.exists, "-wal must not exist");
+      assert.ok(!before.shm.exists, "-shm must not exist");
 
-    // Try to acquire
-    const acquireResult = runAcquire(temp, dbPath);
-    assert.notEqual(acquireResult.status, 0, "Acquire should fail");
-    assert.ok(
-      acquireResult.stdout.includes("Active work exists"),
-      `Expected 'Active work exists' in: ${acquireResult.stdout}`,
-    );
+      const refuseEnv = cleanChildEnv({
+        HOME: temp.homeDir,
+        TAMANDUA_STATE_DIR: path.join(temp.homeDir, ".tamandua"),
+        TAMANDUA_DB_PATH: dbPath,
+      });
 
-    // After acquisition attempt, state should be unchanged
-    const afterTables = getTableNames(dbPath);
-    const afterVersion = getUserVersion(dbPath);
-    const afterRunCount = countRuns(dbPath);
-    const afterHash = fileHash(dbPath);
+      const refuseResult = spawnSync(
+        process.execPath,
+        [
+          "--input-type=module",
+          "-e",
+          `import { acquire } from ${JSON.stringify(PROTOCOL_MODULE)};
+import { writeSync } from "node:fs";
+try {
+  acquire("current", process.ppid, "{}", "{}", "{}");
+  process.exitCode = 2;
+} catch (e) {
+  writeSync(1, JSON.stringify({ error: e.message }) + "\\n");
+  process.exitCode = 1;
+}`,
+        ],
+        { encoding: "utf-8", env: refuseEnv, timeout: 30000 },
+      );
 
-    // Schema names should be equal
-    assert.deepEqual(afterTables.sort(), beforeTables.sort());
-    // user_version should be unchanged
-    assert.equal(afterVersion, beforeVersion);
-    // Run count should be unchanged
-    assert.equal(afterRunCount, beforeRunCount);
-    // File hash should be equal (no side effects)
-    assert.equal(afterHash, beforeHash);
-    // Gate table should NOT exist
-    assert.ok(!tableExists(dbPath, "update_gate"), "Gate table should not exist after refusal");
-    // Triggers should NOT exist
-    assert.ok(!triggerExists(dbPath, "trg_update_gate_block_runs_insert"));
-    assert.ok(!triggerExists(dbPath, "trg_update_gate_block_runs_update"));
+      assert.equal(refuseResult.status, 1, "Acquire must exit 1");
+      assert.equal(refuseResult.signal, null);
+      assert.ok(refuseResult.error === undefined);
+      assert.equal(refuseResult.stderr, "", "stderr must be empty");
+      assert.equal(
+        refuseResult.stdout,
+        '{"error":"Active work exists — acquisition refused"}\n',
+        `stdout mismatch: ${refuseResult.stdout}`,
+      );
 
-    try {
+      const after = snapshotDb(dbPath);
+
+      assert.deepEqual(after.tables, before.tables);
+      assert.equal(after.userVersion, before.userVersion);
+      assert.equal(after.runCount, before.runCount);
+      assert.deepEqual(after.runRow, before.runRow);
+      assert.deepEqual(after.rawBytes, before.rawBytes);
+      assert.equal(after.hash, before.hash);
+      assert.equal(after.journal.exists, before.journal.exists);
+      assert.deepEqual(after.journal.content, before.journal.content);
+      assert.equal(after.wal.exists, before.wal.exists);
+      assert.deepEqual(after.wal.content, before.wal.content);
+      assert.equal(after.shm.exists, before.shm.exists);
+      assert.deepEqual(after.shm.content, before.shm.content);
+      assert.ok(
+        !tableExists(dbPath, "update_gate"),
+        "update_gate must not exist after refusal",
+      );
+      assert.ok(
+        !triggerExists(dbPath, "trg_update_gate_block_runs_insert"),
+      );
+      assert.ok(
+        !triggerExists(dbPath, "trg_update_gate_block_runs_update"),
+      );
+    } finally {
       fs.rmSync(temp.root, { recursive: true, force: true });
-    } catch {
-      /* ignore */
+      assert.ok(!fs.existsSync(temp.root), "active temp root must be absent");
     }
+  }
+
+  it("acquisition exits nonzero when a running run exists", () => {
+    proveActiveRefusal("running");
   });
 
   it("acquisition exits nonzero when a paused run exists", () => {
-    const temp = createTempHome("update-protocol-activepaused-");
-    const dbPath = path.join(temp.root, "activepaused.db");
-
-    const env = cleanChildEnv({
-      HOME: temp.homeDir,
-      TAMANDUA_STATE_DIR: path.join(temp.homeDir, ".tamandua"),
-      TAMANDUA_DB_PATH: dbPath,
-    });
-
-    const setupResult = spawnSync(
-      process.execPath,
-      [
-        "--input-type=module",
-        "-e",
-        `import { getDb, closeDb } from ${JSON.stringify(DIST_DB)};
-process.env.TAMANDUA_DB_PATH = ${JSON.stringify(dbPath)};
-process.env.HOME = ${JSON.stringify(temp.homeDir)};
-const db = getDb();
-db.prepare("INSERT INTO runs (id, workflow_id, task, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)")
-   .run("run-1", "wf-1", "task", "paused", new Date().toISOString(), new Date().toISOString());
-closeDb();
-console.log("setup done");`,
-      ],
-      { encoding: "utf-8", env, timeout: 30000 },
-    );
-    assert.equal(setupResult.status, 0, `Setup failed: ${setupResult.stderr}`);
-
-    const beforeHash = fileHash(dbPath);
-
-    const acquireResult = runAcquire(temp, dbPath);
-    assert.notEqual(acquireResult.status, 0, "Acquire should fail for paused runs");
-    assert.ok(
-      acquireResult.stdout.includes("Active work exists"),
-      `Expected 'Active work exists' in: ${acquireResult.stdout}`,
-    );
-
-    // State unchanged
-    assert.equal(fileHash(dbPath), beforeHash);
-    assert.ok(!tableExists(dbPath, "update_gate"));
-
-    try {
-      fs.rmSync(temp.root, { recursive: true, force: true });
-    } catch {
-      /* ignore */
-    }
+    proveActiveRefusal("paused");
   });
 });
 
