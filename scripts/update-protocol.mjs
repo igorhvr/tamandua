@@ -13,6 +13,7 @@
  *   fail(token, reason, details)
  *   isGateActive()
  *   validateProcessIdentity(identity)
+ *   captureProcessIdentity(pid)
  */
 
 import fs from "node:fs";
@@ -197,14 +198,15 @@ function _vMI(parsed, identity) {
 
 // ── Identity capture ─────────────────────────────────────────────────────────
 
-function captureProcessIdentity(pid) {
+export function captureProcessIdentity(pid) {
+  if (!Number.isSafeInteger(pid) || pid < 1) throw new Error("Invalid process identifier");
   if (process.platform === "linux") {
-    return captureLinuxIdentity(pid);
+    return validateProcessIdentity(captureLinuxIdentity(pid));
   }
   if (process.platform === "darwin") {
-    return captureMacIdentity(pid);
+    return validateProcessIdentity(captureMacIdentity(pid));
   }
-  throw new Error(`Unsupported platform: ${process.platform}`);
+  throw new Error("Cannot capture process identity");
 }
 
 function captureLinuxIdentity(pid) {
@@ -212,7 +214,7 @@ function captureLinuxIdentity(pid) {
   try {
     bootId = fs.readFileSync(path.join("/", "proc", "sys", "kernel", "random", "boot_id"), "utf-8").trim();
   } catch {
-    throw new Error("Cannot read boot_id");
+    throw new Error("Cannot capture process identity");
   }
 
   const statPath = path.join("/", "proc", String(pid), "stat");
@@ -223,18 +225,18 @@ function captureLinuxIdentity(pid) {
     // (comm), then split the remainder by space.
     const commEnd = stat.lastIndexOf(")");
     if (commEnd === -1) {
-      throw new Error(`Cannot parse ${statPath}: no comm field`);
+      throw new Error("Cannot capture process identity");
     }
     const afterComm = stat.slice(commEnd + 2); // skip ') ' after comm
     const fields = afterComm.split(" ");
     // fields[0] = state (field 3), ... fields[19] = starttime (field 22)
     // Index: field 3 is fields[0], field 22 is fields[19]
     if (fields.length < 20) {
-      throw new Error(`Cannot parse ${statPath}: too few fields`);
+      throw new Error("Cannot capture process identity");
     }
     startTicks = fields[19];
   } catch (e) {
-    throw new Error(`Cannot read ${statPath}: ${e.message}`);
+    throw new Error("Cannot capture process identity");
   }
 
   return JSON.stringify({ boot_id: bootId, start_ticks: startTicks });
@@ -242,19 +244,23 @@ function captureLinuxIdentity(pid) {
 
 function captureMacIdentity(pid) {
   // Use argument-vector process API — never interpolated shell commands
-  const result = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], {
-    encoding: "utf-8",
-    timeout: 5000,
-  });
-  if (result.error) {
-    throw new Error(`ps failed: ${result.error.message}`);
+  let result;
+  try {
+    result = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+      encoding: "utf-8",
+      timeout: 5000,
+      maxBuffer: 4096,
+      env: { ...process.env, LC_ALL: "C", LANG: "C" },
+    });
+  } catch {
+    throw new Error("Cannot capture process identity");
   }
-  if (result.status !== 0) {
-    throw new Error(`ps exited ${result.status}: ${result.stderr}`);
+  if (result.error || result.status !== 0 || typeof result.stdout !== "string") {
+    throw new Error("Cannot capture process identity");
   }
   const lstart = result.stdout.trim();
   if (!lstart) {
-    throw new Error(`ps produced empty output for PID ${pid}`);
+    throw new Error("Cannot capture process identity");
   }
   return JSON.stringify({ lstart });
 }
