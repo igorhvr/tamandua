@@ -1569,9 +1569,10 @@ describe("coordinator-contract", () => {
     finally { d.close(); }
   }
 
-  function pubView(row) {
-    const { token, ...rest } = row;
-    return rest;
+  function publicRow(dbPath) {
+    const d = new DatabaseSync(dbPath, { readOnly: true });
+    try { return { ...d.prepare("SELECT artifacts, created_at, failure_details, failure_reason, guardian_identity, guardian_pid, id, mode, owner_identity, owner_pid, phase, readiness, topology, updated_at FROM update_gate WHERE id = 1").get() }; }
+    finally { d.close(); }
   }
 
   // ── Case 1: strict parser and all pre-I/O rejection boundaries ─────────
@@ -1580,23 +1581,20 @@ describe("coordinator-contract", () => {
     const temp = createTempHome("upgx-cc-bdy-");
     const e = envFor(temp);
     const dbPath = path.join(temp.root, "test.db");
-    try {
-      // No command → usage
-      {
-        const r = runNode([COORDINATOR_CLI], e);
-        assert.equal(r.status, 2);
-        assert.equal(r.stdout, "");
-        assert.equal(r.stderr, "Usage: update-coordinator.mjs <acquire|inspect|record-guardian-cas|fail> [args...]\n");
-      }
+    function assertPreIoRejection(r, expectedStderr) {
+      assertRej(r, expectedStderr);
+      assert.ok(!fs.existsSync(dbPath), `DB exists after pre-I/O rejection: ${expectedStderr.trim()}`);
+    }
 
-      // Unknown commands (ordinary-unknown, inherited-property, >4096-byte) → exact "Unknown command\n"
+    try {
+      // No command → usage — pre-I/O proof
+      assertPreIoRejection(runNode([COORDINATOR_CLI], e), "Usage: update-coordinator.mjs <acquire|inspect|record-guardian-cas|fail> [args...]\n");
+
+      // Unknown commands (ordinary-unknown, inherited-property, >4096-byte) → exact "Unknown command\n" + pre-I/O proof
       for (const cmd of ["ordinary-unknown", "toString", "constructor", "__proto__", LONG_CMD]) {
         const r = runNode([COORDINATOR_CLI, cmd], e);
-        assert.equal(r.status, 2);
-        assert.equal(r.stdout, "");
-        assert.equal(r.stderr, "Unknown command\n");
+        assertPreIoRejection(r, "Unknown command\n");
         assert.ok(!r.stderr.includes(cmd.slice(0, 4)), `command echoed for ${cmd}`);
-        assert.ok(!fs.existsSync(dbPath));
       }
 
       // ── Arity boundaries for all four commands ──
@@ -1610,36 +1608,37 @@ describe("coordinator-contract", () => {
         const err = `Invalid argument count for ${cmd}\n`;
         // too few (skip when payload is 0 — no too-few for inspect)
         if (payload > 0) {
-          assertRej(runNode([COORDINATOR_CLI, cmd, ...Array(payload - 1).fill("x")], e), err);
+          assertPreIoRejection(runNode([COORDINATOR_CLI, cmd, ...Array(payload - 1).fill("x")], e), err);
         }
-        // too many — ordinary extra
-        assertRej(runNode([COORDINATOR_CLI, cmd, ...Array(payload + 1).fill("x")], e), err);
-        // too many — >4096-byte extra → byte-identical stderr (for acquire + inspect explicitly;
-        // the other two are covered implicitly by the generic loop; we still verify identity for all)
+        // too many — ordinary extra → pre-I/O proof
+        assertPreIoRejection(runNode([COORDINATOR_CLI, cmd, ...Array(payload + 1).fill("x")], e), err);
+        // too many — >4096-byte extra → individual pre-I/O proof + byte-identical stderr
         const rOrd = runNode([COORDINATOR_CLI, cmd, ...Array(payload).fill("x"), "extra"], e);
         const rBig = runNode([COORDINATOR_CLI, cmd, ...Array(payload).fill("x"), LONG_STR], e);
+        assertPreIoRejection(rOrd, err);
+        assertPreIoRejection(rBig, err);
         assert.equal(rOrd.stderr, rBig.stderr, `extra-arg identity mismatch for ${cmd}`);
-        assert.equal(rOrd.stderr, err);
       }
 
-      // obsolete three-field guardian / fail → arity error
-      assertRej(runNode([COORDINATOR_CLI, "record-guardian-cas", "tok", "1", "id"], e),
+      // obsolete three-field guardian / fail → arity error + pre-I/O proof
+      assertPreIoRejection(runNode([COORDINATOR_CLI, "record-guardian-cas", "tok", "1", "id"], e),
         "Invalid argument count for record-guardian-cas\n");
-      assertRej(runNode([COORDINATOR_CLI, "fail", "tok", "r", "d"], e),
+      assertPreIoRejection(runNode([COORDINATOR_CLI, "fail", "tok", "r", "d"], e),
         "Invalid argument count for fail\n");
 
-      // ── Bound checks after valid arity (oversized safeBoundArg fields) ──
+      // ── Bound checks after valid arity (oversized safeBoundArg fields) — per-invocation pre-I/O proof ──
       // acquire mode
-      assertRej(runNode([COORDINATOR_CLI, "acquire", LONG_STR, "1", "{}", "{}", "{}"], e), "Invalid argument\n");
+      assertPreIoRejection(runNode([COORDINATOR_CLI, "acquire", LONG_STR, "1", "{}", "{}", "{}"], e), "Invalid argument\n");
+      // acquire topology
+      assertPreIoRejection(runNode([COORDINATOR_CLI, "acquire", "current", "1", LONG_STR, "{}", "{}"], e), "Invalid argument\n");
       // guardian token
-      assertRej(runNode([COORDINATOR_CLI, "record-guardian-cas", LONG_STR, "ACQUIRED", "1", DUMB_ID, "1", DUMB_ID], e), "Invalid argument\n");
+      assertPreIoRejection(runNode([COORDINATOR_CLI, "record-guardian-cas", LONG_STR, "ACQUIRED", "1", DUMB_ID, "1", DUMB_ID], e), "Invalid argument\n");
       // guardian expected-owner identity
-      assertRej(runNode([COORDINATOR_CLI, "record-guardian-cas", DUMB_TOKEN, "ACQUIRED", "1", LONG_STR, "1", DUMB_ID], e), "Invalid argument\n");
+      assertPreIoRejection(runNode([COORDINATOR_CLI, "record-guardian-cas", DUMB_TOKEN, "ACQUIRED", "1", LONG_STR, "1", DUMB_ID], e), "Invalid argument\n");
       // guardian expected-guardian identity
-      assertRej(runNode([COORDINATOR_CLI, "record-guardian-cas", DUMB_TOKEN, "ACQUIRED", "1", DUMB_ID, "1", LONG_STR], e), "Invalid argument\n");
+      assertPreIoRejection(runNode([COORDINATOR_CLI, "record-guardian-cas", DUMB_TOKEN, "ACQUIRED", "1", DUMB_ID, "1", LONG_STR], e), "Invalid argument\n");
       // fail details
-      assertRej(runNode([COORDINATOR_CLI, "fail", DUMB_TOKEN, "ACQUIRED", "1", DUMB_ID, "r", LONG_STR], e), "Invalid argument\n");
-      assert.ok(!fs.existsSync(dbPath));
+      assertPreIoRejection(runNode([COORDINATOR_CLI, "fail", DUMB_TOKEN, "ACQUIRED", "1", DUMB_ID, "r", LONG_STR], e), "Invalid argument\n");
 
       // ── PID spelling/value: 11 bad values × 4 positions = 44 rejections ──
       const badPids = [
@@ -1664,8 +1663,7 @@ describe("coordinator-contract", () => {
       const positions = ["acquire-updater", "guardian-expected-owner", "guardian-pid", "fail-expected-owner"];
       for (const pos of positions) {
         for (const bp of badPids) {
-          assertRej(runNode(pidArgs(pos, bp), e), "Invalid argument\n");
-          assert.ok(!fs.existsSync(dbPath), `DB created for bad PID ${JSON.stringify(bp)} at ${pos}`);
+          assertPreIoRejection(runNode(pidArgs(pos, bp), e), "Invalid argument\n");
         }
       }
     } finally {
@@ -1698,14 +1696,21 @@ describe("coordinator-contract", () => {
         ownerPid: process.pid,
         ownerIdentity: ad.ownerIdentity,
       });
-      // DB parity
+      // DB parity — explicit five-field aliased query with deep equality
       {
-        const row = snap(dbPath);
-        assert.equal(row.token, ad.token);
-        assert.equal(row.owner_pid, process.pid);
-        assert.equal(row.owner_identity, ad.ownerIdentity);
-        assert.equal(row.phase, "ACQUIRED");
-        assert.equal(row.mode, "current");
+        let row;
+        {
+          const d = new DatabaseSync(dbPath);
+          try { row = d.prepare("SELECT token, phase, mode, owner_pid AS ownerPid, owner_identity AS ownerIdentity FROM update_gate WHERE id = 1").get(); }
+          finally { d.close(); }
+        }
+        assert.deepEqual({ ...row }, {
+          token: ad.token,
+          phase: "ACQUIRED",
+          mode: "current",
+          ownerPid: process.pid,
+          ownerIdentity: ad.ownerIdentity,
+        });
       }
 
       // (2) Capture the still-live test parent process identity via helper child
@@ -1763,13 +1768,19 @@ describe("coordinator-contract", () => {
         }
       }
 
-      // (7) Inspect: query 14-column public view, deep-equal to { gate: publicRow }, no token leaked
+      // (7) Inspect: query explicit ordered 14-column public view, deep-equal to { gate: publicRow }, no token leaked
       const preInspRow = snap(dbPath);
-      const publicRow = pubView(preInspRow);
+      const publicRowData = publicRow(dbPath);
+      // 14-column allowlist assertion — accidental internal column expansion must fail
+      assert.deepEqual(Object.keys(publicRowData), [
+        "artifacts", "created_at", "failure_details", "failure_reason",
+        "guardian_identity", "guardian_pid", "id", "mode", "owner_identity",
+        "owner_pid", "phase", "readiness", "topology", "updated_at",
+      ]);
       const rInsp = runNode([COORDINATOR_CLI, "inspect"], e);
       assert.equal(rInsp.status, 0, rInsp.stderr);
       const inspParsed = JSON.parse(rInsp.stdout);
-      assert.deepEqual(inspParsed, { gate: publicRow });
+      assert.deepEqual(inspParsed, { gate: publicRowData });
       assert.ok(!rInsp.stdout.includes(ad.token) && !rInsp.stderr.includes(ad.token), "token leaked in inspect output");
       assert.deepEqual(snap(dbPath), preInspRow, "inspect mutated the row");
     } finally {
