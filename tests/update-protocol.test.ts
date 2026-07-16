@@ -1840,71 +1840,157 @@ try {
       TAMANDUA_DB_PATH: dbPath,
     });
 
-    // First, cold-init and insert a non-running run
-    const setupResult = spawnSync(
-      process.execPath,
-      [
-        "--input-type=module",
-        "-e",
-        `import { getDb, closeDb } from ${JSON.stringify(DIST_DB)};
-process.env.TAMANDUA_DB_PATH = ${JSON.stringify(dbPath)};
-process.env.HOME = ${JSON.stringify(homeDir)};
-const db = getDb();
-db.prepare("INSERT INTO runs (id, workflow_id, task, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)")
-  .run("test-run-1", "wf-test", "test task", "done", new Date().toISOString(), new Date().toISOString());
-closeDb();
-console.log("setup done");`,
-      ],
-      { encoding: "utf-8", env, timeout: 30000 },
-    );
-    assert.equal(setupResult.status, 0, `Setup failed: ${setupResult.stderr}`);
+    // Helper: snapshot complete gate row + every runs row from a db handle
+    const snapshot = (db) => {
+      const gateRow = db.prepare("SELECT * FROM update_gate WHERE id = 1").get();
+      const runsRows = db.prepare("SELECT * FROM runs ORDER BY id").all();
+      return {
+        gate: gateRow ? { ...gateRow } : null,
+        runs: runsRows.map((r) => ({ ...r })),
+      };
+    };
 
-    // Now acquire
-    const acquireResult = spawnSync(
-      process.execPath,
-      [
-        "--input-type=module",
-        "-e",
-        `import { acquire } from ${JSON.stringify(PROTOCOL_MODULE)};
-const r = acquire("current", process.ppid, "{}", "{}", "{}");
-console.log("OK");`,
-      ],
-      { encoding: "utf-8", env, timeout: 30000 },
-    );
-    assert.equal(acquireResult.status, 0, `Acquire failed: ${acquireResult.stderr}`);
+    let preSnapshot = null;
+    let postSnapshot = null;
 
-    // Now try to transition the done run to running (should be blocked)
-    const writerResult = spawnSync(
-      process.execPath,
-      [
-        "--input-type=module",
-        "-e",
-        `import { getDb, closeDb } from ${JSON.stringify(DIST_DB)};
+    try {
+      // Setup: cold-init and insert a done run using the real dist/db.js.
+      // Must call closeDb() in finally and emit exactly "SETUP_DONE\n" via process.stdout.write.
+      const setupResult = spawnSync(
+        process.execPath,
+        [
+          "--input-type=module",
+          "-e",
+          `import { getDb, closeDb } from ${JSON.stringify(DIST_DB)};
 process.env.TAMANDUA_DB_PATH = ${JSON.stringify(dbPath)};
 process.env.HOME = ${JSON.stringify(homeDir)};
 try {
   const db = getDb();
-  db.prepare("UPDATE runs SET status = ? WHERE id = ?").run("running", "test-run-1");
+  db.prepare("INSERT INTO runs (id, workflow_id, task, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)")
+    .run("test-run-1", "wf-test", "test task", "done", new Date().toISOString(), new Date().toISOString());
+} finally {
   closeDb();
-  console.log("UNEXPECTED: UPDATE succeeded");
+}
+process.stdout.write("SETUP_DONE\\n");
+`,
+        ],
+        { encoding: "utf-8", env, timeout: 30000 },
+      );
+      assert.strictEqual(setupResult.status, 0, `Setup failed: ${setupResult.stderr}`);
+      assert.strictEqual(setupResult.signal, null);
+      assert.strictEqual(setupResult.error, undefined);
+      assert.strictEqual(setupResult.stdout, "SETUP_DONE\n");
+      assert.strictEqual(setupResult.stderr, "");
+
+      // Acquire — reveals no token, only OK
+      const acquireResult = spawnSync(
+        process.execPath,
+        [
+          "--input-type=module",
+          "-e",
+          `import { acquire } from ${JSON.stringify(PROTOCOL_MODULE)};
+const r = acquire("current", process.ppid, "{}", "{}", "{}");
+process.stdout.write("OK\\n");`,
+        ],
+        { encoding: "utf-8", env, timeout: 30000 },
+      );
+      assert.strictEqual(acquireResult.status, 0, `Acquire failed: ${acquireResult.stderr}`);
+      assert.strictEqual(acquireResult.signal, null);
+      assert.strictEqual(acquireResult.error, undefined);
+      assert.strictEqual(acquireResult.stdout, "OK\n");
+      assert.strictEqual(acquireResult.stderr, "");
+
+      // Pre-snapshot: capture complete gate and runs state before writer
+      {
+        const db = new DatabaseSync(dbPath);
+        try {
+          preSnapshot = snapshot(db);
+        } finally {
+          db.close();
+        }
+      }
+
+      // Verify the target pre-row exists with status exactly done
+      const preTargetRow = preSnapshot.runs.find((r) => r.id === "test-run-1");
+      assert.ok(preTargetRow, "preSnapshot should contain test-run-1");
+      assert.strictEqual(preTargetRow.status, "done");
+
+      // Writer: try to UPDATE status to running (should be blocked by trigger).
+      // Must call closeDb() in finally, capture error fields, emit one JSON line.
+      const writerResult = spawnSync(
+        process.execPath,
+        [
+          "--input-type=module",
+          "-e",
+          `import { getDb, closeDb } from ${JSON.stringify(DIST_DB)};
+process.env.TAMANDUA_DB_PATH = ${JSON.stringify(dbPath)};
+process.env.HOME = ${JSON.stringify(homeDir)};
+let blocked = false;
+let errName, errMessage, errCode, errErrCode, errErrStr;
+try {
+  const db = getDb();
+  db.prepare("UPDATE runs SET status = ? WHERE id = ?").run("running", "test-run-1");
 } catch(e) {
-  console.log("TRIGGER_BLOCKED: " + e.message);
-  process.exit(0);
+  blocked = true;
+  errName = e.name;
+  errMessage = e.message;
+  errCode = e.code;
+  errErrCode = e.errcode;
+  errErrStr = e.errstr;
+} finally {
+  closeDb();
+  const outcome = {};
+  outcome.blocked = blocked;
+  outcome.closed = true;
+  if (blocked) {
+    outcome.name = errName;
+    outcome.message = errMessage;
+    outcome.code = errCode;
+    outcome.errcode = errErrCode;
+    outcome.errstr = errErrStr;
+  }
+  process.stdout.write(JSON.stringify(outcome) + "\\n");
 }`,
-      ],
-      { encoding: "utf-8", env, timeout: 30000 },
-    );
+        ],
+        { encoding: "utf-8", env, timeout: 30000 },
+      );
 
-    assert.equal(writerResult.status, 0);
-    assert.ok(
-      writerResult.stdout.includes("TRIGGER_BLOCKED: update in progress"),
-      `Expected trigger block on UPDATE, got: ${writerResult.stdout}`,
-    );
+      const expectedStdout = JSON.stringify({
+        blocked: true,
+        closed: true,
+        name: "Error",
+        message: "update in progress",
+        code: "ERR_SQLITE_ERROR",
+        errcode: 1811,
+        errstr: "constraint failed",
+      }) + "\n";
 
-    try {
+      assert.strictEqual(writerResult.status, 0);
+      assert.strictEqual(writerResult.signal, null);
+      assert.strictEqual(writerResult.error, undefined);
+      assert.strictEqual(writerResult.stderr, "");
+      assert.strictEqual(writerResult.stdout, expectedStdout);
+
+      // Post-snapshot: capture complete gate and runs state after writer
+      {
+        const db = new DatabaseSync(dbPath);
+        try {
+          postSnapshot = snapshot(db);
+        } finally {
+          db.close();
+        }
+      }
+
+      // Prove full logical gate + runs state unchanged
+      assert.deepStrictEqual(postSnapshot, preSnapshot);
+
+      // Separately prove the target row is byte-for-byte unchanged
+      const postTargetRow = postSnapshot.runs.find((r) => r.id === "test-run-1");
+      assert.ok(postTargetRow, "postSnapshot should contain test-run-1");
+      assert.deepStrictEqual(postTargetRow, preTargetRow);
+      assert.strictEqual(postTargetRow.status, "done");
+    } finally {
       fs.rmSync(temp.root, { recursive: true, force: true });
-    } catch {
-      /* ignore */
     }
   });
 });
