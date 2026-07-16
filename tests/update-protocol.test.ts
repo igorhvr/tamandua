@@ -759,19 +759,24 @@ process.exitCode = 0;
   );
 
   it(
-    "acquirer-first: acquirer commits gate, then writer INSERT is blocked by trigger",
+    "acquirer-first: writer gets BUSY, acquirer commits gate, same INSERT is trigger-blocked",
     { timeout: 60000 },
     async () => {
-      // For the acquirer-first scenario, we need a DB with NO active runs
-      // so acquisition succeeds, then the writer tries to insert and
-      // the trigger should block it.
+      // Deterministic two-process interleaving proof:
+      // (1) writer prepares INSERT before acquisition
+      // (2) acquirer holds real BEGIN IMMEDIATE
+      // (3) writer gets real BUSY-5 from lock conflict
+      // (4) acquirer commits canonical blockers/gate
+      // (5) same prepared statement retries and is rejected by trigger
 
       const temp = createTempHome("update-protocol-race-af-");
       const dbPath = path.join(temp.root, "race-af.db");
       const barrierDir = path.join(temp.root, "barriers");
-      fs.mkdirSync(barrierDir, { recursive: true });
 
-      const acquireDone = path.join(barrierDir, "acquire-done");
+      const writerPrepared = path.join(barrierDir, "writer-prepared");
+      const acquirerLockHeld = path.join(barrierDir, "acquirer-lock-held");
+      const writerBusyObserved = path.join(barrierDir, "writer-busy-observed");
+      const acquirerCommitted = path.join(barrierDir, "acquirer-committed");
 
       const env = cleanChildEnv({
         HOME: temp.homeDir,
@@ -779,106 +784,431 @@ process.exitCode = 0;
         TAMANDUA_DB_PATH: dbPath,
       });
 
-      // Cold-init first
-      const initResult = spawnSync(
-        process.execPath,
-        [
-          "--input-type=module",
-          "-e",
-          `import { getDb, closeDb } from ${JSON.stringify(DIST_DB)};
+      // Shared barrier-wait helper (deterministic Atomics.wait, no setTimeout)
+      const barrierWaitFn = `
+function barrierWait(barrierPath, name, timeoutMs) {
+  const sab = new SharedArrayBuffer(4);
+  const i32 = new Int32Array(sab);
+  const deadline = Date.now() + timeoutMs;
+  while (!fs.existsSync(barrierPath)) {
+    if (Date.now() > deadline) {
+      throw new Error("barrier " + name + " not observed within " + timeoutMs + "ms");
+    }
+    Atomics.wait(i32, 0, 0, 50);
+  }
+}`;
+
+      // Writer: opens own DatabaseSync with busy_timeout=0, proves reserved
+      // artifacts absent, prepares the legacy INSERT exactly once, retains the
+      // StatementSync object, signals writer-prepared.
+      // Then waits for acquirer-lock-held, executes the prepared statement once
+      // (must get BUSY-5), signals writer-busy-observed.
+      // After acquirer-committed, retries the same statement (must get trigger error).
+      const writerCode = `
+import { DatabaseSync } from "node:sqlite";
+import fs from "node:fs";
+const dbPath = process.env.TAMANDUA_DB_PATH;
+const writerPrepared = ${JSON.stringify(writerPrepared)};
+const acquirerLockHeld = ${JSON.stringify(acquirerLockHeld)};
+const writerBusyObserved = ${JSON.stringify(writerBusyObserved)};
+const acquirerCommitted = ${JSON.stringify(acquirerCommitted)};
+
+${barrierWaitFn}
+
+let db;
+try {
+  db = new DatabaseSync(dbPath);
+  db.exec("PRAGMA busy_timeout = 0");
+
+  // Prove reserved artifacts are absent before preparation —
+  // fail-fast: if any exist, throw immediately before preparing or signaling
+  const reserved = db.prepare(
+    "SELECT lower(name) as name FROM main.sqlite_schema WHERE lower(name) IN (" +
+    "'update_gate', 'trg_update_gate_block_runs_insert', 'trg_update_gate_block_runs_update')"
+  ).all();
+  if (reserved.length > 0) {
+    throw new Error("FAIL-FAST: reserved artifacts already exist before acquire");
+  }
+  const reservedAbsent = reserved.length === 0;
+
+  // Prepare INSERT exactly once, retain the StatementSync
+  let prepareCount = 0;
+  const stmt = db.prepare(
+    "INSERT INTO runs (id, workflow_id, task, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)"
+  );
+  prepareCount++;
+
+  // Signal: writer prepared before acquisition
+  fs.writeFileSync(writerPrepared, "");
+
+  // Wait for acquirer to hold the real BEGIN IMMEDIATE lock
+  barrierWait(acquirerLockHeld, "acquirer-lock-held", 15000);
+
+  // Execute the retained statement exactly once — must get BUSY-5
+  let busyAttemptCount = 0;
+  let busyCode = null;
+  let busyErrcode = null;
+  try {
+    busyAttemptCount++;
+    stmt.run("race-run-1", "wf-1", "task", "running",
+      new Date().toISOString(), new Date().toISOString());
+    throw new Error("UNEXPECTED: INSERT succeeded while acquirer held lock");
+  } catch (e) {
+    if (e.code === "ERR_SQLITE_ERROR" && e.errcode === 5) {
+      busyCode = e.code;
+      busyErrcode = e.errcode;
+    } else {
+      throw new Error("UNEXPECTED error instead of BUSY-5: " +
+        (e.code || "(none)") + " errcode=" + (e.errcode ?? "(none)") +
+        " message=" + e.message);
+    }
+  }
+
+  // Signal: writer observed real BUSY-5 — acquirer can continue
+  fs.writeFileSync(writerBusyObserved, "");
+
+  // Wait for acquirer to commit the gate and triggers
+  barrierWait(acquirerCommitted, "acquirer-committed", 15000);
+
+  // Retry the same retained statement exactly once — must get trigger error
+  let retryCount = 0;
+  let triggerError = null;
+  let sameStatementRetried = false;
+  try {
+    retryCount++;
+    sameStatementRetried = true;
+    stmt.run("race-run-1", "wf-1", "task", "running",
+      new Date().toISOString(), new Date().toISOString());
+    throw new Error("UNEXPECTED: retry INSERT succeeded after gate committed");
+  } catch (e) {
+    if (e.message === "update in progress") {
+      triggerError = e.message;
+    } else {
+      throw new Error("UNEXPECTED retry error: " + (e.code || "(none)") +
+        " errcode=" + (e.errcode ?? "(none)") + " message=" + e.message);
+    }
+  }
+
+  const result = {
+    reservedAbsent,
+    prepareCount,
+    busyAttemptCount,
+    busyCode,
+    busyErrcode,
+    retryCount,
+    triggerError,
+    sameStatementRetried,
+  };
+  fs.writeSync(1, JSON.stringify(result) + "\\n");
+} finally {
+  if (db) {
+    try { db.close(); } catch (_) {}
+  }
+}
+`;
+
+      // Acquirer: waits for writer-prepared, monkeypatches DatabaseSync.prototype.exec
+      // to intercept the first BEGIN IMMEDIATE from production acquire().
+      // Calls the saved original first; only after the real call succeeds
+      // (write-lock actually held) increments the count and signals acquirer-lock-held.
+      // Before returning from the wrapper, waits for writer-busy-observed.
+      const acquirerCode = `
+import fs from "node:fs";
+import { DatabaseSync } from "node:sqlite";
+const writerPrepared = ${JSON.stringify(writerPrepared)};
+const acquirerLockHeld = ${JSON.stringify(acquirerLockHeld)};
+const writerBusyObserved = ${JSON.stringify(writerBusyObserved)};
+const acquirerCommitted = ${JSON.stringify(acquirerCommitted)};
+
+${barrierWaitFn}
+
+// Wait for writer to prepare its INSERT before acquisition
+barrierWait(writerPrepared, "writer-prepared", 15000);
+
+// Monkeypatch DatabaseSync.prototype.exec to intercept the first BEGIN IMMEDIATE
+const originalExec = DatabaseSync.prototype.exec;
+let interceptedLockCount = 0;
+
+DatabaseSync.prototype.exec = function(sql) {
+  if (sql === "BEGIN IMMEDIATE" && interceptedLockCount === 0) {
+    // First BEGIN IMMEDIATE from production acquire().
+    // Call the saved original first — only after it returns is the lock held.
+    const result = originalExec.call(this, "BEGIN IMMEDIATE");
+    interceptedLockCount++;
+
+    // Now the write lock is actually held — signal
+    fs.writeFileSync(acquirerLockHeld, "");
+
+    // Wait for writer to observe BUSY-5 before returning from wrapper
+    barrierWait(writerBusyObserved, "writer-busy-observed", 15000);
+
+    return result;
+  }
+
+  return originalExec.call(this, sql);
+};
+
+// Call the real production acquire()
+try {
+  const mod = await import(${JSON.stringify(PROTOCOL_MODULE)});
+  let result;
+  try {
+    result = mod.acquire("current", process.ppid, "{}", "{}", "{}");
+  } catch (e) {
+    throw new Error("acquire() failed: " + e.message);
+  }
+
+  // acquire() returned successfully — the gate is committed, close its DB
+  // (the acquire() call internally opens and closes its own DB via finally)
+
+  // Signal: acquirer committed
+  fs.writeFileSync(acquirerCommitted, "");
+
+  const out = {
+    interceptedLockCount,
+    phase: result.phase,
+    mode: result.mode,
+  };
+  fs.writeSync(1, JSON.stringify(out) + "\\n");
+} finally {
+  // Restore the original exec in all exit paths
+  DatabaseSync.prototype.exec = originalExec;
+}
+`;
+
+      // Declare every handle before try so finally can always reach them
+      let writerChild, acquirerChild;
+      let writerStdout = "", writerStderr = "";
+      let acquirerStdout = "", acquirerStderr = "";
+      let db;
+
+      try {
+        // I/O and resource allocation inside encompassing try
+        fs.mkdirSync(barrierDir, { recursive: true });
+
+        // Cold-init the DB first
+        const initResult = spawnSync(
+          process.execPath,
+          [
+            "--input-type=module",
+            "-e",
+            `import { getDb, closeDb } from ${JSON.stringify(DIST_DB)};
 process.env.TAMANDUA_DB_PATH = ${JSON.stringify(dbPath)};
 process.env.HOME = ${JSON.stringify(temp.homeDir)};
 const db = getDb();
 closeDb();
 console.log("cold init done");`,
-        ],
-        { encoding: "utf-8", env, timeout: 30000 },
-      );
-      assert.equal(initResult.status, 0, `Cold init: ${initResult.stderr}`);
+          ],
+          { encoding: "utf-8", env, timeout: 30000 },
+        );
+        assert.equal(initResult.status, 0, `Cold init failed: ${initResult.stderr}`);
 
-      const acquireDone2 = path.join(barrierDir, "acquire-done-2");
+        // Spawn both children concurrently — the barriers control ordering
+        writerChild = spawn(process.execPath, ["--input-type=module", "-e", writerCode], {
+          env,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        acquirerChild = spawn(process.execPath, ["--input-type=module", "-e", acquirerCode], {
+          env,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
 
-      const acquirerCode = `
-import fs from "node:fs";
-import { acquire } from ${JSON.stringify(PROTOCOL_MODULE)};
-const done = ${JSON.stringify(acquireDone2)};
+        writerChild.stdout.on("data", (d) => { writerStdout += d.toString(); });
+        writerChild.stderr.on("data", (d) => { writerStderr += d.toString(); });
+        acquirerChild.stdout.on("data", (d) => { acquirerStdout += d.toString(); });
+        acquirerChild.stderr.on("data", (d) => { acquirerStderr += d.toString(); });
 
-const r = acquire("current", process.ppid, "{}", "{}", "{}");
-console.log("ACQUIRED:" + JSON.stringify(r));
-fs.writeFileSync(done, "done");
-`;
+        // Close/resolve promises: resolve on close, reject on error
+        const writerClose = new Promise((resolve, reject) => {
+          writerChild.on("close", (code) => resolve(code));
+          writerChild.on("error", (err) => reject(err));
+        });
+        const acquirerClose = new Promise((resolve, reject) => {
+          acquirerChild.on("close", (code) => resolve(code));
+          acquirerChild.on("error", (err) => reject(err));
+        });
 
-      // Writer: waits for acquire, then tries INSERT (should be blocked by trigger)
-      const writerCode = `
-import fs from "node:fs";
-import { DatabaseSync } from "node:sqlite";
-const done = ${JSON.stringify(acquireDone2)};
-const dbPath = process.env.TAMANDUA_DB_PATH;
+        const [writerExitCode, acquirerExitCode] = await Promise.all([
+          writerClose,
+          acquirerClose,
+        ]) as [number, number];
 
-// Wait for acquire to commit
-while (!fs.existsSync(done)) {
-  await new Promise(r => setTimeout(r, 50));
-}
-// Small extra wait to ensure transaction fully committed
-await new Promise(r => setTimeout(r, 500));
+        // Assert exact zero exit codes
+        assert.equal(writerExitCode, 0,
+          `Writer failed (exit ${writerExitCode}): stderr=${writerStderr}`);
+        assert.equal(acquirerExitCode, 0,
+          `Acquirer failed (exit ${acquirerExitCode}): stderr=${acquirerStderr}`);
 
-// Now try INSERT — should be blocked by trigger
-const db = new DatabaseSync(dbPath);
-try {
-  db.prepare("INSERT INTO runs (id, workflow_id, task, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)")
-    .run("race-run-1", "wf-1", "task", "running", new Date().toISOString(), new Date().toISOString());
-  console.log("UNEXPECTED_INSERT_OK");
-} catch(e) {
-  console.log("TRIGGER_BLOCKED: " + e.message);
-}
-db.close();
-process.exit(0);
-`;
+        // Assert empty success stderr
+        assert.equal(writerStderr, "",
+          `Writer stderr not empty: ${writerStderr}`);
+        assert.equal(acquirerStderr, "",
+          `Acquirer stderr not empty: ${acquirerStderr}`);
 
-      // Start acquirer first
-      const acquirerChild = spawn(process.execPath, ["--input-type=module", "-e", acquirerCode], {
-        env,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
+        // Parse exactly one nonempty JSON line from each child
+        let writerResult, acquirerResult;
+        try {
+          writerResult = JSON.parse(writerStdout.trim());
+        } catch {
+          assert.fail(`Writer stdout is not valid JSON: ${writerStdout}`);
+        }
+        try {
+          acquirerResult = JSON.parse(acquirerStdout.trim());
+        } catch {
+          assert.fail(`Acquirer stdout is not valid JSON: ${acquirerStdout}`);
+        }
 
-      const acquirerPromise = new Promise((resolve) => {
-        let out = "";
-        acquirerChild.stdout.on("data", (d) => { out += d.toString(); });
-        acquirerChild.on("close", (code) => resolve({ code, out }));
-      });
+        // Assert no extra output (exactly one JSON line)
+        const writerLines = writerStdout.trim().split("\n");
+        assert.equal(writerLines.length, 1,
+          `Expected 1 JSON line from writer, got ${writerLines.length}`);
+        const acquirerLines = acquirerStdout.trim().split("\n");
+        assert.equal(acquirerLines.length, 1,
+          `Expected 1 JSON line from aquirer, got ${acquirerLines.length}`);
 
-      // Wait for acquirer to finish
-      const acquirerResult = await acquirerPromise as { code: number; out: string };
-      acquirerChild.kill("SIGKILL");
-      assert.equal(acquirerResult.code, 0, `Acquirer failed: ${acquirerResult.out}`);
-      assert.ok(acquirerResult.out.includes("ACQUIRED:"), "Acquirer should have acquired");
+        // ── Writer JSON assertions ──
 
-      // Now start the writer
-      const writerChild = spawn(process.execPath, ["--input-type=module", "-e", writerCode], {
-        env,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
+        assert.equal(writerResult.reservedAbsent, true,
+          "Reserved artifacts must be absent at preparation");
+        assert.equal(writerResult.prepareCount, 1,
+          `Expected prepareCount=1, got ${writerResult.prepareCount}`);
+        assert.equal(writerResult.busyAttemptCount, 1,
+          `Expected busyAttemptCount=1, got ${writerResult.busyAttemptCount}`);
+        assert.equal(writerResult.busyCode, "ERR_SQLITE_ERROR",
+          `Expected busyCode=ERR_SQLITE_ERROR, got ${writerResult.busyCode}`);
+        assert.equal(writerResult.busyErrcode, 5,
+          `Expected busyErrcode=5, got ${writerResult.busyErrcode}`);
+        assert.equal(writerResult.retryCount, 1,
+          `Expected retryCount=1, got ${writerResult.retryCount}`);
+        assert.equal(writerResult.triggerError, "update in progress",
+          `Expected trigger error, got ${writerResult.triggerError}`);
+        assert.equal(writerResult.sameStatementRetried, true,
+          "Retry must use the same retained statement (no second prepare)");
 
-      const writerPromise = new Promise((resolve) => {
-        let out = "";
-        writerChild.stdout.on("data", (d) => { out += d.toString(); });
-        writerChild.on("close", (code) => resolve({ code, out }));
-      });
+        // ── Acquirer JSON assertions ──
 
-      const writerResult = await writerPromise as { code: number; out: string };
-      writerChild.kill("SIGKILL");
-      assert.ok(
-        writerResult.out.includes("TRIGGER_BLOCKED: update in progress"),
-        `Expected trigger block, got: ${writerResult.out}`,
-      );
+        assert.equal(acquirerResult.interceptedLockCount, 1,
+          `Expected interceptedLockCount=1, got ${acquirerResult.interceptedLockCount}`);
+        assert.equal(acquirerResult.phase, "ACQUIRED",
+          `Expected phase=ACQUIRED, got ${acquirerResult.phase}`);
+        assert.equal(acquirerResult.mode, "current",
+          `Expected mode=current, got ${acquirerResult.mode}`);
 
-      // Verify gate exists (acquirer succeeded)
-      assert.ok(tableExists(dbPath, "update_gate"), "Gate table should exist");
+        // ── Final DB state assertions ──
 
-      try {
-        fs.rmSync(temp.root, { recursive: true, force: true });
-      } catch {
-        /* ignore */
+        db = new DatabaseSync(dbPath);
+
+        // DDL normalization helper (mirrors production normalizeDdl)
+        const normalizeDdl = (sql: string | null): string | null => {
+          if (sql === null) return null;
+          let s = sql.trim();
+          while (s.endsWith(";")) s = s.slice(0, -1).trimEnd();
+          return s;
+        };
+
+        // Exact canonical DDL from frozen production at base commit 39dbf59
+        // (inlined as test constants; not imported from production internals)
+        const CANONICAL_GATE_DDL = `CREATE TABLE update_gate (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  token TEXT NOT NULL,
+  mode TEXT NOT NULL CHECK (mode IN ('legacy', 'current')),
+  phase TEXT NOT NULL CHECK (phase IN ('ACQUIRED', 'GUARDIAN_RECORDED', 'FAILED')),
+  owner_pid INTEGER NOT NULL,
+  owner_identity TEXT NOT NULL,
+  guardian_pid INTEGER,
+  guardian_identity TEXT,
+  topology TEXT NOT NULL,
+  artifacts TEXT NOT NULL,
+  readiness TEXT NOT NULL,
+  failure_reason TEXT,
+  failure_details TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+)`;
+        const CANONICAL_TRIGGER_INSERT_DDL = `CREATE TRIGGER trg_update_gate_block_runs_insert
+BEFORE INSERT ON runs
+WHEN EXISTS (SELECT 1 FROM update_gate WHERE id = 1)
+BEGIN
+  SELECT RAISE(ABORT, 'update in progress');
+END`;
+        const CANONICAL_TRIGGER_UPDATE_DDL = `CREATE TRIGGER trg_update_gate_block_runs_update
+BEFORE UPDATE OF status ON runs
+WHEN EXISTS (SELECT 1 FROM update_gate WHERE id = 1)
+  AND NEW.status = 'running' AND OLD.status != 'running'
+BEGIN
+  SELECT RAISE(ABORT, 'update in progress');
+END`;
+        const EXPECTED_SQL: Record<string, string | null> = {
+          update_gate: CANONICAL_GATE_DDL,
+          trg_update_gate_block_runs_insert: CANONICAL_TRIGGER_INSERT_DDL,
+          trg_update_gate_block_runs_update: CANONICAL_TRIGGER_UPDATE_DDL,
+        };
+
+        // All three reserved artifacts exist with exact canonical types,
+        // names, tbl_names, and normalized SQL
+        const artifacts = db.prepare(
+          "SELECT type, name, tbl_name, sql FROM main.sqlite_schema WHERE lower(name) IN (" +
+          "'update_gate', 'trg_update_gate_block_runs_insert', 'trg_update_gate_block_runs_update')" +
+          " ORDER BY lower(name)"
+        ).all() as { type: string; name: string; tbl_name: string; sql: string | null }[];
+        assert.equal(artifacts.length, 3,
+          `Expected 3 reserved artifacts, got ${artifacts.length}: ${JSON.stringify(artifacts)}`);
+
+        // Deterministic order: ORDER BY lower(name)
+        assert.deepEqual(artifacts.map((a) => a.name),
+          ["trg_update_gate_block_runs_insert",
+            "trg_update_gate_block_runs_update",
+            "update_gate"]);
+        assert.deepEqual(artifacts.map((a) => a.type),
+          ["trigger", "trigger", "table"]);
+        assert.deepEqual(artifacts.map((a) => a.tbl_name),
+          ["runs", "runs", "update_gate"]);
+
+        // Deep-assert each artifact's normalized SQL against canonical DDL
+        for (const a of artifacts) {
+          const nameLower = a.name.toLowerCase();
+          const expectedNormalized = normalizeDdl(EXPECTED_SQL[nameLower]);
+          const actualNormalized = normalizeDdl(a.sql);
+          assert.equal(actualNormalized, expectedNormalized,
+            `Artifact ${a.name} normalized SQL mismatch.\nExpected:\n${expectedNormalized}\nActual:\n${actualNormalized}`);
+        }
+
+        // Gate singleton: exactly one row with complete field values
+        const gateRows = db.prepare("SELECT * FROM update_gate").all() as Record<string, unknown>[];
+        assert.equal(gateRows.length, 1,
+          `Expected exactly 1 update_gate row, got ${gateRows.length}`);
+        const gate = gateRows[0] as { id: number; phase: string; mode: string };
+        assert.equal(gate.id, 1,
+          `Expected gate id=1, got ${gate.id}`);
+        assert.equal(gate.phase, "ACQUIRED",
+          `Expected gate phase=ACQUIRED, got ${gate.phase}`);
+        assert.equal(gate.mode, "current",
+          `Expected gate mode=current, got ${gate.mode}`);
+
+        // Legacy writer row race-run-1 does not exist
+        const runRow = db.prepare("SELECT id FROM runs WHERE id = ?").get("race-run-1");
+        assert.equal(runRow, undefined, "race-run-1 row must not exist");
+
+        // No other runs row was inserted
+        const runCount = (db.prepare("SELECT COUNT(*) AS cnt FROM runs").get() as { cnt: number }).cnt;
+        assert.equal(runCount, 0,
+          `Expected 0 runs rows, got ${runCount}`);
+      } finally {
+        // SIGKILL only live children (exitCode === null)
+        if (writerChild && writerChild.exitCode === null) writerChild.kill("SIGKILL");
+        if (acquirerChild && acquirerChild.exitCode === null) acquirerChild.kill("SIGKILL");
+
+        // Close parent DB handle if still open
+        if (db) {
+          try { db.close(); } catch { /* ignore */ }
+        }
+
+        // Remove temp root
+        try {
+          fs.rmSync(temp.root, { recursive: true, force: true });
+        } catch {
+          /* ignore */
+        }
       }
     },
   );
