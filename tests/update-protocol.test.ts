@@ -1337,75 +1337,261 @@ try {
     }
   });
 
-  it("live non-ancestor PID is refused", () => {
+  it("live non-ancestor PID is refused", { timeout: 60000 }, async () => {
     const temp = createTempHome("update-protocol-owner-nonanc-");
-    const dbPath = path.join(temp.root, "owner-nonanc.db");
 
-    const homeDir = temp.homeDir;
-    const env = cleanChildEnv({
-      HOME: homeDir,
-      TAMANDUA_STATE_DIR: path.join(homeDir, ".tamandua"),
-      TAMANDUA_DB_PATH: dbPath,
-    });
-
-    // Find a PID that is definitely not an ancestor and not our process.
-    // We first scan a range above our own PID to find one that doesn't exist
-    // and isn't a parent.
-    const ourPid = process.pid;
-    // Collect PIDs in our ancestry to exclude
-    const ancestryPids = new Set<number>();
-    let p = ourPid;
-    while (p > 1 && !ancestryPids.has(p)) {
-      ancestryPids.add(p);
-      try {
-        const stat = fs.readFileSync(path.join("/", "proc", String(p), "stat"), "utf-8");
-        const commEnd = stat.lastIndexOf(")");
-        const afterComm = stat.slice(commEnd + 2);
-        const fields = afterComm.split(" ");
-        p = parseInt(fields[1], 10) || 0;
-      } catch {
-        break;
-      }
-    }
-    // Find a high PID that doesn't exist
-    let nonAncestorPid = ourPid + 10000;
-    while (true) {
-      try {
-        process.kill(nonAncestorPid, 0);
-        nonAncestorPid += 1000; // PID exists, try higher
-      } catch {
-        break; // PID doesn't exist, use it
-      }
-    }
-
-    const result = spawnSync(
-      process.execPath,
-      [
-        "--input-type=module",
-        "-e",
-        `import { acquire } from ${JSON.stringify(PROTOCOL_MODULE)};
-try {
-  acquire("current", ${nonAncestorPid}, "{}", "{}", "{}");
-  console.log("UNEXPECTED: acquired with PID " + ${nonAncestorPid});
-} catch(e) {
-  console.log("REFUSED: " + e.message);
-}`,
-      ],
-      { encoding: "utf-8", env, timeout: 30000 },
-    );
-
-    assert.equal(result.status, 0);
-    assert.ok(
-      result.stdout.includes("is not an ancestor"),
-      `Expected non-ancestor refusal, got: ${result.stdout}`,
-    );
-    assert.ok(!fs.existsSync(dbPath) || !tableExists(dbPath, "update_gate"));
+    const P = process.pid;
+    let D;
+    let bodyError;
+    const cleanupErrors: Error[] = [];
+    let dClosed: Promise<{ code: number | null; signal: string | null }> | null = null;
+    let expectedDLine: string | null = null;
+    let dCloseResult: { code: number | null; signal: string | null } | null = null;
+    let dStdout = "";
+    let dStderr = "";
+    let dError: Error | undefined;
+    let readinessReject: ((err: Error) => void) | null = null;
 
     try {
-      fs.rmSync(temp.root, { recursive: true, force: true });
-    } catch {
-      /* ignore */
+      const dbPath = path.join(temp.root, "owner-nonanc.db");
+      const homeDir = temp.homeDir;
+      const env = cleanChildEnv({
+        HOME: homeDir,
+        TAMANDUA_STATE_DIR: path.join(homeDir, ".tamandua"),
+        TAMANDUA_DB_PATH: dbPath,
+      });
+
+      D = spawn(
+        process.execPath,
+        [
+          "--input-type=module",
+          "-e",
+          `import { writeSync } from "node:fs";
+writeSync(1, JSON.stringify({ pid: process.pid, parentPid: process.ppid }) + "\\n");
+const ref = setInterval(() => {}, 2147483647);`,
+        ],
+        { env, stdio: ["ignore", "pipe", "pipe"] },
+      );
+
+      dClosed = new Promise((resolve) => {
+        D.on("close", (code, signal) => {
+          resolve({ code, signal });
+        });
+      });
+
+      D.stdout.setEncoding("utf-8");
+      D.stderr.setEncoding("utf-8");
+      D.stdout.on("data", (chunk: string) => {
+        dStdout += chunk;
+      });
+      D.stderr.on("data", (chunk: string) => {
+        dStderr += chunk;
+      });
+      D.on("error", (err: Error) => {
+        dError = err;
+        if (readinessReject) readinessReject(err);
+      });
+
+      assert.ok(
+        typeof D.pid === "number" && Number.isSafeInteger(D.pid) && D.pid > 0,
+        "D PID must be canonical positive",
+      );
+      const dPid: number = D.pid;
+
+      let readinessDeadline: NodeJS.Timeout | null = null;
+      let onReadyData: (() => void) | null = null;
+      try {
+        await new Promise<void>((resolve, reject) => {
+          readinessReject = reject;
+          let readinessResolved = false;
+          readinessDeadline = setTimeout(
+            () => reject(new Error("D readiness timeout")),
+            8000,
+          );
+          onReadyData = () => {
+            if (dStdout.includes("\n") && !readinessResolved) {
+              readinessResolved = true;
+              clearTimeout(readinessDeadline!);
+              readinessDeadline = null;
+              resolve();
+            }
+          };
+          D.stdout.on("data", onReadyData);
+          onReadyData();
+        });
+      } finally {
+        if (readinessDeadline) {
+          clearTimeout(readinessDeadline);
+          readinessDeadline = null;
+        }
+        readinessReject = null;
+        if (onReadyData) {
+          D.stdout.off("data", onReadyData);
+          onReadyData = null;
+        }
+      }
+
+      expectedDLine =
+        JSON.stringify({ pid: dPid, parentPid: P }) + "\n";
+      const dReadiness = JSON.parse(dStdout.slice(0, dStdout.indexOf("\n")));
+
+      // Assert D pre-C state
+      assert.equal(dPid, dReadiness.pid);
+      assert.notEqual(dPid, P);
+      assert.deepEqual(dReadiness, { pid: dPid, parentPid: P });
+      assert.equal(dError, undefined);
+      assert.equal(D.exitCode, null);
+      process.kill(dPid, 0);
+      assert.equal(dStdout, expectedDLine);
+      assert.equal(dStderr, "");
+
+      // Spawn synchronous coordinator C: calls acquire with D.pid, catches refusal
+      const C = spawnSync(
+        process.execPath,
+        [
+          "--input-type=module",
+          "-e",
+          `import { writeSync } from "node:fs";
+import { acquire } from ${JSON.stringify(PROTOCOL_MODULE)};
+try {
+  acquire("current", ${dPid}, "{}", "{}", "{}");
+  writeSync(1, JSON.stringify({ outcome: "unexpected-success", coordinatorPid: process.pid, parentPid: process.ppid }) + "\\n");
+  process.exitCode = 2;
+} catch(e) {
+  writeSync(1, JSON.stringify({ outcome: "refused", coordinatorPid: process.pid, parentPid: process.ppid, message: e.message }) + "\\n");
+  process.exitCode = 1;
+}`,
+        ],
+        { encoding: "utf-8", env, timeout: 30000 },
+      );
+
+      // Assert C PID using canonical check
+      assert.ok(
+        typeof C.pid === "number" && Number.isSafeInteger(C.pid) && C.pid > 0,
+        "C PID must be canonical positive",
+      );
+      assert.notEqual(C.pid, dPid);
+      assert.equal(C.status, 1);
+      assert.equal(C.signal, null);
+      assert.equal(C.error, undefined);
+      assert.equal(C.stderr, "");
+
+      const expectedErrorMsg =
+        `PID ${dPid} is not an ancestor of coordinator (PID ${C.pid})`;
+      const expectedCOutput =
+        JSON.stringify({
+          outcome: "refused",
+          coordinatorPid: C.pid,
+          parentPid: P,
+          message: expectedErrorMsg,
+        }) + "\n";
+
+      // Byte-for-byte before JSON.parse
+      const cOutBuf = Buffer.from(C.stdout, "utf-8");
+      const expectedBuf = Buffer.from(expectedCOutput, "utf-8");
+      assert.ok(
+        cOutBuf.equals(expectedBuf),
+        `C stdout byte mismatch:\nexpected: ${JSON.stringify(expectedCOutput)}\nactual:   ${JSON.stringify(C.stdout)}`,
+      );
+      // Then JSON.parse + deep-equal with no extra keys
+      const cParsed = JSON.parse(C.stdout);
+      assert.deepEqual(cParsed, {
+        outcome: "refused",
+        coordinatorPid: C.pid,
+        parentPid: P,
+        message: expectedErrorMsg,
+      });
+      // Sibling topology: both parentPid equal P
+      assert.equal(cParsed.parentPid, P);
+      assert.equal(dReadiness.parentPid, P);
+
+      // Assert D post-C: still live, stdout/stderr unchanged
+      assert.equal(D.exitCode, null);
+      process.kill(dPid, 0);
+      assert.equal(dStdout, expectedDLine);
+      assert.equal(dStderr, "");
+
+      // No DB created — refusal before I/O
+      assert.ok(
+        !fs.existsSync(dbPath),
+        "DB path must not exist (refusal before I/O)",
+      );
+    } catch (e) {
+      bodyError = e instanceof Error ? e : new Error(String(e));
+    } finally {
+      // Signal only retained D and only if live
+      if (D) {
+        try {
+          if (D.exitCode === null) {
+            const killed = D.kill("SIGKILL");
+            if (!killed)
+              throw new Error("D.kill(SIGKILL) returned false");
+          }
+        } catch (e) {
+          cleanupErrors.push(
+            e instanceof Error ? e : new Error(String(e)),
+          );
+        }
+        // Await registered close promise with 5000ms deadline
+        if (dClosed) {
+          let closeDeadline: NodeJS.Timeout | null = null;
+          try {
+            const timeoutPromise = new Promise<never>((_, reject) => {
+              closeDeadline = setTimeout(
+                () => reject(new Error("D close timeout")),
+                5000,
+              );
+            });
+            dCloseResult = await Promise.race([dClosed, timeoutPromise]);
+          } catch (e) {
+            cleanupErrors.push(
+              e instanceof Error ? e : new Error(String(e)),
+            );
+          } finally {
+            if (closeDeadline) {
+              clearTimeout(closeDeadline);
+              closeDeadline = null;
+            }
+          }
+        } else {
+          cleanupErrors.push(
+            new Error("D exists but close promise is absent"),
+          );
+        }
+      }
+      // Always attempt recursive temp removal
+      try {
+        fs.rmSync(temp.root, { recursive: true, force: true });
+      } catch (e) {
+        cleanupErrors.push(
+          e instanceof Error ? e : new Error(String(e)),
+        );
+      }
     }
+
+    // Combine body and cleanup errors; AggregateError when multiple
+    const allErrors: Error[] = [];
+    if (bodyError) allErrors.push(bodyError);
+    allErrors.push(...cleanupErrors);
+    if (allErrors.length === 1) throw allErrors[0];
+    if (allErrors.length > 1)
+      throw new AggregateError(
+        allErrors,
+        `${allErrors.length} errors (body + cleanup)`,
+      );
+
+    // Success assertions only after error aggregation finds zero errors
+    assert.notEqual(expectedDLine, null, "expectedDLine must be set");
+    assert.notEqual(dCloseResult, null, "dCloseResult must be set");
+    assert.equal(dCloseResult!.code, null);
+    assert.equal(dCloseResult!.signal, "SIGKILL");
+    assert.equal(dError, undefined);
+    assert.equal(dStdout, expectedDLine);
+    assert.equal(dStderr, "");
+    assert.ok(
+      !fs.existsSync(temp.root),
+      "temp root must be absent after cleanup",
+    );
   });
 
   it("exact parent PID is stored as owner", () => {
