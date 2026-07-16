@@ -10,7 +10,7 @@
  *   inspect()
  *   casPhase(token, expectedPhase, newPhase, expectedOwnerPid, expectedOwnerIdentity)
  *   recordGuardian(token, guardianPid, guardianIdentity)
- *   fail(token, reason, details)
+ *   fail(token, expectedPhase, expectedOwnerPid, expectedOwnerIdentity, reason, details)
  *   isGateActive()
  *   validateProcessIdentity(identity)
  *   captureProcessIdentity(pid)
@@ -22,6 +22,7 @@ import os from "node:os";
 import crypto from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { spawnSync } from "node:child_process";
+import { pathToFileURL } from "node:url";
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -673,20 +674,80 @@ export function recordGuardian(token, guardianPid, guardianIdentity) {
   }
 }
 
-/**
- * Token-scoped failure. Legal from ACQUIRED or GUARDIAN_RECORDED.
- *
- * @param {string} token
- * @param {string} reason - bounded failure reason
- * @param {string} details - bounded failure details
- * @returns {{ changed: boolean, phase: string }}
- */
-export function fail(token, reason, details) {
-  const dbPath = resolveDbPath();
-  const db = new DatabaseSync(dbPath);
+// ── Token validation ─────────────────────────────────────────────────────────
 
+const TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
+
+function validateCanonicalToken(token) {
+  if (typeof token !== "string") throw new Error("Invalid capability token");
+  if (!TOKEN_RE.test(token)) throw new Error("Invalid capability token");
+  let decoded;
+  try {
+    decoded = Buffer.from(token, "base64url");
+  } catch {
+    throw new Error("Invalid capability token");
+  }
+  if (decoded.length !== 32) throw new Error("Invalid capability token");
+  const reEncoded = decoded.toString("base64url");
+  if (reEncoded !== token) throw new Error("Invalid capability token");
+}
+
+// ── fail() ───────────────────────────────────────────────────────────────────
+
+/**
+ * Strict CAS failure. All authorization predicates must match or zero rows change.
+ *
+ * @param {string} token - capability token from acquisition
+ * @param {string} expectedPhase - exactly "ACQUIRED" or "GUARDIAN_RECORDED"
+ * @param {number} expectedOwnerPid - expected owner PID
+ * @param {string} expectedOwnerIdentity - expected serialized identity
+ * @param {string} reason - bounded failure reason (1-256 UTF-8 bytes)
+ * @param {string} details - bounded failure details (0-4096 UTF-8 bytes)
+ * @returns {{ changed: boolean, phase?: string }}
+ */
+export function fail(token, expectedPhase, expectedOwnerPid, expectedOwnerIdentity, reason, details) {
+  // ── Input-only validation (before any DB work) ──────────────────────────
+  validateCanonicalToken(token);
+
+  if (expectedPhase !== "ACQUIRED" && expectedPhase !== "GUARDIAN_RECORDED") {
+    throw new Error("Invalid failure source phase");
+  }
+
+  if (!Number.isSafeInteger(expectedOwnerPid) || expectedOwnerPid < 1) {
+    throw new Error("Invalid expected owner PID");
+  }
+
+  validateProcessIdentity(expectedOwnerIdentity);
+
+  if (typeof reason !== "string" || reason.length === 0) {
+    throw new Error("Invalid failure reason");
+  }
+  if (Buffer.byteLength(reason, "utf-8") > 256) {
+    throw new Error("Invalid failure reason");
+  }
+
+  if (typeof details !== "string") {
+    throw new Error("Invalid failure details");
+  }
+  if (Buffer.byteLength(details, "utf-8") > 4096) {
+    throw new Error("Invalid failure details");
+  }
+
+  // ── No-create DB open ──────────────────────────────────────────────────
+  const dbPath = resolveDbPath();
+  let db;
+  try {
+    const dbUrl = pathToFileURL(dbPath);
+    dbUrl.searchParams.set("mode", "rw");
+    db = new DatabaseSync(dbUrl.href);
+  } catch {
+    return { changed: false };
+  }
+
+  let inTransaction = false;
   try {
     db.exec("BEGIN IMMEDIATE");
+    inTransaction = true;
 
     const now = new Date().toISOString();
     const result = db
@@ -698,35 +759,41 @@ export function fail(token, reason, details) {
              updated_at = ?
          WHERE id = ?
            AND token = ?
-           AND phase IN ('ACQUIRED', 'GUARDIAN_RECORDED')`,
+           AND phase = ?
+           AND owner_pid = ?
+           AND owner_identity = ?`,
       )
       .run(
-        bust(BOUND, "failure_reason", reason),
-        bust(BOUND, "failure_details", details),
+        reason,
+        details,
         now,
         SINGLETON_ID,
         token,
+        expectedPhase,
+        expectedOwnerPid,
+        expectedOwnerIdentity,
       );
 
-    if (result.changes === 0) {
+    if (result.changes !== 1) {
       db.exec("ROLLBACK");
-      const current = getGateRow(db);
-      db.close();
-      return {
-        changed: false,
-        phase: current?.phase ?? null,
-      };
+      inTransaction = false;
+      return { changed: false };
     }
 
     db.exec("COMMIT");
+    inTransaction = false;
     return { changed: true, phase: "FAILED" };
   } catch (e) {
-    try {
-      db.exec("ROLLBACK");
-    } catch {
-      // ignore
+    if (inTransaction) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {
+        // ignore
+      }
+      inTransaction = false;
     }
-    throw e;
+    // Generic refusal for absent gate table, corrupt DB, or any SQL error
+    return { changed: false };
   } finally {
     try {
       db.close();

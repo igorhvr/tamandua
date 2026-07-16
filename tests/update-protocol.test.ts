@@ -1316,8 +1316,8 @@ console.log(JSON.stringify(r));`,
     assert.equal(result.status, 0, `Acquire failed: ${result.stderr}`);
     const data = JSON.parse(result.stdout.trim());
     const token = data.token;
-    const ownerPid = process.ppid;
-    const ownerIdentity = getGateOwnerIdentity(dbPath);
+    const ownerPid = data.ownerPid;
+    const ownerIdentity = data.ownerIdentity;
     return { temp, dbPath, env, token, ownerPid, ownerIdentity };
   }
 
@@ -1365,7 +1365,7 @@ console.log(JSON.stringify(r));`,
   });
 
   it("ACQUIRED -> FAILED is legal", () => {
-    const { token, env } = setupAndAcquire();
+    const { token, env, ownerPid, ownerIdentity } = setupAndAcquire();
 
     const result = spawnSync(
       process.execPath,
@@ -1373,7 +1373,7 @@ console.log(JSON.stringify(r));`,
         "--input-type=module",
         "-e",
         `import { fail } from ${JSON.stringify(PROTOCOL_MODULE)};
-const r = fail(${JSON.stringify(token)}, "reason", "details");
+const r = fail(${JSON.stringify(token)}, "ACQUIRED", ${ownerPid}, ${JSON.stringify(ownerIdentity)}, "reason", "details");
 console.log(JSON.stringify(r));`,
       ],
       { encoding: "utf-8", env, timeout: 30000 },
@@ -1385,7 +1385,7 @@ console.log(JSON.stringify(r));`,
   });
 
   it("GUARDIAN_RECORDED -> FAILED is legal", () => {
-    const { token, env } = setupAndAcquire();
+    const { token, env, ownerPid, ownerIdentity } = setupAndAcquire();
 
     // First record guardian
     const gr = spawnSync(
@@ -1408,7 +1408,7 @@ console.log(JSON.stringify(r));`,
         "--input-type=module",
         "-e",
         `import { fail } from ${JSON.stringify(PROTOCOL_MODULE)};
-const r = fail(${JSON.stringify(token)}, "reason", "details");
+const r = fail(${JSON.stringify(token)}, "GUARDIAN_RECORDED", ${ownerPid}, ${JSON.stringify(ownerIdentity)}, "reason", "details");
 console.log(JSON.stringify(r));`,
       ],
       { encoding: "utf-8", env, timeout: 30000 },
@@ -1429,7 +1429,7 @@ console.log(JSON.stringify(r));`,
         "--input-type=module",
         "-e",
         `import { fail } from ${JSON.stringify(PROTOCOL_MODULE)};
-fail(${JSON.stringify(token)}, "reason", "details");`,
+fail(${JSON.stringify(token)}, "ACQUIRED", ${ownerPid}, ${JSON.stringify(ownerIdentity)}, "reason", "details");`,
       ],
       { encoding: "utf-8", env, timeout: 30000 },
     );
@@ -1452,7 +1452,7 @@ fail(${JSON.stringify(token)}, "reason", "details");`,
   });
 
   it("FAILED row still blocks writers", () => {
-    const { token, env, dbPath } = setupAndAcquire();
+    const { token, env, dbPath, ownerPid, ownerIdentity } = setupAndAcquire();
 
     // Fail the gate
     spawnSync(
@@ -1461,7 +1461,7 @@ fail(${JSON.stringify(token)}, "reason", "details");`,
         "--input-type=module",
         "-e",
         `import { fail } from ${JSON.stringify(PROTOCOL_MODULE)};
-fail(${JSON.stringify(token)}, "reason", "details");`,
+fail(${JSON.stringify(token)}, "ACQUIRED", ${ownerPid}, ${JSON.stringify(ownerIdentity)}, "reason", "details");`,
       ],
       { encoding: "utf-8", env, timeout: 30000 },
     );
