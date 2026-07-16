@@ -172,40 +172,6 @@ function getTableNames(dbPath) {
   }
 }
 
-/**
- * Get pragma user_version.
- */
-function getUserVersion(dbPath) {
-  const db = new DatabaseSync(dbPath);
-  try {
-    const row = db.prepare("PRAGMA user_version").get();
-    return row.user_version;
-  } finally {
-    db.close();
-  }
-}
-
-/**
- * Count runs in a database.
- */
-function countRuns(dbPath) {
-  const db = new DatabaseSync(dbPath);
-  try {
-    const row = db.prepare("SELECT COUNT(*) AS cnt FROM runs").get();
-    return row.cnt;
-  } finally {
-    db.close();
-  }
-}
-
-/**
- * Compute a simple file hash.
- */
-function fileHash(filePath) {
-  if (!fs.existsSync(filePath)) return null;
-  const content = fs.readFileSync(filePath);
-  return crypto.createHash("sha256").update(content).digest("hex");
-}
 
 // ── DB-PATH: explicit TAMANDUA_DB_PATH wins ──────────────────────────────
 
