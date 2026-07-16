@@ -514,8 +514,9 @@ describe("RACE conditions", () => {
       const barrierDir = path.join(temp.root, "barriers");
       fs.mkdirSync(barrierDir, { recursive: true });
 
-      const writerGo = path.join(barrierDir, "writer-go"); // acquirer writes, writer waits
-      const writerDone = path.join(barrierDir, "writer-done"); // writer writes, acquirer waits
+      const writerLocked = path.join(barrierDir, "writer-locked");
+      const acquirerBusyObserved = path.join(barrierDir, "acquirer-busy-observed");
+      const writerCommitted = path.join(barrierDir, "writer-committed");
 
       const env = cleanChildEnv({
         HOME: temp.homeDir,
@@ -540,107 +541,219 @@ console.log("cold init done");`,
       );
       assert.equal(initResult.status, 0, `Cold init failed: ${initResult.stderr}`);
 
-      // Writer: starts transaction, signals ready, waits, commits running run, signals done
+      // Shared barrier-wait helper (synchronous polling via Atomics.wait, no setTimeout)
+      const barrierWaitFn = `
+function barrierWait(barrierPath, name, timeoutMs) {
+  const sab = new SharedArrayBuffer(4);
+  const i32 = new Int32Array(sab);
+  const deadline = Date.now() + timeoutMs;
+  while (!fs.existsSync(barrierPath)) {
+    if (Date.now() > deadline) {
+      throw new Error("barrier " + name + " not observed within " + timeoutMs + "ms");
+    }
+    Atomics.wait(i32, 0, 0, 50);
+  }
+}`;
+
+      // Writer: takes BEGIN IMMEDIATE with busy_timeout=0, signals locked,
+      // waits for acquirer BUSY observation, commits running run, signals done
       const writerCode = `
 import { DatabaseSync } from "node:sqlite";
 import fs from "node:fs";
 const dbPath = process.env.TAMANDUA_DB_PATH;
-const writerGo = ${JSON.stringify(writerGo)};
-const writerDone = ${JSON.stringify(writerDone)};
+const writerLocked = ${JSON.stringify(writerLocked)};
+const acquirerBusyObserved = ${JSON.stringify(acquirerBusyObserved)};
+const writerCommitted = ${JSON.stringify(writerCommitted)};
 
-// Open DB and BEGIN IMMEDIATE
+${barrierWaitFn}
+
 const db = new DatabaseSync(dbPath);
+db.exec("PRAGMA busy_timeout = 0");
 db.exec("BEGIN IMMEDIATE");
 
-// Notify acquirer we hold the lock
-fs.writeFileSync(writerGo, "ready");
+// Signal: writer now holds the SQLite writer lock
+fs.writeFileSync(writerLocked, "");
 
-// Wait for acquirer to also reach its BEGIN IMMEDIATE (blocked)
-// Give it 2 seconds to start its attempt
-await new Promise(r => setTimeout(r, 2000));
+// Wait for acquirer to observe real BUSY-5 — progress is event-driven
+barrierWait(acquirerBusyObserved, "acquirer-busy-observed", 15000);
 
-// Insert running run and commit
+// Now insert running run and commit
 db.prepare("INSERT INTO runs (id, workflow_id, task, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)")
   .run("race-run-1", "wf-1", "task", "running", new Date().toISOString(), new Date().toISOString());
 db.exec("COMMIT");
 db.close();
 
-// Notify acquirer that writer committed
-fs.writeFileSync(writerDone, "done");
+// Signal: writer committed — acquirer can now retry
+fs.writeFileSync(writerCommitted, "");
 process.exit(0);
 `;
 
-      // Acquirer: waits for writer to signal, then tries to acquire (will be blocked)
+      // Acquirer: waits for writer lock, monkeypatches DatabaseSync.prototype.exec
+      // to intercept the first BEGIN IMMEDIATE, observes real BUSY-5,
+      // waits for writer commit, retries, and calls real production acquire()
       const acquirerCode = `
 import fs from "node:fs";
-import { acquire } from ${JSON.stringify(PROTOCOL_MODULE)};
-const writerGo = ${JSON.stringify(writerGo)};
-const writerDone = ${JSON.stringify(writerDone)};
+import { DatabaseSync } from "node:sqlite";
+const writerLocked = ${JSON.stringify(writerLocked)};
+const acquirerBusyObserved = ${JSON.stringify(acquirerBusyObserved)};
+const writerCommitted = ${JSON.stringify(writerCommitted)};
 
-// Wait for writer to signal it has the lock
-while (!fs.existsSync(writerGo)) {
-  await new Promise(r => setTimeout(r, 50));
-}
+${barrierWaitFn}
 
-// Now try to acquire — writer holds BEGIN IMMEDIATE, so we'll block briefly
-// When writer commits, we'll see the running run and refuse
-try {
-  acquire("current", process.ppid, "{}", "{}", "{}");
-  console.log("UNEXPECTED_ACQUIRE");
-} catch(e) {
-  if (e.message.includes("Active work exists")) {
-    console.log("REFUSED: " + e.message);
-  } else {
-    console.log("OTHER_ERROR: " + e.message);
+// Wait for writer to signal it holds the lock
+barrierWait(writerLocked, "writer-locked", 15000);
+
+// Monkeypatch DatabaseSync.prototype.exec to intercept the first BEGIN IMMEDIATE
+const originalExec = DatabaseSync.prototype.exec;
+let busyAttemptCount = 0;
+let retryCount = 0;
+
+DatabaseSync.prototype.exec = function(sql) {
+  if (sql === "BEGIN IMMEDIATE" && busyAttemptCount === 0) {
+    // First BEGIN IMMEDIATE from production acquire().
+    // Try with busy_timeout=0 while writer holds the lock — must get BUSY-5.
+    originalExec.call(this, "PRAGMA busy_timeout = 0");
+    busyAttemptCount++;
+    try {
+      originalExec.call(this, "BEGIN IMMEDIATE");
+      // Unexpected success — roll back best-effort and throw
+      try { originalExec.call(this, "ROLLBACK"); } catch (_) {}
+      throw new Error("UNEXPECTED: BEGIN IMMEDIATE succeeded while writer held lock");
+    } catch (e) {
+      if (e.code === "ERR_SQLITE_ERROR" && e.errcode === 5) {
+        // Real BUSY-5 observed — PROOF the writer held the lock
+        fs.writeFileSync(acquirerBusyObserved, "");
+      } else {
+        try { originalExec.call(this, "ROLLBACK"); } catch (_) {}
+        throw e;
+      }
+    }
+
+    // Wait for writer to commit before retrying
+    barrierWait(writerCommitted, "writer-committed", 15000);
+
+    // Restore production busy_timeout and retry BEGIN IMMEDIATE
+    originalExec.call(this, "PRAGMA busy_timeout = 10000");
+    retryCount++;
+    return originalExec.call(this, "BEGIN IMMEDIATE");
   }
+
+  return originalExec.call(this, sql);
+};
+
+// Dynamically import and call the real production acquire()
+try {
+  const mod = await import(${JSON.stringify(PROTOCOL_MODULE)});
+  try {
+    mod.acquire("current", process.ppid, "{}", "{}", "{}");
+    const result = { busyAttemptCount, retryCount, refused: false, error: null };
+    fs.writeSync(1, JSON.stringify(result) + "\\n");
+  } catch (e) {
+    const refused = e.message === "Active work exists — acquisition refused";
+    const result = { busyAttemptCount, retryCount, refused, error: e.message };
+    fs.writeSync(1, JSON.stringify(result) + "\\n");
+  }
+} catch (e) {
+  throw new Error("Import failed: " + e.message);
 }
-process.exit(0);
+
+process.exitCode = 0;
 `;
 
-      // Start both children
-      const writerChild = spawn(process.execPath, ["--input-type=module", "-e", writerCode], {
-        env,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-      const acquirerChild = spawn(process.execPath, ["--input-type=module", "-e", acquirerCode], {
-        env,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-
-      const writerPromise = new Promise((resolve) => {
-        let out = "";
-        writerChild.stdout.on("data", (d) => { out += d.toString(); });
-        writerChild.on("close", (code) => resolve({ code, out }));
-      });
-      const acquirerPromise = new Promise((resolve) => {
-        let out = "";
-        acquirerChild.stdout.on("data", (d) => { out += d.toString(); });
-        acquirerChild.on("close", (code) => resolve({ code, out }));
-      });
-
-      const [writerResult, acquirerResult] = await Promise.all([
-        writerPromise,
-        acquirerPromise,
-      ]) as [{ code: number; out: string }, { code: number; out: string }];
-
-      writerChild.kill("SIGKILL");
-      acquirerChild.kill("SIGKILL");
-
-      // Writer should have committed successfully
-      assert.equal(writerResult.code, 0, `Writer failed: ${writerResult.out}`);
-      // Acquirer should have been refused
-      assert.ok(
-        acquirerResult.out.includes("REFUSED: Active work exists"),
-        `Expected refusal, got: ${acquirerResult.out}`,
-      );
-
-      // Verify no gate residue
-      assert.ok(!tableExists(dbPath, "update_gate"), "No gate table should remain after refusal");
+      // Declare child handles before try so finally can always reach them
+      let writerChild, acquirerChild;
+      let db;
 
       try {
-        fs.rmSync(temp.root, { recursive: true, force: true });
-      } catch {
-        /* ignore */
+        // Spawn both children — capture stdout AND stderr
+        writerChild = spawn(process.execPath, ["--input-type=module", "-e", writerCode], {
+          env,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        acquirerChild = spawn(process.execPath, ["--input-type=module", "-e", acquirerCode], {
+          env,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+
+        let writerStdout = "", writerStderr = "";
+        writerChild.stdout.on("data", (d) => { writerStdout += d.toString(); });
+        writerChild.stderr.on("data", (d) => { writerStderr += d.toString(); });
+        let acquirerStdout = "", acquirerStderr = "";
+        acquirerChild.stdout.on("data", (d) => { acquirerStdout += d.toString(); });
+        acquirerChild.stderr.on("data", (d) => { acquirerStderr += d.toString(); });
+
+        // Close promises: resolve on close, reject on error so spawn failures don't hang
+        const writerClose = new Promise((resolve, reject) => {
+          writerChild.on("close", (code) => resolve(code));
+          writerChild.on("error", (err) => reject(err));
+        });
+        const acquirerClose = new Promise((resolve, reject) => {
+          acquirerChild.on("close", (code) => resolve(code));
+          acquirerChild.on("error", (err) => reject(err));
+        });
+
+        const [writerExitCode, acquirerExitCode] = await Promise.all([
+          writerClose,
+          acquirerClose,
+        ]) as [number, number];
+
+        // Writer should have committed successfully
+        assert.equal(writerExitCode, 0,
+          `Writer failed (exit ${writerExitCode}): stderr=${writerStderr}`);
+
+        // Acquirer should exit 0 with structured JSON output
+        assert.equal(acquirerExitCode, 0,
+          `Acquirer failed (exit ${acquirerExitCode}): stderr=${acquirerStderr}`);
+
+        // Parse exactly one JSON line from stdout
+        let acquirerResult;
+        try {
+          acquirerResult = JSON.parse(acquirerStdout.trim());
+        } catch {
+          assert.fail(`Acquirer stdout is not valid JSON: ${acquirerStdout}`);
+        }
+
+        // Assert exact numeric counters and exact refusal message
+        assert.equal(acquirerResult.busyAttemptCount, 1,
+          `Expected busyAttemptCount=1, got ${JSON.stringify(acquirerResult)}`);
+        assert.equal(acquirerResult.retryCount, 1,
+          `Expected retryCount=1, got ${JSON.stringify(acquirerResult)}`);
+        assert.equal(acquirerResult.refused, true,
+          `Expected refused=true, got ${JSON.stringify(acquirerResult)}`);
+        assert.equal(acquirerResult.error, "Active work exists — acquisition refused",
+          `Expected exact refusal message, got ${JSON.stringify(acquirerResult)}`);
+
+        // Verify the writer's run row exists with expected state
+        db = new DatabaseSync(dbPath);
+        const row = db.prepare("SELECT id, status FROM runs WHERE id = ?").get("race-run-1");
+        assert.ok(row, "race-run-1 row must exist after writer commit");
+        assert.equal(row.status, "running",
+          `Expected status=running, got ${row.status}`);
+
+        // Query main.sqlite_schema for all three reserved protocol artifact names
+        const residue = db.prepare(
+          "SELECT lower(name) as name FROM main.sqlite_schema WHERE lower(name) IN (" +
+          "'update_gate', 'trg_update_gate_block_runs_insert', " +
+          "'trg_update_gate_block_runs_update')"
+        ).all();
+        assert.equal(residue.length, 0,
+          `Expected zero protocol artifact residue, got: ${JSON.stringify(residue)}`);
+      } finally {
+        // Terminate any still-live children (SIGKILL for deterministic cleanup)
+        if (writerChild && writerChild.exitCode === null) writerChild.kill("SIGKILL");
+        if (acquirerChild && acquirerChild.exitCode === null) acquirerChild.kill("SIGKILL");
+
+        // Close parent DB handle if still open
+        if (db) {
+          try { db.close(); } catch { /* ignore */ }
+        }
+
+        // Remove the temp root
+        try {
+          fs.rmSync(temp.root, { recursive: true, force: true });
+        } catch {
+          /* ignore */
+        }
       }
     },
   );
