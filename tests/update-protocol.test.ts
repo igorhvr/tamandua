@@ -2020,3 +2020,97 @@ describe("coordinator-contract", () => {
     }
   });
 });
+
+// ── ACQUIRE: protocol artifact integrity ────────────────────────────────
+
+describe("acquire protocol artifact integrity", () => {
+  const CE = "Update protocol artifacts are corrupted — acquisition refused";
+  const AE = "Update gate already exists — acquisition refused";
+
+  function snap(dbPath) {
+    const d = new DatabaseSync(dbPath);
+    try {
+      const schema = (d.prepare("SELECT type, name, tbl_name, sql FROM main.sqlite_schema ORDER BY type, name, tbl_name").all() as any)
+        .map((r: any) => ({ type: r.type, name: r.name, tbl_name: r.tbl_name, sql: r.sql }));
+      const sv = (d.prepare("PRAGMA schema_version").get() as any).schema_version;
+      const uv = (d.prepare("PRAGMA user_version").get() as any).user_version;
+      let runs: { id: string; status: string }[] = [];
+      try {
+        runs = (d.prepare("SELECT id, status FROM runs ORDER BY id").all() as any)
+          .map((r: any) => ({ id: r.id, status: r.status }));
+      } catch { /* */ }
+      const hasTable = schema.some(
+        (r: any) => r.type === "table" && r.name.toLowerCase() === "update_gate"
+      );
+      let gateRowCount: number | null = null;
+      if (hasTable) {
+        gateRowCount = (d.prepare("SELECT COUNT(*) AS cnt FROM update_gate").get() as any).cnt;
+      }
+      return { schema, sv, uv, runs, gateRowCount };
+    } finally { d.close(); }
+  }
+
+  function aq(env: Record<string, string>) {
+    return spawnSync(process.execPath, ["--input-type=module", "-e",
+      `import { acquire } from ${JSON.stringify(PROTOCOL_MODULE)};
+try { const r = acquire("current", process.ppid, "{}", "{}", "{}"); console.log(JSON.stringify(r)); } catch(e) { console.log("ERROR:" + e.message); process.exit(1); }`],
+      { encoding: "utf-8", env, timeout: 30000 });
+  }
+
+  function env(temp: ReturnType<typeof createTempHome>, dp: string) {
+    return cleanChildEnv({ HOME: temp.homeDir, TAMANDUA_STATE_DIR: path.join(temp.homeDir, ".tamandua"), TAMANDUA_DB_PATH: dp });
+  }
+
+  function mutateDb(dp: string, sql: string[]) {
+    const d = new DatabaseSync(dp);
+    try { for (const s of sql) d.exec(s); } finally { d.close(); }
+  }
+
+  it("fresh acquisition produces exact canonical artifacts with blocking behavior", () => {
+    const t = createTempHome("upgx-fresh-");
+    try {
+      const dp = path.join(t.root, "f.db");
+      assert.equal(aq(env(t, dp)).status, 0);
+      const s = snap(dp);
+      const reservedNames = ["update_gate", "trg_update_gate_block_runs_insert", "trg_update_gate_block_runs_update"];
+      const reserved = s.schema.filter((r: any) => reservedNames.includes(r.name));
+      assert.equal(reserved.length, 3);
+      assert.deepEqual(reserved.map((r: any) => r.name), ["update_gate", "trg_update_gate_block_runs_insert", "trg_update_gate_block_runs_update"]);
+      assert.deepEqual(reserved.map((r: any) => r.type), ["table", "trigger", "trigger"]);
+      assert.deepEqual(reserved.map((r: any) => r.tbl_name), ["update_gate", "runs", "runs"]);
+      for (const a of reserved) assert.ok(typeof a.sql === "string" && a.sql!.length > 0, `${a.name} sql empty`);
+      assert.equal(s.gateRowCount, 1, "gate singleton missing");
+      const db = new DatabaseSync(dp);
+      try {
+        assert.throws(() => db.prepare("INSERT INTO runs (id, workflow_id, task, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)").run("t", "w", "x", "running", new Date().toISOString(), new Date().toISOString()), /update in progress/);
+      } finally { db.close(); }
+    } finally { try { fs.rmSync(t.root, { recursive: true, force: true }); } catch { /* */ } }
+  });
+
+  it("fail-closed matrix: seven states refuse without mutation", () => {
+    const cases: Array<{ label: string; sql: string[]; err: string }> = [
+      { label: "canonical-but-empty", sql: ["DELETE FROM update_gate WHERE id = 1"], err: AE },
+      { label: "partial-set", sql: ["DELETE FROM update_gate WHERE id = 1", "DROP TRIGGER trg_update_gate_block_runs_insert"], err: CE },
+      { label: "malformed-table", sql: ["DELETE FROM update_gate WHERE id = 1", "DROP TABLE update_gate", "CREATE TABLE update_gate (x INTEGER)"], err: CE },
+      { label: "wrong-def-trigger", sql: ["DELETE FROM update_gate WHERE id = 1", "DROP TRIGGER trg_update_gate_block_runs_insert", "CREATE TRIGGER trg_update_gate_block_runs_insert BEFORE INSERT ON runs BEGIN SELECT RAISE(ABORT, 'wrong'); END"], err: CE },
+      { label: "mixed-view", sql: ["DELETE FROM update_gate WHERE id = 1", "DROP TABLE update_gate", 'CREATE VIEW "Update_Gate" AS SELECT 1'], err: CE },
+      { label: "mixed-index", sql: ["DELETE FROM update_gate WHERE id = 1", "DROP TABLE update_gate", 'CREATE INDEX "Update_Gate" ON runs(status)'], err: CE },
+      { label: "wrong-type-mixed", sql: ["DELETE FROM update_gate WHERE id = 1", "DROP TRIGGER trg_update_gate_block_runs_insert", 'CREATE TABLE "Trg_Update_Gate_Block_Runs_Insert" (x INTEGER)'], err: CE },
+    ];
+    for (const c of cases) {
+      const t = createTempHome(`upgx-mx-${c.label}-`);
+      try {
+        const dp = path.join(t.root, "mx.db");
+        const e = env(t, dp);
+        assert.equal(aq(e).status, 0, `[${c.label}] first acquire failed`);
+        mutateDb(dp, c.sql);
+        const before = snap(dp);
+        const r = aq(e);
+        assert.notEqual(r.status, 0, `[${c.label}] expected refusal`);
+        assert.equal(r.stdout, `ERROR:${c.err}\n`, `[${c.label}] stdout mismatch`);
+        assert.equal(r.stderr, '', `[${c.label}] stderr not empty`);
+        assert.deepEqual(snap(dp), before, `[${c.label}] state mutated`);
+      } finally { try { fs.rmSync(t.root, { recursive: true, force: true }); } catch { /* */ } }
+    }
+  });
+});

@@ -293,49 +293,127 @@ function getParentPid(pid) {
 
 // ── Gate table DDL ───────────────────────────────────────────────────────────
 
-function createGateTable(db) {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS ${GATE_TABLE} (
-      id INTEGER PRIMARY KEY CHECK (id = ${SINGLETON_ID}),
-      token TEXT NOT NULL,
-      mode TEXT NOT NULL CHECK (mode IN ('legacy', 'current')),
-      phase TEXT NOT NULL CHECK (phase IN ('ACQUIRED', 'GUARDIAN_RECORDED', 'FAILED')),
-      owner_pid INTEGER NOT NULL,
-      owner_identity TEXT NOT NULL,
-      guardian_pid INTEGER,
-      guardian_identity TEXT,
-      topology TEXT NOT NULL,
-      artifacts TEXT NOT NULL,
-      readiness TEXT NOT NULL,
-      failure_reason TEXT,
-      failure_details TEXT,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
-  `);
+// ── Canonical protocol artifact DDL (without IF NOT EXISTS) ─────────────
+
+const RESERVED_NAMES_LOWER = Object.freeze([
+  "update_gate",
+  "trg_update_gate_block_runs_insert",
+  "trg_update_gate_block_runs_update",
+]);
+
+const CANONICAL_TYPES = Object.freeze({
+  update_gate: "table",
+  trg_update_gate_block_runs_insert: "trigger",
+  trg_update_gate_block_runs_update: "trigger",
+});
+
+const CANONICAL_TBL_NAMES = Object.freeze({
+  update_gate: "update_gate",
+  trg_update_gate_block_runs_insert: "runs",
+  trg_update_gate_block_runs_update: "runs",
+});
+
+const CANONICAL_GATE_DDL = `CREATE TABLE ${GATE_TABLE} (
+  id INTEGER PRIMARY KEY CHECK (id = ${SINGLETON_ID}),
+  token TEXT NOT NULL,
+  mode TEXT NOT NULL CHECK (mode IN ('legacy', 'current')),
+  phase TEXT NOT NULL CHECK (phase IN ('ACQUIRED', 'GUARDIAN_RECORDED', 'FAILED')),
+  owner_pid INTEGER NOT NULL,
+  owner_identity TEXT NOT NULL,
+  guardian_pid INTEGER,
+  guardian_identity TEXT,
+  topology TEXT NOT NULL,
+  artifacts TEXT NOT NULL,
+  readiness TEXT NOT NULL,
+  failure_reason TEXT,
+  failure_details TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+)`;
+
+const CANONICAL_TRIGGER_INSERT_DDL = `CREATE TRIGGER trg_update_gate_block_runs_insert
+BEFORE INSERT ON runs
+WHEN EXISTS (SELECT 1 FROM ${GATE_TABLE} WHERE id = ${SINGLETON_ID})
+BEGIN
+  SELECT RAISE(ABORT, 'update in progress');
+END`;
+
+const CANONICAL_TRIGGER_UPDATE_DDL = `CREATE TRIGGER trg_update_gate_block_runs_update
+BEFORE UPDATE OF status ON runs
+WHEN EXISTS (SELECT 1 FROM ${GATE_TABLE} WHERE id = ${SINGLETON_ID})
+  AND NEW.status = 'running' AND OLD.status != 'running'
+BEGIN
+  SELECT RAISE(ABORT, 'update in progress');
+END`;
+
+const CANONICAL_SQL = Object.freeze({
+  update_gate: CANONICAL_GATE_DDL,
+  trg_update_gate_block_runs_insert: CANONICAL_TRIGGER_INSERT_DDL,
+  trg_update_gate_block_runs_update: CANONICAL_TRIGGER_UPDATE_DDL,
+});
+
+// ── DDL normalization ───────────────────────────────────────────────────
+
+function normalizeDdl(sql) {
+  if (sql === null) return null;
+  let s = sql.trim();
+  while (s.endsWith(";")) {
+    s = s.slice(0, -1).trimEnd();
+  }
+  return s;
 }
 
-function createBlockingTriggers(db) {
-  // Trigger: block INSERT into runs when update gate exists
-  db.exec(`
-    CREATE TRIGGER IF NOT EXISTS trg_update_gate_block_runs_insert
-    BEFORE INSERT ON runs
-    WHEN EXISTS (SELECT 1 FROM ${GATE_TABLE} WHERE id = ${SINGLETON_ID})
-    BEGIN
-      SELECT RAISE(ABORT, 'update in progress');
-    END;
-  `);
+// ── Reserved artifact lookup ────────────────────────────────────────────
 
-  // Trigger: block status transition INTO 'running' when update gate exists
-  db.exec(`
-    CREATE TRIGGER IF NOT EXISTS trg_update_gate_block_runs_update
-    BEFORE UPDATE OF status ON runs
-    WHEN EXISTS (SELECT 1 FROM ${GATE_TABLE} WHERE id = ${SINGLETON_ID})
-      AND NEW.status = 'running' AND OLD.status != 'running'
-    BEGIN
-      SELECT RAISE(ABORT, 'update in progress');
-    END;
-  `);
+function lookupReservedArtifacts(db) {
+  const placeholders = RESERVED_NAMES_LOWER.map(() => "?").join(", ");
+  return db
+    .prepare(
+      `SELECT type, name, tbl_name, sql FROM main.sqlite_schema WHERE lower(name) IN (${placeholders}) ORDER BY lower(name)`,
+    )
+    .all(...RESERVED_NAMES_LOWER);
+}
+
+// ── Artifact set validation ─────────────────────────────────────────────
+
+function validateArtifactSet(rows) {
+  if (rows.length !== 3) return { canonical: false };
+
+  const seen = new Set();
+  for (const row of rows) {
+    // Exact stored-name validation: must be a canonical lowercase name
+    if (!RESERVED_NAMES_LOWER.includes(row.name)) return { canonical: false };
+    // Uniqueness: each canonical name must appear exactly once
+    if (seen.has(row.name)) return { canonical: false };
+    seen.add(row.name);
+
+    const nameLower = row.name.toLowerCase();
+    if (row.type !== CANONICAL_TYPES[nameLower]) return { canonical: false };
+    if (row.tbl_name !== CANONICAL_TBL_NAMES[nameLower]) return { canonical: false };
+    if (row.sql === null) return { canonical: false };
+    if (normalizeDdl(row.sql) !== normalizeDdl(CANONICAL_SQL[nameLower])) {
+      return { canonical: false };
+    }
+  }
+
+  // Prove all three canonical names appear exactly once
+  if (seen.size !== 3) return { canonical: false };
+  for (const name of RESERVED_NAMES_LOWER) {
+    if (!seen.has(name)) return { canonical: false };
+  }
+
+  return { canonical: true };
+}
+
+// ── Canonical DDL creation (no IF NOT EXISTS) ───────────────────────────
+
+function createGateTableCanonical(db) {
+  db.exec(CANONICAL_GATE_DDL);
+}
+
+function createBlockingTriggersCanonical(db) {
+  db.exec(CANONICAL_TRIGGER_INSERT_DDL);
+  db.exec(CANONICAL_TRIGGER_UPDATE_DDL);
 }
 
 function dropGateAndTriggers(db) {
@@ -424,32 +502,43 @@ export function acquire(mode, updaterPid, topology, artifacts, readiness) {
     coldInitDb(dbPath);
   }
 
-  // Open for preflight check (no persistent PRAGMA changes)
+  // Open DB and set busy_timeout before any acquisition predicate
   const db = new DatabaseSync(dbPath);
-  // Set busy_timeout so we don't fail on WAL lock contention during
-  // concurrent writer scenarios. This is not a persistent PRAGMA.
   db.exec("PRAGMA busy_timeout = 10000");
 
   try {
-    // Check for existing gate: fail-closed if ANY row exists
-    if (gateExists(db)) {
-      throw new Error("Update gate already exists — acquisition refused");
-    }
-
-    // Open transaction
+    // BEGIN IMMEDIATE as the first acquisition predicate — no gateExists() before the lock
     db.exec("BEGIN IMMEDIATE");
 
     try {
-      // Check for active work
+      // Inspect reserved artifacts under the writer lock
+      const existing = lookupReservedArtifacts(db);
+
+      if (existing.length > 0) {
+        const validation = validateArtifactSet(existing);
+        if (validation.canonical) {
+          throw new Error("Update gate already exists — acquisition refused");
+        }
+        throw new Error("Update protocol artifacts are corrupted — acquisition refused");
+      }
+
+      // No reserved artifacts exist — create canonical set
+      createGateTableCanonical(db);
+      createBlockingTriggersCanonical(db);
+
+      // Read back and validate created artifacts
+      const created = lookupReservedArtifacts(db);
+      const postValidation = validateArtifactSet(created);
+      if (!postValidation.canonical) {
+        throw new Error("Update protocol artifact validation failed after creation");
+      }
+
+      // Only after validated canonical artifacts exist, check for active work
       if (hasRunningOrPausedWork(db)) {
         throw new Error("Active work exists — acquisition refused");
       }
 
-      // Create gate table and triggers
-      createGateTable(db);
-      createBlockingTriggers(db);
-
-      // Insert singleton row
+      // Insert singleton ACQUIRED row
       const token = crypto.randomBytes(32).toString("base64url");
       const now = new Date().toISOString();
 
@@ -474,11 +563,8 @@ export function acquire(mode, updaterPid, topology, artifacts, readiness) {
 
       return { token, phase: "ACQUIRED", mode, ownerPid: updaterPid, ownerIdentity };
     } catch (e) {
-      // Rollback on any failure — gate, triggers, and run data remain unchanged
+      // Rollback on any failure after BEGIN IMMEDIATE — no DDL, gate row, or mutation survives
       db.exec("ROLLBACK");
-      // The gate table/triggers may have been created in this transaction
-      // before the error — they get rolled back too since they're in the
-      // same transaction.
       throw e;
     }
   } finally {
