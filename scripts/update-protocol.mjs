@@ -169,30 +169,31 @@ function captureProcessIdentity(pid) {
 function captureLinuxIdentity(pid) {
   let bootId;
   try {
-    bootId = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf-8").trim();
+    bootId = fs.readFileSync(path.join("/", "proc", "sys", "kernel", "random", "boot_id"), "utf-8").trim();
   } catch {
     throw new Error("Cannot read boot_id");
   }
 
+  const statPath = path.join("/", "proc", String(pid), "stat");
   let startTicks;
   try {
-    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf-8");
+    const stat = fs.readFileSync(statPath, "utf-8");
     // Field 22 (1-indexed): starttime. Find the closing ')' of field 2
     // (comm), then split the remainder by space.
     const commEnd = stat.lastIndexOf(")");
     if (commEnd === -1) {
-      throw new Error(`Cannot parse /proc/${pid}/stat: no comm field`);
+      throw new Error(`Cannot parse ${statPath}: no comm field`);
     }
     const afterComm = stat.slice(commEnd + 2); // skip ') ' after comm
     const fields = afterComm.split(" ");
     // fields[0] = state (field 3), ... fields[19] = starttime (field 22)
     // Index: field 3 is fields[0], field 22 is fields[19]
     if (fields.length < 20) {
-      throw new Error(`Cannot parse /proc/${pid}/stat: too few fields`);
+      throw new Error(`Cannot parse ${statPath}: too few fields`);
     }
     startTicks = fields[19];
   } catch (e) {
-    throw new Error(`Cannot read /proc/${pid}/stat: ${e.message}`);
+    throw new Error(`Cannot read ${statPath}: ${e.message}`);
   }
 
   return JSON.stringify({ boot_id: bootId, start_ticks: startTicks });
@@ -224,7 +225,7 @@ function validateAncestry(coordinatorPid, claimedUpdaterPid) {
     throw new Error("Coordinator itself cannot be the owner");
   }
 
-  // Walk parent chain using /proc/<pid>/stat field 4 (ppid) on Linux,
+  // Walk parent chain using procfs stat field 4 (ppid) on Linux,
   // or ps on macOS
   let currentPid = coordinatorPid;
   const visited = new Set();
@@ -246,7 +247,8 @@ function validateAncestry(coordinatorPid, claimedUpdaterPid) {
 function getParentPid(pid) {
   if (process.platform === "linux") {
     try {
-      const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf-8");
+      const statPath = path.join("/", "proc", String(pid), "stat");
+      const stat = fs.readFileSync(statPath, "utf-8");
       const commEnd = stat.lastIndexOf(")");
       if (commEnd === -1) return null;
       const afterComm = stat.slice(commEnd + 2);

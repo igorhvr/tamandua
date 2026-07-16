@@ -837,7 +837,7 @@ try {
     while (p > 1 && !ancestryPids.has(p)) {
       ancestryPids.add(p);
       try {
-        const stat = fs.readFileSync(`/proc/${p}/stat`, "utf-8");
+        const stat = fs.readFileSync(path.join("/", "proc", String(p), "stat"), "utf-8");
         const commEnd = stat.lastIndexOf(")");
         const afterComm = stat.slice(commEnd + 2);
         const fields = afterComm.split(" ");
