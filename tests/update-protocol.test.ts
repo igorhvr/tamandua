@@ -1556,3 +1556,69 @@ console.log("ACQUIRED:" + r.token);
     }
   });
 });
+
+// ── TOKEN CONTRACT: 256-bit base64url token and five-field authority ─────
+
+describe("TOKEN contract and five-field return", () => {
+  it("acquire returns 43-char base64url token and five-field authority with ownerPid/ownerIdentity parity", () => {
+    const TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
+    const tempA = createTempHome("upgx-token-a-");
+    const tempB = createTempHome("upgx-token-b-");
+    try {
+      const dbA = path.join(tempA.root, "a.db");
+      const dbB = path.join(tempB.root, "b.db");
+
+      const resultA = runAcquire(tempA, dbA);
+      assert.equal(resultA.status, 0, `acquisition A failed: ${resultA.stderr}`);
+      const dataA = JSON.parse(resultA.stdout.trim());
+
+      const resultB = runAcquire(tempB, dbB);
+      assert.equal(resultB.status, 0, `acquisition B failed: ${resultB.stderr}`);
+      const dataB = JSON.parse(resultB.stdout.trim());
+
+      // 43-char base64url, no padding, 32 bytes decoded
+      assert.ok(TOKEN_RE.test(dataA.token), "token A should be 43-char base64url");
+      assert.ok(TOKEN_RE.test(dataB.token), "token B should be 43-char base64url");
+      assert.ok(!dataA.token.includes("="), "token A should not contain padding");
+      assert.ok(!dataB.token.includes("="), "token B should not contain padding");
+      assert.equal(Buffer.from(dataA.token, "base64url").length, 32, "token A decodes to 32 bytes");
+      assert.equal(Buffer.from(dataB.token, "base64url").length, 32, "token B decodes to 32 bytes");
+
+      // Two independent acquisitions produce different tokens
+      assert.ok(dataA.token !== dataB.token, "tokens from two acquisitions should differ");
+
+      // Exact sorted key set
+      const expectedKeys = ["mode", "ownerIdentity", "ownerPid", "phase", "token"];
+      assert.deepEqual(Object.keys(dataA).sort(), expectedKeys);
+      assert.deepEqual(Object.keys(dataB).sort(), expectedKeys);
+
+      // Phase and mode values
+      assert.equal(dataA.phase, "ACQUIRED");
+      assert.equal(dataA.mode, "current");
+      assert.equal(dataB.phase, "ACQUIRED");
+      assert.equal(dataB.mode, "current");
+
+      // ownerPid equals the test parent PID (child passes process.ppid)
+      assert.equal(dataA.ownerPid, process.pid, "ownerPid A should equal parent process.pid");
+      assert.equal(dataB.ownerPid, process.pid, "ownerPid B should equal parent process.pid");
+
+      // Query gate rows and verify parity
+      for (const [idx, dbPath] of [dbA, dbB].entries()) {
+        const data = idx === 0 ? dataA : dataB;
+        const db = new DatabaseSync(dbPath);
+        try {
+          const row = db.prepare("SELECT token, owner_pid, owner_identity FROM update_gate WHERE id = 1").get();
+          assert.ok(row, "gate row should exist");
+          assert.ok(data.token === row.token, "returned token should match persisted token");
+          assert.equal(row.owner_pid, process.pid, "persisted owner_pid should equal parent process.pid");
+          assert.ok(data.ownerIdentity === row.owner_identity, "returned ownerIdentity should match persisted");
+        } finally {
+          db.close();
+        }
+      }
+    } finally {
+      try { fs.rmSync(tempA.root, { recursive: true, force: true }); } catch { /* ignore */ }
+      try { fs.rmSync(tempB.root, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
+  });
+});

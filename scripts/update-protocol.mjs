@@ -359,7 +359,7 @@ function gateExists(db) {
 // ── Public API ───────────────────────────────────────────────────────────────
 
 /**
- * Acquire the update gate. Returns { token, phase: 'ACQUIRED', mode } on success.
+ * Acquire the update gate. Returns { token, phase: 'ACQUIRED', mode, ownerPid, ownerIdentity } on success.
  * Throws on any refusal; the caller must handle the error.
  *
  * @param {string} mode - 'legacy' or 'current'
@@ -367,7 +367,7 @@ function gateExists(db) {
  * @param {string} topology - topology JSON string
  * @param {string} artifacts - artifacts JSON string
  * @param {string} readiness - readiness JSON string
- * @returns {{ token: string, phase: string, mode: string }}
+ * @returns {{ token: string, phase: string, mode: string, ownerPid: number, ownerIdentity: string }}
  */
 export function acquire(mode, updaterPid, topology, artifacts, readiness) {
   validateMode(mode);
@@ -430,7 +430,7 @@ export function acquire(mode, updaterPid, topology, artifacts, readiness) {
       createBlockingTriggers(db);
 
       // Insert singleton row
-      const token = crypto.randomUUID();
+      const token = crypto.randomBytes(32).toString("base64url");
       const now = new Date().toISOString();
 
       db.prepare(
@@ -452,7 +452,7 @@ export function acquire(mode, updaterPid, topology, artifacts, readiness) {
 
       db.exec("COMMIT");
 
-      return { token, phase: "ACQUIRED", mode };
+      return { token, phase: "ACQUIRED", mode, ownerPid: updaterPid, ownerIdentity };
     } catch (e) {
       // Rollback on any failure — gate, triggers, and run data remain unchanged
       db.exec("ROLLBACK");
