@@ -33,6 +33,7 @@ const COORDINATOR_CLI = path.join(
   "update-coordinator.mjs",
 );
 const DIST_DB = path.join(REPO_ROOT, "dist", "db.js");
+const DIST_STEP_OPS = path.join(REPO_ROOT, "dist", "installer", "step-ops.js");
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -2197,6 +2198,220 @@ try {
       assert.ok(postTargetRow, "postSnapshot should contain test-run-1");
       assert.deepStrictEqual(postTargetRow, preTargetRow);
       assert.strictEqual(postTargetRow.status, "done");
+    } finally {
+      fs.rmSync(temp.root, { recursive: true, force: true });
+    }
+  });
+
+  it("old-style allowed run mutations and step completion remain usable while gated", () => {
+    const temp = createTempHome("update-protocol-oldwriter-allowed-");
+    const dbPath = path.join(temp.root, "oldwriter-allowed.db");
+    const homeDir = temp.homeDir;
+    const env = cleanChildEnv({
+      HOME: homeDir,
+      TAMANDUA_STATE_DIR: path.join(homeDir, ".tamandua"),
+      TAMANDUA_DB_PATH: dbPath,
+    });
+
+    const artifactSnapshot = (db) => ({
+      gate: { ...db.prepare("SELECT * FROM update_gate WHERE id = 1").get() },
+      schema: db.prepare(
+        `SELECT type, name, tbl_name, sql
+         FROM sqlite_schema
+         WHERE name IN (
+           'update_gate',
+           'trg_update_gate_block_runs_insert',
+           'trg_update_gate_block_runs_update'
+         )
+         ORDER BY name`,
+      ).all().map((row) => ({ ...row })),
+    });
+
+    const mutationSnapshot = (db) => ({
+      runs: db.prepare(
+        "SELECT * FROM runs WHERE id IN ('completion-run', 'metadata-run', 'status-run') ORDER BY id",
+      ).all().map((row) => ({ ...row })),
+      steps: db.prepare(
+        "SELECT * FROM steps WHERE run_id = 'completion-run' ORDER BY step_index",
+      ).all().map((row) => ({ ...row })),
+    });
+
+    try {
+      const setupResult = spawnSync(
+        process.execPath,
+        [
+          "--input-type=module",
+          "-e",
+          `import { getDb, closeDb } from ${JSON.stringify(DIST_DB)};
+process.env.TAMANDUA_DB_PATH = ${JSON.stringify(dbPath)};
+process.env.HOME = ${JSON.stringify(homeDir)};
+const seededAt = "2026-07-17T00:00:00.000Z";
+try {
+  const db = getDb();
+  const insertRun = db.prepare("INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, notify_url, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+  insertRun.run("status-run", "wf-test", "status task", "done", "{}", 0, null, seededAt, seededAt);
+  insertRun.run("metadata-run", "wf-test", "original task", "done", "{}", 0, null, seededAt, seededAt);
+  insertRun.run("completion-run", "wf-test", "completion task", "done", "{}", 0, null, seededAt, seededAt);
+  const insertStep = db.prepare("INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, output, retry_count, max_retries, type, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+  insertStep.run("completion-current", "completion-run", "current", "agent-current", 0, "", "", "running", null, 0, 4, "single", seededAt, seededAt);
+  insertStep.run("completion-next", "completion-run", "next", "agent-next", 1, "", "", "waiting", null, 0, 4, "single", seededAt, seededAt);
+} finally {
+  closeDb();
+}
+process.stdout.write("SETUP_DONE\\n");`,
+        ],
+        { encoding: "utf-8", env, timeout: 30000 },
+      );
+      assert.strictEqual(setupResult.status, 0, `Setup failed: ${setupResult.stderr}`);
+      assert.strictEqual(setupResult.signal, null);
+      assert.strictEqual(setupResult.error, undefined);
+      assert.strictEqual(setupResult.stdout, "SETUP_DONE\n");
+      assert.strictEqual(setupResult.stderr, "");
+
+      const acquireResult = spawnSync(
+        process.execPath,
+        [
+          "--input-type=module",
+          "-e",
+          `import { acquire } from ${JSON.stringify(PROTOCOL_MODULE)};
+acquire("current", process.ppid, "{}", "{}", "{}");
+process.stdout.write("OK\\n");`,
+        ],
+        { encoding: "utf-8", env, timeout: 30000 },
+      );
+      assert.strictEqual(acquireResult.status, 0, `Acquire failed: ${acquireResult.stderr}`);
+      assert.strictEqual(acquireResult.signal, null);
+      assert.strictEqual(acquireResult.error, undefined);
+      assert.strictEqual(acquireResult.stdout, "OK\n");
+      assert.strictEqual(acquireResult.stderr, "");
+
+      let artifactsBefore;
+      let rowsBefore;
+      {
+        const db = new DatabaseSync(dbPath);
+        try {
+          artifactsBefore = artifactSnapshot(db);
+          rowsBefore = mutationSnapshot(db);
+        } finally {
+          db.close();
+        }
+      }
+
+      const writerResult = spawnSync(
+        process.execPath,
+        [
+          "--input-type=module",
+          "-e",
+          `import { getDb, closeDb } from ${JSON.stringify(DIST_DB)};
+import { completeStep } from ${JSON.stringify(DIST_STEP_OPS)};
+process.env.TAMANDUA_DB_PATH = ${JSON.stringify(dbPath)};
+process.env.HOME = ${JSON.stringify(homeDir)};
+let completion;
+try {
+  const db = getDb();
+  db.prepare("UPDATE runs SET status = ?, updated_at = ? WHERE id = ?")
+    .run("failed", "2026-07-17T01:00:00.000Z", "status-run");
+  db.prepare("UPDATE runs SET task = ?, context = ?, tokens_spent = ?, notify_url = ?, updated_at = ? WHERE id = ?")
+    .run("updated task", JSON.stringify({ metadata: "allowed" }), 17, "https://example.test/notify", "2026-07-17T02:00:00.000Z", "metadata-run");
+  completion = completeStep("completion-current", "STATUS: done\\nRESULT: allowed");
+} finally {
+  closeDb();
+}
+process.stdout.write(JSON.stringify({ completion, closed: true }) + "\\n");`,
+        ],
+        { encoding: "utf-8", env, timeout: 30000 },
+      );
+      assert.strictEqual(writerResult.status, 0);
+      assert.strictEqual(writerResult.signal, null);
+      assert.strictEqual(writerResult.error, undefined);
+      assert.strictEqual(writerResult.stdout, '{"completion":{"status":"advanced"},"closed":true}\n');
+      assert.strictEqual(writerResult.stderr, "");
+
+      const db = new DatabaseSync(dbPath);
+      try {
+        assert.deepStrictEqual(artifactSnapshot(db), artifactsBefore);
+        const rowsAfter = mutationSnapshot(db);
+        assert.match(rowsAfter.runs[0].updated_at, /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
+        assert.notStrictEqual(rowsAfter.runs[0].updated_at, rowsBefore.runs[0].updated_at);
+        assert.match(rowsAfter.steps[0].updated_at, /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
+        assert.match(rowsAfter.steps[1].updated_at, /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
+        assert.deepStrictEqual(rowsAfter, {
+          runs: [
+            {
+              ...rowsBefore.runs[0],
+              context: '{"status":"done","result":"allowed"}',
+              updated_at: rowsAfter.runs[0].updated_at,
+            },
+            {
+              ...rowsBefore.runs[1],
+              task: "updated task",
+              context: '{"metadata":"allowed"}',
+              tokens_spent: 17,
+              notify_url: "https://example.test/notify",
+              updated_at: "2026-07-17T02:00:00.000Z",
+            },
+            {
+              ...rowsBefore.runs[2],
+              status: "failed",
+              updated_at: "2026-07-17T01:00:00.000Z",
+            },
+          ],
+          steps: [
+            {
+              ...rowsBefore.steps[0],
+              status: "done",
+              output: "STATUS: done\nRESULT: allowed",
+              updated_at: rowsAfter.steps[0].updated_at,
+            },
+            {
+              ...rowsBefore.steps[1],
+              status: "pending",
+              updated_at: rowsAfter.steps[1].updated_at,
+            },
+          ],
+        });
+        assert.deepStrictEqual(
+          { ...db.prepare("SELECT id, workflow_id, task, status, context, tokens_spent, notify_url, created_at, updated_at FROM runs WHERE id = 'status-run'").get() },
+          {
+            id: "status-run", workflow_id: "wf-test", task: "status task", status: "failed",
+            context: "{}", tokens_spent: 0, notify_url: null,
+            created_at: "2026-07-17T00:00:00.000Z", updated_at: "2026-07-17T01:00:00.000Z",
+          },
+        );
+        assert.deepStrictEqual(
+          { ...db.prepare("SELECT id, workflow_id, task, status, context, tokens_spent, notify_url, created_at, updated_at FROM runs WHERE id = 'metadata-run'").get() },
+          {
+            id: "metadata-run", workflow_id: "wf-test", task: "updated task", status: "done",
+            context: '{"metadata":"allowed"}', tokens_spent: 17, notify_url: "https://example.test/notify",
+            created_at: "2026-07-17T00:00:00.000Z", updated_at: "2026-07-17T02:00:00.000Z",
+          },
+        );
+        assert.deepStrictEqual(
+          { ...db.prepare("SELECT id, workflow_id, task, status, context, tokens_spent, notify_url, created_at FROM runs WHERE id = 'completion-run'").get() },
+          {
+            id: "completion-run", workflow_id: "wf-test", task: "completion task", status: "done",
+            context: '{"status":"done","result":"allowed"}', tokens_spent: 0, notify_url: null,
+            created_at: "2026-07-17T00:00:00.000Z",
+          },
+        );
+        assert.deepStrictEqual(
+          db.prepare("SELECT id, run_id, step_id, agent_id, step_index, input_template, expects, status, output, retry_count, max_retries, type FROM steps WHERE run_id = 'completion-run' ORDER BY step_index").all().map((row) => ({ ...row })),
+          [
+            {
+              id: "completion-current", run_id: "completion-run", step_id: "current", agent_id: "agent-current",
+              step_index: 0, input_template: "", expects: "", status: "done",
+              output: "STATUS: done\nRESULT: allowed", retry_count: 0, max_retries: 4, type: "single",
+            },
+            {
+              id: "completion-next", run_id: "completion-run", step_id: "next", agent_id: "agent-next",
+              step_index: 1, input_template: "", expects: "", status: "pending",
+              output: null, retry_count: 0, max_retries: 4, type: "single",
+            },
+          ],
+        );
+      } finally {
+        db.close();
+      }
     } finally {
       fs.rmSync(temp.root, { recursive: true, force: true });
     }
