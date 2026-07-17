@@ -1,43 +1,68 @@
 # Tamandua Cross-Version Update Protocol
 
-This document specifies the cross-version update protocol for Tamandua. It serves
-as the single contract for all protocol runs (PROT, TOPO, RECV, ROLL). The
-protocol is designed so the update machinery in the new version can orchestrate
-a safe handover from the currently-running old version.
+This document is the design record for the cross-version update protocol. It
+serves as the single contract for all protocol runs (PROT, TOPO, RECV, ROLL).
+
+## Reading This Document — Implemented vs. Target Design
+
+**Implemented today:** A dormant Node-built-in protocol foundation and thin
+internal CLI, dynamically tested but **not invoked** by the normal
+updater/build/install/service lifecycle. Present-tense statements describe
+implemented behaviour.
+
+**Deferred target design:** Production interception, topology/service
+handover, guardian spawning/handshake, readiness/takeover/release, recovery,
+and rollback. Sections describing these use **future/target language**
+(e.g., "will", "intended") — they do not describe current production
+behaviour. PROT, TOPO, RECV, and ROLL are scope/design labels; no such runs
+are scheduled or guaranteed.
 
 ## 1. Legacy Interception Point
 
 The legacy updater (`0258feeceeb2ab3934b71463039e6e282700f05a`) pulls candidate
-source and immediately executes the candidate `build-and-install`. Interception
-is therefore the **first line** of the newly-pulled `build-and-install`.
-Everything before that line runs under the old updater. Every instruction after
-that line runs under the candidate's control.
+source and immediately runs `build-and-install`.
 
-Only source HEAD movement is unavoidable on active-work refusal; the candidate
-code itself handles refusal by reading protocol state early in `build-and-install`.
+**Target design:** Interception at the first line of `build-and-install` so
+the candidate's update coordinator can refuse an active-update deployment
+early. This interception is **not wired** today — `build-and-install` does
+not yet call the coordinator, and the dormant foundation does not currently
+make production updates safe. Source HEAD movement as the only mutation on
+active-work refusal is a target guarantee for later integration, not a
+current production claim.
 
 ## 2. Owner Model
 
-| Role             | Owner                                            |
-|------------------|--------------------------------------------------|
-| Legacy owner     | The **old Node.js updater process**, passed from build shell as `$PPID` |
-| Current owner    | `process.pid` of the updater                     |
-| Coordinator      | Is **never** an owner                            |
-| Build shell      | Is **never** an owner                            |
+`acquire(mode, updaterPid, ...)` requires an explicit `updaterPid` — a
+canonical positive safe-integer PID that must be a genuine ancestor of the
+coordinator process. The coordinator's own PID is explicitly rejected. The
+coordinator captures the updater's live immutable process identity. This
+ancestry-based validation rule applies identically to both `legacy` and
+`current` modes; neither mode automatically makes `process.pid` the owner.
 
-The coordinator validates ancestry: the claimed updater PID must be a genuine
-ancestor of the coordinator process. The coordinator's own PID is never an
-acceptable owner.
+**Target design — intended wiring for future callers:**
+
+| Role             | Intended owner                                               |
+|------------------|--------------------------------------------------------------|
+| Legacy owner     | The old Node.js updater process, passed from build shell as `$PPID` |
+| Current owner    | `process.pid` of the updater (when it calls the coordinator directly) |
+| Coordinator      | Is **never** an owner                                        |
+| Build shell      | Is **never** an owner                                        |
+
+The table describes how future callers are expected to supply `updaterPid`,
+not current automatic assignment.
 
 ## 3. Protocol Gate
 
-A transient singleton row (the "gate") lives in the Tamandua database. It is
-protocol state, not application schema. It carries forward-compatible fields:
+A singleton row (the "gate") lives in the Tamandua database. It is protocol state, not application schema.
+The row is intended to be transient only in the deferred final design; no release/clear operation exists,
+and an acquired row—including `FAILED`—remains permanently blocking, never removed by any protocol operation.
+
+It carries forward-compatible fields:
 
 | Field                     | Type      | Description                                         |
 |---------------------------|-----------|-----------------------------------------------------|
 | `id`                      | INTEGER   | Singleton key, always `1`                           |
-| `token`                   | TEXT      | Random capability token (crypto.randomUUID)         |
+| `token`                   | TEXT      | Random capability token (256-bit `crypto.randomBytes(32)`, canonical unpadded base64url, 43 characters) |
 | `mode`                    | TEXT      | `legacy` or `current` (schema constrained)          |
 | `phase`                   | TEXT      | Current phase (see §4, schema constrained)          |
 | `owner_pid`               | INTEGER   | PID of the updater process                          |
@@ -52,7 +77,21 @@ protocol state, not application schema. It carries forward-compatible fields:
 | `created_at`              | TEXT      | ISO 8601 timestamp                                  |
 | `updated_at`              | TEXT      | ISO 8601 timestamp                                  |
 
+`topology`, `artifacts`, and `readiness` must parse as valid JSON and are
+bounded at 4096 UTF-8 bytes each. They are stored exactly and are
+semantically opaque to the protocol foundation.
+
 Schema-level constraints enforce valid `mode` and `phase` values.
+
+### Acquisition Contract
+
+Acquisition resolves from nonblank `TAMANDUA_DB_PATH` or `HOME/.tamandua/tamandua.db`; absent DB or one missing `runs` is cold-initialized via
+real `dist/db.js`. The caller's canonical positive safe-integer updater PID, genuine ancestry, and live owner identity are validated before
+acquisition. After cold init, `BEGIN IMMEDIATE` is the first acquisition predicate; reserved artifacts are inspected under that writer lock. An
+existing exact canonical table+trigger set refuses as already acquired; any partial, corrupt, wrong-type, wrong-table, wrong-DDL, or
+case-conflicting reserved set refuses fail-closed without repair or adoption. With no reserved set, the canonical table and triggers are
+created, validated by read-back, any `running` or `paused` run is refused, and the singleton `ACQUIRED` row is inserted. Post-`BEGIN IMMEDIATE`
+failures roll back all protocol DDL/data; the DB closes in `finally`. Success returns `{ token, phase, mode, ownerPid, ownerIdentity }`.
 
 ## 4. Phase Transition Graph
 
@@ -68,157 +107,178 @@ GUARDIAN_RECORDED -> FAILED
 - No self-transition is legal.
 - No backward transition is legal.
 - No token-only transition is legal.
-- Reading the current phase then CAS is illegal — the caller must supply its
-  own expected phase explicitly.
+- There is no generic `casPhase` module export and no `phase-cas` CLI
+  operation. Phase transitions are performed only through `recordGuardian()`
+  and `fail()`.
 
-Every mutating write (phase CAS, guardian record, failure write) uses **one**
-`BEGIN IMMEDIATE` transaction plus an SQL predicate over:
+Every post-acquisition mutating write uses **one** `BEGIN IMMEDIATE`
+transaction plus a SQL UPDATE predicate over:
 - Singleton `id = 1`
 - The token (must match)
 - Caller-supplied expected phase (must match)
 - Expected owner PID (must match)
 - Exact serialized immutable owner identity (must match)
 
-A zero-row change is a refusal; state is left unchanged.
+A zero-row change is a generic refusal with no phase/authority disclosure;
+state is left unchanged.
+
+Acquisition generates its own token via `crypto.randomBytes(32)` and is not
+authorized by a preexisting token.
 
 ## 5. Token Capability Model
 
-A random token (`crypto.randomUUID()`) is generated during acquisition and
-scopes all mutating operations. The token is returned to the caller on
-successful acquisition. All subsequent mutating calls (CAS, guardian record,
-failure) must present the matching token or the operation changes zero rows.
+A random 256-bit token is generated via
+`crypto.randomBytes(32).toString("base64url")` during acquisition — 43
+characters of canonical unpadded base64url. The token scopes all
+post-acquisition mutating operations and is returned on successful
+acquisition. All subsequent mutating calls must present the matching token
+or change zero rows. The token is stored in the database but never disclosed
+through `inspect()` (see §16).
 
 ## 6. Immutable Process Identity
 
+Identities are canonical bounded JSON objects, not concatenated text.
+
 ### Linux
 
-- `/proc/sys/kernel/random/boot_id` (raw kernel value)
-- `/proc/<pid>/stat` field 22 (`starttime` in clock ticks)
-
-Both values are concatenated and serialized. Raw kernel values are preferred;
-do not use `Date.now()`, elapsed time, or PID-only liveness.
+`{"boot_id":"<uuid>","start_ticks":"<decimal>"}` — `boot_id` from
+`/proc/sys/kernel/random/boot_id`, `start_ticks` from `/proc/<pid>/stat`
+field 22 (starttime in clock ticks).
 
 ### macOS
 
-- `ps -o lstart= -p <pid>` (real process start time data — not elapsed)
-
-Argument-vector process APIs (`child_process.spawn` with `['ps', '-o', 'lstart=', '-p', String(pid)]`)
-only; never use interpolated shell commands.
+`{"lstart":"<ps output>"}` — captured via `spawnSync("ps", ["-o", "lstart=",
+"-p", String(pid)])` under C locale (`LC_ALL=C`, `LANG=C`). Argument-vector
+API only — never an interpolated shell command.
 
 ## 7. Guardian Identity
 
-A guardian is an optional detached process that monitors the legacy updater.
-Guardian identity uses the same immutable identity format as the owner.
-Guardian PID must be a canonical positive PID; guardian identity must be
-captured live. Recording a guardian may only transition `ACQUIRED -> GUARDIAN_RECORDED`.
+### Implemented: Record-Guardian CAS
 
-## 8. Topology, Artifacts, and Readiness
+`recordGuardian()` receives a caller-managed live PID and expected canonical
+identity, captures the guardian's identity live after `BEGIN IMMEDIATE`, and
+requires exact equality before writing. It transitions
+`ACQUIRED -> GUARDIAN_RECORDED` only, with a full authority predicate over
+token, expected phase, expected owner PID, and exact serialized owner
+identity. A zero-row change is a generic refusal; state is left unchanged.
 
-- **Topology JSON**: maps old service endpoints to their new counterparts
-  (legacy unified `tamandua.pid` → current motor + independent dashboard).
-- **Artifacts JSON**: expected build artifacts and their paths.
-- **Readiness JSON**: predicates that must be satisfied for release.
+`recordGuardian()` opens the DB in no-create read/write mode; absent DB, absent gate
+table, or SQL predicate failure returns `{ changed: false }` without creating a DB file.
 
-All three fields must parse as valid JSON and are bounded on insert.
-They are stored as opaque strings; the coordinator validates structure but
-interprets semantics only in later runs (TOPO, RECV).
+### Deferred Target
+
+The module does **not** spawn, detach, handshake with, or monitor a guardian
+— these are deferred target lifecycle behaviours.
+
+## 8. Stored Metadata (Topology, Artifacts, Readiness)
+
+### Implemented
+
+`topology`, `artifacts`, and `readiness` must parse as valid JSON, are
+bounded at 4096 UTF-8 bytes each, stored exactly, and semantically opaque.
+Cold startup starts nothing.
+
+### Deferred Target Semantics
+
+Interpretation belongs to deferred, unscheduled design scopes; topology maps old→new
+service endpoints, artifacts lists expected build outputs, readiness defines
+release predicates. Legacy real paths are positional control-only and
+MCP-only. None of this is implemented, scheduled, or guaranteed.
 
 ## 9. Failure Diagnostics
 
-Failure reason and details are durable, token-scoped, and bounded. They
-preserve forensic data for debugging without leaking unbounded data.
-On any refusal (running/paused work, existing gate, ancestor validation
-failure), the coordinator returns nonzero without mutating state.
+`fail()` persists reason (nonempty string, ≤256 UTF-8 bytes) and details
+(string, ≤4096 UTF-8 bytes) atomically with the `FAILED` phase transition.
+Both are durable, token-scoped, and bounded.
 
-## 10. Takeover Predicates
+`fail()` opens the DB in no-create read/write mode; absent DB, absent gate
+table, or SQL predicate failure returns `{ changed: false }` without creating a DB file.
 
-Takeover (moving from the old updater controlling the DB to the new version
-being live) is predicate-complete:
-- All readiness predicates must pass.
-- The old owner must no longer be running (validated via identity, not just PID).
-- Successful release is atomic.
+## 10. Takeover and Release (Target Design)
 
-A dead process is evidence, never authorization. No public token-only release
-is permitted.
+Takeover and release are deferred integration concerns. The dormant
+foundation does **not** contain an atomic release
+operation, or any release/clear/drop/takeover machinery. There is currently
+no production update orchestrator, no readiness evaluation, no service
+stop/start or topology handover. A dead process is intended to be evidence,
+never authorization.
 
-## 11. Atomic Validated Release
+In the target design, legacy-mode completion would use a detached handshaken
+guardian waiting for the old updater identity to disappear from the process
+table.
 
-Successful release validates all predicates synchronously within
-`runUpdate()` and completes atomically. It does not circularly wait for a
-guardian.
+## 11. ROLL Boundary
 
-In legacy mode, completion uses a detached handshaken guardian that waits for
-the old updater identity to disappear from the process table.
+Rollback and recovery are **not implemented**. A future ROLL scope would
+have to define and prove rollback behaviour; no such run is scheduled or
+guaranteed. In PROT scope, no rollback machinery is present.
 
-## 12. ROLL Boundary
+## 12. --force Semantics
 
-The ROLL run implements rollback behavior. It is deferred to a later run.
-In PROT scope, no rollback machinery is present.
+`--force` is **never** admission authority. It cannot bypass the protocol
+gate, active work refusal, or identity validation. The `--force` flag is
+**not consulted** by the coordinator's acquisition path.
 
-## 13. Legacy Tamandua.pid Mapping
+**Target design:** `--force` may become the documented way to re-enter the
+candidate `build-and-install` path on legacy no-change recovery, but
+running/paused work would still refuse.
 
-The legacy `tamandua.pid` file contains the PID for a unified process that
-serves dashboard + motor/control. In the current architecture these are
-separate (motor/control daemon + independent dashboard). The topology JSON
-captures this mapping. Cold startup starts nothing.
+## 13. Dormant State
 
-Legacy real paths are positional control-only and MCP-only;
-there is no dashboard-standalone entrypoint in the legacy version.
+The protocol module exists but is **not wired** into any production callers.
+Normal Tamandua behaviour is unchanged. There is currently no production
+caller, no service stop/start or topology handover, no guardian
+spawn/handshake, no release/clear/drop/takeover operation, no production update orchestrator,
+and no rollback/recovery machinery. TOPO and RECV are deferred design
+discussions, not scheduled or guaranteed runs.
 
-## 14. --force Semantics
+## 14. Coordinator Interface
 
-`--force` is **never** admission authority. It cannot bypass the protocol gate,
-active work refusal, or identity validation.
+The coordinator exposes exactly four internal machine-oriented commands:
 
-On failed legacy no-change recovery, `--force` may be the documented way to
-re-enter the candidate `build-and-install` path, but running/paused work still
-refuses. The `--force` flag is not consulted by the coordinator's acquisition
-path.
+| Command               | Signature                                                                                                          |
+|-----------------------|--------------------------------------------------------------------------------------------------------------------|
+| `acquire`             | `acquire <mode> <updaterPid> <topology> <artifacts> <readiness>`                                                   |
+| `inspect`             | `inspect`                                                                                                          |
+| `record-guardian-cas` | `record-guardian-cas <token> <expectedPhase> <expectedOwnerPid> <expectedOwnerIdentity> <guardianPid> <expectedGuardianIdentity>` |
+| `fail`                | `fail <token> <expectedPhase> <expectedOwnerPid> <expectedOwnerIdentity> <reason> <details>`                       |
 
-## 15. Dormant State (PROT)
+Release, clear, drop, takeover, and `phase-cas` are **not** exposed.
 
-In the PROT run, the protocol module exists but is **not wired** into any
-production callers. Normal Tamandua behavior is unchanged. The protocol
-becomes active in subsequent TOPO and RECV runs.
+**CLI bounds:** Exact-arity checked before any argument validation. PID
+arguments use canonical ASCII-decimal parsing. External string arguments are
+bounded at 4096 UTF-8 bytes. Success JSON on stdout is bounded at 65536 bytes
+(including newline); `inspect` wraps as `{"gate": ...}`. Diagnostics on
+stderr are bounded at 4096 UTF-8 bytes with code-point-aware truncation.
+Nonzero exit codes on failure. Refused guardian and fail CAS commands use
+generic diagnostics and nonzero status without disclosing which authority
+predicate failed.
 
-## 16. Coordinator Interface
+## 15. Blocking Triggers
 
-The coordinator exposes these internal machine-oriented operations:
-
-| Operation           | Description                                     |
-|---------------------|-------------------------------------------------|
-| `acquire`           | Claim the singleton gate for an update          |
-| `inspect`           | Read current gate state (null-safe)             |
-| `phase-cas`         | Strict CAS phase transition                     |
-| `record-guardian-cas` | Record guardian identity (ACQUIRED→GUARDIAN_RECORDED only) |
-| `fail`              | Token-scoped failure (ACQUIRED/GUARDIAN_RECORDED→FAILED) |
-
-Release, clear, drop, and takeover are **not** exposed in PROT scope.
-
-Emitted JSON on stdout is bounded. Diagnostics on stderr. Meaningful nonzero
-exit codes on failure.
-
-## 17. Blocking Triggers
-
-Two production triggers fire on the `runs` table whenever the singleton gate
-row exists:
+Two triggers fire on the `runs` table when the singleton gate row exists:
 
 1. **INSERT blocker**: `RAISE(ABORT, 'update in progress')` on any `runs` INSERT.
 2. **UPDATE blocker**: `RAISE(ABORT, 'update in progress')` on status transition
    into `running` for existing non-running runs.
 
-These triggers are the only coupling between protocol state and application
-tables. They enforce that no new work can be created or started while an
-update is in progress, including during `FAILED` state.
+Both triggers remain active in `FAILED` state. They enforce that no new
+work can be created or started while an update gate exists. These triggers
+are the only coupling between protocol state and application tables.
 
-## 18. Implementation Structure
+## 16. Implementation and Inspection
 
-- `scripts/update-protocol.mjs`: Single ESM module containing all mutating
-  DDL, gate, phase, and failure operations. Node built-ins only.
-- `scripts/update-coordinator.mjs`: Thin CLI exposing machine-oriented
-  operations with bounded JSON stdout and diagnostics on stderr.
+- `scripts/update-protocol.mjs`: Single ESM module — all mutating DDL, gate,
+  phase, failure, and identity operations. Node built-ins only.
+- `scripts/update-coordinator.mjs`: Thin CLI — machine-oriented operations
+  with bounded JSON stdout and diagnostics on stderr.
 - `docs/upgrade-protocol.md`: This file — the protocol design record.
 - `tests/update-protocol.test.ts`: Adversarial focused tests.
 
-All protocol operations that mutate the database live in a single module.
-There is no duplicate TypeScript state machine and no copied DDL elsewhere.
+`inspect()` is read-only and null-safe, returning an explicit 14-field view
+(non-token columns) or `null`. The token is never disclosed through inspect.
+`isGateActive()` is a module helper (not a CLI command) returning `true` when
+the singleton row exists, including `FAILED` state.
+
+All protocol operations that mutate the database live in a single module —
+there is no duplicate TypeScript state machine and no copied DDL elsewhere.
