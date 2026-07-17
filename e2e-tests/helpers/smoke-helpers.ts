@@ -17,7 +17,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { tamanduaTempDir, tamanduaTempRoot } from "../../src/lib/temp-dir.ts";
-import { DatabaseSync } from "node:sqlite";
+import { openE2eDatabase } from "./e2e-database.mjs";
 
 const repoRoot = process.cwd();
 const cliPath = path.resolve(repoRoot, "dist", "cli", "cli.js");
@@ -314,7 +314,7 @@ export function prepareGitRepo(fixtureDir: string, targetDir: string) {
 /** Resolve full run ID from the 8-char prefix using the temp home DB */
 export function resolveFullRunId(prefix: string, tamanduaDir: string): string {
   const dbPath = path.join(tamanduaDir, "tamandua.db");
-  const db = new DatabaseSync(dbPath);
+  const db = openE2eDatabase(dbPath);
   try {
     const rows = db
       .prepare("SELECT id FROM runs WHERE id LIKE ? ORDER BY created_at DESC LIMIT 1")

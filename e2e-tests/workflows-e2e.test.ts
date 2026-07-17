@@ -53,7 +53,7 @@ import assert from "node:assert/strict";
 import { execFileSync, execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import { openE2eDatabase } from "./helpers/e2e-database.mjs";
 import {
   createTempHome,
   baseEnv,
@@ -996,7 +996,7 @@ describe("real e2e do-now workflow (LIVE agent, daemon, scheduler)", () => {
         // ── MPRT fallback report parsing ───────────────────────────
         // do-now's execute step has no Reply-with format block, so the
         // REPORT field is parsed by the generic KEY:value parser.
-        const db = new DatabaseSync(path.join(env.tamanduaDir, "tamandua.db"));
+        const db = openE2eDatabase(path.join(env.tamanduaDir, "tamandua.db"));
         try {
           const row = db
             .prepare("SELECT context FROM runs WHERE id = ?")

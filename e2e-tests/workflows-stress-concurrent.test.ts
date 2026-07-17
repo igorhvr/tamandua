@@ -25,9 +25,9 @@ import { execSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { tamanduaTempDir } from "../src/lib/temp-dir.ts";
-import { DatabaseSync } from "node:sqlite";
 import type { ChildProcess } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
+import { openE2eDatabase } from "./helpers/e2e-database.mjs";
 import {
   createTempHome,
   baseEnv,
@@ -237,7 +237,7 @@ async function createRunEnv(fi: FeatureInfo): Promise<RunEnv> {
 // ── Diagnostics ───────────────────────────────────────────────────
 
 function dbRow<T>(tamanduaDir: string, sql: string, ...params: (string | number)[]): T {
-  const db = new DatabaseSync(path.join(tamanduaDir, "tamandua.db"));
+  const db = openE2eDatabase(path.join(tamanduaDir, "tamandua.db"));
   try {
     return db.prepare(sql).get(...params) as T;
   } finally {
@@ -246,7 +246,7 @@ function dbRow<T>(tamanduaDir: string, sql: string, ...params: (string | number)
 }
 
 function dbRows<T>(tamanduaDir: string, sql: string, ...params: (string | number)[]): T[] {
-  const db = new DatabaseSync(path.join(tamanduaDir, "tamandua.db"));
+  const db = openE2eDatabase(path.join(tamanduaDir, "tamandua.db"));
   try {
     return db.prepare(sql).all(...params) as T[];
   } finally {

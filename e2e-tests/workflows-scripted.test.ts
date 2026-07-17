@@ -34,8 +34,8 @@ import assert from "node:assert/strict";
 import { execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { DatabaseSync } from "node:sqlite";
 import type { ChildProcess } from "node:child_process";
+import { openE2eDatabase } from "./helpers/e2e-database.mjs";
 import {
   createTempHome,
   baseEnv,
@@ -133,7 +133,7 @@ async function waitForRun(
 }
 
 function dbRow<T>(tamanduaDir: string, sql: string, ...params: string[]): T {
-  const db = new DatabaseSync(path.join(tamanduaDir, "tamandua.db"));
+  const db = openE2eDatabase(path.join(tamanduaDir, "tamandua.db"));
   try {
     return db.prepare(sql).get(...params) as T;
   } finally {
@@ -142,7 +142,7 @@ function dbRow<T>(tamanduaDir: string, sql: string, ...params: string[]): T {
 }
 
 function dbRows<T>(tamanduaDir: string, sql: string, ...params: string[]): T[] {
-  const db = new DatabaseSync(path.join(tamanduaDir, "tamandua.db"));
+  const db = openE2eDatabase(path.join(tamanduaDir, "tamandua.db"));
   try {
     return db.prepare(sql).all(...params) as T[];
   } finally {

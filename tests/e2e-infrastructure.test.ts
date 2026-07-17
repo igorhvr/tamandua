@@ -6,10 +6,54 @@ import { describe, it } from "node:test";
 import { releasePortReservations } from "../e2e-tests/helpers/smoke-helpers.ts";
 
 const repoRoot = process.cwd();
+const e2eDatabaseHelper = path.join(
+  repoRoot,
+  "e2e-tests",
+  "helpers",
+  "e2e-database.mjs",
+);
+
+function findDatabaseSyncConstructors(source: string): number[] {
+  const matches: number[] = [];
+  const pattern = /\bnew\s+DatabaseSync\s*\(/g;
+  for (const match of source.matchAll(pattern)) {
+    matches.push(match.index);
+  }
+  return matches;
+}
+
+function walkFiles(directory: string): string[] {
+  return fs.readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+    const entryPath = path.join(directory, entry.name);
+    return entry.isDirectory() ? walkFiles(entryPath) : [entryPath];
+  });
+}
 
 describe("e2e test infrastructure", () => {
   it("e2e-tests/ directory exists", () => {
     assert.ok(fs.statSync(path.join(repoRoot, "e2e-tests")).isDirectory());
+  });
+
+  it("centralizes direct DatabaseSync construction in the busy-timeout helper", () => {
+    const fixture = 'const db = new DatabaseSync("fixture.db");';
+    assert.equal(
+      findDatabaseSyncConstructors(fixture).length,
+      1,
+      "scanner self-check must detect a direct DatabaseSync construction",
+    );
+
+    const directOpenSites = walkFiles(path.join(repoRoot, "e2e-tests"))
+      .flatMap((filePath) =>
+        findDatabaseSyncConstructors(fs.readFileSync(filePath, "utf-8")).map(
+          () => path.relative(repoRoot, filePath),
+        ),
+      );
+
+    assert.deepEqual(
+      directOpenSites,
+      [path.relative(repoRoot, e2eDatabaseHelper)],
+      `e2e DatabaseSync construction must stay centralized in ${path.relative(repoRoot, e2eDatabaseHelper)}; found:\n${directOpenSites.join("\n")}`,
+    );
   });
 
   it("run-all-e2e-tests script exists and is executable", () => {

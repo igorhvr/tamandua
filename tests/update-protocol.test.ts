@@ -13,7 +13,11 @@ import os from "node:os";
 import crypto from "node:crypto";
 import assert from "node:assert/strict";
 import { describe, it, before, after, afterEach } from "node:test";
-import { spawn, spawnSync, execFileSync } from "node:child_process";
+import {
+  spawn as spawnChild,
+  spawnSync as spawnChildSync,
+  execFileSync,
+} from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { createTempHome, cleanChildEnv } from "./helpers/test-env.ts";
 
@@ -30,6 +34,28 @@ const COORDINATOR_CLI = path.join(
 const DIST_DB = path.join(REPO_ROOT, "dist", "db.js");
 
 // ── Helpers ──────────────────────────────────────────────────────────────
+
+const EXPERIMENTAL_WARNING_ARG = "--disable-warning=ExperimentalWarning";
+
+function nodeArgs(args) {
+  return [EXPERIMENTAL_WARNING_ARG, ...args];
+}
+
+function spawn(command, args, options) {
+  return spawnChild(
+    command,
+    command === process.execPath ? nodeArgs(args) : args,
+    options,
+  );
+}
+
+function spawnSync(command, args, options) {
+  return spawnChildSync(
+    command,
+    command === process.execPath ? nodeArgs(args) : args,
+    options,
+  );
+}
 
 function runNode(args, extraEnv) {
   const env = cleanChildEnv(extraEnv);
@@ -171,6 +197,14 @@ function getTableNames(dbPath) {
     db.close();
   }
 }
+
+it("coordinator Node argv disables ExperimentalWarning before the script path", () => {
+  assert.deepEqual(nodeArgs([COORDINATOR_CLI, "inspect"]), [
+    "--disable-warning=ExperimentalWarning",
+    COORDINATOR_CLI,
+    "inspect",
+  ]);
+});
 
 
 // ── DB-PATH: explicit TAMANDUA_DB_PATH wins ──────────────────────────────

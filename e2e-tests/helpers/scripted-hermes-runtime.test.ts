@@ -19,7 +19,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { DatabaseSync } from "node:sqlite";
+import { openE2eDatabase } from "./e2e-database.mjs";
 import { tamanduaTempDir } from "../../src/lib/temp-dir.ts";
 
 const runtimePath = path.resolve(
@@ -150,7 +150,7 @@ function spawnHermes(
 }
 
 function readStateDb(dbPath: string): Array<Record<string, unknown>> {
-  const db = new DatabaseSync(dbPath, { readOnly: true });
+  const db = openE2eDatabase(dbPath, { readOnly: true });
   try {
     return db.prepare("SELECT * FROM sessions").all() as Array<Record<string, unknown>>;
   } finally {
@@ -355,7 +355,7 @@ describe("scripted-hermes-runtime", () => {
         });
 
         const dbPath = path.join(dirs.hermesHome, "state.db");
-        const db = new DatabaseSync(dbPath, { readOnly: true });
+        const db = openE2eDatabase(dbPath, { readOnly: true });
         try {
           const columns = (
             db

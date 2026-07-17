@@ -48,7 +48,7 @@ import assert from "node:assert/strict";
 import { execFileSync, execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import { openE2eDatabase } from "./helpers/e2e-database.mjs";
 import {
   createTempHome,
   baseEnv,
@@ -269,7 +269,7 @@ ${testOutput.substring(0, 500)}`,
           // Key flow: do → (changes, report) → review → (feedback, issues)
           // → do-again → (changes, report) → verify → (verdict, details)
           const dbPath = path.join(env.tamanduaDir, "tamandua.db");
-          const db = new DatabaseSync(dbPath);
+          const db = openE2eDatabase(dbPath);
           try {
             // 1. Assert runs.context has expected keys
             const contextRows = db

@@ -30,7 +30,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
-import { DatabaseSync } from "node:sqlite";
+import { openE2eDatabase } from "./e2e-database.mjs";
 import {
   parsePrompt,
   createCli,
@@ -131,7 +131,7 @@ function writeSessionRow(sessionId, tokens) {
     fs.mkdirSync(hermesHome, { recursive: true });
     const dbPath = path.join(hermesHome, "state.db");
 
-    const db = new DatabaseSync(dbPath);
+    const db = openE2eDatabase(dbPath);
     try {
       db.exec(SESSIONS_TABLE_SQL);
 

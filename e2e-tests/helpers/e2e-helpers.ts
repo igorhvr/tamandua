@@ -16,9 +16,9 @@ import { setTimeout as sleep } from "node:timers/promises";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { DatabaseSync } from "node:sqlite";
 import { cleanChildEnv } from "../../tests/helpers/test-env.ts";
 import { baseEnv } from "./smoke-helpers.ts";
+import { openE2eDatabase } from "./e2e-database.mjs";
 
 const repoRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -67,7 +67,7 @@ export function collectRunDiagnostics(tamanduaDir: string, runId?: string): stri
     }
 
     try {
-      const db = new DatabaseSync(path.join(tamanduaDir, "tamandua.db"));
+      const db = openE2eDatabase(path.join(tamanduaDir, "tamandua.db"));
       try {
         const steps = db
           .prepare("SELECT step_index, step_id, agent_id, status, retry_count FROM steps WHERE run_id = ? ORDER BY step_index")
@@ -129,7 +129,7 @@ export interface RunTokenAudit {
  * N1–N3) is to change these numbers without changing run outcomes.
  */
 export function auditRunTokens(tamanduaDir: string, runId: string): RunTokenAudit {
-  const db = new DatabaseSync(path.join(tamanduaDir, "tamandua.db"));
+  const db = openE2eDatabase(path.join(tamanduaDir, "tamandua.db"));
   let workTokens = 0;
   let systemTokens = 0;
   try {
