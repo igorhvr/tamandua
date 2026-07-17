@@ -550,10 +550,11 @@ If something isn't working as expected, start with the built-in diagnostic:
 
 | Command | Description |
 |---------|-------------|
-| `tamandua workflow run <id> <task> [--working-directory-for-harness <dir>] [--pi-as-harness \| --hermes-as-harness]` | Start a run (defaults harness CWD to your current directory) |
+| `tamandua workflow run <id> <task> [--working-directory-for-harness <dir>] [--wait [--timeout <dur>] [--json]] [--pi-as-harness \| --hermes-as-harness]` | Start a run (defaults harness CWD to your current directory). With `--wait`, block until the run finishes |
 | `tamandua workflow status <query>` | Check run status |
 | `tamandua workflow runs` | List all runs |
-| `tamandua workflow resume <run-id>` | Resume a failed run |
+| `tamandua workflow wait <selector...> [--all] [--timeout <dur>] [--json] [--quiet]` | Block until selected runs reach terminal status |
+| `tamandua workflow resume <run-id>` | Resume a failed or paused run |
 | `tamandua workflow delete <run-id> [--force]` | Permanently delete a workflow run and associated data |
 | `tamandua workflow list` | List available workflows |
 | `tamandua workflow install <id> [--all]` | Install one or all workflows. **Installed bundled definitions are refreshed on every install/update** — local edits are overwritten. To customize a workflow, copy it under a new workflow id. |

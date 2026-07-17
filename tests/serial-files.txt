@@ -18,6 +18,7 @@ src/cli/commands/merge-branch.test.ts
 src/cli/commands/standalone.test.ts
 src/cli/commands/status.test.ts
 src/cli/commands/step.test.ts
+src/cli/commands/wait.test.ts
 src/cli/commands/workflow.test.ts
 src/cli/commands/worktree.test.ts
 src/cli/merge-branch-cli.test.ts

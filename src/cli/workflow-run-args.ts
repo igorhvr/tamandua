@@ -8,6 +8,12 @@ export interface WorkflowRunArgs {
   harnessAs?: "pi" | "hermes";
   /** Key-value pairs injected as run template context */
   context: Record<string, string>;
+  /** Block until the run reaches a terminal status */
+  wait: boolean;
+  /** Max wait duration (e.g. 30s, 10m, 2h) — only meaningful with --wait */
+  timeout?: string;
+  /** Output JSON after wait completes — only meaningful with --wait */
+  jsonFlag: boolean;
 }
 
 export function parseWorkflowRunArgs(args: string[]): WorkflowRunArgs {
@@ -30,6 +36,27 @@ export function parseWorkflowRunArgs(args: string[]): WorkflowRunArgs {
 
     if (token === "--no-relaunch-upon-rugpull") {
       noRelaunchUponRugpull = true;
+      continue;
+    }
+
+    if (token === "--wait") {
+      continue;
+    }
+
+    if (token === "--json") {
+      continue;
+    }
+
+    if (token === "--timeout") {
+      const value = args[i + 1]?.trim();
+      if (!value) {
+        throw new Error("Missing value for --timeout.");
+      }
+      i++;
+      continue;
+    }
+
+    if (token.startsWith("--timeout=")) {
       continue;
     }
 
@@ -138,6 +165,20 @@ export function parseWorkflowRunArgs(args: string[]): WorkflowRunArgs {
     taskParts.push(token);
   }
 
+  const wait = args.includes("--wait");
+  const jsonFlag = args.includes("--json");
+  let timeout: string | undefined;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--timeout" && i + 1 < args.length) {
+      timeout = args[i + 1];
+      break;
+    }
+    if (args[i].startsWith("--timeout=")) {
+      timeout = args[i].slice("--timeout=".length);
+      break;
+    }
+  }
+
   return {
     taskTitle: taskParts.join(" ").trim(),
     workingDirectoryForHarness,
@@ -147,5 +188,8 @@ export function parseWorkflowRunArgs(args: string[]): WorkflowRunArgs {
     noRelaunchUponRugpull,
     harnessAs,
     context,
+    wait,
+    timeout,
+    jsonFlag,
   };
 }

@@ -20,6 +20,7 @@ import { checkCatalogStalenessWarning } from "../../installer/catalog-version.js
 import { parseWorkflowRunArgs } from "../workflow-run-args.js";
 import type { HarnessType } from "../../installer/types.js";
 import { printWorkflowAutoresearch } from "./autoresearch.js";
+import { handleWait, getWaitHelp } from "./wait.js";
 
 export function getWorkflowListHelp(): string {
   return `tamandua workflow list — List available bundled workflows with descriptions
@@ -138,6 +139,16 @@ Options:
   --no-relaunch-upon-rugpull
       Disable automatic replacement-run after a rugpull (base branch move)
       is detected on a failed merge/merge-worktree run.
+  --wait
+      Block until the run reaches a terminal status (completed, failed,
+      or canceled). Heartbeat output is written to stderr; exit codes
+      follow the same precedence as tamandua workflow wait.
+  --timeout <duration>
+      Max wait duration (e.g. 30s, 10m, 2h). Only meaningful with --wait.
+      Units: s, m, h, d.
+  --json
+      When combined with --wait, print the wait result as a JSON object
+      to stdout after the run completes.
 
 Examples:
   tamandua workflow run feature-dev-merge "Add dark mode toggle"
@@ -148,7 +159,10 @@ Examples:
   tamandua workflow run feature-dev-merge "Fix bug #42" \\
       --worktree-origin-repository /repos/myapp --worktree-origin-ref develop
   tamandua workflow run quarantine-broken-tests-merge-worktree "Quarantine failing tests" \\
-      --context branch=quarantine/broken-tests`;
+      --context branch=quarantine/broken-tests
+  tamandua workflow run feature-dev-merge "Add dark mode" --wait
+  tamandua workflow run feature-dev-merge "Add dark mode" --wait --timeout 5m
+  tamandua workflow run feature-dev-merge "Add dark mode" --wait --json`;
 }
 
 export function getWorkflowStatusHelp(): string {
@@ -295,7 +309,7 @@ Examples:
 export function getWorkflowGroupHelp(): string {
   return `tamandua workflow — Manage workflows and runs
 
-Usage: tamandua workflow <list|runs|install|uninstall|run|status|autoresearch|stop|delete|pause|resume|pause-all|resume-all>
+Usage: tamandua workflow <list|runs|install|uninstall|run|status|autoresearch|stop|delete|wait|pause|resume|pause-all|resume-all>
 
 Commands for managing Tamandua workflows and their runs.
 
@@ -311,6 +325,7 @@ Subcommands:
               Show AutoResearch progress for a run
   stop        Cancel a running workflow
   delete      Permanently delete a run and all its data (--force for active runs)
+  wait        Block until workflow runs reach terminal status
   pause       Pause a running workflow via the daemon
   resume      Resume a paused or failed workflow run
   pause-all   Pause all running workflows
@@ -323,9 +338,14 @@ Examples:
   tamandua workflow run feature-dev-merge "Add a new feature"
   tamandua workflow status abc12345
   tamandua workflow autoresearch abc12345
+  tamandua workflow wait abc12345
   tamandua workflow pause abc12345 --drain`;
 }
 
+
+export function getWorkflowWaitHelp(): string {
+  return getWaitHelp();
+}
 
 export function getWorkflowAutoresearchHelp(): string {
   return `tamandua workflow autoresearch — Show AutoResearch progress for a workflow run
@@ -582,6 +602,14 @@ export async function handleWorkflow(
         process.stderr.write(warning + "\n");
       }
     }
+    // Build wait args for post-run blocking, if --wait is set
+    let waitArgs: string[] | null = null;
+    if (runArgs.wait) {
+      waitArgs = [result.runId];
+      if (runArgs.jsonFlag) waitArgs.push("--json");
+      if (runArgs.timeout) waitArgs.push("--timeout", runArgs.timeout);
+    }
+
     if (result.daemonWarning) {
       let dashboardLine = "";
       try {
@@ -596,6 +624,13 @@ export async function handleWorkflow(
     } else {
       console.log(`Run: ${result.runId.slice(0, 8)}\nWorkflow: ${result.workflowId}\nTask: ${result.taskTitle}\nStatus: ${result.status}\nHarness CWD: ${result.workingDirectoryForHarness}`);
     }
+
+    // If --wait, enter the wait loop for the newly created run
+    if (waitArgs) {
+      const exitCode = await handleWait(waitArgs);
+      process.exitCode = exitCode;
+    }
+
     return true;
   }
 
@@ -639,6 +674,14 @@ export async function handleWorkflow(
       process.exit(1);
     }
     printWorkflowAutoresearch(target);
+    return true;
+  }
+
+  if (action === "wait") {
+    // Shift args to remove the group+action prefix, keeping remaining args.
+    // handleWait returns the exit code. Set it as the process exit code.
+    const exitCode = await handleWait(args.slice(2));
+    process.exitCode = exitCode;
     return true;
   }
 

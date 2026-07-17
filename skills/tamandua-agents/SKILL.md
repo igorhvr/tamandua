@@ -46,9 +46,10 @@ Use these when managing workflow runs (outside individual step execution):
 tamandua workflow list [--json]
 tamandua workflow install <workflow-id|--all>
 tamandua workflow uninstall <workflow-id|--all> [--force]
-tamandua workflow run <workflow-id> "<task>" [--context <key=value> ...] [--working-directory-for-harness <dir>] [--worktree-origin-repository <dir>] [--worktree-origin-ref <ref>] [--pi-as-harness | --hermes-as-harness] [--no-hurry-please-save-tokens-mode] [--no-relaunch-upon-rugpull]
+tamandua workflow run <workflow-id> "<task>" [--context <key=value> ...] [--working-directory-for-harness <dir>] [--worktree-origin-repository <dir>] [--worktree-origin-ref <ref>] [--pi-as-harness | --hermes-as-harness] [--no-hurry-please-save-tokens-mode] [--no-relaunch-upon-rugpull] [--wait [--timeout <dur>] [--json]]
 tamandua workflow status <query>
 tamandua workflow runs
+tamandua workflow wait <selector...> [--all] [--timeout <dur>] [--json] [--quiet]
 tamandua workflow pause <run-id>
 tamandua workflow pause-all [--drain]
 tamandua workflow resume <run-id>
@@ -62,6 +63,35 @@ tamandua nudge
 `tamandua nudge` wakes all scheduled agents for all currently running runs,
 causing them to poll once immediately without waiting for their normal
 timers. Does not resume paused runs or interrupt in-flight agents.
+
+`tamandua workflow wait` blocks until the selected runs reach a terminal
+status (completed/done, failed, or canceled) or until `--timeout` expires.
+Selectors can be a run UUID, a unique run-id prefix, or `#N` (run number).
+Multiple selectors wait for all of them; `--all` waits for every non-terminal
+run at invocation time. Without `--timeout`, waits indefinitely.
+
+The `--wait` flag on `tamandua workflow run` starts the run and then enters
+the wait behavior above for that run. With `--json`, the wait result is
+printed as a JSON object.
+
+**Exit codes** (precedence top-down):
+- 4 — selector not found or ambiguous prefix
+- 2 — timeout expired with at least one run still non-terminal
+- 1 — at least one run failed
+- 3 — at least one run canceled (and none failed)
+- 0 — all runs completed successfully
+
+Exit code 2 is an expected, documented outcome — it means the bounded wait
+window elapsed and the caller should decide whether to keep waiting.
+
+**Bounded-wait loop pattern** for capped shell harnesses:
+```bash
+while ! tamandua workflow wait <selector> --timeout 5m; do
+  [ $? -eq 2 ] || break
+done
+```
+This polls in 5-minute windows until the run finishes (code 0) or fails
+permanently (code 1/3/4).
 
 `resume` works for both paused runs (restarted via the daemon) and failed
 runs (resumed directly). `pause-all --drain` lets in-progress steps finish
