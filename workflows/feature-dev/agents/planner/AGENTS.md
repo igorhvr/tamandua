@@ -78,14 +78,18 @@ Maximum **20 stories** per run. If the task genuinely needs more, the task is to
 
 Malformed STORIES_JSON (fused objects, duplicate keys, invalid story fields) is auto-rejected with specific feedback in RETRY FEEDBACK on retry. Read RETRY FEEDBACK carefully and fix exactly what it describes.
 
+The `STORIES_JSON` value must be a minified single-line JSON array ending with `]`, with no trailing prose. It must not contain embedded newline-separated lines starting with `UPPERCASE_KEY:` because the extractor truncates at those lines. Build the array with `python3` and `json.dumps` via a heredoc, then pipe the completed report, rather than hand-quoting JSON.
+
 ## CRITICAL — STATUS Line Requirement
 
 Your output is parsed by an automated scheduler. It looks for **exact markers** to determine step outcome:
 
-- **On success:** The **last line** of your output MUST be exactly `STATUS: done` — not "done", not "Step completed successfully", not a summary. The literal string `STATUS: done`.
-- **On failure:** End your output with `STATUS: failed` and a `REASON:` line explaining what went wrong.
+- **On success:** `STATUS: done` must appear as its own plain-text line. By convention it is the first report line, followed by the role-specific `KEY:` lines shown below. The scheduler matches status markers anywhere in the report piped to step completion.
+- **On failure:** If you could not do the work, report `STATUS: failed` with a `REASON:` line and use `step fail <stepId> "<reason>"`.
 
-If neither marker is present, the scheduler treats the step as **lost/abandoned** and retried — wasting a retry slot even if the work was actually completed. This is the most common cause of spurious retries.
+STATUS: and KEY: lines must start at column 0 as plain text — no bold, no backticks, no fences, and no leading bullets. Piping the report into `tamandua step complete <stepId>` is the only thing that completes a step; printing `STATUS: done` in a final chat or session message does not complete it.
+
+If no status marker is present in the piped report, the scheduler treats the step as **lost/abandoned** and retries it — wasting a retry slot even if the work was actually completed. This is the most common cause of spurious retries.
 
 ## Output Format
 
@@ -95,25 +99,7 @@ Your output MUST include these KEY: VALUE lines:
 STATUS: done
 REPO: /path/to/repo
 BRANCH: feature-branch-name
-STORIES_JSON: [
-  {
-    "id": "US-001",
-    "title": "Short descriptive title",
-    "description": "As a developer, I need to... so that...\n\nImplementation notes:\n- Detail 1\n- Detail 2",
-    "acceptanceCriteria": [
-      "Specific verifiable criterion 1",
-      "Specific verifiable criterion 2",
-      "Tests for [feature] pass",
-      "Typecheck passes"
-    ]
-  },
-  {
-    "id": "US-002",
-    "title": "...",
-    "description": "...",
-    "acceptanceCriteria": ["...", "Typecheck passes"]
-  }
-]
+STORIES_JSON: [{"id":"US-001","title":"Short descriptive title","description":"As a developer, I need to... so that...\n\nImplementation notes:\n- Detail 1\n- Detail 2","acceptanceCriteria":["Specific verifiable criterion 1","Specific verifiable criterion 2","Tests for [feature] pass","Typecheck passes"]},{"id":"US-002","title":"...","description":"...","acceptanceCriteria":["...","Typecheck passes"]}]
 ```
 
 **STORIES_JSON** must be valid JSON. The array is parsed by the pipeline to create trackable story records.
