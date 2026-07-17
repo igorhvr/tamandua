@@ -694,6 +694,100 @@ try {
   });
 });
 
+// ── ACQUIRE cleanup fault handling ───────────────────────────────────────
+
+describe("Acquire cleanup fault handling", () => {
+  it("preserves the primary acquisition error when rollback also fails", () => {
+    const temp = createTempHome("update-protocol-rollback-fault-");
+    try {
+      const dbPath = path.join(temp.root, "rollback-fault.db");
+      const env = cleanChildEnv({
+        HOME: temp.homeDir,
+        TAMANDUA_STATE_DIR: path.join(temp.homeDir, ".tamandua"),
+        TAMANDUA_DB_PATH: dbPath,
+      });
+
+      const setupResult = spawnSync(
+        process.execPath,
+        [
+          "--input-type=module",
+          "-e",
+          `import { getDb, closeDb } from ${JSON.stringify(DIST_DB)};
+process.env.TAMANDUA_DB_PATH = ${JSON.stringify(dbPath)};
+getDb();
+closeDb();`,
+        ],
+        { encoding: "utf-8", env, timeout: 30000 },
+      );
+      assert.equal(setupResult.status, 0, `Setup failed: ${setupResult.stderr}`);
+
+      const result = spawnSync(
+        process.execPath,
+        [
+          "--input-type=module",
+          "-e",
+          `import { DatabaseSync } from "node:sqlite";
+import { writeSync } from "node:fs";
+
+const primaryMessage = "DISTINCTIVE_PRIMARY_ACQUIRE_FAILURE";
+const secondaryMessage = "DISTINCTIVE_SECONDARY_ROLLBACK_FAILURE";
+const originalExec = DatabaseSync.prototype.exec;
+let rollbackAttempts = 0;
+
+DatabaseSync.prototype.exec = function(sql) {
+  if (sql.startsWith("CREATE TRIGGER trg_update_gate_block_runs_insert")) {
+    throw new Error(primaryMessage);
+  }
+  if (sql === "ROLLBACK") {
+    rollbackAttempts++;
+    throw new Error(secondaryMessage);
+  }
+  return originalExec.call(this, sql);
+};
+
+const { acquire } = await import(${JSON.stringify(PROTOCOL_MODULE)});
+try {
+  acquire("current", process.ppid, "{}", "{}", "{}");
+  writeSync(1, JSON.stringify({ error: null, rollbackAttempts }) + "\\n");
+  process.exitCode = 2;
+} catch (error) {
+  writeSync(1, JSON.stringify({ error: error.message, rollbackAttempts }) + "\\n");
+}`,
+        ],
+        { encoding: "utf-8", env, timeout: 30000 },
+      );
+
+      assert.equal(result.status, 0, `Fault probe failed: ${result.stderr}`);
+      assert.equal(result.signal, null);
+      assert.ok(result.error === undefined);
+      assert.equal(result.stderr, "", "secondary rollback error must not leak");
+      assert.deepEqual(JSON.parse(result.stdout), {
+        error: "DISTINCTIVE_PRIMARY_ACQUIRE_FAILURE",
+        rollbackAttempts: 1,
+      });
+
+      const db = new DatabaseSync(dbPath);
+      try {
+        const residue = db
+          .prepare(
+            `SELECT type, name FROM sqlite_schema
+             WHERE name IN (
+               'update_gate',
+               'trg_update_gate_block_runs_insert',
+               'trg_update_gate_block_runs_update'
+             )`,
+          )
+          .all();
+        assert.deepEqual(residue, [], "failed acquisition must leave no residue");
+      } finally {
+        db.close();
+      }
+    } finally {
+      fs.rmSync(temp.root, { recursive: true, force: true });
+    }
+  });
+});
+
 // ── RACE: real orderings with separate processes and IPC barriers ────────
 
 describe("RACE conditions", () => {

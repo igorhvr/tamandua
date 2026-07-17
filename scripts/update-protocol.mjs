@@ -422,12 +422,6 @@ function createBlockingTriggersCanonical(db) {
   db.exec(CANONICAL_TRIGGER_UPDATE_DDL);
 }
 
-function dropGateAndTriggers(db) {
-  db.exec(`DROP TRIGGER IF EXISTS trg_update_gate_block_runs_insert`);
-  db.exec(`DROP TRIGGER IF EXISTS trg_update_gate_block_runs_update`);
-  db.exec(`DROP TABLE IF EXISTS ${GATE_TABLE}`);
-}
-
 // ── Active work detection ────────────────────────────────────────────────────
 
 function hasRunningOrPausedWork(db) {
@@ -512,67 +506,75 @@ export function acquire(mode, updaterPid, topology, artifacts, readiness) {
   const db = new DatabaseSync(dbPath);
   db.exec("PRAGMA busy_timeout = 10000");
 
+  let inTransaction = false;
   try {
     // BEGIN IMMEDIATE as the first acquisition predicate — no gateExists() before the lock
     db.exec("BEGIN IMMEDIATE");
+    inTransaction = true;
 
-    try {
-      // Inspect reserved artifacts under the writer lock
-      const existing = lookupReservedArtifacts(db);
+    // Inspect reserved artifacts under the writer lock
+    const existing = lookupReservedArtifacts(db);
 
-      if (existing.length > 0) {
-        const validation = validateArtifactSet(existing);
-        if (validation.canonical) {
-          throw new Error("Update gate already exists — acquisition refused");
-        }
-        throw new Error("Update protocol artifacts are corrupted — acquisition refused");
+    if (existing.length > 0) {
+      const validation = validateArtifactSet(existing);
+      if (validation.canonical) {
+        throw new Error("Update gate already exists — acquisition refused");
       }
+      throw new Error("Update protocol artifacts are corrupted — acquisition refused");
+    }
 
-      // No reserved artifacts exist — create canonical set
-      createGateTableCanonical(db);
-      createBlockingTriggersCanonical(db);
+    // No reserved artifacts exist — create canonical set
+    createGateTableCanonical(db);
+    createBlockingTriggersCanonical(db);
 
-      // Read back and validate created artifacts
-      const created = lookupReservedArtifacts(db);
-      const postValidation = validateArtifactSet(created);
-      if (!postValidation.canonical) {
-        throw new Error("Update protocol artifact validation failed after creation");
-      }
+    // Read back and validate created artifacts
+    const created = lookupReservedArtifacts(db);
+    const postValidation = validateArtifactSet(created);
+    if (!postValidation.canonical) {
+      throw new Error("Update protocol artifact validation failed after creation");
+    }
 
-      // Only after validated canonical artifacts exist, check for active work
-      if (hasRunningOrPausedWork(db)) {
-        throw new Error("Active work exists — acquisition refused");
-      }
+    // Only after validated canonical artifacts exist, check for active work
+    if (hasRunningOrPausedWork(db)) {
+      throw new Error("Active work exists — acquisition refused");
+    }
 
-      // Insert singleton ACQUIRED row
-      const token = crypto.randomBytes(32).toString("base64url");
-      const now = new Date().toISOString();
+    // Insert singleton ACQUIRED row
+    const token = crypto.randomBytes(32).toString("base64url");
+    const now = new Date().toISOString();
 
-      db.prepare(
-        `INSERT INTO ${GATE_TABLE}
+    db.prepare(
+      `INSERT INTO ${GATE_TABLE}
          (id, token, mode, phase, owner_pid, owner_identity, topology, artifacts, readiness, created_at, updated_at)
          VALUES (?, ?, ?, 'ACQUIRED', ?, ?, ?, ?, ?, ?, ?)`,
-      ).run(
-        SINGLETON_ID,
-        token,
-        mode,
-        updaterPid,
-        ownerIdentity,
-        topology,
-        artifacts,
-        readiness,
-        now,
-        now,
-      );
+    ).run(
+      SINGLETON_ID,
+      token,
+      mode,
+      updaterPid,
+      ownerIdentity,
+      topology,
+      artifacts,
+      readiness,
+      now,
+      now,
+    );
 
-      db.exec("COMMIT");
+    db.exec("COMMIT");
+    inTransaction = false;
 
-      return { token, phase: "ACQUIRED", mode, ownerPid: updaterPid, ownerIdentity };
-    } catch (e) {
-      // Rollback on any failure after BEGIN IMMEDIATE — no DDL, gate row, or mutation survives
-      db.exec("ROLLBACK");
-      throw e;
+    return { token, phase: "ACQUIRED", mode, ownerPid: updaterPid, ownerIdentity };
+  } catch (e) {
+    if (inTransaction) {
+      // Best-effort cleanup must never replace the primary acquisition failure.
+      try {
+        db.exec("ROLLBACK");
+        inTransaction = false;
+      } catch {
+        // Closing the connection below rolls back any still-active transaction.
+      }
     }
+    throw e;
   } finally {
     db.close();
   }
