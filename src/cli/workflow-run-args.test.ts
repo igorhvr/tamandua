@@ -87,4 +87,76 @@ describe("parseWorkflowRunArgs", () => {
     assert.deepEqual(result.context, {});
     assert.equal(result.worktreeOriginRepository, "/tmp/repo");
   });
+
+  it("parses --wait flag", () => {
+    const result = parseWorkflowRunArgs(["Do something", "--wait"]);
+    assert.equal(result.wait, true);
+    assert.equal(result.jsonFlag, false);
+    assert.equal(result.timeout, undefined);
+  });
+
+  it("wait is false by default", () => {
+    const result = parseWorkflowRunArgs(["Do something"]);
+    assert.equal(result.wait, false);
+    assert.equal(result.jsonFlag, false);
+    assert.equal(result.timeout, undefined);
+  });
+
+  it("parses --timeout <duration>", () => {
+    const result = parseWorkflowRunArgs(["Do something", "--wait", "--timeout", "30s"]);
+    assert.equal(result.wait, true);
+    assert.equal(result.timeout, "30s");
+  });
+
+  it("parses --timeout=<duration>", () => {
+    const result = parseWorkflowRunArgs(["Do something", "--wait", "--timeout=10m"]);
+    assert.equal(result.wait, true);
+    assert.equal(result.timeout, "10m");
+  });
+
+  it("parses --json flag", () => {
+    const result = parseWorkflowRunArgs(["Do something", "--wait", "--json"]);
+    assert.equal(result.wait, true);
+    assert.equal(result.jsonFlag, true);
+  });
+
+  it("parses --wait, --timeout, and --json together", () => {
+    const result = parseWorkflowRunArgs(["Do something", "--wait", "--timeout", "2h", "--json"]);
+    assert.equal(result.wait, true);
+    assert.equal(result.timeout, "2h");
+    assert.equal(result.jsonFlag, true);
+  });
+
+  it("--wait does not affect task title", () => {
+    const result = parseWorkflowRunArgs(["My task description", "--wait", "--timeout", "90s"]);
+    assert.equal(result.taskTitle, "My task description");
+  });
+
+  it("--json without --wait is parsed correctly", () => {
+    const result = parseWorkflowRunArgs(["Do something", "--json"]);
+    assert.equal(result.wait, false);
+    assert.equal(result.jsonFlag, true);
+  });
+
+  it("--wait combined with other flags preserves them", () => {
+    const result = parseWorkflowRunArgs([
+      "--no-hurry-please-save-tokens-mode",
+      "--wait",
+      "--timeout", "5m",
+      "--context", "branch=fix/x",
+      "Build feature",
+    ]);
+    assert.equal(result.wait, true);
+    assert.equal(result.timeout, "5m");
+    assert.equal(result.noHurrySaveTokensMode, true);
+    assert.deepEqual(result.context, { branch: "fix/x" });
+    assert.equal(result.taskTitle, "Build feature");
+  });
+
+  it("rejects --timeout with missing value", () => {
+    assert.throws(
+      () => parseWorkflowRunArgs(["task", "--timeout"]),
+      /Missing value for --timeout/,
+    );
+  });
 });

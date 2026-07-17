@@ -113,10 +113,15 @@ import {
   getWorkflowUninstallHelp,
   handleWorkflow,
 } from "./commands/workflow.js";
+import { getWaitHelp } from "./commands/wait.js";
 import {
   getMergeBranchHelp,
   handleMergeBranch,
 } from "./commands/merge-branch.js";
+import {
+  getRestartHelp,
+  handleRestart,
+} from "./commands/restart.js";
 
 function getUsageText(): string {
   return [
@@ -136,6 +141,7 @@ function getUsageText(): string {
     "                                      [--worktree-origin-ref <ref>]",
     "                                      [--pi-as-harness | --hermes-as-harness]",
     "                                      [--no-relaunch-upon-rugpull]",
+    "                                      [--wait] [--timeout <dur>] [--json]",
     "                                      Start a workflow run",
     "", "tamandua worktree list                List managed worktrees",
     "tamandua worktree status <run-id>     Show worktree details for a run",
@@ -161,6 +167,8 @@ function getUsageText(): string {
     "tamandua workflow resume-all           Resume all paused workflows",
     "tamandua workflow stop <run-id>       Stop/cancel a running workflow",
     "tamandua workflow delete <run-id>     Permanently delete a run [--force]",
+    "tamandua workflow wait <selector...> [--all] [--timeout <dur>] [--json] [--quiet]",
+    "                                      Block until runs reach terminal status",
     "tamandua mcp start [--port N]         Start MCP server (default: 3338)",
     "tamandua mcp stop                     Stop MCP server",
     "tamandua mcp restart [--port N]       Restart MCP server",
@@ -177,6 +185,7 @@ function getUsageText(): string {
     "tamandua dashboard stop               Stop dashboard",
     "tamandua dashboard restart [--port N] Restart dashboard",
     "tamandua dashboard status             Check dashboard status",
+    "", "tamandua restart [--force]            Restart all services with stop→ready barrier",
     "", "tamandua step peek <agent-id> --run-id <run-id>     Check for pending work (HAS_WORK or NO_WORK)",
     "tamandua step claim <agent-id> --run-id <run-id>    Claim pending step (JSON output)",
     "tamandua step complete <step-id>      Complete step (reads output from stdin)",
@@ -286,6 +295,7 @@ async function main() {
       if (action === "resume") { printHelp(getWorkflowResumeHelp()); }
       if (action === "pause-all") { printHelp(getWorkflowPauseAllHelp()); }
       if (action === "resume-all") { printHelp(getWorkflowResumeAllHelp()); }
+      if (action === "wait") { printHelp(getWaitHelp()); }
       printHelp(getWorkflowGroupHelp());
     }
     if (group === "worktree") {
@@ -306,6 +316,9 @@ async function main() {
       if (action === "prune") { printHelp(getAutoresearchPruneHelp()); }
       if (action === "wizard") { printHelp(getAutoresearchWizardHelp()); }
       printHelp(getAutoresearchHelp());
+    }
+    if (group === "restart") {
+      printHelp(getRestartHelp());
     }
     if (group === "nudge") {
       printHelp(getNudgeHelp());
@@ -338,6 +351,8 @@ async function main() {
 
   if (await handleDaemon(group, args)) { return; }
 
+  if (await handleRestart(group, args)) { return; }
+
   if (await handleStatus(group, args)) { return; }
 
   if (await handleStep(group, args)) { return; }
@@ -353,4 +368,9 @@ async function main() {
   printUsage(); process.exit(1);
 }
 
-await main().catch((err) => { console.error("Error:", err.message); process.exit(1); });
+main().then(
+  () => {
+    // Use process.exitCode if set (e.g. by workflow wait), else 0
+    process.exit(process.exitCode ?? 0);
+  },
+).catch((err: Error) => { console.error("Error:", err.message); process.exit(1); });

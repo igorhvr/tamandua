@@ -346,6 +346,52 @@ describe("SKILL.md workflow run command completeness", () => {
       "SKILL.md must document --no-relaunch-upon-rugpull flag"
     );
   });
+
+  it("documents repeatable workflow template context", () => {
+    assert.match(skillContent, /`--context key=value` injects a template context key[^.]*and is\s+repeatable\./);
+    assert.match(skillContent, /splits each value on the first `=` and rejects duplicate\s+keys/);
+    assert.ok(
+      skillContent.includes("--context branch=feature/my-branch"),
+      "SKILL.md must include a concrete --context example"
+    );
+  });
+
+  it("documents workflow workspace modes and mutually exclusive flags", () => {
+    assert.match(skillContent, /`run\.workspace` as `direct` \(the default\) or `worktree`/);
+    assert.match(skillContent, /Workflow IDs ending in `-worktree` use worktree mode/);
+    assert.match(skillContent, /Direct mode rejects both `--worktree-origin-repository` and\s+`--worktree-origin-ref`/);
+    assert.match(skillContent, /Worktree-mode workflows reject `--working-directory-for-harness`/);
+    assert.match(skillContent, /Use\s+`--worktree-origin-repository <dir>`.*\s+`--worktree-origin-ref <ref>`/);
+  });
+
+  it("documents the clean-origin requirement for worktree launches", () => {
+    assert.match(skillContent, /worktree launch requires the origin repository to have no uncommitted\s+changes/);
+    assert.match(skillContent, /Commit or stash changes before launching/);
+  });
+});
+
+describe("SKILL.md workflow supervision guidance", () => {
+  it("shows safe task quoting and the operator inspection commands", () => {
+    assert.ok(skillContent.includes("#### Supervising a run"));
+    assert.ok(skillContent.includes('"$(cat task.md)"'));
+    assert.ok(skillContent.includes("tamandua workflow status <run-id>"));
+    assert.ok(skillContent.includes("tamandua workflow runs"));
+    assert.ok(skillContent.includes("tamandua logs <run-id>"));
+    assert.ok(skillContent.includes("tamandua workflow stop <run-id>"));
+    assert.match(skillContent, /success message says `Cancelled`, but the command verb is\s+`stop`/);
+  });
+
+  it("prefers CLI inspection and constrains direct state access", () => {
+    assert.match(skillContent, /Prefer these CLI commands for run-state inspection/);
+    assert.ok(skillContent.includes("sqlite3 -readonly ~/.tamandua/tamandua.db"));
+    assert.match(skillContent, /do not use the database as the\s+first resort/);
+  });
+
+  it("warns that installed workflows are overwritten", () => {
+    assert.match(skillContent, /Never edit installed workflow files under `~\/\.tamandua\/workflows`/);
+    assert.match(skillContent, /every\s+install and update overwrites them/);
+    assert.match(skillContent, /copy it under a\s+new workflow ID/);
+  });
 });
 
 describe("SKILL.md worktree commands documented", () => {
@@ -511,6 +557,57 @@ describe("SKILL.md output format accuracy", () => {
       skillContent.includes("step fail") && skillContent.includes("reason"),
       "SKILL.md must document step fail with reason parameter"
     );
+  });
+
+  const lifecycleSection = skillContent.slice(
+    skillContent.indexOf("### 3) Follow the step lifecycle exactly"),
+    skillContent.indexOf("### 4) Completion contract"),
+  );
+  const completionSection = skillContent.slice(
+    skillContent.indexOf("### 4) Completion contract"),
+    skillContent.indexOf("### 2.1) MCP run start (remote)"),
+  );
+
+  it("documents scheduled-agent peek behavior and the claim race", () => {
+    assert.match(lifecycleSection, /dispatch prompt[^]*step is\s+pending/i);
+    assert.match(lifecycleSection, /scheduled agents[^]*step peek[^]*optional/i);
+    assert.match(lifecycleSection, /manual or diagnostic/i);
+    assert.match(lifecycleSection, /NO_WORK[^]*HAS_WORK[^]*another worker won[^]*race[^]*loop completed/i);
+    assert.match(lifecycleSection, /check for `NO_WORK` before[^]*pars(?:e|ing)[^]*JSON/i);
+  });
+
+  it("documents the real completion and verifier verdict channels", () => {
+    assert.match(completionSection, /On success[^]*`STATUS: done`[^]*own\s+plain-text line/i);
+    assert.match(completionSection, /convention[^]*first report[^]*KEY:/i);
+    assert.match(completionSection, /markers[^]*anywhere in the piped output/i);
+    assert.match(completionSection, /ONLY\s+thing that completes a step/i);
+    assert.match(completionSection, /final chat or\s+session message does not complete/i);
+    assert.match(completionSection, /verifier[^]*rejects[^]*`STATUS: retry`[^]*step complete/i);
+    assert.match(completionSection, /step fail[^]*could not do the work/i);
+    assert.match(completionSection, /Do not\s+use `step fail`[^]*retry verdict/i);
+    assert.match(completionSection, /lost\/abandoned[^]*retry slot/i);
+    assert.doesNotMatch(
+      skillContent,
+      /last line of successful output must be exactly\s*`STATUS: done`/i,
+    );
+  });
+
+  it("requires plain-text contract lines at column zero", () => {
+    assert.match(completionSection, /STATUS: and KEY:[^.]*column 0[^.]*plain text/i);
+    assert.match(completionSection, /no bold[^.]*backticks[^.]*fences[^.]*leading bullets/i);
+    assert.ok(
+      completionSection.includes("`**BRANCH:** foo` fails validation; `BRANCH: foo` passes."),
+      "SKILL.md must contain the exact wrong/right contract-line pair",
+    );
+  });
+
+  it("documents STORIES_JSON extraction constraints and safe construction", () => {
+    assert.match(completionSection, /STORIES_JSON[^]*single-line\s+JSON[^]*array ending with `\]`/i);
+    assert.match(completionSection, /no trailing prose/i);
+    assert.match(completionSection, /embedded newline-separated[^]*UPPERCASE_KEY:/i);
+    assert.match(completionSection, /extractor truncates/i);
+    assert.match(completionSection, /python3[^]*json\.dumps[^]*heredoc[^]*pip/i);
+    assert.match(completionSection, /rather than hand-quoting/i);
   });
 });
 

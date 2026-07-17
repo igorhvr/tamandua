@@ -28,10 +28,14 @@ Only add flags through the wrapper's `--force` option when you suspect a flaky o
 
 Your output is parsed by an automated scheduler. It looks for **exact markers** to determine step outcome:
 
-- **On success:** The **last line** of your output MUST be exactly `STATUS: done` — not "done", not "Step completed successfully", not a summary. The literal string `STATUS: done`.
-- **On failure:** End your output with `STATUS: failed` and a `REASON:` line explaining what went wrong.
+- **On success:** `STATUS: done` must appear as its own plain-text line. By convention it is the first report line, followed by the role-specific `KEY:` lines shown below. The scheduler matches status markers anywhere in the report piped to step completion.
+- **On failure:** If you could not do the work, report `STATUS: failed` with a `REASON:` line and use `step fail <stepId> "<reason>"`.
 
-If neither marker is present, the scheduler treats the step as **lost/abandoned** and retried — wasting a retry slot even if the work was actually completed. This is the most common cause of spurious retries.
+STATUS: and KEY: lines must start at column 0 as plain text — no bold, no backticks, no fences, and no leading bullets. Piping the report into `tamandua step complete <stepId>` is the only thing that completes a step; printing `STATUS: done` in a final chat or session message does not complete it.
+
+If no status marker is present in the piped report, the scheduler treats the step as **lost/abandoned** and retries it — wasting a retry slot even if the work was actually completed. This is the most common cause of spurious retries.
+
+When rejecting work as a verifier or tester, pipe the rejection report into `step complete <stepId>` with `STATUS: retry` plus a reason or summary; this reroutes the producer. Do not use `step fail` to deliver a retry verdict — `step fail` means you could not do the work.
 
 ## Output Format
 

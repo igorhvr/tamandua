@@ -41,6 +41,9 @@ describe("parseWorkflowRunArgs", () => {
       noRelaunchUponRugpull: undefined,
       harnessAs: undefined,
       context: {},
+      wait: false,
+      timeout: undefined,
+      jsonFlag: false,
     });
   });
 

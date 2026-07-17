@@ -141,7 +141,6 @@ describe("SPL2 CLI static structure", () => {
 
   it("keeps every command module reachable from src/cli/cli.ts", () => {
     const unreachable = findUnreachableCommandModules(repositoryCliSources());
-
     assert.deepEqual(
       unreachable,
       [],

@@ -46,9 +46,10 @@ Use these when managing workflow runs (outside individual step execution):
 tamandua workflow list [--json]
 tamandua workflow install <workflow-id|--all>
 tamandua workflow uninstall <workflow-id|--all> [--force]
-tamandua workflow run <workflow-id> "<task>" [--working-directory-for-harness <dir>] [--worktree-origin-repository <dir>] [--worktree-origin-ref <ref>] [--pi-as-harness | --hermes-as-harness] [--no-hurry-please-save-tokens-mode] [--no-relaunch-upon-rugpull]
+tamandua workflow run <workflow-id> "<task>" [--context <key=value> ...] [--working-directory-for-harness <dir>] [--worktree-origin-repository <dir>] [--worktree-origin-ref <ref>] [--pi-as-harness | --hermes-as-harness] [--no-hurry-please-save-tokens-mode] [--no-relaunch-upon-rugpull] [--wait [--timeout <dur>] [--json]]
 tamandua workflow status <query>
 tamandua workflow runs
+tamandua workflow wait <selector...> [--all] [--timeout <dur>] [--json] [--quiet]
 tamandua workflow pause <run-id>
 tamandua workflow pause-all [--drain]
 tamandua workflow resume <run-id>
@@ -62,6 +63,35 @@ tamandua nudge
 `tamandua nudge` wakes all scheduled agents for all currently running runs,
 causing them to poll once immediately without waiting for their normal
 timers. Does not resume paused runs or interrupt in-flight agents.
+
+`tamandua workflow wait` blocks until the selected runs reach a terminal
+status (completed/done, failed, or canceled) or until `--timeout` expires.
+Selectors can be a run UUID, a unique run-id prefix, or `#N` (run number).
+Multiple selectors wait for all of them; `--all` waits for every non-terminal
+run at invocation time. Without `--timeout`, waits indefinitely.
+
+The `--wait` flag on `tamandua workflow run` starts the run and then enters
+the wait behavior above for that run. With `--json`, the wait result is
+printed as a JSON object.
+
+**Exit codes** (precedence top-down):
+- 4 — selector not found or ambiguous prefix
+- 2 — timeout expired with at least one run still non-terminal
+- 1 — at least one run failed
+- 3 — at least one run canceled (and none failed)
+- 0 — all runs completed successfully
+
+Exit code 2 is an expected, documented outcome — it means the bounded wait
+window elapsed and the caller should decide whether to keep waiting.
+
+**Bounded-wait loop pattern** for capped shell harnesses:
+```bash
+while ! tamandua workflow wait <selector> --timeout 5m; do
+  [ $? -eq 2 ] || break
+done
+```
+This polls in 5-minute windows until the run finishes (code 0) or fails
+permanently (code 1/3/4).
 
 `resume` works for both paused runs (restarted via the daemon) and failed
 runs (resumed directly). `pause-all --drain` lets in-progress steps finish
@@ -77,10 +107,58 @@ bundled workflow in one command. `uninstall` removes the workflow and its
 agent configuration. Use `--force` to skip the active-runs safety check.
 `uninstall --all` removes every installed workflow.
 
-Installed bundled workflow files are **refreshed on every install and every
-`tamandua update`** — local edits are silently overwritten. To customize a
-workflow, copy it under a NEW workflow id instead of editing the installed
-copy.
+Run context guidance:
+
+- `--context key=value` injects a template context key into the run and is
+  repeatable. Tamandua splits each value on the first `=` and rejects duplicate
+  keys.
+- Example: `--context branch=feature/my-branch`.
+
+Workspace-mode guidance:
+
+- Workflows declare `run.workspace` as `direct` (the default) or `worktree`.
+  Workflow IDs ending in `-worktree` use worktree mode.
+- Direct-mode workflows may use `--working-directory-for-harness`; when it is
+  omitted, the directory defaults to the shell's current working directory.
+  Direct mode rejects both `--worktree-origin-repository` and
+  `--worktree-origin-ref`.
+- Worktree-mode workflows reject `--working-directory-for-harness`. Use
+  `--worktree-origin-repository <dir>` to select the origin repository and
+  `--worktree-origin-ref <ref>` to select a branch, tag, or SHA. These default
+  to the current repository and current branch, respectively.
+- A worktree launch requires the origin repository to have no uncommitted
+  changes. Commit or stash changes before launching, or Tamandua refuses the
+  launch.
+- Worktree runs never modify the origin repository; all run changes stay in
+  the isolated worktree.
+
+#### Supervising a run
+
+Put a substantial task in a file and preserve it as one quoted CLI argument:
+
+```bash
+tamandua workflow run <workflow-id> "$(cat task.md)" [workspace-mode flags]
+```
+
+Inspect and stop the run with the CLI:
+
+```bash
+tamandua workflow status <run-id>
+tamandua workflow runs
+tamandua logs <run-id>
+tamandua workflow stop <run-id>
+```
+
+The stop command's success message says `Cancelled`, but the command verb is
+`stop`. Prefer these CLI commands for run-state inspection. If the CLI does not
+expose a needed field, reading `~/.tamandua/tamandua.db` directly is an
+acceptable fallback, but always open it read-only with
+`sqlite3 -readonly ~/.tamandua/tamandua.db`; do not use the database as the
+first resort.
+
+Never edit installed workflow files under `~/.tamandua/workflows`: every
+install and update overwrites them, so local edits are silently overwritten.
+To customize a workflow, copy it under a new workflow ID instead.
 
 Use `tamandua update [--force]` only for local Tamandua maintenance. Without
 `--force`, update blocks after rebuilding if active runs are present — it
@@ -90,6 +168,11 @@ despite active runs (services are stopped and restarted, workflows reinstalled
 Remote MCP clients can discover the same maintenance command via
 `tamandua.update.command`; run the actual update through the local CLI because
 it may restart dashboard, MCP, and the control plane.
+
+**After a local build** (no remote pull): use `./build && ./install` followed
+by `tamandua restart` to pick up the new code. `restart` stops and restarts
+all services from the currently installed build without reinstalling workflows —
+it is the sanctioned replacement for the `sleep 2; tamandua get-ready` idiom.
 
 Harness working directory guidance:
 
@@ -104,7 +187,6 @@ Worktree guidance:
   SHA in the worktree. Defaults to the current branch.
 - Worktree runs never modify the origin repository — all changes stay in
   the isolated worktree.
-
 `--no-hurry-please-save-tokens-mode` makes the run prefer the
 `pi-token-saver` harness: every work spawn looks for a `pi-token-saver`
 command on PATH first (per invocation, so installing it mid-run takes
@@ -177,13 +259,13 @@ dispatch (hosted by the daemon process alongside the reconciler/motor).
 **Live-instance isolation (for agents running INSIDE a tamandua run):** the
 `tamandua step` reporting commands (claim / complete / fail, documented
 below) are the ONLY sanctioned interaction with the live tamandua instance
-that is scheduling you. Never start/stop/restart the live daemon, MCP, or control plane — to
-exercise lifecycle behavior, spin up an ISOLATED instance instead: point
-`HOME`/`TAMANDUA_STATE_DIR` at a temp directory and use non-default ports
-(`TAMANDUA_CONTROL_PORT` plus explicit `--port` values). As a backstop,
-`stop`/`restart` refuse to signal the daemon that scheduled you
-("Refusing to stop the daemon…"): that error means you targeted
-the live instance — switch to an isolated one.
+that is scheduling you. Never start/stop/restart the live daemon, MCP, or control plane — including
+`tamandua restart`, which restarts all three. To exercise lifecycle behavior,
+spin up an ISOLATED instance instead: point `HOME`/`TAMANDUA_STATE_DIR` at a
+temp directory and use non-default ports (`TAMANDUA_CONTROL_PORT` plus
+explicit `--port` values). As a backstop, `stop`/`restart` refuse to signal
+the daemon that scheduled you ("Refusing to stop the daemon…"): that error
+means you targeted the live instance — switch to an isolated one.
 
 ```bash
 tamandua control-plane start [--port N]
@@ -575,13 +657,20 @@ tamandua autoresearch wizard --cwd /path/to/project
 
 ### 3) Follow the step lifecycle exactly
 
-Always execute step commands in this order:
+Scheduled workflow agents are told by their dispatch prompt that a step is
+pending. For those scheduled agents, `tamandua step peek` is optional; peek is
+primarily useful for manual or diagnostic operation. Whether or not you peek,
+follow the claim lifecycle:
 
-1. `tamandua step peek <agent-id> --run-id <run-id>`
-2. If result is `HAS_WORK`, run `tamandua step claim <agent-id> --run-id <run-id>`
-3. Parse claim JSON: `{"stepId":"...","runId":"...","input":"..."}`
-4. **SAVE `stepId` immediately** and execute the `input` task
-5. Report with the saved step id:
+1. Optionally run `tamandua step peek <agent-id> --run-id <run-id>`.
+2. Run `tamandua step claim <agent-id> --run-id <run-id>` when the dispatch
+   prompt says work is pending or peek returns `HAS_WORK`.
+3. Check for `NO_WORK` before parsing the claim output as JSON. A claim can
+   legally return `NO_WORK` even after `HAS_WORK` because another worker won
+   the race or the loop completed. If it does, stop without doing step work.
+4. Otherwise parse claim JSON: `{"stepId":"...","runId":"...","input":"..."}`.
+5. **SAVE `stepId` immediately** and execute the `input` task.
+6. Report with the saved step id:
    - Success: `tamandua step complete <stepId>` (send status output through stdin)
    - Failure: `tamandua step fail <stepId> "<reason>"`
 
@@ -595,23 +684,68 @@ pipelines or understanding story progress.
 
 ### 4) Completion contract
 
-On success, provide structured output that includes:
+**CRITICAL — piping a report into `tamandua step complete <stepId>` is the ONLY
+thing that completes a step.** Printing `STATUS: done` in a final chat or
+session message does not complete it.
 
-- `STATUS: done`
-- `CHANGES: ...`
-- `TESTS: ...`
+On success, pipe structured output containing `STATUS: done` as its own
+plain-text line into `step complete`. By convention, it is the first report
+line, followed by the step's `KEY:` lines such as `CHANGES:` and `TESTS:`. The
+scheduler matches status markers anywhere in the piped output; they do not have
+to be the final line.
 
-Then pipe that output into `tamandua step complete <stepId>`.
+For example, the report payload is:
 
-On failure, call `tamandua step fail <stepId> "<clear reason>"` with actionable detail.
+```text
+STATUS: done
+CHANGES: ...
+TESTS: ...
+```
+
+Pipe that payload to the saved step UUID, for example:
+
+```bash
+printf 'STATUS: done\nCHANGES: ...\nTESTS: ...\n' | tamandua step complete <stepId>
+```
 
 **CRITICAL — STATUS markers are parsed by the scheduler.** Output is
 classified by exact markers: `STATUS: done` (success) or `STATUS: failed` /
-`STATUS: error` (failure). The last line of successful output must be exactly
-`STATUS: done` — not "done", not "Step completed successfully", not a summary.
-On failure, end output with `STATUS: failed` and a `REASON:` line. If neither
-marker is present, the scheduler treats the step as lost/abandoned and retries
-it — wasting a retry slot even when the work was completed.
+`STATUS: error` (failure). If no status marker is present, the scheduler treats
+the step as lost/abandoned and retries it, wasting a retry slot even when the
+work was completed.
+
+STATUS: and KEY: contract lines must start at column 0 as plain text: no bold,
+no backticks, no fences, and no leading bullets in the report payload.
+`**BRANCH:** foo` fails validation; `BRANCH: foo` passes.
+
+Verdict channels are distinct:
+
+- A verifier that rejects work pipes `STATUS: retry` plus a `REASON:` or other
+  summary KEY: line into `tamandua step complete <stepId>`. This reroutes the
+  producer for another attempt.
+- `tamandua step fail <stepId> "<reason>"` means "I could not do the work."
+  Use it with an actionable reason when execution cannot be completed. Do not
+  use `step fail` to deliver a retry verdict.
+
+#### STORIES_JSON reports
+
+When a step requires `STORIES_JSON:`, its value must be a single-line JSON
+array ending with `]`, with no trailing prose after the array. The array must
+not contain embedded newline-separated lines starting with `UPPERCASE_KEY:`;
+the extractor truncates the value when it encounters such a line.
+
+Construct `STORIES_JSON` with `python3` and `json.dumps` via a heredoc and pipe
+the result directly to `step complete`, rather than hand-quoting JSON:
+
+```bash
+python3 - <<'PY' | tamandua step complete <stepId>
+import json
+
+stories = [{"id": "US-001", "title": "Example"}]
+print("STATUS: done")
+print("STORIES_JSON: " + json.dumps(stories, separators=(",", ":")))
+PY
+```
 
 ### 2.1) MCP run start (remote)
 
@@ -687,6 +821,26 @@ tamandua dashboard status              # Check dashboard + MCP status
 output. The remote MCP server can be managed independently with
 `tamandua mcp start [--port N]`, `tamandua mcp stop`, `tamandua mcp restart [--port N]`, and `tamandua mcp status`
 (standalone on port 3338 by default).
+
+Restart all Tamandua services at once (dashboard, MCP server, daemon
+control plane + motor) from the currently installed build:
+
+```bash
+tamandua restart [--force]
+```
+
+`restart` stops services in order (dashboard → MCP → daemon), waits for each
+to fully shut down (real stop→ready barriers, no fixed sleeps), then starts them
+(daemon → dashboard → MCP) and waits for each to become healthy. It does NOT
+git pull, rebuild, reinstall workflows, or touch `~/.tamandua/workflows`.
+Services come up from whatever is currently installed.
+
+This is the sanctioned way to pick up a locally rebuilt tree: build and install
+first (`./build && ./install`), then `tamandua restart` — a single honest verb
+replacing the old `sleep`-then-`get-ready` idiom.
+
+By default, `restart` refuses when active workflow runs exist (running or paused),
+listing them and suggesting `--force`.
 
 `tamandua source-path` prints the source checkout path that `tamandua update`
 uses to pull, rebuild, and reinstall.

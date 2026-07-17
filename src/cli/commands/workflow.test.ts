@@ -48,7 +48,7 @@ describe("SPL2 workflow command module", () => {
   it("preserves the exact workflow group help text", () => {
     assert.equal(getWorkflowGroupHelp(), `tamandua workflow — Manage workflows and runs
 
-Usage: tamandua workflow <list|runs|install|uninstall|run|status|autoresearch|stop|delete|pause|resume|pause-all|resume-all>
+Usage: tamandua workflow <list|runs|install|uninstall|run|status|autoresearch|stop|delete|wait|pause|resume|pause-all|resume-all>
 
 Commands for managing Tamandua workflows and their runs.
 
@@ -64,6 +64,7 @@ Subcommands:
               Show AutoResearch progress for a run
   stop        Cancel a running workflow
   delete      Permanently delete a run and all its data (--force for active runs)
+  wait        Block until workflow runs reach terminal status
   pause       Pause a running workflow via the daemon
   resume      Resume a paused or failed workflow run
   pause-all   Pause all running workflows
@@ -76,6 +77,7 @@ Examples:
   tamandua workflow run feature-dev-merge "Add a new feature"
   tamandua workflow status abc12345
   tamandua workflow autoresearch abc12345
+  tamandua workflow wait abc12345
   tamandua workflow pause abc12345 --drain`);
   });
 

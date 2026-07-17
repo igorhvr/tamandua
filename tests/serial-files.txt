@@ -15,9 +15,11 @@ src/cli/commands/dashboard.test.ts
 src/cli/commands/get-ready.test.ts
 src/cli/commands/mcp.test.ts
 src/cli/commands/merge-branch.test.ts
+src/cli/commands/restart.test.ts
 src/cli/commands/standalone.test.ts
 src/cli/commands/status.test.ts
 src/cli/commands/step.test.ts
+src/cli/commands/wait.test.ts
 src/cli/commands/workflow.test.ts
 src/cli/commands/worktree.test.ts
 src/cli/merge-branch-cli.test.ts
@@ -56,6 +58,7 @@ src/server/daemonctl-mcp-restart.test.ts
 src/server/daemonctl-port.test.ts
 src/server/daemonctl-restart.test.ts
 src/server/daemonctl-self-stop-guard.test.ts
+src/server/daemonctl-stop-barrier.test.ts
 src/server/daemonctl.test.ts
 src/server/dashboard.test.ts
 src/suite/shim-acceptance.test.ts
