@@ -21,7 +21,7 @@ import os from "node:os";
 import crypto from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { spawnSync } from "node:child_process";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -63,7 +63,7 @@ function resolveDbPath() {
 function coldInitDb(dbPath) {
   // Resolve dist/db.js relative to the repository root
   const repoRoot = path.resolve(
-    path.dirname(new URL(import.meta.url).pathname),
+    path.dirname(fileURLToPath(import.meta.url)),
     "..",
   );
   const distDbAbsPath = path.join(repoRoot, "dist", "db.js");

@@ -18,11 +18,12 @@ import {
   spawnSync as spawnChildSync,
   execFileSync,
 } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { createTempHome, cleanChildEnv } from "./helpers/test-env.ts";
 
 const REPO_ROOT = path.resolve(
-  path.dirname(new URL(import.meta.url).pathname),
+  path.dirname(fileURLToPath(import.meta.url)),
   "..",
 );
 const PROTOCOL_MODULE = path.join(REPO_ROOT, "scripts", "update-protocol.mjs");
@@ -93,7 +94,7 @@ try {
   return result;
 }
 
-function runColdInit(tempHome, dbPath) {
+function runColdInit(tempHome, dbPath, protocolModule = PROTOCOL_MODULE) {
   const homeDir = tempHome.homeDir;
   const env = cleanChildEnv({
     HOME: homeDir,
@@ -105,7 +106,7 @@ function runColdInit(tempHome, dbPath) {
     [
       "--input-type=module",
       "-e",
-      `import { acquire } from ${JSON.stringify(PROTOCOL_MODULE)};
+      `import { acquire } from ${JSON.stringify(protocolModule)};
 try {
   const r = acquire("current", process.ppid, JSON.stringify({test:true}), JSON.stringify({}), JSON.stringify({}));
   console.log(JSON.stringify(r));
@@ -382,6 +383,119 @@ describe("COLD initialization", () => {
       assert.equal(gate.phase, "ACQUIRED");
       assert.equal(gate.mode, "current");
       assert.equal(gate.topology, JSON.stringify({ test: true }));
+    } finally {
+      db.close();
+    }
+  });
+
+  it("cold-initializes from a copied checkout path containing spaces and non-ASCII characters", () => {
+    const temp = createTempHome("update-protocol-encoded-checkout-");
+    roots.add(temp.root);
+
+    const copiedRepo = path.join(temp.root, "copied checkout-漢字");
+    const copiedScripts = path.join(copiedRepo, "scripts");
+    fs.mkdirSync(copiedScripts, { recursive: true });
+    fs.copyFileSync(
+      PROTOCOL_MODULE,
+      path.join(copiedScripts, "update-protocol.mjs"),
+    );
+    fs.copyFileSync(
+      path.join(REPO_ROOT, "package.json"),
+      path.join(copiedRepo, "package.json"),
+    );
+    fs.cpSync(path.join(REPO_ROOT, "dist"), path.join(copiedRepo, "dist"), {
+      recursive: true,
+    });
+
+    const copiedProtocolModule = path.join(
+      copiedScripts,
+      "update-protocol.mjs",
+    );
+    const dbPath = path.join(temp.root, "isolated-state", "cold.db");
+    assert.ok(!fs.existsSync(dbPath), "DB should not exist before test");
+
+    const result = runColdInit(temp, dbPath, copiedProtocolModule);
+    assert.equal(
+      result.status,
+      0,
+      `Cold init from encoded checkout failed: ${result.stderr}, stdout: ${result.stdout}`,
+    );
+    assert.ok(fs.existsSync(dbPath), "DB should exist after cold init");
+
+    const db = new DatabaseSync(dbPath);
+    try {
+      assert.ok(
+        db.prepare(
+          "SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 'runs'",
+        ).get(),
+        "copied dist/db.js should create the runs table",
+      );
+
+      const artifacts = db.prepare(
+        `SELECT type, name, tbl_name, sql
+         FROM sqlite_schema
+         WHERE name IN (
+           'update_gate',
+           'trg_update_gate_block_runs_insert',
+           'trg_update_gate_block_runs_update'
+         )
+         ORDER BY name`,
+      ).all().map((row) => ({ ...row }));
+      assert.deepEqual(artifacts, [
+        {
+          type: "trigger",
+          name: "trg_update_gate_block_runs_insert",
+          tbl_name: "runs",
+          sql: `CREATE TRIGGER trg_update_gate_block_runs_insert
+BEFORE INSERT ON runs
+WHEN EXISTS (SELECT 1 FROM update_gate WHERE id = 1)
+BEGIN
+  SELECT RAISE(ABORT, 'update in progress');
+END`,
+        },
+        {
+          type: "trigger",
+          name: "trg_update_gate_block_runs_update",
+          tbl_name: "runs",
+          sql: `CREATE TRIGGER trg_update_gate_block_runs_update
+BEFORE UPDATE OF status ON runs
+WHEN EXISTS (SELECT 1 FROM update_gate WHERE id = 1)
+  AND NEW.status = 'running' AND OLD.status != 'running'
+BEGIN
+  SELECT RAISE(ABORT, 'update in progress');
+END`,
+        },
+        {
+          type: "table",
+          name: "update_gate",
+          tbl_name: "update_gate",
+          sql: `CREATE TABLE update_gate (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  token TEXT NOT NULL,
+  mode TEXT NOT NULL CHECK (mode IN ('legacy', 'current')),
+  phase TEXT NOT NULL CHECK (phase IN ('ACQUIRED', 'GUARDIAN_RECORDED', 'FAILED')),
+  owner_pid INTEGER NOT NULL,
+  owner_identity TEXT NOT NULL,
+  guardian_pid INTEGER,
+  guardian_identity TEXT,
+  topology TEXT NOT NULL,
+  artifacts TEXT NOT NULL,
+  readiness TEXT NOT NULL,
+  failure_reason TEXT,
+  failure_details TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+)`,
+        },
+      ]);
+
+      const gate = db
+        .prepare("SELECT id, mode, phase FROM update_gate WHERE id = 1")
+        .get();
+      assert.deepEqual(
+        { ...gate },
+        { id: 1, mode: "current", phase: "ACQUIRED" },
+      );
     } finally {
       db.close();
     }
