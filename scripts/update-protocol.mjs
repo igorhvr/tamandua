@@ -58,6 +58,12 @@ function resolveDbPath() {
   return path.join(os.homedir(), ".tamandua", "tamandua.db");
 }
 
+function openReadOnlyDb(dbPath) {
+  const dbUrl = pathToFileURL(dbPath);
+  dbUrl.searchParams.set("mode", "ro");
+  return new DatabaseSync(dbUrl.href);
+}
+
 // ── Cold DB initialization through real built dist/db.js ─────────────────────
 
 function coldInitDb(dbPath) {
@@ -97,7 +103,7 @@ closeDb();`,
   // Verify the runs table exists
   let verifyDb;
   try {
-    verifyDb = new DatabaseSync(dbPath);
+    verifyDb = openReadOnlyDb(dbPath);
     const hasRuns = verifyDb
       .prepare(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='runs'",
@@ -114,7 +120,7 @@ closeDb();`,
 }
 
 function hasRunsTable(dbPath) {
-  const db = new DatabaseSync(dbPath);
+  const db = openReadOnlyDb(dbPath);
   try {
     const row = db
       .prepare(
@@ -605,14 +611,18 @@ function toPublicGateView(row) {
 export function inspect() {
   const dbPath = resolveDbPath();
   if (!fs.existsSync(dbPath)) return null;
-  if (!hasRunsTable(dbPath)) return null;
 
-  const db = new DatabaseSync(dbPath);
+  let db;
   try {
+    if (!hasRunsTable(dbPath)) return null;
+    db = openReadOnlyDb(dbPath);
     const row = getGateRow(db);
     return row ? toPublicGateView(row) : null;
+  } catch (error) {
+    if (!fs.existsSync(dbPath)) return null;
+    throw error;
   } finally {
-    db.close();
+    if (db) db.close();
   }
 }
 
@@ -877,10 +887,14 @@ export function isGateActive() {
   const dbPath = resolveDbPath();
   if (!fs.existsSync(dbPath)) return false;
 
-  const db = new DatabaseSync(dbPath);
+  let db;
   try {
+    db = openReadOnlyDb(dbPath);
     return gateExists(db);
+  } catch (error) {
+    if (!fs.existsSync(dbPath)) return false;
+    throw error;
   } finally {
-    db.close();
+    if (db) db.close();
   }
 }

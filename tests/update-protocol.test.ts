@@ -2575,6 +2575,250 @@ describe("TOKEN contract and five-field return", () => {
   });
 });
 
+// ── READ-ONLY OPENS: reads never create or mutate SQLite state ───────────
+
+describe("update protocol read-only opens", () => {
+  function protocolEnv(temp, dbPath) {
+    return {
+      HOME: temp.homeDir,
+      TAMANDUA_STATE_DIR: path.join(temp.homeDir, ".tamandua"),
+      TAMANDUA_DB_PATH: dbPath,
+    };
+  }
+
+  function assertNoSqliteArtifacts(dbPath) {
+    for (const suffix of ["", "-journal", "-wal", "-shm"]) {
+      assert.equal(
+        fs.existsSync(dbPath + suffix),
+        false,
+        `${dbPath + suffix} must not be created`,
+      );
+    }
+  }
+
+  function assertNoSqliteSidecars(dbPath) {
+    for (const suffix of ["-journal", "-wal", "-shm"]) {
+      assert.equal(
+        fs.existsSync(dbPath + suffix),
+        false,
+        `${dbPath + suffix} must not be created`,
+      );
+    }
+  }
+
+  function runDisappearanceRace(temp, dbPath, operation) {
+    const invocation = operation === "inspect"
+      ? "console.log(inspect() === null ? 'MISSING' : 'PRESENT');"
+      : operation === "isGateActive"
+        ? "console.log(isGateActive() ? 'ACTIVE' : 'INACTIVE');"
+        : `try {
+  acquire("current", process.ppid, "{}", "{}", "{}");
+  console.log("ACQUIRED");
+} catch (error) {
+  console.log("FAILED_CLOSED:" + error.message);
+}`;
+
+    return runNode(
+      [
+        "--input-type=module",
+        "-e",
+        `import fs from "node:fs";
+import path from "node:path";
+import { acquire, inspect, isGateActive } from ${JSON.stringify(PROTOCOL_MODULE)};
+const dbPath = process.env.TAMANDUA_DB_PATH;
+const realExistsSync = fs.existsSync;
+let removed = false;
+fs.existsSync = (candidate) => {
+  const exists = realExistsSync(candidate);
+  if (!removed && exists && path.resolve(candidate) === path.resolve(dbPath)) {
+    removed = true;
+    fs.unlinkSync(dbPath);
+  }
+  return exists;
+};
+${invocation}`,
+      ],
+      protocolEnv(temp, dbPath),
+    );
+  }
+
+  it("does not create a database or sidecars when the file disappears after observation", () => {
+    for (const operation of ["inspect", "isGateActive", "acquire"]) {
+      const temp = createTempHome(`update-protocol-read-race-${operation}-`);
+      try {
+        const dbPath = path.join(temp.root, `${operation}.db`);
+        const db = new DatabaseSync(dbPath);
+        db.close();
+
+        const result = runDisappearanceRace(temp, dbPath, operation);
+        assert.equal(result.status, 0, `${operation}: ${result.stderr}`);
+        if (operation === "inspect") assert.equal(result.stdout.trim(), "MISSING");
+        if (operation === "isGateActive") assert.equal(result.stdout.trim(), "INACTIVE");
+        if (operation === "acquire") {
+          assert.match(result.stdout.trim(), /^FAILED_CLOSED:/);
+        }
+        assertNoSqliteArtifacts(dbPath);
+      } finally {
+        fs.rmSync(temp.root, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("does not create an absent database parent for public read operations", () => {
+    for (const [operation, expression, expected] of [
+      ["inspect", "inspect()", null],
+      ["isGateActive", "isGateActive()", false],
+    ]) {
+      const temp = createTempHome(`update-protocol-absent-parent-${operation}-`);
+      try {
+        const parent = path.join(temp.root, "missing", "state");
+        const dbPath = path.join(parent, "tamandua.db");
+        const result = runNode(
+          [
+            "--input-type=module",
+            "-e",
+            `import { inspect, isGateActive } from ${JSON.stringify(PROTOCOL_MODULE)};
+console.log(JSON.stringify(${expression}));`,
+          ],
+          protocolEnv(temp, dbPath),
+        );
+        assert.equal(result.status, 0, `${operation}: ${result.stderr}`);
+        assert.deepEqual(JSON.parse(result.stdout), expected);
+        assert.equal(fs.existsSync(parent), false, `${operation} created the parent`);
+        assertNoSqliteArtifacts(dbPath);
+      } finally {
+        fs.rmSync(temp.root, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("cold-initializes an existing database without runs and preserves its objects", () => {
+    const temp = createTempHome("update-protocol-existing-no-runs-");
+    try {
+      const dbPath = path.join(temp.root, "legacy.db");
+      const db = new DatabaseSync(dbPath);
+      try {
+        db.exec("CREATE TABLE legacy_marker (value TEXT NOT NULL)");
+        db.prepare("INSERT INTO legacy_marker (value) VALUES (?)").run("preserve-me");
+      } finally {
+        db.close();
+      }
+
+      const result = runAcquire(temp, dbPath);
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+
+      const verify = new DatabaseSync(dbPath);
+      try {
+        assert.ok(tableExists(dbPath, "runs"));
+        assert.deepEqual(
+          { ...verify.prepare("SELECT value FROM legacy_marker").get() },
+          { value: "preserve-me" },
+        );
+      } finally {
+        verify.close();
+      }
+    } finally {
+      fs.rmSync(temp.root, { recursive: true, force: true });
+    }
+  });
+
+  it("propagates corrupt database errors instead of treating them as absence", () => {
+    for (const [operation, expression] of [
+      ["inspect", "inspect()"],
+      ["isGateActive", "isGateActive()"],
+    ]) {
+      const temp = createTempHome(`update-protocol-corrupt-${operation}-`);
+      try {
+        const dbPath = path.join(temp.root, "corrupt.db");
+        const corruptBytes = Buffer.from("not a sqlite database");
+        fs.writeFileSync(dbPath, corruptBytes);
+        const result = runNode(
+          [
+            "--input-type=module",
+            "-e",
+            `import { inspect, isGateActive } from ${JSON.stringify(PROTOCOL_MODULE)};
+try {
+  ${expression};
+  console.log("SWALLOWED");
+} catch (error) {
+  console.log("PROPAGATED:" + error.code);
+}`,
+          ],
+          protocolEnv(temp, dbPath),
+        );
+        assert.equal(result.status, 0, `${operation}: ${result.stderr}`);
+        assert.match(result.stdout.trim(), /^PROPAGATED:/);
+        assert.deepEqual(fs.readFileSync(dbPath), corruptBytes);
+        assertNoSqliteSidecars(dbPath);
+      } finally {
+        fs.rmSync(temp.root, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("inspect reads the exact redacted gate from a read-only database location", () => {
+    const temp = createTempHome("update-protocol-readonly-inspect-");
+    const location = path.join(temp.root, "readonly-state");
+    const dbPath = path.join(location, "tamandua.db");
+    fs.mkdirSync(location);
+    const locationMode = fs.statSync(location).mode & 0o777;
+    try {
+      const acquired = runAcquire(temp, dbPath);
+      assert.equal(acquired.status, 0, acquired.stderr || acquired.stdout);
+
+      let expected;
+      const db = new DatabaseSync(dbPath);
+      try {
+        // A WAL-mode database needs a writable directory to create shared-memory
+        // coordination files. Checkpoint into DELETE mode before making the
+        // location genuinely read-only so this proof isolates the open flags.
+        db.exec("PRAGMA journal_mode = DELETE");
+        const row = db.prepare("SELECT * FROM update_gate WHERE id = 1").get();
+        assert.ok(row);
+        const { token: _token, ...redacted } = row;
+        expected = redacted;
+      } finally {
+        db.close();
+      }
+
+      fs.chmodSync(dbPath, 0o444);
+      fs.chmodSync(location, 0o555);
+      const result = runNode(
+        [
+          "--input-type=module",
+          "-e",
+          `import { inspect } from ${JSON.stringify(PROTOCOL_MODULE)};
+console.log(JSON.stringify(inspect()));`,
+        ],
+        protocolEnv(temp, dbPath),
+      );
+      assert.equal(result.status, 0, result.stderr);
+      assert.deepEqual(JSON.parse(result.stdout), expected);
+      assertNoSqliteSidecars(dbPath);
+    } finally {
+      try { fs.chmodSync(location, locationMode); } catch { /* already removable */ }
+      try { fs.chmodSync(dbPath, 0o600); } catch { /* already removable */ }
+      fs.rmSync(temp.root, { recursive: true, force: true });
+    }
+  });
+
+  it("uses explicit mode=ro URL opens at every production read site", () => {
+    const source = fs.readFileSync(PROTOCOL_MODULE, "utf8");
+    assert.match(source, /function openReadOnlyDb\(dbPath\)/);
+    assert.match(source, /searchParams\.set\("mode", "ro"\)/);
+    assert.equal(
+      (source.match(/openReadOnlyDb\(dbPath\)/g) ?? []).length,
+      5,
+      "the helper definition and all four read sites must use mode=ro",
+    );
+    assert.equal(
+      (source.match(/new DatabaseSync\(dbPath\)/g) ?? []).length,
+      1,
+      "only acquire's mutating writer open may use the default path constructor",
+    );
+  });
+});
+
 // ── INSPECT REDACTION: token is never disclosed via inspect() ────────────
 
 describe("inspect redaction", () => {
