@@ -1531,3 +1531,138 @@ export async function restartDashboardStandalone(port?: number, opts?: StartOpti
   }
   return startDashboardStandalone(currentPort);
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// Stop-barrier helpers — poll-until-gone for each service
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * Poll until the dashboard process and port are both gone.
+ *
+ * Captures the PID from the dashboard PID file, then polls both PID
+ * liveness (kill(0)) and TCP port liveness until both are gone.
+ * Must be called after (or concurrently with) stopDashboardStandalone().
+ * Times out after 10s with a clear error naming the dashboard.
+ *
+ * @param opts Optional homeDir for isolated testing.
+ */
+export async function waitForDashboardStop(opts?: DaemonctlPathOptions): Promise<void> {
+  const dashPidFile = getDashboardPidFile(opts);
+  const dashPort = readPort(opts);
+
+  // Capture PID before stop (stopDashboardStandalone cleans up pidfiles immediately)
+  const beforeStatus = checkPidFile(dashPidFile);
+  if (!beforeStatus.running) return;
+
+  const pid = beforeStatus.pid;
+  const deadline = Date.now() + 10_000;
+
+  while (Date.now() < deadline) {
+    let pidAlive = true;
+    try { process.kill(pid, 0); } catch { pidAlive = false; }
+
+    const portOpen = await isTcpPortOpen(dashPort, 300);
+
+    if (!pidAlive && !portOpen) return;
+
+    await sleep(100);
+  }
+
+  // Timed out — build a precise diagnostic
+  let pidAlive = true;
+  try { process.kill(pid, 0); } catch { pidAlive = false; }
+  const portOpen = await isTcpPortOpen(dashPort, 300);
+
+  const stuckReasons: string[] = [];
+  if (pidAlive) stuckReasons.push("process still alive (pid " + pid + ")");
+  if (portOpen) stuckReasons.push("port " + dashPort + " still accepting connections");
+  const reason = stuckReasons.length > 0 ? stuckReasons.join("; ") : "unknown reason";
+
+  throw new Error("dashboard failed to stop within 10s: " + reason);
+}
+
+/**
+ * Poll until the MCP process and port are both gone.
+ *
+ * Captures the PID from the MCP PID file, then polls both PID liveness
+ * (kill(0)) and TCP port liveness until both are gone.
+ * Must be called after (or concurrently with) stopMcp().
+ * Times out after 10s with a clear error naming the MCP server.
+ *
+ * @param opts Optional homeDir for isolated testing.
+ */
+export async function waitForMcpStop(opts?: DaemonctlPathOptions): Promise<void> {
+  const mcpPidFile = getMcpPidFile(opts);
+  const mcpPort = readMcpPort(opts);
+
+  const beforeStatus = checkPidFile(mcpPidFile);
+  if (!beforeStatus.running) return;
+
+  const pid = beforeStatus.pid;
+  const deadline = Date.now() + 10_000;
+
+  while (Date.now() < deadline) {
+    let pidAlive = true;
+    try { process.kill(pid, 0); } catch { pidAlive = false; }
+
+    const portOpen = await isTcpPortOpen(mcpPort, 300);
+
+    if (!pidAlive && !portOpen) return;
+
+    await sleep(100);
+  }
+
+  let pidAlive = true;
+  try { process.kill(pid, 0); } catch { pidAlive = false; }
+  const portOpen = await isTcpPortOpen(mcpPort, 300);
+
+  const stuckReasons: string[] = [];
+  if (pidAlive) stuckReasons.push("process still alive (pid " + pid + ")");
+  if (portOpen) stuckReasons.push("port " + mcpPort + " still accepting connections");
+  const reason = stuckReasons.length > 0 ? stuckReasons.join("; ") : "unknown reason";
+
+  throw new Error("MCP server failed to stop within 10s: " + reason);
+}
+
+/**
+ * Poll until the daemon (control-plane) process and port are both gone.
+ *
+ * Captures the PID from the daemon PID file, then polls both PID liveness
+ * (kill(0)) and TCP port liveness until both are gone.
+ * Must be called after (or concurrently with) stopDaemon().
+ * Times out after 10s with a clear error naming the daemon.
+ *
+ * @param opts Optional homeDir for isolated testing.
+ */
+export async function waitForDaemonStop(opts?: DaemonctlPathOptions): Promise<void> {
+  const daemonPidFile = getPidFile(opts);
+  const daemonPort = readControlPlanePort(opts);
+
+  const beforeStatus = checkPidFile(daemonPidFile);
+  if (!beforeStatus.running) return;
+
+  const pid = beforeStatus.pid;
+  const deadline = Date.now() + 10_000;
+
+  while (Date.now() < deadline) {
+    let pidAlive = true;
+    try { process.kill(pid, 0); } catch { pidAlive = false; }
+
+    const portOpen = await isTcpPortOpen(daemonPort, 300);
+
+    if (!pidAlive && !portOpen) return;
+
+    await sleep(100);
+  }
+
+  let pidAlive = true;
+  try { process.kill(pid, 0); } catch { pidAlive = false; }
+  const portOpen = await isTcpPortOpen(daemonPort, 300);
+
+  const stuckReasons: string[] = [];
+  if (pidAlive) stuckReasons.push("process still alive (pid " + pid + ")");
+  if (portOpen) stuckReasons.push("port " + daemonPort + " still accepting connections");
+  const reason = stuckReasons.length > 0 ? stuckReasons.join("; ") : "unknown reason";
+
+  throw new Error("daemon failed to stop within 10s: " + reason);
+}

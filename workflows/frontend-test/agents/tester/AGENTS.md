@@ -66,4 +66,5 @@ CHECKS_TOTAL: <M>
 
 - NEVER run `tamandua dashboard start` — this kills the parent daemon
 - NEVER run `tamandua dashboard stop`
+- NEVER run `tamandua restart` — this restarts all services including the daemon that scheduled you
 - Don't fabricate success — report actual file contents and errors

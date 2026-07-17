@@ -85,6 +85,7 @@ describe("SPL2 thin CLI dispatcher", () => {
       "handleMcp",
       "handleDashboard",
       "handleDaemon",
+      "handleRestart",
       "handleStatus",
       "handleStep",
       "handleLogs",

@@ -530,7 +530,7 @@ If something isn't working as expected, start with the built-in diagnostic:
 - **Run `tamandua doctor`** — One-shot diagnostic that checks environment (Node.js >= 22, pi on PATH, gh on PATH), services (dashboard, daemon, MCP), daemon staleness (running daemon matches installed build), database state (run-level anomalies), and LLM prompt adherence (per-step key-emission rates from workflow runs, measuring how often agents deliver expected output keys). Each check prints **pass/fail** status and on failure prints the **exact remedy command** to run.
 - **Check service status** — Run `tamandua status` to verify dashboard, daemon, and MCP are running on their expected ports.
 - **Check logs** — Run `tamandua logs` to see recent daemon events. For live tailing: `tamandua logs-tail`.
-- **Restart the daemon** — If the daemon (control plane + motor) is unresponsive, run `tamandua daemon restart`. The dashboard UI can be restarted independently with `tamandua dashboard restart` (safe — never touches the motor).
+- **Restart services** — If the daemon (control plane + motor) is unresponsive, run `tamandua daemon restart`. The dashboard UI can be restarted independently with `tamandua dashboard restart` (safe — never touches the motor). To pick up a locally rebuilt tree, run `./build-and-install` followed by `tamandua restart` — this restarts all services with a real stop→ready barrier instead of blind sleeps.
 
 ---
 
@@ -543,7 +543,7 @@ If something isn't working as expected, start with the built-in diagnostic:
 | `tamandua get-ready` | Install bundled workflows and start dashboard/control plane |
 | `tamandua source-path` | Print the Tamandua source checkout path |
 | `tamandua skill-path` | Print the path to the bundled tamandua-agents agent skill |
-| `tamandua update [--force]` | Pull the source checkout, rebuild, reinstall workflows (refreshes all installed bundled workflow files — local edits are overwritten), and restart previously running services |
+| `tamandua update [--force]` | Pull the source checkout, rebuild, reinstall workflows (refreshes all installed bundled workflow files — local edits are overwritten), and restart previously running services. For local development, use `./build-and-install && tamandua restart` instead. |
 | `tamandua uninstall [--force]` | Full teardown (agents, crons, DB) |
 
 ### Workflows
@@ -564,6 +564,7 @@ If something isn't working as expected, start with the built-in diagnostic:
 
 | Command | Description |
 |---------|-------------|
+| `tamandua restart [--force]` | Restart all services (daemon, dashboard, MCP) with stop→ready barrier — no sleep guessing. The sanctioned way to pick up a locally rebuilt tree (`./build-and-install` first, then `tamandua restart`). |
 | `tamandua dashboard start\|stop\|restart\|status [--port N]` | Manage the standalone dashboard UI server (safe anytime) |
 | `tamandua daemon start\|stop\|restart\|status` | Manage the daemon (control plane + scheduling motor) |
 | `tamandua mcp start\|stop\|restart\|status [--port N]` | Manage the standalone MCP server |

@@ -118,6 +118,10 @@ import {
   getMergeBranchHelp,
   handleMergeBranch,
 } from "./commands/merge-branch.js";
+import {
+  getRestartHelp,
+  handleRestart,
+} from "./commands/restart.js";
 
 function getUsageText(): string {
   return [
@@ -181,6 +185,7 @@ function getUsageText(): string {
     "tamandua dashboard stop               Stop dashboard",
     "tamandua dashboard restart [--port N] Restart dashboard",
     "tamandua dashboard status             Check dashboard status",
+    "", "tamandua restart [--force]            Restart all services with stop→ready barrier",
     "", "tamandua step peek <agent-id> --run-id <run-id>     Check for pending work (HAS_WORK or NO_WORK)",
     "tamandua step claim <agent-id> --run-id <run-id>    Claim pending step (JSON output)",
     "tamandua step complete <step-id>      Complete step (reads output from stdin)",
@@ -312,6 +317,9 @@ async function main() {
       if (action === "wizard") { printHelp(getAutoresearchWizardHelp()); }
       printHelp(getAutoresearchHelp());
     }
+    if (group === "restart") {
+      printHelp(getRestartHelp());
+    }
     if (group === "nudge") {
       printHelp(getNudgeHelp());
     }
@@ -342,6 +350,8 @@ async function main() {
   if (await handleDashboard(group, args)) { return; }
 
   if (await handleDaemon(group, args)) { return; }
+
+  if (await handleRestart(group, args)) { return; }
 
   if (await handleStatus(group, args)) { return; }
 
