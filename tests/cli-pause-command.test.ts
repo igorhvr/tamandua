@@ -408,6 +408,72 @@ describe("tamandua workflow pause CLI", { concurrency: 1 }, () => {
     }
   });
 
+  // US-004: CLI auto-populates requester identity on pause
+  it("pause via CLI auto-populates requester identity in context", async (t) => {
+    if (!fs.existsSync(CLI_SCRIPT)) {
+      t.skip("CLI script not built — run npm run build first");
+      return;
+    }
+
+    const controlPort = await getAvailablePort();
+    const th = createTempHome("tamandua-pause-id-");
+    const dbPath = path.join(th.tamanduaDir, "tamandua.db");
+
+    const runningRunId = crypto.randomUUID();
+    seedRunDb(dbPath, [
+      {
+        id: runningRunId,
+        workflowId: "feature-dev-merge",
+        task: "Test requester identity on pause",
+        status: "running",
+      },
+    ]);
+
+    let daemon: ChildProcess | undefined;
+
+    try {
+      daemon = spawn("node", [DAEMON_SCRIPT], {
+        env: cleanChildEnv({ HOME: th.homeDir,
+          TAMANDUA_CONTROL_PORT: String(controlPort), }),
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      daemon.stdout?.resume();
+      daemon.stderr?.resume();
+
+      await waitForControlUp(controlPort);
+
+      const { stdout, stderr, exitCode } = await runCli(
+        ["workflow", "pause", runningRunId],
+        { HOME: th.homeDir, TAMANDUA_CONTROL_PORT: String(controlPort) },
+      );
+
+      assert.equal(exitCode, 0, `Should exit with code 0, got ${exitCode}, stderr: ${cleanStderr(stderr)}`);
+      assert.ok(stdout.includes("Paused run"), `Expected "Paused run" in stdout, got: ${stdout}`);
+
+      // Verify context keys contain the CLI identity
+      const db = new DatabaseSync(dbPath);
+      const row = db.prepare("SELECT context FROM runs WHERE id = ?").get(runningRunId) as { context: string } | undefined;
+      db.close();
+      assert.ok(row, "Run should exist in DB");
+      const ctx = JSON.parse(row.context) as Record<string, unknown>;
+      assert.equal(typeof ctx.paused_by, "string", "paused_by should be a string");
+      assert.ok(
+        (ctx.paused_by as string).endsWith(" (cli)"),
+        `paused_by should end with " (cli)", got: ${ctx.paused_by}`,
+      );
+      assert.ok(
+        (ctx.paused_by as string).includes("@"),
+        `paused_by should contain "@", got: ${ctx.paused_by}`,
+      );
+      assert.equal(typeof ctx.paused_at, "string", "paused_at should be a string");
+      assert.equal(ctx.pause_drain, "false", "pause_drain should be false");
+    } finally {
+      if (daemon && daemon.exitCode === null && daemon.pid) {
+        try { process.kill(daemon.pid, "SIGTERM"); } catch { /* ignore */ }
+      }
+    }
+  });
+
   // AC: pause with missing run-id prints usage/error
   it("pause missing run-id prints usage error", async (t) => {
     if (!fs.existsSync(CLI_SCRIPT)) {

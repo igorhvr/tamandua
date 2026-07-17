@@ -1,4 +1,5 @@
 import http from "node:http";
+import os from "node:os";
 import { assertPortIsolation } from "../lib/test-guard.js";
 import { randomUUID } from "node:crypto";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -83,7 +84,7 @@ export type TamanduaMcpServer = {
   stop: () => Promise<void>;
 };
 
-const defaultToolServices: TamanduaMcpToolServices = {
+export const defaultToolServices: TamanduaMcpToolServices = {
   listRuns,
   getWorkflowStatus,
   runWorkflow,
@@ -91,13 +92,15 @@ const defaultToolServices: TamanduaMcpToolServices = {
   getSourcePath: resolveSourcePath,
   getSkillPath: resolveSkillPath,
   async pauseRun(runId, drain = false) {
-    const r = await pauseRunWithDaemon(runId, drain);
+    const identity = `${os.userInfo().username}@${os.hostname()}:${process.pid} (mcp)`;
+    const r = await pauseRunWithDaemon(runId, drain, identity);
     if (!r) throw new Error("Daemon control plane unreachable");
     if (r.body.error) throw new Error(String(r.body.error));
     return { runId, status: String(r.body.state ?? r.status) };
   },
   async resumeRun(runId) {
-    const r = await resumeRunWithDaemon(runId);
+    const identity = `${os.userInfo().username}@${os.hostname()}:${process.pid} (mcp)`;
+    const r = await resumeRunWithDaemon(runId, identity);
     if (!r) throw new Error("Daemon control plane unreachable");
     if (r.body.error) throw new Error(String(r.body.error));
     return { runId, status: String(r.body.state ?? r.status) };

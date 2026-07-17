@@ -1872,7 +1872,7 @@ export function parseRunContext(runId: string, raw: string): Record<string, stri
  * Set a key-value pair in a run's context JSON field.
  * Reads existing context, sets the key, and writes back.
  */
-function setRunContextKey(runId: string, key: string, value: string): void {
+export function setRunContextKey(runId: string, key: string, value: string): void {
   const db = getDb();
   const run = db.prepare("SELECT context FROM runs WHERE id = ?").get(runId) as { context: string } | undefined;
   if (!run) return;

@@ -473,6 +473,80 @@ describe("tamandua workflow resume CLI", { concurrency: 1 }, () => {
     );
   });
 
+  // US-004: CLI auto-populates requester identity on resume
+  it("resume via CLI auto-populates requester identity in context", async (t) => {
+    if (!fs.existsSync(CLI_SCRIPT)) {
+      t.skip("CLI script not built — run npm run build first");
+      return;
+    }
+
+    const controlPort = await getAvailablePort();
+    const th = createTempHome("tamandua-resume-id-");
+
+    // Copy the workflow directory so the daemon can register the run on resume
+    const srcWorkflowDir = path.resolve(__dirname, "..", "workflows", "feature-dev-merge");
+    const dstWorkflowDir = path.join(th.tamanduaDir, "workflows", "feature-dev-merge");
+    fs.mkdirSync(path.dirname(dstWorkflowDir), { recursive: true });
+    fs.cpSync(srcWorkflowDir, dstWorkflowDir, { recursive: true });
+
+    const dbPath = path.join(th.tamanduaDir, "tamandua.db");
+
+    const pausedRunId = crypto.randomUUID();
+    seedRunDb(dbPath, [
+      {
+        id: pausedRunId,
+        workflowId: "feature-dev-merge",
+        task: "Test requester identity on resume",
+        status: "paused",
+        context: { working_directory_for_harness: th.root },
+      },
+    ]);
+
+    let daemon: ChildProcess | undefined;
+
+    try {
+      daemon = spawn("node", [DAEMON_SCRIPT], {
+        env: cleanChildEnv({ HOME: th.homeDir,
+          TAMANDUA_CONTROL_PORT: String(controlPort), }),
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      daemon.stdout?.resume();
+      daemon.stderr?.resume();
+
+      await waitForControlUp(controlPort);
+
+      const { stdout, stderr, exitCode } = await runCli(
+        ["workflow", "resume", pausedRunId],
+        { HOME: th.homeDir, TAMANDUA_CONTROL_PORT: String(controlPort) },
+      );
+
+      assert.equal(exitCode, 0, `Should exit with code 0, got ${exitCode}, stderr: ${cleanStderr(stderr)}`);
+      assert.ok(stdout.includes("Resumed run"), `Expected "Resumed run" in stdout, got: ${stdout}`);
+
+      // Verify context keys contain the CLI identity
+      const db = new DatabaseSync(dbPath);
+      const row = db.prepare("SELECT context FROM runs WHERE id = ?").get(pausedRunId) as { context: string } | undefined;
+      db.close();
+      assert.ok(row, "Run should exist in DB");
+      const ctx = JSON.parse(row.context) as Record<string, unknown>;
+      assert.equal(typeof ctx.resumed_by, "string", "resumed_by should be a string");
+      assert.ok(
+        (ctx.resumed_by as string).endsWith(" (cli)"),
+        `resumed_by should end with " (cli)", got: ${ctx.resumed_by}`,
+      );
+      assert.ok(
+        (ctx.resumed_by as string).includes("@"),
+        `resumed_by should contain "@", got: ${ctx.resumed_by}`,
+      );
+      assert.equal(typeof ctx.resumed_at, "string", "resumed_at should be a string");
+    } finally {
+      if (daemon && daemon.exitCode === null && daemon.pid) {
+        try { process.kill(daemon.pid, "SIGTERM"); } catch { /* ignore */ }
+        await sleep(200);
+      }
+    }
+  });
+
   // Resume with missing run-id prints usage error
   it("resume missing run-id prints usage error", async (t) => {
     if (!fs.existsSync(CLI_SCRIPT)) {

@@ -152,13 +152,18 @@ export async function terminateRunWithDaemon(runId: string): Promise<ControlPlan
 }
 
 /** Pause a run (clears timers; sets status='paused'). Optionally drain first. */
-export async function pauseRunWithDaemon(runId: string, drain = false): Promise<ControlPlaneResponse | null> {
-  return controlRequest("POST", "/control/pause-run", drain ? { runId, drain: true } : { runId });
+export async function pauseRunWithDaemon(runId: string, drain = false, requestedBy?: string): Promise<ControlPlaneResponse | null> {
+  const body: Record<string, unknown> = { runId };
+  if (drain) body.drain = true;
+  if (requestedBy) body.requestedBy = requestedBy;
+  return controlRequest("POST", "/control/pause-run", body);
 }
 
 /** Resume a paused run (re-enters admission). */
-export async function resumeRunWithDaemon(runId: string): Promise<ControlPlaneResponse | null> {
-  return controlRequest("POST", "/control/resume-run", { runId });
+export async function resumeRunWithDaemon(runId: string, requestedBy?: string): Promise<ControlPlaneResponse | null> {
+  const body: Record<string, unknown> = { runId };
+  if (requestedBy) body.requestedBy = requestedBy;
+  return controlRequest("POST", "/control/resume-run", body);
 }
 
 /** Request the daemon to nudge all scheduled agents for all running runs. */

@@ -361,6 +361,430 @@ describe("daemon control plane", { concurrency: 1 }, () => {
     db2.close();
   });
 
+  // ── Traceability logging + events tests (US-003) ──────────────────
+
+  it("POST /control/pause-run emits run.pause_requested event before run.paused", async (t) => {
+    if (!daemon) {
+      t.skip("daemon not started");
+      return;
+    }
+
+    const dbPath = path.join(tempHome, ".tamandua", "tamandua.db");
+    const { DatabaseSync } = await import("node:sqlite");
+    const db = new DatabaseSync(dbPath);
+    const runId = crypto.randomUUID();
+    const workflowId = "wf-pause-requested-test";
+    const now = new Date().toISOString();
+    const requester = "alice@box:1234 (cli)";
+
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, scheduling_status, created_at, updated_at) VALUES (?, ?, 'pause-requested-test', 'running', '{}', 0, 'active', ?, ?)",
+    ).run(runId, workflowId, now, now);
+    db.close();
+
+    const r = await jsonRequest(
+      "POST",
+      "/control/pause-run",
+      { runId, requestedBy: requester },
+      secret,
+    );
+    assert.equal(r.status, 200);
+    assert.equal(r.body.state, "paused");
+
+    // Read events and verify ordering: run.pause_requested must appear before run.paused.
+    const runEventsPath = path.join(tempHome, ".tamandua", "events", `${runId}.jsonl`);
+    assert.ok(fs.existsSync(runEventsPath));
+    const runEventsRaw = fs.readFileSync(runEventsPath, "utf-8");
+    const runEvents = runEventsRaw.trim().split("\n").filter(Boolean).map((l: string) => JSON.parse(l));
+
+    const requestIndex = runEvents.findIndex((e: any) => e.event === "run.pause_requested");
+    const pausedIndex = runEvents.findIndex((e: any) => e.event === "run.paused");
+
+    assert.ok(requestIndex >= 0, "expected a run.pause_requested event");
+    assert.ok(pausedIndex >= 0, "expected a run.paused event");
+    assert.ok(requestIndex < pausedIndex,
+      `run.pause_requested (idx=${requestIndex}) must appear before run.paused (idx=${pausedIndex})`);
+
+    // Verify run.pause_requested has requester and drain in detail.
+    const reqEvent = runEvents[requestIndex];
+    assert.equal(reqEvent.runId, runId);
+    assert.equal(reqEvent.workflowId, workflowId);
+    const detail = JSON.parse(reqEvent.detail);
+    assert.equal(detail.requestedBy, requester);
+    assert.equal(detail.drain, false);
+
+    // Verify run.paused still fires unchanged.
+    const pausedEvent = runEvents[pausedIndex];
+    assert.equal(pausedEvent.runId, runId);
+    assert.equal(pausedEvent.workflowId, workflowId);
+
+    // Cleanup
+    const db2 = new DatabaseSync(dbPath);
+    db2.prepare("DELETE FROM runs WHERE id = ?").run(runId);
+    db2.close();
+  });
+
+  it("POST /control/pause-run emits run.pause_requested with drain=true for drain pause", async (t) => {
+    if (!daemon) {
+      t.skip("daemon not started");
+      return;
+    }
+
+    const dbPath = path.join(tempHome, ".tamandua", "tamandua.db");
+    const { DatabaseSync } = await import("node:sqlite");
+    const db = new DatabaseSync(dbPath);
+    const runId = crypto.randomUUID();
+    const workflowId = "wf-pause-drain-requested-test";
+    const now = new Date().toISOString();
+    const requester = "bob@box:5678 (mcp)";
+
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, scheduling_status, created_at, updated_at) VALUES (?, ?, 'pause-drain-requested-test', 'running', '{}', 0, 'active', ?, ?)",
+    ).run(runId, workflowId, now, now);
+    db.close();
+
+    const r = await jsonRequest(
+      "POST",
+      "/control/pause-run",
+      { runId, drain: true, requestedBy: requester },
+      secret,
+    );
+    // Drain pause may return drained state; accept 200.
+    assert.equal(r.status, 200);
+
+    // Read events and verify run.pause_requested has drain=true.
+    const runEventsPath = path.join(tempHome, ".tamandua", "events", `${runId}.jsonl`);
+    assert.ok(fs.existsSync(runEventsPath));
+    const runEventsRaw = fs.readFileSync(runEventsPath, "utf-8");
+    const runEvents = runEventsRaw.trim().split("\n").filter(Boolean).map((l: string) => JSON.parse(l));
+
+    const reqEvent = runEvents.find((e: any) => e.event === "run.pause_requested");
+    assert.ok(reqEvent, "expected a run.pause_requested event");
+    assert.equal(reqEvent.runId, runId);
+    const detail = JSON.parse(reqEvent.detail);
+    assert.equal(detail.requestedBy, requester);
+    assert.equal(detail.drain, true);
+
+    // Cleanup
+    const db2 = new DatabaseSync(dbPath);
+    db2.prepare("DELETE FROM runs WHERE id = ?").run(runId);
+    db2.close();
+  });
+
+  it("POST /control/pause-run with default requestedBy stores unknown in event detail", async (t) => {
+    if (!daemon) {
+      t.skip("daemon not started");
+      return;
+    }
+
+    const dbPath = path.join(tempHome, ".tamandua", "tamandua.db");
+    const { DatabaseSync } = await import("node:sqlite");
+    const db = new DatabaseSync(dbPath);
+    const runId = crypto.randomUUID();
+    const workflowId = "wf-pause-default-test";
+    const now = new Date().toISOString();
+
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, scheduling_status, created_at, updated_at) VALUES (?, ?, 'pause-default-test', 'running', '{}', 0, 'active', ?, ?)",
+    ).run(runId, workflowId, now, now);
+    db.close();
+
+    const r = await jsonRequest(
+      "POST",
+      "/control/pause-run",
+      { runId },
+      secret,
+    );
+    assert.equal(r.status, 200);
+
+    const runEventsPath = path.join(tempHome, ".tamandua", "events", `${runId}.jsonl`);
+    assert.ok(fs.existsSync(runEventsPath));
+    const runEventsRaw = fs.readFileSync(runEventsPath, "utf-8");
+    const runEvents = runEventsRaw.trim().split("\n").filter(Boolean).map((l: string) => JSON.parse(l));
+
+    const reqEvent = runEvents.find((e: any) => e.event === "run.pause_requested");
+    assert.ok(reqEvent, "expected a run.pause_requested event");
+    const detail = JSON.parse(reqEvent.detail);
+    assert.equal(detail.requestedBy, "unknown", "requestedBy should default to unknown");
+    assert.equal(detail.drain, false);
+
+    // Cleanup
+    const db2 = new DatabaseSync(dbPath);
+    db2.prepare("DELETE FROM runs WHERE id = ?").run(runId);
+    db2.close();
+  });
+
+  it("POST /control/resume-run emits run.resume_requested event before run.resumed", async (t) => {
+    if (!daemon) {
+      t.skip("daemon not started");
+      return;
+    }
+
+    const dbPath = path.join(tempHome, ".tamandua", "tamandua.db");
+    const { DatabaseSync } = await import("node:sqlite");
+    const db = new DatabaseSync(dbPath);
+    const runId = crypto.randomUUID();
+    const workflowId = "wf-resume-requested-test";
+    const now = new Date().toISOString();
+    const context = JSON.stringify({ working_directory_for_harness: tempHome });
+    const requester = "carol@box:9012 (cli)";
+
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, scheduling_status, created_at, updated_at) VALUES (?, ?, 'resume-requested-test', 'paused', ?, 0, 'paused', ?, ?)",
+    ).run(runId, workflowId, context, now, now);
+    db.close();
+
+    const r = await jsonRequest(
+      "POST",
+      "/control/resume-run",
+      { runId, requestedBy: requester },
+      secret,
+    );
+    assert.ok(r.status === 200 || r.status === 422,
+      `expected 200 or 422, got ${r.status}`);
+
+    // Read events and verify ordering: run.resume_requested must appear before run.resumed.
+    const runEventsPath = path.join(tempHome, ".tamandua", "events", `${runId}.jsonl`);
+    assert.ok(fs.existsSync(runEventsPath));
+    const runEventsRaw = fs.readFileSync(runEventsPath, "utf-8");
+    const runEvents = runEventsRaw.trim().split("\n").filter(Boolean).map((l: string) => JSON.parse(l));
+
+    const requestIndex = runEvents.findIndex((e: any) => e.event === "run.resume_requested");
+    const resumedIndex = runEvents.findIndex((e: any) => e.event === "run.resumed");
+
+    assert.ok(requestIndex >= 0, "expected a run.resume_requested event");
+    assert.ok(resumedIndex >= 0, "expected a run.resumed event");
+    assert.ok(requestIndex < resumedIndex,
+      `run.resume_requested (idx=${requestIndex}) must appear before run.resumed (idx=${resumedIndex})`);
+
+    // Verify run.resume_requested has requester in detail.
+    const reqEvent = runEvents[requestIndex];
+    assert.equal(reqEvent.runId, runId);
+    assert.equal(reqEvent.workflowId, workflowId);
+    const detail = JSON.parse(reqEvent.detail);
+    assert.equal(detail.requestedBy, requester);
+
+    // Verify run.resumed still fires unchanged.
+    const resumedEvent = runEvents[resumedIndex];
+    assert.equal(resumedEvent.runId, runId);
+    assert.equal(resumedEvent.workflowId, workflowId);
+
+    // Cleanup
+    const db2 = new DatabaseSync(dbPath);
+    db2.prepare("DELETE FROM runs WHERE id = ?").run(runId);
+    db2.close();
+  });
+
+  // ── Attribution context key tests ─────────────────────────────────
+
+  it("POST /control/pause-run stores attribution context keys", async (t) => {
+    if (!daemon) {
+      t.skip("daemon not started");
+      return;
+    }
+
+    const dbPath = path.join(tempHome, ".tamandua", "tamandua.db");
+    const { DatabaseSync } = await import("node:sqlite");
+    const db = new DatabaseSync(dbPath);
+    const runId = crypto.randomUUID();
+    const now = new Date().toISOString();
+
+    // Insert a running run so pause will succeed.
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, scheduling_status, created_at, updated_at) VALUES (?, ?, 'pause-attribution-test', 'running', '{}', 0, 'active', ?, ?)",
+    ).run(runId, "wf-pause-attr", now, now);
+    db.close();
+
+    const r = await jsonRequest(
+      "POST",
+      "/control/pause-run",
+      { runId },
+      secret,
+    );
+    assert.equal(r.status, 200);
+    assert.equal(r.body.state, "paused");
+
+    // Verify context keys in DB.
+    const db2 = new DatabaseSync(dbPath);
+    const row = db2.prepare("SELECT context FROM runs WHERE id = ?").get(runId) as { context: string };
+    const ctx = JSON.parse(row.context);
+    assert.equal(ctx.paused_by, "unknown", "paused_by should default to unknown");
+    assert.ok(typeof ctx.paused_at === "string" && ctx.paused_at.length > 0, "paused_at should be an ISO timestamp");
+    assert.equal(ctx.pause_drain, "false", "pause_drain should be false for non-drain pause");
+    db2.close();
+
+    // Cleanup
+    const db3 = new DatabaseSync(dbPath);
+    db3.prepare("DELETE FROM runs WHERE id = ?").run(runId);
+    db3.close();
+  });
+
+  it("POST /control/pause-run stores requestedBy when provided", async (t) => {
+    if (!daemon) {
+      t.skip("daemon not started");
+      return;
+    }
+
+    const dbPath = path.join(tempHome, ".tamandua", "tamandua.db");
+    const { DatabaseSync } = await import("node:sqlite");
+    const db = new DatabaseSync(dbPath);
+    const runId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    const requester = "igorhvr@tamandua-mac:12345 (cli)";
+
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, scheduling_status, created_at, updated_at) VALUES (?, ?, 'pause-requester-test', 'running', '{}', 0, 'active', ?, ?)",
+    ).run(runId, "wf-pause-req", now, now);
+    db.close();
+
+    const r = await jsonRequest(
+      "POST",
+      "/control/pause-run",
+      { runId, requestedBy: requester },
+      secret,
+    );
+    assert.equal(r.status, 200);
+    assert.equal(r.body.state, "paused");
+
+    // Verify context keys.
+    const db2 = new DatabaseSync(dbPath);
+    const row = db2.prepare("SELECT context FROM runs WHERE id = ?").get(runId) as { context: string };
+    const ctx = JSON.parse(row.context);
+    assert.equal(ctx.paused_by, requester, "paused_by should store the requester string");
+    assert.ok(typeof ctx.paused_at === "string" && ctx.paused_at.length > 0, "paused_at should be an ISO timestamp");
+    assert.equal(ctx.pause_drain, "false", "pause_drain should be false");
+    db2.close();
+
+    // Cleanup
+    const db3 = new DatabaseSync(dbPath);
+    db3.prepare("DELETE FROM runs WHERE id = ?").run(runId);
+    db3.close();
+  });
+
+  it("POST /control/pause-run stores pause_drain=true for drain pause", async (t) => {
+    if (!daemon) {
+      t.skip("daemon not started");
+      return;
+    }
+
+    const dbPath = path.join(tempHome, ".tamandua", "tamandua.db");
+    const { DatabaseSync } = await import("node:sqlite");
+    const db = new DatabaseSync(dbPath);
+    const runId = crypto.randomUUID();
+    const now = new Date().toISOString();
+
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, scheduling_status, created_at, updated_at) VALUES (?, ?, 'pause-drain-attr-test', 'running', '{}', 0, 'active', ?, ?)",
+    ).run(runId, "wf-pause-drain-attr", now, now);
+    db.close();
+
+    const r = await jsonRequest(
+      "POST",
+      "/control/pause-run",
+      { runId, drain: true },
+      secret,
+    );
+    assert.equal(r.status, 200);
+
+    // Verify context keys.
+    const db2 = new DatabaseSync(dbPath);
+    const row = db2.prepare("SELECT context FROM runs WHERE id = ?").get(runId) as { context: string };
+    const ctx = JSON.parse(row.context);
+    assert.equal(ctx.paused_by, "unknown", "paused_by should default to unknown");
+    assert.ok(typeof ctx.paused_at === "string" && ctx.paused_at.length > 0, "paused_at should be set");
+    assert.equal(ctx.pause_drain, "true", "pause_drain should be true for drain pause");
+    db2.close();
+
+    // Cleanup
+    const db3 = new DatabaseSync(dbPath);
+    db3.prepare("DELETE FROM runs WHERE id = ?").run(runId);
+    db3.close();
+  });
+
+  it("POST /control/resume-run stores attribution context keys", async (t) => {
+    if (!daemon) {
+      t.skip("daemon not started");
+      return;
+    }
+
+    const dbPath = path.join(tempHome, ".tamandua", "tamandua.db");
+    const { DatabaseSync } = await import("node:sqlite");
+    const db = new DatabaseSync(dbPath);
+    const runId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    const context = JSON.stringify({ working_directory_for_harness: tempHome });
+
+    // Insert a paused run so resume will process it.
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, scheduling_status, created_at, updated_at) VALUES (?, ?, 'resume-attribution-test', 'paused', ?, 0, 'paused', ?, ?)",
+    ).run(runId, "wf-resume-attr", context, now, now);
+    db.close();
+
+    const r = await jsonRequest(
+      "POST",
+      "/control/resume-run",
+      { runId },
+      secret,
+    );
+    // The resume handler emits the event before calling handleRegisterRun,
+    // which may fail (workflow not installed) but the event and context keys are already set.
+    assert.ok(r.status === 200 || r.status === 422);
+
+    // Verify context keys in DB.
+    const db2 = new DatabaseSync(dbPath);
+    const row = db2.prepare("SELECT context FROM runs WHERE id = ?").get(runId) as { context: string };
+    const ctx = JSON.parse(row.context);
+    assert.equal(ctx.resumed_by, "unknown", "resumed_by should default to unknown");
+    assert.ok(typeof ctx.resumed_at === "string" && ctx.resumed_at.length > 0, "resumed_at should be an ISO timestamp");
+    db2.close();
+
+    // Cleanup
+    const db3 = new DatabaseSync(dbPath);
+    db3.prepare("DELETE FROM runs WHERE id = ?").run(runId);
+    db3.close();
+  });
+
+  it("POST /control/resume-run stores requestedBy when provided", async (t) => {
+    if (!daemon) {
+      t.skip("daemon not started");
+      return;
+    }
+
+    const dbPath = path.join(tempHome, ".tamandua", "tamandua.db");
+    const { DatabaseSync } = await import("node:sqlite");
+    const db = new DatabaseSync(dbPath);
+    const runId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    const context = JSON.stringify({ working_directory_for_harness: tempHome });
+    const requester = "igorhvr@tamandua-mac:99999 (cli)";
+
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, scheduling_status, created_at, updated_at) VALUES (?, ?, 'resume-requester-test', 'paused', ?, 0, 'paused', ?, ?)",
+    ).run(runId, "wf-resume-req", context, now, now);
+    db.close();
+
+    const r = await jsonRequest(
+      "POST",
+      "/control/resume-run",
+      { runId, requestedBy: requester },
+      secret,
+    );
+    assert.ok(r.status === 200 || r.status === 422);
+
+    // Verify context keys.
+    const db2 = new DatabaseSync(dbPath);
+    const row = db2.prepare("SELECT context FROM runs WHERE id = ?").get(runId) as { context: string };
+    const ctx = JSON.parse(row.context);
+    assert.equal(ctx.resumed_by, requester, "resumed_by should store the requester string");
+    assert.ok(typeof ctx.resumed_at === "string" && ctx.resumed_at.length > 0, "resumed_at should be an ISO timestamp");
+    db2.close();
+
+    // Cleanup
+    const db3 = new DatabaseSync(dbPath);
+    db3.prepare("DELETE FROM runs WHERE id = ?").run(runId);
+    db3.close();
+  });
+
   // ── Drain-before-pause tests ───────────────────────────────────────
 
   it("POST /control/pause-run with drain=true waits for in-flight steps", async (t) => {

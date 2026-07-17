@@ -13,6 +13,7 @@ import { listBundledWorkflows, getWorkflowShortDescription } from "../../install
 import { loadWorkflowSpec } from "../../installer/workflow-spec.js";
 import { resolveBundledWorkflowDir } from "../../installer/paths.js";
 import { readPort } from "../../server/daemonctl.js";
+import os from "node:os";
 import { pauseRunWithDaemon, resumeRunWithDaemon } from "../../server/control-client.js";
 import { buildAbandonReasonAggregate } from "../../installer/step-ops.js";
 import { checkCatalogStalenessWarning } from "../../installer/catalog-version.js";
@@ -349,6 +350,9 @@ export async function handleWorkflow(
   if (args.length < 2) { printUsage(); process.exit(1); }
   if (group !== "workflow") { printUsage(); process.exit(1); }
 
+  // Build CLI requester identity for pause/resume attribution (US-004).
+  const cliIdentity = `${os.userInfo().username}@${os.hostname()}:${process.pid} (cli)`;
+
   if (action === "runs") {
     const runs = listRuns();
     if (runs.length === 0) { console.log("No workflow runs found."); return true; }
@@ -409,7 +413,7 @@ export async function handleWorkflow(
       process.stderr.write(`Cannot pause run ${fullId.slice(0, 8)}: status is "${runStatus}" (only running runs can be paused).\n`);
       process.exit(1);
     }
-    const response = await pauseRunWithDaemon(fullId, drain);
+    const response = await pauseRunWithDaemon(fullId, drain, cliIdentity);
     if (response === null) {
       process.stderr.write("Daemon is unreachable. Is the daemon running? Try: tamandua daemon start\n");
       process.exit(1);
@@ -436,7 +440,7 @@ export async function handleWorkflow(
       process.exit(1);
     }
     if (runStatus === "paused") {
-      const response = await resumeRunWithDaemon(fullId);
+      const response = await resumeRunWithDaemon(fullId, cliIdentity);
       if (response === null) {
         process.stderr.write("Daemon is unreachable. Is the daemon running? Try: tamandua daemon start\n");
         process.exit(1);
@@ -472,7 +476,7 @@ export async function handleWorkflow(
     }
     let paused = 0;
     for (const r of runs) {
-      const response = await pauseRunWithDaemon(r.id, drain);
+      const response = await pauseRunWithDaemon(r.id, drain, cliIdentity);
       if (response === null) {
         console.warn(`Warning: daemon unreachable for run ${r.id.slice(0, 8)} — skipped`);
         continue;
@@ -495,7 +499,7 @@ export async function handleWorkflow(
     }
     let resumed = 0;
     for (const r of runs) {
-      const response = await resumeRunWithDaemon(r.id);
+      const response = await resumeRunWithDaemon(r.id, cliIdentity);
       if (response === null) {
         console.warn(`Warning: daemon unreachable for run ${r.id.slice(0, 8)} — skipped`);
         continue;

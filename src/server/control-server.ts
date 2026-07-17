@@ -30,7 +30,7 @@ import { getDb } from "../db.js";
 import { emitEvent } from "../installer/events.js";
 import type { TamanduaEvent } from "../installer/events.js";
 import { validateRunHarnessForScheduling } from "../installer/run-harness.js";
-import { parseRunContext } from "../installer/step-ops.js";
+import { parseRunContext, setRunContextKey } from "../installer/step-ops.js";
 
 export const DEFAULT_CONTROL_PORT = 3339;
 const DEFAULT_MAX_ACTIVE_TIMERS = 50;
@@ -574,11 +574,31 @@ async function handleTerminateRun(runId: string): Promise<JsonResponse> {
   return ok({ terminated: true });
 }
 
-async function handlePauseRun(runId: string, drain = false): Promise<JsonResponse> {
+async function handlePauseRun(runId: string, drain = false, requestedBy = "unknown"): Promise<JsonResponse> {
   const run = getRun(runId);
   if (!run) return notFound(`Run not found: ${runId}`);
   if (isTerminal(run.status)) return conflict(`Run is terminal: ${run.status}`);
   if (run.status === "paused") return ok({ state: "paused" });
+
+  logger.info("control-server: pause requested", { runId, drain, requestedBy });
+
+  emitEvent({
+    ts: new Date().toISOString(),
+    event: "run.pause_requested",
+    runId: run.id,
+    workflowId: run.workflow_id,
+    detail: JSON.stringify({ requestedBy, drain }),
+  });
+
+  // Persist attribution context keys
+  const now = new Date().toISOString();
+  try {
+    setRunContextKey(runId, "paused_by", requestedBy);
+    setRunContextKey(runId, "paused_at", now);
+    setRunContextKey(runId, "pause_drain", String(drain));
+  } catch (err) {
+    logger.warn("control-server: pause context attribution failed", { runId, error: String(err) });
+  }
 
   if (drain) {
     try {
@@ -634,13 +654,23 @@ async function handlePauseRun(runId: string, drain = false): Promise<JsonRespons
   return ok({ state: "paused" });
 }
 
-async function handleResumeRun(runId: string): Promise<JsonResponse> {
+async function handleResumeRun(runId: string, requestedBy = "unknown"): Promise<JsonResponse> {
   const run = getRun(runId);
   if (!run) return notFound(`Run not found: ${runId}`);
   if (isTerminal(run.status)) return conflict(`Run is terminal: ${run.status}`);
   if (run.status === "running" && run.scheduling_status === "active") {
     return ok({ state: "active" });
   }
+
+  logger.info("control-server: resume requested", { runId, requestedBy });
+
+  emitEvent({
+    ts: new Date().toISOString(),
+    event: "run.resume_requested",
+    runId: run.id,
+    workflowId: run.workflow_id,
+    detail: JSON.stringify({ requestedBy }),
+  });
   try {
     await validateRunHarnessForScheduling(run.id, run.context);
   } catch (err) {
@@ -664,6 +694,15 @@ async function handleResumeRun(runId: string): Promise<JsonResponse> {
       .run(new Date().toISOString(), runId);
   } catch {
     /* best-effort */
+  }
+
+  // Persist attribution context keys
+  const now = new Date().toISOString();
+  try {
+    setRunContextKey(runId, "resumed_by", requestedBy);
+    setRunContextKey(runId, "resumed_at", now);
+  } catch (err) {
+    logger.warn("control-server: resume context attribution failed", { runId, error: String(err) });
   }
 
   // Determine the workflow_id for the event. When the run was previously
@@ -951,12 +990,14 @@ export function createControlServer(options: ControlServerOptions = {}): http.Se
         }
         if (pathname === "/control/pause-run") {
           const drain = typeof body.drain === "boolean" ? body.drain : false;
-          const r = await handlePauseRun(runId, drain);
+          const requestedBy = typeof body.requestedBy === "string" ? body.requestedBy : "unknown";
+          const r = await handlePauseRun(runId, drain, requestedBy);
           respond(r.status, r.body);
           return;
         }
         if (pathname === "/control/resume-run") {
-          const r = await handleResumeRun(runId);
+          const requestedBy = typeof body.requestedBy === "string" ? body.requestedBy : "unknown";
+          const r = await handleResumeRun(runId, requestedBy);
           respond(r.status, r.body);
           return;
         }
