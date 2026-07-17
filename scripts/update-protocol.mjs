@@ -614,15 +614,23 @@ export function inspect() {
 
   let db;
   try {
-    if (!hasRunsTable(dbPath)) return null;
     db = openReadOnlyDb(dbPath);
-    const row = getGateRow(db);
-    return row ? toPublicGateView(row) : null;
   } catch (error) {
     if (!fs.existsSync(dbPath)) return null;
     throw error;
+  }
+
+  try {
+    const hasRuns = db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='runs'",
+      )
+      .get();
+    if (hasRuns === undefined) return null;
+    const row = getGateRow(db);
+    return row ? toPublicGateView(row) : null;
   } finally {
-    if (db) db.close();
+    db.close();
   }
 }
 
@@ -890,11 +898,14 @@ export function isGateActive() {
   let db;
   try {
     db = openReadOnlyDb(dbPath);
-    return gateExists(db);
   } catch (error) {
     if (!fs.existsSync(dbPath)) return false;
     throw error;
+  }
+
+  try {
+    return gateExists(db);
   } finally {
-    if (db) db.close();
+    db.close();
   }
 }

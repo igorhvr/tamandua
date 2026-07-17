@@ -2756,6 +2756,60 @@ try {
     }
   });
 
+  it("propagates public read query errors when the database disappears after opening", () => {
+    for (const operation of ["inspect", "isGateActive"]) {
+      const temp = createTempHome(`update-protocol-query-race-${operation}-`);
+      try {
+        const dbPath = path.join(temp.root, `${operation}.db`);
+        const db = new DatabaseSync(dbPath);
+        try {
+          db.exec("CREATE TABLE runs (id TEXT PRIMARY KEY)");
+        } finally {
+          db.close();
+        }
+
+        const result = runNode(
+          [
+            "--input-type=module",
+            "-e",
+            `import fs from "node:fs";
+import { DatabaseSync } from "node:sqlite";
+const dbPath = process.env.TAMANDUA_DB_PATH;
+const originalPrepare = DatabaseSync.prototype.prepare;
+let intercepted = false;
+DatabaseSync.prototype.prepare = function (...args) {
+  if (!intercepted) {
+    intercepted = true;
+    fs.unlinkSync(dbPath);
+    throw new Error("NIT_READ_QUERY_FAILURE");
+  }
+  return Reflect.apply(originalPrepare, this, args);
+};
+try {
+  const { ${operation} } = await import(${JSON.stringify(PROTOCOL_MODULE)});
+  try {
+    ${operation}();
+    console.log("SWALLOWED");
+  } catch (error) {
+    console.log("PROPAGATED:" + error.message);
+  }
+} finally {
+  DatabaseSync.prototype.prepare = originalPrepare;
+}`,
+          ],
+          protocolEnv(temp, dbPath),
+        );
+
+        assert.equal(result.status, 0, `${operation}: ${result.stderr}`);
+        assert.equal(result.stdout, "PROPAGATED:NIT_READ_QUERY_FAILURE\n");
+        assert.equal(result.stderr, "");
+        assertNoSqliteArtifacts(dbPath);
+      } finally {
+        fs.rmSync(temp.root, { recursive: true, force: true });
+      }
+    }
+  });
+
   it("inspect reads the exact redacted gate from a read-only database location", () => {
     const temp = createTempHome("update-protocol-readonly-inspect-");
     const location = path.join(temp.root, "readonly-state");
