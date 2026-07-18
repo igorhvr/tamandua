@@ -534,3 +534,13 @@ production entrypoints, touch live state, start or stop real services, install
 workflows, or run model-token E2E tests. Unknown safety behavior is resolved by
 preserving blockers and requiring authenticated deterministic recovery; it is
 never filled in by local inference.
+
+The reviewed SPEC commit/tree and its external suite ledger are one-time
+changeset evidence that the review and required tests covered the submitted
+tree. They are not permanent byte invariants for production files. The lasting
+closure policy is phase-aware: while every authoritative `productionWired` and
+`claimsLiveSafety` flag is exactly `false`, bounded tests require the canonical
+contract to remain disconnected from production surfaces. Any phase transition
+requires a separately reviewed allow-policy naming the exact production
+surfaces and callers; historical file digests must not block unrelated future
+production changes.

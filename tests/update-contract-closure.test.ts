@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
-import fs from "node:fs";
 import path from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
+import {
+  assertNoProductionContractReferences,
+  assertUnwiredPhasePolicy,
+} from "./update-contract-scope-policy.ts";
 import {
   ACTORS,
   ARTIFACT_CONTRACT,
@@ -41,10 +43,6 @@ function visit(value: unknown, callback: (key: string, value: unknown, location:
 
 function objectKeys(value: object): string[] {
   return Object.keys(value).sort();
-}
-
-function sha256(relativePath: string): string {
-  return createHash("sha256").update(fs.readFileSync(path.join(REPO_ROOT, relativePath))).digest("hex");
 }
 
 type LifecycleEdge = {
@@ -319,47 +317,8 @@ describe("update contract final closure", () => {
 });
 
 describe("SPEC production scope preservation", () => {
-  it("pins every production interception and mutation surface to its pre-SPEC content", () => {
-    const protectedFiles: Record<string, string> = {
-      "build-and-install": "4b354d8ada39bf2bf529ab20682b798c0a696a9c15b4891e77804c6f39531d35",
-      "src/cli/update.ts": "11e9985cd8a440d4fc56dd1164f1f3bf8349e2ee56e402afa0315201a4641b1b",
-      "src/installer/install.ts": "6f6e587670e0f58f4176966c4ffcf8283f79d0366ce69b17b056ab95a6d0c2ef",
-      "src/installer/workflow-fetch.ts": "9bb6dda4d795ca5562158edcb2bdf1f603ac793f9b80ed6b4a907503bb69daee",
-      "src/installer/workspace-files.ts": "4cc13dd7eebc2232ca9f409530f3f558143e6b251d5839aace11989d36131572",
-      "src/server/daemon.ts": "84a708032aa31cea9177552a3e0940dd6c6ea3835c65ac8b76d05c1a6e5c9fc8",
-      "src/server/daemonctl.ts": "a53ccd9f515562ea4aa0366bf23c1b20287a4cfd956ea977d2bd0422f9c30661",
-      "src/server/control-server.ts": "7121109e5ccbfba58b122b4b3a4e975ea31f4790402ff95d4785a05355a8f45d",
-      "src/server/control-client.ts": "654dd635c26883a1e3d224e8b3af3963a42557098625c4b24949f81675f61a68",
-      "scripts/update-protocol.mjs": "4788d1b97df99284be748d40549f7adf2192fb3cf31d70bdf9de3d3e0df61af9",
-    };
-    for (const [relativePath, expectedHash] of Object.entries(protectedFiles)) {
-      assert.equal(sha256(relativePath), expectedHash, `${relativePath} remains pre-SPEC exact content`);
-    }
-  });
-
-  it("keeps the target contract disconnected from production entrypoints", () => {
-    const productionRoots = ["build-and-install", "src", "scripts/update-protocol.mjs"];
-    const sourceFiles: string[] = [];
-    const collect = (relativePath: string): void => {
-      const absolutePath = path.join(REPO_ROOT, relativePath);
-      const stat = fs.statSync(absolutePath);
-      if (stat.isFile()) {
-        sourceFiles.push(relativePath);
-        return;
-      }
-      for (const entry of fs.readdirSync(absolutePath, { withFileTypes: true })) {
-        if (entry.isDirectory() && ["node_modules", "dist"].includes(entry.name)) continue;
-        if (entry.isDirectory() || /\.(?:ts|js|mjs|sh)$/u.test(entry.name)) collect(path.join(relativePath, entry.name));
-      }
-    };
-    productionRoots.forEach(collect);
-
-    for (const relativePath of sourceFiles) {
-      const source = fs.readFileSync(path.join(REPO_ROOT, relativePath), "utf8");
-      assert.doesNotMatch(source, /(?:import|require\s*\()\s*["'][^"']*update-contract\.mjs["']/u, `${relativePath} does not wire the target contract`);
-    }
-    assert.equal(IMPLEMENTATION.foundation.productionWired, false);
-    assert.equal(IMPLEMENTATION.productionLifecycle.productionWired, false);
-    assert.equal(IMPLEMENTATION.productionLifecycle.claimsLiveSafety, false);
+  it("keeps the target contract disconnected while every phase flag remains unwired", () => {
+    assertNoProductionContractReferences(REPO_ROOT);
+    assertUnwiredPhasePolicy(UPDATE_CONTRACT);
   });
 });
