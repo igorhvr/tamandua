@@ -31,6 +31,8 @@ describe("SPL2 workflow command module", () => {
   it("owns the workflow group and every action help route", () => {
     assert.match(getWorkflowGroupHelp(), /Manage workflows and runs/);
     assert.match(getWorkflowListHelp(), /List available bundled workflows/);
+    assert.match(getWorkflowListHelp(), /\[worktree\]/);
+    assert.match(getWorkflowListHelp(), /\[direct\]/);
     assert.match(getWorkflowRunsHelp(), /List all workflow runs/);
     assert.match(getWorkflowInstallHelp(), /Install a specific workflow/);
     assert.match(getWorkflowUninstallHelp(), /Uninstall one or all workflows/);

@@ -9,7 +9,7 @@ import { installWorkflow } from "../../installer/install.js";
 import { uninstallAllWorkflows, uninstallWorkflow, checkActiveRuns } from "../../installer/uninstall.js";
 import { getWorkflowStatus, listRuns, stopWorkflow, deleteWorkflow } from "../../installer/status.js";
 import { runWorkflow, resumeWorkflow } from "../../installer/run.js";
-import { listBundledWorkflows, getWorkflowShortDescription } from "../../installer/workflow-fetch.js";
+import { listBundledWorkflows } from "../../installer/workflow-fetch.js";
 import { loadWorkflowSpec } from "../../installer/workflow-spec.js";
 import { resolveBundledWorkflowDir } from "../../installer/paths.js";
 import { readPort } from "../../server/daemonctl.js";
@@ -18,6 +18,7 @@ import { pauseRunWithDaemon, resumeRunWithDaemon } from "../../server/control-cl
 import { buildAbandonReasonAggregate } from "../../installer/step-ops.js";
 import { checkCatalogStalenessWarning } from "../../installer/catalog-version.js";
 import { parseWorkflowRunArgs } from "../workflow-run-args.js";
+import { reportUnknownCommand } from "../shared.js";
 import type { HarnessType } from "../../installer/types.js";
 import { printWorkflowAutoresearch } from "./autoresearch.js";
 import { handleWait, getWaitHelp } from "./wait.js";
@@ -31,8 +32,11 @@ Lists all bundled workflows that are available for installation from the
 source checkout, showing a one-line description for each. These are the
 workflows defined in the workflows/ directory of the Tamandua source tree.
 
+Each workflow line shows the workspace mode: [worktree] for worktree-mode
+workflows, [direct] for direct-mode workflows.
+
 Options:
-  --json    Output a JSON array of {id, name, description} for programmatic consumption
+  --json    Output a JSON array of {id, name, description, workspaceMode} for programmatic consumption
 
 Examples:
   tamandua workflow list
@@ -389,28 +393,28 @@ export async function handleWorkflow(
       else console.log("No workflows available.");
       return true;
     }
+    // Load specs for all workflows — needed for workspaceMode in both text and JSON paths
+    const specs = await Promise.all(
+      workflows.map(async (wid) => {
+        try {
+          const dir = resolveBundledWorkflowDir(wid);
+          const spec = await loadWorkflowSpec(dir);
+          return { id: spec.id, name: spec.name || spec.id, description: spec.description || "", workspaceMode: spec.run?.workspace || "direct" };
+        } catch {
+          return { id: wid, name: wid, description: "", workspaceMode: "direct" };
+        }
+      }),
+    );
     if (jsonFlag) {
-      const specs = await Promise.all(
-        workflows.map(async (wid) => {
-          try {
-            const dir = resolveBundledWorkflowDir(wid);
-            const spec = await loadWorkflowSpec(dir);
-            return { id: spec.id, name: spec.name || spec.id, description: spec.description || "" };
-          } catch {
-            return { id: wid, name: wid, description: "" };
-          }
-        }),
-      );
       console.log(JSON.stringify(specs));
       return true;
     }
-    const descriptions = await Promise.all(workflows.map(w => getWorkflowShortDescription(w)));
     console.log("Available workflows:");
-    for (let i = 0; i < workflows.length; i++) { console.log(`  ${workflows[i]} - ${descriptions[i]}`); }
+    for (let i = 0; i < workflows.length; i++) { console.log(`  ${specs[i].id} - ${specs[i].description} [${specs[i].workspaceMode}]`); }
     return true;
   }
 
-  if (action === "stop") {
+  if (action === "stop" || action === "cancel") {
     if (!target) { process.stderr.write("Missing run-id.\n"); process.exit(1); }
     try { const fullId = getWorkflowStatus(target).id; const r = await stopWorkflow(fullId); console.log(`Cancelled run ${r.runId.slice(0, 8)}.`); } catch (err) { process.stderr.write(`${err instanceof Error ? err.message : String(err)}\n`); process.exit(1); }
     return true;
@@ -532,6 +536,14 @@ export async function handleWorkflow(
     }
     console.log(`Resumed ${resumed} run(s).`);
     return true;
+  }
+
+  const WORKFLOW_ACTIONS = [
+    "runs", "list", "stop", "cancel", "pause", "resume", "pause-all", "resume-all",
+    "install", "uninstall", "run", "status", "autoresearch", "wait", "delete", "ensure-crons",
+  ];
+  if (!WORKFLOW_ACTIONS.includes(action)) {
+    reportUnknownCommand(action, WORKFLOW_ACTIONS, "workflow");
   }
 
   if (!target) { printUsage(); process.exit(1); }
@@ -720,6 +732,7 @@ export async function handleWorkflow(
     process.exit(1);
   }
 
-  printUsage(); process.exit(1);
+  // Unreachable — all known actions exit or return above. The unknown-action
+  // guard before the target check ensures we never reach this point.
   return true;
 }

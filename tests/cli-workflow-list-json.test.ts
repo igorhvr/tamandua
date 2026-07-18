@@ -76,8 +76,8 @@ const TMP_PREFIX = "tamandua-wfl-json-";
 // ═══════════════════════════════════════════════════════════════════
 
 describe("tamandua workflow list --json", () => {
-  // AC 1: tamandua workflow list --json outputs valid JSON array with id/name/description
-  it("--json outputs valid JSON array with id, name, description", async (t) => {
+  // AC 1: tamandua workflow list --json outputs valid JSON array with id/name/description/workspaceMode
+  it("--json outputs valid JSON array with id, name, description, workspaceMode", async (t) => {
     if (!fs.existsSync(CLI_SCRIPT)) {
       t.skip("CLI script not built — run npm run build first");
       return;
@@ -97,11 +97,27 @@ describe("tamandua workflow list --json", () => {
         assert.ok(typeof entry.id === "string" && entry.id.length > 0, `Entry missing or empty id: ${JSON.stringify(entry)}`);
         assert.ok(typeof entry.name === "string" && entry.name.length > 0, `Entry missing or empty name: ${JSON.stringify(entry)}`);
         assert.ok(typeof entry.description === "string", `Entry missing description field: ${JSON.stringify(entry)}`);
+        // Every entry must have workspaceMode "worktree" or "direct"
+        assert.ok(entry.workspaceMode === "worktree" || entry.workspaceMode === "direct",
+          `workspaceMode must be "worktree" or "direct", got "${entry.workspaceMode}" for ${entry.id}`);
       }
+
+      // At least one worktree workflow
+      const worktreeEntries = parsed.filter((e: any) => e.workspaceMode === "worktree");
+      assert.ok(worktreeEntries.length > 0, "Expected at least one worktree workflow");
+
+      // Verify specific known workflows
+      const featureDevWt = parsed.find((e: any) => e.id === "feature-dev-worktree");
+      assert.ok(featureDevWt, "Expected feature-dev-worktree in list");
+      assert.equal(featureDevWt.workspaceMode, "worktree");
+
+      const featureDev = parsed.find((e: any) => e.id === "feature-dev");
+      assert.ok(featureDev, "Expected feature-dev in list");
+      assert.equal(featureDev.workspaceMode, "direct");
   });
 
-  // AC 2: tamandua workflow list (without --json) still outputs human-readable format
-  it("without --json outputs human-readable format unchanged", async (t) => {
+  // AC 2: tamandua workflow list (without --json) shows workspace mode markers
+  it("without --json shows workspace mode markers", async (t) => {
     if (!fs.existsSync(CLI_SCRIPT)) {
       t.skip("CLI script not built — run npm run build first");
       return;
@@ -120,6 +136,16 @@ describe("tamandua workflow list --json", () => {
       assert.ok(
         lines.some((l) => l.includes(" - ")),
         "Expected at least one line with ' - ' workflow description format",
+      );
+      // At least one worktree marker
+      assert.ok(
+        lines.some((l) => l.includes("[worktree]")),
+        "Expected at least one line with [worktree] marker",
+      );
+      // At least one direct marker
+      assert.ok(
+        lines.some((l) => l.includes("[direct]")),
+        "Expected at least one line with [direct] marker",
       );
   });
 
@@ -146,8 +172,8 @@ describe("tamandua workflow list --json", () => {
       );
   });
 
-  // AC 4: Reasonable output even when something goes wrong
-  it("each entry has string description (even if empty)", async (t) => {
+  // AC 4: workspaceMode is always "worktree" or "direct" and description is string
+  it("each entry has valid workspaceMode and string description", async (t) => {
     if (!fs.existsSync(CLI_SCRIPT)) {
       t.skip("CLI script not built — run npm run build first");
       return;
@@ -164,6 +190,8 @@ describe("tamandua workflow list --json", () => {
 
       for (const entry of parsed) {
         assert.ok(typeof entry.description === "string", `description must be a string, got ${typeof entry.description} for ${entry.id}`);
+        assert.ok(entry.workspaceMode === "worktree" || entry.workspaceMode === "direct",
+          `workspaceMode must be "worktree" or "direct", got "${entry.workspaceMode}" for ${entry.id}`);
       }
   });
 });

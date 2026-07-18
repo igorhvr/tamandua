@@ -9,10 +9,12 @@
 # and tests/serial-files-integrity.test.ts.
 src/autoresearch/autoresearch.test.ts
 src/cli/cli.test.ts
+src/cli/cli.unknown.test.ts
 src/cli/commands/autoresearch.test.ts
 src/cli/commands/daemon.test.ts
 src/cli/commands/dashboard.test.ts
 src/cli/commands/get-ready.test.ts
+src/cli/commands/logs.test.ts
 src/cli/commands/mcp.test.ts
 src/cli/commands/merge-branch.test.ts
 src/cli/commands/restart.test.ts

@@ -43,7 +43,7 @@ install worked by running `tamandua version`.
 Use these when managing workflow runs (outside individual step execution):
 
 ```bash
-tamandua workflow list [--json]
+tamandua workflow list [--json]          # Shows [worktree] or [direct] marker per workflow
 tamandua workflow install <workflow-id|--all>
 tamandua workflow uninstall <workflow-id|--all> [--force]
 tamandua workflow run <workflow-id> "<task>" [--context <key=value> ...] [--working-directory-for-harness <dir>] [--worktree-origin-repository <dir>] [--worktree-origin-ref <ref>] [--pi-as-harness | --hermes-as-harness] [--no-hurry-please-save-tokens-mode] [--no-relaunch-upon-rugpull] [--wait [--timeout <dur>] [--json]]
@@ -55,10 +55,16 @@ tamandua workflow pause-all [--drain]
 tamandua workflow resume <run-id>
 tamandua workflow resume-all
 tamandua workflow stop <run-id>
+tamandua workflow cancel <run-id>        # Alias for stop
 tamandua workflow autoresearch <run-id>
 tamandua workflow delete <run-id> [--force]
 tamandua nudge
 ```
+
+**Flag rejection:** `tamandua workflow run` now rejects unknown `--flags` and
+`-x` short flags with a clear error message instead of silently absorbing them
+into the task title. Use `--` to pass a task that starts with `--` or `-`
+(e.g. `tamandua workflow run mywf -- --my-task-flag`).
 
 `tamandua nudge` wakes all scheduled agents for all currently running runs,
 causing them to poll once immediately without waiting for their normal
@@ -147,10 +153,11 @@ tamandua workflow status <run-id>
 tamandua workflow runs
 tamandua logs <run-id>
 tamandua workflow stop <run-id>
+tamandua workflow cancel <run-id>
 ```
 
-The stop command's success message says `Cancelled`, but the command verb is
-`stop`. Prefer these CLI commands for run-state inspection. If the CLI does not
+Both `stop` and `cancel` terminate the run and print `Cancelled run X.`.
+`cancel` is a documented alias for `stop`. Prefer these CLI commands for run-state inspection. If the CLI does not
 expose a needed field, reading `~/.tamandua/tamandua.db` directly is an
 acceptable fallback, but always open it read-only with
 `sqlite3 -readonly ~/.tamandua/tamandua.db`; do not use the database as the
@@ -787,8 +794,10 @@ The selector can be:
 ```bash
 # Show recent entries
 tamandua logs                        # default: last 20 entries
-tamandua logs 50                     # last 50 entries
+tamandua logs --tail 50              # last 50 entries (flag form)
+tamandua logs 50                     # last 50 entries (numeric selector)
 tamandua logs <run-id>               # entries for a specific run
+tamandua logs <run-id> --tail 20     # tail a specific run with initial limit
 tamandua logs #3                     # entries for run number 3
 
 # Follow activity as new events arrive
