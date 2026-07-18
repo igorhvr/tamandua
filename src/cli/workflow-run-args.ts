@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+
 export interface WorkflowRunArgs {
   taskTitle: string;
   workingDirectoryForHarness?: string;
@@ -28,9 +31,11 @@ const KNOWN_FLAGS = new Set([
   "--worktree-origin-repository",
   "--worktree-origin-ref",
   "--context",
+  "--task-file",
 ]);
 
 export function parseWorkflowRunArgs(args: string[]): WorkflowRunArgs {
+  let taskFileName: string | undefined;
   const taskParts: string[] = [];
   let workingDirectoryForHarness: string | undefined;
   let worktreeOriginRepository: string | undefined;
@@ -167,6 +172,26 @@ export function parseWorkflowRunArgs(args: string[]): WorkflowRunArgs {
       continue;
     }
 
+    if (token === "--task-file") {
+      const value = args[i + 1]?.trim();
+      if (!value) {
+        throw new Error("Missing value for --task-file.");
+      }
+      taskFileName = value;
+      i++;
+      continue;
+    }
+
+    const taskFileInlinePrefix = "--task-file=";
+    if (token.startsWith(taskFileInlinePrefix)) {
+      const value = token.slice(taskFileInlinePrefix.length).trim();
+      if (!value) {
+        throw new Error("Missing value for --task-file.");
+      }
+      taskFileName = value;
+      continue;
+    }
+
     if (token === "--context") {
       const value = args[i + 1]?.trim();
       if (!value) {
@@ -214,6 +239,32 @@ export function parseWorkflowRunArgs(args: string[]): WorkflowRunArgs {
     taskParts.push(token);
   }
 
+  // Mutual exclusion: --task-file and inline task words cannot both be given
+  const hasInlineTask = taskParts.length > 0;
+  if (taskFileName && hasInlineTask) {
+    throw new Error(
+      "--task-file is mutually exclusive with inline task text. Provide the task via --task-file OR as positional arguments, not both.",
+    );
+  }
+
+  // Read task from file if --task-file was given. Dereferenced EXACTLY ONCE at
+  // CLI time — the file path never reaches the DB, events, or any downstream
+  // consumer. Temp files may be deleted immediately after this command returns
+  // with zero effect.
+  let taskTitle: string;
+  if (taskFileName) {
+    const resolvedPath = resolve(process.cwd(), taskFileName);
+    try {
+      taskTitle = readFileSync(resolvedPath, "utf-8").trim();
+    } catch (err) {
+      throw new Error(
+        `Cannot read --task-file "${taskFileName}": ${(err as NodeJS.ErrnoException).message}`,
+      );
+    }
+  } else {
+    taskTitle = taskParts.join(" ").trim();
+  }
+
   // Only consider flags that appear before the -- separator (if any)
   const dashDashIdx = args.indexOf("--");
   const flagArgs = dashDashIdx === -1 ? args : args.slice(0, dashDashIdx);
@@ -233,7 +284,7 @@ export function parseWorkflowRunArgs(args: string[]): WorkflowRunArgs {
   }
 
   return {
-    taskTitle: taskParts.join(" ").trim(),
+    taskTitle,
     workingDirectoryForHarness,
     worktreeOriginRepository,
     worktreeOriginRef,

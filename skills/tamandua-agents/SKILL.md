@@ -46,7 +46,7 @@ Use these when managing workflow runs (outside individual step execution):
 tamandua workflow list [--json]          # Shows [worktree] or [direct] marker per workflow
 tamandua workflow install <workflow-id|--all>
 tamandua workflow uninstall <workflow-id|--all> [--force]
-tamandua workflow run <workflow-id> "<task>" [--context <key=value> ...] [--working-directory-for-harness <dir>] [--worktree-origin-repository <dir>] [--worktree-origin-ref <ref>] [--pi-as-harness | --hermes-as-harness] [--no-hurry-please-save-tokens-mode] [--no-relaunch-upon-rugpull] [--wait [--timeout <dur>] [--json]]
+tamandua workflow run <workflow-id> "<task>" [--context <key=value> ...] [--working-directory-for-harness <dir>] [--worktree-origin-repository <dir>] [--worktree-origin-ref <ref>] [--pi-as-harness | --hermes-as-harness] [--no-hurry-please-save-tokens-mode] [--no-relaunch-upon-rugpull] [--wait [--timeout <dur>] [--json]] [--task-file <path>]
 tamandua workflow status <query> [--json]
 tamandua workflow runs [--json]
 tamandua workflow wait <selector...> [--all] [--timeout <dur>] [--json] [--quiet]
@@ -143,11 +143,16 @@ Workspace-mode guidance:
 
 #### Supervising a run
 
-Put a substantial task in a file and preserve it as one quoted CLI argument:
+Put a substantial task in a file and run it:
 
 ```bash
-tamandua workflow run <workflow-id> "$(cat task.md)" [workspace-mode flags]
+tamandua workflow run <workflow-id> --task-file task.md [workspace-mode flags]
 ```
+
+`--task-file` reads the task description from a file (dereferenced once at
+CLI time; the path is never stored downstream). It is mutually exclusive with
+inline task words — passing both is an error. The legacy `"$(cat task.md)"`
+form still works as an alternative.
 
 Inspect and stop the run with the CLI:
 
@@ -740,7 +745,7 @@ follow the claim lifecycle:
 5. **SAVE `stepId` immediately** and execute the `input` task.
 6. Report with the saved step id:
    - Success: `tamandua step complete <stepId>` (send status output through stdin)
-   - Failure: `tamandua step fail <stepId> "<reason>"`
+   - Failure: `tamandua step fail <stepId> "<reason>"` or `tamandua step fail <stepId> --reason-file <path>` (preferred for multi-line reasons)
 
 If you lose your step id mid-session, do not abandon finished work:
 - Run `tamandua step current <agent-id> --run-id <run-id>` to recover your
@@ -765,15 +770,15 @@ pipelines or understanding story progress.
 
 ### 4) Completion contract
 
-**CRITICAL — piping a report into `tamandua step complete <stepId>` is the ONLY
-thing that completes a step.** Printing `STATUS: done` in a final chat or
+**CRITICAL — submitting a report into `tamandua step complete <stepId>` is the
+ONLY thing that completes a step.** Printing `STATUS: done` in a final chat or
 session message does not complete it.
 
-On success, pipe structured output containing `STATUS: done` as its own
+On success, submit structured output containing `STATUS: done` as its own
 plain-text line into `step complete`. By convention, it is the first report
 line, followed by the step's `KEY:` lines such as `CHANGES:` and `TESTS:`. The
-scheduler matches status markers anywhere in the piped output; they do not have
-to be the final line.
+scheduler matches status markers anywhere in the submitted output; they do not
+have to be the final line.
 
 For example, the report payload is:
 
@@ -783,7 +788,18 @@ CHANGES: ...
 TESTS: ...
 ```
 
-Pipe that payload to the saved step UUID, for example:
+**Preferred — submit via `--file`:** write the report to a file (e.g.,
+`report.txt` in your workdir), then:
+
+```bash
+tamandua step complete <stepId> --file report.txt
+```
+
+The `--file` path is dereferenced exactly once at CLI time — the file contents
+are transmitted as if typed inline, and the path is never stored downstream.
+Temp files may be deleted immediately after the command returns.
+
+**Alternative — stdin pipe:**
 
 ```bash
 printf 'STATUS: done\nCHANGES: ...\nTESTS: ...\n' | tamandua step complete <stepId>
@@ -799,24 +815,49 @@ STATUS: and KEY: contract lines must start at column 0 as plain text: no bold,
 no backticks, no fences, and no leading bullets in the report payload.
 `**BRANCH:** foo` fails validation; `BRANCH: foo` passes.
 
+**REJECTED — you still hold the step:** if `step complete` responds with
+`REJECTED`, the submission was syntactically acceptable but the output failed
+submit-time expects validation. You **still hold the step** — fix the output
+format and resubmit in the same round (no retry slot lost). The REJECTED message
+includes which expects patterns failed and a hint about plain-text `KEY:` lines
+at column 0 (no markdown, no backticks, no leading bullets).
+
 Verdict channels are distinct:
 
-- A verifier that rejects work pipes `STATUS: retry` plus a `REASON:` or other
+- A verifier that rejects work submits `STATUS: retry` plus a `REASON:` or other
   summary KEY: line into `tamandua step complete <stepId>`. This reroutes the
   producer for another attempt.
 - `tamandua step fail <stepId> "<reason>"` means "I could not do the work."
   Use it with an actionable reason when execution cannot be completed. Do not
   use `step fail` to deliver a retry verdict.
+  Prefer `--reason-file <path>` for multi-line reasons — write the reason to a
+  file, then call `tamandua step fail <stepId> --reason-file <path>`. The
+  file is dereferenced once at CLI time; the path is never stored downstream.
 
-#### STORIES_JSON reports
+#### STORIES_JSON and STORIES_JSON_FILE reports
 
 When a step requires `STORIES_JSON:`, its value must be a single-line JSON
 array ending with `]`, with no trailing prose after the array. The array must
 not contain embedded newline-separated lines starting with `UPPERCASE_KEY:`;
 the extractor truncates the value when it encounters such a line.
 
-Construct `STORIES_JSON` with `python3` and `json.dumps` via a heredoc and pipe
-the result directly to `step complete`, rather than hand-quoting JSON:
+**Preferred — use `STORIES_JSON_FILE`:** for multi-KB story payloads, write
+the JSON array to a file and reference it with a `STORIES_JSON_FILE:` line
+instead of inline `STORIES_JSON:`:
+
+```text
+STATUS: done
+CHANGES: planned user stories
+STORIES_JSON_FILE: stories.json
+```
+
+The file is resolved at submit time (relative to the invoking cwd), its
+contents are validated as a JSON array, and it is replaced by a standard
+`STORIES_JSON: <contents>` line before anything reaches the DB or scheduler.
+The file may be deleted immediately after the command returns.
+
+**Inline alternative:** construct `STORIES_JSON` with `python3` and
+`json.dumps` via a heredoc:
 
 ```bash
 python3 - <<'PY' | tamandua step complete <stepId>
@@ -827,6 +868,21 @@ print("STATUS: done")
 print("STORIES_JSON: " + json.dumps(stories, separators=(",", ":")))
 PY
 ```
+
+#### PREVIOUS ATTEMPT FEEDBACK
+
+When a step re-executes because a downstream verifier rejected it or its own
+output was bounced by expects validation, the retry attempt's input includes a
+section like:
+
+```text
+PREVIOUS ATTEMPT FEEDBACK (attempt N was rejected):
+<last 4 KB of the rejection reason>
+```
+
+Read this feedback carefully before re-attempting the work — it tells you
+exactly what was rejected and why. First attempts have no PREVIOUS ATTEMPT
+FEEDBACK section.
 
 ### 2.1) MCP run start (remote)
 

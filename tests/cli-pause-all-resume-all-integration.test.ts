@@ -555,7 +555,8 @@ describe("pause-all / resume-all integration", { concurrency: 1 }, () => {
           run_number INTEGER,
           tokens_spent INTEGER NOT NULL DEFAULT 0,
           notify_url TEXT,
-          scheduling_status TEXT
+          scheduling_status TEXT,
+          worker_lost_count INTEGER NOT NULL DEFAULT 0
         )
       `);
 
@@ -590,8 +591,8 @@ describe("pause-all / resume-all integration", { concurrency: 1 }, () => {
       });
 
       db.prepare(
-        `INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, scheduling_status, run_number, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 0, 'draining_pause', NULL, ?, ?)`,
+        `INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, scheduling_status, run_number, worker_lost_count, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 0, 'draining_pause', NULL, 0, ?, ?)`,
       ).run(runId, "feature-dev-merge", "Drain finalize test", "running", context, now, now);
 
       // Step 0: done (already completed)
@@ -630,10 +631,12 @@ describe("pause-all / resume-all integration", { concurrency: 1 }, () => {
 
       await waitForControlUp(controlPort);
 
-      // Now complete the in-flight step (stepId2) using step complete
+      // Now complete the in-flight step (stepId2) using step complete --file
       // This triggers finalizeDrainingPause internally in completeStep
+      const reportFile = path.join(th.homeDir, "drain-report.txt");
+      fs.writeFileSync(reportFile, "STATUS: done");
       const completeResult = await runCli(
-        ["step", "complete", stepId2, "STATUS: done"],
+        ["step", "complete", stepId2, "--file", reportFile],
         { HOME: th.homeDir, TAMANDUA_STATE_DIR: th.tamanduaDir },
       );
 
@@ -1018,7 +1021,8 @@ describe("pause-all / resume-all integration", { concurrency: 1 }, () => {
           run_number INTEGER,
           tokens_spent INTEGER NOT NULL DEFAULT 0,
           notify_url TEXT,
-          scheduling_status TEXT
+          scheduling_status TEXT,
+          worker_lost_count INTEGER NOT NULL DEFAULT 0
         )
       `);
 
@@ -1036,9 +1040,14 @@ describe("pause-all / resume-all integration", { concurrency: 1 }, () => {
           retry_count INTEGER DEFAULT 0,
           max_retries INTEGER DEFAULT 0,
           type TEXT NOT NULL DEFAULT 'single',
+          loop_config TEXT,
+          current_story_id TEXT,
           abandoned_count INTEGER DEFAULT 0,
+          reroute_count INTEGER DEFAULT 0,
+          claim_pid INTEGER,
+          claim_updated_at TEXT,
           created_at TEXT NOT NULL DEFAULT (datetime('now')),
-          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+          updated_at TEXT NOT null DEFAULT (datetime('now'))
         )
       `);
 
@@ -1051,20 +1060,20 @@ describe("pause-all / resume-all integration", { concurrency: 1 }, () => {
       });
 
       db.prepare(
-        `INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, scheduling_status, run_number, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 0, NULL, NULL, ?, ?)`,
+        `INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, scheduling_status, run_number, worker_lost_count, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 0, NULL, NULL, 0, ?, ?)`,
       ).run(runId, "feature-dev-merge", "Drain no-spawn test", "running", context, now, now);
 
       // Step 0: running (in-flight)
       db.prepare(
-        `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, max_retries, type, created_at, updated_at)
-         VALUES (?, ?, 'plan', 'feature-dev-merge_planner', 0, 'test', 'STATUS: done', 'running', 0, 'single', ?, ?)`,
+        `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, max_retries, type, abandoned_count, reroute_count, created_at, updated_at)
+         VALUES (?, ?, 'plan', 'feature-dev-merge_planner', 0, 'test', 'STATUS: done', 'running', 0, 'single', 0, 0, ?, ?)`,
       ).run(stepIdRunning, runId, now, now);
 
       // Step 1: waiting (should NOT be claimed while draining)
       db.prepare(
-        `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, max_retries, type, created_at, updated_at)
-         VALUES (?, ?, 'setup', 'feature-dev-merge_setup', 1, 'test', 'STATUS: done', 'waiting', 0, 'single', ?, ?)`,
+        `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, max_retries, type, abandoned_count, reroute_count, created_at, updated_at)
+         VALUES (?, ?, 'setup', 'feature-dev-merge_setup', 1, 'test', 'STATUS: done', 'waiting', 0, 'single', 0, 0, ?, ?)`,
       ).run(crypto.randomUUID(), runId, now, now);
 
       db.close();

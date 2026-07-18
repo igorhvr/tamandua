@@ -147,6 +147,11 @@ Options:
   --hermes-as-harness
       Use hermes as the agent harness instead of pi.
       Mutually exclusive with --pi-as-harness.
+  --task-file <path>
+      Read the task description from a file instead of passing it inline.
+      The file path is dereferenced exactly once at CLI time — the path
+      is never stored downstream. Mutually exclusive with inline task
+      text; error if both are given.
   --no-relaunch-upon-rugpull
       Disable automatic replacement-run after a rugpull (base branch move)
       is detected on a failed merge/merge-worktree run.
@@ -173,7 +178,8 @@ Examples:
       --context branch=quarantine/broken-tests
   tamandua workflow run feature-dev-merge "Add dark mode" --wait
   tamandua workflow run feature-dev-merge "Add dark mode" --wait --timeout 5m
-  tamandua workflow run feature-dev-merge "Add dark mode" --wait --json`;
+  tamandua workflow run feature-dev-merge "Add dark mode" --wait --json
+  tamandua workflow run feature-dev-merge --task-file task.md --wait`;
 }
 
 export function getWorkflowStatusHelp(): string {

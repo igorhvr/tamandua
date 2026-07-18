@@ -151,6 +151,49 @@ const RESERVED_CONTEXT_KEYS = new Set([
 ]);
 
 // ══════════════════════════════════════════════════════════════════════
+// Retry Feedback Formatting
+// ══════════════════════════════════════════════════════════════════════
+
+/**
+ * Maximum bytes to keep from retry feedback (4 KB), measured from the END
+ * of the feedback text. Truncation uses Buffer.byteLength to handle
+ * multi-byte UTF-8 characters safely.
+ */
+const RETRY_FEEDBACK_MAX_BYTES = 4096;
+
+/**
+ * Format raw retry feedback into a PREVIOUS ATTEMPT FEEDBACK section.
+ *
+ * Rules:
+ * - Returns empty string when rawFeedback is falsy (null, undefined, empty)
+ * - When rawFeedback is non-empty:
+ *   - retryCount > 0: "PREVIOUS ATTEMPT FEEDBACK (attempt <N> was rejected):\n<bounded feedback>"
+ *   - retryCount == 0: "PREVIOUS ATTEMPT FEEDBACK:\n<bounded feedback>"
+ *     (reroute / producer re-pend case where retry_count stays unchanged)
+ * - Feedback is bounded to the last RETRY_FEEDBACK_MAX_BYTES bytes
+ *   (truncated from the front, keeping the tail).
+ */
+export function formatRetryFeedback(rawFeedback: string | null | undefined, retryCount: number): string {
+  if (!rawFeedback) return "";
+
+  let bounded = rawFeedback;
+  const buf = Buffer.from(bounded, "utf-8");
+  if (buf.length > RETRY_FEEDBACK_MAX_BYTES) {
+    // Find a safe UTF-8 boundary — skip continuation bytes (0x80-0xBF)
+    let start = buf.length - RETRY_FEEDBACK_MAX_BYTES;
+    while (start < buf.length && (buf[start] & 0xC0) === 0x80) {
+      start++;
+    }
+    bounded = buf.toString("utf-8", start);
+  }
+
+  if (retryCount > 0) {
+    return `PREVIOUS ATTEMPT FEEDBACK (attempt ${retryCount} was rejected):\n${bounded}`;
+  }
+  return `PREVIOUS ATTEMPT FEEDBACK:\n${bounded}`;
+}
+
+// ══════════════════════════════════════════════════════════════════════
 // Template Resolution
 // ══════════════════════════════════════════════════════════════════════
 
@@ -185,11 +228,11 @@ export function findMissingTemplateKeys(template: string, context: Record<string
   return missing;
 }
 
-// parseExpectedKeys is now the single-source-of-truth implementation in
-// workflow-contract.ts.  Re-exported here for backward compatibility
-// (existing callers in step-ops.ts and the motor import from this file).
-import { parseExpectedKeys } from "./workflow-contract.js";
-export { parseExpectedKeys };
+// parseExpectedKeys and checkExpectsAcceptsVariant are now the
+// single-source-of-truth implementations in workflow-contract.ts.
+// Re-exported here for backward compatibility.
+import { checkExpectsAcceptsVariant, parseExpectedKeys } from "./workflow-contract.js";
+export { parseExpectedKeys, checkExpectsAcceptsVariant };
 
 /**
  * Result of finding a producer step for a missing template key.
@@ -2133,12 +2176,15 @@ export function claimStep(agentId: string, runId: string, workerOwnership?: Work
   // (e.g. the no-STORIES_JSON guard in completeStep) writes a human-readable
   // explanation into step.output before resetting the step to pending; pull
   // it into context as `retry_feedback` so workflow prompts can include it.
-  // Surface output as retry_feedback whenever it exists, regardless of retry_count.
+  // Format the feedback with a PREVIOUS ATTEMPT FEEDBACK wrapper and
+  // 4 KB truncation via formatRetryFeedback.
+  //
   // Covers three cases:
-  //   - Fresh step (output=null)  → retry_feedback=""
-  //   - Retried step (retry_count>0, output=error) → retry_feedback=error
-  //   - Rerouted producer (retry_count=0, output=reroute feedback) → retry_feedback=feedback
-  context["retry_feedback"] = step.output ? step.output : "";
+  //   - Fresh step (output=null, retry_count=0) → retry_feedback=""
+  //   - Retried step (retry_count>0, output=error) → retry_feedback="PREVIOUS ATTEMPT FEEDBACK (attempt N was rejected):\n<error>"
+  //   - Rerouted producer (retry_count=0, output=reroute feedback) → retry_feedback=""
+  //     (retry_count stays 0 for reroutes, so formatRetryFeedback returns empty)
+  context["retry_feedback"] = formatRetryFeedback(step.output, step.retry_count);
 
   // Compute has_frontend_changes from git diff when repo and branch are available
   if (context["repo"] && context["branch"]) {
@@ -2447,6 +2493,21 @@ export function claimStep(agentId: string, runId: string, workerOwnership?: Work
  */
 export function validateExpects(output: string, expects: string): string | null {
   if (!expects || expects.trim() === "") return null;
+
+  // US-002: Honest verdict check.  When the output carries a non-done
+  // STATUS line (retry, failed, reboot, etc.) whose variant is accepted
+  // by the step's expects contract, validation passes even if some
+  // KEY: lines are absent — the agent provided an honest verdict.
+  //
+  // STATUS: done always goes through normal key validation to preserve
+  // the existing gate behavior (e.g. PR URL regex, CHANGES:/TESTS: lines).
+  const statusMatch = output.match(/^STATUS:\s*(\S+)/m);
+  if (statusMatch) {
+    const variant = statusMatch[1].trim();
+    if (variant.toLowerCase() !== "done" && checkExpectsAcceptsVariant(expects, variant)) {
+      return null;
+    }
+  }
 
   const lines = expects.split("\n");
   for (const line of lines) {
@@ -3770,6 +3831,15 @@ export function resolveStepContext(
 
     if (!context["verify_feedback"]) {
       context["verify_feedback"] = "";
+    }
+
+    // Format retry_feedback from the run context (e.g. set by
+    // writeRerouteFeedbackContext) using the story-level retry count.
+    if (context["retry_feedback"]) {
+      context["retry_feedback"] = formatRetryFeedback(
+        context["retry_feedback"],
+        story.retryCount,
+      );
     }
   }
 

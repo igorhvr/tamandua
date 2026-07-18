@@ -1,6 +1,9 @@
 import { describe, it } from "node:test";
 import assert from "node:assert";
 import { parseWorkflowRunArgs } from "../../dist/cli/workflow-run-args.js";
+import { writeFileSync, unlinkSync, mkdtempSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 
 describe("parseWorkflowRunArgs", () => {
   it("parses task only", () => {
@@ -225,5 +228,133 @@ describe("parseWorkflowRunArgs", () => {
       () => parseWorkflowRunArgs(["task", "--bad-flag", "--", "after-sep"]),
       /Unknown option "--bad-flag" for workflow run/,
     );
+  });
+
+  // US-007: --task-file flag
+  describe("--task-file", () => {
+    it("reads task from file and uses contents as taskTitle", () => {
+      const tmpDir = mkdtempSync(join(tmpdir(), "tamandua-test-"));
+      const taskPath = join(tmpDir, "task.md");
+      writeFileSync(taskPath, "Build a dark mode toggle\n\nWith accessibility support.", "utf-8");
+      try {
+        const result = parseWorkflowRunArgs(["--task-file", taskPath]);
+        assert.equal(result.taskTitle, "Build a dark mode toggle\n\nWith accessibility support.");
+      } finally {
+        unlinkSync(taskPath);
+      }
+    });
+
+    it("--task-file and inline task words are mutually exclusive", () => {
+      assert.throws(
+        () => parseWorkflowRunArgs(["--task-file", "task.md", "inline task here"]),
+        /--task-file is mutually exclusive with inline task text/,
+      );
+    });
+
+    it("missing/unreadable --task-file throws error", () => {
+      assert.throws(
+        () => parseWorkflowRunArgs(["--task-file", "/nonexistent/path/task.md"]),
+        /Cannot read --task-file/,
+      );
+    });
+
+    it("--task-file value missing throws error", () => {
+      assert.throws(
+        () => parseWorkflowRunArgs(["--task-file"]),
+        /Missing value for --task-file/,
+      );
+    });
+
+    it("--task-file=path syntax works", () => {
+      const tmpDir = mkdtempSync(join(tmpdir(), "tamandua-test-"));
+      const taskPath = join(tmpDir, "task.md");
+      writeFileSync(taskPath, "Task from equals syntax.", "utf-8");
+      try {
+        const result = parseWorkflowRunArgs(["--task-file=" + taskPath]);
+        assert.equal(result.taskTitle, "Task from equals syntax.");
+      } finally {
+        unlinkSync(taskPath);
+      }
+    });
+
+    it("provenance: file path NOT stored in taskTitle", () => {
+      const tmpDir = mkdtempSync(join(tmpdir(), "tamandua-test-"));
+      const taskPath = join(tmpDir, "task.md");
+      writeFileSync(taskPath, "The actual task content", "utf-8");
+      try {
+        const result = parseWorkflowRunArgs(["--task-file", taskPath]);
+        // taskTitle should be the file CONTENTS, not the path
+        assert.equal(result.taskTitle, "The actual task content");
+        assert.ok(!result.taskTitle.includes(taskPath));
+        assert.ok(!result.taskTitle.includes("task.md"));
+      } finally {
+        unlinkSync(taskPath);
+      }
+    });
+
+    it("provenance: file deleted after invocation — task content preserved", () => {
+      const tmpDir = mkdtempSync(join(tmpdir(), "tamandua-test-"));
+      const taskPath = join(tmpDir, "task.md");
+      writeFileSync(taskPath, "Preserved task content", "utf-8");
+      let taskTitle: string;
+      try {
+        taskTitle = parseWorkflowRunArgs(["--task-file", taskPath]).taskTitle;
+      } finally {
+        // Delete after parsing completes — contents already captured
+        unlinkSync(taskPath);
+      }
+      assert.equal(taskTitle, "Preserved task content");
+      // File no longer exists, but taskTitle is preserved
+    });
+
+    it("empty file produces empty taskTitle", () => {
+      const tmpDir = mkdtempSync(join(tmpdir(), "tamandua-test-"));
+      const taskPath = join(tmpDir, "task.md");
+      writeFileSync(taskPath, "", "utf-8");
+      try {
+        const result = parseWorkflowRunArgs(["--task-file", taskPath]);
+        assert.equal(result.taskTitle, "");
+      } finally {
+        unlinkSync(taskPath);
+      }
+    });
+
+    it("--task-file works with other flags", () => {
+      const tmpDir = mkdtempSync(join(tmpdir(), "tamandua-test-"));
+      const taskPath = join(tmpDir, "task.md");
+      writeFileSync(taskPath, "Task with other flags", "utf-8");
+      try {
+        const result = parseWorkflowRunArgs([
+          "--no-hurry-please-save-tokens-mode",
+          "--task-file", taskPath,
+          "--context", "branch=fix/x",
+          "--wait",
+          "--timeout", "5m",
+        ]);
+        assert.equal(result.taskTitle, "Task with other flags");
+        assert.equal(result.noHurrySaveTokensMode, true);
+        assert.deepEqual(result.context, { branch: "fix/x" });
+        assert.equal(result.wait, true);
+        assert.equal(result.timeout, "5m");
+      } finally {
+        unlinkSync(taskPath);
+      }
+    });
+
+    it("--task-file is rejected before -- separator", () => {
+      // --task-file should be recognized and file read; anything after --
+      // is considered inline task text, triggering mutual exclusion
+      const tmpDir = mkdtempSync(join(tmpdir(), "tamandua-test-"));
+      const taskPath = join(tmpDir, "task.md");
+      writeFileSync(taskPath, "File task", "utf-8");
+      try {
+        assert.throws(
+          () => parseWorkflowRunArgs(["--task-file", taskPath, "--", "extra", "words"]),
+          /--task-file is mutually exclusive with inline task text/,
+        );
+      } finally {
+        unlinkSync(taskPath);
+      }
+    });
   });
 });

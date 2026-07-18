@@ -4,6 +4,9 @@
  * Extracted mechanically from src/cli/cli.ts (SPL2 story US-008).
  */
 
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { getDb } from "../../db.js";
 import { getWorkflowStatus } from "../../installer/status.js";
 import { logger } from "../../lib/logger.js";
 import {
@@ -16,6 +19,7 @@ import {
   peekStep,
   releaseStep,
   stepCurrent,
+  validateExpects,
 } from "../../installer/step-ops.js";
 
 export function getStepHelp(): string {
@@ -87,15 +91,13 @@ Examples:
 export function getStepCompleteHelp(): string {
   return `tamandua step complete — Mark a step as done
 
-Usage: tamandua step complete <step-id>
-   or: echo "STATUS: done
-  CHANGES: what changed
-  TESTS: what was tested" | tamandua step complete <step-id>
+Usage: tamandua step complete <step-id> [--file <path>]
 
 step complete marks a claimed step as completed. It reads the agent's output
-from either stdin or positional arguments.
+from a file (--file) or stdin. Trailing non-flag arguments after the step-id
+are an error — the report must come from stdin (pipe) or --file.
 
-Expected input format (newline-delimited key:value blocks):
+Input format (newline-delimited key:value blocks):
   STATUS: done
   CHANGES: <what was implemented>
   TESTS: <what tests were run>
@@ -103,11 +105,25 @@ Expected input format (newline-delimited key:value blocks):
   BRANCH: <branch name>      (optional)
   COMMITS: <commit list>     (optional)
 
-When using positional arguments, the entire output is passed as a single
-string. When using stdin, the output is read until EOF.
+  Alternative to inline STORIES_JSON:
+  STORIES_JSON_FILE: <path>  (resolved relative to cwd at submit time)
+
+Submit-time validation:
+  If the step has expects patterns, output is validated BEFORE the step is
+  consumed. On failure, REJECTED is printed to stderr and the agent still
+  holds the step — fix and resubmit in the same round.
+
+Options:
+  --file <path>      Read the report from a file instead of stdin.
+                     Path resolves relative to the current working directory.
+                     File is dereferenced once at command time; the path is
+                     never stored downstream.
 
 Examples:
-  tamandua step complete 123e4567-e89b-12d3-a456-426614174000
+  # File-based (preferred):
+  tamandua step complete 123e4567-e89b-12d3-a456-426614174000 --file report.txt
+
+  # Stdin pipe (alternative):
   echo "STATUS: done\nCHANGES: Added feature X\nTESTS: Wrote unit tests" | \\
     tamandua step complete 123e4567-e89b-12d3-a456-426614174000`;
 }
@@ -115,7 +131,7 @@ Examples:
 export function getStepFailHelp(): string {
   return `tamandua step fail — Mark a step as failed
 
-Usage: tamandua step fail <step-id> [<error message>]
+Usage: tamandua step fail <step-id> [--reason-file <path>] [<error message>]
 
 step fail marks a step as failed with a reason. When a step fails, Tamandua
 automatically triggers retry logic — the step is reset to pending and will
@@ -127,9 +143,18 @@ If no error message is provided, "Unknown error" is used.
 Retry behavior: Steps that exceed the maximum retry count (configured in
 the workflow spec) permanently fail the run.
 
+Options:
+  --reason-file <path>  Read the failure reason from a file instead of argv.
+                        Path resolves relative to the current working directory.
+                        File is dereferenced once at command time; the path is
+                        never stored downstream.
+                        When --reason-file is given, any inline argv reason
+                        is ignored.
+
 Examples:
   tamandua step fail 123e4567-e89b-12d3-a456-426614174000
-  tamandua step fail 123e4567-e89b-12d3-a456-426614174000 "Network timeout"`;
+  tamandua step fail 123e4567-e89b-12d3-a456-426614174000 "Network timeout"
+  tamandua step fail 123e4567-e89b-12d3-a456-426614174000 --reason-file fail.txt`;
 }
 
 export function getStepStoriesHelp(): string {
@@ -262,19 +287,164 @@ export async function handleStep(group: string, args: string[]): Promise<boolean
     return true;
   }
   if (action === "complete") {
-    if (!target) { logger.warn("Rejected step complete: missing step-id"); process.stderr.write("Missing step-id.\n"); process.exit(1); }
-    let output = args.slice(3).join(" ").trim();
-    if (!output) {
+    if (!target) { process.stderr.write("Missing step-id.\n"); process.exit(1); }
+
+    // Parse --file flag from remaining args. Trailing non-flag argv after
+    // the step-id is now an error (trap fix: agents used to pass report text
+    // as positional args, which was fragile under shell escaping).
+    const remainder = args.slice(3);
+    let filePath: string | undefined;
+    const nonFlagArgs: string[] = [];
+    for (let i = 0; i < remainder.length; i++) {
+      const tok = remainder[i];
+      if (tok === "--file") {
+        filePath = remainder[i + 1]?.trim();
+        i++;
+      } else if (tok.startsWith("--file=")) {
+        filePath = tok.slice("--file=".length).trim();
+      } else if (!tok.startsWith("-")) {
+        nonFlagArgs.push(tok);
+      }
+    }
+
+    // Trap fix: trailing non-flag argv after step-id is an error.
+    if (nonFlagArgs.length > 0) {
+      process.stderr.write(
+        `step complete reads the report from stdin or --file; unexpected argument: ${nonFlagArgs[0]}\n`,
+      );
+      process.exit(1);
+    }
+
+    let output: string;
+    if (filePath) {
+      // Read report from file. Dereferenced EXACTLY ONCE at CLI time —
+      // the file path never reaches the DB, events, or any downstream
+      // consumer. Temp files may be deleted immediately after this
+      // command returns with zero effect.
+      const resolvedPath = path.resolve(process.cwd(), filePath);
+      try {
+        output = fs.readFileSync(resolvedPath, "utf-8").trim();
+      } catch (err) {
+        process.stderr.write(
+          `Cannot read --file "${filePath}": ${(err as NodeJS.ErrnoException).message}\n`,
+        );
+        process.exit(1);
+      }
+    } else {
+      // Read from stdin (backward compatibility)
       const chunks: Buffer[] = [];
       for await (const chunk of process.stdin) chunks.push(chunk);
       output = Buffer.concat(chunks).toString("utf-8").trim();
     }
+
+    // STORIES_JSON_FILE resolution (US-003): scan output for a line
+    // starting with STORIES_JSON_FILE:, resolve the referenced file
+    // relative to process.cwd(), read its contents, validate JSON array,
+    // and replace with inline STORIES_JSON: <minified-json>. This runs
+    // BEFORE expects validation so the resolved JSON is what gets
+    // validated and stored. If the file is missing/unreadable or the
+    // contents are not a valid JSON array, print an error and exit 1
+    // without consuming the step.
+    if (output) {
+      const sjfMatch = output.match(/^STORIES_JSON_FILE:\s*(.+)$/m);
+      if (sjfMatch) {
+        const filePath = sjfMatch[1].trim();
+        const resolvedPath = path.resolve(process.cwd(), filePath);
+        let fileContents: string;
+        try {
+          fileContents = fs.readFileSync(resolvedPath, "utf-8");
+        } catch (err) {
+          process.stderr.write(
+            `STORIES_JSON_FILE error: cannot read file "${filePath}": ${(err as NodeJS.ErrnoException).message}\n`,
+          );
+          process.exit(1);
+        }
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(fileContents);
+        } catch (err) {
+          process.stderr.write(
+            `STORIES_JSON_FILE error: file "${filePath}" does not contain valid JSON: ${(err as Error).message}\n`,
+          );
+          process.exit(1);
+        }
+        if (!Array.isArray(parsed)) {
+          process.stderr.write(
+            `STORIES_JSON_FILE error: file "${filePath}" must contain a JSON array, got ${typeof parsed}\n`,
+          );
+          process.exit(1);
+        }
+        const minified = JSON.stringify(parsed);
+        output = output.replace(/^STORIES_JSON_FILE:\s*.+$/m, `STORIES_JSON: ${minified}`);
+      }
+    }
+
+    // Submit-time expects validation: validate BEFORE calling completeStep
+    // so the agent gets immediate feedback and can fix + resubmit in the
+    // same round without burning a retry slot.
+    if (output) {
+      const db = getDb();
+      const step = db.prepare(
+        "SELECT expects FROM steps WHERE id = ?"
+      ).get(target) as { expects: string } | undefined;
+      if (step && step.expects && step.expects.trim() !== "") {
+        const validationError = validateExpects(output, step.expects);
+        if (validationError) {
+          process.stderr.write(
+            `REJECTED: output does not satisfy expects: ${validationError}\n` +
+              `Hint: plain-text KEY: lines at column 0, no markdown. Fix your output and resubmit — you still hold the step.\n`,
+          );
+          process.exit(1);
+        }
+      }
+    }
+
     console.log(JSON.stringify(completeStep(target, output)));
     return true;
   }
   if (action === "fail") {
-    if (!target) { logger.warn("Rejected step fail: missing step-id"); process.stderr.write("Missing step-id.\n"); process.exit(1); }
-    console.log(JSON.stringify(await failStep(target, args.slice(3).join(" ").trim() || "Unknown error")));
+    if (!target) { process.stderr.write("Missing step-id.\n"); process.exit(1); }
+
+    // Parse --reason-file flag from remaining args.
+    // --reason-file and inline reason are mutually exclusive:
+    // if --reason-file is given, inline argv reason is ignored.
+    const remainder = args.slice(3);
+    let reasonFilePath: string | undefined;
+    let inlineReason: string | undefined;
+    for (let i = 0; i < remainder.length; i++) {
+      const tok = remainder[i];
+      if (tok === "--reason-file") {
+        reasonFilePath = remainder[i + 1]?.trim();
+        i++;
+      } else if (tok.startsWith("--reason-file=")) {
+        reasonFilePath = tok.slice("--reason-file=".length).trim();
+      } else if (!tok.startsWith("-")) {
+        inlineReason = (inlineReason ? inlineReason + " " : "") + tok;
+      }
+    }
+
+    let reason: string;
+    if (reasonFilePath) {
+      // Read reason from file. Dereferenced EXACTLY ONCE at CLI time —
+      // the file path never reaches the DB, events, or any downstream
+      // consumer. Temp files may be deleted immediately after this
+      // command returns with zero effect.
+      const resolvedPath = path.resolve(process.cwd(), reasonFilePath);
+      try {
+        reason = fs.readFileSync(resolvedPath, "utf-8").trim();
+      } catch (err) {
+        process.stderr.write(
+          `Cannot read --reason-file "${reasonFilePath}": ${(err as NodeJS.ErrnoException).message}\n`,
+        );
+        process.exit(1);
+      }
+    } else if (inlineReason) {
+      reason = inlineReason;
+    } else {
+      reason = "Unknown error";
+    }
+
+    console.log(JSON.stringify(await failStep(target, reason)));
     return true;
   }
   if (action === "current") {

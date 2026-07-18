@@ -590,7 +590,7 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /CHANGES:/);
       assert.match(result.stdout ?? "", /TESTS:/);
       assert.match(result.stdout ?? "", /stdin/);
-      assert.match(result.stdout ?? "", /EOF/);
+      assert.match(result.stdout ?? "", /Trailing non-flag arguments/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
     } finally {
     }
@@ -604,6 +604,7 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /retry logic/);
       assert.match(result.stdout ?? "", /permanently fail/);
       assert.match(result.stdout ?? "", /Unknown error/);
+      assert.match(result.stdout ?? "", /--reason-file/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
     } finally {
     }
@@ -1385,6 +1386,7 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /--working-directory-for-harness/);
       assert.match(result.stdout ?? "", /--worktree-origin-repository/);
       assert.match(result.stdout ?? "", /--worktree-origin-ref/);
+      assert.match(result.stdout ?? "", /--task-file/);
       assert.match(result.stdout ?? "", /Add dark mode toggle/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
     } finally {
