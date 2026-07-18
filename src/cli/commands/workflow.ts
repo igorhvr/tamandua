@@ -46,7 +46,7 @@ Examples:
 export function getWorkflowRunsHelp(): string {
   return `tamandua workflow runs — List all workflow runs
 
-Usage: tamandua workflow runs
+Usage: tamandua workflow runs [--json]
 
 Lists every workflow run in the database with status, workflow ID, token
 usage, and a preview of the task description.
@@ -58,8 +58,14 @@ Output columns:
   Tokens    Total tokens spent so far
   Task      Task description preview (truncated at 50 characters)
 
+Options:
+  --json    Output a JSON object with a runs array for machine consumption.
+            Each run includes runId, runNumber, workflowId, status, tokensSpent,
+            task (first 120 chars), createdAt, and updatedAt.
+
 Examples:
-  tamandua workflow runs`;
+  tamandua workflow runs
+  tamandua workflow runs --json`;
 }
 
 export function getWorkflowInstallHelp(): string {
@@ -172,7 +178,7 @@ Examples:
 export function getWorkflowStatusHelp(): string {
   return `tamandua workflow status — Show detailed run status with step listing
 
-Usage: tamandua workflow status <query>
+Usage: tamandua workflow status <query> [--json]
 
 Shows detailed information about a workflow run, including status, token
 usage, workspace mode (for worktree runs), and a list of every step with
@@ -195,8 +201,18 @@ Step status indicators:
   [failed ]    Step failed (may be retried)
   [pending]    Step waiting to be claimed
 
+Options:
+  --json    Output a JSON object with full run details for machine consumption.
+            Includes runId, runNumber, workflowId, status, task (first 200 chars),
+            tokensSpent, createdAt, updatedAt, workspaceMode (worktree runs),
+            worktreePath, worktreeOriginRef, steps array (stepId, stepIndex,
+            agentRole, status, retryCount, abandonedCount, rerouteCount, claimPid,
+            claimUpdatedAt, updatedAt), and stories array (storyId, title, status,
+            abandonedCount). Step outputs are NOT included.
+
 Examples:
-  tamandua workflow status abc12345`;
+  tamandua workflow status abc12345
+  tamandua workflow status abc12345 --json`;
 }
 
 export function getWorkflowDeleteHelp(): string {
@@ -378,7 +394,22 @@ export async function handleWorkflow(
   const cliIdentity = `${os.userInfo().username}@${os.hostname()}:${process.pid} (cli)`;
 
   if (action === "runs") {
+    const jsonFlag = args.includes("--json");
     const runs = listRuns();
+    if (jsonFlag) {
+      const jsonRuns = runs.map((r) => ({
+        runId: r.id,
+        runNumber: r.runNumber,
+        workflowId: r.workflowId,
+        status: r.status,
+        tokensSpent: r.tokensSpent,
+        task: r.task.slice(0, 120),
+        createdAt: r.createdAt,
+        updatedAt: r.updatedAt,
+      }));
+      console.log(JSON.stringify({ runs: jsonRuns }));
+      return true;
+    }
     if (runs.length === 0) { console.log("No workflow runs found."); return true; }
     console.log("Workflow runs:");
     for (const r of runs) console.log(`  [${r.status.padEnd(9)}] ${r.id.slice(0, 8).padEnd(10)} ${r.workflowId.padEnd(14)}${r.workerLostCount > 0 ? ` wl:${r.workerLostCount}`.padEnd(6) : "      "}${r.tokensSpent.toLocaleString().padStart(8)} tokens  ${r.task.slice(0, 50)}${r.task.length > 50 ? "..." : ""}`);
@@ -648,8 +679,55 @@ export async function handleWorkflow(
 
   if (action === "status") {
     if (!target) { process.stderr.write("Missing query.\n"); process.exit(1); }
+    const jsonFlag = args.includes("--json");
     try {
       const result = getWorkflowStatus(target);
+      if (jsonFlag) {
+        const jsonSteps = result.steps.map((s) => {
+          const entry: Record<string, unknown> = {
+            stepId: s.stepId,
+            stepIndex: s.stepIndex,
+            agentRole: s.agentId.split("_").slice(-1)[0],
+            status: s.status,
+            retryCount: s.retryCount,
+          };
+          if (s.abandonedCount !== undefined) entry.abandonedCount = s.abandonedCount;
+          if (s.rerouteCount !== undefined) entry.rerouteCount = s.rerouteCount;
+          if (s.claimPid !== undefined) entry.claimPid = s.claimPid;
+          if (s.claimUpdatedAt !== undefined) entry.claimUpdatedAt = s.claimUpdatedAt;
+          if (s.updatedAt !== undefined) entry.updatedAt = s.updatedAt;
+          return entry;
+        });
+        const jsonStories = result.stories ? result.stories.map((s) => {
+          const entry: Record<string, unknown> = {
+            storyId: s.storyId,
+            title: s.title,
+            status: s.status,
+          };
+          if (s.abandonedCount !== undefined) entry.abandonedCount = s.abandonedCount;
+          if (s.updatedAt !== undefined) entry.updatedAt = s.updatedAt;
+          return entry;
+        }) : undefined;
+        const jsonOutput: Record<string, unknown> = {
+          runId: result.id,
+          runNumber: result.runNumber,
+          workflowId: result.workflowId,
+          status: result.status,
+          task: result.task.slice(0, 200),
+          tokensSpent: result.tokensSpent,
+          createdAt: result.createdAt,
+          updatedAt: result.updatedAt,
+          steps: jsonSteps,
+        };
+        if (jsonStories) jsonOutput.stories = jsonStories;
+        if (result.workspace_mode === "worktree") {
+          jsonOutput.workspaceMode = result.workspace_mode;
+          if (result.worktree_path) jsonOutput.worktreePath = result.worktree_path;
+          if (result.worktree_origin_ref) jsonOutput.worktreeOriginRef = result.worktree_origin_ref;
+        }
+        console.log(JSON.stringify(jsonOutput));
+        return true;
+      }
       console.log(`Run: ${result.id.slice(0, 8)}\nWorkflow: ${result.workflowId}\nTask: ${result.task}\nStatus: ${result.status}\nTokens: ${result.tokensSpent.toLocaleString()}`);
       if (result.workerLostCount > 0) console.log(`Worker lost: ${result.workerLostCount}`);
       if (result.workspace_mode === "worktree") {

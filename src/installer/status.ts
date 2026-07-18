@@ -8,6 +8,7 @@ import { parseRunContext } from "./step-ops.js";
 
 export interface RunInfo {
   id: string;
+  runNumber?: number;
   workflowId: string;
   task: string;
   status: string;
@@ -19,6 +20,7 @@ export interface RunInfo {
 }
 
 export interface RunDetail extends RunInfo {
+  runNumber?: number;
   steps: StepInfo[];
   stories?: StoryInfo[];
   workspace_mode?: string;
@@ -34,6 +36,12 @@ export interface StepInfo {
   status: string;
   type: string;
   retryCount: number;
+  stepIndex: number;
+  abandonedCount?: number;
+  rerouteCount?: number;
+  claimPid?: number | null;
+  claimUpdatedAt?: string | null;
+  updatedAt?: string | null;
   output?: string;
 }
 
@@ -42,6 +50,8 @@ export interface StoryInfo {
   title: string;
   status: string;
   retryCount: number;
+  abandonedCount?: number;
+  updatedAt?: string;
 }
 
 /**
@@ -55,17 +65,17 @@ export function getWorkflowStatus(query: string): RunDetail {
   // Try exact id match first
   let row = db
     .prepare(
-      "SELECT id, workflow_id, task, status, context, created_at, updated_at, tokens_spent, worker_lost_count FROM runs WHERE id = ?",
+      "SELECT id, run_number, workflow_id, task, status, context, created_at, updated_at, tokens_spent, worker_lost_count FROM runs WHERE id = ?",
     )
-    .get(query) as unknown as RunRow | undefined;
+    .get(query) as unknown as (RunRow & { run_number: number | null }) | undefined;
 
   // Try id prefix match
   if (!row) {
     const prefixRows = db
       .prepare(
-        "SELECT id, workflow_id, task, status, context, created_at, updated_at, tokens_spent, worker_lost_count FROM runs WHERE id LIKE ?",
+        "SELECT id, run_number, workflow_id, task, status, context, created_at, updated_at, tokens_spent, worker_lost_count FROM runs WHERE id LIKE ?",
       )
-      .all(`${query}%`) as unknown as RunRow[];
+      .all(`${query}%`) as unknown as (RunRow & { run_number: number | null })[];
     if (prefixRows.length === 1) {
       row = prefixRows[0];
     } else if (prefixRows.length > 1) {
@@ -79,9 +89,9 @@ export function getWorkflowStatus(query: string): RunDetail {
   if (!row) {
     const taskRows = db
       .prepare(
-        "SELECT id, workflow_id, task, status, context, created_at, updated_at, tokens_spent, worker_lost_count FROM runs WHERE task LIKE ?",
+        "SELECT id, run_number, workflow_id, task, status, context, created_at, updated_at, tokens_spent, worker_lost_count FROM runs WHERE task LIKE ?",
       )
-      .all(`%${query}%`) as unknown as RunRow[];
+      .all(`%${query}%`) as unknown as (RunRow & { run_number: number | null })[];
     if (taskRows.length === 1) {
       row = taskRows[0];
     } else if (taskRows.length > 1) {
@@ -105,14 +115,15 @@ export function listRuns(limit = 50): RunInfo[] {
   const db = getDb();
   const rows = db
     .prepare(
-      "SELECT id, workflow_id, task, status, created_at, updated_at, tokens_spent, worker_lost_count FROM runs ORDER BY created_at DESC LIMIT ?",
+      "SELECT id, run_number, workflow_id, task, status, created_at, updated_at, tokens_spent, worker_lost_count FROM runs ORDER BY created_at DESC LIMIT ?",
     )
-    .all(limit) as unknown as RunRow[];
+    .all(limit) as unknown as (RunRow & { run_number: number | null })[];
 
   return rows.map((r) => {
     const stepSummary = getStepSummary(db, r.id);
     return {
       id: r.id,
+      runNumber: r.run_number ?? undefined,
       workflowId: r.workflow_id,
       task: r.task,
       status: r.status,
@@ -257,6 +268,7 @@ export async function stopWorkflow(runId: string): Promise<{ ok: boolean; runId:
 
 interface RunRow {
   id: string;
+  run_number: number | null;
   workflow_id: string;
   task: string;
   status: string;
@@ -285,7 +297,7 @@ function buildRunDetail(
 ): RunDetail {
   const steps = db
     .prepare(
-      "SELECT step_id, agent_id, status, type, retry_count, output FROM steps WHERE run_id = ? ORDER BY step_index ASC",
+      "SELECT step_id, agent_id, status, type, retry_count, step_index, abandoned_count, reroute_count, claim_pid, claim_updated_at, updated_at, output FROM steps WHERE run_id = ? ORDER BY step_index ASC",
     )
     .all(row.id) as Array<{
       step_id: string;
@@ -293,6 +305,12 @@ function buildRunDetail(
       status: string;
       type: string;
       retry_count: number;
+      step_index: number;
+      abandoned_count: number;
+      reroute_count: number;
+      claim_pid: number | null;
+      claim_updated_at: string | null;
+      updated_at: string | null;
       output: string | null;
     }>;
 
@@ -302,18 +320,26 @@ function buildRunDetail(
     status: s.status,
     type: s.type,
     retryCount: s.retry_count,
+    stepIndex: s.step_index,
+    abandonedCount: s.abandoned_count > 0 ? s.abandoned_count : undefined,
+    rerouteCount: s.reroute_count > 0 ? s.reroute_count : undefined,
+    claimPid: s.claim_pid ?? undefined,
+    claimUpdatedAt: s.claim_updated_at ?? undefined,
+    updatedAt: s.updated_at ?? undefined,
     output: s.output ?? undefined,
   }));
 
   const stories = db
     .prepare(
-      "SELECT story_id, title, status, retry_count FROM stories WHERE run_id = ? ORDER BY story_index ASC",
+      "SELECT story_id, title, status, retry_count, abandoned_count, updated_at FROM stories WHERE run_id = ? ORDER BY story_index ASC",
     )
     .all(row.id) as Array<{
       story_id: string;
       title: string;
       status: string;
       retry_count: number;
+      abandoned_count: number;
+      updated_at: string | null;
     }>;
 
   const storyInfos: StoryInfo[] = stories.map((s) => ({
@@ -321,6 +347,8 @@ function buildRunDetail(
     title: s.title,
     status: s.status,
     retryCount: s.retry_count,
+    abandonedCount: s.abandoned_count > 0 ? s.abandoned_count : undefined,
+    updatedAt: s.updated_at ?? undefined,
   }));
 
   const stepSummary = getStepSummary(db, row.id);
@@ -356,6 +384,7 @@ function buildRunDetail(
 
   return {
     id: row.id,
+    runNumber: (row as any).run_number ?? undefined,
     workflowId: row.workflow_id,
     task: row.task,
     status: row.status,

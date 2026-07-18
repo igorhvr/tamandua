@@ -10,6 +10,10 @@ import {
   formatRunsSummary,
   formatServiceStatusAsync,
   formatTamanduaInfo,
+  collectServiceStatusAsync,
+  collectTamanduaInfo,
+  collectRunsSummary,
+  collectProcessList,
 } from "../status-format.js";
 import { getVersion } from "./standalone.js";
 
@@ -52,7 +56,7 @@ Examples:
 export function getStatusHelp(): string {
   return `tamandua status — Show detailed Tamandua system status
 
-Usage: tamandua status
+Usage: tamandua status [--json]
 
 Displays a comprehensive status overview of the Tamandua system, including:
 
@@ -61,8 +65,13 @@ Displays a comprehensive status overview of the Tamandua system, including:
   Workflow Runs — Summary of all runs (running, paused, done, failed)
   Running Processes — Active pi/hermes harness processes spawned by tamandua
 
+Options:
+  --json    Output a JSON object with services, info, runs, and processes
+            sections for machine consumption. No other stdout.
+
 Examples:
   tamandua status             # Full system status overview
+  tamandua status --json      # Machine-readable JSON output
   tamandua status --help      # This help text`;
 }
 
@@ -83,6 +92,19 @@ export async function handleStatus(group: string, args: string[]): Promise<boole
   }
 
   if (group === "status") {
+    const jsonFlag = args.includes("--json");
+
+    if (jsonFlag) {
+      const [services, info, runs, processes] = await Promise.all([
+        collectServiceStatusAsync(),
+        Promise.resolve(collectTamanduaInfo({ getVersion })),
+        Promise.resolve(collectRunsSummary()),
+        Promise.resolve(collectProcessList()),
+      ]);
+      console.log(JSON.stringify({ services, info, runs, processes }));
+      return true;
+    }
+
     console.log("Tamandua Status");
     console.log("===============");
     console.log();

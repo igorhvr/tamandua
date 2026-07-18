@@ -47,8 +47,8 @@ tamandua workflow list [--json]          # Shows [worktree] or [direct] marker p
 tamandua workflow install <workflow-id|--all>
 tamandua workflow uninstall <workflow-id|--all> [--force]
 tamandua workflow run <workflow-id> "<task>" [--context <key=value> ...] [--working-directory-for-harness <dir>] [--worktree-origin-repository <dir>] [--worktree-origin-ref <ref>] [--pi-as-harness | --hermes-as-harness] [--no-hurry-please-save-tokens-mode] [--no-relaunch-upon-rugpull] [--wait [--timeout <dur>] [--json]]
-tamandua workflow status <query>
-tamandua workflow runs
+tamandua workflow status <query> [--json]
+tamandua workflow runs [--json]
 tamandua workflow wait <selector...> [--all] [--timeout <dur>] [--json] [--quiet]
 tamandua workflow pause <run-id>
 tamandua workflow pause-all [--drain]
@@ -149,19 +149,21 @@ tamandua workflow run <workflow-id> "$(cat task.md)" [workspace-mode flags]
 Inspect and stop the run with the CLI:
 
 ```bash
-tamandua workflow status <run-id>
-tamandua workflow runs
+tamandua workflow status <run-id> [--json]
+tamandua workflow runs [--json]
 tamandua logs <run-id>
 tamandua workflow stop <run-id>
 tamandua workflow cancel <run-id>
 ```
 
 Both `stop` and `cancel` terminate the run and print `Cancelled run X.`.
-`cancel` is a documented alias for `stop`. Prefer these CLI commands for run-state inspection. If the CLI does not
+`cancel` is a documented alias for `stop`. Prefer these CLI commands for run-state inspection. For machine consumers (agents, scripts), use the
+`--json` flag — it is the preferred machine-readable path. If the CLI does not
 expose a needed field, reading `~/.tamandua/tamandua.db` directly is an
 acceptable fallback, but always open it read-only with
 `sqlite3 -readonly ~/.tamandua/tamandua.db`; do not use the database as the
-first resort.
+first resort. The `--json` output is a single JSON document on stdout; errors
+still go to stderr.
 
 Never edit installed workflow files under `~/.tamandua/workflows`: every
 install and update overwrites them, so local edits are silently overwritten.
@@ -223,7 +225,7 @@ recent experiment timeline.
 Use `tamandua status` for a comprehensive overview of the Tamandua system:
 
 ```bash
-tamandua status
+tamandua status [--json]
 ```
 
 `status` reports:
@@ -1036,7 +1038,9 @@ TESTS: node --test tests/*.test.ts' | tamandua step complete 87409f73-4ba6-492a-
 ### Manual step inspection
 
 ```bash
-tamandua step stories <run-id>
+tamandua step stories <run-id> [--json]
 ```
 
 Use `step stories` to inspect current story status for a run when diagnosing blocked pipelines.
+When invoked with `--json`, output is a single JSON object with `runId` and `stories` array —
+the preferred machine-readable path for story state inspection.

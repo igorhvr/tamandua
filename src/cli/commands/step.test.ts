@@ -28,6 +28,7 @@ describe("SPL2 step protocol command module", () => {
     assert.match(getStepCompleteHelp(), /reads the agent's output\nfrom either stdin or positional arguments/);
     assert.match(getStepFailHelp(), /"Unknown error" is used/);
     assert.match(getStepStoriesHelp(), /List all stories and their status for a run/);
+    assert.match(getStepStoriesHelp(), /--json/);
   });
 
   it("declines commands owned by other command groups", async () => {

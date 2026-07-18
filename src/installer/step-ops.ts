@@ -701,7 +701,26 @@ export function getStories(runId: string): Story[] {
     output: r.output ?? undefined,
     retryCount: r.retry_count,
     maxRetries: r.max_retries,
+    abandonedCount: r.abandoned_count ?? undefined,
+    updatedAt: r.updated_at ?? undefined,
   }));
+}
+
+/**
+ * Build JSON-serializable story objects for machine-readable output.
+ * Omits undefined fields (abandonedCount, updatedAt when absent).
+ */
+export function buildStoriesJson(stories: Story[]): { storyId: string; title: string; status: string; abandonedCount?: number; updatedAt?: string }[] {
+  return stories.map((s) => {
+    const entry: { storyId: string; title: string; status: string; abandonedCount?: number; updatedAt?: string } = {
+      storyId: s.storyId,
+      title: s.title,
+      status: s.status,
+    };
+    if (s.abandonedCount !== undefined && s.abandonedCount !== 0) entry.abandonedCount = s.abandonedCount;
+    if (s.updatedAt) entry.updatedAt = s.updatedAt;
+    return entry;
+  });
 }
 
 /**

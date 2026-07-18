@@ -6,6 +6,7 @@
 
 import { getWorkflowStatus } from "../../installer/status.js";
 import {
+  buildStoriesJson,
   claimStep,
   completeStep,
   failStep,
@@ -106,11 +107,15 @@ Examples:
 export function getStepStoriesHelp(): string {
   return `tamandua step stories — List all stories and their status for a run
 
-Usage: tamandua step stories <run-id>
+Usage: tamandua step stories <run-id> [--json]
 
 step stories displays every story in the current story plan for a run,
 showing their status (pending, running, done, failed), title, and any
 retry counts.
+
+Options:
+  --json    Output a JSON object with runId and stories array for
+            machine consumption (camelCase, omits zero/absent fields)
 
 Output format:
   US-001   [done   ] Story title here
@@ -118,7 +123,8 @@ Output format:
   US-003   [pending] Upcoming story (retry 1)
 
 Examples:
-  tamandua step stories abc12345`;
+  tamandua step stories abc12345
+  tamandua step stories abc12345 --json`;
 }
 
 export function getStepCurrentHelp(): string {
@@ -244,9 +250,18 @@ export async function handleStep(group: string, args: string[]): Promise<boolean
   }
   if (action === "stories") {
     if (!target) { process.stderr.write("Missing run-id.\n"); process.exit(1); }
+    const jsonFlag = args.includes("--json");
     const fullRunId = getWorkflowStatus(target).id;
     const stories = getStories(fullRunId);
-    if (stories.length === 0) { console.log("No stories found."); return true; }
+    if (stories.length === 0) {
+      if (jsonFlag) console.log(JSON.stringify({ runId: fullRunId, stories: [] }));
+      else console.log("No stories found.");
+      return true;
+    }
+    if (jsonFlag) {
+      console.log(JSON.stringify({ runId: fullRunId, stories: buildStoriesJson(stories) }));
+      return true;
+    }
     for (const story of stories) {
       console.log(`${story.storyId.padEnd(8)} [${story.status.padEnd(7)}] ${story.title}${story.retryCount > 0 ? ` (retry ${story.retryCount})` : ""}`);
     }

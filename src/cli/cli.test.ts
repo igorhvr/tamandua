@@ -1483,6 +1483,7 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /running.*Step currently being executed/);
       assert.match(result.stdout ?? "", /failed.*Step failed/);
       assert.match(result.stdout ?? "", /pending.*Step waiting/);
+      assert.match(result.stdout ?? "", /--json/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
     } finally {
     }
