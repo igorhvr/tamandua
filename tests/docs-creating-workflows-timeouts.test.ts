@@ -43,17 +43,17 @@ describe("docs/creating-workflows.md timeout defaults", () => {
 
   it("annotation comments reflect new default timeouts", () => {
     // The comment block next to the timeoutSeconds example should list:
-    //   Defaults: analysis|coding|testing = 3600 (60m);
-    //             verification|pr|scanning = 2400 (40m).
+    //   Defaults: analysis|coding|testing = 5400 (90m);
+    //             verification|pr|scanning = 3600 (60m).
     assert.match(
       content,
-      /Defaults:\s*analysis\|coding\|testing\s*=\s*3600\s*\(60m\)/,
-      "should document analysis|coding|testing default as 3600 (60m)",
+      /Defaults:\s*analysis\|coding\|testing\s*=\s*5400\s*\(90m\)/,
+      "should document analysis|coding|testing default as 5400 (90m)",
     );
     assert.match(
       content,
-      /verification\|pr\|scanning\s*=\s*2400\s*\(40m\)/,
-      "should document verification|pr|scanning default as 2400 (40m)",
+      /verification\|pr\|scanning\s*=\s*3600\s*\(60m\)/,
+      "should document verification|pr|scanning default as 3600 (60m)",
     );
   });
 
@@ -74,12 +74,12 @@ describe("docs/creating-workflows.md timeout defaults", () => {
   it("role table rows have doubled timeout values", () => {
     // Expected per-role values (seconds and display label)
     const expected: Array<{ role: string; text: string }> = [
-      { role: "analysis", text: "3600s (60m)" },
-      { role: "coding", text: "3600s (60m)" },
-      { role: "verification", text: "2400s (40m)" },
-      { role: "testing", text: "3600s (60m)" },
-      { role: "pr", text: "2400s (40m)" },
-      { role: "scanning", text: "2400s (40m)" },
+      { role: "analysis", text: "5400s (90m)" },
+      { role: "coding", text: "5400s (90m)" },
+      { role: "verification", text: "3600s (60m)" },
+      { role: "testing", text: "5400s (90m)" },
+      { role: "pr", text: "3600s (60m)" },
+      { role: "scanning", text: "3600s (60m)" },
     ];
 
     for (const { role, text } of expected) {
