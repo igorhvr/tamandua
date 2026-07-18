@@ -43,18 +43,18 @@ Each story in STORIES_JSON:
 
 Malformed STORIES_JSON (fused objects, duplicate keys, invalid story fields) is auto-rejected with specific feedback in RETRY FEEDBACK on retry. Read RETRY FEEDBACK carefully and fix exactly what it describes.
 
-The `STORIES_JSON` value must be a minified single-line JSON array ending with `]`, with no trailing prose. It must not contain embedded newline-separated lines starting with `UPPERCASE_KEY:` because the extractor truncates at those lines. Build the array with `python3` and `json.dumps` via a heredoc, then pipe the completed report, rather than hand-quoting JSON.
+The `STORIES_JSON` value must be a minified single-line JSON array ending with `]`, with no trailing prose. It must not contain embedded newline-separated lines starting with `UPPERCASE_KEY:` because the extractor truncates at those lines. Build the array with `python3` and `json.dumps` via a heredoc, then submit the completed report (via `--file` or pipe), rather than hand-quoting JSON.
 
 ## CRITICAL — STATUS Line Requirement
 
 Your output is parsed by an automated scheduler. It looks for **exact markers** to determine step outcome:
 
-- **On success:** `STATUS: done` must appear as its own plain-text line. By convention it is the first report line, followed by the role-specific `KEY:` lines shown below. The scheduler matches status markers anywhere in the report piped to step completion.
-- **On failure:** If you could not do the work, report `STATUS: failed` with a `REASON:` line and use `step fail <stepId> "<reason>"`.
+- **On success:** `STATUS: done` must appear as its own plain-text line. By convention it is the first report line, followed by the role-specific `KEY:` lines shown below. The scheduler matches status markers anywhere in the report submitted via `step complete --file <report.txt>` (preferred) or piped to step completion.
+- **On failure:** If you could not do the work, report `STATUS: failed` with a `REASON:` line and use `step fail <stepId> "<reason>"` or `step fail <stepId> --reason-file <path>`.
 
-STATUS: and KEY: lines must start at column 0 as plain text — no bold, no backticks, no fences, and no leading bullets. Piping the report into `tamandua step complete <stepId>` is the only thing that completes a step; printing `STATUS: done` in a final chat or session message does not complete it.
+STATUS: and KEY: lines must start at column 0 as plain text — no bold, no backticks, no fences, and no leading bullets. The preferred method is to write the report to a file and run `tamandua step complete <stepId> --file <report.txt>`. The alternative is piping the report into `tamandua step complete <stepId>`. Either way, calling `tamandua step complete` is the only thing that completes a step; printing `STATUS: done` in a final chat or session message does not complete it. NOTE: If `step complete` responds with `REJECTED`, you still hold the step -- fix the output format and resubmit in the same round.
 
-If no status marker is present in the piped report, the scheduler treats the step as **lost/abandoned** and retries it — wasting a retry slot even if the work was actually completed. This is the most common cause of spurious retries.
+If no status marker is present in the submitted report, the scheduler treats the step as **lost/abandoned** and retries it — wasting a retry slot even if the work was actually completed. This is the most common cause of spurious retries.
 
 ## Output Format
 

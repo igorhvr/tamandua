@@ -78,18 +78,20 @@ Maximum **20 stories** per run. If the task genuinely needs more, the task is to
 
 Malformed STORIES_JSON (fused objects, duplicate keys, invalid story fields) is auto-rejected with specific feedback in RETRY FEEDBACK on retry. Read RETRY FEEDBACK carefully and fix exactly what it describes.
 
-The `STORIES_JSON` value must be a minified single-line JSON array ending with `]`, with no trailing prose. It must not contain embedded newline-separated lines starting with `UPPERCASE_KEY:` because the extractor truncates at those lines. Build the array with `python3` and `json.dumps` via a heredoc, then pipe the completed report, rather than hand-quoting JSON.
+The `STORIES_JSON` value must be a minified single-line JSON array ending with `]`, with no trailing prose. It must not contain embedded newline-separated lines starting with `UPPERCASE_KEY:` because the extractor truncates at those lines. Build the array with `python3` and `json.dumps` via a heredoc, then submit the completed report (via `--file` or pipe), rather than hand-quoting JSON.
+
+**Preferred alternative — STORIES_JSON_FILE:** Instead of inlining JSON on one line, write the stories array to a file (e.g., `stories.json`) and add `STORIES_JSON_FILE: stories.json` to your report. The CLI resolves the file at submit time and inlines it as `STORIES_JSON`. This avoids shell quoting problems with large story payloads. Use this whenever the stories JSON is large or complex.
 
 ## CRITICAL — STATUS Line Requirement
 
 Your output is parsed by an automated scheduler. It looks for **exact markers** to determine step outcome:
 
-- **On success:** `STATUS: done` must appear as its own plain-text line. By convention it is the first report line, followed by the role-specific `KEY:` lines shown below. The scheduler matches status markers anywhere in the report piped to step completion.
-- **On failure:** If you could not do the work, report `STATUS: failed` with a `REASON:` line and use `step fail <stepId> "<reason>"`.
+- **On success:** `STATUS: done` must appear as its own plain-text line. By convention it is the first report line, followed by the role-specific `KEY:` lines shown below. The scheduler matches status markers anywhere in the report submitted via `step complete --file <report.txt>` (preferred) or piped to step completion.
+- **On failure:** If you could not do the work, report `STATUS: failed` with a `REASON:` line and use `step fail <stepId> "<reason>"` or `step fail <stepId> --reason-file <path>`.
 
-STATUS: and KEY: lines must start at column 0 as plain text — no bold, no backticks, no fences, and no leading bullets. Piping the report into `tamandua step complete <stepId>` is the only thing that completes a step; printing `STATUS: done` in a final chat or session message does not complete it.
+STATUS: and KEY: lines must start at column 0 as plain text — no bold, no backticks, no fences, and no leading bullets. The preferred method is to write the report to a file and run `tamandua step complete <stepId> --file <report.txt>`. The alternative is piping the report into `tamandua step complete <stepId>`. Either way, calling `tamandua step complete` is the only thing that completes a step; printing `STATUS: done` in a final chat or session message does not complete it. NOTE: If `step complete` responds with `REJECTED`, you still hold the step -- fix the output format and resubmit in the same round.
 
-If no status marker is present in the piped report, the scheduler treats the step as **lost/abandoned** and retries it — wasting a retry slot even if the work was actually completed. This is the most common cause of spurious retries.
+If no status marker is present in the submitted report, the scheduler treats the step as **lost/abandoned** and retries it — wasting a retry slot even if the work was actually completed. This is the most common cause of spurious retries.
 
 ## Output Format
 
@@ -101,6 +103,17 @@ REPO: /path/to/repo
 BRANCH: feature-branch-name
 STORIES_JSON: [{"id":"US-001","title":"Short descriptive title","description":"As a developer, I need to... so that...\n\nImplementation notes:\n- Detail 1\n- Detail 2","acceptanceCriteria":["Specific verifiable criterion 1","Specific verifiable criterion 2","Tests for [feature] pass","Typecheck passes"]},{"id":"US-002","title":"...","description":"...","acceptanceCriteria":["...","Typecheck passes"]}]
 ```
+
+**Alternative — STORIES_JSON_FILE (preferred for large plans):**
+
+```
+STATUS: done
+REPO: /path/to/repo
+BRANCH: feature-branch-name
+STORIES_JSON_FILE: stories.json
+```
+
+Write the stories array to `stories.json` (valid JSON array) and reference it with the `STORIES_JSON_FILE:` key. The CLI reads and inlines the file at submit time, converting it to the standard `STORIES_JSON` line.
 
 **STORIES_JSON** must be valid JSON. The array is parsed by the pipeline to create trackable story records.
 

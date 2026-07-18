@@ -584,7 +584,7 @@ describe("SKILL.md output format accuracy", () => {
   it("documents the real completion and verifier verdict channels", () => {
     assert.match(completionSection, /On success[^]*`STATUS: done`[^]*own\s+plain-text line/i);
     assert.match(completionSection, /convention[^]*first report[^]*KEY:/i);
-    assert.match(completionSection, /markers[^]*anywhere in the piped output/i);
+    assert.match(completionSection, /markers[^]*anywhere in the (?:piped|submitted) output/i);
     assert.match(completionSection, /ONLY\s+thing that completes a step/i);
     assert.match(completionSection, /final chat or\s+session message does not complete/i);
     assert.match(completionSection, /verifier[^]*rejects[^]*`STATUS: retry`[^]*step complete/i);
@@ -611,8 +611,8 @@ describe("SKILL.md output format accuracy", () => {
     assert.match(completionSection, /no trailing prose/i);
     assert.match(completionSection, /embedded newline-separated[^]*UPPERCASE_KEY:/i);
     assert.match(completionSection, /extractor truncates/i);
-    assert.match(completionSection, /python3[^]*json\.dumps[^]*heredoc[^]*pip/i);
-    assert.match(completionSection, /rather than hand-quoting/i);
+    assert.match(completionSection, /STORIES_JSON_FILE/i, "must document STORIES_JSON_FILE");
+    assert.match(completionSection, /python3[^]*json\.dumps[^]*heredoc/i);
   });
 });
 

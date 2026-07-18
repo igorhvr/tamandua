@@ -142,4 +142,57 @@ describe("buildWorkPrompt (deterministic-dispatch work prompt)", () => {
     assert.ok(fallbackIdx !== -1 && genericIdx !== -1 && genericIdx > fallbackIdx,
       "generic CHANGES/TESTS example must appear only under the no-Reply-format fallback");
   });
+
+  // ── US-008: --file as preferred reporting, REJECTED flow, --reason-file ──
+
+  it("US-008: --file is promoted as the preferred reporting method", () => {
+    const prompt = buildWorkPrompt("feature-dev", "developer", RUN_ID);
+    assert.ok(prompt.includes("--file report.txt"), "must include --file report.txt example");
+    assert.ok(prompt.includes("Preferred:"), "must mark --file as preferred");
+    // The --file form must appear BEFORE the stdin alternative.
+    const preferredIdx = prompt.indexOf("Preferred: write your report to a file");
+    const altIdx = prompt.indexOf("Alternative (stdin pipe)");
+    assert.ok(preferredIdx !== -1 && altIdx !== -1 && preferredIdx < altIdx,
+      "preferred --file method must appear before stdin alternative");
+  });
+
+  it("US-008: stdin pipe form is still documented as alternative", () => {
+    const prompt = buildWorkPrompt("feature-dev", "developer", RUN_ID);
+    assert.ok(prompt.includes("echo '"), "must still mention echo pipe");
+    assert.ok(prompt.includes("Alternative (stdin pipe)"), "must have stdin pipe labeled as alternative");
+  });
+
+  it("US-008: mentions REJECTED-resubmit flow", () => {
+    const prompt = buildWorkPrompt("feature-dev", "developer", RUN_ID);
+    assert.ok(prompt.includes("REJECTED"), "must mention REJECTED");
+    assert.ok(prompt.includes("still hold the step"), "must mention agent still holds the step");
+    assert.ok(prompt.includes("fix the output format"), "must tell agent to fix the format");
+    assert.ok(prompt.includes("same round"), "must mention same round resubmit");
+  });
+
+  it("US-008: mentions --reason-file for step fail", () => {
+    const prompt = buildWorkPrompt("feature-dev", "developer", RUN_ID);
+    assert.ok(prompt.includes("--reason-file"), "must mention --reason-file flag");
+    assert.ok(prompt.includes("--reason-file reason.txt"), "must include --reason-file example");
+  });
+
+  it("US-008: RULES section mentions --file and REJECTED", () => {
+    const prompt = buildWorkPrompt("feature-dev", "developer", RUN_ID);
+    const rulesIdx = prompt.indexOf("─── RULES ───");
+    assert.ok(rulesIdx !== -1, "must have RULES section");
+    const afterRules = prompt.slice(rulesIdx);
+    assert.ok(afterRules.includes("--file (preferred)"), "RULES must mention --file preferred");
+    assert.ok(afterRules.includes("REJECTED"), "RULES must mention REJECTED");
+  });
+
+  it("US-008: prompt still works for both harness types", () => {
+    const piPrompt = buildWorkPrompt("feature-dev", "developer", RUN_ID);
+    const hermesPrompt = buildWorkPrompt("bug-fix-merge-worktree", "verifier", RUN_ID);
+    // Both harness types must have --file promoted.
+    assert.ok(piPrompt.includes("--file report.txt"));
+    assert.ok(hermesPrompt.includes("--file report.txt"));
+    // Both must mention REJECTED flow.
+    assert.ok(piPrompt.includes("REJECTED"));
+    assert.ok(hermesPrompt.includes("REJECTED"));
+  });
 });

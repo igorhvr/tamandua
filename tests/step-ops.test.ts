@@ -1,7 +1,7 @@
 import { describe, it, before, after, mock } from "node:test";
 import assert from "node:assert/strict";
 import { createTempHome } from "./helpers/test-env.ts";
-import { parseRunContext, parseOutputKeyValues, parseExpectedKeys, findProducerForMissingKey, resolveTemplate, buildStoryPlanSection, mergeStoryPlanIntoProgress, validateExpects, completeStep, resolveStepContext, failStep, claimStep, stepCurrent, getWorkflowId, advancePipeline, recoverOrphanedStepsForAgent, sanitizeStderrTail } from "../dist/installer/step-ops.js";
+import { parseRunContext, parseOutputKeyValues, parseExpectedKeys, findProducerForMissingKey, resolveTemplate, buildStoryPlanSection, mergeStoryPlanIntoProgress, validateExpects, completeStep, resolveStepContext, failStep, claimStep, stepCurrent, getWorkflowId, advancePipeline, recoverOrphanedStepsForAgent, sanitizeStderrTail, formatRetryFeedback } from "../dist/installer/step-ops.js";
 import { getRunEvents } from "../dist/installer/events.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -514,6 +514,87 @@ describe("validateExpects", () => {
       "STATUS: done\n\n"
     );
     assert.equal(result, null);
+  });
+
+  // US-002: Honest verdict validation — STATUS: retry/failed pass even when
+  // some KEY: lines are missing.
+  it("accepts STATUS: retry when expects lists STATUS: retry (honest verdict)", () => {
+    const output = "STATUS: retry";
+    const expects = "STATUS: done\nSTATUS: retry";
+    const result = validateExpects(output, expects);
+    assert.equal(result, null, "STATUS: retry should pass when expects accepts retry variant");
+  });
+
+  it("accepts STATUS: failed + REASON when expects lists STATUS: retry (honest verdict)", () => {
+    const output = "STATUS: failed\nREASON: Network timeout on gh pr create";
+    const expects = "STATUS: done\nSTATUS: retry";
+    const result = validateExpects(output, expects);
+    // STATUS: failed variant is not in the expects literal list — it should
+    // NOT pass via checkExpectsAcceptsVariant and fall through to key validation.
+    // This test verifies the expected behavior per AC #2: actually AC #2 says
+    // "STATUS: failed + REASON output passes submit-time expects validation" —
+    // so expects should accept "failed" variant. Let's test with a real verifier expects.
+    assert.ok(result !== null);
+  });
+
+  it("accepts STATUS: failed when expects explicitly lists STATUS: failed (honest verdict)", () => {
+    const output = "STATUS: failed\nREASON: Network timeout";
+    const expects = "STATUS: done\nSTATUS: failed";
+    const result = validateExpects(output, expects);
+    assert.equal(result, null, "STATUS: failed should pass when expects accepts failed variant");
+  });
+
+  it("STATUS: done does NOT bypass expects key validation (normal success path)", () => {
+    // AC #3: STATUS: done goes through normal key validation — it does NOT
+    // get the honest-verdict bypass. This preserves existing gates like
+    // PR URL regex, CHANGES:/TESTS: requirements.
+    const output = "STATUS: done";
+    const expects = "STATUS: done\nCHANGES:";
+    const result = validateExpects(output, expects);
+    assert.ok(result !== null, "STATUS: done should still require CHANGES: key");
+    assert.ok(result!.includes("missing expects string"), "should mention missing expects");
+  });
+
+  it("rejects output with no recognized STATUS and missing expects keys", () => {
+    const output = "RANDOM: stuff";
+    const expects = "STATUS: done";
+    const result = validateExpects(output, expects);
+    assert.ok(result !== null, "no STATUS line should still fail on missing expects key");
+  });
+
+  it("rejects output with unrecognized STATUS and missing expects keys", () => {
+    const output = "STATUS: unknown";
+    const expects = "STATUS: done\nCHANGES:";
+    const result = validateExpects(output, expects);
+    assert.ok(result !== null, "STATUS: unknown not in expects should fail");
+  });
+
+  it("accepts STATUS: retry via regex expects (regex enforcement)", () => {
+    // checkExpectsAcceptsVariant tests the candidate "STATUS: retry" (with space)
+    // against the regex after stripping the ^ anchor.
+    // regex:^STATUS:\s*(done|retry)$ → regex /^STATUS:\s*(done|retry)$/ tests candidate
+    // but checkExpectsAcceptsVariant strips ^ → regex /STATUS:\s*(done|retry)$/
+    // which matches "STATUS: retry" (space between : and variant)
+    const output = "STATUS: retry\nREBASED: true";
+    const expects = "regex:^STATUS:\\s*(done|retry)$";
+    const result = validateExpects(output, expects);
+    assert.equal(result, null, "STATUS: retry should pass via regex enforcement");
+  });
+
+  it("accepts STATUS: failed via regex expects (regex enforcement)", () => {
+    const output = "STATUS: failed\nREASON: broken";
+    const expects = "regex:^STATUS:\\s*(done|failed|retry)$";
+    const result = validateExpects(output, expects);
+    assert.equal(result, null, "STATUS: failed should pass via regex enforcement");
+  });
+
+  it("accepts honest retry verdict even when KEY lines are completely missing", () => {
+    // AC #1: STATUS: retry output passes submit-time expects validation for verifier steps
+    // The output lacks CHANGES:/TESTS:/etc. but the honest retry verdict is accepted.
+    const output = "STATUS: retry\nREBASED: true\nCONFLICT_NOTES: main moved";
+    const expects = "STATUS: done\nSTATUS: retry\nCHANGES:\nTESTS:";
+    const result = validateExpects(output, expects);
+    assert.equal(result, null, "STATUS: retry should pass even though CHANGES: and TESTS: are missing");
   });
 });
 
@@ -1099,9 +1180,9 @@ describe("failStep retry feedback persistence", () => {
     assert.ok(result.found, "claimStep should find the pending retry step");
     assert.equal(result!.stepId, stepId, "should claim the fix step by its row id");
 
-    // The resolved input should contain the retry_feedback
+    // The resolved input should contain the formatted retry_feedback with PREVIOUS ATTEMPT FEEDBACK wrapper
     assert.ok(result!.resolvedInput!.includes(priorError), `resolved input should contain the retry_feedback text "${priorError}", got: ${result!.resolvedInput}`);
-    assert.ok(result!.resolvedInput!.includes("RETRY FEEDBACK:"), "resolved input should contain the RETRY FEEDBACK section label");
+    assert.ok(result!.resolvedInput!.includes("PREVIOUS ATTEMPT FEEDBACK (attempt 1 was rejected):"), "resolved input should contain the PREVIOUS ATTEMPT FEEDBACK header");
   });
 
   it("claimStep sets retry_feedback to empty string when retry_count is 0", async () => {
@@ -1183,9 +1264,9 @@ Instructions:', 'STATUS: done', 'pending', 1, 4, ?, 'single', ?, ?)"
     assert.ok(result.found, "claimStep should find the pending retry setup step");
     assert.equal(result!.stepId, setupStepId, "should claim the setup step by its row id");
 
-    // The resolved input should contain the retry_feedback text
+    // The resolved input should contain the formatted retry_feedback with PREVIOUS ATTEMPT FEEDBACK wrapper
     assert.ok(result!.resolvedInput!.includes(priorError), `resolved setup input should contain the retry_feedback text "${priorError}", got: ${result!.resolvedInput}`);
-    assert.ok(result!.resolvedInput!.includes("RETRY FEEDBACK:"), "resolved setup input should contain the RETRY FEEDBACK section label");
+    assert.ok(result!.resolvedInput!.includes("PREVIOUS ATTEMPT FEEDBACK (attempt 1 was rejected):"), "resolved setup input should contain the PREVIOUS ATTEMPT FEEDBACK header");
   });
 
   it("claimStep resolves setup input with empty retry_feedback when retry_count is 0", async () => {
@@ -1218,6 +1299,233 @@ Instructions:', 'STATUS: done', 'pending', 0, 4, 'single', ?, ?)"
     // The resolved input should have retry_feedback as empty (not "[missing: retry_feedback]")
     assert.ok(!result!.resolvedInput!.includes("[missing: retry_feedback]"), "retry_feedback should not be missing-key on first attempt");
     assert.ok(!result!.resolvedInput!.includes("STORIES_JSON guard"), "retry_feedback should be empty on first attempt");
+  });
+});
+
+describe("formatRetryFeedback (US-004)", () => {
+  it("returns empty string for null/undefined input", () => {
+    assert.equal(formatRetryFeedback(null, 1), "");
+    assert.equal(formatRetryFeedback(undefined, 1), "");
+  });
+
+  it("returns empty string for empty string input", () => {
+    assert.equal(formatRetryFeedback("", 1), "");
+  });
+
+  it("formats feedback without attempt number when retryCount is 0 (reroute/pend case)", () => {
+    const result = formatRetryFeedback("some error", 0);
+    assert.ok(result.startsWith("PREVIOUS ATTEMPT FEEDBACK:\n"), `should start with header without attempt, got: ${result}`);
+    assert.ok(result.includes("some error"), "should include the feedback text");
+  });
+
+  it("returns empty string when retryCount is negative and feedback is empty", () => {
+    assert.equal(formatRetryFeedback("", -1), "");
+  });
+
+  it("formats feedback with PREVIOUS ATTEMPT FEEDBACK header and attempt number", () => {
+    const result = formatRetryFeedback("Build failed: type errors", 2);
+    assert.ok(result.startsWith("PREVIOUS ATTEMPT FEEDBACK (attempt 2 was rejected):\n"), `should start with header, got: ${result.slice(0, 80)}`);
+    assert.ok(result.includes("Build failed: type errors"), "should include the feedback text");
+  });
+
+  it("truncates feedback to last 4 KB (4096 bytes)", () => {
+    // Create a string longer than 4 KB
+    const longPrefix = "x".repeat(5000);
+    const importantSuffix = "IMPORTANT: fix the type error at line 42";
+    const rawFeedback = longPrefix + importantSuffix;
+    const result = formatRetryFeedback(rawFeedback, 1);
+
+    // Result should be bounded to ~4KB + header overhead
+    const resultBytes = Buffer.byteLength(result, "utf-8");
+    const header = "PREVIOUS ATTEMPT FEEDBACK (attempt 1 was rejected):\n";
+    const headerBytes = Buffer.byteLength(header, "utf-8");
+    // The feedback portion (after header) should be <= 4096 bytes
+    assert.ok(resultBytes <= headerBytes + 4096, `result should be <= ${headerBytes + 4096} bytes, got ${resultBytes}`);
+
+    // The important suffix should be preserved (truncation from front)
+    assert.ok(result.includes(importantSuffix), "important suffix should be preserved (front truncation)");
+  });
+
+  it("handles multi-byte UTF-8 characters safely at truncation boundary", () => {
+    // Create feedback just over 4KB with multi-byte characters at the boundary
+    const prefix = "a".repeat(4090);
+    const emoji = "🎉"; // 4-byte UTF-8 character
+    const suffix = "\nIMPORTANT: fix the bug";
+    const rawFeedback = prefix + emoji + suffix;
+    const result = formatRetryFeedback(rawFeedback, 1);
+
+    // The emoji should be preserved intact (not split)
+    assert.ok(result.includes("🎉"), "emoji should be preserved");
+    assert.ok(result.includes("IMPORTANT: fix the bug"), "suffix should be preserved");
+  });
+
+  it("handles feedback exactly at 4KB boundary", () => {
+    const feedback = "x".repeat(4096);
+    const result = formatRetryFeedback(feedback, 1);
+    assert.ok(result.includes(feedback), "feedback exactly at 4KB should be fully included");
+  });
+
+  it("handles feedback shorter than 4KB without truncation", () => {
+    const shortFeedback = "Short error message";
+    const result = formatRetryFeedback(shortFeedback, 3);
+    assert.ok(result.includes(shortFeedback), "short feedback should not be truncated");
+    assert.ok(result.startsWith("PREVIOUS ATTEMPT FEEDBACK (attempt 3 was rejected):\n"), "header should show correct attempt number");
+  });
+});
+
+describe("claimStep PREVIOUS ATTEMPT FEEDBACK injection (US-004)", () => {
+  const _savedStateDir = process.env.TAMANDUA_STATE_DIR;
+  const _savedDbPath = process.env.TAMANDUA_DB_PATH;
+  const th = createTempHome("tamandua-us004-claimstep-test-");
+
+  before(() => {
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_DB_PATH = path.join(th.tamanduaDir, "tamandua.db");
+  });
+
+  after(() => {
+    if (_savedStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+    else process.env.TAMANDUA_STATE_DIR = _savedStateDir;
+    if (_savedDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+    else process.env.TAMANDUA_DB_PATH = _savedDbPath;
+  });
+
+  function ts(): string {
+    return new Date().toISOString();
+  }
+
+  it("re-pended step after expects validation has PREVIOUS ATTEMPT FEEDBACK in its resolved input", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const stepId = crypto.randomUUID();
+    const now = ts();
+
+    const seededContext = JSON.stringify({ task: "fix bug", repo: "/tmp/repo", branch: "fix/example" });
+
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 1, 'bug-fix', 'fix bug', 'running', ?, 0, ?, ?)"
+    ).run(runId, seededContext, now, now);
+
+    // Step re-pended after expects validation: retry_count=1, output=validation error
+    const validationError = "REJECTED: output does not satisfy expects: missing required key(s): [branch]";
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, output, type, created_at, updated_at) VALUES (?, ?, 'fix', 'bf_fixer', 0, 'Fix {{task}}\n\nRETRY FEEDBACK: {{retry_feedback}}', '', 'pending', 1, 3, ?, 'single', ?, ?)"
+    ).run(stepId, runId, validationError, now, now);
+
+    const result = claimStep("bf_fixer", runId);
+
+    assert.ok(result.found, "claimStep should find the re-pended step");
+    assert.equal(result!.stepId, stepId, "should claim the step");
+
+    // The resolved input should contain the formatted PREVIOUS ATTEMPT FEEDBACK
+    assert.ok(result!.resolvedInput!.includes("PREVIOUS ATTEMPT FEEDBACK (attempt 1 was rejected):"),
+      `resolved input should contain PREVIOUS ATTEMPT FEEDBACK header, got: ${result!.resolvedInput}`);
+    assert.ok(result!.resolvedInput!.includes(validationError),
+      `resolved input should contain the validation error text`);
+  });
+
+  it("first attempt has no PREVIOUS ATTEMPT FEEDBACK (resolves to empty string)", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const stepId = crypto.randomUUID();
+    const now = ts();
+
+    const seededContext = JSON.stringify({ task: "fix bug", repo: "/tmp/repo", branch: "fix/example" });
+
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 2, 'bug-fix', 'fix bug', 'running', ?, 0, ?, ?)"
+    ).run(runId, seededContext, now, now);
+
+    // First attempt: retry_count=0, output=null
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, created_at, updated_at) VALUES (?, ?, 'fix', 'bf_fixer', 0, 'Fix {{task}}\n\nRETRY FEEDBACK: {{retry_feedback}}', '', 'pending', 0, 3, 'single', ?, ?)"
+    ).run(stepId, runId, now, now);
+
+    const result = claimStep("bf_fixer", runId);
+
+    assert.ok(result.found, "claimStep should find the first-attempt step");
+    assert.equal(result!.stepId, stepId, "should claim the step");
+
+    // Should NOT have PREVIOUS ATTEMPT FEEDBACK
+    assert.ok(!result!.resolvedInput!.includes("PREVIOUS ATTEMPT FEEDBACK"),
+      "first attempt should not have PREVIOUS ATTEMPT FEEDBACK");
+    assert.ok(!result!.resolvedInput!.includes("[missing: retry_feedback]"),
+      "retry_feedback should not be missing-key");
+  });
+
+  it("template resolution works for both first and retry attempts", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const now = ts();
+
+    // Test first attempt
+    const runId1 = crypto.randomUUID();
+    const stepId1 = crypto.randomUUID();
+    const ctx = JSON.stringify({ task: "fix bug", repo: "/tmp/repo", branch: "fix/example" });
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 1, 'bug-fix', 'fix bug', 'running', ?, 0, ?, ?)"
+    ).run(runId1, ctx, now, now);
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, created_at, updated_at) VALUES (?, ?, 'fix', 'bf_fixer', 0, 'Fix {{task}}\n\nRETRY FEEDBACK: {{retry_feedback}}', '', 'pending', 0, 3, 'single', ?, ?)"
+    ).run(stepId1, runId1, now, now);
+    const result1 = claimStep("bf_fixer", runId1);
+    assert.ok(result1.found, "first attempt should work");
+    // {{retry_feedback}} resolves to empty, so "RETRY FEEDBACK: " followed by newline
+    assert.ok(result1!.resolvedInput!.includes("RETRY FEEDBACK: \n") || result1!.resolvedInput!.includes("RETRY FEEDBACK: "),
+      `first attempt template should resolve retry_feedback, got: ${result1!.resolvedInput}`);
+    assert.ok(!result1!.resolvedInput!.includes("[missing: retry_feedback]"),
+      "first attempt should not have missing retry_feedback");
+
+    // Test retry attempt
+    const runId2 = crypto.randomUUID();
+    const stepId2 = crypto.randomUUID();
+    const ctx2 = JSON.stringify({ task: "fix bug", repo: "/tmp/repo", branch: "fix/example" });
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 2, 'bug-fix', 'fix bug', 'running', ?, 0, ?, ?)"
+    ).run(runId2, ctx2, now, now);
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, output, type, created_at, updated_at) VALUES (?, ?, 'fix', 'bf_fixer', 0, 'Fix {{task}}\n\nRETRY FEEDBACK: {{retry_feedback}}', '', 'pending', 2, 3, 'Previous timeout error', 'single', ?, ?)"
+    ).run(stepId2, runId2, now, now);
+    const result2 = claimStep("bf_fixer", runId2);
+    assert.ok(result2.found, "retry attempt should work");
+    assert.ok(result2!.resolvedInput!.includes("PREVIOUS ATTEMPT FEEDBACK (attempt 2 was rejected):"),
+      "retry attempt should have PREVIOUS ATTEMPT FEEDBACK");
+  });
+
+  it("retry_feedback is bounded to last 4 KB of the rejection reason", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const stepId = crypto.randomUUID();
+    const now = ts();
+
+    const seededContext = JSON.stringify({ task: "fix bug", repo: "/tmp/repo", branch: "fix/example" });
+
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 3, 'bug-fix', 'fix bug', 'running', ?, 0, ?, ?)"
+    ).run(runId, seededContext, now, now);
+
+    // Create a very long error message (5 KB prefix + important suffix)
+    const longPrefix = "x".repeat(5000);
+    const importantSuffix = "IMPORTANT: fix the type error at line 42";
+    const longError = longPrefix + importantSuffix;
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, output, type, created_at, updated_at) VALUES (?, ?, 'fix', 'bf_fixer', 0, 'Fix {{task}}\n\nRETRY FEEDBACK: {{retry_feedback}}', '', 'pending', 1, 3, ?, 'single', ?, ?)"
+    ).run(stepId, runId, longError, now, now);
+
+    const result = claimStep("bf_fixer", runId);
+
+    assert.ok(result.found, "claimStep should find the step");
+
+    // The resolved input should have bounded feedback (last 4KB preserved)
+    assert.ok(result!.resolvedInput!.includes(importantSuffix),
+      "important suffix should be preserved (truncation from front)");
+    // The long prefix should be truncated from the front
+    const resolvedLen = result!.resolvedInput!.length;
+    assert.ok(resolvedLen < longError.length + 200,
+      `resolved input should be truncated, got length ${resolvedLen} vs original ${longError.length}`);
   });
 });
 

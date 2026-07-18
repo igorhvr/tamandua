@@ -69,6 +69,7 @@ src/suite/tree-hash.test.ts
 tests/agent-scheduler.test.ts
 tests/claim-invalidated-by-migration.test.ts
 tests/claim-ownership-recording.test.ts
+tests/cli-cfil-vfbk-integration.test.ts
 tests/cli-get-ready-partial-failure.test.ts
 tests/cli-json-output.test.ts
 tests/cli-pause-all-resume-all-integration.test.ts
