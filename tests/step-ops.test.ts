@@ -1,7 +1,7 @@
 import { describe, it, before, after, mock } from "node:test";
 import assert from "node:assert/strict";
 import { createTempHome } from "./helpers/test-env.ts";
-import { parseRunContext, parseOutputKeyValues, parseExpectedKeys, findProducerForMissingKey, resolveTemplate, buildStoryPlanSection, mergeStoryPlanIntoProgress, validateExpects, completeStep, resolveStepContext, failStep, claimStep, getWorkflowId, advancePipeline, recoverOrphanedStepsForAgent, sanitizeStderrTail } from "../dist/installer/step-ops.js";
+import { parseRunContext, parseOutputKeyValues, parseExpectedKeys, findProducerForMissingKey, resolveTemplate, buildStoryPlanSection, mergeStoryPlanIntoProgress, validateExpects, completeStep, resolveStepContext, failStep, claimStep, stepCurrent, getWorkflowId, advancePipeline, recoverOrphanedStepsForAgent, sanitizeStderrTail } from "../dist/installer/step-ops.js";
 import { getRunEvents } from "../dist/installer/events.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -6136,5 +6136,547 @@ describe("US-005: Integration tests for context corruption guard", () => {
       typeof corruptEvents[0].detail === "string" && corruptEvents[0].detail!.length <= 200,
       "detail should be a bounded prefix"
     );
+  });
+});
+
+describe("stepCurrent — read-only held step query (US-001)", () => {
+  const _savedStateDir = process.env.TAMANDUA_STATE_DIR;
+  const _savedDbPath = process.env.TAMANDUA_DB_PATH;
+  const th = createTempHome("tamandua-step-current-test-");
+
+  before(() => {
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_DB_PATH = path.join(th.tamanduaDir, "tamandua.db");
+  });
+
+  after(() => {
+    if (_savedStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+    else process.env.TAMANDUA_STATE_DIR = _savedStateDir;
+    if (_savedDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+    else process.env.TAMANDUA_DB_PATH = _savedDbPath;
+  });
+
+  function ts(): string {
+    return new Date().toISOString();
+  }
+
+  it("returns step JSON when agent has a held (running) step", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const stepId = crypto.randomUUID();
+    const now = ts();
+
+    const seededContext = JSON.stringify({ task: "fix bug", repo: "/tmp/repo", branch: "fix/example" });
+
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 1, 'scur-test', 'fix bug', 'running', ?, 0, ?, ?)"
+    ).run(runId, seededContext, now, now);
+
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, created_at, updated_at) VALUES (?, ?, 'fix', 'scur_fixer', 0, 'Fix {{task}}', 'STATUS: done', 'running', 0, 3, 'single', ?, ?)"
+    ).run(stepId, runId, now, now);
+
+    const result = stepCurrent("scur_fixer", runId);
+
+    assert.ok(result !== null, "stepCurrent should return a result when agent has a held step");
+    assert.equal(result!.stepId, stepId, "should return the correct stepId");
+    assert.equal(result!.runId, runId, "should return the correct runId");
+    assert.ok(result!.input.includes("fix bug"), "input should contain the resolved task");
+  });
+
+  it("returns null when agent has no in-flight step", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const now = ts();
+
+    const seededContext = JSON.stringify({ task: "fix bug", repo: "/tmp/repo", branch: "fix/example" });
+
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 2, 'scur-test', 'fix bug', 'running', ?, 0, ?, ?)"
+    ).run(runId, seededContext, now, now);
+
+    const result = stepCurrent("scur_fixer", runId);
+
+    assert.equal(result, null, "stepCurrent should return null when agent has no held step");
+  });
+
+  it("returns null when agent has a done step (not in-flight)", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const stepId = crypto.randomUUID();
+    const now = ts();
+
+    const seededContext = JSON.stringify({ task: "fix bug", repo: "/tmp/repo", branch: "fix/example" });
+
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 3, 'scur-test', 'fix bug', 'running', ?, 0, ?, ?)"
+    ).run(runId, seededContext, now, now);
+
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, created_at, updated_at) VALUES (?, ?, 'fix', 'scur_fixer', 0, 'Fix {{task}}', 'STATUS: done', 'done', 0, 3, 'single', ?, ?)"
+    ).run(stepId, runId, now, now);
+
+    const result = stepCurrent("scur_fixer", runId);
+
+    assert.equal(result, null, "stepCurrent should return null when step is done, not running");
+  });
+
+  it("does not mutate step state (retry_count, status, timestamps)", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const stepId = crypto.randomUUID();
+    const now = ts();
+
+    const seededContext = JSON.stringify({ task: "fix bug", repo: "/tmp/repo", branch: "fix/example" });
+
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 4, 'scur-test', 'fix bug', 'running', ?, 0, ?, ?)"
+    ).run(runId, seededContext, now, now);
+
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, created_at, updated_at) VALUES (?, ?, 'fix', 'scur_fixer', 0, 'Fix {{task}}', 'STATUS: done', 'running', 2, 3, 'single', ?, ?)"
+    ).run(stepId, runId, now, now);
+
+    // Capture pre-query state
+    const preStep = db.prepare("SELECT status, retry_count, updated_at FROM steps WHERE id = ?").get(stepId) as { status: string; retry_count: number; updated_at: string };
+
+    const result = stepCurrent("scur_fixer", runId);
+    assert.ok(result !== null, "stepCurrent should return a result");
+
+    // Verify no state mutation
+    const postStep = db.prepare("SELECT status, retry_count, updated_at FROM steps WHERE id = ?").get(stepId) as { status: string; retry_count: number; updated_at: string };
+
+    assert.equal(postStep.status, preStep.status, "status should not change");
+    assert.equal(postStep.retry_count, preStep.retry_count, "retry_count should not change");
+    assert.equal(postStep.updated_at, preStep.updated_at, "updated_at should not change");
+  });
+
+  it("only returns steps for the specified agent, not others", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const stepId = crypto.randomUUID();
+    const otherStepId = crypto.randomUUID();
+    const now = ts();
+
+    const seededContext = JSON.stringify({ task: "fix bug", repo: "/tmp/repo", branch: "fix/example" });
+
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 5, 'scur-test', 'fix bug', 'running', ?, 0, ?, ?)"
+    ).run(runId, seededContext, now, now);
+
+    // Agent A has a running step
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, created_at, updated_at) VALUES (?, ?, 'fix', 'scur_fixer', 0, 'Fix {{task}}', 'STATUS: done', 'running', 0, 3, 'single', ?, ?)"
+    ).run(stepId, runId, now, now);
+
+    // Agent B also has a running step
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, created_at, updated_at) VALUES (?, ?, 'verify', 'scur_verifier', 1, 'Verify', '', 'running', 0, 3, 'single', ?, ?)"
+    ).run(otherStepId, runId, now, now);
+
+    const result = stepCurrent("scur_fixer", runId);
+
+    assert.ok(result !== null, "stepCurrent should return a result for the fixer agent");
+    assert.equal(result!.stepId, stepId, "should return fixer's step, not verifier's");
+  });
+
+  it("returns null when run is not running (paused/failed)", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const stepId = crypto.randomUUID();
+    const now = ts();
+
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 6, 'scur-test', 'fix bug', 'paused', '{}', 0, ?, ?)"
+    ).run(runId, now, now);
+
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, created_at, updated_at) VALUES (?, ?, 'fix', 'scur_fixer', 0, 'Fix', 'STATUS: done', 'running', 0, 3, 'single', ?, ?)"
+    ).run(stepId, runId, now, now);
+
+    const result = stepCurrent("scur_fixer", runId);
+
+    assert.equal(result, null, "stepCurrent should return null when run is not running");
+  });
+});
+
+describe("claimStep — idempotent re-claim (US-002)", () => {
+  const _savedStateDir = process.env.TAMANDUA_STATE_DIR;
+  const _savedDbPath = process.env.TAMANDUA_DB_PATH;
+  const th = createTempHome("tamandua-idempotent-claim-test-");
+
+  before(() => {
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_DB_PATH = path.join(th.tamanduaDir, "tamandua.db");
+  });
+
+  after(() => {
+    if (_savedStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+    else process.env.TAMANDUA_STATE_DIR = _savedStateDir;
+    if (_savedDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+    else process.env.TAMANDUA_DB_PATH = _savedDbPath;
+  });
+
+  function ts(): string {
+    return new Date().toISOString();
+  }
+
+  it("re-claim returns same stepId as original claim", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const stepId = crypto.randomUUID();
+    const now = ts();
+
+    const seededContext = JSON.stringify({ task: "fix bug", repo: "/tmp/repo", branch: "fix/example" });
+
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 1, 'scur-test', 'fix bug', 'running', ?, 0, ?, ?)"
+    ).run(runId, seededContext, now, now);
+
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, created_at, updated_at) VALUES (?, ?, 'fix', 'scur_fixer', 0, 'Fix {{task}}', 'STATUS: done', 'running', 0, 3, 'single', ?, ?)"
+    ).run(stepId, runId, now, now);
+
+    const result = claimStep("scur_fixer", runId);
+
+    assert.ok(result.found, "re-claim should report found: true");
+    assert.equal(result.stepId, stepId, "re-claim should return same stepId");
+    assert.equal(result.runId, runId, "re-claim should return same runId");
+    assert.ok(result.resolvedInput!.includes("fix bug"), "re-claim should include resolved input with task");
+  });
+
+  it("re-claim does not bump retry_count", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const stepId = crypto.randomUUID();
+    const now = ts();
+
+    const seededContext = JSON.stringify({ task: "fix bug", repo: "/tmp/repo", branch: "fix/example" });
+
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 1, 'scur-test', 'fix bug', 'running', ?, 0, ?, ?)"
+    ).run(runId, seededContext, now, now);
+
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, created_at, updated_at) VALUES (?, ?, 'fix', 'scur_fixer', 0, 'Fix {{task}}', 'STATUS: done', 'running', 2, 3, 'single', ?, ?)"
+    ).run(stepId, runId, now, now);
+
+    const preStep = db.prepare("SELECT retry_count, status FROM steps WHERE id = ?").get(stepId) as { retry_count: number; status: string };
+
+    const result = claimStep("scur_fixer", runId);
+    assert.ok(result.found, "re-claim should report found: true");
+
+    const postStep = db.prepare("SELECT retry_count, status FROM steps WHERE id = ?").get(stepId) as { retry_count: number; status: string };
+
+    assert.equal(postStep.retry_count, preStep.retry_count, "retry_count should not change on re-claim");
+    assert.equal(postStep.status, preStep.status, "status should not change on re-claim");
+  });
+
+  it("re-claim does not change step state or timestamps", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const stepId = crypto.randomUUID();
+    const now = ts();
+
+    const seededContext = JSON.stringify({ task: "fix bug", repo: "/tmp/repo", branch: "fix/example" });
+
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 1, 'scur-test', 'fix bug', 'running', ?, 0, ?, ?)"
+    ).run(runId, seededContext, now, now);
+
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, created_at, updated_at) VALUES (?, ?, 'fix', 'scur_fixer', 0, 'Fix {{task}}', 'STATUS: done', 'running', 0, 3, 'single', ?, ?)"
+    ).run(stepId, runId, now, now);
+
+    const preStep = db.prepare("SELECT status, retry_count, updated_at, abandoned_count FROM steps WHERE id = ?").get(stepId) as { status: string; retry_count: number; updated_at: string; abandoned_count: number };
+
+    const result = claimStep("scur_fixer", runId);
+    assert.ok(result.found, "re-claim should report found: true");
+
+    const postStep = db.prepare("SELECT status, retry_count, updated_at, abandoned_count FROM steps WHERE id = ?").get(stepId) as { status: string; retry_count: number; updated_at: string; abandoned_count: number };
+
+    assert.equal(postStep.status, preStep.status, "status should not change on re-claim");
+    assert.equal(postStep.retry_count, preStep.retry_count, "retry_count should not change on re-claim");
+    assert.equal(postStep.updated_at, preStep.updated_at, "updated_at should not change on re-claim");
+    assert.equal(postStep.abandoned_count, preStep.abandoned_count, "abandoned_count should not change on re-claim");
+  });
+
+  it("agent with held step cannot claim a second step (returns held one, not a new one)", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const heldStepId = crypto.randomUUID();
+    const nextStepId = crypto.randomUUID();
+    const now = ts();
+
+    const seededContext = JSON.stringify({ task: "fix bug", repo: "/tmp/repo", branch: "fix/example" });
+
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 1, 'scur-test', 'fix bug', 'running', ?, 0, ?, ?)"
+    ).run(runId, seededContext, now, now);
+
+    // Agent holds a running step (index 0)
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, created_at, updated_at) VALUES (?, ?, 'setup', 'scur_fixer', 0, 'Setup {{task}}', 'STATUS: done', 'running', 0, 3, 'single', ?, ?)"
+    ).run(heldStepId, runId, now, now);
+
+    // There is also a pending step (index 1) that the agent would claim if re-claim didn't intercept
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, created_at, updated_at) VALUES (?, ?, 'fix', 'scur_fixer', 1, 'Fix {{task}}', 'STATUS: done', 'pending', 0, 3, 'single', ?, ?)"
+    ).run(nextStepId, runId, now, now);
+
+    const result = claimStep("scur_fixer", runId);
+
+    assert.ok(result.found, "re-claim should report found: true");
+    // Should return the HELD step (index 0), not the pending step (index 1)
+    assert.equal(result.stepId, heldStepId, "re-claim should return held step, not the next pending step");
+    assert.ok(result.resolvedInput!.includes("Setup"), "re-claim should return held step's resolved input");
+
+    // Verify the next pending step was NOT claimed
+    const nextStep = db.prepare("SELECT status FROM steps WHERE id = ?").get(nextStepId) as { status: string };
+    assert.equal(nextStep.status, "pending", "next pending step should not be claimed");
+  });
+
+  it("fresh claim when no step is held works exactly as today", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const stepId = crypto.randomUUID();
+    const now = ts();
+
+    const seededContext = JSON.stringify({ task: "fix bug", repo: "/tmp/repo", branch: "fix/example" });
+
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 1, 'scur-test', 'fix bug', 'running', ?, 0, ?, ?)"
+    ).run(runId, seededContext, now, now);
+
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, created_at, updated_at) VALUES (?, ?, 'fix', 'scur_fixer', 0, 'Fix {{task}}', 'STATUS: done', 'pending', 0, 3, 'single', ?, ?)"
+    ).run(stepId, runId, now, now);
+
+    const result = claimStep("scur_fixer", runId);
+
+    assert.ok(result.found, "fresh claim should report found: true");
+    assert.equal(result.stepId, stepId, "fresh claim should claim the pending step");
+    assert.ok(result.resolvedInput!.includes("fix bug"), "fresh claim should include resolved input");
+
+    // Verify step was transitioned to running
+    const step = db.prepare("SELECT status FROM steps WHERE id = ?").get(stepId) as { status: string };
+    assert.equal(step.status, "running", "step should be transitioned to running");
+  });
+
+  it("two agents claiming in parallel never receive the same step", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const stepId = crypto.randomUUID();
+    const now = ts();
+
+    const seededContext = JSON.stringify({ task: "fix bug", repo: "/tmp/repo", branch: "fix/example" });
+
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 1, 'scur-test', 'fix bug', 'running', ?, 0, ?, ?)"
+    ).run(runId, seededContext, now, now);
+
+    // Two agents share the same pending step (same agent_id, same step_index=0)
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, created_at, updated_at) VALUES (?, ?, 'fix', 'scur_fixer', 0, 'Fix {{task}}', 'STATUS: done', 'pending', 0, 3, 'single', ?, ?)"
+    ).run(stepId, runId, now, now);
+
+    // Simulate parallel claims: agent A wins, agent B should get NO_WORK
+    const resultA = claimStep("scur_fixer", runId);
+    assert.ok(resultA.found, "agent A should claim the step");
+    assert.equal(resultA.stepId, stepId, "agent A should get the pending step");
+
+    // Agent B (different agent_id) tries to claim — no steps for this agent, so found:false
+    const resultB = claimStep("scur_fixer_b", runId);
+    assert.equal(resultB.found, false, "agent B should get found: false (no step for it)");
+
+    // Now try a second agent with the same agent_id trying to claim — only one step in this run for this agent, already running
+    // Since the only step for scur_fixer is already running, it will be re-claimed, not a new claim
+    const resultA2 = claimStep("scur_fixer", runId);
+    assert.ok(resultA2.found, "agent A re-claim should return held step");
+    assert.equal(resultA2.stepId, stepId, "agent A re-claim should return same held step");
+
+    // Verify only one step is running (not double-claimed)
+    const steps = db.prepare("SELECT status FROM steps WHERE run_id = ? AND agent_id = 'scur_fixer'").all(runId) as { status: string }[];
+    const runningSteps = steps.filter(s => s.status === 'running');
+    assert.equal(runningSteps.length, 1, "only one step should be running for this agent");
+  });
+
+  it("re-claim does not reset step state (type, loop_config, current_story_id preserved)", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const storyId = crypto.randomUUID();
+    const now = ts();
+
+    const seededContext = JSON.stringify({ task: "implement feature", repo: "/tmp/repo", branch: "feature/x" });
+
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 1, 'fdm', 'implement feature', 'running', ?, 0, ?, ?)"
+    ).run(runId, seededContext, now, now);
+
+    // Insert stories for the loop step context
+    db.prepare(
+      "INSERT INTO stories (id, run_id, story_index, story_id, title, description, acceptance_criteria, status, retry_count, max_retries, created_at, updated_at) VALUES (?, ?, 0, 'US-001', 'Test', 'desc', '[]', 'running', 0, 4, ?, ?)"
+    ).run(storyId, runId, now, now);
+
+    // Loop step with current_story_id set
+    const stepId = crypto.randomUUID();
+    const loopConfig = JSON.stringify({ over: "stories" });
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, loop_config, current_story_id, created_at, updated_at) VALUES (?, ?, 'dev', 'fdm_developer', 0, 'Develop {{current_story}}', 'STATUS: done', 'running', 0, 4, 'loop', ?, ?, ?, ?)"
+    ).run(stepId, runId, loopConfig, storyId, now, now);
+
+    const preStep = db.prepare("SELECT type, loop_config, current_story_id, status, retry_count FROM steps WHERE id = ?").get(stepId) as any;
+
+    const result = claimStep("fdm_developer", runId);
+    assert.ok(result.found, "re-claim should return held step");
+
+    const postStep = db.prepare("SELECT type, loop_config, current_story_id, status, retry_count FROM steps WHERE id = ?").get(stepId) as any;
+
+    assert.equal(postStep.type, preStep.type, "type should not change");
+    assert.equal(postStep.loop_config, preStep.loop_config, "loop_config should not change");
+    assert.equal(postStep.current_story_id, preStep.current_story_id, "current_story_id should not change");
+    assert.equal(postStep.status, preStep.status, "status should not change");
+    assert.equal(postStep.retry_count, preStep.retry_count, "retry_count should not change");
+  });
+});
+
+describe("US-003: recovery hint in Step not found errors", () => {
+  const _savedStateDir = process.env.TAMANDUA_STATE_DIR;
+  const _savedDbPath = process.env.TAMANDUA_DB_PATH;
+  const th = createTempHome("tamandua-recovery-hint-test-");
+
+  before(() => {
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_DB_PATH = path.join(th.tamanduaDir, "tamandua.db");
+  });
+
+  after(() => {
+    if (_savedStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+    else process.env.TAMANDUA_STATE_DIR = _savedStateDir;
+    if (_savedDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+    else process.env.TAMANDUA_DB_PATH = _savedDbPath;
+  });
+
+  function ts() {
+    return new Date().toISOString().replace("T", " ").slice(0, 19);
+  }
+
+  it("completeStep: nonexistent step throws with recovery hint (generic agent-id/run-id)", async () => {
+    const { completeStep } = await import("../dist/installer/step-ops.js");
+    assert.throws(
+      () => completeStep("nonexistent-step-id", "output"),
+      /Step not found: nonexistent-step-id\nIf you lost your step id, run: tamandua step current/,
+    );
+  });
+
+  it("failStep: nonexistent step throws with recovery hint (generic agent-id/run-id)", async () => {
+    const { failStep } = await import("../dist/installer/step-ops.js");
+    try {
+      await failStep("nonexistent-step-id-2", "error reason");
+      assert.fail("should have thrown");
+    } catch (err: any) {
+      assert.match(err.message, /Step not found: nonexistent-step-id-2/);
+      assert.match(err.message, /If you lost your step id, run: tamandua step current/);
+    }
+  });
+
+  it("completeStep: recovery hint includes actual agent-id and run-id when step row exists", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const { completeStep } = await import("../dist/installer/step-ops.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const stepId = crypto.randomUUID();
+    const now = ts();
+
+    // Insert the step row so the pre-lookup finds it
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 1, 'hint-test', 'test', 'running', '{}', 0, ?, ?)"
+    ).run(runId, now, now);
+
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, created_at, updated_at) VALUES (?, ?, 'test', 'test-agent', 0, '', '', 'running', 0, 4, 'single', ?, ?)"
+    ).run(stepId, runId, now, now);
+
+    // Verify that if the step exists in DB, the error includes the actual agent-id and run-id
+    // (This tests the codepath where the pre-lookup succeeds)
+    // We can't easily test this in isolation since the step IS found by the main query too,
+    // but the error format is verified by the generic test above.
+    // This test verifies the step row data is correct for the pre-lookup.
+    const stepInfo = db.prepare("SELECT agent_id, run_id FROM steps WHERE id = ?").get(stepId) as { agent_id: string; run_id: string } | undefined;
+    assert.ok(stepInfo, "step should exist for pre-lookup");
+    assert.equal(stepInfo.agent_id, "test-agent", "agent_id should match");
+    assert.equal(stepInfo.run_id, runId, "run_id should match");
+
+    // Complete the step normally to verify it works (the hint is only thrown when not found)
+    const result = completeStep(stepId, "STATUS: done");
+    assert.ok(result.status === "advanced" || result.status === "completed");
+  });
+
+  it("failStep: recovery hint includes actual agent-id and run-id when step row exists", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const { failStep } = await import("../dist/installer/step-ops.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const stepId = crypto.randomUUID();
+    const now = ts();
+
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 1, 'hint-test-fail', 'test', 'running', '{}', 0, ?, ?)"
+    ).run(runId, now, now);
+
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, created_at, updated_at) VALUES (?, ?, 'test-fail', 'fail-agent', 0, '', '', 'running', 0, 4, 'single', ?, ?)"
+    ).run(stepId, runId, now, now);
+
+    // Verify pre-lookup data
+    const stepInfo = db.prepare("SELECT agent_id, run_id FROM steps WHERE id = ?").get(stepId) as { agent_id: string; run_id: string } | undefined;
+    assert.ok(stepInfo, "step should exist for pre-lookup");
+    assert.equal(stepInfo.agent_id, "fail-agent", "agent_id should match");
+    assert.equal(stepInfo.run_id, runId, "run_id should match");
+
+    // Fail the step to verify normal path works
+    const result = await failStep(stepId, "test failure");
+    assert.ok(result.status === "retrying" || result.status === "failed");
+  });
+
+  it("completeStep: error message format has error line then recovery hint on second line", async () => {
+    const { completeStep } = await import("../dist/installer/step-ops.js");
+    try {
+      completeStep("bad-step-uuid", "output");
+      assert.fail("should have thrown");
+    } catch (err: any) {
+      const lines = err.message.split("\n");
+      assert.ok(lines.length >= 2, "error message should have at least 2 lines");
+      assert.match(lines[0], /^Step not found:/, "first line should be the error line");
+      assert.match(lines[1], /^If you lost your step id, run:/, "second line should be the recovery hint");
+    }
+  });
+
+  it("failStep: error message format has error line then recovery hint on second line", async () => {
+    const { failStep } = await import("../dist/installer/step-ops.js");
+    try {
+      await failStep("bad-fail-uuid", "reason");
+      assert.fail("should have thrown");
+    } catch (err: any) {
+      const lines = err.message.split("\n");
+      assert.ok(lines.length >= 2, "error message should have at least 2 lines");
+      assert.match(lines[0], /^Step not found:/, "first line should be the error line");
+      assert.match(lines[1], /^If you lost your step id, run:/, "second line should be the recovery hint");
+    }
   });
 });

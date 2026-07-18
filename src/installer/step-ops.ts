@@ -1970,6 +1970,75 @@ function wrapTestCmdInContext(
 }
 
 /**
+ * Query the currently held (claimed/running) step for an agent in a run.
+ * Pure read-only query — no state mutation. Returns the step's claim JSON
+ * ({ stepId, runId, input }) or null when the agent holds no in-flight step.
+ */
+export function stepCurrent(agentId: string, runId: string): { stepId: string; runId: string; input: string } | null {
+  const db = getDb();
+
+  // Look for a step that is 'running' (claimed by this agent). The agent can
+  // only hold one in-flight step at a time per (agent_id, run_id).
+  const step = db.prepare(
+    `SELECT s.id, s.run_id, s.input_template, s.step_index, s.type, s.loop_config, s.current_story_id
+     FROM steps s
+     JOIN runs r ON r.id = s.run_id
+     WHERE s.agent_id = ? AND s.run_id = ? AND s.status = 'running'
+       AND r.status = 'running'
+     LIMIT 1`,
+  ).get(agentId, runId) as {
+    id: string;
+    run_id: string;
+    input_template: string;
+    step_index: number;
+    type: string;
+    loop_config: string | null;
+    current_story_id: string | null;
+  } | undefined;
+
+  if (!step) return null;
+
+  // Resolve the input template against the current run context.
+  // For loop steps with a current story, include story context.
+  let story: Story | undefined;
+  if (step.type === "loop" && step.current_story_id) {
+    const storyRow = db.prepare(
+      "SELECT * FROM stories WHERE id = ?",
+    ).get(step.current_story_id) as any;
+    if (storyRow) {
+      story = {
+        id: storyRow.id,
+        runId: storyRow.run_id,
+        storyIndex: storyRow.story_index,
+        storyId: storyRow.story_id,
+        title: storyRow.title,
+        description: storyRow.description,
+        acceptanceCriteria: JSON.parse(storyRow.acceptance_criteria),
+        status: storyRow.status,
+        output: storyRow.output ?? undefined,
+        retryCount: storyRow.retry_count,
+        maxRetries: storyRow.max_retries,
+      };
+    }
+  }
+
+  const loopConfig: LoopConfig | undefined = step.loop_config ? JSON.parse(step.loop_config) : undefined;
+  const context = resolveStepContext(step.run_id, step.step_index, loopConfig, story);
+
+  if (!context["verify_feedback"]) context["verify_feedback"] = "";
+  if (!context["timeout_retry"]) context["timeout_retry"] = "";
+
+  // Wrap test_cmd with tamandua-test shim (R18-R19)
+  if (context["repo"]) {
+    wrapTestCmdInContext(context, context["repo"], step.run_id, step.id);
+  }
+
+  const resolvedInput = resolveTemplate(step.input_template, context);
+
+  return { stepId: step.id, runId: step.run_id, input: resolvedInput };
+}
+
+/**
  * Find and claim a pending step for an agent, returning the resolved input.
  */
 export function claimStep(agentId: string, runId: string, workerOwnership?: WorkerOwnership): ClaimResult {
@@ -1979,6 +2048,21 @@ export function claimStep(agentId: string, runId: string, workerOwnership?: Work
     cleanupAbandonedSteps();
     lastCleanupTime = now;
   }
+
+  // SCUR-1: Idempotent re-claim — if the calling agent already holds an
+  // in-flight step in this run, re-return it instead of NO_WORK.
+  // stepCurrent is a pure read-only query; it does not reset progress,
+  // bump retry counts, or change claim timestamps.
+  const heldStep = stepCurrent(agentId, runId);
+  if (heldStep) {
+    return {
+      found: true,
+      stepId: heldStep.stepId,
+      runId: heldStep.runId,
+      resolvedInput: heldStep.input,
+    };
+  }
+
   const db = getDb();
 
   // Notes on the prev-step filter:
@@ -2467,7 +2551,14 @@ function completeStepInternal(stepId: string, output: string): { status: string;
     claim_updated_at: string | null; updated_at: string;
   } | undefined;
 
-  if (!step) throw new Error(`Step not found: ${stepId}`);
+  if (!step) {
+    // Try to recover agent_id and run_id for the error hint
+    const stepInfo = db.prepare("SELECT agent_id, run_id FROM steps WHERE id = ?").get(stepId) as { agent_id: string; run_id: string } | undefined;
+    const hint = stepInfo
+      ? `\nIf you lost your step id, run: tamandua step current ${stepInfo.agent_id} --run-id ${stepInfo.run_id}`
+      : `\nIf you lost your step id, run: tamandua step current <agent-id> --run-id <run-id>`;
+    throw new Error(`Step not found: ${stepId}${hint}`);
+  }
 
   // Guard: don't process completions for failed runs
   const runId = step.run_id;
@@ -3258,7 +3349,14 @@ async function failStepInternal(stepId: string, error: string): Promise<{ status
     current_story_id: string | null;
   } | undefined;
 
-  if (!step) throw new Error(`Step not found: ${stepId}`);
+  if (!step) {
+    // Try to recover agent_id and run_id for the error hint
+    const stepInfo = db.prepare("SELECT agent_id, run_id FROM steps WHERE id = ?").get(stepId) as { agent_id: string; run_id: string } | undefined;
+    const hint = stepInfo
+      ? `\nIf you lost your step id, run: tamandua step current ${stepInfo.agent_id} --run-id ${stepInfo.run_id}`
+      : `\nIf you lost your step id, run: tamandua step current <agent-id> --run-id <run-id>`;
+    throw new Error(`Step not found: ${stepId}${hint}`);
+  }
 
   // Loop step failure — per-story retry
   if (step.type === "loop" && step.current_story_id) {

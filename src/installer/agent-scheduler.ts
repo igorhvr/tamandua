@@ -705,8 +705,9 @@ export async function autoCompleteStepIfRunning(
   context: Record<string, unknown>,
   metadata: WorkRoundMetadata,
 ): Promise<void> {
-  if (!metadata.stepId) {
-    logger.warn("Auto-complete fallback skipped — no stepId in output", { ...context });
+  const jobId = typeof context.jobId === "string" ? context.jobId : null;
+  if (!jobId) {
+    logger.warn("Auto-complete fallback skipped — no jobId in context", { ...context });
     return;
   }
 
@@ -715,30 +716,39 @@ export async function autoCompleteStepIfRunning(
   const db = getDb();
 
   const row = db
-    .prepare("SELECT status, type, current_story_id, run_id FROM steps WHERE id = ?")
-    .get(metadata.stepId) as { status: string; type: string; current_story_id: string | null; run_id: string } | undefined;
+    .prepare("SELECT id, status, type, current_story_id, run_id FROM steps WHERE claim_job_id = ? AND status IN ('claimed', 'running')")
+    .get(jobId) as { id: string; status: string; type: string; current_story_id: string | null; run_id: string } | undefined;
 
   if (!row) {
-    logger.warn("Auto-complete fallback skipped — step not found", {
+    logger.debug("Auto-complete fallback skipped — no step claimed by this job", {
       ...context,
-      stepId: metadata.stepId,
+      jobId,
     });
     return;
   }
 
+  const stepId = row.id;
+
+  logger.info("Auto-complete via claim_job_id for step", {
+    ...context,
+    stepId,
+    stepStatus: row.status,
+    stepType: row.type,
+  });
+
   if (row.type === "loop" && row.current_story_id === null) {
     logger.debug("Auto-complete fallback skipped — loop step mid-iteration (agent already advanced via CLI)", {
       ...context,
-      stepId: metadata.stepId,
+      stepId,
       stepStatus: row.status,
     });
     return;
   }
 
-  if (row.status !== "running") {
-    logger.debug("Auto-complete fallback skipped — step not running (agent likely reported via CLI)", {
+  if (row.status !== "running" && row.status !== "claimed") {
+    logger.debug("Auto-complete fallback skipped — step not running or claimed (agent likely reported via CLI)", {
       ...context,
-      stepId: metadata.stepId,
+      stepId,
       stepStatus: row.status,
     });
     return;
@@ -750,18 +760,18 @@ export async function autoCompleteStepIfRunning(
       : row.run_id;
 
   try {
-    const result = completeStep(metadata.stepId, metadata.assistantOutput);
-    logger.info("Auto-complete fallback invoked completeStep on work_done output", {
+    const result = completeStep(stepId, metadata.assistantOutput);
+    logger.info("Auto-complete via claim_job_id completed step", {
       ...context,
-      stepId: metadata.stepId,
+      stepId,
       result: result.status,
       outputBytes: Buffer.byteLength(metadata.assistantOutput, "utf-8"),
     });
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
-    logger.error("Auto-complete fallback completeStep threw", {
+    logger.error("Auto-complete via claim_job_id completeStep threw", {
       ...context,
-      stepId: metadata.stepId,
+      stepId,
       error: errorMessage,
     });
 
@@ -788,7 +798,7 @@ export async function autoCompleteStepIfRunning(
       if (recoveryResult.recovered > 0 || recoveryResult.failed > 0) {
         logger.info("Orphaned step recovery after auto-complete throw", {
           ...context,
-          stepId: metadata.stepId,
+          stepId,
           recovered: recoveryResult.recovered,
           failed: recoveryResult.failed,
           skipped: recoveryResult.skipped,
@@ -798,7 +808,7 @@ export async function autoCompleteStepIfRunning(
     } catch (recoveryErr) {
       logger.error("Orphaned step recovery after auto-complete throw failed", {
         ...context,
-        stepId: metadata.stepId,
+        stepId,
         error: recoveryErr instanceof Error ? recoveryErr.message : String(recoveryErr),
       });
     }

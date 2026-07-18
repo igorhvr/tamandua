@@ -93,8 +93,11 @@ describe("dispatch races (motor contract C5)", () => {
     const first = claimStep(fx.agentA, fx.runId);
     assert.ok(first.found && first.stepId, "first claim should win the pending step");
 
+    // SCUR-1: Idempotent re-claim — the agent already holds step1;
+    // the second claim re-returns the held step (same stepId), not NO_WORK.
     const second = claimStep(fx.agentA, fx.runId);
-    assert.equal(second.found, false, "second claim must not hand out the running step again");
+    assert.equal(second.found, true, "second claim should re-return the held step");
+    assert.equal(second.stepId, first.stepId, "second claim should return same stepId");
     assert.equal(stepStatus(fx.step1DbId), "running");
     assert.equal(peekStep(fx.agentA, fx.runId), "NO_WORK", "peek must not advertise a running step");
   });

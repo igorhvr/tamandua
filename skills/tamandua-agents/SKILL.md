@@ -675,11 +675,22 @@ follow the claim lifecycle:
 3. Check for `NO_WORK` before parsing the claim output as JSON. A claim can
    legally return `NO_WORK` even after `HAS_WORK` because another worker won
    the race or the loop completed. If it does, stop without doing step work.
+   Claim is idempotent: if you already hold a step in this run, re-claiming
+   returns your held step instead of `NO_WORK`.
 4. Otherwise parse claim JSON: `{"stepId":"...","runId":"...","input":"..."}`.
 5. **SAVE `stepId` immediately** and execute the `input` task.
 6. Report with the saved step id:
    - Success: `tamandua step complete <stepId>` (send status output through stdin)
    - Failure: `tamandua step fail <stepId> "<reason>"`
+
+If you lose your step id mid-session, do not abandon finished work:
+- Run `tamandua step current <agent-id> --run-id <run-id>` to recover your
+  held step's JSON (prints `NONE` if no step is held).
+- Or re-run `tamandua step claim <agent-id> --run-id <run-id>` — the claim is
+  idempotent: if you hold a step, it re-returns that step instead of `NO_WORK`.
+- `NO_WORK` does not mean your finished work should be abandoned. If
+  `step current` prints `NONE` and re-claim returns `NO_WORK`, your step was
+  already resolved; verify with `tamandua step stories <run-id>`.
 
 Use the run ID supplied by your scheduler prompt or workflow context. `step peek` and `step claim` require `--run-id` so agents serving concurrent runs cannot claim each other's work.
 

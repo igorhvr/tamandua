@@ -68,6 +68,7 @@ import {
 import {
   getStepClaimHelp,
   getStepCompleteHelp,
+  getStepCurrentHelp,
   getStepFailHelp,
   getStepPeekHelp,
   getStepStoriesHelp,
@@ -192,6 +193,7 @@ function getUsageText(): string {
     "", "tamandua restart [--force]            Restart all services with stop→ready barrier",
     "", "tamandua step peek <agent-id> --run-id <run-id>     Check for pending work (HAS_WORK or NO_WORK)",
     "tamandua step claim <agent-id> --run-id <run-id>    Claim pending step (JSON output)",
+    "tamandua step current <agent-id> --run-id <run-id>  Read-only query for held step (JSON or NONE)",
     "tamandua step complete <step-id>      Complete step (reads output from stdin)",
     "tamandua step fail <step-id> <error>  Fail step with retry logic",
     "tamandua step stories <run-id>        List stories for a run",
@@ -276,6 +278,7 @@ async function main() {
       if (action === "peek") { printHelp(getStepPeekHelp()); }
       if (action === "claim") { printHelp(getStepClaimHelp()); }
       if (action === "complete") { printHelp(getStepCompleteHelp()); }
+      if (action === "current") { printHelp(getStepCurrentHelp()); }
       if (action === "fail") { printHelp(getStepFailHelp()); }
       if (action === "stories") { printHelp(getStepStoriesHelp()); }
     }
