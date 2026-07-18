@@ -1994,6 +1994,94 @@ describe("suite control-plane endpoints", { concurrency: 1 }, () => {
     assert.equal(claimR3.body.action, "run");
   });
 
+  it("POST /suite/release is exact-key, idempotent, owner-safe, and never deletes rows", async () => {
+    const key = {
+      origin_repo: "/test/release",
+      tree_hash: "release-tree",
+      cmd_hash: "release-cmd",
+      owner_token: "release-owner",
+    };
+    assert.equal((await suiteRequest("POST", "/suite/claim", key)).body.action, "run");
+    const unrelated = { ...key, cmd_hash: "unrelated-cmd", owner_token: "unrelated-owner" };
+    assert.equal((await suiteRequest("POST", "/suite/claim", unrelated)).body.action, "run");
+    // Initialize the isolated suite ledger without changing either claim.
+    await suiteRequest(
+      "GET",
+      `/suite/lookup?origin_repo=${encodeURIComponent(key.origin_repo)}&tree_hash=none&cmd_hash=none`,
+    );
+    insertSuiteRow({
+      originRepo: key.origin_repo, treeHash: key.tree_hash, cmdHash: key.cmd_hash,
+      cmdDisplay: "npm test", exitCode: 0, durationMs: 1,
+    });
+
+    assert.equal((await suiteRequest("POST", "/suite/release", {
+      ...key, owner_token: "wrong",
+    })).status, 409);
+    assert.equal((await suiteRequest("POST", "/suite/claim", key)).body.action, "wait");
+    const released = await suiteRequest("POST", "/suite/release", key);
+    assert.equal(released.status, 200);
+    assert.equal(released.body.released, true);
+    assert.equal((await suiteRequest("POST", "/suite/claim", key)).body.action, "run");
+    assert.equal((await suiteRequest("POST", "/suite/claim", unrelated)).body.action, "wait");
+
+    const db = new DatabaseSync(dbPath);
+    const row = db.prepare(
+      "SELECT COUNT(*) AS cnt FROM suite_results WHERE origin_repo = ? AND tree_hash = ? AND cmd_hash = ?",
+    ).get(key.origin_repo, key.tree_hash, key.cmd_hash) as { cnt: number };
+    db.close();
+    assert.equal(row.cnt, 1, "release must never alter suite_results");
+  });
+
+  it("POST /suite/release validates bounded exact-key fields", async () => {
+    const unauth = await fetch(`http://127.0.0.1:${controlPort}/suite/release`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ origin_repo: "/x", tree_hash: "tree", cmd_hash: "cmd" }),
+    });
+    assert.equal(unauth.status, 401);
+    assert.equal((await suiteRequest("POST", "/suite/release", {})).status, 400);
+    const valid = {
+      origin_repo: "x".repeat(2048),
+      tree_hash: "t".repeat(128),
+      cmd_hash: "c".repeat(128),
+      owner_token: "o".repeat(128),
+    };
+    assert.equal((await suiteRequest("POST", "/suite/claim", valid)).status, 200);
+    assert.equal((await suiteRequest("POST", "/suite/release", valid)).status, 200);
+
+    for (const oversized of [
+      { ...valid, origin_repo: "x".repeat(2049) },
+      { ...valid, tree_hash: "t".repeat(129) },
+      { ...valid, cmd_hash: "c".repeat(129) },
+      { ...valid, owner_token: "o".repeat(129) },
+    ]) {
+      assert.equal((await suiteRequest("POST", "/suite/claim", oversized)).status, 400);
+      assert.equal((await suiteRequest("POST", "/suite/release", oversized)).status, 400);
+    }
+
+    const legacy = { origin_repo: "/legacy", tree_hash: "tree", cmd_hash: "cmd" };
+    assert.equal((await suiteRequest("POST", "/suite/claim", legacy)).body.action, "run");
+    assert.equal((await suiteRequest("POST", "/suite/release", legacy)).body.released, true);
+  });
+
+  it("keeps colon-containing suite tuples collision-free during release", async () => {
+    const first = {
+      origin_repo: "a:b", tree_hash: "c", cmd_hash: "d", owner_token: "first-owner",
+    };
+    const second = {
+      origin_repo: "a", tree_hash: "b", cmd_hash: "c:d", owner_token: "second-owner",
+    };
+
+    assert.equal((await suiteRequest("POST", "/suite/claim", first)).body.action, "run");
+    assert.equal((await suiteRequest("POST", "/suite/claim", second)).body.action, "run");
+    assert.equal((await suiteRequest("POST", "/suite/release", first)).body.released, true);
+    assert.equal(
+      (await suiteRequest("POST", "/suite/claim", second)).body.action,
+      "wait",
+      "releasing the first tuple must not release the second tuple",
+    );
+  });
+
   it("POST /suite/record is append-only (two records for same key)", async () => {
     const repo = "/test/append";
     const treeHash = "append-hash";

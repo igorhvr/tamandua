@@ -6,7 +6,7 @@
  */
 import { describe, it, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { writeFileSync, mkdirSync, chmodSync, readFileSync } from "node:fs";
+import { writeFileSync, mkdirSync, chmodSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { execSync, spawn, type ChildProcess } from "node:child_process";
 import crypto from "node:crypto";
@@ -70,6 +70,12 @@ async function runShim(
   });
 }
 
+async function waitUntil(predicate: () => boolean): Promise<void> {
+  while (!predicate()) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
 /** Create a fixture git repo with a test script and return its path. */
 function createFixtureRepo(
   baseDir: string,
@@ -102,8 +108,9 @@ function createFixtureRepo(
   chmodSync(failScript, 0o755);
 
   // Counter script: increments a counter file, used for side-channel
-  // verification that a command actually executed.
-  const counterFile = join(repoDir, ".counter");
+  // verification that a command actually executed. Keep it outside the
+  // content-addressed repository tree so the counter is not tree drift.
+  const counterFile = join(baseDir, `${repoName}.counter`);
   writeFileSync(counterFile, "0");
   const counterScript = join(repoDir, "test-counter.sh");
   writeFileSync(
@@ -204,7 +211,7 @@ describe("tamandua-test shim", { concurrency: 1 }, () => {
     passScript = fixture.passScript;
     failScript = fixture.failScript;
     counterScript = fixture.counterScript;
-    counterFile = join(repoDir, ".counter");
+    counterFile = join(tempBase, "myproject.counter");
 
     controlEnv = await setupControlEnv(shimTh);
   });
@@ -607,6 +614,206 @@ describe("tamandua-test shim", { concurrency: 1 }, () => {
     );
     assert.equal(r.exitCode, 1, "should propagate exit code 1");
     assert.ok(r.stderr.includes("FAIL: something broke"), "should see failure output");
+  });
+
+  async function runTreeMutationCase(
+    name: string,
+    scriptBody: string,
+    expectedExitCode: number,
+  ): Promise<{ result: ShimResult; rowCount: number; event: Record<string, unknown>; claimAction: unknown }> {
+    const fixture = createFixtureRepo(tempBase, `drift-${name}`);
+    const script = join(fixture.repoDir, `mutate-${name}.sh`);
+    writeFileSync(script, `#!/bin/sh\n${scriptBody}\n`);
+    chmodSync(script, 0o755);
+
+    const { computeTreeHash, computeCmdHash, getOriginRepo } = await import(
+      "../../dist/suite/tree-hash.js"
+    );
+    const preTreeHash = computeTreeHash(fixture.repoDir);
+    assert.ok(preTreeHash, "fixture should have a pre-run tree hash");
+    const cmdHash = computeCmdHash(script);
+    const originRepo = getOriginRepo(fixture.repoDir);
+    const runId = `r-tree-drift-${name}`;
+
+    const result = await runShim(
+      ["--repo", fixture.repoDir, "--run", runId, "--step", "s-drift", "--", script],
+      shimChildEnv(controlEnv),
+    );
+    assert.equal(result.exitCode, expectedExitCode);
+
+    const db = new DatabaseSync(controlEnv.dbPath);
+    const row = db.prepare("SELECT COUNT(*) AS cnt FROM suite_results WHERE run_id = ?")
+      .get(runId) as { cnt: number };
+    db.close();
+
+    const eventsPath = join(controlEnv.stateDir, "events", `${runId}.jsonl`);
+    const events = readFileSync(eventsPath, "utf-8").trim().split("\n").map((line) => JSON.parse(line));
+    const event = events.find((candidate: Record<string, unknown>) =>
+      candidate.event === "suite.tree_drift_detected"
+    );
+    assert.ok(event, "tree drift should emit a suite.tree_drift_detected event");
+
+    const thirdClaim = await controlPlanePost("/suite/claim", {
+      origin_repo: originRepo,
+      tree_hash: preTreeHash,
+      cmd_hash: cmdHash,
+      owner_token: `third-${name}`,
+    });
+
+    return {
+      result,
+      rowCount: row.cnt,
+      event,
+      claimAction: (thirdClaim.body as Record<string, unknown>).action,
+    };
+  }
+
+  it("rejects tracked-file modification during a successful suite and releases the claim", async () => {
+    const { result, rowCount, event, claimAction } = await runTreeMutationCase(
+      "tracked-edit",
+      `printf 'changed\\n' > "${join(tempBase, "drift-tracked-edit", "README.md")}"\nexit 0`,
+      86,
+    );
+    assert.equal(rowCount, 0, "drift must not create a suite result");
+    assert.match(result.stderr, /tree changed during test execution.*stable-tree rerun required/i);
+    assert.equal(String(event.preTreeHash).length, 12);
+    assert.equal(String(event.postTreeHash).length, 12);
+    assert.equal(event.exitCode, 0);
+    assert.equal(claimAction, "run", "released key should be immediately reclaimable");
+  });
+
+  it("rejects untracked-not-ignored creation during a successful suite", async () => {
+    const { rowCount, claimAction } = await runTreeMutationCase(
+      "untracked",
+      `printf 'new\\n' > "${join(tempBase, "drift-untracked", "new-file.txt")}"\nexit 0`,
+      86,
+    );
+    assert.equal(rowCount, 0);
+    assert.equal(claimAction, "run");
+  });
+
+  it("rejects tracked-file deletion during a successful suite", async () => {
+    const { rowCount, claimAction } = await runTreeMutationCase(
+      "tracked-delete",
+      `rm "${join(tempBase, "drift-tracked-delete", "README.md")}"\nexit 0`,
+      86,
+    );
+    assert.equal(rowCount, 0);
+    assert.equal(claimAction, "run");
+  });
+
+  it("rejects an unavailable post-run tree hash and releases the claim", async () => {
+    const { result, rowCount, event, claimAction } = await runTreeMutationCase(
+      "hash-unavailable",
+      `rm -rf "${join(tempBase, "drift-hash-unavailable", ".git")}"\nexit 0`,
+      86,
+    );
+    assert.equal(rowCount, 0);
+    assert.equal(event.postTreeHash, "unavailable");
+    assert.match(result.stderr, /could not be attributed.*stable-tree rerun required/i);
+    assert.equal(claimAction, "run");
+  });
+
+  it("preserves the real nonzero exit code when the tree also drifts", async () => {
+    const { result, rowCount, event, claimAction } = await runTreeMutationCase(
+      "real-failure",
+      `printf 'changed\\n' > "${join(tempBase, "drift-real-failure", "README.md")}"\nexit 7`,
+      7,
+    );
+    assert.equal(rowCount, 0);
+    assert.equal(event.exitCode, 7);
+    assert.equal(result.exitCode, 7);
+    assert.equal(claimAction, "run");
+  });
+
+  it("records normally when only ignored files change during the suite", async () => {
+    const fixture = createFixtureRepo(tempBase, "drift-ignored-only");
+    const script = join(fixture.repoDir, "ignored-only.sh");
+    writeFileSync(script, `#!/bin/sh\nprintf 'ignored\\n' > "${join(fixture.repoDir, "suite.log")}"\nexit 0\n`);
+    chmodSync(script, 0o755);
+    const runId = "r-tree-drift-ignored-only";
+    const result = await runShim(
+      ["--repo", fixture.repoDir, "--run", runId, "--step", "s-drift", "--", script],
+      shimChildEnv(controlEnv),
+    );
+    assert.equal(result.exitCode, 0);
+    const db = new DatabaseSync(controlEnv.dbPath);
+    const row = db.prepare("SELECT COUNT(*) AS cnt FROM suite_results WHERE run_id = ?")
+      .get(runId) as { cnt: number };
+    db.close();
+    assert.equal(row.cnt, 1, "ignored-only changes should retain normal recording");
+  });
+
+  it("promotes a waiter after owner drift instead of replaying the unrecorded result", { timeout: 3_600_000 }, async () => {
+    const fixture = createFixtureRepo(tempBase, "drift-waiter");
+    const attemptsFile = join(tempBase, "drift-waiter-attempts");
+    const ownerStartedFile = join(tempBase, "drift-waiter-owner-started");
+    const releaseOwnerFile = join(tempBase, "drift-waiter-release-owner");
+    writeFileSync(attemptsFile, "0");
+    const script = join(fixture.repoDir, "waiter-drift.sh");
+    writeFileSync(script, `#!/bin/sh
+n=$(cat "${attemptsFile}")
+n=$((n + 1))
+printf '%s' "$n" > "${attemptsFile}"
+if [ "$n" -eq 1 ]; then
+  : > "${ownerStartedFile}"
+  while [ ! -f "${releaseOwnerFile}" ]; do sleep 0.05; done
+  printf 'owner changed tree\\n' > "${join(fixture.repoDir, "README.md")}"
+fi
+exit 0
+`);
+    chmodSync(script, 0o755);
+
+    const owner = runShim(
+      ["--repo", fixture.repoDir, "--run", "r-drift-owner", "--step", "s-owner", "--", script],
+      shimChildEnv(controlEnv),
+    );
+    await waitUntil(() => existsSync(ownerStartedFile));
+    assert.equal(readFileSync(attemptsFile, "utf-8"), "1", "owner must claim and execute first");
+
+    const waiterStartedAt = Date.now();
+    const waiter = runShim(
+      ["--repo", fixture.repoDir, "--run", "r-drift-waiter", "--step", "s-waiter", "--", script],
+      shimChildEnv(controlEnv),
+    );
+    const waiterEventsPath = join(controlEnv.stateDir, "events", "r-drift-waiter.jsonl");
+    await waitUntil(() =>
+      existsSync(waiterEventsPath)
+      && readFileSync(waiterEventsPath, "utf-8").includes("suite.singleflight_wait")
+    );
+    assert.equal(readFileSync(attemptsFile, "utf-8"), "1", "waiter must not execute while owner holds the key");
+    writeFileSync(releaseOwnerFile, "release");
+
+    const [ownerResult, waiterResult] = await Promise.all([owner, waiter]);
+    const waiterElapsedMs = Date.now() - waiterStartedAt;
+    assert.equal(ownerResult.exitCode, 86);
+    assert.equal(waiterResult.exitCode, 0, "waiter should take over and run against the new stable tree");
+    assert.ok(waiterElapsedMs < 30_000, `waiter takeover took ${waiterElapsedMs}ms`);
+    assert.doesNotMatch(waiterResult.stdout, /TAMANDUA-TEST CACHED/);
+    assert.equal(readFileSync(attemptsFile, "utf-8"), "2", "waiter should execute exactly once");
+
+    const db = new DatabaseSync(controlEnv.dbPath);
+    const rows = db.prepare(
+      "SELECT run_id, exit_code FROM suite_results WHERE run_id IN (?, ?) ORDER BY run_id",
+    ).all("r-drift-owner", "r-drift-waiter") as Array<{ run_id: string; exit_code: number }>;
+    db.close();
+    assert.deepEqual(
+      rows.map((row) => ({ run_id: row.run_id, exit_code: row.exit_code })),
+      [{ run_id: "r-drift-waiter", exit_code: 0 }],
+    );
+
+    const { computeTreeHash, computeCmdHash, getOriginRepo } = await import(
+      "../../dist/suite/tree-hash.js"
+    );
+    const stableTreeHash = computeTreeHash(fixture.repoDir);
+    assert.ok(stableTreeHash);
+    const thirdClaim = await controlPlanePost("/suite/claim", {
+      origin_repo: getOriginRepo(fixture.repoDir),
+      tree_hash: stableTreeHash,
+      cmd_hash: computeCmdHash(script),
+      owner_token: "third-after-waiter",
+    });
+    assert.equal((thirdClaim.body as Record<string, unknown>).action, "run");
   });
 
   // ════════════════════════════════════════════════════════════════════

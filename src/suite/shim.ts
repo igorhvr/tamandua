@@ -12,6 +12,7 @@
 
 import { spawn, type ChildProcess } from "node:child_process";
 import { realpathSync, existsSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import {
   TTL_GREEN_MS,
   RED_CONTEXT_WINDOW_MS,
@@ -21,6 +22,8 @@ import {
 } from "./config.js";
 
 const SINGLEFLIGHT_POLL_INTERVAL_MS = 1000; // 1s
+/** Dedicated fail-closed exit when a passing command cannot be attributed. */
+const TREE_DRIFT_EXIT_CODE = 86;
 
 // Module-level variables so the catch handler at the bottom can reach the
 // parsed command even when main() throws after parsing (SHCA fix).
@@ -96,6 +99,9 @@ Environment:
 A content-addressed test-suite ledger that skips re-execution of test
 commands against byte-identical working trees, replaying the recorded
 result instead. Strictly monotone: degrades to passthrough on any doubt.
+Results are recorded only when the repository tree stays unchanged through
+process exit. Tree drift requires a stable-tree rerun and makes an otherwise
+passing command exit ${TREE_DRIFT_EXIT_CODE}.
 `);
 }
 
@@ -273,6 +279,7 @@ interface PollResult {
   action: "replay" | "execute";
   latest?: Record<string, unknown>;
   ageMs?: number;
+  ownsClaim?: boolean;
 }
 
 /**
@@ -285,11 +292,12 @@ async function pollForResult(
   originRepo: string,
   treeHash: string,
   cmdHash: string,
+  ownerToken: string,
 ): Promise<PollResult> {
   const startTime = Date.now();
   // Dynamic import inside poll — by the time we reach here, the module
   // is already loaded via the earlier lookup import.
-  const { lookupSuiteRecord } = await import("../server/control-client.js");
+  const { lookupSuiteRecord, claimSuiteKey } = await import("../server/control-client.js");
 
   while (Date.now() - startTime < CLAIM_TIMEOUT_MS) {
     await sleep(SINGLEFLIGHT_POLL_INTERVAL_MS);
@@ -300,7 +308,7 @@ async function pollForResult(
       process.stderr.write(
         "tamandua-test: warning: control plane unreachable during single-flight poll — executing\n",
       );
-      return { action: "execute" };
+      return { action: "execute", ownsClaim: false };
     }
 
     const latest = lookup.latest as Record<string, unknown> | null;
@@ -311,8 +319,19 @@ async function pollForResult(
         const ageMs = Date.now() - new Date(createdAt).getTime();
         return { action: "replay", latest, ageMs };
       }
-      // Red result recorded → do not replay; execute ourselves.
-      return { action: "execute" };
+      // Red results are never replayed. Its recorder has released the key,
+      // so continue below and claim before executing.
+    }
+
+    const claim = await claimSuiteKey(originRepo, treeHash, cmdHash, ownerToken);
+    if (claim === null) {
+      process.stderr.write(
+        "tamandua-test: warning: control plane unreachable during single-flight claim — executing\n",
+      );
+      return { action: "execute", ownsClaim: false };
+    }
+    if (claim.action === "run") {
+      return { action: "execute", ownsClaim: true };
     }
   }
 
@@ -320,7 +339,7 @@ async function pollForResult(
   process.stderr.write(
     "tamandua-test: single-flight claim poll timed out — executing\n",
   );
-  return { action: "execute" };
+  return { action: "execute", ownsClaim: false };
 }
 
 // ── Main ──────────────────────────────────────────────────────────────
@@ -373,8 +392,8 @@ async function main(): Promise<void> {
   const { computeTreeHash, computeCmdHash, getOriginRepo } = await import("./tree-hash.js");
 
   // R3: Tree hash failure → passthrough.
-  const treeHash = computeTreeHash(repoReal);
-  if (treeHash === null) {
+  let preTreeHash = computeTreeHash(repoReal);
+  if (preTreeHash === null) {
     passthroughNotice("git tree hash failed (non-git directory or git error)");
     passthroughExec(cmdString);
     return;
@@ -382,11 +401,18 @@ async function main(): Promise<void> {
 
   const cmdHash = computeCmdHash(cmdString);
   const originRepo = getOriginRepo(repoReal);
+  const ownerToken = randomUUID();
 
-  const { lookupSuiteRecord, recordSuiteResult, claimSuiteKey, emitSuiteEvent } = await import("../server/control-client.js");
+  const {
+    lookupSuiteRecord,
+    recordSuiteResult,
+    claimSuiteKey,
+    releaseSuiteKey,
+    emitSuiteEvent,
+  } = await import("../server/control-client.js");
 
   // R14: Control plane unreachable → passthrough.
-  const lookup = await lookupSuiteRecord(originRepo, treeHash, cmdHash);
+  const lookup = await lookupSuiteRecord(originRepo, preTreeHash, cmdHash);
   if (lookup === null) {
     passthroughNotice("control plane unreachable at lookup time");
     passthroughExec(cmdString);
@@ -401,7 +427,7 @@ async function main(): Promise<void> {
       event: "suite.flaky_detected",
       run_id: runId,
       step_id: stepId,
-      tree_hash: treeHash,
+      tree_hash: preTreeHash,
       cmd_hash: cmdHash,
       pass_count: lookup.passCount,
       fail_count: lookup.failCount,
@@ -424,7 +450,7 @@ async function main(): Promise<void> {
         event: "suite.cache_hit",
         run_id: runId,
         step_id: stepId,
-        tree_hash: treeHash.slice(0, 12),
+        tree_hash: preTreeHash.slice(0, 12),
         cmd_display: cmdString.slice(0, 200),
         saved_duration_ms: typeof latest.duration_ms === "number"
           ? latest.duration_ms
@@ -448,7 +474,8 @@ async function main(): Promise<void> {
 
   // R7: Miss, expired green, red, or --force → execute.
   // R16-R17: Before executing, claim the key for single-flight.
-  const claim = await claimSuiteKey(originRepo, treeHash, cmdHash);
+  const claim = await claimSuiteKey(originRepo, preTreeHash, cmdHash, ownerToken);
+  let ownsClaim = claim?.action === "run";
 
   if (claim && claim.action === "wait") {
     // US-009: Emit suite.singleflight_wait event (best-effort).
@@ -456,7 +483,7 @@ async function main(): Promise<void> {
       event: "suite.singleflight_wait",
       run_id: runId,
       step_id: stepId,
-      tree_hash: treeHash,
+      tree_hash: preTreeHash,
       cmd_hash: cmdHash,
       waited_ms: 0,
     }).catch(() => {
@@ -464,14 +491,14 @@ async function main(): Promise<void> {
     });
     // Another caller owns the claim — poll until a result is recorded or
     // CLAIM_TIMEOUT elapses.
-    const pollResult = await pollForResult(originRepo, treeHash, cmdHash);
+    const pollResult = await pollForResult(originRepo, preTreeHash, cmdHash, ownerToken);
     if (pollResult.action === "replay" && pollResult.latest) {
       // US-009: Emit suite.cache_hit event on poll-based replay (best-effort).
       await emitSuiteEvent({
         event: "suite.cache_hit",
         run_id: runId,
         step_id: stepId,
-        tree_hash: treeHash.slice(0, 12),
+        tree_hash: preTreeHash.slice(0, 12),
         cmd_display: cmdString.slice(0, 200),
         saved_duration_ms: typeof pollResult.latest.duration_ms === "number"
           ? pollResult.latest.duration_ms
@@ -487,13 +514,107 @@ async function main(): Promise<void> {
       // replay() calls process.exit(0) — never returns.
     }
     // Poll returned "execute" — fall through to execute below.
+    ownsClaim = pollResult.ownsClaim === true;
   }
   // If claim is null (control plane down after lookup) or action is "run",
   // proceed to execute below.
 
+  // A promoted waiter may have observed an old key while the prior owner
+  // changed the tree and released it. Re-key before execution so the retained
+  // pre-run hash describes the tree that this caller actually tests.
+  while (ownsClaim) {
+    const executionTreeHash = computeTreeHash(repoReal);
+    if (executionTreeHash === null || executionTreeHash === preTreeHash) break;
+
+    await releaseSuiteKey(originRepo, preTreeHash, cmdHash, ownerToken).catch(() => false);
+    preTreeHash = executionTreeHash;
+
+    const currentLookup = await lookupSuiteRecord(originRepo, preTreeHash, cmdHash);
+    const currentLatest = currentLookup?.latest as Record<string, unknown> | null | undefined;
+    if (currentLookup?.flaky) {
+      printFlakyBanner(currentLookup.passCount, currentLookup.failCount);
+      emitSuiteEvent({
+        event: "suite.flaky_detected",
+        run_id: runId,
+        step_id: stepId,
+        tree_hash: preTreeHash,
+        cmd_hash: cmdHash,
+        pass_count: currentLookup.passCount,
+        fail_count: currentLookup.failCount,
+        window: "24h",
+      }).catch(() => {
+        // Best-effort — preserve execution when event emission fails.
+      });
+    }
+    if (
+      currentLatest
+      && currentLatest.exit_code === 0
+      && !force
+      && Date.now() - new Date(String(currentLatest.created_at ?? "")).getTime() <= TTL_GREEN_MS
+    ) {
+      replay(
+        currentLatest,
+        cmdString.slice(0, 200) || cmdString,
+        Date.now() - new Date(String(currentLatest.created_at ?? "")).getTime(),
+      );
+    }
+    if (currentLatest && typeof currentLatest.exit_code === "number" && currentLatest.exit_code !== 0) {
+      const currentAgeMs = Date.now() - new Date(String(currentLatest.created_at ?? "")).getTime();
+      if (currentAgeMs <= RED_CONTEXT_WINDOW_MS) {
+        printRedContextNote(currentLatest, cmdString.slice(0, 200) || cmdString, currentAgeMs);
+      }
+    }
+
+    const currentClaim = await claimSuiteKey(originRepo, preTreeHash, cmdHash, ownerToken);
+    if (currentClaim === null) {
+      ownsClaim = false;
+      break;
+    }
+    if (currentClaim.action === "run") continue;
+
+    const currentPoll = await pollForResult(originRepo, preTreeHash, cmdHash, ownerToken);
+    if (currentPoll.action === "replay" && currentPoll.latest) {
+      replay(
+        currentPoll.latest,
+        cmdString.slice(0, 200) || cmdString,
+        currentPoll.ageMs ?? 0,
+      );
+    }
+    ownsClaim = currentPoll.ownsClaim === true;
+  }
+
   // R9: Execute the command verbatim, streaming stdout/stderr through,
   //     preserving the exit code.
   const { exitCode, durationMs, output } = await executeAndCapture(cmdString);
+
+  // Reusable evidence requires one byte-identical tree from command start
+  // through full process exit and output capture.
+  const postTreeHash = computeTreeHash(repoReal);
+  if (postTreeHash === null || postTreeHash !== preTreeHash) {
+    const shortPre = preTreeHash.slice(0, 12);
+    const shortPost = postTreeHash?.slice(0, 12) ?? "unavailable";
+    const release = ownsClaim
+      ? releaseSuiteKey(originRepo, preTreeHash, cmdHash, ownerToken).catch(() => false)
+      : Promise.resolve(false);
+    const event = emitSuiteEvent({
+      event: "suite.tree_drift_detected",
+      run_id: runId,
+      step_id: stepId,
+      pre_tree_hash: shortPre,
+      post_tree_hash: shortPost,
+      exit_code: exitCode,
+    }).catch(() => {
+      // Best-effort observability must not change drift handling.
+    });
+    await Promise.all([release, event]);
+    const reason = postTreeHash === null
+      ? `post-run tree hash unavailable (pre ${shortPre})`
+      : `tree changed during test execution (pre ${shortPre}, post ${shortPost})`;
+    process.stderr.write(
+      `tamandua-test: result could not be attributed: ${reason}; not recorded — stable-tree rerun required\n`,
+    );
+    process.exit(exitCode === 0 ? TREE_DRIFT_EXIT_CODE : exitCode);
+  }
 
   // R10: Record via control plane. R11: Recording failure MUST NOT affect
   //      exit code or output — log a warning line to stderr and continue.
@@ -504,7 +625,7 @@ async function main(): Promise<void> {
 
     await recordSuiteResult({
       origin_repo: originRepo,
-      tree_hash: treeHash,
+      tree_hash: preTreeHash,
       cmd_hash: cmdHash,
       cmd_display: cmdString.slice(0, 200),
       exit_code: exitCode,

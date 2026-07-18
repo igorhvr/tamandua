@@ -288,6 +288,12 @@ of re-running the suite.
   banner identifies the replay
 - On a cache miss or any doubt, the command runs normally — the shim passes
   through stdout/stderr and exit code unchanged
+- TSTX hashes the tree again after the command exits and records a result only
+  when the pre/post hashes match. If tracked or untracked-not-ignored content
+  changes (or the post-run hash is unavailable), the result is not cached and
+  a stable-tree rerun is required. A passing command fails closed with shim
+  exit code 86; an already-failing command keeps its original nonzero code.
+  The abandoned single-flight claim is released so a waiter can rerun promptly.
 
 **Safety:** TSTX is **strictly monotone** — it may only skip work that is
 provably redundant (a green result for the byte-identical tree and command).

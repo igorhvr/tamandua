@@ -206,6 +206,10 @@ export interface SuiteClaimResult {
   claimedAt?: string;
 }
 
+export interface SuiteReleaseResult {
+  released: boolean;
+}
+
 /** A single flaky key entry. */
 export interface SuiteFlakyKey {
   tree_hash: string;
@@ -265,16 +269,47 @@ export async function claimSuiteKey(
   originRepo: string,
   treeHash: string,
   cmdHash: string,
+  ownerTokenOrTimeout?: string | number,
   timeoutMs: number = DEFAULT_TIMEOUT_MS,
 ): Promise<SuiteClaimResult | null> {
+  const ownerToken = typeof ownerTokenOrTimeout === "string" ? ownerTokenOrTimeout : undefined;
+  const effectiveTimeout = typeof ownerTokenOrTimeout === "number" ? ownerTokenOrTimeout : timeoutMs;
   const r = await controlRequest(
     "POST",
     "/suite/claim",
-    { origin_repo: originRepo, tree_hash: treeHash, cmd_hash: cmdHash },
-    timeoutMs,
+    {
+      origin_repo: originRepo,
+      tree_hash: treeHash,
+      cmd_hash: cmdHash,
+      ...(ownerToken ? { owner_token: ownerToken } : {}),
+    },
+    effectiveTimeout,
   );
   if (!r || r.status !== 200) return null;
   return r.body as unknown as SuiteClaimResult;
+}
+
+/** Release an exact single-flight claim without altering suite result rows. */
+export async function releaseSuiteKey(
+  originRepo: string,
+  treeHash: string,
+  cmdHash: string,
+  ownerToken?: string,
+  timeoutMs: number = DEFAULT_TIMEOUT_MS,
+): Promise<boolean> {
+  const r = await controlRequest(
+    "POST",
+    "/suite/release",
+    {
+      origin_repo: originRepo,
+      tree_hash: treeHash,
+      cmd_hash: cmdHash,
+      ...(ownerToken ? { owner_token: ownerToken } : {}),
+    },
+    timeoutMs,
+  );
+  if (!r || r.status !== 200) return false;
+  return (r.body as unknown as SuiteReleaseResult).released === true;
 }
 
 /** Parameters for emitting a suite event via the control plane. */
@@ -292,6 +327,8 @@ export interface SuiteEventParams {
   fail_count?: number;
   window?: string;
   waited_ms?: number;
+  pre_tree_hash?: string;
+  post_tree_hash?: string;
 }
 
 /**
@@ -318,6 +355,8 @@ export async function emitSuiteEvent(
   if (params.fail_count != null) body.fail_count = params.fail_count;
   if (params.window) body.window = params.window;
   if (params.waited_ms != null) body.waited_ms = params.waited_ms;
+  if (params.pre_tree_hash) body.pre_tree_hash = params.pre_tree_hash;
+  if (params.post_tree_hash) body.post_tree_hash = params.post_tree_hash;
 
   const r = await controlRequest("POST", "/suite/event", body, timeoutMs);
   return r !== null && r.status === 200;

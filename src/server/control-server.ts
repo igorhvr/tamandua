@@ -305,12 +305,42 @@ import { FLAKE_WINDOW_MS, CLAIM_TIMEOUT_MS } from "../suite/config.js";
 
 interface SuiteClaim {
   claimedAt: number;
+  ownerToken?: string;
 }
 
 const suiteClaims = new Map<string, SuiteClaim>();
 
 function suiteClaimKey(originRepo: string, treeHash: string, cmdHash: string): string {
-  return `${originRepo}:${treeHash}:${cmdHash}`;
+  // JSON array encoding is injective for string tuples; delimiter joining is not
+  // because repository identifiers and hashes are accepted as opaque strings.
+  return JSON.stringify([originRepo, treeHash, cmdHash]);
+}
+
+const SUITE_ORIGIN_MAX_LENGTH = 2048;
+const SUITE_HASH_MAX_LENGTH = 128;
+const SUITE_OWNER_MAX_LENGTH = 128;
+
+interface ValidSuiteClaimFields {
+  originRepo: string;
+  treeHash: string;
+  cmdHash: string;
+  ownerToken?: string;
+}
+
+function validateSuiteClaimFields(body: Record<string, unknown>): ValidSuiteClaimFields | null {
+  const originRepo = typeof body.origin_repo === "string" ? body.origin_repo : "";
+  const treeHash = typeof body.tree_hash === "string" ? body.tree_hash : "";
+  const cmdHash = typeof body.cmd_hash === "string" ? body.cmd_hash : "";
+  const ownerToken = typeof body.owner_token === "string" ? body.owner_token : undefined;
+  if (
+    !originRepo || originRepo.length > SUITE_ORIGIN_MAX_LENGTH
+    || !treeHash || treeHash.length > SUITE_HASH_MAX_LENGTH
+    || !cmdHash || cmdHash.length > SUITE_HASH_MAX_LENGTH
+    || (ownerToken !== undefined && (!ownerToken || ownerToken.length > SUITE_OWNER_MAX_LENGTH))
+  ) {
+    return null;
+  }
+  return { originRepo, treeHash, cmdHash, ownerToken };
 }
 
 function cleanStaleClaims(): void {
@@ -414,13 +444,11 @@ async function handleSuiteRecord(body: Record<string, unknown>): Promise<JsonRes
 }
 
 async function handleSuiteClaim(body: Record<string, unknown>): Promise<JsonResponse> {
-  const originRepo = typeof body.origin_repo === "string" ? body.origin_repo : "";
-  const treeHash = typeof body.tree_hash === "string" ? body.tree_hash : "";
-  const cmdHash = typeof body.cmd_hash === "string" ? body.cmd_hash : "";
-
-  if (!originRepo || !treeHash || !cmdHash) {
-    return { status: 400, body: { error: "Missing required fields: origin_repo, tree_hash, cmd_hash" } };
+  const fields = validateSuiteClaimFields(body);
+  if (!fields) {
+    return { status: 400, body: { error: "Invalid or oversized suite claim fields" } };
   }
+  const { originRepo, treeHash, cmdHash, ownerToken } = fields;
 
   cleanStaleClaims();
 
@@ -431,8 +459,25 @@ async function handleSuiteClaim(body: Record<string, unknown>): Promise<JsonResp
     return ok({ action: "wait", claimedAt: new Date(existing.claimedAt).toISOString() });
   }
 
-  suiteClaims.set(key, { claimedAt: Date.now() });
+  suiteClaims.set(key, { claimedAt: Date.now(), ownerToken });
   return ok({ action: "run" });
+}
+
+async function handleSuiteRelease(body: Record<string, unknown>): Promise<JsonResponse> {
+  const fields = validateSuiteClaimFields(body);
+  if (!fields) {
+    return { status: 400, body: { error: "Invalid or oversized suite release fields" } };
+  }
+  const { originRepo, treeHash, cmdHash, ownerToken } = fields;
+
+  const key = suiteClaimKey(originRepo, treeHash, cmdHash);
+  const existing = suiteClaims.get(key);
+  if (!existing) return ok({ released: false });
+  if (existing.ownerToken !== ownerToken) {
+    return { status: 409, body: { error: "Suite claim is owned by another caller" } };
+  }
+  suiteClaims.delete(key);
+  return ok({ released: true });
 }
 
 async function handleSuiteEvent(body: Record<string, unknown>): Promise<JsonResponse> {
@@ -461,6 +506,8 @@ async function handleSuiteEvent(body: Record<string, unknown>): Promise<JsonResp
   if (typeof body.fail_count === "number") evt.failCount = body.fail_count;
   if (typeof body.window === "string") evt.window = body.window;
   if (typeof body.waited_ms === "number") evt.waitedMs = body.waited_ms;
+  if (typeof body.pre_tree_hash === "string") evt.preTreeHash = body.pre_tree_hash;
+  if (typeof body.post_tree_hash === "string") evt.postTreeHash = body.post_tree_hash;
 
   try {
     emitEvent(evt as unknown as TamanduaEvent);
@@ -966,6 +1013,11 @@ export function createControlServer(options: ControlServerOptions = {}): http.Se
         }
         if (pathname === "/suite/claim") {
           const r = await handleSuiteClaim(body);
+          respond(r.status, r.body);
+          return;
+        }
+        if (pathname === "/suite/release") {
+          const r = await handleSuiteRelease(body);
           respond(r.status, r.body);
           return;
         }

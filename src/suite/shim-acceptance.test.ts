@@ -127,7 +127,8 @@ function createFixtureRepo(
   );
   chmodSync(failScript, 0o755);
 
-  const counterFile = join(repoDir, ".counter");
+  // Keep execution counters outside the content-addressed fixture tree.
+  const counterFile = join(baseDir, `${repoName}.counter`);
   writeFileSync(counterFile, "0");
   const counterScript = join(repoDir, "test-counter.sh");
   writeFileSync(

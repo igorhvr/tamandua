@@ -608,6 +608,19 @@ describe("suite control-plane client", { concurrency: 1 }, () => {
     assert.equal(claim3!.action, "run");
   });
 
+  it("releaseSuiteKey releases only the matching owner and is idempotent", async () => {
+    const treeHash = crypto.createHash("sha1").update("tree-release-client").digest("hex");
+    const cmdHash = crypto.createHash("sha256").update("cmd-release-client").digest("hex");
+    const { claimSuiteKey, releaseSuiteKey } = await import("../../dist/server/control-client.js");
+
+    assert.equal((await claimSuiteKey("/tmp/test-repo", treeHash, cmdHash, "owner-a"))!.action, "run");
+    assert.equal(await releaseSuiteKey("/tmp/test-repo", treeHash, cmdHash, "owner-b"), false);
+    assert.equal((await claimSuiteKey("/tmp/test-repo", treeHash, cmdHash, "owner-a"))!.action, "wait");
+    assert.equal(await releaseSuiteKey("/tmp/test-repo", treeHash, cmdHash, "owner-a"), true);
+    assert.equal(await releaseSuiteKey("/tmp/test-repo", treeHash, cmdHash, "owner-a"), false);
+    assert.equal((await claimSuiteKey("/tmp/test-repo", treeHash, cmdHash, "owner-c"))!.action, "run");
+  });
+
   it("claimSuiteKey returns null when daemon is unreachable", async () => {
     const savedPort = process.env.TAMANDUA_CONTROL_PORT;
     process.env.TAMANDUA_CONTROL_PORT = "65530";

@@ -53,6 +53,8 @@ export interface TamanduaEvent {
   failCount?: number;
   window?: string;
   waitedMs?: number;
+  preTreeHash?: string;
+  postTreeHash?: string;
   // Plumbing merge fields
   origin?: string;
   branch?: string;
