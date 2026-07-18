@@ -1001,9 +1001,9 @@ export async function executeDispatchRound(
           runStatus: row?.status ?? "missing",
           reason: "run_not_running",
         });
-        // The run is already terminal; a sibling agent's round may still be
-        // flushing its final output — tear down with the completion grace.
-        await removeRunCrons(job.runId, { graceMs: HARNESS_TEARDOWN_GRACE_MS });
+        await removeRunCrons(job.runId, {
+          graceMs: getRunTeardownGraceMs(row?.status),
+        });
         return;
       }
       if (row.status === "paused") {
@@ -1531,6 +1531,18 @@ export async function setupAgentCrons(
  * loses the final round's token usage and any post-report bookkeeping.
  */
 export const HARNESS_TEARDOWN_GRACE_MS = 10_000;
+
+/**
+ * Return the teardown grace for a run status. Only runs that reached a
+ * terminal state naturally may keep their final harness round alive long
+ * enough to flush usage/session metadata; all user-directed, missing, and
+ * invalid states tear down immediately.
+ */
+export function getRunTeardownGraceMs(status: string | undefined): number {
+  return status === "completed" || status === "failed"
+    ? HARNESS_TEARDOWN_GRACE_MS
+    : 0;
+}
 
 export interface RemoveRunCronsOptions {
   /**

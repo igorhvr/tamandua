@@ -542,15 +542,15 @@ async function handleTerminateRun(runId: string): Promise<JsonResponse> {
   if (!run) return notFound(`Run not found: ${runId}`);
 
   try {
-    const { removeRunCrons, HARNESS_TEARDOWN_GRACE_MS } = await import(
+    const { removeRunCrons, getRunTeardownGraceMs } = await import(
       "../installer/agent-scheduler.js"
     );
     // Terminate-run is called both for user-initiated termination of an
     // ACTIVE run (kill in-flight work immediately) and as cleanup after a
-    // run reached a terminal state on its own (the harness that reported
-    // the final step is still flushing its output — give it the grace
-    // window so the final round's token usage is not lost).
-    const graceMs = isTerminal(run.status) ? HARNESS_TEARDOWN_GRACE_MS : 0;
+    // run naturally completed/failed (the harness that reported the final
+    // step is still flushing its output — give only those statuses the grace
+    // window so canceled and other user-directed states stay immediate).
+    const graceMs = getRunTeardownGraceMs(run.status);
     await removeRunCrons(runId, { graceMs });
   } catch (err) {
     logger.warn("control-server: removeRunCrons threw", { runId, error: String(err) });
@@ -1126,7 +1126,7 @@ export function startReconciler(): { stop: () => void } {
         )
         .all() as unknown as RunRow[];
 
-      const { _hasRunScheduled, removeRunCrons } = await import(
+      const { _hasRunScheduled, removeRunCrons, getRunTeardownGraceMs } = await import(
         "../installer/agent-scheduler.js"
       );
 
@@ -1151,7 +1151,9 @@ export function startReconciler(): { stop: () => void } {
           .prepare("SELECT status FROM runs WHERE id = ?")
           .get(runId) as { status: string } | undefined;
         if (!row || row.status !== "running") {
-          await removeRunCrons(runId);
+          await removeRunCrons(runId, {
+            graceMs: getRunTeardownGraceMs(row?.status),
+          });
         }
       }
 

@@ -23,6 +23,7 @@ import {
   _hasPendingSweepTimer,
   DISPATCH_INTERVAL_MS,
   HARNESS_TEARDOWN_GRACE_MS,
+  getRunTeardownGraceMs,
 } from "../../dist/installer/agent-scheduler.js";
 import type { SetupAgentCronsOptions, NudgeResult } from "../../dist/installer/agent-scheduler.js";
 import type { WorkflowSpec } from "../../dist/installer/types.js";
@@ -52,6 +53,28 @@ function makeWorkflow(overrides: {
       : {}),
   };
 }
+
+describe("reconciler run status teardown policy", () => {
+  it("graces only naturally completed and failed runs", () => {
+    const cases: Array<[string | undefined, number]> = [
+      ["completed", HARNESS_TEARDOWN_GRACE_MS],
+      ["failed", HARNESS_TEARDOWN_GRACE_MS],
+      ["canceled", 0],
+      ["paused", 0],
+      ["running", 0],
+      ["invalid", 0],
+      [undefined, 0],
+    ];
+
+    for (const [status, expectedGraceMs] of cases) {
+      assert.equal(
+        getRunTeardownGraceMs(status),
+        expectedGraceMs,
+        `unexpected teardown grace for ${status ?? "missing"} run`,
+      );
+    }
+  });
+});
 
 describe("setupAgentCrons dispatch-job scheduling", () => {
   afterEach(() => {
