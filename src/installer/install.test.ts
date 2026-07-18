@@ -18,36 +18,36 @@ describe("install exports", () => {
       assert.ok(max > 0);
     });
 
-    it("returns the maximum timeout (3600 for 60-min roles)", () => {
+    it("returns the maximum timeout (5400 for 90-min roles)", () => {
       const max = getMaxRoleTimeoutSeconds();
-      // coding, testing, analysis roles are 3600; others are 2400
-      assert.equal(max, 3600);
+      // coding, testing, analysis roles are 5400; others are 3600
+      assert.equal(max, 5400);
     });
   });
 
   describe("getRoleTimeoutSeconds", () => {
-    it("returns 3600 for analysis role (60 min)", () => {
-      assert.equal(getRoleTimeoutSeconds("analysis"), 3600);
+    it("returns 5400 for analysis role (90 min)", () => {
+      assert.equal(getRoleTimeoutSeconds("analysis"), 5400);
     });
 
-    it("returns 3600 for coding role (60 min)", () => {
-      assert.equal(getRoleTimeoutSeconds("coding"), 3600);
+    it("returns 5400 for coding role (90 min)", () => {
+      assert.equal(getRoleTimeoutSeconds("coding"), 5400);
     });
 
-    it("returns 2400 for verification role (40 min)", () => {
-      assert.equal(getRoleTimeoutSeconds("verification"), 2400);
+    it("returns 3600 for verification role (60 min)", () => {
+      assert.equal(getRoleTimeoutSeconds("verification"), 3600);
     });
 
-    it("returns 3600 for testing role (60 min)", () => {
-      assert.equal(getRoleTimeoutSeconds("testing"), 3600);
+    it("returns 5400 for testing role (90 min)", () => {
+      assert.equal(getRoleTimeoutSeconds("testing"), 5400);
     });
 
-    it("returns 2400 for pr role (40 min)", () => {
-      assert.equal(getRoleTimeoutSeconds("pr"), 2400);
+    it("returns 3600 for pr role (60 min)", () => {
+      assert.equal(getRoleTimeoutSeconds("pr"), 3600);
     });
 
-    it("returns 2400 for scanning role (40 min)", () => {
-      assert.equal(getRoleTimeoutSeconds("scanning"), 2400);
+    it("returns 3600 for scanning role (60 min)", () => {
+      assert.equal(getRoleTimeoutSeconds("scanning"), 3600);
     });
   });
 
