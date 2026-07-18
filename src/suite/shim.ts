@@ -411,6 +411,26 @@ async function main(): Promise<void> {
     emitSuiteEvent,
   } = await import("../server/control-client.js");
 
+  const replayCachedResult = async (
+    cachedResult: Record<string, unknown>,
+    treeHash: string,
+    ageMs: number,
+  ): Promise<void> => {
+    await emitSuiteEvent({
+      event: "suite.cache_hit",
+      run_id: runId,
+      step_id: stepId,
+      tree_hash: treeHash.slice(0, 12),
+      cmd_display: cmdString.slice(0, 200),
+      saved_duration_ms: typeof cachedResult.duration_ms === "number"
+        ? cachedResult.duration_ms
+        : undefined,
+    }).catch(() => {
+      // Best-effort — event emission failure must not block replay.
+    });
+    replay(cachedResult, cmdString.slice(0, 200) || cmdString, ageMs);
+  };
+
   // R14: Control plane unreachable → passthrough.
   const lookup = await lookupSuiteRecord(originRepo, preTreeHash, cmdHash);
   if (lookup === null) {
@@ -444,22 +464,7 @@ async function main(): Promise<void> {
     const createdAt = String(latest.created_at ?? "");
     const ageMs = Date.now() - new Date(createdAt).getTime();
     if (ageMs <= TTL_GREEN_MS) {
-      // US-009: Emit suite.cache_hit event (best-effort, awaited so it
-      // completes before process exit).
-      await emitSuiteEvent({
-        event: "suite.cache_hit",
-        run_id: runId,
-        step_id: stepId,
-        tree_hash: preTreeHash.slice(0, 12),
-        cmd_display: cmdString.slice(0, 200),
-        saved_duration_ms: typeof latest.duration_ms === "number"
-          ? latest.duration_ms
-          : undefined,
-      }).catch(() => {
-        // Best-effort — event emission failure must not block replay.
-      });
-      replay(latest, cmdString.slice(0, 200) || cmdString, ageMs);
-      // replay() calls process.exit(0) — never returns.
+      await replayCachedResult(latest, preTreeHash, ageMs);
     }
   }
 
@@ -493,25 +498,7 @@ async function main(): Promise<void> {
     // CLAIM_TIMEOUT elapses.
     const pollResult = await pollForResult(originRepo, preTreeHash, cmdHash, ownerToken);
     if (pollResult.action === "replay" && pollResult.latest) {
-      // US-009: Emit suite.cache_hit event on poll-based replay (best-effort).
-      await emitSuiteEvent({
-        event: "suite.cache_hit",
-        run_id: runId,
-        step_id: stepId,
-        tree_hash: preTreeHash.slice(0, 12),
-        cmd_display: cmdString.slice(0, 200),
-        saved_duration_ms: typeof pollResult.latest.duration_ms === "number"
-          ? pollResult.latest.duration_ms
-          : undefined,
-      }).catch(() => {
-        // Best-effort.
-      });
-      replay(
-        pollResult.latest,
-        cmdString.slice(0, 200) || cmdString,
-        pollResult.ageMs ?? 0,
-      );
-      // replay() calls process.exit(0) — never returns.
+      await replayCachedResult(pollResult.latest, preTreeHash, pollResult.ageMs ?? 0);
     }
     // Poll returned "execute" — fall through to execute below.
     ownsClaim = pollResult.ownsClaim === true;
@@ -552,9 +539,9 @@ async function main(): Promise<void> {
       && !force
       && Date.now() - new Date(String(currentLatest.created_at ?? "")).getTime() <= TTL_GREEN_MS
     ) {
-      replay(
+      await replayCachedResult(
         currentLatest,
-        cmdString.slice(0, 200) || cmdString,
+        preTreeHash,
         Date.now() - new Date(String(currentLatest.created_at ?? "")).getTime(),
       );
     }
@@ -574,11 +561,7 @@ async function main(): Promise<void> {
 
     const currentPoll = await pollForResult(originRepo, preTreeHash, cmdHash, ownerToken);
     if (currentPoll.action === "replay" && currentPoll.latest) {
-      replay(
-        currentPoll.latest,
-        cmdString.slice(0, 200) || cmdString,
-        currentPoll.ageMs ?? 0,
-      );
+      await replayCachedResult(currentPoll.latest, preTreeHash, currentPoll.ageMs ?? 0);
     }
     ownsClaim = currentPoll.ownsClaim === true;
   }

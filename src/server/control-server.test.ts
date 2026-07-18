@@ -2064,6 +2064,67 @@ describe("suite control-plane endpoints", { concurrency: 1 }, () => {
     assert.equal((await suiteRequest("POST", "/suite/release", legacy)).body.released, true);
   });
 
+  it("rejects malformed present owner tokens without changing claims or suite rows", async () => {
+    const invalidTokens: unknown[] = [null, 42, true, [], {}, "", "o".repeat(129)];
+
+    for (const [index, ownerToken] of invalidTokens.entries()) {
+      const key = {
+        origin_repo: `/test/malformed-owner/${index}`,
+        tree_hash: `malformed-tree-${index}`,
+        cmd_hash: `malformed-cmd-${index}`,
+      };
+      const unrelated = {
+        origin_repo: `/test/malformed-owner/unrelated/${index}`,
+        tree_hash: `unrelated-tree-${index}`,
+        cmd_hash: `unrelated-cmd-${index}`,
+        owner_token: `unrelated-owner-${index}`,
+      };
+      assert.equal((await suiteRequest("POST", "/suite/claim", unrelated)).body.action, "run");
+      insertSuiteRow({
+        originRepo: key.origin_repo,
+        treeHash: key.tree_hash,
+        cmdHash: key.cmd_hash,
+        cmdDisplay: "npm test",
+        exitCode: 0,
+        durationMs: 1,
+      });
+
+      assert.equal((await suiteRequest("POST", "/suite/claim", {
+        ...key,
+        owner_token: ownerToken,
+      })).status, 400, `claim should reject ${JSON.stringify(ownerToken)}`);
+      const validOwner = `valid-owner-${index}`;
+      assert.equal((await suiteRequest("POST", "/suite/claim", {
+        ...key,
+        owner_token: validOwner,
+      })).body.action, "run", "invalid claim must not acquire the key");
+
+      assert.equal((await suiteRequest("POST", "/suite/release", {
+        ...key,
+        owner_token: ownerToken,
+      })).status, 400, `release should reject ${JSON.stringify(ownerToken)}`);
+      assert.equal((await suiteRequest("POST", "/suite/claim", {
+        ...key,
+        owner_token: "observer",
+      })).body.action, "wait", "invalid release must preserve the exact-key claim");
+      assert.equal((await suiteRequest("POST", "/suite/claim", unrelated)).body.action, "wait",
+        "invalid requests must preserve unrelated claims");
+
+      const db = new DatabaseSync(dbPath);
+      const row = db.prepare(
+        "SELECT COUNT(*) AS cnt FROM suite_results WHERE origin_repo = ? AND tree_hash = ? AND cmd_hash = ?",
+      ).get(key.origin_repo, key.tree_hash, key.cmd_hash) as { cnt: number };
+      db.close();
+      assert.equal(row.cnt, 1, "invalid requests must not alter suite ledger rows");
+
+      assert.equal((await suiteRequest("POST", "/suite/release", {
+        ...key,
+        owner_token: validOwner,
+      })).body.released, true);
+      assert.equal((await suiteRequest("POST", "/suite/release", unrelated)).body.released, true);
+    }
+  });
+
   it("keeps colon-containing suite tuples collision-free during release", async () => {
     const first = {
       origin_repo: "a:b", tree_hash: "c", cmd_hash: "d", owner_token: "first-owner",

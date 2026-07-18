@@ -331,12 +331,15 @@ function validateSuiteClaimFields(body: Record<string, unknown>): ValidSuiteClai
   const originRepo = typeof body.origin_repo === "string" ? body.origin_repo : "";
   const treeHash = typeof body.tree_hash === "string" ? body.tree_hash : "";
   const cmdHash = typeof body.cmd_hash === "string" ? body.cmd_hash : "";
-  const ownerToken = typeof body.owner_token === "string" ? body.owner_token : undefined;
+  const hasOwnerToken = Object.prototype.hasOwnProperty.call(body, "owner_token");
+  const ownerToken = hasOwnerToken && typeof body.owner_token === "string"
+    ? body.owner_token
+    : undefined;
   if (
     !originRepo || originRepo.length > SUITE_ORIGIN_MAX_LENGTH
     || !treeHash || treeHash.length > SUITE_HASH_MAX_LENGTH
     || !cmdHash || cmdHash.length > SUITE_HASH_MAX_LENGTH
-    || (ownerToken !== undefined && (!ownerToken || ownerToken.length > SUITE_OWNER_MAX_LENGTH))
+    || (hasOwnerToken && (!ownerToken || ownerToken.length > SUITE_OWNER_MAX_LENGTH))
   ) {
     return null;
   }

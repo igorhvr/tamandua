@@ -606,14 +606,40 @@ describe("tamandua-test shim", { concurrency: 1 }, () => {
 
   // ── Exit code propagation ──────────────────────────────────────────
 
-  it("propagates non-zero exit code from failing command", async () => {
-    const env = shimChildEnv(controlEnv);
-    const r = await runShim(
-      ["--repo", repoDir, "--run", "r1", "--step", "s1", "--", failScript],
-      env,
+  it("records one exact red row with the real exit code for a stable tracked tree", async () => {
+    const fixture = createFixtureRepo(tempBase, "stable-red-ledger-evidence");
+    const distinctiveFailure = join(fixture.repoDir, "distinctive-failure.sh");
+    writeFileSync(distinctiveFailure, "#!/bin/sh\necho 'DISTINCTIVE FAILURE' >&2\nexit 23\n");
+    chmodSync(distinctiveFailure, 0o755);
+    const runId = "r-stable-red-ledger-unique";
+    const stepId = "s-stable-red-ledger-unique";
+    const { computeTreeHash, computeCmdHash, getOriginRepo } = await import(
+      "../../dist/suite/tree-hash.js"
     );
-    assert.equal(r.exitCode, 1, "should propagate exit code 1");
-    assert.ok(r.stderr.includes("FAIL: something broke"), "should see failure output");
+    const treeHash = computeTreeHash(fixture.repoDir);
+    assert.ok(treeHash, "stable fixture should have a tree hash");
+    const cmdHash = computeCmdHash(distinctiveFailure);
+    const originRepo = getOriginRepo(fixture.repoDir);
+
+    const result = await runShim(
+      ["--repo", fixture.repoDir, "--run", runId, "--step", stepId, "--", distinctiveFailure],
+      shimChildEnv(controlEnv),
+    );
+    assert.equal(result.exitCode, 23, "shim must preserve the real failing exit code");
+    assert.match(result.stderr, /DISTINCTIVE FAILURE/);
+
+    const db = new DatabaseSync(controlEnv.dbPath);
+    const rows = db.prepare(
+      `SELECT exit_code, run_id, step_id FROM suite_results
+       WHERE origin_repo = ? AND tree_hash = ? AND cmd_hash = ? AND run_id = ? AND step_id = ?`,
+    ).all(originRepo, treeHash, cmdHash, runId, stepId) as Array<{
+      exit_code: number; run_id: string; step_id: string;
+    }>;
+    db.close();
+    assert.equal(rows.length, 1, "the exact suite key and run/step must have one row");
+    assert.equal(rows[0]!.exit_code, 23);
+    assert.equal(rows[0]!.run_id, runId);
+    assert.equal(rows[0]!.step_id, stepId);
   });
 
   async function runTreeMutationCase(
@@ -814,6 +840,93 @@ exit 0
       owner_token: "third-after-waiter",
     });
     assert.equal((thirdClaim.body as Record<string, unknown>).action, "run");
+  });
+
+  it("emits one cache-hit event with the re-keyed tree on post-promotion replay", { timeout: 3_600_000 }, async () => {
+    const fixture = createFixtureRepo(tempBase, "drift-rekey-cache-hit");
+    const attemptsFile = join(tempBase, "drift-rekey-cache-hit-attempts");
+    const ownerStartedFile = join(tempBase, "drift-rekey-owner-started");
+    const mutateOwnerFile = join(tempBase, "drift-rekey-mutate-owner");
+    const ownerMutatedFile = join(tempBase, "drift-rekey-owner-mutated");
+    const releaseOwnerFile = join(tempBase, "drift-rekey-release-owner");
+    writeFileSync(attemptsFile, "0");
+    const script = join(fixture.repoDir, "rekey-cache-hit.sh");
+    writeFileSync(script, `#!/bin/sh
+n=$(cat "${attemptsFile}")
+n=$((n + 1))
+printf '%s' "$n" > "${attemptsFile}"
+if [ "$n" -eq 1 ]; then
+  : > "${ownerStartedFile}"
+  while [ ! -f "${mutateOwnerFile}" ]; do sleep 0.05; done
+  printf 'owner changed tree\\n' > "${join(fixture.repoDir, "README.md")}"
+  : > "${ownerMutatedFile}"
+  while [ ! -f "${releaseOwnerFile}" ]; do sleep 0.05; done
+fi
+exit 0
+`);
+    chmodSync(script, 0o755);
+    const { computeTreeHash, computeCmdHash, getOriginRepo } = await import(
+      "../../dist/suite/tree-hash.js"
+    );
+    const originRepo = getOriginRepo(fixture.repoDir);
+    const cmdHash = computeCmdHash(script);
+
+    const owner = runShim(
+      ["--repo", fixture.repoDir, "--run", "r-rekey-owner", "--step", "s-owner", "--", script],
+      shimChildEnv(controlEnv),
+    );
+    await waitUntil(() => existsSync(ownerStartedFile));
+    const waiterRunId = "r-rekey-cache-hit-waiter";
+    const waiter = runShim(
+      ["--repo", fixture.repoDir, "--run", waiterRunId, "--step", "s-waiter", "--", script],
+      shimChildEnv(controlEnv),
+    );
+    const waiterEventsPath = join(controlEnv.stateDir, "events", `${waiterRunId}.jsonl`);
+    await waitUntil(() =>
+      existsSync(waiterEventsPath)
+      && readFileSync(waiterEventsPath, "utf-8").includes("suite.singleflight_wait")
+    );
+
+    writeFileSync(mutateOwnerFile, "mutate");
+    await waitUntil(() => existsSync(ownerMutatedFile));
+    const rekeyedTreeHash = computeTreeHash(fixture.repoDir);
+    assert.ok(rekeyedTreeHash, "mutated fixture should have a re-keyed tree hash");
+    await controlPlanePost("/suite/record", {
+      origin_repo: originRepo,
+      tree_hash: rekeyedTreeHash,
+      cmd_hash: cmdHash,
+      cmd_display: script.slice(0, 200),
+      exit_code: 0,
+      duration_ms: 37,
+      log_tail: "REKEYED GREEN RESULT",
+      run_id: "r-rekey-seed",
+      step_id: "s-seed",
+    });
+    writeFileSync(releaseOwnerFile, "release");
+
+    const [ownerResult, waiterResult] = await Promise.all([owner, waiter]);
+    assert.equal(ownerResult.exitCode, 86, "tree-changing owner should be rejected");
+    assert.equal(waiterResult.exitCode, 0);
+    assert.match(waiterResult.stdout, /TAMANDUA-TEST CACHED/);
+    assert.match(waiterResult.stdout, /REKEYED GREEN RESULT/);
+    assert.equal(readFileSync(attemptsFile, "utf-8"), "1", "waiter must not execute the command");
+
+    const events = readFileSync(waiterEventsPath, "utf-8").trim().split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    const cacheHits = events.filter((event) => event.event === "suite.cache_hit");
+    assert.equal(cacheHits.length, 1, "one replay must emit exactly one cache-hit event");
+    assert.equal(cacheHits[0]!.treeHash, rekeyedTreeHash.slice(0, 12));
+  });
+
+  it("routes every green replay through the cache-hit replay helper", () => {
+    const source = readFileSync(join(__dirname, "shim.ts"), "utf-8");
+    const directReplayCalls = source.match(/^\s*replay\s*\(/gm) ?? [];
+    assert.equal(
+      directReplayCalls.length,
+      1,
+      "only the shared cache-hit helper may call replay directly",
+    );
   });
 
   // ════════════════════════════════════════════════════════════════════

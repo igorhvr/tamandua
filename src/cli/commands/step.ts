@@ -287,7 +287,11 @@ export async function handleStep(group: string, args: string[]): Promise<boolean
     return true;
   }
   if (action === "complete") {
-    if (!target) { process.stderr.write("Missing step-id.\n"); process.exit(1); }
+    if (!target) {
+      logger.warn("Rejected step complete: missing step-id", { action });
+      process.stderr.write("Missing step-id.\n");
+      process.exit(1);
+    }
 
     // Parse --file flag from remaining args. Trailing non-flag argv after
     // the step-id is now an error (trap fix: agents used to pass report text
@@ -403,7 +407,11 @@ export async function handleStep(group: string, args: string[]): Promise<boolean
     return true;
   }
   if (action === "fail") {
-    if (!target) { process.stderr.write("Missing step-id.\n"); process.exit(1); }
+    if (!target) {
+      logger.warn("Rejected step fail: missing step-id", { action });
+      process.stderr.write("Missing step-id.\n");
+      process.exit(1);
+    }
 
     // Parse --reason-file flag from remaining args.
     // --reason-file and inline reason are mutually exclusive:
