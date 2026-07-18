@@ -2576,6 +2576,7 @@ function completeStepInternal(stepId: string, output: string): { status: string;
     const hint = stepInfo
       ? `\nIf you lost your step id, run: tamandua step current ${stepInfo.agent_id} --run-id ${stepInfo.run_id}`
       : `\nIf you lost your step id, run: tamandua step current <agent-id> --run-id <run-id>`;
+    logger.warn(`Rejected step complete: Step not found: ${stepId}`, { stepId });
     throw new Error(`Step not found: ${stepId}${hint}`);
   }
 
@@ -3374,6 +3375,7 @@ async function failStepInternal(stepId: string, error: string): Promise<{ status
     const hint = stepInfo
       ? `\nIf you lost your step id, run: tamandua step current ${stepInfo.agent_id} --run-id ${stepInfo.run_id}`
       : `\nIf you lost your step id, run: tamandua step current <agent-id> --run-id <run-id>`;
+    logger.warn(`Rejected step fail: Step not found: ${stepId}`, { stepId });
     throw new Error(`Step not found: ${stepId}${hint}`);
   }
 
@@ -3772,4 +3774,135 @@ export function resolveStepContext(
   }
 
   return context;
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Step Release (Operator Recovery)
+// ══════════════════════════════════════════════════════════════════════
+
+export interface ReleaseStepResult {
+  released: boolean;
+  stepId?: string;
+  reason?: string;
+  /** When multiple claimed/running steps exist and no step-id given */
+  claimedSteps?: { stepId: string; agentId: string; claimPid: number | null }[];
+  /** When the worker is alive and no --force */
+  alivePid?: number;
+}
+
+/**
+ * Release a stuck claimed/running step back to pending so the motor re-dispatches it.
+ * Clears claim fields (claim_job_id, claim_pid, claim_pgid, claim_updated_at) but does
+ * NOT increment retry_count — this is an operator action, not a failure.
+ *
+ * Without stepId: acts on the single claimed/running step if exactly one exists;
+ * with multiple, returns a list requiring step-id selection.
+ *
+ * Liveness guard: if the claiming worker's PID is still alive, refuses unless force=true.
+ * force does NOT terminate the worker — it only clears claim fields.
+ *
+ * Emits a step.released event on success.
+ */
+export function releaseStep(runId: string, stepId?: string, force?: boolean): ReleaseStepResult {
+  const db = getDb();
+  const wfId = getWorkflowId(runId);
+
+  // Find claimed/running steps for this run
+  const claimedSteps = db.prepare(
+    `SELECT s.id, s.step_id, s.agent_id, s.claim_pid
+     FROM steps s
+     WHERE s.run_id = ? AND s.status = 'running'
+     ORDER BY s.step_index ASC`
+  ).all(runId) as { id: string; step_id: string; agent_id: string; claim_pid: number | null }[];
+
+  if (claimedSteps.length === 0) {
+    return { released: false, reason: `No running steps found for run ${runId.slice(0, 8)}` };
+  }
+
+  // Determine the target step(s)
+  let target: { id: string; step_id: string; agent_id: string; claim_pid: number | null } | undefined;
+
+  if (stepId) {
+    // Look for stepId as either row id or step_id (the workflow-defined step id)
+    target = claimedSteps.find(
+      (s) => s.id === stepId || s.id.startsWith(stepId),
+    );
+    if (!target) {
+      return { released: false, reason: `Step "${stepId}" not found among running steps in run ${runId.slice(0, 8)}` };
+    }
+  } else {
+    if (claimedSteps.length > 1) {
+      return {
+        released: false,
+        reason: `Multiple running steps found. Specify which step to release with step-id:`,
+        claimedSteps: claimedSteps.map((s) => ({
+          stepId: s.id,
+          agentId: s.agent_id,
+          claimPid: s.claim_pid,
+        })),
+      };
+    }
+    target = claimedSteps[0];
+  }
+
+  // Liveness guard: check if the claiming worker is still alive
+  if (target.claim_pid != null && target.claim_pid > 0) {
+    try {
+      process.kill(target.claim_pid, 0);
+      // PID is alive — refuse unless forced
+      if (!force) {
+        return {
+          released: false,
+          stepId: target.id,
+          reason: `Worker for step ${target.id.slice(0, 8)} (${target.agent_id}) is still alive (PID ${target.claim_pid}). Use --force to release anyway.`,
+          alivePid: target.claim_pid,
+        };
+      }
+    } catch (err) {
+      // ESRCH = process dead — proceed with release
+      if ((err as NodeJS.ErrnoException).code !== "ESRCH") {
+        // EPERM or other error — treat as alive
+        if (!force) {
+          return {
+            released: false,
+            stepId: target.id,
+            reason: `Cannot determine liveness of worker for step ${target.id.slice(0, 8)} (PID ${target.claim_pid}). Use --force to release anyway.`,
+            alivePid: target.claim_pid,
+          };
+        }
+      }
+    }
+  }
+
+  // Release the step: clear claim fields, set status back to pending
+  db.prepare(
+    `UPDATE steps
+     SET status = 'pending',
+         claim_job_id = NULL,
+         claim_pid = NULL,
+         claim_pgid = NULL,
+         claim_updated_at = NULL,
+         updated_at = datetime('now')
+     WHERE id = ?`
+  ).run(target.id);
+
+  // Emit step.released event
+  emitEvent({
+    ts: new Date().toISOString(),
+    event: "step.released",
+    runId,
+    workflowId: wfId,
+    stepId: target.id,
+    agentId: target.agent_id,
+    detail: force ? `Force-released by operator` : `Released by operator`,
+  });
+
+  logger.info(`Step ${target.id.slice(0, 8)} released back to pending`, {
+    runId,
+    stepId: target.id,
+    agentId: target.agent_id,
+    forced: !!force,
+  });
+
+  return { released: true, stepId: target.id };
 }

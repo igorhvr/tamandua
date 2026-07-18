@@ -332,14 +332,27 @@ export function buildWorkPrompt(
   agentId: string,
   runId: string,
   agentPersonaInstructions = "",
+  jobId?: string,
+  runNumber?: number,
 ): string {
   const cli = resolveTamanduaCli();
 
   const persona = agentPersonaInstructions.trim();
-  const prompt = [
+  const prompt: string[] = [];
+
+  // Traceability header: inert bracketed metadata prepended to every dispatched
+  // work prompt so persisted sessions are greppable to their exact step via the DB.
+  if (jobId && runNumber !== undefined) {
+    prompt.push(
+      `[tamandua traceability - metadata only, no action needed] run=${runId} run_number=${runNumber} agent=${agentId} job=${jobId} ts=${new Date().toISOString()}`,
+      "",
+    );
+  }
+
+  prompt.push(
     `You are the work agent for workflow "${workflowId}", agent "${agentId}", run "${runId}".`,
     `You run in --print mode. A pending step is waiting for you: claim it, execute it, report.`,
-  ];
+  );
 
   if (persona.length > 0) {
     prompt.push(
@@ -979,6 +992,9 @@ export async function executeDispatchRound(
 
   // Declared outside try so catch/post-round handlers can access exit diagnostics
   let result: HarnessRoundResult | undefined;
+  // Captured from the run-status DB query so the traceability header can
+  // include run_number without a second DB trip.
+  let runNumber: number | undefined;
 
   try {
     // ── Run-scoped status check ────────────────────────────────────
@@ -989,8 +1005,11 @@ export async function executeDispatchRound(
       const { getDb } = await import("../db.js");
       const db = getDb();
       const row = db
-        .prepare("SELECT status, scheduling_status, context FROM runs WHERE id = ?")
-        .get(job.runId) as { status: string; scheduling_status: string | null; context: string } | undefined;
+        .prepare("SELECT status, scheduling_status, context, run_number FROM runs WHERE id = ?")
+        .get(job.runId) as { status: string; scheduling_status: string | null; context: string; run_number: number | null } | undefined;
+      if (row?.run_number !== null && row?.run_number !== undefined) {
+        runNumber = row.run_number;
+      }
       if (row?.context) {
         const runContext = parseRunContext(job.runId, row.context);
         preferTokenSaver = runContext.no_hurry_save_tokens_mode === "true";
@@ -1124,6 +1143,8 @@ export async function executeDispatchRound(
       job.agentId,
       job.runId,
       agentPersonaInstructions,
+      job.id,
+      runNumber,
     );
 
     logger.info("Work round start", context);

@@ -56,6 +56,7 @@ tamandua workflow resume <run-id>
 tamandua workflow resume-all
 tamandua workflow stop <run-id>
 tamandua workflow cancel <run-id>        # Alias for stop
+tamandua workflow fail <run-id> --reason <text> [--force]
 tamandua workflow autoresearch <run-id>
 tamandua workflow delete <run-id> [--force]
 tamandua nudge
@@ -100,8 +101,10 @@ This polls in 5-minute windows until the run finishes (code 0) or fails
 permanently (code 1/3/4).
 
 `resume` works for both paused runs (restarted via the daemon) and failed
-runs (resumed directly). `pause-all --drain` lets in-progress steps finish
-before pausing.
+runs (resumed directly). On success, resume prints one line per non-done step
+(step id prefix, role, status, retry count) so you can see what will execute
+next without querying the database. `pause-all --drain` lets in-progress steps
+finish before pausing.
 
 `delete` permanently removes a workflow run and associated steps, stories,
 and managed worktree data. Active runs are refused by default; use `--force`
@@ -664,6 +667,60 @@ tamandua autoresearch wizard
 tamandua autoresearch wizard --cwd /path/to/project
 ```
 
+### 2.15) Operator recovery commands
+
+When a step gets stuck (e.g., a worker died mid-execution) or a run needs to
+be force-terminated, use these recovery commands instead of writing to the
+database directly.
+
+#### Step release
+
+`tamandua step release <run-id> [step-id] [--force]` resets a stuck
+claimed/running step back to `pending` so the motor re-dispatches it. The
+run-id accepts prefixes and `#N` (run number).
+
+- **Without step-id:** if exactly one claimed/running step exists, it acts on
+  that step. With multiple, it lists them and requires `step-id`.
+- **Guard:** refuses when the claiming worker is still alive (checked via
+  `process.kill(pid, 0)`). Prints what is alive and requires `--force` to
+  override. `--force` only releases the claim — it does not terminate the
+  worker.
+- **No retry bump:** clearing the claim is an operator action, not a failure,
+  so `retry_count` is not incremented.
+- Emits a `step.released` event visible in logs.
+
+#### Workflow fail
+
+`tamandua workflow fail <run-id> --reason <text> [--force]` forces a
+running/paused run to terminal failed status. The run-id accepts prefixes
+and `#N`. `--reason` is required.
+
+- **Guard:** refuses if a worker for the run is currently alive unless
+  `--force` is given.
+- Records the reason in the `run.force_failed` event and sets the run
+  status to `failed`.
+
+#### Resume per-step output
+
+Both `tamandua workflow resume <run-id>` and `tamandua workflow resume-all`
+now print one line per non-done step after a successful resume. Each line
+shows: `[status] stepIdPrefix (role) retry N`. This lets you see what will
+execute next without querying the database.
+
+#### Traceability header
+
+Every dispatched work prompt (pi and hermes harnesses) begins with a single
+bracketed metadata line, e.g.:
+
+```
+[tamandua traceability - metadata only, no action needed] run=<uuid> run_number=<N> agent=<agent-id> job=<uuid> ts=<iso>
+```
+
+This is inert metadata — **ignore it; do not echo it into reports.** It
+exists so persisted worker sessions can be traced back to their exact step
+via the database. The bracketed prefix and lowercase keys ensure it cannot
+be confused with report `KEY:` lines.
+
 ### 3) Follow the step lifecycle exactly
 
 Scheduled workflow agents are told by their dispatch prompt that a step is
@@ -697,6 +754,10 @@ If you lose your step id mid-session, do not abandon finished work:
 Use the run ID supplied by your scheduler prompt or workflow context. `step peek` and `step claim` require `--run-id` so agents serving concurrent runs cannot claim each other's work.
 
 Never call `step complete` or `step fail` with an agent ID. They require the claimed step UUID.
+
+For operator recovery when a step is stuck (e.g., worker died),
+`tamandua step release <run-id> [step-id] [--force]` resets a claimed/running
+step back to pending. See §2.15 for details.
 
 For diagnostics, use `tamandua step stories <run-id>` to list all stories
 for a run and their statuses. This is useful when diagnosing blocked

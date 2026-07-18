@@ -179,7 +179,7 @@ class PiHarnessAdapter implements HarnessAdapter {
     });
 
     // pi --print mode: single-shot work prompt
-    const args = ["--print", "--mode", "json", "--no-session", prompt];
+    const args = ["--print", "--mode", "json", prompt];
 
     const childEnv: Record<string, string | undefined> = {
       ...(process.env as Record<string, string | undefined>),

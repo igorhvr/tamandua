@@ -321,7 +321,7 @@ describe("--help infrastructure", () => {
     const result = cli(["step", "--help"]);
     try {
       assert.equal(result.status, 0);
-      assert.match(result.stdout ?? "", /tamandua get-ready/);
+      assert.match(result.stdout ?? "", /Worker step protocol commands/);
     } finally {
     }
   });
@@ -623,11 +623,12 @@ describe("--help infrastructure", () => {
     }
   });
 
-  it("tamandua step --help (no known subcommand) falls back to global usage", () => {
+  it("tamandua step --help (no known subcommand) shows step group help", () => {
     const result = cli(["step", "--help"]);
     try {
       assert.equal(result.status, 0);
-      assert.match(result.stdout ?? "", /tamandua get-ready/);
+      assert.match(result.stdout ?? "", /Worker step protocol commands/);
+      assert.match(result.stdout ?? "", /release.*Reset a stuck claimed/);
     } finally {
     }
   });
@@ -967,6 +968,7 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /resume.*Resume a paused or failed/);
       assert.match(result.stdout ?? "", /pause-all.*Pause all running/);
       assert.match(result.stdout ?? "", /resume-all.*Resume all paused/);
+      assert.match(result.stdout ?? "", /fail.*Force a running or paused/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);
     } finally {
     }

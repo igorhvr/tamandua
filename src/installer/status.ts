@@ -1,10 +1,11 @@
 import { getDb } from "../db.js";
-import { scheduleRunCronTeardown } from "./step-ops.js";
+import { scheduleRunCronTeardown, getWorkflowId } from "./step-ops.js";
 import { removeRunCrons } from "./agent-scheduler.js";
 import { terminateRunWithDaemon } from "../server/control-client.js";
 import { getRunWorktree, removeRunWorktree } from "./worktree-manager.js";
 import { emitEvent } from "./events.js";
 import { parseRunContext } from "./step-ops.js";
+import { logger } from "../lib/logger.js";
 
 export interface RunInfo {
   id: string;
@@ -82,6 +83,22 @@ export function getWorkflowStatus(query: string): RunDetail {
       throw new Error(
         `Multiple runs match prefix "${query}": ${prefixRows.map((r) => r.id.slice(0, 12)).join(", ")}. Use a longer prefix to disambiguate.`,
       );
+    }
+  }
+
+  // Try run-number (#N) match
+  if (!row) {
+    const nMatch = query.match(/^#(\d+)$/);
+    if (nMatch) {
+      const num = Number(nMatch[1]);
+      row = db
+        .prepare(
+          "SELECT id, run_number, workflow_id, task, status, context, created_at, updated_at, tokens_spent, worker_lost_count FROM runs WHERE run_number = ?",
+        )
+        .get(num) as unknown as (RunRow & { run_number: number | null }) | undefined;
+      if (!row) {
+        throw new Error(`No run found matching "${query}"`);
+      }
     }
   }
 
@@ -262,6 +279,124 @@ export async function stopWorkflow(runId: string): Promise<{ ok: boolean; runId:
   scheduleRunCronTeardown(runId);
 
   return { ok: true, runId };
+}
+
+/**
+ * Result of force-failing a run.
+ */
+export interface ForceFailResult {
+  ok: boolean;
+  runId: string;
+  status: string;
+  reason: string;
+  /** If ok=false, list of alive workers */
+  aliveWorkers?: Array<{ stepId: string; agentId: string; pid: number }>;
+}
+
+/**
+ * Force a running/paused run to terminal failed status.
+ * Records the reason and emits a run.force_failed event.
+ *
+ * GUARD: refuses if any worker for the run is still alive (step with running
+ * status and live claim_pid), unless --force.
+ */
+export async function forceFailRun(
+  runId: string,
+  reason: string,
+  force?: boolean,
+): Promise<ForceFailResult> {
+  const db = getDb();
+
+  const run = db
+    .prepare("SELECT id, status, workflow_id FROM runs WHERE id = ?")
+    .get(runId) as { id: string; status: string; workflow_id: string } | undefined;
+
+  if (!run) {
+    throw new Error(`Run not found: ${runId}`);
+  }
+
+  if (run.status !== "running" && run.status !== "paused") {
+    throw new Error(
+      `Run ${runId.slice(0, 8)} is already ${run.status} — cannot force-fail`,
+    );
+  }
+
+  // Check for alive workers — steps with running status and live claim_pid
+  const runningSteps = db
+    .prepare(
+      "SELECT id, step_id, agent_id, claim_pid FROM steps WHERE run_id = ? AND status = 'running' AND claim_pid IS NOT NULL",
+    )
+    .all(runId) as { id: string; step_id: string; agent_id: string; claim_pid: number }[];
+
+  const aliveWorkers: Array<{ stepId: string; agentId: string; pid: number }> = [];
+  for (const step of runningSteps) {
+    if (step.claim_pid > 0) {
+      try {
+        process.kill(step.claim_pid, 0);
+        // PID is alive
+        aliveWorkers.push({
+          stepId: step.id,
+          agentId: step.agent_id,
+          pid: step.claim_pid,
+        });
+      } catch (err) {
+        // ESRCH = dead, proceed
+        if ((err as NodeJS.ErrnoException).code !== "ESRCH") {
+          // EPERM or other — treat as alive
+          aliveWorkers.push({
+            stepId: step.id,
+            agentId: step.agent_id,
+            pid: step.claim_pid,
+          });
+        }
+      }
+    }
+  }
+
+  if (aliveWorkers.length > 0 && !force) {
+    return {
+      ok: false,
+      runId,
+      status: run.status,
+      reason: `Run ${runId.slice(0, 8)} has ${aliveWorkers.length} alive worker(s). Use --force to force-fail anyway.`,
+      aliveWorkers,
+    };
+  }
+
+  // Cancel pending/waiting/running steps
+  db.prepare(
+    "UPDATE steps SET status = 'canceled', updated_at = datetime('now') WHERE run_id = ? AND status IN ('waiting', 'pending', 'running')",
+  ).run(runId);
+
+  // Set run to failed and clear scheduling status
+  db.prepare(
+    "UPDATE runs SET status = 'failed', scheduling_status = NULL, updated_at = datetime('now') WHERE id = ?",
+  ).run(runId);
+
+  // Emit run.force_failed event with reason
+  emitEvent({
+    ts: new Date().toISOString(),
+    event: "run.force_failed",
+    runId,
+    workflowId: run.workflow_id,
+    detail: reason,
+  });
+
+  logger.info(`Run ${runId.slice(0, 8)} force-failed: ${reason}`, {
+    runId,
+    reason,
+    forced: !!force,
+    aliveWorkerCount: aliveWorkers.length,
+  });
+
+  // Tear down crons and notify daemon
+  await Promise.allSettled([
+    removeRunCrons(runId),
+    terminateRunWithDaemon(runId),
+  ]);
+  scheduleRunCronTeardown(runId);
+
+  return { ok: true, runId, status: "failed", reason };
 }
 
 // ── Internal helpers ────────────────────────────────────────────────

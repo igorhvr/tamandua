@@ -116,6 +116,7 @@ tests/pi-token-saver.test.ts
 tests/portability-lint.test.ts
 tests/reroute-count-column-migration.test.ts
 tests/reroute-paths.test.ts
+tests/resume-step-output.test.ts
 tests/run-terminal-token-events.test.ts
 tests/run-token-migration.test.ts
 tests/runner-scripts.test.ts
@@ -123,6 +124,8 @@ tests/sample-project-fixture.test.ts
 tests/step-ops-dispatch-races.test.ts
 tests/step-ops.test.ts
 tests/step-ownership-columns-migration.test.ts
+tests/step-rejection-logging.test.ts
+tests/step-release.test.ts
 tests/stories-json-validation.test.ts
 tests/syntax-check.test.ts
 tests/system-token-spend-migration.test.ts
@@ -132,4 +135,5 @@ tests/update-protocol.test.ts
 tests/work-round-persona-prompt.test.ts
 tests/work-round-token-attribution.test.ts
 tests/workflow-contract.test.ts
+tests/workflow-fail.test.ts
 tests/workflow-graph-simulation.test.ts

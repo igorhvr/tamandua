@@ -7,7 +7,7 @@
 
 import { installWorkflow } from "../../installer/install.js";
 import { uninstallAllWorkflows, uninstallWorkflow, checkActiveRuns } from "../../installer/uninstall.js";
-import { getWorkflowStatus, listRuns, stopWorkflow, deleteWorkflow } from "../../installer/status.js";
+import { getWorkflowStatus, listRuns, stopWorkflow, deleteWorkflow, forceFailRun } from "../../installer/status.js";
 import { runWorkflow, resumeWorkflow } from "../../installer/run.js";
 import { listBundledWorkflows } from "../../installer/workflow-fetch.js";
 import { loadWorkflowSpec } from "../../installer/workflow-spec.js";
@@ -19,6 +19,7 @@ import { buildAbandonReasonAggregate } from "../../installer/step-ops.js";
 import { checkCatalogStalenessWarning } from "../../installer/catalog-version.js";
 import { parseWorkflowRunArgs } from "../workflow-run-args.js";
 import { reportUnknownCommand } from "../shared.js";
+import { logger } from "../../lib/logger.js";
 import type { HarnessType } from "../../installer/types.js";
 import { printWorkflowAutoresearch } from "./autoresearch.js";
 import { handleWait, getWaitHelp } from "./wait.js";
@@ -326,10 +327,37 @@ Examples:
   tamandua workflow resume-all`;
 }
 
+export function getWorkflowFailHelp(): string {
+  return `tamandua workflow fail — Force a running or paused run to failed status
+
+Usage: tamandua workflow fail <run-id> --reason <text> [--force]
+
+Forces a running or paused workflow run to terminal failed status. The run-id
+accepts prefix matching and #N (run number).
+
+The --reason argument is required and is recorded in the run.force_failed
+event for auditability.
+
+By default, this command checks whether any worker for the run is still alive
+(step with running status and live claim_pid). If a live worker is found, the
+command refuses and lists the alive workers with their step IDs and PIDs. Use
+--force to override this guard and force-fail the run anyway (the worker is
+NOT terminated — only the run status is changed).
+
+Options:
+  --reason <text>    Reason for force-failing the run (required)
+  --force            Force-fail even if a worker is still alive
+
+Examples:
+  tamandua workflow fail abc12345 --reason "Run stuck after repo migration"
+  tamandua workflow fail abc12345 --reason "Run abandoned" --force
+  tamandua workflow fail #42 --reason "Manual intervention"`;
+}
+
 export function getWorkflowGroupHelp(): string {
   return `tamandua workflow — Manage workflows and runs
 
-Usage: tamandua workflow <list|runs|install|uninstall|run|status|autoresearch|stop|delete|wait|pause|resume|pause-all|resume-all>
+Usage: tamandua workflow <list|runs|install|uninstall|run|status|autoresearch|stop|delete|wait|pause|resume|pause-all|resume-all|fail>
 
 Commands for managing Tamandua workflows and their runs.
 
@@ -350,6 +378,7 @@ Subcommands:
   resume      Resume a paused or failed workflow run
   pause-all   Pause all running workflows
   resume-all  Resume all paused workflows
+  fail        Force a running or paused run to failed status
 
 Examples:
   tamandua workflow list
@@ -359,7 +388,8 @@ Examples:
   tamandua workflow status abc12345
   tamandua workflow autoresearch abc12345
   tamandua workflow wait abc12345
-  tamandua workflow pause abc12345 --drain`;
+  tamandua workflow pause abc12345 --drain
+  tamandua workflow fail abc12345 --reason "Stuck run"`;
 }
 
 
@@ -378,6 +408,24 @@ current metric summary and recent experiment timeline.
 
 Examples:
   tamandua workflow autoresearch abc12345`;
+}
+
+/**
+ * Print non-done step states for a run.
+ * One line per step: [status] stepIdPrefix (role) retry N
+ */
+function printNonDoneStepStates(runId: string): void {
+  try {
+    const detail = getWorkflowStatus(runId);
+    const nonDone = detail.steps.filter((s) => s.status !== "done");
+    for (const step of nonDone) {
+      const role = step.agentId.split("_").slice(-1)[0];
+      const prefix = step.stepId.slice(0, 8);
+      console.log(`  [${step.status}] ${prefix} (${role}) retry ${step.retryCount}`);
+    }
+  } catch {
+    // If step query fails (e.g. DB error), don't break the resume flow.
+  }
 }
 
 export async function handleWorkflow(
@@ -506,12 +554,14 @@ export async function handleWorkflow(
         process.exit(1);
       }
       console.log(`Resumed run ${fullId.slice(0, 8)}.`);
+      printNonDoneStepStates(fullId);
       return true;
     }
     if (runStatus === "failed") {
       const result = await resumeWorkflow(fullId);
       if (result.status === "not_found") { console.log(`No failed run found matching "${target}".`); return true; }
       console.log(`Resumed run ${result.runId!.slice(0, 8)} (${result.workflowId}), restarting from step: ${result.stepId}`);
+      printNonDoneStepStates(result.runId!);
       return true;
     }
     if (runStatus === "completed" || runStatus === "canceled") {
@@ -564,6 +614,9 @@ export async function handleWorkflow(
         continue;
       }
       resumed++;
+      console.log(`  Resumed run ${r.id.slice(0, 8)}.`);
+      printNonDoneStepStates(r.id);
+      console.log();
     }
     console.log(`Resumed ${resumed} run(s).`);
     return true;
@@ -571,7 +624,7 @@ export async function handleWorkflow(
 
   const WORKFLOW_ACTIONS = [
     "runs", "list", "stop", "cancel", "pause", "resume", "pause-all", "resume-all",
-    "install", "uninstall", "run", "status", "autoresearch", "wait", "delete", "ensure-crons",
+    "install", "uninstall", "run", "status", "autoresearch", "wait", "delete", "fail", "ensure-crons",
   ];
   if (!WORKFLOW_ACTIONS.includes(action)) {
     reportUnknownCommand(action, WORKFLOW_ACTIONS, "workflow");
@@ -797,6 +850,59 @@ export async function handleWorkflow(
   }
 
 
+
+  if (action === "fail") {
+    if (!target) { process.stderr.write("Missing run-id.\nUsage: tamandua workflow fail <run-id> --reason <text> [--force]\n"); process.exit(1); }
+
+    // Parse --reason and --force from args (skip group and action indices)
+    const failArgs = args.slice(2);
+    const reasonIdx = failArgs.indexOf("--reason");
+    let failReason: string | undefined;
+    if (reasonIdx !== -1 && reasonIdx + 1 < failArgs.length) {
+      failReason = failArgs[reasonIdx + 1];
+    }
+    if (!failReason) {
+      process.stderr.write("Missing --reason. Usage: tamandua workflow fail <run-id> --reason <text> [--force]\n");
+      process.exit(1);
+    }
+    const forceFlag = failArgs.includes("--force");
+
+    let fullId: string;
+    let runStatus: string;
+    try {
+      const detail = getWorkflowStatus(target);
+      fullId = detail.id;
+      runStatus = detail.status;
+    } catch (err) {
+      process.stderr.write(`${err instanceof Error ? err.message : String(err)}\n`);
+      process.exit(1);
+    }
+
+    if (runStatus !== "running" && runStatus !== "paused") {
+      process.stderr.write(`Cannot force-fail run ${fullId.slice(0, 8)}: status is "${runStatus}" (only running or paused runs can be force-failed).\n`);
+      process.exit(1);
+    }
+
+    try {
+      const result = await forceFailRun(fullId, failReason, forceFlag);
+      if (!result.ok) {
+        // Refused due to alive workers
+        process.stderr.write(`${result.reason}\n`);
+        if (result.aliveWorkers) {
+          for (const w of result.aliveWorkers) {
+            process.stderr.write(`  Step ${w.stepId.slice(0, 8)} (${w.agentId}) PID ${w.pid}\n`);
+          }
+        }
+        logger.warn(`forceFailRun refused: ${result.reason}`, { runId: fullId, aliveWorkers: result.aliveWorkers });
+        process.exit(1);
+      }
+      console.log(`Force-failed run ${fullId.slice(0, 8)}: ${failReason}`);
+    } catch (err) {
+      process.stderr.write(`${err instanceof Error ? err.message : String(err)}\n`);
+      process.exit(1);
+    }
+    return true;
+  }
 
   if (action === "ensure-crons") {
     // Polling jobs are now tied to (runId, agentId) and admitted via the

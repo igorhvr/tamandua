@@ -320,6 +320,44 @@ describe("PiHarnessAdapter implementation", () => {
 
       }
     });
+
+    it("pi spawn args do NOT contain --no-session", async () => {
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-nosession-");
+      const fakePi = path.join(tmpDir, "pi");
+      const argsFile = path.join(tmpDir, "args.txt");
+      fs.writeFileSync(
+        fakePi,
+        `#!/usr/bin/env node
+const fs = require('node:fs');
+fs.writeFileSync('${argsFile}', JSON.stringify(process.argv.slice(1)));
+`,
+        "utf-8"
+      );
+      fs.chmodSync(fakePi, 0o755);
+
+      const originalPiBinary = process.env.TAMANDUA_PI_BINARY;
+      process.env.TAMANDUA_PI_BINARY = fakePi;
+
+      try {
+        await adapter.runRound("test prompt", {
+          timeout: 3,
+          workdir: tmpDir,
+        });
+
+        assert.ok(fs.existsSync(argsFile), "args file should exist");
+        const recorded = JSON.parse(fs.readFileSync(argsFile, "utf-8"));
+        assert.ok(!recorded.includes("--no-session"), `pi args must NOT contain --no-session: ${JSON.stringify(recorded)}`);
+        assert.ok(recorded.includes("--print"), "pi args must contain --print");
+        assert.ok(recorded.includes("--mode"), "pi args must contain --mode");
+        assert.ok(recorded.includes("json"), "pi args must contain json");
+      } finally {
+        if (originalPiBinary === undefined) {
+          delete process.env.TAMANDUA_PI_BINARY;
+        } else {
+          process.env.TAMANDUA_PI_BINARY = originalPiBinary;
+        }
+      }
+    });
   });
 });
 

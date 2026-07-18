@@ -6,6 +6,7 @@ import { describe, it } from "node:test";
 import {
   getWorkflowAutoresearchHelp,
   getWorkflowDeleteHelp,
+  getWorkflowFailHelp,
   getWorkflowGroupHelp,
   getWorkflowInstallHelp,
   getWorkflowListHelp,
@@ -45,12 +46,15 @@ describe("SPL2 workflow command module", () => {
     assert.match(getWorkflowResumeHelp(), /Resume a paused or failed workflow run/);
     assert.match(getWorkflowPauseAllHelp(), /Pause all running workflows/);
     assert.match(getWorkflowResumeAllHelp(), /Resume all paused workflows/);
+    assert.match(getWorkflowFailHelp(), /Force a running or paused run to failed status/);
+    assert.match(getWorkflowFailHelp(), /--reason/);
+    assert.match(getWorkflowFailHelp(), /--force/);
   });
 
   it("preserves the exact workflow group help text", () => {
     assert.equal(getWorkflowGroupHelp(), `tamandua workflow — Manage workflows and runs
 
-Usage: tamandua workflow <list|runs|install|uninstall|run|status|autoresearch|stop|delete|wait|pause|resume|pause-all|resume-all>
+Usage: tamandua workflow <list|runs|install|uninstall|run|status|autoresearch|stop|delete|wait|pause|resume|pause-all|resume-all|fail>
 
 Commands for managing Tamandua workflows and their runs.
 
@@ -71,6 +75,7 @@ Subcommands:
   resume      Resume a paused or failed workflow run
   pause-all   Pause all running workflows
   resume-all  Resume all paused workflows
+  fail        Force a running or paused run to failed status
 
 Examples:
   tamandua workflow list
@@ -80,7 +85,8 @@ Examples:
   tamandua workflow status abc12345
   tamandua workflow autoresearch abc12345
   tamandua workflow wait abc12345
-  tamandua workflow pause abc12345 --drain`);
+  tamandua workflow pause abc12345 --drain
+  tamandua workflow fail abc12345 --reason "Stuck run"`);
   });
 
   it("declines commands owned by other command groups", async () => {

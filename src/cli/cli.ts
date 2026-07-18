@@ -70,7 +70,9 @@ import {
   getStepCompleteHelp,
   getStepCurrentHelp,
   getStepFailHelp,
+  getStepHelp,
   getStepPeekHelp,
+  getStepReleaseHelp,
   getStepStoriesHelp,
   handleStep,
 } from "./commands/step.js";
@@ -103,6 +105,7 @@ import {
 import {
   getWorkflowAutoresearchHelp,
   getWorkflowDeleteHelp,
+  getWorkflowFailHelp,
   getWorkflowGroupHelp,
   getWorkflowInstallHelp,
   getWorkflowListHelp,
@@ -169,6 +172,8 @@ function getUsageText(): string {
     "tamandua workflow pause-all [--drain]  Pause all running workflows",
     "tamandua workflow resume <run-id>     Resume a paused or failed run",
     "tamandua workflow resume-all           Resume all paused workflows",
+    "tamandua workflow fail <run-id> --reason <text> [--force]",
+    "                                      Force a running/paused run to failed status",
     "tamandua workflow stop <run-id>       Stop/cancel a running workflow",
     "tamandua workflow cancel <run-id>     Alias for stop",
     "tamandua workflow delete <run-id>     Permanently delete a run [--force]",
@@ -197,6 +202,7 @@ function getUsageText(): string {
     "tamandua step complete <step-id>      Complete step (reads output from stdin)",
     "tamandua step fail <step-id> <error>  Fail step with retry logic",
     "tamandua step stories <run-id> [--json]        List stories for a run",
+    "tamandua step release <run-id> [step-id] [--force]  Release stuck step back to pending",
     "", "tamandua logs [<lines>|<run-id>|#<run-number>] Show recent activity",
     "tamandua logs-tail [<lines>|<run-id>|#<run-number>] Follow recent activity",
     "", "tamandua version                      Show installed version",
@@ -281,6 +287,8 @@ async function main() {
       if (action === "current") { printHelp(getStepCurrentHelp()); }
       if (action === "fail") { printHelp(getStepFailHelp()); }
       if (action === "stories") { printHelp(getStepStoriesHelp()); }
+      if (action === "release") { printHelp(getStepReleaseHelp()); }
+      printHelp(getStepHelp());
     }
     if (group === "logs") {
       printHelp(getLogsHelp());
@@ -302,6 +310,7 @@ async function main() {
       if (action === "resume") { printHelp(getWorkflowResumeHelp()); }
       if (action === "pause-all") { printHelp(getWorkflowPauseAllHelp()); }
       if (action === "resume-all") { printHelp(getWorkflowResumeAllHelp()); }
+      if (action === "fail") { printHelp(getWorkflowFailHelp()); }
       if (action === "wait") { printHelp(getWaitHelp()); }
       printHelp(getWorkflowGroupHelp());
     }

@@ -26,6 +26,7 @@ const documentedCommands: [string, string][] = [
   ["tamandua workflow resume", "workflow resume"],
   ["tamandua workflow resume-all", "workflow resume-all"],
   ["tamandua workflow stop", "workflow stop"],
+  ["tamandua workflow fail", "workflow fail"],
   ["tamandua workflow autoresearch", "workflow autoresearch"],
 
   // Section 2.2: logs
@@ -86,6 +87,7 @@ const documentedCommands: [string, string][] = [
   ["tamandua step complete", "step complete"],
   ["tamandua step fail", "step fail"],
   ["tamandua step stories", "step stories"],
+  ["tamandua step release", "step release"],
 ];
 
 // Actual CLI commands verified from src/cli/cli.ts
@@ -136,6 +138,7 @@ const actualCommands: string[] = [
   "tamandua step complete",
   "tamandua step fail",
   "tamandua step stories",
+  "tamandua step release",
 
   // workflow
   "tamandua workflow list",
@@ -145,6 +148,7 @@ const actualCommands: string[] = [
   "tamandua workflow run",
   "tamandua workflow status",
   "tamandua workflow stop",
+  "tamandua workflow fail",
   "tamandua workflow autoresearch",
   "tamandua workflow pause",
   "tamandua workflow resume",
