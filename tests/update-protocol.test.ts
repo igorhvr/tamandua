@@ -790,6 +790,360 @@ try {
   });
 });
 
+// ── NIT-CRASH: acquisition DDL crash durability ─────────────────────────
+
+describe("Acquire crash durability", () => {
+  const CRASH_DEADLINE_MS = 7_200_000;
+  const CHILD_OUTPUT_LIMIT = 4_096;
+  const RESERVED_ARTIFACTS = [
+    "update_gate",
+    "trg_update_gate_block_runs_insert",
+    "trg_update_gate_block_runs_update",
+  ];
+
+  function collectBounded(stream, label) {
+    let output = "";
+    let bytes = 0;
+    let overflow = false;
+    stream.on("data", (chunk) => {
+      bytes += chunk.length;
+      if (bytes > CHILD_OUTPUT_LIMIT) {
+        overflow = true;
+        return;
+      }
+      output += chunk.toString();
+    });
+    return {
+      read() {
+        assert.equal(overflow, false, `${label} exceeded bounded output`);
+        return output;
+      },
+    };
+  }
+
+  function childClose(child) {
+    return new Promise((resolve, reject) => {
+      child.once("error", reject);
+      child.once("close", (code, signal) => resolve({ code, signal }));
+    });
+  }
+
+  function awaitClose(closePromise, label) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error(`${label} did not close before its deadline`)),
+        CRASH_DEADLINE_MS,
+      );
+      closePromise.then(
+        (result) => {
+          clearTimeout(timer);
+          resolve(result);
+        },
+        (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      );
+    });
+  }
+
+  function waitForBarrier(barrierPath, child) {
+    if (fs.existsSync(barrierPath)) return Promise.resolve();
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        watcher.close();
+        child.off("close", onPrematureClose);
+        if (error) reject(error);
+        else resolve();
+      };
+      const onPrematureClose = (code, signal) => {
+        finish(
+          new Error(
+            `acquirer closed before the DDL barrier (code=${code}, signal=${signal})`,
+          ),
+        );
+      };
+      const watcher = fs.watch(path.dirname(barrierPath), (_event, filename) => {
+        if (filename === path.basename(barrierPath) && fs.existsSync(barrierPath)) {
+          finish();
+        }
+      });
+      const timer = setTimeout(
+        () => finish(new Error("uncommitted DDL barrier was not observed")),
+        CRASH_DEADLINE_MS,
+      );
+      child.once("close", onPrematureClose);
+      if (fs.existsSync(barrierPath)) finish();
+    });
+  }
+
+  function readRecoverySnapshot(dbPath) {
+    const db = new DatabaseSync(dbPath);
+    try {
+      const runsSchema = db
+        .prepare(
+          `SELECT type, name, tbl_name, sql FROM sqlite_schema
+           WHERE name = 'runs' OR tbl_name = 'runs'
+           ORDER BY type, name`,
+        )
+        .all()
+        .map((row) => ({ ...row }));
+      const runs = db
+        .prepare("SELECT * FROM runs ORDER BY id")
+        .all()
+        .map((row) => ({ ...row }));
+      const reserved = db
+        .prepare(
+          `SELECT type, name, tbl_name, sql FROM sqlite_schema
+           WHERE name IN (?, ?, ?)
+           ORDER BY name`,
+        )
+        .all(...RESERVED_ARTIFACTS)
+        .map((row) => ({ ...row }));
+      const gateRows = reserved.some((row) => row.name === "update_gate")
+        ? db.prepare("SELECT id FROM update_gate ORDER BY id").all()
+        : [];
+      return {
+        runsSchema,
+        runs,
+        reserved,
+        gateRows: gateRows.map((row) => ({ ...row })),
+        userVersion: db.prepare("PRAGMA user_version").get().user_version,
+      };
+    } finally {
+      db.close();
+    }
+  }
+
+  async function reapChild(child, closePromise, label) {
+    if (!child || !closePromise) return;
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill("SIGKILL");
+    }
+    await awaitClose(closePromise, label);
+  }
+
+  it(
+    "rolls back real uncommitted gate DDL after SIGKILL and permits a fresh acquisition",
+    { timeout: CRASH_DEADLINE_MS },
+    async () => {
+      const temp = createTempHome("update-protocol-acquire-crash-");
+      const dbPath = path.join(temp.root, "crash.db");
+      const barrierDir = path.join(temp.root, "barriers");
+      const ddlBarrier = path.join(barrierDir, "canonical-ddl-created");
+      fs.mkdirSync(barrierDir, { recursive: true, mode: 0o700 });
+      const env = cleanChildEnv({
+        HOME: temp.homeDir,
+        TAMANDUA_STATE_DIR: path.join(temp.homeDir, ".tamandua"),
+        TAMANDUA_DB_PATH: dbPath,
+        TAMANDUA_TEST_GUARD: "1",
+      });
+
+      let crashedChild;
+      let crashedClose;
+      try {
+        const setupResult = spawnSync(
+          process.execPath,
+          [
+            "--input-type=module",
+            "-e",
+            `import { getDb, closeDb } from ${JSON.stringify(DIST_DB)};
+const db = getDb();
+try {
+  db.prepare("INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, notify_url, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+    .run("crash-sentinel", 73, "crash-proof", "preserve me", "completed", "{\\"sentinel\\":true}", 17, null, "2026-07-17T00:00:00.000Z", "2026-07-17T00:00:01.000Z");
+  db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+} finally {
+  closeDb();
+}
+process.stdout.write("READY\\n");`,
+          ],
+          {
+            encoding: "utf-8",
+            env,
+            timeout: CRASH_DEADLINE_MS,
+            maxBuffer: CHILD_OUTPUT_LIMIT,
+          },
+        );
+        assert.equal(setupResult.status, 0, `setup failed: ${setupResult.stderr}`);
+        assert.equal(setupResult.signal, null);
+        assert.ok(setupResult.error === undefined);
+        assert.equal(setupResult.stdout, "READY\n");
+        assert.equal(setupResult.stderr, "");
+
+        const before = readRecoverySnapshot(dbPath);
+        assert.equal(before.runs.length, 1, "sentinel setup must create one run");
+        assert.equal(before.runs[0].id, "crash-sentinel");
+        assert.deepEqual(before.reserved, []);
+        assert.deepEqual(before.gateRows, []);
+
+        const crashCode = `
+import fs from "node:fs";
+import { DatabaseSync } from "node:sqlite";
+
+const barrier = ${JSON.stringify(ddlBarrier)};
+const secondTrigger = ${JSON.stringify(`CREATE TRIGGER trg_update_gate_block_runs_update
+BEFORE UPDATE OF status ON runs
+WHEN EXISTS (SELECT 1 FROM update_gate WHERE id = 1)
+  AND NEW.status = 'running' AND OLD.status != 'running'
+BEGIN
+  SELECT RAISE(ABORT, 'update in progress');
+END`)};
+const originalExec = DatabaseSync.prototype.exec;
+const blocker = new Int32Array(new SharedArrayBuffer(4));
+
+DatabaseSync.prototype.exec = function(sql) {
+  const result = originalExec.call(this, sql);
+  if (sql === secondTrigger) {
+    const artifacts = this.prepare(
+      "SELECT type, name FROM sqlite_schema WHERE name IN ('update_gate', 'trg_update_gate_block_runs_insert', 'trg_update_gate_block_runs_update') ORDER BY name"
+    ).all();
+    const singletonCount = this.prepare("SELECT COUNT(*) AS count FROM update_gate").get().count;
+    if (artifacts.length !== 3 || singletonCount !== 0) {
+      throw new Error("canonical uncommitted DDL proof failed");
+    }
+    fs.writeFileSync(barrier, JSON.stringify({ artifactCount: artifacts.length, singletonCount }), { mode: 0o600 });
+    Atomics.wait(blocker, 0, 0);
+  }
+  return result;
+};
+
+try {
+  const { acquire } = await import(${JSON.stringify(PROTOCOL_MODULE)});
+  acquire("current", process.ppid, "{}", "{}", "{}");
+  throw new Error("acquire unexpectedly returned past the crash barrier");
+} finally {
+  DatabaseSync.prototype.exec = originalExec;
+}`;
+
+        crashedChild = spawn(
+          process.execPath,
+          ["--input-type=module", "-e", crashCode],
+          { env, stdio: ["ignore", "pipe", "pipe"] },
+        );
+        crashedClose = childClose(crashedChild);
+        const crashedStdout = collectBounded(crashedChild.stdout, "crashed acquirer stdout");
+        const crashedStderr = collectBounded(crashedChild.stderr, "crashed acquirer stderr");
+
+        await waitForBarrier(ddlBarrier, crashedChild);
+        assert.deepEqual(JSON.parse(fs.readFileSync(ddlBarrier, "utf8")), {
+          artifactCount: 3,
+          singletonCount: 0,
+        });
+        assert.equal(crashedChild.exitCode, null, "acquirer must remain live at barrier");
+        assert.equal(crashedChild.signalCode, null, "acquirer must not already be signaled");
+        assert.doesNotThrow(() => process.kill(crashedChild.pid, 0));
+        assert.equal(crashedChild.kill("SIGKILL"), true, "SIGKILL must target retained child");
+        const crashExit = await awaitClose(crashedClose, "crashed acquirer");
+        assert.deepEqual(crashExit, { code: null, signal: "SIGKILL" });
+        assert.equal(crashedStdout.read(), "");
+        assert.equal(crashedStderr.read(), "");
+        crashedChild = undefined;
+        crashedClose = undefined;
+
+        const recovered = readRecoverySnapshot(dbPath);
+        assert.deepEqual(recovered.runsSchema, before.runsSchema);
+        assert.deepEqual(recovered.runs, before.runs);
+        assert.equal(recovered.userVersion, before.userVersion);
+        assert.deepEqual(recovered.reserved, [], "recovery must remove all protocol DDL");
+        assert.deepEqual(recovered.gateRows, [], "recovery must remove the singleton");
+
+        const reopened = readRecoverySnapshot(dbPath);
+        assert.deepEqual(reopened, recovered, "recovered state must survive a second reopen");
+
+        const freshResult = spawnSync(
+          process.execPath,
+          [
+            "--input-type=module",
+            "-e",
+            `import { acquire } from ${JSON.stringify(PROTOCOL_MODULE)};
+const result = acquire("current", process.ppid, "{}", "{}", "{}");
+process.stdout.write(JSON.stringify({ phase: result.phase, mode: result.mode }) + "\\n");`,
+          ],
+          {
+            encoding: "utf-8",
+            env,
+            timeout: CRASH_DEADLINE_MS,
+            maxBuffer: CHILD_OUTPUT_LIMIT,
+          },
+        );
+        assert.equal(freshResult.status, 0, `fresh acquisition failed: ${freshResult.stderr}`);
+        assert.equal(freshResult.signal, null);
+        assert.ok(freshResult.error === undefined);
+        assert.equal(freshResult.stdout, '{"phase":"ACQUIRED","mode":"current"}\n');
+        assert.equal(freshResult.stderr, "");
+
+        const acquiredDb = new DatabaseSync(dbPath);
+        try {
+          const artifacts = acquiredDb
+            .prepare(
+              `SELECT type, name, tbl_name, sql FROM sqlite_schema
+               WHERE name IN (?, ?, ?)
+               ORDER BY name`,
+            )
+            .all(...RESERVED_ARTIFACTS)
+            .map((row) => ({ ...row }));
+          assert.deepEqual(artifacts, [
+            {
+              type: "trigger",
+              name: "trg_update_gate_block_runs_insert",
+              tbl_name: "runs",
+              sql: "CREATE TRIGGER trg_update_gate_block_runs_insert\nBEFORE INSERT ON runs\nWHEN EXISTS (SELECT 1 FROM update_gate WHERE id = 1)\nBEGIN\n  SELECT RAISE(ABORT, 'update in progress');\nEND",
+            },
+            {
+              type: "trigger",
+              name: "trg_update_gate_block_runs_update",
+              tbl_name: "runs",
+              sql: "CREATE TRIGGER trg_update_gate_block_runs_update\nBEFORE UPDATE OF status ON runs\nWHEN EXISTS (SELECT 1 FROM update_gate WHERE id = 1)\n  AND NEW.status = 'running' AND OLD.status != 'running'\nBEGIN\n  SELECT RAISE(ABORT, 'update in progress');\nEND",
+            },
+            {
+              type: "table",
+              name: "update_gate",
+              tbl_name: "update_gate",
+              sql: "CREATE TABLE update_gate (\n  id INTEGER PRIMARY KEY CHECK (id = 1),\n  token TEXT NOT NULL,\n  mode TEXT NOT NULL CHECK (mode IN ('legacy', 'current')),\n  phase TEXT NOT NULL CHECK (phase IN ('ACQUIRED', 'GUARDIAN_RECORDED', 'FAILED')),\n  owner_pid INTEGER NOT NULL,\n  owner_identity TEXT NOT NULL,\n  guardian_pid INTEGER,\n  guardian_identity TEXT,\n  topology TEXT NOT NULL,\n  artifacts TEXT NOT NULL,\n  readiness TEXT NOT NULL,\n  failure_reason TEXT,\n  failure_details TEXT,\n  created_at TEXT NOT NULL,\n  updated_at TEXT NOT NULL\n)",
+            },
+          ]);
+          const rows = acquiredDb
+            .prepare(
+              `SELECT id, length(token) AS token_length, mode, phase, topology,
+                      artifacts, readiness, guardian_pid, guardian_identity,
+                      failure_reason, failure_details
+               FROM update_gate`,
+            )
+            .all()
+            .map((row) => ({ ...row }));
+          assert.deepEqual(rows, [
+            {
+              id: 1,
+              token_length: 43,
+              mode: "current",
+              phase: "ACQUIRED",
+              topology: "{}",
+              artifacts: "{}",
+              readiness: "{}",
+              guardian_pid: null,
+              guardian_identity: null,
+              failure_reason: null,
+              failure_details: null,
+            },
+          ]);
+        } finally {
+          acquiredDb.close();
+        }
+      } finally {
+        await reapChild(crashedChild, crashedClose, "crashed acquirer cleanup");
+        fs.rmSync(temp.root, { recursive: true, force: true });
+        assert.ok(!fs.existsSync(temp.root), "crash proof temp root must be absent");
+      }
+    },
+  );
+});
+
 // ── NIT-RACE: recordGuardian versus fail from one ACQUIRED snapshot ──────
 
 describe("recordGuardian/fail CAS race", () => {
