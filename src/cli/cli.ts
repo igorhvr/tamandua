@@ -13,6 +13,9 @@ import {
   hasHelpFlag,
   printHelp,
   shouldSkipUpdateWarning,
+  isTopLevelGroup,
+  KNOWN_TOP_LEVEL,
+  reportUnknownCommand,
 } from "./shared.js";
 import {
   getNudgeHelp,
@@ -65,6 +68,7 @@ import {
 import {
   getStepClaimHelp,
   getStepCompleteHelp,
+  getStepCurrentHelp,
   getStepFailHelp,
   getStepPeekHelp,
   getStepStoriesHelp,
@@ -166,6 +170,7 @@ function getUsageText(): string {
     "tamandua workflow resume <run-id>     Resume a paused or failed run",
     "tamandua workflow resume-all           Resume all paused workflows",
     "tamandua workflow stop <run-id>       Stop/cancel a running workflow",
+    "tamandua workflow cancel <run-id>     Alias for stop",
     "tamandua workflow delete <run-id>     Permanently delete a run [--force]",
     "tamandua workflow wait <selector...> [--all] [--timeout <dur>] [--json] [--quiet]",
     "                                      Block until runs reach terminal status",
@@ -188,10 +193,11 @@ function getUsageText(): string {
     "", "tamandua restart [--force]            Restart all services with stop→ready barrier",
     "", "tamandua step peek <agent-id> --run-id <run-id>     Check for pending work (HAS_WORK or NO_WORK)",
     "tamandua step claim <agent-id> --run-id <run-id>    Claim pending step (JSON output)",
+    "tamandua step current <agent-id> --run-id <run-id>  Read-only query for held step (JSON or NONE)",
     "tamandua step complete <step-id>      Complete step (reads output from stdin)",
     "tamandua step fail <step-id> <error>  Fail step with retry logic",
     "tamandua step stories <run-id>        List stories for a run",
-    "", "tamandua logs [<lines>|<run-id>|#<run-number>] Show recent activity",
+    "", "tamandua logs [<lines>|<run-id>|#<run-number>] [--tail <N>] Show recent activity",
     "tamandua logs-tail [<lines>|<run-id>|#<run-number>] Follow recent activity",
     "", "tamandua version                      Show installed version",
     "tamandua skill-path                  Print path to the bundled tamandua-agents skill",
@@ -272,6 +278,7 @@ async function main() {
       if (action === "peek") { printHelp(getStepPeekHelp()); }
       if (action === "claim") { printHelp(getStepClaimHelp()); }
       if (action === "complete") { printHelp(getStepCompleteHelp()); }
+      if (action === "current") { printHelp(getStepCurrentHelp()); }
       if (action === "fail") { printHelp(getStepFailHelp()); }
       if (action === "stories") { printHelp(getStepStoriesHelp()); }
     }
@@ -365,7 +372,15 @@ async function main() {
 
   if (await handleWorkflow(group, args, printUsage)) { return; }
 
-  printUsage(); process.exit(1);
+  // Unknown command: detect whether it's a known top-level group with a missing
+  // subcommand or a completely unknown group. Print a helpful error instead of
+  // dumping the full usage.
+  if (group && !isTopLevelGroup(group)) {
+    reportUnknownCommand(group, KNOWN_TOP_LEVEL);
+  }
+  // No args or command group not recognized by any handler → print usage
+  printUsage();
+  process.exit(1);
 }
 
 main().then(

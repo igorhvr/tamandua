@@ -12,6 +12,7 @@ import {
   getOwnProcessGroupId,
   getStories,
   peekStep,
+  stepCurrent,
 } from "../../installer/step-ops.js";
 
 export function getStepPeekHelp(): string {
@@ -120,6 +121,28 @@ Examples:
   tamandua step stories abc12345`;
 }
 
+export function getStepCurrentHelp(): string {
+  return `tamandua step current — Read-only query for a held step
+
+Usage: tamandua step current <agent-id> --run-id <run-id>
+
+step current returns the claim JSON for the step currently held (running)
+by the given agent in the run. It is a pure read-only query — no state
+mutation, no side effects.
+
+Output:
+  JSON: {"stepId":"<UUID>","runId":"<UUID>","input":"<task description>"}
+  NONE — when the agent has no in-flight (running) step in this run
+
+Exit 0 either way; exit 1 on bad args (missing agent-id or --run-id).
+
+The --run-id flag is required so concurrent runs of the same workflow/agent
+cannot cross-claim each other's steps.
+
+Examples:
+  tamandua step current feature-dev-merge_developer --run-id abc12345`;
+}
+
 /** Handle step protocol commands. Returns false for unrelated command groups. */
 export async function handleStep(group: string, args: string[]): Promise<boolean> {
   if (group !== "step") return false;
@@ -190,6 +213,33 @@ export async function handleStep(group: string, args: string[]): Promise<boolean
   if (action === "fail") {
     if (!target) { process.stderr.write("Missing step-id.\n"); process.exit(1); }
     console.log(JSON.stringify(await failStep(target, args.slice(3).join(" ").trim() || "Unknown error")));
+    return true;
+  }
+  if (action === "current") {
+    if (!target) {
+      process.stderr.write(`Missing agent-id.\nUsage: tamandua step current <agent-id> --run-id <run-id>\n`);
+      process.exit(1);
+    }
+    let runIdArg: string | undefined;
+    const remainder = args.slice(3);
+    for (let i = 0; i < remainder.length; i++) {
+      const tok = remainder[i];
+      if (tok === "--run-id") { runIdArg = remainder[i + 1]?.trim(); i++; continue; }
+      const inline = "--run-id=";
+      if (tok.startsWith(inline)) { runIdArg = tok.slice(inline.length).trim(); }
+    }
+    if (!runIdArg) {
+      process.stderr.write(
+        `Missing --run-id for step current.\nUsage: tamandua step current <agent-id> --run-id <run-id>\n`,
+      );
+      process.exit(1);
+    }
+    const result = stepCurrent(target, runIdArg);
+    if (result) {
+      console.log(JSON.stringify(result));
+    } else {
+      console.log("NONE");
+    }
     return true;
   }
   if (action === "stories") {

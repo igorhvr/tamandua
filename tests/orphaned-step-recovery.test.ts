@@ -1156,9 +1156,9 @@ describe("US-004: Worker-lifecycle recovery regression tests", () => {
     const inputTemplate = "Plan task.\nRETRY FEEDBACK:\n{{retry_feedback}}";
     db.prepare(
       `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects,
-        status, retry_count, max_retries, type, created_at, updated_at)
-       VALUES (?, ?, 'plan', ?, 0, ?, 'STATUS: done', 'running', 0, 2, 'single', ?, ?)`
-    ).run(planStepUuid, runId, agent, inputTemplate, now, now);
+        status, retry_count, max_retries, type, claim_job_id, claim_pid, claim_updated_at, created_at, updated_at)
+       VALUES (?, ?, 'plan', ?, 0, ?, 'STATUS: done', 'running', 0, 2, 'single', 'test-job', 12345, ?, ?, ?)`
+    ).run(planStepUuid, runId, agent, inputTemplate, now, now, now);
 
     // Downstream loop step over stories — completeStep on the plan step
     // calls parseAndInsertStories, which throws on the malformed JSON.
@@ -1519,5 +1519,406 @@ describe("US-004 CLMR: immediate recovery on no_work", () => {
       db.prepare("DELETE FROM runs WHERE id = ?").run(runId);
     }
   });
+
+  // ═══════════════════════════════════════════════════════════════════
+  // US-004: JCAC — Job-scoped auto-complete via claim_job_id
+  // ═══════════════════════════════════════════════════════════════════
+
+describe("US-004 JCAC: auto-complete via claim_job_id", () => {
+    // AC 1: Auto-complete works when output has STATUS: done and no stepId present
+    it("auto-completes via claim_job_id when no stepId in metadata", async () => {
+      const db = getDb();
+      const agent = "test_jcac-nostepid";
+      const runId = crypto.randomUUID();
+      const stepUuid = crypto.randomUUID();
+      const jobId = "job-jcac-nostepid";
+      const now = ts();
+
+      db.prepare(
+        "INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at) VALUES (?, 'test-wf', 'no stepId', 'running', '{}', ?, ?)"
+      ).run(runId, now, now);
+
+      // Step has claim_job_id set — auto-complete should find it
+      db.prepare(
+        `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects,
+          status, retry_count, max_retries, type, claim_job_id, claim_pid, claim_updated_at, created_at, updated_at)
+         VALUES (?, ?, 'dev-step', ?, 0, '', 'STATUS: done', 'running', 0, 2, 'single', ?, 12345, ?, ?, ?)`
+      ).run(stepUuid, runId, agent, jobId, now, now, now);
+
+      // Output has STATUS: done but NO stepId in metadata
+      const assistantOutput = "STATUS: done\nCHANGES: implemented feature\nTESTS: all pass\n";
+      const metadata: PollingRoundMetadata = {
+        assistantOutput,
+        tokenUsage: null,
+        runId: null,
+        stepId: null,  // NO stepId — previously unrescuable
+        jsonMetadataDetected: false,
+      };
+
+      const context: Record<string, unknown> = {
+        jobId,
+        runId,
+        agentId: agent,
+        role: "developer",
+        timeoutSeconds: 1800,
+        workdir: "/tmp",
+        model: "default",
+      };
+
+      try {
+        await autoCompleteStepIfRunning(context, metadata);
+
+        const step = db.prepare(
+          "SELECT status, output FROM steps WHERE id = ?"
+        ).get(stepUuid) as { status: string; output: string | null };
+        assert.equal(step.status, "done", "step should be auto-completed to done");
+        assert.ok(step.output, "step.output should be populated");
+        assert.match(
+          step.output ?? "",
+          /STATUS: done/,
+          "step.output should contain agent output",
+        );
+      } finally {
+        db.prepare("DELETE FROM steps WHERE id = ?").run(stepUuid);
+        db.prepare("DELETE FROM runs WHERE id = ?").run(runId);
+      }
+    });
+
+    // AC 2: Auto-complete does not fire when no step claimed by this job
+    it("skips when no step claimed by this job", async () => {
+      const db = getDb();
+      const agent = "test_jcac-no-claim";
+      const runId = crypto.randomUUID();
+      const jobId = "job-jcac-no-claim-match";
+      const now = ts();
+
+      db.prepare(
+        "INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at) VALUES (?, 'test-wf', 'no claim', 'running', '{}', ?, ?)"
+      ).run(runId, now, now);
+
+      // No step with this claim_job_id exists
+
+      const metadata: PollingRoundMetadata = {
+        assistantOutput: "STATUS: done\nCHANGES: done\n",
+        tokenUsage: null,
+        runId: null,
+        stepId: null,
+        jsonMetadataDetected: false,
+      };
+
+      const context: Record<string, unknown> = {
+        jobId,
+        runId,
+        agentId: agent,
+        role: "developer",
+        timeoutSeconds: 1800,
+        workdir: "/tmp",
+        model: "default",
+      };
+
+      try {
+        // Should not throw — just skip silently
+        await autoCompleteStepIfRunning(context, metadata);
+
+        // No steps were touched (no step existed to begin with)
+      } finally {
+        db.prepare("DELETE FROM runs WHERE id = ?").run(runId);
+      }
+    });
+
+    // AC 3: Auto-complete does not fire on an already-completed step
+    it("skips already-completed step (status=done)", async () => {
+      const db = getDb();
+      const agent = "test_jcac-already-done";
+      const runId = crypto.randomUUID();
+      const stepUuid = crypto.randomUUID();
+      const jobId = "job-jcac-done";
+      const now = ts();
+
+      db.prepare(
+        "INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at) VALUES (?, 'test-wf', 'already done', 'running', '{}', ?, ?)"
+      ).run(runId, now, now);
+
+      // Step already done but has claim_job_id pointing to this job
+      db.prepare(
+        `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects,
+          status, retry_count, max_retries, type, claim_job_id, claim_pid, claim_updated_at, created_at, updated_at)
+         VALUES (?, ?, 'dev-step', ?, 0, '', 'STATUS: done', 'done', 0, 2, 'single', ?, 12345, ?, ?, ?)`
+      ).run(stepUuid, runId, agent, jobId, now, now, now);
+
+      const metadata: PollingRoundMetadata = {
+        assistantOutput: "STATUS: done\nCHANGES: already done\n",
+        tokenUsage: null,
+        runId: null,
+        stepId: null,
+        jsonMetadataDetected: false,
+      };
+
+      const context: Record<string, unknown> = {
+        jobId,
+        runId,
+        agentId: agent,
+        role: "developer",
+        timeoutSeconds: 1800,
+        workdir: "/tmp",
+        model: "default",
+      };
+
+      try {
+        await autoCompleteStepIfRunning(context, metadata);
+
+        // Step should still be done — already-done step not in ('claimed', 'running')
+        const step = db.prepare(
+          "SELECT status FROM steps WHERE id = ?"
+        ).get(stepUuid) as { status: string };
+        assert.equal(step.status, "done", "already-done step must stay done");
+      } finally {
+        db.prepare("DELETE FROM steps WHERE id = ?").run(stepUuid);
+        db.prepare("DELETE FROM runs WHERE id = ?").run(runId);
+      }
+    });
+
+    // AC 4: Auto-complete works when step is in 'claimed' status
+    it("auto-completes step with status=claimed", async () => {
+      const db = getDb();
+      const agent = "test_jcac-claimed";
+      const runId = crypto.randomUUID();
+      const stepUuid = crypto.randomUUID();
+      const jobId = "job-jcac-claimed";
+      const now = ts();
+
+      db.prepare(
+        "INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at) VALUES (?, 'test-wf', 'claimed step', 'running', '{}', ?, ?)"
+      ).run(runId, now, now);
+
+      // Step in 'claimed' status — agent claimed but hasn't started yet
+      db.prepare(
+        `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects,
+          status, retry_count, max_retries, type, claim_job_id, claim_pid, claim_updated_at, created_at, updated_at)
+         VALUES (?, ?, 'dev-step', ?, 0, '', 'STATUS: done', 'claimed', 0, 2, 'single', ?, 12345, ?, ?, ?)`
+      ).run(stepUuid, runId, agent, jobId, now, now, now);
+
+      const metadata: PollingRoundMetadata = {
+        assistantOutput: "STATUS: done\nCHANGES: implemented\n",
+        tokenUsage: null,
+        runId: null,
+        stepId: null,
+        jsonMetadataDetected: false,
+      };
+
+      const context: Record<string, unknown> = {
+        jobId,
+        runId,
+        agentId: agent,
+        role: "developer",
+        timeoutSeconds: 1800,
+        workdir: "/tmp",
+        model: "default",
+      };
+
+      try {
+        await autoCompleteStepIfRunning(context, metadata);
+
+        // completeStep transitions 'claimed' → 'done' directly
+        const step = db.prepare(
+          "SELECT status FROM steps WHERE id = ?"
+        ).get(stepUuid) as { status: string };
+        assert.equal(step.status, "done", "claimed step should be auto-completed");
+      } finally {
+        db.prepare("DELETE FROM steps WHERE id = ?").run(stepUuid);
+        db.prepare("DELETE FROM runs WHERE id = ?").run(runId);
+      }
+    });
+
+    // AC: Auto-complete works when step is claimed by this job (status=running)
+    it("auto-completes running step claimed by this job", async () => {
+      const db = getDb();
+      const agent = "test_jcac-running";
+      const runId = crypto.randomUUID();
+      const stepUuid = crypto.randomUUID();
+      const jobId = "job-jcac-running";
+      const now = ts();
+
+      db.prepare(
+        "INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at) VALUES (?, 'test-wf', 'running step', 'running', '{}', ?, ?)"
+      ).run(runId, now, now);
+
+      db.prepare(
+        `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects,
+          status, retry_count, max_retries, type, claim_job_id, claim_pid, claim_updated_at, created_at, updated_at)
+         VALUES (?, ?, 'dev-step', ?, 0, '', 'STATUS: done', 'running', 0, 2, 'single', ?, 12345, ?, ?, ?)`
+      ).run(stepUuid, runId, agent, jobId, now, now, now);
+
+      const metadata: PollingRoundMetadata = {
+        assistantOutput: "STATUS: done\nCHANGES: implemented\n",
+        tokenUsage: null,
+        runId: null,
+        stepId: null,
+        jsonMetadataDetected: false,
+      };
+
+      const context: Record<string, unknown> = {
+        jobId,
+        runId,
+        agentId: agent,
+        role: "developer",
+        timeoutSeconds: 1800,
+        workdir: "/tmp",
+        model: "default",
+      };
+
+      try {
+        await autoCompleteStepIfRunning(context, metadata);
+
+        const step = db.prepare(
+          "SELECT status FROM steps WHERE id = ?"
+        ).get(stepUuid) as { status: string };
+        assert.equal(step.status, "done", "running step should be auto-completed");
+      } finally {
+        db.prepare("DELETE FROM steps WHERE id = ?").run(stepUuid);
+        db.prepare("DELETE FROM runs WHERE id = ?").run(runId);
+      }
+    });
+
+    // AC: Skip when context has no jobId
+    it("skips when context has no jobId", async () => {
+      const db = getDb();
+      const agent = "test_jcac-no-jobid";
+      const runId = crypto.randomUUID();
+      const now = ts();
+
+      db.prepare(
+        "INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at) VALUES (?, 'test-wf', 'no jobId', 'running', '{}', ?, ?)"
+      ).run(runId, now, now);
+
+      const metadata: PollingRoundMetadata = {
+        assistantOutput: "STATUS: done\nCHANGES: done\n",
+        tokenUsage: null,
+        runId: null,
+        stepId: null,
+        jsonMetadataDetected: false,
+      };
+
+      // No jobId in context
+      const context: Record<string, unknown> = {
+        runId,
+        agentId: agent,
+        role: "developer",
+        timeoutSeconds: 1800,
+        workdir: "/tmp",
+        model: "default",
+      };
+
+      try {
+        await autoCompleteStepIfRunning(context, metadata);
+      } finally {
+        db.prepare("DELETE FROM runs WHERE id = ?").run(runId);
+      }
+    });
+
+    // AC: Skip loop step mid-iteration via claim_job_id lookup
+    it("skips loop step mid-iteration (current_story_id=null)", async () => {
+      const db = getDb();
+      const agent = "test_jcac-loop-mid";
+      const runId = crypto.randomUUID();
+      const stepUuid = crypto.randomUUID();
+      const jobId = "job-jcac-loop";
+      const now = ts();
+
+      db.prepare(
+        "INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at) VALUES (?, 'test-wf', 'loop mid', 'running', '{}', ?, ?)"
+      ).run(runId, now, now);
+
+      // Loop step with current_story_id = NULL (mid-iteration)
+      db.prepare(
+        `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects,
+          status, retry_count, max_retries, type, current_story_id, loop_config, claim_job_id, claim_pid, claim_updated_at, created_at, updated_at)
+         VALUES (?, ?, 'loop-step', ?, 0, '', 'STATUS: done', 'running', 0, 2, 'loop', NULL, '{"over":"stories"}', ?, 12345, ?, ?, ?)`
+      ).run(stepUuid, runId, agent, jobId, now, now, now);
+
+      const metadata: PollingRoundMetadata = {
+        assistantOutput: "STATUS: done\nCHANGES: stories done\n",
+        tokenUsage: null,
+        runId: null,
+        stepId: null,
+        jsonMetadataDetected: false,
+      };
+
+      const context: Record<string, unknown> = {
+        jobId,
+        runId,
+        agentId: agent,
+        role: "developer",
+        timeoutSeconds: 1800,
+        workdir: "/tmp",
+        model: "default",
+      };
+
+      try {
+        await autoCompleteStepIfRunning(context, metadata);
+
+        // Loop step should still be running — auto-complete skipped it
+        const step = db.prepare(
+          "SELECT status FROM steps WHERE id = ?"
+        ).get(stepUuid) as { status: string };
+        assert.equal(step.status, "running", "loop step mid-iteration must stay running");
+      } finally {
+        db.prepare("DELETE FROM steps WHERE id = ?").run(stepUuid);
+        db.prepare("DELETE FROM runs WHERE id = ?").run(runId);
+      }
+    });
+
+    // AC: Skip when step is 'failed' status
+    it("skips failed step (status=failed)", async () => {
+      const db = getDb();
+      const agent = "test_jcac-failed";
+      const runId = crypto.randomUUID();
+      const stepUuid = crypto.randomUUID();
+      const jobId = "job-jcac-failed";
+      const now = ts();
+
+      db.prepare(
+        "INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at) VALUES (?, 'test-wf', 'failed step', 'running', '{}', ?, ?)"
+      ).run(runId, now, now);
+
+      // Step is failed but claim_job_id still points to this job
+      db.prepare(
+        `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects,
+          status, retry_count, max_retries, type, claim_job_id, claim_pid, claim_updated_at, created_at, updated_at)
+         VALUES (?, ?, 'dev-step', ?, 0, '', 'STATUS: done', 'failed', 2, 2, 'single', ?, 12345, ?, ?, ?)`
+      ).run(stepUuid, runId, agent, jobId, now, now, now);
+
+      const metadata: PollingRoundMetadata = {
+        assistantOutput: "STATUS: done\nCHANGES: tried\n",
+        tokenUsage: null,
+        runId: null,
+        stepId: null,
+        jsonMetadataDetected: false,
+      };
+
+      const context: Record<string, unknown> = {
+        jobId,
+        runId,
+        agentId: agent,
+        role: "developer",
+        timeoutSeconds: 1800,
+        workdir: "/tmp",
+        model: "default",
+      };
+
+      try {
+        await autoCompleteStepIfRunning(context, metadata);
+
+        // Step should still be failed — not in ('claimed', 'running') so not matched
+        const step = db.prepare(
+          "SELECT status FROM steps WHERE id = ?"
+        ).get(stepUuid) as { status: string };
+        assert.equal(step.status, "failed", "failed step must stay failed");
+      } finally {
+        db.prepare("DELETE FROM steps WHERE id = ?").run(stepUuid);
+        db.prepare("DELETE FROM runs WHERE id = ?").run(runId);
+      }
+    });
+});
 });
 });

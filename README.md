@@ -555,6 +555,8 @@ If something isn't working as expected, start with the built-in diagnostic:
 | `tamandua workflow runs` | List all runs |
 | `tamandua workflow wait <selector...> [--all] [--timeout <dur>] [--json] [--quiet]` | Block until selected runs reach terminal status |
 | `tamandua workflow resume <run-id>` | Resume a failed or paused run |
+| `tamandua workflow stop <run-id>` | Stop/cancel a running workflow |
+| `tamandua workflow cancel <run-id>` | Alias for stop — cancels a running workflow |
 | `tamandua workflow delete <run-id> [--force]` | Permanently delete a workflow run and associated data |
 | `tamandua workflow list` | List available workflows |
 | `tamandua workflow install <id> [--all]` | Install one or all workflows. **Installed bundled definitions are refreshed on every install/update** — local edits are overwritten. To customize a workflow, copy it under a new workflow id. |
@@ -569,7 +571,7 @@ If something isn't working as expected, start with the built-in diagnostic:
 | `tamandua daemon start\|stop\|restart\|status` | Manage the daemon (control plane + scheduling motor) |
 | `tamandua mcp start\|stop\|restart\|status [--port N]` | Manage the standalone MCP server |
 | `tamandua control-plane start\|stop\|restart\|status [--port N]` | Alias for daemon commands (control plane is hosted by daemon) |
-| `tamandua logs [<lines>|<run-id>|#<run-number>]` | View recent log entries |
+| `tamandua logs [<lines>|<run-id>|#<run-number>] [--tail <N>]` | View recent log entries. `--tail N` shows last N entries (flag equivalent of numeric selector). |
 | `tamandua logs-tail [<lines>|<run-id>|#<run-number>]` | Follow recent activity as new events arrive |
 | `tamandua nudge` | Trigger an immediate dispatch round for all running runs |
 

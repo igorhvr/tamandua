@@ -206,14 +206,15 @@ describe("claimStep ownership recording", () => {
       pid: 1,
     };
 
-    // With ownership works
+    // With ownership works — idempotent re-claim returns the held step
     const r1 = claimStep(TEST_AGENT, singleRunId, ownership);
-    // Step is already running from test 1, so this should not find work
-    assert.equal(r1.found, false, "already-claimed step should not be re-claimed");
+    assert.equal(r1.found, true, "re-claim should return the already-held step");
+    assert.equal(r1.stepId, singleStepId, "re-claim should return same stepId");
 
-    // Without ownership works (same step, different run from legacy)
+    // Without ownership works — idempotent re-claim returns the held legacy step
     const r2 = claimStep(TEST_AGENT, legacyRunId);
-    assert.equal(r2.found, false, "already-claimed legacy step should not be re-claimed");
+    assert.equal(r2.found, true, "re-claim should return the already-held legacy step");
+    assert.equal(r2.stepId, legacyStepId, "re-claim should return same legacy stepId");
   });
 });
 });

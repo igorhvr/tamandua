@@ -115,10 +115,10 @@ describe("completeStep basic paths", () => {
     assert.equal(result.status, "blocked");
   });
 
-  it("throws when step not found", () => {
+  it("throws when step not found with recovery hint", () => {
     assert.throws(
       () => completeStep("nonexistent-id", "output"),
-      /Step not found/,
+      /Step not found: nonexistent-id\nIf you lost your step id, run: tamandua step current/,
     );
   });
 

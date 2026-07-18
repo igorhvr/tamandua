@@ -159,4 +159,71 @@ describe("parseWorkflowRunArgs", () => {
       /Missing value for --timeout/,
     );
   });
+
+  // US-001: Unknown flag rejection
+  it("rejects unknown --flag", () => {
+    assert.throws(
+      () => parseWorkflowRunArgs(["some task", "--unknown-flag", "value"]),
+      /Unknown option "--unknown-flag" for workflow run/,
+    );
+  });
+
+  it("rejects unknown -u short flag", () => {
+    assert.throws(
+      () => parseWorkflowRunArgs(["task", "-u"]),
+      /Unknown option "-u" for workflow run/,
+    );
+  });
+
+  it("rejects unknown -X short flag", () => {
+    assert.throws(
+      () => parseWorkflowRunArgs(["task", "-X"]),
+      /Unknown option "-X" for workflow run/,
+    );
+  });
+
+  it("allows bare - as task text", () => {
+    const result = parseWorkflowRunArgs(["task", "-", "and-more"]);
+    assert.equal(result.taskTitle, "task - and-more");
+  });
+
+  it("allows negative numbers as task text", () => {
+    const result = parseWorkflowRunArgs(["task", "-42"]);
+    assert.equal(result.taskTitle, "task -42");
+  });
+
+  it("allows -- separator: everything after goes verbatim to task title", () => {
+    const result = parseWorkflowRunArgs(["task", "--", "--still-task", "-x", "--more-flags"]);
+    assert.equal(result.taskTitle, "task --still-task -x --more-flags");
+  });
+
+  it("-- separator: prefixing task words are preserved", () => {
+    const result = parseWorkflowRunArgs(["my task", "--", "--pretend-flag"]);
+    assert.equal(result.taskTitle, "my task --pretend-flag");
+  });
+
+  it("-- separator: recognized flags after -- become task text", () => {
+    const result = parseWorkflowRunArgs(["task", "--", "--wait", "--json"]);
+    assert.equal(result.taskTitle, "task --wait --json");
+    assert.equal(result.wait, false);
+    assert.equal(result.jsonFlag, false);
+  });
+
+  it("-- separator with recognized flags before -- still works", () => {
+    const result = parseWorkflowRunArgs([
+      "--no-hurry-please-save-tokens-mode",
+      "my task",
+      "--",
+      "--unknown-flag",
+    ]);
+    assert.equal(result.noHurrySaveTokensMode, true);
+    assert.equal(result.taskTitle, "my task --unknown-flag");
+  });
+
+  it("rejects unknown --flag before -- separator", () => {
+    assert.throws(
+      () => parseWorkflowRunArgs(["task", "--bad-flag", "--", "after-sep"]),
+      /Unknown option "--bad-flag" for workflow run/,
+    );
+  });
 });

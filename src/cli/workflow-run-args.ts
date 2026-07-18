@@ -16,6 +16,20 @@ export interface WorkflowRunArgs {
   jsonFlag: boolean;
 }
 
+const KNOWN_FLAGS = new Set([
+  "--no-hurry-please-save-tokens-mode",
+  "--no-relaunch-upon-rugpull",
+  "--wait",
+  "--json",
+  "--timeout",
+  "--pi-as-harness",
+  "--hermes-as-harness",
+  "--working-directory-for-harness",
+  "--worktree-origin-repository",
+  "--worktree-origin-ref",
+  "--context",
+]);
+
 export function parseWorkflowRunArgs(args: string[]): WorkflowRunArgs {
   const taskParts: string[] = [];
   let workingDirectoryForHarness: string | undefined;
@@ -26,8 +40,21 @@ export function parseWorkflowRunArgs(args: string[]): WorkflowRunArgs {
   let harnessAs: "pi" | "hermes" | undefined;
   const context: Record<string, string> = {};
 
+  let afterDashDash = false;
+
   for (let i = 0; i < args.length; i++) {
     const token = args[i];
+
+    // -- end-of-options separator: everything after goes verbatim to task title
+    if (token === "--") {
+      afterDashDash = true;
+      continue;
+    }
+
+    if (afterDashDash) {
+      taskParts.push(token);
+      continue;
+    }
 
     if (token === "--no-hurry-please-save-tokens-mode") {
       noHurrySaveTokensMode = true;
@@ -162,19 +189,45 @@ export function parseWorkflowRunArgs(args: string[]): WorkflowRunArgs {
       continue;
     }
 
+    // Reject unknown --flags: any token starting with -- that isn't a recognized flag
+    if (token.startsWith("--")) {
+      const flagName = token.includes("=") ? token.slice(0, token.indexOf("=")) : token;
+      if (!KNOWN_FLAGS.has(flagName)) {
+        throw new Error(
+          `Unknown option "${token}" for workflow run. Use -- to pass a task starting with --, or see tamandua workflow run --help.`,
+        );
+      }
+    }
+
+    // Reject unknown short flags: -x where x is a letter (bare - and negative numbers are task text)
+    if (
+      token.length > 1 &&
+      token[0] === "-" &&
+      token[1] !== "-" &&
+      /^-[a-zA-Z]/.test(token)
+    ) {
+      throw new Error(
+        `Unknown option "${token}" for workflow run. Use -- to pass a task starting with --, or see tamandua workflow run --help.`,
+      );
+    }
+
     taskParts.push(token);
   }
 
-  const wait = args.includes("--wait");
-  const jsonFlag = args.includes("--json");
+  // Only consider flags that appear before the -- separator (if any)
+  const dashDashIdx = args.indexOf("--");
+  const flagArgs = dashDashIdx === -1 ? args : args.slice(0, dashDashIdx);
+
+  const wait = flagArgs.includes("--wait");
+  const jsonFlag = flagArgs.includes("--json");
   let timeout: string | undefined;
-  for (let i = 0; i < args.length; i++) {
-    if (args[i] === "--timeout" && i + 1 < args.length) {
-      timeout = args[i + 1];
+  for (let i = 0; i < flagArgs.length; i++) {
+    if (flagArgs[i] === "--timeout" && i + 1 < flagArgs.length) {
+      timeout = flagArgs[i + 1];
       break;
     }
-    if (args[i].startsWith("--timeout=")) {
-      timeout = args[i].slice("--timeout=".length);
+    if (flagArgs[i].startsWith("--timeout=")) {
+      timeout = flagArgs[i].slice("--timeout=".length);
       break;
     }
   }

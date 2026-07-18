@@ -378,7 +378,8 @@ describe("SKILL.md workflow supervision guidance", () => {
     assert.ok(skillContent.includes("tamandua workflow runs"));
     assert.ok(skillContent.includes("tamandua logs <run-id>"));
     assert.ok(skillContent.includes("tamandua workflow stop <run-id>"));
-    assert.match(skillContent, /success message says `Cancelled`, but the command verb is\s+`stop`/);
+    assert.ok(skillContent.includes("tamandua workflow cancel <run-id>"));
+    assert.match(skillContent, /`cancel` is a documented alias for `stop`/);
   });
 
   it("prefers CLI inspection and constrains direct state access", () => {
