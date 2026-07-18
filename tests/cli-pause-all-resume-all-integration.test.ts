@@ -1036,6 +1036,7 @@ describe("pause-all / resume-all integration", { concurrency: 1 }, () => {
           retry_count INTEGER DEFAULT 0,
           max_retries INTEGER DEFAULT 0,
           type TEXT NOT NULL DEFAULT 'single',
+          abandoned_count INTEGER DEFAULT 0,
           created_at TEXT NOT NULL DEFAULT (datetime('now')),
           updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         )
@@ -1099,7 +1100,11 @@ describe("pause-all / resume-all integration", { concurrency: 1 }, () => {
         ["workflow", "pause", runId.slice(0, 8), "--drain"],
         { HOME: th.homeDir, TAMANDUA_CONTROL_PORT: String(controlPort) },
       );
-      assert.equal(result.exitCode, 0, `pause --drain should succeed`);
+      assert.equal(
+        result.exitCode,
+        0,
+        `pause --drain should succeed (exit ${result.exitCode}): ${cleanStderr(result.stderr)}`,
+      );
 
       // Verify draining_pause state (not fully paused)
       const db = new DatabaseSync(dbPath);
