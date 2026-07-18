@@ -70,6 +70,7 @@ tests/agent-scheduler.test.ts
 tests/claim-invalidated-by-migration.test.ts
 tests/claim-ownership-recording.test.ts
 tests/cli-get-ready-partial-failure.test.ts
+tests/cli-json-output.test.ts
 tests/cli-pause-all-resume-all-integration.test.ts
 tests/cli-pause-all-resume-all.test.ts
 tests/cli-pause-command.test.ts
@@ -77,11 +78,15 @@ tests/cli-pause-resume-integration.test.ts
 tests/cli-resume-command.test.ts
 tests/cli-skill-path.test.ts
 tests/cli-status-abandon-reasons.test.ts
+tests/cli-status-json.test.ts
 tests/cli-status-token-display.test.ts
+tests/cli-step-stories-json.test.ts
 tests/cli-version-warning.test.ts
 tests/cli-workflow-install-all.test.ts
 tests/cli-workflow-list-json.test.ts
 tests/cli-workflow-run-working-directory.test.ts
+tests/cli-workflow-runs-json.test.ts
+tests/cli-workflow-status-json.test.ts
 tests/cli-worktree.test.ts
 tests/cli/install-partial-failure.test.ts
 tests/control-plane-cli.test.ts
@@ -111,6 +116,7 @@ tests/pi-token-saver.test.ts
 tests/portability-lint.test.ts
 tests/reroute-count-column-migration.test.ts
 tests/reroute-paths.test.ts
+tests/resume-step-output.test.ts
 tests/run-terminal-token-events.test.ts
 tests/run-token-migration.test.ts
 tests/runner-scripts.test.ts
@@ -118,6 +124,8 @@ tests/sample-project-fixture.test.ts
 tests/step-ops-dispatch-races.test.ts
 tests/step-ops.test.ts
 tests/step-ownership-columns-migration.test.ts
+tests/step-rejection-logging.test.ts
+tests/step-release.test.ts
 tests/stories-json-validation.test.ts
 tests/syntax-check.test.ts
 tests/system-token-spend-migration.test.ts
@@ -127,4 +135,5 @@ tests/update-protocol.test.ts
 tests/work-round-persona-prompt.test.ts
 tests/work-round-token-attribution.test.ts
 tests/workflow-contract.test.ts
+tests/workflow-fail.test.ts
 tests/workflow-graph-simulation.test.ts

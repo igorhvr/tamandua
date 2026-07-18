@@ -8,7 +8,9 @@ import {
   getStepCompleteHelp,
   getStepCurrentHelp,
   getStepFailHelp,
+  getStepHelp,
   getStepPeekHelp,
+  getStepReleaseHelp,
   getStepStoriesHelp,
   handleStep,
 } from "../../../dist/cli/commands/step.js";
@@ -21,6 +23,8 @@ describe("SPL2 step protocol command module", () => {
   });
 
   it("owns all step protocol help", () => {
+    assert.match(getStepHelp(), /Worker step protocol commands/);
+    assert.match(getStepHelp(), /release/);
     assert.match(getStepPeekHelp(), /Output:\n  HAS_WORK/);
     assert.match(getStepClaimHelp(), /On success: \{"stepId":"<UUID>"/);
     assert.match(getStepCurrentHelp(), /Read-only query for a held step/);
@@ -28,6 +32,9 @@ describe("SPL2 step protocol command module", () => {
     assert.match(getStepCompleteHelp(), /reads the agent's output\nfrom either stdin or positional arguments/);
     assert.match(getStepFailHelp(), /"Unknown error" is used/);
     assert.match(getStepStoriesHelp(), /List all stories and their status for a run/);
+    assert.match(getStepStoriesHelp(), /--json/);
+    assert.match(getStepReleaseHelp(), /Reset a stuck claimed/);
+    assert.match(getStepReleaseHelp(), /step.released/);
   });
 
   it("declines commands owned by other command groups", async () => {
@@ -38,5 +45,17 @@ describe("SPL2 step protocol command module", () => {
     const dispatcher = readFileSync(join(process.cwd(), "src/cli/cli.ts"), "utf8");
     assert.match(dispatcher, /getStepCurrentHelp/);
     assert.match(dispatcher, /"current".*printHelp\(getStepCurrentHelp/);
+  });
+
+  it("getStepReleaseHelp is referenced from cli.ts --help dispatch", () => {
+    const dispatcher = readFileSync(join(process.cwd(), "src/cli/cli.ts"), "utf8");
+    assert.match(dispatcher, /getStepReleaseHelp/);
+    assert.match(dispatcher, /"release".*printHelp\(getStepReleaseHelp/);
+  });
+
+  it("getStepHelp is referenced as step-group fallback in cli.ts", () => {
+    const dispatcher = readFileSync(join(process.cwd(), "src/cli/cli.ts"), "utf8");
+    assert.match(dispatcher, /getStepHelp/);
+    assert.match(dispatcher, /printHelp\(getStepHelp\(\)\)/);
   });
 });

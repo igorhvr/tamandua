@@ -86,6 +86,8 @@ const TMP_PATH_ALLOWLIST: Record<string, string> = {
     "test fixture — fake /tmp/nonexistent* paths in DB seeds",
   "tests/step-ops.test.ts":
     "test fixture — fake /tmp/harness-*, /tmp/repo repository paths",
+  "tests/cli-workflow-status-json.test.ts":
+    "test fixture — fake /tmp/tamandua-worktrees/* worktree paths in DB seeds",
   "tests/cli-worktree.test.ts":
     "test fixture — fake /tmp/origin, /tmp/fake-worktree, /tmp/tamandua-wt/*",
   "tests/orphaned-step-recovery.test.ts":

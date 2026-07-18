@@ -45,6 +45,7 @@ export function listProcessesForStatus(
 import { resolveSourcePath, resolveSkillPath } from "../installer/paths.js";
 import { readVersionStatus, type VersionStatus } from "../lib/version-check.js";
 import { listRuns as defaultListRuns, type RunInfo } from "../installer/status.js";
+import { parseEtimeSeconds } from "../lib/proc-info.js";
 
 export function formatServiceStatus(opts?: {
   getDashboardStatus?: typeof getDashboardStatus;
@@ -338,4 +339,194 @@ export function formatProcessList(opts?: {
   }
 
   return lines.join("\n");
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Structured data collectors for --json output
+// ═══════════════════════════════════════════════════════════════════
+
+export interface JsonServiceEntry {
+  up: boolean;
+  pid?: number | null;
+  port?: number;
+  endpoint?: string;
+}
+
+export interface JsonServices {
+  dashboard: JsonServiceEntry;
+  daemon: JsonServiceEntry;
+  mcp: JsonServiceEntry;
+  controlPlane: JsonServiceEntry;
+}
+
+export interface JsonTamanduaInfo {
+  sourcePath: string;
+  skillPath: string;
+  version: string;
+  sourceTreeSha: string;
+}
+
+export interface JsonRunsSummary {
+  total: number;
+  statusCounts: Record<string, number>;
+}
+
+export interface JsonProcess {
+  pid: number;
+  kind: string;
+  uptimeSeconds?: number;
+}
+
+/**
+ * Collect structured service status for JSON output.
+ * Calls the same service status functions as formatServiceStatusAsync.
+ */
+export async function collectServiceStatusAsync(opts?: {
+  getDashboardStatus?: typeof getDashboardStatus;
+  getDaemonStatus?: typeof getDaemonStatus;
+  getMcpStatusAsync?: typeof getMcpStatusAsync;
+  getControlPlaneStatusAsync?: typeof getControlPlaneStatusAsync;
+}): Promise<JsonServices> {
+  const dashboard = (opts?.getDashboardStatus ?? getDashboardStatus)();
+  const daemon = (opts?.getDaemonStatus ?? getDaemonStatus)();
+  const mcp = await (opts?.getMcpStatusAsync ?? getMcpStatusAsync)();
+  const controlPlane = await (opts?.getControlPlaneStatusAsync ?? getControlPlaneStatusAsync)();
+
+  const dashboardEntry: JsonServiceEntry = { up: dashboard.running, port: dashboard.port };
+  if (dashboard.running && dashboard.pid !== null) dashboardEntry.pid = dashboard.pid;
+
+  const daemonEntry: JsonServiceEntry = { up: daemon.running, port: daemon.port };
+  if (daemon.running && daemon.pid !== null) daemonEntry.pid = daemon.pid;
+
+  const mcpEntry: JsonServiceEntry = { up: mcp.running, port: mcp.port, endpoint: mcp.endpoint };
+  if (mcp.running && mcp.pid !== null) mcpEntry.pid = mcp.pid;
+
+  const cpEntry: JsonServiceEntry = { up: controlPlane.running, port: controlPlane.port, endpoint: controlPlane.endpoint };
+  if (controlPlane.running && controlPlane.pid !== null) cpEntry.pid = controlPlane.pid;
+
+  return {
+    dashboard: dashboardEntry,
+    daemon: daemonEntry,
+    mcp: mcpEntry,
+    controlPlane: cpEntry,
+  };
+}
+
+/**
+ * Collect structured tamandua info for JSON output.
+ * Uses the same data sources as formatTamanduaInfo.
+ */
+export function collectTamanduaInfo(opts?: {
+  getVersion?: () => string;
+  resolveSourcePath?: () => string;
+  resolveSkillPath?: () => string;
+  execSync?: (cmd: string) => string;
+}): JsonTamanduaInfo {
+  const version = (opts?.getVersion ?? (() => "unknown"))();
+  const exSync = opts?.execSync ?? execSync;
+  const srcPath = (opts?.resolveSourcePath ?? resolveSourcePath)();
+  const skillPath = (opts?.resolveSkillPath ?? resolveSkillPath)();
+
+  let treeSha = "unavailable";
+  try {
+    const result = exSync(`git -C "${srcPath}" rev-parse HEAD^{tree}`);
+    const trimmed = result.toString().trim();
+    if (/^[0-9a-f]{40}$/i.test(trimmed)) {
+      treeSha = trimmed;
+    }
+  } catch {
+    // treeSha stays "unavailable"
+  }
+
+  return { sourcePath: srcPath, skillPath, version, sourceTreeSha: treeSha };
+}
+
+/**
+ * Collect structured runs summary for JSON output.
+ * Uses the same data sources as formatRunsSummary.
+ */
+export function collectRunsSummary(opts?: {
+  listRuns?: () => RunInfo[];
+}): JsonRunsSummary {
+  const runsFn = opts?.listRuns ?? defaultListRuns;
+  let runs: RunInfo[];
+  try {
+    runs = runsFn();
+  } catch {
+    runs = [];
+  }
+
+  const statusCounts: Record<string, number> = {};
+  for (const r of runs) {
+    statusCounts[r.status] = (statusCounts[r.status] || 0) + 1;
+  }
+
+  return { total: runs.length, statusCounts };
+}
+
+/**
+ * Collect structured process list for JSON output.
+ * Parses the same ps output as formatProcessList.
+ */
+export function collectProcessList(opts?: {
+  isDaemonRunning?: () => boolean;
+  execSync?: (cmd: string, options?: Record<string, unknown>) => string | Buffer;
+}): JsonProcess[] {
+  const daRunning = opts?.isDaemonRunning ?? (() => isRunning().running);
+  const exSync = opts?.execSync ?? execSync;
+
+  if (!daRunning()) {
+    return [];
+  }
+
+  try {
+    const psOutput = listProcessesForStatus(exSync);
+    const processLines = psOutput
+      .toString()
+      .trim()
+      .split("\n")
+      .filter((l) => l.trim());
+
+    const result: JsonProcess[] = [];
+
+    for (const line of processLines) {
+      const lowers = line.toLowerCase();
+      if (
+        !lowers.includes("tamandua") &&
+        !lowers.includes("pi ") &&
+        !lowers.includes("hermes")
+      ) {
+        continue;
+      }
+
+      const parts = line.trim().split(/\s+/);
+      const pidStr = parts[0];
+      const elapsed = parts[1];
+      const command = parts.slice(2).join(" ");
+
+      let kind = "unknown";
+      if (command.includes("pi --print") || command.includes("pi ")) {
+        kind = "pi";
+      } else if (command.includes("hermes")) {
+        kind = "hermes";
+      } else if (command.includes("tamandua step")) {
+        kind = "pi";
+      } else if (command.includes("tamandua")) {
+        kind = "tamandua";
+      }
+
+      const pid = parseInt(pidStr, 10);
+      if (isNaN(pid)) continue;
+
+      const entry: JsonProcess = { pid, kind };
+      const uptime = parseEtimeSeconds(elapsed);
+      if (uptime !== null) entry.uptimeSeconds = uptime;
+
+      result.push(entry);
+    }
+
+    return result;
+  } catch {
+    return [];
+  }
 }

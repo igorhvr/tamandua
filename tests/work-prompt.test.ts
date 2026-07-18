@@ -76,6 +76,61 @@ describe("buildWorkPrompt (deterministic-dispatch work prompt)", () => {
     assert.ok(prompt.includes("SAVE"), "should instruct to save stepId");
   });
 
+  // ── Traceability header ───────────────────────────────────────────
+
+  it("prepends a traceability header when jobId and runNumber are provided", () => {
+    const prompt = buildWorkPrompt("feature-dev", "developer", RUN_ID, "", "job-abc-123", 5);
+    assert.ok(
+      prompt.startsWith("[tamandua traceability"),
+      "prompt must start with the traceability header",
+    );
+  });
+
+  it("traceability header contains all required fields", () => {
+    const jobId = "job-abc-123";
+    const runNumber = 5;
+    const prompt = buildWorkPrompt("feature-dev", "developer", RUN_ID, "", jobId, runNumber);
+    const firstLine = prompt.split("\n")[0];
+    assert.ok(firstLine.includes(`run=${RUN_ID}`), "header must include run uuid");
+    assert.ok(firstLine.includes(`run_number=${runNumber}`), "header must include run_number");
+    assert.ok(firstLine.includes("agent=developer"), "header must include agent id");
+    assert.ok(firstLine.includes(`job=${jobId}`), "header must include job id");
+    assert.ok(firstLine.includes("ts="), "header must include iso timestamp");
+  });
+
+  it("traceability header uses bracketed prefix and lowercase keys", () => {
+    const prompt = buildWorkPrompt("feature-dev", "developer", RUN_ID, "", "job-xyz", 1);
+    const firstLine = prompt.split("\n")[0];
+    assert.ok(firstLine.startsWith("["), "header must start with bracket");
+    assert.ok(firstLine.includes("]"), "header must have closing bracket");
+    assert.ok(firstLine.includes("- metadata only, no action needed]"), "header must contain bracketed disclaimer");
+    // keys are lowercase
+    assert.ok(firstLine.includes("run="), "run key must be lowercase");
+    assert.ok(firstLine.includes("run_number="), "run_number key must be lowercase");
+    assert.ok(firstLine.includes("agent="), "agent key must be lowercase");
+    assert.ok(firstLine.includes("job="), "job key must be lowercase");
+    assert.ok(firstLine.includes("ts="), "ts key must be lowercase");
+  });
+
+  it("traceability header is absent when jobId is not provided (backward compat)", () => {
+    const prompt = buildWorkPrompt("feature-dev", "developer", RUN_ID);
+    assert.ok(!prompt.includes("[tamandua traceability"), "no traceability header without jobId");
+  });
+
+  it("traceability header is absent when runNumber is not provided (backward compat)", () => {
+    const prompt = buildWorkPrompt("feature-dev", "developer", RUN_ID, "", "job-123");
+    assert.ok(!prompt.includes("[tamandua traceability"), "no traceability header without runNumber");
+  });
+
+  it("traceability header cannot be confused with report KEY: lines", () => {
+    const prompt = buildWorkPrompt("feature-dev", "developer", RUN_ID, "", "j", 1);
+    const firstLine = prompt.split("\n")[0];
+    // KEY: lines start at column 0 with uppercase KEY:
+    assert.ok(!/^[A-Z]+:/.test(firstLine), "header must not look like a STATUS:/KEY: report line");
+    // header starts with bracket, not uppercase
+    assert.ok(firstLine.startsWith("["), "header starts with bracket, not a KEY:");
+  });
+
   it("REPORT defers to the task's Reply-with format; generic shape is fallback-only (MPRT)", () => {
     const prompt = buildWorkPrompt("bug-fix-merge-worktree", "verifier", RUN_ID);
     // The success path must point at the task's own reply format...

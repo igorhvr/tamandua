@@ -11,6 +11,7 @@ describe("SPL2 status and doctor command module", () => {
   it("owns help for status and doctor", () => {
     assert.match(getStatusHelp(), /tamandua status/);
     assert.match(getStatusHelp(), /Running Processes/);
+    assert.match(getStatusHelp(), /--json/);
     assert.match(getDoctorHelp(), /tamandua doctor/);
     assert.match(getDoctorHelp(), /LLM PROMPT/);
   });

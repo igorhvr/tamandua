@@ -47,8 +47,8 @@ tamandua workflow list [--json]          # Shows [worktree] or [direct] marker p
 tamandua workflow install <workflow-id|--all>
 tamandua workflow uninstall <workflow-id|--all> [--force]
 tamandua workflow run <workflow-id> "<task>" [--context <key=value> ...] [--working-directory-for-harness <dir>] [--worktree-origin-repository <dir>] [--worktree-origin-ref <ref>] [--pi-as-harness | --hermes-as-harness] [--no-hurry-please-save-tokens-mode] [--no-relaunch-upon-rugpull] [--wait [--timeout <dur>] [--json]]
-tamandua workflow status <query>
-tamandua workflow runs
+tamandua workflow status <query> [--json]
+tamandua workflow runs [--json]
 tamandua workflow wait <selector...> [--all] [--timeout <dur>] [--json] [--quiet]
 tamandua workflow pause <run-id>
 tamandua workflow pause-all [--drain]
@@ -56,6 +56,7 @@ tamandua workflow resume <run-id>
 tamandua workflow resume-all
 tamandua workflow stop <run-id>
 tamandua workflow cancel <run-id>        # Alias for stop
+tamandua workflow fail <run-id> --reason <text> [--force]
 tamandua workflow autoresearch <run-id>
 tamandua workflow delete <run-id> [--force]
 tamandua nudge
@@ -100,8 +101,10 @@ This polls in 5-minute windows until the run finishes (code 0) or fails
 permanently (code 1/3/4).
 
 `resume` works for both paused runs (restarted via the daemon) and failed
-runs (resumed directly). `pause-all --drain` lets in-progress steps finish
-before pausing.
+runs (resumed directly). On success, resume prints one line per non-done step
+(step id prefix, role, status, retry count) so you can see what will execute
+next without querying the database. `pause-all --drain` lets in-progress steps
+finish before pausing.
 
 `delete` permanently removes a workflow run and associated steps, stories,
 and managed worktree data. Active runs are refused by default; use `--force`
@@ -149,19 +152,21 @@ tamandua workflow run <workflow-id> "$(cat task.md)" [workspace-mode flags]
 Inspect and stop the run with the CLI:
 
 ```bash
-tamandua workflow status <run-id>
-tamandua workflow runs
+tamandua workflow status <run-id> [--json]
+tamandua workflow runs [--json]
 tamandua logs <run-id>
 tamandua workflow stop <run-id>
 tamandua workflow cancel <run-id>
 ```
 
 Both `stop` and `cancel` terminate the run and print `Cancelled run X.`.
-`cancel` is a documented alias for `stop`. Prefer these CLI commands for run-state inspection. If the CLI does not
+`cancel` is a documented alias for `stop`. Prefer these CLI commands for run-state inspection. For machine consumers (agents, scripts), use the
+`--json` flag — it is the preferred machine-readable path. If the CLI does not
 expose a needed field, reading `~/.tamandua/tamandua.db` directly is an
 acceptable fallback, but always open it read-only with
 `sqlite3 -readonly ~/.tamandua/tamandua.db`; do not use the database as the
-first resort.
+first resort. The `--json` output is a single JSON document on stdout; errors
+still go to stderr.
 
 Never edit installed workflow files under `~/.tamandua/workflows`: every
 install and update overwrites them, so local edits are silently overwritten.
@@ -223,7 +228,7 @@ recent experiment timeline.
 Use `tamandua status` for a comprehensive overview of the Tamandua system:
 
 ```bash
-tamandua status
+tamandua status [--json]
 ```
 
 `status` reports:
@@ -662,6 +667,60 @@ tamandua autoresearch wizard
 tamandua autoresearch wizard --cwd /path/to/project
 ```
 
+### 2.15) Operator recovery commands
+
+When a step gets stuck (e.g., a worker died mid-execution) or a run needs to
+be force-terminated, use these recovery commands instead of writing to the
+database directly.
+
+#### Step release
+
+`tamandua step release <run-id> [step-id] [--force]` resets a stuck
+claimed/running step back to `pending` so the motor re-dispatches it. The
+run-id accepts prefixes and `#N` (run number).
+
+- **Without step-id:** if exactly one claimed/running step exists, it acts on
+  that step. With multiple, it lists them and requires `step-id`.
+- **Guard:** refuses when the claiming worker is still alive (checked via
+  `process.kill(pid, 0)`). Prints what is alive and requires `--force` to
+  override. `--force` only releases the claim — it does not terminate the
+  worker.
+- **No retry bump:** clearing the claim is an operator action, not a failure,
+  so `retry_count` is not incremented.
+- Emits a `step.released` event visible in logs.
+
+#### Workflow fail
+
+`tamandua workflow fail <run-id> --reason <text> [--force]` forces a
+running/paused run to terminal failed status. The run-id accepts prefixes
+and `#N`. `--reason` is required.
+
+- **Guard:** refuses if a worker for the run is currently alive unless
+  `--force` is given.
+- Records the reason in the `run.force_failed` event and sets the run
+  status to `failed`.
+
+#### Resume per-step output
+
+Both `tamandua workflow resume <run-id>` and `tamandua workflow resume-all`
+now print one line per non-done step after a successful resume. Each line
+shows: `[status] stepIdPrefix (role) retry N`. This lets you see what will
+execute next without querying the database.
+
+#### Traceability header
+
+Every dispatched work prompt (pi and hermes harnesses) begins with a single
+bracketed metadata line, e.g.:
+
+```
+[tamandua traceability - metadata only, no action needed] run=<uuid> run_number=<N> agent=<agent-id> job=<uuid> ts=<iso>
+```
+
+This is inert metadata — **ignore it; do not echo it into reports.** It
+exists so persisted worker sessions can be traced back to their exact step
+via the database. The bracketed prefix and lowercase keys ensure it cannot
+be confused with report `KEY:` lines.
+
 ### 3) Follow the step lifecycle exactly
 
 Scheduled workflow agents are told by their dispatch prompt that a step is
@@ -695,6 +754,10 @@ If you lose your step id mid-session, do not abandon finished work:
 Use the run ID supplied by your scheduler prompt or workflow context. `step peek` and `step claim` require `--run-id` so agents serving concurrent runs cannot claim each other's work.
 
 Never call `step complete` or `step fail` with an agent ID. They require the claimed step UUID.
+
+For operator recovery when a step is stuck (e.g., worker died),
+`tamandua step release <run-id> [step-id] [--force]` resets a claimed/running
+step back to pending. See §2.15 for details.
 
 For diagnostics, use `tamandua step stories <run-id>` to list all stories
 for a run and their statuses. This is useful when diagnosing blocked
@@ -1036,7 +1099,9 @@ TESTS: node --test tests/*.test.ts' | tamandua step complete 87409f73-4ba6-492a-
 ### Manual step inspection
 
 ```bash
-tamandua step stories <run-id>
+tamandua step stories <run-id> [--json]
 ```
 
 Use `step stories` to inspect current story status for a run when diagnosing blocked pipelines.
+When invoked with `--json`, output is a single JSON object with `runId` and `stories` array —
+the preferred machine-readable path for story state inspection.

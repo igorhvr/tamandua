@@ -5,15 +5,44 @@
  */
 
 import { getWorkflowStatus } from "../../installer/status.js";
+import { logger } from "../../lib/logger.js";
 import {
+  buildStoriesJson,
   claimStep,
   completeStep,
   failStep,
   getOwnProcessGroupId,
   getStories,
   peekStep,
+  releaseStep,
   stepCurrent,
 } from "../../installer/step-ops.js";
+
+export function getStepHelp(): string {
+  return `tamandua step — Worker step protocol commands
+
+Usage: tamandua step <peek|claim|current|complete|fail|stories|release>
+
+Commands for managing agent step lifecycle.
+
+Subcommands:
+  peek        Check for pending work for an agent
+  claim       Atomically claim a pending step
+  current     Read-only query for a held step
+  complete    Mark a step as done
+  fail        Mark a step as failed with retry logic
+  stories     List all stories and their status for a run
+  release     Reset a stuck claimed/running step back to pending
+
+Examples:
+  tamandua step peek agent-id --run-id abc12345
+  tamandua step claim agent-id --run-id abc12345
+  tamandua step current agent-id --run-id abc12345
+  tamandua step complete 123e4567
+  tamandua step fail 123e4567 "Timeout"
+  tamandua step stories abc12345
+  tamandua step release abc12345`;
+}
 
 export function getStepPeekHelp(): string {
   return `tamandua step peek — Check for pending work for an agent
@@ -106,11 +135,15 @@ Examples:
 export function getStepStoriesHelp(): string {
   return `tamandua step stories — List all stories and their status for a run
 
-Usage: tamandua step stories <run-id>
+Usage: tamandua step stories <run-id> [--json]
 
 step stories displays every story in the current story plan for a run,
 showing their status (pending, running, done, failed), title, and any
 retry counts.
+
+Options:
+  --json    Output a JSON object with runId and stories array for
+            machine consumption (camelCase, omits zero/absent fields)
 
 Output format:
   US-001   [done   ] Story title here
@@ -118,7 +151,34 @@ Output format:
   US-003   [pending] Upcoming story (retry 1)
 
 Examples:
-  tamandua step stories abc12345`;
+  tamandua step stories abc12345
+  tamandua step stories abc12345 --json`;
+}
+
+export function getStepReleaseHelp(): string {
+  return `tamandua step release — Reset a stuck claimed/running step back to pending
+
+Usage: tamandua step release <run-id> [step-id] [--force]
+
+step release resets a stuck claimed/running step back to pending so the motor
+re-dispatches it. This is an operator recovery action — it does NOT increment
+retry_count.
+
+Run-id accepts a prefix or #N shorthand, same as tamandua workflow status.
+
+Without step-id: if exactly one running step exists in the run, it is released.
+If multiple running steps exist, they are listed and step-id is required.
+
+Guard: if the claiming worker is still alive (checked via claim_pid), the release
+is refused unless --force is provided. --force clears claim fields but does NOT
+terminate the worker.
+
+On success, a step.released event is emitted and visible in logs.
+
+Examples:
+  tamandua step release abc12345
+  tamandua step release abc12345 a3bf9b72
+  tamandua step release abc12345 a3bf9b72 --force`;
 }
 
 export function getStepCurrentHelp(): string {
@@ -167,6 +227,7 @@ export async function handleStep(group: string, args: string[]): Promise<boolean
       if (tok.startsWith(inline)) { runIdArg = tok.slice(inline.length).trim(); }
     }
     if (!runIdArg) {
+      logger.warn(`Rejected step ${action}: missing --run-id`, { agentId: target, action });
       process.stderr.write(
         `Missing --run-id for step ${action}.\nUsage: tamandua step ${action} <agent-id> --run-id <run-id>\n`,
       );
@@ -191,6 +252,7 @@ export async function handleStep(group: string, args: string[]): Promise<boolean
     try {
       result = claimStep(target, runIdArg, workerOwnership);
     } catch (err) {
+      logger.warn(`Rejected step claim: ${(err as Error).message}`, { agentId: target, runId: runIdArg });
       process.stderr.write(`Claim failed: ${(err as Error).message}\n`);
       process.exit(1);
     }
@@ -200,7 +262,7 @@ export async function handleStep(group: string, args: string[]): Promise<boolean
     return true;
   }
   if (action === "complete") {
-    if (!target) { process.stderr.write("Missing step-id.\n"); process.exit(1); }
+    if (!target) { logger.warn("Rejected step complete: missing step-id"); process.stderr.write("Missing step-id.\n"); process.exit(1); }
     let output = args.slice(3).join(" ").trim();
     if (!output) {
       const chunks: Buffer[] = [];
@@ -211,7 +273,7 @@ export async function handleStep(group: string, args: string[]): Promise<boolean
     return true;
   }
   if (action === "fail") {
-    if (!target) { process.stderr.write("Missing step-id.\n"); process.exit(1); }
+    if (!target) { logger.warn("Rejected step fail: missing step-id"); process.stderr.write("Missing step-id.\n"); process.exit(1); }
     console.log(JSON.stringify(await failStep(target, args.slice(3).join(" ").trim() || "Unknown error")));
     return true;
   }
@@ -229,6 +291,7 @@ export async function handleStep(group: string, args: string[]): Promise<boolean
       if (tok.startsWith(inline)) { runIdArg = tok.slice(inline.length).trim(); }
     }
     if (!runIdArg) {
+      logger.warn(`Rejected step current: missing --run-id`, { agentId: target });
       process.stderr.write(
         `Missing --run-id for step current.\nUsage: tamandua step current <agent-id> --run-id <run-id>\n`,
       );
@@ -242,11 +305,44 @@ export async function handleStep(group: string, args: string[]): Promise<boolean
     }
     return true;
   }
+  if (action === "release") {
+    if (!target) { process.stderr.write("Missing run-id.\nUsage: tamandua step release <run-id> [step-id] [--force]\n"); process.exit(1); }
+    const force = args.includes("--force");
+    // Extract the optional step-id by filtering out flags and the run-id itself.
+    // args structure: ["step", "release", <run-id>, <step-id>?, "--force"?]
+    const positionalArgs = args.slice(3).filter((a) => !a.startsWith("--"));
+    const releaseStepId = positionalArgs.length > 0 ? positionalArgs[0] : undefined;
+    const fullRunId = getWorkflowStatus(target).id;
+    const result = releaseStep(fullRunId, releaseStepId, force);
+    if (result.released) {
+      console.log(`Step ${result.stepId!.slice(0, 8)} released back to pending.`);
+    } else {
+      if (result.claimedSteps) {
+        console.log(`${result.reason}`);
+        for (const s of result.claimedSteps) {
+          console.log(`  ${s.stepId.slice(0, 8)}   ${s.agentId}${s.claimPid != null ? `  (PID ${s.claimPid})` : ""}`);
+        }
+      } else {
+        process.stderr.write(`${result.reason}\n`);
+      }
+      process.exit(1);
+    }
+    return true;
+  }
   if (action === "stories") {
     if (!target) { process.stderr.write("Missing run-id.\n"); process.exit(1); }
+    const jsonFlag = args.includes("--json");
     const fullRunId = getWorkflowStatus(target).id;
     const stories = getStories(fullRunId);
-    if (stories.length === 0) { console.log("No stories found."); return true; }
+    if (stories.length === 0) {
+      if (jsonFlag) console.log(JSON.stringify({ runId: fullRunId, stories: [] }));
+      else console.log("No stories found.");
+      return true;
+    }
+    if (jsonFlag) {
+      console.log(JSON.stringify({ runId: fullRunId, stories: buildStoriesJson(stories) }));
+      return true;
+    }
     for (const story of stories) {
       console.log(`${story.storyId.padEnd(8)} [${story.status.padEnd(7)}] ${story.title}${story.retryCount > 0 ? ` (retry ${story.retryCount})` : ""}`);
     }

@@ -70,6 +70,8 @@ export type Story = {
   output?: string;
   retryCount: number;
   maxRetries: number;
+  abandonedCount?: number;
+  updatedAt?: string;
 };
 
 // NOTE: workflow YAML from older versions may still carry a top-level

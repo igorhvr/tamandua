@@ -106,6 +106,10 @@ function seedRunDb(dbPath: string, runs: Array<{
       status TEXT NOT NULL DEFAULT 'waiting',
       output TEXT,
       retry_count INTEGER DEFAULT 0,
+      abandoned_count INTEGER DEFAULT 0,
+      reroute_count INTEGER DEFAULT 0,
+      claim_pid INTEGER,
+      claim_updated_at TEXT,
       type TEXT NOT NULL DEFAULT 'single',
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
