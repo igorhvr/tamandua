@@ -21,6 +21,7 @@ import {
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import { createTempHome, cleanChildEnv } from "./helpers/test-env.ts";
+import { acquire } from "../scripts/update-protocol.mjs";
 
 const REPO_ROOT = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -787,6 +788,300 @@ try {
       fs.rmSync(temp.root, { recursive: true, force: true });
     }
   });
+});
+
+// ── NIT-RACE: recordGuardian versus fail from one ACQUIRED snapshot ──────
+
+describe("recordGuardian/fail CAS race", () => {
+  const RACE_DEADLINE_MS = 7_200_000;
+  const CHILD_OUTPUT_LIMIT = 4_096;
+
+  function waitForBarrier(barrierPath, name) {
+    if (fs.existsSync(barrierPath)) return Promise.resolve();
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        watcher.close();
+        if (error) reject(error);
+        else resolve();
+      };
+      const watcher = fs.watch(path.dirname(barrierPath), (_event, filename) => {
+        if (filename === path.basename(barrierPath) && fs.existsSync(barrierPath)) {
+          finish();
+        }
+      });
+      const timer = setTimeout(
+        () => finish(new Error(`barrier ${name} was not observed`)),
+        RACE_DEADLINE_MS,
+      );
+      if (fs.existsSync(barrierPath)) finish();
+    });
+  }
+
+  function collectBounded(stream, label) {
+    let output = "";
+    let overflow = false;
+    stream.on("data", (chunk) => {
+      if (output.length + chunk.length > CHILD_OUTPUT_LIMIT) {
+        overflow = true;
+        return;
+      }
+      output += chunk.toString();
+    });
+    return {
+      read() {
+        assert.equal(overflow, false, `${label} exceeded bounded output`);
+        return output;
+      },
+    };
+  }
+
+  function childClose(child) {
+    return new Promise((resolve, reject) => {
+      child.once("error", reject);
+      child.once("close", (code, signal) => resolve({ code, signal }));
+    });
+  }
+
+  async function reapChild(child, closePromise) {
+    if (!child || !closePromise) return;
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    await closePromise;
+  }
+
+  function readRaceSnapshot(dbPath) {
+    const db = new DatabaseSync(dbPath);
+    try {
+      return {
+        rows: db.prepare("SELECT * FROM update_gate ORDER BY id").all(),
+        schema: db.prepare(
+          `SELECT type, name, tbl_name, sql FROM main.sqlite_schema
+           WHERE name IN (
+             'update_gate',
+             'trg_update_gate_block_runs_insert',
+             'trg_update_gate_block_runs_update'
+           )
+           ORDER BY name`,
+        ).all(),
+      };
+    } finally {
+      db.close();
+    }
+  }
+
+  async function proveOrdering(firstRole) {
+    const temp = createTempHome(`update-protocol-guardian-fail-${firstRole}-`);
+    const dbPath = path.join(temp.root, "race.db");
+    const barrierDir = path.join(temp.root, "barriers");
+    fs.mkdirSync(barrierDir, { recursive: true, mode: 0o700 });
+
+    const winnerLocked = path.join(barrierDir, "winner-locked");
+    const loserContended = path.join(barrierDir, "loser-contended");
+    const releaseWinner = path.join(barrierDir, "release-winner");
+    const releaseLoser = path.join(barrierDir, "release-loser");
+    const topology = JSON.stringify({ channel: "nit-race", generation: 17 });
+    const artifacts = JSON.stringify({ package: "tamandua", digest: "distinctive" });
+    const readiness = JSON.stringify({ build: true, tests: ["serial", "parallel"] });
+    const failureReason = "forced fail winner";
+    const failureDetails = "recordGuardian/fail CAS race proof";
+    const oldEnv = {
+      HOME: process.env.HOME,
+      TAMANDUA_STATE_DIR: process.env.TAMANDUA_STATE_DIR,
+      TAMANDUA_DB_PATH: process.env.TAMANDUA_DB_PATH,
+      TAMANDUA_TEST_GUARD: process.env.TAMANDUA_TEST_GUARD,
+    };
+
+    let winnerChild, loserChild, winnerClose, loserClose;
+    try {
+      process.env.HOME = temp.homeDir;
+      process.env.TAMANDUA_STATE_DIR = path.join(temp.homeDir, ".tamandua");
+      process.env.TAMANDUA_DB_PATH = dbPath;
+      process.env.TAMANDUA_TEST_GUARD = "1";
+      const authority = acquire("current", process.ppid, topology, artifacts, readiness);
+      const before = readRaceSnapshot(dbPath);
+      assert.equal(before.rows.length, 1, "acquire must create exactly one gate row");
+      assert.equal(before.schema.length, 3, "canonical schema snapshot must contain three rows");
+
+      const childCode = `
+import fs from "node:fs";
+import { DatabaseSync } from "node:sqlite";
+
+const role = process.env.RACE_ROLE;
+const ordering = process.env.RACE_ORDERING;
+const winnerLocked = ${JSON.stringify(winnerLocked)};
+const loserContended = ${JSON.stringify(loserContended)};
+const releaseWinner = ${JSON.stringify(releaseWinner)};
+const releaseLoser = ${JSON.stringify(releaseLoser)};
+const deadlineMs = ${RACE_DEADLINE_MS};
+const authority = JSON.parse(fs.readFileSync(0, "utf8"));
+
+function barrierWait(barrierPath, name) {
+  const signal = new Int32Array(new SharedArrayBuffer(4));
+  const deadline = Date.now() + deadlineMs;
+  while (!fs.existsSync(barrierPath)) {
+    if (Date.now() > deadline) throw new Error("barrier " + name + " deadline exceeded");
+    Atomics.wait(signal, 0, 0, 1_000);
+  }
+}
+
+const originalExec = DatabaseSync.prototype.exec;
+let busyResults = 0;
+let retries = 0;
+DatabaseSync.prototype.exec = function(sql) {
+  if (sql !== "BEGIN IMMEDIATE") return originalExec.call(this, sql);
+  if (role === ordering) {
+    const result = originalExec.call(this, sql);
+    fs.writeFileSync(winnerLocked, "", { mode: 0o600 });
+    barrierWait(releaseWinner, "release-winner");
+    return result;
+  }
+  barrierWait(winnerLocked, "winner-locked");
+  originalExec.call(this, "PRAGMA busy_timeout = 0");
+  try {
+    originalExec.call(this, sql);
+  } catch (error) {
+    if (error.code !== "ERR_SQLITE_ERROR" || error.errcode !== 5) throw error;
+    busyResults++;
+    fs.writeFileSync(loserContended, "", { mode: 0o600 });
+    barrierWait(releaseLoser, "release-loser");
+    originalExec.call(this, "PRAGMA busy_timeout = 3600000");
+    retries++;
+    return originalExec.call(this, sql);
+  }
+  throw new Error("loser acquired writer lock without SQLITE_BUSY contention");
+};
+
+const protocol = await import(${JSON.stringify(PROTOCOL_MODULE)});
+let guardianPid = null;
+let guardianIdentity = null;
+let result;
+if (role === "guardian") {
+  guardianPid = process.pid;
+  guardianIdentity = protocol.captureProcessIdentity(guardianPid);
+  result = protocol.recordGuardian(
+    authority.token,
+    "ACQUIRED",
+    authority.ownerPid,
+    authority.ownerIdentity,
+    guardianPid,
+    guardianIdentity,
+  );
+} else {
+  result = protocol.fail(
+    authority.token,
+    "ACQUIRED",
+    authority.ownerPid,
+    authority.ownerIdentity,
+    authority.failureReason,
+    authority.failureDetails,
+  );
+}
+fs.writeSync(1, JSON.stringify({ role, result, busyResults, retries, guardianPid, guardianIdentity }) + "\\n");
+`;
+
+      const envBase = cleanChildEnv({
+        HOME: temp.homeDir,
+        TAMANDUA_STATE_DIR: path.join(temp.homeDir, ".tamandua"),
+        TAMANDUA_DB_PATH: dbPath,
+        TAMANDUA_TEST_GUARD: "1",
+        RACE_ORDERING: firstRole,
+      });
+      const spawnRole = (role) => {
+        const child = spawn(process.execPath, ["--input-type=module", "-e", childCode], {
+          env: { ...envBase, RACE_ROLE: role },
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+        const stdout = collectBounded(child.stdout, `${role} stdout`);
+        const stderr = collectBounded(child.stderr, `${role} stderr`);
+        child.stdin.end(JSON.stringify({
+          token: authority.token,
+          ownerPid: authority.ownerPid,
+          ownerIdentity: authority.ownerIdentity,
+          failureReason,
+          failureDetails,
+        }));
+        return { child, close: childClose(child), stdout, stderr };
+      };
+
+      const winner = spawnRole(firstRole);
+      winnerChild = winner.child;
+      winnerClose = winner.close;
+      const loserRole = firstRole === "guardian" ? "fail" : "guardian";
+      const loser = spawnRole(loserRole);
+      loserChild = loser.child;
+      loserClose = loser.close;
+
+      await waitForBarrier(loserContended, "loser-contended");
+      fs.writeFileSync(releaseWinner, "", { mode: 0o600 });
+      const winnerExit = await winnerClose;
+      assert.deepEqual(winnerExit, { code: 0, signal: null }, `${firstRole} winner child failed`);
+      assert.equal(winner.stderr.read(), "", `${firstRole} winner stderr must be empty`);
+      fs.writeFileSync(releaseLoser, "", { mode: 0o600 });
+      const loserExit = await loserClose;
+      assert.deepEqual(loserExit, { code: 0, signal: null }, `${loserRole} loser child failed`);
+      assert.equal(loser.stderr.read(), "", `${loserRole} loser stderr must be empty`);
+
+      const winnerResult = JSON.parse(winner.stdout.read());
+      const loserResult = JSON.parse(loser.stdout.read());
+      assert.equal(winnerResult.role, firstRole);
+      assert.equal(loserResult.role, loserRole);
+      assert.deepEqual(winnerResult.result, { changed: true, phase: firstRole === "guardian" ? "GUARDIAN_RECORDED" : "FAILED" });
+      assert.deepEqual(loserResult.result, { changed: false });
+      assert.equal(Number(winnerResult.result.changed) + Number(loserResult.result.changed), 1);
+      assert.equal(winnerResult.busyResults, 0);
+      assert.equal(winnerResult.retries, 0);
+      assert.equal(loserResult.busyResults, 1, "loser must observe one real SQLITE_BUSY result");
+      assert.equal(loserResult.retries, 1, "loser must retry the real BEGIN once after commit");
+
+      const after = readRaceSnapshot(dbPath);
+      assert.equal(after.rows.length, 1, "race must preserve singleton cardinality");
+      assert.deepEqual(after.schema, before.schema, "canonical table and blockers must remain intact");
+      const initial = before.rows[0];
+      const final = after.rows[0];
+      assert.ok(final.token === initial.token, "capability token changed during race");
+      for (const column of ["id", "mode", "owner_pid", "owner_identity", "topology", "artifacts", "readiness", "created_at"]) {
+        assert.equal(final[column], initial[column], `${column} changed during race`);
+      }
+      assert.equal(typeof final.updated_at, "string");
+      assert.equal(Number.isNaN(Date.parse(final.updated_at)), false, "winner must record a canonical update timestamp");
+      if (firstRole === "guardian") {
+        assert.equal(final.phase, "GUARDIAN_RECORDED");
+        assert.equal(final.guardian_pid, winnerResult.guardianPid);
+        assert.equal(final.guardian_identity, winnerResult.guardianIdentity);
+        assert.equal(final.failure_reason, null);
+        assert.equal(final.failure_details, null);
+      } else {
+        assert.equal(final.phase, "FAILED");
+        assert.equal(final.guardian_pid, null);
+        assert.equal(final.guardian_identity, null);
+        assert.equal(final.failure_reason, failureReason);
+        assert.equal(final.failure_details, failureDetails);
+      }
+    } finally {
+      await Promise.allSettled([
+        reapChild(winnerChild, winnerClose),
+        reapChild(loserChild, loserClose),
+      ]);
+      for (const [key, value] of Object.entries(oldEnv)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      fs.rmSync(temp.root, { recursive: true, force: true });
+    }
+  }
+
+  it(
+    "serializes real recordGuardian and fail contenders without a hybrid row in both lock orderings",
+    { timeout: RACE_DEADLINE_MS },
+    async () => {
+      await proveOrdering("guardian");
+      await proveOrdering("fail");
+    },
+  );
 });
 
 // ── RACE: real orderings with separate processes and IPC barriers ────────
