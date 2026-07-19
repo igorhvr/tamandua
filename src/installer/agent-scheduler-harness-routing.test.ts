@@ -153,6 +153,8 @@ describe("executeDispatchRound harness dispatch", () => {
     const workdir = path.join(tempHome, "work");
     fs.mkdirSync(workdir, { recursive: true });
 
+    // Internal DB fixtures use bare valid UUIDs. The run- prefix is reserved
+    // for the external typed-ID representation and is stripped at API boundaries.
     const runId = "11111111-1111-4111-8111-111111111111";
     seedRunWithPendingStep(runId, workdir, "pi");
 

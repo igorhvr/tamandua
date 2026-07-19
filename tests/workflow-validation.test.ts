@@ -129,8 +129,8 @@ describe("workflow structure", () => {
     const skillPath = resolve(repoRoot, "skills", "tamandua-agents", "SKILL.md");
     const content = readFileSync(skillPath, "utf-8");
 
-    assert.match(content, /## Instructions/);
-    assert.match(content, /## Examples/);
+    assert.match(content, /## Quick card — the 90% path/);
+    assert.match(content, /## Step lifecycle & completion contract/);
     assert.match(content, /tamandua workflow list/);
     assert.match(content, /tamandua workflow run <workflow-id>/);
     assert.match(content, /tamandua workflow status <query>/);

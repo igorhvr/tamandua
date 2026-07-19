@@ -129,14 +129,16 @@ describe("www/index.html content sync", () => {
     );
   });
 
-  // Regression test: DDOC — SKILL.md includes doctor section
-  it("SKILL.md includes Troubleshooting with tamandua doctor section", () => {
+  // Regression test: DDOC — SKILL.md includes doctor guidance in maintenance
+  it("SKILL.md includes tamandua doctor guidance under services and maintenance", () => {
     const skillPath = join(sourcePath, "skills", "tamandua-agents", "SKILL.md");
     const skillContent = readFileSync(skillPath, "utf-8");
-    assert.ok(
-      skillContent.includes("Troubleshooting with tamandua doctor"),
-      "skills/tamandua-agents/SKILL.md must include 'Troubleshooting with tamandua doctor' section",
-    );
+    const servicesStart = skillContent.indexOf("## Services & maintenance");
+    const servicesEnd = skillContent.indexOf("## Troubleshooting & recovery recipes");
+    assert.ok(servicesStart >= 0 && servicesEnd > servicesStart);
+    const services = skillContent.slice(servicesStart, servicesEnd);
+    assert.ok(services.includes("### Doctor"));
+    assert.ok(services.includes("tamandua doctor"));
   });
 
   // Regression test: DRTR — SKILL.md covers on_fail routing

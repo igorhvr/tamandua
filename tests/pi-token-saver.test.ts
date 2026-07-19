@@ -151,6 +151,8 @@ describe("dispatch round spawns pi-token-saver for no-hurry runs", () => {
         { id: "dev", role: "coding", workspace: { baseDir: workdir } },
       );
 
+    // Internal DB fixtures use bare valid UUIDs. The run- prefix is reserved
+    // for the external typed-ID representation and is stripped at API boundaries.
     seedRun("cccccccc-cccc-4ccc-8ccc-cccccccccccc", true);
     await round("cccccccc-cccc-4ccc-8ccc-cccccccccccc");
     assert.ok(fs.existsSync(saverMarker), "no-hurry run should spawn pi-token-saver");

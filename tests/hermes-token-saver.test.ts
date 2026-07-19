@@ -158,6 +158,8 @@ describe("dispatch round spawns hermes-token-saver for no-hurry runs", () => {
         { id: "dev", role: "coding", workspace: { baseDir: workdir } },
       );
 
+    // Internal DB fixtures use bare valid UUIDs. The run- prefix is reserved
+    // for the external typed-ID representation and is stripped at API boundaries.
     seedRun("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", true);
     await round("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
     assert.ok(fs.existsSync(saverMarker), "no-hurry run should spawn hermes-token-saver");

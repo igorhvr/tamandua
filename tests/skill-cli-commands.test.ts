@@ -4,7 +4,16 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 const skillPath = resolve(import.meta.dirname, "..", "skills", "tamandua-agents", "SKILL.md");
-const skillContent = readFileSync(skillPath, "utf-8");
+const coreSkillContent = readFileSync(skillPath, "utf-8");
+const autoresearchPath = resolve(
+  import.meta.dirname,
+  "..",
+  "skills",
+  "tamandua-agents",
+  "AUTORESEARCH.md",
+);
+const autoresearchContent = readFileSync(autoresearchPath, "utf-8");
+const skillContent = `${coreSkillContent}\n${autoresearchContent}`;
 
 // CLI commands documented in SKILL.md that should exist in the actual CLI.
 // Format: [commandString, sectionDescription]
@@ -179,9 +188,12 @@ describe("SKILL.md command reference completeness", () => {
 
   for (const [cmd, desc] of documentedCommands) {
     it(`documents command: ${cmd}`, () => {
+      const expectedDocument = cmd.includes("autoresearch")
+        ? autoresearchContent
+        : coreSkillContent;
       assert.ok(
-        skillContent.includes(cmd),
-        `SKILL.md must document command: ${cmd}`
+        expectedDocument.includes(cmd),
+        `${cmd.includes("autoresearch") ? "AUTORESEARCH.md" : "SKILL.md"} must document command: ${cmd}`
       );
     });
   }
@@ -190,11 +202,47 @@ describe("SKILL.md command reference completeness", () => {
     const missing: string[] = [];
     for (const cmd of actualCommands) {
       if (excludedFromSkill.has(cmd)) continue;
-      if (!skillContent.includes(cmd)) {
+      if (!coreSkillContent.includes(cmd) && !autoresearchContent.includes(cmd)) {
         missing.push(cmd);
       }
     }
     assert.deepStrictEqual(missing, [], "SKILL.md is missing documentation for these CLI commands");
+  });
+});
+
+describe("AutoResearch documentation extraction", () => {
+  it("keeps detailed commands in AUTORESEARCH.md and only a pointer in SKILL.md", () => {
+    assert.match(coreSkillContent, /AutoResearch[^]*`AUTORESEARCH\.md`/);
+    assert.doesNotMatch(
+      coreSkillContent,
+      /tamandua autoresearch (?:init|run-experiment|log-experiment|loop|run-loop-iteration|status|next|prune|wizard)/,
+    );
+    assert.doesNotMatch(coreSkillContent, /tamandua workflow autoresearch/);
+
+    for (const command of [
+      "init",
+      "run-experiment",
+      "log-experiment",
+      "loop",
+      "run-loop-iteration",
+      "status",
+      "next",
+      "prune",
+      "wizard",
+    ]) {
+      assert.ok(
+        autoresearchContent.includes(`tamandua autoresearch ${command}`),
+        `AUTORESEARCH.md must document tamandua autoresearch ${command}`,
+      );
+    }
+    assert.ok(autoresearchContent.includes("tamandua workflow autoresearch"));
+  });
+
+  it("lists AUTORESEARCH.md among review artifacts", () => {
+    assert.ok(
+      coreSkillContent.includes("skills/tamandua-agents/AUTORESEARCH.md"),
+      "SKILL.md must list AUTORESEARCH.md as a review artifact",
+    );
   });
 });
 
@@ -378,7 +426,7 @@ describe("SKILL.md workflow run command completeness", () => {
 
 describe("SKILL.md workflow supervision guidance", () => {
   it("shows safe task quoting and the operator inspection commands", () => {
-    assert.ok(skillContent.includes("#### Supervising a run"));
+    assert.ok(skillContent.includes("### Launch, inspect, and stop"));
     assert.ok(skillContent.includes('"$(cat task.md)"'));
     assert.ok(skillContent.includes("tamandua workflow status <run-id>"));
     assert.ok(skillContent.includes("tamandua workflow runs"));
@@ -566,13 +614,20 @@ describe("SKILL.md output format accuracy", () => {
     );
   });
 
-  const lifecycleSection = skillContent.slice(
-    skillContent.indexOf("### 3) Follow the step lifecycle exactly"),
-    skillContent.indexOf("### 4) Completion contract"),
+  const extractSection = (start: string, end: string): string => {
+    const startIndex = skillContent.indexOf(start);
+    const endIndex = skillContent.indexOf(end, startIndex + start.length);
+    assert.ok(startIndex >= 0, `missing semantic heading: ${start}`);
+    assert.ok(endIndex > startIndex, `missing semantic boundary: ${end}`);
+    return skillContent.slice(startIndex, endIndex);
+  };
+  const lifecycleSection = extractSection(
+    "### Claim, save, and execute",
+    "### Completion reports and validation",
   );
-  const completionSection = skillContent.slice(
-    skillContent.indexOf("### 4) Completion contract"),
-    skillContent.indexOf("### 2.1) MCP run start (remote)"),
+  const completionSection = extractSection(
+    "### Completion reports and validation",
+    "### Traceability header",
   );
 
   it("documents scheduled-agent peek behavior and the claim race", () => {
@@ -618,157 +673,157 @@ describe("SKILL.md output format accuracy", () => {
   });
 });
 
-describe("SKILL.md autoresearch commands documented", () => {
+describe("AUTORESEARCH.md autoresearch commands documented", () => {
   it("documents autoresearch init with required options", () => {
-    assert.ok(skillContent.includes("autoresearch init"), "SKILL.md must document autoresearch init");
-    assert.ok(skillContent.includes("--goal"), "SKILL.md must document --goal option");
-    assert.ok(skillContent.includes("--metric"), "SKILL.md must document --metric option");
-    assert.ok(skillContent.includes("--direction"), "SKILL.md must document --direction option");
-    assert.ok(skillContent.includes("--command"), "SKILL.md must document --command option");
+    assert.ok(autoresearchContent.includes("autoresearch init"), "AUTORESEARCH.md must document autoresearch init");
+    assert.ok(autoresearchContent.includes("--goal"), "AUTORESEARCH.md must document --goal option");
+    assert.ok(autoresearchContent.includes("--metric"), "AUTORESEARCH.md must document --metric option");
+    assert.ok(autoresearchContent.includes("--direction"), "AUTORESEARCH.md must document --direction option");
+    assert.ok(autoresearchContent.includes("--command"), "AUTORESEARCH.md must document --command option");
   });
 
   it("documents autoresearch run-experiment", () => {
-    assert.ok(skillContent.includes("autoresearch run-experiment"), "SKILL.md must document autoresearch run-experiment");
-    assert.ok(skillContent.includes("--timeout-seconds"), "SKILL.md must document --timeout-seconds option");
+    assert.ok(autoresearchContent.includes("autoresearch run-experiment"), "AUTORESEARCH.md must document autoresearch run-experiment");
+    assert.ok(autoresearchContent.includes("--timeout-seconds"), "AUTORESEARCH.md must document --timeout-seconds option");
   });
 
   it("documents autoresearch log-experiment", () => {
-    assert.ok(skillContent.includes("autoresearch log-experiment"), "SKILL.md must document autoresearch log-experiment");
-    assert.ok(skillContent.includes("--status"), "SKILL.md must document --status option");
-    assert.ok(skillContent.includes("--description"), "SKILL.md must document --description option");
-    assert.ok(skillContent.includes("--learned"), "SKILL.md must document --learned option");
-    assert.ok(skillContent.includes("--next-focus"), "SKILL.md must document --next-focus option");
+    assert.ok(autoresearchContent.includes("autoresearch log-experiment"), "AUTORESEARCH.md must document autoresearch log-experiment");
+    assert.ok(autoresearchContent.includes("--status"), "AUTORESEARCH.md must document --status option");
+    assert.ok(autoresearchContent.includes("--description"), "AUTORESEARCH.md must document --description option");
+    assert.ok(autoresearchContent.includes("--learned"), "AUTORESEARCH.md must document --learned option");
+    assert.ok(autoresearchContent.includes("--next-focus"), "AUTORESEARCH.md must document --next-focus option");
   });
 
   it("includes at least one usage example for each subcommand", () => {
     // Each subcommand should have a usage example showing the command in context
-    const initExample = skillContent.includes("autoresearch init \\");
-    const runExample = skillContent.includes("autoresearch run-experiment");
-    const logExample = skillContent.includes("autoresearch log-experiment \\");
-    assert.ok(initExample, "SKILL.md must have a usage example for autoresearch init");
-    assert.ok(runExample, "SKILL.md must reference autoresearch run-experiment");
-    assert.ok(logExample, "SKILL.md must have a usage example for autoresearch log-experiment");
+    const initExample = autoresearchContent.includes("autoresearch init \\");
+    const runExample = autoresearchContent.includes("autoresearch run-experiment");
+    const logExample = autoresearchContent.includes("autoresearch log-experiment \\");
+    assert.ok(initExample, "AUTORESEARCH.md must have a usage example for autoresearch init");
+    assert.ok(runExample, "AUTORESEARCH.md must reference autoresearch run-experiment");
+    assert.ok(logExample, "AUTORESEARCH.md must have a usage example for autoresearch log-experiment");
   });
 
   it("autoresearch section uses section 2.10 numbering", () => {
     assert.ok(
-      skillContent.includes("### 2.12) AutoResearch experiment commands"),
-      "SKILL.md must use section 2.12 for autoresearch commands"
+      autoresearchContent.includes("### 2.12) AutoResearch experiment commands"),
+      "AUTORESEARCH.md must use section 2.12 for autoresearch commands"
     );
   });
 });
 
-describe("SKILL.md autoresearch loop commands documented", () => {
+describe("AUTORESEARCH.md autoresearch loop commands documented", () => {
   it("documents autoresearch loop with action modes", () => {
-    assert.ok(skillContent.includes("autoresearch loop"), "SKILL.md must document autoresearch loop");
-    assert.ok(skillContent.includes("--measure-only"), "SKILL.md must document --measure-only action mode");
-    assert.ok(skillContent.includes("--prompt"), "SKILL.md must document --prompt action mode");
+    assert.ok(autoresearchContent.includes("autoresearch loop"), "AUTORESEARCH.md must document autoresearch loop");
+    assert.ok(autoresearchContent.includes("--measure-only"), "AUTORESEARCH.md must document --measure-only action mode");
+    assert.ok(autoresearchContent.includes("--prompt"), "AUTORESEARCH.md must document --prompt action mode");
   });
 
   it("documents loop stop conditions", () => {
-    assert.ok(skillContent.includes("--target-metric"), "SKILL.md must document --target-metric option");
-    assert.ok(skillContent.includes("--max-iterations"), "SKILL.md must document --max-iterations option");
-    assert.ok(skillContent.includes("--max-consecutive-failures"), "SKILL.md must document --max-consecutive-failures option");
-    assert.ok(skillContent.includes("Ctrl-C") || skillContent.includes("SIGINT"), "SKILL.md must document Ctrl-C/SIGINT stop condition");
+    assert.ok(autoresearchContent.includes("--target-metric"), "AUTORESEARCH.md must document --target-metric option");
+    assert.ok(autoresearchContent.includes("--max-iterations"), "AUTORESEARCH.md must document --max-iterations option");
+    assert.ok(autoresearchContent.includes("--max-consecutive-failures"), "AUTORESEARCH.md must document --max-consecutive-failures option");
+    assert.ok(autoresearchContent.includes("Ctrl-C") || autoresearchContent.includes("SIGINT"), "AUTORESEARCH.md must document Ctrl-C/SIGINT stop condition");
   });
 
   it("documents loop progress display", () => {
-    assert.ok(skillContent.match(/\[measure-only\]/), "SKILL.md must show measure-only label in progress display");
-    assert.ok(skillContent.match(/\[prompt\]/), "SKILL.md must show prompt label in progress display");
+    assert.ok(autoresearchContent.match(/\[measure-only\]/), "AUTORESEARCH.md must show measure-only label in progress display");
+    assert.ok(autoresearchContent.match(/\[prompt\]/), "AUTORESEARCH.md must show prompt label in progress display");
   });
 
   it("documents autoresearch run-loop-iteration", () => {
-    assert.ok(skillContent.includes("autoresearch run-loop-iteration"), "SKILL.md must document autoresearch run-loop-iteration");
-    assert.ok(skillContent.includes("--iteration"), "SKILL.md must document --iteration option");
-    assert.ok(skillContent.includes("--description"), "SKILL.md must document --description option");
+    assert.ok(autoresearchContent.includes("autoresearch run-loop-iteration"), "AUTORESEARCH.md must document autoresearch run-loop-iteration");
+    assert.ok(autoresearchContent.includes("--iteration"), "AUTORESEARCH.md must document --iteration option");
+    assert.ok(autoresearchContent.includes("--description"), "AUTORESEARCH.md must document --description option");
   });
 
   it("documents run-loop-iteration transactional lifecycle", () => {
     assert.ok(
-      skillContent.match(/committed.*reverted|reverted.*committed/i),
-      "SKILL.md must describe commit on keep, revert on discard/crash"
+      autoresearchContent.match(/committed.*reverted|reverted.*committed/i),
+      "AUTORESEARCH.md must describe commit on keep, revert on discard/crash"
     );
-    assert.ok(skillContent.includes("keep") && skillContent.includes("baseline"),
-      "SKILL.md must mention keep/baseline results behavior");
-    assert.ok(skillContent.includes("discard") || skillContent.includes("reverted"),
-      "SKILL.md must mention discard revert behavior");
+    assert.ok(autoresearchContent.includes("keep") && autoresearchContent.includes("baseline"),
+      "AUTORESEARCH.md must mention keep/baseline results behavior");
+    assert.ok(autoresearchContent.includes("discard") || autoresearchContent.includes("reverted"),
+      "AUTORESEARCH.md must mention discard revert behavior");
   });
 
   it("loop section uses section 2.11 numbering", () => {
     assert.ok(
-      skillContent.includes("### 2.13) AutoResearch loop and iteration commands"),
-      "SKILL.md must use section 2.13 for autoresearch loop commands"
+      autoresearchContent.includes("### 2.13) AutoResearch loop and iteration commands"),
+      "AUTORESEARCH.md must use section 2.13 for autoresearch loop commands"
     );
   });
 });
 
-describe("SKILL.md autoresearch monitoring and setup commands documented", () => {
+describe("AUTORESEARCH.md autoresearch monitoring and setup commands documented", () => {
   it("documents autoresearch status", () => {
-    assert.ok(skillContent.includes("autoresearch status"), "SKILL.md must document autoresearch status");
-    assert.ok(skillContent.includes("Baseline") || skillContent.includes("baseline"), "SKILL.md must document baseline in status output");
-    assert.ok(skillContent.includes("Best result") || skillContent.includes("best result"), "SKILL.md must document best result in status output");
-    assert.ok(skillContent.includes("Ratchet prompt") || skillContent.includes("ratchet prompt"), "SKILL.md must document ratchet prompt in status output");
+    assert.ok(autoresearchContent.includes("autoresearch status"), "AUTORESEARCH.md must document autoresearch status");
+    assert.ok(autoresearchContent.includes("Baseline") || autoresearchContent.includes("baseline"), "AUTORESEARCH.md must document baseline in status output");
+    assert.ok(autoresearchContent.includes("Best result") || autoresearchContent.includes("best result"), "AUTORESEARCH.md must document best result in status output");
+    assert.ok(autoresearchContent.includes("Ratchet prompt") || autoresearchContent.includes("ratchet prompt"), "AUTORESEARCH.md must document ratchet prompt in status output");
   });
 
   it("documents autoresearch next", () => {
-    assert.ok(skillContent.includes("autoresearch next"), "SKILL.md must document autoresearch next");
-    assert.ok(skillContent.match(/evidence.driven|ratchet prompt/), "SKILL.md must describe next as evidence-driven or ratchet prompt");
+    assert.ok(autoresearchContent.includes("autoresearch next"), "AUTORESEARCH.md must document autoresearch next");
+    assert.ok(autoresearchContent.match(/evidence.driven|ratchet prompt/), "AUTORESEARCH.md must describe next as evidence-driven or ratchet prompt");
   });
 
   it("documents autoresearch prune with duration format", () => {
-    assert.ok(skillContent.includes("autoresearch prune"), "SKILL.md must document autoresearch prune");
-    assert.ok(skillContent.includes("--older-than"), "SKILL.md must document --older-than option");
-    assert.ok(skillContent.includes("--missing"), "SKILL.md must document --missing option");
-    assert.ok(skillContent.includes("--dry-run"), "SKILL.md must document --dry-run option");
-    assert.ok(skillContent.includes("30d") || (skillContent.includes("d") && skillContent.includes("days")), "SKILL.md must document duration format with d for days");
-    assert.ok(skillContent.includes("h") && skillContent.includes("hours"), "SKILL.md must document duration format with h for hours");
-    assert.ok(skillContent.includes("m") && skillContent.includes("minutes"), "SKILL.md must document duration format with m for minutes");
+    assert.ok(autoresearchContent.includes("autoresearch prune"), "AUTORESEARCH.md must document autoresearch prune");
+    assert.ok(autoresearchContent.includes("--older-than"), "AUTORESEARCH.md must document --older-than option");
+    assert.ok(autoresearchContent.includes("--missing"), "AUTORESEARCH.md must document --missing option");
+    assert.ok(autoresearchContent.includes("--dry-run"), "AUTORESEARCH.md must document --dry-run option");
+    assert.ok(autoresearchContent.includes("30d") || (autoresearchContent.includes("d") && autoresearchContent.includes("days")), "AUTORESEARCH.md must document duration format with d for days");
+    assert.ok(autoresearchContent.includes("h") && autoresearchContent.includes("hours"), "AUTORESEARCH.md must document duration format with h for hours");
+    assert.ok(autoresearchContent.includes("m") && autoresearchContent.includes("minutes"), "AUTORESEARCH.md must document duration format with m for minutes");
   });
 
   it("documents autoresearch wizard interactive setup", () => {
-    assert.ok(skillContent.includes("autoresearch wizard"), "SKILL.md must document autoresearch wizard");
-    assert.ok(skillContent.match(/interactive/i), "SKILL.md must describe wizard as interactive");
-    assert.ok(skillContent.includes("Goal") || skillContent.includes("goal"), "SKILL.md must document wizard asks about goal");
+    assert.ok(autoresearchContent.includes("autoresearch wizard"), "AUTORESEARCH.md must document autoresearch wizard");
+    assert.ok(autoresearchContent.match(/interactive/i), "AUTORESEARCH.md must describe wizard as interactive");
+    assert.ok(autoresearchContent.includes("Goal") || autoresearchContent.includes("goal"), "AUTORESEARCH.md must document wizard asks about goal");
   });
 
   it("monitoring section uses section 2.12 numbering", () => {
     assert.ok(
-      skillContent.includes("### 2.14) AutoResearch monitoring and setup commands"),
-      "SKILL.md must use section 2.14 for autoresearch monitoring commands"
+      autoresearchContent.includes("### 2.14) AutoResearch monitoring and setup commands"),
+      "AUTORESEARCH.md must use section 2.14 for autoresearch monitoring commands"
     );
   });
 
   it("autoresearch prune explicitly states it does not touch project files", () => {
     assert.ok(
-      skillContent.match(/does not touch|never touches|safe on disk|remain safe/i),
-      "SKILL.md must state prune does not remove project-local files"
+      autoresearchContent.match(/does not touch|never touches|safe on disk|remain safe/i),
+      "AUTORESEARCH.md must state prune does not remove project-local files"
     );
   });
 });
 
-describe("SKILL.md workflow autoresearch command documented", () => {
+describe("AUTORESEARCH.md workflow autoresearch command documented", () => {
   it("documents workflow autoresearch", () => {
     assert.ok(
-      skillContent.includes("workflow autoresearch"),
-      "SKILL.md must document workflow autoresearch"
+      autoresearchContent.includes("workflow autoresearch"),
+      "AUTORESEARCH.md must document workflow autoresearch"
     );
   });
 
   it("describes that it resolves harness working directory", () => {
     assert.ok(
-      skillContent.match(/harness working directory/i),
-      "SKILL.md must explain workflow autoresearch resolves harness working directory"
+      autoresearchContent.match(/harness working directory/i),
+      "AUTORESEARCH.md must explain workflow autoresearch resolves harness working directory"
     );
   });
 
   it("describes reading autoresearch config and jsonl", () => {
     assert.ok(
-      skillContent.includes("autoresearch.config.json"),
-      "SKILL.md must mention autoresearch.config.json"
+      autoresearchContent.includes("autoresearch.config.json"),
+      "AUTORESEARCH.md must mention autoresearch.config.json"
     );
     assert.ok(
-      skillContent.includes("autoresearch.jsonl"),
-      "SKILL.md must mention autoresearch.jsonl"
+      autoresearchContent.includes("autoresearch.jsonl"),
+      "AUTORESEARCH.md must mention autoresearch.jsonl"
     );
   });
 });
