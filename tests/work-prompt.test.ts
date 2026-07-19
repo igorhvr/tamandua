@@ -145,12 +145,15 @@ describe("buildWorkPrompt (deterministic-dispatch work prompt)", () => {
 
   // ── US-008: --file as preferred reporting, REJECTED flow, --reason-file ──
 
-  it("US-008: --file is promoted as the preferred reporting method", () => {
+  it("uses a unique quoted external temp file for completion reports", () => {
     const prompt = buildWorkPrompt("feature-dev", "developer", RUN_ID);
-    assert.ok(prompt.includes("--file report.txt"), "must include --file report.txt example");
+    assert.ok(prompt.includes('report_file="$(mktemp "${TMPDIR:-/tmp}/tamandua-report.XXXXXX")"'));
+    assert.ok(prompt.includes('--file "$report_file"'), "must quote the generated report path");
+    assert.ok(prompt.includes("outside the repository/worktree"));
+    assert.ok(!prompt.includes("--file report.txt"), "must not recommend a repository-local report");
     assert.ok(prompt.includes("Preferred:"), "must mark --file as preferred");
     // The --file form must appear BEFORE the stdin alternative.
-    const preferredIdx = prompt.indexOf("Preferred: write your report to a file");
+    const preferredIdx = prompt.indexOf("Preferred:");
     const altIdx = prompt.indexOf("Alternative (stdin pipe)");
     assert.ok(preferredIdx !== -1 && altIdx !== -1 && preferredIdx < altIdx,
       "preferred --file method must appear before stdin alternative");
@@ -162,18 +165,24 @@ describe("buildWorkPrompt (deterministic-dispatch work prompt)", () => {
     assert.ok(prompt.includes("Alternative (stdin pipe)"), "must have stdin pipe labeled as alternative");
   });
 
-  it("US-008: mentions REJECTED-resubmit flow", () => {
+  it("retains the same report on REJECTED and removes it only after acceptance", () => {
     const prompt = buildWorkPrompt("feature-dev", "developer", RUN_ID);
     assert.ok(prompt.includes("REJECTED"), "must mention REJECTED");
     assert.ok(prompt.includes("still hold the step"), "must mention agent still holds the step");
     assert.ok(prompt.includes("fix the output format"), "must tell agent to fix the format");
     assert.ok(prompt.includes("same round"), "must mention same round resubmit");
+    assert.ok(prompt.includes('retain the same "$report_file"'));
+    assert.ok(prompt.includes('rm -f -- "$report_file"'));
+    assert.ok(prompt.includes("only after the completion is accepted"));
   });
 
-  it("US-008: mentions --reason-file for step fail", () => {
+  it("uses and cleans up a unique quoted external temp file for failure reasons", () => {
     const prompt = buildWorkPrompt("feature-dev", "developer", RUN_ID);
     assert.ok(prompt.includes("--reason-file"), "must mention --reason-file flag");
-    assert.ok(prompt.includes("--reason-file reason.txt"), "must include --reason-file example");
+    assert.ok(prompt.includes('reason_file="$(mktemp "${TMPDIR:-/tmp}/tamandua-reason.XXXXXX")"'));
+    assert.ok(prompt.includes('--reason-file "$reason_file"'));
+    assert.ok(prompt.includes('rm -f -- "$reason_file"'));
+    assert.ok(!prompt.includes("--reason-file reason.txt"));
   });
 
   it("US-008: RULES section mentions --file and REJECTED", () => {
@@ -189,8 +198,8 @@ describe("buildWorkPrompt (deterministic-dispatch work prompt)", () => {
     const piPrompt = buildWorkPrompt("feature-dev", "developer", RUN_ID);
     const hermesPrompt = buildWorkPrompt("bug-fix-merge-worktree", "verifier", RUN_ID);
     // Both harness types must have --file promoted.
-    assert.ok(piPrompt.includes("--file report.txt"));
-    assert.ok(hermesPrompt.includes("--file report.txt"));
+    assert.ok(piPrompt.includes('--file "$report_file"'));
+    assert.ok(hermesPrompt.includes('--file "$report_file"'));
     // Both must mention REJECTED flow.
     assert.ok(piPrompt.includes("REJECTED"));
     assert.ok(hermesPrompt.includes("REJECTED"));

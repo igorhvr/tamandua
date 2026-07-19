@@ -788,16 +788,20 @@ CHANGES: ...
 TESTS: ...
 ```
 
-**Preferred — submit via `--file`:** write the report to a file (e.g.,
-`report.txt` in your workdir), then:
+**Preferred — submit via `--file`:** create a unique report below the external
+temporary directory, never in the repository/worktree, then submit its quoted
+path:
 
 ```bash
-tamandua step complete <stepId> --file report.txt
+report_file="$(mktemp "${TMPDIR:-/tmp}/tamandua-report.XXXXXX")"
+tamandua step complete <stepId> --file "$report_file"
 ```
 
 The `--file` path is dereferenced exactly once at CLI time — the file contents
 are transmitted as if typed inline, and the path is never stored downstream.
-Temp files may be deleted immediately after the command returns.
+The file remains caller-owned. If submission returns `REJECTED`, retain the
+same file, correct it, and resubmit it. Run `rm -f -- "$report_file"` only after
+completion is accepted.
 
 **Alternative — stdin pipe:**
 
@@ -830,9 +834,11 @@ Verdict channels are distinct:
 - `tamandua step fail <stepId> "<reason>"` means "I could not do the work."
   Use it with an actionable reason when execution cannot be completed. Do not
   use `step fail` to deliver a retry verdict.
-  Prefer `--reason-file <path>` for multi-line reasons — write the reason to a
-  file, then call `tamandua step fail <stepId> --reason-file <path>`. The
-  file is dereferenced once at CLI time; the path is never stored downstream.
+  Prefer `--reason-file <path>` for multi-line reasons — create it externally
+  with `reason_file="$(mktemp "${TMPDIR:-/tmp}/tamandua-reason.XXXXXX")"`, then
+  call `tamandua step fail <stepId> --reason-file "$reason_file"`. The file is
+  dereferenced once at CLI time; the path is never stored downstream. Remove
+  it with `rm -f -- "$reason_file"` only after `step fail` succeeds.
 
 #### STORIES_JSON and STORIES_JSON_FILE reports
 
@@ -841,20 +847,25 @@ array ending with `]`, with no trailing prose after the array. The array must
 not contain embedded newline-separated lines starting with `UPPERCASE_KEY:`;
 the extractor truncates the value when it encounters such a line.
 
-**Preferred — use `STORIES_JSON_FILE`:** for multi-KB story payloads, write
-the JSON array to a file and reference it with a `STORIES_JSON_FILE:` line
-instead of inline `STORIES_JSON:`:
+**Preferred — use `STORIES_JSON_FILE`:** for multi-KB story payloads, create a
+unique external file with
+`stories_file="$(mktemp "${TMPDIR:-/tmp}/tamandua-stories.XXXXXX")"`, write the
+JSON array there, and reference its absolute path with a `STORIES_JSON_FILE:`
+line instead of inline `STORIES_JSON:`:
 
 ```text
 STATUS: done
 CHANGES: planned user stories
-STORIES_JSON_FILE: stories.json
+STORIES_JSON_FILE: /tmp/tamandua-stories.ABC123
 ```
 
 The file is resolved at submit time (relative to the invoking cwd), its
 contents are validated as a JSON array, and it is replaced by a standard
 `STORIES_JSON: <contents>` line before anything reaches the DB or scheduler.
-The file may be deleted immediately after the command returns.
+Always quote `"$stories_file"` in shell commands. If completion is `REJECTED`,
+retain both story and report files for correction and resubmission. Remove them
+only after completion is accepted. Never place transport files in the
+repository/worktree.
 
 **Inline alternative:** construct `STORIES_JSON` with `python3` and
 `json.dumps` via a heredoc:

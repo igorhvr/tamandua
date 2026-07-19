@@ -117,11 +117,13 @@ Options:
   --file <path>      Read the report from a file instead of stdin.
                      Path resolves relative to the current working directory.
                      File is dereferenced once at command time; the path is
-                     never stored downstream.
+                     never stored downstream. The file remains caller-owned;
+                     the CLI does not delete it. Retain it after REJECTED and
+                     delete it only after completion is accepted.
 
 Examples:
   # File-based (preferred):
-  tamandua step complete 123e4567-e89b-12d3-a456-426614174000 --file report.txt
+  tamandua step complete 123e4567-e89b-12d3-a456-426614174000 --file "/absolute/temp/tamandua-report.ABC123"
 
   # Stdin pipe (alternative):
   echo "STATUS: done\nCHANGES: Added feature X\nTESTS: Wrote unit tests" | \\
@@ -147,14 +149,16 @@ Options:
   --reason-file <path>  Read the failure reason from a file instead of argv.
                         Path resolves relative to the current working directory.
                         File is dereferenced once at command time; the path is
-                        never stored downstream.
+                        never stored downstream. The file remains caller-owned;
+                        the CLI does not delete it. Delete it after step fail
+                        succeeds.
                         When --reason-file is given, any inline argv reason
                         is ignored.
 
 Examples:
   tamandua step fail 123e4567-e89b-12d3-a456-426614174000
   tamandua step fail 123e4567-e89b-12d3-a456-426614174000 "Network timeout"
-  tamandua step fail 123e4567-e89b-12d3-a456-426614174000 --reason-file fail.txt`;
+  tamandua step fail 123e4567-e89b-12d3-a456-426614174000 --reason-file "/absolute/temp/tamandua-reason.ABC123"`;
 }
 
 export function getStepStoriesHelp(): string {

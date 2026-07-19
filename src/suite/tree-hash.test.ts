@@ -4,7 +4,8 @@
  */
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { rmSync, writeFileSync, mkdirSync, symlinkSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execSync } from "node:child_process";
 import { createTempHome } from "../../tests/helpers/test-env.ts";
@@ -98,6 +99,36 @@ describe("computeTreeHash", () => {
       hashAfter,
       "untracked non-ignored file should change the hash",
     );
+  });
+
+  it("external transport files leave the hash unchanged while in-repo files change it", async () => {
+    const { computeTreeHash } = await import(
+      "../../dist/suite/tree-hash.js"
+    );
+    const externalDir = mkdtempSync(join(tmpdir(), "tamandua-transport-test-"));
+    const externalReport = join(externalDir, "report");
+    const inRepoReport = join(repoDir, "transport-report");
+    const hashBefore = computeTreeHash(repoDir);
+    assert.ok(hashBefore, "initial hash should be non-null");
+
+    try {
+      writeFileSync(externalReport, "STATUS: done\nCHANGES: external transport\n");
+      assert.equal(
+        computeTreeHash(repoDir),
+        hashBefore,
+        "an external transport file must not alter repository evidence",
+      );
+
+      writeFileSync(inRepoReport, "STATUS: done\nCHANGES: external transport\n");
+      assert.notEqual(
+        computeTreeHash(repoDir),
+        hashBefore,
+        "equivalent untracked transport bytes inside the repo must remain hashed",
+      );
+    } finally {
+      rmSync(inRepoReport, { force: true });
+      rmSync(externalDir, { recursive: true, force: true });
+    }
   });
 
   it("untracked files in .gitignore are NOT included in the tree hash", async () => {
