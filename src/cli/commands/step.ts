@@ -297,7 +297,11 @@ export async function handleStep(group: string, args: string[]): Promise<boolean
     return true;
   }
   if (action === "complete") {
-    if (!target) { process.stderr.write("Missing step-id.\n"); process.exit(1); }
+    if (!target) {
+      logger.warn("Rejected step complete: missing step-id", { action: "complete" });
+      process.stderr.write("Missing step-id.\n");
+      process.exit(1);
+    }
 
     const completeWrongPrefix = detectWrongPrefix(target, "step");
     if (completeWrongPrefix) {
@@ -420,7 +424,11 @@ export async function handleStep(group: string, args: string[]): Promise<boolean
     return true;
   }
   if (action === "fail") {
-    if (!target) { process.stderr.write("Missing step-id.\n"); process.exit(1); }
+    if (!target) {
+      logger.warn("Rejected step fail: missing step-id", { action: "fail" });
+      process.stderr.write("Missing step-id.\n");
+      process.exit(1);
+    }
 
     const failWrongPrefix = detectWrongPrefix(target, "step");
     if (failWrongPrefix) {
