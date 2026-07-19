@@ -138,26 +138,34 @@ describe("CLI help text timeout default", () => {
 });
 
 // ---------------------------------------------------------------------------
-// SKILL.md: timeout default was doubled
+// AUTORESEARCH.md: timeout default was doubled
 // ---------------------------------------------------------------------------
-describe("SKILL.md timeout default", () => {
+describe("AUTORESEARCH.md timeout default", () => {
   let content: string;
 
   before(() => {
-    const skillPath = path.join(PROJECT_ROOT, "skills", "tamandua-agents", "SKILL.md");
-    assert.ok(fs.existsSync(skillPath), `SKILL.md must exist at ${skillPath}`);
-    content = fs.readFileSync(skillPath, "utf-8");
+    const autoresearchPath = path.join(
+      PROJECT_ROOT,
+      "skills",
+      "tamandua-agents",
+      "AUTORESEARCH.md",
+    );
+    assert.ok(
+      fs.existsSync(autoresearchPath),
+      `AUTORESEARCH.md must exist at ${autoresearchPath}`,
+    );
+    content = fs.readFileSync(autoresearchPath, "utf-8");
   });
 
   it("--timeout-seconds documents the doubled default", () => {
     assert.match(
       content,
       /\(default:\s*3600\)/,
-      "SKILL.md must document the doubled default",
+      "AUTORESEARCH.md must document the doubled default",
     );
   });
 
   it("no remaining previous default in --timeout-seconds docs", () => {
-    assert.ok(!oldHelpRe.test(content), "previous default must not remain in SKILL.md");
+    assert.ok(!oldHelpRe.test(content), "previous default must not remain in AUTORESEARCH.md");
   });
 });

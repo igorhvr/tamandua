@@ -151,13 +151,15 @@ describe("dispatch round spawns pi-token-saver for no-hurry runs", () => {
         { id: "dev", role: "coding", workspace: { baseDir: workdir } },
       );
 
-    seedRun("run-no-hurry", true);
-    await round("run-no-hurry");
+    // DB fixtures use bare IDs; run- is the external typed-ID prefix and is
+    // stripped by executeDispatchRound's step lookup.
+    seedRun("no-hurry", true);
+    await round("no-hurry");
     assert.ok(fs.existsSync(saverMarker), "no-hurry run should spawn pi-token-saver");
     assert.ok(!fs.existsSync(piMarker), "no-hurry run should not spawn pi when the saver exists");
 
-    seedRun("run-normal", false);
-    await round("run-normal");
+    seedRun("normal", false);
+    await round("normal");
     assert.ok(fs.existsSync(piMarker), "normal run should spawn pi");
     assert.equal(
       fs.readFileSync(saverMarker, "utf-8").trim().split("\n").length,

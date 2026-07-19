@@ -153,7 +153,9 @@ describe("executeDispatchRound harness dispatch", () => {
     const workdir = path.join(tempHome, "work");
     fs.mkdirSync(workdir, { recursive: true });
 
-    const runId = "run-pi-dispatch";
+    // Internal DB fixtures use bare IDs. The run- prefix is reserved for the
+    // external typed-ID representation and is stripped at API boundaries.
+    const runId = "pi-dispatch";
     seedRunWithPendingStep(runId, workdir, "pi");
 
     const workflow = makeWorkflow();
@@ -190,7 +192,7 @@ describe("executeDispatchRound harness dispatch", () => {
     makeMockBinary(hermesPath, `echo "$@" >> "${hermesLog}"; echo "NO_WORK_AVAILABLE"`);
     process.env.TAMANDUA_HERMES_BINARY = hermesPath;
 
-    const runId = "run-hermes-dispatch";
+    const runId = "hermes-dispatch";
     seedRunWithPendingStep(runId, workdir, "hermes");
 
     const workflow = makeWorkflow();
@@ -220,7 +222,7 @@ describe("executeDispatchRound harness dispatch", () => {
     const workdir = path.join(tempHome, "work");
     fs.mkdirSync(workdir, { recursive: true });
 
-    const runId = "run-default-dispatch";
+    const runId = "default-dispatch";
     seedRunWithPendingStep(runId, workdir);
 
     const workflow = makeWorkflow();
@@ -252,7 +254,7 @@ describe("executeDispatchRound harness dispatch", () => {
     const workdir = path.join(tempHome, "work");
     fs.mkdirSync(workdir, { recursive: true });
 
-    const runId = "run-idle-no-spawn";
+    const runId = "idle-no-spawn";
     // Run exists but its only step is already done — peek says NO_WORK.
     const db = getDb();
     const now = new Date().toISOString();
@@ -284,7 +286,7 @@ describe("executeDispatchRound harness dispatch", () => {
     makeMockBinary(hermesPath, `env | grep TAMANDUA >> "${envLog}"; echo "NO_WORK_AVAILABLE"`);
     process.env.TAMANDUA_HERMES_BINARY = hermesPath;
 
-    const runId = "run-hermes-env";
+    const runId = "hermes-env";
     seedRunWithPendingStep(runId, workdir, "hermes");
 
     const workflow = makeWorkflow();

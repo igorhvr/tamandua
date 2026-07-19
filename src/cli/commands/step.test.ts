@@ -136,13 +136,13 @@ describe("SPL2 step protocol command module", () => {
   });
 
   it("getStepReleaseHelp is referenced from cli.ts --help dispatch", () => {
-    const dispatcher = readFileSync(join(process.cwd(), "src/cli/cli.ts"), "utf8");
+    const dispatcher = fs.readFileSync(path.join(process.cwd(), "src/cli/cli.ts"), "utf8");
     assert.match(dispatcher, /getStepReleaseHelp/);
     assert.match(dispatcher, /"release".*printHelp\(getStepReleaseHelp/);
   });
 
   it("getStepHelp is referenced as step-group fallback in cli.ts", () => {
-    const dispatcher = readFileSync(join(process.cwd(), "src/cli/cli.ts"), "utf8");
+    const dispatcher = fs.readFileSync(path.join(process.cwd(), "src/cli/cli.ts"), "utf8");
     assert.match(dispatcher, /getStepHelp/);
     assert.match(dispatcher, /printHelp\(getStepHelp\(\)\)/);
   });

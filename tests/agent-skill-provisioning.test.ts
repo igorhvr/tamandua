@@ -83,6 +83,10 @@ describe("agent skill provisioning", () => {
         "# bundled shared skill\n",
       );
       writeText(
+        path.join(root, "bundled", "skills", "tamandua-agents", "AUTORESEARCH.md"),
+        "# bundled autoresearch reference\n",
+      );
+      writeText(
         path.join(root, "bundled", "skills", "tamandua-agents", "examples", "usage.md"),
         "shared usage",
       );
@@ -118,6 +122,10 @@ describe("agent skill provisioning", () => {
         "tamandua-agents",
       );
       assert.equal(fs.existsSync(path.join(copiedSkillDir, "SKILL.md")), true);
+      assert.equal(
+        fs.readFileSync(path.join(copiedSkillDir, "AUTORESEARCH.md"), "utf-8"),
+        "# bundled autoresearch reference\n",
+      );
       assert.equal(
         fs.readFileSync(path.join(copiedSkillDir, "examples", "usage.md"), "utf-8"),
         "shared usage",

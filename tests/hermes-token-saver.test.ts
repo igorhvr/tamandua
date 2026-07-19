@@ -158,13 +158,15 @@ describe("dispatch round spawns hermes-token-saver for no-hurry runs", () => {
         { id: "dev", role: "coding", workspace: { baseDir: workdir } },
       );
 
-    seedRun("run-no-hurry", true);
-    await round("run-no-hurry");
+    // DB fixtures use bare IDs; run- is the external typed-ID prefix and is
+    // stripped by executeDispatchRound's step lookup.
+    seedRun("no-hurry", true);
+    await round("no-hurry");
     assert.ok(fs.existsSync(saverMarker), "no-hurry run should spawn hermes-token-saver");
     assert.ok(!fs.existsSync(hermesMarker), "no-hurry run should not spawn hermes when the saver exists");
 
-    seedRun("run-normal", false);
-    await round("run-normal");
+    seedRun("normal", false);
+    await round("normal");
     assert.ok(fs.existsSync(hermesMarker), "normal run should spawn hermes");
     assert.equal(
       fs.readFileSync(saverMarker, "utf-8").trim().split("\n").length,
