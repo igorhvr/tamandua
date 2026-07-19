@@ -149,7 +149,7 @@ describe("CLI token display", () => {
     const stdout = getStdout();
     const stderr = getStderr();
 
-    assert.match(stdout, new RegExp(`Run: ${runId.substring(0, 8)}`));
+    assert.match(stdout, new RegExp(`Run: run-${runId}`));
     assert.match(stdout, /Tokens: 4,242/);
     assert.match(stdout, /Steps:/);
 
@@ -186,7 +186,7 @@ describe("CLI token display", () => {
     const stdout = getStdout();
     const stderr = getStderr();
 
-    assert.match(stdout, new RegExp(`Run: ${runId.substring(0, 8)}`));
+    assert.match(stdout, new RegExp(`Run: run-${runId}`));
     assert.match(stdout, /Tokens: 0/);
 
     try { fs.rmSync(env.root, { recursive: true }); } catch { /* cleanup */ }
@@ -308,7 +308,7 @@ describe("CLI token display", () => {
 
     const stdout = getStdout();
 
-    assert.match(stdout, new RegExp(`Run: ${runId.substring(0, 8)}`));
+    assert.match(stdout, new RegExp(`Run: run-${runId}`));
     assert.match(stdout, /Tokens: 500/);
 
     try { fs.rmSync(env.root, { recursive: true }); } catch { /* cleanup */ }

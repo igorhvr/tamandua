@@ -459,7 +459,7 @@ describe("tamandua workflow status --json (integration)", () => {
     const parsed = JSON.parse(stdout);
 
     // Top-level fields
-    assert.equal(parsed.runId, runId1);
+    assert.equal(parsed.runId, "run-" + runId1);
     assert.equal(typeof parsed.runNumber, "number");
     assert.equal(parsed.workflowId, "feature-dev-merge-worktree");
     assert.equal(parsed.status, "running");
@@ -480,6 +480,7 @@ describe("tamandua workflow status --json (integration)", () => {
 
     const step0 = parsed.steps[0];
     assert.equal(typeof step0.stepId, "string");
+    assert.match(step0.stepId, /^step-/, "stepId must use step- prefix");
     assert.equal(typeof step0.agentRole, "string");
     assert.equal(step0.agentRole, "planner");
     assert.equal(typeof step0.status, "string");

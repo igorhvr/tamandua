@@ -412,22 +412,22 @@ describe("mcp-server bootstrap", () => {
       const pauseResult = await callTool(server.port, sessionId, 20, "tamandua.run.pause", { runId: "run-abc" });
       assert.equal(pauseResult.status, 200);
       assert.equal(pauseResult.body?.error, undefined);
-      assert.deepEqual(pauseResult.body?.result?.structuredContent, { runId: "run-abc", status: "paused" });
-      assert.deepEqual(pauseCalls, [{ runId: "run-abc", drain: false }]);
+      assert.deepEqual(pauseResult.body?.result?.structuredContent, { runId: "abc", status: "paused" });
+      assert.deepEqual(pauseCalls, [{ runId: "abc", drain: false }]);
 
       // Test pause with drain
       const pauseDrainResult = await callTool(server.port, sessionId, 21, "tamandua.run.pause", { runId: "run-def", drain: true });
       assert.equal(pauseDrainResult.status, 200);
       assert.equal(pauseDrainResult.body?.error, undefined);
-      assert.deepEqual(pauseDrainResult.body?.result?.structuredContent, { runId: "run-def", status: "draining_pause" });
-      assert.deepEqual(pauseCalls, [{ runId: "run-abc", drain: false }, { runId: "run-def", drain: true }]);
+      assert.deepEqual(pauseDrainResult.body?.result?.structuredContent, { runId: "def", status: "draining_pause" });
+      assert.deepEqual(pauseCalls, [{ runId: "abc", drain: false }, { runId: "def", drain: true }]);
 
       // Test resume
       const resumeResult = await callTool(server.port, sessionId, 22, "tamandua.run.resume", { runId: "run-abc" });
       assert.equal(resumeResult.status, 200);
       assert.equal(resumeResult.body?.error, undefined);
-      assert.deepEqual(resumeResult.body?.result?.structuredContent, { runId: "run-abc", status: "running" });
-      assert.deepEqual(resumeCalls, ["run-abc"]);
+      assert.deepEqual(resumeResult.body?.result?.structuredContent, { runId: "abc", status: "running" });
+      assert.deepEqual(resumeCalls, ["abc"]);
     } finally {
       await stopTamanduaMcpServer(server);
     }
@@ -457,8 +457,8 @@ describe("mcp-server bootstrap", () => {
       const deleteResult = await callTool(server.port, sessionId, 23, "tamandua.run.delete", { runId: "run-abc", force: true });
       assert.equal(deleteResult.status, 200);
       assert.equal(deleteResult.body?.error, undefined);
-      assert.deepEqual(deleteResult.body?.result?.structuredContent, { ok: true, runId: "run-abc", status: "deleted" });
-      assert.deepEqual(deleteCalls, [{ runId: "run-abc", force: true }]);
+      assert.deepEqual(deleteResult.body?.result?.structuredContent, { ok: true, runId: "abc", status: "deleted" });
+      assert.deepEqual(deleteCalls, [{ runId: "abc", force: true }]);
     } finally {
       await stopTamanduaMcpServer(server);
     }

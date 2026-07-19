@@ -344,13 +344,13 @@ export function buildWorkPrompt(
   // work prompt so persisted sessions are greppable to their exact step via the DB.
   if (jobId && runNumber !== undefined) {
     prompt.push(
-      `[tamandua traceability - metadata only, no action needed] run=${runId} run_number=${runNumber} agent=${agentId} job=${jobId} ts=${new Date().toISOString()}`,
+      `[tamandua traceability - metadata only, no action needed] run=run-${runId} run_number=${runNumber} agent=${agentId} job=${jobId} ts=${new Date().toISOString()}`,
       "",
     );
   }
 
   prompt.push(
-    `You are the work agent for workflow "${workflowId}", agent "${agentId}", run "${runId}".`,
+    `You are the work agent for workflow "${workflowId}", agent "${agentId}", run "run-${runId}".`,
     `You run in --print mode. A pending step is waiting for you: claim it, execute it, report.`,
   );
 
@@ -368,7 +368,7 @@ export function buildWorkPrompt(
     `─── CLAIM ───`,
     `1. Claim the step and capture the JSON response:`,
     `   "${cli}" step claim "${agentId}" --run-id "${runId}"`,
-    `   The output is JSON: {"stepId":"<UUID>", "runId":"<UUID>", "input":"<task description>"}`,
+    `   The output is JSON: {"stepId":"step-<UUID>", "runId":"run-<UUID>", "input":"<task description>"}`,
     `   SAVE the stepId — you MUST use it when reporting results.`,
     ``,
     `   If the claim output contains NO_WORK, another worker already took the step.`,
@@ -384,21 +384,21 @@ export function buildWorkPrompt(
     `4. When finished, report using the SAVED stepId (NOT the agent ID):`,
     `   - Preferred: create a unique temporary report outside the repository/worktree, then submit its quoted path:`,
     `     report_file="$(mktemp "\${TMPDIR:-/tmp}/tamandua-report.XXXXXX")"`,
-    `     "${cli}" step complete "<stepId>" --file "$report_file"`,
+    `     "${cli}" step complete "step-<uuid>" --file "$report_file"`,
     `     The report must follow EXACTLY the reply format from the task's "Reply with:" section.`,
     `     It always begins with "STATUS: done" and lists the KEY: lines this step must produce —`,
     `     downstream steps consume those keys, and omitting one forces a retry.`,
     `   - Only if the task has NO "Reply with:" section, write: STATUS: done`,
     `     CHANGES: <what you did>`,
     `     TESTS: <tests you ran>`,
-    `     then invoke: "${cli}" step complete "<stepId>" --file "$report_file"`,
-    `   - Alternative (stdin pipe): echo '<your report>' | "${cli}" step complete "<stepId>"`,
+    `     then invoke: "${cli}" step complete "step-<uuid>" --file "$report_file"`,
+    `   - Alternative (stdin pipe): echo '<your report>' | "${cli}" step complete "step-<uuid>"`,
     `   - If step complete responds with 'REJECTED', you still hold the step —`,
     `     retain the same "$report_file", fix the output format, and resubmit it in the same round.`,
     `     Run rm -f -- "$report_file" only after the completion is accepted.`,
-    `   - Failure: "${cli}" step fail "<stepId>" "clear reason for failure"`,
+    `   - Failure: "${cli}" step fail "step-<uuid>" "clear reason for failure"`,
     `     Or create an external reason file: reason_file="$(mktemp "\${TMPDIR:-/tmp}/tamandua-reason.XXXXXX")"`,
-    `     Then run: "${cli}" step fail "<stepId>" --reason-file "$reason_file"`,
+    `     Then run: "${cli}" step fail "step-<uuid>" --reason-file "$reason_file"`,
     `     After step fail succeeds, run rm -f -- "$reason_file".`,
     ``,
     `─── RULES ───`,

@@ -72,11 +72,18 @@ function emit(obj) {
   process.stdout.write(JSON.stringify(obj) + "\n");
 }
 
+function stripIdPrefix(id) {
+  return id.replace(/^(run-|step-)/, "");
+}
+
 function emitToolAttribution(stepId, runId) {
   emit({
     type: "tool_execution_end",
     toolName: "bash",
-    result: { content: [{ type: "text", text: JSON.stringify({ stepId, runId }) }] },
+    result: { content: [{ type: "text", text: JSON.stringify({
+      stepId: stripIdPrefix(stepId),
+      runId: stripIdPrefix(runId)
+    }) }] },
     isError: false,
   });
 }
@@ -213,7 +220,7 @@ function runWorkRound() {
   const claimed = JSON.parse(claimRaw);
   const stepId = claimed.stepId;
   const inputVars = parseInputVars(claimed.input ?? "");
-  inputVars.RUN_ID = claimed.runId;
+  inputVars.RUN_ID = stripIdPrefix(claimed.runId);
 
   // Log the work round NOW: once the final `step complete` of a run lands,
   // the daemon tears down crons and SIGTERMs this process group, so any

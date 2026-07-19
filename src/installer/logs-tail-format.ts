@@ -60,7 +60,7 @@ export function formatLogsTailLine(evt: TamanduaEvent): string {
   const story = evt.storyTitle ? ` — ${evt.storyTitle}` : "";
   const detail = evt.detail ? ` (${evt.detail})` : "";
   const tokenSpend = formatTokenSpend(evt);
-  const run = evt.runId ? `  [${evt.runId.slice(0, 8)}]` : "";
+  const run = evt.runId ? `  [run-${evt.runId.slice(0, 8)}]` : "";
   return `${time}${run}${agent}  ${label}${story}${detail}${tokenSpend}`;
 }
 

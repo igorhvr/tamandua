@@ -262,6 +262,7 @@ describe("tamandua workflow status --json", () => {
     // Step 1 (done, planner → agentRole: planner)
     const s1 = parsed.steps[0];
     assert.equal(typeof s1.stepId, "string");
+    assert.match(s1.stepId, /^step-/, "stepId must use step- prefix");
     assert.equal(typeof s1.stepIndex, "number");
     assert.equal(s1.stepIndex, 0);
     assert.equal(typeof s1.agentRole, "string");
@@ -378,7 +379,7 @@ describe("tamandua workflow status --json", () => {
     const lines = stdout.trim().split("\n");
 
     // Check for expected human output lines
-    assert.match(lines[0], /^Run: a1b2c3d4/);
+    assert.match(lines[0], /^Run: run-a1b2c3d4/);
     assert.match(lines[1], /^Workflow: feature-dev-merge-worktree/);
     assert.match(lines[2], /^Task: Add --json flag to step stories/);
     assert.match(lines[3], /^Status: running/);
@@ -390,13 +391,13 @@ describe("tamandua workflow status --json", () => {
 
     // Step status indicators with agent role in parens
     const stepLines = lines.slice(stepsIdx + 1);
-    assert.match(stepLines[0], /\[done   \] feature-dev-merge-worktree_planner/);
+    assert.match(stepLines[0], /\[done   \] step-feature-dev-merge-worktree_planner/);
     assert.match(stepLines[0], /\(planner\)/);
-    assert.match(stepLines[1], /\[running\] feature-dev-merge-worktree_developer/);
+    assert.match(stepLines[1], /\[running\] step-feature-dev-merge-worktree_developer/);
     assert.match(stepLines[1], /\(developer\)/);
-    assert.match(stepLines[2], /\[pending\] feature-dev-merge-worktree_verifier/);
+    assert.match(stepLines[2], /\[pending\] step-feature-dev-merge-worktree_verifier/);
     assert.match(stepLines[2], /\(verifier\)/);
-    assert.match(stepLines[3], /\[failed \] feature-dev-merge-worktree_pr/);
+    assert.match(stepLines[3], /\[failed \] step-feature-dev-merge-worktree_pr/);
     assert.match(stepLines[3], /\(pr\)/);
   });
 
@@ -462,7 +463,7 @@ describe("tamandua workflow status --json", () => {
     const { stdout } = await runCli(["workflow", "status", prefix, "--json"], homeDir, tamanduaDir, dbPath);
     const parsed = JSON.parse(stdout);
 
-    assert.equal(parsed.runId, runId);
+    assert.equal(parsed.runId, "run-" + runId);
     assert.ok(Array.isArray(parsed.steps));
   });
 
@@ -483,7 +484,7 @@ describe("tamandua workflow status --json", () => {
     const { stdout } = await runCli(["workflow", "status", runId, "--json"], homeDir, tamanduaDir, dbPath);
     const parsed = JSON.parse(stdout);
 
-    assert.equal(parsed.runId, runId);
+    assert.equal(parsed.runId, "run-" + runId);
     assert.equal(parsed.runNumber, 1);
     assert.ok(Array.isArray(parsed.steps));
     assert.equal(parsed.steps.length, 0);

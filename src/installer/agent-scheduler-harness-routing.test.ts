@@ -153,7 +153,7 @@ describe("executeDispatchRound harness dispatch", () => {
     const workdir = path.join(tempHome, "work");
     fs.mkdirSync(workdir, { recursive: true });
 
-    const runId = "run-pi-dispatch";
+    const runId = "11111111-1111-4111-8111-111111111111";
     seedRunWithPendingStep(runId, workdir, "pi");
 
     const workflow = makeWorkflow();
@@ -190,7 +190,7 @@ describe("executeDispatchRound harness dispatch", () => {
     makeMockBinary(hermesPath, `echo "$@" >> "${hermesLog}"; echo "NO_WORK_AVAILABLE"`);
     process.env.TAMANDUA_HERMES_BINARY = hermesPath;
 
-    const runId = "run-hermes-dispatch";
+    const runId = "22222222-2222-4222-8222-222222222222";
     seedRunWithPendingStep(runId, workdir, "hermes");
 
     const workflow = makeWorkflow();
@@ -220,7 +220,7 @@ describe("executeDispatchRound harness dispatch", () => {
     const workdir = path.join(tempHome, "work");
     fs.mkdirSync(workdir, { recursive: true });
 
-    const runId = "run-default-dispatch";
+    const runId = "33333333-3333-4333-8333-333333333333";
     seedRunWithPendingStep(runId, workdir);
 
     const workflow = makeWorkflow();
@@ -252,7 +252,7 @@ describe("executeDispatchRound harness dispatch", () => {
     const workdir = path.join(tempHome, "work");
     fs.mkdirSync(workdir, { recursive: true });
 
-    const runId = "run-idle-no-spawn";
+    const runId = "44444444-4444-4444-8444-444444444444";
     // Run exists but its only step is already done — peek says NO_WORK.
     const db = getDb();
     const now = new Date().toISOString();
@@ -284,7 +284,7 @@ describe("executeDispatchRound harness dispatch", () => {
     makeMockBinary(hermesPath, `env | grep TAMANDUA >> "${envLog}"; echo "NO_WORK_AVAILABLE"`);
     process.env.TAMANDUA_HERMES_BINARY = hermesPath;
 
-    const runId = "run-hermes-env";
+    const runId = "55555555-5555-4555-8555-555555555555";
     seedRunWithPendingStep(runId, workdir, "hermes");
 
     const workflow = makeWorkflow();
@@ -343,7 +343,7 @@ describe("createAgentCronJob harnessType from run context", () => {
     const workdir = path.join(tempHome, "work");
     fs.mkdirSync(workdir, { recursive: true });
 
-    const runId = "run-cron-harness-hermes";
+    const runId = "66666666-6666-4666-8666-666666666666";
     const db = getDb();
     const now = new Date().toISOString();
     db.prepare(
@@ -373,7 +373,7 @@ describe("createAgentCronJob harnessType from run context", () => {
     const workdir = path.join(tempHome, "work");
     fs.mkdirSync(workdir, { recursive: true });
 
-    const runId = "run-cron-harness-default";
+    const runId = "77777777-7777-4777-8777-777777777777";
     const db = getDb();
     const now = new Date().toISOString();
     db.prepare(
@@ -403,7 +403,7 @@ describe("createAgentCronJob harnessType from run context", () => {
     const workdir = path.join(tempHome, "work");
     fs.mkdirSync(workdir, { recursive: true });
 
-    const runId = "run-cron-harness-pi";
+    const runId = "88888888-8888-4888-8888-888888888888";
     const db = getDb();
     const now = new Date().toISOString();
     db.prepare(

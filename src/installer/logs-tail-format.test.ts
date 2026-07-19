@@ -54,7 +54,7 @@ describe("formatLogsTailLine", () => {
     });
     const line = formatLogsTailLine(evt);
     assert.ok(line.includes("Run nudged"), `Expected 'Run nudged' in: ${line}`);
-    assert.ok(line.includes("abcd1234"), `Expected run ID in: ${line}`);
+    assert.ok(line.includes("run-abcd1234"), `Expected run ID in: ${line}`);
     assert.ok(line.includes("developer"), `Expected agent label in: ${line}`);
   });
 

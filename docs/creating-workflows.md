@@ -137,7 +137,7 @@ The context for each step is built from:
 | Placeholder | Description |
 |-------------|-------------|
 | `{{task}}` | The task description from `tamandua workflow run` |
-| `{{run_id}}` | The run UUID |
+| `{{run_id}}` | The run id, prefixed as `run-<uuid>` (e.g. `run-a1b2c3d4-...`). Both prefixed and bare forms are accepted on CLI input; templates resolve to the prefixed form. |
 
 ### Computed when context allows
 
@@ -156,8 +156,21 @@ The context for each step is built from:
 | `{{completed_stories}}` | Bullet list of completed stories, or `(none yet)` |
 | `{{stories_remaining}}` | Count of pending + running stories |
 | `{{progress}}` | Contents of the progress file (if the agent maintains one) |
-| `{{progress_file}}` | Absolute path to the progress file (e.g. `~/.tamandua/runs/<run_id>/progress.txt`) |
+| `{{progress_file}}` | Absolute path to the progress file (e.g. `~/.tamandua/runs/run-<uuid>/progress.txt`) |
 | `{{verify_feedback}}` | Feedback from the verify step on retry, else empty |
+
+### ID Format: Prefixed vs Bare
+
+Tamandua now emits **prefixed ids** on all agent-facing and operator-facing surfaces:
+
+- Run ids appear as `run-<uuid>` (e.g. `run-a1b2c3d4-5678-...`)
+- Step ids appear as `step-<uuid>` (e.g. `step-a1b2c3d4-5678-...`)
+
+**Display:** All CLI output (human and `--json`), logs, events, and agent prompts show the prefixed form. Placeholders like `{{run_id}}` resolve to `run-<uuid>`.
+
+**Input acceptance:** Every CLI argument and API field that takes an id accepts **both** the prefixed form (`run-<uuid>`, `step-<uuid>`) **and** the bare form (`<uuid>`). Prefix matching (e.g. `run-799c`, `799c`, `#207`) works with either form. DB storage remains bare UUIDs — prefixes are a presentation/parsing concern only.
+
+**Type checking:** Passing an id with the *wrong* prefix (e.g. `step complete run-<uuid>`) fails immediately with a specific error: "that is a run id, not a step id." This catches id-type confusion at the boundary instead of letting it manifest as silent not-found lookups.
 
 ### From prior step `KEY: value` outputs
 

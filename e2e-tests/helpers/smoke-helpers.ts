@@ -247,7 +247,7 @@ export function spawnWorkflowRun(
 
     child.stdout.on("data", (chunk: Buffer) => {
       stdout += chunk.toString();
-      const match = stdout.match(/^Run:\s+([0-9a-f]{8,})/im);
+      const match = stdout.match(/^Run:\s+(?:run-)?([0-9a-f]{8,})/im);
       if (match && !resolved) {
         resolved = true;
         clearTimeout(timeout);
@@ -271,7 +271,7 @@ export function spawnWorkflowRun(
       if (resolved) return;
       resolved = true;
       clearTimeout(timeout);
-      const match = stdout.match(/^Run:\s+([0-9a-f]{8,})/im);
+      const match = stdout.match(/^Run:\s+(?:run-)?([0-9a-f]{8,})/im);
       if (match) {
         resolve(match[1]);
       } else {

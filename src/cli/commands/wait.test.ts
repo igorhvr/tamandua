@@ -222,7 +222,7 @@ describe("wait command", () => {
     const parsed = JSON.parse(jsonStr);
     assert.equal(parsed.timedOut, false);
     assert.equal(parsed.runs.length, 1);
-    assert.equal(parsed.runs[0].runId, "aaa-bbb-ccc");
+    assert.equal(parsed.runs[0].runId, "run-aaa-bbb-ccc");
     assert.equal(parsed.runs[0].runNumber, 42);
     assert.equal(parsed.runs[0].workflowId, "test-wf");
     assert.equal(parsed.runs[0].status, "completed");
@@ -342,7 +342,7 @@ describe("wait command", () => {
     const parsed = JSON.parse(result.stdout.trim());
     assert.equal(parsed.timedOut, false);
     assert.equal(parsed.runs.length, 1);
-    assert.equal(parsed.runs[0].runId, "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee");
+    assert.equal(parsed.runs[0].runId, "run-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee");
     assert.equal(parsed.runs[0].status, "completed");
     assert.equal(parsed.runs[0].tokensSpent, 500);
   });

@@ -76,6 +76,7 @@ tests/cli-pause-all-resume-all-integration.test.ts
 tests/cli-pause-all-resume-all.test.ts
 tests/cli-pause-command.test.ts
 tests/cli-pause-resume-integration.test.ts
+tests/cli-prefixed-id-acceptance.test.ts
 tests/cli-resume-command.test.ts
 tests/cli-skill-path.test.ts
 tests/cli-status-abandon-reasons.test.ts

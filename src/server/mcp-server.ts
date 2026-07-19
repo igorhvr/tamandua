@@ -12,6 +12,7 @@ import {
   isInitializeRequest,
 } from "@modelcontextprotocol/sdk/types.js";
 import { getWorkflowStatus, listRuns, deleteWorkflow, type RunDetail, type RunInfo } from "../installer/status.js";
+import { stripIdPrefix } from "../lib/id-prefix.js";
 import { runWorkflow, type RunWorkflowResult } from "../installer/run.js";
 import { getRecentEvents, type TamanduaEvent } from "../installer/events.js";
 import { resolveSourcePath, resolveSkillPath, resolveWorkflowDir } from "../installer/paths.js";
@@ -750,7 +751,7 @@ function createProtocolServer(services: TamanduaMcpToolServices): Server {
     }
 
     if (name === MCP_TOOL_RUN_PAUSE) {
-      const runId = readRequiredStringArgument(args, "runId");
+      const runId = stripIdPrefix(readRequiredStringArgument(args, "runId"));
       const drain = args.drain === true;
       try {
         const result = await services.pauseRun(runId, drain);
@@ -761,7 +762,7 @@ function createProtocolServer(services: TamanduaMcpToolServices): Server {
     }
 
     if (name === MCP_TOOL_RUN_RESUME) {
-      const runId = readRequiredStringArgument(args, "runId");
+      const runId = stripIdPrefix(readRequiredStringArgument(args, "runId"));
       try {
         const result = await services.resumeRun(runId);
         return createToolResult({ runId: result.runId, status: result.status });
@@ -771,7 +772,7 @@ function createProtocolServer(services: TamanduaMcpToolServices): Server {
     }
 
     if (name === MCP_TOOL_RUN_DELETE) {
-      const runId = readRequiredStringArgument(args, "runId");
+      const runId = stripIdPrefix(readRequiredStringArgument(args, "runId"));
       const force = args.force === true;
       try {
         const result = await services.deleteRun(runId, force);

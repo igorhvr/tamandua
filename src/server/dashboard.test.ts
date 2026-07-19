@@ -74,7 +74,7 @@ describe("dashboard logs-tail API", () => {
       assert.equal(payload.lines.length, 2);
       assert.ok(payload.nextOffset > 0);
 
-      assert.match(payload.lines[0], /\[runalpha\]/);
+      assert.match(payload.lines[0], /\[run-runalpha\]/);
       assert.match(payload.lines[0], /developer/);
       assert.match(payload.lines[0], /Step pending/);
       assert.match(payload.lines[0], /— Expose logs-tail API/);

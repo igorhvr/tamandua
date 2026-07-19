@@ -290,12 +290,12 @@ describe("workflows smoke (state-machine integration)", { concurrency: 1 }, () =
           "workflow status",
         );
         assert.match(statusOut, /Status:\s+completed/i);
-        assert.match(statusOut, /\[done\s+\]\s+plan/);
-        assert.match(statusOut, /\[done\s+\]\s+setup/);
-        assert.match(statusOut, /\[done\s+\]\s+implement/);
-        assert.match(statusOut, /\[done\s+\]\s+verify/);
-        assert.match(statusOut, /\[done\s+\]\s+test/);
-        assert.match(statusOut, /\[done\s+\]\s+finalize_merge/);
+        assert.match(statusOut, /\[done\s+\]\s+step-plan/);
+        assert.match(statusOut, /\[done\s+\]\s+step-setup/);
+        assert.match(statusOut, /\[done\s+\]\s+step-implement/);
+        assert.match(statusOut, /\[done\s+\]\s+step-verify/);
+        assert.match(statusOut, /\[done\s+\]\s+step-test/);
+        assert.match(statusOut, /\[done\s+\]\s+step-finalize_merge/);
       } finally {
         cleanupTempHome(env);
       }
@@ -441,12 +441,12 @@ describe("workflows smoke (state-machine integration)", { concurrency: 1 }, () =
           "workflow status",
         );
         assert.match(statusOut, /Status:\s+completed/i);
-        assert.match(statusOut, /\[done\s+\]\s+triage/);
-        assert.match(statusOut, /\[done\s+\]\s+investigate/);
-        assert.match(statusOut, /\[done\s+\]\s+setup/);
-        assert.match(statusOut, /\[done\s+\]\s+fix/);
-        assert.match(statusOut, /\[done\s+\]\s+verify/);
-        assert.match(statusOut, /\[done\s+\]\s+finalize_merge/);
+        assert.match(statusOut, /\[done\s+\]\s+step-triage/);
+        assert.match(statusOut, /\[done\s+\]\s+step-investigate/);
+        assert.match(statusOut, /\[done\s+\]\s+step-setup/);
+        assert.match(statusOut, /\[done\s+\]\s+step-fix/);
+        assert.match(statusOut, /\[done\s+\]\s+step-verify/);
+        assert.match(statusOut, /\[done\s+\]\s+step-finalize_merge/);
       } finally {
         cleanupTempHome(env);
       }

@@ -10,6 +10,7 @@ import { logger } from "../lib/logger.js";
 import { getMaxRoleTimeoutSeconds } from "./install.js";
 import { loadWorkflowSpec, loadWorkflowSpecSync } from "./workflow-spec.js";
 import { isFrontendChange } from "../lib/frontend-detect.js";
+import { stripIdPrefix } from "../lib/id-prefix.js";
 import type { LoopConfig, Story, WorkflowStepFailure } from "./types.js";
 import { detectRugpull, relaunchRunAfterRugpull } from "./rugpull.js";
 import { getPgid } from "../lib/proc-info.js";
@@ -1963,6 +1964,8 @@ export type PeekResult = "HAS_WORK" | "NO_WORK";
  * Returns "HAS_WORK" if any pending/waiting steps exist, "NO_WORK" otherwise.
  */
 export function peekStep(agentId: string, runId: string): PeekResult {
+  // Defense-in-depth: strip run- prefix (US-013)
+  runId = stripIdPrefix(runId);
   const db = getDb();
   // Match 'pending' only — 'waiting' steps are still upstream-blocked, so
   // reporting them as work would cause spurious claim attempts.
@@ -2037,6 +2040,8 @@ function wrapTestCmdInContext(
  * ({ stepId, runId, input }) or null when the agent holds no in-flight step.
  */
 export function stepCurrent(agentId: string, runId: string): { stepId: string; runId: string; input: string } | null {
+  // Defense-in-depth: strip run- prefix (US-013)
+  runId = stripIdPrefix(runId);
   const db = getDb();
 
   // Look for a step that is 'running' (claimed by this agent). The agent can
@@ -2104,6 +2109,8 @@ export function stepCurrent(agentId: string, runId: string): { stepId: string; r
  * Find and claim a pending step for an agent, returning the resolved input.
  */
 export function claimStep(agentId: string, runId: string, workerOwnership?: WorkerOwnership): ClaimResult {
+  // Defense-in-depth: strip run- prefix (US-013)
+  runId = stripIdPrefix(runId);
   // Throttle cleanup: run at most once every 5 minutes across all agents
   const now = Date.now();
   if (now - lastCleanupTime >= CLEANUP_THROTTLE_MS) {
@@ -2595,6 +2602,7 @@ export function finalizeDrainingPause(runId: string): void {
  * Complete a step: validate expects, save output, merge context, advance pipeline.
  */
 export function completeStep(stepId: string, output: string): { status: string; detail?: string } {
+  stepId = stripIdPrefix(stepId);
   const result = completeStepInternal(stepId, output);
 
   // Write story plan to progress log after successful completion.
@@ -2635,8 +2643,8 @@ function completeStepInternal(stepId: string, output: string): { status: string;
     // Try to recover agent_id and run_id for the error hint
     const stepInfo = db.prepare("SELECT agent_id, run_id FROM steps WHERE id = ?").get(stepId) as { agent_id: string; run_id: string } | undefined;
     const hint = stepInfo
-      ? `\nIf you lost your step id, run: tamandua step current ${stepInfo.agent_id} --run-id ${stepInfo.run_id}`
-      : `\nIf you lost your step id, run: tamandua step current <agent-id> --run-id <run-id>`;
+      ? `\nIf you lost your step id, run: tamandua step current ${stepInfo.agent_id} --run-id ${stepInfo.run_id}\nIf this is a run id, step complete expects a step id — you may have passed the wrong identifier.`
+      : `\nIf you lost your step id, run: tamandua step current <agent-id> --run-id <run-id>\nIf this is a run id, step complete expects a step id — you may have passed the wrong identifier.`;
     logger.warn(`Rejected step complete: Step not found: ${stepId}`, { stepId });
     throw new Error(`Step not found: ${stepId}${hint}`);
   }
@@ -3407,6 +3415,7 @@ function rerouteWithPolicy(
  * Fail a step, with retry logic. For loop steps, applies per-story retry.
  */
 export async function failStep(stepId: string, error: string): Promise<{ status: string }> {
+  stepId = stripIdPrefix(stepId);
   const result = await failStepInternal(stepId, error);
   // A retry re-pends the step (or its story) — nudge the daemon so the
   // dispatch motor retries immediately instead of on the fallback sweep.
@@ -3417,6 +3426,7 @@ export async function failStep(stepId: string, error: string): Promise<{ status:
 }
 
 async function failStepInternal(stepId: string, error: string): Promise<{ status: string }> {
+  stepId = stripIdPrefix(stepId);
   const db = getDb();
 
   const step = db.prepare(
@@ -3434,8 +3444,8 @@ async function failStepInternal(stepId: string, error: string): Promise<{ status
     // Try to recover agent_id and run_id for the error hint
     const stepInfo = db.prepare("SELECT agent_id, run_id FROM steps WHERE id = ?").get(stepId) as { agent_id: string; run_id: string } | undefined;
     const hint = stepInfo
-      ? `\nIf you lost your step id, run: tamandua step current ${stepInfo.agent_id} --run-id ${stepInfo.run_id}`
-      : `\nIf you lost your step id, run: tamandua step current <agent-id> --run-id <run-id>`;
+      ? `\nIf you lost your step id, run: tamandua step current ${stepInfo.agent_id} --run-id ${stepInfo.run_id}\nIf this is a run id, step fail expects a step id — you may have passed the wrong identifier.`
+      : `\nIf you lost your step id, run: tamandua step current <agent-id> --run-id <run-id>\nIf this is a run id, step fail expects a step id — you may have passed the wrong identifier.`;
     logger.warn(`Rejected step fail: Step not found: ${stepId}`, { stepId });
     throw new Error(`Step not found: ${stepId}${hint}`);
   }
@@ -3874,6 +3884,7 @@ export interface ReleaseStepResult {
  * Emits a step.released event on success.
  */
 export function releaseStep(runId: string, stepId?: string, force?: boolean): ReleaseStepResult {
+  if (stepId) stepId = stripIdPrefix(stepId);
   const db = getDb();
   const wfId = getWorkflowId(runId);
 

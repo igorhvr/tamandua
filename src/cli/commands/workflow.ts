@@ -23,6 +23,7 @@ import { logger } from "../../lib/logger.js";
 import type { HarnessType } from "../../installer/types.js";
 import { printWorkflowAutoresearch } from "./autoresearch.js";
 import { handleWait, getWaitHelp } from "./wait.js";
+import { detectWrongPrefix, stripIdPrefix, prefixRunId, prefixStepId } from "../../lib/id-prefix.js";
 
 export function getWorkflowListHelp(): string {
   return `tamandua workflow list — List available bundled workflows with descriptions
@@ -117,6 +118,9 @@ Usage: tamandua workflow run <name> <task> [options]
 
 Starts a new run of the given workflow with the specified task description.
 The task is passed to the workflow's agents as their objective.
+
+On success, prints the run ID in prefixed format: run-<uuid>. Both prefixed
+and bare UUID forms are accepted when passing the run ID to other commands.
 
 Options:
   --no-hurry-please-save-tokens-mode
@@ -218,8 +222,8 @@ Options:
             abandonedCount). Step outputs are NOT included.
 
 Examples:
-  tamandua workflow status abc12345
-  tamandua workflow status abc12345 --json`;
+  tamandua workflow status run-abc12345
+  tamandua workflow status run-abc12345 --json`;
 }
 
 export function getWorkflowDeleteHelp(): string {
@@ -237,8 +241,8 @@ Options:
   --force    Cancel and delete even if the run is currently running or paused.
 
 Examples:
-  tamandua workflow delete abc12345
-  tamandua workflow delete abc12345 --force`;
+  tamandua workflow delete run-abc12345
+  tamandua workflow delete run-abc12345 --force`;
 }
 
 export function getWorkflowStopHelp(): string {
@@ -253,7 +257,7 @@ Active agents associated with the run will see the cancellation on their
 next polling cycle.
 
 Examples:
-  tamandua workflow stop abc12345`;
+  tamandua workflow stop run-abc12345`;
 }
 
 export function getWorkflowPauseHelp(): string {
@@ -273,8 +277,8 @@ Options:
              than interrupting them immediately.
 
 Examples:
-  tamandua workflow pause abc12345
-  tamandua workflow pause abc12345 --drain`;
+  tamandua workflow pause run-abc12345
+  tamandua workflow pause run-abc12345 --drain`;
 }
 
 export function getWorkflowResumeHelp(): string {
@@ -295,8 +299,8 @@ Behavior by status:
             need to be resumed.
 
 Examples:
-  tamandua workflow resume abc12345       # Resume a paused run
-  tamandua workflow resume abc12345       # Re-start a failed run`;
+  tamandua workflow resume run-abc12345   # Resume a paused run
+  tamandua workflow resume run-abc12345   # Re-start a failed run`;
 }
 
 export function getWorkflowPauseAllHelp(): string {
@@ -355,8 +359,8 @@ Options:
   --force            Force-fail even if a worker is still alive
 
 Examples:
-  tamandua workflow fail abc12345 --reason "Run stuck after repo migration"
-  tamandua workflow fail abc12345 --reason "Run abandoned" --force
+  tamandua workflow fail run-abc12345 --reason "Run stuck after repo migration"
+  tamandua workflow fail run-abc12345 --reason "Run abandoned" --force
   tamandua workflow fail #42 --reason "Manual intervention"`;
 }
 
@@ -391,11 +395,11 @@ Examples:
   tamandua workflow runs
   tamandua workflow install feature-dev-merge
   tamandua workflow run feature-dev-merge "Add a new feature"
-  tamandua workflow status abc12345
-  tamandua workflow autoresearch abc12345
-  tamandua workflow wait abc12345
-  tamandua workflow pause abc12345 --drain
-  tamandua workflow fail abc12345 --reason "Stuck run"`;
+  tamandua workflow status run-abc12345
+  tamandua workflow autoresearch run-abc12345
+  tamandua workflow wait run-abc12345
+  tamandua workflow pause run-abc12345 --drain
+  tamandua workflow fail run-abc12345 --reason "Stuck run"`;
 }
 
 
@@ -413,7 +417,7 @@ autoresearch.config.json and autoresearch.jsonl files, then prints the
 current metric summary and recent experiment timeline.
 
 Examples:
-  tamandua workflow autoresearch abc12345`;
+  tamandua workflow autoresearch run-abc12345`;
 }
 
 /**
@@ -427,7 +431,7 @@ function printNonDoneStepStates(runId: string): void {
     for (const step of nonDone) {
       const role = step.agentId.split("_").slice(-1)[0];
       const prefix = step.stepId.slice(0, 8);
-      console.log(`  [${step.status}] ${prefix} (${role}) retry ${step.retryCount}`);
+      console.log(`  [${step.status}] step-${prefix} (${role}) retry ${step.retryCount}`);
     }
   } catch {
     // If step query fails (e.g. DB error), don't break the resume flow.
@@ -452,7 +456,7 @@ export async function handleWorkflow(
     const runs = listRuns();
     if (jsonFlag) {
       const jsonRuns = runs.map((r) => ({
-        runId: r.id,
+        runId: prefixRunId(r.id),
         runNumber: r.runNumber,
         workflowId: r.workflowId,
         status: r.status,
@@ -466,7 +470,7 @@ export async function handleWorkflow(
     }
     if (runs.length === 0) { console.log("No workflow runs found."); return true; }
     console.log("Workflow runs:");
-    for (const r of runs) console.log(`  [${r.status.padEnd(9)}] ${r.id.slice(0, 8).padEnd(10)} ${r.workflowId.padEnd(14)}${r.workerLostCount > 0 ? ` wl:${r.workerLostCount}`.padEnd(6) : "      "}${r.tokensSpent.toLocaleString().padStart(8)} tokens  ${r.task.slice(0, 50)}${r.task.length > 50 ? "..." : ""}`);
+    for (const r of runs) console.log(`  [${r.status.padEnd(9)}] run-${r.id.slice(0, 8).padEnd(10)} ${r.workflowId.padEnd(14)}${r.workerLostCount > 0 ? ` wl:${r.workerLostCount}`.padEnd(6) : "      "}${r.tokensSpent.toLocaleString().padStart(8)} tokens  ${r.task.slice(0, 50)}${r.task.length > 50 ? "..." : ""}`);
     return true;
   }
 
@@ -501,12 +505,16 @@ export async function handleWorkflow(
 
   if (action === "stop" || action === "cancel") {
     if (!target) { process.stderr.write("Missing run-id.\n"); process.exit(1); }
-    try { const fullId = getWorkflowStatus(target).id; const r = await stopWorkflow(fullId); console.log(`Cancelled run ${r.runId.slice(0, 8)}.`); } catch (err) { process.stderr.write(`${err instanceof Error ? err.message : String(err)}\n`); process.exit(1); }
+    const wrongPrefix = detectWrongPrefix(target, "run");
+    if (wrongPrefix) { process.stderr.write(`${wrongPrefix}\n`); process.exit(1); }
+    try { const fullId = getWorkflowStatus(target).id; const r = await stopWorkflow(fullId); console.log(`Cancelled run run-${r.runId.slice(0, 8)}.`); } catch (err) { process.stderr.write(`${err instanceof Error ? err.message : String(err)}\n`); process.exit(1); }
     return true;
   }
 
   if (action === "pause") {
     if (!target) { process.stderr.write("Missing run-id.\n"); process.exit(1); }
+    const wrongPrefix = detectWrongPrefix(target, "run");
+    if (wrongPrefix) { process.stderr.write(`${wrongPrefix}\n`); process.exit(1); }
     const drain = args.includes("--drain");
     let fullId: string;
     let runStatus: string;
@@ -519,7 +527,7 @@ export async function handleWorkflow(
       process.exit(1);
     }
     if (runStatus !== "running") {
-      process.stderr.write(`Cannot pause run ${fullId.slice(0, 8)}: status is "${runStatus}" (only running runs can be paused).\n`);
+      process.stderr.write(`Cannot pause run run-${fullId.slice(0, 8)}: status is "${runStatus}" (only running runs can be paused).\n`);
       process.exit(1);
     }
     const response = await pauseRunWithDaemon(fullId, drain, cliIdentity);
@@ -532,12 +540,14 @@ export async function handleWorkflow(
       process.stderr.write(`Failed to pause run: ${errMsg}\n`);
       process.exit(1);
     }
-    console.log(`Paused run ${fullId.slice(0, 8)}.`);
+    console.log(`Paused run run-${fullId.slice(0, 8)}.`);
     return true;
   }
 
   if (action === "resume") {
     if (!target) { process.stderr.write("Missing run-id.\n"); process.exit(1); }
+    const wrongPrefix = detectWrongPrefix(target, "run");
+    if (wrongPrefix) { process.stderr.write(`${wrongPrefix}\n`); process.exit(1); }
     let fullId: string;
     let runStatus: string;
     try {
@@ -559,22 +569,22 @@ export async function handleWorkflow(
         process.stderr.write(`Failed to resume run: ${errMsg}\n`);
         process.exit(1);
       }
-      console.log(`Resumed run ${fullId.slice(0, 8)}.`);
+      console.log(`Resumed run run-${fullId.slice(0, 8)}.`);
       printNonDoneStepStates(fullId);
       return true;
     }
     if (runStatus === "failed") {
       const result = await resumeWorkflow(fullId);
       if (result.status === "not_found") { console.log(`No failed run found matching "${target}".`); return true; }
-      console.log(`Resumed run ${result.runId!.slice(0, 8)} (${result.workflowId}), restarting from step: ${result.stepId}`);
+      console.log(`Resumed run run-${result.runId!.slice(0, 8)} (${result.workflowId}), restarting from step: ${result.stepId}`);
       printNonDoneStepStates(result.runId!);
       return true;
     }
     if (runStatus === "completed" || runStatus === "canceled") {
-      process.stderr.write(`Cannot resume run ${fullId.slice(0, 8)}: status is "${runStatus}" (terminal runs cannot be resumed).\n`);
+      process.stderr.write(`Cannot resume run run-${fullId.slice(0, 8)}: status is "${runStatus}" (terminal runs cannot be resumed).\n`);
       process.exit(1);
     }
-    process.stderr.write(`Cannot resume run ${fullId.slice(0, 8)}: status is "${runStatus}" (only paused or failed runs can be resumed).\n`);
+    process.stderr.write(`Cannot resume run run-${fullId.slice(0, 8)}: status is "${runStatus}" (only paused or failed runs can be resumed).\n`);
     process.exit(1);
   }
 
@@ -589,11 +599,11 @@ export async function handleWorkflow(
     for (const r of runs) {
       const response = await pauseRunWithDaemon(r.id, drain, cliIdentity);
       if (response === null) {
-        console.warn(`Warning: daemon unreachable for run ${r.id.slice(0, 8)} — skipped`);
+        console.warn(`Warning: daemon unreachable for run run-${r.id.slice(0, 8)} — skipped`);
         continue;
       }
       if (response.status !== 200) {
-        console.warn(`Warning: failed to pause run ${r.id.slice(0, 8)} — skipped`);
+        console.warn(`Warning: failed to pause run run-${r.id.slice(0, 8)} — skipped`);
         continue;
       }
       paused++;
@@ -612,15 +622,15 @@ export async function handleWorkflow(
     for (const r of runs) {
       const response = await resumeRunWithDaemon(r.id, cliIdentity);
       if (response === null) {
-        console.warn(`Warning: daemon unreachable for run ${r.id.slice(0, 8)} — skipped`);
+        console.warn(`Warning: daemon unreachable for run run-${r.id.slice(0, 8)} — skipped`);
         continue;
       }
       if (response.status !== 200 && response.status !== 202) {
-        console.warn(`Warning: failed to resume run ${r.id.slice(0, 8)} — skipped`);
+        console.warn(`Warning: failed to resume run run-${r.id.slice(0, 8)} — skipped`);
         continue;
       }
       resumed++;
-      console.log(`  Resumed run ${r.id.slice(0, 8)}.`);
+      console.log(`  Resumed run run-${r.id.slice(0, 8)}.`);
       printNonDoneStepStates(r.id);
       console.log();
     }
@@ -721,10 +731,10 @@ export async function handleWorkflow(
       } catch {
         // can't read dashboard port
       }
-      console.log(`Run: ${result.runId.slice(0, 8)}\nWorkflow: ${result.workflowId}\nTask: ${result.taskTitle}\nRun created (pending admission); the reconciler will admit it when the control plane responds.`);
-      console.log(`Check: tamandua workflow status ${result.runId.slice(0, 8)}${dashboardLine}`);
+      console.log(`Run: ${prefixRunId(result.runId)}\nWorkflow: ${result.workflowId}\nTask: ${result.taskTitle}\nRun created (pending admission); the reconciler will admit it when the control plane responds.`);
+      console.log(`Check: tamandua workflow status run-${result.runId.slice(0, 8)}${dashboardLine}`);
     } else {
-      console.log(`Run: ${result.runId.slice(0, 8)}\nWorkflow: ${result.workflowId}\nTask: ${result.taskTitle}\nStatus: ${result.status}\nHarness CWD: ${result.workingDirectoryForHarness}`);
+      console.log(`Run: ${prefixRunId(result.runId)}\nWorkflow: ${result.workflowId}\nTask: ${result.taskTitle}\nStatus: ${result.status}\nHarness CWD: ${result.workingDirectoryForHarness}`);
     }
 
     // If --wait, enter the wait loop for the newly created run
@@ -738,13 +748,15 @@ export async function handleWorkflow(
 
   if (action === "status") {
     if (!target) { process.stderr.write("Missing query.\n"); process.exit(1); }
+    const wrongPrefix = detectWrongPrefix(target, "run");
+    if (wrongPrefix) { process.stderr.write(`${wrongPrefix}\n`); process.exit(1); }
     const jsonFlag = args.includes("--json");
     try {
       const result = getWorkflowStatus(target);
       if (jsonFlag) {
         const jsonSteps = result.steps.map((s) => {
           const entry: Record<string, unknown> = {
-            stepId: s.stepId,
+            stepId: prefixStepId(s.stepId),
             stepIndex: s.stepIndex,
             agentRole: s.agentId.split("_").slice(-1)[0],
             status: s.status,
@@ -768,7 +780,7 @@ export async function handleWorkflow(
           return entry;
         }) : undefined;
         const jsonOutput: Record<string, unknown> = {
-          runId: result.id,
+          runId: prefixRunId(result.id),
           runNumber: result.runNumber,
           workflowId: result.workflowId,
           status: result.status,
@@ -787,7 +799,7 @@ export async function handleWorkflow(
         console.log(JSON.stringify(jsonOutput));
         return true;
       }
-      console.log(`Run: ${result.id.slice(0, 8)}\nWorkflow: ${result.workflowId}\nTask: ${result.task}\nStatus: ${result.status}\nTokens: ${result.tokensSpent.toLocaleString()}`);
+      console.log(`Run: ${prefixRunId(result.id)}\nWorkflow: ${result.workflowId}\nTask: ${result.task}\nStatus: ${result.status}\nTokens: ${result.tokensSpent.toLocaleString()}`);
       if (result.workerLostCount > 0) console.log(`Worker lost: ${result.workerLostCount}`);
       if (result.workspace_mode === "worktree") {
         console.log(`Workspace: ${result.workspace_mode}`);
@@ -805,7 +817,7 @@ export async function handleWorkflow(
       console.log(`Steps:`);
       for (const step of result.steps) {
         const icon = step.status === "done" ? "  [done   ]" : step.status === "running" ? "  [running]" : step.status === "failed" ? "  [failed ]" : step.status === "pending" ? "  [pending]" : `  [${step.status.padEnd(7)}]`;
-        console.log(`${icon} ${step.stepId} (${step.agentId.split("_").slice(-1)[0]})`);
+        console.log(`${icon} ${prefixStepId(step.stepId)} (${step.agentId.split("_").slice(-1)[0]})`);
         if (step.status === "failed" && step.output) {
           console.log(`         ${step.output}`);
         }
@@ -822,6 +834,8 @@ export async function handleWorkflow(
       process.stderr.write("Missing run-id.\nUsage: tamandua workflow autoresearch <run-id>\n");
       process.exit(1);
     }
+    const wrongPrefix = detectWrongPrefix(target, "run");
+    if (wrongPrefix) { process.stderr.write(`${wrongPrefix}\n`); process.exit(1); }
     printWorkflowAutoresearch(target);
     return true;
   }
@@ -836,6 +850,8 @@ export async function handleWorkflow(
 
   if (action === "delete") {
     if (!target) { process.stderr.write("Missing run-id.\nUsage: tamandua workflow delete <run-id> [--force]\n"); process.exit(1); }
+    const wrongPrefix = detectWrongPrefix(target, "run");
+    if (wrongPrefix) { process.stderr.write(`${wrongPrefix}\n`); process.exit(1); }
     const force = args.includes("--force");
     try {
       let fullId: string;
@@ -847,7 +863,7 @@ export async function handleWorkflow(
         process.exit(1);
       }
       const result = await deleteWorkflow(fullId, { force });
-      console.log(`Deleted run ${result.runId.slice(0, 8)}.`);
+      console.log(`Deleted run run-${result.runId.slice(0, 8)}.`);
     } catch (err) {
       process.stderr.write(`${err instanceof Error ? err.message : String(err)}\n`);
       process.exit(1);
@@ -859,6 +875,9 @@ export async function handleWorkflow(
 
   if (action === "fail") {
     if (!target) { process.stderr.write("Missing run-id.\nUsage: tamandua workflow fail <run-id> --reason <text> [--force]\n"); process.exit(1); }
+
+    const wrongPrefix = detectWrongPrefix(target, "run");
+    if (wrongPrefix) { process.stderr.write(`${wrongPrefix}\n`); process.exit(1); }
 
     // Parse --reason and --force from args (skip group and action indices)
     const failArgs = args.slice(2);
@@ -885,7 +904,7 @@ export async function handleWorkflow(
     }
 
     if (runStatus !== "running" && runStatus !== "paused") {
-      process.stderr.write(`Cannot force-fail run ${fullId.slice(0, 8)}: status is "${runStatus}" (only running or paused runs can be force-failed).\n`);
+      process.stderr.write(`Cannot force-fail run run-${fullId.slice(0, 8)}: status is "${runStatus}" (only running or paused runs can be force-failed).\n`);
       process.exit(1);
     }
 
@@ -896,13 +915,13 @@ export async function handleWorkflow(
         process.stderr.write(`${result.reason}\n`);
         if (result.aliveWorkers) {
           for (const w of result.aliveWorkers) {
-            process.stderr.write(`  Step ${w.stepId.slice(0, 8)} (${w.agentId}) PID ${w.pid}\n`);
+            process.stderr.write(`  Step step-${w.stepId.slice(0, 8)} (${w.agentId}) PID ${w.pid}\n`);
           }
         }
         logger.warn(`forceFailRun refused: ${result.reason}`, { runId: fullId, aliveWorkers: result.aliveWorkers });
         process.exit(1);
       }
-      console.log(`Force-failed run ${fullId.slice(0, 8)}: ${failReason}`);
+      console.log(`Force-failed run run-${fullId.slice(0, 8)}: ${failReason}`);
     } catch (err) {
       process.stderr.write(`${err instanceof Error ? err.message : String(err)}\n`);
       process.exit(1);

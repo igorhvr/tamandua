@@ -741,11 +741,12 @@ follow the claim lifecycle:
    the race or the loop completed. If it does, stop without doing step work.
    Claim is idempotent: if you already hold a step in this run, re-claiming
    returns your held step instead of `NO_WORK`.
-4. Otherwise parse claim JSON: `{"stepId":"...","runId":"...","input":"..."}`.
+4. Otherwise parse claim JSON: `{"stepId":"step-...","runId":"run-...","input":"..."}`.
+   stepId is the step identifier (prefix `step-`); runId is the run identifier (prefix `run-`).
 5. **SAVE `stepId` immediately** and execute the `input` task.
 6. Report with the saved step id:
-   - Success: `tamandua step complete <stepId>` (send status output through stdin)
-   - Failure: `tamandua step fail <stepId> "<reason>"` or `tamandua step fail <stepId> --reason-file <path>` (preferred for multi-line reasons)
+   - Success: `tamandua step complete step-<uuid>` (send status output through stdin)
+   - Failure: `tamandua step fail step-<uuid> "<reason>"` or `tamandua step fail step-<uuid> --reason-file <path>` (preferred for multi-line reasons)
 
 If you lose your step id mid-session, do not abandon finished work:
 - Run `tamandua step current <agent-id> --run-id <run-id>` to recover your
@@ -759,6 +760,8 @@ If you lose your step id mid-session, do not abandon finished work:
 Use the run ID supplied by your scheduler prompt or workflow context. `step peek` and `step claim` require `--run-id` so agents serving concurrent runs cannot claim each other's work.
 
 Never call `step complete` or `step fail` with an agent ID. They require the claimed step UUID.
+
+**ID forms on input:** Both prefixed (`step-<uuid>`, `run-<uuid>`) and bare (`<uuid>`) forms are accepted on all CLI arguments (step complete, step fail, --run-id, workflow status, etc.). Output always uses prefixed ids so they are self-describing.
 
 For operator recovery when a step is stuck (e.g., worker died),
 `tamandua step release <run-id> [step-id] [--force]` resets a claimed/running
@@ -794,7 +797,7 @@ path:
 
 ```bash
 report_file="$(mktemp "${TMPDIR:-/tmp}/tamandua-report.XXXXXX")"
-tamandua step complete <stepId> --file "$report_file"
+tamandua step complete step-<uuid> --file "$report_file"
 ```
 
 The `--file` path is dereferenced exactly once at CLI time — the file contents
@@ -806,7 +809,7 @@ completion is accepted.
 **Alternative — stdin pipe:**
 
 ```bash
-printf 'STATUS: done\nCHANGES: ...\nTESTS: ...\n' | tamandua step complete <stepId>
+printf 'STATUS: done\nCHANGES: ...\nTESTS: ...\n' | tamandua step complete step-<uuid>
 ```
 
 **CRITICAL — STATUS markers are parsed by the scheduler.** Output is
@@ -829,14 +832,14 @@ at column 0 (no markdown, no backticks, no leading bullets).
 Verdict channels are distinct:
 
 - A verifier that rejects work submits `STATUS: retry` plus a `REASON:` or other
-  summary KEY: line into `tamandua step complete <stepId>`. This reroutes the
+  summary KEY: line into `tamandua step complete step-<uuid>`. This reroutes the
   producer for another attempt.
-- `tamandua step fail <stepId> "<reason>"` means "I could not do the work."
+- `tamandua step fail step-<uuid> "<reason>"` means "I could not do the work."
   Use it with an actionable reason when execution cannot be completed. Do not
   use `step fail` to deliver a retry verdict.
   Prefer `--reason-file <path>` for multi-line reasons — create it externally
   with `reason_file="$(mktemp "${TMPDIR:-/tmp}/tamandua-reason.XXXXXX")"`, then
-  call `tamandua step fail <stepId> --reason-file "$reason_file"`. The file is
+  call `tamandua step fail step-<uuid> --reason-file "$reason_file"`. The file is
   dereferenced once at CLI time; the path is never stored downstream. Remove
   it with `rm -f -- "$reason_file"` only after `step fail` succeeds.
 
@@ -1144,23 +1147,23 @@ files reflect the change.
 
 ```bash
 # Phase 1: Peek
-tamandua step peek feature-dev_developer --run-id 7aeb4da9-1111-4222-8333-abcdefabcdef
+tamandua step peek feature-dev_developer --run-id run-7aeb4da9-1111-4222-8333-abcdefabcdef
 # -> NO_WORK (stop) OR HAS_WORK (continue)
 
 # Phase 2: Claim
-tamandua step claim feature-dev_developer --run-id 7aeb4da9-1111-4222-8333-abcdefabcdef
-# -> {"stepId":"87409f73-...","runId":"7aeb4da9-...","input":"Implement ..."}
-# Save stepId=87409f73-...
+tamandua step claim feature-dev_developer --run-id run-7aeb4da9-1111-4222-8333-abcdefabcdef
+# -> {"stepId":"step-87409f73-...","runId":"run-7aeb4da9-...","input":"Implement ..."}
+# Save stepId=step-87409f73-...
 
 # Execute the input task...
 
 # Success report (uses saved stepId)
 echo 'STATUS: done
 CHANGES: Added skill docs and tests
-TESTS: node --test tests/*.test.ts' | tamandua step complete 87409f73-4ba6-492a-be44-30b2b6ffbadb
+TESTS: node --test tests/*.test.ts' | tamandua step complete step-87409f73-4ba6-492a-be44-30b2b6ffbadb
 
 # Failure alternative
-# tamandua step fail 87409f73-4ba6-492a-be44-30b2b6ffbadb "Missing repository path"
+# tamandua step fail step-87409f73-4ba6-492a-be44-30b2b6ffbadb "Missing repository path"
 ```
 
 ### Manual step inspection

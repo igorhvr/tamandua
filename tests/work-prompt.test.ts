@@ -35,7 +35,7 @@ describe("buildWorkPrompt (deterministic-dispatch work prompt)", () => {
   it("includes the header line the scripted runtime parses", () => {
     const prompt = buildWorkPrompt("feature-dev", "feature-dev_developer", RUN_ID);
     assert.ok(
-      /workflow "feature-dev", agent "feature-dev_developer", run "7aeb4da9/.test(prompt),
+      /workflow "feature-dev", agent "feature-dev_developer", run "run-7aeb4da9/.test(prompt),
       "header must stay matchable by the scripted-agent runtime",
     );
   });
@@ -76,6 +76,83 @@ describe("buildWorkPrompt (deterministic-dispatch work prompt)", () => {
     assert.ok(prompt.includes("SAVE"), "should instruct to save stepId");
   });
 
+  it("US-008: claim JSON example shows prefixed step-<UUID> and run-<UUID>", () => {
+    const prompt = buildWorkPrompt("feature-dev", "developer", RUN_ID);
+    assert.ok(
+      prompt.includes('"stepId":"step-<UUID>"'),
+      "claim JSON must show step-<UUID> as the stepId value",
+    );
+    assert.ok(
+      prompt.includes('"runId":"run-<UUID>"'),
+      "claim JSON must show run-<UUID> as the runId value",
+    );
+  });
+
+  it("US-008: step complete examples show step-<uuid> placeholder", () => {
+    const prompt = buildWorkPrompt("feature-dev", "developer", RUN_ID);
+    assert.ok(
+      prompt.includes('step complete "step-<uuid>"'),
+      "step complete examples must use step-<uuid> placeholder",
+    );
+    // Should NOT have bare <stepId> anymore.
+    assert.ok(
+      !prompt.includes('"<stepId>"'),
+      "step complete/fail examples should no longer show bare <stepId>",
+    );
+  });
+
+  it("US-008: step fail examples show step-<uuid> placeholder", () => {
+    const prompt = buildWorkPrompt("feature-dev", "developer", RUN_ID);
+    assert.ok(
+      prompt.includes('step fail "step-<uuid>"'),
+      "step fail examples must use step-<uuid> placeholder",
+    );
+  });
+
+  it("US-008: intro line shows prefixed run id", () => {
+    const prompt = buildWorkPrompt("feature-dev", "developer", RUN_ID);
+    assert.ok(
+      prompt.includes(`run "run-${RUN_ID}"`),
+      "intro line must show prefixed run id",
+    );
+    assert.ok(
+      !prompt.includes(`run "${RUN_ID}"`),
+      "intro line should NOT show bare run id",
+    );
+  });
+
+  it("US-008: traceability header shows prefixed run id", () => {
+    const prompt = buildWorkPrompt("feature-dev", "developer", RUN_ID, "", "job-xyz", 1);
+    assert.ok(
+      prompt.includes(`run=run-${RUN_ID}`),
+      "traceability header must show prefixed run id",
+    );
+    assert.ok(
+      !prompt.includes(`run=${RUN_ID}`),
+      "traceability header should NOT show bare run id",
+    );
+    // The closing bracket comes after the timestamp, not after the run id.
+    assert.ok(
+      prompt.startsWith(`[tamandua traceability - metadata only, no action needed] run=run-${RUN_ID}`),
+      "traceability header starts with prefixed run id",
+    );
+  });
+
+  it("US-008: --run-id in claim command stays bare (backward compat)", () => {
+    const prompt = buildWorkPrompt("feature-dev", "developer", RUN_ID);
+    assert.ok(
+      prompt.includes(`--run-id "${RUN_ID}"`),
+      "--run-id in claim command must stay bare for step claim backward compat",
+    );
+  });
+
+  it("US-008: stepId key still mentioned for SAVE instruction", () => {
+    const prompt = buildWorkPrompt("feature-dev", "developer", RUN_ID);
+    // The instruction still says "SAVE the stepId" — the key name didn't change.
+    assert.ok(prompt.includes("stepId"), "prompt must still mention stepId JSON key");
+    assert.ok(prompt.includes("SAVE"), "must still instruct to save stepId");
+  });
+
   // ── Traceability header ───────────────────────────────────────────
 
   it("prepends a traceability header when jobId and runNumber are provided", () => {
@@ -91,7 +168,7 @@ describe("buildWorkPrompt (deterministic-dispatch work prompt)", () => {
     const runNumber = 5;
     const prompt = buildWorkPrompt("feature-dev", "developer", RUN_ID, "", jobId, runNumber);
     const firstLine = prompt.split("\n")[0];
-    assert.ok(firstLine.includes(`run=${RUN_ID}`), "header must include run uuid");
+    assert.ok(firstLine.includes(`run=run-${RUN_ID}`), "header must include run uuid");
     assert.ok(firstLine.includes(`run_number=${runNumber}`), "header must include run_number");
     assert.ok(firstLine.includes("agent=developer"), "header must include agent id");
     assert.ok(firstLine.includes(`job=${jobId}`), "header must include job id");
