@@ -12,7 +12,7 @@ import {
   reservePortHandles,
   type PortHandle,
 } from "../../tests/helpers/test-env.ts";
-import { spawnSync, spawn } from "node:child_process";
+import { execSync, spawnSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -309,6 +309,21 @@ export function prepareGitRepo(fixtureDir: string, targetDir: string) {
   git(["add", "-A"]);
   git(["commit", "-m", "initial commit with sample project"]);
   return targetDir;
+}
+
+/**
+ * Detach the origin checkout from its current branch so the fail-closed
+ * merge policy (merge-branch refuses to write when the destination ref is
+ * the checked-out HEAD) does not refuse the landing. Captures the pre-detach
+ * tip and tree SHA for later assertions that the detached origin remained
+ * unchanged.
+ */
+export function detachOriginCheckout(repoDir: string): { branch: string; tip: string; tree: string } {
+  const branch = execSync("git symbolic-ref --short HEAD", { cwd: repoDir, encoding: "utf-8" }).trim();
+  const tip = execSync(`git rev-parse "refs/heads/${branch}"`, { cwd: repoDir, encoding: "utf-8" }).trim();
+  const tree = execSync(`git rev-parse "refs/heads/${branch}^{tree}"`, { cwd: repoDir, encoding: "utf-8" }).trim();
+  execSync(`git checkout --detach "${tip}"`, { cwd: repoDir, encoding: "utf-8" });
+  return { branch, tip, tree };
 }
 
 /** Resolve full run ID from the 8-char prefix using the temp home DB */

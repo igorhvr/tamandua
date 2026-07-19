@@ -22,7 +22,7 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { execSync } from "node:child_process";
+import { execSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import type { ChildProcess } from "node:child_process";
@@ -33,6 +33,7 @@ import {
   cliMustSucceed,
   spawnWorkflowRun,
   prepareGitRepo,
+  detachOriginCheckout,
   resolveFullRunId,
   cleanupTempHome,
   releasePortReservations,
@@ -284,7 +285,7 @@ describe("scripted-hermes full pipeline (real daemon/scheduler, zero tokens)", {
       try {
         ctx = await startHermesScriptedEnvironment("bug-fix-merge-worktree", bugFixBehaviors);
         const repoDir = prepareGitRepo(fixtureDir, path.join(ctx.env.root, "origin-repo"));
-        const originalBranch = execSync("git symbolic-ref --short HEAD", { cwd: repoDir, encoding: "utf-8" }).trim();
+        const { branch: originalBranch, tip: originTip, tree: originTree } = detachOriginCheckout(repoDir);
 
         // Pass --hermes-as-harness AND the hermes env (so validateRunHarnessForScheduling
         // can find the fake hermes binary).
@@ -298,6 +299,8 @@ describe("scripted-hermes full pipeline (real daemon/scheduler, zero tokens)", {
             "--hermes-as-harness",
             "--worktree-origin-repository",
             repoDir,
+            "--worktree-origin-ref",
+            originalBranch,
           ],
           runEnv,
         );
@@ -320,20 +323,38 @@ describe("scripted-hermes full pipeline (real daemon/scheduler, zero tokens)", {
           assert.equal(step.status, "done", `step ${step.step_id} should be done, got ${step.status}`);
         }
 
-        // ── Repository outcome: the target ref and checked-out origin landed the fix ──
+        // ── Repository outcome: the target ref landed the fix; the detached origin remains unchanged ──
         const targetMath = execSync(`git show "refs/heads/${originalBranch}:src/math.ts"`, {
           cwd: repoDir,
           encoding: "utf-8",
         });
         assert.ok(targetMath.includes("a + b"), `target ref math.ts should be fixed:\n${targetMath}`);
         assert.ok(!targetMath.includes("a - b"), `target ref math.ts should not keep the bug:\n${targetMath}`);
-        assert.equal(fs.readFileSync(path.join(repoDir, "src", "math.ts"), "utf-8"), targetMath);
+        // Origin HEAD is detached; working tree and index are unchanged
+        assert.notEqual(
+          spawnSync("git", ["symbolic-ref", "HEAD"], { cwd: repoDir, encoding: "utf-8" }).status,
+          0,
+          "HEAD should be detached (symbolic-ref should fail)",
+        );
+        assert.equal(
+          execSync("git rev-parse HEAD", { cwd: repoDir, encoding: "utf-8" }).trim(),
+          originTip,
+          "origin detached HEAD should remain at the pre-run tip",
+        );
+        assert.equal(
+          execSync("git write-tree", { cwd: repoDir, encoding: "utf-8" }).trim(),
+          originTree,
+          "origin index should match the pre-run tip tree (unchanged)",
+        );
+        assert.equal(
+          execSync("git status --porcelain", { cwd: repoDir, encoding: "utf-8" }),
+          "",
+          "origin checkout should be clean (unchanged)",
+        );
         const mergedTree = execSync(`git rev-parse "refs/heads/${originalBranch}^{tree}"`, {
           cwd: repoDir,
           encoding: "utf-8",
         }).trim();
-        assert.equal(execSync("git write-tree", { cwd: repoDir, encoding: "utf-8" }).trim(), mergedTree);
-        assert.equal(execSync("git status --porcelain", { cwd: repoDir, encoding: "utf-8" }), "");
         const mergeStep = dbRow<{ output: string }>(
           ctx.env.tamanduaDir,
           "SELECT output FROM steps WHERE run_id = ? AND step_id = 'finalize_merge'",
@@ -349,10 +370,10 @@ describe("scripted-hermes full pipeline (real daemon/scheduler, zero tokens)", {
           .filter((event) => event.event.startsWith("merge."));
         assert.deepEqual(mergeEvents.map((event) => event.event), ["merge.landed"]);
 
-        const gitLog = execSync("git log --oneline -5", { cwd: repoDir, encoding: "utf-8" });
+        const targetLog = execSync(`git log --oneline -5 "refs/heads/${originalBranch}"`, { cwd: repoDir, encoding: "utf-8" });
         assert.ok(
-          gitLog.trim().split("\n").length >= 2,
-          `expected initial + squash-merge commits, got:\n${gitLog}`,
+          targetLog.trim().split("\n").length >= 2,
+          `expected initial + squash-merge commits on target ref, got:\n${targetLog}`,
         );
         // ── Regression: no progress-* files leaked into the repo working tree ─
         const progressFiles = fs.readdirSync(repoDir).filter((f) => f.startsWith("progress-"));

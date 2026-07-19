@@ -34,6 +34,7 @@ import {
   cliMustSucceed,
   spawnWorkflowRun,
   prepareGitRepo,
+  detachOriginCheckout,
   resolveFullRunId,
   cleanupTempHome,
   preserveE2eTestHome,
@@ -451,7 +452,7 @@ describe("concurrent-runs stress test", { concurrency: 1 }, () => {
         // ── Prepare shared origin repo ─────────────────────────────
         const tempRoot = tamanduaTempDir("tamandua-e2e-concurrent-");
         const repoDir = prepareGitRepo(fixtureDir, path.join(tempRoot, "origin-repo"));
-        const originalBranch = execSync("git symbolic-ref --short HEAD", { cwd: repoDir, encoding: "utf-8" }).trim();
+        const { branch: originalBranch, tip: originTip, tree: originTree } = detachOriginCheckout(repoDir);
         const initialTip = execSync(`git rev-parse "refs/heads/${originalBranch}"`, { cwd: repoDir, encoding: "utf-8" }).trim();
         const originIndexBefore = execSync("git write-tree", { cwd: repoDir, encoding: "utf-8" }).trim();
         const sampledOriginIndexTrees = new Set([originIndexBefore]);
@@ -477,6 +478,8 @@ describe("concurrent-runs stress test", { concurrency: 1 }, () => {
                 desc,
                 "--worktree-origin-repository",
                 repoDir,
+                "--worktree-origin-ref",
+                originalBranch,
               ],
               baseEnv(runEnv.env.homeDir, runEnv.env.controlPort),
             );
@@ -687,10 +690,10 @@ describe("concurrent-runs stress test", { concurrency: 1 }, () => {
           assert.ok(mergedTree, `feature-${i + 1}: missing MERGED_TREE`);
           assert.match(mergeOutput, new RegExp(`^TARGET: refs/heads/${originalBranch}$`, "m"));
           const outputRefresh = mergeOutput.match(/^CHECKOUT_REFRESH: (.+)$/m)?.[1];
-          assert.match(
-            outputRefresh ?? "",
-            /^(?:refreshed|already-coherent|not-applicable)$/,
-            `feature-${i + 1}: missing or invalid CHECKOUT_REFRESH`,
+          assert.equal(
+            outputRefresh,
+            "not-applicable",
+            `feature-${i + 1}: CHECKOUT_REFRESH should be not-applicable, got ${outputRefresh}`,
           );
           const mergeEvents = fs
             .readFileSync(path.join(runEnv.env.tamanduaDir, "events", `${rid}.jsonl`), "utf-8")
@@ -711,7 +714,7 @@ describe("concurrent-runs stress test", { concurrency: 1 }, () => {
           assert.equal(mergeEvents.filter((event) => event.event === "merge.conflicts").length, 0);
           assert.equal(landedEvents[0].mergedCommit, mergedCommit);
           assert.equal(landedEvents[0].mergedTree, mergedTree);
-          assert.equal(landedEvents[0].checkoutRefresh, outputRefresh);
+          assert.equal(landedEvents[0].checkoutRefresh, "not-applicable");
           assert.ok(targetLandingCommits.has(mergedCommit));
           eventLandingCommits.add(mergedCommit);
           for (const event of movedEvents) {
@@ -737,15 +740,26 @@ describe("concurrent-runs stress test", { concurrency: 1 }, () => {
         }
         assert.deepEqual([...eventLandingCommits].sort(), [...targetLandingCommits].sort());
 
-        // Once all mergers are quiescent, the checked-out origin must be
-        // synchronized. Every successful checkout outcome is coherent or
-        // explicitly applies only when no checkout owns the target.
+        // Once all mergers are quiescent, the origin checkout remains detached
+        // at the pre-run tip. Successful merge-branch calls update only the target
+        // ref; the detached origin HEAD, index, and working tree stay unchanged.
+        assert.notEqual(
+          spawnSync("git", ["symbolic-ref", "HEAD"], { cwd: repoDir, encoding: "utf-8" }).status,
+          0,
+          "origin HEAD should remain detached after all runs",
+        );
         assert.equal(
-          execSync("git symbolic-ref --short HEAD", { cwd: repoDir, encoding: "utf-8" }).trim(),
-          originalBranch,
+          execSync("git rev-parse HEAD", { cwd: repoDir, encoding: "utf-8" }).trim(),
+          originTip,
+          "origin detached HEAD should remain at the pre-run tip",
+        );
+        assert.equal(
+          execSync("git write-tree", { cwd: repoDir, encoding: "utf-8" }).trim(),
+          originTree,
+          "origin index should be unchanged after all runs",
         );
         const finalStatus = execSync("git status --porcelain", { cwd: repoDir, encoding: "utf-8" });
-        assert.equal(finalStatus, "", `origin checkout is stale:\n${finalStatus}`);
+        assert.equal(finalStatus, "", `origin checkout should be clean after all runs:\n${finalStatus}`);
 
         // ── Diagnostics report ────────────────────────────────────
         const report = collectDiagnostics(runEnvs, runIds, wallMs);
