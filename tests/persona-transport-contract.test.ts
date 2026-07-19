@@ -1,20 +1,31 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, readdirSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-function discoverPersonaFiles(): string[] {
-  const shared = readdirSync("agents/shared", { withFileTypes: true })
+export function discoverPersonaFiles(
+  sharedRoot = "agents/shared",
+  workflowsRoot = "workflows",
+): string[] {
+  const shared = readdirSync(sharedRoot, { withFileTypes: true })
     .filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
-    .map((entry) => join("agents/shared", entry.name, "AGENTS.md"));
-  const bundled = readdirSync("workflows", { withFileTypes: true }).flatMap((workflow) => {
-    const agentsDir = join("workflows", workflow.name, "agents");
+    .map((entry) => join(sharedRoot, entry.name, "AGENTS.md"));
+  const workflows = readdirSync(workflowsRoot, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .sort((left, right) => left.name.localeCompare(right.name));
+  const bundled = workflows.flatMap((workflow) => {
+    const agentsDir = join(workflowsRoot, workflow.name, "agents");
     try {
       return readdirSync(agentsDir, { withFileTypes: true })
         .filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
         .map((entry) => join(agentsDir, entry.name, "AGENTS.md"));
-    } catch {
-      return [];
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `Unable to inventory workflow "${workflow.name}" personas at ${agentsDir}: ${detail}`,
+        { cause: error },
+      );
     }
   });
   return [...shared, ...bundled].sort();
@@ -22,6 +33,31 @@ function discoverPersonaFiles(): string[] {
 
 describe("agent persona transport-file guidance", () => {
   const personaFiles = discoverPersonaFiles();
+
+  it("fails when a bundled workflow agents directory cannot be inventoried", () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "tamandua-persona-inventory-"));
+    const sharedRoot = join(fixtureRoot, "agents", "shared");
+    const workflowsRoot = join(fixtureRoot, "workflows");
+    const completeAgentsRoot = join(workflowsRoot, "complete-workflow", "agents");
+
+    try {
+      mkdirSync(sharedRoot, { recursive: true });
+      mkdirSync(completeAgentsRoot, { recursive: true });
+      for (let index = 0; index < 80; index += 1) {
+        mkdirSync(join(completeAgentsRoot, `persona-${index}`));
+      }
+      assert.equal(discoverPersonaFiles(sharedRoot, workflowsRoot).length, 80);
+
+      mkdirSync(join(workflowsRoot, "missing-agents-workflow"));
+
+      assert.throws(
+        () => discoverPersonaFiles(sharedRoot, workflowsRoot),
+        /missing-agents-workflow.*agents/,
+      );
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  });
 
   it("inventories every canonical and bundled persona, including variants", () => {
     assert.ok(personaFiles.length >= 79, `expected all persona variants, found ${personaFiles.length}`);
