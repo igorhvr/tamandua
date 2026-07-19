@@ -63,24 +63,31 @@ Machine-readable results:
   MERGED_COMMIT: <sha>
   MERGED_TREE: <tree-sha>
   TARGET: refs/heads/<target-ref>
-  CHECKOUT_REFRESH: <refreshed | already-coherent | not-applicable>
+  CHECKOUT_REFRESH: not-applicable
 
 Landing outcomes:
   true               Feature content was already landed; target tip/tree are unchanged
   false              A new squash commit was created and landed
 
 Checkout refresh outcomes:
-  refreshed          The exact checked-out target index and worktree were synchronized
-  already-coherent   A checked-out no-op target was proven clean and already synchronized
   not-applicable     Origin is bare or the target branch is not checked out anywhere
 
-Checkout safety:
-  Target ownership is discovered across the origin and linked worktrees. A checked-out
-  target is preflighted at --expect-tip and must be clean and unambiguous.
-  Dirty or ambiguous checkout state fails closed with exit code 1 before the ref moves.
-  If synchronization unexpectedly fails after the compare-and-swap (post-CAS) update,
-  Tamandua attempts a guarded ref rollback and checkout restoration, then exits 1 with
-  refresh and rollback diagnostics. It never reports STATUS: landed for that failure.
+Checked-out target safety — fail-closed owner policy:
+  Target-tip validation happens first. Tamandua then discovers ownership with exact
+  strict git worktree list --porcelain -z metadata. Any unique root or linked checkout
+  owning the target causes bounded operational refusal with exit code 1. This applies
+  even to clean targets and would-be no-op targets.
+  Refusal happens BEFORE candidate resolution, merge-base, merge/object creation,
+  target-ref mutation, index/filesystem mutation, or event emission.
+  This is not a partial landing and is not a retryable lock wait.
+  Every currently reachable successful result reports CHECKOUT_REFRESH: not-applicable.
+  Success is possible only for bare origins or otherwise unowned targets.
+  Historical refreshed and already-coherent values remain valid in the exported
+  CheckoutRefreshOutcome type and old persisted events, but are not emitted by
+  current production.
+  Operator remedy: make the target ref unowned by every worktree (or use a bare
+  origin), re-verify the expected tip, and retry. Do not use bypass flags, direct
+  ref writes, checkout/reset tricks, or manual editing of worktree metadata.
 
   STATUS: target_moved
 
@@ -89,7 +96,7 @@ Checkout safety:
 
 Exit codes:
   0  Newly landed or already landed (no-op)
-  1  Invalid invocation or operational Git error (including checkout preflight/rollback)
+  1  Invalid invocation or operational Git error (including checked-out target refusal)
   2  Target moved before atomic landing
   3  Merge conflicts`;
 }

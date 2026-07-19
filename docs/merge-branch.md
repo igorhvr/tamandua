@@ -15,47 +15,35 @@ tamandua merge-branch \
 
 Every option is required exactly once. Unknown, duplicate, positional, unsupported, or valueless inputs are rejected with exit code 1 before Git mutation.
 
-## Checked-out target safety
+## Checked-out target safety — fail-closed owner policy
 
-Before creating or landing a commit, Tamandua uses `git worktree list --porcelain -z` to discover whether the exact `refs/heads/<target-branch>` is owned by the origin checkout or a linked worktree.
+1. Target-tip validation happens first: Tamandua verifies `refs/heads/<target-branch>` resolves to `--expect-tip` before any further action.
+2. Tamandua then discovers ownership with exact strict `git worktree list --porcelain -z` metadata.
+3. Any unique root or linked checkout owning the target causes bounded operational refusal with exit code 1. This applies even to clean targets and would-be no-op targets.
+4. Refusal happens **before** candidate resolution, merge-base computation, merge/object creation, target-ref mutation, index/filesystem mutation, or event emission.
+5. This is not a partial landing and is not a retryable lock wait.
 
-- If no checkout owns the target, atomic landing may proceed without checkout synchronization.
-- If exactly one checkout owns it, that checkout must be accessible, attached to the exact target ref at `--expect-tip`, and clean of tracked, staged, and untracked changes.
-- Dirty or ambiguous ownership, multiple owners, unreadable metadata, a wrong ref, or a wrong tip fails closed before the target ref moves. No checkout branch or user byte is changed.
-
-After the target compare-and-swap succeeds, Tamandua refreshes the preflighted owning worktree's index and filesystem with Git plumbing. It does not use `checkout`, `switch`, `--ignore-other-worktrees`, or a hard reset.
-
-A successful result reports exactly one checkout outcome:
-
-```text
-CHECKOUT_REFRESH: refreshed
-```
-
-The sole owning checkout is synchronized to `MERGED_TREE` and clean, or:
-
-```text
-CHECKOUT_REFRESH: already-coherent
-```
-
-The operation was a no-op and the sole owning root or linked checkout was proven to already have the exact target ref, HEAD, index tree, clean filesystem, and no ordinary untracked paths. Tamandua does not mutate the checkout to produce this outcome. Or:
+Every currently reachable successful result reports:
 
 ```text
 CHECKOUT_REFRESH: not-applicable
 ```
 
-The origin is bare or the target is not checked out anywhere. A target known to be checked out is never reported as `not-applicable`.
+Success is possible only for bare origins or otherwise unowned targets.
 
-## Post-CAS failure and rollback
+Historical `refreshed` and `already-coherent` values remain valid in the exported `CheckoutRefreshOutcome` type and old persisted events for source and data compatibility, but current production does not emit them.
 
-If checkout refresh unexpectedly fails after the target ref moves, the operation is not successful and does not emit `merge.landed`. Tamandua attempts a compare-and-swap rollback from the new merge commit to the expected old tip. It restores and verifies the target checkout's old tree only if that guarded rollback wins.
+## Operator remedy
 
-A concurrent ref winner is never overwritten. The command exits with operational exit code 1 and reports separate diagnostics for the post-CAS refresh, compare-and-swap rollback, and checkout restoration outcomes.
+If the target is owned by any checkout, the operator must make the target ref unowned by every worktree (remove the owning worktree or checkout a different branch in that worktree) or use a bare origin. Then re-verify the expected tip and retry.
+
+Do not use bypass flags, direct ref writes, checkout/reset tricks, or manual editing of worktree metadata — those can corrupt the worktree index and are not supported by Tamandua.
 
 ## Exit codes
 
 | Code | Meaning |
 |------|---------|
 | `0` | Newly landed or already landed (no-op) |
-| `1` | Invalid invocation or operational failure, including unsafe preflight or post-CAS refresh/rollback failure |
+| `1` | Invalid invocation, operational failure, or checked-out target refusal |
 | `2` | Target moved before atomic landing |
 | `3` | Merge conflicts |

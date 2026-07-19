@@ -51,10 +51,14 @@ describe("SPL2 merge-branch command module", () => {
     const help = getMergeBranchHelp();
     assert.match(help, /^tamandua merge-branch — Atomically land a squash merge with Git plumbing/);
     assert.match(help, /STATUS: landed[\s\S]*STATUS: target_moved[\s\S]*STATUS: conflicts/);
-    assert.match(help, /linked worktrees/i);
-    assert.match(help, /dirty or ambiguous[\s\S]*exit code 1/i);
-    assert.match(help, /post-CAS[\s\S]*rollback/i);
-    assert.match(help, /CHECKOUT_REFRESH: <refreshed \| already-coherent \| not-applicable>/);
+    assert.match(help, /worktree list --porcelain/);
+    assert.match(help, /checked-out[\s\S]*refusal[\s\S]*exit code 1/i);
+    assert.match(help, /not a partial landing/i);
+    assert.match(help, /not a retryable lock wait/i);
+    assert.match(help, /CHECKOUT_REFRESH: not-applicable/);
+    assert.doesNotMatch(help, /CHECKOUT_REFRESH: <refreshed/);
+    assert.doesNotMatch(help, /post-CAS/);
+    assert.doesNotMatch(help, /rollback/);
     assert.doesNotMatch(help, /skipped:/);
     assert.equal(handleMergeBranch("workflow", ["workflow", "list"]), false);
   });
@@ -62,11 +66,17 @@ describe("SPL2 merge-branch command module", () => {
   it("publishes the fail-closed checkout contract in operator documentation", () => {
     const documentation = readFileSync(join(process.cwd(), "docs/merge-branch.md"), "utf8");
     assert.match(documentation, /git worktree list --porcelain/);
-    assert.match(documentation, /dirty or ambiguous[\s\S]*before[\s\S]*target ref moves/i);
-    assert.match(documentation, /post-CAS[\s\S]*compare-and-swap rollback/i);
-    assert.match(documentation, /CHECKOUT_REFRESH: refreshed/);
-    assert.match(documentation, /CHECKOUT_REFRESH: already-coherent/);
+    assert.match(documentation, /any unique root or linked checkout/i);
+    assert.match(documentation, /bounded operational refusal/i);
+    assert.match(documentation, /not a partial landing/i);
+    assert.match(documentation, /not a retryable lock wait/i);
     assert.match(documentation, /CHECKOUT_REFRESH: not-applicable/);
+    assert.match(documentation, /success is possible only for bare/i);
+    assert.match(documentation, /the operator must make the target ref unowned/i);
+    assert.doesNotMatch(documentation, /CHECKOUT_REFRESH: refreshed/);
+    assert.doesNotMatch(documentation, /CHECKOUT_REFRESH: already-coherent/);
+    assert.doesNotMatch(documentation, /post-CAS/i);
+    assert.doesNotMatch(documentation, /rollback/i);
     assert.doesNotMatch(documentation, /skipped:/);
   });
 

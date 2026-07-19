@@ -108,64 +108,33 @@ function readEvents(eventsPath: string): Array<{ event: string; checkoutRefresh?
   return contents.split("\n").map((line) => JSON.parse(line) as { event: string; checkoutRefresh?: string });
 }
 
-function createRefreshFailureGitWrapper(
+function createWrappedGitLedger(
   repo: string,
-  initial: string,
-  mode: "rollback" | "concurrent-winner",
-): { env: Record<string, string>; competingCommitPath: string } {
+): { env: Record<string, string>; getLedger: () => string[] } {
   const wrapperDir = tamanduaTempDir("tamandua-merge-branch-cli-git-wrapper-");
   cleanup.push(wrapperDir);
-  const markerPath = path.join(wrapperDir, "refresh-failed");
-  const mergedCommitPath = path.join(wrapperDir, "merged-commit");
-  const competingCommitPath = path.join(wrapperDir, "competing-commit");
+  const ledgerPath = path.join(wrapperDir, "commands.ledger");
   const wrapperPath = path.join(wrapperDir, "git");
   fs.writeFileSync(wrapperPath, `#!/usr/bin/env node
 const fs = require("node:fs");
 const { spawnSync } = require("node:child_process");
 const args = process.argv.slice(2);
-const run = (gitArgs) => spawnSync("/usr/bin/git", gitArgs, { encoding: "utf-8" });
-const command = args[0] === "-C" ? args[2] : args[0];
-const actual = run(args);
-if (command === "commit-tree" && actual.status === 0) {
-  fs.writeFileSync(process.env.MBLC_MERGED_COMMIT_PATH, actual.stdout.trim());
-}
-if (command === "read-tree" && actual.status === 0 && !fs.existsSync(process.env.MBLC_MARKER_PATH)) {
-  fs.writeFileSync(process.env.MBLC_MARKER_PATH, "failed");
-  if (process.env.MBLC_MODE === "concurrent-winner") {
-    const initialTree = run(["-C", process.env.MBLC_REPO, "rev-parse", process.env.MBLC_INITIAL + "^{tree}"]).stdout.trim();
-    const winner = run(["-C", process.env.MBLC_REPO, "commit-tree", initialTree, "-p", process.env.MBLC_INITIAL, "-m", "concurrent winner"]);
-    if (winner.status !== 0) {
-      process.stderr.write(winner.stderr);
-      process.exit(winner.status || 1);
-    }
-    const competingCommit = winner.stdout.trim();
-    const mergedCommit = fs.readFileSync(process.env.MBLC_MERGED_COMMIT_PATH, "utf-8").trim();
-    const update = run(["-C", process.env.MBLC_REPO, "update-ref", "refs/heads/staging", competingCommit, mergedCommit]);
-    if (update.status !== 0) {
-      process.stderr.write(update.stderr);
-      process.exit(update.status || 1);
-    }
-    fs.writeFileSync(process.env.MBLC_COMPETING_COMMIT_PATH, competingCommit);
-  }
-  process.stderr.write("injected CLI refresh failure after CAS\\n");
-  process.exit(128);
-}
-process.stdout.write(actual.stdout || "");
-process.stderr.write(actual.stderr || "");
-process.exit(actual.status === null ? 1 : actual.status);
+fs.appendFileSync(process.env.MBLC_LEDGER_PATH, JSON.stringify(args) + "\\n");
+const result = spawnSync("/usr/bin/git", args, { encoding: "utf-8" });
+process.stdout.write(result.stdout || "");
+process.stderr.write(result.stderr || "");
+process.exit(result.status === null ? 1 : result.status);
 `, "utf-8");
   fs.chmodSync(wrapperPath, 0o755);
   return {
     env: {
       PATH: `${wrapperDir}:${process.env.PATH ?? ""}`,
-      MBLC_MODE: mode,
-      MBLC_REPO: repo,
-      MBLC_INITIAL: initial,
-      MBLC_MARKER_PATH: markerPath,
-      MBLC_MERGED_COMMIT_PATH: mergedCommitPath,
-      MBLC_COMPETING_COMMIT_PATH: competingCommitPath,
+      MBLC_LEDGER_PATH: ledgerPath,
     },
-    competingCommitPath,
+    getLedger: () => {
+      if (!fs.existsSync(ledgerPath)) return [];
+      return fs.readFileSync(ledgerPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l) as string[]);
+    },
   };
 }
 
@@ -198,10 +167,14 @@ describe("tamandua merge-branch CLI", () => {
     assert.match(result.stdout, /true[\s\S]*already landed[\s\S]*false[\s\S]*new squash commit/i);
     assert.match(result.stdout, /STATUS: target_moved/);
     assert.match(result.stdout, /STATUS: conflicts/);
-    assert.match(result.stdout, /linked worktrees/i);
-    assert.match(result.stdout, /dirty or ambiguous[\s\S]*exit code 1/i);
-    assert.match(result.stdout, /post-CAS[\s\S]*rollback/i);
-    assert.match(result.stdout, /CHECKOUT_REFRESH: <refreshed \| already-coherent \| not-applicable>/);
+    assert.match(result.stdout, /worktree list --porcelain/);
+    assert.match(result.stdout, /checked-out[\s\S]*refusal[\s\S]*exit code 1/i);
+    assert.match(result.stdout, /not a partial landing/i);
+    assert.match(result.stdout, /not a retryable lock wait/i);
+    assert.match(result.stdout, /CHECKOUT_REFRESH: not-applicable/);
+    assert.doesNotMatch(result.stdout, /CHECKOUT_REFRESH: <refreshed/);
+    assert.doesNotMatch(result.stdout, /post-CAS/);
+    assert.doesNotMatch(result.stdout, /rollback/);
     assert.doesNotMatch(result.stdout, /skipped:/);
     assert.match(result.stdout, /Exit codes:[\s\S]*0\s+Newly landed or already landed \(no-op\)[\s\S]*2[\s\S]*3/);
     assert.equal(result.stderr, "");
@@ -270,13 +243,15 @@ describe("tamandua merge-branch CLI", () => {
     assert.equal(git(repo, ["rev-parse", "refs/heads/main"]), initial);
   });
 
-  it("IDEM reports an already-landed branch without changing target history", () => {
+  it("reports an already-landed unowned branch with not-applicable and no target mutation", () => {
     const { repo, initial } = createRepo();
     createFeature(repo, initial);
     git(repo, ["merge", "--ff-only", "feature"]);
-    const targetBefore = git(repo, ["rev-parse", "refs/heads/main"]);
-    const treeBefore = git(repo, ["rev-parse", "refs/heads/main^{tree}"]);
-    const commitCountBefore = git(repo, ["rev-list", "--count", "refs/heads/main"]);
+    git(repo, ["branch", "staging", "refs/heads/main"]);
+    git(repo, ["checkout", "-b", "other", initial]);
+    const targetBefore = git(repo, ["rev-parse", "refs/heads/staging"]);
+    const treeBefore = git(repo, ["rev-parse", "refs/heads/staging^{tree}"]);
+    const commitCountBefore = git(repo, ["rev-list", "--count", "refs/heads/staging"]);
 
     const result = runCli(validArgs(repo, targetBefore, "main"));
 
@@ -286,7 +261,7 @@ describe("tamandua merge-branch CLI", () => {
     assert.match(result.stdout, new RegExp(`^MERGED_COMMIT: ${targetBefore}$`, "m"));
     assert.match(result.stdout, new RegExp(`^MERGED_TREE: ${treeBefore}$`, "m"));
     assert.match(result.stdout, /^TARGET: refs\/heads\/main$/m);
-    assert.match(result.stdout, /^CHECKOUT_REFRESH: already-coherent$/m);
+    assert.match(result.stdout, /^CHECKOUT_REFRESH: not-applicable$/m);
     assert.equal(git(repo, ["rev-parse", "refs/heads/main"]), targetBefore);
     assert.equal(git(repo, ["rev-list", "--count", "refs/heads/main"]), commitCountBefore);
 
@@ -306,10 +281,73 @@ describe("tamandua merge-branch CLI", () => {
     assert.equal(events[0]?.noop, true);
     assert.equal(events[0]?.mergedCommit, targetBefore);
     assert.equal(events[0]?.mergedTree, treeBefore);
-    assert.equal(events[0]?.checkoutRefresh, "already-coherent");
+    assert.equal(events[0]?.checkoutRefresh, "not-applicable");
   });
 
-  it("reports already-coherent for a linked no-op owner and not-applicable for an unowned no-op", () => {
+  it("reports not-applicable for an unowned no-op without altering checkout state", () => {
+    const { repo, initial } = createRepo();
+    createFeature(repo, initial);
+    const featureTip = git(repo, ["rev-parse", "refs/heads/feature"]);
+    git(repo, ["branch", "staging", featureTip]);
+    const before = captureCheckoutState(repo);
+
+    const result = runCli(validArgs(repo, featureTip, "staging"));
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /^NOOP: true$/m);
+    assert.match(result.stdout, /^CHECKOUT_REFRESH: not-applicable$/m);
+    assert.equal(readEvents(path.join(result.testHome.tamanduaDir, "events", "all.jsonl"))[0]?.checkoutRefresh, "not-applicable");
+    assert.deepEqual(captureCheckoutState(repo), before);
+  });
+
+  it("refuses a root checked-out non-no-op target with exit code 1 and operator diagnostics", () => {
+    const { repo, initial } = createRepo();
+    createFeature(repo, initial);
+    const rootBranchBefore = git(repo, ["symbolic-ref", "--short", "HEAD"]);
+    const targetRefBefore = git(repo, ["rev-parse", "refs/heads/main"]);
+    const targetIndexPath = git(repo, ["rev-parse", "--path-format=absolute", "--git-path", "index"]);
+    const targetIndexBytesBefore = fs.readFileSync(targetIndexPath);
+    const rootBefore = captureCheckoutState(repo);
+
+    const result = runCli(validArgs(repo, initial, "main"));
+
+    assert.equal(result.status, 1);
+    assert.equal(result.stdout, "");
+    assert.match(result.stderr, /checked-out target landing is disabled/i);
+    assert.match(result.stderr, /exact owned-index-lock release cannot be guaranteed/i);
+    assert.match(result.stderr, /this is not a partial landing/i);
+    assert.match(result.stderr, /this is not a retryable lock wait/i);
+    assert.equal(git(repo, ["rev-parse", "refs/heads/main"]), targetRefBefore);
+    assert.equal(git(repo, ["symbolic-ref", "--short", "HEAD"]), rootBranchBefore);
+    assert.deepEqual(fs.readFileSync(targetIndexPath), targetIndexBytesBefore);
+    assert.deepEqual(captureCheckoutState(repo), rootBefore);
+    assert.deepEqual(readEvents(path.join(result.testHome.tamanduaDir, "events", "all.jsonl")), []);
+  });
+
+  it("refuses a linked checked-out non-no-op target with exit code 1 and preserves root state", () => {
+    const { repo, targetWorktree, initial } = createLinkedTargetRepo();
+    const rootBranchBefore = git(repo, ["symbolic-ref", "HEAD"]);
+    const rootBefore = captureCheckoutState(repo);
+    const linkedBefore = captureCheckoutState(targetWorktree);
+    const targetIndexPath = git(targetWorktree, ["rev-parse", "--path-format=absolute", "--git-path", "index"]);
+    const targetIndexBytesBefore = fs.readFileSync(targetIndexPath);
+
+    const result = runCli(validArgs(repo, initial, "staging"));
+
+    assert.equal(result.status, 1);
+    assert.equal(result.stdout, "");
+    assert.match(result.stderr, /checked-out target landing is disabled/i);
+    assert.match(result.stderr, /exact owned-index-lock release cannot be guaranteed/i);
+    assert.match(result.stderr, /this is not a partial landing/i);
+    assert.match(result.stderr, /this is not a retryable lock wait/i);
+    assert.equal(git(repo, ["rev-parse", "refs/heads/staging"]), initial);
+    assert.deepEqual(captureCheckoutState(repo), rootBefore);
+    assert.deepEqual(captureCheckoutState(targetWorktree), linkedBefore);
+    assert.deepEqual(fs.readFileSync(targetIndexPath), targetIndexBytesBefore);
+    assert.deepEqual(readEvents(path.join(result.testHome.tamanduaDir, "events", "all.jsonl")), []);
+  });
+
+  it("refuses a checked-out would-be no-op without resolving candidate or emitting events", () => {
     const { repo, initial } = createRepo();
     createFeature(repo, initial);
     const featureTip = git(repo, ["rev-parse", "refs/heads/feature"]);
@@ -317,159 +355,81 @@ describe("tamandua merge-branch CLI", () => {
     const targetWorktree = tamanduaTempDir("tamandua-merge-branch-cli-noop-linked-");
     cleanup.push(targetWorktree);
     git(repo, ["worktree", "add", targetWorktree, "staging"]);
-    fs.writeFileSync(path.join(repo, "operator-notes.txt"), "root operator bytes\n");
     const rootBefore = captureCheckoutState(repo);
     const linkedBefore = captureCheckoutState(targetWorktree);
 
-    const linkedResult = runCli(validArgs(repo, featureTip, "staging"));
+    const wrapper = createWrappedGitLedger(repo);
+    const result = runCli(validArgs(repo, featureTip, "staging"), wrapper.env);
 
-    assert.equal(linkedResult.status, 0, linkedResult.stderr);
-    assert.match(linkedResult.stdout, /^NOOP: true$/m);
-    assert.match(linkedResult.stdout, /^CHECKOUT_REFRESH: already-coherent$/m);
-    assert.equal(readEvents(path.join(linkedResult.testHome.tamanduaDir, "events", "all.jsonl"))[0]?.checkoutRefresh, "already-coherent");
+    assert.equal(result.status, 1);
+    assert.equal(result.stdout, "");
+    assert.match(result.stderr, /checked-out target landing is disabled/i);
     assert.deepEqual(captureCheckoutState(repo), rootBefore);
     assert.deepEqual(captureCheckoutState(targetWorktree), linkedBefore);
+    assert.deepEqual(readEvents(path.join(result.testHome.tamanduaDir, "events", "all.jsonl")), []);
 
-    git(repo, ["worktree", "remove", targetWorktree]);
-    const unownedBefore = captureCheckoutState(repo);
-    const unownedResult = runCli(validArgs(repo, featureTip, "staging"));
-
-    assert.equal(unownedResult.status, 0, unownedResult.stderr);
-    assert.match(unownedResult.stdout, /^NOOP: true$/m);
-    assert.match(unownedResult.stdout, /^CHECKOUT_REFRESH: not-applicable$/m);
-    assert.equal(readEvents(path.join(unownedResult.testHome.tamanduaDir, "events", "all.jsonl"))[0]?.checkoutRefresh, "not-applicable");
-    assert.deepEqual(captureCheckoutState(repo), unownedBefore);
+    const ledger = wrapper.getLedger();
+    const wtListIdx = ledger.findIndex((cmd) => cmd[0] === "-C" && cmd[2] === "worktree" && cmd[3] === "list");
+    assert.ok(wtListIdx !== -1, "expected worktree list in command ledger");
+    const commandsAfterWtList = ledger.slice(wtListIdx + 1);
+    assert.deepEqual(commandsAfterWtList, [], "no commands after worktree list for checked-out refusal");
+    const commandNamesBefore = ledger.slice(0, wtListIdx).map((cmd) => cmd[0] === "-C" ? cmd[2] : cmd[0]);
+    assert.ok(commandNamesBefore.every((n) => n === "rev-parse"), `unexpected commands before worktree list: ${commandNamesBefore.join(", ")}`);
   });
 
-  it("STCK reports refreshed and synchronizes a clean checked-out target", () => {
+  it("preserves index-lock bytes and operator files through checked-out refusal", () => {
     const { repo, initial } = createRepo();
     createFeature(repo, initial);
+    const operatorNotesPath = path.join(repo, "operator-notes.txt");
+    const operatorBytes = Buffer.from("ordinary operator bytes\n");
+    fs.writeFileSync(operatorNotesPath, operatorBytes);
 
-    const result = runCli(validArgs(repo, initial, "main"));
+    const rootBranchBefore = git(repo, ["symbolic-ref", "HEAD"]);
+    const targetIndexPath = git(repo, ["rev-parse", "--path-format=absolute", "--git-path", "index"]);
+    const targetIndexBytesBefore = fs.readFileSync(targetIndexPath);
+    const targetIndexTreeBefore = git(repo, ["write-tree"]);
+    const targetHeadBefore = git(repo, ["rev-parse", "HEAD"]);
+    const targetHeadTreeBefore = git(repo, ["rev-parse", "HEAD^{tree}"]);
+    const refsBefore = git(repo, ["show-ref"]);
+    const objectCountBefore = Number(git(repo, ["count-objects", "-v"]).match(/count: (\d+)/)?.[1] ?? "0");
 
-    assert.equal(result.status, 0, result.stderr);
-    assert.match(result.stdout, /^STATUS: landed$/m);
-    assert.match(result.stdout, /^CHECKOUT_REFRESH: refreshed$/m);
-    assert.equal(fs.readFileSync(path.join(repo, "feature.txt"), "utf-8"), "feature\n");
-    assert.equal(git(repo, ["status", "--porcelain"]), "");
-    assert.equal(git(repo, ["diff", "--cached", "--name-only"]), "");
-  });
-
-  it("refreshes linked staging while leaving the root checkout byte-for-byte unchanged", () => {
-    const { repo, targetWorktree, initial } = createLinkedTargetRepo();
-    const rootUntrackedPath = path.join(repo, "operator-notes.txt");
-    fs.writeFileSync(rootUntrackedPath, Buffer.from("root operator bytes\n"));
-    const rootBefore = captureCheckoutState(repo);
-
-    const result = runCli(validArgs(repo, initial, "staging"));
-
-    assert.equal(result.status, 0, result.stderr);
-    assert.match(result.stdout, /^STATUS: landed$/m);
-    assert.match(result.stdout, /^CHECKOUT_REFRESH: refreshed$/m);
-    const mergedCommit = result.stdout.match(/^MERGED_COMMIT: ([0-9a-f]{40})$/m)?.[1];
-    const mergedTree = result.stdout.match(/^MERGED_TREE: ([0-9a-f]{40})$/m)?.[1];
-    assert.ok(mergedCommit);
-    assert.ok(mergedTree);
-    assert.equal(git(repo, ["rev-parse", "refs/heads/staging"]), mergedCommit);
-    assert.equal(git(targetWorktree, ["rev-parse", "HEAD"]), mergedCommit);
-    assert.equal(git(targetWorktree, ["rev-parse", "HEAD^{tree}"]), mergedTree);
-    assert.equal(git(targetWorktree, ["write-tree"]), mergedTree);
-    assert.equal(git(targetWorktree, ["status", "--porcelain=v1", "--untracked-files=all"]), "");
-    assert.equal(fs.readFileSync(path.join(targetWorktree, "base.txt"), "utf-8"), "feature change\n");
-    assert.deepEqual(captureCheckoutState(repo), rootBefore);
-    assert.equal(fs.existsSync(path.join(repo, "feature.txt")), false);
-    const events = readEvents(path.join(result.testHome.tamanduaDir, "events", "all.jsonl"));
-    assert.deepEqual(events.map(({ event, checkoutRefresh }) => ({ event, checkoutRefresh })), [
-      { event: "merge.landed", checkoutRefresh: "refreshed" },
-    ]);
-  });
-
-  for (const dirtyState of ["tracked", "staged", "untracked"] as const) {
-    it(`rejects a linked target with ${dirtyState} bytes before moving its ref`, () => {
-      const { repo, targetWorktree, initial } = createLinkedTargetRepo();
-      const userPath = dirtyState === "untracked"
-        ? path.join(targetWorktree, "operator-notes.txt")
-        : path.join(targetWorktree, "base.txt");
-      const userBytes = Buffer.from(`${dirtyState} operator bytes\n`);
-      fs.writeFileSync(userPath, userBytes);
-      if (dirtyState === "staged") git(targetWorktree, ["add", "base.txt"]);
-      const rootBranchBefore = git(repo, ["symbolic-ref", "HEAD"]);
-      const targetBranchBefore = git(targetWorktree, ["symbolic-ref", "HEAD"]);
-      const targetIndexPath = git(targetWorktree, ["rev-parse", "--path-format=absolute", "--git-path", "index"]);
-      const targetIndexBytesBefore = fs.readFileSync(targetIndexPath);
-      const targetStatusBefore = git(targetWorktree, ["status", "--porcelain=v1", "--untracked-files=all"]);
-
-      const result = runCli(validArgs(repo, initial, "staging"));
-
-      assert.equal(result.status, 1);
-      assert.equal(result.stdout, "");
-      assert.match(result.stderr, /target worktree.*not clean/i);
-      assert.equal(git(repo, ["rev-parse", "refs/heads/staging"]), initial);
-      assert.equal(git(repo, ["symbolic-ref", "HEAD"]), rootBranchBefore);
-      assert.equal(git(targetWorktree, ["symbolic-ref", "HEAD"]), targetBranchBefore);
-      assert.deepEqual(fs.readFileSync(targetIndexPath), targetIndexBytesBefore);
-      assert.equal(git(targetWorktree, ["status", "--porcelain=v1", "--untracked-files=all"]), targetStatusBefore);
-      assert.deepEqual(fs.readFileSync(userPath), userBytes);
-      assert.deepEqual(readEvents(path.join(result.testHome.tamanduaDir, "events", "all.jsonl")), []);
-    });
-  }
-
-  it("rolls back the ref but preserves unknown checkout drift after a forced post-CAS refresh failure", () => {
-    const { repo, targetWorktree, initial } = createLinkedTargetRepo();
-    const targetTreeBefore = git(targetWorktree, ["rev-parse", "HEAD^{tree}"]);
-    const targetIndexBefore = git(targetWorktree, ["write-tree"]);
-    const targetBytesBefore = fs.readFileSync(path.join(targetWorktree, "base.txt"));
-    const injection = createRefreshFailureGitWrapper(repo, initial, "rollback");
-
-    const result = runCli(validArgs(repo, initial, "staging"), injection.env);
-
-    assert.equal(result.status, 1);
-    assert.equal(result.stdout, "");
-    assert.match(result.stderr, /checkout refresh: failed.*injected CLI refresh failure/i);
-    assert.match(result.stderr, /ref rollback: restored/i);
-    assert.match(result.stderr, /checkout restoration: not attempted because state drifted/i);
-    assert.match(result.stderr, /tracked filesystem difference is M base\.txt/i);
-    assert.equal(git(repo, ["rev-parse", "refs/heads/staging"]), initial);
-    assert.equal(git(targetWorktree, ["rev-parse", "HEAD"]), initial);
-    assert.equal(git(targetWorktree, ["rev-parse", "HEAD^{tree}"]), targetTreeBefore);
-    assert.equal(git(targetWorktree, ["write-tree"]), targetIndexBefore);
-    assert.equal(git(targetWorktree, ["status", "--porcelain=v1", "--untracked-files=all"]), "M base.txt");
-    assert.notDeepEqual(fs.readFileSync(path.join(targetWorktree, "base.txt")), targetBytesBefore);
-    assert.equal(fs.readFileSync(path.join(targetWorktree, "base.txt"), "utf-8"), "feature change\n");
-    assert.deepEqual(readEvents(path.join(result.testHome.tamanduaDir, "events", "all.jsonl")), []);
-  });
-
-  it("preserves a concurrent ref winner when forced refresh rollback loses at the CLI boundary", () => {
-    const { repo, initial } = createLinkedTargetRepo();
-    const injection = createRefreshFailureGitWrapper(repo, initial, "concurrent-winner");
-
-    const result = runCli(validArgs(repo, initial, "staging"), injection.env);
-
-    assert.equal(result.status, 1);
-    assert.equal(result.stdout, "");
-    assert.match(result.stderr, /checkout refresh: failed.*injected CLI refresh failure/i);
-    assert.match(result.stderr, /ref rollback: failed/i);
-    assert.match(result.stderr, /checkout restoration: not attempted/i);
-    const competingCommit = fs.readFileSync(injection.competingCommitPath, "utf-8").trim();
-    assert.match(competingCommit, /^[0-9a-f]{40}$/);
-    assert.equal(git(repo, ["rev-parse", "refs/heads/staging"]), competingCommit);
-    assert.deepEqual(readEvents(path.join(result.testHome.tamanduaDir, "events", "all.jsonl")), []);
-  });
-
-  it("STCK fails closed while preserving a touched local change", () => {
-    const { repo, initial } = createRepo();
-    createFeatureChangingBase(repo, initial);
-    const localContents = "local change\n";
-    fs.writeFileSync(path.join(repo, "base.txt"), localContents, "utf-8");
+    const lockPath = path.join(repo, ".git", "index.lock");
+    const lockBytes = Buffer.from("pre-existing lock payload\n");
+    fs.writeFileSync(lockPath, lockBytes);
+    const lockStat = fs.statSync(lockPath);
 
     const result = runCli(validArgs(repo, initial, "main"));
 
     assert.equal(result.status, 1);
     assert.equal(result.stdout, "");
-    assert.match(result.stderr, /target worktree.*not clean/i);
-    assert.equal(fs.readFileSync(path.join(repo, "base.txt"), "utf-8"), localContents);
-    assert.equal(git(repo, ["rev-parse", "refs/heads/main"]), initial);
-    assert.equal(git(repo, ["show", "refs/heads/main:base.txt"]), "base");
+    assert.match(result.stderr, /checked-out target landing is disabled/i);
+    assert.equal(git(repo, ["rev-parse", "refs/heads/main"]), targetHeadBefore);
+    assert.equal(git(repo, ["symbolic-ref", "HEAD"]), rootBranchBefore);
+    assert.equal(git(repo, ["rev-parse", "HEAD"]), targetHeadBefore);
+    assert.equal(git(repo, ["rev-parse", "HEAD^{tree}"]), targetHeadTreeBefore);
+    assert.deepEqual(fs.readFileSync(targetIndexPath), targetIndexBytesBefore);
+    assert.deepEqual(fs.readFileSync(operatorNotesPath), operatorBytes);
+    const lockAfter = fs.statSync(lockPath);
+    assert.ok(lockAfter.isFile());
+    assert.deepEqual(fs.readFileSync(lockPath), lockBytes);
+    assert.equal(lockAfter.mode, lockStat.mode);
+    assert.equal(lockAfter.mtimeMs, lockStat.mtimeMs);
+    assert.equal(git(repo, ["show-ref"]), refsBefore);
+    assert.equal(Number(git(repo, ["count-objects", "-v"]).match(/count: (\d+)/)?.[1] ?? "0"), objectCountBefore);
+    assert.deepEqual(readEvents(path.join(result.testHome.tamanduaDir, "events", "all.jsonl")), []);
+    assert.equal(
+      fs.existsSync(path.join(repo, ".git", "tamandua.merge.lock")),
+      false,
+      "no Tamandua/quarantine lock artifacts",
+    );
+    assert.equal(
+      fs.existsSync(path.join(repo, ".git", "tamandua.merge.quarantine")),
+      false,
+      "no Tamandua/quarantine directory artifacts",
+    );
+
+    // Clean up the lock so cleanup doesn't fail
+    fs.unlinkSync(lockPath);
   });
 
   it("STCK reports not-applicable for a bare origin", () => {

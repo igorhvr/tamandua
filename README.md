@@ -572,7 +572,7 @@ If something isn't working as expected, start with the built-in diagnostic:
 
 | Command | Description |
 |---------|-------------|
-| `tamandua merge-branch --origin <repo> --branch <branch> --into <target> --expect-tip <sha> --message <message>` | Atomically land a plumbing-based squash merge. Checked-out targets are discovered across linked worktrees and fail closed unless they can be safely synchronized; no-op results distinguish an `already-coherent` checkout from a target where refresh is `not-applicable`. See [Atomic merge-branch landing](docs/merge-branch.md). |
+| `tamandua merge-branch --origin <repo> --branch <branch> --into <target> --expect-tip <sha> --message <message>` | Atomically land a plumbing-based squash merge. Ownership is discovered with strict `git worktree list --porcelain -z` metadata; any checked-out target is refused before mutation (not a partial landing, not a retryable lock wait). Every successful result reports `CHECKOUT_REFRESH: not-applicable`. See [Atomic merge-branch landing](docs/merge-branch.md). |
 
 ### Management
 
