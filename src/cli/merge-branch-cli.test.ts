@@ -148,7 +148,7 @@ function captureExactSnapshot(
   const writeTreeResult = spawnSync("git", ["write-tree"], {
     cwd: ownerWorktree,
     encoding: "utf-8",
-    env: { ...process.env, GIT_INDEX_FILE: tempIndex },
+    env: cleanChildEnv({ GIT_INDEX_FILE: tempIndex }),
   });
   assert.equal(writeTreeResult.status, 0, `git write-tree failed: ${writeTreeResult.stderr}`);
   const indexTree = writeTreeResult.stdout.trim();

@@ -10,6 +10,7 @@ import {
   type MergeBranchEvent,
 } from "../../dist/installer/merge-branch.js";
 import type { CheckoutRefreshOutcome } from "../../dist/installer/events.js";
+import { assertStatePathIsolation } from "../../dist/lib/test-guard.js";
 
 const cleanup: string[] = [];
 
