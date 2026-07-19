@@ -48,8 +48,30 @@ describe("SPL2 merge-branch command module", () => {
   });
 
   it("owns merge help and declines unrelated command groups", () => {
-    assert.match(getMergeBranchHelp(), /^tamandua merge-branch — Atomically land a squash merge with Git plumbing/);
-    assert.match(getMergeBranchHelp(), /STATUS: landed[\s\S]*STATUS: target_moved[\s\S]*STATUS: conflicts/);
+    const help = getMergeBranchHelp();
+    assert.match(help, /^tamandua merge-branch — Atomically land a squash merge with Git plumbing/);
+    assert.match(help, /STATUS: landed[\s\S]*STATUS: target_moved[\s\S]*STATUS: conflicts/);
+    assert.match(help, /linked worktrees/i);
+    assert.match(help, /dirty or ambiguous[\s\S]*exit code 1/i);
+    assert.match(help, /post-CAS[\s\S]*rollback/i);
+    assert.match(help, /CHECKOUT_REFRESH: <refreshed \| not-applicable>/);
+    assert.doesNotMatch(help, /skipped:/);
     assert.equal(handleMergeBranch("workflow", ["workflow", "list"]), false);
+  });
+
+  it("publishes the fail-closed checkout contract in operator documentation", () => {
+    const documentation = readFileSync(join(process.cwd(), "docs/merge-branch.md"), "utf8");
+    assert.match(documentation, /git worktree list --porcelain/);
+    assert.match(documentation, /dirty or ambiguous[\s\S]*before[\s\S]*target ref moves/i);
+    assert.match(documentation, /post-CAS[\s\S]*compare-and-swap rollback/i);
+    assert.match(documentation, /CHECKOUT_REFRESH: refreshed/);
+    assert.match(documentation, /CHECKOUT_REFRESH: not-applicable/);
+    assert.doesNotMatch(documentation, /skipped:/);
+  });
+
+  it("limits successful merge event checkout outcomes to truthful values", () => {
+    const eventTypes = readFileSync(join(process.cwd(), "src/installer/events.ts"), "utf8");
+    assert.match(eventTypes, /export type CheckoutRefreshOutcome = "refreshed" \| "not-applicable";/);
+    assert.doesNotMatch(eventTypes, /skipped:/);
   });
 });

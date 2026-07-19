@@ -63,16 +63,23 @@ Machine-readable results:
   MERGED_COMMIT: <sha>
   MERGED_TREE: <tree-sha>
   TARGET: refs/heads/<target-ref>
-  CHECKOUT_REFRESH: <refreshed | skipped:<reason> | not-applicable>
+  CHECKOUT_REFRESH: <refreshed | not-applicable>
 
 Landing outcomes:
   true               Feature content was already landed; target tip/tree are unchanged
   false              A new squash commit was created and landed
 
 Checkout refresh outcomes:
-  refreshed          Checked-out target index and worktree were synchronized
-  skipped:<reason>   Refresh was safely skipped; the merge still landed
-  not-applicable     Origin is bare or the target branch is not checked out
+  refreshed          The exact checked-out target index and worktree were synchronized
+  not-applicable     Origin is bare or the target branch is not checked out anywhere
+
+Checkout safety:
+  Target ownership is discovered across the origin and linked worktrees. A checked-out
+  target is preflighted at --expect-tip and must be clean and unambiguous.
+  Dirty or ambiguous checkout state fails closed with exit code 1 before the ref moves.
+  If synchronization unexpectedly fails after the compare-and-swap (post-CAS) update,
+  Tamandua attempts a guarded ref rollback and checkout restoration, then exits 1 with
+  refresh and rollback diagnostics. It never reports STATUS: landed for that failure.
 
   STATUS: target_moved
 
@@ -81,7 +88,7 @@ Checkout refresh outcomes:
 
 Exit codes:
   0  Newly landed or already landed (no-op)
-  1  Invalid invocation or operational Git error
+  1  Invalid invocation or operational Git error (including checkout preflight/rollback)
   2  Target moved before atomic landing
   3  Merge conflicts`;
 }

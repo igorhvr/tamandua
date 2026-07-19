@@ -568,6 +568,12 @@ If something isn't working as expected, start with the built-in diagnostic:
 | `tamandua workflow install <id> [--all]` | Install one or all workflows. **Installed bundled definitions are refreshed on every install/update** — local edits are overwritten. To customize a workflow, copy it under a new workflow id. |
 | `tamandua workflow uninstall <id>` | Remove a single workflow |
 
+### Atomic landing
+
+| Command | Description |
+|---------|-------------|
+| `tamandua merge-branch --origin <repo> --branch <branch> --into <target> --expect-tip <sha> --message <message>` | Atomically land a plumbing-based squash merge. Checked-out targets are discovered across linked worktrees and fail closed unless they can be safely synchronized. See [Atomic merge-branch landing](docs/merge-branch.md). |
+
 ### Management
 
 | Command | Description |

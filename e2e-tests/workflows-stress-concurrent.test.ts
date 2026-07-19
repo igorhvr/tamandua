@@ -690,7 +690,7 @@ describe("concurrent-runs stress test", { concurrency: 1 }, () => {
           const outputRefresh = mergeOutput.match(/^CHECKOUT_REFRESH: (.+)$/m)?.[1];
           assert.match(
             outputRefresh ?? "",
-            /^(?:refreshed|not-applicable|skipped:.+)$/,
+            /^(?:refreshed|not-applicable)$/,
             `feature-${i + 1}: missing or invalid CHECKOUT_REFRESH`,
           );
           const mergeEvents = fs

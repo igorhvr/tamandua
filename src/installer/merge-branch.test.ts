@@ -66,6 +66,16 @@ function createTouchedFeature(repo: string, branch = "feature"): string {
   return featureTip;
 }
 
+function createLinkedTargetRepo(): { repo: string; targetWorktree: string; initial: string } {
+  const { repo, initial } = createRepo();
+  createTouchedFeature(repo);
+  git(repo, ["branch", "staging", initial]);
+  const targetWorktree = tamanduaTempDir("tamandua-merge-branch-linked-");
+  cleanup.push(targetWorktree);
+  git(repo, ["worktree", "add", targetWorktree, "staging"]);
+  return { repo, targetWorktree, initial };
+}
+
 afterEach(() => {
   for (const dir of cleanup.splice(0)) {
     fs.rmSync(dir, { recursive: true, force: true });
@@ -250,6 +260,59 @@ describe("runPlumbingMerge", () => {
     ]);
   });
 
+  it("refreshes the linked worktree that owns the target without touching the origin checkout", () => {
+    const { repo, targetWorktree, initial } = createLinkedTargetRepo();
+    const rootUntrackedPath = path.join(repo, "operator-notes.txt");
+    const rootUntrackedBytes = Buffer.from("root operator bytes\n");
+    fs.writeFileSync(rootUntrackedPath, rootUntrackedBytes);
+    const rootIndexPath = git(repo, ["rev-parse", "--path-format=absolute", "--git-path", "index"]);
+    const rootBefore = {
+      branch: git(repo, ["symbolic-ref", "HEAD"]),
+      head: git(repo, ["rev-parse", "HEAD"]),
+      indexTree: git(repo, ["write-tree"]),
+      indexBytes: fs.readFileSync(rootIndexPath),
+      status: git(repo, ["status", "--porcelain=v1", "--untracked-files=all"]),
+      trackedBytes: fs.readFileSync(path.join(repo, "base.txt")),
+      untrackedBytes: fs.readFileSync(rootUntrackedPath),
+    };
+    const events: MergeBranchEvent[] = [];
+
+    const result = runPlumbingMerge(
+      {
+        origin: repo,
+        branch: "feature",
+        into: "staging",
+        expectTip: initial,
+        message: "Land feature into linked staging",
+        runId: "run-linked-target",
+      },
+      { emitEvent: (event) => events.push(event) },
+    );
+
+    assert.equal(result.status, "landed");
+    assert.equal(result.exitCode, 0);
+    if (result.status !== "landed") return;
+    assert.equal(result.checkoutRefresh, "refreshed");
+    assert.equal(git(repo, ["rev-parse", "refs/heads/staging"]), result.mergedCommit);
+    assert.equal(git(targetWorktree, ["rev-parse", "HEAD"]), result.mergedCommit);
+    assert.equal(git(targetWorktree, ["rev-parse", "HEAD^{tree}"]), result.mergedTree);
+    assert.equal(git(targetWorktree, ["write-tree"]), result.mergedTree);
+    assert.equal(git(targetWorktree, ["status", "--porcelain=v1", "--untracked-files=all"]), "");
+    assert.equal(fs.readFileSync(path.join(targetWorktree, "base.txt"), "utf-8"), "feature version\n");
+
+    assert.equal(git(repo, ["symbolic-ref", "HEAD"]), rootBefore.branch);
+    assert.equal(git(repo, ["rev-parse", "HEAD"]), rootBefore.head);
+    assert.equal(git(repo, ["write-tree"]), rootBefore.indexTree);
+    assert.deepEqual(fs.readFileSync(rootIndexPath), rootBefore.indexBytes);
+    assert.equal(git(repo, ["status", "--porcelain=v1", "--untracked-files=all"]), rootBefore.status);
+    assert.deepEqual(fs.readFileSync(path.join(repo, "base.txt")), rootBefore.trackedBytes);
+    assert.deepEqual(fs.readFileSync(rootUntrackedPath), rootBefore.untrackedBytes);
+    assert.equal(fs.existsSync(path.join(repo, "feature.txt")), false);
+    assert.equal(events.length, 1);
+    assert.equal(events[0]?.event, "merge.landed");
+    assert.equal(events[0]?.checkoutRefresh, "refreshed");
+  });
+
   it("STCK leaves the checkout untouched when landing into a non-checked-out branch", () => {
     const { repo, initial } = createRepo();
     createFeature(repo);
@@ -272,7 +335,145 @@ describe("runPlumbingMerge", () => {
     assert.equal(events[0]?.checkoutRefresh, "not-applicable");
   });
 
-  it("STCK preserves touched local changes and records a skipped refresh", () => {
+  for (const dirtyState of ["tracked", "staged", "untracked"] as const) {
+    it(`fails before object creation when a linked target has ${dirtyState} changes`, () => {
+      const { repo, targetWorktree, initial } = createLinkedTargetRepo();
+      const userPath = dirtyState === "untracked"
+        ? path.join(targetWorktree, "operator-notes.txt")
+        : path.join(targetWorktree, "base.txt");
+      const userBytes = `${dirtyState} operator bytes\n`;
+      fs.writeFileSync(userPath, userBytes, "utf-8");
+      if (dirtyState === "staged") git(targetWorktree, ["add", "base.txt"]);
+
+      const rootBranchBefore = git(repo, ["symbolic-ref", "HEAD"]);
+      const targetBranchBefore = git(targetWorktree, ["symbolic-ref", "HEAD"]);
+      const targetIndexBefore = git(targetWorktree, ["write-tree"]);
+      const targetStatusBefore = git(targetWorktree, ["status", "--porcelain=v1", "--untracked-files=all"]);
+      const targetIndexPath = git(targetWorktree, ["rev-parse", "--path-format=absolute", "--git-path", "index"]);
+      const targetIndexBytesBefore = fs.readFileSync(targetIndexPath);
+      const commands: string[][] = [];
+      const events: MergeBranchEvent[] = [];
+
+      const result = runPlumbingMerge(
+        { origin: repo, branch: "feature", into: "staging", expectTip: initial, message: "must not land", runId: `run-dirty-${dirtyState}` },
+        {
+          runGit: (origin, args) => {
+            commands.push(args);
+            return rawGit(origin, args);
+          },
+          emitEvent: (event) => events.push(event),
+        },
+      );
+
+      assert.equal(result.status, "operational_error");
+      assert.equal(result.exitCode, 1);
+      if (result.status !== "operational_error") return;
+      assert.match(result.detail, /target worktree.*not clean/i);
+      assert.equal(git(repo, ["rev-parse", "refs/heads/staging"]), initial);
+      assert.equal(git(repo, ["symbolic-ref", "HEAD"]), rootBranchBefore);
+      assert.equal(git(targetWorktree, ["symbolic-ref", "HEAD"]), targetBranchBefore);
+      assert.equal(git(targetWorktree, ["write-tree"]), targetIndexBefore);
+      assert.equal(git(targetWorktree, ["status", "--porcelain=v1", "--untracked-files=all"]), targetStatusBefore);
+      assert.deepEqual(fs.readFileSync(targetIndexPath), targetIndexBytesBefore);
+      assert.equal(fs.readFileSync(userPath, "utf-8"), userBytes);
+      assert.equal(commands.some((args) => args[0] === "commit-tree" || args[0] === "update-ref"), false);
+      assert.deepEqual(events, []);
+    });
+  }
+
+  it("fails closed on duplicate target owners before merge object creation", () => {
+    const { repo, initial } = createRepo();
+    createFeature(repo);
+    const commands: string[][] = [];
+    const events: MergeBranchEvent[] = [];
+
+    const result = runPlumbingMerge(
+      { origin: repo, branch: "feature", into: "main", expectTip: initial, message: "must not land", runId: "run-duplicate-owner" },
+      {
+        runGit: (origin, args) => {
+          commands.push(args);
+          const actual = rawGit(origin, args);
+          if (args[0] === "worktree" && args[1] === "list") {
+            return { ...actual, stdout: `${actual.stdout}\0${actual.stdout}` };
+          }
+          return actual;
+        },
+        emitEvent: (event) => events.push(event),
+      },
+    );
+
+    assert.equal(result.status, "operational_error");
+    if (result.status !== "operational_error") return;
+    assert.match(result.detail, /multiple worktrees.*refs\/heads\/main/i);
+    assert.equal(git(repo, ["rev-parse", "refs/heads/main"]), initial);
+    assert.equal(commands.some((args) => args[0] === "commit-tree" || args[0] === "update-ref"), false);
+    assert.deepEqual(events, []);
+  });
+
+  it("fails closed on malformed or unreadable worktree metadata", () => {
+    for (const metadataFailure of ["malformed", "unreadable"] as const) {
+      const { repo, initial } = createRepo();
+      createFeature(repo, `feature-${metadataFailure}`);
+      const commands: string[][] = [];
+
+      const result = runPlumbingMerge(
+        { origin: repo, branch: `feature-${metadataFailure}`, into: "main", expectTip: initial, message: "must not land" },
+        {
+          runGit: (origin, args) => {
+            commands.push(args);
+            if (args[0] === "worktree" && args[1] === "list") {
+              if (metadataFailure === "unreadable") {
+                return { status: 128, stdout: "", stderr: "fatal: cannot read worktree metadata" };
+              }
+              return { status: 0, stdout: `worktree ${repo}\0branch refs/heads/main\0\0`, stderr: "" };
+            }
+            return rawGit(origin, args);
+          },
+          emitEvent: () => assert.fail("unsafe preflight must not emit an event"),
+        },
+      );
+
+      assert.equal(result.status, "operational_error");
+      if (result.status !== "operational_error") continue;
+      assert.match(result.detail, /worktree metadata|worktree list/i);
+      assert.equal(git(repo, ["rev-parse", "refs/heads/main"]), initial);
+      assert.equal(commands.some((args) => args[0] === "commit-tree" || args[0] === "update-ref"), false);
+    }
+  });
+
+  it("fails closed when the discovered owner becomes inaccessible or changes ref or tip", () => {
+    for (const unsafeOwner of ["inaccessible", "wrong-ref", "wrong-tip"] as const) {
+      const { repo, targetWorktree, initial } = createLinkedTargetRepo();
+      const commands: Array<{ origin: string; args: string[] }> = [];
+      const events: MergeBranchEvent[] = [];
+
+      const result = runPlumbingMerge(
+        { origin: repo, branch: "feature", into: "staging", expectTip: initial, message: "must not land" },
+        {
+          runGit: (origin, args) => {
+            commands.push({ origin, args });
+            if (origin === targetWorktree && args[0] === "symbolic-ref") {
+              if (unsafeOwner === "inaccessible") return { status: 128, stdout: "", stderr: "fatal: inaccessible worktree" };
+              if (unsafeOwner === "wrong-ref") return { status: 0, stdout: "refs/heads/other", stderr: "" };
+            }
+            if (origin === targetWorktree && args[0] === "rev-parse" && args.at(-1) === "HEAD" && unsafeOwner === "wrong-tip") {
+              return { status: 0, stdout: "0".repeat(40), stderr: "" };
+            }
+            return rawGit(origin, args);
+          },
+          emitEvent: (event) => events.push(event),
+        },
+      );
+
+      assert.equal(result.status, "operational_error");
+      assert.equal(git(repo, ["rev-parse", "refs/heads/staging"]), initial);
+      assert.equal(git(targetWorktree, ["symbolic-ref", "HEAD"]), "refs/heads/staging");
+      assert.equal(commands.some(({ args }) => args[0] === "commit-tree" || args[0] === "update-ref"), false);
+      assert.deepEqual(events, []);
+    }
+  });
+
+  it("STCK rejects touched local changes before moving the target", () => {
     const { repo, initial } = createRepo();
     createTouchedFeature(repo);
     const localBytes = "uncommitted user change\n";
@@ -284,13 +485,13 @@ describe("runPlumbingMerge", () => {
       { emitEvent: (event) => events.push(event) },
     );
 
-    assert.equal(result.status, "landed");
-    assert.equal(result.exitCode, 0);
-    if (result.status !== "landed") return;
-    assert.match(result.checkoutRefresh, /^skipped:/);
-    assert.equal(git(repo, ["rev-parse", "refs/heads/main"]), result.mergedCommit);
+    assert.equal(result.status, "operational_error");
+    assert.equal(result.exitCode, 1);
+    if (result.status !== "operational_error") return;
+    assert.match(result.detail, /target worktree.*not clean/i);
+    assert.equal(git(repo, ["rev-parse", "refs/heads/main"]), initial);
     assert.equal(fs.readFileSync(path.join(repo, "base.txt"), "utf-8"), localBytes);
-    assert.equal(events[0]?.checkoutRefresh, result.checkoutRefresh);
+    assert.deepEqual(events, []);
   });
 
   it("STCK reports checkout refresh as not applicable for a bare origin", () => {
@@ -312,31 +513,150 @@ describe("runPlumbingMerge", () => {
     assert.equal(events[0]?.checkoutRefresh, "not-applicable");
   });
 
-  it("STCK treats an injected checkout refresh failure as a non-fatal skip", () => {
+  it("rolls back the target ref and checkout when post-CAS refresh fails", () => {
     const { repo, initial } = createRepo();
     createFeature(repo);
     const events: MergeBranchEvent[] = [];
+    const branchBefore = git(repo, ["symbolic-ref", "HEAD"]);
+    const treeBefore = git(repo, ["rev-parse", "HEAD^{tree}"]);
+    const indexBefore = git(repo, ["write-tree"]);
+    const baseBefore = fs.readFileSync(path.join(repo, "base.txt"));
+    let injectedRefreshFailure = false;
+    let mergedCommit = "";
+    const commands: string[][] = [];
 
     const result = runPlumbingMerge(
       { origin: repo, branch: "feature", into: "main", expectTip: initial, message: "Land feature", runId: "run-lock" },
       {
         runGit: (origin, args) => {
-          if (args[0] === "read-tree") {
+          commands.push(args);
+          if (args[0] === "read-tree" && !injectedRefreshFailure) {
+            injectedRefreshFailure = true;
+            const applied = rawGit(origin, args);
+            assert.equal(applied.status, 0);
             return { status: 128, stdout: "", stderr: "fatal: Unable to create '.git/index.lock': File exists." };
           }
-          return rawGit(origin, args);
+          const actual = rawGit(origin, args);
+          if (args[0] === "commit-tree" && actual.status === 0) mergedCommit = actual.stdout;
+          return actual;
         },
         emitEvent: (event) => events.push(event),
       },
     );
 
-    assert.equal(result.status, "landed");
-    assert.equal(result.exitCode, 0);
-    if (result.status !== "landed") return;
-    assert.match(result.checkoutRefresh, /^skipped:/);
-    assert.match(result.checkoutRefresh, /index\.lock|File exists/i);
-    assert.equal(git(repo, ["rev-parse", "refs/heads/main"]), result.mergedCommit);
-    assert.equal(events[0]?.checkoutRefresh, result.checkoutRefresh);
+    assert.equal(result.status, "operational_error");
+    assert.equal(result.exitCode, 1);
+    if (result.status !== "operational_error") return;
+    assert.match(result.detail, /checkout refresh: failed.*index\.lock|checkout refresh: failed.*File exists/i);
+    assert.match(result.detail, /ref rollback: restored/i);
+    assert.match(result.detail, /checkout restoration: restored/i);
+    assert.equal(git(repo, ["rev-parse", "refs/heads/main"]), initial);
+    assert.equal(git(repo, ["rev-parse", "HEAD"]), initial);
+    assert.equal(git(repo, ["rev-parse", "HEAD^{tree}"]), treeBefore);
+    assert.equal(git(repo, ["write-tree"]), indexBefore);
+    assert.equal(git(repo, ["status", "--porcelain=v1", "--untracked-files=all"]), "");
+    assert.deepEqual(fs.readFileSync(path.join(repo, "base.txt")), baseBefore);
+    assert.equal(fs.existsSync(path.join(repo, "feature.txt")), false);
+    assert.equal(git(repo, ["symbolic-ref", "HEAD"]), branchBefore);
+    assert.ok(mergedCommit);
+    assert.equal(
+      commands.some((args) =>
+        args[0] === "update-ref" &&
+        args[1] === "refs/heads/main" &&
+        args[2] === initial &&
+        args[3] === mergedCommit
+      ),
+      true,
+    );
+    assert.deepEqual(events, []);
+  });
+
+  it("preserves a concurrent target winner when refresh rollback loses its CAS", () => {
+    const { repo, initial } = createRepo();
+    createFeature(repo);
+    const events: MergeBranchEvent[] = [];
+    let competingCommit = "";
+    let mergedCommit = "";
+
+    const result = runPlumbingMerge(
+      { origin: repo, branch: "feature", into: "main", expectTip: initial, message: "Land feature", runId: "run-refresh-race" },
+      {
+        runGit: (origin, args) => {
+          const actual = rawGit(origin, args);
+          if (args[0] === "commit-tree" && actual.status === 0) mergedCommit = actual.stdout;
+          if (args[0] === "read-tree" && competingCommit === "") {
+            assert.equal(actual.status, 0);
+            const initialTree = git(repo, ["rev-parse", `${initial}^{tree}`]);
+            competingCommit = git(repo, ["commit-tree", initialTree, "-p", initial, "-m", "concurrent winner"]);
+            git(repo, ["update-ref", "refs/heads/main", competingCommit, mergedCommit]);
+            return { status: 128, stdout: "", stderr: "injected refresh failure after CAS" };
+          }
+          return actual;
+        },
+        emitEvent: (event) => events.push(event),
+      },
+    );
+
+    assert.equal(result.status, "operational_error");
+    assert.equal(result.exitCode, 1);
+    if (result.status !== "operational_error") return;
+    assert.match(result.detail, /checkout refresh: failed.*injected refresh failure/i);
+    assert.match(result.detail, /ref rollback: failed/i);
+    assert.match(result.detail, /checkout restoration: not attempted/i);
+    assert.equal(git(repo, ["rev-parse", "refs/heads/main"]), competingCommit);
+    assert.notEqual(competingCommit, mergedCommit);
+    assert.deepEqual(events, []);
+  });
+
+  it("reports injected rollback and checkout-restoration failures without false success", () => {
+    for (const failure of ["ref-rollback", "checkout-restoration"] as const) {
+      const { repo, initial } = createRepo();
+      createFeature(repo, `feature-${failure}`);
+      const events: MergeBranchEvent[] = [];
+      let mergedCommit = "";
+      let refreshFailed = false;
+
+      const result = runPlumbingMerge(
+        { origin: repo, branch: `feature-${failure}`, into: "main", expectTip: initial, message: "Land feature", runId: `run-${failure}` },
+        {
+          runGit: (origin, args) => {
+            if (args[0] === "commit-tree") {
+              const actual = rawGit(origin, args);
+              mergedCommit = actual.stdout;
+              return actual;
+            }
+            if (args[0] === "read-tree" && !refreshFailed) {
+              refreshFailed = true;
+              const applied = rawGit(origin, args);
+              assert.equal(applied.status, 0);
+              return { status: 128, stdout: "", stderr: "injected refresh failure" };
+            }
+            if (failure === "ref-rollback" && args[0] === "update-ref" && args[2] === initial && args[3] === mergedCommit) {
+              return { status: 128, stdout: "", stderr: "injected rollback failure" };
+            }
+            if (failure === "checkout-restoration" && args[0] === "read-tree" && refreshFailed) {
+              return { status: 128, stdout: "", stderr: "injected restoration failure" };
+            }
+            return rawGit(origin, args);
+          },
+          emitEvent: (event) => events.push(event),
+        },
+      );
+
+      assert.equal(result.status, "operational_error");
+      if (result.status !== "operational_error") continue;
+      assert.match(result.detail, /checkout refresh: failed.*injected refresh failure/i);
+      if (failure === "ref-rollback") {
+        assert.match(result.detail, /ref rollback: failed.*injected rollback failure/i);
+        assert.match(result.detail, /checkout restoration: not attempted/i);
+        assert.equal(git(repo, ["rev-parse", "refs/heads/main"]), mergedCommit);
+      } else {
+        assert.match(result.detail, /ref rollback: restored/i);
+        assert.match(result.detail, /checkout restoration: failed.*injected restoration failure/i);
+        assert.equal(git(repo, ["rev-parse", "refs/heads/main"]), initial);
+      }
+      assert.deepEqual(events, []);
+    }
   });
 
   it("reports preflight target movement before creating merge objects", () => {
@@ -439,13 +759,13 @@ describe("runPlumbingMerge", () => {
     const targetTree = "5".repeat(40);
     const scripted = [
       { status: 0, stdout: expected, stderr: "" },
+      { status: 0, stdout: "worktree /origin\0bare\0\0", stderr: "" },
       { status: 0, stdout: "4".repeat(40), stderr: "" },
       { status: 0, stdout: targetTree, stderr: "" },
       { status: 1, stdout: "", stderr: "" },
       { status: 0, stdout: tree, stderr: "" },
       { status: 0, stdout: commit, stderr: "" },
       { status: 0, stdout: "", stderr: "" },
-      { status: 0, stdout: "true", stderr: "" },
     ];
 
     const result = runPlumbingMerge(
@@ -462,13 +782,13 @@ describe("runPlumbingMerge", () => {
     assert.equal(result.status, "landed");
     assert.deepEqual(commands, [
       ["rev-parse", "--verify", "refs/heads/release"],
+      ["worktree", "list", "--porcelain", "-z"],
       ["rev-parse", "--verify", "refs/heads/feature^{commit}"],
       ["rev-parse", "--verify", "refs/heads/release^{tree}"],
       ["merge-base", "--is-ancestor", "4".repeat(40), expected],
       ["merge-tree", "--write-tree", expected, "refs/heads/feature"],
       ["commit-tree", tree, "-p", expected, "-m", "plumbing only"],
       ["update-ref", "refs/heads/release", commit, expected],
-      ["rev-parse", "--is-bare-repository"],
     ]);
     assert.equal(commands.some((args) => ["checkout", "switch", "merge", "commit", "reset"].includes(args[0]!)), false);
   });
@@ -480,6 +800,7 @@ describe("runPlumbingMerge", () => {
     const events: MergeBranchEvent[] = [];
     const scripted = [
       { status: 0, stdout: expected, stderr: "" },
+      { status: 0, stdout: "worktree /origin\0bare\0\0", stderr: "" },
       { status: 0, stdout: "4".repeat(40), stderr: "" },
       { status: 0, stdout: "5".repeat(40), stderr: "" },
       { status: 1, stdout: "", stderr: "" },
