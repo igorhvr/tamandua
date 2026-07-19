@@ -741,7 +741,7 @@ describe("concurrent-runs stress test", { concurrency: 1 }, () => {
         assert.deepEqual([...eventLandingCommits].sort(), [...targetLandingCommits].sort());
 
         // Once all mergers are quiescent, the origin checkout remains detached
-        // at the pre-run tip. Successful merge-branch calls update only the target
+        // at the pre-run tip. Successful landing calls update only the target
         // ref; the detached origin HEAD, index, and working tree stay unchanged.
         assert.notEqual(
           spawnSync("git", ["symbolic-ref", "HEAD"], { cwd: repoDir, encoding: "utf-8" }).status,
