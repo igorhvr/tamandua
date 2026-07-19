@@ -12,7 +12,7 @@ import {
   reservePortHandles,
   type PortHandle,
 } from "../../tests/helpers/test-env.ts";
-import { execSync, spawnSync, spawn } from "node:child_process";
+import { spawnSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -319,10 +319,17 @@ export function prepareGitRepo(fixtureDir: string, targetDir: string) {
  * unchanged.
  */
 export function detachOriginCheckout(repoDir: string): { branch: string; tip: string; tree: string } {
-  const branch = execSync("git symbolic-ref --short HEAD", { cwd: repoDir, encoding: "utf-8" }).trim();
-  const tip = execSync(`git rev-parse "refs/heads/${branch}"`, { cwd: repoDir, encoding: "utf-8" }).trim();
-  const tree = execSync(`git rev-parse "refs/heads/${branch}^{tree}"`, { cwd: repoDir, encoding: "utf-8" }).trim();
-  execSync(`git checkout --detach "${tip}"`, { cwd: repoDir, encoding: "utf-8" });
+  const { status: s1, stdout: branchOut, stderr: e1 } = spawnSync("git", ["symbolic-ref", "--short", "HEAD"], { cwd: repoDir, encoding: "utf-8" });
+  assert.equal(s1, 0, `git symbolic-ref failed: ${e1}`);
+  const branch = branchOut.trim();
+  const { status: s2, stdout: tipOut, stderr: e2 } = spawnSync("git", ["rev-parse", `refs/heads/${branch}`], { cwd: repoDir, encoding: "utf-8" });
+  assert.equal(s2, 0, `git rev-parse tip failed: ${e2}`);
+  const tip = tipOut.trim();
+  const { status: s3, stdout: treeOut, stderr: e3 } = spawnSync("git", ["rev-parse", `refs/heads/${branch}^{tree}`], { cwd: repoDir, encoding: "utf-8" });
+  assert.equal(s3, 0, `git rev-parse tree failed: ${e3}`);
+  const tree = treeOut.trim();
+  const { status: s4, stderr: e4 } = spawnSync("git", ["checkout", "--detach", tip], { cwd: repoDir, encoding: "utf-8" });
+  assert.equal(s4, 0, `git checkout --detach failed: ${e4}`);
   return { branch, tip, tree };
 }
 

@@ -569,6 +569,18 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
         assert.equal(landed.mergedTree, mergedTree);
         assert.equal(landed.checkoutRefresh, "not-applicable");
 
+        // ── Step output assertions: finalize_merge output matches ──
+        const finalizeStep = dbRow<{ output: string }>(
+          ctx.env.tamanduaDir,
+          "SELECT output FROM steps WHERE run_id = ? AND step_id = 'finalize_merge'",
+          runId,
+        );
+        assert.match(finalizeStep.output, /^STATUS: landed$/m);
+        assert.match(finalizeStep.output, new RegExp(`^MERGED_COMMIT: ${mergedCommit}$`, "m"));
+        assert.match(finalizeStep.output, new RegExp(`^MERGED_TREE: ${mergedTree}$`, "m"));
+        assert.match(finalizeStep.output, new RegExp(`^TARGET: refs/heads/${originalBranch}$`, "m"));
+        assert.match(finalizeStep.output, /^CHECKOUT_REFRESH: not-applicable$/m);
+
         // Target ref has the merged content (marker + feature fix)
         assert.equal(
           execSync(`git show "refs/heads/${originalBranch}:contention-marker.txt"`, {

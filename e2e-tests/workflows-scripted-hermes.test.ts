@@ -362,13 +362,15 @@ describe("scripted-hermes full pipeline (real daemon/scheduler, zero tokens)", {
         );
         assert.match(mergeStep.output, /^STATUS: landed$/m);
         assert.match(mergeStep.output, new RegExp(`^MERGED_TREE: ${mergedTree}$`, "m"));
+        assert.match(mergeStep.output, /^CHECKOUT_REFRESH: not-applicable$/m);
         const mergeEvents = fs
           .readFileSync(path.join(ctx.env.tamanduaDir, "events", `${runId}.jsonl`), "utf-8")
           .trim()
           .split("\n")
-          .map((line) => JSON.parse(line) as { event: string })
+          .map((line) => JSON.parse(line) as { event: string; checkoutRefresh?: string })
           .filter((event) => event.event.startsWith("merge."));
         assert.deepEqual(mergeEvents.map((event) => event.event), ["merge.landed"]);
+        assert.equal(mergeEvents[0]?.checkoutRefresh, "not-applicable");
 
         const targetLog = execSync(`git log --oneline -5 "refs/heads/${originalBranch}"`, { cwd: repoDir, encoding: "utf-8" });
         assert.ok(
