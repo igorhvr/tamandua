@@ -108,6 +108,130 @@ function readEvents(eventsPath: string): Array<{ event: string; checkoutRefresh?
   return contents.split("\n").map((line) => JSON.parse(line) as { event: string; checkoutRefresh?: string });
 }
 
+function collectObjectFiles(objectsDir: string) {
+  const result: Array<{ relativePath: string; bytes: Buffer; mode: number; size: bigint; mtimeNs: bigint }> = [];
+  function walk(dir: string, prefix: string) {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      const rel = prefix ? path.join(prefix, entry.name) : entry.name;
+      if (entry.isDirectory()) {
+        walk(full, rel);
+      } else if (entry.isFile()) {
+        const st = fs.statSync(full, { bigint: true });
+        result.push({ relativePath: rel, bytes: fs.readFileSync(full), mode: st.mode, size: st.size, mtimeNs: st.mtimeNs });
+      }
+    }
+  }
+  walk(objectsDir, "");
+  result.sort((a, b) => a.relativePath.localeCompare(b.relativePath));
+  return result;
+}
+
+function captureExactSnapshot(
+  repo: string,
+  ownerWorktree: string,
+  targetBranch: string,
+  ignoredCollisionPaths: string[],
+  eventsPath?: string,
+) {
+  const commonGitDir = git(ownerWorktree, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+  const objectsDir = path.join(commonGitDir, "objects");
+  const ownerGitDir = git(ownerWorktree, ["rev-parse", "--path-format=absolute", "--git-dir"]);
+  const ownerIndexPath = git(ownerWorktree, ["rev-parse", "--path-format=absolute", "--git-path", "index"]);
+
+  const objectFiles = collectObjectFiles(objectsDir);
+
+  const idxCopyDir = tamanduaTempDir("tamandua-mblc-idx-");
+  cleanup.push(idxCopyDir);
+  const tempIndex = path.join(idxCopyDir, "index");
+  fs.copyFileSync(ownerIndexPath, tempIndex);
+  const indexTree = spawnSync("git", ["write-tree"], {
+    cwd: ownerWorktree,
+    encoding: "utf-8",
+    env: { ...process.env, GIT_INDEX_FILE: tempIndex },
+  }).stdout.trim();
+  fs.rmSync(idxCopyDir, { recursive: true, force: true });
+
+  const idxStat = fs.statSync(ownerIndexPath, { bigint: true });
+
+  const trackedFileList = git(ownerWorktree, ["ls-files", "--cached"])
+    .split("\n")
+    .filter(Boolean)
+    .sort();
+  const trackedFiles: Array<[string, Buffer]> = trackedFileList.map(
+    (f) => [f, fs.readFileSync(path.join(ownerWorktree, f))] as [string, Buffer],
+  );
+
+  const untrackedFileList = git(ownerWorktree, ["ls-files", "--others", "--exclude-standard"])
+    .split("\n")
+    .filter(Boolean)
+    .sort();
+  const untrackedFiles: Array<[string, Buffer]> = untrackedFileList.map(
+    (f) => [f, fs.readFileSync(path.join(ownerWorktree, f))] as [string, Buffer],
+  );
+
+  const ignoredCollisionFiles: Array<[string, Buffer]> = ignoredCollisionPaths
+    .slice()
+    .sort()
+    .map((f) => [f, fs.readFileSync(path.join(ownerWorktree, f))] as [string, Buffer]);
+
+  const lockPath = path.join(ownerGitDir, "index.lock");
+  let indexLock: {
+    dev: bigint;
+    ino: bigint;
+    bytes: Buffer;
+    mode: number;
+    size: bigint;
+    mtimeNs: bigint;
+  } | null = null;
+  if (fs.existsSync(lockPath)) {
+    const lkStat = fs.statSync(lockPath, { bigint: true });
+    indexLock = {
+      dev: lkStat.dev,
+      ino: lkStat.ino,
+      bytes: fs.readFileSync(lockPath),
+      mode: lkStat.mode,
+      size: lkStat.size,
+      mtimeNs: lkStat.mtimeNs,
+    };
+  }
+
+  const tamanduaQuarantineFilenames = fs
+    .readdirSync(ownerGitDir)
+    .filter((n) => /tamandua|quarantine/i.test(n))
+    .sort();
+
+  const events =
+    eventsPath && fs.existsSync(eventsPath)
+      ? fs
+          .readFileSync(eventsPath, "utf-8")
+          .trim()
+          .split("\n")
+          .filter(Boolean)
+          .map((l) => JSON.parse(l))
+      : [];
+
+  return {
+    refs: git(repo, ["show-ref"]),
+    objectFiles,
+    symbolicHead: git(ownerWorktree, ["symbolic-ref", "HEAD"]),
+    headCommit: git(ownerWorktree, ["rev-parse", "HEAD"]),
+    headTree: git(ownerWorktree, ["rev-parse", "HEAD^{tree}"]),
+    targetRefTip: git(repo, ["rev-parse", `refs/heads/${targetBranch}`]),
+    indexTree,
+    indexBytes: fs.readFileSync(ownerIndexPath),
+    indexMode: idxStat.mode,
+    indexSize: idxStat.size,
+    indexMtimeNs: idxStat.mtimeNs,
+    trackedFiles,
+    untrackedFiles,
+    ignoredCollisionFiles,
+    indexLock,
+    tamanduaQuarantineFilenames,
+    events,
+  };
+}
+
 function createWrappedGitLedger(
   repo: string,
 ): { env: Record<string, string>; getLedger: () => string[] } {
@@ -377,62 +501,71 @@ describe("tamandua merge-branch CLI", () => {
     assert.ok(commandNamesBefore.every((n) => n === "rev-parse"), `unexpected commands before worktree list: ${commandNamesBefore.join(", ")}`);
   });
 
-  it("preserves index-lock bytes and operator files through checked-out refusal", () => {
-    const { repo, initial } = createRepo();
-    createFeature(repo, initial);
-    const operatorNotesPath = path.join(repo, "operator-notes.txt");
-    const operatorBytes = Buffer.from("ordinary operator bytes\n");
-    fs.writeFileSync(operatorNotesPath, operatorBytes);
+  it("proves exact CLI boundary through checked-out refusal with full repository snapshot", () => {
+    // Shared repo with linked worktree owning the target branch.
+    const { repo, targetWorktree, initial } = createLinkedTargetRepo();
+    const stagingTip = git(repo, ["rev-parse", "refs/heads/staging"]);
 
-    const rootBranchBefore = git(repo, ["symbolic-ref", "HEAD"]);
-    const targetIndexPath = git(repo, ["rev-parse", "--path-format=absolute", "--git-path", "index"]);
-    const targetIndexBytesBefore = fs.readFileSync(targetIndexPath);
-    const targetIndexTreeBefore = git(repo, ["write-tree"]);
-    const targetHeadBefore = git(repo, ["rev-parse", "HEAD"]);
-    const targetHeadTreeBefore = git(repo, ["rev-parse", "HEAD^{tree}"]);
-    const refsBefore = git(repo, ["show-ref"]);
-    const objectCountBefore = Number(git(repo, ["count-objects", "-v"]).match(/count: (\d+)/)?.[1] ?? "0");
+    // Delete the auto-created feature; build a new candidate with collision setup.
+    git(repo, ["branch", "-D", "feature"]);
+    git(repo, ["switch", "-c", "feature", initial]);
+    fs.writeFileSync(path.join(repo, ".gitignore"), "collision/\n");
+    git(repo, ["add", ".gitignore"]);
+    fs.mkdirSync(path.join(repo, "collision"));
+    fs.writeFileSync(path.join(repo, "collision", "data.txt"), "candidate collision bytes\n");
+    git(repo, ["add", "-f", "collision/data.txt"]);
+    fs.writeFileSync(path.join(repo, "ordinary.txt"), "candidate ordinary\n");
+    git(repo, ["add", "ordinary.txt"]);
+    git(repo, ["commit", "-m", "candidate with ignored collision and ordinary"]);
+    const featureTip = git(repo, ["rev-parse", "HEAD"]);
+    git(repo, ["switch", "main"]);
 
-    const lockPath = path.join(repo, ".git", "index.lock");
+    // Populate target owner (linked worktree) with operator artifacts.
+    fs.writeFileSync(path.join(targetWorktree, "untracked.txt"), "operator untracked bytes\n");
+    fs.mkdirSync(path.join(targetWorktree, "collision"));
+    fs.writeFileSync(path.join(targetWorktree, "collision", "data.txt"), "operator collision bytes\n");
+
+    const ownerGitDir = git(targetWorktree, ["rev-parse", "--path-format=absolute", "--git-dir"]);
+    const lockPath = path.join(ownerGitDir, "index.lock");
     const lockBytes = Buffer.from("pre-existing lock payload\n");
     fs.writeFileSync(lockPath, lockBytes);
-    const lockStat = fs.statSync(lockPath);
+    fs.chmodSync(lockPath, 0o600);
 
-    const result = runCli(validArgs(repo, initial, "main"));
+    // Exact snapshot BEFORE CLI invocation.
+    const before = captureExactSnapshot(repo, targetWorktree, "staging", ["collision/data.txt"]);
 
+    // Run the CLI under ledger wrapper, targeting the checked-out staging branch.
+    const wrapper = createWrappedGitLedger(repo);
+    const result = runCli(validArgs(repo, stagingTip, "staging"), wrapper.env);
+    const eventsPath = path.join(result.testHome.tamanduaDir, "events", "all.jsonl");
+    const after = captureExactSnapshot(repo, targetWorktree, "staging", ["collision/data.txt"], eventsPath);
+
+    // --- CLI behavioural assertions ---
     assert.equal(result.status, 1);
     assert.equal(result.stdout, "");
-    assert.match(result.stderr, /checked-out target landing is disabled/i);
-    assert.equal(git(repo, ["rev-parse", "refs/heads/main"]), targetHeadBefore);
-    assert.equal(git(repo, ["symbolic-ref", "HEAD"]), rootBranchBefore);
-    assert.equal(git(repo, ["rev-parse", "HEAD"]), targetHeadBefore);
-    assert.equal(git(repo, ["rev-parse", "HEAD^{tree}"]), targetHeadTreeBefore);
-    assert.deepEqual(fs.readFileSync(targetIndexPath), targetIndexBytesBefore);
-    assert.deepEqual(fs.readFileSync(operatorNotesPath), operatorBytes);
-    const lockAfter = fs.statSync(lockPath);
-    assert.ok(lockAfter.isFile());
-    assert.deepEqual(fs.readFileSync(lockPath), lockBytes);
-    assert.equal(lockAfter.mode, lockStat.mode);
-    assert.equal(lockAfter.mtimeMs, lockStat.mtimeMs);
-    assert.equal(git(repo, ["show-ref"]), refsBefore);
-    assert.equal(Number(git(repo, ["count-objects", "-v"]).match(/count: (\d+)/)?.[1] ?? "0"), objectCountBefore);
-    assert.deepEqual(readEvents(path.join(result.testHome.tamanduaDir, "events", "all.jsonl")), []);
-    assert.equal(
-      fs.existsSync(path.join(repo, ".git", "tamandua.merge.lock")),
-      false,
-      "no Tamandua/quarantine lock artifacts",
-    );
-    assert.equal(
-      fs.existsSync(path.join(repo, ".git", "tamandua.merge.quarantine")),
-      false,
-      "no Tamandua/quarantine directory artifacts",
-    );
+    assert.match(result.stderr, /^Error: /);
+    const detail = result.stderr.replace(/^Error: /, "").replace(/\n$/, "");
+    assert.ok(detail.length <= 512, `detail length ${detail.length} > 512`);
+    assert.match(detail, /checked-out target landing is disabled/);
+    assert.match(detail, /exact owned-index-lock release cannot be guaranteed/);
+    assert.match(detail, /this is not a partial landing/);
+    assert.match(detail, /this is not a retryable lock wait/);
+    assert.deepEqual(readEvents(eventsPath), []);
 
-    // Clean up the lock so cleanup doesn't fail
+    // --- Command ledger: exactly rev-parse then worktree list, nothing after ---
+    const ledger = wrapper.getLedger();
+    assert.equal(ledger.length, 2, `unexpected ledger length ${ledger.length}`);
+    assert.deepEqual(ledger[0], ["-C", repo, "rev-parse", "--verify", "refs/heads/staging"]);
+    assert.deepEqual(ledger[1], ["-C", repo, "worktree", "list", "--porcelain", "-z"]);
+
+    // --- Repository snapshot: nothing changed ---
+    assert.deepEqual(after, before);
+
+    // Clean up the lock so afterEach cleanup doesn't fail.
     fs.unlinkSync(lockPath);
   });
 
-  it("STCK reports not-applicable for a bare origin", () => {
+  it("reports not-applicable CHECKOUT_REFRESH for a bare origin", () => {
     const { repo, initial } = createRepo();
     createFeature(repo, initial);
     const cloneRoot = tamanduaTempDir("tamandua-merge-branch-cli-bare-");
