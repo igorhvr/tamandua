@@ -145,11 +145,13 @@ function captureExactSnapshot(
   cleanup.push(idxCopyDir);
   const tempIndex = path.join(idxCopyDir, "index");
   fs.copyFileSync(ownerIndexPath, tempIndex);
-  const indexTree = spawnSync("git", ["write-tree"], {
+  const writeTreeResult = spawnSync("git", ["write-tree"], {
     cwd: ownerWorktree,
     encoding: "utf-8",
     env: { ...process.env, GIT_INDEX_FILE: tempIndex },
-  }).stdout.trim();
+  });
+  assert.equal(writeTreeResult.status, 0, `git write-tree failed: ${writeTreeResult.stderr}`);
+  const indexTree = writeTreeResult.stdout.trim();
   fs.rmSync(idxCopyDir, { recursive: true, force: true });
 
   const idxStat = fs.statSync(ownerIndexPath, { bigint: true });
@@ -212,7 +214,7 @@ function captureExactSnapshot(
       : [];
 
   return {
-    refs: git(repo, ["show-ref"]),
+    refs: git(repo, ["for-each-ref", "--sort=refname", "--format=%(refname) %(objectname)"]),
     objectFiles,
     symbolicHead: git(ownerWorktree, ["symbolic-ref", "HEAD"]),
     headCommit: git(ownerWorktree, ["rev-parse", "HEAD"]),
@@ -232,9 +234,7 @@ function captureExactSnapshot(
   };
 }
 
-function createWrappedGitLedger(
-  repo: string,
-): { env: Record<string, string>; getLedger: () => string[] } {
+function createWrappedGitLedger(): { env: Record<string, string>; getLedger: () => string[][] } {
   const wrapperDir = tamanduaTempDir("tamandua-merge-branch-cli-git-wrapper-");
   cleanup.push(wrapperDir);
   const ledgerPath = path.join(wrapperDir, "commands.ledger");
@@ -482,7 +482,7 @@ describe("tamandua merge-branch CLI", () => {
     const rootBefore = captureCheckoutState(repo);
     const linkedBefore = captureCheckoutState(targetWorktree);
 
-    const wrapper = createWrappedGitLedger(repo);
+    const wrapper = createWrappedGitLedger();
     const result = runCli(validArgs(repo, featureTip, "staging"), wrapper.env);
 
     assert.equal(result.status, 1);
@@ -502,25 +502,36 @@ describe("tamandua merge-branch CLI", () => {
   });
 
   it("proves exact CLI boundary through checked-out refusal with full repository snapshot", () => {
-    // Shared repo with linked worktree owning the target branch.
-    const { repo, targetWorktree, initial } = createLinkedTargetRepo();
-    const stagingTip = git(repo, ["rev-parse", "refs/heads/staging"]);
+    // 1. Create the base repository.
+    const { repo, initial } = createRepo();
 
-    // Delete the auto-created feature; build a new candidate with collision setup.
-    git(repo, ["branch", "-D", "feature"]);
-    git(repo, ["switch", "-c", "feature", initial]);
+    // 2. Add and commit .gitignore on the target baseline.
     fs.writeFileSync(path.join(repo, ".gitignore"), "collision/\n");
     git(repo, ["add", ".gitignore"]);
+    git(repo, ["commit", "-m", "add .gitignore with collision rule"]);
+    const baselineTip = git(repo, ["rev-parse", "HEAD"]);
+
+    // 3. Create the candidate feature from the baseline tip.
+    git(repo, ["switch", "-c", "feature", baselineTip]);
     fs.mkdirSync(path.join(repo, "collision"));
     fs.writeFileSync(path.join(repo, "collision", "data.txt"), "candidate collision bytes\n");
     git(repo, ["add", "-f", "collision/data.txt"]);
     fs.writeFileSync(path.join(repo, "ordinary.txt"), "candidate ordinary\n");
     git(repo, ["add", "ordinary.txt"]);
-    git(repo, ["commit", "-m", "candidate with ignored collision and ordinary"]);
+    git(repo, ["commit", "-m", "candidate with tracked collision and ordinary"]);
     const featureTip = git(repo, ["rev-parse", "HEAD"]);
+
+    // 4. Return the root checkout to a different branch.
     git(repo, ["switch", "main"]);
 
-    // Populate target owner (linked worktree) with operator artifacts.
+    // 5. Create staging at the baseline tip and create the linked worktree.
+    git(repo, ["branch", "staging", baselineTip]);
+    const targetWorktree = tamanduaTempDir("tamandua-merge-branch-cli-linked-");
+    cleanup.push(targetWorktree);
+    git(repo, ["worktree", "add", targetWorktree, "staging"]);
+    const stagingTip = git(repo, ["rev-parse", "refs/heads/staging"]);
+
+    // 6. Populate target owner with operator artifacts.
     fs.writeFileSync(path.join(targetWorktree, "untracked.txt"), "operator untracked bytes\n");
     fs.mkdirSync(path.join(targetWorktree, "collision"));
     fs.writeFileSync(path.join(targetWorktree, "collision", "data.txt"), "operator collision bytes\n");
@@ -531,11 +542,33 @@ describe("tamandua merge-branch CLI", () => {
     fs.writeFileSync(lockPath, lockBytes);
     fs.chmodSync(lockPath, 0o600);
 
-    // Exact snapshot BEFORE CLI invocation.
+    // 7. Assert Git ignore and file listing before snapshot.
+    const checkIgnore = rawGit(targetWorktree, ["check-ignore", "collision/data.txt"]);
+    assert.equal(checkIgnore.status, 0, `check-ignore failed: ${checkIgnore.stderr}`);
+    assert.equal(checkIgnore.stdout, "collision/data.txt");
+
+    const others = git(targetWorktree, ["ls-files", "--others", "--exclude-standard"])
+      .split("\n")
+      .filter(Boolean);
+    assert.ok(others.includes("untracked.txt"), "untracked.txt should appear in ls-files --others");
+    assert.ok(!others.includes("collision/data.txt"), "collision/data.txt should be ignored and excluded");
+
+    // Candidate tree contains the tracked collision path.
+    assert.ok(
+      git(repo, ["ls-tree", featureTip, "collision/data.txt"]).length > 0,
+      "candidate tree should contain collision/data.txt",
+    );
+
+    // Target baseline tree contains .gitignore but not collision/data.txt.
+    const baselineLs = git(repo, ["ls-tree", baselineTip]);
+    assert.ok(baselineLs.includes(".gitignore"), "baseline tree should contain .gitignore");
+    assert.ok(!baselineLs.includes("collision"), "baseline tree should not contain collision");
+
+    // 8. Exact snapshot BEFORE CLI invocation.
     const before = captureExactSnapshot(repo, targetWorktree, "staging", ["collision/data.txt"]);
 
-    // Run the CLI under ledger wrapper, targeting the checked-out staging branch.
-    const wrapper = createWrappedGitLedger(repo);
+    // 9. Run the CLI under ledger wrapper, targeting the checked-out staging branch.
+    const wrapper = createWrappedGitLedger();
     const result = runCli(validArgs(repo, stagingTip, "staging"), wrapper.env);
     const eventsPath = path.join(result.testHome.tamanduaDir, "events", "all.jsonl");
     const after = captureExactSnapshot(repo, targetWorktree, "staging", ["collision/data.txt"], eventsPath);
