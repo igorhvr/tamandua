@@ -154,6 +154,7 @@ describe("tamandua workflow runs --json", () => {
     // Most recent first (ordering matches listRuns: ORDER BY created_at DESC)
     const r1 = parsed.runs[0];
     assert.equal(typeof r1.runId, "string");
+    assert.match(r1.runId, /^run-/, "runId must use run- prefix in JSON output");
     assert.equal(typeof r1.runNumber, "number");
     assert.equal(typeof r1.workflowId, "string");
     assert.equal(typeof r1.status, "string");
@@ -194,6 +195,7 @@ describe("tamandua workflow runs --json", () => {
       for (const field of requiredFields) {
         assert.ok(field in run, `run must have ${field}`);
       }
+      assert.match(run.runId, /^run-/, `every runId must use run- prefix, got ${run.runId}`);
     }
   });
 
@@ -217,15 +219,15 @@ describe("tamandua workflow runs --json", () => {
     // Status is 9-char padded, ID is 8 chars + 2 spaces, workflow 14-char padded
 
     // Line 1: most recent run (running, runNumber 2) — t2 = 1 min ago
-    assert.match(lines[1], /^  \[running  \] b2c3d4e5/);
+    assert.match(lines[1], /^  \[running  \] run-b2c3d4e5/);
     assert.ok(lines[1].includes("567 tokens"));
 
     // Line 2: next recent (failed, runNumber 3) — t1 = 2 min ago
-    assert.match(lines[2], /^  \[failed   \] c3d4e5f6/);
+    assert.match(lines[2], /^  \[failed   \] run-c3d4e5f6/);
     assert.match(lines[2], /Add dark mode toggle$/);
 
     // Line 3: oldest (done, runNumber 1) — t3 = 1 day ago
-    assert.match(lines[3], /^  \[done     \] a1b2c3d4/);
+    assert.match(lines[3], /^  \[done     \] run-a1b2c3d4/);
   });
 
   // AC 4: With --json, stdout contains exactly one JSON object and nothing else

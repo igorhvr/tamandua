@@ -1,4 +1,5 @@
 import { getDb } from "../db.js";
+import { stripIdPrefix } from "../lib/id-prefix.js";
 
 export interface RunSelectorResult {
   runIds: string[];
@@ -55,7 +56,7 @@ function resolveOne(
   runIds: Set<string>,
   warnings: string[],
 ): void {
-  // #N run number
+  // #N run number — never prefixed, so check selector directly.
   if (/^#\d+$/.test(selector)) {
     const runNumber = parseInt(selector.slice(1), 10);
     const row = db
@@ -68,7 +69,13 @@ function resolveOne(
     return;
   }
 
-  // Try exact UUID match first
+  // Strip run- prefix for the lookup. If stripping produces a different
+  // value, try the original first (handles run IDs that happen to start
+  // with "run-" but aren't prefixed UUIDs), then fall back to the
+  // stripped form.
+  const bare = stripIdPrefix(selector);
+
+  // Try exact match with original selector first
   const exactRow = db
     .prepare("SELECT id FROM runs WHERE id = ?")
     .get(selector) as { id: string } | undefined;
@@ -77,11 +84,28 @@ function resolveOne(
     return;
   }
 
-  // Try prefix match
-  // Use LIKE to be compatible with SQLite DatabaseSync (no GLOB needed here)
-  const prefixRows = db
+  // If stripped is different, try exact match with stripped
+  if (bare !== selector) {
+    const strippedRow = db
+      .prepare("SELECT id FROM runs WHERE id = ?")
+      .get(bare) as { id: string } | undefined;
+    if (strippedRow) {
+      runIds.add(strippedRow.id);
+      return;
+    }
+  }
+
+  // Try prefix match with original selector
+  let prefixRows = db
     .prepare("SELECT id FROM runs WHERE id LIKE ?")
     .all(`${selector}%`) as Array<{ id: string }>;
+
+  // If stripped is different and no match, try prefix match with stripped
+  if (prefixRows.length === 0 && bare !== selector) {
+    prefixRows = db
+      .prepare("SELECT id FROM runs WHERE id LIKE ?")
+      .all(`${bare}%`) as Array<{ id: string }>;
+  }
 
   if (prefixRows.length === 1) {
     runIds.add(prefixRows[0].id);

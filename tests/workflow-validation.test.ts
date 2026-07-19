@@ -137,7 +137,7 @@ describe("workflow structure", () => {
     assert.match(content, /tamandua step peek <agent-id> --run-id <run-id>/);
     assert.match(content, /tamandua step claim <agent-id> --run-id <run-id>/);
     assert.match(content, /tamandua step complete <stepId>/);
-    assert.match(content, /tamandua step fail <stepId>/);
+    assert.match(content, /tamandua step fail step-<uuid>/);
     assert.match(content, /SAVE `stepId` immediately/i);
     assert.match(content, /Never call `step complete` or `step fail` with an agent ID/i);
     assert.match(content, /tamandua workflow pause/);

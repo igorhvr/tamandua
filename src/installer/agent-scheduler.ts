@@ -344,13 +344,13 @@ export function buildWorkPrompt(
   // work prompt so persisted sessions are greppable to their exact step via the DB.
   if (jobId && runNumber !== undefined) {
     prompt.push(
-      `[tamandua traceability - metadata only, no action needed] run=${runId} run_number=${runNumber} agent=${agentId} job=${jobId} ts=${new Date().toISOString()}`,
+      `[tamandua traceability - metadata only, no action needed] run=run-${runId} run_number=${runNumber} agent=${agentId} job=${jobId} ts=${new Date().toISOString()}`,
       "",
     );
   }
 
   prompt.push(
-    `You are the work agent for workflow "${workflowId}", agent "${agentId}", run "${runId}".`,
+    `You are the work agent for workflow "${workflowId}", agent "${agentId}", run "run-${runId}".`,
     `You run in --print mode. A pending step is waiting for you: claim it, execute it, report.`,
   );
 
@@ -368,7 +368,7 @@ export function buildWorkPrompt(
     `─── CLAIM ───`,
     `1. Claim the step and capture the JSON response:`,
     `   "${cli}" step claim "${agentId}" --run-id "${runId}"`,
-    `   The output is JSON: {"stepId":"<UUID>", "runId":"<UUID>", "input":"<task description>"}`,
+    `   The output is JSON: {"stepId":"step-<UUID>", "runId":"run-<UUID>", "input":"<task description>"}`,
     `   SAVE the stepId — you MUST use it when reporting results.`,
     ``,
     `   If the claim output contains NO_WORK, another worker already took the step.`,
@@ -383,19 +383,19 @@ export function buildWorkPrompt(
     `─── REPORT ───`,
     `4. When finished, report using the SAVED stepId (NOT the agent ID):`,
     `   - Preferred: write your report to a file (e.g., report.txt in your workdir), then`,
-    `     "${cli}" step complete "<stepId>" --file report.txt`,
+    `     "${cli}" step complete "step-<uuid>" --file report.txt`,
     `     The report must follow EXACTLY the reply format from the task's "Reply with:" section.`,
     `     It always begins with "STATUS: done" and lists the KEY: lines this step must produce —`,
     `     downstream steps consume those keys, and omitting one forces a retry.`,
     `   - Only if the task has NO "Reply with:" section, write: STATUS: done`,
     `     CHANGES: <what you did>`,
     `     TESTS: <tests you ran>`,
-    `     then invoke: "${cli}" step complete "<stepId>" --file report.txt`,
-    `   - Alternative (stdin pipe): echo '<your report>' | "${cli}" step complete "<stepId>"`,
+    `     then invoke: "${cli}" step complete "step-<uuid>" --file report.txt`,
+    `   - Alternative (stdin pipe): echo '<your report>' | "${cli}" step complete "step-<uuid>"`,
     `   - If step complete responds with 'REJECTED', you still hold the step —`,
     `     fix the output format and resubmit in the same round (no retry slot lost).`,
-    `   - Failure: "${cli}" step fail "<stepId>" "clear reason for failure"`,
-    `     Or use --reason-file: "${cli}" step fail "<stepId>" --reason-file reason.txt`,
+    `   - Failure: "${cli}" step fail "step-<uuid>" "clear reason for failure"`,
+    `     Or use --reason-file: "${cli}" step fail "step-<uuid>" --reason-file reason.txt`,
     ``,
     `─── RULES ───`,
     `- ALWAYS report results. Never exit without calling step complete or step fail.`,

@@ -111,8 +111,9 @@ describe("SPL2 step protocol command module", () => {
     assert.match(getStepHelp(), /Worker step protocol commands/);
     assert.match(getStepHelp(), /release/);
     assert.match(getStepPeekHelp(), /Output:\n  HAS_WORK/);
-    assert.match(getStepClaimHelp(), /On success: \{"stepId":"<UUID>"/);
+    assert.match(getStepClaimHelp(), /On success: \{"stepId":"step-<UUID>"/);
     assert.match(getStepCurrentHelp(), /Read-only query for a held step/);
+    assert.match(getStepCurrentHelp(), /"stepId":"step-<UUID>"/);
     assert.match(getStepCurrentHelp(), /Exit 0 either way; exit 1 on bad args/);
     assert.match(getStepCompleteHelp(), /--file <path>/);
     assert.match(getStepCompleteHelp(), /Read the report from a file instead of stdin/);
@@ -898,5 +899,315 @@ STORIES_JSON_FILE: ${jsonFilePath}`;
 
     const step = db.prepare("SELECT output FROM steps WHERE id = ?").get(stepId) as { output: string | null };
     assert.ok(step.output?.includes("Unknown error"), `output should contain Unknown error: ${step.output}`);
+  });
+
+  // ══════════════════════════════════════════════════════════════════
+  // US-003: Accept both prefixed and bare ids in step complete/fail
+  // ══════════════════════════════════════════════════════════════════
+
+  it("US-003: step complete with prefixed step id (step-<uuid>) works", async () => {
+    const runId = crypto.randomUUID();
+    const stepId = crypto.randomUUID();
+    db.prepare("INSERT INTO runs (id) VALUES (?)").run(runId);
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, status, expects, retry_count, max_retries, type) VALUES (?, ?, ?, 'running', '', 0, 4, 'single')"
+    ).run(stepId, runId, "test-step");
+
+    const reportFile = writeOutputFile(tempDir, "STATUS: done\nCHANGES: test\nTESTS: test");
+    await handleStep("step", ["step", "complete", `step-${stepId}`, "--file", reportFile]);
+
+    const step = db.prepare("SELECT status FROM steps WHERE id = ?").get(stepId) as { status: string };
+    assert.equal(step.status, "done", `expected done, got ${step.status}`);
+  });
+
+  it("US-003: step complete with bare step id still works (backward compat)", async () => {
+    const runId = crypto.randomUUID();
+    const stepId = crypto.randomUUID();
+    db.prepare("INSERT INTO runs (id) VALUES (?)").run(runId);
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, status, expects, retry_count, max_retries, type) VALUES (?, ?, ?, 'running', '', 0, 4, 'single')"
+    ).run(stepId, runId, "test-step");
+
+    const reportFile = writeOutputFile(tempDir, "STATUS: done\nCHANGES: test\nTESTS: test");
+    await handleStep("step", ["step", "complete", stepId, "--file", reportFile]);
+
+    const step = db.prepare("SELECT status FROM steps WHERE id = ?").get(stepId) as { status: string };
+    assert.equal(step.status, "done", `expected done, got ${step.status}`);
+  });
+
+  it("US-003: step fail with prefixed step id (step-<uuid>) works", async () => {
+    const runId = crypto.randomUUID();
+    const stepId = crypto.randomUUID();
+    db.prepare("INSERT INTO runs (id) VALUES (?)").run(runId);
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, retry_count, max_retries, type, status) VALUES (?, ?, ?, 0, 4, 'single', 'running')"
+    ).run(stepId, runId, "test-step");
+
+    await handleStep("step", ["step", "fail", `step-${stepId}`, "timeout"]);
+
+    // Should be retrying or pending (retry_count was 0, max_retries is 4)
+    const step = db.prepare("SELECT status, output FROM steps WHERE id = ?").get(stepId) as { status: string; output: string | null };
+    assert.ok(step.status === "retrying" || step.status === "pending", `expected retrying/pending, got ${step.status}`);
+    assert.ok(step.output?.includes("timeout"), `output should contain reason: ${step.output}`);
+  });
+
+  it("US-003: step fail with bare step id still works (backward compat)", async () => {
+    const runId = crypto.randomUUID();
+    const stepId = crypto.randomUUID();
+    db.prepare("INSERT INTO runs (id) VALUES (?)").run(runId);
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, retry_count, max_retries, type, status) VALUES (?, ?, ?, 0, 4, 'single', 'running')"
+    ).run(stepId, runId, "test-step");
+
+    await handleStep("step", ["step", "fail", stepId, "bare works"]);
+
+    const step = db.prepare("SELECT status, output FROM steps WHERE id = ?").get(stepId) as { status: string; output: string | null };
+    assert.ok(step.status === "retrying" || step.status === "pending", `expected retrying/pending, got ${step.status}`);
+    assert.ok(step.output?.includes("bare works"), `output should contain reason: ${step.output}`);
+  });
+
+  it("US-003: step complete with wrong-prefix run-<uuid> fails with clear error", async () => {
+    const runId = crypto.randomUUID();
+
+    const { getExitCode, restore } = mockProcessExit();
+    let stderrOutput = "";
+    const origStderr = process.stderr.write;
+    (process.stderr as { write: typeof process.stderr.write }).write = (chunk: any, ...rest: any[]) => {
+      stderrOutput += String(chunk);
+      return true;
+    };
+    try {
+      await handleStep("step", ["step", "complete", `run-${runId}`]);
+    } catch (e) {
+      if (!(e instanceof ExitError)) throw e;
+    } finally {
+      restore();
+      (process.stderr as { write: typeof process.stderr.write }).write = origStderr;
+    }
+
+    assert.equal(getExitCode(), 1);
+    assert.match(stderrOutput, /run id/);
+    assert.match(stderrOutput, /stepId/);
+  });
+
+  it("US-003: step fail with wrong-prefix run-<uuid> fails with clear error", async () => {
+    const runId = crypto.randomUUID();
+
+    const { getExitCode, restore } = mockProcessExit();
+    let stderrOutput = "";
+    const origStderr = process.stderr.write;
+    (process.stderr as { write: typeof process.stderr.write }).write = (chunk: any, ...rest: any[]) => {
+      stderrOutput += String(chunk);
+      return true;
+    };
+    try {
+      await handleStep("step", ["step", "fail", `run-${runId}`]);
+    } catch (e) {
+      if (!(e instanceof ExitError)) throw e;
+    } finally {
+      restore();
+      (process.stderr as { write: typeof process.stderr.write }).write = origStderr;
+    }
+
+    assert.equal(getExitCode(), 1);
+    assert.match(stderrOutput, /run id/);
+    assert.match(stderrOutput, /stepId/);
+  });
+});
+
+describe("US-013: --run-id prefix acceptance in step peek, claim, current", () => {
+  let tempDir: string;
+  let dbPath: string;
+  let db: DatabaseSync;
+  let originalDbPath: string | undefined;
+  let originalHome: string | undefined;
+  let originalStateDir: string | undefined;
+
+  beforeEach(() => {
+    originalDbPath = process.env.TAMANDUA_DB_PATH;
+    originalHome = process.env.HOME;
+    originalStateDir = process.env.TAMANDUA_STATE_DIR;
+
+    const setup = setupTempDb();
+    tempDir = setup.tempDir;
+    dbPath = setup.dbPath;
+    db = setup.db;
+
+    process.env.TAMANDUA_DB_PATH = dbPath;
+    process.env.HOME = tempDir;
+    process.env.TAMANDUA_STATE_DIR = path.join(tempDir, ".tamandua");
+  });
+
+  afterEach(() => {
+    if (originalDbPath) process.env.TAMANDUA_DB_PATH = originalDbPath;
+    else delete process.env.TAMANDUA_DB_PATH;
+    if (originalHome) process.env.HOME = originalHome;
+    else delete process.env.HOME;
+    if (originalStateDir) process.env.TAMANDUA_STATE_DIR = originalStateDir;
+    else delete process.env.TAMANDUA_STATE_DIR;
+
+    db.close();
+    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+  });
+
+  function mockProcessExit() {
+    const origExit = process.exit;
+    let exitCode = 0;
+    (process.exit as unknown) = (code: number) => {
+      exitCode = code;
+      throw new ExitError(code);
+    };
+    return {
+      getExitCode: () => exitCode,
+      restore: () => { process.exit = origExit; },
+    };
+  }
+
+  /**
+   * Helper: capture stdout during an async operation.
+   */
+  async function captureStdout(fn: () => Promise<void>): Promise<string> {
+    let output = "";
+    const origStdout = process.stdout.write;
+    (process.stdout as { write: typeof process.stdout.write }).write = (chunk: any, ..._rest: any[]) => {
+      output += String(chunk);
+      return true;
+    };
+    try {
+      await fn();
+    } finally {
+      (process.stdout as { write: typeof process.stdout.write }).write = origStdout;
+    }
+    return output;
+  }
+
+  it("US-013: step peek agent --run-id run-<uuid> works", async () => {
+    const runId = crypto.randomUUID();
+    db.prepare("INSERT INTO runs (id, status) VALUES (?, 'running')").run(runId);
+    db.prepare(
+      "INSERT INTO steps (id, run_id, agent_id, step_index, status, type) VALUES (?, ?, 'test-agent', 0, 'pending', 'single')"
+    ).run(crypto.randomUUID(), runId);
+
+    const output = await captureStdout(async () => {
+      await handleStep("step", ["step", "peek", "test-agent", "--run-id", `run-${runId}`]);
+    });
+    assert.equal(output.trim(), "HAS_WORK");
+  });
+
+  it("US-013: step peek agent --run-id <bare-uuid> works", async () => {
+    const runId = crypto.randomUUID();
+    db.prepare("INSERT INTO runs (id, status) VALUES (?, 'running')").run(runId);
+    db.prepare(
+      "INSERT INTO steps (id, run_id, agent_id, step_index, status, type) VALUES (?, ?, 'test-agent', 0, 'pending', 'single')"
+    ).run(crypto.randomUUID(), runId);
+
+    const output = await captureStdout(async () => {
+      await handleStep("step", ["step", "peek", "test-agent", "--run-id", runId]);
+    });
+    assert.equal(output.trim(), "HAS_WORK");
+  });
+
+  it("US-013: step peek agent --run-id step-<uuid> fails with wrong-prefix error", async () => {
+    const runId = crypto.randomUUID();
+    db.prepare("INSERT INTO runs (id, status) VALUES (?, 'running')").run(runId);
+
+    const { getExitCode, restore } = mockProcessExit();
+    let stderrOutput = "";
+    const origStderr = process.stderr.write;
+    (process.stderr as { write: typeof process.stderr.write }).write = (chunk: any, ..._rest: any[]) => {
+      stderrOutput += String(chunk);
+      return true;
+    };
+    try {
+      await handleStep("step", ["step", "peek", "test-agent", "--run-id", `step-${runId}`]);
+    } catch (e) {
+      if (!(e instanceof ExitError)) throw e;
+    } finally {
+      restore();
+      (process.stderr as { write: typeof process.stderr.write }).write = origStderr;
+    }
+
+    assert.equal(getExitCode(), 1);
+    assert.match(stderrOutput, /step id/);
+  });
+
+  it("US-013: step claim agent --run-id run-<uuid> works", async () => {
+    const runId = crypto.randomUUID();
+    const stepId = crypto.randomUUID();
+    db.prepare("INSERT INTO runs (id, status) VALUES (?, 'running')").run(runId);
+    db.prepare(
+      "INSERT INTO steps (id, run_id, agent_id, step_index, status, type) VALUES (?, ?, 'test-agent', 0, 'pending', 'single')"
+    ).run(stepId, runId);
+
+    const output = await captureStdout(async () => {
+      await handleStep("step", ["step", "claim", "test-agent", "--run-id", `run-${runId}`]);
+    });
+    const parsed = JSON.parse(output.trim());
+    assert.match(parsed.stepId, /^step-/);
+    assert.match(parsed.runId, /^run-/);
+  });
+
+  it("US-013: step claim agent --run-id step-<uuid> fails with wrong-prefix error", async () => {
+    const runId = crypto.randomUUID();
+    db.prepare("INSERT INTO runs (id, status) VALUES (?, 'running')").run(runId);
+
+    const { getExitCode, restore } = mockProcessExit();
+    let stderrOutput = "";
+    const origStderr = process.stderr.write;
+    (process.stderr as { write: typeof process.stderr.write }).write = (chunk: any, ..._rest: any[]) => {
+      stderrOutput += String(chunk);
+      return true;
+    };
+    try {
+      await handleStep("step", ["step", "claim", "test-agent", "--run-id", `step-${runId}`]);
+    } catch (e) {
+      if (!(e instanceof ExitError)) throw e;
+    } finally {
+      restore();
+      (process.stderr as { write: typeof process.stderr.write }).write = origStderr;
+    }
+
+    assert.equal(getExitCode(), 1);
+    assert.match(stderrOutput, /step id/);
+  });
+
+  it("US-013: step current agent --run-id run-<uuid> works", async () => {
+    const runId = crypto.randomUUID();
+    const stepId = crypto.randomUUID();
+    db.prepare("INSERT INTO runs (id, status) VALUES (?, 'running')").run(runId);
+    db.prepare(
+      "INSERT INTO steps (id, run_id, agent_id, step_index, status, type) VALUES (?, ?, 'test-agent', 0, 'running', 'single')"
+    ).run(stepId, runId);
+
+    const output = await captureStdout(async () => {
+      await handleStep("step", ["step", "current", "test-agent", "--run-id", `run-${runId}`]);
+    });
+    const parsed = JSON.parse(output.trim());
+    assert.match(parsed.stepId, /^step-/);
+    assert.match(parsed.runId, /^run-/);
+  });
+
+  it("US-013: step current agent --run-id step-<uuid> fails with wrong-prefix error", async () => {
+    const runId = crypto.randomUUID();
+    db.prepare("INSERT INTO runs (id, status) VALUES (?, 'running')").run(runId);
+
+    const { getExitCode, restore } = mockProcessExit();
+    let stderrOutput = "";
+    const origStderr = process.stderr.write;
+    (process.stderr as { write: typeof process.stderr.write }).write = (chunk: any, ..._rest: any[]) => {
+      stderrOutput += String(chunk);
+      return true;
+    };
+    try {
+      await handleStep("step", ["step", "current", "test-agent", "--run-id", `step-${runId}`]);
+    } catch (e) {
+      if (!(e instanceof ExitError)) throw e;
+    } finally {
+      restore();
+      (process.stderr as { write: typeof process.stderr.write }).write = origStderr;
+    }
+
+    assert.equal(getExitCode(), 1);
+    assert.match(stderrOutput, /step id/);
   });
 });

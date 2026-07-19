@@ -981,7 +981,7 @@ describe("--help infrastructure", () => {
       assert.equal(result.status, 0);
       assert.match(result.stdout ?? "", /Show AutoResearch progress for a workflow run/);
       assert.match(result.stdout ?? "", /autoresearch\.jsonl/);
-      assert.match(result.stdout ?? "", /tamandua workflow autoresearch abc12345/);
+      assert.match(result.stdout ?? "", /tamandua workflow autoresearch run-abc12345/);
     } finally {
     }
   });

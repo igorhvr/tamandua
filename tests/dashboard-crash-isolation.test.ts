@@ -443,7 +443,7 @@ describe("Dashboard crash isolation", () => {
       env,
       "create do-now run",
     );
-    const runIdMatch = runOutput.match(/^Run:\s+([0-9a-f]{8,})/im);
+    const runIdMatch = runOutput.match(/^Run:\s+(?:run-)?([0-9a-f]{8,})/im);
     assert.ok(runIdMatch, `could not parse run ID from output: ${runOutput}`);
     const runIdPrefix = runIdMatch[1];
 

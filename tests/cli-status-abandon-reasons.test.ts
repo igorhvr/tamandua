@@ -210,7 +210,7 @@ describe("ABND — CLI abandon reason display", () => {
     const stdout = getStdout();
 
     // Run info should be displayed
-    assert.match(stdout, new RegExp(`Run: ${runId.substring(0, 8)}`));
+    assert.match(stdout, new RegExp(`Run: run-${runId}`));
     assert.match(stdout, /Status: failed/);
 
     // Abandon reasons should be displayed with the aggregate
@@ -350,7 +350,7 @@ describe("ABND — CLI abandon reason display", () => {
     const stdout = getStdout();
 
     // Normal run info
-    assert.match(stdout, new RegExp(`Run: ${runId.substring(0, 8)}`));
+    assert.match(stdout, new RegExp(`Run: run-${runId}`));
     assert.match(stdout, /Status: running/);
     assert.match(stdout, /Tokens: 300/);
 

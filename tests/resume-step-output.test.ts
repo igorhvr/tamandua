@@ -253,14 +253,14 @@ describe("resume per-step output (US-006)", { concurrency: 1 }, () => {
       // stepId2 is pending, retry 1
       assert.match(
         stdout,
-        new RegExp(`\\[pending\\] ${stepId2.slice(0, 8)} \\(verifier\\) retry 1`),
+        new RegExp(`\\[pending\\] step-${stepId2.slice(0, 8)} \\(verifier\\) retry 1`),
         `Expected pending step output for ${stepId2.slice(0, 8)}`,
       );
 
       // stepId3 is waiting, retry 0
       assert.match(
         stdout,
-        new RegExp(`\\[waiting\\] ${stepId3.slice(0, 8)} \\(merger\\) retry 0`),
+        new RegExp(`\\[waiting\\] step-${stepId3.slice(0, 8)} \\(merger\\) retry 0`),
         `Expected waiting step output for ${stepId3.slice(0, 8)}`,
       );
 
@@ -340,13 +340,13 @@ describe("resume per-step output (US-006)", { concurrency: 1 }, () => {
       // The stepId2 (first non-done) will be pending, stepId3 stays waiting
       assert.match(
         stdout,
-        new RegExp(`\\[pending\\] ${stepId2.slice(0, 8)} \\(developer\\) retry 0`),
+        new RegExp(`\\[pending\\] step-${stepId2.slice(0, 8)} \\(developer\\) retry 0`),
         `Expected promoted developer step output for ${stepId2.slice(0, 8)}`,
       );
 
       assert.match(
         stdout,
-        new RegExp(`\\[waiting\\] ${stepId3.slice(0, 8)} \\(verifier\\) retry 0`),
+        new RegExp(`\\[waiting\\] step-${stepId3.slice(0, 8)} \\(verifier\\) retry 0`),
         `Expected reset verifier step output for ${stepId3.slice(0, 8)}`,
       );
 
@@ -427,10 +427,10 @@ describe("resume per-step output (US-006)", { concurrency: 1 }, () => {
       );
 
       // At minimum, run1 should be resumed with step output
-      assert.match(stdout, new RegExp(`Resumed run ${runId1.slice(0, 8)}`), "Should mention run 1");
+      assert.match(stdout, new RegExp(`Resumed run run-${runId1.slice(0, 8)}`), "Should mention run 1");
       assert.match(
         stdout,
-        new RegExp(`\\[pending\\] ${stepA.slice(0, 8)} \\(developer\\) retry 0`),
+        new RegExp(`\\[pending\\] step-${stepA.slice(0, 8)} \\(developer\\) retry 0`),
         `Expected step output for run1 step ${stepA.slice(0, 8)}`,
       );
 

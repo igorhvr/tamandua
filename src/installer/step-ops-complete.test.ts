@@ -93,12 +93,12 @@ describe("completeStep basic paths", () => {
 
     db.prepare(
       "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, expects, status) VALUES (?, ?, ?, ?, ?, ?, ?)"
-    ).run("step-1-id", "run-1", "plan", "dev", 0, "", "running");
+    ).run("s1-id", "run-1", "plan", "dev", 0, "", "running");
 
-    const result = completeStep("step-1-id", "CHANGES: done");
+    const result = completeStep("s1-id", "CHANGES: done");
     assert.ok(result.status === "advanced" || result.status === "completed");
 
-    const step = db.prepare("SELECT status FROM steps WHERE id = ?").get("step-1-id") as { status: string };
+    const step = db.prepare("SELECT status FROM steps WHERE id = ?").get("s1-id") as { status: string };
     assert.equal(step.status, "done");
   });
 
@@ -109,9 +109,9 @@ describe("completeStep basic paths", () => {
 
     db.prepare(
       "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, status) VALUES (?, ?, ?, ?, ?, ?)"
-    ).run("step-fail-id", "run-fail", "plan", "dev", 0, "running");
+    ).run("sfail-id", "run-fail", "plan", "dev", 0, "running");
 
-    const result = completeStep("step-fail-id", "output");
+    const result = completeStep("sfail-id", "output");
     assert.equal(result.status, "blocked");
   });
 

@@ -277,7 +277,7 @@ function runWorkRound() {
   const claimed = JSON.parse(claimRaw);
   const stepId = claimed.stepId;
   const inputVars = parseInputVars(claimed.input ?? "");
-  inputVars.RUN_ID = claimed.runId;
+  inputVars.RUN_ID = claimed.runId.replace(/^run-/, "");
 
   // Log the work round NOW (before step complete may trigger daemon teardown).
   logInvocation({ ...work, stepId, note: "claimed" });

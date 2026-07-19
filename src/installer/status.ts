@@ -6,6 +6,7 @@ import { getRunWorktree, removeRunWorktree } from "./worktree-manager.js";
 import { emitEvent } from "./events.js";
 import { parseRunContext } from "./step-ops.js";
 import { logger } from "../lib/logger.js";
+import { stripIdPrefix } from "../lib/id-prefix.js";
 
 export interface RunInfo {
   id: string;
@@ -63,20 +64,45 @@ export interface StoryInfo {
 export function getWorkflowStatus(query: string): RunDetail {
   const db = getDb();
 
-  // Try exact id match first
+  // Strip run- prefix so callers can pass prefixed ids directly.
+  // Try the original query first (handles run IDs that happen to start
+  // with "run-"), then fall back to the stripped form.
+  const stripped = stripIdPrefix(query);
+  const useOriginal = query !== stripped;
+
+  // Try exact id match first (original)
   let row = db
     .prepare(
       "SELECT id, run_number, workflow_id, task, status, context, created_at, updated_at, tokens_spent, worker_lost_count FROM runs WHERE id = ?",
     )
     .get(query) as unknown as (RunRow & { run_number: number | null }) | undefined;
 
-  // Try id prefix match
+  // If stripped is different and no match, try stripped
+  if (!row && useOriginal) {
+    row = db
+      .prepare(
+        "SELECT id, run_number, workflow_id, task, status, context, created_at, updated_at, tokens_spent, worker_lost_count FROM runs WHERE id = ?",
+      )
+      .get(stripped) as unknown as (RunRow & { run_number: number | null }) | undefined;
+  }
+
+  // Try id prefix match (original)
   if (!row) {
-    const prefixRows = db
+    let prefixRows = db
       .prepare(
         "SELECT id, run_number, workflow_id, task, status, context, created_at, updated_at, tokens_spent, worker_lost_count FROM runs WHERE id LIKE ?",
       )
       .all(`${query}%`) as unknown as (RunRow & { run_number: number | null })[];
+
+    // If stripped is different and no match, try stripped
+    if (prefixRows.length === 0 && useOriginal) {
+      prefixRows = db
+        .prepare(
+          "SELECT id, run_number, workflow_id, task, status, context, created_at, updated_at, tokens_spent, worker_lost_count FROM runs WHERE id LIKE ?",
+        )
+        .all(`${stripped}%`) as unknown as (RunRow & { run_number: number | null })[];
+    }
+
     if (prefixRows.length === 1) {
       row = prefixRows[0];
     } else if (prefixRows.length > 1) {
@@ -102,13 +128,22 @@ export function getWorkflowStatus(query: string): RunDetail {
     }
   }
 
-  // Try task substring match
+  // Try task substring match (original first, then stripped)
   if (!row) {
-    const taskRows = db
+    let taskRows = db
       .prepare(
         "SELECT id, run_number, workflow_id, task, status, context, created_at, updated_at, tokens_spent, worker_lost_count FROM runs WHERE task LIKE ?",
       )
       .all(`%${query}%`) as unknown as (RunRow & { run_number: number | null })[];
+
+    if (taskRows.length === 0 && useOriginal) {
+      taskRows = db
+        .prepare(
+          "SELECT id, run_number, workflow_id, task, status, context, created_at, updated_at, tokens_spent, worker_lost_count FROM runs WHERE task LIKE ?",
+        )
+        .all(`%${stripped}%`) as unknown as (RunRow & { run_number: number | null })[];
+    }
+
     if (taskRows.length === 1) {
       row = taskRows[0];
     } else if (taskRows.length > 1) {
@@ -119,7 +154,8 @@ export function getWorkflowStatus(query: string): RunDetail {
   }
 
   if (!row) {
-    throw new Error(`No run found matching "${query}"`);
+    const hint = " — did you pass the right id? If this is a step id, run commands expect a run id.";
+    throw new Error(`No run found matching "${query}"${hint}`);
   }
 
   return buildRunDetail(db, row);

@@ -32,6 +32,8 @@ const { createScriptedHermes } = await import(
 
 const MOCK_RUN_ID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
 const MOCK_STEP_ID = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+const PREF_RUN_ID = `run-${MOCK_RUN_ID}`;
+const PREF_STEP_ID = `step-${MOCK_STEP_ID}`;
 
 interface TestDirs {
   tmp: string;
@@ -71,8 +73,8 @@ function createMockCli(dir: string, opts?: { noWork?: boolean }): string {
       : "  process.stdout.write('HAS_WORK'); process.exit(0);",
     "} else if (args[0] === 'step' && args[1] === 'claim') {",
     "  process.stdout.write(JSON.stringify({",
-    "    stepId: " + JSON.stringify(MOCK_STEP_ID) + ",",
-    "    runId: " + JSON.stringify(MOCK_RUN_ID) + ",",
+    "    stepId: " + JSON.stringify(PREF_STEP_ID) + ",",
+    "    runId: " + JSON.stringify(PREF_RUN_ID) + ",",
     "    input: 'MOCK_INPUT: canned input\\n',",
     "  }));",
     "  process.exit(0);",
@@ -102,13 +104,13 @@ function spawnScriptedHermes(
   const mockCliPath = env.TAMANDUA_SCRIPTED_MOCK_CLI ?? "";
   const prompt = [
     'workflow "test-wf", agent "test-wf_doer", run "' +
-      MOCK_RUN_ID +
+      PREF_RUN_ID +
       '"',
     "Task: do a thing",
     '"' +
       mockCliPath +
       '" step claim "test-wf_doer" --run-id "' +
-      MOCK_RUN_ID +
+      PREF_RUN_ID +
       '"',
   ].join("\n");
 
@@ -449,13 +451,13 @@ describe("createScriptedHermes", () => {
         const mockCliPath = path.join(dirs.tmp, "mock-tamandua");
         const promptDoer = [
           'workflow "test-wf", agent "test-wf_doer", run "' +
-            MOCK_RUN_ID +
+            PREF_RUN_ID +
             '"',
           "Task: do a thing",
           '"' +
             mockCliPath +
             '" step claim "test-wf_doer" --run-id "' +
-            MOCK_RUN_ID +
+            PREF_RUN_ID +
             '"',
         ].join("\n");
 

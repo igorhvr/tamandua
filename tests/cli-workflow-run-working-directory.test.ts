@@ -164,7 +164,7 @@ describe("CLI workflow run working-directory-for-harness", () => {
         .filter((line) => !line.includes("Stopping at filesystem boundary"))
         .join("\n");
       assert.equal(meaningfulStderr, "", `expected no meaningful stderr, got: ${stderr}`);
-      assert.match(stdout, /Run: [0-9a-f]{8}/i);
+      assert.match(stdout, /Run: run-/i);
       assert.match(stdout, new RegExp(`Harness CWD: ${path.resolve(harnessDir).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
 
       const dbPath = path.join(env.tamanduaDir, "tamandua.db");
@@ -274,7 +274,7 @@ describe("CLI workflow run working-directory-for-harness", () => {
       );
       assert.match(
         result.stdout,
-        /Run: [0-9a-f]{8}/i,
+        /Run: run-/i,
         "output should contain the run ID",
       );
       assert.ok(

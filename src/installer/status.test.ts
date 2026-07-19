@@ -173,7 +173,7 @@ describe("CLI workflow status worktree display", () => {
     });
 
     const stdout = getStdout();
-    assert.match(stdout, /Run: eeee5555/);
+    assert.match(stdout, /Run: run-eeee5555/);
     assert.match(stdout, /Workspace: worktree/);
     assert.match(stdout, /Worktree: \/tmp\/tamandua-worktrees\/my-repo-hash\/5-eeee5555/);
     assert.match(stdout, /Origin ref: feature\/cool-thing/);
@@ -199,7 +199,7 @@ describe("CLI workflow status worktree display", () => {
     });
 
     const stdout = getStdout();
-    assert.match(stdout, /Run: ffff6666/);
+    assert.match(stdout, /Run: run-ffff6666/);
     assert.doesNotMatch(stdout, /Workspace:/);
     assert.doesNotMatch(stdout, /Worktree:/);
     assert.doesNotMatch(stdout, /Origin ref:/);
@@ -309,7 +309,7 @@ describe("CLI workflow status worktree display", () => {
     const stdout = getStdout();
     const stderr = getStderr();
     // Should not crash — the run should still be displayed (status truncates runId to first 8 chars)
-    assert.match(stdout, /Run: 7777aaaa/, "should show the run ID prefix");
+    assert.match(stdout, /Run: run-7777aaaa/, "should show the run ID prefix");
     assert.match(stdout, /Status: running/, "should show the run status");
     // Verify no crash traceback in stderr
     assert.doesNotMatch(stderr, /Error|TypeError|SyntaxError/, "stderr should not contain crash error");

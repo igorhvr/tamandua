@@ -10,6 +10,7 @@ import { resolvePiStateDir } from "../../installer/paths.js";
 import { parseDuration, readOption } from "../shared.js";
 import fs from "node:fs";
 import path from "node:path";
+import { prefixRunId } from "../../lib/id-prefix.js";
 
 // ── Types ──────────────────────────────────────────────────────────
 
@@ -140,7 +141,7 @@ export function computeExitCode(states: RunState[], timedOut: boolean): number {
 export function formatJsonOutput(result: WaitResult): string {
   return JSON.stringify({
     runs: result.runs.map((r) => ({
-      runId: r.runId,
+      runId: prefixRunId(r.runId),
       runNumber: r.runNumber,
       workflowId: r.workflowId,
       status: r.status,
@@ -162,11 +163,11 @@ export function formatJsonOutput(result: WaitResult): string {
 export function formatHumanOutput(result: WaitResult): string {
   return result.runs
     .map((r) => {
-      const prefix = r.runNumber !== null ? `#${r.runNumber}` : r.runId.slice(0, 8);
+      const snapshot = r.runNumber !== null ? `#${r.runNumber}` : `run-${r.runId.slice(0, 8)}`;
       const duration = r.createdAt
         ? formatElapsed(Date.now() - new Date(r.createdAt).getTime())
         : "?";
-      return `${prefix} ${r.runId.slice(0, 8)} ${r.workflowId} ${r.status} ${duration} ${r.tokensSpent.toLocaleString()} tokens`;
+      return `${snapshot} run-${r.runId.slice(0, 8)} ${r.workflowId} ${r.status} ${duration} ${r.tokensSpent.toLocaleString()} tokens`;
     })
     .join("\n") + "\n";
 }
@@ -339,7 +340,7 @@ export async function handleWait(args: string[]): Promise<number> {
       }
       if (!quietFlag) {
         const elapsed = formatElapsed(elapsedMs);
-        const runLabel = state.runNumber !== null ? `#${state.runNumber}` : state.runId.slice(0, 8);
+        const runLabel = state.runNumber !== null ? `#${state.runNumber}` : `run-${state.runId.slice(0, 8)}`;
         process.stderr.write(
           `[wait ${elapsed}] ${runLabel} ${state.workflowId}: ${stepsSummary(state.steps)}\n`,
         );
@@ -408,7 +409,7 @@ export async function handleWait(args: string[]): Promise<number> {
           !quietFlag
         ) {
           process.stderr.write(
-            `warning: run ${s.runId.slice(0, 8)} is 'running' but the daemon is down — it may be stalled\n`,
+            `warning: run run-${s.runId.slice(0, 8)} is 'running' but the daemon is down — it may be stalled\n`,
           );
           daemonWarned.add(s.runId);
         }

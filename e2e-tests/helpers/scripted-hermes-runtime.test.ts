@@ -29,6 +29,8 @@ const runtimePath = path.resolve(
 
 const MOCK_RUN_ID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
 const MOCK_STEP_ID = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+const PREF_RUN_ID = `run-${MOCK_RUN_ID}`;
+const PREF_STEP_ID = `step-${MOCK_STEP_ID}`;
 
 interface TestDirs {
   tmp: string;
@@ -89,8 +91,8 @@ function createMockCli(dir: string, opts?: { noWork?: boolean }): string {
       : "  process.stdout.write('HAS_WORK'); process.exit(0);",
     "} else if (args[0] === 'step' && args[1] === 'claim') {",
     "  process.stdout.write(JSON.stringify({",
-    "    stepId: " + JSON.stringify(MOCK_STEP_ID) + ",",
-    "    runId: " + JSON.stringify(MOCK_RUN_ID) + ",",
+    "    stepId: " + JSON.stringify(PREF_STEP_ID) + ",",
+    "    runId: " + JSON.stringify(PREF_RUN_ID) + ",",
     "    input: 'MOCK_INPUT: canned input\\n',",
     "  }));",
     "  process.exit(0);",
@@ -117,11 +119,11 @@ function spawnHermes(
   env: Record<string, string>,
   opts?: { timeoutMs?: number },
 ): ReturnType<typeof spawnSync> {
-  const runId = MOCK_RUN_ID;
+  const prefRunId = PREF_RUN_ID;
   const prompt = [
-    'workflow "test-wf", agent "test-wf_doer", run "' + runId + '"',
+    'workflow "test-wf", agent "test-wf_doer", run "' + prefRunId + '"',
     "Task: do a thing",
-    '"' + mockCliPath + '" step claim "test-wf_doer" --run-id "' + runId + '"',
+    '"' + mockCliPath + '" step claim "test-wf_doer" --run-id "' + prefRunId + '"',
   ].join("\n");
 
   return spawnSync(

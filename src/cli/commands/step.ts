@@ -21,6 +21,7 @@ import {
   stepCurrent,
   validateExpects,
 } from "../../installer/step-ops.js";
+import { detectWrongPrefix, prefixRunId, prefixStepId, stripIdPrefix } from "../../lib/id-prefix.js";
 
 export function getStepHelp(): string {
   return `tamandua step — Worker step protocol commands
@@ -39,13 +40,13 @@ Subcommands:
   release     Reset a stuck claimed/running step back to pending
 
 Examples:
-  tamandua step peek agent-id --run-id abc12345
-  tamandua step claim agent-id --run-id abc12345
-  tamandua step current agent-id --run-id abc12345
-  tamandua step complete 123e4567
-  tamandua step fail 123e4567 "Timeout"
-  tamandua step stories abc12345
-  tamandua step release abc12345`;
+  tamandua step peek agent-id --run-id run-abc12345
+  tamandua step claim agent-id --run-id run-abc12345
+  tamandua step current agent-id --run-id run-abc12345
+  tamandua step complete step-123e4567
+  tamandua step fail step-123e4567 "Timeout"
+  tamandua step stories run-abc12345
+  tamandua step release run-abc12345`;
 }
 
 export function getStepPeekHelp(): string {
@@ -65,7 +66,7 @@ The --run-id flag is required so concurrent runs of the same workflow/agent
 cannot cross-claim each other's steps.
 
 Examples:
-  tamandua step peek feature-dev-merge_developer --run-id abc12345`;
+  tamandua step peek feature-dev-merge_developer --run-id run-abc12345`;
 }
 
 export function getStepClaimHelp(): string {
@@ -78,14 +79,14 @@ The claim is atomic — if two agents claim simultaneously, only one will
 receive the step.
 
 Output (JSON):
-  On success: {"stepId":"<UUID>", "runId":"<UUID>", "input":"<task description>"}
+  On success: {"stepId":"step-<UUID>", "runId":"run-<UUID>", "input":"<task description>"}
   No pending steps: NO_WORK
 
 The --run-id flag is required so concurrent runs of the same workflow/agent
 cannot cross-claim each other's steps.
 
 Examples:
-  tamandua step claim feature-dev-merge_developer --run-id abc12345`;
+  tamandua step claim feature-dev-merge_developer --run-id run-abc12345`;
 }
 
 export function getStepCompleteHelp(): string {
@@ -121,11 +122,11 @@ Options:
 
 Examples:
   # File-based (preferred):
-  tamandua step complete 123e4567-e89b-12d3-a456-426614174000 --file report.txt
+  tamandua step complete step-123e4567-e89b-12d3-a456-426614174000 --file report.txt
 
   # Stdin pipe (alternative):
   echo "STATUS: done\nCHANGES: Added feature X\nTESTS: Wrote unit tests" | \\
-    tamandua step complete 123e4567-e89b-12d3-a456-426614174000`;
+    tamandua step complete step-123e4567-e89b-12d3-a456-426614174000`;
 }
 
 export function getStepFailHelp(): string {
@@ -152,9 +153,9 @@ Options:
                         is ignored.
 
 Examples:
-  tamandua step fail 123e4567-e89b-12d3-a456-426614174000
-  tamandua step fail 123e4567-e89b-12d3-a456-426614174000 "Network timeout"
-  tamandua step fail 123e4567-e89b-12d3-a456-426614174000 --reason-file fail.txt`;
+  tamandua step fail step-123e4567-e89b-12d3-a456-426614174000
+  tamandua step fail step-123e4567-e89b-12d3-a456-426614174000 "Network timeout"
+  tamandua step fail step-123e4567-e89b-12d3-a456-426614174000 --reason-file fail.txt`;
 }
 
 export function getStepStoriesHelp(): string {
@@ -176,8 +177,8 @@ Output format:
   US-003   [pending] Upcoming story (retry 1)
 
 Examples:
-  tamandua step stories abc12345
-  tamandua step stories abc12345 --json`;
+  tamandua step stories run-abc12345
+  tamandua step stories run-abc12345 --json`;
 }
 
 export function getStepReleaseHelp(): string {
@@ -201,9 +202,9 @@ terminate the worker.
 On success, a step.released event is emitted and visible in logs.
 
 Examples:
-  tamandua step release abc12345
-  tamandua step release abc12345 a3bf9b72
-  tamandua step release abc12345 a3bf9b72 --force`;
+  tamandua step release run-abc12345
+  tamandua step release run-abc12345 step-a3bf9b72
+  tamandua step release run-abc12345 step-a3bf9b72 --force`;
 }
 
 export function getStepCurrentHelp(): string {
@@ -216,7 +217,7 @@ by the given agent in the run. It is a pure read-only query — no state
 mutation, no side effects.
 
 Output:
-  JSON: {"stepId":"<UUID>","runId":"<UUID>","input":"<task description>"}
+  JSON: {"stepId":"step-<UUID>","runId":"run-<UUID>","input":"<task description>"}
   NONE — when the agent has no in-flight (running) step in this run
 
 Exit 0 either way; exit 1 on bad args (missing agent-id or --run-id).
@@ -225,7 +226,7 @@ The --run-id flag is required so concurrent runs of the same workflow/agent
 cannot cross-claim each other's steps.
 
 Examples:
-  tamandua step current feature-dev-merge_developer --run-id abc12345`;
+  tamandua step current feature-dev-merge_developer --run-id run-abc12345`;
 }
 
 /** Handle step protocol commands. Returns false for unrelated command groups. */
@@ -258,6 +259,15 @@ export async function handleStep(group: string, args: string[]): Promise<boolean
       );
       process.exit(1);
     }
+
+    // US-013: strip run- prefix and detect wrong-prefix ids
+    const runWrongPrefix = detectWrongPrefix(runIdArg, "run");
+    if (runWrongPrefix) {
+      process.stderr.write(`${runWrongPrefix}\n`);
+      process.exit(1);
+    }
+    runIdArg = stripIdPrefix(runIdArg);
+
     if (action === "peek") {
       console.log(peekStep(target, runIdArg));
       return true;
@@ -282,12 +292,19 @@ export async function handleStep(group: string, args: string[]): Promise<boolean
       process.exit(1);
     }
     console.log(result.found
-      ? JSON.stringify({ stepId: result.stepId, runId: result.runId, input: result.resolvedInput })
+      ? JSON.stringify({ stepId: prefixStepId(result.stepId!), runId: prefixRunId(result.runId!), input: result.resolvedInput })
       : "NO_WORK");
     return true;
   }
   if (action === "complete") {
     if (!target) { process.stderr.write("Missing step-id.\n"); process.exit(1); }
+
+    const completeWrongPrefix = detectWrongPrefix(target, "step");
+    if (completeWrongPrefix) {
+      process.stderr.write(`${completeWrongPrefix}\n`);
+      process.exit(1);
+    }
+    const stepId = stripIdPrefix(target);
 
     // Parse --file flag from remaining args. Trailing non-flag argv after
     // the step-id is now an error (trap fix: agents used to pass report text
@@ -386,7 +403,7 @@ export async function handleStep(group: string, args: string[]): Promise<boolean
       const db = getDb();
       const step = db.prepare(
         "SELECT expects FROM steps WHERE id = ?"
-      ).get(target) as { expects: string } | undefined;
+      ).get(stepId) as { expects: string } | undefined;
       if (step && step.expects && step.expects.trim() !== "") {
         const validationError = validateExpects(output, step.expects);
         if (validationError) {
@@ -399,11 +416,18 @@ export async function handleStep(group: string, args: string[]): Promise<boolean
       }
     }
 
-    console.log(JSON.stringify(completeStep(target, output)));
+    console.log(JSON.stringify(completeStep(stepId, output)));
     return true;
   }
   if (action === "fail") {
     if (!target) { process.stderr.write("Missing step-id.\n"); process.exit(1); }
+
+    const failWrongPrefix = detectWrongPrefix(target, "step");
+    if (failWrongPrefix) {
+      process.stderr.write(`${failWrongPrefix}\n`);
+      process.exit(1);
+    }
+    const failStepId = stripIdPrefix(target);
 
     // Parse --reason-file flag from remaining args.
     // --reason-file and inline reason are mutually exclusive:
@@ -444,7 +468,7 @@ export async function handleStep(group: string, args: string[]): Promise<boolean
       reason = "Unknown error";
     }
 
-    console.log(JSON.stringify(await failStep(target, reason)));
+    console.log(JSON.stringify(await failStep(failStepId, reason)));
     return true;
   }
   if (action === "current") {
@@ -467,9 +491,18 @@ export async function handleStep(group: string, args: string[]): Promise<boolean
       );
       process.exit(1);
     }
+
+    // US-013: strip run- prefix and detect wrong-prefix ids
+    const currentWrongPrefix = detectWrongPrefix(runIdArg, "run");
+    if (currentWrongPrefix) {
+      process.stderr.write(`${currentWrongPrefix}\n`);
+      process.exit(1);
+    }
+    runIdArg = stripIdPrefix(runIdArg);
+
     const result = stepCurrent(target, runIdArg);
     if (result) {
-      console.log(JSON.stringify(result));
+      console.log(JSON.stringify({ stepId: prefixStepId(result.stepId), runId: prefixRunId(result.runId), input: result.input }));
     } else {
       console.log("NONE");
     }
@@ -481,7 +514,15 @@ export async function handleStep(group: string, args: string[]): Promise<boolean
     // Extract the optional step-id by filtering out flags and the run-id itself.
     // args structure: ["step", "release", <run-id>, <step-id>?, "--force"?]
     const positionalArgs = args.slice(3).filter((a) => !a.startsWith("--"));
-    const releaseStepId = positionalArgs.length > 0 ? positionalArgs[0] : undefined;
+    let releaseStepId = positionalArgs.length > 0 ? positionalArgs[0] : undefined;
+    if (releaseStepId) {
+      const releaseWrongPrefix = detectWrongPrefix(releaseStepId, "step");
+      if (releaseWrongPrefix) {
+        process.stderr.write(`${releaseWrongPrefix}\n`);
+        process.exit(1);
+      }
+      releaseStepId = stripIdPrefix(releaseStepId);
+    }
     const fullRunId = getWorkflowStatus(target).id;
     const result = releaseStep(fullRunId, releaseStepId, force);
     if (result.released) {

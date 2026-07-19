@@ -216,18 +216,20 @@ describe("SKILL.md step command accuracy", () => {
   it("step complete uses stepId not agentId", () => {
     // Must explain that complete takes stepId, not agentId
     assert.ok(
-      skillContent.match(/step complete.*step-id/i) ||
+      skillContent.match(/step complete.*step-(?:id|uuid)/i) ||
       skillContent.includes("step complete <stepId>") ||
-      skillContent.includes("step complete <step-id>"),
+      skillContent.includes("step complete <step-id>") ||
+      skillContent.includes("step complete step-<uuid>"),
       "SKILL.md must show step complete uses step ID, not agent ID"
     );
   });
 
   it("step fail uses stepId not agentId", () => {
     assert.ok(
-      skillContent.match(/step fail.*step-id/i) ||
+      skillContent.match(/step fail.*step-(?:id|uuid)/i) ||
       skillContent.includes("step fail <stepId>") ||
-      skillContent.includes("step fail <step-id>"),
+      skillContent.includes("step fail <step-id>") ||
+      skillContent.includes("step fail step-<uuid>"),
       "SKILL.md must show step fail uses step ID, not agent ID"
     );
   });
