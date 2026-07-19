@@ -34,10 +34,16 @@ CHECKOUT_REFRESH: refreshed
 The sole owning checkout is synchronized to `MERGED_TREE` and clean, or:
 
 ```text
+CHECKOUT_REFRESH: already-coherent
+```
+
+The operation was a no-op and the sole owning root or linked checkout was proven to already have the exact target ref, HEAD, index tree, clean filesystem, and no ordinary untracked paths. Tamandua does not mutate the checkout to produce this outcome. Or:
+
+```text
 CHECKOUT_REFRESH: not-applicable
 ```
 
-The origin is bare or the target is not checked out anywhere.
+The origin is bare or the target is not checked out anywhere. A target known to be checked out is never reported as `not-applicable`.
 
 ## Post-CAS failure and rollback
 

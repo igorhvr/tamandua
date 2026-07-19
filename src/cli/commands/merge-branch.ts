@@ -63,7 +63,7 @@ Machine-readable results:
   MERGED_COMMIT: <sha>
   MERGED_TREE: <tree-sha>
   TARGET: refs/heads/<target-ref>
-  CHECKOUT_REFRESH: <refreshed | not-applicable>
+  CHECKOUT_REFRESH: <refreshed | already-coherent | not-applicable>
 
 Landing outcomes:
   true               Feature content was already landed; target tip/tree are unchanged
@@ -71,6 +71,7 @@ Landing outcomes:
 
 Checkout refresh outcomes:
   refreshed          The exact checked-out target index and worktree were synchronized
+  already-coherent   A checked-out no-op target was proven clean and already synchronized
   not-applicable     Origin is bare or the target branch is not checked out anywhere
 
 Checkout safety:

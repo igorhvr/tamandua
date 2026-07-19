@@ -54,7 +54,7 @@ describe("SPL2 merge-branch command module", () => {
     assert.match(help, /linked worktrees/i);
     assert.match(help, /dirty or ambiguous[\s\S]*exit code 1/i);
     assert.match(help, /post-CAS[\s\S]*rollback/i);
-    assert.match(help, /CHECKOUT_REFRESH: <refreshed \| not-applicable>/);
+    assert.match(help, /CHECKOUT_REFRESH: <refreshed \| already-coherent \| not-applicable>/);
     assert.doesNotMatch(help, /skipped:/);
     assert.equal(handleMergeBranch("workflow", ["workflow", "list"]), false);
   });
@@ -65,13 +65,14 @@ describe("SPL2 merge-branch command module", () => {
     assert.match(documentation, /dirty or ambiguous[\s\S]*before[\s\S]*target ref moves/i);
     assert.match(documentation, /post-CAS[\s\S]*compare-and-swap rollback/i);
     assert.match(documentation, /CHECKOUT_REFRESH: refreshed/);
+    assert.match(documentation, /CHECKOUT_REFRESH: already-coherent/);
     assert.match(documentation, /CHECKOUT_REFRESH: not-applicable/);
     assert.doesNotMatch(documentation, /skipped:/);
   });
 
   it("limits successful merge event checkout outcomes to truthful values", () => {
     const eventTypes = readFileSync(join(process.cwd(), "src/installer/events.ts"), "utf8");
-    assert.match(eventTypes, /export type CheckoutRefreshOutcome = "refreshed" \| "not-applicable";/);
+    assert.match(eventTypes, /export type CheckoutRefreshOutcome = "refreshed" \| "already-coherent" \| "not-applicable";/);
     assert.doesNotMatch(eventTypes, /skipped:/);
   });
 });

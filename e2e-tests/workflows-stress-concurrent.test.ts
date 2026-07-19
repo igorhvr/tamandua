@@ -654,7 +654,6 @@ describe("concurrent-runs stress test", { concurrency: 1 }, () => {
         // ── Assert: every step in every run is 'done' ─────────────
         let targetMovedEvents = 0;
         const eventLandingCommits = new Set<string>();
-        const checkoutRefreshOutcomes: string[] = [];
         for (let i = 0; i < runEnvs.length; i++) {
           const runEnv = runEnvs[i];
           const rid = runIds[i];
@@ -690,7 +689,7 @@ describe("concurrent-runs stress test", { concurrency: 1 }, () => {
           const outputRefresh = mergeOutput.match(/^CHECKOUT_REFRESH: (.+)$/m)?.[1];
           assert.match(
             outputRefresh ?? "",
-            /^(?:refreshed|not-applicable)$/,
+            /^(?:refreshed|already-coherent|not-applicable)$/,
             `feature-${i + 1}: missing or invalid CHECKOUT_REFRESH`,
           );
           const mergeEvents = fs
@@ -713,7 +712,6 @@ describe("concurrent-runs stress test", { concurrency: 1 }, () => {
           assert.equal(landedEvents[0].mergedCommit, mergedCommit);
           assert.equal(landedEvents[0].mergedTree, mergedTree);
           assert.equal(landedEvents[0].checkoutRefresh, outputRefresh);
-          checkoutRefreshOutcomes.push(landedEvents[0].checkoutRefresh ?? "");
           assert.ok(targetLandingCommits.has(mergedCommit));
           eventLandingCommits.add(mergedCommit);
           for (const event of movedEvents) {
@@ -739,18 +737,15 @@ describe("concurrent-runs stress test", { concurrency: 1 }, () => {
         }
         assert.deepEqual([...eventLandingCommits].sort(), [...targetLandingCommits].sort());
 
-        // Once all mergers are quiescent, the checked-out origin should be
-        // synchronized. Under contention a guarded refresh may skip instead;
-        // in that case the landed event must make the stale checkout explicit.
+        // Once all mergers are quiescent, the checked-out origin must be
+        // synchronized. Every successful checkout outcome is coherent or
+        // explicitly applies only when no checkout owns the target.
         assert.equal(
           execSync("git symbolic-ref --short HEAD", { cwd: repoDir, encoding: "utf-8" }).trim(),
           originalBranch,
         );
         const finalStatus = execSync("git status --porcelain", { cwd: repoDir, encoding: "utf-8" });
-        assert.ok(
-          finalStatus === "" || checkoutRefreshOutcomes.some((outcome) => outcome.startsWith("skipped:")),
-          `origin checkout is stale without a refresh skip event:\n${finalStatus}`,
-        );
+        assert.equal(finalStatus, "", `origin checkout is stale:\n${finalStatus}`);
 
         // ── Diagnostics report ────────────────────────────────────
         const report = collectDiagnostics(runEnvs, runIds, wallMs);

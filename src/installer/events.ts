@@ -23,7 +23,7 @@ export const MAX_ROTATED_EVENTS_FILES = 3;
 
 // ── Types ────────────────────────────────────────────────────────────
 
-export type CheckoutRefreshOutcome = "refreshed" | "not-applicable";
+export type CheckoutRefreshOutcome = "refreshed" | "already-coherent" | "not-applicable";
 
 export interface TamanduaEvent {
   ts: string;
