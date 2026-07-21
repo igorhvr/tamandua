@@ -52,37 +52,51 @@ describe("SPL2 merge-branch command module", () => {
     assert.match(help, /^tamandua merge-branch — Atomically land a squash merge with Git plumbing/);
     assert.match(help, /STATUS: landed[\s\S]*STATUS: target_moved[\s\S]*STATUS: conflicts/);
     assert.match(help, /worktree list --porcelain/);
-    assert.match(help, /checked-out[\s\S]*refusal[\s\S]*exit code 1/i);
-    assert.match(help, /not a partial landing/i);
-    assert.match(help, /not a retryable lock wait/i);
-    assert.match(help, /CHECKOUT_REFRESH: not-applicable/);
-    assert.doesNotMatch(help, /CHECKOUT_REFRESH: <refreshed/);
-    assert.doesNotMatch(help, /post-CAS/);
-    assert.doesNotMatch(help, /rollback/);
-    assert.doesNotMatch(help, /skipped:/);
+    assert.match(help, /managed parking/i);
+    assert.match(help, /clean[\s\S]*refreshed/i);
+    assert.match(help, /dirty[\s\S]*parked/i);
+    assert.match(help, /multiple worktrees/i);
+    assert.match(help, /invalid or ambiguous worktree metadata/i);
+    assert.match(help, /operation in progress/i);
+    assert.match(help, /CHECKOUT_REFRESH: <refreshed \| already-coherent \| not-applicable \| parked:branch>/);
+    assert.match(help, /PARKED_BRANCH: <branch>/);
+    assert.match(help, /PARKED_REASON: <local-changes \| advance-refused: detail>/);
+    assert.doesNotMatch(help, /Operator remedy/i);
+    assert.doesNotMatch(help, /git (?:checkout|reset|symbolic-ref|read-tree)/i);
     assert.equal(handleMergeBranch("workflow", ["workflow", "list"]), false);
   });
 
-  it("publishes the fail-closed checkout contract in operator documentation", () => {
+  it("publishes the managed checkout contract in operator documentation", () => {
     const documentation = readFileSync(join(process.cwd(), "docs/merge-branch.md"), "utf8");
+    const readme = readFileSync(join(process.cwd(), "README.md"), "utf8");
+    const readmeAtomicLanding = readme.slice(
+      readme.indexOf("### Atomic landing"),
+      readme.indexOf("### Management"),
+    );
+
     assert.match(documentation, /git worktree list --porcelain/);
-    assert.match(documentation, /any unique root or linked checkout/i);
-    assert.match(documentation, /bounded operational refusal/i);
-    assert.match(documentation, /not a partial landing/i);
-    assert.match(documentation, /not a retryable lock wait/i);
-    assert.match(documentation, /CHECKOUT_REFRESH: not-applicable/);
-    assert.match(documentation, /success is possible only for bare/i);
-    assert.match(documentation, /the operator must make the target ref unowned/i);
-    assert.doesNotMatch(documentation, /CHECKOUT_REFRESH: refreshed/);
-    assert.doesNotMatch(documentation, /CHECKOUT_REFRESH: already-coherent/);
-    assert.doesNotMatch(documentation, /post-CAS/i);
-    assert.doesNotMatch(documentation, /rollback/i);
+    assert.match(documentation, /clean[\s\S]*CHECKOUT_REFRESH: refreshed/i);
+    assert.match(documentation, /dirty[\s\S]*CHECKOUT_REFRESH: parked:<backup-branch>/i);
+    assert.match(documentation, /no-op[\s\S]*CHECKOUT_REFRESH: already-coherent/i);
+    assert.match(documentation, /unowned[\s\S]*CHECKOUT_REFRESH: not-applicable/i);
+    assert.match(documentation, /multiple worktrees[\s\S]*invalid or ambiguous[\s\S]*operation in progress/i);
+    assert.doesNotMatch(documentation, /Operator remedy/i);
+    assert.doesNotMatch(documentation, /(?:detach|manually switch|manual(?:ly)? reset|edit (?:worktree )?metadata|direct(?:ly)? rewrite refs)/i);
     assert.doesNotMatch(documentation, /skipped:/);
+
+    assert.match(readmeAtomicLanding, /clean[\s\S]*refreshed/i);
+    assert.match(readmeAtomicLanding, /dirty[\s\S]*parked/i);
+    assert.match(readmeAtomicLanding, /no-op[\s\S]*already-coherent/i);
+    assert.match(readmeAtomicLanding, /unowned[\s\S]*not-applicable/i);
+    assert.doesNotMatch(readmeAtomicLanding, /any checked-out target is refused/i);
+    assert.doesNotMatch(readmeAtomicLanding, /(?:detach|manually switch|manual(?:ly)? reset|edit (?:worktree )?metadata|direct(?:ly)? rewrite refs)/i);
   });
 
   it("limits successful merge event checkout outcomes to truthful values", () => {
     const eventTypes = readFileSync(join(process.cwd(), "src/installer/events.ts"), "utf8");
-    assert.match(eventTypes, /export type CheckoutRefreshOutcome = "refreshed" \| "already-coherent" \| "not-applicable";/);
+    assert.match(eventTypes, /`parked:\$\{string\}`/);
+    assert.match(eventTypes, /parkedBranch\?: string;/);
+    assert.match(eventTypes, /parkedReason\?: string;/);
     assert.doesNotMatch(eventTypes, /skipped:/);
   });
 });

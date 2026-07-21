@@ -99,6 +99,20 @@ function assertNoDirectOriginMutation(content: string): void {
   assert.doesNotMatch(content, /git\s+-C\s+[^\n]*\supdate-ref\b/);
 }
 
+function assertManagedParkingGuardrail(content: string, label: string): void {
+  assert.match(
+    content,
+    /never[^\n]*checkout[^\n]*reset[^\n]*symbolic-ref[^\n]*read-tree[^\n]*origin/i,
+    `${label} must explicitly leave checkout parking to tamandua merge-branch`,
+  );
+  assert.match(
+    content,
+    /only `tamandua merge-branch` may (?:mutate|update) the target ref/i,
+    `${label} must reserve target-ref mutation for merge-branch`,
+  );
+  assert.match(content, /verbatim/i, `${label} must preserve merge-branch output verbatim`);
+}
+
 describe("US-003 PLMB feature merger prompt contracts", () => {
   it("keeps the worktree merger as a symlink consumer of the shared persona", () => {
     assert.equal(realpathSync(worktreePersonaPath), realpathSync(sharedPersonaPath));
@@ -147,6 +161,7 @@ describe("US-003 PLMB feature merger prompt contracts", () => {
     const uniquePersonas = new Map<string, MergerPersonaConsumer>();
     for (const consumer of consumers) {
       assertRetryBeforeMergeBranch(consumer.content, consumer.workflowId);
+      assertManagedParkingGuardrail(consumer.content, consumer.workflowId);
       uniquePersonas.set(consumer.realpath, consumer);
     }
 

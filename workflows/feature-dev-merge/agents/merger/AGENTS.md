@@ -215,5 +215,6 @@ REASON: <clear reason>
 - Do not rewrite history beyond the rebase described in Phase 2
 - Do not force-push
 - Do not leave the repository detached
+- NEVER run checkout, reset, symbolic-ref, or read-tree against the origin repository; managed parking is exclusively `tamandua merge-branch`'s job
 - NEVER mutate the origin worktree or index; only `tamandua merge-branch` may update the target ref
 - Map only `conflicts` and `target_moved` to tester revalidation; fail loudly for every other command error

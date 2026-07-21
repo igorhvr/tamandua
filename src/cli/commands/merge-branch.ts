@@ -63,31 +63,30 @@ Machine-readable results:
   MERGED_COMMIT: <sha>
   MERGED_TREE: <tree-sha>
   TARGET: refs/heads/<target-ref>
-  CHECKOUT_REFRESH: not-applicable
+  CHECKOUT_REFRESH: <refreshed | already-coherent | not-applicable | parked:branch>
+  PARKED_BRANCH: <branch> (parked outcomes only)
+  PARKED_REASON: <local-changes | advance-refused: detail> (parked outcomes only)
 
 Landing outcomes:
   true               Feature content was already landed; target tip/tree are unchanged
   false              A new squash commit was created and landed
 
 Checkout refresh outcomes:
+  refreshed          A clean attached target was advanced in place and remains attached
+  already-coherent   An attached no-op target was already coherent at the target tip
   not-applicable     Origin is bare or the target branch is not checked out anywhere
+  parked:<branch>    The target landed while its prior checkout stayed safely on <branch>
 
-Checked-out target safety — fail-closed owner policy:
-  Target-tip validation happens first. Tamandua then discovers ownership with exact
-  strict git worktree list --porcelain -z metadata. Any unique root or linked checkout
-  owning the target causes bounded operational refusal with exit code 1. This applies
-  even to clean targets and would-be no-op targets.
-  Refusal happens BEFORE candidate resolution, merge-base, merge/object creation,
-  target-ref mutation, index/filesystem mutation, or event emission.
-  This is not a partial landing and is not a retryable lock wait.
-  Every currently reachable successful result reports CHECKOUT_REFRESH: not-applicable.
-  Success is possible only for bare origins or otherwise unowned targets.
-  Historical refreshed and already-coherent values remain valid in the exported
-  CheckoutRefreshOutcome type and old persisted events, but are not emitted by
-  current production.
-  Operator remedy: make the target ref unowned by every worktree (or use a bare
-  origin), re-verify the expected tip, and retry. Do not use bypass flags, direct
-  ref writes, checkout/reset tricks, or manual editing of worktree metadata.
+Checked-out target safety — managed parking:
+  Tamandua discovers target ownership from strict git worktree list --porcelain -z
+  metadata. No-op landings leave the target and checkout untouched. For a mutating
+  landing with one safe owner, Tamandua first creates a backup branch and moves the
+  owner onto it, then atomically advances the target. A clean owner is refreshed and
+  reattached to the target. A dirty owner remains parked with local bytes untouched;
+  a clean owner also remains parked if the in-place advance is refused.
+  Tamandua still fails closed with exit code 1 when multiple worktrees own the target,
+  invalid or ambiguous worktree metadata is reported, or an operation in progress is
+  detected in the owner.
 
   STATUS: target_moved
 
@@ -96,7 +95,7 @@ Checked-out target safety — fail-closed owner policy:
 
 Exit codes:
   0  Newly landed or already landed (no-op)
-  1  Invalid invocation or operational Git error (including checked-out target refusal)
+  1  Invalid invocation, operational Git error, or unsafe owner-state refusal
   2  Target moved before atomic landing
   3  Merge conflicts`;
 }
@@ -125,7 +124,11 @@ export function handleMergeBranch(group: string, args: string[]): boolean {
     message: options["--message"],
   });
   if (result.status === "landed") {
-    process.stdout.write(`STATUS: landed\nNOOP: ${result.noop}\nMERGED_COMMIT: ${result.mergedCommit}\nMERGED_TREE: ${result.mergedTree}\nTARGET: ${result.target}\nCHECKOUT_REFRESH: ${result.checkoutRefresh}\n`);
+    let output = `STATUS: landed\nNOOP: ${result.noop}\nMERGED_COMMIT: ${result.mergedCommit}\nMERGED_TREE: ${result.mergedTree}\nTARGET: ${result.target}\nCHECKOUT_REFRESH: ${result.checkoutRefresh}\n`;
+    if (result.checkoutRefresh.startsWith("parked:")) {
+      output += `PARKED_BRANCH: ${result.parkedBranch}\nPARKED_REASON: ${result.parkedReason}\n`;
+    }
+    process.stdout.write(output);
   } else if (result.status === "target_moved") {
     process.stdout.write("STATUS: target_moved\n");
     process.stderr.write(`${result.detail}\n`);

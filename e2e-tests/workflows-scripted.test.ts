@@ -493,8 +493,6 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
         });
         execSync(`git switch "${originalBranch}"`, { cwd: repoDir, encoding: "utf-8" });
         const originTip = initialTip;
-        const originTree = execSync(`git rev-parse "${originTip}^{tree}"`, { cwd: repoDir, encoding: "utf-8" }).trim();
-        execSync(`git checkout --detach "${originTip}"`, { cwd: repoDir, encoding: "utf-8" });
 
         const runIdPrefix = await spawnWorkflowRun(
           [
@@ -567,7 +565,7 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
         assert.equal(landed.expectedTip, markerTip);
         assert.equal(landed.mergedCommit, mergedCommit);
         assert.equal(landed.mergedTree, mergedTree);
-        assert.equal(landed.checkoutRefresh, "not-applicable");
+        assert.equal(landed.checkoutRefresh, "refreshed");
 
         // ── Step output assertions: finalize_merge output matches ──
         const finalizeStep = dbRow<{ output: string }>(
@@ -579,7 +577,7 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
         assert.match(finalizeStep.output, new RegExp(`^MERGED_COMMIT: ${mergedCommit}$`, "m"));
         assert.match(finalizeStep.output, new RegExp(`^MERGED_TREE: ${mergedTree}$`, "m"));
         assert.match(finalizeStep.output, new RegExp(`^TARGET: refs/heads/${originalBranch}$`, "m"));
-        assert.match(finalizeStep.output, /^CHECKOUT_REFRESH: not-applicable$/m);
+        assert.match(finalizeStep.output, /^CHECKOUT_REFRESH: refreshed$/m);
 
         // Target ref has the merged content (marker + feature fix)
         assert.equal(
@@ -594,15 +592,16 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
           encoding: "utf-8",
         });
         assert.ok(targetMath.includes("a + b"), `target should contain the feature fix:\n${targetMath}`);
-        // Origin checkout is detached at the pre-run tip, unchanged and clean
-        assert.notEqual(
-          spawnSync("git", ["symbolic-ref", "HEAD"], { cwd: repoDir, encoding: "utf-8" }).status,
-          0,
-          "HEAD should be detached (symbolic-ref should fail)",
+        // The clean attached origin follows both managed landings and stays coherent.
+        assert.equal(
+          execSync("git symbolic-ref HEAD", { cwd: repoDir, encoding: "utf-8" }).trim(),
+          `refs/heads/${originalBranch}`,
         );
-        assert.equal(execSync("git rev-parse HEAD", { cwd: repoDir, encoding: "utf-8" }).trim(), originTip);
-        assert.equal(execSync("git write-tree", { cwd: repoDir, encoding: "utf-8" }).trim(), originTree);
+        assert.equal(execSync("git rev-parse HEAD", { cwd: repoDir, encoding: "utf-8" }).trim(), mergedCommit);
         assert.equal(execSync("git status --porcelain", { cwd: repoDir, encoding: "utf-8" }), "");
+        const originLog = execSync("git log --oneline -5", { cwd: repoDir, encoding: "utf-8" });
+        assert.match(originLog, /fix: deterministic target-moved retry/);
+        assert.ok(originLog.includes(mergedCommit.slice(0, 7)), `origin working-copy log should contain ${mergedCommit}:\n${originLog}`);
       } finally {
         await teardown(ctx);
       }
@@ -880,7 +879,7 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
             ],
             merger: {
               commands: [
-                `expected_tip=$(git -C "{{input.WORKTREE_ORIGIN_REPOSITORY}}" rev-parse "refs/heads/{{input.ORIGINAL_BRANCH}}") && TAMANDUA_RUN_ID="{{input.RUN_ID}}" "${process.execPath}" "${cliPath}" merge-branch --origin "{{input.WORKTREE_ORIGIN_REPOSITORY}}" --branch "${REROUTE_BRANCH}" --into "{{input.ORIGINAL_BRANCH}}" --expect-tip "$expected_tip" --message "fix: correct add implementation (squash of ${REROUTE_BRANCH})"`,
+                `origin="{{input.WORKTREE_ORIGIN_REPOSITORY}}" && printf '\n// local dirty bytes must survive managed landing\n' >> "$origin/src/math.ts" && expected_tip=$(git -C "$origin" rev-parse "refs/heads/{{input.ORIGINAL_BRANCH}}") && TAMANDUA_RUN_ID="{{input.RUN_ID}}" "${process.execPath}" "${cliPath}" merge-branch --origin "$origin" --branch "${REROUTE_BRANCH}" --into "{{input.ORIGINAL_BRANCH}}" --expect-tip "$expected_tip" --message "fix: correct add implementation (squash of ${REROUTE_BRANCH})"`,
               ],
               includeCommandOutput: true,
               output: [
@@ -894,7 +893,16 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
 
         ctx = await startScriptedEnvironment("bug-fix-merge-worktree", rerouteBehaviors);
         const repoDir = prepareGitRepo(fixtureDir, path.join(ctx.env.root, "origin-repo"));
-        const { branch: originalBranch, tip: originTip, tree: originTree } = detachOriginCheckout(repoDir);
+        const originalBranch = execSync("git symbolic-ref --short HEAD", { cwd: repoDir, encoding: "utf-8" }).trim();
+        const originTip = execSync(`git rev-parse "refs/heads/${originalBranch}"`, {
+          cwd: repoDir,
+          encoding: "utf-8",
+        }).trim();
+        const dirtyPath = path.join(repoDir, "src", "math.ts");
+        const dirtyBytes = Buffer.concat([
+          fs.readFileSync(dirtyPath),
+          Buffer.from("\n// local dirty bytes must survive managed landing\n"),
+        ]);
 
         const runIdPrefix = await spawnWorkflowRun(
           [
@@ -991,21 +999,12 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
           `expected 0 heartbeats, got ${heartbeats.length}\n${diagnostics(ctx)}`,
         );
 
-        // ── Repository outcome: the corrected fix landed; the detached origin remains unchanged ──
+        // ── Repository outcome: the corrected fix landed; the dirty origin is safely parked ──
         const targetMath = execSync(`git show "refs/heads/${originalBranch}:src/math.ts"`, {
           cwd: repoDir,
           encoding: "utf-8",
         });
         assert.ok(targetMath.includes("a + b"), `target ref math.ts should use addition:\n${targetMath}`);
-        // Origin checkout is detached at the pre-run tip, unchanged and clean
-        assert.notEqual(
-          spawnSync("git", ["symbolic-ref", "HEAD"], { cwd: repoDir, encoding: "utf-8" }).status,
-          0,
-          "HEAD should be detached (symbolic-ref should fail)",
-        );
-        assert.equal(execSync("git rev-parse HEAD", { cwd: repoDir, encoding: "utf-8" }).trim(), originTip);
-        assert.equal(execSync("git write-tree", { cwd: repoDir, encoding: "utf-8" }).trim(), originTree);
-        assert.equal(execSync("git status --porcelain", { cwd: repoDir, encoding: "utf-8" }), "");
         const mergedTree = execSync(`git rev-parse "refs/heads/${originalBranch}^{tree}"`, {
           cwd: repoDir,
           encoding: "utf-8",
@@ -1017,15 +1016,41 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
         );
         assert.match(mergeStep.output, /^STATUS: landed$/m);
         assert.match(mergeStep.output, new RegExp(`^MERGED_TREE: ${mergedTree}$`, "m"));
-        assert.match(mergeStep.output, /^CHECKOUT_REFRESH: not-applicable$/m);
+        const parkedBranch = mergeStep.output.match(/^PARKED_BRANCH: (.+)$/m)?.[1];
+        assert.ok(parkedBranch, `parked landing should report its backup branch:\n${mergeStep.output}`);
+        assert.match(parkedBranch, new RegExp(`^${originalBranch}-tamandua-parked-\\d{8}T\\d{6}Z-${runId.slice(0, 8)}$`));
+        assert.match(mergeStep.output, new RegExp(`^CHECKOUT_REFRESH: parked:${parkedBranch}$`, "m"));
+        assert.match(mergeStep.output, /^PARKED_REASON: local-changes$/m);
         const mergeEvents = fs
           .readFileSync(path.join(ctx.env.tamanduaDir, "events", `${runId}.jsonl`), "utf-8")
           .trim()
           .split("\n")
-          .map((line) => JSON.parse(line) as { event: string; checkoutRefresh?: string })
+          .map((line) => JSON.parse(line) as {
+            event: string;
+            checkoutRefresh?: string;
+            parkedBranch?: string;
+            parkedReason?: string;
+          })
           .filter((event) => event.event.startsWith("merge."));
         assert.deepEqual(mergeEvents.map((event) => event.event), ["merge.landed"]);
-        assert.equal(mergeEvents[0]?.checkoutRefresh, "not-applicable");
+        assert.equal(mergeEvents[0]?.checkoutRefresh, `parked:${parkedBranch}`);
+        assert.equal(mergeEvents[0]?.parkedBranch, parkedBranch);
+        assert.equal(mergeEvents[0]?.parkedReason, "local-changes");
+        const mergedCommit = execSync(`git rev-parse "refs/heads/${originalBranch}"`, {
+          cwd: repoDir,
+          encoding: "utf-8",
+        }).trim();
+        assert.equal(
+          execSync("git symbolic-ref HEAD", { cwd: repoDir, encoding: "utf-8" }).trim(),
+          `refs/heads/${parkedBranch}`,
+        );
+        assert.equal(
+          execSync(`git rev-parse "refs/heads/${parkedBranch}"`, { cwd: repoDir, encoding: "utf-8" }).trim(),
+          originTip,
+        );
+        assert.equal(execSync("git rev-parse HEAD", { cwd: repoDir, encoding: "utf-8" }).trim(), originTip);
+        assert.notEqual(mergedCommit, originTip, "target ref should advance to the landed squash commit");
+        assert.deepEqual(fs.readFileSync(dirtyPath), dirtyBytes, "tracked dirty bytes must remain byte-identical while parked");
 
         console.log(
           `[scripted-e2e reroute] verifier exhaustion → reroute to fixer: ` +

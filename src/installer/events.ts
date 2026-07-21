@@ -23,7 +23,11 @@ export const MAX_ROTATED_EVENTS_FILES = 3;
 
 // ── Types ────────────────────────────────────────────────────────────
 
-export type CheckoutRefreshOutcome = "refreshed" | "already-coherent" | "not-applicable";
+export type CheckoutRefreshOutcome =
+  | "refreshed"
+  | "already-coherent"
+  | "not-applicable"
+  | `parked:${string}`;
 
 export interface TamanduaEvent {
   ts: string;
@@ -65,6 +69,8 @@ export interface TamanduaEvent {
   mergedCommit?: string;
   noop?: boolean;
   checkoutRefresh?: CheckoutRefreshOutcome;
+  parkedBranch?: string;
+  parkedReason?: string;
 }
 
 export type EventCursorSource =

@@ -101,11 +101,16 @@ function captureCheckoutState(worktree: string) {
   };
 }
 
-function readEvents(eventsPath: string): Array<{ event: string; checkoutRefresh?: string }> {
+function readEvents(eventsPath: string): Array<{
+  event: string;
+  checkoutRefresh?: string;
+  parkedBranch?: string;
+  parkedReason?: string;
+}> {
   if (!fs.existsSync(eventsPath)) return [];
   const contents = fs.readFileSync(eventsPath, "utf-8").trim();
   if (!contents) return [];
-  return contents.split("\n").map((line) => JSON.parse(line) as { event: string; checkoutRefresh?: string });
+  return contents.split("\n").map((line) => JSON.parse(line));
 }
 
 function collectObjectFiles(objectsDir: string) {
@@ -292,14 +297,15 @@ describe("tamandua merge-branch CLI", () => {
     assert.match(result.stdout, /STATUS: target_moved/);
     assert.match(result.stdout, /STATUS: conflicts/);
     assert.match(result.stdout, /worktree list --porcelain/);
-    assert.match(result.stdout, /checked-out[\s\S]*refusal[\s\S]*exit code 1/i);
-    assert.match(result.stdout, /not a partial landing/i);
-    assert.match(result.stdout, /not a retryable lock wait/i);
-    assert.match(result.stdout, /CHECKOUT_REFRESH: not-applicable/);
-    assert.doesNotMatch(result.stdout, /CHECKOUT_REFRESH: <refreshed/);
-    assert.doesNotMatch(result.stdout, /post-CAS/);
-    assert.doesNotMatch(result.stdout, /rollback/);
-    assert.doesNotMatch(result.stdout, /skipped:/);
+    assert.match(result.stdout, /managed parking/i);
+    assert.match(result.stdout, /clean[\s\S]*refreshed/i);
+    assert.match(result.stdout, /dirty[\s\S]*parked/i);
+    assert.match(result.stdout, /multiple worktrees/i);
+    assert.match(result.stdout, /invalid or ambiguous worktree metadata/i);
+    assert.match(result.stdout, /operation in progress/i);
+    assert.match(result.stdout, /CHECKOUT_REFRESH: <refreshed \| already-coherent \| not-applicable \| parked:branch>/);
+    assert.doesNotMatch(result.stdout, /Operator remedy/i);
+    assert.doesNotMatch(result.stdout, /git (?:checkout|reset|symbolic-ref|read-tree)/i);
     assert.match(result.stdout, /Exit codes:[\s\S]*0\s+Newly landed or already landed \(no-op\)[\s\S]*2[\s\S]*3/);
     assert.equal(result.stderr, "");
     assert.equal(globalHelp.status, 0);
@@ -424,54 +430,71 @@ describe("tamandua merge-branch CLI", () => {
     assert.deepEqual(captureCheckoutState(repo), before);
   });
 
-  it("refuses a root checked-out non-no-op target with exit code 1 and operator diagnostics", () => {
+  it("refreshes a clean root checked-out non-no-op target", () => {
     const { repo, initial } = createRepo();
     createFeature(repo, initial);
-    const rootBranchBefore = git(repo, ["symbolic-ref", "--short", "HEAD"]);
-    const targetRefBefore = git(repo, ["rev-parse", "refs/heads/main"]);
-    const targetIndexPath = git(repo, ["rev-parse", "--path-format=absolute", "--git-path", "index"]);
-    const targetIndexBytesBefore = fs.readFileSync(targetIndexPath);
-    const rootBefore = captureCheckoutState(repo);
 
     const result = runCli(validArgs(repo, initial, "main"));
 
-    assert.equal(result.status, 1);
-    assert.equal(result.stdout, "");
-    assert.match(result.stderr, /checked-out target landing is disabled/i);
-    assert.match(result.stderr, /exact owned-index-lock release cannot be guaranteed/i);
-    assert.match(result.stderr, /this is not a partial landing/i);
-    assert.match(result.stderr, /this is not a retryable lock wait/i);
-    assert.equal(git(repo, ["rev-parse", "refs/heads/main"]), targetRefBefore);
-    assert.equal(git(repo, ["symbolic-ref", "--short", "HEAD"]), rootBranchBefore);
-    assert.deepEqual(fs.readFileSync(targetIndexPath), targetIndexBytesBefore);
-    assert.deepEqual(captureCheckoutState(repo), rootBefore);
-    assert.deepEqual(readEvents(path.join(result.testHome.tamanduaDir, "events", "all.jsonl")), []);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /^STATUS: landed$/m);
+    assert.match(result.stdout, /^CHECKOUT_REFRESH: refreshed$/m);
+    assert.doesNotMatch(result.stdout, /^PARKED_(?:BRANCH|REASON):/m);
+    assert.equal(git(repo, ["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert.notEqual(git(repo, ["rev-parse", "refs/heads/main"]), initial);
+    assert.equal(fs.existsSync(path.join(repo, "feature.txt")), true);
+    const [event] = readEvents(path.join(result.testHome.tamanduaDir, "events", "all.jsonl"));
+    assert.equal(event?.checkoutRefresh, "refreshed");
+    assert.equal("parkedBranch" in event!, false);
+    assert.equal("parkedReason" in event!, false);
   });
 
-  it("refuses a linked checked-out non-no-op target with exit code 1 and preserves root state", () => {
+  it("parks a dirty attached target and publishes ordered CLI and event metadata", () => {
     const { repo, targetWorktree, initial } = createLinkedTargetRepo();
-    const rootBranchBefore = git(repo, ["symbolic-ref", "HEAD"]);
-    const rootBefore = captureCheckoutState(repo);
-    const linkedBefore = captureCheckoutState(targetWorktree);
-    const targetIndexPath = git(targetWorktree, ["rev-parse", "--path-format=absolute", "--git-path", "index"]);
-    const targetIndexBytesBefore = fs.readFileSync(targetIndexPath);
+    fs.writeFileSync(path.join(targetWorktree, "base.txt"), "operator dirty bytes\n", "utf-8");
 
     const result = runCli(validArgs(repo, initial, "staging"));
 
-    assert.equal(result.status, 1);
-    assert.equal(result.stdout, "");
-    assert.match(result.stderr, /checked-out target landing is disabled/i);
-    assert.match(result.stderr, /exact owned-index-lock release cannot be guaranteed/i);
-    assert.match(result.stderr, /this is not a partial landing/i);
-    assert.match(result.stderr, /this is not a retryable lock wait/i);
-    assert.equal(git(repo, ["rev-parse", "refs/heads/staging"]), initial);
-    assert.deepEqual(captureCheckoutState(repo), rootBefore);
-    assert.deepEqual(captureCheckoutState(targetWorktree), linkedBefore);
-    assert.deepEqual(fs.readFileSync(targetIndexPath), targetIndexBytesBefore);
-    assert.deepEqual(readEvents(path.join(result.testHome.tamanduaDir, "events", "all.jsonl")), []);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stderr, "");
+    const lines = result.stdout.trimEnd().split("\n");
+    const checkoutRefreshIndex = lines.findIndex((line) => line.startsWith("CHECKOUT_REFRESH: parked:"));
+    assert.ok(checkoutRefreshIndex >= 0);
+    const parkedBranch = lines[checkoutRefreshIndex]!.slice("CHECKOUT_REFRESH: parked:".length);
+    assert.deepEqual(lines.slice(checkoutRefreshIndex), [
+      `CHECKOUT_REFRESH: parked:${parkedBranch}`,
+      `PARKED_BRANCH: ${parkedBranch}`,
+      "PARKED_REASON: local-changes",
+    ]);
+    assert.equal(git(targetWorktree, ["symbolic-ref", "HEAD"]), `refs/heads/${parkedBranch}`);
+    assert.equal(git(repo, ["rev-parse", `refs/heads/${parkedBranch}`]), initial);
+    assert.notEqual(git(repo, ["rev-parse", "refs/heads/staging"]), initial);
+    assert.equal(fs.readFileSync(path.join(targetWorktree, "base.txt"), "utf-8"), "operator dirty bytes\n");
+
+    const [event] = readEvents(path.join(result.testHome.tamanduaDir, "events", "all.jsonl"));
+    assert.equal(event?.checkoutRefresh, `parked:${parkedBranch}`);
+    assert.equal(event?.parkedBranch, parkedBranch);
+    assert.equal(event?.parkedReason, "local-changes");
   });
 
-  it("refuses a checked-out would-be no-op without resolving candidate or emitting events", () => {
+  it("refreshes a clean linked checked-out non-no-op target and preserves root state", () => {
+    const { repo, targetWorktree, initial } = createLinkedTargetRepo();
+    const rootBranchBefore = git(repo, ["symbolic-ref", "HEAD"]);
+    const rootBefore = captureCheckoutState(repo);
+
+    const result = runCli(validArgs(repo, initial, "staging"));
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /^CHECKOUT_REFRESH: refreshed$/m);
+    assert.notEqual(git(repo, ["rev-parse", "refs/heads/staging"]), initial);
+    assert.equal(git(targetWorktree, ["symbolic-ref", "HEAD"]), "refs/heads/staging");
+    assert.equal(fs.readFileSync(path.join(targetWorktree, "base.txt"), "utf-8"), "feature change\n");
+    assert.deepEqual(captureCheckoutState(repo), rootBefore);
+    assert.equal(git(repo, ["symbolic-ref", "HEAD"]), rootBranchBefore);
+    assert.equal(readEvents(path.join(result.testHome.tamanduaDir, "events", "all.jsonl"))[0]?.checkoutRefresh, "refreshed");
+  });
+
+  it("lands a checked-out no-op as already-coherent without checkout mutation", () => {
     const { repo, initial } = createRepo();
     createFeature(repo, initial);
     const featureTip = git(repo, ["rev-parse", "refs/heads/feature"]);
@@ -485,23 +508,30 @@ describe("tamandua merge-branch CLI", () => {
     const wrapper = createWrappedGitLedger();
     const result = runCli(validArgs(repo, featureTip, "staging"), wrapper.env);
 
-    assert.equal(result.status, 1);
-    assert.equal(result.stdout, "");
-    assert.match(result.stderr, /checked-out target landing is disabled/i);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /^STATUS: landed$/m);
+    assert.match(result.stdout, /^NOOP: true$/m);
+    assert.match(result.stdout, /^CHECKOUT_REFRESH: already-coherent$/m);
+    assert.doesNotMatch(result.stdout, /^PARKED_(?:BRANCH|REASON):/m);
+    assert.equal(result.stderr, "");
     assert.deepEqual(captureCheckoutState(repo), rootBefore);
     assert.deepEqual(captureCheckoutState(targetWorktree), linkedBefore);
-    assert.deepEqual(readEvents(path.join(result.testHome.tamanduaDir, "events", "all.jsonl")), []);
+    assert.equal(
+      readEvents(path.join(result.testHome.tamanduaDir, "events", "all.jsonl"))[0]?.checkoutRefresh,
+      "already-coherent",
+    );
 
     const ledger = wrapper.getLedger();
     const wtListIdx = ledger.findIndex((cmd) => cmd[0] === "-C" && cmd[2] === "worktree" && cmd[3] === "list");
     assert.ok(wtListIdx !== -1, "expected worktree list in command ledger");
-    const commandsAfterWtList = ledger.slice(wtListIdx + 1);
-    assert.deepEqual(commandsAfterWtList, [], "no commands after worktree list for checked-out refusal");
-    const commandNamesBefore = ledger.slice(0, wtListIdx).map((cmd) => cmd[0] === "-C" ? cmd[2] : cmd[0]);
-    assert.ok(commandNamesBefore.every((n) => n === "rev-parse"), `unexpected commands before worktree list: ${commandNamesBefore.join(", ")}`);
+    assert.equal(
+      ledger.some((cmd) => ["update-ref", "symbolic-ref", "read-tree"].includes(cmd[2] ?? cmd[0]!)),
+      false,
+      "no-op ownership discovery must not invoke checkout mutation commands",
+    );
   });
 
-  it("proves exact CLI boundary through checked-out refusal with full repository snapshot", () => {
+  it("leaves a clean owner safely parked when checkout refresh is refused", () => {
     // 1. Create the base repository.
     const { repo, initial } = createRepo();
 
@@ -571,28 +601,42 @@ describe("tamandua merge-branch CLI", () => {
     const wrapper = createWrappedGitLedger();
     const result = runCli(validArgs(repo, stagingTip, "staging"), wrapper.env);
     const eventsPath = path.join(result.testHome.tamanduaDir, "events", "all.jsonl");
-    const after = captureExactSnapshot(repo, targetWorktree, "staging", ["collision/data.txt"], eventsPath);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /^STATUS: landed$/m);
+    const parkedMatch = result.stdout.match(/^CHECKOUT_REFRESH: parked:(.+)$/m);
+    assert.ok(parkedMatch);
+    const parkedBranch = parkedMatch[1]!;
+    const lines = result.stdout.trimEnd().split("\n");
+    const checkoutRefreshIndex = lines.findIndex((line) => line === `CHECKOUT_REFRESH: parked:${parkedBranch}`);
+    assert.deepEqual(lines.slice(checkoutRefreshIndex, checkoutRefreshIndex + 2), [
+      `CHECKOUT_REFRESH: parked:${parkedBranch}`,
+      `PARKED_BRANCH: ${parkedBranch}`,
+    ]);
+    assert.match(lines[checkoutRefreshIndex + 2]!, /^PARKED_REASON: advance-refused:/);
+    assert.equal(lines.length, checkoutRefreshIndex + 3);
+    assert.equal(result.stderr, "");
+    assert.notEqual(git(repo, ["rev-parse", "refs/heads/staging"]), stagingTip);
+    assert.equal(git(targetWorktree, ["symbolic-ref", "HEAD"]), `refs/heads/${parkedBranch}`);
+    assert.equal(git(repo, ["rev-parse", `refs/heads/${parkedBranch}`]), stagingTip);
+    assert.deepEqual(fs.readFileSync(path.join(targetWorktree, "untracked.txt")), Buffer.from("operator untracked bytes\n"));
+    assert.deepEqual(fs.readFileSync(path.join(targetWorktree, "collision", "data.txt")), Buffer.from("operator collision bytes\n"));
+    assert.deepEqual(fs.readFileSync(lockPath), lockBytes);
+    const events = readEvents(eventsPath);
+    assert.equal(events.length, 1);
+    assert.equal(events[0]?.checkoutRefresh, `parked:${parkedBranch}`);
+    assert.equal(events[0]?.parkedBranch, parkedBranch);
+    assert.match(String(events[0]?.parkedReason), /^advance-refused:/);
 
-    // --- CLI behavioural assertions ---
-    assert.equal(result.status, 1);
-    assert.equal(result.stdout, "");
-    assert.match(result.stderr, /^Error: /);
-    const detail = result.stderr.replace(/^Error: /, "").replace(/\n$/, "");
-    assert.ok(detail.length <= 512, `detail length ${detail.length} > 512`);
-    assert.match(detail, /checked-out target landing is disabled/);
-    assert.match(detail, /exact owned-index-lock release cannot be guaranteed/);
-    assert.match(detail, /this is not a partial landing/);
-    assert.match(detail, /this is not a retryable lock wait/);
-    assert.deepEqual(readEvents(eventsPath), []);
-
-    // --- Command ledger: exactly rev-parse then worktree list, nothing after ---
+    // The checkout is parked before the target CAS, and refresh is attempted only afterwards.
     const ledger = wrapper.getLedger();
-    assert.equal(ledger.length, 2, `unexpected ledger length ${ledger.length}`);
     assert.deepEqual(ledger[0], ["-C", repo, "rev-parse", "--verify", "refs/heads/staging"]);
     assert.deepEqual(ledger[1], ["-C", repo, "worktree", "list", "--porcelain", "-z"]);
-
-    // --- Repository snapshot: nothing changed ---
-    assert.deepEqual(after, before);
+    const commandNames = ledger.map((cmd) => cmd[0] === "-C" ? cmd[2] : cmd[0]);
+    const parkIndex = commandNames.indexOf("symbolic-ref");
+    const landIndex = ledger.findIndex((cmd) => cmd.includes("refs/heads/staging") && cmd.includes("update-ref"));
+    const refreshIndex = commandNames.indexOf("read-tree");
+    assert.ok(parkIndex >= 0 && parkIndex < landIndex && landIndex < refreshIndex);
+    assert.equal(before.symbolicHead, "refs/heads/staging");
 
     // Clean up the lock so afterEach cleanup doesn't fail.
     fs.unlinkSync(lockPath);
@@ -626,6 +670,21 @@ describe("tamandua merge-branch CLI", () => {
     assert.equal(result.status, 2);
     assert.match(result.stdout, /^STATUS: target_moved$/m);
     assert.equal(git(repo, ["rev-parse", "refs/heads/scratch"]), initial);
+  });
+
+  it("preserves exit code 1 for an operational owner refusal", () => {
+    const { repo, initial } = createRepo();
+    createFeature(repo, initial);
+    const mergeHeadPath = git(repo, ["rev-parse", "--path-format=absolute", "--git-path", "MERGE_HEAD"]);
+    fs.writeFileSync(mergeHeadPath, git(repo, ["rev-parse", "refs/heads/feature"]) + "\n", "utf-8");
+
+    const result = runCli(validArgs(repo, initial, "main"));
+
+    assert.equal(result.status, 1);
+    assert.equal(result.stdout, "");
+    assert.match(result.stderr, /merge operation in progress/i);
+    assert.equal(git(repo, ["rev-parse", "refs/heads/main"]), initial);
+    assert.equal(git(repo, ["symbolic-ref", "HEAD"]), "refs/heads/main");
   });
 
   it("prints conflicts and Git's listing with exit code 3", () => {

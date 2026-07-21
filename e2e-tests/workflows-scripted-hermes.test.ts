@@ -22,7 +22,7 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { execSync, spawnSync } from "node:child_process";
+import { execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import type { ChildProcess } from "node:child_process";
@@ -33,7 +33,6 @@ import {
   cliMustSucceed,
   spawnWorkflowRun,
   prepareGitRepo,
-  detachOriginCheckout,
   resolveFullRunId,
   cleanupTempHome,
   releasePortReservations,
@@ -285,7 +284,11 @@ describe("scripted-hermes full pipeline (real daemon/scheduler, zero tokens)", {
       try {
         ctx = await startHermesScriptedEnvironment("bug-fix-merge-worktree", bugFixBehaviors);
         const repoDir = prepareGitRepo(fixtureDir, path.join(ctx.env.root, "origin-repo"));
-        const { branch: originalBranch, tip: originTip, tree: originTree } = detachOriginCheckout(repoDir);
+        const originalBranch = execSync("git symbolic-ref --short HEAD", { cwd: repoDir, encoding: "utf-8" }).trim();
+        const originTip = execSync(`git rev-parse "refs/heads/${originalBranch}"`, {
+          cwd: repoDir,
+          encoding: "utf-8",
+        }).trim();
 
         // Pass --hermes-as-harness AND the hermes env (so validateRunHarnessForScheduling
         // can find the fake hermes binary).
@@ -323,33 +326,27 @@ describe("scripted-hermes full pipeline (real daemon/scheduler, zero tokens)", {
           assert.equal(step.status, "done", `step ${step.step_id} should be done, got ${step.status}`);
         }
 
-        // ── Repository outcome: the target ref landed the fix; the detached origin remains unchanged ──
+        // ── Repository outcome: the target ref and clean attached origin both land the fix ──
         const targetMath = execSync(`git show "refs/heads/${originalBranch}:src/math.ts"`, {
           cwd: repoDir,
           encoding: "utf-8",
         });
         assert.ok(targetMath.includes("a + b"), `target ref math.ts should be fixed:\n${targetMath}`);
         assert.ok(!targetMath.includes("a - b"), `target ref math.ts should not keep the bug:\n${targetMath}`);
-        // Origin HEAD is detached; working tree and index are unchanged
-        assert.notEqual(
-          spawnSync("git", ["symbolic-ref", "HEAD"], { cwd: repoDir, encoding: "utf-8" }).status,
-          0,
-          "HEAD should be detached (symbolic-ref should fail)",
-        );
+        const mergedCommit = execSync(`git rev-parse "refs/heads/${originalBranch}"`, {
+          cwd: repoDir,
+          encoding: "utf-8",
+        }).trim();
+        assert.notEqual(mergedCommit, originTip, "target ref should advance to the landed squash commit");
         assert.equal(
-          execSync("git rev-parse HEAD", { cwd: repoDir, encoding: "utf-8" }).trim(),
-          originTip,
-          "origin detached HEAD should remain at the pre-run tip",
+          execSync("git symbolic-ref HEAD", { cwd: repoDir, encoding: "utf-8" }).trim(),
+          `refs/heads/${originalBranch}`,
         );
-        assert.equal(
-          execSync("git write-tree", { cwd: repoDir, encoding: "utf-8" }).trim(),
-          originTree,
-          "origin index should match the pre-run tip tree (unchanged)",
-        );
+        assert.equal(execSync("git rev-parse HEAD", { cwd: repoDir, encoding: "utf-8" }).trim(), mergedCommit);
         assert.equal(
           execSync("git status --porcelain", { cwd: repoDir, encoding: "utf-8" }),
           "",
-          "origin checkout should be clean (unchanged)",
+          "refreshed origin checkout should be clean",
         );
         const mergedTree = execSync(`git rev-parse "refs/heads/${originalBranch}^{tree}"`, {
           cwd: repoDir,
@@ -361,22 +358,34 @@ describe("scripted-hermes full pipeline (real daemon/scheduler, zero tokens)", {
           runId,
         );
         assert.match(mergeStep.output, /^STATUS: landed$/m);
+        assert.match(mergeStep.output, new RegExp(`^MERGED_COMMIT: ${mergedCommit}$`, "m"));
         assert.match(mergeStep.output, new RegExp(`^MERGED_TREE: ${mergedTree}$`, "m"));
-        assert.match(mergeStep.output, /^CHECKOUT_REFRESH: not-applicable$/m);
+        assert.match(mergeStep.output, /^CHECKOUT_REFRESH: refreshed$/m);
         const mergeEvents = fs
           .readFileSync(path.join(ctx.env.tamanduaDir, "events", `${runId}.jsonl`), "utf-8")
           .trim()
           .split("\n")
-          .map((line) => JSON.parse(line) as { event: string; checkoutRefresh?: string })
+          .map((line) => JSON.parse(line) as {
+            event: string;
+            checkoutRefresh?: string;
+            expectedTip?: string;
+            mergedCommit?: string;
+            mergedTree?: string;
+          })
           .filter((event) => event.event.startsWith("merge."));
         assert.deepEqual(mergeEvents.map((event) => event.event), ["merge.landed"]);
-        assert.equal(mergeEvents[0]?.checkoutRefresh, "not-applicable");
+        assert.equal(mergeEvents[0]?.checkoutRefresh, "refreshed");
+        assert.equal(mergeEvents[0]?.expectedTip, originTip);
+        assert.equal(mergeEvents[0]?.mergedCommit, mergedCommit);
+        assert.equal(mergeEvents[0]?.mergedTree, mergedTree);
 
-        const targetLog = execSync(`git log --oneline -5 "refs/heads/${originalBranch}"`, { cwd: repoDir, encoding: "utf-8" });
+        const targetLog = execSync("git log --oneline -5", { cwd: repoDir, encoding: "utf-8" });
         assert.ok(
           targetLog.trim().split("\n").length >= 2,
-          `expected initial + squash-merge commits on target ref, got:\n${targetLog}`,
+          `expected initial + squash-merge commits in origin working-copy log, got:\n${targetLog}`,
         );
+        assert.match(targetLog, /fix: correct add implementation/);
+        assert.ok(targetLog.includes(mergedCommit.slice(0, 7)), `origin working-copy log should contain ${mergedCommit}:\n${targetLog}`);
         // ── Regression: no progress-* files leaked into the repo working tree ─
         const progressFiles = fs.readdirSync(repoDir).filter((f) => f.startsWith("progress-"));
         assert.equal(progressFiles.length, 0, `origin repo contains leaked progress files: ${progressFiles.join(", ")}`);

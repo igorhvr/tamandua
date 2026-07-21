@@ -1,6 +1,6 @@
 # Atomic `merge-branch` landing
 
-`tamandua merge-branch` creates a squash commit with Git plumbing and moves an explicit target branch with a compare-and-swap ref update. It never checks out or switches a branch.
+`tamandua merge-branch` creates a squash commit with Git plumbing and moves an explicit target branch with a compare-and-swap ref update. When the target is attached to a worktree, the command manages that checkout itself without porcelain commands or operator intervention.
 
 ## Invocation
 
@@ -15,35 +15,24 @@ tamandua merge-branch \
 
 Every option is required exactly once. Unknown, duplicate, positional, unsupported, or valueless inputs are rejected with exit code 1 before Git mutation.
 
-## Checked-out target safety — fail-closed owner policy
+## Managed checked-out target safety
 
-1. Target-tip validation happens first: Tamandua verifies `refs/heads/<target-branch>` resolves to `--expect-tip` before any further action.
-2. Tamandua then discovers ownership with exact strict `git worktree list --porcelain -z` metadata.
-3. Any unique root or linked checkout owning the target causes bounded operational refusal with exit code 1. This applies even to clean targets and would-be no-op targets.
-4. Refusal happens **before** candidate resolution, merge-base computation, merge/object creation, target-ref mutation, index/filesystem mutation, or event emission.
-5. This is not a partial landing and is not a retryable lock wait.
+1. Tamandua verifies `refs/heads/<target-branch>` resolves to `--expect-tip`, then discovers ownership from strict `git worktree list --porcelain -z` metadata.
+2. A no-op landing does not move a ref or checkout. A single coherent attached owner reports `CHECKOUT_REFRESH: already-coherent`; all other no-op ownership states report `CHECKOUT_REFRESH: not-applicable`.
+3. For a mutating landing with one attached owner, Tamandua first creates a uniquely named backup branch at the old target tip and parks the owner on it. The target ref is advanced only after parking succeeds.
+4. A clean owner is advanced in place, reattached to the target, and reports `CHECKOUT_REFRESH: refreshed`. Untracked files alone still count as clean, but an incoming untracked-file collision safely falls back to parking.
+5. A dirty owner is left attached to the backup branch with local tracked changes untouched and reports `CHECKOUT_REFRESH: parked:<backup-branch>`, followed by `PARKED_BRANCH` and `PARKED_REASON`. A clean owner whose in-place advance is refused uses the same parked outcome.
+6. A bare origin or otherwise unowned target is landed without touching a checkout and reports `CHECKOUT_REFRESH: not-applicable`.
 
-Every currently reachable successful result reports:
+Managed parking is crash-safe: interruption can leave the repository untouched, consistently parked at the old tip, or fully refreshed. The command rolls back parking if the target compare-and-swap fails.
 
-```text
-CHECKOUT_REFRESH: not-applicable
-```
-
-Success is possible only for bare origins or otherwise unowned targets.
-
-Historical `refreshed` and `already-coherent` values remain valid in the exported `CheckoutRefreshOutcome` type and old persisted events for source and data compatibility, but current production does not emit them.
-
-## Operator remedy
-
-If the target is owned by any checkout, the operator must make the target ref unowned by every worktree (remove the owning worktree or checkout a different branch in that worktree) or use a bare origin. Then re-verify the expected tip and retry.
-
-Do not use bypass flags, direct ref writes, checkout/reset tricks, or manual editing of worktree metadata — those can corrupt the worktree index and are not supported by Tamandua.
+Tamandua still refuses a mutating landing when multiple worktrees own the target, worktree metadata is invalid or ambiguous, or the attached owner has a Git operation in progress. These are bounded operational failures; Tamandua does not partially land the target.
 
 ## Exit codes
 
 | Code | Meaning |
 |------|---------|
 | `0` | Newly landed or already landed (no-op) |
-| `1` | Invalid invocation, operational failure, or checked-out target refusal |
+| `1` | Invalid invocation or operational failure, including an unsafe owner state |
 | `2` | Target moved before atomic landing |
 | `3` | Merge conflicts |

@@ -37,29 +37,6 @@ function rawGit(repo: string, args: string[]): { stdout: string; stderr: string;
   };
 }
 
-function rawGitWithIndex(
-  repo: string,
-  args: string[],
-  indexPath: string,
-): { stdout: string; stderr: string; status: number } {
-  const result = spawnSync("git", args, {
-    cwd: repo,
-    env: {
-      HOME: repo,
-      PATH: process.env.PATH ?? "/usr/bin:/bin",
-      GIT_CONFIG_NOSYSTEM: "1",
-      GIT_INDEX_FILE: indexPath,
-    },
-    encoding: "utf-8",
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  return {
-    stdout: (result.stdout ?? "").trim(),
-    stderr: (result.stderr ?? "").trim(),
-    status: result.status ?? -1,
-  };
-}
-
 function treeFromIndexCopy(repo: string, indexPath: string): string {
   const scratch = tamanduaTempDir("tamandua-merge-branch-index-copy-");
   cleanup.push(scratch);
@@ -102,25 +79,6 @@ function createFeature(repo: string, branch = "feature"): string {
   return featureTip;
 }
 
-function createTouchedFeature(repo: string, branch = "feature"): string {
-  git(repo, ["switch", "-c", branch]);
-  fs.writeFileSync(path.join(repo, "base.txt"), "feature version\n", "utf-8");
-  git(repo, ["commit", "-am", "feature touches base"]);
-  const featureTip = git(repo, ["rev-parse", "HEAD"]);
-  git(repo, ["switch", "main"]);
-  return featureTip;
-}
-
-function createLinkedTargetRepo(): { repo: string; targetWorktree: string; initial: string } {
-  const { repo, initial } = createRepo();
-  createTouchedFeature(repo);
-  git(repo, ["branch", "staging", initial]);
-  const targetWorktree = tamanduaTempDir("tamandua-merge-branch-linked-");
-  cleanup.push(targetWorktree);
-  git(repo, ["worktree", "add", targetWorktree, "staging"]);
-  return { repo, targetWorktree, initial };
-}
-
 function captureFileBytes(worktree: string, args: string[]): Array<[string, Buffer]> {
   const files = git(worktree, args)
     .split("\n")
@@ -155,219 +113,6 @@ function captureCheckoutState(worktree: string): {
   };
 }
 
-interface ExactFileSnapshot {
-  bytes: Buffer;
-  mode: number;
-  size: bigint;
-  mtimeNs: bigint;
-}
-
-interface OwnerSafetySnapshot {
-  refs: string;
-  objectStore: Array<[string, ExactFileSnapshot]>;
-  symbolicHead: string;
-  head: string;
-  headTree: string;
-  targetTip: string;
-  indexTree: string;
-  index: ExactFileSnapshot;
-  trackedBytes: Buffer;
-  untrackedBytes: Buffer;
-  ignoredCollisionBytes: Buffer;
-  indexLock: ExactFileSnapshot & { dev: bigint; ino: bigint };
-  adjacentArtifacts: string[];
-}
-
-function captureExactFile(file: string): ExactFileSnapshot {
-  const stat = fs.statSync(file, { bigint: true });
-  return {
-    bytes: fs.readFileSync(file),
-    mode: Number(stat.mode),
-    size: stat.size,
-    mtimeNs: stat.mtimeNs,
-  };
-}
-
-function captureObjectStore(repo: string): Array<[string, ExactFileSnapshot]> {
-  const objectDirectory = git(repo, ["rev-parse", "--path-format=absolute", "--git-path", "objects"]);
-  const files: string[] = [];
-  const visit = (directory: string): void => {
-    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-      const absolute = path.join(directory, entry.name);
-      if (entry.isDirectory()) visit(absolute);
-      else if (entry.isFile()) files.push(absolute);
-    }
-  };
-  visit(objectDirectory);
-  return files
-    .sort()
-    .map((file) => [path.relative(objectDirectory, file), captureExactFile(file)]);
-}
-
-function captureOwnerSafetyState(
-  repo: string,
-  owner: string,
-  targetRef: string,
-  indexPath: string,
-  untrackedPath: string,
-  ignoredCollisionPath: string,
-): OwnerSafetySnapshot {
-  const lockPath = `${indexPath}.lock`;
-  const lockStat = fs.statSync(lockPath, { bigint: true });
-  const indexDirectory = path.dirname(indexPath);
-  return {
-    refs: git(repo, ["for-each-ref", "--sort=refname", "--format=%(refname) %(objectname)"]),
-    objectStore: captureObjectStore(repo),
-    symbolicHead: git(owner, ["symbolic-ref", "HEAD"]),
-    head: git(owner, ["rev-parse", "HEAD"]),
-    headTree: git(owner, ["rev-parse", "HEAD^{tree}"]),
-    targetTip: git(repo, ["rev-parse", targetRef]),
-    indexTree: treeFromIndexCopy(owner, indexPath),
-    index: captureExactFile(indexPath),
-    trackedBytes: fs.readFileSync(path.join(owner, "base.txt")),
-    untrackedBytes: fs.readFileSync(untrackedPath),
-    ignoredCollisionBytes: fs.readFileSync(ignoredCollisionPath),
-    indexLock: {
-      ...captureExactFile(lockPath),
-      dev: lockStat.dev,
-      ino: lockStat.ino,
-    },
-    adjacentArtifacts: fs.readdirSync(indexDirectory)
-      .filter((name) => /tamandua|quarantine/i.test(name))
-      .sort(),
-  };
-}
-
-function createCheckedOutSafetyFixture(ownerKind: "root" | "linked"): {
-  repo: string;
-  owner: string;
-  target: string;
-  targetRef: string;
-  initial: string;
-  indexPath: string;
-  untrackedPath: string;
-  ignoredCollisionPath: string;
-} {
-  const { repo } = createRepo();
-  fs.writeFileSync(path.join(repo, ".gitignore"), ".collision/\n", "utf-8");
-  git(repo, ["add", ".gitignore"]);
-  git(repo, ["commit", "-m", "ignore collision fixture"]);
-  const initial = git(repo, ["rev-parse", "HEAD"]);
-
-  git(repo, ["switch", "-c", "feature"]);
-  fs.writeFileSync(path.join(repo, "base.txt"), "candidate tracked bytes\n", "utf-8");
-  const candidateCollision = path.join(repo, ".collision", "payload.bin");
-  fs.mkdirSync(path.dirname(candidateCollision), { recursive: true });
-  fs.writeFileSync(candidateCollision, Buffer.from([0, 1, 2, 3, 255]));
-  git(repo, ["add", "base.txt"]);
-  git(repo, ["add", "-f", ".collision/payload.bin"]);
-  git(repo, ["commit", "-m", "candidate collides with ignored owner bytes"]);
-  git(repo, ["switch", "main"]);
-
-  let owner = repo;
-  let target = "main";
-  if (ownerKind === "linked") {
-    target = "staging";
-    git(repo, ["branch", target, initial]);
-    owner = tamanduaTempDir("tamandua-merge-branch-safety-linked-");
-    cleanup.push(owner);
-    git(repo, ["worktree", "add", owner, target]);
-  }
-
-  const untrackedPath = path.join(owner, "operator-notes.txt");
-  const ignoredCollisionPath = path.join(owner, ".collision", "payload.bin");
-  fs.writeFileSync(untrackedPath, Buffer.from("ordinary untracked operator bytes\n"));
-  fs.mkdirSync(path.dirname(ignoredCollisionPath), { recursive: true });
-  fs.writeFileSync(ignoredCollisionPath, Buffer.from("ignored owner collision bytes\n"));
-
-  const indexPath = git(owner, ["rev-parse", "--path-format=absolute", "--git-path", "index"]);
-  fs.writeFileSync(`${indexPath}.lock`, Buffer.from("pre-existing real owner index lock\n"), {
-    flag: "wx",
-    mode: 0o640,
-  });
-  return {
-    repo,
-    owner,
-    target,
-    targetRef: `refs/heads/${target}`,
-    initial,
-    indexPath,
-    untrackedPath,
-    ignoredCollisionPath,
-  };
-}
-
-function assertCheckedOutRefusal(ownerKind: "root" | "linked"): void {
-  const fixture = createCheckedOutSafetyFixture(ownerKind);
-  const before = captureOwnerSafetyState(
-    fixture.repo,
-    fixture.owner,
-    fixture.targetRef,
-    fixture.indexPath,
-    fixture.untrackedPath,
-    fixture.ignoredCollisionPath,
-  );
-  assert.deepEqual(before.adjacentArtifacts, []);
-
-  const commands: string[][] = [];
-  const events: MergeBranchEvent[] = [];
-  let indexedCalls = 0;
-  const result = runPlumbingMerge(
-    {
-      origin: fixture.repo,
-      branch: "feature",
-      into: fixture.target,
-      expectTip: fixture.initial,
-      message: `must refuse ${ownerKind} owner`,
-      runId: `run-refuse-${ownerKind}`,
-    },
-    {
-      runGit: (origin, args) => {
-        commands.push([...args]);
-        return rawGit(origin, args);
-      },
-      runGitWithIndex: () => {
-        indexedCalls += 1;
-        return { status: 99, stdout: "", stderr: "deprecated dependency must be unreachable" };
-      },
-      emitEvent: (event) => events.push(event),
-    },
-  );
-
-  assert.equal(result.status, "operational_error");
-  assert.equal(result.exitCode, 1);
-  if (result.status !== "operational_error") return;
-  assert.ok(result.detail.length <= 512, "the refusal diagnostic must remain bounded");
-  assert.match(result.detail, /checked-out target landing is disabled/);
-  assert.match(result.detail, /exact owned-index-lock release cannot be guaranteed/);
-  assert.match(result.detail, /this is not a partial landing/);
-  assert.match(result.detail, /this is not a retryable lock wait/);
-  assert.match(result.detail, new RegExp(fixture.targetRef.replaceAll("/", "\\/")));
-  assert.ok(result.detail.includes(fixture.owner));
-  assert.equal(indexedCalls, 0);
-  assert.deepEqual(events, []);
-
-  const ownerDiscovery = ["worktree", "list", "--porcelain", "-z"];
-  const ownerDiscoveryIndex = commands.findIndex((args) => args.join("\0") === ownerDiscovery.join("\0"));
-  assert.equal(ownerDiscoveryIndex, 1, "owner discovery must immediately follow target-tip verification");
-  assert.deepEqual(commands.slice(ownerDiscoveryIndex + 1), [], "no Git command may follow owner discovery");
-  assert.deepEqual(commands, [
-    ["rev-parse", "--verify", fixture.targetRef],
-    ownerDiscovery,
-  ]);
-
-  const after = captureOwnerSafetyState(
-    fixture.repo,
-    fixture.owner,
-    fixture.targetRef,
-    fixture.indexPath,
-    fixture.untrackedPath,
-    fixture.ignoredCollisionPath,
-  );
-  assert.deepEqual(after, before);
-  assert.equal(fs.existsSync(`${fixture.indexPath}.lock`), true);
-}
-
 afterEach(() => {
   for (const dir of cleanup.splice(0)) {
     fs.rmSync(dir, { recursive: true, force: true });
@@ -375,63 +120,671 @@ afterEach(() => {
 });
 
 describe("runPlumbingMerge", () => {
-  it("keeps historical CheckoutRefreshOutcome values source-compatible while current successes are not-applicable", () => {
-    const historicalValues: CheckoutRefreshOutcome[] = ["refreshed", "already-coherent", "not-applicable"];
-    assert.deepEqual(historicalValues, ["refreshed", "already-coherent", "not-applicable"]);
-
-    const source = fs.readFileSync(path.resolve("src/installer/merge-branch.ts"), "utf-8");
-    assert.doesNotMatch(
-      source,
-      /checkoutRefresh\s*(?::[^=;]+)?=\s*["'](?:refreshed|already-coherent)["']/,
-      "current production must not construct a positive checkout-refresh success",
-    );
-    assert.match(source, /checkoutRefresh(?:\s*:\s*CheckoutRefreshOutcome)?\s*=\s*["']not-applicable["']/);
-    assert.match(source, /checkoutRefresh:\s*["']not-applicable["']/);
+  it("accepts all checkout refresh outcomes and parked merge metadata", () => {
+    const outcomes: CheckoutRefreshOutcome[] = [
+      "refreshed",
+      "already-coherent",
+      "not-applicable",
+      "parked:main-tamandua-parked-20260720T152300Z-db40fbc2",
+    ];
+    const event: MergeBranchEvent = {
+      ts: new Date(0).toISOString(),
+      event: "merge.landed",
+      runId: "run-types",
+      origin: "/origin",
+      branch: "feature",
+      target: "refs/heads/main",
+      expectedTip: "1".repeat(40),
+      parkedBranch: "main-tamandua-parked-20260720T152300Z-db40fbc2",
+      parkedReason: "local-changes",
+    };
+    assert.equal(outcomes[3]?.startsWith("parked:"), true);
+    assert.equal(event.parkedReason, "local-changes");
   });
 
-  it("refuses an ordinary non-no-op landing into a root checked-out target without any mutation", () => {
-    assertCheckedOutRefusal("root");
-  });
-
-  it("refuses an ordinary non-no-op landing into a linked checked-out target without any mutation", () => {
-    assertCheckedOutRefusal("linked");
-  });
-
-  it("refuses a checked-out would-be no-op before candidate resolution or merge-base", () => {
+  it("returns an already-coherent ancestor no-op for a single attached owner without checkout mutation", () => {
     const { repo } = createRepo();
     const featureTip = createFeature(repo);
     git(repo, ["merge", "--ff-only", "feature"]);
     const targetTip = git(repo, ["rev-parse", "refs/heads/main"]);
     const events: MergeBranchEvent[] = [];
     const commands: string[][] = [];
-    let indexedCalls = 0;
+    const checkoutBefore = captureCheckoutState(repo);
 
     const result = runPlumbingMerge(
-      { origin: repo, branch: "feature", into: "main", expectTip: targetTip, message: "would-be no-op" },
+      { origin: repo, branch: "feature", into: "main", expectTip: targetTip, message: "owned no-op" },
       {
         runGit: (origin, args) => {
           commands.push([...args]);
           return rawGit(origin, args);
-        },
-        runGitWithIndex: () => {
-          indexedCalls += 1;
-          return { status: 99, stdout: "", stderr: "must not run" };
         },
         emitEvent: (event) => events.push(event),
       },
     );
 
     assert.equal(featureTip, targetTip);
+    assert.equal(result.status, "landed");
+    if (result.status !== "landed") return;
+    assert.equal(result.noop, true);
+    assert.equal(result.checkoutRefresh, "already-coherent");
+    assert.deepEqual(captureCheckoutState(repo), checkoutBefore);
+    assert.equal(commands.some((args) => ["update-ref", "symbolic-ref", "read-tree"].includes(args[0]!)), false);
+    assert.equal(events[0]?.checkoutRefresh, "already-coherent");
+  });
+
+  it("reports not-applicable when a no-op owner's live HEAD no longer matches metadata", () => {
+    const { repo } = createRepo();
+    const featureTip = createFeature(repo);
+    git(repo, ["merge", "--ff-only", "feature"]);
+    const commands: string[][] = [];
+
+    const result = runPlumbingMerge(
+      { origin: repo, branch: "feature", into: "main", expectTip: featureTip, message: "raced no-op" },
+      {
+        runGit: (origin, args) => {
+          commands.push([...args]);
+          if (origin === repo && args.join(" ") === "rev-parse --verify HEAD^{commit}") {
+            return { status: 0, stdout: "f".repeat(40), stderr: "" };
+          }
+          return rawGit(origin, args);
+        },
+        emitEvent: () => undefined,
+      },
+    );
+
+    assert.equal(result.status, "landed");
+    if (result.status !== "landed") return;
+    assert.equal(result.noop, true);
+    assert.equal(result.checkoutRefresh, "not-applicable");
+    assert.equal(commands.some((args) => ["update-ref", "symbolic-ref", "read-tree"].includes(args[0]!)), false);
+  });
+
+  it("reports not-applicable when no-op ownership metadata has a stale HEAD", () => {
+    const { repo } = createRepo();
+    const featureTip = createFeature(repo);
+    git(repo, ["merge", "--ff-only", "feature"]);
+
+    const result = runPlumbingMerge(
+      { origin: repo, branch: "feature", into: "main", expectTip: featureTip, message: "stale metadata no-op" },
+      {
+        runGit: (origin, args) => {
+          const actual = rawGit(origin, args);
+          if (args[0] === "worktree" && args[1] === "list") {
+            return { ...actual, stdout: actual.stdout.replace(featureTip, "e".repeat(40)) };
+          }
+          return actual;
+        },
+        emitEvent: () => undefined,
+      },
+    );
+
+    assert.equal(result.status, "landed");
+    if (result.status !== "landed") return;
+    assert.equal(result.noop, true);
+    assert.equal(result.checkoutRefresh, "not-applicable");
+  });
+
+  it("allows a no-op with unusable ownership metadata and reports not-applicable", () => {
+    const { repo } = createRepo();
+    const featureTip = createFeature(repo);
+    git(repo, ["merge", "--ff-only", "feature"]);
+    const commands: string[][] = [];
+
+    const result = runPlumbingMerge(
+      { origin: repo, branch: "feature", into: "main", expectTip: featureTip, message: "metadata-safe no-op" },
+      {
+        runGit: (origin, args) => {
+          commands.push([...args]);
+          if (args[0] === "worktree" && args[1] === "list") {
+            return { status: 0, stdout: `worktree ${repo}\0branch refs/heads/main\0\0`, stderr: "" };
+          }
+          return rawGit(origin, args);
+        },
+        emitEvent: () => undefined,
+      },
+    );
+
+    assert.equal(result.status, "landed");
+    if (result.status !== "landed") return;
+    assert.equal(result.checkoutRefresh, "not-applicable");
+    assert.equal(commands.some((args) => ["update-ref", "symbolic-ref", "read-tree"].includes(args[0]!)), false);
+  });
+
+  it("returns an already-coherent equal-tree no-op for a single attached owner", () => {
+    const { repo, initial } = createRepo();
+    const featureTip = createFeature(repo);
+    const featureTree = git(repo, ["rev-parse", `${featureTip}^{tree}`]);
+    const equivalentTarget = git(repo, ["commit-tree", featureTree, "-p", initial, "-m", "equivalent target"]);
+    git(repo, ["reset", "--hard", equivalentTarget]);
+    const commands: string[][] = [];
+    const before = captureCheckoutState(repo);
+
+    const result = runPlumbingMerge(
+      { origin: repo, branch: "feature", into: "main", expectTip: equivalentTarget, message: "equal-tree no-op" },
+      {
+        runGit: (origin, args) => {
+          commands.push([...args]);
+          return rawGit(origin, args);
+        },
+        emitEvent: () => undefined,
+      },
+    );
+
+    assert.equal(result.status, "landed");
+    if (result.status !== "landed") return;
+    assert.equal(result.noop, true);
+    assert.equal(result.checkoutRefresh, "already-coherent");
+    assert.deepEqual(captureCheckoutState(repo), before);
+    assert.equal(commands.some((args) => ["update-ref", "symbolic-ref", "read-tree"].includes(args[0]!)), false);
+  });
+
+  it("refuses each named operation in progress through owner-relative git-path resolution", () => {
+    const sentinels = [
+      ["MERGE_HEAD", /merge operation/i],
+      ["CHERRY_PICK_HEAD", /cherry-pick operation/i],
+      ["REVERT_HEAD", /revert operation/i],
+      ["BISECT_LOG", /bisect operation/i],
+      ["rebase-merge", /rebase operation/i],
+      ["rebase-apply", /rebase operation/i],
+    ] as const;
+
+    for (const [sentinel, operation] of sentinels) {
+      const { repo, initial } = createRepo();
+      const branch = `feature-${sentinel.toLowerCase().replaceAll("_", "-")}`;
+      createFeature(repo, branch);
+      const sentinelPath = git(repo, ["rev-parse", "--path-format=absolute", "--git-path", sentinel]);
+      if (sentinel.startsWith("rebase-")) fs.mkdirSync(sentinelPath, { recursive: true });
+      else fs.writeFileSync(sentinelPath, `${sentinel}\n`, "utf-8");
+      const commands: string[][] = [];
+
+      const result = runPlumbingMerge(
+        { origin: repo, branch, into: "main", expectTip: initial, message: "operation must refuse" },
+        {
+          runGit: (origin, args) => {
+            commands.push([...args]);
+            return rawGit(origin, args);
+          },
+        },
+      );
+
+      assert.equal(result.status, "operational_error", sentinel);
+      if (result.status !== "operational_error") continue;
+      assert.match(result.detail, operation);
+      assert.ok(commands.some((args) => args.join(" ") === `rev-parse --git-path ${sentinel}`));
+      assert.equal(commands.some((args) => ["update-ref", "symbolic-ref", "read-tree"].includes(args[0]!)), false);
+    }
+  });
+
+  it("refuses when the attached owner HEAD differs from the CAS-verified target tip", () => {
+    const { repo, initial } = createRepo();
+    createFeature(repo);
+    const racedHead = "9".repeat(40);
+    const commands: string[][] = [];
+
+    const result = runPlumbingMerge(
+      { origin: repo, branch: "feature", into: "main", expectTip: initial, message: "head race" },
+      {
+        runGit: (origin, args) => {
+          commands.push([...args]);
+          if (origin === repo && args.join(" ") === "rev-parse --verify HEAD^{commit}") {
+            return { status: 0, stdout: racedHead, stderr: "" };
+          }
+          return rawGit(origin, args);
+        },
+      },
+    );
+
     assert.equal(result.status, "operational_error");
-    assert.equal(result.exitCode, 1);
-    assert.equal(indexedCalls, 0);
-    assert.deepEqual(commands, [
-      ["rev-parse", "--verify", "refs/heads/main"],
-      ["worktree", "list", "--porcelain", "-z"],
-    ]);
-    assert.equal(commands.some((args) => args.includes("refs/heads/feature^{commit}")), false);
-    assert.equal(commands.some((args) => args[0] === "merge-base"), false);
-    assert.deepEqual(events, []);
+    if (result.status !== "operational_error") return;
+    assert.match(result.detail, /HEAD.*disagrees.*expected target tip/i);
+    assert.match(result.detail, new RegExp(racedHead));
+    assert.equal(commands.some((args) => ["update-ref", "symbolic-ref", "read-tree"].includes(args[0]!)), false);
+  });
+
+  it("refreshes a clean owner with untracked files and parks staged or unstaged tracked changes", () => {
+    for (const change of ["untracked", "unstaged", "staged"] as const) {
+      const { repo, initial } = createRepo();
+      const branch = `feature-${change}`;
+      createFeature(repo, branch);
+      const localPath = change === "untracked" ? path.join(repo, "notes.txt") : path.join(repo, "base.txt");
+      const localBytes = Buffer.from(`${change} operator bytes\n`);
+      fs.writeFileSync(localPath, localBytes);
+      if (change === "staged") git(repo, ["add", "base.txt"]);
+      const commands: string[][] = [];
+      const events: MergeBranchEvent[] = [];
+
+      const result = runPlumbingMerge(
+        {
+          origin: repo,
+          branch,
+          into: "main",
+          expectTip: initial,
+          message: "managed owner",
+          runId: "db40fbc2-1234-5678",
+        },
+        {
+          runGit: (origin, args) => {
+            commands.push([...args]);
+            return rawGit(origin, args);
+          },
+          emitEvent: (event) => events.push(event),
+        },
+      );
+
+      assert.equal(result.status, "landed");
+      assert.equal(result.exitCode, 0);
+      if (result.status !== "landed") continue;
+      assert.ok(commands.some((args) => args.join(" ") === "--no-optional-locks status --porcelain=v1 --untracked-files=no"));
+      assert.deepEqual(fs.readFileSync(localPath), localBytes);
+      assert.equal(git(repo, ["rev-parse", "refs/heads/main"]), result.mergedCommit);
+
+      const backupCreateIndex = commands.findIndex((args) =>
+        args[0] === "update-ref" && args[1]?.startsWith("refs/heads/main-tamandua-parked-") && args[3] === "0".repeat(40)
+      );
+      const parkIndex = commands.findIndex((args) => args[0] === "symbolic-ref" && args[1] === "HEAD" && args[2]?.includes("tamandua-parked"));
+      const landIndex = commands.findIndex((args) => args[0] === "update-ref" && args[1] === "refs/heads/main");
+      assert.ok(backupCreateIndex >= 0 && backupCreateIndex < parkIndex && parkIndex < landIndex);
+
+      if (change === "untracked") {
+        assert.equal(result.checkoutRefresh, "refreshed");
+        assert.equal(git(repo, ["symbolic-ref", "HEAD"]), "refs/heads/main");
+        assert.equal(fs.existsSync(path.join(repo, "feature.txt")), true);
+        assert.equal(commands.some((args) => args.join(" ").startsWith("read-tree -m -u ")), true);
+        assert.equal(git(repo, ["for-each-ref", "--format=%(refname)", "refs/heads/*-tamandua-parked-*"]), "");
+      } else {
+        assert.match(result.checkoutRefresh, /^parked:main-tamandua-parked-\d{8}T\d{6}Z-db40fbc2$/);
+        assert.equal(result.parkedReason, "local-changes");
+        assert.equal(result.parkedBranch, result.checkoutRefresh.slice("parked:".length));
+        assert.equal(git(repo, ["symbolic-ref", "HEAD"]), `refs/heads/${result.parkedBranch}`);
+        assert.equal(git(repo, ["rev-parse", `refs/heads/${result.parkedBranch}`]), initial);
+        assert.equal(commands.some((args) => args[0] === "read-tree"), false);
+        assert.equal(events[0]?.parkedReason, "local-changes");
+      }
+    }
+  });
+
+  it("uses a manual lowercase-hex suffix when no run id is available", () => {
+    const { repo, initial } = createRepo();
+    createFeature(repo);
+    fs.writeFileSync(path.join(repo, "base.txt"), "dirty operator bytes\n", "utf-8");
+
+    const result = runPlumbingMerge(
+      {
+        origin: repo,
+        branch: "feature",
+        into: "main",
+        expectTip: initial,
+        message: "manual managed owner",
+        runId: "",
+      },
+      { emitEvent: () => undefined },
+    );
+
+    assert.equal(result.status, "landed");
+    if (result.status !== "landed") return;
+    assert.match(result.checkoutRefresh, /^parked:main-tamandua-parked-\d{8}T\d{6}Z-manual-[0-9a-f]{6}$/);
+    assert.equal(result.parkedBranch, result.checkoutRefresh.slice("parked:".length));
+  });
+
+  it("refuses a colliding backup ref before mutating HEAD or the target with a bounded diagnostic", () => {
+    const { repo, initial } = createRepo();
+    createFeature(repo);
+    const symbolicHeadBefore = git(repo, ["symbolic-ref", "HEAD"]);
+    const indexPath = git(repo, ["rev-parse", "--path-format=absolute", "--git-path", "index"]);
+    const indexBefore = fs.readFileSync(indexPath);
+    let collidingRef = "";
+    const commands: string[][] = [];
+
+    const result = runPlumbingMerge(
+      { origin: repo, branch: "feature", into: "main", expectTip: initial, message: "backup collision", runId: "collision-run" },
+      {
+        runGit: (origin, args) => {
+          commands.push([...args]);
+          if (args[0] === "update-ref" && args[1]?.includes("tamandua-parked") && args[3] === "0".repeat(40)) {
+            collidingRef = args[1];
+            git(repo, ["update-ref", collidingRef, initial]);
+            return { status: 128, stdout: "", stderr: `fatal: ${"diagnostic ".repeat(200)}reference already exists` };
+          }
+          return rawGit(origin, args);
+        },
+        emitEvent: () => assert.fail("a refused backup collision must not emit an event"),
+      },
+    );
+
+    assert.equal(result.status, "operational_error");
+    if (result.status !== "operational_error") return;
+    assert.ok(result.detail.length <= 512);
+    assert.match(result.detail, /cannot create backup/);
+    assert.equal(git(repo, ["symbolic-ref", "HEAD"]), symbolicHeadBefore);
+    assert.equal(git(repo, ["rev-parse", "refs/heads/main"]), initial);
+    assert.deepEqual(fs.readFileSync(indexPath), indexBefore);
+    assert.equal(git(repo, ["rev-parse", collidingRef]), initial);
+    assert.equal(commands.some((args) => args[0] === "symbolic-ref" || (args[0] === "update-ref" && args[1] === "refs/heads/main")), false);
+  });
+
+  it("fully unparks after target CAS failure and preserves target-moved classification", () => {
+    for (const failure of ["operational", "target-moved"] as const) {
+      const { repo, initial } = createRepo();
+      createFeature(repo, `feature-${failure}`);
+      let competingTip = "";
+      let backupRef = "";
+      const commands: string[][] = [];
+
+      const result = runPlumbingMerge(
+        { origin: repo, branch: `feature-${failure}`, into: "main", expectTip: initial, message: `CAS ${failure}`, runId: `cas-${failure}` },
+        {
+          runGit: (origin, args) => {
+            commands.push([...args]);
+            if (args[0] === "update-ref" && args[1]?.includes("tamandua-parked") && args[2] === initial) backupRef = args[1];
+            if (args[0] === "update-ref" && args[1] === "refs/heads/main" && args[3] === initial) {
+              if (failure === "target-moved") {
+                const tree = git(repo, ["rev-parse", `${initial}^{tree}`]);
+                competingTip = git(repo, ["commit-tree", tree, "-p", initial, "-m", "competing target"]);
+                git(repo, ["update-ref", "refs/heads/main", competingTip, initial]);
+              }
+              return { status: 128, stdout: "", stderr: failure === "operational" ? "permission denied" : "reference is at another value" };
+            }
+            return rawGit(origin, args);
+          },
+          emitEvent: () => undefined,
+        },
+      );
+
+      assert.equal(result.status, failure === "operational" ? "operational_error" : "target_moved");
+      assert.equal(git(repo, ["symbolic-ref", "HEAD"]), "refs/heads/main");
+      assert.equal(git(repo, ["rev-parse", "refs/heads/main"]), failure === "operational" ? initial : competingTip);
+      assert.notEqual(backupRef, "");
+      assert.notEqual(rawGit(repo, ["rev-parse", "--verify", backupRef]).status, 0);
+      assert.ok(commands.some((args) => args.join(" ") === `update-ref -d ${backupRef} ${initial}`));
+    }
+  });
+
+  it("leaves a stray backup without re-parking when target CAS and backup cleanup fail", () => {
+    const { repo, initial } = createRepo();
+    createFeature(repo, "feature-cas-cleanup-failure");
+    let backupRef = "";
+    let cleanupAttempts = 0;
+
+    const result = runPlumbingMerge(
+      {
+        origin: repo,
+        branch: "feature-cas-cleanup-failure",
+        into: "main",
+        expectTip: initial,
+        message: "CAS cleanup failure",
+        runId: "cas-cleanup-failure",
+      },
+      {
+        runGit: (origin, args) => {
+          const isBackup = args[0] === "update-ref" && args[1]?.includes("tamandua-parked") && args[3] === "0".repeat(40);
+          const isTargetCas = args[0] === "update-ref" && args[1] === "refs/heads/main" && args[3] === initial;
+          const isCleanup = args[0] === "update-ref" && args[1] === "-d" && args[2]?.includes("tamandua-parked");
+          if (isBackup) backupRef = args[1]!;
+          if (isTargetCas) return { status: 128, stdout: "", stderr: "injected target CAS failure" };
+          if (isCleanup) {
+            cleanupAttempts += 1;
+            return { status: 128, stdout: "", stderr: "injected persistent backup cleanup failure" };
+          }
+          return rawGit(origin, args);
+        },
+        emitEvent: () => undefined,
+      },
+    );
+
+    assert.equal(cleanupAttempts, 2);
+    assert.equal(result.status, "operational_error");
+    if (result.status !== "operational_error") return;
+    assert.equal(git(repo, ["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert.equal(git(repo, ["rev-parse", "refs/heads/main"]), initial);
+    assert.equal(git(repo, ["rev-parse", backupRef]), initial);
+    assert.match(result.detail, /stray backup/);
+    assert.ok(result.detail.includes(backupRef));
+    assert.ok(result.detail.length <= 512);
+  });
+
+  it("parks a clean owner when read-tree refuses and preserves an offending untracked path in bounded diagnostics", () => {
+    const { repo, initial } = createRepo();
+    createFeature(repo);
+    const collisionPath = path.join(repo, "feature.txt");
+    const collisionBytes = Buffer.from("operator collision bytes\n");
+    fs.writeFileSync(collisionPath, collisionBytes);
+
+    const result = runPlumbingMerge(
+      { origin: repo, branch: "feature", into: "main", expectTip: initial, message: "collision fallback", runId: "read-tree-collision" },
+      {
+        runGit: (origin, args) => {
+          if (args[0] === "read-tree") {
+            return {
+              status: 128,
+              stdout: "",
+              stderr: `${"noise ".repeat(200)}\nerror: Untracked working tree file 'feature.txt' would be overwritten by merge.`,
+            };
+          }
+          return rawGit(origin, args);
+        },
+        emitEvent: () => undefined,
+      },
+    );
+
+    assert.equal(result.status, "landed");
+    if (result.status !== "landed") return;
+    assert.match(result.checkoutRefresh, /^parked:/);
+    assert.match(result.parkedReason ?? "", /^advance-refused: /);
+    assert.match(result.parkedReason ?? "", /feature\.txt/);
+    assert.ok((result.parkedReason ?? "").length <= 512);
+    assert.deepEqual(fs.readFileSync(collisionPath), collisionBytes);
+    assert.equal(git(repo, ["symbolic-ref", "HEAD"]), `refs/heads/${result.parkedBranch}`);
+    assert.equal(git(repo, ["rev-parse", `refs/heads/${result.parkedBranch}`]), initial);
+    assert.equal(git(repo, ["rev-parse", "refs/heads/main"]), result.mergedCommit);
+  });
+
+  it("leaves only untouched, consistently parked, or fully completed states when each mutating boundary fails once", () => {
+    const boundaries = ["backup", "park", "land", "refresh", "reattach", "cleanup"] as const;
+    for (const boundary of boundaries) {
+      const { repo, initial } = createRepo();
+      createFeature(repo, `feature-${boundary}`);
+      const initialTree = git(repo, ["rev-parse", `${initial}^{tree}`]);
+      let mergedCommit = "";
+      let backupRef = "";
+      let parked = false;
+      let failed = false;
+
+      runPlumbingMerge(
+        { origin: repo, branch: `feature-${boundary}`, into: "main", expectTip: initial, message: `fault ${boundary}`, runId: `fault-${boundary}` },
+        {
+          runGit: (origin, args) => {
+            const isBackup = args[0] === "update-ref" && args[1]?.includes("tamandua-parked") && args[3] === "0".repeat(40);
+            const isPark = args[0] === "symbolic-ref" && args[2]?.includes("tamandua-parked");
+            const isLand = args[0] === "update-ref" && args[1] === "refs/heads/main" && args[3] === initial;
+            const isRefresh = args[0] === "read-tree";
+            const isReattach = parked && args.join(" ") === "symbolic-ref HEAD refs/heads/main";
+            const isCleanup = args[0] === "update-ref" && args[1] === "-d" && args[2]?.includes("tamandua-parked");
+            const matches = { backup: isBackup, park: isPark, land: isLand, refresh: isRefresh, reattach: isReattach, cleanup: isCleanup }[boundary];
+            if (isBackup) backupRef = args[1]!;
+            if (matches && !failed) {
+              failed = true;
+              return { status: 128, stdout: "", stderr: `injected ${boundary} failure` };
+            }
+            const actual = rawGit(origin, args);
+            if (args[0] === "commit-tree" && actual.status === 0) mergedCommit = actual.stdout;
+            if (isPark && actual.status === 0) parked = true;
+            return actual;
+          },
+          emitEvent: () => undefined,
+        },
+      );
+
+      assert.equal(failed, true, `${boundary} boundary was not exercised`);
+      const symbolicHead = rawGit(repo, ["symbolic-ref", "HEAD"]);
+      assert.equal(symbolicHead.status, 0, `${boundary}: HEAD must never be detached`);
+      const targetTip = git(repo, ["rev-parse", "refs/heads/main"]);
+      const backup = backupRef ? rawGit(repo, ["rev-parse", "--verify", backupRef]) : { status: 1, stdout: "", stderr: "" };
+      const indexTree = git(repo, ["write-tree"]);
+      const completedTree = mergedCommit ? git(repo, ["rev-parse", `${mergedCommit}^{tree}`]) : "";
+      const untouched = targetTip === initial && symbolicHead.stdout === "refs/heads/main" && backup.status !== 0 && indexTree === initialTree;
+      const consistentlyParked = targetTip === mergedCommit && symbolicHead.stdout === backupRef && backup.stdout === initial && indexTree === initialTree;
+      const completed = targetTip === mergedCommit && symbolicHead.stdout === "refs/heads/main" && backup.status !== 0 && indexTree === completedTree;
+      assert.equal(untouched || consistentlyParked || completed, true,
+        `${boundary}: illegal state target=${targetTip} HEAD=${symbolicHead.stdout} backup=${backup.stdout} index=${indexTree}`);
+      assert.equal(targetTip !== initial && symbolicHead.stdout === "refs/heads/main" && indexTree === initialTree, false,
+        `${boundary}: target moved underneath an attached stale checkout`);
+    }
+  });
+
+  it("falls back to a consistent parked state when backup cleanup keeps failing", () => {
+    const { repo, initial } = createRepo();
+    createFeature(repo, "feature-cleanup-persistent");
+    const initialTree = git(repo, ["rev-parse", `${initial}^{tree}`]);
+    let backupRef = "";
+    let cleanupAttempts = 0;
+
+    const result = runPlumbingMerge(
+      {
+        origin: repo,
+        branch: "feature-cleanup-persistent",
+        into: "main",
+        expectTip: initial,
+        message: "persistent cleanup fault",
+        runId: "cleanup-persistent",
+      },
+      {
+        runGit: (origin, args) => {
+          const isBackup = args[0] === "update-ref" && args[1]?.includes("tamandua-parked") && args[3] === "0".repeat(40);
+          const isCleanup = args[0] === "update-ref" && args[1] === "-d" && args[2]?.includes("tamandua-parked");
+          if (isBackup) backupRef = args[1]!;
+          if (isCleanup) {
+            cleanupAttempts += 1;
+            return { status: 128, stdout: "", stderr: "injected persistent cleanup failure" };
+          }
+          return rawGit(origin, args);
+        },
+        emitEvent: () => undefined,
+      },
+    );
+
+    assert.equal(cleanupAttempts, 2);
+    assert.equal(result.status, "landed");
+    if (result.status !== "landed") return;
+    assert.equal(result.checkoutRefresh, `parked:${result.parkedBranch}`);
+    assert.equal(`refs/heads/${result.parkedBranch}`, backupRef);
+    assert.match(result.parkedReason ?? "", /^advance-refused: /);
+    assert.match(result.parkedReason ?? "", /cleanup/);
+    assert.equal(git(repo, ["symbolic-ref", "HEAD"]), backupRef);
+    assert.equal(git(repo, ["rev-parse", backupRef]), initial);
+    assert.equal(git(repo, ["rev-parse", "refs/heads/main"]), result.mergedCommit);
+    assert.equal(git(repo, ["write-tree"]), initialTree);
+  });
+
+  it("reports a parked checkout as inconsistent when reattach and content rollback both fail", () => {
+    const { repo, initial } = createRepo();
+    createFeature(repo, "feature-reattach-rollback-failure");
+    let backupRef = "";
+    let readTreeAttempts = 0;
+    let reattachAttempts = 0;
+
+    const result = runPlumbingMerge(
+      {
+        origin: repo,
+        branch: "feature-reattach-rollback-failure",
+        into: "main",
+        expectTip: initial,
+        message: "reattach and rollback failure",
+        runId: "reattach-rollback-failure",
+      },
+      {
+        runGit: (origin, args) => {
+          const isBackup = args[0] === "update-ref" && args[1]?.includes("tamandua-parked") && args[3] === "0".repeat(40);
+          const isReattach = args.join(" ") === "symbolic-ref HEAD refs/heads/main";
+          if (isBackup) backupRef = args[1]!;
+          if (isReattach) {
+            reattachAttempts += 1;
+            return { status: 128, stdout: "", stderr: "injected persistent reattach failure" };
+          }
+          if (args[0] === "read-tree") {
+            readTreeAttempts += 1;
+            if (readTreeAttempts > 1) {
+              return { status: 128, stdout: "", stderr: "injected persistent content rollback failure" };
+            }
+          }
+          return rawGit(origin, args);
+        },
+        emitEvent: () => undefined,
+      },
+    );
+
+    assert.equal(reattachAttempts, 2);
+    assert.equal(readTreeAttempts, 3);
+    assert.equal(result.status, "landed");
+    if (result.status !== "landed") return;
+    assert.equal(result.checkoutRefresh, `parked:${result.parkedBranch}`);
+    assert.equal(`refs/heads/${result.parkedBranch}`, backupRef);
+    assert.match(result.parkedReason ?? "", /^parked-inconsistent: /);
+    assert.match(result.parkedReason ?? "", /reattach failed/);
+    assert.match(result.parkedReason ?? "", /content rollback failed/);
+    assert.ok((result.parkedReason ?? "").length <= 512);
+    assert.equal(git(repo, ["symbolic-ref", "HEAD"]), backupRef);
+    assert.equal(git(repo, ["write-tree"]), result.mergedTree);
+  });
+
+  it("retains honest parked metadata when cleanup rollback and final recovery all fail", () => {
+    const { repo, initial } = createRepo();
+    createFeature(repo, "feature-cleanup-deep-failure");
+    let backupRef = "";
+    let cleanupAttempts = 0;
+    let readTreeAttempts = 0;
+    let targetAttachmentAttempts = 0;
+
+    const result = runPlumbingMerge(
+      {
+        origin: repo,
+        branch: "feature-cleanup-deep-failure",
+        into: "main",
+        expectTip: initial,
+        message: "cleanup deep failure",
+        runId: "cleanup-deep-failure",
+      },
+      {
+        runGit: (origin, args) => {
+          const isBackup = args[0] === "update-ref" && args[1]?.includes("tamandua-parked") && args[3] === "0".repeat(40);
+          const isCleanup = args[0] === "update-ref" && args[1] === "-d" && args[2]?.includes("tamandua-parked");
+          const isTargetAttachment = args.join(" ") === "symbolic-ref HEAD refs/heads/main";
+          if (isBackup) backupRef = args[1]!;
+          if (isCleanup) {
+            cleanupAttempts += 1;
+            return { status: 128, stdout: "", stderr: "injected persistent cleanup failure" };
+          }
+          if (isTargetAttachment) {
+            targetAttachmentAttempts += 1;
+            if (targetAttachmentAttempts > 1) {
+              return { status: 128, stdout: "", stderr: "injected final target recovery failure" };
+            }
+          }
+          if (args[0] === "read-tree") {
+            readTreeAttempts += 1;
+            if (readTreeAttempts > 1) {
+              return { status: 128, stdout: "", stderr: "injected rollback and final refresh failure" };
+            }
+          }
+          return rawGit(origin, args);
+        },
+        emitEvent: () => undefined,
+      },
+    );
+
+    assert.equal(cleanupAttempts, 2);
+    assert.equal(targetAttachmentAttempts, 3);
+    assert.equal(readTreeAttempts, 5);
+    assert.equal(result.status, "landed");
+    if (result.status !== "landed") return;
+    assert.equal(result.checkoutRefresh, `parked:${result.parkedBranch}`);
+    assert.equal(`refs/heads/${result.parkedBranch}`, backupRef);
+    assert.match(result.parkedReason ?? "", /^parked-inconsistent: /);
+    assert.match(result.parkedReason ?? "", /cleanup failed/);
+    assert.match(result.parkedReason ?? "", /content rollback failed/);
+    assert.match(result.parkedReason ?? "", /final recovery failed/);
+    assert.ok((result.parkedReason ?? "").length <= 512);
+    assert.equal(git(repo, ["symbolic-ref", "HEAD"]), backupRef);
+    assert.equal(git(repo, ["write-tree"]), result.mergedTree);
   });
 
   it("lands into an unowned target when metadata also contains a detached worktree", () => {

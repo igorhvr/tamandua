@@ -693,7 +693,7 @@ describe("concurrent-runs stress test", { concurrency: 1 }, () => {
           assert.equal(
             outputRefresh,
             "not-applicable",
-            `feature-${i + 1}: CHECKOUT_REFRESH should be not-applicable, got ${outputRefresh}`,
+            `feature-${i + 1}: detached origin should report CHECKOUT_REFRESH not-applicable, got ${outputRefresh}`,
           );
           const mergeEvents = fs
             .readFileSync(path.join(runEnv.env.tamanduaDir, "events", `${rid}.jsonl`), "utf-8")
