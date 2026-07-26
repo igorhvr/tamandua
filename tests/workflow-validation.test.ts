@@ -472,29 +472,34 @@ describe("workflow structure", () => {
     assert.match(readme, /plan → setup → implement → verify → test → finalize_merge/);
   });
 
-  it("security-audit-merge finalize_merge step includes fast-forward-first merge instructions", async () => {
+  it("security-audit-merge finalize_merge step includes atomic plumbing instructions", async () => {
     const spec = await loadWorkflowSpec(wfDir("security-audit-merge"));
     const finalStep = spec.steps.find((s) => s.id === "finalize_merge");
     assert.ok(finalStep, "finalize_merge step must exist");
     assert.equal(finalStep!.agent, "merger");
 
-    // Phase 1: Fast-Forward Check
+    // Phase 1: capture the target tip, then check FF safety against it.
     assert.match(finalStep!.input, /Fast-Forward Check/);
-    assert.match(finalStep!.input, /git merge-base --is-ancestor \{\{original_branch\}\} \{\{branch\}\}/);
+    assert.match(finalStep!.input, /EXPECT_TIP=\$\(git -C "\$ORIGIN_REPOSITORY" rev-parse "\$TARGET_REF"\)/);
+    assert.match(finalStep!.input, /merge-base --is-ancestor "\$EXPECT_TIP" refs\/heads\/\{\{branch\}\}/);
 
-    // Phase 2: Rebase
+    // Phase 2: rebase in the workspace and always loop back to testing.
     assert.match(finalStep!.input, /Phase 2.*Rebase/);
-    assert.match(finalStep!.input, /git rebase \{\{original_branch\}\}/);
+    assert.match(finalStep!.input, /git -C \{\{repo\}\} rebase "\$EXPECT_TIP"/);
     assert.match(finalStep!.input, /git rebase --continue/);
     assert.match(finalStep!.input, /CONFLICT_NOTES/);
     assert.match(finalStep!.input, /RETRY_STEP: test/);
-    assert.match(finalStep!.input, /Do NOT merge/);
+    assert.match(finalStep!.input, /stop before landing/);
 
-    // Phase 3: Squash Merge
-    assert.match(finalStep!.input, /Phase 3.*Squash Merge/);
-    assert.match(finalStep!.input, /git checkout \{\{original_branch\}\}/);
-    assert.match(finalStep!.input, /git merge --squash \{\{branch\}\}/);
-    assert.match(finalStep!.input, /git commit -F <tempfile>/);
+    // Phase 3: CAS-protected atomic landing with the complete plumbing contract.
+    assert.match(finalStep!.input, /Phase 3.*Atomic Landing/);
+    assert.match(finalStep!.input, /MERGE_OUTPUT=\$\(tamandua merge-branch/);
+    assert.match(finalStep!.input, /--origin "\$ORIGIN_REPOSITORY"/);
+    assert.match(finalStep!.input, /--branch "\{\{branch\}\}"/);
+    assert.match(finalStep!.input, /--into "\{\{original_branch\}\}"/);
+    assert.match(finalStep!.input, /--expect-tip "\$EXPECT_TIP"/);
+    assert.match(finalStep!.input, /--message "\$\(cat "\$MESSAGE_FILE"\)"/);
+    assert.doesNotMatch(finalStep!.input, /git checkout|git merge --squash|git commit -F/);
 
     // Output format includes REBASED
     assert.match(finalStep!.input, /REBASED:\s*false/);
@@ -516,20 +521,21 @@ describe("workflow structure", () => {
     assert.match(testStep!.input, /re-validate the rebased changes/);
   });
 
-  it("security-audit-merge merger AGENTS.md includes fast-forward-first merge process", () => {
+  it("security-audit-merge merger AGENTS.md uses atomic plumbing landing", () => {
     const mergerAgentsMdPath = resolve(wfDir("security-audit-merge"), "agents", "merger", "AGENTS.md");
     const content = readFileSync(mergerAgentsMdPath, "utf-8");
 
-    // Phase 1: Fast-Forward Check as first Required Process step
-    assert.match(content, /Phase 1: Fast-Forward Check/);
-    assert.match(content, /git merge-base --is-ancestor \{\{original_branch\}\} \{\{branch\}\}/);
-    const phase1Index = content.indexOf("Phase 1: Fast-Forward Check");
-    const phase3Index = content.indexOf("Phase 3: Squash Merge");
-    assert.ok(phase1Index < phase3Index, "Fast-Forward Check must come before Squash Merge");
+    // Phase 1 captures the current origin target before checking FF safety.
+    assert.match(content, /Phase 1: Capture Target Tip and Check Fast-Forward Safety/);
+    assert.match(content, /EXPECT_TIP=\$\(git -C "\$ORIGIN_REPOSITORY" rev-parse "\$TARGET_REF"\)/);
+    assert.match(content, /merge-base --is-ancestor "\$EXPECT_TIP" refs\/heads\/\{\{branch\}\}/);
+    const phase1Index = content.indexOf("Phase 1: Capture Target Tip");
+    const phase3Index = content.indexOf("Phase 3: Atomic Landing");
+    assert.ok(phase1Index < phase3Index, "target-tip capture must come before atomic landing");
 
     // Phase 2: Rebase on non-FF path with conflict resolution
     assert.match(content, /Phase 2: Rebase/);
-    assert.match(content, /git rebase \{\{original_branch\}\}/);
+    assert.match(content, /git -C \{\{repo\}\} rebase "\$EXPECT_TIP"/);
     assert.match(content, /git rebase --continue/);
     assert.match(content, /fix them carefully|resolve each conflict|If conflicts arise/i);
 
@@ -539,20 +545,26 @@ describe("workflow structure", () => {
     assert.match(content, /RETRY_STEP: test/);
     assert.match(content, /do NOT merge/);
 
-    // Guardrails forbid squash merge when not FF-safe
-    assert.match(content, /NEVER squash-merge when the branch is not fast-forward-safe/);
+    // Guardrails permit only the CAS-protected plumbing command to mutate the target ref.
+    assert.match(content, /only `tamandua merge-branch` may update the target ref/i);
     assert.match(content, /IF YOU REBASED, YOU NEVER MERGE IN THIS INVOCATION/);
+    assert.match(content, /--origin "\$ORIGIN_REPOSITORY"/);
+    assert.match(content, /--branch "\{\{branch\}\}"/);
+    assert.match(content, /--into "\{\{original_branch\}\}"/);
+    assert.match(content, /--expect-tip "\$EXPECT_TIP"/);
+    assert.match(content, /--message "\$\(cat "\$MESSAGE_FILE"\)"/);
 
-    // Output format includes REBASED field
-    assert.match(content, /On successful merge[\s\S]*REBASED:\s*false/);
+    // Output preserves plumbing metadata and legacy workflow keys.
+    assert.match(content, /STATUS: landed[\s\S]*MERGED_COMMIT:[\s\S]*CHECKOUT_REFRESH:[\s\S]*REBASED:\s*false/);
 
     // Preserves fix(security):-prefix commit message guidance
     assert.match(content, /fix\(security\)/);
     assert.match(content, /Do NOT use `feat:` prefix/);
 
-    // Preserves existing commit message generation (git commit -F, not git commit -m)
-    assert.match(content, /git commit -F/);
-    assert.doesNotMatch(content, /git commit -m/);
+    // Preserves message provenance while removing porcelain landing.
+    assert.match(content, /security audit task from `\{\{task\}\}`/);
+    assert.match(content, /progress file `\{\{progress_file\}\}`/);
+    assert.doesNotMatch(content, /git checkout|git merge --squash|git commit -F|git commit -m/);
     assert.match(content, /Co-Authored-By: Tamandua/);
   });
 
@@ -633,9 +645,7 @@ describe("US-004: fast-forward-first merge contradiction prevention and ordering
 
       const input = finalStep!.input;
       const ffIdx = input.search(/merge-base --is-ancestor/);
-      const landingIdx = wfId === "feature-dev-merge"
-        ? input.search(/MERGE_OUTPUT=\$\(tamandua merge-branch/)
-        : input.search(/git merge --squash/);
+      const landingIdx = input.search(/MERGE_OUTPUT=\$\(tamandua merge-branch/);
 
       assert.ok(ffIdx >= 0, `${wfId}: must contain merge-base --is-ancestor`);
       assert.ok(landingIdx >= 0, `${wfId}: must contain its landing command`);
@@ -657,13 +667,14 @@ describe("US-004: fast-forward-first merge contradiction prevention and ordering
     });
   }
 
-  // AC 6: Bug-fix-merge does NOT have tester retry path
-  it("bug-fix-merge finalize_merge step input does NOT have tester retry path (US-004)", async () => {
+  // Bug-fix reroutes rebase and landing races to its verifier rather than the tester.
+  it("bug-fix-merge finalize_merge step input reroutes to verifier (US-004)", async () => {
     const spec = await loadWorkflowSpec(wfDir("bug-fix-merge"));
     const finalStep = spec.steps.find((s) => s.id === "finalize_merge");
     assert.ok(finalStep);
     assert.doesNotMatch(finalStep!.input, /RETRY_STEP:\s*test/);
-    assert.doesNotMatch(finalStep!.input, /CONFLICT_NOTES/);
+    assert.match(finalStep!.input, /RETRY_STEP:\s*verify/);
+    assert.match(finalStep!.input, /CONFLICT_NOTES/);
   });
 });
 
@@ -778,24 +789,27 @@ describe("US-010: Create remaining worktree workflow variants", () => {
       // Should include worktree mode instructions
       assert.match(finalStep!.input, /Worktree Mode/);
 
-      // Should direct Phase 1 and Phase 3 to the origin repository
-      assert.match(finalStep!.input, /cd \{\{worktree_origin_repository\}\}/);
+      // Origin refs are read explicitly while the origin checkout/index stay untouched.
+      assert.match(finalStep!.input, /ORIGIN_REPOSITORY:\s*\{\{worktree_origin_repository\}\}/);
+      assert.match(finalStep!.input, /git -C "\$ORIGIN_REPOSITORY" rev-parse/);
+      assert.match(finalStep!.input, /--origin "\$ORIGIN_REPOSITORY"/);
+      assert.doesNotMatch(finalStep!.input, /cd \{\{worktree_origin_repository\}\}|git checkout|git merge --squash/);
     });
 
-    it(`${id} preserves fast-forward-first merge ordering (FF check before squash)`, async () => {
+    it(`${id} preserves fast-forward-first merge ordering (FF check before atomic landing)`, async () => {
       const spec = await loadWorkflowSpec(wfDir(id));
       const finalStep = spec.steps.find((s) => s.id === "finalize_merge");
       assert.ok(finalStep);
 
       const input = finalStep!.input;
-      const ffIdx = input.search(/git merge-base --is-ancestor/);
-      const squashIdx = input.search(/git merge --squash/);
+      const ffIdx = input.search(/merge-base --is-ancestor/);
+      const landingIdx = input.search(/MERGE_OUTPUT=\$\(tamandua merge-branch/);
 
-      assert.ok(ffIdx >= 0, `${id}: must contain git merge-base --is-ancestor`);
-      assert.ok(squashIdx >= 0, `${id}: must contain git merge --squash`);
+      assert.ok(ffIdx >= 0, `${id}: must contain merge-base --is-ancestor`);
+      assert.ok(landingIdx >= 0, `${id}: must contain tamandua merge-branch`);
       assert.ok(
-        ffIdx < squashIdx,
-        `${id}: FF check (pos ${ffIdx}) must appear before squash merge (pos ${squashIdx})`,
+        ffIdx < landingIdx,
+        `${id}: FF check (pos ${ffIdx}) must appear before atomic landing (pos ${landingIdx})`,
       );
     });
   }

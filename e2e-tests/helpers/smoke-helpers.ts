@@ -223,10 +223,12 @@ export function spawnWorkflowRun(
   args: string[],
   env: Record<string, string>,
   timeoutMs = 30_000,
+  cwd?: string,
 ): Promise<string> {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [cliPath, ...args], {
       env: cleanChildEnv(env),
+      cwd,
       stdio: ["ignore", "pipe", "pipe"],
     });
 

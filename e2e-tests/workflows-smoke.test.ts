@@ -30,6 +30,93 @@ import {
 
 const fixtureDir = path.join(process.cwd(), "e2e-tests", "fixtures", "sample-project");
 
+const plumbingMergeOutput = (commit: string, tree: string): string =>
+  "STATUS: landed\n" +
+  `MERGED_COMMIT: ${commit}\n` +
+  `MERGED_TREE: ${tree}\n` +
+  "TARGET: refs/heads/main\n" +
+  "CHECKOUT_REFRESH: updated\n" +
+  "REBASED: false\n" +
+  `MERGE_COMMIT: ${commit.slice(0, 7)}\n` +
+  "MERGED_INTO: main\n" +
+  `MERGED_TREE: ${tree}\n` +
+  "STATUS: done\n";
+
+interface CannedStep {
+  agent: string;
+  output: (repoDir: string) => string;
+}
+
+interface CannedWorkflow {
+  id: string;
+  task: string;
+  worktree: boolean;
+  steps: CannedStep[];
+}
+
+async function runCannedWorkflow(workflow: CannedWorkflow): Promise<void> {
+  const env = await createTempHome();
+  const be = () => baseEnv(env.homeDir, env.controlPort);
+
+  try {
+    cliMustSucceed(
+      ["workflow", "install", workflow.id],
+      be(),
+      `install ${workflow.id}`,
+    );
+
+    const repoDir = path.join(env.root, "sample-repo");
+    prepareGitRepo(fixtureDir, repoDir);
+    const runArgs = [
+      "workflow",
+      "run",
+      workflow.id,
+      workflow.task,
+      "--context",
+      `repo=${repoDir}`,
+      "--context",
+      `branch=smoke/${workflow.id}`,
+    ];
+    if (workflow.worktree) {
+      runArgs.push("--worktree-origin-repository", repoDir);
+    }
+    const runIdPrefix = await spawnWorkflowRun(runArgs, be());
+    const runId = resolveFullRunId(runIdPrefix, env.tamanduaDir);
+
+    for (const step of workflow.steps) {
+      let claimed;
+      try {
+        claimed = stepClaim(`${workflow.id}_${step.agent}`, runId, be());
+      } catch (error) {
+        const status = cliMustSucceed(
+          ["workflow", "status", runId],
+          be(),
+          `${workflow.id} failed-claim status`,
+        );
+        throw new Error(
+          `${workflow.id}/${step.agent}: failed to claim step\n${status}`,
+          { cause: error },
+        );
+      }
+      const result = stepComplete(claimed.stepId, step.output(repoDir), be());
+      assert.ok(
+        result.status === "advanced" || result.status === "completed",
+        `${workflow.id}/${step.agent}: expected advanced/completed, got ${result.status}`,
+      );
+    }
+
+    const statusOut = cliMustSucceed(
+      ["workflow", "status", runId],
+      be(),
+      `${workflow.id} status`,
+    );
+    assert.match(statusOut, /Status:\s+completed/i);
+    assert.match(statusOut, /\[done\s+\]\s+step-finalize_merge/);
+  } finally {
+    cleanupTempHome(env);
+  }
+}
+
 describe("createTempHome pi auth isolation", () => {
   it("default createTempHome() creates a stub .pi directory (not a symlink)", async () => {
     const env = await createTempHome();
@@ -275,10 +362,7 @@ describe("workflows smoke (state-machine integration)", { concurrency: 1 }, () =
         );
         const mergeResult = stepComplete(
           merge.stepId,
-          "STATUS: done\n" +
-            "REBASED: false\n" +
-            "MERGE_COMMIT: abc1234\n" +
-            "MERGED_INTO: main\n",
+          plumbingMergeOutput("abc1234deadbeef", "abc123deadbeef"),
           be(),
         );
         assert.equal(mergeResult.status, "completed");
@@ -426,10 +510,7 @@ describe("workflows smoke (state-machine integration)", { concurrency: 1 }, () =
         );
         const mergeResult = stepComplete(
           merge.stepId,
-          "STATUS: done\n" +
-            "REBASED: false\n" +
-            "MERGE_COMMIT: def5678\n" +
-            "MERGED_INTO: main\n",
+          plumbingMergeOutput("def5678deadbeef", "scripted-smoke-tree"),
           be(),
         );
         assert.equal(mergeResult.status, "completed");
@@ -452,4 +533,179 @@ describe("workflows smoke (state-machine integration)", { concurrency: 1 }, () =
       }
     },
   );
+
+  const bugFixSteps: CannedStep[] = [
+    {
+      agent: "triager",
+      output: (repoDir) =>
+        "STATUS: done\n" +
+        `REPO: ${repoDir}\n` +
+        "BRANCH: bugfix/fix-add-function\n" +
+        "SEVERITY: high\n" +
+        "AFFECTED_AREA: src/math.ts\n" +
+        "REPRODUCTION: add(2, 3) returns -1\n" +
+        "PROBLEM_STATEMENT: add subtracts instead of adding\n",
+    },
+    {
+      agent: "investigator",
+      output: () =>
+        "STATUS: done\n" +
+        "ROOT_CAUSE: add uses the subtraction operator\n" +
+        "FIX_APPROACH: replace subtraction with addition\n",
+    },
+    {
+      agent: "setup",
+      output: () =>
+        "STATUS: done\n" +
+        "ORIGINAL_BRANCH: main\n" +
+        "BUILD_CMD: npm run build\n" +
+        "TEST_CMD: npm test\n" +
+        "BASELINE: known failing regression test\n",
+    },
+    {
+      agent: "fixer",
+      output: () =>
+        "STATUS: done\n" +
+        "CHANGES: corrected the add implementation\n" +
+        "REGRESSION_TEST: verifies add(2, 3) equals 5\n",
+    },
+    {
+      agent: "verifier",
+      output: () =>
+        "STATUS: done\n" +
+        "VERIFIED: fix and regression test pass\n" +
+        "TESTED_TREE: bug-fix-smoke-tree\n",
+    },
+    {
+      agent: "merger",
+      output: () => plumbingMergeOutput("badd00ddeadbeef", "bug-fix-smoke-tree"),
+    },
+  ];
+
+  const quarantineSteps: CannedStep[] = [
+    {
+      agent: "setup",
+      output: () =>
+        "STATUS: done\n" +
+        "ORIGINAL_BRANCH: main\n" +
+        "BUILD_CMD: npm run build\n" +
+        "TEST_CMD: npm test\n" +
+        "CI_NOTES: one broken test\n" +
+        "BASELINE: one test fails\n",
+    },
+    {
+      agent: "quarantiner",
+      output: () =>
+        "STATUS: done\n" +
+        "DISABLED: 1\n" +
+        "FILES_CHANGED: 1\n" +
+        "SUMMARY: quarantined the broken math test\n",
+    },
+    {
+      agent: "verifier",
+      output: () =>
+        "STATUS: done\n" +
+        "VERIFIED: suite passes and only the test file changed\n" +
+        "TESTED_TREE: quarantine-smoke-tree\n",
+    },
+    {
+      agent: "merger",
+      output: () => plumbingMergeOutput("cafe123deadbeef", "quarantine-smoke-tree"),
+    },
+  ];
+
+  const securitySteps: CannedStep[] = [
+    {
+      agent: "scanner",
+      output: (repoDir) =>
+        "STATUS: done\n" +
+        `REPO: ${repoDir}\n` +
+        "BRANCH: security-audit-smoke\n" +
+        "VULNERABILITY_COUNT: 1\n" +
+        "FINDINGS: unsafe input reaches a command\n",
+    },
+    {
+      agent: "prioritizer",
+      output: () =>
+        "STATUS: done\n" +
+        "FIX_PLAN: validate command input\n" +
+        "CRITICAL_COUNT: 0\n" +
+        "HIGH_COUNT: 1\n" +
+        "DEFERRED: none\n" +
+        'STORIES_JSON: [{"id":"US-001","title":"Validate command input","description":"Reject unsafe command input","acceptanceCriteria":["unsafe input is rejected","tests pass"]}]\n',
+    },
+    {
+      agent: "setup",
+      output: () =>
+        "STATUS: done\n" +
+        "ORIGINAL_BRANCH: main\n" +
+        "BUILD_CMD: npm run build\n" +
+        "TEST_CMD: npm test\n" +
+        "BASELINE: existing tests pass\n",
+    },
+    {
+      agent: "fixer",
+      output: () =>
+        "STATUS: done\n" +
+        "CHANGES: added command input validation\n" +
+        "REGRESSION_TEST: rejects unsafe command input\n",
+    },
+    {
+      agent: "verifier",
+      output: () => "STATUS: done\nVERIFIED: vulnerability is fixed\n",
+    },
+    {
+      agent: "tester",
+      output: () =>
+        "STATUS: done\n" +
+        "RESULTS: full suite and audit pass\n" +
+        "TESTED_TREE: security-smoke-tree\n" +
+        "AUDIT_AFTER: no remaining findings\n",
+    },
+    {
+      agent: "merger",
+      output: () => plumbingMergeOutput("5ec0123deadbeef", "security-smoke-tree"),
+    },
+  ];
+
+  const additionalMergeWorkflows: CannedWorkflow[] = [
+    {
+      id: "bug-fix-merge",
+      task: "Fix the add function",
+      worktree: false,
+      steps: bugFixSteps,
+    },
+    {
+      id: "quarantine-broken-tests-merge",
+      task: "Quarantine broken tests",
+      worktree: false,
+      steps: quarantineSteps,
+    },
+    {
+      id: "quarantine-broken-tests-merge-worktree",
+      task: "Quarantine broken tests",
+      worktree: true,
+      steps: quarantineSteps,
+    },
+    {
+      id: "security-audit-merge",
+      task: "Audit and fix security vulnerabilities",
+      worktree: false,
+      steps: securitySteps,
+    },
+    {
+      id: "security-audit-merge-worktree",
+      task: "Audit and fix security vulnerabilities",
+      worktree: true,
+      steps: securitySteps,
+    },
+  ];
+
+  for (const workflow of additionalMergeWorkflows) {
+    it(
+      `${workflow.id}: canned plumbing merger output completes the workflow`,
+      { timeout: 120_000 },
+      async () => runCannedWorkflow(workflow),
+    );
+  }
 });

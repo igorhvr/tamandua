@@ -34,6 +34,34 @@ const bugFixWorktreePersonaPath = resolve(
   "merger",
   "AGENTS.md",
 );
+const quarantinePersonaPath = resolve(
+  workflowsRoot,
+  "quarantine-broken-tests-merge",
+  "agents",
+  "merger",
+  "AGENTS.md",
+);
+const quarantineWorktreePersonaPath = resolve(
+  workflowsRoot,
+  "quarantine-broken-tests-merge-worktree",
+  "agents",
+  "merger",
+  "AGENTS.md",
+);
+const securityAuditPersonaPath = resolve(
+  workflowsRoot,
+  "security-audit-merge",
+  "agents",
+  "merger",
+  "AGENTS.md",
+);
+const securityAuditWorktreePersonaPath = resolve(
+  workflowsRoot,
+  "security-audit-merge-worktree",
+  "agents",
+  "merger",
+  "AGENTS.md",
+);
 const persona = readFileSync(sharedPersonaPath, "utf8");
 
 interface MergerPersonaConsumer {
@@ -155,7 +183,16 @@ describe("US-003 PLMB feature merger prompt contracts", () => {
     const consumers = mergeBranchPersonaConsumers();
     assert.deepEqual(
       consumers.map((consumer) => consumer.workflowId),
-      ["feature-dev-merge", "feature-dev-merge-worktree"],
+      [
+        "bug-fix-merge",
+        "bug-fix-merge-worktree",
+        "feature-dev-merge",
+        "feature-dev-merge-worktree",
+        "quarantine-broken-tests-merge",
+        "quarantine-broken-tests-merge-worktree",
+        "security-audit-merge",
+        "security-audit-merge-worktree",
+      ],
     );
 
     const uniquePersonas = new Map<string, MergerPersonaConsumer>();
@@ -165,22 +202,68 @@ describe("US-003 PLMB feature merger prompt contracts", () => {
       uniquePersonas.set(consumer.realpath, consumer);
     }
 
-    assert.equal(uniquePersonas.size, 1, "feature merge variants must share one merger persona");
+    assert.equal(
+      uniquePersonas.size,
+      4,
+      "feature, bug-fix, quarantine, and security-audit variants must share per-family personas",
+    );
     assert.equal(consumers[0]?.realpath, consumers[1]?.realpath);
+    assert.equal(consumers[2]?.realpath, consumers[3]?.realpath);
+    assert.equal(consumers[4]?.realpath, consumers[5]?.realpath);
+    assert.equal(consumers[6]?.realpath, consumers[7]?.realpath);
   });
 
-  it("explicitly audits bug-fix merge variants for immediate retry before landing", () => {
+  it("enforces the plumbing contract for bug-fix merge variants", () => {
     assert.equal(realpathSync(bugFixWorktreePersonaPath), realpathSync(bugFixPersonaPath));
     const bugFixPersona = readFileSync(bugFixPersonaPath, "utf8");
+    assertRetryBeforeMergeBranch(bugFixPersona, "bug-fix merger persona");
+    assertCompleteMergeBranchInvocation(bugFixPersona);
+    assertManagedParkingGuardrail(bugFixPersona, "bug-fix merger persona");
+    assert.match(bugFixPersona, /RETRY_STEP: verify/);
+    assert.match(bugFixPersona, /Use `fix:` prefix/);
+    assert.match(bugFixPersona, /STATUS: conflicts/);
+    assert.match(bugFixPersona, /STATUS: target_moved/);
+    assert.doesNotMatch(bugFixPersona, /git checkout|git merge --squash|git commit -F/);
+  });
+
+  it("enforces the plumbing contract and message vocabulary for quarantine merge variants", () => {
+    assert.equal(realpathSync(quarantineWorktreePersonaPath), realpathSync(quarantinePersonaPath));
+    const quarantinePersona = readFileSync(quarantinePersonaPath, "utf8");
+    assertRetryBeforeMergeBranch(quarantinePersona, "quarantine merger persona");
+    assertCompleteMergeBranchInvocation(quarantinePersona);
+    assertManagedParkingGuardrail(quarantinePersona, "quarantine merger persona");
+    assert.match(quarantinePersona, /RETRY_STEP: verify/);
+    assert.match(quarantinePersona, /Use `chore:` prefix/);
+    assert.match(quarantinePersona, /git diff --stat \{\{original_branch\}\}\.\.\{\{branch\}\}/);
+    assert.match(quarantinePersona, /`\{\{disabled\}\}`|DISABLED/);
+    assert.match(quarantinePersona, /`\{\{summary\}\}`|SUMMARY/);
+    assert.match(quarantinePersona, /STATUS: conflicts/);
+    assert.match(quarantinePersona, /STATUS: target_moved/);
     assert.match(
-      bugFixPersona,
-      /rebase succeeds[\s\S]{0,300}immediately emit `STATUS: retry`[\s\S]{0,300}return from the invocation before any squash-merge, commit, or other landing step/i,
+      quarantinePersona,
+      /STATUS: landed[\s\S]*MERGED_COMMIT:[\s\S]*MERGED_TREE:[\s\S]*REBASED: false[\s\S]*MERGE_COMMIT:[\s\S]*MERGED_INTO:[\s\S]*STATUS: done/,
     );
-    assert.match(bugFixPersona, /Never land and then report retry/i);
+    assert.doesNotMatch(quarantinePersona, /git checkout|git merge --squash|git commit -F/);
+  });
+
+  it("enforces the plumbing contract and message vocabulary for security-audit merge variants", () => {
+    assert.equal(realpathSync(securityAuditWorktreePersonaPath), realpathSync(securityAuditPersonaPath));
+    const securityAuditPersona = readFileSync(securityAuditPersonaPath, "utf8");
+    assertRetryBeforeMergeBranch(securityAuditPersona, "security-audit merger persona");
+    assertCompleteMergeBranchInvocation(securityAuditPersona);
+    assertManagedParkingGuardrail(securityAuditPersona, "security-audit merger persona");
+    assert.match(securityAuditPersona, /RETRY_STEP: test/);
+    assert.match(securityAuditPersona, /Use `fix\(security\):` prefix/);
+    assert.match(securityAuditPersona, /security audit task from `\{\{task\}\}`/);
+    assert.match(securityAuditPersona, /progress file `\{\{progress_file\}\}`/);
+    assert.match(securityAuditPersona, /vulnerabilities were found and fixed/);
+    assert.match(securityAuditPersona, /STATUS: conflicts/);
+    assert.match(securityAuditPersona, /STATUS: target_moved/);
     assert.match(
-      bugFixPersona,
-      /Landing may run only in a fresh invocation where no rebase was needed and the branch was already based on the current target/,
+      securityAuditPersona,
+      /STATUS: landed[\s\S]*MERGED_COMMIT:[\s\S]*MERGED_TREE:[\s\S]*REBASED: false[\s\S]*MERGE_COMMIT:[\s\S]*MERGED_INTO:[\s\S]*STATUS: done/,
     );
+    assert.doesNotMatch(securityAuditPersona, /git checkout|git merge --squash|git commit -F/);
   });
 
   it("maps conflicts and target movement to tester revalidation and fails other errors", () => {
@@ -199,6 +282,54 @@ describe("US-003 PLMB feature merger prompt contracts", () => {
     assert.match(persona, /MERGED_INTO/);
     assert.match(persona, /STATUS: done/);
   });
+
+  const migratedWorkflowContracts = [
+    { id: "bug-fix-merge", origin: "{{repo}}", retryStep: "verify", maxReroutes: 4 },
+    { id: "bug-fix-merge-worktree", origin: "{{worktree_origin_repository}}", retryStep: "verify", maxReroutes: 8 },
+    { id: "quarantine-broken-tests-merge", origin: "{{repo}}", retryStep: "verify", maxRetries: 4 },
+    { id: "quarantine-broken-tests-merge-worktree", origin: "{{worktree_origin_repository}}", retryStep: "verify", maxRetries: 4 },
+    { id: "security-audit-merge", origin: "{{repo}}", retryStep: "test", maxRetries: 4 },
+    { id: "security-audit-merge-worktree", origin: "{{worktree_origin_repository}}", retryStep: "test", maxRetries: 4 },
+  ] as const;
+
+  for (const contract of migratedWorkflowContracts) {
+    it(`${contract.id} finalize_merge uses the plumbing landing contract`, async () => {
+      const spec = await loadWorkflowSpec(resolve(workflowsRoot, contract.id));
+      const step = spec.steps.find((candidate) => candidate.id === "finalize_merge");
+      assert.ok(step, `${contract.id} must define finalize_merge`);
+
+      assert.match(step.input, /RUN_ID:\s*\{\{run_id\}\}/);
+      assert.match(
+        step.input,
+        new RegExp(`ORIGIN_REPOSITORY:\\s*${contract.origin.replace(/[{}]/g, "\\$&")}`),
+      );
+      if (contract.id.endsWith("-worktree")) {
+        assert.match(step.input, /WORKTREE_ORIGIN_REPOSITORY:\s*\{\{worktree_origin_repository\}\}/);
+      }
+      assert.match(step.input, /EXPECT_TIP=\$\(git -C "\$ORIGIN_REPOSITORY" rev-parse "\$TARGET_REF"\)/);
+      assert.match(step.input, /git -C "\$ORIGIN_REPOSITORY" merge-base --is-ancestor "\$EXPECT_TIP" refs\/heads\/\{\{branch\}\}/);
+      assert.match(step.input, /git -C \{\{repo\}\} rebase "\$EXPECT_TIP"/);
+      assertCompleteMergeBranchInvocation(step.input);
+      assert.match(step.input, /Preserve MERGE_OUTPUT verbatim/);
+      assert.match(step.input, new RegExp(`RETRY_STEP:\\s*${contract.retryStep}`));
+      assert.match(step.input, /MERGED_TREE[\s\S]*\{\{tested_tree\}\}/);
+      assertNoDirectOriginMutation(step.input);
+      assert.doesNotMatch(step.input, /git merge --squash|git commit -F/);
+
+      assert.equal(step.on_fail?.retry_step, contract.retryStep);
+      if ("maxReroutes" in contract) {
+        assert.equal(step.on_fail?.max_reroutes, contract.maxReroutes);
+      } else {
+        assert.equal(step.on_fail?.max_retries, contract.maxRetries);
+      }
+      assert.equal(
+        step.expects,
+        "regex:^STATUS:\\s*(done|retry)\\s*$\n" +
+          "regex:^REBASED:\\s*(true|false)\\s*$\n" +
+          "regex:^(STATUS:\\s*retry|REBASED:\\s*false)\\s*$\n",
+      );
+    });
+  }
 
   for (const workflowId of ["feature-dev-merge", "feature-dev-merge-worktree"]) {
     it(`${workflowId} invokes only merge-branch for origin landing`, async () => {

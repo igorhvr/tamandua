@@ -251,11 +251,137 @@ const bugFixBehaviors: ScriptedAgentConfig = {
   },
 };
 
+const MIGRATED_MERGE_WORKFLOWS = [
+  { id: "bug-fix-merge", family: "bug-fix", worktree: false },
+  { id: "bug-fix-merge-worktree", family: "bug-fix", worktree: true },
+  { id: "quarantine-broken-tests-merge", family: "quarantine", worktree: false },
+  { id: "quarantine-broken-tests-merge-worktree", family: "quarantine", worktree: true },
+  { id: "security-audit-merge", family: "security", worktree: false },
+  { id: "security-audit-merge-worktree", family: "security", worktree: true },
+] as const;
+
+function createMigratedMergerBehaviors(
+  family: (typeof MIGRATED_MERGE_WORKFLOWS)[number]["family"],
+): ScriptedAgentConfig {
+  const branch = `scripted-${family}-landing`;
+  const change = family === "quarantine"
+    ? { file: "test/math.test.ts", find: 'it("correctly expects addition"', replace: 'it.skip("correctly expects addition"' }
+    : { file: "src/math.ts", find: "a - b", replace: "a + b" };
+  const commitMessage = family === "quarantine"
+    ? "chore: quarantine broken math test"
+    : family === "security"
+      ? "fix(security): correct unsafe math operation"
+      : "fix: correct add implementation";
+
+  return {
+    agents: {
+      triager: { output: `STATUS: done\nREPO: {{cwd}}\nBRANCH: ${branch}\nSEVERITY: high\nAFFECTED_AREA: src/math.ts\nREPRODUCTION: add returns subtraction\nPROBLEM_STATEMENT: wrong operator` },
+      investigator: { output: "STATUS: done\nROOT_CAUSE: subtraction operator used\nFIX_APPROACH: use addition" },
+      scanner: { output: `STATUS: done\nREPO: {{cwd}}\nBRANCH: ${branch}\nVULNERABILITY_COUNT: 1\nFINDINGS: unsafe arithmetic behavior` },
+      prioritizer: {
+        output: 'STATUS: done\nFIX_PLAN: correct unsafe arithmetic\nCRITICAL_COUNT: 0\nHIGH_COUNT: 1\nDEFERRED: none\nSTORIES_JSON: [{"id":"US-001","title":"Correct arithmetic","description":"Use safe addition","acceptanceCriteria":["addition is used","tests pass"]}]',
+      },
+      setup: {
+        commands: [`git show-ref --verify --quiet "refs/heads/${branch}" && git checkout "${branch}" || git checkout -b "${branch}"`],
+        output: "STATUS: done\nORIGINAL_BRANCH: {{input.ORIGINAL_BRANCH}}\nBUILD_CMD: true\nTEST_CMD: true\nCI_NOTES: scripted fixture\nBASELINE: scripted baseline",
+      },
+      fixer: {
+        edits: [change],
+        commands: ["git add -A", `git commit -m "${commitMessage}"`],
+        output: "STATUS: done\nCHANGES: corrected scripted fixture\nREGRESSION_TEST: scripted coverage",
+      },
+      quarantiner: {
+        edits: [change],
+        commands: ["git add -A", `git commit -m "${commitMessage}"`],
+        output: "STATUS: done\nDISABLED: 1\nFILES_CHANGED: 1\nSUMMARY: quarantined broken math test",
+      },
+      verifier: { output: "STATUS: done\nVERIFIED: scripted change verified\nTESTED_TREE: scripted-tested-tree" },
+      tester: { output: "STATUS: done\nRESULTS: scripted suite passed\nTESTED_TREE: scripted-tested-tree\nAUDIT_AFTER: clean" },
+      merger: {
+        commands: [
+          `expected_tip=$(git -C "{{input.ORIGIN_REPOSITORY}}" rev-parse "refs/heads/{{input.ORIGINAL_BRANCH}}") && TAMANDUA_RUN_ID="{{input.RUN_ID}}" "${process.execPath}" "${cliPath}" merge-branch --origin "{{input.ORIGIN_REPOSITORY}}" --branch "${branch}" --into "{{input.ORIGINAL_BRANCH}}" --expect-tip "$expected_tip" --message "${commitMessage} (squash of ${branch})"`,
+        ],
+        includeCommandOutput: true,
+        output: "STATUS: done\nREBASED: false\nMERGED_INTO: {{input.ORIGINAL_BRANCH}}",
+      },
+    },
+  };
+}
+
 const BUG_FIX_AGENTS = ["triager", "investigator", "setup", "fixer", "verifier", "merger"];
 
 // ── Tests ───────────────────────────────────────────────────────────
 
 describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { concurrency: 3 }, () => {
+  for (const workflow of MIGRATED_MERGE_WORKFLOWS) {
+    it(
+      `${workflow.id}: scripted merger lands through plumbing without switching the origin checkout`,
+      { timeout: 240_000 },
+      async () => {
+        let ctx: ScriptedRunContext | undefined;
+        try {
+          ctx = await startScriptedEnvironment(workflow.id, createMigratedMergerBehaviors(workflow.family));
+          const repoDir = prepareGitRepo(fixtureDir, path.join(ctx.env.root, "origin-repo"));
+          const originalBranch = execSync("git symbolic-ref --short HEAD", { cwd: repoDir, encoding: "utf-8" }).trim();
+          const initialCheckout = `observer/${workflow.id}`;
+          execSync(`git checkout -b "${initialCheckout}"`, { cwd: repoDir, stdio: "ignore" });
+          const targetBranch = workflow.worktree ? originalBranch : initialCheckout;
+          const expectedFinalCheckout = workflow.worktree
+            ? initialCheckout
+            : `scripted-${workflow.family}-landing`;
+          const originTip = execSync(`git rev-parse "refs/heads/${targetBranch}"`, { cwd: repoDir, encoding: "utf-8" }).trim();
+
+          const runArgs = [
+            "workflow", "run", workflow.id, `Exercise plumbing landing for ${workflow.id}`,
+            "--context", `repo=${repoDir}`,
+          ];
+          if (workflow.worktree) {
+            runArgs.push(
+              "--context", `branch=scripted-${workflow.family}-landing`,
+              "--worktree-origin-repository", repoDir,
+              "--worktree-origin-ref", originalBranch,
+            );
+          } else if (workflow.family === "quarantine") {
+            runArgs.push("--context", `branch=${initialCheckout}`);
+          }
+          const runIdPrefix = await spawnWorkflowRun(
+            runArgs,
+            baseEnv(ctx.env.homeDir, ctx.env.controlPort),
+            30_000,
+            repoDir,
+          );
+          const runId = resolveFullRunId(runIdPrefix, ctx.env.tamanduaDir);
+          const status = await waitForRun(ctx, runId, 180_000);
+          assert.ok(status === "completed" || status === "done", `${workflow.id} failed: ${status}\n${diagnostics(ctx)}`);
+
+          const mergedCommit = execSync(`git rev-parse "refs/heads/${targetBranch}"`, { cwd: repoDir, encoding: "utf-8" }).trim();
+          const mergedTree = execSync(`git rev-parse "refs/heads/${targetBranch}^{tree}"`, { cwd: repoDir, encoding: "utf-8" }).trim();
+          const mergeStep = dbRow<{ output: string }>(
+            ctx.env.tamanduaDir,
+            "SELECT output FROM steps WHERE run_id = ? AND step_id = 'finalize_merge'",
+            runId,
+          );
+          assert.notEqual(mergedCommit, originTip, `target ref should advance to the squash commit\n${mergeStep.output}`);
+          assert.equal(
+            execSync("git symbolic-ref --short HEAD", { cwd: repoDir, encoding: "utf-8" }).trim(),
+            expectedFinalCheckout,
+            "origin checkout must stay on its pre-run branch during merger and must not switch to the target",
+          );
+
+          assert.match(mergeStep.output, /^STATUS: landed$/m);
+          assert.match(mergeStep.output, new RegExp(`^MERGED_COMMIT: ${mergedCommit}$`, "m"));
+          assert.match(mergeStep.output, new RegExp(`^MERGED_TREE: ${mergedTree}$`, "m"));
+          assert.match(mergeStep.output, /^CHECKOUT_REFRESH: \S+$/m);
+          assert.match(mergeStep.output, /^STATUS: done$/m);
+          assert.match(mergeStep.output, /^REBASED: false$/m);
+          assert.match(mergeStep.output, new RegExp(`^MERGED_INTO: ${targetBranch}$`, "m"));
+        } finally {
+          await teardown(ctx);
+        }
+      },
+    );
+  }
+
   it(
     "bug-fix-merge-worktree: full pipeline through scripted agents merges the fix",
     { timeout: 240_000 },

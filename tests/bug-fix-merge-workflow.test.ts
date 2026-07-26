@@ -44,22 +44,26 @@ describe("bug-fix-merge workflow", () => {
     assert.doesNotMatch(finalStep!.input, /git push/);
   });
 
-  it("finalize_merge step contains fast-forward-first merge instructions", async () => {
+  it("finalize_merge step contains the atomic plumbing merge instructions", async () => {
     const spec = await loadWorkflowSpec(wfDir);
     const finalStep = spec.steps.find((s) => s.id === "finalize_merge");
     assert.ok(finalStep);
-    // Phase 1: Fast-Forward Check
-    assert.match(finalStep!.input, /git merge-base --is-ancestor \{\{original_branch\}\} \{\{branch\}\}/);
-    assert.match(finalStep!.input, /Phase 1.*Fast-Forward Check/);
+    // Phase 1: capture the target tip and check fast-forward safety against it.
+    assert.match(finalStep!.input, /RUN_ID:\s*\{\{run_id\}\}/);
+    assert.match(finalStep!.input, /ORIGIN_REPOSITORY:\s*\{\{repo\}\}/);
+    assert.match(finalStep!.input, /EXPECT_TIP=.*rev-parse/);
+    assert.match(finalStep!.input, /merge-base --is-ancestor "\$EXPECT_TIP"/);
+    assert.match(finalStep!.input, /Phase 1.*Capture Explicit Target.*Fast-Forward Check/);
     // Phase 2: Rebase
     assert.match(finalStep!.input, /Phase 2.*Rebase/);
-    assert.match(finalStep!.input, /git rebase \{\{original_branch\}\}/);
+    assert.match(finalStep!.input, /git -C \{\{repo\}\} rebase "\$EXPECT_TIP"/);
     assert.match(finalStep!.input, /git rebase --continue/);
-    // Phase 3: Squash Merge (preserved)
-    assert.match(finalStep!.input, /Phase 3.*Squash Merge/);
-    assert.match(finalStep!.input, /git checkout \{\{original_branch\}\}/);
-    assert.match(finalStep!.input, /git merge --squash \{\{branch\}\}/);
-    assert.match(finalStep!.input, /git commit -F <tempfile>/);
+    // Phase 3: atomic plumbing landing, without porcelain origin mutation.
+    assert.match(finalStep!.input, /Phase 3.*Atomic Landing/);
+    assert.match(finalStep!.input, /tamandua merge-branch/);
+    assert.match(finalStep!.input, /--expect-tip "\$EXPECT_TIP"/);
+    assert.match(finalStep!.input, /Preserve MERGE_OUTPUT verbatim/);
+    assert.doesNotMatch(finalStep!.input, /git checkout|git merge --squash|git commit -F/);
     // Output format includes REBASED
     assert.match(finalStep!.input, /REBASED:\s*false/);
     assert.match(finalStep!.input, /ORIGINAL_BRANCH:\s*\{\{original_branch\}\}/);
@@ -140,19 +144,19 @@ describe("bug-fix-merge workflow", () => {
   });
 
   // US-004: Ordering and tester retry absence in step input
-  it("finalize_merge step input places FF check before squash merge (US-004 ordering)", async () => {
+  it("finalize_merge step input places FF check before atomic landing", async () => {
     const spec = await loadWorkflowSpec(wfDir);
     const finalStep = spec.steps.find((s) => s.id === "finalize_merge");
     assert.ok(finalStep);
 
-    const ffIdx = finalStep!.input.search(/git merge-base --is-ancestor/);
-    const squashIdx = finalStep!.input.search(/git merge --squash/);
+    const ffIdx = finalStep!.input.search(/git -C "\$ORIGIN_REPOSITORY" merge-base --is-ancestor/);
+    const landingIdx = finalStep!.input.search(/MERGE_OUTPUT=\$\(tamandua merge-branch/);
 
-    assert.ok(ffIdx >= 0, "must contain git merge-base --is-ancestor");
-    assert.ok(squashIdx >= 0, "must contain git merge --squash");
+    assert.ok(ffIdx >= 0, "must contain the EXPECT_TIP fast-forward check");
+    assert.ok(landingIdx >= 0, "must contain tamandua merge-branch");
     assert.ok(
-      ffIdx < squashIdx,
-      `FF check (pos ${ffIdx}) must appear before squash merge (pos ${squashIdx})`,
+      ffIdx < landingIdx,
+      `FF check (pos ${ffIdx}) must appear before atomic landing (pos ${landingIdx})`,
     );
   });
 
@@ -161,7 +165,7 @@ describe("bug-fix-merge workflow", () => {
     const finalStep = spec.steps.find((s) => s.id === "finalize_merge");
     assert.ok(finalStep);
     assert.doesNotMatch(finalStep!.input, /RETRY_STEP:\s*test/);
-    assert.doesNotMatch(finalStep!.input, /CONFLICT_NOTES/);
+    assert.match(finalStep!.input, /CONFLICT_NOTES/);
   });
 
   // US-002: Verify merger persona files
@@ -192,9 +196,10 @@ describe("bug-fix-merge workflow", () => {
       assert.match(mergerIdentityMd, /Role:.*[Ss]quash/);
     });
 
-    it("AGENTS.md contains commit message guidance and git commit -F instructions", () => {
+    it("AGENTS.md supplies the generated commit message to merge-branch", () => {
       assert.match(mergerAgentsMd, /Commit Message Generation/);
-      assert.match(mergerAgentsMd, /git commit -F/);
+      assert.match(mergerAgentsMd, /--message "\$\(cat "\$MESSAGE_FILE"\)"/);
+      assert.doesNotMatch(mergerAgentsMd, /git commit -F/);
     });
 
     it("AGENTS.md does NOT contain gh pr create or git push", () => {
@@ -208,31 +213,43 @@ describe("bug-fix-merge workflow", () => {
       assert.match(mergerAgentsMd, /Do NOT use a hardcoded one-line commit message/);
     });
 
-    it("AGENTS.md includes fast-forward check as first Required Process step", () => {
-      assert.match(mergerAgentsMd, /Phase 1: Fast-Forward Check/);
-      assert.match(mergerAgentsMd, /git merge-base --is-ancestor \{\{original_branch\}\} \{\{branch\}\}/);
-      // Fast-forward check must appear before squash merge
-      const phase1Index = mergerAgentsMd.indexOf("Phase 1: Fast-Forward Check");
-      const phase3Index = mergerAgentsMd.indexOf("Phase 3: Squash Merge");
-      assert.ok(phase1Index < phase3Index, "Fast-Forward Check must come before Squash Merge");
+    it("AGENTS.md captures EXPECT_TIP before atomic landing", () => {
+      assert.match(mergerAgentsMd, /Phase 1: Capture Target Tip and Check Fast-Forward Safety/);
+      assert.match(mergerAgentsMd, /TARGET_REF="refs\/heads\/\{\{original_branch\}\}"/);
+      assert.match(
+        mergerAgentsMd,
+        /EXPECT_TIP=\$\(git -C "\$ORIGIN_REPOSITORY" rev-parse "\$TARGET_REF"\)/,
+      );
+      assert.match(
+        mergerAgentsMd,
+        /git -C "\$ORIGIN_REPOSITORY" merge-base --is-ancestor "\$EXPECT_TIP" refs\/heads\/\{\{branch\}\}/,
+      );
+      const phase1Index = mergerAgentsMd.indexOf("Phase 1: Capture Target Tip");
+      const phase3Index = mergerAgentsMd.indexOf("Phase 3: Atomic Landing");
+      assert.ok(phase1Index < phase3Index, "target-tip capture must come before atomic landing");
     });
 
     it("AGENTS.md includes rebase path for non-FF case with conflict resolution", () => {
       assert.match(mergerAgentsMd, /Phase 2: Rebase/);
-      assert.match(mergerAgentsMd, /git rebase \{\{original_branch\}\}/);
+      assert.match(mergerAgentsMd, /git -C \{\{repo\}\} rebase "\$EXPECT_TIP"/);
       assert.match(mergerAgentsMd, /git rebase --continue/);
       assert.match(mergerAgentsMd, /fix them carefully|resolve each conflict|If conflicts arise/i);
-      // Bug-fix-merge has no tester — rebase proceeds directly to squash merge
       assert.match(mergerAgentsMd, /RETRY_STEP:\s*verify/);
     });
 
-    it("AGENTS.md guardrails forbid squash merge when not FF-safe", () => {
-      assert.match(mergerAgentsMd, /NEVER squash-merge when the branch is not fast-forward-safe/);
-      assert.match(mergerAgentsMd, /IF YOU REBASED, YOU NEVER MERGE IN THIS INVOCATION/);
+    it("AGENTS.md lands only through the complete merge-branch contract", () => {
+      assert.match(mergerAgentsMd, /IF YOU REBASED, YOU NEVER LAND IN THIS INVOCATION/);
+      assert.match(mergerAgentsMd, /MERGE_OUTPUT=\$\(tamandua merge-branch/);
+      for (const flag of ["--origin", "--branch", "--into", "--expect-tip", "--message"]) {
+        assert.match(mergerAgentsMd, new RegExp(flag));
+      }
+      assert.doesNotMatch(mergerAgentsMd, /git checkout|git merge --squash|git commit -F/);
     });
 
     it("AGENTS.md output format includes REBASED field", () => {
-      assert.match(mergerAgentsMd, /On successful merge[\s\S]*REBASED:\s*false/);
+      assert.match(mergerAgentsMd, /On successful landing[\s\S]*REBASED:\s*false/);
+      assert.match(mergerAgentsMd, /STATUS: landed[\s\S]*MERGED_COMMIT:[\s\S]*MERGED_TREE:/);
+      assert.match(mergerAgentsMd, /MERGE_COMMIT:[\s\S]*MERGED_INTO:[\s\S]*STATUS: done/);
     });
 
     it("AGENTS.md retry path routes to verifier (RETRY_STEP: verify)", () => {
@@ -240,31 +257,16 @@ describe("bug-fix-merge workflow", () => {
       assert.match(mergerAgentsMd, /CONFLICT_NOTES:/);
     });
 
-    it("AGENTS.md guardrails have no contradictory FF + unrelated squash instructions (US-004)", () => {
-      // Acceptance Criteria 4: Every squash-merge mention must be in
-      // a Phase 3 / FF-safe context or the guardrails section.
-      const squashRe = /squash[ -]?merge/gi;
-      let match: RegExpExecArray | null;
-      while ((match = squashRe.exec(mergerAgentsMd)) !== null) {
-        const idx = match.index;
-        // Wide window to capture distant "NEVER" / "only valid paths"
-        // in the guardrails section which describes valid paths.
-        const context = mergerAgentsMd.substring(Math.max(0, idx - 250), idx + 250);
-        assert.ok(
-          context.includes("Phase 3") ||
-            context.includes("FF-safe") ||
-            context.includes("fast-forward-safe") ||
-            context.includes("NEVER") ||
-            context.includes("only valid paths") ||
-            context.includes("is now fast-forward-safe") ||
-            context.includes("IF YOU REBASED") ||
-          context.includes("RETRY_STEP") ||
-          context.includes("MERGED_TREE") ||
-          context.includes("validated") ||
-          context.includes("report retry"),
-          `squash merge mention outside FF-safe context (pos ${idx}): ...${context.substring(230, 270)}...`,
-        );
-      }
+    it("AGENTS.md keeps the origin checkout and index read-only", () => {
+      assert.match(mergerAgentsMd, /origin working tree and index are read-only/i);
+      assert.match(mergerAgentsMd, /only `tamandua merge-branch` may (?:mutate|update) the target ref/i);
+      assert.match(
+        mergerAgentsMd,
+        /never[^\n]*checkout[^\n]*reset[^\n]*symbolic-ref[^\n]*read-tree[^\n]*origin/i,
+      );
+      assert.match(mergerAgentsMd, /STATUS: conflicts/);
+      assert.match(mergerAgentsMd, /STATUS: target_moved/);
+      assert.match(mergerAgentsMd, /other non-zero exit|any other non-zero exit/i);
     });
   });
 

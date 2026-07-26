@@ -6,6 +6,14 @@ import { resolveBundledWorkflowsDir } from "../dist/installer/paths.js";
 
 const TAMANDUA_FOOTER = "Co-Authored-By: Tamandua <tamandua@tetradactyla.org>";
 const CLAUDE_FOOTER_PREFIX = "Co-Authored-By: Claude";
+const MIGRATED_MERGER_WORKFLOW_IDS = [
+  "bug-fix-merge",
+  "bug-fix-merge-worktree",
+  "quarantine-broken-tests-merge",
+  "quarantine-broken-tests-merge-worktree",
+  "security-audit-merge",
+  "security-audit-merge-worktree",
+] as const;
 
 const workflowsDir = resolveBundledWorkflowsDir();
 const workflowIds = readdirSync(workflowsDir, { withFileTypes: true })
@@ -22,7 +30,7 @@ function findPersonaFilesWithCommitInstructions(): { workflowId: string; path: s
     const agentsDir = join(workflowsDir, wfId, "agents");
     if (!existsSync(agentsDir)) continue;
     const agentDirs = readdirSync(agentsDir, { withFileTypes: true })
-      .filter((d) => d.isDirectory());
+      .filter((d) => d.isDirectory() || d.isSymbolicLink());
     for (const agentDir of agentDirs) {
       const agentsMdPath = join(agentsDir, agentDir.name, "AGENTS.md");
       if (!existsSync(agentsMdPath)) continue;
@@ -48,6 +56,19 @@ describe("Tamandua co-author footer", () => {
       paths.some((p) => p.includes("bug-fix-merge")),
       "should include bug-fix-merge merger persona",
     );
+  });
+
+  it("finds all six merger personas migrated to merge-branch", () => {
+    const workflowIdsWithCommitInstructions = new Set(
+      personaFiles.map((file) => file.workflowId),
+    );
+
+    for (const workflowId of MIGRATED_MERGER_WORKFLOW_IDS) {
+      assert.ok(
+        workflowIdsWithCommitInstructions.has(workflowId),
+        `${workflowId}: migrated merger persona must be checked for the Tamandua footer`,
+      );
+    }
   });
 
   it("every bundled persona with commit instructions contains the Tamandua co-author footer", () => {
