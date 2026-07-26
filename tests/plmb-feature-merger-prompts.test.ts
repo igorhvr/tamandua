@@ -34,6 +34,20 @@ const bugFixWorktreePersonaPath = resolve(
   "merger",
   "AGENTS.md",
 );
+const quarantinePersonaPath = resolve(
+  workflowsRoot,
+  "quarantine-broken-tests-merge",
+  "agents",
+  "merger",
+  "AGENTS.md",
+);
+const quarantineWorktreePersonaPath = resolve(
+  workflowsRoot,
+  "quarantine-broken-tests-merge-worktree",
+  "agents",
+  "merger",
+  "AGENTS.md",
+);
 const persona = readFileSync(sharedPersonaPath, "utf8");
 
 interface MergerPersonaConsumer {
@@ -160,6 +174,8 @@ describe("US-003 PLMB feature merger prompt contracts", () => {
         "bug-fix-merge-worktree",
         "feature-dev-merge",
         "feature-dev-merge-worktree",
+        "quarantine-broken-tests-merge",
+        "quarantine-broken-tests-merge-worktree",
       ],
     );
 
@@ -170,9 +186,14 @@ describe("US-003 PLMB feature merger prompt contracts", () => {
       uniquePersonas.set(consumer.realpath, consumer);
     }
 
-    assert.equal(uniquePersonas.size, 2, "feature and bug-fix variants must share per-family personas");
+    assert.equal(
+      uniquePersonas.size,
+      3,
+      "feature, bug-fix, and quarantine variants must share per-family personas",
+    );
     assert.equal(consumers[0]?.realpath, consumers[1]?.realpath);
     assert.equal(consumers[2]?.realpath, consumers[3]?.realpath);
+    assert.equal(consumers[4]?.realpath, consumers[5]?.realpath);
   });
 
   it("enforces the plumbing contract for bug-fix merge variants", () => {
@@ -186,6 +207,26 @@ describe("US-003 PLMB feature merger prompt contracts", () => {
     assert.match(bugFixPersona, /STATUS: conflicts/);
     assert.match(bugFixPersona, /STATUS: target_moved/);
     assert.doesNotMatch(bugFixPersona, /git checkout|git merge --squash|git commit -F/);
+  });
+
+  it("enforces the plumbing contract and message vocabulary for quarantine merge variants", () => {
+    assert.equal(realpathSync(quarantineWorktreePersonaPath), realpathSync(quarantinePersonaPath));
+    const quarantinePersona = readFileSync(quarantinePersonaPath, "utf8");
+    assertRetryBeforeMergeBranch(quarantinePersona, "quarantine merger persona");
+    assertCompleteMergeBranchInvocation(quarantinePersona);
+    assertManagedParkingGuardrail(quarantinePersona, "quarantine merger persona");
+    assert.match(quarantinePersona, /RETRY_STEP: verify/);
+    assert.match(quarantinePersona, /Use `chore:` prefix/);
+    assert.match(quarantinePersona, /git diff --stat \{\{original_branch\}\}\.\.\{\{branch\}\}/);
+    assert.match(quarantinePersona, /`\{\{disabled\}\}`|DISABLED/);
+    assert.match(quarantinePersona, /`\{\{summary\}\}`|SUMMARY/);
+    assert.match(quarantinePersona, /STATUS: conflicts/);
+    assert.match(quarantinePersona, /STATUS: target_moved/);
+    assert.match(
+      quarantinePersona,
+      /STATUS: landed[\s\S]*MERGED_COMMIT:[\s\S]*MERGED_TREE:[\s\S]*REBASED: false[\s\S]*MERGE_COMMIT:[\s\S]*MERGED_INTO:[\s\S]*STATUS: done/,
+    );
+    assert.doesNotMatch(quarantinePersona, /git checkout|git merge --squash|git commit -F/);
   });
 
   it("maps conflicts and target movement to tester revalidation and fails other errors", () => {
