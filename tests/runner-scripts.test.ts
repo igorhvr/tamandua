@@ -689,6 +689,231 @@ describe("run-all-lanes.sh", () => {
       fs.rmSync(scopedTmpDir, { recursive: true, force: true });
     }
   });
+
+  // --- Drift Detection Tests ---
+
+  function setupGitRepo(tmpDir) {
+    execSync("git init", { cwd: tmpDir, stdio: "pipe" });
+    execSync("git config user.email test@test.com", { cwd: tmpDir, stdio: "pipe" });
+    execSync("git config user.name Test", { cwd: tmpDir, stdio: "pipe" });
+
+    fs.mkdirSync(path.join(tmpDir, "src"), { recursive: true });
+    fs.mkdirSync(path.join(tmpDir, "tests"), { recursive: true });
+    writeText(path.join(tmpDir, "src", "tracked.test.ts"), passTestContent());
+    writeText(path.join(tmpDir, "tests", "serial-files.txt"), "src/tracked.test.ts\n");
+    writeText(path.join(tmpDir, "package.json"), JSON.stringify({
+      name: "test",
+      scripts: { build: "echo 'build ok'" },
+    }));
+
+    const scriptsDir = path.join(tmpDir, "scripts");
+    fs.mkdirSync(scriptsDir, { recursive: true });
+
+    const serialStub = [
+      '#!/bin/bash',
+      'set -euo pipefail',
+      'REPO_ROOT="${TAMANDUA_REPO_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"',
+      'if [ "${DRIFT_MUTATE_TRACKED:-0}" = "1" ]; then',
+      '  echo "// mutated by drift stub" >> "$REPO_ROOT/src/tracked.test.ts"',
+      'fi',
+      'if [ "${DRIFT_CREATE_COMMIT:-0}" = "1" ]; then',
+      '  git -C "$REPO_ROOT" commit --allow-empty -m "drift commit"',
+      'fi',
+      'if [ "${DRIFT_CREATE_UNTRACKED:-0}" = "1" ]; then',
+      '  echo "log output" > "$REPO_ROOT/test-output.log"',
+      'fi',
+      'exit ${SERIAL_EXIT_CODE:-0}',
+    ].join("\n");
+    writeText(path.join(scriptsDir, "run-serial-tests.sh"), serialStub);
+    fs.chmodSync(path.join(scriptsDir, "run-serial-tests.sh"), 0o755);
+
+    const parallelStub = [
+      '#!/bin/bash',
+      'set -euo pipefail',
+      'exit ${PARALLEL_EXIT_CODE:-0}',
+    ].join("\n");
+    writeText(path.join(scriptsDir, "run-parallel-tests.sh"), parallelStub);
+    fs.chmodSync(path.join(scriptsDir, "run-parallel-tests.sh"), 0o755);
+
+    execSync("git add -A", { cwd: tmpDir, stdio: "pipe" });
+    execSync("git commit -m initial", { cwd: tmpDir, stdio: "pipe" });
+  }
+
+  it("drift: quiescent tree green lanes exits 0 with no drift", () => {
+    const tmpDir = makeTmpDir();
+    try {
+      setupGitRepo(tmpDir);
+
+      const result = execFileSync("bash", [ALL_LANES_SCRIPT], {
+        cwd: tmpDir,
+        env: cleanChildEnv({ HOME: tmpDir, TAMANDUA_REPO_ROOT: tmpDir, TAMANDUA_TEST_GUARD: "0" }),
+        stdio: "pipe",
+        encoding: "utf-8",
+      });
+
+      assert.ok(
+        result.includes("Serial lane:   PASSED"),
+        "summary must show serial PASSED",
+      );
+      assert.ok(
+        result.includes("Parallel lane: PASSED"),
+        "summary must show parallel PASSED",
+      );
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("drift: quiescent tree red serial lane exits 1 with no drift", () => {
+    const tmpDir = makeTmpDir();
+    try {
+      setupGitRepo(tmpDir);
+
+      try {
+        execFileSync("bash", [ALL_LANES_SCRIPT], {
+          cwd: tmpDir,
+          env: cleanChildEnv({ HOME: tmpDir, TAMANDUA_REPO_ROOT: tmpDir, TAMANDUA_TEST_GUARD: "0", SERIAL_EXIT_CODE: "1" }),
+          stdio: "pipe",
+          encoding: "utf-8",
+        });
+        assert.fail("Should exit non-zero on serial failure");
+      } catch (e) {
+        assert.equal(e.status, 1, "exit code must be 1 (lane failure), not 3 (drift)");
+        const stderr = e.stderr || "";
+        assert.ok(
+          !stderr.includes("TREE DRIFT DETECTED"),
+          "stderr must not contain drift message on quiescent tree",
+        );
+        const stdout = e.stdout || "";
+        assert.ok(
+          stdout.includes("Serial lane:   FAILED"),
+          "summary must show serial FAILED",
+        );
+      }
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("drift: detects drift when serial lane mutates a tracked file", () => {
+    const tmpDir = makeTmpDir();
+    try {
+      setupGitRepo(tmpDir);
+
+      try {
+        execFileSync("bash", [ALL_LANES_SCRIPT], {
+          cwd: tmpDir,
+          env: cleanChildEnv({ HOME: tmpDir, TAMANDUA_REPO_ROOT: tmpDir, TAMANDUA_TEST_GUARD: "0", DRIFT_MUTATE_TRACKED: "1" }),
+          stdio: "pipe",
+          encoding: "utf-8",
+        });
+        assert.fail("Should exit 3 on drift");
+      } catch (e) {
+        assert.equal(e.status, 3, "exit code must be 3 (drift detected)");
+        const stderr = e.stderr || "";
+        assert.ok(
+          stderr.includes("TREE DRIFT DETECTED"),
+          "stderr must contain drift message",
+        );
+        assert.ok(
+          stderr.includes("RESULTS VOID"),
+          "stderr must contain RESULTS VOID",
+        );
+        const stdout = e.stdout || "";
+        assert.ok(
+          stdout.includes("Tree drift:    DETECTED"),
+          "summary must show drift detected",
+        );
+        assert.ok(
+          stdout.includes("(exit code 3)"),
+          "summary must mention exit code 3",
+        );
+      }
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("drift: detects drift when serial lane creates a commit (HEAD change)", () => {
+    const tmpDir = makeTmpDir();
+    try {
+      setupGitRepo(tmpDir);
+
+      try {
+        execFileSync("bash", [ALL_LANES_SCRIPT], {
+          cwd: tmpDir,
+          env: cleanChildEnv({ HOME: tmpDir, TAMANDUA_REPO_ROOT: tmpDir, TAMANDUA_TEST_GUARD: "0", DRIFT_CREATE_COMMIT: "1" }),
+          stdio: "pipe",
+          encoding: "utf-8",
+        });
+        assert.fail("Should exit 3 on drift from commit");
+      } catch (e) {
+        assert.equal(e.status, 3, "exit code must be 3 (drift via HEAD change)");
+        const stderr = e.stderr || "";
+        assert.ok(
+          stderr.includes("TREE DRIFT DETECTED"),
+          "stderr must contain drift message for HEAD change",
+        );
+      }
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("drift: untracked file churn does not trigger drift", () => {
+    const tmpDir = makeTmpDir();
+    try {
+      setupGitRepo(tmpDir);
+
+      // DRIFT_CREATE_UNTRACKED creates test-output.log (untracked).
+      // With --untracked-files=no in the fingerprint, this must not trigger drift.
+      const result = execFileSync("bash", [ALL_LANES_SCRIPT], {
+        cwd: tmpDir,
+        env: cleanChildEnv({ HOME: tmpDir, TAMANDUA_REPO_ROOT: tmpDir, TAMANDUA_TEST_GUARD: "0", DRIFT_CREATE_UNTRACKED: "1" }),
+        stdio: "pipe",
+        encoding: "utf-8",
+      });
+
+      assert.ok(
+        result.includes("Serial lane:   PASSED"),
+        "lanes should pass despite untracked file churn",
+      );
+      assert.ok(
+        !result.includes("TREE DRIFT"),
+        "no drift message on untracked churn",
+      );
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("drift: non-git directory bypasses drift check and lanes run normally", () => {
+    const tmpDir = makeTmpDir();
+    try {
+      setupTempRepo(tmpDir, {
+        serialFiles: ["src/serial.test.ts"],
+        parallelFiles: ["src/parallel.test.ts"],
+      });
+
+      const result = execFileSync("bash", [ALL_LANES_SCRIPT], {
+        cwd: tmpDir,
+        env: cleanChildEnv({ HOME: tmpDir, TAMANDUA_REPO_ROOT: tmpDir, TAMANDUA_TEST_GUARD: "0" }),
+        stdio: "pipe",
+        encoding: "utf-8",
+      });
+
+      assert.ok(
+        result.includes("PRLL Test Suite Summary"),
+        "non-git directory must still run tests",
+      );
+      assert.ok(
+        !result.includes("TREE DRIFT"),
+        "no drift message in non-git directory",
+      );
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("prll-verify.sh", () => {

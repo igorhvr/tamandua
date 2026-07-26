@@ -2,7 +2,8 @@
 # Run both serial and parallel test lanes.
 # Serial lane runs first, parallel lane runs after.
 # Both lanes always run regardless of the other's outcome.
-# Exit code: 0 only when both lanes pass, non-zero when either fails.
+# Exit code: 0 when both lanes pass, 1 when either lane fails,
+#   3 when tree drift detected (results void).
 set -uo pipefail
 
 REPO_ROOT="${TAMANDUA_REPO_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
@@ -20,6 +21,17 @@ else
   tail -n 20 "$BUILD_LOG" >&2
   echo "---" >&2
   exit 1
+fi
+
+# --- Tree Drift Detection: fingerprint the working tree after build ---
+# If the repo changes mid-run, test results are chimeric and void.
+DRIFT_DETECTED=0
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  FINGERPRINT_HEAD=$(git rev-parse HEAD)
+  FINGERPRINT_STATUS=$(git --no-optional-locks status --porcelain --untracked-files=no)
+else
+  FINGERPRINT_HEAD=""
+  FINGERPRINT_STATUS=""
 fi
 
 export TAMANDUA_TEST_GUARD="${TAMANDUA_TEST_GUARD:-1}"
@@ -61,6 +73,27 @@ else
 fi
 echo ""
 
+# --- Serial drift check ---
+if [ -n "$FINGERPRINT_HEAD" ]; then
+  CHECK_HEAD=$(git rev-parse HEAD)
+  CHECK_STATUS=$(git --no-optional-locks status --porcelain --untracked-files=no)
+  if [ "$FINGERPRINT_HEAD" != "$CHECK_HEAD" ] || [ "$FINGERPRINT_STATUS" != "$CHECK_STATUS" ]; then
+    DRIFT_DETECTED=1
+    echo "" >&2
+    echo "============================================" >&2
+    echo "  TREE DRIFT DETECTED" >&2
+    echo "============================================" >&2
+    echo "  The repository changed while tests were running — RESULTS VOID" >&2
+    echo "  HEAD before: $FINGERPRINT_HEAD" >&2
+    echo "  HEAD after:  $CHECK_HEAD" >&2
+    echo "  Status before: $FINGERPRINT_STATUS" >&2
+    echo "  Status after:  $CHECK_STATUS" >&2
+    echo "  Re-run npm test on a quiescent tree." >&2
+    echo "============================================" >&2
+    echo "" >&2
+  fi
+fi
+
 # --- Parallel Lane ---
 echo ">>> Starting PARALLEL lane (default concurrency)..."
 bash "$REPO_ROOT/scripts/run-parallel-tests.sh" || PARALLEL_EXIT=$?
@@ -73,13 +106,44 @@ else
 fi
 echo ""
 
+# --- Parallel drift check ---
+if [ -n "$FINGERPRINT_HEAD" ]; then
+  CHECK_HEAD=$(git rev-parse HEAD)
+  CHECK_STATUS=$(git --no-optional-locks status --porcelain --untracked-files=no)
+  if [ "$FINGERPRINT_HEAD" != "$CHECK_HEAD" ] || [ "$FINGERPRINT_STATUS" != "$CHECK_STATUS" ]; then
+    DRIFT_DETECTED=1
+    echo "" >&2
+    echo "============================================" >&2
+    echo "  TREE DRIFT DETECTED" >&2
+    echo "============================================" >&2
+    echo "  The repository changed while tests were running — RESULTS VOID" >&2
+    echo "  HEAD before: $FINGERPRINT_HEAD" >&2
+    echo "  HEAD after:  $CHECK_HEAD" >&2
+    echo "  Status before: $FINGERPRINT_STATUS" >&2
+    echo "  Status after:  $CHECK_STATUS" >&2
+    echo "  Re-run npm test on a quiescent tree." >&2
+    echo "============================================" >&2
+    echo "" >&2
+  fi
+fi
+
 # --- Final Summary ---
 echo "============================================"
 echo "  PRLL Test Suite Summary"
 echo "============================================"
-echo "  Serial lane:   $([ "$SERIAL_EXIT" -eq 0 ] && echo "PASSED" || echo "FAILED")"
-echo "  Parallel lane: $([ "$PARALLEL_EXIT" -eq 0 ] && echo "PASSED" || echo "FAILED")"
-echo "============================================"
+if [ "$DRIFT_DETECTED" -eq 1 ]; then
+  echo "  Tree drift:    DETECTED — RESULTS VOID (exit code 3)"
+  echo "  Serial lane:   $([ "$SERIAL_EXIT" -eq 0 ] && echo "PASSED" || echo "FAILED") (void)"
+  echo "  Parallel lane: $([ "$PARALLEL_EXIT" -eq 0 ] && echo "PASSED" || echo "FAILED") (void)"
+  echo "============================================"
+  echo "" >&2
+  echo "  Re-run npm test on a quiescent tree." >&2
+  exit 3
+else
+  echo "  Serial lane:   $([ "$SERIAL_EXIT" -eq 0 ] && echo "PASSED" || echo "FAILED")"
+  echo "  Parallel lane: $([ "$PARALLEL_EXIT" -eq 0 ] && echo "PASSED" || echo "FAILED")"
+  echo "============================================"
+fi
 
 if [ "$SERIAL_EXIT" -eq 0 ] && [ "$PARALLEL_EXIT" -eq 0 ]; then
   exit 0
