@@ -759,6 +759,15 @@ describe("run-all-lanes.sh", () => {
         result.includes("Parallel lane: PASSED"),
         "summary must show parallel PASSED",
       );
+      // Assert NO drift output for clean quiescent tree
+      assert.ok(
+        !result.includes("TREE DRIFT"),
+        "must not contain TREE DRIFT text on clean quiescent tree: " + result.slice(0, 500),
+      );
+      assert.ok(
+        !result.includes("Tree drift:"),
+        "must not contain Tree drift: summary line on clean tree: " + result.slice(0, 500),
+      );
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
@@ -882,6 +891,55 @@ describe("run-all-lanes.sh", () => {
         !result.includes("TREE DRIFT"),
         "no drift message on untracked churn",
       );
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("drift: red serial lane + drift — exit code 3 beats lane failure, summary shows (void)", () => {
+    const tmpDir = makeTmpDir();
+    try {
+      setupGitRepo(tmpDir);
+
+      try {
+        execFileSync("bash", [ALL_LANES_SCRIPT], {
+          cwd: tmpDir,
+          env: cleanChildEnv({
+            HOME: tmpDir,
+            TAMANDUA_REPO_ROOT: tmpDir,
+            TAMANDUA_TEST_GUARD: "0",
+            SERIAL_EXIT_CODE: "1",
+            DRIFT_MUTATE_TRACKED: "1",
+          }),
+          stdio: "pipe",
+          encoding: "utf-8",
+        });
+        assert.fail("Should exit non-zero when serial lane fails AND drift detected");
+      } catch (e) {
+        // Drift exit code (3) beats lane failure (1)
+        assert.equal(e.status, 3, "exit code must be 3 (drift), not 1 (lane failure)");
+
+        const stderr = e.stderr || "";
+        assert.ok(
+          stderr.includes("TREE DRIFT DETECTED"),
+          "stderr must contain drift message: " + stderr.slice(0, 500),
+        );
+
+        const stdout = e.stdout || "";
+        assert.ok(
+          stdout.includes("Tree drift:    DETECTED"),
+          "summary must show drift detected: " + stdout.slice(0, 500),
+        );
+        assert.ok(
+          stdout.includes("(exit code 3)"),
+          "summary must mention exit code 3: " + stdout.slice(0, 500),
+        );
+        // Lanes should be marked (void) when drift is detected
+        assert.ok(
+          stdout.includes("(void)"),
+          "lanes must be marked (void) when drift detected: " + stdout.slice(0, 500),
+        );
+      }
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }

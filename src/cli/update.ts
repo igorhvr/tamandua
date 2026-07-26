@@ -161,6 +161,50 @@ async function readGitHead(sourcePath: string, runCommand: RunCommand): Promise<
   return head;
 }
 
+/**
+ * Check if the local checkout has commits that the upstream does not have.
+ * Returns false if upstream doesn't exist or cannot be reached.
+ * Verifies remote reachability explicitly so network failures are not
+ * misclassified as divergence.
+ */
+async function checkAheadOfUpstream(sourcePath: string, runCommand: RunCommand): Promise<{ ahead: boolean; remoteOk: boolean }> {
+  // First verify the remote is reachable
+  let remoteOk = false;
+  try {
+    await runCommand("git", ["ls-remote", "--heads", "--exit-code", "origin"], {
+      cwd: sourcePath,
+      stdio: "pipe",
+    });
+    remoteOk = true;
+  } catch {
+    // Remote unreachable
+  }
+
+  // Verify the upstream remote-tracking ref exists
+  let upstreamExists = false;
+  try {
+    await runCommand("git", ["rev-parse", "@{u}"], { cwd: sourcePath, stdio: "pipe" });
+    upstreamExists = true;
+  } catch {
+    // No upstream configured or unreachable — not divergence
+  }
+
+  if (!upstreamExists) return { ahead: false, remoteOk };
+
+  // Count commits that exist locally but not on upstream
+  try {
+    const result = await runCommand("git", ["rev-list", "--count", "@{u}..HEAD"], {
+      cwd: sourcePath,
+      stdio: "pipe",
+    });
+    const count = parseInt(result.stdout.trim(), 10);
+    return { ahead: count > 0, remoteOk };
+  } catch {
+    // Plumbing probe failed (e.g. broken ref) — treat as not provably divergence
+    return { ahead: false, remoteOk };
+  }
+}
+
 function formatActiveRuns(activeRuns: ActiveRunInfo[]): string {
   return activeRuns
     .map((run) => `  - ${run.id}: [${run.status}] ${run.task}`)
@@ -305,20 +349,36 @@ export async function runUpdate(options: RunUpdateOptions = {}): Promise<UpdateR
   output.log("Pulling latest changes...");
 
   try {
-    await runCommand("git", ["pull", "--ff-only"], { cwd: sourcePath, stdio: "inherit" });
-  } catch {
-    // ff-only pull failed — local is ahead of or diverged from origin.
-    // --ff-only exits cleanly (non-zero + no side-effects) so there is
-    // no rebase state and HEAD stays attached.
-    if (options.force) {
-      output.log("skipping pull: local checkout ahead of/diverged from origin (--force)");
+    await runCommand("git", ["pull", "--ff-only"], { cwd: sourcePath, stdio: "pipe" });
+  } catch (err) {
+    // ff-only pull failed — determine if it's genuine divergence or a pull failure
+    const pullError = err instanceof Error ? err.message : String(err);
+    const { ahead, remoteOk } = await checkAheadOfUpstream(sourcePath, runCommand);
+
+    if (ahead && remoteOk) {
+      // Genuine divergence: local has commits upstream does not have,
+      // and the remote was reachable (so the pull failure was from --ff-only)
+      // --ff-only exits cleanly (non-zero + no side-effects) so there is
+      // no rebase state and HEAD stays attached.
+      if (options.force) {
+        output.log("skipping pull: local checkout ahead of/diverged from origin (--force)");
+      } else {
+        output.warn(
+          `Source checkout at ${sourcePath} has local commits origin does not have (or histories have diverged). Not pulling.`,
+        );
+        output.warn(
+          "Commit/stash/push or reset your local changes, or run `tamandua update --force` to skip the pull and rebuild+reinstall the current checkout as-is.",
+        );
+        return { status: "refused_diverged", sourcePath, head: beforeHead };
+      }
+    } else if (options.force) {
+      // Pull failed for non-divergence reason (network, auth, missing upstream)
+      // With --force: proceed with rebuild-only, but say what actually happened
+      output.log(`skipping pull: pull failed — rebuilding current checkout as-is (${pullError})`);
     } else {
-      output.warn(
-        `Source checkout at ${sourcePath} has local commits origin does not have (or histories have diverged). Not pulling.`,
-      );
-      output.warn(
-        "Commit/stash/push or reset your local changes, or run `tamandua update --force` to skip the pull and rebuild+reinstall the current checkout as-is.",
-      );
+      // Pull failed for non-divergence reason, no --force
+      output.warn(`git pull failed: ${pullError}`);
+      output.warn("Aborting update. Fix the pull failure or run `tamandua update --force` to rebuild the current checkout as-is.");
       return { status: "refused_diverged", sourcePath, head: beforeHead };
     }
   }
