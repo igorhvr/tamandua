@@ -72,7 +72,7 @@ function createOutput(): { output: UpdateOutput; logs: string[]; warnings: strin
   };
 }
 
-function createRunCommand(heads: string[], calls: string[]): RunCommand {
+function createRunCommand(heads: string[], calls: string[], opts?: { pullShouldFail?: boolean }): RunCommand {
   let headIndex = 0;
   return async (command, args, options) => {
     calls.push(`${command} ${args.join(" ")}`.trim());
@@ -84,8 +84,11 @@ function createRunCommand(heads: string[], calls: string[]): RunCommand {
       return { stdout: `${head}\n`, stderr: "" };
     }
 
-    if (command === "git" && args.join(" ") === "pull") {
+    if (command === "git" && args[0] === "pull" && args[1] === "--ff-only") {
       assert.equal(options.stdio, "inherit");
+      if (opts?.pullShouldFail) {
+        throw new Error("Command failed (exit code 128): git pull --ff-only");
+      }
       return { stdout: "", stderr: "" };
     }
 
@@ -165,7 +168,7 @@ describe("tamandua update command helpers", () => {
       assert.equal(result.status, "no_change");
       assert.deepEqual(commands, [
         "git rev-parse HEAD",
-        "git pull",
+        "git pull --ff-only",
         "git rev-parse HEAD",
       ]);
       assert.match(logs.join("\n"), /No source changes after git pull/);
@@ -210,7 +213,7 @@ describe("tamandua update command helpers", () => {
       assert.equal(result.status, "blocked_active_runs");
       assert.deepEqual(commands, [
         "git rev-parse HEAD",
-        "git pull",
+        "git pull --ff-only",
         "git rev-parse HEAD",
         "./build-and-install",
       ]);
@@ -344,7 +347,7 @@ describe("tamandua update command helpers", () => {
       assert.equal(result.status, "updated");
       assert.deepEqual(commands, [
         "git rev-parse HEAD",
-        "git pull",
+        "git pull --ff-only",
         "git rev-parse HEAD",
         "./build-and-install",
       ]);
@@ -389,6 +392,174 @@ describe("tamandua update command helpers", () => {
 
       assert.equal(result.status, "updated");
       assert.notDeepEqual(result.status, "no_change");
+    } finally {
+      fs.rmSync(sourcePath, { recursive: true, force: true });
+    }
+  });
+
+  // --- ff-only divergence tests ---
+
+  it("refuses when local is ahead of origin (ff-only pull fails, no --force)", async () => {
+    const sourcePath = createSourceRoot();
+    const commands: string[] = [];
+    const { output, logs, warnings } = createOutput();
+    const sha = crypto.randomBytes(8).toString('hex');
+
+    try {
+      const result = await runUpdate({
+        sourcePath,
+        output,
+        runCommand: createRunCommand([sha], commands, { pullShouldFail: true }),
+        services: createServices({
+          daemon: { running: true, pid: 111111, port: 4601 },
+          dashboard: { running: true, pid: 222222, port: 4602 },
+          mcp: { running: false, pid: null, port: 4603 },
+        }),
+      });
+
+      assert.equal(result.status, "refused_diverged");
+      // Should only have read HEAD and attempted pull — no build, no service stops
+      assert.deepEqual(commands, [
+        "git rev-parse HEAD",
+        "git pull --ff-only",
+      ]);
+      assert.match(warnings.join("\n"), /Source checkout at .+ has local commits origin does not have/);
+      assert.match(warnings.join("\n"), /tamandua update --force/);
+      // No service stop logs — refusal happens before service stops
+      assert.ok(!logs.some(l => /Stopping|stop/i.test(l)), "no service stop messages in logs");
+    } finally {
+      fs.rmSync(sourcePath, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses on diverged histories (same as local-ahead)", async () => {
+    const sourcePath = createSourceRoot();
+    const commands: string[] = [];
+    const { output, warnings } = createOutput();
+    const sha = crypto.randomBytes(8).toString('hex');
+
+    try {
+      const result = await runUpdate({
+        sourcePath,
+        output,
+        runCommand: createRunCommand([sha], commands, { pullShouldFail: true }),
+        services: createServices({
+          daemon: { running: false, pid: null, port: 4701 },
+          dashboard: { running: false, pid: null, port: 4702 },
+          mcp: { running: true, pid: 333333, port: 4703 },
+        }),
+      });
+
+      assert.equal(result.status, "refused_diverged");
+      assert.deepEqual(commands, [
+        "git rev-parse HEAD",
+        "git pull --ff-only",
+      ]);
+      assert.match(warnings.join("\n"), /Source checkout at .+ has local commits origin does not have/);
+      assert.match(warnings.join("\n"), /tamandua update --force/);
+    } finally {
+      fs.rmSync(sourcePath, { recursive: true, force: true });
+    }
+  });
+
+  it("ahead + --force skips pull and proceeds with rebuild", async () => {
+    const sourcePath = createSourceRoot();
+    const commands: string[] = [];
+    const serviceCalls: string[] = [];
+    const installed: string[] = [];
+    const { output, logs } = createOutput();
+    const sha = crypto.randomBytes(8).toString('hex');
+
+    try {
+      const result = await runUpdate({
+        force: true,
+        sourcePath,
+        output,
+        runCommand: createRunCommand([sha, sha], commands, { pullShouldFail: true }),
+        services: createServices({
+          daemon: { running: true, pid: 111111, port: 4801 },
+          dashboard: { running: false, pid: null, port: 4802 },
+          mcp: { running: false, pid: null, port: 4803 },
+        }, serviceCalls),
+        checkActiveRuns: async () => [],
+        listWorkflows: async () => ["bug-fix"],
+        installWorkflowById: async (workflowId) => {
+          installed.push(workflowId);
+        },
+        waitForProcessExit: async () => {},
+      });
+
+      assert.equal(result.status, "updated");
+      // Pull attempted and failed, then rebuild proceeds
+      assert.deepEqual(commands, [
+        "git rev-parse HEAD",
+        "git pull --ff-only",
+        "git rev-parse HEAD",
+        "./build-and-install",
+      ]);
+      assert.match(logs.join("\n"), /skipping pull: local checkout ahead of\/diverged from origin \(--force\)/);
+      assert.match(logs.join("\n"), /--force set; rebuilding/);
+      assert.deepEqual(installed, ["bug-fix"]);
+      assert.deepEqual(serviceCalls, [
+        "snapshot",
+        "stopDaemon",
+        "startDaemon:4801",
+      ]);
+    } finally {
+      fs.rmSync(sourcePath, { recursive: true, force: true });
+    }
+  });
+
+  it("after refusal, subsequent behind-origin update works", async () => {
+    const sourcePath = createSourceRoot();
+    const { output, warnings } = createOutput();
+    const sha = crypto.randomBytes(8).toString('hex');
+    const sha2 = crypto.randomBytes(8).toString('hex');
+
+    try {
+      // First update: pull fails, get refused
+      const commands1: string[] = [];
+      const result1 = await runUpdate({
+        sourcePath,
+        output,
+        runCommand: createRunCommand([sha], commands1, { pullShouldFail: true }),
+        services: createServices({
+          daemon: { running: false, pid: null, port: 4901 },
+          dashboard: { running: false, pid: null, port: 4902 },
+          mcp: { running: false, pid: null, port: 4903 },
+        }),
+      });
+
+      assert.equal(result1.status, "refused_diverged");
+      assert.match(warnings.join("\n"), /Source checkout at .+ has local commits origin does not have/);
+
+      // Generate fresh output/warnings for second call
+      const { output: output2, warnings: warnings2 } = createOutput();
+
+      // Second update: behind-origin (pull succeeds, heads differ)
+      const cmd2: string[] = [];
+      const result2 = await runUpdate({
+        sourcePath,
+        output: output2,
+        runCommand: createRunCommand([sha, sha2], cmd2),
+        services: createServices({
+          daemon: { running: false, pid: null, port: 4901 },
+          dashboard: { running: false, pid: null, port: 4902 },
+          mcp: { running: false, pid: null, port: 4903 },
+        }),
+        checkActiveRuns: async () => [],
+        listWorkflows: async () => ["bug-fix"],
+        installWorkflowById: async () => {},
+        waitForProcessExit: async () => {},
+      });
+
+      assert.equal(result2.status, "updated");
+      assert.deepEqual(cmd2, [
+        "git rev-parse HEAD",
+        "git pull --ff-only",
+        "git rev-parse HEAD",
+        "./build-and-install",
+      ]);
     } finally {
       fs.rmSync(sourcePath, { recursive: true, force: true });
     }

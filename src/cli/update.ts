@@ -63,6 +63,7 @@ export type RunCommand = (
 export type UpdateResult =
   | { status: "no_change"; sourcePath: string; head: string }
   | { status: "blocked_active_runs"; sourcePath: string; beforeHead: string; afterHead: string; activeRuns: ActiveRunInfo[] }
+  | { status: "refused_diverged"; sourcePath: string; head: string }
   | { status: "updated"; sourcePath: string; beforeHead: string; afterHead: string; services: UpdateServiceSnapshot; installedWorkflows: string[] };
 
 export interface RunUpdateOptions {
@@ -302,7 +303,25 @@ export async function runUpdate(options: RunUpdateOptions = {}): Promise<UpdateR
   const beforeHead = await readGitHead(sourcePath, runCommand);
   output.log(`Tamandua source: ${sourcePath}`);
   output.log("Pulling latest changes...");
-  await runCommand("git", ["pull"], { cwd: sourcePath, stdio: "inherit" });
+
+  try {
+    await runCommand("git", ["pull", "--ff-only"], { cwd: sourcePath, stdio: "inherit" });
+  } catch {
+    // ff-only pull failed — local is ahead of or diverged from origin.
+    // --ff-only exits cleanly (non-zero + no side-effects) so there is
+    // no rebase state and HEAD stays attached.
+    if (options.force) {
+      output.log("skipping pull: local checkout ahead of/diverged from origin (--force)");
+    } else {
+      output.warn(
+        `Source checkout at ${sourcePath} has local commits origin does not have (or histories have diverged). Not pulling.`,
+      );
+      output.warn(
+        "Commit/stash/push or reset your local changes, or run `tamandua update --force` to skip the pull and rebuild+reinstall the current checkout as-is.",
+      );
+      return { status: "refused_diverged", sourcePath, head: beforeHead };
+    }
+  }
 
   const afterHead = await readGitHead(sourcePath, runCommand);
   if (beforeHead === afterHead) {

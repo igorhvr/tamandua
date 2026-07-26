@@ -97,8 +97,10 @@ In order, it does this:
   1. Resolves the installed Tamandua source checkout and verifies it has
      package.json and build-and-install.
   2. Reads current git HEAD.
-  3. Runs git pull in that checkout, using the checkout's current
-     branch/remote config.
+  3. Runs git pull --ff-only in that checkout. On divergence (local
+     ahead or history forked from origin) the update stops before any
+     destructive steps, with an actionable message listing recovery
+     options. Use --force to skip the pull and rebuild as-is.
   4. Reads git HEAD again.
   5. If HEAD did not change and --force is not set, it stops there: no
      build, no workflow install, no service restart. With --force, it

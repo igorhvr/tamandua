@@ -140,7 +140,7 @@ describe("update exports", () => {
           revParseCalls++;
           return { stdout: fakeHead, stderr: "" };
         }
-        if (command === "git" && args[0] === "pull") {
+        if (command === "git" && args[0] === "pull" && args[1] === "--ff-only") {
           return { stdout: "Already up to date.", stderr: "" };
         }
         throw new Error(`Unexpected command: ${command} ${args.join(" ")}`);

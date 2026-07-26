@@ -448,7 +448,7 @@ describe("--help infrastructure", () => {
       // Step-by-step detail
       assert.match(result.stdout ?? "", /1\. Resolves the installed/);
       assert.match(result.stdout ?? "", /2\. Reads current git HEAD/);
-      assert.match(result.stdout ?? "", /3\. Runs git pull/);
+      assert.match(result.stdout ?? "", /3\. Runs git pull --ff-only/);
       assert.match(result.stdout ?? "", /4\. Reads git HEAD again/);
       assert.match(result.stdout ?? "", /5\. If HEAD did not change/);
       assert.match(result.stdout ?? "", /6\. If HEAD changed/);
