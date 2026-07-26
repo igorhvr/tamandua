@@ -413,6 +413,7 @@ steps:
       ORIGINAL_BRANCH: {{original_branch}}
       TESTED_TREE: {{tested_tree}}
       WORKTREE_ORIGIN_REPOSITORY: {{worktree_origin_repository}}
+      ORIGIN_REPOSITORY: {{worktree_origin_repository}}
 
       PROGRESS LOG:
       {{progress}}
@@ -422,44 +423,55 @@ steps:
 
       Follow the Required Process from your AGENTS.md.
 
-      IMPORTANT — Worktree Mode: All git operations below (phases 1–3) must run
-      in the ORIGIN repository, NOT the worktree. Use:
-        git -C {{worktree_origin_repository}} <command>
-      for every git command. The worktree at {{repo}} contains the security branch
-      changes; the origin at {{worktree_origin_repository}} is where the merge
-      must be finalized.
+      IMPORTANT — Worktree Mode: The origin working tree and index are read-only.
+      Read origin refs with git -C {{worktree_origin_repository}}, but perform any
+      rebase only in the security worktree at {{repo}}. The only origin ref mutation
+      permitted is through tamandua merge-branch.
 
-      Phase 1 — Fast-Forward Check (ALWAYS FIRST):
-      1. cd {{worktree_origin_repository}}
-      2. git checkout {{original_branch}}
-      3. git merge-base --is-ancestor {{original_branch}} {{branch}}
-         - Exit 0 (FF): proceed to Phase 3
-         - Exit non-zero (not FF): proceed to Phase 2
+      Branch Existence Guard (ALWAYS FIRST):
+      1. git -C {{repo}} rev-parse --verify refs/heads/{{branch}}
+         - If missing, fail loudly. Never discover or substitute another branch.
 
-      Phase 2 — Rebase (Non-Fast-Forward Path):
-      4. cd {{repo}}
-      5. git rebase {{original_branch}}
-      6. Fix any conflicts; `git rebase --continue` until complete
-      7. If rebase changed code/tests/docs/config:
-         - Report STATUS: retry with REBASED: true, CONFLICT_NOTES, RETRY_STEP: test
-         - Do NOT merge — tester must re-validate first
-      8. If rebase was clean: proceed to Phase 3
+      Phase 1 — Capture Explicit Origin Target + Fast-Forward Check:
+      2. ORIGIN_REPOSITORY={{worktree_origin_repository}}
+      3. TARGET_REF="refs/heads/{{original_branch}}"
+      4. EXPECT_TIP=$(git -C "$ORIGIN_REPOSITORY" rev-parse "$TARGET_REF")
+      5. git -C "$ORIGIN_REPOSITORY" merge-base --is-ancestor "$EXPECT_TIP" refs/heads/{{branch}}
+         - Exit 0 (FF-safe against EXPECT_TIP): proceed to Phase 3.
+         - Exit non-zero (not FF-safe): proceed to Phase 2.
 
-      Phase 3 — Squash Merge (Fast-Forward-Safe):
-      9. cd {{worktree_origin_repository}}
-      10. git checkout {{original_branch}}
-      11. git merge --squash {{branch}}
-      12. Build a descriptive commit message (see AGENTS.md for full instructions — use fix(security): prefix), write it to a temp file, then commit with `git commit -F <tempfile>`
+      Phase 2 — Rebase Only in the Security Worktree, Then Loop Back:
+      6. git -C {{repo}} rebase "$EXPECT_TIP"
+      7. Fix any conflicts in {{repo}}; `git rebase --continue` until complete.
+      8. After every successful rebase, even a clean one, stop before landing and reply:
+         STATUS: retry
+         REBASED: true
+         CONFLICT_NOTES: <what changed>
+         RETRY_STEP: test
 
-      Verify the merge commit was created:
-      - MERGE_COMMIT=$(git rev-parse --short HEAD)
+      Phase 3 — Atomic Landing (Fast-Forward-Safe):
+      9. Build a descriptive commit message with `fix(security):` prefix (see AGENTS.md),
+         including the required co-author footer, write it to MESSAGE_FILE, then invoke exactly:
+         MERGE_OUTPUT=$(tamandua merge-branch \
+           --origin "$ORIGIN_REPOSITORY" \
+           --branch "{{branch}}" \
+           --into "{{original_branch}}" \
+           --expect-tip "$EXPECT_TIP" \
+           --message "$(cat "$MESSAGE_FILE")")
+         MERGE_EXIT=$?
+      10. Preserve MERGE_OUTPUT verbatim in the reply.
+          - STATUS: conflicts or STATUS: target_moved maps to STATUS: retry,
+            REBASED: false, CONFLICT_NOTES, and RETRY_STEP: test.
+          - Any other non-zero exit maps to STATUS: failed with the exact reason.
+      11. On success, compare MERGED_TREE from MERGE_OUTPUT with {{tested_tree}}.
+          Fail loudly on mismatch; do not weaken this attestation.
 
-      Reply with:
-      STATUS: done
+      Reply on success with the merge-branch output verbatim, followed by:
       REBASED: false
-      MERGE_COMMIT: <short commit hash>
+      MERGE_COMMIT: <short form of MERGED_COMMIT>
       MERGED_INTO: {{original_branch}}
-      MERGED_TREE: $(git rev-parse HEAD^{tree})
+      MERGED_TREE: <verbatim MERGED_TREE from merge-branch>
+      STATUS: done
     expects: |
       regex:^STATUS:\s*(done|retry)\s*$
       regex:^REBASED:\s*(true|false)\s*$

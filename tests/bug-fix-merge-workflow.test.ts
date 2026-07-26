@@ -44,22 +44,26 @@ describe("bug-fix-merge workflow", () => {
     assert.doesNotMatch(finalStep!.input, /git push/);
   });
 
-  it("finalize_merge step contains fast-forward-first merge instructions", async () => {
+  it("finalize_merge step contains the atomic plumbing merge instructions", async () => {
     const spec = await loadWorkflowSpec(wfDir);
     const finalStep = spec.steps.find((s) => s.id === "finalize_merge");
     assert.ok(finalStep);
-    // Phase 1: Fast-Forward Check
-    assert.match(finalStep!.input, /git merge-base --is-ancestor \{\{original_branch\}\} \{\{branch\}\}/);
-    assert.match(finalStep!.input, /Phase 1.*Fast-Forward Check/);
+    // Phase 1: capture the target tip and check fast-forward safety against it.
+    assert.match(finalStep!.input, /RUN_ID:\s*\{\{run_id\}\}/);
+    assert.match(finalStep!.input, /ORIGIN_REPOSITORY:\s*\{\{repo\}\}/);
+    assert.match(finalStep!.input, /EXPECT_TIP=.*rev-parse/);
+    assert.match(finalStep!.input, /merge-base --is-ancestor "\$EXPECT_TIP"/);
+    assert.match(finalStep!.input, /Phase 1.*Capture Explicit Target.*Fast-Forward Check/);
     // Phase 2: Rebase
     assert.match(finalStep!.input, /Phase 2.*Rebase/);
-    assert.match(finalStep!.input, /git rebase \{\{original_branch\}\}/);
+    assert.match(finalStep!.input, /git -C \{\{repo\}\} rebase "\$EXPECT_TIP"/);
     assert.match(finalStep!.input, /git rebase --continue/);
-    // Phase 3: Squash Merge (preserved)
-    assert.match(finalStep!.input, /Phase 3.*Squash Merge/);
-    assert.match(finalStep!.input, /git checkout \{\{original_branch\}\}/);
-    assert.match(finalStep!.input, /git merge --squash \{\{branch\}\}/);
-    assert.match(finalStep!.input, /git commit -F <tempfile>/);
+    // Phase 3: atomic plumbing landing, without porcelain origin mutation.
+    assert.match(finalStep!.input, /Phase 3.*Atomic Landing/);
+    assert.match(finalStep!.input, /tamandua merge-branch/);
+    assert.match(finalStep!.input, /--expect-tip "\$EXPECT_TIP"/);
+    assert.match(finalStep!.input, /Preserve MERGE_OUTPUT verbatim/);
+    assert.doesNotMatch(finalStep!.input, /git checkout|git merge --squash|git commit -F/);
     // Output format includes REBASED
     assert.match(finalStep!.input, /REBASED:\s*false/);
     assert.match(finalStep!.input, /ORIGINAL_BRANCH:\s*\{\{original_branch\}\}/);
@@ -140,19 +144,19 @@ describe("bug-fix-merge workflow", () => {
   });
 
   // US-004: Ordering and tester retry absence in step input
-  it("finalize_merge step input places FF check before squash merge (US-004 ordering)", async () => {
+  it("finalize_merge step input places FF check before atomic landing", async () => {
     const spec = await loadWorkflowSpec(wfDir);
     const finalStep = spec.steps.find((s) => s.id === "finalize_merge");
     assert.ok(finalStep);
 
-    const ffIdx = finalStep!.input.search(/git merge-base --is-ancestor/);
-    const squashIdx = finalStep!.input.search(/git merge --squash/);
+    const ffIdx = finalStep!.input.search(/git -C "\$ORIGIN_REPOSITORY" merge-base --is-ancestor/);
+    const landingIdx = finalStep!.input.search(/MERGE_OUTPUT=\$\(tamandua merge-branch/);
 
-    assert.ok(ffIdx >= 0, "must contain git merge-base --is-ancestor");
-    assert.ok(squashIdx >= 0, "must contain git merge --squash");
+    assert.ok(ffIdx >= 0, "must contain the EXPECT_TIP fast-forward check");
+    assert.ok(landingIdx >= 0, "must contain tamandua merge-branch");
     assert.ok(
-      ffIdx < squashIdx,
-      `FF check (pos ${ffIdx}) must appear before squash merge (pos ${squashIdx})`,
+      ffIdx < landingIdx,
+      `FF check (pos ${ffIdx}) must appear before atomic landing (pos ${landingIdx})`,
     );
   });
 
@@ -161,7 +165,7 @@ describe("bug-fix-merge workflow", () => {
     const finalStep = spec.steps.find((s) => s.id === "finalize_merge");
     assert.ok(finalStep);
     assert.doesNotMatch(finalStep!.input, /RETRY_STEP:\s*test/);
-    assert.doesNotMatch(finalStep!.input, /CONFLICT_NOTES/);
+    assert.match(finalStep!.input, /CONFLICT_NOTES/);
   });
 
   // US-002: Verify merger persona files
