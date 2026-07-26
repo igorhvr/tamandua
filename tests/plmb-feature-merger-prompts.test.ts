@@ -155,7 +155,12 @@ describe("US-003 PLMB feature merger prompt contracts", () => {
     const consumers = mergeBranchPersonaConsumers();
     assert.deepEqual(
       consumers.map((consumer) => consumer.workflowId),
-      ["feature-dev-merge", "feature-dev-merge-worktree"],
+      [
+        "bug-fix-merge",
+        "bug-fix-merge-worktree",
+        "feature-dev-merge",
+        "feature-dev-merge-worktree",
+      ],
     );
 
     const uniquePersonas = new Map<string, MergerPersonaConsumer>();
@@ -165,22 +170,22 @@ describe("US-003 PLMB feature merger prompt contracts", () => {
       uniquePersonas.set(consumer.realpath, consumer);
     }
 
-    assert.equal(uniquePersonas.size, 1, "feature merge variants must share one merger persona");
+    assert.equal(uniquePersonas.size, 2, "feature and bug-fix variants must share per-family personas");
     assert.equal(consumers[0]?.realpath, consumers[1]?.realpath);
+    assert.equal(consumers[2]?.realpath, consumers[3]?.realpath);
   });
 
-  it("explicitly audits bug-fix merge variants for immediate retry before landing", () => {
+  it("enforces the plumbing contract for bug-fix merge variants", () => {
     assert.equal(realpathSync(bugFixWorktreePersonaPath), realpathSync(bugFixPersonaPath));
     const bugFixPersona = readFileSync(bugFixPersonaPath, "utf8");
-    assert.match(
-      bugFixPersona,
-      /rebase succeeds[\s\S]{0,300}immediately emit `STATUS: retry`[\s\S]{0,300}return from the invocation before any squash-merge, commit, or other landing step/i,
-    );
-    assert.match(bugFixPersona, /Never land and then report retry/i);
-    assert.match(
-      bugFixPersona,
-      /Landing may run only in a fresh invocation where no rebase was needed and the branch was already based on the current target/,
-    );
+    assertRetryBeforeMergeBranch(bugFixPersona, "bug-fix merger persona");
+    assertCompleteMergeBranchInvocation(bugFixPersona);
+    assertManagedParkingGuardrail(bugFixPersona, "bug-fix merger persona");
+    assert.match(bugFixPersona, /RETRY_STEP: verify/);
+    assert.match(bugFixPersona, /Use `fix:` prefix/);
+    assert.match(bugFixPersona, /STATUS: conflicts/);
+    assert.match(bugFixPersona, /STATUS: target_moved/);
+    assert.doesNotMatch(bugFixPersona, /git checkout|git merge --squash|git commit -F/);
   });
 
   it("maps conflicts and target movement to tester revalidation and fails other errors", () => {
