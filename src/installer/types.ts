@@ -33,6 +33,8 @@ export type WorkflowStepFailure = {
   retry_step?: string;
   max_retries?: number;
   max_reroutes?: number;
+  /** Failure classes explicitly eligible for this reroute policy. */
+  retry_on?: string[];
 };
 
 export type LoopConfig = {

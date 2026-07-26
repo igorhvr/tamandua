@@ -362,3 +362,4 @@ steps:
     on_fail:
       retry_step: verify
       max_reroutes: 4
+      retry_on: [target_moved, conflicts]

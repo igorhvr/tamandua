@@ -451,3 +451,4 @@ steps:
     on_fail:
       retry_step: test
       max_retries: 4
+      retry_on: [target_moved, conflicts]

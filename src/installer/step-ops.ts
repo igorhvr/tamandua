@@ -3254,6 +3254,37 @@ export function archiveRunProgress(runId: string): void {
 // Fail Step
 // ══════════════════════════════════════════════════════════════════════
 
+const FAILURE_CLASS_VOCABULARY: Record<string, "transient" | "terminal"> = {
+  target_moved: "transient",
+  conflicts: "transient",
+  refused_permanent: "terminal",
+};
+
+type FailureRerouteMode = "legacy" | "declared_retryable" | "terminal";
+
+/** Read the first class line without normalizing the caller-owned reason. */
+function parseFailureClass(reason: string): string | null {
+  for (const line of reason.split(/\r?\n/)) {
+    const match = /^FAILURE_CLASS:[ \t]+(\S+)[ \t]*$/.exec(line);
+    if (match) return match[1];
+  }
+  return null;
+}
+
+/** Unknown and undeclared nonterminal classes retain legacy behavior. */
+function getFailureRerouteMode(
+  reason: string,
+  policy: WorkflowStepFailure | null,
+): FailureRerouteMode {
+  const failureClass = parseFailureClass(reason);
+  if (!failureClass) return "legacy";
+
+  const disposition = FAILURE_CLASS_VOCABULARY[failureClass];
+  if (!disposition) return "legacy";
+  if (disposition === "terminal") return "terminal";
+  return policy?.retry_on?.includes(failureClass) ? "declared_retryable" : "legacy";
+}
+
 async function getOnFailPolicy(runId: string, stepId: string): Promise<WorkflowStepFailure | null> {
   try {
     const db = getDb();
@@ -3289,7 +3320,7 @@ function getOnFailPolicySync(runId: string, stepId: string): WorkflowStepFailure
 }
 
 /**
- * Shared core of rerouteStep and rerouteStepSync.
+ * Shared core for async step-failure reroutes and rerouteStepSync.
  * Takes a pre-resolved policy object and performs all reroute logic:
  * validation, budget check, DB updates, story reset, event emission.
  *
@@ -3430,12 +3461,13 @@ async function failStepInternal(stepId: string, error: string): Promise<{ status
   const db = getDb();
 
   const step = db.prepare(
-    "SELECT run_id, step_id, retry_count, max_retries, type, current_story_id FROM steps WHERE id = ?"
+    "SELECT run_id, step_id, retry_count, max_retries, reroute_count, type, current_story_id FROM steps WHERE id = ?"
   ).get(stepId) as {
     run_id: string;
     step_id: string;
     retry_count: number;
     max_retries: number;
+    reroute_count: number | null;
     type: string;
     current_story_id: string | null;
   } | undefined;
@@ -3490,8 +3522,17 @@ async function failStepInternal(stepId: string, error: string): Promise<{ status
     // a consumer's failure root cause lives in producer output.
     // Falls through to normal run failure on budget exhaustion,
     // invalid target, or when no retry_step is declared.
+    let terminalRerouteLimitExhausted = false;
     try {
-      const rerouteResult = await rerouteStep(step.run_id, step.step_id, stepId, error);
+      const policy = await getOnFailPolicy(step.run_id, step.step_id);
+      const rerouteMode = getFailureRerouteMode(error, policy);
+      terminalRerouteLimitExhausted =
+        rerouteMode === "terminal" && (step.reroute_count ?? 0) >= 1;
+      const rerouteResult = terminalRerouteLimitExhausted
+        ? "budget_exhausted"
+        : policy?.retry_step
+          ? rerouteWithPolicy(policy, step.run_id, step.step_id, stepId, error)
+          : "not_found";
       if (rerouteResult === "rerouted") {
         nudgeDispatch();
         finalizeDrainingPause(step.run_id);
@@ -3500,7 +3541,6 @@ async function failStepInternal(stepId: string, error: string): Promise<{ status
       if (rerouteResult === "invalid_target") {
         // Spec error: retry_step targets a downstream or unknown step.
         // Fail the run with a clear message so the bug is visible.
-        const policy = await getOnFailPolicy(step.run_id, step.step_id);
         error = `Run failed: step "${step.step_id}" declares on_fail.retry_step "${policy?.retry_step ?? "?"}" which is not a valid upstream step (must have lower step_index).`;
         logger.error(error, { runId: step.run_id, stepId: step.step_id });
       }
@@ -3520,7 +3560,12 @@ async function failStepInternal(stepId: string, error: string): Promise<{ status
     ).run(step.run_id);
     const wfId2 = getWorkflowId(step.run_id);
     emitEvent({ ts: new Date().toISOString(), event: "step.failed", runId: step.run_id, workflowId: wfId2, stepId, detail: error });
-    emitRunTerminalEvent({ event: "run.failed", runId: step.run_id, workflowId: wfId2, detail: "Step retries exhausted" });
+    emitRunTerminalEvent({
+      event: "run.failed",
+      runId: step.run_id,
+      workflowId: wfId2,
+      detail: terminalRerouteLimitExhausted ? error : "Step retries exhausted",
+    });
     scheduleRunCronTeardown(step.run_id);
     finalizeDrainingPause(step.run_id);
 
@@ -3697,29 +3742,8 @@ function resetStoriesOnReroute(
   }
 
   // Story reset complete. verify_feedback context is written by the caller
-  // (rerouteStep / rerouteStepSync) after this function returns, so it
+  // (the async failure path / rerouteStepSync) after this function returns, so it
   // can happen unconditionally for loop-targeted reroutes.
-}
-
-/**
- * Async wrapper around rerouteWithPolicy. Resolves the on_fail policy
- * asynchronously via getOnFailPolicy, then delegates to the shared core.
- *
- * Returns:
- * - "rerouted" on success
- * - "budget_exhausted" when reroute_count >= max_reroutes (caller falls through to fail)
- * - "invalid_target" when retry_step names a downstream/unknown step
- * - "not_found" when no on_fail.retry_step is declared
- */
-async function rerouteStep(
-  runId: string,
-  consumerStepId: string,
-  consumerRowId: string,
-  error: string,
-): Promise<"rerouted" | "budget_exhausted" | "invalid_target" | "not_found"> {
-  const policy = await getOnFailPolicy(runId, consumerStepId);
-  if (!policy?.retry_step) return "not_found";
-  return rerouteWithPolicy(policy, runId, consumerStepId, consumerRowId, error);
 }
 
 /**

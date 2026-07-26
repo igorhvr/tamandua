@@ -551,7 +551,7 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
   );
 
   it(
-    "CDET bug-fix-merge-worktree: target movement reroutes through verifier before a successful landing",
+    "RAMP bug-fix-merge-worktree: classified target movement reroutes through verifier before a successful landing",
     { timeout: 240_000 },
     async () => {
       let ctx: ScriptedRunContext | undefined;
@@ -589,7 +589,9 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
               {
                 commands: [firstMergerCommand],
                 includeCommandOutput: true,
-                output: "REBASED: false",
+                output: "STATUS: failed\nREASON: target moved before landing",
+                stepAction: "fail",
+                failReason: "target moved before landing\nFAILURE_CLASS: target_moved",
               },
               {
                 commands: [secondMergerCommand],
@@ -662,6 +664,7 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
         const rerouted = events.find((event) => event.event === "step.rerouted");
         assert.equal(rerouted?.stepId, "finalize_merge");
         assert.match(String(rerouted?.detail), /verify/);
+        assert.match(String(rerouted?.detail), /FAILURE_CLASS: target_moved/);
         const mergeEvents = events.filter((event) => String(event.event).startsWith("merge."));
         assert.deepEqual(mergeEvents.map((event) => event.event), ["merge.target_moved", "merge.landed"]);
 
@@ -728,6 +731,250 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
         const originLog = execSync("git log --oneline -5", { cwd: repoDir, encoding: "utf-8" });
         assert.match(originLog, /fix: deterministic target-moved retry/);
         assert.ok(originLog.includes(mergedCommit.slice(0, 7)), `origin working-copy log should contain ${mergedCommit}:\n${originLog}`);
+      } finally {
+        await teardown(ctx);
+      }
+    },
+  );
+
+  it(
+    "RAMP bug-fix-merge-worktree: classified conflicts reroute through verifier before a successful landing",
+    { timeout: 240_000 },
+    async () => {
+      let ctx: ScriptedRunContext | undefined;
+      try {
+        const conflictsBehaviors: ScriptedAgentConfig = {
+          agents: {
+            ...bugFixBehaviors.agents,
+            verifier: {
+              output: [
+                "STATUS: done",
+                "VERIFIED: feature tree revalidated after merge conflicts",
+                "TESTED_TREE: scripted-tree-after-conflicts",
+              ].join("\n"),
+            },
+            merger: [
+              {
+                output: "STATUS: failed\nREASON: feature conflicts with the target branch",
+                stepAction: "fail",
+                failReason: "feature conflicts with the target branch\nFAILURE_CLASS: conflicts",
+              },
+              {
+                commands: [
+                  `expected_tip=$(git -C "{{input.WORKTREE_ORIGIN_REPOSITORY}}" rev-parse "refs/heads/{{input.ORIGINAL_BRANCH}}") && TAMANDUA_RUN_ID="{{input.RUN_ID}}" "${process.execPath}" "${cliPath}" merge-branch --origin "{{input.WORKTREE_ORIGIN_REPOSITORY}}" --branch "${BRANCH}" --into "{{input.ORIGINAL_BRANCH}}" --expect-tip "$expected_tip" --message "fix: deterministic conflicts retry (squash of ${BRANCH})"`,
+                ],
+                includeCommandOutput: true,
+                output: [
+                  "STATUS: done",
+                  "REBASED: false",
+                  "MERGED_INTO: {{input.ORIGINAL_BRANCH}}",
+                ].join("\n"),
+              },
+            ],
+          },
+        };
+
+        ctx = await startScriptedEnvironment("bug-fix-merge-worktree", conflictsBehaviors);
+        const repoDir = prepareGitRepo(fixtureDir, path.join(ctx.env.root, "origin-repo"));
+        const { branch: originalBranch } = detachOriginCheckout(repoDir);
+
+        const runIdPrefix = await spawnWorkflowRun(
+          [
+            "workflow",
+            "run",
+            "bug-fix-merge-worktree",
+            "The add function in src/math.ts returns a - b instead of a + b",
+            "--worktree-origin-repository",
+            repoDir,
+            "--worktree-origin-ref",
+            originalBranch,
+          ],
+          baseEnv(ctx.env.homeDir, ctx.env.controlPort),
+        );
+        const runId = resolveFullRunId(runIdPrefix, ctx.env.tamanduaDir);
+
+        const status = await waitForRun(ctx, runId, 200_000);
+        assert.ok(
+          status === "completed" || status === "done",
+          `run should complete after conflicts reroute, got "${status}"\n${diagnostics(ctx)}`,
+        );
+
+        assert.equal(ctx.scripted.workInvocations("verifier").length, 2, "conflicts should reroute through verifier");
+        assert.equal(ctx.scripted.workInvocations("merger").length, 2, "merger should retry once after revalidation");
+
+        const steps = dbRows<{ step_id: string; status: string; reroute_count: number | null }>(
+          ctx.env.tamanduaDir,
+          "SELECT step_id, status, reroute_count FROM steps WHERE run_id = ? ORDER BY step_index",
+          runId,
+        );
+        for (const step of steps) assert.equal(step.status, "done", `${step.step_id} should finish done`);
+        assert.equal(steps.find((step) => step.step_id === "finalize_merge")?.reroute_count, 1);
+
+        const rerouted = readRunEvents(ctx.env.tamanduaDir, runId)
+          .find((event) => event.event === "step.rerouted");
+        assert.equal(rerouted?.stepId, "finalize_merge");
+        assert.match(String(rerouted?.detail), /verify/);
+        assert.match(String(rerouted?.detail), /FAILURE_CLASS: conflicts/);
+
+        const mergeStep = dbRow<{ output: string }>(
+          ctx.env.tamanduaDir,
+          "SELECT output FROM steps WHERE run_id = ? AND step_id = 'finalize_merge'",
+          runId,
+        );
+        assert.match(mergeStep.output, /^STATUS: landed$/m);
+        assert.match(mergeStep.output, /^STATUS: done$/m);
+        const targetMath = execSync(`git show "refs/heads/${originalBranch}:src/math.ts"`, {
+          cwd: repoDir,
+          encoding: "utf-8",
+        });
+        assert.ok(targetMath.includes("a + b"), `target should contain the feature fix:\n${targetMath}`);
+      } finally {
+        await teardown(ctx);
+      }
+    },
+  );
+
+  it(
+    "RAMP bug-fix-merge-worktree: a second permanent refusal fails verbatim after exactly one reroute",
+    { timeout: 240_000 },
+    async () => {
+      let ctx: ScriptedRunContext | undefined;
+      try {
+        const refusalReason = [
+          "Landing refused by repository policy.",
+          "FAILURE_CLASS: refused_permanent",
+          "Required approval is absent; automated landing remains prohibited.",
+        ].join("\n");
+        const refusedBehaviors: ScriptedAgentConfig = {
+          agents: {
+            ...bugFixBehaviors.agents,
+            verifier: {
+              output: "STATUS: done\nVERIFIED: feature tree revalidated after permanent refusal\nTESTED_TREE: scripted-tree-after-refusal",
+            },
+            merger: [
+              { stepAction: "fail", failReason: refusalReason },
+              { stepAction: "fail", failReason: refusalReason },
+            ],
+          },
+        };
+
+        ctx = await startScriptedEnvironment("bug-fix-merge-worktree", refusedBehaviors);
+        const repoDir = prepareGitRepo(fixtureDir, path.join(ctx.env.root, "origin-repo"));
+        const { branch: originalBranch } = detachOriginCheckout(repoDir);
+        const runIdPrefix = await spawnWorkflowRun(
+          [
+            "workflow", "run", "bug-fix-merge-worktree",
+            "The add function in src/math.ts returns a - b instead of a + b",
+            "--worktree-origin-repository", repoDir,
+            "--worktree-origin-ref", originalBranch,
+          ],
+          baseEnv(ctx.env.homeDir, ctx.env.controlPort),
+        );
+        const runId = resolveFullRunId(runIdPrefix, ctx.env.tamanduaDir);
+
+        const status = await waitForRun(ctx, runId, 200_000);
+        assert.equal(status, "failed", `run should fail after the second permanent refusal\n${diagnostics(ctx)}`);
+        assert.equal(ctx.scripted.workInvocations("verifier").length, 2, "only one refusal revalidation should run");
+        assert.equal(ctx.scripted.workInvocations("merger").length, 2, "a third merger attempt must not run");
+
+        const run = dbRow<{ status: string }>(ctx.env.tamanduaDir, "SELECT status FROM runs WHERE id = ?", runId);
+        assert.equal(run.status, "failed");
+        const mergeStep = dbRow<{ status: string; output: string; reroute_count: number }>(
+          ctx.env.tamanduaDir,
+          "SELECT status, output, reroute_count FROM steps WHERE run_id = ? AND step_id = 'finalize_merge'",
+          runId,
+        );
+        assert.equal(mergeStep.status, "failed");
+        assert.equal(mergeStep.output, refusalReason);
+        assert.equal(mergeStep.reroute_count, 1);
+
+        const events = readRunEvents(ctx.env.tamanduaDir, runId);
+        const rerouted = events.filter((event) => event.event === "step.rerouted");
+        assert.equal(rerouted.length, 1, "the first permanent refusal should be the only reroute");
+        assert.equal(rerouted[0].stepId, "finalize_merge");
+        assert.match(String(rerouted[0].detail), /verify/);
+        assert.ok(String(rerouted[0].detail).includes(refusalReason));
+        const stepFailed = events.filter((event) => event.event === "step.failed");
+        const runFailed = events.filter((event) => event.event === "run.failed");
+        assert.equal(stepFailed.length, 1);
+        assert.equal(runFailed.length, 1);
+        assert.equal(stepFailed[0].detail, refusalReason);
+        assert.equal(runFailed[0].detail, refusalReason);
+      } finally {
+        await teardown(ctx);
+      }
+    },
+  );
+
+  it(
+    "RAMP bug-fix-merge-worktree: a permanent refusal can resolve after its one concessionary reroute",
+    { timeout: 240_000 },
+    async () => {
+      let ctx: ScriptedRunContext | undefined;
+      try {
+        const refusalReason = [
+          "Landing refused while repository policy is being refreshed.",
+          "FAILURE_CLASS: refused_permanent",
+          "Revalidation may observe the completed policy update.",
+        ].join("\n");
+        const resolvedBehaviors: ScriptedAgentConfig = {
+          agents: {
+            ...bugFixBehaviors.agents,
+            verifier: {
+              output: "STATUS: done\nVERIFIED: feature tree revalidated after permanent refusal\nTESTED_TREE: scripted-tree-after-refusal",
+            },
+            merger: [
+              { stepAction: "fail", failReason: refusalReason },
+              {
+                commands: [
+                  `expected_tip=$(git -C "{{input.WORKTREE_ORIGIN_REPOSITORY}}" rev-parse "refs/heads/{{input.ORIGINAL_BRANCH}}") && TAMANDUA_RUN_ID="{{input.RUN_ID}}" "${process.execPath}" "${cliPath}" merge-branch --origin "{{input.WORKTREE_ORIGIN_REPOSITORY}}" --branch "${BRANCH}" --into "{{input.ORIGINAL_BRANCH}}" --expect-tip "$expected_tip" --message "fix: resolved permanent refusal (squash of ${BRANCH})"`,
+                ],
+                includeCommandOutput: true,
+                output: "STATUS: done\nREBASED: false\nMERGED_INTO: {{input.ORIGINAL_BRANCH}}",
+              },
+            ],
+          },
+        };
+
+        ctx = await startScriptedEnvironment("bug-fix-merge-worktree", resolvedBehaviors);
+        const repoDir = prepareGitRepo(fixtureDir, path.join(ctx.env.root, "origin-repo"));
+        const { branch: originalBranch } = detachOriginCheckout(repoDir);
+        const runIdPrefix = await spawnWorkflowRun(
+          [
+            "workflow", "run", "bug-fix-merge-worktree",
+            "The add function in src/math.ts returns a - b instead of a + b",
+            "--worktree-origin-repository", repoDir,
+            "--worktree-origin-ref", originalBranch,
+          ],
+          baseEnv(ctx.env.homeDir, ctx.env.controlPort),
+        );
+        const runId = resolveFullRunId(runIdPrefix, ctx.env.tamanduaDir);
+
+        const status = await waitForRun(ctx, runId, 200_000);
+        assert.ok(
+          status === "completed" || status === "done",
+          `run should complete when the permanent refusal resolves, got "${status}"\n${diagnostics(ctx)}`,
+        );
+        assert.equal(ctx.scripted.workInvocations("verifier").length, 2, "the refusal should trigger one revalidation");
+        assert.equal(ctx.scripted.workInvocations("merger").length, 2, "the merger should land on its second attempt");
+
+        const mergeStep = dbRow<{ status: string; reroute_count: number; output: string }>(
+          ctx.env.tamanduaDir,
+          "SELECT status, reroute_count, output FROM steps WHERE run_id = ? AND step_id = 'finalize_merge'",
+          runId,
+        );
+        assert.equal(mergeStep.status, "done");
+        assert.equal(mergeStep.reroute_count, 1);
+        assert.match(mergeStep.output, /^STATUS: landed$/m);
+
+        const events = readRunEvents(ctx.env.tamanduaDir, runId);
+        const rerouted = events.filter((event) => event.event === "step.rerouted");
+        assert.equal(rerouted.length, 1);
+        assert.equal(rerouted[0].stepId, "finalize_merge");
+        assert.ok(String(rerouted[0].detail).includes(refusalReason));
+        assert.equal(events.filter((event) => event.event === "step.failed").length, 0);
+        assert.equal(events.filter((event) => event.event === "run.failed").length, 0);
+        assert.equal(events.filter((event) => event.event === "run.completed").length, 1);
       } finally {
         await teardown(ctx);
       }

@@ -141,6 +141,30 @@ function assertManagedParkingGuardrail(content: string, label: string): void {
   assert.match(content, /verbatim/i, `${label} must preserve merge-branch output verbatim`);
 }
 
+function assertFailureClassContract(content: string, label: string): void {
+  for (const [exitCode, failureClass] of [
+    [2, "target_moved"],
+    [3, "conflicts"],
+    [1, "refused_permanent"],
+  ] as const) {
+    assert.match(
+      content,
+      new RegExp(`exit(?: code)?\\s*${exitCode}[\\s\\S]{0,240}FAILURE_CLASS: ${failureClass}`, "i"),
+      `${label} must map merge-branch exit ${exitCode} to ${failureClass}`,
+    );
+  }
+  assert.match(
+    content,
+    /whenever[^\n]*`tamandua step fail`[^\n]*merge-branch[^\n]*reason[^\n]*plain `FAILURE_CLASS: <class>` line/i,
+    `${label} must require a plain FAILURE_CLASS line in every merge-branch step-fail reason`,
+  );
+  assert.match(
+    content,
+    /agent-signaled `STATUS: target_moved` and `STATUS: conflicts`[^\n]*existing `STATUS: retry` revalidation path[^\n]*unchanged/i,
+    `${label} must preserve the agent-signaled transient retry path`,
+  );
+}
+
 describe("US-003 PLMB feature merger prompt contracts", () => {
   it("keeps the worktree merger as a symlink consumer of the shared persona", () => {
     assert.equal(realpathSync(worktreePersonaPath), realpathSync(sharedPersonaPath));
@@ -199,6 +223,7 @@ describe("US-003 PLMB feature merger prompt contracts", () => {
     for (const consumer of consumers) {
       assertRetryBeforeMergeBranch(consumer.content, consumer.workflowId);
       assertManagedParkingGuardrail(consumer.content, consumer.workflowId);
+      assertFailureClassContract(consumer.content, consumer.workflowId);
       uniquePersonas.set(consumer.realpath, consumer);
     }
 
