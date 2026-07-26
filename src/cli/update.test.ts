@@ -144,6 +144,15 @@ describe("update exports", () => {
         if (command === "git" && args[0] === "pull" && args[1] === "--ff-only") {
           return { stdout: "Already up to date.", stderr: "" };
         }
+        if (command === "git" && args[0] === "ls-remote" && args[1] === "--heads" && args[2] === "--exit-code") {
+          return { stdout: "", stderr: "" };
+        }
+        if (command === "git" && args[0] === "rev-parse" && args[1] === "@{u}") {
+          return { stdout: "refs/remotes/origin/main\n", stderr: "" };
+        }
+        if (command === "git" && args[0] === "rev-list" && args[1] === "--count") {
+          return { stdout: "0\n", stderr: "" };
+        }
         throw new Error(`Unexpected command: ${command} ${args.join(" ")}`);
       };
 

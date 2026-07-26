@@ -72,28 +72,64 @@ function createOutput(): { output: UpdateOutput; logs: string[]; warnings: strin
   };
 }
 
-function createRunCommand(heads: string[], calls: string[], opts?: { pullShouldFail?: boolean }): RunCommand {
+interface CreateRunCommandOpts {
+  heads: string[];
+  pullShouldFail?: boolean;
+  /** rev-list --count @{u}..HEAD result — set to "1" or higher for ahead/divergence tests */
+  aheadCount?: string;
+  /** Whether ls-remote --heads --exit-code origin fails (remote unreachable) */
+  lsRemoteFails?: boolean;
+  /** Whether rev-parse @{u} succeeds (upstream exists) — default true */
+  upstreamExists?: boolean;
+}
+
+function createRunCommand(
+  heads: string[] | CreateRunCommandOpts,
+  calls: string[],
+  opts?: { pullShouldFail?: boolean },
+): RunCommand {
+  const cfg: CreateRunCommandOpts =
+    Array.isArray(heads)
+      ? { heads, pullShouldFail: opts?.pullShouldFail }
+      : heads;
+
   let headIndex = 0;
   return async (command, args, options) => {
     calls.push(`${command} ${args.join(" ")}`.trim());
     assert.equal(options.cwd.length > 0, true);
 
     if (command === "git" && args.join(" ") === "rev-parse HEAD") {
-      const head = heads[Math.min(headIndex, heads.length - 1)];
+      const head = cfg.heads[Math.min(headIndex, cfg.heads.length - 1)];
       headIndex++;
       return { stdout: `${head}\n`, stderr: "" };
     }
 
     if (command === "git" && args[0] === "pull" && args[1] === "--ff-only") {
-      assert.equal(options.stdio, "inherit");
-      if (opts?.pullShouldFail) {
+      if (cfg.pullShouldFail) {
         throw new Error("Command failed (exit code 128): git pull --ff-only");
       }
       return { stdout: "", stderr: "" };
     }
 
+    if (command === "git" && args[0] === "ls-remote" && args[1] === "--heads" && args[2] === "--exit-code") {
+      if (cfg.lsRemoteFails) {
+        throw new Error("Command failed: git ls-remote");
+      }
+      return { stdout: "", stderr: "" };
+    }
+
+    if (command === "git" && args[0] === "rev-parse" && args[1] === "@{u}") {
+      if (cfg.upstreamExists === false) {
+        throw new Error("Command failed: no upstream");
+      }
+      return { stdout: "refs/remotes/origin/main\n", stderr: "" };
+    }
+
+    if (command === "git" && args[0] === "rev-list" && args[1] === "--count") {
+      return { stdout: `${cfg.aheadCount ?? "0"}\n`, stderr: "" };
+    }
+
     if (command === "./build-and-install" && args.length === 0) {
-      assert.equal(options.stdio, "inherit");
       return { stdout: "", stderr: "" };
     }
 
@@ -409,7 +445,7 @@ describe("tamandua update command helpers", () => {
       const result = await runUpdate({
         sourcePath,
         output,
-        runCommand: createRunCommand([sha], commands, { pullShouldFail: true }),
+        runCommand: createRunCommand({ heads: [sha], pullShouldFail: true, aheadCount: "1" }, commands),
         services: createServices({
           daemon: { running: true, pid: 111111, port: 4601 },
           dashboard: { running: true, pid: 222222, port: 4602 },
@@ -418,10 +454,12 @@ describe("tamandua update command helpers", () => {
       });
 
       assert.equal(result.status, "refused_diverged");
-      // Should only have read HEAD and attempted pull — no build, no service stops
       assert.deepEqual(commands, [
         "git rev-parse HEAD",
         "git pull --ff-only",
+        "git ls-remote --heads --exit-code origin",
+        "git rev-parse @{u}",
+        "git rev-list --count @{u}..HEAD",
       ]);
       assert.match(warnings.join("\n"), /Source checkout at .+ has local commits origin does not have/);
       assert.match(warnings.join("\n"), /tamandua update --force/);
@@ -442,7 +480,7 @@ describe("tamandua update command helpers", () => {
       const result = await runUpdate({
         sourcePath,
         output,
-        runCommand: createRunCommand([sha], commands, { pullShouldFail: true }),
+        runCommand: createRunCommand({ heads: [sha], pullShouldFail: true, aheadCount: "1" }, commands),
         services: createServices({
           daemon: { running: false, pid: null, port: 4701 },
           dashboard: { running: false, pid: null, port: 4702 },
@@ -454,6 +492,9 @@ describe("tamandua update command helpers", () => {
       assert.deepEqual(commands, [
         "git rev-parse HEAD",
         "git pull --ff-only",
+        "git ls-remote --heads --exit-code origin",
+        "git rev-parse @{u}",
+        "git rev-list --count @{u}..HEAD",
       ]);
       assert.match(warnings.join("\n"), /Source checkout at .+ has local commits origin does not have/);
       assert.match(warnings.join("\n"), /tamandua update --force/);
@@ -475,7 +516,7 @@ describe("tamandua update command helpers", () => {
         force: true,
         sourcePath,
         output,
-        runCommand: createRunCommand([sha, sha], commands, { pullShouldFail: true }),
+        runCommand: createRunCommand({ heads: [sha, sha], pullShouldFail: true, aheadCount: "1" }, commands),
         services: createServices({
           daemon: { running: true, pid: 111111, port: 4801 },
           dashboard: { running: false, pid: null, port: 4802 },
@@ -490,10 +531,13 @@ describe("tamandua update command helpers", () => {
       });
 
       assert.equal(result.status, "updated");
-      // Pull attempted and failed, then rebuild proceeds
+      // Pull attempted and failed, then divergence probes, then force-skip, then rebuild
       assert.deepEqual(commands, [
         "git rev-parse HEAD",
         "git pull --ff-only",
+        "git ls-remote --heads --exit-code origin",
+        "git rev-parse @{u}",
+        "git rev-list --count @{u}..HEAD",
         "git rev-parse HEAD",
         "./build-and-install",
       ]);
@@ -522,7 +566,7 @@ describe("tamandua update command helpers", () => {
       const result1 = await runUpdate({
         sourcePath,
         output,
-        runCommand: createRunCommand([sha], commands1, { pullShouldFail: true }),
+        runCommand: createRunCommand({ heads: [sha], pullShouldFail: true, aheadCount: "1" }, commands1),
         services: createServices({
           daemon: { running: false, pid: null, port: 4901 },
           dashboard: { running: false, pid: null, port: 4902 },
