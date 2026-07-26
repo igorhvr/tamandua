@@ -516,20 +516,21 @@ describe("workflow structure", () => {
     assert.match(testStep!.input, /re-validate the rebased changes/);
   });
 
-  it("security-audit-merge merger AGENTS.md includes fast-forward-first merge process", () => {
+  it("security-audit-merge merger AGENTS.md uses atomic plumbing landing", () => {
     const mergerAgentsMdPath = resolve(wfDir("security-audit-merge"), "agents", "merger", "AGENTS.md");
     const content = readFileSync(mergerAgentsMdPath, "utf-8");
 
-    // Phase 1: Fast-Forward Check as first Required Process step
-    assert.match(content, /Phase 1: Fast-Forward Check/);
-    assert.match(content, /git merge-base --is-ancestor \{\{original_branch\}\} \{\{branch\}\}/);
-    const phase1Index = content.indexOf("Phase 1: Fast-Forward Check");
-    const phase3Index = content.indexOf("Phase 3: Squash Merge");
-    assert.ok(phase1Index < phase3Index, "Fast-Forward Check must come before Squash Merge");
+    // Phase 1 captures the current origin target before checking FF safety.
+    assert.match(content, /Phase 1: Capture Target Tip and Check Fast-Forward Safety/);
+    assert.match(content, /EXPECT_TIP=\$\(git -C "\$ORIGIN_REPOSITORY" rev-parse "\$TARGET_REF"\)/);
+    assert.match(content, /merge-base --is-ancestor "\$EXPECT_TIP" refs\/heads\/\{\{branch\}\}/);
+    const phase1Index = content.indexOf("Phase 1: Capture Target Tip");
+    const phase3Index = content.indexOf("Phase 3: Atomic Landing");
+    assert.ok(phase1Index < phase3Index, "target-tip capture must come before atomic landing");
 
     // Phase 2: Rebase on non-FF path with conflict resolution
     assert.match(content, /Phase 2: Rebase/);
-    assert.match(content, /git rebase \{\{original_branch\}\}/);
+    assert.match(content, /git -C \{\{repo\}\} rebase "\$EXPECT_TIP"/);
     assert.match(content, /git rebase --continue/);
     assert.match(content, /fix them carefully|resolve each conflict|If conflicts arise/i);
 
@@ -539,20 +540,26 @@ describe("workflow structure", () => {
     assert.match(content, /RETRY_STEP: test/);
     assert.match(content, /do NOT merge/);
 
-    // Guardrails forbid squash merge when not FF-safe
-    assert.match(content, /NEVER squash-merge when the branch is not fast-forward-safe/);
+    // Guardrails permit only the CAS-protected plumbing command to mutate the target ref.
+    assert.match(content, /only `tamandua merge-branch` may update the target ref/i);
     assert.match(content, /IF YOU REBASED, YOU NEVER MERGE IN THIS INVOCATION/);
+    assert.match(content, /--origin "\$ORIGIN_REPOSITORY"/);
+    assert.match(content, /--branch "\{\{branch\}\}"/);
+    assert.match(content, /--into "\{\{original_branch\}\}"/);
+    assert.match(content, /--expect-tip "\$EXPECT_TIP"/);
+    assert.match(content, /--message "\$\(cat "\$MESSAGE_FILE"\)"/);
 
-    // Output format includes REBASED field
-    assert.match(content, /On successful merge[\s\S]*REBASED:\s*false/);
+    // Output preserves plumbing metadata and legacy workflow keys.
+    assert.match(content, /STATUS: landed[\s\S]*MERGED_COMMIT:[\s\S]*CHECKOUT_REFRESH:[\s\S]*REBASED:\s*false/);
 
     // Preserves fix(security):-prefix commit message guidance
     assert.match(content, /fix\(security\)/);
     assert.match(content, /Do NOT use `feat:` prefix/);
 
-    // Preserves existing commit message generation (git commit -F, not git commit -m)
-    assert.match(content, /git commit -F/);
-    assert.doesNotMatch(content, /git commit -m/);
+    // Preserves message provenance while removing porcelain landing.
+    assert.match(content, /security audit task from `\{\{task\}\}`/);
+    assert.match(content, /progress file `\{\{progress_file\}\}`/);
+    assert.doesNotMatch(content, /git checkout|git merge --squash|git commit -F|git commit -m/);
     assert.match(content, /Co-Authored-By: Tamandua/);
   });
 

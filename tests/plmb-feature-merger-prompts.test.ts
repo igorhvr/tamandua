@@ -48,6 +48,20 @@ const quarantineWorktreePersonaPath = resolve(
   "merger",
   "AGENTS.md",
 );
+const securityAuditPersonaPath = resolve(
+  workflowsRoot,
+  "security-audit-merge",
+  "agents",
+  "merger",
+  "AGENTS.md",
+);
+const securityAuditWorktreePersonaPath = resolve(
+  workflowsRoot,
+  "security-audit-merge-worktree",
+  "agents",
+  "merger",
+  "AGENTS.md",
+);
 const persona = readFileSync(sharedPersonaPath, "utf8");
 
 interface MergerPersonaConsumer {
@@ -176,6 +190,8 @@ describe("US-003 PLMB feature merger prompt contracts", () => {
         "feature-dev-merge-worktree",
         "quarantine-broken-tests-merge",
         "quarantine-broken-tests-merge-worktree",
+        "security-audit-merge",
+        "security-audit-merge-worktree",
       ],
     );
 
@@ -188,12 +204,13 @@ describe("US-003 PLMB feature merger prompt contracts", () => {
 
     assert.equal(
       uniquePersonas.size,
-      3,
-      "feature, bug-fix, and quarantine variants must share per-family personas",
+      4,
+      "feature, bug-fix, quarantine, and security-audit variants must share per-family personas",
     );
     assert.equal(consumers[0]?.realpath, consumers[1]?.realpath);
     assert.equal(consumers[2]?.realpath, consumers[3]?.realpath);
     assert.equal(consumers[4]?.realpath, consumers[5]?.realpath);
+    assert.equal(consumers[6]?.realpath, consumers[7]?.realpath);
   });
 
   it("enforces the plumbing contract for bug-fix merge variants", () => {
@@ -227,6 +244,26 @@ describe("US-003 PLMB feature merger prompt contracts", () => {
       /STATUS: landed[\s\S]*MERGED_COMMIT:[\s\S]*MERGED_TREE:[\s\S]*REBASED: false[\s\S]*MERGE_COMMIT:[\s\S]*MERGED_INTO:[\s\S]*STATUS: done/,
     );
     assert.doesNotMatch(quarantinePersona, /git checkout|git merge --squash|git commit -F/);
+  });
+
+  it("enforces the plumbing contract and message vocabulary for security-audit merge variants", () => {
+    assert.equal(realpathSync(securityAuditWorktreePersonaPath), realpathSync(securityAuditPersonaPath));
+    const securityAuditPersona = readFileSync(securityAuditPersonaPath, "utf8");
+    assertRetryBeforeMergeBranch(securityAuditPersona, "security-audit merger persona");
+    assertCompleteMergeBranchInvocation(securityAuditPersona);
+    assertManagedParkingGuardrail(securityAuditPersona, "security-audit merger persona");
+    assert.match(securityAuditPersona, /RETRY_STEP: test/);
+    assert.match(securityAuditPersona, /Use `fix\(security\):` prefix/);
+    assert.match(securityAuditPersona, /security audit task from `\{\{task\}\}`/);
+    assert.match(securityAuditPersona, /progress file `\{\{progress_file\}\}`/);
+    assert.match(securityAuditPersona, /vulnerabilities were found and fixed/);
+    assert.match(securityAuditPersona, /STATUS: conflicts/);
+    assert.match(securityAuditPersona, /STATUS: target_moved/);
+    assert.match(
+      securityAuditPersona,
+      /STATUS: landed[\s\S]*MERGED_COMMIT:[\s\S]*MERGED_TREE:[\s\S]*REBASED: false[\s\S]*MERGE_COMMIT:[\s\S]*MERGED_INTO:[\s\S]*STATUS: done/,
+    );
+    assert.doesNotMatch(securityAuditPersona, /git checkout|git merge --squash|git commit -F/);
   });
 
   it("maps conflicts and target movement to tester revalidation and fails other errors", () => {
