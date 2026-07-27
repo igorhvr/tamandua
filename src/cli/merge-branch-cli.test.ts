@@ -29,6 +29,20 @@ function git(repo: string, args: string[]): string {
   return result.stdout;
 }
 
+function resolveRealGit(): string {
+  const result = spawnSync("sh", ["-c", "command -v git"], { encoding: "utf-8" });
+  const resolved = (result.stdout ?? "").trim();
+  assert.ok(resolved, "git not found on PATH");
+  return resolved;
+}
+
+// The shim below shadows `git` on PATH, so it must delegate through an absolute
+// path resolved from the *unmodified* PATH — a bare `git` would re-enter the
+// shim. Hardcoding /usr/bin/git is not portable: it is absent on non-FHS
+// systems, and where /usr/bin is an envfs mount (common on NixOS) it resolves
+// through the caller's PATH, which puts the shim right back in front of itself.
+const REAL_GIT = resolveRealGit();
+
 function runCli(args: string[], envOverrides: Record<string, string> = {}) {
   const testHome = createTempHome("tamandua-merge-branch-cli-home-");
   cleanup.push(testHome.root);
@@ -249,7 +263,7 @@ const fs = require("node:fs");
 const { spawnSync } = require("node:child_process");
 const args = process.argv.slice(2);
 fs.appendFileSync(process.env.MBLC_LEDGER_PATH, JSON.stringify(args) + "\\n");
-const result = spawnSync("/usr/bin/git", args, { encoding: "utf-8" });
+const result = spawnSync(${JSON.stringify(REAL_GIT)}, args, { encoding: "utf-8" });
 process.stdout.write(result.stdout || "");
 process.stderr.write(result.stderr || "");
 process.exit(result.status === null ? 1 : result.status);
