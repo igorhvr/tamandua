@@ -57,8 +57,9 @@ export interface ScriptedBehavior {
   includeCommandOutput?: boolean;
   /**
    * Text piped to `step complete` and emitted as the assistant message.
-   * Supports {{cwd}} and {{input.KEY}} placeholders (KEY: value lines parsed
-   * from the claimed step input). Defaults to "STATUS: done".
+   * Supports {{cwd}}, {{gitTree}} (the current HEAD tree), and {{input.KEY}}
+   * placeholders (KEY: value lines parsed from the claimed step input).
+   * Defaults to "STATUS: done".
    */
   output?: string;
   /** Report via `step fail` instead of `step complete`. */

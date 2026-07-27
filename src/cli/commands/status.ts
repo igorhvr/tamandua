@@ -62,7 +62,8 @@ Displays a comprehensive status overview of the Tamandua system, including:
 
   Services — Dashboard, daemon (control-plane+motor), and MCP status (up/down, PID, port)
   Tamandua Info — Source path, skill path, version, and source tree SHA256
-  Workflow Runs — Summary of all runs (running, paused, done, failed)
+  Workflow Runs — Summary of all runs (running, paused, done, failed), with
+                  visible red-ledger landing annotations when present
   Running Processes — Active pi/hermes harness processes spawned by tamandua
 
 Options:

@@ -22,6 +22,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
+import fs from "node:fs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CLI_SCRIPT = path.resolve(__dirname, "..", "dist", "cli", "cli.js");
@@ -500,6 +501,42 @@ describe("tamandua workflow status --json (integration)", () => {
     assert.equal(parsed.stories.length, 3);
     assert.equal(parsed.stories[0].storyId, "US-001");
     assert.equal(parsed.stories[0].status, "done");
+    assert.equal("redLedgerLanding" in parsed, false);
+  });
+
+  it("renders persisted red-ledger landing evidence in text and JSON", async () => {
+    const { homeDir, tamanduaDir } = createTempHome("tamandua-json-out-red-ledger-");
+    const dbPath = path.join(tamanduaDir, "tamandua.db");
+    const { runId } = seedDb(dbPath);
+    const db = new DatabaseSync(dbPath);
+    db.prepare("UPDATE runs SET status = 'completed' WHERE id = ?").run(runId);
+    db.close();
+    const ledgerCreatedAt = "2026-07-26T20:00:00.000Z";
+    fs.mkdirSync(path.join(tamanduaDir, "events"), { recursive: true });
+    fs.writeFileSync(
+      path.join(tamanduaDir, "events", `${runId}.jsonl`),
+      JSON.stringify({
+        ts: "2026-07-26T20:00:01.000Z",
+        event: "merge.landed_over_red_suite",
+        runId,
+        ledgerRowId: 42,
+        exitCode: 7,
+        ledgerCreatedAt,
+      }) + "\n",
+    );
+
+    const human = await runCli(["workflow", "status", runId], homeDir, tamanduaDir);
+    assert.match(human.stdout, /Red-ledger landing:.*row 42.*exit 7.*2026-07-26T20:00:00\.000Z/);
+
+    const json = await runCli(["workflow", "status", runId, "--json"], homeDir, tamanduaDir);
+    assert.deepEqual(JSON.parse(json.stdout).redLedgerLanding, {
+      ledgerRowId: 42,
+      exitCode: 7,
+      ledgerCreatedAt,
+    });
+
+    const system = await runCli(["status"], homeDir, tamanduaDir);
+    assert.match(system.stdout, /a1010101.*RED LEDGER.*exit 7.*2026-07-26T20:00:00\.000Z/);
   });
 
   it("--json stdout purity: exactly one JSON object", async () => {

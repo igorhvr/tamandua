@@ -1559,6 +1559,7 @@ describe("status command", () => {
       assert.match(result.stdout ?? "", /Services.*Dashboard, daemon.*control-plane\+motor.*MCP/);
       assert.match(result.stdout ?? "", /Tamandua Info.*Source path, skill path, version/);
       assert.match(result.stdout ?? "", /Workflow Runs.*Summary of all runs/);
+      assert.match(result.stdout ?? "", /red-ledger landing annotations/i);
       assert.match(result.stdout ?? "", /Running Processes.*Active pi\/hermes/);
       assert.match(result.stdout ?? "", /tamandua status/);
       assert.doesNotMatch(result.stdout ?? "", /tamandua get-ready/);

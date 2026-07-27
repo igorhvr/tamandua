@@ -126,6 +126,7 @@ describe("SPL2 workflow command module", () => {
     assert.match(getWorkflowRunHelp(), /Start a new workflow run/);
     assert.match(getWorkflowRunHelp(), /--task-file/);
     assert.match(getWorkflowStatusHelp(), /Show detailed run status/);
+    assert.match(getWorkflowStatusHelp(), /red-ledger landing/i);
     assert.match(getWorkflowAutoresearchHelp(), /Show AutoResearch progress/);
     assert.match(getWorkflowDeleteHelp(), /Permanently delete a workflow run/);
     assert.match(getWorkflowStopHelp(), /Cancel a running workflow/);

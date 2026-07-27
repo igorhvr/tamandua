@@ -205,6 +205,9 @@ Output includes:
   Tokens       Total tokens spent
   Workspace    Workspace mode (only shown for worktree runs)
   Steps        Per-step listing with step ID, status icon, and agent role
+  Red-ledger landing
+               Ledger row, non-zero exit code, and suite timestamp when a
+               default-mode merge landed over known red suite evidence
 
 Step status indicators:
   [done   ]    Step completed successfully
@@ -218,8 +221,9 @@ Options:
             tokensSpent, createdAt, updatedAt, workspaceMode (worktree runs),
             worktreePath, worktreeOriginRef, steps array (stepId, stepIndex,
             agentRole, status, retryCount, abandonedCount, rerouteCount, claimPid,
-            claimUpdatedAt, updatedAt), and stories array (storyId, title, status,
-            abandonedCount). Step outputs are NOT included.
+            claimUpdatedAt, updatedAt), stories array (storyId, title, status,
+            abandonedCount), and optional redLedgerLanding evidence. Step outputs
+            are NOT included.
 
 Examples:
   tamandua workflow status run-abc12345
@@ -791,6 +795,7 @@ export async function handleWorkflow(
           steps: jsonSteps,
         };
         if (jsonStories) jsonOutput.stories = jsonStories;
+        if (result.redLedgerLanding) jsonOutput.redLedgerLanding = result.redLedgerLanding;
         if (result.workspace_mode === "worktree") {
           jsonOutput.workspaceMode = result.workspace_mode;
           if (result.worktree_path) jsonOutput.worktreePath = result.worktree_path;
@@ -800,6 +805,9 @@ export async function handleWorkflow(
         return true;
       }
       console.log(`Run: ${prefixRunId(result.id)}\nWorkflow: ${result.workflowId}\nTask: ${result.task}\nStatus: ${result.status}\nTokens: ${result.tokensSpent.toLocaleString()}`);
+      if (result.redLedgerLanding) {
+        console.log(`Red-ledger landing: row ${result.redLedgerLanding.ledgerRowId}, exit ${result.redLedgerLanding.exitCode}, suite recorded ${result.redLedgerLanding.ledgerCreatedAt}`);
+      }
       if (result.workerLostCount > 0) console.log(`Worker lost: ${result.workerLostCount}`);
       if (result.workspace_mode === "worktree") {
         console.log(`Workspace: ${result.workspace_mode}`);

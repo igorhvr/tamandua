@@ -24,6 +24,9 @@ import {
 const SINGLEFLIGHT_POLL_INTERVAL_MS = 1000; // 1s
 /** Dedicated fail-closed exit when a passing command cannot be attributed. */
 const TREE_DRIFT_EXIT_CODE = 86;
+/** Dedicated red-ledger exit for executions interrupted by a catchable signal. */
+const INTERRUPTED_EXIT_CODE = 87;
+const FORWARDED_SIGNALS: NodeJS.Signals[] = ["SIGHUP", "SIGINT", "SIGQUIT", "SIGTERM"];
 
 // Module-level variables so the catch handler at the bottom can reach the
 // parsed command even when main() throws after parsing (SHCA fix).
@@ -102,6 +105,8 @@ result instead. Strictly monotone: degrades to passthrough on any doubt.
 Results are recorded only when the repository tree stays unchanged through
 process exit. Tree drift requires a stable-tree rerun and makes an otherwise
 passing command exit ${TREE_DRIFT_EXIT_CODE}.
+Executions interrupted by SIGHUP, SIGINT, SIGQUIT, or SIGTERM terminate their
+child process, record red evidence, and exit ${INTERRUPTED_EXIT_CODE}.
 `);
 }
 
@@ -159,9 +164,49 @@ function executeAndCapture(cmdString: string): Promise<ExecuteResult> {
     const startTime = Date.now();
     const child: ChildProcess = spawn("/bin/sh", ["-c", cmdString], {
       stdio: ["ignore", "pipe", "pipe"],
+      // Give the shell and its descendants a process group so timeout signals
+      // forwarded to the shim terminate the whole suite, not only /bin/sh.
+      detached: process.platform !== "win32",
     });
 
     let captured = "";
+    let completed = false;
+    let interruptedBy: NodeJS.Signals | null = null;
+
+    const finish = (exitCode: number, output: string = captured): void => {
+      if (completed) return;
+      completed = true;
+      resolve({
+        exitCode,
+        durationMs: Date.now() - startTime,
+        output,
+      });
+    };
+
+    const forwardSignal = (signal: NodeJS.Signals): void => {
+      if (completed || interruptedBy !== null) return;
+      interruptedBy = signal;
+      const evidence = `tamandua-test: suite interrupted by ${signal}; terminating child process\n`;
+      process.stderr.write(evidence);
+      captured += evidence;
+      try {
+        if (process.platform !== "win32" && child.pid !== undefined) {
+          process.kill(-child.pid, signal);
+        } else {
+          child.kill(signal);
+        }
+      } catch {
+        // The child may already have closed; its close event still completes
+        // this execution exactly once with interrupted evidence.
+      }
+    };
+
+    for (const signal of FORWARDED_SIGNALS) {
+      // Keep handlers through ledger finalization. A duplicate timeout signal
+      // after child close must not restore Node's default immediate exit and
+      // race the pending suite_results write.
+      process.on(signal, () => forwardSignal(signal));
+    }
 
     child.stdout!.on("data", (chunk: Buffer) => {
       const text = chunk.toString();
@@ -177,21 +222,13 @@ function executeAndCapture(cmdString: string): Promise<ExecuteResult> {
 
     child.on("error", (err: Error) => {
       // If the command itself can't be spawned, treat as passthrough-ish failure.
-      process.stderr.write(`tamandua-test: failed to spawn command: ${err.message}\n`);
-      resolve({
-        exitCode: 1,
-        durationMs: Date.now() - startTime,
-        output: `tamandua-test: failed to spawn command: ${err.message}`,
-      });
+      const evidence = `tamandua-test: failed to spawn command: ${err.message}`;
+      process.stderr.write(`${evidence}\n`);
+      finish(interruptedBy === null ? 1 : INTERRUPTED_EXIT_CODE, captured + evidence);
     });
 
     child.on("close", (code: number | null) => {
-      const durationMs = Date.now() - startTime;
-      resolve({
-        exitCode: code ?? 1,
-        durationMs,
-        output: captured,
-      });
+      finish(interruptedBy === null ? (code ?? 1) : INTERRUPTED_EXIT_CODE);
     });
   });
 }

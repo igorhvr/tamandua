@@ -31,7 +31,7 @@ import {
   createTempHome,
   baseEnv,
   cliMustSucceed,
-  spawnWorkflowRun,
+  spawnScriptedWorkflowRun as spawnWorkflowRun,
   prepareGitRepo,
   resolveFullRunId,
   cleanupTempHome,
@@ -495,7 +495,7 @@ describe("scripted-hermes full pipeline (real daemon/scheduler, zero tokens)", {
             mergedCommit?: string;
             mergedTree?: string;
           })
-          .filter((event) => event.event.startsWith("merge."));
+          .filter((event) => event.event.startsWith("merge.") && event.event !== "merge.gate_overridden");
         assert.deepEqual(mergeEvents.map((event) => event.event), ["merge.landed"]);
         assert.equal(mergeEvents[0]?.checkoutRefresh, "refreshed");
         assert.equal(mergeEvents[0]?.expectedTip, originTip);

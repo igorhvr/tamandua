@@ -3,7 +3,7 @@ import { scheduleRunCronTeardown, getWorkflowId } from "./step-ops.js";
 import { removeRunCrons } from "./agent-scheduler.js";
 import { terminateRunWithDaemon } from "../server/control-client.js";
 import { getRunWorktree, removeRunWorktree } from "./worktree-manager.js";
-import { emitEvent } from "./events.js";
+import { emitEvent, getRunEvents } from "./events.js";
 import { parseRunContext } from "./step-ops.js";
 import { logger } from "../lib/logger.js";
 import { stripIdPrefix } from "../lib/id-prefix.js";
@@ -19,6 +19,13 @@ export interface RunInfo {
   stepSummary?: string;
   tokensSpent: number;
   workerLostCount: number;
+  redLedgerLanding?: RedLedgerLanding;
+}
+
+export interface RedLedgerLanding {
+  ledgerRowId: number;
+  exitCode: number;
+  ledgerCreatedAt: string;
 }
 
 export interface RunDetail extends RunInfo {
@@ -174,6 +181,7 @@ export function listRuns(limit = 50): RunInfo[] {
 
   return rows.map((r) => {
     const stepSummary = getStepSummary(db, r.id);
+    const redLedgerLanding = getRedLedgerLanding(r.id);
     return {
       id: r.id,
       runNumber: r.run_number ?? undefined,
@@ -185,6 +193,7 @@ export function listRuns(limit = 50): RunInfo[] {
       stepSummary,
       tokensSpent: r.tokens_spent,
       workerLostCount: r.worker_lost_count,
+      ...(redLedgerLanding ? { redLedgerLanding } : {}),
     };
   });
 }
@@ -462,6 +471,26 @@ function getStepSummary(db: ReturnType<typeof getDb>, runId: string): string {
   return parts.join(" ");
 }
 
+function getRedLedgerLanding(runId: string): RedLedgerLanding | undefined {
+  const events = getRunEvents(runId);
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i];
+    if (
+      event.event === "merge.landed_over_red_suite"
+      && typeof event.ledgerRowId === "number"
+      && typeof event.exitCode === "number"
+      && typeof event.ledgerCreatedAt === "string"
+    ) {
+      return {
+        ledgerRowId: event.ledgerRowId,
+        exitCode: event.exitCode,
+        ledgerCreatedAt: event.ledgerCreatedAt,
+      };
+    }
+  }
+  return undefined;
+}
+
 function buildRunDetail(
   db: ReturnType<typeof getDb>,
   row: RunRow,
@@ -523,6 +552,7 @@ function buildRunDetail(
   }));
 
   const stepSummary = getStepSummary(db, row.id);
+  const redLedgerLanding = getRedLedgerLanding(row.id);
 
   // Enrich with worktree information when workspace_mode is 'worktree'
   let workspaceMode: string | undefined;
@@ -564,6 +594,7 @@ function buildRunDetail(
     stepSummary,
     tokensSpent: row.tokens_spent,
     workerLostCount: row.worker_lost_count,
+    ...(redLedgerLanding ? { redLedgerLanding } : {}),
     steps: stepInfos,
     stories: storyInfos.length > 0 ? storyInfos : undefined,
     workspace_mode: workspaceMode,

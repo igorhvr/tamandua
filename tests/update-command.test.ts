@@ -105,6 +105,7 @@ function createRunCommand(
     }
 
     if (command === "git" && args[0] === "pull" && args[1] === "--ff-only") {
+      assert.equal(options.stdio, "pipe");
       if (cfg.pullShouldFail) {
         throw new Error("Command failed (exit code 128): git pull --ff-only");
       }
@@ -130,6 +131,7 @@ function createRunCommand(
     }
 
     if (command === "./build-and-install" && args.length === 0) {
+      assert.equal(options.stdio, "inherit");
       return { stdout: "", stderr: "" };
     }
 

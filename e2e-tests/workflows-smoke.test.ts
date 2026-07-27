@@ -22,7 +22,7 @@ import {
   cliMustSucceed,
   stepClaim,
   stepComplete,
-  spawnWorkflowRun,
+  spawnScriptedWorkflowRun as spawnWorkflowRun,
   prepareGitRepo,
   resolveFullRunId,
   cleanupTempHome,

@@ -14,7 +14,7 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { tamanduaTempDir } from "../../src/lib/temp-dir.ts";
@@ -90,6 +90,21 @@ function spawnWorkIndexWorker(
 }
 
 describe("scripted-agent-runtime-shared", () => {
+  describe("substitute", () => {
+    it("renders the current git tree for tester attestations", async () => {
+      const mod = await import(sharedModulePath);
+      const expectedTree = execFileSync("git", ["rev-parse", "HEAD^{tree}"], {
+        cwd: process.cwd(),
+        encoding: "utf-8",
+      }).trim();
+
+      assert.equal(
+        mod.substitute("TESTED_TREE: {{gitTree}}", process.cwd(), {}),
+        `TESTED_TREE: ${expectedTree}`,
+      );
+    });
+  });
+
   describe("nextWorkIndex sequential (single-process)", () => {
     it("returns 0 on first call for a key", async () => {
       const stateDir = makeTempStateDir();

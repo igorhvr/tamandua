@@ -223,14 +223,19 @@ export function formatRunsSummary(opts?: {
   }
   lines.push(`${runs.length} total (${breakdownParts.join(", ")})`);
 
-  // List running and paused runs with details
+  // List active runs and terminal runs carrying a red-ledger landing annotation.
+  // Other terminal runs remain collapsed into the count line below.
   const now = Date.now();
   const daemonRunning = daemonCheck();
   const activeRuns = runs.filter(
     (r) => r.status === "running" || r.status === "paused",
   );
-  if (activeRuns.length > 0) {
-    for (const r of activeRuns) {
+  const annotatedTerminalRuns = runs.filter(
+    (r) => r.status !== "running" && r.status !== "paused" && r.redLedgerLanding !== undefined,
+  );
+  const visibleRuns = [...activeRuns, ...annotatedTerminalRuns];
+  if (visibleRuns.length > 0) {
+    for (const r of visibleRuns) {
       const idShort = r.id.slice(0, 8);
       const taskPreview =
         r.task.length > 60 ? r.task.slice(0, 57) + "..." : r.task;
@@ -238,18 +243,27 @@ export function formatRunsSummary(opts?: {
       // AND the daemon is not running, annotate the status as stale.
       let displayStatus = r.status;
       const updatedAtMs = r.updatedAt ? new Date(r.updatedAt).getTime() : 0;
-      if (!daemonRunning && (now - updatedAtMs) > ABANDONED_THRESHOLD_MS) {
+      if (
+        (r.status === "running" || r.status === "paused")
+        && !daemonRunning
+        && (now - updatedAtMs) > ABANDONED_THRESHOLD_MS
+      ) {
         displayStatus = `${r.status} (stale — daemon down?)`;
       }
+      const redLedgerMarker = r.redLedgerLanding
+        ? `  RED LEDGER row ${r.redLedgerLanding.ledgerRowId}, exit ${r.redLedgerLanding.exitCode} @ ${r.redLedgerLanding.ledgerCreatedAt}`
+        : "";
       lines.push(
-        `  [${displayStatus.padEnd(7)}] ${idShort}  ${r.workflowId.padEnd(14)} ${r.tokensSpent.toLocaleString().padStart(8)} tokens  ${taskPreview}`,
+        `  [${displayStatus.padEnd(7)}] ${idShort}  ${r.workflowId.padEnd(14)} ${r.tokensSpent.toLocaleString().padStart(8)} tokens  ${taskPreview}${redLedgerMarker}`,
       );
     }
   }
 
   // Show completed/failed count line
-  const completedCount = counts["completed"] || 0;
-  const failedCount = counts["failed"] || 0;
+  const completedCount = (counts["completed"] || 0)
+    - annotatedTerminalRuns.filter((r) => r.status === "completed").length;
+  const failedCount = (counts["failed"] || 0)
+    - annotatedTerminalRuns.filter((r) => r.status === "failed").length;
   if (completedCount > 0 || failedCount > 0) {
     const parts: string[] = [];
     if (completedCount > 0) parts.push(`${completedCount} completed`);

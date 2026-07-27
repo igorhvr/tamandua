@@ -32,7 +32,7 @@ import {
   createTempHome,
   baseEnv,
   cliMustSucceed,
-  spawnWorkflowRun,
+  spawnScriptedWorkflowRun as spawnWorkflowRun,
   prepareGitRepo,
   detachOriginCheckout,
   resolveFullRunId,
@@ -700,7 +700,7 @@ describe("concurrent-runs stress test", { concurrency: 1 }, () => {
             .trim()
             .split("\n")
             .map((line) => JSON.parse(line) as MergeEvent)
-            .filter((event) => event.event.startsWith("merge."));
+            .filter((event) => event.event.startsWith("merge.") && event.event !== "merge.gate_overridden");
           for (const event of mergeEvents) {
             assert.equal(event.runId, rid);
             assert.equal(event.origin, repoDir);

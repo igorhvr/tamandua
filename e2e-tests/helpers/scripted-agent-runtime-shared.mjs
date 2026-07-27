@@ -191,7 +191,7 @@ export function nextWorkIndex(stateDir, key) {
 }
 
 // ── Placeholder substitution ────────────────────────────────────────
-// {{cwd}} → workdir; {{input.KEY}} → "KEY: value" line from step input
+// {{cwd}} → workdir; {{gitTree}} → current HEAD tree; {{input.KEY}} → input
 
 /**
  * Parse KEY: value lines from a step input string.
@@ -206,12 +206,23 @@ export function parseInputVars(input) {
 }
 
 /**
- * Substitute {{cwd}} and {{input.KEY}} placeholders in text.
+ * Substitute {{cwd}}, {{gitTree}}, and {{input.KEY}} placeholders in text.
  * Throws if a referenced KEY is missing from inputVars.
  */
 export function substitute(text, cwd, inputVars) {
-  return text
-    .replaceAll("{{cwd}}", cwd)
+  let rendered = text.replaceAll("{{cwd}}", cwd);
+  if (rendered.includes("{{gitTree}}")) {
+    const tree = spawnSync("git", ["rev-parse", "HEAD^{tree}"], {
+      cwd,
+      encoding: "utf-8",
+      env: process.env,
+    });
+    if (tree.status !== 0 || !tree.stdout.trim()) {
+      throw new Error(`could not resolve git tree in ${cwd}: ${tree.stderr.trim()}`);
+    }
+    rendered = rendered.replaceAll("{{gitTree}}", tree.stdout.trim());
+  }
+  return rendered
     .replace(/\{\{input\.([A-Za-z0-9_]+)\}\}/g, (_, key) => {
       const upper = key.toUpperCase();
       if (!(upper in inputVars)) {

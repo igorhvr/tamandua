@@ -70,6 +70,54 @@ async function runShim(
   });
 }
 
+/** Spawn the shim, wait until its suite starts, then interrupt it as an external timeout would. */
+async function runInterruptedShim(
+  args: string[],
+  env: NodeJS.ProcessEnv,
+  signal: NodeJS.Signals,
+): Promise<ShimResult> {
+  return new Promise((resolve, reject) => {
+    const start = Date.now();
+    const child = spawn("node", [SHIM_PATH, ...args], {
+      env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    let interrupted = false;
+    const timeout = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error(`shim did not finish after ${signal}`));
+    }, 10_000);
+
+    child.stdout!.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString();
+      if (!interrupted && stdout.includes("INTERRUPTIBLE SUITE STARTED")) {
+        interrupted = true;
+        child.kill(signal);
+        // Exercise duplicate-signal/close races without permitting duplicate recording.
+        child.kill(signal);
+      }
+    });
+    child.stderr!.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString();
+    });
+    child.once("error", (err) => {
+      clearTimeout(timeout);
+      reject(err);
+    });
+    child.once("close", (code) => {
+      clearTimeout(timeout);
+      resolve({
+        exitCode: code ?? 1,
+        stdout,
+        stderr,
+        durationMs: Date.now() - start,
+      });
+    });
+  });
+}
+
 async function waitUntil(predicate: () => boolean): Promise<void> {
   while (!predicate()) {
     await new Promise((resolve) => setTimeout(resolve, 10));
@@ -641,6 +689,59 @@ describe("tamandua-test shim", { concurrency: 1 }, () => {
     assert.equal(rows[0]!.run_id, runId);
     assert.equal(rows[0]!.step_id, stepId);
   });
+
+  for (const { name, signal } of [
+    { name: "timeout termination", signal: "SIGTERM" as const },
+    { name: "operator interrupt", signal: "SIGINT" as const },
+  ]) {
+    it(`records exactly one red ledger row after ${name}`, async () => {
+      const fixture = createFixtureRepo(tempBase, `interrupted-${signal.toLowerCase()}`);
+      const script = join(fixture.repoDir, "interruptible-suite.sh");
+      writeFileSync(
+        script,
+        "#!/bin/sh\ntrap 'echo CHILD RECEIVED TERMINATION >&2; exit 99' TERM INT\necho 'INTERRUPTIBLE SUITE STARTED'\nwhile :; do sleep 1; done\n",
+      );
+      chmodSync(script, 0o755);
+      const runId = `r-interrupted-${signal.toLowerCase()}`;
+      const stepId = `s-interrupted-${signal.toLowerCase()}`;
+      const { computeTreeHash, computeCmdHash, getOriginRepo } = await import(
+        "../../dist/suite/tree-hash.js"
+      );
+      const treeHash = computeTreeHash(fixture.repoDir);
+      assert.ok(treeHash);
+      const cmdHash = computeCmdHash(script);
+      const originRepo = getOriginRepo(fixture.repoDir);
+
+      const result = await runInterruptedShim(
+        ["--repo", fixture.repoDir, "--run", runId, "--step", stepId, "--", script],
+        shimChildEnv(controlEnv),
+        signal,
+      );
+      assert.equal(result.exitCode, 87, "interrupted executions use the documented shim exit code");
+
+      const db = new DatabaseSync(controlEnv.dbPath);
+      const rows = db.prepare(
+        `SELECT exit_code, duration_ms, log_tail, run_id, step_id
+         FROM suite_results
+         WHERE origin_repo = ? AND tree_hash = ? AND cmd_hash = ? AND run_id = ? AND step_id = ?`,
+      ).all(originRepo, treeHash, cmdHash, runId, stepId) as Array<{
+        exit_code: number;
+        duration_ms: number;
+        log_tail: string | null;
+        run_id: string;
+        step_id: string;
+      }>;
+      db.close();
+
+      assert.equal(rows.length, 1, "signal/error/close races must record once");
+      assert.equal(rows[0]!.exit_code, 87);
+      assert.ok(rows[0]!.duration_ms > 0);
+      assert.equal(rows[0]!.run_id, runId);
+      assert.equal(rows[0]!.step_id, stepId);
+      assert.match(rows[0]!.log_tail ?? "", new RegExp(`interrupted by ${signal}`));
+      assert.match(rows[0]!.log_tail ?? "", /CHILD RECEIVED TERMINATION/);
+    });
+  }
 
   async function runTreeMutationCase(
     name: string,

@@ -14,6 +14,10 @@ import { stripIdPrefix } from "../lib/id-prefix.js";
 import type { LoopConfig, Story, WorkflowStepFailure } from "./types.js";
 import { detectRugpull, relaunchRunAfterRugpull } from "./rugpull.js";
 import { getPgid } from "../lib/proc-info.js";
+import {
+  evaluateFinalizeMergeLedgerGate,
+  formatLedgerGateRefusal,
+} from "./ledger-gate.js";
 
 // ══════════════════════════════════════════════════════════════════════
 // Stderr Sanitization
@@ -2175,6 +2179,17 @@ export function claimStep(agentId: string, runId: string, workerOwnership?: Work
   const runStatus = db.prepare("SELECT status FROM runs WHERE id = ?").get(step.run_id) as { status: string } | undefined;
   if (runStatus?.status !== "running") return { found: false };
 
+  // LGAT: route an obstructing finalize_merge decision through RAMP before
+  // the merger receives work. Green and ineligible decisions remain inert.
+  const ledgerGateDecision = evaluateFinalizeMergeLedgerGate(step.id);
+  if (
+    ledgerGateDecision.status === "missing"
+    || (ledgerGateDecision.status === "red" && ledgerGateDecision.gateMode === "green")
+  ) {
+    applyLedgerGateRefusalSync(step, formatLedgerGateRefusal(ledgerGateDecision));
+    return { found: false };
+  }
+
   // Build context via resolveStepContext
   const context = resolveStepContext(step.run_id, step.step_index);
 
@@ -2412,6 +2427,24 @@ export function claimStep(agentId: string, runId: string, workerOwnership?: Work
   if ((claim.changes ?? 0) <= 0) return { found: false };
   try {
     emitEvent({ ts: new Date().toISOString(), event: "step.running", runId: step.run_id, workflowId: getWorkflowId(step.run_id), stepId: step.step_id, agentId });
+    if (ledgerGateDecision.status === "overridden") {
+      const launch = db.prepare(
+        "SELECT run_number, workflow_id, created_at FROM runs WHERE id = ?",
+      ).get(step.run_id) as { run_number: number; workflow_id: string; created_at: string } | undefined;
+      emitEvent({
+        ts: new Date().toISOString(),
+        event: "merge.gate_overridden",
+        runId: step.run_id,
+        workflowId: launch?.workflow_id ?? getWorkflowId(step.run_id),
+        stepId: step.step_id,
+        gateMode: ledgerGateDecision.gateMode,
+        runNumber: launch?.run_number,
+        launchTs: launch?.created_at,
+        origin: ledgerGateDecision.originRepo,
+        treeHash: ledgerGateDecision.treeHash,
+        cmdHash: ledgerGateDecision.cmdHash,
+      });
+    }
     logger.info(`Step claimed by ${agentId}`, { runId: step.run_id, stepId: step.step_id });
 
     // Inject progress for any step in a run that has stories
@@ -2696,6 +2729,19 @@ function completeStepInternal(stepId: string, output: string): { status: string;
       });
     }
     return { status: "blocked", detail: "stale completion blocked — step was rerouted" };
+  }
+
+  // Defense-in-depth at acceptance time. The normal motor blocks before
+  // claim, but a completion from an older/in-flight claimant must not bypass
+  // an obstructing decision that became visible meanwhile.
+  const acceptanceGateDecision = evaluateFinalizeMergeLedgerGate(step.id);
+  if (
+    acceptanceGateDecision.status === "missing"
+    || (acceptanceGateDecision.status === "red" && acceptanceGateDecision.gateMode === "green")
+  ) {
+    const refusal = formatLedgerGateRefusal(acceptanceGateDecision);
+    const refusalStatus = applyLedgerGateRefusalSync(step, refusal);
+    return { status: refusalStatus, detail: refusal };
   }
 
   // Validate output against the expects column before accepting the step
@@ -2996,6 +3042,25 @@ function completeStepInternal(stepId: string, output: string): { status: string;
     logger.info(`Step retrying due to STATUS: retry verdict (retry ${newRetry}/${maxRetries})`, { runId: step.run_id, stepId: step.step_id });
     finalizeDrainingPause(step.run_id);
     return { status: "retrying", detail: `STATUS: retry verdict (retry ${newRetry}/${maxRetries})` };
+  }
+
+  // Default-mode red evidence is informational. Persist its run-scoped
+  // annotation only when finalize_merge is accepted as done.
+  if (acceptanceGateDecision.status === "red" && acceptanceGateDecision.gateMode === "default") {
+    emitEvent({
+      ts: new Date().toISOString(),
+      event: "merge.landed_over_red_suite",
+      runId: step.run_id,
+      workflowId: getWorkflowId(step.run_id),
+      stepId: step.step_id,
+      origin: acceptanceGateDecision.originRepo,
+      treeHash: acceptanceGateDecision.treeHash,
+      cmdHash: acceptanceGateDecision.cmdHash,
+      ledgerRowId: acceptanceGateDecision.row.id,
+      exitCode: acceptanceGateDecision.row.exitCode,
+      ledgerCreatedAt: acceptanceGateDecision.row.createdAt,
+      durationMs: acceptanceGateDecision.row.durationMs,
+    });
   }
 
   // Single step: mark done and advance
@@ -3339,6 +3404,13 @@ function rerouteWithPolicy(
   const db = getDb();
   const targetStepId = policy.retry_step!;
 
+  // Integrity-gate terminal refusals carry the durable ledger evidence needed
+  // to diagnose and recover the run. RAMP transports those mechanically
+  // generated reasons verbatim; ordinary agent-authored feedback remains
+  // bounded to keep prompts and event records small.
+  const boundedReason = error.length > 200 ? error.slice(0, 197) + "..." : error;
+  const rerouteReason = /^FAILURE_CLASS: refused_permanent$/m.test(error) ? error : boundedReason;
+
   // Look up the consumer step metadata
   const consumerStep = db.prepare(
     "SELECT step_id, step_index, reroute_count FROM steps WHERE id = ?"
@@ -3360,19 +3432,17 @@ function rerouteWithPolicy(
   const maxReroutes = policy.max_reroutes ?? 2;
   const currentReroutes = consumerStep.reroute_count ?? 0;
   if (currentReroutes >= maxReroutes) {
-    const boundedReasonPre =
-      error.length > 200 ? error.slice(0, 197) + "..." : error;
     emitEvent({
       ts: new Date().toISOString(),
       event: "step.reroute_budget_exhausted",
       runId,
       workflowId: getWorkflowId(runId),
       stepId: consumerStepId,
-      detail: `Reroute budget exhausted: ${currentReroutes}/${maxReroutes} to ${targetStepId}. Consumer failure: ${boundedReasonPre}`,
+      detail: `Reroute budget exhausted: ${currentReroutes}/${maxReroutes} to ${targetStepId}. Consumer failure: ${rerouteReason}`,
     });
     logger.warn("Reroute budget exhausted", {
       runId, fromStep: consumerStepId, toStep: targetStepId,
-      rerouteCount: currentReroutes, budget: maxReroutes, reason: boundedReasonPre,
+      rerouteCount: currentReroutes, budget: maxReroutes, reason: rerouteReason,
     });
     return "budget_exhausted";
   }
@@ -3380,8 +3450,6 @@ function rerouteWithPolicy(
   const newRerouteCount = currentReroutes + 1;
 
   // Build bounded feedback for the producer
-  const boundedReason =
-    error.length > 200 ? error.slice(0, 197) + "..." : error;
   const feedback =
     `Reroute from "${consumerStep.step_id}" (reroute ${newRerouteCount}/${maxReroutes}). ` +
     `Consumer failure: ${boundedReason}`;
@@ -3424,7 +3492,7 @@ function rerouteWithPolicy(
     stepId: consumerStepId,
     detail:
       `Rerouted to ${targetStepId} (${newRerouteCount}/${maxReroutes}). ` +
-      `Consumer failure: ${boundedReason}`,
+      `Consumer failure: ${rerouteReason}`,
   });
 
   logger.info(
@@ -3435,11 +3503,71 @@ function rerouteWithPolicy(
       toStep: targetStepId,
       rerouteCount: newRerouteCount,
       budget: maxReroutes,
-      reason: boundedReason,
+      reason: rerouteReason,
     },
   );
 
   return "rerouted";
+}
+
+/**
+ * Route a motor-generated LGAT refusal through RAMP's existing policy core.
+ * Terminal refusals receive the RAMP-wide one-reroute allowance regardless
+ * of the workflow's larger transient reroute budget.
+ */
+function applyLedgerGateRefusalSync(
+  step: { id: string; run_id: string; step_id: string },
+  refusal: string,
+): "rerouted" | "failed" {
+  const db = getDb();
+  const metadata = db.prepare(
+    "SELECT retry_count, reroute_count FROM steps WHERE id = ?",
+  ).get(step.id) as { retry_count: number; reroute_count: number | null } | undefined;
+  const policy = getOnFailPolicySync(step.run_id, step.step_id);
+  const rerouteCount = metadata?.reroute_count ?? 0;
+  const rerouteMode = getFailureRerouteMode(refusal, policy);
+  const terminalRerouteLimitExhausted = rerouteMode === "terminal" && rerouteCount >= 1;
+
+  if (!terminalRerouteLimitExhausted && policy?.retry_step) {
+    const rerouteResult = rerouteWithPolicy(
+      policy,
+      step.run_id,
+      step.step_id,
+      step.id,
+      refusal,
+    );
+    if (rerouteResult === "rerouted") {
+      nudgeDispatch();
+      finalizeDrainingPause(step.run_id);
+      return "rerouted";
+    }
+  }
+
+  const retryCount = (metadata?.retry_count ?? 0) + 1;
+  db.prepare(
+    "UPDATE steps SET status = 'failed', output = ?, retry_count = ?, updated_at = datetime('now') WHERE id = ?",
+  ).run(refusal, retryCount, step.id);
+  db.prepare(
+    "UPDATE runs SET status = 'failed', updated_at = datetime('now') WHERE id = ?",
+  ).run(step.run_id);
+  const workflowId = getWorkflowId(step.run_id);
+  emitEvent({
+    ts: new Date().toISOString(),
+    event: "step.failed",
+    runId: step.run_id,
+    workflowId,
+    stepId: step.step_id,
+    detail: refusal,
+  });
+  emitRunTerminalEvent({
+    event: "run.failed",
+    runId: step.run_id,
+    workflowId,
+    detail: refusal,
+  });
+  scheduleRunCronTeardown(step.run_id);
+  finalizeDrainingPause(step.run_id);
+  return "failed";
 }
 
 /**

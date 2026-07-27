@@ -40,7 +40,7 @@ import {
   createTempHome,
   baseEnv,
   cliMustSucceed,
-  spawnWorkflowRun,
+  spawnScriptedWorkflowRun as spawnWorkflowRun,
   prepareGitRepo,
   detachOriginCheckout,
   resolveFullRunId,
@@ -56,6 +56,7 @@ import {
   createScriptedAgent,
   type ScriptedAgent,
   type ScriptedAgentConfig,
+  type ScriptedBehavior,
 } from "./helpers/scripted-agent.ts";
 
 const fixtureDir = path.join(process.cwd(), "e2e-tests", "fixtures", "sample-project");
@@ -469,7 +470,7 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
           .trim()
           .split("\n")
           .map((line) => JSON.parse(line) as { event: string; checkoutRefresh?: string })
-          .filter((event) => event.event.startsWith("merge."));
+          .filter((event) => event.event.startsWith("merge.") && event.event !== "merge.gate_overridden");
         assert.deepEqual(mergeEvents.map((event) => event.event), ["merge.landed"]);
         assert.equal(mergeEvents[0]?.checkoutRefresh, "not-applicable");
 
@@ -665,7 +666,9 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
         assert.equal(rerouted?.stepId, "finalize_merge");
         assert.match(String(rerouted?.detail), /verify/);
         assert.match(String(rerouted?.detail), /FAILURE_CLASS: target_moved/);
-        const mergeEvents = events.filter((event) => String(event.event).startsWith("merge."));
+        const mergeEvents = events.filter(
+          (event) => String(event.event).startsWith("merge.") && event.event !== "merge.gate_overridden",
+        );
         assert.deepEqual(mergeEvents.map((event) => event.event), ["merge.target_moved", "merge.landed"]);
 
         const moved = mergeEvents[0];
@@ -1248,7 +1251,9 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
               { stepAction: "fail", failReason: "Code quality issues — unnecessary complexity in the expression" },
               { stepAction: "fail", failReason: "Side effects not addressed — edge cases still broken" },
               { stepAction: "fail", failReason: "Fix is semantically wrong — produces incorrect results" },
-              { output: ["STATUS: done", "VERIFIED: add() now uses a + b, regression test passes", "TESTED_TREE: scripted-tree-reroute"].join("\n") },
+              {
+                output: ["STATUS: done", "VERIFIED: add() now uses a + b, regression test passes", "TESTED_TREE: scripted-tree-reroute"].join("\n"),
+              },
             ],
             merger: {
               commands: [
@@ -1404,7 +1409,7 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
             parkedBranch?: string;
             parkedReason?: string;
           })
-          .filter((event) => event.event.startsWith("merge."));
+          .filter((event) => event.event.startsWith("merge.") && event.event !== "merge.gate_overridden");
         assert.deepEqual(mergeEvents.map((event) => event.event), ["merge.landed"]);
         assert.equal(mergeEvents[0]?.checkoutRefresh, `parked:${parkedBranch}`);
         assert.equal(mergeEvents[0]?.parkedBranch, parkedBranch);
@@ -1492,6 +1497,334 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
   const OREF_BRANCH = "feature/scripted-oref-test";
   const OREF_MERGE_TARGET = "alt-branch";
 
+  const LGAT_BRANCH = "feature/lgat-scripted";
+
+  interface LgatRunResult {
+    ctx: ScriptedRunContext;
+    repoDir: string;
+    originalBranch: string;
+    originTip: string;
+    runId: string;
+    status: string;
+  }
+
+  interface LgatLedgerRow {
+    id: number;
+    origin_repo: string;
+    tree_hash: string;
+    cmd_hash: string;
+    cmd_display: string;
+    exit_code: number;
+    duration_ms: number;
+    log_tail: string | null;
+    run_id: string | null;
+    step_id: string | null;
+    created_at: string;
+  }
+
+  function assertLgatMarkerLanded(run: LgatRunResult): void {
+    const landedTip = execSync(`git rev-parse "refs/heads/${run.originalBranch}"`, {
+      cwd: run.repoDir,
+      encoding: "utf-8",
+    }).trim();
+    assert.notEqual(landedTip, run.originTip, "the actual origin ref must advance when LGAT permits landing");
+    assert.match(execSync(`git show "refs/heads/${run.originalBranch}:src/lgat-marker.ts"`, {
+      cwd: run.repoDir,
+      encoding: "utf-8",
+    }), /ledger gate scripted acceptance marker/);
+  }
+
+  function assertLgatMarkerNotLanded(run: LgatRunResult): void {
+    const currentTip = execSync(`git rev-parse "refs/heads/${run.originalBranch}"`, {
+      cwd: run.repoDir,
+      encoding: "utf-8",
+    }).trim();
+    assert.equal(currentTip, run.originTip, "a refused LGAT landing must leave the actual origin ref unchanged");
+    const marker = spawnSync("git", ["show", `refs/heads/${run.originalBranch}:src/lgat-marker.ts`], {
+      cwd: run.repoDir,
+      encoding: "utf-8",
+    });
+    assert.notEqual(marker.status, 0, "the refused LGAT marker must remain absent from the actual origin ref");
+  }
+
+  function expectedRedLedgerRefusal(row: LgatLedgerRow): string {
+    return [
+      "FAILURE_CLASS: refused_permanent",
+      "Ledger gate refused finalize_merge: latest matching TSTX suite execution is red.",
+      "LEDGER_EVIDENCE: red",
+      `ORIGIN_REPO: ${row.origin_repo}`,
+      `TREE_HASH: ${row.tree_hash}`,
+      `CMD_HASH: ${row.cmd_hash}`,
+      `TEST_CMD: ${row.cmd_display}`,
+      `LEDGER_ROW_ID: ${row.id}`,
+      `EXIT_CODE: ${row.exit_code}`,
+      `TIMESTAMP: ${row.created_at}`,
+      `DURATION_MS: ${row.duration_ms}`,
+      `LEDGER_RUN_ID: ${row.run_id ?? ""}`,
+      `LEDGER_STEP_ID: ${row.step_id ?? ""}`,
+      `LOG_TAIL: ${row.log_tail ?? ""}`,
+    ].join("\n");
+  }
+
+  function lgatBehaviors(testCmd: "true" | "false", tester: ScriptedBehavior | ScriptedBehavior[]): ScriptedAgentConfig {
+    return {
+      agents: {
+        planner: {
+          output: [
+            "STATUS: done",
+            "REPO: {{cwd}}",
+            `BRANCH: ${LGAT_BRANCH}`,
+            `STORIES_JSON: [{"id":"US-001","title":"LGAT scripted acceptance","description":"Exercise ledger gate behavior","acceptanceCriteria":["Gate result is deterministic"]}]`,
+          ].join("\n"),
+        },
+        setup: {
+          commands: [`git checkout -b ${LGAT_BRANCH}`],
+          output: [
+            "STATUS: done",
+            "ORIGINAL_BRANCH: {{input.ORIGINAL_BRANCH}}",
+            "BUILD_CMD: true",
+            `TEST_CMD: ${testCmd}`,
+            "BASELINE: scripted fixture ready",
+          ].join("\n"),
+        },
+        developer: {
+          writes: [{ file: "src/lgat-marker.ts", content: "// ledger gate scripted acceptance marker\n" }],
+          commands: ["git add -A", 'git commit -m "feat: add LGAT acceptance marker"'],
+          output: "STATUS: done\nCHANGES: added LGAT marker\nTESTS: scripted fixture",
+        },
+        verifier: { output: "STATUS: done\nVERIFIED: LGAT marker exists" },
+        tester,
+        merger: {
+          commands: [
+            `expected_tip=$(git -C "{{input.WORKTREE_ORIGIN_REPOSITORY}}" rev-parse "refs/heads/{{input.ORIGINAL_BRANCH}}") && TAMANDUA_RUN_ID="{{input.RUN_ID}}" "${process.execPath}" "${cliPath}" merge-branch --origin "{{input.WORKTREE_ORIGIN_REPOSITORY}}" --branch "${LGAT_BRANCH}" --into "{{input.ORIGINAL_BRANCH}}" --expect-tip "$expected_tip" --message "feat: LGAT scripted acceptance (squash of ${LGAT_BRANCH})"`,
+          ],
+          includeCommandOutput: true,
+          output: "STATUS: done\nREBASED: false\nMERGED_INTO: {{input.ORIGINAL_BRANCH}}",
+        },
+      },
+    };
+  }
+
+  async function launchLgatRun(
+    testCmd: "true" | "false",
+    tester: ScriptedBehavior | ScriptedBehavior[],
+    options: { mergeGate?: "green" | "off"; inert?: boolean } = {},
+  ): Promise<LgatRunResult> {
+    const ctx = await startScriptedEnvironment("feature-dev-merge-worktree", lgatBehaviors(testCmd, tester));
+    if (options.inert) {
+      const installedWorkflow = path.join(ctx.env.tamanduaDir, "workflows", "feature-dev-merge-worktree", "workflow.yml");
+      const workflowText = fs.readFileSync(installedWorkflow, "utf-8");
+      const unattested = workflowText.replace(
+        'expects: "STATUS: done\\nregex:^TESTED_TREE:\\\\s*\\\\S+"',
+        'expects: "STATUS: done"',
+      );
+      assert.notEqual(unattested, workflowText, "fixture workflow should drop the TESTED_TREE contract");
+      fs.writeFileSync(installedWorkflow, unattested);
+    }
+    const repoDir = prepareGitRepo(fixtureDir, path.join(ctx.env.root, "origin-repo"));
+    const { branch: originalBranch, tip: originTip } = detachOriginCheckout(repoDir);
+    const args = [
+      "workflow", "run", "feature-dev-merge-worktree", "Exercise LGAT scripted acceptance behavior",
+      "--worktree-origin-repository", repoDir,
+      "--worktree-origin-ref", originalBranch,
+    ];
+    args.push("--context", `merge_gate=${options.mergeGate ?? "default"}`);
+    const runIdPrefix = await spawnWorkflowRun(args, baseEnv(ctx.env.homeDir, ctx.env.controlPort));
+    const runId = resolveFullRunId(runIdPrefix, ctx.env.tamanduaDir);
+    const status = await waitForRun(ctx, runId, 200_000);
+    return { ctx, repoDir, originalBranch, originTip, runId, status };
+  }
+
+  it("LGAT: missing evidence reroutes once, then a real green TSTX row allows landing", { timeout: 240_000 }, async () => {
+    let run: Awaited<ReturnType<typeof launchLgatRun>> | undefined;
+    try {
+      run = await launchLgatRun("true", [
+        { output: "STATUS: done\nRESULTS: attested without running TEST_CMD\nTESTED_TREE: {{gitTree}}" },
+        {
+          commands: ["{{input.BUILD_CMD}}", "{{input.TEST_CMD}}"],
+          output: "STATUS: done\nRESULTS: rerun created green ledger evidence\nTESTED_TREE: {{gitTree}}",
+        },
+      ]);
+      assert.equal(run.status, "completed", diagnostics(run.ctx));
+      assert.equal(run.ctx.scripted.workInvocations("tester").length, 2);
+      assert.equal(run.ctx.scripted.workInvocations("merger").length, 1, "merger must run only after recovery");
+      assertLgatMarkerLanded(run);
+      const mergeStep = dbRow<{ status: string; reroute_count: number }>(
+        run.ctx.env.tamanduaDir,
+        "SELECT status, reroute_count FROM steps WHERE run_id = ? AND step_id = 'finalize_merge'",
+        run.runId,
+      );
+      assert.equal(mergeStep.status, "done");
+      assert.equal(mergeStep.reroute_count, 1);
+      const rows = dbRows<{ exit_code: number; tree_hash: string; cmd_hash: string; cmd_display: string }>(
+        run.ctx.env.tamanduaDir,
+        "SELECT exit_code, tree_hash, cmd_hash, cmd_display FROM suite_results WHERE run_id = ? ORDER BY id",
+        run.runId,
+      );
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0].exit_code, 0);
+      assert.match(rows[0].tree_hash, /^[0-9a-f]{40}$/);
+      assert.match(rows[0].cmd_hash, /^[0-9a-f]{64}$/);
+      assert.equal(rows[0].cmd_display, "true");
+      const events = readRunEvents(run.ctx.env.tamanduaDir, run.runId);
+      const gateRefusal = events.find((event) => event.event === "step.rerouted");
+      assert.match(String(gateRefusal?.detail), /LEDGER_EVIDENCE: missing/);
+    } finally {
+      await teardown(run?.ctx);
+    }
+  });
+
+  it("LGAT: repeated red evidence refuses permanently after one reroute", { timeout: 240_000 }, async () => {
+    let run: Awaited<ReturnType<typeof launchLgatRun>> | undefined;
+    try {
+      const redTester: ScriptedBehavior = {
+        commands: ["{{input.BUILD_CMD}}", "{{input.TEST_CMD}} || true"],
+        output: "STATUS: done\nRESULTS: failing suite recorded for gate\nTESTED_TREE: {{gitTree}}",
+      };
+      run = await launchLgatRun("false", [redTester, redTester], { mergeGate: "green" });
+      assert.equal(run.status, "failed", diagnostics(run.ctx));
+      assert.equal(run.ctx.scripted.workInvocations("tester").length, 2);
+      assert.equal(run.ctx.scripted.workInvocations("merger").length, 0, "merge command must never execute");
+      assertLgatMarkerNotLanded(run);
+      const mergeStep = dbRow<{ status: string; reroute_count: number; output: string }>(
+        run.ctx.env.tamanduaDir,
+        "SELECT status, reroute_count, output FROM steps WHERE run_id = ? AND step_id = 'finalize_merge'",
+        run.runId,
+      );
+      assert.equal(mergeStep.status, "failed");
+      assert.equal(mergeStep.reroute_count, 1);
+      const rows = dbRows<LgatLedgerRow>(
+        run.ctx.env.tamanduaDir,
+        `SELECT id, origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms,
+                log_tail, run_id, step_id, created_at
+         FROM suite_results WHERE run_id = ? ORDER BY id`,
+        run.runId,
+      );
+      assert.deepEqual(rows.map((row) => row.exit_code), [1, 1]);
+      const firstRefusal = expectedRedLedgerRefusal(rows[0]);
+      const terminalRefusal = expectedRedLedgerRefusal(rows[1]);
+      assert.equal(mergeStep.output, terminalRefusal, "terminal refusal must preserve the exact latest ledger row");
+      const events = readRunEvents(run.ctx.env.tamanduaDir, run.runId);
+      const rerouted = events.filter((event) => event.event === "step.rerouted");
+      const failed = events.filter((event) => event.event === "step.failed" && event.stepId === "finalize_merge");
+      assert.equal(rerouted.length, 1);
+      assert.equal(failed.length, 1);
+      assert.ok(String(rerouted[0].detail).includes(firstRefusal), "reroute must preserve the exact first red ledger row");
+      assert.equal(failed[0].detail, terminalRefusal, "terminal event must preserve the exact latest red ledger row");
+      const runFailed = events.filter((event) => event.event === "run.failed");
+      assert.equal(runFailed.length, 1);
+      assert.equal(runFailed[0].detail, terminalRefusal, "run failure must preserve the exact latest red ledger row");
+      const statusText = cliMustSucceed(
+        ["workflow", "status", run.runId],
+        baseEnv(run.ctx.env.homeDir, run.ctx.env.controlPort),
+        "render red LGAT workflow status",
+      );
+      assert.match(statusText, /LEDGER_EVIDENCE:\s*red/);
+    } finally {
+      await teardown(run?.ctx);
+    }
+  });
+
+  it("LGAT: default mode lands over red evidence and surfaces the durable annotation", { timeout: 240_000 }, async () => {
+    let run: Awaited<ReturnType<typeof launchLgatRun>> | undefined;
+    try {
+      run = await launchLgatRun("false", {
+        commands: ["{{input.BUILD_CMD}}", "{{input.TEST_CMD}} || true"],
+        output: "STATUS: done\nRESULTS: red evidence recorded for annotated landing\nTESTED_TREE: {{gitTree}}",
+      });
+      assert.equal(run.status, "completed", diagnostics(run.ctx));
+      assert.equal(run.ctx.scripted.workInvocations("tester").length, 1);
+      assert.equal(run.ctx.scripted.workInvocations("merger").length, 1);
+      assertLgatMarkerLanded(run);
+      const mergeStep = dbRow<{ status: string; reroute_count: number }>(
+        run.ctx.env.tamanduaDir,
+        "SELECT status, reroute_count FROM steps WHERE run_id = ? AND step_id = 'finalize_merge'",
+        run.runId,
+      );
+      assert.equal(mergeStep.status, "done");
+      assert.equal(mergeStep.reroute_count, 0);
+      const row = dbRow<{ id: number; exit_code: number; created_at: string }>(
+        run.ctx.env.tamanduaDir,
+        "SELECT id, exit_code, created_at FROM suite_results WHERE run_id = ?",
+        run.runId,
+      );
+      assert.equal(row.exit_code, 1);
+      const events = readRunEvents(run.ctx.env.tamanduaDir, run.runId);
+      const annotation = events.filter((event) => event.event === "merge.landed_over_red_suite");
+      assert.equal(annotation.length, 1);
+      assert.equal(annotation[0].runId, run.runId);
+      assert.equal(annotation[0].ledgerRowId, row.id);
+      assert.equal(annotation[0].exitCode, 1);
+      assert.equal(annotation[0].ledgerCreatedAt, row.created_at);
+      const statusText = cliMustSucceed(
+        ["workflow", "status", run.runId],
+        baseEnv(run.ctx.env.homeDir, run.ctx.env.controlPort),
+        "render annotated red-ledger landing",
+      );
+      assert.match(statusText, new RegExp(`Red-ledger landing: row ${row.id}, exit 1`));
+    } finally {
+      await teardown(run?.ctx);
+    }
+  });
+
+  it("LGAT: merge_gate=off lands despite red evidence and emits an attributed override", { timeout: 240_000 }, async () => {
+    let run: Awaited<ReturnType<typeof launchLgatRun>> | undefined;
+    try {
+      run = await launchLgatRun("false", {
+        commands: ["{{input.BUILD_CMD}}", "{{input.TEST_CMD}} || true"],
+        output: "STATUS: done\nRESULTS: red evidence intentionally overridden\nTESTED_TREE: {{gitTree}}",
+      }, { mergeGate: "off" });
+      assert.equal(run.status, "completed", diagnostics(run.ctx));
+      assert.equal(run.ctx.scripted.workInvocations("merger").length, 1);
+      assertLgatMarkerLanded(run);
+      const rows = dbRows<LgatLedgerRow>(
+        run.ctx.env.tamanduaDir,
+        `SELECT id, origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms,
+                log_tail, run_id, step_id, created_at
+         FROM suite_results WHERE run_id = ?`,
+        run.runId,
+      );
+      assert.deepEqual(rows.map((row) => row.exit_code), [1]);
+      const launch = dbRow<{ run_number: number; workflow_id: string; created_at: string }>(
+        run.ctx.env.tamanduaDir,
+        "SELECT run_number, workflow_id, created_at FROM runs WHERE id = ?",
+        run.runId,
+      );
+      const events = readRunEvents(run.ctx.env.tamanduaDir, run.runId);
+      const overrides = events.filter((event) => event.event === "merge.gate_overridden");
+      assert.equal(overrides.length, 1);
+      assert.equal(overrides[0].runId, run.runId);
+      assert.equal(overrides[0].stepId, "finalize_merge");
+      assert.equal(overrides[0].gateMode, "off");
+      assert.equal(overrides[0].runNumber, launch.run_number);
+      assert.equal(overrides[0].launchTs, launch.created_at);
+      assert.equal(overrides[0].workflowId, launch.workflow_id);
+      assert.equal(overrides[0].origin, rows[0].origin_repo);
+      assert.equal(overrides[0].treeHash, rows[0].tree_hash);
+      assert.equal(overrides[0].cmdHash, rows[0].cmd_hash);
+    } finally {
+      await teardown(run?.ctx);
+    }
+  });
+
+  it("LGAT: an unattested workflow remains inert and lands without gate events", { timeout: 240_000 }, async () => {
+    let run: Awaited<ReturnType<typeof launchLgatRun>> | undefined;
+    try {
+      run = await launchLgatRun("false", {
+        output: "STATUS: done\nRESULTS: legacy workflow intentionally omits an attestation",
+      }, { mergeGate: "green", inert: true });
+      assert.equal(run.status, "completed", diagnostics(run.ctx));
+      assert.equal(run.ctx.scripted.workInvocations("merger").length, 1);
+      assertLgatMarkerLanded(run);
+      const events = readRunEvents(run.ctx.env.tamanduaDir, run.runId);
+      assert.equal(events.filter((event) => event.event === "step.rerouted").length, 0);
+      assert.equal(events.filter((event) => event.event === "merge.gate_overridden").length, 0);
+      assert.equal(dbRows(run.ctx.env.tamanduaDir, "SELECT id FROM suite_results WHERE run_id = ?", run.runId).length, 0);
+    } finally {
+      await teardown(run?.ctx);
+    }
+  });
+
   const OREF_WORK_TOKENS = 111;
   const FEATURE_DEV_AGENTS = ["planner", "setup", "developer", "verifier", "tester", "merger"];
 
@@ -1510,8 +1843,8 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
         output: [
           "STATUS: done",
           "ORIGINAL_BRANCH: {{input.ORIGINAL_BRANCH}}",
-          "BUILD_CMD: npm run build",
-          "TEST_CMD: npm test",
+          "BUILD_CMD: true",
+          "TEST_CMD: true",
           "BASELINE: fixture project ready",
         ].join("\n"),
       },
@@ -1531,10 +1864,11 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
         output: ["STATUS: done", "VERIFIED: src/oref-marker.ts exists, build passes"].join("\n"),
       },
       tester: {
+        commands: ["{{input.BUILD_CMD}}", "{{input.TEST_CMD}}"],
         output: [
           "STATUS: done",
           "RESULTS: Full test suite passes, oref-marker.ts verified",
-          "TESTED_TREE: scripted-oref-tree",
+          "TESTED_TREE: {{gitTree}}",
         ].join("\n"),
       },
       merger: {
@@ -1582,6 +1916,8 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
             repoDir,
             "--worktree-origin-ref",
             OREF_MERGE_TARGET,
+            "--context",
+            "merge_gate=default",
           ],
           baseEnv(ctx.env.homeDir, ctx.env.controlPort),
         );

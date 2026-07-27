@@ -287,6 +287,28 @@ export function spawnWorkflowRun(
   });
 }
 
+/**
+ * Launch a scripted run with LGAT disabled unless the scenario explicitly
+ * supplies a merge_gate context. Legacy scripted scenarios use synthetic
+ * attestations and do not execute the suite shim; dedicated LGAT scenarios
+ * opt into green/off modes and create real suite_results rows instead.
+ */
+export function spawnScriptedWorkflowRun(
+  args: string[],
+  env: Record<string, string>,
+  timeoutMs = 30_000,
+  cwd?: string,
+): Promise<string> {
+  const workflowId = args[2] ?? "";
+  const hasExplicitGate = args.some(
+    (arg, index) => arg === "--context" && args[index + 1]?.startsWith("merge_gate="),
+  );
+  const scriptedArgs = workflowId.includes("-merge") && !hasExplicitGate
+    ? [...args, "--context", "merge_gate=off"]
+    : args;
+  return spawnWorkflowRun(scriptedArgs, env, timeoutMs, cwd);
+}
+
 /** Prepare a clean git repo from the sample project fixture */
 export function prepareGitRepo(fixtureDir: string, targetDir: string) {
   fs.mkdirSync(targetDir, { recursive: true });

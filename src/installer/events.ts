@@ -71,6 +71,12 @@ export interface TamanduaEvent {
   checkoutRefresh?: CheckoutRefreshOutcome;
   parkedBranch?: string;
   parkedReason?: string;
+  // Finalize-merge ledger gate fields
+  ledgerRowId?: number;
+  ledgerCreatedAt?: string;
+  gateMode?: string;
+  runNumber?: number;
+  launchTs?: string;
 }
 
 export type EventCursorSource =

@@ -72,6 +72,10 @@ function seedContext(spec: WorkflowSpec): Record<string, string> {
     no_hurry_save_tokens_mode: "false",
     harness_type: "pi",
     no_relaunch_upon_rugpull: "false",
+    // This generic graph simulator does not execute real test commands or
+    // create ledger rows. Opt out explicitly; ledger-gate enforcement has a
+    // dedicated integration suite with real git fixtures and gate evidence.
+    merge_gate: "off",
     repo: "/sim/origin-repo",
     branch: `sim-branch-${spec.id}`,
     original_branch: "main",
