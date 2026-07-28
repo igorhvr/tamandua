@@ -31,6 +31,10 @@ description: Tamandua is a local CLI/workflow orchestrator for coordinating mult
 ### Operator essentials
 
 - Launch: `tamandua workflow run <workflow-id> "<task>"` or `tamandua workflow run <workflow-id> --task-file <path>`.
+  Worktree-mode launches perform a synchronous `git worktree add` BEFORE printing
+  anything, which can take 10–30+ seconds on large repos or cold caches. Never
+  wrap the launch in a command timeout under ~120 seconds; prefer a generous
+  timeout or run it in the background.
 - Wait: `tamandua workflow wait <selector...> [--timeout <dur>]`.
 - Inspect: `tamandua workflow status <run-id> --json`.
 - Stop: `tamandua workflow stop <run-id>`.
@@ -495,6 +499,10 @@ Workspace-mode guidance:
   `--worktree-origin-repository <dir>` to select the origin repository and
   `--worktree-origin-ref <ref>` to select a branch, tag, or SHA. These default
   to the current repository and current branch, respectively.
+  Worktree-mode launches perform a synchronous `git worktree add` BEFORE printing
+  anything, which can take 10–30+ seconds on large repos or cold caches. Never
+  wrap the launch in a command timeout under ~120 seconds; prefer a generous
+  timeout or running it in the background.
 - A worktree launch requires the origin repository to have no uncommitted
   changes. Commit or stash changes before launching, or Tamandua refuses the
   launch.
@@ -890,6 +898,12 @@ resuming.
 
 ### Recovery recipes
 
+- **If a launch times out or dies with no output:** do NOT re-launch blind.
+  First run `tamandua workflow runs --json` and look for a just-created run
+  matching your task. If it exists and has steps, adopt it (it launched fine).
+  If it exists with zero steps, it is a dead partial launch: delete it with
+  `tamandua workflow delete <run-id> --force`, then re-launch. (The daemon also
+  auto-fails such partial launches after ~30 minutes.)
 - A wait timeout (exit code 2) is not a failed run; wait again or inspect with `workflow status --json` and `logs-tail`.
 - For a dead worker holding a claim, use `tamandua step release <run-id> [step-id] [--force]`; do not edit SQLite.
 - For a permanently failed run, fix the cause and use `tamandua workflow resume <run-id>`.

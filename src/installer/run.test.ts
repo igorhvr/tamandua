@@ -1387,4 +1387,128 @@ fi
       }
     });
   });
+
+  // ── US-004: synchronous early run-id line on stderr ──
+
+  describe("synchronous early run-id line on stderr (US-004)", () => {
+    /**
+     * Helper: invoke runWorkflow in a subprocess so we can capture stderr
+     * (writeSync to fd 2 is invisible to in-process test frameworks).
+     */
+    function runWorkflowSubprocess(
+      tempHome: string,
+      workflowId: string,
+      workspaceMode: "direct" | "worktree",
+      extraArgs: string,
+    ): { stderr: string; exitCode: number } {
+      const scriptPath = path.join(tempHome, "_test_runner.mjs");
+      const distDir = path.resolve(import.meta.dirname ?? __dirname, "..", "..", "dist");
+      const testRunnerContent = [
+        `process.env.HOME = ${JSON.stringify(tempHome)};`,
+        `process.env.TAMANDUA_STATE_DIR = ${JSON.stringify(path.join(tempHome, ".tamandua"))};`,
+        `process.env.TAMANDUA_DB_PATH = ${JSON.stringify(path.join(tempHome, ".tamandua", "tamandua.db"))};`,
+        `process.env.TAMANDUA_WORKTREE_ROOT = ${JSON.stringify(path.join(tempHome, ".tamandua", "worktrees"))};`,
+        `process.env.TAMANDUA_CONTROL_PORT = "19999";`,
+      ];
+
+      // Set up a dead control port so the test doesn't try to connect to anything real
+      let runnerBody: string;
+      if (workspaceMode === "direct") {
+        runnerBody = `
+const { runWorkflow } = await import(${JSON.stringify(path.join(distDir, "installer", "run.js"))});
+try {
+  await runWorkflow({
+    workflowId: ${JSON.stringify(workflowId)},
+    taskTitle: "Test stderr line",
+    ${extraArgs}
+  });
+} catch (e) {
+  // Expected — daemon registration will fail in test environment
+}
+`;
+      } else {
+        runnerBody = `
+const { runWorkflow } = await import(${JSON.stringify(path.join(distDir, "installer", "run.js"))});
+try {
+  await runWorkflow({
+    workflowId: ${JSON.stringify(workflowId)},
+    taskTitle: "Test stderr line",
+    ${extraArgs}
+  });
+} catch (e) {
+  // Expected — daemon registration will fail in test environment
+}
+`;
+      }
+
+      fs.writeFileSync(scriptPath, testRunnerContent.join("\n") + runnerBody, "utf-8");
+
+      const result = spawnSync("node", ["--no-warnings", scriptPath], {
+        encoding: "utf-8",
+        stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env, HOME: tempHome },
+        timeout: 30000,
+      });
+
+      return {
+        stderr: result.stderr ?? "",
+        exitCode: result.status ?? -1,
+      };
+    }
+
+    it("emits synchronous stderr line in direct mode", () => {
+      const workflowId = "test-us004-direct";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      const repoDir = path.join(tempHome, "test-us004-repo");
+      initGitRepo(repoDir);
+
+      const { stderr } = runWorkflowSubprocess(
+        tempHome,
+        workflowId,
+        "direct",
+        `workingDirectoryForHarness: ${JSON.stringify(repoDir)},`,
+      );
+
+      assert.match(stderr, /run #\d+ \([0-9a-f]{8}\) created; preparing workspace\.\.\./,
+        `stderr should contain the synchronous run-id line, got: ${stderr}`);
+    });
+
+    it("emits synchronous stderr line in worktree mode", () => {
+      const workflowId = "test-us004-wt";
+      writeMinimalWorkflow(tempHome, workflowId, "worktree");
+      const originDir = path.join(tempHome, "test-us004-wt-origin");
+      initGitRepo(originDir);
+
+      const { stderr } = runWorkflowSubprocess(
+        tempHome,
+        workflowId,
+        "worktree",
+        `worktreeOriginRepository: ${JSON.stringify(originDir)},`,
+      );
+
+      assert.match(stderr, /run #\d+ \([0-9a-f]{8}\) created; preparing workspace\.\.\./,
+        `stderr should contain the synchronous run-id line, got: ${stderr}`);
+    });
+
+    it("stderr line contains the run number (numeric)", () => {
+      const workflowId = "test-us004-runnum";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      const repoDir = path.join(tempHome, "test-us004-runnum-repo");
+      initGitRepo(repoDir);
+
+      const { stderr } = runWorkflowSubprocess(
+        tempHome,
+        workflowId,
+        "direct",
+        `workingDirectoryForHarness: ${JSON.stringify(repoDir)},`,
+      );
+
+      const match = stderr.match(/run #(\d+) \(([0-9a-f]{8})\) created; preparing workspace\.\.\./);
+      assert.ok(match, `stderr should match the run-id line pattern, got: ${stderr}`);
+      const runNumber = parseInt(match![1], 10);
+      assert.ok(runNumber > 0, `run number should be positive, got: ${runNumber}`);
+      assert.ok(Number.isInteger(runNumber), `run number should be an integer, got: ${runNumber}`);
+      assert.equal(match![2].length, 8, `run-id prefix should be 8 hex chars, got: ${match![2]}`);
+    });
+  });
 });

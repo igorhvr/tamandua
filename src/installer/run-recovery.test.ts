@@ -74,7 +74,7 @@ describe("recoverStaleLaunchPhantoms", () => {
       `INSERT INTO run_worktrees
          (run_id, worktree_origin_repository, worktree_origin_git_common_dir, worktree_path,
           status, cleanup_policy, created_at)
-       VALUES (?, '/origin', '/origin/.git', '/worktree', 'creating', 'remove_on_terminal', ?)`,
+       VALUES (?, '/origin', '/origin/.git', '/worktree', 'ready', 'remove_on_terminal', ?)`,
     ).run(withWorktreeId, oldTimestamp);
 
     const first = recoverStaleLaunchPhantoms(nowMs);
@@ -112,5 +112,120 @@ describe("recoverStaleLaunchPhantoms", () => {
       ).length,
       1,
     );
+  });
+
+  it("fails old zero-step runs whose worktree row is stuck in a launch-failure state", () => {
+    const db = getDb();
+    const nowMs = Date.now();
+    const oldTimestamp = new Date(nowMs - STALE_LAUNCH_PHANTOM_AGE_MS - 60_000).toISOString();
+
+    for (const stuckStatus of ["creating", "error", "cleanup_failed"]) {
+      const runId = crypto.randomUUID();
+      db.prepare(
+        `INSERT INTO runs
+           (id, workflow_id, task, status, context, tokens_spent, scheduling_status, created_at, updated_at)
+         VALUES (?, 'lncz-recovery-test', 'test', 'running', '{}', 0, 'pending_register', ?, ?)`,
+      ).run(runId, oldTimestamp, oldTimestamp);
+      db.prepare(
+        `INSERT INTO run_worktrees
+           (run_id, worktree_origin_repository, worktree_origin_git_common_dir, worktree_path,
+            status, cleanup_policy, created_at)
+         VALUES (?, '/origin', '/origin/.git', ? || '/worktree', ?, 'remove_on_terminal', ?)`,
+      ).run(runId, runId, stuckStatus, oldTimestamp);
+
+      const result = recoverStaleLaunchPhantoms(nowMs);
+      assert.deepEqual(result, { recovered: 1, runIds: [runId] });
+
+      const row = db.prepare("SELECT status, scheduling_error FROM runs WHERE id = ?").get(runId) as {
+        status: string;
+        scheduling_error: string;
+      };
+      assert.equal(row.status, "failed");
+      assert.equal(row.scheduling_error, STALE_LAUNCH_PHANTOM_REASON);
+
+      // Idempotent: second sweep recovers 0
+      assert.deepEqual(recoverStaleLaunchPhantoms(nowMs), { recovered: 0, runIds: [] });
+    }
+  });
+
+  it("leaves untouched zero-step runs with 'creating' worktree row but younger than cutoff", () => {
+    const db = getDb();
+    const nowMs = Date.now();
+    const youngTimestamp = new Date(nowMs - STALE_LAUNCH_PHANTOM_AGE_MS + 60_000).toISOString();
+    const runId = crypto.randomUUID();
+
+    db.prepare(
+      `INSERT INTO runs
+         (id, workflow_id, task, status, context, tokens_spent, scheduling_status, created_at, updated_at)
+       VALUES (?, 'lncz-recovery-test', 'test', 'running', '{}', 0, 'pending_register', ?, ?)`,
+    ).run(runId, youngTimestamp, youngTimestamp);
+    db.prepare(
+      `INSERT INTO run_worktrees
+         (run_id, worktree_origin_repository, worktree_origin_git_common_dir, worktree_path,
+          status, cleanup_policy, created_at)
+       VALUES (?, '/origin', '/origin/.git', '/worktree', 'creating', 'remove_on_terminal', ?)`,
+    ).run(runId, youngTimestamp);
+
+    const result = recoverStaleLaunchPhantoms(nowMs);
+    assert.deepEqual(result, { recovered: 0, runIds: [] });
+
+    const row = db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string };
+    assert.equal(row.status, "running");
+  });
+
+  it("leaves untouched runs with steps even when worktree is stuck in 'creating'", () => {
+    const db = getDb();
+    const nowMs = Date.now();
+    const oldTimestamp = new Date(nowMs - STALE_LAUNCH_PHANTOM_AGE_MS - 60_000).toISOString();
+    const runId = crypto.randomUUID();
+
+    db.prepare(
+      `INSERT INTO runs
+         (id, workflow_id, task, status, context, tokens_spent, scheduling_status, created_at, updated_at)
+       VALUES (?, 'lncz-recovery-test', 'test', 'running', '{}', 0, 'pending_register', ?, ?)`,
+    ).run(runId, oldTimestamp, oldTimestamp);
+    db.prepare(
+      `INSERT INTO steps
+         (id, run_id, step_id, step_index, agent_id, type, status, input_template, expects,
+          retry_count, max_retries, created_at, updated_at)
+       VALUES (?, ?, 'implement', 0, 'developer', 'single', 'pending', 'work', '', 0, 3, ?, ?)`,
+    ).run(crypto.randomUUID(), runId, oldTimestamp, oldTimestamp);
+    db.prepare(
+      `INSERT INTO run_worktrees
+         (run_id, worktree_origin_repository, worktree_origin_git_common_dir, worktree_path,
+          status, cleanup_policy, created_at)
+       VALUES (?, '/origin', '/origin/.git', '/worktree', 'creating', 'remove_on_terminal', ?)`,
+    ).run(runId, oldTimestamp);
+
+    const result = recoverStaleLaunchPhantoms(nowMs);
+    assert.deepEqual(result, { recovered: 0, runIds: [] });
+
+    const row = db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string };
+    assert.equal(row.status, "running");
+  });
+
+  it("leaves untouched zero-step runs with worktree row 'ready' regardless of age", () => {
+    const db = getDb();
+    const nowMs = Date.now();
+    const oldTimestamp = new Date(nowMs - STALE_LAUNCH_PHANTOM_AGE_MS - 60_000).toISOString();
+    const runId = crypto.randomUUID();
+
+    db.prepare(
+      `INSERT INTO runs
+         (id, workflow_id, task, status, context, tokens_spent, scheduling_status, created_at, updated_at)
+       VALUES (?, 'lncz-recovery-test', 'test', 'running', '{}', 0, 'pending_register', ?, ?)`,
+    ).run(runId, oldTimestamp, oldTimestamp);
+    db.prepare(
+      `INSERT INTO run_worktrees
+         (run_id, worktree_origin_repository, worktree_origin_git_common_dir, worktree_path,
+          status, cleanup_policy, created_at)
+       VALUES (?, '/origin', '/origin/.git', '/worktree', 'ready', 'remove_on_terminal', ?)`,
+    ).run(runId, oldTimestamp);
+
+    const result = recoverStaleLaunchPhantoms(nowMs);
+    assert.deepEqual(result, { recovered: 0, runIds: [] });
+
+    const row = db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string };
+    assert.equal(row.status, "running");
   });
 });

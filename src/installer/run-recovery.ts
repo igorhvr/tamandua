@@ -10,7 +10,7 @@ import { logger } from "../lib/logger.js";
 export const STALE_LAUNCH_PHANTOM_AGE_MS = 30 * 60 * 1000;
 
 export const STALE_LAUNCH_PHANTOM_REASON =
-  "Daemon recovery: stale launch phantom had no steps or managed-worktree state after 30 minutes";
+  "Daemon recovery: stale launch phantom had no steps and worktree state was absent or stuck in a launch-failure state after 30 minutes";
 
 export interface StaleLaunchPhantomSweepResult {
   recovered: number;
@@ -26,10 +26,17 @@ interface PhantomCandidate {
 /**
  * Fail legacy launch phantoms without racing an in-flight launch.
  *
+ * Detects runs that have no steps AND either (a) no run_worktrees row at all
+ * (pre-existing phantom shape) or (b) a run_worktrees row stuck in a
+ * launch-failure state ('creating', 'error', 'cleanup_failed'). Runs whose
+ * worktree row is 'ready'/'removing'/'removed' are intentionally left alone —
+ * those are actively managed by other cleanup paths.
+ *
  * Each conditional update rechecks every invariant atomically, so a concurrent
- * launcher that creates a step or run_worktrees row protects its run even when
- * it was selected just before that setup completed. Only successful updates
- * emit events, which makes repeated and concurrent sweeps idempotent.
+ * launcher that creates a step or flips a worktree row to 'ready' protects its
+ * run even when it was selected just before that setup completed. Only
+ * successful updates emit events, which makes repeated and concurrent sweeps
+ * idempotent.
  */
 export function recoverStaleLaunchPhantoms(
   nowMs: number = Date.now(),
@@ -43,7 +50,10 @@ export function recoverStaleLaunchPhantoms(
      WHERE r.status = 'running'
        AND datetime(r.created_at) < datetime(?)
        AND NOT EXISTS (SELECT 1 FROM steps s WHERE s.run_id = r.id)
-       AND NOT EXISTS (SELECT 1 FROM run_worktrees rw WHERE rw.run_id = r.id)
+       AND (NOT EXISTS (SELECT 1 FROM run_worktrees rw WHERE rw.run_id = r.id)
+            OR EXISTS (SELECT 1 FROM run_worktrees rw
+                       WHERE rw.run_id = r.id
+                         AND rw.status IN ('creating', 'error', 'cleanup_failed')))
      ORDER BY r.created_at ASC, r.id ASC`,
   ).all(cutoff) as unknown as PhantomCandidate[];
 
@@ -58,7 +68,10 @@ export function recoverStaleLaunchPhantoms(
        AND status = 'running'
        AND datetime(created_at) < datetime(?)
        AND NOT EXISTS (SELECT 1 FROM steps s WHERE s.run_id = runs.id)
-       AND NOT EXISTS (SELECT 1 FROM run_worktrees rw WHERE rw.run_id = runs.id)`,
+       AND (NOT EXISTS (SELECT 1 FROM run_worktrees rw WHERE rw.run_id = runs.id)
+            OR EXISTS (SELECT 1 FROM run_worktrees rw
+                       WHERE rw.run_id = runs.id
+                         AND rw.status IN ('creating', 'error', 'cleanup_failed')))`,
   );
 
   for (const candidate of candidates) {

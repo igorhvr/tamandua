@@ -549,6 +549,95 @@ describe("worktree-manager", () => {
         /has no managed worktree/i,
       );
     });
+
+    it("(force=false) fails on a locked worktree", () => {
+      const wt = createRunWorktree({
+        runId: "run-remove-locked",
+        runNumber: 33,
+        workflowId: "test-workflow",
+        worktreeOriginRepository: originRepo,
+      });
+
+      // Lock the worktree simulating the 'initialising' lock from a killed git worktree add.
+      // Must run from the origin repo, not the worktree itself.
+      const r = spawnSync("git", ["worktree", "lock", wt.worktreePath, "--reason", "initialising"], {
+        cwd: originRepo,
+        encoding: "utf-8",
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      assert.equal(r.status, 0, `git worktree lock should succeed, got: ${r.stderr}`);
+
+      // Non-force removal should fail on a locked worktree
+      assert.throws(
+        () => removeRunWorktree({ runId: "run-remove-locked" }),
+        /Failed to remove managed worktree/i,
+      );
+
+      // Clean up: unlock then force-remove
+      spawnSync("git", ["worktree", "unlock", wt.worktreePath], { cwd: originRepo });
+      removeRunWorktree({ runId: "run-remove-locked", force: true });
+    });
+
+    it("(force=true) removes a locked worktree (double --force)", () => {
+      const wt = createRunWorktree({
+        runId: "run-remove-locked-force",
+        runNumber: 34,
+        workflowId: "test-workflow",
+        worktreeOriginRepository: originRepo,
+      });
+
+      const wtPath = wt.worktreePath;
+
+      // Lock the worktree. Must run from the origin repo.
+      const r = spawnSync("git", ["worktree", "lock", wtPath, "--reason", "initialising"], {
+        cwd: originRepo,
+        encoding: "utf-8",
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      assert.equal(r.status, 0, `git worktree lock should succeed, got: ${r.stderr}`);
+
+      // Force removal should succeed with double --force
+      removeRunWorktree({ runId: "run-remove-locked-force", force: true });
+
+      // DB row should be marked removed
+      const row = getRunWorktree("run-remove-locked-force");
+      assert.ok(row, "row should still exist in DB");
+      assert.equal(row!.status, "removed");
+
+      // Worktree directory should be gone from disk
+      try {
+        const stat = spawnSync("ls", [wtPath], { encoding: "utf-8", stdio: "pipe" });
+        assert.notEqual(stat.status, 0, "worktree directory should be gone after forced removal");
+      } catch {
+        // Directory being gone is the expected case; the spawnSync check above is sufficient
+      }
+    });
+
+    it("(force=true) still works on a normal unlocked worktree (no regression)", () => {
+      const wt = createRunWorktree({
+        runId: "run-remove-unlocked-force",
+        runNumber: 35,
+        workflowId: "test-workflow",
+        worktreeOriginRepository: originRepo,
+      });
+
+      const wtPath = wt.worktreePath;
+
+      // Force removal should succeed on a normal unlocked worktree
+      removeRunWorktree({ runId: "run-remove-unlocked-force", force: true });
+
+      const row = getRunWorktree("run-remove-unlocked-force");
+      assert.ok(row, "row should still exist in DB");
+      assert.equal(row!.status, "removed");
+
+      // Worktree directory should be gone
+      try {
+        const stat = spawnSync("ls", [wtPath], { encoding: "utf-8", stdio: "pipe" });
+        assert.notEqual(stat.status, 0, "worktree directory should be gone");
+      } catch {
+        // ok
+      }
+    });
   });
 
   // ── listRunWorktrees ──

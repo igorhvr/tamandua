@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { execFileSync } from "node:child_process";
+import { writeSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { getDb } from "../db.js";
@@ -285,6 +286,11 @@ export async function runWorkflow(
     // Read back the atomically allocated run_number.
     const runRow = db.prepare("SELECT run_number FROM runs WHERE id = ?").get(runId) as { run_number: number };
     runNumber = runRow.run_number;
+
+    // Emit run id to stderr synchronously BEFORE any blocking spawnSync (worktree add).
+    // Agents that wrap the launch with a timeout need to see the run id so they
+    // know a run was created even if the process is killed mid-worktree-add.
+    writeSync(2, `run #${runNumber} (${runId.slice(0, 8)}) created; preparing workspace...\n`);
   } else if (workspaceMode === "worktree") {
     if (requestedWorkingDirectoryForHarness) {
       throw new Error(
@@ -319,6 +325,11 @@ export async function runWorkflow(
     // Read back the atomically allocated run_number.
     const runRow = db.prepare("SELECT run_number FROM runs WHERE id = ?").get(runId) as { run_number: number };
     runNumber = runRow.run_number;
+
+    // Emit run id to stderr synchronously BEFORE the blocking createRunWorktree
+    // (which calls spawnSync for git worktree add). Agents that wrap the launch
+    // with a timeout need to see the run id even if the process is killed mid-add.
+    writeSync(2, `run #${runNumber} (${runId.slice(0, 8)}) created; preparing workspace...\n`);
 
     // Now create the managed worktree using the allocated run_number.
     let managedWorktree: ManagedRunWorktree;

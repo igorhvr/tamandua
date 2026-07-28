@@ -369,9 +369,11 @@ export function removeRunWorktree(params: {
       }
     }
 
-    // Remove the worktree (must be run from origin repo, not the worktree itself)
+    // Remove the worktree (must be run from origin repo, not the worktree itself).
+    // Double --force is required to override a git worktree lock (e.g. the
+    // 'initialising' lock left by a killed-mid-add git process).
     const removeArgs = params.force
-      ? ["worktree", "remove", "--force", wt.worktreePath]
+      ? ["worktree", "remove", "--force", "--force", wt.worktreePath]
       : ["worktree", "remove", wt.worktreePath];
 
     const result = runGit(removeArgs, wt.worktreeOriginRepository);
