@@ -2008,36 +2008,54 @@ interface ClaimResult {
 let lastCleanupTime = 0;
 const CLEANUP_THROTTLE_MS = 5 * 60 * 1000;
 
+/** POSIX single-argument quoting: wraps value in single quotes with embedded-quote escaping. */
+function posixQuoteArg(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+/**
+ * Pure builder: returns a shell-safe tamandua-test wrapper invocation.
+ * Every dynamic value (repo, runId, stepId, raw) is quoted as a single shell argument.
+ * Fixed literals (tamandua-test, --repo, --run, --step, --) need no quoting.
+ */
+function buildWrappedTestCommand(raw: string, repo: string, runId: string, stepId: string): string {
+  const q = posixQuoteArg;
+  return `tamandua-test --repo ${q(repo)} --run ${q(runId)} --step ${q(stepId)} -- ${q(raw)}`;
+}
+
 /**
  * Wrap test_cmd with the tamandua-test shim invocation if present in context.
- * Saves the original command as test_cmd_raw and replaces test_cmd with the
- * wrapped shim invocation (R18, R19).
+ * Saves the original command as test_cmd_raw and returns a render context with
+ * the wrapped shim invocation in test_cmd (R18, R19).
  *
- * Example: if test_cmd = "npm test", replaces it with:
- *   tamandua-test --repo <repo> --run <run_id> --step <step_id> -- 'npm test'
+ * The input context is the CANONICAL context (safe to persist): test_cmd is
+ * left unchanged and test_cmd_raw is set to the raw command.  The returned
+ * render context is a shallow copy with test_cmd replaced by the wrapper.
  *
- * SHSH: The command is single-quoted (with embedded single quotes
- * properly escaped) so that shell operators (&&, |, env prefixes, etc.)
- * survive the agent's shell and reach the shim as a single argv element.
+ * Example: if test_cmd = "npm test", returns a render context where test_cmd is:
+ *   tamandua-test --repo '<repo>' --run '<run_id>' --step '<step_id>' -- 'npm test'
  *
- * Does nothing if test_cmd is missing, empty, or whitespace-only.
+ * Does nothing and returns the input context unchanged if test_cmd is missing,
+ * empty, whitespace-only, or repo is missing.
  */
 function wrapTestCmdInContext(
   context: Record<string, string>,
   repo: string | undefined,
   runId: string,
   stepId: string,
-): void {
-  const testCmd = context["test_cmd"];
-  if (!testCmd || testCmd.trim().length === 0) return;
-  if (!repo) return;
+): Record<string, string> {
+  // Prefer test_cmd_raw (canonical) when available, else use test_cmd as raw
+  const rawCmd = context["test_cmd_raw"] || context["test_cmd"];
+  if (!rawCmd || rawCmd.trim().length === 0) return context;
+  if (!repo) return context;
 
-  context["test_cmd_raw"] = testCmd;
-  // SHSH: single-quote the command with proper escaping of embedded
-  // single quotes so it arrives as a single argv element when the
-  // agent's shell parses the wrapped line.
-  const escaped = testCmd.replace(/'/g, "'\\''");
-  context["test_cmd"] = `tamandua-test --repo ${repo} --run ${runId} --step ${stepId} -- '${escaped}'`;
+  // Canonical context: save raw command, leave test_cmd unchanged
+  context["test_cmd_raw"] = rawCmd;
+
+  // Render context: shallow copy with wrapper in test_cmd
+  const renderContext = { ...context };
+  renderContext["test_cmd"] = buildWrappedTestCommand(rawCmd, repo, runId, stepId);
+  return renderContext;
 }
 
 /**
@@ -2102,11 +2120,11 @@ export function stepCurrent(agentId: string, runId: string): { stepId: string; r
   if (!context["timeout_retry"]) context["timeout_retry"] = "";
 
   // Wrap test_cmd with tamandua-test shim (R18-R19)
-  if (context["repo"]) {
-    wrapTestCmdInContext(context, context["repo"], step.run_id, step.id);
-  }
+  const renderContext = context["repo"]
+    ? wrapTestCmdInContext(context, context["repo"], step.run_id, step.id)
+    : context;
 
-  const resolvedInput = resolveTemplate(step.input_template, context);
+  const resolvedInput = resolveTemplate(step.input_template, renderContext);
 
   return { stepId: step.id, runId: step.run_id, input: resolvedInput };
 }
@@ -2362,7 +2380,7 @@ export function claimStep(agentId: string, runId: string, workerOwnership?: Work
       }
 
       // Wrap test_cmd with tamandua-test shim (R18-R19)
-      wrapTestCmdInContext(context, context["repo"], step.run_id, step.step_id);
+      const renderContext = wrapTestCmdInContext(context, context["repo"], step.run_id, step.step_id);
 
       const missingKeys = findMissingTemplateKeys(step.input_template, context);
       const blockResult = resolveMissingKeys(
@@ -2386,15 +2404,16 @@ export function claimStep(agentId: string, runId: string, workerOwnership?: Work
 
       // Clear one-shot timeout_retry so it doesn't leak into subsequent stories.
       // The resolved template must capture it first; delete only after resolution.
-      const hasTimeoutRetryLoop = Boolean(context["timeout_retry"]);
+      const hasTimeoutRetryLoop = Boolean(renderContext["timeout_retry"]);
 
-      // Persist story context vars to DB so verify_each steps can access them
+      // Persist canonical context (test_cmd is raw, not wrapped)
       db.prepare("UPDATE runs SET context = ?, updated_at = datetime('now') WHERE id = ?").run(JSON.stringify(context), step.run_id);
 
-      const resolvedInput = resolveTemplate(step.input_template, context);
+      const resolvedInput = resolveTemplate(step.input_template, renderContext);
 
       if (hasTimeoutRetryLoop) {
         delete context["timeout_retry"];
+        delete renderContext["timeout_retry"];
         db.prepare("UPDATE runs SET context = ?, updated_at = datetime('now') WHERE id = ?").run(JSON.stringify(context), step.run_id);
       }
 
@@ -2473,7 +2492,7 @@ export function claimStep(agentId: string, runId: string, workerOwnership?: Work
     }
 
     // Wrap test_cmd with tamandua-test shim (R18-R19)
-    wrapTestCmdInContext(context, context["repo"], step.run_id, step.step_id);
+    const renderContext = wrapTestCmdInContext(context, context["repo"], step.run_id, step.step_id);
 
     const missingKeys = findMissingTemplateKeys(step.input_template, context);
     const blockResult = resolveMissingKeys(
@@ -2491,7 +2510,7 @@ export function claimStep(agentId: string, runId: string, workerOwnership?: Work
       return { found: false };
     }
 
-    const resolvedInput = resolveTemplate(step.input_template, context);
+    const resolvedInput = resolveTemplate(step.input_template, renderContext);
 
     if (hasTimeoutRetry) {
       delete context["timeout_retry"];
@@ -2830,7 +2849,17 @@ function completeStepInternal(stepId: string, output: string): { status: string;
   const parsed = parseOutputKeyValues(output);
   for (const [key, value] of Object.entries(parsed)) {
     if (!RESERVED_CONTEXT_KEYS.has(key)) {
+      // TSTX-PQ: reject test_cmd values that echo the tamandua-test shim wrapper
+      // (a misbehaving persona echoing its already-wrapped input).
+      if (key === "test_cmd" && value.startsWith("tamandua-test --repo")) {
+        logger.warn(
+          `Rejected TEST_CMD output that echoes the tamandua-test wrapper prefix (step ${step.step_id}), keeping existing context values unchanged.`,
+          { runId: step.run_id, stepId: step.step_id }
+        );
+        continue;
+      }
       context[key] = value;
+      if (key === "test_cmd") context["test_cmd_raw"] = value;
     }
   }
 

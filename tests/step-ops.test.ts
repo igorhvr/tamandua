@@ -732,6 +732,79 @@ describe("Reserved context key protection", () => {
     assert.equal(context.branch, "bugfix/x", "non-reserved keys like branch should still be merged");
   });
 
+  it("completeStep synchronizes test_cmd_raw when test_cmd is emitted by agent output", async () => {
+    // Regression: when completeStep merges a TEST_CMD from agent output,
+    // test_cmd_raw must be set to the same value so the persisted context
+    // never contains a stale raw command alongside a newer raw command.
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const stepId = crypto.randomUUID();
+    const now = ts();
+
+    // Seed run with older test_cmd and test_cmd_raw
+    const seededContext = JSON.stringify({
+      repo: "/tmp/test-repo",
+      test_cmd: "old-command",
+      test_cmd_raw: "old-command",
+    });
+
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 1, 'test-wf', 'fix bug', 'running', ?, 0, ?, ?)"
+    ).run(runId, seededContext, now, now);
+
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, created_at, updated_at) VALUES (?, ?, 'setup', 'test-wf_setup', 0, 'Setup step', '', 'running', 0, 4, 'single', ?, ?)"
+    ).run(stepId, runId, now, now);
+
+    // Upstream step emits a new TEST_CMD
+    const output = "STATUS: done\nTEST_CMD: new-command --verbose";
+    completeStep(stepId, output);
+
+    // Both persisted keys must equal the newly emitted value
+    const run = db.prepare("SELECT context FROM runs WHERE id = ?").get(runId) as { context: string };
+    const context = JSON.parse(run.context);
+
+    assert.equal(context.test_cmd, "new-command --verbose", "test_cmd should be the newly emitted value");
+    assert.equal(context.test_cmd_raw, "new-command --verbose", "test_cmd_raw must be synchronized to the same value as test_cmd");
+  });
+
+  it("completeStep rejects TEST_CMD values that echo the tamandua-test wrapper", async () => {
+    // Regression: a misbehaving persona that echoes its already-wrapped
+    // test_cmd input must not poison the canonical command via producer output.
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const stepId = crypto.randomUUID();
+    const now = ts();
+
+    const rawCmd = "npm test -- --coverage";
+    const seededContext = JSON.stringify({
+      repo: "/tmp/test-repo",
+      test_cmd: rawCmd,
+      test_cmd_raw: rawCmd,
+    });
+
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 1, 'test-wf', 'fix bug', 'running', ?, 0, ?, ?)"
+    ).run(runId, seededContext, now, now);
+
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, created_at, updated_at) VALUES (?, ?, 'fix', 'test-wf_fix', 1, 'Fix it', '', 'running', 0, 4, 'single', ?, ?)"
+    ).run(stepId, runId, now, now);
+
+    // Agent echoes a wrapped value back as TEST_CMD output
+    const output = "STATUS: done\nTEST_CMD: tamandua-test --repo '/tmp/test-repo' --run 'r' --step 's' -- 'npm test -- --coverage'";
+    completeStep(stepId, output);
+
+    // Context test_cmd and test_cmd_raw must remain the prior raw value
+    const run = db.prepare("SELECT context FROM runs WHERE id = ?").get(runId) as { context: string };
+    const context = JSON.parse(run.context);
+
+    assert.equal(context.test_cmd, rawCmd, "test_cmd must not be overwritten by a wrapped TEST_CMD echo");
+    assert.equal(context.test_cmd_raw, rawCmd, "test_cmd_raw must not be overwritten by a wrapped TEST_CMD echo");
+  });
+
   it("resolveStepContext does not overwrite reserved keys from previous step outputs", async () => {
     const { getDb } = await import("../dist/db.js");
     const db = getDb();
@@ -4894,15 +4967,15 @@ describe("claimStep test_cmd wrapping (US-008)", () => {
       `resolved input should contain tamandua-test shim, got: ${input}`
     );
     assert.ok(
-      input.includes(`--repo /tmp/test-repo`),
+      input.includes(`--repo '/tmp/test-repo'`),
       `wrapper should include --repo flag, got: ${input}`
     );
     assert.ok(
-      input.includes(`--run ${runId}`),
+      input.includes(`--run '${runId}'`),
       `wrapper should include --run flag with run ID, got: ${input}`
     );
     assert.ok(
-      input.includes(`--step developer`),
+      input.includes(`--step 'developer'`),
       `wrapper should include --step flag with step ID, got: ${input}`
     );
     assert.ok(
@@ -5015,17 +5088,18 @@ describe("claimStep test_cmd wrapping (US-008)", () => {
     );
   });
 
-  it("test_cmd_raw is overwritten on subsequent claims (idempotent)", async () => {
+  it("wrapTestCmdInContext prefers test_cmd_raw over test_cmd when both are present", async () => {
     const { getDb } = await import("../dist/db.js");
     const db = getDb();
     const runId = crypto.randomUUID();
     const now = ts();
 
+    const divergencePayload = "this is the raw cmd (must be wrapped)";
     const seededContext = JSON.stringify({
       task: "implement feature X",
       repo: "/tmp/test-repo",
       test_cmd: "npm test",
-      test_cmd_raw: "old value should be overwritten",
+      test_cmd_raw: divergencePayload,
     });
 
     db.prepare(
@@ -5040,9 +5114,14 @@ describe("claimStep test_cmd wrapping (US-008)", () => {
     const result = claimStep("test-wf_test", runId);
 
     assert.ok(result.found, "claimStep should find the step");
+    // The wrapped payload must be the test_cmd_raw value (precedence), not the divergent test_cmd
     assert.ok(
-      result!.resolvedInput!.includes("tamandua-test --repo"),
-      `should contain wrapper even with pre-existing test_cmd_raw, got: ${result!.resolvedInput}`
+      result!.resolvedInput!.includes(divergencePayload),
+      `wrapped payload must be test_cmd_raw value "${divergencePayload}", got: ${result!.resolvedInput}`
+    );
+    assert.ok(
+      !result!.resolvedInput!.includes("npm test"),
+      `wrapped payload must NOT be test_cmd value "npm test", got: ${result!.resolvedInput}`
     );
   });
 
@@ -5202,7 +5281,7 @@ describe("claimStep test_cmd wrapping (US-008)", () => {
     const devResult = claimStep("test-wf_developer", runId);
     assert.ok(devResult.found, "should claim developer step");
     assert.ok(
-      devResult!.resolvedInput!.includes("--step developer"),
+      devResult!.resolvedInput!.includes("--step 'developer'"),
       `developer wrapper should have --step developer, got: ${devResult!.resolvedInput}`
     );
 
@@ -5216,13 +5295,302 @@ describe("claimStep test_cmd wrapping (US-008)", () => {
     const verifierResult = claimStep("test-wf_verifier", runId);
     assert.ok(verifierResult.found, "should claim verifier step after developer completed");
     assert.ok(
-      verifierResult!.resolvedInput!.includes("--step verifier"),
+      verifierResult!.resolvedInput!.includes("--step 'verifier'"),
       `verifier wrapper should have --step verifier, got: ${verifierResult!.resolvedInput}`
     );
     assert.ok(
       verifierResult!.resolvedInput!.includes("Raw: npm test"),
       `verifier should have test_cmd_raw, got: ${verifierResult!.resolvedInput}`
     );
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════
+// TSTX-PQ: test_cmd persistence and POSIX quoting regression tests
+// ══════════════════════════════════════════════════════════════════════
+
+describe("TSTX-PQ persistence (canonical vs render context separation)", () => {
+  const _savedStateDir = process.env.TAMANDUA_STATE_DIR;
+  const _savedDbPath = process.env.TAMANDUA_DB_PATH;
+  const th = createTempHome("tamandua-tstx-pq-persist-");
+
+  before(() => {
+    process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_DB_PATH = path.join(th.tamanduaDir, "tamandua.db");
+  });
+
+  after(() => {
+    if (_savedStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+    else process.env.TAMANDUA_STATE_DIR = _savedStateDir;
+    if (_savedDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+    else process.env.TAMANDUA_DB_PATH = _savedDbPath;
+  });
+
+  function ts(): string {
+    return new Date().toISOString();
+  }
+
+  it("twenty-story lifecycle: persisted test_cmd stays byte-identical to raw command", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const loopStepId = crypto.randomUUID();
+    const now = ts();
+
+    const rawCmd = "npm test -- --coverage";
+    const seededContext = JSON.stringify({
+      task: "twenty story feature",
+      repo: "/tmp/test-repo",
+      test_cmd: rawCmd,
+      build_cmd: "npm run build",
+    });
+
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 1, 'tstx-pq', 'twenty stories', 'running', ?, 0, ?, ?)"
+    ).run(runId, seededContext, now, now);
+
+    // Create 20 stories
+    const storyIds: string[] = [];
+    for (let i = 0; i < 20; i++) {
+      const sid = crypto.randomUUID();
+      storyIds.push(sid);
+      db.prepare(
+        "INSERT INTO stories (id, run_id, story_index, story_id, title, description, acceptance_criteria, status, retry_count, max_retries, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, 4, ?, ?)"
+      ).run(sid, runId, i, `US-${String(i + 1).padStart(3, "0")}`, `Story ${i + 1}`, `desc ${i + 1}`, "[]", now, now);
+    }
+
+    const loopConfig = JSON.stringify({ over: "stories" });
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, loop_config, created_at, updated_at) VALUES (?, ?, 'developer', 'tstx-pq_developer', 0, 'Test: {{test_cmd}} | Raw: {{test_cmd_raw}}', '', 'pending', 0, 4, 'loop', ?, ?, ?)"
+    ).run(loopStepId, runId, loopConfig, now, now);
+
+    let prevWrapperLen: number | null = null;
+
+    for (let storyIdx = 0; storyIdx < 20; storyIdx++) {
+      const result = claimStep("tstx-pq_developer", runId);
+      assert.ok(result.found, `story ${storyIdx}: claimStep should find work`);
+      const input = result!.resolvedInput!;
+
+      // Persisted runs.context.test_cmd must be byte-identical to raw command
+      const run = db.prepare("SELECT context FROM runs WHERE id = ?").get(runId) as { context: string };
+      const persistedCtx = JSON.parse(run.context) as Record<string, string>;
+      assert.equal(
+        persistedCtx["test_cmd"],
+        rawCmd,
+        `story ${storyIdx}: persisted test_cmd must equal original raw command`
+      );
+      assert.equal(
+        persistedCtx["test_cmd_raw"],
+        rawCmd,
+        `story ${storyIdx}: persisted test_cmd_raw must equal original raw command`
+      );
+
+      // Rendered input must have exactly one wrapper (no double-wrapping)
+      const wrapperMatches = input.match(/tamandua-test/g);
+      assert.ok(wrapperMatches !== null, `story ${storyIdx}: rendered input must contain tamandua-test`);
+      assert.equal(
+        wrapperMatches!.length,
+        1,
+        `story ${storyIdx}: rendered input must have exactly one tamandua-test wrapper, got ${wrapperMatches!.length}: ${input.slice(0, 200)}`
+      );
+
+      // Wrapper byte length must be constant for equal-length attribution
+      const wrapperStart = input.indexOf("tamandua-test");
+      const wrapperStr = input.slice(wrapperStart);
+      if (prevWrapperLen === null) {
+        prevWrapperLen = wrapperStr.length;
+      } else {
+        assert.equal(
+          wrapperStr.length,
+          prevWrapperLen,
+          `story ${storyIdx}: wrapper byte length must be constant (prev=${prevWrapperLen}, current=${wrapperStr.length})`
+        );
+      }
+
+      // Complete the story (last story may return "completed" instead of "advanced")
+      const doneResult = completeStep(
+        result!.stepId!,
+        `STATUS: done\nCHANGES: story ${storyIdx + 1} done\nTESTS: pass`
+      );
+      assert.ok(
+        doneResult.status === "advanced" || doneResult.status === "completed",
+        `story ${storyIdx}: completeStep should advance or complete, got ${doneResult.status}`
+      );
+    }
+
+    // After all 20 stories, the step should auto-complete (no more pending stories)
+    const finalClaim = claimStep("tstx-pq_developer", runId);
+    assert.ok(!finalClaim.found, "after all stories complete, no more work");
+  });
+
+  it("idempotent claimStep/stepCurrent preserves canonical test_cmd", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const loopStepId = crypto.randomUUID();
+    const now = ts();
+
+    const rawCmd = "pytest -xvs";
+    const seededContext = JSON.stringify({
+      task: "idempotent test",
+      repo: "/tmp/test-repo",
+      test_cmd: rawCmd,
+    });
+
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 1, 'tstx-pq', 'idempotent test', 'running', ?, 0, ?, ?)"
+    ).run(runId, seededContext, now, now);
+
+    const storyId = crypto.randomUUID();
+    db.prepare(
+      "INSERT INTO stories (id, run_id, story_index, story_id, title, description, acceptance_criteria, status, retry_count, max_retries, created_at, updated_at) VALUES (?, ?, 0, 'US-001', 'Story 1', 'desc', '[]', 'pending', 0, 4, ?, ?)"
+    ).run(storyId, runId, now, now);
+
+    const loopConfig = JSON.stringify({ over: "stories" });
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, loop_config, created_at, updated_at) VALUES (?, ?, 'fixer', 'tstx-pq_fixer', 0, 'Run: {{test_cmd}} | Raw: {{test_cmd_raw}}', '', 'pending', 0, 4, 'loop', ?, ?, ?)"
+    ).run(loopStepId, runId, loopConfig, now, now);
+
+    // First claim
+    const claim1 = claimStep("tstx-pq_fixer", runId);
+    assert.ok(claim1.found, "first claim should succeed");
+
+    // Verify persisted context
+    let run = db.prepare("SELECT context FROM runs WHERE id = ?").get(runId) as { context: string };
+    let persistedCtx = JSON.parse(run.context) as Record<string, string>;
+    assert.equal(persistedCtx["test_cmd"], rawCmd, "after first claim, persisted test_cmd is raw");
+    assert.equal(persistedCtx["test_cmd_raw"], rawCmd, "after first claim, persisted test_cmd_raw is raw");
+
+    // Idempotent re-claim (stepCurrent path) — same agent calls again
+    const claim2 = claimStep("tstx-pq_fixer", runId);
+    assert.ok(claim2.found, "idempotent re-claim should return same step");
+    assert.equal(claim2.stepId, claim1.stepId, "idempotent re-claim returns same stepId");
+
+    // Persisted context still raw
+    run = db.prepare("SELECT context FROM runs WHERE id = ?").get(runId) as { context: string };
+    persistedCtx = JSON.parse(run.context) as Record<string, string>;
+    assert.equal(persistedCtx["test_cmd"], rawCmd, "after idempotent re-claim, persisted test_cmd is raw");
+
+    // stepCurrent should also preserve raw
+    const current = stepCurrent("tstx-pq_fixer", runId);
+    assert.ok(current !== null, "stepCurrent should find the claimed step");
+    run = db.prepare("SELECT context FROM runs WHERE id = ?").get(runId) as { context: string };
+    persistedCtx = JSON.parse(run.context) as Record<string, string>;
+    assert.equal(persistedCtx["test_cmd"], rawCmd, "after stepCurrent, persisted test_cmd is raw");
+
+    // Complete the story
+    completeStep(claim1.stepId!, "STATUS: done\nCHANGES: done\nTESTS: pass");
+  });
+
+  it("story retry via failStep preserves canonical test_cmd", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const { failStep } = await import("../dist/installer/step-ops.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const loopStepId = crypto.randomUUID();
+    const now = ts();
+
+    const rawCmd = "go test ./...";
+    const seededContext = JSON.stringify({
+      task: "retry test",
+      repo: "/tmp/test-repo",
+      test_cmd: rawCmd,
+    });
+
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 1, 'tstx-pq', 'retry test', 'running', ?, 0, ?, ?)"
+    ).run(runId, seededContext, now, now);
+
+    const storyId1 = crypto.randomUUID();
+    db.prepare(
+      "INSERT INTO stories (id, run_id, story_index, story_id, title, description, acceptance_criteria, status, retry_count, max_retries, created_at, updated_at) VALUES (?, ?, 0, 'US-001', 'Story 1', 'desc', '[]', 'pending', 0, 4, ?, ?)"
+    ).run(storyId1, runId, now, now);
+
+    const loopConfig = JSON.stringify({ over: "stories" });
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, loop_config, created_at, updated_at) VALUES (?, ?, 'fixer', 'tstx-pq_fixer', 0, 'Run: {{test_cmd}} | Raw: {{test_cmd_raw}}', '', 'pending', 0, 4, 'loop', ?, ?, ?)"
+    ).run(loopStepId, runId, loopConfig, now, now);
+
+    // First claim
+    const claim1 = claimStep("tstx-pq_fixer", runId);
+    assert.ok(claim1.found, "first claim should succeed");
+
+    // Fail the story via failStep (triggers per-story retry)
+    const failResult = await failStep(claim1.stepId!, "story needs another attempt");
+    assert.equal(failResult.status, "retrying", "failStep should trigger story retry");
+
+    // Verify persisted context after story retry
+    const run = db.prepare("SELECT context FROM runs WHERE id = ?").get(runId) as { context: string };
+    const persistedCtx = JSON.parse(run.context) as Record<string, string>;
+    assert.equal(persistedCtx["test_cmd"], rawCmd, "after story retry, persisted test_cmd is still raw");
+
+    // Second claim after story retry
+    const claim2 = claimStep("tstx-pq_fixer", runId);
+    assert.ok(claim2.found, "second claim after story retry should succeed");
+    const input2 = claim2!.resolvedInput!;
+
+    // Only one wrapper in rendered input
+    const wrapperMatches = input2.match(/tamandua-test/g);
+    assert.ok(wrapperMatches !== null, "post-retry input must contain tamandua-test");
+    assert.equal(wrapperMatches!.length, 1, `post-retry input must have exactly one wrapper, got ${wrapperMatches!.length}`);
+
+    // Complete the story successfully
+    completeStep(claim2.stepId!, "STATUS: done\nCHANGES: fixed\nTESTS: pass");
+  });
+
+  it("timeout_retry path preserves canonical test_cmd", async () => {
+    const { getDb } = await import("../dist/db.js");
+    const { setRunContextKey } = await import("../dist/installer/step-ops.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const loopStepId = crypto.randomUUID();
+    const now = ts();
+
+    const rawCmd = "cargo test";
+    const seededContext = JSON.stringify({
+      task: "timeout retry test",
+      repo: "/tmp/test-repo",
+      test_cmd: rawCmd,
+    });
+
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 1, 'tstx-pq', 'timeout test', 'running', ?, 0, ?, ?)"
+    ).run(runId, seededContext, now, now);
+
+    const storyId = crypto.randomUUID();
+    db.prepare(
+      "INSERT INTO stories (id, run_id, story_index, story_id, title, description, acceptance_criteria, status, retry_count, max_retries, created_at, updated_at) VALUES (?, ?, 0, 'US-001', 'Story 1', 'desc', '[]', 'pending', 0, 4, ?, ?)"
+    ).run(storyId, runId, now, now);
+
+    const loopConfig = JSON.stringify({ over: "stories" });
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, loop_config, created_at, updated_at) VALUES (?, ?, 'fixer', 'tstx-pq_fixer', 0, 'Run: {{test_cmd}} | Raw: {{test_cmd_raw}}', '', 'pending', 0, 4, 'loop', ?, ?, ?)"
+    ).run(loopStepId, runId, loopConfig, now, now);
+
+    // Seed timeout_retry into the run context BEFORE claiming (simulates dead worker recovery)
+    setRunContextKey(runId, "timeout_retry", "Previous worker timed out after 30 minutes");
+
+    // Claim with timeout_retry seeded
+    const claim1 = claimStep("tstx-pq_fixer", runId);
+    assert.ok(claim1.found, "claim with timeout_retry seeded should succeed");
+
+    // Verify persisted context after timeout_retry cleanup
+    const run = db.prepare("SELECT context FROM runs WHERE id = ?").get(runId) as { context: string };
+    const persistedCtx = JSON.parse(run.context) as Record<string, string>;
+    assert.equal(persistedCtx["test_cmd"], rawCmd, "after timeout_retry claim, persisted test_cmd is raw");
+    assert.equal(persistedCtx["test_cmd_raw"], rawCmd, "after timeout_retry claim, persisted test_cmd_raw is raw");
+
+    // timeout_retry should be cleaned from the persisted context
+    assert.equal(persistedCtx["timeout_retry"] || "", "", "timeout_retry should be cleared after claim");
+
+    // Rendered input has exactly one wrapper
+    const input = claim1!.resolvedInput!;
+    const wrapperMatches = input.match(/tamandua-test/g);
+    assert.ok(wrapperMatches !== null, "timeout_retry input must contain tamandua-test");
+    assert.equal(wrapperMatches!.length, 1, `timeout_retry input must have exactly one wrapper`);
+
+    // Complete the story
+    completeStep(claim1.stepId!, "STATUS: done\nCHANGES: timeout recovery done\nTESTS: pass");
   });
 });
 

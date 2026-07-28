@@ -126,6 +126,7 @@ tests/run-token-migration.test.ts
 tests/runner-scripts.test.ts
 tests/sample-project-fixture.test.ts
 tests/step-ops-dispatch-races.test.ts
+tests/step-ops-tstx-pq-shell.test.ts
 tests/step-ops.test.ts
 tests/step-ownership-columns-migration.test.ts
 tests/step-rejection-logging.test.ts
