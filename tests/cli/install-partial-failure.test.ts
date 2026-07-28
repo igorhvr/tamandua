@@ -24,7 +24,7 @@ import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CLI_SCRIPT = path.resolve(__dirname, "..", "..", "dist", "cli", "cli.js");
-const WORKFLOWS_SRC = path.resolve(__dirname, "..", "..", "workflows");
+const REAL_WORKFLOWS_SRC = path.resolve(__dirname, "..", "..", "workflows");
 
 const BROKEN_WORKFLOW_DIRNAME = "_test-partial-failure-broken";
 
@@ -38,14 +38,14 @@ interface CliResult {
   exitCode: number | null;
 }
 
-function runCli(args: string[], homeDir: string): Promise<CliResult> {
+function runCli(args: string[], homeDir: string, extraEnv?: Record<string, string>): Promise<CliResult> {
   return new Promise<CliResult>((resolve) => {
     let stdout = "";
     let stderr = "";
 
     const child = spawn("node", ["--no-warnings", CLI_SCRIPT, ...args], {
       stdio: ["ignore", "pipe", "pipe"],
-      env: cleanChildEnv({ HOME: homeDir }),
+      env: cleanChildEnv({ HOME: homeDir, ...(extraEnv ?? {}) }),
     });
 
     child.stdout?.on("data", (chunk: Buffer) => {
@@ -90,23 +90,30 @@ function setupTempHome(): string {
 }
 
 /**
- * Create a deliberately broken workflow directory (no workflow.yml) under
- * the source checkout's workflows/ dir. The caller MUST remove it in a
- * finally block.
+ * Create an isolated temp workflows source by copying all real bundled
+ * workflows into a temp dir, then creating the deliberately-broken fixture
+ * there. Returns the temp workflows source dir, the broken fixture path,
+ * and a cleanup function.
  */
-function createBrokenWorkflowDir(): string {
-  const brokenDir = path.join(WORKFLOWS_SRC, BROKEN_WORKFLOW_DIRNAME);
-  fs.mkdirSync(brokenDir, { recursive: true });
-  return brokenDir;
-}
+function createTestWorkflowsSource(): { workflowsSrc: string; brokenDir: string; cleanup: () => void } {
+  const workflowsSrc = fs.mkdtempSync(path.join(fs.realpathSync("/tmp"), "tamandua-install-pf-wf-"));
 
-function removeBrokenWorkflowDir(): void {
-  const brokenDir = path.join(WORKFLOWS_SRC, BROKEN_WORKFLOW_DIRNAME);
-  try {
-    fs.rmSync(brokenDir, { recursive: true, force: true });
-  } catch {
-    // best-effort cleanup
+  // Copy all valid bundled workflows from the real checkout
+  for (const entry of fs.readdirSync(REAL_WORKFLOWS_SRC, { withFileTypes: true })) {
+    if (entry.isDirectory()) {
+      fs.cpSync(path.join(REAL_WORKFLOWS_SRC, entry.name), path.join(workflowsSrc, entry.name), { recursive: true });
+    }
   }
+
+  // Create the broken fixture in the temp workflows dir
+  const brokenDir = path.join(workflowsSrc, BROKEN_WORKFLOW_DIRNAME);
+  fs.mkdirSync(brokenDir, { recursive: true });
+
+  const cleanup = () => {
+    try { fs.rmSync(workflowsSrc, { recursive: true, force: true }); } catch { /* best-effort */ }
+  };
+
+  return { workflowsSrc, brokenDir, cleanup };
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -114,9 +121,15 @@ function removeBrokenWorkflowDir(): void {
 // ═══════════════════════════════════════════════════════════════════
 
 describe("tamandua install partial failure", () => {
-  // Clean up any lingering broken dir from a previous aborted run.
+  // Clean up any lingering temp dirs from a previous aborted run.
   before(() => {
-    removeBrokenWorkflowDir();
+    // Best-effort: clean up any leftover temp dirs matching our prefix
+    const tmpDir = fs.realpathSync("/tmp");
+    for (const entry of fs.readdirSync(tmpDir, { withFileTypes: true })) {
+      if (entry.isDirectory() && entry.name.startsWith("tamandua-install-pf-wf-")) {
+        try { fs.rmSync(path.join(tmpDir, entry.name), { recursive: true, force: true }); } catch { /* ignore */ }
+      }
+    }
   });
 
   // AC 1: workflow install --all exits non-zero on partial failure,
@@ -128,13 +141,14 @@ describe("tamandua install partial failure", () => {
     }
 
     // Use try/finally for broken directory cleanup as required by AC 3.
-    createBrokenWorkflowDir();
+    const { workflowsSrc, cleanup } = createTestWorkflowsSource();
     try {
       const tempHome = setupTempHome();
 
       const { stdout, stderr, exitCode } = await runCli(
         ["workflow", "install", "--all"],
         tempHome,
+        { TAMANDUA_WORKFLOWS_SRC: workflowsSrc },
       );
 
       const cleanErr = cleanStderr(stderr);
@@ -171,7 +185,7 @@ describe("tamandua install partial failure", () => {
         `Expected "Done. Start with:" after failure summary`,
       );
     } finally {
-      removeBrokenWorkflowDir();
+      cleanup();
     }
   });
 
@@ -182,10 +196,10 @@ describe("tamandua install partial failure", () => {
       return;
     }
 
-    createBrokenWorkflowDir();
+    const { workflowsSrc, cleanup } = createTestWorkflowsSource();
     try {
       const tempHome = setupTempHome();
-      await runCli(["workflow", "install", "--all"], tempHome);
+      await runCli(["workflow", "install", "--all"], tempHome, { TAMANDUA_WORKFLOWS_SRC: workflowsSrc });
 
       // agents.json should have entries from valid workflows
       const agentsPath = path.join(tempHome, ".tamandua", "agents.json");
@@ -213,7 +227,7 @@ describe("tamandua install partial failure", () => {
         `broken workflow should have no agents, got: ${brokenAgents.map((a) => a.id).join(", ")}`,
       );
     } finally {
-      removeBrokenWorkflowDir();
+      cleanup();
     }
   });
 
@@ -225,13 +239,14 @@ describe("tamandua install partial failure", () => {
       return;
     }
 
-    createBrokenWorkflowDir();
+    const { workflowsSrc, cleanup } = createTestWorkflowsSource();
     try {
       const tempHome = setupTempHome();
 
       const { stdout, stderr, exitCode } = await runCli(
         ["get-ready"],
         tempHome,
+        { TAMANDUA_WORKFLOWS_SRC: workflowsSrc },
       );
 
       const cleanErr = cleanStderr(stderr);
@@ -259,7 +274,7 @@ describe("tamandua install partial failure", () => {
         `Expected checkmarks for valid workflows, got ${checkMarks}`,
       );
     } finally {
-      removeBrokenWorkflowDir();
+      cleanup();
     }
   });
 
@@ -270,11 +285,11 @@ describe("tamandua install partial failure", () => {
       return;
     }
 
-    createBrokenWorkflowDir();
+    const { workflowsSrc, cleanup } = createTestWorkflowsSource();
     try {
       const tempHome = setupTempHome();
 
-      const { stdout } = await runCli(["get-ready"], tempHome);
+      const { stdout } = await runCli(["get-ready"], tempHome, { TAMANDUA_WORKFLOWS_SRC: workflowsSrc });
 
       // "Done. Start with:" should appear after the summary line
       const failureSummaryIdx = stdout.search(/\d+ of \d+ workflows failed to install/);
@@ -286,7 +301,7 @@ describe("tamandua install partial failure", () => {
         `Expected "Done. Start with:" after failure summary, got: ${stdout}`,
       );
     } finally {
-      removeBrokenWorkflowDir();
+      cleanup();
     }
   });
 
@@ -297,10 +312,10 @@ describe("tamandua install partial failure", () => {
       return;
     }
 
-    createBrokenWorkflowDir();
+    const { workflowsSrc, cleanup } = createTestWorkflowsSource();
     try {
       const tempHome = setupTempHome();
-      await runCli(["get-ready"], tempHome);
+      await runCli(["get-ready"], tempHome, { TAMANDUA_WORKFLOWS_SRC: workflowsSrc });
 
       const agentsPath = path.join(tempHome, ".tamandua", "agents.json");
       assert.ok(fs.existsSync(agentsPath), "agents.json should exist even on partial failure");
@@ -324,7 +339,60 @@ describe("tamandua install partial failure", () => {
         `broken workflow should have no agents`,
       );
     } finally {
-      removeBrokenWorkflowDir();
+      cleanup();
     }
+  });
+
+  // Regression: the two serial-lane test suites (this file and update.test.ts)
+  // must be hermetic — they must never influence each other's execution.
+  // Before the fix, install-partial-failure created a broken fixture in the
+  // live workflows/ dir that update.test.ts's real-git runUpdate tests could
+  // pick up, making the serial lane order-dependent.
+  //
+  // Guard: don't re-enter when this test spawns itself (prevent infinite recursion).
+  const HERMETIC_GUARD = process.env.TAMANDUA_HERMETIC_PROBE;
+  it("serial lane is hermetic: interleaved with update.test.ts 2x passes", { skip: !!HERMETIC_GUARD }, async (t) => {
+    // Build first so the CLI script exists
+    if (!fs.existsSync(CLI_SCRIPT)) {
+      t.skip("CLI script not built — run npm run build first");
+      return;
+    }
+
+    const testDir = path.resolve(__dirname, "..", "..");
+    const updateTestFile = path.join(testDir, "src", "cli", "update.test.ts");
+    const installPfTestFile = path.join(testDir, "tests", "cli", "install-partial-failure.test.ts");
+
+    const failures: string[] = [];
+
+    for (let i = 0; i < 2; i++) {
+      await new Promise<void>((resolve, reject) => {
+        const child = spawn("node", ["--experimental-test-module-mocks", "--test", installPfTestFile, updateTestFile], {
+          stdio: ["ignore", "pipe", "pipe"],
+          env: cleanChildEnv({ TAMANDUA_TEST_GUARD: "1", TAMANDUA_HERMETIC_PROBE: "1" }),
+          cwd: testDir,
+        });
+
+        let stdout = "";
+        let stderr = "";
+        child.stdout?.on("data", (chunk: Buffer) => { stdout += chunk.toString("utf-8"); });
+        child.stderr?.on("data", (chunk: Buffer) => { stderr += chunk.toString("utf-8"); });
+
+        child.once("error", reject);
+        child.once("close", (code) => {
+          if (code !== 0) {
+            failures.push(
+              `Iteration ${i + 1} failed (exit ${code}):\nSTDOUT last 2k: ${stdout.slice(-2000)}\nSTDERR last 2k: ${stderr.slice(-2000)}`,
+            );
+          }
+          resolve();
+        });
+      });
+    }
+
+    assert.equal(
+      failures.length,
+      0,
+      `Expected all 2 interleaved runs to pass, got ${failures.length} failure(s):\n${failures.join("\n---\n")}`,
+    );
   });
 });

@@ -297,6 +297,7 @@ describe("update exports", () => {
           output: { log: () => {}, warn: () => {} },
           services,
           checkActiveRuns: async () => [],
+          listWorkflows: async () => [],
         });
 
         // Should detect change: pull updated HEAD, then build-and-install ran
@@ -313,6 +314,7 @@ describe("update exports", () => {
         const result = await runUpdate({
           sourcePath: workingDir,
           output: { log: () => {}, warn: () => {} },
+          listWorkflows: async () => [],
         });
 
         assert.equal(result.status, "no_change");
@@ -332,6 +334,7 @@ describe("update exports", () => {
         const result = await runUpdate({
           sourcePath: workingDir,
           output: { log: () => {}, warn: () => {} },
+          listWorkflows: async () => [],
         });
 
         // git pull --ff-only succeeds when only local is ahead (no new origin commits)
@@ -366,6 +369,7 @@ describe("update exports", () => {
         const result = await runUpdate({
           sourcePath: workingDir,
           output: { log: () => {}, warn: () => {} },
+          listWorkflows: async () => [],
         });
 
         assert.equal(result.status, "refused_diverged");
@@ -393,6 +397,7 @@ describe("update exports", () => {
           sourcePath: workingDir,
           output: { log: () => {}, warn: () => {} },
           services,
+          listWorkflows: async () => [],
         });
 
         // With --force, build proceeds even when pull is up-to-date
@@ -431,6 +436,7 @@ describe("update exports", () => {
           sourcePath: workingDir,
           output: { log: () => {}, warn: () => {} },
           services,
+          listWorkflows: async () => [],
         });
 
         assert.equal(result.status, "refused_diverged");
@@ -461,6 +467,7 @@ describe("update exports", () => {
             log: (msg) => logs.push(msg),
             warn: (msg) => warnings.push(msg),
           },
+          listWorkflows: async () => [],
         });
 
         // Should return pull_failed, not refused_diverged (network/auth/missing-upstream = pull failure, not divergence)
@@ -511,6 +518,7 @@ describe("update exports", () => {
           },
           services,
           checkActiveRuns: async () => [],
+          listWorkflows: async () => [],
         });
 
         // With --force, should proceed with rebuild

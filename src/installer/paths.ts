@@ -7,6 +7,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // Bundled workflows ship with tamandua (in the repo's workflows/ directory)
 export function resolveBundledWorkflowsDir(): string {
+  const env = process.env.TAMANDUA_WORKFLOWS_SRC?.trim();
+  if (env) return path.resolve(env);
   // From dist/installer/paths.js -> ../../workflows
   return path.resolve(__dirname, "..", "..", "workflows");
 }
