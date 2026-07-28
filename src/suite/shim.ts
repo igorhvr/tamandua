@@ -330,6 +330,7 @@ async function pollForResult(
   treeHash: string,
   cmdHash: string,
   ownerToken: string,
+  force: boolean,
 ): Promise<PollResult> {
   const startTime = Date.now();
   // Dynamic import inside poll — by the time we reach here, the module
@@ -350,7 +351,7 @@ async function pollForResult(
 
     const latest = lookup.latest as Record<string, unknown> | null;
     if (latest && typeof latest.exit_code === "number") {
-      if (latest.exit_code === 0) {
+      if (!force && latest.exit_code === 0) {
         // Green result recorded by the claim owner → replay it.
         const createdAt = String(latest.created_at ?? "");
         const ageMs = Date.now() - new Date(createdAt).getTime();
@@ -533,7 +534,7 @@ async function main(): Promise<void> {
     });
     // Another caller owns the claim — poll until a result is recorded or
     // CLAIM_TIMEOUT elapses.
-    const pollResult = await pollForResult(originRepo, preTreeHash, cmdHash, ownerToken);
+    const pollResult = await pollForResult(originRepo, preTreeHash, cmdHash, ownerToken, force);
     if (pollResult.action === "replay" && pollResult.latest) {
       await replayCachedResult(pollResult.latest, preTreeHash, pollResult.ageMs ?? 0);
     }
@@ -596,7 +597,7 @@ async function main(): Promise<void> {
     }
     if (currentClaim.action === "run") continue;
 
-    const currentPoll = await pollForResult(originRepo, preTreeHash, cmdHash, ownerToken);
+    const currentPoll = await pollForResult(originRepo, preTreeHash, cmdHash, ownerToken, force);
     if (currentPoll.action === "replay" && currentPoll.latest) {
       await replayCachedResult(currentPoll.latest, preTreeHash, currentPoll.ageMs ?? 0);
     }

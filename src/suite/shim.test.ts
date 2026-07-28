@@ -1266,6 +1266,88 @@ exit 0
     assert.equal(count, 1, "counter should increment on actual execution");
   });
 
+  // ── Regression: --force must not be ignored on singleflight wait path ──
+
+  it("single-flight: --force bypasses green replay on wait path and executes fresh", async () => {
+    await clearSuiteResultsForCmd(repoDir, counterScript);
+    const env = shimChildEnv(controlEnv);
+
+    // Prime a green suite_result by running once.
+    const r1 = await runShim(
+      ["--repo", repoDir, "--run", "r-sf-force", "--step", "s-prime", "--", counterScript],
+      env,
+    );
+    assert.equal(r1.exitCode, 0, "priming run should pass");
+    let count = parseInt(readFileSync(counterFile, "utf-8").trim(), 10);
+    assert.equal(count, 1, "counter should be 1 after priming");
+
+    // Compute the key.
+    const { computeTreeHash, computeCmdHash, getOriginRepo } = await import(
+      "../../dist/suite/tree-hash.js"
+    );
+    const treeHash = computeTreeHash(repoDir);
+    assert.ok(treeHash, "should get a tree hash");
+    const cmdHash = computeCmdHash(counterScript);
+    const originRepo = getOriginRepo(repoDir);
+
+    // Pre-claim the key so the shim gets "wait" on claim.
+    const claimResp = await controlPlanePost("/suite/claim", {
+      origin_repo: originRepo,
+      tree_hash: treeHash,
+      cmd_hash: cmdHash,
+    });
+    assert.equal(claimResp.status, 200, "should claim successfully");
+    const claimBody = claimResp.body as Record<string, unknown>;
+    assert.equal(claimBody.action, "run", "first claim should say run");
+
+    // Now spawn the shim with --force. It should get "wait" on claim,
+    // enter pollForResult, see the green result, but skip it (!force guard)
+    // and continue polling until the claim is released.
+    const shimPromise = runShim(
+      ["--repo", repoDir, "--run", "r-sf-force", "--step", "s-forced", "--force", "--", counterScript],
+      env,
+    );
+
+    // Give the shim time to enter the poll loop, then record a result
+    // for this key (which clears the pending claim via the control plane).
+    // The shim's next poll iteration will see the green, skip it (!force),
+    // attempt to claim → get "run" → execute fresh.
+    await new Promise((r) => setTimeout(r, 3000));
+
+    await controlPlanePost("/suite/record", {
+      origin_repo: originRepo,
+      tree_hash: treeHash,
+      cmd_hash: cmdHash,
+      cmd_display: counterScript.slice(0, 200),
+      exit_code: 0,
+      duration_ms: 42,
+      log_tail: "FORCE-TEST: claim-clearing record",
+      run_id: "r-sf-force-claim-clear",
+      step_id: "s-clear",
+    });
+
+    const r2 = await shimPromise;
+    assert.equal(r2.exitCode, 0, "forced execution should pass");
+
+    // Must NOT have replayed — force must bypass the cached green.
+    assert.ok(
+      !r2.stdout.includes("TAMANDUA-TEST CACHED"),
+      "--force must bypass cache replay on singleflight wait path",
+    );
+
+    // Counter must be 2: the priming run + the forced fresh execution.
+    count = parseInt(readFileSync(counterFile, "utf-8").trim(), 10);
+    assert.equal(count, 2, "counter should be 2 after forced execution");
+
+    // Verify two distinct suite_results rows (priming + forced).
+    const db = new DatabaseSync(controlEnv.dbPath);
+    const rows = db
+      .prepare("SELECT COUNT(*) as cnt FROM suite_results WHERE run_id = ?")
+      .get("r-sf-force") as { cnt: number };
+    assert.equal(rows.cnt, 2, "should have two recorded results (priming + forced)");
+    db.close();
+  });
+
   // ── US-006: Claim "run" response proceeds to execute ─────────────
 
   it("single-flight: claim 'run' response proceeds to execute and record", async () => {
