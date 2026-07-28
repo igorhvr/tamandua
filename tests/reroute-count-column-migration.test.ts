@@ -24,7 +24,7 @@ function runMigrationScript(homeDir: string) {
 
       const db = getDb();
       const cols = db.prepare("PRAGMA table_info(steps)").all();
-      const rows = db.prepare("SELECT id, reroute_count FROM steps").all();
+      const rows = db.prepare("SELECT id, reroute_count, terminal_reroute_count FROM steps").all();
       console.log(JSON.stringify({ cols, rows }));
     `],
     {
@@ -50,8 +50,8 @@ function runMigrationScript(homeDir: string) {
   return JSON.parse(lastLine) as Record<string, unknown>;
 }
 
-describe("reroute_count column migration", () => {
-  it("migrates legacy steps schema to include reroute_count column with default 0", () => {
+describe("reroute counter column migration", () => {
+  it("migrates v1 steps schema to include terminal_reroute_count with default 0", () => {
     const temp = createTempHome();
 
     try {
@@ -60,7 +60,7 @@ describe("reroute_count column migration", () => {
       fs.mkdirSync(dbDir, { recursive: true });
 
       const legacyDb = new DatabaseSync(dbPath);
-      // Create a minimal schema mimicking pre-reroute steps + required runs table
+      // Create a minimal version-1 schema with the general reroute counter.
       legacyDb.exec(`
         CREATE TABLE runs (
           id TEXT PRIMARY KEY,
@@ -89,9 +89,11 @@ describe("reroute_count column migration", () => {
           loop_config TEXT,
           current_story_id TEXT,
           abandoned_count INTEGER DEFAULT 0,
+          reroute_count INTEGER DEFAULT 0,
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL
         );
+        PRAGMA user_version = 1;
       `);
       const now = new Date().toISOString();
       legacyDb.prepare(`
@@ -114,11 +116,17 @@ describe("reroute_count column migration", () => {
       assert.equal(rerouteCount.notnull, 0, "reroute_count should be nullable");
       assert.equal(rerouteCount.dflt_value, "0", "reroute_count should default to 0");
 
+      const terminalRerouteCount = cols.find((c) => c.name === "terminal_reroute_count");
+      assert.ok(terminalRerouteCount, "terminal_reroute_count column should exist after migration");
+      assert.equal(terminalRerouteCount.notnull, 0, "terminal_reroute_count should be nullable");
+      assert.equal(terminalRerouteCount.dflt_value, "0", "terminal_reroute_count should default to 0");
+
       // Check legacy row has default value (0)
-      const rows = result.rows as Array<{ id: string; reroute_count: number }>;
+      const rows = result.rows as Array<{ id: string; reroute_count: number; terminal_reroute_count: number }>;
       assert.equal(rows.length, 1, "should have one step row");
       assert.equal(rows[0].id, "legacy-step");
       assert.equal(rows[0].reroute_count, 0, "legacy reroute_count should be 0");
+      assert.equal(rows[0].terminal_reroute_count, 0, "legacy terminal_reroute_count should be 0");
     } finally {
       fs.rmSync(temp.root, { recursive: true, force: true });
     }
@@ -182,12 +190,14 @@ describe("reroute_count column migration", () => {
       const cols = result.cols as Array<{ name: string }>;
       const rerouteCount = cols.find((c) => c.name === "reroute_count");
       assert.ok(rerouteCount, "reroute_count should still exist after second migration");
+      const terminalRerouteCount = cols.find((c) => c.name === "terminal_reroute_count");
+      assert.ok(terminalRerouteCount, "terminal_reroute_count should still exist after second migration");
     } finally {
       fs.rmSync(temp.root, { recursive: true, force: true });
     }
   });
 
-  it("new rows inserted after migration default to reroute_count=0", () => {
+  it("new rows inserted after migration default both reroute counters to 0", () => {
     const temp = createTempHome();
 
     try {
@@ -241,7 +251,7 @@ describe("reroute_count column migration", () => {
             .run("new-run", "wf", "task", now, now);
           db.prepare("INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
             .run("new-step", "new-run", "s1", "a1", 1, "x", "y", "pending", now, now);
-          const row = db.prepare("SELECT reroute_count FROM steps WHERE id = ?").get("new-step");
+          const row = db.prepare("SELECT reroute_count, terminal_reroute_count FROM steps WHERE id = ?").get("new-step");
           console.log(JSON.stringify(row));
         `],
         {
@@ -255,8 +265,12 @@ describe("reroute_count column migration", () => {
         throw new Error(`Migration script failed: ${migrateResult.stderr}`);
       }
 
-      const row = JSON.parse(migrateResult.stdout.trim().split(/\r?\n/).filter(Boolean).pop()!) as { reroute_count: number };
+      const row = JSON.parse(migrateResult.stdout.trim().split(/\r?\n/).filter(Boolean).pop()!) as {
+        reroute_count: number;
+        terminal_reroute_count: number;
+      };
       assert.equal(row.reroute_count, 0, "newly inserted row should have reroute_count=0 by default");
+      assert.equal(row.terminal_reroute_count, 0, "newly inserted row should have terminal_reroute_count=0 by default");
     } finally {
       fs.rmSync(temp.root, { recursive: true, force: true });
     }

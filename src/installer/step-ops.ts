@@ -17,6 +17,8 @@ import { getPgid } from "../lib/proc-info.js";
 import {
   evaluateFinalizeMergeLedgerGate,
   formatLedgerGateRefusal,
+  type LedgerGateDecision,
+  type LedgerGateRefusalDecision,
 } from "./ledger-gate.js";
 
 // ══════════════════════════════════════════════════════════════════════
@@ -2182,11 +2184,12 @@ export function claimStep(agentId: string, runId: string, workerOwnership?: Work
   // LGAT: route an obstructing finalize_merge decision through RAMP before
   // the merger receives work. Green and ineligible decisions remain inert.
   const ledgerGateDecision = evaluateFinalizeMergeLedgerGate(step.id);
-  if (
-    ledgerGateDecision.status === "missing"
-    || (ledgerGateDecision.status === "red" && ledgerGateDecision.gateMode === "green")
-  ) {
-    applyLedgerGateRefusalSync(step, formatLedgerGateRefusal(ledgerGateDecision));
+  const ledgerGateRefusal = getLedgerGateRefusal(step.id, ledgerGateDecision);
+  if (ledgerGateRefusal) {
+    applyLedgerGateRefusalSync(
+      step,
+      formatLedgerGateRefusal(ledgerGateRefusal),
+    );
     return { found: false };
   }
 
@@ -2696,7 +2699,12 @@ function completeStepInternal(stepId: string, output: string): { status: string;
   // stories, and re-advance the pipeline. Steps still 'running' — or reset
   // to 'pending' by the stale-claim sweeper — ARE processed: late work is
   // valid work.
-  if (step.status === "done" || step.status === "failed" || step.status === "skipped") {
+  if (
+    step.status === "waiting"
+    || step.status === "done"
+    || step.status === "failed"
+    || step.status === "skipped"
+  ) {
     return { status: "blocked", detail: `step already ${step.status}` };
   }
 
@@ -2734,14 +2742,33 @@ function completeStepInternal(stepId: string, output: string): { status: string;
   // Defense-in-depth at acceptance time. The normal motor blocks before
   // claim, but a completion from an older/in-flight claimant must not bypass
   // an obstructing decision that became visible meanwhile.
+  //
+  // C24 (already-landed guard): skip the acceptance-time refusal when the
+  // target ref already advanced to the attested MERGED_COMMIT — refusing a
+  // merge that already happened would waste a tester reroute.
   const acceptanceGateDecision = evaluateFinalizeMergeLedgerGate(step.id);
-  if (
-    acceptanceGateDecision.status === "missing"
-    || (acceptanceGateDecision.status === "red" && acceptanceGateDecision.gateMode === "green")
-  ) {
-    const refusal = formatLedgerGateRefusal(acceptanceGateDecision);
-    const refusalStatus = applyLedgerGateRefusalSync(step, refusal);
-    return { status: refusalStatus, detail: refusal };
+  const acceptanceGateRefusal = getLedgerGateRefusal(step.id, acceptanceGateDecision);
+  if (acceptanceGateRefusal) {
+    if (isAlreadyLanded(step.id, output)) {
+      const wfId = getWorkflowId(step.run_id);
+      emitEvent({
+        ts: new Date().toISOString(),
+        event: "merge.accepted_already_landed",
+        runId: step.run_id,
+        workflowId: wfId,
+        stepId: step.step_id,
+        detail: "Acceptance gate refusal skipped — target already at attested MERGED_COMMIT",
+      });
+      logger.info("Skipped acceptance gate refusal: target already at attested MERGED_COMMIT", {
+        runId: step.run_id,
+        stepId: step.step_id,
+      });
+      // Fall through to normal acceptance (expects validation, context merge, etc.)
+    } else {
+      const refusal = formatLedgerGateRefusal(acceptanceGateRefusal);
+      const refusalStatus = applyLedgerGateRefusalSync(step, refusal);
+      return { status: refusalStatus, detail: refusal };
+    }
   }
 
   // Validate output against the expects column before accepting the step
@@ -3060,6 +3087,28 @@ function completeStepInternal(stepId: string, output: string): { status: string;
       exitCode: acceptanceGateDecision.row.exitCode,
       ledgerCreatedAt: acceptanceGateDecision.row.createdAt,
       durationMs: acceptanceGateDecision.row.durationMs,
+    });
+  }
+
+  // A second default-mode missing decision demonstrates that the suite
+  // recording path remained unwritable after its one terminal tester pass.
+  // Annotate only the accepted landing; duplicate completions are rejected
+  // above before they can emit another event.
+  if (
+    acceptanceGateDecision.status === "missing"
+    && acceptanceGateDecision.gateMode === "default"
+    && hasTerminalLedgerConcession(step.id)
+  ) {
+    emitEvent({
+      ts: new Date().toISOString(),
+      event: "merge.landed_without_suite_evidence",
+      runId: step.run_id,
+      workflowId: getWorkflowId(step.run_id),
+      stepId: step.step_id,
+      gateMode: acceptanceGateDecision.gateMode,
+      origin: acceptanceGateDecision.originRepo,
+      treeHash: acceptanceGateDecision.treeHash,
+      cmdHash: acceptanceGateDecision.cmdHash,
     });
   }
 
@@ -3413,9 +3462,14 @@ function rerouteWithPolicy(
 
   // Look up the consumer step metadata
   const consumerStep = db.prepare(
-    "SELECT step_id, step_index, reroute_count FROM steps WHERE id = ?"
+    "SELECT step_id, step_index, reroute_count, terminal_reroute_count FROM steps WHERE id = ?"
   ).get(consumerRowId) as
-    { step_id: string; step_index: number; reroute_count: number | null } | undefined;
+    {
+      step_id: string;
+      step_index: number;
+      reroute_count: number | null;
+      terminal_reroute_count: number | null;
+    } | undefined;
   if (!consumerStep) return "not_found";
 
   // Look up the target (producer) step in the same run (include type + loop_config for story reset)
@@ -3448,6 +3502,9 @@ function rerouteWithPolicy(
   }
 
   const newRerouteCount = currentReroutes + 1;
+  const rerouteMode = getFailureRerouteMode(error, policy);
+  const newTerminalRerouteCount =
+    (consumerStep.terminal_reroute_count ?? 0) + (rerouteMode === "terminal" ? 1 : 0);
 
   // Build bounded feedback for the producer
   const feedback =
@@ -3473,11 +3530,12 @@ function rerouteWithPolicy(
   //        on the next claim (unconditional — even when no stories were reset).
   writeRerouteFeedbackContext(db, runId, targetStep, error);
 
-  // (b) Reset consumer: status=waiting, retry_count=0, increment reroute_count.
+  // (b) Reset consumer: status=waiting, retry_count=0, increment the general
+  //     counter and, for a terminal-class concession, its dedicated counter.
   //     Clear output and ownership so it looks like a fresh step.
   db.prepare(
-    "UPDATE steps SET status = 'waiting', retry_count = 0, reroute_count = ?, output = NULL, claim_job_id = NULL, claim_pid = NULL, claim_pgid = NULL, updated_at = datetime('now') WHERE id = ?"
-  ).run(newRerouteCount, consumerRowId);
+    "UPDATE steps SET status = 'waiting', retry_count = 0, reroute_count = ?, terminal_reroute_count = ?, output = NULL, claim_job_id = NULL, claim_pid = NULL, claim_pgid = NULL, updated_at = datetime('now') WHERE id = ?"
+  ).run(newRerouteCount, newTerminalRerouteCount, consumerRowId);
 
   // (c) Intermediate done steps are left untouched — advancePipeline will
   //     naturally re-pend the consumer after the producer completes.
@@ -3515,18 +3573,77 @@ function rerouteWithPolicy(
  * Terminal refusals receive the RAMP-wide one-reroute allowance regardless
  * of the workflow's larger transient reroute budget.
  */
+/**
+ * Check whether the merge attested by the finalize_merge output's
+ * MERGED_COMMIT has already landed on the target ref. When this
+ * returns true at acceptance time, the gate refusal is skipped —
+ * refusing a merge that already happened would waste a tester reroute.
+ *
+ * Exported so it can be tested independently.
+ */
+export function isAlreadyLanded(stepId: string, output: string): boolean {
+  const parsed = parseOutputKeyValues(output);
+  const mergedCommit = parsed["merged_commit"];
+  if (!mergedCommit) return false;
+
+  const db = getDb();
+  const step = db.prepare(
+    "SELECT run_id FROM steps WHERE id = ?",
+  ).get(stepId) as { run_id: string } | undefined;
+  if (!step) return false;
+
+  const run = db.prepare("SELECT context FROM runs WHERE id = ?").get(step.run_id) as
+    | { context: string }
+    | undefined;
+  if (!run) return false;
+
+  const context = parseRunContext(step.run_id, run.context);
+  const targetBranch = context.original_branch;
+  const repo = context.worktree_origin_repository || context.repo || context.working_directory_for_harness;
+  if (!targetBranch || !repo) return false;
+
+  try {
+    const targetRef = `refs/heads/${targetBranch}`;
+    const tip = execSync(`git rev-parse ${targetRef}`, { cwd: repo, encoding: "utf-8", timeout: 10_000 }).trim();
+    return tip === mergedCommit;
+  } catch {
+    return false;
+  }
+}
+
+function hasTerminalLedgerConcession(stepId: string): boolean {
+  const row = getDb().prepare(
+    "SELECT terminal_reroute_count FROM steps WHERE id = ?",
+  ).get(stepId) as { terminal_reroute_count: number | null } | undefined;
+  return (row?.terminal_reroute_count ?? 0) >= 1;
+}
+
+function getLedgerGateRefusal(
+  stepId: string,
+  decision: LedgerGateDecision,
+): LedgerGateRefusalDecision | null {
+  if (decision.status === "missing") {
+    return decision.gateMode === "green" || !hasTerminalLedgerConcession(stepId)
+      ? decision
+      : null;
+  }
+  return decision.status === "red" && decision.gateMode === "green"
+    ? decision
+    : null;
+}
+
 function applyLedgerGateRefusalSync(
   step: { id: string; run_id: string; step_id: string },
   refusal: string,
 ): "rerouted" | "failed" {
   const db = getDb();
   const metadata = db.prepare(
-    "SELECT retry_count, reroute_count FROM steps WHERE id = ?",
-  ).get(step.id) as { retry_count: number; reroute_count: number | null } | undefined;
+    "SELECT retry_count, terminal_reroute_count FROM steps WHERE id = ?",
+  ).get(step.id) as { retry_count: number; terminal_reroute_count: number | null } | undefined;
   const policy = getOnFailPolicySync(step.run_id, step.step_id);
-  const rerouteCount = metadata?.reroute_count ?? 0;
+  const terminalRerouteCount = metadata?.terminal_reroute_count ?? 0;
   const rerouteMode = getFailureRerouteMode(refusal, policy);
-  const terminalRerouteLimitExhausted = rerouteMode === "terminal" && rerouteCount >= 1;
+  const terminalRerouteLimitExhausted = rerouteMode === "terminal" && terminalRerouteCount >= 1;
 
   if (!terminalRerouteLimitExhausted && policy?.retry_step) {
     const rerouteResult = rerouteWithPolicy(
@@ -3589,13 +3706,14 @@ async function failStepInternal(stepId: string, error: string): Promise<{ status
   const db = getDb();
 
   const step = db.prepare(
-    "SELECT run_id, step_id, retry_count, max_retries, reroute_count, type, current_story_id FROM steps WHERE id = ?"
+    "SELECT run_id, step_id, retry_count, max_retries, reroute_count, terminal_reroute_count, type, current_story_id FROM steps WHERE id = ?"
   ).get(stepId) as {
     run_id: string;
     step_id: string;
     retry_count: number;
     max_retries: number;
     reroute_count: number | null;
+    terminal_reroute_count: number | null;
     type: string;
     current_story_id: string | null;
   } | undefined;
@@ -3655,7 +3773,7 @@ async function failStepInternal(stepId: string, error: string): Promise<{ status
       const policy = await getOnFailPolicy(step.run_id, step.step_id);
       const rerouteMode = getFailureRerouteMode(error, policy);
       terminalRerouteLimitExhausted =
-        rerouteMode === "terminal" && (step.reroute_count ?? 0) >= 1;
+        rerouteMode === "terminal" && (step.terminal_reroute_count ?? 0) >= 1;
       const rerouteResult = terminalRerouteLimitExhausted
         ? "budget_exhausted"
         : policy?.retry_step

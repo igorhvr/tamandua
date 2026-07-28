@@ -38,4 +38,4 @@ if [ ${#FILES[@]} -eq 0 ]; then
 fi
 
 echo "=== Serial lane: running ${#FILES[@]} test files with concurrency 1 ==="
-node --test --test-concurrency=1 "${FILES[@]}"
+node --experimental-test-module-mocks --test --test-concurrency=1 "${FILES[@]}"

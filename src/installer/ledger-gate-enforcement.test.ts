@@ -6,7 +6,7 @@ import { after, afterEach, before, beforeEach, describe, it } from "node:test";
 
 import { closeDb, getDb } from "../../dist/db.js";
 import { getRunEvents } from "../../dist/installer/events.js";
-import { claimStep, completeStep } from "../../dist/installer/step-ops.js";
+import { claimStep, completeStep, isAlreadyLanded } from "../../dist/installer/step-ops.js";
 import { loadWorkflowSpecSync } from "../../dist/installer/workflow-spec.js";
 import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
 import { assertStatePathIsolation } from "../../dist/lib/test-guard.js";
@@ -213,6 +213,66 @@ describe("finalize_merge ledger gate enforcement", () => {
     );
   });
 
+  it("degrades repeated default missing evidence after one tester reroute and annotates the landing once", () => {
+    const seeded = seedRun("default", "missing");
+
+    assert.equal(claimStep("merger", seeded.runId).found, false);
+    const afterFirst = seeded.db.prepare(
+      "SELECT status, reroute_count, terminal_reroute_count FROM steps WHERE id = ?",
+    ).get(seeded.finalizeId) as {
+      status: string;
+      reroute_count: number;
+      terminal_reroute_count: number;
+    };
+    assert.equal(afterFirst.status, "waiting");
+    assert.equal(afterFirst.reroute_count, 1);
+    assert.equal(afterFirst.terminal_reroute_count, 1);
+
+    assert.equal(
+      completeStep(seeded.finalizeId, "STATUS: done").status,
+      "blocked",
+      "a stale merger completion must not consume the concession before the tester rerun",
+    );
+    assert.equal(
+      getRunEvents(seeded.runId).filter(
+        (event) => event.event === "merge.landed_without_suite_evidence",
+      ).length,
+      0,
+    );
+    assert.equal(
+      (seeded.db.prepare("SELECT status FROM steps WHERE id = ?").get(seeded.finalizeId) as { status: string }).status,
+      "waiting",
+    );
+
+    assert.equal(claimStep("tester", seeded.runId).found, true);
+    assert.equal(completeStep(seeded.testerId, TESTER_OUTPUT).status, "advanced");
+
+    const mergerClaim = claimStep("merger", seeded.runId);
+    assert.equal(mergerClaim.found, true);
+    assert.equal(mergerClaim.stepId, seeded.finalizeId);
+    assert.equal(completeStep(seeded.finalizeId, "STATUS: done").status, "completed");
+
+    const annotations = getRunEvents(seeded.runId).filter(
+      (event) => event.event === "merge.landed_without_suite_evidence",
+    );
+    assert.equal(annotations.length, 1);
+    assert.equal(annotations[0].runId, seeded.runId);
+    assert.equal(annotations[0].workflowId, WORKFLOW_ID);
+    assert.equal(annotations[0].stepId, "finalize_merge");
+    assert.equal(annotations[0].gateMode, "default");
+    assert.equal(annotations[0].origin, getOriginRepo(repo));
+    assert.equal(annotations[0].treeHash, TESTED_TREE);
+    assert.equal(annotations[0].cmdHash, computeCmdHash(TEST_CMD));
+
+    assert.equal(completeStep(seeded.finalizeId, "STATUS: done").status, "blocked");
+    assert.equal(
+      getRunEvents(seeded.runId).filter(
+        (event) => event.event === "merge.landed_without_suite_evidence",
+      ).length,
+      1,
+    );
+  });
+
   it("allows all merge_gate=off ledger states and emits attributed overrides", () => {
     for (const evidence of ["green", "red", "missing"] as const) {
       const seeded = seedRun("off", evidence);
@@ -236,7 +296,6 @@ describe("finalize_merge ledger gate enforcement", () => {
   });
 
   for (const [mode, evidence] of [
-    ["default", "missing"],
     ["green", "missing"],
     ["green", "red"],
   ] as const) {
@@ -293,4 +352,305 @@ describe("finalize_merge ledger gate enforcement", () => {
       assert.equal(runFailed?.detail, failedStep.output);
     });
   }
+
+  it("grants a motor-generated terminal concession after a prior transient reroute", () => {
+    const seeded = seedRun("green", "red");
+    seeded.db.prepare(
+      "UPDATE steps SET reroute_count = 1, terminal_reroute_count = 0 WHERE id = ?",
+    ).run(seeded.finalizeId);
+
+    assert.equal(claimStep("merger", seeded.runId).found, false);
+    const afterFirst = seeded.db.prepare(
+      "SELECT status, reroute_count, terminal_reroute_count FROM steps WHERE id = ?",
+    ).get(seeded.finalizeId) as {
+      status: string;
+      reroute_count: number;
+      terminal_reroute_count: number;
+    };
+    assert.equal(afterFirst.status, "waiting");
+    assert.equal(afterFirst.reroute_count, 2);
+    assert.equal(afterFirst.terminal_reroute_count, 1);
+
+    assert.equal(claimStep("tester", seeded.runId).found, true);
+    assert.equal(completeStep(seeded.testerId, TESTER_OUTPUT).status, "advanced");
+    assert.equal(claimStep("merger", seeded.runId).found, false);
+    const afterSecond = seeded.db.prepare(
+      "SELECT status, reroute_count, terminal_reroute_count FROM steps WHERE id = ?",
+    ).get(seeded.finalizeId) as {
+      status: string;
+      reroute_count: number;
+      terminal_reroute_count: number;
+    };
+    assert.equal(afterSecond.status, "failed");
+    assert.equal(afterSecond.reroute_count, 2);
+    assert.equal(afterSecond.terminal_reroute_count, 1);
+  });
+
+  // ─── Already-Landed Guard Tests (US-006) ────────────────────────────
+
+  it("isAlreadyLanded returns true when target tip matches MERGED_COMMIT", () => {
+    const db = getDb();
+    const suffix = Math.random().toString(16).slice(2);
+    const runId = `lgat-landed-unit-${suffix}`;
+    const finalizeId = `finalize-${suffix}`;
+    const testerId = `tester-${suffix}`;
+    const targetBranch = execFileSync("git", ["symbolic-ref", "--short", "HEAD"], {
+      cwd: repo,
+      encoding: "utf-8",
+    }).trim();
+    const mainTip = execFileSync("git", ["rev-parse", `refs/heads/${targetBranch}`], {
+      cwd: repo,
+      encoding: "utf-8",
+    }).trim();
+
+    db.prepare(
+      `INSERT INTO runs (id, run_number, workflow_id, task, status, context, created_at, updated_at)
+       VALUES (?, 42, ?, 'task', 'running', ?, '2026-07-26T12:34:56.000Z', '2026-07-26T12:34:56.000Z')`,
+    ).run(runId, WORKFLOW_ID, JSON.stringify({
+      repo,
+      original_branch: targetBranch,
+      worktree_origin_repository: repo,
+      test_cmd: TEST_CMD,
+    }));
+    db.prepare(
+      `INSERT INTO steps
+         (id, run_id, step_id, agent_id, step_index, input_template, expects, status,
+          output, type, retry_count, max_retries, reroute_count, created_at, updated_at)
+       VALUES (?, ?, 'test', 'tester', 0, 'Test', 'STATUS: done', 'done',
+          ?, 'single', 0, 0, 0, '2026-07-26T12:34:56.000Z', '2026-07-26T12:34:56.000Z')`,
+    ).run(testerId, runId, TESTER_OUTPUT);
+    db.prepare(
+      `INSERT INTO steps
+         (id, run_id, step_id, agent_id, step_index, input_template, expects, status,
+          type, retry_count, max_retries, reroute_count, created_at, updated_at)
+       VALUES (?, ?, 'finalize_merge', 'merger', 1, 'Merge', 'STATUS: done', 'pending',
+          'single', 0, 0, 0, '2026-07-26T12:34:56.000Z', '2026-07-26T12:34:56.000Z')`,
+    ).run(finalizeId, runId);
+
+    const outputMatching = `STATUS: done\nMERGED_COMMIT: ${mainTip}\nTARGET: refs/heads/${targetBranch}`;
+    assert.equal(isAlreadyLanded(finalizeId, outputMatching), true);
+  });
+
+  it("isAlreadyLanded returns false when MERGED_COMMIT does not match target tip", () => {
+    const db = getDb();
+    const suffix = Math.random().toString(16).slice(2);
+    const runId = `lgat-landed-unit-${suffix}`;
+    const finalizeId = `finalize-${suffix}`;
+    const testerId = `tester-${suffix}`;
+    const targetBranch = execFileSync("git", ["symbolic-ref", "--short", "HEAD"], {
+      cwd: repo,
+      encoding: "utf-8",
+    }).trim();
+
+    db.prepare(
+      `INSERT INTO runs (id, run_number, workflow_id, task, status, context, created_at, updated_at)
+       VALUES (?, 42, ?, 'task', 'running', ?, '2026-07-26T12:34:56.000Z', '2026-07-26T12:34:56.000Z')`,
+    ).run(runId, WORKFLOW_ID, JSON.stringify({
+      repo,
+      original_branch: targetBranch,
+      worktree_origin_repository: repo,
+      test_cmd: TEST_CMD,
+    }));
+    db.prepare(
+      `INSERT INTO steps
+         (id, run_id, step_id, agent_id, step_index, input_template, expects, status,
+          output, type, retry_count, max_retries, reroute_count, created_at, updated_at)
+       VALUES (?, ?, 'test', 'tester', 0, 'Test', 'STATUS: done', 'done',
+          ?, 'single', 0, 0, 0, '2026-07-26T12:34:56.000Z', '2026-07-26T12:34:56.000Z')`,
+    ).run(testerId, runId, TESTER_OUTPUT);
+    db.prepare(
+      `INSERT INTO steps
+         (id, run_id, step_id, agent_id, step_index, input_template, expects, status,
+          type, retry_count, max_retries, reroute_count, created_at, updated_at)
+       VALUES (?, ?, 'finalize_merge', 'merger', 1, 'Merge', 'STATUS: done', 'pending',
+          'single', 0, 0, 0, '2026-07-26T12:34:56.000Z', '2026-07-26T12:34:56.000Z')`,
+    ).run(finalizeId, runId);
+
+    const fakeCommit = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+    const outputNonMatching = `STATUS: done\nMERGED_COMMIT: ${fakeCommit}\nTARGET: refs/heads/${targetBranch}`;
+    assert.equal(isAlreadyLanded(finalizeId, outputNonMatching), false);
+  });
+
+  it("isAlreadyLanded returns false when output has no MERGED_COMMIT", () => {
+    const db = getDb();
+    const suffix = Math.random().toString(16).slice(2);
+    const runId = `lgat-landed-unit-${suffix}`;
+    const finalizeId = `finalize-${suffix}`;
+    const testerId = `tester-${suffix}`;
+    const targetBranch = execFileSync("git", ["symbolic-ref", "--short", "HEAD"], {
+      cwd: repo,
+      encoding: "utf-8",
+    }).trim();
+
+    db.prepare(
+      `INSERT INTO runs (id, run_number, workflow_id, task, status, context, created_at, updated_at)
+       VALUES (?, 42, ?, 'task', 'running', ?, '2026-07-26T12:34:56.000Z', '2026-07-26T12:34:56.000Z')`,
+    ).run(runId, WORKFLOW_ID, JSON.stringify({
+      repo,
+      original_branch: targetBranch,
+      worktree_origin_repository: repo,
+      test_cmd: TEST_CMD,
+    }));
+    db.prepare(
+      `INSERT INTO steps
+         (id, run_id, step_id, agent_id, step_index, input_template, expects, status,
+          output, type, retry_count, max_retries, reroute_count, created_at, updated_at)
+       VALUES (?, ?, 'test', 'tester', 0, 'Test', 'STATUS: done', 'done',
+          ?, 'single', 0, 0, 0, '2026-07-26T12:34:56.000Z', '2026-07-26T12:34:56.000Z')`,
+    ).run(testerId, runId, TESTER_OUTPUT);
+    db.prepare(
+      `INSERT INTO steps
+         (id, run_id, step_id, agent_id, step_index, input_template, expects, status,
+          type, retry_count, max_retries, reroute_count, created_at, updated_at)
+       VALUES (?, ?, 'finalize_merge', 'merger', 1, 'Merge', 'STATUS: done', 'pending',
+          'single', 0, 0, 0, '2026-07-26T12:34:56.000Z', '2026-07-26T12:34:56.000Z')`,
+    ).run(finalizeId, runId);
+
+    assert.equal(isAlreadyLanded(finalizeId, "STATUS: done"), false);
+  });
+
+  function seedAlreadyLandedRun() {
+    const db = getDb();
+    const suffix = Math.random().toString(16).slice(2);
+    const runId = `lgat-landed-${suffix}`;
+    const testerId = `tester-${suffix}`;
+    const finalizeId = `finalize-${suffix}`;
+    const targetBranch = execFileSync("git", ["symbolic-ref", "--short", "HEAD"], {
+      cwd: repo,
+      encoding: "utf-8",
+    }).trim();
+    const context: Record<string, string> = {
+      repo,
+      original_branch: targetBranch,
+      worktree_origin_repository: repo,
+      test_cmd: TEST_CMD,
+      launch_actor: "integration-test",
+      merge_gate: "green",
+    };
+    const createdAt = "2026-07-26T12:34:56.000Z";
+
+    db.prepare(
+      `INSERT INTO runs
+         (id, run_number, workflow_id, task, status, context, created_at, updated_at)
+       VALUES (?, 42, ?, 'task', 'running', ?, ?, ?)`,
+    ).run(runId, WORKFLOW_ID, JSON.stringify(context), createdAt, createdAt);
+    db.prepare(
+      `INSERT INTO steps
+         (id, run_id, step_id, agent_id, step_index, input_template, expects, status,
+          output, type, retry_count, max_retries, reroute_count, created_at, updated_at)
+       VALUES (?, ?, 'test', 'tester', 0, 'Test', 'STATUS: done', 'done', ?, 'single', 0, 0, 0, ?, ?)`,
+    ).run(testerId, runId, TESTER_OUTPUT, createdAt, createdAt);
+    db.prepare(
+      `INSERT INTO steps
+         (id, run_id, step_id, agent_id, step_index, input_template, expects, status,
+          type, retry_count, max_retries, reroute_count, created_at, updated_at)
+       VALUES (?, ?, 'finalize_merge', 'merger', 1, 'Merge', 'STATUS: done', 'pending',
+          'single', 0, 0, 0, ?, ?)`,
+    ).run(finalizeId, runId, createdAt, createdAt);
+
+    // Insert GREEN suite evidence so the claim-time gate does not refuse.
+    const rowCreatedAt = "2026-07-26T12:35:00.000Z";
+    const inserted = db.prepare(
+      `INSERT INTO suite_results
+         (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms,
+          log_tail, run_id, step_id, created_at)
+       VALUES (?, ?, ?, ?, 0, 321, 'ledger log tail', 'writer-run', 'writer-step', ?)`,
+    ).run(getOriginRepo(repo), TESTED_TREE, computeCmdHash(TEST_CMD), TEST_CMD, rowCreatedAt);
+    const row = { id: Number(inserted.lastInsertRowid), exitCode: 0, createdAt: rowCreatedAt };
+
+    return { db, runId, testerId, finalizeId, targetBranch, row };
+  }
+
+  it("skips acceptance gate refusal when target ref already at attested MERGED_COMMIT", () => {
+    const seeded = seedAlreadyLandedRun();
+
+    // Claim succeeds because the gate sees green evidence (green+green = no refusal).
+    const claim = claimStep("merger", seeded.runId);
+    assert.equal(claim.found, true);
+    assert.equal(claim.stepId, seeded.finalizeId);
+
+    // Between claim and completion: change suite evidence to red so the
+    // acceptance-time gate re-evaluation would normally refuse (green+red).
+    seeded.db.prepare("UPDATE suite_results SET exit_code = 1 WHERE id = ?").run(seeded.row.id);
+
+    const mainTip = execFileSync("git", ["rev-parse", `refs/heads/${seeded.targetBranch}`], {
+      cwd: repo,
+      encoding: "utf-8",
+    }).trim();
+
+    // Complete with MERGED_COMMIT matching the current target tip — the
+    // acceptance gate should normally refuse (green+red), but the
+    // already-landed guard should skip the refusal.
+    const completionOutput = `STATUS: done\nMERGED_COMMIT: ${mainTip}\nMERGED_TREE: abc123\nTARGET: refs/heads/${seeded.targetBranch}`;
+    const result = completeStep(seeded.finalizeId, completionOutput);
+    assert.equal(result.status, "completed", "already-landed guard should skip refusal");
+
+    // Verify the annotation event was emitted
+    const annotations = getRunEvents(seeded.runId).filter(
+      (event) => event.event === "merge.accepted_already_landed",
+    );
+    assert.equal(annotations.length, 1);
+    assert.equal(annotations[0].runId, seeded.runId);
+    assert.equal(annotations[0].workflowId, WORKFLOW_ID);
+    assert.equal(annotations[0].stepId, "finalize_merge");
+  });
+
+  it("does not skip acceptance gate refusal when MERGED_COMMIT does not match target tip", () => {
+    const seeded = seedAlreadyLandedRun();
+
+    const claim = claimStep("merger", seeded.runId);
+    assert.equal(claim.found, true);
+    assert.equal(claim.stepId, seeded.finalizeId);
+
+    // Change evidence to red so acceptance gate would refuse.
+    seeded.db.prepare("UPDATE suite_results SET exit_code = 1 WHERE id = ?").run(seeded.row.id);
+
+    // Use a non-matching commit hash
+    const fakeCommit = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+    const completionOutput = `STATUS: done\nMERGED_COMMIT: ${fakeCommit}\nMERGED_TREE: abc123\nTARGET: refs/heads/${seeded.targetBranch}`;
+    const result = completeStep(seeded.finalizeId, completionOutput);
+    assert.equal(result.status, "rerouted", "non-matching commit should trigger acceptance gate refusal + reroute");
+
+    // Verify no already-landed annotation
+    const annotations = getRunEvents(seeded.runId).filter(
+      (event) => event.event === "merge.accepted_already_landed",
+    );
+    assert.equal(annotations.length, 0);
+  });
+
+  it("does not skip acceptance gate refusal when no MERGED_COMMIT in output", () => {
+    const seeded = seedAlreadyLandedRun();
+
+    const claim = claimStep("merger", seeded.runId);
+    assert.equal(claim.found, true);
+    assert.equal(claim.stepId, seeded.finalizeId);
+
+    // Change evidence to red so acceptance gate would refuse.
+    seeded.db.prepare("UPDATE suite_results SET exit_code = 1 WHERE id = ?").run(seeded.row.id);
+
+    // Output without MERGED_COMMIT
+    const result = completeStep(seeded.finalizeId, "STATUS: done\nCHANGES: stuff");
+    assert.equal(result.status, "rerouted", "missing MERGED_COMMIT should trigger acceptance gate refusal + reroute");
+  });
+
+  it("normal non-already-landed paths unaffected (green mode, red evidence, default scenario)", () => {
+    // Use the default seedRun which does NOT set original_branch —
+    // isAlreadyLanded returns false because there's no target branch.
+    // The claim-time gate blocks (green+red) as usual.
+    const seeded = seedRun("green", "red");
+
+    const firstClaim = claimStep("merger", seeded.runId);
+    assert.equal(firstClaim.found, false, "hard refusal with green mode, red evidence");
+
+    // After the reroute, the step is waiting. Tester claims and completes.
+    assert.equal(claimStep("tester", seeded.runId).found, true);
+    assert.equal(completeStep(seeded.testerId, TESTER_OUTPUT).status, "advanced");
+
+    // Second claim also fails (run fails).
+    assert.equal(claimStep("merger", seeded.runId).found, false);
+    const run = seeded.db.prepare("SELECT status FROM runs WHERE id = ?").get(seeded.runId) as {
+      status: string;
+    };
+    assert.equal(run.status, "failed");
+  });
 });

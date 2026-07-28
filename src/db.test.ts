@@ -443,6 +443,7 @@ describe("stories abandoned_count migration", () => {
     assert.ok(stepCols.has("id"), "steps.id should exist");
     assert.ok(stepCols.has("abandoned_count"), "steps.abandoned_count should exist");
     assert.ok(stepCols.has("reroute_count"), "steps.reroute_count should exist");
+    assert.ok(stepCols.has("terminal_reroute_count"), "steps.terminal_reroute_count should exist");
 
     const storyCols = columnNames(db, "stories");
     assert.ok(storyCols.has("id"), "stories.id should exist");

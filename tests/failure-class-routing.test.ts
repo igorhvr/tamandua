@@ -63,7 +63,7 @@ describe("failure-class motor routing", () => {
     fs.rmSync(isolationDir, { recursive: true, force: true });
   });
 
-  async function insertRun(rerouteCount = 0) {
+  async function insertRun(rerouteCount = 0, terminalRerouteCount = 0) {
     const { getDb } = await import("../dist/db.js");
     const db = getDb();
     const runId = crypto.randomUUID();
@@ -77,17 +77,17 @@ describe("failure-class motor routing", () => {
     db.prepare(
       `INSERT INTO steps
        (id, run_id, step_id, agent_id, step_index, input_template, expects, status,
-        retry_count, max_retries, reroute_count, type, output, created_at, updated_at)
+        retry_count, max_retries, reroute_count, terminal_reroute_count, type, output, created_at, updated_at)
        VALUES (?, ?, 'produce', 'producer', 0, 'Produce', 'STATUS: done', 'done',
-        0, 0, 0, 'single', 'STATUS: done', ?, ?)`,
+        0, 0, 0, 0, 'single', 'STATUS: done', ?, ?)`,
     ).run(producerId, runId, now, now);
     db.prepare(
       `INSERT INTO steps
        (id, run_id, step_id, agent_id, step_index, input_template, expects, status,
-        retry_count, max_retries, reroute_count, type, created_at, updated_at)
+        retry_count, max_retries, reroute_count, terminal_reroute_count, type, created_at, updated_at)
        VALUES (?, ?, 'consume', 'consumer', 1, 'Consume', 'STATUS: done', 'running',
-        0, 0, ?, 'single', ?, ?)`,
-    ).run(consumerId, runId, rerouteCount, now, now);
+        0, 0, ?, ?, 'single', ?, ?)`,
+    ).run(consumerId, runId, rerouteCount, terminalRerouteCount, now, now);
 
     return { db, runId, producerId, consumerId };
   }
@@ -100,10 +100,11 @@ describe("failure-class motor routing", () => {
 
     assert.equal(result.status, "rerouted");
     const consumer = db.prepare(
-      "SELECT status, reroute_count FROM steps WHERE id = ?",
-    ).get(consumerId) as { status: string; reroute_count: number };
+      "SELECT status, reroute_count, terminal_reroute_count FROM steps WHERE id = ?",
+    ).get(consumerId) as { status: string; reroute_count: number; terminal_reroute_count: number };
     assert.equal(consumer.status, "waiting");
     assert.equal(consumer.reroute_count, 4);
+    assert.equal(consumer.terminal_reroute_count, 0);
   });
 
   it("reroutes a multiline reason whose failure class matches retry_on", async () => {
@@ -125,10 +126,12 @@ describe("failure-class motor routing", () => {
     const result = await failStep(consumerId, "Conflict found\nFAILURE_CLASS: conflicts");
 
     assert.equal(result.status, "rerouted");
-    const consumer = db.prepare("SELECT reroute_count FROM steps WHERE id = ?").get(consumerId) as {
+    const consumer = db.prepare("SELECT reroute_count, terminal_reroute_count FROM steps WHERE id = ?").get(consumerId) as {
       reroute_count: number;
+      terminal_reroute_count: number;
     };
     assert.equal(consumer.reroute_count, 1);
+    assert.equal(consumer.terminal_reroute_count, 0);
   });
 
   it("uses legacy rerouting for an unknown failure class", async () => {
@@ -137,10 +140,12 @@ describe("failure-class motor routing", () => {
     const result = await failStep(consumerId, "Odd failure\nFAILURE_CLASS: future_class");
 
     assert.equal(result.status, "rerouted");
-    const consumer = db.prepare("SELECT reroute_count FROM steps WHERE id = ?").get(consumerId) as {
+    const consumer = db.prepare("SELECT reroute_count, terminal_reroute_count FROM steps WHERE id = ?").get(consumerId) as {
       reroute_count: number;
+      terminal_reroute_count: number;
     };
     assert.equal(consumer.reroute_count, 3);
+    assert.equal(consumer.terminal_reroute_count, 0);
   });
 
   it("allows the first refused_permanent failure to reroute", async () => {
@@ -153,14 +158,15 @@ describe("failure-class motor routing", () => {
 
     assert.equal(result.status, "rerouted");
     const consumer = db.prepare(
-      "SELECT status, reroute_count FROM steps WHERE id = ?",
-    ).get(consumerId) as { status: string; reroute_count: number };
+      "SELECT status, reroute_count, terminal_reroute_count FROM steps WHERE id = ?",
+    ).get(consumerId) as { status: string; reroute_count: number; terminal_reroute_count: number };
     assert.equal(consumer.status, "waiting");
     assert.equal(consumer.reroute_count, 1);
+    assert.equal(consumer.terminal_reroute_count, 1);
   });
 
   it("fails on the second refused_permanent failure and preserves the refusal verbatim", async () => {
-    const { db, runId, consumerId } = await insertRun(1);
+    const { db, runId, consumerId } = await insertRun(1, 1);
     const reason = [
       "Landing refused by branch policy.",
       "FAILURE_CLASS: refused_permanent",
@@ -171,11 +177,12 @@ describe("failure-class motor routing", () => {
 
     assert.equal(result.status, "failed");
     const step = db.prepare(
-      "SELECT status, output, reroute_count FROM steps WHERE id = ?",
-    ).get(consumerId) as { status: string; output: string; reroute_count: number };
+      "SELECT status, output, reroute_count, terminal_reroute_count FROM steps WHERE id = ?",
+    ).get(consumerId) as { status: string; output: string; reroute_count: number; terminal_reroute_count: number };
     assert.equal(step.status, "failed");
     assert.equal(step.output, reason);
     assert.equal(step.reroute_count, 1);
+    assert.equal(step.terminal_reroute_count, 1);
     const run = db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string };
     assert.equal(run.status, "failed");
 
@@ -185,5 +192,54 @@ describe("failure-class motor routing", () => {
     assert.equal(stepFailed?.detail, reason);
     assert.equal(runFailed?.detail, reason);
     assert.equal(events.filter((event) => event.event === "step.rerouted").length, 0);
+  });
+
+  it("preserves one terminal concession after a transient reroute", async () => {
+    const { db, runId, producerId, consumerId } = await insertRun();
+    const prepareNextAttempt = () => {
+      db.prepare("UPDATE steps SET status = 'done', output = 'STATUS: done' WHERE id = ?").run(producerId);
+      db.prepare("UPDATE steps SET status = 'running' WHERE id = ?").run(consumerId);
+    };
+
+    assert.equal(
+      (await failStep(consumerId, "Target moved\nFAILURE_CLASS: target_moved")).status,
+      "rerouted",
+    );
+    let counts = db.prepare(
+      "SELECT reroute_count, terminal_reroute_count FROM steps WHERE id = ?",
+    ).get(consumerId) as { reroute_count: number; terminal_reroute_count: number };
+    assert.equal(counts.reroute_count, 1);
+    assert.equal(counts.terminal_reroute_count, 0);
+
+    prepareNextAttempt();
+    assert.equal(
+      (await failStep(consumerId, "First terminal refusal\nFAILURE_CLASS: refused_permanent")).status,
+      "rerouted",
+    );
+    counts = db.prepare(
+      "SELECT reroute_count, terminal_reroute_count FROM steps WHERE id = ?",
+    ).get(consumerId) as { reroute_count: number; terminal_reroute_count: number };
+    assert.equal(counts.reroute_count, 2);
+    assert.equal(counts.terminal_reroute_count, 1);
+
+    prepareNextAttempt();
+    const reason = "Second terminal refusal\nFAILURE_CLASS: refused_permanent";
+    assert.equal((await failStep(consumerId, reason)).status, "failed");
+    const terminal = db.prepare(
+      "SELECT status, output, reroute_count, terminal_reroute_count FROM steps WHERE id = ?",
+    ).get(consumerId) as {
+      status: string;
+      output: string;
+      reroute_count: number;
+      terminal_reroute_count: number;
+    };
+    assert.equal(terminal.status, "failed");
+    assert.equal(terminal.output, reason);
+    assert.equal(terminal.reroute_count, 2);
+    assert.equal(terminal.terminal_reroute_count, 1);
+    assert.equal(
+      (db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string }).status,
+      "failed",
+    );
   });
 });

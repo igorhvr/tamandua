@@ -181,7 +181,7 @@ export function listRuns(limit = 50): RunInfo[] {
 
   return rows.map((r) => {
     const stepSummary = getStepSummary(db, r.id);
-    const redLedgerLanding = getRedLedgerLanding(r.id);
+    const redLedgerLanding = r.workflow_id.includes("merge") ? getRedLedgerLanding(r.id) : undefined;
     return {
       id: r.id,
       runNumber: r.run_number ?? undefined,
@@ -472,7 +472,7 @@ function getStepSummary(db: ReturnType<typeof getDb>, runId: string): string {
 }
 
 function getRedLedgerLanding(runId: string): RedLedgerLanding | undefined {
-  const events = getRunEvents(runId);
+  const events = getRunEvents(runId, 50);
   for (let i = events.length - 1; i >= 0; i--) {
     const event = events[i];
     if (
@@ -552,7 +552,7 @@ function buildRunDetail(
   }));
 
   const stepSummary = getStepSummary(db, row.id);
-  const redLedgerLanding = getRedLedgerLanding(row.id);
+  const redLedgerLanding = row.workflow_id.includes("merge") ? getRedLedgerLanding(row.id) : undefined;
 
   // Enrich with worktree information when workspace_mode is 'worktree'
   let workspaceMode: string | undefined;

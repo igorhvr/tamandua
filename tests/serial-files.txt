@@ -18,7 +18,6 @@ src/cli/commands/logs.test.ts
 src/cli/commands/mcp.test.ts
 src/cli/commands/merge-branch.test.ts
 src/cli/commands/restart.test.ts
-src/cli/commands/standalone.test.ts
 src/cli/commands/status.test.ts
 src/cli/commands/step.test.ts
 src/cli/commands/wait.test.ts

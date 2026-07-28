@@ -838,23 +838,41 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
   );
 
   it(
-    "RAMP bug-fix-merge-worktree: a second permanent refusal fails verbatim after exactly one reroute",
+    "RAMP bug-fix-merge-worktree: transient recovery does not consume the one permanent-refusal concession",
     { timeout: 240_000 },
     async () => {
       let ctx: ScriptedRunContext | undefined;
       try {
+        const targetMovedReason = "target moved before landing\nFAILURE_CLASS: target_moved";
         const refusalReason = [
           "Landing refused by repository policy.",
           "FAILURE_CLASS: refused_permanent",
           "Required approval is absent; automated landing remains prohibited.",
         ].join("\n");
+        const targetMovedCommand = [
+          "set -e",
+          'origin="{{input.WORKTREE_ORIGIN_REPOSITORY}}"',
+          'target="refs/heads/{{input.ORIGINAL_BRANCH}}"',
+          'expected_tip=$(git -C "$origin" rev-parse "$target")',
+          `"${process.execPath}" "${cliPath}" merge-branch --origin "$origin" --branch "cdet-target-marker" --into "{{input.ORIGINAL_BRANCH}}" --expect-tip "$expected_tip" --message "test: advance target before composed refusal history"`,
+          "set +e",
+          `TAMANDUA_RUN_ID="{{input.RUN_ID}}" "${process.execPath}" "${cliPath}" merge-branch --origin "$origin" --branch "${BRANCH}" --into "{{input.ORIGINAL_BRANCH}}" --expect-tip "$expected_tip" --message "fix: composed reroute history (squash of ${BRANCH})"`,
+          "merge_exit=$?",
+          "set -e",
+          'test "$merge_exit" -eq 2',
+        ].join("; ");
         const refusedBehaviors: ScriptedAgentConfig = {
           agents: {
             ...bugFixBehaviors.agents,
             verifier: {
-              output: "STATUS: done\nVERIFIED: feature tree revalidated after permanent refusal\nTESTED_TREE: scripted-tree-after-refusal",
+              output: "STATUS: done\nVERIFIED: feature tree revalidated after classified failure\nTESTED_TREE: scripted-tree-after-reroute",
             },
             merger: [
+              {
+                commands: [targetMovedCommand],
+                stepAction: "fail",
+                failReason: targetMovedReason,
+              },
               { stepAction: "fail", failReason: refusalReason },
               { stepAction: "fail", failReason: refusalReason },
             ],
@@ -863,7 +881,14 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
 
         ctx = await startScriptedEnvironment("bug-fix-merge-worktree", refusedBehaviors);
         const repoDir = prepareGitRepo(fixtureDir, path.join(ctx.env.root, "origin-repo"));
-        const { branch: originalBranch } = detachOriginCheckout(repoDir);
+        const originalBranch = execSync("git symbolic-ref --short HEAD", { cwd: repoDir, encoding: "utf-8" }).trim();
+        execSync("git switch -c cdet-target-marker", { cwd: repoDir, encoding: "utf-8" });
+        fs.writeFileSync(path.join(repoDir, "contention-marker.txt"), "independent target update\n", "utf-8");
+        execSync("git add contention-marker.txt && git commit -m 'test: prepare independent target update'", {
+          cwd: repoDir,
+          encoding: "utf-8",
+        });
+        execSync(`git switch "${originalBranch}"`, { cwd: repoDir, encoding: "utf-8" });
         const runIdPrefix = await spawnWorkflowRun(
           [
             "workflow", "run", "bug-fix-merge-worktree",
@@ -877,32 +902,40 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
 
         const status = await waitForRun(ctx, runId, 200_000);
         assert.equal(status, "failed", `run should fail after the second permanent refusal\n${diagnostics(ctx)}`);
-        assert.equal(ctx.scripted.workInvocations("verifier").length, 2, "only one refusal revalidation should run");
-        assert.equal(ctx.scripted.workInvocations("merger").length, 2, "a third merger attempt must not run");
+        assert.equal(ctx.scripted.workInvocations("verifier").length, 3, "transient and first terminal failures should revalidate");
+        assert.equal(ctx.scripted.workInvocations("merger").length, 3, "the second terminal failure must not reroute again");
 
         const run = dbRow<{ status: string }>(ctx.env.tamanduaDir, "SELECT status FROM runs WHERE id = ?", runId);
         assert.equal(run.status, "failed");
-        const mergeStep = dbRow<{ status: string; output: string; reroute_count: number }>(
+        const mergeStep = dbRow<{ status: string; output: string; reroute_count: number; terminal_reroute_count: number }>(
           ctx.env.tamanduaDir,
-          "SELECT status, output, reroute_count FROM steps WHERE run_id = ? AND step_id = 'finalize_merge'",
+          "SELECT status, output, reroute_count, terminal_reroute_count FROM steps WHERE run_id = ? AND step_id = 'finalize_merge'",
           runId,
         );
         assert.equal(mergeStep.status, "failed");
         assert.equal(mergeStep.output, refusalReason);
-        assert.equal(mergeStep.reroute_count, 1);
+        assert.equal(mergeStep.reroute_count, 2, "aggregate count should include the transient and terminal reroutes");
+        assert.equal(mergeStep.terminal_reroute_count, 1, "only the first permanent refusal should consume the terminal concession");
 
         const events = readRunEvents(ctx.env.tamanduaDir, runId);
         const rerouted = events.filter((event) => event.event === "step.rerouted");
-        assert.equal(rerouted.length, 1, "the first permanent refusal should be the only reroute");
-        assert.equal(rerouted[0].stepId, "finalize_merge");
-        assert.match(String(rerouted[0].detail), /verify/);
-        assert.ok(String(rerouted[0].detail).includes(refusalReason));
+        assert.equal(rerouted.length, 2, "target movement and the first permanent refusal should each reroute once");
+        assert.deepEqual(rerouted.map((event) => event.stepId), ["finalize_merge", "finalize_merge"]);
+        assert.ok(String(rerouted[0].detail).includes(targetMovedReason));
+        assert.ok(String(rerouted[1].detail).includes(refusalReason));
         const stepFailed = events.filter((event) => event.event === "step.failed");
         const runFailed = events.filter((event) => event.event === "run.failed");
         assert.equal(stepFailed.length, 1);
         assert.equal(runFailed.length, 1);
         assert.equal(stepFailed[0].detail, refusalReason);
         assert.equal(runFailed[0].detail, refusalReason);
+        assert.equal(
+          execSync(`git show "refs/heads/${originalBranch}:contention-marker.txt"`, {
+            cwd: repoDir,
+            encoding: "utf-8",
+          }),
+          "independent target update\n",
+        );
       } finally {
         await teardown(ctx);
       }

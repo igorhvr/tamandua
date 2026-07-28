@@ -5,7 +5,7 @@ import { assertStatePathIsolation } from "./lib/test-guard.js";
 import { LEDGER_RETENTION_MS } from "./suite/config.js";
 
 // Any change to migrate() MUST bump SCHEMA_VERSION. Missing a bump causes broken DBs.
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 // Counter for tests — increments each time migrate() runs the full DDL path.
 export let _migrateFullRuns = 0;
@@ -174,6 +174,12 @@ function migrate(db: DatabaseSync): void {
   // Used to enforce the max_reroutes budget; NULL/0 means no reroute has happened.
   if (!stepColNames.has("reroute_count")) {
     db.exec("ALTER TABLE steps ADD COLUMN reroute_count INTEGER DEFAULT 0");
+  }
+
+  // Terminal-class reroutes have a separate one-concession budget. General
+  // reroutes still count every retry_step traversal for max_reroutes.
+  if (!stepColNames.has("terminal_reroute_count")) {
+    db.exec("ALTER TABLE steps ADD COLUMN terminal_reroute_count INTEGER DEFAULT 0");
   }
 
   // ── RETR claim invalidation marker ──

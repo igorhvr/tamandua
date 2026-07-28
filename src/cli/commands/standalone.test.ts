@@ -1,18 +1,109 @@
 import assert from "node:assert/strict";
-import { describe, it } from "node:test";
+import { describe, it, mock } from "node:test";
+import { fileURLToPath } from "node:url";
 
-import {
-  getNudgeHelp,
-  getSkillPathHelp,
-  getSourcePathHelp,
-  getTamanduaHelp,
-  getUpdateHelp,
-  getVersionHelp,
-  handleStandalone,
-} from "../../../dist/cli/commands/standalone.js";
+const updateSpecifier = fileURLToPath(
+  new URL("../../../dist/cli/update.js", import.meta.url),
+);
 
 describe("SPL2 standalone command module", () => {
-  it("owns help for every standalone command", () => {
+  // Handler-level update exit code tests with stubbed runUpdate.
+  // Uses mock.module so we can verify the exit-code dispatch in
+  // handleStandalone without exercising the real update pipeline.
+  // The mock is installed BEFORE standalone.js is imported so that
+  // the live ESM binding to runUpdate resolves to our stub.
+  describe("update exit codes (handler-level, with stubbed runUpdate)", () => {
+    let mockResult: any;
+
+    // Guard: mock.module requires --experimental-test-module-mocks.
+    // Without it, skip these tests rather than erroring.
+    const hasMockModule = typeof mock.module === "function";
+
+    if (hasMockModule) {
+      mock.module(updateSpecifier, {
+        exports: {
+          runUpdate: async () => mockResult,
+        },
+      });
+    }
+
+    it("maps blocked_active_runs, refused_diverged, pull_failed to exitCode 1", {
+      skip: !hasMockModule ? "requires --experimental-test-module-mocks" : undefined,
+    }, async () => {
+      const { handleStandalone } = await import(
+        "../../../dist/cli/commands/standalone.js"
+      );
+
+      const failureStatuses: Array<{ status: string } & Record<string, any>> = [
+        { status: "blocked_active_runs", sourcePath: "", beforeHead: "", afterHead: "", activeRuns: [] },
+        { status: "refused_diverged", sourcePath: "", head: "" },
+        { status: "pull_failed", sourcePath: "", head: "", error: "network failure" },
+      ];
+
+      for (const result of failureStatuses) {
+        mockResult = result;
+        process.exitCode = 0;
+        await handleStandalone("update", ["update"]);
+        assert.equal(
+          process.exitCode,
+          1,
+          `${result.status} should set exitCode=1, got ${process.exitCode}`,
+        );
+      }
+      process.exitCode = 0;
+    });
+
+    it("maps no_change, updated to exitCode 0", {
+      skip: !hasMockModule ? "requires --experimental-test-module-mocks" : undefined,
+    }, async () => {
+      const { handleStandalone } = await import(
+        "../../../dist/cli/commands/standalone.js"
+      );
+
+      // no_change
+      mockResult = { status: "no_change", sourcePath: "", head: "" };
+      process.exitCode = 0;
+      await handleStandalone("update", ["update"]);
+      assert.equal(
+        process.exitCode,
+        0,
+        `no_change should leave exitCode=0, got ${process.exitCode}`,
+      );
+
+      // updated
+      mockResult = {
+        status: "updated",
+        sourcePath: "",
+        beforeHead: "",
+        afterHead: "",
+        services: {
+          daemon: { running: false, pid: null, port: 0 },
+          dashboard: { running: false, pid: null, port: 0 },
+          mcp: { running: false, pid: null, port: 0 },
+        },
+        installedWorkflows: [],
+      };
+      process.exitCode = 0;
+      await handleStandalone("update", ["update"]);
+      assert.equal(
+        process.exitCode,
+        0,
+        `updated should leave exitCode=0, got ${process.exitCode}`,
+      );
+
+      process.exitCode = 0;
+    });
+  });
+
+  it("owns help for every standalone command", async () => {
+    const {
+      getTamanduaHelp,
+      getVersionHelp,
+      getSkillPathHelp,
+      getSourcePathHelp,
+      getUpdateHelp,
+      getNudgeHelp,
+    } = await import("../../../dist/cli/commands/standalone.js");
     assert.match(getTamanduaHelp(), /tamandua tamandua/);
     assert.match(getVersionHelp(), /tamandua --version/);
     assert.match(getSkillPathHelp(), /tamandua skill-path/);
@@ -22,32 +113,9 @@ describe("SPL2 standalone command module", () => {
   });
 
   it("declines commands owned by other command groups", async () => {
+    const { handleStandalone } = await import(
+      "../../../dist/cli/commands/standalone.js"
+    );
     assert.equal(await handleStandalone("doctor", ["doctor"]), false);
-  });
-
-  /**
-   * Verifies the exit code dispatch condition in the standalone handler.
-   *
-   * The handler sets process.exitCode = 1 for both blocked_active_runs
-   * and refused_diverged statuses. This is the condition that fix 1 added.
-   *
-   * The actual runtime behavior is tested end-to-end by the real-git
-   * fixture tests in update.test.ts (which exercise runUpdate through
-   * refusal, divergence, and network failure paths).
-   */
-  it("maps both blocked_active_runs and refused_diverged to exit code 1", async () => {
-    const { readFileSync } = await import("node:fs");
-    const path = await import("node:path");
-    const { fileURLToPath } = await import("node:url");
-    const standaloneJs = readFileSync(
-      path.join(path.dirname(fileURLToPath(import.meta.url)), "../../../dist/cli/commands/standalone.js"),
-      "utf-8",
-    );
-
-    // The condition must include both failure statuses
-    assert.ok(
-      standaloneJs.includes("blocked_active_runs") && standaloneJs.includes("refused_diverged"),
-      "standalone.js must check both blocked_active_runs AND refused_diverged for exitCode=1",
-    );
   });
 });

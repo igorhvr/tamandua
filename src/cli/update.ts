@@ -64,6 +64,7 @@ export type UpdateResult =
   | { status: "no_change"; sourcePath: string; head: string }
   | { status: "blocked_active_runs"; sourcePath: string; beforeHead: string; afterHead: string; activeRuns: ActiveRunInfo[] }
   | { status: "refused_diverged"; sourcePath: string; head: string }
+  | { status: "pull_failed"; sourcePath: string; head: string; error: string }
   | { status: "updated"; sourcePath: string; beforeHead: string; afterHead: string; services: UpdateServiceSnapshot; installedWorkflows: string[] };
 
 export interface RunUpdateOptions {
@@ -146,7 +147,8 @@ export const defaultRunCommand: RunCommand = (command, args, options) => (
         return;
       }
       const suffix = signal ? `signal ${signal}` : `exit code ${code ?? "unknown"}`;
-      reject(new Error(`Command failed (${suffix}): ${[command, ...args].join(" ")}`));
+      const stderrSuffix = stderr ? `\n${stderr.trim()}` : "";
+      reject(new Error(`Command failed (${suffix}): ${[command, ...args].join(" ")}${stderrSuffix}`));
     });
   })
 );
@@ -376,10 +378,10 @@ export async function runUpdate(options: RunUpdateOptions = {}): Promise<UpdateR
       // With --force: proceed with rebuild-only, but say what actually happened
       output.log(`skipping pull: pull failed — rebuilding current checkout as-is (${pullError})`);
     } else {
-      // Pull failed for non-divergence reason, no --force
+      // Pull failed for non-divergence reason (network, auth, missing upstream), no --force
       output.warn(`git pull failed: ${pullError}`);
       output.warn("Aborting update. Fix the pull failure or run `tamandua update --force` to rebuild the current checkout as-is.");
-      return { status: "refused_diverged", sourcePath, head: beforeHead };
+      return { status: "pull_failed", sourcePath, head: beforeHead, error: pullError };
     }
   }
 

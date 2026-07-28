@@ -75,4 +75,28 @@ describe("red-ledger landing status model", () => {
     assert.equal("redLedgerLanding" in getWorkflowStatus("green-run"), false);
     assert.equal("redLedgerLanding" in listRuns()[0], false);
   });
+
+  it("skips red-ledger lookup for non-merge runs even when events exist", () => {
+    const db = getDb();
+    const runId = "non-merge-red-run";
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    ).run(runId, "feature-dev-worktree", "Non-merge run with red event", "completed", "{}", "2026-07-26T20:00:00.000Z", "2026-07-26T20:00:01.000Z");
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, type, status, output, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    ).run("nonmerge-step", runId, "implement", "developer", 0, "Implement", "STATUS: done", "single", "done", "some output", "2026-07-26T20:00:00.000Z", "2026-07-26T20:00:01.000Z");
+    emitEvent({
+      ts: "2026-07-26T20:00:01.000Z",
+      event: "merge.landed_over_red_suite",
+      runId,
+      ledgerRowId: 99,
+      exitCode: 3,
+      ledgerCreatedAt: "2026-07-26T20:00:00.000Z",
+    });
+
+    // Non-merge run should NOT have redLedgerLanding even though the event exists
+    const detail = getWorkflowStatus(runId);
+    assert.equal("redLedgerLanding" in detail, false, "getWorkflowStatus should omit redLedgerLanding for non-merge runs");
+    assert.equal("redLedgerLanding" in listRuns()[0], false, "listRuns should omit redLedgerLanding for non-merge runs");
+  });
 });

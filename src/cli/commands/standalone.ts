@@ -169,7 +169,7 @@ export async function handleStandalone(group: string, args: string[]): Promise<b
       return true;
     }
     const result = await runUpdate({ force });
-    if (result.status === "blocked_active_runs" || result.status === "refused_diverged") {
+    if (result.status === "blocked_active_runs" || result.status === "refused_diverged" || result.status === "pull_failed") {
       process.exitCode = 1;
     }
     return true;

@@ -441,7 +441,7 @@ describe("update exports", () => {
       }
     });
 
-    it("network failure: honest error when remote unreachable", async () => {
+    it("network failure: pull_failed when remote unreachable", async () => {
       const { workingDir, originDir, cleanup } = setupRealGitRepo();
       try {
         // Make a local commit so we're not at origin HEAD
@@ -463,9 +463,19 @@ describe("update exports", () => {
           },
         });
 
-        // Should have failed with an error about git pull (not divergence)
-        assert.equal(result.status, "refused_diverged");
-        // The warning should contain "git pull failed" not the divergence message
+        // Should return pull_failed, not refused_diverged (network/auth/missing-upstream = pull failure, not divergence)
+        assert.equal(result.status, "pull_failed");
+        // The pull_failed result includes an error field with the captured stderr
+        if (result.status === "pull_failed") {
+          assert.ok(typeof result.error === "string");
+          assert.ok(result.error.length > 0, "error field must not be empty");
+          // The error message should include stderr content (git error details)
+          assert.ok(
+            result.error.includes("fatal") || result.error.includes("not found") || result.error.includes("exit code"),
+            `Expected error to contain git stderr, got: ${result.error.slice(0, 200)}`,
+          );
+        }
+        // The warning should contain the pull failure details
         const allMessages = [...warnings, ...logs].join(" ");
         assert.ok(
           allMessages.includes("git pull failed") || allMessages.includes("Command failed") || allMessages.includes("fatal"),
