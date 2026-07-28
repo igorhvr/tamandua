@@ -1443,10 +1443,17 @@ try {
 
       fs.writeFileSync(scriptPath, testRunnerContent.join("\n") + runnerBody, "utf-8");
 
+      // Build env explicitly (do not spread `process.env`) so the
+      // test-isolation guard pattern checker does not flag this file.
+      const childEnv: Record<string, string> = { HOME: tempHome };
+      for (const k of ["PATH", "TMPDIR", "TMP", "TEMP", "SHELL", "USER", "LANG", "LC_ALL"]) {
+        const v = process.env[k];
+        if (v !== undefined) childEnv[k] = v;
+      }
       const result = spawnSync("node", ["--no-warnings", scriptPath], {
         encoding: "utf-8",
         stdio: ["ignore", "pipe", "pipe"],
-        env: { ...process.env, HOME: tempHome },
+        env: childEnv,
         timeout: 30000,
       });
 

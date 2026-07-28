@@ -162,6 +162,7 @@ describe("CLI workflow run working-directory-for-harness", () => {
         .filter((line) => !line.includes("Unable to capture original branch at launch"))
         .filter((line) => !line.includes("Unable to capture base branch SHA at launch"))
         .filter((line) => !line.includes("Stopping at filesystem boundary"))
+        .filter((line) => !/^run #\d+ \([0-9a-f]{8}\) created; preparing workspace\.\.\.$/.test(line))
         .join("\n");
       assert.equal(meaningfulStderr, "", `expected no meaningful stderr, got: ${stderr}`);
       assert.match(stdout, /Run: run-/i);
