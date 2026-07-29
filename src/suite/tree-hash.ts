@@ -74,6 +74,96 @@ export function computeTreeHash(repoDir: string): string | null {
 }
 
 /**
+ * Compute the committed tree hash of HEAD.
+ *
+ * Runs `git rev-parse HEAD^{tree}` — a read-only operation that requires
+ * no temporary index. Returns the trimmed tree hash, or `null` on any
+ * git failure (non-git dir, empty repo with no commits, spawn failure).
+ *
+ * @param repoDir - Path to the git repository.
+ * @returns The tree hash (40 hex chars), or `null` on failure.
+ */
+export function committedTreeHash(repoDir: string): string | null {
+  try {
+    const result = spawnSync("git", ["rev-parse", "HEAD^{tree}"], {
+      cwd: repoDir,
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 30_000,
+    });
+    if (result.status !== 0) return null;
+    return result.stdout.trim();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Compute a git tree hash over tracked content only (HEAD + modifications
+ * to already-tracked paths), using a temporary GIT_INDEX_FILE.
+ *
+ * Uses `git read-tree HEAD`, `git add -u` (NOT `-A` — updates only
+ * already-tracked paths, ignores untracked files), then `git write-tree`.
+ *
+ * R2: MUST NOT touch the repository's real index or working tree.
+ * R3: If git fails for ANY reason, returns `null`.
+ *
+ * @param repoDir - Path to the git repository (worktree or main).
+ * @returns The tree hash (40 hex chars), or `null` on failure.
+ */
+export function trackedTreeHash(repoDir: string): string | null {
+  const tempIndex = join(tmpdir(), `tamandua-tstx-index-${randomUUID()}`);
+
+  try {
+    // R2: Use a temporary index file — never touch the real index.
+    const env = { ...process.env, GIT_INDEX_FILE: tempIndex };
+
+    // 1. Read HEAD into the temporary index.
+    const readTree = spawnSync("git", ["read-tree", "HEAD"], {
+      cwd: repoDir,
+      env,
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 30_000,
+    });
+    if (readTree.status !== 0) return null; // R3: passthrough fallback
+
+    // 2. Update only already-tracked paths (modifications + deletions).
+    //    `-u` ignores untracked files — the key distinction from computeTreeHash.
+    const addTracked = spawnSync("git", ["add", "-u"], {
+      cwd: repoDir,
+      env,
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 30_000,
+    });
+    if (addTracked.status !== 0) return null; // R3: passthrough fallback
+
+    // 3. Write the tree.
+    const writeTree = spawnSync("git", ["write-tree"], {
+      cwd: repoDir,
+      env,
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 30_000,
+    });
+    if (writeTree.status !== 0) return null; // R3: passthrough fallback
+
+    return writeTree.stdout.trim();
+  } catch {
+    return null; // R3: any unexpected error → passthrough
+  } finally {
+    // Clean up temp index regardless of outcome.
+    try {
+      unlinkSync(tempIndex);
+    } catch {
+      // Best-effort cleanup — temp file may not exist if git never
+      // wrote to it.
+    }
+  }
+}
+
+/**
  * Compute the SHA-256 hash of the exact test command string bytes,
  * with no normalization.
  *

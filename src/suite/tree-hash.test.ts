@@ -222,6 +222,279 @@ describe("computeTreeHash", () => {
   });
 });
 
+describe("committedTreeHash", () => {
+  const th = createTempHome("tamandua-committed-hash-test-");
+  let repoDir: string;
+
+  before(() => {
+    repoDir = th.root;
+    execSync("git init", { cwd: repoDir });
+    execSync("git config user.email test@test.com", { cwd: repoDir });
+    execSync("git config user.name Test", { cwd: repoDir });
+    writeFileSync(join(repoDir, "README.md"), "# Test Repo\n");
+    execSync("git add README.md", { cwd: repoDir });
+    execSync("git commit -m init", { cwd: repoDir });
+  });
+
+  after(() => {
+    // createTempHome handles cleanup via after()
+  });
+
+  it("equals shelling git rev-parse HEAD^{tree} on a committed fixture", async () => {
+    const { committedTreeHash } = await import(
+      "../../dist/suite/tree-hash.js"
+    );
+    const expected = execSync("git rev-parse HEAD^{tree}", {
+      cwd: repoDir,
+      encoding: "utf-8",
+    }).trim();
+    const hash = committedTreeHash(repoDir);
+    assert.equal(hash, expected, "should equal git rev-parse HEAD^{tree}");
+  });
+
+  it("returns null on a non-git directory", async () => {
+    const { committedTreeHash } = await import(
+      "../../dist/suite/tree-hash.js"
+    );
+    const nonGitDir = createTempHome("tamandua-no-git-committed-").root;
+    try {
+      const hash = committedTreeHash(nonGitDir);
+      assert.equal(hash, null, "non-git directory should return null");
+    } finally {
+      // createTempHome handles cleanup via after()
+    }
+  });
+
+  it("returns null on a repo with no commits", async () => {
+    const { committedTreeHash } = await import(
+      "../../dist/suite/tree-hash.js"
+    );
+    const emptyRepo = createTempHome("tamandua-empty-repo-").root;
+    try {
+      execSync("git init", { cwd: emptyRepo });
+      const hash = committedTreeHash(emptyRepo);
+      assert.equal(hash, null, "empty repo should return null");
+    } finally {
+      // createTempHome handles cleanup via after()
+    }
+  });
+});
+
+describe("trackedTreeHash", () => {
+  const th = createTempHome("tamandua-tracked-hash-test-");
+  let repoDir: string;
+
+  before(() => {
+    repoDir = th.root;
+    execSync("git init", { cwd: repoDir });
+    execSync("git config user.email test@test.com", { cwd: repoDir });
+    execSync("git config user.name Test", { cwd: repoDir });
+    writeFileSync(join(repoDir, "README.md"), "# Test Repo\n");
+    writeFileSync(join(repoDir, "src.ts"), "const x = 1;\n");
+    execSync("git add README.md src.ts", { cwd: repoDir });
+    execSync("git commit -m init", { cwd: repoDir });
+  });
+
+  after(() => {
+    // createTempHome handles cleanup via after()
+  });
+
+  it("== committedTreeHash on a clean tree", async () => {
+    const { trackedTreeHash, committedTreeHash } = await import(
+      "../../dist/suite/tree-hash.js"
+    );
+    const committed = committedTreeHash(repoDir);
+    const tracked = trackedTreeHash(repoDir);
+    assert.ok(committed, "committed hash should be non-null");
+    assert.ok(tracked, "tracked hash should be non-null");
+    assert.equal(tracked, committed, "clean tree should match");
+  });
+
+  it("== committedTreeHash when untracked non-ignored file present (add -u ignores untracked)", async () => {
+    const { trackedTreeHash, committedTreeHash } = await import(
+      "../../dist/suite/tree-hash.js"
+    );
+    // Add an untracked, non-ignored file.
+    writeFileSync(join(repoDir, "untracked.txt"), "not tracked\n");
+
+    const committed = committedTreeHash(repoDir);
+    const tracked = trackedTreeHash(repoDir);
+    assert.ok(committed, "committed hash should be non-null");
+    assert.ok(tracked, "tracked hash should be non-null");
+    assert.equal(
+      tracked,
+      committed,
+      "untracked file should be ignored by trackedTreeHash",
+    );
+  });
+
+  it("DIFFERS from committedTreeHash when a tracked file is modified", async () => {
+    const { trackedTreeHash, committedTreeHash } = await import(
+      "../../dist/suite/tree-hash.js"
+    );
+    writeFileSync(join(repoDir, "README.md"), "# Test Repo\nedited!\n");
+
+    try {
+      const committed = committedTreeHash(repoDir);
+      const tracked = trackedTreeHash(repoDir);
+      assert.ok(committed, "committed hash should be non-null");
+      assert.ok(tracked, "tracked hash should be non-null");
+      assert.notEqual(
+        tracked,
+        committed,
+        "modified tracked file should change hash",
+      );
+    } finally {
+      // Restore clean state for subsequent tests.
+      execSync("git checkout -- README.md", { cwd: repoDir });
+    }
+  });
+
+  it("DIFFERS when a tracked file is deleted", async () => {
+    const { trackedTreeHash, committedTreeHash } = await import(
+      "../../dist/suite/tree-hash.js"
+    );
+    rmSync(join(repoDir, "src.ts"));
+
+    try {
+      const committed = committedTreeHash(repoDir);
+      const tracked = trackedTreeHash(repoDir);
+      assert.ok(committed, "committed hash should be non-null");
+      assert.ok(tracked, "tracked hash should be non-null");
+      assert.notEqual(
+        tracked,
+        committed,
+        "deleted tracked file should change hash",
+      );
+    } finally {
+      // Restore deleted file for subsequent tests.
+      execSync("git checkout -- src.ts", { cwd: repoDir });
+    }
+  });
+
+  it("DIFFERS when a change is staged but uncommitted", async () => {
+    const { trackedTreeHash, committedTreeHash } = await import(
+      "../../dist/suite/tree-hash.js"
+    );
+    // Stage but don't commit.
+    writeFileSync(join(repoDir, "README.md"), "# Test Repo\nstaged change\n");
+    execSync("git add README.md", { cwd: repoDir });
+
+    try {
+      const committed = committedTreeHash(repoDir);
+      const tracked = trackedTreeHash(repoDir);
+      assert.ok(committed, "committed hash should be non-null");
+      assert.ok(tracked, "tracked hash should be non-null");
+      assert.notEqual(
+        tracked,
+        committed,
+        "staged change should differ from committed hash",
+      );
+    } finally {
+      // Unstage and restore file for subsequent tests.
+      execSync("git reset HEAD README.md", { cwd: repoDir });
+      execSync("git checkout -- README.md", { cwd: repoDir });
+    }
+  });
+
+  it("dirty .gitignore'd file leaves trackedTreeHash == committedTreeHash", async () => {
+    const { trackedTreeHash, committedTreeHash } = await import(
+      "../../dist/suite/tree-hash.js"
+    );
+    // Add a .gitignore that covers *.log
+    writeFileSync(join(repoDir, ".gitignore"), "*.log\n");
+    execSync("git add .gitignore", { cwd: repoDir });
+    execSync("git commit -m gitignore", { cwd: repoDir });
+
+    // Create an ignored file.
+    writeFileSync(join(repoDir, "debug.log"), "ignored content\n");
+
+    const committed = committedTreeHash(repoDir);
+    const tracked = trackedTreeHash(repoDir);
+    assert.ok(committed, "committed hash should be non-null");
+    assert.ok(tracked, "tracked hash should be non-null");
+    assert.equal(
+      tracked,
+      committed,
+      "ignored file should not affect trackedTreeHash",
+    );
+  });
+
+  it("returns null on a non-git directory", async () => {
+    const { trackedTreeHash } = await import(
+      "../../dist/suite/tree-hash.js"
+    );
+    const nonGitDir = createTempHome("tamandua-no-git-tracked-").root;
+    try {
+      const hash = trackedTreeHash(nonGitDir);
+      assert.equal(hash, null, "non-git directory should return null");
+    } finally {
+      // createTempHome handles cleanup via after()
+    }
+  });
+});
+
+describe("R2 invariant (committedTreeHash + trackedTreeHash)", () => {
+  const th = createTempHome("tamandua-r2-invariant-test-");
+  let repoDir: string;
+
+  before(() => {
+    repoDir = th.root;
+    execSync("git init", { cwd: repoDir });
+    execSync("git config user.email test@test.com", { cwd: repoDir });
+    execSync("git config user.name Test", { cwd: repoDir });
+    writeFileSync(join(repoDir, "tracked.txt"), "tracked content\n");
+    execSync("git add tracked.txt", { cwd: repoDir });
+    execSync("git commit -m init", { cwd: repoDir });
+
+    // Dirty the working tree: untracked file + modified tracked file.
+    writeFileSync(join(repoDir, "untracked.txt"), "untracked file\n");
+    writeFileSync(join(repoDir, "tracked.txt"), "modified content\n");
+  });
+
+  after(() => {
+    // createTempHome handles cleanup via after()
+  });
+
+  it("git status --porcelain is identical before/after committedTreeHash", async () => {
+    const { committedTreeHash } = await import(
+      "../../dist/suite/tree-hash.js"
+    );
+    const statusBefore = execSync("git status --porcelain", {
+      cwd: repoDir,
+      encoding: "utf-8",
+    });
+
+    const hash = committedTreeHash(repoDir);
+    assert.ok(hash, "should get a valid hash");
+
+    const statusAfter = execSync("git status --porcelain", {
+      cwd: repoDir,
+      encoding: "utf-8",
+    });
+    assert.equal(statusBefore, statusAfter, "committedTreeHash must not modify the real index");
+  });
+
+  it("git status --porcelain is identical before/after trackedTreeHash", async () => {
+    const { trackedTreeHash } = await import(
+      "../../dist/suite/tree-hash.js"
+    );
+    const statusBefore = execSync("git status --porcelain", {
+      cwd: repoDir,
+      encoding: "utf-8",
+    });
+
+    const hash = trackedTreeHash(repoDir);
+    assert.ok(hash, "should get a valid hash");
+
+    const statusAfter = execSync("git status --porcelain", {
+      cwd: repoDir,
+      encoding: "utf-8",
+    });
+    assert.equal(statusBefore, statusAfter, "trackedTreeHash must not modify the real index");
+  });
+});
+
 describe("computeCmdHash", () => {
   it("produces deterministic SHA-256", async () => {
     const { computeCmdHash } = await import(
