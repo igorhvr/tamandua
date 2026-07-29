@@ -134,6 +134,23 @@ describe("failure-class motor routing", () => {
     assert.equal(consumer.terminal_reroute_count, 0);
   });
 
+  it("routes tree_dirty as transient without consuming the terminal concession", async () => {
+    const { db, consumerId } = await insertRun();
+
+    const result = await failStep(
+      consumerId,
+      "Uncommitted tracked changes\nFAILURE_CLASS: tree_dirty\nCommit or discard them",
+    );
+
+    assert.equal(result.status, "rerouted");
+    const consumer = db.prepare(
+      "SELECT status, reroute_count, terminal_reroute_count FROM steps WHERE id = ?",
+    ).get(consumerId) as { status: string; reroute_count: number; terminal_reroute_count: number };
+    assert.equal(consumer.status, "waiting");
+    assert.equal(consumer.reroute_count, 1);
+    assert.equal(consumer.terminal_reroute_count, 0);
+  });
+
   it("uses legacy rerouting for an unknown failure class", async () => {
     const { db, consumerId } = await insertRun(2);
 

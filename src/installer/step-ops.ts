@@ -3378,6 +3378,7 @@ export function archiveRunProgress(runId: string): void {
 const FAILURE_CLASS_VOCABULARY: Record<string, "transient" | "terminal"> = {
   target_moved: "transient",
   conflicts: "transient",
+  tree_dirty: "transient",
   refused_permanent: "terminal",
 };
 

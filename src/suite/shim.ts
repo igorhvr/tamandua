@@ -10,7 +10,7 @@
  * CLI: tamandua-test --repo <path> --run <runId> --step <stepId> [--force] -- <cmd...>
  */
 
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { realpathSync, existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import {
@@ -26,6 +26,8 @@ const SINGLEFLIGHT_POLL_INTERVAL_MS = 1000; // 1s
 const TREE_DRIFT_EXIT_CODE = 86;
 /** Dedicated red-ledger exit for executions interrupted by a catchable signal. */
 const INTERRUPTED_EXIT_CODE = 87;
+/** Dedicated refusal when tracked files are already dirty before testing. */
+const TREE_DIRTY_EXIT_CODE = 88;
 const FORWARDED_SIGNALS: NodeJS.Signals[] = ["SIGHUP", "SIGINT", "SIGQUIT", "SIGTERM"];
 
 // Module-level variables so the catch handler at the bottom can reach the
@@ -102,9 +104,11 @@ Environment:
 A content-addressed test-suite ledger that skips re-execution of test
 commands against byte-identical working trees, replaying the recorded
 result instead. Strictly monotone: degrades to passthrough on any doubt.
-Results are recorded only when the repository tree stays unchanged through
-process exit. Tree drift requires a stable-tree rerun and makes an otherwise
-passing command exit ${TREE_DRIFT_EXIT_CODE}.
+Results are recorded only when tracked repository content stays unchanged
+through process exit. Tree drift requires a stable-tree rerun and makes an
+otherwise passing command exit ${TREE_DRIFT_EXIT_CODE}.
+Uncommitted tracked changes are refused before lookup or execution with exit
+${TREE_DIRTY_EXIT_CODE}; untracked artifacts do not affect ledger evidence.
 Executions interrupted by SIGHUP, SIGINT, SIGQUIT, or SIGTERM terminate their
 child process, record red evidence, and exit ${INTERRUPTED_EXIT_CODE}.
 `);
@@ -142,6 +146,25 @@ function passthroughExec(cmdString: string): void {
     process.stderr.write(`tamandua-test: failed to spawn command: ${err.message}\n`);
     process.exit(1);
   });
+}
+
+function getTrackedDirtyPaths(repoDir: string): string[] | null {
+  try {
+    const result = spawnSync(
+      "git",
+      ["status", "--porcelain", "--untracked-files=no"],
+      {
+        cwd: repoDir,
+        encoding: "utf-8",
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 30_000,
+      },
+    );
+    if (result.status !== 0) return null;
+    return result.stdout.split(/\r?\n/).filter((line) => line.length > 0);
+  } catch {
+    return null;
+  }
 }
 
 // ── Execute & capture ─────────────────────────────────────────────────
@@ -427,14 +450,39 @@ async function main(): Promise<void> {
 
   // ── Dynamic imports for heavy modules (fast startup) ──────────────
 
-  const { computeTreeHash, computeCmdHash, getOriginRepo } = await import("./tree-hash.js");
+  const { committedTreeHash, trackedTreeHash, computeCmdHash, getOriginRepo } = await import("./tree-hash.js");
+  const { formatTrackedDirtyList } = await import("./dirty-list.js");
 
-  // R3: Tree hash failure → passthrough.
-  let preTreeHash = computeTreeHash(repoReal);
+  // R3: Committed or tracked tree hashing failure → passthrough.
+  let preTreeHash = committedTreeHash(repoReal);
   if (preTreeHash === null) {
     passthroughNotice("git tree hash failed (non-git directory or git error)");
     passthroughExec(cmdString);
     return;
+  }
+  if (trackedTreeHash(repoReal) === null) {
+    passthroughNotice("git tracked tree hash failed (non-git directory or git error)");
+    passthroughExec(cmdString);
+    return;
+  }
+
+  // A committed-tree green must never replay while tracked content differs
+  // from that commit. Ignore untracked files by construction.
+  const initialDirtyPaths = getTrackedDirtyPaths(repoReal);
+  if (initialDirtyPaths === null) {
+    passthroughNotice("git tracked status failed");
+    passthroughExec(cmdString);
+    return;
+  }
+  if (initialDirtyPaths.length > 0) {
+    process.stderr.write(
+      `FAILURE_CLASS: tree_dirty\n`
+      + `FAILURE: uncommitted changes to tracked files — commit them before testing\n`
+      + `(the merge gate verifies the committed tree: git rev-parse HEAD^{tree}).\n`
+      + `${formatTrackedDirtyList(initialDirtyPaths, 32)}\n`
+      + `ACTION: commit or discard these, then re-run the suite via the shim.\n`,
+    );
+    process.exit(TREE_DIRTY_EXIT_CODE);
   }
 
   const cmdHash = computeCmdHash(cmdString);
@@ -548,7 +596,7 @@ async function main(): Promise<void> {
   // changed the tree and released it. Re-key before execution so the retained
   // pre-run hash describes the tree that this caller actually tests.
   while (ownsClaim) {
-    const executionTreeHash = computeTreeHash(repoReal);
+    const executionTreeHash = committedTreeHash(repoReal);
     if (executionTreeHash === null || executionTreeHash === preTreeHash) break;
 
     await releaseSuiteKey(originRepo, preTreeHash, cmdHash, ownerToken).catch(() => false);
@@ -604,16 +652,51 @@ async function main(): Promise<void> {
     ownsClaim = currentPoll.ownsClaim === true;
   }
 
+  // A promoted waiter may have spent time behind the prior owner. Refuse if
+  // tracked content became dirty while it waited, before running anything.
+  const executionDirtyPaths = getTrackedDirtyPaths(repoReal);
+  if (executionDirtyPaths === null) {
+    if (ownsClaim) {
+      await releaseSuiteKey(originRepo, preTreeHash, cmdHash, ownerToken).catch(() => false);
+    }
+    passthroughNotice("git tracked status failed before execution");
+    passthroughExec(cmdString);
+    return;
+  }
+  if (executionDirtyPaths.length > 0) {
+    if (ownsClaim) {
+      await releaseSuiteKey(originRepo, preTreeHash, cmdHash, ownerToken).catch(() => false);
+    }
+    process.stderr.write(
+      `FAILURE_CLASS: tree_dirty\n`
+      + `FAILURE: uncommitted changes to tracked files — commit them before testing\n`
+      + `(the merge gate verifies the committed tree: git rev-parse HEAD^{tree}).\n`
+      + `${formatTrackedDirtyList(executionDirtyPaths, 32)}\n`
+      + `ACTION: commit or discard these, then re-run the suite via the shim.\n`,
+    );
+    process.exit(TREE_DIRTY_EXIT_CODE);
+  }
+
+  const trackedPre = trackedTreeHash(repoReal);
+  if (trackedPre === null) {
+    if (ownsClaim) {
+      await releaseSuiteKey(originRepo, preTreeHash, cmdHash, ownerToken).catch(() => false);
+    }
+    passthroughNotice("git tracked tree hash failed before execution");
+    passthroughExec(cmdString);
+    return;
+  }
+
   // R9: Execute the command verbatim, streaming stdout/stderr through,
   //     preserving the exit code.
   const { exitCode, durationMs, output } = await executeAndCapture(cmdString);
 
-  // Reusable evidence requires one byte-identical tree from command start
-  // through full process exit and output capture.
-  const postTreeHash = computeTreeHash(repoReal);
-  if (postTreeHash === null || postTreeHash !== preTreeHash) {
-    const shortPre = preTreeHash.slice(0, 12);
-    const shortPost = postTreeHash?.slice(0, 12) ?? "unavailable";
+  // Reusable evidence requires byte-identical tracked content from command
+  // start through full process exit. Untracked artifacts are irrelevant.
+  const trackedPost = trackedTreeHash(repoReal);
+  if (trackedPost === null || trackedPost !== trackedPre) {
+    const shortPre = trackedPre.slice(0, 12);
+    const shortPost = trackedPost?.slice(0, 12) ?? "unavailable";
     const release = ownsClaim
       ? releaseSuiteKey(originRepo, preTreeHash, cmdHash, ownerToken).catch(() => false)
       : Promise.resolve(false);
@@ -628,7 +711,7 @@ async function main(): Promise<void> {
       // Best-effort observability must not change drift handling.
     });
     await Promise.all([release, event]);
-    const reason = postTreeHash === null
+    const reason = trackedPost === null
       ? `post-run tree hash unavailable (pre ${shortPre})`
       : `tree changed during test execution (pre ${shortPre}, post ${shortPost})`;
     process.stderr.write(

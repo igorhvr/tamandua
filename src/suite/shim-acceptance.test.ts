@@ -435,10 +435,10 @@ describe("TSTX Acceptance Criteria & Monotonicity", { concurrency: 1 }, () => {
   // ────────────────────────────────────────────────────────────────────
 
   it("AC 4: flaky key is visible via GET /suite/flaky after both red and green", async () => {
-    const { computeTreeHash, computeCmdHash, getOriginRepo } = await import(
+    const { committedTreeHash, computeCmdHash, getOriginRepo } = await import(
       "../../dist/suite/tree-hash.js"
     );
-    const treeHash = computeTreeHash(s.repoDir);
+    const treeHash = committedTreeHash(s.repoDir);
     assert.ok(treeHash, "should get tree hash");
     const cmdHash = computeCmdHash(s.failScript);
     const originRepo = getOriginRepo(s.repoDir);
@@ -503,10 +503,10 @@ describe("TSTX Acceptance Criteria & Monotonicity", { concurrency: 1 }, () => {
   });
 
   it("AC 4: FLAKY banner printed on shim invocation when key has both green and red", async () => {
-    const { computeTreeHash, computeCmdHash, getOriginRepo } = await import(
+    const { committedTreeHash, computeCmdHash, getOriginRepo } = await import(
       "../../dist/suite/tree-hash.js"
     );
-    const treeHash = computeTreeHash(s.repoDir);
+    const treeHash = committedTreeHash(s.repoDir);
     assert.ok(treeHash, "should get tree hash");
     const cmdHash = computeCmdHash(s.passScript);
     const originRepo = getOriginRepo(s.repoDir);
@@ -622,10 +622,10 @@ describe("TSTX Acceptance Criteria & Monotonicity", { concurrency: 1 }, () => {
   // ────────────────────────────────────────────────────────────────────
 
   it("R6: recent red entry re-executes with context note", async () => {
-    const { computeTreeHash, computeCmdHash, getOriginRepo } = await import(
+    const { committedTreeHash, computeCmdHash, getOriginRepo } = await import(
       "../../dist/suite/tree-hash.js"
     );
-    const treeHash = computeTreeHash(s.repoDir);
+    const treeHash = committedTreeHash(s.repoDir);
     assert.ok(treeHash, "should get tree hash");
     const cmdHash = computeCmdHash(s.failScript);
     const originRepo = getOriginRepo(s.repoDir);
@@ -660,10 +660,10 @@ describe("TSTX Acceptance Criteria & Monotonicity", { concurrency: 1 }, () => {
   });
 
   it("R6: old red entry (outside window) re-executes without context note", async () => {
-    const { computeTreeHash, computeCmdHash, getOriginRepo } = await import(
+    const { committedTreeHash, computeCmdHash, getOriginRepo } = await import(
       "../../dist/suite/tree-hash.js"
     );
-    const treeHash = computeTreeHash(s.repoDir);
+    const treeHash = committedTreeHash(s.repoDir);
     assert.ok(treeHash, "should get tree hash");
     const cmdHash = computeCmdHash(s.failScript);
     const originRepo = getOriginRepo(s.repoDir);
@@ -696,10 +696,10 @@ describe("TSTX Acceptance Criteria & Monotonicity", { concurrency: 1 }, () => {
   // ────────────────────────────────────────────────────────────────────
 
   it("R6 monotonicity: red entry never causes replay regardless of age or count", async () => {
-    const { computeTreeHash, computeCmdHash, getOriginRepo } = await import(
+    const { committedTreeHash, computeCmdHash, getOriginRepo } = await import(
       "../../dist/suite/tree-hash.js"
     );
-    const treeHash = computeTreeHash(s.repoDir);
+    const treeHash = committedTreeHash(s.repoDir);
     assert.ok(treeHash, "should get tree hash");
     const cmdHash = computeCmdHash(s.passScript);
     const originRepo = getOriginRepo(s.repoDir);
@@ -836,10 +836,10 @@ describe("TSTX Acceptance Criteria & Monotonicity", { concurrency: 1 }, () => {
   });
 
   // ────────────────────────────────────────────────────────────────────
-  // AC 2 extension: untracked-not-ignored file triggers cache miss
+  // Committed-tree evidence ignores untracked-not-ignored files
   // ────────────────────────────────────────────────────────────────────
 
-  it("untracked-not-ignored file change triggers cache miss (AC 2 extension)", async () => {
+  it("untracked-not-ignored file change preserves the committed-tree cache hit", async () => {
     // Prime cache with --force to guarantee execution.
     await runShim(
       ["--repo", s.repoDir, "--run", "r-ac2-untracked", "--step", "s1", "--force", "--", s.passScript],
@@ -856,19 +856,16 @@ describe("TSTX Acceptance Criteria & Monotonicity", { concurrency: 1 }, () => {
       "same tree should replay",
     );
 
-    // Add an untracked, not-ignored file (changes tree hash).
+    // Add untracked junk; the committed tree remains unchanged.
     writeFileSync(join(s.repoDir, "new-test-file.ts"), "const x = 1;\n");
 
-    // Third run: must be cache miss.
+    // Third run: must still replay from the committed-tree key.
     const r3 = await runShim(
       ["--repo", s.repoDir, "--run", "r-ac2-untracked", "--step", "s3", "--", s.passScript],
       s.commandEnv,
     );
     assert.equal(r3.exitCode, 0);
-    assert.ok(
-      !r3.stdout.includes("TAMANDUA-TEST CACHED"),
-      "untracked-not-ignored file must trigger cache miss",
-    );
+    assert.ok(r3.stdout.includes("TAMANDUA-TEST CACHED"), "untracked junk must not change the cache key");
   });
 
   // ────────────────────────────────────────────────────────────────────

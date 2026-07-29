@@ -460,9 +460,9 @@ describe("tamandua-test shim", { concurrency: 1 }, () => {
     );
   });
 
-  // ── AC 2: File edit produces cache miss ───────────────────────────
+  // ── Tracked dirt is refused before cache lookup ───────────────────
 
-  it("file edit produces cache miss and executes the real command (AC 2)", async () => {
+  it("refuses a modified tracked file before replay or execution, then records after commit", async () => {
     const env = shimChildEnv(controlEnv);
 
     // Prime the cache.
@@ -482,19 +482,78 @@ describe("tamandua-test shim", { concurrency: 1 }, () => {
     // Edit a tracked file.
     writeFileSync(join(repoDir, "README.md"), "# Modified\nFile changed!\n");
 
-    // Third run: must be a cache miss (different tree), execute.
+    // Third run: the committed key still has green evidence, but tracked dirt
+    // must be refused before replaying it.
     const r3 = await runShim(
       ["--repo", repoDir, "--run", "r-ac2", "--step", "s3", "--", passScript],
       env,
     );
-    assert.equal(r3.exitCode, 0, "should execute after file edit");
-    assert.ok(
-      !r3.stdout.includes("TAMANDUA-TEST CACHED"),
-      "edited tree must miss cache",
-    );
+    assert.equal(r3.exitCode, 88);
+    assert.doesNotMatch(r3.stdout, /PASS: all tests passed|TAMANDUA-TEST CACHED/);
+    assert.match(r3.stderr, /^FAILURE_CLASS: tree_dirty$/m);
+    assert.match(r3.stderr, /^FAILURE: uncommitted changes to tracked files — commit them before testing$/m);
+    assert.match(r3.stderr, /^\(the merge gate verifies the committed tree: git rev-parse HEAD\^\{tree\}\)\.$/m);
+    assert.match(r3.stderr, /README\.md/);
+    assert.match(r3.stderr, /^ACTION: commit or discard these, then re-run the suite via the shim\.$/m);
 
-    // Restore the file.
-    writeFileSync(join(repoDir, "README.md"), "# Test\n");
+    execSync("git add README.md && git commit -m 'tracked change'", { cwd: repoDir });
+    const r4 = await runShim(
+      ["--repo", repoDir, "--run", "r-ac2", "--step", "s4", "--", passScript],
+      env,
+    );
+    assert.equal(r4.exitCode, 0, "a committed tracked change should execute normally");
+    assert.match(r4.stdout, /PASS: all tests passed/);
+  });
+
+  for (const dirtyCase of ["deleted", "staged"] as const) {
+    it(`refuses a ${dirtyCase} tracked file without executing or recording`, async () => {
+      const fixture = createFixtureRepo(tempBase, `dirty-${dirtyCase}`);
+      const marker = join(tempBase, `dirty-${dirtyCase}.executed`);
+      const script = join(fixture.repoDir, `dirty-${dirtyCase}.sh`);
+      writeFileSync(script, `#!/bin/sh\n: > "${marker}"\nexit 0\n`);
+      chmodSync(script, 0o755);
+      if (dirtyCase === "deleted") {
+        execSync("rm README.md", { cwd: fixture.repoDir });
+      } else {
+        writeFileSync(join(fixture.repoDir, "README.md"), "staged change\n");
+        execSync("git add README.md", { cwd: fixture.repoDir });
+      }
+      const runId = `r-tree-dirty-${dirtyCase}`;
+
+      const result = await runShim(
+        ["--repo", fixture.repoDir, "--run", runId, "--step", "s-dirty", "--", script],
+        shimChildEnv(controlEnv),
+      );
+      assert.equal(result.exitCode, 88);
+      assert.match(result.stderr, /README\.md/);
+      assert.equal(existsSync(marker), false, "dirty refusal must not execute the command");
+      const db = new DatabaseSync(controlEnv.dbPath);
+      const count = db.prepare("SELECT COUNT(*) AS count FROM suite_results WHERE run_id = ?")
+        .get(runId) as { count: number };
+      db.close();
+      assert.equal(count.count, 0);
+    });
+  }
+
+  it("bounds tracked-dirty output at 32 paths with a total summary", async () => {
+    const fixture = createFixtureRepo(tempBase, "dirty-bounded");
+    for (let i = 0; i < 35; i++) {
+      writeFileSync(join(fixture.repoDir, `tracked-${String(i).padStart(2, "0")}.txt`), "clean\n");
+    }
+    execSync("git add . && git commit -m 'tracked files'", { cwd: fixture.repoDir });
+    for (let i = 0; i < 35; i++) {
+      writeFileSync(join(fixture.repoDir, `tracked-${String(i).padStart(2, "0")}.txt`), "dirty\n");
+    }
+
+    const result = await runShim(
+      ["--repo", fixture.repoDir, "--run", "r-tree-dirty-bounded", "--step", "s-dirty", "--", fixture.passScript],
+      shimChildEnv(controlEnv),
+    );
+    assert.equal(result.exitCode, 88);
+    const listed = result.stderr.split("\n").filter((line) => /^ [ MADRCU?!]{2} tracked-/.test(line));
+    assert.equal(listed.length, 32);
+    assert.match(result.stderr, /… and 3 more tracked files not listed here \(35 total\)\./);
+    assert.doesNotMatch(result.stderr, /tracked-34\.txt/);
   });
 
   // ── AC 3: Red recorded → re-executes ──────────────────────────────
@@ -519,11 +578,11 @@ describe("tamandua-test shim", { concurrency: 1 }, () => {
     // Now directly insert a RED record for the same key into the DB
     // to simulate a previous failure.
     const db = new DatabaseSync(controlEnv.dbPath);
-    // Get the tree hash by computing it.
-    const { computeTreeHash, computeCmdHash, getOriginRepo } = await import(
+    // Get the committed tree hash used by the shim.
+    const { committedTreeHash, computeCmdHash, getOriginRepo } = await import(
       "../../dist/suite/tree-hash.js"
     );
-    const treeHash = computeTreeHash(repoDir);
+    const treeHash = committedTreeHash(repoDir);
     assert.ok(treeHash, "should get a tree hash");
     const cmdHash = computeCmdHash(counterScript);
     const originRepo = getOriginRepo(repoDir);
@@ -570,10 +629,10 @@ describe("tamandua-test shim", { concurrency: 1 }, () => {
     const env = shimChildEnv(controlEnv);
 
     // Compute the key.
-    const { computeTreeHash, computeCmdHash, getOriginRepo } = await import(
+    const { committedTreeHash, computeCmdHash, getOriginRepo } = await import(
       "../../dist/suite/tree-hash.js"
     );
-    const treeHash = computeTreeHash(repoDir);
+    const treeHash = committedTreeHash(repoDir);
     assert.ok(treeHash, "should get a tree hash");
     const originRepo = getOriginRepo(repoDir);
 
@@ -661,10 +720,10 @@ describe("tamandua-test shim", { concurrency: 1 }, () => {
     chmodSync(distinctiveFailure, 0o755);
     const runId = "r-stable-red-ledger-unique";
     const stepId = "s-stable-red-ledger-unique";
-    const { computeTreeHash, computeCmdHash, getOriginRepo } = await import(
+    const { committedTreeHash, computeCmdHash, getOriginRepo } = await import(
       "../../dist/suite/tree-hash.js"
     );
-    const treeHash = computeTreeHash(fixture.repoDir);
+    const treeHash = committedTreeHash(fixture.repoDir);
     assert.ok(treeHash, "stable fixture should have a tree hash");
     const cmdHash = computeCmdHash(distinctiveFailure);
     const originRepo = getOriginRepo(fixture.repoDir);
@@ -704,10 +763,10 @@ describe("tamandua-test shim", { concurrency: 1 }, () => {
       chmodSync(script, 0o755);
       const runId = `r-interrupted-${signal.toLowerCase()}`;
       const stepId = `s-interrupted-${signal.toLowerCase()}`;
-      const { computeTreeHash, computeCmdHash, getOriginRepo } = await import(
+      const { committedTreeHash, computeCmdHash, getOriginRepo } = await import(
         "../../dist/suite/tree-hash.js"
       );
-      const treeHash = computeTreeHash(fixture.repoDir);
+      const treeHash = committedTreeHash(fixture.repoDir);
       assert.ok(treeHash);
       const cmdHash = computeCmdHash(script);
       const originRepo = getOriginRepo(fixture.repoDir);
@@ -753,10 +812,10 @@ describe("tamandua-test shim", { concurrency: 1 }, () => {
     writeFileSync(script, `#!/bin/sh\n${scriptBody}\n`);
     chmodSync(script, 0o755);
 
-    const { computeTreeHash, computeCmdHash, getOriginRepo } = await import(
+    const { committedTreeHash, computeCmdHash, getOriginRepo } = await import(
       "../../dist/suite/tree-hash.js"
     );
-    const preTreeHash = computeTreeHash(fixture.repoDir);
+    const preTreeHash = committedTreeHash(fixture.repoDir);
     assert.ok(preTreeHash, "fixture should have a pre-run tree hash");
     const cmdHash = computeCmdHash(script);
     const originRepo = getOriginRepo(fixture.repoDir);
@@ -809,14 +868,36 @@ describe("tamandua-test shim", { concurrency: 1 }, () => {
     assert.equal(claimAction, "run", "released key should be immediately reclaimable");
   });
 
-  it("rejects untracked-not-ignored creation during a successful suite", async () => {
-    const { rowCount, claimAction } = await runTreeMutationCase(
-      "untracked",
-      `printf 'new\\n' > "${join(tempBase, "drift-untracked", "new-file.txt")}"\nexit 0`,
-      86,
+  it("records under the committed tree when a suite creates an untracked file", async () => {
+    const fixture = createFixtureRepo(tempBase, "drift-untracked");
+    const script = join(fixture.repoDir, "create-untracked.sh");
+    writeFileSync(script, `#!/bin/sh\nprintf 'new\\n' > "${join(fixture.repoDir, "new-file.txt")}"\nexit 23\n`);
+    chmodSync(script, 0o755);
+    const { committedTreeHash, computeTreeHash, computeCmdHash, getOriginRepo } = await import("../../dist/suite/tree-hash.js");
+    const expectedTree = committedTreeHash(fixture.repoDir);
+    assert.ok(expectedTree);
+    const revParseTree = execSync("git rev-parse HEAD^{tree}", { cwd: fixture.repoDir, encoding: "utf-8" }).trim();
+    assert.equal(expectedTree, revParseTree);
+    const addAllTree = computeTreeHash(fixture.repoDir);
+    assert.ok(addAllTree);
+    assert.notEqual(addAllTree, expectedTree, "pre-existing untracked script must not enter the ledger key");
+    const runId = "r-tree-drift-untracked";
+
+    const result = await runShim(
+      ["--repo", fixture.repoDir, "--run", runId, "--step", "s-untracked", "--", script],
+      shimChildEnv(controlEnv),
     );
-    assert.equal(rowCount, 0);
-    assert.equal(claimAction, "run");
+    assert.equal(result.exitCode, 23, "untracked generation must preserve the real command exit code");
+
+    const db = new DatabaseSync(controlEnv.dbPath);
+    const rows = db.prepare("SELECT tree_hash, exit_code FROM suite_results WHERE run_id = ?").all(runId) as Array<{ tree_hash: string; exit_code: number }>;
+    db.close();
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0]?.tree_hash, expectedTree);
+    assert.equal(rows[0]?.exit_code, 23);
+    const { lookupSuiteRecord } = await import("../../dist/server/control-client.js");
+    const lookup = await lookupSuiteRecord(getOriginRepo(fixture.repoDir), expectedTree, computeCmdHash(script));
+    assert.equal((lookup?.latest as Record<string, unknown> | null)?.tree_hash, expectedTree);
   });
 
   it("rejects tracked-file deletion during a successful suite", async () => {
@@ -886,6 +967,8 @@ if [ "$n" -eq 1 ]; then
   : > "${ownerStartedFile}"
   while [ ! -f "${releaseOwnerFile}" ]; do sleep 0.05; done
   printf 'owner changed tree\\n' > "${join(fixture.repoDir, "README.md")}"
+  git -C "${fixture.repoDir}" add README.md
+  git -C "${fixture.repoDir}" commit -m 'owner tree change' >/dev/null
 fi
 exit 0
 `);
@@ -929,10 +1012,10 @@ exit 0
       [{ run_id: "r-drift-waiter", exit_code: 0 }],
     );
 
-    const { computeTreeHash, computeCmdHash, getOriginRepo } = await import(
+    const { committedTreeHash, computeCmdHash, getOriginRepo } = await import(
       "../../dist/suite/tree-hash.js"
     );
-    const stableTreeHash = computeTreeHash(fixture.repoDir);
+    const stableTreeHash = committedTreeHash(fixture.repoDir);
     assert.ok(stableTreeHash);
     const thirdClaim = await controlPlanePost("/suite/claim", {
       origin_repo: getOriginRepo(fixture.repoDir),
@@ -960,13 +1043,15 @@ if [ "$n" -eq 1 ]; then
   : > "${ownerStartedFile}"
   while [ ! -f "${mutateOwnerFile}" ]; do sleep 0.05; done
   printf 'owner changed tree\\n' > "${join(fixture.repoDir, "README.md")}"
+  git -C "${fixture.repoDir}" add README.md
+  git -C "${fixture.repoDir}" commit -m 'owner rekey change' >/dev/null
   : > "${ownerMutatedFile}"
   while [ ! -f "${releaseOwnerFile}" ]; do sleep 0.05; done
 fi
 exit 0
 `);
     chmodSync(script, 0o755);
-    const { computeTreeHash, computeCmdHash, getOriginRepo } = await import(
+    const { committedTreeHash, computeCmdHash, getOriginRepo } = await import(
       "../../dist/suite/tree-hash.js"
     );
     const originRepo = getOriginRepo(fixture.repoDir);
@@ -990,7 +1075,7 @@ exit 0
 
     writeFileSync(mutateOwnerFile, "mutate");
     await waitUntil(() => existsSync(ownerMutatedFile));
-    const rekeyedTreeHash = computeTreeHash(fixture.repoDir);
+    const rekeyedTreeHash = committedTreeHash(fixture.repoDir);
     assert.ok(rekeyedTreeHash, "mutated fixture should have a re-keyed tree hash");
     await controlPlanePost("/suite/record", {
       origin_repo: originRepo,
@@ -1086,11 +1171,11 @@ exit 0
       getDb();
       _suiteMigrationDone = true;
     }
-    const { computeTreeHash, computeCmdHash, getOriginRepo } = await import(
+    const { committedTreeHash, computeCmdHash, getOriginRepo } = await import(
       "../../dist/suite/tree-hash.js"
     );
     const originRepo = getOriginRepo(repoDir);
-    const treeHash = computeTreeHash(repoDir);
+    const treeHash = committedTreeHash(repoDir);
     if (!treeHash) return;
     const cmdHash = computeCmdHash(cmd);
     const db = new DatabaseSync(controlEnv.dbPath);
@@ -1154,11 +1239,11 @@ exit 0
     await clearSuiteResultsForCmd(repoDir, counterScript);
     const env = shimChildEnv(controlEnv);
 
-    // Compute the key that the shim will use.
-    const { computeTreeHash, computeCmdHash, getOriginRepo } = await import(
+    // Compute the committed-tree key that the shim will use.
+    const { committedTreeHash, computeCmdHash, getOriginRepo } = await import(
       "../../dist/suite/tree-hash.js"
     );
-    const treeHash = computeTreeHash(repoDir);
+    const treeHash = committedTreeHash(repoDir);
     assert.ok(treeHash, "should get a tree hash");
     const cmdHash = computeCmdHash(counterScript);
     const originRepo = getOriginRepo(repoDir);
@@ -1217,10 +1302,10 @@ exit 0
     await clearSuiteResultsForCmd(repoDir, counterScript);
     const env = shimChildEnv(controlEnv);
 
-    const { computeTreeHash, computeCmdHash, getOriginRepo } = await import(
+    const { committedTreeHash, computeCmdHash, getOriginRepo } = await import(
       "../../dist/suite/tree-hash.js"
     );
-    const treeHash = computeTreeHash(repoDir);
+    const treeHash = committedTreeHash(repoDir);
     assert.ok(treeHash, "should get a tree hash");
     const cmdHash = computeCmdHash(counterScript);
     const originRepo = getOriginRepo(repoDir);
@@ -1282,10 +1367,10 @@ exit 0
     assert.equal(count, 1, "counter should be 1 after priming");
 
     // Compute the key.
-    const { computeTreeHash, computeCmdHash, getOriginRepo } = await import(
+    const { committedTreeHash, computeCmdHash, getOriginRepo } = await import(
       "../../dist/suite/tree-hash.js"
     );
-    const treeHash = computeTreeHash(repoDir);
+    const treeHash = committedTreeHash(repoDir);
     assert.ok(treeHash, "should get a tree hash");
     const cmdHash = computeCmdHash(counterScript);
     const originRepo = getOriginRepo(repoDir);
