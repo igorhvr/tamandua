@@ -3119,28 +3119,6 @@ function completeStepInternal(stepId: string, output: string): { status: string;
     });
   }
 
-  // A second default-mode missing decision demonstrates that the suite
-  // recording path remained unwritable after its one terminal tester pass.
-  // Annotate only the accepted landing; duplicate completions are rejected
-  // above before they can emit another event.
-  if (
-    acceptanceGateDecision.status === "missing"
-    && acceptanceGateDecision.gateMode === "default"
-    && hasTerminalLedgerConcession(step.id)
-  ) {
-    emitEvent({
-      ts: new Date().toISOString(),
-      event: "merge.landed_without_suite_evidence",
-      runId: step.run_id,
-      workflowId: getWorkflowId(step.run_id),
-      stepId: step.step_id,
-      gateMode: acceptanceGateDecision.gateMode,
-      origin: acceptanceGateDecision.originRepo,
-      treeHash: acceptanceGateDecision.treeHash,
-      cmdHash: acceptanceGateDecision.cmdHash,
-    });
-  }
-
   // Single step: mark done and advance
   db.prepare(
     "UPDATE steps SET status = 'done', output = ?, updated_at = datetime('now') WHERE id = ?"
@@ -3560,7 +3538,7 @@ function rerouteWithPolicy(
   writeRerouteFeedbackContext(db, runId, targetStep, error);
 
   // (b) Reset consumer: status=waiting, retry_count=0, increment the general
-  //     counter and, for a terminal-class concession, its dedicated counter.
+  //     counter and, for a terminal-class reroute, its dedicated counter.
   //     Clear output and ownership so it looks like a fresh step.
   db.prepare(
     "UPDATE steps SET status = 'waiting', retry_count = 0, reroute_count = ?, terminal_reroute_count = ?, output = NULL, claim_job_id = NULL, claim_pid = NULL, claim_pgid = NULL, updated_at = datetime('now') WHERE id = ?"
@@ -3640,21 +3618,12 @@ export function isAlreadyLanded(stepId: string, output: string): boolean {
   }
 }
 
-function hasTerminalLedgerConcession(stepId: string): boolean {
-  const row = getDb().prepare(
-    "SELECT terminal_reroute_count FROM steps WHERE id = ?",
-  ).get(stepId) as { terminal_reroute_count: number | null } | undefined;
-  return (row?.terminal_reroute_count ?? 0) >= 1;
-}
-
 function getLedgerGateRefusal(
   stepId: string,
   decision: LedgerGateDecision,
 ): LedgerGateRefusalDecision | null {
   if (decision.status === "missing") {
-    return decision.gateMode === "green" || !hasTerminalLedgerConcession(stepId)
-      ? decision
-      : null;
+    return decision;
   }
   return decision.status === "red" && decision.gateMode === "green"
     ? decision

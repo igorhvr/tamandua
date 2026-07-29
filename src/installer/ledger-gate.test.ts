@@ -7,7 +7,9 @@ import { after, afterEach, before, beforeEach, describe, it } from "node:test";
 import { closeDb, getDb } from "../../dist/db.js";
 import {
   evaluateFinalizeMergeLedgerGate,
+  formatLedgerGateRefusal,
   type LedgerGateDecision,
+  type LedgerGateRefusalDecision,
 } from "../../dist/installer/ledger-gate.js";
 import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
 import { computeCmdHash, getOriginRepo } from "../../dist/suite/tree-hash.js";
@@ -187,5 +189,161 @@ describe("finalize_merge ledger gate evaluator", () => {
       status: "inert",
       reason: "no_test_cmd",
     });
+  });
+});
+
+describe("formatLedgerGateRefusal diagnostics", () => {
+  let fixtureRoot: string;
+  let originRepo: string;
+  let stateDir: string;
+  let originalDbPath: string | undefined;
+  let originalHome: string | undefined;
+  let originalStateDir: string | undefined;
+
+  before(() => {
+    fixtureRoot = tamanduaTempDir("tamandua-refusal-diag-repo-");
+    originRepo = path.join(fixtureRoot, "origin");
+    fs.mkdirSync(originRepo, { recursive: true });
+    execFileSync("git", ["init"], { cwd: originRepo, stdio: "ignore" });
+    execFileSync("git", ["config", "user.email", "refusal-diag@example.test"], { cwd: originRepo });
+    execFileSync("git", ["config", "user.name", "Refusal Diag Test"], { cwd: originRepo });
+    fs.writeFileSync(path.join(originRepo, "README.md"), "fixture\n");
+    execFileSync("git", ["add", "README.md"], { cwd: originRepo });
+    execFileSync("git", ["commit", "-m", "fixture"], { cwd: originRepo, stdio: "ignore" });
+  });
+
+  beforeEach(() => {
+    originalDbPath = process.env.TAMANDUA_DB_PATH;
+    originalHome = process.env.HOME;
+    originalStateDir = process.env.TAMANDUA_STATE_DIR;
+    stateDir = tamanduaTempDir("tamandua-refusal-diag-state-");
+    process.env.HOME = stateDir;
+    process.env.TAMANDUA_STATE_DIR = path.join(stateDir, ".tamandua");
+    process.env.TAMANDUA_DB_PATH = path.join(stateDir, ".tamandua", "tamandua.db");
+    closeDb();
+    getDb();
+  });
+
+  afterEach(() => {
+    closeDb();
+    if (originalDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+    else process.env.TAMANDUA_DB_PATH = originalDbPath;
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+    if (originalStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+    else process.env.TAMANDUA_STATE_DIR = originalStateDir;
+    fs.rmSync(stateDir, { recursive: true, force: true });
+    // Clean up any test detritus from the shared repo
+    try { fs.unlinkSync(path.join(originRepo, "unstaged.txt")); } catch { /* ok */ }
+  });
+
+  after(() => {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  });
+
+  function makeMissingDecision(): LedgerGateRefusalDecision {
+    return {
+      status: "missing",
+      gateMode: "default",
+      originRepo: fs.realpathSync(originRepo),
+      treeHash: "abcdef1234567890abcdef1234567890abcdef12",
+      cmdHash: computeCmdHash(TEST_CMD),
+      testCmd: TEST_CMD,
+    };
+  }
+
+  it("includes WORKSPACE_STATE clean for a clean repo", () => {
+    const decision = makeMissingDecision();
+    const output = formatLedgerGateRefusal(decision);
+    assert.match(output, /^FAILURE_CLASS: refused_permanent$/m);
+    assert.match(output, /^LEDGER_EVIDENCE: missing$/m);
+    assert.match(output, /^WORKSPACE_STATE: clean$/m);
+    assert.match(output, /^ACTION: execute the test suite/m);
+  });
+
+  it("includes WORKSPACE_STATE dirty with file count for a dirty repo", () => {
+    // Make the repo dirty by adding an uncommitted file
+    fs.writeFileSync(path.join(originRepo, "unstaged.txt"), "dirty\n");
+    const decision = makeMissingDecision();
+    const output = formatLedgerGateRefusal(decision);
+    assert.match(output, /^FAILURE_CLASS: refused_permanent$/m);
+    assert.match(output, /^WORKSPACE_STATE: dirty \(1 file: \?\? unstaged.txt\)$/m);
+    assert.match(output, /^Uncommitted changes mean the tested tree/m);
+    assert.match(output, /^ACTION: commit all workspace changes/m);
+  });
+
+  it("includes NEAREST_EVIDENCE none when no suite_results exist", () => {
+    const decision = makeMissingDecision();
+    const output = formatLedgerGateRefusal(decision);
+    assert.match(output, /^NEAREST_EVIDENCE: none for this test command$/m);
+    assert.match(output, /^No recording was ever made/m);
+  });
+
+  it("includes NEAREST_EVIDENCE with matching rows when evidence exists", () => {
+    const db = getDb();
+    const decision = makeMissingDecision();
+    const otherTree = "9999999abcdef9999999abcdef9999999abc";
+    db.prepare(
+      `INSERT INTO suite_results
+         (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, log_tail, run_id, step_id, created_at)
+       VALUES (?, ?, ?, ?, 0, 100, 'log', 'some-run', 'some-step', ?)`,
+    ).run(decision.originRepo, otherTree, decision.cmdHash, TEST_CMD, "2026-07-01T00:00:00.000Z");
+    const output = formatLedgerGateRefusal(decision);
+    assert.match(output, /^NEAREST_EVIDENCE: tree 9999999 exit 0 recorded 2026-07-01/m);
+    assert.match(output, /^Evidence exists for a DIFFERENT tree/m);
+  });
+
+  it("falls back gracefully when git status fails (nonexistent repo)", () => {
+    const decision: LedgerGateRefusalDecision = {
+      status: "missing",
+      gateMode: "default",
+      originRepo: "/nonexistent/path/to/repo",
+      treeHash: "abcdef1234567890abcdef1234567890abcdef12",
+      cmdHash: computeCmdHash(TEST_CMD),
+      testCmd: TEST_CMD,
+    };
+    const output = formatLedgerGateRefusal(decision);
+    assert.match(output, /^FAILURE_CLASS: refused_permanent$/m);
+    assert.match(output, /^WORKSPACE_STATE: unavailable$/m);
+    assert.match(output, /^NEAREST_EVIDENCE: none for this test command$/m);
+    assert.match(output, /^ACTION: ensure the workspace is clean/m);
+  });
+
+  it("format is unchanged for red decisions (diagnostics appended after existing red lines)", () => {
+    const db = getDb();
+    const origin = fs.realpathSync(originRepo);
+    const cmdHash = computeCmdHash(TEST_CMD);
+    const result = db.prepare(
+      `INSERT INTO suite_results
+         (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, log_tail, run_id, step_id, created_at)
+       VALUES (?, ?, ?, ?, 7, 50, 'red-log', 'red-run', 'red-step', '2026-06-15T12:00:00.000Z')`,
+    ).run(origin, "abcdef1234567890abcdef1234567890abcdef12", cmdHash, TEST_CMD);
+    const decision: LedgerGateRefusalDecision = {
+      status: "red",
+      gateMode: "green",
+      originRepo: origin,
+      treeHash: "abcdef1234567890abcdef1234567890abcdef12",
+      cmdHash,
+      testCmd: TEST_CMD,
+      row: {
+        id: Number(result.lastInsertRowid),
+        exitCode: 7,
+        durationMs: 50,
+        logTail: "red-log",
+        runId: "red-run",
+        stepId: "red-step",
+        createdAt: "2026-06-15T12:00:00.000Z",
+      },
+    };
+    const output = formatLedgerGateRefusal(decision);
+    assert.match(output, /^FAILURE_CLASS: refused_permanent$/m);
+    assert.match(output, /^LEDGER_EVIDENCE: red$/m);
+    assert.match(output, /^LEDGER_ROW_ID: \d+$/m);
+    assert.match(output, /^EXIT_CODE: 7$/m);
+    assert.match(output, /^LOG_TAIL: red-log$/m);
+    // Diagnostics are appended after
+    assert.match(output, /^WORKSPACE_STATE: clean$/m);
+    assert.match(output, /^NEAREST_EVIDENCE: tree abcdef1/m);
+    assert.match(output, /^ACTION: execute the test suite/m);
   });
 });

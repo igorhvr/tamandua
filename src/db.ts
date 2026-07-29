@@ -176,7 +176,7 @@ function migrate(db: DatabaseSync): void {
     db.exec("ALTER TABLE steps ADD COLUMN reroute_count INTEGER DEFAULT 0");
   }
 
-  // Terminal-class reroutes have a separate one-concession budget. General
+  // Terminal-class reroutes have a separate dedicated counter. General
   // reroutes still count every retry_step traversal for max_reroutes.
   if (!stepColNames.has("terminal_reroute_count")) {
     db.exec("ALTER TABLE steps ADD COLUMN terminal_reroute_count INTEGER DEFAULT 0");

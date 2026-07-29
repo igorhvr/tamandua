@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { getDb } from "../db.js";
 import { computeCmdHash, getOriginRepo } from "../suite/tree-hash.js";
 
@@ -204,5 +205,106 @@ export function formatLedgerGateRefusal(decision: LedgerGateRefusalDecision): st
     );
   }
 
+  // Append self-diagnosing enrichment. Diagnostics are strictly read-only
+  // (git status + SELECT). Any failure must never prevent or alter the
+  // refusal itself — fall back to the unenriched message.
+  try {
+    lines.push(...buildRefusalDiagnostics(decision));
+  } catch {
+    // diagnostic failure — refuse with the unenriched message
+  }
+
   return lines.join("\n");
+}
+
+/**
+ * Build self-diagnosing enrichment lines for a ledger gate refusal.
+ *
+ * Appends WORKSPACE_STATE, NEAREST_EVIDENCE, and ACTION lines so agent
+ * teams can understand why their suite evidence was rejected and what
+ * corrective action to take.
+ */
+function buildRefusalDiagnostics(decision: LedgerGateRefusalDecision): string[] {
+  const diag: string[] = [];
+
+  // ── WORKSPACE_STATE ──────────────────────────────────────────────────
+  let workspaceState: string;
+  try {
+    const statusOut = execFileSync("git", ["status", "--porcelain"], {
+      cwd: decision.originRepo,
+      encoding: "utf-8",
+      timeout: 5000,
+    }).trim();
+    if (!statusOut) {
+      workspaceState = "WORKSPACE_STATE: clean";
+    } else {
+      const files = statusOut.split("\n").filter(Boolean);
+      const count = files.length;
+      const preview = files.slice(0, 5);
+      const suffix = count > 5 ? ` (showing first 5 of ${count})` : "";
+      workspaceState = `WORKSPACE_STATE: dirty (${count} file${count === 1 ? "" : "s"}: ${preview.join(", ")}${suffix})`;
+    }
+  } catch {
+    workspaceState = "WORKSPACE_STATE: unavailable";
+  }
+  diag.push(workspaceState);
+
+  if (workspaceState.startsWith("WORKSPACE_STATE: dirty")) {
+    diag.push(
+      "Uncommitted changes mean the tested tree cannot match the merge tree. Commit all changes, then re-run the suite.",
+    );
+  }
+
+  // ── NEAREST_EVIDENCE ─────────────────────────────────────────────────
+  try {
+    const db = getDb();
+    const rows = db
+      .prepare(
+        `SELECT tree_hash, exit_code, created_at
+         FROM suite_results
+         WHERE origin_repo = ? AND cmd_hash = ?
+         ORDER BY created_at DESC
+         LIMIT 3`,
+      )
+      .all(decision.originRepo, decision.cmdHash) as Array<{
+      tree_hash: string;
+      exit_code: number;
+      created_at: string;
+    }>;
+
+    if (rows.length === 0) {
+      diag.push("NEAREST_EVIDENCE: none for this test command");
+      diag.push(
+        "No recording was ever made — the suite must be executed through the tamandua suite shim (the provided test_cmd wrapper); a raw test command run is invisible to the merge gate.",
+      );
+    } else {
+      const newest = rows[0];
+      const shortHash = newest.tree_hash.slice(0, 7);
+      diag.push(
+        `NEAREST_EVIDENCE: tree ${shortHash} exit ${newest.exit_code} recorded ${newest.created_at}`,
+      );
+      diag.push(
+        "Evidence exists for a DIFFERENT tree — the workspace changed after that suite run (new commits, or dirty workspace at recording time). Re-run the suite on the final committed tree.",
+      );
+    }
+  } catch {
+    diag.push("NEAREST_EVIDENCE: unavailable");
+  }
+
+  // ── ACTION ───────────────────────────────────────────────────────────
+  if (workspaceState.startsWith("WORKSPACE_STATE: dirty")) {
+    diag.push(
+      "ACTION: commit all workspace changes, then execute the test suite via the provided shim-wrapped test command so evidence is recorded for the final tree, then resubmit.",
+    );
+  } else if (workspaceState.startsWith("WORKSPACE_STATE: clean")) {
+    diag.push(
+      "ACTION: execute the test suite via the provided shim-wrapped test command so evidence is recorded for the current tree, then resubmit.",
+    );
+  } else {
+    diag.push(
+      "ACTION: ensure the workspace is clean, then execute the test suite via the provided shim-wrapped test command so evidence is recorded for the final tree, then resubmit.",
+    );
+  }
+
+  return diag;
 }

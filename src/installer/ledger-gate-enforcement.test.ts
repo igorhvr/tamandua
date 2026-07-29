@@ -213,9 +213,10 @@ describe("finalize_merge ledger gate enforcement", () => {
     );
   });
 
-  it("degrades repeated default missing evidence after one tester reroute and annotates the landing once", () => {
+  it("refuses default missing evidence on both attempts — no concession", () => {
     const seeded = seedRun("default", "missing");
 
+    // First merger claim: missing evidence → refused, rerouted to tester.
     assert.equal(claimStep("merger", seeded.runId).found, false);
     const afterFirst = seeded.db.prepare(
       "SELECT status, reroute_count, terminal_reroute_count FROM steps WHERE id = ?",
@@ -228,48 +229,48 @@ describe("finalize_merge ledger gate enforcement", () => {
     assert.equal(afterFirst.reroute_count, 1);
     assert.equal(afterFirst.terminal_reroute_count, 1);
 
+    // Stale completion is still blocked before the tester rerun.
     assert.equal(
       completeStep(seeded.finalizeId, "STATUS: done").status,
       "blocked",
-      "a stale merger completion must not consume the concession before the tester rerun",
-    );
-    assert.equal(
-      getRunEvents(seeded.runId).filter(
-        (event) => event.event === "merge.landed_without_suite_evidence",
-      ).length,
-      0,
+      "a stale merger completion must not land before the tester rerun",
     );
     assert.equal(
       (seeded.db.prepare("SELECT status FROM steps WHERE id = ?").get(seeded.finalizeId) as { status: string }).status,
       "waiting",
     );
 
+    // Tester reruns.
     assert.equal(claimStep("tester", seeded.runId).found, true);
     assert.equal(completeStep(seeded.testerId, TESTER_OUTPUT).status, "advanced");
 
-    const mergerClaim = claimStep("merger", seeded.runId);
-    assert.equal(mergerClaim.found, true);
-    assert.equal(mergerClaim.stepId, seeded.finalizeId);
-    assert.equal(completeStep(seeded.finalizeId, "STATUS: done").status, "completed");
+    // Second merger claim: missing evidence still refuses (terminal limit exhausted → fails).
+    assert.equal(claimStep("merger", seeded.runId).found, false);
+    const afterSecond = seeded.db.prepare(
+      "SELECT status, output, reroute_count, terminal_reroute_count FROM steps WHERE id = ?",
+    ).get(seeded.finalizeId) as {
+      status: string;
+      output: string;
+      reroute_count: number;
+      terminal_reroute_count: number;
+    };
+    assert.equal(afterSecond.status, "failed");
+    assert.equal(afterSecond.reroute_count, 1);
+    assert.equal(afterSecond.terminal_reroute_count, 1);
+    assert.match(afterSecond.output, /^FAILURE_CLASS: refused_permanent$/m);
+    assert.match(afterSecond.output, /^LEDGER_EVIDENCE: missing$/m);
+    assert.ok(afterSecond.output.includes(`TREE_HASH: ${TESTED_TREE}`));
+    assert.ok(afterSecond.output.includes(`CMD_HASH: ${computeCmdHash(TEST_CMD)}`));
 
-    const annotations = getRunEvents(seeded.runId).filter(
-      (event) => event.event === "merge.landed_without_suite_evidence",
-    );
-    assert.equal(annotations.length, 1);
-    assert.equal(annotations[0].runId, seeded.runId);
-    assert.equal(annotations[0].workflowId, WORKFLOW_ID);
-    assert.equal(annotations[0].stepId, "finalize_merge");
-    assert.equal(annotations[0].gateMode, "default");
-    assert.equal(annotations[0].origin, getOriginRepo(repo));
-    assert.equal(annotations[0].treeHash, TESTED_TREE);
-    assert.equal(annotations[0].cmdHash, computeCmdHash(TEST_CMD));
+    const run = seeded.db.prepare("SELECT status FROM runs WHERE id = ?").get(seeded.runId) as { status: string };
+    assert.equal(run.status, "failed");
 
-    assert.equal(completeStep(seeded.finalizeId, "STATUS: done").status, "blocked");
+    // No merge.landed_without_suite_evidence event was ever emitted.
     assert.equal(
       getRunEvents(seeded.runId).filter(
         (event) => event.event === "merge.landed_without_suite_evidence",
       ).length,
-      1,
+      0,
     );
   });
 
