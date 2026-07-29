@@ -334,4 +334,13 @@ describe("dashboard kanban view", () => {
     assert.match(html, /<th>View<\/th>/);
     assert.match(html, /a\.kanban-link\s*\{[^}]*border-radius:\s*999px/);
   });
+
+  it("styles the parked-loop 'verifying' lane distinctly in kanban.html", () => {
+    const html = fs.readFileSync(path.join(repoRoot, "src", "server", "kanban.html"), "utf-8");
+    // A parked verify_each loop lane carries status "verifying" (kanban-data);
+    // it must have its own colour var and dot rule so it does not render as the
+    // amber "running" lane.
+    assert.match(html, /--verifying:\s*#[0-9a-fA-F]{3,6};/);
+    assert.match(html, /\.lane-name\.verifying\s+\.dot\s*\{\s*background:\s*var\(--verifying\)/);
+  });
 });

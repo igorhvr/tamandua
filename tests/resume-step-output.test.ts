@@ -117,6 +117,7 @@ function seedRunDb(dbPath: string, runs: Array<{
       retry_count INTEGER DEFAULT 0,
       abandoned_count INTEGER DEFAULT 0,
       reroute_count INTEGER DEFAULT 0,
+      current_story_id TEXT,
       claim_pid INTEGER,
       claim_updated_at TEXT,
       type TEXT NOT NULL DEFAULT 'single',

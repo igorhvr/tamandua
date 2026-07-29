@@ -214,13 +214,14 @@ Step status indicators:
   [running]    Step currently being executed
   [failed ]    Step failed (may be retried)
   [pending]    Step waiting to be claimed
+  [verify ]    Loop step parked between stories while per-story verification runs
 
 Options:
   --json    Output a JSON object with full run details for machine consumption.
             Includes runId, runNumber, workflowId, status, task (first 200 chars),
             tokensSpent, createdAt, updatedAt, workspaceMode (worktree runs),
             worktreePath, worktreeOriginRef, steps array (stepId, stepIndex,
-            agentRole, status, retryCount, abandonedCount, rerouteCount, claimPid,
+            agentRole, status, displayStatus, retryCount, abandonedCount, rerouteCount, claimPid,
             claimUpdatedAt, updatedAt), stories array (storyId, title, status,
             abandonedCount), and optional redLedgerLanding evidence. Step outputs
             are NOT included.
@@ -764,6 +765,7 @@ export async function handleWorkflow(
             stepIndex: s.stepIndex,
             agentRole: s.agentId.split("_").slice(-1)[0],
             status: s.status,
+            displayStatus: s.displayStatus,
             retryCount: s.retryCount,
           };
           if (s.abandonedCount !== undefined) entry.abandonedCount = s.abandonedCount;
@@ -824,7 +826,8 @@ export async function handleWorkflow(
       }
       console.log(`Steps:`);
       for (const step of result.steps) {
-        const icon = step.status === "done" ? "  [done   ]" : step.status === "running" ? "  [running]" : step.status === "failed" ? "  [failed ]" : step.status === "pending" ? "  [pending]" : `  [${step.status.padEnd(7)}]`;
+        const ds = step.displayStatus;
+        const icon = ds === "done" ? "  [done   ]" : ds === "running" ? "  [running]" : ds === "failed" ? "  [failed ]" : ds === "pending" ? "  [pending]" : ds === "verifying" ? "  [verify ]" : `  [${ds.padEnd(7)}]`;
         console.log(`${icon} ${prefixStepId(step.stepId)} (${step.agentId.split("_").slice(-1)[0]})`);
         if (step.status === "failed" && step.output) {
           console.log(`         ${step.output}`);

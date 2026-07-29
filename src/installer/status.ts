@@ -7,6 +7,7 @@ import { emitEvent, getRunEvents } from "./events.js";
 import { parseRunContext } from "./step-ops.js";
 import { logger } from "../lib/logger.js";
 import { stripIdPrefix } from "../lib/id-prefix.js";
+import { displayStepStatus } from "../lib/step-display.js";
 
 export interface RunInfo {
   id: string;
@@ -43,7 +44,9 @@ export interface StepInfo {
   stepId: string;
   agentId: string;
   status: string;
+  displayStatus: string;
   type: string;
+  currentStoryId?: string | null;
   retryCount: number;
   stepIndex: number;
   abandonedCount?: number;
@@ -497,13 +500,14 @@ function buildRunDetail(
 ): RunDetail {
   const steps = db
     .prepare(
-      "SELECT step_id, agent_id, status, type, retry_count, step_index, abandoned_count, reroute_count, claim_pid, claim_updated_at, updated_at, output FROM steps WHERE run_id = ? ORDER BY step_index ASC",
+      "SELECT step_id, agent_id, status, type, current_story_id, retry_count, step_index, abandoned_count, reroute_count, claim_pid, claim_updated_at, updated_at, output FROM steps WHERE run_id = ? ORDER BY step_index ASC",
     )
     .all(row.id) as Array<{
       step_id: string;
       agent_id: string;
       status: string;
       type: string;
+      current_story_id: string | null;
       retry_count: number;
       step_index: number;
       abandoned_count: number;
@@ -514,20 +518,25 @@ function buildRunDetail(
       output: string | null;
     }>;
 
-  const stepInfos: StepInfo[] = steps.map((s) => ({
-    stepId: s.step_id,
-    agentId: s.agent_id,
-    status: s.status,
-    type: s.type,
-    retryCount: s.retry_count,
-    stepIndex: s.step_index,
-    abandonedCount: s.abandoned_count > 0 ? s.abandoned_count : undefined,
-    rerouteCount: s.reroute_count > 0 ? s.reroute_count : undefined,
-    claimPid: s.claim_pid ?? undefined,
-    claimUpdatedAt: s.claim_updated_at ?? undefined,
-    updatedAt: s.updated_at ?? undefined,
-    output: s.output ?? undefined,
-  }));
+  const stepInfos: StepInfo[] = steps.map((s) => {
+    const currentStoryId = s.current_story_id ?? null;
+    return {
+      stepId: s.step_id,
+      agentId: s.agent_id,
+      status: s.status,
+      displayStatus: displayStepStatus({ type: s.type, status: s.status, currentStoryId }),
+      type: s.type,
+      currentStoryId,
+      retryCount: s.retry_count,
+      stepIndex: s.step_index,
+      abandonedCount: s.abandoned_count > 0 ? s.abandoned_count : undefined,
+      rerouteCount: s.reroute_count > 0 ? s.reroute_count : undefined,
+      claimPid: s.claim_pid ?? undefined,
+      claimUpdatedAt: s.claim_updated_at ?? undefined,
+      updatedAt: s.updated_at ?? undefined,
+      output: s.output ?? undefined,
+    };
+  });
 
   const stories = db
     .prepare(

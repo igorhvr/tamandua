@@ -569,6 +569,53 @@ describe("stopWorkflow", () => {
     assert.equal((db.prepare("SELECT COUNT(*) AS count FROM steps WHERE run_id = ?").get("run-active") as { count: number }).count, 0);
   });
 
+  it("stepInfos include displayStatus and currentStoryId from the data layer", async () => {
+    const { getWorkflowStatus } = await import("../../dist/installer/status.js");
+
+    const runId = "run-display-status";
+
+    db.prepare("INSERT INTO runs (id, workflow_id, task, status) VALUES (?, ?, ?, ?)").run(runId, "test-wf", "test task", "running");
+
+    // Parked loop: loop + running + current_story_id NULL → displayStatus="verifying"
+    db.prepare("INSERT INTO steps (id, run_id, step_id, agent_id, step_index, type, status, current_story_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").run("s-parked", runId, "verify-each-parked", "dev", 0, "loop", "running", null);
+
+    // Active loop: loop + running + current_story_id SET → displayStatus="running"
+    db.prepare("INSERT INTO steps (id, run_id, step_id, agent_id, step_index, type, status, current_story_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").run("s-active-loop", runId, "verify-each-active", "dev", 1, "loop", "running", "story-001");
+
+    // Single step: running → displayStatus="running" (same as raw)
+    db.prepare("INSERT INTO steps (id, run_id, step_id, agent_id, step_index, type, status, current_story_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").run("s-single", runId, "implement", "dev", 2, "single", "running", null);
+
+    // Parked loop with current_story_id as empty string (active): displayStatus="running"
+    db.prepare("INSERT INTO steps (id, run_id, step_id, agent_id, step_index, type, status, current_story_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").run("s-active-loop-empty", runId, "verify_each-loop", "dev", 3, "loop", "running", "");
+
+    const detail = getWorkflowStatus(runId);
+
+    // Parked loop: status invariant is "running", displayStatus is "verifying"
+    const parked = detail.steps.find((s) => s.stepId === "verify-each-parked")!;
+    assert.equal(parked.status, "running");
+    assert.equal(parked.displayStatus, "verifying");
+    assert.equal(parked.currentStoryId, null);
+    assert.equal(parked.type, "loop");
+
+    // Active loop: both status and displayStatus are "running"
+    const activeLoop = detail.steps.find((s) => s.stepId === "verify-each-active")!;
+    assert.equal(activeLoop.status, "running");
+    assert.equal(activeLoop.displayStatus, "running");
+    assert.equal(activeLoop.currentStoryId, "story-001");
+
+    // Single step: displayStatus matches raw status
+    const single = detail.steps.find((s) => s.stepId === "implement")!;
+    assert.equal(single.status, "running");
+    assert.equal(single.displayStatus, "running");
+    assert.equal(single.currentStoryId, null);
+
+    // Active loop with empty current_story_id: treated as active (not parked)
+    const activeLoopEmpty = detail.steps.find((s) => s.stepId === "verify_each-loop")!;
+    assert.equal(activeLoopEmpty.status, "running");
+    assert.equal(activeLoopEmpty.displayStatus, "running");
+    assert.equal(activeLoopEmpty.currentStoryId, "");
+  });
+
   it("preserves run_worktrees row with cleanup_failed when worktree removal fails", async () => {
     const { deleteWorkflow } = await import("../../dist/installer/status.js");
 

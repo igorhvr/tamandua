@@ -114,6 +114,7 @@ function seedDb(dbPath: string): void {
       retry_count INTEGER NOT NULL DEFAULT 0,
       abandoned_count INTEGER NOT NULL DEFAULT 0,
       reroute_count INTEGER NOT NULL DEFAULT 0,
+      current_story_id TEXT,
       claim_pid INTEGER,
       claim_updated_at TEXT,
       input_template TEXT NOT NULL DEFAULT '',

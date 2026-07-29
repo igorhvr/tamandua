@@ -21,6 +21,7 @@
       --accent: #f0883e;
       --todo: #8b949e;
       --running: #d29922;
+      --verifying: #a371f7;
       --done: #3fb950;
       --failed: #f85149;
     }
@@ -135,9 +136,10 @@
       width: 8px; height: 8px; border-radius: 50%;
       background: var(--todo);
     }
-    .lane-name.running .dot { background: var(--running); }
-    .lane-name.done    .dot { background: var(--done); }
-    .lane-name.failed  .dot { background: var(--failed); }
+    .lane-name.running   .dot { background: var(--running); }
+    .lane-name.verifying .dot { background: var(--verifying); }
+    .lane-name.done      .dot { background: var(--done); }
+    .lane-name.failed    .dot { background: var(--failed); }
     .lane-sub {
       font-size: 11px;
       color: var(--ink-soft);

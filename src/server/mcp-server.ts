@@ -179,7 +179,7 @@ const mcpTools: Array<Record<string, unknown>> = [
       properties: {
         run: {
           type: "object",
-          description: "Detailed run status returned by getWorkflowStatus().",
+          description: "Detailed run status returned by getWorkflowStatus(). Steps carry both the raw status field (back-compat) and a derived displayStatus field (presentation label, e.g. 'verifying' for parked loop steps).",
         },
       },
     },

@@ -267,6 +267,55 @@ describe("kanban-data: buildKanbanSnapshot", () => {
     assert.match(snap.lanes[0].cards[0].sub, /retry 2\/4/);
   });
 
+  it("parked loop lane has status verifying", () => {
+    const db = seedDb();
+    insertRun(db, "r-verify", "running");
+    // Parked loop: running with no current_story_id
+    insertStep(db, "r-verify", "implement", "developer", 0, "running", {
+      type: "loop",
+      current_story_id: null,
+    });
+    insertStory(db, "r-verify", "US-001", 0, "First story", "done");
+
+    const snap = buildKanbanSnapshot(db, "r-verify")!;
+    const devLane = snap.lanes[0];
+    assert.equal(devLane.agent, "developer");
+    assert.equal(devLane.status, "verifying");
+    // Stories are still rendered as cards
+    assert.equal(devLane.cards.length, 1);
+    assert.equal(devLane.cards[0].status, "done");
+  });
+
+  it("active loop lane has status running with claimed story card promoted", () => {
+    const db = seedDb();
+    insertRun(db, "r-active", "running");
+    // Active loop: running with a claimed story
+    insertStep(db, "r-active", "implement", "developer", 0, "running", {
+      type: "loop",
+      current_story_id: "US-002",
+    });
+    insertStory(db, "r-active", "US-001", 0, "Done story", "done");
+    insertStory(db, "r-active", "US-002", 1, "Active story", "pending");
+
+    const snap = buildKanbanSnapshot(db, "r-active")!;
+    const devLane = snap.lanes[0];
+    assert.equal(devLane.status, "running");
+    // The claimed story is promoted to running
+    assert.equal(devLane.cards[1].id, "US-002");
+    assert.equal(devLane.cards[1].status, "running");
+  });
+
+  it("non-loop steps keep their normal lane status", () => {
+    const db = seedDb();
+    insertRun(db, "r-single", "running");
+    insertStep(db, "r-single", "plan", "planner", 0, "done");
+    insertStep(db, "r-single", "verify", "verifier", 1, "running");
+
+    const snap = buildKanbanSnapshot(db, "r-single")!;
+    assert.equal(snap.lanes[0].status, "done");
+    assert.equal(snap.lanes[1].status, "running");
+  });
+
   it("orders lanes by step_index", () => {
     const db = seedDb();
     insertRun(db, "r5", "running");

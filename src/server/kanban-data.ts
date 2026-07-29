@@ -21,7 +21,7 @@
 import type { DatabaseSync } from "node:sqlite";
 import type { TamanduaEvent } from "../installer/events.js";
 
-export type VisualStatus = "todo" | "running" | "done" | "failed";
+export type VisualStatus = "todo" | "running" | "done" | "failed" | "verifying";
 
 export interface KanbanCard {
   /** Card identifier shown in the chip (story_id for stories, step_id for steps). */
@@ -456,12 +456,14 @@ export function buildKanbanSnapshot(
     }
 
     const stepStatus = normaliseStatus(step.status);
+    const parked = step.type === "loop" && step.status === "running" && step.current_story_id === null;
+    const laneStatus = parked ? "verifying" : laneStatusFromStepAndCards(stepStatus, cards);
     return {
       agent,
       label,
       stepId: step.step_id,
       stepType: step.type,
-      status: laneStatusFromStepAndCards(stepStatus, cards),
+      status: laneStatus,
       cards,
       summary: summarise(cards),
     };

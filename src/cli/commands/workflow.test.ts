@@ -80,6 +80,7 @@ function setupTempDb(): { db: DatabaseSync; dbPath: string; tempDir: string } {
     retry_count INTEGER DEFAULT 0,
     max_retries INTEGER DEFAULT 4,
     type TEXT NOT NULL DEFAULT 'single',
+    current_story_id TEXT,
     output TEXT,
     abandoned_count INTEGER DEFAULT 0,
     reroute_count INTEGER DEFAULT 0,
@@ -426,6 +427,86 @@ Examples:
       const { getWorkflowStatus } = await import("../../../dist/installer/status.js");
       const detail = getWorkflowStatus(prefix);
       assert.equal(detail.id, runId);
+    });
+  });
+
+  describe("US-004: displayStatus in --json output (in-process with temp DB)", () => {
+    let tempDir: string;
+    let dbPath: string;
+    let db: DatabaseSync;
+    let originalDbPath: string | undefined;
+    let originalHome: string | undefined;
+    let originalStateDir: string | undefined;
+
+    beforeEach(() => {
+      originalDbPath = process.env.TAMANDUA_DB_PATH;
+      originalHome = process.env.HOME;
+      originalStateDir = process.env.TAMANDUA_STATE_DIR;
+
+      const setup = setupTempDb();
+      tempDir = setup.tempDir;
+      dbPath = setup.dbPath;
+      db = setup.db;
+
+      process.env.TAMANDUA_DB_PATH = dbPath;
+      process.env.HOME = tempDir;
+      process.env.TAMANDUA_STATE_DIR = join(tempDir, ".tamandua");
+    });
+
+    afterEach(() => {
+      if (originalDbPath) process.env.TAMANDUA_DB_PATH = originalDbPath;
+      else delete process.env.TAMANDUA_DB_PATH;
+      if (originalHome) process.env.HOME = originalHome;
+      else delete process.env.HOME;
+      if (originalStateDir) process.env.TAMANDUA_STATE_DIR = originalStateDir;
+      else delete process.env.TAMANDUA_STATE_DIR;
+
+      db.close();
+      try { rmSync(tempDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    });
+
+    it("parked loop step has status=running AND displayStatus=verifying", async () => {
+      const runId = crypto.randomUUID();
+      db.prepare("INSERT INTO runs (id) VALUES (?)").run(runId);
+      db.prepare(`INSERT INTO steps (id, run_id, step_id, agent_id, status, type, current_story_id, step_index)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(crypto.randomUUID(), runId, 'dev', 'test_developer', 'running', 'loop', null, 0);
+
+      const { getWorkflowStatus } = await import("../../../dist/installer/status.js");
+      const detail = getWorkflowStatus(`run-${runId}`);
+      const step = detail.steps[0];
+      assert.equal(step.status, "running", "raw status must be running (invariant)");
+      assert.equal(step.displayStatus, "verifying", "displayStatus must be verifying for parked loop");
+      assert.equal(step.currentStoryId, null);
+    });
+
+    it("active loop step has status=running AND displayStatus=running", async () => {
+      const runId = crypto.randomUUID();
+      const storyId = "story-001";
+      db.prepare("INSERT INTO runs (id) VALUES (?)").run(runId);
+      db.prepare(`INSERT INTO steps (id, run_id, step_id, agent_id, status, type, current_story_id, step_index)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(crypto.randomUUID(), runId, 'dev', 'test_developer', 'running', 'loop', storyId, 0);
+
+      const { getWorkflowStatus } = await import("../../../dist/installer/status.js");
+      const detail = getWorkflowStatus(`run-${runId}`);
+      const step = detail.steps[0];
+      assert.equal(step.status, "running");
+      assert.equal(step.displayStatus, "running", "active loop must display as running");
+    });
+
+    it("non-loop step has displayStatus equal to raw status", async () => {
+      const runId = crypto.randomUUID();
+      db.prepare("INSERT INTO runs (id) VALUES (?)").run(runId);
+      db.prepare(`INSERT INTO steps (id, run_id, step_id, agent_id, status, type, step_index)
+        VALUES (?, ?, ?, ?, ?, ?, ?)`)
+        .run(crypto.randomUUID(), runId, 'dev', 'test_developer', 'failed', 'single', 0);
+
+      const { getWorkflowStatus } = await import("../../../dist/installer/status.js");
+      const detail = getWorkflowStatus(`run-${runId}`);
+      const step = detail.steps[0];
+      assert.equal(step.status, "failed");
+      assert.equal(step.displayStatus, "failed", "non-loop displayStatus must equal raw status");
     });
   });
 });

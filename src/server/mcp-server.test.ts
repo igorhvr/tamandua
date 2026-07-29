@@ -260,6 +260,15 @@ describe("mcp-server bootstrap", () => {
       assert.deepEqual((tools[1]?.inputSchema as { required?: string[] }).required, ["query"]);
       assert.deepEqual((tools[2]?.inputSchema as { required?: string[] }).required, ["workflowId", "taskTitle"]);
 
+      // US-004: outputSchema description mentions both status and displayStatus
+      const runStatusTool = tools[1] as { outputSchema?: { properties?: Record<string, { description?: string }> } };
+      assert.ok(runStatusTool.outputSchema?.properties?.run?.description, "outputSchema.run description must exist");
+      assert.match(
+        runStatusTool.outputSchema?.properties?.run?.description ?? "",
+        /displayStatus|display.status|derived display/,
+        "outputSchema.run.description must mention displayStatus"
+      );
+
       const runsList = await callTool(server.port, sessionId, 3, "tamandua.runs.list", { limit: 10 });
       assert.equal(runsList.status, 200);
       assert.equal(runsList.body?.error, undefined);
