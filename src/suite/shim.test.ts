@@ -802,6 +802,66 @@ describe("tamandua-test shim", { concurrency: 1 }, () => {
     });
   }
 
+  it("identifies a real shim claim so a waiter can reclaim it after SIGKILL", async () => {
+    const fixture = createFixtureRepo(tempBase, "dead-owner-reclaim");
+    const suitePidFile = join(tempBase, "dead-owner-reclaim.pid");
+    const script = join(fixture.repoDir, "dead-owner-suite.sh");
+    writeFileSync(
+      script,
+      `#!/bin/sh\necho $$ > "${suitePidFile}"\necho 'DEAD OWNER SUITE STARTED'\nwhile :; do sleep 1; done\n`,
+    );
+    chmodSync(script, 0o755);
+    const runId = "r-dead-owner";
+    const stepId = "s-dead-owner";
+    const owner = spawn("node", [SHIM_PATH, "--repo", fixture.repoDir, "--run", runId, "--step", stepId, "--", script], {
+      env: shimChildEnv(controlEnv),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error("owner suite did not start")), 10_000);
+        owner.stdout!.on("data", (chunk: Buffer) => {
+          if (chunk.toString().includes("DEAD OWNER SUITE STARTED")) {
+            clearTimeout(timeout);
+            resolve();
+          }
+        });
+        owner.once("error", reject);
+      });
+      owner.kill("SIGKILL");
+      await new Promise<void>((resolve) => owner.once("close", () => resolve()));
+
+      const { committedTreeHash, computeCmdHash, getOriginRepo } = await import(
+        "../../dist/suite/tree-hash.js"
+      );
+      const treeHash = committedTreeHash(fixture.repoDir);
+      assert.ok(treeHash);
+      const reclaim = await controlPlanePost("/suite/claim", {
+        origin_repo: getOriginRepo(fixture.repoDir),
+        tree_hash: treeHash,
+        cmd_hash: computeCmdHash(script),
+        owner_token: "replacement-owner",
+        owner_pid: process.pid,
+        run_id: "r-replacement",
+        step_id: "s-replacement",
+      });
+      assert.equal(
+        (reclaim.body as Record<string, unknown>).action,
+        "run",
+        "dead real shim owner should be reclaimed immediately",
+      );
+    } finally {
+      owner.kill("SIGKILL");
+      if (existsSync(suitePidFile)) {
+        const suitePid = Number(readFileSync(suitePidFile, "utf-8").trim());
+        if (Number.isSafeInteger(suitePid) && suitePid > 0) {
+          try { process.kill(-suitePid, "SIGKILL"); } catch { /* already gone */ }
+        }
+      }
+    }
+  });
+
   async function runTreeMutationCase(
     name: string,
     scriptBody: string,

@@ -206,8 +206,20 @@ export interface SuiteClaimResult {
   claimedAt?: string;
 }
 
+export interface SuiteClaimOwner {
+  ownerToken?: string;
+  ownerPid?: number;
+  runId?: string;
+  stepId?: string;
+  timeoutMs?: number;
+}
+
 export interface SuiteReleaseResult {
   released: boolean;
+}
+
+export interface SuiteOwnerReleaseResult {
+  released: number;
 }
 
 /** A single flaky key entry. */
@@ -269,11 +281,16 @@ export async function claimSuiteKey(
   originRepo: string,
   treeHash: string,
   cmdHash: string,
-  ownerTokenOrTimeout?: string | number,
+  ownerTokenOrTimeout?: string | number | SuiteClaimOwner,
   timeoutMs: number = DEFAULT_TIMEOUT_MS,
 ): Promise<SuiteClaimResult | null> {
-  const ownerToken = typeof ownerTokenOrTimeout === "string" ? ownerTokenOrTimeout : undefined;
-  const effectiveTimeout = typeof ownerTokenOrTimeout === "number" ? ownerTokenOrTimeout : timeoutMs;
+  const ownership = typeof ownerTokenOrTimeout === "object" ? ownerTokenOrTimeout : undefined;
+  const ownerToken = typeof ownerTokenOrTimeout === "string"
+    ? ownerTokenOrTimeout
+    : ownership?.ownerToken;
+  const effectiveTimeout = typeof ownerTokenOrTimeout === "number"
+    ? ownerTokenOrTimeout
+    : ownership?.timeoutMs ?? timeoutMs;
   const r = await controlRequest(
     "POST",
     "/suite/claim",
@@ -282,6 +299,9 @@ export async function claimSuiteKey(
       tree_hash: treeHash,
       cmd_hash: cmdHash,
       ...(ownerToken ? { owner_token: ownerToken } : {}),
+      ...(ownership?.ownerPid !== undefined ? { owner_pid: ownership.ownerPid } : {}),
+      ...(ownership?.runId ? { run_id: ownership.runId } : {}),
+      ...(ownership?.stepId ? { step_id: ownership.stepId } : {}),
     },
     effectiveTimeout,
   );
@@ -310,6 +330,23 @@ export async function releaseSuiteKey(
   );
   if (!r || r.status !== 200) return false;
   return (r.body as unknown as SuiteReleaseResult).released === true;
+}
+
+/** Best-effort ownership-scoped release used by motor teardown/recovery. */
+export async function releaseSuiteClaimsByOwner(
+  runId: string,
+  stepId?: string,
+  timeoutMs: number = DEFAULT_TIMEOUT_MS,
+): Promise<number | null> {
+  const r = await controlRequest(
+    "POST",
+    "/suite/release-owner",
+    { run_id: runId, ...(stepId ? { step_id: stepId } : {}) },
+    timeoutMs,
+  );
+  if (!r || r.status !== 200) return null;
+  const released = (r.body as unknown as SuiteOwnerReleaseResult).released;
+  return Number.isSafeInteger(released) && released >= 0 ? released : null;
 }
 
 /** Parameters for emitting a suite event via the control plane. */

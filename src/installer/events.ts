@@ -59,6 +59,13 @@ export interface TamanduaEvent {
   waitedMs?: number;
   preTreeHash?: string;
   postTreeHash?: string;
+  originRepo?: string;
+  ownerRunId?: string;
+  ownerStepId?: string;
+  ownerPid?: number;
+  reclaimerRunId?: string;
+  reclaimerStepId?: string;
+  reclaimerPid?: number;
   // Plumbing merge fields
   origin?: string;
   branch?: string;

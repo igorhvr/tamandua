@@ -249,6 +249,57 @@ describe("daemon control plane", { concurrency: 1 }, () => {
     assert.equal(r.status, 404);
   });
 
+  it("pause and terminate release only suite claims attributed to the affected run", async (t) => {
+    if (!daemon?.pid) {
+      t.skip("daemon not started");
+      return;
+    }
+
+    const dbPath = path.join(tempHome, ".tamandua", "tamandua.db");
+    const db = new DatabaseSync(dbPath);
+    const pauseRunId = crypto.randomUUID();
+    const terminateRunId = crypto.randomUUID();
+    const unrelatedRunId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    const insertRun = db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, scheduling_status, created_at, updated_at) VALUES (?, 'suite-release-test', 'suite release', 'running', '{}', 0, 'active', ?, ?)",
+    );
+    insertRun.run(pauseRunId, now, now);
+    insertRun.run(terminateRunId, now, now);
+    insertRun.run(unrelatedRunId, now, now);
+    db.close();
+
+    const claim = async (suffix: string, runId: string, ownerToken: string): Promise<JsonResponse> =>
+      await jsonRequest("POST", "/suite/claim", {
+        origin_repo: `/control-release/${suffix}`,
+        tree_hash: `tree-${suffix}`,
+        cmd_hash: `cmd-${suffix}`,
+        owner_token: ownerToken,
+        owner_pid: daemon!.pid,
+        run_id: runId,
+        step_id: `step-${suffix}`,
+      }, secret);
+
+    assert.equal((await claim("pause", pauseRunId, "pause-owner")).body.action, "run");
+    assert.equal((await claim("terminate", terminateRunId, "terminate-owner")).body.action, "run");
+    assert.equal((await claim("unrelated", unrelatedRunId, "unrelated-owner")).body.action, "run");
+
+    const paused = await jsonRequest("POST", "/control/pause-run", { runId: pauseRunId }, secret);
+    assert.equal(paused.status, 200);
+    assert.equal((await claim("pause", unrelatedRunId, "pause-replacement")).body.action, "run");
+    assert.equal((await claim("terminate", unrelatedRunId, "terminate-waiter")).body.action, "wait");
+    assert.equal((await claim("unrelated", unrelatedRunId, "unrelated-waiter")).body.action, "wait");
+
+    const terminated = await jsonRequest("POST", "/control/terminate-run", { runId: terminateRunId }, secret);
+    assert.equal(terminated.status, 200);
+    assert.equal((await claim("terminate", unrelatedRunId, "terminate-replacement")).body.action, "run");
+    assert.equal((await claim("unrelated", unrelatedRunId, "unrelated-still-waiting")).body.action, "wait");
+
+    const cleanup = new DatabaseSync(dbPath);
+    cleanup.prepare("DELETE FROM runs WHERE id IN (?, ?, ?)").run(pauseRunId, terminateRunId, unrelatedRunId);
+    cleanup.close();
+  });
+
   it("POST /control/pause-run emits run.paused event", async (t) => {
     if (!daemon) {
       t.skip("daemon not started");

@@ -342,6 +342,13 @@ interface PollResult {
   ownsClaim?: boolean;
 }
 
+interface ClaimOwnership {
+  ownerToken: string;
+  ownerPid: number;
+  runId: string;
+  stepId: string;
+}
+
 /**
  * Poll the lookup endpoint until the claim owner records a result or
  * CLAIM_TIMEOUT elapses. Returns "replay" with the green result data
@@ -352,7 +359,7 @@ async function pollForResult(
   originRepo: string,
   treeHash: string,
   cmdHash: string,
-  ownerToken: string,
+  ownership: ClaimOwnership,
   force: boolean,
 ): Promise<PollResult> {
   const startTime = Date.now();
@@ -384,7 +391,7 @@ async function pollForResult(
       // so continue below and claim before executing.
     }
 
-    const claim = await claimSuiteKey(originRepo, treeHash, cmdHash, ownerToken);
+    const claim = await claimSuiteKey(originRepo, treeHash, cmdHash, ownership);
     if (claim === null) {
       process.stderr.write(
         "tamandua-test: warning: control plane unreachable during single-flight claim — executing\n",
@@ -488,6 +495,12 @@ async function main(): Promise<void> {
   const cmdHash = computeCmdHash(cmdString);
   const originRepo = getOriginRepo(repoReal);
   const ownerToken = randomUUID();
+  const claimOwnership: ClaimOwnership = {
+    ownerToken,
+    ownerPid: process.pid,
+    runId,
+    stepId,
+  };
 
   const {
     lookupSuiteRecord,
@@ -565,7 +578,7 @@ async function main(): Promise<void> {
 
   // R7: Miss, expired green, red, or --force → execute.
   // R16-R17: Before executing, claim the key for single-flight.
-  const claim = await claimSuiteKey(originRepo, preTreeHash, cmdHash, ownerToken);
+  const claim = await claimSuiteKey(originRepo, preTreeHash, cmdHash, claimOwnership);
   let ownsClaim = claim?.action === "run";
 
   if (claim && claim.action === "wait") {
@@ -582,7 +595,7 @@ async function main(): Promise<void> {
     });
     // Another caller owns the claim — poll until a result is recorded or
     // CLAIM_TIMEOUT elapses.
-    const pollResult = await pollForResult(originRepo, preTreeHash, cmdHash, ownerToken, force);
+    const pollResult = await pollForResult(originRepo, preTreeHash, cmdHash, claimOwnership, force);
     if (pollResult.action === "replay" && pollResult.latest) {
       await replayCachedResult(pollResult.latest, preTreeHash, pollResult.ageMs ?? 0);
     }
@@ -638,14 +651,14 @@ async function main(): Promise<void> {
       }
     }
 
-    const currentClaim = await claimSuiteKey(originRepo, preTreeHash, cmdHash, ownerToken);
+    const currentClaim = await claimSuiteKey(originRepo, preTreeHash, cmdHash, claimOwnership);
     if (currentClaim === null) {
       ownsClaim = false;
       break;
     }
     if (currentClaim.action === "run") continue;
 
-    const currentPoll = await pollForResult(originRepo, preTreeHash, cmdHash, ownerToken, force);
+    const currentPoll = await pollForResult(originRepo, preTreeHash, cmdHash, claimOwnership, force);
     if (currentPoll.action === "replay" && currentPoll.latest) {
       await replayCachedResult(currentPoll.latest, preTreeHash, currentPoll.ageMs ?? 0);
     }
@@ -738,6 +751,11 @@ async function main(): Promise<void> {
       run_id: runId || null,
       step_id: stepId || null,
     });
+    if (ownsClaim && exitCode === INTERRUPTED_EXIT_CODE) {
+      // Recording normally clears the claim. This exact owner-token release
+      // covers partial cancellation writes without touching another owner.
+      await releaseSuiteKey(originRepo, preTreeHash, cmdHash, ownerToken).catch(() => false);
+    }
   } catch {
     // R11: Recording failure — warn and continue.
     process.stderr.write("tamandua-test: warning: failed to record suite result to control plane\n");

@@ -621,6 +621,54 @@ describe("suite control-plane client", { concurrency: 1 }, () => {
     assert.equal((await claimSuiteKey("/tmp/test-repo", treeHash, cmdHash, "owner-c"))!.action, "run");
   });
 
+  it("claimSuiteKey forwards PID and workflow ownership metadata", async () => {
+    const treeHash = crypto.createHash("sha1").update("tree-owner-metadata").digest("hex");
+    const cmdHash = crypto.createHash("sha256").update("cmd-owner-metadata").digest("hex");
+    const { claimSuiteKey, releaseSuiteKey } = await import("../../dist/server/control-client.js");
+    const ownership = {
+      ownerToken: "metadata-owner",
+      ownerPid: 2_147_483_647,
+      runId: "run-metadata",
+      stepId: "step-metadata",
+    };
+
+    assert.equal((await claimSuiteKey("/tmp/test-repo", treeHash, cmdHash, ownership))!.action, "run");
+    assert.equal((await claimSuiteKey("/tmp/test-repo", treeHash, cmdHash, {
+      ownerToken: "metadata-reclaimer",
+      ownerPid: process.pid,
+      runId: "run-reclaimer",
+      stepId: "step-reclaimer",
+    }))!.action, "run", "forwarded dead PID should make the first claim reclaimable");
+
+    const eventLines = fs.readFileSync(path.join(stateDir, "events", "all.jsonl"), "utf8")
+      .trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
+    const event = eventLines.find((entry) => entry.event === "suite.claim_dead_owner_reclaimed"
+      && entry.cmdHash === cmdHash);
+    assert.ok(event, "dead-owner reclaim event should prove server received client metadata");
+    assert.equal(event.ownerRunId, "run-metadata");
+    assert.equal(event.ownerStepId, "step-metadata");
+    assert.equal(event.reclaimerRunId, "run-reclaimer");
+    assert.equal(event.reclaimerStepId, "step-reclaimer");
+    assert.equal(await releaseSuiteKey("/tmp/test-repo", treeHash, cmdHash, "metadata-reclaimer"), true);
+  });
+
+  it("releaseSuiteClaimsByOwner releases only matching attributed claims", async () => {
+    const { claimSuiteKey, releaseSuiteClaimsByOwner } = await import("../../dist/server/control-client.js");
+    const first = {
+      ownerToken: "bulk-first",
+      ownerPid: process.pid,
+      runId: "run-bulk-release",
+      stepId: "step-bulk-first",
+    };
+    const second = { ...first, ownerToken: "bulk-second", stepId: "step-bulk-second" };
+    assert.equal((await claimSuiteKey("/tmp/bulk-a", "tree-a", "cmd-a", first))!.action, "run");
+    assert.equal((await claimSuiteKey("/tmp/bulk-b", "tree-b", "cmd-b", second))!.action, "run");
+
+    assert.equal(await releaseSuiteClaimsByOwner(first.runId, first.stepId), 1);
+    assert.equal((await claimSuiteKey("/tmp/bulk-a", "tree-a", "cmd-a", first))!.action, "run");
+    assert.equal((await claimSuiteKey("/tmp/bulk-b", "tree-b", "cmd-b", second))!.action, "wait");
+  });
+
   it("claimSuiteKey returns null when daemon is unreachable", async () => {
     const savedPort = process.env.TAMANDUA_CONTROL_PORT;
     process.env.TAMANDUA_CONTROL_PORT = "65530";

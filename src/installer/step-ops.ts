@@ -1404,6 +1404,18 @@ export function recoverOrphanedStepsForAgent(
   let failed = 0;
   let skipped = 0;
 
+  const releaseRecoveredSuiteClaims = (recoveredRunId: string, recoveredStepId: string): void => {
+    void import("../server/control-client.js")
+      .then((client) => client.releaseSuiteClaimsByOwner(recoveredRunId, recoveredStepId))
+      .catch((err) => {
+        logger.warn("Suite claim release after step recovery failed", {
+          runId: recoveredRunId,
+          stepId: recoveredStepId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+  };
+
   for (const step of steps) {
     // Skip loop steps waiting on verify_each (mid-iteration pause, not orphaned)
     if (step.type === "loop" && !step.current_story_id && step.loop_config) {
@@ -1424,6 +1436,11 @@ export function recoverOrphanedStepsForAgent(
         // If loop config is malformed, fall through to recovery.
       }
     }
+
+    // Recovery means the prior execution is being abandoned. Release only
+    // this run/step's suite claims; PID collision reclaim remains the fallback
+    // if the local control plane cannot be reached.
+    releaseRecoveredSuiteClaims(step.run_id, step.step_id);
 
     // Loop steps with current_story_id: handle story-level abandonment recovery
     if (step.type === "loop" && step.current_story_id) {

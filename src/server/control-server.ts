@@ -306,9 +306,20 @@ import { FLAKE_WINDOW_MS, CLAIM_TIMEOUT_MS } from "../suite/config.js";
 interface SuiteClaim {
   claimedAt: number;
   ownerToken?: string;
+  ownerPid?: number;
+  runId?: string;
+  stepId?: string;
+  originRepo: string;
+  treeHash: string;
+  cmdHash: string;
 }
 
 const suiteClaims = new Map<string, SuiteClaim>();
+// A dead claim may be discovered while sweeping for an unrelated request.
+// Keep its owner metadata until the first same-key caller is actually granted,
+// so the reclaim event attributes the real reclaimer rather than the request
+// that happened to trigger housekeeping.
+const sweptDeadSuiteClaims = new Map<string, SuiteClaim>();
 
 function suiteClaimKey(originRepo: string, treeHash: string, cmdHash: string): string {
   // JSON array encoding is injective for string tuples; delimiter joining is not
@@ -325,6 +336,9 @@ interface ValidSuiteClaimFields {
   treeHash: string;
   cmdHash: string;
   ownerToken?: string;
+  ownerPid?: number;
+  runId?: string;
+  stepId?: string;
 }
 
 function validateSuiteClaimFields(body: Record<string, unknown>): ValidSuiteClaimFields | null {
@@ -335,6 +349,13 @@ function validateSuiteClaimFields(body: Record<string, unknown>): ValidSuiteClai
   const ownerToken = hasOwnerToken && typeof body.owner_token === "string"
     ? body.owner_token
     : undefined;
+  const ownerPid = Number.isSafeInteger(body.owner_pid) && (body.owner_pid as number) > 0
+    ? body.owner_pid as number
+    : undefined;
+  const runId = typeof body.run_id === "string" && body.run_id.length > 0
+    && body.run_id.length <= SUITE_OWNER_MAX_LENGTH ? body.run_id : undefined;
+  const stepId = typeof body.step_id === "string" && body.step_id.length > 0
+    && body.step_id.length <= SUITE_OWNER_MAX_LENGTH ? body.step_id : undefined;
   if (
     !originRepo || originRepo.length > SUITE_ORIGIN_MAX_LENGTH
     || !treeHash || treeHash.length > SUITE_HASH_MAX_LENGTH
@@ -343,15 +364,89 @@ function validateSuiteClaimFields(body: Record<string, unknown>): ValidSuiteClai
   ) {
     return null;
   }
-  return { originRepo, treeHash, cmdHash, ownerToken };
+  return { originRepo, treeHash, cmdHash, ownerToken, ownerPid, runId, stepId };
 }
 
-function cleanStaleClaims(): void {
-  const now = Date.now();
+export type SuiteOwnerLiveness = "alive" | "dead" | "indeterminate";
+
+export function probeSuiteOwnerPid(
+  pid: number,
+  signalZero: (targetPid: number, signal: 0) => unknown = (targetPid, signal) => process.kill(targetPid, signal),
+): SuiteOwnerLiveness {
+  try {
+    signalZero(pid, 0);
+    return "alive";
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "ESRCH" ? "dead" : "indeterminate";
+  }
+}
+
+interface SuiteClaimRuntime {
+  now: () => number;
+  probePid: (pid: number) => SuiteOwnerLiveness;
+  emitClaimEvent: (event: TamanduaEvent) => void;
+}
+
+function claimOwnerLiveness(claim: SuiteClaim, runtime: SuiteClaimRuntime): SuiteOwnerLiveness {
+  if (claim.ownerPid === undefined) return "indeterminate";
+  try {
+    return runtime.probePid(claim.ownerPid);
+  } catch {
+    return "indeterminate";
+  }
+}
+
+function emitDeadOwnerReclaim(
+  claim: SuiteClaim,
+  reclaimer: ValidSuiteClaimFields | undefined,
+  runtime: SuiteClaimRuntime,
+): void {
+  const event: TamanduaEvent = {
+    ts: new Date(runtime.now()).toISOString(),
+    event: "suite.claim_dead_owner_reclaimed",
+    runId: reclaimer?.runId ?? claim.runId ?? "",
+    stepId: reclaimer?.stepId,
+    originRepo: claim.originRepo,
+    treeHash: claim.treeHash,
+    cmdHash: claim.cmdHash,
+    ownerRunId: claim.runId,
+    ownerStepId: claim.stepId,
+    ownerPid: claim.ownerPid,
+    reclaimerRunId: reclaimer?.runId,
+    reclaimerStepId: reclaimer?.stepId,
+    reclaimerPid: reclaimer?.ownerPid,
+  };
+  try {
+    runtime.emitClaimEvent(event);
+  } catch (err) {
+    logger.warn("control-server: suite dead-owner reclaim event emission failed", {
+      error: String(err),
+      originRepo: claim.originRepo,
+      treeHash: claim.treeHash,
+      cmdHash: claim.cmdHash,
+    });
+  }
+}
+
+function cleanStaleClaims(
+  runtime: SuiteClaimRuntime,
+  collisionKey?: string,
+  reclaimer?: ValidSuiteClaimFields,
+): void {
+  const now = runtime.now();
+  for (const [key, claim] of sweptDeadSuiteClaims) {
+    if (now - claim.claimedAt > CLAIM_TIMEOUT_MS) sweptDeadSuiteClaims.delete(key);
+  }
   for (const [key, claim] of suiteClaims) {
     if (now - claim.claimedAt > CLAIM_TIMEOUT_MS) {
       suiteClaims.delete(key);
+      sweptDeadSuiteClaims.delete(key);
+      continue;
     }
+    if (claimOwnerLiveness(claim, runtime) !== "dead") continue;
+    suiteClaims.delete(key);
+    if (key === collisionKey) emitDeadOwnerReclaim(claim, reclaimer, runtime);
+    else sweptDeadSuiteClaims.set(key, claim);
   }
 }
 
@@ -438,6 +533,7 @@ async function handleSuiteRecord(body: Record<string, unknown>): Promise<JsonRes
     // Clear any pending claim so waiters can pick up the result.
     const claimKey = suiteClaimKey(originRepo, treeHash, cmdHash);
     suiteClaims.delete(claimKey);
+    sweptDeadSuiteClaims.delete(claimKey);
 
     return ok({ id: Number(result.lastInsertRowid), created_at });
   } catch (err) {
@@ -446,23 +542,33 @@ async function handleSuiteRecord(body: Record<string, unknown>): Promise<JsonRes
   }
 }
 
-async function handleSuiteClaim(body: Record<string, unknown>): Promise<JsonResponse> {
+async function handleSuiteClaim(
+  body: Record<string, unknown>,
+  runtime: SuiteClaimRuntime,
+): Promise<JsonResponse> {
   const fields = validateSuiteClaimFields(body);
   if (!fields) {
     return { status: 400, body: { error: "Invalid or oversized suite claim fields" } };
   }
-  const { originRepo, treeHash, cmdHash, ownerToken } = fields;
-
-  cleanStaleClaims();
+  const { originRepo, treeHash, cmdHash, ownerToken, ownerPid, runId, stepId } = fields;
 
   const key = suiteClaimKey(originRepo, treeHash, cmdHash);
+  cleanStaleClaims(runtime, key, fields);
   const existing = suiteClaims.get(key);
 
   if (existing) {
     return ok({ action: "wait", claimedAt: new Date(existing.claimedAt).toISOString() });
   }
 
-  suiteClaims.set(key, { claimedAt: Date.now(), ownerToken });
+  const sweptDeadClaim = sweptDeadSuiteClaims.get(key);
+  if (sweptDeadClaim) {
+    sweptDeadSuiteClaims.delete(key);
+    emitDeadOwnerReclaim(sweptDeadClaim, fields, runtime);
+  }
+
+  suiteClaims.set(key, {
+    claimedAt: runtime.now(), ownerToken, ownerPid, runId, stepId, originRepo, treeHash, cmdHash,
+  });
   return ok({ action: "run" });
 }
 
@@ -481,6 +587,26 @@ async function handleSuiteRelease(body: Record<string, unknown>): Promise<JsonRe
   }
   suiteClaims.delete(key);
   return ok({ released: true });
+}
+
+function releaseSuiteClaimsByOwner(runId: string, stepId?: string): number {
+  let released = 0;
+  for (const [key, claim] of suiteClaims) {
+    if (claim.runId !== runId || (stepId !== undefined && claim.stepId !== stepId)) continue;
+    suiteClaims.delete(key);
+    released += 1;
+  }
+  return released;
+}
+
+async function handleSuiteOwnerRelease(body: Record<string, unknown>): Promise<JsonResponse> {
+  const runId = typeof body.run_id === "string" ? body.run_id.trim() : "";
+  const stepId = typeof body.step_id === "string" ? body.step_id.trim() : undefined;
+  if (!runId || runId.length > SUITE_OWNER_MAX_LENGTH
+    || (stepId !== undefined && (!stepId || stepId.length > SUITE_OWNER_MAX_LENGTH))) {
+    return { status: 400, body: { error: "Invalid suite claim owner attribution" } };
+  }
+  return ok({ released: releaseSuiteClaimsByOwner(runId, stepId) });
 }
 
 async function handleSuiteEvent(body: Record<string, unknown>): Promise<JsonResponse> {
@@ -605,6 +731,7 @@ async function handleTerminateRun(runId: string): Promise<JsonResponse> {
   } catch (err) {
     logger.warn("control-server: removeRunCrons threw", { runId, error: String(err) });
   }
+  releaseSuiteClaimsByOwner(runId);
 
   try {
     getDb()
@@ -678,6 +805,7 @@ async function handlePauseRun(runId: string, drain = false, requestedBy = "unkno
   } catch (err) {
     logger.warn("control-server: pause removeRunCrons threw", { runId, error: String(err) });
   }
+  releaseSuiteClaimsByOwner(runId);
   try {
     getDb()
       .prepare(
@@ -946,10 +1074,21 @@ export interface ControlServerOptions {
   secret?: string;
   onError?: (err: NodeJS.ErrnoException) => void;
   listen?: boolean;
+  /** Deterministic suite-claim test seam. */
+  now?: () => number;
+  /** Deterministic suite owner liveness test seam. */
+  probeSuiteOwnerPid?: (pid: number) => SuiteOwnerLiveness;
+  /** Deterministic suite reclaim observability test seam. */
+  emitSuiteClaimEvent?: (event: TamanduaEvent) => void;
 }
 
 export function createControlServer(options: ControlServerOptions = {}): http.Server {
   const expectedSecret = options.secret;
+  const suiteClaimRuntime: SuiteClaimRuntime = {
+    now: options.now ?? Date.now,
+    probePid: options.probeSuiteOwnerPid ?? probeSuiteOwnerPid,
+    emitClaimEvent: options.emitSuiteClaimEvent ?? emitEvent,
+  };
 
   const server = http.createServer(async (req, res) => {
     const respond = (status: number, body: Record<string, unknown>): void => {
@@ -1015,12 +1154,17 @@ export function createControlServer(options: ControlServerOptions = {}): http.Se
           return;
         }
         if (pathname === "/suite/claim") {
-          const r = await handleSuiteClaim(body);
+          const r = await handleSuiteClaim(body, suiteClaimRuntime);
           respond(r.status, r.body);
           return;
         }
         if (pathname === "/suite/release") {
           const r = await handleSuiteRelease(body);
+          respond(r.status, r.body);
+          return;
+        }
+        if (pathname === "/suite/release-owner") {
+          const r = await handleSuiteOwnerRelease(body);
           respond(r.status, r.body);
           return;
         }
