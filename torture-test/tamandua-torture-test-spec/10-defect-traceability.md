@@ -57,6 +57,9 @@ where coverage is ambient (checked on every run).
 | DC48 | Resource exhaustion (ENOSPC) & weird-git targets (detached-HEAD origin, tree-rewriting hooks, unreachable origin, identical-tree repos) | W4.32; W4.30; W4.31; W4.26; W4.28 |
 | DC49 | Upgrade-in-place: DB migrations over aged state; stale CLI vs new daemon | W4.25; W4.34; W5 aged-state seeding |
 | DC50 | Advertised-but-unwired features: `notifications.url` webhook never populated from normal launches | W2.26 |
+| DC51 | Release-delivery corridor: installer artifact fidelity (shallow clone + fresh `npm install` + symlink + uninstall), update transaction failing AFTER the pull (build failure / SIGINT / post-stop install failure), downgrade-on-revert over a forward-migrated DB (live seam: strict-equality `migrate()` down-stamps `user_version`), custom workflows across versions | W0.9; W4.49; W4.25 legs 2–3 + custom-workflow leg; Tier-0 |
+| DC52 | Secret/credential leakage into user-shareable artifacts (logs, events, DB dumps, error messages folding child stderr, forensics bundles) | O18 canary sweep |
+| DC53 | Slow resource leaks over long daemon uptime (RSS/fd/DB+WAL growth) — invisible to terminal-state oracles, surfaces at week two in the field | O19 trend oracle |
 
 ## Accepted gaps (explicitly NOT covered, with rationale)
 

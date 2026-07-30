@@ -80,7 +80,9 @@ before it ever reaches a campaign.
 **`tt-recorder` (process telemetry).** A local sampler (nohup loop, 5s:
 PID/PGID/cwd/cmdline of tamandua-family processes → flat file, harvested
 into `results/` at wave boundaries). This is O4's liveness-provenance
-source. Evidence collection is cmdline/cwd/lsof-based, never env-based
+source, and — extended with per-daemon RSS, open-fd count, and
+`tamandua.db`+WAL byte size per sample — O19's resource-trend source.
+Evidence collection is cmdline/cwd/lsof-based, never env-based
 (portable across kernels that hide other processes' env).
 
 **`tt-chaos` (operator).** Executes per-scenario/per-storm schedules:
@@ -203,4 +205,5 @@ granularity because week-rounding hides the spread; Tier-1 ≈ 10–13
 person-days). Tracked under bd (`tamandua-20o` and children); campaigns
 are repeatable per release thereafter — marginal cost of a
 re-certification ≈ 48h + ~50M tokens (Tier-2) or ~24h + ~15M (Tier-1),
-all tooling amortized.
+all tooling amortized — and Tier-0 (~3h + <=2M tokens) becomes the
+per-push gate that runs between campaigns.

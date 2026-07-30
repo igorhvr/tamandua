@@ -55,10 +55,11 @@ Every manifest case carries one of:
   O9, O10, O11, O16 — the S0/S1 carriers, each with mutation self-tests
   before T+0.
 - **Post-batch (non-gating during the campaign, mandatory in W6):** O5,
-  O6, O7, O12, O13 — hygiene/truthfulness batch scripts (O14
-  retired; O17 gates only concession landings, else post-batch);
-  findings
-  become S2 issues.
+  O6, O7, O12, O13, O19 — hygiene/truthfulness batch scripts (O14
+  retired; O17 gates only concession landings, else post-batch); findings
+  become S2 issues. **O18 (secret hygiene) runs at every wave boundary
+  and pages on a hit** — the one hygiene oracle that escalates like a
+  gate.
 - **Bracketing:** O15 runs at W0 and W6 exactly.
 
 ## Oracle battery
@@ -299,7 +300,12 @@ event run-id sets — not mtimes) and the choice is recorded in the
 manifest. The dev checkout and inert-junk hashes are watched by a 1-min
 sampler for the whole campaign; an unexpected change emits SECURITY-ALERT
 and auto-pauses TT launches (transient mutate-and-restore inside one poll
-window is a recorded v1 blind spot).
+window is a recorded v1 blind spot). Known benign exclusion, recorded not
+alarmed: the daemon's background version check performs a quiet
+`git fetch` in its install repo on a timer (failures swallowed) — the TT
+daemons will do this inside the TT env; O15's watch list treats that
+fetch's ref/FETCH_HEAD churn in the TT install repo as expected, while
+any such churn in the PRODUCTION checkout still alarms.
 
 **O16 — Held-out acceptance probes (anti-fake-work; per mutation run, gating).**
 For every completed run of a mutation workflow — **merging or not** (plain
@@ -326,6 +332,32 @@ landed via `merge.landed_without_suite_evidence` has no green-evidence
 backstop, so any new red/skip/xfail beyond planned deletions is a hard
 PRODUCT_FAIL — the one structural guard that the FMIS default gate did not
 ship broken code (exercised by W4.36).
+
+**O18 — Secret hygiene (wave boundaries + W6; a hit pages).**
+At provisioning, every credential the TT env owns gets a **canary**: the
+TT daemon secret is generated with a unique greppable prefix
+(`TTSECRET-...`), and the copied `.pi` / `.hermes` auth material is
+augmented with canary tokens of the same prefix (real values also listed
+in a sealed grep set). O18 sweeps every artifact class a user might share
+or the suite archives — daemon/dashboard/MCP logs, events JSONL +
+archives, a full `tamandua.db` dump, all captured CLI outputs
+(`doctor`/`status`/`logs`/error messages), forensics bundles, the final
+report — for any canary or sealed-set hit. One hit = S1-security
+(error-message paths that fold child stderr into thrown errors are the
+expected offender class). Mutation self-test: a canary planted in a
+synthetic log must be detected before T+0. Zero tokens, minutes per
+sweep.
+
+**O19 — Daemon resource trend (post-batch, W6-mandatory).**
+tt-recorder samples each TT daemon's RSS and open-fd count (plus
+`tamandua.db`+WAL byte size) every 5s for the whole campaign. O19 flags:
+sustained monotonic RSS growth across >=6h after excluding active-run
+windows; fd counts that never return to their post-wave baseline; DB+WAL
+growth disproportionate to row growth. The 46-hour campaign is the
+closest proxy the suite has for users' weeks-long daemon uptimes — a
+slow leak passes every terminal-state oracle and ships green without
+this. Advisory S2 in the first campaign (calibrates the thresholds),
+gating thereafter.
 
 ## Outcome taxonomy (per scenario)
 

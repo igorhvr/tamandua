@@ -53,6 +53,17 @@ this spec.
 
 Tiers are **host capability profiles**, not machine names (01):
 
+- **Tier-0 (push gate):** <=3h, <=2M tokens, headless, runnable on EVERY
+  push — because a 24h minimum gate loses to "ship it" every time on a
+  fix-today day, and then the release ships ungated. Contents (all
+  reused from the waves; this tier is selection, not new machinery):
+  W0.0 fast subset + W0.1/W0.2 + W0.3b binding proof + W0.9
+  install-shape fidelity + W4.49 update-transaction arms + W4.25
+  upgrade/downgrade legs + W4.35's zero-token verdict matrix + **one
+  real bfmw (tt-ts, pi) under the full gating oracle set** + one real
+  do-now (hermes) for O3z attribution. Verdict vocabulary identical to
+  the campaign's. Tier-0 certifies a push; Tier-1/2 remain the periodic
+  deep gates.
 - **Tier-1 (MVP, first execution):** ~40 runs, ~24–30h, ~15M tokens;
   requires only {node ≥22, python3}; fixtures tt-ts + tt-python
   (+ tt-poly-lite). Covers the S0/S1-generating defect classes. Marked
@@ -75,7 +86,7 @@ Tiers are **host capability profiles**, not machine names (01):
 | W2 | Full workflow catalog + CLI/authoring surface | 8–20h | 3 | 29 (7 of them ≈zero-token) | 10M / 13M |
 | W3 | Harness duel: fdmw/bfmw, pi vs hermes | 10–34h | 4–5 | 21 | 20M / 26M |
 | — | Triage block A (post-W2) | 20–22h | — | — | — |
-| W4 | Fault injection & adversarial ops | 26–38h | 3 | ~45 scen. (~20 token-bearing; the rest scripted/zero-token) | 6M / 8M |
+| W4 | Fault injection & adversarial ops | 26–38h | 3 | ~47 scen. (~20 token-bearing; the rest scripted/zero-token) | 6M / 8M |
 | — | Triage block B (post-W3/W4 core) | 34–36h | — | — | — |
 | W5 | The storm — Round A clean 8+2, Round B chaos ×5 | 38–46h | 8 active + 2 queued | 15 | 12M / 16M |
 | W6 | Forensic audit & report | 46–48h | — | 0 | ≈0 |
@@ -96,7 +107,7 @@ at 03:00 (11).
 | `README.md` | This file — mission, principles, tiers, wave map. |
 | `01-environment-and-isolation.md` | Single-host model, capability profiles & predicates, platform facts, P0 provisioning, TT-env design (controller vs spawn env!), credentials, isolation probe. |
 | `02-fixture-projects.md` | Language fixtures + `tt-poly`/`tt-poly-lite`; seeded-defect calibration protocol; junk probes; reset & disk budgets. |
-| `03-oracles.md` | Oracle battery O1–O17 (tiered; incl. O16 held-out probes, O17 test-inventory), outcome taxonomy incl. INVALID, scenario classes & sample sizes, severity gates, KNOWN-OPEN waivers. |
+| `03-oracles.md` | Oracle battery O1–O19 (tiered; incl. O16 held-out probes, O17 test-inventory, O18 secret hygiene, O19 resource trend), outcome taxonomy incl. INVALID, scenario classes & sample sizes, severity gates, KNOWN-OPEN waivers. |
 | `04-wave-0-preflight.md` | Zero-token gates, dress rehearsal, canaries. |
 | `05-wave-1-language-smoke.md` | Per-language plumbing validation. |
 | `06-wave-2-workflow-coverage.md` | 20 workflows + authoring/CLI/branch-shape scenarios. |

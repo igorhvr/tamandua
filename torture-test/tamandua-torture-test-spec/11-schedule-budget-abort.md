@@ -8,6 +8,14 @@ Tier-1's measured durations and spends replace the production-derived
 estimates below for Tier-2 planning — the numbers in this file are honest
 *priors*, not measurements.
 
+**Tier-0 per push.** Once the tooling exists, the Tier-0 push gate
+(README §tiers: <=3h, <=2M tokens — delivery-corridor scenarios W0.9/
+W4.49/W4.25 + the scripted verdict matrix + one real bfmw + one hermes
+do-now) runs on every push to the release branch, headless, gates
+auto-evaluated. Tier-0 red blocks the push the way a red unit suite
+would; it never substitutes for the periodic Tier-1/2 campaigns, it
+keeps the S0/S1 classes from regressing between them.
+
 ## 48-hour timeline (Tier-2; T+0 = campaign start, preceded by the W0 dress-rehearsal day)
 
 ```
