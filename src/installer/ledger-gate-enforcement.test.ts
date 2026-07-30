@@ -213,7 +213,7 @@ describe("finalize_merge ledger gate enforcement", () => {
     );
   });
 
-  it("refuses default missing evidence on both attempts — no concession", () => {
+  it("default missing evidence reroutes once, then lands with merge.landed_without_suite_evidence annotation", () => {
     const seeded = seedRun("default", "missing");
 
     // First merger claim: missing evidence → refused, rerouted to tester.
@@ -244,7 +244,50 @@ describe("finalize_merge ledger gate enforcement", () => {
     assert.equal(claimStep("tester", seeded.runId).found, true);
     assert.equal(completeStep(seeded.testerId, TESTER_OUTPUT).status, "advanced");
 
-    // Second merger claim: missing evidence still refuses (terminal limit exhausted → fails).
+    // Second merger claim: concession valve consumed → claim succeeds, step lands.
+    assert.equal(claimStep("merger", seeded.runId).found, true);
+    assert.equal(completeStep(seeded.finalizeId, "STATUS: done").status, "completed");
+
+    // merge.landed_without_suite_evidence event emitted.
+    const landingEvents = getRunEvents(seeded.runId).filter(
+      (event) => event.event === "merge.landed_without_suite_evidence",
+    );
+    assert.equal(landingEvents.length, 1);
+    assert.equal(landingEvents[0].runId, seeded.runId);
+    assert.equal(landingEvents[0].gateMode, "default");
+
+    // Run completed successfully (not failed).
+    const run = seeded.db.prepare("SELECT status FROM runs WHERE id = ?").get(seeded.runId) as { status: string };
+    assert.equal(run.status, "completed");
+  });
+
+  it("fail_missing=1 refuses default missing evidence permanently with no concession", () => {
+    const seeded = seedRun("default", "missing");
+
+    // Inject fail_missing=1 into the run context.
+    const run = seeded.db.prepare("SELECT context FROM runs WHERE id = ?").get(seeded.runId) as { context: string };
+    const ctx = JSON.parse(run.context);
+    ctx.fail_missing = "1";
+    seeded.db.prepare("UPDATE runs SET context = ? WHERE id = ?").run(JSON.stringify(ctx), seeded.runId);
+
+    // First merger claim: missing evidence → refused, rerouted to tester.
+    assert.equal(claimStep("merger", seeded.runId).found, false);
+    const afterFirst = seeded.db.prepare(
+      "SELECT status, reroute_count, terminal_reroute_count FROM steps WHERE id = ?",
+    ).get(seeded.finalizeId) as {
+      status: string;
+      reroute_count: number;
+      terminal_reroute_count: number;
+    };
+    assert.equal(afterFirst.status, "waiting");
+    assert.equal(afterFirst.reroute_count, 1);
+    assert.equal(afterFirst.terminal_reroute_count, 1);
+
+    // Tester reruns.
+    assert.equal(claimStep("tester", seeded.runId).found, true);
+    assert.equal(completeStep(seeded.testerId, TESTER_OUTPUT).status, "advanced");
+
+    // Second merger claim: fail_missing=1 → strict-missing, refuses permanently.
     assert.equal(claimStep("merger", seeded.runId).found, false);
     const afterSecond = seeded.db.prepare(
       "SELECT status, output, reroute_count, terminal_reroute_count FROM steps WHERE id = ?",
@@ -259,11 +302,66 @@ describe("finalize_merge ledger gate enforcement", () => {
     assert.equal(afterSecond.terminal_reroute_count, 1);
     assert.match(afterSecond.output, /^FAILURE_CLASS: refused_permanent$/m);
     assert.match(afterSecond.output, /^LEDGER_EVIDENCE: missing$/m);
-    assert.ok(afterSecond.output.includes(`TREE_HASH: ${TESTED_TREE}`));
-    assert.ok(afterSecond.output.includes(`CMD_HASH: ${computeCmdHash(TEST_CMD)}`));
 
-    const run = seeded.db.prepare("SELECT status FROM runs WHERE id = ?").get(seeded.runId) as { status: string };
-    assert.equal(run.status, "failed");
+    const failedRun = seeded.db.prepare("SELECT status FROM runs WHERE id = ?").get(seeded.runId) as { status: string };
+    assert.equal(failedRun.status, "failed");
+
+    // No merge.landed_without_suite_evidence event was ever emitted.
+    assert.equal(
+      getRunEvents(seeded.runId).filter(
+        (event) => event.event === "merge.landed_without_suite_evidence",
+      ).length,
+      0,
+    );
+  });
+
+  it("fail_missing=1 with green mode both refuse missing evidence permanently (combined strict)", () => {
+    // When both fail_missing=1 AND merge_gate=green are active, the
+    // combined strict-missing behavior must still refuse permanently —
+    // no concession, no landing, just like either alone.
+    const seeded = seedRun("green", "missing");
+
+    // Inject fail_missing=1 into the run context on top of green mode.
+    const run = seeded.db.prepare("SELECT context FROM runs WHERE id = ?").get(seeded.runId) as { context: string };
+    const ctx = JSON.parse(run.context);
+    ctx.fail_missing = "1";
+    seeded.db.prepare("UPDATE runs SET context = ? WHERE id = ?").run(JSON.stringify(ctx), seeded.runId);
+
+    // First merger claim: missing evidence → refused, rerouted to tester.
+    assert.equal(claimStep("merger", seeded.runId).found, false);
+    const afterFirst = seeded.db.prepare(
+      "SELECT status, reroute_count, terminal_reroute_count FROM steps WHERE id = ?",
+    ).get(seeded.finalizeId) as {
+      status: string;
+      reroute_count: number;
+      terminal_reroute_count: number;
+    };
+    assert.equal(afterFirst.status, "waiting");
+    assert.equal(afterFirst.reroute_count, 1);
+    assert.equal(afterFirst.terminal_reroute_count, 1);
+
+    // Tester reruns.
+    assert.equal(claimStep("tester", seeded.runId).found, true);
+    assert.equal(completeStep(seeded.testerId, TESTER_OUTPUT).status, "advanced");
+
+    // Second merger claim: green + fail_missing=1 → strict-missing, refuses permanently.
+    assert.equal(claimStep("merger", seeded.runId).found, false);
+    const afterSecond = seeded.db.prepare(
+      "SELECT status, output, reroute_count, terminal_reroute_count FROM steps WHERE id = ?",
+    ).get(seeded.finalizeId) as {
+      status: string;
+      output: string;
+      reroute_count: number;
+      terminal_reroute_count: number;
+    };
+    assert.equal(afterSecond.status, "failed");
+    assert.equal(afterSecond.reroute_count, 1);
+    assert.equal(afterSecond.terminal_reroute_count, 1);
+    assert.match(afterSecond.output, /^FAILURE_CLASS: refused_permanent$/m);
+    assert.match(afterSecond.output, /^LEDGER_EVIDENCE: missing$/m);
+
+    const failedRun = seeded.db.prepare("SELECT status FROM runs WHERE id = ?").get(seeded.runId) as { status: string };
+    assert.equal(failedRun.status, "failed");
 
     // No merge.landed_without_suite_evidence event was ever emitted.
     assert.equal(

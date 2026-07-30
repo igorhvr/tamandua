@@ -8,6 +8,7 @@ import { closeDb, getDb } from "../../dist/db.js";
 import {
   evaluateFinalizeMergeLedgerGate,
   formatLedgerGateRefusal,
+  isStrictMissing,
   type LedgerGateDecision,
   type LedgerGateRefusalDecision,
 } from "../../dist/installer/ledger-gate.js";
@@ -197,6 +198,56 @@ describe("finalize_merge ledger gate evaluator", () => {
   });
 });
 
+describe("isStrictMissing", () => {
+  it("returns false when fail_missing is absent and gateMode is default", () => {
+    assert.equal(isStrictMissing({}, "default"), false);
+  });
+
+  it("returns false when fail_missing is 0", () => {
+    assert.equal(isStrictMissing({ fail_missing: "0" }, "default"), false);
+  });
+
+  it("returns false when fail_missing is empty", () => {
+    assert.equal(isStrictMissing({ fail_missing: "" }, "default"), false);
+  });
+
+  it("returns false when fail_missing is false", () => {
+    assert.equal(isStrictMissing({ fail_missing: "false" }, "default"), false);
+  });
+
+  it("returns false when fail_missing is random string", () => {
+    assert.equal(isStrictMissing({ fail_missing: "maybe" }, "default"), false);
+  });
+
+  it("returns true when fail_missing is 1", () => {
+    assert.equal(isStrictMissing({ fail_missing: "1" }, "default"), true);
+  });
+
+  it("returns true when fail_missing is true", () => {
+    assert.equal(isStrictMissing({ fail_missing: "true" }, "default"), true);
+  });
+
+  it("returns true when fail_missing is on", () => {
+    assert.equal(isStrictMissing({ fail_missing: "on" }, "default"), true);
+  });
+
+  it("returns true when fail_missing is TRUE (case-insensitive)", () => {
+    assert.equal(isStrictMissing({ fail_missing: "TRUE" }, "default"), true);
+  });
+
+  it("returns true when gateMode is green regardless of fail_missing", () => {
+    assert.equal(isStrictMissing({}, "green"), true);
+    assert.equal(isStrictMissing({ fail_missing: "0" }, "green"), true);
+    assert.equal(isStrictMissing({ fail_missing: "false" }, "green"), true);
+  });
+
+  it("returns false when gateMode is off regardless of fail_missing", () => {
+    // off is the master bypass: strict-missing doesn't matter, but for
+    // correctness the helper reports it as not strict.
+    assert.equal(isStrictMissing({ fail_missing: "1" }, "off"), false);
+  });
+});
+
 describe("formatLedgerGateRefusal diagnostics", () => {
   let fixtureRoot: string;
   let originRepo: string;
@@ -271,7 +322,7 @@ describe("formatLedgerGateRefusal diagnostics", () => {
     assert.match(output, /^FAILURE_CLASS: refused_permanent$/m);
     assert.match(output, /^LEDGER_EVIDENCE: missing$/m);
     assert.match(output, /^WORKSPACE_STATE: clean$/m);
-    assert.match(output, /^ACTION: execute the test suite/m);
+    assert.match(output, /^ACTION: Run the EXACT shim-wrapped test command/m);
   });
 
   it("includes WORKSPACE_STATE dirty with file count for a dirty repo", () => {
@@ -282,7 +333,7 @@ describe("formatLedgerGateRefusal diagnostics", () => {
     assert.match(output, /^FAILURE_CLASS: refused_permanent$/m);
     assert.match(output, /^WORKSPACE_STATE: dirty \(1 file: \?\? unstaged.txt\)$/m);
     assert.match(output, /^Uncommitted changes mean the tested tree/m);
-    assert.match(output, /^ACTION: commit all workspace changes/m);
+    assert.match(output, /^ACTION: Run the EXACT shim-wrapped test command/m);
   });
 
   it("diagnoses a dirty tested worktree when its ledger origin is clean", () => {
@@ -346,7 +397,71 @@ describe("formatLedgerGateRefusal diagnostics", () => {
     assert.match(output, /^FAILURE_CLASS: refused_permanent$/m);
     assert.match(output, /^WORKSPACE_STATE: unavailable$/m);
     assert.match(output, /^NEAREST_EVIDENCE: none for this test command$/m);
-    assert.match(output, /^ACTION: ensure the workspace is clean/m);
+    assert.match(output, /^ACTION: Run the EXACT shim-wrapped test command/m);
+  });
+
+  it("missing-evidence refusal message contains the exact test command", () => {
+    const decision: LedgerGateRefusalDecision = {
+      ...makeMissingDecision(),
+      testCmd: "tamandua-test --repo '/some/repo' --run 'r1' --step 'test' -- 'npm test'",
+      cmdHash: computeCmdHash("tamandua-test --repo '/some/repo' --run 'r1' --step 'test' -- 'npm test'"),
+    };
+    const output = formatLedgerGateRefusal(decision);
+    assert.match(output, /Run the EXACT shim-wrapped test command VERBATIM/);
+    assert.match(output, /do NOT run the raw test script directly/);
+    assert.match(output, /tamandua-test --repo '\/some\/repo' --run 'r1' --step 'test' -- 'npm test'/);
+  });
+
+  it("missing-evidence refusal message contains timeout and --force guidance", () => {
+    const decision = makeMissingDecision();
+    const output = formatLedgerGateRefusal(decision);
+    assert.match(output, /TIMED OUT/);
+    assert.match(output, /--force/);
+    assert.match(output, /longer timeout/);
+  });
+
+  it("missing-evidence refusal message states the merge-will-land-without-evidence stakes", () => {
+    const decision = makeMissingDecision();
+    const output = formatLedgerGateRefusal(decision);
+    assert.match(output, /STAKES:/);
+    assert.match(output, /verified evidence/);
+    assert.match(output, /cached for other runs/);
+    assert.match(output, /allowed to land WITHOUT evidence this once/);
+    assert.match(output, /path is discouraged/);
+  });
+
+  it("red-evidence refusal message does NOT contain shim-usage imperative", () => {
+    const db = getDb();
+    const origin = fs.realpathSync(originRepo);
+    const cmdHash = computeCmdHash(TEST_CMD);
+    const result = db.prepare(
+      `INSERT INTO suite_results
+         (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, log_tail, run_id, step_id, created_at)
+       VALUES (?, ?, ?, ?, 7, 50, 'red-log', 'red-run', 'red-step', '2026-06-15T12:00:00.000Z')`,
+    ).run(origin, "abcdef1234567890abcdef1234567890abcdef12", cmdHash, TEST_CMD);
+    const decision: LedgerGateRefusalDecision = {
+      status: "red",
+      gateMode: "green",
+      originRepo: origin,
+      treeHash: "abcdef1234567890abcdef1234567890abcdef12",
+      cmdHash,
+      testCmd: TEST_CMD,
+      row: {
+        id: Number(result.lastInsertRowid),
+        exitCode: 7,
+        durationMs: 50,
+        logTail: "red-log",
+        runId: "red-run",
+        stepId: "red-step",
+        createdAt: "2026-06-15T12:00:00.000Z",
+      },
+    };
+    const output = formatLedgerGateRefusal(decision);
+    // Red evidence uses the general ACTION enrichment, NOT the shim-usage imperative
+    assert.doesNotMatch(output, /Run the EXACT shim-wrapped test command VERBATIM/);
+    assert.doesNotMatch(output, /STAKES:/);
+    assert.doesNotMatch(output, /allowed to land WITHOUT evidence this once/);
+    assert.match(output, /^ACTION: execute the test suite/m);
   });
 
   it("format is unchanged for red decisions (diagnostics appended after existing red lines)", () => {

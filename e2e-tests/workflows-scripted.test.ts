@@ -1648,6 +1648,7 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
     tester: ScriptedBehavior | ScriptedBehavior[],
     options: {
       mergeGate?: "green" | "off";
+      failMissing?: boolean;
       inert?: boolean;
       buildCmd?: string;
       developer?: ScriptedBehavior | ScriptedBehavior[];
@@ -1675,6 +1676,9 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
       "--worktree-origin-ref", originalBranch,
     ];
     args.push("--context", `merge_gate=${options.mergeGate ?? "default"}`);
+    if (options.failMissing) {
+      args.push("--context", "fail_missing=1");
+    }
     const runIdPrefix = await spawnWorkflowRun(args, baseEnv(ctx.env.homeDir, ctx.env.controlPort));
     const runId = resolveFullRunId(runIdPrefix, ctx.env.tamanduaDir);
     const status = await waitForRun(ctx, runId, 200_000);
@@ -1837,56 +1841,143 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
     }
   });
 
-  it("LGAT: missing evidence refuses in default and green modes", { timeout: 240_000 }, async () => {
-    for (const mergeGate of [undefined, "green"] as const) {
-      let run: Awaited<ReturnType<typeof launchLgatRun>> | undefined;
-      try {
-        const unattestedTester: ScriptedBehavior = {
-          output: "STATUS: done\nRESULTS: intentionally omitted suite execution\nTESTED_TREE: {{gitTree}}",
-        };
-        run = await launchLgatRun("true", [unattestedTester, unattestedTester], { mergeGate });
+  it("LGAT: default mode missing evidence reroutes once then lands with concession annotation", { timeout: 240_000 }, async () => {
+    let run: Awaited<ReturnType<typeof launchLgatRun>> | undefined;
+    try {
+      const unattestedTester: ScriptedBehavior = {
+        output: "STATUS: done\nRESULTS: intentionally omitted suite execution\nTESTED_TREE: {{gitTree}}",
+      };
+      run = await launchLgatRun("true", [unattestedTester, unattestedTester]);
 
-        assert.equal(run.status, "failed", `${mergeGate ?? "default"} mode must refuse missing evidence\n${diagnostics(run.ctx)}`);
-        assert.equal(run.ctx.scripted.workInvocations("tester").length, 2);
-        assert.equal(run.ctx.scripted.workInvocations("merger").length, 0, "merge command must never execute");
-        assertLgatMarkerNotLanded(run);
-        assert.equal(
-          dbRows(run.ctx.env.tamanduaDir, "SELECT id FROM suite_results WHERE run_id = ?", run.runId).length,
-          0,
-        );
+      assert.equal(run.status, "completed", `default mode must land via concession\n${diagnostics(run.ctx)}`);
+      assert.equal(run.ctx.scripted.workInvocations("tester").length, 2);
+      assert.equal(run.ctx.scripted.workInvocations("merger").length, 1, "merge command must execute after concession");
+      assertLgatMarkerLanded(run);
+      assert.equal(
+        dbRows(run.ctx.env.tamanduaDir, "SELECT id FROM suite_results WHERE run_id = ?", run.runId).length,
+        0,
+      );
 
-        const mergeStep = dbRow<{ status: string; reroute_count: number; output: string }>(
-          run.ctx.env.tamanduaDir,
-          "SELECT status, reroute_count, output FROM steps WHERE run_id = ? AND step_id = 'finalize_merge'",
-          run.runId,
-        );
-        assert.equal(mergeStep.status, "failed");
-        assert.equal(mergeStep.reroute_count, 1);
-        assert.ok(
-          mergeStep.output.startsWith(
-            "FAILURE_CLASS: refused_permanent\n" +
-            "Ledger gate refused finalize_merge: no matching TSTX suite execution exists.\n" +
-            "LEDGER_EVIDENCE: missing\n",
-          ),
-          "missing-evidence refusal must retain its core prefix before dynamic diagnostics",
-        );
-        assert.match(mergeStep.output, /^ORIGIN_REPO: .+$/m);
-        assert.match(mergeStep.output, /^TREE_HASH: [0-9a-f]{40}$/m);
-        assert.match(mergeStep.output, /^CMD_HASH: [0-9a-f]{64}$/m);
-        assert.match(mergeStep.output, /^TEST_CMD: true$/m);
-        assert.match(mergeStep.output, /^WORKSPACE_STATE: /m);
-        assert.match(mergeStep.output, /^NEAREST_EVIDENCE: /m);
-        assert.match(mergeStep.output, /^ACTION: /m);
+      const mergeStep = dbRow<{ status: string; reroute_count: number; terminal_reroute_count: number; output: string }>(
+        run.ctx.env.tamanduaDir,
+        "SELECT status, reroute_count, terminal_reroute_count, output FROM steps WHERE run_id = ? AND step_id = 'finalize_merge'",
+        run.runId,
+      );
+      assert.equal(mergeStep.status, "done");
+      assert.equal(mergeStep.reroute_count, 1);
+      assert.equal(mergeStep.terminal_reroute_count, 1, "concession consumed on second attempt");
 
-        const events = readRunEvents(run.ctx.env.tamanduaDir, run.runId);
-        assert.equal(events.filter((event) => event.event === "step.rerouted").length, 1);
-        assert.equal(
-          events.filter((event) => event.event === "step.failed" && event.stepId === "finalize_merge").length,
-          1,
-        );
-      } finally {
-        await teardown(run?.ctx);
-      }
+      const events = readRunEvents(run.ctx.env.tamanduaDir, run.runId);
+      assert.equal(events.filter((event) => event.event === "step.rerouted").length, 1);
+      const concessions = events.filter((event) => event.event === "merge.landed_without_suite_evidence");
+      assert.equal(concessions.length, 1, "concession landing must emit merge.landed_without_suite_evidence");
+      assert.equal(concessions[0].runId, run.runId);
+      assert.equal(concessions[0].stepId, "finalize_merge");
+      assert.equal(concessions[0].gateMode, "default");
+      assert.match(String(concessions[0].origin), /origin-repo$/);
+      assert.match(String(concessions[0].treeHash), /^[0-9a-f]{40}$/);
+      assert.match(String(concessions[0].cmdHash), /^[0-9a-f]{64}$/);
+    } finally {
+      await teardown(run?.ctx);
+    }
+  });
+
+  it("LGAT: green mode missing evidence refuses permanently", { timeout: 240_000 }, async () => {
+    let run: Awaited<ReturnType<typeof launchLgatRun>> | undefined;
+    try {
+      const unattestedTester: ScriptedBehavior = {
+        output: "STATUS: done\nRESULTS: intentionally omitted suite execution\nTESTED_TREE: {{gitTree}}",
+      };
+      run = await launchLgatRun("true", [unattestedTester, unattestedTester], { mergeGate: "green" });
+
+      assert.equal(run.status, "failed", `green mode must refuse missing evidence\n${diagnostics(run.ctx)}`);
+      assert.equal(run.ctx.scripted.workInvocations("tester").length, 2);
+      assert.equal(run.ctx.scripted.workInvocations("merger").length, 0, "merge command must never execute");
+      assertLgatMarkerNotLanded(run);
+      assert.equal(
+        dbRows(run.ctx.env.tamanduaDir, "SELECT id FROM suite_results WHERE run_id = ?", run.runId).length,
+        0,
+      );
+
+      const mergeStep = dbRow<{ status: string; reroute_count: number; output: string }>(
+        run.ctx.env.tamanduaDir,
+        "SELECT status, reroute_count, output FROM steps WHERE run_id = ? AND step_id = 'finalize_merge'",
+        run.runId,
+      );
+      assert.equal(mergeStep.status, "failed");
+      assert.equal(mergeStep.reroute_count, 1);
+      assert.ok(
+        mergeStep.output.startsWith(
+          "FAILURE_CLASS: refused_permanent\n" +
+          "Ledger gate refused finalize_merge: no matching TSTX suite execution exists.\n" +
+          "LEDGER_EVIDENCE: missing\n",
+        ),
+        "missing-evidence refusal must retain its core prefix before dynamic diagnostics",
+      );
+
+      const events = readRunEvents(run.ctx.env.tamanduaDir, run.runId);
+      assert.equal(events.filter((event) => event.event === "step.rerouted").length, 1);
+      assert.equal(
+        events.filter((event) => event.event === "step.failed" && event.stepId === "finalize_merge").length,
+        1,
+      );
+      assert.equal(
+        events.filter((event) => event.event === "merge.landed_without_suite_evidence").length,
+        0,
+        "green mode must NOT emit concession landing event",
+      );
+    } finally {
+      await teardown(run?.ctx);
+    }
+  });
+
+  it("LGAT: fail_missing=1 missing evidence refuses permanently", { timeout: 240_000 }, async () => {
+    let run: Awaited<ReturnType<typeof launchLgatRun>> | undefined;
+    try {
+      const unattestedTester: ScriptedBehavior = {
+        output: "STATUS: done\nRESULTS: intentionally omitted suite execution\nTESTED_TREE: {{gitTree}}",
+      };
+      run = await launchLgatRun("true", [unattestedTester, unattestedTester], { failMissing: true });
+
+      assert.equal(run.status, "failed", `fail_missing=1 must refuse missing evidence\n${diagnostics(run.ctx)}`);
+      assert.equal(run.ctx.scripted.workInvocations("tester").length, 2);
+      assert.equal(run.ctx.scripted.workInvocations("merger").length, 0, "merge command must never execute");
+      assertLgatMarkerNotLanded(run);
+      assert.equal(
+        dbRows(run.ctx.env.tamanduaDir, "SELECT id FROM suite_results WHERE run_id = ?", run.runId).length,
+        0,
+      );
+
+      const mergeStep = dbRow<{ status: string; reroute_count: number; terminal_reroute_count: number; output: string }>(
+        run.ctx.env.tamanduaDir,
+        "SELECT status, reroute_count, terminal_reroute_count, output FROM steps WHERE run_id = ? AND step_id = 'finalize_merge'",
+        run.runId,
+      );
+      assert.equal(mergeStep.status, "failed");
+      assert.equal(mergeStep.reroute_count, 1);
+      assert.equal(mergeStep.terminal_reroute_count, 1, "first refusal consumes terminal concession, but strict-missing forbids landing");
+      assert.ok(
+        mergeStep.output.startsWith(
+          "FAILURE_CLASS: refused_permanent\n" +
+          "Ledger gate refused finalize_merge: no matching TSTX suite execution exists.\n" +
+          "LEDGER_EVIDENCE: missing\n",
+        ),
+        "missing-evidence refusal must retain its core prefix before dynamic diagnostics",
+      );
+
+      const events = readRunEvents(run.ctx.env.tamanduaDir, run.runId);
+      assert.equal(events.filter((event) => event.event === "step.rerouted").length, 1);
+      assert.equal(
+        events.filter((event) => event.event === "step.failed" && event.stepId === "finalize_merge").length,
+        1,
+      );
+      assert.equal(
+        events.filter((event) => event.event === "merge.landed_without_suite_evidence").length,
+        0,
+        "fail_missing=1 must NOT emit concession landing event",
+      );
+    } finally {
+      await teardown(run?.ctx);
     }
   });
 

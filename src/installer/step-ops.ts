@@ -17,7 +17,9 @@ import { getPgid } from "../lib/proc-info.js";
 import {
   evaluateFinalizeMergeLedgerGate,
   formatLedgerGateRefusal,
+  isStrictMissing,
   type LedgerGateDecision,
+  type LedgerGateMode,
   type LedgerGateRefusalDecision,
 } from "./ledger-gate.js";
 
@@ -3136,6 +3138,31 @@ function completeStepInternal(stepId: string, output: string): { status: string;
     });
   }
 
+  // Default-mode missing evidence landing via restored concession valve.
+  // When strict-missing is NOT in force AND the terminal concession has
+  // been consumed (one reroute already happened), the merge lands
+  // annotated so operators can see it happened without suite evidence.
+  if (
+    acceptanceGateDecision.status === "missing"
+    && hasTerminalLedgerConcession(step.id)
+  ) {
+    const runCtx = getRunContextForStep(step.id);
+    const strictMissing = isStrictMissing(runCtx ?? {}, acceptanceGateDecision.gateMode);
+    if (!strictMissing) {
+      emitEvent({
+        ts: new Date().toISOString(),
+        event: "merge.landed_without_suite_evidence",
+        runId: step.run_id,
+        workflowId: getWorkflowId(step.run_id),
+        stepId: step.step_id,
+        gateMode: acceptanceGateDecision.gateMode,
+        origin: acceptanceGateDecision.originRepo,
+        treeHash: acceptanceGateDecision.treeHash,
+        cmdHash: acceptanceGateDecision.cmdHash,
+      });
+    }
+  }
+
   // Single step: mark done and advance
   db.prepare(
     "UPDATE steps SET status = 'done', output = ?, updated_at = datetime('now') WHERE id = ?"
@@ -3636,12 +3663,59 @@ export function isAlreadyLanded(stepId: string, output: string): boolean {
   }
 }
 
+/**
+ * Check whether the terminal concession valve has been consumed for a step.
+ *
+ * A concession is "terminal" when the step has been rerouted at least once
+ * via a FAILURE_CLASS: refused_permanent refusal.  After the first terminal
+ * reroute, the concession is exhausted and the next refusal is converted
+ * into a soft landing (default-mode missing evidence only).
+ */
+export function hasTerminalLedgerConcession(stepId: string): boolean {
+  const db = getDb();
+  const step = db.prepare(
+    "SELECT terminal_reroute_count FROM steps WHERE id = ?",
+  ).get(stepId) as { terminal_reroute_count: number | null } | undefined;
+  return (step?.terminal_reroute_count ?? 0) >= 1;
+}
+
+/**
+ * Look up the run context for a step.
+ */
+function getRunContextForStep(stepId: string): Record<string, string> | null {
+  const db = getDb();
+  const stepRow = db.prepare(
+    "SELECT run_id FROM steps WHERE id = ?",
+  ).get(stepId) as { run_id: string } | undefined;
+  if (!stepRow) return null;
+  const run = db.prepare(
+    "SELECT context FROM runs WHERE id = ?",
+  ).get(stepRow.run_id) as { context: string } | undefined;
+  if (!run) return null;
+  try {
+    return JSON.parse(run.context);
+  } catch {
+    return {};
+  }
+}
+
 function getLedgerGateRefusal(
   stepId: string,
   decision: LedgerGateDecision,
 ): LedgerGateRefusalDecision | null {
   if (decision.status === "missing") {
-    return decision;
+    const runCtx = getRunContextForStep(stepId);
+    const strictMissing = isStrictMissing(runCtx ?? {}, decision.gateMode);
+    if (strictMissing) {
+      // Strict-missing (green mode or fail_missing=1): always refuse, no concession.
+      return decision;
+    }
+    // Default missing (not strict): reroute once, then concede.
+    if (!hasTerminalLedgerConcession(stepId)) {
+      return decision;
+    }
+    // Concession valve consumed — allow the merge to land.
+    return null;
   }
   return decision.status === "red" && decision.gateMode === "green"
     ? decision

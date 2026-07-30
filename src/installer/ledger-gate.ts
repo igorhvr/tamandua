@@ -97,6 +97,23 @@ function gateModeFromContext(context: Record<string, string>): LedgerGateMode {
 }
 
 /**
+ * Determine whether strict-missing enforcement is in force.
+ *
+ * Strict-missing is active when:
+ *   - gateMode is "green" (green already implies strict — backward compat),
+ *     OR the fail_missing context key has a truthy value ("1", "true", "on").
+ *
+ * When NOT strict-missing, the default concession valve (reroute once, then
+ * land-annotate) is in play for missing evidence.
+ */
+export function isStrictMissing(context: Record<string, string>, gateMode: LedgerGateMode): boolean {
+  if (gateMode === "off") return false;
+  if (gateMode === "green") return true;
+  const v = (context.fail_missing ?? "").toLowerCase();
+  return v === "1" || v === "true" || v === "on";
+}
+
+/**
  * Evaluate the TSTX ledger evidence for a pending finalize_merge step.
  *
  * Eligibility deliberately comes from a completed upstream step's output,
@@ -297,18 +314,28 @@ function buildRefusalDiagnostics(decision: LedgerGateRefusalDecision): string[] 
   }
 
   // ── ACTION ───────────────────────────────────────────────────────────
-  if (workspaceState.startsWith("WORKSPACE_STATE: dirty")) {
+  if (decision.status === "missing") {
+    // Missing evidence: deliver a detailed shim-usage imperative so the
+    // agent knows EXACTLY how to get evidence recorded (and what happens
+    // if it doesn't).
     diag.push(
-      "ACTION: commit all workspace changes, then execute the test suite via the provided shim-wrapped test command so evidence is recorded for the final tree, then resubmit.",
-    );
-  } else if (workspaceState.startsWith("WORKSPACE_STATE: clean")) {
-    diag.push(
-      "ACTION: execute the test suite via the provided shim-wrapped test command so evidence is recorded for the current tree, then resubmit.",
+      `ACTION: Run the EXACT shim-wrapped test command VERBATIM — do NOT run the raw test script directly:\n\n  ${decision.testCmd}\n\nIf the suite TIMED OUT (or you suspect a stale/interrupted result), re-run via the wrapper with --force and a longer timeout so it completes and records.\n\nSTAKES: If you record a green result this reroute, the merge lands on verified evidence AND the result is cached for other runs. If you do not, the merge will be allowed to land WITHOUT evidence this once (annotated), but that path is discouraged.`,
     );
   } else {
-    diag.push(
-      "ACTION: ensure the workspace is clean, then execute the test suite via the provided shim-wrapped test command so evidence is recorded for the final tree, then resubmit.",
-    );
+    // Red evidence: use the existing general ACTION enrichment (unchanged).
+    if (workspaceState.startsWith("WORKSPACE_STATE: dirty")) {
+      diag.push(
+        "ACTION: commit all workspace changes, then execute the test suite via the provided shim-wrapped test command so evidence is recorded for the final tree, then resubmit.",
+      );
+    } else if (workspaceState.startsWith("WORKSPACE_STATE: clean")) {
+      diag.push(
+        "ACTION: execute the test suite via the provided shim-wrapped test command so evidence is recorded for the current tree, then resubmit.",
+      );
+    } else {
+      diag.push(
+        "ACTION: ensure the workspace is clean, then execute the test suite via the provided shim-wrapped test command so evidence is recorded for the final tree, then resubmit.",
+      );
+    }
   }
 
   return diag;
