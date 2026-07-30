@@ -126,6 +126,11 @@ describe("finalize_merge ledger gate evaluator", () => {
     assert.equal(decision.treeHash, TESTED_TREE);
     assert.equal(decision.cmdHash, computeCmdHash(TEST_CMD));
     assert.equal(decision.originRepo, fs.realpathSync(originRepo));
+    assert.equal(
+      decision.testedRepo,
+      worktreeRepo,
+      "the tested worktree path must be retained separately from the normalized ledger origin",
+    );
     assert.equal(decision.testCmd, TEST_CMD, "the exact raw test command must be retained and hashed");
   }
 
@@ -195,6 +200,7 @@ describe("finalize_merge ledger gate evaluator", () => {
 describe("formatLedgerGateRefusal diagnostics", () => {
   let fixtureRoot: string;
   let originRepo: string;
+  let worktreeRepo: string;
   let stateDir: string;
   let originalDbPath: string | undefined;
   let originalHome: string | undefined;
@@ -203,6 +209,7 @@ describe("formatLedgerGateRefusal diagnostics", () => {
   before(() => {
     fixtureRoot = tamanduaTempDir("tamandua-refusal-diag-repo-");
     originRepo = path.join(fixtureRoot, "origin");
+    worktreeRepo = path.join(fixtureRoot, "tested-worktree");
     fs.mkdirSync(originRepo, { recursive: true });
     execFileSync("git", ["init"], { cwd: originRepo, stdio: "ignore" });
     execFileSync("git", ["config", "user.email", "refusal-diag@example.test"], { cwd: originRepo });
@@ -210,6 +217,10 @@ describe("formatLedgerGateRefusal diagnostics", () => {
     fs.writeFileSync(path.join(originRepo, "README.md"), "fixture\n");
     execFileSync("git", ["add", "README.md"], { cwd: originRepo });
     execFileSync("git", ["commit", "-m", "fixture"], { cwd: originRepo, stdio: "ignore" });
+    execFileSync("git", ["worktree", "add", "-b", "refusal-diag-test", worktreeRepo], {
+      cwd: originRepo,
+      stdio: "ignore",
+    });
   });
 
   beforeEach(() => {
@@ -235,17 +246,19 @@ describe("formatLedgerGateRefusal diagnostics", () => {
     fs.rmSync(stateDir, { recursive: true, force: true });
     // Clean up any test detritus from the shared repo
     try { fs.unlinkSync(path.join(originRepo, "unstaged.txt")); } catch { /* ok */ }
+    execFileSync("git", ["clean", "-fd"], { cwd: worktreeRepo, stdio: "ignore" });
   });
 
   after(() => {
     fs.rmSync(fixtureRoot, { recursive: true, force: true });
   });
 
-  function makeMissingDecision(): LedgerGateRefusalDecision {
+  function makeMissingDecision(options: { testedRepo?: string } = {}): LedgerGateRefusalDecision {
     return {
       status: "missing",
       gateMode: "default",
       originRepo: fs.realpathSync(originRepo),
+      ...(options.testedRepo === undefined ? {} : { testedRepo: options.testedRepo }),
       treeHash: "abcdef1234567890abcdef1234567890abcdef12",
       cmdHash: computeCmdHash(TEST_CMD),
       testCmd: TEST_CMD,
@@ -270,6 +283,33 @@ describe("formatLedgerGateRefusal diagnostics", () => {
     assert.match(output, /^WORKSPACE_STATE: dirty \(1 file: \?\? unstaged.txt\)$/m);
     assert.match(output, /^Uncommitted changes mean the tested tree/m);
     assert.match(output, /^ACTION: commit all workspace changes/m);
+  });
+
+  it("diagnoses a dirty tested worktree when its ledger origin is clean", () => {
+    fs.writeFileSync(path.join(worktreeRepo, "worktree-only.txt"), "dirty\n");
+    const decision = makeMissingDecision({ testedRepo: worktreeRepo });
+
+    assert.equal(execFileSync("git", ["status", "--porcelain"], {
+      cwd: originRepo,
+      encoding: "utf-8",
+    }).trim(), "", "the shared origin must remain clean for this regression");
+
+    const output = formatLedgerGateRefusal(decision);
+    assert.match(output, /^WORKSPACE_STATE: dirty \(1 file: \?\? worktree-only.txt\)$/m);
+  });
+
+  it("caps dirty tested-worktree diagnostics at 32 paths", () => {
+    for (let index = 0; index < 35; index += 1) {
+      fs.writeFileSync(path.join(worktreeRepo, `dirty-${String(index).padStart(2, "0")}.txt`), "dirty\n");
+    }
+    const output = formatLedgerGateRefusal(makeMissingDecision({ testedRepo: worktreeRepo }));
+    const workspaceLine = output.split("\n").find((line) => line.startsWith("WORKSPACE_STATE:"));
+
+    assert.ok(workspaceLine);
+    assert.match(workspaceLine, /\?\? dirty-00\.txt/);
+    assert.match(workspaceLine, /\?\? dirty-31\.txt/);
+    assert.doesNotMatch(workspaceLine, /dirty-32\.txt/);
+    assert.match(workspaceLine, /… and 3 more \(35 total\)/);
   });
 
   it("includes NEAREST_EVIDENCE none when no suite_results exist", () => {

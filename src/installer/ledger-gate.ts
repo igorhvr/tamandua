@@ -6,6 +6,7 @@ export type LedgerGateMode = "default" | "green" | "off";
 
 export interface LedgerGateKey {
   originRepo: string;
+  testedRepo?: string;
   treeHash: string;
   cmdHash: string;
   testCmd: string;
@@ -142,9 +143,13 @@ export function evaluateFinalizeMergeLedgerGate(stepId: string): LedgerGateDecis
     || context.repo
     || context.working_directory_for_harness;
   if (!repoPath?.trim()) return { status: "inert", reason: "no_origin_repo" };
+  const testedRepo = context.working_directory_for_harness?.trim()
+    || context.repo?.trim()
+    || context.worktree_origin_repository?.trim();
 
   const key: LedgerGateKey = {
     originRepo: getOriginRepo(repoPath),
+    testedRepo,
     treeHash,
     cmdHash: computeCmdHash(testCmd),
     testCmd,
@@ -231,7 +236,7 @@ function buildRefusalDiagnostics(decision: LedgerGateRefusalDecision): string[] 
   let workspaceState: string;
   try {
     const statusOut = execFileSync("git", ["status", "--porcelain"], {
-      cwd: decision.originRepo,
+      cwd: decision.testedRepo?.trim() || decision.originRepo,
       encoding: "utf-8",
       timeout: 5000,
     }).trim();
@@ -240,8 +245,8 @@ function buildRefusalDiagnostics(decision: LedgerGateRefusalDecision): string[] 
     } else {
       const files = statusOut.split("\n").filter(Boolean);
       const count = files.length;
-      const preview = files.slice(0, 5);
-      const suffix = count > 5 ? ` (showing first 5 of ${count})` : "";
+      const preview = files.slice(0, 32);
+      const suffix = count > 32 ? `, … and ${count - 32} more (${count} total)` : "";
       workspaceState = `WORKSPACE_STATE: dirty (${count} file${count === 1 ? "" : "s"}: ${preview.join(", ")}${suffix})`;
     }
   } catch {

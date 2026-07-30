@@ -1599,7 +1599,12 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
     ].join("\n");
   }
 
-  function lgatBehaviors(testCmd: "true" | "false", tester: ScriptedBehavior | ScriptedBehavior[]): ScriptedAgentConfig {
+  function lgatBehaviors(
+    testCmd: string,
+    tester: ScriptedBehavior | ScriptedBehavior[],
+    buildCmd = "true",
+    developer?: ScriptedBehavior | ScriptedBehavior[],
+  ): ScriptedAgentConfig {
     return {
       agents: {
         planner: {
@@ -1615,12 +1620,12 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
           output: [
             "STATUS: done",
             "ORIGINAL_BRANCH: {{input.ORIGINAL_BRANCH}}",
-            "BUILD_CMD: true",
+            `BUILD_CMD: ${buildCmd}`,
             `TEST_CMD: ${testCmd}`,
             "BASELINE: scripted fixture ready",
           ].join("\n"),
         },
-        developer: {
+        developer: developer ?? {
           writes: [{ file: "src/lgat-marker.ts", content: "// ledger gate scripted acceptance marker\n" }],
           commands: ["git add -A", 'git commit -m "feat: add LGAT acceptance marker"'],
           output: "STATUS: done\nCHANGES: added LGAT marker\nTESTS: scripted fixture",
@@ -1639,11 +1644,19 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
   }
 
   async function launchLgatRun(
-    testCmd: "true" | "false",
+    testCmd: string,
     tester: ScriptedBehavior | ScriptedBehavior[],
-    options: { mergeGate?: "green" | "off"; inert?: boolean } = {},
+    options: {
+      mergeGate?: "green" | "off";
+      inert?: boolean;
+      buildCmd?: string;
+      developer?: ScriptedBehavior | ScriptedBehavior[];
+    } = {},
   ): Promise<LgatRunResult> {
-    const ctx = await startScriptedEnvironment("feature-dev-merge-worktree", lgatBehaviors(testCmd, tester));
+    const ctx = await startScriptedEnvironment(
+      "feature-dev-merge-worktree",
+      lgatBehaviors(testCmd, tester, options.buildCmd, options.developer),
+    );
     if (options.inert) {
       const installedWorkflow = path.join(ctx.env.tamanduaDir, "workflows", "feature-dev-merge-worktree", "workflow.yml");
       const workflowText = fs.readFileSync(installedWorkflow, "utf-8");
@@ -1667,6 +1680,123 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
     const status = await waitForRun(ctx, runId, 200_000);
     return { ctx, repoDir, originalBranch, originTip, runId, status };
   }
+
+  it("LGAT: intentional untracked package-lock.json junk records and lands", { timeout: 240_000 }, async () => {
+    let run: Awaited<ReturnType<typeof launchLgatRun>> | undefined;
+    try {
+      run = await launchLgatRun("true", {
+        commands: [
+          "{{input.BUILD_CMD}}",
+          'test "$(git status --porcelain -- package-lock.json)" = "?? package-lock.json"',
+          "{{input.TEST_CMD}}",
+        ],
+        output: "STATUS: done\nRESULTS: intentional package-lock junk tolerated\nPROBE: package-lock.json untracked at tester time\nTESTED_TREE: {{gitTree}}",
+      }, { buildCmd: "npm install --package-lock-only --ignore-scripts --no-audit --no-fund" });
+
+      assert.equal(run.status, "completed", diagnostics(run.ctx));
+      assert.equal(run.ctx.scripted.workInvocations("tester").length, 1);
+      assert.equal(run.ctx.scripted.workInvocations("merger").length, 1);
+      assertLgatMarkerLanded(run);
+
+      const testStep = dbRow<{ output: string }>(
+        run.ctx.env.tamanduaDir,
+        "SELECT output FROM steps WHERE run_id = ? AND step_id = 'test'",
+        run.runId,
+      );
+      assert.match(testStep.output, /^PROBE: package-lock\.json untracked at tester time$/m);
+
+      const finalizeStep = dbRow<{ status: string }>(
+        run.ctx.env.tamanduaDir,
+        "SELECT status FROM steps WHERE run_id = ? AND step_id = 'finalize_merge'",
+        run.runId,
+      );
+      assert.equal(finalizeStep.status, "done");
+      const rows = dbRows<{ tree_hash: string; exit_code: number }>(
+        run.ctx.env.tamanduaDir,
+        "SELECT tree_hash, exit_code FROM suite_results WHERE run_id = ? ORDER BY id",
+        run.runId,
+      );
+      assert.equal(rows.length, 1, "the package-lock incident regression must record one suite result");
+      assert.equal(rows[0].exit_code, 0);
+      const landedTree = execSync(`git rev-parse "refs/heads/${run.originalBranch}^{tree}"`, {
+        cwd: run.repoDir,
+        encoding: "utf-8",
+      }).trim();
+      assert.equal(rows[0].tree_hash, landedTree, "package-lock junk must not change the committed-tree ledger key");
+      const landedLockfile = spawnSync(
+        "git",
+        ["show", `refs/heads/${run.originalBranch}:package-lock.json`],
+        { cwd: run.repoDir, encoding: "utf-8" },
+      );
+      assert.notEqual(landedLockfile.status, 0, "the untracked package-lock probe must not be committed by the regression");
+    } finally {
+      await teardown(run?.ctx);
+    }
+  });
+
+  it("LGAT: test-command-generated untracked content records against the committed tree and lands", { timeout: 240_000 }, async () => {
+    const pathBTestCmd = "printf 'generated during test\\n' > path-b-untracked.txt && printf 'PATH_B_COMMAND_EXECUTED\\n'";
+    let run: Awaited<ReturnType<typeof launchLgatRun>> | undefined;
+    try {
+      run = await launchLgatRun(pathBTestCmd, {
+        commands: [
+          "{{input.BUILD_CMD}}",
+          "{{input.TEST_CMD}}",
+          'test "$(git status --porcelain -- path-b-untracked.txt)" = "?? path-b-untracked.txt"',
+        ],
+        output: "STATUS: done\nRESULTS: generated untracked content tolerated\nCOMMAND: Path-B probe generated by shim-wrapped TEST_CMD\nPROBE: path-b-untracked.txt untracked after TEST_CMD\nTESTED_TREE: {{gitTree}}",
+      });
+
+      assert.equal(run.status, "completed", diagnostics(run.ctx));
+      assert.equal(run.ctx.scripted.workInvocations("tester").length, 1);
+      assert.equal(run.ctx.scripted.workInvocations("merger").length, 1);
+      assertLgatMarkerLanded(run);
+
+      const testStep = dbRow<{ output: string }>(
+        run.ctx.env.tamanduaDir,
+        "SELECT output FROM steps WHERE run_id = ? AND step_id = 'test'",
+        run.runId,
+      );
+      assert.match(testStep.output, /^COMMAND: Path-B probe generated by shim-wrapped TEST_CMD$/m);
+      assert.match(testStep.output, /^PROBE: path-b-untracked\.txt untracked after TEST_CMD$/m);
+      assert.doesNotMatch(testStep.output, /exit(?:ed with)? 86/i);
+
+      const rows = dbRows<{ tree_hash: string; cmd_display: string; exit_code: number }>(
+        run.ctx.env.tamanduaDir,
+        "SELECT tree_hash, cmd_display, exit_code FROM suite_results WHERE run_id = ? ORDER BY id",
+        run.runId,
+      );
+      assert.equal(rows.length, 1, "Path-B must record exactly one suite result");
+      assert.equal(rows[0].exit_code, 0);
+      assert.equal(rows[0].cmd_display, pathBTestCmd);
+      const landedTree = execSync(`git rev-parse "refs/heads/${run.originalBranch}^{tree}"`, {
+        cwd: run.repoDir,
+        encoding: "utf-8",
+      }).trim();
+      assert.equal(rows[0].tree_hash, landedTree, "suite evidence must be keyed to the committed tree that landed");
+
+      const finalizeStep = dbRow<{ status: string }>(
+        run.ctx.env.tamanduaDir,
+        "SELECT status FROM steps WHERE run_id = ? AND step_id = 'finalize_merge'",
+        run.runId,
+      );
+      assert.equal(finalizeStep.status, "done");
+      const events = readRunEvents(run.ctx.env.tamanduaDir, run.runId);
+      assert.equal(
+        events.filter((event) => event.event === "suite.tree_drift_detected").length,
+        0,
+        "untracked Path-B output must not take the exit-86 tree-drift path",
+      );
+      const landedProbe = spawnSync(
+        "git",
+        ["show", `refs/heads/${run.originalBranch}:path-b-untracked.txt`],
+        { cwd: run.repoDir, encoding: "utf-8" },
+      );
+      assert.notEqual(landedProbe.status, 0, "the generated untracked probe must not be committed by the regression");
+    } finally {
+      await teardown(run?.ctx);
+    }
+  });
 
   it("LGAT: missing evidence reroutes once, then a real green TSTX row allows landing", { timeout: 240_000 }, async () => {
     let run: Awaited<ReturnType<typeof launchLgatRun>> | undefined;
@@ -1707,6 +1837,184 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
     }
   });
 
+  it("LGAT: missing evidence refuses in default and green modes", { timeout: 240_000 }, async () => {
+    for (const mergeGate of [undefined, "green"] as const) {
+      let run: Awaited<ReturnType<typeof launchLgatRun>> | undefined;
+      try {
+        const unattestedTester: ScriptedBehavior = {
+          output: "STATUS: done\nRESULTS: intentionally omitted suite execution\nTESTED_TREE: {{gitTree}}",
+        };
+        run = await launchLgatRun("true", [unattestedTester, unattestedTester], { mergeGate });
+
+        assert.equal(run.status, "failed", `${mergeGate ?? "default"} mode must refuse missing evidence\n${diagnostics(run.ctx)}`);
+        assert.equal(run.ctx.scripted.workInvocations("tester").length, 2);
+        assert.equal(run.ctx.scripted.workInvocations("merger").length, 0, "merge command must never execute");
+        assertLgatMarkerNotLanded(run);
+        assert.equal(
+          dbRows(run.ctx.env.tamanduaDir, "SELECT id FROM suite_results WHERE run_id = ?", run.runId).length,
+          0,
+        );
+
+        const mergeStep = dbRow<{ status: string; reroute_count: number; output: string }>(
+          run.ctx.env.tamanduaDir,
+          "SELECT status, reroute_count, output FROM steps WHERE run_id = ? AND step_id = 'finalize_merge'",
+          run.runId,
+        );
+        assert.equal(mergeStep.status, "failed");
+        assert.equal(mergeStep.reroute_count, 1);
+        assert.ok(
+          mergeStep.output.startsWith(
+            "FAILURE_CLASS: refused_permanent\n" +
+            "Ledger gate refused finalize_merge: no matching TSTX suite execution exists.\n" +
+            "LEDGER_EVIDENCE: missing\n",
+          ),
+          "missing-evidence refusal must retain its core prefix before dynamic diagnostics",
+        );
+        assert.match(mergeStep.output, /^ORIGIN_REPO: .+$/m);
+        assert.match(mergeStep.output, /^TREE_HASH: [0-9a-f]{40}$/m);
+        assert.match(mergeStep.output, /^CMD_HASH: [0-9a-f]{64}$/m);
+        assert.match(mergeStep.output, /^TEST_CMD: true$/m);
+        assert.match(mergeStep.output, /^WORKSPACE_STATE: /m);
+        assert.match(mergeStep.output, /^NEAREST_EVIDENCE: /m);
+        assert.match(mergeStep.output, /^ACTION: /m);
+
+        const events = readRunEvents(run.ctx.env.tamanduaDir, run.runId);
+        assert.equal(events.filter((event) => event.event === "step.rerouted").length, 1);
+        assert.equal(
+          events.filter((event) => event.event === "step.failed" && event.stepId === "finalize_merge").length,
+          1,
+        );
+      } finally {
+        await teardown(run?.ctx);
+      }
+    }
+  });
+
+  it("LGAT: merge_gate=off lands without evidence and emits an attributed override", { timeout: 240_000 }, async () => {
+    let run: Awaited<ReturnType<typeof launchLgatRun>> | undefined;
+    try {
+      run = await launchLgatRun("true", {
+        output: "STATUS: done\nRESULTS: missing evidence intentionally overridden\nTESTED_TREE: {{gitTree}}",
+      }, { mergeGate: "off" });
+
+      assert.equal(run.status, "completed", diagnostics(run.ctx));
+      assert.equal(run.ctx.scripted.workInvocations("tester").length, 1);
+      assert.equal(run.ctx.scripted.workInvocations("merger").length, 1);
+      assertLgatMarkerLanded(run);
+      assert.equal(
+        dbRows(run.ctx.env.tamanduaDir, "SELECT id FROM suite_results WHERE run_id = ?", run.runId).length,
+        0,
+      );
+
+      const launch = dbRow<{ run_number: number; workflow_id: string; created_at: string }>(
+        run.ctx.env.tamanduaDir,
+        "SELECT run_number, workflow_id, created_at FROM runs WHERE id = ?",
+        run.runId,
+      );
+      const overrides = readRunEvents(run.ctx.env.tamanduaDir, run.runId)
+        .filter((event) => event.event === "merge.gate_overridden");
+      assert.equal(overrides.length, 1);
+      assert.equal(overrides[0].runId, run.runId);
+      assert.equal(overrides[0].stepId, "finalize_merge");
+      assert.equal(overrides[0].gateMode, "off");
+      assert.equal(overrides[0].runNumber, launch.run_number);
+      assert.equal(overrides[0].launchTs, launch.created_at);
+      assert.equal(overrides[0].workflowId, launch.workflow_id);
+      assert.match(String(overrides[0].origin), /origin-repo$/);
+      assert.match(String(overrides[0].treeHash), /^[0-9a-f]{40}$/);
+      assert.match(String(overrides[0].cmdHash), /^[0-9a-f]{64}$/);
+    } finally {
+      await teardown(run?.ctx);
+    }
+  });
+
+  it("LGAT: tracked-dirty tester failure reroutes to recovery, retests, and lands", { timeout: 240_000 }, async () => {
+    const suiteShimPath = path.resolve(process.cwd(), "dist", "suite", "shim.js");
+    const testThroughShim =
+      `"${process.execPath}" "${suiteShimPath}" --repo "$PWD" --run "{{input.RUN_ID}}" --step test -- true`;
+    const initialDeveloper: ScriptedBehavior = {
+      writes: [{ file: "src/lgat-marker.ts", content: "// ledger gate scripted acceptance marker\n" }],
+      commands: ["git add -A", 'git commit -m "feat: add LGAT acceptance marker"'],
+      output: "STATUS: done\nCHANGES: added LGAT marker\nTESTS: scripted fixture",
+    };
+    const recoveryDeveloper: ScriptedBehavior = {
+      commands: ["git add package.json", 'git commit -m "fix: commit tracked tester change"'],
+      output: "STATUS: done\nCHANGES: committed tracked tester change for recovery\nTESTS: ready to retest",
+    };
+    const firstDirtyTester: ScriptedBehavior = {
+      commands: [
+        `"${process.execPath}" -e "const fs = require('node:fs'); const pkg = require('./package.json'); pkg.trackedDirtyRecoveryProbe = true; fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\\n')"`,
+        "{{input.BUILD_CMD}}",
+        testThroughShim,
+      ],
+    };
+    const stillDirtyTester: ScriptedBehavior = {
+      commands: ["{{input.BUILD_CMD}}", testThroughShim],
+    };
+    const recoveredTester: ScriptedBehavior = {
+      commands: ["{{input.BUILD_CMD}}", testThroughShim],
+      output: "STATUS: done\nRESULTS: committed recovery tree passed\nTESTED_TREE: {{gitTree}}",
+    };
+    let run: Awaited<ReturnType<typeof launchLgatRun>> | undefined;
+    try {
+      run = await launchLgatRun(
+        "true",
+        [firstDirtyTester, stillDirtyTester, stillDirtyTester, stillDirtyTester, stillDirtyTester, recoveredTester],
+        { developer: [initialDeveloper, recoveryDeveloper] },
+      );
+
+      assert.equal(run.status, "completed", diagnostics(run.ctx));
+      assert.equal(run.ctx.scripted.workInvocations("developer").length, 2, "RAMP must reroute to implementation recovery");
+      assert.equal(run.ctx.scripted.workInvocations("tester").length, 6, "five exit-88 attempts precede the recovered retest");
+      assert.equal(run.ctx.scripted.workInvocations("merger").length, 1);
+      assertLgatMarkerLanded(run);
+      const landedPackage = JSON.parse(
+        execSync(`git show "refs/heads/${run.originalBranch}:package.json"`, { cwd: run.repoDir, encoding: "utf-8" }),
+      ) as { trackedDirtyRecoveryProbe?: boolean };
+      assert.equal(landedPackage.trackedDirtyRecoveryProbe, true);
+
+      const failedTesterRounds = run.ctx.scripted.readInvocations().filter(
+        (invocation) => invocation.phase === "result" && invocation.shortAgent === "tester" && invocation.ok === false,
+      );
+      assert.equal(failedTesterRounds.length, 5);
+      assert.ok(
+        failedTesterRounds.every((invocation) => String(invocation.note).includes("exit 88")),
+        `all dirty tester rounds must expose exit 88: ${JSON.stringify(failedTesterRounds)}`,
+      );
+      assert.ok(
+        failedTesterRounds.every((invocation) => String(invocation.note).includes("FAILURE_CLASS: tree_dirty")),
+        "every pre-recovery tester failure must preserve the shim's tree_dirty classification",
+      );
+
+      const rows = dbRows<{ exit_code: number; tree_hash: string }>(
+        run.ctx.env.tamanduaDir,
+        "SELECT exit_code, tree_hash FROM suite_results WHERE run_id = ? ORDER BY id",
+        run.runId,
+      );
+      assert.deepEqual(rows.map((row) => row.exit_code), [0], "exit-88 attempts must not record suite evidence");
+      const landedTree = execSync(`git rev-parse "refs/heads/${run.originalBranch}^{tree}"`, {
+        cwd: run.repoDir,
+        encoding: "utf-8",
+      }).trim();
+      assert.equal(rows[0].tree_hash, landedTree, "the recovered retest must attest the tree that lands");
+
+      const testStep = dbRow<{ status: string; reroute_count: number; terminal_reroute_count: number }>(
+        run.ctx.env.tamanduaDir,
+        "SELECT status, reroute_count, terminal_reroute_count FROM steps WHERE run_id = ? AND step_id = 'test'",
+        run.runId,
+      );
+      assert.equal(testStep.status, "done");
+      assert.equal(testStep.reroute_count, 1);
+      assert.equal(testStep.terminal_reroute_count, 0, "tree_dirty must consume no terminal-refusal concession");
+      const reroutes = readRunEvents(run.ctx.env.tamanduaDir, run.runId)
+        .filter((event) => event.event === "step.rerouted");
+      assert.equal(reroutes.length, 1);
+      assert.equal(reroutes[0].stepId, "test");
+    } finally {
+      await teardown(run?.ctx);
+    }
+  });
+
   it("LGAT: repeated red evidence refuses permanently after one reroute", { timeout: 240_000 }, async () => {
     let run: Awaited<ReturnType<typeof launchLgatRun>> | undefined;
     try {
@@ -1736,17 +2044,29 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
       assert.deepEqual(rows.map((row) => row.exit_code), [1, 1]);
       const firstRefusal = expectedRedLedgerRefusal(rows[0]);
       const terminalRefusal = expectedRedLedgerRefusal(rows[1]);
-      assert.equal(mergeStep.output, terminalRefusal, "terminal refusal must preserve the exact latest ledger row");
+      assert.ok(
+        mergeStep.output.startsWith(terminalRefusal),
+        "terminal refusal must contain the core refusal prefix and latest ledger row",
+      );
       const events = readRunEvents(run.ctx.env.tamanduaDir, run.runId);
       const rerouted = events.filter((event) => event.event === "step.rerouted");
       const failed = events.filter((event) => event.event === "step.failed" && event.stepId === "finalize_merge");
       assert.equal(rerouted.length, 1);
       assert.equal(failed.length, 1);
-      assert.ok(String(rerouted[0].detail).includes(firstRefusal), "reroute must preserve the exact first red ledger row");
-      assert.equal(failed[0].detail, terminalRefusal, "terminal event must preserve the exact latest red ledger row");
+      assert.ok(
+        String(rerouted[0].detail).includes(firstRefusal),
+        "reroute must contain the core refusal and exact first red ledger row",
+      );
+      assert.ok(
+        String(failed[0].detail).startsWith(terminalRefusal),
+        "terminal event must contain the core refusal prefix and latest red ledger row",
+      );
       const runFailed = events.filter((event) => event.event === "run.failed");
       assert.equal(runFailed.length, 1);
-      assert.equal(runFailed[0].detail, terminalRefusal, "run failure must preserve the exact latest red ledger row");
+      assert.ok(
+        String(runFailed[0].detail).startsWith(terminalRefusal),
+        "run failure must contain the core refusal prefix and latest red ledger row",
+      );
       const statusText = cliMustSucceed(
         ["workflow", "status", run.runId],
         baseEnv(run.ctx.env.homeDir, run.ctx.env.controlPort),

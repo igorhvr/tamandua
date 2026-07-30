@@ -23,6 +23,50 @@ import { describe, it } from "node:test";
 import { createTempHome, cleanupTempHome } from "./helpers/smoke-helpers.ts";
 
 const fixturesDir = path.join(process.cwd(), "e2e-tests", "fixtures");
+const intentionalJunkFixtures = [
+  "sample-project",
+  "sample-project-review",
+  "sample-project-vuln",
+] as const;
+
+describe("fixture-health — intentional package-lock.json junk probes", () => {
+  for (const fixtureName of intentionalJunkFixtures) {
+    it(`${fixtureName} keeps package-lock.json untracked and unignored`, () => {
+      const fixtureDir = path.join(fixturesDir, fixtureName);
+      const readmePath = path.join(fixtureDir, "README-JUNK.md");
+      const guidance = `${fixtureName}: see ${readmePath}`;
+
+      assert.ok(fs.existsSync(readmePath), `${guidance} (documentation is missing)`);
+
+      const checkIgnore = spawnSync(
+        "git",
+        ["-C", fixtureDir, "check-ignore", "-q", "package-lock.json"],
+        { encoding: "utf-8" },
+      );
+      assert.notEqual(
+        checkIgnore.status,
+        0,
+        `${guidance} — package-lock.json must not be gitignored`,
+      );
+
+      const lsFiles = spawnSync(
+        "git",
+        ["-C", fixtureDir, "ls-files", "--", "package-lock.json"],
+        { encoding: "utf-8" },
+      );
+      assert.equal(
+        lsFiles.status,
+        0,
+        `${guidance} — git ls-files failed: ${lsFiles.stderr}`,
+      );
+      assert.equal(
+        lsFiles.stdout.trim(),
+        "",
+        `${guidance} — package-lock.json must remain untracked`,
+      );
+    });
+  }
+});
 
 /**
  * Copy a fixture to a temp dir (under `root`) and run the install+tsc sequence.
