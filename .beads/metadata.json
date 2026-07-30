@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "tamandua",
+  "project_id": "9477838d-971a-4a0f-a2a5-73a329457b18"
+}
