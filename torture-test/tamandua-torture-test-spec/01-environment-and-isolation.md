@@ -54,7 +54,17 @@ authoritative inventory of everything the suite needs. Fresh-environment
 bring-up is then: install nix, clone, `run-torture-test`.
 Ad-hoc installers (rustup, brew, apt) are not used by the suite; a
 toolchain already present outside nix is accepted if its probe passes,
-but the remedy for any gap is always the nix manifest. (Motivating
+but the remedy for any gap is always the nix manifest.
+
+**Carve-out — the harnesses.** `pi` and `hermes` can NOT be provisioned
+by nix and are the operator's responsibility: the torture-test user MUST
+pre-install and pre-configure both (binaries resolvable, credentials
+valid) before any token-bearing tier. W0.0 verifies them (presence
+mechanically; auth via the live `--spend` probes) but never installs or
+configures them; a missing/unauthenticated harness is a hard REQUIRED
+failure with a remedy that says "configure it yourself", not a
+provisioning action. `--provision` therefore covers toolchains and
+utilities only. (Motivating
 incident: the first W0.0 execution found an x86_64 rustup cargo on an
 arm64 host — dead weight nix replaced in one command.) Sequenced after
 the core implementation phases; tracked in bd.
