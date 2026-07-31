@@ -135,6 +135,14 @@ describe("finalize_merge ledger gate evaluator", () => {
     assert.equal(decision.testCmd, TEST_CMD, "the exact raw test command must be retained and hashed");
   }
 
+  function updateContext(values: Record<string, unknown>): void {
+    const db = getDb();
+    const row = db.prepare("SELECT context FROM runs WHERE id = 'run-current'").get() as { context: string };
+    db.prepare("UPDATE runs SET context = ? WHERE id = 'run-current'").run(
+      JSON.stringify({ ...JSON.parse(row.context), ...values }),
+    );
+  }
+
   for (const mode of ["default", "green", "off"] as const) {
     for (const state of ["green", "red", "missing"] as const) {
       it(`returns the ${state}/${mode} decision`, () => {
@@ -163,6 +171,78 @@ describe("finalize_merge ledger gate evaluator", () => {
       });
     }
   }
+
+  for (const { label, mergeGate, failMissing, expectedMode, expectedStrict } of [
+    { label: "default", mergeGate: undefined, failMissing: undefined, expectedMode: "default", expectedStrict: false },
+    { label: "green", mergeGate: "green", failMissing: undefined, expectedMode: "green", expectedStrict: true },
+    { label: "fail_missing", mergeGate: undefined, failMissing: "1", expectedMode: "default", expectedStrict: true },
+    { label: "off", mergeGate: "off", failMissing: "1", expectedMode: "off", expectedStrict: false },
+  ] as const) {
+    for (const evidence of ["missing", "red"] as const) {
+      it(`preserves the FMIS ${label}/${evidence} decision`, () => {
+        seedEligibleRun("default");
+        updateContext({ merge_gate: mergeGate, fail_missing: failMissing });
+        if (evidence === "red") seedLedger("red");
+
+        const decision = evaluateFinalizeMergeLedgerGate("finalize-step");
+
+        if (expectedMode === "off") {
+          assert.equal(decision.status, "overridden");
+          assert.equal(decision.gateMode, "off");
+        } else {
+          assert.equal(decision.status, evidence);
+          assert.equal(decision.gateMode, expectedMode);
+        }
+        assert.equal(
+          isStrictMissing({ fail_missing: failMissing }, expectedMode),
+          expectedStrict,
+        );
+      });
+    }
+  }
+
+  for (const { supplied, expectedMode } of [
+    { supplied: " OFF ", expectedMode: "off" },
+    { supplied: " Green ", expectedMode: "green" },
+  ] as const) {
+    it(`normalizes merge_gate=${JSON.stringify(supplied)} case-insensitively`, () => {
+      seedEligibleRun("default");
+      updateContext({ merge_gate: supplied });
+
+      const decision = evaluateFinalizeMergeLedgerGate("finalize-step");
+
+      if (decision.status === "inert") assert.fail(`unexpected inert decision: ${decision.reason}`);
+      assert.equal(decision.gateMode, expectedMode);
+      assert.equal(decision.status, expectedMode === "off" ? "overridden" : "missing");
+    });
+  }
+
+  it("warns once and defaults an unrecognized merge_gate value", () => {
+    seedEligibleRun("default");
+    updateContext({ merge_gate: " garbage " });
+
+    const decision = evaluateFinalizeMergeLedgerGate("finalize-step");
+
+    assert.equal(decision.status, "missing");
+    assert.equal(decision.gateMode, "default");
+    const warnings = fs.readFileSync(path.join(stateDir, ".tamandua", "tamandua.log"), "utf-8")
+      .split("\n")
+      .filter((line) => line.includes("Unrecognized ledger gate context value"));
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /"key":"merge_gate"/);
+    assert.match(warnings[0], /"value":" garbage "/);
+  });
+
+  it("warns once and defaults an unrecognized fail_missing value", () => {
+    assert.equal(isStrictMissing({ fail_missing: "yes" }, "default"), false);
+
+    const warnings = fs.readFileSync(path.join(stateDir, ".tamandua", "tamandua.log"), "utf-8")
+      .split("\n")
+      .filter((line) => line.includes("Unrecognized ledger gate context value"));
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /"key":"fail_missing"/);
+    assert.match(warnings[0], /"value":"yes"/);
+  });
 
   it("is inert for a non-finalize step despite a completed attestation and seeded tested_tree", () => {
     seedEligibleRun("default", { stepId: "review" });
@@ -199,6 +279,26 @@ describe("finalize_merge ledger gate evaluator", () => {
 });
 
 describe("isStrictMissing", () => {
+  let stateDir: string;
+  let originalHome: string | undefined;
+  let originalStateDir: string | undefined;
+
+  beforeEach(() => {
+    originalHome = process.env.HOME;
+    originalStateDir = process.env.TAMANDUA_STATE_DIR;
+    stateDir = tamanduaTempDir("tamandua-ledger-knob-state-");
+    process.env.HOME = stateDir;
+    process.env.TAMANDUA_STATE_DIR = path.join(stateDir, ".tamandua");
+  });
+
+  afterEach(() => {
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+    if (originalStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+    else process.env.TAMANDUA_STATE_DIR = originalStateDir;
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  });
+
   it("returns false when fail_missing is absent and gateMode is default", () => {
     assert.equal(isStrictMissing({}, "default"), false);
   });
@@ -234,6 +334,15 @@ describe("isStrictMissing", () => {
   it("returns true when fail_missing is TRUE (case-insensitive)", () => {
     assert.equal(isStrictMissing({ fail_missing: "TRUE" }, "default"), true);
   });
+
+  for (const value of [" ON ", true, 1] as const) {
+    it(`accepts fail_missing=${JSON.stringify(value)} without throwing`, () => {
+      assert.equal(
+        isStrictMissing({ fail_missing: value }, "default"),
+        true,
+      );
+    });
+  }
 
   it("returns true when gateMode is green regardless of fail_missing", () => {
     assert.equal(isStrictMissing({}, "green"), true);

@@ -5,7 +5,7 @@ import { assertStatePathIsolation } from "./lib/test-guard.js";
 import { LEDGER_RETENTION_MS } from "./suite/config.js";
 
 // Any change to migrate() MUST bump SCHEMA_VERSION. Missing a bump causes broken DBs.
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 // Counter for tests — increments each time migrate() runs the full DDL path.
 export let _migrateFullRuns = 0;
@@ -180,6 +180,12 @@ function migrate(db: DatabaseSync): void {
   // reroutes still count every retry_step traversal for max_reroutes.
   if (!stepColNames.has("terminal_reroute_count")) {
     db.exec("ALTER TABLE steps ADD COLUMN terminal_reroute_count INTEGER DEFAULT 0");
+  }
+
+  // Ledger-gate concessions are distinct from general terminal reroutes so
+  // unrelated terminal failures cannot consume the missing-evidence allowance.
+  if (!stepColNames.has("ledger_concession_count")) {
+    db.exec("ALTER TABLE steps ADD COLUMN ledger_concession_count INTEGER DEFAULT 0");
   }
 
   // ── RETR claim invalidation marker ──

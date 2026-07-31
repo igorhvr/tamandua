@@ -1,16 +1,17 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { after, afterEach, before, beforeEach, describe, it } from "node:test";
 
 import { closeDb, getDb } from "../../dist/db.js";
 import { getRunEvents } from "../../dist/installer/events.js";
-import { claimStep, completeStep, isAlreadyLanded } from "../../dist/installer/step-ops.js";
+import { claimStep, completeStep, failStep, isAlreadyLanded } from "../../dist/installer/step-ops.js";
 import { loadWorkflowSpecSync } from "../../dist/installer/workflow-spec.js";
 import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
 import { assertStatePathIsolation } from "../../dist/lib/test-guard.js";
 import { computeCmdHash, getOriginRepo } from "../../dist/suite/tree-hash.js";
+import { cleanChildEnv } from "../../tests/helpers/test-env.ts";
 
 const WORKFLOW_ID = "test-ledger-gate-enforcement";
 const TEST_CMD = "npm test -- --runInBand ";
@@ -158,6 +159,13 @@ describe("finalize_merge ledger gate enforcement", () => {
     return { db, runId, testerId, finalizeId, createdAt, row };
   }
 
+  function writeWorkflow(yaml: string): void {
+    fs.writeFileSync(
+      path.join(process.env.TAMANDUA_STATE_DIR!, "workflows", WORKFLOW_ID, "workflow.yml"),
+      yaml,
+    );
+  }
+
   it("keeps green and ineligible finalize_merge claims unchanged and unannotated", () => {
     const green = seedRun("default", "green");
     const greenClaim = claimStep("merger", green.runId);
@@ -259,6 +267,269 @@ describe("finalize_merge ledger gate enforcement", () => {
     // Run completed successfully (not failed).
     const run = seeded.db.prepare("SELECT status FROM runs WHERE id = ?").get(seeded.runId) as { status: string };
     assert.equal(run.status, "completed");
+  });
+
+  it("serializes duplicate claim-time missing-evidence refusals", async () => {
+    const seeded = seedRun("default", "missing");
+    const startFile = path.join(stateRoot, "release-claimers");
+    const claimantScript = `
+      import fs from "node:fs";
+      import { claimStep } from ${JSON.stringify(new URL("../../dist/installer/step-ops.js", import.meta.url).href)};
+      process.stdout.write("READY\\n");
+      while (!fs.existsSync(${JSON.stringify(startFile)})) {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+      }
+      process.stdout.write(JSON.stringify(claimStep("merger", ${JSON.stringify(seeded.runId)})) + "\\n");
+    `;
+
+    const launchClaimant = () => {
+      const child = spawn(process.execPath, ["--input-type=module", "--eval", claimantScript], {
+        env: cleanChildEnv({
+          HOME: process.env.HOME,
+          TAMANDUA_STATE_DIR: process.env.TAMANDUA_STATE_DIR,
+          TAMANDUA_DB_PATH: process.env.TAMANDUA_DB_PATH,
+        }),
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let stdout = "";
+      let stderr = "";
+      let readyResolve!: () => void;
+      const ready = new Promise<void>((resolve) => { readyResolve = resolve; });
+      child.stdout.setEncoding("utf8");
+      child.stderr.setEncoding("utf8");
+      child.stdout.on("data", (chunk: string) => {
+        stdout += chunk;
+        if (stdout.includes("READY\n")) readyResolve();
+      });
+      child.stderr.on("data", (chunk: string) => { stderr += chunk; });
+      const done = new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
+        child.on("close", (code) => resolve({ code, stdout, stderr }));
+      });
+      return { ready, done };
+    };
+
+    const claimants = [launchClaimant(), launchClaimant()];
+    await Promise.all(claimants.map((claimant) => claimant.ready));
+    fs.writeFileSync(startFile, "go");
+    const results = await Promise.all(claimants.map((claimant) => claimant.done));
+    for (const result of results) {
+      assert.equal(result.code, 0, result.stderr);
+      assert.deepEqual(JSON.parse(result.stdout.trim().split("\n").at(-1)!), { found: false });
+    }
+
+    const finalize = seeded.db.prepare(
+      `SELECT status, reroute_count, terminal_reroute_count, ledger_concession_count
+       FROM steps WHERE id = ?`,
+    ).get(seeded.finalizeId) as {
+      status: string;
+      reroute_count: number;
+      terminal_reroute_count: number;
+      ledger_concession_count: number;
+    };
+    assert.deepEqual({ ...finalize }, {
+      status: "waiting",
+      reroute_count: 1,
+      terminal_reroute_count: 1,
+      ledger_concession_count: 1,
+    });
+    const tester = seeded.db.prepare(
+      "SELECT status, claim_invalidated_by FROM steps WHERE id = ?",
+    ).get(seeded.testerId) as { status: string; claim_invalidated_by: string | null };
+    assert.deepEqual({ ...tester }, { status: "pending", claim_invalidated_by: "reroute" });
+    const rerouteEvents = getRunEvents(seeded.runId).filter(
+      (event) => event.event === "step.rerouted",
+    );
+    assert.equal(rerouteEvents.length, 1);
+    assert.match(
+      rerouteEvents[0].detail ?? "",
+      /Ledger gate refused finalize_merge: no matching TSTX suite execution exists/,
+    );
+  });
+
+  it("recovers an already-landed merge before claim-time gating without spending its concession", () => {
+    const seeded = seedRun("default", "missing");
+    const targetBranch = execFileSync("git", ["branch", "--show-current"], {
+      cwd: repo,
+      encoding: "utf-8",
+    }).trim();
+    const mergedCommit = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: repo,
+      encoding: "utf-8",
+    }).trim();
+    const run = seeded.db.prepare("SELECT context FROM runs WHERE id = ?").get(seeded.runId) as {
+      context: string;
+    };
+    seeded.db.prepare("UPDATE runs SET context = ? WHERE id = ?").run(
+      JSON.stringify({ ...JSON.parse(run.context), original_branch: targetBranch }),
+      seeded.runId,
+    );
+    const landedOutput = `STATUS: done\nMERGED_COMMIT: ${mergedCommit}`;
+    seeded.db.prepare("UPDATE steps SET output = ? WHERE id = ?").run(landedOutput, seeded.finalizeId);
+
+    const claim = claimStep("merger", seeded.runId);
+    assert.equal(claim.found, true);
+    assert.equal(claim.stepId, seeded.finalizeId);
+    const counters = seeded.db.prepare(
+      `SELECT reroute_count, terminal_reroute_count, ledger_concession_count
+       FROM steps WHERE id = ?`,
+    ).get(seeded.finalizeId) as {
+      reroute_count: number;
+      terminal_reroute_count: number;
+      ledger_concession_count: number;
+    };
+    assert.equal(counters.reroute_count, 0);
+    assert.equal(counters.terminal_reroute_count, 0);
+    assert.equal(counters.ledger_concession_count, 0);
+    assert.equal(claimStep("tester", seeded.runId).found, false);
+    assert.equal(
+      getRunEvents(seeded.runId).filter((event) => event.event === "step.rerouted").length,
+      0,
+    );
+
+    assert.equal(completeStep(seeded.finalizeId, landedOutput).status, "completed");
+    assert.equal(
+      getRunEvents(seeded.runId).filter(
+        (event) => event.event === "merge.landed_without_suite_evidence",
+      ).length,
+      1,
+      "an already-landed missing-evidence completion must be annotated with an unspent concession",
+    );
+  });
+
+  it("uses the one-shot terminal allowance after the shared reroute budget is exhausted", () => {
+    const seeded = seedRun("default", "missing");
+    seeded.db.prepare(
+      "UPDATE steps SET reroute_count = 8, terminal_reroute_count = 0 WHERE id = ?",
+    ).run(seeded.finalizeId);
+
+    assert.equal(claimStep("merger", seeded.runId).found, false);
+    const afterRefusal = seeded.db.prepare(
+      `SELECT status, reroute_count, terminal_reroute_count, ledger_concession_count
+       FROM steps WHERE id = ?`,
+    ).get(seeded.finalizeId) as {
+      status: string;
+      reroute_count: number;
+      terminal_reroute_count: number;
+      ledger_concession_count: number;
+    };
+    assert.equal(afterRefusal.status, "waiting");
+    assert.equal(afterRefusal.reroute_count, 8, "terminal allowance must not charge the shared budget");
+    assert.equal(afterRefusal.terminal_reroute_count, 1);
+    assert.equal(afterRefusal.ledger_concession_count, 1);
+
+    assert.equal(claimStep("tester", seeded.runId).found, true);
+    assert.equal(completeStep(seeded.testerId, TESTER_OUTPUT).status, "advanced");
+    assert.equal(claimStep("merger", seeded.runId).found, true, "the one-shot concession must prevent a loop");
+  });
+
+  for (const [label, workflowYaml] of [
+    ["no retry_step", WORKFLOW_YAML.replace(/    on_fail:\n(?:      .*\n){3}/, "")],
+    ["an invalid retry target", WORKFLOW_YAML.replace("retry_step: test", "retry_step: missing_test_step")],
+  ] as const) {
+    it(`concedes default missing evidence with ${label}`, () => {
+      writeWorkflow(workflowYaml);
+      const seeded = seedRun("default", "missing");
+
+      const claim = claimStep("merger", seeded.runId);
+      assert.equal(claim.found, true);
+      assert.equal(claim.stepId, seeded.finalizeId);
+      assert.equal(completeStep(seeded.finalizeId, "STATUS: done").status, "completed");
+      assert.equal(
+        getRunEvents(seeded.runId).filter(
+          (event) => event.event === "merge.landed_without_suite_evidence",
+        ).length,
+        1,
+      );
+      const counters = seeded.db.prepare(
+        `SELECT reroute_count, terminal_reroute_count, ledger_concession_count
+         FROM steps WHERE id = ?`,
+      ).get(seeded.finalizeId) as {
+        reroute_count: number;
+        terminal_reroute_count: number;
+        ledger_concession_count: number;
+      };
+      assert.equal(counters.reroute_count, 0);
+      assert.equal(counters.terminal_reroute_count, 0);
+      assert.equal(counters.ledger_concession_count, 0);
+    });
+  }
+
+  for (const mode of ["green", "fail_missing"] as const) {
+    it(`keeps ${mode} missing evidence strict when retry_step is unavailable`, () => {
+      writeWorkflow(WORKFLOW_YAML.replace(/    on_fail:\n(?:      .*\n){3}/, ""));
+      const seeded = seedRun(mode === "green" ? "green" : "default", "missing");
+      if (mode === "fail_missing") {
+        const run = seeded.db.prepare("SELECT context FROM runs WHERE id = ?").get(seeded.runId) as { context: string };
+        seeded.db.prepare("UPDATE runs SET context = ? WHERE id = ?").run(
+          JSON.stringify({ ...JSON.parse(run.context), fail_missing: "1" }),
+          seeded.runId,
+        );
+      }
+
+      assert.equal(claimStep("merger", seeded.runId).found, false);
+      assert.equal(
+        (seeded.db.prepare("SELECT status FROM runs WHERE id = ?").get(seeded.runId) as { status: string }).status,
+        "failed",
+      );
+      assert.equal(
+        getRunEvents(seeded.runId).filter(
+          (event) => event.event === "merge.landed_without_suite_evidence",
+        ).length,
+        0,
+      );
+    });
+  }
+
+  it("keeps the ledger concession available after an unrelated terminal reroute", async () => {
+    const seeded = seedRun("default", "missing");
+    seeded.db.prepare("UPDATE steps SET status = 'running' WHERE id = ?").run(seeded.finalizeId);
+
+    assert.equal(
+      (await failStep(
+        seeded.finalizeId,
+        "FAILURE_CLASS: refused_permanent\nmerge-branch exited 1 for an operational failure",
+      )).status,
+      "rerouted",
+    );
+    const afterOperationalFailure = seeded.db.prepare(
+      "SELECT reroute_count, terminal_reroute_count, ledger_concession_count FROM steps WHERE id = ?",
+    ).get(seeded.finalizeId) as {
+      reroute_count: number;
+      terminal_reroute_count: number;
+      ledger_concession_count: number;
+    };
+    assert.equal(afterOperationalFailure.reroute_count, 1);
+    assert.equal(afterOperationalFailure.terminal_reroute_count, 1);
+    assert.equal(afterOperationalFailure.ledger_concession_count, 0);
+
+    assert.equal(claimStep("tester", seeded.runId).found, true);
+    assert.equal(completeStep(seeded.testerId, TESTER_OUTPUT).status, "advanced");
+
+    assert.equal(
+      claimStep("merger", seeded.runId).found,
+      false,
+      "missing evidence must still receive its gate-owned refusal",
+    );
+    const afterGateRefusal = seeded.db.prepare(
+      "SELECT status, reroute_count, terminal_reroute_count, ledger_concession_count FROM steps WHERE id = ?",
+    ).get(seeded.finalizeId) as {
+      status: string;
+      reroute_count: number;
+      terminal_reroute_count: number;
+      ledger_concession_count: number;
+    };
+    assert.equal(afterGateRefusal.status, "waiting");
+    assert.equal(afterGateRefusal.reroute_count, 2);
+    assert.equal(afterGateRefusal.terminal_reroute_count, 2);
+    assert.equal(afterGateRefusal.ledger_concession_count, 1);
+    const gateReroute = getRunEvents(seeded.runId)
+      .filter((event) => event.event === "step.rerouted")
+      .at(-1);
+    assert.match(gateReroute?.detail ?? "", /ACTION: Run the EXACT shim-wrapped test command/);
+
+    assert.equal(claimStep("tester", seeded.runId).found, true);
+    assert.equal(completeStep(seeded.testerId, TESTER_OUTPUT).status, "advanced");
+    assert.equal(claimStep("merger", seeded.runId).found, true);
   });
 
   it("fail_missing=1 refuses default missing evidence permanently with no concession", () => {
@@ -528,6 +799,38 @@ describe("finalize_merge ledger gate enforcement", () => {
 
     const outputMatching = `STATUS: done\nMERGED_COMMIT: ${mainTip}\nTARGET: refs/heads/${targetBranch}`;
     assert.equal(isAlreadyLanded(finalizeId, outputMatching), true);
+  });
+
+  it("isAlreadyLanded treats shell metacharacters in the target branch as ref text", () => {
+    const db = getDb();
+    const suffix = Math.random().toString(16).slice(2);
+    const runId = `lgat-landed-shell-safe-${suffix}`;
+    const finalizeId = `finalize-${suffix}`;
+    const sentinel = path.join(stateRoot, `rev-parse-sentinel-${suffix}`);
+    const targetBranch = `missing;touch ${sentinel}`;
+
+    db.prepare(
+      `INSERT INTO runs (id, run_number, workflow_id, task, status, context, created_at, updated_at)
+       VALUES (?, 42, ?, 'task', 'running', ?, '2026-07-26T12:34:56.000Z', '2026-07-26T12:34:56.000Z')`,
+    ).run(runId, WORKFLOW_ID, JSON.stringify({
+      repo,
+      original_branch: targetBranch,
+      worktree_origin_repository: repo,
+      test_cmd: TEST_CMD,
+    }));
+    db.prepare(
+      `INSERT INTO steps
+         (id, run_id, step_id, agent_id, step_index, input_template, expects, status,
+          type, retry_count, max_retries, reroute_count, created_at, updated_at)
+       VALUES (?, ?, 'finalize_merge', 'merger', 1, 'Merge', 'STATUS: done', 'pending',
+          'single', 0, 0, 0, '2026-07-26T12:34:56.000Z', '2026-07-26T12:34:56.000Z')`,
+    ).run(finalizeId, runId);
+
+    assert.equal(
+      isAlreadyLanded(finalizeId, "STATUS: done\nMERGED_COMMIT: deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
+      false,
+    );
+    assert.equal(fs.existsSync(sentinel), false, "target ref text must never be interpreted by a shell");
   });
 
   it("isAlreadyLanded returns false when MERGED_COMMIT does not match target tip", () => {

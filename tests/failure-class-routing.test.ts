@@ -109,7 +109,7 @@ describe("failure-class motor routing", () => {
 
   it("reroutes a multiline reason whose failure class matches retry_on", async () => {
     const { db, producerId, consumerId } = await insertRun();
-    const reason = "Target changed while landing\nFAILURE_CLASS: target_moved\nPlease revalidate";
+    const reason = "FAILURE_CLASS: target_moved\nTarget changed while landing\nPlease revalidate";
 
     const result = await failStep(consumerId, reason);
 
@@ -123,7 +123,7 @@ describe("failure-class motor routing", () => {
   it("uses legacy rerouting for a known nonterminal class not listed in retry_on", async () => {
     const { db, consumerId } = await insertRun();
 
-    const result = await failStep(consumerId, "Conflict found\nFAILURE_CLASS: conflicts");
+    const result = await failStep(consumerId, "FAILURE_CLASS: conflicts\nConflict found");
 
     assert.equal(result.status, "rerouted");
     const consumer = db.prepare("SELECT reroute_count, terminal_reroute_count FROM steps WHERE id = ?").get(consumerId) as {
@@ -139,7 +139,7 @@ describe("failure-class motor routing", () => {
 
     const result = await failStep(
       consumerId,
-      "Uncommitted tracked changes\nFAILURE_CLASS: tree_dirty\nCommit or discard them",
+      "FAILURE_CLASS: tree_dirty\nUncommitted tracked changes\nCommit or discard them",
     );
 
     assert.equal(result.status, "rerouted");
@@ -154,7 +154,7 @@ describe("failure-class motor routing", () => {
   it("uses legacy rerouting for an unknown failure class", async () => {
     const { db, consumerId } = await insertRun(2);
 
-    const result = await failStep(consumerId, "Odd failure\nFAILURE_CLASS: future_class");
+    const result = await failStep(consumerId, "FAILURE_CLASS: future_class\nOdd failure");
 
     assert.equal(result.status, "rerouted");
     const consumer = db.prepare("SELECT reroute_count, terminal_reroute_count FROM steps WHERE id = ?").get(consumerId) as {
@@ -170,7 +170,7 @@ describe("failure-class motor routing", () => {
 
     const result = await failStep(
       consumerId,
-      "Policy refuses this merge\nFAILURE_CLASS: refused_permanent\nManual intervention required",
+      "FAILURE_CLASS: refused_permanent\nPolicy refuses this merge\nManual intervention required",
     );
 
     assert.equal(result.status, "rerouted");
@@ -182,11 +182,32 @@ describe("failure-class motor routing", () => {
     assert.equal(consumer.terminal_reroute_count, 1);
   });
 
+  it("ignores a quoted terminal marker after the first line", async () => {
+    const { db, consumerId } = await insertRun();
+
+    const result = await failStep(
+      consumerId,
+      "Operational failure while invoking merge-branch\nFAILURE_CLASS: refused_permanent\nRetry normally",
+    );
+
+    assert.equal(result.status, "rerouted");
+    const consumer = db.prepare(
+      "SELECT reroute_count, terminal_reroute_count, ledger_concession_count FROM steps WHERE id = ?",
+    ).get(consumerId) as {
+      reroute_count: number;
+      terminal_reroute_count: number;
+      ledger_concession_count: number;
+    };
+    assert.equal(consumer.reroute_count, 1);
+    assert.equal(consumer.terminal_reroute_count, 0);
+    assert.equal(consumer.ledger_concession_count, 0);
+  });
+
   it("fails on the second refused_permanent failure and preserves the refusal verbatim", async () => {
     const { db, runId, consumerId } = await insertRun(1, 1);
     const reason = [
-      "Landing refused by branch policy.",
       "FAILURE_CLASS: refused_permanent",
+      "Landing refused by branch policy.",
       "Required approval is absent; no automated repair is allowed.",
     ].join("\n");
 
@@ -219,7 +240,7 @@ describe("failure-class motor routing", () => {
     };
 
     assert.equal(
-      (await failStep(consumerId, "Target moved\nFAILURE_CLASS: target_moved")).status,
+      (await failStep(consumerId, "FAILURE_CLASS: target_moved\nTarget moved")).status,
       "rerouted",
     );
     let counts = db.prepare(
@@ -230,7 +251,7 @@ describe("failure-class motor routing", () => {
 
     prepareNextAttempt();
     assert.equal(
-      (await failStep(consumerId, "First terminal refusal\nFAILURE_CLASS: refused_permanent")).status,
+      (await failStep(consumerId, "FAILURE_CLASS: refused_permanent\nFirst terminal refusal")).status,
       "rerouted",
     );
     counts = db.prepare(
@@ -240,7 +261,7 @@ describe("failure-class motor routing", () => {
     assert.equal(counts.terminal_reroute_count, 1);
 
     prepareNextAttempt();
-    const reason = "Second terminal refusal\nFAILURE_CLASS: refused_permanent";
+    const reason = "FAILURE_CLASS: refused_permanent\nSecond terminal refusal";
     assert.equal((await failStep(consumerId, reason)).status, "failed");
     const terminal = db.prepare(
       "SELECT status, output, reroute_count, terminal_reroute_count FROM steps WHERE id = ?",

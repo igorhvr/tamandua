@@ -452,6 +452,120 @@ describe("stories abandoned_count migration", () => {
   });
 });
 
+describe("steps ledger_concession_count migration", () => {
+  it("adds the column to a legacy steps table without losing rows", () => {
+    const th = createTempHome("tamandua-ledger-concession-migration-");
+    const dbPath = path.join(th.root, "legacy.db");
+    const legacyDb = new DatabaseSync(dbPath);
+    legacyDb.exec(`
+      CREATE TABLE runs (
+        id TEXT PRIMARY KEY,
+        workflow_id TEXT NOT NULL,
+        task TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'running',
+        context TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE steps (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        step_id TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        step_index INTEGER NOT NULL,
+        input_template TEXT NOT NULL,
+        expects TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'waiting',
+        output TEXT,
+        retry_count INTEGER DEFAULT 0,
+        max_retries INTEGER DEFAULT 4,
+        type TEXT NOT NULL DEFAULT 'single',
+        loop_config TEXT,
+        current_story_id TEXT,
+        abandoned_count INTEGER DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO runs (
+        id, workflow_id, task, status, created_at, updated_at
+      ) VALUES (
+        'legacy-run', 'workflow', 'task', 'running',
+        '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+      );
+      INSERT INTO steps (
+        id, run_id, step_id, agent_id, step_index, input_template, expects,
+        status, created_at, updated_at
+      ) VALUES (
+        'legacy-step', 'legacy-run', 'finalize_merge', 'merger', 0, '', '',
+        'waiting', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+      );
+      PRAGMA user_version = ${SCHEMA_VERSION - 1};
+    `);
+    legacyDb.close();
+
+    const distDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "dist");
+    const importPath = JSON.stringify(path.join(distDir, "db.js"));
+    const script = [
+      `import { getDb } from ${importPath};`,
+      "const db = getDb();",
+      "const column = db.prepare(\"PRAGMA table_info(steps)\").all().find((entry) => entry.name === \"ledger_concession_count\");",
+      "const row = db.prepare(\"SELECT id, ledger_concession_count FROM steps WHERE id = 'legacy-step'\").get();",
+      "console.log(JSON.stringify({ column, row }));",
+    ].join("\n");
+
+    const result = execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+      cwd: distDir,
+      env: {
+        HOME: th.homeDir,
+        TAMANDUA_DB_PATH: dbPath,
+        TAMANDUA_TEST_GUARD: "1",
+        PATH: process.env.PATH ?? "",
+      },
+      encoding: "utf-8",
+    });
+    const migrated = JSON.parse(result.trim()) as {
+      column?: { type: string; dflt_value: string | null };
+      row: { id: string; ledger_concession_count: number };
+    };
+
+    assert.ok(migrated.column, "ledger_concession_count column should be added");
+    assert.equal(migrated.column.type, "INTEGER");
+    assert.equal(migrated.column.dflt_value, "0");
+    assert.deepEqual(migrated.row, {
+      id: "legacy-step",
+      ledger_concession_count: 0,
+    });
+  });
+
+  it("defaults ledger_concession_count to zero for new step rows", () => {
+    const th = createTempHome("tamandua-ledger-concession-default-");
+    const dbPath = path.join(th.root, "fresh.db");
+    const distDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "dist");
+    const importPath = JSON.stringify(path.join(distDir, "db.js"));
+    const script = [
+      `import { getDb } from ${importPath};`,
+      "const db = getDb();",
+      "const now = new Date().toISOString();",
+      "db.prepare(\"INSERT INTO runs (id, workflow_id, task, created_at, updated_at) VALUES (?, ?, ?, ?, ?)\").run('new-run', 'workflow', 'task', now, now);",
+      "db.prepare(\"INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)\").run('new-step', 'new-run', 'test', 'tester', 0, '', '', now, now);",
+      "console.log(JSON.stringify(db.prepare(\"SELECT ledger_concession_count FROM steps WHERE id = 'new-step'\").get()));",
+    ].join("\n");
+
+    const result = execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+      cwd: distDir,
+      env: {
+        HOME: th.homeDir,
+        TAMANDUA_DB_PATH: dbPath,
+        TAMANDUA_TEST_GUARD: "1",
+        PATH: process.env.PATH ?? "",
+      },
+      encoding: "utf-8",
+    });
+
+    assert.deepEqual(JSON.parse(result.trim()), { ledger_concession_count: 0 });
+  });
+});
+
 describe("getDbPath", () => {
   it("returns path ending with .tamandua/tamandua.db under HOME", () => {
     const result = getDbPath();

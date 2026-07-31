@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { getDb } from "../db.js";
+import { logger } from "../lib/logger.js";
 import { computeCmdHash, getOriginRepo } from "../suite/tree-hash.js";
 
 export type LedgerGateMode = "default" | "green" | "off";
@@ -70,11 +71,16 @@ interface SuiteResultRow {
   created_at: string;
 }
 
-function parseContext(raw: string): Record<string, string> {
+type LedgerGateContext = Record<string, unknown>;
+
+const MERGE_GATE_VALUES = new Set(["default", "green", "off"]);
+const FAIL_MISSING_VALUES = new Set(["0", "1", "false", "true", "off", "on"]);
+
+function parseContext(raw: string): LedgerGateContext {
   try {
     const parsed = JSON.parse(raw) as unknown;
     return parsed && typeof parsed === "object"
-      ? parsed as Record<string, string>
+      ? parsed as LedgerGateContext
       : {};
   } catch {
     return {};
@@ -90,9 +96,27 @@ function testedTreeFromOutput(output: string | null): string | null {
   return null;
 }
 
-function gateModeFromContext(context: Record<string, string>): LedgerGateMode {
-  if (context.merge_gate === "green") return "green";
-  if (context.merge_gate === "off") return "off";
+function normalizeContextKnob(
+  context: LedgerGateContext,
+  key: "merge_gate" | "fail_missing",
+  recognized: ReadonlySet<string>,
+): string {
+  const original = context[key];
+  const normalized = String(original ?? "").trim().toLowerCase();
+  if (normalized && !recognized.has(normalized)) {
+    logger.warn("Unrecognized ledger gate context value", { key, value: original });
+  }
+  return normalized;
+}
+
+function gateModeFromContext(context: LedgerGateContext): LedgerGateMode {
+  const mode = normalizeContextKnob(
+    context,
+    "merge_gate",
+    MERGE_GATE_VALUES,
+  );
+  if (mode === "green") return "green";
+  if (mode === "off") return "off";
   return "default";
 }
 
@@ -106,10 +130,14 @@ function gateModeFromContext(context: Record<string, string>): LedgerGateMode {
  * When NOT strict-missing, the default concession valve (reroute once, then
  * land-annotate) is in play for missing evidence.
  */
-export function isStrictMissing(context: Record<string, string>, gateMode: LedgerGateMode): boolean {
+export function isStrictMissing(context: LedgerGateContext, gateMode: LedgerGateMode): boolean {
+  const v = normalizeContextKnob(
+    context,
+    "fail_missing",
+    FAIL_MISSING_VALUES,
+  );
   if (gateMode === "off") return false;
   if (gateMode === "green") return true;
-  const v = (context.fail_missing ?? "").toLowerCase();
   return v === "1" || v === "true" || v === "on";
 }
 
@@ -156,13 +184,17 @@ export function evaluateFinalizeMergeLedgerGate(stepId: string): LedgerGateDecis
       : "";
   if (!testCmd.trim()) return { status: "inert", reason: "no_test_cmd" };
 
-  const repoPath = context.worktree_origin_repository
-    || context.repo
-    || context.working_directory_for_harness;
-  if (!repoPath?.trim()) return { status: "inert", reason: "no_origin_repo" };
-  const testedRepo = context.working_directory_for_harness?.trim()
-    || context.repo?.trim()
-    || context.worktree_origin_repository?.trim();
+  const repoPath = [
+    context.worktree_origin_repository,
+    context.repo,
+    context.working_directory_for_harness,
+  ].find((value): value is string => typeof value === "string" && value.trim().length > 0);
+  if (!repoPath) return { status: "inert", reason: "no_origin_repo" };
+  const testedRepo = [
+    context.working_directory_for_harness,
+    context.repo,
+    context.worktree_origin_repository,
+  ].find((value): value is string => typeof value === "string" && value.trim().length > 0)?.trim();
 
   const key: LedgerGateKey = {
     originRepo: getOriginRepo(repoPath),

@@ -101,6 +101,10 @@ function commandError(args: string[], result: GitResult): string {
   return `git ${args.join(" ")} failed (exit ${result.status})${diagnostics ? `: ${diagnostics}` : ""}`;
 }
 
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
 function gitFailureDiagnostic(result: GitResult, maxLength: number): string {
   const diagnostics = result.stderr || result.stdout;
   return boundedDiagnostic(
@@ -502,6 +506,12 @@ export function runPlumbingMerge(
             256,
           );
         }
+      } else {
+        const recoveryCommand = `git -C ${shellQuote(owner.path)} symbolic-ref HEAD ${shellQuote(target)}`;
+        cleanupDetail = boundedDiagnostic(
+          `checkout remains parked on ${backupRef}; recover with: ${recoveryCommand}`,
+          256,
+        );
       }
       const updateError = commandError(updateArgs, updateResult);
       const updateDetail = cleanupDetail

@@ -499,6 +499,58 @@ describe("runPlumbingMerge", () => {
     }
   });
 
+  it("diagnoses a checkout left parked when target CAS and un-park retries both fail", () => {
+    for (const failure of ["operational", "target-moved"] as const) {
+      const { repo, initial } = createRepo();
+      createFeature(repo, `feature-parked-${failure}`);
+      let backupRef = "";
+      let unparkAttempts = 0;
+
+      const result = runPlumbingMerge(
+        {
+          origin: repo,
+          branch: `feature-parked-${failure}`,
+          into: "main",
+          expectTip: initial,
+          message: `parked CAS ${failure}`,
+          runId: `parked-cas-${failure}`,
+        },
+        {
+          runGit: (origin, args) => {
+            const isBackup = args[0] === "update-ref" && args[1]?.includes("tamandua-parked") && args[3] === "0".repeat(40);
+            const isTargetCas = args[0] === "update-ref" && args[1] === "refs/heads/main" && args[3] === initial;
+            const isUnpark = args.join(" ") === "symbolic-ref HEAD refs/heads/main";
+            if (isBackup) backupRef = args[1]!;
+            if (isTargetCas) {
+              if (failure === "target-moved") {
+                const tree = git(repo, ["rev-parse", `${initial}^{tree}`]);
+                const competingTip = git(repo, ["commit-tree", tree, "-p", initial, "-m", "competing target"]);
+                git(repo, ["update-ref", "refs/heads/main", competingTip, initial]);
+              }
+              return { status: 128, stdout: "", stderr: "injected target CAS failure" };
+            }
+            if (isUnpark) {
+              unparkAttempts += 1;
+              return { status: 128, stdout: "", stderr: "injected persistent un-park failure" };
+            }
+            return rawGit(origin, args);
+          },
+          emitEvent: () => undefined,
+        },
+      );
+
+      assert.equal(unparkAttempts, 2);
+      assert.equal(result.status, failure === "operational" ? "operational_error" : "target_moved");
+      if (result.status !== "operational_error" && result.status !== "target_moved") continue;
+      assert.ok(result.detail.length <= 512);
+      assert.match(result.detail, /checkout remains parked/);
+      assert.notEqual(backupRef, "");
+      assert.ok(result.detail.includes(backupRef));
+      assert.ok(result.detail.includes(`git -C '${repo}' symbolic-ref HEAD 'refs/heads/main'`));
+      assert.equal(git(repo, ["symbolic-ref", "HEAD"]), backupRef);
+    }
+  });
+
   it("leaves a stray backup without re-parking when target CAS and backup cleanup fail", () => {
     const { repo, initial } = createRepo();
     createFeature(repo, "feature-cas-cleanup-failure");

@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { execSync, execFileSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { getDb } from "../db.js";
 import { resolvePiStateDir, resolveWorkflowDir, resolveTamanduaCli, resolveRunRoot } from "./paths.js";
 import { teardownWorkflowCronsIfIdle } from "./agent-scheduler.js";
@@ -157,6 +157,9 @@ const RESERVED_CONTEXT_KEYS = new Set([
   "worktree_origin_ref",
   "worktree_origin_sha",
   "original_branch",
+  "merge_gate",
+  "fail_missing",
+  "test_cmd_raw",
 ]);
 
 // ══════════════════════════════════════════════════════════════════════
@@ -2151,6 +2154,56 @@ export function stepCurrent(agentId: string, runId: string): { stepId: string; r
 /**
  * Find and claim a pending step for an agent, returning the resolved input.
  */
+function enforceClaimLedgerGate(
+  step: { id: string; run_id: string; step_id: string },
+): { eligible: boolean; decision: LedgerGateDecision | null } {
+  const db = getDb();
+  let decision: LedgerGateDecision | null = null;
+  let eligible = true;
+
+  // Duplicate pollers may both observe the candidate before reaching this
+  // seam. BEGIN IMMEDIATE makes the loser re-check eligibility only after the
+  // winning refusal commits. Events stay buffered until that commit so an
+  // aborted mutation cannot leave a phantom refusal sequence on disk.
+  beginEventBuffering();
+  try {
+    db.exec("BEGIN IMMEDIATE");
+    const candidate = db.prepare(
+      `SELECT s.status, s.output, r.status AS run_status
+       FROM steps s
+       JOIN runs r ON r.id = s.run_id
+       WHERE s.id = ?`,
+    ).get(step.id) as { status: string; output: string | null; run_status: string } | undefined;
+
+    if (!candidate || candidate.status !== "pending" || candidate.run_status !== "running") {
+      eligible = false;
+    } else {
+      const alreadyLanded = candidate.output ? isAlreadyLanded(step.id, candidate.output) : false;
+      decision = alreadyLanded ? null : evaluateFinalizeMergeLedgerGate(step.id);
+      if (decision) {
+        const refusal = getLedgerGateRefusal(step.id, decision);
+        if (refusal) {
+          const refusalStatus = applyLedgerGateRefusalSync(
+            step,
+            formatLedgerGateRefusal(refusal),
+            refusal.status === "missing",
+            usesLedgerConcessionAllowance(step.id, refusal),
+          );
+          eligible = refusalStatus === "conceded";
+        }
+      }
+    }
+
+    db.exec("COMMIT");
+    flushEventBuffer();
+    return { eligible, decision };
+  } catch (error) {
+    try { db.exec("ROLLBACK"); } catch { /* ignore rollback errors */ }
+    discardEventBuffer();
+    throw error;
+  }
+}
+
 export function claimStep(agentId: string, runId: string, workerOwnership?: WorkerOwnership): ClaimResult {
   // Defense-in-depth: strip run- prefix (US-013)
   runId = stripIdPrefix(runId);
@@ -2214,20 +2267,17 @@ export function claimStep(agentId: string, runId: string, workerOwnership?: Work
 
   if (!step) return { found: false };
 
-  // Guard: don't claim work for a terminal/paused run
-  const runStatus = db.prepare("SELECT status FROM runs WHERE id = ?").get(step.run_id) as { status: string } | undefined;
-  if (runStatus?.status !== "running") return { found: false };
-
-  // LGAT: route an obstructing finalize_merge decision through RAMP before
-  // the merger receives work. Green and ineligible decisions remain inert.
-  const ledgerGateDecision = evaluateFinalizeMergeLedgerGate(step.id);
-  const ledgerGateRefusal = getLedgerGateRefusal(step.id, ledgerGateDecision);
-  if (ledgerGateRefusal) {
-    applyLedgerGateRefusalSync(
-      step,
-      formatLedgerGateRefusal(ledgerGateRefusal),
-    );
-    return { found: false };
+  let ledgerGateDecision: LedgerGateDecision | null = null;
+  if (step.step_id === "finalize_merge") {
+    const gateClaim = enforceClaimLedgerGate(step);
+    ledgerGateDecision = gateClaim.decision;
+    if (!gateClaim.eligible) return { found: false };
+  } else {
+    // Guard: don't claim work for a terminal/paused run.
+    const runStatus = db.prepare("SELECT status FROM runs WHERE id = ?").get(step.run_id) as
+      | { status: string }
+      | undefined;
+    if (runStatus?.status !== "running") return { found: false };
   }
 
   // Build context via resolveStepContext
@@ -2468,7 +2518,7 @@ export function claimStep(agentId: string, runId: string, workerOwnership?: Work
   if ((claim.changes ?? 0) <= 0) return { found: false };
   try {
     emitEvent({ ts: new Date().toISOString(), event: "step.running", runId: step.run_id, workflowId: getWorkflowId(step.run_id), stepId: step.step_id, agentId });
-    if (ledgerGateDecision.status === "overridden") {
+    if (ledgerGateDecision?.status === "overridden") {
       const launch = db.prepare(
         "SELECT run_number, workflow_id, created_at FROM runs WHERE id = ?",
       ).get(step.run_id) as { run_number: number; workflow_id: string; created_at: string } | undefined;
@@ -2804,8 +2854,15 @@ function completeStepInternal(stepId: string, output: string): { status: string;
       // Fall through to normal acceptance (expects validation, context merge, etc.)
     } else {
       const refusal = formatLedgerGateRefusal(acceptanceGateRefusal);
-      const refusalStatus = applyLedgerGateRefusalSync(step, refusal);
-      return { status: refusalStatus, detail: refusal };
+      const refusalStatus = applyLedgerGateRefusalSync(
+        step,
+        refusal,
+        acceptanceGateRefusal.status === "missing",
+        usesLedgerConcessionAllowance(step.id, acceptanceGateRefusal),
+      );
+      if (refusalStatus !== "conceded") {
+        return { status: refusalStatus, detail: refusal };
+      }
     }
   }
 
@@ -3138,14 +3195,9 @@ function completeStepInternal(stepId: string, output: string): { status: string;
     });
   }
 
-  // Default-mode missing evidence landing via restored concession valve.
-  // When strict-missing is NOT in force AND the terminal concession has
-  // been consumed (one reroute already happened), the merge lands
-  // annotated so operators can see it happened without suite evidence.
-  if (
-    acceptanceGateDecision.status === "missing"
-    && hasTerminalLedgerConcession(step.id)
-  ) {
+  // Every non-strict missing-evidence landing is annotated, including the
+  // safe fallback used when no valid retry target makes refusal reachable.
+  if (acceptanceGateDecision.status === "missing") {
     const runCtx = getRunContextForStep(step.id);
     const strictMissing = isStrictMissing(runCtx ?? {}, acceptanceGateDecision.gateMode);
     if (!strictMissing) {
@@ -3430,11 +3482,9 @@ type FailureRerouteMode = "legacy" | "declared_retryable" | "terminal";
 
 /** Read the first class line without normalizing the caller-owned reason. */
 function parseFailureClass(reason: string): string | null {
-  for (const line of reason.split(/\r?\n/)) {
-    const match = /^FAILURE_CLASS:[ \t]+(\S+)[ \t]*$/.exec(line);
-    if (match) return match[1];
-  }
-  return null;
+  const firstLine = reason.split(/\r?\n/, 1)[0] ?? "";
+  const match = /^FAILURE_CLASS:[ \t]+(\S+)[ \t]*$/.exec(firstLine);
+  return match?.[1] ?? null;
 }
 
 /** Unknown and undeclared nonterminal classes retain legacy behavior. */
@@ -3501,6 +3551,7 @@ function rerouteWithPolicy(
   consumerStepId: string,
   consumerRowId: string,
   error: string,
+  hasIndependentGateAllowance = false,
 ): "rerouted" | "budget_exhausted" | "invalid_target" | "not_found" {
   const db = getDb();
   const targetStepId = policy.retry_step!;
@@ -3534,10 +3585,17 @@ function rerouteWithPolicy(
   if (!targetStep) return "invalid_target";
   if (targetStep.step_index >= consumerStep.step_index) return "invalid_target";
 
-  // Check reroute budget (default 2 when not declared in YAML)
+  const rerouteMode = getFailureRerouteMode(error, policy);
+  const hasIndependentTerminalAllowance = rerouteMode === "terminal" && (
+    (consumerStep.terminal_reroute_count ?? 0) < 1 || hasIndependentGateAllowance
+  );
+
+  // Check the shared reroute budget (default 2 when not declared in YAML).
+  // A terminal refusal with an unspent durable allowance can cross an
+  // exhausted shared budget without charging it again.
   const maxReroutes = policy.max_reroutes ?? 2;
   const currentReroutes = consumerStep.reroute_count ?? 0;
-  if (currentReroutes >= maxReroutes) {
+  if (currentReroutes >= maxReroutes && !hasIndependentTerminalAllowance) {
     emitEvent({
       ts: new Date().toISOString(),
       event: "step.reroute_budget_exhausted",
@@ -3553,8 +3611,9 @@ function rerouteWithPolicy(
     return "budget_exhausted";
   }
 
-  const newRerouteCount = currentReroutes + 1;
-  const rerouteMode = getFailureRerouteMode(error, policy);
+  const usesBudgetIndependentAllowance =
+    currentReroutes >= maxReroutes && hasIndependentTerminalAllowance;
+  const newRerouteCount = currentReroutes + (usesBudgetIndependentAllowance ? 0 : 1);
   const newTerminalRerouteCount =
     (consumerStep.terminal_reroute_count ?? 0) + (rerouteMode === "terminal" ? 1 : 0);
 
@@ -3656,7 +3715,11 @@ export function isAlreadyLanded(stepId: string, output: string): boolean {
 
   try {
     const targetRef = `refs/heads/${targetBranch}`;
-    const tip = execSync(`git rev-parse ${targetRef}`, { cwd: repo, encoding: "utf-8", timeout: 10_000 }).trim();
+    const tip = execFileSync("git", ["rev-parse", targetRef], {
+      cwd: repo,
+      encoding: "utf-8",
+      timeout: 10_000,
+    }).trim();
     return tip === mergedCommit;
   } catch {
     return false;
@@ -3664,19 +3727,17 @@ export function isAlreadyLanded(stepId: string, output: string): boolean {
 }
 
 /**
- * Check whether the terminal concession valve has been consumed for a step.
+ * Check whether the ledger gate's concession valve has been consumed for a step.
  *
- * A concession is "terminal" when the step has been rerouted at least once
- * via a FAILURE_CLASS: refused_permanent refusal.  After the first terminal
- * reroute, the concession is exhausted and the next refusal is converted
- * into a soft landing (default-mode missing evidence only).
+ * Only a successful default-mode missing-evidence gate reroute consumes this
+ * counter. Generic terminal reroutes retain their separate RAMP accounting.
  */
-export function hasTerminalLedgerConcession(stepId: string): boolean {
+export function hasLedgerGateConcession(stepId: string): boolean {
   const db = getDb();
   const step = db.prepare(
-    "SELECT terminal_reroute_count FROM steps WHERE id = ?",
-  ).get(stepId) as { terminal_reroute_count: number | null } | undefined;
-  return (step?.terminal_reroute_count ?? 0) >= 1;
+    "SELECT ledger_concession_count FROM steps WHERE id = ?",
+  ).get(stepId) as { ledger_concession_count: number | null } | undefined;
+  return (step?.ledger_concession_count ?? 0) >= 1;
 }
 
 /**
@@ -3711,7 +3772,7 @@ function getLedgerGateRefusal(
       return decision;
     }
     // Default missing (not strict): reroute once, then concede.
-    if (!hasTerminalLedgerConcession(stepId)) {
+    if (!hasLedgerGateConcession(stepId)) {
       return decision;
     }
     // Concession valve consumed — allow the merge to land.
@@ -3722,32 +3783,64 @@ function getLedgerGateRefusal(
     : null;
 }
 
+function usesLedgerConcessionAllowance(
+  stepId: string,
+  decision: LedgerGateRefusalDecision,
+): boolean {
+  if (decision.status !== "missing") return false;
+  const runCtx = getRunContextForStep(stepId);
+  return !isStrictMissing(runCtx ?? {}, decision.gateMode);
+}
+
 function applyLedgerGateRefusalSync(
   step: { id: string; run_id: string; step_id: string },
   refusal: string,
-): "rerouted" | "failed" {
+  recordsLedgerConcession: boolean,
+  usesConcessionAllowance: boolean,
+): "rerouted" | "failed" | "conceded" {
   const db = getDb();
   const metadata = db.prepare(
     "SELECT retry_count, terminal_reroute_count FROM steps WHERE id = ?",
   ).get(step.id) as { retry_count: number; terminal_reroute_count: number | null } | undefined;
   const policy = getOnFailPolicySync(step.run_id, step.step_id);
-  const terminalRerouteCount = metadata?.terminal_reroute_count ?? 0;
   const rerouteMode = getFailureRerouteMode(refusal, policy);
-  const terminalRerouteLimitExhausted = rerouteMode === "terminal" && terminalRerouteCount >= 1;
+  const terminalRerouteLimitExhausted =
+    rerouteMode === "terminal" && (metadata?.terminal_reroute_count ?? 0) >= 1;
 
-  if (!terminalRerouteLimitExhausted && policy?.retry_step) {
+  // The default missing-evidence gate owns an independent one-shot allowance;
+  // all other terminal refusals continue to obey RAMP's terminal limit.
+  if ((!terminalRerouteLimitExhausted || usesConcessionAllowance) && policy?.retry_step) {
     const rerouteResult = rerouteWithPolicy(
       policy,
       step.run_id,
       step.step_id,
       step.id,
       refusal,
+      usesConcessionAllowance,
     );
     if (rerouteResult === "rerouted") {
+      if (recordsLedgerConcession) {
+        db.prepare(
+          "UPDATE steps SET ledger_concession_count = COALESCE(ledger_concession_count, 0) + 1 WHERE id = ?",
+        ).run(step.id);
+      }
       nudgeDispatch();
       finalizeDrainingPause(step.run_id);
       return "rerouted";
     }
+  }
+
+  // Default missing-evidence mode is fail-open by design. If its one-time
+  // refusal cannot reach a valid producer, concede immediately rather than
+  // turning a missing ledger row into a terminal run failure. Strict modes
+  // do not use this allowance and continue through the failure path below.
+  if (usesConcessionAllowance) {
+    logger.warn("Ledger gate refusal could not reach a valid retry target; conceding default missing evidence", {
+      runId: step.run_id,
+      stepId: step.step_id,
+      retryStep: policy?.retry_step,
+    });
+    return "conceded";
   }
 
   const retryCount = (metadata?.retry_count ?? 0) + 1;
