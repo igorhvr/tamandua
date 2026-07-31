@@ -28,7 +28,9 @@ import {
 const SINGLEFLIGHT_POLL_INTERVAL_MS = 1000; // 1s
 /** Dedicated fail-closed exit when a passing command cannot be attributed. */
 const TREE_DRIFT_EXIT_CODE = 86;
-/** Dedicated red-ledger exit for executions interrupted by a catchable signal. */
+/** Dedicated red-ledger exit for executions interrupted by a catchable signal
+ *  from the CALLER (e.g., command timeout, external kill). The suite was
+ *  terminated before it could finish; no usable evidence was produced. */
 const INTERRUPTED_EXIT_CODE = 87;
 /** Dedicated refusal when tracked files are already dirty before testing. */
 const TREE_DIRTY_EXIT_CODE = 88;
@@ -217,7 +219,8 @@ function executeAndCapture(cmdString: string): Promise<ExecuteResult> {
     const forwardSignal = (signal: NodeJS.Signals): void => {
       if (completed || interruptedBy !== null) return;
       interruptedBy = signal;
-      const evidence = `tamandua-test: suite interrupted by ${signal}; terminating child process\n`;
+      const evidence = `tamandua-test: suite KILLED by external ${signal} - this means the caller's command timeout or external signal terminated the suite before it finished. This attempt produced NO USABLE EVIDENCE; the suite must run to completion for results to be recorded in the evidence ledger.
+`;
       process.stderr.write(evidence);
       captured += evidence;
       try {
@@ -826,6 +829,28 @@ async function main(): Promise<void> {
         // unreachable — replayCachedResult calls process.exit(0) on success
       }
       ownsClaim = rekeyPoll.ownsClaim === true;
+    }
+  }
+
+  // US-002: Print prior-duration p50 hint before execution starts.
+  // Silent degradation if the control plane is unreachable or no history exists.
+  if (!force) {
+    try {
+      const { lookupSuiteDurationHistory } = await import("../server/control-client.js");
+      const durations = await lookupSuiteDurationHistory(originRepo, cmdHash);
+      if (durations !== null && durations.length > 0) {
+        const sorted = [...durations].sort((a, b) => a - b);
+        const mid = Math.floor(sorted.length / 2);
+        const p50Ms = sorted.length % 2 === 0
+          ? (sorted[mid - 1] + sorted[mid]) / 2
+          : sorted[mid];
+        const p50Min = Math.round(p50Ms / 60_000);
+        process.stderr.write(
+          `TAMANDUA-TEST: expect ~${p50Min}min based on ${durations.length} prior runs — use a timeout comfortably above this\n`,
+        );
+      }
+    } catch {
+      // Silent degradation — hint is advisory only.
     }
   }
 

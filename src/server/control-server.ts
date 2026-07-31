@@ -680,6 +680,31 @@ async function handleSuiteFlaky(url: string): Promise<JsonResponse> {
   }
 }
 
+async function handleSuiteDurationHistory(url: string): Promise<JsonResponse> {
+  const parsed = new URL(url, "http://localhost");
+  const originRepo = parsed.searchParams.get("origin_repo");
+  const cmdHash = parsed.searchParams.get("cmd_hash");
+
+  if (!originRepo || !cmdHash) {
+    return { status: 400, body: { error: "Missing required query params: origin_repo, cmd_hash" } };
+  }
+
+  try {
+    const db = getDb();
+    const rows = db.prepare(
+      `SELECT duration_ms FROM suite_results
+       WHERE origin_repo = ? AND cmd_hash = ? AND exit_code != 87
+       ORDER BY created_at DESC`,
+    ).all(originRepo, cmdHash) as Array<{ duration_ms: number }>;
+
+    const durations = rows.map((r) => r.duration_ms);
+    return ok({ durations, count: durations.length });
+  } catch (err) {
+    logger.warn("control-server: suite duration history failed", { error: String(err) });
+    return { status: 500, body: { error: err instanceof Error ? err.message : String(err) } };
+  }
+}
+
 // ── Run scheduling handlers ──────────────────────────────────────────
 
 async function handleRegisterRun(runId: string): Promise<JsonResponse> {
@@ -1138,6 +1163,11 @@ export function createControlServer(options: ControlServerOptions = {}): http.Se
       }
       if (pathname === "/suite/flaky" && method === "GET") {
         const r = await handleSuiteFlaky(url);
+        respond(r.status, r.body);
+        return;
+      }
+      if (pathname === "/suite/duration-history" && method === "GET") {
+        const r = await handleSuiteDurationHistory(url);
         respond(r.status, r.body);
         return;
       }

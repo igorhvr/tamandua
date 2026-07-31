@@ -797,7 +797,8 @@ describe("tamandua-test shim", { concurrency: 1 }, () => {
       assert.ok(rows[0]!.duration_ms > 0);
       assert.equal(rows[0]!.run_id, runId);
       assert.equal(rows[0]!.step_id, stepId);
-      assert.match(rows[0]!.log_tail ?? "", new RegExp(`interrupted by ${signal}`));
+      assert.match(rows[0]!.log_tail ?? "", new RegExp(`KILLED by external ${signal}`));
+      assert.match(rows[0]!.log_tail ?? "", /NO USABLE EVIDENCE/);
       assert.match(rows[0]!.log_tail ?? "", /CHILD RECEIVED TERMINATION/);
     });
   }
@@ -2373,6 +2374,237 @@ exit 0
     assert.ok(
       committedTreeHashCount >= 2,
       `committedTreeHash should appear multiple times in compiled shim, got ${committedTreeHashCount}`,
+    );
+  });
+
+  // ════════════════════════════════════════════════════════════════════
+  // US-002: Prior-duration p50 hint at execution start
+  // ════════════════════════════════════════════════════════════════════
+
+  it("US-002: prints duration hint when prior completed durations exist", async () => {
+    const env = shimChildEnv(controlEnv);
+
+    const { computeCmdHash, getOriginRepo } = await import(
+      "../../dist/suite/tree-hash.js"
+    );
+    const cmdHash = computeCmdHash(counterScript);
+    const originRepo = getOriginRepo(repoDir);
+
+    // Clear ALL rows for this repo+cmd to avoid interference from prior tests.
+    const db0 = new DatabaseSync(controlEnv.dbPath);
+    db0.prepare("DELETE FROM suite_results WHERE origin_repo = ? AND cmd_hash = ?").run(originRepo, cmdHash);
+    db0.close();
+
+    // Insert prior completed durations: 5min, 10min, 15min, 20min.
+    // The p50 of [5, 10, 15, 20] is (10+15)/2 = 12.5 min, rounded to 13.
+    // Use different tree hashes so the current tree doesn't hit the cache (no replay).
+    // Duration history queries ALL trees for the same (origin_repo, cmd_hash).
+    const db = new DatabaseSync(controlEnv.dbPath);
+    const durations = [5 * 60_000, 10 * 60_000, 15 * 60_000, 20 * 60_000];
+    const cmdDisplay = counterScript.slice(0, 200);
+    for (let i = 0; i < durations.length; i++) {
+      db.prepare(
+        `INSERT INTO suite_results (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, log_tail, run_id, step_id, created_at)
+         VALUES (?, ?, ?, ?, 0, ?, 'PASS: prior run', ?, ?, ?)`,
+      ).run(
+        originRepo,
+        `other-tree-hash-${i}-for-cross-tree-duration-test`,
+        cmdHash,
+        cmdDisplay,
+        durations[i],
+        `r-prior-${i}`,
+        `s-prior-${i}`,
+        new Date(Date.now() - (durations.length - i) * 60_000).toISOString(),
+      );
+    }
+    db.close();
+
+    // Run the shim — it should print the hint before executing.
+    const r = await runShim(
+      ["--repo", repoDir, "--run", "r-p50-hint", "--step", "s1", "--", counterScript],
+      env,
+    );
+    assert.equal(r.exitCode, 0, "should execute and exit 0");
+
+    // Check stderr for the TAMANDUA-TEST hint line.
+    // P50 of [300000, 600000, 900000, 1200000] = (600000+900000)/2 = 750000ms = 12.5min → 13min.
+    assert.match(
+      r.stderr,
+      /TAMANDUA-TEST: expect ~\d+min based on 4 prior runs — use a timeout comfortably above this/,
+      `stderr should contain duration hint, got: ${r.stderr}`,
+    );
+    assert.match(r.stderr, /expect ~1[2-3]min/);
+  });
+
+  it("US-002: prints nothing when no prior completed durations exist", async () => {
+    // Clear ALL rows for this repo+cmd (including cross-tree rows from other tests).
+    const { computeCmdHash, getOriginRepo } = await import(
+      "../../dist/suite/tree-hash.js"
+    );
+    const originRepo = getOriginRepo(repoDir);
+    const cmdHash = computeCmdHash(counterScript);
+    const db0 = new DatabaseSync(controlEnv.dbPath);
+    db0.prepare("DELETE FROM suite_results WHERE origin_repo = ? AND cmd_hash = ?").run(originRepo, cmdHash);
+    db0.close();
+
+    const env = shimChildEnv(controlEnv);
+
+    // Fresh key with no history at all.
+    const r = await runShim(
+      ["--repo", repoDir, "--run", "r-no-prior", "--step", "s1", "--", counterScript],
+      env,
+    );
+    assert.equal(r.exitCode, 0, "should execute and exit 0");
+
+    // Must NOT contain the duration hint line.
+    assert.doesNotMatch(
+      r.stderr,
+      /TAMANDUA-TEST: expect ~/,
+      `stderr should NOT contain duration hint when no prior history, got: ${r.stderr}`,
+    );
+  });
+
+  it("US-002: interrupted runs (exit 87) are excluded from duration history", async () => {
+    await clearSuiteResultsForCmd(repoDir, counterScript);
+    const env = shimChildEnv(controlEnv);
+
+    const { committedTreeHash, computeCmdHash, getOriginRepo } = await import(
+      "../../dist/suite/tree-hash.js"
+    );
+    const treeHash = committedTreeHash(repoDir);
+    assert.ok(treeHash, "should get a tree hash");
+    const cmdHash = computeCmdHash(counterScript);
+    const originRepo = getOriginRepo(repoDir);
+
+    // Insert one interrupted (exit 87) and one successful (exit 0) run.
+    // Use different tree hashes so the current tree doesn't hit cache.
+    const db = new DatabaseSync(controlEnv.dbPath);
+    const cmdDisplay = counterScript.slice(0, 200);
+    // Interrupted run — exit 87, should be excluded from duration history.
+    db.prepare(
+      `INSERT INTO suite_results (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, log_tail, run_id, step_id, created_at)
+       VALUES (?, ?, ?, ?, 87, 5000, 'INTERRUPTED: timeout', 'r-int-87', 's-int', ?)`,
+    ).run(originRepo, "other-tree-for-interrupted", cmdHash, cmdDisplay, new Date(Date.now() - 60000).toISOString());
+
+    // Successful run — should be the only one counted.
+    db.prepare(
+      `INSERT INTO suite_results (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, log_tail, run_id, step_id, created_at)
+       VALUES (?, ?, ?, ?, 0, 600000, 'PASS: good run', 'r-prior-ok', 's-ok', ?)`,
+    ).run(originRepo, "other-tree-for-interrupted-2", cmdHash, cmdDisplay, new Date().toISOString());
+    db.close();
+
+    const r = await runShim(
+      ["--repo", repoDir, "--run", "r-exit87-excl", "--step", "s1", "--", counterScript],
+      env,
+    );
+    assert.equal(r.exitCode, 0, "should execute and exit 0");
+
+    // Should have hint based on 1 prior run (only the successful one), NOT 2.
+    assert.match(
+      r.stderr,
+      /TAMANDUA-TEST: expect ~\d+min based on 1 prior runs? — use a timeout comfortably above this/,
+      `stderr should show 1 prior run (exit 87 excluded), got: ${r.stderr}`,
+    );
+  });
+
+  it("US-002: control plane unreachable — shim proceeds without hint", async () => {
+    await clearSuiteResultsForCmd(repoDir, counterScript);
+
+    // Use a port where nothing is listening — lookupSuiteDurationHistory returns null.
+    const env = shimChildEnv(controlEnv, {
+      TAMANDUA_CONTROL_PORT: "19999",
+    });
+
+    const r = await runShim(
+      ["--repo", repoDir, "--run", "r-cp-down-hint", "--step", "s1", "--", passScript],
+      env,
+    );
+    assert.equal(r.exitCode, 0, "should execute and exit 0");
+    assert.ok(r.stdout.includes("PASS: all tests passed"), "should see command output");
+
+    // Must NOT crash, and must NOT contain the duration hint.
+    assert.doesNotMatch(
+      r.stderr,
+      /TAMANDUA-TEST: expect ~/,
+      `stderr should NOT contain duration hint when control plane is down, got: ${r.stderr}`,
+    );
+  });
+
+  it("US-002: --force bypasses duration hint", async () => {
+    await clearSuiteResultsForCmd(repoDir, counterScript);
+    const env = shimChildEnv(controlEnv);
+
+    const { committedTreeHash, computeCmdHash, getOriginRepo } = await import(
+      "../../dist/suite/tree-hash.js"
+    );
+    const treeHash = committedTreeHash(repoDir);
+    assert.ok(treeHash, "should get a tree hash");
+    const cmdHash = computeCmdHash(counterScript);
+    const originRepo = getOriginRepo(repoDir);
+
+    // Insert one prior successful run with a known duration (e.g. 15 minutes).
+    // Use different tree hash so the current tree doesn't hit cache.
+    const db = new DatabaseSync(controlEnv.dbPath);
+    const cmdDisplay = counterScript.slice(0, 200);
+    db.prepare(
+      `INSERT INTO suite_results (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, log_tail, run_id, step_id, created_at)
+       VALUES (?, ?, ?, ?, 0, 900000, 'PASS: prior', 'r-prior-force', 's-prior', ?)`,
+    ).run(originRepo, "other-tree-for-force-test", cmdHash, cmdDisplay, new Date(Date.now() - 60000).toISOString());
+    db.close();
+
+    // Run with --force — hint should NOT appear (force skips the hint).
+    const r = await runShim(
+      ["--repo", repoDir, "--run", "r-force-hint", "--step", "s1", "--force", "--", counterScript],
+      env,
+    );
+    assert.equal(r.exitCode, 0, "should execute and exit 0");
+
+    // Must NOT contain the duration hint (force bypasses it).
+    assert.doesNotMatch(
+      r.stderr,
+      /TAMANDUA-TEST: expect ~/,
+      `--force should bypass duration hint, got: ${r.stderr}`,
+    );
+  });
+
+  it("US-002: p50 computed correctly for odd number of durations", async () => {
+    const env = shimChildEnv(controlEnv);
+
+    const { computeCmdHash, getOriginRepo } = await import(
+      "../../dist/suite/tree-hash.js"
+    );
+    const cmdHash = computeCmdHash(counterScript);
+    const originRepo = getOriginRepo(repoDir);
+
+    // Clear ALL rows for this repo+cmd to avoid interference from prior tests.
+    const db0 = new DatabaseSync(controlEnv.dbPath);
+    db0.prepare("DELETE FROM suite_results WHERE origin_repo = ? AND cmd_hash = ?").run(originRepo, cmdHash);
+    db0.close();
+
+    // Insert 3 prior runs: 5min, 10min, 20min → p50 = 10min.
+    // Use different tree hashes so the current tree doesn't hit cache.
+    const db = new DatabaseSync(controlEnv.dbPath);
+    const durations = [5 * 60_000, 10 * 60_000, 20 * 60_000];
+    const cmdDisplay = counterScript.slice(0, 200);
+    for (let i = 0; i < durations.length; i++) {
+      db.prepare(
+        `INSERT INTO suite_results (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, log_tail, run_id, step_id, created_at)
+         VALUES (?, ?, ?, ?, 0, ?, 'PASS', ?, ?, ?)`,
+      ).run(originRepo, `other-tree-odd-${i}`, cmdHash, cmdDisplay, durations[i], `r-odd-${i}`, `s-odd-${i}`, new Date(Date.now() - 60000).toISOString());
+    }
+    db.close();
+
+    const r = await runShim(
+      ["--repo", repoDir, "--run", "r-p50-odd", "--step", "s1", "--", counterScript],
+      env,
+    );
+    assert.equal(r.exitCode, 0);
+
+    // P50 of [300000, 600000, 1200000] = index 1 = 600000ms = 10min.
+    assert.match(
+      r.stderr,
+      /expect ~10min based on 3 prior runs/,
+      `should report p50=10min for [5,10,20] with 3 runs, got: ${r.stderr}`,
     );
   });
 });

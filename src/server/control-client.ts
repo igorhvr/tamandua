@@ -400,6 +400,23 @@ export async function emitSuiteEvent(
 }
 
 /**
+ * Query duration history for a given (origin_repo, cmd_hash) key across
+ * ANY tree. Returns an array of duration_ms values from completed runs
+ * (exit_code != 87), or null when the daemon is unreachable.
+ */
+export async function lookupSuiteDurationHistory(
+  originRepo: string,
+  cmdHash: string,
+  timeoutMs: number = DEFAULT_TIMEOUT_MS,
+): Promise<number[] | null> {
+  const qs = new URLSearchParams({ origin_repo: originRepo, cmd_hash: cmdHash });
+  const r = await controlRequest("GET", `/suite/duration-history?${qs.toString()}`, undefined, timeoutMs);
+  if (!r || r.status !== 200) return null;
+  const body = r.body as { durations?: number[] };
+  return Array.isArray(body.durations) ? body.durations : null;
+}
+
+/**
  * Query flaky keys for a given origin repository.
  * Returns array of flaky key entries, null when the daemon is unreachable.
  */
