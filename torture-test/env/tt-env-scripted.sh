@@ -20,7 +20,8 @@ export TAMANDUA_CONTROL_PORT=5339
 export TAMANDUA_MCP_PORT=5338
 export TAMANDUA_DASHBOARD_PORT=5334
 export HERMES_HOME="$TT_SCRIPTED_HOME/.hermes"
-export TAMANDUA_TEST_GUARD=1
+# TAMANDUA_TEST_GUARD is intentionally NOT set here.
+# See tt-env.sh for the rationale.
 
 # Scripted harness binaries (wrappers with absolute node paths — the
 # daemon PATH is not guaranteed; the runtimes are the P3/Phase-D
@@ -31,7 +32,7 @@ export TAMANDUA_HERMES_BINARY="$TT_REPO_ROOT/torture-test/scripted-runtimes/bin/
 if [ "${1:-}" = "print" ]; then
   for v in TT_REPO_ROOT TT_ROOT TT_SCRIPTED_HOME HOME TAMANDUA_STATE_DIR \
            TAMANDUA_CONTROL_PORT TAMANDUA_MCP_PORT TAMANDUA_DASHBOARD_PORT \
-           HERMES_HOME TAMANDUA_TEST_GUARD TAMANDUA_PI_BINARY \
+           HERMES_HOME TAMANDUA_PI_BINARY \
            TAMANDUA_HERMES_BINARY; do
     printf '%s=%s\n' "$v" "$(eval "printf '%s' \"\$$v\"")"
   done

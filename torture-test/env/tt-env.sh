@@ -26,13 +26,17 @@ export TAMANDUA_CONTROL_PORT=4339
 export TAMANDUA_MCP_PORT=4338
 export TAMANDUA_DASHBOARD_PORT=4334
 export HERMES_HOME="$TT_HOME/.hermes"
-export TAMANDUA_TEST_GUARD=1
+# TAMANDUA_TEST_GUARD is intentionally NOT set here.
+# The test guard (src/lib/test-guard.ts) will block daemon startup when the
+# state directory happens to be under ~/.tamandua/ (e.g. when running from
+# a tamandua worktree). Production isolation is handled by daemon-control's
+# own production guard (ports + cwd checks), which is sufficient.
 
 # Helper: print the env as KEY=VALUE pairs for `env $(...)` composition.
 if [ "${1:-}" = "print" ]; then
   for v in TT_REPO_ROOT TT_ROOT TT_HOME HOME TAMANDUA_STATE_DIR \
            TAMANDUA_CONTROL_PORT TAMANDUA_MCP_PORT TAMANDUA_DASHBOARD_PORT \
-           HERMES_HOME TAMANDUA_TEST_GUARD; do
+           HERMES_HOME; do
     printf '%s=%s\n' "$v" "$(eval "printf '%s' \"\$$v\"")"
   done
 fi

@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+# tt-provision-home — idempotently provisions TT_HOME directories.
+#
+# Creates real TT_HOME (torture-test/var/home/) and scripted TT_HOME
+# (torture-test/var/home-scripted/) per spec 01 TT_HOME provisioning
+# checklist.
+#
+# Idempotent: safe to run repeatedly — second run is a no-op.
+# Follows spec 01 two-env rule: never mutates caller environment.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TT_DIR="$(dirname "$SCRIPT_DIR")"                        # torture-test/
+TT_REPO_ROOT="$(dirname "$TT_DIR")"                      # repo root
+# Allow override for testing
+TT_VAR="${TT_VAR:-$TT_DIR/var}"
+
+REAL_TT_HOME="$TT_VAR/home"
+SCRIPTED_TT_HOME="$TT_VAR/home-scripted"
+
+REAL_HOME="${HOME}"
+
+# ── helpers ───────────────────────────────────────────────────────────
+
+log() { printf '[tt-provision-home] %s\n' "$*"; }
+log_verbose() { log "$@"; }
+
+# ── .gitconfig creation ──────────────────────────────────────────────
+
+provision_gitconfig() {
+  local dest="$1"
+  local dest_gitconfig="$dest/.gitconfig"
+
+  mkdir -p "$dest"
+
+  if [ -f "$dest_gitconfig" ]; then
+    log "  .gitconfig already exists at $dest_gitconfig — skipping"
+    return 0
+  fi
+
+  log "Creating $dest_gitconfig"
+  cat > "$dest_gitconfig" <<'GITCONF'
+[user]
+    name = Tamandua Torture Test
+    email = tt@tamandua.test
+[commit]
+    gpgsign = false
+[init]
+    defaultBranch = main
+[pull]
+    ff = only
+GITCONF
+}
+
+# ── directory copy with path audit ───────────────────────────────────
+
+copy_and_audit() {
+  local src_dir="$1"
+  local dest_dir="$2"
+  local audit_file="$3"
+  local label="$4"
+
+  if [ ! -d "$src_dir" ]; then
+    log "  $src_dir does not exist — skipping $label copy"
+    mkdir -p "$dest_dir" 2>/dev/null || true
+    return 0
+  fi
+
+  if [ -d "$dest_dir" ] && [ -n "$(ls -A "$dest_dir" 2>/dev/null || true)" ]; then
+    log "  $dest_dir already exists and is non-empty — skipping $label copy"
+    return 0
+  fi
+
+  log "Copying $src_dir → $dest_dir (NOT a symlink)"
+  rm -rf "$dest_dir"
+  cp -a "$src_dir" "$dest_dir"
+
+  # Audit for absolute paths pointing at the real HOME
+  log "  Auditing $dest_dir for real-home paths ($REAL_HOME) ..."
+  local rewrites=0
+  while IFS= read -r file; do
+    if [ ! -f "$file" ]; then continue; fi
+    if grep -qF "$REAL_HOME" "$file" 2>/dev/null; then
+      log_verbose "    Found real-home reference in: $file"
+      # Escape for sed: use | as delimiter since paths contain /
+      # But first we must also escape | characters if they appear in the home path
+      local sed_real_home
+      sed_real_home="$(printf '%s' "$REAL_HOME" | sed 's/|/\\|/g')"
+      local sed_tt_home
+      sed_tt_home="$(printf '%s' "$dest_dir" | sed 's/|/\\|/g')"
+
+      # Count and record rewrites before doing them
+      local count
+      count="$(grep -cF "$REAL_HOME" "$file" 2>/dev/null || echo 0)"
+
+      sed -i "s|${sed_real_home}|${sed_tt_home}|g" "$file"
+
+      printf '{"file":"%s","replacements":%s,"old":"%s","new":"%s"}\n' \
+        "${file#"$dest_dir/"}" "$count" "$REAL_HOME" "$dest_dir" \
+        >> "$audit_file"
+      rewrites=$((rewrites + count))
+    fi
+  done < <(find "$dest_dir" -type f 2>/dev/null || true)
+
+  if [ "$rewrites" -gt 0 ]; then
+    log "  Audited: $rewrites path rewrite(s) in $label copy → $audit_file"
+  else
+    log "  Audited: no real-home paths found in $label copy"
+  fi
+}
+
+# ── remove .ssh if it exists ─────────────────────────────────────────
+
+remove_ssh_dir() {
+  local dest="$1"
+  if [ -d "$dest/.ssh" ]; then
+    log "  Removing $dest/.ssh (not permitted in TT_HOME)"
+    rm -rf "$dest/.ssh"
+  fi
+}
+
+# ── usage ────────────────────────────────────────────────────────────
+
+usage() {
+  cat <<EOF
+tt-provision-home — idempotently provisions TT_HOME directories.
+
+Usage: tt-provision-home [--help]
+
+Provisions:
+  torture-test/var/home/          (real TT_HOME)
+  torture-test/var/home-scripted/ (scripted TT_HOME)
+
+Real TT_HOME gets:
+  - .gitconfig with TT-specific identity settings
+  - COPY of ~/.pi/ and ~/.hermes/ (audited for absolute paths)
+  - NO .ssh directory
+
+Scripted TT_HOME gets:
+  - .gitconfig only (same settings)
+  - NO .pi / .hermes copies
+
+Idempotent: safe to run repeatedly — second run is a no-op.
+Never mutates the caller's environment (spec 01 two-env rule).
+EOF
+}
+
+# ── main ──────────────────────────────────────────────────────────────
+
+case "${1:-}" in
+  --help|-h) usage; exit 0 ;;
+  "")
+    # proceed
+    ;;
+  *)
+    echo "Unknown argument: $1" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
+
+log "Starting TT_HOME provisioning"
+log "  Real TT_HOME  : $REAL_TT_HOME"
+log "  Scripted TT_HOME: $SCRIPTED_TT_HOME"
+log "  Real HOME     : $REAL_HOME"
+
+# ──────── real TT_HOME ────────────────────────────────────────────────
+
+echo ""
+log "── Real TT_HOME ($REAL_TT_HOME) ──"
+
+provision_gitconfig "$REAL_TT_HOME"
+
+# Copy pi config
+copy_and_audit \
+  "$REAL_HOME/.pi" \
+  "$REAL_TT_HOME/.pi" \
+  "$REAL_TT_HOME/provision-audit.json" \
+  "~/.pi"
+
+# Copy hermes config
+copy_and_audit \
+  "$REAL_HOME/.hermes" \
+  "$REAL_TT_HOME/.hermes" \
+  "$REAL_TT_HOME/provision-audit.json" \
+  "~/.hermes"
+
+# Remove .ssh if present (belt-and-suspenders)
+remove_ssh_dir "$REAL_TT_HOME"
+
+# ──────── scripted TT_HOME ────────────────────────────────────────────
+
+echo ""
+log "── Scripted TT_HOME ($SCRIPTED_TT_HOME) ──"
+
+provision_gitconfig "$SCRIPTED_TT_HOME"
+
+# No .pi / .hermes copies for scripted
+# No .ssh either
+remove_ssh_dir "$SCRIPTED_TT_HOME"
+
+echo ""
+log "Provisioning complete."
+log "  Real TT_HOME    : $REAL_TT_HOME"
+log "  Scripted TT_HOME: $SCRIPTED_TT_HOME"
+log "  Audit file      : $REAL_TT_HOME/provision-audit.json"

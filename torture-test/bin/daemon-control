@@ -1,0 +1,905 @@
+#!/usr/bin/env bash
+# daemon-control — the ONLY sanctioned start/stop/restart/status path for
+# torture-test daemons (spec 01 §Daemon containment, spec 12 §daemon-control).
+#
+# Usage: daemon-control <real|scripted> <start|stop|restart|status>
+#
+# Applies the matching env script (tt-env.sh or tt-env-scripted.sh) to
+# spawned processes ONLY — never mutates the caller's env.
+#
+# Production guards: refuses absolutely to touch production ports
+# 3334/3338/3339 or the real ~/.tamandua.
+#
+# Where systemd-run --user --scope is available, starts daemons inside
+# dedicated named scopes and re-asserts cgroup membership after every
+# start/restart, recording provenance to
+# torture-test/var/daemon-control/<name>.json.
+set -euo pipefail
+
+# ── path resolution ──────────────────────────────────────────────────
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TT_DIR="$(dirname "$SCRIPT_DIR")"                        # torture-test/
+TT_REPO_ROOT="$(dirname "$TT_DIR")"                      # repo root
+export TT_ROOT="${TT_REPO_ROOT}/torture-test/var"
+
+# Env script paths
+TT_ENV_REAL="$TT_DIR/env/tt-env.sh"
+TT_ENV_SCRIPTED="$TT_DIR/env/tt-env-scripted.sh"
+
+# Provenance directory
+PROV_DIR="$TT_ROOT/daemon-control"
+
+# Production ports (spec 01: real daemon on 43xx; production is 33xx)
+PROD_PORTS="3334 3338 3339"
+# Real tamandua state dir (the production ~/.tamandua that must NEVER be touched)
+REAL_TAMANDUA_STATE="${HOME}/.tamandua"
+
+# ── production guards ─────────────────────────────────────────────────
+
+# is_production_port: checks if a port number is a production port.
+is_production_port() {
+  local port="$1"
+  for p in $PROD_PORTS; do
+    if [ "$port" = "$p" ]; then return 0; fi
+  done
+  return 1
+}
+
+# is_production_cwd: checks if a directory is the REAL ~/.tamandua or
+# under the real HOME/.tamandua (i.e. NOT a TT-contained path). Returns
+# 0 if it IS production (dangerous), 1 if safe.
+is_production_cwd() {
+  local dir="$1"
+  # Absolute realpath of the directory being checked
+  local rp
+  rp="$(cd "$dir" 2>/dev/null && pwd || true)"
+  if [ -z "$rp" ]; then return 1; fi
+  # Real ~/.tamandua
+  local real_state
+  real_state="$(cd "$REAL_TAMANDUA_STATE" 2>/dev/null && pwd || true)"
+  if [ -n "$real_state" ] && [ "$rp" = "$real_state" ]; then return 0; fi
+  # Under TT_ROOT is safe
+  local tt_root_rp
+  tt_root_rp="$(cd "$TT_ROOT" 2>/dev/null && pwd || true)"
+  if [ -n "$tt_root_rp" ]; then
+    case "$rp" in
+      "$tt_root_rp"|"$tt_root_rp"/*) return 1 ;; # TT-contained = safe
+    esac
+  fi
+  # Anything else under the real HOME that ends with .tamandua is suspect,
+  # EXCEPT worktrees (which live at ~/.tamandua/worktrees/ and are part of
+  # the development workspace, not the production state).
+  case "$rp" in
+    "$HOME/.tamandua") return 0 ;;
+    "$HOME/.tamandua/worktrees"|"$HOME/.tamandua/worktrees"/*) return 1 ;;
+    "$HOME/.tamandua"/*) return 0 ;;
+  esac
+  return 1
+}
+
+# production_target: checks if a (port, cwd) pair targets production.
+# Returns 0 if it IS production (block!), 1 if safe.
+production_target() {
+  local port="$1"
+  local cwd="$2"
+  if is_production_port "$port"; then return 0; fi
+  if is_production_cwd "$cwd"; then return 0; fi
+  return 1
+}
+
+# refuse_production: prints an error message and exits 1 with a clear
+# explanation of which guard tripped.
+refuse_production() {
+  local reason="$1"
+  cat >&2 <<EOF
+daemon-control: REFUSING — production guard tripped.
+  Reason: $reason
+  This tool is designed to ONLY manage torture-test daemons.
+  It MUST NOT touch the production tamandua instance on ports 3334/3338/3339
+  or the real ~/.tamandua state directory.
+  Aborting.
+EOF
+  exit 1
+}
+
+# ── systemd detection ────────────────────────────────────────────────
+
+# has_systemd_scope: checks mechanically whether systemd-run --user --scope
+# is available on this host.
+has_systemd_scope() {
+  if command -v systemd-run >/dev/null 2>&1; then
+    if systemd-run --user --scope --quiet true 2>/dev/null; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+# ── env script application ───────────────────────────────────────────
+
+# env_for_kind: prints environment variables for the given kind
+# (real|scripted) as KEY=VALUE lines, suitable for `env $(...)` composition.
+# This NEVER sources into the caller shell.
+env_for_kind() {
+  local kind="$1"
+  case "$kind" in
+    real)
+      env -i bash "$TT_ENV_REAL" print
+      ;;
+    scripted)
+      env -i bash "$TT_ENV_SCRIPTED" print
+      ;;
+    *)
+      echo "daemon-control: internal error — unknown kind '$kind'" >&2
+      exit 2
+      ;;
+  esac
+}
+
+# run_under_env: runs a command under the spawn env for the given kind.
+# Usage: run_under_env <real|scripted> <cmd...>
+run_under_env() {
+  local kind="$1"
+  shift
+  env -i $(env_for_kind "$kind") PATH="${PATH}" "$@"
+}
+
+# ── directory setup ──────────────────────────────────────────────────
+
+ensure_prov_dir() {
+  mkdir -p "$PROV_DIR"
+}
+
+# ── port extraction for a given kind ─────────────────────────────────
+
+ports_for_kind() {
+  local kind="$1"
+  case "$kind" in
+    real)     echo "4334 4338 4339" ;;
+    scripted) echo "5334 5338 5339" ;;
+  esac
+}
+
+dashboard_port_for_kind() {
+  local kind="$1"
+  case "$kind" in
+    real)     echo "4334" ;;
+    scripted) echo "5334" ;;
+  esac
+}
+
+# ── production guard check for a given kind ──────────────────────────
+
+guard_kind_ports() {
+  local kind="$1"
+  local ports; ports="$(ports_for_kind "$kind")"
+  for port in $ports; do
+    if is_production_port "$port"; then
+      refuse_production "kind '$kind' port $port is a production port"
+    fi
+  done
+}
+
+guard_kind_cwd() {
+  local kind="$1"
+  local state_dir
+  state_dir="$(env_for_kind "$kind" | grep '^TAMANDUA_STATE_DIR=' | cut -d= -f2-)"
+  if [ -n "$state_dir" ] && is_production_cwd "$state_dir"; then
+    refuse_production "kind '$kind' state dir '$state_dir' is production"
+  fi
+}
+
+# ── usage ────────────────────────────────────────────────────────────
+
+usage() {
+  cat <<EOF
+daemon-control — manage torture-test daemons (start/stop/restart/status).
+
+Usage: daemon-control <real|scripted> <start|stop|restart|status>
+       daemon-control --help
+
+Manages tamandua daemons for the torture-test environment. This is the
+ONLY sanctioned path for starting, stopping, restarting, or checking
+the status of TT daemons. Production daemons (ports 3334/3338/3339,
+real ~/.tamandua) are ABSOLUTELY rejected — this tool will never touch
+the live instance by construction.
+
+Daemon kinds:
+  real      The real-harness daemon (ports 4334/4338/4339, HOME=TT_HOME)
+  scripted  The scripted-harness zero-token daemon (ports 5334/5338/5339,
+            HOME=TT_HOME-scripted). The scripted daemon start works even
+            before scripted harness runtimes are installed — harness
+            resolution happens at dispatch time, not at daemon start.
+
+Commands:
+  start     Start the daemon inside a systemd user scope (when available)
+            or as a plain background process. Records provenance to
+            torture-test/var/daemon-control/<name>.json.
+  stop      Stop the daemon gracefully via tamandua CLI, escalating only
+            to evidence-based process signals (cwd/cmdline provenance).
+  restart   Stop then start, re-asserting cgroup membership after start.
+  status    Report daemon running state (RUNNING/STOPPED/UNKNOWN) from
+            provenance file and liveness checks.
+
+Environment:
+  Spawn env is applied ONLY to the tamandua process, never to the caller.
+  - real:     torture-test/env/tt-env.sh
+  - scripted: torture-test/env/tt-env-scripted.sh
+
+Production guards:
+  - Ports 3334/3338/3339 are blocked by construction.
+  - Real ~/.tamandua is blocked by construction.
+  - Any attempt to target production exits with an error.
+  - The guard checks BEFORE every signal, not just at startup.
+
+Examples:
+  daemon-control real start        # start the real-harness TT daemon
+  daemon-control real stop         # stop it gracefully
+  daemon-control real restart      # stop + start with cgroup re-assertion
+  daemon-control real status       # check if it's running
+  daemon-control scripted start    # start the scripted TT daemon (43→53)
+  daemon-control --help            # this help
+EOF
+}
+
+# ── start subcommand ─────────────────────────────────────────────────
+
+# wait_for_port: poll until a TCP port is listening, up to a timeout in
+# seconds (default 10). Returns 0 if the port becomes available, 1 on timeout.
+wait_for_port() {
+  local port="$1"
+  local timeout="${2:-10}"
+  local deadline; deadline=$(($(date +%s) + timeout))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if timeout 1 bash -c "echo >/dev/tcp/localhost/$port" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
+# verify_cgroup: check whether PID $1 lives under the expected systemd scope
+# unit name $2. Returns 0 if verified, 1 otherwise.
+verify_cgroup() {
+  local pid="$1"
+  local scope_unit="$2"
+  local cgroup_file="/proc/$pid/cgroup"
+  if [ -f "$cgroup_file" ] && grep -q "$scope_unit" "$cgroup_file" 2>/dev/null; then
+    return 0
+  fi
+  return 1
+}
+
+# is_port_listening: check if a TCP port is accepting connections.
+# Returns 0 if listening, 1 if not.
+is_port_listening() {
+  local port="$1"
+  timeout 1 bash -c "echo >/dev/tcp/localhost/$port" 2>/dev/null
+}
+
+# verify_process_tt_owned: check that a PID belongs to the TT environment
+# by examining /proc/$PID/cwd and /proc/$PID/cmdline.
+# $1 = PID, $2 = expected cwd from provenance (for reference; actual check
+# is against TT_REPO_ROOT).
+# Returns 0 if proven TT-owned, 1 otherwise.
+verify_process_tt_owned() {
+  local pid="$1"
+  local expected_cwd="$2"
+
+  # Check /proc/$PID/cwd — must be under TT_REPO_ROOT
+  local actual_cwd
+  if [ -L "/proc/$pid/cwd" ]; then
+    actual_cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null || true)
+  fi
+  if [ -z "$actual_cwd" ]; then
+    return 1  # cannot verify — refuse
+  fi
+
+  # Must be under the TT repo root
+  case "$actual_cwd" in
+    "$TT_REPO_ROOT"|"$TT_REPO_ROOT"/*) ;;
+    *) return 1 ;;  # not under TT repo — not ours
+  esac
+
+  # Check /proc/$PID/cmdline — must contain tamandua
+  local cmdline
+  cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
+  if [ -z "$cmdline" ]; then
+    return 1  # cannot read cmdline — refuse
+  fi
+  if ! echo "$cmdline" | grep -q 'tamandua'; then
+    return 1  # cmdline doesn't contain tamandua — refuse
+  fi
+
+  return 0
+}
+
+# update_provenance_after_stop: add stoppedAt and exitCode to a provenance
+# JSON file. Uses jq if available, otherwise sed-based fallback.
+update_provenance_after_stop() {
+  local prov_file="$1"
+  local exit_code="$2"
+  local stopped_at
+  stopped_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+  if command -v jq >/dev/null 2>&1; then
+    local tmp_file="${prov_file}.tmp"
+    jq --arg stoppedAt "$stopped_at" --arg exitCode "$exit_code" \
+      '. + {stoppedAt: $stoppedAt, exitCode: ($exitCode | tonumber)}' \
+      "$prov_file" > "$tmp_file" && mv "$tmp_file" "$prov_file"
+  else
+    # Fallback: read file, strip closing brace, add fields
+    local tmp_file="${prov_file}.tmp"
+    sed '$d' "$prov_file" > "$tmp_file"
+    printf ',\n  "stoppedAt": "%s",\n  "exitCode": %s\n}\n' "$stopped_at" "$exit_code" >> "$tmp_file"
+    mv "$tmp_file" "$prov_file"
+  fi
+}
+
+# write_provenance: write JSON provenance record to
+# $PROV_DIR/$NAME.json. Uses jq if available, otherwise writes a
+# minimal JSON with printf.
+write_provenance() {
+  local name="$1"
+  local kind="$2"
+  local pid="$3"
+  local ports="$4"  # space-separated
+  local scope_unit="$5"
+  local cgroup_ok="$6"
+  local started_at="$7"
+  local cmdline="$8"
+  local cwd="$9"
+  local prov_file="$PROV_DIR/$name.json"
+
+  # Convert space-separated ports to a JSON array
+  local ports_json
+  ports_json="$(printf '%s' "$ports" | tr ' ' '\n' | while read -r p; do [ -n "$p" ] && printf '"%s",' "$p"; done | sed 's/,$//')"
+  ports_json="[$ports_json]"
+
+  if command -v jq >/dev/null 2>&1; then
+    jq -n \
+      --arg name "$name" \
+      --arg kind "$kind" \
+      --arg pid "$pid" \
+      --argjson ports "$ports_json" \
+      --arg scopeUnit "$scope_unit" \
+      --arg cgroupVerified "$cgroup_ok" \
+      --arg startedAt "$started_at" \
+      --arg cmdline "$cmdline" \
+      --arg cwd "$cwd" \
+      '{
+        name: $name,
+        kind: $kind,
+        pid: ($pid | tonumber),
+        ports: $ports,
+        scopeUnit: $scopeUnit,
+        cgroupVerified: ($cgroupVerified == "true"),
+        startedAt: $startedAt,
+        cmdline: $cmdline,
+        cwd: $cwd
+      }' > "$prov_file"
+  else
+    # Fallback: write JSON with printf (no jq dependency for basic operation)
+    cat > "$prov_file" <<PROVEOF
+{
+  "name": "$name",
+  "kind": "$kind",
+  "pid": $pid,
+  "ports": $ports_json,
+  "scopeUnit": "$scope_unit",
+  "cgroupVerified": $cgroup_ok,
+  "startedAt": "$started_at",
+  "cmdline": "$cmdline",
+  "cwd": "$cwd"
+}
+PROVEOF
+  fi
+  echo "daemon-control: provenance written to $prov_file" >&2
+}
+
+cmd_start() {
+  local kind="$1"
+  local name="$kind"
+
+  # Gather spawn env
+  local spawn_env; spawn_env="$(env_for_kind "$kind")"
+
+  # Extract key values from spawn env
+  local spawn_home;  spawn_home="$(echo "$spawn_env" | grep '^HOME=' | cut -d= -f2-)"
+  local dash_port;   dash_port="$(echo "$spawn_env" | grep '^TAMANDUA_DASHBOARD_PORT=' | cut -d= -f2-)"
+  local mcp_port;    mcp_port="$(echo "$spawn_env" | grep '^TAMANDUA_MCP_PORT=' | cut -d= -f2-)"
+  local ctrl_port;   ctrl_port="$(echo "$spawn_env" | grep '^TAMANDUA_CONTROL_PORT=' | cut -d= -f2-)"
+  local state_dir;   state_dir="$(echo "$spawn_env" | grep '^TAMANDUA_STATE_DIR=' | cut -d= -f2-)"
+
+  # Double-check production guard (already run in main but belt-and-suspenders)
+  for port in $dash_port $mcp_port $ctrl_port; do
+    if [ -n "$port" ] && is_production_port "$port"; then
+      refuse_production "kind '$kind' port $port is a production port"
+    fi
+  done
+  if [ -n "$state_dir" ] && is_production_cwd "$state_dir"; then
+    refuse_production "kind '$kind' state dir '$state_dir' is production"
+  fi
+
+  # Ensure state dir exists so the daemon can write its PID file
+  mkdir -p "$state_dir"
+
+  # Ensure provenance directory exists
+  ensure_prov_dir
+
+  echo "daemon-control: starting $kind daemon..." >&2
+
+  local daemon_pid_file="$state_dir/tamandua.pid"
+  local use_systemd=false
+  local scope_unit="tamandua-tt-$name"
+
+  # Build the launch command: start daemon (control-plane+motor),
+  # then dashboard, then MCP — all under the spawn env.
+  local launch_script
+  launch_script="tamandua daemon start && tamandua dashboard start --port $dash_port && tamandua mcp start --port $mcp_port"
+
+  if has_systemd_scope; then
+    use_systemd=true
+    echo "daemon-control: using systemd scope: $scope_unit" >&2
+    # Clear any lingering scope unit from a previous failed run
+    systemctl --user stop "$scope_unit" 2>/dev/null || true
+    systemctl --user reset-failed "$scope_unit" 2>/dev/null || true
+    # systemd-run exits immediately; the daemon+runs inside the scope.
+    # We pass the full env via env -i composition.
+    systemd-run --user --scope --unit="$scope_unit" --quiet \
+      env -i $(env_for_kind "$kind") PATH="${PATH}" bash -c "$launch_script" >/dev/null 2>&1
+  else
+    echo "daemon-control: systemd not available — using plain background spawn" >&2
+    nohup env -i $(env_for_kind "$kind") PATH="${PATH}" bash -c "$launch_script" >/dev/null 2>&1 &
+  fi
+
+  # Wait for the daemon PID file to appear
+  local deadline; deadline=$(($(date +%s) + 15))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if [ -f "$daemon_pid_file" ]; then break; fi
+    sleep 0.5
+  done
+
+  if [ ! -f "$daemon_pid_file" ]; then
+    echo "daemon-control: ERROR — daemon PID file did not appear at $daemon_pid_file within timeout" >&2
+    exit 1
+  fi
+
+  local daemon_pid; daemon_pid="$(cat "$daemon_pid_file")"
+  if [ -z "$daemon_pid" ] || ! kill -0 "$daemon_pid" 2>/dev/null; then
+    echo "daemon-control: ERROR — daemon PID $daemon_pid is not alive" >&2
+    exit 1
+  fi
+  echo "daemon-control: daemon PID $daemon_pid" >&2
+
+  # Verify cgroup membership when systemd was used
+  local cgroup_ok=false
+  if $use_systemd; then
+    if verify_cgroup "$daemon_pid" "$scope_unit"; then
+      cgroup_ok=true
+      echo "daemon-control: cgroup membership verified for $scope_unit" >&2
+    else
+      echo "daemon-control: WARNING — cgroup verification failed for $scope_unit" >&2
+    fi
+  fi
+
+  # Wait for each port to be listening
+  local port_ok=true
+  for port in $dash_port $mcp_port $ctrl_port; do
+    echo "daemon-control: waiting for port $port..." >&2
+    if wait_for_port "$port" 15; then
+      echo "daemon-control: port $port is listening" >&2
+    else
+      echo "daemon-control: WARNING — port $port did not become available within timeout" >&2
+      port_ok=false
+    fi
+  done
+
+  local started_at; started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  # Write provenance
+  write_provenance \
+    "$name" \
+    "$kind" \
+    "$daemon_pid" \
+    "$dash_port $mcp_port $ctrl_port" \
+    "$scope_unit" \
+    "$cgroup_ok" \
+    "$started_at" \
+    "tamandua daemon start" \
+    "$state_dir"
+
+  echo "daemon-control: $kind daemon started on ports $dash_port (dashboard) $mcp_port (MCP) $ctrl_port (control)" >&2
+
+  if ! $port_ok; then
+    echo "daemon-control: WARNING — one or more ports did not become available; the daemon may not be fully ready" >&2
+  fi
+}
+
+cmd_stop() {
+  local kind="$1"
+  local name="$kind"
+  local prov_file="$PROV_DIR/$name.json"
+
+  # ── Handle missing provenance ──────────────────────────────────────
+  if [ ! -f "$prov_file" ]; then
+    echo "daemon-control: no provenance record for $kind — daemon was never started by this tool" >&2
+    local ports; ports="$(ports_for_kind "$kind")"
+    for port in $ports; do
+      if is_port_listening "$port"; then
+        echo "daemon-control: ERROR — port $port is in use but no provenance record exists; refusing to stop unknown process" >&2
+        exit 1
+      fi
+    done
+    echo "daemon-control: $kind daemon is already stopped (no provenance, ports free)" >&2
+    return 0
+  fi
+
+  # ── Read provenance ────────────────────────────────────────────────
+  local prov_pid prov_ports prov_scope prov_cwd
+  prov_pid=$(jq -r '.pid // 0' "$prov_file" 2>/dev/null)
+  prov_ports=$(jq -r '.ports | join(" ")' "$prov_file" 2>/dev/null)
+  prov_scope=$(jq -r '.scopeUnit // ""' "$prov_file" 2>/dev/null)
+  prov_cwd=$(jq -r '.cwd // ""' "$prov_file" 2>/dev/null)
+
+  # ── Already stopped: ports free → no-op ────────────────────────────
+  local all_ports_free=true
+  for port in $prov_ports; do
+    if [ -n "$port" ] && is_port_listening "$port"; then
+      all_ports_free=false
+      break
+    fi
+  done
+
+  if $all_ports_free; then
+    echo "daemon-control: $kind daemon is already stopped" >&2
+    local has_stopped_at
+    has_stopped_at=$(jq -r '.stoppedAt // ""' "$prov_file" 2>/dev/null)
+    if [ -z "$has_stopped_at" ]; then
+      update_provenance_after_stop "$prov_file" "0"
+    fi
+    return 0
+  fi
+
+  # ── Production guard (provenance evidence) ─────────────────────────
+  for port in $prov_ports; do
+    if [ -n "$port" ] && is_production_port "$port"; then
+      refuse_production "provenance shows port $port — this is a production port"
+    fi
+  done
+  if [ -n "$prov_cwd" ] && [ "$prov_cwd" != "null" ] && is_production_cwd "$prov_cwd"; then
+    refuse_production "provenance cwd points to production: $prov_cwd"
+  fi
+
+  # ── PID liveness ──────────────────────────────────────────────────
+  local pid_alive=true
+  if [ "$prov_pid" -gt 0 ] 2>/dev/null; then
+    if ! kill -0 "$prov_pid" 2>/dev/null; then
+      pid_alive=false
+      echo "daemon-control: provenance PID $prov_pid is not alive, but ports are still in use" >&2
+    fi
+  else
+    pid_alive=false
+  fi
+
+  echo "daemon-control: stopping $kind daemon (PID $prov_pid)..." >&2
+
+  # ── Step 1: Graceful stop via tamandua CLI under spawn env ─────────
+  echo "daemon-control: graceful stop via tamandua dashboard stop..." >&2
+  run_under_env "$kind" tamandua dashboard stop >/dev/null 2>&1 || true
+
+  # ── Step 2: Poll for graceful shutdown (up to 10s) ─────────────────
+  local all_stopped=false
+  local deadline; deadline=$(($(date +%s) + 10))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    all_stopped=true
+    for port in $prov_ports; do
+      if [ -n "$port" ] && is_port_listening "$port"; then
+        all_stopped=false
+        break
+      fi
+    done
+    if $all_stopped; then break; fi
+    sleep 0.5
+  done
+
+  if $all_stopped; then
+    echo "daemon-control: $kind daemon stopped gracefully" >&2
+  else
+    # ── Step 3: Escalate → SIGTERM → SIGKILL (evidence-based only) ──
+    echo "daemon-control: daemon did not stop within timeout — escalating..." >&2
+
+    if $pid_alive && [ "$prov_pid" -gt 0 ] 2>/dev/null; then
+      # Production guard: refuse if cwd resolves to production
+      if [ -n "$prov_cwd" ] && [ "$prov_cwd" != "null" ] && is_production_cwd "$prov_cwd"; then
+        refuse_production "refusing to signal PID $prov_pid — cwd is production"
+      fi
+
+      # Verify TT-owned via /proc evidence before signaling
+      if verify_process_tt_owned "$prov_pid" "$prov_cwd"; then
+        echo "daemon-control: sending SIGTERM to proven TT-owned PID $prov_pid" >&2
+        kill -TERM "$prov_pid" 2>/dev/null || true
+        sleep 2
+        if kill -0 "$prov_pid" 2>/dev/null; then
+          echo "daemon-control: sending SIGKILL to PID $prov_pid" >&2
+          kill -KILL "$prov_pid" 2>/dev/null || true
+        fi
+      else
+        echo "daemon-control: REFUSING — PID $prov_pid is NOT proven TT-owned (cwd/cmdline evidence check failed)" >&2
+      fi
+    else
+      # PID not alive but ports still in use — cannot safely stop
+      # (name-only matching is forbidden by spec)
+      echo "daemon-control: WARNING — PID not alive but ports still in use; cannot escalate without evidence" >&2
+    fi
+  fi
+
+  # ── Step 4: Clean up any remaining port listeners (MCP may survive
+  # the daemon PID death). We find processes listening on the TT ports
+  # and, after verifying they are TT-owned, kill them.
+  for port in $prov_ports; do
+    if [ -n "$port" ] && is_port_listening "$port"; then
+      local lingering_pid
+      lingering_pid=$(ss -tlnp 2>/dev/null | grep ":$port " | grep -oP 'pid=\K[0-9]+' | head -1 || true)
+      if [ -z "$lingering_pid" ]; then
+        lingering_pid=$(netstat -tlnp 2>/dev/null | grep ":$port " | awk '{print $NF}' | grep -oP '\d+' | head -1 || true)
+      fi
+      if [ -n "$lingering_pid" ] && verify_process_tt_owned "$lingering_pid" "$prov_cwd"; then
+        echo "daemon-control: killing lingering TT-owned process on port $port (PID $lingering_pid)" >&2
+        kill -KILL "$lingering_pid" 2>/dev/null || true
+      fi
+    fi
+  done
+
+  # ── Step 5: Clean up systemd scope ─────────────────────────────────
+  if [ -n "$prov_scope" ] && [ "$prov_scope" != "null" ] && has_systemd_scope; then
+    echo "daemon-control: cleaning up systemd scope $prov_scope..." >&2
+    systemctl --user stop "$prov_scope" 2>/dev/null || true
+    # reset-failed clears the unit so a fresh systemd-run can reuse the name
+    systemctl --user reset-failed "$prov_scope" 2>/dev/null || true
+  fi
+
+  # ── Step 6: Update provenance with stop metadata ───────────────────
+  sleep 0.5  # brief settle for ports to release
+  local final_exit_code=0
+  for port in $prov_ports; do
+    if [ -n "$port" ] && is_port_listening "$port"; then
+      final_exit_code=1
+      break
+    fi
+  done
+
+  if [ "$final_exit_code" -eq 0 ]; then
+    echo "daemon-control: $kind daemon stopped successfully" >&2
+  else
+    echo "daemon-control: WARNING — one or more ports still in use after stop" >&2
+  fi
+
+  update_provenance_after_stop "$prov_file" "$final_exit_code"
+}
+
+cmd_restart() {
+  local kind="$1"
+  local name="$kind"
+  local prov_file="$PROV_DIR/$name.json"
+
+  echo "daemon-control: restarting $kind daemon..." >&2
+
+  # Check if daemon is currently running (provenance exists + ports active)
+  local need_stop=false
+  if [ -f "$prov_file" ]; then
+    local prov_ports
+    if command -v jq >/dev/null 2>&1; then
+      prov_ports=$(jq -r '.ports | join(" ")' "$prov_file" 2>/dev/null || true)
+    else
+      prov_ports=$(grep -o '"ports": *\[[^]]*\]' "$prov_file" 2>/dev/null | sed 's/.*\[//;s/\]//;s/"//g;s/,/ /g' || true)
+    fi
+    for port in $prov_ports; do
+      if [ -n "$port" ] && is_port_listening "$port"; then
+        need_stop=true
+        break
+      fi
+    done
+  fi
+
+  if $need_stop; then
+    echo "daemon-control: stopping existing daemon..." >&2
+    cmd_stop "$kind"
+    echo "daemon-control: stop complete, waiting for ports to settle..." >&2
+    sleep 1
+    # Verify ports are free before starting
+    if [ -f "$prov_file" ]; then
+      local post_stop_ports
+      if command -v jq >/dev/null 2>&1; then
+        post_stop_ports=$(jq -r '.ports | join(" ")' "$prov_file" 2>/dev/null || true)
+      else
+        post_stop_ports=$(grep -o '"ports": *\[[^]]*\]' "$prov_file" 2>/dev/null | sed 's/.*\[//;s/\]//;s/"//g;s/,/ /g' || true)
+      fi
+      local port_still_busy=false
+      for port in $post_stop_ports; do
+        if [ -n "$port" ] && is_port_listening "$port"; then
+          echo "daemon-control: WARNING — port $port still in use after stop" >&2
+          port_still_busy=true
+        fi
+      done
+      if $port_still_busy; then
+        echo "daemon-control: ERROR — ports not freed after stop; cannot restart" >&2
+        exit 1
+      fi
+    fi
+  else
+    echo "daemon-control: no running daemon found — performing clean start" >&2
+  fi
+
+  # Start (re-asserts cgroup membership via cmd_start's systemd + verify_cgroup logic)
+  cmd_start "$kind"
+}
+
+cmd_status() {
+  local kind="$1"
+  local name="$kind"
+  local prov_file="$PROV_DIR/$name.json"
+
+  # ── No provenance file ───────────────────────────────────────────
+  if [ ! -f "$prov_file" ]; then
+    echo "STATUS: NO_PROVENANCE"
+    echo "  kind: $kind"
+    echo "  reason: no provenance file at $prov_file"
+    return 0
+  fi
+
+  # ── Read provenance fields ───────────────────────────────────────
+  local prov_pid prov_ports prov_started prov_stopped prov_cmdline prov_cwd
+  if command -v jq >/dev/null 2>&1; then
+    prov_pid=$(jq -r '.pid // 0' "$prov_file" 2>/dev/null || echo "0")
+    prov_ports=$(jq -r '.ports | join(" ")' "$prov_file" 2>/dev/null || true)
+    prov_started=$(jq -r '.startedAt // ""' "$prov_file" 2>/dev/null || true)
+    prov_stopped=$(jq -r '.stoppedAt // ""' "$prov_file" 2>/dev/null || true)
+    prov_cmdline=$(jq -r '.cmdline // ""' "$prov_file" 2>/dev/null || true)
+    prov_cwd=$(jq -r '.cwd // ""' "$prov_file" 2>/dev/null || true)
+  else
+    prov_pid=$(grep -o '"pid": *[0-9]*' "$prov_file" 2>/dev/null | sed 's/.*: *//' || echo "0")
+    prov_ports=$(grep -o '"ports": *\[[^]]*\]' "$prov_file" 2>/dev/null | sed 's/.*\[//;s/\]//;s/"//g;s/,/ /g' || true)
+    prov_started=$(grep -o '"startedAt": *"[^"]*"' "$prov_file" 2>/dev/null | sed 's/.*"\([^"]*\)".*/\1/' || true)
+    prov_stopped=$(grep -o '"stoppedAt": *"[^"]*"' "$prov_file" 2>/dev/null | sed 's/.*"\([^"]*\)".*/\1/' || true)
+    prov_cmdline=$(grep -o '"cmdline": *"[^"]*"' "$prov_file" 2>/dev/null | sed 's/.*"\([^"]*\)".*/\1/' || true)
+    prov_cwd=$(grep -o '"cwd": *"[^"]*"' "$prov_file" 2>/dev/null | sed 's/.*"\([^"]*\)".*/\1/' || true)
+  fi
+
+  # ── Production guard ────────────────────────────────────────────
+  for port in $prov_ports; do
+    if [ -n "$port" ] && is_production_port "$port"; then
+      refuse_production "status: provenance port $port is a production port"
+    fi
+  done
+
+  # ── Process liveness (kill -0 + /proc) ──────────────────────────
+  local pid_alive=false
+  if [ -n "$prov_pid" ] && [ "$prov_pid" != "null" ] && [ "$prov_pid" -gt 0 ] 2>/dev/null; then
+    if [ -d "/proc/$prov_pid" ] && kill -0 "$prov_pid" 2>/dev/null; then
+      pid_alive=true
+    fi
+  fi
+
+  # ── Port listening status ───────────────────────────────────────
+  local ports_active=false
+  local any_port_listening=false
+  for port in $prov_ports; do
+    if [ -n "$port" ] && is_port_listening "$port"; then
+      any_port_listening=true
+      break
+    fi
+  done
+  if $pid_alive && $any_port_listening; then
+    ports_active=true
+  fi
+
+  # ── Cmdline verification (must contain tamandua for RUNNING) ────
+  local cmdline_ok=false
+  if $pid_alive; then
+    local actual_cmdline
+    actual_cmdline=$(tr '\0' ' ' < "/proc/$prov_pid/cmdline" 2>/dev/null || true)
+    if echo "$actual_cmdline" | grep -q 'tamandua'; then
+      cmdline_ok=true
+    fi
+  fi
+
+  # ── Determine and report status ─────────────────────────────────
+  if $pid_alive && $cmdline_ok && $ports_active; then
+    echo "STATUS: RUNNING"
+    echo "  kind: $kind"
+    echo "  pid: $prov_pid"
+    echo "  ports: $prov_ports"
+    echo "  startedAt: $prov_started"
+    echo "  cmdline: tamandua ✓"
+    for port in $prov_ports; do
+      if [ -n "$port" ] && is_port_listening "$port"; then
+        echo "  - port $port: LISTENING"
+      else
+        echo "  - port $port: free"
+      fi
+    done
+  elif [ -n "$prov_stopped" ] && [ "$prov_stopped" != "null" ] && ! $pid_alive && ! $any_port_listening; then
+    echo "STATUS: STOPPED"
+    echo "  kind: $kind"
+    echo "  pid: $prov_pid (not alive)"
+    echo "  ports: $prov_ports"
+    echo "  startedAt: $prov_started"
+    echo "  stoppedAt: $prov_stopped"
+    for port in $prov_ports; do
+      echo "  - port $port: free"
+    done
+  else
+    echo "STATUS: UNKNOWN"
+    echo "  kind: $kind"
+    echo "  pid: $prov_pid"
+    echo "  pid alive: $pid_alive"
+    echo "  cmdline verified: $cmdline_ok"
+    echo "  ports active: $any_port_listening"
+    echo "  ports: $prov_ports"
+    echo "  startedAt: $prov_started"
+    [ -n "$prov_stopped" ] && [ "$prov_stopped" != "null" ] && echo "  stoppedAt: $prov_stopped"
+    for port in $prov_ports; do
+      if [ -n "$port" ] && is_port_listening "$port"; then
+        echo "  - port $port: LISTENING"
+      else
+        echo "  - port $port: free"
+      fi
+    done
+  fi
+}
+
+# ── main dispatch ────────────────────────────────────────────────────
+
+main() {
+  # --help (standalone or as first argument)
+  case "${1:-}" in
+    --help|-h) usage; exit 0 ;;
+  esac
+
+  if [ $# -lt 2 ]; then
+    echo "daemon-control: missing arguments." >&2
+    echo "Usage: daemon-control <real|scripted> <start|stop|restart|status>" >&2
+    echo "       daemon-control --help" >&2
+    exit 1
+  fi
+
+  local kind="$1"
+  local cmd="$2"
+
+  # Validate kind
+  case "$kind" in
+    real|scripted) ;;
+    *)
+      echo "daemon-control: invalid kind '$kind'. Expected 'real' or 'scripted'." >&2
+      echo "Usage: daemon-control <real|scripted> <start|stop|restart|status>" >&2
+      exit 1
+      ;;
+  esac
+
+  # Ensure provenance directory exists
+  ensure_prov_dir
+
+  # Production guard: refuse absolutely if any TT port maps to a production port.
+  # This is a belt-and-suspenders check — the env scripts set non-production
+  # ports by construction, but this guard is the backstop.
+  guard_kind_ports "$kind"
+  guard_kind_cwd "$kind"
+
+  # Dispatch subcommand
+  case "$cmd" in
+    start)    cmd_start "$kind" ;;
+    stop)     cmd_stop "$kind" ;;
+    restart)  cmd_restart "$kind" ;;
+    status)   cmd_status "$kind" ;;
+    *)
+      echo "daemon-control: invalid command '$cmd'. Expected start, stop, restart, or status." >&2
+      echo "Usage: daemon-control <real|scripted> <start|stop|restart|status>" >&2
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
