@@ -443,6 +443,7 @@ registerCheck('toolchain-rust-cargo', 'rust/cargo toolchain build+test probe', '
 
   const dir = probeDir('rust-cargo');
   try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) { /* ok */ }
+  fs.mkdirSync(dir, { recursive: true });
   try {
     const init = spawnSync('cargo', ['init', '--name', 'hello'], { cwd: dir, encoding: 'utf-8', timeout: 30000, stdio: ['ignore', 'pipe', 'pipe'] });
     if (init.status !== 0) {
