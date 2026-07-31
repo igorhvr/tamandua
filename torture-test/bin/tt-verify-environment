@@ -1,0 +1,1718 @@
+#!/usr/bin/env node
+
+// tt-verify-environment — W0.0 assumption gate
+// Per spec 04-wave-0-preflight.md and 01-environment-and-isolation.md
+// Design rules from 12-runner-automation.md:
+//   - Mechanical checks only, no prose interpretation
+//   - UTC ISO-8601 timestamps
+//   - Deterministic, side-effect-free re-runs
+
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+import { execSync, spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+
+// ── CLI parsing ──────────────────────────────────────────────────────
+
+const args = process.argv.slice(2);
+const flags = new Set();
+
+function showHelp() {
+  console.log(`Usage: tt-verify-environment [--fast] [--json] [--spend] [--help]
+
+W0.0 assumption gate — mechanical environment verification for the tamandua torture-test suite.
+
+Options:
+  --fast     Skip toolchain build+test probes (~30s wave-boundary subset)
+  --json     Machine-readable JSON output to stdout (suppresses table)
+  --spend    Run live harness auth probes (pi/hermes 1-prompt); skipped otherwise
+  --help     Print this usage and exit
+
+Output:
+  Default: human-readable table: CHECK | RESULT | EVIDENCE [| REMEDY]
+  --json:   Single JSON object to stdout with all check results
+
+Exit code:
+  0        All REQUIRED checks pass (SKIPPED is not failure)
+  non-zero Any REQUIRED check failed
+`);
+}
+
+for (const arg of args) {
+  if (arg === '--help' || arg === '-h') {
+    showHelp();
+    process.exit(0);
+  }
+  flags.add(arg);
+}
+
+const OPT = {
+  fast: flags.has('--fast'),
+  json: flags.has('--json'),
+  spend: flags.has('--spend'),
+  testRequiredFail: flags.has('--test-required-fail'),
+};
+
+// ── Paths ─────────────────────────────────────────────────────────────
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const TT_ROOT = path.resolve(__dirname, '..');
+const VAR_DIR = path.resolve(TT_ROOT, 'var');
+const W0_DIR = path.resolve(VAR_DIR, 'w0');
+
+// Ensure var/w0 exists
+fs.mkdirSync(W0_DIR, { recursive: true });
+
+// ── Host profile accumulator ─────────────────────────────────────────
+// Accumulates structured data across all checks so US-011 can serialize
+// host-profile.json and environment.json. Each check that discovers
+// host capability facts records them here.
+
+const hostProfile = {
+  platform: null,         // { os, arch, release, label }
+  nodeRuntimes: [],        // [{ version, major, sqliteAvailable }]
+  npmVersion: null,        // string or null if not found
+  containment: null,       // { systemdUserScope: boolean|null } (US-003)
+  utilities: null,         // { sqlite3: boolean, curl: boolean, jq: boolean } (US-003)
+  git: null,               // { version: string, mergeTreeAvailable: boolean } (US-004)
+  ports: null,              // { [port]: 'free' | 'in-use-by-TT' | 'in-use-by-other' } (US-005)
+  diskHeadroom: null,        // { availableBytes, available, thresholdBytes, threshold } (US-006)
+  toolchains: null,           // { 'java+maven': {...}, 'rust/cargo': {...}, go: {...}, python3: {...}, node: {...} } (US-007)
+  harness: null,              // { pi: { authenticated, sessionId?, inputTokens?, outputTokens? }, hermes: { authenticated, sessionId?, inputTokens?, outputTokens? } } (US-010)
+  // Populated by US-011:
+  // spawnSpeedClass: null,
+};
+
+function recordHostProfile(section, key, value) {
+  if (section === 'platform') {
+    hostProfile.platform = hostProfile.platform || {};
+    hostProfile.platform[key] = value;
+  } else if (section === 'nodeRuntimes') {
+    hostProfile.nodeRuntimes.push(value);
+  } else if (section === 'npmVersion') {
+    hostProfile.npmVersion = value;
+  } else if (section === 'containment') {
+    hostProfile.containment = hostProfile.containment || {};
+    hostProfile.containment[key] = value;
+  } else if (section === 'utilities') {
+    hostProfile.utilities = hostProfile.utilities || {};
+    hostProfile.utilities[key] = value;
+  } else if (section === 'git') {
+    hostProfile.git = hostProfile.git || {};
+    hostProfile.git[key] = value;
+  } else if (section === 'ports') {
+    hostProfile.ports = hostProfile.ports || {};
+    hostProfile.ports[key] = value;
+  } else if (section === 'diskHeadroom') {
+    hostProfile.diskHeadroom = hostProfile.diskHeadroom || {};
+    hostProfile.diskHeadroom[key] = value;
+  } else if (section === 'toolchains') {
+    hostProfile.toolchains = hostProfile.toolchains || {};
+    hostProfile.toolchains[key] = value;
+  } else if (section === 'harness') {
+    hostProfile.harness = hostProfile.harness || {};
+    hostProfile.harness[key] = value;
+  } else if (section === 'spawnSpeedClass') {
+    hostProfile.spawnSpeedClass = hostProfile.spawnSpeedClass || {};
+    hostProfile.spawnSpeedClass[key] = value;
+  }
+}
+
+// ── Check registry ────────────────────────────────────────────────────
+
+/**
+ * @typedef {Object} Check
+ * @property {string} id - Unique check identifier
+ * @property {string} description - Human-readable description
+ * @property {'REQUIRED'|'OPTIONAL'} severity - Check severity
+ * @property {string} category - Grouping category
+ * @property {function(): Promise<CheckResult>} run - Check function
+ */
+
+/**
+ * @typedef {Object} CheckResult
+ * @property {'PASS'|'FAIL'|'SKIPPED'} result
+ * @property {string} evidence - Evidence string
+ * @property {string|null} remedy - Remedy on failure (null if not applicable)
+ * @property {string|null} skipReason - Reason if SKIPPED
+ */
+
+const checks = [];
+
+function registerCheck(id, description, severity, category, runFn) {
+  checks.push({ id, description, severity, category, runFn });
+}
+
+// ── Check implementations ─────────────────────────────────────────────
+
+// --- Platform ---
+registerCheck('platform', 'Host platform detection', 'REQUIRED', 'platform', async () => {
+  const platform = os.platform(); // 'linux', 'darwin', etc.
+  const arch = os.arch();
+  const release = os.release();
+  let label;
+  if (platform === 'linux') label = 'linux';
+  else if (platform === 'darwin') label = 'darwin';
+  else label = `other (${platform})`;
+
+  // Record in host profile accumulator (US-002)
+  recordHostProfile('platform', 'os', platform);
+  recordHostProfile('platform', 'arch', arch);
+  recordHostProfile('platform', 'release', release);
+  recordHostProfile('platform', 'label', label);
+
+  return {
+    result: 'PASS',
+    evidence: `platform=${label}; arch=${arch}; release=${release}`,
+    remedy: null,
+    skipReason: null,
+  };
+});
+
+// --- Node.js version ---
+registerCheck('node-version', 'Node.js >= 22', 'REQUIRED', 'platform', async () => {
+  const version = process.version; // e.g. 'v24.18.0'
+  const parts = version.replace(/^v/, '').split('.');
+  const major = parseInt(parts[0], 10);
+  const minor = parseInt(parts[1], 10);
+  const patch = parseInt(parts[2], 10);
+
+  // Record in host profile accumulator (US-002) — always record,
+  // even on failure, so the profile accurately describes the host
+  hostProfile.nodeRuntimes.push({
+    version: process.version,
+    major,
+    minor,
+    patch,
+    sqliteAvailable: null, // filled in by node-sqlite check below
+  });
+
+  if (major >= 22) {
+    return {
+      result: 'PASS',
+      evidence: `Node.js ${version} (>= 22 required)`,
+      remedy: null,
+      skipReason: null,
+    };
+  }
+  return {
+    result: 'FAIL',
+    evidence: `Node.js ${version} (< 22 required)`,
+    remedy: 'Install Node.js >= 22 (https://nodejs.org/)',
+    skipReason: null,
+  };
+});
+
+// --- node:sqlite loading ---
+registerCheck('node-sqlite', 'node:sqlite loads without error', 'REQUIRED', 'platform', async () => {
+  let sqliteAvailable = false;
+  try {
+    // Dynamic import to verify the built-in module exists and loads
+    await import('node:sqlite');
+    sqliteAvailable = true;
+  } catch (_) {
+    sqliteAvailable = false;
+  }
+
+  // Update the node runtime entry in the accumulator (US-002)
+  if (hostProfile.nodeRuntimes.length > 0) {
+    hostProfile.nodeRuntimes[hostProfile.nodeRuntimes.length - 1].sqliteAvailable = sqliteAvailable;
+  }
+
+  if (sqliteAvailable) {
+    return {
+      result: 'PASS',
+      evidence: 'node:sqlite loaded successfully',
+      remedy: null,
+      skipReason: null,
+    };
+  }
+  return {
+    result: 'FAIL',
+    evidence: 'node:sqlite failed to load (requires Node.js >= 22.5.0)',
+    remedy: 'Upgrade to Node.js >= 22.5 (node:sqlite added in v22.5.0)',
+    skipReason: null,
+  };
+});
+
+// --- npm presence ---
+registerCheck('npm', 'npm is present', 'REQUIRED', 'platform', async () => {
+  try {
+    const result = spawnSync('npm', ['--version'], { encoding: 'utf-8', timeout: 10000 });
+    if (result.status === 0 && result.stdout.trim()) {
+      const npmVer = result.stdout.trim();
+      // Record in host profile accumulator (US-002)
+      recordHostProfile('npmVersion', null, npmVer);
+      return {
+        result: 'PASS',
+        evidence: `npm ${npmVer}`,
+        remedy: null,
+        skipReason: null,
+      };
+    }
+    return {
+      result: 'FAIL',
+      evidence: `npm --version exited ${result.status}: ${result.stderr?.trim() || ''}`,
+      remedy: 'Install npm (bundled with Node.js >= 22)',
+      skipReason: null,
+    };
+  } catch (e) {
+    return {
+      result: 'FAIL',
+      evidence: `npm not found: ${e.message}`,
+      remedy: 'Install npm (bundled with Node.js >= 22)',
+      skipReason: null,
+    };
+  }
+});
+
+// ── Future W0.0 checks — registered as SKIPPED stubs ──────────────
+// Per spec 04 W0.0 row: these checks are specified but not yet
+// implemented. They must appear in the table/JSON as SKIPPED rather
+// than being silently omitted (US-012).
+
+registerCheck('repo-clean', 'Repository clean at TT_COMMIT', 'REQUIRED', 'system', async () => ({
+  result: 'SKIPPED',
+  evidence: 'Not yet implemented — requires TT_COMMIT context',
+  remedy: null,
+  skipReason: 'not yet implemented',
+}));
+
+registerCheck('dist-staleness', 'Distribution freshness (doctor staleness check)', 'REQUIRED', 'system', async () => ({
+  result: 'SKIPPED',
+  evidence: 'Not yet implemented — requires tamandua doctor integration',
+  remedy: null,
+  skipReason: 'not yet implemented',
+}));
+
+registerCheck('production-quiesced', 'Production runs quiesced + daemon posture decided', 'REQUIRED', 'containment', async () => ({
+  result: 'SKIPPED',
+  evidence: 'Not yet implemented — requires tamandua daemon inspection',
+  remedy: null,
+  skipReason: 'not yet implemented',
+}));
+
+registerCheck('login-shell-path', 'Harness binaries resolvable via login-shell PATH', 'REQUIRED', 'harness', async () => ({
+  result: 'SKIPPED',
+  evidence: 'Not yet implemented — requires zsh -lic / bash -lc probing',
+  remedy: null,
+  skipReason: 'not yet implemented',
+}));
+
+// ── Toolchain build+test probes (US-007) ─────────────────────────────
+// Per spec 04: hello-world build+test executed for each toolchain, NOT just --version.
+// Temp probe dirs under torture-test/var/w0/toolchain-probes/ cleaned/recreated deterministically.
+
+/**
+ * Check if a binary is available on PATH by running it with --version.
+ * Returns the first line of output on success, null if not found.
+ */
+/**
+ * Check if a binary is on PATH at all (via `which`, no execution).
+ * Returns true even if the binary is broken (e.g. wrong arch).
+ */
+function binaryOnPath(name) {
+  try {
+    const result = spawnSync('which', [name], { encoding: 'utf-8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'] });
+    return result.status === 0 && result.stdout?.trim();
+  } catch (_) {
+    return false;
+  }
+}
+
+/**
+ * Check if a binary is available on PATH by running it with --version.
+ * Returns the first line of output on success, null if not found or broken.
+ */
+function binaryPresent(name, versionArg) {
+  try {
+    const result = spawnSync(name, [versionArg || '--version'], {
+      encoding: 'utf-8', timeout: 15000, stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    if (result.status === 0 && result.stdout?.trim()) {
+      return result.stdout.trim().split('\n')[0];
+    }
+    return null;
+  } catch (_) {
+    return null;
+  }
+}
+
+/** Get the deterministic probe directory path for a toolchain. */
+function probeDir(name) {
+  return path.join(W0_DIR, 'toolchain-probes', name);
+}
+
+// --- java+maven ---
+registerCheck('toolchain-java-maven', 'java+maven toolchain build+test probe', 'REQUIRED', 'toolchains', async () => {
+  if (OPT.fast) {
+    const ver = binaryPresent('mvn');
+    recordHostProfile('toolchains', 'java+maven', { present: !!ver, buildPassed: null, testPassed: null, evidence: ver ? `present (--fast, --version only): ${ver}` : 'not found (--fast)' });
+    return { result: 'SKIPPED', evidence: 'Toolchain build probe skipped (--fast)', remedy: null, skipReason: '--fast' };
+  }
+
+  const ver = binaryPresent('mvn');
+  if (!ver) {
+    recordHostProfile('toolchains', 'java+maven', { present: false, buildPassed: false, testPassed: false, evidence: 'mvn not found' });
+    return { result: 'FAIL', evidence: 'mvn not found on PATH', remedy: 'Install maven + JDK >= 21 (https://maven.apache.org/)', skipReason: null };
+  }
+
+  const dir = probeDir('java-maven');
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) { /* ok */ }
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.mkdirSync(path.join(dir, 'src', 'main', 'java', 'tt'), { recursive: true });
+
+    fs.writeFileSync(path.join(dir, 'pom.xml'), `<?xml version="1.0" encoding="UTF-8"?>
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>tt</groupId>
+  <artifactId>hello</artifactId>
+  <version>1.0</version>
+  <properties>
+    <maven.compiler.source>21</maven.compiler.source>
+    <maven.compiler.target>21</maven.compiler.target>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+  </properties>
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>exec-maven-plugin</artifactId>
+        <version>3.6.3</version>
+      </plugin>
+    </plugins>
+  </build>
+</project>
+`);
+
+    fs.writeFileSync(path.join(dir, 'src', 'main', 'java', 'tt', 'Hello.java'), `package tt;
+public class Hello {
+    public static String greet() { return "hello"; }
+    public static void main(String[] args) {
+        if (!"hello".equals(greet())) { System.out.println("FAIL"); System.exit(1); }
+        System.out.println("OK");
+    }
+}
+`);
+
+    const build = spawnSync('mvn', ['-q', 'compile'], { cwd: dir, encoding: 'utf-8', timeout: 120000, stdio: ['ignore', 'pipe', 'pipe'] });
+    if (build.status !== 0) {
+      const err = build.stderr?.trim() || build.stdout?.trim() || `exit ${build.status}`;
+      recordHostProfile('toolchains', 'java+maven', { present: true, buildPassed: false, testPassed: false, evidence: err.substring(0, 200) });
+      return { result: 'FAIL', evidence: `maven build failed: ${err.substring(0, 150)}`, remedy: 'Check maven and JDK installation', skipReason: null };
+    }
+
+    const testRun = spawnSync('mvn', ['-q', 'exec:java', '-Dexec.mainClass=tt.Hello'], { cwd: dir, encoding: 'utf-8', timeout: 30000, stdio: ['ignore', 'pipe', 'pipe'] });
+    if (testRun.status !== 0 || !testRun.stdout?.includes('OK')) {
+      const err = testRun.stderr?.trim() || testRun.stdout?.trim() || `exit ${testRun.status}`;
+      recordHostProfile('toolchains', 'java+maven', { present: true, buildPassed: true, testPassed: false, evidence: err.substring(0, 200) });
+      return { result: 'FAIL', evidence: `maven run failed: ${err.substring(0, 150)}`, remedy: 'Check maven and JDK installation', skipReason: null };
+    }
+
+    recordHostProfile('toolchains', 'java+maven', { present: true, buildPassed: true, testPassed: true, evidence: `${ver}` });
+    return { result: 'PASS', evidence: `maven build+test OK: ${ver}`, remedy: null, skipReason: null };
+  } catch (e) {
+    recordHostProfile('toolchains', 'java+maven', { present: true, buildPassed: false, testPassed: false, evidence: e.message });
+    return { result: 'FAIL', evidence: `maven probe error: ${e.message}`.substring(0, 150), remedy: 'Check maven and JDK installation', skipReason: null };
+  } finally {
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) { /* ok */ }
+  }
+});
+
+// --- rust/cargo ---
+registerCheck('toolchain-rust-cargo', 'rust/cargo toolchain build+test probe', 'REQUIRED', 'toolchains', async () => {
+  if (OPT.fast) {
+    const ver = binaryPresent('cargo');
+    recordHostProfile('toolchains', 'rust/cargo', { present: !!ver, buildPassed: null, testPassed: null, evidence: ver ? `present (--fast, --version only): ${ver}` : 'not found (--fast)' });
+    return { result: 'SKIPPED', evidence: 'Toolchain build probe skipped (--fast)', remedy: null, skipReason: '--fast' };
+  }
+
+  const onPath = binaryOnPath('cargo');
+  const ver = binaryPresent('cargo');
+  if (!onPath) {
+    recordHostProfile('toolchains', 'rust/cargo', { present: false, buildPassed: false, testPassed: false, evidence: 'cargo not found' });
+    return { result: 'FAIL', evidence: 'cargo not found on PATH', remedy: 'Install rust via https://rustup.rs/', skipReason: null };
+  }
+  if (!ver) {
+    recordHostProfile('toolchains', 'rust/cargo', { present: true, buildPassed: false, testPassed: false, evidence: 'cargo present but --version failed' });
+    return { result: 'FAIL', evidence: 'cargo present on PATH but not functional (check arch/emulation)', remedy: 'Ensure rust/cargo is installed for the correct architecture (https://rustup.rs/)', skipReason: null };
+  }
+
+  const dir = probeDir('rust-cargo');
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) { /* ok */ }
+  try {
+    const init = spawnSync('cargo', ['init', '--name', 'hello'], { cwd: dir, encoding: 'utf-8', timeout: 30000, stdio: ['ignore', 'pipe', 'pipe'] });
+    if (init.status !== 0) {
+      const err = init.stderr?.trim() || `exit ${init.status}`;
+      recordHostProfile('toolchains', 'rust/cargo', { present: true, buildPassed: false, testPassed: false, evidence: err.substring(0, 200) });
+      return { result: 'FAIL', evidence: `cargo init failed: ${err.substring(0, 150)}`, remedy: 'Check rust/cargo installation', skipReason: null };
+    }
+
+    // Overwrite main.rs with a simple hello-world that asserts
+    fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'src', 'main.rs'), `fn greet() -> &'static str { "hello" }
+fn main() {
+    assert_eq!(greet(), "hello");
+    println!("OK");
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_greet() { assert_eq!(greet(), "hello"); }
+}
+`);
+
+    const build = spawnSync('cargo', ['build', '-q'], { cwd: dir, encoding: 'utf-8', timeout: 120000, stdio: ['ignore', 'pipe', 'pipe'] });
+    if (build.status !== 0) {
+      const err = build.stderr?.trim() || `exit ${build.status}`;
+      recordHostProfile('toolchains', 'rust/cargo', { present: true, buildPassed: false, testPassed: false, evidence: err.substring(0, 200) });
+      return { result: 'FAIL', evidence: `cargo build failed: ${err.substring(0, 150)}`, remedy: 'Check rust/cargo installation', skipReason: null };
+    }
+
+    const testRun = spawnSync('cargo', ['test', '-q'], { cwd: dir, encoding: 'utf-8', timeout: 120000, stdio: ['ignore', 'pipe', 'pipe'] });
+    if (testRun.status !== 0) {
+      const err = testRun.stderr?.trim() || `exit ${testRun.status}`;
+      recordHostProfile('toolchains', 'rust/cargo', { present: true, buildPassed: true, testPassed: false, evidence: err.substring(0, 200) });
+      return { result: 'FAIL', evidence: `cargo test failed: ${err.substring(0, 150)}`, remedy: 'Check rust/cargo installation', skipReason: null };
+    }
+
+    recordHostProfile('toolchains', 'rust/cargo', { present: true, buildPassed: true, testPassed: true, evidence: `${ver}` });
+    return { result: 'PASS', evidence: `cargo build+test OK: ${ver}`, remedy: null, skipReason: null };
+  } catch (e) {
+    recordHostProfile('toolchains', 'rust/cargo', { present: true, buildPassed: false, testPassed: false, evidence: e.message });
+    return { result: 'FAIL', evidence: `cargo probe error: ${e.message}`.substring(0, 150), remedy: 'Check rust/cargo installation', skipReason: null };
+  } finally {
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) { /* ok */ }
+  }
+});
+
+// --- go ---
+registerCheck('toolchain-go', 'go toolchain build+test probe', 'REQUIRED', 'toolchains', async () => {
+  if (OPT.fast) {
+    const ver = binaryPresent('go', 'version');
+    recordHostProfile('toolchains', 'go', { present: !!ver, buildPassed: null, testPassed: null, evidence: ver ? `present (--fast, --version only): ${ver}` : 'not found (--fast)' });
+    return { result: 'SKIPPED', evidence: 'Toolchain build probe skipped (--fast)', remedy: null, skipReason: '--fast' };
+  }
+
+  const ver = binaryPresent('go', 'version');
+  if (!ver) {
+    recordHostProfile('toolchains', 'go', { present: false, buildPassed: false, testPassed: false, evidence: 'go not found' });
+    return { result: 'FAIL', evidence: 'go not found on PATH', remedy: 'Install go >= 1.21 (https://go.dev/dl/)', skipReason: null };
+  }
+
+  const dir = probeDir('go');
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) { /* ok */ }
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+
+    const modInit = spawnSync('go', ['mod', 'init', 'hello'], { cwd: dir, encoding: 'utf-8', timeout: 15000, stdio: ['ignore', 'pipe', 'pipe'] });
+    if (modInit.status !== 0) {
+      const err = modInit.stderr?.trim() || `exit ${modInit.status}`;
+      recordHostProfile('toolchains', 'go', { present: true, buildPassed: false, testPassed: false, evidence: err.substring(0, 200) });
+      return { result: 'FAIL', evidence: `go mod init failed: ${err.substring(0, 150)}`, remedy: 'Check go installation', skipReason: null };
+    }
+
+    fs.writeFileSync(path.join(dir, 'main.go'), `package main
+
+import "fmt"
+
+func Greet() string { return "hello" }
+func main() {
+	if Greet() != "hello" { panic("FAIL") }
+	fmt.Println("OK")
+}
+`);
+    fs.writeFileSync(path.join(dir, 'main_test.go'), `package main
+
+import "testing"
+
+func TestGreet(t *testing.T) {
+	if Greet() != "hello" { t.Fatal("Greet() did not return hello") }
+}
+`);
+
+    const build = spawnSync('go', ['build', '-o', '/dev/null', '.'], { cwd: dir, encoding: 'utf-8', timeout: 60000, stdio: ['ignore', 'pipe', 'pipe'] });
+    if (build.status !== 0) {
+      const err = build.stderr?.trim() || `exit ${build.status}`;
+      recordHostProfile('toolchains', 'go', { present: true, buildPassed: false, testPassed: false, evidence: err.substring(0, 200) });
+      return { result: 'FAIL', evidence: `go build failed: ${err.substring(0, 150)}`, remedy: 'Check go installation', skipReason: null };
+    }
+
+    const testRun = spawnSync('go', ['test', './...'], { cwd: dir, encoding: 'utf-8', timeout: 60000, stdio: ['ignore', 'pipe', 'pipe'] });
+    if (testRun.status !== 0) {
+      const err = testRun.stderr?.trim() || testRun.stdout?.trim() || `exit ${testRun.status}`;
+      recordHostProfile('toolchains', 'go', { present: true, buildPassed: true, testPassed: false, evidence: err.substring(0, 200) });
+      return { result: 'FAIL', evidence: `go test failed: ${err.substring(0, 150)}`, remedy: 'Check go installation', skipReason: null };
+    }
+
+    recordHostProfile('toolchains', 'go', { present: true, buildPassed: true, testPassed: true, evidence: `${ver}` });
+    return { result: 'PASS', evidence: `go build+test OK: ${ver}`, remedy: null, skipReason: null };
+  } catch (e) {
+    recordHostProfile('toolchains', 'go', { present: true, buildPassed: false, testPassed: false, evidence: e.message });
+    return { result: 'FAIL', evidence: `go probe error: ${e.message}`.substring(0, 150), remedy: 'Check go installation', skipReason: null };
+  } finally {
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) { /* ok */ }
+  }
+});
+
+// --- python3 ---
+registerCheck('toolchain-python3', 'python3 toolchain build+test probe', 'REQUIRED', 'toolchains', async () => {
+  if (OPT.fast) {
+    const ver = binaryPresent('python3');
+    recordHostProfile('toolchains', 'python3', { present: !!ver, buildPassed: null, testPassed: null, evidence: ver ? `present (--fast, --version only): ${ver}` : 'not found (--fast)' });
+    return { result: 'SKIPPED', evidence: 'Toolchain build probe skipped (--fast)', remedy: null, skipReason: '--fast' };
+  }
+
+  const ver = binaryPresent('python3');
+  if (!ver) {
+    recordHostProfile('toolchains', 'python3', { present: false, buildPassed: false, testPassed: false, evidence: 'python3 not found' });
+    return { result: 'FAIL', evidence: 'python3 not found on PATH', remedy: 'Install python3 >= 3.9 (https://www.python.org/downloads/)', skipReason: null };
+  }
+
+  const dir = probeDir('python3');
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) { /* ok */ }
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+
+    fs.writeFileSync(path.join(dir, 'test_hello.py'), `import unittest
+
+def greet():
+    return "hello"
+
+class TestHello(unittest.TestCase):
+    def test_greet(self):
+        self.assertEqual(greet(), "hello")
+
+if __name__ == '__main__':
+    unittest.main()
+`);
+
+    // Build probe: python3 -c imports + runs the function
+    const build = spawnSync('python3', ['-c', 'from test_hello import greet; assert greet() == "hello"; print("OK")'], {
+      cwd: dir, encoding: 'utf-8', timeout: 15000, stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    if (build.status !== 0 || !build.stdout?.includes('OK')) {
+      const err = build.stderr?.trim() || build.stdout?.trim() || `exit ${build.status}`;
+      recordHostProfile('toolchains', 'python3', { present: true, buildPassed: false, testPassed: false, evidence: err.substring(0, 200) });
+      return { result: 'FAIL', evidence: `python3 build probe failed: ${err.substring(0, 150)}`, remedy: 'Check python3 installation', skipReason: null };
+    }
+
+    // Test probe: python3 -m unittest
+    const testRun = spawnSync('python3', ['-m', 'unittest', 'test_hello.py'], {
+      cwd: dir, encoding: 'utf-8', timeout: 15000, stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    if (testRun.status !== 0) {
+      const err = testRun.stderr?.trim() || testRun.stdout?.trim() || `exit ${testRun.status}`;
+      recordHostProfile('toolchains', 'python3', { present: true, buildPassed: true, testPassed: false, evidence: err.substring(0, 200) });
+      return { result: 'FAIL', evidence: `python3 test probe failed: ${err.substring(0, 150)}`, remedy: 'Check python3 installation', skipReason: null };
+    }
+
+    recordHostProfile('toolchains', 'python3', { present: true, buildPassed: true, testPassed: true, evidence: `${ver}` });
+    return { result: 'PASS', evidence: `python3 build+test OK: ${ver}`, remedy: null, skipReason: null };
+  } catch (e) {
+    recordHostProfile('toolchains', 'python3', { present: true, buildPassed: false, testPassed: false, evidence: e.message });
+    return { result: 'FAIL', evidence: `python3 probe error: ${e.message}`.substring(0, 150), remedy: 'Check python3 installation', skipReason: null };
+  } finally {
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) { /* ok */ }
+  }
+});
+
+// --- node ---
+registerCheck('toolchain-node', 'node toolchain build+test probe', 'REQUIRED', 'toolchains', async () => {
+  if (OPT.fast) {
+    const ver = binaryPresent('node');
+    recordHostProfile('toolchains', 'node', { present: !!ver, buildPassed: null, testPassed: null, evidence: ver ? `present (--fast, --version only): ${ver}` : 'not found (--fast)' });
+    return { result: 'SKIPPED', evidence: 'Toolchain build probe skipped (--fast)', remedy: null, skipReason: '--fast' };
+  }
+
+  const ver = binaryPresent('node');
+  if (!ver) {
+    recordHostProfile('toolchains', 'node', { present: false, buildPassed: false, testPassed: false, evidence: 'node not found' });
+    return { result: 'FAIL', evidence: 'node not found on PATH', remedy: 'Install node >= 22 (https://nodejs.org/)', skipReason: null };
+  }
+
+  const dir = probeDir('node');
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) { /* ok */ }
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+
+    // Create a simple test file for node --test (built-in test runner, Node 22+)
+    // Use .cjs extension — the root package.json has "type": "module"
+    // which would make .js files fail with require() not available.
+    fs.writeFileSync(path.join(dir, 'hello.test.cjs'), `const assert = require('node:assert');
+const { describe, it } = require('node:test');
+
+function greet() { return 'hello'; }
+
+describe('hello', () => {
+  it('returns hello', () => {
+    assert.strictEqual(greet(), 'hello');
+  });
+});
+`);
+
+    // Build probe: node -e evaluates the function
+    const build = spawnSync('node', ['-e', "const assert = require('node:assert'); function greet(){return'hello';} assert.strictEqual(greet(),'hello'); console.log('OK');"], {
+      encoding: 'utf-8', timeout: 15000, stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    if (build.status !== 0 || !build.stdout?.includes('OK')) {
+      const err = build.stderr?.trim() || build.stdout?.trim() || `exit ${build.status}`;
+      recordHostProfile('toolchains', 'node', { present: true, buildPassed: false, testPassed: false, evidence: err.substring(0, 200) });
+      return { result: 'FAIL', evidence: `node build probe failed: ${err.substring(0, 150)}`, remedy: 'Check node installation', skipReason: null };
+    }
+
+    // Test probe: node --test (built-in test runner)
+    const testRun = spawnSync('node', ['--test', 'hello.test.cjs'], {
+      cwd: dir, encoding: 'utf-8', timeout: 15000, stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    if (testRun.status !== 0) {
+      const err = testRun.stderr?.trim() || testRun.stdout?.trim() || `exit ${testRun.status}`;
+      recordHostProfile('toolchains', 'node', { present: true, buildPassed: true, testPassed: false, evidence: err.substring(0, 200) });
+      return { result: 'FAIL', evidence: `node --test failed: ${err.substring(0, 150)}`, remedy: 'Check node installation', skipReason: null };
+    }
+
+    recordHostProfile('toolchains', 'node', { present: true, buildPassed: true, testPassed: true, evidence: `${ver}` });
+    return { result: 'PASS', evidence: `node build+test OK: ${ver}`, remedy: null, skipReason: null };
+  } catch (e) {
+    recordHostProfile('toolchains', 'node', { present: true, buildPassed: false, testPassed: false, evidence: e.message });
+    return { result: 'FAIL', evidence: `node probe error: ${e.message}`.substring(0, 150), remedy: 'Check node installation', skipReason: null };
+  } finally {
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) { /* ok */ }
+  }
+});
+
+// System utilities — US-003
+function checkUtilOnPath(name, evidenceFlag) {
+  try {
+    const result = spawnSync(name, [evidenceFlag || '--version'], { encoding: 'utf-8', timeout: 10000 });
+    if (result.status === 0 && result.stdout.trim()) {
+      return {
+        result: 'PASS',
+        evidence: result.stdout.trim().split('\n')[0],
+        remedy: null,
+        skipReason: null,
+      };
+    }
+    return {
+      result: 'FAIL',
+      evidence: `${name} ${evidenceFlag || '--version'} exited ${result.status}: ${result.stderr?.trim() || ''}`,
+      remedy: `Install ${name} (required for W0.0 gate)`,
+      skipReason: null,
+    };
+  } catch (e) {
+    return {
+      result: 'FAIL',
+      evidence: `${name} not found on PATH: ${e.message}`,
+      remedy: `Install ${name} (required for W0.0 gate)`,
+      skipReason: null,
+    };
+  }
+}
+
+registerCheck('util-sqlite3', 'sqlite3 is present on PATH', 'REQUIRED', 'utilities', async () => {
+  const cr = checkUtilOnPath('sqlite3', '--version');
+  recordHostProfile('utilities', 'sqlite3', cr.result === 'PASS');
+  return cr;
+});
+
+registerCheck('util-curl', 'curl is present on PATH', 'REQUIRED', 'utilities', async () => {
+  const cr = checkUtilOnPath('curl', '--version');
+  recordHostProfile('utilities', 'curl', cr.result === 'PASS');
+  return cr;
+});
+
+registerCheck('util-jq', 'jq is present on PATH', 'REQUIRED', 'utilities', async () => {
+  const cr = checkUtilOnPath('jq', '--version');
+  recordHostProfile('utilities', 'jq', cr.result === 'PASS');
+  return cr;
+});
+
+// systemd user scope — US-003
+registerCheck('systemd-user-scope', 'systemd user scope available', 'REQUIRED', 'containment', async () => {
+  const platform = os.platform();
+  // systemd is a Linux-only facility; darwin uses launchd
+  if (platform !== 'linux') {
+    recordHostProfile('containment', 'systemdUserScope', false);
+    return {
+      result: 'SKIPPED',
+      evidence: `systemd not applicable on ${platform}`,
+      remedy: null,
+      skipReason: `platform is ${platform} (systemd is linux-only)`,
+    };
+  }
+
+  // Probe systemd user scope: try systemd-run --user --scope true first
+  // (most reliable cross-distro signal), then fall back to systemctl --user
+  let systemdAvailable = false;
+  let evidence = '';
+
+  try {
+    const runResult = spawnSync('systemd-run', ['--user', '--scope', 'true'], {
+      encoding: 'utf-8',
+      timeout: 10000,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    if (runResult.status === 0) {
+      systemdAvailable = true;
+      evidence = 'systemd-run --user --scope true exited 0';
+    }
+  } catch (_) {
+    // systemd-run not found — try systemctl
+  }
+
+  if (!systemdAvailable) {
+    try {
+      const ctlResult = spawnSync('systemctl', ['--user', 'show'], {
+        encoding: 'utf-8',
+        timeout: 10000,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      if (ctlResult.status === 0 && ctlResult.stdout.trim()) {
+        systemdAvailable = true;
+        evidence = 'systemctl --user show returned data';
+      }
+    } catch (_) {
+      // systemctl not found
+    }
+  }
+
+  recordHostProfile('containment', 'systemdUserScope', systemdAvailable);
+
+  if (systemdAvailable) {
+    return {
+      result: 'PASS',
+      evidence,
+      remedy: null,
+      skipReason: null,
+    };
+  }
+  return {
+    result: 'FAIL',
+    evidence: 'systemd user scope not available (tried systemd-run --user --scope true and systemctl --user show)',
+    remedy: 'Ensure systemd user instance is running (loginctl enable-linger or systemctl --user start)',
+    skipReason: null,
+  };
+});
+
+// Git version — parse semver, assert >= 2.38
+registerCheck('git-version', 'Git >= 2.38', 'REQUIRED', 'system', async () => {
+  try {
+    const result = spawnSync('git', ['--version'], { encoding: 'utf-8', timeout: 10000 });
+    if (result.status !== 0 || !result.stdout.trim()) {
+      return {
+        result: 'FAIL',
+        evidence: `git --version exited ${result.status}: ${result.stderr?.trim() || ''}`,
+        remedy: 'Install git >= 2.38',
+        skipReason: null,
+      };
+    }
+    // Parse: "git version 2.47.0" or "git version 2.38.0.windows.1"
+    const raw = result.stdout.trim();
+    const match = raw.match(/git version (\d+)\.(\d+)\.(\d+)/);
+    if (!match) {
+      return {
+        result: 'FAIL',
+        evidence: `Could not parse git version from: ${raw}`,
+        remedy: 'Install git >= 2.38',
+        skipReason: null,
+      };
+    }
+    const major = parseInt(match[1], 10);
+    const minor = parseInt(match[2], 10);
+    const patch = parseInt(match[3], 10);
+
+    // Record in host profile (US-004)
+    recordHostProfile('git', 'version', `${major}.${minor}.${patch}`);
+
+    if (major > 2 || (major === 2 && minor >= 38)) {
+      return {
+        result: 'PASS',
+        evidence: `git ${major}.${minor}.${patch} (>= 2.38 required)`,
+        remedy: null,
+        skipReason: null,
+      };
+    }
+    return {
+      result: 'FAIL',
+      evidence: `git ${major}.${minor}.${patch} (< 2.38 required)`,
+      remedy: 'Install git >= 2.38 (merge-tree --write-tree added in 2.38)',
+      skipReason: null,
+    };
+  } catch (e) {
+    return {
+      result: 'FAIL',
+      evidence: `git not found: ${e.message}`,
+      remedy: 'Install git >= 2.38',
+      skipReason: null,
+    };
+  }
+});
+
+// git merge-tree --write-tree probe on a scratch repo
+registerCheck('git-merge-tree', 'git merge-tree --write-tree probe', 'REQUIRED', 'system', async () => {
+  const scratchDir = path.join(W0_DIR, 'git-merge-tree-probe');
+
+  // Deterministic re-runs: remove any leftover scratch dir first
+  try { fs.rmSync(scratchDir, { recursive: true, force: true }); } catch (_) { /* ok */ }
+
+  try {
+    fs.mkdirSync(scratchDir, { recursive: true });
+
+    const gitEnv = {
+      ...process.env,
+      GIT_CONFIG_GLOBAL: '/dev/null',
+      GIT_CONFIG_NOSYSTEM: '1',
+    };
+    // Suppress git's stderr (branch-switch messages); only capture merge-tree stdout
+    const gitQuietOpts = { cwd: scratchDir, timeout: 15000, env: gitEnv, stdio: 'ignore' };
+    const gitMergeOpts = { cwd: scratchDir, encoding: 'utf-8', timeout: 15000, env: gitEnv, stdio: ['pipe', 'pipe', 'pipe'] };
+
+    // 1. git init
+    execSync('git init -b main', gitQuietOpts);
+
+    // 2. Create initial commit on main
+    fs.writeFileSync(path.join(scratchDir, 'README.md'), '# main branch\n', 'utf-8');
+    execSync('git -c user.name=tt-probe -c user.email=tt@test add README.md', gitQuietOpts);
+    execSync('git -c user.name=tt-probe -c user.email=tt@test commit -m "initial commit"', gitQuietOpts);
+
+    // 3. Create feature branch with a different file
+    execSync('git checkout -b feature', gitQuietOpts);
+    fs.writeFileSync(path.join(scratchDir, 'feature.txt'), 'feature content\n', 'utf-8');
+    execSync('git -c user.name=tt-probe -c user.email=tt@test add feature.txt', gitQuietOpts);
+    execSync('git -c user.name=tt-probe -c user.email=tt@test commit -m "feature work"', gitQuietOpts);
+
+    // 4. Switch back to main
+    execSync('git checkout main', gitQuietOpts);
+
+    // 5. Run merge-tree --write-tree (only this one needs its stdout)
+    const mergeResult = execSync('git merge-tree --write-tree main feature', gitMergeOpts).trim();
+    if (!mergeResult) {
+      return {
+        result: 'FAIL',
+        evidence: 'git merge-tree --write-tree produced no output',
+        remedy: 'Verify git >= 2.38 is installed and functional',
+        skipReason: null,
+      };
+    }
+
+    // First line is the tree hash (40 hex chars; may be longer with SHA-256 repos)
+    const treeHash = mergeResult.split('\n')[0];
+    if (!/^[0-9a-f]{40,}$/.test(treeHash)) {
+      return {
+        result: 'FAIL',
+        evidence: `merge-tree output first line is not a tree hash: ${treeHash.substring(0, 80)}`,
+        remedy: 'Verify git >= 2.38 is installed and functional',
+        skipReason: null,
+      };
+    }
+
+    // Record in host profile (US-004)
+    recordHostProfile('git', 'mergeTreeAvailable', true);
+
+    return {
+      result: 'PASS',
+      evidence: `merge-tree OK: ${treeHash}`,
+      remedy: null,
+      skipReason: null,
+    };
+  } catch (e) {
+    // If version check passed but merge-tree fails, the version doesn't actually support it
+    return {
+      result: 'FAIL',
+      evidence: `merge-tree probe failed: ${e.message}`,
+      remedy: 'Install git >= 2.38 (merge-tree --write-tree added in 2.38)',
+      skipReason: null,
+    };
+  } finally {
+    // Clean up scratch repo (deterministic, side-effect-free)
+    try { fs.rmSync(scratchDir, { recursive: true, force: true }); } catch (_) { /* ok */ }
+  }
+});
+
+// ── Port probing (shared data source for all port checks) ───────
+
+/**
+ * Probe all listening TCP ports via ss (Linux) or lsof (fallback/darwin).
+ * Returns a Map of port number → { pid: number|null, processName: string|null }
+ * - pid is null if the port is free
+ * - processName is from the tool output (best-effort identification)
+ * This is bind-free, read-only observation.
+ */
+function probePorts() {
+  /** @type {Map<number, { pid: number|null, processName: string|null }>} */
+  const ports = new Map();
+
+  // Try ss first (Linux)
+  try {
+    const result = spawnSync('ss', ['-tlnp'], { encoding: 'utf-8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'] });
+    if (result.status === 0 && result.stdout) {
+      // Parse lines like:
+      // LISTEN  0  128  0.0.0.0:3334  0.0.0.0:*  users:(("node",pid=12345,fd=10))
+      for (const line of result.stdout.split('\n')) {
+        if (!line.startsWith('LISTEN')) continue;
+        // Extract port from the local address column (before the peer address)
+        const portMatch = line.match(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|\*|\[::\]|\[::1\]):(\d+)\s/);
+        if (!portMatch) continue;
+        const port = parseInt(portMatch[2], 10);
+        // Extract PID from process info
+        const pidMatch = line.match(/pid=(\d+)/);
+        const pid = pidMatch ? parseInt(pidMatch[1], 10) : null;
+        // Extract process name
+        const procMatch = line.match(/users:\(\("(\w+)"/);
+        const processName = procMatch ? procMatch[1] : null;
+        ports.set(port, { pid, processName });
+      }
+      if (ports.size > 0) return ports;
+    }
+  } catch (_) { /* ss not available, try lsof */ }
+
+  // Fallback: lsof -i -sTCP:LISTEN (works on linux and darwin)
+  try {
+    const result = spawnSync('lsof', ['-i', '-sTCP:LISTEN', '-nP', '-Fnct'], {
+      encoding: 'utf-8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    if (result.status === 0 && result.stdout) {
+      // lsof -Fnct outputs process blocks:
+      // p<PID>\nc<command>\nn<address>:<port>
+      let currentPid = null;
+      let currentCmd = null;
+      for (const line of result.stdout.split('\n')) {
+        if (line.startsWith('p')) {
+          currentPid = parseInt(line.substring(1), 10);
+        } else if (line.startsWith('c')) {
+          currentCmd = line.substring(1);
+        } else if (line.startsWith('n')) {
+          const portMatch = line.match(/:(\d+)$/);
+          if (portMatch && currentPid) {
+            const port = parseInt(portMatch[1], 10);
+            ports.set(port, { pid: currentPid, processName: currentCmd });
+          }
+        }
+      }
+    }
+  } catch (_) { /* lsof not available */ }
+
+  return ports;
+}
+
+/**
+ * Check if a process (by PID) is owned by the torture-test suite.
+ * TT-owned means the process cmdline or cwd contains the TT_ROOT path.
+ * On Linux, reads from /proc/<pid>/. Returns false if the PID no longer
+ * exists or cannot be inspected.
+ */
+function isProcessTTOwned(pid) {
+  if (pid === null) return false;
+  try {
+    // Check /proc/<pid>/cmdline
+    const cmdlinePath = `/proc/${pid}/cmdline`;
+    if (fs.existsSync(cmdlinePath)) {
+      const cmdline = fs.readFileSync(cmdlinePath, 'utf-8');
+      // cmdline uses null bytes as separators
+      if (cmdline.includes(TT_ROOT)) return true;
+    }
+    // Check /proc/<pid>/cwd (symlink target)
+    try {
+      const cwd = fs.readlinkSync(`/proc/${pid}/cwd`);
+      if (cwd.startsWith(TT_ROOT)) return true;
+    } catch (_) { /* cwd not readable */ }
+    return false;
+  } catch (_) {
+    // PID may have exited, or /proc not available (darwin)
+    return false;
+  }
+}
+
+// Run port probe once — all port checks share this data
+const portProbeResults = probePorts();
+
+// Port checks — implemented in US-005
+const ALL_PORTS = [3334, 3338, 3339, 4334, 4338, 4339, 5334, 5338, 5339];
+
+// Accumulator for hostProfile port status (for US-011 serialization)
+const portStatusRecord = {};
+
+for (const port of ALL_PORTS) {
+  const isProduction = port < 4000;
+  registerCheck(`port-${port}`, `Port ${port} status`, isProduction ? 'OPTIONAL' : 'REQUIRED', 'ports', async () => {
+    const portInfo = portProbeResults.get(port);
+
+    if (!portInfo || portInfo.pid === null) {
+      // Port is free
+      portStatusRecord[port] = 'free';
+      recordHostProfile('ports', String(port), 'free');
+      return {
+        result: 'PASS',
+        evidence: `Port ${port} is free`,
+        remedy: null,
+        skipReason: null,
+      };
+    }
+
+    // Port is in use — determine ownership
+    const ttOwned = isProcessTTOwned(portInfo.pid);
+    const procInfo = `PID ${portInfo.pid}${portInfo.processName ? ` (${portInfo.processName})` : ''}`;
+
+    if (ttOwned) {
+      portStatusRecord[port] = 'in-use-by-TT';
+      recordHostProfile('ports', String(port), 'in-use-by-TT');
+      return {
+        result: 'PASS',
+        evidence: `Port ${port} in use by TT-owned process: ${procInfo}`,
+        remedy: null,
+        skipReason: null,
+      };
+    }
+
+    // Port is in use by a non-TT process
+    portStatusRecord[port] = 'in-use-by-other';
+    recordHostProfile('ports', String(port), 'in-use-by-other');
+
+    if (isProduction) {
+      // Production ports: REPORT only, never fail
+      return {
+        result: 'PASS',
+        evidence: `Port ${port} in use (production port — report only): ${procInfo}`,
+        remedy: null,
+        skipReason: null,
+      };
+    }
+
+    // TT ports: FAIL when occupied by non-TT process
+    return {
+      result: 'FAIL',
+      evidence: `Port ${port} in use by non-TT process: ${procInfo}`,
+      remedy: `Free port ${port} before running torture-test suite (stop the conflicting process or change TT port assignment)`,
+      skipReason: null,
+    };
+  });
+}
+
+// Disk headroom — check available space against tier-2 threshold per spec 02+04
+// Spec 02: fixture budget ≤40GB under $TT_ROOT
+// Spec 04: threshold = fixture budget + 20GB headroom => 60GB for tier-2
+registerCheck('disk-headroom', 'Disk headroom check', 'REQUIRED', 'system', async () => {
+  const TIER2_FIXTURE_BUDGET_BYTES = 40n * 1024n * 1024n * 1024n;   // 40 GB
+  const HEADROOM_MARGIN_BYTES = 20n * 1024n * 1024n * 1024n;        // 20 GB
+  const TIER2_THRESHOLD_BYTES = TIER2_FIXTURE_BUDGET_BYTES + HEADROOM_MARGIN_BYTES; // 60 GB
+
+  /**
+   * Parse df output to get available bytes.
+   * Tries df -B1 (GNU df, bytes) first, falls back to df -k (POSIX, 1K blocks).
+   * Returns null if parsing fails.
+   */
+  function probeDiskAvail(targetPath) {
+    // Try GNU df -B1 first (most Linux systems)
+    try {
+      const result = spawnSync('df', ['-B1', targetPath], {
+        encoding: 'utf-8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      if (result.status === 0 && result.stdout) {
+        const lines = result.stdout.trim().split('\n');
+        if (lines.length > 1) {
+          // Parse header row to find the Available column index
+          const header = lines[0].trim().split(/\s+/);
+          const availIdx = header.indexOf('Available');
+          if (availIdx >= 0) {
+            const fields = lines[1].trim().split(/\s+/);
+            if (fields.length > availIdx) {
+              const val = parseInt(fields[availIdx], 10);
+              if (!isNaN(val)) return val;
+            }
+          }
+          // Fallback: assume columns are Filesystem, 1B-blocks, Used, Available, Use%, Mounted on
+          const fields = lines[1].trim().split(/\s+/);
+          if (fields.length >= 4) {
+            const val = parseInt(fields[3], 10);
+            if (!isNaN(val)) return val;
+          }
+        }
+      }
+    } catch (_) { /* fall through */ }
+
+    // Fallback: POSIX df -k (1K blocks); Available is column 4
+    try {
+      const result = spawnSync('df', ['-k', targetPath], {
+        encoding: 'utf-8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      if (result.status === 0 && result.stdout) {
+        const lines = result.stdout.trim().split('\n');
+        if (lines.length > 1) {
+          const fields = lines[1].trim().split(/\s+/);
+          if (fields.length >= 4) {
+            const val = parseInt(fields[3], 10);
+            if (!isNaN(val)) return val * 1024; // convert 1K blocks to bytes
+          }
+        }
+      }
+    } catch (_) { /* fall through */ }
+
+    return null;
+  }
+
+  try {
+    const availBytes = probeDiskAvail(VAR_DIR);
+    if (availBytes === null) {
+      return {
+        result: 'FAIL',
+        evidence: 'Could not parse available disk space from df output',
+        remedy: 'Ensure df is available and the filesystem is accessible',
+        skipReason: null,
+      };
+    }
+
+    const availGB = (Number(availBytes) / (1024 * 1024 * 1024)).toFixed(1);
+    const thresholdGB = Math.ceil(Number(TIER2_THRESHOLD_BYTES) / (1024 * 1024 * 1024));
+
+    // Record in hostProfile accumulator for US-011 serialization
+    recordHostProfile('diskHeadroom', 'availableBytes', Number(availBytes));
+    recordHostProfile('diskHeadroom', 'available', `${availGB} GB`);
+    recordHostProfile('diskHeadroom', 'thresholdBytes', Number(TIER2_THRESHOLD_BYTES));
+    recordHostProfile('diskHeadroom', 'threshold', `${thresholdGB} GB`);
+
+    if (BigInt(availBytes) >= TIER2_THRESHOLD_BYTES) {
+      return {
+        result: 'PASS',
+        evidence: `${availGB} GB available (threshold: ${thresholdGB} GB)`,
+        remedy: null,
+        skipReason: null,
+      };
+    }
+
+    const deficitGB = ((Number(TIER2_THRESHOLD_BYTES) - availBytes) / (1024 * 1024 * 1024)).toFixed(1);
+    return {
+      result: 'FAIL',
+      evidence: `${availGB} GB available (threshold: ${thresholdGB} GB — ${deficitGB} GB short)`,
+      remedy: `Free at least ${thresholdGB} GB on the filesystem containing ${VAR_DIR} (spec 02 fixture budget 40 GB + 20 GB headroom)`,
+      skipReason: null,
+    };
+  } catch (e) {
+    return {
+      result: 'FAIL',
+      evidence: `df failed: ${e.message}`,
+      remedy: 'Ensure df is available and the filesystem is accessible',
+      skipReason: null,
+    };
+  }
+});
+
+// ── Harness auth probes (US-010) ────────────────────────────────────
+// Per spec W0.0/W0.5: pi AND hermes authenticated via live 1-prompt probes.
+// Only run under explicit --spend; without it show SKIPPED (requires --spend).
+// Probes that run but fail (unauthenticated, zero tokens, missing binary)
+// report FAIL with evidence.
+
+/** Get the hermes state.db path from env or default. */
+function hermesStateDbPath() {
+  const home = process.env.HERMES_HOME || path.join(os.homedir(), '.hermes');
+  return path.join(home, 'state.db');
+}
+
+registerCheck('harness-pi', 'pi harness authenticated (1-prompt probe)', 'REQUIRED', 'harness', async () => {
+  if (!OPT.spend) {
+    recordHostProfile('harness', 'pi', { authenticated: null, skipReason: 'requires --spend' });
+    return {
+      result: 'SKIPPED',
+      evidence: 'Harness auth probe requires --spend flag',
+      remedy: null,
+      skipReason: 'requires --spend',
+    };
+  }
+
+  // Find pi binary
+  const piPath = binaryOnPath('pi');
+  if (!piPath) {
+    recordHostProfile('harness', 'pi', { authenticated: false, error: 'pi binary not found on PATH' });
+    return {
+      result: 'FAIL',
+      evidence: 'pi binary not found on PATH',
+      remedy: 'Install pi (the coding agent CLI) or add it to PATH',
+      skipReason: null,
+    };
+  }
+
+  try {
+    const result = spawnSync('pi', ['--print', '--mode', 'json'], {
+      input: 'Say exactly: OK',
+      encoding: 'utf-8',
+      timeout: 120000,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    if (result.error) {
+      const errMsg = result.error.message || String(result.error);
+      recordHostProfile('harness', 'pi', { authenticated: false, error: errMsg });
+      return {
+        result: 'FAIL',
+        evidence: `pi probe spawn failed: ${errMsg}`,
+        remedy: 'Check pi installation and PATH',
+        skipReason: null,
+      };
+    }
+
+    // Parse JSON stream output for token usage in message_end event
+    const lines = (result.stdout || '').split('\n').filter(Boolean);
+    let usage = null;
+    for (const line of lines) {
+      try {
+        const obj = JSON.parse(line);
+        if (obj.type === 'message_end' && obj.message?.usage) {
+          usage = obj.message.usage;
+          break;
+        }
+      } catch (_) { /* skip non-JSON or partial lines */ }
+    }
+
+    if (!usage) {
+      const stderrSnippet = (result.stderr || '').substring(0, 200);
+      recordHostProfile('harness', 'pi', { authenticated: false, error: 'no message_end with usage found in pi output', stderr: stderrSnippet });
+      return {
+        result: 'FAIL',
+        evidence: `pi probe completed but no token usage found in JSON stream (stderr: ${stderrSnippet || 'none'})`,
+        remedy: 'Check pi authentication and API key configuration',
+        skipReason: null,
+      };
+    }
+
+    // Verify non-zero token attribution
+    const inputTokens = usage.input_tokens || usage.input || 0;
+    const outputTokens = usage.output_tokens || usage.output || 0;
+    const totalTokens = (inputTokens + outputTokens) || usage.totalTokens || 0;
+
+    if (totalTokens > 0) {
+      recordHostProfile('harness', 'pi', {
+        authenticated: true,
+        inputTokens,
+        outputTokens,
+        totalTokens,
+      });
+      return {
+        result: 'PASS',
+        evidence: `pi authenticated: input=${inputTokens}, output=${outputTokens}, total=${totalTokens} tokens`,
+        remedy: null,
+        skipReason: null,
+      };
+    }
+
+    // Zero tokens — harness is present but attributes 0 tokens
+    recordHostProfile('harness', 'pi', { authenticated: false, error: 'zero tokens', inputTokens: 0, outputTokens: 0 });
+    return {
+      result: 'FAIL',
+      evidence: 'pi probe completed but attributed 0 tokens (unauthenticated or dry-run mode)',
+      remedy: 'Check pi authentication: API keys, provider configuration, network access',
+      skipReason: null,
+    };
+  } catch (e) {
+    recordHostProfile('harness', 'pi', { authenticated: false, error: e.message });
+    return {
+      result: 'FAIL',
+      evidence: `pi probe error: ${e.message}`,
+      remedy: 'Check pi installation and configuration',
+      skipReason: null,
+    };
+  }
+});
+
+registerCheck('harness-hermes', 'hermes harness authenticated (1-prompt probe)', 'REQUIRED', 'harness', async () => {
+  if (!OPT.spend) {
+    recordHostProfile('harness', 'hermes', { authenticated: null, skipReason: 'requires --spend' });
+    return {
+      result: 'SKIPPED',
+      evidence: 'Harness auth probe requires --spend flag',
+      remedy: null,
+      skipReason: 'requires --spend',
+    };
+  }
+
+  // Find hermes binary
+  const hermesPath = binaryOnPath('hermes');
+  if (!hermesPath) {
+    recordHostProfile('harness', 'hermes', { authenticated: false, error: 'hermes binary not found on PATH' });
+    return {
+      result: 'FAIL',
+      evidence: 'hermes binary not found on PATH',
+      remedy: 'Install hermes or add it to PATH',
+      skipReason: null,
+    };
+  }
+
+  try {
+    const result = spawnSync('hermes', ['chat', '-q', 'Say exactly: OK', '-Q'], {
+      encoding: 'utf-8',
+      timeout: 120000,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    if (result.error) {
+      const errMsg = result.error.message || String(result.error);
+      recordHostProfile('harness', 'hermes', { authenticated: false, error: errMsg });
+      return {
+        result: 'FAIL',
+        evidence: `hermes probe spawn failed: ${errMsg}`,
+        remedy: 'Check hermes installation and PATH',
+        skipReason: null,
+      };
+    }
+
+    // Extract session_id from output (format: "session_id: <id>")
+    // hermes -Q sends session_id to stderr, response to stdout
+    const combined = (result.stdout || '') + '\n' + (result.stderr || '');
+    const sessionMatch = combined.match(/session_id:\s*(\S+)/);
+    if (!sessionMatch) {
+      const stderrSnippet = (result.stderr || '').substring(0, 200);
+      const stdoutSnippet = (result.stdout || '').substring(0, 200);
+      recordHostProfile('harness', 'hermes', { authenticated: false, error: 'no session_id in hermes output', stderr: stderrSnippet });
+      return {
+        result: 'FAIL',
+        evidence: `hermes probe completed but no session_id found in output (stdout: ${stdoutSnippet || 'none'}, stderr: ${stderrSnippet || 'none'})`,
+        remedy: 'Check hermes authentication and configuration',
+        skipReason: null,
+      };
+    }
+
+    const sessionId = sessionMatch[1];
+
+    // Query state.db for token attribution
+    const stateDbPath = hermesStateDbPath();
+    if (!fs.existsSync(stateDbPath)) {
+      recordHostProfile('harness', 'hermes', { authenticated: false, error: `state.db not found at ${stateDbPath}`, sessionId });
+      return {
+        result: 'FAIL',
+        evidence: `hermes state.db not found at ${stateDbPath} (session ${sessionId})`,
+        remedy: 'Check HERMES_HOME and hermes configuration',
+        skipReason: null,
+      };
+    }
+
+    // Use sqlite3 CLI to query the sessions table for token counts.
+    // sqlite3 CLI does not support ? bind parameters in command-line mode;
+    // embed the session_id directly (alphanumeric, safe from injection).
+    const query = `SELECT input_tokens, output_tokens FROM sessions WHERE id = '${sessionId}'`;
+    const sqlResult = spawnSync('sqlite3', [stateDbPath, query], {
+      encoding: 'utf-8',
+      timeout: 5000,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    if (sqlResult.status !== 0 || !sqlResult.stdout?.trim()) {
+      recordHostProfile('harness', 'hermes', { authenticated: false, error: 'no session row in state.db', sessionId });
+      return {
+        result: 'FAIL',
+        evidence: `hermes session ${sessionId} not found in state.db (or sqlite3 query failed)`,
+        remedy: 'Check hermes state.db integrity and sqlite3 availability',
+        skipReason: null,
+      };
+    }
+
+    const parts = sqlResult.stdout.trim().split('|');
+    const inputTokens = parseInt(parts[0], 10) || 0;
+    const outputTokens = parseInt(parts[1], 10) || 0;
+    const totalTokens = inputTokens + outputTokens;
+
+    if (totalTokens > 0) {
+      recordHostProfile('harness', 'hermes', {
+        authenticated: true,
+        sessionId,
+        inputTokens,
+        outputTokens,
+        totalTokens,
+      });
+      return {
+        result: 'PASS',
+        evidence: `hermes authenticated: session=${sessionId}, input=${inputTokens}, output=${outputTokens}, total=${totalTokens} tokens`,
+        remedy: null,
+        skipReason: null,
+      };
+    }
+
+    // Zero tokens
+    recordHostProfile('harness', 'hermes', { authenticated: false, error: 'zero tokens', sessionId, inputTokens: 0, outputTokens: 0 });
+    return {
+      result: 'FAIL',
+      evidence: `hermes session ${sessionId} attributed 0 tokens (unauthenticated or no model invocation)`,
+      remedy: 'Check hermes authentication: API keys, provider configuration, network access',
+      skipReason: null,
+    };
+  } catch (e) {
+    recordHostProfile('harness', 'hermes', { authenticated: false, error: e.message });
+    return {
+      result: 'FAIL',
+      evidence: `hermes probe error: ${e.message}`,
+      remedy: 'Check hermes installation and configuration',
+      skipReason: null,
+    };
+  }
+});
+
+// ── Test hook: synthetic REQUIRED failure (US-012) ────────────────────
+// Hidden flag --test-required-fail injects a synthetic REQUIRED check
+// that always fails, so self-tests can verify non-zero exit code behavior
+// without depending on the host environment.
+
+if (OPT.testRequiredFail) {
+  registerCheck('test-required-fail', 'Synthetic REQUIRED failure (test hook)', 'REQUIRED', 'system', async () => ({
+    result: 'FAIL',
+    evidence: 'Synthetic failure injected by --test-required-fail flag',
+    remedy: 'This is a test-only failure — remove --test-required-fail for normal operation',
+    skipReason: null,
+  }));
+}
+
+// ── Spawn-speed class (US-011) ──────────────────────────────────────
+// Spawns true 100 times and measures wall clock time.
+// Classifies as fast / normal / slow based on median spawn time.
+// Only runs once; result cached.
+
+let _spawnSpeedClass = null;
+
+function computeSpawnSpeedClass() {
+  if (_spawnSpeedClass !== null) return _spawnSpeedClass;
+
+  const ITERATIONS = 100;
+  const times = [];
+
+  for (let i = 0; i < ITERATIONS; i++) {
+    const start = process.hrtime.bigint();
+    try {
+      spawnSync('true', [], { timeout: 5000, stdio: 'ignore' });
+    } catch (_) { /* ignore individual failures */ }
+    const end = process.hrtime.bigint();
+    times.push(Number(end - start) / 1e6); // ms
+  }
+
+  times.sort((a, b) => a - b);
+  // Use median (p50) to avoid outlier influence from occasional scheduling jitter
+  const median = times[Math.floor(times.length / 2)];
+
+  let cls;
+  if (median <= 5) cls = 'fast';
+  else if (median <= 20) cls = 'normal';
+  else cls = 'slow';
+
+  _spawnSpeedClass = { class: cls, medianMs: Math.round(median * 100) / 100, iterations: ITERATIONS };
+  return _spawnSpeedClass;
+}
+
+// ── Tier derivation (US-011) ──────────────────────────────────────────
+// Per spec 01:
+//   Tier-2: all five language toolchains passing W0.0's build+test probe.
+//   Tier-1: node ≥22 and python3 passing build+test probe.
+//   Below: neither condition met.
+
+function deriveTier(toolchains) {
+  if (!toolchains) return 'unknown';
+
+  const allFive = ['java+maven', 'rust/cargo', 'go', 'python3', 'node'];
+  const allFivePass = allFive.every(name => {
+    const tc = toolchains[name];
+    return tc && tc.buildPassed === true && tc.testPassed === true;
+  });
+  if (allFivePass) return 'tier2';
+
+  const nodePass = toolchains['node'] && toolchains['node'].buildPassed === true && toolchains['node'].testPassed === true;
+  const python3Pass = toolchains['python3'] && toolchains['python3'].buildPassed === true && toolchains['python3'].testPassed === true;
+  if (nodePass && python3Pass) return 'tier1';
+
+  return 'below_tier1';
+}
+
+// ── Profile output (US-011) ───────────────────────────────────────────
+// Emits host-profile.json and environment.json to torture-test/var/w0/.
+
+function writeProfileFiles(results, exitCode) {
+  // Compute spawn-speed class (cached)
+  const spawnSpeed = computeSpawnSpeedClass();
+  recordHostProfile('spawnSpeedClass', 'class', spawnSpeed.class);
+  recordHostProfile('spawnSpeedClass', 'medianMs', spawnSpeed.medianMs);
+  recordHostProfile('spawnSpeedClass', 'iterations', spawnSpeed.iterations);
+
+  // Compute tier
+  const tier = deriveTier(hostProfile.toolchains);
+
+  // ── host-profile.json ───────────────────────────────────
+  // Per spec 01/04: platform, containment, toolchains, node runtimes,
+  // spawn-speed class, disk headroom.
+  const hostProfileOut = {
+    platform: hostProfile.platform,
+    containment: hostProfile.containment,
+    toolchains: hostProfile.toolchains,
+    nodeRuntimes: hostProfile.nodeRuntimes,
+    npmVersion: hostProfile.npmVersion,
+    spawnSpeedClass: hostProfile.spawnSpeedClass,
+    diskHeadroom: hostProfile.diskHeadroom,
+    harness: hostProfile.harness,
+  };
+
+  const hpPath = path.join(W0_DIR, 'host-profile.json');
+  fs.writeFileSync(hpPath, JSON.stringify(hostProfileOut, null, 2), 'utf-8');
+
+  // ── environment.json ────────────────────────────────────
+  // Per spec 04: full table output as structured data, git version,
+  // port status for all 9 ports, sqlite3/curl/jq presence, derived tier,
+  // timestamp UTC ISO-8601.
+  const environmentOut = {
+    checks: results.map(r => ({
+      id: r.id,
+      description: r.description,
+      result: r.result,
+      evidence: r.evidence || '',
+      remedy: r.remedy || null,
+      required: r.severity === 'REQUIRED',
+      skipReason: r.skipReason || null,
+      category: r.category,
+    })),
+    exitCode,
+    tier,
+    platform: os.platform(),
+    git: hostProfile.git,
+    ports: hostProfile.ports,
+    utilities: hostProfile.utilities,
+    timestamp: new Date().toISOString(),
+    flags: {
+      fast: OPT.fast,
+      spend: OPT.spend,
+    },
+  };
+
+  const envPath = path.join(W0_DIR, 'environment.json');
+  fs.writeFileSync(envPath, JSON.stringify(environmentOut, null, 2), 'utf-8');
+
+  return tier;
+}
+
+// ── Output formatting ─────────────────────────────────────────────────
+
+function formatTable(results) {
+  const lines = [];
+  // Column widths
+  const idWidth = Math.max(5, ...results.map(r => r.id.length));
+  const resultWidth = 8; // PASS/FAIL/SKIPPED
+  const evidenceWidth = Math.max(8, ...results.map(r => (r.evidence || '').length), 60);
+
+  // Determine if any FAIL row has a remedy (to decide whether to include REMEDY column)
+  const hasRemedy = results.some(r => r.result === 'FAIL' && r.remedy);
+  const remedyWidth = hasRemedy ? Math.max(6, ...results.filter(r => r.remedy).map(r => r.remedy.length)) : 0;
+
+  // Build columns
+  const cols = ['CHECK'.padEnd(idWidth), 'RESULT'.padEnd(resultWidth), 'EVIDENCE'.padEnd(evidenceWidth)];
+  if (hasRemedy) cols.push('REMEDY');
+  const header = cols.join(' | ');
+  lines.push(header);
+  lines.push('-'.repeat(header.length));
+
+  for (const r of results) {
+    const ev = r.evidence || '';
+    const rem = r.remedy || '';
+    const rowCols = [
+      r.id.padEnd(idWidth),
+      r.result.padEnd(resultWidth),
+      ev,
+    ];
+    if (hasRemedy) {
+      rowCols.push(r.result === 'FAIL' && rem ? rem : '');
+    }
+    lines.push(rowCols.join(' | '));
+  }
+
+  return lines.join('\n');
+}
+
+function formatJson(results, exitCode, tier) {
+  const checksJson = results.map(r => ({
+    id: r.id,
+    description: r.description,
+    result: r.result,
+    evidence: r.evidence || '',
+    remedy: r.remedy || null,
+    required: r.severity === 'REQUIRED',
+    skipReason: r.skipReason || null,
+    category: r.category,
+  }));
+
+  const output = {
+    checks: checksJson,
+    exitCode,
+    tier: tier || 'unknown',
+    platform: os.platform(),
+    timestamp: new Date().toISOString(),
+    flags: {
+      fast: OPT.fast,
+      spend: OPT.spend,
+    },
+    hostProfile,  // raw accumulator (US-002 populates)
+  };
+
+  return JSON.stringify(output, null, 2);
+}
+
+// ── Output helper ──────────────────────────────────────────────────────
+// Writes large strings to a file descriptor in 4096-byte chunks to avoid
+// pipe buffer truncation at the default PIPE_BUF (8KB on Linux).
+
+function writeSyncLarge(fd, data) {
+  const buf = Buffer.from(data, 'utf-8');
+  const CHUNK = 4096;
+  for (let offset = 0; offset < buf.length; offset += CHUNK) {
+    const end = Math.min(offset + CHUNK, buf.length);
+    fs.writeSync(fd, buf, offset, end - offset);
+  }
+}
+
+// ── Main ──────────────────────────────────────────────────────────────
+
+async function main() {
+  const results = [];
+
+  for (const check of checks) {
+    let cr;
+    try {
+      cr = await check.runFn();
+    } catch (e) {
+      cr = {
+        result: 'FAIL',
+        evidence: `Check threw: ${e.message}`,
+        remedy: 'Check implementation error',
+        skipReason: null,
+      };
+    }
+    results.push({
+      id: check.id,
+      description: check.description,
+      ...cr,
+      severity: check.severity,
+      category: check.category,
+    });
+  }
+
+  // Compute exit code: non-zero if any REQUIRED check fails
+  const hasRequiredFailure = results.some(
+    r => r.severity === 'REQUIRED' && r.result === 'FAIL'
+  );
+  const exitCode = hasRequiredFailure ? 1 : 0;
+
+  // Emit host-profile.json and environment.json (US-011)
+  const tier = writeProfileFiles(results, exitCode);
+
+  // Output — write in chunks to avoid pipe buffer truncation (>8KB)
+  if (OPT.json) {
+    writeSyncLarge(process.stdout.fd, formatJson(results, exitCode, tier) + '\n');
+  } else {
+    writeSyncLarge(process.stdout.fd, formatTable(results) + '\n\nTier: ' + tier + '\n');
+    if (hasRequiredFailure) {
+      writeSyncLarge(process.stdout.fd, 'RESULT: Some REQUIRED checks FAILED — environment not ready for campaign.\n');
+    } else {
+      writeSyncLarge(process.stdout.fd, 'RESULT: All REQUIRED checks passed or skipped.\n');
+    }
+  }
+
+  process.exit(exitCode);
+}
+
+main().catch(err => {
+  console.error('FATAL:', err.message);
+  process.exit(1);
+});
