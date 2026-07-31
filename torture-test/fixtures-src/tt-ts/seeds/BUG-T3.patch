@@ -1,0 +1,16 @@
+diff --git a/torture-test/fixtures-src/tt-ts/src/store.ts b/torture-test/fixtures-src/tt-ts/src/store.ts
+index c0167db..b3bed9d 100644
+--- a/torture-test/fixtures-src/tt-ts/src/store.ts
++++ b/torture-test/fixtures-src/tt-ts/src/store.ts
+@@ -30,7 +30,10 @@ export class InMemoryStore {
+ 
+     const existing = this.#expenses[index];
+     const updated: Expense = { ...existing, ...updates };
+-    this.#expenses[index] = updated;
++
++    // BUG-T3: Remove from original position and push to end — corrupts ordering
++    this.#expenses.splice(index, 1);
++    this.#expenses.push(updated);
+     return updated;
+   }
+ 

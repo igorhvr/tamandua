@@ -1,0 +1,46 @@
+diff --git a/torture-test/fixtures-src/tt-ts/src/store.test.ts b/torture-test/fixtures-src/tt-ts/src/store.test.ts
+index 9bb3846..b47b869 100644
+--- a/torture-test/fixtures-src/tt-ts/src/store.test.ts
++++ b/torture-test/fixtures-src/tt-ts/src/store.test.ts
+@@ -162,6 +162,25 @@ describe('InMemoryStore', () => {
+       assert.strictEqual(exp.category, 'Food');
+       assert.strictEqual(exp.date, '2025-01-15');
+     });
++
++    it('preserves expense order in getAll() after update (regression BUG-T3)', () => {
++      const e1 = store.add(makeExpense({ id: '1', description: 'First', amount: 10 }));
++      const e2 = store.add(makeExpense({ id: '2', description: 'Second', amount: 20 }));
++      const e3 = store.add(makeExpense({ id: '3', description: 'Third', amount: 30 }));
++
++      // Update the middle expense — order should stay [e1, e2-updated, e3]
++      store.update('2', { description: 'Second updated', amount: 25 });
++
++      const all = store.getAll();
++      assert.strictEqual(all.length, 3);
++      assert.strictEqual(all[0].id, '1');
++      assert.strictEqual(all[0].description, 'First');
++      assert.strictEqual(all[1].id, '2');
++      assert.strictEqual(all[1].description, 'Second updated');
++      assert.strictEqual(all[1].amount, 25);
++      assert.strictEqual(all[2].id, '3');
++      assert.strictEqual(all[2].description, 'Third');
++    });
+   });
+ 
+   describe('delete', () => {
+diff --git a/torture-test/fixtures-src/tt-ts/src/store.ts b/torture-test/fixtures-src/tt-ts/src/store.ts
+index b3bed9d..c0167db 100644
+--- a/torture-test/fixtures-src/tt-ts/src/store.ts
++++ b/torture-test/fixtures-src/tt-ts/src/store.ts
+@@ -30,10 +30,7 @@ export class InMemoryStore {
+ 
+     const existing = this.#expenses[index];
+     const updated: Expense = { ...existing, ...updates };
+-
+-    // BUG-T3: Remove from original position and push to end — corrupts ordering
+-    this.#expenses.splice(index, 1);
+-    this.#expenses.push(updated);
++    this.#expenses[index] = updated;
+     return updated;
+   }
+ 

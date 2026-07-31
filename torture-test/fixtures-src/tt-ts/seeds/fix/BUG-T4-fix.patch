@@ -1,0 +1,51 @@
+diff --git a/torture-test/fixtures-src/tt-ts/src/store.test.ts b/torture-test/fixtures-src/tt-ts/src/store.test.ts
+index 9bb3846..7fa3f41 100644
+--- a/torture-test/fixtures-src/tt-ts/src/store.test.ts
++++ b/torture-test/fixtures-src/tt-ts/src/store.test.ts
+@@ -79,6 +79,22 @@ describe('InMemoryStore', () => {
+     it('returns empty array for empty store', () => {
+       assert.deepStrictEqual(store.getByCategory('Food'), []);
+     });
++
++    it('completes in under 50ms with 2000 expenses (regression BUG-T4)', () => {
++      const categories: Category[] = ['Food', 'Transport', 'Utilities', 'Entertainment', 'Other'];
++      for (let i = 0; i < 2000; i++) {
++        store.add(makeExpense({
++          id: `perf-${i}`,
++          category: categories[i % categories.length],
++          amount: i + 1,
++        }));
++      }
++      const start = performance.now();
++      const result = store.getByCategory('Food');
++      const elapsed = performance.now() - start;
++      assert.strictEqual(result.length, 400);
++      assert.ok(elapsed < 50, `getByCategory took ${elapsed}ms, expected under 50ms`);
++    });
+   });
+ 
+   describe('getByDateRange', () => {
+diff --git a/torture-test/fixtures-src/tt-ts/src/store.ts b/torture-test/fixtures-src/tt-ts/src/store.ts
+index 0655fb4..c0167db 100644
+--- a/torture-test/fixtures-src/tt-ts/src/store.ts
++++ b/torture-test/fixtures-src/tt-ts/src/store.ts
+@@ -12,18 +12,7 @@ export class InMemoryStore {
+   }
+ 
+   getByCategory(category: Category): Expense[] {
+-    // O(n^2): for each expense, serialize and compare with every other expense
+-    const result: Expense[] = [];
+-    for (const expense of this.#expenses) {
+-      const target = JSON.stringify([expense.id, category]);
+-      for (const other of this.#expenses) {
+-        if (JSON.stringify([other.id, other.category]) === target) {
+-          result.push(expense);
+-          break;
+-        }
+-      }
+-    }
+-    return result;
++    return this.#expenses.filter(e => e.category === category);
+   }
+ 
+   getByDateRange(startDate: string, endDate: string): Expense[] {

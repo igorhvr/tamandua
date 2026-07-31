@@ -1,0 +1,42 @@
+diff --git a/torture-test/fixtures-src/tt-ts/src/store.test.ts b/torture-test/fixtures-src/tt-ts/src/store.test.ts
+index 9bb3846..54acfbf 100644
+--- a/torture-test/fixtures-src/tt-ts/src/store.test.ts
++++ b/torture-test/fixtures-src/tt-ts/src/store.test.ts
+@@ -79,6 +79,18 @@ describe('InMemoryStore', () => {
+     it('returns empty array for empty store', () => {
+       assert.deepStrictEqual(store.getByCategory('Food'), []);
+     });
++
++    it('returns all matching expenses when category has multiple entries (regression BUG-T1)', () => {
++      store.add(makeExpense({ id: 'a', category: 'Food', description: 'A', amount: 5 }));
++      store.add(makeExpense({ id: 'b', category: 'Food', description: 'B', amount: 10 }));
++      store.add(makeExpense({ id: 'c', category: 'Transport', description: 'Bus', amount: 3 }));
++      store.add(makeExpense({ id: 'd', category: 'Food', description: 'C', amount: 15 }));
++
++      const food = store.getByCategory('Food');
++      assert.strictEqual(food.length, 3);
++      const ids = food.map(e => e.id).sort();
++      assert.deepStrictEqual(ids, ['a', 'b', 'd']);
++    });
+   });
+ 
+   describe('getByDateRange', () => {
+diff --git a/torture-test/fixtures-src/tt-ts/src/store.ts b/torture-test/fixtures-src/tt-ts/src/store.ts
+index 58418ec..c0167db 100644
+--- a/torture-test/fixtures-src/tt-ts/src/store.ts
++++ b/torture-test/fixtures-src/tt-ts/src/store.ts
+@@ -12,13 +12,7 @@ export class InMemoryStore {
+   }
+ 
+   getByCategory(category: Category): Expense[] {
+-    const result: Expense[] = [];
+-    for (let i = 0; i < this.#expenses.length - 1; i++) {
+-      if (this.#expenses[i].category === category) {
+-        result.push(this.#expenses[i]);
+-      }
+-    }
+-    return result;
++    return this.#expenses.filter(e => e.category === category);
+   }
+ 
+   getByDateRange(startDate: string, endDate: string): Expense[] {

@@ -1,0 +1,79 @@
+diff --git a/torture-test/fixtures-src/tt-ts/src/server.ts b/torture-test/fixtures-src/tt-ts/src/server.ts
+index d8c6682..d4f2523 100644
+--- a/torture-test/fixtures-src/tt-ts/src/server.ts
++++ b/torture-test/fixtures-src/tt-ts/src/server.ts
+@@ -103,7 +103,7 @@ export function startServer(port: number) {
+         return;
+       }
+ 
+-      const { description, amount, category } = body as Record<string, unknown>;
++      const { description, amount, category, date: dateParam } = body as Record<string, unknown>;
+ 
+       if (typeof description !== 'string' || description.trim().length === 0) {
+         sendError(res, 400, 'Missing required field: description');
+@@ -120,12 +120,26 @@ export function startServer(port: number) {
+         return;
+       }
+ 
++      // BUG-T2: Parses user-provided date as local time via new Date(dateStr),
++      // producing full ISO with timezone offset — causes boundary issues in string-based filtering
++      let date: string;
++      if (typeof dateParam === 'string' && dateParam.trim().length > 0) {
++        const parsed = new Date(dateParam.trim());
++        if (isNaN(parsed.getTime())) {
++          sendError(res, 400, 'Invalid date format');
++          return;
++        }
++        date = parsed.toISOString();
++      } else {
++        date = new Date().toISOString().split('T')[0];
++      }
++
+       const expense: Expense = {
+         id: randomUUID(),
+         description: description.trim(),
+         amount,
+         category,
+-        date: new Date().toISOString().split('T')[0],
++        date,
+       };
+ 
+       store.add(expense);
+@@ -133,11 +147,19 @@ export function startServer(port: number) {
+       return;
+     }
+ 
+-    // GET /api/expenses — list all, optional ?category=
++    // GET /api/expenses — list all, optional ?category= and ?startDate=/ ?endDate=
+     if (req.method === 'GET' && pathname === '/api/expenses') {
+       const categoryParam = url.searchParams.get('category');
++      const startDate = url.searchParams.get('startDate');
++      const endDate = url.searchParams.get('endDate');
++
+       let expenses: Expense[];
+-      if (categoryParam && isCategory(categoryParam)) {
++      if (startDate && endDate) {
++        expenses = store.getByDateRange(startDate, endDate);
++        if (categoryParam && isCategory(categoryParam)) {
++          expenses = expenses.filter(e => e.category === categoryParam);
++        }
++      } else if (categoryParam && isCategory(categoryParam)) {
+         expenses = store.getByCategory(categoryParam);
+       } else if (categoryParam) {
+         // Invalid category filter — return empty
+diff --git a/torture-test/fixtures-src/tt-ts/src/store.ts b/torture-test/fixtures-src/tt-ts/src/store.ts
+index c0167db..d321be5 100644
+--- a/torture-test/fixtures-src/tt-ts/src/store.ts
++++ b/torture-test/fixtures-src/tt-ts/src/store.ts
+@@ -15,8 +15,10 @@ export class InMemoryStore {
+     return this.#expenses.filter(e => e.category === category);
+   }
+ 
++  // BUG-T2: localeCompare is locale-sensitive and unsuitable for date filtering;
++  // combined with server-side timezone-offset ISO dates, boundary entries are missed
+   getByDateRange(startDate: string, endDate: string): Expense[] {
+-    return this.#expenses.filter(e => e.date >= startDate && e.date <= endDate);
++    return this.#expenses.filter(e => e.date.localeCompare(startDate) >= 0 && e.date.localeCompare(endDate) <= 0);
+   }
+ 
+   add(expense: Expense): Expense {

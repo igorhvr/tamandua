@@ -1,0 +1,181 @@
+diff --git a/torture-test/fixtures-src/tt-ts/src/server.test.ts b/torture-test/fixtures-src/tt-ts/src/server.test.ts
+index 69e616f..a6b96ab 100644
+--- a/torture-test/fixtures-src/tt-ts/src/server.test.ts
++++ b/torture-test/fixtures-src/tt-ts/src/server.test.ts
+@@ -158,6 +158,41 @@ describe('Server API', () => {
+       const { status } = await httpRequest('POST', port, '/api/expenses', 42);
+       assert.strictEqual(status, 400);
+     });
++
++    it('accepts optional date field and normalizes to YYYY-MM-DD (regression BUG-T2)', async () => {
++      const { status, data } = await httpRequest('POST', port, '/api/expenses', {
++        description: 'Dated expense',
++        amount: 100,
++        category: 'Food',
++        date: '2025-06-15',
++      });
++      assert.strictEqual(status, 201);
++      const expense = data as Record<string, unknown>;
++      assert.strictEqual(expense.date, '2025-06-15');
++    });
++
++    it('normalizes full ISO date strings to YYYY-MM-DD (regression BUG-T2)', async () => {
++      const { status, data } = await httpRequest('POST', port, '/api/expenses', {
++        description: 'ISO date',
++        amount: 75,
++        category: 'Transport',
++        date: '2025-07-01T12:00:00-03:00',
++      });
++      assert.strictEqual(status, 201);
++      const expense = data as Record<string, unknown>;
++      assert.strictEqual(expense.date, '2025-07-01');
++    });
++
++    it('returns 400 for invalid date format', async () => {
++      const { status, data } = await httpRequest('POST', port, '/api/expenses', {
++        description: 'Bad date',
++        amount: 10,
++        category: 'Food',
++        date: 'not-a-date',
++      });
++      assert.strictEqual(status, 400);
++      assert.strictEqual((data as Record<string, unknown>).error, 'Invalid date format');
++    });
+   });
+ 
+   describe('GET /api/expenses', () => {
+@@ -218,6 +253,66 @@ describe('Server API', () => {
+       assert.strictEqual(status, 200);
+       assert.deepStrictEqual(data, []);
+     });
++
++    it('filters by date range with startDate and endDate query params (regression BUG-T2)', async () => {
++      await httpRequest('POST', port, '/api/expenses', {
++        description: 'Early expense',
++        amount: 10,
++        category: 'Food',
++        date: '2025-06-10',
++      });
++      await httpRequest('POST', port, '/api/expenses', {
++        description: 'Mid expense',
++        amount: 20,
++        category: 'Food',
++        date: '2025-06-15',
++      });
++      await httpRequest('POST', port, '/api/expenses', {
++        description: 'Late expense',
++        amount: 30,
++        category: 'Food',
++        date: '2025-06-20',
++      });
++
++      const { status, data } = await httpRequest('GET', port, '/api/expenses?startDate=2025-06-14&endDate=2025-06-16');
++      assert.strictEqual(status, 200);
++      const expenses = data as Record<string, unknown>[];
++      const descriptions = expenses.map(e => e.description as string);
++      assert.ok(descriptions.includes('Mid expense'));
++      assert.ok(!descriptions.includes('Early expense'));
++      assert.ok(!descriptions.includes('Late expense'));
++    });
++
++    it('excludes expenses outside date range boundaries (regression BUG-T2)', async () => {
++      const { status, data } = await httpRequest('GET', port, '/api/expenses?startDate=2025-06-15&endDate=2025-06-15');
++      assert.strictEqual(status, 200);
++      const expenses = data as Record<string, unknown>[];
++      const descriptions = expenses.map(e => e.description as string);
++      assert.ok(descriptions.includes('Mid expense'));
++      assert.ok(!descriptions.includes('Early expense'));
++      assert.ok(!descriptions.includes('Late expense'));
++    });
++
++    it('combines category and date range filters (regression BUG-T2)', async () => {
++      await httpRequest('POST', port, '/api/expenses', {
++        description: 'Food mid',
++        amount: 15,
++        category: 'Food',
++        date: '2025-06-15',
++      });
++      await httpRequest('POST', port, '/api/expenses', {
++        description: 'Transport mid',
++        amount: 5,
++        category: 'Transport',
++        date: '2025-06-15',
++      });
++
++      const { status, data } = await httpRequest('GET', port, '/api/expenses?startDate=2025-06-14&endDate=2025-06-16&category=Transport');
++      assert.strictEqual(status, 200);
++      const expenses = data as Record<string, unknown>[];
++      assert.strictEqual(expenses.length, 1);
++      assert.strictEqual(expenses[0].description, 'Transport mid');
++    });
+   });
+ 
+   describe('GET /api/expenses/:id', () => {
+diff --git a/torture-test/fixtures-src/tt-ts/src/server.ts b/torture-test/fixtures-src/tt-ts/src/server.ts
+index d4f2523..7633347 100644
+--- a/torture-test/fixtures-src/tt-ts/src/server.ts
++++ b/torture-test/fixtures-src/tt-ts/src/server.ts
+@@ -120,16 +120,15 @@ export function startServer(port: number) {
+         return;
+       }
+ 
+-      // BUG-T2: Parses user-provided date as local time via new Date(dateStr),
+-      // producing full ISO with timezone offset — causes boundary issues in string-based filtering
+       let date: string;
+       if (typeof dateParam === 'string' && dateParam.trim().length > 0) {
+-        const parsed = new Date(dateParam.trim());
++        const cleanDate = dateParam.trim().split('T')[0];
++        const parsed = new Date(cleanDate + 'T00:00:00Z');
+         if (isNaN(parsed.getTime())) {
+           sendError(res, 400, 'Invalid date format');
+           return;
+         }
+-        date = parsed.toISOString();
++        date = parsed.toISOString().split('T')[0];
+       } else {
+         date = new Date().toISOString().split('T')[0];
+       }
+diff --git a/torture-test/fixtures-src/tt-ts/src/store.test.ts b/torture-test/fixtures-src/tt-ts/src/store.test.ts
+index 9bb3846..81466ec 100644
+--- a/torture-test/fixtures-src/tt-ts/src/store.test.ts
++++ b/torture-test/fixtures-src/tt-ts/src/store.test.ts
+@@ -111,6 +111,18 @@ describe('InMemoryStore', () => {
+     it('returns empty array for empty store', () => {
+       assert.deepStrictEqual(store.getByDateRange('2025-01-01', '2025-12-31'), []);
+     });
++
++    it('handles full ISO date strings with timezone offsets (regression BUG-T2)', () => {
++      store.add(makeExpense({ id: '1', date: '2025-06-15T03:00:00.000Z', description: 'UTC-3 morning expense' }));
++      store.add(makeExpense({ id: '2', date: '2025-06-15', description: 'Normal expense' }));
++      store.add(makeExpense({ id: '3', date: '2025-06-15T23:00:00.000Z', description: 'Late evening expense' }));
++      store.add(makeExpense({ id: '4', date: '2025-06-16', description: 'Next day' }));
++
++      const range = store.getByDateRange('2025-06-15', '2025-06-15');
++      assert.strictEqual(range.length, 3);
++      const ids = range.map(e => e.id).sort();
++      assert.deepStrictEqual(ids, ['1', '2', '3']);
++    });
+   });
+ 
+   describe('add', () => {
+diff --git a/torture-test/fixtures-src/tt-ts/src/store.ts b/torture-test/fixtures-src/tt-ts/src/store.ts
+index d321be5..c8b6af1 100644
+--- a/torture-test/fixtures-src/tt-ts/src/store.ts
++++ b/torture-test/fixtures-src/tt-ts/src/store.ts
+@@ -15,10 +15,13 @@ export class InMemoryStore {
+     return this.#expenses.filter(e => e.category === category);
+   }
+ 
+-  // BUG-T2: localeCompare is locale-sensitive and unsuitable for date filtering;
+-  // combined with server-side timezone-offset ISO dates, boundary entries are missed
+   getByDateRange(startDate: string, endDate: string): Expense[] {
+-    return this.#expenses.filter(e => e.date.localeCompare(startDate) >= 0 && e.date.localeCompare(endDate) <= 0);
++    const start = new Date(startDate + 'T00:00:00Z').getTime();
++    const end = new Date(endDate + 'T23:59:59.999Z').getTime();
++    return this.#expenses.filter(e => {
++      const d = new Date(e.date).getTime();
++      return d >= start && d <= end;
++    });
+   }
+ 
+   add(expense: Expense): Expense {
