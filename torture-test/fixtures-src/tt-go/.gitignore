@@ -1,0 +1,14 @@
+# IDE and operating system files
+.idea/
+.vscode/
+.DS_Store
+
+# NOTE: testdata/ and operator-notes.local are deliberately NOT gitignored.
+# testdata/exec-bit-probe.sh is a committed junk probe for exec-bit tree hashing.
+# operator-notes.local is an inert junk probe.
+# See JUNK-IS-INTENTIONAL.md for details.
+
+# NOTE: Go build artifacts are deliberately NOT gitignored —
+# they don't appear in-tree for this fixture (go test produces no
+# cache files in the module root), but if they did, we would want them
+# visible as potential junk probes.
