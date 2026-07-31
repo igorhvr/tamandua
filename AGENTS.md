@@ -180,6 +180,10 @@ followed by a top-level command listing.
 - A corresponding `get<Thing>Help()` function
 - A `--help` dispatch if-block in `main()` (before the command execution path)
 
+## Environment Overrides
+
+- `TAMANDUA_WORKFLOWS_SRC`: Overrides the directory from which bundled workflows are loaded. When set, the installer resolves this directory (relative or absolute) instead of the default `<repo>/workflows/`. Tests that exercise `workflow install --all` or `get-ready` with custom workflow fixtures should point this at a temp directory containing the desired workflow set. Set in `src/installer/paths.ts` `resolveBundledWorkflowsDir()`.
+
 ## State
 
 - SQLite database: `~/.tamandua/tamandua.db`

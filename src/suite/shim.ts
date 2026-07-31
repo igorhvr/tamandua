@@ -7,6 +7,10 @@
  * only skip work that is provably redundant. On any doubt, error, or
  * unexpected condition it degrades to running the real command unchanged.
  *
+ * The one deliberate exception: tracked-dirty refusals (exit 88) are
+ * fail-closed even when the control plane is down. TAMANDUA_TSTX=0 is the
+ * complete bypass for all shim logic (see printHelp).
+ *
  * CLI: tamandua-test --repo <path> --run <runId> --step <stepId> [--force] -- <cmd...>
  */
 
@@ -111,6 +115,10 @@ Uncommitted tracked changes are refused before lookup or execution with exit
 ${TREE_DIRTY_EXIT_CODE}; untracked artifacts do not affect ledger evidence.
 Executions interrupted by SIGHUP, SIGINT, SIGQUIT, or SIGTERM terminate their
 child process, record red evidence, and exit ${INTERRUPTED_EXIT_CODE}.
+
+Exit codes 86, 87, 88 are meaningful only when accompanied by this shim's
+own stderr message. A test command's own 86, 87, or 88 exit code is passed
+through verbatim.
 `);
 }
 
@@ -152,7 +160,7 @@ function getTrackedDirtyPaths(repoDir: string): string[] | null {
   try {
     const result = spawnSync(
       "git",
-      ["status", "--porcelain", "--untracked-files=no"],
+      ["--no-optional-locks", "status", "--porcelain", "--untracked-files=no"],
       {
         cwd: repoDir,
         encoding: "utf-8",
@@ -382,10 +390,14 @@ async function pollForResult(
     const latest = lookup.latest as Record<string, unknown> | null;
     if (latest && typeof latest.exit_code === "number") {
       if (!force && latest.exit_code === 0) {
-        // Green result recorded by the claim owner → replay it.
+        // Green result recorded by the claim owner → replay if fresh enough.
         const createdAt = String(latest.created_at ?? "");
         const ageMs = Date.now() - new Date(createdAt).getTime();
-        return { action: "replay", latest, ageMs };
+        if (!isNaN(ageMs) && ageMs <= TTL_GREEN_MS) {
+          return { action: "replay", latest, ageMs };
+        }
+        // Expired or NaN created_at — continue polling; the owner may be
+        // producing a fresher result or the aged record is no longer valid.
       }
       // Red results are never replayed. Its recorder has released the key,
       // so continue below and claim before executing.
@@ -514,7 +526,34 @@ async function main(): Promise<void> {
     cachedResult: Record<string, unknown>,
     treeHash: string,
     ageMs: number,
-  ): Promise<void> => {
+  ): Promise<boolean> => {
+    // F1: Revalidate the working tree before replaying. Replay corridors
+    // (waiter, re-key loop) bypass the owner-only initial checks, so they
+    // must verify tracked-dirt and tree-hash independently here.
+
+    // 1. Tracked-dirty: refuse to replay when tracked files are modified.
+    const dirtyPaths = getTrackedDirtyPaths(repoReal);
+    if (dirtyPaths === null) {
+      return false; // can't verify — fall through to execute
+    }
+    if (dirtyPaths.length > 0) {
+      process.stderr.write(
+        `FAILURE_CLASS: tree_dirty\n`
+        + `FAILURE: uncommitted changes to tracked files — commit them before testing\n`
+        + `(the merge gate verifies the committed tree: git rev-parse HEAD^{tree}).\n`
+        + `${formatTrackedDirtyList(dirtyPaths, 32)}\n`
+        + `ACTION: commit or discard these, then re-run the suite via the shim.\n`,
+      );
+      process.exit(TREE_DIRTY_EXIT_CODE);
+    }
+
+    // 2. Tree-hash match: if HEAD moved, the cached result describes a
+    //    different tree — fall through to execute against the current tree.
+    const currentTreeHash = committedTreeHash(repoReal);
+    if (currentTreeHash === null || currentTreeHash !== treeHash) {
+      return false;
+    }
+
     await emitSuiteEvent({
       event: "suite.cache_hit",
       run_id: runId,
@@ -528,6 +567,8 @@ async function main(): Promise<void> {
       // Best-effort — event emission failure must not block replay.
     });
     replay(cachedResult, cmdString.slice(0, 200) || cmdString, ageMs);
+    // unreachable — replay() calls process.exit(0)
+    return true;
   };
 
   // R14: Control plane unreachable → passthrough.
@@ -698,6 +739,94 @@ async function main(): Promise<void> {
     passthroughNotice("git tracked tree hash failed before execution");
     passthroughExec(cmdString);
     return;
+  }
+
+  // F3: On ALL execution paths (owner and non-owner), if the HEAD moved
+  // during the wait, re-key to the current committed tree so the recorded
+  // row's tree_hash describes the tree that was actually tested.
+  // On a clean tree trackedTreeHash === committedTreeHash, so
+  // trackedPre !== preTreeHash means HEAD^{tree} changed.
+  if (trackedPre !== preTreeHash) {
+    if (ownsClaim) {
+      await releaseSuiteKey(originRepo, preTreeHash, cmdHash, ownerToken).catch(() => false);
+    }
+    const currentTreeHash = committedTreeHash(repoReal);
+    if (currentTreeHash === null) {
+      passthroughNotice("git committed tree hash failed during re-key");
+      passthroughExec(cmdString);
+      return;
+    }
+    preTreeHash = currentTreeHash;
+
+    // Look up the new key — a fresh green may exist for immediate replay.
+    const rekeyLookup = await lookupSuiteRecord(originRepo, preTreeHash, cmdHash);
+    if (rekeyLookup === null) {
+      passthroughNotice("control plane unreachable during re-key lookup");
+      passthroughExec(cmdString);
+      return;
+    }
+    if (rekeyLookup.flaky) {
+      printFlakyBanner(rekeyLookup.passCount, rekeyLookup.failCount);
+      emitSuiteEvent({
+        event: "suite.flaky_detected",
+        run_id: runId,
+        step_id: stepId,
+        tree_hash: preTreeHash,
+        cmd_hash: cmdHash,
+        pass_count: rekeyLookup.passCount,
+        fail_count: rekeyLookup.failCount,
+        window: "24h",
+      }).catch(() => {
+        // Best-effort — event emission failure must not affect the test flow.
+      });
+    }
+
+    const rekeyLatest = rekeyLookup.latest as Record<string, unknown> | null;
+    if (
+      rekeyLatest
+      && rekeyLatest.exit_code === 0
+      && !force
+      && Date.now() - new Date(String(rekeyLatest.created_at ?? "")).getTime() <= TTL_GREEN_MS
+    ) {
+      await replayCachedResult(
+        rekeyLatest,
+        preTreeHash,
+        Date.now() - new Date(String(rekeyLatest.created_at ?? "")).getTime(),
+      );
+      // unreachable — replayCachedResult calls process.exit(0) on success
+    }
+    if (rekeyLatest && typeof rekeyLatest.exit_code === "number" && rekeyLatest.exit_code !== 0) {
+      const rekeyAgeMs = Date.now() - new Date(String(rekeyLatest.created_at ?? "")).getTime();
+      if (rekeyAgeMs <= RED_CONTEXT_WINDOW_MS) {
+        printRedContextNote(rekeyLatest, cmdString.slice(0, 200) || cmdString, rekeyAgeMs);
+      }
+    }
+
+    // Re-claim for the new key.
+    const rekeyClaim = await claimSuiteKey(originRepo, preTreeHash, cmdHash, claimOwnership);
+    if (rekeyClaim === null) {
+      ownsClaim = false;
+    } else if (rekeyClaim.action === "run") {
+      ownsClaim = true;
+    } else {
+      // Another caller holds the claim — poll for result.
+      emitSuiteEvent({
+        event: "suite.singleflight_wait",
+        run_id: runId,
+        step_id: stepId,
+        tree_hash: preTreeHash,
+        cmd_hash: cmdHash,
+        waited_ms: 0,
+      }).catch(() => {
+        // Best-effort — event emission failure must not block the wait loop.
+      });
+      const rekeyPoll = await pollForResult(originRepo, preTreeHash, cmdHash, claimOwnership, force);
+      if (rekeyPoll.action === "replay" && rekeyPoll.latest) {
+        await replayCachedResult(rekeyPoll.latest, preTreeHash, rekeyPoll.ageMs ?? 0);
+        // unreachable — replayCachedResult calls process.exit(0) on success
+      }
+      ownsClaim = rekeyPoll.ownsClaim === true;
+    }
   }
 
   // R9: Execute the command verbatim, streaming stdout/stderr through,

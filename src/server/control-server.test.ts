@@ -1966,6 +1966,45 @@ describe("suite control-plane endpoints", { concurrency: 1 }, () => {
     assert.equal(r.body.flaky, false);
   });
 
+  it("GET /suite/lookup excludes exit_code=87 from flaky detection (green + 87 = NOT flaky)", async () => {
+    const repo = "/test/exit87-repo";
+    const treeHash = "exit87-hash";
+    const cmdHash = "exit87-cmd";
+
+    // Insert a green pass and an interrupted (87) row.
+    insertSuiteRow({ originRepo: repo, treeHash, cmdHash, cmdDisplay: "npm test", exitCode: 0, durationMs: 1000 });
+    insertSuiteRow({ originRepo: repo, treeHash, cmdHash, cmdDisplay: "npm test", exitCode: 87, durationMs: 500 });
+
+    const r = await suiteRequest(
+      "GET",
+      `/suite/lookup?origin_repo=${encodeURIComponent(repo)}&tree_hash=${treeHash}&cmd_hash=${cmdHash}`,
+    );
+    assert.equal(r.status, 200);
+    // Exit 87 should NOT count toward passCount or failCount.
+    assert.equal(r.body.passCount, 1);
+    assert.equal(r.body.failCount, 0);
+    assert.equal(r.body.flaky, false, "green + 87 should NOT be flaky");
+  });
+
+  it("GET /suite/lookup still detects flaky with green + real red (exit_code != 0, != 87)", async () => {
+    const repo = "/test/real-red-repo";
+    const treeHash = "real-red-hash";
+    const cmdHash = "real-red-cmd";
+
+    // Insert green and a real failure (exit_code=1 — not 87).
+    insertSuiteRow({ originRepo: repo, treeHash, cmdHash, cmdDisplay: "npm test", exitCode: 0, durationMs: 1000 });
+    insertSuiteRow({ originRepo: repo, treeHash, cmdHash, cmdDisplay: "npm test", exitCode: 1, durationMs: 500 });
+
+    const r = await suiteRequest(
+      "GET",
+      `/suite/lookup?origin_repo=${encodeURIComponent(repo)}&tree_hash=${treeHash}&cmd_hash=${cmdHash}`,
+    );
+    assert.equal(r.status, 200);
+    assert.equal(r.body.passCount, 1);
+    assert.equal(r.body.failCount, 1);
+    assert.equal(r.body.flaky, true, "green + real red should still be flaky");
+  });
+
   // ── 2. POST /suite/record ────────────────────────────────────────
 
   it("POST /suite/record returns 401 without auth", async () => {
@@ -2427,6 +2466,37 @@ describe("suite control-plane endpoints", { concurrency: 1 }, () => {
     assert.equal(keys.length, 2, "should return both flaky keys");
     // Verify sorted by total runs descending.
     assert.ok((keys[0].pass_count as number) + (keys[0].fail_count as number) >= (keys[1].pass_count as number) + (keys[1].fail_count as number));
+  });
+
+  it("GET /suite/flaky excludes keys where the only 'fail' is exit_code=87", async () => {
+    const repo = "/test/flaky-exit87";
+    const treeHash = "exit87-flaky-hash";
+    const cmdHash = "exit87-flaky-cmd";
+
+    // Green pass + interrupted (87) — should NOT be flaky.
+    insertSuiteRow({ originRepo: repo, treeHash, cmdHash, cmdDisplay: "npm test", exitCode: 0, durationMs: 1000 });
+    insertSuiteRow({ originRepo: repo, treeHash, cmdHash, cmdDisplay: "npm test", exitCode: 87, durationMs: 500 });
+
+    const r = await suiteRequest("GET", `/suite/flaky?origin_repo=${encodeURIComponent(repo)}`);
+    assert.equal(r.status, 200);
+    const keys = r.body.flaky_keys as Array<Record<string, unknown>>;
+    assert.equal(keys.length, 0, "green + 87 should not appear as flaky");
+  });
+
+  it("GET /suite/flaky still detects flaky with green + real red (exit_code != 0, != 87)", async () => {
+    const repo = "/test/flaky-real-red";
+    const treeHash = "real-red-flaky-hash";
+    const cmdHash = "real-red-flaky-cmd";
+
+    insertSuiteRow({ originRepo: repo, treeHash, cmdHash, cmdDisplay: "npm test", exitCode: 0, durationMs: 1000 });
+    insertSuiteRow({ originRepo: repo, treeHash, cmdHash, cmdDisplay: "npm test", exitCode: 1, durationMs: 500 });
+
+    const r = await suiteRequest("GET", `/suite/flaky?origin_repo=${encodeURIComponent(repo)}`);
+    assert.equal(r.status, 200);
+    const keys = r.body.flaky_keys as Array<Record<string, unknown>>;
+    assert.equal(keys.length, 1, "green + real red should still be flaky");
+    assert.equal(keys[0].pass_count, 1);
+    assert.equal(keys[0].fail_count, 1);
   });
 
   // ── 5. POST /suite/event ────────────────────────────────────────

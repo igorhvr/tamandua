@@ -9,9 +9,11 @@
  * 3. Broken test directory is cleaned up even when the test fails via
  *    try/finally (US-003 AC 3)
  *
- * All tests use isolated temp HOME directories. The broken workflow directory
- * is a deliberately invalid dir (no workflow.yml) created under the source
- * checkout's workflows/ dir and removed in a finally block.
+ * All tests use isolated temp HOME directories. A temp workflows source dir
+ * is created by copying all valid bundled workflows, then adding a deliberately
+ * broken directory (no workflow.yml) there. The CLI is run with
+ * TAMANDUA_WORKFLOWS_SRC pointing at this temp dir. The temp dir is removed
+ * in a finally block.
  */
 
 import { describe, it, before } from "node:test";

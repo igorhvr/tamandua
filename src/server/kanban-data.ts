@@ -20,6 +20,7 @@
  */
 import type { DatabaseSync } from "node:sqlite";
 import type { TamanduaEvent } from "../installer/events.js";
+import { displayStepStatus } from "../lib/step-display.js";
 
 export type VisualStatus = "todo" | "running" | "done" | "failed" | "verifying";
 
@@ -456,8 +457,8 @@ export function buildKanbanSnapshot(
     }
 
     const stepStatus = normaliseStatus(step.status);
-    const parked = step.type === "loop" && step.status === "running" && step.current_story_id === null;
-    const laneStatus = parked ? "verifying" : laneStatusFromStepAndCards(stepStatus, cards);
+    const displayStatus = displayStepStatus({ type: step.type, status: step.status, currentStoryId: step.current_story_id });
+    const laneStatus = displayStatus === "verifying" ? "verifying" : laneStatusFromStepAndCards(stepStatus, cards);
     return {
       agent,
       label,

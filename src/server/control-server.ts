@@ -474,12 +474,12 @@ async function handleSuiteLookup(url: string): Promise<JsonResponse> {
 
     const passCount = (db.prepare(
       `SELECT COUNT(*) as cnt FROM suite_results
-       WHERE origin_repo = ? AND tree_hash = ? AND cmd_hash = ? AND exit_code = 0 AND created_at >= ?`,
+       WHERE origin_repo = ? AND tree_hash = ? AND cmd_hash = ? AND exit_code = 0 AND exit_code != 87 AND created_at >= ?`,
     ).get(originRepo, treeHash, cmdHash, flakeCutoff) as { cnt: number }).cnt;
 
     const failCount = (db.prepare(
       `SELECT COUNT(*) as cnt FROM suite_results
-       WHERE origin_repo = ? AND tree_hash = ? AND cmd_hash = ? AND exit_code != 0 AND created_at >= ?`,
+       WHERE origin_repo = ? AND tree_hash = ? AND cmd_hash = ? AND exit_code != 0 AND exit_code != 87 AND created_at >= ?`,
     ).get(originRepo, treeHash, cmdHash, flakeCutoff) as { cnt: number }).cnt;
 
     return ok({
@@ -659,11 +659,13 @@ async function handleSuiteFlaky(url: string): Promise<JsonResponse> {
     const db = getDb();
     const flakeCutoff = new Date(Date.now() - FLAKE_WINDOW_MS).toISOString();
 
-    // Find keys that have both pass (exit_code=0) and fail (exit_code!=0) within the window.
+    // Find keys that have both pass (exit_code=0) and fail (exit_code!=0 and !=87) within the window.
+    // Exit code 87 (interrupted) rows are excluded from flaky detection — they are honest history,
+    // not real failures, and should not poison the flaky counter.
     const rows = db.prepare(
       `SELECT tree_hash, cmd_hash, cmd_display,
-              SUM(CASE WHEN exit_code = 0 THEN 1 ELSE 0 END) as pass_count,
-              SUM(CASE WHEN exit_code != 0 THEN 1 ELSE 0 END) as fail_count
+              SUM(CASE WHEN exit_code != 87 AND exit_code = 0 THEN 1 ELSE 0 END) as pass_count,
+              SUM(CASE WHEN exit_code != 87 AND exit_code != 0 THEN 1 ELSE 0 END) as fail_count
        FROM suite_results
        WHERE origin_repo = ? AND created_at >= ?
        GROUP BY tree_hash, cmd_hash

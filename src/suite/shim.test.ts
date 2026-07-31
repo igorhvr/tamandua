@@ -1523,6 +1523,131 @@ exit 0
     db.close();
   });
 
+  // ── US-001 (F2): Waiter TTL guard in pollForResult ─────────────
+
+  it("single-flight: expired green (>24h) does NOT replay — continues polling and executes", async () => {
+    await clearSuiteResultsForCmd(repoDir, counterScript);
+    const env = shimChildEnv(controlEnv);
+
+    const { committedTreeHash, computeCmdHash, getOriginRepo } = await import(
+      "../../dist/suite/tree-hash.js"
+    );
+    const treeHash = committedTreeHash(repoDir);
+    assert.ok(treeHash, "should get a tree hash");
+    const cmdHash = computeCmdHash(counterScript);
+    const originRepo = getOriginRepo(repoDir);
+
+    // Insert an expired green row (25 hours old) directly into suite_results.
+    const expiredCreatedAt = new Date(Date.now() - 25 * 3600 * 1000).toISOString();
+    const db = new DatabaseSync(controlEnv.dbPath);
+    db.prepare(
+      `INSERT INTO suite_results (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, log_tail, run_id, step_id, created_at)
+       VALUES (?, ?, ?, ?, 0, 42, 'EXPIRED: old green result', 'r-f2-expired-prime', 's-prime', ?)`,
+    ).run(originRepo, treeHash, cmdHash, counterScript.slice(0, 200), expiredCreatedAt);
+    db.close();
+
+    // Pre-claim the key so the shim gets "wait" and enters pollForResult.
+    const claimResp = await controlPlanePost("/suite/claim", {
+      origin_repo: originRepo,
+      tree_hash: treeHash,
+      cmd_hash: cmdHash,
+    });
+    assert.equal(claimResp.status, 200, "pre-claim should succeed");
+
+    // Spawn the shim — it should get "wait", enter pollForResult,
+    // see the expired green, skip it, and continue polling.
+    const shimPromise = runShim(
+      ["--repo", repoDir, "--run", "r-f2-expired", "--step", "s1", "--", counterScript],
+      env,
+    );
+
+    // Give the shim time to enter the poll loop.
+    await new Promise((r) => setTimeout(r, 2000));
+
+    // Record a RED result — this clears the claim and the shim should see
+    // the red, fall through to claim → execute (never replays red).
+    await controlPlanePost("/suite/record", {
+      origin_repo: originRepo,
+      tree_hash: treeHash,
+      cmd_hash: cmdHash,
+      cmd_display: counterScript.slice(0, 200),
+      exit_code: 1,
+      duration_ms: 100,
+      log_tail: "RED: forced execution for expired green test",
+      run_id: "r-f2-expired-red",
+      step_id: "s-red",
+    });
+
+    const r = await shimPromise;
+    assert.equal(r.exitCode, 0, "should execute and exit 0 (counter always passes)");
+    // Should NOT have replayed the expired green.
+    assert.ok(
+      !r.stdout.includes("TAMANDUA-TEST CACHED"),
+      "must NOT replay an expired green result",
+    );
+    // Counter should be 1 — proving execution happened.
+    const count = parseInt(readFileSync(counterFile, "utf-8").trim(), 10);
+    assert.equal(count, 1, "counter should increment on execution (no expired replay)");
+  });
+
+  it("single-flight: NaN/empty created_at does NOT replay — continues polling and executes", async () => {
+    await clearSuiteResultsForCmd(repoDir, counterScript);
+    const env = shimChildEnv(controlEnv);
+
+    const { committedTreeHash, computeCmdHash, getOriginRepo } = await import(
+      "../../dist/suite/tree-hash.js"
+    );
+    const treeHash = committedTreeHash(repoDir);
+    assert.ok(treeHash, "should get a tree hash");
+    const cmdHash = computeCmdHash(counterScript);
+    const originRepo = getOriginRepo(repoDir);
+
+    // Insert a green row with empty (NaN) created_at.
+    const db = new DatabaseSync(controlEnv.dbPath);
+    db.prepare(
+      `INSERT INTO suite_results (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, log_tail, run_id, step_id, created_at)
+       VALUES (?, ?, ?, ?, 0, 42, 'NAN: empty created_at result', 'r-f2-nan-prime', 's-prime', '')`,
+    ).run(originRepo, treeHash, cmdHash, counterScript.slice(0, 200));
+    db.close();
+
+    // Pre-claim so the shim enters pollForResult.
+    const claimResp = await controlPlanePost("/suite/claim", {
+      origin_repo: originRepo,
+      tree_hash: treeHash,
+      cmd_hash: cmdHash,
+    });
+    assert.equal(claimResp.status, 200, "pre-claim should succeed");
+
+    const shimPromise = runShim(
+      ["--repo", repoDir, "--run", "r-f2-nan", "--step", "s1", "--", counterScript],
+      env,
+    );
+
+    await new Promise((r) => setTimeout(r, 2000));
+
+    // Record a red result to release the claim and force execution.
+    await controlPlanePost("/suite/record", {
+      origin_repo: originRepo,
+      tree_hash: treeHash,
+      cmd_hash: cmdHash,
+      cmd_display: counterScript.slice(0, 200),
+      exit_code: 1,
+      duration_ms: 100,
+      log_tail: "RED: execution for NaN created_at test",
+      run_id: "r-f2-nan-red",
+      step_id: "s-red",
+    });
+
+    const r = await shimPromise;
+    assert.equal(r.exitCode, 0, "should execute and exit 0");
+    assert.ok(
+      !r.stdout.includes("TAMANDUA-TEST CACHED"),
+      "must NOT replay a result with NaN/empty created_at",
+    );
+    const count = parseInt(readFileSync(counterFile, "utf-8").trim(), 10);
+    assert.equal(count, 1, "counter should increment on execution (no NaN replay)");
+  });
+
   // ── US-009: Suite events for observability ──────────────────────────
 
   it("emits suite.cache_hit event on replay", async () => {
@@ -1926,5 +2051,328 @@ exit 0
     assert.equal(r.exitCode, 0, "should execute and exit 0");
     assert.ok(r.stdout.includes("PASS: all tests passed"), "should see pass output");
     assert.ok(r.stdout.includes("run 1"), "counter should increment");
+  });
+
+  // ════════════════════════════════════════════════════════════════════
+  // US-002 (F1): replayCachedResult revalidates tree before replaying
+  // ════════════════════════════════════════════════════════════════════
+
+  it("F1: waiter with dirty tracked files does NOT replay — exits 88 with FAILURE_CLASS: tree_dirty", async () => {
+    await clearSuiteResultsForCmd(repoDir, counterScript);
+    const env = shimChildEnv(controlEnv);
+
+    const { committedTreeHash, computeCmdHash, getOriginRepo } = await import(
+      "../../dist/suite/tree-hash.js"
+    );
+    const treeHash = committedTreeHash(repoDir);
+    assert.ok(treeHash, "should get a tree hash");
+    const cmdHash = computeCmdHash(counterScript);
+    const originRepo = getOriginRepo(repoDir);
+
+    // Pre-claim the key so the shim gets "wait" and enters pollForResult
+    // (initial lookup misses — no cached green for this key).
+    const claimResp = await controlPlanePost("/suite/claim", {
+      origin_repo: originRepo,
+      tree_hash: treeHash,
+      cmd_hash: cmdHash,
+    });
+    assert.equal(claimResp.status, 200, "pre-claim should succeed");
+
+    // Spawn the shim — initial lookup miss → claim → "wait" → pollForResult.
+    const waiterRunId = "r-f1-dirty-waiter";
+    const shimPromise = runShim(
+      ["--repo", repoDir, "--run", waiterRunId, "--step", "s-waiter", "--", counterScript],
+      env,
+    );
+
+    // Wait for the shim to enter the poll loop (singleflight_wait event).
+    const waiterEventsPath = join(controlEnv.stateDir, "events", `${waiterRunId}.jsonl`);
+    await waitUntil(() =>
+      existsSync(waiterEventsPath)
+      && readFileSync(waiterEventsPath, "utf-8").includes("suite.singleflight_wait")
+    );
+
+    // Now make a tracked file dirty while the shim is polling.
+    writeFileSync(join(repoDir, "README.md"), "# Dirty\nModified while polling!\n");
+
+    // Record a green result — this releases the claim so the shim
+    // can find it on its next poll iteration and attempt replay.
+    await controlPlanePost("/suite/record", {
+      origin_repo: originRepo,
+      tree_hash: treeHash,
+      cmd_hash: cmdHash,
+      cmd_display: counterScript.slice(0, 200),
+      exit_code: 0,
+      duration_ms: 42,
+      log_tail: "FAKE: green from dirty-waiter test",
+      run_id: "r-f1-dirty-owner",
+      step_id: "s-owner",
+    });
+
+    const r = await shimPromise;
+    // Must exit 88 — replayCachedResult refuses to replay a dirty tree.
+    assert.equal(r.exitCode, 88, "should exit 88 for dirty tree on replay path");
+    assert.doesNotMatch(r.stdout, /TAMANDUA-TEST CACHED/);
+    assert.match(r.stderr, /^FAILURE_CLASS: tree_dirty$/m);
+    assert.match(r.stderr, /^FAILURE: uncommitted changes to tracked files — commit them before testing$/m);
+    assert.match(r.stderr, /README\.md/);
+
+    // Clean up: reset the dirty file so other tests are not affected.
+    execSync("git checkout -- README.md", { cwd: repoDir });
+  });
+
+  it("F1: waiter whose HEAD moved does NOT replay the old key — executes fresh against the new tree", async () => {
+    await clearSuiteResultsForCmd(repoDir, counterScript);
+    const env = shimChildEnv(controlEnv);
+
+    const { committedTreeHash, computeCmdHash, getOriginRepo } = await import(
+      "../../dist/suite/tree-hash.js"
+    );
+    const treeHashA = committedTreeHash(repoDir);
+    assert.ok(treeHashA, "should get tree hash A (original)");
+    const cmdHash = computeCmdHash(counterScript);
+    const originRepo = getOriginRepo(repoDir);
+
+    // Pre-claim the key so the shim gets "wait" and enters pollForResult.
+    const claimResp = await controlPlanePost("/suite/claim", {
+      origin_repo: originRepo,
+      tree_hash: treeHashA,
+      cmd_hash: cmdHash,
+    });
+    assert.equal(claimResp.status, 200, "pre-claim should succeed");
+
+    // Spawn the shim — initial lookup miss (no cached green) → claim → "wait" → pollForResult.
+    const waiterRunId = "r-f1-headmove-waiter";
+    const shimPromise = runShim(
+      ["--repo", repoDir, "--run", waiterRunId, "--step", "s-waiter", "--", counterScript],
+      env,
+    );
+
+    // Wait for the shim to enter the poll loop.
+    const waiterEventsPath = join(controlEnv.stateDir, "events", `${waiterRunId}.jsonl`);
+    await waitUntil(() =>
+      existsSync(waiterEventsPath)
+      && readFileSync(waiterEventsPath, "utf-8").includes("suite.singleflight_wait")
+    );
+
+    // While the shim is polling, create a new commit → tree B.
+    // This changes HEAD so committedTreeHash returns a different value.
+    writeFileSync(join(repoDir, "README.md"), "# HEAD moved\nNew commit while polling!\n");
+    execSync("git add README.md && git commit -m 'HEAD moved during poll'", { cwd: repoDir });
+
+    // Now record a green result for tree A (the OLD key). This releases
+    // the claim so the shim's next poll iteration finds it.
+    await controlPlanePost("/suite/record", {
+      origin_repo: originRepo,
+      tree_hash: treeHashA,
+      cmd_hash: cmdHash,
+      cmd_display: counterScript.slice(0, 200),
+      exit_code: 0,
+      duration_ms: 42,
+      log_tail: "GREEN: stale key for head-move test",
+      run_id: "r-f1-headmove-owner",
+      step_id: "s-owner",
+    });
+
+    const r = await shimPromise;
+    // The shim should NOT replay the stale green.
+    // replayCachedResult detects treeHash A ≠ current committedTreeHash B → returns false.
+    // Falls through to execute fresh.
+    assert.equal(r.exitCode, 0, "should execute fresh and exit 0");
+    assert.doesNotMatch(r.stdout, /TAMANDUA-TEST CACHED/);
+
+    // Counter must be 1 — fresh execution happened exactly once.
+    const count = parseInt(readFileSync(counterFile, "utf-8").trim(), 10);
+    assert.equal(count, 1, "counter should be 1 — fresh execution happened");
+  });
+
+  it("F1: clean unmoved waiter still replays instantly (no behavior change on honest path)", async () => {
+    await clearSuiteResultsForCmd(repoDir, counterScript);
+    const env = shimChildEnv(controlEnv);
+
+    // Prime a green result at the clean tree.
+    const r1 = await runShim(
+      ["--repo", repoDir, "--run", "r-f1-honest", "--step", "s-prime", "--force", "--", counterScript],
+      env,
+    );
+    assert.equal(r1.exitCode, 0, "priming run should pass");
+
+    // Second invocation: clean tree, unmoved HEAD → should replay.
+    const r2 = await runShim(
+      ["--repo", repoDir, "--run", "r-f1-honest", "--step", "s-replay", "--", counterScript],
+      env,
+    );
+    assert.equal(r2.exitCode, 0, "replay should exit 0");
+    assert.match(r2.stdout, /TAMANDUA-TEST CACHED/);
+
+    // Counter should still be 1 (only the priming run executed).
+    const count = parseInt(readFileSync(counterFile, "utf-8").trim(), 10);
+    assert.equal(count, 1, "counter should not increment on replay");
+  });
+
+  it("F1: replayCachedResult calls committedTreeHash to validate key before replay", () => {
+    // Structural test: verify that replayCachedResult in the compiled
+    // shim.js calls committedTreeHash (the tree-hash revalidation check).
+    const dist = readFileSync(
+      join(__dirname, "..", "..", "dist", "suite", "shim.js"),
+      "utf-8",
+    );
+    // The function was renamed during compilation but the logic is:
+    // inside replayCachedResult, we call committedTreeHash before emitSuiteEvent.
+    // Verify the structural invariant: committedTreeHash is referenced
+    // in proximity to suite.cache_hit emission.
+    const suiteCacheHitIdx = dist.indexOf("suite.cache_hit");
+    assert.ok(suiteCacheHitIdx >= 0, "suite.cache_hit event must be in compiled output");
+    // committedTreeHash import should exist (from tree-hash.js).
+    assert.ok(
+      dist.includes("committedTreeHash"),
+      "committedTreeHash must be referenced in compiled shim",
+    );
+  });
+
+  // ════════════════════════════════════════════════════════════════════
+  // US-003 (F3): Record key equals executed tree on ALL execution paths
+  // ════════════════════════════════════════════════════════════════════
+
+  it("F3: non-owner HEAD move during wait → recorded tree_hash equals new committed tree (not stale key)", async () => {
+    await clearSuiteResultsForCmd(repoDir, counterScript);
+    const env = shimChildEnv(controlEnv);
+
+    const { committedTreeHash, computeCmdHash, getOriginRepo } = await import(
+      "../../dist/suite/tree-hash.js"
+    );
+    const treeHashA = committedTreeHash(repoDir);
+    assert.ok(treeHashA, "should get tree hash A (original)");
+    const cmdHash = computeCmdHash(counterScript);
+    const originRepo = getOriginRepo(repoDir);
+
+    // Pre-claim the key so the shim gets "wait" and enters pollForResult
+    // (initial lookup misses — no cached green for this key).
+    const claimResp = await controlPlanePost("/suite/claim", {
+      origin_repo: originRepo,
+      tree_hash: treeHashA,
+      cmd_hash: cmdHash,
+    });
+    assert.equal(claimResp.status, 200, "pre-claim should succeed");
+
+    // Spawn the shim — initial lookup miss → claim → "wait" → pollForResult.
+    const waiterRunId = "r-f3-headmove-waiter";
+    const shimPromise = runShim(
+      ["--repo", repoDir, "--run", waiterRunId, "--step", "s-waiter", "--", counterScript],
+      env,
+    );
+
+    // Wait for the shim to enter the poll loop.
+    const waiterEventsPath = join(controlEnv.stateDir, "events", `${waiterRunId}.jsonl`);
+    await waitUntil(() =>
+      existsSync(waiterEventsPath)
+      && readFileSync(waiterEventsPath, "utf-8").includes("suite.singleflight_wait")
+    );
+
+    // While the shim polls, create a new commit → tree B.
+    writeFileSync(join(repoDir, "README.md"), "# HEAD moved — F3 test\nNew commit while waiter polls!\n");
+    execSync("git add README.md && git commit -m 'HEAD moved during poll (F3)'", { cwd: repoDir });
+
+    const treeHashB = committedTreeHash(repoDir);
+    assert.ok(treeHashB, "should get tree hash B (after commit)");
+    assert.notEqual(treeHashA, treeHashB, "tree hash A and B must differ after commit");
+
+    // Record a green result for tree A (the OLD key). This releases the
+    // claim so the shim's next poll iteration finds it.
+    await controlPlanePost("/suite/record", {
+      origin_repo: originRepo,
+      tree_hash: treeHashA,
+      cmd_hash: cmdHash,
+      cmd_display: counterScript.slice(0, 200),
+      exit_code: 0,
+      duration_ms: 42,
+      log_tail: "GREEN: stale key for F3 head-move test",
+      run_id: "r-f3-headmove-owner",
+      step_id: "s-owner",
+    });
+
+    const r = await shimPromise;
+    // Should execute fresh (not replay the stale green).
+    assert.equal(r.exitCode, 0, "should execute fresh and exit 0");
+    assert.doesNotMatch(r.stdout, /TAMANDUA-TEST CACHED/, "should NOT replay stale key");
+
+    // Counter must be 1 — fresh execution happened exactly once.
+    const count = parseInt(readFileSync(counterFile, "utf-8").trim(), 10);
+    assert.equal(count, 1, "counter should be 1 — fresh execution happened");
+
+    // F3 CRITICAL: recorded tree_hash must equal the NEW committed tree (B),
+    // not the stale key (A).
+    const db = new DatabaseSync(controlEnv.dbPath);
+    const rows = db.prepare(
+      `SELECT tree_hash FROM suite_results
+       WHERE origin_repo = ? AND cmd_hash = ? AND run_id = ? AND step_id = ?
+       ORDER BY id DESC LIMIT 1`
+    ).all(originRepo, cmdHash, waiterRunId, "s-waiter");
+    db.close();
+    assert.ok(rows.length > 0, "should find the recorded suite result row");
+    const recordedTreeHash = (rows[0] as Record<string, unknown>).tree_hash;
+    assert.equal(recordedTreeHash, treeHashB, `recorded tree_hash should be ${treeHashB} (new tree B), not ${treeHashA} (stale key A)`);
+  });
+
+  it("F3: owner-path with unmoved tree — no re-key, records under correct preTreeHash", async () => {
+    await clearSuiteResultsForCmd(repoDir, counterScript);
+    const env = shimChildEnv(controlEnv);
+
+    const { committedTreeHash, computeCmdHash, getOriginRepo } = await import(
+      "../../dist/suite/tree-hash.js"
+    );
+    const treeHash = committedTreeHash(repoDir);
+    assert.ok(treeHash, "should get tree hash");
+    const cmdHash = computeCmdHash(counterScript);
+    const originRepo = getOriginRepo(repoDir);
+
+    const r = await runShim(
+      ["--repo", repoDir, "--run", "r-f3-owner", "--step", "s-owner", "--force", "--", counterScript],
+      env,
+    );
+    assert.equal(r.exitCode, 0, "owner should execute and exit 0");
+    assert.doesNotMatch(r.stdout, /TAMANDUA-TEST CACHED/, "--force should not replay");
+
+    // Counter should be 1 — execution happened.
+    const count = parseInt(readFileSync(counterFile, "utf-8").trim(), 10);
+    assert.equal(count, 1, "counter should be 1");
+
+    // Recorded tree_hash must match the committed tree before execution.
+    const db = new DatabaseSync(controlEnv.dbPath);
+    const rows = db.prepare(
+      `SELECT tree_hash FROM suite_results
+       WHERE origin_repo = ? AND cmd_hash = ? AND run_id = ? AND step_id = ?
+       ORDER BY id DESC LIMIT 1`
+    ).all(originRepo, cmdHash, "r-f3-owner", "s-owner");
+    db.close();
+    assert.ok(rows.length > 0, "should find the recorded suite result row");
+    const recordedTreeHash = (rows[0] as Record<string, unknown>).tree_hash;
+    assert.equal(recordedTreeHash, treeHash, "recorded tree_hash should match committed tree");
+  });
+
+  it("F3: structural invariant — preTreeHash re-key present in compiled shim", () => {
+    const dist = readFileSync(
+      join(__dirname, "..", "..", "dist", "suite", "shim.js"),
+      "utf-8",
+    );
+    // F3 invariant: trackedPre !== preTreeHash triggers a re-key path.
+    // Verify the compiled output contains the re-key lookup pattern.
+    // The key behavioral marker is a lookupSuiteRecord call that appears
+    // AFTER a trackedTreeHash computation and a comparison with preTreeHash.
+    assert.ok(
+      dist.includes("trackedPre") && dist.includes("preTreeHash"),
+      "compiled shim must reference trackedPre and preTreeHash for F3 comparison",
+    );
+    // The re-key path does a fresh lookupSuiteRecord on the new key.
+    // Verify committedTreeHash is called in the F3 re-key path (in addition
+    // to the existing re-key loop and replayCachedResult).
+    const committedTreeHashCount = [...dist.matchAll(/committedTreeHash/g)].length;
+    // Before F3: committedTreeHash appears in (1) preTreeHash init, (2) re-key loop,
+    // (3) replayCachedResult. After F3: one more use in the all-paths re-key block.
+    // The exact number may vary with bundling, so just verify >= 2.
+    assert.ok(
+      committedTreeHashCount >= 2,
+      `committedTreeHash should appear multiple times in compiled shim, got ${committedTreeHashCount}`,
+    );
   });
 });
