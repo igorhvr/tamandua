@@ -592,7 +592,7 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
                 includeCommandOutput: true,
                 output: "STATUS: failed\nREASON: target moved before landing",
                 stepAction: "fail",
-                failReason: "target moved before landing\nFAILURE_CLASS: target_moved",
+                failReason: "FAILURE_CLASS: target_moved\ntarget moved before landing",
               },
               {
                 commands: [secondMergerCommand],
@@ -760,7 +760,7 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
               {
                 output: "STATUS: failed\nREASON: feature conflicts with the target branch",
                 stepAction: "fail",
-                failReason: "feature conflicts with the target branch\nFAILURE_CLASS: conflicts",
+                failReason: "FAILURE_CLASS: conflicts\nfeature conflicts with the target branch",
               },
               {
                 commands: [
@@ -843,10 +843,10 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
     async () => {
       let ctx: ScriptedRunContext | undefined;
       try {
-        const targetMovedReason = "target moved before landing\nFAILURE_CLASS: target_moved";
+        const targetMovedReason = "FAILURE_CLASS: target_moved\ntarget moved before landing";
         const refusalReason = [
-          "Landing refused by repository policy.",
           "FAILURE_CLASS: refused_permanent",
+          "Landing refused by repository policy.",
           "Required approval is absent; automated landing remains prohibited.",
         ].join("\n");
         const targetMovedCommand = [
@@ -949,8 +949,8 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
       let ctx: ScriptedRunContext | undefined;
       try {
         const refusalReason = [
-          "Landing refused while repository policy is being refreshed.",
           "FAILURE_CLASS: refused_permanent",
+          "Landing refused while repository policy is being refreshed.",
           "Revalidation may observe the completed policy update.",
         ].join("\n");
         const resolvedBehaviors: ScriptedAgentConfig = {
