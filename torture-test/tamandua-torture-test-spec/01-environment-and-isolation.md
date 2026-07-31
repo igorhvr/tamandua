@@ -43,6 +43,22 @@ What the spec DOES own is host *adaptation*:
 | slow process spawn (observed on darwin hosts) | serial-lane deadlines; W0.4 records per-suite durations and scales caps |
 | multiple node runtimes coexisting (e.g. nix node 24 + a vendored v22) | W0.1 dual-runtime check, W4.23 runtime-swap scenario |
 
+### Nix-first self-provisioning (target end-state for P0)
+
+The suite's only hard environment prerequisite should be **nix** (plus
+git and a POSIX shell). W0.0 grows a `--provision` mode: instead of
+merely FAILing missing-toolchain checks with a remedy string, it
+installs them via nix from a **pinned declarative manifest**
+(`torture-test/env/nix-prereqs`) — which thereby becomes the single
+authoritative inventory of everything the suite needs. Fresh-environment
+bring-up is then: install nix, clone, `run-torture-test`.
+Ad-hoc installers (rustup, brew, apt) are not used by the suite; a
+toolchain already present outside nix is accepted if its probe passes,
+but the remedy for any gap is always the nix manifest. (Motivating
+incident: the first W0.0 execution found an x86_64 rustup cargo on an
+arm64 host — dead weight nix replaced in one command.) Sequenced after
+the core implementation phases; tracked in bd.
+
 ## The torture environment (TT env)
 
 Never run the suite against the live install. Layout:
