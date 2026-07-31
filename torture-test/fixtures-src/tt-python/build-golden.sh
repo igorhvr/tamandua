@@ -30,7 +30,7 @@ VAR_DIR="$REPO_ROOT/torture-test/var"
 FIXTURE_SRC="$SCRIPT_DIR"
 GOLDEN_DIR="$VAR_DIR/fixtures/golden"
 GOLDEN_BARE="$GOLDEN_DIR/tt-python.git"
-HASH_FILE="$GOLDEN_DIR/.build-hashes"
+HASH_FILE="$GOLDEN_DIR/tt-python.git.hashes"
 
 # ── Create output directories ──────────────────────────────────────
 mkdir -p "$GOLDEN_DIR"
