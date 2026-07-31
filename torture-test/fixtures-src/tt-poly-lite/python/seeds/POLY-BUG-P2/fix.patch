@@ -1,0 +1,38 @@
+--- a/src/schedlib/recurrence.py
++++ b/src/schedlib/recurrence.py
+@@ -73,13 +73,6 @@
+         gen_count = 0
+         max_count_val: int = self.count if self.count is not None else -1
+ 
+-        # BUG-P1: off-by-one error — when both count and until are set,
+-        # the effective count is reduced by one. This causes recurrence
+-        # rules like weekly(count=52, until=<end-of-year>) to produce
+-        # 51 occurrences instead of 52 for a full year.
+-        if max_count_val > 0 and self.until is not None:
+-            max_count_val -= 1
+-
+         # Find the first matching date >= dtstart
+         current = dtstart
+         while current <= dtend:
+@@ -113,7 +106,7 @@
+         elif self.frequency == RecurrenceFrequency.MONTHLY:
+             return _add_months(d, self.interval)
+         elif self.frequency == RecurrenceFrequency.YEARLY:
+-            return _add_years(d, 1)  # POLY-BUG-P2: yearly recurrence ignores interval
++            return _add_years(d, self.interval)
+         return d + timedelta(days=1)
+ 
+     def _uses_fine_grained(self) -> bool:
+--- a/src/schedlib/conflict.py
++++ b/src/schedlib/conflict.py
+@@ -81,8 +81,8 @@
+     overlap_dur = end - start
+ 
+     # Contained: one event fully inside the other
+-    if (a.start < b.start and a.end > b.end) or (  # POLY-BUG-P2: CONTAINED strict comparison
+-        b.start < a.start and b.end > a.end  # POLY-BUG-P2: also strict comparison
++    if (a.start <= b.start and a.end >= b.end) or (
++        b.start <= a.start and b.end >= a.end
+     ):
+         return ConflictSeverity.CONTAINED
+ 

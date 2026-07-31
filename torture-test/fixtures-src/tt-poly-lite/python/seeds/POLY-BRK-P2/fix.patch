@@ -1,0 +1,23 @@
+--- a/tests/test_broken_p2.py
++++ b/tests/test_broken_p2.py
+@@ -44,12 +44,12 @@
+         conflicts = find_conflicts(events)
+
+         # 2 conflicts: Standup↔Review, Review↔Planning. Lunch has none.
+-        assert len(conflicts) == 1  # BROKEN: should be 2
++        assert len(conflicts) == 2
+
+     def test_no_conflicts_in_empty_list(self) -> None:
+         """Fails: expected non-zero conflicts for empty list."""
+         conflicts = find_conflicts([])
+-        assert len(conflicts) == 1  # BROKEN: should be 0
++        assert len(conflicts) == 0
+
+     def test_non_overlapping_events_have_no_conflicts(self) -> None:
+         """Fails: expects conflict count for non-overlapping events."""
+@@ -67,4 +67,4 @@
+         ]
+
+         conflicts = find_conflicts(events)
+-        assert len(conflicts) == 1  # BROKEN: should be 0
++        assert len(conflicts) == 0

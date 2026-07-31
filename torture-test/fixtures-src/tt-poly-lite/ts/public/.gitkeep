@@ -1,0 +1,3 @@
+# This file ensures the public/ directory is always tracked by git,
+# even when empty. The server serves static files from this directory,
+# so it must exist at clone time. Do not delete this file.

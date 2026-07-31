@@ -1,0 +1,16 @@
+--- a/tests/test_broken_p1.py
++++ b/tests/test_broken_p1.py
+@@ -20,11 +20,11 @@
+         # Mon 7/27 + 5 business days = Mon 8/3 (skips Sat 8/1, Sun 8/2)
+         # The broken expectation uses 5 calendar days = Fri 7/31
+         result = add_business_days(start, 5)
+-        assert result == date(2026, 7, 31)  # BROKEN
++        assert result == date(2026, 8, 3)
+
+     def test_add_business_days_across_weekend(self) -> None:
+         """Fails: expected date does not skip weekend."""
+         start = date(2026, 7, 30)  # Thursday
+         # add_business_days(thu, 2): Thu 7/30 + 1 = Fri 7/31, + 1 = Mon 8/3
+         result = add_business_days(start, 2)
+-        assert result == date(2026, 8, 1)  # BROKEN
++        assert result == date(2026, 8, 3)

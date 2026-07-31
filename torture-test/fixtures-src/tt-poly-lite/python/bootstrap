@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# bootstrap — create .venv and install pytest for the tt-poly-lite python/ subtree.
+#
+# Spec 02 trap: must handle both python and python3 discovery across
+# platforms (python vs python3 is the deliberate trap — agents that
+# hardcode one will fail on hosts where only the other exists).
+#
+# This script is idempotent: safe to run on an already-bootstrapped tree.
+
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+# --- python discovery (spec 02 trap) ---
+_discover_python() {
+    # Try python3 first (standard on most current distros), then python.
+    for candidate in python3 python; do
+        if command -v "$candidate" >/dev/null 2>&1; then
+            # Must actually run, not just exist (macOS /usr/bin/python3 stub trap)
+            if "$candidate" -c 'import sys; sys.exit(0)' >/dev/null 2>&1; then
+                echo "$candidate"
+                return 0
+            fi
+        fi
+    done
+    echo "ERROR: no working python3 or python found on PATH" >&2
+    exit 1
+}
+
+PYTHON="$(_discover_python)"
+
+echo "bootstrap: using $PYTHON ($("$PYTHON" --version 2>&1))"
+
+# --- create venv if missing ---
+if [ ! -d .venv ]; then
+    "$PYTHON" -m venv .venv
+    echo "bootstrap: created .venv"
+else
+    echo "bootstrap: .venv already exists"
+fi
+
+# --- install pytest and schedlib-poly in editable mode ---
+.venv/bin/python -m pip install --quiet pytest
+.venv/bin/python -m pip install --quiet -e ".[test]"
+echo "bootstrap: pytest and schedlib-poly installed"
+
+# --- verify ---
+.venv/bin/python -m pytest --version
+echo "bootstrap: done — run '.venv/bin/pytest -q' to execute the test suite"

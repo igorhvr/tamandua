@@ -1,0 +1,41 @@
+--- a/src/schedlib/integrations.py
++++ b/src/schedlib/integrations.py
+@@ -48,7 +48,7 @@
+ # POLY-VULN-P2: subprocess.run(..., shell=True) with unsanitized input
+ 
+ 
+-def run_external_calendar_sync(command: str) -> str:
++def run_external_calendar_sync(args: list[str]) -> str:
+     """Execute an external calendar synchronization command.
+
+     Runs a shell command provided by the caller, e.g. to fetch ICS
+@@ -59,15 +59,15 @@
+     import subprocess  # nosec
+
+     result = subprocess.run(
+-        command,
+-        shell=True,  # POLY-VULN-P2: shell=True injection
++        args,
++        # shell=False is the default — no shell injection
+         capture_output=True,
+         text=True,
+     )
+     return result.stdout
+ 
+ 
+-def run_external_calendar_sync_with_timeout(command: str, timeout: int = 30) -> str:
++def run_external_calendar_sync_with_timeout(args: list[str], timeout: int = 30) -> str:
+     """Like ``run_external_calendar_sync`` but with a configurable timeout.
+
+     Dormant — not exercised by the test suite.
+@@ -75,8 +75,8 @@
+     import subprocess  # nosec
+
+     result = subprocess.run(
+-        command,
+-        shell=True,
++        args,
++        # shell=False is the default — no shell injection
+         capture_output=True,
+         text=True,
+         timeout=timeout,

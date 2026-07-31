@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# run-all-tests — execute both python/ and ts/ test suites for tt-poly-lite.
+#
+# Requirements: python3 + node on PATH only (offline, no other toolchains).
+# Target wall time: < 4 minutes for the full suite.
+#
+# The script bootstraps each subtree on first run and exits non-zero if
+# either suite fails.
+
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+OVERALL_EXIT=0
+
+# --- colours (optional) ---
+if [ -t 1 ]; then
+    BOLD='\033[1m'
+    GREEN='\033[0;32m'
+    RED='\033[0;31m'
+    NC='\033[0m'  # no colour
+else
+    BOLD='' GREEN='' RED='' NC=''
+fi
+
+banner() {
+    printf "\n%b%s%b\n" "${BOLD}" "$*" "${NC}"
+}
+
+pass_msg() {
+    printf "  %bPASS%b  %s\n" "${GREEN}" "${NC}" "$*"
+}
+fail_msg() {
+    printf "  %bFAIL%b  %s\n" "${RED}" "${NC}" "$*"
+}
+
+# ── python/ ────────────────────────────────────────────────────────────
+banner "[python/] tt-poly-lite python suite"
+
+if [ ! -d "$ROOT_DIR/python/.venv" ]; then
+    echo "  bootstrapping python subtree..."
+    bash "$ROOT_DIR/python/bootstrap"
+fi
+
+# Run from inside python/ so pytest only discovers this subtree's tests.
+if (cd "$ROOT_DIR/python" && .venv/bin/pytest -q --tb=short); then
+    pass_msg "python suite"
+else
+    fail_msg "python suite"
+    OVERALL_EXIT=1
+fi
+
+# ── ts/ ────────────────────────────────────────────────────────────────
+banner "[ts/] tt-poly-lite typescript suite"
+
+if [ ! -d "$ROOT_DIR/ts/node_modules" ]; then
+    echo "  bootstrapping ts subtree..."
+    (cd "$ROOT_DIR/ts" && npm install --no-audit --no-fund)
+fi
+
+if (cd "$ROOT_DIR/ts" && npm test); then
+    pass_msg "ts suite"
+else
+    fail_msg "ts suite"
+    OVERALL_EXIT=1
+fi
+
+# ── summary ────────────────────────────────────────────────────────────
+echo ""
+if [ "$OVERALL_EXIT" -eq 0 ]; then
+    printf "%bALL SUITES PASSED%b\n" "${GREEN}${BOLD}" "${NC}"
+else
+    printf "%bONE OR MORE SUITES FAILED%b\n" "${RED}${BOLD}" "${NC}"
+fi
+
+exit $OVERALL_EXIT

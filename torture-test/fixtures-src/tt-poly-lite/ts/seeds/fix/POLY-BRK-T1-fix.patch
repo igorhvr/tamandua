@@ -1,0 +1,13 @@
+diff --git a/torture-test/fixtures-src/tt-poly-lite/ts/src/store.test.ts b/torture-test/fixtures-src/tt-poly-lite/ts/src/store.test.ts
+index 0d4214a..9bb3846 100644
+--- a/torture-test/fixtures-src/tt-poly-lite/ts/src/store.test.ts
++++ b/torture-test/fixtures-src/tt-poly-lite/ts/src/store.test.ts
+@@ -193,7 +193,7 @@ describe('InMemoryStore', () => {
+       store.add(makeExpense({ id: '1', amount: 10 }));
+       store.add(makeExpense({ id: '2', amount: 20 }));
+       store.add(makeExpense({ id: '3', amount: 30 }));
+-      assert.strictEqual(store.getTotal(), 150);
++      assert.strictEqual(store.getTotal(), 60);
+     });
+ 
+     it('handles negative amounts', () => {
