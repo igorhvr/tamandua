@@ -457,7 +457,7 @@ steps:
            --branch "{{branch}}" \
            --into "{{original_branch}}" \
            --expect-tip "$EXPECT_TIP" \
-           --message "$(cat "$MESSAGE_FILE")")
+           --message "$(cat "$MESSAGE_FILE")" 2>&1)
          MERGE_EXIT=$?
       10. Preserve MERGE_OUTPUT verbatim in the reply.
           - STATUS: conflicts or STATUS: target_moved maps to STATUS: retry,

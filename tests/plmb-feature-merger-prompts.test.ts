@@ -155,8 +155,8 @@ function assertFailureClassContract(content: string, label: string): void {
   }
   assert.match(
     content,
-    /whenever[^\n]*`tamandua step fail`[^\n]*merge-branch[^\n]*reason[^\n]*plain `FAILURE_CLASS: <class>` line/i,
-    `${label} must require a plain FAILURE_CLASS line in every merge-branch step-fail reason`,
+    /`FAILURE_CLASS: <class>`[^\n]*first line/i,
+    `${label} must require FAILURE_CLASS as the first line of step-fail reasons`,
   );
   assert.match(
     content,
@@ -430,6 +430,26 @@ describe("US-003 PLMB feature merger prompt contracts", () => {
         consumer.content,
         /MERGE_OUTPUT=\$\(tamandua merge-branch[\s\S]*?2>&1\)/,
         `${consumer.workflowId} merger must capture merge-branch stderr with 2>&1`,
+      );
+    }
+  });
+
+  it("all 8 workflow.yml finalize_merge inputs capture stderr with 2>&1 in MERGE_OUTPUT", async () => {
+    for (const workflowId of [
+      "bug-fix-merge",
+      "bug-fix-merge-worktree",
+      "feature-dev-merge",
+      "feature-dev-merge-worktree",
+      "quarantine-broken-tests-merge",
+      "quarantine-broken-tests-merge-worktree",
+      "security-audit-merge",
+      "security-audit-merge-worktree",
+    ]) {
+      const input = await finalizeMergeInput(workflowId);
+      assert.match(
+        input,
+        /MERGE_OUTPUT=\$\(tamandua merge-branch[\s\S]*?2>&1\)/,
+        `${workflowId} workflow.yml finalize_merge input must capture merge-branch stderr with 2>&1`,
       );
     }
   });

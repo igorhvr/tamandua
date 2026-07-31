@@ -92,7 +92,13 @@ Do not edit, reorder, summarize, or omit any line in `MERGE_OUTPUT`; include it 
 
 10. Handle the command result:
     - Classify any `merge-branch` step failure mechanically from `MERGE_EXIT`: exit code 2 → `FAILURE_CLASS: target_moved`; exit code 3 → `FAILURE_CLASS: conflicts`; exit code 1 → `FAILURE_CLASS: refused_permanent`. Treat any other operational refusal as `FAILURE_CLASS: refused_permanent`.
-    - Whenever you call `tamandua step fail` for a merge-branch failure, its reason must contain a plain `FAILURE_CLASS: <class>` line using that mapping, in addition to the command output and failure details.
+    - Whenever you call `tamandua step fail` for a merge-branch failure, the `FAILURE_CLASS: <class>` line must be the **first line** of the reason, before any command output. Use this shape:
+      
+      ```
+      FAILURE_CLASS: <class>
+      <MERGE_OUTPUT verbatim>
+      <details>
+      ```
     - Agent-signaled `STATUS: target_moved` and `STATUS: conflicts` command verdicts keep the existing `STATUS: retry` revalidation path unchanged; do not replace that path with `step fail`.
     - If `MERGE_OUTPUT` contains `STATUS: conflicts` or `STATUS: target_moved`, include the command output verbatim, then return the existing tester revalidation path:
 
