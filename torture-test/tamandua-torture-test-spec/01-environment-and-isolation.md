@@ -42,6 +42,7 @@ What the spec DOES own is host *adaptation*:
 | kernel hides other processes' env (darwin) | recorder/census must use cmdline/cwd/lsof evidence, never env |
 | slow process spawn (observed on darwin hosts) | serial-lane deadlines; W0.4 records per-suite durations and scales caps |
 | multiple node runtimes coexisting (e.g. nix node 24 + a vendored v22) | W0.1 dual-runtime check, W4.23 runtime-swap scenario |
+| node via version-manager shims keyed on HOME (Volta: `~/.volta/bin/node` resolves per-HOME; nvm similar) | the TT spawn env overrides HOME, so shims die ("Node is not available", rc=126) — env scripts pin the REAL node binary dir on PATH + export VOLTA_HOME (incident: 21 daemon-control self-test failures, 2026-07-31) |
 
 ### Nix-first self-provisioning (target end-state for P0)
 
