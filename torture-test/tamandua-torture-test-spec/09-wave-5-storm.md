@@ -74,11 +74,11 @@ failure of a forced-queue hope.
 | S2 | storm-fdmw-2 | feature-dev-merge-worktree | hermes | java/ ledger feature |
 | S3 | storm-fdmw-3 | feature-dev-merge-worktree | pi | python/ scheduling feature |
 | S4 | storm-bfmw-1 | bug-fix-merge-worktree | pi | rust/ POLY-BUG-R |
-| S5 | storm-bfmw-2 | bug-fix-merge-worktree | hermes | **ts/src/store.js** (overlap pair A) |
+| S5 | storm-bfmw-2 | bug-fix-merge-worktree | hermes | **ts/src/store.ts** (overlap pair A) |
 | S6 | storm-sec | security-audit-merge-worktree | pi | repo-wide audit (POLY-VULNs) |
 | S7 | storm-quar | quarantine-broken-tests-merge-worktree | pi | POLY-BRK tests, `--context branch=broken-tests` — lands on `broken-tests`, NEVER main |
 | S8 | storm-drdv | do-review-do-verify | hermes | docs+code consistency task |
-| S9 (queued) | storm-fdmw-4 | feature-dev-merge-worktree | pi | **ts/src/store.js** (overlap pair B — guaranteed conflict with S5's landing) |
+| S9 (queued) | storm-fdmw-4 | feature-dev-merge-worktree | pi | **ts/src/store.ts** (overlap pair B — guaranteed conflict with S5's landing) |
 | S10 (queued) | storm-donow | do-now | pi | trivial task (queue-drain canary) |
 
 **Eight merge-eligible runs** (S1–S7 active + S9 queued); seven target
@@ -87,7 +87,7 @@ broken tests leave main; any quarantine content reaching main, or a
 quarantine landing that moves main's ref at all, is an S1 targeting
 violation, and O2's union math for main EXCLUDES S7 by design). The
 overlap pair (S5/S9) is a **guaranteed** conflict, not a hoped one: both tasks specify mutually incompatible required edits to the same
-sentinel line of `ts/src/store.js`, and the controller pre-verifies with
+sentinel line of `ts/src/store.ts`, and the controller pre-verifies with
 `git merge-tree` (after S5's landing, before S9 merges) that the textual
 conflict actually exists — merely "touching the same file" does not
 conflict, especially with model-generated diffs. Everything else is
