@@ -1,0 +1,11 @@
+--- a/src/schedlib/integrations.py
++++ b/src/schedlib/integrations.py
+@@ -30,7 +30,7 @@
+     import yaml  # nosec
+
+     with open(filepath, "r", encoding="utf-8") as fh:
+-        return yaml.load(fh, Loader=yaml.Loader)  # VULN-P1: unsafe
++        return yaml.safe_load(fh)  # VULN-P1: fixed
+ 
+ 
+ def export_schedule_to_yaml(schedule_data: dict, filepath: str) -> None:

@@ -1,0 +1,35 @@
+--- a/src/schedlib/recurrence.py	2026-07-31 03:38:09.541233577 -0300
++++ b/src/schedlib/recurrence.py	2026-07-31 03:38:09.542111667 -0300
+@@ -106,11 +106,7 @@
+         elif self.frequency == RecurrenceFrequency.MONTHLY:
+             return _add_months(d, self.interval)
+         elif self.frequency == RecurrenceFrequency.YEARLY:
+-            # BUG-P2: yearly recurrence ignores interval — always
+-            # advances by 1 year even when interval > 1, causing
+-            # rules like yearly(interval=2) to produce annual
+-            # occurrences instead of biennial ones.
+-            return _add_years(d, 1)
++            return _add_years(d, self.interval)
+         return d + timedelta(days=1)
+ 
+     def _uses_fine_grained(self) -> bool:
+--- a/src/schedlib/conflict.py	2026-07-31 03:38:09.542814697 -0300
++++ b/src/schedlib/conflict.py	2026-07-31 03:38:09.544610719 -0300
+@@ -80,14 +80,9 @@
+     end = min(a.end, b.end)
+     overlap_dur = end - start
+ 
+-    # BUG-P2: CONTAINED check uses strict comparison (< >)
+-    # instead of non-strict (<= >=).  Events with identical
+-    # start/end bounds are no longer classified as CONTAINED
+-    # and fall through to HARD.  A single-file revert of this
+-    # alone does NOT restore green — the recurrence _advance
+-    # bug in recurrence.py must also be fixed.
+-    if (a.start < b.start and a.end > b.end) or (
+-        b.start < a.start and b.end > a.end
++    # Contained: one event fully inside the other
++    if (a.start <= b.start and a.end >= b.end) or (
++        b.start <= a.start and b.end >= a.end
+     ):
+         return ConflictSeverity.CONTAINED
+ 

@@ -1,0 +1,17 @@
+--- src/schedlib/dates.py	2026-07-30 23:47:13.828814333 -0300
++++ src/schedlib/dates.py	2026-07-30 23:47:19.676193135 -0300
+@@ -131,13 +131,7 @@
+ 
+ def is_weekday(dt: AnyDate) -> bool:
+     """Return True if *dt* is Monday–Friday."""
+-    # BUG-P3: off-by-one comparison — weekday 5 (Saturday) is
+-    # incorrectly treated as a weekday.  This causes
+-    # is_business_day() to return True for Saturdays, breaking
+-    # next_business_day / previous_business_day in calendar_helpers.
+-    # The test failure and traceback point to calendar_helpers.py,
+-    # but the root cause is HERE in dates.py.
+-    return parse_date(dt).weekday() <= 5
++    return parse_date(dt).weekday() < 5
+ 
+ 
+ def is_weekend(dt: AnyDate) -> bool:
