@@ -271,7 +271,7 @@ steps:
     expects: "STATUS: done\nregex:^VERIFIED:\\s*\\S+"
     on_fail:
       retry_step: fix
-      max_retries: 6
+      max_reroutes: 6
 
   - id: pr
     agent: pr

@@ -289,7 +289,7 @@ steps:
     expects: "regex:^STATUS:\\s*(done|retry)\\s*$"
     on_fail:
       retry_step: implement
-      max_retries: 4
+      max_reroutes: 4
 
   - id: test
     agent: tester
@@ -327,7 +327,7 @@ steps:
     expects: "STATUS: done\nregex:^RESULTS:\\s*\\S+"
     on_fail:
       retry_step: implement
-      max_retries: 4
+      max_reroutes: 4
 
   - id: pr
     agent: developer
@@ -415,4 +415,4 @@ steps:
     expects: "STATUS: done"
     on_fail:
       retry_step: implement
-      max_retries: 6
+      max_reroutes: 6

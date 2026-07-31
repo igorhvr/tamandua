@@ -122,6 +122,8 @@ const TMP_PATH_ALLOWLIST: Record<string, string> = {
     `test fixture — "/tmp/test-repo" origin repository for suite record tests`,
   "src/server/mcp-server.test.ts":
     "test fixture — fake /tmp/remote-harness, /tmp/harness, /tmp/test-project",
+  "tests/plmb-feature-merger-prompts.test.ts":
+    "test names and assertion messages reference /tmp/ in describing mktemp template paths",
 
   // ── Bundled e2e fixture (not Tamandua runtime code) ──
   "e2e-tests/fixtures/sample-project-vuln/test/server.test.ts":

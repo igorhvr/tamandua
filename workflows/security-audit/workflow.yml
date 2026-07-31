@@ -316,7 +316,7 @@ steps:
     expects: "regex:^STATUS:\\s*(done|retry)\\s*$"
     on_fail:
       retry_step: fix
-      max_retries: 6
+      max_reroutes: 6
 
   - id: test
     agent: tester
@@ -357,4 +357,4 @@ steps:
     expects: "STATUS: done\nregex:^RESULTS:\\s*\\S+\nregex:^AUDIT_AFTER:\\s*\\S+"
     on_fail:
       retry_step: fix
-      max_retries: 4
+      max_reroutes: 4

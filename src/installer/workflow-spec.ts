@@ -4,6 +4,60 @@ import path from "node:path";
 import { parse as parseYaml } from "yaml";
 import type { WorkflowSpec } from "./types.js";
 
+const VALID_ON_FAIL_KEYS = new Set(["retry_step", "max_reroutes", "retry_on"]);
+
+/**
+ * Validates on_fail blocks on every step:
+ * - Rejects unknown keys (only retry_step, max_reroutes, retry_on are valid).
+ * - Enforces the M4 attestation rule: if a step has on_fail.retry_step, it must
+ *   match the nearest upstream step whose input template contains TESTED_TREE
+ *   (the attesting step).
+ */
+function validateOnFail(
+  steps: Array<Record<string, unknown>>,
+  workflowDir: string,
+): void {
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i];
+    const stepId = String(step.id ?? `<unknown>`);
+
+    if (!step.on_fail || typeof step.on_fail !== "object") continue;
+
+    const onFail = step.on_fail as Record<string, unknown>;
+
+    // Check for unknown keys
+    for (const key of Object.keys(onFail)) {
+      if (!VALID_ON_FAIL_KEYS.has(key)) {
+        throw new Error(
+          `workflow.yml step[${i}] ("${stepId}") on_fail in ${workflowDir} contains unknown key: "${key}". Valid keys are: retry_step, max_reroutes, retry_on.`,
+        );
+      }
+    }
+
+    // M4 attestation rule: if a step has on_fail.retry_step, it must match the
+    // nearest upstream step whose input template contains TESTED_TREE.
+    const retryStep = onFail.retry_step;
+    if (typeof retryStep !== "string") continue;
+
+    // Scan backwards to find the nearest upstream step declaring TESTED_TREE
+    let attestingStepId: string | null = null;
+    for (let j = i - 1; j >= 0; j--) {
+      const upstream = steps[j];
+      const input = upstream.input;
+      if (typeof input === "string" && input.includes("TESTED_TREE")) {
+        attestingStepId = String(upstream.id ?? "");
+        break;
+      }
+    }
+
+    if (attestingStepId !== null && retryStep !== attestingStepId) {
+      throw new Error(
+        `workflow.yml step[${i}] ("${stepId}") on_fail.retry_step is "${retryStep}" but the attesting step that produces TESTED_TREE is "${attestingStepId}" in ${workflowDir}`,
+      );
+    }
+  }
+}
+
 function validateRetryOn(
   step: Record<string, unknown>,
   stepIndex: number,
@@ -94,6 +148,9 @@ function parseAndValidateWorkflowSpec(
     }
     validateRetryOn(step, i, workflowDir);
   }
+
+  // Validate on_fail blocks after all steps are parsed (needed for M4 attestation rule)
+  validateOnFail(spec.steps as Array<Record<string, unknown>>, workflowDir);
 
   // Validate run.workspace if present
   if (spec.run && typeof spec.run === "object") {

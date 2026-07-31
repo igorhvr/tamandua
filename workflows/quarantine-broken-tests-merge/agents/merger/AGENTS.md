@@ -84,7 +84,7 @@ MERGE_OUTPUT=$(tamandua merge-branch \
   --branch "{{branch}}" \
   --into "{{original_branch}}" \
   --expect-tip "$EXPECT_TIP" \
-  --message "$(cat "$MESSAGE_FILE")")
+  --message "$(cat "$MESSAGE_FILE")" 2>&1)
 MERGE_EXIT=$?
 ```
 

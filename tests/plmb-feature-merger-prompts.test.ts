@@ -308,13 +308,26 @@ describe("US-003 PLMB feature merger prompt contracts", () => {
     assert.match(persona, /STATUS: done/);
   });
 
+  const allMergeWorkflowIds = [
+    "bug-fix-merge",
+    "bug-fix-merge-worktree",
+    "feature-dev-merge",
+    "feature-dev-merge-worktree",
+    "quarantine-broken-tests-merge",
+    "quarantine-broken-tests-merge-worktree",
+    "security-audit-merge",
+    "security-audit-merge-worktree",
+  ] as const;
+
   const migratedWorkflowContracts = [
-    { id: "bug-fix-merge", origin: "{{repo}}", retryStep: "verify", maxReroutes: 4 },
-    { id: "bug-fix-merge-worktree", origin: "{{worktree_origin_repository}}", retryStep: "verify", maxReroutes: 8 },
-    { id: "quarantine-broken-tests-merge", origin: "{{repo}}", retryStep: "verify", maxRetries: 4 },
-    { id: "quarantine-broken-tests-merge-worktree", origin: "{{worktree_origin_repository}}", retryStep: "verify", maxRetries: 4 },
-    { id: "security-audit-merge", origin: "{{repo}}", retryStep: "test", maxRetries: 4 },
-    { id: "security-audit-merge-worktree", origin: "{{worktree_origin_repository}}", retryStep: "test", maxRetries: 4 },
+    { id: "bug-fix-merge", origin: "{{repo}}", retryStep: "verify", maxReroutes: 8, maxRetries: 0 },
+    { id: "bug-fix-merge-worktree", origin: "{{worktree_origin_repository}}", retryStep: "verify", maxReroutes: 8, maxRetries: 0 },
+    { id: "feature-dev-merge", origin: "{{repo}}", retryStep: "test", maxReroutes: 8, maxRetries: 0 },
+    { id: "feature-dev-merge-worktree", origin: "{{worktree_origin_repository}}", retryStep: "test", maxReroutes: 8, maxRetries: 0 },
+    { id: "quarantine-broken-tests-merge", origin: "{{repo}}", retryStep: "verify", maxReroutes: 4, maxRetries: 0 },
+    { id: "quarantine-broken-tests-merge-worktree", origin: "{{worktree_origin_repository}}", retryStep: "verify", maxReroutes: 4, maxRetries: 0 },
+    { id: "security-audit-merge", origin: "{{repo}}", retryStep: "test", maxReroutes: 4, maxRetries: 0 },
+    { id: "security-audit-merge-worktree", origin: "{{worktree_origin_repository}}", retryStep: "test", maxReroutes: 4, maxRetries: 0 },
   ] as const;
 
   for (const contract of migratedWorkflowContracts) {
@@ -342,11 +355,12 @@ describe("US-003 PLMB feature merger prompt contracts", () => {
       assert.doesNotMatch(step.input, /git merge --squash|git commit -F/);
 
       assert.equal(step.on_fail?.retry_step, contract.retryStep);
-      if ("maxReroutes" in contract) {
-        assert.equal(step.on_fail?.max_reroutes, contract.maxReroutes);
-      } else {
-        assert.equal(step.on_fail?.max_retries, contract.maxRetries);
-      }
+      assert.equal(step.on_fail?.max_reroutes, contract.maxReroutes);
+      assert.equal(
+        step.max_retries,
+        0,
+        `${contract.id} finalize_merge max_retries must be 0 so target_moved and conflict retry verdicts immediately reroute to on_fail.retry_step instead of self-retrying`,
+      );
       assert.equal(
         step.expects,
         "regex:^STATUS:\\s*(done|retry)\\s*$\n" +
@@ -356,7 +370,7 @@ describe("US-003 PLMB feature merger prompt contracts", () => {
     });
   }
 
-  for (const workflowId of ["feature-dev-merge", "feature-dev-merge-worktree"]) {
+  for (const workflowId of allMergeWorkflowIds) {
     it(`${workflowId} invokes only merge-branch for origin landing`, async () => {
       const input = await finalizeMergeInput(workflowId);
       assert.match(input, /ORIGIN_REPOSITORY:/);
@@ -366,23 +380,27 @@ describe("US-003 PLMB feature merger prompt contracts", () => {
       assert.doesNotMatch(input, /git merge --squash|git commit -F/);
       assert.match(input, /STATUS: conflicts/);
       assert.match(input, /STATUS: target_moved/);
-      assert.match(input, /RETRY_STEP: test/);
+      assert.match(input, /RETRY_STEP: (?:test|verify)/);
       assert.match(input, /MERGED_TREE[\s\S]*\{\{tested_tree\}\}/);
     });
 
-    it(`${workflowId} reroutes retry verdicts to tester revalidation immediately`, async () => {
+    it(`${workflowId} reroutes retry verdicts to revalidation immediately`, async () => {
       const spec = await loadWorkflowSpec(resolve(workflowsRoot, workflowId));
       const step = spec.steps.find((candidate) => candidate.id === "finalize_merge");
       assert.ok(step, `${workflowId} must define finalize_merge`);
+      const retryStep = step.on_fail?.retry_step;
+      assert.ok(
+        retryStep === "test" || retryStep === "verify",
+        `${workflowId} finalize_merge on_fail.retry_step must be test or verify, got: ${retryStep}`,
+      );
       assert.equal(
         step.max_retries,
         0,
-        "target_moved and conflict retry verdicts must not retry landing before tester revalidation",
+        "target_moved and conflict retry verdicts must not retry landing before revalidation",
       );
-      assert.equal(step.on_fail?.retry_step, "test");
       assert.ok(
-        (step.on_fail?.max_reroutes ?? 0) >= 8,
-        "eight-way concurrent landing must have enough bounded revalidation reroutes",
+        (step.on_fail?.max_reroutes ?? 0) >= 4,
+        `${workflowId} finalize_merge on_fail.max_reroutes must be at least 4 for revalidation reroutes, got: ${step.on_fail?.max_reroutes}`,
       );
     });
   }
@@ -394,6 +412,36 @@ describe("US-003 PLMB feature merger prompt contracts", () => {
     assert.match(input, /EXPECT_TIP=\$\(git -C "\$ORIGIN_REPOSITORY" rev-parse "\$TARGET_REF"\)/);
     assert.match(input, /git -C \{\{repo\}\} rebase "\$EXPECT_TIP"/);
     assert.doesNotMatch(input, /git -C \{\{worktree_origin_repository\}\} rebase/);
+  });
+
+  it("all 8 merger personas use mktemp for MESSAGE_FILE, not hardcoded /tmp/ paths", () => {
+    for (const consumer of mergeBranchPersonaConsumers()) {
+      assert.match(
+        consumer.content,
+        /MESSAGE_FILE="\$\(mktemp "\$\{TMPDIR:-\/tmp\}\/tamandua-merge-message\.XXXXXX"\)"/,
+        `${consumer.workflowId} merger must use mktemp to create MESSAGE_FILE, not a hardcoded /tmp/ path`,
+      );
+    }
+  });
+
+  it("all 8 merger personas capture stderr with 2>&1 in MERGE_OUTPUT", () => {
+    for (const consumer of mergeBranchPersonaConsumers()) {
+      assert.match(
+        consumer.content,
+        /MERGE_OUTPUT=\$\(tamandua merge-branch[\s\S]*?2>&1\)/,
+        `${consumer.workflowId} merger must capture merge-branch stderr with 2>&1`,
+      );
+    }
+  });
+
+  it("no merger persona claims to capture 'combined stdout'", () => {
+    for (const consumer of mergeBranchPersonaConsumers()) {
+      assert.doesNotMatch(
+        consumer.content,
+        /capturing combined stdout/,
+        `${consumer.workflowId} merger must not claim to capture 'combined stdout' (capture is stdout+stderr via 2>&1)`,
+      );
+    }
   });
 
   it("shared persona and both workflow prompts prohibit direct origin mutation", async () => {

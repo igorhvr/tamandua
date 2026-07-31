@@ -350,7 +350,7 @@ steps:
     expects: "regex:^STATUS:\\s*(done|retry)\\s*$"
     on_fail:
       retry_step: fix
-      max_retries: 6
+      max_reroutes: 6
 
   - id: test
     agent: tester
@@ -394,7 +394,7 @@ steps:
     expects: "STATUS: done\nregex:^TESTED_TREE:\\s*\\S+"
     on_fail:
       retry_step: fix
-      max_retries: 4
+      max_reroutes: 4
 
   - id: finalize_merge
     agent: merger
@@ -476,7 +476,8 @@ steps:
       regex:^STATUS:\s*(done|retry)\s*$
       regex:^REBASED:\s*(true|false)\s*$
       regex:^(STATUS:\s*retry|REBASED:\s*false)\s*$
+    max_retries: 0
     on_fail:
       retry_step: test
-      max_retries: 4
+      max_reroutes: 4
       retry_on: [target_moved, conflicts]

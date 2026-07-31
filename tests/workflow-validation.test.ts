@@ -273,7 +273,7 @@ describe("workflow structure", () => {
     assert.match(content, /imperative mood/);
     assert.match(content, /Under 72 characters/);
     assert.doesNotMatch(content, /git commit -F|git commit -m/);
-    assert.match(content, /Write the full message to a temp file/);
+    assert.match(content, /Create a securely named temp file outside the repository/);
     assert.match(content, /### Gathering Information/);
   });
 
@@ -573,7 +573,7 @@ describe("workflow structure", () => {
     const finalStep = spec.steps.find((s) => s.id === "finalize_merge");
     assert.ok(finalStep, "finalize_merge step must exist");
     assert.equal(finalStep!.on_fail?.retry_step, "test");
-    assert.ok(finalStep!.on_fail?.max_retries);
+    assert.equal(finalStep!.on_fail?.max_reroutes, 4);
     assert.equal(finalStep!.on_fail?.on_exhausted, undefined);
   });
 
@@ -1757,5 +1757,92 @@ describe("agent file divergence detection", () => {
         "workflows/quarantine-broken-tests-merge/agents/merger/SOUL.md",
       ]);
     });
+  });
+});
+
+describe("US-003: Static bundled workflow compliance tests", () => {
+  const mergeWorkflowIds = [
+    "bug-fix-merge",
+    "bug-fix-merge-worktree",
+    "feature-dev-merge",
+    "feature-dev-merge-worktree",
+    "quarantine-broken-tests-merge",
+    "quarantine-broken-tests-merge-worktree",
+    "security-audit-merge",
+    "security-audit-merge-worktree",
+  ];
+
+  // AC 1: No bundled workflow has unknown on_fail keys.
+  // The loader already rejects unknown keys at parse time, but this static
+  // test provides a build-failing assertion over every bundled workflow.
+  it("no bundled workflow has unknown on_fail keys", async () => {
+    const validKeys = new Set(["retry_step", "max_reroutes", "retry_on"]);
+    for (const id of workflowIds) {
+      const spec = await loadWorkflowSpec(wfDir(id));
+      for (const step of spec.steps) {
+        if (!step.on_fail || typeof step.on_fail !== "object") continue;
+        for (const key of Object.keys(step.on_fail as Record<string, unknown>)) {
+          assert.ok(
+            validKeys.has(key),
+            `${id}: step "${step.id}" on_fail has unknown key "${key}". Valid: retry_step, max_reroutes, retry_on`,
+          );
+        }
+      }
+    }
+  });
+
+  // AC 2: max_retries === 0 on finalize_merge for all 8 merge workflows.
+  // Retry verdicts (STATUS: retry) must route immediately to on_fail.retry_step
+  // without self-retrying first, so max_retries must be zero.
+  it("finalize_merge has max_retries: 0 in all 8 merge workflows", async () => {
+    for (const id of mergeWorkflowIds) {
+      const spec = await loadWorkflowSpec(wfDir(id));
+      const finalStep = spec.steps.find((s) => s.id === "finalize_merge");
+      assert.ok(finalStep, `${id}: must define finalize_merge`);
+      assert.strictEqual(
+        finalStep!.max_retries,
+        0,
+        `${id}: finalize_merge must have max_retries: 0 ` +
+          `so retry verdicts route immediately to on_fail.retry_step`,
+      );
+    }
+  });
+
+  // AC 3: retry_step matches the nearest upstream TESTED_TREE attesting step
+  // for all 8 merge workflows. A reroute re-runs ONLY the retry_step target,
+  // so if it's not the attesting step, a stale attestation can green-light
+  // an untested tree.
+  it("finalize_merge on_fail.retry_step matches TESTED_TREE attesting step in all 8 merge workflows", async () => {
+    for (const id of mergeWorkflowIds) {
+      const spec = await loadWorkflowSpec(wfDir(id));
+      const finalStep = spec.steps.find((s) => s.id === "finalize_merge");
+      assert.ok(finalStep, `${id}: must define finalize_merge`);
+
+      // All 8 merge workflows have on_fail.retry_step on finalize_merge
+      const retryStep = (finalStep!.on_fail as Record<string, unknown> | undefined)?.retry_step as string | undefined;
+      assert.ok(retryStep, `${id}: finalize_merge must have on_fail.retry_step`);
+
+      // Find nearest upstream step whose input contains TESTED_TREE
+      const finalIdx = spec.steps.indexOf(finalStep!);
+      let attestingStepId: string | null = null;
+      for (let j = finalIdx - 1; j >= 0; j--) {
+        const upstream = spec.steps[j];
+        if (typeof upstream.input === "string" && upstream.input.includes("TESTED_TREE")) {
+          attestingStepId = upstream.id;
+          break;
+        }
+      }
+
+      assert.ok(
+        attestingStepId !== null,
+        `${id}: must have an upstream step whose input contains TESTED_TREE`,
+      );
+      assert.strictEqual(
+        retryStep,
+        attestingStepId,
+        `${id}: finalize_merge on_fail.retry_step is "${retryStep}" ` +
+          `but the attesting step that produces TESTED_TREE is "${attestingStepId}"`,
+      );
+    }
   });
 });

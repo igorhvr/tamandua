@@ -23,7 +23,8 @@ const mergeWorkflowPolicies: Record<string, ExpectedFinalizePolicy> = {
   },
   "bug-fix-merge": {
     retryStep: "verify",
-    maxReroutes: 4,
+    maxReroutes: 8,
+    stepMaxRetries: 0,
   },
   "bug-fix-merge-worktree": {
     retryStep: "verify",
@@ -32,19 +33,23 @@ const mergeWorkflowPolicies: Record<string, ExpectedFinalizePolicy> = {
   },
   "quarantine-broken-tests-merge": {
     retryStep: "verify",
-    maxRetries: 4,
+    maxReroutes: 4,
+    stepMaxRetries: 0,
   },
   "quarantine-broken-tests-merge-worktree": {
     retryStep: "verify",
-    maxRetries: 4,
+    maxReroutes: 4,
+    stepMaxRetries: 0,
   },
   "security-audit-merge": {
     retryStep: "test",
-    maxRetries: 4,
+    maxReroutes: 4,
+    stepMaxRetries: 0,
   },
   "security-audit-merge-worktree": {
     retryStep: "test",
-    maxRetries: 4,
+    maxReroutes: 4,
+    stepMaxRetries: 0,
   },
 };
 

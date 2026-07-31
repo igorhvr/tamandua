@@ -76,7 +76,7 @@ The pipeline routes this to the tester step via `on_fail.retry_step: test`. The 
 This must be a fresh invocation where no rebase was needed: the branch was already based on the exact current target tip captured in `EXPECT_TIP`. A prior invocation may have rebased and returned for tester re-validation, but this invocation did not rebase. Only under these conditions may `tamandua merge-branch` run.
 
 8. Build a descriptive commit message (see "Commit Message Generation" below) and write it to `MESSAGE_FILE`.
-9. Invoke the plumbing command with every required flag, capturing combined stdout exactly in `MERGE_OUTPUT` and its exit code in `MERGE_EXIT`:
+9. Invoke the plumbing command with every required flag, capturing its output exactly in `MERGE_OUTPUT` and its exit code in `MERGE_EXIT`:
 
 ```sh
 MERGE_OUTPUT=$(tamandua merge-branch \
@@ -84,7 +84,7 @@ MERGE_OUTPUT=$(tamandua merge-branch \
   --branch "{{branch}}" \
   --into "{{original_branch}}" \
   --expect-tip "$EXPECT_TIP" \
-  --message "$(cat "$MESSAGE_FILE")")
+  --message "$(cat "$MESSAGE_FILE")" 2>&1)
 MERGE_EXIT=$?
 ```
 
@@ -143,7 +143,13 @@ Construct a commit message with these parts:
 
 ### Supplying the Message to Atomic Landing
 
-Write the full message to a temp file (e.g., `/tmp/merge-commit-msg.txt`) and set `MESSAGE_FILE` to that path. Pass its complete contents through the required `--message` flag of `tamandua merge-branch`. The plumbing command creates the commit; do not run a separate commit command.
+Create a securely named temp file outside the repository and set `MESSAGE_FILE` to its path:
+
+```sh
+MESSAGE_FILE="$(mktemp "${TMPDIR:-/tmp}/tamandua-merge-message.XXXXXX")"
+```
+
+Write the full message to `MESSAGE_FILE`. Pass its complete contents through the required `--message` flag of `tamandua merge-branch`. The plumbing command creates the commit; do not run a separate commit command. Remove `MESSAGE_FILE` after `MERGE_OUTPUT` and `MERGE_EXIT` have been captured.
 
 The commit message MUST end with the co-author footer line:
 
@@ -187,6 +193,7 @@ STATUS: landed
 MERGED_COMMIT: <full commit hash>
 MERGED_TREE: <tree hash>
 TARGET: refs/heads/<original branch>
+CHECKOUT_REFRESH: <merge-branch checkout refresh result>
 REBASED: false
 MERGE_COMMIT: <short commit hash>
 MERGED_INTO: <original branch>

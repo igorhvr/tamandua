@@ -84,7 +84,7 @@ MERGE_OUTPUT=$(tamandua merge-branch \
   --branch "{{branch}}" \
   --into "{{original_branch}}" \
   --expect-tip "$EXPECT_TIP" \
-  --message "$(cat "$MESSAGE_FILE")")
+  --message "$(cat "$MESSAGE_FILE")" 2>&1)
 MERGE_EXIT=$?
 ```
 
@@ -141,7 +141,7 @@ Construct a commit message with these parts:
    - Critical/High severity findings: which ones were found and fixed
    - Individual fixes: each fix from the git log, paraphrased with its purpose
    - Remediation summary: what security posture improved
-   - WASPHALSPHALT: the WHAT and WHY for future maintainers
+   - Body: the WHAT and WHY for future maintainers
 
 ### Supplying the Message to Atomic Landing
 

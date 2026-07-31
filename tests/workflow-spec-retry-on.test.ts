@@ -42,7 +42,7 @@ afterEach(() => {
 describe("on_fail.retry_on workflow contract", () => {
   it("both loaders preserve known and unknown retry_on classes", async () => {
     const workflowDir = writeWorkflow(
-      "    on_fail:\n      retry_step: implement\n      max_retries: 2\n      max_reroutes: 4\n      retry_on: [target_moved, future_failure_class]\n",
+      "    on_fail:\n      retry_step: implement\n      max_reroutes: 2\n      retry_on: [target_moved, future_failure_class]\n",
     );
 
     const asyncSpec = await loadWorkflowSpec(workflowDir);
@@ -51,8 +51,7 @@ describe("on_fail.retry_on workflow contract", () => {
     for (const spec of [asyncSpec, syncSpec]) {
       assert.deepEqual(spec.steps[0].on_fail, {
         retry_step: "implement",
-        max_retries: 2,
-        max_reroutes: 4,
+        max_reroutes: 2,
         retry_on: ["target_moved", "future_failure_class"],
       });
     }

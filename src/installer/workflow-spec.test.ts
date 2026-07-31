@@ -497,3 +497,255 @@ steps:
     assert.equal(spec.steps.length, 2);
   });
 });
+
+describe("validateOnFail — on_fail key validation and M4 attestation rule", () => {
+  it("accepts valid on_fail keys: retry_step, max_reroutes, retry_on", async () => {
+    const yml = `
+id: test-valid-on-fail
+agents:
+  - id: dev
+    workspace:
+      baseDir: agents/dev
+steps:
+  - id: step1
+    agent: dev
+    input: "TESTED_TREE: treehash"
+    expects: "STATUS: done"
+  - id: step2
+    agent: dev
+    input: "consume TESTED_TREE"
+    expects: "STATUS: done"
+    on_fail:
+      retry_step: step1
+      max_reroutes: 4
+      retry_on: [conflicts, target_moved]
+`;
+    const dir = createTempWorkflow(yml);
+    const spec = await loadWorkflowSpec(dir);
+    assert.equal(spec.id, "test-valid-on-fail");
+  });
+
+  it("rejects unknown on_fail key naming the step and key", async () => {
+    const yml = `
+id: test-bad-key
+agents:
+  - id: dev
+    workspace:
+      baseDir: agents/dev
+steps:
+  - id: step1
+    agent: dev
+    input: "hello"
+    expects: "world"
+    on_fail:
+      retry_step: step0
+      max_retries: 4
+`;
+    const dir = createTempWorkflow(yml);
+    await assert.rejects(
+      () => loadWorkflowSpec(dir),
+      /on_fail.*contains unknown key.*"max_retries".*retry_step, max_reroutes, retry_on/i,
+    );
+    await assert.rejects(
+      () => loadWorkflowSpec(dir),
+      /step\[0\] \("step1"\)/i,
+    );
+  });
+
+  it("rejects unknown on_fail key with other junk (typo, extra field)", async () => {
+    const yml = `
+id: test-typo-key
+agents:
+  - id: dev
+    workspace:
+      baseDir: agents/dev
+steps:
+  - id: step1
+    agent: dev
+    input: "hello"
+    expects: "world"
+    on_fail:
+      retry_step: step0
+      max_reroutes: 3
+      misspelled_key: true
+`;
+    const dir = createTempWorkflow(yml);
+    await assert.rejects(
+      () => loadWorkflowSpec(dir),
+      /on_fail.*contains unknown key.*"misspelled_key"/i,
+    );
+  });
+
+  it("accepts step with on_fail.retry_step matching the attesting (TESTED_TREE) step", async () => {
+    const yml = `
+id: test-attestation-ok
+agents:
+  - id: dev
+    workspace:
+      baseDir: agents/dev
+steps:
+  - id: test
+    agent: dev
+    input: |
+      Verify the work
+      Reply with:
+      STATUS: done
+      TESTED_TREE: treehash123
+    expects: "STATUS: done\\nregex:^TESTED_TREE:\\\\s*\\\\S+"
+  - id: finalize_merge
+    agent: dev
+    input: |
+      Land the changes
+      TESTED_TREE: {{tested_tree}}
+    expects: "STATUS: done"
+    on_fail:
+      retry_step: test
+      max_reroutes: 8
+      retry_on: [target_moved, conflicts]
+`;
+    const dir = createTempWorkflow(yml);
+    const spec = await loadWorkflowSpec(dir);
+    assert.equal(spec.id, "test-attestation-ok");
+  });
+
+  it("rejects when retry_step mismatches the TESTED_TREE attesting step, naming both", async () => {
+    const yml = `
+id: test-attestation-bad
+agents:
+  - id: dev
+    workspace:
+      baseDir: agents/dev
+steps:
+  - id: test
+    agent: dev
+    input: |
+      Verify the work
+      Reply with:
+      STATUS: done
+      TESTED_TREE: treehash123
+    expects: "STATUS: done\\nregex:^TESTED_TREE:\\\\s*\\\\S+"
+  - id: finalize_merge
+    agent: dev
+    input: |
+      Land the changes
+      TESTED_TREE: {{tested_tree}}
+    expects: "STATUS: done"
+    on_fail:
+      retry_step: wrong_step
+      max_reroutes: 8
+      retry_on: [target_moved, conflicts]
+`;
+    const dir = createTempWorkflow(yml);
+    await assert.rejects(
+      () => loadWorkflowSpec(dir),
+      /on_fail\.retry_step is "wrong_step" but the attesting step that produces TESTED_TREE is "test"/i,
+    );
+  });
+
+  it("skips attestation check when no upstream step has TESTED_TREE", async () => {
+    const yml = `
+id: test-no-attester
+agents:
+  - id: dev
+    workspace:
+      baseDir: agents/dev
+steps:
+  - id: step1
+    agent: dev
+    input: "do something"
+    expects: "STATUS: done"
+    on_fail:
+      retry_step: step0
+      max_reroutes: 3
+`;
+    const dir = createTempWorkflow(yml);
+    const spec = await loadWorkflowSpec(dir);
+    assert.equal(spec.id, "test-no-attester");
+  });
+
+  it("attestation check looks at nearest upstream TESTED_TREE step only", async () => {
+    // step2 retry_step is step1_b — but the nearest upstream TESTED_TREE is step1_a.
+    // So this should fail because retry_step doesn't match step1_a.
+    const yml = `
+id: test-nearest-attester
+agents:
+  - id: dev
+    workspace:
+      baseDir: agents/dev
+steps:
+  - id: step0
+    agent: dev
+    input: "no tree here"
+    expects: "STATUS: done"
+  - id: step1_a
+    agent: dev
+    input: |
+      TESTED_TREE: aaa
+    expects: "STATUS: done"
+  - id: step1_b
+    agent: dev
+    input: |
+      more work
+      TESTED_TREE: bbb
+    expects: "STATUS: done"
+  - id: step2
+    agent: dev
+    input: "consume"
+    expects: "STATUS: done"
+    on_fail:
+      retry_step: step1_a
+      max_reroutes: 3
+`;
+    // step2's retry_step is step1_a. The nearest upstream with TESTED_TREE is step1_b.
+    // So it should fail with: retry_step "step1_a" but attesting step is "step1_b"
+    const dir = createTempWorkflow(yml);
+    await assert.rejects(
+      () => loadWorkflowSpec(dir),
+      /on_fail\.retry_step is "step1_a" but the attesting step that produces TESTED_TREE is "step1_b"/i,
+    );
+  });
+
+  it("accepts step with on_fail but no retry_step (only retry_on)", async () => {
+    const yml = `
+id: test-retry-on-only
+agents:
+  - id: dev
+    workspace:
+      baseDir: agents/dev
+steps:
+  - id: step1
+    agent: dev
+    input: "hello"
+    expects: "world"
+    on_fail:
+      retry_on: [timeout]
+`;
+    const dir = createTempWorkflow(yml);
+    const spec = await loadWorkflowSpec(dir);
+    assert.equal(spec.id, "test-retry-on-only");
+  });
+
+  it("rejects multiple unknown on_fail keys", async () => {
+    const yml = `
+id: test-multi-bad
+agents:
+  - id: dev
+    workspace:
+      baseDir: agents/dev
+steps:
+  - id: step1
+    agent: dev
+    input: "hello"
+    expects: "world"
+    on_fail:
+      foo: 1
+      bar: 2
+`;
+    const dir = createTempWorkflow(yml);
+    // Throws on the first bad key — 'foo' (Object.keys order)
+    await assert.rejects(
+      () => loadWorkflowSpec(dir),
+      /on_fail.*contains unknown key.*"foo".*retry_step, max_reroutes, retry_on/i,
+    );
+  });
+});

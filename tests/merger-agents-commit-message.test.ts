@@ -60,7 +60,7 @@ describe("merger AGENTS.md commit message generation", () => {
 
   it("instructs writing the message to a temp file and passing it to merge-branch", () => {
     assert.match(content, /--message "\$\(cat "\$MESSAGE_FILE"\)"/);
-    assert.match(content, /\/tmp\/merge-commit-msg\.txt/);
+    assert.match(content, /MESSAGE_FILE="\$\(mktemp "\$\{TMPDIR:-\/tmp\}\/tamandua-merge-message\.XXXXXX"\)"/);
     assert.doesNotMatch(content, /git commit -F/);
   });
 

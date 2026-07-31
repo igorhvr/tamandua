@@ -164,4 +164,4 @@ steps:
     expects: "STATUS: done\nregex:^VERIFIED:\\s*\\S+"
     on_fail:
       retry_step: quarantine
-      max_retries: 4
+      max_reroutes: 4

@@ -183,7 +183,7 @@ steps:
     expects: "STATUS: done\nregex:^VERIFIED:\\s*\\S+\nregex:^TESTED_TREE:\\s*\\S+"
     on_fail:
       retry_step: quarantine
-      max_retries: 4
+      max_reroutes: 4
 
   - id: finalize_merge
     agent: merger
@@ -206,7 +206,7 @@ steps:
       SUMMARY: {{summary}}
       TESTED_TREE: {{tested_tree}}
 
-      RETRY FEEDBACK (only present if the verifier re-validated a rebased branch — the verifier has confirmed the rebased changes pass; proceed to Phase 3 squash merge):
+      RETRY FEEDBACK (only present if the verifier re-validated a rebased branch — the branch was rebased; revalidation happens via the verifier reroute):
       {{retry_feedback}}
 
       Follow the Required Process from your AGENTS.md. The origin working tree
@@ -260,7 +260,8 @@ steps:
       regex:^STATUS:\s*(done|retry)\s*$
       regex:^REBASED:\s*(true|false)\s*$
       regex:^(STATUS:\s*retry|REBASED:\s*false)\s*$
+    max_retries: 0
     on_fail:
       retry_step: verify
-      max_retries: 4
+      max_reroutes: 4
       retry_on: [target_moved, conflicts]
