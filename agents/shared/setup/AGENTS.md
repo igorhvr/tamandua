@@ -81,3 +81,10 @@ Treat that as a passing test run — no need to re-execute.
 - Don't skip the baseline — downstream agents need to know the starting state
 
 **Exception:** You DO create `.gitignore` and `.env.example` if they're missing — this is project hygiene, not application code.
+
+
+## Test Suite Timeout Warning
+
+**The full test suite may take 15-25+ minutes to complete.** Never run it under a command timeout below 30 minutes. An interrupted suite produces zero usable evidence and poisons the evidence ledger — the entire attempt is wasted.
+
+Prefer launching the suite in the background (nohup/detached, output to a file) and polling, rather than relying on the command's built-in timeout. If the suite is interrupted by a signal or timeout, the run's ledger records no usable evidence, and the cache cannot replay a green result.

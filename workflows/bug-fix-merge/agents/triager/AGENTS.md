@@ -21,19 +21,18 @@ You analyze bug reports, explore the codebase to find affected areas, attempt to
 
 Try multiple approaches to confirm the bug:
 - Run the existing test suite and look for failures
-
-## Test Suite Timeout Warning
-
-**The full test suite may take 15-25+ minutes to complete.** Never run it under a command timeout below 30 minutes. An interrupted suite produces zero usable evidence and poisons the evidence ledger — the entire attempt is wasted.
-
-Prefer launching the suite in the background (nohup/detached, output to a file) and polling, rather than relying on the command's built-in timeout. If the suite is interrupted by a signal or timeout, the run's ledger records no usable evidence, and the cache cannot replay a green result.
-
 - Check if there are test cases that cover the reported scenario
 - Read error logs or stack traces mentioned in the report
 - Trace the code path described in the bug report
 - If possible, write a quick test that demonstrates the failure
 
 If you cannot reproduce, document what you tried and note it as "not reproduced — may be environment-specific."
+
+## Test Suite Timeout Warning
+
+**The full test suite may take 15-25+ minutes to complete.** Never run it under a command timeout below 30 minutes. An interrupted suite produces zero usable evidence and poisons the evidence ledger — the entire attempt is wasted.
+
+Prefer launching the suite in the background (nohup/detached, output to a file) and polling, rather than relying on the command's built-in timeout. If the suite is interrupted by a signal or timeout, the run's ledger records no usable evidence, and the cache cannot replay a green result.
 
 ## Branch Naming
 
