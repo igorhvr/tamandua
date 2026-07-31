@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# tt-run — torture-test controller entrypoint (invoked via ../run-torture-test).
+#
+# Launcher contract (spec 12 + operator decision 2026-07-30):
+#   - Bare invocation: print a warning, the token/wall estimate for the most
+#     comprehensive AVAILABLE tier, usage help, then a visible 32-second
+#     countdown; if not interrupted (Ctrl-C), launch that maximum tier.
+#   - An explicit tier flag skips all ceremony and just runs.
+#   - Exit code is the verdict: 0 green, 1 findings/red, 2 infra failure,
+#     3 not-yet-implemented, 4 usage error.
+set -euo pipefail
+
+TT_BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TT_DIR="$(dirname "$TT_BIN_DIR")"                 # torture-test/
+TT_REPO_ROOT="$(dirname "$TT_DIR")"               # repo root
+export TT_REPO_ROOT
+TT_VAR="$TT_DIR/var"
+
+# Tier registry: name | available(0/1) | est. tokens | est. wall | descr.
+# Availability flips as implementation phases land (A: smoke; D: scripted
+# scenario battery folds INTO smoke; E: tier0; campaigns: tier1/tier2).
+tier_available() {
+  case "$1" in
+    smoke)  [ -x "$TT_BIN_DIR/tt-verify-environment" ] && return 0 || return 1 ;;
+    tier0|tier1|tier2) return 1 ;;   # flipped by later phases
+    *) return 1 ;;
+  esac
+}
+
+tier_info() {
+  case "$1" in
+    smoke) printf '%s|%s|%s\n' "0 tokens"        "minutes"  "zero-token battery: environment gates, scripted scenarios, oracle self-tests" ;;
+    tier0) printf '%s|%s|%s\n' "~2M tokens"      "~3h"      "push gate: delivery corridor + verdict matrix + 1 real bfmw + 1 hermes do-now" ;;
+    tier1) printf '%s|%s|%s\n' "~15M tokens"     "~24-30h"  "MVP campaign: ~40 runs, tt-ts/tt-python/tt-poly-lite" ;;
+    tier2) printf '%s|%s|%s\n' "~50M tokens (65M hard abort)" "~48h" "full campaign: all languages, all workflows, harness duel, storm" ;;
+  esac
+}
+
+max_available_tier() {
+  local t
+  for t in tier2 tier1 tier0 smoke; do
+    if tier_available "$t"; then printf '%s' "$t"; return 0; fi
+  done
+  return 1
+}
+
+usage() {
+  cat <<EOF
+run-torture-test — tamandua torture-test suite (spec: torture-test/tamandua-torture-test-spec/)
+
+Usage: run-torture-test [--smoke | --tier0 | --tier1 | --tier2] [--report] [--help]
+
+Tiers (explicit flag = run immediately, no countdown):
+EOF
+  local t avail info
+  for t in smoke tier0 tier1 tier2; do
+    info="$(tier_info "$t")"
+    if tier_available "$t"; then avail="available"; else avail="NOT YET IMPLEMENTED"; fi
+    printf '  --%-6s %-28s %-9s %s [%s]\n' "$t" \
+      "$(printf '%s' "$info" | cut -d'|' -f1)" \
+      "$(printf '%s' "$info" | cut -d'|' -f2)" \
+      "$(printf '%s' "$info" | cut -d'|' -f3)" \
+      "$avail"
+  done
+  cat <<EOF
+
+  --report   Print the most recent results summary and exit.
+  --help     This help.
+
+Bare invocation (no flags): after a 32s countdown, runs the most
+comprehensive available tier. Ctrl-C during the countdown cancels.
+All state stays under torture-test/var/ (gitignored).
+EOF
+}
+
+report_latest() {
+  local latest
+  latest="$(ls -1dt "$TT_VAR"/results/*/ 2>/dev/null | head -1 || true)"
+  if [ -z "$latest" ]; then
+    echo "No results yet under torture-test/var/results/."
+    return 0
+  fi
+  echo "Latest results: $latest"
+  if [ -f "$latest/report.txt" ]; then cat "$latest/report.txt"; else
+    echo "(no report.txt in it yet; contents:)"; ls -la "$latest"
+  fi
+}
+
+run_tier() {
+  local tier="$1"
+  if ! tier_available "$tier"; then
+    info="$(tier_info "$tier")"
+    echo "Tier '$tier' is not implemented yet ($(printf '%s' "$info" | cut -d'|' -f3))." >&2
+    echo "Implementation status: bd show tamandua-0j7" >&2
+    exit 3
+  fi
+  case "$tier" in
+    smoke)
+      exec "$TT_BIN_DIR/tt-verify-environment"
+      ;;
+    *)
+      echo "internal error: tier '$tier' marked available but has no runner" >&2
+      exit 2
+      ;;
+  esac
+}
+
+countdown_and_run_max() {
+  local max
+  if ! max="$(max_available_tier)"; then
+    echo "No tier is implemented yet. Implementation status: bd show tamandua-0j7" >&2
+    exit 3
+  fi
+  local info; info="$(tier_info "$max")"
+  cat <<EOF
+================================================================
+  TAMANDUA TORTURE TEST
+  About to run the most comprehensive available tier: --$max
+    estimated spend : $(printf '%s' "$info" | cut -d'|' -f1)
+    estimated wall  : $(printf '%s' "$info" | cut -d'|' -f2)
+    what it does    : $(printf '%s' "$info" | cut -d'|' -f3)
+
+  This can take a long time and (for token-bearing tiers) costs
+  real harness tokens. To run a smaller tier instead, Ctrl-C now
+  and re-invoke with an explicit flag:
+      run-torture-test --smoke     (zero tokens)
+      run-torture-test --tier0     (push gate)
+      run-torture-test --tier1     (MVP campaign)
+      run-torture-test --tier2     (full campaign)
+================================================================
+EOF
+  local i
+  for i in $(seq 32 -1 1); do
+    printf '\r  Starting --%s in %2ds  (Ctrl-C to cancel) ' "$max" "$i"
+    sleep 1
+  done
+  printf '\r%-60s\r' ' '
+  echo "Launching --$max"
+  run_tier "$max"
+}
+
+case "${1:-}" in
+  "")        countdown_and_run_max ;;
+  --smoke)   run_tier smoke ;;
+  --tier0)   run_tier tier0 ;;
+  --tier1)   run_tier tier1 ;;
+  --tier2)   run_tier tier2 ;;
+  --report)  report_latest ;;
+  --help|-h) usage ;;
+  *)         echo "Unknown argument: $1" >&2; usage >&2; exit 4 ;;
+esac

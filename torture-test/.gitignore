@@ -1,0 +1,4 @@
+# All torture-test runtime state (TT_HOME, golden bares, working clones,
+# worktrees, results, recorder samples) lives under var/ and is never
+# committed. One line is the whole containment story.
+var/

@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# run-torture-test — top-level launcher for the tamandua torture test.
+# The only torture-test file outside torture-test/; everything else,
+# including all generated state, lives under torture-test/.
+set -euo pipefail
+exec "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/torture-test/bin/tt-run" "$@"
