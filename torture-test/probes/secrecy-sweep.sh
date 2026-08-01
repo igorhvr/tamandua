@@ -20,7 +20,7 @@
 # Exit codes:
 #   0 = clean — no leakage found
 #   1 = leakage found (prints offending repo + evidence)
-#   2 = infra error
+#   2 = infra error (missing golden dir, zero fixtures scanned, etc.)
 #
 # Hard constraints:
 #   - No network access
@@ -32,7 +32,7 @@ set -euo pipefail
 # ── Default golden dir ──
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-DEFAULT_GOLDEN_DIR="$REPO_ROOT/torture-test/var/golden"
+DEFAULT_GOLDEN_DIR="$REPO_ROOT/torture-test/var/fixtures/golden"
 
 # ── Forbidden ref patterns (grep -E regex) ──
 # These patterns match refs that MUST NOT exist in any agent-reachable repo.
@@ -271,6 +271,49 @@ self_test() {
     bare="$(_st_make_bare probes-word 'Space probes are cool instruments')"
     _check_content_wrapped "$bare" probes-word 2>/dev/null && _st_pass || _st_fail
 
+    # Test 9: Empty golden dir → exits 2 with zero-fixtures message
+    # Uses subprocess invocation because infra detection lives in main() before
+    # any per-fixture checks.
+    total=$((total + 1)); echo "[TEST $total] Empty golden dir (--golden-dir) → should exit 2 with zero-fixtures message" >&2
+    local empty_dir="$TEST_TMP/empty-golden"
+    mkdir -p "$empty_dir"
+    local output9
+    if output9="$(bash "$0" --golden-dir "$empty_dir" 2>&1)"; then
+        echo "    expected non-zero exit, got 0" >&2
+        _st_fail
+    else
+        local ec9=$?
+        if [ "$ec9" -ne 2 ]; then
+            echo "    expected exit 2, got $ec9" >&2
+            _st_fail
+        elif echo "$output9" | grep -qi "zero"; then
+            _st_pass
+        else
+            echo "    error message doesn't mention 'zero'" >&2
+            _st_fail
+        fi
+    fi
+
+    # Test 10: Missing golden dir → exits 2 with message naming the missing path
+    total=$((total + 1)); echo "[TEST $total] Missing golden dir (--golden-dir) → should exit 2 with missing-path message" >&2
+    local missing_dir="$TEST_TMP/nonexistent-dir"
+    local output10
+    if output10="$(bash "$0" --golden-dir "$missing_dir" 2>&1)"; then
+        echo "    expected non-zero exit, got 0" >&2
+        _st_fail
+    else
+        local ec10=$?
+        if [ "$ec10" -ne 2 ]; then
+            echo "    expected exit 2, got $ec10" >&2
+            _st_fail
+        elif echo "$output10" | grep -qi "not found"; then
+            _st_pass
+        else
+            echo "    error message doesn't mention 'not found'" >&2
+            _st_fail
+        fi
+    fi
+
     # ── Summary ──
     echo "" >&2
     echo "=== Self-test results: $pass/$total passed ===" >&2
@@ -286,11 +329,9 @@ self_test() {
 # ── Main sweep ──
 main() {
     if [ ! -d "$GOLDEN_DIR" ]; then
-        echo "Golden bares directory not found: $GOLDEN_DIR" >&2
-        echo "This is expected if golden bares haven't been created yet." >&2
-        echo "No leakage found (0 fixtures to scan)." >&2
-        echo "CLEAN: 0 fixtures scanned, 0 leaks found"
-        exit 0
+        echo "INFRA-ERROR: golden bares directory not found: $GOLDEN_DIR" >&2
+        echo "Remedy: build golden bares first (e.g. run build-golden.sh for each fixture)." >&2
+        exit 2
     fi
 
     local total_leaks=0
@@ -323,6 +364,12 @@ main() {
             fi
         fi
     done
+
+    if [ "$fixtures_scanned" -eq 0 ]; then
+        echo "INFRA-ERROR: zero fixtures scanned — golden dir exists ($GOLDEN_DIR) but contains no *.git bare repos." >&2
+        echo "Remedy: build golden bares first (e.g. run build-golden.sh for each fixture)." >&2
+        exit 2
+    fi
 
     echo "" >&2
     echo "=== Secrecy sweep complete ===" >&2
