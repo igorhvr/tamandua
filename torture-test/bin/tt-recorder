@@ -1,0 +1,779 @@
+#!/usr/bin/env bash
+# tt-recorder — process + resource telemetry sampler for the tamandua
+# torture-test suite (spec 12 §tt-recorder).
+#
+# Usage: tt-recorder start|stop|status [--interval <seconds>]
+#
+# Records per-process telemetry samples (ts, pid, pgid, ppid, cwd, cmdline,
+# RSS kB, open-fd count) for tamandua-family processes whose cwd/cmdline
+# evidence ties them to torture-test/var/. Appends JSONL to
+# torture-test/var/recorder/samples-<startedAt>.jsonl.
+#
+# Evidence collection is cmdline/cwd/fd-based, never env-based.
+# Production processes (state under the real ~/.tamandua, ports 33xx)
+# are explicitly OUT of scope.
+set -euo pipefail
+
+# ── path resolution ──────────────────────────────────────────────────
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TT_DIR="$(dirname "$SCRIPT_DIR")"                        # torture-test/
+TT_REPO_ROOT="$(dirname "$TT_DIR")"                      # repo root
+export TT_ROOT="${TT_REPO_ROOT}/torture-test/var"
+
+# Recorder state directory
+RECORDER_DIR="$TT_ROOT/recorder"
+
+# Rotation threshold (50 MB in bytes)
+ROTATION_THRESHOLD=$((50 * 1024 * 1024))
+
+# Default sampling interval (seconds)
+DEFAULT_INTERVAL=5
+
+# ── usage ────────────────────────────────────────────────────────────
+
+usage() {
+  cat <<EOF
+tt-recorder — process + resource telemetry sampler for the tamandua
+torture-test suite.
+
+Usage: tt-recorder <start|stop|status> [--interval <seconds>]
+       tt-recorder --help
+
+Records per-process telemetry (ts, pid, pgid, ppid, cwd, cmdline,
+RSS kB, open-fd count) for tamandua-family processes tied to
+torture-test/var/. Appends JSONL to samples-<startedAt>.jsonl.
+
+Commands:
+  start     Start the recorder in the background (nohup-style).
+            Writes pidfile to var/recorder/tt-recorder.pid.
+            Refuses double-start.
+  stop      Stop the running recorder via evidence-based kill.
+            Removes pidfile after successful stop.
+  status    Report recorder running state, current output file,
+            and sample count.
+
+Options:
+  --interval <seconds>   Sampling interval in seconds (default: $DEFAULT_INTERVAL).
+                         Only meaningful with 'start'.
+
+Recorder behavior:
+  - Every interval: discovers processes whose cwd or cmdline evidence
+    ties them to torture-test/var/ (NEVER name-only matching).
+  - Records: ts (UTC ISO-8601), pid, pgid, ppid, cwd, cmdline,
+    RSS kB, open-fd count.
+  - For TT daemons: additionally records tamandua.db and -wal byte sizes.
+  - Appends JSONL to var/recorder/samples-<startedAt>.jsonl.
+  - Rotates file at 50MB; never buffers more than one interval in memory.
+  - Production processes (state under real ~/.tamandua, ports 33xx)
+    are explicitly excluded.
+
+Examples:
+  tt-recorder start                    # start sampling every 5s
+  tt-recorder start --interval 10      # start sampling every 10s
+  tt-recorder status                   # check if running
+  tt-recorder stop                     # stop the recorder
+  tt-recorder --help                   # this help
+EOF
+}
+
+# Per-subcommand help functions
+
+usage_start() {
+  cat <<EOF
+tt-recorder start — start the recorder in the background.
+
+Usage: tt-recorder start [--interval <seconds>]
+
+Starts the recorder as a detached background process (nohup-style).
+Writes pidfile to var/recorder/tt-recorder.pid. Refuses double-start.
+
+The recorder samples every <interval> seconds and appends one JSON
+object per in-scope process per interval to the output file.
+
+Options:
+  --interval <seconds>   Sampling interval in seconds (default: $DEFAULT_INTERVAL).
+
+Examples:
+  tt-recorder start
+  tt-recorder start --interval 10
+EOF
+}
+
+usage_stop() {
+  cat <<EOF
+tt-recorder stop — stop the running recorder.
+
+Usage: tt-recorder stop
+
+Kills the recorder process after verifying its cmdline is tt-recorder
+(evidence-based — never name-only matching). Removes pidfile after
+successful stop.
+
+Idempotent: if the recorder is not running, exits 0 with a message.
+
+Examples:
+  tt-recorder stop
+EOF
+}
+
+usage_status() {
+  cat <<EOF
+tt-recorder status — report recorder running state.
+
+Usage: tt-recorder status
+
+Reports whether the recorder is running, the current output file path,
+and the sample count.
+
+Examples:
+  tt-recorder status
+EOF
+}
+
+# ── helpers ──────────────────────────────────────────────────────────
+
+# _json_escape — properly escape a string for inclusion in JSON.
+# Handles backslash, double-quote, and all control characters.
+_json_escape() {
+    printf '%s' "$1" | LC_ALL=C sed '
+        s/\\/\\\\/g
+        s/"/\\"/g
+        s/\x0a/\\n/g
+        s/\x0d/\\r/g
+        s/\x09/\\t/g
+        s/\x08/\\b/g
+        s/\x0c/\\f/g
+        s/[\x00-\x07\x0b\x0e-\x1f]/?/g
+    '
+}
+
+# ── production exclusion (US-009) ──────────────────────────────────────
+
+# _resolve_real_home — resolve the REAL user home directory (NOT $HOME,
+# which may be overridden to TT_HOME in test environments).
+#
+# Uses getent first, then eval echo ~, then hard fallback.
+# Can be overridden via TT_REAL_HOME env var for testing.
+_resolve_real_home() {
+    if [ -n "${TT_REAL_HOME:-}" ]; then
+        printf '%s' "$TT_REAL_HOME"
+        return 0
+    fi
+
+    local home
+    home="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6 || true)"
+    if [ -n "$home" ] && [ -d "$home" ]; then
+        printf '%s' "$home"
+        return 0
+    fi
+
+    home="$(eval echo "~$(id -un)" 2>/dev/null || true)"
+    if [ -n "$home" ] && [ -d "$home" ]; then
+        printf '%s' "$home"
+        return 0
+    fi
+
+    printf '%s' "/home/$(id -un)"
+}
+
+# _is_production_cwd — check if a process cwd falls under the real
+# ~/.tamandua (production state), EXCLUDING worktrees which are safe.
+#
+# Args: $1 = process cwd (resolved), $2 = real home path
+# Returns: 0 (true) if production, 1 (false) if safe.
+_is_production_cwd() {
+    local cwd="$1"
+    local real_home="$2"
+    local tamandua_dir="$real_home/.tamandua"
+    local worktrees_dir="$tamandua_dir/worktrees"
+
+    # If cwd is under real ~/.tamandua/worktrees/ — safe (developer checkout)
+    if [[ "$cwd" == "$worktrees_dir" ]] || [[ "$cwd" == "$worktrees_dir"/* ]]; then
+        return 1
+    fi
+
+    # If cwd is under real ~/.tamandua/ but NOT under worktrees/ — production
+    if [[ "$cwd" == "$tamandua_dir" ]] || [[ "$cwd" == "$tamandua_dir"/* ]]; then
+        return 0
+    fi
+
+    return 1
+}
+
+# _is_production_ports — check if a process is listening on production
+# ports 3334, 3338, or 3339 via socket inode matching.
+#
+# Args: $1 = PID
+# Returns: 0 (true) if production port found, 1 (false) if safe.
+#
+# Uses /proc/net/tcp and /proc/<pid>/fd/ symlink targets — evidence-based,
+# never name-only or env-based.
+_is_production_ports() {
+    local pid="$1"
+    local fd_dir="/proc/$pid/fd"
+    [ -d "$fd_dir" ] || return 1
+
+    # Collect socket inodes for production ports from /proc/net/tcp.
+    # Ports in hex: 3334=0D06, 3338=0D0A, 3339=0D0B. State 0A=LISTEN.
+    local prod_inodes
+    prod_inodes="$(awk '
+        $4 == "0A" {
+            split($2, addr, ":")
+            port = addr[length(addr)]
+            if (port == "0D06" || port == "0D0A" || port == "0D0B") {
+                gsub(/\r/, "")
+                print $10
+            }
+        }
+    ' /proc/net/tcp 2>/dev/null)"
+
+    # Also check tcp6
+    prod_inodes="$prod_inodes $(awk '
+        $4 == "0A" {
+            split($2, addr, ":")
+            port = addr[length(addr)]
+            if (port == "0D06" || port == "0D0A" || port == "0D0B") {
+                gsub(/\r/, "")
+                print $10
+            }
+        }
+    ' /proc/net/tcp6 2>/dev/null)"
+
+    # Trim and check if any production sockets exist at all
+    prod_inodes="$(echo $prod_inodes)"
+    [ -z "$prod_inodes" ] && return 1
+
+    # Check PID's fd symlinks for production socket inodes
+    local fd_link target inode pi
+    for fd_link in "$fd_dir"/*; do
+        [ -e "$fd_link" ] || continue
+        target="$(readlink "$fd_link" 2>/dev/null || true)"
+        if [[ "$target" == socket:* ]]; then
+            inode="${target#socket:}"
+            inode="${inode#[}"
+            inode="${inode%]}"
+            for pi in $prod_inodes; do
+                if [ "$inode" = "$pi" ]; then
+                    return 0
+                fi
+            done
+        fi
+    done
+
+    return 1
+}
+
+# ── process discovery (US-002) ────────────────────────────────────────
+
+# _find_pids — discover PIDs of processes tied to TT_ROOT via cwd/cmdline.
+# Uses find and grep for fast kernel-level scanning instead of iterating
+# all /proc entries in bash. Returns a newline-delimited list of PIDs.
+# NEVER uses process-name matching; NEVER reads /proc/<pid>/environ.
+# Per US-009: filters out production processes (real ~/.tamandua, ports 33xx).
+_find_pids() {
+    local tt_root_resolved
+    tt_root_resolved="$(readlink -f "$TT_ROOT" 2>/dev/null || printf '%s' "$TT_ROOT")"
+
+    # Phase 1: collect raw PIDs from cwd and cmdline evidence
+    local raw_pids
+    raw_pids="$(
+        find /proc/[0-9]*/cwd -lname "*/torture-test/var*" 2>/dev/null | \
+            sed 's|.*/proc/\([0-9]*\)/cwd|\1|'
+        grep -rlaF 'torture-test/var' /proc/[0-9]*/cmdline 2>/dev/null | \
+            sed 's|.*/proc/\([0-9]*\)/cmdline|\1|' || true
+    )"
+
+    # Phase 2: deduplicate
+    local pids
+    pids="$(printf '%s' "$raw_pids" | sort -un)"
+
+    # Phase 3: production exclusion filter (US-009)
+    local real_home
+    real_home="$(_resolve_real_home)"
+
+    local pid pid_cwd
+    for pid in $pids; do
+        [ -n "$pid" ] || continue
+        [ -d "/proc/$pid" ] || continue
+
+        pid_cwd="$(readlink -f "/proc/$pid/cwd" 2>/dev/null || true)"
+
+        # Guard 1: cwd under real ~/.tamandua (but not under worktrees/)
+        if [ -n "$pid_cwd" ] && _is_production_cwd "$pid_cwd" "$real_home"; then
+            if [ -n "${TT_RECORDER_VERBOSE:-}" ]; then
+                echo "tt-recorder: excluding production process PID=$pid cwd=$pid_cwd (matches real ~/.tamandua)" >&2
+            fi
+            continue
+        fi
+
+        # Guard 2: process listens on production ports 3334/3338/3339
+        if _is_production_ports "$pid"; then
+            if [ -n "${TT_RECORDER_VERBOSE:-}" ]; then
+                echo "tt-recorder: excluding production process PID=$pid (listens on production port 3334/3338/3339)" >&2
+            fi
+            continue
+        fi
+
+        echo "$pid"
+    done
+}
+
+# discover_processes — scan /proc for tamandua-family processes whose
+# cwd or cmdline evidence ties them to TT_ROOT.
+#
+# Outputs a JSON array of {pid, cwd, cmdline} objects to stdout.
+# Processes with inaccessible /proc entries are silently skipped.
+# NEVER uses process-name matching; NEVER reads /proc/<pid>/environ.
+discover_processes() {
+    local tt_root_resolved
+    tt_root_resolved="$(readlink -f "$TT_ROOT" 2>/dev/null || printf '%s' "$TT_ROOT")"
+
+    local first=true
+    local pid cwd cmdline escaped_cmdline
+
+    printf '['
+
+    # Use _find_pids for fast discovery, then collect details only for matches
+    local pids
+    pids="$(_find_pids | sort -un)"
+
+    for pid in $pids; do
+        [ -n "$pid" ] || continue
+        local pid_dir="/proc/$pid"
+        [ -d "$pid_dir" ] || continue
+
+        # Read cwd symlink target (resolve to canonical path)
+        cwd="$(readlink -f "$pid_dir/cwd" 2>/dev/null || true)"
+        [ -z "$cwd" ] && continue
+
+        # Read cmdline (null-byte separated → space-joined)
+        cmdline="$(tr '\0' ' ' < "$pid_dir/cmdline" 2>/dev/null || true)"
+
+        # Escape for JSON using proper control-char handling
+        escaped_cmdline="$(_json_escape "$cmdline")"
+        escaped_cwd="$(_json_escape "$cwd")"
+
+        # Output JSON object
+        if [ "$first" = true ]; then
+            first=false
+        else
+            printf ','
+        fi
+
+        printf '{"pid":%s,"cwd":"%s","cmdline":"%s"}' \
+            "$pid" "$escaped_cwd" "$escaped_cmdline"
+    done
+
+    printf ']\n'
+}
+
+# ── sample collection (US-003) ──────────────────────────────────────
+
+# collect_sample — collect a single sample of all in-scope processes.
+#
+# Discovers tamandua-family processes whose cwd/cmdline evidence ties
+# them to TT_ROOT, then collects per-process metrics: ts (UTC ISO-8601),
+# pid, pgid, ppid, cwd, cmdline, RSS kB, open-fd count.
+#
+# Outputs JSONL to stdout — one JSON object per process per line.
+# Never reads /proc/<pid>/environ.
+collect_sample() {
+    local ts
+    ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+    local pid cwd cmdline escaped_cmdline stat_content stat_after_comm
+    local ppid pgid rss_kb open_fds rss_line
+
+    # Use _find_pids for fast discovery, then collect details only for matches
+    local pids
+    pids="$(_find_pids | sort -un)"
+
+    for pid in $pids; do
+        [ -n "$pid" ] || continue
+        local pid_dir="/proc/$pid"
+        [ -d "$pid_dir" ] || continue
+
+        # Read cwd symlink target (resolve to canonical path)
+        cwd="$(readlink -f "$pid_dir/cwd" 2>/dev/null || true)"
+        [ -z "$cwd" ] && continue
+
+        # Read cmdline (null-byte separated → space-joined)
+        cmdline="$(tr '\0' ' ' < "$pid_dir/cmdline" 2>/dev/null || true)"
+
+        # Read /proc/<pid>/stat for pgid (field 5) and ppid (field 4).
+        # Format: pid (comm) state ppid pgrp session ...
+        # After the closing ')' of the comm field:
+        #   $1=state  $2=ppid  $3=pgrp
+        stat_content="$(cat "$pid_dir/stat" 2>/dev/null || true)"
+        [ -z "$stat_content" ] && continue
+
+        stat_after_comm="${stat_content#*)}"
+        read -r _state ppid pgid _ <<< "$stat_after_comm"
+
+        ppid="${ppid:-0}"
+        pgid="${pgid:-0}"
+
+        # RSS from /proc/<pid>/status (VmRSS line, value in kB)
+        rss_kb=0
+        rss_line="$(grep '^VmRSS:' "$pid_dir/status" 2>/dev/null || true)"
+        if [ -n "$rss_line" ]; then
+            rss_kb="$(printf '%s' "$rss_line" | awk '{print $2}')"
+        fi
+        rss_kb="${rss_kb:-0}"
+
+        # Open fd count from /proc/<pid>/fd/
+        open_fds=0
+        if [ -d "$pid_dir/fd" ]; then
+            open_fds="$(ls -1 "$pid_dir/fd" 2>/dev/null | wc -l)"
+        fi
+        open_fds="${open_fds:-0}"
+
+        # Escape for JSON using proper control-char handling
+        escaped_cmdline="$(_json_escape "$cmdline")"
+        escaped_cwd="$(_json_escape "$cwd")"
+
+        # Check if this process is a TT daemon and collect db/wal sizes
+        local db_path
+        db_path="$(_detect_daemon_db "$cwd" 2>/dev/null || true)"
+
+        if [ -n "$db_path" ]; then
+            local db_size wal_size wal_path escaped_db_path
+            db_size="$(stat -c%s "$db_path" 2>/dev/null || echo 0)"
+            wal_path="${db_path}-wal"
+            wal_size="$(stat -c%s "$wal_path" 2>/dev/null || echo 0)"
+            db_size="${db_size:-0}"
+            wal_size="${wal_size:-0}"
+            escaped_db_path="$(_json_escape "$db_path")"
+
+            printf '{"ts":"%s","pid":%s,"pgid":%s,"ppid":%s,"cwd":"%s","cmdline":"%s","rss_kb":%s,"open_fds":%s,"db_path":"%s","db_size_bytes":%s,"wal_size_bytes":%s}\n' \
+                "$ts" "$pid" "$pgid" "$ppid" "$escaped_cwd" "$escaped_cmdline" \
+                "$rss_kb" "$open_fds" "$escaped_db_path" "$db_size" "$wal_size"
+        else
+            printf '{"ts":"%s","pid":%s,"pgid":%s,"ppid":%s,"cwd":"%s","cmdline":"%s","rss_kb":%s,"open_fds":%s}\n' \
+                "$ts" "$pid" "$pgid" "$ppid" "$escaped_cwd" "$escaped_cmdline" \
+                "$rss_kb" "$open_fds"
+        fi
+    done
+}
+
+# ── daemon detection (US-005) ────────────────────────────────────────
+
+# _detect_daemon_db — determine if a given process cwd belongs to a TT daemon
+# and return the path to its tamandua.db if one exists at the expected location.
+#
+# Args: $1 = process cwd (resolved canonical path)
+# Output: path to tamandua.db if this is a TT daemon process, empty string otherwise.
+#
+# A process is a TT daemon if its cwd is under TT_ROOT/home/ (real daemon)
+# or TT_ROOT/home-scripted/ (scripted daemon) AND tamandua.db exists at the
+# expected .tamandua directory under that home. Never reads /proc/<pid>/environ.
+_detect_daemon_db() {
+    local cwd="$1"
+    local tt_root_resolved
+    tt_root_resolved="$(readlink -f "$TT_ROOT" 2>/dev/null || printf '%s' "$TT_ROOT")"
+
+    local scripted_home="$tt_root_resolved/home-scripted"
+    local real_home="$tt_root_resolved/home"
+
+    # Check scripted daemon home (check first: /home/ is a prefix of /home-scripted/)
+    if [[ "$cwd" == "$scripted_home" ]] || [[ "$cwd" == "$scripted_home"/* ]]; then
+        local db_path="$scripted_home/.tamandua/tamandua.db"
+        if [ -f "$db_path" ]; then
+            printf '%s' "$db_path"
+            return 0
+        fi
+    fi
+
+    # Check real daemon home
+    if [[ "$cwd" == "$real_home" ]] || [[ "$cwd" == "$real_home"/* ]]; then
+        local db_path="$real_home/.tamandua/tamandua.db"
+        if [ -f "$db_path" ]; then
+            printf '%s' "$db_path"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+# ── output file management (US-004) ──────────────────────────────────
+
+# generate_output_filename — produce output file path from startedAt.
+# Output file: var/recorder/samples-<startedAt_UTC_ISO>.jsonl
+generate_output_filename() {
+    local started_at="$1"
+    printf '%s/samples-%s.jsonl' "$RECORDER_DIR" "$started_at"
+}
+
+# _run_loop — foreground sample collection loop.
+# Writes JSONL samples to the output file every <interval> seconds.
+# Rotates output file when it reaches ROTATION_THRESHOLD bytes (50MB).
+# Never buffers more than one interval in memory — each interval is
+# collected and written immediately to disk.
+_run_loop() {
+    local interval="$1"
+
+    # Trap signals for clean exit (pidfile NOT removed — stop handles that)
+    trap 'exit 0' SIGTERM SIGINT SIGHUP
+
+    mkdir -p "$RECORDER_DIR"
+
+    local started_at
+    started_at="$(date -u +%Y-%m-%dT%H%M%SZ)"
+    local current_file
+    current_file="$(generate_output_filename "$started_at")"
+    local statefile="$RECORDER_DIR/current-state"
+
+    # Write state file for status command (US-008)
+    _write_state() {
+        printf 'startedAt=%s\nfile=%s\n' "$started_at" "$current_file" > "$statefile"
+    }
+    _write_state
+
+    while true; do
+        sleep "$interval"
+
+        # Check rotation: if current file >= threshold, rotate
+        if [ -f "$current_file" ]; then
+            local file_size
+            file_size="$(stat -c%s "$current_file" 2>/dev/null || echo 0)"
+            if [ "$file_size" -ge "$ROTATION_THRESHOLD" ]; then
+                started_at="$(date -u +%Y-%m-%dT%H%M%SZ)"
+                current_file="$(generate_output_filename "$started_at")"
+                _write_state
+            fi
+        fi
+
+        # Collect samples and write immediately (never buffered in memory)
+        collect_sample >> "$current_file" || true
+    done
+}
+
+# ── subcommand stubs (US-006+ implement these) ────────────────────────
+
+cmd_start() {
+  local interval="$1"
+  local pidfile="$RECORDER_DIR/tt-recorder.pid"
+
+  # Check for existing pidfile — refuse double-start
+  if [ -f "$pidfile" ]; then
+    local existing_pid
+    existing_pid="$(cat "$pidfile" 2>/dev/null || true)"
+    if [ -n "$existing_pid" ] && [ -d "/proc/$existing_pid" ]; then
+      # Evidence-based: verify cmdline contains "tt-recorder"
+      local ex_cmdline
+      ex_cmdline="$(tr '\0' ' ' < "/proc/$existing_pid/cmdline" 2>/dev/null || true)"
+      if echo "$ex_cmdline" | grep -q "tt-recorder"; then
+        echo "tt-recorder is already running (PID $existing_pid)" >&2
+        exit 1
+      else
+        # Process is alive but not tt-recorder — pidfile corruption, refuse
+        echo "tt-recorder: pidfile exists but PID $existing_pid is not a tt-recorder process (refusing)" >&2
+        exit 1
+      fi
+    fi
+    # Stale pidfile (process dead) — clean up
+    rm -f "$pidfile"
+  fi
+
+  # Ensure recorder directory exists
+  mkdir -p "$RECORDER_DIR"
+
+  # Detach: setsid to create new session, redirect all fds, background
+  local self_script
+  self_script="$(readlink -f "${BASH_SOURCE[0]}")"
+  setsid /bin/bash -c "source '$self_script'; _run_loop '$interval'" </dev/null &>/dev/null &
+  local bg_pid=$!
+
+  # Store PID in pidfile immediately after detach
+  echo "$bg_pid" > "$pidfile"
+
+  echo "tt-recorder started (PID $bg_pid, interval=${interval}s)"
+}
+
+cmd_stop() {
+  local pidfile="$RECORDER_DIR/tt-recorder.pid"
+
+  # If pidfile does not exist: idempotent exit 0
+  if [ ! -f "$pidfile" ]; then
+    echo "tt-recorder is not running (no pidfile)"
+    exit 0
+  fi
+
+  local pid
+  pid="$(cat "$pidfile" 2>/dev/null || true)"
+
+  # Verify process exists AND its cmdline contains "tt-recorder" (evidence-based)
+  if [ -z "$pid" ] || [ ! -d "/proc/$pid" ]; then
+    # Process dead — stale pidfile
+    rm -f "$pidfile"
+    echo "stale pidfile removed"
+    exit 0
+  fi
+
+  # Evidence-based: verify cmdline contains "tt-recorder"
+  local cmdline
+  cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+  if ! echo "$cmdline" | grep -q "tt-recorder"; then
+    rm -f "$pidfile"
+    echo "stale pidfile removed"
+    exit 0
+  fi
+
+  # Process is verified as tt-recorder — attempt graceful shutdown
+  echo "stopping tt-recorder (PID $pid)..."
+
+  # Send SIGTERM and wait up to 5 seconds
+  kill -TERM "$pid" 2>/dev/null || true
+
+  local waited=0
+  while [ -d "/proc/$pid" ] && [ "$waited" -lt 50 ]; do
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+
+  # If still alive after SIGTERM, escalate to SIGKILL and wait up to 3s
+  if [ -d "/proc/$pid" ]; then
+    kill -KILL "$pid" 2>/dev/null || true
+
+    waited=0
+    while [ -d "/proc/$pid" ] && [ "$waited" -lt 30 ]; do
+      sleep 0.1
+      waited=$((waited + 1))
+    done
+  fi
+
+  # If still alive after both signals: report failure
+  if [ -d "/proc/$pid" ]; then
+    echo "tt-recorder: failed to stop process (PID $pid still alive after SIGTERM + SIGKILL)" >&2
+    exit 1
+  fi
+
+  # Successful kill — remove pidfile and state file
+  rm -f "$pidfile"
+  rm -f "$RECORDER_DIR/current-state"
+  echo "tt-recorder stopped"
+}
+
+cmd_status() {
+  local pidfile="$RECORDER_DIR/tt-recorder.pid"
+  local statefile="$RECORDER_DIR/current-state"
+
+  # Check pidfile and process aliveness (evidence-based, same as start/stop)
+  if [ -f "$pidfile" ]; then
+    local pid
+    pid="$(cat "$pidfile" 2>/dev/null || true)"
+
+    # Evidence-based: verify process is alive AND cmdline contains tt-recorder
+    if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then
+      local cmdline
+      cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+      if echo "$cmdline" | grep -q "tt-recorder"; then
+        # Recorder is running — report status
+        echo "tt-recorder is RUNNING"
+        echo "  PID: $pid"
+
+        # Read state file for output file path and sample count
+        if [ -f "$statefile" ]; then
+          local output_file sample_count
+          output_file="$(grep '^file=' "$statefile" 2>/dev/null | sed 's/^file=//' || true)"
+          echo "  Output: $output_file"
+
+          if [ -n "$output_file" ] && [ -f "$output_file" ]; then
+            sample_count="$(wc -l < "$output_file" 2>/dev/null || echo 0)"
+          else
+            sample_count=0
+          fi
+          echo "  Samples: $sample_count"
+        else
+          echo "  UNKNOWN (no state file)"
+        fi
+        return 0
+      fi
+    fi
+  fi
+
+  # Not running
+  echo "tt-recorder is NOT RUNNING"
+  return 0
+}
+
+# ── main dispatch ────────────────────────────────────────────────────
+
+main() {
+  # --help / -h (standalone — first argument, no subcommand)
+  if [ $# -eq 1 ] && { [ "$1" = "--help" ] || [ "$1" = "-h" ]; }; then
+    usage
+    exit 0
+  fi
+
+  # No arguments: print usage to stderr and exit non-zero
+  if [ $# -eq 0 ]; then
+    usage >&2
+    exit 1
+  fi
+
+  local subcmd="$1"
+  shift
+
+  local interval="$DEFAULT_INTERVAL"
+
+  # Parse remaining arguments
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --help|-h)
+        case "$subcmd" in
+          start)  usage_start ;;
+          stop)   usage_stop ;;
+          status) usage_status ;;
+        esac
+        exit 0
+        ;;
+      --interval)
+        shift
+        if [ $# -eq 0 ]; then
+          echo "tt-recorder: --interval requires a value" >&2
+          exit 1
+        fi
+        if [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -gt 0 ]; then
+          interval="$1"
+        else
+          echo "tt-recorder: --interval requires a positive integer (got: '$1')" >&2
+          exit 1
+        fi
+        ;;
+      *)
+        echo "tt-recorder: unknown option '$1'" >&2
+        usage >&2
+        exit 1
+        ;;
+    esac
+    shift
+  done
+
+  # Dispatch subcommand
+  case "$subcmd" in
+    start)
+      cmd_start "$interval"
+      ;;
+    stop)
+      cmd_stop
+      ;;
+    status)
+      cmd_status
+      ;;
+    *)
+      echo "tt-recorder: unknown subcommand '$subcmd'" >&2
+      echo "Usage: tt-recorder <start|stop|status> [--interval <seconds>]" >&2
+      echo "       tt-recorder --help" >&2
+      exit 1
+      ;;
+  esac
+}
+
+# Only run main if executed directly (not sourced — allows tests to source
+# and call discover_processes).
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
