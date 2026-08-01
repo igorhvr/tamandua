@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+# install-scenario-workflows — install scenario-unique workflow copies into the
+# scripted daemon's env so no two scripted scenarios ever share a workflow id.
+#
+# Usage:
+#   install-scenario-workflows <base-workflow-id> <scenario-id> [--json]
+#
+# Actions:
+#   1. Copies ~/.tamandua/workflows/<base> to ~/.tamandua/workflows/<base>-<scenarioId>
+#   2. Rewrites the workflow.yml id field to <base>-<scenarioId>
+#   3. Outputs a behaviors fragment JSON (one entry per agent) to stdout
+#
+# With --json, outputs the behaviors fragment as compact JSON on stdout.
+# Without --json, outputs the behaviors fragment as human-readable text.
+#
+# The script targets the SCRIPTED daemon's env: TAMANDUA_STATE_DIR from
+# tt-env-scripted.sh is the source of truth for the workflows directory.
+set -euo pipefail
+
+usage() {
+  cat >&2 <<'EOF'
+Usage: install-scenario-workflows <base-workflow-id> <scenario-id> [--json]
+
+  Creates a scenario-unique workflow copy:
+    <base>-<scenarioId>
+
+  The copy lives under the SCRIPTED daemon's TAMANDUA_STATE_DIR (must be set
+  in the environment, e.g. via tt-env-scripted.sh).
+
+  --json   Output the behaviors fragment as compact JSON on stdout.
+EOF
+  exit 2
+}
+
+main() {
+  if [[ $# -lt 2 ]]; then
+    usage
+  fi
+
+  BASE_WORKFLOW="$1"
+  SCENARIO_ID="$2"
+  shift 2
+
+  OUTPUT_JSON=false
+  if [[ $# -gt 0 && "$1" == "--json" ]]; then
+    OUTPUT_JSON=true
+    shift
+  fi
+
+  NEW_ID="${BASE_WORKFLOW}-${SCENARIO_ID}"
+
+  # ── Resolve workflows directory from TAMANDUA_STATE_DIR ──────────
+  if [[ -z "${TAMANDUA_STATE_DIR:-}" ]]; then
+    echo "install-scenario-workflows: TAMANDUA_STATE_DIR is not set" >&2
+    echo "Source tt-env-scripted.sh before running this script." >&2
+    exit 1
+  fi
+
+  WORKFLOWS_DIR="$TAMANDUA_STATE_DIR/workflows"
+
+  # ── Check source exists ──────────────────────────────────────────
+  SRC_DIR="$WORKFLOWS_DIR/$BASE_WORKFLOW"
+  if [[ ! -d "$SRC_DIR" ]]; then
+    echo "install-scenario-workflows: source workflow not found: $SRC_DIR" >&2
+    echo "Run 'tamandua workflow install <base>' or 'tamandua update' first." >&2
+    exit 1
+  fi
+
+  DST_DIR="$WORKFLOWS_DIR/$NEW_ID"
+
+  # ── Copy workflow directory ──────────────────────────────────────
+  if [[ -d "$DST_DIR" ]]; then
+    echo "install-scenario-workflows: destination already exists: $DST_DIR" >&2
+    echo "Remove it first or use a different scenario id." >&2
+    exit 1
+  fi
+
+  cp -a "$SRC_DIR" "$DST_DIR"
+
+  # ── Rewrite workflow.yml id field ────────────────────────────────
+  YML="$DST_DIR/workflow.yml"
+  if [[ ! -f "$YML" ]]; then
+    echo "install-scenario-workflows: workflow.yml not found in $DST_DIR" >&2
+    rm -rf "$DST_DIR"
+    exit 1
+  fi
+
+  # Replace the id: line. We match exactly "id: <BASE_WORKFLOW>" (with optional
+  # trailing whitespace) and replace with "id: <NEW_ID>".
+  sed -i "s/^id: ${BASE_WORKFLOW}[[:space:]]*$/id: ${NEW_ID}/" "$YML"
+
+  # Verify the replacement worked
+  if ! grep -q "^id: ${NEW_ID}[[:space:]]*$" "$YML"; then
+    echo "install-scenario-workflows: failed to rewrite id field in $YML" >&2
+    echo "Expected: id: ${NEW_ID}" >&2
+    echo "Got:" >&2
+    grep '^id:' "$YML" >&2 || echo "  (no id: line found)" >&2
+    rm -rf "$DST_DIR"
+    exit 1
+  fi
+
+  # ── Extract agent IDs from workflow.yml ──────────────────────────
+  # We look for lines matching `  - id: <agentId>` in the agents: section.
+  # This is intentionally simple — we don't parse YAML deeply.
+  AGENT_IDS=()
+  IN_AGENTS=false
+  while IFS= read -r line; do
+    # Detect the agents: section start
+    if [[ "$line" =~ ^agents: ]]; then
+      IN_AGENTS=true
+      continue
+    fi
+    # Detect a new top-level key (ends the agents section)
+    if [[ "$IN_AGENTS" == "true" && "$line" =~ ^[a-z] ]]; then
+      IN_AGENTS=false
+      continue
+    fi
+    # Within the agents section, capture `  - id: <name>` lines
+    if [[ "$IN_AGENTS" == "true" && "$line" =~ ^[[:space:]]+-[[:space:]]+id:[[:space:]]+(.+)$ ]]; then
+      AGENT_IDS+=("${BASH_REMATCH[1]}")
+    fi
+  done < "$YML"
+
+  if [[ ${#AGENT_IDS[@]} -eq 0 ]]; then
+    echo "install-scenario-workflows: no agent IDs found in $YML" >&2
+    rm -rf "$DST_DIR"
+    exit 1
+  fi
+
+  # ── Build behaviors fragment ─────────────────────────────────────
+  # For each agent, produce a key: "<workflowId>_<agentId>" → {}
+  # The {} is an empty behavior — downstream scenarios will fill these in.
+  declare -A BEHAVIORS
+  for agent_id in "${AGENT_IDS[@]}"; do
+    key="${NEW_ID}_${agent_id}"
+    BEHAVIORS["$key"]='{}'
+  done
+
+  if [[ "$OUTPUT_JSON" == "true" ]]; then
+    # Build compact JSON
+    echo -n "{"
+    local first=true
+    for agent_id in "${AGENT_IDS[@]}"; do
+      key="${NEW_ID}_${agent_id}"
+      if [[ "$first" == "true" ]]; then
+        first=false
+      else
+        echo -n ","
+      fi
+      echo -n "\"$key\":${BEHAVIORS[$key]}"
+    done
+    echo "}"
+  else
+    echo "# Behaviors fragment for ${NEW_ID}"
+    echo "# Source: ${BASE_WORKFLOW} (scenario: ${SCENARIO_ID})"
+    echo ""
+    for agent_id in "${AGENT_IDS[@]}"; do
+      key="${NEW_ID}_${agent_id}"
+      echo "# ${key}:"
+      echo "\"$key\": ${BEHAVIORS[$key]}"
+    done
+  fi
+
+  echo "install-scenario-workflows: installed ${NEW_ID} (${#AGENT_IDS[@]} agents)" >&2
+}
+
+main "$@"

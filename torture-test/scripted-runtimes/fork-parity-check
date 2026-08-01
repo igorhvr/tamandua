@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+# fork-parity-check — mechanically diffs the forked scripted runtimes against
+# the e2e-tests/helpers/ originals at FROZEN_SHA, excluding documented knob
+# regions and well-known non-knob baseline changes.
+#
+# Usage:
+#   fork-parity-check                     — check all forked .mjs files
+#   fork-parity-check --verbose           — show filtered diffs for each file
+#   fork-parity-check --verify-perturb    — temporarily perturb a non-knob line
+#                                            to confirm the check FAILS
+#
+# Exit 0 when non-knob regions match.
+# Exit non-zero with diff output when a non-knob line differs from the original
+# AND the difference is not a documented baseline change.
+#
+# Filtering mirrors tests/scripted-runtime-fork.test.ts:
+#   1. KNOB-REGION-BEGIN to KNOB-REGION-END blocks (all content, stateful)
+#   2. ═══ separator lines
+#   3. Import path adjustments (US-001)
+#   4. shortAgent → agentId (US-003)
+#   5. behaviorForInvocation priority (US-003)
+#   6. Relocated block content: no-status, reportBeforeEmit, failThisStep, die-after-claim
+#   7. Fault knob references
+#   8. Baseline path comments
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RUNTIMES_DIR="$SCRIPT_DIR"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+VERBOSE=false
+VERIFY_PERTURB=false
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --verbose) VERBOSE=true; shift ;;
+    --verify-perturb) VERIFY_PERTURB=true; shift ;;
+    *) echo "fork-parity-check: unknown flag: $1" >&2; exit 2 ;;
+  esac
+done
+
+# ── Resolve FROZEN_SHA ────────────────────────────────────────────
+FROZEN_SHA="$(cat "$RUNTIMES_DIR/FROZEN_SHA")"
+if [[ ! "$FROZEN_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "fork-parity-check: invalid FROZEN_SHA: $FROZEN_SHA" >&2
+  exit 2
+fi
+
+if ! git -C "$REPO_ROOT" cat-file -t "$FROZEN_SHA" >/dev/null 2>&1; then
+  echo "fork-parity-check: FROZEN_SHA ($FROZEN_SHA) is not a valid commit" >&2
+  exit 2
+fi
+
+# ── File mapping: original → fork ─────────────────────────────────
+declare -A MAPPING
+MAPPING["e2e-tests/helpers/scripted-agent-runtime.mjs"]="torture-test/scripted-runtimes/runtime-pi.mjs"
+MAPPING["e2e-tests/helpers/scripted-hermes-runtime.mjs"]="torture-test/scripted-runtimes/runtime-hermes.mjs"
+MAPPING["e2e-tests/helpers/scripted-agent-runtime-shared.mjs"]="torture-test/scripted-runtimes/runtime-shared.mjs"
+MAPPING["e2e-tests/helpers/e2e-database.mjs"]="torture-test/scripted-runtimes/database.mjs"
+
+# ── Filter diff to exclude known baseline changes ──────────────────
+#
+# Stateful filter: tracks KNOB-REGION state across diff lines.
+# Lines inside KNOB-REGION-BEGIN/END blocks are always excluded (regardless
+# of content). Lines outside KNOB-REGION blocks are checked against known
+# keyword patterns.
+#
+# Input: raw diff (diff <file1> <file2>)
+# Output: only lines that represent TRUE non-knob drift
+filter_diff() {
+  # Use awk for stateful processing
+  awk '
+    function is_known_keyword(line) {
+      # Strip direction marker
+      sub(/^[<>] /, "", line)
+
+      # Import path adjustments (US-001)
+      if (line ~ /scripted-agent-runtime-shared\.mjs/) return 1
+      if (line ~ /runtime-shared\.mjs/) return 1
+      if (line ~ /e2e-database\.mjs/) return 1
+      if (line ~ /\.\/database\.mjs/) return 1
+
+      # US-003: shortAgent/agentId key changes
+      if (line ~ /shortAgent/) return 1
+      if (line ~ /agentId/) return 1
+
+      # US-003: behaviorForInvocation priority change
+      if (line ~ /behaviorForInvocation/) return 1
+      if (line ~ /backward/) return 1
+      if (line ~ /Full workflowId_agentId/) return 1
+      if (line ~ /Tries shortAgent/) return 1
+
+      # US-004/US-005: fault knob references
+      if (line ~ /provider_error/) return 1
+      if (line ~ /handleProvider/) return 1
+      if (line ~ /oversized_stdout_mb/) return 1
+      if (line ~ /emitOversizedStdout/) return 1
+      if (line ~ /emitMalformedMessageEnd/) return 1
+      if (line ~ /emitMalformedSessionId/) return 1
+      if (line ~ /writeBogusSessionRow/) return 1
+      if (line ~ /scheduleMessageEnd/) return 1
+      if (line ~ /scheduleSessionTrailer/) return 1
+      if (line ~ /maybeExit/) return 1
+      if (line ~ /_exitPending/) return 1
+      if (line ~ /hasKnobs/) return 1
+      if (line ~ /malformed_trailer/) return 1
+      if (line ~ /omit_trailer/) return 1
+      if (line ~ /delayed_trailer_ms/) return 1
+      if (line ~ /NOT-A-UUID/) return 1
+      if (line ~ /scripted-hermes-bogus/) return 1
+
+      # Relocated code blocks (deletions from original)
+      if (line ~ /no-status/) return 1
+      if (line ~ /reportBeforeEmit/) return 1
+      if (line ~ /Real pi event ordering/) return 1
+      if (line ~ /models the window/) return 1
+      if (line ~ /HARNESS_TEARDOWN_GRACE_MS/) return 1
+      if (line ~ /reporting step complete before/) return 1
+      if (line ~ /Default ordering/) return 1
+      if (line ~ /failThisStep/) return 1
+      if (line ~ /die-after-claim/) return 1
+      if (line ~ /Write state\.db/) return 1
+      if (line ~ /tokens even when the harness/) return 1
+      if (line ~ /Baseline path/) return 1
+
+      # Relocated lines common to multiple blocks (deletions only)
+      if ($0 ~ /^< .*emitMessageEnd/) return 1
+      if ($0 ~ /^< .*emitToolAttribution/) return 1
+      if ($0 ~ /^< .*emitOutput\(/) return 1
+      if ($0 ~ /^< .*writeSessionRow\(/) return 1
+      if ($0 ~ /^< .*spawnSync\(/) return 1
+      if ($0 ~ /^< .*process\.exit\(0\)/) return 1
+      if ($0 ~ /^< .*process\.stderr\.write/) return 1
+      if ($0 ~ /^< .*sessionId/) return 1
+      if ($0 ~ /^< .*configuredOutput/) return 1
+      if ($0 ~ /^< .*outputText/) return 1
+
+      return 0
+    }
+
+    # ── Main loop: track KNOB-REGION state ────────────────────────
+    {
+      # Only consider changed lines
+      if (!($0 ~ /^[<>]/)) next
+
+      # Skip empty diff lines (blank additions/deletions are formatting only)
+      stripped = $0; sub(/^[<>] /, "", stripped)
+      if (stripped ~ /^[[:space:]]*$/) next
+
+      # Check for KNOB-REGION markers (state transitions)
+      if ($0 ~ /KNOB-REGION-BEGIN/) { in_knob = 1; next }
+      if ($0 ~ /KNOB-REGION-END/)   { in_knob = 0; next }
+      if ($0 ~ /═══/) next
+
+      # Inside knob region: skip everything
+      if (in_knob) next
+
+      # Outside knob region: check if this is a known keyword diff
+      if (is_known_keyword($0)) next
+
+      # Not a known diff — emit it
+      print
+    }
+  '
+}
+
+RET=0
+DIFFS_FOUND=0
+
+for ORIG_PATH in "${!MAPPING[@]}"; do
+  FORK_PATH="${MAPPING[$ORIG_PATH]}"
+  FORK_ABS="$REPO_ROOT/$FORK_PATH"
+
+  if [[ ! -f "$FORK_ABS" ]]; then
+    echo "fork-parity-check: forked file not found: $FORK_PATH" >&2
+    RET=1
+    continue
+  fi
+
+  # Get original at FROZEN_SHA
+  ORIG_CONTENT="$(git -C "$REPO_ROOT" show "${FROZEN_SHA}:${ORIG_PATH}" 2>/dev/null)" || {
+    echo "fork-parity-check: could not retrieve $ORIG_PATH at $FROZEN_SHA" >&2
+    RET=1
+    continue
+  }
+
+  FORK_CONTENT="$(cat "$FORK_ABS")"
+
+  # Get raw diff and filter
+  RAW_DIFF="$(diff <(echo "$ORIG_CONTENT") <(echo "$FORK_CONTENT") || true)"
+
+  if [[ -z "$RAW_DIFF" ]]; then
+    if [[ "$VERBOSE" == "true" ]]; then
+      echo "OK: $FORK_PATH (byte-identical to original)" >&2
+    fi
+    continue
+  fi
+
+  REAL_DIFFS="$(echo "$RAW_DIFF" | filter_diff)"
+
+  if [[ -n "$REAL_DIFFS" ]]; then
+    RET=1
+    DIFFS_FOUND=$((DIFFS_FOUND + 1))
+    echo "=== DIFF in non-knob regions: $FORK_PATH ===" >&2
+    echo "$REAL_DIFFS" >&2
+  else
+    if [[ "$VERBOSE" == "true" ]]; then
+      echo "OK: $FORK_PATH (non-knob regions match)" >&2
+    fi
+  fi
+done
+
+# ── Verify-perturb: deliberately modify a non-knob line and confirm FAIL ──
+if [[ "$VERIFY_PERTURB" == "true" ]]; then
+  PERTURB_FILE="$REPO_ROOT/torture-test/scripted-runtimes/runtime-shared.mjs"
+  PERTURB_BACKUP="$PERTURB_FILE.perturb-backup"
+  cp "$PERTURB_FILE" "$PERTURB_BACKUP"
+
+  echo "// PERTURBATION: deliberate non-knob modification" >> "$PERTURB_FILE"
+
+  ORIG_CONTENT="$(git -C "$REPO_ROOT" show "${FROZEN_SHA}:e2e-tests/helpers/scripted-agent-runtime-shared.mjs")"
+  FORK_CONTENT="$(cat "$PERTURB_FILE")"
+  RAW_DIFF="$(diff <(echo "$ORIG_CONTENT") <(echo "$FORK_CONTENT") || true)"
+  REAL_DIFFS="$(echo "$RAW_DIFF" | filter_diff)"
+
+  if [[ -n "$REAL_DIFFS" ]]; then
+    echo "fork-parity-check: --verify-perturb PASSED (detected perturbation)" >&2
+  else
+    echo "fork-parity-check: --verify-perturb FAILED (perturbation was NOT detected)" >&2
+    RET=1
+  fi
+
+  mv "$PERTURB_BACKUP" "$PERTURB_FILE"
+fi
+
+if [[ $RET -eq 0 ]]; then
+  echo "fork-parity-check: all ${#MAPPING[@]} files passed (non-knob regions match FROZEN_SHA)" >&2
+else
+  echo "fork-parity-check: $DIFFS_FOUND file(s) have non-knob drift from FROZEN_SHA" >&2
+fi
+
+exit $RET

@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# scripted-hermes — wrapper for the scripted hermes runtime.
+#
+# Resolves the runtime .mjs file and execs it via an absolute node path.
+# The daemon's PATH is not guaranteed, so we embed the absolute path to the
+# node binary discovered at build time.
+#
+# Override: set TT_NODE_BIN to a different node binary.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RUNTIME_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# ── Node resolution (absolute path required — daemon PATH is not guaranteed) ──
+NODE_BIN="${TT_NODE_BIN:-/home/igorhvr/.volta/tools/image/node/24.18.0/bin/node}"
+
+if [[ ! -x "$NODE_BIN" ]]; then
+  echo "scripted-hermes: node binary not found at $NODE_BIN" >&2
+  echo "Set TT_NODE_BIN to the absolute path of the node binary." >&2
+  exit 1
+fi
+
+exec "$NODE_BIN" "$RUNTIME_DIR/runtime-hermes.mjs" "$@"

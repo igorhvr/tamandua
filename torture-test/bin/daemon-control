@@ -135,6 +135,14 @@ env_for_kind() {
       exit 2
       ;;
   esac
+  # Forward additional env vars from the caller's environment — these
+  # are per-scenario knobs not baked into the static env scripts.
+  for v in TAMANDUA_SCRIPTED_BEHAVIORS TAMANDUA_SCRIPTED_STATE; do
+    local val="${!v:-}"
+    if [ -n "$val" ]; then
+      printf '%s=%s\n' "$v" "$val"
+    fi
+  done
 }
 
 # run_under_env: runs a command under the spawn env for the given kind.

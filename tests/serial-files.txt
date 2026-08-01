@@ -125,6 +125,13 @@ tests/run-terminal-token-events.test.ts
 tests/run-token-migration.test.ts
 tests/runner-scripts.test.ts
 tests/sample-project-fixture.test.ts
+tests/scripted-runtime-behaviors.test.ts
+tests/scripted-runtime-binding-proof.test.ts
+tests/scripted-runtime-fault-knobs-hermes.test.ts
+tests/scripted-runtime-fault-knobs.test.ts
+tests/scripted-runtime-fork.test.ts
+tests/scripted-runtime-install-parity.test.ts
+tests/scripted-runtime-wrappers.test.ts
 tests/step-ops-dispatch-races.test.ts
 tests/step-ops-tstx-pq-shell.test.ts
 tests/step-ops.test.ts
