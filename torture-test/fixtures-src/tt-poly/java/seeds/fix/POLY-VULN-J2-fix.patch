@@ -1,0 +1,211 @@
+diff --git a/torture-test/fixtures-src/tt-poly/java/src/main/java/com/tamandua/ledger/ExportService.java b/torture-test/fixtures-src/tt-poly/java/src/main/java/com/tamandua/ledger/ExportService.java
+index d55dc59..31ef4bc 100644
+--- a/torture-test/fixtures-src/tt-poly/java/src/main/java/com/tamandua/ledger/ExportService.java
++++ b/torture-test/fixtures-src/tt-poly/java/src/main/java/com/tamandua/ledger/ExportService.java
+@@ -3,6 +3,7 @@ package com.tamandua.ledger;
+ import java.io.FileWriter;
+ import java.io.IOException;
+ import java.io.PrintWriter;
++import java.nio.file.Path;
+ import java.util.List;
+ import java.util.logging.Logger;
+ 
+@@ -13,13 +14,10 @@ import java.util.logging.Logger;
+  * LedgerService, or any test. It exists as a security vulnerability seed
+  * (VULN-J2: path traversal in file export).</p>
+  *
+- * <p>The baseline implementation writes entries to a user-supplied filename
+- * using {@code new FileWriter(filename)} without any path validation. A
+- * path traversal attack like {@code ../../etc/passwd} can overwrite
+- * arbitrary files on the system.</p>
++ * <p>The secure version validates that the canonical path of the target
++ * file is within an allowed export directory.</p>
+  *
+- * <p>The fix (VULN-J2-fix.patch) validates that the canonical path of the
+- * target file is within an allowed export directory.</p>
++ * <p>The fix (VULN-J2-fix.patch) adds path traversal validation.</p>
+  */
+ public final class ExportService {
+ 
+@@ -34,15 +32,15 @@ public final class ExportService {
+      *
+      * <p>Each entry is written as a JSON-like line for simplicity.</p>
+      *
+-     * <p><strong>VULN-J2:</strong> The filename is used directly without
+-     * path validation. A caller can supply a relative path with
+-     * {@code ../} segments to escape the working directory and overwrite
+-     * arbitrary files (e.g., {@code ../../etc/passwd} or
+-     * {@code ../../../home/user/.bashrc}).</p>
++     * <p>The target file is validated to ensure it resides within the
++     * allowed export directory ({@code exports/} under the current working
++     * directory). Path traversal attacks using {@code ../} segments are
++     * rejected.</p>
+      *
+      * @param entries  the entries to export (must not be null, may be empty)
+-     * @param filename the target filename (may contain path traversal segments)
++     * @param filename the target filename (must be within the allowed export directory)
+      * @throws IOException if writing fails
++     * @throws SecurityException if the target path escapes the export directory
+      */
+     public static void exportToFile(List<LedgerEntry> entries, String filename) throws IOException {
+         if (entries == null) {
+@@ -52,9 +50,22 @@ public final class ExportService {
+             throw new IllegalArgumentException("filename must not be null");
+         }
+ 
++        // VULN-J2 fix: validate that the target path is within the allowed export directory
++        Path exportDir = Path.of(System.getProperty("user.dir"), "exports").toRealPath();
++        Path target = Path.of(filename).toAbsolutePath().normalize();
++
++        // Create exports directory on-demand for convenience
++        java.nio.file.Files.createDirectories(exportDir);
++
++        if (!target.startsWith(exportDir)) {
++            throw new SecurityException(
++                    "Path traversal detected: '" + filename + "' resolves to '" + target
++                            + "', which is outside the allowed export directory '" + exportDir + "'");
++        }
++
+         LOG.info("Exporting " + entries.size() + " entries to " + filename);
+ 
+-        try (PrintWriter writer = new PrintWriter(new FileWriter(filename))) {
++        try (PrintWriter writer = new PrintWriter(new FileWriter(target.toFile()))) {
+             for (LedgerEntry e : entries) {
+                 writer.printf("{\"id\":\"%s\",\"date\":\"%s\",\"description\":\"%s\",\"amount\":%s,\"category\":\"%s\"}%n",
+                         e.getId(), e.getDate(), e.getDescription(), e.getAmount(), e.getCategory());
+diff --git a/torture-test/fixtures-src/tt-poly/java/src/test/java/com/tamandua/ledger/ExportServiceTest.java b/torture-test/fixtures-src/tt-poly/java/src/test/java/com/tamandua/ledger/ExportServiceTest.java
+new file mode 100644
+index 0000000..542f893
+--- /dev/null
++++ b/torture-test/fixtures-src/tt-poly/java/src/test/java/com/tamandua/ledger/ExportServiceTest.java
+@@ -0,0 +1,130 @@
++package com.tamandua.ledger;
++
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++
++import java.io.IOException;
++import java.math.BigDecimal;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.time.LocalDate;
++import java.util.ArrayList;
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.*;
++
++/**
++ * Tests for ExportService.
++ *
++ * <p>These tests verify that the VULN-J2 fix properly prevents path
++ * traversal attacks in file export. The tests are added by the VULN-J2
++ * fix patch.</p>
++ */
++class ExportServiceTest {
++
++    private Path exportDir;
++    private Path testFile;
++
++    @BeforeEach
++    void setUp() throws IOException {
++        // Create the exports directory used by ExportService
++        exportDir = Path.of(System.getProperty("user.dir"), "exports");
++        Files.createDirectories(exportDir);
++        testFile = exportDir.resolve("test-export.jsonl");
++    }
++
++    @AfterEach
++    void tearDown() throws IOException {
++        // Clean up test files in exports directory
++        if (Files.exists(testFile)) {
++            Files.delete(testFile);
++        }
++    }
++
++    private List<LedgerEntry> sampleEntries() {
++        List<LedgerEntry> entries = new ArrayList<>();
++        entries.add(LedgerEntry.create(
++                LocalDate.of(2025, 1, 15), "Groceries",
++                new BigDecimal("100.50"), "food"));
++        entries.add(LedgerEntry.create(
++                LocalDate.of(2025, 1, 16), "Salary",
++                new BigDecimal("5000.00"), "income"));
++        return entries;
++    }
++
++    @Test
++    @DisplayName("export entries to a file in the allowed directory")
++    void exportToAllowedDirectory() throws IOException {
++        List<LedgerEntry> entries = sampleEntries();
++        String filename = testFile.toString();
++
++        assertDoesNotThrow(() -> ExportService.exportToFile(entries, filename),
++                "Export to allowed directory should not throw");
++
++        assertTrue(Files.exists(testFile), "Export file should exist");
++        String content = Files.readString(testFile);
++        assertTrue(content.contains("Groceries"));
++        assertTrue(content.contains("Salary"));
++    }
++
++    @Test
++    @DisplayName("export empty list creates file")
++    void exportEmptyList() throws IOException {
++        List<LedgerEntry> empty = List.of();
++        String filename = testFile.toString();
++
++        assertDoesNotThrow(() -> ExportService.exportToFile(empty, filename));
++        assertTrue(Files.exists(testFile));
++    }
++
++    @Test
++    @DisplayName("regression VULN-J2: path traversal is rejected")
++    void regressionVulnJ2PathTraversalRejected() {
++        List<LedgerEntry> entries = sampleEntries();
++
++        // Attempt to escape the exports directory via relative path traversal
++        String traversalPath = exportDir.resolve("../../../etc/passwd").toString();
++
++        SecurityException ex = assertThrows(SecurityException.class,
++                () -> ExportService.exportToFile(entries, traversalPath),
++                "VULN-J2: path traversal should be detected and rejected");
++
++        assertTrue(ex.getMessage().contains("Path traversal"),
++                "Exception message should mention 'Path traversal'");
++        assertTrue(ex.getMessage().contains("outside the allowed export directory"),
++                "Exception message should explain the constraint");
++    }
++
++    @Test
++    @DisplayName("regression VULN-J2: simple relative traversal with ../ is rejected")
++    void regressionVulnJ2RelativeTraversalRejected() {
++        List<LedgerEntry> entries = sampleEntries();
++
++        // Use a simple "../" relative path
++        String traversalPath = "../etc/critical-file";
++
++        SecurityException ex = assertThrows(SecurityException.class,
++                () -> ExportService.exportToFile(entries, traversalPath),
++                "VULN-J2: relative path traversal with '../' should be rejected");
++
++        assertTrue(ex.getMessage().contains("Path traversal"),
++                "Exception message should mention 'Path traversal'");
++    }
++
++    @Test
++    @DisplayName("null entries throws IllegalArgumentException")
++    void nullEntriesThrows() {
++        assertThrows(IllegalArgumentException.class,
++                () -> ExportService.exportToFile(null, testFile.toString()));
++    }
++
++    @Test
++    @DisplayName("null filename throws IllegalArgumentException")
++    void nullFilenameThrows() {
++        List<LedgerEntry> entries = sampleEntries();
++        assertThrows(IllegalArgumentException.class,
++                () -> ExportService.exportToFile(entries, null));
++    }
++}

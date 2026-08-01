@@ -1,0 +1,13 @@
+--- pool_test.go
++++ pool_test.go
+@@ -81,9 +81,8 @@
+ 	if r.Value != "hello" {
+ 		t.Errorf("expected Value=hello, got %v", r.Value)
+ 	}
+-	// BROKEN: inverted assertion — expects error when err IS nil
+-	if r.Err == nil {
+-		t.Errorf("expected error but got nil")
++	if r.Err != nil {
++		t.Errorf("expected nil error, got %v", r.Err)
+ 	}
+ }

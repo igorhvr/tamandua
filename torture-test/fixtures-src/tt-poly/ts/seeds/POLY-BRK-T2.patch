@@ -1,0 +1,13 @@
+diff --git a/torture-test/fixtures-src/tt-poly/ts/src/server.test.ts b/torture-test/fixtures-src/tt-poly/ts/src/server.test.ts
+index 47ca4db..3c69a91 100644
+--- a/torture-test/fixtures-src/tt-poly/ts/src/server.test.ts
++++ b/torture-test/fixtures-src/tt-poly/ts/src/server.test.ts
+@@ -91,7 +91,7 @@ describe('Server API', () => {
+         category: 'Food',
+       });
+ 
+-      assert.strictEqual(status, 201);
++      assert.strictEqual(status, 200);
+       const expense = data as Record<string, unknown>;
+       assert.strictEqual(expense.description, 'Groceries');
+       assert.strictEqual(expense.amount, 45.50);

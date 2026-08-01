@@ -1,0 +1,7 @@
+# Build output
+dist/
+
+# NOTE: package-lock.json and node_modules/ are deliberately NOT
+# gitignored — they serve as junk probes for the tamandua torture
+# test suite. DO NOT add them to this file.
+# See README-JUNK.md for details.

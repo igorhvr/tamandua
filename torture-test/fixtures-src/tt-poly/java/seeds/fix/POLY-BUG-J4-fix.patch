@@ -1,0 +1,31 @@
+diff --git a/torture-test/fixtures-src/tt-poly/java/src/main/java/com/tamandua/ledger/LedgerService.java b/torture-test/fixtures-src/tt-poly/java/src/main/java/com/tamandua/ledger/LedgerService.java
+index f4d6e20..1c40cf5 100644
+--- a/torture-test/fixtures-src/tt-poly/java/src/main/java/com/tamandua/ledger/LedgerService.java
++++ b/torture-test/fixtures-src/tt-poly/java/src/main/java/com/tamandua/ledger/LedgerService.java
+@@ -98,22 +98,11 @@ public final class LedgerService {
+     public static Map<String, BigDecimal> getCategoryTotals(List<LedgerEntry> entries) {
+         Map<String, BigDecimal> totals = new TreeMap<>();
+         List<LedgerEntry> safe = (entries != null) ? entries : Collections.emptyList();
+-        // BUG: O(n^2) — for each entry, scan all entries to sum its category
+-        for (int i = 0; i < safe.size(); i++) {
+-            LedgerEntry e = safe.get(i);
++        for (LedgerEntry e : safe) {
+             String cat = e.getCategory();
+-            if (cat == null) continue;
+-            BigDecimal sum = BigDecimal.ZERO;
+-            for (int j = 0; j < safe.size(); j++) {
+-                LedgerEntry e2 = safe.get(j);
+-                if (cat.equals(e2.getCategory())) {
+-                    BigDecimal amt = e2.getAmount();
+-                    if (amt != null) {
+-                        sum = sum.add(amt);
+-                    }
+-                }
+-            }
+-            totals.put(cat, sum);
++            BigDecimal amt = e.getAmount();
++            if (cat == null || amt == null) continue;
++            totals.merge(cat, amt, MoneyUtils::add);
+         }
+         return totals;
+     }

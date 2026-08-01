@@ -1,0 +1,13 @@
+--- pool_test.go
++++ pool_test.go
+@@ -256,9 +256,8 @@
+ 	p.Shutdown()
+ 	results := collectResults(p)
+ 
+-	// BROKEN: off-by-one — expects N-1 results instead of N
+-	if len(results) != n-1 {
+-		t.Errorf("expected %d results, got %d", n-1, len(results))
++	if len(results) != n {
++		t.Errorf("expected %d results, got %d", n, len(results))
+ 	}
+ }

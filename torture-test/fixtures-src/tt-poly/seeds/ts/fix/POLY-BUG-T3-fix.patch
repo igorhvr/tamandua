@@ -1,0 +1,15 @@
+diff --git b/torture-test/fixtures-src/tt-poly/ts/src/store.ts a/torture-test/fixtures-src/tt-poly/ts/src/store.ts
+index c1fcf47..facf999 100644
+--- b/torture-test/fixtures-src/tt-poly/ts/src/store.ts
++++ a/torture-test/fixtures-src/tt-poly/ts/src/store.ts
+@@ -36,9 +36,8 @@ export class InMemoryStore {
+     if (index === -1) return undefined;
+ 
+     const existing = this.#expenses[index];
+-    this.#expenses.splice(index, 1);
+     const updated: Expense = { ...existing, ...updates };
+-    this.#expenses.push(updated); // BUG: corrupts ordering
++    this.#expenses[index] = updated;
+     return updated;
+   }
+ 

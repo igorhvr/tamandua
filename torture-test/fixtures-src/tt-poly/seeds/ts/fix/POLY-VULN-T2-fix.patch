@@ -1,0 +1,20 @@
+diff --git a/torture-test/fixtures-src/tt-poly/ts/src/server.ts b/torture-test/fixtures-src/tt-poly/ts/src/server.ts
+index d8c6682..ac829a7 100644
+--- a/torture-test/fixtures-src/tt-poly/ts/src/server.ts
++++ b/torture-test/fixtures-src/tt-poly/ts/src/server.ts
+@@ -182,8 +182,13 @@ export function startServer(port: number) {
+         return;
+       }
+ 
+-      // VULN-T2: Object.assign with unsanitized user input — dormant in green baseline
+-      const updates = Object.assign({}, body as Record<string, unknown>);
++      // POLY-VULN-T2 fixed: safe property assignment skipping __proto__, constructor, prototype
++      const bodyObj = body as Record<string, unknown>;
++      const updates: Record<string, unknown> = {};
++      for (const key of Object.keys(bodyObj)) {
++        if (key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
++        updates[key] = bodyObj[key];
++      }
+ 
+       // Validate optional fields if provided
+       if ('description' in updates && (typeof updates.description !== 'string' || (updates.description as string).trim().length === 0)) {

@@ -1,0 +1,16 @@
+--- a/src/schedlib/recurrence.py
++++ b/src/schedlib/recurrence.py
+@@ -73,13 +73,6 @@
+         gen_count = 0
+         max_count_val: int = self.count if self.count is not None else -1
+ 
+-        # BUG-P1: off-by-one error — when both count and until are set,
+-        # the effective count is reduced by one. This causes recurrence
+-        # rules like weekly(count=52, until=<end-of-year>) to produce
+-        # 51 occurrences instead of 52 for a full year.
+-        if max_count_val > 0 and self.until is not None:
+-            max_count_val -= 1
+-
+         # Find the first matching date >= dtstart
+         current = dtstart
+         while current <= dtend:

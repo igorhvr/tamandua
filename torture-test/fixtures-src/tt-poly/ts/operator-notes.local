@@ -1,0 +1,24 @@
+# operator-notes.local — inert operator junk probe (spec 02)
+#
+# This file is deliberately planted in the fixture and must NEVER be
+# modified by any tool, agent, or test runner. It must stay byte-identical
+# across the entire torture-test campaign.
+#
+# The 1-min sampler hashes this file; transient delete-and-restore is in
+# scope. Any drift triggers an oracle finding.
+#
+# Content below is stable — do not edit.
+###############################################################################
+Operator Notes — tt-poly ts/ Subtree
+Date planted: 2026-08-01
+Fixture version: 0.1.0
+
+Quick reference:
+  - Bootstrap:        npm install
+  - Run tests:        npm test
+  - Baseline:         GREEN (~24 tests)
+  - Node:             >= 18
+  - STORM-SENTINEL:   4a7f2e9b1c6d8 (ts/src/store.ts line 18)
+
+Known local quirks on this host: none recorded.
+###############################################################################

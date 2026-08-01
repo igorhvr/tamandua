@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# run-all-tests — execute all five language test suites for tt-poly.
+#
+# Requirements: python3, node, go, cargo (on PATH via nix), JAVA_HOME.
+# Target wall time: < 10 minutes for the full suite.
+#
+# The script bootstraps python/ and ts/ subtrees on first run and exits
+# non-zero if any suite fails.  Each suite failure sets OVERALL_EXIT=1
+# but continues to the next suite so all results are visible.
+
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+OVERALL_EXIT=0
+
+# --- colours (optional) ---
+if [ -t 1 ]; then
+    BOLD='\033[1m'
+    GREEN='\033[0;32m'
+    RED='\033[0;31m'
+    NC='\033[0m'  # no colour
+else
+    BOLD='' GREEN='' RED='' NC=''
+fi
+
+banner() {
+    printf "\n%b%s%b\n" "${BOLD}" "$*" "${NC}"
+}
+
+pass_msg() {
+    printf "  %bPASS%b  %s\n" "${GREEN}" "${NC}" "$*"
+}
+fail_msg() {
+    printf "  %bFAIL%b  %s\n" "${RED}" "${NC}" "$*"
+}
+
+# ── python/ ────────────────────────────────────────────────────────────
+banner "[python/] tt-poly python suite"
+
+if [ ! -d "$ROOT_DIR/python/.venv" ]; then
+    echo "  bootstrapping python subtree..."
+    bash "$ROOT_DIR/python/bootstrap"
+fi
+
+if (cd "$ROOT_DIR/python" && .venv/bin/pytest -q --tb=short); then
+    pass_msg "python suite"
+else
+    fail_msg "python suite"
+    OVERALL_EXIT=1
+fi
+
+# ── ts/ ────────────────────────────────────────────────────────────────
+banner "[ts/] tt-poly typescript suite"
+
+if [ ! -d "$ROOT_DIR/ts/node_modules" ]; then
+    echo "  bootstrapping ts subtree..."
+    (cd "$ROOT_DIR/ts" && npm install --no-audit --no-fund)
+fi
+
+if (cd "$ROOT_DIR/ts" && npm test); then
+    pass_msg "ts suite"
+else
+    fail_msg "ts suite"
+    OVERALL_EXIT=1
+fi
+
+# ── go/ ────────────────────────────────────────────────────────────────
+banner "[go/] tt-poly go suite"
+
+if (cd "$ROOT_DIR/go" && go test ./...); then
+    pass_msg "go suite"
+else
+    fail_msg "go suite"
+    OVERALL_EXIT=1
+fi
+
+# ── rust/ ──────────────────────────────────────────────────────────────
+banner "[rust/] tt-poly rust suite"
+
+if (cd "$ROOT_DIR/rust" && cargo test --quiet); then
+    pass_msg "rust suite"
+else
+    fail_msg "rust suite"
+    OVERALL_EXIT=1
+fi
+
+# ── java/ ──────────────────────────────────────────────────────────────
+banner "[java/] tt-poly java suite"
+
+if [ -z "${JAVA_HOME:-}" ]; then
+    echo "  ERROR: JAVA_HOME is not set. Set JAVA_HOME to a JDK installation."
+    fail_msg "java suite (JAVA_HOME not set)"
+    OVERALL_EXIT=1
+elif [ ! -d "$JAVA_HOME" ]; then
+    echo "  ERROR: JAVA_HOME ($JAVA_HOME) does not exist."
+    fail_msg "java suite (JAVA_HOME not found)"
+    OVERALL_EXIT=1
+else
+    if (cd "$ROOT_DIR/java" && ./mvnw -q -B test); then
+        pass_msg "java suite"
+    else
+        fail_msg "java suite"
+        OVERALL_EXIT=1
+    fi
+fi
+
+# ── summary ────────────────────────────────────────────────────────────
+echo ""
+if [ "$OVERALL_EXIT" -eq 0 ]; then
+    printf "%bALL SUITES PASSED%b\n" "${GREEN}${BOLD}" "${NC}"
+else
+    printf "%bONE OR MORE SUITES FAILED%b\n" "${RED}${BOLD}" "${NC}"
+fi
+
+exit $OVERALL_EXIT

@@ -1,0 +1,88 @@
+--- src/util_unsafe.rs
++++ src/util_unsafe.rs
+@@ -11,30 +11,26 @@
+ 
+ #![allow(dead_code)]
+ 
+-/// Access the element at `index` in `data` using unsafe pointer arithmetic.
++/// Access the element at `index` in `data` using safe indexing.
+ ///
+-/// # Safety (VULN-R1 — deliberately unsafe)
+-///
+-/// This function performs **no** bounds checking.  If `index` is
+-/// out-of-bounds the behaviour is undefined — Rust guarantees nothing,
+-/// and the compiler is free to assume this never happens.
+-pub fn get_unchecked(data: &[i32], index: usize) -> i32 {
+-    let ptr = data.as_ptr();
+-    // SAFETY: caller must ensure `index` < data.len().
+-    // This function does NOT check — it relies on the caller.
+-    unsafe { *ptr.add(index) }
++/// Returns `Some(&value)` when `index` is in bounds, `None` otherwise.
++/// The unsafe pointer arithmetic has been replaced with safe indexing.
++pub fn get_unchecked(data: &[i32], index: usize) -> Option<&i32> {
++    data.get(index)
+ }
+ 
+-/// Set the element at `index` in `data` using unsafe pointer arithmetic.
+-///
+-/// # Safety (VULN-R1 — deliberately unsafe)
++/// Set the element at `index` in `data` using safe indexing.
+ ///
+-/// Same as `get_unchecked`: no bounds checking, UB on OOB access.
+-pub fn set_unchecked(data: &mut [i32], index: usize, value: i32) {
+-    let ptr = data.as_mut_ptr();
+-    // SAFETY: caller must ensure `index` < data.len().
+-    // This function does NOT check — it relies on the caller.
+-    unsafe { *ptr.add(index) = value }
++/// Returns `Ok(())` when `index` is in bounds, `Err(())` otherwise.
++/// The unsafe pointer arithmetic has been replaced with safe indexing.
++pub fn set_unchecked(data: &mut [i32], index: usize, value: i32) -> Result<(), ()> {
++    match data.get_mut(index) {
++        Some(entry) => {
++            *entry = value;
++            Ok(())
++        }
++        None => Err(()),
++    }
+ }
+ 
+ #[cfg(test)]
+@@ -44,8 +40,24 @@
+     #[test]
+     fn get_unchecked_in_bounds() {
+         let data = [10, 20, 30];
+-        assert_eq!(get_unchecked(&data, 0), 10);
+-        assert_eq!(get_unchecked(&data, 2), 30);
++        assert_eq!(get_unchecked(&data, 0), Some(&10));
++        assert_eq!(get_unchecked(&data, 2), Some(&30));
++    }
++
++    #[test]
++    fn get_unchecked_out_of_bounds() {
++        let data = [10, 20, 30];
++        assert_eq!(get_unchecked(&data, 3), None);
++        assert_eq!(get_unchecked(&data, 100), None);
++    }
++
++    #[test]
++    fn set_unchecked_out_of_bounds() {
++        let mut data = [1, 2, 3];
++        // Out-of-bounds set should return Err.
++        assert!(set_unchecked(&mut data, 3, 99).is_err());
++        // Data unchanged.
++        assert_eq!(data, [1, 2, 3]);
+     }
+ 
+     #[test]
+@@ -53,5 +65,11 @@
+         let mut data = [1, 2, 3];
+         set_unchecked(&mut data, 1, 99);
+         assert_eq!(data[1], 99);
++        // Verify it returns Ok for in-bounds.
++        assert!(set_unchecked(&mut data, 0, 7).is_ok());
++        assert_eq!(data[0], 7);
+     }
+ }
++
++// VULN-R1 fix: replaced unsafe pointer arithmetic with safe get/get_mut.
++// Bounds-checked access returning Option/Result — no more undefined behavior.

@@ -1,0 +1,80 @@
+diff --git a/python/src/schedlib/integrations.py b/python/src/schedlib/integrations.py
+index c05bc5d..a6b2b18 100644
+--- a/python/src/schedlib/integrations.py
++++ b/python/src/schedlib/integrations.py
+@@ -96,10 +96,8 @@ def lookup_calendar_name(calendar_id: int) -> dict:
+ 
+     Cross-language integration point — the TypeScript ``server.ts``
+     consumes the dict returned by this function via a test-only bridge.
+-    The contract is ``{"name": str, "id": int}`` but POLY-BUG-A5
+-    simultaneously renames the keys in both subtrees.
++    The contract is ``{"name": str, "id": int}``.
+ 
+     Imported by ``tests/test_calendar_integration.py`` for verification.
+     """
+-    # POLY-BUG-A5: wrong key names — should be "name" and "id"
+-    return {"calendar_name": f"Calendar-{calendar_id}", "calendar_id": calendar_id}
++    return {"name": f"Calendar-{calendar_id}", "id": calendar_id}
+diff --git a/python/tests/test_calendar_integration.py b/python/tests/test_calendar_integration.py
+index 860717a..e70e40a 100644
+--- a/python/tests/test_calendar_integration.py
++++ b/python/tests/test_calendar_integration.py
+@@ -5,28 +5,22 @@ Verifies the ``lookup_calendar_name()`` contract used by the TypeScript
+ for POLY-BUG-A5: the seed simultaneously changes key names in both
+ ``integrations.py`` and ``server.ts``, and fixing only one subtree
+ leaves the other broken.
+-
+-POLY-BUG-A5 seed state: keys are ``calendar_name`` / ``calendar_id``
+-instead of the baseline ``name`` / ``id``.
+ """
+ 
+ from schedlib.integrations import lookup_calendar_name
+ 
+ 
+ def test_lookup_calendar_name_contract() -> None:
+-    """Verify that lookup_calendar_name returns the expected contract keys.
+-
+-    POLY-BUG-A5: keys are calendar_name / calendar_id (seed state).
+-    """
++    """Verify that lookup_calendar_name returns the expected contract keys."""
+     result = lookup_calendar_name(42)
+-    assert result == {"calendar_name": "Calendar-42", "calendar_id": 42}
++    assert result == {"name": "Calendar-42", "id": 42}
+ 
+ 
+ def test_lookup_calendar_name_different_ids() -> None:
+     """Verify contract holds for multiple calendar IDs."""
+     for cid in (1, 7, 999):
+         result = lookup_calendar_name(cid)
+-        assert "calendar_name" in result, f"key 'calendar_name' missing for id={cid}"
+-        assert "calendar_id" in result, f"key 'calendar_id' missing for id={cid}"
+-        assert result["calendar_name"] == f"Calendar-{cid}"
+-        assert result["calendar_id"] == cid
++        assert "name" in result, f"key 'name' missing for id={cid}"
++        assert "id" in result, f"key 'id' missing for id={cid}"
++        assert result["name"] == f"Calendar-{cid}"
++        assert result["id"] == cid
+diff --git a/ts/src/server.ts b/ts/src/server.ts
+index dba5a9a..dfd3182 100644
+--- a/ts/src/server.ts
++++ b/ts/src/server.ts
+@@ -83,13 +83,14 @@ function getSingleId(pathname: string): string | null {
+ 
+ // ── Cross-language integration bridge (POLY-BUG-A5) ───────────────
+ // Test-only bridge that mirrors the Python lookup_calendar_name() contract.
+-// POLY-BUG-A5: keys simultaneously changed to calendarName/calendarId in
+-// both python/src/schedlib/integrations.py AND this bridge.
+-export function lookupCalendarName(calendarId: number): { calendarName: string; calendarId: number } {
+-  // POLY-BUG-A5: keys renamed to calendarName/calendarId in both subtrees.
++// Python function returns {"name": str, "id": int}; this function wraps that
++// contract for in-language testing.  POLY-BUG-A5 simultaneously changes the
++// key names in both python/src/schedlib/integrations.py AND this bridge.
++export function lookupCalendarName(calendarId: number): { name: string; id: number } {
++  // Bridge: mirrors schedlib.integrations.lookup_calendar_name() contract.
+   // The keys must match the Python side exactly — this is the cross-language
+   // coupling that A5 exploits.
+-  return { calendarName: `Calendar-${calendarId}`, calendarId: calendarId };
++  return { name: `Calendar-${calendarId}`, id: calendarId };
+ }
+ 
+ export function startServer(port: number) {

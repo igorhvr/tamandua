@@ -1,0 +1,22 @@
+# operator-notes.local — inert operator junk probe (spec 02)
+#
+# This file is deliberately planted in the fixture and must NEVER be
+# modified by any tool, agent, or test runner. It must stay byte-identical
+# across the entire torture-test campaign.
+#
+# The 1-min sampler hashes this file; transient delete-and-restore is in
+# scope. Any drift triggers an oracle finding.
+#
+# Content below is stable — do not edit.
+###############################################################################
+Operator Notes — tt-poly (root)
+Date planted: 2026-08-01
+Fixture version: 0.1.0
+
+Quick reference:
+  - Run all tests:   ./run-all-tests
+  - Build golden:     ./build-golden.sh
+  - Fixture type:     five-language storm monorepo (python/, ts/, go/, java/, rust/)
+
+Known local quirks on this host: none recorded.
+###############################################################################

@@ -1,0 +1,83 @@
+diff --git a/torture-test/fixtures-src/tt-poly/java/src/main/java/com/tamandua/ledger/CsvParser.java b/torture-test/fixtures-src/tt-poly/java/src/main/java/com/tamandua/ledger/CsvParser.java
+index cbcf503..4a9f061 100644
+--- a/torture-test/fixtures-src/tt-poly/java/src/main/java/com/tamandua/ledger/CsvParser.java
++++ b/torture-test/fixtures-src/tt-poly/java/src/main/java/com/tamandua/ledger/CsvParser.java
+@@ -77,14 +77,8 @@ public final class CsvParser {
+                 String id = fields.get(0).trim();
+                 LocalDate date = LocalDate.parse(fields.get(1).trim());
+                 String description = fields.get(2).trim();
+-                // BUG: swapped amount and category column indices
+-                BigDecimal amount;
+-                try {
+-                    amount = new BigDecimal(fields.get(4).trim());
+-                } catch (NumberFormatException e) {
+-                    amount = BigDecimal.ZERO;
+-                }
+-                String category = fields.get(3).trim();
++                BigDecimal amount = new BigDecimal(fields.get(3).trim());
++                String category = fields.get(4).trim();
+                 entries.add(LedgerEntry.of(id, date, description, amount, category));
+             } catch (Exception e) {
+                 LOG.log(Level.WARNING, "Skipping malformed row: " + lines.get(i), e);
+diff --git a/torture-test/fixtures-src/tt-poly/java/src/test/java/com/tamandua/ledger/CsvParserTest.java b/torture-test/fixtures-src/tt-poly/java/src/test/java/com/tamandua/ledger/CsvParserTest.java
+index 680257f..e010b7b 100644
+--- a/torture-test/fixtures-src/tt-poly/java/src/test/java/com/tamandua/ledger/CsvParserTest.java
++++ b/torture-test/fixtures-src/tt-poly/java/src/test/java/com/tamandua/ledger/CsvParserTest.java
+@@ -242,6 +242,57 @@ class CsvParserTest {
+         assertTrue(entries.isEmpty());
+     }
+ 
++    @Test
++    @DisplayName("regression BUG-J3: amount and category columns are NOT swapped")
++    void regressionBugJ3AmountCategoryNotSwapped() throws IOException {
++        // Seed BUG-J3 swaps column indices for amount (index 4) and category (index 3).
++        // This regression test uses a CSV with very distinct amount and category
++        // values to catch any column swap: amounts are large round numbers,
++        // categories are lowercase strings — a swap would produce ZERO amounts
++        // and numeric-string categories.
++        String csv = """
++                id,date,description,amount,category
++                j3-001,2025-04-01,Rent payment,120000.00,housing
++                j3-002,2025-04-02,Electric bill,8525.50,utilities
++                j3-003,2025-04-03,Groceries,12750.00,housing
++                """;
++        Files.writeString(tempFile, csv);
++
++        List<LedgerEntry> entries = CsvParser.parse(tempFile);
++
++        assertEquals(3, entries.size(), "BUG-J3: should parse all 3 entries");
++
++        // Entry 0
++        LedgerEntry e0 = entries.get(0);
++        assertEquals("j3-001", e0.getId());
++        assertEquals("Rent payment", e0.getDescription());
++        assertEquals(new BigDecimal("120000.00"), e0.getAmount(),
++                "BUG-J3: amount should be 120000.00, not ZERO (column swap would parse 'housing' as ZERO)");
++        assertEquals("housing", e0.getCategory(),
++                "BUG-J3: category should be 'housing', not '120000.00' (column swap would put amount here)");
++
++        // Entry 1
++        LedgerEntry e1 = entries.get(1);
++        assertEquals("j3-002", e1.getId());
++        assertEquals(new BigDecimal("8525.50"), e1.getAmount(),
++                "BUG-J3: amount should be 8525.50, not ZERO (column swap would parse 'utilities' as ZERO)");
++        assertEquals("utilities", e1.getCategory(),
++                "BUG-J3: category should be 'utilities', not '8525.50'");
++
++        // Entry 2
++        LedgerEntry e2 = entries.get(2);
++        assertEquals("j3-003", e2.getId());
++        assertEquals(new BigDecimal("12750.00"), e2.getAmount(),
++                "BUG-J3: amount should be 12750.00, not ZERO");
++        assertEquals("housing", e2.getCategory(),
++                "BUG-J3: category should be 'housing', not '12750.00'");
++
++        // Verify total via LedgerService — this would be ZERO with column swap
++        BigDecimal total = LedgerService.getTotal(entries);
++        assertEquals(new BigDecimal("141275.50"), total,
++                "BUG-J3: total should be 141275.50, not 0 (column swap yields all ZERO amounts)");
++    }
++
+     /**
+      * A simple log handler that captures messages for test assertions.
+      */

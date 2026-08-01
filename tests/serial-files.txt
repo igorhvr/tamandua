@@ -142,7 +142,12 @@ tests/stories-json-validation.test.ts
 tests/syntax-check.test.ts
 tests/system-token-spend-migration.test.ts
 tests/token-log-formatting.test.ts
+tests/tt-poly-a5-seed-and-sentinel.test.ts
+tests/tt-poly-build-golden.test.ts
+tests/tt-poly-end-to-end-verification.test.ts
+tests/tt-poly-go-subtree.test.ts
 tests/tt-poly-lite-build-golden.test.ts
+tests/tt-poly-rust-subtree.test.ts
 tests/update-command.test.ts
 tests/update-protocol.test.ts
 tests/work-round-persona-prompt.test.ts

@@ -1,0 +1,4 @@
+# NOTE: testdata/exec-bit-probe.sh and operator-notes.local are deliberately
+# NOT gitignored — they serve as junk probes for the tamandua torture
+# test suite. DO NOT add them to this file.
+# See README-JUNK.md for details.

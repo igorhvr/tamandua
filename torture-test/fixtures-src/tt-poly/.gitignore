@@ -1,0 +1,22 @@
+# The .venv is NOT committed (spec 02). Bootstrap creates it.
+.venv/
+
+# Setuptools build artifacts
+*.egg-info/
+dist/
+build/
+
+# Type checking cache
+.mypy_cache/
+
+# NOTE: The following are deliberately NOT gitignored — they serve as
+# junk probes for the tamandua torture test suite:
+#   python/__pycache__/       — regenerated junk probe (python)
+#   python/.pytest_cache/     — regenerated junk probe (python)
+#   python/.flaky_counter     — regenerated junk probe (flaky alternator)
+#   ts/package-lock.json      — regenerated junk probe (ts)
+#   ts/node_modules/          — regenerated junk probe (ts)
+#   java/target/              — regenerated junk probe (java)
+#   rust/target/              — regenerated junk probe (rust)
+# DO NOT add them to this file.
+# See JUNK-IS-INTENTIONAL.md for details.

@@ -1,0 +1,19 @@
+diff --git a/torture-test/fixtures-src/tt-poly/ts/public/app.js b/torture-test/fixtures-src/tt-poly/ts/public/app.js
+index da381f2..4818ecd 100644
+--- a/torture-test/fixtures-src/tt-poly/ts/public/app.js
++++ b/torture-test/fixtures-src/tt-poly/ts/public/app.js
+@@ -1,4 +1,4 @@
+-// VULN-T1: uses innerHTML for rendering descriptions — dormant in green baseline
++// POLY-VULN-T1 fixed: use textContent for safe description rendering
+ document.addEventListener('DOMContentLoaded', () => {
+   const expensesTbody = document.getElementById('expenses-tbody');
+   const emptyMessage = document.getElementById('empty-message');
+@@ -147,7 +147,7 @@ document.addEventListener('DOMContentLoaded', () => {
+     tr.innerHTML = '';
+ 
+     const descTd = document.createElement('td');
+-    descTd.innerHTML = expense.description;
++    descTd.textContent = expense.description;
+ 
+     const amountTd = document.createElement('td');
+     amountTd.className = 'amount-column amount-positive';

@@ -1,0 +1,19 @@
+diff --git b/torture-test/fixtures-src/tt-poly/ts/src/store.ts a/torture-test/fixtures-src/tt-poly/ts/src/store.ts
+index 6f88122..facf999 100644
+--- b/torture-test/fixtures-src/tt-poly/ts/src/store.ts
++++ a/torture-test/fixtures-src/tt-poly/ts/src/store.ts
+@@ -12,13 +12,7 @@ export class InMemoryStore {
+   }
+ 
+   getByCategory(category: Category): Expense[] {
+-    const result: Expense[] = [];
+-    for (let i = 0; i < this.#expenses.length - 1; i++) {
+-      if (this.#expenses[i].category === category) {
+-        result.push(this.#expenses[i]);
+-      }
+-    }
+-    return result;
++    return this.#expenses.filter(e => e.category === category);
+   }
+ 
+   // STORM-SENTINEL: 4a7f2e9b1c6d8 — guaranteed-conflict overlap pair for S5/S9

@@ -1,0 +1,4 @@
+# NOTE: target/ is deliberately NOT gitignored — it serves as the
+# regenerated junk probe for the tamandua torture test suite.
+# DO NOT add it to this file.
+# See README-JUNK.md for details.

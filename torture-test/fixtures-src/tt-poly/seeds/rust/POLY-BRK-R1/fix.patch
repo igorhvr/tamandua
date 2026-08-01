@@ -1,0 +1,12 @@
+--- tests/integration.rs
++++ tests/integration.rs
+@@ -112,8 +112,7 @@
+         .collect();
+ 
+     let total: u32 = handles.into_iter().map(|h| h.join().unwrap()).sum();
+-    // BROKEN: off-by-one — expects N-1 tokens instead of N
+-    assert_eq!(total, 4_999);
++    assert_eq!(total, 5_000);
+ }
+ 
+ #[test]

@@ -1,0 +1,30 @@
+diff --git a/torture-test/fixtures-src/tt-poly/java/src/main/java/com/tamandua/ledger/CsvParser.java b/torture-test/fixtures-src/tt-poly/java/src/main/java/com/tamandua/ledger/CsvParser.java
+index 4a9f061..c4cd4b5 100644
+--- a/torture-test/fixtures-src/tt-poly/java/src/main/java/com/tamandua/ledger/CsvParser.java
++++ b/torture-test/fixtures-src/tt-poly/java/src/main/java/com/tamandua/ledger/CsvParser.java
+@@ -85,6 +85,10 @@ public final class CsvParser {
+             }
+         }
+ 
++        // BUG: returns null for header-only CSV (no data rows)
++        if (entries.isEmpty()) {
++            return null;
++        }
+         return entries;
+     }
+ 
+diff --git a/torture-test/fixtures-src/tt-poly/java/src/main/java/com/tamandua/ledger/LedgerService.java b/torture-test/fixtures-src/tt-poly/java/src/main/java/com/tamandua/ledger/LedgerService.java
+index 1c40cf5..18123e5 100644
+--- a/torture-test/fixtures-src/tt-poly/java/src/main/java/com/tamandua/ledger/LedgerService.java
++++ b/torture-test/fixtures-src/tt-poly/java/src/main/java/com/tamandua/ledger/LedgerService.java
+@@ -76,9 +76,8 @@ public final class LedgerService {
+      * @return total sum (never null, {@code BigDecimal.ZERO} for empty/null input)
+      */
+     public static BigDecimal getTotal(List<LedgerEntry> entries) {
+-        List<LedgerEntry> safe = (entries != null) ? entries : Collections.emptyList();
+         BigDecimal total = BigDecimal.ZERO;
+-        for (LedgerEntry e : safe) {
++        for (LedgerEntry e : entries) {
+             BigDecimal amt = e.getAmount();
+             if (amt != null) {
+                 total = MoneyUtils.add(total, amt);

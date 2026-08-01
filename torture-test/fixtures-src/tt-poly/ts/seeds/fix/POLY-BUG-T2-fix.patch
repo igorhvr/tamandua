@@ -1,0 +1,13 @@
+diff --git b/torture-test/fixtures-src/tt-poly/ts/src/store.ts a/torture-test/fixtures-src/tt-poly/ts/src/store.ts
+index 512873d..facf999 100644
+--- b/torture-test/fixtures-src/tt-poly/ts/src/store.ts
++++ a/torture-test/fixtures-src/tt-poly/ts/src/store.ts
+@@ -23,7 +23,7 @@ export class InMemoryStore {
+   // git merge-tree before the storm round.
+ 
+   getByDateRange(startDate: string, endDate: string): Expense[] {
+-    return this.#expenses.filter(e => e.date.localeCompare(startDate, undefined, { numeric: true }) >= 0 && e.date <= endDate);
++    return this.#expenses.filter(e => e.date >= startDate && e.date <= endDate);
+   }
+ 
+   add(expense: Expense): Expense {
