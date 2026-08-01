@@ -1,0 +1,7 @@
+# NOTE: target/ is deliberately NOT gitignored — it serves as
+# a junk probe for the tamandua torture test suite.
+# DO NOT add target/ to this file.
+# See JUNK-IS-INTENTIONAL.md for details.
+
+# Maven Wrapper JAR (downloaded by mvnw script)
+.mvn/wrapper/maven-wrapper.jar

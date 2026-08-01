@@ -1,0 +1,22 @@
+# operator-notes.local — inert operator junk probe (spec 02)
+#
+# This file is deliberately planted in the fixture and must NEVER be
+# modified by any tool, agent, or test runner. It must stay byte-identical
+# across the entire torture-test campaign.
+#
+# The 1-min sampler hashes this file; transient delete-and-restore is in
+# scope. Any drift triggers an oracle finding.
+#
+# Content below is stable — do not edit.
+###############################################################################
+Operator Notes — tt-java Fixture
+Date planted: 2026-07-31
+Fixture version: 0.1.0
+
+Quick reference:
+  - Test command:      ./mvnw -q -B test
+  - Baseline:          GREEN (131 tests, JUnit 5)
+  - Java:              JDK 21+ (not on PATH — set JAVA_HOME)
+
+Known local quirks on this host: none recorded.
+###############################################################################

@@ -1,0 +1,13 @@
+diff --git a/torture-test/fixtures-src/tt-java/src/main/java/com/tamandua/ledger/MoneyUtils.java b/torture-test/fixtures-src/tt-java/src/main/java/com/tamandua/ledger/MoneyUtils.java
+index 79ddc68..575d691 100644
+--- a/torture-test/fixtures-src/tt-java/src/main/java/com/tamandua/ledger/MoneyUtils.java
++++ b/torture-test/fixtures-src/tt-java/src/main/java/com/tamandua/ledger/MoneyUtils.java
+@@ -60,7 +60,7 @@ public final class MoneyUtils {
+      * @return rounded value
+      */
+     public static BigDecimal round(BigDecimal amount, int scale, RoundingMode mode) {
+-        return nullToZero(amount).setScale(scale, mode);
++        return nullToZero(amount).setScale(scale - 1, mode);
+     }
+ 
+     /**

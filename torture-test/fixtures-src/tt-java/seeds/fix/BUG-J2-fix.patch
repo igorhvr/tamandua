@@ -1,0 +1,81 @@
+diff --git a/torture-test/fixtures-src/tt-java/src/main/java/com/tamandua/ledger/CsvParser.java b/torture-test/fixtures-src/tt-java/src/main/java/com/tamandua/ledger/CsvParser.java
+index c4cd4b5..4a9f061 100644
+--- a/torture-test/fixtures-src/tt-java/src/main/java/com/tamandua/ledger/CsvParser.java
++++ b/torture-test/fixtures-src/tt-java/src/main/java/com/tamandua/ledger/CsvParser.java
+@@ -85,10 +85,6 @@ public final class CsvParser {
+             }
+         }
+ 
+-        // BUG: returns null for header-only CSV (no data rows)
+-        if (entries.isEmpty()) {
+-            return null;
+-        }
+         return entries;
+     }
+ 
+diff --git a/torture-test/fixtures-src/tt-java/src/main/java/com/tamandua/ledger/LedgerService.java b/torture-test/fixtures-src/tt-java/src/main/java/com/tamandua/ledger/LedgerService.java
+index 18123e5..1c40cf5 100644
+--- a/torture-test/fixtures-src/tt-java/src/main/java/com/tamandua/ledger/LedgerService.java
++++ b/torture-test/fixtures-src/tt-java/src/main/java/com/tamandua/ledger/LedgerService.java
+@@ -76,8 +76,9 @@ public final class LedgerService {
+      * @return total sum (never null, {@code BigDecimal.ZERO} for empty/null input)
+      */
+     public static BigDecimal getTotal(List<LedgerEntry> entries) {
++        List<LedgerEntry> safe = (entries != null) ? entries : Collections.emptyList();
+         BigDecimal total = BigDecimal.ZERO;
+-        for (LedgerEntry e : entries) {
++        for (LedgerEntry e : safe) {
+             BigDecimal amt = e.getAmount();
+             if (amt != null) {
+                 total = MoneyUtils.add(total, amt);
+diff --git a/torture-test/fixtures-src/tt-java/src/test/java/com/tamandua/ledger/CsvParserTest.java b/torture-test/fixtures-src/tt-java/src/test/java/com/tamandua/ledger/CsvParserTest.java
+index 680257f..9d8f99b 100644
+--- a/torture-test/fixtures-src/tt-java/src/test/java/com/tamandua/ledger/CsvParserTest.java
++++ b/torture-test/fixtures-src/tt-java/src/test/java/com/tamandua/ledger/CsvParserTest.java
+@@ -225,6 +225,22 @@ class CsvParserTest {
+         assertEquals("Item with \"quoted\" text", entries.get(0).getDescription());
+     }
+ 
++    @Test
++    @DisplayName("regression BUG-J2: header-only CSV returns empty list, not null")
++    void regressionBugJ2EmptyCsvReturnsEmptyList() throws IOException {
++        // Seed BUG-J2 makes CsvParser return null for header-only CSVs.
++        // This regression test verifies we always get an empty list.
++        String csv = "id,date,description,amount,category\n";
++        Files.writeString(tempFile, csv);
++
++        List<LedgerEntry> entries = CsvParser.parse(tempFile);
++
++        assertNotNull(entries,
++                "BUG-J2: CsvParser returned null for header-only CSV — should return empty list");
++        assertTrue(entries.isEmpty(),
++                "BUG-J2: expected empty list for header-only CSV");
++    }
++
+     @Test
+     @DisplayName("CSV file with only comments and empty lines returns empty list")
+     void testOnlyCommentsReturnsEmptyList() throws IOException {
+diff --git a/torture-test/fixtures-src/tt-java/src/test/java/com/tamandua/ledger/LedgerServiceTest.java b/torture-test/fixtures-src/tt-java/src/test/java/com/tamandua/ledger/LedgerServiceTest.java
+index 5b8c9b4..d7a7594 100644
+--- a/torture-test/fixtures-src/tt-java/src/test/java/com/tamandua/ledger/LedgerServiceTest.java
++++ b/torture-test/fixtures-src/tt-java/src/test/java/com/tamandua/ledger/LedgerServiceTest.java
+@@ -237,6 +237,19 @@ class LedgerServiceTest {
+         assertEquals(BigDecimal.ZERO, LedgerService.getTotal(null));
+     }
+ 
++    @Test
++    @DisplayName("regression BUG-J2: getTotal with null list returns ZERO, no NPE")
++    void regressionBugJ2GetTotalNullListReturnsZero() {
++        // Seed BUG-J2 removes null-guard from getTotal(), causing NPE.
++        // This regression test verifies null input returns ZERO safely.
++        BigDecimal result = assertDoesNotThrow(
++                () -> LedgerService.getTotal(null),
++                "BUG-J2: getTotal(null) should not throw NullPointerException"
++        );
++        assertEquals(BigDecimal.ZERO, result,
++                "BUG-J2: getTotal(null) should return BigDecimal.ZERO");
++    }
++
+     @Test
+     @DisplayName("getTotal: works with entries that have non-null amounts")
+     void getTotalHandlesNormalEntries() {

@@ -1,0 +1,13 @@
+diff --git a/torture-test/fixtures-src/tt-java/src/test/java/com/tamandua/ledger/LedgerServiceTest.java b/torture-test/fixtures-src/tt-java/src/test/java/com/tamandua/ledger/LedgerServiceTest.java
+index 5b8c9b4..af0dff0 100644
+--- a/torture-test/fixtures-src/tt-java/src/test/java/com/tamandua/ledger/LedgerServiceTest.java
++++ b/torture-test/fixtures-src/tt-java/src/test/java/com/tamandua/ledger/LedgerServiceTest.java
+@@ -214,7 +214,7 @@ class LedgerServiceTest {
+     void getTotalSampleDataset() {
+         List<LedgerEntry> entries = createSampleEntries();
+         // 100 + 50 + 75 + 150 + 25 + 75 = 475
+-        assertEquals(new BigDecimal("475.00"), LedgerService.getTotal(entries));
++        assertEquals(new BigDecimal("450.00"), LedgerService.getTotal(entries));
+     }
+ 
+     @Test

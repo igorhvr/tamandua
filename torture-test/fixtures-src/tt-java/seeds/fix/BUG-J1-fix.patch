@@ -1,0 +1,33 @@
+diff --git a/torture-test/fixtures-src/tt-java/src/main/java/com/tamandua/ledger/MoneyUtils.java b/torture-test/fixtures-src/tt-java/src/main/java/com/tamandua/ledger/MoneyUtils.java
+index 575d691..79ddc68 100644
+--- a/torture-test/fixtures-src/tt-java/src/main/java/com/tamandua/ledger/MoneyUtils.java
++++ b/torture-test/fixtures-src/tt-java/src/main/java/com/tamandua/ledger/MoneyUtils.java
+@@ -60,7 +60,7 @@ public final class MoneyUtils {
+      * @return rounded value
+      */
+     public static BigDecimal round(BigDecimal amount, int scale, RoundingMode mode) {
+-        return nullToZero(amount).setScale(scale - 1, mode);
++        return nullToZero(amount).setScale(scale, mode);
+     }
+ 
+     /**
+diff --git a/torture-test/fixtures-src/tt-java/src/test/java/com/tamandua/ledger/MoneyUtilsTest.java b/torture-test/fixtures-src/tt-java/src/test/java/com/tamandua/ledger/MoneyUtilsTest.java
+index d8383a7..878cd26 100644
+--- a/torture-test/fixtures-src/tt-java/src/test/java/com/tamandua/ledger/MoneyUtilsTest.java
++++ b/torture-test/fixtures-src/tt-java/src/test/java/com/tamandua/ledger/MoneyUtilsTest.java
+@@ -114,6 +114,15 @@ class MoneyUtilsTest {
+         assertEquals(new BigDecimal("2.45"), MoneyUtils.round(new BigDecimal("2.446"), 2, RoundingMode.HALF_UP));
+     }
+ 
++    @Test
++    @DisplayName("regression BUG-J1: round 2.445 HALF_UP preserves correct scale")
++    void regressionBugJ1ScalePreserved() {
++        BigDecimal result = MoneyUtils.round(new BigDecimal("2.445"), 2, RoundingMode.HALF_UP);
++        assertEquals(new BigDecimal("2.45"), result);
++        assertEquals(2, result.scale(),
++                "BUG-J1: off-by-one in setScale produces scale 1, not 2");
++    }
++
+     @Test
+     @DisplayName("round: HALF_DOWN boundary")
+     void roundHalfDown() {

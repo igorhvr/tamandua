@@ -1,0 +1,13 @@
+diff --git a/torture-test/fixtures-src/tt-java/src/test/java/com/tamandua/ledger/CliAppTest.java b/torture-test/fixtures-src/tt-java/src/test/java/com/tamandua/ledger/CliAppTest.java
+index 4ccd180..8546c6d 100644
+--- a/torture-test/fixtures-src/tt-java/src/test/java/com/tamandua/ledger/CliAppTest.java
++++ b/torture-test/fixtures-src/tt-java/src/test/java/com/tamandua/ledger/CliAppTest.java
+@@ -222,7 +222,7 @@ class CliAppTest {
+         assertTrue(line.contains("2025-01-10"));
+         assertTrue(line.contains("Groceries"));
+         assertTrue(line.contains("$100.00"));
+-        assertTrue(line.contains("food"));
++        assertTrue(line.contains("groceries"));
+     }
+ 
+     @Test

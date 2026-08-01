@@ -1,0 +1,21 @@
+diff --git a/torture-test/fixtures-src/tt-java/src/main/java/com/tamandua/ledger/CsvParser.java b/torture-test/fixtures-src/tt-java/src/main/java/com/tamandua/ledger/CsvParser.java
+index 4a9f061..cbcf503 100644
+--- a/torture-test/fixtures-src/tt-java/src/main/java/com/tamandua/ledger/CsvParser.java
++++ b/torture-test/fixtures-src/tt-java/src/main/java/com/tamandua/ledger/CsvParser.java
+@@ -77,8 +77,14 @@ public final class CsvParser {
+                 String id = fields.get(0).trim();
+                 LocalDate date = LocalDate.parse(fields.get(1).trim());
+                 String description = fields.get(2).trim();
+-                BigDecimal amount = new BigDecimal(fields.get(3).trim());
+-                String category = fields.get(4).trim();
++                // BUG: swapped amount and category column indices
++                BigDecimal amount;
++                try {
++                    amount = new BigDecimal(fields.get(4).trim());
++                } catch (NumberFormatException e) {
++                    amount = BigDecimal.ZERO;
++                }
++                String category = fields.get(3).trim();
+                 entries.add(LedgerEntry.of(id, date, description, amount, category));
+             } catch (Exception e) {
+                 LOG.log(Level.WARNING, "Skipping malformed row: " + lines.get(i), e);

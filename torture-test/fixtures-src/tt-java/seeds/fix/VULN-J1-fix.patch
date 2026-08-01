@@ -1,0 +1,164 @@
+diff --git a/torture-test/fixtures-src/tt-java/src/main/java/com/tamandua/ledger/XmlImportService.java b/torture-test/fixtures-src/tt-java/src/main/java/com/tamandua/ledger/XmlImportService.java
+index 3a8b6b9..8ba8084 100644
+--- a/torture-test/fixtures-src/tt-java/src/main/java/com/tamandua/ledger/XmlImportService.java
++++ b/torture-test/fixtures-src/tt-java/src/main/java/com/tamandua/ledger/XmlImportService.java
+@@ -9,6 +9,7 @@ import java.util.ArrayList;
+ import java.util.List;
+ import java.util.logging.Logger;
+ 
++import javax.xml.XMLConstants;
+ import javax.xml.parsers.DocumentBuilder;
+ import javax.xml.parsers.DocumentBuilderFactory;
+ 
+@@ -55,12 +56,6 @@ public final class XmlImportService {
+      * </ledger>
+      * }</pre>
+      *
+-     * <p><strong>VULN-J1:</strong> The DocumentBuilderFactory is used without
+-     * disabling external entities or DTD processing. An attacker can craft
+-     * XML with a DOCTYPE referencing local files (e.g., {@code <!ENTITY xxe
+-     * SYSTEM "file:///etc/passwd">}) to exfiltrate their contents via
+-     * entity expansion, or reference external URLs for SSRF.</p>
+-     *
+      * @param xml the XML input stream (must not be null)
+      * @return list of parsed LedgerEntry objects (never {@code null})
+      * @throws RuntimeException if XML parsing fails
+@@ -73,6 +68,15 @@ public final class XmlImportService {
+         List<LedgerEntry> entries = new ArrayList<>();
+         try {
+             DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
++
++            // VULN-J1 fix: secure the DocumentBuilderFactory against XXE attacks
++            dbf.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
++            dbf.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
++            dbf.setFeature("http://xml.org/sax/features/external-general-entities", false);
++            dbf.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
++            dbf.setXIncludeAware(false);
++            dbf.setExpandEntityReferences(false);
++
+             DocumentBuilder db = dbf.newDocumentBuilder();
+             Document doc = db.parse(xml);
+ 
+diff --git a/torture-test/fixtures-src/tt-java/src/test/java/com/tamandua/ledger/XmlImportServiceTest.java b/torture-test/fixtures-src/tt-java/src/test/java/com/tamandua/ledger/XmlImportServiceTest.java
+new file mode 100644
+index 0000000..d66236a
+--- /dev/null
++++ b/torture-test/fixtures-src/tt-java/src/test/java/com/tamandua/ledger/XmlImportServiceTest.java
+@@ -0,0 +1,117 @@
++package com.tamandua.ledger;
++
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.DisplayName;
++import org.junit.jupiter.api.Test;
++
++import java.io.ByteArrayInputStream;
++import java.io.InputStream;
++import java.math.BigDecimal;
++import java.nio.charset.StandardCharsets;
++import java.util.List;
++
++import static org.junit.jupiter.api.Assertions.*;
++
++/**
++ * Tests for XmlImportService.
++ *
++ * <p>These tests verify that the VULN-J1 fix properly secures XML parsing
++ * against XXE attacks. The tests are added by the VULN-J1 fix patch.</p>
++ */
++class XmlImportServiceTest {
++
++    @Test
++    @DisplayName("parse valid XML with ledger entries")
++    void parseValidXml() {
++        String xml = """
++                <?xml version="1.0" encoding="UTF-8"?>
++                <ledger>
++                  <entry>
++                    <id>entry-001</id>
++                    <date>2025-01-15</date>
++                    <description>Groceries</description>
++                    <amount>100.50</amount>
++                    <category>food</category>
++                  </entry>
++                  <entry>
++                    <id>entry-002</id>
++                    <date>2025-01-16</date>
++                    <description>Salary</description>
++                    <amount>5000.00</amount>
++                    <category>income</category>
++                  </entry>
++                </ledger>
++                """;
++
++        List<LedgerEntry> entries = XmlImportService.importFromXml(
++                new ByteArrayInputStream(xml.getBytes(StandardCharsets.UTF_8)));
++
++        assertEquals(2, entries.size());
++        assertEquals("Groceries", entries.get(0).getDescription());
++        assertEquals("Salary", entries.get(1).getDescription());
++        assertEquals(new BigDecimal("100.50"), entries.get(0).getAmount());
++        assertEquals("food", entries.get(0).getCategory());
++    }
++
++    @Test
++    @DisplayName("regression VULN-J1: XML with DOCTYPE and external entity is rejected")
++    void regressionVulnJ1XxeRejected() {
++        // This XML attempts XXE: defines an external entity that reads /etc/passwd
++        // With VULN-J1 fix, the secure DocumentBuilderFactory disallows DOCTYPE,
++        // so parsing should throw an exception.
++        String maliciousXml = """
++                <?xml version="1.0" encoding="UTF-8"?>
++                <!DOCTYPE ledger [
++                  <!ENTITY xxe SYSTEM "file:///etc/passwd">
++                ]>
++                <ledger>
++                  <entry>
++                    <id>entry-001</id>
++                    <date>2025-01-15</date>
++                    <description>&xxe;</description>
++                    <amount>100.50</amount>
++                    <category>food</category>
++                  </entry>
++                </ledger>
++                """;
++
++        assertThrows(RuntimeException.class, () -> {
++            XmlImportService.importFromXml(
++                    new ByteArrayInputStream(maliciousXml.getBytes(StandardCharsets.UTF_8)));
++        }, "VULN-J1: XML with DOCTYPE declaration should be rejected by secure parser");
++    }
++
++    @Test
++    @DisplayName("null InputStream throws IllegalArgumentException")
++    void nullInputStreamThrows() {
++        assertThrows(IllegalArgumentException.class, () -> XmlImportService.importFromXml(null));
++    }
++
++    @Test
++    @DisplayName("empty ledger returns empty list")
++    void emptyLedgerReturnsEmptyList() {
++        String xml = """
++                <?xml version="1.0" encoding="UTF-8"?>
++                <ledger>
++                </ledger>
++                """;
++
++        List<LedgerEntry> entries = XmlImportService.importFromXml(
++                new ByteArrayInputStream(xml.getBytes(StandardCharsets.UTF_8)));
++
++        assertNotNull(entries);
++        assertTrue(entries.isEmpty());
++    }
++
++    @Test
++    @DisplayName("malformed XML throws RuntimeException")
++    void malformedXmlThrows() {
++        String badXml = "this is not xml at all";
++
++        assertThrows(RuntimeException.class, () -> {
++            XmlImportService.importFromXml(
++                    new ByteArrayInputStream(badXml.getBytes(StandardCharsets.UTF_8)));
++        });
++    }
++}
