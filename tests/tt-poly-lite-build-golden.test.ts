@@ -44,7 +44,7 @@ describe("tt-poly-lite build-golden.sh", () => {
     "golden",
   );
   const bareRepo = path.join(goldenDir, "tt-poly-lite.git");
-  const hashFile = path.join(goldenDir, ".build-hashes-tt-poly-lite");
+  const hashFile = path.join(goldenDir, "tt-poly-lite.git.hashes");
 
   it("exists and is executable", () => {
     assert.ok(fs.existsSync(scriptPath), "build-golden.sh should exist");
@@ -123,11 +123,11 @@ describe("tt-poly-lite build-golden.sh", () => {
     }
   });
 
-  it("defines hash file path as .build-hashes-tt-poly-lite", () => {
+  it("defines hash file path as tt-poly-lite.git.hashes", () => {
     const content = fs.readFileSync(scriptPath, "utf-8");
     assert.ok(
-      content.includes(".build-hashes-tt-poly-lite"),
-      "hash file should be named .build-hashes-tt-poly-lite",
+      content.includes("tt-poly-lite.git.hashes"),
+      "hash file should be named tt-poly-lite.git.hashes",
     );
   });
 
@@ -187,7 +187,7 @@ describe("tt-poly-lite build-golden.sh integration", { skip: process.env.TT_POLY
     "golden",
   );
   const bareRepo = path.join(goldenDir, "tt-poly-lite.git");
-  const hashFile = path.join(goldenDir, ".build-hashes-tt-poly-lite");
+  const hashFile = path.join(goldenDir, "tt-poly-lite.git.hashes");
 
   it("creates golden bare repo with all seed refs", function () {
     this.timeout = 600_000;
@@ -280,7 +280,7 @@ describe("tt-poly-lite end-to-end validation", { skip: process.env.TT_POLY_LITE_
     "golden",
   );
   const bareRepo = path.join(goldenDir, "tt-poly-lite.git");
-  const hashFile = path.join(goldenDir, ".build-hashes-tt-poly-lite");
+  const hashFile = path.join(goldenDir, "tt-poly-lite.git.hashes");
   const fixtureSrc = path.join(
     repoRoot,
     "torture-test",

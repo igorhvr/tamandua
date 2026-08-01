@@ -7,7 +7,38 @@ import { fileURLToPath } from 'node:url';
 
 const BIN_DIR = path.dirname(fileURLToPath(import.meta.url));
 const TT_ROOT = path.resolve(BIN_DIR, '..');
-const GOLDEN_ROOT = path.join(TT_ROOT, 'var', 'fixtures', 'golden');
+const GOLDEN_ROOT = process.env.TEST_GOLDEN_ROOT || path.join(TT_ROOT, 'var', 'fixtures', 'golden');
+
+// Parse CLI arguments
+const EXPECTED_FIXTURES = [];
+let showHelp = false;
+const argv = process.argv.slice(2);
+for (let i = 0; i < argv.length; i++) {
+  if (argv[i] === '--help' || argv[i] === '-h') {
+    showHelp = true;
+  } else if (argv[i] === '--expect') {
+    const raw = argv[i + 1];
+    if (!raw || raw.startsWith('-')) {
+      fail('--expect requires a comma-separated list of fixture names');
+    }
+    for (const name of raw.split(',')) {
+      const trimmed = name.trim();
+      if (trimmed) EXPECTED_FIXTURES.push(trimmed);
+    }
+    i++;
+  }
+}
+
+if (showHelp) {
+  console.log(`Usage: tt-verify-fixture-baselines [options]
+
+Options:
+  --expect <name>[,<name>...]  Fixtures that MUST be present (missing = FAIL).
+                               Names are without the .git suffix (e.g. tt-python).
+  --help, -h                   Show this help message.
+`);
+  process.exit(0);
+}
 
 function fail(message) {
   console.error(message);
@@ -27,15 +58,51 @@ function runGit(gitDir, args) {
   return result.stdout.trim();
 }
 
+// US-001: refuse vacuous passes — detect missing or empty golden root
+if (!fs.existsSync(GOLDEN_ROOT)) {
+  console.log(JSON.stringify({
+    check: 'fixture-baselines',
+    golden_root: path.relative(TT_ROOT, GOLDEN_ROOT),
+    error: `golden root missing: ${GOLDEN_ROOT}`,
+    result: 'FAIL',
+  }));
+  fail(`golden root missing: ${GOLDEN_ROOT}`);
+}
+
 let entries = [];
 try {
-  if (fs.existsSync(GOLDEN_ROOT)) {
-    entries = fs.readdirSync(GOLDEN_ROOT, { withFileTypes: true })
-      .filter((entry) => entry.name.endsWith('.git'))
-      .sort((left, right) => left.name.localeCompare(right.name));
-  }
+  entries = fs.readdirSync(GOLDEN_ROOT, { withFileTypes: true })
+    .filter((entry) => entry.name.endsWith('.git'))
+    .sort((left, right) => left.name.localeCompare(right.name));
 } catch (error) {
   fail(`cannot enumerate golden fixtures: ${error.message}`);
+}
+
+if (entries.length === 0) {
+  console.log(JSON.stringify({
+    check: 'fixture-baselines',
+    golden_root: path.relative(TT_ROOT, GOLDEN_ROOT),
+    error: `golden root contains zero *.git fixtures: ${GOLDEN_ROOT}`,
+    result: 'FAIL',
+  }));
+  fail(`golden root contains zero *.git fixtures: ${GOLDEN_ROOT}`);
+}
+
+// US-004: if --expect is given, verify expected fixtures are present
+if (EXPECTED_FIXTURES.length > 0) {
+  const presentNames = new Set(entries.map((e) => e.name.replace(/\.git$/, '')));
+  const absent = EXPECTED_FIXTURES.filter((name) => !presentNames.has(name));
+  if (absent.length > 0) {
+    console.log(JSON.stringify({
+      check: 'fixture-baselines',
+      golden_root: path.relative(TT_ROOT, GOLDEN_ROOT),
+      error: `expected fixtures not found: ${absent.join(', ')} — run each missing builder (fixtures-src/<name>/build-golden.sh) to provision`,
+      expected: EXPECTED_FIXTURES,
+      absent,
+      result: 'FAIL',
+    }));
+    fail(`expected fixtures not found: ${absent.join(', ')}`);
+  }
 }
 
 const fixtures = [];
@@ -46,23 +113,154 @@ for (const entry of entries) {
     path: path.relative(TT_ROOT, fixturePath),
     result: 'FAIL',
   };
+
+  // Security: validate and resolve the fixture path
+  let resolved;
   try {
     const details = fs.lstatSync(fixturePath);
     if (!entry.isDirectory() || !details.isDirectory() || details.isSymbolicLink()) {
       throw new Error('golden fixture is not a regular directory');
     }
-    const resolved = fs.realpathSync(fixturePath);
+    resolved = fs.realpathSync(fixturePath);
     const relative = path.relative(fs.realpathSync(GOLDEN_ROOT), resolved);
     if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
       throw new Error('golden fixture escapes the contained golden root');
     }
+  } catch (error) {
+    evidence.error = error.message;
+    fixtures.push(evidence);
+    continue;
+  }
+
+  // US-002: require .git.hashes file alongside each fixture
+  const fixtureName = entry.name.replace(/\.git$/, '');
+  const hashesPath = path.join(GOLDEN_ROOT, `${fixtureName}.git.hashes`);
+  if (!fs.existsSync(hashesPath)) {
+    evidence.error = `missing determinism record: run fixtures-src/${fixtureName}/build-golden.sh`;
+    fixtures.push(evidence);
+    continue;
+  }
+
+  // US-003: parse .git.hashes and verify every recorded ref
+  evidence.hash_check = { passed: true, total: 0, matched: 0, failures: [] };
+  let hashCheckPassed = false;
+  try {
+    const content = fs.readFileSync(hashesPath, 'utf8');
+    const lines = content.split('\n');
+
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+      if (line === '' || line.startsWith('#')) continue;
+
+      let key, expectedHash;
+      if (line.includes('=')) {
+        const eqIdx = line.indexOf('=');
+        key = line.substring(0, eqIdx).trim();
+        expectedHash = line.substring(eqIdx + 1).trim();
+      } else {
+        const parts = line.split(/\s+/);
+        expectedHash = parts[parts.length - 1];
+        key = parts.slice(0, -1).join(' ');
+      }
+
+      if (!key || !expectedHash) continue;
+      evidence.hash_check.total++;
+
+      // Resolve the key to an actual git ref.
+      // Builders store human-readable labels ("SEED BUG-G1", "BASELINE", "BRANCH broken-tests")
+      // but the actual refs use conventional git paths (tags/seed/BUG-G1, heads/main, heads/broken-tests).
+      // Try a sequence of resolution strategies, from most-precise to catch-all.
+      let actualHash = null;
+      let refUsed = null;
+      const toTry = [];
+
+      // 1. Direct refs: heads, tags, any ref, then key as-is (git show-ref short-name resolution).
+      toTry.push([`refs/heads/${key}`, null]);
+      toTry.push([`refs/tags/${key}`, null]);
+      toTry.push([`refs/${key}`, null]);
+      toTry.push([key, null]);
+
+      // 2. If key is "BASELINE"/"baseline" (case-insensitive), resolve HEAD.
+      if (/^baseline$/i.test(key)) {
+        toTry.push(['HEAD', '→ HEAD (baseline)']);
+      }
+
+      // 3. Normalize spaces → slashes, preserving case ("SEED BUG-G1" → "seed/BUG-G1").
+      const slugKey = key.toLowerCase().replace(/\s+/g, '/');
+      if (slugKey !== key.replace(/\s+/g, '/')) {
+        toTry.push([`refs/tags/${slugKey}`, `→ refs/tags/${slugKey}`]);
+        toTry.push([slugKey, `→ ${slugKey}`]);
+        toTry.push([`refs/heads/${slugKey}`, `→ refs/heads/${slugKey}`]);
+        toTry.push([`refs/${slugKey}`, `→ refs/${slugKey}`]);
+      }
+
+      // 4. Strip known prefixes ("SEED BUG-G1" → "seed/BUG-G1"), preserving case of the body.
+      const prefixMap = [
+        [/^seed\s+/i, 'seed/'],
+        [/^branch\s+/i, ''],
+        [/^vuln\s+/i, 'seed/'],
+        [/^flaky\s+/i, 'seed/'],
+        [/^brk\s+/i, 'seed/'],
+      ];
+      for (const [pattern, replacement] of prefixMap) {
+        const match = key.match(pattern);
+        if (match) {
+          const body = key.substring(match[0].length);
+          const refPath = (replacement + body).replace(/\s+/g, '/');
+          toTry.push([`refs/tags/${refPath}`, `→ refs/tags/${refPath}`]);
+          toTry.push([refPath, `→ ${refPath}`]);
+          toTry.push([`refs/heads/${refPath}`, `→ refs/heads/${refPath}`]);
+          toTry.push([`refs/${refPath}`, `→ refs/${refPath}`]);
+          break; // use only the first matching prefix pattern
+        }
+      }
+
+      const triedRefs = [];
+      for (const [candidate, label] of toTry) {
+        if (actualHash !== null) break;
+        try {
+          actualHash = runGit(resolved, ['rev-parse', '--verify', candidate]);
+          refUsed = label ? `${candidate} ${label}` : candidate;
+        } catch {
+          triedRefs.push(candidate);
+        }
+      }
+
+      if (actualHash === null) {
+        evidence.hash_check.passed = false;
+        evidence.hash_check.failures.push({
+          key,
+          expected: expectedHash,
+          error: `ref not found: tried ${triedRefs.slice(0, 6).join(', ')}`,
+        });
+      } else if (actualHash !== expectedHash) {
+        evidence.hash_check.passed = false;
+        evidence.hash_check.failures.push({
+          key,
+          expected: expectedHash,
+          actual: actualHash,
+          error: 'hash mismatch',
+        });
+      } else {
+        evidence.hash_check.matched++;
+      }
+    }
+    hashCheckPassed = evidence.hash_check.passed;
+  } catch (readErr) {
+    evidence.hash_check = { passed: false, error: readErr.message };
+  }
+
+  // Existing bare/HEAD/fsck checks
+  try {
     if (runGit(resolved, ['rev-parse', '--is-bare-repository']) !== 'true') {
       throw new Error('golden fixture is not a bare git repository');
     }
     evidence.default_branch = runGit(resolved, ['symbolic-ref', 'HEAD']);
     evidence.head = runGit(resolved, ['rev-parse', '--verify', 'HEAD^{commit}']);
     runGit(resolved, ['fsck', '--strict', '--no-dangling']);
-    evidence.result = 'PASS';
+    if (hashCheckPassed) {
+      evidence.result = 'PASS';
+    }
   } catch (error) {
     evidence.error = error.message;
   }
@@ -70,7 +268,7 @@ for (const entry of entries) {
 }
 
 const failed = fixtures.filter((fixture) => fixture.result !== 'PASS');
-console.log(JSON.stringify({
+const evidence = {
   check: 'fixture-baselines',
   golden_root: path.relative(TT_ROOT, GOLDEN_ROOT),
   fixtures,
@@ -78,5 +276,9 @@ console.log(JSON.stringify({
   passed: fixtures.length - failed.length,
   failed: failed.length,
   result: failed.length === 0 ? 'PASS' : 'FAIL',
-}));
+};
+if (EXPECTED_FIXTURES.length > 0) {
+  evidence.expected = EXPECTED_FIXTURES;
+}
+console.log(JSON.stringify(evidence));
 process.exit(failed.length === 0 ? 0 : 1);
