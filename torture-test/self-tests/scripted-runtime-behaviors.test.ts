@@ -19,7 +19,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { describe, it } from "node:test";
-import { tamanduaTempDir } from "../src/lib/temp-dir.ts";
+import { tamanduaTempDir } from "../../src/lib/temp-dir.ts";
 
 const sharedModulePath = path.resolve(
   process.cwd(),

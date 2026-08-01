@@ -773,6 +773,20 @@ test_hermes_provider_error_mid_stream_drop
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="
 
+# ── Deep self-test lane (optional, gated by TT_DEEP_SELF_TEST=1) ──
+if [ "${TT_DEEP_SELF_TEST:-0}" = "1" ]; then
+  echo ""
+  echo "=== Deep self-tests (TT_DEEP_SELF_TEST=1) ==="
+  "$SCRIPT_DIR/../self-tests/run.sh"
+  deep_rc=$?
+  if [ "$deep_rc" -ne 0 ]; then
+    red "Deep self-tests FAILED (exit $deep_rc)"
+    FAIL=$((FAIL + 1))
+  else
+    green "Deep self-tests PASSED"
+  fi
+fi
+
 if [ "$FAIL" -gt 0 ]; then
   exit 1
 fi

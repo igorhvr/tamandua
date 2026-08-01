@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { tamanduaTempDir } from "../src/lib/temp-dir.ts";
+import { tamanduaTempDir } from "../../src/lib/temp-dir.ts";
 import { describe, it, before } from "node:test";
 
 const repoRoot = process.cwd();

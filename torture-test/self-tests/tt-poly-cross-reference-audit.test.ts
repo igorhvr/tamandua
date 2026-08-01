@@ -5,7 +5,7 @@ import { readFileSync, readdirSync, existsSync, readlinkSync } from "node:fs";
 
 const TT_POLY = path.resolve(
   import.meta.dirname,
-  "../torture-test/fixtures-src/tt-poly",
+  "../../torture-test/fixtures-src/tt-poly",
 );
 
 function readAll(filePath: string): string {
