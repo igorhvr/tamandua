@@ -1,0 +1,1559 @@
+#!/usr/bin/env node
+
+// tt-chaos — fault-injection operator for the tamandua torture-test suite
+// Per spec 08-wave-4-fault-injection.md, 11-schedule-budget-abort.md,
+// and 12-runner-automation.md (§tt-chaos)
+
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { DatabaseSync } from 'node:sqlite';
+import { execSync, spawnSync } from 'node:child_process';
+
+// ── Phase wait constants ─────────────────────────────────────────────
+
+const POLL_INTERVAL_MS = 500;
+const DEFAULT_TIMEOUT_S = 120;
+
+// ── Exit codes ───────────────────────────────────────────────────────
+
+const EXIT_TRIGGER_NEVER = 2;
+const EXIT_GUARD_MISS = 3;
+const EXIT_INVALID_MARKER = 1;
+
+// ── Paths ─────────────────────────────────────────────────────────────
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const TT_DIR = path.resolve(__dirname, '..');
+const TT_ROOT = process.env.TT_ROOT ? path.resolve(process.env.TT_ROOT) : path.resolve(TT_DIR, 'var');
+const TT_REPO_ROOT = path.resolve(TT_DIR, '..');
+const CHAOS_DIR = path.resolve(TT_ROOT, 'chaos');
+const CHAOS_LOG = path.resolve(CHAOS_DIR, 'chaos.log');
+
+// Ensure var/chaos exists
+fs.mkdirSync(CHAOS_DIR, { recursive: true });
+
+// ── Destructive vs non-destructive classification ───────────────────
+
+const DESTRUCTIVE_ACTIONS = new Set([
+  'kill-harness',
+  'kill-daemon',
+  'delete-tstx-row',
+  'dirty-tree',
+  'move-branch',
+]);
+
+function isDestructive(action) {
+  return DESTRUCTIVE_ACTIONS.has(action);
+}
+
+// ── Action metadata ───────────────────────────────────────────────────
+
+const ACTIONS = {
+  'kill-harness': {
+    args: '[--signal <SIG>]',
+    desc: 'Send signal to the active harness process for --run',
+  },
+  'kill-daemon': {
+    args: '[--signal <SIG>]',
+    desc: 'Send signal to the TT daemon (never the production daemon)',
+  },
+  'colleague-commit': {
+    args: '--repo <fixture-clone> --file <f> [--line <sentinel>]',
+    desc: 'Make a competing commit from a second clone perspective',
+  },
+  pause: {
+    args: '',
+    desc: 'Pause the run via tamandua CLI under TT spawn env',
+  },
+  resume: {
+    args: '',
+    desc: 'Resume the run via tamandua CLI under TT spawn env',
+  },
+  cancel: {
+    args: '',
+    desc: 'Cancel the run via tamandua CLI under TT spawn env',
+  },
+  stop: {
+    args: '',
+    desc: 'Stop the run via tamandua CLI under TT spawn env',
+  },
+  'delete-tstx-row': {
+    args: '--tree <hash>',
+    desc: 'Delete a TSTX evidence row from the TT DB',
+  },
+  'write-context': {
+    args: '--key <k> --value <v>',
+    desc: 'Write/overwrite a context key in the TT DB',
+  },
+  'dirty-tree': {
+    args: '--repo <path>',
+    desc: 'Dirty a tracked file in the repo to create PARK bait',
+  },
+  'move-branch': {
+    args: '--repo <bare> --ref <r>',
+    desc: 'Move a ref in a bare repo to create rugpull pressure',
+  },
+};
+
+// ── Help ──────────────────────────────────────────────────────────────
+
+function showHelp() {
+  const actionList = Object.entries(ACTIONS)
+    .map(([name, { args, desc }]) => {
+      const argStr = args ? ` ${args}` : '';
+      return `  ${name}${argStr}\n      ${desc}`;
+    })
+    .join('\n');
+
+  console.log(`Usage: tt-chaos <action> --run <run-id> [action-args] --when <phase-marker> [--timeout <s>]
+
+Fault-injection operator for the tamandua torture-test suite.
+Executes one injection action per invocation, armed on a phase marker.
+
+Actions:
+${actionList}
+
+Options:
+  --run <run-id>       Target run ID (required)
+  --when <marker>      Phase marker expression — step:<role>:<state>,
+                       event:<type>, file:<path>, or "now"
+  --timeout <s>        Max seconds to wait for the phase marker
+                       (default: 120; --when now ignores this)
+  --help, -h           Print this usage and exit
+
+Phase markers:
+  step:<role>:<state>  Wait for step state transition (e.g. step:developer:running)
+  event:<type>         Wait for event row appearance (e.g. event:merge.parked)
+  file:<path>           Wait for file existence
+  now                  Fire immediately (no polling; logged as timed-not-triggered)
+
+Examples:
+  tt-chaos kill-harness --run run-abc123 --when now
+  tt-chaos pause --run run-abc123 --when step:developer:running
+  tt-chaos colleague-commit --repo var/fixture-clone --file README.md \\
+      --line "CHAOS MARKER" --run run-abc123 --when event:merge.parked
+`);
+}
+
+// ── Not-yet-implemented handler ──────────────────────────────────────
+
+function notYetImplemented(action) {
+  return () => {
+    console.error(`Action "${action}" is not yet implemented.`);
+    process.exit(1);
+  };
+}
+
+// ── US-005: Process action handlers ──────────────────────────────────
+
+const VALID_SIGNALS = ['SIGKILL', 'SIGTERM', 'SIGSTOP', 'SIGCONT', 'SIGINT', 'SIGHUP', 'SIGUSR1', 'SIGUSR2'];
+
+/**
+ * Resolve signal from --signal arg, defaulting to SIGKILL.
+ * Exits with error for invalid signal names.
+ */
+function resolveSignal(signalArg) {
+  const sig = (signalArg || 'SIGKILL').toUpperCase();
+  if (!VALID_SIGNALS.includes(sig)) {
+    console.error(`Error: Invalid signal "${sig}". Valid: ${VALID_SIGNALS.join(', ')}`);
+    process.exit(1);
+  }
+  return sig;
+}
+
+/**
+ * kill-harness: Send a signal to the active harness process for --run.
+ * Default signal: SIGKILL.
+ */
+function killHarness(opts) {
+  const { run: runId, args } = opts;
+  const signal = resolveSignal(args.signal);
+
+  const pid = findHarnessPid(runId);
+  if (!pid) {
+    const entry = {
+      ts: new Date().toISOString(),
+      action: 'kill-harness',
+      runId,
+      outcome: 'target_not_found',
+      error: `No harness process found for run ${runId}`,
+    };
+    logStructured(entry);
+    console.error(`Error: No harness process found for run ${runId}`);
+    process.exit(1);
+  }
+
+  try {
+    process.kill(pid, signal);
+    const entry = {
+      ts: new Date().toISOString(),
+      action: 'kill-harness',
+      runId,
+      target: `pid:${pid}`,
+      signal,
+      outcome: 'fired',
+    };
+    logStructured(entry);
+    console.error(`kill-harness: ${signal} sent to harness PID ${pid} (run ${runId})`);
+    process.exit(0);
+  } catch (e) {
+    const entry = {
+      ts: new Date().toISOString(),
+      action: 'kill-harness',
+      runId,
+      target: `pid:${pid}`,
+      signal,
+      outcome: 'fire_failed',
+      error: e.message,
+    };
+    logStructured(entry);
+    console.error(`Error: Failed to send ${signal} to PID ${pid}: ${e.message}`);
+    process.exit(1);
+  }
+}
+
+/**
+ * kill-daemon: Send a signal to the TT daemon (never the production daemon).
+ * Default signal: SIGKILL.
+ */
+function killDaemon(opts) {
+  const { run: runId, args } = opts;
+  const signal = resolveSignal(args.signal);
+
+  const pid = findDaemonPid();
+  if (!pid) {
+    const entry = {
+      ts: new Date().toISOString(),
+      action: 'kill-daemon',
+      runId,
+      outcome: 'target_not_found',
+      error: 'No TT daemon PID found',
+    };
+    logStructured(entry);
+    console.error('Error: No TT daemon PID found');
+    process.exit(1);
+  }
+
+  try {
+    process.kill(pid, signal);
+    const entry = {
+      ts: new Date().toISOString(),
+      action: 'kill-daemon',
+      runId,
+      target: `pid:${pid}`,
+      signal,
+      outcome: 'fired',
+    };
+    logStructured(entry);
+    console.error(`kill-daemon: ${signal} sent to daemon PID ${pid} (run ${runId})`);
+    process.exit(0);
+  } catch (e) {
+    const entry = {
+      ts: new Date().toISOString(),
+      action: 'kill-daemon',
+      runId,
+      target: `pid:${pid}`,
+      signal,
+      outcome: 'fire_failed',
+      error: e.message,
+    };
+    logStructured(entry);
+    console.error(`Error: Failed to send ${signal} to daemon PID ${pid}: ${e.message}`);
+    process.exit(1);
+  }
+}
+
+// ── US-008: DB mutation action handlers ─────────────────────────────
+
+/**
+ * Verify the DB path is under TT_ROOT before any mutation.
+ * Defense-in-depth check even though guardFire already validates this.
+ */
+function verifyDbPathForMutation() {
+  const dbPath = path.resolve(resolveDbPath());
+  if (!dbPath.startsWith(TT_ROOT + path.sep)) {
+    console.error(`Error: DB path "${dbPath}" is not under ${TT_ROOT}`);
+    process.exit(EXIT_GUARD_MISS);
+  }
+  return dbPath;
+}
+
+/**
+ * delete-tstx-row: Delete TSTX evidence rows from the TT DB.
+ * --tree <hash>: the tree hash to match for deletion.
+ */
+function deleteTstxRow(opts) {
+  const { run: runId, args } = opts;
+  const treeHash = args.tree;
+
+  if (!treeHash) {
+    console.error('Error: --tree is required for delete-tstx-row');
+    process.exit(1);
+  }
+
+  const dbPath = verifyDbPathForMutation();
+  let db = null;
+  let deletedCount = 0;
+
+  try {
+    db = new DatabaseSync(dbPath, { open: true });
+    const result = db.prepare('DELETE FROM tstx WHERE tree = ?').run(treeHash);
+    deletedCount = result.changes;
+  } catch (e) {
+    const entry = {
+      ts: new Date().toISOString(), action: 'delete-tstx-row', runId,
+      outcome: 'fire_failed', error: e.message,
+    };
+    logStructured(entry);
+    console.error(`Error: delete-tstx-row failed: ${e.message}`);
+    if (db) try { db.close(); } catch { /* ignore */ }
+    process.exit(1);
+  }
+
+  try { db.close(); } catch { /* ignore */ }
+
+  const entry = {
+    ts: new Date().toISOString(), action: 'delete-tstx-row', runId,
+    target: `tree:${treeHash}`, deletedCount,
+    outcome: 'fired',
+  };
+  logStructured(entry);
+  console.error(`delete-tstx-row: deleted ${deletedCount} row(s) for tree ${treeHash}`);
+  process.exit(0);
+}
+
+/**
+ * write-context: Write/overwrite a context key in the TT DB.
+ * --key <k> --value <v>: the key-value pair to write.
+ */
+function writeContext(opts) {
+  const { run: runId, args } = opts;
+  const key = args.key;
+  const value = args.value;
+
+  if (!key) {
+    console.error('Error: --key is required for write-context');
+    process.exit(1);
+  }
+  if (value === undefined) {
+    console.error('Error: --value is required for write-context');
+    process.exit(1);
+  }
+
+  const dbPath = verifyDbPathForMutation();
+  let db = null;
+
+  try {
+    db = new DatabaseSync(dbPath, { open: true });
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS run_context (
+        run_id TEXT NOT NULL,
+        key TEXT NOT NULL,
+        value TEXT,
+        PRIMARY KEY (run_id, key)
+      )
+    `);
+    db.prepare('INSERT OR REPLACE INTO run_context (run_id, key, value) VALUES (?, ?, ?)').run(runId, key, value);
+  } catch (e) {
+    const entry = {
+      ts: new Date().toISOString(), action: 'write-context', runId,
+      outcome: 'fire_failed', error: e.message,
+    };
+    logStructured(entry);
+    console.error(`Error: write-context failed: ${e.message}`);
+    if (db) try { db.close(); } catch { /* ignore */ }
+    process.exit(1);
+  }
+
+  try { db.close(); } catch { /* ignore */ }
+
+  const entry = {
+    ts: new Date().toISOString(), action: 'write-context', runId,
+    target: `key:${key}`, key, value: value.slice(0, 200),
+    outcome: 'fired',
+  };
+  logStructured(entry);
+  console.error(`write-context: wrote key "${key}" = "${value.slice(0, 80)}" for run ${runId}`);
+  process.exit(0);
+}
+
+// ── US-007: Git mutation action handlers ────────────────────────────
+
+/**
+ * colleague-commit: Make a competing commit from a second clone perspective.
+ * Uses plain git (git -C <repo>) to modify a file, stage it, and commit.
+ */
+function colleagueCommit(opts) {
+  const { run: runId, args } = opts;
+  const repo = args.repo;
+  const file = args.file;
+
+  if (!repo) {
+    console.error('Error: --repo is required for colleague-commit');
+    process.exit(1);
+  }
+  if (!file) {
+    console.error('Error: --file is required for colleague-commit');
+    process.exit(1);
+  }
+
+  const repoPath = path.resolve(repo);
+  const filePath = path.join(repoPath, file);
+  const sentinel = args.line || ('CHAOS MARKER ' + new Date().toISOString());
+
+  // Verify the repo path exists
+  try { fs.accessSync(repoPath); } catch {
+    const entry = { ts: new Date().toISOString(), action: 'colleague-commit', runId, outcome: 'target_not_found', error: `Repo path does not exist: ${repoPath}` };
+    logStructured(entry);
+    console.error(`Error: Repo path does not exist: ${repoPath}`);
+    process.exit(1);
+  }
+
+  let commitHash = '';
+  try {
+    // Append the sentinel line to the file (create if absent)
+    fs.appendFileSync(filePath, sentinel + '\n');
+
+    // Stage and commit
+    execSync(`git -C "${repoPath}" add -- "${file}"`, { encoding: 'utf-8', timeout: 10000 });
+    const result = execSync(
+      `git -C "${repoPath}" commit -m "chaos: colleague commit — ${sentinel.slice(0, 72)}"`,
+      { encoding: 'utf-8', timeout: 10000, env: { ...process.env, GIT_AUTHOR_NAME: 'Chaos Operator', GIT_AUTHOR_EMAIL: 'chaos@tamandua.test', GIT_COMMITTER_NAME: 'Chaos Operator', GIT_COMMITTER_EMAIL: 'chaos@tamandua.test' } }
+    );
+    // Extract commit hash from output
+    const match = result.match(/\[\S+\s+([a-f0-9]+)\]/);
+    if (match) commitHash = match[1];
+  } catch (e) {
+    const entry = { ts: new Date().toISOString(), action: 'colleague-commit', runId, outcome: 'fire_failed', error: e.message };
+    logStructured(entry);
+    console.error(`Error: colleague-commit failed: ${e.message}`);
+    process.exit(1);
+  }
+
+  const entry = {
+    ts: new Date().toISOString(), action: 'colleague-commit', runId,
+    target: `repo:${repoPath} file:${file}`, sentinel,
+    commit: commitHash || undefined, outcome: 'fired',
+  };
+  logStructured(entry);
+  console.error(`colleague-commit: committed "${sentinel.slice(0, 60)}" to ${file} in ${repoPath} (${commitHash || 'unknown hash'})`);
+  process.exit(0);
+}
+
+/**
+ * dirty-tree: Modify a tracked file without committing to create PARK bait.
+ * Appends a sentinel line to the first tracked file in the repo.
+ */
+function dirtyTree(opts) {
+  const { run: runId, args } = opts;
+  const repo = args.repo;
+
+  if (!repo) {
+    console.error('Error: --repo is required for dirty-tree');
+    process.exit(1);
+  }
+
+  const repoPath = path.resolve(repo);
+
+  try { fs.accessSync(repoPath); } catch {
+    const entry = { ts: new Date().toISOString(), action: 'dirty-tree', runId, outcome: 'target_not_found', error: `Repo path does not exist: ${repoPath}` };
+    logStructured(entry);
+    console.error(`Error: Repo path does not exist: ${repoPath}`);
+    process.exit(1);
+  }
+
+  let targetFile = '';
+  let sentinel = '';
+  try {
+    // Find a tracked file to dirty
+    const tracked = execSync(`git -C "${repoPath}" ls-files`, { encoding: 'utf-8', timeout: 10000 }).trim().split('\n').filter(Boolean);
+    if (tracked.length === 0) {
+      console.error('Error: No tracked files in repo to dirty');
+      process.exit(1);
+    }
+    targetFile = tracked[0];
+    sentinel = 'CHAOS DIRTY ' + new Date().toISOString();
+
+    fs.appendFileSync(path.join(repoPath, targetFile), sentinel + '\n');
+  } catch (e) {
+    const entry = { ts: new Date().toISOString(), action: 'dirty-tree', runId, outcome: 'fire_failed', error: e.message };
+    logStructured(entry);
+    console.error(`Error: dirty-tree failed: ${e.message}`);
+    process.exit(1);
+  }
+
+  const entry = {
+    ts: new Date().toISOString(), action: 'dirty-tree', runId,
+    target: `repo:${repoPath} file:${targetFile}`, sentinel,
+    outcome: 'fired',
+  };
+  logStructured(entry);
+  console.error(`dirty-tree: modified ${targetFile} in ${repoPath}`);
+  process.exit(0);
+}
+
+/**
+ * move-branch: Move a ref in a bare repo to create rugpull pressure.
+ * Moves the ref to its parent commit (ref~1).
+ */
+function moveBranch(opts) {
+  const { run: runId, args } = opts;
+  const repo = args.repo;
+  const ref = args.ref;
+
+  if (!repo) {
+    console.error('Error: --repo is required for move-branch');
+    process.exit(1);
+  }
+  if (!ref) {
+    console.error('Error: --ref is required for move-branch');
+    process.exit(1);
+  }
+
+  const repoPath = path.resolve(repo);
+
+  try { fs.accessSync(repoPath); } catch {
+    const entry = { ts: new Date().toISOString(), action: 'move-branch', runId, outcome: 'target_not_found', error: `Bare repo path does not exist: ${repoPath}` };
+    logStructured(entry);
+    console.error(`Error: Bare repo path does not exist: ${repoPath}`);
+    process.exit(1);
+  }
+
+  try {
+    // Resolve the ref to its full path and current commit hash
+    let currentHash = '';
+    let resolvedRef = '';
+
+    // First, resolve the full ref path (handles short names like "main" → "refs/heads/main")
+    try {
+      resolvedRef = execSync(`git --git-dir="${repoPath}" rev-parse --symbolic-full-name "${ref}"`, {
+        encoding: 'utf-8', timeout: 10000,
+        env: { ...process.env, GIT_DIR: repoPath },
+      }).trim();
+    } catch {
+      // If --symbolic-full-name fails, prepend refs/heads/ and try
+      resolvedRef = `refs/heads/${ref}`;
+      // Verify it exists
+      execSync(`git --git-dir="${repoPath}" rev-parse --verify "${resolvedRef}"`, {
+        encoding: 'utf-8', timeout: 10000,
+        env: { ...process.env, GIT_DIR: repoPath },
+      });
+    }
+
+    // Get current hash
+    currentHash = execSync(`git --git-dir="${repoPath}" rev-parse --verify "${resolvedRef}"`, {
+      encoding: 'utf-8', timeout: 10000,
+      env: { ...process.env, GIT_DIR: repoPath },
+    }).trim();
+
+    // Get parent commit
+    let parentHash = '';
+    try {
+      parentHash = execSync(`git --git-dir="${repoPath}" rev-parse --verify "${currentHash}~1"`, {
+        encoding: 'utf-8', timeout: 10000,
+        env: { ...process.env, GIT_DIR: repoPath },
+      }).trim();
+    } catch {
+      const entry = {
+        ts: new Date().toISOString(), action: 'move-branch', runId,
+        target: `repo:${repoPath} ref:${ref}`, outcome: 'fire_failed',
+        error: `Ref ${ref} (${currentHash}) has no parent commit to move to`,
+      };
+      logStructured(entry);
+      console.error(`Error: Ref ${ref} (${currentHash}) has no parent commit — cannot move`);
+      process.exit(1);
+    }
+
+    // Move the ref via update-ref (for bare repos)
+    execSync(`git --git-dir="${repoPath}" update-ref "${resolvedRef}" "${parentHash}"`, {
+      encoding: 'utf-8', timeout: 10000,
+      env: { ...process.env, GIT_DIR: repoPath },
+    });
+
+    const entry = {
+      ts: new Date().toISOString(), action: 'move-branch', runId,
+      target: `repo:${repoPath} ref:${ref}`, from: currentHash, to: parentHash,
+      outcome: 'fired',
+    };
+    logStructured(entry);
+    console.error(`move-branch: moved ${ref} from ${currentHash.slice(0, 8)} to ${parentHash.slice(0, 8)} in ${repoPath}`);
+    process.exit(0);
+  } catch (e) {
+    const entry = { ts: new Date().toISOString(), action: 'move-branch', runId, outcome: 'fire_failed', error: e.message };
+    logStructured(entry);
+    console.error(`Error: move-branch failed: ${e.message}`);
+    process.exit(1);
+  }
+}
+
+// ── US-006: Execution control actions (pause, resume, cancel, stop) ───
+
+/**
+ * Resolve the tamandua binary path.
+ * Priority: TAMANDUA_BINARY env var → <repo-root>/bin/tamandua → tamandua on PATH
+ */
+function resolveTamanduaBinary() {
+  if (process.env.TAMANDUA_BINARY) {
+    return process.env.TAMANDUA_BINARY;
+  }
+  const binPath = path.join(TT_REPO_ROOT, 'bin', 'tamandua');
+  try {
+    fs.accessSync(binPath, fs.constants.X_OK);
+    return binPath;
+  } catch {
+    // Fallback to PATH
+    return 'tamandua';
+  }
+}
+
+/**
+ * Build the environment for spawning the tamandua CLI under the TT env.
+ * Uses TT-specific HOME, TAMANDUA_STATE_DIR, and port files so the CLI
+ * talks to the TT daemon (43xx ports), never the production one (3334/3338/3339).
+ */
+function getTTSpawnEnv() {
+  const env = { ...process.env };
+  const ttHome = process.env.TT_HOME || path.resolve(TT_ROOT, '..', '..');
+  env.HOME = ttHome;
+  env.TAMANDUA_STATE_DIR = process.env.TAMANDUA_STATE_DIR || path.join(ttHome, '.tamandua');
+
+  // Read port overrides from TT state dir files (if present)
+  const stateDir = env.TAMANDUA_STATE_DIR;
+  try {
+    const port = fs.readFileSync(path.join(stateDir, 'port'), 'utf-8').trim();
+    if (port) env.TAMANDUA_PORT = port;
+  } catch { /* port file may not exist */ }
+  try {
+    const controlPort = fs.readFileSync(path.join(stateDir, 'control-port'), 'utf-8').trim();
+    if (controlPort) env.TAMANDUA_CONTROL_PORT = controlPort;
+  } catch { /* control-port file may not exist */ }
+  try {
+    const mcpPort = fs.readFileSync(path.join(stateDir, 'mcp-port'), 'utf-8').trim();
+    if (mcpPort) env.TAMANDUA_MCP_PORT = mcpPort;
+  } catch { /* mcp-port file may not exist */ }
+
+  return env;
+}
+
+/**
+ * Create an execution control handler for pause/resume/cancel/stop.
+ * Each action maps to `tamandua workflow <action> <run-id>` invoked
+ * via spawnSync under the TT spawn env.
+ */
+function makeExecutionControl(action) {
+  return function (opts) {
+    const { run: runId } = opts;
+    const binary = resolveTamanduaBinary();
+    const env = getTTSpawnEnv();
+
+    const cliArgs = ['workflow', action, runId];
+
+    try {
+      const result = spawnSync(binary, cliArgs, {
+        env,
+        timeout: 30000,
+        stdio: 'pipe',
+        encoding: 'utf-8',
+      });
+
+      const stdout = (result.stdout || '').slice(0, 500);
+      const stderr = (result.stderr || '').slice(0, 500);
+      const status = result.status ?? (result.error ? -1 : null);
+      const outcome = status === 0 ? 'fired' : 'execution_failed';
+
+      const entry = {
+        ts: new Date().toISOString(),
+        action,
+        runId,
+        outcome,
+        exitCode: status,
+        stdout: stdout || undefined,
+        stderr: stderr || undefined,
+      };
+      logStructured(entry);
+
+      if (status !== 0) {
+        console.error(`${action}: workflow ${action} failed for run ${runId} (exit ${status})`);
+        if (stderr) console.error(stderr.slice(0, 200));
+        process.exit(1);
+      }
+
+      console.error(`${action}: workflow ${action} invoked for run ${runId}`);
+      process.exit(0);
+    } catch (e) {
+      const entry = {
+        ts: new Date().toISOString(),
+        action,
+        runId,
+        outcome: 'execution_failed',
+        error: e.message,
+      };
+      logStructured(entry);
+      console.error(`Error: ${action} failed: ${e.message}`);
+      process.exit(1);
+    }
+  };
+}
+
+// ── Action dispatch table ─────────────────────────────────────────────
+
+/** @type {Record<string, (opts: {run: string, when: string, timeout: number, args: Record<string, string>}) => void>} */
+const dispatch = {
+  'kill-harness': killHarness,
+  'kill-daemon': killDaemon,
+  'colleague-commit': colleagueCommit,
+  pause: makeExecutionControl('pause'),
+  resume: makeExecutionControl('resume'),
+  cancel: makeExecutionControl('cancel'),
+  stop: makeExecutionControl('stop'),
+  'delete-tstx-row': deleteTstxRow,
+  'write-context': writeContext,
+  'dirty-tree': dirtyTree,
+  'move-branch': moveBranch,
+};
+
+// ── Helper: resolve TT DB path ──────────────────────────────────────
+
+function resolveDbPath() {
+  if (process.env.TAMANDUA_STATE_DIR) {
+    return path.resolve(process.env.TAMANDUA_STATE_DIR, 'tamandua.db');
+  }
+  if (process.env.TT_HOME) {
+    return path.resolve(process.env.TT_HOME, '.tamandua', 'tamandua.db');
+  }
+  // Fallback: TT_HOME is at the parent of TT_ROOT (which is torture-test/var)
+  return path.resolve(TT_ROOT, '..', '..', '.tamandua', 'tamandua.db');
+}
+
+// ── phase_wait: marker polling and timeout engine ────────────────────
+
+/**
+ * Poll for a phase marker with timeout.
+ *
+ * @param {string} marker - The phase marker expression
+ * @param {number} timeoutSec - Max seconds to wait
+ * @param {string} runId - The run ID for DB-scoped queries
+ * @returns {{satisfied: boolean, reason?: string}}
+ */
+function phaseWait(marker, timeoutSec, runId) {
+  // --when now: fire immediately, log as timed-not-triggered
+  if (marker === 'now') {
+    logStructured({ ts: new Date().toISOString(), action: 'phase_wait', runId, phaseMarker: marker, phaseSatisfied: false, outcome: 'timed_not_triggered' });
+    return { satisfied: true };
+  }
+
+  let db = null;
+  const needsDb = marker.startsWith('step:') || marker.startsWith('event:');
+
+  if (needsDb) {
+    const dbPath = resolveDbPath();
+    try {
+      db = new DatabaseSync(dbPath, { open: true, readOnly: true });
+    } catch {
+      // DB not available — can't poll step/event markers, fail after timeout
+      // (let the poll loop handle it so error is clean)
+    }
+  }
+
+  const deadline = Date.now() + timeoutSec * 1000;
+
+  while (Date.now() < deadline) {
+    const found = checkMarker(marker, db, runId);
+    if (found) {
+      logStructured({ ts: new Date().toISOString(), action: 'phase_wait', runId, phaseMarker: marker, phaseSatisfied: true, outcome: 'marker_satisfied' });
+      if (db) db.close();
+      return { satisfied: true };
+    }
+    // Busy-wait sleep via synchronous spin (sync alternative to setTimeout for CLI scripts)
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, POLL_INTERVAL_MS);
+  }
+
+  if (db) db.close();
+
+  logStructured({ ts: new Date().toISOString(), action: 'phase_wait', runId, phaseMarker: marker, phaseSatisfied: false, outcome: 'trigger_never_materialized' });
+  return { satisfied: false, reason: 'TRIGGER_NEVER_MATERIALIZED' };
+}
+
+/**
+ * Check if a specific marker is currently satisfied.
+ */
+function checkMarker(marker, db, runId) {
+  if (marker.startsWith('step:')) {
+    return checkStepMarker(marker, db, runId);
+  }
+  if (marker.startsWith('event:')) {
+    return checkEventMarker(marker, db, runId);
+  }
+  if (marker.startsWith('file:')) {
+    return checkFileMarker(marker);
+  }
+  return false;
+}
+
+/**
+ * Check step:<role>:<state> marker.
+ * Format: step:<role>:<state> (exact match on agent_id containing role, status exact match)
+ */
+function checkStepMarker(marker, db, runId) {
+  if (!db) return false;
+  const parts = marker.slice('step:'.length).split(':');
+  if (parts.length !== 2) return false;
+  const [role, state] = parts;
+
+  try {
+    const rows = db.prepare(
+      `SELECT 1 FROM steps WHERE run_id = ? AND agent_id LIKE ? AND status = ? LIMIT 1`
+    ).all(runId, `%${role}%`, state);
+    return rows.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Check event:<type> marker.
+ * Format: event:<type> (substring match on event column)
+ */
+function checkEventMarker(marker, db, runId) {
+  if (!db) return false;
+  const eventType = marker.slice('event:'.length);
+
+  try {
+    const rows = db.prepare(
+      `SELECT 1 FROM events WHERE run_id = ? AND event LIKE ? LIMIT 1`
+    ).all(runId, `%${eventType}%`);
+    return rows.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Check file:<path> marker.
+ * Format: file:<path> (fs.accessSync for existence)
+ */
+function checkFileMarker(marker) {
+  const filePath = marker.slice('file:'.length);
+  try {
+    fs.accessSync(filePath, fs.constants.F_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Validate --when marker format.
+ */
+function validateMarker(marker) {
+  if (marker === 'now') return true;
+  if (marker.startsWith('step:') && marker.slice('step:'.length).includes(':')) return true;
+  if (marker.startsWith('event:') && marker.slice('event:'.length).length > 0) return true;
+  if (marker.startsWith('file:') && marker.slice('file:'.length).length > 0) return true;
+  return false;
+}
+
+// ── Target guard classification ─────────────────────────────────────
+
+/**
+ * Classify whether an action targets a process, filesystem path, or DB.
+ * Returns { kind: 'process'|'filesystem'|'db'|'none', path?: string }.
+ */
+function classifyTarget(action, opts) {
+  const processActions = ['kill-harness', 'kill-daemon'];
+  const fsActions = ['colleague-commit', 'dirty-tree', 'move-branch'];
+  const dbActions = ['delete-tstx-row', 'write-context'];
+
+  if (processActions.includes(action)) {
+    return { kind: 'process' };
+  }
+  if (fsActions.includes(action)) {
+    // Resolve the --repo path if present
+    const repoPath = opts.args.repo || '';
+    return { kind: 'filesystem', path: repoPath ? path.resolve(repoPath) : '' };
+  }
+  if (dbActions.includes(action)) {
+    return { kind: 'db', path: resolveDbPath() };
+  }
+  return { kind: 'none' };
+}
+
+/**
+ * Target guard — called immediately before every fire.
+ * Checks:
+ *   (a) --run id exists in TT DB and is non-terminal (where relevant)
+ *   (b) process cwd/cmdline contain torture-test/var (process actions)
+ *   (c) repo path is under torture-test/var (filesystem actions)
+ *   (d) DB path is under torture-test/var (DB-mutating actions)
+ *
+ * @returns {{guarded: true} | {guarded: false, reason: string}}
+ */
+function guardFire(action, runId, opts) {
+  const target = classifyTarget(action, opts);
+
+  // (a) Run existence check
+  const dbPath = resolveDbPath();
+  let db = null;
+  try {
+    db = new DatabaseSync(dbPath, { open: true, readOnly: true });
+  } catch {
+    return { guarded: false, reason: `Cannot open TT DB at ${dbPath} for guard check` };
+  }
+
+  try {
+    const rows = db.prepare('SELECT status FROM runs WHERE run_id = ? LIMIT 1').all(runId);
+    if (rows.length === 0) {
+      db.close();
+      return { guarded: false, reason: `Run ${runId} not found in TT DB` };
+    }
+    const status = rows[0].status;
+    const terminalStatuses = ['completed', 'failed', 'cancelled', 'stopped'];
+    if (terminalStatuses.includes(status)) {
+      db.close();
+      return { guarded: false, reason: `Run ${runId} is terminal (${status}) — refusing to fire` };
+    }
+  } catch (e) {
+    db.close();
+    return { guarded: false, reason: `DB query failed during guard check: ${e.message}` };
+  }
+  db.close();
+
+  // (b) Process provenance check
+  if (target.kind === 'process') {
+    const pid = findTargetPid(action, runId);
+    if (!pid) {
+      return { guarded: false, reason: `Cannot find target PID for ${action} run ${runId}` };
+    }
+    if (!verifyProcessProvenance(pid)) {
+      return { guarded: false, reason: `Process ${pid} cwd/cmdline does not contain ${TT_ROOT}` };
+    }
+  }
+
+  // (c) Filesystem path check
+  if (target.kind === 'filesystem') {
+    const resolvedPath = target.path;
+    if (!resolvedPath || !resolvedPath.startsWith(TT_ROOT + path.sep)) {
+      return { guarded: false, reason: `Path "${resolvedPath}" is not under ${TT_ROOT}` };
+    }
+  }
+
+  // (d) DB path check
+  if (target.kind === 'db') {
+    const resolvedDbPath = target.path;
+    if (!resolvedDbPath || !resolvedDbPath.startsWith(TT_ROOT + path.sep)) {
+      return { guarded: false, reason: `DB path "${resolvedDbPath}" is not under ${TT_ROOT}` };
+    }
+  }
+
+  return { guarded: true };
+}
+
+/**
+ * Find the target PID for process-targeting actions.
+ * kill-harness: finds the harness process for the run via cwd/cmdline under TT_ROOT
+ * kill-daemon: finds the TT daemon process via pidfile or process scan
+ */
+function findTargetPid(action, runId) {
+  if (action === 'kill-harness') {
+    // Scan /proc for processes running under TT_ROOT with the run ID in their cmdline
+    return findHarnessPid(runId);
+  }
+  if (action === 'kill-daemon') {
+    return findDaemonPid();
+  }
+  return null;
+}
+
+/**
+ * Find a harness process PID by scanning /proc for processes whose
+ * cwd or cmdline contains the run ID and torture-test/var.
+ */
+function findHarnessPid(runId) {
+  try {
+    const procDirs = fs.readdirSync('/proc').filter(d => /^\d+$/.test(d));
+    for (const d of procDirs) {
+      const cwdPath = `/proc/${d}/cwd`;
+      const cmdlinePath = `/proc/${d}/cmdline`;
+      try {
+        const cwd = fs.readlinkSync(cwdPath);
+        const cmdline = fs.readFileSync(cmdlinePath, 'utf-8').replace(/\0/g, ' ');
+        if (cwd.includes(TT_ROOT) && cmdline.includes(runId)) {
+          return parseInt(d, 10);
+        }
+      } catch {
+        // Process may have exited or we may lack permissions — skip
+      }
+    }
+  } catch {
+    // /proc may not be readable
+  }
+  return null;
+}
+
+/**
+ * Find the TT daemon PID from the TT state directory pidfile.
+ */
+function findDaemonPid() {
+  // Check standard pidfile locations under TT state
+  const ttHome = process.env.TT_HOME || path.resolve(TT_ROOT, '..', '..');
+  const pidFile = path.resolve(ttHome, '.tamandua', 'daemon.pid');
+  try {
+    const pidStr = fs.readFileSync(pidFile, 'utf-8').trim();
+    const pid = parseInt(pidStr, 10);
+    if (pid > 0) return pid;
+  } catch {
+    // pidfile doesn't exist
+  }
+
+  // Fallback: scan /proc for node processes with tamandua daemon in cmdline under TT_ROOT
+  return findDaemonPidByScan();
+}
+
+/**
+ * Scan /proc for a node process with 'daemon' in cmdline under TT_ROOT.
+ */
+function findDaemonPidByScan() {
+  try {
+    const procDirs = fs.readdirSync('/proc').filter(d => /^\d+$/.test(d));
+    for (const d of procDirs) {
+      const cwdPath = `/proc/${d}/cwd`;
+      const cmdlinePath = `/proc/${d}/cmdline`;
+      try {
+        const cwd = fs.readlinkSync(cwdPath);
+        const cmdline = fs.readFileSync(cmdlinePath, 'utf-8').replace(/\0/g, ' ');
+        if (cwd.includes(TT_ROOT) && cmdline.includes('daemon') && !cmdline.includes('daemonctl') && !cmdline.includes('daemon-control')) {
+          return parseInt(d, 10);
+        }
+      } catch {
+        // skip
+      }
+    }
+  } catch {
+    // /proc not readable
+  }
+  return null;
+}
+
+/**
+ * Verify a process PID's provenance: its cwd and cmdline must contain TT_ROOT.
+ */
+function verifyProcessProvenance(pid) {
+  try {
+    const cwdPath = `/proc/${pid}/cwd`;
+    const cmdlinePath = `/proc/${pid}/cmdline`;
+    const cwd = fs.readlinkSync(cwdPath);
+    const cmdline = fs.readFileSync(cmdlinePath, 'utf-8').replace(/\0/g, ' ');
+    return cwd.includes(TT_ROOT) && cmdline.includes(TT_ROOT);
+  } catch {
+    return false;
+  }
+}
+
+// ── Evidence capture before destruction ─────────────────────────────
+
+/**
+ * Capture pre-fire evidence snapshot.
+ *
+ * For destructive actions: full snapshot (DB rows, process tree, git status, daemon log).
+ * For non-destructive actions: lighter capture (DB rows only).
+ *
+ * The evidence directory is created before any mutation.
+ * Failed evidence capture does not block the injection — logs a warning and continues.
+ *
+ * @param {string} action - The action name
+ * @param {string} runId - The run ID
+ * @param {object} opts - The parsed CLI options
+ * @param {object|null} targetInfo - classifyTarget result (pre-computed)
+ * @returns {{path: string}|null} - Evidence directory path, or null if skipped
+ */
+function captureEvidence(action, runId, opts, targetInfo) {
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  const evidenceDir = path.resolve(CHAOS_DIR, `${ts}-${action}`);
+
+  try {
+    fs.mkdirSync(evidenceDir, { recursive: true });
+  } catch (e) {
+    console.error(`Warning: Cannot create evidence directory ${evidenceDir}: ${e.message}`);
+    return null;
+  }
+
+  const writeFile = (name, content) => {
+    try {
+      fs.writeFileSync(path.join(evidenceDir, name), content);
+    } catch (e) {
+      console.error(`Warning: Evidence capture failed for ${name}: ${e.message}`);
+    }
+  };
+
+  // 1. Capture DB data (runs, steps, events) — always attempted if DB accessible
+  captureDbEvidence(runId, writeFile, action, opts);
+
+  // 2. Capture pre-mutation DB state for DB-targeting actions
+  if (targetInfo && targetInfo.kind === 'db') {
+    captureDbMutationEvidence(action, runId, opts, writeFile);
+  }
+
+  // 3. Capture process tree for process-targeting actions
+  if (targetInfo && targetInfo.kind === 'process') {
+    captureProcessEvidence(action, runId, writeFile);
+  }
+
+  // 4. Capture git status for filesystem-targeting actions and destructive actions
+  if (targetInfo && (targetInfo.kind === 'filesystem' || isDestructive(action))) {
+    captureWorktreeEvidence(runId, opts, writeFile);
+  }
+
+  // 5. Capture daemon log tail for destructive actions
+  if (isDestructive(action)) {
+    captureDaemonLogEvidence(writeFile);
+  }
+
+  return { path: evidenceDir };
+}
+
+/**
+ * Capture run, steps, and events data from the TT DB.
+ */
+function captureDbEvidence(runId, writeFile, _action, _opts) {
+  const dbPath = resolveDbPath();
+  let db = null;
+
+  // Open read-only for evidence capture
+  try {
+    db = new DatabaseSync(dbPath, { open: true, readOnly: true });
+  } catch {
+    writeFile('db_error.txt', `Cannot open TT DB at ${dbPath}\n`);
+    return;
+  }
+
+  try {
+    // Capture run row
+    const runRows = db.prepare('SELECT * FROM runs WHERE run_id = ?').all(runId);
+    if (runRows.length > 0) {
+      writeFile('run.json', JSON.stringify(runRows[0], null, 2));
+    } else {
+      writeFile('run.json', JSON.stringify({ error: `run_id ${runId} not found` }, null, 2));
+    }
+
+    // Capture steps for this run
+    const stepRows = db.prepare('SELECT * FROM steps WHERE run_id = ?').all(runId);
+    writeFile('steps.json', JSON.stringify(stepRows, null, 2));
+
+    // Capture events for this run (last 200 rows to keep evidence manageable)
+    const eventRows = db.prepare(
+      'SELECT * FROM events WHERE run_id = ? ORDER BY ts DESC LIMIT 200'
+    ).all(runId);
+    writeFile('events.json', JSON.stringify(eventRows, null, 2));
+  } catch (e) {
+    writeFile('db_error.txt', `DB query failed: ${e.message}\n`);
+  } finally {
+    try { db.close(); } catch { /* ignore */ }
+  }
+}
+
+/**
+ * Capture target process tree information.
+ */
+function captureProcessEvidence(action, runId, writeFile) {
+  const pid = findTargetPid(action, runId);
+  let output = '';
+
+  if (pid) {
+    output += `Target PID: ${pid}\n`;
+    output += captureProcInfo(pid);
+
+    // Capture child processes (pgid)
+    try {
+      const statusStr = fs.readFileSync(`/proc/${pid}/status`, 'utf-8');
+      const ppidMatch = statusStr.match(/PPid:\s*(\d+)/);
+      const pgid = pid; // approximate
+      output += `\nProcess tree (children of ${pid}):\n`;
+      output += captureChildrenProcs(pid);
+    } catch {
+      output += '(could not read process tree)\n';
+    }
+  } else {
+    output += 'Target process not found (may have already exited)\n';
+
+    // Provide a broader /proc snapshot for context
+    output += '\nActive processes under ' + TT_ROOT + ':\n';
+    output += captureProcScan();
+  }
+
+  writeFile('process_tree.txt', output);
+}
+
+/**
+ * Capture /proc info for a single PID.
+ */
+function captureProcInfo(pid) {
+  let info = '';
+  try {
+    info += `  Cmdline: ${fs.readFileSync(`/proc/${pid}/cmdline`, 'utf-8').replace(/\0/g, ' ')}\n`;
+  } catch { info += `  Cmdline: (unreadable)\n`; }
+  try {
+    info += `  CWD: ${fs.readlinkSync(`/proc/${pid}/cwd`)}\n`;
+  } catch { info += `  CWD: (unreadable)\n`; }
+  try {
+    const statusStr = fs.readFileSync(`/proc/${pid}/status`, 'utf-8');
+    for (const key of ['Name', 'State', 'Pid', 'PPid', 'Tgid', 'Threads', 'VmSize', 'VmRSS', 'voluntary_ctxt_switches', 'nonvoluntary_ctxt_switches']) {
+      const match = statusStr.match(new RegExp(`^${key}:\\s*(.+)$`, 'm'));
+      if (match) info += `  ${key}: ${match[1].trim()}\n`;
+    }
+  } catch { info += `  Status: (unreadable)\n`; }
+  return info;
+}
+
+/**
+ * Capture child processes of a given PID.
+ */
+function captureChildrenProcs(parentPid) {
+  let output = '';
+  try {
+    const procDirs = fs.readdirSync('/proc').filter(d => /^\d+$/.test(d));
+    for (const d of procDirs) {
+      try {
+        const statusStr = fs.readFileSync(`/proc/${d}/status`, 'utf-8');
+        const ppidMatch = statusStr.match(/PPid:\s*(\d+)/);
+        if (ppidMatch && parseInt(ppidMatch[1], 10) === parentPid) {
+          output += `  └─ PID ${d}`;
+          try {
+            const cmdline = fs.readFileSync(`/proc/${d}/cmdline`, 'utf-8').replace(/\0/g, ' ');
+            output += ` ${cmdline}`;
+          } catch { /* ignore */ }
+          output += `\n`;
+        }
+      } catch { /* skip unreadable */ }
+    }
+  } catch { /* /proc unreadable */ }
+  if (!output) output = '  (no children found)\n';
+  return output;
+}
+
+/**
+ * Scan /proc for processes running under TT_ROOT (broad context).
+ */
+function captureProcScan() {
+  let output = '';
+  try {
+    const procDirs = fs.readdirSync('/proc').filter(d => /^\d+$/.test(d));
+    for (const d of procDirs) {
+      try {
+        const cwd = fs.readlinkSync(`/proc/${d}/cwd`);
+        if (cwd.includes(TT_ROOT)) {
+          const cmdline = fs.readFileSync(`/proc/${d}/cmdline`, 'utf-8').replace(/\0/g, ' ');
+          output += `  PID ${d}: ${cmdline}\n`;
+          output += `    CWD: ${cwd}\n`;
+        }
+      } catch { /* skip */ }
+    }
+  } catch { /* /proc unreadable */ }
+  if (!output) output = '(no processes found under ' + TT_ROOT + ')\n';
+  return output;
+}
+
+/**
+ * Capture worktree git status and HEAD for filesystem-targeting actions.
+ */
+function captureWorktreeEvidence(runId, opts, writeFile) {
+  // Try to find the worktree path from DB (if accessible)
+  const dbPath = resolveDbPath();
+  let worktreePath = null;
+
+  try {
+    const db = new DatabaseSync(dbPath, { open: true, readOnly: true });
+    try {
+      const rows = db.prepare(
+        `SELECT path FROM worktrees WHERE run_id = ? LIMIT 1`
+      ).all(runId);
+      if (rows.length > 0 && rows[0].path) {
+        worktreePath = rows[0].path;
+      }
+    } catch { /* table may not exist */ }
+    db.close();
+  } catch { /* DB not accessible */ }
+
+  // Fallback: use the --repo path from opts
+  if (!worktreePath && opts.args.repo) {
+    worktreePath = path.resolve(opts.args.repo);
+  }
+
+  if (worktreePath) {
+    captureGitStatus(worktreePath, writeFile);
+  } else {
+    writeFile('git_status.txt', '(worktree path unknown)\n');
+  }
+}
+
+/**
+ * Capture git status and HEAD for a given repository path.
+ */
+function captureGitStatus(repoPath, writeFile) {
+  let output = `Repo: ${repoPath}\n\n`;
+
+  const runGit = (args, label) => {
+    try {
+      const stdout = execSync(['git', ...args].join(' '), {
+        cwd: repoPath,
+        encoding: 'utf-8',
+        timeout: 5000,
+      });
+      return `${label}:\n${stdout}\n`;
+    } catch (e) {
+      return `${label}: (error: ${e.message})\n`;
+    }
+  };
+
+  output += runGit(['-C', repoPath, 'rev-parse', 'HEAD'], 'HEAD');
+  output += runGit(['-C', repoPath, 'status', '--porcelain', '--branch'], 'Status');
+  output += runGit(['-C', repoPath, 'log', '--oneline', '-5'], 'Recent log');
+
+  writeFile('git_status.txt', output);
+}
+
+/**
+ * Capture daemon log tail (last 200 lines).
+ */
+function captureDaemonLogEvidence(writeFile) {
+  const logPaths = [];
+
+  // TT daemon log path: $TAMANDUA_STATE_DIR/tamandua.log or $TT_HOME/.tamandua/tamandua.log
+  if (process.env.TAMANDUA_STATE_DIR) {
+    logPaths.push(path.resolve(process.env.TAMANDUA_STATE_DIR, 'tamandua.log'));
+  }
+  if (process.env.TT_HOME) {
+    logPaths.push(path.resolve(process.env.TT_HOME, '.tamandua', 'tamandua.log'));
+  }
+  // Fallback: default TT state dir
+  logPaths.push(path.resolve(TT_ROOT, '..', '..', '.tamandua', 'tamandua.log'));
+
+  let captured = false;
+  for (const logPath of logPaths) {
+    try {
+      if (!fs.existsSync(logPath)) continue;
+      const content = fs.readFileSync(logPath, 'utf-8');
+      // Last 200 lines
+      const lines = content.split('\n');
+      const tail = lines.slice(Math.max(0, lines.length - 200)).join('\n');
+      writeFile('daemon_log_tail.txt', `Source: ${logPath}\n\n${tail}`);
+      captured = true;
+      break;
+    } catch { /* continue to next candidate */ }
+  }
+
+  if (!captured) {
+    writeFile('daemon_log_tail.txt', '(daemon log not found)\n');
+  }
+}
+
+/**
+ * Capture pre-mutation DB state for DB-targeting actions.
+ * Snapshot the rows that will be affected by delete-tstx-row or write-context.
+ */
+function captureDbMutationEvidence(action, runId, opts, writeFile) {
+  const dbPath = resolveDbPath();
+  let db = null;
+
+  try {
+    db = new DatabaseSync(dbPath, { open: true, readOnly: true });
+  } catch {
+    writeFile('db_mutation_no_db.txt', `Cannot open TT DB at ${dbPath} for pre-mutation evidence\n`);
+    return;
+  }
+
+  try {
+    if (action === 'delete-tstx-row' && opts.args.tree) {
+      const rows = db.prepare('SELECT * FROM tstx WHERE tree = ?').all(opts.args.tree);
+      writeFile('pre_mutation_tstx.json', JSON.stringify(rows, null, 2));
+    } else if (action === 'write-context' && opts.args.key) {
+      // Check if run_context table exists first
+      try {
+        const rows = db.prepare('SELECT * FROM run_context WHERE run_id = ? AND key = ?').all(runId, opts.args.key);
+        writeFile('pre_mutation_run_context.json', JSON.stringify(rows, null, 2));
+      } catch {
+        // Table may not exist yet
+        writeFile('pre_mutation_run_context.json', JSON.stringify([], null, 2));
+      }
+    }
+  } catch (e) {
+    writeFile('db_mutation_error.txt', `Pre-mutation DB capture failed: ${e.message}\n`);
+  } finally {
+    try { db.close(); } catch { /* ignore */ }
+  }
+}
+
+// ── Chaos log (atomic append) ────────────────────────────────────────
+
+/**
+ * Append a structured JSON entry to the chaos log atomically.
+ * Uses temp-file + rename for atomicity — no partial lines.
+ */
+function logStructured(entry) {
+  try {
+    const line = JSON.stringify(entry) + '\n';
+    // Read existing log, append, write to temp, rename
+    let existing = '';
+    try {
+      existing = fs.readFileSync(CHAOS_LOG, 'utf-8');
+    } catch {
+      // Log doesn't exist yet — start fresh
+    }
+    const tmpLog = `${CHAOS_LOG}.tmp.${process.pid}.${Date.now()}`;
+    fs.writeFileSync(tmpLog, existing + line);
+    fs.renameSync(tmpLog, CHAOS_LOG);
+  } catch {
+    // Best-effort logging; don't fail on log write errors
+  }
+}
+
+// ── CLI parsing ───────────────────────────────────────────────────────
+
+const args = process.argv.slice(2);
+
+// Check for --help/-h before anything else
+const helpIdx = args.findIndex(a => a === '--help' || a === '-h');
+if (helpIdx !== -1) {
+  showHelp();
+  process.exit(0);
+}
+
+// First positional arg is the action
+if (args.length === 0) {
+  console.error('Error: Missing action. Use --help for usage.');
+  process.exit(1);
+}
+
+const action = args[0];
+
+// Validate action
+const actionNames = Object.keys(ACTIONS);
+if (!actionNames.includes(action)) {
+  console.error(`Error: Unknown action "${action}". Valid actions: ${actionNames.join(', ')}`);
+  process.exit(1);
+}
+
+// Parse remaining args: --run, --when, --timeout, and action-specific args
+const opts = {
+  run: null,
+  when: null,
+  timeout: 120,
+  args: /** @type {Record<string, string>} */ ({}),
+};
+
+let i = 1;
+while (i < args.length) {
+  const arg = args[i];
+
+  if (arg === '--run') {
+    if (i + 1 >= args.length) {
+      console.error('Error: --run requires a value.');
+      process.exit(1);
+    }
+    opts.run = args[++i];
+  } else if (arg === '--when') {
+    if (i + 1 >= args.length) {
+      console.error('Error: --when requires a value.');
+      process.exit(1);
+    }
+    opts.when = args[++i];
+  } else if (arg === '--timeout') {
+    if (i + 1 >= args.length) {
+      console.error('Error: --timeout requires a value.');
+      process.exit(1);
+    }
+    const t = parseInt(args[++i], 10);
+    if (isNaN(t) || t <= 0) {
+      console.error(`Error: --timeout must be a positive integer, got "${args[i]}".`);
+      process.exit(1);
+    }
+    opts.timeout = t;
+  } else if (arg.startsWith('--')) {
+    // Action-specific flag argument (--flag value)
+    const flagName = arg.slice(2);
+    if (i + 1 >= args.length || args[i + 1].startsWith('--')) {
+      console.error(`Error: Flag "${arg}" requires a value.`);
+      process.exit(1);
+    }
+    opts.args[flagName] = args[++i];
+  } else {
+    // Unrecognized positional arg (shouldn't happen after action)
+    console.error(`Error: Unexpected argument "${arg}". Use --help for usage.`);
+    process.exit(1);
+  }
+  i++;
+}
+
+// Validate --run is required
+if (!opts.run) {
+  console.error('Error: --run is required. Use --help for usage.');
+  process.exit(1);
+}
+
+// Validate --when is required
+if (!opts.when) {
+  console.error('Error: --when is required. Use --help for usage.');
+  process.exit(1);
+}
+
+// Validate marker format
+if (!validateMarker(opts.when)) {
+  console.error(`Error: Invalid --when marker format "${opts.when}".`);
+  console.error('  Must be one of: now, step:<role>:<state>, event:<type>, file:<path>');
+  process.exit(EXIT_INVALID_MARKER);
+}
+
+// ── Phase wait ───────────────────────────────────────────────────────
+
+const phaseResult = phaseWait(opts.when, opts.timeout, opts.run);
+if (!phaseResult.satisfied) {
+  console.error(`TRIGGER_NEVER_MATERIALIZED: Marker "${opts.when}" did not materialize within ${opts.timeout}s.`);
+  process.exit(EXIT_TRIGGER_NEVER);
+}
+
+// ── Evidence capture before destruction ──────────────────────────────
+
+// Capture evidence BEFORE the target guard so we have a pre-state snapshot
+// even on guard failure (captures what triggered the guard).
+// Classify target first so captureEvidence knows what to capture.
+const targetInfo = classifyTarget(action, opts);
+const evidenceResult = captureEvidence(action, opts.run, opts, targetInfo);
+
+// ── Target guard ─────────────────────────────────────────────────────
+
+const guardResult = guardFire(action, opts.run, opts);
+if (!guardResult.guarded) {
+  const logEntry = {
+    ts: new Date().toISOString(),
+    action,
+    runId: opts.run,
+    phaseMarker: opts.when,
+    phaseSatisfied: true,
+    target: targetInfo.kind,
+    outcome: 'guard_miss',
+    error: guardResult.reason,
+    evidence: evidenceResult ? evidenceResult.path : null,
+  };
+  logStructured(logEntry);
+  console.error(`GUARD_MISS: ${guardResult.reason}`);
+  process.exit(EXIT_GUARD_MISS);
+}
+
+// ── Dispatch ──────────────────────────────────────────────────────────
+
+// Log the successful fire with evidence path
+const fireLogEntry = {
+  ts: new Date().toISOString(),
+  action,
+  runId: opts.run,
+  phaseMarker: opts.when,
+  phaseSatisfied: true,
+  target: targetInfo.kind,
+  outcome: 'firing',
+  evidence: evidenceResult ? evidenceResult.path : null,
+};
+logStructured(fireLogEntry);
+
+const handler = dispatch[action];
+handler({ run: opts.run, when: opts.when, timeout: opts.timeout, args: opts.args });
