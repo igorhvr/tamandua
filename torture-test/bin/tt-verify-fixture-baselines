@@ -1,0 +1,82 @@
+#!/usr/bin/env node
+
+import fs from 'node:fs';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+
+const BIN_DIR = path.dirname(fileURLToPath(import.meta.url));
+const TT_ROOT = path.resolve(BIN_DIR, '..');
+const GOLDEN_ROOT = path.join(TT_ROOT, 'var', 'fixtures', 'golden');
+
+function fail(message) {
+  console.error(message);
+  process.exit(2);
+}
+
+function runGit(gitDir, args) {
+  const result = spawnSync('git', [`--git-dir=${gitDir}`, ...args], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    shell: false,
+  });
+  if (result.error !== undefined) throw result.error;
+  if (result.status !== 0) {
+    throw new Error(`git ${args.join(' ')} exited ${result.status}: ${result.stderr.trim()}`);
+  }
+  return result.stdout.trim();
+}
+
+let entries = [];
+try {
+  if (fs.existsSync(GOLDEN_ROOT)) {
+    entries = fs.readdirSync(GOLDEN_ROOT, { withFileTypes: true })
+      .filter((entry) => entry.name.endsWith('.git'))
+      .sort((left, right) => left.name.localeCompare(right.name));
+  }
+} catch (error) {
+  fail(`cannot enumerate golden fixtures: ${error.message}`);
+}
+
+const fixtures = [];
+for (const entry of entries) {
+  const fixturePath = path.join(GOLDEN_ROOT, entry.name);
+  const evidence = {
+    name: entry.name,
+    path: path.relative(TT_ROOT, fixturePath),
+    result: 'FAIL',
+  };
+  try {
+    const details = fs.lstatSync(fixturePath);
+    if (!entry.isDirectory() || !details.isDirectory() || details.isSymbolicLink()) {
+      throw new Error('golden fixture is not a regular directory');
+    }
+    const resolved = fs.realpathSync(fixturePath);
+    const relative = path.relative(fs.realpathSync(GOLDEN_ROOT), resolved);
+    if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+      throw new Error('golden fixture escapes the contained golden root');
+    }
+    if (runGit(resolved, ['rev-parse', '--is-bare-repository']) !== 'true') {
+      throw new Error('golden fixture is not a bare git repository');
+    }
+    evidence.default_branch = runGit(resolved, ['symbolic-ref', 'HEAD']);
+    evidence.head = runGit(resolved, ['rev-parse', '--verify', 'HEAD^{commit}']);
+    runGit(resolved, ['fsck', '--strict', '--no-dangling']);
+    evidence.result = 'PASS';
+  } catch (error) {
+    evidence.error = error.message;
+  }
+  fixtures.push(evidence);
+}
+
+const failed = fixtures.filter((fixture) => fixture.result !== 'PASS');
+console.log(JSON.stringify({
+  check: 'fixture-baselines',
+  golden_root: path.relative(TT_ROOT, GOLDEN_ROOT),
+  fixtures,
+  total: fixtures.length,
+  passed: fixtures.length - failed.length,
+  failed: failed.length,
+  result: failed.length === 0 ? 'PASS' : 'FAIL',
+}));
+process.exit(failed.length === 0 ? 0 : 1);

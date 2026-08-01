@@ -1,0 +1,220 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tamandua.org/torture-test/case.schema.json",
+  "title": "Tamandua torture-test case",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "wave",
+    "workflow",
+    "fixture",
+    "harness",
+    "task",
+    "context",
+    "caps",
+    "requires",
+    "boundary_files",
+    "forbidden",
+    "oracles",
+    "gates",
+    "chaos",
+    "shed_ok",
+    "mandatory",
+    "class"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "wave": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "workflow": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "fixture": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "harness": {
+      "enum": ["pi", "hermes", "scripted-pi", "scripted-hermes", "local"]
+    },
+    "task": {
+      "$ref": "#/$defs/relativePath"
+    },
+    "context": {
+      "type": "object",
+      "properties": {
+        "execution_mode": {
+          "enum": ["real", "scripted"]
+        }
+      }
+    },
+    "caps": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tokens", "wall_min"],
+      "properties": {
+        "tokens": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "wall_min": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        }
+      }
+    },
+    "requires": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "platform": {
+          "anyOf": [
+            { "enum": ["linux", "darwin", "other"] },
+            {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "enum": ["linux", "darwin", "other"]
+              }
+            }
+          ]
+        },
+        "toolchains": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": ["node", "python3", "go", "rust/cargo", "java+maven"]
+          }
+        },
+        "capabilities": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+          }
+        },
+        "containment": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": ["systemd-user-scope", "procfs"]
+          }
+        },
+        "node_min": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "boundary_files": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/relativePath"
+      }
+    },
+    "forbidden": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/relativePath"
+      }
+    },
+    "oracles": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 64,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+      }
+    },
+    "gates": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 64,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+      }
+    },
+    "chaos": {
+      "anyOf": [
+        { "type": "null" },
+        { "type": "object" }
+      ]
+    },
+    "shed_ok": {
+      "type": "boolean"
+    },
+    "mandatory": {
+      "type": "boolean"
+    },
+    "class": {
+      "enum": ["verification", "characterization", "exploratory"]
+    },
+    "reset": {
+      "anyOf": [
+        { "type": "null" },
+        { "$ref": "#/$defs/hook" }
+      ]
+    },
+    "command": {
+      "anyOf": [
+        { "type": "null" },
+        { "$ref": "#/$defs/hook" }
+      ]
+    }
+  },
+  "$defs": {
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "hook": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["executable", "args", "cwd"],
+      "properties": {
+        "executable": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "args": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "type": "string",
+            "maxLength": 65536
+          }
+        },
+        "cwd": {
+          "$ref": "#/$defs/relativePath"
+        }
+      }
+    }
+  }
+}

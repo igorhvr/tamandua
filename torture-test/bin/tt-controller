@@ -1,0 +1,3140 @@
+#!/usr/bin/env node
+
+import fs from 'node:fs';
+import path from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
+import { spawn, spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { DatabaseSync } from 'node:sqlite';
+import { OUTCOMES, classifyAttempt, providerRetryDecision } from './tt-classification.mjs';
+import { writeCampaignReports } from './tt-report.mjs';
+
+const __filename = fileURLToPath(import.meta.url);
+const BIN_DIR = path.dirname(__filename);
+const TT_ROOT = path.resolve(BIN_DIR, '..');
+const SCHEMA_PATH = path.join(TT_ROOT, 'cases', 'case.schema.json');
+const VAR_ROOT = path.join(TT_ROOT, 'var');
+const RESULTS_ROOT = path.join(VAR_ROOT, 'results');
+const HOST_PROFILE_PATH = path.join(VAR_ROOT, 'w0', 'host-profile.json');
+const REAL_ENV_PATH = path.join(TT_ROOT, 'env', 'tt-env.sh');
+const SCRIPTED_ENV_PATH = path.join(TT_ROOT, 'env', 'tt-env-scripted.sh');
+const DAEMON_CONTROL_PATH = process.env.TT_CONTROLLER_DAEMON_CONTROL_PATH === undefined
+  ? path.join(TT_ROOT, 'bin', 'daemon-control')
+  : path.resolve(process.env.TT_CONTROLLER_DAEMON_CONTROL_PATH);
+const HOOK_RUNNER_PATH = path.join(TT_ROOT, 'bin', 'tt-hook-runner');
+const ORACLES_ROOT = path.join(TT_ROOT, 'oracles');
+const ORACLE_CONTRACT_VERSION = 1;
+const STATE_VERSION = 1;
+const DEFAULT_CONCURRENCY = 1;
+const DEFAULT_STAGGER_MS = 0;
+const DEFAULT_TOKEN_POLL_INTERVAL_MS = 5 * 60_000;
+const DEFAULT_PROVIDER_RETRY_BACKOFF_MS = 60_000;
+const EVIDENCE_LIMIT_BYTES = 16 * 1024 * 1024;
+const TERMINAL_RUN_STATUSES = new Set(['completed', 'done', 'failed', 'canceled']);
+
+function usage() {
+  console.log(`Usage: tt-controller --manifest <path> [options]
+       tt-controller --resume <campaign-id> [--manifest <path>] [options]
+
+Validate and execute a Tamandua torture-test case manifest.
+
+Options:
+  --manifest <path>       JSONL case manifest beneath torture-test/
+  --resume <campaign-id>  Resume an existing campaign without relaunching it
+  --concurrency <count>   Maximum active cases; integer >= 1 (default: 1)
+  --stagger <duration>    Delay between launches (default: 0s)
+  --help, -h              Print this help
+
+Duration examples: 250ms, 5s, 2m, 1h
+`);
+}
+
+function parseDuration(value) {
+  const match = /^(0|[1-9]\d*)(ms|s|m|h)$/.exec(value);
+  if (match === null) {
+    throw new Error('--stagger must be a duration such as 250ms, 5s, 2m, or 1h');
+  }
+  const multipliers = { ms: 1, s: 1_000, m: 60_000, h: 3_600_000 };
+  const duration = Number(match[1]) * multipliers[match[2]];
+  if (!Number.isSafeInteger(duration)) throw new Error('--stagger duration is too large');
+  return duration;
+}
+
+function readOptionValue(argv, index, option) {
+  const nextIndex = index + 1;
+  if (nextIndex >= argv.length || argv[nextIndex].startsWith('--')) {
+    throw new Error(`${option} requires a value`);
+  }
+  return { value: argv[nextIndex], nextIndex };
+}
+
+function parseArgs(argv) {
+  const options = {
+    help: false,
+    manifest: null,
+    resume: null,
+    concurrency: DEFAULT_CONCURRENCY,
+    staggerMs: DEFAULT_STAGGER_MS,
+    concurrencySpecified: false,
+    staggerSpecified: false,
+  };
+  const seen = new Set();
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+    if (arg === '--help' || arg === '-h') return { ...options, help: true };
+    if (arg === '--manifest') {
+      if (seen.has(arg)) throw new Error('--manifest may be specified only once');
+      seen.add(arg);
+      const parsed = readOptionValue(argv, index, arg);
+      options.manifest = parsed.value;
+      index = parsed.nextIndex;
+      continue;
+    }
+    if (arg === '--resume') {
+      if (seen.has(arg)) throw new Error('--resume may be specified only once');
+      seen.add(arg);
+      const parsed = readOptionValue(argv, index, arg);
+      if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(parsed.value)) {
+        throw new Error('--resume requires a contained campaign ID');
+      }
+      options.resume = parsed.value;
+      index = parsed.nextIndex;
+      continue;
+    }
+    if (arg === '--concurrency') {
+      if (seen.has(arg)) throw new Error('--concurrency may be specified only once');
+      seen.add(arg);
+      const parsed = readOptionValue(argv, index, arg);
+      if (!/^[1-9]\d*$/.test(parsed.value) || !Number.isSafeInteger(Number(parsed.value))) {
+        throw new Error('--concurrency must be an integer >= 1');
+      }
+      options.concurrency = Number(parsed.value);
+      options.concurrencySpecified = true;
+      index = parsed.nextIndex;
+      continue;
+    }
+    if (arg === '--stagger') {
+      if (seen.has(arg)) throw new Error('--stagger may be specified only once');
+      seen.add(arg);
+      const parsed = readOptionValue(argv, index, arg);
+      options.staggerMs = parseDuration(parsed.value);
+      options.staggerSpecified = true;
+      index = parsed.nextIndex;
+      continue;
+    }
+    throw new Error(`unknown argument: ${arg}`);
+  }
+  if (options.manifest === null && options.resume === null) {
+    throw new Error('--manifest is required for a new campaign');
+  }
+  return options;
+}
+
+function isObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function valueType(value) {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return 'array';
+  if (Number.isInteger(value)) return 'integer';
+  return typeof value;
+}
+
+function typeMatches(value, expected) {
+  switch (expected) {
+    case 'null': return value === null;
+    case 'array': return Array.isArray(value);
+    case 'object': return isObject(value);
+    case 'integer': return Number.isInteger(value);
+    case 'number': return typeof value === 'number' && Number.isFinite(value);
+    case 'string': return typeof value === 'string';
+    case 'boolean': return typeof value === 'boolean';
+    default: return false;
+  }
+}
+
+function displayValue(value) {
+  return JSON.stringify(value);
+}
+
+function resolveReference(rootSchema, reference) {
+  if (!reference.startsWith('#/')) throw new Error(`unsupported schema reference: ${reference}`);
+  return reference.slice(2).split('/').reduce((current, token) => {
+    const key = token.replaceAll('~1', '/').replaceAll('~0', '~');
+    if (!isObject(current) || !(key in current)) {
+      throw new Error(`unresolved schema reference: ${reference}`);
+    }
+    return current[key];
+  }, rootSchema);
+}
+
+function validateSchema(value, schema, location, rootSchema) {
+  if (schema.$ref !== undefined) {
+    return validateSchema(value, resolveReference(rootSchema, schema.$ref), location, rootSchema);
+  }
+
+  if (Array.isArray(schema.anyOf)) {
+    const alternatives = schema.anyOf.map((alternative) =>
+      validateSchema(value, alternative, location, rootSchema));
+    if (alternatives.some((errors) => errors.length === 0)) return [];
+    const details = alternatives
+      .map((errors) => errors[0])
+      .filter(Boolean)
+      .join('; ');
+    return [`${location}: does not match any allowed schema${details ? ` (${details})` : ''}`];
+  }
+
+  const errors = [];
+  if (schema.type !== undefined && !typeMatches(value, schema.type)) {
+    return [`${location}: expected ${schema.type}, got ${valueType(value)}`];
+  }
+
+  if (Array.isArray(schema.enum) && !schema.enum.some((item) =>
+    JSON.stringify(item) === JSON.stringify(value))) {
+    errors.push(`${location}: must be one of ${schema.enum.map(displayValue).join(', ')}`);
+    return errors;
+  }
+
+  if (typeof value === 'string') {
+    if (schema.minLength !== undefined && value.length < schema.minLength) {
+      errors.push(`${location}: must contain at least ${schema.minLength} character(s)`);
+    }
+    if (schema.maxLength !== undefined && value.length > schema.maxLength) {
+      errors.push(`${location}: must contain at most ${schema.maxLength} character(s)`);
+    }
+    if (schema.pattern !== undefined && !(new RegExp(schema.pattern)).test(value)) {
+      errors.push(`${location}: does not match required pattern ${schema.pattern}`);
+    }
+  }
+
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) errors.push(`${location}: must be finite`);
+    if (schema.minimum !== undefined && value < schema.minimum) {
+      errors.push(`${location}: must be >= ${schema.minimum}`);
+    }
+    if (schema.exclusiveMinimum !== undefined && value <= schema.exclusiveMinimum) {
+      errors.push(`${location}: must be > ${schema.exclusiveMinimum}`);
+    }
+  }
+
+  if (Array.isArray(value)) {
+    if (schema.minItems !== undefined && value.length < schema.minItems) {
+      errors.push(`${location}: must contain at least ${schema.minItems} item(s)`);
+    }
+    if (schema.maxItems !== undefined && value.length > schema.maxItems) {
+      errors.push(`${location}: must contain at most ${schema.maxItems} item(s)`);
+    }
+    if (schema.uniqueItems === true) {
+      const seen = new Set();
+      value.forEach((item, index) => {
+        const key = JSON.stringify(item);
+        if (seen.has(key)) errors.push(`${location}[${index}]: duplicate array item`);
+        seen.add(key);
+      });
+    }
+    if (schema.items !== undefined) {
+      value.forEach((item, index) => {
+        errors.push(...validateSchema(item, schema.items, `${location}[${index}]`, rootSchema));
+      });
+    }
+  }
+
+  if (isObject(value)) {
+    if (Array.isArray(schema.required)) {
+      for (const key of schema.required) {
+        if (!Object.hasOwn(value, key)) {
+          errors.push(`${location}: missing required property ${JSON.stringify(key)}`);
+        }
+      }
+    }
+    const properties = schema.properties ?? {};
+    for (const [key, item] of Object.entries(value)) {
+      if (Object.hasOwn(properties, key)) {
+        errors.push(...validateSchema(item, properties[key], `${location}.${key}`, rootSchema));
+      } else if (schema.additionalProperties === false) {
+        errors.push(`${location}: unknown property ${JSON.stringify(key)}`);
+      }
+    }
+  }
+
+  return errors;
+}
+
+function pathIsWithin(root, candidate) {
+  const relative = path.relative(root, candidate);
+  return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
+}
+
+function existingPrefixIsContained(candidate) {
+  const rootRealPath = fs.realpathSync(TT_ROOT);
+  const relative = path.relative(TT_ROOT, candidate);
+  let current = TT_ROOT;
+
+  for (const segment of relative.split(path.sep).filter(Boolean)) {
+    current = path.join(current, segment);
+    try {
+      fs.lstatSync(current);
+    } catch (error) {
+      if (error.code === 'ENOENT') return true;
+      return false;
+    }
+
+    try {
+      if (!pathIsWithin(rootRealPath, fs.realpathSync(current))) return false;
+    } catch {
+      // lstat succeeded but realpath failed: this is a dangling symlink or
+      // another path that cannot be safely dereferenced.
+      return false;
+    }
+  }
+  return true;
+}
+
+function isSafeRelativePath(candidate, { executable = false } = {}) {
+  if (typeof candidate !== 'string' || candidate.length === 0 || candidate.includes('\0')) return false;
+  if (executable && !candidate.includes('/') && !candidate.includes('\\') && candidate !== '..' && candidate !== '.') {
+    return true;
+  }
+
+  const portable = candidate.replaceAll('\\', '/');
+  if (portable.startsWith('/') || /^[A-Za-z]:\//.test(portable)) return false;
+  if (portable.split('/').includes('..')) return false;
+
+  const resolved = path.resolve(TT_ROOT, portable);
+  if (!pathIsWithin(TT_ROOT, resolved)) return false;
+
+  return existingPrefixIsContained(resolved);
+}
+
+function validateSafePaths(caseRecord) {
+  const errors = [];
+  const check = (value, location, options) => {
+    if (!isSafeRelativePath(value, options)) {
+      errors.push(`${location}: path escapes torture-test/`);
+    }
+  };
+
+  check(caseRecord.task, '$.task');
+  for (const [index, value] of caseRecord.boundary_files.entries()) {
+    check(value, `$.boundary_files[${index}]`);
+  }
+  for (const [index, value] of caseRecord.forbidden.entries()) {
+    check(value, `$.forbidden[${index}]`);
+  }
+  for (const hookName of ['reset', 'command']) {
+    const hook = caseRecord[hookName];
+    if (!isObject(hook)) continue;
+    check(hook.executable, `$.${hookName}.executable`, { executable: true });
+    check(hook.cwd, `$.${hookName}.cwd`);
+    hook.args.forEach((argument, index) => {
+      if (argument.includes('\0')) errors.push(`$.${hookName}.args[${index}]: must not contain NUL`);
+    });
+  }
+  return errors;
+}
+
+function loadSchema() {
+  try {
+    return JSON.parse(fs.readFileSync(SCHEMA_PATH, 'utf8'));
+  } catch (error) {
+    throw new Error(`cannot load case schema ${SCHEMA_PATH}: ${error.message}`);
+  }
+}
+
+function loadManifest(manifestPath, schema) {
+  let source;
+  try {
+    source = fs.readFileSync(manifestPath, 'utf8');
+  } catch (error) {
+    throw new Error(`cannot read manifest ${manifestPath}: ${error.message}`);
+  }
+
+  const records = [];
+  const errors = [];
+  const ids = new Map();
+  source.split(/\r?\n/).forEach((line, index) => {
+    const lineNumber = index + 1;
+    if (line.trim() === '') return;
+
+    let record;
+    try {
+      record = JSON.parse(line);
+    } catch (error) {
+      errors.push(`line ${lineNumber}: invalid JSON: ${error.message}`);
+      return;
+    }
+
+    const schemaErrors = validateSchema(record, schema, '$', schema);
+    for (const error of schemaErrors) errors.push(`line ${lineNumber}: ${error}`);
+    if (schemaErrors.length > 0) return;
+
+    if (ids.has(record.id)) {
+      errors.push(`line ${lineNumber}: duplicate id ${JSON.stringify(record.id)} (first declared on line ${ids.get(record.id)})`);
+    } else {
+      ids.set(record.id, lineNumber);
+    }
+
+    for (const error of validateSafePaths(record)) errors.push(`line ${lineNumber}: ${error}`);
+    records.push(record);
+  });
+
+  if (records.length === 0 && errors.length === 0) errors.push('manifest contains no cases');
+  if (errors.length > 0) {
+    const error = new Error(`Manifest validation failed:\n${errors.map((item) => `- ${item}`).join('\n')}`);
+    error.validationFailure = true;
+    throw error;
+  }
+  return { cases: records, source };
+}
+
+function hasRequirements(caseRecord) {
+  return Object.keys(caseRecord.requires).length > 0;
+}
+
+function validateHostProfile(profile) {
+  if (!isObject(profile)) return ['profile must be a JSON object'];
+  const errors = [];
+  const objectSections = ['platform', 'containment', 'toolchains', 'capabilities', 'spawnSpeedClass'];
+  for (const section of objectSections) {
+    if (profile[section] !== undefined && profile[section] !== null && !isObject(profile[section])) {
+      errors.push(`${section} must be an object or null`);
+    }
+  }
+  if (profile.nodeRuntimes !== undefined && profile.nodeRuntimes !== null) {
+    if (!Array.isArray(profile.nodeRuntimes)) {
+      errors.push('nodeRuntimes must be an array or null');
+    } else if (profile.nodeRuntimes.some((runtime) => !isObject(runtime))) {
+      errors.push('nodeRuntimes entries must be objects');
+    }
+  }
+  return errors;
+}
+
+function loadRequiredHostProfile(cases) {
+  if (!cases.some(hasRequirements)) return null;
+  let profile;
+  try {
+    const details = fs.lstatSync(HOST_PROFILE_PATH);
+    if (!details.isFile() || details.isSymbolicLink()) {
+      throw new Error('host-profile.json is not a contained regular file');
+    }
+    if (!pathIsWithin(fs.realpathSync(VAR_ROOT), fs.realpathSync(HOST_PROFILE_PATH))) {
+      throw new Error('host-profile.json escapes torture-test/var');
+    }
+    profile = JSON.parse(fs.readFileSync(HOST_PROFILE_PATH, 'utf8'));
+  } catch (error) {
+    throw new Error(`cannot load required host profile ${HOST_PROFILE_PATH}: ${error.message}`);
+  }
+  const errors = validateHostProfile(profile);
+  if (errors.length > 0) {
+    throw new Error(`cannot load required host profile ${HOST_PROFILE_PATH}: ${errors.join('; ')}`);
+  }
+  return profile;
+}
+
+function observedPlatform(profile) {
+  const label = profile.platform?.label;
+  if (label === 'linux' || label === 'darwin' || label === 'other') return label;
+  const os = profile.platform?.os;
+  if (os === 'linux' || os === 'darwin') return os;
+  if (typeof os === 'string' && os.length > 0) return 'other';
+  return null;
+}
+
+function observedToolchain(profile, name) {
+  const toolchain = profile.toolchains?.[name];
+  if (!isObject(toolchain)) return toolchain === undefined ? null : toolchain;
+  return {
+    present: toolchain.present ?? null,
+    buildPassed: toolchain.buildPassed ?? null,
+    testPassed: toolchain.testPassed ?? null,
+  };
+}
+
+function toolchainSatisfied(observed) {
+  return isObject(observed) && observed.buildPassed === true && observed.testPassed === true;
+}
+
+function observedContainment(profile, name) {
+  if (name === 'systemd-user-scope') return profile.containment?.systemdUserScope ?? null;
+  if (name === 'procfs') {
+    return profile.containment?.procfs ?? profile.capabilities?.procfs ?? null;
+  }
+  return null;
+}
+
+function observedNodeMajor(profile) {
+  if (!Array.isArray(profile.nodeRuntimes)) return null;
+  const majors = profile.nodeRuntimes
+    .map((runtime) => runtime.major)
+    .filter((major) => Number.isSafeInteger(major) && major >= 0);
+  return majors.length === 0 ? null : Math.max(...majors);
+}
+
+function observedCapability(profile, name) {
+  if (name === 'procfs') return observedContainment(profile, 'procfs');
+  if (name === 'systemd-user-scope') return observedContainment(profile, name);
+  if (name === 'node-sqlite') {
+    if (!Array.isArray(profile.nodeRuntimes)) return null;
+    const observations = profile.nodeRuntimes
+      .map((runtime) => runtime.sqliteAvailable)
+      .filter((available) => typeof available === 'boolean');
+    return observations.length === 0 ? null : observations.some(Boolean);
+  }
+  if (Object.hasOwn(profile.capabilities ?? {}, name)) return profile.capabilities[name];
+  const spawnClass = profile.spawnSpeedClass?.class;
+  if (typeof spawnClass === 'string' && name === `spawn-${spawnClass}`) return true;
+  return null;
+}
+
+function evaluateRequirements(requires, profile) {
+  const failures = [];
+  const fail = (predicate, expected, observed) => {
+    failures.push({ predicate, expected, observed });
+  };
+
+  if (requires.platform !== undefined) {
+    const expected = requires.platform;
+    const allowed = Array.isArray(expected) ? expected : [expected];
+    const observed = observedPlatform(profile);
+    if (!allowed.includes(observed)) fail('platform', expected, observed);
+  }
+  for (const name of requires.toolchains ?? []) {
+    const observed = observedToolchain(profile, name);
+    if (!toolchainSatisfied(observed)) fail(`toolchains.${name}`, true, observed);
+  }
+  for (const name of requires.containment ?? []) {
+    const observed = observedContainment(profile, name);
+    if (observed !== true) fail(`containment.${name}`, true, observed);
+  }
+  if (requires.node_min !== undefined) {
+    const observed = observedNodeMajor(profile);
+    if (observed === null || observed < requires.node_min) fail('node_min', requires.node_min, observed);
+  }
+  for (const name of requires.capabilities ?? []) {
+    const observed = observedCapability(profile, name);
+    if (observed !== true) fail(`capabilities.${name}`, true, observed);
+  }
+  return failures;
+}
+
+function applyHostRequirements(manifest, state, profile) {
+  if (profile === null) return;
+  let terminalTimestamp = null;
+  for (let index = 0; index < manifest.cases.length; index += 1) {
+    const record = manifest.cases[index];
+    if (!hasRequirements(record)) continue;
+    const evidence = evaluateRequirements(record.requires, profile);
+    if (evidence.length === 0) continue;
+    terminalTimestamp ??= utcTimestamp();
+    Object.assign(state.cases[index], {
+      phase: 'terminal',
+      outcome: 'NOT_RUN',
+      terminal_at: terminalTimestamp,
+      reason: {
+        category: 'predicate',
+        evidence,
+      },
+    });
+  }
+  if (terminalTimestamp !== null) state.updated_at = terminalTimestamp;
+}
+
+function resolveManifestPath(input) {
+  const manifestPath = path.resolve(process.cwd(), input);
+  if (!pathIsWithin(TT_ROOT, manifestPath)) {
+    throw new Error(`manifest path escapes torture-test/: ${input}`);
+  }
+  try {
+    if (!pathIsWithin(fs.realpathSync(TT_ROOT), fs.realpathSync(manifestPath))) {
+      throw new Error(`manifest path escapes torture-test/: ${input}`);
+    }
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+  return manifestPath;
+}
+
+function sha256(value) {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+function toPortableRelativePath(absolutePath) {
+  return path.relative(TT_ROOT, absolutePath).split(path.sep).join('/');
+}
+
+function utcTimestamp() {
+  return new Date().toISOString();
+}
+
+function configuredTokenPollIntervalMs() {
+  const configured = process.env.TT_CONTROLLER_POLL_INTERVAL_MS;
+  if (configured === undefined) return DEFAULT_TOKEN_POLL_INTERVAL_MS;
+  if (!/^[1-9]\d*$/.test(configured) || !Number.isSafeInteger(Number(configured))) {
+    throw new Error('TT_CONTROLLER_POLL_INTERVAL_MS must be a positive integer');
+  }
+  return Number(configured);
+}
+
+function configuredProviderRetryBackoffMs() {
+  const configured = process.env.TT_CONTROLLER_PROVIDER_RETRY_BACKOFF_MS;
+  if (configured === undefined) return DEFAULT_PROVIDER_RETRY_BACKOFF_MS;
+  if (!/^\d+$/.test(configured) || !Number.isSafeInteger(Number(configured))) {
+    throw new Error('TT_CONTROLLER_PROVIDER_RETRY_BACKOFF_MS must be a nonnegative integer');
+  }
+  return Number(configured);
+}
+
+function ensureResultsRoot() {
+  const ttRealPath = fs.realpathSync(TT_ROOT);
+  if (fs.existsSync(VAR_ROOT)) {
+    const varDetails = fs.lstatSync(VAR_ROOT);
+    if (!varDetails.isDirectory() || varDetails.isSymbolicLink()) {
+      throw new Error('torture-test/var is not a contained directory');
+    }
+  } else {
+    fs.mkdirSync(VAR_ROOT, { mode: 0o700 });
+  }
+  const varRealPath = fs.realpathSync(VAR_ROOT);
+  if (!pathIsWithin(ttRealPath, varRealPath)) {
+    throw new Error('results directory escapes torture-test/var');
+  }
+  if (fs.existsSync(RESULTS_ROOT)) {
+    const resultsDetails = fs.lstatSync(RESULTS_ROOT);
+    if (!resultsDetails.isDirectory() || resultsDetails.isSymbolicLink()) {
+      throw new Error('results directory is not a contained directory');
+    }
+  } else {
+    fs.mkdirSync(RESULTS_ROOT, { mode: 0o700 });
+  }
+  if (!pathIsWithin(varRealPath, fs.realpathSync(RESULTS_ROOT))) {
+    throw new Error('results directory escapes torture-test/var');
+  }
+}
+
+function generateCampaignId() {
+  const compactTimestamp = utcTimestamp().replaceAll(/[-:.]/g, '');
+  return `campaign-${compactTimestamp}-${randomUUID()}`;
+}
+
+function createCampaignDirectory() {
+  ensureResultsRoot();
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    const campaignId = generateCampaignId();
+    const campaignDir = path.join(RESULTS_ROOT, campaignId);
+    try {
+      fs.mkdirSync(campaignDir, { mode: 0o700 });
+      return { campaignId, campaignDir };
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+    }
+  }
+  throw new Error('could not allocate a unique campaign ID');
+}
+
+function atomicWriteState(campaignDir, state) {
+  const statePath = path.join(campaignDir, 'state.json');
+  const tempPath = path.join(campaignDir, `.state.json.${process.pid}.${randomUUID()}.tmp`);
+  let descriptor;
+  try {
+    descriptor = fs.openSync(tempPath, 'wx', 0o600);
+    fs.writeFileSync(descriptor, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+    fs.fsyncSync(descriptor);
+    fs.closeSync(descriptor);
+    descriptor = undefined;
+    fs.renameSync(tempPath, statePath);
+    const directoryDescriptor = fs.openSync(campaignDir, 'r');
+    try {
+      fs.fsyncSync(directoryDescriptor);
+    } finally {
+      fs.closeSync(directoryDescriptor);
+    }
+  } catch (error) {
+    if (descriptor !== undefined) fs.closeSync(descriptor);
+    try {
+      fs.rmSync(tempPath, { force: true });
+    } catch {
+      // Preserve the original persistence failure.
+    }
+    throw new Error(`cannot persist campaign state: ${error.message}`);
+  }
+}
+
+function processIsAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    try {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+      const closingParenthesis = stat.lastIndexOf(')');
+      if (closingParenthesis >= 0 && stat.slice(closingParenthesis + 2).startsWith('Z ')) return false;
+    } catch {
+      // procfs is Linux-specific; kill(0) remains the portable fallback.
+    }
+    return true;
+  } catch (error) {
+    return error.code === 'EPERM';
+  }
+}
+
+function processIdentity(pid) {
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const closingParenthesis = stat.lastIndexOf(')');
+    if (closingParenthesis < 0) return null;
+    const fields = stat.slice(closingParenthesis + 2).trim().split(/\s+/);
+    if (fields[0] === 'Z' || fields[19] === undefined) return null;
+    return `linux-proc-start-${fields[19]}`;
+  } catch {
+    return null;
+  }
+}
+
+function processMatchesIdentity(pid, identity) {
+  return typeof identity === 'string' && processIsAlive(pid) && processIdentity(pid) === identity;
+}
+
+function acquireCampaignLock(campaignDir) {
+  const lockPath = path.join(campaignDir, '.controller.lock');
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const owner = { pid: process.pid, token: randomUUID(), acquired_at: utcTimestamp() };
+    try {
+      const descriptor = fs.openSync(lockPath, 'wx', 0o600);
+      try {
+        fs.writeFileSync(descriptor, `${JSON.stringify(owner)}\n`, 'utf8');
+        fs.fsyncSync(descriptor);
+      } finally {
+        fs.closeSync(descriptor);
+      }
+      return () => {
+        try {
+          const current = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+          if (current.token === owner.token) fs.unlinkSync(lockPath);
+        } catch (error) {
+          if (error.code !== 'ENOENT') throw error;
+        }
+      };
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw new Error(`cannot acquire campaign ownership: ${error.message}`);
+      let existing;
+      try {
+        const details = fs.lstatSync(lockPath);
+        if (!details.isFile() || details.isSymbolicLink()) throw new Error('lock is not a regular file');
+        existing = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+        if (!Number.isSafeInteger(existing.pid) || existing.pid <= 0 || typeof existing.token !== 'string') {
+          throw new Error('lock owner is invalid');
+        }
+      } catch (lockError) {
+        throw new Error(`cannot acquire campaign ownership: ${lockError.message}`);
+      }
+      if (processIsAlive(existing.pid)) {
+        throw new Error(`campaign is already controlled by process ${existing.pid}`);
+      }
+      try {
+        fs.unlinkSync(lockPath);
+      } catch (unlinkError) {
+        if (unlinkError.code !== 'ENOENT') {
+          throw new Error(`cannot replace stale campaign ownership: ${unlinkError.message}`);
+        }
+      }
+    }
+  }
+  throw new Error('cannot acquire campaign ownership after replacing a stale lock');
+}
+
+function operatorEnvironmentWithoutRuntimeRouting() {
+  const environment = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (key === 'HOME' || key.startsWith('TT_') || key.startsWith('TAMANDUA_') || key.startsWith('HERMES_')) {
+      continue;
+    }
+    environment[key] = value;
+  }
+  return environment;
+}
+
+function parsePrintedEnvironment(output, scriptPath) {
+  const parsed = {};
+  for (const line of output.split(/\r?\n/)) {
+    if (line === '') continue;
+    const separator = line.indexOf('=');
+    if (separator < 1) throw new Error(`${scriptPath} print emitted an invalid environment line`);
+    const key = line.slice(0, separator);
+    const value = line.slice(separator + 1);
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key) || Object.hasOwn(parsed, key) || value.includes('\0')) {
+      throw new Error(`${scriptPath} print emitted an invalid environment entry`);
+    }
+    parsed[key] = value;
+  }
+  if (typeof parsed.HOME !== 'string' || typeof parsed.TAMANDUA_STATE_DIR !== 'string') {
+    throw new Error(`${scriptPath} print omitted HOME or TAMANDUA_STATE_DIR`);
+  }
+  return parsed;
+}
+
+function loadSpawnEnvironment(scripted) {
+  const scriptPath = scripted ? SCRIPTED_ENV_PATH : REAL_ENV_PATH;
+  const operatorBaseEnv = operatorEnvironmentWithoutRuntimeRouting();
+  const result = spawnSync('bash', [scriptPath, 'print'], {
+    cwd: TT_ROOT,
+    env: operatorBaseEnv,
+    encoding: 'utf8',
+    maxBuffer: 1024 * 1024,
+    shell: false,
+  });
+  if (result.error !== undefined || result.status !== 0) {
+    const detail = result.error?.message ?? result.stderr?.trim() ?? `exit ${result.status}`;
+    throw new Error(`cannot load spawn environment from ${scriptPath}: ${detail}`);
+  }
+  return { ...operatorBaseEnv, ...parsePrintedEnvironment(result.stdout, scriptPath) };
+}
+
+function caseUsesScriptedEnvironment(caseRecord) {
+  return caseRecord.harness === 'scripted-pi'
+    || caseRecord.harness === 'scripted-hermes'
+    || caseRecord.context.execution_mode === 'scripted';
+}
+
+function daemonControlAvailable() {
+  try {
+    const details = fs.lstatSync(DAEMON_CONTROL_PATH);
+    fs.accessSync(DAEMON_CONTROL_PATH, fs.constants.X_OK);
+    return details.isFile() && !details.isSymbolicLink()
+      && pathIsWithin(fs.realpathSync(TT_ROOT), fs.realpathSync(DAEMON_CONTROL_PATH));
+  } catch {
+    return false;
+  }
+}
+
+function evidenceRelativePath(campaignDir, absolutePath) {
+  return path.relative(campaignDir, absolutePath).split(path.sep).join('/');
+}
+
+function resolvePinnedHookExecutable(executable) {
+  if (!executable.includes('/') && !executable.includes('\\')) return executable;
+  const unresolved = path.resolve(TT_ROOT, executable);
+  const details = fs.lstatSync(unresolved);
+  if (!details.isFile() || details.isSymbolicLink()) {
+    throw new Error(`hook executable is not a contained regular file: ${executable}`);
+  }
+  const pinned = fs.realpathSync(unresolved);
+  if (!pathIsWithin(fs.realpathSync(TT_ROOT), pinned)) {
+    throw new Error(`hook executable escapes torture-test/: ${executable}`);
+  }
+  fs.accessSync(pinned, fs.constants.X_OK);
+  return pinned;
+}
+
+function resolvePinnedHookCwd(cwd) {
+  const unresolved = path.resolve(TT_ROOT, cwd);
+  const details = fs.lstatSync(unresolved);
+  if (!details.isDirectory() || details.isSymbolicLink()) {
+    throw new Error(`hook cwd is not a contained directory: ${cwd}`);
+  }
+  const pinned = fs.realpathSync(unresolved);
+  if (!pathIsWithin(fs.realpathSync(TT_ROOT), pinned)) {
+    throw new Error(`hook cwd escapes torture-test/: ${cwd}`);
+  }
+  return pinned;
+}
+
+function runHook(hookName, hook, childEnv, campaignDir, state, attempt, {
+  enforceWall = true,
+  timeoutMs,
+  onChunk,
+} = {}) {
+  const evidenceDir = path.join(campaignDir, 'evidence', attempt.case_id, attempt.id);
+  fs.mkdirSync(evidenceDir, { recursive: true, mode: 0o700 });
+  const stdoutPath = path.join(evidenceDir, `${hookName}.stdout`);
+  const stderrPath = path.join(evidenceDir, `${hookName}.stderr`);
+  const hookState = {
+    argv: [hook.executable, ...hook.args],
+    cwd: hook.cwd,
+    intent_at: utcTimestamp(),
+    started_at: utcTimestamp(),
+    finished_at: null,
+    exit_code: null,
+    signal: null,
+    stdout: evidenceRelativePath(campaignDir, stdoutPath),
+    stderr: evidenceRelativePath(campaignDir, stderrPath),
+  };
+  attempt[hookName] = hookState;
+  state.updated_at = hookState.started_at;
+  atomicWriteState(campaignDir, state);
+
+  let executable;
+  let cwd;
+  try {
+    executable = resolvePinnedHookExecutable(hook.executable);
+    cwd = resolvePinnedHookCwd(hook.cwd);
+  } catch (error) {
+    fs.writeFileSync(stdoutPath, Buffer.alloc(0), { mode: 0o600 });
+    fs.writeFileSync(stderrPath, Buffer.alloc(0), { mode: 0o600 });
+    hookState.finished_at = utcTimestamp();
+    hookState.error = error.message;
+    state.updated_at = hookState.finished_at;
+    atomicWriteState(campaignDir, state);
+    return Promise.resolve(hookState);
+  }
+
+  const stdoutDescriptor = fs.openSync(stdoutPath, 'wx', 0o600);
+  let stderrDescriptor;
+  try {
+    stderrDescriptor = fs.openSync(stderrPath, 'wx', 0o600);
+  } catch (error) {
+    fs.closeSync(stdoutDescriptor);
+    throw error;
+  }
+  return new Promise((resolve) => {
+    let child;
+    let launchError;
+    let settled = false;
+    let wallTimer;
+    let forceKillTimer;
+    const evidenceBytes = { stdout: 0, stderr: 0 };
+    const stopChild = (message) => {
+      launchError ??= new Error(message);
+      if (child !== undefined && child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGTERM');
+        forceKillTimer ??= setTimeout(() => child.kill('SIGKILL'), 1_000);
+      }
+    };
+    const capture = (streamName, descriptor, chunk) => {
+      const remaining = EVIDENCE_LIMIT_BYTES - evidenceBytes[streamName];
+      if (remaining > 0) {
+        const captured = chunk.subarray(0, remaining);
+        try {
+          fs.writeSync(descriptor, captured);
+          evidenceBytes[streamName] += captured.length;
+        } catch (error) {
+          stopChild(`${streamName} evidence write failed: ${error.message}`);
+          return;
+        }
+      }
+      if (chunk.length > remaining) {
+        stopChild(`${streamName} evidence limit of ${EVIDENCE_LIMIT_BYTES} bytes exceeded`);
+      }
+      if (onChunk !== undefined) {
+        try {
+          onChunk(streamName, chunk);
+        } catch (error) {
+          stopChild(`${hookName} stream processing failed: ${error.message}`);
+        }
+      }
+    };
+    const finish = (exitCode, signal) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(wallTimer);
+      clearTimeout(forceKillTimer);
+      fs.closeSync(stdoutDescriptor);
+      fs.closeSync(stderrDescriptor);
+      hookState.finished_at = utcTimestamp();
+      hookState.exit_code = exitCode;
+      hookState.signal = signal;
+      if (launchError !== undefined) hookState.error = launchError.message;
+      state.updated_at = hookState.finished_at;
+      atomicWriteState(campaignDir, state);
+      resolve(hookState);
+    };
+    try {
+      child = spawn(executable, hook.args, {
+        cwd,
+        env: childEnv,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        shell: false,
+      });
+      child.stdout.on('data', (chunk) => capture('stdout', stdoutDescriptor, chunk));
+      child.stderr.on('data', (chunk) => capture('stderr', stderrDescriptor, chunk));
+      hookState.pid = child.pid ?? null;
+      state.updated_at = utcTimestamp();
+      atomicWriteState(campaignDir, state);
+      if (enforceWall || timeoutMs !== undefined) {
+        const remainingWallMs = enforceWall
+          ? new Date(attempt.deadline_at).valueOf() - Date.now()
+          : Number.POSITIVE_INFINITY;
+        const hookTimeoutMs = timeoutMs ?? Number.POSITIVE_INFINITY;
+        wallTimer = setTimeout(() => {
+          stopChild(`${enforceWall ? 'case wall limit' : 'hook runtime limit'} reached while running ${hookName}`);
+        }, Math.max(0, Math.min(remainingWallMs, hookTimeoutMs)));
+      }
+      child.once('error', (error) => {
+        launchError = error;
+      });
+      child.once('close', finish);
+    } catch (error) {
+      launchError = error;
+      finish(null, null);
+    }
+  });
+}
+
+function durableResultPath(campaignDir, hookState) {
+  const absolutePath = path.resolve(campaignDir, hookState.result);
+  if (!pathIsWithin(fs.realpathSync(campaignDir), absolutePath)) {
+    throw new Error('durable hook result path escapes campaign directory');
+  }
+  return absolutePath;
+}
+
+function readDurableHookResult(campaignDir, hookState) {
+  const resultPath = durableResultPath(campaignDir, hookState);
+  const details = fs.lstatSync(resultPath);
+  if (!details.isFile() || details.isSymbolicLink()) throw new Error('durable hook result is not a regular file');
+  const result = JSON.parse(fs.readFileSync(resultPath, 'utf8'));
+  if (!isObject(result) || result.version !== 1
+      || !Number.isSafeInteger(result.runner_pid) || result.runner_pid <= 0
+      || !isUtcTimestamp(result.started_at) || !isUtcTimestamp(result.finished_at)
+      || (result.exit_code !== null && !Number.isInteger(result.exit_code))
+      || (result.signal !== null && typeof result.signal !== 'string')
+      || (result.error !== undefined && typeof result.error !== 'string')) {
+    throw new Error('durable hook result is invalid');
+  }
+  if (hookState.runner_pid !== result.runner_pid) throw new Error('durable hook result runner PID does not match');
+  return result;
+}
+
+function applyDurableHookResult(hookState, result) {
+  hookState.started_at = result.started_at;
+  hookState.finished_at = result.finished_at;
+  hookState.exit_code = result.exit_code;
+  hookState.signal = result.signal;
+  hookState.child_pid = result.child_pid;
+  if (result.error !== undefined) hookState.error = result.error;
+}
+
+function runDurableLocalCommand(hook, childEnv, campaignDir, state, attempt) {
+  const evidenceDir = path.join(campaignDir, 'evidence', attempt.case_id, attempt.id);
+  fs.mkdirSync(evidenceDir, { recursive: true, mode: 0o700 });
+  const stdoutPath = path.join(evidenceDir, 'command.stdout');
+  const stderrPath = path.join(evidenceDir, 'command.stderr');
+  const resultPath = path.join(evidenceDir, 'command.result.json');
+  const configPath = path.join(evidenceDir, 'command.runner.json');
+  const hookState = {
+    argv: [hook.executable, ...hook.args],
+    cwd: hook.cwd,
+    intent_at: utcTimestamp(),
+    started_at: utcTimestamp(),
+    finished_at: null,
+    exit_code: null,
+    signal: null,
+    stdout: evidenceRelativePath(campaignDir, stdoutPath),
+    stderr: evidenceRelativePath(campaignDir, stderrPath),
+    result: evidenceRelativePath(campaignDir, resultPath),
+  };
+  attempt.command = hookState;
+  state.updated_at = hookState.started_at;
+  atomicWriteState(campaignDir, state);
+
+  let executable;
+  let cwd;
+  try {
+    executable = resolvePinnedHookExecutable(hook.executable);
+    cwd = resolvePinnedHookCwd(hook.cwd);
+  } catch (error) {
+    fs.writeFileSync(stdoutPath, Buffer.alloc(0), { mode: 0o600 });
+    fs.writeFileSync(stderrPath, Buffer.alloc(0), { mode: 0o600 });
+    hookState.finished_at = utcTimestamp();
+    hookState.error = error.message;
+    state.updated_at = hookState.finished_at;
+    atomicWriteState(campaignDir, state);
+    return Promise.resolve(hookState);
+  }
+
+  fs.writeFileSync(configPath, `${JSON.stringify({
+    executable,
+    args: hook.args,
+    cwd,
+    stdout_path: stdoutPath,
+    stderr_path: stderrPath,
+    result_path: resultPath,
+    deadline_at: attempt.deadline_at,
+    evidence_limit_bytes: EVIDENCE_LIMIT_BYTES,
+  }, null, 2)}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+
+  return new Promise((resolve) => {
+    let launchError;
+    const finish = () => {
+      if (launchError !== undefined) {
+        hookState.finished_at = utcTimestamp();
+        hookState.error = launchError.message;
+      } else {
+        try {
+          applyDurableHookResult(hookState, readDurableHookResult(campaignDir, hookState));
+        } catch (error) {
+          hookState.finished_at = utcTimestamp();
+          hookState.error = `durable command result unavailable: ${error.message}`;
+        }
+      }
+      state.updated_at = hookState.finished_at;
+      atomicWriteState(campaignDir, state);
+      resolve(hookState);
+    };
+    try {
+      const runner = spawn(process.execPath, [HOOK_RUNNER_PATH, configPath], {
+        cwd: fs.realpathSync(TT_ROOT),
+        env: childEnv,
+        detached: true,
+        stdio: 'ignore',
+        shell: false,
+      });
+      hookState.runner_pid = runner.pid ?? null;
+      hookState.runner_identity = hookState.runner_pid === null ? null : processIdentity(hookState.runner_pid);
+      state.updated_at = utcTimestamp();
+      atomicWriteState(campaignDir, state);
+      runner.once('error', (error) => { launchError = error; });
+      runner.once('close', finish);
+    } catch (error) {
+      launchError = error;
+      finish();
+    }
+  });
+}
+
+function markTerminal(state, caseState, campaignDir, outcome, reason) {
+  const timestamp = utcTimestamp();
+  Object.assign(caseState, {
+    phase: 'terminal',
+    outcome,
+    terminal_at: timestamp,
+    ...(reason === undefined ? {} : { reason }),
+  });
+  state.updated_at = timestamp;
+  atomicWriteState(campaignDir, state);
+}
+
+const ORACLE_MECHANICAL_STEP_FIELDS = [
+  'stepId', 'step_id',
+  'agentId', 'agent_id',
+  'status', 'type',
+  'currentStoryId', 'current_story_id',
+  'retryCount', 'retry_count',
+  'stepIndex', 'step_index',
+  'abandonedCount', 'abandoned_count',
+  'rerouteCount', 'reroute_count',
+  'claimPid', 'claim_pid',
+  'claimUpdatedAt', 'claim_updated_at',
+  'updatedAt', 'updated_at',
+];
+
+function oracleStepsSnapshot(snapshot) {
+  if (!isObject(snapshot) || !Array.isArray(snapshot.steps)) return null;
+  return {
+    source: snapshot.source,
+    captured_at: snapshot.captured_at,
+    provenance: snapshot.provenance,
+    steps: snapshot.steps.map((step) => {
+      if (!isObject(step)) return {};
+      return Object.fromEntries(ORACLE_MECHANICAL_STEP_FIELDS
+        .filter((field) => Object.hasOwn(step, field))
+        .map((field) => [field, step[field]]));
+    }),
+  };
+}
+
+function oracleContext(caseRecord, caseState, state, oracleId) {
+  const attempts = caseState.attempts.map((attempt) => ({
+    id: attempt.id,
+    kind: attempt.kind,
+    phase: attempt.phase,
+    run_id: attempt.run_id ?? null,
+    started_at: attempt.started_at,
+    terminal_at: attempt.terminal_at ?? null,
+    terminal_status: attempt.terminal_status ?? null,
+    tokens_observed: attempt.tokens_observed ?? 0,
+    command: attempt.command === undefined ? null : {
+      exit_code: attempt.command.exit_code,
+      signal: attempt.command.signal,
+      stdout: attempt.command.stdout,
+      stderr: attempt.command.stderr,
+    },
+    terminal_evidence: attempt.terminal_evidence ?? null,
+    steps_snapshot: oracleStepsSnapshot(attempt.steps_snapshot),
+  }));
+  return {
+    contract_version: ORACLE_CONTRACT_VERSION,
+    oracle_id: oracleId,
+    campaign: { id: state.campaign_id, created_at: state.created_at, manifest: state.manifest },
+    case: {
+      id: caseRecord.id,
+      wave: caseRecord.wave,
+      workflow: caseRecord.workflow,
+      fixture: caseRecord.fixture,
+      harness: caseRecord.harness,
+      class: caseRecord.class,
+      context: caseRecord.context,
+      caps: caseRecord.caps,
+      boundary_files: caseRecord.boundary_files,
+      forbidden: caseRecord.forbidden,
+      chaos: caseRecord.chaos,
+    },
+    run_id: attempts.findLast((attempt) => attempt.run_id !== null)?.run_id ?? null,
+    attempts,
+    discovered_runs: (state.discovered_runs ?? [])
+      .filter((run) => run.root_case_id === caseRecord.id)
+      .map((run) => ({
+        run_id: run.run_id,
+        parent_run_id: run.parent_run_id,
+        phase: run.phase,
+        terminal_status: run.terminal_status ?? null,
+        terminal_evidence: run.terminal_evidence ?? null,
+        steps_snapshot: oracleStepsSnapshot(run.steps_snapshot),
+      })),
+  };
+}
+
+function oracleExecutable(oracleId) {
+  const candidate = path.join(ORACLES_ROOT, oracleId);
+  try {
+    const details = fs.lstatSync(candidate);
+    if (!details.isFile() || details.isSymbolicLink()) return null;
+    const pinned = fs.realpathSync(candidate);
+    if (!pathIsWithin(fs.realpathSync(ORACLES_ROOT), pinned)) return null;
+    fs.accessSync(pinned, fs.constants.X_OK);
+    return pinned;
+  } catch {
+    return null;
+  }
+}
+
+function validateOracleResponse(response, oracleId, exitCode, evidenceDir) {
+  const errors = [];
+  if (!isObject(response)) return ['response must be one JSON object'];
+  if (response.contract_version !== ORACLE_CONTRACT_VERSION) errors.push('contract_version must be 1');
+  if (response.oracle_id !== oracleId) errors.push('oracle_id does not match the invoked oracle');
+  if (!['PASS', 'FAIL', 'ERROR'].includes(response.result)) errors.push('result must be PASS, FAIL, or ERROR');
+  if (!isUtcTimestamp(response.started_at)) errors.push('started_at must be a UTC ISO-8601 timestamp');
+  if (!isUtcTimestamp(response.finished_at)) errors.push('finished_at must be a UTC ISO-8601 timestamp');
+  if (isUtcTimestamp(response.started_at) && isUtcTimestamp(response.finished_at)
+      && new Date(response.finished_at) < new Date(response.started_at)) {
+    errors.push('finished_at must not precede started_at');
+  }
+  if (!Array.isArray(response.findings)) {
+    errors.push('findings must be an array');
+  } else {
+    response.findings.forEach((finding, index) => {
+      if (!isObject(finding) || typeof finding.id !== 'string' || finding.id.length === 0
+          || typeof finding.summary !== 'string' || finding.summary.length === 0) {
+        errors.push(`findings[${index}] must contain nonempty id and summary strings`);
+      }
+    });
+    if (response.result === 'PASS' && response.findings.length !== 0) errors.push('PASS must not contain findings');
+    if (response.result === 'FAIL' && response.findings.length === 0) errors.push('FAIL must contain a finding');
+  }
+  if (!Array.isArray(response.evidence)) {
+    errors.push('evidence must be an array');
+  } else {
+    response.evidence.forEach((reference, index) => {
+      if (!isObject(reference) || typeof reference.path !== 'string' || reference.path.length === 0
+          || path.isAbsolute(reference.path) || typeof reference.kind !== 'string' || reference.kind.length === 0) {
+        errors.push(`evidence[${index}] must contain a relative path and nonempty kind`);
+        return;
+      }
+      const candidate = path.resolve(evidenceDir, reference.path);
+      try {
+        const details = fs.lstatSync(candidate);
+        if (!details.isFile() || details.isSymbolicLink()
+            || !pathIsWithin(fs.realpathSync(evidenceDir), fs.realpathSync(candidate))) {
+          errors.push(`evidence[${index}].path is not a contained regular file`);
+        }
+      } catch {
+        errors.push(`evidence[${index}].path does not exist`);
+      }
+    });
+  }
+  if (response.classification !== undefined) {
+    const classification = response.classification;
+    if (!isObject(classification)) {
+      errors.push('classification must be an object');
+    } else {
+      const allowed = new Set([
+        'manipulation_checks', 'provider_failure', 'expectation_met',
+        'agent_task_succeeded', 'ambiguous',
+      ]);
+      for (const key of Object.keys(classification)) {
+        if (!allowed.has(key)) errors.push(`classification contains unknown property ${key}`);
+      }
+      if (classification.manipulation_checks !== undefined
+          && (!Array.isArray(classification.manipulation_checks)
+            || classification.manipulation_checks.some((check) => !isObject(check)
+              || typeof check.id !== 'string' || check.id.length === 0
+              || typeof check.engaged !== 'boolean'
+              || (check.required !== undefined && typeof check.required !== 'boolean')))) {
+        errors.push('classification.manipulation_checks must contain structured checks');
+      }
+      if (classification.provider_failure !== undefined
+          && (!isObject(classification.provider_failure)
+            || classification.provider_failure.identified !== true
+            || typeof classification.provider_failure.injected !== 'boolean'
+            || typeof classification.provider_failure.kind !== 'string'
+            || classification.provider_failure.kind.length === 0)) {
+        errors.push('classification.provider_failure must identify a structured provider failure');
+      }
+      for (const key of ['expectation_met', 'agent_task_succeeded']) {
+        if (classification[key] !== undefined && typeof classification[key] !== 'boolean') {
+          errors.push(`classification.${key} must be boolean`);
+        }
+      }
+      if (classification.ambiguous !== undefined
+          && (!isObject(classification.ambiguous)
+            || typeof classification.ambiguous.category !== 'string'
+            || classification.ambiguous.category.length === 0)) {
+        errors.push('classification.ambiguous must contain a category');
+      }
+    }
+  }
+  const expectedExit = { PASS: 0, FAIL: 1, ERROR: 2 }[response.result];
+  if (expectedExit !== undefined && exitCode !== expectedExit) {
+    errors.push(`exit code ${exitCode} contradicts result ${response.result} (expected ${expectedExit})`);
+  }
+  return errors;
+}
+
+function runCaseOracles(caseRecord, caseState, state, campaignDir, childEnv) {
+  caseState.oracle_results ??= [];
+  const attempt = caseState.attempts.at(-1);
+  const attemptId = attempt?.id ?? 'case-without-attempt';
+  for (const oracleId of caseRecord.oracles) {
+    const prior = caseState.oracle_results.find((result) => result.oracle_id === oracleId
+      && (result.attempt_id ?? 'attempt-1') === attemptId);
+    if (prior !== undefined) {
+      if (prior.status === 'RUNNING') {
+        prior.status = 'TEST_INFRA';
+        prior.finished_at = utcTimestamp();
+        prior.errors = ['controller stopped while oracle invocation was in flight; hook was not relaunched'];
+        state.updated_at = prior.finished_at;
+        atomicWriteState(campaignDir, state);
+      }
+      continue;
+    }
+    const executable = oracleExecutable(oracleId);
+    if (executable === null) {
+      const timestamp = utcTimestamp();
+      caseState.oracle_results.push({
+        oracle_id: oracleId,
+        attempt_id: attemptId,
+        status: 'ORACLE_MISSING',
+        executable: `oracles/${oracleId}`,
+        started_at: timestamp,
+        finished_at: timestamp,
+      });
+      state.updated_at = timestamp;
+      atomicWriteState(campaignDir, state);
+      continue;
+    }
+
+    const evidenceDir = path.join(campaignDir, 'evidence', caseRecord.id, attemptId, 'oracles', oracleId);
+    fs.mkdirSync(evidenceDir, { recursive: true, mode: 0o700 });
+    const contextPath = path.join(evidenceDir, 'context.json');
+    const stdoutPath = path.join(evidenceDir, 'stdout.json');
+    const stderrPath = path.join(evidenceDir, 'stderr.txt');
+    const input = oracleContext(caseRecord, caseState, state, oracleId);
+    fs.writeFileSync(contextPath, `${JSON.stringify(input, null, 2)}\n`,
+      { encoding: 'utf8', mode: 0o400, flag: 'wx' });
+    const startedAt = utcTimestamp();
+    const record = {
+      oracle_id: oracleId,
+      attempt_id: attemptId,
+      status: 'RUNNING',
+      executable: `oracles/${oracleId}`,
+      argv: [`oracles/${oracleId}`, '--contract-version', '1', '--context', evidenceRelativePath(campaignDir, contextPath)],
+      context: evidenceRelativePath(campaignDir, contextPath),
+      started_at: startedAt,
+    };
+    caseState.oracle_results.push(record);
+    state.updated_at = startedAt;
+    atomicWriteState(campaignDir, state);
+
+    const result = spawnSync(executable, ['--contract-version', '1', '--context', contextPath], {
+      cwd: evidenceDir,
+      env: {
+        ...childEnv,
+        TT_ORACLE_CONTRACT_VERSION: '1',
+        TT_ORACLE_ID: oracleId,
+        TT_ORACLE_CONTEXT: contextPath,
+        TT_ORACLE_EVIDENCE_DIR: evidenceDir,
+        TT_CASE_ID: caseRecord.id,
+        TT_CAMPAIGN_ID: state.campaign_id,
+        ...(input.run_id === null ? {} : { TT_RUN_ID: input.run_id }),
+      },
+      encoding: null,
+      maxBuffer: EVIDENCE_LIMIT_BYTES,
+      timeout: 5 * 60_000,
+      shell: false,
+    });
+    const stdout = Buffer.isBuffer(result.stdout) ? result.stdout : Buffer.from(result.stdout ?? '');
+    const stderr = Buffer.isBuffer(result.stderr) ? result.stderr : Buffer.from(result.stderr ?? '');
+    fs.writeFileSync(stdoutPath, stdout, { mode: 0o400, flag: 'wx' });
+    fs.writeFileSync(stderrPath, stderr, { mode: 0o400, flag: 'wx' });
+    Object.assign(record, {
+      finished_at: utcTimestamp(),
+      exit_code: result.status,
+      signal: result.signal,
+      stdout: evidenceRelativePath(campaignDir, stdoutPath),
+      stderr: evidenceRelativePath(campaignDir, stderrPath),
+      stdout_sha256: sha256(stdout),
+      stderr_sha256: sha256(stderr),
+    });
+    let response;
+    const errors = [];
+    if (result.error !== undefined) errors.push(`oracle execution failed: ${result.error.message}`);
+    if (result.signal !== null) errors.push(`oracle terminated by signal ${result.signal}`);
+    try {
+      response = JSON.parse(stdout.toString('utf8').trim());
+    } catch (error) {
+      errors.push(`stdout is not one JSON object: ${error.message}`);
+    }
+    if (response !== undefined) errors.push(...validateOracleResponse(response, oracleId, result.status, evidenceDir));
+    if (errors.length === 0) {
+      record.status = 'VALID';
+      record.response = response;
+      for (const reference of response.evidence) {
+        const evidencePath = path.resolve(evidenceDir, reference.path);
+        reference.sha256 = sha256(fs.readFileSync(evidencePath));
+        try { fs.chmodSync(evidencePath, 0o400); } catch { /* the hash still pins the content */ }
+      }
+    } else {
+      record.status = 'TEST_INFRA';
+      record.errors = errors;
+    }
+    state.updated_at = record.finished_at;
+    atomicWriteState(campaignDir, state);
+  }
+  return caseState.oracle_results.filter((result) => result.oracle_id !== undefined
+    && (result.attempt_id ?? 'attempt-1') === attemptId);
+}
+
+function outcomeWithOracleEvidence(caseRecord, baseOutcome, baseReason, oracleResults) {
+  const evidence = { caseClass: caseRecord.class, oracle_results: oracleResults };
+  if (baseOutcome === 'PASS') evidence.expectation_met = true;
+  else if (baseOutcome === 'PRODUCT_FAIL') evidence.expectation_met = false;
+  else if (baseOutcome === 'AGENT_FLAKE') evidence.agent_task_succeeded = false;
+  else if (baseOutcome === 'PROVIDER_FAIL') evidence.provider_failure = baseReason;
+  else if (baseOutcome === 'TEST_INFRA_FAIL') evidence.infrastructure_failure = baseReason;
+  else if (baseOutcome === 'INVALID') evidence.manipulation_checks = baseReason?.checks ?? [];
+  else if (baseOutcome === 'NOT_RUN') evidence.not_run = baseReason;
+  else if (baseReason?.category === 'runaway-cap-enforced') evidence.cap_evidence = baseReason;
+  else evidence.ambiguous = baseReason ?? { category: 'unclassified-terminal-state' };
+  return classifyAttempt(evidence);
+}
+
+function persistClassifiedAttempt(caseState, attempt, state, campaignDir, verdict) {
+  attempt.outcome = verdict.outcome;
+  attempt.counts_toward_gate = verdict.outcome === 'PASS' || verdict.outcome === 'PRODUCT_FAIL';
+  if (verdict.reason !== undefined) attempt.classification_reason = verdict.reason;
+  const retry = providerRetryDecision({
+    outcome: verdict.outcome,
+    attempts: caseState.attempts,
+    backoffMs: state.options.provider_retry_backoff_ms ?? DEFAULT_PROVIDER_RETRY_BACKOFF_MS,
+  });
+  if (retry.retry) {
+    caseState.phase = 'pending';
+    caseState.provider_retry = {
+      status: 'scheduled',
+      scheduled_at: utcTimestamp(),
+      ...retry,
+    };
+    state.updated_at = caseState.provider_retry.scheduled_at;
+    atomicWriteState(campaignDir, state);
+    return;
+  }
+  caseState.counts_toward_gate = attempt.counts_toward_gate;
+  if (caseState.provider_retry !== undefined) {
+    caseState.provider_retry.status = 'completed';
+    caseState.provider_retry.final_attempt_id = attempt.id;
+    caseState.provider_retry.final_outcome = verdict.outcome;
+  }
+  markTerminal(state, caseState, campaignDir, verdict.outcome, verdict.reason);
+}
+
+function persistMechanicalOutcome(caseState, attempt, state, campaignDir, outcome, reason) {
+  persistClassifiedAttempt(caseState, attempt, state, campaignDir, { outcome, reason });
+}
+
+function retryAttemptMetadata(caseState) {
+  if (caseState.provider_retry?.status !== 'scheduled') return {};
+  caseState.provider_retry.status = 'launched';
+  return {
+    retry_of: caseState.provider_retry.retry_of,
+    retry_number: caseState.provider_retry.retry_number,
+    retry_scheduled_at: caseState.provider_retry.scheduled_at,
+  };
+}
+
+function hookSucceeded(result) {
+  return result.error === undefined && result.exit_code === 0 && result.signal === null;
+}
+
+function hasAssociatedNonterminalRun(caseState) {
+  return caseState.attempts.some((attempt) => attempt.outcome === undefined);
+}
+
+async function executeLocalCase(caseRecord, caseState, state, campaignDir) {
+  if (hasAssociatedNonterminalRun(caseState)) return;
+  const launchIntentTimestamp = utcTimestamp();
+  const attempt = {
+    id: `attempt-${caseState.attempts.length + 1}`,
+    case_id: caseRecord.id,
+    kind: 'local',
+    phase: 'launch-intent',
+    execution_mode: caseUsesScriptedEnvironment(caseRecord) ? 'scripted' : 'real',
+    launch_intent_at: launchIntentTimestamp,
+    started_at: launchIntentTimestamp,
+    deadline_at: new Date(Date.now() + (caseRecord.caps.wall_min * 60_000)).toISOString(),
+    ...retryAttemptMetadata(caseState),
+  };
+  caseState.phase = 'running';
+  caseState.attempts.push(attempt);
+  state.updated_at = attempt.started_at;
+  atomicWriteState(campaignDir, state);
+
+  let childEnv;
+  try {
+    childEnv = loadSpawnEnvironment(attempt.execution_mode === 'scripted');
+  } catch (error) {
+    attempt.phase = 'terminal';
+    attempt.terminal_at = utcTimestamp();
+    persistMechanicalOutcome(caseState, attempt, state, campaignDir, 'TEST_INFRA_FAIL', {
+      category: 'spawn-environment',
+      message: error.message,
+    });
+    return;
+  }
+
+  if (caseRecord.reset !== null && caseRecord.reset !== undefined) {
+    attempt.phase = 'resetting';
+    const resetResult = await runHook('reset', caseRecord.reset, childEnv, campaignDir, state, attempt);
+    if (!hookSucceeded(resetResult)) {
+      attempt.phase = 'terminal';
+      attempt.terminal_at = utcTimestamp();
+      persistMechanicalOutcome(caseState, attempt, state, campaignDir, 'TEST_INFRA_FAIL', {
+        category: 'reset-failed',
+        exit_code: resetResult.exit_code,
+        signal: resetResult.signal,
+        error: resetResult.error ?? null,
+      });
+      return;
+    }
+  }
+
+  if (caseRecord.command === null || caseRecord.command === undefined) {
+    attempt.phase = 'terminal';
+    attempt.terminal_at = utcTimestamp();
+    persistMechanicalOutcome(caseState, attempt, state, campaignDir, 'TEST_INFRA_FAIL', {
+      category: 'local-command-missing',
+    });
+    return;
+  }
+
+  attempt.phase = 'running';
+  const commandResult = await runDurableLocalCommand(caseRecord.command, childEnv, campaignDir, state, attempt);
+  attempt.phase = 'terminal';
+  attempt.terminal_at = utcTimestamp();
+  const baseOutcome = hookSucceeded(commandResult)
+    ? 'PASS'
+    : (commandResult.error === undefined ? 'PRODUCT_FAIL' : 'TEST_INFRA_FAIL');
+  const baseReason = hookSucceeded(commandResult) ? undefined : {
+        category: commandResult.error === undefined ? 'local-command-failed' : 'local-command-launch-failed',
+        exit_code: commandResult.exit_code,
+        signal: commandResult.signal,
+        error: commandResult.error ?? null,
+      };
+  const verdict = outcomeWithOracleEvidence(
+    caseRecord, baseOutcome, baseReason,
+    runCaseOracles(caseRecord, caseState, state, campaignDir, childEnv),
+  );
+  persistClassifiedAttempt(caseState, attempt, state, campaignDir, verdict);
+}
+
+function workflowRunArgs(caseRecord) {
+  const args = ['workflow', 'run', caseRecord.workflow, '--task-file', caseRecord.task];
+  for (const [key, value] of Object.entries(caseRecord.context)) {
+    if (key === 'execution_mode') continue;
+    args.push('--context', `${key}=${typeof value === 'string' ? value : JSON.stringify(value)}`);
+  }
+  if (caseRecord.harness === 'pi' || caseRecord.harness === 'scripted-pi') {
+    args.push('--pi-as-harness');
+  } else {
+    args.push('--hermes-as-harness');
+  }
+  const fixturePath = path.join(VAR_ROOT, 'fixtures', 'work', caseRecord.id, caseRecord.fixture);
+  if (caseRecord.workflow.includes('worktree')) {
+    args.push('--worktree-origin-repository', fixturePath);
+  } else {
+    args.push('--working-directory-for-harness', fixturePath);
+  }
+  args.push('--wait', '--json');
+  return args;
+}
+
+const FULL_RUN_ID_PATTERN = /(?:^|\r?\n)Run:\s+(run-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/gim;
+const EARLY_SHORT_RUN_ID_PATTERN = /\brun\s+#\d+\s+\(([0-9a-f]{8})\)\s+created\b/gi;
+
+function parseSingleJsonObject(output) {
+  const lines = output.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  if (lines.length !== 1) throw new Error(`expected one JSON line, received ${lines.length}`);
+  const parsed = JSON.parse(lines[0]);
+  if (!isObject(parsed)) throw new Error('JSON response is not an object');
+  return parsed;
+}
+
+function resolveShortRunId(shortId, childEnv) {
+  const result = spawnSync('tamandua', ['workflow', 'status', `run-${shortId}`, '--json'], {
+    cwd: fs.realpathSync(TT_ROOT),
+    env: childEnv,
+    encoding: 'utf8',
+    maxBuffer: 1024 * 1024,
+    shell: false,
+  });
+  if (result.error !== undefined) throw result.error;
+  if (result.status !== 0) {
+    const detail = String(result.stderr ?? '').trim();
+    throw new Error(`workflow status exited ${result.status}${detail ? `: ${detail}` : ''}`);
+  }
+  const status = parseSingleJsonObject(String(result.stdout ?? ''));
+  const runIdMatch = /^run-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i.exec(status.runId);
+  if (runIdMatch === null || !runIdMatch[1].toLowerCase().startsWith(shortId.toLowerCase())) {
+    throw new Error(`workflow status returned a non-matching runId: ${displayValue(status.runId)}`);
+  }
+  return `run-${runIdMatch[1].toLowerCase()}`;
+}
+
+function createRunIdentifierCapture(attempt, state, campaignDir, childEnv, onResolvedRunId) {
+  const buffers = { stdout: '', stderr: '' };
+  const observed = { stdout: new Set(), stderr: new Set() };
+  attempt.run_id_observations = [];
+
+  const persist = () => {
+    state.updated_at = utcTimestamp();
+    atomicWriteState(campaignDir, state);
+  };
+  const recordError = (category, details) => {
+    attempt.run_id_error ??= { category, ...details, observed_at: utcTimestamp() };
+    persist();
+  };
+  const recordResolvedId = (runId, source, observation) => {
+    if (attempt.run_id === undefined) {
+      attempt.run_id = runId;
+      attempt.run_id_source = source;
+      attempt.run_id_persisted_at = utcTimestamp();
+      onResolvedRunId(runId);
+    } else if (attempt.run_id !== runId) {
+      recordError('conflicting-run-identifiers', {
+        persisted_run_id: attempt.run_id,
+        conflicting_run_id: runId,
+        conflicting_source: source,
+      });
+    }
+    attempt.run_id_observations.push({ ...observation, resolved_run_id: runId, observed_at: utcTimestamp() });
+    persist();
+  };
+
+  return (streamName, chunk) => {
+    buffers[streamName] = `${buffers[streamName]}${chunk.toString('utf8')}`.slice(-16 * 1024);
+    if (streamName === 'stdout') {
+      for (const match of buffers.stdout.matchAll(FULL_RUN_ID_PATTERN)) {
+        const runId = match[1].toLowerCase();
+        if (observed.stdout.has(runId)) continue;
+        observed.stdout.add(runId);
+        recordResolvedId(runId, 'stdout-full', { stream: 'stdout', identifier: runId });
+      }
+      return;
+    }
+
+    for (const match of buffers.stderr.matchAll(EARLY_SHORT_RUN_ID_PATTERN)) {
+      const shortId = match[1].toLowerCase();
+      if (observed.stderr.has(shortId)) continue;
+      observed.stderr.add(shortId);
+      attempt.run_id_observations.push({ stream: 'stderr', identifier: shortId, observed_at: utcTimestamp() });
+      persist();
+      try {
+        recordResolvedId(resolveShortRunId(shortId, childEnv), 'stderr-short-status', {
+          stream: 'stderr', identifier: shortId,
+        });
+      } catch (error) {
+        attempt.run_id_resolution_errors ??= [];
+        attempt.run_id_resolution_errors.push({
+          category: 'unresolved-short-run-identifier',
+          short_id: shortId,
+          message: error.message,
+          observed_at: utcTimestamp(),
+        });
+        persist();
+      }
+    }
+  };
+}
+
+function queryWorkflowStatus(runId, childEnv) {
+  const result = spawnSync('tamandua', ['workflow', 'status', runId, '--json'], {
+    cwd: fs.realpathSync(TT_ROOT),
+    env: childEnv,
+    encoding: 'utf8',
+    maxBuffer: 1024 * 1024,
+    shell: false,
+  });
+  if (result.error !== undefined) throw result.error;
+  if (result.status !== 0) {
+    const detail = String(result.stderr ?? '').trim();
+    throw new Error(`workflow status exited ${result.status}${detail ? `: ${detail}` : ''}`);
+  }
+  const status = parseSingleJsonObject(String(result.stdout ?? ''));
+  if (status.runId !== runId || typeof status.status !== 'string'
+      || !Number.isSafeInteger(status.tokensSpent) || status.tokensSpent < 0) {
+    throw new Error(`workflow status returned invalid monitoring data for ${runId}`);
+  }
+  return status;
+}
+
+function readHookStdout(campaignDir, hookState) {
+  if (hookState === undefined || typeof hookState.stdout !== 'string') return '';
+  const absolutePath = path.resolve(campaignDir, hookState.stdout);
+  const campaignRoot = fs.realpathSync(campaignDir);
+  if (!pathIsWithin(campaignRoot, absolutePath)) {
+    throw new Error('workflow waiter stdout path escapes campaign directory');
+  }
+  const details = fs.lstatSync(absolutePath);
+  if (!details.isFile() || details.isSymbolicLink()
+      || !pathIsWithin(campaignRoot, fs.realpathSync(absolutePath))) {
+    throw new Error('workflow waiter stdout is not a contained regular file');
+  }
+  return fs.readFileSync(absolutePath, 'utf8');
+}
+
+function parseWaitJson(output, runId) {
+  let waitJson = null;
+  for (const line of output.split(/\r?\n/)) {
+    if (line.trim() === '') continue;
+    try {
+      const parsed = JSON.parse(line);
+      if (!isObject(parsed)) continue;
+      if (Array.isArray(parsed.runs)) {
+        if (parsed.runs.some((run) => normalizedRunId(run?.runId) === runId)) waitJson = parsed;
+      } else if (typeof parsed.status === 'string') {
+        waitJson = parsed;
+      }
+    } catch {
+      // The early "Run:" line and any human progress lines are not waiter JSON.
+    }
+  }
+  return waitJson;
+}
+
+function queryWorkflowDatabaseEvidence(runId, childEnv) {
+  const selectedHome = childEnv.HOME;
+  if (typeof selectedHome !== 'string' || !path.isAbsolute(selectedHome)) {
+    throw new Error('selected TT HOME is unavailable');
+  }
+  const databasePath = path.join(path.resolve(selectedHome), '.tamandua', 'tamandua.db');
+  if (!pathIsWithin(fs.realpathSync(TT_ROOT), databasePath)) {
+    throw new Error('selected TT HOME database path escapes torture-test state');
+  }
+  let details;
+  try {
+    details = fs.lstatSync(databasePath);
+  } catch (error) {
+    throw new Error(`cannot inspect TT workflow database: ${error.message}`);
+  }
+  if (!details.isFile() || details.isSymbolicLink()
+      || !pathIsWithin(fs.realpathSync(TT_ROOT), fs.realpathSync(databasePath))) {
+    throw new Error('TT workflow database is not a contained regular file');
+  }
+  const storedRunId = runId.slice(4);
+  const invoke = (sql) => {
+    const result = spawnSync('sqlite3', ['-readonly', '-json', databasePath, sql], {
+      cwd: fs.realpathSync(TT_ROOT), env: childEnv, encoding: 'utf8',
+      maxBuffer: 16 * 1024 * 1024, shell: false,
+    });
+    if (result.error !== undefined) throw result.error;
+    if (result.status !== 0) {
+      const detail = String(result.stderr ?? '').trim();
+      throw new Error(`sqlite3 -readonly exited ${result.status}${detail ? `: ${detail}` : ''}`);
+    }
+    const parsed = JSON.parse(String(result.stdout ?? '[]') || '[]');
+    if (!Array.isArray(parsed)) throw new Error('sqlite3 -readonly did not emit a JSON array');
+    return parsed;
+  };
+  const quotedRunId = `'${storedRunId.replaceAll("'", "''")}'`;
+  const runs = invoke(`SELECT id, status, tokens_spent AS tokensSpent, created_at AS createdAt, updated_at AS updatedAt FROM runs WHERE id = ${quotedRunId} OR id = 'run-' || ${quotedRunId}`);
+  if (runs.length !== 1 || typeof runs[0].status !== 'string'
+      || !Number.isSafeInteger(runs[0].tokensSpent) || runs[0].tokensSpent < 0) {
+    throw new Error(`sqlite3 -readonly returned invalid run evidence for ${runId}`);
+  }
+  const steps = invoke(`SELECT step_id, agent_id, step_index, status, type, current_story_id, retry_count, abandoned_count, reroute_count, claim_pid, claim_updated_at, updated_at FROM steps WHERE run_id = ${quotedRunId} OR run_id = 'run-' || ${quotedRunId} ORDER BY step_index ASC`);
+  return {
+    runId,
+    status: runs[0].status,
+    tokensSpent: runs[0].tokensSpent,
+    steps,
+    evidenceSource: {
+      source: 'sqlite-readonly',
+      database: toPortableRelativePath(databasePath),
+      mode: '-readonly',
+      command: ['sqlite3', '-readonly', '-json', toPortableRelativePath(databasePath)],
+    },
+  };
+}
+
+function queryWorkflowTerminalEvidence(runId, childEnv) {
+  try {
+    const status = queryWorkflowStatus(runId, childEnv);
+    if (!Array.isArray(status.steps)) throw new Error('workflow status omitted the complete steps array');
+    return {
+      ...status,
+      evidenceSource: { source: 'workflow-status-json', command: ['workflow', 'status', runId, '--json'] },
+    };
+  } catch (statusError) {
+    try {
+      return queryWorkflowDatabaseEvidence(runId, childEnv);
+    } catch (databaseError) {
+      throw new Error(`terminal evidence unavailable from status (${statusError.message}) and readonly DB (${databaseError.message})`);
+    }
+  }
+}
+
+function waitJsonStatus(waitJson, runId) {
+  if (waitJson === null) return null;
+  if (Array.isArray(waitJson.runs)) {
+    const run = waitJson.runs.find((entry) => normalizedRunId(entry?.runId) === runId);
+    return typeof run?.status === 'string' ? run.status : null;
+  }
+  return typeof waitJson.status === 'string' ? waitJson.status : null;
+}
+
+function canonicalTerminalStatus(status) {
+  return status === 'done' ? 'completed' : status;
+}
+
+function expectedWaitExitCode(status) {
+  const canonical = canonicalTerminalStatus(status);
+  if (canonical === 'completed') return 0;
+  if (canonical === 'failed') return 1;
+  if (canonical === 'canceled') return 3;
+  return null;
+}
+
+function configuredTruthRecheckMs() {
+  const configured = Number(process.env.TT_CONTROLLER_TRUTH_RECHECK_MS ?? 30_000);
+  return Number.isSafeInteger(configured) && configured >= 1 ? configured : 30_000;
+}
+
+function waitEvidenceDisagrees(status, waitHook, waitExitCode, observedWaitStatus) {
+  return waitHook !== undefined
+    && (expectedWaitExitCode(status) !== waitExitCode
+      || (observedWaitStatus !== null
+        && canonicalTerminalStatus(observedWaitStatus) !== canonicalTerminalStatus(status)));
+}
+
+async function harvestWorkflowAttempt(caseState, attempt, waitHook, childEnv, state, campaignDir) {
+  let evidence = queryWorkflowTerminalEvidence(attempt.run_id, childEnv);
+  persistTokenObservation(evidence, attempt, caseState, state, campaignDir);
+  if (!TERMINAL_RUN_STATUSES.has(evidence.status)) return null;
+
+  const waitJson = parseWaitJson(readHookStdout(campaignDir, waitHook), attempt.run_id);
+  const waitExitCode = waitHook?.exit_code ?? null;
+  const observedWaitStatus = waitJsonStatus(waitJson, attempt.run_id);
+  const disagrees = waitEvidenceDisagrees(
+    evidence.status, waitHook, waitExitCode, observedWaitStatus,
+  );
+  let persistentDisagreement = false;
+  if (disagrees) {
+    await delay(configuredTruthRecheckMs());
+    const resampled = queryWorkflowTerminalEvidence(attempt.run_id, childEnv);
+    persistTokenObservation(resampled, attempt, caseState, state, campaignDir);
+    persistentDisagreement = TERMINAL_RUN_STATUSES.has(resampled.status)
+      && waitEvidenceDisagrees(resampled.status, waitHook, waitExitCode, observedWaitStatus);
+    evidence = resampled;
+  }
+
+  attempt.terminal_status = evidence.status;
+  attempt.wait_exit_code = waitExitCode;
+  attempt.wait_json = waitJson;
+  attempt.steps_snapshot = {
+    source: evidence.evidenceSource.source,
+    captured_at: utcTimestamp(),
+    provenance: evidence.evidenceSource,
+    steps: evidence.steps,
+  };
+  attempt.terminal_evidence = {
+    source: evidence.evidenceSource.source,
+    observed_at: attempt.steps_snapshot.captured_at,
+    status: evidence.status,
+    tokens: evidence.tokensSpent,
+  };
+  if (persistentDisagreement) {
+    caseState.findings.push({
+      type: 'O13_TRUTHFULNESS',
+      oracle: 'O13',
+      run_id: attempt.run_id,
+      detected_at: utcTimestamp(),
+      terminal_status: evidence.status,
+      terminal_source: evidence.evidenceSource.source,
+      wait_exit_code: waitExitCode,
+      expected_wait_exit_code: expectedWaitExitCode(evidence.status),
+      wait_json_status: observedWaitStatus,
+      recheck_ms: configuredTruthRecheckMs(),
+    });
+  }
+  state.updated_at = utcTimestamp();
+  atomicWriteState(campaignDir, state);
+  return evidence;
+}
+
+function resolveChildDatabasePath(childEnv) {
+  const explicit = childEnv.TAMANDUA_DB_PATH;
+  const home = childEnv.HOME;
+  const candidate = typeof explicit === 'string' && explicit.trim() !== ''
+    ? path.resolve(explicit)
+    : typeof home === 'string' && path.isAbsolute(home)
+      ? path.join(home, '.tamandua', 'tamandua.db')
+      : null;
+  if (candidate === null || !pathIsWithin(fs.realpathSync(TT_ROOT), candidate)) return null;
+  return candidate;
+}
+
+function queryWorkflowRunsDatabase(childEnv) {
+  const databasePath = resolveChildDatabasePath(childEnv);
+  if (databasePath === null) return null;
+  for (const candidate of [databasePath, `${databasePath}-wal`, `${databasePath}-shm`]) {
+    let details;
+    try {
+      details = fs.lstatSync(candidate);
+    } catch (error) {
+      if (error.code === 'ENOENT' && candidate === databasePath) return null;
+      if (error.code === 'ENOENT') continue;
+      throw new Error(`cannot inspect TT run database: ${error.message}`);
+    }
+    if (!details.isFile() || details.isSymbolicLink()
+        || !pathIsWithin(fs.realpathSync(TT_ROOT), fs.realpathSync(candidate))) {
+      throw new Error(`TT run database file ${path.basename(candidate)} is not a contained regular file`);
+    }
+  }
+
+  let database;
+  try {
+    database = new DatabaseSync(databasePath, { readOnly: true });
+    const rows = database.prepare(`
+      SELECT id, workflow_id, task, status, context, tokens_spent, created_at, updated_at
+      FROM runs
+      ORDER BY created_at DESC
+    `).all();
+    return rows.map((row) => {
+      let context = {};
+      try {
+        const parsed = JSON.parse(row.context);
+        if (isObject(parsed)) context = parsed;
+      } catch {
+        // Relationship fields in malformed context are ignored; the durable
+        // run inventory remains usable and status harvesting will expose DB drift.
+      }
+      return {
+        runId: normalizedStoredRunId(row.id) ?? row.id,
+        workflowId: row.workflow_id,
+        task: row.task,
+        status: row.status,
+        context,
+        tokensSpent: row.tokens_spent,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+      };
+    });
+  } catch (error) {
+    throw new Error(`cannot query complete TT run inventory: ${error.message}`);
+  } finally {
+    database?.close();
+  }
+}
+
+function queryWorkflowRuns(childEnv) {
+  const runs = queryWorkflowRunsDatabase(childEnv);
+  if (runs === null) {
+    throw new Error('complete TT run inventory is unavailable: contained database does not exist');
+  }
+  const relationships = readRunRelationships(childEnv);
+  return runs.map((run) => {
+    const runId = normalizedRunId(run?.runId ?? run?.id);
+    const parentRunId = runId === null ? undefined : relationships.get(runId);
+    return parentRunId === undefined || linkedParentRunId(run) !== null
+      ? run
+      : { ...run, parentRunId };
+  });
+}
+
+function normalizedRunId(value) {
+  if (typeof value !== 'string') return null;
+  const match = /^run-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i.exec(value);
+  return match === null ? null : `run-${match[1].toLowerCase()}`;
+}
+
+function normalizedStoredRunId(value) {
+  const external = normalizedRunId(value);
+  if (external !== null) return external;
+  if (typeof value !== 'string'
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)) {
+    return null;
+  }
+  return `run-${value.toLowerCase()}`;
+}
+
+function linkedParentRunId(run) {
+  if (!isObject(run)) return null;
+  const context = isObject(run.context) ? run.context : {};
+  for (const value of [
+    run.parentRunId, run.parent_run_id,
+    run.replacementForRunId, run.replacement_for_run_id,
+    run.replacesRunId, run.replaces_run_id,
+    context.parentRunId, context.parent_run_id,
+    context.replacementForRunId, context.replacement_for_run_id,
+  ]) {
+    const runId = normalizedStoredRunId(value);
+    if (runId !== null) return runId;
+  }
+  return null;
+}
+
+function runStartedAt(run) {
+  for (const value of [run.createdAt, run.created_at, run.startedAt, run.started_at]) {
+    if (isUtcTimestamp(value)) return value;
+  }
+  return null;
+}
+
+function readRunRelationships(childEnv) {
+  const relationships = new Map();
+  const stateDirectory = childEnv.TAMANDUA_STATE_DIR;
+  if (typeof stateDirectory !== 'string' || !path.isAbsolute(stateDirectory)) return relationships;
+  const resolvedStateDirectory = path.resolve(stateDirectory);
+  if (!pathIsWithin(fs.realpathSync(TT_ROOT), resolvedStateDirectory)) return relationships;
+  const liveEventsPath = path.join(resolvedStateDirectory, 'events', 'all.jsonl');
+  // Tamandua retains three numbered global-event archives. Read oldest to
+  // newest so a newer relationship observation wins deterministically.
+  const eventPaths = [3, 2, 1].map((suffix) => `${liveEventsPath}.${suffix}`)
+    .concat(liveEventsPath);
+  for (const eventsPath of eventPaths) {
+    let source;
+    try {
+      const details = fs.lstatSync(eventsPath);
+      if (!details.isFile() || details.isSymbolicLink()
+          || !pathIsWithin(fs.realpathSync(TT_ROOT), fs.realpathSync(eventsPath))) {
+        throw new Error(`${path.basename(eventsPath)} is not a contained regular file`);
+      }
+      source = fs.readFileSync(eventsPath, 'utf8');
+    } catch (error) {
+      if (error.code === 'ENOENT') continue;
+      throw new Error(`cannot read TT run relationships: ${error.message}`);
+    }
+    for (const line of source.split(/\r?\n/)) {
+      if (line.trim() === '') continue;
+      let event;
+      try {
+        event = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      const parentRunId = normalizedStoredRunId(event.parentRunId ?? event.parent_run_id ?? event.runId);
+      let childRunId = normalizedStoredRunId(event.childRunId ?? event.child_run_id
+        ?? event.replacementRunId ?? event.replacement_run_id);
+      if (childRunId === null && event.event === 'run.rugpull_relaunched') {
+        const match = /Rugpull replacement run launched:\s+((?:run-)?[0-9a-f-]{36})\b/i.exec(String(event.detail ?? ''));
+        childRunId = normalizedStoredRunId(match?.[1]);
+      }
+      if (parentRunId !== null && childRunId !== null && parentRunId !== childRunId) {
+        relationships.set(childRunId, parentRunId);
+      }
+    }
+  }
+  return relationships;
+}
+
+function persistTokenObservation(status, attempt, caseState, state, campaignDir) {
+  const observedAt = utcTimestamp();
+  const previous = attempt.tokens_observed ?? 0;
+  const tokensObserved = Math.max(previous, status.tokensSpent);
+  const attributedDelta = tokensObserved - previous;
+  const observation = {
+    observed_at: observedAt,
+    run_id: attempt.run_id,
+    status: status.status,
+    tokens_observed: status.tokensSpent,
+    attributed_delta: attributedDelta,
+  };
+  attempt.tokens_observed = tokensObserved;
+  attempt.token_observations ??= [];
+  attempt.token_observations.push(observation);
+  caseState.spend.tokens_observed += attributedDelta;
+  caseState.spend.observations.push({ attempt_id: attempt.id, ...observation });
+  state.spend.tokens_observed += attributedDelta;
+  state.spend.observations.push({ case_id: caseState.id, attempt_id: attempt.id, ...observation });
+  state.updated_at = observedAt;
+  atomicWriteState(campaignDir, state);
+}
+
+function rootRunAttribution(state) {
+  const attribution = new Map();
+  for (const caseState of state.cases) {
+    for (const attempt of caseState.attempts) {
+      const runId = normalizedRunId(attempt.run_id);
+      if (runId !== null) attribution.set(runId, caseState.id);
+    }
+  }
+  for (const run of state.discovered_runs ?? []) {
+    attribution.set(run.run_id, run.root_case_id);
+  }
+  return attribution;
+}
+
+function discoveredRunRecord(run, runId, parentRunId, caseRecord, rootCaseId) {
+  const startedAt = runStartedAt(run);
+  if (startedAt === null) {
+    throw new Error(`linked run ${runId} has no valid created/start timestamp`);
+  }
+  return {
+    id: `discovered-${runId.slice(4)}`,
+    case_id: rootCaseId,
+    kind: 'discovered-workflow',
+    phase: 'attached',
+    run_id: runId,
+    parent_run_id: parentRunId,
+    root_case_id: rootCaseId,
+    discovered_at: utcTimestamp(),
+    started_at: startedAt,
+    deadline_at: new Date(new Date(startedAt).valueOf()
+      + (caseRecord.caps.wall_min * 60_000)).toISOString(),
+    tokens_observed: 0,
+    token_observations: [],
+  };
+}
+
+function inferJustDoItParentRunId(listed, caseRecord, caseState, rootTask) {
+  if (caseRecord.workflow !== 'just-do-it' || typeof rootTask !== 'string'
+      || typeof listed?.task !== 'string') return null;
+  const rootAttempt = caseState.attempts.find((attempt) =>
+    attempt.kind === 'workflow' && normalizedRunId(attempt.run_id) !== null);
+  const listedRunId = normalizedRunId(listed.runId ?? listed.id);
+  const startedAt = runStartedAt(listed);
+  if (rootAttempt === undefined || listedRunId === null || startedAt === null
+      || listedRunId === rootAttempt.run_id
+      || new Date(startedAt).valueOf() < new Date(rootAttempt.started_at).valueOf()) return null;
+  const listedTask = listed.task;
+  if (listedTask !== rootTask && listedTask !== rootTask.slice(0, 120)) return null;
+  return rootAttempt.run_id;
+}
+
+function reconcileDiscoveredRuns(caseRecord, caseState, childEnv, state, campaignDir) {
+  state.discovered_runs ??= [];
+  const listedRuns = queryWorkflowRuns(childEnv);
+  const attribution = rootRunAttribution(state);
+  const launchedRunIds = new Set(state.cases.flatMap((item) => item.attempts)
+    .map((attempt) => normalizedRunId(attempt.run_id)).filter(Boolean));
+  const discoveredById = new Map(state.discovered_runs.map((run) => [run.run_id, run]));
+  const rootAttempt = caseState.attempts.find((attempt) =>
+    attempt.kind === 'workflow' && normalizedRunId(attempt.run_id) !== null);
+  const rootTask = caseRecord.workflow === 'just-do-it' && rootAttempt !== undefined
+    ? queryWorkflowStatus(rootAttempt.run_id, childEnv).task
+    : null;
+  let added = 0;
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const listed of listedRuns) {
+      const runId = normalizedRunId(listed?.runId ?? listed?.id);
+      const parentRunId = linkedParentRunId(listed)
+        ?? inferJustDoItParentRunId(listed, caseRecord, caseState, rootTask);
+      if (runId === null || parentRunId === null || launchedRunIds.has(runId)
+          || discoveredById.has(runId)) continue;
+      const rootCaseId = attribution.get(parentRunId);
+      if (rootCaseId !== caseState.id) continue;
+      const record = discoveredRunRecord(listed, runId, parentRunId, caseRecord, rootCaseId);
+      state.discovered_runs.push(record);
+      discoveredById.set(runId, record);
+      attribution.set(runId, rootCaseId);
+      added += 1;
+      changed = true;
+      state.updated_at = record.discovered_at;
+      atomicWriteState(campaignDir, state);
+    }
+  }
+
+  for (const run of state.discovered_runs.filter((item) =>
+    item.root_case_id === caseState.id && item.phase !== 'terminal')) {
+    const status = queryWorkflowStatus(run.run_id, childEnv);
+    persistTokenObservation(status, run, caseState, state, campaignDir);
+    run.last_status = status.status;
+    run.status_observed_at = utcTimestamp();
+    state.updated_at = run.status_observed_at;
+    atomicWriteState(campaignDir, state);
+  }
+  return added;
+}
+
+function discoveredRunBreach(caseRecord, caseState, run) {
+  if (caseState.spend.tokens_observed >= caseRecord.caps.tokens) {
+    return { cap: 'tokens', threshold: caseRecord.caps.tokens, observed: caseState.spend.tokens_observed };
+  }
+  if (Date.now() >= new Date(run.deadline_at).valueOf()) {
+    const elapsed = (Date.now() - new Date(run.started_at).valueOf()) / 60_000;
+    return { cap: 'wall_min', threshold: caseRecord.caps.wall_min, observed: elapsed };
+  }
+  return null;
+}
+
+async function stopDiscoveredRun(caseState, run, breach, childEnv, state, campaignDir) {
+  if (run.stop_intent_at !== undefined) return;
+  run.stop_intent_at = utcTimestamp();
+  run.stop_reason = breach;
+  caseState.findings.push({
+    type: 'RUNAWAY', ...breach, run_id: run.run_id, discovered: true,
+    detected_at: run.stop_intent_at,
+  });
+  state.updated_at = run.stop_intent_at;
+  atomicWriteState(campaignDir, state);
+  const stopResult = await runHook(`discovered_stop_${run.id}`, {
+    executable: 'tamandua', args: ['workflow', 'stop', run.run_id], cwd: '.',
+  }, childEnv, campaignDir, state, run, { enforceWall: false });
+  if (!hookSucceeded(stopResult)) throw new Error(`workflow stop failed for ${run.run_id}`);
+}
+
+async function awaitDiscoveredRun(caseRecord, caseState, run, childEnv, state, campaignDir) {
+  const cleanupWaitTimeoutMs = Math.min(state.options.token_poll_interval_ms, 60_000);
+  const initialBreach = discoveredRunBreach(caseRecord, caseState, run);
+  if (initialBreach !== null) {
+    await stopDiscoveredRun(caseState, run, initialBreach, childEnv, state, campaignDir);
+  }
+
+  run.reattach_count = (run.reattach_count ?? 0) + 1;
+  let waitSettled = false;
+  const waitPromise = runHook(`discovered_wait_${run.reattach_count}`, {
+    executable: 'tamandua', args: ['workflow', 'wait', run.run_id, '--json'], cwd: '.',
+  }, childEnv, campaignDir, state, run, {
+    enforceWall: run.stop_intent_at === undefined,
+    timeoutMs: run.stop_intent_at === undefined ? undefined : cleanupWaitTimeoutMs,
+  })
+    .then((result) => {
+      waitSettled = true;
+      return result;
+    });
+
+  while (!waitSettled) {
+    const remainingWallMs = Math.max(1, new Date(run.deadline_at).valueOf() - Date.now());
+    await new Promise((resolve) => {
+      const timer = setTimeout(resolve, Math.min(state.options.token_poll_interval_ms, remainingWallMs));
+      waitPromise.then(() => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+    if (waitSettled) break;
+    const status = queryWorkflowStatus(run.run_id, childEnv);
+    persistTokenObservation(status, run, caseState, state, campaignDir);
+    if (TERMINAL_RUN_STATUSES.has(status.status)) continue;
+    const breach = discoveredRunBreach(caseRecord, caseState, run);
+    if (breach !== null) {
+      await stopDiscoveredRun(caseState, run, breach, childEnv, state, campaignDir);
+      break;
+    }
+  }
+
+  let waitResult = await waitPromise;
+  let status = queryWorkflowStatus(run.run_id, childEnv);
+  persistTokenObservation(status, run, caseState, state, campaignDir);
+  if (!TERMINAL_RUN_STATUSES.has(status.status)) {
+    const breach = discoveredRunBreach(caseRecord, caseState, run);
+    if (breach === null) {
+      throw new Error(`discovered run remained ${status.status} after workflow wait: ${run.run_id}`);
+    }
+    await stopDiscoveredRun(caseState, run, breach, childEnv, state, campaignDir);
+    const terminalWait = await runHook(`discovered_terminal_wait_${run.reattach_count}`, {
+      executable: 'tamandua', args: ['workflow', 'wait', run.run_id, '--json'], cwd: '.',
+    }, childEnv, campaignDir, state, run, {
+      enforceWall: false, timeoutMs: cleanupWaitTimeoutMs,
+    });
+    status = queryWorkflowStatus(run.run_id, childEnv);
+    persistTokenObservation(status, run, caseState, state, campaignDir);
+    waitResult = terminalWait;
+    if (!TERMINAL_RUN_STATUSES.has(status.status)
+        && (terminalWait.error !== undefined || terminalWait.signal !== null || terminalWait.exit_code === 2)) {
+      throw new Error(`terminal wait failed for discovered run ${run.run_id}`);
+    }
+  }
+  if (!TERMINAL_RUN_STATUSES.has(status.status)) {
+    throw new Error(`discovered run remained ${status.status} after terminal cleanup: ${run.run_id}`);
+  }
+  const terminalEvidence = await harvestWorkflowAttempt(
+    caseState, run, waitResult, childEnv, state, campaignDir,
+  );
+  run.phase = 'terminal';
+  run.terminal_status = terminalEvidence.status;
+  run.terminal_at = utcTimestamp();
+  state.updated_at = run.terminal_at;
+  atomicWriteState(campaignDir, state);
+}
+
+async function convergeDiscoveredRuns(caseRecord, caseState, childEnv, state, campaignDir) {
+  while (true) {
+    const added = reconcileDiscoveredRuns(caseRecord, caseState, childEnv, state, campaignDir);
+    const active = (state.discovered_runs ?? []).filter((run) =>
+      run.root_case_id === caseState.id && run.phase !== 'terminal');
+    if (active.length === 0) {
+      if (added === 0) return;
+      continue;
+    }
+
+    for (const run of active) {
+      await awaitDiscoveredRun(caseRecord, caseState, run, childEnv, state, campaignDir);
+    }
+  }
+}
+
+async function monitorWorkflowRun(caseRecord, caseState, attempt, childEnv, state, campaignDir, launchEndedPromise) {
+  while (true) {
+    const launchEnded = await new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(false), state.options.token_poll_interval_ms);
+      launchEndedPromise.then(() => {
+        clearTimeout(timer);
+        resolve(true);
+      });
+    });
+    if (launchEnded && attempt.stop_intent_at === undefined) return { stopped: false };
+
+    const status = queryWorkflowStatus(attempt.run_id, childEnv);
+    persistTokenObservation(status, attempt, caseState, state, campaignDir);
+    reconcileDiscoveredRuns(caseRecord, caseState, childEnv, state, campaignDir);
+    if (TERMINAL_RUN_STATUSES.has(status.status)) return { stopped: false, terminal_status: status.status };
+
+    const elapsedWallMin = (Date.now() - new Date(attempt.started_at).valueOf()) / 60_000;
+    let breach;
+    if (caseState.spend.tokens_observed >= caseRecord.caps.tokens) {
+      breach = {
+        cap: 'tokens', threshold: caseRecord.caps.tokens, observed: caseState.spend.tokens_observed,
+      };
+    } else if (elapsedWallMin >= caseRecord.caps.wall_min) {
+      breach = { cap: 'wall_min', threshold: caseRecord.caps.wall_min, observed: elapsedWallMin };
+    }
+    if (breach === undefined) continue;
+
+    const detectedAt = utcTimestamp();
+    attempt.stop_intent_at = detectedAt;
+    attempt.stop_reason = breach;
+    caseState.findings.push({ type: 'RUNAWAY', ...breach, run_id: attempt.run_id, detected_at: detectedAt });
+    state.updated_at = detectedAt;
+    atomicWriteState(campaignDir, state);
+
+    const stopResult = await runHook('stop', {
+      executable: 'tamandua', args: ['workflow', 'stop', attempt.run_id], cwd: '.',
+    }, childEnv, campaignDir, state, attempt, { enforceWall: false });
+    if (!hookSucceeded(stopResult)) throw new Error(`workflow stop failed for ${attempt.run_id}`);
+
+    const waitResult = await runHook('terminal_wait', {
+      executable: 'tamandua', args: ['workflow', 'wait', attempt.run_id, '--json'], cwd: '.',
+    }, childEnv, campaignDir, state, attempt, { enforceWall: false });
+    if (waitResult.error !== undefined || waitResult.signal !== null || waitResult.exit_code === 2) {
+      throw new Error(`workflow wait failed after stopping ${attempt.run_id}`);
+    }
+    const terminalStatus = queryWorkflowStatus(attempt.run_id, childEnv);
+    persistTokenObservation(terminalStatus, attempt, caseState, state, campaignDir);
+    if (!TERMINAL_RUN_STATUSES.has(terminalStatus.status)) {
+      throw new Error(`workflow remained ${terminalStatus.status} after stop and wait: ${attempt.run_id}`);
+    }
+    return { stopped: true, terminal_status: terminalStatus.status, breach };
+  }
+}
+
+async function executeWorkflowCase(caseRecord, caseState, state, campaignDir) {
+  if (hasAssociatedNonterminalRun(caseState)) return;
+  const launchIntentTimestamp = utcTimestamp();
+  const attempt = {
+    id: `attempt-${caseState.attempts.length + 1}`,
+    case_id: caseRecord.id,
+    kind: 'workflow',
+    phase: 'launch-intent',
+    execution_mode: caseUsesScriptedEnvironment(caseRecord) ? 'scripted' : 'real',
+    launch_intent_at: launchIntentTimestamp,
+    started_at: launchIntentTimestamp,
+    deadline_at: new Date(Date.now() + (caseRecord.caps.wall_min * 60_000)).toISOString(),
+    ...retryAttemptMetadata(caseState),
+  };
+  caseState.phase = 'running';
+  caseState.attempts.push(attempt);
+  state.updated_at = launchIntentTimestamp;
+  atomicWriteState(campaignDir, state);
+
+  let childEnv;
+  try {
+    childEnv = loadSpawnEnvironment(attempt.execution_mode === 'scripted');
+  } catch (error) {
+    attempt.phase = 'terminal';
+    attempt.terminal_at = utcTimestamp();
+    persistMechanicalOutcome(caseState, attempt, state, campaignDir, 'TEST_INFRA_FAIL', {
+      category: 'spawn-environment',
+      message: error.message,
+    });
+    return;
+  }
+
+  if (caseRecord.reset !== null && caseRecord.reset !== undefined) {
+    attempt.phase = 'resetting';
+    const resetResult = await runHook('reset', caseRecord.reset, childEnv, campaignDir, state, attempt);
+    if (!hookSucceeded(resetResult)) {
+      attempt.phase = 'terminal';
+      attempt.terminal_at = utcTimestamp();
+      persistMechanicalOutcome(caseState, attempt, state, campaignDir, 'TEST_INFRA_FAIL', {
+        category: 'reset-failed',
+        exit_code: resetResult.exit_code,
+        signal: resetResult.signal,
+        error: resetResult.error ?? null,
+      });
+      return;
+    }
+  }
+
+  attempt.phase = 'running';
+  let signalLaunchEnded;
+  const launchEndedPromise = new Promise((resolve) => { signalLaunchEnded = resolve; });
+  let monitorPromise;
+  const captureRunIdentifier = createRunIdentifierCapture(attempt, state, campaignDir, childEnv, () => {
+    monitorPromise ??= monitorWorkflowRun(
+      caseRecord, caseState, attempt, childEnv, state, campaignDir, launchEndedPromise,
+    );
+  });
+  const launchResult = await runHook('launch', {
+    executable: 'tamandua',
+    args: workflowRunArgs(caseRecord),
+    cwd: '.',
+  }, childEnv, campaignDir, state, attempt, {
+    enforceWall: false,
+    onChunk: captureRunIdentifier,
+  });
+  signalLaunchEnded();
+  const monitorResult = monitorPromise === undefined ? { stopped: false } : await monitorPromise;
+  if (attempt.run_id !== undefined && attempt.run_id_error === undefined) {
+    await convergeDiscoveredRuns(caseRecord, caseState, childEnv, state, campaignDir);
+  }
+  let terminalEvidence = null;
+  if (attempt.run_id !== undefined && attempt.run_id_error === undefined) {
+    terminalEvidence = await harvestWorkflowAttempt(
+      caseState,
+      attempt,
+      monitorResult.stopped ? attempt.terminal_wait : launchResult,
+      childEnv,
+      state,
+      campaignDir,
+    );
+  }
+  if (attempt.run_id_error !== undefined || attempt.run_id === undefined) {
+    attempt.phase = 'terminal';
+    attempt.terminal_at = utcTimestamp();
+    persistMechanicalOutcome(caseState, attempt, state, campaignDir, 'TEST_INFRA_FAIL', {
+      category: 'workflow-run-identification',
+      error: attempt.run_id_error ?? {
+        category: 'missing-run-identifier',
+        resolution_errors: attempt.run_id_resolution_errors ?? [],
+      },
+      exit_code: launchResult.exit_code,
+      signal: launchResult.signal,
+    });
+  } else if (monitorResult.stopped) {
+    attempt.phase = 'terminal';
+    attempt.terminal_at = utcTimestamp();
+    const baseReason = {
+      category: 'runaway-cap-enforced',
+      ...monitorResult.breach,
+      terminal_status: monitorResult.terminal_status,
+    };
+    const verdict = outcomeWithOracleEvidence(
+      caseRecord, 'INCONCLUSIVE', baseReason,
+      runCaseOracles(caseRecord, caseState, state, campaignDir, childEnv),
+    );
+    persistClassifiedAttempt(caseState, attempt, state, campaignDir, verdict);
+  } else if (terminalEvidence !== null) {
+    attempt.phase = 'terminal';
+    attempt.terminal_at = utcTimestamp();
+    const passed = canonicalTerminalStatus(terminalEvidence.status) === 'completed';
+    const baseReason = passed ? undefined : {
+        category: 'workflow-terminal',
+        terminal_status: terminalEvidence.status,
+        wait_exit_code: attempt.wait_exit_code,
+      };
+    const verdict = outcomeWithOracleEvidence(
+      caseRecord, passed ? 'PASS' : 'INCONCLUSIVE', baseReason,
+      runCaseOracles(caseRecord, caseState, state, campaignDir, childEnv),
+    );
+    persistClassifiedAttempt(caseState, attempt, state, campaignDir, verdict);
+  } else {
+    attempt.phase = 'attached';
+    attempt.wait_ended_at = utcTimestamp();
+    state.updated_at = attempt.wait_ended_at;
+    atomicWriteState(campaignDir, state);
+  }
+}
+
+function delay(milliseconds) {
+  if (milliseconds <= 0) return Promise.resolve();
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function latestLaunchIntentTime(state) {
+  let latest = null;
+  for (const attempt of state.cases.flatMap((caseState) => caseState.attempts)) {
+    if (attempt.launch_intent_at === undefined) continue;
+    const timestamp = new Date(attempt.launch_intent_at).valueOf();
+    if (latest === null || timestamp > latest) latest = timestamp;
+  }
+  return latest;
+}
+
+function finishRecoveredAttempt(state, caseState, attempt, campaignDir, outcome, reason) {
+  attempt.phase = 'terminal';
+  attempt.terminal_at = utcTimestamp();
+  attempt.recovery = {
+    ...(attempt.recovery ?? {}),
+    status: 'reconciled',
+    finished_at: attempt.terminal_at,
+  };
+  persistMechanicalOutcome(caseState, attempt, state, campaignDir, outcome, reason);
+}
+
+function harvestRecoveredLocalAttempt(caseRecord, state, caseState, attempt, campaignDir, commandResult) {
+  const succeeded = hookSucceeded(commandResult);
+  const baseOutcome = succeeded
+    ? 'PASS'
+    : (commandResult.error === undefined ? 'PRODUCT_FAIL' : 'TEST_INFRA_FAIL');
+  const baseReason = succeeded ? undefined : {
+    category: commandResult.error === undefined ? 'local-command-failed' : 'local-command-launch-failed',
+    exit_code: commandResult.exit_code,
+    signal: commandResult.signal,
+    error: commandResult.error ?? null,
+    recovered: true,
+  };
+  const childEnv = loadSpawnEnvironment(attempt.execution_mode === 'scripted');
+  const verdict = outcomeWithOracleEvidence(
+    caseRecord, baseOutcome, baseReason,
+    runCaseOracles(caseRecord, caseState, state, campaignDir, childEnv),
+  );
+  attempt.phase = 'terminal';
+  attempt.terminal_at = utcTimestamp();
+  attempt.recovery = {
+    ...(attempt.recovery ?? {}), status: 'reconciled', finished_at: attempt.terminal_at,
+  };
+  persistClassifiedAttempt(caseState, attempt, state, campaignDir, verdict);
+}
+
+async function recoverLocalAttempt(caseRecord, state, caseState, attempt, campaignDir) {
+  const commandState = attempt.command;
+  if (commandState?.result !== undefined) {
+    let resultExists = false;
+    try {
+      resultExists = fs.existsSync(durableResultPath(campaignDir, commandState));
+      if (resultExists) {
+        applyDurableHookResult(commandState, readDurableHookResult(campaignDir, commandState));
+        attempt.recovery = {
+          strategy: 'local-result', status: 'harvested', started_at: utcTimestamp(),
+        };
+        state.updated_at = attempt.recovery.started_at;
+        atomicWriteState(campaignDir, state);
+        harvestRecoveredLocalAttempt(caseRecord, state, caseState, attempt, campaignDir, commandState);
+        return;
+      }
+    } catch (error) {
+      finishRecoveredAttempt(state, caseState, attempt, campaignDir, 'TEST_INFRA_FAIL', {
+        category: 'invalid-local-result-evidence', message: error.message,
+      });
+      return;
+    }
+
+    if (Number.isSafeInteger(commandState.runner_pid)
+        && processMatchesIdentity(commandState.runner_pid, commandState.runner_identity)) {
+      attempt.recovery = {
+        strategy: 'local-process', status: 'observing', started_at: utcTimestamp(),
+        runner_pid: commandState.runner_pid, runner_identity: commandState.runner_identity,
+      };
+      state.updated_at = attempt.recovery.started_at;
+      atomicWriteState(campaignDir, state);
+      while (processMatchesIdentity(commandState.runner_pid, commandState.runner_identity)) {
+        await delay(50);
+        if (fs.existsSync(durableResultPath(campaignDir, commandState))) break;
+      }
+      try {
+        applyDurableHookResult(commandState, readDurableHookResult(campaignDir, commandState));
+        harvestRecoveredLocalAttempt(caseRecord, state, caseState, attempt, campaignDir, commandState);
+      } catch (error) {
+        finishRecoveredAttempt(state, caseState, attempt, campaignDir, 'TEST_INFRA_FAIL', {
+          category: 'local-process-lost', message: error.message,
+          runner_pid: commandState.runner_pid,
+        });
+      }
+      return;
+    }
+  }
+
+  if (commandState?.finished_at !== null && commandState?.finished_at !== undefined) {
+    attempt.recovery = { strategy: 'persisted-hook-state', status: 'harvested', started_at: utcTimestamp() };
+    state.updated_at = attempt.recovery.started_at;
+    atomicWriteState(campaignDir, state);
+    harvestRecoveredLocalAttempt(caseRecord, state, caseState, attempt, campaignDir, commandState);
+    return;
+  }
+
+  finishRecoveredAttempt(state, caseState, attempt, campaignDir, 'TEST_INFRA_FAIL', {
+    category: 'unidentified-launch-intent',
+    kind: 'local',
+    message: 'local launch intent has neither durable result evidence nor a matching live process',
+  });
+}
+
+async function recoverWorkflowAttempt(caseRecord, state, caseState, attempt, campaignDir) {
+  if (typeof attempt.run_id !== 'string') {
+    finishRecoveredAttempt(state, caseState, attempt, campaignDir, 'TEST_INFRA_FAIL', {
+      category: 'unidentified-launch-intent',
+      kind: 'workflow',
+      message: 'workflow launch intent has no durable run ID',
+    });
+    return;
+  }
+
+  let childEnv;
+  try {
+    childEnv = loadSpawnEnvironment(attempt.execution_mode === 'scripted');
+  } catch (error) {
+    finishRecoveredAttempt(state, caseState, attempt, campaignDir, 'TEST_INFRA_FAIL', {
+      category: 'spawn-environment', message: error.message,
+    });
+    return;
+  }
+
+  const recoveryStartedAt = utcTimestamp();
+  attempt.recovery = { strategy: 'workflow-wait', status: 'reattaching', started_at: recoveryStartedAt };
+  state.updated_at = recoveryStartedAt;
+  atomicWriteState(campaignDir, state);
+  const waitHookName = `recovery_wait_${state.resume_count}`;
+  const waitResult = await runHook(waitHookName, {
+    executable: 'tamandua', args: ['workflow', 'wait', attempt.run_id, '--json'], cwd: '.',
+  }, childEnv, campaignDir, state, attempt, { enforceWall: false });
+
+  let status;
+  try {
+    status = await harvestWorkflowAttempt(caseState, attempt, waitResult, childEnv, state, campaignDir);
+  } catch (error) {
+    finishRecoveredAttempt(state, caseState, attempt, campaignDir, 'TEST_INFRA_FAIL', {
+      category: 'workflow-reattachment-failed', message: error.message,
+      wait_exit_code: waitResult.exit_code, wait_signal: waitResult.signal,
+    });
+    return;
+  }
+  if (status === null || !TERMINAL_RUN_STATUSES.has(status.status)) {
+    finishRecoveredAttempt(state, caseState, attempt, campaignDir, 'TEST_INFRA_FAIL', {
+      category: 'workflow-wait-nonterminal', terminal_status: status?.status ?? null,
+      wait_exit_code: waitResult.exit_code,
+    });
+    return;
+  }
+  try {
+    await convergeDiscoveredRuns(caseRecord, caseState, childEnv, state, campaignDir);
+  } catch (error) {
+    finishRecoveredAttempt(state, caseState, attempt, campaignDir, 'TEST_INFRA_FAIL', {
+      category: 'discovered-run-reconciliation-failed', message: error.message,
+    });
+    return;
+  }
+  const passed = status.status === 'completed' || status.status === 'done';
+  const baseReason = passed ? undefined : {
+      category: 'recovered-workflow-terminal', terminal_status: status.status,
+      wait_exit_code: waitResult.exit_code,
+    };
+  const verdict = outcomeWithOracleEvidence(
+    caseRecord, passed ? 'PASS' : 'INCONCLUSIVE', baseReason,
+    runCaseOracles(caseRecord, caseState, state, campaignDir, childEnv),
+  );
+  attempt.phase = 'terminal';
+  attempt.terminal_at = utcTimestamp();
+  attempt.recovery = {
+    ...(attempt.recovery ?? {}), status: 'reconciled', finished_at: attempt.terminal_at,
+  };
+  persistClassifiedAttempt(caseState, attempt, state, campaignDir, verdict);
+}
+
+async function reconcileInterruptedAttempts(manifest, state, campaignDir) {
+  for (let index = 0; index < state.cases.length; index += 1) {
+    const caseState = state.cases[index];
+    if (caseState.phase !== 'running') continue;
+    const nonterminalAttempts = caseState.attempts.filter((attempt) => attempt.outcome === undefined);
+    if (nonterminalAttempts.length !== 1) {
+      const attempt = nonterminalAttempts[0] ?? caseState.attempts.at(-1);
+      if (attempt !== undefined) {
+        finishRecoveredAttempt(state, caseState, attempt, campaignDir, 'TEST_INFRA_FAIL', {
+          category: 'ambiguous-attempt-ledger', nonterminal_attempt_count: nonterminalAttempts.length,
+        });
+      } else {
+        markTerminal(state, caseState, campaignDir, 'TEST_INFRA_FAIL', {
+          category: 'missing-attempt-ledger',
+        });
+      }
+      continue;
+    }
+    const attempt = nonterminalAttempts[0];
+    if (attempt.kind === 'workflow') {
+      await recoverWorkflowAttempt(manifest.cases[index], state, caseState, attempt, campaignDir);
+    } else if (attempt.kind === 'local') {
+      await recoverLocalAttempt(manifest.cases[index], state, caseState, attempt, campaignDir);
+    } else {
+      finishRecoveredAttempt(state, caseState, attempt, campaignDir, 'TEST_INFRA_FAIL', {
+        category: 'unidentified-launch-intent', kind: attempt.kind ?? null,
+      });
+    }
+  }
+}
+
+async function reconcilePersistedDiscoveredRuns(manifest, state, campaignDir) {
+  const rootCaseIds = new Set((state.discovered_runs ?? [])
+    .filter((run) => run.phase !== 'terminal').map((run) => run.root_case_id));
+  for (const rootCaseId of rootCaseIds) {
+    const index = state.cases.findIndex((caseState) => caseState.id === rootCaseId);
+    if (index < 0) throw new Error(`discovered run refers to missing root case ${rootCaseId}`);
+    const caseState = state.cases[index];
+    const caseRecord = manifest.cases[index];
+    const rootAttempt = caseState.attempts.find((attempt) => attempt.kind === 'workflow');
+    if (rootAttempt === undefined) {
+      throw new Error(`discovered run root case ${rootCaseId} has no workflow attempt`);
+    }
+    const childEnv = loadSpawnEnvironment(rootAttempt.execution_mode === 'scripted');
+    const persistedActive = state.discovered_runs.filter((run) =>
+      run.root_case_id === rootCaseId && run.phase !== 'terminal');
+    for (const run of persistedActive) {
+      await awaitDiscoveredRun(caseRecord, caseState, run, childEnv, state, campaignDir);
+    }
+    await convergeDiscoveredRuns(caseRecord, caseState, childEnv, state, campaignDir);
+  }
+}
+
+async function executeCaseWithProviderRetry(caseRecord, caseState, state, campaignDir) {
+  const executeCase = caseRecord.harness === 'local' ? executeLocalCase : executeWorkflowCase;
+  while (caseState.phase === 'pending') {
+    const retryNotBefore = caseState.provider_retry?.status === 'scheduled'
+      ? new Date(caseState.provider_retry.retry_not_before).valueOf()
+      : null;
+    while (retryNotBefore !== null && Date.now() < retryNotBefore) {
+      await delay(retryNotBefore - Date.now());
+    }
+    await executeCase(caseRecord, caseState, state, campaignDir);
+    if (caseState.provider_retry?.status !== 'scheduled') return;
+  }
+}
+
+async function executeEligibleCases(manifest, state, campaignDir) {
+  // Pending work is never started while an interrupted attempt remains
+  // unreconciled; resumeCampaign performs reconciliation before scheduling.
+  if (state.cases.some((caseState) => caseState.phase === 'running')) return;
+
+  const eligible = [];
+  for (let index = 0; index < manifest.cases.length; index += 1) {
+    const caseRecord = manifest.cases[index];
+    const caseState = state.cases[index];
+    if (caseState.phase === 'terminal') continue;
+    if (caseRecord.harness === 'local') {
+      if (caseState.phase === 'pending') eligible.push({ caseRecord, caseState });
+      continue;
+    }
+    if (!daemonControlAvailable()) {
+      markTerminal(state, caseState, campaignDir, 'NOT_RUN', {
+        category: 'daemon-control-unavailable',
+        executable: toPortableRelativePath(DAEMON_CONTROL_PATH),
+      });
+    } else if (caseState.phase === 'pending') {
+      eligible.push({ caseRecord, caseState });
+    }
+  }
+
+  const active = new Set();
+  for (const item of eligible) {
+    if (active.size >= state.options.concurrency) await Promise.race(active);
+    const lastLaunchAt = latestLaunchIntentTime(state);
+    if (lastLaunchAt !== null) {
+      await delay(Math.max(0, state.options.stagger_ms - (Date.now() - lastLaunchAt)));
+    }
+    let execution;
+    execution = executeCaseWithProviderRetry(
+      item.caseRecord, item.caseState, state, campaignDir,
+    )
+      .catch((error) => {
+        const attempt = item.caseState.attempts.at(-1);
+        if (attempt !== undefined && attempt.terminal_at === undefined) {
+          attempt.phase = 'terminal';
+          attempt.terminal_at = utcTimestamp();
+        }
+        if (item.caseState.phase !== 'terminal') {
+          const reason = { category: 'scheduler-execution-failed', message: error.message };
+          if (attempt === undefined) {
+            markTerminal(state, item.caseState, campaignDir, 'TEST_INFRA_FAIL', reason);
+          } else {
+            persistMechanicalOutcome(
+              item.caseState, attempt, state, campaignDir, 'TEST_INFRA_FAIL', reason,
+            );
+          }
+        }
+      })
+      .finally(() => active.delete(execution));
+    active.add(execution);
+  }
+  await Promise.all(active);
+}
+
+function isUtcTimestamp(value) {
+  if (typeof value !== 'string' || !value.endsWith('Z')) return false;
+  const date = new Date(value);
+  return !Number.isNaN(date.valueOf()) && date.toISOString() === value;
+}
+
+function isValidAttemptState(attempt) {
+  if (!isObject(attempt)
+      || typeof attempt.id !== 'string'
+      || typeof attempt.case_id !== 'string'
+      || typeof attempt.phase !== 'string'
+      || !isUtcTimestamp(attempt.started_at)) return false;
+  if (attempt.launch_intent_at !== undefined && !isUtcTimestamp(attempt.launch_intent_at)) return false;
+  if (attempt.deadline_at !== undefined && !isUtcTimestamp(attempt.deadline_at)) return false;
+  if (attempt.terminal_at !== undefined && !isUtcTimestamp(attempt.terminal_at)) return false;
+  for (const hookName of ['reset', 'command', 'launch', 'stop', 'terminal_wait']) {
+    const hook = attempt[hookName];
+    if (hook === undefined) continue;
+    if (!isObject(hook)
+        || !Array.isArray(hook.argv) || hook.argv.some((value) => typeof value !== 'string')
+        || typeof hook.cwd !== 'string'
+        || (hook.intent_at !== undefined && !isUtcTimestamp(hook.intent_at))
+        || !isUtcTimestamp(hook.started_at)
+        || (hook.finished_at !== null && !isUtcTimestamp(hook.finished_at))
+        || (hook.exit_code !== null && !Number.isInteger(hook.exit_code))
+        || (hook.signal !== null && typeof hook.signal !== 'string')
+        || (hook.pid !== undefined && hook.pid !== null && (!Number.isSafeInteger(hook.pid) || hook.pid <= 0))
+        || typeof hook.stdout !== 'string'
+        || typeof hook.stderr !== 'string') return false;
+  }
+  return true;
+}
+
+function isValidDiscoveredRun(run) {
+  return isValidAttemptState(run)
+    && run.kind === 'discovered-workflow'
+    && normalizedRunId(run.run_id) === run.run_id
+    && normalizedRunId(run.parent_run_id) === run.parent_run_id
+    && typeof run.root_case_id === 'string'
+    && run.case_id === run.root_case_id
+    && isUtcTimestamp(run.discovered_at)
+    && Number.isSafeInteger(run.tokens_observed) && run.tokens_observed >= 0
+    && Array.isArray(run.token_observations)
+    && ['attached', 'terminal'].includes(run.phase)
+    && (run.phase !== 'terminal'
+      || (isUtcTimestamp(run.terminal_at) && TERMINAL_RUN_STATUSES.has(run.terminal_status)));
+}
+
+function isValidCaseState(item) {
+  const commonValid = isObject(item)
+    && typeof item.id === 'string'
+    && Number.isInteger(item.wave) && item.wave >= 0
+    && typeof item.workflow === 'string'
+    && typeof item.fixture === 'string'
+    && ['pi', 'hermes', 'scripted-pi', 'scripted-hermes', 'local'].includes(item.harness)
+    && ['verification', 'characterization', 'exploratory'].includes(item.class)
+    && Array.isArray(item.findings)
+    && (item.oracle_results === undefined || (Array.isArray(item.oracle_results)
+      && item.oracle_results.every((result) => isObject(result)
+        && typeof result.oracle_id === 'string'
+        && ['RUNNING', 'VALID', 'ORACLE_MISSING', 'TEST_INFRA'].includes(result.status)
+        && isUtcTimestamp(result.started_at)
+        && (result.finished_at === undefined || isUtcTimestamp(result.finished_at)))))
+    && isObject(item.spend)
+    && Number.isSafeInteger(item.spend.tokens_observed) && item.spend.tokens_observed >= 0
+    && Array.isArray(item.spend.observations)
+    && Array.isArray(item.attempts)
+    && item.attempts.every(isValidAttemptState)
+    && new Set(item.attempts.map((attempt) => attempt.id)).size === item.attempts.length;
+  if (!commonValid) return false;
+  if (item.phase === 'pending') {
+    return item.outcome === undefined && item.terminal_at === undefined && item.reason === undefined;
+  }
+  if (item.phase === 'running') {
+    return item.outcome === undefined && item.terminal_at === undefined && item.reason === undefined;
+  }
+  if (item.phase !== 'terminal'
+      || !OUTCOMES.includes(item.outcome)
+      || !isUtcTimestamp(item.terminal_at)) return false;
+  if (item.outcome === 'PASS') {
+    return item.reason === undefined || item.reason?.category === 'characterization-observed';
+  }
+  if (item.reason?.category === 'predicate') {
+    return item.outcome === 'NOT_RUN'
+      && Array.isArray(item.reason.evidence)
+      && item.reason.evidence.length > 0
+      && item.reason.evidence.every((entry) => isObject(entry)
+        && typeof entry.predicate === 'string'
+        && Object.hasOwn(entry, 'expected')
+        && Object.hasOwn(entry, 'observed'));
+  }
+  if (item.outcome === 'NOT_RUN') return item.reason?.category === 'daemon-control-unavailable';
+  return typeof item.reason?.category === 'string';
+}
+
+function validateLoadedState(state, campaignId) {
+  const errors = [];
+  if (!isObject(state)) return ['state must be a JSON object'];
+  if (state.version !== STATE_VERSION) errors.push(`unsupported state version ${displayValue(state.version)}`);
+  if (state.campaign_id !== campaignId) errors.push('campaign ID does not match its directory');
+  if (!isUtcTimestamp(state.created_at)) errors.push('created_at is not a UTC ISO-8601 timestamp');
+  if (!isUtcTimestamp(state.updated_at)) errors.push('updated_at is not a UTC ISO-8601 timestamp');
+  if (state.phase !== 'ready') errors.push(`unsupported campaign phase ${displayValue(state.phase)}`);
+  if (!isObject(state.options)
+      || !Number.isSafeInteger(state.options.concurrency) || state.options.concurrency < 1
+      || !Number.isSafeInteger(state.options.stagger_ms) || state.options.stagger_ms < 0
+      || !Number.isSafeInteger(state.options.token_poll_interval_ms)
+      || state.options.token_poll_interval_ms < 1
+      || (state.options.provider_retry_backoff_ms !== undefined
+        && (!Number.isSafeInteger(state.options.provider_retry_backoff_ms)
+          || state.options.provider_retry_backoff_ms < 0))) {
+    errors.push('campaign options are missing or invalid');
+  }
+  if (!isObject(state.spend)
+      || !Number.isSafeInteger(state.spend.tokens_observed) || state.spend.tokens_observed < 0
+      || !Array.isArray(state.spend.observations)) {
+    errors.push('campaign spend ledger is missing or invalid');
+  }
+  if (!isObject(state.manifest)
+      || typeof state.manifest.path !== 'string'
+      || !/^[a-f0-9]{64}$/.test(state.manifest.sha256 ?? '')
+      || !Number.isSafeInteger(state.manifest.case_count)
+      || !Array.isArray(state.manifest.case_ids)
+      || state.manifest.case_ids.some((id) => typeof id !== 'string')) {
+    errors.push('immutable manifest metadata is missing or invalid');
+  }
+  if (!Array.isArray(state.cases) || state.cases.some((item) => !isValidCaseState(item))) {
+    errors.push('case state is missing or invalid');
+  }
+  if (state.discovered_runs !== undefined
+      && (!Array.isArray(state.discovered_runs)
+        || state.discovered_runs.some((run) => !isValidDiscoveredRun(run))
+        || new Set(state.discovered_runs.map((run) => run.run_id)).size !== state.discovered_runs.length)) {
+    errors.push('discovered run ledger is invalid');
+  }
+  if (isObject(state.manifest)
+      && Number.isSafeInteger(state.manifest.case_count)
+      && Array.isArray(state.manifest.case_ids)
+      && Array.isArray(state.cases)) {
+    const caseIds = state.cases.map((item) => item?.id);
+    const uniqueCaseIds = new Set(caseIds);
+    if (state.cases.length !== state.manifest.case_count
+        || uniqueCaseIds.size !== caseIds.length
+        || JSON.stringify(caseIds) !== JSON.stringify(state.manifest.case_ids)) {
+      errors.push('case ledger does not match immutable manifest metadata');
+    }
+  }
+  if (state.resume_count !== undefined
+      && (!Number.isSafeInteger(state.resume_count) || state.resume_count < 0)) {
+    errors.push('resume_count is invalid');
+  }
+  if (state.resumed_at !== undefined
+      && (!Array.isArray(state.resumed_at) || state.resumed_at.some((value) => !isUtcTimestamp(value)))) {
+    errors.push('resumed_at contains a non-UTC timestamp');
+  }
+  return errors;
+}
+
+function resolveCampaignDirectory(campaignId) {
+  ensureResultsRoot();
+  const campaignDir = path.join(RESULTS_ROOT, campaignId);
+  let details;
+  try {
+    details = fs.lstatSync(campaignDir);
+  } catch (error) {
+    throw new Error(`cannot load campaign state for ${campaignId}: ${error.message}`);
+  }
+  if (!details.isDirectory() || details.isSymbolicLink()) {
+    throw new Error(`cannot load campaign state for ${campaignId}: campaign path is not a contained directory`);
+  }
+  if (!pathIsWithin(fs.realpathSync(RESULTS_ROOT), fs.realpathSync(campaignDir))) {
+    throw new Error(`cannot load campaign state for ${campaignId}: campaign path escapes results`);
+  }
+  return campaignDir;
+}
+
+function loadCampaignState(campaignId) {
+  const campaignDir = resolveCampaignDirectory(campaignId);
+  const statePath = path.join(campaignDir, 'state.json');
+  let state;
+  try {
+    const stateDetails = fs.lstatSync(statePath);
+    if (!stateDetails.isFile() || stateDetails.isSymbolicLink()) {
+      throw new Error('state.json is not a contained regular file');
+    }
+    state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+  } catch (error) {
+    throw new Error(`cannot load campaign state for ${campaignId}: ${error.message}`);
+  }
+  const errors = validateLoadedState(state, campaignId);
+  if (errors.length > 0) {
+    throw new Error(`cannot load campaign state for ${campaignId}: ${errors.join('; ')}`);
+  }
+  return { campaignDir, state };
+}
+
+function createInitialState(campaignId, manifestPath, manifest, options) {
+  const timestamp = utcTimestamp();
+  return {
+    version: STATE_VERSION,
+    campaign_id: campaignId,
+    phase: 'ready',
+    created_at: timestamp,
+    updated_at: timestamp,
+    resume_count: 0,
+    resumed_at: [],
+    options: {
+      concurrency: options.concurrency,
+      stagger_ms: options.staggerMs,
+      token_poll_interval_ms: configuredTokenPollIntervalMs(),
+      provider_retry_backoff_ms: configuredProviderRetryBackoffMs(),
+    },
+    spend: {
+      tokens_observed: 0,
+      observations: [],
+    },
+    discovered_runs: [],
+    manifest: {
+      path: toPortableRelativePath(manifestPath),
+      sha256: sha256(manifest.source),
+      case_count: manifest.cases.length,
+      case_ids: manifest.cases.map((record) => record.id),
+    },
+    cases: manifest.cases.map((record) => ({
+      id: record.id,
+      wave: record.wave,
+      workflow: record.workflow,
+      fixture: record.fixture,
+      harness: record.harness,
+      class: record.class,
+      phase: 'pending',
+      attempts: [],
+      findings: [],
+      oracle_results: [],
+      spend: {
+        tokens_observed: 0,
+        observations: [],
+      },
+    })),
+  };
+}
+
+function manifestMatchesState(manifestPath, manifest, state) {
+  return toPortableRelativePath(manifestPath) === state.manifest.path
+    && sha256(manifest.source) === state.manifest.sha256
+    && manifest.cases.length === state.manifest.case_count
+    && JSON.stringify(manifest.cases.map((record) => record.id)) === JSON.stringify(state.manifest.case_ids)
+    && manifest.cases.every((record, index) => {
+      const persisted = state.cases[index];
+      return persisted.id === record.id
+        && persisted.wave === record.wave
+        && persisted.workflow === record.workflow
+        && persisted.fixture === record.fixture
+        && persisted.harness === record.harness
+        && persisted.class === record.class;
+    });
+}
+
+function writeTerminalCampaignReports(campaignDir, state) {
+  if (state.cases.some((item) => item.phase !== 'terminal')
+      || (state.discovered_runs ?? []).some((run) => run.phase !== 'terminal')) {
+    return 0;
+  }
+  return writeCampaignReports(campaignDir, state).exit_code;
+}
+
+async function startCampaign(options, schema) {
+  const manifestPath = resolveManifestPath(options.manifest);
+  const manifest = loadManifest(manifestPath, schema);
+  const hostProfile = loadRequiredHostProfile(manifest.cases);
+  const { campaignId, campaignDir } = createCampaignDirectory();
+  const releaseCampaignLock = acquireCampaignLock(campaignDir);
+  try {
+    try {
+      const state = createInitialState(campaignId, manifestPath, manifest, options);
+      applyHostRequirements(manifest, state, hostProfile);
+      atomicWriteState(campaignDir, state);
+    } catch (error) {
+      try {
+        fs.rmSync(campaignDir, { recursive: true, force: true });
+      } catch {
+        // Preserve the original state persistence failure.
+      }
+      throw error;
+    }
+    const { state } = loadCampaignState(campaignId);
+    await executeEligibleCases(manifest, state, campaignDir);
+    const exitCode = writeTerminalCampaignReports(campaignDir, state);
+    console.log(`Validated ${manifest.cases.length} case(s) from ${path.relative(TT_ROOT, manifestPath)}`);
+    console.log(`Campaign: ${campaignId}`);
+    return exitCode;
+  } finally {
+    releaseCampaignLock();
+  }
+}
+
+async function resumeCampaign(options, schema) {
+  const campaignDir = resolveCampaignDirectory(options.resume);
+  const releaseCampaignLock = acquireCampaignLock(campaignDir);
+  try {
+    const { state } = loadCampaignState(options.resume);
+    const persistedManifestPath = resolveManifestPath(path.join(TT_ROOT, state.manifest.path));
+    const manifestPath = options.manifest === null
+      ? persistedManifestPath
+      : resolveManifestPath(options.manifest);
+    const manifest = loadManifest(manifestPath, schema);
+    if (!manifestMatchesState(manifestPath, manifest, state)) {
+      throw new Error('manifest does not match campaign state');
+    }
+    if (options.concurrencySpecified && options.concurrency !== state.options.concurrency) {
+      throw new Error('concurrency does not match campaign state');
+    }
+    if (options.staggerSpecified && options.staggerMs !== state.options.stagger_ms) {
+      throw new Error('stagger does not match campaign state');
+    }
+
+    const timestamp = utcTimestamp();
+    state.resume_count = (state.resume_count ?? 0) + 1;
+    state.resumed_at = [...(state.resumed_at ?? []), timestamp];
+    state.updated_at = timestamp;
+    atomicWriteState(campaignDir, state);
+    state.discovered_runs ??= [];
+    await reconcileInterruptedAttempts(manifest, state, campaignDir);
+    await reconcilePersistedDiscoveredRuns(manifest, state, campaignDir);
+    await executeEligibleCases(manifest, state, campaignDir);
+    const exitCode = writeTerminalCampaignReports(campaignDir, state);
+    console.log(`Validated ${manifest.cases.length} case(s) from ${path.relative(TT_ROOT, manifestPath)}`);
+    console.log(`Resumed campaign: ${state.campaign_id}`);
+    console.log(`Campaign: ${state.campaign_id}`);
+    return exitCode;
+  } finally {
+    releaseCampaignLock();
+  }
+}
+
+async function main() {
+  let options;
+  try {
+    options = parseArgs(process.argv.slice(2));
+  } catch (error) {
+    console.error(`tt-controller: ${error.message}`);
+    usage();
+    return 4;
+  }
+
+  if (options.help) {
+    usage();
+    return 0;
+  }
+
+  try {
+    const schema = loadSchema();
+    if (options.resume === null) return await startCampaign(options, schema);
+    return await resumeCampaign(options, schema);
+  } catch (error) {
+    console.error(`tt-controller: ${error.message}`);
+    return 2;
+  }
+}
+
+process.exitCode = await main();

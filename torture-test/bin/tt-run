@@ -21,7 +21,11 @@ TT_VAR="$TT_DIR/var"
 # scenario battery folds INTO smoke; E: tier0; campaigns: tier1/tier2).
 tier_available() {
   case "$1" in
-    smoke)  [ -x "$TT_BIN_DIR/tt-verify-environment" ] && return 0 || return 1 ;;
+    smoke)
+      [ -x "$TT_BIN_DIR/tt-controller" ] \
+        && [ -x "$TT_BIN_DIR/tt-verify-environment" ] \
+        && [ -f "$TT_DIR/cases/smoke.jsonl" ]
+      ;;
     tier0|tier1|tier2) return 1 ;;   # flipped by later phases
     *) return 1 ;;
   esac
@@ -96,7 +100,7 @@ run_tier() {
   fi
   case "$tier" in
     smoke)
-      exec "$TT_BIN_DIR/tt-verify-environment"
+      exec "$TT_BIN_DIR/tt-controller" --manifest "$TT_DIR/cases/smoke.jsonl"
       ;;
     *)
       echo "internal error: tier '$tier' marked available but has no runner" >&2

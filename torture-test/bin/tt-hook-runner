@@ -1,0 +1,126 @@
+#!/usr/bin/env node
+
+import fs from 'node:fs';
+import path from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { spawn } from 'node:child_process';
+
+function atomicWriteJson(filePath, value) {
+  const tempPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  const descriptor = fs.openSync(tempPath, 'wx', 0o600);
+  try {
+    fs.writeFileSync(descriptor, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+    fs.fsyncSync(descriptor);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+  fs.renameSync(tempPath, filePath);
+  const directoryDescriptor = fs.openSync(path.dirname(filePath), 'r');
+  try {
+    fs.fsyncSync(directoryDescriptor);
+  } finally {
+    fs.closeSync(directoryDescriptor);
+  }
+}
+
+function fail(message) {
+  process.stderr.write(`tt-hook-runner: ${message}\n`);
+  process.exitCode = 2;
+}
+
+const configPath = process.argv[2];
+if (configPath === undefined) {
+  fail('config path is required');
+} else {
+  let config;
+  try {
+    config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  } catch (error) {
+    fail(`cannot read config: ${error.message}`);
+  }
+
+  if (config !== undefined) {
+    const startedAt = new Date().toISOString();
+    const stdoutDescriptor = fs.openSync(config.stdout_path, 'wx', 0o600);
+    let stderrDescriptor;
+    try {
+      stderrDescriptor = fs.openSync(config.stderr_path, 'wx', 0o600);
+    } catch (error) {
+      fs.closeSync(stdoutDescriptor);
+      throw error;
+    }
+
+    let child;
+    let launchError;
+    let settled = false;
+    let wallTimer;
+    let forceKillTimer;
+    const evidenceBytes = { stdout: 0, stderr: 0 };
+    const stopChild = (message) => {
+      launchError ??= new Error(message);
+      if (child !== undefined && child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGTERM');
+        forceKillTimer ??= setTimeout(() => child.kill('SIGKILL'), 1_000);
+      }
+    };
+    const capture = (streamName, descriptor, chunk) => {
+      const remaining = config.evidence_limit_bytes - evidenceBytes[streamName];
+      if (remaining > 0) {
+        const captured = chunk.subarray(0, remaining);
+        try {
+          fs.writeSync(descriptor, captured);
+          evidenceBytes[streamName] += captured.length;
+        } catch (error) {
+          stopChild(`${streamName} evidence write failed: ${error.message}`);
+          return;
+        }
+      }
+      if (chunk.length > remaining) {
+        stopChild(`${streamName} evidence limit of ${config.evidence_limit_bytes} bytes exceeded`);
+      }
+    };
+    const finish = (exitCode, signal) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(wallTimer);
+      clearTimeout(forceKillTimer);
+      fs.closeSync(stdoutDescriptor);
+      fs.closeSync(stderrDescriptor);
+      const result = {
+        version: 1,
+        runner_pid: process.pid,
+        child_pid: child?.pid ?? null,
+        started_at: startedAt,
+        finished_at: new Date().toISOString(),
+        exit_code: exitCode,
+        signal,
+        ...(launchError === undefined ? {} : { error: launchError.message }),
+      };
+      try {
+        atomicWriteJson(config.result_path, result);
+      } catch (error) {
+        fail(`cannot persist result: ${error.message}`);
+      }
+    };
+
+    try {
+      child = spawn(config.executable, config.args, {
+        cwd: config.cwd,
+        env: process.env,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        shell: false,
+      });
+      child.stdout.on('data', (chunk) => capture('stdout', stdoutDescriptor, chunk));
+      child.stderr.on('data', (chunk) => capture('stderr', stderrDescriptor, chunk));
+      const remainingWallMs = new Date(config.deadline_at).valueOf() - Date.now();
+      wallTimer = setTimeout(() => {
+        stopChild('case wall limit reached while running command');
+      }, Math.max(0, remainingWallMs));
+      child.once('error', (error) => { launchError = error; });
+      child.once('close', finish);
+    } catch (error) {
+      launchError = error;
+      finish(null, null);
+    }
+  }
+}
