@@ -1,0 +1,79 @@
+--- src/util_timing.rs
++++ src/util_timing.rs
+@@ -11,27 +11,30 @@
+ 
+ #![allow(dead_code)]
+ 
+-/// Compare two byte slices for equality (timing-unsafe).
++/// Compare two byte slices for equality (constant-time).
+ ///
+ /// Returns `true` if `a` and `b` are equal, `false` otherwise.
+ ///
+-/// # Security (VULN-R2 — deliberately timing-unsafe)
++/// # Security
+ ///
+-/// The comparison **short-circuits** on the first mismatch.  An attacker
+-/// who can measure the wall-clock duration can infer how many leading
+-/// bytes match, exposing partial secrets one byte at a time.  This is
+-/// the classic MAC/token timing oracle.
+-pub fn timing_unsafe_compare(a: &[u8], b: &[u8]) -> bool {
+-    // VULN-R2: short-circuit on first mismatch — timing leak.
++/// This is a constant-time comparison using an XOR accumulator.
++/// Every byte is compared regardless of any early mismatch, so an
++/// attacker cannot infer partial secrets from timing measurements.
++pub fn timing_safe_compare(a: &[u8], b: &[u8]) -> bool {
++    // VULN-R2 fix: constant-time comparison via XOR accumulator.
++    //
++    // The accumulator `acc` is a u8 that becomes non-zero as soon as any
++    // mismatch is detected, but we still visit every byte.  The final
++    // check compares lengths (non-constant) but the comparison loop is
++    // now free of short-circuit exits.
+     if a.len() != b.len() {
+         return false;
+     }
++    let mut acc: u8 = 0;
+     for i in 0..a.len() {
+-        if a[i] != b[i] {
+-            return false;   // ← leaks position of first mismatch
+-        }
++        acc |= a[i] ^ b[i];
+     }
+-    true
++    acc == 0
+ }
+ 
+ #[cfg(test)]
+@@ -40,16 +43,30 @@
+ 
+     #[test]
+     fn equal_slices() {
+-        assert!(timing_unsafe_compare(b"abc", b"abc"));
++        assert!(timing_safe_compare(b"abc", b"abc"));
+     }
+ 
+     #[test]
+     fn unequal_slices() {
+-        assert!(!timing_unsafe_compare(b"abc", b"abd"));
++        assert!(!timing_safe_compare(b"abc", b"abd"));
+     }
+ 
+     #[test]
+     fn different_lengths() {
+-        assert!(!timing_unsafe_compare(b"abc", b"ab"));
++        assert!(!timing_safe_compare(b"abc", b"ab"));
++    }
++
++    #[test]
++    fn mismatch_at_start() {
++        assert!(!timing_safe_compare(b"\x00hello", b"\xffhello"));
++    }
++
++    #[test]
++    fn mismatch_at_end() {
++        assert!(!timing_safe_compare(b"hell\x00", b"hell\xff"));
+     }
+ }
++
++// VULN-R2 fix: replaced short-circuit comparison with XOR-accumulator
++// constant-time compare.  Every byte is XORed regardless of mismatch
++// position — no timing oracle.

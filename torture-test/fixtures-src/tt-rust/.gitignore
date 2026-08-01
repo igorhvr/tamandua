@@ -1,0 +1,13 @@
+# IDE and operating system files
+.idea/
+.vscode/
+.DS_Store
+
+# NOTE: target/ is deliberately NOT gitignored.
+# target/ is regenerated junk produced by cargo build/test.
+# It serves as a junk probe for the tamandua torture test suite.
+# See JUNK-IS-INTENTIONAL.md for details.
+
+# NOTE: operator-notes.local is deliberately NOT gitignored.
+# It is an inert junk probe planted at fixture instantiation.
+# See README-JUNK.md for details.

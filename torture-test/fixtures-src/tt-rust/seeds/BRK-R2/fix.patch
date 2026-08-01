@@ -1,0 +1,12 @@
+--- tests/integration.rs
++++ tests/integration.rs
+@@ -38,8 +38,7 @@
+ #[test]
+ fn integration_try_consume_fails_when_insufficient() {
+     let bucket = TokenBucket::new(RateLimiterConfig::new(3, 5));
+-    // BROKEN: inverted assertion — expects true when false is correct
+-    assert!(bucket.try_consume(4));
++    assert!(!bucket.try_consume(4));
+     assert_eq!(bucket.available(), 3);
+ }
+ 
