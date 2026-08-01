@@ -23,7 +23,8 @@ FIXTURE_SRC="$SCRIPT_DIR"
 REPO_ROOT="$(cd "$SCRIPT_DIR" && git rev-parse --show-toplevel)"
 GOLDEN_DIR="$REPO_ROOT/torture-test/var/fixtures/golden"
 BARE_REPO="$GOLDEN_DIR/tt-poly.git"
-HASH_FILE="$GOLDEN_DIR/.build-hashes-tt-poly"
+HASH_FILE="$GOLDEN_DIR/tt-poly.git.hashes"
+FIXTURE_NAME="tt-poly"
 
 # -------------------------------------------------------------------
 # Deterministic commit environment (byte-stable hashes across rebuilds)
@@ -1096,7 +1097,7 @@ echo "--- Phase 11: Hash stability ---"
 # Collect current hashes for all refs
 NEW_HASHES="$(mktemp "${TMPDIR:-/tmp}/.hashes-tt-poly.XXXXXX")"
 {
-    echo "baseline=$BASELINE_SHA"
+    echo "#baseline=$BASELINE_SHA"
     for seed_id in "${PYTHON_SEED_REFS[@]}" "${TS_SEED_REFS[@]}" \
                    "${GO_SEED_REFS[@]}" "${RUST_SEED_REFS[@]}" "${JAVA_SEED_REFS[@]}" \
                    POLY-BRK-T1 POLY-BRK-T2 POLY-BRK-J1 POLY-BRK-J2 \
@@ -1137,6 +1138,10 @@ fi
 cp "$NEW_HASHES" "$HASH_FILE"
 rm -f "$NEW_HASHES"
 echo "  Hashes saved to $HASH_FILE"
+
+# Clean up stale old-format hash files
+rm -f "$GOLDEN_DIR/.build-hashes-${FIXTURE_NAME}"
+rm -f "$GOLDEN_DIR/.build-hashes-${FIXTURE_NAME}-lite"
 
 # -------------------------------------------------------------------
 # Summary

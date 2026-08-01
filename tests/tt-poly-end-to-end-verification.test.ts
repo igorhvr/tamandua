@@ -36,7 +36,7 @@ const fixtureSrc = path.join(
 const scriptPath = path.join(fixtureSrc, "build-golden.sh");
 const goldenDir = path.join(repoRoot, "torture-test", "var", "fixtures", "golden");
 const bareRepo = path.join(goldenDir, "tt-poly.git");
-const hashFile = path.join(goldenDir, ".build-hashes-tt-poly");
+const hashFile = path.join(goldenDir, "tt-poly.git.hashes");
 
 // --------------------------------------------------------------------------
 // Helper: run build-golden.sh (one pass)
@@ -80,14 +80,14 @@ function ensureGoldenBuilt(): void {
 describe("tt-poly end-to-end verification (US-016)", () => {
   // ── AC 5: Build hash stability file exists ───────────────────────────────
 
-  it("AC5: build hash stability file exists at var/fixtures/golden/.build-hashes-tt-poly", function () {
+  it("AC5: build hash stability file exists at var/fixtures/golden/tt-poly.git.hashes", function () {
     this.timeout = 600_000;
 
     ensureGoldenBuilt();
 
     assert.ok(
       fs.existsSync(hashFile),
-      `.build-hashes-tt-poly should exist at ${hashFile}`,
+      `tt-poly.git.hashes should exist at ${hashFile}`,
     );
 
     const hashes = fs.readFileSync(hashFile, "utf-8");

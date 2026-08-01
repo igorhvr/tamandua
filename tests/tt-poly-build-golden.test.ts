@@ -44,7 +44,7 @@ describe("tt-poly build-golden.sh", () => {
     "golden",
   );
   const bareRepo = path.join(goldenDir, "tt-poly.git");
-  const hashFile = path.join(goldenDir, ".build-hashes-tt-poly");
+  const hashFile = path.join(goldenDir, "tt-poly.git.hashes");
 
   // ── AC 1: build-golden.sh exists and is executable ──────────────────────
 
@@ -159,11 +159,11 @@ describe("tt-poly build-golden.sh", () => {
     );
   });
 
-  it("hash file named .build-hashes-tt-poly", () => {
+  it("hash file named tt-poly.git.hashes", () => {
     const content = fs.readFileSync(scriptPath, "utf-8");
     assert.ok(
-      content.includes(".build-hashes-tt-poly"),
-      "should use .build-hashes-tt-poly",
+      content.includes("tt-poly.git.hashes"),
+      "should use tt-poly.git.hashes",
     );
   });
 
@@ -684,7 +684,7 @@ describe("tt-poly build-golden.sh", () => {
     // Verify hash file
     assert.ok(
       fs.existsSync(hashFile),
-      ".build-hashes-tt-poly should exist",
+      "tt-poly.git.hashes should exist",
     );
     const hashes = fs.readFileSync(hashFile, "utf-8");
     assert.ok(
