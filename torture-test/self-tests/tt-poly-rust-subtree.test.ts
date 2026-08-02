@@ -19,6 +19,14 @@ const ttRustDir = path.join(
   "tt-rust",
 );
 
+// Helper: ensure self-tests scratch parent exists, then create a unique subdir.
+// Follows the FIX6 pattern from tt-poly-build-golden.test.ts.
+function makeScratchDir(prefix: string): string {
+  const parent = path.join(repoRoot, "torture-test", "var", "self-tests");
+  fs.mkdirSync(parent, { recursive: true });
+  return fs.mkdtempSync(path.join(parent, prefix));
+}
+
 describe("tt-poly rust/ subtree integration (US-005)", () => {
   it("rust/ directory exists and contains all Rust source files from tt-rust fixture", () => {
     assert.ok(
@@ -382,45 +390,59 @@ describe("tt-poly rust/ subtree integration (US-005)", () => {
     );
   });
 
-  it("cargo test --quiet passes from rust/ directory", () => {
+  it("cargo test --quiet passes from a scratch copy under var/self-tests/", () => {
+    const scratchDir = makeScratchDir("tt-poly-rust-");
     try {
-      const output = execSync("cargo test --quiet", {
-        cwd: ttPolyRustDir,
-        timeout: 120000,
-        encoding: "utf-8",
-      });
-      // Should have passing test results
-      assert.ok(
-        output.includes("passed") || output.includes("test result: ok"),
-        "cargo test should pass",
-      );
-      // Should not have FAIL
-      assert.ok(
-        !output.includes("FAILED"),
-        "cargo test should not have any failures",
-      );
-    } catch (err: any) {
-      // If cargo is not available, skip this test
-      if (err.message?.includes("command not found") || err.message?.includes("ENOENT")) {
-        return; // Skip — cargo not available
+      const scratchRustDir = path.join(scratchDir, "rust");
+      fs.cpSync(ttPolyRustDir, scratchRustDir, { recursive: true });
+      try {
+        const output = execSync("cargo test --quiet", {
+          cwd: scratchRustDir,
+          timeout: 120000,
+          encoding: "utf-8",
+        });
+        // Should have passing test results
+        assert.ok(
+          output.includes("passed") || output.includes("test result: ok"),
+          "cargo test should pass",
+        );
+        // Should not have FAIL
+        assert.ok(
+          !output.includes("FAILED"),
+          "cargo test should not have any failures",
+        );
+      } catch (err: any) {
+        // If cargo is not available, skip this test
+        if (err.message?.includes("command not found") || err.message?.includes("ENOENT")) {
+          return; // Skip — cargo not available
+        }
+        throw err;
       }
-      throw err;
+    } finally {
+      fs.rmSync(scratchDir, { recursive: true, force: true });
     }
   });
 
-  it("cargo check passes from rust/ directory (typecheck)", () => {
+  it("cargo check passes from a scratch copy under var/self-tests/ (typecheck)", () => {
+    const scratchDir = makeScratchDir("tt-poly-rust-");
     try {
-      execSync("cargo check", {
-        cwd: ttPolyRustDir,
-        timeout: 120000,
-        encoding: "utf-8",
-      });
-      // cargo check exits 0 on success
-    } catch (err: any) {
-      if (err.message?.includes("command not found") || err.message?.includes("ENOENT")) {
-        return; // Skip — cargo not available
+      const scratchRustDir = path.join(scratchDir, "rust");
+      fs.cpSync(ttPolyRustDir, scratchRustDir, { recursive: true });
+      try {
+        execSync("cargo check", {
+          cwd: scratchRustDir,
+          timeout: 120000,
+          encoding: "utf-8",
+        });
+        // cargo check exits 0 on success
+      } catch (err: any) {
+        if (err.message?.includes("command not found") || err.message?.includes("ENOENT")) {
+          return; // Skip — cargo not available
+        }
+        assert.fail(`cargo check failed: ${err.stderr || err.message}`);
       }
-      assert.fail(`cargo check failed: ${err.stderr || err.message}`);
+    } finally {
+      fs.rmSync(scratchDir, { recursive: true, force: true });
     }
   });
 

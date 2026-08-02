@@ -3,6 +3,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { describe, it } from "node:test";
 
+// This test file performs read-only validation against fixtures-src —
+// no commands are executed inside fixtures-src.
+
 const repoRoot = process.cwd();
 const ttPolyTsDir = path.join(
   repoRoot,

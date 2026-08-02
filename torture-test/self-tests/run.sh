@@ -23,6 +23,29 @@ FAIL=0
 red()  { printf '\033[31m%s\033[0m\n' "$*" >&2; }
 green() { printf '\033[32m%s\033[0m\n' "$*" >&2; }
 
+# ── Git status cleanliness guard ──────────────────────────────────
+# Capture git status --porcelain BEFORE tests so we can detect any
+# test that dirties the working tree (build artifacts, cache files,
+# etc.).  If the tree is dirty when run.sh starts, the guard fails
+# immediately so we never blame tests for pre-existing dirt.
+GIT_BEFORE_FILE="$(mktemp "${TMPDIR:-/tmp}/run-sh-git-before.XXXXXX")"
+GIT_AFTER_FILE="$(mktemp "${TMPDIR:-/tmp}/run-sh-git-after.XXXXXX")"
+
+# EXIT trap MUST be set before any capture so the temp files are
+# cleaned up even on early failure (set -e).
+cleanup_git_snapshots() {
+  rm -f -- "$GIT_BEFORE_FILE" "$GIT_AFTER_FILE"
+}
+trap cleanup_git_snapshots EXIT
+
+git status --porcelain > "$GIT_BEFORE_FILE"
+if [ -s "$GIT_BEFORE_FILE" ]; then
+  red "ERROR: working tree is dirty before any tests ran.  Refusing to proceed."
+  red "Dirty files:"
+  cat "$GIT_BEFORE_FILE" >&2
+  exit 1
+fi
+
 pass() { green "  PASS: $1"; PASS=$((PASS + 1)); }
 fail() { red "  FAIL: $1"; FAIL=$((FAIL + 1)); }
 
@@ -60,7 +83,7 @@ for file in "$SELF_DIR"/scripted-runtime-*.test.ts; do
     break
   fi
   base="$(basename "$file")"
-  run_test_file "scripted-runtime $base" "$file"
+  run_test_file "scripted-runtime $base" "$file" || true
 done
 
 # ── tt-poly tests ─────────────────────────────────────────────────
@@ -72,8 +95,22 @@ for file in "$SELF_DIR"/tt-poly-*.test.ts; do
     break
   fi
   base="$(basename "$file")"
-  run_test_file "tt-poly $base" "$file"
+  run_test_file "tt-poly $base" "$file" || true
 done
+
+# ── Git status cleanliness check ─────────────────────────────────
+echo ""
+echo "--- git status cleanliness ---"
+
+git status --porcelain > "$GIT_AFTER_FILE"
+if diff -q "$GIT_BEFORE_FILE" "$GIT_AFTER_FILE" > /dev/null 2>&1; then
+  green "Working tree: clean"
+else
+  red "ERROR: working tree is DIRTY after test run — tests wrote build artifacts"
+  red "Files that appeared or changed during the run:"
+  diff "$GIT_BEFORE_FILE" "$GIT_AFTER_FILE" >&2 || true
+  FAIL=$((FAIL + 1))
+fi
 
 # ── Summary ───────────────────────────────────────────────────────
 echo ""

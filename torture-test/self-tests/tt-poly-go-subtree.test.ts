@@ -19,6 +19,14 @@ const ttGoDir = path.join(
   "tt-go",
 );
 
+// Helper: ensure self-tests scratch parent exists, then create a unique subdir.
+// Follows the FIX6 pattern from tt-poly-build-golden.test.ts.
+function makeScratchDir(prefix: string): string {
+  const parent = path.join(repoRoot, "torture-test", "var", "self-tests");
+  fs.mkdirSync(parent, { recursive: true });
+  return fs.mkdtempSync(path.join(parent, prefix));
+}
+
 describe("tt-poly go/ subtree integration (US-004)", () => {
   it("go/ directory exists and contains all Go source files from tt-go fixture", () => {
     assert.ok(
@@ -398,47 +406,59 @@ describe("tt-poly go/ subtree integration (US-004)", () => {
     );
   });
 
-  it("go test ./... passes from go/ directory", () => {
-    // This test verifies the Go test suite is green at baseline.
-    // Skip if go is not available.
+  it("go test ./... passes from a scratch copy under var/self-tests/", () => {
+    const scratchDir = makeScratchDir("tt-poly-go-");
     try {
-      const output = execSync("go test ./...", {
-        cwd: ttPolyGoDir,
-        timeout: 30000,
-        encoding: "utf-8",
-      });
-      assert.ok(
-        output.includes("ok") || output.includes("PASS"),
-        "go test ./... should pass",
-      );
-      // Should not have FAIL
-      assert.ok(
-        !output.includes("FAIL"),
-        "go test ./... should not have any failures",
-      );
-    } catch (err: any) {
-      // If go is not available, skip this test
-      if (err.message?.includes("command not found") || err.message?.includes("ENOENT")) {
-        return; // Skip — go not available
+      const scratchGoDir = path.join(scratchDir, "go");
+      fs.cpSync(ttPolyGoDir, scratchGoDir, { recursive: true });
+      try {
+        const output = execSync("go test ./...", {
+          cwd: scratchGoDir,
+          timeout: 30000,
+          encoding: "utf-8",
+        });
+        assert.ok(
+          output.includes("ok") || output.includes("PASS"),
+          "go test ./... should pass",
+        );
+        // Should not have FAIL
+        assert.ok(
+          !output.includes("FAIL"),
+          "go test ./... should not have any failures",
+        );
+      } catch (err: any) {
+        // If go is not available, skip this test
+        if (err.message?.includes("command not found") || err.message?.includes("ENOENT")) {
+          return; // Skip — go not available
+        }
+        throw err;
       }
-      throw err;
+    } finally {
+      fs.rmSync(scratchDir, { recursive: true, force: true });
     }
   });
 
-  it("go vet ./... passes from go/ directory (static analysis clean)", () => {
+  it("go vet ./... passes from a scratch copy under var/self-tests/ (static analysis clean)", () => {
+    const scratchDir = makeScratchDir("tt-poly-go-");
     try {
-      execSync("go vet ./...", {
-        cwd: ttPolyGoDir,
-        timeout: 30000,
-        encoding: "utf-8",
-      });
-      // vet exits 0 on success — reaching here is success
-    } catch (err: any) {
-      if (err.message?.includes("command not found") || err.message?.includes("ENOENT")) {
-        return; // Skip — go not available
+      const scratchGoDir = path.join(scratchDir, "go");
+      fs.cpSync(ttPolyGoDir, scratchGoDir, { recursive: true });
+      try {
+        execSync("go vet ./...", {
+          cwd: scratchGoDir,
+          timeout: 30000,
+          encoding: "utf-8",
+        });
+        // vet exits 0 on success — reaching here is success
+      } catch (err: any) {
+        if (err.message?.includes("command not found") || err.message?.includes("ENOENT")) {
+          return; // Skip — go not available
+        }
+        // go vet failures should propagate as test failures
+        assert.fail(`go vet failed: ${err.stderr || err.message}`);
       }
-      // go vet failures should propagate as test failures
-      assert.fail(`go vet failed: ${err.stderr || err.message}`);
+    } finally {
+      fs.rmSync(scratchDir, { recursive: true, force: true });
     }
   });
 
