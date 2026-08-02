@@ -1,6 +1,8 @@
---- src/schedlib/conflict.py	2026-07-31 00:14:21.409536161 -0300
-+++ src/schedlib/conflict.py	2026-07-31 00:14:21.436264283 -0300
-@@ -110,6 +110,36 @@
+diff --git b/src/schedlib/conflict.py a/src/schedlib/conflict.py
+index c8c9a9c..e946a4c 100644
+--- b/src/schedlib/conflict.py
++++ a/src/schedlib/conflict.py
+@@ -110,6 +110,36 @@ def find_conflicts(schedule_events: list[Event]) -> list[Conflict]:
      return conflicts
  
  
@@ -37,7 +39,7 @@
  def find_available_slots(
      events: list[Event],
      duration: timedelta,
-@@ -119,58 +149,11 @@
+@@ -119,58 +149,11 @@ def find_available_slots(
      """Find all non-overlapping slots of at least *duration* within
      [*window_start*, *window_end*], avoiding all *events*.
  
@@ -62,7 +64,8 @@
 -        e for e in events
 -        if e.start < window_end and e.end > window_start
 -    ]
--
++    busy = _coalesce_intervals(events, window_start, window_end)
+ 
 -    # Build initial busy intervals (clipped to window bounds)
 -    busy: list[list[datetime]] = []
 -    for e in window_events:
@@ -93,8 +96,7 @@
 -
 -    # Sort the now-merged intervals by start
 -    busy.sort(key=lambda b: b[0])
-+    busy = _coalesce_intervals(events, window_start, window_end)
- 
+-
 -    # Single-pass gap scan (this part is fine — the damage was above)
      slots: list[tuple[datetime, datetime]] = []
      cursor = window_start

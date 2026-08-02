@@ -1,6 +1,8 @@
---- src/bucket.rs
-+++ src/bucket.rs
-@@ -50,46 +50,29 @@
+diff --git b/src/bucket.rs a/src/bucket.rs
+index a08c80a..2fb2048 100644
+--- b/src/bucket.rs
++++ a/src/bucket.rs
+@@ -50,46 +50,29 @@ impl TokenBucket {
      /// `false` if insufficient tokens are available (even after refill).
      ///
      /// Consuming 0 tokens always succeeds.
@@ -22,11 +24,14 @@
 -        // When many threads compete for a limited token pool, they all
 -        // spin here calling refill() and retrying, consuming 100% CPU
 -        // and never making progress fast enough for tests to complete.
--        loop {
--            self.refill();
 +        // Refill before checking availability.
 +        self.refill();
- 
++
++        // Atomically subtract count if enough tokens are available.
++        // Use a CAS loop to handle concurrent consumers correctly.
+         loop {
+-            self.refill();
+-
 -            // Inner CAS loop to atomically subtract count.
 -            loop {
 -                let current = self.current_tokens.load(Ordering::Acquire);
@@ -43,9 +48,6 @@
 -                    Ok(_) => return true,
 -                    Err(_) => continue,
 -                }
-+        // Atomically subtract count if enough tokens are available.
-+        // Use a CAS loop to handle concurrent consumers correctly.
-+        loop {
 +            let current = self.current_tokens.load(Ordering::Acquire);
 +            if current < count {
 +                return false;
@@ -63,89 +65,3 @@
          }
      }
  
-@@ -601,4 +584,85 @@
-         thread::sleep(Duration::from_millis(200));
-         assert_eq!(bucket.available(), 10);
-     }
-+
-+    // ── BUG-R3 regression tests ──────────────────────────────────
-+
-+    #[test]
-+    fn bug_r3_try_consume_returns_false_when_exhausted() {
-+        // After draining all tokens, try_consume must return false
-+        // (not busy-wait indefinitely).
-+        let bucket = TokenBucket::new(
-+            RateLimiterConfig::new(5, 100).with_refill_interval(10_000),
-+        );
-+        assert!(bucket.try_consume(5));
-+        // With a 10s refill interval, no tokens will be added within
-+        // a few ms. try_consume must return false quickly, not hang.
-+        assert!(!bucket.try_consume(1));
-+    }
-+
-+    #[test]
-+    fn bug_r3_concurrent_many_threads_completes_without_hang() {
-+        // Many threads competing for a limited token pool must all
-+        // complete without hanging. The bounded retry + yield fix
-+        // ensures try_consume eventually returns false when tokens
-+        // are exhausted, even under heavy contention.
-+        use std::sync::Arc;
-+        let bucket = Arc::new(TokenBucket::new(
-+            RateLimiterConfig::new(50, 10).with_refill_interval(10_000),
-+        ));
-+        let handles: Vec<_> = (0..16)
-+            .map(|_| {
-+                let b = Arc::clone(&bucket);
-+                thread::spawn(move || {
-+                    let mut consumed = 0u32;
-+                    // Each thread tries up to 20 times — most will fail.
-+                    for _ in 0..20 {
-+                        if b.try_consume(1) {
-+                            consumed += 1;
-+                        } else {
-+                            break;
-+                        }
-+                    }
-+                    consumed
-+                })
-+            })
-+            .collect();
-+
-+        let total: u32 = handles.into_iter().map(|h| h.join().unwrap()).sum();
-+        // All threads must complete (no hang). Total consumed must be
-+        // bounded by the burst size (50).
-+        assert!(total <= 50, "consumed more than burst: {}", total);
-+    }
-+
-+    #[test]
-+    fn bug_r3_try_consume_eventually_succeeds_with_refill() {
-+        // With a fast refill rate, a thread retrying should eventually
-+        // get tokens (yield prevents CPU starvation).
-+        use std::sync::Arc;
-+        use std::sync::atomic::AtomicBool;
-+        let bucket = Arc::new(TokenBucket::new(
-+            RateLimiterConfig::new(100, 1000).with_refill_interval(10),
-+        ));
-+        // Drain most tokens first.
-+        assert!(bucket.try_consume(99));
-+
-+        let success = Arc::new(AtomicBool::new(false));
-+        let b = Arc::clone(&bucket);
-+        let s = Arc::clone(&success);
-+        let handle = thread::spawn(move || {
-+            // Try to consume 2 tokens — only 1 available now, but refill
-+            // should provide more within a short time.
-+            if b.try_consume(2) {
-+                s.store(true, Ordering::Relaxed);
-+            }
-+        });
-+
-+        // Give the thread time to retry with refill.
-+        thread::sleep(Duration::from_millis(500));
-+        // The thread should have succeeded or returned — it must not hang.
-+        // If it's still running, join will block; the test timeout catches that.
-+        handle.join().unwrap();
-+        // At least one token was consumed (the initial 1), and refill may
-+        // have provided the second. Either way the call returned.
-+    }
- }

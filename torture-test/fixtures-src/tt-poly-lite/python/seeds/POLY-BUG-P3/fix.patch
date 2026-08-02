@@ -1,6 +1,8 @@
---- a/src/schedlib/dates.py
-+++ b/src/schedlib/dates.py
-@@ -131,13 +131,7 @@
+diff --git b/python/src/schedlib/dates.py a/python/src/schedlib/dates.py
+index 4b316af..b258ab9 100644
+--- b/python/src/schedlib/dates.py
++++ a/python/src/schedlib/dates.py
+@@ -131,13 +131,7 @@ def date_range(start: AnyDate, end: AnyDate) -> list[date]:
  
  def is_weekday(dt: AnyDate) -> bool:
      """Return True if *dt* is Monday–Friday."""

@@ -1,6 +1,8 @@
---- tests/integration.rs
-+++ tests/integration.rs
-@@ -112,8 +112,7 @@
+diff --git b/tests/integration.rs a/tests/integration.rs
+index 845ba3e..6d1ddfd 100644
+--- b/tests/integration.rs
++++ a/tests/integration.rs
+@@ -112,8 +112,7 @@ fn integration_concurrent_consumers() {
          .collect();
  
      let total: u32 = handles.into_iter().map(|h| h.join().unwrap()).sum();

@@ -151,15 +151,25 @@ git checkout -qb broken-tests
 # BRK seeds both modify tests/integration.rs, so we apply fix patches
 # in reverse (patch -R introduces the bug instead of fixing it).
 # This ensures both bugs coexist on the broken-tests branch.
+# Auto-detect p-level: patches with a/ or b/ prefix need -p1, bare paths need -p0.
+
+_detect_p() {
+    local patch_file="$1"
+    if grep -m1 '^--- ' "$patch_file" 2>/dev/null | grep -qE '^--- [ab]/'; then
+        echo "-p1"
+    else
+        echo "-p0"
+    fi
+}
 
 # BRK-R1: off-by-one assertion in integration_concurrent_consumers
-patch -s -p0 -R < "$FIXTURE_SRC/seeds/BRK-R1/fix.patch"
+patch -s $(_detect_p "$FIXTURE_SRC/seeds/BRK-R1/fix.patch") -R < "$FIXTURE_SRC/seeds/BRK-R1/fix.patch"
 git add -A
 git commit -q -m "seed: BRK-R1 (broken test — off-by-one assertion)"
 printf "  BRK-R1             → %s\n" "$(git rev-parse HEAD)"
 
 # BRK-R2: inverted boolean assertion in integration_try_consume_fails_when_insufficient
-patch -s -p0 -R < "$FIXTURE_SRC/seeds/BRK-R2/fix.patch"
+patch -s $(_detect_p "$FIXTURE_SRC/seeds/BRK-R2/fix.patch") -R < "$FIXTURE_SRC/seeds/BRK-R2/fix.patch"
 git add -A
 git commit -q -m "seed: BRK-R2 (broken test — inverted boolean assertion)"
 printf "  BRK-R2             → %s\n" "$(git rev-parse HEAD)"
@@ -275,7 +285,7 @@ for seed_id in "${SEED_ORDER[@]}"; do
     # Apply fix.patch and verify GREEN (the fix must restore green always)
     seed_fix="$FIXTURE_SRC/seeds/$seed_id/fix.patch"
     if [ -f "$seed_fix" ]; then
-        if patch -s -p0 -d "$SCRATCH_DIR" < "$seed_fix"; then
+        if patch -s $(_detect_p "$seed_fix") -d "$SCRATCH_DIR" < "$seed_fix"; then
             if (cd "$SCRATCH_DIR" && cargo test --quiet >/dev/null 2>&1); then
                 echo "  ✓ seed/$seed_id + fix.patch: GREEN"
             else
@@ -298,9 +308,9 @@ echo "Verifying broken-tests fix patches restore green..."
 (cd "$SCRATCH_DIR" && git checkout -q broken-tests)
 
 # Apply BRK-R1 fix.patch (normally, not reversed)
-if patch -s -p0 -d "$SCRATCH_DIR" < "$FIXTURE_SRC/seeds/BRK-R1/fix.patch"; then
+if patch -s $(_detect_p "$FIXTURE_SRC/seeds/BRK-R1/fix.patch") -d "$SCRATCH_DIR" < "$FIXTURE_SRC/seeds/BRK-R1/fix.patch"; then
     # Apply BRK-R2 fix.patch on top
-    if patch -s -p0 -d "$SCRATCH_DIR" < "$FIXTURE_SRC/seeds/BRK-R2/fix.patch"; then
+    if patch -s $(_detect_p "$FIXTURE_SRC/seeds/BRK-R2/fix.patch") -d "$SCRATCH_DIR" < "$FIXTURE_SRC/seeds/BRK-R2/fix.patch"; then
         # Both fix patches applied — should be fully green now
         if (cd "$SCRATCH_DIR" && cargo test --quiet >/dev/null 2>&1); then
             echo "  ✓ broken-tests + all fix patches: GREEN"

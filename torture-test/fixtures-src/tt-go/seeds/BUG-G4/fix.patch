@@ -1,6 +1,8 @@
---- pool.go	2026-07-31 16:01:59.066425547 -0300
-+++ pool.go	2026-07-31 16:01:59.066425547 -0300
-@@ -21,13 +21,7 @@
+diff --git b/pool.go a/pool.go
+index 45a0fed..90b23d3 100644
+--- b/pool.go
++++ a/pool.go
+@@ -21,13 +21,7 @@ type WorkerPool struct {
  	cancel      context.CancelFunc
  	wg          sync.WaitGroup
  	running     atomic.Int64
@@ -15,7 +17,7 @@
  }
  
  // NewPool creates a new WorkerPool with the given maxWorkers and queueSize.
-@@ -97,11 +91,8 @@
+@@ -97,11 +91,8 @@ func (p *WorkerPool) Running() int64 {
  }
  
  // Completed returns the number of tasks that have completed execution.
@@ -28,7 +30,7 @@
  }
  
  // worker is the goroutine that processes tasks from the task queue.
-@@ -120,9 +111,7 @@
+@@ -120,9 +111,7 @@ func (p *WorkerPool) worker(id int) {
  					p.running.Add(1)
  					result := p.executeTask(task)
  					p.running.Add(-1)
@@ -39,7 +41,7 @@
  					p.resultQueue <- result
  				default:
  					return
-@@ -135,9 +124,7 @@
+@@ -135,9 +124,7 @@ func (p *WorkerPool) worker(id int) {
  			p.running.Add(1)
  			result := p.executeTask(task)
  			p.running.Add(-1)
@@ -50,49 +52,3 @@
  			select {
  			case p.resultQueue <- result:
  			case <-p.ctx.Done():
---- /dev/null	2026-07-09 23:42:55.920105794 -0300
-+++ pool_bug_g4_test.go	2026-07-31 16:01:48.098620093 -0300
-@@ -0,0 +1,43 @@
-+package ttgo
-+
-+import (
-+	"fmt"
-+	"testing"
-+	"time"
-+)
-+
-+func TestBugG4NoDataRaceOnCompletedCounter(t *testing.T) {
-+	t.Run("high-concurrency completed counter has no race", func(t *testing.T) {
-+		p := NewPool(8, 200)
-+		n := 200
-+		for i := 0; i < n; i++ {
-+			task := Task{
-+				ID:   fmt.Sprintf("g4-race-%d", i),
-+				Name: "g4-race",
-+				Func: func() (any, error) {
-+					time.Sleep(100 * time.Microsecond)
-+					return "ok", nil
-+				},
-+			}
-+			if err := p.Submit(task); err != nil {
-+				t.Fatalf("Submit #%d returned error: %v", i, err)
-+			}
-+		}
-+		p.Shutdown()
-+		results := collectResults(p)
-+		if len(results) != n {
-+			t.Errorf("expected %d results, got %d", n, len(results))
-+		}
-+		if c := p.Completed(); c != int64(n) {
-+			t.Errorf("expected Completed()=%d, got %d", n, c)
-+		}
-+	})
-+	t.Run("sequential operation still works", func(t *testing.T) {
-+		p := NewPool(1, 5)
-+		for i := 0; i < 5; i++ {
-+			_ = p.Submit(Task{ID: fmt.Sprintf("g4-seq-%d", i), Name: "seq", Func: func() (any, error) { return nil, nil }})
-+		}
-+		p.Shutdown()
-+		_ = collectResults(p)
-+	})
-+}

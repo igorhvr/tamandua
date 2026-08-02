@@ -31,7 +31,7 @@ assert_grep 'getTotal.*,\s*60' "$TEST_FILE" \
 
 # ── 2. Full test suite passes ──
 echo "[] Running full test suite..." >&2
-if ! run_in_workspace "$WORKSPACE/ts" npm test 2>&1 | grep -q "0 fail"; then
+if ! run_in_workspace "$WORKSPACE/ts" npm test 2>&1 | grep -q "fail 0"; then
     fail "POLY-BRK-T1: test suite still has failures"
 fi
 

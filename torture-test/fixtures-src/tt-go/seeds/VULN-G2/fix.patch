@@ -1,6 +1,8 @@
---- util/archive.go
-+++ util/archive.go
-@@ -2,17 +2,24 @@
+diff --git a/util/archive.go b/util/archive.go
+index 3204d25..e075f8f 100644
+--- a/util/archive.go
++++ b/util/archive.go
+@@ -2,16 +2,18 @@ package util
  
  import (
  	"archive/tar"
@@ -16,34 +18,43 @@
 -// VULNERABLE (VULN-G2): header.Name is used directly in filepath.Join(dest, header.Name)
 -// without validation. A tar archive containing entries named ../../etc/passwd
 -// would write files outside the dest directory via path traversal.
-+// Path traversal is prevented by resolving the joined target path and verifying
-+// it stays within the dest directory (VULN-G2 fix).
++// Fixed (VULN-G2): target path is resolved with filepath.Abs and checked
++// for path containment (HasPrefix) before writing. Path traversal attempts
++// are detected and rejected with an error.
  func ExtractTar(r io.Reader, dest string) error {
-+	// Resolve dest to an absolute path for secure prefix checking.
-+	cleanDest, err := filepath.Abs(dest)
-+	if err != nil {
-+		return fmt.Errorf("ExtractTar: cannot resolve dest: %w", err)
-+	}
-+
  	tr := tar.NewReader(r)
  	for {
- 		hdr, err := tr.Next()
-@@ -23,9 +30,17 @@
+@@ -23,19 +25,29 @@ func ExtractTar(r io.Reader, dest string) error {
  			return err
  		}
  
 -		// VULN-G2: no path traversal check — header.Name used directly.
  		target := filepath.Join(dest, hdr.Name)
- 
-+		// VULN-G2 fix: path traversal check.
-+		cleanTarget, err := filepath.Abs(target)
++		absTarget, err := filepath.Abs(target)
 +		if err != nil {
-+			return fmt.Errorf("ExtractTar: cannot resolve target: %w", err)
++			return err
 +		}
-+		if !strings.HasPrefix(cleanTarget, cleanDest+string(filepath.Separator)) && cleanTarget != cleanDest {
-+			return fmt.Errorf("ExtractTar: path traversal detected: %s", hdr.Name)
++		absDest, err := filepath.Abs(dest)
++		if err != nil {
++			return err
 +		}
-+
++		if !strings.HasPrefix(absTarget, absDest+string(os.PathSeparator)) && absTarget != absDest {
++			return fmt.Errorf("path traversal detected: %s escapes dest %s", hdr.Name, dest)
++		}
+ 
  		switch hdr.Typeflag {
  		case tar.TypeDir:
- 			if err := os.MkdirAll(target, 0755); err != nil {
+-			if err := os.MkdirAll(target, 0755); err != nil {
++			if err := os.MkdirAll(absTarget, 0755); err != nil {
+ 				return err
+ 			}
+ 		case tar.TypeReg:
+-			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
++			if err := os.MkdirAll(filepath.Dir(absTarget), 0755); err != nil {
+ 				return err
+ 			}
+-			f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY, os.FileMode(hdr.Mode))
++			f, err := os.OpenFile(absTarget, os.O_CREATE|os.O_WRONLY, os.FileMode(hdr.Mode))
+ 			if err != nil {
+ 				return err
+ 			}

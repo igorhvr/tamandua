@@ -34,6 +34,66 @@ probe.sh <workspace> <base-ref> <scratch-dir>
 - **Revert-probes:** bug-task probes additionally assert the regression test exists AND fails when the fix is reverted (stash-style revert in a throwaway clone).
 - **Held-out:** probes live ONLY in this directory, outside every agent-reachable fixture repo. The `secrecy-sweep.sh` script enforces this mechanically.
 
+## Monorepo Path Convention
+
+Monorepo fixtures (`tt-poly-lite`) use **repo-root-relative** paths for all
+seeds, fix patches, and probes. This is the authoritative convention per
+`torture-test/tamandua-torture-test-spec/02-fixture-projects.md`.
+
+### Convention
+
+- **Seeds, patches, and probes** reference files relative to the monorepo root
+  (the golden bare clone root), which contains `python/` and `ts/` subtrees.
+- **Seed overlay files** for `tt-poly-lite/python` targets are resolved by
+  basename within the workspace root; the `python/` prefix is implicit in the
+  directory layout.
+- **Fix patches** carry the full subtree prefix in their paths.
+
+### Path examples
+
+For `tt-poly-lite/python` overlay fix patches (applied with `-p1`):
+
+| Component | Correct (repo-root-relative) | Incorrect (subtree-relative) |
+|---|---|---|
+| Fix patch path | `b/python/src/schedlib/recurrence.py` | `b/src/schedlib/recurrence.py` |
+| Fix patch path | `a/python/tests/test_recurrence.py` | `a/tests/test_recurrence.py` |
+
+For `tt-poly-lite/ts` git-format fix patches (applied with `-p4`):
+
+| Component | Path convention |
+|---|---|
+| Fix patch header | `b/torture-test/fixtures-src/tt-poly-lite/ts/src/store.ts` |
+| Effective workspace path (after -p4 strip) | `ts/src/store.ts` |
+
+### How validate-all.sh applies patches for monorepo fixtures
+
+`validate-all.sh` always applies fix patches from the **repo root**
+(the golden bare clone), never from a subtree. The `detect_patch_level`
+function determines the correct `-p` level from the patch header:
+
+- **`tt-poly-lite/python` overlay patches** use `b/python/...` or `a/python/...`
+  paths → `detect_patch_level` returns `-p1`. With `-p1`, the leading `a/` or `b/`
+  is stripped, yielding `python/src/...` — which matches the repo-root layout.
+- **`tt-poly-lite/ts` git-format patches** use
+  `a/torture-test/fixtures-src/tt-poly-lite/ts/...` paths →
+  `detect_patch_level` returns `-p4`. After stripping 4 leading components,
+  the effective path is `ts/src/...`.
+
+### Probes
+
+Probes for monorepo fixtures live under `tt-poly-lite/python/<task-id>/` and
+`tt-poly-lite/ts/<task-id>/`. They operate on the agent's result workspace
+(same layout: `python/` + `ts/` subtrees at root). Probe scripts reference
+`probe-common.sh` with the correct relative path:
+
+```bash
+# From tt-poly-lite/python/<task-id>/probe.sh:
+source "$(dirname "$0")/../../../lib/probe-common.sh"
+
+# From tt-poly-lite/ts/<task-id>/probe.sh:
+source "$(dirname "$0")/../../../lib/probe-common.sh"
+```
+
 ## Shared Library
 
 `lib/probe-common.sh` — source at the top of every probe script:

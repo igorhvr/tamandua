@@ -1,8 +1,10 @@
---- src/bucket.rs
-+++ src/bucket.rs
-@@ -119,13 +119,10 @@
+diff --git b/src/bucket.rs a/src/bucket.rs
+index 8ffc62b..2fb2048 100644
+--- b/src/bucket.rs
++++ a/src/bucket.rs
+@@ -119,13 +119,10 @@ impl TokenBucket {
          }
-
+ 
          // Compute tokens to add: (elapsed_ms * refill_rate) / 1000.
 -        // BUG-R1: u32 arithmetic overflows silently in release mode.
 -        // When elapsed_ms * refill_rate exceeds u32::MAX (~4.3 billion),
@@ -15,66 +17,6 @@
 +        // and get sub-second precision.
 +        let tokens_to_add = ((elapsed as u64 * self.config.refill_rate() as u64) / 1_000)
 +            .min(u32::MAX as u64) as u32;
-
+ 
          if tokens_to_add == 0 {
              return;
-@@ -587,4 +584,59 @@
-         thread::sleep(Duration::from_millis(200));
-         assert_eq!(bucket.available(), 10);
-     }
-+
-+    // ── BUG-R1 regression: large refill values ──────────────────
-+
-+    #[test]
-+    fn refill_handles_large_values_without_overflow() {
-+        // BUG-R1 regression: with u32 arithmetic, elapsed_ms * refill_rate
-+        // would exceed u32::MAX (~4.3B), causing silent wrap in release mode
-+        // or an overflow panic in debug mode. This test verifies that u64
-+        // intermediate computation produces correct results.
-+        //
-+        // 5M tokens/sec * ~1.1s = ~5.5B → exceeds u32::MAX.
-+        let cfg = RateLimiterConfig::new(2_000_000, 5_000_000)
-+            .with_refill_interval(50);
-+        let bucket = TokenBucket::new(cfg);
-+
-+        // Drain all tokens.
-+        assert!(bucket.try_consume(2_000_000));
-+        assert_eq!(bucket.available(), 0);
-+
-+        // Wait ~1.1s — with 5M tokens/sec, enough time passes that
-+        // the u32 multiplication would overflow. With u64, the
-+        // intermediate value is correct and refill works.
-+        thread::sleep(Duration::from_millis(1100));
-+
-+        // Bucket should be fully refilled (capped at max_tokens).
-+        let av = bucket.available();
-+        assert!(
-+            av > 1_000_000,
-+            "expected >1M tokens after 1.1s with 5M/sec rate, got {}",
-+            av
-+        );
-+        assert_eq!(av, 2_000_000, "bucket should be at max after 1.1s at 5M/sec");
-+    }
-+
-+    #[test]
-+    fn refill_large_refill_rate_with_short_interval() {
-+        // Another BUG-R1 regression: high refill rate with short sleep.
-+        // Verifies that the u64 path handles edge-rate values correctly.
-+        let cfg = RateLimiterConfig::new(1_000_000, 10_000_000)
-+            .with_refill_interval(100);
-+        let bucket = TokenBucket::new(cfg);
-+
-+        assert!(bucket.try_consume(1_000_000)); // drain
-+        assert_eq!(bucket.available(), 0);
-+
-+        // 200ms * 10M/sec = 2M tokens in u64; would overflow u32.
-+        thread::sleep(Duration::from_millis(200));
-+
-+        let av = bucket.available();
-+        assert!(
-+            av >= 500_000,
-+            "expected significant refill, got {}",
-+            av
-+        );
-+    }
- }

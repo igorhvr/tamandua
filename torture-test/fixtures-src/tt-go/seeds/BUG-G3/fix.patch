@@ -1,27 +1,17 @@
---- worker.go	2026-07-31 16:01:06.181793860 -0300
-+++ worker.go	2026-07-31 16:01:06.225828342 -0300
-@@ -1,24 +1,27 @@
- package ttgo
+diff --git b/pool.go a/pool.go
+index 0860403..90b23d3 100644
+--- b/pool.go
++++ a/pool.go
+@@ -95,6 +95,46 @@ func (p *WorkerPool) Completed() int64 {
+ 	return p.completed.Load()
+ }
  
- // worker is the goroutine that processes tasks from the task queue.
--//
--// BUG-G3: when ctx.Done() fires (shutdown signal), the worker exits
--// immediately WITHOUT draining the remaining tasks from taskQueue.
--// This causes a goroutine leak: tasks left in the queue are never
--// processed, but Shutdown() is waiting for resultQueue to drain.
--// If 1000 tasks are queued and Shutdown is called, the workers exit,
--// no more results arrive, and the caller reading from Results() hangs
--// forever — a deadlock that looks like a test infrastructure timeout.
- func (p *WorkerPool) worker(id int) {
- 	defer p.wg.Done()
- 	for {
- 		select {
- 		case <-p.ctx.Done():
--			// BUG: exit immediately without draining the task queue.
--			// Any tasks still in taskQueue are abandoned. Since no more
--			// results are produced, the resultQueue never drains, and
--			// the caller reading from Results() hangs indefinitely.
--			return
++// worker is the goroutine that processes tasks from the task queue.
++func (p *WorkerPool) worker(id int) {
++	defer p.wg.Done()
++	for {
++		select {
++		case <-p.ctx.Done():
 +			// Drain remaining tasks before exiting.
 +			for {
 +				select {
@@ -38,65 +28,80 @@
 +					return
 +				}
 +			}
- 		case task, ok := <-p.taskQueue:
- 			if !ok {
- 				return
---- /dev/null	2026-07-09 23:42:55.920105794 -0300
-+++ pool_bug_g3_test.go	2026-07-31 16:01:06.227829909 -0300
-@@ -0,0 +1,56 @@
-+package ttgo
-+
-+import (
-+	"fmt"
-+	"testing"
-+	"time"
-+)
-+
-+func TestBugG3ShutdownDrainsAllTasks(t *testing.T) {
-+	t.Run("many queued tasks all complete after shutdown", func(t *testing.T) {
-+		p := NewPool(2, 100)
-+		done := make(chan []Result, 1)
-+		go func() { done <- collectResults(p) }()
-+		n := 50
-+		for i := 0; i < n; i++ {
-+			task := Task{
-+				ID:   fmt.Sprintf("g3-drain-%d", i),
-+				Name: "g3-drain",
-+				Func: func() (any, error) {
-+					time.Sleep(1 * time.Millisecond)
-+					return "ok", nil
-+				},
++		case task, ok := <-p.taskQueue:
++			if !ok {
++				return
 +			}
-+			if err := p.Submit(task); err != nil {
-+				t.Fatalf("Submit #%d returned error: %v", i, err)
++			p.running.Add(1)
++			result := p.executeTask(task)
++			p.running.Add(-1)
++			p.completed.Add(1)
++			select {
++			case p.resultQueue <- result:
++			case <-p.ctx.Done():
++				// Keep trying to deliver until successful.
++				p.resultQueue <- result
 +			}
 +		}
-+		p.Shutdown()
-+		select {
-+		case results := <-done:
-+			if len(results) != n {
-+				t.Errorf("expected %d results, got %d", n, len(results))
-+			}
-+			if c := p.Completed(); c != int64(n) {
-+				t.Errorf("expected Completed()=%d, got %d", n, c)
-+			}
-+		case <-time.After(15 * time.Second):
-+			t.Fatal("pool hung")
-+		}
-+	})
-+	t.Run("shutdown with empty queue still works", func(t *testing.T) {
-+		p := NewPool(2, 10)
-+		task := Task{ID: "g3-single", Name: "single", Func: func() (any, error) { return "done", nil }}
-+		if err := p.Submit(task); err != nil {
-+			t.Fatalf("Submit returned error: %v", err)
-+		}
-+		p.Shutdown()
-+		results := collectResults(p)
-+		if len(results) != 1 {
-+			t.Errorf("expected 1 result, got %d", len(results))
-+		}
-+		if results[0].Value != "done" {
-+			t.Errorf("expected Value='done', got %v", results[0].Value)
-+		}
-+	})
++	}
 +}
++
+ // executeTask runs a single task and captures its result with timing.
+ // It recovers from panics in the task function and converts them to
+ // descriptive errors so that a panic never crashes a worker goroutine.
+@@ -107,9 +147,9 @@ func (p *WorkerPool) executeTask(task Task) Result {
+ 		defer func() {
+ 			if r := recover(); r != nil {
+ 				err = &PanicError{
+-					TaskID:   task.ID,
++					TaskID: task.ID,
+ 					TaskName: task.Name,
+-					Panic:    r,
++					Panic:   r,
+ 				}
+ 			}
+ 		}()
+diff --git b/worker.go a/worker.go
+deleted file mode 100644
+index 600e64c..0000000
+--- b/worker.go
++++ /dev/null
+@@ -1,38 +0,0 @@
+-package ttgo
+-
+-// worker is the goroutine that processes tasks from the task queue.
+-//
+-// BUG-G3: when ctx.Done() fires (shutdown signal), the worker exits
+-// immediately WITHOUT draining the remaining tasks from taskQueue.
+-// This causes a goroutine leak: tasks left in the queue are never
+-// processed, but Shutdown() is waiting for resultQueue to drain.
+-// If 1000 tasks are queued and Shutdown is called, the workers exit,
+-// no more results arrive, and the caller reading from Results() hangs
+-// forever — a deadlock that looks like a test infrastructure timeout.
+-func (p *WorkerPool) worker(id int) {
+-	defer p.wg.Done()
+-	for {
+-		select {
+-		case <-p.ctx.Done():
+-			// BUG: exit immediately without draining the task queue.
+-			// Any tasks still in taskQueue are abandoned. Since no more
+-			// results are produced, the resultQueue never drains, and
+-			// the caller reading from Results() hangs indefinitely.
+-			return
+-		case task, ok := <-p.taskQueue:
+-			if !ok {
+-				return
+-			}
+-			p.running.Add(1)
+-			result := p.executeTask(task)
+-			p.running.Add(-1)
+-			p.completed.Add(1)
+-			select {
+-			case p.resultQueue <- result:
+-			case <-p.ctx.Done():
+-				// Keep trying to deliver until successful.
+-				p.resultQueue <- result
+-			}
+-		}
+-	}
+-}

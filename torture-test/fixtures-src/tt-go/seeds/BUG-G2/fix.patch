@@ -1,6 +1,8 @@
---- pool.go	2026-07-31 15:16:11.881849301 -0300
-+++ pool.go	2026-07-31 15:16:11.882850350 -0300
-@@ -3,7 +3,6 @@
+diff --git b/pool.go a/pool.go
+index 524fbbc..90b23d3 100644
+--- b/pool.go
++++ a/pool.go
+@@ -3,7 +3,6 @@ package ttgo
  import (
  	"context"
  	"errors"
@@ -8,31 +10,117 @@
  	"sync"
  	"sync/atomic"
  	"time"
-@@ -81,7 +80,7 @@
- // detecting the shutdown signal via errors.Is when they check for the
- // sentinel — the error chain contains context.Canceled, not ErrPoolShutdown.
+@@ -23,7 +22,6 @@ type WorkerPool struct {
+ 	wg          sync.WaitGroup
+ 	running     atomic.Int64
+ 	completed   atomic.Int64
+-	shutdownErr error
+ }
+ 
+ // NewPool creates a new WorkerPool with the given maxWorkers and queueSize.
+@@ -75,13 +73,7 @@ func (p *WorkerPool) Submit(task Task) error {
+ // for all workers to finish, then closes the result queue. After Shutdown
+ // returns, no more Results will be produced and Submit will always return
+ // ErrPoolShutdown.
+-//
+-// BUG-G2: shutdownErr is wrapped via fmt.Errorf instead of using the
+-// ErrPoolShutdown sentinel directly. This wrapping prevents workers from
+-// detecting the shutdown signal via errors.Is when they check for the
+-// sentinel — the error chain contains context.Canceled, not ErrPoolShutdown.
  func (p *WorkerPool) Shutdown() {
 -	p.shutdownErr = fmt.Errorf("pool shutdown: %w", context.Canceled)
-+	p.shutdownErr = ErrPoolShutdown
  	p.cancel()
  	p.wg.Wait()
  	close(p.resultQueue)
---- worker.go	2026-07-31 15:16:11.883746997 -0300
-+++ worker.go	2026-07-31 15:16:11.884675303 -0300
-@@ -1,9 +1,5 @@
- package ttgo
+@@ -103,9 +95,44 @@ func (p *WorkerPool) Completed() int64 {
+ 	return p.completed.Load()
+ }
  
+-// ShutdownErr returns the shutdown error set by Shutdown().
+-func (p *WorkerPool) ShutdownErr() error {
+-	return p.shutdownErr
++// worker is the goroutine that processes tasks from the task queue.
++func (p *WorkerPool) worker(id int) {
++	defer p.wg.Done()
++	for {
++		select {
++		case <-p.ctx.Done():
++			// Drain remaining tasks before exiting.
++			for {
++				select {
++				case task, ok := <-p.taskQueue:
++					if !ok {
++						return
++					}
++					p.running.Add(1)
++					result := p.executeTask(task)
++					p.running.Add(-1)
++					p.completed.Add(1)
++					p.resultQueue <- result
++				default:
++					return
++				}
++			}
++		case task, ok := <-p.taskQueue:
++			if !ok {
++				return
++			}
++			p.running.Add(1)
++			result := p.executeTask(task)
++			p.running.Add(-1)
++			p.completed.Add(1)
++			select {
++			case p.resultQueue <- result:
++			case <-p.ctx.Done():
++				// Keep trying to deliver until successful.
++				p.resultQueue <- result
++			}
++		}
++	}
+ }
+ 
+ // executeTask runs a single task and captures its result with timing.
+@@ -120,9 +147,9 @@ func (p *WorkerPool) executeTask(task Task) Result {
+ 		defer func() {
+ 			if r := recover(); r != nil {
+ 				err = &PanicError{
+-					TaskID:   task.ID,
++					TaskID: task.ID,
+ 					TaskName: task.Name,
+-					Panic:    r,
++					Panic:   r,
+ 				}
+ 			}
+ 		}()
+diff --git b/worker.go a/worker.go
+deleted file mode 100644
+index 1c3d2c8..0000000
+--- b/worker.go
++++ /dev/null
+@@ -1,55 +0,0 @@
+-package ttgo
+-
 -import (
 -	"errors"
 -)
 -
- // worker is the goroutine that processes tasks from the task queue.
- func (p *WorkerPool) worker(id int) {
- 	defer p.wg.Done()
-@@ -21,17 +17,7 @@
- 					result := p.executeTask(task)
- 					p.running.Add(-1)
- 					p.completed.Add(1)
+-// worker is the goroutine that processes tasks from the task queue.
+-func (p *WorkerPool) worker(id int) {
+-	defer p.wg.Done()
+-	for {
+-		select {
+-		case <-p.ctx.Done():
+-			// Drain remaining tasks before exiting.
+-			for {
+-				select {
+-				case task, ok := <-p.taskQueue:
+-					if !ok {
+-						return
+-					}
+-					p.running.Add(1)
+-					result := p.executeTask(task)
+-					p.running.Add(-1)
+-					p.completed.Add(1)
 -					// BUG-G2: worker checks for ErrPoolShutdown to decide
 -					// whether to send results. But pool.go wraps the error
 -					// as fmt.Errorf("pool shutdown: %w", context.Canceled),
@@ -44,92 +132,24 @@
 -					}
 -					// else: result silently dropped — worker thinks pool
 -					//        did not shut down cleanly.
-+					p.resultQueue <- result
- 				default:
- 					return
- 				}
---- /dev/null	2026-07-09 23:42:55.920105794 -0300
-+++ pool_bug_g2_test.go	2026-07-31 15:16:11.885463880 -0300
-@@ -0,0 +1,82 @@
-+package ttgo
-+
-+import (
-+	"fmt"
-+	"testing"
-+	"time"
-+)
-+
-+// TestBugG2ShutdownResultsNotDropped verifies the BUG-G2 fix:
-+// 1. ShutdownErr() must return ErrPoolShutdown directly (not wrapped).
-+// 2. Tasks submitted before shutdown must produce results — no silent drops.
-+func TestBugG2ShutdownResultsNotDropped(t *testing.T) {
-+	t.Run("all tasks produce results during shutdown", func(t *testing.T) {
-+		p := NewPool(2, 10)
-+
-+		n := 10
-+		for i := 0; i < n; i++ {
-+			task := Task{
-+				ID:   fmt.Sprintf("g2-task-%d", i),
-+				Name: "g2-shutdown",
-+				Func: func() (any, error) {
-+					time.Sleep(5 * time.Millisecond)
-+					return "ok", nil
-+				},
-+			}
-+			if err := p.Submit(task); err != nil {
-+				t.Fatalf("Submit #%d returned error: %v", i, err)
-+			}
-+		}
-+
-+		p.Shutdown()
-+		results := collectResults(p)
-+
-+		if len(results) != n {
-+			t.Errorf("expected %d results, got %d — tasks submitted before shutdown had results dropped", n, len(results))
-+		}
-+		if c := p.Completed(); c != int64(n) {
-+			t.Errorf("expected Completed()=%d, got %d", n, c)
-+		}
-+	})
-+
-+	t.Run("ShutdownErr returns sentinel directly", func(t *testing.T) {
-+		p := NewPool(1, 1)
-+
-+		task := Task{
-+			ID:   "g2-sentinel",
-+			Name: "sentinel check",
-+			Func: func() (any, error) {
-+				return "ok", nil
-+			},
-+		}
-+		_ = p.Submit(task)
-+		p.Shutdown()
-+		_ = collectResults(p)
-+
-+		if p.ShutdownErr() != ErrPoolShutdown {
-+			t.Errorf("expected ShutdownErr() = ErrPoolShutdown, got %v", p.ShutdownErr())
-+		}
-+	})
-+
-+	t.Run("normal operation unaffected", func(t *testing.T) {
-+		p := NewPool(3, 10)
-+
-+		for i := 0; i < 5; i++ {
-+			task := Task{
-+				ID:   fmt.Sprintf("g2-normal-%d", i),
-+				Name: "normal",
-+				Func: func() (any, error) {
-+					return i, nil
-+				},
-+			}
-+			if err := p.Submit(task); err != nil {
-+				t.Fatalf("Submit #%d returned error: %v", i, err)
-+			}
-+		}
-+
-+		p.Shutdown()
-+		if results := collectResults(p); len(results) != 5 {
-+			t.Errorf("normal operation: expected 5 results, got %d", len(results))
-+		}
-+	})
-+}
+-				default:
+-					return
+-				}
+-			}
+-		case task, ok := <-p.taskQueue:
+-			if !ok {
+-				return
+-			}
+-			p.running.Add(1)
+-			result := p.executeTask(task)
+-			p.running.Add(-1)
+-			p.completed.Add(1)
+-			select {
+-			case p.resultQueue <- result:
+-			case <-p.ctx.Done():
+-				// Keep trying to deliver until successful.
+-				p.resultQueue <- result
+-			}
+-		}
+-	}
+-}

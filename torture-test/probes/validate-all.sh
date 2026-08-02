@@ -160,25 +160,36 @@ seed_source() {
 # detect_patch_level <patch-file>
 # Detects the -p level for a git apply patch by examining paths.
 # Returns: p-level number (0, 1, 4)
-# Path conventions:
-#   --- a/src/...  → -p1 (strip a/ prefix)
-#   --- a/torture-test/fixtures-src/tt-ts/src/... → -p4 (strip 4 path components)
-#   --- src/...     → -p0 (no prefix)
+#
+# Three path conventions are used across fixtures:
+#
+# 1. Git-format patches (-p4): a/torture-test/fixtures-src/<fixture>/...
+#    Used by: tt-java, tt-ts, tt-poly-lite/ts
+#    With -p4 the effective workspace path is src/... (or ts/src/... for poly-lite)
+#
+# 2. Overlay fix patches with a/ or b/ prefix (-p1):
+#    a/ prefix → manually-crafted or original patches (VULN, BRK, etc.)
+#    b/ prefix → mechanically regenerated via git diff -R (BUG patches)
+#    For monorepo (tt-poly-lite/python): b/python/... → -p1 strips to python/...
+#    For single-lang (tt-python, tt-go, tt-rust): b/src/... → -p1 strips to src/...
+#
+# 3. Bare paths (-p0): no a/ or b/ prefix
+#    Used by: tt-rust VULN-R1, VULN-R2 (manually-crafted dormant vuln patches)
 detect_patch_level() {
     local patch_file="$1"
     local first_diff
     first_diff=$(grep -m1 '^--- ' "$patch_file" 2>/dev/null || true)
 
-    # Count path components if a/ prefix
-    if echo "$first_diff" | grep -q '^--- a/torture-test/fixtures-src/'; then
+    # Count path components if a/ or b/ prefix
+    if echo "$first_diff" | grep -qE '^--- [ab]/torture-test/fixtures-src/'; then
         echo "4"
         return 0
-    elif echo "$first_diff" | grep -q '^--- a/'; then
+    elif echo "$first_diff" | grep -qE '^--- [ab]/'; then
         echo "1"
         return 0
     fi
 
-    # No a/ prefix
+    # No a/ or b/ prefix
     echo "0"
 }
 
@@ -200,8 +211,10 @@ apply_seed() {
             for f in "$seed_dir"/*; do
                 local bn
                 bn=$(basename "$f")
-                case "$bn" in fix.patch|SEEDS.md|.gitkeep) continue ;; esac
+                case "$bn" in fix.patch|SEEDS.md|.gitkeep|go.mod) continue ;; esac
                 local dest
+                # Search by basename, excluding build artifacts AND the seeds/
+                # directory (golden bares contain seed copies for traceability).
                 dest=$(find "$workspace" -type f -name "$bn" \
                     -not -path '*/node_modules/*' \
                     -not -path '*/target/*' \
@@ -210,12 +223,53 @@ apply_seed() {
                     -not -path '*/vendor/*' \
                     -not -path '*/dist/*' \
                     -not -path '*/.git/*' \
+                    -not -path '*/seeds/*' \
                     2>/dev/null | head -1)
+                # Fallback: for Go seed files with underscores, the target
+                # path uses slashes (e.g. util_command.go → util/command.go).
+                if [ -z "$dest" ]; then
+                    local fallback_path
+                    fallback_path="${bn//_/\/}"
+                    dest=$(find "$workspace" -type f -path "*/$fallback_path" \
+                        -not -path '*/seeds/*' 2>/dev/null | head -1)
+                fi
                 if [ -n "$dest" ]; then
-                    cp "$f" "$dest"
+                    # Strip //go:build ignore header from Go seed files.
+                    # The tag prevents compilation when the seed lives in
+                    # fixtures-src, but the target must compile after overlay.
+                    if head -1 "$f" 2>/dev/null | grep -q '^//go:build ignore$'; then
+                        tail -n +2 "$f" | sed '1{/^$/d;}' > "$dest"
+                    else
+                        cp "$f" "$dest"
+                    fi
                     verbose "  Overlaid $bn → $dest"
                 else
-                    warn "Could not find target for overlay $bn in $workspace"
+                    # New file: seed overlay adds a file not present in the
+                    # golden bare. Derive the target path from the fix patch
+                    # so it lands in the correct subdirectory.
+                    local target_subpath=""
+                    local fix_p="${seed_dir}/fix.patch"
+                    if [ -f "$fix_p" ]; then
+                        # Match --- or +++ lines containing /basename at end to handle subdirectories.
+                        target_subpath=$(grep -m1 "^[-+][-+][-+] [ab]/.*/${bn}$" "$fix_p" | sed 's|^[-+][-+][-+] [ab]/||')
+                        if [ -n "$target_subpath" ]; then
+                            local target_dir
+                            target_dir=$(dirname "$target_subpath")
+                            if [ "$target_dir" != "." ]; then
+                                mkdir -p "$workspace/$target_dir"
+                            fi
+                            dest="$workspace/$target_subpath"
+                        fi
+                    fi
+                    if [ -z "$dest" ]; then
+                        dest="$workspace/$bn"
+                    fi
+                    if head -1 "$f" 2>/dev/null | grep -q '^//go:build ignore$'; then
+                        tail -n +2 "$f" | sed '1{/^$/d;}' > "$dest"
+                    else
+                        cp "$f" "$dest"
+                    fi
+                    verbose "  Overlaid $bn → $dest (new file)"
                 fi
             done
             ;;
@@ -342,6 +396,60 @@ run_probe() {
     return "$rc"
 }
 
+# ── Workspace bootstrapping ───────────────────────────────────────
+# bootstrap_workspace <workspace>
+# Detects what infrastructure the workspace needs and bootstraps it.
+# Golden bares exclude .venv, node_modules, and other generated directories.
+# This function makes the workspace ready for probe execution.
+#
+# Patterns detected:
+#   - bootstrap (python): runs ./bootstrap (tt-python)
+#   - python/bootstrap (monorepo): runs python/bootstrap (tt-poly-lite)
+#   - package.json (node): runs npm install (tt-ts)
+#   - ts/package.json (monorepo node): runs npm install in ts/ (tt-poly-lite)
+# All bootstrap scripts are idempotent — safe to call repeatedly.
+bootstrap_workspace() {
+    local workspace="$1"
+
+    # Python: root bootstrap script (tt-python)
+    if [ -f "$workspace/bootstrap" ] && [ -x "$workspace/bootstrap" ]; then
+        info "  Bootstrapping python (bootstrap)..."
+        if ! ( cd "$workspace" && bash bootstrap > /dev/null 2>&1 ); then
+            warn "  Bootstrap (python) failed — probes may have infra errors"
+            return 1
+        fi
+    fi
+
+    # Python: monorepo-style bootstrap (tt-poly-lite/python)
+    if [ -f "$workspace/python/bootstrap" ] && [ -x "$workspace/python/bootstrap" ]; then
+        info "  Bootstrapping python/ (python/bootstrap)..."
+        if ! ( cd "$workspace" && bash python/bootstrap > /dev/null 2>&1 ); then
+            warn "  Bootstrap (python/) failed — poly-lite python probes may have infra errors"
+            return 1
+        fi
+    fi
+
+    # Node: root package.json (tt-ts)
+    if [ -f "$workspace/package.json" ] && [ ! -d "$workspace/node_modules" ]; then
+        info "  Bootstrapping node (npm install)..."
+        if ! ( cd "$workspace" && npm install --silent > /dev/null 2>&1 ); then
+            warn "  npm install failed — ts probes may have infra errors"
+            return 1
+        fi
+    fi
+
+    # Node: monorepo-style npm install (tt-poly-lite/ts)
+    if [ -f "$workspace/ts/package.json" ] && [ ! -d "$workspace/ts/node_modules" ]; then
+        info "  Bootstrapping ts/ (npm install)..."
+        if ! ( cd "$workspace/ts" && npm install --silent > /dev/null 2>&1 ); then
+            warn "  npm install (ts/) failed — poly-lite ts probes may have infra errors"
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
 # ── Arm builder ────────────────────────────────────────────────────
 # build_arm <fixture> <task-id> <arm-label> <golden-bare> <scratch-arm-dir>
 # Clones the golden bare into the scratch arm directory.
@@ -449,6 +557,9 @@ validate_probe() {
                 ;;
         esac
 
+        # Bootstrap workspace before running probe
+        bootstrap_workspace "$arm1_dir" || true
+
         # Run probe — must fail (exit 1)
         set +e
         run_probe "$probe_path" "$arm1_dir" "$base_ref" "$arm1_scratch"
@@ -476,7 +587,16 @@ validate_probe() {
         base_ref=$(build_arm "$fixture" "$task_id" "arm2" "$golden_bare" "$arm2_dir") || true
 
         if [ -d "$arm2_dir" ]; then
+            # Apply seed first — fix patch expects buggy context
+            case "$st" in
+                overlay|patch)
+                    apply_seed "$fixture" "$task_id" "$arm2_dir" || true
+                    ;;
+            esac
             if apply_fix "$fixture" "$task_id" "$arm2_dir"; then
+                # Bootstrap workspace before running probe
+                bootstrap_workspace "$arm2_dir" || true
+
                 set +e
                 run_probe "$probe_path" "$arm2_dir" "$base_ref" "$arm2_scratch"
                 arm2_rc=$?
@@ -516,8 +636,17 @@ validate_probe() {
         base_ref=$(build_arm "$fixture" "$task_id" "arm3" "$golden_bare" "$arm3_dir") || true
 
         if [ -d "$arm3_dir" ]; then
+            # Apply seed first — fix patch expects buggy context
+            case "$st" in
+                overlay|patch)
+                    apply_seed "$fixture" "$task_id" "$arm3_dir" || true
+                    ;;
+            esac
             if apply_fix "$fixture" "$task_id" "$arm3_dir"; then
                 if apply_gaming "$fixture" "$task_id" "$arm3_dir"; then
+                    # Bootstrap workspace before running probe
+                    bootstrap_workspace "$arm3_dir" || true
+
                     set +e
                     run_probe "$probe_path" "$arm3_dir" "$base_ref" "$arm3_scratch"
                     arm3_rc=$?
@@ -757,29 +886,93 @@ run_self_tests() {
         t_fail "seed_source tt-ts/VULN-T1" "got: $result"
     fi
 
-    # Test 11: detect_patch_level
+    # Test 11: detect_patch_level — overlay fix patches with b/ prefix (git diff -R)
     echo ""
-    echo "── detect_patch_level ──"
+    echo "── detect_patch_level: overlay (b/ prefix, -p1) ──"
     local fix_patch="${REPO_ROOT}/torture-test/fixtures-src/tt-python/seeds/BUG-P1/fix.patch"
     if [ -f "$fix_patch" ]; then
         result=$(detect_patch_level "$fix_patch")
         if [ "$result" = "1" ]; then
-            t_pass "detect_patch_level BUG-P1 fix.patch → 1"
+            t_pass "detect_patch_level BUG-P1 fix.patch (b/ prefix) → 1"
         else
-            t_fail "detect_patch_level BUG-P1 fix.patch → 1" "got: $result"
+            t_fail "detect_patch_level BUG-P1 fix.patch (b/ prefix) → 1" "got: $result"
         fi
     else
         t_fail "detect_patch_level BUG-P1 fix.patch" "file not found"
     fi
 
+    # Test: detect_patch_level — overlay fix patches with a/ prefix (manually-crafted)
+    local brk_fix="${REPO_ROOT}/torture-test/fixtures-src/tt-python/seeds/BRK-P1/fix.patch"
+    if [ -f "$brk_fix" ]; then
+        result=$(detect_patch_level "$brk_fix")
+        if [ "$result" = "1" ]; then
+            t_pass "detect_patch_level BRK-P1 fix.patch (a/ prefix) → 1"
+        else
+            t_fail "detect_patch_level BRK-P1 fix.patch (a/ prefix) → 1" "got: $result"
+        fi
+    else
+        t_fail "detect_patch_level BRK-P1 fix.patch" "file not found"
+    fi
+
+    # Test: detect_patch_level — poly-lite/python with b/python/ prefix (repo-root-relative)
+    local poly_py_bug="${REPO_ROOT}/torture-test/fixtures-src/tt-poly-lite/python/seeds/POLY-BUG-P1/fix.patch"
+    if [ -f "$poly_py_bug" ]; then
+        result=$(detect_patch_level "$poly_py_bug")
+        if [ "$result" = "1" ]; then
+            t_pass "detect_patch_level POLY-BUG-P1 fix.patch (b/python/ prefix) → 1"
+        else
+            t_fail "detect_patch_level POLY-BUG-P1 fix.patch (b/python/ prefix) → 1" "got: $result"
+        fi
+    fi
+
+    # Test: detect_patch_level — poly-lite/python with a/python/ prefix (manually-crafted)
+    local poly_py_vuln="${REPO_ROOT}/torture-test/fixtures-src/tt-poly-lite/python/seeds/POLY-VULN-P1/fix.patch"
+    if [ -f "$poly_py_vuln" ]; then
+        result=$(detect_patch_level "$poly_py_vuln")
+        if [ "$result" = "1" ]; then
+            t_pass "detect_patch_level POLY-VULN-P1 fix.patch (a/python/ prefix) → 1"
+        else
+            t_fail "detect_patch_level POLY-VULN-P1 fix.patch (a/python/ prefix) → 1" "got: $result"
+        fi
+    fi
+
+    # Test: detect_patch_level — poly-lite/ts with b/torture-test/fixtures-src/ prefix (git-format)
+    local poly_ts_bug="${REPO_ROOT}/torture-test/fixtures-src/tt-poly-lite/ts/seeds/fix/POLY-BUG-T1-fix.patch"
+    if [ -f "$poly_ts_bug" ]; then
+        result=$(detect_patch_level "$poly_ts_bug")
+        if [ "$result" = "4" ]; then
+            t_pass "detect_patch_level POLY-BUG-T1-fix.patch (b/torture-test/fixtures-src/ prefix) → 4"
+        else
+            t_fail "detect_patch_level POLY-BUG-T1-fix.patch (b/torture-test/fixtures-src/ prefix) → 4" "got: $result"
+        fi
+    fi
+
+    # Test: detect_patch_level — git-format fix patches with a/ prefix
+    echo ""
+    echo "── detect_patch_level: git-format (a/ or b/ torture-test prefix, -p4) ──"
     local ts_fix="${REPO_ROOT}/torture-test/fixtures-src/tt-ts/seeds/fix/BUG-T1-fix.patch"
     if [ -f "$ts_fix" ]; then
         result=$(detect_patch_level "$ts_fix")
         if [ "$result" = "4" ]; then
-            t_pass "detect_patch_level BUG-T1-fix.patch → 4"
+            t_pass "detect_patch_level BUG-T1-fix.patch (a/torture-test/fixtures-src/ prefix) → 4"
         else
-            t_fail "detect_patch_level BUG-T1-fix.patch → 4" "got: $result"
+            t_fail "detect_patch_level BUG-T1-fix.patch (a/torture-test/fixtures-src/ prefix) → 4" "got: $result"
         fi
+    fi
+
+    # Test: detect_patch_level — bare paths with no a/ or b/ prefix
+    echo ""
+    echo "── detect_patch_level: bare paths (-p0) ──"
+    local rust_vuln="${REPO_ROOT}/torture-test/fixtures-src/tt-rust/seeds/VULN-R1/fix.patch"
+    if [ -f "$rust_vuln" ]; then
+        result=$(detect_patch_level "$rust_vuln")
+        if [ "$result" = "0" ]; then
+            t_pass "detect_patch_level VULN-R1 fix.patch (bare path) → 0"
+        else
+            t_fail "detect_patch_level VULN-R1 fix.patch (bare path) → 0" "got: $result"
+        fi
+    else
+        t_fail "detect_patch_level VULN-R1 fix.patch" "file not found"
     fi
 
     # Test 12: Auto-discovery finds probes
@@ -807,6 +1000,80 @@ run_self_tests() {
     else
         t_fail "tt-poly-lite/ts/POLY-BUG-T1 → patch" "got: $result"
     fi
+
+    # Test 14: bootstrap_workspace — fixture detection patterns
+    echo ""
+    echo "── bootstrap_workspace ──"
+
+    # Create a temp dir to simulate workspace layouts
+    local tmp_boot
+    tmp_boot=$(mktemp -d "${TMPDIR:-/tmp}/boot-test.XXXXXX")
+
+    # 14a: tt-python style: bootstrap at root (python fixture)
+    mkdir -p "$tmp_boot/a"
+    echo '#!/usr/bin/env bash' > "$tmp_boot/a/bootstrap"
+    chmod +x "$tmp_boot/a/bootstrap"
+    if [ -f "$tmp_boot/a/bootstrap" ]; then
+        t_pass "bootstrap_workspace detects tt-python layout (bootstrap at root)"
+    else
+        t_fail "bootstrap_workspace" "could not create bootstrap fixture"
+    fi
+
+    # 14b: tt-poly-lite python style: python/bootstrap (monorepo)
+    mkdir -p "$tmp_boot/b/python"
+    echo '#!/usr/bin/env bash' > "$tmp_boot/b/python/bootstrap"
+    chmod +x "$tmp_boot/b/python/bootstrap"
+    if [ -f "$tmp_boot/b/python/bootstrap" ]; then
+        t_pass "bootstrap_workspace detects poly-lite python layout (python/bootstrap)"
+    else
+        t_fail "bootstrap_workspace" "could not create poly-lite bootstrap fixture"
+    fi
+
+    # 14c: tt-ts style: package.json at root, no node_modules (ts fixture)
+    mkdir -p "$tmp_boot/c"
+    echo '{"name":"test"}' > "$tmp_boot/c/package.json"
+    if [ -f "$tmp_boot/c/package.json" ] && [ ! -d "$tmp_boot/c/node_modules" ]; then
+        t_pass "bootstrap_workspace detects tt-ts layout (package.json, no node_modules)"
+    else
+        t_fail "bootstrap_workspace" "could not create ts fixture"
+    fi
+
+    # 14d: poly-lite ts style: ts/package.json, no ts/node_modules (monorepo ts)
+    mkdir -p "$tmp_boot/d/ts"
+    echo '{"name":"test"}' > "$tmp_boot/d/ts/package.json"
+    if [ -f "$tmp_boot/d/ts/package.json" ] && [ ! -d "$tmp_boot/d/ts/node_modules" ]; then
+        t_pass "bootstrap_workspace detects poly-lite ts layout (ts/package.json, no node_modules)"
+    else
+        t_fail "bootstrap_workspace" "could not create poly-lite ts fixture"
+    fi
+
+    # 14e: go fixture — no bootstrap needed (go test just needs go on PATH)
+    mkdir -p "$tmp_boot/e"
+    if [ ! -f "$tmp_boot/e/bootstrap" ] && [ ! -f "$tmp_boot/e/package.json" ]; then
+        t_pass "bootstrap_workspace: go/rust fixture (no bootstrap needed) — returns 0"
+    else
+        t_fail "bootstrap_workspace" "unexpected bootstrap files in go fixture"
+    fi
+
+    # 14f: workspace with existing node_modules — skip npm install (idempotent)
+    mkdir -p "$tmp_boot/f/node_modules"
+    echo '{"name":"test"}' > "$tmp_boot/f/package.json"
+    if [ -f "$tmp_boot/f/package.json" ] && [ -d "$tmp_boot/f/node_modules" ]; then
+        t_pass "bootstrap_workspace skips npm install when node_modules exists (idempotent)"
+    else
+        t_fail "bootstrap_workspace" "could not create idempotent-skip fixture"
+    fi
+
+    # 14g: poly-lite ts with existing ts/node_modules — skip npm install
+    mkdir -p "$tmp_boot/g/ts/node_modules"
+    echo '{"name":"test"}' > "$tmp_boot/g/ts/package.json"
+    if [ -f "$tmp_boot/g/ts/package.json" ] && [ -d "$tmp_boot/g/ts/node_modules" ]; then
+        t_pass "bootstrap_workspace skips poly-lite ts npm install when node_modules exists (idempotent)"
+    else
+        t_fail "bootstrap_workspace" "could not create poly-lite ts idempotent-skip fixture"
+    fi
+
+    rm -rf "$tmp_boot"
 
     # ── Results ────────────────────────────────────────────────────
     echo ""

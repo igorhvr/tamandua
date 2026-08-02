@@ -1,5 +1,7 @@
---- a/tests/test_broken_p2.py
-+++ b/tests/test_broken_p2.py
+# Fix patch convention: repo-root-relative paths (python/ prefix for monorepo).
+# BRK seed — new file added by seed, fix corrects broken assertions.
+--- a/python/tests/test_broken_p2.py
++++ b/python/tests/test_broken_p2.py
 @@ -44,12 +44,12 @@
          conflicts = find_conflicts(events)
 

@@ -1,6 +1,8 @@
---- pool_test.go
-+++ pool_test.go
-@@ -81,9 +81,8 @@
+diff --git b/pool_test.go a/pool_test.go
+index 80c87d7..c92becd 100644
+--- b/pool_test.go
++++ a/pool_test.go
+@@ -81,9 +81,8 @@ func TestSubmitAndCollectResult(t *testing.T) {
  	if r.Value != "hello" {
  		t.Errorf("expected Value=hello, got %v", r.Value)
  	}
@@ -11,3 +13,4 @@
 +		t.Errorf("expected nil error, got %v", r.Err)
  	}
  }
+ 

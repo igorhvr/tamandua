@@ -8,7 +8,7 @@
 #   2. Uses yaml.safe_load() instead
 # Dormant in baseline — no revert-probe needed
 
-source "$(dirname "$0")/../../lib/probe-common.sh"
+source "$(dirname "$0")/../../../lib/probe-common.sh"
 
 WORKSPACE="$1"
 BASE_REF="$2"

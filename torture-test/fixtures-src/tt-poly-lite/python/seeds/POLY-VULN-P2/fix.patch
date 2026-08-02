@@ -1,5 +1,7 @@
---- a/src/schedlib/integrations.py
-+++ b/src/schedlib/integrations.py
+# Fix patch convention: repo-root-relative paths (python/ prefix for monorepo).
+# Dormant vuln seed — vulnerable code exists in baseline, manually-crafted fix.
+--- a/python/src/schedlib/integrations.py
++++ b/python/src/schedlib/integrations.py
 @@ -48,7 +48,7 @@
  # POLY-VULN-P2: subprocess.run(..., shell=True) with unsanitized input
  

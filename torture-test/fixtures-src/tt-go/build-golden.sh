@@ -161,15 +161,25 @@ git checkout -qb broken-tests
 # BRK seeds both modify pool_test.go, so we apply fix patches in reverse
 # (patch -R introduces the bug instead of fixing it). This ensures
 # both bugs coexist on the broken-tests branch.
+# Auto-detect p-level: patches with a/ or b/ prefix need -p1, bare paths need -p0.
+
+_detect_p() {
+    local patch_file="$1"
+    if grep -m1 '^--- ' "$patch_file" 2>/dev/null | grep -qE '^--- [ab]/'; then
+        echo "-p1"
+    else
+        echo "-p0"
+    fi
+}
 
 # BRK-G1: off-by-one assertion in TestMultipleResults
-patch -s -p0 -R < "$FIXTURE_SRC/seeds/BRK-G1/fix.patch"
+patch -s $(_detect_p "$FIXTURE_SRC/seeds/BRK-G1/fix.patch") -R < "$FIXTURE_SRC/seeds/BRK-G1/fix.patch"
 git add -A
 git commit -q -m "seed: BRK-G1 (broken test — off-by-one assertion)"
 printf "  BRK-G1             → %s\n" "$(git rev-parse HEAD)"
 
 # BRK-G2: inverted boolean assertion in TestSubmitAndCollectResult
-patch -s -p0 -R < "$FIXTURE_SRC/seeds/BRK-G2/fix.patch"
+patch -s $(_detect_p "$FIXTURE_SRC/seeds/BRK-G2/fix.patch") -R < "$FIXTURE_SRC/seeds/BRK-G2/fix.patch"
 git add -A
 git commit -q -m "seed: BRK-G2 (broken test — inverted boolean assertion)"
 printf "  BRK-G2             → %s\n" "$(git rev-parse HEAD)"

@@ -1,21 +1,8 @@
---- a/src/schedlib/recurrence.py	2026-07-31 03:38:09.541233577 -0300
-+++ b/src/schedlib/recurrence.py	2026-07-31 03:38:09.542111667 -0300
-@@ -106,11 +106,7 @@
-         elif self.frequency == RecurrenceFrequency.MONTHLY:
-             return _add_months(d, self.interval)
-         elif self.frequency == RecurrenceFrequency.YEARLY:
--            # BUG-P2: yearly recurrence ignores interval — always
--            # advances by 1 year even when interval > 1, causing
--            # rules like yearly(interval=2) to produce annual
--            # occurrences instead of biennial ones.
--            return _add_years(d, 1)
-+            return _add_years(d, self.interval)
-         return d + timedelta(days=1)
- 
-     def _uses_fine_grained(self) -> bool:
---- a/src/schedlib/conflict.py	2026-07-31 03:38:09.542814697 -0300
-+++ b/src/schedlib/conflict.py	2026-07-31 03:38:09.544610719 -0300
-@@ -80,14 +80,9 @@
+diff --git b/src/schedlib/conflict.py a/src/schedlib/conflict.py
+index f1d07d1..e946a4c 100644
+--- b/src/schedlib/conflict.py
++++ a/src/schedlib/conflict.py
+@@ -80,14 +80,9 @@ def conflict_severity(a: Event, b: Event) -> ConflictSeverity:
      end = min(a.end, b.end)
      overlap_dur = end - start
  
@@ -33,3 +20,20 @@
      ):
          return ConflictSeverity.CONTAINED
  
+diff --git b/src/schedlib/recurrence.py a/src/schedlib/recurrence.py
+index 78244f3..352fb21 100644
+--- b/src/schedlib/recurrence.py
++++ a/src/schedlib/recurrence.py
+@@ -106,11 +106,7 @@ class RecurrenceRule:
+         elif self.frequency == RecurrenceFrequency.MONTHLY:
+             return _add_months(d, self.interval)
+         elif self.frequency == RecurrenceFrequency.YEARLY:
+-            # BUG-P2: yearly recurrence ignores interval — always
+-            # advances by 1 year even when interval > 1, causing
+-            # rules like yearly(interval=2) to produce annual
+-            # occurrences instead of biennial ones.
+-            return _add_years(d, 1)
++            return _add_years(d, self.interval)
+         return d + timedelta(days=1)
+ 
+     def _uses_fine_grained(self) -> bool:

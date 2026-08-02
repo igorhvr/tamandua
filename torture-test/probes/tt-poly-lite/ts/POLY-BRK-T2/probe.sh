@@ -23,15 +23,13 @@ echo "[] Checking POST status assertion..." >&2
 
 # The broken version: assert.strictEqual(status, 200) in POST test
 # The fixed version: assert.strictEqual(status, 201)
-assert_not_grep 'assert\.strictEqual.*status.*200' "$TEST_FILE" \
-    "POLY-BRK-T2 not fixed: POST assertion still expects status 200 (should be 201)"
-
+# Only the POST test uses 201 — all other endpoints use 200
 assert_grep 'assert\.strictEqual.*status.*201' "$TEST_FILE" \
     "POLY-BRK-T2 not fixed: POST assertion does not expect status 201"
 
 # ── 2. Full test suite passes ──
 echo "[] Running full test suite..." >&2
-if ! run_in_workspace "$WORKSPACE/ts" npm test 2>&1 | grep -q "0 fail"; then
+if ! run_in_workspace "$WORKSPACE/ts" npm test 2>&1 | grep -q "fail 0"; then
     fail "POLY-BRK-T2: test suite still has failures"
 fi
 

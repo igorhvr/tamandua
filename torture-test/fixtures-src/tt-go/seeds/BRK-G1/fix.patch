@@ -1,6 +1,8 @@
---- pool_test.go
-+++ pool_test.go
-@@ -256,9 +256,8 @@
+diff --git b/pool_test.go a/pool_test.go
+index ce18273..c92becd 100644
+--- b/pool_test.go
++++ a/pool_test.go
+@@ -256,9 +256,8 @@ func TestMultipleResults(t *testing.T) {
  	p.Shutdown()
  	results := collectResults(p)
  
@@ -11,3 +13,4 @@
 +		t.Errorf("expected %d results, got %d", n, len(results))
  	}
  }
+ 

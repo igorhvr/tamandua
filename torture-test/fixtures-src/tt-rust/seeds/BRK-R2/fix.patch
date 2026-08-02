@@ -1,6 +1,8 @@
---- tests/integration.rs
-+++ tests/integration.rs
-@@ -38,8 +38,7 @@
+diff --git b/tests/integration.rs a/tests/integration.rs
+index a6ce562..6d1ddfd 100644
+--- b/tests/integration.rs
++++ a/tests/integration.rs
+@@ -38,8 +38,7 @@ fn integration_try_consume_succeeds_with_enough_tokens() {
  #[test]
  fn integration_try_consume_fails_when_insufficient() {
      let bucket = TokenBucket::new(RateLimiterConfig::new(3, 5));

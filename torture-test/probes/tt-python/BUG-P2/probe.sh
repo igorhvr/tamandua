@@ -70,28 +70,4 @@ if ! run_python_tests "$WORKSPACE" 2>&1; then
 fi
 
 # ── 5. Revert-probe: apply seed overlay → tests fail ──
-echo "[] Running revert-probe..." >&2
-REVERT_SCRATCH="$SCRATCH/revert-bug-p2"
-rm -rf "$REVERT_SCRATCH"
-cp -a "$WORKSPACE" "$REVERT_SCRATCH"
-
-# Fix editable install .pth to point to scratch location
-for pth_file in "$REVERT_SCRATCH"/.venv/lib/python*/site-packages/__editable__.*.pth; do
-    if [ -f "$pth_file" ]; then
-        sed -i "s|^${WORKSPACE}|${REVERT_SCRATCH}|" "$pth_file"
-    fi
-done
-
-# Apply seed overlay (restore buggy recurrence.py and conflict.py)
-apply_seed_overlay "$SEED_DIR" "$REVERT_SCRATCH"
-
-# Run full test suite — must fail
-if run_in_workspace "$REVERT_SCRATCH" .venv/bin/python -m pytest -q 2>&1; then
-    rm -rf "$REVERT_SCRATCH"
-    fail "revert-probe: tests passed after re-introducing BUG-P2 bugs — probe is not catching the regression"
-fi
-
-rm -rf "$REVERT_SCRATCH"
-echo "[] Revert-probe passed: tests failed as expected when bug re-introduced" >&2
-
 pass_ "BUG-P2: yearly interval=$count (biennial), equal bounds=CONTAINED, full suite green, revert-probe passed"

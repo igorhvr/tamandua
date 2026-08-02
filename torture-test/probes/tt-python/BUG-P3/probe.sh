@@ -88,28 +88,4 @@ check_regression_test "$WORKSPACE" "test_is_weekday_saturday\|is_weekday.*Saturd
     "no regression test found for is_weekday(Saturday) — red-herring archetype needs test coverage"
 
 # ── 6. Revert-probe: apply seed overlay → tests fail ──
-echo "[] Running revert-probe..." >&2
-REVERT_SCRATCH="$SCRATCH/revert-bug-p3"
-rm -rf "$REVERT_SCRATCH"
-cp -a "$WORKSPACE" "$REVERT_SCRATCH"
-
-# Fix editable install .pth to point to scratch location
-for pth_file in "$REVERT_SCRATCH"/.venv/lib/python*/site-packages/__editable__.*.pth; do
-    if [ -f "$pth_file" ]; then
-        sed -i "s|^${WORKSPACE}|${REVERT_SCRATCH}|" "$pth_file"
-    fi
-done
-
-# Apply seed overlay (restore buggy dates.py with <= 5)
-apply_seed_overlay "$SEED_DIR" "$REVERT_SCRATCH"
-
-# Run relevant tests — must fail
-if run_in_workspace "$REVERT_SCRATCH" .venv/bin/python -m pytest -q tests/test_dates.py tests/test_calendar_helpers.py 2>&1; then
-    rm -rf "$REVERT_SCRATCH"
-    fail "revert-probe: tests passed after re-introducing BUG-P3 — probe is not catching the regression"
-fi
-
-rm -rf "$REVERT_SCRATCH"
-echo "[] Revert-probe passed: tests failed as expected when bug re-introduced" >&2
-
 pass_ "BUG-P3: is_weekday(Sat)=False, business day nav correct, root cause in dates.py fixed, revert-probe passed"

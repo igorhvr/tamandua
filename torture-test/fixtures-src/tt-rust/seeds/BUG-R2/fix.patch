@@ -1,48 +1,8 @@
---- src/config.rs	2026-07-31 21:53:44.008175850 -0300
-+++ src/config.rs	2026-07-31 21:53:44.009010915 -0300
-@@ -33,35 +33,27 @@
-             burst_size: max_tokens,
-         }
-     }
- 
-     /// Set a custom refill interval in milliseconds.
--    ///
--    /// BUG-R2: The argument is validated but then ignored — the field is
--    /// always set to 100 regardless of what the caller passes. This is
--    /// one half of the two-module coordinated bug.
-     pub fn with_refill_interval(mut self, ms: u64) -> Self {
-         assert!(ms > 0, "refill_interval_ms must be greater than 0");
--        self.refill_interval_ms = 100;
-+        self.refill_interval_ms = ms;
-         self
-     }
- 
-     /// Set a custom burst size (initial tokens).
-     ///
-     /// # Panics
-     ///
-     /// Panics if `burst_size` exceeds `max_tokens`.
--    ///
--    /// BUG-R2: The argument is validated but then ignored — burst_size
--    /// is always set to max_tokens regardless of what the caller passes.
--    /// This is the other half of the two-module coordinated bug.
-     pub fn with_burst_size(mut self, burst_size: u32) -> Self {
-         assert!(
-             burst_size <= self.max_tokens,
-             "burst_size must not exceed max_tokens"
-         );
--        self.burst_size = self.max_tokens;
-+        self.burst_size = burst_size;
-         self
-     }
- 
-     /// Maximum number of tokens the bucket can hold.
-     pub fn max_tokens(&self) -> u32 {
---- src/bucket.rs	2026-07-31 21:53:44.011507650 -0300
-+++ src/bucket.rs	2026-07-31 21:53:44.021011244 -0300
-@@ -31,16 +31,13 @@
- }
- 
+diff --git b/src/bucket.rs a/src/bucket.rs
+index c75d8a2..2fb2048 100644
+--- b/src/bucket.rs
++++ a/src/bucket.rs
+@@ -33,12 +33,9 @@ pub struct TokenBucket {
  impl TokenBucket {
      /// Create a new TokenBucket with the given configuration.
      ///
@@ -57,11 +17,7 @@
          Self {
              current_tokens: AtomicU32::new(initial),
              last_refill: AtomicU64::new(0), // 0 ms elapsed from start
-             config,
-             start: Instant::now(),
-@@ -90,15 +87,17 @@
-     ///
-     /// This is safe under concurrent access: token count is atomically
+@@ -92,11 +89,13 @@ impl TokenBucket {
      /// reset and the time reference is bumped to the current elapsed
      /// time so that future refills compute intervals from "right now".
      pub fn reset(&self) {
@@ -77,11 +33,7 @@
          let now_ms = self.elapsed_now_ms();
          self.last_refill.store(now_ms, Ordering::Release);
      }
- 
-     // ── private ────────────────────────────────────────────────────
-@@ -111,17 +110,13 @@
-     /// Replenish tokens based on elapsed time since the last refill.
-     fn refill(&self) {
+@@ -113,13 +112,9 @@ impl TokenBucket {
          let now_ms = self.elapsed_now_ms();
          let last = self.last_refill.load(Ordering::Acquire);
  
@@ -97,11 +49,7 @@
              return;
          }
  
-         // Compute tokens to add: (elapsed_ms * refill_rate) / 1000.
-         // Use u64 for intermediate calculation to avoid overflow
-@@ -132,21 +127,24 @@
-         if tokens_to_add == 0 {
-             return;
+@@ -134,6 +129,8 @@ impl TokenBucket {
          }
  
          // Claim the refill window by updating last_refill.
@@ -110,10 +58,7 @@
          match self.last_refill.compare_exchange(
              last,
              now_ms,
-             Ordering::AcqRel,
-             Ordering::Acquire,
-         ) {
-             Ok(_) => {
+@@ -144,7 +141,8 @@ impl TokenBucket {
                  self.add_tokens(tokens_to_add);
              }
              Err(_new_last) => {
@@ -123,11 +68,7 @@
              }
          }
      }
- 
-     /// Add tokens up to max_tokens (CAS loop for atomicity).
-@@ -167,10 +165,17 @@
-             }
-         }
+@@ -169,6 +167,13 @@ impl TokenBucket {
      }
  }
  
@@ -141,11 +82,7 @@
  #[cfg(test)]
  mod tests {
      use super::*;
-     use std::thread;
-     use std::time::Duration;
-@@ -179,23 +184,18 @@
- 
-     #[test]
+@@ -181,19 +186,14 @@ mod tests {
      fn new_bucket_starts_with_burst_tokens() {
          let cfg = RateLimiterConfig::new(10, 5);
          let bucket = TokenBucket::new(cfg);
@@ -166,11 +103,7 @@
      }
  
      // ── consumption ──────────────────────────────────────────────
- 
-     #[test]
-@@ -244,20 +244,19 @@
- 
-     // ── refill ───────────────────────────────────────────────────
+@@ -246,16 +246,15 @@ mod tests {
  
      #[test]
      fn refill_after_sleep_restores_tokens() {
@@ -190,11 +123,7 @@
          thread::sleep(Duration::from_millis(1100));
          let available = bucket.available();
          assert!(
-             available >= 10,
-             "expected >= 10 tokens after 1s sleep, got {}",
-@@ -268,25 +267,25 @@
-     #[test]
-     fn refill_respects_max_tokens() {
+@@ -270,21 +269,21 @@ mod tests {
          let cfg = RateLimiterConfig::new(5, 100);
          let bucket = TokenBucket::new(cfg);
  
@@ -219,11 +148,7 @@
          thread::sleep(Duration::from_millis(160));
          let av = bucket.available();
          assert!(av > 0, "expected some refill after 160ms, got {}", av);
-     }
- 
-@@ -294,36 +293,33 @@
- 
-     #[test]
+@@ -296,8 +295,6 @@ mod tests {
      fn burst_allows_immediate_full_consumption() {
          let cfg = RateLimiterConfig::new(100, 10);
          let bucket = TokenBucket::new(cfg);
@@ -232,8 +157,7 @@
          assert!(bucket.try_consume(100));
      }
  
-     #[test]
-     fn burst_is_capped_by_max_tokens_after_refill() {
+@@ -306,6 +303,7 @@ mod tests {
          let cfg = RateLimiterConfig::new(10, 50);
          let bucket = TokenBucket::new(cfg);
  
@@ -241,8 +165,7 @@
          thread::sleep(Duration::from_millis(500));
          assert!(bucket.available() <= 10);
      }
- 
-     // ── rate limiting ────────────────────────────────────────────
+@@ -314,14 +312,12 @@ mod tests {
  
      #[test]
      fn tokens_drain_before_refill_interval() {
@@ -259,11 +182,7 @@
          assert!(!bucket.try_consume(1));
      }
  
-     // ── concurrent access ────────────────────────────────────────
- 
-@@ -402,10 +398,12 @@
-         }
-     }
+@@ -404,6 +400,8 @@ mod tests {
  
      #[test]
      fn concurrent_four_plus_threads_no_races() {
@@ -272,11 +191,7 @@
          use std::sync::Arc;
          let bucket = Arc::new(TokenBucket::new(RateLimiterConfig::new(2000, 500)));
  
-         let handles: Vec<_> = (0..6)
-             .map(|i| {
-@@ -429,31 +427,28 @@
- 
-     // ── reset ────────────────────────────────────────────────────
+@@ -431,17 +429,14 @@ mod tests {
  
      #[test]
      fn reset_restores_burst_tokens() {
@@ -296,9 +211,7 @@
      }
  
      #[test]
-     fn reset_restores_full_burst() {
-         let bucket = TokenBucket::new(RateLimiterConfig::new(20, 10));
-         assert!(bucket.try_consume(8));
+@@ -451,7 +446,7 @@ mod tests {
          assert_eq!(bucket.available(), 12);
  
          bucket.reset();
@@ -307,11 +220,7 @@
      }
  
      #[test]
-     fn reset_then_consume_works() {
-         let bucket = TokenBucket::new(RateLimiterConfig::new(10, 5));
-@@ -466,22 +461,21 @@
-         assert_eq!(bucket.available(), 5);
-     }
+@@ -468,18 +463,17 @@ mod tests {
  
      #[test]
      fn reset_resets_refill_clock() {
@@ -335,11 +244,7 @@
      }
  
      // ── available() ──────────────────────────────────────────────
- 
-     #[test]
-@@ -501,10 +495,11 @@
-     }
- 
+@@ -503,6 +497,7 @@ mod tests {
      #[test]
      fn available_never_negative() {
          let bucket = TokenBucket::new(RateLimiterConfig::new(1, 1000));
@@ -347,11 +252,7 @@
          assert!(!bucket.try_consume(100));
          let av = bucket.available();
          assert!(av <= 1, "available should not be negative, got {}", av);
-     }
- 
-@@ -530,10 +525,11 @@
-         let bucket = TokenBucket::new(cfg);
- 
+@@ -532,6 +527,7 @@ mod tests {
          assert!(bucket.try_consume(10)); // drain
          assert_eq!(bucket.available(), 0);
  
@@ -359,11 +260,7 @@
          thread::sleep(Duration::from_millis(1100));
          let av = bucket.available();
          assert!(av >= 1, "expected >= 1 token, got {}", av);
-     }
- 
-@@ -555,10 +551,12 @@
-         assert!(bucket.try_consume(10)); // drain
-         assert_eq!(bucket.available(), 0);
+@@ -557,6 +553,8 @@ mod tests {
  
          thread::sleep(Duration::from_millis(300));
  
@@ -372,11 +269,7 @@
          let av = bucket.available();
          assert!(av >= 5, "expected monotonic clock refill, got {}", av);
      }
- 
-     // ── overflow edge cases ──────────────────────────────────────
-@@ -571,17 +569,73 @@
-     }
- 
+@@ -573,6 +571,7 @@ mod tests {
      #[test]
      fn refill_at_max_does_not_overflow() {
          let bucket = TokenBucket::new(RateLimiterConfig::new(100, 10));
@@ -384,7 +277,7 @@
          thread::sleep(Duration::from_millis(200));
          assert_eq!(bucket.available(), 100);
      }
- 
+@@ -580,6 +579,7 @@ mod tests {
      #[test]
      fn refill_when_saturated() {
          let bucket = TokenBucket::new(RateLimiterConfig::new(10, 1000));
@@ -392,59 +285,40 @@
          assert!(bucket.try_consume(5));
          thread::sleep(Duration::from_millis(200));
          assert_eq!(bucket.available(), 10);
+diff --git b/src/config.rs a/src/config.rs
+index 4dbed32..1c59adf 100644
+--- b/src/config.rs
++++ a/src/config.rs
+@@ -35,13 +35,9 @@ impl RateLimiterConfig {
      }
-+
-+    // ── BUG-R2 regression: two-module coordinated fix ───────
-+
-+    #[test]
-+    fn bug_r2_custom_burst_size_respected() {
-+        let cfg = RateLimiterConfig::new(100, 50).with_burst_size(30);
-+        let bucket = TokenBucket::new(cfg);
-+        assert_eq!(bucket.available(), 30,
-+            "bucket should start with burst_size (30), not max_tokens (100)");
-+        assert!(bucket.try_consume(30));
-+        assert_eq!(bucket.available(), 0);
-+        bucket.reset();
-+        assert_eq!(bucket.available(), 30,
-+            "reset should restore burst_size (30), not max_tokens (100)");
-+    }
-+
-+    #[test]
-+    fn bug_r2_custom_refill_interval_respected() {
-+        let cfg = RateLimiterConfig::new(10, 100).with_refill_interval(200);
-+        let bucket = TokenBucket::new(cfg);
-+        assert!(bucket.try_consume(10));
-+        assert_eq!(bucket.available(), 0);
-+        thread::sleep(Duration::from_millis(100));
-+        assert_eq!(bucket.available(), 0,
-+            "no refill expected after 100ms with 200ms interval");
-+        let cfg2 = RateLimiterConfig::new(10, 100).with_refill_interval(50);
-+        let bucket2 = TokenBucket::new(cfg2);
-+        assert!(bucket2.try_consume(10));
-+        assert_eq!(bucket2.available(), 0);
-+        thread::sleep(Duration::from_millis(100));
-+        let av = bucket2.available();
-+        assert!(av > 0, "expected refill after 100ms with 50ms interval, got {}", av);
-+    }
-+
-+    #[test]
-+    fn bug_r2_coordinated_both_work() {
-+        let cfg = RateLimiterConfig::new(50, 200)
-+            .with_burst_size(25)
-+            .with_refill_interval(150);
-+        assert_eq!(cfg.burst_size(), 25);
-+        assert_eq!(cfg.refill_interval_ms(), 150);
-+        assert_ne!(cfg.burst_size(), cfg.max_tokens());
-+        let bucket = TokenBucket::new(cfg);
-+        assert_eq!(bucket.available(), 25);
-+        assert!(bucket.try_consume(25));
-+        assert_eq!(bucket.available(), 0);
-+        bucket.reset();
-+        assert_eq!(bucket.available(), 25);
-+        assert!(bucket.try_consume(25));
-+        thread::sleep(Duration::from_millis(100));
-+        assert_eq!(bucket.available(), 0,
-+            "no refill expected after 100ms with 150ms interval");
-+    }
-+
- }
+ 
+     /// Set a custom refill interval in milliseconds.
+-    ///
+-    /// BUG-R2: The argument is validated but then ignored — the field is
+-    /// always set to 100 regardless of what the caller passes. This is
+-    /// one half of the two-module coordinated bug.
+     pub fn with_refill_interval(mut self, ms: u64) -> Self {
+         assert!(ms > 0, "refill_interval_ms must be greater than 0");
+-        self.refill_interval_ms = 100;
++        self.refill_interval_ms = ms;
+         self
+     }
+ 
+@@ -50,16 +46,12 @@ impl RateLimiterConfig {
+     /// # Panics
+     ///
+     /// Panics if `burst_size` exceeds `max_tokens`.
+-    ///
+-    /// BUG-R2: The argument is validated but then ignored — burst_size
+-    /// is always set to max_tokens regardless of what the caller passes.
+-    /// This is the other half of the two-module coordinated bug.
+     pub fn with_burst_size(mut self, burst_size: u32) -> Self {
+         assert!(
+             burst_size <= self.max_tokens,
+             "burst_size must not exceed max_tokens"
+         );
+-        self.burst_size = self.max_tokens;
++        self.burst_size = burst_size;
+         self
+     }
+ 

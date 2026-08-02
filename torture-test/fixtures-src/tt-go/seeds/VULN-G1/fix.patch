@@ -1,14 +1,8 @@
---- util/command.go
-+++ util/command.go
-@@ -5,6 +5,7 @@
- package util
- 
- import (
-+	"fmt"
- 	"os/exec"
- )
- 
-@@ -19,10 +20,16 @@
+diff --git a/util/command.go b/util/command.go
+index 7427727..7f93f32 100644
+--- a/util/command.go
++++ b/util/command.go
+@@ -19,10 +19,10 @@ func RunCommand(name string, args ...string) (string, error) {
  	return string(out), nil
  }
  
@@ -16,16 +10,10 @@
 -// VULNERABLE: unsanitized cmdStr allows shell injection (VULN-G1).
 -func RunCommandShell(cmdStr string) (string, error) {
 -	cmd := exec.Command("sh", "-c", cmdStr) // VULN-G1: shell injection via unsanitized cmdStr
-+// RunCommandSafe executes a command using an argument list, avoiding shell injection.
-+//
-+// This replaces the unsafe RunCommandShell which passed unsanitized strings
-+// to sh -c, enabling command injection (VULN-G1).  RunCommandSafe uses
-+// exec.Command with args only — no shell, no injection surface.
-+func RunCommandSafe(args ...string) (string, error) {
-+	if len(args) == 0 {
-+		return "", fmt.Errorf("RunCommandSafe: at least one argument required")
-+	}
-+	cmd := exec.Command(args[0], args[1:]...)
++// RunCommandSafe executes a command safely using exec.Command with an
++// explicit argument list — no shell, no injection surface.
++func RunCommandSafe(name string, args ...string) (string, error) {
++	cmd := exec.Command(name, args...)
  	out, err := cmd.Output()
  	if err != nil {
  		return "", err

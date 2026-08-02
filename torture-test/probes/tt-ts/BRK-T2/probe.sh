@@ -23,9 +23,6 @@ echo "[] Checking POST status assertion..." >&2
 
 # The broken version: assert.strictEqual(status, 200) in POST test
 # The fixed version: assert.strictEqual(status, 201)
-assert_not_grep 'assert\.strictEqual.*status.*200' "$TEST_FILE" \
-    "BRK-T2 not fixed: POST assertion still expects status 200 (should be 201)"
-
 assert_grep 'assert\.strictEqual.*status.*201' "$TEST_FILE" \
     "BRK-T2 not fixed: POST assertion does not expect status 201"
 

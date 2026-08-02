@@ -8,7 +8,7 @@
 #   2. Event model handles IANA timezone strings
 #   3. Feature-specific tests exist and pass
 
-source "$(dirname "$0")/../../lib/probe-common.sh"
+source "$(dirname "$0")/../../../lib/probe-common.sh"
 
 WORKSPACE="$1"
 BASE_REF="$2"

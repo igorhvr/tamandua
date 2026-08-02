@@ -1,105 +1,49 @@
---- pool.go	2026-07-31 15:15:45.040623187 -0300
-+++ pool.go	2026-07-31 15:15:45.042849569 -0300
-@@ -60,7 +60,7 @@
- 	// is shut down. When ctx.Done() fires concurrently, rejected tasks still
- 	// increment the counter — causing an off-by-one (or more) between the
- 	// submitted count and the actual number of tasks executed.
+diff --git b/pool.go a/pool.go
+index 1e596ec..90b23d3 100644
+--- b/pool.go
++++ a/pool.go
+@@ -22,7 +22,6 @@ type WorkerPool struct {
+ 	wg          sync.WaitGroup
+ 	running     atomic.Int64
+ 	completed   atomic.Int64
+-	submitted   atomic.Int64
+ }
+ 
+ // NewPool creates a new WorkerPool with the given maxWorkers and queueSize.
+@@ -56,12 +55,6 @@ func NewPool(maxWorkers int, queueSize int) *WorkerPool {
+ // Submit enqueues a task for execution. Returns ErrPoolShutdown if the pool
+ // has been shut down.
+ func (p *WorkerPool) Submit(task Task) error {
+-	// BUG-G1: submitted counter is incremented BEFORE checking if the pool
+-	// is shut down. When ctx.Done() fires concurrently, rejected tasks still
+-	// increment the counter — causing an off-by-one (or more) between the
+-	// submitted count and the actual number of tasks executed.
 -	p.submitted.Add(1)
-+	
- 
+-
  	select {
- 	case <-p.ctx.Done():
-@@ -70,6 +70,9 @@
- 
- 	select {
- 	case p.taskQueue <- task:
-+		// Only increment submitted counter after successful enqueue.
-+		// This ensures Submitted() matches actual task count.
-+		p.submitted.Add(1)
- 		return nil
  	case <-p.ctx.Done():
  		return ErrPoolShutdown
---- /dev/null	2026-07-09 23:42:55.920105794 -0300
-+++ pool_bug_g1_test.go	2026-07-31 15:15:45.043621008 -0300
-@@ -0,0 +1,81 @@
-+package ttgo
-+
-+import (
-+	"fmt"
-+	"testing"
-+)
-+
-+// TestBugG1SubmittedCounterMatchesResults verifies the BUG-G1 fix:
-+// the submitted counter must match the actual number of Results collected.
-+// With the bug, rejected tasks still increment the submitted counter,
-+// causing a mismatch.
-+func TestBugG1SubmittedCounterMatchesResults(t *testing.T) {
-+	t.Run("rejected submits do not inflate the counter", func(t *testing.T) {
-+		p := NewPool(1, 1)
-+
-+		task := Task{
-+			ID:   "g1-before",
-+			Name: "before shutdown",
-+			Func: func() (any, error) {
-+				return "ok", nil
-+			},
-+		}
-+		if err := p.Submit(task); err != nil {
-+			t.Fatalf("Submit before shutdown: %v", err)
-+		}
-+
-+		p.Shutdown()
-+		_ = collectResults(p)
-+
-+		submittedBefore := p.Submitted()
-+
-+		lateTask := Task{
-+			ID:   "g1-after",
-+			Name: "after shutdown",
-+			Func: func() (any, error) {
-+				return "late", nil
-+			},
-+		}
-+		err := p.Submit(lateTask)
-+		if err != ErrPoolShutdown {
-+			t.Fatalf("expected ErrPoolShutdown for late submit, got %v", err)
-+		}
-+
-+		submittedAfter := p.Submitted()
-+		if submittedAfter != submittedBefore {
-+			t.Errorf("rejected submit incremented the counter: before=%d, after=%d (off by %d)",
-+				submittedBefore, submittedAfter, submittedAfter-submittedBefore)
-+		}
-+	})
-+
-+	t.Run("submitted matches results without concurrent shutdown", func(t *testing.T) {
-+		p := NewPool(2, 20)
-+		n := 10
-+
-+		for i := 0; i < n; i++ {
-+			task := Task{
-+				ID:   fmt.Sprintf("g1-basic-%d", i),
-+				Name: "g1-basic",
-+				Func: func() (any, error) {
-+					return "ok", nil
-+				},
-+			}
-+			if err := p.Submit(task); err != nil {
-+				t.Fatalf("Submit #%d returned error: %v", i, err)
-+			}
-+		}
-+
-+		p.Shutdown()
-+		results := collectResults(p)
-+
-+		if submitted := p.Submitted(); submitted != int64(len(results)) {
-+			t.Errorf("Submitted()=%d does not match len(results)=%d", submitted, len(results))
-+		}
-+		if submitted := p.Submitted(); submitted != int64(n) {
-+			t.Errorf("Submitted()=%d, expected %d", submitted, n)
-+		}
-+		if completed := p.Completed(); completed != int64(n) {
-+			t.Errorf("Completed()=%d, expected %d", completed, n)
-+		}
-+	})
-+}
+@@ -102,11 +95,6 @@ func (p *WorkerPool) Completed() int64 {
+ 	return p.completed.Load()
+ }
+ 
+-// Submitted returns the number of tasks submitted to the pool.
+-func (p *WorkerPool) Submitted() int64 {
+-	return p.submitted.Load()
+-}
+-
+ // worker is the goroutine that processes tasks from the task queue.
+ func (p *WorkerPool) worker(id int) {
+ 	defer p.wg.Done()
+@@ -159,9 +147,9 @@ func (p *WorkerPool) executeTask(task Task) Result {
+ 		defer func() {
+ 			if r := recover(); r != nil {
+ 				err = &PanicError{
+-					TaskID:   task.ID,
++					TaskID: task.ID,
+ 					TaskName: task.Name,
+-					Panic:    r,
++					Panic:   r,
+ 				}
+ 			}
+ 		}()

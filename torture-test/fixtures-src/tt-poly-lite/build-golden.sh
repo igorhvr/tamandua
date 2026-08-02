@@ -510,7 +510,7 @@ for seed_id in "${PYTHON_BUG_SEEDS[@]}" "${PYTHON_VULN_SEEDS[@]}"; do
         (
             cd "$PY_VERIFY"
             fix="$FIXTURE_SRC/python/seeds/$seed_id/fix.patch"
-            (cd python && patch -p1 -s --batch < "$fix") || {
+            (patch -p1 -s --batch < "$fix") || {
                 echo " Fix patch FAILED to apply!"
                 exit 1
             }
@@ -536,7 +536,7 @@ for seed_id in "${PYTHON_BUG_SEEDS[@]}" "${PYTHON_VULN_SEEDS[@]}"; do
         (
             cd "$PY_VERIFY"
             fix="$FIXTURE_SRC/python/seeds/$seed_id/fix.patch"
-            (cd python && patch -p1 -s --batch < "$fix") || {
+            (patch -p1 -s --batch < "$fix") || {
                 echo " Fix patch FAILED to apply!"
                 exit 1
             }

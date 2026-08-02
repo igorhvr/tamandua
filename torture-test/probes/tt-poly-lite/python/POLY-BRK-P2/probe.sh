@@ -8,7 +8,7 @@
 #   2. All three assertions corrected (no == 1 where should be != 1)
 #   3. Pytest exits 0 for test_broken_p2.py
 
-source "$(dirname "$0")/../../lib/probe-common.sh"
+source "$(dirname "$0")/../../../lib/probe-common.sh"
 
 WORKSPACE="$1"
 BASE_REF="$2"

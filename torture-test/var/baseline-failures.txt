@@ -1,0 +1,234 @@
+# Baseline Failure Analysis — validate-all.sh
+# Generated: 2026-08-01T14:50:00Z
+# Summary: 24 validated, 52 failed, 0 skipped (of 76 probes)
+
+## Overall Counts by Fixture
+
+Fixture                  Total  Valid  Failed
+------                   -----  -----  ------
+tt-go                      10      3       7
+tt-java                    12      6       6
+tt-poly-lite/python        11      0      11
+tt-poly-lite/ts             8      2       6
+tt-python                  12      4       8
+tt-rust                    11      3       8
+tt-ts                      12      6       6
+TOTAL                      76     24      52
+
+---
+
+## Cluster 1: Fix Patches Fail to Apply (arm2=FAIL "could not apply fix patch")
+
+These probes have valid arm1 (correctly FAIL on seeded tree) but the fix
+patch fails to apply via `git apply`, so arm2 and arm3 can't be evaluated.
+
+Root cause: patches have incorrect hunk headers (line counts in @@ lines
+don't match body) — likely generated with a lenient tool. The golden
+builder's own fix verification passed, meaning it used different logic
+than validate-all.sh.
+
+### tt-go (6) — corrupt patch at line N
+
+  BRK-G1: arm1=PASS arm2=FAIL arm3=SKIP [INVALID]
+    Error: corrupt patch at line 14 (-p0)
+  BRK-G2: arm1=PASS arm2=FAIL arm3=SKIP [INVALID]
+    Error: corrupt patch at line 14 (-p0)
+  BUG-G1: arm1=PASS arm2=FAIL arm3=SKIP [INVALID]
+    Error: patch does not apply (-p0)
+  BUG-G2: arm1=PASS arm2=FAIL arm3=SKIP [INVALID]
+    Error: patch does not apply (-p0)
+  BUG-G3: arm1=PASS arm2=FAIL arm3=SKIP [INVALID]
+    Error: patch does not apply (-p0)
+  BUG-G4: arm1=PASS arm2=FAIL arm3=SKIP [INVALID]
+    Error: patch does not apply (-p0)
+
+### tt-java (6) — git-format patches, -p4
+
+  BRK-J1: arm1=PASS arm2=FAIL arm3=SKIP [INVALID]
+    Error: patch does not apply (-p4)
+  BRK-J2: arm1=PASS arm2=FAIL arm3=SKIP [INVALID]
+    Error: patch does not apply (-p4)
+  BUG-J1: arm1=PASS arm2=FAIL arm3=SKIP [INVALID]
+    Error: patch does not apply (-p4)
+  BUG-J2: arm1=PASS arm2=FAIL arm3=SKIP [INVALID]
+    Error: patch does not apply (-p4)
+  BUG-J3: arm1=PASS arm2=FAIL arm3=SKIP [INVALID]
+    Error: patch does not apply (-p4)
+  BUG-J4: arm1=PASS arm2=FAIL arm3=SKIP [INVALID]
+    Error: patch does not apply (-p4)
+
+### tt-poly-lite/ts (6) — git-format patches
+
+  POLY-BRK-T1: arm1=PASS arm2=FAIL arm3=SKIP [INVALID]
+    Error: patch does not apply (-p4)
+  POLY-BRK-T2: arm1=PASS arm2=FAIL arm3=SKIP [INVALID]
+    Error: patch does not apply (-p4)
+  POLY-BUG-T1: arm1=PASS arm2=FAIL arm3=SKIP [INVALID]
+    Error: patch does not apply (-p0)
+  POLY-BUG-T2: arm1=PASS arm2=FAIL arm3=SKIP [INVALID]
+    Error: patch does not apply (-p0)
+  POLY-BUG-T3: arm1=PASS arm2=FAIL arm3=SKIP [INVALID]
+    Error: patch does not apply (-p0)
+  POLY-BUG-T4: arm1=PASS arm2=FAIL arm3=SKIP [INVALID]
+    Error: patch does not apply (-p0)
+
+### tt-python (6) — arm2 fix patches fail, arm1 infra-error for BUG*
+
+  BRK-P1: arm1=PASS arm2=FAIL arm3=SKIP [INVALID]
+    Error: patch does not apply (-p1)
+  BRK-P2: arm1=PASS arm2=FAIL arm3=SKIP [INVALID]
+    Error: patch does not apply (-p1)
+  BUG-P1: arm1=FAIL (infra-error exit 2) arm2=FAIL arm3=SKIP [INVALID]
+    arm1 error: probe.sh exited 2 (infra)
+    arm2 error: patch does not apply (-p1)
+  BUG-P2: arm1=FAIL (infra-error exit 2) arm2=FAIL arm3=SKIP [INVALID]
+    arm1 error: probe.sh exited 2 (infra)
+    arm2 error: patch does not apply (-p1)
+  BUG-P3: arm1=FAIL (infra-error exit 2) arm2=FAIL arm3=SKIP [INVALID]
+    arm1 error: probe.sh exited 2 (infra)
+    arm2 error: patch does not apply (-p0, hunk mismatch in dates.py)
+  BUG-P4: arm1=FAIL (infra-error exit 2) arm2=FAIL arm3=SKIP [INVALID]
+    arm1 error: probe.sh exited 2 (infra)
+    arm2 error: patch does not apply (-p0, hunk mismatch in conflict.py)
+
+### tt-rust (4) — overlay patches
+
+  BUG-R1: arm1=PASS arm2=FAIL arm3=SKIP [INVALID]
+    Error: patch does not apply (-p0, hunk mismatch in bucket.rs)
+  BUG-R2: arm1=PASS arm2=FAIL arm3=SKIP [INVALID]
+    Error: patch does not apply (-p0, hunk mismatch in config.rs+bucket.rs)
+  BUG-R3: arm1=PASS arm2=FAIL arm3=SKIP [INVALID]
+    Error: patch does not apply (-p0, hunk mismatch in bucket.rs)
+  BUG-R4: arm1=PASS arm2=FAIL arm3=SKIP [INVALID]
+    Error: patch does not apply (-p0, hunk mismatch in bucket.rs)
+
+### tt-ts (6) — git-format patches, -p4
+
+  BRK-T1: arm1=PASS arm2=FAIL arm3=SKIP [INVALID]
+    Error: patch does not apply (-p4, store.test.ts)
+  BRK-T2: arm1=PASS arm2=FAIL arm3=SKIP [INVALID]
+    Error: patch does not apply (-p4, server.test.ts)
+  BUG-T1: arm1=PASS arm2=FAIL arm3=SKIP [INVALID]
+    Error: patch does not apply (-p4, store.test.ts + store.ts)
+  BUG-T2: arm1=PASS arm2=FAIL arm3=SKIP [INVALID]
+    Error: patch does not apply (-p4, server.test.ts + server.ts + store.test.ts + store.ts)
+  BUG-T3: arm1=PASS arm2=FAIL arm3=SKIP [INVALID]
+    Error: patch does not apply (-p4, store.test.ts + store.ts)
+  BUG-T4: arm1=PASS arm2=FAIL arm3=SKIP [INVALID]
+    Error: patch does not apply (-p4, store.test.ts + store.ts)
+
+---
+
+## Cluster 2: tt-poly-lite/python Monorepo Prefix (11 probes, all FAIL)
+
+All 11 tt-poly-lite/python probes fail arm1 with exit 127 (command not
+found / path broken) and arm2 fix patches fail to apply (wrong prefix).
+
+Root cause: Probes run from a workspace directory but the python code
+lives in the `python/` subdirectory of the monorepo. The probes reference
+paths like `src/schedlib/...` and commands like `.venv/bin/...` that
+don't exist at the workspace root. Fix patches also use subtree-relative
+paths (src/schedlib/...) instead of repo-root-relative (python/src/...).
+
+  POLY-BRK-P1: arm1=FAIL (exit 127) arm2=FAIL arm3=SKIP [INVALID]
+  POLY-BRK-P2: arm1=FAIL (exit 127) arm2=FAIL arm3=SKIP [INVALID]
+  POLY-BUG-P1: arm1=FAIL (exit 127) arm2=FAIL arm3=SKIP [INVALID]
+  POLY-BUG-P2: arm1=FAIL (exit 127) arm2=FAIL arm3=SKIP [INVALID]
+  POLY-BUG-P3: arm1=FAIL (exit 127) arm2=FAIL arm3=SKIP [INVALID]
+  POLY-BUG-P4: arm1=FAIL (exit 127) arm2=FAIL arm3=SKIP [INVALID]
+  POLY-FEAT-P1: arm1=FAIL (exit 127) arm2=SKIP arm3=SKIP [INVALID]
+  POLY-FEAT-P2: arm1=FAIL (exit 127) arm2=SKIP arm3=SKIP [INVALID]
+  POLY-FEAT-P3: arm1=FAIL (exit 127) arm2=SKIP arm3=SKIP [INVALID]
+  POLY-VULN-P1: arm1=FAIL (exit 127) arm2=FAIL arm3=SKIP [INVALID]
+  POLY-VULN-P2: arm1=FAIL (exit 127) arm2=FAIL arm3=SKIP [INVALID]
+
+---
+
+## Cluster 3: Probe Script Defects (7 probes, arm-specific failures)
+
+These probes have fix patches that apply but the probe logic itself is
+incorrect — arm2 incorrectly fails when fix should make it pass, or
+arm3 gaming detection is absent.
+
+  tt-go/VULN-G1: arm1=PASS arm2=FAIL arm3=PASS [INVALID]
+    arm2 error: probe incorrectly FAILED — fix applied cleanly but probe
+    still fails. The probe's arm2 check is likely too strict or tests
+    a different aspect than the fix addresses.
+    The fix patch applied cleanly (no corrupt patch error here).
+
+  tt-go/VULN-G2: arm1=PASS arm2=PASS arm3=FAIL [INVALID]
+    arm3 error: probe incorrectly PASSED — gaming not detected.
+    The probe's arm3 doesn't detect the gaming bypass, meaning the probe
+    isn't checking the specific vulnerability that was fixed.
+
+  tt-python/VULN-P1: arm1=PASS arm2=PASS arm3=FAIL [INVALID]
+    arm3 error: probe incorrectly PASSED — gaming not detected.
+    Fix applied cleanly, arm2 passes, but gaming bypass also passes.
+
+  tt-rust/BRK-R1: arm1=FAIL arm2=FAIL arm3=SKIP [INVALID]
+    arm1 error: probe incorrectly PASSED — should have detected issue
+    on the seeded tree (exit 0 when it should have failed).
+    arm2 error: fix patch does not apply (-p0).
+    The probe itself can't detect the break; the fix patch also broken.
+
+  tt-rust/BRK-R2: arm1=FAIL arm2=FAIL arm3=SKIP [INVALID]
+    arm1 error: probe incorrectly PASSED — should have detected issue
+    on the seeded tree (exit 0 when it should have failed).
+    arm2 error: fix patch does not apply (-p0).
+    Same issue as BRK-R1: probe blind spot + broken fix patch.
+
+  tt-rust/VULN-R1: arm1=PASS arm2=FAIL arm3=PASS [INVALID]
+    arm2 error: probe incorrectly FAILED — fix applied cleanly to
+    src/util_unsafe.rs but probe still exits non-zero.
+
+  tt-rust/VULN-R2: arm1=PASS arm2=FAIL arm3=PASS [INVALID]
+    arm2 error: probe incorrectly FAILED — fix applied cleanly to
+    src/util_timing.rs but probe still exits non-zero.
+
+---
+
+## Valid Probes (24) — Reference
+
+Probes that pass all three arms correctly:
+
+  tt-go/FEAT-G1, FEAT-G2, FEAT-G3
+    (feature probes: arm1 correctly FAIL, arm2/arm3 SKIP)
+
+  tt-java/FEAT-J1, FEAT-J2, FEAT-J3, FEAT-J4
+    (feature probes: arm1 correctly FAIL, arm2/arm3 SKIP)
+  tt-java/VULN-J1, VULN-J2
+    (vuln probes: all arms correct — fix applies cleanly, gaming detected)
+
+  tt-poly-lite/ts/POLY-VULN-T1, POLY-VULN-T2
+    (vuln probes: all arms correct — fix applies cleanly, gaming detected)
+
+  tt-python/FEAT-P1, FEAT-P2, FEAT-P3
+    (feature probes: arm1 correctly FAIL, arm2/arm3 SKIP)
+  tt-python/VULN-P2
+    (vuln probe: all arms correct)
+
+  tt-rust/FEAT-R1, FEAT-R2, FEAT-R3
+    (feature probes: arm1 correctly FAIL, arm2/arm3 SKIP)
+
+  tt-ts/FEAT-T1, FEAT-T2, FEAT-T3, FEAT-T4
+    (feature probes: arm1 correctly FAIL, arm2/arm3 SKIP)
+  tt-ts/VULN-T1, VULN-T2
+    (vuln probes: all arms correct — fix applies cleanly, gaming detected)
+
+---
+
+## Action Plan Summary
+
+1. **Fix malformed patches** (Cluster 1, ~34 probes): Regenerate every fix
+   patch mechanically — apply seed to golden bare clone, produce `git diff`,
+   and verify `git apply --check` passes. This addresses the largest cluster.
+
+2. **Fix poly-lite/python monorepo prefix** (Cluster 2, 11 probes): Update
+   probes to run in `python/` subdirectory, regenerate fix patches with
+   repo-root-relative paths (`python/src/schedlib/...`), and update
+   validate-all.sh `detect_patch_level` / `apply_fix` to handle monorepo
+   layout.
+
+3. **Fix probe defects** (Cluster 3, 7 probes): Fix individual probe.sh
+   scripts — arm2 incorrectly failing when fix applied, arm3 missing
+   gaming detection, or probes blind to the seeded issue.

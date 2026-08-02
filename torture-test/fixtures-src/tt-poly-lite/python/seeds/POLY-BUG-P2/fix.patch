@@ -1,6 +1,23 @@
---- a/src/schedlib/recurrence.py
-+++ b/src/schedlib/recurrence.py
-@@ -73,13 +73,6 @@
+diff --git b/python/src/schedlib/conflict.py a/python/src/schedlib/conflict.py
+index 294236d..e946a4c 100644
+--- b/python/src/schedlib/conflict.py
++++ a/python/src/schedlib/conflict.py
+@@ -81,8 +81,8 @@ def conflict_severity(a: Event, b: Event) -> ConflictSeverity:
+     overlap_dur = end - start
+ 
+     # Contained: one event fully inside the other
+-    if (a.start < b.start and a.end > b.end) or (  # POLY-BUG-P2: CONTAINED strict comparison
+-        b.start < a.start and b.end > a.end  # POLY-BUG-P2: also strict comparison
++    if (a.start <= b.start and a.end >= b.end) or (
++        b.start <= a.start and b.end >= a.end
+     ):
+         return ConflictSeverity.CONTAINED
+ 
+diff --git b/python/src/schedlib/recurrence.py a/python/src/schedlib/recurrence.py
+index 68a2fe8..352fb21 100644
+--- b/python/src/schedlib/recurrence.py
++++ a/python/src/schedlib/recurrence.py
+@@ -73,13 +73,6 @@ class RecurrenceRule:
          gen_count = 0
          max_count_val: int = self.count if self.count is not None else -1
  
@@ -14,7 +31,7 @@
          # Find the first matching date >= dtstart
          current = dtstart
          while current <= dtend:
-@@ -113,7 +106,7 @@
+@@ -113,7 +106,7 @@ class RecurrenceRule:
          elif self.frequency == RecurrenceFrequency.MONTHLY:
              return _add_months(d, self.interval)
          elif self.frequency == RecurrenceFrequency.YEARLY:
@@ -23,16 +40,3 @@
          return d + timedelta(days=1)
  
      def _uses_fine_grained(self) -> bool:
---- a/src/schedlib/conflict.py
-+++ b/src/schedlib/conflict.py
-@@ -81,8 +81,8 @@
-     overlap_dur = end - start
- 
-     # Contained: one event fully inside the other
--    if (a.start < b.start and a.end > b.end) or (  # POLY-BUG-P2: CONTAINED strict comparison
--        b.start < a.start and b.end > a.end  # POLY-BUG-P2: also strict comparison
-+    if (a.start <= b.start and a.end >= b.end) or (
-+        b.start <= a.start and b.end >= a.end
-     ):
-         return ConflictSeverity.CONTAINED
- 
