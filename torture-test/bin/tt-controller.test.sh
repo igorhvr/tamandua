@@ -12,6 +12,9 @@ DANGLING_LINK=""
 ESCAPED_CWD=""
 INTERRUPTION_PID=""
 INTERRUPTION_CONTROLLER_PID=""
+O9_CONTROL_PID=""
+O9_EVENTS_PATH=""
+O9_EVENTS_BACKUP=""
 DAEMON_CONTROL_ORIGINAL_HASH="$(sha256sum "$TT_DIR/bin/daemon-control" | cut -d' ' -f1)"
 SMOKE_GOLDENS=()
 ORACLE_TEST_FILES=()
@@ -33,6 +36,14 @@ HOST_PROFILE_BACKUP="$TEST_ROOT/original-host-profile.json"
 mkdir -p "$(dirname "$HOST_PROFILE")"
 if [ -f "$HOST_PROFILE" ]; then cp "$HOST_PROFILE" "$HOST_PROFILE_BACKUP"; fi
 cleanup() {
+  if [ -n "$O9_CONTROL_PID" ]; then
+    kill -9 "$O9_CONTROL_PID" 2>/dev/null || true
+    wait "$O9_CONTROL_PID" 2>/dev/null || true
+  fi
+  if [ -n "$O9_EVENTS_PATH" ]; then
+    rm -f -- "$O9_EVENTS_PATH"
+    if [ -f "$O9_EVENTS_BACKUP" ]; then mv "$O9_EVENTS_BACKUP" "$O9_EVENTS_PATH"; fi
+  fi
   if [ -n "$INTERRUPTION_CONTROLLER_PID" ]; then
     kill -9 "$INTERRUPTION_CONTROLLER_PID" 2>/dev/null || true
   fi
@@ -142,7 +153,7 @@ expect_usage_error() {
 
 valid_case() {
   local id="$1"
-  printf '%s\n' "{\"id\":\"$id\",\"wave\":3,\"workflow\":\"bug-fix-merge-worktree\",\"fixture\":\"tt-ts\",\"harness\":\"hermes\",\"task\":\"tasks/W3.07.md\",\"context\":{},\"caps\":{\"tokens\":4000000,\"wall_min\":240},\"requires\":{\"toolchains\":[\"node\"]},\"boundary_files\":[\"fixtures/tt-ts/src\"],\"forbidden\":[],\"oracles\":[\"O1\",\"O2\"],\"gates\":[\"W2\"],\"chaos\":null,\"shed_ok\":false,\"mandatory\":true,\"class\":\"verification\"}"
+  printf '%s\n' "{\"id\":\"$id\",\"wave\":3,\"workflow\":\"bug-fix-merge-worktree\",\"fixture\":\"tt-ts\",\"harness\":\"hermes\",\"task\":\"tasks/W3.07.md\",\"context\":{},\"caps\":{\"tokens\":4000000,\"wall_min\":240},\"requires\":{\"toolchains\":[\"node\"]},\"boundary_files\":[\"fixtures/tt-ts/src\"],\"forbidden\":[],\"oracles\":[\"TT-MISSING-O1\",\"TT-MISSING-O2\"],\"gates\":[\"W2\"],\"chaos\":null,\"shed_ok\":false,\"mandatory\":true,\"class\":\"verification\"}"
 }
 
 write_local_case() {
@@ -326,6 +337,7 @@ NODE
 oracle_output=$(run_recorded_campaign "$CONTROLLER" --manifest "$oracle_manifest") || fail "oracle campaign failed: $oracle_output"
 oracle_campaign_id=$(remember_campaign "$oracle_output")
 node --input-type=module - "$TT_DIR/var/results/$oracle_campaign_id/state.json" "$TT_DIR/var/results/$oracle_campaign_id" <<'NODE'
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 const [statePath, campaignDir] = process.argv.slice(2);
@@ -335,8 +347,12 @@ const pass = byId['ORACLE-PASS'];
 const result = pass.oracle_results?.[0];
 if (pass.outcome !== 'PASS' || result?.status !== 'VALID' || result?.response?.result !== 'PASS'
     || result.exit_code !== 0 || !result.stdout || !result.stderr || !result.context
-    || !/^[a-f0-9]{64}$/.test(result.stdout_sha256) || !/^[a-f0-9]{64}$/.test(result.stderr_sha256)) {
+    || !/^[a-f0-9]{64}$/.test(result.stdout_sha256) || !/^[a-f0-9]{64}$/.test(result.stderr_sha256)
+    || !/^[a-f0-9]{64}$/.test(result.context_sha256)) {
   throw new Error(`valid oracle evidence was not persisted: ${JSON.stringify(pass)}`);
+}
+if (createHash('sha256').update(fs.readFileSync(path.join(campaignDir, result.context))).digest('hex') !== result.context_sha256) {
+  throw new Error('persisted oracle context hash does not match its bytes');
 }
 for (const reference of [result.stdout,result.stderr,result.context]) {
   const absolute = path.join(campaignDir, reference);
@@ -356,6 +372,20 @@ for (const id of ['ORACLE-MALFORMED','ORACLE-CONTRADICTORY']) {
 }
 NODE
 pass "oracle hooks receive mechanical context and invalid or missing evidence fails closed"
+
+node --test "$SCRIPT_DIR/oracle-context.test.mjs" || fail "oracle context schema/projection tests failed"
+pass "oracle context schema accepts complete v1 evidence and rejects malformed or escaping references"
+
+node --test "$SCRIPT_DIR/o9-mechanical-harvest.integration.test.mjs" \
+  || fail "O9 controller-to-snapshot mechanical harvest integration failed"
+pass "O9 real reclaim, stop/cancel, and targeted probes harvest to a contract-valid PASS"
+
+node --test "$TT_DIR/oracles/lib/runtime.test.mjs" "$TT_DIR/oracles/self-test/harness.test.mjs" \
+  "$TT_DIR/oracles/self-test/o1.test.mjs" "$TT_DIR/oracles/self-test/o3z.test.mjs" \
+  "$TT_DIR/oracles/self-test/o9.test.mjs" \
+  || fail "shared oracle runtime/self-test harness tests failed"
+"$TT_DIR/oracles/self-test/run.sh" || fail "shared oracle mutation harness failed"
+pass "shared oracle runtime enforces CONTRACT v1 and the mutation harness rejects result mismatches"
 
 node "$SCRIPT_DIR/tt-classification.test.mjs" || fail "mechanical classification table failed"
 pass "every taxonomy outcome and case class has deterministic structured precedence"
@@ -782,7 +812,8 @@ const database = new DatabaseSync(process.argv[2]);
 database.exec(`CREATE TABLE runs (
   id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, task TEXT NOT NULL,
   status TEXT NOT NULL, context TEXT NOT NULL DEFAULT '{}',
-  tokens_spent INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+  tokens_spent INTEGER NOT NULL DEFAULT 0, scheduling_status TEXT,
+  scheduling_requested_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
 CREATE TABLE steps (
   id TEXT PRIMARY KEY, run_id TEXT NOT NULL, step_id TEXT NOT NULL,
@@ -821,7 +852,8 @@ if [ "${1:-}" = "workflow" ] && [ "${2:-}" = "status" ]; then
     stderr) printf '{"runId":"run-22222222-2222-4222-8222-222222222222","status":"running","tokensSpent":0,"steps":[]}\n' ;;
     resume) printf '{"runId":"run-22222222-2222-4222-8222-222222222222","status":"completed","tokensSpent":7,"steps":[]}\n' ;;
     harvest-status) printf '{"runId":"run-aaaaaaaa-1111-4111-8111-111111111111","status":"completed","tokensSpent":13,"steps":[{"stepId":"step-status","stepIndex":0,"status":"done"}]}\n' ;;
-    oracle-prose) printf '{"runId":"run-eeeeeeee-5555-4555-8555-555555555555","status":"completed","tokensSpent":0,"steps":[{"stepId":"step-oracle-prose","stepIndex":0,"status":"done","agentId":"developer","output":"AGENT_RESPONSE_SENTINEL STATUS: done","error":"AGENT_RESPONSE_SENTINEL failure prose"}]}\n' ;;
+    oracle-prose) printf '{"runId":"run-eeeeeeee-5555-4555-8555-555555555555","status":"completed","tokensSpent":0,"steps":[{"stepId":"step-oracle-prose","stepIndex":0,"status":"done","displayStatus":"done","agentRole":"developer","output":"AGENT_RESPONSE_SENTINEL STATUS: done","error":"AGENT_RESPONSE_SENTINEL failure prose"}]}\n' ;;
+    o9-special) printf '{"runId":"run-ffffffff-6666-4666-8666-666666666666","status":"completed","tokensSpent":0,"steps":[]}\n' ;;
     harvest-db) exit 9 ;;
     harvest-lie) printf '{"runId":"run-cccccccc-3333-4333-8333-333333333333","status":"failed","tokensSpent":17,"steps":[{"stepId":"step-lie","stepIndex":0,"status":"failed"}]}\n' ;;
     harvest-shifting-lie)
@@ -946,6 +978,16 @@ case "${CONTROLLER_WORKFLOW_MODE:-stdout}" in
   oracle-prose)
     printf 'Run: run-eeeeeeee-5555-4555-8555-555555555555\n'
     printf '{"runs":[{"runId":"run-eeeeeeee-5555-4555-8555-555555555555","status":"completed","tokensSpent":0}],"timedOut":false}\n'
+    ;;
+  o9-special)
+    "$CONTROLLER_O9_SHIM" --repo "$CONTROLLER_O9_FIXTURE" \
+      --run run-ffffffff-6666-4666-8666-666666666666 --step O9-CONTROLLER-SPECIAL-baseline-execute \
+      --force -- /bin/true >/dev/null
+    "$CONTROLLER_O9_SHIM" --repo "$CONTROLLER_O9_FIXTURE" \
+      --run run-ffffffff-6666-4666-8666-666666666666 --step O9-CONTROLLER-SPECIAL-baseline-replay \
+      -- /bin/true >/dev/null
+    printf 'Run: run-ffffffff-6666-4666-8666-666666666666\n'
+    printf '{"runs":[{"runId":"run-ffffffff-6666-4666-8666-666666666666","status":"completed","tokensSpent":0}],"timedOut":false}\n'
     ;;
 esac
 SH
@@ -1077,7 +1119,7 @@ pass "workflow harvest records status evidence, readonly DB fallback, and O13 di
 oracle_prose_manifest="$TEST_ROOT/manifests/oracle-prose.jsonl"
 valid_case "ORACLE-PROSE" \
   | sed 's/"requires":{"toolchains":\["node"\]}/"requires":{}/' \
-  | sed 's/"oracles":\["O1","O2"\]/"oracles":["TT-ORACLE-NO-PROSE"]/' \
+  | sed 's/"oracles":\["TT-MISSING-O1","TT-MISSING-O2"\]/"oracles":["TT-ORACLE-NO-PROSE"]/' \
   > "$oracle_prose_manifest"
 oracle_prose_output=$(PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$workflow_events" \
   CONTROLLER_WORKFLOW_MODE=oracle-prose run_recorded_campaign "$CONTROLLER" --manifest "$oracle_prose_manifest") \
@@ -1100,6 +1142,335 @@ if (context.includes('AGENT_RESPONSE_SENTINEL')) {
 }
 NODE
 pass "workflow oracle context excludes agent response prose from status steps"
+
+O9_EVENTS_PATH="$TT_DIR/var/home/.tamandua/events/all.jsonl"
+O9_EVENTS_BACKUP="$TEST_ROOT/original-o9-events.jsonl"
+mkdir -p "$(dirname "$O9_EVENTS_PATH")"
+if [ -f "$O9_EVENTS_PATH" ]; then mv "$O9_EVENTS_PATH" "$O9_EVENTS_BACKUP"; fi
+o9_control_ready="$TEST_ROOT/o9-control-ready"
+o9_control_log="$TEST_ROOT/o9-control.log"
+cat > "$TEST_ROOT/o9-control-server.mjs" <<'NODE'
+import fs from 'node:fs';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+const [repoRoot, readyPath] = process.argv.slice(2);
+const dbModule = await import(pathToFileURL(path.join(repoRoot, 'dist/db.js')).href);
+dbModule.getDb();
+const { createControlServer } = await import(pathToFileURL(path.join(repoRoot, 'dist/server/control-server.js')).href);
+const server = createControlServer({ listen: false });
+server.once('error', (error) => {
+  process.stderr.write(`${error.stack ?? error.message}\n`);
+  process.exit(1);
+});
+server.listen(Number(process.env.TAMANDUA_CONTROL_PORT), '127.0.0.1', () => {
+  fs.writeFileSync(readyPath, `${process.pid}\n`);
+});
+process.on('SIGTERM', () => {
+  server.closeAllConnections();
+  dbModule.closeDb();
+  process.exit(0);
+});
+NODE
+HOME="$TT_DIR/var/home" TAMANDUA_STATE_DIR="$TT_DIR/var/home/.tamandua" \
+  TAMANDUA_DB_PATH="$WORKFLOW_REAL_DB" TAMANDUA_CONTROL_PORT=4339 TAMANDUA_TEST_GUARD=0 \
+  node "$TEST_ROOT/o9-control-server.mjs" "$TT_DIR/.." "$o9_control_ready" \
+  > "$o9_control_log" 2>&1 &
+O9_CONTROL_PID=$!
+for _ in $(seq 1 100); do
+  [ ! -f "$o9_control_ready" ] || break
+  kill -0 "$O9_CONTROL_PID" 2>/dev/null \
+    || fail "O9 control server exited before readiness: $(cat "$o9_control_log")"
+  sleep 0.05
+done
+[ -f "$o9_control_ready" ] || fail "O9 control server did not become ready: $(cat "$o9_control_log")"
+O9_CONTROL_PID="$(<"$o9_control_ready")"
+
+o9_controller_fixture="$TT_DIR/var/fixtures/work/O9-CONTROLLER-SPECIAL/tt-ts"
+rm -rf -- "$TT_DIR/var/fixtures/work/O9-CONTROLLER-SPECIAL"
+mkdir -p "$o9_controller_fixture/src"
+git -C "$o9_controller_fixture" init -q -b main
+git -C "$o9_controller_fixture" config user.name 'Controller O9 Test'
+git -C "$o9_controller_fixture" config user.email 'controller-o9@example.invalid'
+printf 'export const o9Fixture = "original bytes";\n' > "$o9_controller_fixture/src/value.ts"
+git -C "$o9_controller_fixture" add .
+git -C "$o9_controller_fixture" commit -qm fixture
+o9_controller_original_hash="$(sha256sum "$o9_controller_fixture/src/value.ts" | cut -d' ' -f1)"
+o9_controller_manifest="$TEST_ROOT/manifests/o9-controller-special.jsonl"
+node --input-type=module - "$o9_controller_manifest" <<'NODE'
+import fs from 'node:fs';
+const manifest = process.argv[2];
+const record = {
+  id: 'O9-CONTROLLER-SPECIAL', wave: 0, workflow: 'bug-fix-merge-worktree',
+  fixture: 'tt-ts', harness: 'hermes', task: 'tasks/W3.07.md',
+  context: {test_cmd: '/bin/true'}, caps: {tokens: 1, wall_min: 5}, requires: {},
+  boundary_files: ['src'], forbidden: [], oracles: ['O9'], gates: [],
+  chaos: {o9_special_exits: true}, shed_ok: false, mandatory: true, class: 'verification',
+};
+fs.writeFileSync(manifest, `${JSON.stringify(record)}\n`);
+NODE
+o9_controller_output=$(PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$workflow_events" \
+  CONTROLLER_O9_FIXTURE="$o9_controller_fixture" CONTROLLER_O9_SHIM="$TT_DIR/../bin/tamandua-test" \
+  CONTROLLER_WORKFLOW_MODE=o9-special run_recorded_campaign "$CONTROLLER" --manifest "$o9_controller_manifest") \
+  || fail "controller-authored O9 special-exit campaign failed: $o9_controller_output"
+o9_controller_id=$(remember_campaign "$o9_controller_output")
+node --input-type=module - "$TT_DIR/var/results/$o9_controller_id/state.json" \
+  "$TT_DIR/var/results/$o9_controller_id" "$TT_DIR/var/home/.tamandua/events/all.jsonl" \
+  "$o9_controller_fixture" "$o9_controller_original_hash" "$o9_controller_manifest" <<'NODE'
+import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
+const [statePath, campaignDir, eventsPath, fixturePath, originalHash, manifestPath] = process.argv.slice(2);
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const item = state.cases[0];
+const attempt = item.attempts[0];
+const oracle = item.oracle_results?.find(result => result.oracle_id === 'O9');
+const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+if (manifest.oracles?.[0] !== 'O9' || manifest.chaos?.o9_special_exits !== true) {
+  throw new Error(`test manifest did not opt into controller O9 probes: ${JSON.stringify(manifest)}`);
+}
+if (attempt.o9_targeted_probes?.status !== 'COMPLETE'
+    || JSON.stringify(attempt.o9_targeted_probes.evidence?.exits) !== JSON.stringify([86,87,88])) {
+  throw new Error(`controller did not author all targeted probes: ${JSON.stringify(attempt.o9_targeted_probes)}`);
+}
+if (attempt.oracle_evidence?.status !== 'COMPLETE'
+    || oracle?.status !== 'VALID' || oracle.response?.result !== 'PASS') {
+  throw new Error(`controller snapshot/O9 result was not PASS: ${JSON.stringify({attempt,oracle})}`);
+}
+const raw = fs.readFileSync(eventsPath, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
+  .filter(event => event.event === 'suite.special_exit_observed'
+    && event.runId === 'run-ffffffff-6666-4666-8666-666666666666'
+    && event.stepId?.startsWith('O9-CONTROLLER-SPECIAL-o9-'));
+if (raw.length !== 3 || JSON.stringify(raw.map(event => event.shimExitCode).sort()) !== JSON.stringify([86,87,88])) {
+  throw new Error(`controller did not mechanically emit exactly one 86/87/88 observation: ${JSON.stringify(raw)}`);
+}
+const observations = JSON.parse(fs.readFileSync(
+  path.join(campaignDir, attempt.oracle_evidence.references.suite_observations.path), 'utf8',
+)).special_exit_observations;
+if (observations.length !== 3) throw new Error(`snapshot did not retain exactly three special exits: ${JSON.stringify(observations)}`);
+const ledger = JSON.parse(fs.readFileSync(
+  path.join(campaignDir, attempt.oracle_evidence.references.suite_ledger.path), 'utf8',
+)).rows;
+for (const event of raw) {
+  const observation = observations.find(row => row.shim_exit_code === event.shimExitCode);
+  if (!observation || observation.invocation_id !== `${event.runId}:${event.stepId}`
+      || observation.origin_repo !== event.originRepo || observation.tree_hash !== event.treeHash
+      || observation.cmd_hash !== event.cmdHash || observation.pre_tree_hash !== event.preTreeHash
+      || observation.post_tree_hash !== event.postTreeHash || observation.ledger_row_id !== event.ledgerRowId
+      || observation.command_exit_code !== event.commandExitCode
+      || observation.interrupted !== event.interrupted || observation.tracked_dirty !== event.trackedDirty
+      || observation.junk_probe_path !== event.junkProbePath
+      || observation.junk_probe_tracked !== false || event.junkProbeTracked !== false) {
+    throw new Error(`snapshot did not preserve emitted exact-key/process evidence: ${JSON.stringify({event,observation})}`);
+  }
+}
+const byCode = Object.fromEntries(observations.map(row => [row.shim_exit_code,row]));
+if (byCode[86].command_exit_code !== 0 || byCode[86].pre_tree_hash === byCode[86].post_tree_hash
+    || byCode[86].ledger_row_id !== null || byCode[86].interrupted || byCode[86].tracked_dirty) {
+  throw new Error(`exit 86 contract evidence is wrong: ${JSON.stringify(byCode[86])}`);
+}
+const red87 = ledger.find(row => row.id === byCode[87].ledger_row_id);
+if (byCode[87].command_exit_code !== 87 || !byCode[87].interrupted || byCode[87].tracked_dirty
+    || byCode[87].pre_tree_hash !== byCode[87].post_tree_hash || red87?.exit_code !== 87
+    || red87.origin_repo !== byCode[87].origin_repo || red87.tree_hash !== byCode[87].tree_hash
+    || red87.cmd_hash !== byCode[87].cmd_hash) {
+  throw new Error(`exit 87 contract evidence is wrong: ${JSON.stringify({observation:byCode[87],red87})}`);
+}
+if (byCode[88].command_exit_code !== null || !byCode[88].tracked_dirty || byCode[88].interrupted
+    || byCode[88].pre_tree_hash !== byCode[88].post_tree_hash || byCode[88].ledger_row_id !== null) {
+  throw new Error(`exit 88 contract evidence is wrong: ${JSON.stringify(byCode[88])}`);
+}
+const fixtureHash = createHash('sha256').update(fs.readFileSync(path.join(fixturePath, 'src/value.ts'))).digest('hex');
+if (fixtureHash !== originalHash) throw new Error('controller did not restore tracked fixture bytes');
+if (fs.existsSync(path.join(fixturePath, '.git/tamandua-o9-junk-probe'))) throw new Error('controller did not remove the junk probe');
+const trackedProbe = spawnSync('git', ['ls-files', '--error-unmatch', '--', '.git/tamandua-o9-junk-probe'], {
+  cwd: fixturePath, stdio: 'ignore', shell: false,
+}).status === 0;
+if (trackedProbe) throw new Error('controller O9 junk probe entered the Git index');
+NODE
+kill -9 "$O9_CONTROL_PID"
+wait "$O9_CONTROL_PID" 2>/dev/null || true
+O9_CONTROL_PID=""
+rm -f -- "$O9_EVENTS_PATH"
+if [ -f "$O9_EVENTS_BACKUP" ]; then mv "$O9_EVENTS_BACKUP" "$O9_EVENTS_PATH"; fi
+O9_EVENTS_PATH=""
+O9_EVENTS_BACKUP=""
+pass "controller authors, snapshots, and passes O9 special exits 86/87/88 with a restored fixture"
+
+snapshot_fixture="$TT_DIR/var/fixtures/work/ORACLE-SNAPSHOT/tt-ts"
+rm -rf -- "$TT_DIR/var/fixtures/work/ORACLE-SNAPSHOT"
+mkdir -p "$snapshot_fixture/src" "$snapshot_fixture/test"
+git -C "$snapshot_fixture" init -q -b main
+git -C "$snapshot_fixture" config user.name 'Controller Snapshot Test'
+git -C "$snapshot_fixture" config user.email 'snapshot@example.invalid'
+printf 'export const value = 1;\n' > "$snapshot_fixture/src/value.ts"
+printf 'test("value", () => {});\n' > "$snapshot_fixture/test/value.test.ts"
+printf 'bait\n' > "$snapshot_fixture/bait.txt"
+git -C "$snapshot_fixture" add .
+git -C "$snapshot_fixture" commit -qm fixture
+snapshot_manifest="$TEST_ROOT/manifests/oracle-snapshot.jsonl"
+valid_case "ORACLE-SNAPSHOT" \
+  | sed 's/"requires":{"toolchains":\["node"\]}/"requires":{}/' \
+  | sed 's/"context":{}/"context":{"merge_gate":"green","agent_prose":"AGENT_LAUNCH_PROSE_SENTINEL"}/' \
+  | sed 's/"oracles":\["TT-MISSING-O1","TT-MISSING-O2"\]/"oracles":["O1"]/' \
+  | sed 's/"forbidden":\[\]/"forbidden":["bait.txt"]/' \
+  | sed 's#"fixtures/tt-ts/src"#"src"#' \
+  > "$snapshot_manifest"
+snapshot_output=$(PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$workflow_events" \
+  CONTROLLER_WORKFLOW_MODE=oracle-prose run_recorded_campaign "$CONTROLLER" --manifest "$snapshot_manifest") \
+  || fail "workflow oracle snapshot campaign failed: $snapshot_output"
+snapshot_id=$(remember_campaign "$snapshot_output")
+node --input-type=module - "$TT_DIR/var/results/$snapshot_id/state.json" \
+  "$TT_DIR/var/results/$snapshot_id" "$WORKFLOW_REAL_DB" <<'NODE'
+import { createHash } from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+const [statePath, campaignDir, sourceDb] = process.argv.slice(2);
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const attempt = state.cases[0].attempts[0];
+const oracleResult = state.cases[0].oracle_results?.[0];
+if (attempt.oracle_evidence?.status !== 'COMPLETE'
+    || oracleResult?.status !== 'VALID' || oracleResult.response?.result !== 'FAIL'
+    || !oracleResult.response?.findings?.some(finding => finding.id === 'O1_DB_RUN_MISSING')) {
+  throw new Error(`oracle snapshot did not complete before invocation: ${JSON.stringify(state.cases[0])}`);
+}
+for (const [key, reference] of Object.entries(attempt.oracle_evidence.references)) {
+  if (reference === null) throw new Error(`snapshot omitted ${key}`);
+  const file = path.join(campaignDir, reference.path);
+  const digest = createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+  if (digest !== reference.sha256 || (fs.statSync(file).mode & 0o222) !== 0) {
+    throw new Error(`snapshot provenance/immutability failed for ${key}`);
+  }
+}
+const context = fs.readFileSync(path.join(campaignDir, state.cases[0].oracle_results[0].context), 'utf8');
+if (context.includes(sourceDb) || context.includes(`${process.env.HOME}/.tamandua`)) {
+  throw new Error('oracle context leaked a source or production database path');
+}
+const launchIntent = fs.readFileSync(path.join(campaignDir, attempt.oracle_evidence.references.launch_intent.path), 'utf8');
+if (launchIntent.includes('AGENT_LAUNCH_PROSE_SENTINEL') || !launchIntent.includes('merge_gate=green')) {
+  throw new Error(`launch intent leaked prose or omitted gate policy: ${launchIntent}`);
+}
+NODE
+
+battery_oracles="$TEST_ROOT/gating-oracles"
+mkdir -p "$battery_oracles"
+cat > "$battery_oracles/oracle" <<'NODE'
+#!/usr/bin/env node
+import { createHash } from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+const contextIndex = process.argv.indexOf('--context');
+const contextPath = process.argv[contextIndex + 1];
+if (process.argv[2] !== '--contract-version' || process.argv[3] !== '1'
+    || !path.isAbsolute(contextPath) || contextPath !== process.env.TT_ORACLE_CONTEXT) process.exit(9);
+const context = JSON.parse(fs.readFileSync(contextPath, 'utf8'));
+let campaignDir = path.dirname(contextPath);
+while (!fs.existsSync(path.join(campaignDir, 'state.json'))) {
+  const parent = path.dirname(campaignDir);
+  if (parent === campaignDir) process.exit(8);
+  campaignDir = parent;
+}
+for (const reference of Object.values(context.mechanical_evidence.references)) {
+  if (reference === null) process.exit(7);
+  const bytes = fs.readFileSync(path.join(campaignDir, reference.path));
+  if (createHash('sha256').update(bytes).digest('hex') !== reference.sha256) process.exit(6);
+}
+const evidenceName = `${context.oracle_id.toLowerCase()}-controller-observation.json`;
+fs.writeFileSync(path.join(process.env.TT_ORACLE_EVIDENCE_DIR, evidenceName), `${JSON.stringify({
+  oracle_id: context.oracle_id, contract_version: context.contract_version,
+  context_absolute: path.isAbsolute(contextPath), reference_count: Object.keys(context.mechanical_evidence.references).length,
+})}\n`, { flag: 'wx' });
+const planted = process.env.TT_CASE_ID === 'ORACLE-BATTERY-FAIL' && context.oracle_id === 'O11';
+const now = new Date().toISOString();
+console.log(JSON.stringify({
+  contract_version: 1, oracle_id: context.oracle_id, result: planted ? 'FAIL' : 'PASS',
+  started_at: now, finished_at: now,
+  findings: planted ? [{ id: 'O11_PLANTED_CONTROLLER_FAILURE', summary: 'planted mechanical controller integration failure' }] : [],
+  evidence: [{ path: evidenceName, kind: 'controller-integration' }],
+}));
+process.exit(planted ? 1 : 0);
+NODE
+chmod +x "$battery_oracles/oracle"
+for oracle_id in O1 O2 O3z O8 O9 O10 O11; do
+  cp "$battery_oracles/oracle" "$battery_oracles/$oracle_id"
+  chmod +x "$battery_oracles/$oracle_id"
+done
+
+for battery_case in ORACLE-BATTERY ORACLE-BATTERY-FAIL; do
+  rm -rf -- "$TT_DIR/var/fixtures/work/$battery_case"
+  mkdir -p "$TT_DIR/var/fixtures/work/$battery_case"
+  cp -R "$snapshot_fixture" "$TT_DIR/var/fixtures/work/$battery_case/tt-ts"
+  battery_manifest="$TEST_ROOT/manifests/${battery_case,,}.jsonl"
+  valid_case "$battery_case" \
+    | sed 's/"requires":{"toolchains":\["node"\]}/"requires":{}/' \
+    | sed 's/"oracles":\["TT-MISSING-O1","TT-MISSING-O2"\]/"oracles":["O1","O2","O3z","O8","O9","O10","O11"]/' \
+    | sed 's/"forbidden":\[\]/"forbidden":["bait.txt"]/' \
+    | sed 's#"fixtures/tt-ts/src"#"src"#' \
+    > "$battery_manifest"
+  set +e
+  battery_output=$(PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$workflow_events" \
+    CONTROLLER_WORKFLOW_MODE=oracle-prose TT_CONTROLLER_SELF_TEST=1 \
+    TT_CONTROLLER_SELF_TEST_ORACLES_ROOT="$battery_oracles" \
+    "$CONTROLLER" --manifest "$battery_manifest" 2>&1)
+  battery_status=$?
+  set -e
+  expected_battery_status=0
+  [ "$battery_case" = "ORACLE-BATTERY-FAIL" ] && expected_battery_status=1
+  [ "$battery_status" -eq "$expected_battery_status" ] \
+    || fail "$battery_case exited $battery_status instead of $expected_battery_status: $battery_output"
+  battery_id=$(remember_campaign "$battery_output")
+  node --input-type=module - "$TT_DIR/var/results/$battery_id/state.json" \
+    "$TT_DIR/var/results/$battery_id" "$battery_case" <<'NODE'
+import { createHash } from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+const [statePath, campaignDir, caseId] = process.argv.slice(2);
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const item = state.cases[0];
+const ids = ['O1', 'O2', 'O3z', 'O8', 'O9', 'O10', 'O11'];
+if (item.oracle_results?.length !== ids.length
+    || JSON.stringify(item.oracle_results.map(result => result.oracle_id)) !== JSON.stringify(ids)
+    || item.oracle_results.some(result => result.status !== 'VALID')) {
+  throw new Error(`controller did not discover and validate the gating battery: ${JSON.stringify(item)}`);
+}
+for (const result of item.oracle_results) {
+  if (result.argv[1] !== '--contract-version' || result.argv[2] !== '1' || result.argv[3] !== '--context') {
+    throw new Error(`wrong persisted oracle argv: ${JSON.stringify(result.argv)}`);
+  }
+  for (const [fileKey, hashKey] of [['stdout', 'stdout_sha256'], ['stderr', 'stderr_sha256'], ['context', 'context_sha256']]) {
+    const bytes = fs.readFileSync(path.join(campaignDir, result[fileKey]));
+    if (createHash('sha256').update(bytes).digest('hex') !== result[hashKey]) throw new Error(`${result.oracle_id} ${fileKey} hash mismatch`);
+  }
+  for (const evidence of result.response.evidence) {
+    const bytes = fs.readFileSync(path.join(campaignDir, path.dirname(result.context), evidence.path));
+    if (createHash('sha256').update(bytes).digest('hex') !== evidence.sha256) throw new Error(`${result.oracle_id} evidence hash mismatch`);
+  }
+  const context = JSON.parse(fs.readFileSync(path.join(campaignDir, result.context), 'utf8'));
+  for (const reference of Object.values(context.mechanical_evidence.references)) {
+    if (reference === null || createHash('sha256').update(fs.readFileSync(path.join(campaignDir, reference.path))).digest('hex') !== reference.sha256) {
+      throw new Error(`${result.oracle_id} referenced mechanical evidence was not hash-pinned`);
+    }
+  }
+}
+if (caseId === 'ORACLE-BATTERY') {
+  if (item.outcome !== 'PASS' || item.oracle_results.some(result => result.response.result !== 'PASS')) {
+    throw new Error(`synthetic harvested run did not persist seven green responses: ${JSON.stringify(item)}`);
+  }
+} else {
+  const planted = item.oracle_results.find(result => result.oracle_id === 'O11');
+  if (item.outcome !== 'PRODUCT_FAIL' || item.reason?.category !== 'oracle-failed'
+      || planted?.response?.result !== 'FAIL'
+      || !planted.response.findings.some(finding => finding.id === 'O11_PLANTED_CONTROLLER_FAILURE')) {
+    throw new Error(`planted failure was not a named PRODUCT_FAIL: ${JSON.stringify(item)}`);
+  }
+}
+NODE
+  rm -rf -- "$TT_DIR/var/fixtures/work/$battery_case"
+done
+pass "controller discovers, invokes, hashes, validates, and classifies the seven-oracle battery"
+
+rm -rf -- "$snapshot_fixture"
+pass "controller harvests immutable complete evidence before invoking the real O1 gating oracle"
 
 direct_workflow_manifest="$TEST_ROOT/manifests/workflow-direct.jsonl"
 valid_case "WORKFLOW-DIRECT" \
@@ -1218,6 +1589,9 @@ if (child.started_at !== childStartedAt
 if (discovered.some(run => run.phase !== 'terminal' || run.terminal_status !== 'completed')) {
   throw new Error(`campaign finished with a nonterminal discovered run: ${JSON.stringify(discovered)}`);
 }
+if (discovered.some(run => run.execution_mode !== item.attempts[0].execution_mode)) {
+  throw new Error(`discovered runs did not inherit root launch execution mode: ${JSON.stringify(discovered)}`);
+}
 if (discovered.some(run => run.wait_exit_code !== 0 || run.wait_json?.runs?.[0]?.status !== 'completed'
     || !Array.isArray(run.steps_snapshot?.steps) || run.steps_snapshot?.source !== 'workflow-status-json')) {
   throw new Error(`discovered run harvest evidence is incomplete: ${JSON.stringify(discovered)}`);
@@ -1283,7 +1657,10 @@ const stops = fs.readFileSync(eventsPath, 'utf8').trim().split('\n').map(line =>
     && event.argv[2] === child.run_id);
 if (child.phase !== 'terminal' || child.terminal_status !== 'completed'
     || child.reattach_count !== 2 || waits.length !== 2 || stops.length !== 1
-    || child.stop_reason?.cap !== 'wall_min') {
+    || child.stop_reason?.cap !== 'wall_min'
+    || child.straggler_capture?.stop_intent_at !== child.stop_intent_at
+    || child.straggler_capture?.reason?.cap !== 'wall_min'
+    || !Array.isArray(child.straggler_capture?.steps_snapshot?.steps)) {
   throw new Error(`resume did not bound and reattach the persisted discovered run: ${JSON.stringify({child,waits,stops})}`);
 }
 if (state.cases[0].spend.tokens_observed !== 23 || state.spend.tokens_observed !== 23) {
@@ -1333,6 +1710,11 @@ if (item.phase !== 'terminal' || attempt.phase !== 'terminal' || !attempt.termin
 }
 if (attempt.stop?.exit_code !== 0 || attempt.terminal_wait?.exit_code !== 3) {
   throw new Error(`stop/wait evidence missing: ${JSON.stringify(attempt)}`);
+}
+if (attempt.straggler_capture?.stop_intent_at !== attempt.stop_intent_at
+    || attempt.straggler_capture?.reason?.cap !== (mode === 'token-cap' ? 'tokens' : 'wall_min')
+    || !Array.isArray(attempt.straggler_capture?.steps_snapshot?.steps)) {
+  throw new Error(`mechanical pre-stop straggler capture missing: ${JSON.stringify(attempt.straggler_capture)}`);
 }
 const finding = item.findings?.find(entry => entry.type === 'RUNAWAY');
 const expectedKind = mode === 'token-cap' ? 'tokens' : 'wall_min';
@@ -1934,9 +2316,10 @@ pass "campaign verdict exits are 0 green/predicate, 1 finding, and 2 infrastruct
 
 smoke_manifest="$TT_DIR/cases/smoke.jsonl"
 [ -f "$smoke_manifest" ] || fail "smoke.jsonl is missing"
-golden_root="$TT_DIR/var/fixtures/golden"
+golden_root="$TEST_ROOT/smoke-golden"
 mkdir -p "$golden_root"
-for fixture_name in "tt-selftest-a-$$" "tt-selftest-b-$$"; do
+for fixture_name in tt-python tt-ts tt-go tt-java tt-rust tt-poly-lite tt-poly \
+    "tt-selftest-a-$$" "tt-selftest-b-$$"; do
   fixture_path="$golden_root/$fixture_name.git"
   git init --bare --quiet "$fixture_path"
   git --git-dir="$fixture_path" symbolic-ref HEAD refs/heads/main
@@ -1946,10 +2329,10 @@ for fixture_name in "tt-selftest-a-$$" "tt-selftest-b-$$"; do
     GIT_COMMITTER_EMAIL='tt@example.invalid' GIT_COMMITTER_DATE='2026-01-01T00:00:00Z' \
     git --git-dir="$fixture_path" commit-tree "$fixture_tree")
   git --git-dir="$fixture_path" update-ref refs/heads/main "$fixture_commit"
-  SMOKE_GOLDENS+=("$fixture_path")
+  printf 'BASELINE=%s\n' "$fixture_commit" > "$golden_root/$fixture_name.git.hashes"
 done
 set +e
-smoke_output=$("$CONTROLLER" --manifest "$smoke_manifest" 2>&1)
+smoke_output=$(TEST_GOLDEN_ROOT="$golden_root" "$CONTROLLER" --manifest "$smoke_manifest" 2>&1)
 smoke_status=$?
 set -e
 [ "$smoke_status" -eq 0 ] || fail "zero-token smoke campaign exited $smoke_status: $smoke_output"

@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "contract_version": 1,
+  "runtime_root": "torture-test/var",
+  "cases": [
+    {
+      "id": "o2-phantom-merge",
+      "oracle_id": "O2",
+      "source_fixture": "o2-phantom-merge",
+      "expected_result": "FAIL",
+      "expected_finding": "O2_PHANTOM_MERGE"
+    },
+    {
+      "id": "o9-stale-replay",
+      "oracle_id": "O9",
+      "source_fixture": "o9-stale-replay",
+      "expected_result": "FAIL",
+      "expected_finding": "O9_REPLAY_STALE"
+    },
+    {
+      "id": "o11-cross-charge",
+      "oracle_id": "O11",
+      "source_fixture": "o11-calibration-cross-charge",
+      "expected_result": "FAIL",
+      "expected_finding": "O11_CROSS_CHARGE"
+    }
+  ]
+}

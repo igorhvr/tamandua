@@ -464,6 +464,8 @@ describe("tamandua-test shim", { concurrency: 1 }, () => {
 
   it("refuses a modified tracked file before replay or execution, then records after commit", async () => {
     const env = shimChildEnv(controlEnv);
+    writeFileSync(join(repoDir, "o9-junk-probe.tmp"), "untracked\n");
+    env.TAMANDUA_TSTX_JUNK_PROBE = "o9-junk-probe.tmp";
 
     // Prime the cache.
     const r1 = await runShim(
@@ -495,6 +497,12 @@ describe("tamandua-test shim", { concurrency: 1 }, () => {
     assert.match(r3.stderr, /^\(the merge gate verifies the committed tree: git rev-parse HEAD\^\{tree\}\)\.$/m);
     assert.match(r3.stderr, /README\.md/);
     assert.match(r3.stderr, /^ACTION: commit or discard these, then re-run the suite via the shim\.$/m);
+    const dirtySpecial = readFileSync(join(controlEnv.stateDir, "events", "r-ac2.jsonl"), "utf8")
+      .trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>)
+      .find((event) => event.event === "suite.special_exit_observed" && event.stepId === "s3");
+    assert.equal(dirtySpecial?.shimExitCode, 88);
+    assert.equal(dirtySpecial?.trackedDirty, true);
+    assert.equal(dirtySpecial?.junkProbeTracked, false);
 
     execSync("git add README.md && git commit -m 'tracked change'", { cwd: repoDir });
     const r4 = await runShim(
@@ -761,6 +769,7 @@ describe("tamandua-test shim", { concurrency: 1 }, () => {
         "#!/bin/sh\ntrap 'echo CHILD RECEIVED TERMINATION >&2; exit 99' TERM INT\necho 'INTERRUPTIBLE SUITE STARTED'\nwhile :; do sleep 1; done\n",
       );
       chmodSync(script, 0o755);
+      writeFileSync(join(fixture.repoDir, "o9-junk-probe.tmp"), "untracked\n");
       const runId = `r-interrupted-${signal.toLowerCase()}`;
       const stepId = `s-interrupted-${signal.toLowerCase()}`;
       const { committedTreeHash, computeCmdHash, getOriginRepo } = await import(
@@ -773,7 +782,7 @@ describe("tamandua-test shim", { concurrency: 1 }, () => {
 
       const result = await runInterruptedShim(
         ["--repo", fixture.repoDir, "--run", runId, "--step", stepId, "--", script],
-        shimChildEnv(controlEnv),
+        { ...shimChildEnv(controlEnv), TAMANDUA_TSTX_JUNK_PROBE: "o9-junk-probe.tmp" },
         signal,
       );
       assert.equal(result.exitCode, 87, "interrupted executions use the documented shim exit code");
@@ -800,6 +809,12 @@ describe("tamandua-test shim", { concurrency: 1 }, () => {
       assert.match(rows[0]!.log_tail ?? "", new RegExp(`KILLED by external ${signal}`));
       assert.match(rows[0]!.log_tail ?? "", /NO USABLE EVIDENCE/);
       assert.match(rows[0]!.log_tail ?? "", /CHILD RECEIVED TERMINATION/);
+      const special = readFileSync(join(controlEnv.stateDir, "events", `${runId}.jsonl`), "utf8")
+        .trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>)
+        .find((event) => event.event === "suite.special_exit_observed");
+      assert.equal(special?.shimExitCode, 87);
+      assert.equal(special?.interrupted, true);
+      assert.equal(special?.junkProbeTracked, false);
     });
   }
 
@@ -872,6 +887,7 @@ describe("tamandua-test shim", { concurrency: 1 }, () => {
     const script = join(fixture.repoDir, `mutate-${name}.sh`);
     writeFileSync(script, `#!/bin/sh\n${scriptBody}\n`);
     chmodSync(script, 0o755);
+    writeFileSync(join(fixture.repoDir, "o9-junk-probe.tmp"), "untracked\n");
 
     const { committedTreeHash, computeCmdHash, getOriginRepo } = await import(
       "../../dist/suite/tree-hash.js"
@@ -884,7 +900,7 @@ describe("tamandua-test shim", { concurrency: 1 }, () => {
 
     const result = await runShim(
       ["--repo", fixture.repoDir, "--run", runId, "--step", "s-drift", "--", script],
-      shimChildEnv(controlEnv),
+      { ...shimChildEnv(controlEnv), TAMANDUA_TSTX_JUNK_PROBE: "o9-junk-probe.tmp" },
     );
     assert.equal(result.exitCode, expectedExitCode);
 
@@ -899,6 +915,16 @@ describe("tamandua-test shim", { concurrency: 1 }, () => {
       candidate.event === "suite.tree_drift_detected"
     );
     assert.ok(event, "tree drift should emit a suite.tree_drift_detected event");
+    const special = events.find((candidate: Record<string, unknown>) =>
+      candidate.event === "suite.special_exit_observed"
+    );
+    if (expectedExitCode === 86) {
+      assert.equal(special?.shimExitCode, expectedExitCode);
+      assert.equal(special?.ledgerRowId, null);
+      assert.equal(special?.junkProbeTracked, false);
+    } else {
+      assert.equal(special, undefined, "a command's own non-special exit must not be mislabeled as a shim exit");
+    }
 
     const thirdClaim = await controlPlanePost("/suite/claim", {
       origin_repo: originRepo,
@@ -1680,6 +1706,7 @@ exit 0
     assert.ok(executedEvent, "should have suite.executed event");
     assert.ok(typeof executedEvent.treeHash === "string" && executedEvent.treeHash.length > 0);
     assert.equal(executedEvent.exitCode, 0);
+    assert.equal(executedEvent.force, true, "forced execution intent must be mechanically observable");
 
     const cacheHitEvent = events.find((e: Record<string, unknown>) => e.event === "suite.cache_hit");
     assert.ok(cacheHitEvent, "should have suite.cache_hit event");
@@ -1688,6 +1715,7 @@ exit 0
     assert.ok(typeof cacheHitEvent.treeHash === "string" && cacheHitEvent.treeHash.length === 12);
     assert.ok(typeof cacheHitEvent.cmdDisplay === "string" && cacheHitEvent.cmdDisplay.length > 0);
     assert.ok(typeof cacheHitEvent.savedDurationMs === "number" && cacheHitEvent.savedDurationMs > 0);
+    assert.equal(cacheHitEvent.force, false, "cache hits must be mechanically identified as non-forced");
   });
 
   it("emits suite.flaky_detected event when flaky key exists", async () => {

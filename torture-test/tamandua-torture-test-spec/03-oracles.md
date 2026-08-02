@@ -262,11 +262,24 @@ Semantics folded from source reconciliation:
   raw-run) is the laundering shape.
 - Refusals carry the self-diagnosis block.
 
-**O11 — Output-contract enforcement (per run, gating).**
+**O11 — Output-contract and token-attribution enforcement (per run, gating).**
 No step completed without satisfying its expects; no `[missing: <key>]`
 rendered into any dispatched prompt; no run completed off a retry verdict;
-producer-key failures attributed to the producer; submit-time rejection
-texts are informed (distinct per attempt), not generic.
+producer-key failures attributed to the producer. Submit-time rejections retain
+ordered, distinct, actionable validation codes and missing/invalid-key metadata per
+claim attempt; a generic or collapsed rejection is a finding. The submitted output
+body and agent prose are never oracle inputs.
+
+Every `run.tokens.updated` delta must bind mechanically to exactly one
+`(run, step, round)` and one captured harness usage observation. Each run's stored
+`runs.tokens_spent` equals the sum of its attributed deltas; a scripted run equals
+its manifest-declared synthetic ledger exactly. Pi uses the usage trailer's product
+formula. Hermes uses input + output + cache_write, excluding cache_read and reasoning.
+A round/session may not be charged to another overlapping run (**no cross-charge**).
+Concurrent Hermes session-set evidence that cannot identify one run is an explicit
+attribution finding, never guessed or silently reconciled. O3z remains the independent
+coarse tripwire for completed-real-run nonzero spend and the legacy system counter's
+absolute zero; O11 proves the per-round ownership and per-run reconciliation legs.
 
 **O12 — DB invariants (post-batch).**
 `PRAGMA integrity_check` + `foreign_key_check` clean; explicit orphan

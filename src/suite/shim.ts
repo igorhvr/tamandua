@@ -488,6 +488,48 @@ async function main(): Promise<void> {
     return;
   }
 
+  const cmdHash = computeCmdHash(cmdString);
+  const originRepo = getOriginRepo(repoReal);
+  const ownerToken = randomUUID();
+  const claimOwnership: ClaimOwnership = {
+    ownerToken,
+    ownerPid: process.pid,
+    runId,
+    stepId,
+  };
+  const {
+    lookupSuiteRecord,
+    recordSuiteResult,
+    claimSuiteKey,
+    releaseSuiteKey,
+    emitSuiteEvent,
+  } = await import("../server/control-client.js");
+  const junkProbePath = process.env.TAMANDUA_TSTX_JUNK_PROBE;
+  const junkProbeTracked = (): boolean => junkProbePath !== undefined && spawnSync(
+    "git", ["ls-files", "--error-unmatch", "--", junkProbePath],
+    { cwd: repoReal, stdio: "ignore" },
+  ).status === 0;
+  const emitSpecialExit = async (details: {
+    shimExitCode: number;
+    commandExitCode: number | null;
+    preTreeHash: string;
+    postTreeHash: string;
+    ledgerRowId: number | null;
+    interrupted: boolean;
+    trackedDirty: boolean;
+  }): Promise<void> => {
+    if (!junkProbePath) return;
+    await emitSuiteEvent({
+      event: "suite.special_exit_observed", run_id: runId, step_id: stepId,
+      origin_repo: originRepo, tree_hash: details.preTreeHash, cmd_hash: cmdHash,
+      shim_exit_code: details.shimExitCode, command_exit_code: details.commandExitCode,
+      pre_tree_hash: details.preTreeHash, post_tree_hash: details.postTreeHash,
+      ledger_row_id: details.ledgerRowId, interrupted: details.interrupted,
+      tracked_dirty: details.trackedDirty, junk_probe_path: junkProbePath,
+      junk_probe_tracked: junkProbeTracked(),
+    }).catch(() => false);
+  };
+
   // A committed-tree green must never replay while tracked content differs
   // from that commit. Ignore untracked files by construction.
   const initialDirtyPaths = getTrackedDirtyPaths(repoReal);
@@ -497,6 +539,11 @@ async function main(): Promise<void> {
     return;
   }
   if (initialDirtyPaths.length > 0) {
+    await emitSpecialExit({
+      shimExitCode: TREE_DIRTY_EXIT_CODE, commandExitCode: null,
+      preTreeHash, postTreeHash: preTreeHash, ledgerRowId: null,
+      interrupted: false, trackedDirty: true,
+    });
     process.stderr.write(
       `FAILURE_CLASS: tree_dirty\n`
       + `FAILURE: uncommitted changes to tracked files — commit them before testing\n`
@@ -507,23 +554,6 @@ async function main(): Promise<void> {
     process.exit(TREE_DIRTY_EXIT_CODE);
   }
 
-  const cmdHash = computeCmdHash(cmdString);
-  const originRepo = getOriginRepo(repoReal);
-  const ownerToken = randomUUID();
-  const claimOwnership: ClaimOwnership = {
-    ownerToken,
-    ownerPid: process.pid,
-    runId,
-    stepId,
-  };
-
-  const {
-    lookupSuiteRecord,
-    recordSuiteResult,
-    claimSuiteKey,
-    releaseSuiteKey,
-    emitSuiteEvent,
-  } = await import("../server/control-client.js");
 
   const replayCachedResult = async (
     cachedResult: Record<string, unknown>,
@@ -561,11 +591,15 @@ async function main(): Promise<void> {
       event: "suite.cache_hit",
       run_id: runId,
       step_id: stepId,
+      origin_repo: originRepo,
       tree_hash: treeHash.slice(0, 12),
+      cmd_hash: cmdHash,
       cmd_display: cmdString.slice(0, 200),
       saved_duration_ms: typeof cachedResult.duration_ms === "number"
         ? cachedResult.duration_ms
         : undefined,
+      ledger_row_id: typeof cachedResult.id === "number" ? cachedResult.id : undefined,
+      force,
     }).catch(() => {
       // Best-effort — event emission failure must not block replay.
     });
@@ -856,6 +890,12 @@ async function main(): Promise<void> {
 
   // R9: Execute the command verbatim, streaming stdout/stderr through,
   //     preserving the exit code.
+  const executionStartedAt = new Date().toISOString();
+  await emitSuiteEvent({
+    event: "suite.execute_started", run_id: runId, step_id: stepId,
+    origin_repo: originRepo, tree_hash: preTreeHash, cmd_hash: cmdHash,
+    started_at: executionStartedAt,
+  }).catch(() => false);
   const { exitCode, durationMs, output } = await executeAndCapture(cmdString);
 
   // Reusable evidence requires byte-identical tracked content from command
@@ -865,7 +905,7 @@ async function main(): Promise<void> {
     const shortPre = trackedPre.slice(0, 12);
     const shortPost = trackedPost?.slice(0, 12) ?? "unavailable";
     const release = ownsClaim
-      ? releaseSuiteKey(originRepo, preTreeHash, cmdHash, ownerToken).catch(() => false)
+      ? releaseSuiteKey(originRepo, preTreeHash, cmdHash, ownerToken, "tree_drift").catch(() => false)
       : Promise.resolve(false);
     const event = emitSuiteEvent({
       event: "suite.tree_drift_detected",
@@ -877,7 +917,18 @@ async function main(): Promise<void> {
     }).catch(() => {
       // Best-effort observability must not change drift handling.
     });
-    await Promise.all([release, event]);
+    const specialExit = exitCode === 0
+      ? emitSpecialExit({
+        shimExitCode: TREE_DRIFT_EXIT_CODE,
+        commandExitCode: exitCode,
+        preTreeHash: trackedPre,
+        postTreeHash: trackedPost ?? trackedPre,
+        ledgerRowId: null,
+        interrupted: false,
+        trackedDirty: false,
+      })
+      : Promise.resolve();
+    await Promise.all([release, event, specialExit]);
     const reason = trackedPost === null
       ? `post-run tree hash unavailable (pre ${shortPre})`
       : `tree changed during test execution (pre ${shortPre}, post ${shortPost})`;
@@ -894,7 +945,7 @@ async function main(): Promise<void> {
       ? output.slice(-LOG_TAIL_KB * 1024)
       : output || null;
 
-    await recordSuiteResult({
+    const recorded = await recordSuiteResult({
       origin_repo: originRepo,
       tree_hash: preTreeHash,
       cmd_hash: cmdHash,
@@ -904,11 +955,24 @@ async function main(): Promise<void> {
       log_tail: logTail,
       run_id: runId || null,
       step_id: stepId || null,
+      force,
+      started_at: executionStartedAt,
     });
+    if (exitCode === INTERRUPTED_EXIT_CODE) {
+      await emitSpecialExit({
+        shimExitCode: INTERRUPTED_EXIT_CODE,
+        commandExitCode: INTERRUPTED_EXIT_CODE,
+        preTreeHash,
+        postTreeHash: preTreeHash,
+        ledgerRowId: recorded?.id ?? null,
+        interrupted: true,
+        trackedDirty: false,
+      });
+    }
     if (ownsClaim && exitCode === INTERRUPTED_EXIT_CODE) {
       // Recording normally clears the claim. This exact owner-token release
       // covers partial cancellation writes without touching another owner.
-      await releaseSuiteKey(originRepo, preTreeHash, cmdHash, ownerToken).catch(() => false);
+      await releaseSuiteKey(originRepo, preTreeHash, cmdHash, ownerToken, "cancel").catch(() => false);
     }
   } catch {
     // R11: Recording failure — warn and continue.

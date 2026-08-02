@@ -7,6 +7,15 @@ import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { OUTCOMES, classifyAttempt, providerRetryDecision } from './tt-classification.mjs';
+import {
+  GATING_ORACLE_IDS,
+  createOracleContext,
+  validateOracleContext,
+} from './oracle-context.mjs';
+import {
+  beginOracleEvidenceSnapshot,
+  completeOracleEvidenceSnapshot,
+} from './oracle-evidence-snapshot.mjs';
 import { writeCampaignReports } from './tt-report.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -22,7 +31,9 @@ const DAEMON_CONTROL_PATH = process.env.TT_CONTROLLER_DAEMON_CONTROL_PATH === un
   ? path.join(TT_ROOT, 'bin', 'daemon-control')
   : path.resolve(process.env.TT_CONTROLLER_DAEMON_CONTROL_PATH);
 const HOOK_RUNNER_PATH = path.join(TT_ROOT, 'bin', 'tt-hook-runner');
-const ORACLES_ROOT = path.join(TT_ROOT, 'oracles');
+const O9_TARGETED_PROBES_PATH = path.join(TT_ROOT, 'bin', 'o9-targeted-probes.mjs');
+const DEFAULT_ORACLES_ROOT = path.join(TT_ROOT, 'oracles');
+const ORACLES_ROOT = resolveOraclesRoot();
 const ORACLE_CONTRACT_VERSION = 1;
 const STATE_VERSION = 1;
 const DEFAULT_CONCURRENCY = 1;
@@ -31,6 +42,22 @@ const DEFAULT_TOKEN_POLL_INTERVAL_MS = 5 * 60_000;
 const DEFAULT_PROVIDER_RETRY_BACKOFF_MS = 60_000;
 const EVIDENCE_LIMIT_BYTES = 16 * 1024 * 1024;
 const TERMINAL_RUN_STATUSES = new Set(['completed', 'done', 'failed', 'canceled']);
+
+function resolveOraclesRoot() {
+  const override = process.env.TT_CONTROLLER_SELF_TEST_ORACLES_ROOT;
+  if (override === undefined) return DEFAULT_ORACLES_ROOT;
+  if (process.env.TT_CONTROLLER_SELF_TEST !== '1') {
+    throw new Error('TT_CONTROLLER_SELF_TEST_ORACLES_ROOT requires TT_CONTROLLER_SELF_TEST=1');
+  }
+  const candidate = path.resolve(override);
+  const details = fs.lstatSync(candidate);
+  const realVarRoot = fs.realpathSync(VAR_ROOT);
+  const realCandidate = fs.realpathSync(candidate);
+  if (!details.isDirectory() || details.isSymbolicLink() || !pathIsWithin(realVarRoot, realCandidate)) {
+    throw new Error('self-test oracle root must be a contained regular directory beneath torture-test/var');
+  }
+  return realCandidate;
+}
 
 function usage() {
   console.log(`Usage: tt-controller --manifest <path> [options]
@@ -1103,86 +1130,6 @@ function markTerminal(state, caseState, campaignDir, outcome, reason) {
   atomicWriteState(campaignDir, state);
 }
 
-const ORACLE_MECHANICAL_STEP_FIELDS = [
-  'stepId', 'step_id',
-  'agentId', 'agent_id',
-  'status', 'type',
-  'currentStoryId', 'current_story_id',
-  'retryCount', 'retry_count',
-  'stepIndex', 'step_index',
-  'abandonedCount', 'abandoned_count',
-  'rerouteCount', 'reroute_count',
-  'claimPid', 'claim_pid',
-  'claimUpdatedAt', 'claim_updated_at',
-  'updatedAt', 'updated_at',
-];
-
-function oracleStepsSnapshot(snapshot) {
-  if (!isObject(snapshot) || !Array.isArray(snapshot.steps)) return null;
-  return {
-    source: snapshot.source,
-    captured_at: snapshot.captured_at,
-    provenance: snapshot.provenance,
-    steps: snapshot.steps.map((step) => {
-      if (!isObject(step)) return {};
-      return Object.fromEntries(ORACLE_MECHANICAL_STEP_FIELDS
-        .filter((field) => Object.hasOwn(step, field))
-        .map((field) => [field, step[field]]));
-    }),
-  };
-}
-
-function oracleContext(caseRecord, caseState, state, oracleId) {
-  const attempts = caseState.attempts.map((attempt) => ({
-    id: attempt.id,
-    kind: attempt.kind,
-    phase: attempt.phase,
-    run_id: attempt.run_id ?? null,
-    started_at: attempt.started_at,
-    terminal_at: attempt.terminal_at ?? null,
-    terminal_status: attempt.terminal_status ?? null,
-    tokens_observed: attempt.tokens_observed ?? 0,
-    command: attempt.command === undefined ? null : {
-      exit_code: attempt.command.exit_code,
-      signal: attempt.command.signal,
-      stdout: attempt.command.stdout,
-      stderr: attempt.command.stderr,
-    },
-    terminal_evidence: attempt.terminal_evidence ?? null,
-    steps_snapshot: oracleStepsSnapshot(attempt.steps_snapshot),
-  }));
-  return {
-    contract_version: ORACLE_CONTRACT_VERSION,
-    oracle_id: oracleId,
-    campaign: { id: state.campaign_id, created_at: state.created_at, manifest: state.manifest },
-    case: {
-      id: caseRecord.id,
-      wave: caseRecord.wave,
-      workflow: caseRecord.workflow,
-      fixture: caseRecord.fixture,
-      harness: caseRecord.harness,
-      class: caseRecord.class,
-      context: caseRecord.context,
-      caps: caseRecord.caps,
-      boundary_files: caseRecord.boundary_files,
-      forbidden: caseRecord.forbidden,
-      chaos: caseRecord.chaos,
-    },
-    run_id: attempts.findLast((attempt) => attempt.run_id !== null)?.run_id ?? null,
-    attempts,
-    discovered_runs: (state.discovered_runs ?? [])
-      .filter((run) => run.root_case_id === caseRecord.id)
-      .map((run) => ({
-        run_id: run.run_id,
-        parent_run_id: run.parent_run_id,
-        phase: run.phase,
-        terminal_status: run.terminal_status ?? null,
-        terminal_evidence: run.terminal_evidence ?? null,
-        steps_snapshot: oracleStepsSnapshot(run.steps_snapshot),
-      })),
-  };
-}
-
 function oracleExecutable(oracleId) {
   const candidate = path.join(ORACLES_ROOT, oracleId);
   try {
@@ -1195,6 +1142,110 @@ function oracleExecutable(oracleId) {
   } catch {
     return null;
   }
+}
+
+function caseNeedsGatingEvidence(caseRecord) {
+  return caseRecord.oracles.some((oracleId) =>
+    GATING_ORACLE_IDS.includes(oracleId) && oracleExecutable(oracleId) !== null);
+}
+
+function oracleSnapshotInput(caseRecord, caseState, attempt, state, campaignDir, childEnv) {
+  const stateDir = childEnv.TAMANDUA_STATE_DIR;
+  const databasePath = resolveChildDatabasePath(childEnv);
+  if (typeof stateDir !== 'string' || !path.isAbsolute(stateDir) || databasePath === null) {
+    throw new Error('controller-provided TT state is unavailable for oracle snapshot');
+  }
+  return {
+    ttRoot: TT_ROOT,
+    campaignDir,
+    stateDir: path.resolve(stateDir),
+    databasePath,
+    repositoryPath: path.join(VAR_ROOT, 'fixtures', 'work', caseRecord.id, caseRecord.fixture),
+    caseRecord,
+    attempt,
+    launchArgv: ['tamandua', ...workflowRunArgs(caseRecord)],
+    discoveredRuns: (state.discovered_runs ?? []).filter((run) => run.root_case_id === caseState.id),
+  };
+}
+
+function beginCaseOracleSnapshot(caseRecord, caseState, attempt, state, campaignDir, childEnv) {
+  if (!caseNeedsGatingEvidence(caseRecord)) return;
+  attempt.oracle_evidence = {
+    schema_version: ORACLE_CONTRACT_VERSION,
+    status: 'RUNNING',
+    ledger_path: `snapshots/${caseRecord.id}/${attempt.id}/snapshot.json`,
+    references: {},
+  };
+  state.updated_at = utcTimestamp();
+  atomicWriteState(campaignDir, state);
+  attempt.oracle_evidence = {
+    schema_version: ORACLE_CONTRACT_VERSION,
+    ...beginOracleEvidenceSnapshot(
+      oracleSnapshotInput(caseRecord, caseState, attempt, state, campaignDir, childEnv),
+    ),
+  };
+  state.updated_at = utcTimestamp();
+  atomicWriteState(campaignDir, state);
+}
+
+function runCaseO9TargetedProbes(caseRecord, attempt, state, campaignDir, childEnv) {
+  if (!caseRecord.oracles.includes('O9') || caseRecord.chaos?.o9_special_exits !== true) return;
+  if (attempt.o9_targeted_probes?.status === 'COMPLETE') return;
+  if (attempt.o9_targeted_probes?.status === 'RUNNING') {
+    throw new Error('controller stopped while targeted O9 probes were in flight; classified TEST_INFRA');
+  }
+  const repositoryPath = path.join(VAR_ROOT, 'fixtures', 'work', caseRecord.id, caseRecord.fixture);
+  attempt.o9_targeted_probes = { status: 'RUNNING', started_at: utcTimestamp() };
+  state.updated_at = attempt.o9_targeted_probes.started_at;
+  atomicWriteState(campaignDir, state);
+  const result = spawnSync(process.execPath, [
+    O9_TARGETED_PROBES_PATH,
+    '--repo', repositoryPath,
+    '--run', attempt.run_id,
+    '--step-prefix', `${caseRecord.id}-o9`,
+    '--shim', path.join(TT_ROOT, '..', 'bin', 'tamandua-test'),
+  ], {
+    cwd: TT_ROOT,
+    env: { ...childEnv, TAMANDUA_TSTX_JUNK_PROBE: '.git/tamandua-o9-junk-probe' },
+    encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024, shell: false,
+  });
+  if (result.error !== undefined || result.status !== 0 || result.signal !== null) {
+    throw new Error(`targeted O9 probes failed: ${result.error?.message ?? result.stderr?.trim() ?? result.signal ?? `exit ${result.status}`}`);
+  }
+  let evidence;
+  try {
+    evidence = JSON.parse(result.stdout.trim());
+  } catch (error) {
+    throw new Error(`targeted O9 probes emitted invalid evidence: ${error.message}`);
+  }
+  if (JSON.stringify(evidence.exits) !== JSON.stringify([86, 87, 88])
+      || evidence.junk_probe_tracked !== false) {
+    throw new Error('targeted O9 probes omitted required 86/87/88 or junk-probe evidence');
+  }
+  attempt.o9_targeted_probes = { status: 'COMPLETE', finished_at: utcTimestamp(), evidence };
+  state.updated_at = attempt.o9_targeted_probes.finished_at;
+  atomicWriteState(campaignDir, state);
+}
+
+function completeCaseOracleSnapshot(caseRecord, caseState, attempt, state, campaignDir, childEnv) {
+  if (!caseNeedsGatingEvidence(caseRecord)) return;
+  if (attempt.oracle_evidence?.status === 'COMPLETE') return;
+  if (attempt.oracle_evidence?.status !== 'BASELINE_CAPTURED') {
+    throw new Error('oracle evidence snapshot was interrupted or is partial; classified TEST_INFRA');
+  }
+  runCaseO9TargetedProbes(caseRecord, attempt, state, campaignDir, childEnv);
+  attempt.oracle_evidence = completeOracleEvidenceSnapshot(
+    oracleSnapshotInput(caseRecord, caseState, attempt, state, campaignDir, childEnv),
+    attempt.oracle_evidence,
+  );
+  if (attempt.o9_targeted_probes?.status === 'COMPLETE') {
+    const repositoryPath = oracleSnapshotInput(
+      caseRecord, caseState, attempt, state, campaignDir, childEnv,
+    ).repositoryPath;
+    fs.rmSync(path.join(repositoryPath, attempt.o9_targeted_probes.evidence.junk_probe_path), { force: true });
+  }
+  state.updated_at = utcTimestamp();
+  atomicWriteState(campaignDir, state);
 }
 
 function validateOracleResponse(response, oracleId, exitCode, evidenceDir) {
@@ -1294,6 +1345,9 @@ function runCaseOracles(caseRecord, caseState, state, campaignDir, childEnv) {
   caseState.oracle_results ??= [];
   const attempt = caseState.attempts.at(-1);
   const attemptId = attempt?.id ?? 'case-without-attempt';
+  if (attempt !== undefined) {
+    completeCaseOracleSnapshot(caseRecord, caseState, attempt, state, campaignDir, childEnv);
+  }
   for (const oracleId of caseRecord.oracles) {
     const prior = caseState.oracle_results.find((result) => result.oracle_id === oracleId
       && (result.attempt_id ?? 'attempt-1') === attemptId);
@@ -1328,7 +1382,10 @@ function runCaseOracles(caseRecord, caseState, state, campaignDir, childEnv) {
     const contextPath = path.join(evidenceDir, 'context.json');
     const stdoutPath = path.join(evidenceDir, 'stdout.json');
     const stderrPath = path.join(evidenceDir, 'stderr.txt');
-    const input = oracleContext(caseRecord, caseState, state, oracleId);
+    const input = createOracleContext({ caseRecord, caseState, state, oracleId });
+    const contextErrors = validateOracleContext(input, campaignDir, {
+      requireOracleEvidence: GATING_ORACLE_IDS.includes(oracleId),
+    });
     fs.writeFileSync(contextPath, `${JSON.stringify(input, null, 2)}\n`,
       { encoding: 'utf8', mode: 0o400, flag: 'wx' });
     const startedAt = utcTimestamp();
@@ -1339,11 +1396,21 @@ function runCaseOracles(caseRecord, caseState, state, campaignDir, childEnv) {
       executable: `oracles/${oracleId}`,
       argv: [`oracles/${oracleId}`, '--contract-version', '1', '--context', evidenceRelativePath(campaignDir, contextPath)],
       context: evidenceRelativePath(campaignDir, contextPath),
+      context_sha256: sha256(fs.readFileSync(contextPath)),
       started_at: startedAt,
     };
     caseState.oracle_results.push(record);
     state.updated_at = startedAt;
     atomicWriteState(campaignDir, state);
+
+    if (contextErrors.length > 0) {
+      record.status = 'TEST_INFRA';
+      record.finished_at = utcTimestamp();
+      record.errors = contextErrors;
+      state.updated_at = record.finished_at;
+      atomicWriteState(campaignDir, state);
+      continue;
+    }
 
     const result = spawnSync(executable, ['--contract-version', '1', '--context', contextPath], {
       cwd: evidenceDir,
@@ -2083,16 +2150,20 @@ function rootRunAttribution(state) {
   return attribution;
 }
 
-function discoveredRunRecord(run, runId, parentRunId, caseRecord, rootCaseId) {
+function discoveredRunRecord(run, runId, parentRunId, caseRecord, rootCaseId, executionMode) {
   const startedAt = runStartedAt(run);
   if (startedAt === null) {
     throw new Error(`linked run ${runId} has no valid created/start timestamp`);
+  }
+  if (!['real', 'scripted'].includes(executionMode)) {
+    throw new Error(`linked run ${runId} has no mechanically identified execution mode`);
   }
   return {
     id: `discovered-${runId.slice(4)}`,
     case_id: rootCaseId,
     kind: 'discovered-workflow',
     phase: 'attached',
+    execution_mode: executionMode,
     run_id: runId,
     parent_run_id: parentRunId,
     root_case_id: rootCaseId,
@@ -2144,7 +2215,9 @@ function reconcileDiscoveredRuns(caseRecord, caseState, childEnv, state, campaig
           || discoveredById.has(runId)) continue;
       const rootCaseId = attribution.get(parentRunId);
       if (rootCaseId !== caseState.id) continue;
-      const record = discoveredRunRecord(listed, runId, parentRunId, caseRecord, rootCaseId);
+      const record = discoveredRunRecord(
+        listed, runId, parentRunId, caseRecord, rootCaseId, rootAttempt?.execution_mode,
+      );
       state.discovered_runs.push(record);
       discoveredById.set(runId, record);
       attribution.set(runId, rootCaseId);
@@ -2178,10 +2251,29 @@ function discoveredRunBreach(caseRecord, caseState, run) {
   return null;
 }
 
-async function stopDiscoveredRun(caseState, run, breach, childEnv, state, campaignDir) {
+function captureStragglerPreStop(run, status, breach, capturedAt) {
+  run.straggler_capture = {
+    captured_at: capturedAt,
+    stop_intent_at: capturedAt,
+    reason: {
+      cap: breach.cap,
+      threshold: breach.threshold,
+      observed: breach.observed,
+    },
+    steps_snapshot: {
+      source: 'workflow-status-json',
+      captured_at: capturedAt,
+      steps: Array.isArray(status.steps) ? status.steps : [],
+    },
+  };
+}
+
+async function stopDiscoveredRun(caseState, run, breach, childEnv, state, campaignDir, observedStatus) {
   if (run.stop_intent_at !== undefined) return;
   run.stop_intent_at = utcTimestamp();
   run.stop_reason = breach;
+  const status = observedStatus ?? queryWorkflowStatus(run.run_id, childEnv);
+  captureStragglerPreStop(run, status, breach, run.stop_intent_at);
   caseState.findings.push({
     type: 'RUNAWAY', ...breach, run_id: run.run_id, discovered: true,
     detected_at: run.stop_intent_at,
@@ -2229,7 +2321,7 @@ async function awaitDiscoveredRun(caseRecord, caseState, run, childEnv, state, c
     if (TERMINAL_RUN_STATUSES.has(status.status)) continue;
     const breach = discoveredRunBreach(caseRecord, caseState, run);
     if (breach !== null) {
-      await stopDiscoveredRun(caseState, run, breach, childEnv, state, campaignDir);
+      await stopDiscoveredRun(caseState, run, breach, childEnv, state, campaignDir, status);
       break;
     }
   }
@@ -2242,7 +2334,7 @@ async function awaitDiscoveredRun(caseRecord, caseState, run, childEnv, state, c
     if (breach === null) {
       throw new Error(`discovered run remained ${status.status} after workflow wait: ${run.run_id}`);
     }
-    await stopDiscoveredRun(caseState, run, breach, childEnv, state, campaignDir);
+    await stopDiscoveredRun(caseState, run, breach, childEnv, state, campaignDir, status);
     const terminalWait = await runHook(`discovered_terminal_wait_${run.reattach_count}`, {
       executable: 'tamandua', args: ['workflow', 'wait', run.run_id, '--json'], cwd: '.',
     }, childEnv, campaignDir, state, run, {
@@ -2315,6 +2407,7 @@ async function monitorWorkflowRun(caseRecord, caseState, attempt, childEnv, stat
     const detectedAt = utcTimestamp();
     attempt.stop_intent_at = detectedAt;
     attempt.stop_reason = breach;
+    captureStragglerPreStop(attempt, status, breach, detectedAt);
     caseState.findings.push({ type: 'RUNAWAY', ...breach, run_id: attempt.run_id, detected_at: detectedAt });
     state.updated_at = detectedAt;
     atomicWriteState(campaignDir, state);
@@ -2386,6 +2479,8 @@ async function executeWorkflowCase(caseRecord, caseState, state, campaignDir) {
       return;
     }
   }
+
+  beginCaseOracleSnapshot(caseRecord, caseState, attempt, state, campaignDir, childEnv);
 
   attempt.phase = 'running';
   let signalLaunchEnded;
@@ -2640,10 +2735,18 @@ async function recoverWorkflowAttempt(caseRecord, state, caseState, attempt, cam
       category: 'recovered-workflow-terminal', terminal_status: status.status,
       wait_exit_code: waitResult.exit_code,
     };
-  const verdict = outcomeWithOracleEvidence(
-    caseRecord, passed ? 'PASS' : 'INCONCLUSIVE', baseReason,
-    runCaseOracles(caseRecord, caseState, state, campaignDir, childEnv),
-  );
+  let verdict;
+  try {
+    verdict = outcomeWithOracleEvidence(
+      caseRecord, passed ? 'PASS' : 'INCONCLUSIVE', baseReason,
+      runCaseOracles(caseRecord, caseState, state, campaignDir, childEnv),
+    );
+  } catch (error) {
+    finishRecoveredAttempt(state, caseState, attempt, campaignDir, 'TEST_INFRA_FAIL', {
+      category: 'oracle-evidence-snapshot', message: error.message,
+    });
+    return;
+  }
   attempt.phase = 'terminal';
   attempt.terminal_at = utcTimestamp();
   attempt.recovery = {
@@ -2833,6 +2936,9 @@ function isValidCaseState(item) {
     && typeof item.fixture === 'string'
     && ['pi', 'hermes', 'scripted-pi', 'scripted-hermes', 'local'].includes(item.harness)
     && ['verification', 'characterization', 'exploratory'].includes(item.class)
+    && (item.production_duration_floor_ms === null
+      || (Number.isSafeInteger(item.production_duration_floor_ms) && item.production_duration_floor_ms > 0))
+    && typeof item.expected_fast_failure === 'boolean'
     && Array.isArray(item.findings)
     && (item.oracle_results === undefined || (Array.isArray(item.oracle_results)
       && item.oracle_results.every((result) => isObject(result)
@@ -3007,6 +3113,8 @@ function createInitialState(campaignId, manifestPath, manifest, options) {
       fixture: record.fixture,
       harness: record.harness,
       class: record.class,
+      production_duration_floor_ms: record.production_duration_floor_ms ?? null,
+      expected_fast_failure: record.expected_fast_failure ?? false,
       phase: 'pending',
       attempts: [],
       findings: [],
@@ -3031,7 +3139,9 @@ function manifestMatchesState(manifestPath, manifest, state) {
         && persisted.workflow === record.workflow
         && persisted.fixture === record.fixture
         && persisted.harness === record.harness
-        && persisted.class === record.class;
+        && persisted.class === record.class
+        && persisted.production_duration_floor_ms === (record.production_duration_floor_ms ?? null)
+        && persisted.expected_fast_failure === (record.expected_fast_failure ?? false);
     });
 }
 

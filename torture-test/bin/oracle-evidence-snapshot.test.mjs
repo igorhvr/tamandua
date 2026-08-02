@@ -1,0 +1,424 @@
+#!/usr/bin/env node
+
+import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { DatabaseSync } from 'node:sqlite';
+import test from 'node:test';
+import {
+  beginOracleEvidenceSnapshot,
+  completeOracleEvidenceSnapshot,
+} from './oracle-evidence-snapshot.mjs';
+import { ORACLE_EVIDENCE_KEYS } from './oracle-context.mjs';
+import { evaluateO9 } from '../oracles/lib/o9.mjs';
+
+const TT_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
+const VAR_ROOT = path.join(TT_ROOT, 'var');
+const RUN_ID = 'run-11111111-1111-4111-8111-111111111111';
+
+function run(command, args, cwd) {
+  const result = spawnSync(command, args, { cwd, encoding: 'utf8', shell: false });
+  assert.equal(result.status, 0, `${command} ${args.join(' ')}: ${result.stderr}`);
+  return result.stdout.trim();
+}
+
+function fixture() {
+  fs.mkdirSync(VAR_ROOT, { recursive: true });
+  const root = fs.mkdtempSync(path.join(VAR_ROOT, 'oracle-snapshot-test.'));
+  const stateDir = path.join(root, 'state');
+  const repoDir = path.join(root, 'repo');
+  const campaignDir = path.join(root, 'results', 'campaign-test');
+  fs.mkdirSync(path.join(stateDir, 'events'), { recursive: true });
+  fs.mkdirSync(campaignDir, { recursive: true });
+  fs.mkdirSync(repoDir);
+  run('git', ['init', '-b', 'main'], repoDir);
+  run('git', ['config', 'user.name', 'Snapshot Test'], repoDir);
+  run('git', ['config', 'user.email', 'snapshot@example.invalid'], repoDir);
+  fs.mkdirSync(path.join(repoDir, 'src'));
+  fs.mkdirSync(path.join(repoDir, 'test'));
+  fs.writeFileSync(path.join(repoDir, 'src', 'value.ts'), 'export const value = 1;\n');
+  fs.writeFileSync(path.join(repoDir, 'test', 'value.test.ts'), 'test("value", () => {});\n');
+  fs.writeFileSync(path.join(repoDir, 'bait.txt'), 'do not touch\n');
+  run('git', ['add', '.'], repoDir);
+  run('git', ['commit', '-m', 'fixture'], repoDir);
+  const suiteTree = run('git', ['rev-parse', 'HEAD^{tree}'], repoDir);
+  const suiteCommandHash = createHash('sha256').update('npm test').digest('hex');
+  const suiteOrigin = fs.realpathSync(repoDir);
+  fs.writeFileSync(path.join(repoDir, 'junk-probe.tmp'), 'untracked by design\n');
+
+  const databasePath = path.join(stateDir, 'tamandua.db');
+  const db = new DatabaseSync(databasePath);
+  db.exec(`
+    CREATE TABLE runs (id TEXT PRIMARY KEY, status TEXT, tokens_spent INTEGER);
+    CREATE TABLE suite_results (
+      id INTEGER PRIMARY KEY, origin_repo TEXT, tree_hash TEXT, cmd_hash TEXT,
+      cmd_display TEXT, exit_code INTEGER, duration_ms INTEGER, log_tail TEXT,
+      run_id TEXT, step_id TEXT, created_at TEXT
+    );
+    CREATE TABLE tamandua_stats (id INTEGER PRIMARY KEY, system_tokens_spent INTEGER);
+    INSERT INTO runs VALUES ('11111111-1111-4111-8111-111111111111', 'completed', 17);
+    INSERT INTO tamandua_stats VALUES (1, 0);
+  `);
+  db.prepare('INSERT INTO suite_results VALUES (1, ?, ?, ?, ?, 0, 12, NULL, ?, ?, ?)').run(
+    suiteOrigin, suiteTree, suiteCommandHash, 'npm test', RUN_ID, 'step-1', '2026-08-01T12:00:00.000Z',
+  );
+  db.prepare('INSERT INTO suite_results VALUES (2, ?, ?, ?, ?, 0, 100, NULL, ?, ?, ?)').run(
+    suiteOrigin, suiteTree, suiteCommandHash, 'npm test', 'run-reclaimer', 'step-reclaimer', '2026-08-01T12:00:00.100Z',
+  );
+  db.prepare('INSERT INTO suite_results VALUES (3, ?, ?, ?, ?, 87, 50, NULL, ?, ?, ?)').run(
+    suiteOrigin, suiteTree, suiteCommandHash, 'npm test', RUN_ID, 'exit-87', '2026-08-01T12:00:00.200Z',
+  );
+  db.prepare('INSERT INTO suite_results VALUES (4, ?, ?, ?, ?, 0, 100, NULL, ?, ?, ?)').run(
+    suiteOrigin, suiteTree, suiteCommandHash, 'npm test', 'run-ordinary-owner', 'step-ordinary-owner', '2026-08-01T12:00:04.400Z',
+  );
+  db.prepare('INSERT INTO suite_results VALUES (5, ?, ?, ?, ?, 0, 100, NULL, ?, ?, ?)').run(
+    suiteOrigin, suiteTree, suiteCommandHash, 'npm test', 'run-stop-waiter', 'step-stop-waiter', '2026-08-01T12:00:05.600Z',
+  );
+  db.close();
+  fs.writeFileSync(path.join(stateDir, 'events', 'all.jsonl'), [
+    JSON.stringify({ ts: '2026-08-01T11:59:58.000Z', event: 'suite.claim_granted', runId: 'run-owner', stepId: 'step-owner', originRepo: suiteOrigin, treeHash: suiteTree, cmdHash: suiteCommandHash, ownerRunId: 'run-owner', ownerStepId: 'step-owner', ownerPid: 4100 }),
+    JSON.stringify({ ts: '2026-08-01T11:59:58.250Z', event: 'suite.execute_started', runId: 'run-owner', stepId: 'step-owner', originRepo: suiteOrigin, treeHash: suiteTree, cmdHash: suiteCommandHash }),
+    JSON.stringify({ ts: '2026-08-01T11:59:59.500Z', event: 'suite.claim_dead_owner_reclaimed', runId: 'run-reclaimer', stepId: 'step-reclaimer', originRepo: suiteOrigin, treeHash: suiteTree, cmdHash: suiteCommandHash, ownerRunId: 'run-owner', ownerStepId: 'step-owner', ownerPid: 4100, reclaimerRunId: 'run-reclaimer', reclaimerStepId: 'step-reclaimer', reclaimerPid: 4200 }),
+    JSON.stringify({ ts: '2026-08-01T11:59:59.600Z', event: 'suite.claim_granted', runId: 'run-reclaimer', stepId: 'step-reclaimer', originRepo: suiteOrigin, treeHash: suiteTree, cmdHash: suiteCommandHash, ownerRunId: 'run-reclaimer', ownerStepId: 'step-reclaimer', ownerPid: 4200 }),
+    JSON.stringify({ ts: '2026-08-01T11:59:59.700Z', event: 'suite.execute_started', runId: 'run-reclaimer', stepId: 'step-reclaimer', originRepo: suiteOrigin, treeHash: suiteTree, cmdHash: suiteCommandHash }),
+    JSON.stringify({ ts: '2026-08-01T12:00:00.000Z', event: 'run.started', runId: RUN_ID }),
+    JSON.stringify({ ts: '2026-08-01T12:00:00.000Z', event: 'suite.executed', runId: RUN_ID, stepId: 'step-1', treeHash: suiteTree, cmdDisplay: 'npm test', durationMs: 12, exitCode: 0, force: true }),
+    JSON.stringify({ ts: '2026-08-01T12:00:00.100Z', event: 'suite.executed', runId: 'run-reclaimer', stepId: 'step-reclaimer', treeHash: suiteTree, cmdDisplay: 'npm test', durationMs: 100, exitCode: 0, force: false }),
+    JSON.stringify({ ts: '2026-08-01T12:00:01.000Z', event: 'run.tokens.updated', runId: RUN_ID, tokenDelta: 17, tokensSpent: 17, stepId: 'step-1', roundId: 'round-1', usageId: 'usage-1' }),
+    JSON.stringify({ ts: '2026-08-01T12:00:00.900Z', event: 'harness.usage.captured', runId: RUN_ID, stepId: 'step-1', roundId: 'round-1', usageId: 'usage-1', harness: 'pi', sessionId: null, startedAt: '2026-08-01T12:00:00.100Z', finishedAt: '2026-08-01T12:00:00.900Z', inputTokens: 10, outputTokens: 5, cacheReadTokens: 1, cacheWriteTokens: 1, totalTokens: 17, candidateRunIds: [RUN_ID] }),
+    JSON.stringify({ ts: '2026-08-01T12:00:02.000Z', event: 'suite.cache_hit', runId: RUN_ID, stepId: 'step-1', treeHash: suiteTree.slice(0, 12), cmdDisplay: 'npm test', savedDurationMs: 12, force: false }),
+    JSON.stringify({ ts: '2026-08-01T12:00:02.100Z', event: 'suite.special_exit_observed', runId: RUN_ID, stepId: 'exit-86', originRepo: suiteOrigin, treeHash: suiteTree, cmdHash: suiteCommandHash, shimExitCode: 86, commandExitCode: 0, preTreeHash: suiteTree, postTreeHash: 'a'.repeat(suiteTree.length), ledgerRowId: null, interrupted: false, trackedDirty: false, junkProbePath: 'junk-probe.tmp', junkProbeTracked: false }),
+    JSON.stringify({ ts: '2026-08-01T12:00:02.200Z', event: 'suite.special_exit_observed', runId: RUN_ID, stepId: 'exit-87', originRepo: suiteOrigin, treeHash: suiteTree, cmdHash: suiteCommandHash, shimExitCode: 87, commandExitCode: 87, preTreeHash: suiteTree, postTreeHash: suiteTree, ledgerRowId: 3, interrupted: true, trackedDirty: false, junkProbePath: 'junk-probe.tmp', junkProbeTracked: false }),
+    JSON.stringify({ ts: '2026-08-01T12:00:02.300Z', event: 'suite.special_exit_observed', runId: RUN_ID, stepId: 'exit-88', originRepo: suiteOrigin, treeHash: suiteTree, cmdHash: suiteCommandHash, shimExitCode: 88, commandExitCode: null, preTreeHash: suiteTree, postTreeHash: suiteTree, ledgerRowId: null, interrupted: false, trackedDirty: true, junkProbePath: 'junk-probe.tmp', junkProbeTracked: false }),
+    JSON.stringify({ ts: '2026-08-01T12:00:03.000Z', event: 'step.submit.rejected', recordId: 'rejection-1', runId: RUN_ID, stepRowId: 'row-step-1', stepId: 'step-1', claimId: 'claim-1', attemptNumber: 1, validationCode: 'EXPECTS_REJECTED', missingKeys: ['TESTS'], invalidKeys: [], diagnosticCode: 'EXPECTS_MISSING_TESTS', detail: 'agent prose must not be copied' }),
+    JSON.stringify({ ts: '2026-08-01T12:00:03.100Z', event: 'step.expects.validated', recordId: 'validation-1', runId: RUN_ID, stepRowId: 'row-step-1', stepId: 'step-1', claimId: 'claim-1', attemptNumber: 1, outcome: 'rejected', verdict: null, expectsRequired: true, requiredKeys: ['STATUS', 'TESTS'], missingKeys: ['TESTS'], invalidKeys: [], diagnosticCode: 'EXPECTS_MISSING_TESTS', producerStepRowId: 'row-producer', transitionAction: 'reroute', transitionTargetStepRowId: 'row-producer' }),
+    JSON.stringify({ ts: '2026-08-01T12:00:03.200Z', event: 'dispatch.render.validated', recordId: 'render-1', runId: RUN_ID, stepRowId: 'row-step-1', stepId: 'step-1', claimId: 'claim-1', requiredKeys: ['ARTIFACT'], unresolvedPlaceholderCount: 0, unresolvedKeys: [] }),
+    JSON.stringify({ ts: '2026-08-01T12:00:04.000Z', event: 'suite.claim_granted', runId: 'run-ordinary-owner', stepId: 'step-ordinary-owner', originRepo: suiteOrigin, treeHash: suiteTree, cmdHash: suiteCommandHash, ownerRunId: 'run-ordinary-owner', ownerStepId: 'step-ordinary-owner', ownerPid: 4300 }),
+    JSON.stringify({ ts: '2026-08-01T12:00:04.100Z', event: 'suite.execute_started', runId: 'run-ordinary-owner', stepId: 'step-ordinary-owner', originRepo: suiteOrigin, treeHash: suiteTree, cmdHash: suiteCommandHash, startedAt: '2026-08-01T12:00:04.050Z' }),
+    JSON.stringify({ ts: '2026-08-01T12:00:04.200Z', event: 'suite.claim_wait', runId: 'run-ordinary-waiter', stepId: 'step-ordinary-waiter', originRepo: suiteOrigin, treeHash: suiteTree, cmdHash: suiteCommandHash, ownerRunId: 'run-ordinary-owner', ownerStepId: 'step-ordinary-owner' }),
+    JSON.stringify({ ts: '2026-08-01T12:00:04.400Z', event: 'suite.executed', runId: 'run-ordinary-owner', stepId: 'step-ordinary-owner', originRepo: suiteOrigin, treeHash: suiteTree, cmdHash: suiteCommandHash, durationMs: 100, exitCode: 0, ledgerRowId: 4 }),
+    JSON.stringify({ ts: '2026-08-01T12:00:04.500Z', event: 'suite.cache_hit', runId: 'run-ordinary-waiter', stepId: 'step-ordinary-waiter', originRepo: suiteOrigin, treeHash: suiteTree, cmdHash: suiteCommandHash, ledgerRowId: 4 }),
+    JSON.stringify({ ts: '2026-08-01T12:00:05.000Z', event: 'suite.claim_granted', runId: 'run-stop-owner', stepId: 'step-stop-owner', originRepo: suiteOrigin, treeHash: suiteTree, cmdHash: suiteCommandHash, ownerRunId: 'run-stop-owner', ownerStepId: 'step-stop-owner', ownerPid: 4400 }),
+    JSON.stringify({ ts: '2026-08-01T12:00:05.100Z', event: 'suite.execute_started', runId: 'run-stop-owner', stepId: 'step-stop-owner', originRepo: suiteOrigin, treeHash: suiteTree, cmdHash: suiteCommandHash, startedAt: '2026-08-01T12:00:05.050Z' }),
+    JSON.stringify({ ts: '2026-08-01T12:00:05.200Z', event: 'suite.claim_wait', runId: 'run-stop-waiter', stepId: 'step-stop-waiter', originRepo: suiteOrigin, treeHash: suiteTree, cmdHash: suiteCommandHash, ownerRunId: 'run-stop-owner', ownerStepId: 'step-stop-owner' }),
+    JSON.stringify({ ts: '2026-08-01T12:00:05.300Z', event: 'suite.claim_owner_released', runId: 'run-stop-owner', stepId: 'step-stop-owner', originRepo: suiteOrigin, treeHash: suiteTree, cmdHash: suiteCommandHash, ownerRunId: 'run-stop-owner', ownerStepId: 'step-stop-owner', releaseReason: 'cancel' }),
+    JSON.stringify({ ts: '2026-08-01T12:00:05.400Z', event: 'suite.claim_granted', runId: 'run-stop-waiter', stepId: 'step-stop-waiter', originRepo: suiteOrigin, treeHash: suiteTree, cmdHash: suiteCommandHash, ownerRunId: 'run-stop-waiter', ownerStepId: 'step-stop-waiter', ownerPid: 4500 }),
+    JSON.stringify({ ts: '2026-08-01T12:00:05.500Z', event: 'suite.execute_started', runId: 'run-stop-waiter', stepId: 'step-stop-waiter', originRepo: suiteOrigin, treeHash: suiteTree, cmdHash: suiteCommandHash, startedAt: '2026-08-01T12:00:05.450Z' }),
+    JSON.stringify({ ts: '2026-08-01T12:00:05.600Z', event: 'suite.executed', runId: 'run-stop-waiter', stepId: 'step-stop-waiter', originRepo: suiteOrigin, treeHash: suiteTree, cmdHash: suiteCommandHash, durationMs: 100, exitCode: 0, ledgerRowId: 5 }),
+  ].join('\n') + '\n');
+  return { root, stateDir, repoDir, campaignDir, databasePath, suiteOrigin };
+}
+
+function input(data) {
+  return {
+    ttRoot: TT_ROOT,
+    campaignDir: data.campaignDir,
+    stateDir: data.stateDir,
+    databasePath: data.databasePath,
+    repositoryPath: data.repoDir,
+    caseRecord: {
+      id: 'CASE-1', workflow: 'feature-dev-merge-worktree', fixture: 'tt-ts', harness: 'hermes',
+      context: { merge_gate: 'green', fail_missing: '1', test_cmd: 'npm test', prose: 'do not capture me' },
+      boundary_files: ['src'], forbidden: ['bait.txt'],
+    },
+    attempt: {
+      id: 'attempt-1', run_id: RUN_ID, launch_intent_at: '2026-08-01T12:00:00.000Z',
+      execution_mode: 'real', terminal_status: 'completed', tokens_observed: 17,
+      steps_snapshot: { source: 'workflow-status-json', captured_at: '2026-08-01T12:00:04.000Z', steps: [] },
+    },
+    launchArgv: ['workflow', 'run', 'feature-dev-merge-worktree', '--context', 'merge_gate=green'],
+    discoveredRuns: [
+      { run_id: 'run-reclaimer', parent_run_id: RUN_ID },
+      { run_id: 'run-owner', parent_run_id: RUN_ID },
+      { run_id: 'run-ordinary-owner', parent_run_id: RUN_ID },
+      { run_id: 'run-ordinary-waiter', parent_run_id: RUN_ID },
+      { run_id: 'run-stop-owner', parent_run_id: RUN_ID },
+      { run_id: 'run-stop-waiter', parent_run_id: RUN_ID },
+    ],
+  };
+}
+
+function digest(file) {
+  return createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+}
+
+test('harvests a complete immutable snapshot that passes O9 with immediate reclaim and cancel evidence', async () => {
+  const data = fixture();
+  try {
+    const request = input(data);
+    const sourceDatabaseHash = digest(data.databasePath);
+    fs.writeFileSync(`${data.databasePath}-wal`, '');
+    const started = beginOracleEvidenceSnapshot(request);
+    assert.equal(fs.existsSync(`${data.databasePath}-shm`), false, 'baseline read created source SHM');
+    fs.rmSync(`${data.databasePath}-wal`);
+    assert.equal(started.status, 'BASELINE_CAPTURED');
+    fs.writeFileSync(path.join(data.repoDir, 'src', 'value.ts'), 'export const value = 2;\n');
+    run('git', ['add', 'src/value.ts'], data.repoDir);
+    run('git', ['commit', '-m', 'terminal'], data.repoDir);
+    const unattachedCommit = run('git', [
+      'commit-tree', run('git', ['rev-parse', 'HEAD^{tree}'], data.repoDir), '-m', 'unattached tested commit',
+    ], data.repoDir);
+    fs.writeFileSync(`${data.databasePath}-wal`, '');
+
+    const completed = completeOracleEvidenceSnapshot(request, started);
+    assert.equal(fs.existsSync(`${data.databasePath}-shm`), false, 'terminal read created source SHM');
+    assert.equal(completed.status, 'COMPLETE');
+    assert.equal(digest(data.databasePath), sourceDatabaseHash, 'source database was modified');
+    assert.deepEqual(Object.keys(completed.references), ORACLE_EVIDENCE_KEYS);
+    for (const [key, reference] of Object.entries(completed.references)) {
+      assert.ok(reference, `${key} was not captured`);
+      const absolute = path.join(data.campaignDir, reference.path);
+      assert.equal(digest(absolute), reference.sha256, `${key} hash mismatch`);
+      assert.equal(fs.lstatSync(absolute).isSymbolicLink(), false);
+      assert.equal(fs.statSync(absolute).mode & 0o222, 0, `${key} is writable`);
+    }
+
+    const dbCopy = new DatabaseSync(path.join(data.campaignDir, completed.references.database_snapshot.path), { readOnly: true });
+    assert.equal(dbCopy.prepare('SELECT tokens_spent FROM runs').get().tokens_spent, 17);
+    dbCopy.close();
+    const extractedGit = path.join(data.root, 'extracted-git');
+    fs.mkdirSync(extractedGit);
+    run('tar', ['-C', extractedGit, '-xf', path.join(data.campaignDir, completed.references.git_bundle.path)], data.root);
+    run('git', [`--git-dir=${extractedGit}`, 'cat-file', '-e', `${unattachedCommit}^{commit}`], data.root);
+    const refsBefore = JSON.parse(fs.readFileSync(path.join(data.campaignDir, completed.references.refs_before.path)));
+    const refsAfter = JSON.parse(fs.readFileSync(path.join(data.campaignDir, completed.references.refs_after.path)));
+    assert.notEqual(refsBefore.target_tip, refsAfter.target_tip);
+    assert.match(refsAfter.for_each_ref, /refs\/heads\/main/);
+    const reflog = JSON.parse(fs.readFileSync(path.join(data.campaignDir, completed.references.target_reflog.path)));
+    assert.equal(reflog.target_ref, 'refs/heads/main');
+    assert.ok(Array.isArray(reflog.entries));
+    const baseline = JSON.parse(fs.readFileSync(path.join(data.campaignDir, completed.references.checksum_baseline.path)));
+    assert.ok(baseline.entries.some((entry) => entry.path === 'bait.txt' && entry.categories.includes('forbidden')));
+    assert.ok(baseline.entries.some((entry) => entry.path === 'test/value.test.ts' && entry.categories.includes('seeded-test')));
+    assert.deepEqual(
+      baseline.entries.find((entry) => entry.path === 'test/value.test.ts').test_markers,
+      { skip: 0, todo: 0, xfail: 0 },
+    );
+    const events = fs.readFileSync(path.join(data.campaignDir, completed.references.run_events.path), 'utf8');
+    assert.equal(events.includes('agent prose must not be copied'), false);
+    const roundUsage = JSON.parse(fs.readFileSync(path.join(data.campaignDir, completed.references.round_usage.path)));
+    assert.equal(roundUsage.rows[0].id, 'usage-1');
+    assert.equal(roundUsage.rows[0].formula_inputs.total, 17);
+    assert.deepEqual(roundUsage.rows[0].candidate_run_ids, [RUN_ID]);
+    assert.deepEqual(roundUsage.synthetic_ledger, []);
+    const submitRejections = JSON.parse(fs.readFileSync(path.join(data.campaignDir, completed.references.submit_rejections.path)));
+    assert.deepEqual(submitRejections.rows[0], {
+      id: 'rejection-1', observed_at: '2026-08-01T12:00:03.000Z', run_id: RUN_ID,
+      step_row_id: 'row-step-1', step_id: 'step-1', claim_id: 'claim-1', attempt_number: 1,
+      validation_code: 'EXPECTS_REJECTED', missing_keys: ['TESTS'], invalid_keys: [], diagnostic_code: 'EXPECTS_MISSING_TESTS',
+    });
+    const expectsValidations = JSON.parse(fs.readFileSync(path.join(data.campaignDir, completed.references.expects_validations.path)));
+    assert.deepEqual(expectsValidations.rows[0].key_sources, [{ key: 'TESTS', producer_step_row_id: 'row-producer' }]);
+    assert.deepEqual(expectsValidations.rows[0].transition, { action: 'reroute', target_step_row_id: 'row-producer' });
+    const dispatchRenderings = JSON.parse(fs.readFileSync(path.join(data.campaignDir, completed.references.dispatch_renderings.path)));
+    assert.deepEqual(dispatchRenderings.rows[0].required_keys, ['ARTIFACT']);
+    assert.equal(dispatchRenderings.rows[0].unresolved_placeholder_count, 0);
+    const suiteObservations = JSON.parse(fs.readFileSync(path.join(data.campaignDir, completed.references.suite_observations.path)));
+    assert.equal(suiteObservations.ttl_green_ms, 86_400_000);
+    assert.deepEqual(suiteObservations.rows.map((row) => row.phase).slice(0, 8), ['lookup', 'execute', 'record', 'lookup', 'execute', 'record', 'lookup', 'replay']);
+    assert.equal(suiteObservations.rows[0].force, true);
+    assert.equal(suiteObservations.rows[6].force, false);
+    assert.equal(suiteObservations.rows[7].ledger_row_id, 1);
+    assert.equal(suiteObservations.rows[7].marker, 'TAMANDUA-TEST CACHED');
+    assert.deepEqual(suiteObservations.origin_identities, [{ origin_repo: data.suiteOrigin, normalized_origin_repo: data.suiteOrigin }]);
+    assert.equal(suiteObservations.singleflight_observations.length, 3);
+    assert.equal(suiteObservations.singleflight_observations[0].recovery, 'dead_owner');
+    assert.deepEqual(
+      suiteObservations.singleflight_observations[0].events.map((event) => event.type),
+      ['execute_started', 'wait', 'dead_owner_reclaimed', 'execute_started'],
+    );
+    assert.equal(
+      suiteObservations.singleflight_observations[0].events.at(-1).observed_at,
+      '2026-08-01T11:59:59.700Z',
+      'real execution start must not be reconstructed or clamped to reclaim time',
+    );
+    assert.deepEqual(
+      suiteObservations.singleflight_observations.map((observation) => observation.recovery),
+      ['dead_owner', null, 'stop_cancel'],
+    );
+    assert.deepEqual(
+      suiteObservations.singleflight_observations[1].events.map((event) => event.type),
+      ['execute_started', 'wait', 'record', 'replay'],
+    );
+    assert.equal(
+      suiteObservations.singleflight_observations[2].events.some((event) => event.type === 'dead_owner_reclaimed'),
+      false,
+      'stop/cancel release must not be laundered into dead-owner recovery',
+    );
+    assert.deepEqual(suiteObservations.special_exit_observations.map((row) => row.shim_exit_code), [86, 87, 88]);
+    assert.deepEqual(suiteObservations.special_exit_observations.map((row) => row.junk_probe_tracked), [false, false, false]);
+    assert.equal(suiteObservations.special_exit_observations[2].tracked_dirty, true);
+    assert.equal(suiteObservations.special_exit_observations[2].command_exit_code, null);
+    const o9EvidenceDir = path.join(data.campaignDir, 'o9-evidence');
+    fs.mkdirSync(o9EvidenceDir);
+    const o9Result = await evaluateO9({
+      campaignRoot: data.campaignDir,
+      evidenceDir: o9EvidenceDir,
+      evidencePaths: Object.fromEntries(Object.entries(completed.references)
+        .map(([key, reference]) => [key, path.join(data.campaignDir, reference.path)])),
+    });
+    assert.equal(o9Result.result, 'PASS', JSON.stringify(o9Result.findings));
+    const launchIntent = fs.readFileSync(path.join(data.campaignDir, completed.references.launch_intent.path), 'utf8');
+    assert.equal(launchIntent.includes('do not capture me'), false);
+    const launchIntentJson = JSON.parse(launchIntent);
+    assert.equal(launchIntentJson.gate_key.origin_repo, fs.realpathSync(data.repoDir));
+    assert.equal(launchIntentJson.gate_key.cmd_hash, createHash('sha256').update('npm test').digest('hex'));
+    const provenance = JSON.parse(fs.readFileSync(path.join(data.campaignDir, completed.provenance.path)));
+    assert.equal(provenance.status, 'COMPLETE');
+    assert.deepEqual(Object.keys(provenance.files), ORACLE_EVIDENCE_KEYS);
+  } finally {
+    fs.rmSync(data.root, { recursive: true, force: true });
+  }
+});
+
+test('preserves an unresolved cache hit beside a valid invocation so O9 can reject it', () => {
+  const data = fixture();
+  try {
+    fs.appendFileSync(
+      path.join(data.stateDir, 'events', 'all.jsonl'),
+      `${JSON.stringify({
+        ts: '2026-08-01T12:00:04.000Z', event: 'suite.cache_hit', runId: RUN_ID,
+        stepId: 'step-invalid', treeHash: 'ffffffffffff', cmdDisplay: 'npm test',
+        savedDurationMs: 999, force: true,
+      })}\n`,
+    );
+    const request = input(data);
+    const started = beginOracleEvidenceSnapshot(request);
+    const completed = completeOracleEvidenceSnapshot(request, started);
+    const observations = JSON.parse(fs.readFileSync(
+      path.join(data.campaignDir, completed.references.suite_observations.path),
+      'utf8',
+    ));
+    const invalid = observations.rows.filter((row) => row.step_id === 'step-invalid');
+    assert.deepEqual(invalid.map((row) => row.phase), ['lookup', 'replay']);
+    assert.deepEqual(invalid.map((row) => row.force), [true, true]);
+    assert.equal(invalid[0].latest_row_id, null);
+    assert.equal(invalid[1].ledger_row_id, null);
+  } finally {
+    fs.rmSync(data.root, { recursive: true, force: true });
+  }
+});
+
+test('preserves the event-time junk-probe state when the terminal index later changes', () => {
+  const data = fixture();
+  try {
+    const request = input(data);
+    const started = beginOracleEvidenceSnapshot(request);
+    run('git', ['add', 'junk-probe.tmp'], data.repoDir);
+    const completed = completeOracleEvidenceSnapshot(request, started);
+    const observations = JSON.parse(fs.readFileSync(
+      path.join(data.campaignDir, completed.references.suite_observations.path),
+      'utf8',
+    ));
+    assert.deepEqual(observations.special_exit_observations.map((row) => row.junk_probe_tracked), [false, false, false]);
+  } finally {
+    fs.rmSync(data.root, { recursive: true, force: true });
+  }
+});
+
+test('rejects incomplete targeted special-exit process evidence instead of dropping it', () => {
+  const data = fixture();
+  try {
+    fs.appendFileSync(path.join(data.stateDir, 'events', 'all.jsonl'), `${JSON.stringify({
+      ts: '2026-08-01T12:00:03.500Z', event: 'suite.special_exit_observed', runId: RUN_ID,
+      stepId: 'exit-incomplete', originRepo: data.suiteOrigin, treeHash: 'a'.repeat(40),
+      cmdHash: createHash('sha256').update('npm test').digest('hex'), shimExitCode: 88,
+      commandExitCode: null, preTreeHash: 'a'.repeat(40), postTreeHash: 'a'.repeat(40),
+      ledgerRowId: null, interrupted: false, junkProbePath: 'junk-probe.tmp',
+    })}\n`);
+    const request = input(data);
+    const started = beginOracleEvidenceSnapshot(request);
+    assert.throws(
+      () => completeOracleEvidenceSnapshot(request, started),
+      /special_exit_observed lacks complete mechanical process\/tree evidence/,
+    );
+  } finally {
+    fs.rmSync(data.root, { recursive: true, force: true });
+  }
+});
+
+test('rejects malformed mechanical event lines instead of silently dropping evidence', () => {
+  const data = fixture();
+  try {
+    fs.appendFileSync(path.join(data.stateDir, 'events', 'all.jsonl'), '{not-json}\n');
+    const request = input(data);
+    const started = beginOracleEvidenceSnapshot(request);
+    assert.throws(
+      () => completeOracleEvidenceSnapshot(request, started),
+      /event source all\.jsonl:\d+ contains malformed JSON/,
+    );
+  } finally {
+    fs.rmSync(data.root, { recursive: true, force: true });
+  }
+});
+
+test('rejects production-state paths outside the controller-provided TT state', () => {
+  const data = fixture();
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'oracle-production-state.'));
+  try {
+    const outsideDb = path.join(outside, 'tamandua.db');
+    fs.copyFileSync(data.databasePath, outsideDb);
+    assert.throws(
+      () => beginOracleEvidenceSnapshot({ ...input(data), databasePath: outsideDb }),
+      /database.*outside controller-provided TT state/i,
+    );
+    assert.equal(fs.readdirSync(data.campaignDir).length, 0);
+  } finally {
+    fs.rmSync(data.root, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test('rejects a symlinked SQLite WAL or SHM sidecar before opening the source', () => {
+  const data = fixture();
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'oracle-sidecar-state.'));
+  try {
+    const outsideWal = path.join(outside, 'tamandua.db-wal');
+    fs.writeFileSync(outsideWal, 'outside WAL bytes');
+    fs.symlinkSync(outsideWal, `${data.databasePath}-wal`);
+    assert.throws(
+      () => beginOracleEvidenceSnapshot(input(data)),
+      /database sidecar.*regular file|outside controller-provided TT state/i,
+    );
+    assert.equal(fs.readdirSync(data.campaignDir).length, 0);
+  } finally {
+    fs.rmSync(data.root, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test('rejects pre-existing symlink components in the snapshot destination', () => {
+  const data = fixture();
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'oracle-snapshot-escape.'));
+  try {
+    fs.symlinkSync(outside, path.join(data.campaignDir, 'snapshots'));
+    assert.throws(() => beginOracleEvidenceSnapshot(input(data)), /snapshot directory.*symlink/i);
+    assert.deepEqual(fs.readdirSync(outside), []);
+  } finally {
+    fs.rmSync(data.root, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test('an interrupted or partial snapshot remains TEST_INFRA and is never resumed as complete', async () => {
+  const data = fixture();
+  try {
+    const request = input(data);
+    const started = beginOracleEvidenceSnapshot(request);
+    const ledgerPath = path.join(data.campaignDir, started.ledger_path);
+    const interrupted = JSON.parse(fs.readFileSync(ledgerPath, 'utf8'));
+    interrupted.status = 'RUNNING';
+    fs.writeFileSync(ledgerPath, `${JSON.stringify(interrupted, null, 2)}\n`);
+    const reloaded = await import(`./oracle-evidence-snapshot.mjs?interrupted=${Date.now()}`);
+    assert.throws(
+      () => reloaded.completeOracleEvidenceSnapshot(request, { ...started, status: 'RUNNING' }),
+      /interrupted.*TEST_INFRA/i,
+    );
+    assert.equal(JSON.parse(fs.readFileSync(ledgerPath, 'utf8')).status, 'TEST_INFRA');
+  } finally {
+    fs.rmSync(data.root, { recursive: true, force: true });
+  }
+});

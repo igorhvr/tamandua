@@ -6,7 +6,9 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { createHash, randomUUID } from "node:crypto";
 import { getDb } from "../../db.js";
+import { emitEvent } from "../../installer/events.js";
 import { getWorkflowStatus } from "../../installer/status.js";
 import { logger } from "../../lib/logger.js";
 import {
@@ -22,6 +24,69 @@ import {
   validateExpects,
 } from "../../installer/step-ops.js";
 import { detectWrongPrefix, prefixRunId, prefixStepId, stripIdPrefix } from "../../lib/id-prefix.js";
+
+interface CompletionEvidenceStep {
+  id: string;
+  run_id: string;
+  step_id: string;
+  expects: string;
+  claim_job_id: string | null;
+  claim_updated_at: string | null;
+  updated_at: string;
+}
+
+function completionEvidenceStep(stepId: string): CompletionEvidenceStep | undefined {
+  return getDb().prepare(
+    "SELECT id, run_id, step_id, expects, claim_job_id, claim_updated_at, updated_at FROM steps WHERE id = ?",
+  ).get(stepId) as CompletionEvidenceStep | undefined;
+}
+
+function completionClaimId(step: CompletionEvidenceStep): string {
+  return step.claim_job_id ?? `${step.id}:${step.claim_updated_at ?? step.updated_at}`;
+}
+
+function expectsKeys(expects: string): string[] {
+  const keys = new Set<string>();
+  for (const line of expects.split("\n")) {
+    const literal = line.trim().match(/^([A-Z][A-Z0-9_]*):/);
+    if (literal) keys.add(literal[1]);
+  }
+  return [...keys];
+}
+
+function validationDiagnostic(validationError: string): { missingKeys: string[]; invalidKeys: string[]; code: string } {
+  const missing = validationError.match(/^Output missing expects string: "([A-Z][A-Z0-9_]*):/);
+  if (missing) return { missingKeys: [missing[1]], invalidKeys: [], code: `EXPECTS_MISSING_${missing[1]}` };
+  const invalid = validationError.match(/^Invalid expects regex pattern:/);
+  const digest = createHash("sha256").update(validationError).digest("hex").slice(0, 12).toUpperCase();
+  return {
+    missingKeys: [],
+    invalidKeys: invalid ? ["EXPECTS_REGEX"] : ["EXPECTS_MATCH"],
+    code: `${invalid ? "EXPECTS_INVALID_REGEX" : "EXPECTS_REGEX_MISMATCH"}_${digest}`,
+  };
+}
+
+function emitCompletionValidation(
+  step: CompletionEvidenceStep,
+  fields: {
+    outcome: "accepted" | "rejected";
+    verdict: "done" | "retry" | "failed" | null;
+    diagnosticCode: string;
+    missingKeys?: string[];
+    invalidKeys?: string[];
+    transitionAction: "done" | "retry" | "reroute" | "fail";
+  },
+): void {
+  emitEvent({
+    ts: new Date().toISOString(), event: "step.expects.validated", recordId: randomUUID(),
+    runId: step.run_id, stepRowId: step.id, stepId: step.step_id,
+    claimId: completionClaimId(step), outcome: fields.outcome, verdict: fields.verdict,
+    expectsRequired: step.expects.trim() !== "", requiredKeys: expectsKeys(step.expects),
+    missingKeys: fields.missingKeys ?? [], invalidKeys: fields.invalidKeys ?? [],
+    diagnosticCode: fields.diagnosticCode, producerStepRowId: null,
+    transitionAction: fields.transitionAction, transitionTargetStepRowId: step.id,
+  });
+}
 
 export function getStepHelp(): string {
   return `tamandua step — Worker step protocol commands
@@ -408,13 +473,23 @@ export async function handleStep(group: string, args: string[]): Promise<boolean
     // so the agent gets immediate feedback and can fix + resubmit in the
     // same round without burning a retry slot.
     if (output) {
-      const db = getDb();
-      const step = db.prepare(
-        "SELECT expects FROM steps WHERE id = ?"
-      ).get(stepId) as { expects: string } | undefined;
+      const step = completionEvidenceStep(stepId);
       if (step && step.expects && step.expects.trim() !== "") {
         const validationError = validateExpects(output, step.expects);
         if (validationError) {
+          const diagnostic = validationDiagnostic(validationError);
+          emitEvent({
+            ts: new Date().toISOString(), event: "step.submit.rejected", recordId: randomUUID(),
+            runId: step.run_id, stepRowId: step.id, stepId: step.step_id,
+            claimId: completionClaimId(step), validationCode: "EXPECTS_REJECTED",
+            missingKeys: diagnostic.missingKeys, invalidKeys: diagnostic.invalidKeys,
+            diagnosticCode: diagnostic.code,
+          });
+          emitCompletionValidation(step, {
+            outcome: "rejected", verdict: null, diagnosticCode: diagnostic.code,
+            missingKeys: diagnostic.missingKeys, invalidKeys: diagnostic.invalidKeys,
+            transitionAction: "retry",
+          });
           process.stderr.write(
             `REJECTED: output does not satisfy expects: ${validationError}\n` +
               `Hint: plain-text KEY: lines at column 0, no markdown. Fix your output and resubmit — you still hold the step.\n`,
@@ -424,7 +499,18 @@ export async function handleStep(group: string, args: string[]): Promise<boolean
       }
     }
 
-    console.log(JSON.stringify(completeStep(stepId, output)));
+    const evidenceStep = completionEvidenceStep(stepId);
+    const result = completeStep(stepId, output);
+    if (evidenceStep && !["blocked"].includes(result.status)) {
+      const submittedVerdict = output.match(/^STATUS:\s*(done|retry|failed)\s*$/mi)?.[1]?.toLowerCase();
+      const verdict = submittedVerdict === "retry" ? "retry" : submittedVerdict === "failed" ? "failed" : "done";
+      const transitionAction = result.status === "rerouted" ? "reroute"
+        : result.status === "retrying" ? "retry" : result.status === "failed" ? "fail" : "done";
+      emitCompletionValidation(evidenceStep, {
+        outcome: "accepted", verdict, diagnosticCode: "EXPECTS_SATISFIED", transitionAction,
+      });
+    }
+    console.log(JSON.stringify(result));
     return true;
   }
   if (action === "fail") {

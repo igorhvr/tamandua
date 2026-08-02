@@ -34,14 +34,566 @@ plus these variables:
 - `TT_RUN_ID=<full run ID>` when the case has an identified workflow run
 
 The context file is a versioned JSON object containing campaign identity and
-manifest metadata, case metadata, mechanical attempt evidence references,
-terminal/step snapshots, token observations, and discovered-run records. It does
-not contain command stdout contents, model transcripts, or agent response prose.
-Step snapshots for both root attempts and discovered runs are projected onto
-mechanical lifecycle fields (IDs, status/type, counters, claim metadata, and
-timestamps); prose-bearing fields such as `output` and `error` are omitted.
-Paths stored in the context are relative to the campaign results directory unless
-explicitly documented otherwise.
+immutable manifest identity, case metadata, projected mechanical lifecycle state,
+and references to immutable evidence snapshots. It does not contain command stdout
+or stderr references, model transcripts, raw step output, `STATUS:` lines, agent
+response prose, or the manifest's free-form launch context. Launch policy is supplied
+through the captured `launch_intent` artifact described below, not copied from an
+agent-writable run context.
+
+### Version-1 input shape
+
+The controller writes this exact top-level shape (fields shown as `null` are nullable
+as described below):
+
+```json
+{
+  "contract_version": 1,
+  "oracle_id": "O2",
+  "campaign": {
+    "id": "campaign-...",
+    "created_at": "2026-08-01T00:00:00.000Z",
+    "manifest": {"sha256": "<64 lowercase hex>", "case_count": 1, "case_ids": ["W3.07"]}
+  },
+  "case": {
+    "id": "W3.07", "wave": 3, "workflow": "bug-fix-merge-worktree",
+    "fixture": "tt-ts", "harness": "hermes", "class": "verification",
+    "caps": {"tokens": 4000000, "wall_min": 240},
+    "boundary_files": ["fixtures/tt-ts/src"], "forbidden": [], "chaos": null
+  },
+  "run_id": "run-...",
+  "attempts": [],
+  "discovered_runs": [],
+  "o1_wave": {"schema_version": 1, "wave": 3, "duration_floors": [], "runs": []},
+  "mechanical_evidence": {"schema_version": 1, "references": {"...": null}}
+}
+```
+
+`attempts` contains, in launch order: `id`, `kind`, `phase`, `execution_mode`
+(`real` or `scripted`), nullable `run_id`, `started_at`, nullable `terminal_at`,
+nullable `terminal_status`, non-negative `tokens_observed`, nullable
+nullable `command_result` (`exit_code` and `signal` only), and nullable
+`steps_snapshot`, plus nullable `straggler_capture`. A straggler capture is written by
+the controller immediately before its own `workflow stop`: `captured_at`, identical
+`stop_intent_at`, numeric cap `reason`, and a mechanical workflow-status
+`steps_snapshot`. It preserves the live-claim pre-state that terminal harvesting would
+otherwise erase; it is never inferred from an agent report.
+`steps_snapshot` contains only `source`, `captured_at`, and `steps`. Each step is
+projected onto IDs, agent ID or the CLI's mechanical `agentRole`, raw `status`, optional `displayStatus`/`display_status`, optional type/story ID, retry/abandon/reroute counters, step index,
+claim PID/update time, and update time. In particular, step `output`, `error`, snapshot
+database paths, and other provenance strings are excluded. `discovered_runs` uses the
+same projection and adds `parent_run_id`. `run_id` is the most recently identified
+root-attempt run ID, or `null` for a case without one. SQLite
+`YYYY-MM-DD HH:MM:SS` step timestamps are normalized to canonical UTC ISO-8601 during
+projection; all timestamps presented to an oracle are canonical.
+
+`o1_wave` is a deterministic campaign-ledger projection used by O1's anti-gaming leg.
+It contains the current wave number; exactly one duration-floor row per launched workflow
+family (`workflow`, positive nullable `duration_floor_ms`, `source`, and
+`sample_size`); and every launched root/discovered run in that wave (`case_id`,
+`run_id`, workflow, start/terminal timestamps and status, and the manifest boolean
+`expected_fast_failure`). `source=w1-median` is computed from terminal, non-fast-failure
+Wave-1 attempts for that workflow family. If none exist, the controller uses the
+manifest's mechanically pinned `production_duration_floor_ms` and records
+`source=production-median`; no unique fallback is recorded as `unavailable` and O1
+fails closed for a launched family. `expected_fast_failure` defaults false and is the
+only exclusion from the wave-rate denominator. O1 fails closed if a launched family
+has no floor row or duplicate rows, or if a floor names a family absent from the wave's
+launched runs. For the current case, O1 reconciles the wave projection against every
+non-null root attempt and discovered run in the context and fails if any launched run
+is absent, duplicated, or if a current-case wave row names an unknown run. Run IDs are
+campaign-global, so duplicate rows are rejected even when they carry different case IDs.
+The current-case row's workflow and start/terminal timestamps and status must exactly
+match its root-attempt or discovered-run projection.
+
+### Evidence reference type and containment
+
+Every non-null value in `mechanical_evidence.references` has exactly this version-1
+reference shape:
+
+```json
+{
+  "path": "snapshots/attempt-1/database.sqlite",
+  "sha256": "<64 lowercase hex>",
+  "captured_at": "2026-08-01T00:00:00.000Z",
+  "source": "controller-snapshot"
+}
+```
+
+`path` is POSIX-style and relative to the campaign results directory (the directory
+that contains `state.json`), never to the oracle working directory. Absolute paths,
+backslashes, empty/`.`/`..` segments, missing files, directories, and symlinks are
+invalid. The controller resolves and realpaths the file beneath the campaign directory,
+requires a regular non-symlink file, and verifies `sha256` before invoking a gating
+hook. Thus a context never instructs a hook to infer a fixture, production DB, or
+`~/.tamandua` path. `captured_at` is canonical UTC ISO-8601. `source` identifies the
+controller collector; it is provenance only and cannot override the artifact bytes.
+SQLite artifacts are backups opened read-only by hooks; source database paths are not
+published in the context.
+
+### Controller snapshot lifecycle
+
+For a case with an executable gating hook, the controller starts one attempt-scoped
+snapshot after fixture reset and before workflow launch. It durably records `RUNNING`
+before collection, captures launch intent, pre-launch refs, checksum baselines, and the
+preflight system-token value, then records `BASELINE_CAPTURED`. After terminal run-graph
+convergence and immediately before the first gating invocation, it captures the remaining
+artifacts and atomically records `COMPLETE`. Every referenced file is SHA-256 pinned and
+made read-only before the context is written.
+
+The SQLite copy is made from the controller-selected `TAMANDUA_STATE_DIR` using an
+explicit read-only source connection. The source DB, event directory, and fixture git
+repository must all resolve beneath `torture-test/`; there is no HOME or
+`~/.tamandua` fallback. A `RUNNING`, absent, malformed, or otherwise partial snapshot on
+resume is `TEST_INFRA`, and no oracle is invoked from it. Snapshot ledgers and artifacts
+live under `var/results/<campaign>/snapshots/<case>/<attempt>/`.
+
+The `references` object always contains the following keys in this order. A key is
+`null` only when it is optional for the invoked oracle; a required null blocks hook
+execution as `TEST_INFRA`.
+
+| Key | Mechanical contents and controller provenance |
+|---|---|
+| `database_snapshot` | Consistent read-only TT `tamandua.db` backup after terminal harvest; includes runs, steps, stories, suite ledger, and stats tables. |
+| `run_events` | Run/case-scoped event rows copied from the contained TT event files and archives, with archive name and line number. |
+| `workflow_status` | Timestamped `workflow status --json` observations projected onto mechanical status/display fields. |
+| `launch_intent` | Pre-launch manifest policy, exact `merge_gate`/`fail_missing` argv, SHA-256 of the full workflow argv, prose-free argv projection, harness, fixture/repository identity, launch timestamp, and nullable immutable `gate_key` (`origin_repo` plus SHA-256 `cmd_hash` of the exact manifest `test_cmd_raw`/`test_cmd` bytes); captured before spawn. O2 requires a non-null gate key. |
+| `git_bundle` | Campaign-contained git-common-dir tar snapshot sufficient for offline commit/tree/ancestry/patch-id plumbing, including unreachable retained test commits; refs artifacts name its captured origin identity. |
+| `refs_before` | Pre-launch target tip and `for-each-ref` snapshot. |
+| `refs_after` | Terminal target tip and `for-each-ref` snapshot. |
+| `target_reflog` | Raw target-ref reflog captured mechanically, including old/new OIDs and reflog timestamps. |
+| `checksum_baseline` | Baseline inventory of boundary, forbidden/bait, seeded-test, and expected-file paths with type/mode/SHA-256. |
+| `checksum_terminal` | Terminal/merged-tree inventory and changed-path list using the same checksum schema. |
+| `suite_ledger` | Read-only `suite_results` rows relevant to captured origins/trees/command hashes, including result, timestamps, duration, TTL, and exact key. |
+| `suite_observations` | Ordered shim lookup/claim/execute/record/replay, cache-marker, force, exit-86/87/88, single-flight, and repository-drift observations. |
+| `token_deltas` | Ordered `run.tokens.updated` events with run ID, delta, resulting total, step/round identity, and event timestamp. |
+| `round_usage` | Harness trailer/session usage projected onto run/step/round, harness, timing window, and formula inputs; no transcript or model text. |
+| `system_tokens_before` | Preflight `tamandua_stats.system_tokens_spent` observation from a read-only snapshot. |
+| `system_tokens_after` | Terminal value of the same absolute-zero counter. |
+| `submit_rejections` | Ordered submit-time validator attempts: claim/step/run IDs, attempt number, timestamp, validation code, missing/invalid keys, and actionable diagnostic code; no submitted output body. |
+| `expects_validations` | Structured expects evaluations and accepted verdict transitions, including producer/consumer attribution and retry/done decision. |
+| `dispatch_renderings` | Structured prompt-render validation: required keys and unresolved-placeholder count/keys only; the rendered prompt itself is excluded. |
+
+Required (`R`) versus optional (`—`) inputs for the seven gating hooks are pinned here:
+
+| Evidence key | O1 | O2 | O3z | O8 | O9 | O10 | O11 |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| `database_snapshot` | R | R | R | — | R | R | R |
+| `run_events` | R | R | — | — | R | R | R |
+| `workflow_status` | R | — | — | — | — | — | — |
+| `launch_intent` | — | R | — | — | — | R | — |
+| `git_bundle` | — | R | — | R | R | — | — |
+| `refs_before`, `refs_after`, `target_reflog` | — | R | — | — | — | `refs_before` + `refs_after` | — |
+| `checksum_baseline`, `checksum_terminal` | — | — | — | R | — | — | — |
+| `suite_ledger`, `suite_observations` | — | R | — | — | R | R | — |
+| `token_deltas`, `round_usage` | — | — | — | — | — | — | R |
+| `system_tokens_before`, `system_tokens_after` | — | — | R | — | — | — | R |
+| `submit_rejections` | — | — | — | — | — | R | R |
+| `expects_validations`, `dispatch_renderings` | — | — | — | — | — | — | R |
+
+An artifact marked optional may be present and used for corroboration, but its presence
+does not permit an oracle to weaken or replace a required evidence leg. These are the
+only input references in version 1; adding a key requires a contract-version change.
+
+### Shared version-1 runtime
+
+Gating executables import `torture-test/oracles/lib/index.mjs` and run their check
+through `oracleMain`. The shared runtime is the canonical implementation of argv and
+environment identity checks, context/reference validation, SHA-256 verification,
+contained path resolution, read-only `node:sqlite` access, shell-free contained git
+plumbing, deterministic finding aggregation, exclusive evidence creation, output
+validation, and PASS/FAIL/ERROR exit mapping.
+
+The runtime locates the campaign results directory by walking upward from the absolute
+context path to the first directory containing the controller's regular non-symlink
+`state.json`. It never consults HOME or a default Tamandua state path. Database access
+accepts only a context reference, requires a non-writable captured file, and opens it
+with `DatabaseSync(..., {readOnly: true})`. Oracle-created artifacts are portable paths
+relative to `TT_ORACLE_EVIDENCE_DIR` and are opened with exclusive-create and
+no-follow semantics.
+
+Mutation fixtures use `oracles/self-test/harness.mjs --oracle <executable> --context
+<context.json> --expected PASS|FAIL`. The harness applies this contract to both stdout
+and exit status and fails on either mismatch direction. `oracles/self-test/run.sh`
+creates one unique `torture-test/var/oracle-self-test.*` workspace and its cleanup trap
+refuses to remove any path outside that namespace.
+
+### O1 terminal-state interpretation
+
+O1 canonicalizes public `run-<uuid>` identifiers and unprefixed SQLite IDs before
+joining evidence. Each oracle invocation evaluates its current root attempt and every `discovered_runs` entry,
+in canonical run-ID order, against `runs`, `steps`, `run_events`, and the terminal
+`workflow_status` observation. A terminal event is exactly `run.completed`,
+`run.failed`, or `run.canceled`, matching the DB terminal status. The DISP comparison
+uses raw status for DB equality and computes `displayStatus=verifying` only for a
+`type=loop`, raw `status=running` step whose current story ID is null; all other
+display statuses equal raw status. CLI-presented step IDs carry one `step-` prefix;
+O1 removes that presentation prefix before joining them to raw `steps.step_id` values.
+
+The five-minute scheduling bound is measured from `scheduling_requested_at`, falling
+back to `created_at`, through `workflow_status.captured_at`. A nonterminal run whose
+status is null, `pending_register`, or `queued` after that bound is unadmitted;
+`scheduling_status=error` is independently a finding.
+
+The only O1 healthy-straggler declaration in contract version 1 is the mechanical
+manifest projection below. `recent_within_ms` must be a positive integer no greater
+than 300000, the case harness must be `hermes`, and the run ID must be listed.
+
+```json
+{"healthy_straggler":{"policy":"hermes-storm","run_ids":["run-..."],"recent_within_ms":300000}}
+```
+
+The exemption engages only for a listed run canceled by the controller after a
+`straggler_capture` whose pre-stop snapshot contains a `running` step with a positive
+claim PID and recent claim update. A recent production-shaped `run.tokens.updated`
+event must match that run and its DB workflow ID and contain a positive token delta
+with a consistent cumulative token total. Tamandua's production event has no step or
+round ID, so the live step is correlated mechanically by the shared run ID and bounded
+timestamps rather than a synthetic field. Unlike the former synthetic-only
+`work.round.output`/`run.force_stop_requested` convention, both the token event and
+pre-stop capture are produced on real controller/Tamandua paths. O1 records the run as
+`healthy_straggler` in its deterministic evidence and, when no independent finding
+remains, returns PASS with `classification.ambiguous.category` equal to
+`HEALTHY_STRAGGLER`. Missing declaration or any missing mechanical leg leaves the
+ordinary terminal checks engaged.
+
+For anti-gaming, O1 groups `o1_wave.runs` by workflow family, excludes mechanically
+predeclared fast-failure cases, and fails when the count terminating strictly below
+the selected floor divided by all launched eligible runs is greater than 20%. Exactly
+20% is allowed. The output evidence records floor source, denominator, numerator, and
+rate deterministically.
+
+### O3z zero-token interpretation
+
+O3z evaluates every identified root attempt and discovered run in the context. Run
+identity and terminal status/token totals come from the read-only `runs` snapshot;
+`execution_mode` comes only from the controller's immutable attempt projection. A
+`status=completed`, `execution_mode=real` run requires positive `runs.tokens_spent`.
+Scripted attempts are exempt from that coarse nonzero rule because their exact
+synthetic accounting belongs to O11, but they are never exempt from the system-token
+tripwire. Discovered child/replacement runs inherit the root attempt's mechanically
+captured launch mode when they enter the durable controller ledger. Failed and canceled
+real runs are likewise outside the completed-run rule.
+
+`system_tokens_before` and `system_tokens_after` each contain `schema_version`,
+`captured_at`, `table_present`, the ordered captured `rows` of
+`system_tokens_spent`, and their numeric `value` sum. O3z requires the table and at
+least one non-negative-integer row, verifies the sum, and requires every row and the
+sum to equal zero. It independently reads the terminal `tamandua_stats` rows from the
+database snapshot, applies the same absolute-zero check, and requires them to exactly
+reconcile with `system_tokens_after`. Missing or malformed observations are oracle
+errors rather than guessed passes.
+
+### O2 merge-identity interpretation
+
+O2 evaluates the captured merge-family root/discovered runs and reads only the
+whitelisted `tested_tree` hash from each run's durable context; raw step output and
+the remainder of the agent response are never read. The captured merge-family graph
+must have one non-noop `merge.landed` event, one target transition between the
+`refs_before` capture and terminal reflog capture, and a changed target tip. The
+event's `expectedTip`/`mergedCommit` must equal the captured pre/post tips. Landing
+uniqueness is enforced both per run and across the root/discovered run graph; a later
+discovered run may only contribute a mechanically valid no-op recovery observation.
+A run that owns the landing must finish `completed`; failed or canceled after landing
+is a product failure because the target already moved.
+
+For that landing, O2 requires event `mergedTree == tested_tree`, resolves
+`mergedCommit^{tree}` from the extracted controller git-common-dir snapshot, and
+requires the same tree. The merged commit must be an ancestor of the terminal
+target. Patch truth is computed mechanically from the attested trees rather than a
+self-asserted branch name: O2 computes stable patch-id from `expectedTip` to the
+attested merged tree, corroborates that the captured landing-source ref resolves to
+that tree, computes patch-ids for commits in `expectedTip..target_tip`, and requires
+the attested patch-id in that target set. The source must be a named non-target branch
+and cannot resolve to the terminal target commit. An empty source diff is not a landing.
+
+No-op `merge.landed` observations never count as another landing. They are accepted
+only after the run's one non-noop landing, with `expectedTip`, `mergedCommit`,
+`mergedTree`, and target proving that the same commit was already landed, plus a
+canonical event timestamp strictly later than that landing. A no-op
+without that prior transition does not exempt a completed run from the phantom-merge
+rule. Mode-scoped suite provenance and full bidirectional transition attribution are
+added by the O2 mode-reconciliation layer; these core identity checks remain engaged
+for every mode.
+
+The O2 mode-reconciliation layer binds its exact suite key to
+`launch_intent.gate_key` and the mechanically attested merged tree. Ordinary
+landings require at least one captured `suite_results` row for that exact
+`(origin_repo, merged_tree, cmd_hash)` key. A default concession instead requires
+exactly one matching `merge.landed_without_suite_evidence` event, no exact-key
+green or red row, exactly one earlier `step.rerouted` event for `finalize_merge`,
+and a single DB finalize step whose `terminal_reroute_count` is one. Off mode
+requires both manifest policy and projected argv to bind `merge_gate=off` and one
+earlier exact-key `merge.gate_overridden` event. Agent output and mutable run
+gate/test-command keys do not establish any of these legs.
+
+O2 reconciles each non-noop `merge.landed` old/new pair to exactly one captured
+raw-reflog transition and each in-window non-noop transition back to exactly one
+captured merge-run landing. Terminal disposition never waives commit/tree/patch
+checks: a landed failed or canceled run is a finding after those identity checks
+run. On every FAIL, O2 writes a separate contained raw-reflog anomaly artifact
+carrying the complete captured raw entries and deterministic finding IDs; branch
+names are used only to corroborate source-tree identity, never to infer target
+movement.
+
+The extracted git snapshot rejects symlinks, non-regular archive entries, traversal,
+alternates, HTTP alternates, and replacement refs. Git plumbing ignores repository,
+global, and system config and replacement objects while evaluating the snapshot.
+
+### O8 boundary and test-integrity interpretation
+
+O8 treats `case.boundary_files` as the per-merge expected-file declaration. A changed
+path that existed at baseline must match that declaration. A new path must match it or
+be mechanically recognized as a test path (a `test`, `tests`, or `__tests__` directory,
+not merely a test/spec filename outside such a directory). This bidirectional inventory reconciliation is the expected-file
+leg; the transport-artifact denylist is an independent leg and still applies inside an
+allowed boundary.
+
+The baseline and terminal checksum artifacts contain path-sorted complete-tree entries
+with type, mode, SHA-256, categories, and, for test files, non-negative counts of the
+case-insensitive `skip`, `todo`, and `xfail` tokens. `changed_paths` must exactly equal
+the difference of those inventories. O8 extracts the contained Git snapshot, rejects
+external-object mechanisms, and requires the terminal inventory's paths, regular-file
+modes, and bytes to equal captured Git `HEAD`; it does not trust a changed-path list by
+itself. Forbidden declarations must resolve to baseline entries and every such entry's
+terminal bytes must have the same SHA-256. Test marker counts may not increase.
+
+A seeded test may be deleted or changed only when the immutable manifest workflow ID is
+a `test-quarantine` workflow; mutable run context or agent output cannot declare that
+exception. The exception does not waive the new-marker or transport-artifact checks.
+Progress/report/transport filenames are rejected across the complete terminal tree,
+including `progress*`, `report*`, `transport*`, Tamandua report/reason/story transports,
+and story input/output transport files.
+
+### O9 ledger-key and replay interpretation
+
+O9 reconciles the captured `suite_ledger.rows` byte-for-field with a read-only query of
+`suite_results`; artifact rows are ordered by positive `id`. Every row's `tree_hash`
+must be a tree object used by a reachable commit in the isolated captured Git snapshot.
+An object that exists but is not a captured committed tree is not reusable evidence.
+
+`suite_observations` is a version-1 ordered mechanical state-machine projection. It
+contains a positive `ttl_green_ms` and globally timestamp/sequence-ordered rows. Every
+row carries a unique `id`, `invocation_id`, phase (`lookup`, `execute`, `record`, or
+`replay`), canonical `observed_at`, exact `origin_repo`/`tree_hash`/`cmd_hash`, boolean
+`force`, and nullable mechanical run/step attribution. A lookup carries nullable
+`latest_row_id`; execute carries `started_at`, full pre/post committed-tree hashes and
+the command exit code; record carries its positive `ledger_row_id` and exit code; replay
+carries its positive `ledger_row_id` when reconciliation succeeds (or null when the
+mechanical cache-hit observation names no valid prior row), exit code, full current `committed_tree_hash`, and the exact
+mechanically observed marker `TAMANDUA-TEST CACHED`. These fields are controller/shim
+observations, not captured stdout or agent prose. An unresolved cache hit is preserved
+as a complete lookup/replay invocation so O9 emits `O9_REPLAY_ROW_MISSING`; harvesting
+must never drop an invalid invocation merely because another invocation is valid.
+
+The artifact also contains three required arrays. `origin_identities` maps every ledger
+or observation `origin_repo` to the absolute, lexically normalized git-common-dir
+identity captured by the shim/controller; normalized identities are unique. This is the
+origin leg of the exact key: independent repositories do not collapse merely because
+their tree and command hashes match. `singleflight_observations` contains an ID, exact
+key, owner invocation, nonempty waiter invocation list, positive configured recovery
+bound, nullable recovery kind (`dead_owner` or `stop_cancel`), and a timestamp-ordered
+mechanical event timeline. Timeline event types are `execute_started`, `wait`, `record`,
+`replay`, `dead_owner_reclaimed`, and `owner_released`; process IDs, release reason, and
+ledger row ID are carried where mechanically observed. Ordinary contention has exactly
+one executor and every waiter replays the exact-key green row named by the owner's
+`record` event; another prior exact-key green row is not an owner-row substitute.
+Recovery may add one waiter execution only strictly after the recorded recovery leg.
+Dead-owner recovery
+requires exactly one `suite.claim_dead_owner_reclaimed` projection within the configured
+bound and no owner-release event; stop/cancel release requires one `owner_released` with
+reason `stop` or `cancel` and forbids a dead-owner event.
+When liveness probing reclaims the owner in the first colliding claim request, the reclaim
+event itself mechanically identifies the reclaimer and collision. The snapshotter projects
+that request as a zero-duration `wait` at the reclaim timestamp; it must not discard the
+reclaim merely because no separate `suite.claim_wait` event preceded it.
+
+`special_exit_observations` contains mechanically injected exit-86/87/88 process
+outcomes: invocation and exact key, timestamp, shim and nullable command exits, full
+pre/post committed trees, nullable ledger row, interrupted/tracked-dirty booleans, and
+the captured junk-probe tracked state. A nonempty targeted set has exactly one of each
+code. Exit 86 is a passing command whose tree drifted and has no row; exit 87 is an
+interrupted stable-tree execution with exactly one red-87 row; exit 88 is a pre-execution
+tracked-dirty refusal with no row. Every special arm must leave its junk probe untracked.
+Empty concurrency and special-exit arrays mean those targeted manipulations were not
+part of the case; they do not synthesize coverage.
+
+Targeted special-exit process evidence is harvested only from the controller-authored
+`suite.special_exit_observed` mechanical event. That event carries the full exact key,
+full pre/post committed-tree hashes, shim and nullable command exit codes, nullable
+ledger row ID, interruption and tracked-dirty observations, and a safe repository-relative
+junk-probe path plus the event-time boolean produced by Git index plumbing. The snapshotter
+preserves that event-time `junk_probe_tracked` value even if the index changes later and
+validates that the probe remains a contained regular file; it never hardcodes or re-derives
+historical state from the terminal index. Malformed event-source JSON is a snapshot
+infrastructure error rather than silently disappearing. Ordinary
+`suite.executed` or `suite.tree_drift_detected` product events alone are insufficient to
+claim targeted exit-matrix coverage because they do not capture all process and
+filesystem legs. A malformed targeted event is snapshot infrastructure failure rather
+than an omitted observation.
+
+A manifest opts into this targeted arm with `chaos.o9_special_exits: true`. After the
+workflow converges and before terminal evidence is snapshotted, `tt-controller` launches
+three isolated `tamandua-test --force` probes attributed to the run with distinct step
+IDs and sets `TAMANDUA_TSTX_JUNK_PROBE` itself. The probe driver requires a clean tracked
+fixture, restores the selected tracked file byte-for-byte after the 86 and 88 arms,
+mechanically interrupts the 87 arm, verifies exact exits `[86,87,88]`, and verifies the
+junk path is not in the Git index. A launch, timeout, restoration, or evidence failure is
+TEST_INFRA; the controller never substitutes hand-authored special-exit observations.
+
+Each invocation keeps one exact key and force mode and follows `lookup -> replay` or
+`lookup -> execute -> record`. A replay must name the lookup's prior green row with the
+same exact key, at or before replay time and no older than `ttl_green_ms`; red rows are
+never replayable. The replay tree must remain equal to the lookup key and the cache
+marker must be present. A force invocation must execute and may not replay. A stable
+execution must reconcile its record row and timestamps, while a pre/post tree drift
+must produce no record. If a mechanically paired later force execution for the same key
+is red after a green replay, O9 reports a monotonicity violation because caching changed
+the observed would-run result. Single-flight ownership/recovery, special exits, junk
+probes, and cross-origin separation are enforced by the additional arrays without
+weakening these key/replay checks. The controller preserves same-command rows from all
+captured origins, so O9 can reconcile each normalized origin against the read-only DB
+and detect an otherwise plausible cross-repository replay.
+
+### O11 token-attribution interpretation
+
+O11's output-contract leg reads the terminal `steps` rows and three controller-authored
+structured event projections. It never reads `steps.output`, a submitted body, a rendered
+prompt, stderr, or agent prose. Every terminal `status=done` step in the captured root/
+discovered run graph must have exactly one accepted expects-validation row whose verdict
+and transition are both `done` for that same database step row. A completed run containing
+an accepted `retry` verdict is a finding; retry is a lifecycle transition, not completion.
+
+`expects_validations.rows` is ordered mechanical validation evidence emitted by the real
+`tamandua step complete` validator after its lifecycle transition returns. Each row contains a
+unique `id`, canonical `observed_at`, `run_id`, database `step_row_id`, workflow `step_id`,
+`claim_id`, positive `attempt_number`, `outcome` (`accepted` or `rejected`), nullable
+`verdict` (`done`, `retry`, or `failed`), boolean `expects_required`, ordered
+`required_keys`/`missing_keys`/`invalid_keys`, nonempty `diagnostic_code`, and a structured
+`transition` (`action` and target database step row). `key_sources` is retained for schema
+compatibility but submit-time missing output keys identify the submitting step, not a
+downstream context producer. Producer attribution is therefore proven by the dispatch rows
+described below. The artifact is projected only from `step.expects.validated` events with
+flat mechanical fields; submitted bytes are excluded. Production events may omit an attempt
+number: the controller assigns it from immutable event order independently for each claim,
+so repeated rejected submissions do not need a mutable database counter and cannot collapse.
+
+`submit_rejections.rows` contains a unique record ID, timestamp, run/step/claim identity,
+positive attempt number, validation code, ordered missing/invalid key inventories, and a
+specific diagnostic code. It reconciles one-for-one with rejected expects-validation
+attempts. Attempts for one claim remain as distinct rows in strict time/attempt order;
+repeating the same mechanical violation may repeat its specific code, but must not replace
+or collapse either attempt. Generic diagnostics (`GENERIC`, `REJECTED`,
+`UNKNOWN`, `VALIDATION_FAILED`, or `EXPECTS_REJECTED`) are findings even when a CLI message
+would have contained more prose. This ensures every resubmission retains independently
+actionable mechanical evidence without admitting that prose to the oracle.
+
+`dispatch_renderings.rows` contains a unique record ID, timestamp, run/step/claim identity,
+ordered `required_keys`, and only the count and key inventory of unresolved placeholders.
+The rendered prompt is not captured. A `dispatched=true` row must have an empty unresolved
+inventory; a positive value mechanically proves that a `[missing: <key>]` placeholder was
+rendered and is a finding. A `dispatched=false` `dispatch.keys.rejected` row instead proves
+the pre-dispatch guard blocked the model round. Such a row carries the producer database row
+and structured retry/reroute transition; the producer must be a distinct same-run upstream
+step and the transition must target it rather than consuming a retry on the downstream
+consumer. The snapshotter fails closed on malformed matching `step.submit.rejected`,
+`step.expects.validated`, `dispatch.render.validated`, or `dispatch.keys.rejected` events
+instead of dropping a product-invalid observation.
+
+O11 reconciles every `run.tokens.updated` row in `token_deltas` byte-for-byte with the
+same archive/line/event row in `run_events`. Each event has canonical `ts`, `runId`,
+non-negative integer `tokenDelta` and cumulative `tokensSpent`, plus nonempty `stepId`,
+`roundId`, and `usageId`. The latter three fields are the captured round identity; their
+absence is a product finding rather than permission to infer identity from timestamps.
+Events are ordered by timestamp and source line per run, and their cumulative totals must
+equal the running sum from zero. That sum must equal terminal `runs.tokens_spent` and the
+controller attempt's `tokens_observed`. Every completed real run requires a positive sum.
+
+`round_usage` has `schema_version`, `captured_at`, `rows`, and `synthetic_ledger`. Every
+usage row has a unique nonempty `id` (the event's `usageId`), nullable mechanically
+captured `run_id`, `step_id`, and `round_id`, `harness` (`pi`, `hermes`, or `scripted`),
+nullable `session_id`, canonical `started_at`/`finished_at`, ordered
+`candidate_run_ids`, and `formula_inputs`. Pi uses `formula_inputs.total` when present;
+otherwise its product trailer formula is `input + output + cache_read + cache_write`.
+Hermes is exactly `input + output + cache_write`; O11 validates but excludes both
+`cache_read` and `reasoning`. Scripted usage uses `synthetic_tokens`. Every usage maps to
+exactly one token event, with the same run/step/round and computed delta. A differing
+usage owner and charged event run is cross-charge even when their attempt windows overlap.
+The owner and every candidate must name a captured attempt whose start/terminal window
+overlaps the usage interval, the owner must occur in its candidate set, and the token
+event cannot precede usage completion. Token events naming a run outside the captured
+root/discovered graph are findings.
+
+A Hermes usage with no bound `run_id` or a `candidate_run_ids` set other than exactly one
+is an explicit `O11_HERMES_ATTRIBUTION_AMBIGUOUS` finding. O11 never chooses a candidate
+by comparing totals. Each `synthetic_ledger` row contains one `run_id` and non-negative
+`expected_tokens`; there is exactly one row for every scripted root/discovered run and no
+row for a real or unknown run. The artifact must byte-for-field equal the immutable
+`case.chaos.synthetic_token_ledger` manifest projection. Its value must equal the
+attributed event sum exactly.
+When the production event stream does not yet expose normalized trailer/session inputs,
+the controller writes empty usage rows rather than duplicating token events or fabricating
+formula inputs; O11 then reports missing usage/identity findings with contract-valid
+evidence. Output-contract, expects, rendering, and informed-rejection legs use the other
+required O11 artifacts and are independent of this token-attribution layer.
+
+### O10 FMIS decision-table interpretation
+
+O10 evaluates each projected merge run against the immutable `launch_intent.policy`
+and `launch_intent.gate_key`. The four policy rows are `off`, default, default with
+strict missing, and `green`. Strict missing is active for green mode or when the
+launch-time `fail_missing` value is a string equal to `1`, `true`, or `on`
+case-insensitively. The value is deliberately not trimmed and non-string truthy values
+are not accepted. Off mode dominates `fail_missing` and always remains permissive.
+For every root or discovered replacement run, O10 parses the terminal read-only
+`runs.context` and compares the effective `merge_gate` and `fail_missing` values
+exactly with the captured launch values (an absent key and launch `null` are equivalent).
+Any differing value is a launch-intent mutation finding; the effective context never
+governs the expected table cell.
+
+The decision evidence is the latest captured suite row at or before the terminal
+`finalize_merge.updated_at` for the exact launch origin and command hash plus the
+mechanically attested gate tree. The `suite_ledger` artifact must reconcile
+byte-for-field with the read-only `suite_results` table. O10 derives merger invocation
+count from `step.running` events for `finalize_merge`, reroute count from both the
+terminal step counter and `step.rerouted` events, ref movement from `refs_before` and
+`refs_after`, and terminal disposition from the database, controller projection, and
+terminal run event.
+
+For each FMIS cell, the exact corridor event multiset consists only of the applicable
+`step.rerouted`, `step.running`, `merge.gate_overridden`,
+`merge.landed_without_suite_evidence`, `merge.landed_over_red_suite`, `merge.landed`,
+and terminal `run.*` events. Every obstructing path reroutes exactly once. A default
+missing row then concedes and lands; strict missing and green red refuse permanently;
+default red remains advisory and lands; green evidence lands; off always lands with an
+override event. Landing cells move the target and invoke the merger once. Refusal cells
+do neither and end failed.
+
+`merge.accepted_already_landed` is the sole no-ref-movement completion exception. It
+requires exactly one such event, no `merge.landed` event, a non-off launch mode, no
+reroute, one merger invocation, an obstructing red/missing pre-claim decision, unchanged
+pre/post target tips, and the accepted
+`MERGED_COMMIT` equal to that tip. Its accepted `MERGED_TREE` must equal the mechanically
+attested gate tree. A completed no-landing output without the annotation fails. This
+models a row flip or deletion between claim and acceptance without falsely requiring a
+second ref transition.
+
+Every `merge.landed_without_suite_evidence` concession must itself name the immutable
+launch `origin_repo` and `cmd_hash` plus the mechanically attested merged tree. O10
+selects the latest exact-key row whose timestamp is at or before gate evaluation. An
+exact-key red row paired with a missing-evidence concession is
+`O10_EXACT_KEY_RED_LAUNDERED`; red rows for another origin/tree/command or rows written
+after gate evaluation do not trigger that finding and remain mechanically missing for
+that decision.
+
+Strict refusals are created by the pre-claim gate, not by an agent. O10 may therefore
+read only the gate-generated `finalize_merge.output` key lines from the read-only
+database snapshot. It validates `FAILURE_CLASS`, `LEDGER_EVIDENCE`, exact origin/tree/
+command identity, red-row identity when applicable, and the nonempty `TEST_CMD`,
+`WORKSPACE_STATE`, `NEAREST_EVIDENCE`, and `ACTION` diagnostics. It does not inspect
+claimed agent response prose or use any output line as a policy override. Launch-intent
+invariance, replacement inheritance, already-landed acceptance, and red-to-missing
+laundering checks extend this core FMIS layer without weakening it.
 
 ## Output
 
@@ -108,8 +660,9 @@ hook that executed incorrectly.
 
 Before invocation, the controller writes the context and a durable `RUNNING`
 ledger record. It captures stdout and stderr separately, records the exit code,
-signal, argv, start/finish timestamps, and SHA-256 hashes, and then validates the
-response. Referenced evidence files are also hashed. Captured files are made
+signal, argv, start/finish timestamps, and SHA-256 hashes for context, stdout,
+and stderr, and then validates the response. Referenced evidence files are also
+hashed. Captured files are made
 read-only after capture/validation. If the controller is interrupted while an
 oracle is in flight, resume records `TEST_INFRA` and does not blindly execute the
 hook a second time.

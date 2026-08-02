@@ -428,6 +428,31 @@ function emitDeadOwnerReclaim(
   }
 }
 
+function emitClaimTimelineEvent(
+  name: "suite.claim_granted" | "suite.claim_wait" | "suite.claim_owner_released",
+  claim: SuiteClaim,
+  actor: ValidSuiteClaimFields | undefined,
+  runtime: SuiteClaimRuntime,
+  releaseReason?: string,
+): void {
+  runtime.emitClaimEvent({
+    ts: new Date(runtime.now()).toISOString(),
+    event: name,
+    runId: actor?.runId ?? claim.runId ?? "",
+    stepId: actor?.stepId ?? claim.stepId,
+    originRepo: claim.originRepo,
+    treeHash: claim.treeHash,
+    cmdHash: claim.cmdHash,
+    ownerRunId: claim.runId,
+    ownerStepId: claim.stepId,
+    ownerPid: claim.ownerPid,
+    reclaimerRunId: actor?.runId,
+    reclaimerStepId: actor?.stepId,
+    reclaimerPid: actor?.ownerPid,
+    releaseReason,
+  });
+}
+
 function cleanStaleClaims(
   runtime: SuiteClaimRuntime,
   collisionKey?: string,
@@ -504,6 +529,8 @@ async function handleSuiteRecord(body: Record<string, unknown>): Promise<JsonRes
   const logTail = typeof body.log_tail === "string" ? body.log_tail : null;
   const runId = typeof body.run_id === "string" ? body.run_id : null;
   const stepId = typeof body.step_id === "string" ? body.step_id : null;
+  const force = body.force === true;
+  const startedAt = typeof body.started_at === "string" ? body.started_at : undefined;
 
   if (!originRepo || !treeHash || !cmdHash || !cmdDisplay || exitCode === null || durationMs === null) {
     return { status: 400, body: { error: "Missing required fields: origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms" } };
@@ -517,17 +544,23 @@ async function handleSuiteRecord(body: Record<string, unknown>): Promise<JsonRes
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(originRepo, treeHash, cmdHash, cmdDisplay, exitCode, durationMs, logTail, runId, stepId, created_at);
 
-    // Emit suite.executed event for observability (US-009).
+    const ledgerRowId = Number(result.lastInsertRowid);
+    // Emit exact-key execution/record evidence for immutable O9 harvesting.
     const eventRunId = runId || "";
     emitEvent({
       ts: created_at,
       event: "suite.executed",
       runId: eventRunId,
       stepId: stepId || undefined,
+      originRepo,
       treeHash,
+      cmdHash,
       cmdDisplay,
       durationMs,
       exitCode,
+      force,
+      startedAt,
+      ledgerRowId,
     });
 
     // Clear any pending claim so waiters can pick up the result.
@@ -535,7 +568,7 @@ async function handleSuiteRecord(body: Record<string, unknown>): Promise<JsonRes
     suiteClaims.delete(claimKey);
     sweptDeadSuiteClaims.delete(claimKey);
 
-    return ok({ id: Number(result.lastInsertRowid), created_at });
+    return ok({ id: ledgerRowId, created_at });
   } catch (err) {
     logger.warn("control-server: suite record failed", { error: String(err) });
     return { status: 500, body: { error: err instanceof Error ? err.message : String(err) } };
@@ -557,6 +590,7 @@ async function handleSuiteClaim(
   const existing = suiteClaims.get(key);
 
   if (existing) {
+    emitClaimTimelineEvent("suite.claim_wait", existing, fields, runtime);
     return ok({ action: "wait", claimedAt: new Date(existing.claimedAt).toISOString() });
   }
 
@@ -566,13 +600,15 @@ async function handleSuiteClaim(
     emitDeadOwnerReclaim(sweptDeadClaim, fields, runtime);
   }
 
-  suiteClaims.set(key, {
+  const granted: SuiteClaim = {
     claimedAt: runtime.now(), ownerToken, ownerPid, runId, stepId, originRepo, treeHash, cmdHash,
-  });
+  };
+  suiteClaims.set(key, granted);
+  emitClaimTimelineEvent("suite.claim_granted", granted, fields, runtime);
   return ok({ action: "run" });
 }
 
-async function handleSuiteRelease(body: Record<string, unknown>): Promise<JsonResponse> {
+async function handleSuiteRelease(body: Record<string, unknown>, runtime: SuiteClaimRuntime): Promise<JsonResponse> {
   const fields = validateSuiteClaimFields(body);
   if (!fields) {
     return { status: 400, body: { error: "Invalid or oversized suite release fields" } };
@@ -586,27 +622,52 @@ async function handleSuiteRelease(body: Record<string, unknown>): Promise<JsonRe
     return { status: 409, body: { error: "Suite claim is owned by another caller" } };
   }
   suiteClaims.delete(key);
+  emitClaimTimelineEvent(
+    "suite.claim_owner_released",
+    existing,
+    fields,
+    runtime,
+    typeof body.reason === "string" ? body.reason : "exact_owner_release",
+  );
   return ok({ released: true });
 }
 
-function releaseSuiteClaimsByOwner(runId: string, stepId?: string): number {
+function releaseSuiteClaimsByOwner(
+  runId: string,
+  stepId?: string,
+  runtime?: SuiteClaimRuntime,
+  releaseReason = "owner_recovery",
+): number {
   let released = 0;
   for (const [key, claim] of suiteClaims) {
     if (claim.runId !== runId || (stepId !== undefined && claim.stepId !== stepId)) continue;
     suiteClaims.delete(key);
+    if (runtime) {
+      emitClaimTimelineEvent("suite.claim_owner_released", claim, undefined, runtime, releaseReason);
+    }
     released += 1;
   }
   return released;
 }
 
-async function handleSuiteOwnerRelease(body: Record<string, unknown>): Promise<JsonResponse> {
+async function handleSuiteOwnerRelease(
+  body: Record<string, unknown>,
+  runtime: SuiteClaimRuntime,
+): Promise<JsonResponse> {
   const runId = typeof body.run_id === "string" ? body.run_id.trim() : "";
   const stepId = typeof body.step_id === "string" ? body.step_id.trim() : undefined;
   if (!runId || runId.length > SUITE_OWNER_MAX_LENGTH
     || (stepId !== undefined && (!stepId || stepId.length > SUITE_OWNER_MAX_LENGTH))) {
     return { status: 400, body: { error: "Invalid suite claim owner attribution" } };
   }
-  return ok({ released: releaseSuiteClaimsByOwner(runId, stepId) });
+  return ok({
+    released: releaseSuiteClaimsByOwner(
+      runId,
+      stepId,
+      runtime,
+      typeof body.reason === "string" ? body.reason : "owner_recovery",
+    ),
+  });
 }
 
 async function handleSuiteEvent(body: Record<string, unknown>): Promise<JsonResponse> {
@@ -637,6 +698,16 @@ async function handleSuiteEvent(body: Record<string, unknown>): Promise<JsonResp
   if (typeof body.waited_ms === "number") evt.waitedMs = body.waited_ms;
   if (typeof body.pre_tree_hash === "string") evt.preTreeHash = body.pre_tree_hash;
   if (typeof body.post_tree_hash === "string") evt.postTreeHash = body.post_tree_hash;
+  if (typeof body.force === "boolean") evt.force = body.force;
+  if (typeof body.origin_repo === "string") evt.originRepo = body.origin_repo;
+  if (typeof body.started_at === "string") evt.startedAt = body.started_at;
+  if (typeof body.shim_exit_code === "number") evt.shimExitCode = body.shim_exit_code;
+  if (typeof body.command_exit_code === "number" || body.command_exit_code === null) evt.commandExitCode = body.command_exit_code;
+  if (typeof body.ledger_row_id === "number" || body.ledger_row_id === null) evt.ledgerRowId = body.ledger_row_id;
+  if (typeof body.interrupted === "boolean") evt.interrupted = body.interrupted;
+  if (typeof body.tracked_dirty === "boolean") evt.trackedDirty = body.tracked_dirty;
+  if (typeof body.junk_probe_path === "string") evt.junkProbePath = body.junk_probe_path;
+  if (typeof body.junk_probe_tracked === "boolean") evt.junkProbeTracked = body.junk_probe_tracked;
 
   try {
     emitEvent(evt as unknown as TamanduaEvent);
@@ -740,7 +811,7 @@ async function handleRegisterRun(runId: string): Promise<JsonResponse> {
   }
 }
 
-async function handleTerminateRun(runId: string): Promise<JsonResponse> {
+async function handleTerminateRun(runId: string, suiteRuntime?: SuiteClaimRuntime): Promise<JsonResponse> {
   const run = getRun(runId);
   if (!run) return notFound(`Run not found: ${runId}`);
 
@@ -758,7 +829,7 @@ async function handleTerminateRun(runId: string): Promise<JsonResponse> {
   } catch (err) {
     logger.warn("control-server: removeRunCrons threw", { runId, error: String(err) });
   }
-  releaseSuiteClaimsByOwner(runId);
+  releaseSuiteClaimsByOwner(runId, undefined, suiteRuntime, "cancel");
 
   try {
     getDb()
@@ -778,7 +849,12 @@ async function handleTerminateRun(runId: string): Promise<JsonResponse> {
   return ok({ terminated: true });
 }
 
-async function handlePauseRun(runId: string, drain = false, requestedBy = "unknown"): Promise<JsonResponse> {
+async function handlePauseRun(
+  runId: string,
+  drain = false,
+  requestedBy = "unknown",
+  suiteRuntime?: SuiteClaimRuntime,
+): Promise<JsonResponse> {
   const run = getRun(runId);
   if (!run) return notFound(`Run not found: ${runId}`);
   if (isTerminal(run.status)) return conflict(`Run is terminal: ${run.status}`);
@@ -832,7 +908,7 @@ async function handlePauseRun(runId: string, drain = false, requestedBy = "unkno
   } catch (err) {
     logger.warn("control-server: pause removeRunCrons threw", { runId, error: String(err) });
   }
-  releaseSuiteClaimsByOwner(runId);
+  releaseSuiteClaimsByOwner(runId, undefined, suiteRuntime, "stop");
   try {
     getDb()
       .prepare(
@@ -1191,12 +1267,12 @@ export function createControlServer(options: ControlServerOptions = {}): http.Se
           return;
         }
         if (pathname === "/suite/release") {
-          const r = await handleSuiteRelease(body);
+          const r = await handleSuiteRelease(body, suiteClaimRuntime);
           respond(r.status, r.body);
           return;
         }
         if (pathname === "/suite/release-owner") {
-          const r = await handleSuiteOwnerRelease(body);
+          const r = await handleSuiteOwnerRelease(body, suiteClaimRuntime);
           respond(r.status, r.body);
           return;
         }
@@ -1215,14 +1291,14 @@ export function createControlServer(options: ControlServerOptions = {}): http.Se
           return;
         }
         if (pathname === "/control/terminate-run") {
-          const r = await handleTerminateRun(runId);
+          const r = await handleTerminateRun(runId, suiteClaimRuntime);
           respond(r.status, r.body);
           return;
         }
         if (pathname === "/control/pause-run") {
           const drain = typeof body.drain === "boolean" ? body.drain : false;
           const requestedBy = typeof body.requestedBy === "string" ? body.requestedBy : "unknown";
-          const r = await handlePauseRun(runId, drain, requestedBy);
+          const r = await handlePauseRun(runId, drain, requestedBy, suiteClaimRuntime);
           respond(r.status, r.body);
           return;
         }

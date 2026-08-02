@@ -192,6 +192,8 @@ export interface SuiteRecordParams {
   log_tail?: string | null;
   run_id?: string | null;
   step_id?: string | null;
+  force?: boolean;
+  started_at?: string;
 }
 
 /** Result of a suite record operation. */
@@ -266,6 +268,8 @@ export async function recordSuiteResult(
   if (params.log_tail != null) body.log_tail = params.log_tail;
   if (params.run_id != null) body.run_id = params.run_id;
   if (params.step_id != null) body.step_id = params.step_id;
+  if (params.force != null) body.force = params.force;
+  if (params.started_at) body.started_at = params.started_at;
   const r = await controlRequest("POST", "/suite/record", body, timeoutMs);
   if (!r || r.status !== 200) return null;
   return r.body as unknown as SuiteRecordResult;
@@ -315,8 +319,11 @@ export async function releaseSuiteKey(
   treeHash: string,
   cmdHash: string,
   ownerToken?: string,
+  reasonOrTimeout?: string | number,
   timeoutMs: number = DEFAULT_TIMEOUT_MS,
 ): Promise<boolean> {
+  const reason = typeof reasonOrTimeout === "string" ? reasonOrTimeout : undefined;
+  const effectiveTimeout = typeof reasonOrTimeout === "number" ? reasonOrTimeout : timeoutMs;
   const r = await controlRequest(
     "POST",
     "/suite/release",
@@ -325,8 +332,9 @@ export async function releaseSuiteKey(
       tree_hash: treeHash,
       cmd_hash: cmdHash,
       ...(ownerToken ? { owner_token: ownerToken } : {}),
+      ...(reason ? { reason } : {}),
     },
-    timeoutMs,
+    effectiveTimeout,
   );
   if (!r || r.status !== 200) return false;
   return (r.body as unknown as SuiteReleaseResult).released === true;
@@ -336,13 +344,16 @@ export async function releaseSuiteKey(
 export async function releaseSuiteClaimsByOwner(
   runId: string,
   stepId?: string,
+  reasonOrTimeout?: string | number,
   timeoutMs: number = DEFAULT_TIMEOUT_MS,
 ): Promise<number | null> {
+  const reason = typeof reasonOrTimeout === "string" ? reasonOrTimeout : undefined;
+  const effectiveTimeout = typeof reasonOrTimeout === "number" ? reasonOrTimeout : timeoutMs;
   const r = await controlRequest(
     "POST",
     "/suite/release-owner",
-    { run_id: runId, ...(stepId ? { step_id: stepId } : {}) },
-    timeoutMs,
+    { run_id: runId, ...(stepId ? { step_id: stepId } : {}), ...(reason ? { reason } : {}) },
+    effectiveTimeout,
   );
   if (!r || r.status !== 200) return null;
   const released = (r.body as unknown as SuiteOwnerReleaseResult).released;
@@ -366,6 +377,16 @@ export interface SuiteEventParams {
   waited_ms?: number;
   pre_tree_hash?: string;
   post_tree_hash?: string;
+  force?: boolean;
+  origin_repo?: string;
+  started_at?: string;
+  shim_exit_code?: number;
+  command_exit_code?: number | null;
+  ledger_row_id?: number | null;
+  interrupted?: boolean;
+  tracked_dirty?: boolean;
+  junk_probe_path?: string;
+  junk_probe_tracked?: boolean;
 }
 
 /**
@@ -394,6 +415,16 @@ export async function emitSuiteEvent(
   if (params.waited_ms != null) body.waited_ms = params.waited_ms;
   if (params.pre_tree_hash) body.pre_tree_hash = params.pre_tree_hash;
   if (params.post_tree_hash) body.post_tree_hash = params.post_tree_hash;
+  if (params.force != null) body.force = params.force;
+  if (params.origin_repo) body.origin_repo = params.origin_repo;
+  if (params.started_at) body.started_at = params.started_at;
+  if (params.shim_exit_code != null) body.shim_exit_code = params.shim_exit_code;
+  if (params.command_exit_code !== undefined) body.command_exit_code = params.command_exit_code;
+  if (params.ledger_row_id !== undefined) body.ledger_row_id = params.ledger_row_id;
+  if (params.interrupted != null) body.interrupted = params.interrupted;
+  if (params.tracked_dirty != null) body.tracked_dirty = params.tracked_dirty;
+  if (params.junk_probe_path) body.junk_probe_path = params.junk_probe_path;
+  if (params.junk_probe_tracked != null) body.junk_probe_tracked = params.junk_probe_tracked;
 
   const r = await controlRequest("POST", "/suite/event", body, timeoutMs);
   return r !== null && r.status === 200;

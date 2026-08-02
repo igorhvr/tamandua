@@ -1,0 +1,6 @@
+#!/usr/bin/env node
+
+import { oracleMain } from './lib/index.mjs';
+import { evaluateO10 } from './lib/o10.mjs';
+
+await oracleMain(evaluateO10);

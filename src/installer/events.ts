@@ -59,6 +59,7 @@ export interface TamanduaEvent {
   waitedMs?: number;
   preTreeHash?: string;
   postTreeHash?: string;
+  force?: boolean;
   originRepo?: string;
   ownerRunId?: string;
   ownerStepId?: string;
@@ -66,6 +67,14 @@ export interface TamanduaEvent {
   reclaimerRunId?: string;
   reclaimerStepId?: string;
   reclaimerPid?: number;
+  releaseReason?: string;
+  startedAt?: string;
+  shimExitCode?: number;
+  commandExitCode?: number | null;
+  interrupted?: boolean;
+  trackedDirty?: boolean;
+  junkProbePath?: string;
+  junkProbeTracked?: boolean;
   // Plumbing merge fields
   origin?: string;
   branch?: string;
@@ -84,6 +93,27 @@ export interface TamanduaEvent {
   gateMode?: string;
   runNumber?: number;
   launchTs?: string;
+  // Mechanical output-contract evidence (O11). These fields describe the
+  // validator/lifecycle decision only; submitted output and rendered prompts
+  // are deliberately excluded.
+  recordId?: string;
+  stepRowId?: string;
+  claimId?: string;
+  attemptNumber?: number;
+  validationCode?: string;
+  diagnosticCode?: string;
+  outcome?: string;
+  verdict?: string | null;
+  expectsRequired?: boolean;
+  requiredKeys?: string[];
+  missingKeys?: string[];
+  invalidKeys?: string[];
+  producerStepRowId?: string | null;
+  transitionAction?: string;
+  transitionTargetStepRowId?: string;
+  unresolvedPlaceholderCount?: number;
+  unresolvedKeys?: string[];
+  dispatched?: boolean;
 }
 
 export type EventCursorSource =

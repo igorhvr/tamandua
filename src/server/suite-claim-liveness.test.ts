@@ -191,8 +191,31 @@ describe("suite claim owner liveness", { concurrency: 1 }, () => {
     assert.equal(released.status, 200);
     assert.equal(released.body.released, 1);
 
+    const releaseEvent = events.find((event) => event.event === "suite.claim_owner_released"
+      && event.originRepo === "/repo/release-a");
+    assert.ok(releaseEvent, "owner-scoped release must leave a mechanically attributable timeline event");
+    assert.equal(releaseEvent.ownerRunId, "run-release-a");
+    assert.equal(releaseEvent.ownerStepId, "step-release-a");
+    assert.equal(releaseEvent.releaseReason, "owner_recovery");
+
     assert.equal((await request(key("release-a", "replacement", 604))).body.action, "run");
     assert.equal((await request(key("release-b", "waiter-b", 605))).body.action, "wait");
     assert.equal((await request(key("release-c", "waiter-c", 606))).body.action, "wait");
+  });
+
+  it("emits claim-granted and claim-wait events for ordinary one-owner/N-waiter contention", async () => {
+    const owner = key("ordinary", "ordinary-owner", 701);
+    assert.equal((await request(owner)).body.action, "run");
+    const waiters = await Promise.all(Array.from({ length: 3 }, (_, index) =>
+      request(key("ordinary", `ordinary-waiter-${index}`, 710 + index))));
+    assert.deepEqual(waiters.map((response) => response.body.action), ["wait", "wait", "wait"]);
+
+    const ordinaryEvents = events.filter((event) => event.originRepo === "/repo/ordinary");
+    assert.equal(ordinaryEvents.filter((event) => event.event === "suite.claim_granted").length, 1);
+    assert.equal(ordinaryEvents.filter((event) => event.event === "suite.claim_wait").length, 3);
+    assert.deepEqual(
+      ordinaryEvents.filter((event) => event.event === "suite.claim_wait").map((event) => event.ownerRunId),
+      ["run-ordinary-owner", "run-ordinary-owner", "run-ordinary-owner"],
+    );
   });
 });

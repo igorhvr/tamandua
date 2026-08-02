@@ -295,6 +295,24 @@ describe("daemon control plane", { concurrency: 1 }, () => {
     assert.equal((await claim("terminate", unrelatedRunId, "terminate-replacement")).body.action, "run");
     assert.equal((await claim("unrelated", unrelatedRunId, "unrelated-still-waiting")).body.action, "wait");
 
+    const events = fs.readFileSync(path.join(tempHome, ".tamandua", "events", "all.jsonl"), "utf8")
+      .trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>);
+    const releases = events.filter((event) => event.event === "suite.claim_owner_released");
+    assert.equal(
+      releases.find((event) => event.originRepo === "/control-release/pause")?.releaseReason,
+      "stop",
+    );
+    assert.equal(
+      releases.find((event) => event.originRepo === "/control-release/terminate")?.releaseReason,
+      "cancel",
+    );
+    assert.equal(
+      events.some((event) => event.event === "suite.claim_dead_owner_reclaimed"
+        && ["/control-release/pause", "/control-release/terminate"].includes(String(event.originRepo))),
+      false,
+      "stop/cancel release must not emit dead-owner evidence",
+    );
+
     const cleanup = new DatabaseSync(dbPath);
     cleanup.prepare("DELETE FROM runs WHERE id IN (?, ?, ?)").run(pauseRunId, terminateRunId, unrelatedRunId);
     cleanup.close();
@@ -2620,6 +2638,37 @@ describe("suite control-plane endpoints", { concurrency: 1 }, () => {
     assert.equal(evt.treeHash, "sf-hash");
     assert.equal(evt.cmdHash, "sf-cmd");
     assert.equal(evt.waitedMs, 0);
+  });
+
+  it("POST /suite/event preserves complete controller-authored special-exit evidence", async () => {
+    const runId = "evt-special-exit-run";
+    const body = {
+      event: "suite.special_exit_observed",
+      run_id: runId,
+      step_id: "exit-86",
+      origin_repo: "/fixture/origin",
+      tree_hash: "a".repeat(40),
+      cmd_hash: "b".repeat(64),
+      shim_exit_code: 86,
+      command_exit_code: 0,
+      pre_tree_hash: "a".repeat(40),
+      post_tree_hash: "c".repeat(40),
+      ledger_row_id: null,
+      interrupted: false,
+      tracked_dirty: false,
+      junk_probe_path: "junk-probe.tmp",
+      junk_probe_tracked: false,
+    };
+    assert.equal((await suiteRequest("POST", "/suite/event", body)).status, 200);
+    const evt = JSON.parse(fs.readFileSync(path.join(stateDir, "events", `${runId}.jsonl`), "utf8"));
+    assert.equal(evt.originRepo, body.origin_repo);
+    assert.equal(evt.shimExitCode, 86);
+    assert.equal(evt.commandExitCode, 0);
+    assert.equal(evt.ledgerRowId, null);
+    assert.equal(evt.interrupted, false);
+    assert.equal(evt.trackedDirty, false);
+    assert.equal(evt.junkProbePath, "junk-probe.tmp");
+    assert.equal(evt.junkProbeTracked, false);
   });
 
   it("POST /suite/event writes to both run and global event files", async () => {

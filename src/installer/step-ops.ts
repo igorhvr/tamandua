@@ -240,6 +240,30 @@ export function findMissingTemplateKeys(template: string, context: Record<string
   return missing;
 }
 
+function templateKeys(template: string): string[] {
+  const keys = new Set<string>();
+  template.replace(/\{\{(\w+(?:\.\w+)*)\}\}/g, (_match, key: string) => {
+    keys.add(key.toLowerCase());
+    return "";
+  });
+  return [...keys];
+}
+
+function emitDispatchRenderingValidation(step: {
+  id: string; run_id: string; step_id: string; input_template: string;
+}): void {
+  const claim = getDb().prepare(
+    "SELECT claim_job_id, claim_updated_at, updated_at FROM steps WHERE id = ?",
+  ).get(step.id) as { claim_job_id: string | null; claim_updated_at: string | null; updated_at: string } | undefined;
+  const claimId = claim?.claim_job_id ?? `${step.id}:${claim?.claim_updated_at ?? claim?.updated_at ?? "unknown"}`;
+  emitEvent({
+    ts: new Date().toISOString(), event: "dispatch.render.validated", recordId: crypto.randomUUID(),
+    runId: step.run_id, stepRowId: step.id, stepId: step.step_id, claimId,
+    requiredKeys: templateKeys(step.input_template), unresolvedPlaceholderCount: 0, unresolvedKeys: [],
+    dispatched: true,
+  });
+}
+
 // parseExpectedKeys and checkExpectsAcceptsVariant are now the
 // single-source-of-truth implementations in workflow-contract.ts.
 // Re-exported here for backward compatibility.
@@ -341,6 +365,7 @@ function resolveMissingKeys(
   // Deduplicate by producer stepId — multiple keys from the same upstream
   // step should only re-pend that step once.
   const producerMap = new Map<string, ProducerResult>();
+  const producerByKey = new Map<string, ProducerResult>();
   const unresolvableKeys: string[] = [];
   const exhaustedDetails: string[] = [];
 
@@ -354,6 +379,7 @@ function resolveMissingKeys(
       );
     } else {
       producerMap.set(producer.stepId, producer);
+      producerByKey.set(key, producer);
     }
   }
 
@@ -400,6 +426,17 @@ function resolveMissingKeys(
       agentId,
       detail: `Re-pended with retry_feedback: ${feedback}`,
     });
+    const producerKeys = missingKeys.filter((key) => producerByKey.get(key)?.stepId === producer.stepId);
+    for (const key of producerKeys) {
+      emitEvent({
+        ts: new Date().toISOString(), event: "dispatch.keys.rejected", recordId: crypto.randomUUID(),
+        runId, stepRowId: consumerStepRowId, stepId: consumerStepId,
+        claimId: `${consumerStepRowId}:missing-context`, requiredKeys: missingKeys,
+        unresolvedPlaceholderCount: 1, unresolvedKeys: [key], dispatched: false,
+        producerStepRowId: producer.stepId, transitionAction: "reroute",
+        transitionTargetStepRowId: producer.stepId,
+      });
+    }
     logger.info(
       `Re-pended producer step ${producer.stepId} ` +
         `(retry ${newRetryCount}/${producer.maxRetries}) ` +
@@ -1411,7 +1448,7 @@ export function recoverOrphanedStepsForAgent(
 
   const releaseRecoveredSuiteClaims = (recoveredRunId: string, recoveredStepId: string): void => {
     void import("../server/control-client.js")
-      .then((client) => client.releaseSuiteClaimsByOwner(recoveredRunId, recoveredStepId))
+      .then((client) => client.releaseSuiteClaimsByOwner(recoveredRunId, recoveredStepId, "cancel"))
       .catch((err) => {
         logger.warn("Suite claim release after step recovery failed", {
           runId: recoveredRunId,
@@ -2479,6 +2516,7 @@ export function claimStep(agentId: string, runId: string, workerOwnership?: Work
       db.prepare("UPDATE runs SET context = ?, updated_at = datetime('now') WHERE id = ?").run(JSON.stringify(context), step.run_id);
 
       const resolvedInput = resolveTemplate(step.input_template, renderContext);
+      emitDispatchRenderingValidation(step);
 
       if (hasTimeoutRetryLoop) {
         delete context["timeout_retry"];
@@ -2580,6 +2618,7 @@ export function claimStep(agentId: string, runId: string, workerOwnership?: Work
     }
 
     const resolvedInput = resolveTemplate(step.input_template, renderContext);
+    emitDispatchRenderingValidation(step);
 
     if (hasTimeoutRetry) {
       delete context["timeout_retry"];
