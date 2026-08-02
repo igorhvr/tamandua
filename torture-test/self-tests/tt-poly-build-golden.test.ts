@@ -3,7 +3,7 @@ import { execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { tamanduaTempDir } from "../../src/lib/temp-dir.ts";
-import { describe, it } from "node:test";
+import { before, after, describe, it } from "node:test";
 
 const repoRoot = process.cwd();
 
@@ -36,15 +36,47 @@ describe("tt-poly build-golden.sh", () => {
     "tt-poly",
     "build-golden.sh",
   );
-  const goldenDir = path.join(
-    repoRoot,
-    "torture-test",
-    "var",
-    "fixtures",
-    "golden",
-  );
-  const bareRepo = path.join(goldenDir, "tt-poly.git");
-  const hashFile = path.join(goldenDir, "tt-poly.git.hashes");
+
+  // Scratch golden dir for tests — built once by before() hook into
+  // torture-test/var/self-tests/ so the shared var/fixtures/golden/ is
+  // never touched.  Every builder invocation uses TORTURE_GOLDEN_DIR.
+  let scratchDir: string;
+  let goldenDir: string;
+  let bareRepo: string;
+  let hashFile: string;
+
+  // Helper: ensure self-tests scratch parent exists, then create a unique subdir
+  function makeScratchDir(prefix: string): string {
+    const parent = path.join(repoRoot, "torture-test", "var", "self-tests");
+    fs.mkdirSync(parent, { recursive: true });
+    return fs.mkdtempSync(path.join(parent, prefix));
+  }
+
+  // Helper: build golden output into a specific directory
+  function runBuilder(goldenOutDir: string): string {
+    return execSync(`bash "${scriptPath}"`, {
+      cwd: repoRoot,
+      env: { ...CLEAN_ENV, TORTURE_GOLDEN_DIR: goldenOutDir },
+      stdio: "pipe",
+      encoding: "utf-8",
+      timeout: 300_000,
+    });
+  }
+
+  before(function () {
+    this.timeout = 600_000; // golden build takes ~5 min
+    scratchDir = makeScratchDir("tt-poly-golden-");
+    goldenDir = scratchDir;
+    bareRepo = path.join(goldenDir, "tt-poly.git");
+    hashFile = path.join(goldenDir, "tt-poly.git.hashes");
+    runBuilder(goldenDir);
+  });
+
+  after(function () {
+    if (scratchDir && fs.existsSync(scratchDir)) {
+      fs.rmSync(scratchDir, { recursive: true, force: true });
+    }
+  });
 
   // ── AC 1: build-golden.sh exists and is executable ──────────────────────
 
@@ -592,105 +624,100 @@ describe("tt-poly build-golden.sh", () => {
   it("build-golden.sh executes successfully and creates golden bare repo", function () {
     this.timeout = 300_000; // 5 minutes — enough for baseline + seed refs
 
-    // Remove any previous golden output
-    if (fs.existsSync(goldenDir)) {
-      fs.rmSync(goldenDir, { recursive: true, force: true });
-    }
+    // Use a FRESH scratch dir — never touch the shared golden dir
+    const tDir = makeScratchDir("tt-poly-exec-");
+    const tBare = path.join(tDir, "tt-poly.git");
+    const tHashes = path.join(tDir, "tt-poly.git.hashes");
 
     let output: string;
     try {
-      output = execSync(`bash "${scriptPath}"`, {
-        cwd: repoRoot,
-        env: CLEAN_ENV,
-        stdio: "pipe",
-        encoding: "utf-8",
-        timeout: 300_000,
-      });
-    } catch (e: unknown) {
-      const err = e as Error & { stdout?: string; stderr?: string };
-      const msg = [
-        "build-golden.sh failed!",
-        `stdout: ${err.stdout || "(none)"}`,
-        `stderr: ${err.stderr || err.message || "(none)"}`,
-      ].join("\n");
-      assert.fail(msg);
-    }
+      output = runBuilder(tDir);
 
-    // Verify output banner
-    assert.ok(
-      output.includes("build-golden.sh — tt-poly deterministic golden builder"),
-      "should print banner",
-    );
+      // Verify output banner
+      assert.ok(
+        output.includes("build-golden.sh — tt-poly deterministic golden builder"),
+        "should print banner",
+      );
 
-    // Verify Phase 1
-    assert.ok(
-      output.includes("Phase 1: Building working tree"),
-      "should execute Phase 1",
-    );
-    assert.ok(
-      output.includes("Baseline commit"),
-      "should show baseline commit hash",
-    );
+      // Verify Phase 1
+      assert.ok(
+        output.includes("Phase 1: Building working tree"),
+        "should execute Phase 1",
+      );
+      assert.ok(
+        output.includes("Baseline commit"),
+        "should show baseline commit hash",
+      );
 
-    // Verify Phase 2
-    assert.ok(
-      output.includes("Phase 2: Building python seed refs"),
-      "should execute Phase 2",
-    );
+      // Verify Phase 2
+      assert.ok(
+        output.includes("Phase 2: Building python seed refs"),
+        "should execute Phase 2",
+      );
 
-    // Verify Phase 3
-    assert.ok(
-      output.includes("Phase 3: Building ts seed refs"),
-      "should execute Phase 3",
-    );
+      // Verify Phase 3
+      assert.ok(
+        output.includes("Phase 3: Building ts seed refs"),
+        "should execute Phase 3",
+      );
 
-    // Verify bare repo exists
-    assert.ok(
-      fs.existsSync(bareRepo),
-      "bare repo should be created at tt-poly.git",
-    );
+      // Verify bare repo exists
+      assert.ok(
+        fs.existsSync(tBare),
+        "bare repo should be created at tt-poly.git",
+      );
 
-    // Verify it's a bare repo
-    const headFile = path.join(bareRepo, "HEAD");
-    assert.ok(fs.existsSync(headFile), "HEAD file should exist in bare repo");
-    const head = fs.readFileSync(headFile, "utf-8").trim();
-    assert.ok(
-      head.includes("refs/heads/main"),
-      "bare repo HEAD should point to main",
-    );
+      // Verify it's a bare repo
+      const headFile = path.join(tBare, "HEAD");
+      assert.ok(fs.existsSync(headFile), "HEAD file should exist in bare repo");
+      const head = fs.readFileSync(headFile, "utf-8").trim();
+      assert.ok(
+        head.includes("refs/heads/main"),
+        "bare repo HEAD should point to main",
+      );
 
-    // Verify baseline ref exists
-    const mainSha = execSync(
-      `git --git-dir="${bareRepo}" rev-parse refs/heads/main`,
-      { encoding: "utf-8", stdio: "pipe" },
-    ).trim();
-    assert.ok(mainSha.length === 40, `main SHA should be 40 chars, got ${mainSha.length}: ${mainSha}`);
-
-    // Verify seed refs exist
-    for (const seed of [
-      "POLY-BUG-P1", "POLY-BUG-P2", "POLY-BUG-P3", "POLY-BUG-P4",
-      "POLY-VULN-P1", "POLY-VULN-P2",
-      "POLY-BUG-T1", "POLY-BUG-T2", "POLY-BUG-T3", "POLY-BUG-T4",
-      "POLY-VULN-T1", "POLY-VULN-T2",
-      "POLY-BRK-T1", "POLY-BRK-T2",
-    ]) {
-      const sha = execSync(
-        `git --git-dir="${bareRepo}" rev-parse "refs/heads/seed/${seed}"`,
+      // Verify baseline ref exists
+      const mainSha = execSync(
+        `git --git-dir="${tBare}" rev-parse refs/heads/main`,
         { encoding: "utf-8", stdio: "pipe" },
       ).trim();
-      assert.ok(sha.length === 40, `seed/${seed} should be a valid 40-char SHA, got: ${sha}`);
-    }
+      assert.ok(mainSha.length === 40, `main SHA should be 40 chars, got ${mainSha.length}: ${mainSha}`);
 
-    // Verify hash file
-    assert.ok(
-      fs.existsSync(hashFile),
-      "tt-poly.git.hashes should exist",
-    );
-    const hashes = fs.readFileSync(hashFile, "utf-8");
-    assert.ok(
-      hashes.includes("baseline=") && hashes.includes(mainSha),
-      `hash file should contain baseline=${mainSha}`,
-    );
+      // Verify seed refs exist
+      for (const seed of [
+        "POLY-BUG-P1", "POLY-BUG-P2", "POLY-BUG-P3", "POLY-BUG-P4",
+        "POLY-VULN-P1", "POLY-VULN-P2",
+        "POLY-BUG-T1", "POLY-BUG-T2", "POLY-BUG-T3", "POLY-BUG-T4",
+        "POLY-VULN-T1", "POLY-VULN-T2",
+        "POLY-BRK-T1", "POLY-BRK-T2",
+      ]) {
+        const sha = execSync(
+          `git --git-dir="${tBare}" rev-parse "refs/heads/seed/${seed}"`,
+          { encoding: "utf-8", stdio: "pipe" },
+        ).trim();
+        assert.ok(sha.length === 40, `seed/${seed} should be a valid 40-char SHA, got: ${sha}`);
+      }
+
+      // Verify hash file
+      assert.ok(
+        fs.existsSync(tHashes),
+        "tt-poly.git.hashes should exist",
+      );
+      const hashes = fs.readFileSync(tHashes, "utf-8");
+      assert.ok(
+        hashes.includes("baseline=") && hashes.includes(mainSha),
+        `hash file should contain baseline=${mainSha}`,
+      );
+    } catch (e: unknown) {
+      const err = e as Error & { stdout?: string; stderr?: string };
+      const msg = err.message || String(err);
+      if (msg.includes("build-golden.sh failed")) {
+        assert.fail(msg);
+      }
+      throw e;
+    } finally {
+      fs.rmSync(tDir, { recursive: true, force: true });
+    }
   });
 
   // ── Hash stability: second run matches first ────────────────────────────
@@ -698,39 +725,27 @@ describe("tt-poly build-golden.sh", () => {
   it("two consecutive builds produce identical hashes", function () {
     this.timeout = 600_000; // 10 minutes for two builds
 
-    // First run — already done by previous test, but let's verify
-    // We need a fresh first run to start from scratch
-    if (fs.existsSync(goldenDir)) {
-      fs.rmSync(goldenDir, { recursive: true, force: true });
+    // Build twice into a fresh scratch dir — never touch the shared golden dir
+    const tDir = makeScratchDir("tt-poly-hash2-");
+    const tHashes = path.join(tDir, "tt-poly.git.hashes");
+
+    try {
+      // First build
+      runBuilder(tDir);
+      const firstHashes = fs.readFileSync(tHashes, "utf-8");
+
+      // Second build — should be identical
+      runBuilder(tDir);
+      const secondHashes = fs.readFileSync(tHashes, "utf-8");
+
+      assert.strictEqual(
+        firstHashes,
+        secondHashes,
+        "two consecutive builds should produce identical hashes",
+      );
+    } finally {
+      fs.rmSync(tDir, { recursive: true, force: true });
     }
-
-    // First build
-    execSync(`bash "${scriptPath}"`, {
-      cwd: repoRoot,
-      env: CLEAN_ENV,
-      stdio: "pipe",
-      encoding: "utf-8",
-      timeout: 300_000,
-    });
-
-    const firstHashes = fs.readFileSync(hashFile, "utf-8");
-
-    // Second build — should be identical
-    execSync(`bash "${scriptPath}"`, {
-      cwd: repoRoot,
-      env: CLEAN_ENV,
-      stdio: "pipe",
-      encoding: "utf-8",
-      timeout: 300_000,
-    });
-
-    const secondHashes = fs.readFileSync(hashFile, "utf-8");
-
-    assert.strictEqual(
-      firstHashes,
-      secondHashes,
-      "two consecutive builds should produce identical hashes",
-    );
   });
 
   // ── Baseline commit content verification ────────────────────────────────
@@ -1219,12 +1234,10 @@ describe("tt-poly build-golden.sh", () => {
 
   it("build output shows post-build verification phases", function () {
     this.timeout = 300_000;
-    if (fs.existsSync(goldenDir)) {
-      fs.rmSync(goldenDir, { recursive: true, force: true });
-    }
-    const output = execSync(`bash "${scriptPath}"`, {
-      cwd: repoRoot, env: CLEAN_ENV, stdio: "pipe", encoding: "utf-8", timeout: 300_000,
-    });
+    // Build into a fresh scratch dir — never touch the shared golden dir
+    const tDir = makeScratchDir("tt-poly-verify-");
+    const output = runBuilder(tDir);
+    fs.rmSync(tDir, { recursive: true, force: true });
     assert.ok(
       output.includes("Phase 10: Post-build verification"),
       "should show Phase 10",

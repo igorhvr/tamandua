@@ -30,7 +30,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FIXTURE_SRC="$(cd "$SCRIPT_DIR/../tt-python" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 VAR_DIR="$REPO_ROOT/torture-test/var"
-GOLDEN_DIR="$VAR_DIR/fixtures/golden"
+GOLDEN_DIR="${TORTURE_GOLDEN_DIR:-$VAR_DIR/fixtures/golden}"
 GOLDEN_BARE="$GOLDEN_DIR/tt-python@master.git"
 HASH_FILE="$GOLDEN_DIR/.build-hashes-tt-python-master"
 

@@ -34,24 +34,26 @@ const fixtureSrc = path.join(
   "tt-poly",
 );
 const scriptPath = path.join(fixtureSrc, "build-golden.sh");
-const goldenDir = path.join(repoRoot, "torture-test", "var", "fixtures", "golden");
-const bareRepo = path.join(goldenDir, "tt-poly.git");
-const hashFile = path.join(goldenDir, "tt-poly.git.hashes");
+// Shared golden dir — READ-ONLY. Self-tests must never write to this.
+const sharedGoldenDir = path.join(repoRoot, "torture-test", "var", "fixtures", "golden");
+const sharedBareRepo = path.join(sharedGoldenDir, "tt-poly.git");
+const sharedHashFile = path.join(sharedGoldenDir, "tt-poly.git.hashes");
 
 // --------------------------------------------------------------------------
-// Helper: run build-golden.sh (one pass)
+// Helper: run build-golden.sh (one pass) into a scratch dir
 // --------------------------------------------------------------------------
-function runBuildGolden(): string {
-  if (fs.existsSync(goldenDir)) {
-    fs.rmSync(goldenDir, { recursive: true, force: true });
-  }
-  return execSync(`bash "${scriptPath}"`, {
+function runBuildGolden(): { goldenDir: string; bareRepo: string; hashFile: string; output: string } {
+  const scratchDir = tamanduaTempDir("tt-poly-e2e-golden-");
+  const scratchBare = path.join(scratchDir, "tt-poly.git");
+  const scratchHashes = path.join(scratchDir, "tt-poly.git.hashes");
+  const output = execSync(`bash "${scriptPath}"`, {
     cwd: repoRoot,
-    env: CLEAN_ENV,
+    env: { ...CLEAN_ENV, TORTURE_GOLDEN_DIR: scratchDir },
     stdio: "pipe",
     encoding: "utf-8",
     timeout: 300_000,
   });
+  return { goldenDir: scratchDir, bareRepo: scratchBare, hashFile: scratchHashes, output };
 }
 
 // --------------------------------------------------------------------------
@@ -59,19 +61,24 @@ function runBuildGolden(): string {
 // --------------------------------------------------------------------------
 function cloneBareRepo(prefix: string): string {
   const tmpDir = tamanduaTempDir(prefix);
-  execSync(`git clone "${bareRepo}" "${tmpDir}"`, {
+  execSync(`git clone "${sharedBareRepo}" "${tmpDir}"`, {
     stdio: "pipe", encoding: "utf-8",
   });
   return tmpDir;
 }
 
 // --------------------------------------------------------------------------
-// Helper: ensure golden repo is built
+// Helper: ensure shared golden repo exists (read-only check).
+// If it doesn't exist, build into a scratch dir and use that for the test.
+// Returns the paths to use.
 // --------------------------------------------------------------------------
-function ensureGoldenBuilt(): void {
-  if (!fs.existsSync(bareRepo)) {
-    runBuildGolden();
+function ensureGoldenBuilt(): { bareRepo: string; hashFile: string; goldenDir: string; isScratch: boolean } {
+  if (fs.existsSync(sharedBareRepo)) {
+    return { bareRepo: sharedBareRepo, hashFile: sharedHashFile, goldenDir: sharedGoldenDir, isScratch: false };
   }
+  // Fallback: build into scratch dir
+  const scratch = runBuildGolden();
+  return { bareRepo: scratch.bareRepo, hashFile: scratch.hashFile, goldenDir: scratch.goldenDir, isScratch: true };
 }
 
 // ==========================================================================
@@ -83,14 +90,14 @@ describe("tt-poly end-to-end verification (US-016)", () => {
   it("AC5: build hash stability file exists at var/fixtures/golden/tt-poly.git.hashes", function () {
     this.timeout = 600_000;
 
-    ensureGoldenBuilt();
+    const gb = ensureGoldenBuilt();
 
     assert.ok(
-      fs.existsSync(hashFile),
-      `tt-poly.git.hashes should exist at ${hashFile}`,
+      fs.existsSync(gb.hashFile),
+      `tt-poly.git.hashes should exist at ${gb.hashFile}`,
     );
 
-    const hashes = fs.readFileSync(hashFile, "utf-8");
+    const hashes = fs.readFileSync(gb.hashFile, "utf-8");
     assert.ok(
       hashes.includes("baseline="),
       "hash file should contain baseline= entry",
@@ -114,50 +121,35 @@ describe("tt-poly end-to-end verification (US-016)", () => {
   it("AC1: two consecutive build-golden.sh runs produce identical hashes", function () {
     this.timeout = 600_000; // 10 minutes for two full builds
 
-    // Fresh start — remove any previous golden output
-    if (fs.existsSync(goldenDir)) {
-      fs.rmSync(goldenDir, { recursive: true, force: true });
-    }
+    // Use a unique scratch dir for both builds so the second build
+    // detects existing golden output and reports IDENTICAL.
+    const scratchDir = tamanduaTempDir("tt-poly-e2e-ac1-");
+    const scratchBare = path.join(scratchDir, "tt-poly.git");
+    const scratchHashes = path.join(scratchDir, "tt-poly.git.hashes");
 
-    // First build
-    let output1: string;
-    try {
-      output1 = execSync(`bash "${scriptPath}"`, {
-        cwd: repoRoot,
-        env: CLEAN_ENV,
-        stdio: "pipe",
-        encoding: "utf-8",
-        timeout: 300_000,
-      });
-    } catch (e: unknown) {
-      const err = e as Error & { stdout?: string; stderr?: string };
-      assert.fail(
-        `First build-golden.sh failed!\nstdout: ${err.stdout || "(none)"}\nstderr: ${err.stderr || err.message}`,
-      );
-    }
+    // First build into scratch dir
+    const output1 = execSync(`bash "${scriptPath}"`, {
+      cwd: repoRoot,
+      env: { ...CLEAN_ENV, TORTURE_GOLDEN_DIR: scratchDir },
+      stdio: "pipe",
+      encoding: "utf-8",
+      timeout: 300_000,
+    });
 
     // Verify first build succeeded
     assert.ok(output1.includes("build-golden.sh — COMPLETE"), "first build should complete");
     assert.ok(output1.includes("Verification   : ALL PASSED"), "first build verification should pass");
 
-    const firstHashes = fs.readFileSync(hashFile, "utf-8");
+    const firstHashes = fs.readFileSync(scratchHashes, "utf-8");
 
-    // Second build
-    let output2: string;
-    try {
-      output2 = execSync(`bash "${scriptPath}"`, {
-        cwd: repoRoot,
-        env: CLEAN_ENV,
-        stdio: "pipe",
-        encoding: "utf-8",
-        timeout: 300_000,
-      });
-    } catch (e: unknown) {
-      const err = e as Error & { stdout?: string; stderr?: string };
-      assert.fail(
-        `Second build-golden.sh failed!\nstdout: ${err.stdout || "(none)"}\nstderr: ${err.stderr || err.message}`,
-      );
-    }
+    // Second build into same scratch dir
+    const output2 = execSync(`bash "${scriptPath}"`, {
+      cwd: repoRoot,
+      env: { ...CLEAN_ENV, TORTURE_GOLDEN_DIR: scratchDir },
+      stdio: "pipe",
+      encoding: "utf-8",
+      timeout: 300_000,
+    });
 
     // Verify second build succeeded
     assert.ok(output2.includes("build-golden.sh — COMPLETE"), "second build should complete");
@@ -167,7 +159,7 @@ describe("tt-poly end-to-end verification (US-016)", () => {
       "second build should NOT report hash mismatch",
     );
 
-    const secondHashes = fs.readFileSync(hashFile, "utf-8");
+    const secondHashes = fs.readFileSync(scratchHashes, "utf-8");
 
     // Byte-for-byte identical
     assert.strictEqual(
@@ -182,7 +174,7 @@ describe("tt-poly end-to-end verification (US-016)", () => {
   it("AC2: scratch clone baseline — structural content verification", function () {
     this.timeout = 300_000;
 
-    ensureGoldenBuilt();
+    ensureGoldenBuilt(); // ensures shared golden bare exists for cloning
 
     const tmpDir = cloneBareRepo("tt-poly-e2e-baseline-");
     try {
@@ -745,8 +737,8 @@ describe("tt-poly end-to-end verification (US-016)", () => {
   it("build-golden.sh Phase 10 verification passes all sub-phases", function () {
     this.timeout = 600_000;
 
-    // Fresh build to get fresh verification output
-    const output = runBuildGolden();
+    // Fresh build to get fresh verification output (scratch dir)
+    const output = runBuildGolden().output;
 
     // Verify all 6 sub-phases of Phase 10 pass
     assert.ok(
@@ -828,12 +820,22 @@ describe("tt-poly end-to-end verification (US-016)", () => {
   it("hash stability: second run confirms IDENTICAL output", function () {
     this.timeout = 600_000;
 
-    ensureGoldenBuilt();
+    // Build golden into scratch dir, then build again over same scratch to
+    // verify hash stability (IDENTICAL). Never touch shared golden dir.
+    const scratchDir = tamanduaTempDir("tt-poly-e2e-hashstab-");
+    const firstOutput = execSync(`bash "${scriptPath}"`, {
+      cwd: repoRoot,
+      env: { ...CLEAN_ENV, TORTURE_GOLDEN_DIR: scratchDir },
+      stdio: "pipe",
+      encoding: "utf-8",
+      timeout: 300_000,
+    });
+    assert.ok(firstOutput.includes("build-golden.sh — COMPLETE"), "first build should complete");
 
-    // Run build-golden.sh again (golden already exists from ensureGoldenBuilt)
+    // Run build-golden.sh again in the same scratch dir
     const output = execSync(`bash "${scriptPath}"`, {
       cwd: repoRoot,
-      env: CLEAN_ENV,
+      env: { ...CLEAN_ENV, TORTURE_GOLDEN_DIR: scratchDir },
       stdio: "pipe",
       encoding: "utf-8",
       timeout: 300_000,
@@ -855,10 +857,10 @@ describe("tt-poly end-to-end verification (US-016)", () => {
   it("all 36 seed refs exist under refs/heads/seed/", function () {
     this.timeout = 300_000;
 
-    ensureGoldenBuilt();
+    const gb = ensureGoldenBuilt();
 
     const refs = execSync(
-      `git --git-dir="${bareRepo}" for-each-ref --format='%(refname:short)' refs/heads/seed/`,
+      `git --git-dir="${gb.bareRepo}" for-each-ref --format='%(refname:short)' refs/heads/seed/`,
       { encoding: "utf-8", stdio: "pipe" },
     ).trim().split("\n").filter(Boolean);
 
@@ -874,16 +876,16 @@ describe("tt-poly end-to-end verification (US-016)", () => {
   it("broken-tests branch exists and differs from baseline", function () {
     this.timeout = 300_000;
 
-    ensureGoldenBuilt();
+    const gb = ensureGoldenBuilt();
 
     const brkSha = execSync(
-      `git --git-dir="${bareRepo}" rev-parse refs/heads/broken-tests`,
+      `git --git-dir="${gb.bareRepo}" rev-parse refs/heads/broken-tests`,
       { encoding: "utf-8", stdio: "pipe" },
     ).trim();
     assert.ok(brkSha.length === 40, "broken-tests should be valid 40-char SHA");
 
     const mainSha = execSync(
-      `git --git-dir="${bareRepo}" rev-parse refs/heads/main`,
+      `git --git-dir="${gb.bareRepo}" rev-parse refs/heads/main`,
       { encoding: "utf-8", stdio: "pipe" },
     ).trim();
 

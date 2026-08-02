@@ -24,10 +24,18 @@
 #   --self-test           Run built-in self-tests for the harness itself
 #   --help, -h            Show this help
 #
-# Exit codes:
-#   0 = all probes validated (all arms correct)
-#   1 = validation failures listed
-#   2 = harness error (missing golden bares, invalid args, etc.)
+# Exit codes (complete contract — do not relax without updating self-tests):
+#   0 = all discovered probes validated through at least one arm and NO arm failed.
+#       Some probes may have been skipped (INTERNAL-SKIP or golden-bare missing),
+#       but ONLY when at least one probe validated with at least one arm executed
+#       and zero FAIL outcomes. This is an informational partial-skip — the harness
+#       did real work. Skipped probes are reported in the summary.
+#   1 = validation failures listed — at least one arm FAILed.
+#       A partial-skip with zero failures exits 0 (condition above), never 1.
+#   2 = harness/infrastructure error — execution could not proceed:
+#       • Every probe was skipped because all golden bares are missing (vacuous run)
+#       • Invalid arguments, missing directories, unrecoverable I/O errors
+#       A run that validated NOTHING must never exit green.
 
 set -euo pipefail
 
@@ -46,6 +54,10 @@ TIMEOUT_SEC=120
 PASS=0
 FAIL=0
 SKIP=0
+MISSING_BARES_FILE=$(mktemp "${TMPDIR:-/tmp}/validate-all-missing-bares.XXXXXX")
+SKIPPED_PROBES_FILE=$(mktemp "${TMPDIR:-/tmp}/validate-all-skipped-probes.XXXXXX")
+# shellcheck disable=SC2064
+trap "rm -f '$MISSING_BARES_FILE' '$SKIPPED_PROBES_FILE'" EXIT
 
 # ── Help ───────────────────────────────────────────────────────────
 show_help() {
@@ -518,6 +530,8 @@ validate_probe() {
     if [ ! -d "$golden_bare" ]; then
         warn "SKIP $probe_label: golden bare not found at $golden_bare"
         SKIP=$((SKIP + 1))
+        echo "$golden_bare" >> "$MISSING_BARES_FILE"
+        echo "$probe_label" >> "$SKIPPED_PROBES_FILE"
         return 0
     fi
 
@@ -757,8 +771,44 @@ validate_all() {
 
     if [ "$PASS" -eq 0 ] && [ "$SKIP" -gt 0 ]; then
         echo ""
-        echo "All probes were skipped (golden bares may not exist yet)."
-        exit 0
+        echo "══╡ INFRASTRUCTURE ERROR: all probes skipped ═══════════════════"
+        echo ""
+        echo "No probe could be validated — every probe depends on a golden bare"
+        echo "that is missing. A validation run that validates NOTHING must not"
+        echo "exit green."
+        echo ""
+        echo "Missing golden bares:"
+        if [ -s "$MISSING_BARES_FILE" ]; then
+            sort -u "$MISSING_BARES_FILE" | while IFS= read -r miss_bare; do
+                bare_name=$(basename "$miss_bare" .git)
+                build_script="${REPO_ROOT}/torture-test/fixtures-src/${bare_name}/build-golden.sh"
+                if [ -f "$build_script" ]; then
+                    printf '  • %s (build with: %s)\n' "$miss_bare" "$build_script"
+                else
+                    printf '  • %s (no build-golden.sh found for fixture %s)\n' "$miss_bare" "$bare_name"
+                fi
+            done
+        fi
+        echo ""
+        echo "Remedy: populate golden bares by running each build-golden.sh listed above,"
+        echo "  then re-run validate-all.sh."
+        exit 2
+    fi
+
+    # Partial-skip: at least one probe validated, zero failures, some skipped
+    if [ "$SKIP" -gt 0 ]; then
+        echo ""
+        echo "══╡ NOTICE: some probes skipped ════════════════════════════════"
+        echo ""
+        echo "The following probes were skipped (golden bares may be missing):"
+        if [ -s "$SKIPPED_PROBES_FILE" ]; then
+            sort -u "$SKIPPED_PROBES_FILE" | while IFS= read -r skip_label; do
+                printf '  • %s\n' "$skip_label"
+            done
+        fi
+        echo ""
+        echo "At least one probe validated successfully and no probe failed,"
+        echo "so this is informational — the harness did real work."
     fi
 
     echo ""
@@ -1074,6 +1124,109 @@ run_self_tests() {
     fi
 
     rm -rf "$tmp_boot"
+
+    # Test: all-skipped scenario — exit 2 with remedy message
+    echo ""
+    echo "── exit code: all-skipped → exit 2 ──"
+    local empty_golden
+    empty_golden=$(mktemp -d "${TMPDIR:-/tmp}/empty-golden-self-test.XXXXXX")
+    local all_skip_out all_skip_rc
+    set +e
+    all_skip_out=$(SELF_TEST=false bash "$0" --golden-dir "$empty_golden" 2>&1)
+    all_skip_rc=$?
+    set -e
+    if [ "$all_skip_rc" -eq 2 ]; then
+        if echo "$all_skip_out" | grep -q "INFRASTRUCTURE ERROR"; then
+            t_pass "all-skipped → exit 2 with INFRASTRUCTURE ERROR message"
+        else
+            t_pass "all-skipped → exit 2 (message check skipped — output captured)"
+        fi
+    else
+        t_fail "all-skipped exit 2" "Expected exit 2, got $all_skip_rc. Output: $all_skip_out"
+    fi
+    rm -rf "$empty_golden"
+
+    # Test: all-skipped remedy message names missing bares and build scripts
+    echo ""
+    echo "── exit code: all-skipped remedy message ──"
+    empty_golden=$(mktemp -d "${TMPDIR:-/tmp}/empty-golden-remedy-test.XXXXXX")
+    set +e
+    all_skip_out=$(SELF_TEST=false bash "$0" --golden-dir "$empty_golden" 2>&1)
+    local remedy_rc=$?
+    set -e
+    if [ "$remedy_rc" -eq 2 ]; then
+        local remedy_ok=true
+        if ! echo "$all_skip_out" | grep -q "build with:"; then
+            remedy_ok=false
+        fi
+        if ! echo "$all_skip_out" | grep -q "build-golden.sh"; then
+            remedy_ok=false
+        fi
+        if $remedy_ok; then
+            t_pass "all-skipped remedy names missing bares and build-golden.sh scripts"
+        else
+            t_fail "all-skipped remedy" "Missing build-golden.sh references. Output: $all_skip_out"
+        fi
+    else
+        t_fail "all-skipped remedy" "Expected exit 2, got $remedy_rc"
+    fi
+    rm -rf "$empty_golden"
+
+    # Test: partial-skip — at least one probe validates, some skipped → exit 0
+    echo ""
+    echo "── exit code: partial-skip → exit 0 ──"
+    local ps_golden ps_probes
+    ps_golden=$(mktemp -d "${TMPDIR:-/tmp}/ps-golden.XXXXXX")
+    ps_probes=$(mktemp -d "${TMPDIR:-/tmp}/ps-probes.XXXXXX")
+
+    # Create a minimal bare repo with one commit (git clone needs refs)
+    local tmp_src
+    tmp_src=$(mktemp -d "${TMPDIR:-/tmp}/ps-src.XXXXXX")
+    git -C "$tmp_src" init -q
+    echo "mock fixture for validate-all self-test" > "$tmp_src/README.md"
+    git -C "$tmp_src" add README.md
+    git -C "$tmp_src" commit -q -m "initial"
+    git clone -q --bare "$tmp_src" "$ps_golden/mock-feat.git"
+    rm -rf "$tmp_src"
+
+    # Mock probe: feat task — exits 1 (feature not implemented) → Arm 1 PASS
+    mkdir -p "$ps_probes/mock-feat/FEAT-01"
+    cat > "$ps_probes/mock-feat/FEAT-01/probe.sh" << 'MOCKEOF'
+#!/usr/bin/env bash
+# Mock probe for validate-all self-test (partial-skip scenario)
+WORKSPACE="$1"
+# Feat task: feature not implemented → probe fails (exit 1) → Arm 1 PASS
+if [ -f "$WORKSPACE/feature-done.flag" ]; then
+    exit 0
+fi
+exit 1
+MOCKEOF
+    chmod +x "$ps_probes/mock-feat/FEAT-01/probe.sh"
+
+    # Missing fixture probe: golden bare missing → SKIP
+    mkdir -p "$ps_probes/missing-fixture/BUG-01"
+    cat > "$ps_probes/missing-fixture/BUG-01/probe.sh" << 'MOCKEOF'
+#!/usr/bin/env bash
+echo "should not be reached"
+exit 0
+MOCKEOF
+    chmod +x "$ps_probes/missing-fixture/BUG-01/probe.sh"
+
+    local ps_rc ps_out
+    set +e
+    ps_out=$(SELF_TEST=false bash "$0" --golden-dir "$ps_golden" --probes-dir "$ps_probes" 2>&1)
+    ps_rc=$?
+    set -e
+    if [ "$ps_rc" -eq 0 ]; then
+        if echo "$ps_out" | grep -q "NOTICE: some probes skipped"; then
+            t_pass "partial-skip → exit 0 with skip notice"
+        else
+            t_pass "partial-skip → exit 0"
+        fi
+    else
+        t_fail "partial-skip exit 0" "Expected exit 0, got $ps_rc. Output (last 500 chars): ${ps_out: -500}"
+    fi
+    rm -rf "$ps_golden" "$ps_probes"
 
     # ── Results ────────────────────────────────────────────────────
     echo ""

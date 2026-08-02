@@ -3,7 +3,7 @@ import { execSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { tamanduaTempDir } from "../../src/lib/temp-dir.ts";
-import { describe, it } from "node:test";
+import { after, before, describe, it } from "node:test";
 
 const repoRoot = process.cwd();
 
@@ -179,27 +179,45 @@ describe("tt-poly-lite build-golden.sh integration", { skip: process.env.TT_POLY
     "tt-poly-lite",
     "build-golden.sh",
   );
-  const goldenDir = path.join(
-    repoRoot,
-    "torture-test",
-    "var",
-    "fixtures",
-    "golden",
-  );
-  const bareRepo = path.join(goldenDir, "tt-poly-lite.git");
-  const hashFile = path.join(goldenDir, "tt-poly-lite.git.hashes");
+
+  let scratchDir: string;
+  let goldenDir: string;
+  let bareRepo: string;
+  let hashFile: string;
+
+  function makeScratchDir(prefix: string): string {
+    const parent = path.join(repoRoot, "torture-test", "var", "self-tests");
+    fs.mkdirSync(parent, { recursive: true });
+    return fs.mkdtempSync(path.join(parent, prefix));
+  }
+
+  function runBuilder(goldenOutDir: string): string {
+    return execSync(`bash "${scriptPath}"`, {
+      cwd: repoRoot,
+      env: { ...CLEAN_ENV, TORTURE_GOLDEN_DIR: goldenOutDir },
+      stdio: "pipe",
+      encoding: "utf-8",
+      timeout: 600_000,
+    });
+  }
+
+  before(function () {
+    this.timeout = 600_000;
+    scratchDir = makeScratchDir("tt-poly-lite-golden-");
+    goldenDir = scratchDir;
+    bareRepo = path.join(goldenDir, "tt-poly-lite.git");
+    hashFile = path.join(goldenDir, "tt-poly-lite.git.hashes");
+    runBuilder(goldenDir);
+  });
+
+  after(function () {
+    if (scratchDir && fs.existsSync(scratchDir)) {
+      fs.rmSync(scratchDir, { recursive: true, force: true });
+    }
+  });
 
   it("creates golden bare repo with all seed refs", function () {
     this.timeout = 600_000;
-
-    if (fs.existsSync(bareRepo)) {
-      fs.rmSync(bareRepo, { recursive: true, force: true });
-    }
-    if (fs.existsSync(hashFile)) {
-      fs.rmSync(hashFile, { force: true });
-    }
-
-    execSync(`bash "${scriptPath}"`, execOpts({ cwd: repoRoot, stdio: "pipe", timeout: 600_000 }));
 
     assert.ok(fs.existsSync(bareRepo), "golden bare repo should exist");
 
@@ -231,35 +249,32 @@ describe("tt-poly-lite build-golden.sh integration", { skip: process.env.TT_POLY
   it("hash stability — two consecutive builds produce identical hashes", function () {
     this.timeout = 600_000;
 
-    if (fs.existsSync(hashFile)) {
-      fs.rmSync(hashFile, { force: true });
+    const hashScratch = makeScratchDir("tt-poly-lite-hash2-");
+    try {
+      const hashGolden = hashScratch;
+      const hashBare = path.join(hashGolden, "tt-poly-lite.git");
+      const hf = path.join(hashGolden, "tt-poly-lite.git.hashes");
+
+      runBuilder(hashGolden);
+
+      const firstHashes = fs.readFileSync(hf, "utf-8");
+
+      const secondOutput = runBuilder(hashGolden);
+
+      assert.ok(
+        secondOutput.includes("Hash stability: IDENTICAL"),
+        "Second build should report hash stability as IDENTICAL",
+      );
+
+      const secondHashes = fs.readFileSync(hf, "utf-8");
+      assert.equal(
+        firstHashes,
+        secondHashes,
+        "Two consecutive builds must produce identical hash files",
+      );
+    } finally {
+      fs.rmSync(hashScratch, { recursive: true, force: true });
     }
-    if (fs.existsSync(bareRepo)) {
-      fs.rmSync(bareRepo, { recursive: true, force: true });
-    }
-
-    execSync(`bash "${scriptPath}"`, execOpts({ cwd: repoRoot, stdio: "pipe", timeout: 600_000 }));
-
-    const firstHashes = fs.readFileSync(hashFile, "utf-8");
-
-    const secondOutput = execSync(`bash "${scriptPath}"`, execOpts({
-      cwd: repoRoot,
-      stdio: "pipe",
-      encoding: "utf-8",
-      timeout: 600_000,
-    }));
-
-    assert.ok(
-      secondOutput.includes("Hash stability: IDENTICAL"),
-      "Second build should report hash stability as IDENTICAL",
-    );
-
-    const secondHashes = fs.readFileSync(hashFile, "utf-8");
-    assert.equal(
-      firstHashes,
-      secondHashes,
-      "Two consecutive builds must produce identical hash files",
-    );
   });
 });
 
@@ -272,15 +287,6 @@ describe("tt-poly-lite end-to-end validation", { skip: process.env.TT_POLY_LITE_
     "tt-poly-lite",
     "build-golden.sh",
   );
-  const goldenDir = path.join(
-    repoRoot,
-    "torture-test",
-    "var",
-    "fixtures",
-    "golden",
-  );
-  const bareRepo = path.join(goldenDir, "tt-poly-lite.git");
-  const hashFile = path.join(goldenDir, "tt-poly-lite.git.hashes");
   const fixtureSrc = path.join(
     repoRoot,
     "torture-test",
@@ -288,15 +294,50 @@ describe("tt-poly-lite end-to-end validation", { skip: process.env.TT_POLY_LITE_
     "tt-poly-lite",
   );
 
-  let goldenReady = false;
-  function ensureGolden(): void {
-    if (goldenReady) return;
-    if (!fs.existsSync(bareRepo) || !fs.existsSync(hashFile)) {
-      if (fs.existsSync(hashFile)) fs.rmSync(hashFile, { force: true });
-      if (fs.existsSync(bareRepo)) fs.rmSync(bareRepo, { recursive: true, force: true });
-      execSync(`bash "${scriptPath}"`, execOpts({ cwd: repoRoot, stdio: "pipe", timeout: 600_000 }));
+  let e2eScratchDir: string;
+  let goldenDir: string;
+  let bareRepo: string;
+  let hashFile: string;
+
+  function makeScratchDir(prefix: string): string {
+    const parent = path.join(repoRoot, "torture-test", "var", "self-tests");
+    fs.mkdirSync(parent, { recursive: true });
+    return fs.mkdtempSync(path.join(parent, prefix));
+  }
+
+  function runBuilder(goldenOutDir: string): string {
+    return execSync(`bash "${scriptPath}"`, {
+      cwd: repoRoot,
+      env: { ...CLEAN_ENV, TORTURE_GOLDEN_DIR: goldenOutDir },
+      stdio: "pipe",
+      encoding: "utf-8",
+      timeout: 600_000,
+    });
+  }
+
+  before(function () {
+    this.timeout = 600_000;
+    e2eScratchDir = makeScratchDir("tt-poly-lite-e2e-golden-");
+    goldenDir = e2eScratchDir;
+    bareRepo = path.join(goldenDir, "tt-poly-lite.git");
+    hashFile = path.join(goldenDir, "tt-poly-lite.git.hashes");
+    runBuilder(goldenDir);
+  });
+
+  after(function () {
+    if (e2eScratchDir && fs.existsSync(e2eScratchDir)) {
+      fs.rmSync(e2eScratchDir, { recursive: true, force: true });
     }
-    goldenReady = true;
+  });
+
+  let goldenBuilt = false;
+  function ensureGolden(): void {
+    // Golden output is built once by the before() hook into a scratch dir.
+    // All builder invocations use TORTURE_GOLDEN_DIR, so the shared
+    // var/fixtures/golden/ is never touched by this describe block.
+    // This function is a backward-compatible no-op retained so existing
+    // tests that call ensureGolden() don't break.
+    goldenBuilt = true;
   }
 
   function scratchClone(): string {

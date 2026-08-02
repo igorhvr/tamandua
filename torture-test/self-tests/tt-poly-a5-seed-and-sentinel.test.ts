@@ -221,16 +221,14 @@ describe("tt-poly A5 seed and sentinel pre-verification (US-017)", () => {
     it("S5 and S9 branches produce conflicting edits on the sentinel region", function () {
       this.timeout = 120_000;
 
-      // Verify build-golden.sh runs successfully (includes sentinel pre-verification)
-      if (fs.existsSync(goldenDir)) {
-        fs.rmSync(goldenDir, { recursive: true, force: true });
-      }
+      // Build into a scratch dir (never touch shared golden)
+      const scratchGolden = tamanduaTempDir("tt-poly-a5-sentinel-");
 
       let output: string;
       try {
         output = execSync(`bash "${scriptPath}"`, {
           cwd: repoRoot,
-          env: CLEAN_ENV,
+          env: { ...CLEAN_ENV, TORTURE_GOLDEN_DIR: scratchGolden },
           stdio: "pipe",
           encoding: "utf-8",
           timeout: 300_000,
@@ -263,14 +261,11 @@ describe("tt-poly A5 seed and sentinel pre-verification (US-017)", () => {
     it("sentinel pre-verification is mentioned in build completion summary", function () {
       this.timeout = 60_000;
 
-      const bareRepo = path.join(goldenDir, "tt-poly.git");
-      // Already built from previous test; verify hash file exists
-      assert.ok(fs.existsSync(bareRepo), "golden repo should exist after build");
-
-      // Read the build output (rerun is OK, deterministic)
+      // Build into a scratch dir (never touch shared golden)
+      const scratchGolden = tamanduaTempDir("tt-poly-a5-summary-");
       const output = execSync(`bash "${scriptPath}"`, {
         cwd: repoRoot,
-        env: CLEAN_ENV,
+        env: { ...CLEAN_ENV, TORTURE_GOLDEN_DIR: scratchGolden },
         stdio: "pipe",
         encoding: "utf-8",
         timeout: 300_000,

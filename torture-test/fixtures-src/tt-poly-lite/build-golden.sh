@@ -18,7 +18,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FIXTURE_SRC="$SCRIPT_DIR"
 REPO_ROOT="$(cd "$SCRIPT_DIR" && git rev-parse --show-toplevel)"
-GOLDEN_DIR="$REPO_ROOT/torture-test/var/fixtures/golden"
+GOLDEN_DIR="${TORTURE_GOLDEN_DIR:-$REPO_ROOT/torture-test/var/fixtures/golden}"
 BARE_REPO="$GOLDEN_DIR/tt-poly-lite.git"
 HASH_FILE="$GOLDEN_DIR/tt-poly-lite.git.hashes"
 
