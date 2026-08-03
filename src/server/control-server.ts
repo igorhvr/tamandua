@@ -24,6 +24,7 @@ import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
 import { logger } from "../lib/logger.js";
+import { getProcessStartIdentity } from "../lib/process-start-identity.js";
 import { getBuildVersion } from "../lib/version.js";
 import { assertPortIsolation, assertStatePathIsolation, testGuardActive } from "../lib/test-guard.js";
 import { getDb } from "../db.js";
@@ -307,6 +308,7 @@ interface SuiteClaim {
   claimedAt: number;
   ownerToken?: string;
   ownerPid?: number;
+  ownerStartTime?: string;
   runId?: string;
   stepId?: string;
   originRepo: string;
@@ -337,6 +339,7 @@ interface ValidSuiteClaimFields {
   cmdHash: string;
   ownerToken?: string;
   ownerPid?: number;
+  ownerStartTime?: string;
   runId?: string;
   stepId?: string;
 }
@@ -352,6 +355,10 @@ function validateSuiteClaimFields(body: Record<string, unknown>): ValidSuiteClai
   const ownerPid = Number.isSafeInteger(body.owner_pid) && (body.owner_pid as number) > 0
     ? body.owner_pid as number
     : undefined;
+  const hasOwnerStartTime = Object.prototype.hasOwnProperty.call(body, "owner_start_time");
+  const ownerStartTime = hasOwnerStartTime && typeof body.owner_start_time === "string"
+    ? body.owner_start_time
+    : undefined;
   const runId = typeof body.run_id === "string" && body.run_id.length > 0
     && body.run_id.length <= SUITE_OWNER_MAX_LENGTH ? body.run_id : undefined;
   const stepId = typeof body.step_id === "string" && body.step_id.length > 0
@@ -361,10 +368,11 @@ function validateSuiteClaimFields(body: Record<string, unknown>): ValidSuiteClai
     || !treeHash || treeHash.length > SUITE_HASH_MAX_LENGTH
     || !cmdHash || cmdHash.length > SUITE_HASH_MAX_LENGTH
     || (hasOwnerToken && (!ownerToken || ownerToken.length > SUITE_OWNER_MAX_LENGTH))
+    || (hasOwnerStartTime && (!ownerStartTime || ownerStartTime.length > SUITE_OWNER_MAX_LENGTH))
   ) {
     return null;
   }
-  return { originRepo, treeHash, cmdHash, ownerToken, ownerPid, runId, stepId };
+  return { originRepo, treeHash, cmdHash, ownerToken, ownerPid, ownerStartTime, runId, stepId };
 }
 
 export type SuiteOwnerLiveness = "alive" | "dead" | "indeterminate";
@@ -372,25 +380,30 @@ export type SuiteOwnerLiveness = "alive" | "dead" | "indeterminate";
 export function probeSuiteOwnerPid(
   pid: number,
   signalZero: (targetPid: number, signal: 0) => unknown = (targetPid, signal) => process.kill(targetPid, signal),
+  expectedStartTime?: string,
+  readStartTime: (targetPid: number) => string | null | undefined = getProcessStartIdentity,
 ): SuiteOwnerLiveness {
   try {
     signalZero(pid, 0);
-    return "alive";
   } catch (err) {
     return (err as NodeJS.ErrnoException).code === "ESRCH" ? "dead" : "indeterminate";
   }
+  if (expectedStartTime === undefined) return "alive";
+  const actualStartTime = readStartTime(pid);
+  if (actualStartTime == null) return "indeterminate";
+  return actualStartTime === expectedStartTime ? "alive" : "dead";
 }
 
 interface SuiteClaimRuntime {
   now: () => number;
-  probePid: (pid: number) => SuiteOwnerLiveness;
+  probePid: (pid: number, expectedStartTime?: string) => SuiteOwnerLiveness;
   emitClaimEvent: (event: TamanduaEvent) => void;
 }
 
 function claimOwnerLiveness(claim: SuiteClaim, runtime: SuiteClaimRuntime): SuiteOwnerLiveness {
   if (claim.ownerPid === undefined) return "indeterminate";
   try {
-    return runtime.probePid(claim.ownerPid);
+    return runtime.probePid(claim.ownerPid, claim.ownerStartTime);
   } catch {
     return "indeterminate";
   }
@@ -583,7 +596,7 @@ async function handleSuiteClaim(
   if (!fields) {
     return { status: 400, body: { error: "Invalid or oversized suite claim fields" } };
   }
-  const { originRepo, treeHash, cmdHash, ownerToken, ownerPid, runId, stepId } = fields;
+  const { originRepo, treeHash, cmdHash, ownerToken, ownerPid, ownerStartTime, runId, stepId } = fields;
 
   const key = suiteClaimKey(originRepo, treeHash, cmdHash);
   cleanStaleClaims(runtime, key, fields);
@@ -601,7 +614,7 @@ async function handleSuiteClaim(
   }
 
   const granted: SuiteClaim = {
-    claimedAt: runtime.now(), ownerToken, ownerPid, runId, stepId, originRepo, treeHash, cmdHash,
+    claimedAt: runtime.now(), ownerToken, ownerPid, ownerStartTime, runId, stepId, originRepo, treeHash, cmdHash,
   };
   suiteClaims.set(key, granted);
   emitClaimTimelineEvent("suite.claim_granted", granted, fields, runtime);
@@ -1180,7 +1193,7 @@ export interface ControlServerOptions {
   /** Deterministic suite-claim test seam. */
   now?: () => number;
   /** Deterministic suite owner liveness test seam. */
-  probeSuiteOwnerPid?: (pid: number) => SuiteOwnerLiveness;
+  probeSuiteOwnerPid?: (pid: number, expectedStartTime?: string) => SuiteOwnerLiveness;
   /** Deterministic suite reclaim observability test seam. */
   emitSuiteClaimEvent?: (event: TamanduaEvent) => void;
 }
@@ -1189,7 +1202,12 @@ export function createControlServer(options: ControlServerOptions = {}): http.Se
   const expectedSecret = options.secret;
   const suiteClaimRuntime: SuiteClaimRuntime = {
     now: options.now ?? Date.now,
-    probePid: options.probeSuiteOwnerPid ?? probeSuiteOwnerPid,
+    probePid: options.probeSuiteOwnerPid
+      ?? ((pid, expectedStartTime) => probeSuiteOwnerPid(
+        pid,
+        (targetPid, signal) => process.kill(targetPid, signal),
+        expectedStartTime,
+      )),
     emitClaimEvent: options.emitSuiteClaimEvent ?? emitEvent,
   };
 

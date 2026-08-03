@@ -9,6 +9,7 @@ import {
   type SuiteOwnerLiveness,
 } from "../../dist/server/control-server.js";
 import { CLAIM_TIMEOUT_MS } from "../../dist/suite/config.js";
+import { getProcessStartIdentity } from "../../dist/lib/process-start-identity.js";
 
 interface JsonResponse {
   status: number;
@@ -20,14 +21,17 @@ describe("suite claim owner liveness", { concurrency: 1 }, () => {
   const deadPids = new Set<number>();
   const indeterminatePids = new Set<number>();
   const probedPids: number[] = [];
+  const probedIdentities: Array<{ pid: number; startTime?: string }> = [];
   const events: Array<Parameters<NonNullable<ControlServerOptions["emitSuiteClaimEvent"]>>[0]> = [];
   const secret = "suite-claim-liveness-secret";
   const server = createControlServer({
     listen: false,
     secret,
     now: () => now,
-    probeSuiteOwnerPid: (pid): SuiteOwnerLiveness => {
+    probeSuiteOwnerPid: (pid, startTime): SuiteOwnerLiveness => {
       probedPids.push(pid);
+      probedIdentities.push({ pid, startTime });
+      if (pid === 801 && startTime === "original-start") return "dead";
       if (deadPids.has(pid)) return "dead";
       if (indeterminatePids.has(pid)) return "indeterminate";
       return "alive";
@@ -103,6 +107,19 @@ describe("suite claim owner liveness", { concurrency: 1 }, () => {
     }
   });
 
+  it("classifies a reused PID with a different process start time as dead", () => {
+    assert.equal(probeSuiteOwnerPid(4, () => true, "original-start", () => "replacement-start"), "dead");
+    assert.equal(probeSuiteOwnerPid(4, () => true, "original-start", () => "original-start"), "alive");
+    assert.equal(probeSuiteOwnerPid(4, () => true, "original-start", () => undefined), "indeterminate");
+  });
+
+  it("reads a stable start identity for the current process", () => {
+    const first = getProcessStartIdentity(process.pid);
+    assert.ok(first?.startsWith("proc:") || first?.startsWith("ps:"));
+    assert.equal(getProcessStartIdentity(process.pid), first);
+    assert.equal(getProcessStartIdentity(Number.MAX_SAFE_INTEGER), null);
+  });
+
   it("reclaims a provably dead owner once and grants exactly one concurrent waiter", async () => {
     const original = key("dead", "original");
     assert.equal((await request(original)).body.action, "run");
@@ -123,7 +140,19 @@ describe("suite claim owner liveness", { concurrency: 1 }, () => {
     assert.match(reclaimEvents[0].reclaimerStepId ?? "", /^step-waiter-/);
   });
 
+  it("forwards process start identity and reclaims a PID-reused owner", async () => {
+    const original = { ...key("pid-reuse", "pid-reuse-owner", 801), owner_start_time: "original-start" };
+    assert.equal((await request(original)).body.action, "run");
+    assert.equal((await request(key("pid-reuse", "pid-reuse-waiter", 802))).body.action, "run");
+    assert.ok(probedIdentities.some(({ pid, startTime }) => pid === 801 && startTime === "original-start"));
+    const reclaim = events.find((event) => event.event === "suite.claim_dead_owner_reclaimed"
+      && event.originRepo === "/repo/pid-reuse");
+    assert.equal(reclaim?.ownerPid, 801);
+    assert.equal(reclaim?.reclaimerPid, 802);
+  });
+
   it("retains live, indeterminate, and legacy owners below the ceiling", async () => {
+    const reclaimCount = events.filter((event) => event.event === "suite.claim_dead_owner_reclaimed").length;
     indeterminatePids.add(302);
     for (const [suffix, pid] of [
       ["alive", 301],
@@ -137,7 +166,7 @@ describe("suite claim owner liveness", { concurrency: 1 }, () => {
     const malformed = { ...key("malformed", "malformed-owner", null), owner_pid: "not-a-pid" };
     assert.equal((await request(malformed)).body.action, "run");
     assert.equal((await request(key("malformed", "malformed-waiter", 401))).body.action, "wait");
-    assert.equal(events.filter((event) => event.event === "suite.claim_dead_owner_reclaimed").length, 1);
+    assert.equal(events.filter((event) => event.event === "suite.claim_dead_owner_reclaimed").length, reclaimCount);
   });
 
   it("sweeps dead owners early, retains uncertain owners, and keeps ceiling expiration", async () => {

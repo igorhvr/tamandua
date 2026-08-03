@@ -211,6 +211,7 @@ export interface SuiteClaimResult {
 export interface SuiteClaimOwner {
   ownerToken?: string;
   ownerPid?: number;
+  ownerStartTime?: string;
   runId?: string;
   stepId?: string;
   timeoutMs?: number;
@@ -304,6 +305,7 @@ export async function claimSuiteKey(
       cmd_hash: cmdHash,
       ...(ownerToken ? { owner_token: ownerToken } : {}),
       ...(ownership?.ownerPid !== undefined ? { owner_pid: ownership.ownerPid } : {}),
+      ...(ownership?.ownerStartTime ? { owner_start_time: ownership.ownerStartTime } : {}),
       ...(ownership?.runId ? { run_id: ownership.runId } : {}),
       ...(ownership?.stepId ? { step_id: ownership.stepId } : {}),
     },

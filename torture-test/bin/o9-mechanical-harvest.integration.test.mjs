@@ -60,35 +60,156 @@ function spawnShim(repo, env, runId, stepId, script) {
   const child = spawn(process.execPath, [SHIM, '--repo', repo, '--run', runId, '--step', stepId, '--', script], {
     env,
     stdio: ['ignore', 'pipe', 'pipe'],
+    detached: process.platform !== 'win32',
   });
   let stdout = '';
   let stderr = '';
   child.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
   child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+  const exited = new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.once('exit', (code, signal) => resolve({ code, signal }));
+  });
   const closed = new Promise((resolve, reject) => {
     child.once('error', reject);
     child.once('close', (code, signal) => resolve({ code, signal, stdout, stderr }));
   });
-  return { child, closed };
+  return { child, exited, closed, output: () => ({ stdout, stderr }) };
 }
 
-function killProcessGroup(pidFile) {
-  if (!fs.existsSync(pidFile)) return;
-  const pid = Number(fs.readFileSync(pidFile, 'utf8').trim());
-  if (!Number.isSafeInteger(pid) || pid <= 0) return;
-  try { process.kill(-pid, 'SIGKILL'); } catch { /* already stopped */ }
+function bounded(promise, message, timeoutMs = 10_000) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+    timer.unref();
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+async function stopShim(shim) {
+  if (shim.child.exitCode === null && shim.child.signalCode === null) {
+    try {
+      const target = process.platform === 'win32' ? shim.child.pid : -shim.child.pid;
+      process.kill(target, 'SIGKILL');
+    } catch (error) {
+      if (error?.code !== 'ESRCH') throw error;
+    }
+  }
+  shim.child.stdout.destroy();
+  shim.child.stderr.destroy();
+  await bounded(shim.exited, `shim ${shim.child.pid} did not exit during cleanup`, 2_000);
+}
+
+function inspectSuiteProcessGroup(suite) {
+  if (!fs.existsSync(suite.pidFile)) return undefined;
+  const pid = Number(fs.readFileSync(suite.pidFile, 'utf8').trim());
+  assert.ok(Number.isSafeInteger(pid) && pid > 1, `${suite.name} wrote an invalid suite PID`);
+  const inspected = spawnSync('ps', ['-o', 'pgid=', '-o', 'args=', '-p', String(pid)], { encoding: 'utf8' });
+  if (inspected.status !== 0 || inspected.stdout.trim() === '') return undefined;
+  const match = inspected.stdout.trim().match(/^(\d+)\s+(.+)$/);
+  assert.ok(match, `could not inspect ${suite.name} suite process ${pid}`);
+  const pgid = Number(match[1]);
+  const args = match[2];
+  assert.ok(Number.isSafeInteger(pgid) && pgid > 1, `${suite.name} has an invalid process group`);
+  assert.ok(args.includes(suite.script), `${suite.name} PID ${pid} is not owned by this fixture: ${args}`);
+  return { pid, pgid };
+}
+
+function processGroupExists(pgid) {
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === 'ESRCH') return false;
+    if (error?.code === 'EPERM') return true;
+    throw error;
+  }
+}
+
+function signalOwnedSuiteGroup(suite, ownership, signal) {
+  const current = inspectSuiteProcessGroup(suite);
+  if (!current) return;
+  assert.deepEqual(current, ownership, `${suite.name} suite ownership changed before ${signal}`);
+  process.kill(-ownership.pgid, signal);
+}
+
+async function stopSuite(suite) {
+  await waitFor(
+    () => fs.existsSync(suite.pidFile) || fs.existsSync(suite.doneFile),
+    `${suite.name} suite never published its process identity`,
+    2_000,
+  );
+  const ownership = inspectSuiteProcessGroup(suite);
+  fs.writeFileSync(suite.stopFile, 'stop\n');
+  if (!ownership) return;
+  try {
+    await waitFor(
+      () => fs.existsSync(suite.doneFile) && !processGroupExists(ownership.pgid),
+      `${suite.name} suite ignored its stop marker`,
+      2_000,
+    );
+    return;
+  } catch {
+    signalOwnedSuiteGroup(suite, ownership, 'SIGTERM');
+  }
+  try {
+    await waitFor(() => !processGroupExists(ownership.pgid), `${suite.name} suite ignored SIGTERM`, 500);
+  } catch {
+    signalOwnedSuiteGroup(suite, ownership, 'SIGKILL');
+    await waitFor(() => !processGroupExists(ownership.pgid), `${suite.name} suite survived SIGKILL`, 2_000);
+  }
+}
+
+function removeSuiteMarkers(suite) {
+  fs.rmSync(suite.pidFile, { force: true });
+  fs.rmSync(suite.stopFile, { force: true });
+  fs.rmSync(suite.doneFile, { force: true });
 }
 
 function makeRecoveryScript(root, repo, name) {
   const marker = path.join(root, `${name}.marker`);
   const pidFile = path.join(root, `${name}.pid`);
+  const stopFile = path.join(root, `${name}.stop`);
+  const doneFile = path.join(root, `${name}.done`);
   const script = path.join(repo, `${name}.sh`);
-  fs.writeFileSync(script, `#!/bin/sh\nif [ ! -e '${marker}' ]; then\n  : > '${marker}'\n  echo $$ > '${pidFile}'\n  echo '${name} OWNER STARTED'\n  while :; do sleep 1; done\nfi\necho '${name} RECOVERY FINISHED'\n`);
+  fs.writeFileSync(script, `#!/bin/sh\nif [ ! -e '${marker}' ]; then\n  : > '${marker}'\n  echo $$ > '${pidFile}'\n  echo '${name} OWNER STARTED'\n  while [ ! -e '${stopFile}' ]; do sleep 0.05; done\n  : > '${doneFile}'\nfi\necho '${name} RECOVERY FINISHED'\n`);
   fs.chmodSync(script, 0o755);
   command('git', ['add', path.basename(script)], repo);
   command('git', ['commit', '-m', `add ${name} suite`], repo);
-  return { script, pidFile };
+  return { name, script, pidFile, stopFile, doneFile };
 }
+
+test('cleanup force-terminates a wedged invocation-owned suite process group', { timeout: 10_000 }, async () => {
+  const root = fs.mkdtempSync(path.join(VAR_ROOT, 'o9-mechanical-cleanup.'));
+  const suite = {
+    name: 'wedged-cleanup',
+    script: path.join(root, 'wedged-cleanup.sh'),
+    pidFile: path.join(root, 'wedged-cleanup.pid'),
+    stopFile: path.join(root, 'wedged-cleanup.stop'),
+    doneFile: path.join(root, 'wedged-cleanup.done'),
+  };
+  fs.writeFileSync(
+    suite.script,
+    `#!/bin/sh\ntrap '' TERM\necho $$ > '${suite.pidFile}'\nwhile :; do sleep 0.05; done\n`,
+  );
+  fs.chmodSync(suite.script, 0o755);
+  const child = spawn('/bin/sh', ['-c', suite.script], {
+    detached: process.platform !== 'win32',
+    stdio: 'ignore',
+  });
+  try {
+    await waitFor(() => fs.existsSync(suite.pidFile), 'wedged suite did not publish its PID');
+    const suitePid = Number(fs.readFileSync(suite.pidFile, 'utf8').trim());
+    await stopSuite(suite);
+    assert.throws(() => process.kill(suitePid, 0), { code: 'ESRCH' });
+  } finally {
+    try { process.kill(process.platform === 'win32' ? child.pid : -child.pid, 'SIGKILL'); } catch { /* gone */ }
+    if (child.exitCode === null && child.signalCode === null) {
+      await new Promise((resolve) => child.once('exit', resolve));
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
 
 function snapshotInput({ campaignDir, stateDir, databasePath, repo, runIds }) {
   return {
@@ -125,60 +246,102 @@ async function runRecovery({ kind, repo, root, env, port, databasePath, eventsPa
   appendRun(db, waiterRun);
   db.close();
 
-  const owner = spawnShim(repo, env, ownerRun, ownerStep, suite.script);
-  await waitFor(
-    () => eventRows(eventsPath).some((event) => event.event === 'suite.execute_started' && event.runId === ownerRun),
-    `${kind} owner did not emit suite.execute_started`,
-  );
-
-  if (kind === 'dead-owner') {
-    owner.child.kill('SIGKILL');
-    await owner.closed;
-    const waiter = spawnShim(repo, env, waiterRun, waiterStep, suite.script);
-    const waiterResult = await waiter.closed;
-    assert.equal(waiterResult.code, 0, waiterResult.stderr);
-    assert.ok(eventRows(eventsPath).some((event) => event.event === 'suite.claim_dead_owner_reclaimed'
-      && event.ownerRunId === ownerRun && event.reclaimerRunId === waiterRun));
-  } else {
-    const waiter = spawnShim(repo, env, waiterRun, waiterStep, suite.script);
+  const shims = [];
+  try {
+    const owner = spawnShim(repo, env, ownerRun, ownerStep, suite.script);
+    shims.push(owner);
     await waitFor(
-      () => eventRows(eventsPath).some((event) => event.event === 'suite.claim_wait' && event.runId === waiterRun),
-      `${kind} waiter did not emit suite.claim_wait`,
+      () => eventRows(eventsPath).some((event) => event.event === 'suite.execute_started' && event.runId === ownerRun),
+      `${kind} owner did not emit suite.execute_started`,
     );
-    const endpoint = kind === 'stop' ? '/control/pause-run' : '/control/terminate-run';
-    const released = await post(port, endpoint, { runId: ownerRun });
-    assert.equal(released.status, 200, JSON.stringify(released.body));
-    const waiterResult = await waiter.closed;
-    assert.equal(waiterResult.code, 0, waiterResult.stderr);
-    owner.child.kill('SIGKILL');
-    await owner.closed;
-    const relevant = eventRows(eventsPath).filter((event) => event.originRepo === fs.realpathSync(repo)
-      && event.ownerRunId === ownerRun);
-    assert.ok(relevant.some((event) => event.event === 'suite.claim_owner_released'
-      && event.releaseReason === (kind === 'stop' ? 'stop' : 'cancel')));
-    assert.equal(relevant.some((event) => event.event === 'suite.claim_dead_owner_reclaimed'), false);
+
+    if (kind === 'dead-owner') {
+      // The control-plane claim records this exact shim PID. Wait for the
+      // process to exit, not for stdio to close: an orphaned suite descendant
+      // can inherit a descriptor and keep ChildProcess 'close' pending.
+      owner.child.kill('SIGKILL');
+      await bounded(owner.exited, `${kind} owner did not exit after SIGKILL`);
+      const waiter = spawnShim(repo, env, waiterRun, waiterStep, suite.script);
+      shims.push(waiter);
+      let waiterResult;
+      try {
+        waiterResult = await bounded(waiter.closed, `${kind} waiter did not reclaim within deadline`);
+      } catch (error) {
+        const ownerPid = eventRows(eventsPath).find((event) => event.event === 'suite.claim_granted'
+          && event.runId === ownerRun)?.ownerPid;
+        let ownerProcess = 'absent';
+        if (Number.isSafeInteger(ownerPid)) {
+          ownerProcess = spawnSync('ps', ['-o', 'pid=', '-o', 'ppid=', '-o', 'stat=', '-o', 'args=', '-p', String(ownerPid)], { encoding: 'utf8' }).stdout.trim() || 'absent';
+        }
+        throw new Error(`${error.message}; ownerPid=${ownerPid}; ownerProcess=${ownerProcess}; waiterPid=${waiter.child.pid}; waiterOutput=${JSON.stringify(waiter.output())}; events=${JSON.stringify(eventRows(eventsPath).slice(-12))}`);
+      }
+      assert.equal(waiterResult.code, 0, waiterResult.stderr);
+      const reclaims = eventRows(eventsPath).filter((event) => event.event === 'suite.claim_dead_owner_reclaimed'
+        && event.ownerRunId === ownerRun);
+      assert.equal(reclaims.length, 1, 'dead owner must be reclaimed exactly once by the real waiter');
+      assert.equal(reclaims[0].ownerStepId, ownerStep);
+      assert.equal(reclaims[0].ownerPid, owner.child.pid);
+      assert.equal(reclaims[0].reclaimerRunId, waiterRun);
+      assert.equal(reclaims[0].reclaimerStepId, waiterStep);
+      assert.equal(reclaims[0].reclaimerPid, waiter.child.pid);
+    } else {
+      const waiter = spawnShim(repo, env, waiterRun, waiterStep, suite.script);
+      shims.push(waiter);
+      await waitFor(
+        () => eventRows(eventsPath).some((event) => event.event === 'suite.claim_wait' && event.runId === waiterRun),
+        `${kind} waiter did not emit suite.claim_wait`,
+      );
+      const endpoint = kind === 'stop' ? '/control/pause-run' : '/control/terminate-run';
+      const released = await post(port, endpoint, { runId: ownerRun });
+      assert.equal(released.status, 200, JSON.stringify(released.body));
+      const waiterResult = await bounded(waiter.closed, `${kind} waiter did not complete within deadline`);
+      assert.equal(waiterResult.code, 0, waiterResult.stderr);
+      owner.child.kill('SIGKILL');
+      await bounded(owner.exited, `${kind} owner did not exit after cleanup signal`);
+      const relevant = eventRows(eventsPath).filter((event) => event.originRepo === fs.realpathSync(repo)
+        && event.ownerRunId === ownerRun);
+      const releases = relevant.filter((event) => event.event === 'suite.claim_owner_released');
+      assert.equal(releases.length, 1, `${kind} must emit exactly one distinct owner release`);
+      assert.equal(releases[0].releaseReason, kind === 'stop' ? 'stop' : 'cancel');
+      assert.equal(relevant.some((event) => event.event === 'suite.claim_dead_owner_reclaimed'), false);
+    }
+    const emitted = eventRows(eventsPath).filter((event) => event.originRepo === fs.realpathSync(repo));
+    return {
+      kind,
+      ownerRun,
+      ownerStep,
+      waiterRun,
+      waiterStep,
+      ownerGrant: emitted.find((event) => event.event === 'suite.claim_granted'
+        && event.runId === ownerRun && event.ownerRunId === ownerRun),
+      ownerStart: emitted.find((event) => event.event === 'suite.execute_started'
+        && event.runId === ownerRun && event.stepId === ownerStep),
+      waiterGrant: emitted.find((event) => event.event === 'suite.claim_granted'
+        && event.runId === waiterRun && event.ownerRunId === waiterRun),
+      waiterStart: emitted.find((event) => event.event === 'suite.execute_started'
+        && event.runId === waiterRun && event.stepId === waiterStep),
+      reclaim: emitted.find((event) => event.event === 'suite.claim_dead_owner_reclaimed'
+        && event.ownerRunId === ownerRun),
+      release: emitted.find((event) => event.event === 'suite.claim_owner_released'
+        && event.ownerRunId === ownerRun),
+    };
+  } finally {
+    // Publish the suite's cooperative stop before terminating any shim. If a
+    // shim is still between claim and spawn, allowing it to proceed means the
+    // late suite sees the marker immediately. The production suite shell has
+    // its own detached process group, so killing the shim first would not be a
+    // reliable descendant cleanup mechanism.
+    let suiteStopError;
+    try {
+      await stopSuite(suite);
+    } catch (error) {
+      suiteStopError = error;
+    }
+    const cleanup = await Promise.allSettled(shims.map((shim) => stopShim(shim)));
+    removeSuiteMarkers(suite);
+    for (const result of cleanup) assert.equal(result.status, 'fulfilled', String(result.reason));
+    if (suiteStopError) throw suiteStopError;
   }
-  killProcessGroup(suite.pidFile);
-  const emitted = eventRows(eventsPath).filter((event) => event.originRepo === fs.realpathSync(repo));
-  return {
-    kind,
-    ownerRun,
-    ownerStep,
-    waiterRun,
-    waiterStep,
-    ownerGrant: emitted.find((event) => event.event === 'suite.claim_granted'
-      && event.runId === ownerRun && event.ownerRunId === ownerRun),
-    ownerStart: emitted.find((event) => event.event === 'suite.execute_started'
-      && event.runId === ownerRun && event.stepId === ownerStep),
-    waiterGrant: emitted.find((event) => event.event === 'suite.claim_granted'
-      && event.runId === waiterRun && event.ownerRunId === waiterRun),
-    waiterStart: emitted.find((event) => event.event === 'suite.execute_started'
-      && event.runId === waiterRun && event.stepId === waiterStep),
-    reclaim: emitted.find((event) => event.event === 'suite.claim_dead_owner_reclaimed'
-      && event.ownerRunId === ownerRun),
-    release: emitted.find((event) => event.event === 'suite.claim_owner_released'
-      && event.ownerRunId === ownerRun),
-  };
 }
 
 test('real dead-owner, stop/cancel, and controller probes harvest through snapshot to O9 PASS', { timeout: 30_000 }, async () => {
@@ -202,6 +365,7 @@ test('real dead-owner, stop/cancel, and controller probes harvest through snapsh
   const previousEnv = Object.fromEntries(['HOME', 'TAMANDUA_STATE_DIR', 'TAMANDUA_DB_PATH', 'TAMANDUA_CONTROL_PORT', 'TAMANDUA_TEST_GUARD']
     .map((key) => [key, process.env[key]]));
   process.env.HOME = path.join(root, 'home');
+  fs.mkdirSync(process.env.HOME);
   process.env.TAMANDUA_STATE_DIR = stateDir;
   process.env.TAMANDUA_DB_PATH = databasePath;
   process.env.TAMANDUA_TEST_GUARD = '0';
@@ -301,7 +465,6 @@ test('real dead-owner, stop/cancel, and controller probes harvest through snapsh
       server.closeAllConnections();
       await new Promise((resolve) => server.close(resolve));
     }
-    for (const name of ['dead-owner', 'stop', 'cancel']) killProcessGroup(path.join(root, `${name}.pid`));
     fs.rmSync(root, { recursive: true, force: true });
     for (const [key, value] of Object.entries(previousEnv)) {
       if (value === undefined) delete process.env[key];

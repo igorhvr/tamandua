@@ -17,6 +17,7 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { realpathSync, existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
+import { getProcessStartIdentity } from "../lib/process-start-identity.js";
 import {
   TTL_GREEN_MS,
   RED_CONTEXT_WINDOW_MS,
@@ -356,9 +357,11 @@ interface PollResult {
 interface ClaimOwnership {
   ownerToken: string;
   ownerPid: number;
+  ownerStartTime?: string;
   runId: string;
   stepId: string;
 }
+
 
 /**
  * Poll the lookup endpoint until the claim owner records a result or
@@ -494,6 +497,7 @@ async function main(): Promise<void> {
   const claimOwnership: ClaimOwnership = {
     ownerToken,
     ownerPid: process.pid,
+    ownerStartTime: getProcessStartIdentity(process.pid) ?? undefined,
     runId,
     stepId,
   };

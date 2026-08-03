@@ -65,8 +65,11 @@ interface Violation {
 
 // ── Hardcoded exceptions ──────────────────────────────────────────────
 
-/** Files that are fully allowed to reference procfs. */
-const PROC_ALLOWED = new Set(["src/lib/proc-info.ts"]);
+/** Dedicated process-introspection helpers that are allowed to reference procfs. */
+const PROC_ALLOWED = new Set([
+  "src/lib/proc-info.ts",
+  "src/lib/process-start-identity.ts",
+]);
 
 /** Files with a known linux-guarded procfs environ read + lsof fallback. */
 const GUARDED_PROC_FILES = new Set([
@@ -232,6 +235,14 @@ describe("portability lint - unit", () => {
   it("allows proc helper file", () => {
     const v = scanFileContent(
       "src/lib/proc-info.ts",
+      "readFileSync(`" + P + "${pid}/stat`)",
+    );
+    assert.equal(v.length, 0);
+  });
+
+  it("allows the Linux-only process-start identity helper", () => {
+    const v = scanFileContent(
+      "src/lib/process-start-identity.ts",
       "readFileSync(`" + P + "${pid}/stat`)",
     );
     assert.equal(v.length, 0);
