@@ -18,36 +18,36 @@ describe("install exports", () => {
       assert.ok(max > 0);
     });
 
-    it("returns the maximum timeout (5400 for 90-min roles)", () => {
+    it("returns the maximum timeout (10800 for 180-min roles)", () => {
       const max = getMaxRoleTimeoutSeconds();
-      // coding, testing, analysis roles are 5400; others are 3600
-      assert.equal(max, 5400);
+      // coding, testing, analysis roles are 10800; others are 7200
+      assert.equal(max, 10800);
     });
   });
 
   describe("getRoleTimeoutSeconds", () => {
-    it("returns 5400 for analysis role (90 min)", () => {
-      assert.equal(getRoleTimeoutSeconds("analysis"), 5400);
+    it("returns 10800 for analysis role (180 min)", () => {
+      assert.equal(getRoleTimeoutSeconds("analysis"), 10800);
     });
 
-    it("returns 5400 for coding role (90 min)", () => {
-      assert.equal(getRoleTimeoutSeconds("coding"), 5400);
+    it("returns 10800 for coding role (180 min)", () => {
+      assert.equal(getRoleTimeoutSeconds("coding"), 10800);
     });
 
-    it("returns 3600 for verification role (60 min)", () => {
-      assert.equal(getRoleTimeoutSeconds("verification"), 3600);
+    it("returns 7200 for verification role (120 min)", () => {
+      assert.equal(getRoleTimeoutSeconds("verification"), 7200);
     });
 
-    it("returns 5400 for testing role (90 min)", () => {
-      assert.equal(getRoleTimeoutSeconds("testing"), 5400);
+    it("returns 10800 for testing role (180 min)", () => {
+      assert.equal(getRoleTimeoutSeconds("testing"), 10800);
     });
 
-    it("returns 3600 for pr role (60 min)", () => {
-      assert.equal(getRoleTimeoutSeconds("pr"), 3600);
+    it("returns 7200 for pr role (120 min)", () => {
+      assert.equal(getRoleTimeoutSeconds("pr"), 7200);
     });
 
-    it("returns 3600 for scanning role (60 min)", () => {
-      assert.equal(getRoleTimeoutSeconds("scanning"), 3600);
+    it("returns 7200 for scanning role (120 min)", () => {
+      assert.equal(getRoleTimeoutSeconds("scanning"), 7200);
     });
   });
 

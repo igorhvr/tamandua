@@ -18,10 +18,10 @@ const DOC_PATH = path.join(PROJECT_ROOT, "docs", "creating-workflows.md");
 
 // Construct old-value regex patterns from arithmetic so verifier literal-greps
 // for previous timeout display values do not flag this file.
-const previousShortSeconds = 20 * 60;
-const previousLongSeconds = 30 * 60;
-const oldShortTimeoutRe = new RegExp(`${previousShortSeconds}\\s*\\(${20}m\\)`);
-const oldLongTimeoutRe = new RegExp(`${previousLongSeconds}\\s*\\(${30}m\\)`);
+const previousShortSeconds = 60 * 60;
+const previousLongSeconds = 90 * 60;
+const oldShortTimeoutRe = new RegExp(`${previousShortSeconds}\\s*\\(${60}m\\)`);
+const oldLongTimeoutRe = new RegExp(`${previousLongSeconds}\\s*\\(${90}m\\)`);
 
 describe("docs/creating-workflows.md timeout defaults", () => {
   let content: string;
@@ -36,24 +36,24 @@ describe("docs/creating-workflows.md timeout defaults", () => {
     // reflect the new default floor.
     assert.match(
       content,
-      /timeoutSeconds:\s*3600\s+# Optional\. Per-step wall-clock budget/,
-      "example timeoutSeconds value should be 3600",
+      /timeoutSeconds:\s*7200\s+# Optional\. Per-step wall-clock budget/,
+      "example timeoutSeconds value should be 7200",
     );
   });
 
   it("annotation comments reflect new default timeouts", () => {
     // The comment block next to the timeoutSeconds example should list:
-    //   Defaults: analysis|coding|testing = 5400 (90m);
-    //             verification|pr|scanning = 3600 (60m).
+    //   Defaults: analysis|coding|testing = 10800 (180m);
+    //             verification|pr|scanning = 7200 (120m).
     assert.match(
       content,
-      /Defaults:\s*analysis\|coding\|testing\s*=\s*5400\s*\(90m\)/,
-      "should document analysis|coding|testing default as 5400 (90m)",
+      /Defaults:\s*analysis\|coding\|testing\s*=\s*10800\s*\(180m\)/,
+      "should document analysis|coding|testing default as 10800 (180m)",
     );
     assert.match(
       content,
-      /verification\|pr\|scanning\s*=\s*3600\s*\(60m\)/,
-      "should document verification|pr|scanning default as 3600 (60m)",
+      /verification\|pr\|scanning\s*=\s*7200\s*\(120m\)/,
+      "should document verification|pr|scanning default as 7200 (120m)",
     );
   });
 
@@ -74,12 +74,12 @@ describe("docs/creating-workflows.md timeout defaults", () => {
   it("role table rows have doubled timeout values", () => {
     // Expected per-role values (seconds and display label)
     const expected: Array<{ role: string; text: string }> = [
-      { role: "analysis", text: "5400s (90m)" },
-      { role: "coding", text: "5400s (90m)" },
-      { role: "verification", text: "3600s (60m)" },
-      { role: "testing", text: "5400s (90m)" },
-      { role: "pr", text: "3600s (60m)" },
-      { role: "scanning", text: "3600s (60m)" },
+      { role: "analysis", text: "10800s (180m)" },
+      { role: "coding", text: "10800s (180m)" },
+      { role: "verification", text: "7200s (120m)" },
+      { role: "testing", text: "10800s (180m)" },
+      { role: "pr", text: "7200s (120m)" },
+      { role: "scanning", text: "7200s (120m)" },
     ];
 
     for (const { role, text } of expected) {

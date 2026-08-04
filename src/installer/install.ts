@@ -67,8 +67,14 @@ function ensureMainAgentInList(list: Array<Record<string, unknown>>): void {
 // Pi doesn't have tool profiles like OpenClaw, so these are simplified to
 // role descriptions and timeout values only.
 
-const TIMEOUT_60_MIN = 3600;
-const TIMEOUT_90_MIN = 5400;
+// Doubled 2026-08-04 (operator decision): torture-test proof stories run
+// campaign-length work inside a single round (35-90+ min execution plus
+// debugging), and the old 90-min ceiling reaped healthy token-producing
+// workers mid-story (runs #836/#837, 12 worker_lost abandons between them).
+// Genuinely dead workers are still caught fast by the PGID liveness watchdog,
+// which does not depend on these values.
+const TIMEOUT_120_MIN = 7200;
+const TIMEOUT_180_MIN = 10800;
 
 interface RolePolicy {
   description: string;
@@ -79,37 +85,37 @@ const ROLE_POLICIES: Record<AgentRole, RolePolicy> = {
   // analysis: read-only code exploration (planner, prioritizer, reviewer, investigator, triager)
   analysis: {
     description: "Read-only code exploration and reasoning — no file modification, web, or browser access",
-    timeoutSeconds: TIMEOUT_90_MIN,
+    timeoutSeconds: TIMEOUT_180_MIN,
   },
 
   // coding: full read/write/exec — the workhorses (developer, fixer, setup)
   coding: {
     description: "Full read/write/exec for implementation work — the primary workhorse role",
-    timeoutSeconds: TIMEOUT_90_MIN,
+    timeoutSeconds: TIMEOUT_180_MIN,
   },
 
   // verification: read + exec but NO write — preserves independent verification integrity
   verification: {
     description: "Read + exec but NO write — independent verification and code review",
-    timeoutSeconds: TIMEOUT_60_MIN,
+    timeoutSeconds: TIMEOUT_120_MIN,
   },
 
   // testing: read + exec + browser/web for E2E, NO write
   testing: {
     description: "Read + exec capability for running tests and E2E validation",
-    timeoutSeconds: TIMEOUT_90_MIN,
+    timeoutSeconds: TIMEOUT_180_MIN,
   },
 
   // pr: just needs read + exec (for `gh pr create`)
   pr: {
     description: "Read + exec only — creates pull requests and manages version control",
-    timeoutSeconds: TIMEOUT_60_MIN,
+    timeoutSeconds: TIMEOUT_120_MIN,
   },
 
   // scanning: read + exec + web (CVE lookups), NO write
   scanning: {
     description: "Read + exec for security scanning and vulnerability analysis",
-    timeoutSeconds: TIMEOUT_60_MIN,
+    timeoutSeconds: TIMEOUT_120_MIN,
   },
 };
 
