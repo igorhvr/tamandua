@@ -354,12 +354,12 @@ describe("recoverOrphanedStepsForAgent — story-level WLST", () => {
 
 describe("cleanupAbandonedSteps — story-level WLST", () => {
   it("increments story.abandoned_count, not story.retry_count, on age-based cleanup", async () => {
-    // Backdate by 2 hours to exceed ABANDONED_THRESHOLD_MS (maxRoleTimeout + 5min grace)
+    // Backdate by 4 hours to exceed ABANDONED_THRESHOLD_MS (maxRoleTimeout + 5min grace)
     const { runId, storyRowId } = seedStoryRun({
       agentId: "wf-dead_dev",
       abandonedCount: 0,
       retryCount: 2,
-      backdateSeconds: 7200,
+      backdateSeconds: 14400,
     });
 
     const { cleanupAbandonedSteps } = await import("../dist/installer/step-ops.js");
@@ -376,7 +376,7 @@ describe("cleanupAbandonedSteps — story-level WLST", () => {
       agentId: "wf-dead_dev",
       abandonedCount: 8,
       retryCount: 0,
-      backdateSeconds: 7200,
+      backdateSeconds: 14400,
     });
 
     const { cleanupAbandonedSteps } = await import("../dist/installer/step-ops.js");
@@ -399,7 +399,7 @@ describe("cleanupAbandonedSteps — story-level WLST", () => {
       abandonedCount: 0,
       retryCount: 4,
       maxRetries: 4,
-      backdateSeconds: 7200,
+      backdateSeconds: 14400,
     });
 
     const { cleanupAbandonedSteps } = await import("../dist/installer/step-ops.js");
@@ -1118,7 +1118,7 @@ describe("ABND story_abandonments — reason threading", () => {
       agentId: "wf-abnd_dev",
       abandonedCount: 0,
       retryCount: 0,
-      backdateSeconds: 7200, // 2 hours, exceeds ABANDONED_THRESHOLD_MS
+      backdateSeconds: 14400, // 4 hours, exceeds ABANDONED_THRESHOLD_MS
     });
 
     cleanupAbandonedSteps();
@@ -1264,7 +1264,7 @@ describe("ABND story_abandonments — reason threading", () => {
       agentId: "wf-abnd_dev",
       abandonedCount: 0,
       retryCount: 0,
-      backdateSeconds: 7200,
+      backdateSeconds: 14400,
     });
 
     cleanupAbandonedSteps();
@@ -1453,7 +1453,7 @@ describe("ABND — abandon reason aggregate", () => {
       agentId: "wf-abnd_dev",
       abandonedCount: 8, // exactly at max, so +1 triggers exhaustion
       retryCount: 0,
-      backdateSeconds: 7200, // 2 hours back to trigger timeout sweeper
+      backdateSeconds: 14400, // 4 hours back to trigger timeout sweeper
     });
 
     // Insert a prior abandonment to get an aggregate with actual data
@@ -1686,7 +1686,7 @@ describe("ABND — abandon reason aggregate", () => {
     const db = getDb();
     const runId = crypto.randomUUID();
     const stepRowId = crypto.randomUUID();
-    const ago = new Date(Date.now() - 7200 * 1000).toISOString();
+    const ago = new Date(Date.now() - 14400 * 1000).toISOString();
 
     db.prepare(
       "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 'wf-dead', 'task', 'running', '{}', 0, ?, ?)"
@@ -1720,7 +1720,7 @@ describe("ABND — abandon reason aggregate", () => {
     const db = getDb();
     const runId = crypto.randomUUID();
     const stepRowId = crypto.randomUUID();
-    const ago = new Date(Date.now() - 7200 * 1000).toISOString();
+    const ago = new Date(Date.now() - 14400 * 1000).toISOString();
 
     db.prepare(
       "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 'wf-dead', 'task', 'running', '{}', 0, ?, ?)"
@@ -1973,7 +1973,7 @@ describe("ABN2 cleanupAbandonedSteps resilience — telemetry failures do not bl
       agentId: "wf-cleanup-resil_dev",
       abandonedCount: 0,
       retryCount: 0,
-      backdateSeconds: 7200,
+      backdateSeconds: 14400,
     });
 
     // Corrupt the story_abandonments table to make INSERT fail
@@ -2002,7 +2002,7 @@ describe("ABN2 cleanupAbandonedSteps resilience — telemetry failures do not bl
       agentId: "wf-cleanup-resil2_dev",
       abandonedCount: 3,
       retryCount: 0,
-      backdateSeconds: 7200,
+      backdateSeconds: 14400,
     });
 
     db.prepare("DROP TABLE IF EXISTS story_abandonments").run();
@@ -2024,7 +2024,7 @@ describe("ABN2 cleanupAbandonedSteps resilience — telemetry failures do not bl
     const db = getDb();
     const runId = crypto.randomUUID();
     const stepId = crypto.randomUUID();
-    const ago = new Date(Date.now() - 7200 * 1000).toISOString();
+    const ago = new Date(Date.now() - 14400 * 1000).toISOString();
 
     db.prepare(
       "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 'wf-dead', 'task', 'running', '{}', 0, ?, ?)",
