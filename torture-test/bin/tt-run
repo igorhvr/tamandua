@@ -26,7 +26,13 @@ tier_available() {
         && [ -x "$TT_BIN_DIR/tt-verify-environment" ] \
         && [ -f "$TT_DIR/cases/smoke.jsonl" ]
       ;;
-    tier0|tier1|tier2) return 1 ;;   # flipped by later phases
+    tier0)
+      [ -x "$TT_BIN_DIR/tt-controller" ] \
+        && [ -x "$TT_BIN_DIR/tt-tier0-assets" ] \
+        && [ -f "$TT_DIR/cases/tier0.jsonl" ] \
+        && "$TT_BIN_DIR/tt-tier0-assets" "$TT_DIR/cases/tier0.jsonl" >/dev/null 2>&1
+      ;;
+    tier1|tier2) return 1 ;;   # flipped by later phases
     *) return 1 ;;
   esac
 }
@@ -52,7 +58,7 @@ usage() {
   cat <<EOF
 run-torture-test — tamandua torture-test suite (spec: torture-test/tamandua-torture-test-spec/)
 
-Usage: run-torture-test [--smoke | --tier0 | --tier1 | --tier2] [--report] [--help]
+Usage: run-torture-test [--smoke | --tier0 [--include-real] | --tier1 | --tier2 | --report | --help]
 
 Tiers (explicit flag = run immediately, no countdown):
 EOF
@@ -70,6 +76,10 @@ EOF
 
   --report   Print the most recent results summary and exit.
   --help     This help.
+
+  --tier0 runs the scripted/local push-gate cases only (zero tokens).
+  --tier0 --include-real includes both real canaries.
+  WARNING: --include-real launches real pi and Hermes work and spends real tokens.
 
 Bare invocation (no flags): after a 32s countdown, runs the most
 comprehensive available tier. Ctrl-C during the countdown cancels.
@@ -92,15 +102,21 @@ report_latest() {
 
 run_tier() {
   local tier="$1"
+  local include_real="${2:-false}"
   if ! tier_available "$tier"; then
     info="$(tier_info "$tier")"
-    echo "Tier '$tier' is not implemented yet ($(printf '%s' "$info" | cut -d'|' -f3))." >&2
-    echo "Implementation status: bd show tamandua-0j7" >&2
+    echo "Tier '$tier' is unavailable because its required assets are not installed or valid ($(printf '%s' "$info" | cut -d'|' -f3))." >&2
     exit 3
   fi
   case "$tier" in
     smoke)
       exec "$TT_BIN_DIR/tt-controller" --manifest "$TT_DIR/cases/smoke.jsonl"
+      ;;
+    tier0)
+      if [ "$include_real" = true ]; then
+        exec "$TT_BIN_DIR/tt-controller" --manifest "$TT_DIR/cases/tier0.jsonl"
+      fi
+      exec "$TT_BIN_DIR/tt-controller" --manifest "$TT_DIR/cases/tier0.jsonl" --scripted-only
       ;;
     *)
       echo "internal error: tier '$tier' marked available but has no runner" >&2
@@ -143,13 +159,22 @@ EOF
   run_tier "$max"
 }
 
-case "${1:-}" in
-  "")        countdown_and_run_max ;;
-  --smoke)   run_tier smoke ;;
-  --tier0)   run_tier tier0 ;;
-  --tier1)   run_tier tier1 ;;
-  --tier2)   run_tier tier2 ;;
-  --report)  report_latest ;;
-  --help|-h) usage ;;
-  *)         echo "Unknown argument: $1" >&2; usage >&2; exit 4 ;;
-esac
+if [ "$#" -eq 0 ]; then
+  countdown_and_run_max
+elif [ "$#" -eq 1 ]; then
+  case "$1" in
+    --smoke)   run_tier smoke ;;
+    --tier0)   run_tier tier0 ;;
+    --tier1)   run_tier tier1 ;;
+    --tier2)   run_tier tier2 ;;
+    --report)  report_latest ;;
+    --help|-h) usage ;;
+    *)         echo "Unknown argument: $1" >&2; usage >&2; exit 4 ;;
+  esac
+elif [ "$#" -eq 2 ] && [ "$1" = "--tier0" ] && [ "$2" = "--include-real" ]; then
+  run_tier tier0 true
+else
+  echo "Unknown or conflicting arguments: $*" >&2
+  usage >&2
+  exit 4
+fi

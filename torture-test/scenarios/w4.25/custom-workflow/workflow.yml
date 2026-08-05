@@ -1,0 +1,21 @@
+id: puma-custom-probe
+name: Puma Custom Probe
+version: 1
+description: |
+  A one-step custom workflow authored from the puma creating-workflows guide.
+agents:
+  - id: worker
+    name: Worker
+    role: coding
+    workspace:
+      baseDir: agents/worker
+steps:
+  - id: execute
+    agent: worker
+    input: |
+      Execute this fixture task: {{task}}
+      Reply with:
+      STATUS: done
+      REPORT: what completed
+    expects: "STATUS: done"
+    max_retries: 0

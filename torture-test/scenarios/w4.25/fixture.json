@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "puma_ref": "refs/tags/puma",
+  "puma_commit": "d49f8714b8fec94b4e2bf7a102a4f01a04d95956",
+  "tt_commit_source": "TT_COMMIT-or-HEAD",
+  "custom_workflow": "puma-custom-probe",
+  "history": ["completed", "paused", "failed"]
+}

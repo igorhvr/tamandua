@@ -2120,8 +2120,161 @@ expect_rejected "complete file is validated before hooks" "$all_or_nothing" 'lin
 [ ! -e "$sentinel" ] || fail "a hook ran before complete manifest validation"
 pass "invalid later line prevents earlier hook execution"
 
+tier0_selection_manifest="$TEST_ROOT/manifests/tier0-selection.jsonl"
+tier0_scripted_sentinel="$TEST_ROOT/tier0-scripted-ran"
+tier0_real_sentinel="$TEST_ROOT/tier0-real-ran"
+tier0_legacy_real_sentinel="$TEST_ROOT/tier0-legacy-real-ran"
+write_local_case "$tier0_selection_manifest" "TIER0-SCRIPTED" scripted 0 0 "$tier0_scripted_sentinel"
+node --input-type=module - "$tier0_selection_manifest" "$tier0_scripted_sentinel" "$tier0_real_sentinel" "$tier0_legacy_real_sentinel" <<'NODE'
+import fs from 'node:fs';
+const [manifestPath, scriptedSentinel, realSentinel, legacyRealSentinel] = process.argv.slice(2);
+const scripted = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+scripted.reset = null;
+scripted.requires = { toolchains: ['node'] };
+scripted.command.args = ['-e', `require('node:fs').writeFileSync(${JSON.stringify(scriptedSentinel)},'scripted')`];
+const real = structuredClone(scripted);
+real.id = 'TIER0-REAL';
+real.context.execution_mode = 'real';
+real.requires = { platform: 'darwin' };
+real.command.args = ['-e', `require('node:fs').writeFileSync(${JSON.stringify(realSentinel)},'real')`];
+const legacyReal = structuredClone(real);
+legacyReal.id = 'TIER0-LEGACY-REAL';
+legacyReal.context = {};
+legacyReal.requires = {};
+legacyReal.command.args = ['-e', `require('node:fs').writeFileSync(${JSON.stringify(legacyRealSentinel)},'legacy-real')`];
+fs.writeFileSync(manifestPath, `${JSON.stringify(scripted)}\n${JSON.stringify(real)}\n${JSON.stringify(legacyReal)}\n`);
+NODE
+
+validate_before_count=$(find "$TT_DIR/var/results" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+validate_output=$("$CONTROLLER" --manifest "$tier0_selection_manifest" --validate-only 2>&1) \
+  || fail "validate-only rejected a valid mixed manifest: $validate_output"
+validate_after_count=$(find "$TT_DIR/var/results" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+[ "$validate_after_count" -eq "$validate_before_count" ] || fail "validate-only created a campaign"
+[ ! -e "$tier0_scripted_sentinel" ] && [ ! -e "$tier0_real_sentinel" ] \
+  && [ ! -e "$tier0_legacy_real_sentinel" ] \
+  || fail "validate-only launched a case hook"
+printf '%s' "$validate_output" | grep -Fq 'Validated 3 case(s)' \
+  || fail "validate-only did not report every validated record: $validate_output"
+pass "validate-only checks every mixed-manifest record without creating or launching a campaign"
+
+validate_malformed="$TEST_ROOT/manifests/tier0-validate-malformed.jsonl"
+{
+  valid_case "VALIDATE-FIRST"
+  printf '%s\n' '{not-json}'
+} > "$validate_malformed"
+set +e
+validate_malformed_output=$("$CONTROLLER" --manifest "$validate_malformed" --validate-only 2>&1)
+validate_malformed_status=$?
+set -e
+[ "$validate_malformed_status" -eq 2 ] \
+  || fail "validate-only malformed manifest exited $validate_malformed_status instead of 2: $validate_malformed_output"
+printf '%s' "$validate_malformed_output" | grep -Fq 'line 2: invalid JSON' \
+  || fail "validate-only malformed error was not line-numbered: $validate_malformed_output"
+pass "validate-only returns infrastructure exit 2 for malformed manifests"
+
+set +e
+tier0_selection_output=$("$CONTROLLER" --manifest "$tier0_selection_manifest" --scripted-only 2>&1)
+tier0_selection_status=$?
+set -e
+[ "$tier0_selection_status" -eq 0 ] \
+  || fail "scripted-only mixed campaign exited $tier0_selection_status: $tier0_selection_output"
+tier0_selection_id=$(remember_campaign "$tier0_selection_output")
+tier0_selection_dir="$TT_DIR/var/results/$tier0_selection_id"
+[ -e "$tier0_scripted_sentinel" ] || fail "scripted-only campaign did not launch the scripted case"
+[ ! -e "$tier0_real_sentinel" ] || fail "scripted-only campaign launched a real case"
+[ ! -e "$tier0_legacy_real_sentinel" ] || fail "scripted-only campaign launched a legacy real case"
+node --input-type=module - "$tier0_selection_dir/state.json" "$tier0_selection_dir/report.json" "$tier0_selection_dir/report.txt" <<'NODE'
+import fs from 'node:fs';
+const [statePath, reportPath, textPath] = process.argv.slice(2);
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const report = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
+const text = fs.readFileSync(textPath, 'utf8');
+const byId = Object.fromEntries(state.cases.map(item => [item.id, item]));
+if (state.options.execution_selection !== 'scripted-only') {
+  throw new Error(`selection policy was not persisted: ${JSON.stringify(state.options)}`);
+}
+if (byId['TIER0-SCRIPTED']?.outcome !== 'PASS' || byId['TIER0-SCRIPTED'].attempts.length !== 1) {
+  throw new Error(`scripted case did not execute once: ${JSON.stringify(byId['TIER0-SCRIPTED'])}`);
+}
+for (const id of ['TIER0-REAL', 'TIER0-LEGACY-REAL']) {
+  const real = byId[id];
+  if (real?.phase !== 'terminal' || real.outcome !== 'NOT_RUN'
+      || real.reason?.category !== 'pending-real' || real.attempts.length !== 0) {
+    throw new Error(`real case was not mechanically held pending: ${JSON.stringify(real)}`);
+  }
+}
+if (report.verdict !== 'GREEN' || report.exit_code !== 0
+    || report.pending_real?.length !== 2
+    || report.pending_real.map(item => item.id).join(',') !== 'TIER0-REAL,TIER0-LEGACY-REAL'
+    || report.not_run.length !== 0 || !text.includes('PENDING_REAL\n- TIER0-REAL: pending-real')) {
+  throw new Error(`pending-real reporting changed the campaign verdict: ${JSON.stringify(report)}`);
+}
+NODE
+pass "scripted-only executes scripted cases and reports real cases pending-real without changing verdict exits"
+
+node --input-type=module - "$tier0_selection_dir/state.json" <<'NODE'
+import fs from 'node:fs';
+const statePath = process.argv[2];
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const real = state.cases.find(item => item.id === 'TIER0-REAL');
+real.phase = 'pending';
+delete real.outcome;
+delete real.reason;
+delete real.terminal_at;
+state.updated_at = new Date().toISOString();
+fs.writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`);
+NODE
+tier0_resume_output=$(run_recorded_campaign "$CONTROLLER" --resume "$tier0_selection_id") \
+  || fail "scripted-only resume failed: $tier0_resume_output"
+[ ! -e "$tier0_real_sentinel" ] || fail "resume silently launched a previously pending real case"
+[ ! -e "$tier0_legacy_real_sentinel" ] || fail "resume silently launched a legacy real case"
+node --input-type=module - "$tier0_selection_dir/state.json" <<'NODE'
+import fs from 'node:fs';
+const state = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const real = state.cases.find(item => item.id === 'TIER0-REAL');
+if (state.options.execution_selection !== 'scripted-only' || real?.outcome !== 'NOT_RUN'
+    || real.reason?.category !== 'pending-real' || real.attempts.length !== 0) {
+  throw new Error(`resume did not reapply its persisted selection policy: ${JSON.stringify({options:state.options,real})}`);
+}
+NODE
+pass "resume reapplies the persisted scripted-only policy before scheduling"
+
+cp "$tier0_selection_dir/state.json" "$TEST_ROOT/tier0-selection-valid-state.json"
+for corruption in all-policy scripted-case real-attempt; do
+  cp "$TEST_ROOT/tier0-selection-valid-state.json" "$tier0_selection_dir/state.json"
+  node --input-type=module - "$tier0_selection_dir/state.json" "$corruption" <<'NODE'
+import fs from 'node:fs';
+const [statePath, corruption] = process.argv.slice(2);
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+if (corruption === 'all-policy') {
+  state.options.execution_selection = 'all';
+} else if (corruption === 'scripted-case') {
+  const scripted = state.cases.find(item => item.id === 'TIER0-SCRIPTED');
+  scripted.phase = 'terminal';
+  scripted.outcome = 'NOT_RUN';
+  scripted.reason = {category:'pending-real'};
+  scripted.terminal_at = new Date().toISOString();
+  scripted.attempts = [];
+} else {
+  const real = state.cases.find(item => item.id === 'TIER0-REAL');
+  real.attempts = [{id:'forged-attempt',case_id:real.id,kind:'local',phase:'terminal',started_at:state.created_at,terminal_at:state.updated_at,outcome:'PASS'}];
+}
+fs.writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`);
+NODE
+  set +e
+  corruption_output=$("$CONTROLLER" --resume "$tier0_selection_id" 2>&1)
+  corruption_status=$?
+  set -e
+  [ "$corruption_status" -eq 2 ] \
+    || fail "$corruption pending-real state exited $corruption_status instead of 2: $corruption_output"
+  printf '%s' "$corruption_output" | grep -Fq 'execution selection state is invalid' \
+    || fail "$corruption pending-real state was not rejected clearly: $corruption_output"
+done
+cp "$TEST_ROOT/tier0-selection-valid-state.json" "$tier0_selection_dir/state.json"
+pass "resume rejects pending-real state with the wrong policy, case mode, or attempt history"
+
 help_output=$("$CONTROLLER" --help 2>&1) || fail "--help failed: $help_output"
-for text in '--manifest <path>' '--resume <campaign-id>' '--concurrency <count>' '--stagger <duration>' 'Duration examples: 250ms, 5s, 2m, 1h'; do
+for text in '--manifest <path>' '--resume <campaign-id>' '--validate-only' '--scripted-only' '--concurrency <count>' '--stagger <duration>' 'Duration examples: 250ms, 5s, 2m, 1h'; do
   printf '%s' "$help_output" | grep -Fq -- "$text" || fail "help omitted '$text': $help_output"
 done
 pass "help documents campaign and duration options"
@@ -2132,6 +2285,12 @@ expect_usage_error "concurrency must be positive" --manifest "$CASES" --concurre
 expect_usage_error "stagger requires a documented unit" --manifest "$CASES" --stagger 10
 expect_usage_error "stagger rejects unsupported units" --manifest "$CASES" --stagger 2days
 expect_usage_error "resume IDs cannot escape results" --resume ../outside
+expect_usage_error "validate-only may be specified only once" --manifest "$CASES" --validate-only --validate-only
+expect_usage_error "scripted-only may be specified only once" --manifest "$CASES" --scripted-only --scripted-only
+expect_usage_error "validate-only rejects resume" --resume campaign-example --validate-only
+expect_usage_error "validate-only rejects scripted selection" --manifest "$CASES" --validate-only --scripted-only
+expect_usage_error "validate-only rejects scheduler options" --manifest "$CASES" --validate-only --concurrency 2
+expect_usage_error "validate-only rejects stagger" --manifest "$CASES" --validate-only --stagger 1s
 
 campaign_manifest="$TEST_ROOT/manifests/campaign.jsonl"
 valid_case "CAMPAIGN-STATE" > "$campaign_manifest"
@@ -2174,6 +2333,23 @@ if find "$campaign_dir" -mindepth 1 -maxdepth 1 -name '*.tmp' | grep -q .; then
   fail "atomic state writer left a temporary file behind"
 fi
 pass "new invocation atomically creates one versioned campaign state"
+
+node --input-type=module - "$state_file" <<'NODE'
+import fs from 'node:fs';
+const statePath = process.argv[2];
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+delete state.options.execution_selection;
+fs.writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`);
+NODE
+set +e
+selection_mismatch_output=$("$CONTROLLER" --resume "$campaign_id" --scripted-only 2>&1)
+selection_mismatch_status=$?
+set -e
+[ "$selection_mismatch_status" -eq 2 ] \
+  || fail "all-campaign scripted-only resume exited $selection_mismatch_status instead of 2: $selection_mismatch_output"
+printf '%s' "$selection_mismatch_output" | grep -Fq 'execution selection does not match campaign state' \
+  || fail "all-campaign scripted-only resume mismatch was unclear: $selection_mismatch_output"
+pass "legacy all-policy state resumes as all and rejects scripted-only escalation"
 
 resume_before_count=$(find "$TT_DIR/var/results" -mindepth 1 -maxdepth 1 -type d | wc -l)
 resume_output=$(run_recorded_campaign "$CONTROLLER" --resume "$campaign_id" --manifest "$campaign_manifest") || fail "resume failed: $resume_output"
@@ -2376,9 +2552,41 @@ printf '%s\n' "$smoke_dir" >> "$CAMPAIGN_DIRS_FILE"
 pass "smoke manifest checks W0.0 and every present golden fixture without a daemon or harness"
 
 launcher_root="$TEST_ROOT/launcher-torture-test"
-mkdir -p "$launcher_root/bin" "$launcher_root/cases" "$launcher_root/var/results/campaign-newest"
+mkdir -p "$launcher_root/bin" "$launcher_root/cases" "$launcher_root/var/results/campaign-newest" \
+  "$launcher_root/scenarios/lib" "$launcher_root/scenarios/example" "$launcher_root/oracles" \
+  "$TEST_ROOT/workflows/do-now"
 cp "$SCRIPT_DIR/tt-run" "$launcher_root/bin/tt-run"
+cp "$SCRIPT_DIR/tt-tier0-assets" "$launcher_root/bin/tt-tier0-assets"
+cp "$TT_DIR/scenarios/lib/validate-scenario.mjs" "$launcher_root/scenarios/lib/validate-scenario.mjs"
 : > "$launcher_root/cases/smoke.jsonl"
+cat > "$TEST_ROOT/workflows/do-now/workflow.yml" <<'YAML'
+id: do-now
+agents:
+  - id: worker
+steps:
+  - id: work
+    agent: worker
+YAML
+cat > "$launcher_root/scenarios/example/scenario.json" <<'JSON'
+{"schema_version":1,"id":"launcher-example","workflow_base":"do-now","behaviors":"behaviors.json","command":"run.sh","expected_outcome":"completed","oracles":["O3z"]}
+JSON
+cat > "$launcher_root/scenarios/example/behaviors.json" <<'JSON'
+{"heartbeatTokens":0,"defaultTokens":0,"agents":{"worker":{"output":"STATUS: done","tokens":0}}}
+JSON
+cat > "$launcher_root/scenarios/example/run.sh" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+cat > "$launcher_root/oracles/O3z" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+chmod +x "$launcher_root/scenarios/example/run.sh" "$launcher_root/oracles/O3z"
+cat > "$launcher_root/cases/tier0.jsonl" <<'JSONL'
+{"id":"launcher-scripted","context":{"execution_mode":"scripted","scenario_id":"launcher-example","scenario_path":"scenarios/example"}}
+{"id":"launcher-real-pi","context":{"execution_mode":"real"}}
+{"id":"launcher-real-hermes","context":{"execution_mode":"real"}}
+JSONL
 cat > "$launcher_root/bin/tt-controller" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$@" > "$TT_FAKE_CONTROLLER_LOG"
@@ -2404,6 +2612,72 @@ for expected_status in 0 1 2; do
     && [ "${launcher_argv[1]}" = "$launcher_root/cases/smoke.jsonl" ] \
     || fail "tt-run --smoke did not delegate the smoke manifest: $(tr '\n' ' ' < "$launcher_log")"
 done
+
+launcher_help=$("$launcher_root/bin/tt-run" --help)
+printf '%s' "$launcher_help" | grep -Eq -- '--tier0 .*\[available\]' \
+  || fail "tt-run --help did not mark the validated Tier-0 assets available: $launcher_help"
+printf '%s' "$launcher_help" | grep -Fq -- '--include-real' \
+  || fail "tt-run --help did not name the Tier-0 real-case opt-in: $launcher_help"
+printf '%s' "$launcher_help" | grep -Eq 'WARNING.*real.*tokens|real.*tokens.*WARNING' \
+  || fail "tt-run --help did not prominently warn that the opt-in spends real tokens: $launcher_help"
+
+for expected_status in 0 1 2; do
+  set +e
+  TT_FAKE_CONTROLLER_LOG="$launcher_log" TT_FAKE_CONTROLLER_EXIT="$expected_status" \
+    "$launcher_root/bin/tt-run" --tier0 >"$TEST_ROOT/tier0-$expected_status.stdout" \
+    2>"$TEST_ROOT/tier0-$expected_status.stderr"
+  launcher_status=$?
+  set -e
+  [ "$launcher_status" -eq "$expected_status" ] \
+    || fail "tt-run --tier0 changed controller exit $expected_status to $launcher_status"
+  mapfile -t launcher_argv < "$launcher_log"
+  [ "${#launcher_argv[@]}" -eq 3 ] && [ "${launcher_argv[0]}" = "--manifest" ] \
+    && [ "${launcher_argv[1]}" = "$launcher_root/cases/tier0.jsonl" ] \
+    && [ "${launcher_argv[2]}" = "--scripted-only" ] \
+    || fail "tt-run --tier0 did not enforce scripted-only routing: $(tr '\n' ' ' < "$launcher_log")"
+done
+
+TT_FAKE_CONTROLLER_LOG="$launcher_log" "$launcher_root/bin/tt-run" --tier0 --include-real
+mapfile -t launcher_argv < "$launcher_log"
+[ "${#launcher_argv[@]}" -eq 2 ] && [ "${launcher_argv[0]}" = "--manifest" ] \
+  && [ "${launcher_argv[1]}" = "$launcher_root/cases/tier0.jsonl" ] \
+  || fail "tt-run --tier0 --include-real did not delegate the complete manifest: $(tr '\n' ' ' < "$launcher_log")"
+
+for launcher_bad_args in \
+  '--include-real' \
+  '--tier0 --smoke' \
+  '--smoke --include-real' \
+  '--tier0 --include-real --report'; do
+  read -r -a launcher_bad_argv <<< "$launcher_bad_args"
+  set +e
+  "$launcher_root/bin/tt-run" "${launcher_bad_argv[@]}" >"$TEST_ROOT/launcher-bad.stdout" 2>"$TEST_ROOT/launcher-bad.stderr"
+  launcher_status=$?
+  set -e
+  [ "$launcher_status" -eq 4 ] \
+    || fail "tt-run accepted conflicting/unknown arguments '$launcher_bad_args' with exit $launcher_status"
+done
+
+chmod -x "$launcher_root/scenarios/example/run.sh"
+launcher_help=$("$launcher_root/bin/tt-run" --help)
+printf '%s' "$launcher_help" | grep -Eq -- '--tier0 .*\[NOT YET IMPLEMENTED\]' \
+  || fail "tt-run --help advertised Tier-0 with an invalid scenario library: $launcher_help"
+set +e
+TT_FAKE_CONTROLLER_LOG="$launcher_log" "$launcher_root/bin/tt-run" --tier0 \
+  >"$TEST_ROOT/tier0-unavailable.stdout" 2>"$TEST_ROOT/tier0-unavailable.stderr"
+launcher_status=$?
+set -e
+[ "$launcher_status" -eq 3 ] || fail "unavailable Tier-0 assets exited $launcher_status instead of 3"
+chmod +x "$launcher_root/scenarios/example/run.sh"
+
+for required_asset in "$launcher_root/bin/tt-controller" "$launcher_root/cases/tier0.jsonl"; do
+  mv "$required_asset" "$required_asset.missing"
+  launcher_help=$("$launcher_root/bin/tt-run" --help)
+  printf '%s' "$launcher_help" | grep -Eq -- '--tier0 .*\[NOT YET IMPLEMENTED\]' \
+    || fail "tt-run --help advertised Tier-0 without required asset $required_asset: $launcher_help"
+  mv "$required_asset.missing" "$required_asset"
+done
+pass "tt-run detects validated Tier-0 assets, defaults to zero-token routing, gates real cases, and preserves verdict exits"
+
 printf 'controller-generated newest report\n' > "$launcher_root/var/results/campaign-newest/report.txt"
 launcher_report=$("$launcher_root/bin/tt-run" --report)
 printf '%s' "$launcher_report" | grep -Fq 'controller-generated newest report' \

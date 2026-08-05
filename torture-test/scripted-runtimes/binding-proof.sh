@@ -21,6 +21,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TT_REPO_ROOT="${TT_REPO_ROOT:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 TT_DIR="$TT_REPO_ROOT/torture-test"
 VAR_DIR="$TT_DIR/var"
+ACCOUNT_HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)"
+ACCOUNT_HOME="${ACCOUNT_HOME:-/home/$(id -un)}"
 
 RED='\033[31m'
 GREEN='\033[32m'
@@ -31,6 +33,7 @@ info()  { printf '%s\n' "$*" >&2; }
 pass() { printf "${GREEN}  PASS: %s${NC}\n" "$*" >&2; }
 fail() { printf "${RED}  FAIL: %s${NC}\n" "$*" >&2; }
 warn() { printf "${YELLOW}  WARN: %s${NC}\n" "$*" >&2; }
+daemon_control() { env HOME="$ACCOUNT_HOME" "$DAEMON_CONTROL" "$@"; }
 
 # ── Cleanup trap ─────────────────────────────────────────────────────
 # Executed on exit regardless of success/failure. Stops the daemon and
@@ -43,7 +46,7 @@ cleanup() {
   # Stop daemon if it was started (daemon-control stop is idempotent)
   if [ "${DAEMON_STARTED:-0}" = "1" ]; then
     info "Stopping scripted daemon..."
-    "$DAEMON_CONTROL" scripted stop 2>&1 | while IFS= read -r line; do info "  [daemon-control] $line"; done || true
+    daemon_control scripted stop 2>&1 | while IFS= read -r line; do info "  [daemon-control] $line"; done || true
   fi
 
   # Clean up scenario workflow copy
@@ -78,7 +81,7 @@ print_diagnostics() {
   info "=== Diagnostics ==="
   info "Daemon status:"
   if [ "${DAEMON_STARTED:-0}" = "1" ]; then
-    "$DAEMON_CONTROL" scripted status 2>&1 || true
+    daemon_control scripted status 2>&1 || true
   else
     info "  Daemon was not started."
   fi
@@ -228,15 +231,15 @@ start_daemon() {
   info "Daemon control: $DAEMON_CONTROL"
 
   # Make sure any previous daemon is stopped first
-  "$DAEMON_CONTROL" scripted stop 2>&1 | while IFS= read -r line; do info "  [pre-stop] $line"; done || true
+  daemon_control scripted stop 2>&1 | while IFS= read -r line; do info "  [pre-stop] $line"; done || true
   sleep 1
 
   # Start the daemon
-  "$DAEMON_CONTROL" scripted start 2>&1 | while IFS= read -r line; do info "  [start] $line"; done
+  daemon_control scripted start 2>&1 | while IFS= read -r line; do info "  [start] $line"; done
 
   # Verify daemon is running
   local status_out
-  status_out="$("$DAEMON_CONTROL" scripted status 2>&1)" || true
+  status_out="$(daemon_control scripted status 2>&1)" || true
   if echo "$status_out" | grep -q 'RUNNING'; then
     pass "Scripted daemon is RUNNING"
   else
@@ -262,6 +265,26 @@ install_scenario_workflow() {
   # Source env for the command
   local scripted_env; scripted_env="$(source_scripted_env)"
   local scripted_state; scripted_state="$(echo "$scripted_env" | grep '^TAMANDUA_STATE_DIR=' | cut -d= -f2-)"
+  local scripted_home; scripted_home="$(echo "$scripted_env" | grep '^HOME=' | cut -d= -f2-)"
+  SCENARIO_WF_DIR="$scripted_state/workflows/do-now-proof"
+
+  # Workflow installation provisions agent workspaces and reads pi settings
+  # even though this proof cannot invoke a real model.  Provision only the
+  # empty config shape in the contained scripted HOME.
+  mkdir -p "$scripted_home/.pi/agent"
+  if [ ! -f "$scripted_home/.pi/agent/settings.json" ]; then
+    printf '{}\n' >"$scripted_home/.pi/agent/settings.json"
+  fi
+
+  # The proof uses a deliberately stable behavior key.  A killed prior proof
+  # can therefore leave this one known scenario copy behind; reclaim only
+  # that contained destination before asking the fail-closed installer to
+  # create it again.  Assigning the path before install also lets EXIT cleanup
+  # remove a partially-created destination.
+  if [ -d "$SCENARIO_WF_DIR" ]; then
+    info "Removing stale binding-proof workflow copy: $SCENARIO_WF_DIR"
+    rm -rf -- "$SCENARIO_WF_DIR"
+  fi
 
   # First ensure the base workflow is installed in the scripted env
   info "Ensuring 'do-now' workflow is installed in scripted env..."
@@ -280,7 +303,6 @@ install_scenario_workflow() {
   info "  $install_out"
 
   # Verify the copy exists
-  SCENARIO_WF_DIR="$scripted_state/workflows/do-now-proof"
   if [ -d "$SCENARIO_WF_DIR" ]; then
     pass "Workflow copy created: do-now-proof"
   else

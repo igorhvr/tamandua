@@ -1,0 +1,113 @@
+#!/usr/bin/env node
+
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { validateScenario } from "../scenarios/lib/validate-scenario.mjs";
+
+const binDir = path.dirname(fileURLToPath(import.meta.url));
+const ttRoot = path.resolve(binDir, "..");
+const scenariosRoot = path.join(ttRoot, "scenarios");
+
+function fail(message) {
+  throw new Error(`Tier-0 assets unavailable: ${message}`);
+}
+
+function sameJson(left, right) {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function readManifest(manifestPath) {
+  const contents = fs.readFileSync(manifestPath, "utf8");
+  const records = [];
+  for (const [index, line] of contents.split(/\r?\n/).entries()) {
+    if (line.trim() === "") continue;
+    try {
+      records.push(JSON.parse(line));
+    } catch (error) {
+      fail(`manifest line ${index + 1} is not JSON: ${error.message}`);
+    }
+  }
+  if (records.length === 0) fail("manifest contains no cases");
+  return records;
+}
+
+function resolveScenario(relative, caseId) {
+  if (typeof relative !== "string" || !relative.startsWith("scenarios/") || path.isAbsolute(relative)) {
+    fail(`${caseId} has an invalid scenario_path`);
+  }
+  const candidate = path.resolve(ttRoot, relative);
+  const rootPrefix = `${scenariosRoot}${path.sep}`;
+  if (!candidate.startsWith(rootPrefix)) fail(`${caseId} scenario_path escapes scenarios/`);
+  const details = fs.lstatSync(candidate, { throwIfNoEntry: false });
+  if (!details?.isDirectory() || details.isSymbolicLink()) {
+    fail(`${caseId} scenario_path is not a regular directory: ${relative}`);
+  }
+  const realRoot = fs.realpathSync(scenariosRoot);
+  const realCandidate = fs.realpathSync(candidate);
+  if (!realCandidate.startsWith(`${realRoot}${path.sep}`)) {
+    fail(`${caseId} scenario_path resolves outside scenarios/: ${relative}`);
+  }
+  return candidate;
+}
+
+function validateTier0Assets(manifestPath) {
+  const records = readManifest(manifestPath);
+  const seenScenarioIds = new Set();
+  let scenarioCount = 0;
+
+  for (const record of records) {
+    const caseId = typeof record?.id === "string" ? record.id : "<unknown-case>";
+    const context = record?.context;
+    if (!context || typeof context !== "object" || Array.isArray(context)) continue;
+    const hasScenarioId = Object.hasOwn(context, "scenario_id");
+    const hasScenarioPath = Object.hasOwn(context, "scenario_path");
+    if (hasScenarioId !== hasScenarioPath) {
+      fail(`${caseId} must declare scenario_id and scenario_path together`);
+    }
+    if (!hasScenarioPath) continue;
+
+    const scenarioDir = resolveScenario(context.scenario_path, caseId);
+    const scenario = validateScenario(scenarioDir);
+    if (scenario.id !== context.scenario_id) {
+      fail(`${caseId} scenario_id ${context.scenario_id} does not match ${scenario.id}`);
+    }
+    if (seenScenarioIds.has(scenario.id)) fail(`scenario ${scenario.id} is referenced more than once`);
+    seenScenarioIds.add(scenario.id);
+    if (Object.hasOwn(context, "scenario_expected_outcome")
+        && context.scenario_expected_outcome !== scenario.expected_outcome) {
+      fail(`${caseId} expected outcome does not match scenario metadata`);
+    }
+    const metadata = JSON.parse(fs.readFileSync(scenario.metadata_path, "utf8"));
+    if (Object.hasOwn(context, "scenario_expected_route")
+        && !sameJson(context.scenario_expected_route, metadata.expected_route)) {
+      fail(`${caseId} expected route does not match scenario metadata`);
+    }
+    scenarioCount += 1;
+  }
+
+  if (scenarioCount === 0) fail("manifest references no scripted scenarios");
+  return scenarioCount;
+}
+
+function main() {
+  const args = process.argv.slice(2);
+  if (args.length !== 1) {
+    process.stderr.write("Usage: tt-tier0-assets <tier0-manifest>\n");
+    process.exit(2);
+  }
+  try {
+    const manifestPath = path.resolve(args[0]);
+    const casesRoot = path.join(ttRoot, "cases");
+    if (!manifestPath.startsWith(`${casesRoot}${path.sep}`)) fail("manifest must be beneath torture-test/cases/");
+    const details = fs.lstatSync(manifestPath, { throwIfNoEntry: false });
+    if (!details?.isFile() || details.isSymbolicLink()) fail("manifest is not a regular file");
+    const count = validateTier0Assets(manifestPath);
+    process.stdout.write(`Validated ${count} Tier-0 scenario asset set(s)\n`);
+  } catch (error) {
+    process.stderr.write(`${error.message}\n`);
+    process.exit(1);
+  }
+}
+
+main();

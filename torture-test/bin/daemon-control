@@ -452,8 +452,8 @@ cmd_start() {
     use_systemd=true
     echo "daemon-control: using systemd scope: $scope_unit" >&2
     # Clear any lingering scope unit from a previous failed run
-    systemctl --user stop "$scope_unit" 2>/dev/null || true
-    systemctl --user reset-failed "$scope_unit" 2>/dev/null || true
+    systemctl --user stop "${scope_unit%.scope}.scope" 2>/dev/null || true
+    systemctl --user reset-failed "${scope_unit%.scope}.scope" 2>/dev/null || true
     # systemd-run exits immediately; the daemon+runs inside the scope.
     # We pass the full env via env -i composition.
     systemd-run --user --scope --unit="$scope_unit" --quiet \
@@ -563,6 +563,15 @@ cmd_stop() {
 
   if $all_ports_free; then
     echo "daemon-control: $kind daemon is already stopped" >&2
+    # A descendant that no longer owns a listener (for example an SSH control
+    # process spawned by a daemon child) can keep the transient scope alive.
+    # Tear down the provenanced scope even on this idempotent path so the next
+    # scenario can reuse daemon-control's fixed unit name without colliding.
+    if [ -n "$prov_scope" ] && [ "$prov_scope" != "null" ] && has_systemd_scope; then
+      echo "daemon-control: cleaning up residual systemd scope $prov_scope..." >&2
+      systemctl --user stop "${prov_scope%.scope}.scope" 2>/dev/null || true
+      systemctl --user reset-failed "${prov_scope%.scope}.scope" 2>/dev/null || true
+    fi
     local has_stopped_at
     has_stopped_at=$(jq -r '.stoppedAt // ""' "$prov_file" 2>/dev/null)
     if [ -z "$has_stopped_at" ]; then
@@ -664,9 +673,9 @@ cmd_stop() {
   # ── Step 5: Clean up systemd scope ─────────────────────────────────
   if [ -n "$prov_scope" ] && [ "$prov_scope" != "null" ] && has_systemd_scope; then
     echo "daemon-control: cleaning up systemd scope $prov_scope..." >&2
-    systemctl --user stop "$prov_scope" 2>/dev/null || true
+    systemctl --user stop "${prov_scope%.scope}.scope" 2>/dev/null || true
     # reset-failed clears the unit so a fresh systemd-run can reuse the name
-    systemctl --user reset-failed "$prov_scope" 2>/dev/null || true
+    systemctl --user reset-failed "${prov_scope%.scope}.scope" 2>/dev/null || true
   fi
 
   # ── Step 6: Update provenance with stop metadata ───────────────────

@@ -115,11 +115,34 @@ test('renderCampaignReport is deterministic and contains all required sections',
 test('verdict exit codes distinguish green, findings, and infrastructure failure', () => {
   assert.deepEqual(verdictExitCode(stateWith([caseState('green', 'PASS')])), { verdict: 'GREEN', exitCode: 0 });
   assert.deepEqual(verdictExitCode(stateWith([caseState('predicate', 'NOT_RUN', { attempts: [], reason: { category: 'predicate', evidence: [] } })])), { verdict: 'GREEN', exitCode: 0 });
+  assert.deepEqual(verdictExitCode(stateWith([caseState('pending-real', 'NOT_RUN', {
+    attempts: [], reason: { category: 'pending-real' },
+  })])), { verdict: 'GREEN', exitCode: 0 });
   assert.deepEqual(verdictExitCode(stateWith([caseState('red', 'PRODUCT_FAIL')])), { verdict: 'FINDINGS', exitCode: 1 });
   assert.deepEqual(verdictExitCode(stateWith([caseState('infra', 'TEST_INFRA_FAIL', { reason: { category: 'hook-failed' } })])), { verdict: 'INFRA_FAILURE', exitCode: 2 });
   assert.deepEqual(verdictExitCode(stateWith([caseState('oracle-infra', 'PRODUCT_FAIL', {
     oracle_results: [{ oracle_id: 'O2', status: 'TEST_INFRA' }],
   })])), { verdict: 'INFRA_FAILURE', exitCode: 2 });
+});
+
+test('pending real cases are reported distinctly from other NOT_RUN cases', () => {
+  const report = buildCampaignReport(stateWith([
+    caseState('pending-real', 'NOT_RUN', {
+      attempts: [], reason: { category: 'pending-real' },
+    }),
+    caseState('predicate', 'NOT_RUN', {
+      attempts: [], reason: { category: 'predicate', evidence: [] },
+    }),
+    caseState('executed', 'PASS'),
+  ]));
+
+  assert.deepEqual(report.pending_real.map((item) => item.id), ['pending-real']);
+  assert.deepEqual(report.not_run.map((item) => item.id), ['predicate']);
+  assert.equal(report.verdict, 'GREEN');
+  assert.equal(report.exit_code, 0);
+  const text = renderCampaignReport(report);
+  assert.match(text, /PENDING_REAL\n- pending-real: pending-real/);
+  assert.match(text, /NOT_RUN\n- predicate: predicate/);
 });
 
 test('writeCampaignReports uses only persisted state and atomically replaces deterministic reports', () => {

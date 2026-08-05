@@ -231,5 +231,16 @@ export function loadOracleInvocation({ argv = process.argv, env = process.env } 
   for (const key of REQUIRED_ORACLE_EVIDENCE[oracleId] ?? []) {
     if (evidencePaths[key] === undefined) throw new OracleRuntimeError(`${key} required evidence is missing`);
   }
-  return Object.freeze({ context, contextPath, campaignRoot, evidenceDir, evidencePaths: Object.freeze(evidencePaths), oracleId });
+  const suppliedReferences = Object.values(context.mechanical_evidence.references).filter((reference) => reference !== null);
+  const localCaseProfile = suppliedReferences.length > 0
+    && suppliedReferences.every((reference) => reference.source === 'controller-local-case'
+      && reference.path === suppliedReferences[0].path
+      && reference.sha256 === suppliedReferences[0].sha256);
+  if (suppliedReferences.some((reference) => reference.source === 'controller-local-case') && !localCaseProfile) {
+    throw new OracleRuntimeError('local-case evidence references must all identify one immutable proof');
+  }
+  return Object.freeze({
+    context, contextPath, campaignRoot, evidenceDir, evidencePaths: Object.freeze(evidencePaths),
+    oracleId, localCaseProfile,
+  });
 }

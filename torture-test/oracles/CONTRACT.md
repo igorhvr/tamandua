@@ -106,6 +106,26 @@ campaign-global, so duplicate rows are rejected even when they carry different c
 The current-case row's workflow and start/terminal timestamps and status must exactly
 match its root-attempt or discovered-run projection.
 
+### Local-case mechanical profile
+
+Contract version 1 also supports controller-owned `workflow=local` commands without
+a workflow run ID. The top-level context and evidence-key set remain unchanged. For
+this profile, every evidence key required by the declared oracle resolves to the same
+read-only, SHA-256-pinned artifact with `source=controller-local-case`; optional keys
+remain null. Mixing that source with another artifact or hash is invalid.
+
+The shared oracle runtime recognizes the profile only when the latest projected
+attempt has `kind=local`, a null `run_id`, and a command result matching the pinned
+proof. It then evaluates the proof mechanically inside the declared
+`oracles/<id>` executable rather than fabricating a controller verdict. The proof
+contains the command exit/signal projection, immutable scenario identity and oracle
+declarations, parsed machine-readable scenario result, contained run-token rows, and
+pre/terminal absolute system-token observations. Every local oracle gates command and
+scenario success; O3z additionally gates complete zero-token reconciliation. The
+normal oracle response, exit-code, stdout/stderr, context, and evidence-retention
+contracts still apply. This profile never accepts agent prose or a `STATUS:` line as
+evidence.
+
 ### Evidence reference type and containment
 
 Every non-null value in `mechanical_evidence.references` has exactly this version-1

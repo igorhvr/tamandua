@@ -1,0 +1,49 @@
+{
+  "agents": {
+    "triager": {
+      "output": "STATUS: done\nREPO: {{cwd}}\nBRANCH: w435-failed-fix\nSEVERITY: high\nAFFECTED_AREA: value.txt\nREPRODUCTION: fixture contains the old value\nPROBLEM_STATEMENT: fixture value must be corrected",
+      "tokens": 0
+    },
+    "investigator": {
+      "output": "STATUS: done\nROOT_CAUSE: fixture contains a stale value\nFIX_APPROACH: replace old with fixed",
+      "tokens": 0
+    },
+    "setup": {
+      "commands": [
+        "git checkout -b w435-failed-fix"
+      ],
+      "output": "STATUS: done\nORIGINAL_BRANCH: {{input.ORIGINAL_BRANCH}}\nBUILD_CMD: true\nTEST_CMD: false\nBASELINE: deterministic fixture ready",
+      "tokens": 0
+    },
+    "fixer": {
+      "edits": [
+        {
+          "file": "value.txt",
+          "find": "old",
+          "replace": "fixed"
+        }
+      ],
+      "commands": [
+        "git add value.txt",
+        "git commit -m \"fix: update scripted failed matrix fixture\""
+      ],
+      "output": "STATUS: done\nCHANGES: corrected the deterministic fixture value\nREGRESSION_TEST: scripted FMIS failed matrix evidence",
+      "tokens": 0
+    },
+    "verifier": {
+      "output": "STATUS: done\nVERIFIED: deterministic fixture tree verified\nTESTED_TREE: {{gitTree}}",
+      "tokens": 0,
+      "commands": [
+        "set +e; {{input.TEST_CMD}}; rc=$?; set -e; test \"$rc\" -eq 1"
+      ]
+    },
+    "merger": {
+      "output": "STATUS: failed\nREASON: deterministic explicit merger refusal",
+      "stepAction": "fail",
+      "failReason": "STATUS: failed\nREASON: deterministic explicit merger refusal",
+      "tokens": 0
+    }
+  },
+  "heartbeatTokens": 0,
+  "defaultTokens": 0
+}

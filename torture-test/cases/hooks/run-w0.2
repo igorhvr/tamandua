@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+cd "$repo_root"
+# Let the e2e tests allocate their own state and listener ports, but preserve
+# the controller's contained HOME and deterministic harness binaries.
+unset TT_ROOT TT_SCRIPTED_HOME HERMES_HOME \
+  TAMANDUA_STATE_DIR TAMANDUA_DB_PATH \
+  TAMANDUA_CONTROL_PORT TAMANDUA_MCP_PORT TAMANDUA_DASHBOARD_PORT \
+  TAMANDUA_SCRIPTED_BEHAVIORS TAMANDUA_SCRIPTED_STATE \
+  TAMANDUA_TEST_GUARD NODE_TEST_CONTEXT
+./run-all-e2e-tests
+node --test e2e-tests/workflows-stress-concurrent.test.ts

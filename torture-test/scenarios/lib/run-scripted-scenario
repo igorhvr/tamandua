@@ -1,0 +1,315 @@
+#!/usr/bin/env bash
+# Shared Tier-0 scripted-scenario harness. Metadata and behavior templates are
+# validated before lifecycle work; all daemon operations use daemon-control
+# scripted, and every child receives tt-env-scripted.sh without mutating this
+# shell's HOME or Tamandua variables.
+set -uo pipefail
+
+LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TT_DIR="$(cd "$LIB_DIR/../.." && pwd)"
+REPO_ROOT="$(dirname "$TT_DIR")"
+VALIDATOR="$LIB_DIR/validate-scenario.mjs"
+MATERIALIZER="$LIB_DIR/materialize-behaviors.mjs"
+DAEMON_CONTROL="$TT_DIR/bin/daemon-control"
+INSTALLER="$TT_DIR/scripted-runtimes/install-scenario-workflows"
+ENV_SCRIPT="$TT_DIR/env/tt-env-scripted.sh"
+TAMANDUA_CLI="$REPO_ROOT/bin/tamandua"
+VAR_ROOT="$TT_DIR/var/scenarios"
+NODE_BIN="${TT_NODE_BIN:-$(command -v node 2>/dev/null || true)}"
+BASH_BIN="$(command -v bash 2>/dev/null || true)"
+ACCOUNT_HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)"
+ACCOUNT_HOME="${ACCOUNT_HOME:-/home/$(id -un)}"
+
+usage() {
+  cat <<'EOF'
+Usage: run-scripted-scenario <scenario-directory>
+
+Validates scenario.json, its behavior template, workflow base, outcome, and
+oracle list before starting the contained scripted daemon. The scenario's
+command receives TT_SCENARIO_* plus TAMANDUA_SCRIPTED_BEHAVIORS/STATE.
+EOF
+}
+
+fail() {
+  printf 'run-scripted-scenario: %s\n' "$*" >&2
+  exit 1
+}
+
+if [ $# -ne 1 ]; then
+  usage >&2
+  exit 2
+fi
+SCENARIO_DIR="$1"
+
+# Test doubles are accepted only explicitly and only for self-tests. Normal
+# scenarios cannot redirect lifecycle calls away from the sanctioned tools.
+if [ "${TT_SCENARIO_TEST_MODE:-0}" = "1" ]; then
+  DAEMON_CONTROL="${TT_SCENARIO_DAEMON_CONTROL:-$DAEMON_CONTROL}"
+  INSTALLER="${TT_SCENARIO_INSTALLER:-$INSTALLER}"
+  ENV_SCRIPT="${TT_SCENARIO_ENV:-$ENV_SCRIPT}"
+  TAMANDUA_CLI="${TT_SCENARIO_CLI:-$TAMANDUA_CLI}"
+  VAR_ROOT="${TT_SCENARIO_VAR_ROOT:-$VAR_ROOT}"
+elif env | grep -q '^TT_SCENARIO_\(DAEMON_CONTROL\|INSTALLER\|ENV\|CLI\|VAR_ROOT\)='; then
+  fail "tool-path overrides require TT_SCENARIO_TEST_MODE=1"
+fi
+
+[ -n "$NODE_BIN" ] && [ -x "$NODE_BIN" ] || fail "node is required"
+[ -n "$BASH_BIN" ] && [ -x "$BASH_BIN" ] || fail "bash is required"
+[ -x "$DAEMON_CONTROL" ] || fail "daemon-control is not executable: $DAEMON_CONTROL"
+[ -x "$INSTALLER" ] || fail "workflow installer is not executable: $INSTALLER"
+[ -f "$ENV_SCRIPT" ] || fail "scripted child environment is missing: $ENV_SCRIPT"
+[ -x "$TAMANDUA_CLI" ] || fail "tamandua CLI is not executable: $TAMANDUA_CLI"
+
+# Acceptance requires fail-fast metadata checking before any daemon call.
+SCENARIO_JSON="$($NODE_BIN "$VALIDATOR" "$SCENARIO_DIR")" || exit $?
+json_field() {
+  "$NODE_BIN" -e 'const value=JSON.parse(process.argv[1])[process.argv[2]]; if (typeof value !== "string") process.exit(2); process.stdout.write(value)' "$SCENARIO_JSON" "$1"
+}
+SCENARIO_ID="$(json_field id)" || fail "validator returned no scenario id"
+WORKFLOW_BASE="$(json_field workflow_base)" || fail "validator returned no workflow base"
+COMMAND_PATH="$(json_field command_path)" || fail "validator returned no command"
+EXPECTED_OUTCOME="$(json_field expected_outcome)" || fail "validator returned no expected outcome"
+SCENARIO_DIR="$(json_field scenario_dir)" || fail "validator returned no scenario directory"
+
+case "$VAR_ROOT" in
+  "$TT_DIR/var"|"$TT_DIR/var"/*) ;;
+  *) fail "scenario state root must stay under torture-test/var: $VAR_ROOT" ;;
+esac
+mkdir -p "$VAR_ROOT"
+LOCK_DIR="$VAR_ROOT/.scripted-daemon.lock"
+LOCK_OWNED=0
+INVOCATION_DIR=""
+WORKFLOW_DIR=""
+COMMAND_PID=""
+COMMAND_STARTTIME=""
+COMMAND_GROUP_PROVEN=0
+COMMAND_READY_FILE=""
+COMMAND_RELEASE_FILE=""
+DAEMON_TOUCHED=0
+
+process_starttime() {
+  local pid="$1" details rest
+  [ -r "/proc/$pid/stat" ] || return 1
+  details="$(<"/proc/$pid/stat")" || return 1
+  rest="${details##*) }"
+  set -- $rest
+  printf '%s\n' "${20:-}"
+}
+
+process_group() {
+  local pid="$1" details rest
+  [ -r "/proc/$pid/stat" ] || return 1
+  details="$(<"/proc/$pid/stat")" || return 1
+  rest="${details##*) }"
+  set -- $rest
+  printf '%s\n' "${3:-}"
+}
+
+stop_owned_command() {
+  [ -n "$COMMAND_PID" ] && [ "$COMMAND_GROUP_PROVEN" = "1" ] || return 0
+  local current
+  current="$(process_starttime "$COMMAND_PID" 2>/dev/null || true)"
+  # Once the dedicated process group is proven while its leader is alive, it
+  # remains scenario-owned even if that leader exits before its descendants.
+  # A live leader with a changed start time means PID/PGID reuse, so fail closed.
+  if [ -z "$current" ] || [ "$current" = "$COMMAND_STARTTIME" ]; then
+    kill -TERM -- "-$COMMAND_PID" 2>/dev/null || true
+    local attempt
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+      kill -0 -- "-$COMMAND_PID" 2>/dev/null || break
+      sleep 0.05
+    done
+    kill -KILL -- "-$COMMAND_PID" 2>/dev/null || true
+    wait "$COMMAND_PID" 2>/dev/null || true
+  fi
+  COMMAND_PID=""
+  COMMAND_GROUP_PROVEN=0
+}
+
+daemon_control() {
+  local operation="$1"
+  case "$operation" in start|status|restart|stop) ;;
+    *) fail "invalid scripted daemon operation: $operation" ;;
+  esac
+  env HOME="$ACCOUNT_HOME" PATH="$REPO_ROOT/bin:$PATH" TAMANDUA_SCRIPTED_BEHAVIORS="$BEHAVIORS_FILE" \
+      TAMANDUA_SCRIPTED_STATE="$COUNTER_DIR" \
+      "$DAEMON_CONTROL" scripted "$operation"
+}
+
+stop_unreleased_command() {
+  [ -n "$COMMAND_PID" ] || return 0
+  local current group
+  current="$(process_starttime "$COMMAND_PID" 2>/dev/null || true)"
+  # COMMAND_PID is our direct, unreaped child and scenario code has not been
+  # released, so an initially unavailable /proc start time is still safe.
+  if [ -n "$current" ] && { [ -z "$COMMAND_STARTTIME" ] || [ "$current" = "$COMMAND_STARTTIME" ]; }; then
+    group="$(process_group "$COMMAND_PID" 2>/dev/null || true)"
+    if [ "$group" = "$COMMAND_PID" ]; then
+      kill -TERM -- "-$COMMAND_PID" 2>/dev/null || true
+    else
+      kill -TERM "$COMMAND_PID" 2>/dev/null || true
+    fi
+  fi
+  wait "$COMMAND_PID" 2>/dev/null || true
+  COMMAND_PID=""
+}
+
+cleanup() {
+  local exit_code=$?
+  trap - EXIT INT TERM HUP
+  if [ "$COMMAND_GROUP_PROVEN" = "1" ]; then
+    stop_owned_command
+  else
+    stop_unreleased_command
+  fi
+  if [ "$DAEMON_TOUCHED" = "1" ]; then
+    daemon_control stop >/dev/null 2>&1 || true
+  fi
+  if [ -n "$WORKFLOW_DIR" ] && [ -d "$WORKFLOW_DIR" ]; then
+    case "$WORKFLOW_DIR" in
+      "$SCRIPTED_STATE_DIR/workflows/$WORKFLOW_ID") rm -rf -- "$WORKFLOW_DIR" ;;
+    esac
+  fi
+  if [ -n "$INVOCATION_DIR" ] && [ -d "$INVOCATION_DIR" ]; then
+    case "$INVOCATION_DIR" in "$VAR_ROOT"/*) rm -rf -- "$INVOCATION_DIR" ;; esac
+  fi
+  if [ "$LOCK_OWNED" = "1" ]; then rm -rf -- "$LOCK_DIR" 2>/dev/null || true; fi
+  exit "$exit_code"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+# The scripted daemon has one behavior file fixed at start, so serialize daemon
+# ownership. IDs and counter directories remain unique even across repeats.
+# Write a PID stamp inside the lock dir so a successor can detect a stale lock.
+for _attempt in $(seq 1 600); do
+  if mkdir "$LOCK_DIR" 2>/dev/null; then
+    LOCK_OWNED=1
+    printf '%s\n' "$$" >"$LOCK_DIR/pid" || { rmdir -- "$LOCK_DIR" 2>/dev/null || true; continue; }
+    break
+  fi
+  # Lock directory exists — check for staleness.
+  owner_pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+  if [ -n "$owner_pid" ] && ! kill -0 "$owner_pid" 2>/dev/null; then
+    # Owner is dead — steal the lock.
+    rm -rf -- "$LOCK_DIR" 2>/dev/null || true
+  fi
+  sleep 0.1
+done
+[ "$LOCK_OWNED" = "1" ] || fail "timed out acquiring scripted-daemon scenario lock"
+
+UUID_SUFFIX="$(tr -d '-' </proc/sys/kernel/random/uuid 2>/dev/null | cut -c1-12)"
+[ -n "$UUID_SUFFIX" ] || UUID_SUFFIX="$$-$(date +%s%N)"
+INVOCATION_ID="${SCENARIO_ID}-$(date -u +%Y%m%dT%H%M%S)-$$-${UUID_SUFFIX}"
+WORKFLOW_ID="${WORKFLOW_BASE}-${INVOCATION_ID}"
+INVOCATION_DIR="$VAR_ROOT/$INVOCATION_ID"
+COUNTER_DIR="$INVOCATION_DIR/work-count"
+BEHAVIORS_FILE="$INVOCATION_DIR/behaviors.json"
+COMMAND_READY_FILE="$INVOCATION_DIR/command-group-ready"
+COMMAND_RELEASE_FILE="$INVOCATION_DIR/command-group-release"
+mkdir -p "$COUNTER_DIR"
+
+# Resolve child state without sourcing the scripted env into this shell.
+SCRIPTED_ENV_OUTPUT="$(bash "$ENV_SCRIPT" print)" || fail "could not resolve scripted child environment"
+SCRIPTED_STATE_DIR="$(printf '%s\n' "$SCRIPTED_ENV_OUTPUT" | sed -n 's/^TAMANDUA_STATE_DIR=//p' | head -1)"
+SCRIPTED_HOME="$(printf '%s\n' "$SCRIPTED_ENV_OUTPUT" | sed -n 's/^HOME=//p' | head -1)"
+case "$SCRIPTED_STATE_DIR" in "$TT_DIR/var"/*) ;;
+  *)
+    if [ "${TT_SCENARIO_TEST_MODE:-0}" != "1" ]; then
+      fail "scripted TAMANDUA_STATE_DIR escaped torture-test/var: $SCRIPTED_STATE_DIR"
+    fi
+    case "$SCRIPTED_STATE_DIR" in "$TT_DIR/var"/*) ;; *) fail "test scripted state escaped torture-test/var: $SCRIPTED_STATE_DIR" ;; esac
+    ;;
+esac
+case "$SCRIPTED_HOME" in "$TT_DIR/var"/*) ;;
+  *) fail "scripted HOME escaped torture-test/var: $SCRIPTED_HOME" ;;
+esac
+# Workflow installation provisions agent workspaces and therefore reads pi's
+# settings even though the scripted runtime never contacts pi. Scripted HOME
+# intentionally carries no copied credentials, so materialize only the empty
+# config shape required by the installer.
+if [ ! -f "$SCRIPTED_HOME/.pi/agent/settings.json" ]; then
+  mkdir -p "$SCRIPTED_HOME/.pi/agent"
+  printf '{}\n' >"$SCRIPTED_HOME/.pi/agent/settings.json"
+fi
+WORKFLOW_DIR="$SCRIPTED_STATE_DIR/workflows/$WORKFLOW_ID"
+
+"$NODE_BIN" "$MATERIALIZER" "$SCENARIO_DIR" "$WORKFLOW_ID" "$BEHAVIORS_FILE" || fail "could not materialize scenario behaviors"
+
+# Source tt-env-scripted.sh only inside each child process.
+(
+  set -euo pipefail
+  source "$ENV_SCRIPT"
+  exec "$TAMANDUA_CLI" workflow install "$WORKFLOW_BASE"
+) >"$INVOCATION_DIR/base-install.log" 2>&1 || {
+  sed 's/^/  /' "$INVOCATION_DIR/base-install.log" >&2
+  fail "could not install base workflow: $WORKFLOW_BASE"
+}
+(
+  set -euo pipefail
+  source "$ENV_SCRIPT"
+  exec "$INSTALLER" "$WORKFLOW_BASE" "$INVOCATION_ID" --json
+) >"$INVOCATION_DIR/installer-output.json"
+[ -d "$WORKFLOW_DIR" ] || fail "scenario workflow copy was not installed: $WORKFLOW_ID"
+
+DAEMON_TOUCHED=1
+daemon_control stop >/dev/null 2>&1 || true
+daemon_control start || fail "daemon-control scripted start failed"
+DAEMON_STATUS=""
+for _attempt in $(seq 1 50); do
+  DAEMON_STATUS="$(daemon_control status 2>&1 || true)"
+  if printf '%s\n' "$DAEMON_STATUS" | grep -q 'STATUS: RUNNING'; then break; fi
+  sleep 0.1
+done
+printf '%s\n' "$DAEMON_STATUS" | grep -q 'STATUS: RUNNING' \
+  || fail "scripted daemon did not report RUNNING: $DAEMON_STATUS"
+
+(
+  set -euo pipefail
+  source "$ENV_SCRIPT"
+  export TAMANDUA_SCRIPTED_BEHAVIORS="$BEHAVIORS_FILE"
+  export TAMANDUA_SCRIPTED_STATE="$COUNTER_DIR"
+  export TT_SCENARIO_ID="$SCENARIO_ID"
+  export TT_SCENARIO_INVOCATION_ID="$INVOCATION_ID"
+  export TT_SCENARIO_WORKFLOW_ID="$WORKFLOW_ID"
+  export TT_SCENARIO_STATE_DIR="$INVOCATION_DIR"
+  export TT_SCENARIO_EXPECTED_OUTCOME="$EXPECTED_OUTCOME"
+  # Publish readiness from inside the dedicated session, then wait until the
+  # parent has proven process-group ownership before executing scenario code.
+  exec setsid "$BASH_BIN" -c '
+    set -euo pipefail
+    ready_file=$1
+    release_file=$2
+    command_path=$3
+    : >"$ready_file"
+    while [ ! -f "$release_file" ]; do sleep 0.01; done
+    export TT_SCENARIO_COMMAND_GROUP_PROVEN=1
+    exec "$command_path"
+  ' scripted-scenario-command "$COMMAND_READY_FILE" "$COMMAND_RELEASE_FILE" "$COMMAND_PATH"
+) &
+COMMAND_PID=$!
+COMMAND_STARTTIME="$(process_starttime "$COMMAND_PID" 2>/dev/null || true)"
+for _attempt in $(seq 1 500); do
+  if [ -z "$COMMAND_STARTTIME" ]; then
+    COMMAND_STARTTIME="$(process_starttime "$COMMAND_PID" 2>/dev/null || true)"
+  fi
+  if [ -f "$COMMAND_READY_FILE" ]; then
+    COMMAND_GROUP="$(process_group "$COMMAND_PID" 2>/dev/null || true)"
+    if [ -n "$COMMAND_STARTTIME" ] && [ "$COMMAND_GROUP" = "$COMMAND_PID" ]; then
+      COMMAND_GROUP_PROVEN=1
+      break
+    fi
+  fi
+  kill -0 "$COMMAND_PID" 2>/dev/null || break
+  sleep 0.01
+done
+if [ "$COMMAND_GROUP_PROVEN" != "1" ]; then
+  stop_unreleased_command
+  fail "could not prove the scenario command process group before release"
+fi
+: >"$COMMAND_RELEASE_FILE"
+wait "$COMMAND_PID"
+COMMAND_STATUS=$?
+exit "$COMMAND_STATUS"

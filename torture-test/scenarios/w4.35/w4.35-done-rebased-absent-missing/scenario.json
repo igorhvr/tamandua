@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "id": "w4.35-done-rebased-absent-missing",
+  "workflow_base": "bug-fix-merge-worktree",
+  "workflow_id": "bug-fix-merge-worktree-w4.35-done-rebased-absent-missing",
+  "behaviors": "behaviors.json",
+  "command": "run.sh",
+  "task": "task.md",
+  "expected_outcome": "failed",
+  "oracles": [
+    "O1",
+    "O2",
+    "O3z",
+    "O8",
+    "O9",
+    "O10",
+    "O11"
+  ],
+  "oracle_justification": "full merge-run evidence contract",
+  "matrix": {
+    "verdict": "done",
+    "rebased": "absent",
+    "suite_evidence": "missing"
+  },
+  "expected_route": {
+    "terminal_route": "expects-reroute-exhausted",
+    "run_status": "failed",
+    "finalize_status": "failed",
+    "ref_movement": "forbidden",
+    "landing_policy": "must-not-land",
+    "evidence_annotation": "none",
+    "suite_rows": 0,
+    "retry_count": 1,
+    "terminal_reroute_count": 1,
+    "reroute_count": 8,
+    "ledger_concession_count": 1,
+    "reroute_events": 8,
+    "merger_invocations": 8,
+    "system_tokens_spent": 0
+  }
+}

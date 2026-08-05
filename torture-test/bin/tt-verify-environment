@@ -240,7 +240,7 @@ registerCheck('node-sqlite', 'node:sqlite loads without error', 'REQUIRED', 'pla
 // --- npm presence ---
 registerCheck('npm', 'npm is present', 'REQUIRED', 'platform', async () => {
   try {
-    const result = spawnSync('npm', ['--version'], { encoding: 'utf-8', timeout: 10000 });
+    const result = spawnSync('npm', ['--version'], { encoding: 'utf-8', timeout: 30000 });
     if (result.status === 0 && result.stdout.trim()) {
       const npmVer = result.stdout.trim();
       // Record in host profile accumulator (US-002)

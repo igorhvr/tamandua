@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "id": "w4.35-retry-rebased-absent-green",
+  "workflow_base": "bug-fix-merge-worktree",
+  "workflow_id": "bug-fix-merge-worktree-w4.35-retry-rebased-absent-green",
+  "behaviors": "behaviors.json",
+  "command": "run.sh",
+  "task": "task.md",
+  "expected_outcome": "failed",
+  "oracles": [
+    "O1",
+    "O2",
+    "O3z",
+    "O8",
+    "O9",
+    "O10",
+    "O11"
+  ],
+  "oracle_justification": "full merge-run retry evidence contract",
+  "matrix": {
+    "verdict": "retry",
+    "rebased": "absent",
+    "suite_evidence": "green"
+  },
+  "expected_route": {
+    "terminal_route": "accepted-retry-reroute-exhausted",
+    "run_status": "failed",
+    "finalize_status": "failed",
+    "ref_movement": "forbidden",
+    "landing_policy": "must-not-land",
+    "evidence_annotation": "none",
+    "suite_rows": 1,
+    "retry_count": 1,
+    "terminal_reroute_count": 0,
+    "reroute_count": 8,
+    "ledger_concession_count": 0,
+    "reroute_events": 8,
+    "merger_invocations": 9,
+    "verifier_invocations": 9,
+    "accepted_retry_events": 0,
+    "retry_feedback_contains": "STATUS: retry",
+    "retry_feedback_reroutes": 8,
+    "story_retry_events": 0,
+    "fixer_invocations": 1,
+    "story_rows": 0,
+    "story_retry_count": 0,
+    "unresolved_placeholder_events": 0,
+    "system_tokens_spent": 0
+  }
+}

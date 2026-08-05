@@ -86,6 +86,30 @@ for file in "$SELF_DIR"/scripted-runtime-*.test.ts; do
   run_test_file "scripted-runtime $base" "$file" || true
 done
 
+# ── Scripted-scenario harness tests ───────────────────────────────
+echo ""
+echo "--- scripted-scenario tests ---"
+for file in "$SELF_DIR"/scripted-scenario-*.test.ts; do
+  if [ ! -f "$file" ]; then
+    fail "scripted-scenario glob" "no files matching $SELF_DIR/scripted-scenario-*.test.ts"
+    break
+  fi
+  base="$(basename "$file")"
+  run_test_file "scripted-scenario $base" "$file" || true
+done
+
+# ── Tier-0 manifest and repeatability acceptance tests ────────────
+echo ""
+echo "--- tier0 tests ---"
+for file in "$SELF_DIR"/tier0-*.test.ts; do
+  if [ ! -f "$file" ]; then
+    fail "tier0 glob" "no files matching $SELF_DIR/tier0-*.test.ts"
+    break
+  fi
+  base="$(basename "$file")"
+  run_test_file "tier0 $base" "$file" || true
+done
+
 # ── tt-poly tests ─────────────────────────────────────────────────
 echo ""
 echo "--- tt-poly tests ---"

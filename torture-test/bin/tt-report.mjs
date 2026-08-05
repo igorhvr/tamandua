@@ -58,7 +58,7 @@ function oracleFindings(caseState) {
 
 function hasInfrastructureFailure(state) {
   return state.cases.some((item) => item.outcome === 'TEST_INFRA_FAIL'
-    || (item.outcome === 'NOT_RUN' && item.reason?.category !== 'predicate')
+    || (item.outcome === 'NOT_RUN' && !['predicate', 'pending-real'].includes(item.reason?.category))
     || (item.oracle_results ?? []).some((result) =>
       result.status === 'TEST_INFRA'
         || (result.status === 'VALID' && result.response?.result === 'ERROR')));
@@ -110,8 +110,11 @@ export function buildCampaignReport(state) {
     ...row.findings.map((finding) => ({ case_id: row.id, ...finding })),
     ...oracleFindings(state.cases[index]),
   ]);
+  const pendingReal = rows
+    .filter((row) => row.outcome === 'NOT_RUN' && row.reason?.category === 'pending-real')
+    .map((row) => ({ id: row.id, wave: row.wave, class: row.class, reason: clone(row.reason) }));
   const notRun = rows
-    .filter((row) => row.outcome === 'NOT_RUN')
+    .filter((row) => row.outcome === 'NOT_RUN' && row.reason?.category !== 'pending-real')
     .map((row) => ({ id: row.id, wave: row.wave, class: row.class, reason: clone(row.reason) }));
   const verdict = verdictExitCode(state);
 
@@ -132,6 +135,7 @@ export function buildCampaignReport(state) {
       wall_ms: elapsedMs(state.created_at, state.updated_at),
       observations: clone(state.spend?.observations ?? []),
     },
+    pending_real: pendingReal,
     not_run: notRun,
     findings,
     verdict: verdict.verdict,
@@ -186,6 +190,11 @@ export function renderCampaignReport(report) {
     'SPEND LEDGER',
     `Tokens observed: ${report.spend.tokens_observed}`,
     `Wall spend: ${formatDuration(report.spend.wall_ms)}`,
+    '',
+    'PENDING_REAL',
+    ...(report.pending_real.length === 0
+      ? ['(none)']
+      : report.pending_real.map((item) => `- ${item.id}: ${reasonSummary(item.reason)}`)),
     '',
     'NOT_RUN',
     ...(report.not_run.length === 0

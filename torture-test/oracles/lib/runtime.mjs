@@ -1,4 +1,5 @@
 import { loadOracleInvocation } from './context.mjs';
+import { evaluateLocalCase } from './local-case.mjs';
 import { buildOracleResponse, RESULT_EXIT_CODES, validateOracleResponse } from './output.mjs';
 
 export async function oracleMain(check, options = {}) {
@@ -7,7 +8,7 @@ export async function oracleMain(check, options = {}) {
   let response;
   try {
     invocation = loadOracleInvocation(options);
-    const outcome = await check(invocation);
+    const outcome = await (invocation.localCaseProfile ? evaluateLocalCase(invocation) : check(invocation));
     const findings = outcome?.findings ?? [];
     const result = outcome?.result ?? (findings.length === 0 ? 'PASS' : 'FAIL');
     response = buildOracleResponse({

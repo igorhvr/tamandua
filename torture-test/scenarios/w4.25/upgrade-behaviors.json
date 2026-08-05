@@ -1,0 +1,14 @@
+{
+  "agents": {
+    "doer": {
+      "output": "STATUS: done\nREPORT: paused puma run resumed under TT_COMMIT",
+      "tokens": 0
+    },
+    "worker": {
+      "output": "STATUS: done\nREPORT: preserved custom workflow completed under TT_COMMIT",
+      "tokens": 0
+    }
+  },
+  "heartbeatTokens": 0,
+  "defaultTokens": 0
+}

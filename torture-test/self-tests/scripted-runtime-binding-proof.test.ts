@@ -371,6 +371,16 @@ describe("binding-proof.sh", () => {
     );
   });
 
+  it("provisions the empty scripted pi settings required by workflow installation", () => {
+    const content = fs.readFileSync(bindingProofScript, "utf-8");
+    assert.match(content, /\.pi\/agent\/settings\.json/);
+    assert.match(content, /printf '\{\}\\n'/);
+    assert.ok(
+      content.indexOf(".pi/agent/settings.json") < content.indexOf("workflow install do-now"),
+      "Scripted pi settings must exist before the base workflow install",
+    );
+  });
+
   it("asserts zero real tokens spent", () => {
     const content = fs.readFileSync(bindingProofScript, "utf-8");
     assert.ok(

@@ -9,6 +9,8 @@ import { DatabaseSync } from 'node:sqlite';
 import { OUTCOMES, classifyAttempt, providerRetryDecision } from './tt-classification.mjs';
 import {
   GATING_ORACLE_IDS,
+  ORACLE_EVIDENCE_KEYS,
+  REQUIRED_ORACLE_EVIDENCE,
   createOracleContext,
   validateOracleContext,
 } from './oracle-context.mjs';
@@ -68,6 +70,8 @@ Validate and execute a Tamandua torture-test case manifest.
 Options:
   --manifest <path>       JSONL case manifest beneath torture-test/
   --resume <campaign-id>  Resume an existing campaign without relaunching it
+  --validate-only         Validate every manifest record without creating a campaign
+  --scripted-only         Execute scripted/local cases and report real cases pending-real
   --concurrency <count>   Maximum active cases; integer >= 1 (default: 1)
   --stagger <duration>    Delay between launches (default: 0s)
   --help, -h              Print this help
@@ -104,6 +108,9 @@ function parseArgs(argv) {
     staggerMs: DEFAULT_STAGGER_MS,
     concurrencySpecified: false,
     staggerSpecified: false,
+    validateOnly: false,
+    scriptedOnly: false,
+    scriptedOnlySpecified: false,
   };
   const seen = new Set();
   for (let index = 0; index < argv.length; index += 1) {
@@ -126,6 +133,19 @@ function parseArgs(argv) {
       }
       options.resume = parsed.value;
       index = parsed.nextIndex;
+      continue;
+    }
+    if (arg === '--validate-only') {
+      if (seen.has(arg)) throw new Error('--validate-only may be specified only once');
+      seen.add(arg);
+      options.validateOnly = true;
+      continue;
+    }
+    if (arg === '--scripted-only') {
+      if (seen.has(arg)) throw new Error('--scripted-only may be specified only once');
+      seen.add(arg);
+      options.scriptedOnly = true;
+      options.scriptedOnlySpecified = true;
       continue;
     }
     if (arg === '--concurrency') {
@@ -153,6 +173,15 @@ function parseArgs(argv) {
   }
   if (options.manifest === null && options.resume === null) {
     throw new Error('--manifest is required for a new campaign');
+  }
+  if (options.validateOnly && options.resume !== null) {
+    throw new Error('--validate-only cannot be combined with --resume');
+  }
+  if (options.validateOnly && options.scriptedOnly) {
+    throw new Error('--validate-only cannot be combined with --scripted-only');
+  }
+  if (options.validateOnly && (options.concurrencySpecified || options.staggerSpecified)) {
+    throw new Error('--validate-only cannot be combined with scheduler options');
   }
   return options;
 }
@@ -551,6 +580,7 @@ function applyHostRequirements(manifest, state, profile) {
   let terminalTimestamp = null;
   for (let index = 0; index < manifest.cases.length; index += 1) {
     const record = manifest.cases[index];
+    if (state.cases[index].phase === 'terminal') continue;
     if (!hasRequirements(record)) continue;
     const evidence = evaluateRequirements(record.requires, profile);
     if (evidence.length === 0) continue;
@@ -563,6 +593,24 @@ function applyHostRequirements(manifest, state, profile) {
         category: 'predicate',
         evidence,
       },
+    });
+  }
+  if (terminalTimestamp !== null) state.updated_at = terminalTimestamp;
+}
+
+function applyExecutionSelection(manifest, state) {
+  if ((state.options.execution_selection ?? 'all') !== 'scripted-only') return;
+  let terminalTimestamp = null;
+  for (let index = 0; index < manifest.cases.length; index += 1) {
+    const record = manifest.cases[index];
+    const caseState = state.cases[index];
+    if (caseUsesScriptedEnvironment(record) || caseState.phase !== 'pending') continue;
+    terminalTimestamp ??= utcTimestamp();
+    Object.assign(caseState, {
+      phase: 'terminal',
+      outcome: 'NOT_RUN',
+      terminal_at: terminalTimestamp,
+      reason: { category: 'pending-real' },
     });
   }
   if (terminalTimestamp !== null) state.updated_at = terminalTimestamp;
@@ -1471,6 +1519,145 @@ function runCaseOracles(caseRecord, caseState, state, campaignDir, childEnv) {
     && (result.attempt_id ?? 'attempt-1') === attemptId);
 }
 
+function parseLocalCommandSummary(campaignDir, attempt) {
+  const stdout = readHookStdout(campaignDir, attempt.command);
+  for (const line of stdout.split(/\r?\n/).reverse()) {
+    if (line.trim() === '') continue;
+    try {
+      const parsed = JSON.parse(line);
+      if (isObject(parsed)) return parsed;
+    } catch { /* preflight hooks may emit TAP or human-readable output */ }
+  }
+  return null;
+}
+
+function collectTokenValues(value, prefix = '', output = []) {
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => collectTokenValues(item, `${prefix}[${index}]`, output));
+  } else if (isObject(value)) {
+    for (const [key, item] of Object.entries(value)) {
+      const location = prefix === '' ? key : `${prefix}.${key}`;
+      if (/tokens?(?:_spent|_observed)?$|system_tokens_spent/i.test(key)
+          && Number.isSafeInteger(item) && item >= 0) output.push({ path: location, value: item });
+      collectTokenValues(item, location, output);
+    }
+  }
+  return output;
+}
+
+function localDatabaseTokenEvidence(childEnv) {
+  const databasePath = resolveChildDatabasePath(childEnv);
+  if (databasePath === null || !fs.existsSync(databasePath)) return { present: false, runs: [], system_tokens: [] };
+  const database = new DatabaseSync(databasePath, { readOnly: true });
+  try {
+    const tables = new Set(database.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map((row) => row.name));
+    const runs = tables.has('runs')
+      ? database.prepare('SELECT id, status, tokens_spent FROM runs ORDER BY id').all()
+        .map((row) => ({ run_id: normalizedStoredRunId(row.id), status: row.status, tokens_spent: row.tokens_spent }))
+      : [];
+    const systemTokens = tables.has('tamandua_stats')
+      ? database.prepare('SELECT system_tokens_spent FROM tamandua_stats ORDER BY rowid').all().map((row) => row.system_tokens_spent)
+      : [];
+    return { present: true, runs, system_tokens: systemTokens };
+  } finally { database.close(); }
+}
+
+function initializeLocalTokenLedger(childEnv) {
+  const executable = path.join(TT_ROOT, '..', 'bin', 'tamandua');
+  const result = spawnSync(executable, ['workflow', 'runs', '--json'], {
+    cwd: TT_ROOT, env: childEnv, encoding: 'utf8', timeout: 30_000,
+    maxBuffer: EVIDENCE_LIMIT_BYTES, shell: false,
+  });
+  if (result.error !== undefined || result.status !== 0 || result.signal !== null) {
+    throw new Error(`cannot initialize contained token ledger: ${result.error?.message ?? result.stderr?.trim() ?? result.signal ?? `exit ${result.status}`}`);
+  }
+  const evidence = localDatabaseTokenEvidence(childEnv);
+  if (!evidence.present || evidence.system_tokens.length === 0
+      || evidence.system_tokens.some((value) => !Number.isSafeInteger(value) || value < 0)) {
+    throw new Error('contained token ledger did not expose the absolute system-token counter');
+  }
+  return evidence;
+}
+
+function runLocalCaseOracles(caseRecord, caseState, state, campaignDir, childEnv) {
+  const attempt = caseState.attempts.at(-1);
+  if (attempt === undefined) throw new Error('local oracle evaluation requires a durable attempt');
+  caseState.oracle_results ??= [];
+  const summary = parseLocalCommandSummary(campaignDir, attempt);
+  let scenario = null;
+  if (typeof caseRecord.context.scenario_path === 'string') {
+    scenario = JSON.parse(fs.readFileSync(path.join(TT_ROOT, caseRecord.context.scenario_path, 'scenario.json'), 'utf8'));
+    if (scenario.id !== caseRecord.context.scenario_id || !Array.isArray(scenario.oracles)) {
+      throw new Error('local scenario metadata changed after manifest validation');
+    }
+  }
+  const commandPassed = hookSucceeded(attempt.command);
+  const scenarioPassed = scenario === null || summary?.result === 'PASS';
+  const tokenValues = collectTokenValues(summary);
+  const baselineTokens = attempt.local_token_baseline;
+  const databaseTokens = localDatabaseTokenEvidence(childEnv);
+  const summarySystemTokens = tokenValues
+    .filter((item) => item.path === 'system_tokens_spent' || item.path.endsWith('.system_tokens_spent'))
+    .map((item) => item.value);
+  const baselinePresent = isObject(baselineTokens) && baselineTokens.present === true
+    && Array.isArray(baselineTokens.system_tokens) && baselineTokens.system_tokens.length > 0;
+  const terminalSystemTokens = databaseTokens.system_tokens.length > 0
+    ? databaseTokens.system_tokens
+    : summarySystemTokens;
+  const terminalLedgerPresent = databaseTokens.present === true || summarySystemTokens.length > 0;
+  const systemCounterPresent = terminalSystemTokens.length > 0;
+  const tokenGatePassed = baselinePresent && terminalLedgerPresent && systemCounterPresent
+    && baselineTokens.system_tokens.every((value) => value === 0)
+    && tokenValues.every((item) => item.value === 0)
+    && databaseTokens.runs.every((run) => run.tokens_spent === 0)
+    && terminalSystemTokens.every((value) => value === 0);
+  const snapshotDir = path.join(campaignDir, 'snapshots', caseRecord.id, attempt.id);
+  fs.mkdirSync(snapshotDir, { recursive: true, mode: 0o700 });
+  const capturedAt = utcTimestamp();
+  const systemBefore = baselinePresent
+    ? baselineTokens.system_tokens.reduce((total, value) => total + value, 0)
+    : null;
+  const systemTotal = terminalSystemTokens.reduce((total, value) => total + value, 0);
+  const proofPath = path.join(snapshotDir, 'local-case-proof.json');
+  fs.writeFileSync(proofPath, `${JSON.stringify({
+    schema_version: 1, profile: 'local-case', captured_at: capturedAt, case_id: caseRecord.id,
+    command_result: { exit_code: attempt.command.exit_code, signal: attempt.command.signal },
+    scenario_id: scenario?.id ?? null, declared_oracles: scenario?.oracles ?? caseRecord.oracles,
+    scenario_result: summary?.result ?? (commandPassed ? 'PASS' : 'FAIL'), summary,
+    token_values: tokenValues, runs: databaseTokens.runs,
+    system_tokens: { before: systemBefore, after: systemTotal, terminal_database: systemTotal },
+    checks: {
+      command_passed: commandPassed, scenario_passed: scenarioPassed,
+      baseline_present: baselinePresent, terminal_ledger_present: terminalLedgerPresent,
+      system_counter_present: systemCounterPresent, token_gate_passed: tokenGatePassed,
+    },
+  }, null, 2)}\n`, { flag: 'wx', mode: 0o400 });
+  const proofReference = {
+    path: path.relative(campaignDir, proofPath).split(path.sep).join('/'),
+    sha256: sha256(fs.readFileSync(proofPath)), captured_at: capturedAt,
+    source: 'controller-local-case',
+  };
+  const requiredReferenceKeys = new Set(caseRecord.oracles.flatMap((oracleId) => REQUIRED_ORACLE_EVIDENCE[oracleId] ?? []));
+  const references = Object.fromEntries(ORACLE_EVIDENCE_KEYS
+    .map((key) => [key, requiredReferenceKeys.has(key) ? proofReference : null]));
+  attempt.oracle_evidence = {
+    schema_version: ORACLE_CONTRACT_VERSION, status: 'COMPLETE',
+    ledger_path: path.relative(campaignDir, path.join(snapshotDir, 'snapshot.json')).split(path.sep).join('/'),
+    references,
+  };
+  state.updated_at = utcTimestamp();
+  atomicWriteState(campaignDir, state);
+  runCaseOracles(caseRecord, caseState, state, campaignDir, childEnv);
+  const ledgerPath = path.join(snapshotDir, 'snapshot.json');
+  fs.writeFileSync(ledgerPath, `${JSON.stringify({
+    schema_version: ORACLE_CONTRACT_VERSION, status: 'COMPLETE', case_id: caseRecord.id,
+    attempt_id: attempt.id, completed_at: utcTimestamp(), files: references,
+  }, null, 2)}\n`, { flag: 'wx', mode: 0o400 });
+  state.updated_at = utcTimestamp();
+  atomicWriteState(campaignDir, state);
+  return caseState.oracle_results.filter((result) => result.attempt_id === attempt.id);
+}
+
 function outcomeWithOracleEvidence(caseRecord, baseOutcome, baseReason, oracleResults) {
   const evidence = { caseClass: caseRecord.class, oracle_results: oracleResults };
   if (baseOutcome === 'PASS') evidence.expectation_met = true;
@@ -1568,6 +1755,20 @@ async function executeLocalCase(caseRecord, caseState, state, campaignDir) {
     return;
   }
 
+  try {
+    attempt.local_token_baseline = initializeLocalTokenLedger(childEnv);
+    state.updated_at = utcTimestamp();
+    atomicWriteState(campaignDir, state);
+  } catch (error) {
+    attempt.phase = 'terminal';
+    attempt.terminal_at = utcTimestamp();
+    persistMechanicalOutcome(caseState, attempt, state, campaignDir, 'TEST_INFRA_FAIL', {
+      category: 'token-ledger-baseline',
+      message: error.message,
+    });
+    return;
+  }
+
   if (caseRecord.reset !== null && caseRecord.reset !== undefined) {
     attempt.phase = 'resetting';
     const resetResult = await runHook('reset', caseRecord.reset, childEnv, campaignDir, state, attempt);
@@ -1597,6 +1798,7 @@ async function executeLocalCase(caseRecord, caseState, state, campaignDir) {
   const commandResult = await runDurableLocalCommand(caseRecord.command, childEnv, campaignDir, state, attempt);
   attempt.phase = 'terminal';
   attempt.terminal_at = utcTimestamp();
+  attempt.terminal_status = hookSucceeded(commandResult) ? 'completed' : 'failed';
   const baseOutcome = hookSucceeded(commandResult)
     ? 'PASS'
     : (commandResult.error === undefined ? 'PRODUCT_FAIL' : 'TEST_INFRA_FAIL');
@@ -1608,7 +1810,9 @@ async function executeLocalCase(caseRecord, caseState, state, campaignDir) {
       };
   const verdict = outcomeWithOracleEvidence(
     caseRecord, baseOutcome, baseReason,
-    runCaseOracles(caseRecord, caseState, state, campaignDir, childEnv),
+    attempt.execution_mode === 'scripted'
+      ? runLocalCaseOracles(caseRecord, caseState, state, campaignDir, childEnv)
+      : runCaseOracles(caseRecord, caseState, state, campaignDir, childEnv),
   );
   persistClassifiedAttempt(caseState, attempt, state, campaignDir, verdict);
 }
@@ -2974,7 +3178,9 @@ function isValidCaseState(item) {
         && Object.hasOwn(entry, 'expected')
         && Object.hasOwn(entry, 'observed'));
   }
-  if (item.outcome === 'NOT_RUN') return item.reason?.category === 'daemon-control-unavailable';
+  if (item.outcome === 'NOT_RUN') {
+    return ['daemon-control-unavailable', 'pending-real'].includes(item.reason?.category);
+  }
   return typeof item.reason?.category === 'string';
 }
 
@@ -2991,6 +3197,8 @@ function validateLoadedState(state, campaignId) {
       || !Number.isSafeInteger(state.options.stagger_ms) || state.options.stagger_ms < 0
       || !Number.isSafeInteger(state.options.token_poll_interval_ms)
       || state.options.token_poll_interval_ms < 1
+      || (state.options.execution_selection !== undefined
+        && !['all', 'scripted-only'].includes(state.options.execution_selection))
       || (state.options.provider_retry_backoff_ms !== undefined
         && (!Number.isSafeInteger(state.options.provider_retry_backoff_ms)
           || state.options.provider_retry_backoff_ms < 0))) {
@@ -3094,6 +3302,7 @@ function createInitialState(campaignId, manifestPath, manifest, options) {
       stagger_ms: options.staggerMs,
       token_poll_interval_ms: configuredTokenPollIntervalMs(),
       provider_retry_backoff_ms: configuredProviderRetryBackoffMs(),
+      execution_selection: options.scriptedOnly ? 'scripted-only' : 'all',
     },
     spend: {
       tokens_observed: 0,
@@ -3145,6 +3354,33 @@ function manifestMatchesState(manifestPath, manifest, state) {
     });
 }
 
+function executionSelectionStateErrors(manifest, state) {
+  const errors = [];
+  const policy = state.options.execution_selection ?? 'all';
+  for (let index = 0; index < manifest.cases.length; index += 1) {
+    const record = manifest.cases[index];
+    const caseState = state.cases[index];
+    const isReal = !caseUsesScriptedEnvironment(record);
+    const isPendingReal = caseState.phase === 'terminal'
+      && caseState.outcome === 'NOT_RUN'
+      && caseState.reason?.category === 'pending-real';
+    const isUnselectedPendingReal = caseState.phase === 'pending'
+      && caseState.outcome === undefined
+      && caseState.reason === undefined
+      && caseState.terminal_at === undefined;
+
+    if (isPendingReal
+        && (policy !== 'scripted-only' || !isReal || caseState.attempts.length !== 0)) {
+      errors.push(`${caseState.id}: pending-real is inconsistent with campaign policy, case mode, or attempt history`);
+    }
+    if (policy === 'scripted-only' && isReal
+        && !isPendingReal && !(isUnselectedPendingReal && caseState.attempts.length === 0)) {
+      errors.push(`${caseState.id}: real case is not safely excluded by scripted-only policy`);
+    }
+  }
+  return errors;
+}
+
 function writeTerminalCampaignReports(campaignDir, state) {
   if (state.cases.some((item) => item.phase !== 'terminal')
       || (state.discovered_runs ?? []).some((run) => run.phase !== 'terminal')) {
@@ -3156,12 +3392,16 @@ function writeTerminalCampaignReports(campaignDir, state) {
 async function startCampaign(options, schema) {
   const manifestPath = resolveManifestPath(options.manifest);
   const manifest = loadManifest(manifestPath, schema);
-  const hostProfile = loadRequiredHostProfile(manifest.cases);
+  const selectedCases = options.scriptedOnly
+    ? manifest.cases.filter(caseUsesScriptedEnvironment)
+    : manifest.cases;
+  const hostProfile = loadRequiredHostProfile(selectedCases);
   const { campaignId, campaignDir } = createCampaignDirectory();
   const releaseCampaignLock = acquireCampaignLock(campaignDir);
   try {
     try {
       const state = createInitialState(campaignId, manifestPath, manifest, options);
+      applyExecutionSelection(manifest, state);
       applyHostRequirements(manifest, state, hostProfile);
       atomicWriteState(campaignDir, state);
     } catch (error) {
@@ -3196,17 +3436,27 @@ async function resumeCampaign(options, schema) {
     if (!manifestMatchesState(manifestPath, manifest, state)) {
       throw new Error('manifest does not match campaign state');
     }
+    const selectionErrors = executionSelectionStateErrors(manifest, state);
+    if (selectionErrors.length > 0) {
+      throw new Error(`execution selection state is invalid: ${selectionErrors.join('; ')}`);
+    }
     if (options.concurrencySpecified && options.concurrency !== state.options.concurrency) {
       throw new Error('concurrency does not match campaign state');
     }
     if (options.staggerSpecified && options.staggerMs !== state.options.stagger_ms) {
       throw new Error('stagger does not match campaign state');
     }
+    const persistedSelection = state.options.execution_selection ?? 'all';
+    if (options.scriptedOnlySpecified
+        && (options.scriptedOnly ? 'scripted-only' : 'all') !== persistedSelection) {
+      throw new Error('execution selection does not match campaign state');
+    }
 
     const timestamp = utcTimestamp();
     state.resume_count = (state.resume_count ?? 0) + 1;
     state.resumed_at = [...(state.resumed_at ?? []), timestamp];
     state.updated_at = timestamp;
+    applyExecutionSelection(manifest, state);
     atomicWriteState(campaignDir, state);
     state.discovered_runs ??= [];
     await reconcileInterruptedAttempts(manifest, state, campaignDir);
@@ -3239,6 +3489,12 @@ async function main() {
 
   try {
     const schema = loadSchema();
+    if (options.validateOnly) {
+      const manifestPath = resolveManifestPath(options.manifest);
+      const manifest = loadManifest(manifestPath, schema);
+      console.log(`Validated ${manifest.cases.length} case(s) from ${path.relative(TT_ROOT, manifestPath)}`);
+      return 0;
+    }
     if (options.resume === null) return await startCampaign(options, schema);
     return await resumeCampaign(options, schema);
   } catch (error) {

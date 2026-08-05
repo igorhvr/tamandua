@@ -1,0 +1,10 @@
+{
+  "agents": {
+    "doer": {
+      "mode": "hang-after-claim",
+      "tokens": 0
+    }
+  },
+  "heartbeatTokens": 0,
+  "defaultTokens": 0
+}
