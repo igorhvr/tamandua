@@ -67,14 +67,17 @@ function ensureMainAgentInList(list: Array<Record<string, unknown>>): void {
 // Pi doesn't have tool profiles like OpenClaw, so these are simplified to
 // role descriptions and timeout values only.
 
-// Doubled 2026-08-04 (operator decision): torture-test proof stories run
-// campaign-length work inside a single round (35-90+ min execution plus
-// debugging), and the old 90-min ceiling reaped healthy token-producing
-// workers mid-story (runs #836/#837, 12 worker_lost abandons between them).
-// Genuinely dead workers are still caught fast by the PGID liveness watchdog,
-// which does not depend on these values.
-const TIMEOUT_120_MIN = 7200;
-const TIMEOUT_180_MIN = 10800;
+// Doubled 2026-08-04 and AGAIN 2026-08-05 (operator decision): torture-test
+// proof stories run campaign-length work inside a single round (a full
+// scripted Tier-0 campaign is ~2h15m of wall time plus launch/debug
+// overhead), and both the 90-min and 180-min ceilings reaped healthy
+// token-producing workers mid-wait (run #837: a 180-min round died at
+// PASS=31/32 with the campaign minutes from green; provider forensics
+// showed zero LLM stalls — 94% of the round was legitimate detached-
+// campaign polling). Genuinely dead workers are still caught fast by the
+// PGID liveness watchdog, which does not depend on these values.
+const TIMEOUT_240_MIN = 14400;
+const TIMEOUT_360_MIN = 21600;
 
 interface RolePolicy {
   description: string;
@@ -85,37 +88,37 @@ const ROLE_POLICIES: Record<AgentRole, RolePolicy> = {
   // analysis: read-only code exploration (planner, prioritizer, reviewer, investigator, triager)
   analysis: {
     description: "Read-only code exploration and reasoning — no file modification, web, or browser access",
-    timeoutSeconds: TIMEOUT_180_MIN,
+    timeoutSeconds: TIMEOUT_360_MIN,
   },
 
   // coding: full read/write/exec — the workhorses (developer, fixer, setup)
   coding: {
     description: "Full read/write/exec for implementation work — the primary workhorse role",
-    timeoutSeconds: TIMEOUT_180_MIN,
+    timeoutSeconds: TIMEOUT_360_MIN,
   },
 
   // verification: read + exec but NO write — preserves independent verification integrity
   verification: {
     description: "Read + exec but NO write — independent verification and code review",
-    timeoutSeconds: TIMEOUT_120_MIN,
+    timeoutSeconds: TIMEOUT_240_MIN,
   },
 
   // testing: read + exec + browser/web for E2E, NO write
   testing: {
     description: "Read + exec capability for running tests and E2E validation",
-    timeoutSeconds: TIMEOUT_180_MIN,
+    timeoutSeconds: TIMEOUT_360_MIN,
   },
 
   // pr: just needs read + exec (for `gh pr create`)
   pr: {
     description: "Read + exec only — creates pull requests and manages version control",
-    timeoutSeconds: TIMEOUT_120_MIN,
+    timeoutSeconds: TIMEOUT_240_MIN,
   },
 
   // scanning: read + exec + web (CVE lookups), NO write
   scanning: {
     description: "Read + exec for security scanning and vulnerability analysis",
-    timeoutSeconds: TIMEOUT_120_MIN,
+    timeoutSeconds: TIMEOUT_240_MIN,
   },
 };
 

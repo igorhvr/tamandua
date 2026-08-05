@@ -18,36 +18,36 @@ describe("install exports", () => {
       assert.ok(max > 0);
     });
 
-    it("returns the maximum timeout (10800 for 180-min roles)", () => {
+    it("returns the maximum timeout (21600 for 360-min roles)", () => {
       const max = getMaxRoleTimeoutSeconds();
-      // coding, testing, analysis roles are 10800; others are 7200
-      assert.equal(max, 10800);
+      // coding, testing, analysis roles are 21600; others are 14400
+      assert.equal(max, 21600);
     });
   });
 
   describe("getRoleTimeoutSeconds", () => {
-    it("returns 10800 for analysis role (180 min)", () => {
-      assert.equal(getRoleTimeoutSeconds("analysis"), 10800);
+    it("returns 21600 for analysis role (360 min)", () => {
+      assert.equal(getRoleTimeoutSeconds("analysis"), 21600);
     });
 
-    it("returns 10800 for coding role (180 min)", () => {
-      assert.equal(getRoleTimeoutSeconds("coding"), 10800);
+    it("returns 21600 for coding role (360 min)", () => {
+      assert.equal(getRoleTimeoutSeconds("coding"), 21600);
     });
 
-    it("returns 7200 for verification role (120 min)", () => {
-      assert.equal(getRoleTimeoutSeconds("verification"), 7200);
+    it("returns 14400 for verification role (240 min)", () => {
+      assert.equal(getRoleTimeoutSeconds("verification"), 14400);
     });
 
-    it("returns 10800 for testing role (180 min)", () => {
-      assert.equal(getRoleTimeoutSeconds("testing"), 10800);
+    it("returns 21600 for testing role (360 min)", () => {
+      assert.equal(getRoleTimeoutSeconds("testing"), 21600);
     });
 
-    it("returns 7200 for pr role (120 min)", () => {
-      assert.equal(getRoleTimeoutSeconds("pr"), 7200);
+    it("returns 14400 for pr role (240 min)", () => {
+      assert.equal(getRoleTimeoutSeconds("pr"), 14400);
     });
 
-    it("returns 7200 for scanning role (120 min)", () => {
-      assert.equal(getRoleTimeoutSeconds("scanning"), 7200);
+    it("returns 14400 for scanning role (240 min)", () => {
+      assert.equal(getRoleTimeoutSeconds("scanning"), 14400);
     });
   });
 

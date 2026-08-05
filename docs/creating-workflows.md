@@ -35,9 +35,9 @@ agents:
     role: analysis             # Optional. analysis|coding|verification|testing|pr|scanning
                                # If omitted, the role is inferred from the agent id.
     model: claude-sonnet       # Optional. Per-agent model override
-    timeoutSeconds: 7200       # Optional. Per-step wall-clock budget (seconds).
-                               # Defaults: analysis|coding|testing = 10800 (180m);
-                               #           verification|pr|scanning = 7200 (120m).
+    timeoutSeconds: 14400       # Optional. Per-step wall-clock budget (seconds).
+                               # Defaults: analysis|coding|testing = 21600 (360m);
+                               #           verification|pr|scanning = 14400 (240m).
     workspace:
       baseDir: agents/planner  # Required. Directory (relative to workflow.yml) holding
                                # this agent's persona files. AGENTS.md, IDENTITY.md, and
@@ -462,12 +462,12 @@ npm run build && npm test
 
 | Role | Capabilities | Use For | Default timeout |
 |------|--------------|---------|-----------------|
-| `analysis`     | Read code, reason — no write/exec restrictions enforced by tamandua, used as a description on pi | Planner, reviewer, investigator, triager | 10800s (180m) |
-| `coding`       | Read/write/exec — primary workhorse role            | Developer, fixer, setup        | 10800s (180m) |
-| `verification` | Read + exec, no write — independent verification    | Verifier                       | 7200s (120m) |
-| `testing`      | Read + exec for E2E, no write                       | Tester                         | 10800s (180m) |
-| `pr`           | Read + exec only — runs `gh pr create`              | PR creation                    | 7200s (120m) |
-| `scanning`     | Read + exec for security scanning                   | Security scanner               | 7200s (120m) |
+| `analysis`     | Read code, reason — no write/exec restrictions enforced by tamandua, used as a description on pi | Planner, reviewer, investigator, triager | 21600s (360m) |
+| `coding`       | Read/write/exec — primary workhorse role            | Developer, fixer, setup        | 21600s (360m) |
+| `verification` | Read + exec, no write — independent verification    | Verifier                       | 14400s (240m) |
+| `testing`      | Read + exec for E2E, no write                       | Tester                         | 21600s (360m) |
+| `pr`           | Read + exec only — runs `gh pr create`              | PR creation                    | 14400s (240m) |
+| `scanning`     | Read + exec for security scanning                   | Security scanner               | 14400s (240m) |
 
 If `role` is omitted, the role is inferred from the agent id (e.g., ids containing `planner` → `analysis`, `verifier` → `verification`, `tester` → `testing`, `scanner` → `scanning`, `pr` → `pr`, anything else → `coding`).
 
