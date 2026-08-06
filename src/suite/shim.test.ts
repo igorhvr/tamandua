@@ -15,7 +15,8 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { cleanChildEnv, createTempHome, reservePortHandles } from "../../tests/helpers/test-env.ts";
-import { terminateOwnedProcessGroup } from "../../tests/helpers/dead-owner-teardown.ts";
+import { terminateOwnedProcessGroup, reapStaleOrphans } from "../../tests/helpers/dead-owner-teardown.ts";
+import { getProcessStartIdentity } from "../lib/process-start-identity.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SHIM_PATH = path.resolve(__dirname, "..", "..", "dist", "suite", "shim.js");
@@ -820,6 +821,27 @@ describe("tamandua-test shim", { concurrency: 1 }, () => {
   }
 
   describe("dead-owner reclaim", () => {
+    // US-002: Snapshot pre-existing dead-owner-suite orphans so the
+    // afterEach assertion only fails for test-owned (new) orphans.
+    // Pre-existing stale orphans from prior runs are best-effort
+    // reaped but do NOT cause assertion failures.
+    let preExistingPids: Set<number> = new Set();
+
+    before(() => {
+      try {
+        const out = execSync("pgrep -f '[d]ead-owner-suite'", {
+          encoding: "utf-8",
+          timeout: 5000,
+          stdio: ["ignore", "pipe", "pipe"],
+        }).trim();
+        if (out.length > 0) {
+          preExistingPids = new Set(out.split("\n").map(Number));
+        }
+      } catch {
+        // pgrep exit 1 = no matches or pgrep not available (non-Linux)
+      }
+    });
+
     afterEach(() => {
       // Regression guard (US-003): assert no dead-owner orphan survives after
       // the dead-owner reclaim test.  The bracket trick ([d]) prevents pgrep
@@ -827,8 +849,6 @@ describe("tamandua-test shim", { concurrency: 1 }, () => {
       // are found, so a non-throwing execSync means orphans leaked.
       // Scope to dead-owner-suite to avoid matching the test runner
       // itself (which references "dead-owner-reclaim" in fixture paths).
-      // The bracket trick ([d]) prevents pgrep from matching its own
-      // command line; pgrep exits 1 when no matches are found.
       let pgrepOut: string;
       try {
         pgrepOut = execSync("pgrep -f '[d]ead-owner-suite'", {
@@ -841,9 +861,25 @@ describe("tamandua-test shim", { concurrency: 1 }, () => {
         // Also catches pgrep not being available (non-Linux).
         return;
       }
-      if (pgrepOut.length > 0) {
+      if (pgrepOut.length === 0) return;
+
+      const currentPids = new Set(pgrepOut.split("\n").map(Number));
+
+      // Test-owned pids: those that appeared after the before hook snapshot
+      const testOwnedPids = [...currentPids].filter((p) => !preExistingPids.has(p));
+
+      // Pre-existing stale orphans: best-effort reap them so historical
+      // leaks self-heal instead of accumulating.  Do NOT fail the assertion.
+      const stalePids = [...currentPids].filter((p) => preExistingPids.has(p));
+      if (stalePids.length > 0) {
+        reapStaleOrphans(stalePids);
+      }
+
+      // Assert test-owned pids are EMPTY — these are the ones the current
+      // test should have cleaned up.
+      if (testOwnedPids.length > 0) {
         assert.fail(
-          `dead-owner orphan(s) survived teardown: ${pgrepOut.replace(/\n/g, ", ")}`,
+          `dead-owner orphan(s) survived teardown: ${testOwnedPids.join(", ")}`,
         );
       }
     });
@@ -854,7 +890,7 @@ describe("tamandua-test shim", { concurrency: 1 }, () => {
       const script = join(fixture.repoDir, "dead-owner-suite.sh");
       writeFileSync(
         script,
-        `#!/bin/sh\nps -o pgid= -p $$ | tr -d ' ' > "${suitePidFile}"\necho 'DEAD OWNER SUITE STARTED'\nwhile :; do sleep 1; done\n`,
+        `#!/bin/sh\nps -o pgid= -p $$ | tr -d ' ' > "${suitePidFile}"\necho $$ > "${suitePidFile}.pid"\necho 'DEAD OWNER SUITE STARTED'\nwhile :; do sleep 1; done\n`,
       );
       chmodSync(script, 0o755);
       const runId = "r-dead-owner";
@@ -899,8 +935,25 @@ describe("tamandua-test shim", { concurrency: 1 }, () => {
         );
       } finally {
         owner.kill("SIGKILL");
+        // Read the suite shell PID for ABA-safe ownership verification
+        let suitePid: number | undefined;
+        let startTime: string | undefined;
+        const suitePidFilePath = `${suitePidFile}.pid`;
+        if (existsSync(suitePidFilePath)) {
+          try {
+            const pidStr = readFileSync(suitePidFilePath, "utf-8").trim();
+            suitePid = Number(pidStr);
+            if (Number.isSafeInteger(suitePid) && suitePid > 0) {
+              startTime = getProcessStartIdentity(suitePid) ?? undefined;
+            }
+          } catch {
+            // PID file read failed — teardown falls back to marker-only ownership
+          }
+        }
         terminateOwnedProcessGroup({
           pgidFile: suitePidFile,
+          pid: suitePid,
+          startTime,
           ownershipMarker: script,
           graceMs: 2000,
         });

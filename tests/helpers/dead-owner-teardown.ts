@@ -1,5 +1,6 @@
 import { execSync } from "node:child_process";
 import { readFileSync } from "node:fs";
+import { getProcessStartIdentity } from "../../src/lib/process-start-identity.ts";
 
 /**
  * Options for {@link terminateOwnedProcessGroup}.
@@ -7,6 +8,10 @@ import { readFileSync } from "node:fs";
 export interface TerminateOwnedProcessGroupOptions {
   /** Path to the file containing the process-group id. */
   pgidFile: string;
+  /** Optional PID of the suite shell process for ABA-safe ownership verification. */
+  pid?: number;
+  /** Optional process-start-identity string for ABA-safe PID reuse protection. */
+  startTime?: string;
   /** Unique marker string that MUST appear in the group leader's command args for ownership to be proven. */
   ownershipMarker: string;
   /** Grace window (ms) between TERM and KILL. Defaults to 2000 if not provided. */
@@ -47,6 +52,24 @@ export interface TerminateOwnedProcessGroupOptions {
  * - **pgidFile contains non-integer** → no-op
  * - **Group leader already exited** → signals work because ownership is validated via process-group membership, not a PID probe
  * - **No process in the group has the ownershipMarker** → no-op (won't kill unrelated processes)
+ *
+ * ## ABA-safe PID verification
+ *
+ * When both `pid` and `startTime` are provided, the helper additionally
+ * verifies that the current process running at that PID has the same
+ * start-time identity as when the
+ * fixture was created.  If the PID was recycled between creation and
+ * teardown, the identity won't match and the helper refuses to signal
+ * (prevents ABA PID-reuse attacks).
+ *
+ * ## Fallback marker-scan kill (C2.2)
+ *
+ * After the pgid-targeted TERM → KILL escalation, the helper performs a
+ * best-effort re-scan of ALL processes whose args contain the
+ * `ownershipMarker`, regardless of process group.  Each survivor is
+ * killed individually with TERM → 500ms grace → KILL.  This catches
+ * orphans that the pgid-targeted kill misses due to pgid/session
+ * asymmetry (class C2.2).
  */
 export function terminateOwnedProcessGroup(opts: TerminateOwnedProcessGroupOptions): void {
   const { pgidFile, ownershipMarker, graceMs = 2000 } = opts;
@@ -77,6 +100,11 @@ export function terminateOwnedProcessGroup(opts: TerminateOwnedProcessGroupOptio
   // SIGKILLed first, which can kill the outer shell).  The inner shell
   // and its children survive in the same process group, so a
   // process-group query is the right scope.
+  //
+  // IMPORTANT: `ps -eo pgid=` right-aligns the pgid column with leading
+  // spaces (e.g. "  53666 /bin/sh..."), so we split on whitespace to get
+  // the first column rather than using startsWith, which would miss
+  // short pgids typical in plain-shell environments.
   let psOutput: string;
   try {
     psOutput = execSync("ps -eo pgid=,args= 2>/dev/null", {
@@ -93,17 +121,37 @@ export function terminateOwnedProcessGroup(opts: TerminateOwnedProcessGroupOptio
     return;
   }
 
-  // Each output row is "<pgid> <args>".  We filter to rows whose pgid
-  // column matches our expected value, then check whether any of those
-  // rows' args contain the ownershipMarker.
-  const pgidColumnPrefix = `${pgid} `;
+  // Each output row is "<pgid> <args>".  Split on whitespace to get the
+  // pgid as the first token (avoids the leading-space padding trap).
   let ownershipProven = false;
   for (const line of psOutput.split("\n")) {
-    if (!line.startsWith(pgidColumnPrefix)) continue;
-    const args = line.slice(pgidColumnPrefix.length);
+    const trimmed = line.trimStart();
+    const firstSpace = trimmed.indexOf(" ");
+    if (firstSpace === -1) continue;
+    const rowPidStr = trimmed.slice(0, firstSpace);
+    const rowPgid = Number(rowPidStr);
+    if (!Number.isSafeInteger(rowPgid) || rowPgid !== pgid) continue;
+    const args = trimmed.slice(firstSpace + 1);
     if (args.includes(ownershipMarker)) {
       ownershipProven = true;
       break;
+    }
+  }
+
+  // ── ABA-safe PID ownership verification (when pid + startTime are provided) ──
+  // The startTime returned by getProcessStartIdentity uniquely identifies the
+  // process incarnation.  If the PID was recycled between fixture creation
+  // and teardown, the startTime won't match and we bail out.
+  if (ownershipProven && opts.pid !== undefined && opts.startTime !== undefined) {
+    const currentIdentity = getProcessStartIdentity(opts.pid);
+    if (currentIdentity !== null && currentIdentity !== opts.startTime) {
+      // PID was recycled — the process we'd signal is not the one the fixture
+      // created.  Do NOT signal.
+      console.warn(
+        `[dead-owner-teardown] Ownership not proven via process-start-identity: ` +
+        `pid=${opts.pid} expected=${opts.startTime} got=${currentIdentity} — refusing to signal (possible PID reuse)`,
+      );
+      ownershipProven = false;
     }
   }
 
@@ -112,19 +160,17 @@ export function terminateOwnedProcessGroup(opts: TerminateOwnedProcessGroupOptio
     return;
   }
 
-  // ── Ownership proven: TERM → grace → KILL ──
+  // ── Ownership proven: TERM → grace → KILL (pgid-targeted) ──
   signalProcessGroup(pgid, "SIGTERM");
 
   // Synchronous grace window; give the group time to clean up after TERM.
-  // We check process state (not just signal-0) because the group leader
-  // can become a zombie (defunct) after SIGTERM but still respond to
-  // signal 0, which would cause us to wait the full graceMs unnecessarily.
   if (graceMs > 0) {
     const deadline = Date.now() + graceMs;
     while (Date.now() < deadline) {
       if (!processGroupHasLiveMembers(pgid)) {
-        // All group members are gone or defunct — stop waiting
-        return;
+        // All group members are gone or defunct — stop waiting,
+        // but continue to the fallback marker scan (don't return early).
+        break;
       }
       const remaining = deadline - Date.now();
       if (remaining <= 0) break;
@@ -133,6 +179,12 @@ export function terminateOwnedProcessGroup(opts: TerminateOwnedProcessGroupOptio
   }
 
   signalProcessGroup(pgid, "SIGKILL");
+
+  // ── Fallback: re-scan for survivors matching the ownership marker ──
+  // When the pgid-targeted kill leaves survivors (pgid/session asymmetry,
+  // C2.2 class), we fall back to killing individual processes whose args
+  // contain the ownership marker.  We use TERM → short grace → KILL.
+  reapMarkerSurvivors(ownershipMarker);
 }
 
 function signalProcessGroup(pgid: number, signal: NodeJS.Signals): void {
@@ -163,14 +215,143 @@ function processGroupHasLiveMembers(pgid: number): boolean {
       stdio: ["ignore", "pipe", "pipe"],
     }).trim();
     if (output.length === 0) return false;
-    const pgidPrefix = `${pgid} `;
     // State codes: Z = zombie, X = dead. Any other state is live.
+    // Split on whitespace to avoid the ps column-padding trap (C2.2).
     for (const line of output.split("\n")) {
-      if (!line.startsWith(pgidPrefix)) continue;
-      const state = line[pgidPrefix.length];
-      if (state !== "Z" && state !== "X" && state !== undefined) return true;
+      const parts = line.trim().split(/\s+/);
+      if (parts.length < 2) continue;
+      const rowPgid = Number(parts[0]);
+      if (rowPgid !== pgid) continue;
+      const state = parts[1][0];
+      if (state !== "Z" && state !== "X") return true;
     }
     return false;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Best-effort reap of specific PIDs (stale orphans from prior runs).
+ *
+ * Unlike {@link terminateOwnedProcessGroup}, this function takes raw PIDs
+ * and does NOT validate ownership — it is intended for use when the
+ * caller already knows these PIDs match the dead-owner signature (e.g.,
+ * via a prior pgrep).
+ *
+ * Strategy: TERM → 200ms grace → KILL per pid.
+ * Logs each pid killed via console.log so historical leaks self-heal
+ * instead of accumulating silently.
+ *
+ * Never throws — all errors are caught and logged.
+ */
+export function reapStaleOrphans(pids: number[]): void {
+  const alive = pids.filter((p) => isProcessAlive(p));
+  if (alive.length === 0) return;
+
+  // TERM
+  for (const pid of alive) {
+    try { process.kill(pid, "SIGTERM"); } catch { /* */ }
+  }
+
+  // Short grace window
+  const graceDeadline = Date.now() + 200;
+  while (Date.now() < graceDeadline) {
+    if (alive.every((p) => !isProcessAlive(p))) break;
+    spinWait(Math.min(graceDeadline - Date.now(), 50));
+  }
+
+  // KILL + log
+  for (const pid of alive) {
+    try { process.kill(-pid, "SIGKILL"); } catch { /* */ }
+    try { process.kill(pid, "SIGKILL"); } catch { /* */ }
+    if (isProcessAlive(pid)) {
+      console.log(`[dead-owner-teardown] Could not reap stale orphan pid=${pid}`);
+    } else {
+      console.log(`[dead-owner-teardown] Best-effort reaped stale orphan pid=${pid}`);
+    }
+  }
+}
+
+/**
+ * Best-effort reap of any surviving processes whose args contain the
+ * ownership marker, regardless of process group.  This catches orphans
+ * that the pgid-targeted kill missed due to pgid/session asymmetry (C2.2).
+ *
+ * Strategy: TERM → 500ms grace with liveness check → KILL, per pid.
+ */
+function reapMarkerSurvivors(marker: string): void {
+  let psOutput: string;
+  try {
+    psOutput = execSync(`ps -eo pid=,args= 2>/dev/null`, {
+      encoding: "utf-8",
+      timeout: 5000,
+      stdio: ["ignore", "pipe", "pipe"],
+    }).trim();
+  } catch {
+    return;
+  }
+  if (psOutput.length === 0) return;
+
+  const survivorPids: number[] = [];
+  for (const line of psOutput.split("\n")) {
+    const trimmed = line.trimStart();
+    const firstSpace = trimmed.indexOf(" ");
+    if (firstSpace === -1) continue;
+    const rowPidStr = trimmed.slice(0, firstSpace);
+    const rowPid = Number(rowPidStr);
+    if (!Number.isSafeInteger(rowPid) || rowPid <= 0) continue;
+    const args = trimmed.slice(firstSpace + 1);
+    if (args.includes(marker)) {
+      survivorPids.push(rowPid);
+    }
+  }
+
+  for (const pid of survivorPids) {
+    // TERM → 500ms grace → KILL
+    try { process.kill(pid, "SIGTERM"); } catch { /* */ }
+  }
+  if (survivorPids.length > 0) {
+    // Short grace window with zombie-aware liveness check.
+    // process.kill(pid, 0) returns success for zombies, so we use
+    // ps state instead to detect true liveness.
+    const deadline = Date.now() + 500;
+    while (Date.now() < deadline) {
+      if (survivorPids.every((p) => !isProcessAlive(p))) break;
+      spinWait(Math.min(deadline - Date.now(), 50));
+    }
+    for (const pid of survivorPids) {
+      // Best-effort KILL: also targets the process group in case the
+      // survivor spawned children in its group that escaped the PID scan.
+      try { process.kill(-pid, "SIGKILL"); } catch { /* */ }
+      try { process.kill(pid, "SIGKILL"); } catch { /* */ }
+    }
+  }
+}
+
+/**
+ * Check if a pid references a live process whose state is not Z (zombie) or X (dead).
+ * Uses ps state instead of signal-0 because signal-0 succeeds for zombies.
+ */
+function isProcessAlive(pid: number): boolean {
+  try {
+    const result = execSync(`ps -p ${pid} -o state= 2>/dev/null`, {
+      encoding: "utf-8",
+      timeout: 5000,
+      stdio: ["ignore", "pipe", "pipe"],
+    }).trim();
+    if (result.length === 0) return false;
+    const state = result[0];
+    return state !== "Z" && state !== "X";
+  } catch {
+    return false;
+  }
+}
+
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
   } catch {
     return false;
   }

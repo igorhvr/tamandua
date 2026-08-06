@@ -4,7 +4,8 @@ import { writeFileSync, existsSync, mkdtempSync, rmSync, readFileSync } from "no
 import { join } from "node:path";
 import { spawn, execSync, type ChildProcess } from "node:child_process";
 import { tmpdir } from "node:os";
-import { terminateOwnedProcessGroup } from "./dead-owner-teardown.ts";
+import { terminateOwnedProcessGroup, reapStaleOrphans } from "./dead-owner-teardown.ts";
+import { getProcessStartIdentity } from "../../src/lib/process-start-identity.ts";
 
 describe("terminateOwnedProcessGroup", { concurrency: 1 }, () => {
   const tempDir = mkdtempSync(join(tmpdir(), "dead-owner-teardown-test-"));
@@ -37,6 +38,7 @@ describe("terminateOwnedProcessGroup", { concurrency: 1 }, () => {
       `#!/bin/sh
 pgid=$(ps -o pgid= -p $$ | tr -d ' ')
 echo "$pgid" > "${pgidFile}"
+echo $$ > "${pgidFile}.pid"
 while :; do sleep 0.1; done
 `,
       { mode: 0o755 },
@@ -92,6 +94,11 @@ while :; do sleep 0.1; done
     } catch {
       return false;
     }
+  }
+
+  function spinWait(ms: number): void {
+    const end = Date.now() + ms;
+    while (Date.now() < end) { /* busy-wait */ }
   }
 
   after(() => {
@@ -222,5 +229,184 @@ while :; do sleep 0.1; done
 
     // Cleanup unrelated
     try { process.kill(-unrelatedPid, "SIGKILL"); } catch { /* */ }
+  });
+
+  // ── ABA-safe PID ownership verification ──
+
+  it("terminates a process group when pid + startTime match (ABA protection passes)", () => {
+    const marker = uniqueMarker();
+    const pgidFile = join(tempDir, `aba-valid-${marker}.pid`);
+    const { pgid } = spawnDetachedSuite(pgidFile, marker);
+    readPgidWhenReady(pgidFile);
+    assert.ok(isAlive(pgid), "suite should be alive before teardown");
+
+    // Read the PID from the .pid file and compute the start identity
+    const pidFile = `${pgidFile}.pid`;
+    assert.ok(existsSync(pidFile), "pid file must exist");
+    const suitePid = Number(readFileSync(pidFile, "utf-8").trim());
+    const startIdentity = getProcessStartIdentity(suitePid);
+    assert.ok(startIdentity !== null, "process start identity must be computable");
+
+    terminateOwnedProcessGroup({
+      pgidFile,
+      pid: suitePid,
+      startTime: startIdentity!,
+      ownershipMarker: marker,
+      graceMs: 500,
+    });
+
+    // Suite must be dead
+    assert.ok(!isAlive(pgid), "suite must be dead when ABA identity matches");
+  });
+
+  it("refuses to signal when pid is provided but startTime does not match (PID reused)", () => {
+    const marker = uniqueMarker();
+    const pgidFile = join(tempDir, `aba-mismatch-${marker}.pid`);
+    const { pgid } = spawnDetachedSuite(pgidFile, marker);
+    readPgidWhenReady(pgidFile);
+    assert.ok(isAlive(pgid), "suite should be alive before teardown");
+
+    // Provide a deliberately WRONG startTime
+    terminateOwnedProcessGroup({
+      pgidFile,
+      pid: pgid,
+      startTime: "proc:99999999",
+      ownershipMarker: marker,
+      graceMs: 500,
+    });
+
+    // Suite must still be alive — ABA protection blocked the kill
+    assert.ok(isAlive(pgid), "suite must still be alive when ABA identity mismatches");
+
+    // Cleanup
+    try { process.kill(-pgid, "SIGKILL"); } catch { /* */ }
+  });
+
+  // ── Fallback marker-scan kill ──
+
+  it("marker-scan fallback kills survivors that the pgid-targeted kill misses", () => {
+    // Spawn a detached process whose args contain the marker but that is
+    // NOT in the recorded pgid — the marker-scan fallback should catch it.
+    const marker = uniqueMarker();
+    const pgidFile = join(tempDir, `marker-scan-${marker}.pid`);
+
+    // Spawn a suite normally (records its pgid + pid)
+    const { pgid: suitePgid } = spawnDetachedSuite(pgidFile, marker);
+    readPgidWhenReady(pgidFile);
+    assert.ok(isAlive(suitePgid), "suite should be alive before teardown");
+
+    // Also spawn a SECOND detached process with the SAME marker but in a
+    // DIFFERENT process group. This simulates what happens when the
+    // fixture spawns a child that escapes the parent's pgid.
+    const strayScript = join(tempDir, `stray-${marker}.sh`);
+    writeFileSync(
+      strayScript,
+      `#!/bin/sh\n# marker: ${marker}\nwhile :; do sleep 0.1; done\n`,
+      { mode: 0o755 },
+    );
+    const strayChild = spawn("/bin/sh", ["-c", strayScript], {
+      detached: true,
+      stdio: "ignore",
+      env: { PATH: process.env.PATH },
+    });
+    strayChild.unref();
+    ownedChildren.push(strayChild);
+    const strayPid = strayChild.pid!;
+    // Wait for stray to start
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      if (isAlive(strayPid)) break;
+      spinWait(50);
+    }
+    assert.ok(isAlive(strayPid), "stray process should be alive before teardown");
+
+    // The pgid-targeted kill handles the main suite; the marker-scan
+    // fallback should catch the stray.
+    terminateOwnedProcessGroup({
+      pgidFile,
+      ownershipMarker: marker,
+      graceMs: 500,
+    });
+
+    // Both main suite AND stray must be dead
+    assert.ok(!isAlive(suitePgid), "main suite must be dead");
+    assert.ok(!isAlive(strayPid), "stray process must be dead after marker-scan fallback");
+  });
+
+  // ── reapStaleOrphans ──
+
+  it("reapStaleOrphans kills a live process and logs it", () => {
+    // Spawn a detached process we can reap
+    const marker = uniqueMarker();
+    const script = join(tempDir, `reap-test-${marker}.sh`);
+    writeFileSync(
+      script,
+      `#!/bin/sh\nwhile :; do sleep 0.1; done\n`,
+      { mode: 0o755 },
+    );
+    const child = spawn("/bin/sh", ["-c", script], {
+      detached: true,
+      stdio: "ignore",
+      env: { PATH: process.env.PATH },
+    });
+    child.unref();
+    ownedChildren.push(child);
+    const pid = child.pid!;
+
+    // Wait for it to start
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      if (isAlive(pid)) break;
+      spinWait(50);
+    }
+    assert.ok(isAlive(pid), "process should be alive before reap");
+
+    // Reap it
+    reapStaleOrphans([pid]);
+
+    // Must be dead
+    assert.ok(!isAlive(pid), "process must be dead after reapStaleOrphans");
+  });
+
+  it("reapStaleOrphans is a no-op for an empty array", () => {
+    // Must not throw
+    reapStaleOrphans([]);
+  });
+
+  it("reapStaleOrphans tolerates non-existent PIDs", () => {
+    // Must not throw for a PID that doesn't exist
+    reapStaleOrphans([99999999]);
+  });
+
+  it("reapStaleOrphans tolerates a mix of alive and dead PIDs", () => {
+    const marker = uniqueMarker();
+    const script = join(tempDir, `reap-mix-${marker}.sh`);
+    writeFileSync(
+      script,
+      `#!/bin/sh\nwhile :; do sleep 0.1; done\n`,
+      { mode: 0o755 },
+    );
+    const child = spawn("/bin/sh", ["-c", script], {
+      detached: true,
+      stdio: "ignore",
+      env: { PATH: process.env.PATH },
+    });
+    child.unref();
+    ownedChildren.push(child);
+    const alivePid = child.pid!;
+
+    // Wait for it to start
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      if (isAlive(alivePid)) break;
+      spinWait(50);
+    }
+    assert.ok(isAlive(alivePid), "process should be alive before reap");
+
+    // Reap mix: one alive, one non-existent
+    reapStaleOrphans([alivePid, 99999999]);
+
+    // Alive one must be dead, call must not have thrown
+    assert.ok(!isAlive(alivePid), "alive process must be dead after reapStaleOrphans");
   });
 });
