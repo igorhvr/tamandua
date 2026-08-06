@@ -44,7 +44,7 @@
       "type": "string",
       "minLength": 1,
       "maxLength": 128,
-      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._@-]*$"
     },
     "harness": {
       "enum": ["pi", "hermes", "scripted-pi", "scripted-hermes", "local"]
@@ -149,6 +149,22 @@
         "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
       }
     },
+    "probe_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "probes": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+      }
+    },
     "gates": {
       "type": "array",
       "uniqueItems": true,
@@ -173,6 +189,11 @@
     },
     "class": {
       "enum": ["verification", "characterization", "exploratory"]
+    },
+    "spec_ref": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
     },
     "production_duration_floor_ms": {
       "type": "integer",

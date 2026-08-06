@@ -32,7 +32,14 @@ tier_available() {
         && [ -f "$TT_DIR/cases/tier0.jsonl" ] \
         && "$TT_BIN_DIR/tt-tier0-assets" "$TT_DIR/cases/tier0.jsonl" >/dev/null 2>&1
       ;;
-    tier1|tier2) return 1 ;;   # flipped by later phases
+    tier1)
+      [ -x "$TT_BIN_DIR/tt-controller" ] \
+        && [ -x "$TT_BIN_DIR/tt-tier1-assets" ] \
+        && [ -f "$TT_DIR/cases/tier1.jsonl" ] \
+        && "$TT_BIN_DIR/tt-controller" --manifest "$TT_DIR/cases/tier1.jsonl" --validate-only >/dev/null 2>&1 \
+        && "$TT_BIN_DIR/tt-tier1-assets" "$TT_DIR/cases/tier1.jsonl" >/dev/null 2>&1
+      ;;
+    tier2) return 1 ;;
     *) return 1 ;;
   esac
 }
@@ -79,6 +86,8 @@ EOF
 
   --tier0 runs the scripted/local push-gate cases only (zero tokens).
   --tier0 --include-real includes both real canaries.
+  --tier1 reports + validates Tier-1 cases as pending-real (zero tokens).
+  --tier1 --include-real executes the full Tier-1 campaign.
   WARNING: --include-real launches real pi and Hermes work and spends real tokens.
 
 Bare invocation (no flags): after a 32s countdown, runs the most
@@ -117,6 +126,12 @@ run_tier() {
         exec "$TT_BIN_DIR/tt-controller" --manifest "$TT_DIR/cases/tier0.jsonl"
       fi
       exec "$TT_BIN_DIR/tt-controller" --manifest "$TT_DIR/cases/tier0.jsonl" --scripted-only
+      ;;
+    tier1)
+      if [ "$include_real" = true ]; then
+        exec "$TT_BIN_DIR/tt-controller" --manifest "$TT_DIR/cases/tier1.jsonl"
+      fi
+      exec "$TT_BIN_DIR/tt-controller" --manifest "$TT_DIR/cases/tier1.jsonl" --scripted-only
       ;;
     *)
       echo "internal error: tier '$tier' marked available but has no runner" >&2
@@ -173,6 +188,8 @@ elif [ "$#" -eq 1 ]; then
   esac
 elif [ "$#" -eq 2 ] && [ "$1" = "--tier0" ] && [ "$2" = "--include-real" ]; then
   run_tier tier0 true
+elif [ "$#" -eq 2 ] && [ "$1" = "--tier1" ] && [ "$2" = "--include-real" ]; then
+  run_tier tier1 true
 else
   echo "Unknown or conflicting arguments: $*" >&2
   usage >&2

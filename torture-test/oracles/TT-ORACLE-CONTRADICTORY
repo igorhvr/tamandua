@@ -1,0 +1,4 @@
+#!/usr/bin/env node
+const now = new Date().toISOString();
+console.log(JSON.stringify({contract_version:1,oracle_id:process.env.TT_ORACLE_ID,result:'FAIL',started_at:now,finished_at:now,findings:[{id:'F1',summary:'mechanical mismatch'}],evidence:[]}));
+process.exit(0);

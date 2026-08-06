@@ -1,0 +1,19 @@
+#!/usr/bin/env node
+import fs from 'node:fs';
+const contextFlag = process.argv.indexOf('--context');
+if (process.argv[2] !== '--contract-version' || process.argv[3] !== '1'
+    || contextFlag < 0 || process.argv[contextFlag + 1] !== process.env.TT_ORACLE_CONTEXT) process.exit(9);
+const context = JSON.parse(fs.readFileSync(process.env.TT_ORACLE_CONTEXT, 'utf8'));
+if (context.contract_version !== 1 || context.oracle_id !== process.env.TT_ORACLE_ID
+    || context.case.id !== process.env.TT_CASE_ID
+    || context.campaign.id !== process.env.TT_CAMPAIGN_ID
+    || context.agent_prose !== undefined || !Array.isArray(context.attempts)) process.exit(8);
+const started = new Date().toISOString();
+const evidencePath = `${process.env.TT_ORACLE_EVIDENCE_DIR}/mechanical.json`;
+fs.writeFileSync(evidencePath, `${JSON.stringify({mechanical:true,run_id:context.run_id})}\n`, {flag:'wx'});
+console.log(JSON.stringify({
+  contract_version: 1, oracle_id: process.env.TT_ORACLE_ID, result: 'PASS',
+  started_at: started, finished_at: new Date().toISOString(), findings: [],
+  evidence: [{path:'mechanical.json', kind:'filesystem'}],
+}));
+console.error('oracle diagnostic');

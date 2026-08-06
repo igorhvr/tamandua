@@ -451,7 +451,7 @@ function hasRequirements(caseRecord) {
 function validateHostProfile(profile) {
   if (!isObject(profile)) return ['profile must be a JSON object'];
   const errors = [];
-  const objectSections = ['platform', 'containment', 'toolchains', 'capabilities', 'spawnSpeedClass'];
+  const objectSections = ['platform', 'containment', 'toolchains', 'capabilities', 'spawnSpeedClass', 'harness'];
   for (const section of objectSections) {
     if (profile[section] !== undefined && profile[section] !== null && !isObject(profile[section])) {
       errors.push(`${section} must be an object or null`);
@@ -538,6 +538,8 @@ function observedCapability(profile, name) {
       .filter((available) => typeof available === 'boolean');
     return observations.length === 0 ? null : observations.some(Boolean);
   }
+  if (name === 'hermes') return profile.harness?.hermes?.authenticated ?? null;
+  if (name === 'pi') return profile.harness?.pi?.authenticated ?? null;
   if (Object.hasOwn(profile.capabilities ?? {}, name)) return profile.capabilities[name];
   const spawnClass = profile.spawnSpeedClass?.class;
   if (typeof spawnClass === 'string' && name === `spawn-${spawnClass}`) return true;

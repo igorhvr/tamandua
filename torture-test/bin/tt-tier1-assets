@@ -1,0 +1,195 @@
+#!/usr/bin/env node
+
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const binDir = path.dirname(fileURLToPath(import.meta.url));
+const ttRoot = path.resolve(binDir, "..");
+const probesRoot = path.join(ttRoot, "probes");
+
+const ALLOWED_REQUIRES_KEYS = new Set([
+  "platform",
+  "toolchains",
+  "capabilities",
+  "containment",
+  "node_min",
+]);
+
+function fail(message) {
+  throw new Error(`Tier-1 assets unavailable: ${message}`);
+}
+
+function readManifest(manifestPath) {
+  const contents = fs.readFileSync(manifestPath, "utf8");
+  const records = [];
+  for (const [index, line] of contents.split(/\r?\n/).entries()) {
+    if (line.trim() === "") continue;
+    try {
+      records.push(JSON.parse(line));
+    } catch (error) {
+      fail(`manifest line ${index + 1} is not JSON: ${error.message}`);
+    }
+  }
+  if (records.length === 0) fail("manifest contains no cases");
+  return records;
+}
+
+function resolveTaskFile(relative, caseId) {
+  if (typeof relative !== "string" || relative.length === 0 || path.isAbsolute(relative)) {
+    fail(`${caseId} has an invalid task path`);
+  }
+  const candidate = path.resolve(ttRoot, relative);
+  const ttRealPath = fs.realpathSync(ttRoot);
+  if (!candidate.startsWith(`${ttRoot}${path.sep}`)) {
+    fail(`${caseId} task path escapes torture-test/`);
+  }
+  const details = fs.lstatSync(candidate, { throwIfNoEntry: false });
+  if (!details?.isFile() || details.isSymbolicLink()) {
+    fail(`${caseId} task path is not a regular file: ${relative}`);
+  }
+  try {
+    const realCandidate = fs.realpathSync(candidate);
+    if (!realCandidate.startsWith(`${ttRealPath}${path.sep}`) && realCandidate !== ttRealPath) {
+      fail(`${caseId} task path resolves outside torture-test/: ${relative}`);
+    }
+  } catch {
+    // realpath failure (dangling symlink, absent path, etc.)
+    fail(`${caseId} task path is not a contained regular file: ${relative}`);
+  }
+  return candidate;
+}
+
+function isContainedRegularFile(filePath) {
+  const details = fs.lstatSync(filePath, { throwIfNoEntry: false });
+  if (!details?.isFile() || details.isSymbolicLink()) return false;
+  try {
+    const realRoot = fs.realpathSync(probesRoot);
+    const realFile = fs.realpathSync(filePath);
+    return realFile.startsWith(`${realRoot}${path.sep}`) || realFile === realRoot;
+  } catch {
+    return false;
+  }
+}
+
+function resolveProbe(probeId, fixture, caseId) {
+  const fixtureDir = path.join(probesRoot, fixture);
+
+  // Standard layout: probes/<fixture>/<probe_id>/probe.sh
+  const directProbe = path.join(fixtureDir, probeId, "probe.sh");
+  if (isContainedRegularFile(directProbe)) return directProbe;
+
+  // Poly-lite layout: probes/<fixture>/<lang>/<probe_id>/probe.sh
+  const fixtureDetails = fs.lstatSync(fixtureDir, { throwIfNoEntry: false });
+  if (fixtureDetails?.isDirectory() && !fixtureDetails.isSymbolicLink()) {
+    for (const entry of fs.readdirSync(fixtureDir, { withFileTypes: true })) {
+      if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+      const polyProbe = path.join(fixtureDir, entry.name, probeId, "probe.sh");
+      if (isContainedRegularFile(polyProbe)) return polyProbe;
+    }
+  }
+
+  fail(`${caseId} probe_id ${JSON.stringify(probeId)} has no probe.sh under probes/${fixture}/`);
+}
+
+function validateRequiresPredicates(requires, caseId) {
+  for (const key of Object.keys(requires)) {
+    if (!ALLOWED_REQUIRES_KEYS.has(key)) {
+      fail(`${caseId} requires has invalid key: ${JSON.stringify(key)}`);
+    }
+  }
+  // Validate shape of known keys
+  if (Array.isArray(requires.toolchains)) {
+    for (const tc of requires.toolchains) {
+      if (typeof tc !== "string" || tc.length === 0) {
+        fail(`${caseId} requires.toolchains contains a non-string entry`);
+      }
+    }
+  }
+  if (Array.isArray(requires.capabilities)) {
+    for (const cap of requires.capabilities) {
+      if (typeof cap !== "string" || cap.length === 0 || cap.length > 128) {
+        fail(`${caseId} requires.capabilities contains an invalid entry`);
+      }
+    }
+  }
+  if (Array.isArray(requires.containment)) {
+    for (const c of requires.containment) {
+      if (typeof c !== "string" || c.length === 0) {
+        fail(`${caseId} requires.containment contains a non-string entry`);
+      }
+    }
+  }
+  if (requires.platform !== undefined) {
+    const allowedPlatforms = ["linux", "darwin", "other"];
+    if (Array.isArray(requires.platform)) {
+      for (const p of requires.platform) {
+        if (!allowedPlatforms.includes(p)) {
+          fail(`${caseId} requires.platform array has invalid value: ${JSON.stringify(p)}`);
+        }
+      }
+    } else if (!allowedPlatforms.includes(requires.platform)) {
+      fail(`${caseId} requires.platform has invalid value: ${JSON.stringify(requires.platform)}`);
+    }
+  }
+  if (requires.node_min !== undefined && (!Number.isInteger(requires.node_min) || requires.node_min < 0)) {
+    fail(`${caseId} requires.node_min must be a non-negative integer`);
+  }
+}
+
+function collectProbeIds(caseRecord) {
+  const ids = [];
+  if (typeof caseRecord.probe_id === "string") ids.push(caseRecord.probe_id);
+  if (Array.isArray(caseRecord.probes)) ids.push(...caseRecord.probes);
+  return ids;
+}
+
+function validateTier1Assets(manifestPath) {
+  const records = readManifest(manifestPath);
+  let caseCount = 0;
+
+  for (const record of records) {
+    const caseId = typeof record?.id === "string" ? record.id : "<unknown-case>";
+    caseCount += 1;
+
+    // (b) Validate task file exists
+    resolveTaskFile(record.task, caseId);
+
+    // (c) Validate probes
+    const probeIds = collectProbeIds(record);
+    for (const probeId of probeIds) {
+      resolveProbe(probeId, record.fixture, caseId);
+    }
+
+    // (d) Validate requires predicate shape
+    validateRequiresPredicates(record.requires, caseId);
+  }
+
+  return caseCount;
+}
+
+function main() {
+  const args = process.argv.slice(2);
+  if (args.length !== 1) {
+    process.stderr.write("Usage: tt-tier1-assets <tier1-manifest>\n");
+    process.exit(2);
+  }
+  try {
+    const manifestPath = path.resolve(args[0]);
+    const casesRoot = path.join(ttRoot, "cases");
+    if (!manifestPath.startsWith(`${casesRoot}${path.sep}`)) {
+      fail("manifest must be beneath torture-test/cases/");
+    }
+    const details = fs.lstatSync(manifestPath, { throwIfNoEntry: false });
+    if (!details?.isFile() || details.isSymbolicLink()) {
+      fail("manifest is not a regular file");
+    }
+    const count = validateTier1Assets(manifestPath);
+    process.stdout.write(`Validated ${count} Tier-1 case asset set(s)\n`);
+  } catch (error) {
+    process.stderr.write(`${error.message}\n`);
+    process.exit(1);
+  }
+}
+
+main();

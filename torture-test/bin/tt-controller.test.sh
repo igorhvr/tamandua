@@ -1930,6 +1930,10 @@ for (const key of [
 ]) {
   if (!required.has(key)) throw new Error(`schema does not require ${key}`);
 }
+// spec_ref, probe_id, probes must NOT be required
+for (const key of ['spec_ref', 'probe_id', 'probes']) {
+  if (required.has(key)) throw new Error(`schema must not require optional field ${key}`);
+}
 const values = schema.properties.class.enum;
 if (JSON.stringify(values) !== JSON.stringify(['verification', 'characterization', 'exploratory'])) {
   throw new Error(`unexpected class enum: ${JSON.stringify(values)}`);
@@ -1937,8 +1941,35 @@ if (JSON.stringify(values) !== JSON.stringify(['verification', 'characterization
 if (!schema.properties.caps.required.includes('tokens') || !schema.properties.caps.required.includes('wall_min')) {
   throw new Error('caps does not require tokens and wall_min');
 }
+// spec_ref: optional string with length bounds
+const specRef = schema.properties.spec_ref;
+if (!specRef) throw new Error('schema is missing spec_ref property');
+if (specRef.type !== 'string') throw new Error(`spec_ref type=${specRef.type}, expected string`);
+if (specRef.minLength !== 1 || specRef.maxLength !== 512) throw new Error('spec_ref length bounds wrong');
+// probe_id: optional string with pattern
+const probeId = schema.properties.probe_id;
+if (!probeId) throw new Error('schema is missing probe_id property');
+if (probeId.type !== 'string') throw new Error(`probe_id type=${probeId.type}, expected string`);
+if (!/^\^\[A-Za-z0-9\]/.test(probeId.pattern ?? '')) throw new Error('probe_id missing pattern');
+// probes: optional array of strings, uniqueItems
+const probes = schema.properties.probes;
+if (!probes) throw new Error('schema is missing probes property');
+if (probes.type !== 'array') throw new Error(`probes type=${probes.type}, expected array`);
+if (!probes.uniqueItems) throw new Error('probes must declare uniqueItems');
+if (!probes.items || probes.items.type !== 'string') throw new Error('probes items are not strings');
 NODE
-pass "schema pins required fields, caps, and class taxonomy"
+pass "schema pins required fields, caps, class taxonomy, and new optional spec_ref/probe_id/probes properties"
+
+# Optional spec_ref/probe_id/probes fields are accepted by --validate-only
+new_fields_manifest="$TEST_ROOT/manifests/new-fields.jsonl"
+valid_case "NEW-FIELDS" | sed 's/"oracles":\["TT-MISSING-O1","TT-MISSING-O2"\]/"oracles":["O1"],"probe_id":"BUG-001-probe","probes":["BUG-001-probe","BUG-002-probe"],"spec_ref":"05-wave-1-language-smoke.md#W1.L3"/' > "$new_fields_manifest"
+new_fields_output=$("$CONTROLLER" --manifest "$new_fields_manifest" --validate-only 2>&1) || fail "new spec_ref/probe_id/probes fields rejected: $new_fields_output"
+pass "optional spec_ref, probe_id, and probes fields pass --validate-only"
+
+# Misspelled top-level key (spec_refs) is still rejected
+misspelled_manifest="$TEST_ROOT/manifests/misspelled.jsonl"
+valid_case "MISSPELLED-KEY" | sed 's/"class":"verification"/"spec_refs":"oops","class":"verification"/' > "$misspelled_manifest"
+expect_rejected "misspelled top-level key spec_refs is rejected" "$misspelled_manifest" 'unknown property "spec_refs"'
 
 valid_output=$(run_recorded_campaign "$CONTROLLER" --manifest "$CASES") || fail "cases.jsonl rejected: $valid_output"
 printf '%s' "$valid_output" | grep -Fq 'Validated ' || fail "valid manifest did not report validation success"
@@ -2036,6 +2067,220 @@ valid_case "PROFILE-NOT-REQUIRED" | sed 's/"requires":{"toolchains":\["node"\]}/
 empty_output=$(run_recorded_campaign "$CONTROLLER" --manifest "$empty_requires") || fail "empty requirements unexpectedly needed host profile: $empty_output"
 remember_campaign "$empty_output" > /dev/null
 pass "empty requires does not require host-profile.json"
+write_satisfying_host_profile
+
+# --- Harness capability predicate resolution (hermes/pi) ---
+
+# Set up host profile with harness section for hermes (authenticated) + pi (authenticated)
+harness_profile="$TEST_ROOT/manifests/harness-host-profile.json"
+cat > "$HOST_PROFILE" <<'JSON'
+{
+  "platform": {"os": "linux", "label": "linux"},
+  "containment": {"systemdUserScope": true, "procfs": true},
+  "toolchains": {
+    "node": {"present": true, "buildPassed": true, "testPassed": true}
+  },
+  "nodeRuntimes": [
+    {"version": "v24.0.0", "major": 24, "sqliteAvailable": true}
+  ],
+  "harness": {
+    "pi": {"authenticated": true},
+    "hermes": {"authenticated": true}
+  }
+}
+JSON
+
+# Test: hermes capability satisfied when harness.hermes.authenticated is true
+hermes_eligible="$TEST_ROOT/manifests/harness-hermes-eligible.jsonl"
+valid_case "HERMES-ELIGIBLE" \
+  | sed 's/"requires":{"toolchains":\["node"\]}/"requires":{"toolchains":["node"],"capabilities":["hermes"]}/' \
+  > "$hermes_eligible"
+hermes_eligible_output=$(run_recorded_campaign "$CONTROLLER" --manifest "$hermes_eligible") || fail "hermes eligible predicate failed: $hermes_eligible_output"
+hermes_eligible_id=$(remember_campaign "$hermes_eligible_output")
+node --input-type=module - "$TT_DIR/var/results/$hermes_eligible_id/state.json" <<'NODE'
+import fs from 'node:fs';
+const state = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const item = state.cases[0];
+if (item.reason?.category === 'predicate' && item.reason?.evidence?.some(e => e.predicate === 'capabilities.hermes')) {
+  throw new Error(`hermes capability was not satisfied: ${JSON.stringify(item.reason)}`);
+}
+NODE
+pass "hermes capability satisfied when harness.hermes.authenticated is true"
+
+# Test: hermes capability fails when harness.hermes.authenticated is false
+cat > "$HOST_PROFILE" <<'JSON'
+{
+  "platform": {"os": "linux", "label": "linux"},
+  "containment": {"systemdUserScope": true, "procfs": true},
+  "toolchains": {
+    "node": {"present": true, "buildPassed": true, "testPassed": true}
+  },
+  "nodeRuntimes": [
+    {"version": "v24.0.0", "major": 24, "sqliteAvailable": true}
+  ],
+  "harness": {
+    "pi": {"authenticated": true},
+    "hermes": {"authenticated": false}
+  }
+}
+JSON
+hermes_excluded="$TEST_ROOT/manifests/harness-hermes-excluded.jsonl"
+valid_case "HERMES-EXCLUDED" \
+  | sed 's/"requires":{"toolchains":\["node"\]}/"requires":{"toolchains":["node"],"capabilities":["hermes"]}/' \
+  > "$hermes_excluded"
+hermes_excluded_output=$(run_recorded_campaign "$CONTROLLER" --manifest "$hermes_excluded") || fail "hermes excluded predicate failed: $hermes_excluded_output"
+hermes_excluded_id=$(remember_campaign "$hermes_excluded_output")
+node --input-type=module - "$TT_DIR/var/results/$hermes_excluded_id/state.json" <<'NODE'
+import fs from 'node:fs';
+const state = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const item = state.cases[0];
+if (item.phase !== 'terminal' || item.outcome !== 'NOT_RUN' || item.reason?.category !== 'predicate') {
+  throw new Error(`hermes excluded case is not terminal NOT_RUN: ${JSON.stringify(item)}`);
+}
+const evidence = new Map(item.reason.evidence.map(entry => [entry.predicate, entry]));
+const entry = evidence.get('capabilities.hermes');
+if (!entry || entry.expected !== true || entry.observed !== false) {
+  throw new Error(`wrong hermes predicate evidence: ${JSON.stringify(entry)}`);
+}
+NODE
+pass "hermes capability fails when harness.hermes.authenticated is false"
+
+# Test: hermes capability fails when harness.hermes section is absent
+cat > "$HOST_PROFILE" <<'JSON'
+{
+  "platform": {"os": "linux", "label": "linux"},
+  "containment": {"systemdUserScope": true, "procfs": true},
+  "toolchains": {
+    "node": {"present": true, "buildPassed": true, "testPassed": true}
+  },
+  "nodeRuntimes": [
+    {"version": "v24.0.0", "major": 24, "sqliteAvailable": true}
+  ],
+  "harness": {
+    "pi": {"authenticated": true}
+  }
+}
+JSON
+hermes_absent="$TEST_ROOT/manifests/harness-hermes-absent.jsonl"
+valid_case "HERMES-ABSENT" \
+  | sed 's/"requires":{"toolchains":\["node"\]}/"requires":{"toolchains":["node"],"capabilities":["hermes"]}/' \
+  > "$hermes_absent"
+hermes_absent_output=$(run_recorded_campaign "$CONTROLLER" --manifest "$hermes_absent") || fail "hermes absent predicate failed: $hermes_absent_output"
+hermes_absent_id=$(remember_campaign "$hermes_absent_output")
+node --input-type=module - "$TT_DIR/var/results/$hermes_absent_id/state.json" <<'NODE'
+import fs from 'node:fs';
+const state = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const item = state.cases[0];
+if (item.phase !== 'terminal' || item.outcome !== 'NOT_RUN' || item.reason?.category !== 'predicate') {
+  throw new Error(`hermes absent case is not terminal NOT_RUN: ${JSON.stringify(item)}`);
+}
+const evidence = new Map(item.reason.evidence.map(entry => [entry.predicate, entry]));
+const entry = evidence.get('capabilities.hermes');
+if (!entry || entry.expected !== true || entry.observed !== null) {
+  throw new Error(`wrong hermes absent evidence (expected null observed): ${JSON.stringify(entry)}`);
+}
+NODE
+pass "hermes capability fails when harness.hermes section is absent"
+
+# Test: hermes capability fails when harness section is entirely absent
+cat > "$HOST_PROFILE" <<'JSON'
+{
+  "platform": {"os": "linux", "label": "linux"},
+  "containment": {"systemdUserScope": true, "procfs": true},
+  "toolchains": {
+    "node": {"present": true, "buildPassed": true, "testPassed": true}
+  },
+  "nodeRuntimes": [
+    {"version": "v24.0.0", "major": 24, "sqliteAvailable": true}
+  ]
+}
+JSON
+hermes_no_harness="$TEST_ROOT/manifests/harness-hermes-no-harness.jsonl"
+valid_case "HERMES-NO-HARNESS" \
+  | sed 's/"requires":{"toolchains":\["node"\]}/"requires":{"toolchains":["node"],"capabilities":["hermes"]}/' \
+  > "$hermes_no_harness"
+hermes_no_harness_output=$(run_recorded_campaign "$CONTROLLER" --manifest "$hermes_no_harness") || fail "hermes no-harness predicate failed: $hermes_no_harness_output"
+hermes_no_harness_id=$(remember_campaign "$hermes_no_harness_output")
+node --input-type=module - "$TT_DIR/var/results/$hermes_no_harness_id/state.json" <<'NODE'
+import fs from 'node:fs';
+const state = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const item = state.cases[0];
+if (item.phase !== 'terminal' || item.outcome !== 'NOT_RUN' || item.reason?.category !== 'predicate') {
+  throw new Error(`hermes no-harness case is not terminal NOT_RUN: ${JSON.stringify(item)}`);
+}
+NODE
+pass "hermes capability fails when harness section is entirely absent"
+
+# Test: pi capability satisfied when harness.pi.authenticated is true
+cat > "$HOST_PROFILE" <<'JSON'
+{
+  "platform": {"os": "linux", "label": "linux"},
+  "containment": {"systemdUserScope": true, "procfs": true},
+  "toolchains": {
+    "node": {"present": true, "buildPassed": true, "testPassed": true}
+  },
+  "nodeRuntimes": [
+    {"version": "v24.0.0", "major": 24, "sqliteAvailable": true}
+  ],
+  "harness": {
+    "pi": {"authenticated": true}
+  }
+}
+JSON
+pi_eligible="$TEST_ROOT/manifests/harness-pi-eligible.jsonl"
+valid_case "PI-ELIGIBLE" \
+  | sed 's/"requires":{"toolchains":\["node"\]}/"requires":{"toolchains":["node"],"capabilities":["pi"]}/' \
+  > "$pi_eligible"
+pi_eligible_output=$(run_recorded_campaign "$CONTROLLER" --manifest "$pi_eligible") || fail "pi eligible predicate failed: $pi_eligible_output"
+pi_eligible_id=$(remember_campaign "$pi_eligible_output")
+node --input-type=module - "$TT_DIR/var/results/$pi_eligible_id/state.json" <<'NODE'
+import fs from 'node:fs';
+const state = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const item = state.cases[0];
+if (item.reason?.category === 'predicate' && item.reason?.evidence?.some(e => e.predicate === 'capabilities.pi')) {
+  throw new Error(`pi capability was not satisfied: ${JSON.stringify(item.reason)}`);
+}
+NODE
+pass "pi capability satisfied when harness.pi.authenticated is true"
+
+# Test: pi capability fails when harness.pi.authenticated is false
+cat > "$HOST_PROFILE" <<'JSON'
+{
+  "platform": {"os": "linux", "label": "linux"},
+  "containment": {"systemdUserScope": true, "procfs": true},
+  "toolchains": {
+    "node": {"present": true, "buildPassed": true, "testPassed": true}
+  },
+  "nodeRuntimes": [
+    {"version": "v24.0.0", "major": 24, "sqliteAvailable": true}
+  ],
+  "harness": {
+    "pi": {"authenticated": false}
+  }
+}
+JSON
+pi_excluded="$TEST_ROOT/manifests/harness-pi-excluded.jsonl"
+valid_case "PI-EXCLUDED" \
+  | sed 's/"requires":{"toolchains":\["node"\]}/"requires":{"toolchains":["node"],"capabilities":["pi"]}/' \
+  > "$pi_excluded"
+pi_excluded_output=$(run_recorded_campaign "$CONTROLLER" --manifest "$pi_excluded") || fail "pi excluded predicate failed: $pi_excluded_output"
+pi_excluded_id=$(remember_campaign "$pi_excluded_output")
+node --input-type=module - "$TT_DIR/var/results/$pi_excluded_id/state.json" <<'NODE'
+import fs from 'node:fs';
+const state = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const item = state.cases[0];
+if (item.phase !== 'terminal' || item.outcome !== 'NOT_RUN' || item.reason?.category !== 'predicate') {
+  throw new Error(`pi excluded case is not terminal NOT_RUN: ${JSON.stringify(item)}`);
+}
+const evidence = new Map(item.reason.evidence.map(entry => [entry.predicate, entry]));
+const entry = evidence.get('capabilities.pi');
+if (!entry || entry.expected !== true || entry.observed !== false) {
+  throw new Error(`wrong pi predicate evidence: ${JSON.stringify(entry)}`);
+}
+NODE
+pass "pi capability fails when harness.pi.authenticated is false"
+
+# Restore the vanilla satisfying host profile
 write_satisfying_host_profile
 
 duplicate="$TEST_ROOT/manifests/duplicate.jsonl"

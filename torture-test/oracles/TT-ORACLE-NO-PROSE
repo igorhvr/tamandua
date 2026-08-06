@@ -1,0 +1,12 @@
+#!/usr/bin/env node
+import fs from 'node:fs';
+const context = JSON.parse(fs.readFileSync(process.env.TT_ORACLE_CONTEXT, 'utf8'));
+const serialized = JSON.stringify(context);
+if (serialized.includes('AGENT_RESPONSE_SENTINEL')) process.exit(8);
+const step = context.attempts?.[0]?.steps_snapshot?.steps?.[0];
+if (step?.stepId !== 'step-oracle-prose' || step?.stepIndex !== 0 || step?.status !== 'done') process.exit(9);
+const now = new Date().toISOString();
+console.log(JSON.stringify({
+  contract_version:1, oracle_id:process.env.TT_ORACLE_ID, result:'PASS',
+  started_at:now, finished_at:now, findings:[], evidence:[],
+}));
