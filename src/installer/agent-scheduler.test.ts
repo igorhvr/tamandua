@@ -21,6 +21,7 @@ import {
   nudgeScheduledRuns,
   _pendingSweepTimerCount,
   _hasPendingSweepTimer,
+  _schedulerGeneration,
   DISPATCH_INTERVAL_MS,
   HARNESS_TEARDOWN_GRACE_MS,
   getRunTeardownGraceMs,
@@ -514,6 +515,22 @@ describe("removeRunCrons sweep timer scheduling", () => {
     assert.equal(_hasPendingSweepTimer(runId), false);
   });
 
+  it("_schedulerGeneration increases by exactly 1 after each shutdownAllCrons", () => {
+    // The generation/epoch counter is bumped on every teardown so a
+    // dispatch round that captured a stale epoch can detect that
+    // shutdown happened while it was in flight.
+    const before = _schedulerGeneration();
+
+    shutdownAllCrons();
+    assert.equal(_schedulerGeneration(), before + 1);
+
+    shutdownAllCrons();
+    assert.equal(_schedulerGeneration(), before + 2);
+
+    shutdownAllCrons();
+    assert.equal(_schedulerGeneration(), before + 3);
+  });
+
   it("does not schedule sweep timer when no jobs were removed", async () => {
     // removeRunCrons on an unknown runId must NOT schedule a timer: with
     // no dispatch jobs torn down there is nothing to sweep. This guards
@@ -544,5 +561,132 @@ describe("removeRunCrons sweep timer scheduling", () => {
     await removeRunCrons(runId);
     assert.equal(_pendingSweepTimerCount(), 1);
     assert.equal(_hasPendingSweepTimer(runId), true);
+  });
+
+  it("stale epoch: removeRunCrons after shutdown does not schedule a sweep even with jobs removed", async () => {
+    // Simulate a fire-and-forget executeDispatchRound that captured the
+    // scheduler epoch, then had shutdownAllCrons() run (afterEach-style
+    // teardown) while it was in flight. Its late-arriving teardown
+    // removeRunCrons must NOT re-populate pendingSweepTimers.
+    const workflow = makeWorkflow();
+    const runId = "run-sweep-stale-epoch";
+
+    await setupAgentCrons(workflow, runId);
+    // Capture the epoch as the round would at its top, before any await.
+    const roundGeneration = _schedulerGeneration();
+
+    // Teardown happens (bumps the epoch), clearing all timer/job state.
+    shutdownAllCrons();
+    assert.equal(_pendingSweepTimerCount(), 0);
+    assert.notEqual(_schedulerGeneration(), roundGeneration);
+
+    // Re-establish jobs so removed.length > 0 for this run, then invoke
+    // the stale teardown carrying the pre-shutdown epoch. Even though
+    // jobs are removed, the stale epoch must suppress the sweep timer.
+    await setupAgentCrons(workflow, runId);
+    await removeRunCrons(runId, { schedulerGeneration: roundGeneration });
+    assert.equal(_pendingSweepTimerCount(), 0);
+    assert.equal(_hasPendingSweepTimer(runId), false);
+  });
+
+  it("current epoch: removeRunCrons with matching epoch and jobs removed schedules one sweep", async () => {
+    // A round whose epoch is still current (no shutdown in flight) must
+    // schedule the sweep exactly as an epoch-less call would.
+    const workflow = makeWorkflow();
+    const runId = "run-sweep-current-epoch";
+
+    await setupAgentCrons(workflow, runId);
+    const roundGeneration = _schedulerGeneration();
+
+    await removeRunCrons(runId, { schedulerGeneration: roundGeneration });
+    assert.equal(_pendingSweepTimerCount(), 1);
+    assert.equal(_hasPendingSweepTimer(runId), true);
+  });
+
+  it("no epoch option: legitimate removeRunCrons after teardown still schedules exactly one sweep timer", async () => {
+    // Legitimate external callers (control-plane terminate, explicit
+    // tear-down) pass no schedulerGeneration and must behave exactly as
+    // before: one sweep timer per run that actually had jobs removed.
+    const workflow = makeWorkflow();
+    const runId = "run-sweep-no-epoch";
+
+    await setupAgentCrons(workflow, runId);
+    await removeRunCrons(runId);
+    assert.equal(_pendingSweepTimerCount(), 1);
+    assert.equal(_hasPendingSweepTimer(runId), true);
+  });
+
+  it("cross-teardown leak regression: a late round resolving after shutdown cannot revive pendingSweepTimers", async () => {
+    // US-003 regression: reproduce the exact failure shape that the tier0
+    // gate caught. A fire-and-forget executeDispatchRound captured the
+    // scheduler epoch at its top (before any await); shutdownAllCrons()
+    // (the afterEach-style teardown) then ran and cleared all timer state
+    // AND bumped the epoch. When the stale round finally resolves and its
+    // teardown removeRunCrons fires, it must NOT re-populate
+    // pendingSweepTimers — otherwise the leaked timer bleeds into the next
+    // test ("does not schedule sweep timer when no jobs were removed").
+    const workflow = makeWorkflow();
+    const runId = "run-sweep-cross-teardown-leak";
+
+    // Round starts: crons set up, epoch captured before its first await.
+    await setupAgentCrons(workflow, runId);
+    const preShutdownEpoch = _schedulerGeneration();
+
+    // Teardown runs while the round is "in flight": clears state + bumps epoch.
+    shutdownAllCrons();
+    assert.equal(_pendingSweepTimerCount(), 0);
+    assert.notEqual(_schedulerGeneration(), preShutdownEpoch);
+
+    // Simulate the late round's teardown: jobs exist again (removed.length > 0)
+    // but the round carries the STALE pre-shutdown epoch. The product must
+    // suppress the sweep so nothing revives across the test boundary.
+    await setupAgentCrons(workflow, runId);
+    await removeRunCrons(runId, { schedulerGeneration: preShutdownEpoch });
+    assert.equal(
+      _pendingSweepTimerCount(),
+      0,
+      "stale-epoch late round must not re-populate pendingSweepTimers after shutdown",
+    );
+    assert.equal(_hasPendingSweepTimer(runId), false);
+  });
+
+  it("stability: repeated setup -> stale-round teardown -> shutdown cycles never accumulate sweep timers", async () => {
+    // US-003 stability: run the full boundary cycle several times and assert
+    // pendingSweepTimers returns to 0 after every shutdown, proving no
+    // accumulation across teardown boundaries even when late rounds keep
+    // firing with stale epochs.
+    const workflow = makeWorkflow();
+
+    for (let i = 0; i < 5; i++) {
+      const runId = `run-sweep-stability-${i}`;
+
+      await setupAgentCrons(workflow, runId);
+      const staleEpoch = _schedulerGeneration();
+
+      // Teardown mid-round: clears state, bumps epoch.
+      shutdownAllCrons();
+      assert.equal(
+        _pendingSweepTimerCount(),
+        0,
+        `cycle ${i}: shutdown must leave zero pending sweep timers`,
+      );
+
+      // Late stale-epoch round teardown must not revive anything.
+      await setupAgentCrons(workflow, runId);
+      await removeRunCrons(runId, { schedulerGeneration: staleEpoch });
+      assert.equal(
+        _pendingSweepTimerCount(),
+        0,
+        `cycle ${i}: stale-epoch late round must not schedule a sweep timer`,
+      );
+
+      // Final teardown for the cycle: back to a clean slate.
+      shutdownAllCrons();
+      assert.equal(
+        _pendingSweepTimerCount(),
+        0,
+        `cycle ${i}: end-of-cycle shutdown must leave zero pending sweep timers`,
+      );
+    }
   });
 });

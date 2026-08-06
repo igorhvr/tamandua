@@ -114,6 +114,18 @@ const inFlightChildren = new Map<string, InFlightChild>();
  */
 const pendingSweepTimers = new Map<string, NodeJS.Timeout>();
 
+/**
+ * Monotonic scheduler generation/epoch counter.
+ *
+ * Bumped on every `shutdownAllCrons()` call. A dispatch round captures
+ * the current generation before its first await; if the generation has
+ * moved by the time the round resolves, teardown happened while the
+ * round was in flight and the round must not revive timer state.
+ *
+ * @internal — exposed for test introspection via `_schedulerGeneration`.
+ */
+let schedulerGeneration = 0;
+
 const AGENT_PERSONA_FILES = ["AGENTS.md", "IDENTITY.md", "SOUL.md"] as const;
 
 export interface CronJobInfo {
@@ -975,12 +987,19 @@ export async function executeDispatchRound(
   const workingDirectoryForHarness = job.workingDirectoryForHarness ?? legacyJobWorkdir;
   const context = buildDispatchRoundContext(job, agent, timeout, workingDirectoryForHarness);
 
+  // Capture the scheduler epoch BEFORE any await. If shutdownAllCrons()
+  // runs while this round is in flight, schedulerGeneration will have
+  // moved on by the time our teardown removeRunCrons calls resolve; we
+  // pass this captured value so a stale round cannot re-populate
+  // pendingSweepTimers after teardown.
+  const roundGeneration = schedulerGeneration;
+
   if (!workingDirectoryForHarness) {
     logger.error("Dispatch round refused — missing harness workdir", {
       ...context,
       reason: "missing_working_directory_for_harness",
     });
-    await removeRunCrons(job.runId);
+    await removeRunCrons(job.runId, { schedulerGeneration: roundGeneration });
     return;
   }
 
@@ -1036,6 +1055,7 @@ export async function executeDispatchRound(
         });
         await removeRunCrons(job.runId, {
           graceMs: getRunTeardownGraceMs(row?.status),
+          schedulerGeneration: roundGeneration,
         });
         return;
       }
@@ -1588,6 +1608,17 @@ export interface RemoveRunCronsOptions {
    * HARNESS_TEARDOWN_GRACE_MS.
    */
   graceMs?: number;
+  /**
+   * The scheduler epoch captured at the top of the dispatch round that
+   * issued this teardown. When provided AND it no longer matches the
+   * current module-level `schedulerGeneration`, the round is stale (a
+   * `shutdownAllCrons()` ran while it was in flight): the trailing
+   * `scheduleSweepTimer` is skipped so a late fire-and-forget round
+   * cannot re-populate `pendingSweepTimers` after teardown. Absent for
+   * legitimate external callers (control-plane terminate, explicit
+   * tear-down), which behave exactly as before.
+   */
+  schedulerGeneration?: number;
 }
 
 /**
@@ -1713,7 +1744,15 @@ export async function removeRunCrons(
   // (explicit tear-down, dispatch-round run_not_running, control-plane
   // terminate) have the run's jobs in jobMetadata at call time, so
   // this condition always holds for them.
-  if (removed.length > 0) {
+  //
+  // Epoch guard (US-002): when the caller passed the round's captured
+  // schedulerGeneration and it no longer equals the current epoch, the
+  // round outlived a shutdownAllCrons() — skip the sweep entirely so a
+  // stale round cannot revive pendingSweepTimers after teardown. When
+  // the option is absent, behave exactly as before.
+  const epoch = options.schedulerGeneration;
+  const epochStale = epoch !== undefined && epoch !== schedulerGeneration;
+  if (removed.length > 0 && !epochStale) {
     scheduleSweepTimer(runId);
   }
 }
@@ -1811,6 +1850,7 @@ export function shutdownAllCrons(): void {
   inFlightChildren.clear();
   inFlightJobs.clear();
   jobMetadata.clear();
+  schedulerGeneration++;
   if (count > 0) {
     logger.info("Shut down all cron jobs", { count });
   }
@@ -1989,6 +2029,11 @@ export function _pendingSweepTimerCount(): number {
 /** @internal — exposed for tests to check whether a timer is pending for a runId. */
 export function _hasPendingSweepTimer(runId: string): boolean {
   return pendingSweepTimers.has(runId);
+}
+
+/** @internal — exposed for tests to observe scheduler generation/epoch bumps. */
+export function _schedulerGeneration(): number {
+  return schedulerGeneration;
 }
 
 /** @internal — exposed for daemon reconciler. */
