@@ -1703,7 +1703,19 @@ export async function removeRunCrons(
   // Daemon-resident: only fires when the daemon tears down a run's
   // crons. One-shot, deduplicated per runId, unref-ed so empty event
   // loops exit without waiting.
-  scheduleSweepTimer(runId);
+  //
+  // Guard: only schedule a sweep when we actually tore down dispatch
+  // jobs for this run. This prevents late-arriving fire-and-forget
+  // executeDispatchRound calls (e.g. from nudgeScheduledRuns) from
+  // re-populating pendingSweepTimers after shutdownAllCrons has
+  // already cleared it — the source of an environment-dependent
+  // sweep-timer leak into downstream tests. All legitimate callers
+  // (explicit tear-down, dispatch-round run_not_running, control-plane
+  // terminate) have the run's jobs in jobMetadata at call time, so
+  // this condition always holds for them.
+  if (removed.length > 0) {
+    scheduleSweepTimer(runId);
+  }
 }
 
 /**

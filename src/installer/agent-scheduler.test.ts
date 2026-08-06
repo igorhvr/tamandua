@@ -427,8 +427,17 @@ describe("nudgeScheduledRuns", () => {
 // ── Sweep timer scheduling tests ───────────────────────────────────
 
 describe("removeRunCrons sweep timer scheduling", () => {
+  let tempHome: string;
+
+  beforeEach(() => {
+    tempHome = tamanduaTempDir("tamandua-sweep-");
+    process.env.TAMANDUA_STATE_DIR = path.join(tempHome, ".tamandua");
+  });
+
   afterEach(() => {
     shutdownAllCrons();
+    delete process.env.TAMANDUA_STATE_DIR;
+    fs.rmSync(tempHome, { recursive: true, force: true });
   });
 
   it("schedules a sweep timer when removeRunCrons is called", async () => {
@@ -506,14 +515,34 @@ describe("removeRunCrons sweep timer scheduling", () => {
   });
 
   it("does not schedule sweep timer when no jobs were removed", async () => {
-    // removeRunCrons on an unknown runId should still schedule a timer
-    // (the timer callback handles the "no worktree" case gracefully).
+    // removeRunCrons on an unknown runId must NOT schedule a timer: with
+    // no dispatch jobs torn down there is nothing to sweep. This guards
+    // against late-arriving fire-and-forget executeDispatchRound calls
+    // re-populating pendingSweepTimers after shutdownAllCrons cleared it.
     await removeRunCrons("no-such-run");
-    assert.equal(_pendingSweepTimerCount(), 1);
-    assert.equal(_hasPendingSweepTimer("no-such-run"), true);
+    assert.equal(_pendingSweepTimerCount(), 0);
+    assert.equal(_hasPendingSweepTimer("no-such-run"), false);
 
-    // Cleanup
+    // Cleanup (no-op here, asserts state remains clean)
     shutdownAllCrons();
     assert.equal(_pendingSweepTimerCount(), 0);
+  });
+
+  it("called twice for same runId schedules only one timer (second finds no jobs)", async () => {
+    const workflow = makeWorkflow();
+    const runId = "run-sweep-twice";
+
+    await setupAgentCrons(workflow, runId);
+
+    // First call tears down the run's dispatch jobs and schedules a sweep.
+    await removeRunCrons(runId);
+    assert.equal(_pendingSweepTimerCount(), 1);
+    assert.equal(_hasPendingSweepTimer(runId), true);
+
+    // Second call finds no remaining jobs (removed.length === 0), so it
+    // must not schedule (or re-schedule) a sweep timer.
+    await removeRunCrons(runId);
+    assert.equal(_pendingSweepTimerCount(), 1);
+    assert.equal(_hasPendingSweepTimer(runId), true);
   });
 });
