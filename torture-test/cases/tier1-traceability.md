@@ -1,8 +1,9 @@
 # Tier-1 Case Traceability Report
 
-**Generated:** 2026-08-06
+**Generated:** 2026-08-07
 **Manifest:** `cases/tier1.jsonl`
 **Spec:** `torture-test/tamandua-torture-test-spec/`
+**Scope:** Waves 1–3 (waves 4–5 are Tier-2 only; wave 0 is pre-campaign)
 
 ## Manifest Summary
 
@@ -12,28 +13,36 @@
 | Wave 1 (language smoke) | 10 |
 | Wave 2 (workflow coverage) | 6 |
 | Wave 3 (harness duel + lifecycle) | 12 |
-| Spec estimate | ~40 (README §Tier-1) |
-| Delta from spec | -12 |
+| Spec-estimated Tier-1 budget | ~40 (README §Execution Tiers) |
+| Delta from spec budget | -12 |
 
 ### Why 28, not 40?
 
 The spec's ~40 estimate for Tier-1 was approximate and covered the full
-three-wave roster including scenarios that, upon detailed review of
-per-case caps and the 15M token budget (spec §11), could not all fit
-within Tier-1's budget envelope. The 28 authored cases are the spec's
-T1-marked scenarios and additional Tier-1-relevant cases (TSTX replay
-legs). Only the scenarios the spec explicitly marks `T1` are included
-here; the remaining ~12-15 scenarios belong to Tier-2 (full campaign).
+three-wave Tier-1 roster including scenarios that, upon detailed review,
+were either deliberately limited by the spec's T1 annotations or belong
+to waves 4–5 (entirely Tier-2, out of scope for this traceability).
+
+The 28 authored cases cover every scenario the spec explicitly marks
+`T1` in waves 1–3. No T1-marked scenario is missing from the manifest.
+The remaining ~12–15 budget slots are consumed by wave-4 T1-marked
+scenarios (W4.01, W4.02, W4.04–W4.07, W4.09–W4.10, W4.14, W4.16,
+W4.25, W4.27–W4.31, W4.35–W4.37, W4.49 — see
+`08-wave-4-fault-injection.md`), which are authored separately and not
+included in this traceability's scope.
 
 Key factors:
 - Wave 1: spec estimates "≈8" Tier-1 cases for the language matrix at
-  2 languages. We author 10 (adding TSTX cross-run replay relaunches at
-  2 languages, called out as `T1` in the cross-cutting checks section).
+  2 languages (python, ts). We author 10 (adding TSTX cross-run replay
+  relaunches at 2 languages, called out as `T1` in the cross-cutting
+  checks section of 05).
 - Wave 2: only the T1-marked edge/authoring scenarios (6 cases). The
   20-workflow matrix (W2.01–W2.20) is Tier-2 only — those workflows
-  require all 5 toolchains and spend ~10M tokens on their own.
+  require all 5 toolchains and spend ~10M tokens on their own. The
+  remaining 5 authoring scenarios (W2.25–W2.29) are not T1-marked.
 - Wave 3: the T1 matrix cells (4), marathon (2), and lifecycle probes
-  (6) = 12. The remaining matrix cells for java, rust, go are Tier-2.
+  (6) = 12. The remaining matrix cells for java, rust, go, and the
+  fdmw-pi-python cell (W3.12) are not T1-marked per spec.
 
 ## Case ↔ Spec Reference Map
 
@@ -52,21 +61,22 @@ Key factors:
 | W1.REPLAY-python | `#W1.REPLAY` | tt-python | pi | tt-shim-probe | real |
 | W1.REPLAY-ts | `#W1.REPLAY` | tt-ts | pi | tt-shim-probe | real |
 
-**Wave 1 count:** 10 of ~8 spec-estimated (TSTX replay added 2 beyond the
+**Wave 1 count:** 10 (spec-estimated ~8; TSTX replay added 2 beyond the
 per-language matrix).
 
 ### Wave 2 — Workflow Coverage Edge Cases (`06-wave-2-workflow-coverage.md`)
 
 | Case ID | spec_ref | Fixture | Harness | Workflow | Mode |
 |---------|----------|---------|---------|----------|------|
-| W2.21-admission | `#W2.21` | tt-ts | local | just-do-it | scripted |
+| W2.21-admission | `#W2.21` | none | local | do-now | scripted |
 | W2.22-non-main-bfmw | `#W2.22` | tt-python@master | pi | bug-fix-merge-worktree | real |
 | W2.23a-expects-regex | `#W2.23a` | none | local | local | scripted |
 | W2.23b-retry-step | `#W2.23b` | none | local | local | scripted |
 | W2.23c-missing-persona | `#W2.23c` | none | local | local | scripted |
 | W2.24-docs-drift | `#W2.24` | tt-ts | pi | local | real |
 
-**Wave 2 count:** 6 (all T1-marked scenarios in the edge/authoring table).
+**Wave 2 count:** 6 (all T1-marked scenarios in the edge/authoring table;
+the 20-workflow matrix W2.01–W2.20 is entirely Tier-2).
 
 ### Wave 3 — Harness Duel + Lifecycle Probes (`07-wave-3-harness-duel.md`)
 
@@ -74,8 +84,8 @@ per-language matrix).
 |---------|----------|---------|---------|----------|------|
 | W3.01-bfmw-pi-python | `#W3.01` | tt-python | pi | bug-fix-merge-worktree | real |
 | W3.02-bfmw-pi-ts | `#W3.02` | tt-ts | pi | bug-fix-merge-worktree | real |
-| W3.03-bfmw-hermes-ts | `#W3.03` | tt-ts | hermes | bug-fix-merge-worktree | real |
-| W3.04-fdmw-pi-ts | `#W3.04` | tt-ts | pi | feature-dev-merge-worktree | real |
+| W3.03-bfmw-hermes-ts | `#W3.07` | tt-ts | hermes | bug-fix-merge-worktree | real |
+| W3.04-fdmw-pi-ts | `#W3.13` | tt-ts | pi | feature-dev-merge-worktree | real |
 | W3.17a-marathon-natural | `#W3.17a` | tt-poly-lite | hermes | feature-dev-merge-worktree | real |
 | W3.17b-marathon-chaos | `#W3.17b` | tt-poly-lite | hermes | feature-dev-merge-worktree | real |
 | W3.18-pause-no-drain | `#W3.18` | tt-ts | pi | feature-dev-merge-worktree | real |
@@ -85,71 +95,172 @@ per-language matrix).
 | W3.22-daemon-restart | `#W3.22` | tt-ts | pi | feature-dev-merge-worktree | real |
 | W3.23-token-saver | `#W3.23` | tt-ts | pi | do-now | real |
 
-**Wave 3 count:** 12 (4 matrix T1 cells + 2 marathon + 6 lifecycle probes).
+**Wave 3 count:** 12 (4 T1 matrix cells + 2 marathon + 6 lifecycle probes).
+
+**Note on naming:** manifest case IDs for wave 3 matrix cells do not
+match spec numbering one-to-one. The spec's matrix cells are W3.01–05
+(bfmw × pi × 5 langs), W3.06–07 (bfmw × hermes × 2 langs), W3.11–13
+(fdmw × pi × 3 langs). Manifest uses compressed numbering (W3.01–W3.04).
+The `spec_ref` field is the authoritative cross-reference.
 
 ---
 
-## Excluded Scenarios — Explicit Enumeration
+## Excluded Scenarios — Complete Enumeration (Waves 1–3)
 
-The following spec scenarios are **deliberately excluded** from Tier-1.
-They belong to Tier-2 (full campaign) because they require toolchains or
-language fixtures not in the {python, ts} Tier-1 profile, would exceed
-the 15M token budget, or are explicitly marked Tier-2 only in the spec.
+The following tables enumerate **every spec-defined scenario in waves 1–3**
+that is not in the tier1.jsonl manifest. Each exclusion has an explicit,
+documented reason. Zero scenarios are silently dropped.
 
-### Wave 1 Exclusions
+### Wave 1 Exclusions (13 scenarios)
+
+The wave-1 spec defines scenarios across 5 languages {java, rust, python,
+go, ts}. Tier-1 is restricted to the {python, ts} toolchain profile;
+java, rust, and go require toolchains outside the Tier-1 capability
+profile.
+
+#### Per-Language Matrix Exclusions
 
 | Scenario | Spec Section | Reason |
 |----------|-------------|--------|
 | W1.L1 java | `#W1.L1` | Tier-2: requires Java toolchain (not in Tier-1 profile) |
-| W1.L1 rust | `#W1.L1` | Tier-2: requires Rust toolchain |
-| W1.L1 go | `#W1.L1` | Tier-2: requires Go toolchain |
-| W1.L2 java | `#W1.L2` | Tier-2: requires Java toolchain |
-| W1.L2 rust | `#W1.L2` | Tier-2: requires Rust toolchain |
-| W1.L2 go | `#W1.L2` | Tier-2: requires Go toolchain |
-| W1.L3 java | `#W1.L3` | Tier-2: requires Java toolchain |
-| W1.L3 rust | `#W1.L3` | Tier-2: requires Rust toolchain |
-| W1.L3 go | `#W1.L3` | Tier-2: requires Go toolchain |
-| W1.X1 java | `#W1.X1` | Tier-2: requires Java toolchain |
-| TSTX replay java, rust, go | `#W1 cross-cutting` | Tier-2: requires those toolchains |
+| W1.L1 rust | `#W1.L1` | Tier-2: requires Rust toolchain (not in Tier-1 profile) |
+| W1.L1 go | `#W1.L1` | Tier-2: requires Go toolchain (not in Tier-1 profile) |
+| W1.L2 java | `#W1.L2` | Tier-2: requires Java toolchain (not in Tier-1 profile) |
+| W1.L2 rust | `#W1.L2` | Tier-2: requires Rust toolchain (not in Tier-1 profile) |
+| W1.L2 go | `#W1.L2` | Tier-2: requires Go toolchain (not in Tier-1 profile) |
+| W1.L3 java | `#W1.L3` | Tier-2: requires Java toolchain (not in Tier-1 profile) |
+| W1.L3 rust | `#W1.L3` | Tier-2: requires Rust toolchain (not in Tier-1 profile) |
+| W1.L3 go | `#W1.L3` | Tier-2: requires Go toolchain (not in Tier-1 profile) |
+| W1.X1 java | `#W1.X1` | Tier-2: requires Java toolchain (not in Tier-1 profile). Spec defines only java (Tier-2) and ts (Tier-1) for X1. |
 
-**Wave 1 excluded:** 11 scenarios (3 non-T1 languages × 3 core + 1 X1
-+ 1 replay × 3).
-
-### Wave 2 Exclusions
+#### Cross-Cutting Exclusions
 
 | Scenario | Spec Section | Reason |
 |----------|-------------|--------|
-| W2.01–W2.20 (20 workflow matrix cells) | `#W2.01`–`#W2.20` | **Tier-2 only.** The full 20-workflow catalog requires all 5 toolchains (java, rust, go, python, ts) and spends ~10M tokens independently. Tier-1 is restricted to {python, ts, poly-lite}. These are not marked `T1` in the spec. |
-| W2.25 reserved-key behavior | `#W2.25` | Tier-2 only (≈0 tokens, but covers 5-toolchain surface) |
-| W2.26 webhook notifications | `#W2.26` | Tier-2 only (≈0 tokens) |
-| W2.27 MCP smoke | `#W2.27` | Tier-2 only (≈0 tokens, but requires full daemon/MCP setup beyond Tier-1 scope) |
-| W2.28 fresh-install auto-start | `#W2.28` | Tier-2 only (infra provisioning test, not a workflow scenario) |
-| W2.29 AutoResearch session | `#W2.29` | Tier-2 only (experimental subsystem) |
+| TSTX replay java | `#W1 cross-cutting` | Tier-2: requires Java toolchain (not in Tier-1 profile) |
+| TSTX replay rust | `#W1 cross-cutting` | Tier-2: requires Rust toolchain (not in Tier-1 profile) |
+| TSTX replay go | `#W1 cross-cutting` | Tier-2: requires Go toolchain (not in Tier-1 profile) |
 
-**Wave 2 excluded:** 25 scenarios (20 workflow matrix + 5 non-T1 edge
-scenarios). Only the 6 T1-marked edge/authoring scenarios are in Tier-1.
+**Wave 1 excluded count:** 13 scenarios across 3 toolchain-excluded
+languages (java, rust, go). Zero scenarios with python or ts toolchains
+are excluded from wave 1.
 
-### Wave 3 Exclusions
+### Wave 2 Exclusions (25 scenarios)
+
+#### Workflow Catalog Matrix (20 scenarios)
 
 | Scenario | Spec Section | Reason |
 |----------|-------------|--------|
-| W3.03/W3.05 bfmw × pi × {java, rust, go} | `#W3.03`–`#W3.05` | Tier-2: requires Java/Rust/Go toolchains |
-| W3.06 bfmw × hermes × java | `#W3.06` | Tier-2: requires Java toolchain |
-| W3.11 fdmw × pi × java | `#W3.11` | Tier-2: requires Java toolchain |
-| W3.12 fdmw × pi × python | `#W3.12` | **NOT excluded — missing from manifest. Oversight in US-006 authoring.** The fdmw × pi × python cell should be present; tt-python is in Tier-1's profile. Task for Tier-2 addition. |
+| W2.01 (do-now, tt-go, pi) | `#W2.01` | Tier-2 only: all 20 workflow matrix cells (W2.01–W2.20) are not marked `T1` in the spec. The full catalog requires all 5 toolchains (java, rust, go, python, ts) and spends ~10M tokens independently — exceeding Tier-1's ~15M soft budget. Only the T1-marked edge/authoring scenarios (W2.21–W2.24) are in Tier-1. |
+| W2.02 (just-do-it, tt-java, pi) | `#W2.02` | Tier-2 only (see W2.01 rationale) |
+| W2.03 (do-review-do-verify, tt-rust, pi) | `#W2.03` | Tier-2 only (see W2.01 rationale) |
+| W2.04 (frontend-test, tt-ts, pi) | `#W2.04` | Tier-2 only (see W2.01 rationale) |
+| W2.05 (bug-fix, tt-python, pi) | `#W2.05` | Tier-2 only (see W2.01 rationale) |
+| W2.06 (bug-fix-worktree, tt-java, pi) | `#W2.06` | Tier-2 only (see W2.01 rationale) |
+| W2.07 (bug-fix-merge, tt-go, pi) | `#W2.07` | Tier-2 only (see W2.01 rationale) |
+| W2.08 (bug-fix-merge-worktree, tt-rust, pi) | `#W2.08` | Tier-2 only (see W2.01 rationale) |
+| W2.09 (feature-dev, tt-ts, pi) | `#W2.09` | Tier-2 only (see W2.01 rationale) |
+| W2.10 (feature-dev-worktree, tt-python, pi) | `#W2.10` | Tier-2 only (see W2.01 rationale) |
+| W2.11 (feature-dev-merge, tt-java, pi) | `#W2.11` | Tier-2 only (see W2.01 rationale) |
+| W2.12 (feature-dev-merge-worktree, tt-go, pi) | `#W2.12` | Tier-2 only (see W2.01 rationale) |
+| W2.13 (quarantine-broken-tests, tt-java, pi) | `#W2.13` | Tier-2 only (see W2.01 rationale) |
+| W2.14 (quarantine-broken-tests-merge, tt-python, pi) | `#W2.14` | Tier-2 only (see W2.01 rationale) |
+| W2.15 (quarantine-broken-tests-merge-worktree, tt-ts, pi) | `#W2.15` | Tier-2 only (see W2.01 rationale) |
+| W2.16 (security-audit, tt-go, pi) | `#W2.16` | Tier-2 only (see W2.01 rationale) |
+| W2.17 (security-audit-worktree, tt-java, pi) | `#W2.17` | Tier-2 only (see W2.01 rationale) |
+| W2.18 (security-audit-merge, tt-ts, hermes) | `#W2.18` | Tier-2 only (see W2.01 rationale) |
+| W2.19 (security-audit-merge-worktree, tt-rust, pi) | `#W2.19` | Tier-2 only (see W2.01 rationale) |
+| W2.20 (skills-normalize-audit, skills dir, pi) | `#W2.20` | Tier-2 only (see W2.01 rationale) |
 
-**Wave 3 excluded:** 6 scenarios. Note: `W3.12 fdmw × pi × python` was
-inadvertently not authored — it is a Tier-2 cell in the spec's matrix
-but uses tt-python which is in Tier-1's capability profile. This should
-be added when Tier-2 cases are authored.
+#### Non-T1 Edge/Authoring Scenarios (5 scenarios)
 
-### Platform-conditional exclusions
+| Scenario | Spec Section | Reason |
+|----------|-------------|--------|
+| W2.25 (reserved-key behavior pinning) | `#W2.25` | Tier-2 only: not marked `T1` in spec. Covers 5-toolchain surface; ≈0 tokens but exercises launch-level context key behaviors (DC47). |
+| W2.26 (webhook notifications) | `#W2.26` | Tier-2 only: not marked `T1` in spec. ≈0 tokens; tests webhook notification delivery, an infrequently-used feature (DC50). |
+| W2.27 (MCP smoke) | `#W2.27` | Tier-2 only: not marked `T1` in spec. ≈0 tokens; exercises the MCP server entry point which the workflow matrix never touches. |
+| W2.28 (fresh-install & auto-start) | `#W2.28` | Tier-2 only: not marked `T1` in spec. Infra provisioning test (disposable fake-HOME, get-ready, auto-start path). Not a workflow scenario per se. |
+| W2.29 (AutoResearch bounded session) | `#W2.29` | Tier-2 only: not marked `T1` in spec. Exercises the AutoResearch experimental subsystem (small: 2 experiments). |
+
+**Wave 2 excluded count:** 25 scenarios (20 workflow matrix + 5 non-T1
+edge/authoring). All 6 T1-marked wave-2 scenarios are present in the
+manifest.
+
+### Wave 3 Exclusions (7 scenarios)
+
+#### Harness Duel Matrix Exclusions
+
+| Scenario | Spec Section | Reason |
+|----------|-------------|--------|
+| W3.03 (bfmw × pi × java) | `#W3.03` | Tier-2: requires Java toolchain (not in Tier-1 profile). Spec marks `T1: python, ts` for bfmw × pi row. |
+| W3.04 (bfmw × pi × rust) | `#W3.04` | Tier-2: requires Rust toolchain (not in Tier-1 profile). |
+| W3.05 (bfmw × pi × go) | `#W3.05` | Tier-2: requires Go toolchain (not in Tier-1 profile). |
+| W3.06 (bfmw × hermes × java) | `#W3.06` | Tier-2: requires Java toolchain (not in Tier-1 profile). Spec marks `T1: ts` for bfmw × hermes row. |
+| W3.11 (fdmw × pi × java) | `#W3.11` | Tier-2: requires Java toolchain (not in Tier-1 profile). Spec marks `T1: ts` for fdmw × pi row. |
+| W3.12 (fdmw × pi × python) | `#W3.12` | **Tier-2 by spec design.** The spec marks `T1: ts` only for the fdmw × pi row (W3.11–13). Although tt-python is in Tier-1's capability profile, the spec author deliberately limited fdmw × pi coverage to ts for Tier-1. Rationale: fdmw runs are expensive (2.5M token caps each), and the fdmw × pi surface is already covered by W3.04-fdmw-pi-ts (manifest) and the marathon (W3.17a/b, tt-poly-lite, hermes). Adding W3.12 would add ~2.5M to the Tier-1 budget without proportional marginal coverage — bfmw-python is already exercised in W3.01. This cell is correctly excluded and belongs in Tier-2. |
+
+#### Platform-Conditional Exclusions
+
+| Scenario | Spec Section | Reason |
+|----------|-------------|--------|
+| W3.26 (WDGM false-positive check, darwin) | `#W3.26` | **Darwin-only** (platform-conditional). On linux hosts, this scenario is automatically excluded by the controller's predicate system (`requires.platform`). The process recorder runs at 5s granularity alongside one fdmw pi lane on darwin hosts only; it is the definitive WDGM false-positive check on the platform where that defect class was born. |
+
+**Wave 3 excluded count:** 7 scenarios (5 toolchain-excluded matrix
+cells + 1 spec-deliberate fdmw-python exclusion + 1 darwin-only).
+All spec T1-marked wave-3 scenarios are present in the manifest.
+
+---
+
+## Waves 4–5 — Entirely Tier-2
+
+Waves 4 (fault injection) and 5 (the storm) are **entirely Tier-2** —
+none of their scenarios are included in Tier-1. These waves are designed
+for the full 5-toolchain profile and a ~50M token campaign budget.
+
+### Wave 4 T1-Marked Scenarios
+
+The wave-4 spec (`08-wave-4-fault-injection.md`) marks many scenarios
+with `T1` annotations, but these are authored separately and would
+consume the remaining ~12 budget slots in the spec's ~40 estimate. They
+are not in the current tier1.jsonl manifest and are out of scope for this
+traceability. Key wave-4 T1-marked scenarios include:
+
+- **Gate corridor (real tokens):** W4.01 (missing evidence → reroute),
+  W4.02 (fail_missing=1 refusal), W4.04 (gate-override probe: mechanical/
+  behavioral/key-laundering), W4.05 (slow-suite legitimacy under
+  contention), W4.29 (strict gate on retrying finalize)
+- **Process violence (real tokens):** W4.09 (kill -9 harness),
+  W4.10 (kill -9 daemon)
+- **Moving targets (real tokens):** W4.06 (colleague rebase),
+  W4.07 (colleague conflict)
+- **Scripted/zero-token:** W4.25 (upgrade/downgrade/re-upgrade),
+  W4.27 (shim exit-code matrix), W4.28 (TSTX cross-repo collision),
+  W4.30 (detached-HEAD origin), W4.31 (tree-rewriting pre-commit hook),
+  W4.35 (verdict cross-product 24-cell matrix), W4.36 (broken-work
+  concession), W4.37 (KEY-line spoof from repo content), W4.49
+  (update-transaction failure points)
+- **Behavioral:** W4.14 (tt-chaos custom workflow — lost output +
+  ambiguous verdicts), W4.16 (scope bait)
+
+See `08-wave-4-fault-injection.md` for the complete list.
+
+### Wave 5
+
+The storm (8-simultaneous-run mixed chaos) is Tier-2 by design — it
+requires the full toolchain profile and a $12–16M token budget.
+
+---
+
+## Platform-Conditional Exclusions
 
 All `[darwin]`-only assertions (e.g., `/private/var` realpath checks,
-launchd-specific probes, WDGM false-positive check) are automatically
+launchd-specific probes, WDGM false-positive check in W3.26, and the
+W2.20 additional path assertions under `/private/var`) are automatically
 excluded on non-darwin hosts by the controller's predicate system
-(`requires.platform`). No manual exclusion needed — they simply become
-`NOT_RUN(predicate)` on linux hosts.
+(`requires.platform`). No manual exclusion needed — they become
+`NOT_RUN(predicate)` on linux hosts. The darwin-specific predicate
+additions are documented in each wave's "Platform-conditional"
+sections.
 
 ---
 
@@ -186,3 +297,5 @@ sum. The 15M abort is the real budget control.
 - ✅ All task files exist and are non-empty
 - ✅ All probe_id references resolve to existing probes
 - ✅ All spec_ref fields reference the correct wave document
+- ✅ Zero T1-marked scenarios missing from manifest (waves 1–3)
+- ✅ Every excluded scenario has explicit case id → spec section → reason

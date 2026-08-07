@@ -1,0 +1,10 @@
+{
+  "agents": {
+    "doer": {
+      "output": "STATUS: done\nREPORT: Hostile-expects test — deterministic pass.\n",
+      "tokens": 0
+    }
+  },
+  "heartbeatTokens": 0,
+  "defaultTokens": 0
+}

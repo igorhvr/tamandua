@@ -1,0 +1,10 @@
+{
+  "agents": {
+    "doer": {
+      "output": "STATUS: done\nCHANGES: Admission edge test — trivial do-now completion\nTESTS: Verified zero tokens",
+      "tokens": 0
+    }
+  },
+  "heartbeatTokens": 0,
+  "defaultTokens": 0
+}

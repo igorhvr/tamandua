@@ -1,0 +1,10 @@
+{
+  "agents": {
+    "doer": {
+      "output": "STATUS: done\nREPORT: Missing-persona test — deterministic pass. Persona files absent but scripted output satisfies expects.\n",
+      "tokens": 0
+    }
+  },
+  "heartbeatTokens": 0,
+  "defaultTokens": 0
+}

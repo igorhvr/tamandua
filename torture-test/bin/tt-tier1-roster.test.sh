@@ -313,22 +313,36 @@ if $all_ok; then
 fi
 
 # Check W2.21 admission case specifics
+# NOTE: W2.21 is a SCRIPTED (zero-token) admission case using harness 'local'
+# and workflow 'local' (it exercises admission edge through the scripted daemon,
+# not a real just-do-it run). O4 was removed from its oracles because O4 does not
+# exist as a CONTRACT oracle executable — scripted scenarios use [O1, O3z, O11].
+# See scenarios/w2.21/ and project history (US-002/US-005).
 total_count=$((total_count + 1))
 echo "--- Test: W2.21 admission edge case specifics ---" >&2
 w2_21_line=$(grep '"W2.21-admission"' "$MANIFEST")
 w2_21_wf=$(echo "$w2_21_line" | node -e "process.stdin.on('data',d=>{const j=JSON.parse(d);process.stdout.write(j.workflow||'');})" 2>/dev/null || true)
+w2_21_harness=$(echo "$w2_21_line" | node -e "process.stdin.on('data',d=>{const j=JSON.parse(d);process.stdout.write(j.harness||'');})" 2>/dev/null || true)
 w2_21_oracles=$(echo "$w2_21_line" | node -e "process.stdin.on('data',d=>{const j=JSON.parse(d);process.stdout.write(JSON.stringify(j.oracles||[]));})" 2>/dev/null || true)
 all_ok=true
-if [ "$w2_21_wf" != "just-do-it" ]; then
-  fail "W2.21: workflow is '$w2_21_wf', expected just-do-it"
+if [ "$w2_21_wf" != "local" ]; then
+  fail "W2.21: workflow is '$w2_21_wf', expected local (scripted admission case)"
   all_ok=false
 fi
-if echo "$w2_21_oracles" | grep -qv 'O4'; then
-  fail "W2.21: missing O4 (claim hygiene) in oracles"
+if [ "$w2_21_harness" != "local" ]; then
+  fail "W2.21: harness is '$w2_21_harness', expected local (scripted)"
+  all_ok=false
+fi
+if echo "$w2_21_oracles" | grep -q 'O4'; then
+  fail "W2.21: O4 present in oracles, but O4 is not a CONTRACT oracle (use O1/O3z/O11)"
+  all_ok=false
+fi
+if echo "$w2_21_oracles" | grep -qv 'O1'; then
+  fail "W2.21: missing O1 oracle"
   all_ok=false
 fi
 if $all_ok; then
-  pass "W2.21 admission case has just-do-it workflow + O4 oracle"
+  pass "W2.21 admission case is local/scripted with [O1,O3z,O11] oracles (no O4)"
 fi
 
 # Check W2.22 non-main bfmw case specifics
