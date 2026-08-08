@@ -7,6 +7,27 @@ contained Tamandua state, git plumbing, files, processes, and controller evidenc
 They MUST NOT read an agent response or interpret agent prose as a verdict. The
 controller intentionally supplies evidence references rather than response text.
 
+## Host adaptation (predicates / host profile)
+
+This contract governs the **single canonical host-adaptation representation**
+and forbids any divergent one. The authoritative statement lives in
+`tamandua-torture-test-spec/01-environment-and-isolation.md`; oracles that
+consume manifest `requires` predicates or the W0.0-emitted `host-profile.json`
+MUST follow it exactly:
+
+- A toolchain predicate is satisfied **iff** `host-profile.json` records
+  `toolchains.<name>.present === true` (Boolean leaf) using the profile's real
+  key names (`python3`, `node`, `go`, `rust/cargo`, `java+maven`). No
+  representation that reads toolchains as a flat boolean key
+  (e.g. `toolchains.python3 == true`) or otherwise diverges from the
+  Boolean-leaf/object shape is permitted here or in any case predicate.
+- `requires.capabilities` entries `pi`/`hermes` map to harness presence
+  recorded in the host profile (`harness.<name>.present`). W0.0 records
+  mechanical presence; it never installs.
+- An honestly-missing capability gates the case `NOT_RUN (predicate)` with
+  expected/observed evidence — it is never silently skipped and never a
+  failure.
+
 ## Discovery and invocation
 
 For each oracle ID in a case manifest, the controller looks for an executable

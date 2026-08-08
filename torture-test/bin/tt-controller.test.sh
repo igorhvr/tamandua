@@ -186,6 +186,24 @@ fs.writeFileSync(manifest, `${JSON.stringify(record)}\n`);
 NODE
 }
 
+write_local_predicate_case() {
+  local manifest="$1"
+  local id="$2"
+  node --input-type=module - "$manifest" "$id" <<'NODE'
+import fs from 'node:fs';
+const [manifest, id] = process.argv.slice(2);
+const record = {
+  id, wave: 0, workflow: 'local', fixture: 'none', harness: 'local',
+  task: 'tasks/W3.07.md', context: { execution_mode: 'scripted' },
+  caps: { tokens: 0, wall_min: 5 }, requires: { platform: 'darwin' },
+  boundary_files: [], forbidden: [], oracles: [], gates: [], chaos: null,
+  shed_ok: false, mandatory: true, class: 'verification',
+  command: { executable: 'node', args: ['-e', 'process.exit(0)'], cwd: '.' },
+};
+fs.writeFileSync(manifest, `${JSON.stringify(record)}\n`);
+NODE
+}
+
 write_scheduler_manifest() {
   local manifest="$1"
   local event_log="$2"
@@ -2055,6 +2073,150 @@ NODE
 [ ! -e "$predicate_sentinel" ] || fail "predicate-excluded case executed a hook"
 pass "failed and unavailable predicates persist terminal NOT_RUN evidence without executing hooks"
 
+# ── US-002: canonical boolean-leaf predicate contract ───────────────────
+# A toolchain predicate is satisfied iff the profile records
+# toolchains.<name>.present === true. buildPassed/testPassed are NOT
+# required for satisfaction (W0.0's --fast probes leave them null).
+boolean_leaf_profile="$TEST_ROOT/manifests/boolean-leaf-host-profile.json"
+cat > "$HOST_PROFILE" <<'JSON'
+{
+  "platform": {"os": "linux", "label": "linux"},
+  "containment": {"systemdUserScope": true, "procfs": true},
+  "toolchains": {
+    "node": {"present": true, "buildPassed": null, "testPassed": null},
+    "python3": {"present": true, "buildPassed": null, "testPassed": null}
+  },
+  "nodeRuntimes": [
+    {"version": "v24.0.0", "major": 24, "sqliteAvailable": true}
+  ]
+}
+JSON
+
+bool_leaf="$TEST_ROOT/manifests/boolean-leaf-eligible.jsonl"
+valid_case "BOOL-LEAF-ELIGIBLE" \
+  | sed 's/"requires":{"toolchains":\["node"\]}/"requires":{"toolchains":["node","python3"]}/' \
+  > "$bool_leaf"
+bool_leaf_output=$(run_recorded_campaign "$CONTROLLER" --manifest "$bool_leaf") || fail "present-only toolchain predicate failed: $bool_leaf_output"
+bool_leaf_id=$(remember_campaign "$bool_leaf_output")
+node --input-type=module - "$TT_DIR/var/results/$bool_leaf_id/state.json" <<'NODE'
+import fs from 'node:fs';
+const state = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const item = state.cases[0];
+if (item.reason?.category === 'predicate') {
+  throw new Error(`present-only toolchain with null build/test was spuriously blocked: ${JSON.stringify(item.reason)}`);
+}
+NODE
+pass "toolchain predicate satisfied on present=true alone (buildPassed/testPassed null)"
+
+# A toolchain recorded present=false is honestly absent -> NOT_RUN(predicate).
+cat > "$HOST_PROFILE" <<'JSON'
+{
+  "platform": {"os": "linux", "label": "linux"},
+  "containment": {"systemdUserScope": true, "procfs": true},
+  "toolchains": {
+    "node": {"present": false, "buildPassed": false, "testPassed": false}
+  },
+  "nodeRuntimes": [
+    {"version": "v24.0.0", "major": 24, "sqliteAvailable": true}
+  ]
+}
+JSON
+bool_leaf_absent="$TEST_ROOT/manifests/boolean-leaf-absent.jsonl"
+valid_case "BOOL-LEAF-ABSENT" > "$bool_leaf_absent"
+bool_leaf_absent_output=$(run_recorded_campaign "$CONTROLLER" --manifest "$bool_leaf_absent") || fail "absent toolchain predicate failed: $bool_leaf_absent_output"
+bool_leaf_absent_id=$(remember_campaign "$bool_leaf_absent_output")
+node --input-type=module - "$TT_DIR/var/results/$bool_leaf_absent_id/state.json" <<'NODE'
+import fs from 'node:fs';
+const state = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const item = state.cases[0];
+if (item.phase !== 'terminal' || item.outcome !== 'NOT_RUN' || item.reason?.category !== 'predicate') {
+  throw new Error(`absent toolchain case is not terminal NOT_RUN(predicate): ${JSON.stringify(item)}`);
+}
+const evidence = new Map(item.reason.evidence.map(entry => [entry.predicate, entry]));
+const entry = evidence.get('toolchains.node');
+if (!entry || entry.expected !== true
+    || !(entry.observed && entry.observed.present === false)) {
+  throw new Error(`wrong absent toolchain evidence: ${JSON.stringify(entry)}`);
+}
+NODE
+pass "present=false toolchain gates NOT_RUN(predicate) with expected/observed evidence"
+
+# ── US-002: pi/hermes capabilities resolve against harness presence ─────
+# requires.capabilities hermes/pi must resolve against harness.<name>.present
+# (canonical contract), so an honestly-present harness is not blocked and an
+# honestly-absent one still gates NOT_RUN(predicate) with evidence.
+cat > "$HOST_PROFILE" <<'JSON'
+{
+  "platform": {"os": "linux", "label": "linux"},
+  "containment": {"systemdUserScope": true, "procfs": true},
+  "toolchains": {
+    "node": {"present": true, "buildPassed": true, "testPassed": true}
+  },
+  "nodeRuntimes": [
+    {"version": "v24.0.0", "major": 24, "sqliteAvailable": true}
+  ],
+  "harness": {
+    "pi": {"present": true, "authenticated": null, "skipReason": "requires --spend"},
+    "hermes": {"present": true, "authenticated": null, "skipReason": "requires --spend"}
+  }
+}
+JSON
+hermes_present_eligible="$TEST_ROOT/manifests/harness-hermes-present-eligible.jsonl"
+valid_case "HERMES-PRESENT-ELIGIBLE" \
+  | sed 's/"requires":{"toolchains":\["node"\]}/"requires":{"toolchains":["node"],"capabilities":["hermes"]}/' \
+  > "$hermes_present_eligible"
+hermes_present_out=$(run_recorded_campaign "$CONTROLLER" --manifest "$hermes_present_eligible") || fail "present hermes capability failed: $hermes_present_out"
+hermes_present_id=$(remember_campaign "$hermes_present_out")
+node --input-type=module - "$TT_DIR/var/results/$hermes_present_id/state.json" <<'NODE'
+import fs from 'node:fs';
+const state = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const item = state.cases[0];
+if (item.reason?.category === 'predicate'
+    && item.reason?.evidence?.some(e => e.predicate === 'capabilities.hermes')) {
+  throw new Error(`honestly-present hermes capability was spuriously blocked: ${JSON.stringify(item.reason)}`);
+}
+NODE
+pass "hermes capability satisfied on harness.hermes.present===true (authenticated null)"
+
+# Honestly-absent harness (present=false) must still gate NOT_RUN(predicate).
+cat > "$HOST_PROFILE" <<'JSON'
+{
+  "platform": {"os": "linux", "label": "linux"},
+  "containment": {"systemdUserScope": true, "procfs": true},
+  "toolchains": {
+    "node": {"present": true, "buildPassed": true, "testPassed": true}
+  },
+  "nodeRuntimes": [
+    {"version": "v24.0.0", "major": 24, "sqliteAvailable": true}
+  ],
+  "harness": {
+    "hermes": {"present": false, "authenticated": false, "error": "hermes binary not found on PATH"}
+  }
+}
+JSON
+hermes_present_absent="$TEST_ROOT/manifests/harness-hermes-present-absent.jsonl"
+valid_case "HERMES-PRESENT-ABSENT" \
+  | sed 's/"requires":{"toolchains":\["node"\]}/"requires":{"toolchains":["node"],"capabilities":["hermes"]}/' \
+  > "$hermes_present_absent"
+hermes_present_absent_out=$(run_recorded_campaign "$CONTROLLER" --manifest "$hermes_present_absent") || fail "absent-present hermes capability failed: $hermes_present_absent_out"
+hermes_present_absent_id=$(remember_campaign "$hermes_present_absent_out")
+node --input-type=module - "$TT_DIR/var/results/$hermes_present_absent_id/state.json" <<'NODE'
+import fs from 'node:fs';
+const state = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const item = state.cases[0];
+if (item.phase !== 'terminal' || item.outcome !== 'NOT_RUN' || item.reason?.category !== 'predicate') {
+  throw new Error(`absent hermes case is not terminal NOT_RUN(predicate): ${JSON.stringify(item)}`);
+}
+const evidence = new Map(item.reason.evidence.map(entry => [entry.predicate, entry]));
+const entry = evidence.get('capabilities.hermes');
+if (!entry || entry.expected !== true || entry.observed !== false) {
+  throw new Error(`wrong absent hermes evidence: ${JSON.stringify(entry)}`);
+}
+NODE
+pass "honestly-absent hermes (present=false) gates NOT_RUN(predicate) with evidence"
+
+write_satisfying_host_profile
+
 profile_required="$TEST_ROOT/manifests/profile-required.jsonl"
 valid_case "PROFILE-REQUIRED" > "$profile_required"
 rm -f -- "$HOST_PROFILE"
@@ -2701,16 +2863,40 @@ for (const heading of ['SCENARIO OUTCOMES', 'SPEND LEDGER', 'NOT_RUN', 'FINDINGS
 NODE
 pass "terminal campaign writes self-contained report.json and report.txt"
 
+# A single REAL (hermes) case blocked by predicate while include-real is
+# requested is exactly the zero-real-launches vacuous-GREEN defect US-005
+# fixes: >0 real cases exist and 0 real cases launch, so the campaign must
+# fail closed (exit 2, INFRA_FAILURE) naming the cause — NOT report a generic
+# GREEN. The predicate NOT_RUN reason must still be recorded as evidence.
 report_predicate_manifest="$TEST_ROOT/manifests/report-predicate.jsonl"
 valid_case "REPORT-PREDICATE" | sed 's/"requires":{"toolchains":\["node"\]}/"requires":{"platform":"darwin"}/' > "$report_predicate_manifest"
 set +e
 report_predicate_output=$("$CONTROLLER" --manifest "$report_predicate_manifest" 2>&1)
 report_predicate_status=$?
 set -e
-[ "$report_predicate_status" -eq 0 ] || fail "predicate-only campaign exited $report_predicate_status: $report_predicate_output"
+[ "$report_predicate_status" -eq 2 ] || fail "real predicate-only campaign exited $report_predicate_status instead of 2 (fail-closed): $report_predicate_output"
 report_predicate_id=$(remember_campaign "$report_predicate_output")
 grep -Fq -- '- REPORT-PREDICATE: predicate' "$TT_DIR/var/results/$report_predicate_id/report.txt" \
   || fail "predicate NOT_RUN reason missing from report.txt"
+grep -Fq 'INFRA_FAILURE (exit 2)' "$TT_DIR/var/results/$report_predicate_id/report.txt" \
+  || fail "real predicate-blocked campaign did not fail closed: $report_predicate_output"
+grep -Fq 'Cause: include-real requested but zero real cases launched' "$TT_DIR/var/results/$report_predicate_id/report.txt" \
+  || fail "fail-closed report did not name the zero-real-launch cause"
+
+# A LOCAL (non-real) case blocked by predicate must NOT trigger fail-closed:
+# with zero real cases in the manifest, a predicate NOT_RUN stays GREEN exit 0.
+report_loc_predicate_manifest="$TEST_ROOT/manifests/report-local-predicate.jsonl"
+write_local_predicate_case "$report_loc_predicate_manifest" "REPORT-LOCAL-PREDICATE"
+set +e
+report_loc_predicate_output=$("$CONTROLLER" --manifest "$report_loc_predicate_manifest" 2>&1)
+report_loc_predicate_status=$?
+set -e
+[ "$report_loc_predicate_status" -eq 0 ] || fail "local predicate-only campaign exited $report_loc_predicate_status instead of 0: $report_loc_predicate_output"
+report_loc_predicate_id=$(remember_campaign "$report_loc_predicate_output")
+grep -Fq -- '- REPORT-LOCAL-PREDICATE: predicate' "$TT_DIR/var/results/$report_loc_predicate_id/report.txt" \
+  || fail "local predicate NOT_RUN reason missing from report.txt"
+grep -Fq 'GREEN (exit 0)' "$TT_DIR/var/results/$report_loc_predicate_id/report.txt" \
+  || fail "local predicate-blocked campaign unexpectedly failed closed"
 
 report_red_manifest="$TEST_ROOT/manifests/report-red.jsonl"
 write_local_case "$report_red_manifest" "REPORT-RED" real 0 7 "$TEST_ROOT/report-red-sentinel"

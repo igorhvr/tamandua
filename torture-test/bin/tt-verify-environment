@@ -1214,8 +1214,12 @@ function hermesStateDbPath() {
 }
 
 registerCheck('harness-pi', 'pi harness authenticated (1-prompt probe)', 'REQUIRED', 'harness', async () => {
+  // Record mechanical presence per the canonical contract (
+  // harness.<name>.present) regardless of --spend: spec 01 makes pi an
+  // operator-preconfigured harness — W0.0 records presence, never installs.
+  const present = !!binaryOnPath('pi');
   if (!OPT.spend) {
-    recordHostProfile('harness', 'pi', { authenticated: null, skipReason: 'requires --spend' });
+    recordHostProfile('harness', 'pi', { present, authenticated: null, skipReason: 'requires --spend' });
     return {
       result: 'SKIPPED',
       evidence: 'Harness auth probe requires --spend flag',
@@ -1227,7 +1231,7 @@ registerCheck('harness-pi', 'pi harness authenticated (1-prompt probe)', 'REQUIR
   // Find pi binary
   const piPath = binaryOnPath('pi');
   if (!piPath) {
-    recordHostProfile('harness', 'pi', { authenticated: false, error: 'pi binary not found on PATH' });
+    recordHostProfile('harness', 'pi', { present: false, authenticated: false, error: 'pi binary not found on PATH' });
     return {
       result: 'FAIL',
       evidence: 'pi binary not found on PATH',
@@ -1246,7 +1250,7 @@ registerCheck('harness-pi', 'pi harness authenticated (1-prompt probe)', 'REQUIR
 
     if (result.error) {
       const errMsg = result.error.message || String(result.error);
-      recordHostProfile('harness', 'pi', { authenticated: false, error: errMsg });
+      recordHostProfile('harness', 'pi', { present, authenticated: false, error: errMsg });
       return {
         result: 'FAIL',
         evidence: `pi probe spawn failed: ${errMsg}`,
@@ -1270,7 +1274,7 @@ registerCheck('harness-pi', 'pi harness authenticated (1-prompt probe)', 'REQUIR
 
     if (!usage) {
       const stderrSnippet = (result.stderr || '').substring(0, 200);
-      recordHostProfile('harness', 'pi', { authenticated: false, error: 'no message_end with usage found in pi output', stderr: stderrSnippet });
+      recordHostProfile('harness', 'pi', { present, authenticated: false, error: 'no message_end with usage found in pi output', stderr: stderrSnippet });
       return {
         result: 'FAIL',
         evidence: `pi probe completed but no token usage found in JSON stream (stderr: ${stderrSnippet || 'none'})`,
@@ -1286,6 +1290,7 @@ registerCheck('harness-pi', 'pi harness authenticated (1-prompt probe)', 'REQUIR
 
     if (totalTokens > 0) {
       recordHostProfile('harness', 'pi', {
+        present: true,
         authenticated: true,
         inputTokens,
         outputTokens,
@@ -1300,7 +1305,7 @@ registerCheck('harness-pi', 'pi harness authenticated (1-prompt probe)', 'REQUIR
     }
 
     // Zero tokens — harness is present but attributes 0 tokens
-    recordHostProfile('harness', 'pi', { authenticated: false, error: 'zero tokens', inputTokens: 0, outputTokens: 0 });
+    recordHostProfile('harness', 'pi', { present: true, authenticated: false, error: 'zero tokens', inputTokens: 0, outputTokens: 0 });
     return {
       result: 'FAIL',
       evidence: 'pi probe completed but attributed 0 tokens (unauthenticated or dry-run mode)',
@@ -1308,7 +1313,7 @@ registerCheck('harness-pi', 'pi harness authenticated (1-prompt probe)', 'REQUIR
       skipReason: null,
     };
   } catch (e) {
-    recordHostProfile('harness', 'pi', { authenticated: false, error: e.message });
+    recordHostProfile('harness', 'pi', { present, authenticated: false, error: e.message });
     return {
       result: 'FAIL',
       evidence: `pi probe error: ${e.message}`,
@@ -1319,8 +1324,11 @@ registerCheck('harness-pi', 'pi harness authenticated (1-prompt probe)', 'REQUIR
 });
 
 registerCheck('harness-hermes', 'hermes harness authenticated (1-prompt probe)', 'REQUIRED', 'harness', async () => {
+  // Record mechanical presence per the canonical contract (
+  // harness.<name>.present) regardless of --spend.
+  const present = !!binaryOnPath('hermes');
   if (!OPT.spend) {
-    recordHostProfile('harness', 'hermes', { authenticated: null, skipReason: 'requires --spend' });
+    recordHostProfile('harness', 'hermes', { present, authenticated: null, skipReason: 'requires --spend' });
     return {
       result: 'SKIPPED',
       evidence: 'Harness auth probe requires --spend flag',
@@ -1350,7 +1358,7 @@ registerCheck('harness-hermes', 'hermes harness authenticated (1-prompt probe)',
 
     if (result.error) {
       const errMsg = result.error.message || String(result.error);
-      recordHostProfile('harness', 'hermes', { authenticated: false, error: errMsg });
+      recordHostProfile('harness', 'hermes', { present, authenticated: false, error: errMsg });
       return {
         result: 'FAIL',
         evidence: `hermes probe spawn failed: ${errMsg}`,
@@ -1366,7 +1374,7 @@ registerCheck('harness-hermes', 'hermes harness authenticated (1-prompt probe)',
     if (!sessionMatch) {
       const stderrSnippet = (result.stderr || '').substring(0, 200);
       const stdoutSnippet = (result.stdout || '').substring(0, 200);
-      recordHostProfile('harness', 'hermes', { authenticated: false, error: 'no session_id in hermes output', stderr: stderrSnippet });
+      recordHostProfile('harness', 'hermes', { present, authenticated: false, error: 'no session_id in hermes output', stderr: stderrSnippet });
       return {
         result: 'FAIL',
         evidence: `hermes probe completed but no session_id found in output (stdout: ${stdoutSnippet || 'none'}, stderr: ${stderrSnippet || 'none'})`,
@@ -1380,7 +1388,7 @@ registerCheck('harness-hermes', 'hermes harness authenticated (1-prompt probe)',
     // Query state.db for token attribution
     const stateDbPath = hermesStateDbPath();
     if (!fs.existsSync(stateDbPath)) {
-      recordHostProfile('harness', 'hermes', { authenticated: false, error: `state.db not found at ${stateDbPath}`, sessionId });
+      recordHostProfile('harness', 'hermes', { present, authenticated: false, error: `state.db not found at ${stateDbPath}`, sessionId });
       return {
         result: 'FAIL',
         evidence: `hermes state.db not found at ${stateDbPath} (session ${sessionId})`,
@@ -1400,7 +1408,7 @@ registerCheck('harness-hermes', 'hermes harness authenticated (1-prompt probe)',
     });
 
     if (sqlResult.status !== 0 || !sqlResult.stdout?.trim()) {
-      recordHostProfile('harness', 'hermes', { authenticated: false, error: 'no session row in state.db', sessionId });
+      recordHostProfile('harness', 'hermes', { present, authenticated: false, error: 'no session row in state.db', sessionId });
       return {
         result: 'FAIL',
         evidence: `hermes session ${sessionId} not found in state.db (or sqlite3 query failed)`,
@@ -1416,6 +1424,7 @@ registerCheck('harness-hermes', 'hermes harness authenticated (1-prompt probe)',
 
     if (totalTokens > 0) {
       recordHostProfile('harness', 'hermes', {
+        present: true,
         authenticated: true,
         sessionId,
         inputTokens,
@@ -1431,7 +1440,7 @@ registerCheck('harness-hermes', 'hermes harness authenticated (1-prompt probe)',
     }
 
     // Zero tokens
-    recordHostProfile('harness', 'hermes', { authenticated: false, error: 'zero tokens', sessionId, inputTokens: 0, outputTokens: 0 });
+    recordHostProfile('harness', 'hermes', { present: true, authenticated: false, error: 'zero tokens', sessionId, inputTokens: 0, outputTokens: 0 });
     return {
       result: 'FAIL',
       evidence: `hermes session ${sessionId} attributed 0 tokens (unauthenticated or no model invocation)`,
@@ -1439,7 +1448,7 @@ registerCheck('harness-hermes', 'hermes harness authenticated (1-prompt probe)',
       skipReason: null,
     };
   } catch (e) {
-    recordHostProfile('harness', 'hermes', { authenticated: false, error: e.message });
+    recordHostProfile('harness', 'hermes', { present, authenticated: false, error: e.message });
     return {
       result: 'FAIL',
       evidence: `hermes probe error: ${e.message}`,

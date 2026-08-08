@@ -1079,6 +1079,103 @@ else
   fail "JSON missing test-required-fail as FAIL (REQUIRED)"
 fi
 
+# ── Test 14: US-003 — harness presence recording (no --spend) ─────────
+echo ""
+echo "--- Test: US-003 harness presence recording ---"
+
+# AC1: Running WITHOUT --spend writes host-profile.json with harness presence boolean leaves
+"$TOOL" --fast > /dev/null 2>&1 && : || :
+HP="${SCRIPT_DIR}/../var/w0/host-profile.json"
+if jq -e '.harness.pi.present | type == "boolean"' "$HP" > /dev/null 2>&1; then
+  pass "host-profile.json .harness.pi.present is a boolean leaf (no --spend)"
+else
+  fail "host-profile.json .harness.pi.present missing or not boolean (no --spend)"
+fi
+if jq -e '.harness.hermes.present | type == "boolean"' "$HP" > /dev/null 2>&1; then
+  pass "host-profile.json .harness.hermes.present is a boolean leaf (no --spend)"
+else
+  fail "host-profile.json .harness.hermes.present missing or not boolean (no --spend)"
+fi
+
+# Preserve existing harness section shape: pi/hermes objects with present alongside authenticated/skipReason
+if jq -e '.harness.pi | has("present") and (has("authenticated") or has("skipReason"))' "$HP" > /dev/null 2>&1; then
+  pass "harness.pi retains section shape (present + authenticated/skipReason)"
+else
+  fail "harness.pi section shape wrong (present should sit alongside authenticated/skipReason)"
+fi
+if jq -e '.harness.hermes | has("present") and (has("authenticated") or has("skipReason"))' "$HP" > /dev/null 2>&1; then
+  pass "harness.hermes retains section shape (present + authenticated/skipReason)"
+else
+  fail "harness.hermes section shape wrong (present should sit alongside authenticated/skipReason)"
+fi
+
+# AC2: presence reflects real binary resolution on the login-shell PATH
+pi_expected=$(command -v pi >/dev/null 2>&1 && echo true || echo false)
+hermes_expected=$(command -v hermes >/dev/null 2>&1 && echo true || echo false)
+pi_present=$(jq -r '.harness.pi.present' "$HP")
+hermes_present=$(jq -r '.harness.hermes.present' "$HP")
+if [ "$pi_present" = "$pi_expected" ]; then
+  pass "harness.pi.present reflects real binary resolution (${pi_present})"
+else
+  fail "harness.pi.present = ${pi_present}, expected ${pi_expected} (binary resolution)"
+fi
+if [ "$hermes_present" = "$hermes_expected" ]; then
+  pass "harness.hermes.present reflects real binary resolution (${hermes_present})"
+else
+  fail "harness.hermes.present = ${hermes_present}, expected ${hermes_expected} (binary resolution)"
+fi
+
+# AC4: toolchain section records present boolean leaves for each probed toolchain
+for tc in 'java+maven' 'rust/cargo' go python3 node; do
+  if jq -e ".toolchains.\"${tc}\".present | type == \"boolean\"" "$HP" > /dev/null 2>&1; then
+    pass "host-profile.json toolchains['${tc}'].present is a boolean leaf"
+  else
+    fail "host-profile.json toolchains['${tc}'].present missing or not boolean"
+  fi
+done
+
+# AC3: --spend still records authenticated and leaves presence booleans intact
+# (spends a small number of tokens on the live pi/hermes probes)
+spend_presence_json=$("$TOOL" --spend --json 2>&1) && : || :  # always succeeds
+if echo "$spend_presence_json" | jq -e '.hostProfile.harness.pi.present | type == "boolean"' > /dev/null 2>&1; then
+  pass "--spend leaves harness.pi.present intact (boolean after --spend)"
+else
+  fail "--spend dropped/overwrote harness.pi.present (presence leaf lost under --spend)"
+fi
+if echo "$spend_presence_json" | jq -e '.hostProfile.harness.hermes.present | type == "boolean"' > /dev/null 2>&1; then
+  pass "--spend leaves harness.hermes.present intact (boolean after --spend)"
+else
+  fail "--spend dropped/overwrote harness.hermes.present (presence leaf lost under --spend)"
+fi
+
+# When the binary is on PATH, --spend must NOT flip present to false
+if [ "$pi_expected" = "true" ]; then
+  if echo "$spend_presence_json" | jq -e '.hostProfile.harness.pi.present == true' > /dev/null 2>&1; then
+    pass "--spend keeps harness.pi.present=true (binary present on PATH)"
+  else
+    fail "--spend changed harness.pi.present away from true despite binary on PATH"
+  fi
+fi
+if [ "$hermes_expected" = "true" ]; then
+  if echo "$spend_presence_json" | jq -e '.hostProfile.harness.hermes.present == true' > /dev/null 2>&1; then
+    pass "--spend keeps harness.hermes.present=true (binary present on PATH)"
+  else
+    fail "--spend changed harness.hermes.present away from true despite binary on PATH"
+  fi
+fi
+
+# --spend records authenticated as a boolean or null (never drops the authenticated probe result)
+if echo "$spend_presence_json" | jq -e '(.hostProfile.harness.pi.authenticated | type == "boolean") or (.hostProfile.harness.pi.authenticated == null)' > /dev/null 2>&1; then
+  pass "--spend records harness.pi.authenticated (boolean or null) alongside present"
+else
+  fail "--spend harness.pi.authenticated not recorded or wrong type"
+fi
+if echo "$spend_presence_json" | jq -e '(.hostProfile.harness.hermes.authenticated | type == "boolean") or (.hostProfile.harness.hermes.authenticated == null)' > /dev/null 2>&1; then
+  pass "--spend records harness.hermes.authenticated (boolean or null) alongside present"
+else
+  fail "--spend harness.hermes.authenticated not recorded or wrong type"
+fi
+
 # ── Summary ───────────────────────────────────────────────────────────
 echo ""
 echo "========================================"

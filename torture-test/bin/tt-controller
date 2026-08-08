@@ -44,6 +44,38 @@ const DEFAULT_TOKEN_POLL_INTERVAL_MS = 5 * 60_000;
 const DEFAULT_PROVIDER_RETRY_BACKOFF_MS = 60_000;
 const EVIDENCE_LIMIT_BYTES = 16 * 1024 * 1024;
 const TERMINAL_RUN_STATUSES = new Set(['completed', 'done', 'failed', 'canceled']);
+// Zero-token dry-run hook for the real-launch path (US-006): when
+// TT_DRY_RUN_REAL_LAUNCH is set, the controller records the full launch argv
+// it WOULD hand to `tamandua` for each real (pi/hermes) case and marks the
+// case PASS without ever spawning the model-backed tamandua run. The variable's
+// value is the JSONL file to append records to (empty => default under var/).
+// Unset => exact prior behavior (no behavioral change).
+const DRY_RUN_REAL_LAUNCH_ENV = 'TT_DRY_RUN_REAL_LAUNCH';
+const DEFAULT_DRY_RUN_ARGV_PATH = path.join(VAR_ROOT, 'dry-run', 'launch-argv.jsonl');
+
+function dryRunRealLaunchOutPath() {
+  const value = process.env[DRY_RUN_REAL_LAUNCH_ENV];
+  if (value === undefined) return null;
+  return value === '' ? DEFAULT_DRY_RUN_ARGV_PATH : path.resolve(value);
+}
+
+function recordDryRunRealLaunch(caseRecord, argv) {
+  const outPath = dryRunRealLaunchOutPath();
+  if (outPath === null) return null;
+  fs.mkdirSync(path.dirname(outPath), { recursive: true, mode: 0o700 });
+  const record = {
+    recorded_at: utcTimestamp(),
+    case_id: caseRecord.id,
+    harness: caseRecord.harness,
+    workflow: caseRecord.workflow,
+    fixture: caseRecord.fixture,
+    task: caseRecord.task,
+    executable: 'tamandua',
+    argv,
+  };
+  fs.appendFileSync(outPath, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+  return outPath;
+}
 
 function resolveOraclesRoot() {
   const override = process.env.TT_CONTROLLER_SELF_TEST_ORACLES_ROOT;
@@ -508,8 +540,12 @@ function observedToolchain(profile, name) {
   };
 }
 
+// Canonical boolean-leaf contract (E2.2/US-002): a toolchain predicate is
+// satisfied iff the host profile records toolchains.<name>.present === true.
+// buildPassed/testPassed are NOT required for satisfaction (W0.0's --fast
+// probes leave them null). See case.schema.json predicates and spec 01.
 function toolchainSatisfied(observed) {
-  return isObject(observed) && observed.buildPassed === true && observed.testPassed === true;
+  return isObject(observed) && observed.present === true;
 }
 
 function observedContainment(profile, name) {
@@ -528,6 +564,20 @@ function observedNodeMajor(profile) {
   return majors.length === 0 ? null : Math.max(...majors);
 }
 
+// Harness presence per the canonical contract: a `pi`/`hermes` capability is
+// satisfied iff the profile records harness.<name>.present === true (W0.0
+// records mechanical presence; the live --spend probes additionally record
+// `authenticated`). For backward compatibility with pre-contract profiles we
+// also accept an explicitly-recorded `authenticated` boolean (true => present,
+// false => honestly absent). An unrecorded harness is honestly absent (null).
+function observedHarnessPresence(profile, name) {
+  const harness = profile.harness?.[name];
+  if (!isObject(harness)) return null;
+  if (typeof harness.present === 'boolean') return harness.present;
+  if (typeof harness.authenticated === 'boolean') return harness.authenticated;
+  return null;
+}
+
 function observedCapability(profile, name) {
   if (name === 'procfs') return observedContainment(profile, 'procfs');
   if (name === 'systemd-user-scope') return observedContainment(profile, name);
@@ -538,8 +588,8 @@ function observedCapability(profile, name) {
       .filter((available) => typeof available === 'boolean');
     return observations.length === 0 ? null : observations.some(Boolean);
   }
-  if (name === 'hermes') return profile.harness?.hermes?.authenticated ?? null;
-  if (name === 'pi') return profile.harness?.pi?.authenticated ?? null;
+  if (name === 'hermes') return observedHarnessPresence(profile, 'hermes');
+  if (name === 'pi') return observedHarnessPresence(profile, 'pi');
   if (Object.hasOwn(profile.capabilities ?? {}, name)) return profile.capabilities[name];
   const spawnClass = profile.spawnSpeedClass?.class;
   if (typeof spawnClass === 'string' && name === `spawn-${spawnClass}`) return true;
@@ -2656,6 +2706,23 @@ async function executeWorkflowCase(caseRecord, caseState, state, campaignDir) {
   caseState.attempts.push(attempt);
   state.updated_at = launchIntentTimestamp;
   atomicWriteState(campaignDir, state);
+
+  // Zero-token dry-run hook (US-006): when TT_DRY_RUN_REAL_LAUNCH is set,
+  // record the exact launch argv the scheduler would pass to `tamandua` for
+  // each real (non-scripted) case, then mark it PASS without spawning the
+  // model-backed run. Walled off: unset => previous behavior entirely.
+  if (attempt.execution_mode === 'real' && dryRunRealLaunchOutPath() !== null) {
+    const launchArgv = ['tamandua', ...workflowRunArgs(caseRecord)];
+    const outPath = recordDryRunRealLaunch(caseRecord, launchArgv);
+    attempt.phase = 'terminal';
+    attempt.terminal_at = utcTimestamp();
+    attempt.terminal_status = 'completed';
+    attempt.dry_run_launch = true;
+    attempt.dry_run_argv = launchArgv;
+    attempt.dry_run_argv_path = outPath;
+    persistMechanicalOutcome(caseState, attempt, state, campaignDir, 'PASS');
+    return;
+  }
 
   let childEnv;
   try {

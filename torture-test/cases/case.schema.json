@@ -77,6 +77,7 @@
     },
     "requires": {
       "type": "object",
+      "description": "CANONICAL HOST-ADAPTATION CONTRACT (predicates). Every entry is evaluated against the host capability profile emitted by W0.0 (tt-verify-environment) as host-profile.json. A predicate that the host cannot satisfy gates the case to outcome NOT_RUN (predicate) with evidence — it is never silently skipped and never a failure. See tamandua-torture-test-spec/01-environment-and-isolation.md and oracles/CONTRACT.md (host-adaptation note) for the single authoritative contract; every representation here MUST agree with the profile's real key names or the case drifts.",
       "additionalProperties": false,
       "properties": {
         "platform": {
@@ -94,6 +95,7 @@
         },
         "toolchains": {
           "type": "array",
+          "description": "CANONICAL CONTRACT: an ARRAY of toolchain names; each name is SATISFIED iff the host profile records `toolchains.<name>.present === true` (a Boolean leaf) using the profile's REAL key names (python3, node, go, rust/cargo, java+maven). buildPassed/testPassed (W0.0's --fast probes leave them null) are NOT required for a predicate to be satisfied. A missing/inactive toolchain gates the case NOT_RUN (predicate) with expected true / observed evidence — never silently skipped.",
           "minItems": 1,
           "uniqueItems": true,
           "items": {
@@ -102,6 +104,7 @@
         },
         "capabilities": {
           "type": "array",
+          "description": "CANONICAL CONTRACT: harness capabilities `pi` and `hermes` map to harness PRESENCE recorded in the host profile (harness.<name>.present Boolean leaf; spec 01 makes pi/hermes operator-preconfigured, so W0.0 RECORDS mechanical presence, never installs). Any other capability name is resolved against the profile per the same Boolean-leaf rule. An honestly-present capability must NOT be gated; an honestly-absent capability gates the case NOT_RUN (predicate) with expected/observed evidence.",
           "minItems": 1,
           "uniqueItems": true,
           "items": {

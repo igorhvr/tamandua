@@ -4,6 +4,8 @@ import { randomUUID } from 'node:crypto';
 
 import { OUTCOMES } from './tt-classification.mjs';
 
+const REAL_HARNESSES = new Set(['pi', 'hermes']);
+
 function clone(value) {
   return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
 }
@@ -64,7 +66,36 @@ function hasInfrastructureFailure(state) {
         || (result.status === 'VALID' && result.response?.result === 'ERROR')));
 }
 
+function isRealHarness(harness) {
+  return REAL_HARNESSES.has(harness);
+}
+
+function isRealMode(state) {
+  // Real-mode intent is signalled by execution_selection 'all' (the controller
+  // maps --include-real / no --scripted-only to 'all'; bare scripted-only runs
+  // persist execution_selection 'scripted-only'). Bare mode therefore never
+  // trips this check, preserving the pending-real GREEN semantics.
+  return (state?.options?.execution_selection ?? 'all') === 'all';
+}
+
+// When an include-real campaign was requested, >0 real (pi/hermes) cases exist
+// in the manifest, and yet zero real cases actually launched (every real case is
+// terminal without any execution round — predicate-blocked or otherwise
+// skipped), return a human-readable cause string. Otherwise return null. This is
+// the fail-closed guard against a vacuous GREEN for a real campaign that ran
+// nothing.
+export function zeroRealLaunchesCause(state) {
+  if (!isRealMode(state)) return null;
+  const realCases = (state?.cases ?? []).filter((item) => isRealHarness(item.harness));
+  if (realCases.length === 0) return null;
+  const realLaunched = realCases.filter((item) => (item.attempts ?? []).length > 0).length;
+  if (realLaunched > 0) return null;
+  return `include-real requested but zero real cases launched (${realCases.length} real pi/hermes cases in manifest, execution_selection=all, but no real launch recorded)`;
+}
+
 export function verdictExitCode(state) {
+  const failClosedCause = zeroRealLaunchesCause(state);
+  if (failClosedCause !== null) return { verdict: 'INFRA_FAILURE', exitCode: 2 };
   if (hasInfrastructureFailure(state)) return { verdict: 'INFRA_FAILURE', exitCode: 2 };
   const hasFinding = state.cases.some((item) =>
     !['PASS', 'NOT_RUN'].includes(item.outcome) || (item.findings ?? []).length > 0);
@@ -117,6 +148,7 @@ export function buildCampaignReport(state) {
     .filter((row) => row.outcome === 'NOT_RUN' && row.reason?.category !== 'pending-real')
     .map((row) => ({ id: row.id, wave: row.wave, class: row.class, reason: clone(row.reason) }));
   const verdict = verdictExitCode(state);
+  const failClosedCause = zeroRealLaunchesCause(state);
 
   return {
     version: 1,
@@ -140,6 +172,10 @@ export function buildCampaignReport(state) {
     findings,
     verdict: verdict.verdict,
     exit_code: verdict.exitCode,
+    fail_closed: {
+      triggered: failClosedCause !== null,
+      cause: failClosedCause,
+    },
   };
 }
 
@@ -208,7 +244,9 @@ export function renderCampaignReport(report) {
     '',
     'VERDICT',
     `${report.verdict} (exit ${report.exit_code})`,
-    '',
+    ...(report.fail_closed?.triggered && report.fail_closed.cause
+      ? [`Cause: ${report.fail_closed.cause}`, '']
+      : ['']),
   ].join('\n');
 }
 

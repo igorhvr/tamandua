@@ -13,12 +13,28 @@ What the spec DOES own is host *adaptation*:
 
 - **W0.0 emits `host-profile.json`** — platform (linux/darwin/other),
   init/containment facilities (systemd user scopes present or not),
-  toolchains that pass build+test, node runtimes present, procfs
+  toolchains, node runtimes present, procfs
   availability, process-spawn speed class, disk headroom.
-- **Every manifest case may carry a `requires` predicate** (platform
-  and/or capabilities). Cases the host cannot satisfy are recorded
-  `NOT_RUN (predicate)` — visible in the report, never silently skipped
-  and never a failure. `[darwin]`-tagged scenarios in the wave files are
+
+  **CANONICAL host-profile/predicate contract (the ONLY representation; never
+  diverge):** toolchains are recorded as an OBJECT keyed by the real
+  toolchain name (`python3`, `node`, `go`, `rust/cargo`, `java+maven`), and
+  each toolchain's entry carries a **Boolean `present` leaf**,
+  `toolchains.<name>.present === true` meaning the toolchain is available on
+  this host. Harness capabilities `pi`/`hermes` are RECORDED as mechanical
+  **presence** under `harness.<name>.present` (spec 01 makes pi/hermes
+  operator-preconfigured: W0.0 records presence, it never installs them;
+  the live `--spend` probes additionally record `authenticated` without
+  overwriting the presence leaf).
+- **Every manifest case may carry a `requires` predicate** (
+  `platform` and/or `toolchains` and/or `capabilities`). Each toolchain
+  predicate is satisfied **iff** `host-profile.json` records
+  `toolchains.<name>.present === true`; a `capabilities` predicate entry
+  (`pi`/`hermes`) is satisfied iff the profile records that harness's
+  presence. Cases the host cannot honestly satisfy are recorded
+  `NOT_RUN (predicate)` with expected/observed evidence — visible in the
+  report, never silently skipped
+  and never a failure. [darwin]-tagged scenarios in the wave files are
   exactly such predicates: the portability defect classes (DC30, DC44 —
   BSD userland, bash 3.2, `/var`→`/private/var` realpath, kernel-hidden
   env, launchd parenting, slow spawn, absent `/bin/false`) are real

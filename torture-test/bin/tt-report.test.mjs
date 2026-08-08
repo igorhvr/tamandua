@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { buildCampaignReport, renderCampaignReport, verdictExitCode, writeCampaignReports } from './tt-report.mjs';
+import { buildCampaignReport, renderCampaignReport, verdictExitCode, writeCampaignReports, zeroRealLaunchesCause } from './tt-report.mjs';
 
 const at = (seconds) => `2026-08-01T00:00:${String(seconds).padStart(2, '0')}.000Z`;
 
@@ -20,7 +20,8 @@ function attempt(id, outcome, started = 1, ended = 3) {
   };
 }
 
-function stateWith(cases, discoveredRuns = []) {
+function stateWith(cases, discoveredRuns = [], optionsOverrides = {}) {
+  const options = { concurrency: 2, stagger_ms: 100, token_poll_interval_ms: 300000, ...optionsOverrides };
   return {
     version: 1,
     campaign_id: 'campaign-report-test',
@@ -28,7 +29,7 @@ function stateWith(cases, discoveredRuns = []) {
     created_at: at(0),
     updated_at: at(9),
     manifest: { path: 'cases/test.jsonl', sha256: 'a'.repeat(64), case_count: cases.length, case_ids: cases.map((item) => item.id) },
-    options: { concurrency: 2, stagger_ms: 100, token_poll_interval_ms: 300000 },
+    options,
     spend: { tokens_observed: 17, observations: [{ run_id: 'run-root', observed_tokens: 17, observed_at: at(4) }] },
     cases,
     discovered_runs: discoveredRuns,
@@ -143,6 +144,70 @@ test('pending real cases are reported distinctly from other NOT_RUN cases', () =
   const text = renderCampaignReport(report);
   assert.match(text, /PENDING_REAL\n- pending-real: pending-real/);
   assert.match(text, /NOT_RUN\n- predicate: predicate/);
+});
+
+test('fail-closed: include-real with zero real launches returns INFRA_FAILURE exit 2 naming the cause', () => {
+  const real = caseState('W1.L1-python', 'NOT_RUN', {
+    harness: 'pi',
+    attempts: [],
+    reason: { category: 'predicate', evidence: [{ predicate: 'toolchains.python3', expected: true, observed: { present: false } }] },
+  });
+  const state = stateWith([real], [], { execution_selection: 'all' });
+
+  const cause = zeroRealLaunchesCause(state);
+  assert.ok(cause !== null, 'fail-closed cause must be present');
+  assert.match(cause, /zero real cases launched/);
+  assert.deepEqual(verdictExitCode(state), { verdict: 'INFRA_FAILURE', exitCode: 2 });
+
+  const report = buildCampaignReport(state);
+  assert.equal(report.exit_code, 2);
+  assert.equal(report.verdict, 'INFRA_FAILURE');
+  assert.equal(report.fail_closed.triggered, true);
+  assert.match(report.fail_closed.cause, /zero real cases launched/);
+  const text = renderCampaignReport(report);
+  assert.match(text, /VERDICT\nINFRA_FAILURE \(exit 2\)\nCause: include-real requested but zero real cases launched/);
+  assert.ok(!text.includes('GREEN (exit 0)'), 'zero real launches must not render a vacuous GREEN');
+});
+
+test('fail-closed: real-mode campaign with >=1 real launch stays GREEN', () => {
+  const launched = caseState('W1.L1-python', 'PASS', { harness: 'pi' });
+  const state = stateWith([launched], [], { execution_selection: 'all' });
+  assert.equal(zeroRealLaunchesCause(state), null);
+  assert.deepEqual(verdictExitCode(state), { verdict: 'GREEN', exitCode: 0 });
+});
+
+test('fail-closed: real-mode with no real cases in manifest stays GREEN', () => {
+  const local = caseState('local-only', 'PASS', { harness: 'local' });
+  const state = stateWith([local], [], { execution_selection: 'all' });
+  assert.equal(zeroRealLaunchesCause(state), null);
+  assert.deepEqual(verdictExitCode(state), { verdict: 'GREEN', exitCode: 0 });
+});
+
+test('fail-closed: bare scripted-only with pending-real cases stays GREEN exit 0', () => {
+  const pendingReal = caseState('W1.L1-python', 'NOT_RUN', {
+    harness: 'pi',
+    attempts: [],
+    reason: { category: 'pending-real' },
+  });
+  const state = stateWith([pendingReal], [], { execution_selection: 'scripted-only' });
+  assert.equal(zeroRealLaunchesCause(state), null);
+  assert.deepEqual(verdictExitCode(state), { verdict: 'GREEN', exitCode: 0 });
+  const report = buildCampaignReport(state);
+  assert.equal(report.exit_code, 0);
+  assert.equal(report.fail_closed.triggered, false);
+  assert.match(renderCampaignReport(report), /VERDICT\nGREEN \(exit 0\)\n$/);
+});
+
+test('fail-closed: a real launch that fails on infra still reports INFRA_FAILURE (not reclassified GREEN)', () => {
+  // A real case that attempted a launch and hit infra already fails closed via
+  // hasInfrastructureFailure; the zero-real-launch guard must not mask it.
+  const infra = caseState('W1.L1-python', 'TEST_INFRA_FAIL', {
+    harness: 'pi',
+    reason: { category: 'hook-failed' },
+  });
+  const state = stateWith([infra], [], { execution_selection: 'all' });
+  assert.equal(zeroRealLaunchesCause(state), null);
+  assert.deepEqual(verdictExitCode(state), { verdict: 'INFRA_FAILURE', exitCode: 2 });
 });
 
 test('writeCampaignReports uses only persisted state and atomically replaces deterministic reports', () => {
