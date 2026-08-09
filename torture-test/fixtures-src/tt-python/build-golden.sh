@@ -40,7 +40,10 @@ rm -rf "$GOLDEN_BARE"
 
 # ── Prepare work tree ──────────────────────────────────────────────
 # Copy fixture source excluding generated crud that shouldn't be committed
-# (.venv, mypy cache, bytecode, egg-info, pytest cache, flaky counter).
+# (.venv, mypy cache, bytecode, egg-info, pytest cache, flaky counter) plus
+# the inert operator junk (operator-notes.local), which spec 02 mandates be
+# PLANTED at instantiation and NEVER tracked — so it is excluded from the
+# golden commit and the provisioning adapter plants it as an untracked file.
 WORK_DIR="$(mktemp -d "$VAR_DIR/tmp.build-golden.XXXXXX")"
 cleanup_work() { rm -rf "$WORK_DIR"; }
 trap cleanup_work EXIT
@@ -52,6 +55,7 @@ rsync -a \
     --exclude='*.egg-info/' \
     --exclude='.pytest_cache/' \
     --exclude='.flaky_counter' \
+    --exclude='operator-notes.local' \
     "$FIXTURE_SRC/" "$WORK_DIR/"
 
 cd "$WORK_DIR"

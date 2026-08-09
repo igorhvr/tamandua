@@ -46,6 +46,18 @@
       "maxLength": 128,
       "pattern": "^[A-Za-z0-9][A-Za-z0-9._@-]*$"
     },
+    "seed": {
+      "description": "OPTIONAL immutable seed git ref the working fixture clone should land on. Holds a ref NAME (e.g. 'BUG-P1' or 'seed/storm' or 'broken-tests'), never a 'refs/...' prefix: the provisioning stage resolves a bare name by checking it out directly as given, and resolves a branch-style name (no 'seed/' prefix) onto the working clone's current branch. A seed ref reproduces the case's exact starting tree (green base + exactly one seeded defect) per spec 02-fixture-projects.md green-base + seed-ref discipline. Absent or null => provision from the fixture's green baseline.",
+      "anyOf": [
+        { "type": "null" },
+        {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9]([A-Za-z0-9._/-]*[A-Za-z0-9])?$"
+        }
+      ]
+    },
     "harness": {
       "enum": ["pi", "hermes", "scripted-pi", "scripted-hermes", "local"]
     },

@@ -695,7 +695,7 @@ echo "--- Phase 8: Hash stability ---"
 # Collect current hashes
 NEW_HASHES="$(mktemp "${TMPDIR:-/tmp}/.hashes-tt-poly-lite.XXXXXX")"
 {
-    echo "#baseline=$BASELINE_SHA"
+    echo "baseline=$BASELINE_SHA"
     for seed_id in "${PYTHON_SEED_REFS[@]}" "${TS_SEED_REFS[@]}"; do
         ref_sha="$(git --git-dir="$BARE_REPO" rev-parse "refs/heads/seed/$seed_id" 2>/dev/null || echo 'MISSING')"
         echo "seed/$seed_id=$ref_sha"

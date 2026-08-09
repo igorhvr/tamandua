@@ -289,6 +289,191 @@ sum. The 15M abort is the real budget control.
 
 ---
 
+## Seed-Ref Field (`seed`)
+
+Real-case fixture provisioning reproduces each case's **exact starting tree**
+by checking the working clone out onto an immutable **seed ref** — the
+fixture's green base plus exactly one seeded defect (spec
+`02-fixture-projects.md` §Green-base + seed-ref discipline). Semantics:
+
+- **Schema:** `seed` is an **optional, nullable** string in `case.schema.json`.
+  Absent or `null` ⇒ provision the working clone from the fixture's green
+  **baseline** (the default for do-now / feature-dev cases).
+- **Ref name, not a `refs/...` prefix:** the field holds a ref **name** such
+  as `BUG-P1` (a seed ref `seed/BUG-P1`), `seed/storm` (a composite seed ref),
+  or `broken-tests` (a direct branch). The provisioning stage resolves it onto
+  the working clone and ensures a real current branch (merge workflows need a
+  real branch as merge target, not a detached HEAD).
+- **Migration:** an existing bare-name ref `BUG-P1` is resolved as
+  `seed/BUG-P1`; a value already containing `/` (e.g. `seed/storm`,
+  `broken-tests`) is used as-is. The exact resolution rules live with the
+  provisioning adapter (E2.3) and spec `12-runner-automation.md`.
+- **Validation:** a non-null `seed` must match the ref-name regex
+  `^[A-Za-z0-9]([A-Za-z0-9._/-]*[A-Za-z0-9])?$` (alphanumerics, `.`, `_`, `/`,
+  `-`; may not begin with a digit-symbol or end in `/` or `.`). Malformed ref
+  names (bad characters, wrong shape) are **rejected fail-closed** by
+  `tt-controller --manifest ... --validate-only` before any launch, so a bad
+  seed can never silently fall back to the wrong starting tree.
+
+| Manifest | `seed` present | Validated |
+|----------|----------------|-----------|
+| tier1.jsonl (current) | no | ✅ |
+| any manifest | yes (valid ref name / null) | ✅ |
+| any manifest | yes (malformed ref name) | ❌ rejected |
+
+---
+
+## Golden Bare Bootstrap (`tt-golden-bootstrap`)
+
+Real-case provisioning (E2.3) clones working copies from
+`var/fixtures/golden/<fixture>.git`. The pipelined torture-test never built
+those golden bares — they were previously produced only by manual
+`build-golden.sh` runs. `bin/tt-golden-bootstrap.mjs` is the single,
+**fail-closed** bootstrap for a golden bare, and is both an importable module
+(consumed by the controller's real-case launch path) and a CLI.
+
+- **Absent golden** ⇒ runs `fixtures-src/<fixture>/build-golden.sh` (deterministic,
+  byte-stable hashes) to create the bare, then verifies the result against its
+  just-recorded hash ledger. A failed build or a bad result is reported, never
+  a silent half-launch.
+- **Present golden** ⇒ verifies it is a **valid bare git repo** whose every ref
+  matches its recorded hash ledger exactly, including the fixture's baseline
+  branch (`main`, or `master` for `tt-python@master`) pointing at the recorded
+  green baseline. Re-running is an idempotent **no-op** (never rewrites a valid
+  golden).
+- **Fail-closed:** a missing or malformed golden yields a **precise TEST_INFRA
+  reason** (e.g. `golden-not-bare-repo`, `golden-ref-mismatch`,
+  `golden-hash-file-missing`, `golden-baseline-branch-missing`) with the exact
+  ref/hash that diverged. A healthy host must never hit these.
+
+**Zero-token proof (US-002):** the golden *greenness* is established at build
+time by `build-golden.sh` (which runs the baseline suite and refuses to finish
+on a red tree); the bootstrap's present-golden gate verifies byte-for-byte
+against the same recorded hashes — it does not re-run the suite (zero tokens).
+
+Usage:
+
+```
+tt-golden-bootstrap --fixture <name> [--golden-dir <dir>] [--force] [--json]
+tt-golden-bootstrap --help
+```
+
+Exit codes: `0` golden OK; `1` fail-closed TEST_INFRA defect; `2` usage error.
+
+---
+
+## Fixture Work-Clone Provisioning (`tt-fixture-provision`)
+
+E2.3's root gap: the controller's real-case launch path passed
+`var/fixtures/work/<case-id>/<fixture>` to the harness as
+`--worktree-origin-repository` / `--working-directory-for-harness`, but NOTHING
+created that working clone — the first genuine real launch went terminal
+`TEST_INFRA_FAIL` with `ENOENT` (an argv-recording stub proof never lstats the
+path, so it could not catch this). `bin/tt-fixture-provision.mjs` is the
+standalone, **fail-closed** adapter that provisions a pristine working clone. It
+is both an importable module (consumed by the controller's real-case launch path
+in US-004) and a CLI.
+
+Given a verified golden bare (via `tt-golden-bootstrap`), a case's work dir, and
+seed-or-baseline, it:
+
+- **(a)** creates a **fresh clone** of `var/fixtures/golden/<fixture>.git` into
+  `var/fixtures/work/<case-id>/<fixture>`, wiping any previous clone first (a
+  re-provision is always **clean** — an attempt N+1 / rugpull replacement never
+  inherits a dirtied clone);
+- **(b)** checks out the case's **seed ref** (`seed/<ID>` per the manifest `seed`
+  field) **or** the green **baseline** onto a real current **named branch** —
+  never detached HEAD, so merge workflows have a real merge target. Seed refs
+  that live on tags get a fresh named branch (`seed-<ID>`) created at that
+  commit; seed refs that live on branches checkout that branch directly;
+  baseline cases stay on the fixture's baseline branch (`main`, or `master` for
+  `tt-python@master`).
+- **(c)** applies per-fixture working-state / junk preparation per spec 02:
+  plants the inert `operator-notes.local` (present + untracked + byte-identical
+  to the fixture source), and for the tt-python do-now path pre-bootstraps the
+  `.venv` (runs `./bootstrap`) and regenerates junk (`__pycache__/`,
+  `.pytest_cache/`) as untracked files. `--arming prebootstrapped` is the
+do-now default; `--arming raw` defers bootstrap/junk to a full-chain
+workflow's own setup step.
+
+A provision failure yields a **precise TEST_INFRA reason** (fail-closed):
+`unknown-fixture`, `seed-unknown`, `git-clone-failed`, `git-checkout-seed-failed`,
+`clone-detached-head`, `golden-not-bare-repo`, `operator-notes-tracked`,
+`fixture-operator-notes-unverifiable`,
+`fixture-bootstrap-failed`, `fixture-junk-tracked`, and the golden-bootstrap
+family. On a healthy host these are never reached.
+
+**Controller wiring (US-004):** the controller's real-case launch path
+(`executeWorkflowCase`) runs `provisionWorkClone` as a **mandatory stage BEFORE**
+the workflow launch builds `workflowRunArgs` (and before the zero-token
+dry-run argv capture), so the path handed to `--worktree-origin-repository` /
+`--working-directory-for-harness` always exists and always equals the
+provisioned clone path exactly. It runs on **every** attempt — `provisionWorkClone`
+wipes any prior clone first, so an attempt N+1 (retry/rugpull replacement) is a
+**clean re-provision** and never inherits a dirtied clone. A provision failure
+persists `TEST_INFRA_FAIL` with the precise adapter category/reason (fail-closed)
+and short-circuits before the launch.
+
+The runtime teardown policy (keep failed-case clones for evidence, prune
+passed-case clones after oracle harvest) is declared in US-005 / spec 11–12.
+
+Usage:
+
+```
+tt-fixture-provision --fixture <name> --case-id <id> [--seed <id>] [--arming prebootstrapped|raw] \
+                     [--golden-dir <dir>] [--work-dir <dir>] [--force] [--json]
+tt-fixture-provision --help
+```
+
+Exit codes: `0` provisioned OK; `1` fail-closed TEST_INFRA defect; `2` usage
+error.
+
+---
+
+## Working-Clone Teardown Policy (`tt-teardown`)
+
+Spec 11 (schedule/budget/abort) and spec 12 (runner automation) are **silent**
+on whether a terminal case's provisioned working clone
+(`var/fixtures/work/<case-id>/<fixture>`) should be retained as evidence or
+pruned after terminalization. US-005 adopts and **declares** an explicit policy
+(module `tt-teardown.mjs`, constant `DECLARED_TEARDOWN_POLICY`):
+
+| Terminal outcome | Action | Rationale |
+|---|---|---|
+| `PASS` | **PRUNE** the work clone (after oracle harvest) | A harvested PASS clone carries only deterministic arming junk and no failure forensics; retaining it would accumulate `<case-count>` full clones under `var/fixtures/work/` for zero evidentiary value. |
+| every other outcome (`PRODUCT_FAIL`, `AGENT_FLAKE`, `PROVIDER_FAIL`, `TEST_INFRA_FAIL`, `INVALID`, `INCONCLUSIVE`, `NOT_RUN`) | **KEEP** the work clone | A FAILED case's working tree is ITSELF the evidence of its terminal failure state (spec 11's evidence-capture-before-destruction: never destroy evidence that could explain a failure). Re-provisioning reconstructs the starting tree, not the failure state. |
+
+Every teardown decision is **recorded** (case id, terminal outcome, kept/pruned
+action, work clone path, UTC timestamp) as `<case>.teardown` in
+`results/state.json` **and** surfaced in the campaign report (the `RUN TEARDOWN
+(US-005)` section of `report.txt` plus the `teardown_decisions` ledger in
+`report.json`; each report row also carries the case's `teardown` record).
+
+Teardown runs at terminalization from the controller's single
+`markTerminal` choke point, **after** oracles have already harvested their
+evidence (oracle snapshot/collection completes before `markTerminal`). It only
+ever touches a clone a case actually provisioned (a provisioned path recorded on
+an attempt) — cases that never provisioned (NOT_RUN / pending-real /
+predicate-excluded, or a provision-failure) are left completely untouched (no
+record, no filesystem action). Provider-retry scheduling returns before
+`markTerminal`, so teardown only runs on the final, genuinely-terminal outcome.
+
+The adapter is a standalone importable module AND a thin CLI
+(`tt-teardown --case-id <id> --outcome <outcome> [--work-clone-path <path>]`);
+it is idempotent (pruning an already-missing clone is a no-op) and its record
+reflects physical reality via `existed` / `pruned` / `kept`.
+
+Usage:
+
+```
+tt-teardown --case-id <id> --outcome <outcome> [--work-clone-path <path>] [--json]
+tt-teardown --help
+```
+
+Exit codes: `0` policy applied (decision recorded); `2` usage error / caller bug.
+
+---
+
 ## Validation Status
 
 - ✅ `tt-controller --manifest cases/tier1.jsonl --validate-only` exits 0
@@ -299,3 +484,73 @@ sum. The 15M abort is the real budget control.
 - ✅ All spec_ref fields reference the correct wave document
 - ✅ Zero T1-marked scenarios missing from manifest (waves 1–3)
 - ✅ Every excluded scenario has explicit case id → spec section → reason
+- ✅ `seed` field is optional/nullable and validated per ref-name regex (see Seed-Ref Field)
+- ✅ `tt-golden-bootstrap --fixture tt-python` builds/verifies the golden bare
+  (see Golden Bare Bootstrap); re-runs are idempotent no-ops; malformed goldens
+  fail-closed with a precise TEST_INFRA reason
+- ✅ `tt-fixture-provision --fixture tt-python --case-id <id>` provisions a
+  clean work clone at `var/fixtures/work/<id>/tt-python` on a non-detached named
+  branch (seed or baseline), with operator junk + bootstrapped venv + regenerated
+  junk (see Fixture Work-Clone Provisioning); unknown fixtures/seeds fail-closed
+- ✅ Controller real-case launch (US-004) provisions the work clone as a
+  mandatory stage before building `workflowRunArgs`; the recorded launch argv
+  fixture path equals the provisioned clone path exactly; a provision failure
+  persists `TEST_INFRA_FAIL` with the precise adapter category (fail-closed);
+  per-attempt re-provision is always clean (see Fixture Work-Clone Provisioning)
+- ✅ Terminal-case teardown (US-005) applies the DECLARED policy
+  (`tt-teardown`): PASS prunes the harvested clone, every failure outcome keeps
+  it as evidence; every decision is recorded to `results/state.json` (`<case>.teardown`)
+  and surfaced in the campaign report; cases that never provision a clone are
+  untouched (see Working-Clone Teardown Policy)
+- ✅ `tt-controller --case <id>` (US-006) selects exactly ONE manifest case id
+  for focused reruns (validate-only, new campaign, and resume paths). An
+  unknown id fails fast (exit 2) with a message listing the available ids; it
+  combines with `--scripted-only` and with the default include-real (all)
+  execution selection; `--help` documents the flag. Wired through `tt-run`
+  as `run-torture-test --tier0/--tier1 [--include-real] --case <id>`.
+- ✅ The `TT_DRY_RUN_REAL_LAUNCH` hook (US-007) records the captured launch
+  argv WITH the E2.3-proof: it lstats the provisioned work clone at
+  argv-capture time and embeds `work_clone { path, existed, is_directory,
+  size, lstat_error }` in the argv record, so a zero-token dry run proves the
+  clone physically existed before launch (closing the original stub's blind
+  spot — a stub that never lstats the path cannot surface the ENOENT).
+- ✅ `tier1-fixture-probe.test.ts` (US-007) asserts end-to-end that a real
+  case's dry-run launch record proves the provisioned clone existed at
+  argv-capture time and that the argv fixture path equals the clone path.
+- ✅ Built-in golden hash-ledger fix (US-007, infra): the tt-poly / tt-poly-lite
+  `build-golden.sh` scripts wrote `#baseline=<sha>` (commented-out) instead of
+  `baseline=<sha>`, which `tt-golden-bootstrap.parseHashFile` could not read —
+  it surfaced as `golden-hash-file-malformed` ("no baseline or no seed/ref
+  entries") for the W3.17a/b `tt-poly-lite` real cases. Both scripts now emit
+  the uncommented `baseline=` line; the tt-poly-lite golden was deterministically
+  rebuilt (all refs byte-identical) and the include-real scripted tier1 proof
+  is GREEN again.
+- ✅ **REAL single-case integration proof (US-008, token-bearing)** — one
+  W1.L1-python case executed end-to-end via
+  `tt-controller --manifest cases/tier1.jsonl --case W1.L1-python` (pi harness,
+  do-now on tt-python, caps tokens 200000 / wall_min 5). Authoritative campaign:
+  `campaign-20260808T102346890Z-...` — TOKENS observed 19507 (>0),
+  `TEST_INFRA_FAIL=0`, NO `scheduler-execution-failed`, NO `ENOENT lstat` in any
+  evidence file; the work clone was provisioned before launch and the real pi
+  workflow ran to completion and committed valid work; O3z & O11 PASS (token
+  attribution reconciled); evidence dirs complete for all configured oracles
+  (O1, O3z, O8, O11). Validated by `self-tests/tier1-real-case-proof.test.ts`.
+  The real run also exposed & fixed (all within torture-test/) latent
+  oracle/harness-infra defects only a REAL armed clone exercises — see the
+  US-008 record in the run progress log (async token settle, O8 tracked-tree +
+  rebase + mode-semantics reconciliation, DB-schema + workflow-catalog
+  prerequisites, O11 telemetry calibration).
+- ✅ US-008 residual (honest, by design): O8_SEEDED_TEST_CHANGED fires because
+  the W1.L1 do-now task extends the pre-seeded `tests/test_dates.py` (pinned by
+  the O8 self-test). The run is otherwise clean (PRODUCT_FAIL exit 1 with a
+  single named finding) — a documented fixture/oracle design tension, not an
+  E2.3 or tamandua defect.
+- ✅ US-009: bare `./run-torture-test --tier1` (zero-token pending-real
+  semantics) executed twice consecutively on a clean, quiescent host — BOTH
+  exited GREEN (verdict GREEN, exit 0, tokens_observed 0), every real Tier-1
+  case `pending-real`, every scripted case `PASS`. Repeatability is pinned by
+  `self-tests/tier1-repeatability.test.ts`. Hygiene sweep post-run: git tree
+  clean, `var/` gitignored, scripted daemon STOPPED, TT ports free, no leaked
+  controller/recorder/daemon/hook/scenario processes. The US-008 tamandua
+  observations are recorded as collected findings (no product fix) in
+  `impl-tasks/E2.3-fixture-work-clone-provisioning.md` §Findings.

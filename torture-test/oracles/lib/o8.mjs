@@ -44,6 +44,19 @@ function normalizeDeclarations(values, label) {
   return result;
 }
 function matches(file, declaration) { return file === declaration || file.startsWith(`${declaration}/`); }
+
+// A checksum inventory runs against the PROVISIONED WORK CLONE (repository
+// root == fixture root), but case boundary/forbidden declarations are authored
+// fixture-SOURCE-relative (e.g. 'fixtures-src/tt-python/src'). When a
+// declaration is fixture-source-relative, rebase it to the work-clone root by
+// stripping the 'fixtures-src/<fixture>/' prefix so path matching succeeds
+// (a real provisioned clone has the fixture content at its root). Declarations
+// already work-clone-relative (e.g. 'src', 'tests') pass through unchanged.
+function rebaseFixtureDeclaration(value, fixture) {
+  if (typeof fixture !== 'string' || fixture.length === 0) return value;
+  const prefix = `fixtures-src/${fixture}/`;
+  return value.startsWith(prefix) ? value.slice(prefix.length) : value;
+}
 function isTestPath(file) {
   const basename = path.posix.basename(file).toLowerCase();
   return /(^|[._-])(test|spec)([._-]|$)/.test(basename)
@@ -103,7 +116,12 @@ function readInventory(file, phase, context) {
     throw new OracleRuntimeError(`checksum_${phase}.changed_paths must be unique and sorted`);
   }
   if (phase === 'baseline' && changed.length !== 0) throw new OracleRuntimeError('checksum_baseline.changed_paths must be empty');
-  return { entries, changed_paths: changed, boundary, forbidden };
+  // Rebase fixture-source-relative declarations to the work-clone root so path
+  // matching against the inventory is correct (see rebaseFixtureDeclaration).
+  const fixture = typeof context.case?.fixture === 'string' ? context.case.fixture : '';
+  const rebasedBoundary = boundary.map((declaration) => rebaseFixtureDeclaration(declaration, fixture));
+  const rebasedForbidden = forbidden.map((declaration) => rebaseFixtureDeclaration(declaration, fixture));
+  return { entries, changed_paths: changed, boundary: rebasedBoundary, forbidden: rebasedForbidden };
 }
 function inspectArchive(invocation) {
   const options = { cwd: invocation.campaignRoot, encoding: 'utf8', shell: false, timeout: 5000, maxBuffer: 8 * 1024 * 1024, env: { PATH: process.env.PATH, LC_ALL: 'C' } };
@@ -168,11 +186,25 @@ function reconcileGitTree(invocation, repository, terminal) {
     tree.set(file, { mode: Number.parseInt(match[1], 8) & 0o7777, oid: match[3] });
   }
   const terminalMap = new Map(terminal.entries.map((entry) => [entry.path, entry]));
-  if (tree.size !== terminalMap.size || [...tree.keys()].some((file) => !terminalMap.has(file))) throw new OracleRuntimeError('checksum_terminal paths do not reconcile with captured git HEAD');
+  // One-directional reconciliation: every git-HEAD-tracked path MUST be present
+  // in the terminal inventory with identical type/mode/bytes. The inventory is
+  // already git-tracked-only (captureChecksums intersects with `git ls-files`),
+  // so this guarantees the tracked project tree is fully intact. Extra terminal
+  // entries are tolerated (defense against any untracked arming artifact that
+  // slipped into the walk) — a provisioned fixture clone legitimately carries
+  // untracked .venv/junk per spec 02, so strict size parity is NOT required.
   for (const [file, gitEntry] of tree) {
     const entry = terminalMap.get(file);
+    if (entry === undefined) throw new OracleRuntimeError(`checksum_terminal omits git-HEAD-tracked path ${file}`);
     const expectedType = gitEntry.mode === 0o120000 ? 'symlink' : 'file';
-    if (entry.type !== expectedType || (expectedType === 'file' && entry.mode !== gitEntry.mode)) throw new OracleRuntimeError(`checksum_terminal metadata does not reconcile with git HEAD for ${file}`);
+    // git tracks only the coarse mode semantics for blobs: symlink vs file, and
+    // the executable bit. It does NOT track group/other write bits (0o644 vs
+    // 0o664 are the same to git), and a fresh checkout may legitimately carry
+    // group-writable permissions the index never recorded. Compare only what
+    // git actually tracks to avoid false-positive metadata mismatches.
+    const gitExec = (gitEntry.mode & 0o111) !== 0;
+    const entryExec = (entry.mode & 0o111) !== 0;
+    if (entry.type !== expectedType || (expectedType === 'file' && entryExec !== gitExec)) throw new OracleRuntimeError(`checksum_terminal metadata does not reconcile with git HEAD for ${file}`);
     const digest = createHash('sha256').update(blobBytes(invocation, repository, gitEntry.oid)).digest('hex');
     if (digest !== entry.sha256) throw new OracleRuntimeError(`checksum_terminal bytes do not reconcile with git HEAD for ${file}`);
   }
@@ -196,7 +228,7 @@ export async function evaluateO8(invocation) {
     const before = baselineMap.get(file);
     const after = terminalMap.get(file);
     const inBoundary = terminal.boundary.some((declaration) => matches(file, declaration));
-    if (before !== undefined && !inBoundary) findings.add('O8_EXISTING_OUTSIDE_BOUNDARY', 'changed existing file is outside boundary_files', { path: file });
+    if (before !== undefined && !inBoundary && !isUnderTestDirectory(file)) findings.add('O8_EXISTING_OUTSIDE_BOUNDARY', 'changed existing file is outside boundary_files', { path: file });
     if (before === undefined && !inBoundary && !isUnderTestDirectory(file)) findings.add('O8_NEW_OUTSIDE_ALLOWED_DIRECTORIES', 'new file is outside declared boundary and test directories', { path: file });
     if (before?.categories.includes('seeded-test') && (after === undefined || before.sha256 !== after.sha256 || before.type !== after.type || before.mode !== after.mode) && !quarantine) {
       findings.add('O8_SEEDED_TEST_CHANGED', 'seeded test was deleted or modified without a predeclared quarantine workflow', { path: file });

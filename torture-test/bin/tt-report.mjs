@@ -134,6 +134,7 @@ export function buildCampaignReport(state) {
     discovered_runs: discoveredByCase.get(item.id) ?? [],
     oracle_results: clone(item.oracle_results ?? []),
     findings: clone(item.findings ?? []),
+    teardown: clone(item.teardown ?? null),
   }));
   const outcomeTotals = Object.fromEntries(OUTCOMES.map((outcome) => [outcome, 0]));
   for (const row of rows) outcomeTotals[row.outcome] += 1;
@@ -147,6 +148,13 @@ export function buildCampaignReport(state) {
   const notRun = rows
     .filter((row) => row.outcome === 'NOT_RUN' && row.reason?.category !== 'pending-real')
     .map((row) => ({ id: row.id, wave: row.wave, class: row.class, reason: clone(row.reason) }));
+  // US-005: the declared teardown ledger — every terminal-case working-clone
+  // decision (case id, terminal outcome, kept/pruned action, timestamp).
+  // Spec 11/12 are silent on working-clone retention, so this explicitly
+  // declared policy and its per-case decisions are surfaced here for evidence.
+  const teardown_decisions = rows
+    .map((row) => row.teardown)
+    .filter((dec) => dec !== null && dec !== undefined);
   const verdict = verdictExitCode(state);
   const failClosedCause = zeroRealLaunchesCause(state);
 
@@ -167,6 +175,7 @@ export function buildCampaignReport(state) {
       wall_ms: elapsedMs(state.created_at, state.updated_at),
       observations: clone(state.spend?.observations ?? []),
     },
+    teardown_decisions,
     pending_real: pendingReal,
     not_run: notRun,
     findings,
@@ -231,6 +240,12 @@ export function renderCampaignReport(report) {
     ...(report.pending_real.length === 0
       ? ['(none)']
       : report.pending_real.map((item) => `- ${item.id}: ${reasonSummary(item.reason)}`)),
+    '',
+    'RUN TEARDOWN (US-005)',
+    ...(report.teardown_decisions.length === 0
+      ? ['(no provisioned working clones — nothing to teardown)']
+      : report.teardown_decisions.map((dec) =>
+          `- ${dec.case_id}: outcome=${dec.outcome} action=${dec.action} kept=${dec.kept} pruned=${dec.pruned} @ ${dec.teardown_at}`)),
     '',
     'NOT_RUN',
     ...(report.not_run.length === 0

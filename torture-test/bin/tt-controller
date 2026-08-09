@@ -19,6 +19,8 @@ import {
   completeOracleEvidenceSnapshot,
 } from './oracle-evidence-snapshot.mjs';
 import { writeCampaignReports } from './tt-report.mjs';
+import { provisionWorkClone } from './tt-fixture-provision.mjs';
+import { applyTeardownPolicy } from './tt-teardown.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const BIN_DIR = path.dirname(__filename);
@@ -59,10 +61,33 @@ function dryRunRealLaunchOutPath() {
   return value === '' ? DEFAULT_DRY_RUN_ARGV_PATH : path.resolve(value);
 }
 
-function recordDryRunRealLaunch(caseRecord, argv) {
+// Record the launch argv a real case WOULD hand to `tamandua`. This hook is a
+// proof, not just a stub: E2.3's argv-recording stub never lstats the path, so
+// it could not surface the ENOENT lstat every real launch hit. To close that
+// blind spot (US-007), this hook lstats the PROVISIONED work clone at
+// argv-capture time and embeds the existence evidence in-band (work_clone).
+// A real case has already run the mandatory provisioning stage, so on a
+// healthy host the clone MUST exist here; if it does not, the record carries
+// existed:false + the lstat error, surfacing E2.3's ENOENT even in the
+// zero-token proof. Evidence is recorded (never swallowed) so downstream
+// tests/consumers can assert the clone physically existed when the argv was
+// captured.
+function recordDryRunRealLaunch(caseRecord, argv, workClonePath) {
   const outPath = dryRunRealLaunchOutPath();
   if (outPath === null) return null;
   fs.mkdirSync(path.dirname(outPath), { recursive: true, mode: 0o700 });
+  let cloneStat = null;
+  let lstatError = null;
+  if (typeof workClonePath === 'string' && workClonePath !== '') {
+    try {
+      const st = fs.lstatSync(workClonePath);
+      cloneStat = { exists: true, is_directory: st.isDirectory(), size: st.size };
+    } catch (error) {
+      lstatError = error.message;
+    }
+  } else {
+    lstatError = 'work-clone-path-not-provided';
+  }
   const record = {
     recorded_at: utcTimestamp(),
     case_id: caseRecord.id,
@@ -72,6 +97,13 @@ function recordDryRunRealLaunch(caseRecord, argv) {
     task: caseRecord.task,
     executable: 'tamandua',
     argv,
+    work_clone: {
+      path: workClonePath ?? null,
+      existed: cloneStat !== null,
+      is_directory: cloneStat === null ? null : cloneStat.is_directory,
+      size: cloneStat === null ? null : cloneStat.size,
+      lstat_error: lstatError,
+    },
   };
   fs.appendFileSync(outPath, `${JSON.stringify(record)}\n`, { mode: 0o600 });
   return outPath;
@@ -103,6 +135,7 @@ Options:
   --manifest <path>       JSONL case manifest beneath torture-test/
   --resume <campaign-id>  Resume an existing campaign without relaunching it
   --validate-only         Validate every manifest record without creating a campaign
+  --case <id>             Run/validate exactly ONE manifest case id (focused rerun)
   --scripted-only         Execute scripted/local cases and report real cases pending-real
   --concurrency <count>   Maximum active cases; integer >= 1 (default: 1)
   --stagger <duration>    Delay between launches (default: 0s)
@@ -143,6 +176,8 @@ function parseArgs(argv) {
     validateOnly: false,
     scriptedOnly: false,
     scriptedOnlySpecified: false,
+    caseId: null,
+    caseSpecified: false,
   };
   const seen = new Set();
   for (let index = 0; index < argv.length; index += 1) {
@@ -178,6 +213,18 @@ function parseArgs(argv) {
       seen.add(arg);
       options.scriptedOnly = true;
       options.scriptedOnlySpecified = true;
+      continue;
+    }
+    if (arg === '--case') {
+      if (seen.has(arg)) throw new Error('--case may be specified only once');
+      seen.add(arg);
+      const parsed = readOptionValue(argv, index, arg);
+      if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(parsed.value)) {
+        throw new Error('--case requires a contained case id');
+      }
+      options.caseId = parsed.value;
+      options.caseSpecified = true;
+      index = parsed.nextIndex;
       continue;
     }
     if (arg === '--concurrency') {
@@ -474,6 +521,23 @@ function loadManifest(manifestPath, schema) {
     throw error;
   }
   return { cases: records, source };
+}
+
+// Apply the --case single-case filter. Selcets exactly the matching case id;
+// an unknown id fails fast with a clear message listing available ids. Returns
+// a NEW manifest object so downstream callers (state creation, execution,
+// reports) operate only on the focused case. Never mutates the loaded source.
+function applyCaseFilter(manifest, caseId) {
+  if (caseId === null) return manifest;
+  const matches = manifest.cases.filter((record) => record.id === caseId);
+  if (matches.length === 0) {
+    const ids = manifest.cases.map((record) => record.id);
+    const shown = ids.length > 12
+      ? `${ids.slice(0, 12).join(', ')}, ... (${ids.length} total)`
+      : ids.join(', ');
+    throw new Error(`unknown --case id '${caseId}': not present in manifest (available ids: ${shown})`);
+  }
+  return { cases: matches, source: manifest.source };
 }
 
 function hasRequirements(caseRecord) {
@@ -1218,6 +1282,38 @@ function runDurableLocalCommand(hook, childEnv, campaignDir, state, attempt) {
   });
 }
 
+// Find the provisioned working-clone path a case actually created, if any. A
+// case has one only if a REAL (non-scripted, non-dry-run-stub) provisioning run
+// succeeded (US-004 records it as attempt.fixture_work_clone). NOT_RUN /
+// pending-real / predicate-excluded cases and provision-FAILED cases never
+// record one, so teardown never touches a clone they never created.
+function provisionedWorkClonePath(caseState) {
+  for (const attempt of caseState.attempts ?? []) {
+    if (typeof attempt.fixture_work_clone === 'string' && attempt.fixture_work_clone !== '') {
+      return attempt.fixture_work_clone;
+    }
+  }
+  return null;
+}
+
+// US-005: apply the DECLARED teardown policy at terminalization. This is the
+// single choke point every case passes through exactly once when it becomes
+// terminal (and AFTER oracle harvest — the oracles have already run and their
+// evidence is recorded before markTerminal is reached). Per the declared policy
+// (tt-teardown.mjs DECLARED_TEARDOWN_POLICY), a PASSED case's harvested clone is
+// pruned to keep var/fixtures/work bounded, while a FAILED case's clone is kept
+// as failure-state evidence. Only clones a case actually provisioned are ever
+// touched; the decision (case id, outcome, kept/pruned, timestamp) is recorded
+// on the case and persisted to results/state.json. Provider-retry scheduling
+// returns before markTerminal, so teardown only ever runs on the FINAL,
+// genuinely-terminal outcome of a case.
+function applyCaseTeardown(caseState, outcome) {
+  const workClonePath = provisionedWorkClonePath(caseState);
+  if (workClonePath === null) return;
+  const result = applyTeardownPolicy({ caseId: caseState.id, outcome, workClonePath });
+  if (result.ok) caseState.teardown = result.record;
+}
+
 function markTerminal(state, caseState, campaignDir, outcome, reason) {
   const timestamp = utcTimestamp();
   Object.assign(caseState, {
@@ -1226,6 +1322,7 @@ function markTerminal(state, caseState, campaignDir, outcome, reason) {
     terminal_at: timestamp,
     ...(reason === undefined ? {} : { reason }),
   });
+  applyCaseTeardown(caseState, outcome);
   state.updated_at = timestamp;
   atomicWriteState(campaignDir, state);
 }
@@ -2141,6 +2238,54 @@ function configuredTruthRecheckMs() {
   return Number.isSafeInteger(configured) && configured >= 1 ? configured : 30_000;
 }
 
+function configuredTokenSettleMs() {
+  // Bounded window the controller waits for tamandua to finalize a real run's
+  // token spend after the run reaches a terminal status. tamandua attributes
+  // token usage ASYNCHRONOUSLY (its scheduler finalizes each work round's usage
+  // in a separate bookkeeping step), so runs.tokens_spent can read 0 in the
+  // moments after the run flips to 'completed'. A consumer (this controller and
+  // the terminal oracle snapshot) that samples at that instant would record a
+  // false zero. Settling for this window lets the ledger reach its real value.
+  const configured = Number(process.env.TT_CONTROLLER_TOKEN_SETTLE_MS ?? 20_000);
+  return Number.isSafeInteger(configured) && configured >= 1 ? configured : 20_000;
+}
+
+const TOKEN_SETTLE_POLL_MS = 2_000;
+const TOKEN_SETTLE_MIN_STABLE_POLLS = 3;
+
+// Wait for tamandua's asynchronous token-finalization to land for a terminal
+// REAL run, then persist the settled spend so the campaign ledger (and the
+// terminal oracle snapshot captured afterwards) reflect the run's true spend.
+// Fail-closed: never blocks unboundedly; bounded by TT_CONTROLLER_TOKEN_SETTLE_MS.
+async function settleTerminalTokenSpend(caseState, attempt, childEnv, state, campaignDir) {
+  if (attempt.execution_mode !== 'real') return; // scripted runs are zero-token
+  let settled = attempt.tokens_observed ?? 0;
+  const startedAt = Date.now();
+  const settleWindowMs = configuredTokenSettleMs();
+  let stableStreak = 0;
+  while (Date.now() - startedAt < settleWindowMs) {
+    await delay(Math.min(TOKEN_SETTLE_POLL_MS, Math.max(1, startedAt + settleWindowMs - Date.now())));
+    let next;
+    try {
+      next = queryWorkflowTerminalEvidence(attempt.run_id, childEnv);
+    } catch (error) {
+      // Token settle is best-effort evidence collection: if status reading
+      // transiently fails, stop settling without corrupting the terminal state.
+      break;
+    }
+    persistTokenObservation(next, attempt, caseState, state, campaignDir);
+    if (next.tokensSpent > settled) {
+      settled = next.tokensSpent;
+      stableStreak = 0;
+    } else {
+      stableStreak += 1;
+    }
+    // Stop once spend is positive and has been stable across enough consecutive
+    // polls (tail-attribution is done), never later than the settle window.
+    if (settled > 0 && stableStreak >= TOKEN_SETTLE_MIN_STABLE_POLLS) break;
+  }
+}
+
 function waitEvidenceDisagrees(status, waitHook, waitExitCode, observedWaitStatus) {
   return waitHook !== undefined
     && (expectedWaitExitCode(status) !== waitExitCode
@@ -2168,6 +2313,11 @@ async function harvestWorkflowAttempt(caseState, attempt, waitHook, childEnv, st
       && waitEvidenceDisagrees(resampled.status, waitHook, waitExitCode, observedWaitStatus);
     evidence = resampled;
   }
+
+  // US-008: tamandua finalizes token spend asynchronously after terminal, so
+  // settle before capturing terminal evidence (attempt tokens AND, critically,
+  // the terminal oracle snapshot taken later by completeCaseOracleSnapshot).
+  await settleTerminalTokenSpend(caseState, attempt, childEnv, state, campaignDir);
 
   attempt.terminal_status = evidence.status;
   attempt.wait_exit_code = waitExitCode;
@@ -2707,13 +2857,59 @@ async function executeWorkflowCase(caseRecord, caseState, state, campaignDir) {
   state.updated_at = launchIntentTimestamp;
   atomicWriteState(campaignDir, state);
 
+  // Fixture work-clone provisioning (US-004): for REAL (non-scripted) cases,
+  // provision the working clone from the golden BEFORE the launch builds
+  // workflowRunArgs, so the path handed to --worktree-origin-repository /
+  // --working-directory-for-harness ALWAYS exists (E2.3's ENOENT lstat root
+  // cause). This runs on EVERY attempt: provisionWorkClone wipes any prior
+  // clone first and clones fresh, so attempt N+1 (retry/rugpull replacement)
+  // is a CLEAN re-provision and never inherits a dirtied tree. A provision
+  // failure persists TEST_INFRA_FAIL with a precise category/reason
+  // (fail-closed); on a healthy host it must never be reached. Breakage is
+  // never a silent half-launch.
+  if (attempt.execution_mode === 'real') {
+    const provision = provisionWorkClone({
+      fixture: caseRecord.fixture,
+      caseId: caseRecord.id,
+      seed: caseRecord.seed ?? null,
+    });
+    if (!provision.ok) {
+      attempt.phase = 'terminal';
+      attempt.terminal_at = utcTimestamp();
+      const reason = provision.reason ?? {};
+      persistMechanicalOutcome(caseState, attempt, state, campaignDir, 'TEST_INFRA_FAIL', {
+        category: reason.category ?? 'fixture-provision-failed',
+        message: reason.message ?? 'fixture work-clone provisioning failed before launch',
+        ...reason,
+      });
+      return;
+    }
+    attempt.fixture_work_clone = provision.workClonePath;
+    attempt.fixture_provision_record = {
+      fixture: provision.fixture,
+      case_id: provision.caseId,
+      work_clone_path: provision.workClonePath,
+      golden_bare: provision.goldenBare,
+      target_kind: provision.target?.kind ?? null,
+      seed: provision.target?.seed ?? null,
+      arming: provision.arming,
+      venv_bootstrapped: provision.venvBootstrapped,
+      operator_notes_planted: provision.operatorNotesPlanted,
+      junk_verified: provision.junkVerified,
+      prepared_at: provision.prepared_at,
+    };
+  }
+
   // Zero-token dry-run hook (US-006): when TT_DRY_RUN_REAL_LAUNCH is set,
   // record the exact launch argv the scheduler would pass to `tamandua` for
   // each real (non-scripted) case, then mark it PASS without spawning the
   // model-backed run. Walled off: unset => previous behavior entirely.
   if (attempt.execution_mode === 'real' && dryRunRealLaunchOutPath() !== null) {
     const launchArgv = ['tamandua', ...workflowRunArgs(caseRecord)];
-    const outPath = recordDryRunRealLaunch(caseRecord, launchArgv);
+    // US-007: pass the provisioned clone path so the argv record embeds the
+    // E2.3-proof lstat at capture time (existed + dir + size). Provisioning
+    // ran as a mandatory stage above, so attempt.fixture_work_clone is set.
+    const outPath = recordDryRunRealLaunch(caseRecord, launchArgv, attempt.fixture_work_clone);
     attempt.phase = 'terminal';
     attempt.terminal_at = utcTimestamp();
     attempt.terminal_status = 'completed';
@@ -3460,7 +3656,7 @@ function writeTerminalCampaignReports(campaignDir, state) {
 
 async function startCampaign(options, schema) {
   const manifestPath = resolveManifestPath(options.manifest);
-  const manifest = loadManifest(manifestPath, schema);
+  const manifest = applyCaseFilter(loadManifest(manifestPath, schema), options.caseId);
   const selectedCases = options.scriptedOnly
     ? manifest.cases.filter(caseUsesScriptedEnvironment)
     : manifest.cases;
@@ -3501,7 +3697,7 @@ async function resumeCampaign(options, schema) {
     const manifestPath = options.manifest === null
       ? persistedManifestPath
       : resolveManifestPath(options.manifest);
-    const manifest = loadManifest(manifestPath, schema);
+    const manifest = applyCaseFilter(loadManifest(manifestPath, schema), options.caseId);
     if (!manifestMatchesState(manifestPath, manifest, state)) {
       throw new Error('manifest does not match campaign state');
     }
@@ -3560,7 +3756,7 @@ async function main() {
     const schema = loadSchema();
     if (options.validateOnly) {
       const manifestPath = resolveManifestPath(options.manifest);
-      const manifest = loadManifest(manifestPath, schema);
+      const manifest = applyCaseFilter(loadManifest(manifestPath, schema), options.caseId);
       console.log(`Validated ${manifest.cases.length} case(s) from ${path.relative(TT_ROOT, manifestPath)}`);
       return 0;
     }

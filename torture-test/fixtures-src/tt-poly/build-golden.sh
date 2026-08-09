@@ -1097,7 +1097,7 @@ echo "--- Phase 11: Hash stability ---"
 # Collect current hashes for all refs
 NEW_HASHES="$(mktemp "${TMPDIR:-/tmp}/.hashes-tt-poly.XXXXXX")"
 {
-    echo "#baseline=$BASELINE_SHA"
+    echo "baseline=$BASELINE_SHA"
     for seed_id in "${PYTHON_SEED_REFS[@]}" "${TS_SEED_REFS[@]}" \
                    "${GO_SEED_REFS[@]}" "${RUST_SEED_REFS[@]}" "${JAVA_SEED_REFS[@]}" \
                    POLY-BRK-T1 POLY-BRK-T2 POLY-BRK-J1 POLY-BRK-J2 \

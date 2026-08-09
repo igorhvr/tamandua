@@ -189,6 +189,16 @@ archived report is deliberately self-contained so campaigns run on
 different hosts can be compared by the operator afterwards — that
 comparison is outside the suite.)
 
+**Working-clone teardown policy (US-005):** spec 11 is silent on whether a
+terminal case's provisioned working clone (`var/fixtures/work/<case-id>/<fixture>`)
+is retained as evidence or pruned. The declared policy (module
+`tt-teardown.mjs`) is: PASS cases PRUNE their harvested clone after oracle
+harvest (bounded work dir, no forensics worth keeping); every failure outcome
+KEEPS its clone as failure-state evidence (never destroy evidence that could
+explain a failure). Every decision (case id, outcome, kept/pruned, timestamp) is
+recorded to `results/state.json` and the campaign report. Cases that never
+provisioned a clone are untouched.
+
 Report contents (controller-generated, human-reviewed):
 1. Verdict + findings list with severities and waiver status.
 2. Scorecard: scenarios by wave × outcome class; class-level behavioral

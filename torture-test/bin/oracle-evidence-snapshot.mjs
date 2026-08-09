@@ -231,9 +231,18 @@ function fileSha256(file) {
   return sha256(fs.readFileSync(file));
 }
 
+function bytewiseNameComparator(a, b) {
+  // Byte-wise (UTF-16 code-unit) ordering, matching the strict path-sorted
+  // contract the O8 oracle enforces on checksum inventories. localeCompare
+  // applies locale/case-insensitive collation (underscore before dot, lower
+  // before upper) which produces a flat list that O8 rejects as unsorted on
+  // real provisioned clones (e.g. tt-python .venv).
+  return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
+}
+
 function walkFiles(root, relative = '') {
   const directory = path.join(root, relative);
-  const entries = fs.readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
+  const entries = fs.readdirSync(directory, { withFileTypes: true }).sort(bytewiseNameComparator);
   const files = [];
   for (const entry of entries) {
     const childRelative = relative === '' ? entry.name : `${relative}/${entry.name}`;
@@ -270,12 +279,46 @@ function testMarkerCounts(file) {
   };
 }
 
+// Fixture-source-relative declarations (e.g. 'fixtures-src/tt-python/src')
+// must be rebased to the work-clone root before matching against an
+// inventory whose paths are repository-root-relative, and to retain declared
+// untracked forbidden baits.
+function rebaseFixtureDeclarationList(declarations, fixture) {
+  const prefix = typeof fixture === 'string' && fixture.length > 0 ? `fixtures-src/${fixture}/` : null;
+  return (declarations ?? []).map((value) => {
+    if (prefix !== null && typeof value === 'string' && value.startsWith(prefix)) return value.slice(prefix.length);
+    return value;
+  });
+}
+
+function gitTrackedPaths(repositoryPath) {
+  // The checksum inventory must represent the git-TRACKED project tree, not
+  // the whole working tree. Provisioned fixture work clones intentionally
+  // carry untracked arming artifacts (bootstrapped .venv, regenerated junk,
+  // planted operator-notes.local) per spec 02. Including them made O8's
+  // git-HEAD reconciliation impossible (tree.size !== terminalMap.size) and
+  // risked spurious boundary findings from .venv/junk drift. Intersect the
+  // walk with `git ls-files` so only committed content is inventoried.
+  return new Set(git(repositoryPath, ['ls-files', '-z']).split('\0').filter(Boolean));
+}
+
 function captureChecksums(repositoryPath, caseRecord, phase, baselineEntries = null) {
   const declarations = {
     boundary_files: [...caseRecord.boundary_files],
     forbidden: [...caseRecord.forbidden],
   };
-  const entries = walkFiles(repositoryPath).map((entry) => {
+  const tracked = gitTrackedPaths(repositoryPath);
+  // Declared forbidden baits MUST remain inventoried even though they are
+  // deliberately untracked (spec 02 plants operator-notes.local as an untracked
+  // file; its goldens exclude it). O8 verifies these baits stay byte-identical
+  // across the run, so exclude them from the tracked-only filter.
+  const fixture = typeof caseRecord.fixture === 'string' ? caseRecord.fixture : '';
+  const forbiddenBaits = rebaseFixtureDeclarationList(declarations.forbidden, fixture);
+  const keepInventoryEntry = (entry) => tracked.has(entry.path)
+    || forbiddenBaits.some((bait) => entry.path === bait || entry.path.startsWith(`${bait}/`));
+  const entries = walkFiles(repositoryPath)
+    .filter(keepInventoryEntry)
+    .map((entry) => {
     const categories = [];
     if (declarations.boundary_files.some((item) => boundaryMatches(entry.path, item))) categories.push('boundary');
     if (declarations.forbidden.some((item) => boundaryMatches(entry.path, item))) categories.push('forbidden');
@@ -293,6 +336,10 @@ function captureChecksums(repositoryPath, caseRecord, phase, baselineEntries = n
   const changed_paths = baselineEntries === null ? [] : [...new Set([...current.keys(), ...baseline.keys()])]
     .filter((file) => JSON.stringify(current.get(file) ?? null) !== JSON.stringify(baseline.get(file) ?? null))
     .sort();
+  // Guarantee strict byte-wise (code-unit) path ordering regardless of the
+  // depth-first traversal order, so checksum inventories always satisfy the
+  // O8 unique + path-sorted contract on real provisioned clones.
+  entries.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
   return { schema_version: 1, phase, declarations, entries, changed_paths };
 }
 

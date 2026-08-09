@@ -88,6 +88,8 @@ EOF
   --tier0 --include-real includes both real canaries.
   --tier1 reports + validates Tier-1 cases as pending-real (zero tokens).
   --tier1 --include-real executes the full Tier-1 campaign.
+  --case <id>  Run exactly ONE manifest case id (focused rerun).
+               Combine with --tier0/--tier1 and optionally --include-real.
   WARNING: --include-real launches real pi and Hermes work and spends real tokens.
 
 Bare invocation (no flags): after a 32s countdown, runs the most
@@ -112,26 +114,35 @@ report_latest() {
 run_tier() {
   local tier="$1"
   local include_real="${2:-false}"
+  local case_id="${3:-}"
   if ! tier_available "$tier"; then
     info="$(tier_info "$tier")"
     echo "Tier '$tier' is unavailable because its required assets are not installed or valid ($(printf '%s' "$info" | cut -d'|' -f3))." >&2
     exit 3
   fi
+  local manifest="$TT_DIR/cases/$tier.jsonl"
+  if [ "$tier" = "smoke" ]; then
+    manifest="$TT_DIR/cases/smoke.jsonl"
+  fi
+  local case_args=()
+  if [ -n "$case_id" ]; then
+    case_args=(--case "$case_id")
+  fi
   case "$tier" in
     smoke)
-      exec "$TT_BIN_DIR/tt-controller" --manifest "$TT_DIR/cases/smoke.jsonl"
+      exec "$TT_BIN_DIR/tt-controller" --manifest "$manifest" "${case_args[@]}"
       ;;
     tier0)
       if [ "$include_real" = true ]; then
-        exec "$TT_BIN_DIR/tt-controller" --manifest "$TT_DIR/cases/tier0.jsonl"
+        exec "$TT_BIN_DIR/tt-controller" --manifest "$manifest" "${case_args[@]}"
       fi
-      exec "$TT_BIN_DIR/tt-controller" --manifest "$TT_DIR/cases/tier0.jsonl" --scripted-only
+      exec "$TT_BIN_DIR/tt-controller" --manifest "$manifest" "${case_args[@]}" --scripted-only
       ;;
     tier1)
       if [ "$include_real" = true ]; then
-        exec "$TT_BIN_DIR/tt-controller" --manifest "$TT_DIR/cases/tier1.jsonl"
+        exec "$TT_BIN_DIR/tt-controller" --manifest "$manifest" "${case_args[@]}"
       fi
-      exec "$TT_BIN_DIR/tt-controller" --manifest "$TT_DIR/cases/tier1.jsonl" --scripted-only
+      exec "$TT_BIN_DIR/tt-controller" --manifest "$manifest" "${case_args[@]}" --scripted-only
       ;;
     *)
       echo "internal error: tier '$tier' marked available but has no runner" >&2
@@ -176,22 +187,57 @@ EOF
 
 if [ "$#" -eq 0 ]; then
   countdown_and_run_max
-elif [ "$#" -eq 1 ]; then
+  exit 0
+fi
+
+# Parsed flags: exactly one tier flag, optional --include-real and --case <id>.
+tier=""
+include_real="false"
+case_id=""
+while [ "$#" -gt 0 ]; do
   case "$1" in
-    --smoke)   run_tier smoke ;;
-    --tier0)   run_tier tier0 ;;
-    --tier1)   run_tier tier1 ;;
-    --tier2)   run_tier tier2 ;;
-    --report)  report_latest ;;
-    --help|-h) usage ;;
-    *)         echo "Unknown argument: $1" >&2; usage >&2; exit 4 ;;
+    --smoke|--tier0|--tier1|--tier2)
+      tier="$1"
+      ;;
+    --include-real)
+      include_real="true"
+      ;;
+    --case)
+      if [ "$#" -lt 2 ]; then
+        echo "--case requires a case id" >&2
+        usage >&2
+        exit 4
+      fi
+      case_id="$2"
+      shift
+      ;;
+    --report)
+      report_latest
+      exit 0
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage >&2
+      exit 4
+      ;;
   esac
-elif [ "$#" -eq 2 ] && [ "$1" = "--tier0" ] && [ "$2" = "--include-real" ]; then
-  run_tier tier0 true
-elif [ "$#" -eq 2 ] && [ "$1" = "--tier1" ] && [ "$2" = "--include-real" ]; then
-  run_tier tier1 true
-else
-  echo "Unknown or conflicting arguments: $*" >&2
+  shift
+done
+
+if [ -z "$tier" ]; then
+  echo "A tier flag (--smoke/--tier0/--tier1/--tier2) is required when --include-real/--case are used" >&2
   usage >&2
   exit 4
 fi
+
+case "$tier" in
+  --smoke)  run_tier smoke "$include_real" "$case_id" ;;
+  --tier0)  run_tier tier0 "$include_real" "$case_id" ;;
+  --tier1)  run_tier tier1 "$include_real" "$case_id" ;;
+  --tier2)  run_tier tier2 "$include_real" "$case_id" ;;
+  *)        echo "internal error: unknown tier flag $tier" >&2; exit 4 ;;
+esac
