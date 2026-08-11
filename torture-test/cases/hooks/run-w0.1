@@ -12,6 +12,14 @@ unset TT_ROOT TT_SCRIPTED_HOME HERMES_HOME \
   TAMANDUA_SCRIPTED_BEHAVIORS TAMANDUA_SCRIPTED_STATE \
   TAMANDUA_TEST_GUARD NODE_TEST_CONTEXT
 
+# ── FIX10 US-002: fail closed unless HOME is contained ──────────────
+# This hook writes git identity below; git resolves the write target from
+# $HOME (GIT_CONFIG_GLOBAL=$HOME/.gitconfig), so an uncontained HOME would
+# write the OPERATOR's real ~/.gitconfig (the 2026-08-05 breach). The shared
+# guard aborts with exit 2 BEFORE any seeding or git config write when $HOME
+# is not a real directory strictly inside torture-test/var.
+source "$repo_root/torture-test/cases/hooks/containment-guard.sh"
+
 # The outer controller HOME is intentionally contained and starts without the
 # operator's Git or pi configuration. Nested unit tests create commits and a
 # few workflow-install tests require settings.json even though every harness
@@ -21,6 +29,24 @@ printf '%s\n' '{"defaultProvider":"stub","defaultModel":"stub"}' \
   > "$HOME/.pi/agent/settings.json"
 export GIT_CONFIG_GLOBAL="$HOME/.gitconfig"
 export GIT_CONFIG_NOSYSTEM=1
+
+# Belt-and-suspenders (after the guard): the write target must itself
+# resolve inside var and be a regular file — never a symlink to the
+# operator's real home.
+case "$(cd "$(dirname "$GIT_CONFIG_GLOBAL")" && pwd -P)/" in
+  "$tt_var_real"/*) ;;
+  *) fail_containment "GIT_CONFIG_GLOBAL parent escapes torture-test/var: $GIT_CONFIG_GLOBAL" ;;
+esac
+if [ -L "$GIT_CONFIG_GLOBAL" ]; then
+  case "$(readlink -f "$GIT_CONFIG_GLOBAL")/" in
+    "$tt_var_real"/*) ;;
+    *) fail_containment "GIT_CONFIG_GLOBAL is a symlink escaping var: $GIT_CONFIG_GLOBAL" ;;
+  esac
+fi
+if [ -e "$GIT_CONFIG_GLOBAL" ] && [ ! -f "$GIT_CONFIG_GLOBAL" ]; then
+  fail_containment "GIT_CONFIG_GLOBAL target is not a regular file: $GIT_CONFIG_GLOBAL"
+fi
+
 git config --global user.name "Tamandua Tier-0"
 git config --global user.email "tier0@tetradactyla.invalid"
 git config --global commit.gpgsign false

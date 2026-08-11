@@ -8,7 +8,10 @@
 # spawned processes ONLY — never mutates the caller's env.
 #
 # Production guards: refuses absolutely to touch production ports
-# 3334/3338/3339 or the real ~/.tamandua.
+# 3334/3338/3339 or the real ~/.tamandua, and fails CLOSED (FIX10 US-004)
+# when a kind's resolved HOME or TAMANDUA_STATE_DIR escapes
+# torture-test/var — so a daemon can never be started under an uncontained
+# HOME (the 2026-08-05 ~/.gitconfig breach surface).
 #
 # Where systemd-run --user --scope is available, starts daemons inside
 # dedicated named scopes and re-asserts cgroup membership after every
@@ -198,6 +201,71 @@ guard_kind_cwd() {
   fi
 }
 
+# ── FIX10 US-004 fail-closed containment guard ──────────────────────
+
+# resolve_contained_dir: resolve $1 to a real (symlink-free) directory path,
+# walking up to the nearest EXISTING ancestor when the path itself does not
+# exist yet (fresh checkout: var/home-scripted is provisioned at daemon
+# start, but a guard may run before that). Mirrors the US-003
+# resolveExistingRealPath semantics in bin/tt-containment.mjs: a
+# not-yet-provisioned contained home is judged by where it WILL live (inside
+# var), never by the operator's real HOME. Prints the resolved path on
+# success, nothing on failure.
+resolve_contained_dir() {
+  local candidate="$1"
+  while [ ! -e "$candidate" ] && [ "$candidate" != "/" ]; do
+    candidate="$(dirname "$candidate")"
+  done
+  if [ -d "$candidate" ]; then
+    (cd "$candidate" && pwd -P)
+  fi
+}
+
+# guard_kind_containment: fails CLOSED unless the kind's resolved HOME and
+# TAMANDUA_STATE_DIR are STRICTLY inside torture-test/var ($TT_ROOT).
+#
+# WHY: a daemon whose spawn env resolves outside var would run tamandua
+# agents under a HOME the operator does not control — and a git-identity
+# write under such a HOME is exactly the 2026-08-05 ~/.gitconfig breach
+# surface (an uncontained HOME redirected the hook's --global write to the
+# OPERATOR's real config). The env scripts are static, but a tampered env
+# script, a broken TT_REPO_ROOT, or a future env override must never fall
+# through to a daemon spawn with an escaping HOME. Refuse before any start.
+guard_kind_containment() {
+  local kind="$1"
+  local spawn_env
+  spawn_env="$(env_for_kind "$kind")"
+  local tt_root_rp
+  tt_root_rp="$(resolve_contained_dir "$TT_ROOT")"
+  if [ -z "$tt_root_rp" ]; then
+    refuse_production "cannot resolve torture-test/var containment root ($TT_ROOT)"
+  fi
+  local spec value rp
+  for spec in HOME TAMANDUA_STATE_DIR; do
+    value="$(echo "$spawn_env" | grep "^$spec=" | cut -d= -f2-)"
+    if [ -z "$value" ]; then
+      refuse_production "kind '$kind' spawn env $spec is unset or empty"
+    fi
+    rp="$(resolve_contained_dir "$value")"
+    if [ -z "$rp" ]; then
+      refuse_production "kind '$kind' spawn env $spec does not resolve to a directory: $value"
+    fi
+    if [ "$rp" = "$tt_root_rp" ]; then
+      # Resolved to var itself: acceptable ONLY when the requested path is a
+      # not-yet-provisioned CHILD (fresh checkout, judged by its nearest
+      # existing ancestor); var itself as a live HOME is refused.
+      if [ ! -e "$value" ]; then continue; fi
+      refuse_production "kind '$kind' spawn env $spec is torture-test/var itself: $value"
+    fi
+    case "$rp/" in
+      "$tt_root_rp"/*) ;;
+      *)
+        refuse_production "kind '$kind' spawn env $spec escapes torture-test/var: $value (resolves to $rp)"
+        ;;
+    esac
+  done
+}
+
 # ── usage ────────────────────────────────────────────────────────────
 
 usage() {
@@ -238,6 +306,10 @@ Environment:
 Production guards:
   - Ports 3334/3338/3339 are blocked by construction.
   - Real ~/.tamandua is blocked by construction.
+  - A kind whose resolved HOME or TAMANDUA_STATE_DIR escapes
+    torture-test/var is refused before any daemon start (FIX10 US-004
+    fail-closed containment — an uncontained HOME is the 2026-08-05
+    ~/.gitconfig breach surface).
   - Any attempt to target production exits with an error.
   - The guard checks BEFORE every signal, not just at startup.
 
@@ -904,6 +976,11 @@ main() {
   # ports by construction, but this guard is the backstop.
   guard_kind_ports "$kind"
   guard_kind_cwd "$kind"
+  # FIX10 US-004: fail closed unless the kind's resolved HOME and
+  # TAMANDUA_STATE_DIR are strictly inside torture-test/var. Every daemon
+  # operation (start/restart/stop/status) refuses when the spawn env would
+  # escape var, so a daemon can never be started under an uncontained HOME.
+  guard_kind_containment "$kind"
 
   # Dispatch subcommand
   case "$cmd" in

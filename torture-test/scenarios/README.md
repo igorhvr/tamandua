@@ -221,3 +221,44 @@ stop the contained daemon, terminate only the recorded process group after PID
 start-time verification, remove the exact invocation workflow copy, and delete
 only invocation-owned state. Tool-path overrides are rejected outside explicit
 self-test mode.
+
+## HOME containment (FIX10 US-004)
+
+Scenario code — and the scenario daemon it manages — must NEVER run with the
+OPERATOR's real HOME, because a git-identity write under an uncontained HOME is
+exactly the 2026-08-05 `~/.gitconfig` breach (a torture-test hook rewrote the
+operator's real git config). Three layers enforce this for scenarios:
+
+1. **Harness command child**: `run-scripted-scenario` sources
+   `env/tt-env-scripted.sh` into every command child (contained
+   `TT_SCRIPTED_HOME`), and the child wrapper sources
+   `scenarios/lib/scenario-containment-guard.sh` before executing scenario
+   code — the guard refuses (exit 2) unless `$HOME` is a real directory
+   STRICTLY inside `torture-test/var`.
+2. **Every scenario entry point**: each `scenarios/*/run.sh` sources the same
+   guard, so a scenario invoked OUTSIDE the harness (direct developer
+   invocation with the operator HOME) fails closed instead of running against
+   the real home.
+3. **daemon-control**: `guard_kind_containment` refuses to operate a kind
+   whose resolved HOME or `TAMANDUA_STATE_DIR` escapes `torture-test/var`,
+   and every daemon child is spawned under `env -i $(env_for_kind <kind>)`
+   with the contained env — the operator HOME never reaches a daemon child.
+
+### daemon-control real-HOME handoff (safe by invariant)
+
+The harness `daemon_control()` and the scenario executables pass
+`HOME=<operator home>` to `bin/daemon-control`. This is SAFE and required:
+
+- daemon-control uses the operator HOME ONLY for its production-guard
+  derivation (`REAL_TAMANDUA_STATE`, `is_production_cwd`). With the contained
+  scripted HOME it cannot distinguish the real production state from TT state
+  and refuses everything (fail closed — which is why scenario-local
+  `daemon-control` calls must use the operator home to actually work).
+- daemon-control itself performs NO git/config writes and no HOME-side
+  effects (grep-verified).
+- Every process daemon-control spawns (daemon, dashboard, mcp, stop-path
+  CLI) is launched under `env -i $(env_for_kind <kind>)` — the contained
+  HOME + `TAMANDUA_STATE_DIR` from `tt-env-scripted.sh`.
+- daemon-control `guard_kind_containment` additionally fails closed if the
+  KIND's resolved HOME or state dir escapes `torture-test/var`, so even a
+  tampered env script cannot hand the operator HOME to a spawned daemon.

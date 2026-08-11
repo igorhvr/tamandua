@@ -14,6 +14,7 @@ assert.equal(process.env.TT_SCENARIO_COMMAND_GROUP_PROVEN, "1",
   "scenario must run in the harness-proven process group");
 
 const disposableHome = path.join(invocationDir, "home-disposable");
+const operatorHome = resolveOperatorHome();
 const remote = path.join(invocationDir, "remote.git");
 const seed = path.join(invocationDir, "remote-seed");
 const tools = path.join(invocationDir, "tools");
@@ -176,9 +177,18 @@ try {
 } finally {
   // run-scripted-scenario also stops in its EXIT trap; this local barrier makes
   // every W0.9 leg independently stop the sanctioned scripted daemon first.
+  // FIX10 US-004: daemon-control must receive the OPERATOR home (like the
+  // harness daemon_control() handoff) so its production-guard derivation
+  // (REAL_TAMANDUA_STATE, is_production_cwd) can distinguish the real
+  // production state from TT state. With the CONTAINED HOME it would refuse
+  // every operation (fail closed — safe, but this barrier would silently no-op)
+  // and with the real HOME its guard_kind_containment still forces the KIND's
+  // spawn env (HOME + TAMANDUA_STATE_DIR) to stay inside torture-test/var, and
+  // every daemon child gets the contained env via env -i env_for_kind. No
+  // git-identity write can reach the operator home through this chain.
   spawnSync(daemonControl, ["scripted", "stop"], {
     cwd: repoRoot,
-    env: process.env,
+    env: { ...process.env, HOME: operatorHome },
     encoding: "utf8",
     timeout: 30_000,
   });
@@ -201,6 +211,18 @@ function commandPath(command) {
   const result = spawnSync("bash", ["-lc", `command -v ${command}`], { encoding: "utf8" });
   if (result.status !== 0 || !result.stdout.trim()) throw new Error(`${command} is required`);
   return result.stdout.trim();
+}
+
+// FIX10 US-004: daemon-control's production-guard derivation needs the REAL
+// operator home (REAL_TAMANDUA_STATE, is_production_cwd); the daemon children
+// still get the contained env via env -i env_for_kind, and daemon-control's
+// guard_kind_containment forces HOME/TAMANDUA_STATE_DIR inside torture-test/var.
+function resolveOperatorHome() {
+  const getent = fs.existsSync("/usr/bin/getent") ? "/usr/bin/getent" : "/bin/getent";
+  const result = spawnSync(getent, ["passwd", String(process.getuid())], { encoding: "utf8" });
+  const home = result.status === 0 ? result.stdout.trim().split(":")[5] : "";
+  assert.ok(home && path.isAbsolute(home), "could not resolve operator HOME for daemon-control");
+  return home;
 }
 
 function run(command, args, options = {}) {

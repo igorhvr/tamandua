@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import net from "node:net";
+import os from "node:os";
 import path from "node:path";
 import { describe, it } from "node:test";
 
@@ -17,6 +19,16 @@ const scenarioReadme = path.join(ttRoot, "scenarios", "README.md");
 const preflightHooks = ["run-w0.1", "run-w0.2"].map((name) =>
   path.join(ttRoot, "cases", "hooks", name));
 const realCaseIds = ["T0.real-pi-bfmw-tt-ts", "T0.real-hermes-do-now"];
+
+// FIX10 US-006: the operator's real ~/.gitconfig must be byte-identical
+// before and after the double-gate, and every gate's retained report must
+// carry the HYGIENE CANARY section with gitconfig UNCHANGED.
+const operatorHome = os.homedir();
+const realGitconfig = path.join(operatorHome, ".gitconfig");
+
+function sha256(file: string): string {
+  return crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+}
 const blockedRealEnv: NodeJS.ProcessEnv = {
   ...Object.fromEntries(Object.entries(process.env).filter(([key]) => key !== "NODE_TEST_CONTEXT")),
   // node:test marks descendants as tests; these scenarios intentionally use
@@ -213,6 +225,18 @@ async function assertCampaign(runNumber: number): Promise<string> {
   assert.deepEqual(scenarioOwnedProcesses(), [], "scenario-owned process survived teardown");
   assertTransientStateRemoved(campaignDir);
   assert.equal(gitSnapshot(), before, `Tier-0 run ${runNumber} changed git status`);
+  // FIX10 US-006: the retained report must prove the hygiene canary armed
+  // and verified the REAL operator identity files unchanged (no silent
+  // contamination like the 2026-08-05 ~/.gitconfig breach).
+  assert.ok(Array.isArray(report.hygiene_canary?.files), `Tier-0 run ${runNumber} report lacks hygiene_canary`);
+  const canaryGitconfig = report.hygiene_canary.files.find((entry: any) => entry.name === "gitconfig");
+  assert.equal(canaryGitconfig?.status, "UNCHANGED", `Tier-0 run ${runNumber}: canary gitconfig must be UNCHANGED`);
+  assert.equal(canaryGitconfig?.before, canaryGitconfig?.after,
+    `Tier-0 run ${runNumber}: canary gitconfig before/after hashes must match`);
+  assert.deepEqual(report.hygiene_canary.diffs, [], `Tier-0 run ${runNumber}: canary reported hygiene diffs`);
+  const text = fs.readFileSync(textPath, "utf8");
+  assert.match(text, /HYGIENE CANARY/, `Tier-0 run ${runNumber}: report.txt must render the HYGIENE CANARY section`);
+  assert.match(text, /- gitconfig: UNCHANGED/, `Tier-0 run ${runNumber}: report.txt must show gitconfig UNCHANGED`);
   return campaignDir;
 }
 
@@ -272,7 +296,10 @@ describe("Tier-0 repeatability acceptance", () => {
     const validation = run(controller, ["--manifest", manifest, "--validate-only"]);
     assert.equal(validation.status, 0, `${validation.stdout}\n${validation.stderr}`);
     assert.match(validation.stdout, /Validated 35 case\(s\)/);
+    const gitconfigBefore = sha256(realGitconfig);
     const campaigns = [await assertCampaign(1), await assertCampaign(2)];
     assert.notEqual(campaigns[0], campaigns[1], "repeat executions must retain distinct campaign evidence");
+    assert.equal(sha256(realGitconfig), gitconfigBefore,
+      "the real ~/.gitconfig sha256 must be byte-identical after both Tier-0 gates");
   });
 });

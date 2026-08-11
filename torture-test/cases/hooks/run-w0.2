@@ -9,5 +9,13 @@ unset TT_ROOT TT_SCRIPTED_HOME HERMES_HOME \
   TAMANDUA_CONTROL_PORT TAMANDUA_MCP_PORT TAMANDUA_DASHBOARD_PORT \
   TAMANDUA_SCRIPTED_BEHAVIORS TAMANDUA_SCRIPTED_STATE \
   TAMANDUA_TEST_GUARD NODE_TEST_CONTEXT
+
+# ── FIX10 US-002: fail closed unless HOME is contained ──────────────
+# This hook runs e2e suites that create commits; with an uncontained HOME,
+# git identity reads/writes could touch the operator's real home. Same shared
+# fail-closed guard as run-w0.1: abort with exit 2 unless HOME is a real
+# directory strictly inside torture-test/var.
+source "$repo_root/torture-test/cases/hooks/containment-guard.sh"
+
 ./run-all-e2e-tests
 node --test e2e-tests/workflows-stress-concurrent.test.ts

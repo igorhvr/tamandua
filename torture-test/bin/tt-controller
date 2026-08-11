@@ -21,6 +21,14 @@ import {
 import { writeCampaignReports } from './tt-report.mjs';
 import { provisionWorkClone } from './tt-fixture-provision.mjs';
 import { applyTeardownPolicy } from './tt-teardown.mjs';
+import {
+  assertContainedHome,
+  isContainmentViolation,
+} from './tt-containment.mjs';
+import {
+  snapshotHygieneCanary,
+  verifyHygieneCanary,
+} from './tt-hygiene-canary.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const BIN_DIR = path.dirname(__filename);
@@ -977,7 +985,25 @@ function loadSpawnEnvironment(scripted) {
     const detail = result.error?.message ?? result.stderr?.trim() ?? `exit ${result.status}`;
     throw new Error(`cannot load spawn environment from ${scriptPath}: ${detail}`);
   }
-  return { ...operatorBaseEnv, ...parsePrintedEnvironment(result.stdout, scriptPath) };
+  const merged = { ...operatorBaseEnv, ...parsePrintedEnvironment(result.stdout, scriptPath) };
+  // FIX10 US-003: fail closed — the resolved HOME must be strictly inside
+  // torture-test/var (realpath). A misconfigured env script (or one that
+  // prints an escaping HOME) throws here, and the existing callers convert
+  // the failure to TEST_INFRA_FAIL with category spawn-environment. Never
+  // fall through to the real operator HOME.
+  assertContainedHome(merged.HOME, VAR_ROOT, 'spawn environment HOME');
+  return merged;
+}
+
+// FIX10 US-003: single fail-closed choke-point for EVERY spawned child in
+// tt-controller. Every spawn — reset/command/launch/stop/oracle hooks,
+// durable commands, targeted O9 probes, token-ledger and status queries —
+// passes through this assertion: childEnv.HOME must resolve strictly inside
+// torture-test/var. A violation throws (error.code = TT_CONTAINMENT_VIOLATION)
+// and executeEligibleCases aborts the case as TEST_INFRA_FAIL with category
+// 'containment-violation' — never a silent fall-through to the real HOME.
+function assertContainedSpawnEnv(childEnv) {
+  assertContainedHome(childEnv?.HOME, VAR_ROOT, 'spawn environment HOME');
 }
 
 function caseUsesScriptedEnvironment(caseRecord) {
@@ -1034,6 +1060,10 @@ function runHook(hookName, hook, childEnv, campaignDir, state, attempt, {
   timeoutMs,
   onChunk,
 } = {}) {
+  // FIX10 US-003 choke-point: never spawn a case/hook child with an
+  // uncontained HOME (fails closed as TEST_INFRA_FAIL 'containment-violation'
+  // via executeEligibleCases).
+  assertContainedSpawnEnv(childEnv);
   const evidenceDir = path.join(campaignDir, 'evidence', attempt.case_id, attempt.id);
   fs.mkdirSync(evidenceDir, { recursive: true, mode: 0o700 });
   const stdoutPath = path.join(evidenceDir, `${hookName}.stdout`);
@@ -1195,6 +1225,10 @@ function applyDurableHookResult(hookState, result) {
 }
 
 function runDurableLocalCommand(hook, childEnv, campaignDir, state, attempt) {
+  // FIX10 US-003 choke-point: the durable runner (tt-hook-runner) inherits
+  // childEnv, so refuse to launch it with an uncontained HOME (fails closed
+  // as TEST_INFRA_FAIL 'containment-violation').
+  assertContainedSpawnEnv(childEnv);
   const evidenceDir = path.join(campaignDir, 'evidence', attempt.case_id, attempt.id);
   fs.mkdirSync(evidenceDir, { recursive: true, mode: 0o700 });
   const stdoutPath = path.join(evidenceDir, 'command.stdout');
@@ -1386,6 +1420,8 @@ function beginCaseOracleSnapshot(caseRecord, caseState, attempt, state, campaign
 }
 
 function runCaseO9TargetedProbes(caseRecord, attempt, state, campaignDir, childEnv) {
+  // FIX10 US-003 choke-point: the probe child must run with the contained HOME.
+  assertContainedSpawnEnv(childEnv);
   if (!caseRecord.oracles.includes('O9') || caseRecord.chaos?.o9_special_exits !== true) return;
   if (attempt.o9_targeted_probes?.status === 'COMPLETE') return;
   if (attempt.o9_targeted_probes?.status === 'RUNNING') {
@@ -1539,6 +1575,8 @@ function validateOracleResponse(response, oracleId, exitCode, evidenceDir) {
 }
 
 function runCaseOracles(caseRecord, caseState, state, campaignDir, childEnv) {
+  // FIX10 US-003 choke-point: oracle executables must run with the contained HOME.
+  assertContainedSpawnEnv(childEnv);
   caseState.oracle_results ??= [];
   const attempt = caseState.attempts.at(-1);
   const attemptId = attempt?.id ?? 'case-without-attempt';
@@ -1712,6 +1750,8 @@ function localDatabaseTokenEvidence(childEnv) {
 }
 
 function initializeLocalTokenLedger(childEnv) {
+  // FIX10 US-003 choke-point: the tamandua ledger query must run with the contained HOME.
+  assertContainedSpawnEnv(childEnv);
   const executable = path.join(TT_ROOT, '..', 'bin', 'tamandua');
   const result = spawnSync(executable, ['workflow', 'runs', '--json'], {
     cwd: TT_ROOT, env: childEnv, encoding: 'utf8', timeout: 30_000,
@@ -1999,6 +2039,8 @@ function parseSingleJsonObject(output) {
 }
 
 function resolveShortRunId(shortId, childEnv) {
+  // FIX10 US-003 choke-point: the status query must run with the contained HOME.
+  assertContainedSpawnEnv(childEnv);
   const result = spawnSync('tamandua', ['workflow', 'status', `run-${shortId}`, '--json'], {
     cwd: fs.realpathSync(TT_ROOT),
     env: childEnv,
@@ -2086,6 +2128,8 @@ function createRunIdentifierCapture(attempt, state, campaignDir, childEnv, onRes
 }
 
 function queryWorkflowStatus(runId, childEnv) {
+  // FIX10 US-003 choke-point: the status query must run with the contained HOME.
+  assertContainedSpawnEnv(childEnv);
   const result = spawnSync('tamandua', ['workflow', 'status', runId, '--json'], {
     cwd: fs.realpathSync(TT_ROOT),
     env: childEnv,
@@ -2141,6 +2185,8 @@ function parseWaitJson(output, runId) {
 }
 
 function queryWorkflowDatabaseEvidence(runId, childEnv) {
+  // FIX10 US-003 choke-point: the sqlite3 evidence query must run with the contained HOME.
+  assertContainedSpawnEnv(childEnv);
   const selectedHome = childEnv.HOME;
   if (typeof selectedHome !== 'string' || !path.isAbsolute(selectedHome)) {
     throw new Error('selected TT HOME is unavailable');
@@ -3333,7 +3379,14 @@ async function executeEligibleCases(manifest, state, campaignDir) {
           attempt.terminal_at = utcTimestamp();
         }
         if (item.caseState.phase !== 'terminal') {
-          const reason = { category: 'scheduler-execution-failed', message: error.message };
+          // FIX10 US-003: a HOME-containment violation (error.code
+          // TT_CONTAINMENT_VIOLATION) is aborted with the precise
+          // 'containment-violation' category — never a generic
+          // scheduler failure, and never a silent fall-through.
+          const reason = {
+            category: isContainmentViolation(error) ? 'containment-violation' : 'scheduler-execution-failed',
+            message: error.message,
+          };
           if (attempt === undefined) {
             markTerminal(state, item.caseState, campaignDir, 'TEST_INFRA_FAIL', reason);
           } else {
@@ -3511,6 +3564,15 @@ function validateLoadedState(state, campaignId) {
       && (!Array.isArray(state.resumed_at) || state.resumed_at.some((value) => !isUtcTimestamp(value)))) {
     errors.push('resumed_at contains a non-UTC timestamp');
   }
+  if (state.hygiene_canary !== undefined
+      && (!isObject(state.hygiene_canary)
+        || (state.hygiene_canary.home !== null && typeof state.hygiene_canary.home !== 'string')
+        || !Array.isArray(state.hygiene_canary.before)
+        || !Array.isArray(state.hygiene_canary.diffs)
+        || (state.hygiene_canary.armed_at !== undefined && !isUtcTimestamp(state.hygiene_canary.armed_at))
+        || (state.hygiene_canary.verified_at !== undefined && !isUtcTimestamp(state.hygiene_canary.verified_at)))) {
+    errors.push('hygiene canary state is invalid');
+  }
   return errors;
 }
 
@@ -3646,11 +3708,72 @@ function executionSelectionStateErrors(manifest, state) {
   return errors;
 }
 
+// FIX10 US-005: O18-style operator-identity hygiene canary. Before case
+// execution the campaign snapshots sha256 hashes of the operator's real
+// identity files (~/.gitconfig required; ~/.ssh/config and crontab when
+// present) into state.hygiene_canary.before. Once every case is terminal the
+// hashes are recomputed and compared; any diff is recorded as a campaign-level
+// FINDING (state.hygiene_canary.diffs with HYGIENE_* types) and forces
+// verdictExitCode to FINDINGS (exit 1) — never silent. Only hashes are ever
+// stored; file contents never leave tt-hygiene-canary.mjs. A resume keeps the
+// original before-baseline (the canary covers the whole campaign lifetime); a
+// campaign that somehow reaches terminal verify without a baseline fails
+// closed with a HYGIENE_CANARY_NOT_ARMED finding rather than a silent pass.
+function ensureHygieneCanaryBefore(state) {
+  if (state.hygiene_canary !== undefined
+      && isObject(state.hygiene_canary)
+      && Array.isArray(state.hygiene_canary.before)) {
+    return; // already armed — a resumed campaign keeps its original baseline
+  }
+  const snapshot = snapshotHygieneCanary();
+  state.hygiene_canary = {
+    home: snapshot.home,
+    before: snapshot.files,
+    diffs: [],
+    armed_at: utcTimestamp(),
+  };
+  state.updated_at = utcTimestamp();
+}
+
+function verifyHygieneCanaryAtTerminal(campaignDir, state) {
+  if (state.hygiene_canary === undefined
+      || !isObject(state.hygiene_canary)
+      || !Array.isArray(state.hygiene_canary.before)) {
+    // Fail closed: without a before baseline we cannot prove the operator
+    // identity survived the campaign — surface a loud FINDING instead of a
+    // silent pass.
+    state.hygiene_canary = {
+      home: null,
+      before: [],
+      diffs: [{
+        type: 'HYGIENE_CANARY_NOT_ARMED',
+        file: '(no before snapshot recorded)',
+        before: null,
+        after: null,
+      }],
+    };
+  } else {
+    const after = snapshotHygieneCanary();
+    const result = verifyHygieneCanary(state.hygiene_canary.before, after.files);
+    state.hygiene_canary.after = after.files;
+    state.hygiene_canary.statuses = result.statuses;
+    state.hygiene_canary.diffs = result.diffs;
+    state.hygiene_canary.home = after.home;
+  }
+  state.hygiene_canary.verified_at = utcTimestamp();
+  state.updated_at = utcTimestamp();
+  atomicWriteState(campaignDir, state);
+}
+
 function writeTerminalCampaignReports(campaignDir, state) {
   if (state.cases.some((item) => item.phase !== 'terminal')
       || (state.discovered_runs ?? []).some((run) => run.phase !== 'terminal')) {
     return 0;
   }
+  // FIX10 US-005: recompute the operator-identity hashes and compare against
+  // the pre-campaign baseline before the reports are built (the verdict and
+  // the HYGIENE CANARY section both read state.hygiene_canary).
+  verifyHygieneCanaryAtTerminal(campaignDir, state);
   return writeCampaignReports(campaignDir, state).exit_code;
 }
 
@@ -3678,6 +3801,10 @@ async function startCampaign(options, schema) {
       throw error;
     }
     const { state } = loadCampaignState(campaignId);
+    // FIX10 US-005: arm the operator-identity hygiene canary BEFORE any case
+    // execution; a snapshot failure fails the campaign closed (infra error).
+    ensureHygieneCanaryBefore(state);
+    atomicWriteState(campaignDir, state);
     await executeEligibleCases(manifest, state, campaignDir);
     const exitCode = writeTerminalCampaignReports(campaignDir, state);
     console.log(`Validated ${manifest.cases.length} case(s) from ${path.relative(TT_ROOT, manifestPath)}`);
@@ -3724,6 +3851,12 @@ async function resumeCampaign(options, schema) {
     applyExecutionSelection(manifest, state);
     atomicWriteState(campaignDir, state);
     state.discovered_runs ??= [];
+    // FIX10 US-005: a resumed campaign arms the canary before further case
+    // execution when it is not already armed (resume of a pre-US-005 campaign);
+    // an already-armed campaign keeps its original baseline. The verify still
+    // happens at terminal-report time inside writeTerminalCampaignReports.
+    ensureHygieneCanaryBefore(state);
+    atomicWriteState(campaignDir, state);
     await reconcileInterruptedAttempts(manifest, state, campaignDir);
     await reconcilePersistedDiscoveredRuns(manifest, state, campaignDir);
     await executeEligibleCases(manifest, state, campaignDir);

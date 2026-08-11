@@ -970,6 +970,70 @@ else
   fail "cmd_restart missing provenance file reference"
 fi
 
+# ── Test 47b: FIX10 US-004 fail-closed containment guard ──────────
+echo ""
+echo "--- Test: kind HOME/TAMANDUA_STATE_DIR containment guard (FIX10 US-004) ---"
+
+# guard_kind_containment must exist and refuse when the kind's spawn env
+# escapes torture-test/var (the 2026-08-05 ~/.gitconfig breach surface:
+# an uncontained HOME redirects git-identity writes to the real home).
+if grep -q 'guard_kind_containment()' "$TOOL"; then
+  pass "guard_kind_containment function exists in source"
+else
+  fail "guard_kind_containment function missing from source"
+fi
+
+if grep -q 'resolve_contained_dir()' "$TOOL"; then
+  pass "resolve_contained_dir helper exists in source"
+else
+  fail "resolve_contained_dir helper missing from source"
+fi
+
+# main() must invoke the containment guard before dispatching subcommands,
+# so every start/restart/stop/status refuses when the env escapes var.
+if grep -A 12 'guard_kind_cwd "\$kind"' "$TOOL" | grep -q 'guard_kind_containment'; then
+  pass "main dispatch runs guard_kind_containment after guard_kind_cwd"
+else
+  fail "main dispatch missing guard_kind_containment call"
+fi
+
+# The guard must check BOTH HOME and TAMANDUA_STATE_DIR from the spawn env.
+if grep -A 20 '^guard_kind_containment()' "$TOOL" | grep -q 'for spec in HOME TAMANDUA_STATE_DIR'; then
+  pass "guard_kind_containment checks HOME and TAMANDUA_STATE_DIR"
+else
+  fail "guard_kind_containment missing HOME/TAMANDUA_STATE_DIR loop"
+fi
+
+# The guard must fail closed (refuse) rather than warn-and-continue.
+if grep -A 30 '^guard_kind_containment()' "$TOOL" | grep -q 'refuse_production'; then
+  pass "guard_kind_containment fails closed via refuse_production"
+else
+  fail "guard_kind_containment does not refuse on violation"
+fi
+
+# The guard must tolerate a not-yet-provisioned contained child home
+# (fresh checkout: var/home-scripted is provisioned at daemon start) by
+# judging the nearest existing ancestor, while rejecting var itself as a
+# live HOME. Verify the escape check is a strictly-inside prefix match.
+if grep -A 40 '^guard_kind_containment()' "$TOOL" | grep -q 'torture-test/var itself'; then
+  pass "guard_kind_containment rejects var itself as a live HOME"
+else
+  fail "guard_kind_containment missing var-itself refusal"
+fi
+
+# ── Test 48: restart subcommand — provenance preserved ─────────────
+echo ""
+echo "--- Test: restart provenance preserved ---"
+
+# cmd_restart does NOT create a second provenance file — both stop and
+# start write to the SAME $PROV_DIR/$name.json. Verify no alternative
+# provenance paths are created.
+if grep -A 100 '^cmd_restart()' "$TOOL" | grep -q 'prov_file'; then
+  pass "cmd_restart references prov_file for provenance"
+else
+  fail "cmd_restart missing provenance file reference"
+fi
+
 # Verify cmd_start always writes to the same prov_file (no timestamp-suffixed backup)
 prov_paths=$(grep -o 'PROV_DIR/[^"]*' "$TOOL" | sort -u)
 prov_count=$(echo "$prov_paths" | wc -l)

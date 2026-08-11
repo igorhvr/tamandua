@@ -97,11 +97,46 @@ export function verdictExitCode(state) {
   const failClosedCause = zeroRealLaunchesCause(state);
   if (failClosedCause !== null) return { verdict: 'INFRA_FAILURE', exitCode: 2 };
   if (hasInfrastructureFailure(state)) return { verdict: 'INFRA_FAILURE', exitCode: 2 };
+  // FIX10 US-005: a hygiene-canary diff (operator-identity file changed
+  // during the campaign) is a campaign-level FINDING — never silent.
+  const hygieneDiffs = state?.hygiene_canary?.diffs;
+  if (Array.isArray(hygieneDiffs) && hygieneDiffs.length > 0) {
+    return { verdict: 'FINDINGS', exitCode: 1 };
+  }
   const hasFinding = state.cases.some((item) =>
     !['PASS', 'NOT_RUN'].includes(item.outcome) || (item.findings ?? []).length > 0);
   return hasFinding
     ? { verdict: 'FINDINGS', exitCode: 1 }
     : { verdict: 'GREEN', exitCode: 0 };
+}
+
+function hygieneCanaryFiles(hygieneCanary) {
+  if (Array.isArray(hygieneCanary.statuses)) return clone(hygieneCanary.statuses);
+  // Fallback for states without a recorded verify (pre-verify or synthetic):
+  // derive the per-file status from the before/after snapshots.
+  const before = Array.isArray(hygieneCanary.before) ? hygieneCanary.before : [];
+  const after = Array.isArray(hygieneCanary.after) ? hygieneCanary.after : [];
+  const names = new Set([...before, ...after].map((entry) => entry?.name).filter(Boolean));
+  const rows = [];
+  for (const name of names) {
+    const beforeEntry = before.find((entry) => entry.name === name);
+    const afterEntry = after.find((entry) => entry.name === name);
+    const beforeHash = beforeEntry?.hash ?? null;
+    const afterHash = afterEntry?.hash ?? null;
+    const beforePresent = beforeEntry?.present === true;
+    const afterPresent = afterEntry?.present === true;
+    const status = !beforePresent && !afterPresent
+      ? 'ABSENT'
+      : (beforePresent && afterPresent && beforeHash === afterHash) ? 'UNCHANGED' : 'CHANGED';
+    rows.push({
+      name,
+      path: afterEntry?.path ?? beforeEntry?.path ?? null,
+      before: beforeHash,
+      after: afterHash,
+      status,
+    });
+  }
+  return rows;
 }
 
 export function buildCampaignReport(state) {
@@ -179,6 +214,17 @@ export function buildCampaignReport(state) {
     pending_real: pendingReal,
     not_run: notRun,
     findings,
+    // FIX10 US-005: O18-style operator-identity hygiene canary — per-file
+    // before/after hashes and status (UNCHANGED/CHANGED/ABSENT) plus any
+    // campaign-level HYGIENE_* diffs. Hashes only, never file contents.
+    hygiene_canary: state.hygiene_canary === undefined || state.hygiene_canary === null
+      ? null
+      : {
+          home: state.hygiene_canary.home ?? null,
+          files: hygieneCanaryFiles(state.hygiene_canary),
+          diffs: state.hygiene_canary.diffs ?? [],
+          verified_at: state.hygiene_canary.verified_at ?? null,
+        },
     verdict: verdict.verdict,
     exit_code: verdict.exitCode,
     fail_closed: {
@@ -256,6 +302,19 @@ export function renderCampaignReport(report) {
     ...(report.findings.length === 0
       ? ['(none)']
       : report.findings.map((finding) => `- ${findingSummary(finding)}`)),
+    '',
+    'HYGIENE CANARY',
+    ...(report.hygiene_canary === null || report.hygiene_canary === undefined
+      ? ['(no hygiene canary state — campaign predates FIX10 US-005)']
+      : [
+          `Home: ${report.hygiene_canary.home ?? '(unresolved)'}`,
+          ...report.hygiene_canary.files.map((file) =>
+            `- ${file.name}: ${file.status} (before=${file.before ?? 'absent'}, after=${file.after ?? 'absent'})`),
+          ...(report.hygiene_canary.diffs.length === 0
+            ? ['- operator identity files unchanged']
+            : report.hygiene_canary.diffs.map((diff) =>
+                `- FINDING ${diff.type}: ${diff.file ?? diff.name ?? '?'} changed (before=${diff.before ?? 'absent'}, after=${diff.after ?? 'absent'})`)),
+        ]),
     '',
     'VERDICT',
     `${report.verdict} (exit ${report.exit_code})`,

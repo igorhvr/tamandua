@@ -126,6 +126,32 @@ stop_owned_command() {
   COMMAND_GROUP_PROVEN=0
 }
 
+# daemon_control <operation> — run daemon-control scripted for the
+# scenario's scripted daemon.
+#
+# FIX10 US-004 containment note: daemon-control is invoked with
+# HOME=$ACCOUNT_HOME (the OPERATOR's real home), NOT the contained
+# TT_SCRIPTED_HOME. This handoff is SAFE by the following invariant:
+#   1. daemon-control uses the operator HOME ONLY for its production-guard
+#      derivation — REAL_TAMANDUA_STATE (the real .tamandua state dir) and
+#      is_production_cwd's real-home comparisons in bin/daemon-control.
+#      With the contained scripted HOME it could not distinguish the real
+#      production state from TT state and would misjudge every path.
+#   2. daemon-control itself performs NO git/config writes and no
+#      HOME-side-effects: grep-verified, bin/daemon-control contains no
+#      'git config' invocation of any kind.
+#   3. Every process daemon-control spawns (the tamandua daemon, dashboard,
+#      mcp, and the stop-path CLI) is launched under
+#      `env -i $(env_for_kind <kind>)` — env_for_kind applies
+#      env/tt-env-scripted.sh via env -i, so the child HOME is the
+#      CONTAINED TT_SCRIPTED_HOME and TAMANDUA_STATE_DIR stays under
+#      torture-test/var. The operator HOME never reaches a daemon child.
+#   4. daemon-control additionally fails closed (bin/daemon-control
+#      guard_kind_containment) if a kind's resolved HOME or
+#      TAMANDUA_STATE_DIR escapes torture-test/var — so even a tampered
+#      env script cannot hand the operator HOME to a spawned daemon.
+# Therefore the real-HOME handoff is read-only (guard derivation) and
+# never inherited by anything that could write git identity.
 daemon_control() {
   local operation="$1"
   case "$operation" in start|status|restart|stop) ;;
@@ -276,10 +302,17 @@ printf '%s\n' "$DAEMON_STATUS" | grep -q 'STATUS: RUNNING' \
   export TT_SCENARIO_WORKFLOW_ID="$WORKFLOW_ID"
   export TT_SCENARIO_STATE_DIR="$INVOCATION_DIR"
   export TT_SCENARIO_EXPECTED_OUTCOME="$EXPECTED_OUTCOME"
+  # FIX10 US-004: the scenario command child must fail closed if its HOME is
+  # not contained. The env script above sets the contained HOME, but the
+  # guard below is the belt-and-suspenders check AT scenario-code-run time
+  # (covers a tampered env script or a direct invocation outside the
+  # harness); the same guard is also sourced by every scenarios/*/run.sh.
+  export TT_SCENARIO_CONTAINMENT_GUARD="$LIB_DIR/scenario-containment-guard.sh"
   # Publish readiness from inside the dedicated session, then wait until the
   # parent has proven process-group ownership before executing scenario code.
   exec setsid "$BASH_BIN" -c '
     set -euo pipefail
+    source "${TT_SCENARIO_CONTAINMENT_GUARD:?}"
     ready_file=$1
     release_file=$2
     command_path=$3

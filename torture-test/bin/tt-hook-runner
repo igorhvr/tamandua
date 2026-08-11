@@ -2,8 +2,17 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
+import { assertContainedHome } from './tt-containment.mjs';
+
+// FIX10 US-003: the runner must only ever spawn its command with a CONTAINED
+// HOME. Derive torture-test/var from the runner's own location so the check
+// works even when the runner is invoked outside tt-controller (direct
+// developer invocation — the fail-open surface behind the 2026-08-05
+// ~/.gitconfig breach).
+const TT_VAR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'var');
 
 function atomicWriteJson(filePath, value) {
   const tempPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
@@ -40,6 +49,18 @@ if (configPath === undefined) {
   }
 
   if (config !== undefined) {
+    // FIX10 US-003: fail closed BEFORE any spawn or evidence-file side
+    // effect — process.env.HOME must resolve strictly inside
+    // torture-test/var. When the runner is spawned by tt-controller it
+    // inherits the contained childEnv, so this passes; when it is invoked
+    // OUTSIDE the controller with the operator's real HOME (the 2026-08-05
+    // breach surface), it refuses with exit 2 and a clear stderr message.
+    try {
+      assertContainedHome(process.env.HOME, TT_VAR, 'process.env.HOME');
+    } catch (error) {
+      fail(error.message);
+      process.exit(2);
+    }
     const startedAt = new Date().toISOString();
     const stdoutDescriptor = fs.openSync(config.stdout_path, 'wx', 0o600);
     let stderrDescriptor;

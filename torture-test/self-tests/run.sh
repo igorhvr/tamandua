@@ -122,6 +122,18 @@ for file in "$SELF_DIR"/tier1-*.test.ts; do
   run_test_file "tier1 $base" "$file" || true
 done
 
+# ── FIX10 audit tests ──────────────────────────────────────────────
+echo ""
+echo "--- fix10 audit tests ---"
+for file in "$SELF_DIR"/fix10-*.test.ts; do
+  if [ ! -f "$file" ]; then
+    fail "fix10 glob" "no files matching $SELF_DIR/fix10-*.test.ts"
+    break
+  fi
+  base="$(basename "$file")"
+  run_test_file "fix10 audit $base" "$file" || true
+done
+
 # ── tt-poly tests ─────────────────────────────────────────────────
 echo ""
 echo "--- tt-poly tests ---"
