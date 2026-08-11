@@ -87,10 +87,10 @@ describe("www/index.html structure", () => {
     );
   });
 
-  it("links to pi GitHub repository", () => {
+  it("links to the pi website", () => {
     assert.ok(
-      html.includes("github.com/mariozechner/pi-coding-agent"),
-      "should link to pi on GitHub"
+      html.includes("https://pi.dev"),
+      "should link to pi at pi.dev"
     );
   });
 
