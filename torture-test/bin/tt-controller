@@ -2884,6 +2884,54 @@ async function monitorWorkflowRun(caseRecord, caseState, attempt, childEnv, stat
   }
 }
 
+// US-005: Definite infrastructure launch-error classification. A real-case
+// launch whose stderr exposes a DEFINITE infrastructure failure (missing
+// workflow spec, ENOENT on the workflow/catalog dir, missing catalog, or a
+// daemon/control-plane error) must be reported with THAT reason, never the
+// generic workflow-run-identification / missing-run-identifier — otherwise
+// the real defect is buried. Only a genuinely ambiguous case (run started but
+// no captured run id and no infra signature) keeps the legacy classification.
+// The classifier reads the launch-stderr evidence file that runHook durably
+// captures; it is pure/defensive (never throws) so classification always
+// falls back to the legacy category on any read/scan failure or empty input.
+const INFRA_LAUNCH_SIGNATURES = [
+  // precedence-ordered: more specific infra signatures first.
+  { re: /No workflow\.yml found/i, category: 'workflow-spec-missing' },
+  { re: /ENOENT[^\n]{0,120}(?:workflow|catalog)[^\n]{0,120}/i, category: 'workflow-dir-enoent' },
+  { re: /(?:catalog|workflow)[^\n]{0,80}not (?:found|installed|provisioned)[^\n]{0,80}/i, category: 'catalog-missing' },
+  { re: /daemon[^\n]{0,80}(?:down|unreachable|refused to connect|connect\s+refused|ECONNREFUSED|not running)/i, category: 'daemon-unreachable' },
+  { re: /control[ -]plane[^\n]{0,80}(?:down|unreachable|refused|fail|error)/i, category: 'daemon-unreachable' },
+  { re: /ECONNREFUSED[^\n]{0,80}(?:port|daemon|control|433[0-9]|333[0-9])/i, category: 'daemon-unreachable' },
+];
+
+// Returns a reason fragment { category, message, signature } when the launch
+// stderr contains a definite infrastructure-failure signature, else null.
+function classifyInfraLaunchFailure(launchStderr) {
+  if (typeof launchStderr !== 'string' || launchStderr.trim().length === 0) return null;
+  for (const signature of INFRA_LAUNCH_SIGNATURES) {
+    const match = signature.re.exec(launchStderr);
+    if (match === null) continue;
+    // Surface the exact error message near the matched signature as evidence.
+    const start = Math.max(0, match.index - 160);
+    const end = Math.min(launchStderr.length, match.index + match[0].length + 240);
+    const snippet = launchStderr.slice(start, end);
+    const message = snippet.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).slice(0, 4).join(' | ');
+    return { category: signature.category, message, signature: match[0] };
+  }
+  return null;
+}
+
+// Read the launch-stderr evidence file a runHook produced; never throws.
+function readLaunchEvidenceStderr(campaignDir, launchResult) {
+  try {
+    const relative = launchResult?.stderr;
+    if (typeof relative !== 'string' || relative.length === 0) return '';
+    return fs.readFileSync(path.join(campaignDir, relative.split('/').join(path.sep)), 'utf8');
+  } catch {
+    return '';
+  }
+}
+
 async function executeWorkflowCase(caseRecord, caseState, state, campaignDir) {
   if (hasAssociatedNonterminalRun(caseState)) return;
   const launchIntentTimestamp = utcTimestamp();
@@ -3033,12 +3081,19 @@ async function executeWorkflowCase(caseRecord, caseState, state, campaignDir) {
   if (attempt.run_id_error !== undefined || attempt.run_id === undefined) {
     attempt.phase = 'terminal';
     attempt.terminal_at = utcTimestamp();
+    // US-005: surface a DEFINITE launch infra failure by its actual reason
+    // (reading the launch-stderr evidence runHook produced), not the generic
+    // missing-run-identifier. Only a genuinely ambiguous case (no captured run
+    // id AND no infra signature) keeps the legacy classification.
+    const infra = classifyInfraLaunchFailure(readLaunchEvidenceStderr(campaignDir, launchResult));
     persistMechanicalOutcome(caseState, attempt, state, campaignDir, 'TEST_INFRA_FAIL', {
-      category: 'workflow-run-identification',
-      error: attempt.run_id_error ?? {
-        category: 'missing-run-identifier',
-        resolution_errors: attempt.run_id_resolution_errors ?? [],
-      },
+      category: infra !== null ? infra.category : 'workflow-run-identification',
+      ...(infra !== null
+        ? { message: infra.message, signature: infra.signature }
+        : { error: attempt.run_id_error ?? {
+            category: 'missing-run-identifier',
+            resolution_errors: attempt.run_id_resolution_errors ?? [],
+          } }),
       exit_code: launchResult.exit_code,
       signal: launchResult.signal,
     });
@@ -3624,6 +3679,11 @@ function createInitialState(campaignId, manifestPath, manifest, options) {
     updated_at: timestamp,
     resume_count: 0,
     resumed_at: [],
+    // E2.5 US-004: populated only when the campaign runs the real-case
+    // preflight (real selection, not scripted-only, not dry-run). null
+    // otherwise. Records the preflight legs and, at teardown, the daemon-stop
+    // outcome so a failure is attributable to a DISTINCT reason (US-004 AC2).
+    real_preflight: null,
     options: {
       concurrency: options.concurrency,
       stagger_ms: options.staggerMs,
@@ -3777,6 +3837,145 @@ function writeTerminalCampaignReports(campaignDir, state) {
   return writeCampaignReports(campaignDir, state).exit_code;
 }
 
+// ── E2.5 US-004: real-case campaign preflight wiring ─────────────────────
+// Before any real case executes, tt-controller must ensure the CONTAINED real
+// TT home is provisioned (US-001), the bundled workflow catalog is installed
+// (US-002), and the real TT daemon is up on the 43xx ports (US-003) —
+// otherwise a real launch lands in an unprovisioned home and fails with a
+// misleading run-identification error. Each leg delegates to its dedicated
+// helper under the CONTAINED spawn env and FAILS CLOSED with a DISTINCT
+// machine-parseable reason (tt-home-unprovisioned / catalog-missing /
+// tt-daemon-down). The daemon is stopped at campaign end (and on resume) for
+// hygiene. Scripted-only selections and TT_DRY_RUN_REAL_LAUNCH dry runs never
+// require or start the real daemon (US-004 AC4). The operator's ~/.tamandua
+// and 33xx daemon are never touched (all helpers run under env/tt-env.sh).
+const PREFLIGHT_PROVISION_PATH = process.env.TT_CONTROLLER_PREFLIGHT_PROVISION === undefined
+  ? path.join(BIN_DIR, 'tt-provision-home')
+  : path.resolve(process.env.TT_CONTROLLER_PREFLIGHT_PROVISION);
+const PREFLIGHT_CATALOG_PATH = process.env.TT_CONTROLLER_PREFLIGHT_CATALOG === undefined
+  ? path.join(BIN_DIR, 'tt-catalog-install')
+  : path.resolve(process.env.TT_CONTROLLER_PREFLIGHT_CATALOG);
+const PREFLIGHT_DAEMON_PATH = process.env.TT_CONTROLLER_PREFLIGHT_DAEMON === undefined
+  ? path.join(BIN_DIR, 'tt-daemon-up')
+  : path.resolve(process.env.TT_CONTROLLER_PREFLIGHT_DAEMON);
+
+// Preflight engages ONLY for a real arm: the selection includes a real
+// (non-scripted) case, is not scripted-only, and is not a zero-token dry-run.
+// TT_CONTROLLER_PREFLIGHT_DISABLED=1 is an explicit escape hatch for
+// unit-style controller regression tests that simulate real launches with a
+// stub `tamandua` (tight timing windows, no contained real daemon set up);
+// real deployments leave it unset so the preflight runs automatically.
+const PREFLIGHT_DISABLED_ENV = 'TT_CONTROLLER_PREFLIGHT_DISABLED';
+
+function realPreflightRequired(manifest, state) {
+  if (process.env[PREFLIGHT_DISABLED_ENV] === '1') return false;
+  if (dryRunRealLaunchOutPath() !== null) return false;
+  if ((state.options.execution_selection ?? 'all') === 'scripted-only') return false;
+  return manifest.cases.some((caseRecord) => !caseUsesScriptedEnvironment(caseRecord));
+}
+
+// Extract the DISTINCT machine-parseable reason from a helper's stderr.
+function readPreflightReason(stderr) {
+  const line = (stderr || '').split(/\r?\n/).find((l) => /^REASON:\s*/.test(l));
+  return line === undefined ? null : line.replace(/^REASON:\s*/, '').trim();
+}
+
+function spawnPreflightLeg(script, args, env) {
+  const result = spawnSync('bash', [script, ...args], {
+    cwd: TT_ROOT,
+    env,
+    encoding: 'utf8',
+    maxBuffer: 16 * 1024 * 1024,
+    timeout: 5 * 60_000,
+    shell: false,
+  });
+  if (result.error !== undefined) {
+    return { ok: false, error: result.error.message, stderr: result.stderr ?? '' };
+  }
+  return { ok: result.status === 0, exit_code: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
+}
+
+function persistPreflightState(campaignDir, state, preflight) {
+  state.real_preflight = preflight;
+  state.updated_at = utcTimestamp();
+  atomicWriteState(campaignDir, state);
+}
+
+// Runs the three preflight legs in order under the CONTAINED real spawn env.
+// On any leg failure it FAILS CLOSED: persists the DISTINCT reason and throws
+// so the campaign aborts non-zero (US-004 AC2). Never touches the operator's
+// ~/.tamandua or 33xx daemon.
+function runRealPreflight(campaignDir, state) {
+  let env;
+  try {
+    env = loadSpawnEnvironment(false);
+  } catch (error) {
+    persistPreflightState(campaignDir, state, {
+      engaged: true,
+      ok: false,
+      leg: 'spawn-environment',
+      reason: 'spawn-environment',
+      message: error.message,
+      stopped_at: null,
+    });
+    throw new Error(`real-case preflight FAILED at spawn-environment: ${error.message}`);
+  }
+  const legs = [
+    { label: 'home-provision', script: PREFLIGHT_PROVISION_PATH, args: ['--fail-closed'], reason: 'tt-home-unprovisioned' },
+    { label: 'catalog-install', script: PREFLIGHT_CATALOG_PATH, args: [], reason: 'catalog-missing' },
+    { label: 'daemon-up', script: PREFLIGHT_DAEMON_PATH, args: ['ensure-up'], reason: 'tt-daemon-down' },
+  ];
+  const outcomes = [];
+  for (const leg of legs) {
+    const result = spawnPreflightLeg(leg.script, leg.args, env);
+    outcomes.push({
+      leg: leg.label,
+      ok: result.ok,
+      exit_code: result.exit_code ?? null,
+      ...(result.stderr ? { stderr_tail: result.stderr.trim().slice(-500) } : {}),
+    });
+    if (!result.ok) {
+      const detected = readPreflightReason(result.stderr) ?? leg.reason;
+      persistPreflightState(campaignDir, state, {
+        engaged: true,
+        ok: false,
+        leg: leg.label,
+        reason: detected,
+        message: result.error ?? `preflight ${leg.label} leg exited ${result.exit_code ?? 'non-zero'}`,
+        legs: outcomes,
+        stopped_at: null,
+      });
+      throw new Error(`real-case preflight FAILED at ${leg.label}: ${detected}`);
+    }
+  }
+  persistPreflightState(campaignDir, state, { engaged: true, ok: true, legs: outcomes, started_at: utcTimestamp(), stopped_at: null });
+  for (const o of outcomes) console.log(`Real-case preflight ${o.leg}: ${o.ok ? 'OK' : 'FAILED'}`);
+}
+
+// Campaign-end (and resume) hygiene: stop the contained real daemon so ports
+// 43xx are free and no process leaks (US-004 AC3). Delegates to tt-daemon-up
+// stop, which is idempotent and fails closed. Best-effort: never throws.
+function stopRealDaemon(campaignDir, state) {
+  let env;
+  try {
+    env = loadSpawnEnvironment(false);
+  } catch {
+    return;
+  }
+  const result = spawnPreflightLeg(PREFLIGHT_DAEMON_PATH, ['stop'], env);
+  if (state) {
+    if (!state.real_preflight) state.real_preflight = { engaged: true };
+    state.real_preflight.stopped_at = utcTimestamp();
+    state.real_preflight.stop_ok = result.ok;
+    if (!result.ok) {
+      state.real_preflight.stop_message = result.error ?? `daemon stop exited ${result.exit_code ?? 'non-zero'}`;
+    }
+    state.updated_at = utcTimestamp();
+    atomicWriteState(campaignDir, state);
+  }
+  if (!result.ok) console.error(`Real-case daemon stop hygiene FAILED: ${result.error ?? ''}`);
+}
+
 async function startCampaign(options, schema) {
   const manifestPath = resolveManifestPath(options.manifest);
   const manifest = applyCaseFilter(loadManifest(manifestPath, schema), options.caseId);
@@ -3786,6 +3985,7 @@ async function startCampaign(options, schema) {
   const hostProfile = loadRequiredHostProfile(selectedCases);
   const { campaignId, campaignDir } = createCampaignDirectory();
   const releaseCampaignLock = acquireCampaignLock(campaignDir);
+  let teardownState = null;
   try {
     try {
       const state = createInitialState(campaignId, manifestPath, manifest, options);
@@ -3805,12 +4005,21 @@ async function startCampaign(options, schema) {
     // execution; a snapshot failure fails the campaign closed (infra error).
     ensureHygieneCanaryBefore(state);
     atomicWriteState(campaignDir, state);
+    // E2.5 US-004: run the real-case preflight before executeEligibleCases so
+    // real cases never launch into an unprovisioned home. A failing leg aborts
+    // the campaign closed with a DISTINCT reason. The daemon is stopped in the
+    // finally/teardown path (both on success and on any preflight/exec error).
+    if (realPreflightRequired(manifest, state)) {
+      teardownState = state;
+      runRealPreflight(campaignDir, state);
+    }
     await executeEligibleCases(manifest, state, campaignDir);
     const exitCode = writeTerminalCampaignReports(campaignDir, state);
     console.log(`Validated ${manifest.cases.length} case(s) from ${path.relative(TT_ROOT, manifestPath)}`);
     console.log(`Campaign: ${campaignId}`);
     return exitCode;
   } finally {
+    if (teardownState !== null) stopRealDaemon(campaignDir, teardownState);
     releaseCampaignLock();
   }
 }
@@ -3818,6 +4027,7 @@ async function startCampaign(options, schema) {
 async function resumeCampaign(options, schema) {
   const campaignDir = resolveCampaignDirectory(options.resume);
   const releaseCampaignLock = acquireCampaignLock(campaignDir);
+  let teardownState = null;
   try {
     const { state } = loadCampaignState(options.resume);
     const persistedManifestPath = resolveManifestPath(path.join(TT_ROOT, state.manifest.path));
@@ -3859,6 +4069,12 @@ async function resumeCampaign(options, schema) {
     atomicWriteState(campaignDir, state);
     await reconcileInterruptedAttempts(manifest, state, campaignDir);
     await reconcilePersistedDiscoveredRuns(manifest, state, campaignDir);
+    // E2.5 US-004: on resume we verify the real-case preflight again before
+    // further real-case execution, and stop the daemon in teardown for hygiene.
+    if (realPreflightRequired(manifest, state)) {
+      teardownState = state;
+      runRealPreflight(campaignDir, state);
+    }
     await executeEligibleCases(manifest, state, campaignDir);
     const exitCode = writeTerminalCampaignReports(campaignDir, state);
     console.log(`Validated ${manifest.cases.length} case(s) from ${path.relative(TT_ROOT, manifestPath)}`);
@@ -3866,6 +4082,7 @@ async function resumeCampaign(options, schema) {
     console.log(`Campaign: ${state.campaign_id}`);
     return exitCode;
   } finally {
+    if (teardownState !== null) stopRealDaemon(campaignDir, teardownState);
     releaseCampaignLock();
   }
 }

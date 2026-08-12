@@ -5,6 +5,18 @@
 # (torture-test/var/home-scripted/) per spec 01 TT_HOME provisioning
 # checklist.
 #
+# Modes:
+#   (no args)           — idempotent best-effort provisioning (Phase A).
+#   --fail-closed       — ITERATIVE fail-closed preflight: provisions the REAL
+#                         contained TT home (resolved from env/tt-env.sh, never
+#                         the operator's ~/.tamandua) and VERIFIES the spec-01
+#                         required legs. On ANY leg that cannot be established
+#                         (missing dirs, gitconfig identity, copy failure) it
+#                         exits non-zero and emits the DISTINCT machine-parseable
+#                         reason string `tt-home-unprovisioned` on stderr.
+#                         Idempotent: repeated runs against a healthy home are
+#                         no-ops.
+#
 # Idempotent: safe to run repeatedly — second run is a no-op.
 # Follows spec 01 two-env rule: never mutates caller environment.
 set -euo pipefail
@@ -119,13 +131,130 @@ remove_ssh_dir() {
   fi
 }
 
+# ── contained TT_HOME resolution (fail-closed) ──────────────────────
+
+# resolve_contained_tt_home: prints the REAL contained TT_HOME (the home the
+# spawned tamandua/pi/hermes processes actually use). Resolution priority:
+#   1. TT_VAR env override (test seam) → $TT_VAR/home
+#   2. env/tt-env.sh `print` output → TT_HOME (the contained home under
+#      torture-test/var, ports 43xx)
+#   3. ultimate fallback → $TT_DIR/var/home
+#
+# It NEVER resolves to the operator's real ~/.tamandua: the env script derives
+# TT_HOME from TT_REPO_ROOT (torture-test/var/home), which is inside the repo.
+resolve_contained_tt_home() {
+  if [ -n "${TT_VAR:-}" ]; then
+    printf '%s' "$TT_VAR/home"
+    return 0
+  fi
+  local env_script="$TT_DIR/env/tt-env.sh"
+  if [ -f "$env_script" ]; then
+    local home_line
+    home_line="$(env -i bash "$env_script" print 2>/dev/null | grep '^TT_HOME=' | head -n1 || true)"
+    if [ -n "$home_line" ]; then
+      local home
+      home="${home_line#TT_HOME=}"
+      if [ -n "$home" ]; then
+        printf '%s' "$home"
+        return 0
+      fi
+    fi
+  fi
+  printf '%s' "$TT_VAR/home"
+}
+
+# verify_gitconfig_identity: returns 0 if $1/.gitconfig carries the spec-01
+# required identity fields rooted at the contained home; prints the failing
+# leg names otherwise (never exits the script).
+verify_gitconfig_identity() {
+  local cfg="$1/.gitconfig"
+  [ -f "$cfg" ] || { printf 'gitconfig-missing'; return 1; }
+  local required=("user.name" "user.email" "commit.gpgsign" "init.defaultBranch" "pull.ff")
+  local missing=""
+  local r
+  for r in "${required[@]}"; do
+    local val
+    val="$(git config -f "$cfg" --get "$r" 2>/dev/null || true)"
+    if [ -z "$val" ]; then
+      missing="${missing}${r};"
+    fi
+  done
+  # Belt-and-suspenders: the exact TT identity per spec 01 (a wrong identity
+  # is a provisioning defect even though the keys parse).
+  local name email
+  name="$(git config -f "$cfg" --get user.name 2>/dev/null || true)"
+  email="$(git config -f "$cfg" --get user.email 2>/dev/null || true)"
+  [ "$name" != "Tamandua Torture Test" ] && missing="${missing}identity:user.name;"
+  [ "$email" != "tt@tamandua.test" ] && missing="${missing}identity:user.email;"
+  if [ -n "$missing" ]; then
+    printf '%s' "$missing"
+    return 1
+  fi
+  return 0
+}
+
+# fail_closed_real_home: ensures the REAL contained TT home is provisioned and
+# fail-closes with the DISTINCT reason `tt-home-unprovisioned` if any leg cannot
+# be established. Runs entirely under the contained env semantics — the copy
+# sources are the operator's real ~/.pi and ~/.hermes, but every WRITE lands
+# under the contained TT_VAR; the operator's ~/.tamandua and 33xx daemon are
+# never touched.
+fail_closed_real_home() {
+  local home
+  home="$(resolve_contained_tt_home)"
+  local fail=""
+
+  # Provisioning must be best-effort here so the verification legs below are
+  # what decides the outcome (a sub-step failure is a leg, not an abort).
+  set +e
+  provision_gitconfig "$home"
+  copy_and_audit "$HOME/.pi"      "$home/.pi"      "$home/provision-audit.json" "~/.pi"
+  copy_and_audit "$HOME/.hermes"  "$home/.hermes"  "$home/provision-audit.json" "~/.hermes"
+  remove_ssh_dir "$home"
+
+  # ── verification legs (fail-closed) ──
+  if [ ! -d "$home" ]; then
+    fail="${fail}missing-dir:${home};"
+  fi
+  if [ -d "$home" ]; then
+    local gitcfg_fail
+    gitcfg_fail="$(verify_gitconfig_identity "$home")" && true
+    if [ "$gitcfg_fail" != "" ] || [ ! -f "$home/.gitconfig" ]; then
+      fail="${fail}gitconfig:${gitcfg_fail:-missing};"
+    fi
+  else
+    fail="${fail}gitconfig:no-home;"
+  fi
+  # Copy legs: a copy is a failure ONLY when the operator source exists but the
+  # contained destination is absent (a genuine copy failure). If the operator
+  # has no ~/.pi / ~/.hermes the base tool skips intentionally — not a leg.
+  local copy_item src dst
+  for copy_item in ".pi" ".hermes"; do
+    src="${HOME}/${copy_item}"
+    dst="${home}/${copy_item}"
+    if [ -d "$src" ] && [ ! -d "$dst" ]; then
+      fail="${fail}copy-missing:${copy_item};"
+    fi
+  done
+  set -e
+
+  if [ -n "$fail" ]; then
+    echo "REASON: tt-home-unprovisioned" >&2
+    echo "DETAILS: ${fail}" >&2
+    log "FAIL: contained TT home NOT provisioned ($home)" >&2
+    return 1
+  fi
+  log "OK: contained TT home provisioned at $home"
+  return 0
+}
+
 # ── usage ────────────────────────────────────────────────────────────
 
 usage() {
   cat <<EOF
 tt-provision-home — idempotently provisions TT_HOME directories.
 
-Usage: tt-provision-home [--help]
+Usage: tt-provision-home [--fail-closed] [--help]
 
 Provisions:
   torture-test/var/home/          (real TT_HOME)
@@ -140,6 +269,14 @@ Scripted TT_HOME gets:
   - .gitconfig only (same settings)
   - NO .pi / .hermes copies
 
+--fail-closed (E2.5): preflight mode for real-case campaigns. Resolves the
+  contained real TT_HOME (from env/tt-env.sh — never the operator's
+  ~/.tamandua), provisions it if absent, then FAILS CLOSED with the DISTINCT
+  machine-parseable reason string 'tt-home-unprovisioned' (exit non-zero) if
+  any spec-01 required leg cannot be established. Idempotent: repeated runs
+  against a healthy home are no-ops (exit 0). Never touches the operator's
+  ~/.tamandua or the 33xx daemon.
+
 Idempotent: safe to run repeatedly — second run is a no-op.
 Never mutates the caller's environment (spec 01 two-env rule).
 EOF
@@ -149,8 +286,8 @@ EOF
 
 case "${1:-}" in
   --help|-h) usage; exit 0 ;;
+  --fail-closed|-f) FAIL_CLOSED=1 ;;  # leading marker; handled below
   "")
-    # proceed
     ;;
   *)
     echo "Unknown argument: $1" >&2
@@ -158,6 +295,14 @@ case "${1:-}" in
     exit 2
     ;;
 esac
+
+# ── dispatch ──────────────────────────────────────────────────────────
+
+if [ "${FAIL_CLOSED:-0}" = "1" ]; then
+  fail_closed_real_home
+  exit $?
+fi
+
 
 log "Starting TT_HOME provisioning"
 log "  Real TT_HOME  : $REAL_TT_HOME"

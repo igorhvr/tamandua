@@ -1,0 +1,318 @@
+#!/usr/bin/env bash
+# tt-catalog-install — stamp-aware bundled workflow catalog install for the
+# CONTAINED TT home (E2.5 US-002).
+#
+# Installs the repo's own bundled workflow catalog into the contained TT home
+# (torture-test/var/home/.tamandua/workflows) by running the repo's OWN dist
+# build of `tamandua workflow install --all` under the contained spawn env
+# (env/tt-env.sh — never the operator's ~/.tamandua or 33xx daemon).
+#
+# Idempotence / stamp semantics:
+#   - The install records a catalog stamp (.catalog-version.json) carrying the
+#     build version + source path + install timestamp.
+#   - If the existing stamp already matches the CURRENT build/source AND the
+#     catalog is present and complete, the helper SKIPS the install entirely
+#     (zero churn).
+#   - If the stamp is stale (older build), absent, source mismatch, or the
+#     catalog is incomplete, it REINSTALLS — reinstall is NOT a failure.
+#   - Only if the catalog still cannot be installed/verified present after a
+#     reinstall attempt does it FAIL CLOSED with the DISTINCT machine-parseable
+#     reason `catalog-missing` on stderr and exit non-zero.
+#
+# Env/resolution:
+#   - TT_VAR         : override the torture-test/var root (test seam). Defaults
+#                      to torture-test/var.
+#   - TT_WORKFLOWS_SRC: override the source workflows dir (test seam). Defaults
+#                      to the repo's workflows/ dir (the repo's own bundled
+#                      catalog — never the operator's).
+#   - The tamandua CLI invoked is the repo's own dist build
+#     ($TT_REPO_ROOT/dist/cli/cli.js), so the recorded build version and the
+#     installed catalog always correspond to THIS checkout.
+#
+# Idempotent for same-build/same-source: safe to run repeatedly — second run is
+# a no-op (no reinstall churn). Never mutates the caller's environment.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TT_DIR="$(dirname "$SCRIPT_DIR")"                        # torture-test/
+TT_REPO_ROOT="$(dirname "$TT_DIR")"                      # repo root
+# Allow override for testing
+TT_VAR="${TT_VAR:-$TT_DIR/var}"
+TT_ENV_REAL="$TT_DIR/env/tt-env.sh"
+
+# The repo's own dist CLI (this checkout's build) — never the operator's ~/.tamandua.
+TAMANDUA_CLI="$TT_REPO_ROOT/dist/cli/cli.js"
+# Source of the bundled catalog: the repo's own workflows dir (override for tests).
+SOURCE_WORKFLOWS="${TT_WORKFLOWS_SRC:-$TT_REPO_ROOT/workflows}"
+
+# ── helpers ───────────────────────────────────────────────────────────
+
+log() { printf '[tt-catalog-install] %s\n' "$*"; }
+
+# resolve_contained_tt_home: prints the REAL contained TT_HOME (the home the
+# spawned tamandua processes actually use). Resolution priority:
+#   1. TT_VAR env override (test seam) → $TT_VAR/home
+#   2. env/tt-env.sh `print` output → TT_HOME
+#   3. ultimate fallback → $TT_DIR/var/home
+# It NEVER resolves to the operator's real ~/.tamandua.
+resolve_contained_tt_home() {
+  if [ -n "${TT_VAR:-}" ]; then
+    printf '%s' "$TT_VAR/home"
+    return 0
+  fi
+  if [ -f "$TT_ENV_REAL" ]; then
+    local home_line
+    home_line="$(env -i bash "$TT_ENV_REAL" print 2>/dev/null | grep '^TT_HOME=' | head -n1 || true)"
+    if [ -n "$home_line" ]; then
+      local home
+      home="${home_line#TT_HOME=}"
+      if [ -n "$home" ]; then
+        printf '%s' "$home"
+        return 0
+      fi
+    fi
+  fi
+  printf '%s' "$TT_VAR/home"
+}
+
+# read_build_version: the current build version of THIS checkout's dist build.
+# Uses dist/version (same source getBuildVersion() reads). Falls back to
+# "unknown" if the file is absent.
+read_build_version() {
+  local v
+  v="$(cat "$TT_REPO_ROOT/dist/version" 2>/dev/null | tr -d '[:space:]' || true)"
+  printf '%s' "${v:-unknown}"
+}
+
+# repo_root_real: the realpath of the repo root — this is the sourcePath that
+# the tamandua install records in the catalog stamp (resolveSourcePath()).
+repo_root_real() {
+  (cd "$TT_REPO_ROOT" && pwd -P) 2>/dev/null || printf '%s' "$TT_REPO_ROOT"
+}
+
+# read_stamp_version / read_stamp_source: parse fields from an installed stamp
+# file. Print empty on missing/invalid.
+read_stamp_field() {
+  local stamp="$1" field="$2"
+  [ -f "$stamp" ] || return 0
+  local val
+  val="$(sed -n "s/^[[:space:]]*\"${field}\"[[:space:]]*:[[:space:]]*\"\(.*\)\",\?$/\1/p" "$stamp" | head -n1)"
+  printf '%s' "$val"
+}
+
+# count_source_workflows: number of workflow specs in the source dir.
+count_source_workflows() {
+  local n=0
+  local d
+  if [ -d "$SOURCE_WORKFLOWS" ]; then
+    for d in "$SOURCE_WORKFLOWS"/*/; do
+      [ -e "$d" ] || continue
+      if [ -f "$d/workflow.yml" ]; then n=$((n + 1)); fi
+    done
+  fi
+  printf '%s' "$n"
+}
+
+# verify_catalog_present: returns 0 iff EVERY source workflow spec has a
+# matching installed copy under $1/.tamandua/workflows (catalog complete).
+# Prints nothing when complete, a failing summary otherwise (never exits).
+verify_catalog_present() {
+  local home="$1"
+  local inst="$home/.tamandua/workflows"
+  if [ ! -d "$inst" ]; then
+    echo "catalog-dir-missing:$inst"
+    return 1
+  fi
+  local missing=""
+  local n=0
+  local d base
+  if [ -d "$SOURCE_WORKFLOWS" ]; then
+    for d in "$SOURCE_WORKFLOWS"/*/; do
+      [ -e "$d" ] || continue
+      base="$(basename "$d")"
+      if [ -f "$d/workflow.yml" ]; then
+        n=$((n + 1))
+        if [ ! -f "$inst/$base/workflow.yml" ]; then
+          missing="${missing}${base};"
+        fi
+      fi
+    done
+  fi
+  if [ "$n" -eq 0 ]; then
+    # No source workflows resolvable — an empty catalog is a defect here.
+    echo "empty-catalog-source:$SOURCE_WORKFLOWS"
+    return 1
+  fi
+  if [ -n "$missing" ]; then
+    echo "missing-workflows:${missing}"
+    return 1
+  fi
+  return 0
+}
+
+# ensure_contained_pi_config: the tamandua install requires a READABLE
+# ~/.pi/agent/settings.json in the spawn HOME (install hard-fails otherwise).
+# If it is absent in the contained home, seed a minimal valid config — copying
+# the operator's real pi settings when present, else a minimal stub. Writes
+# ONLY under the contained home. Non-churning (no-op when already present).
+ensure_contained_pi_config() {
+  local home="$1"
+  local dest="$home/.pi/agent/settings.json"
+  if [ -f "$dest" ]; then
+    return 0
+  fi
+  mkdir -p "$(dirname "$dest")"
+  if [ -f "$HOME/.pi/agent/settings.json" ]; then
+    cp "$HOME/.pi/agent/settings.json" "$dest"
+    log "  seeded contained pi config from operator ~/.pi/agent/settings.json"
+  else
+    printf '{\n  "defaultProvider": "local",\n  "defaultModel": "local"\n}\n' > "$dest"
+    log "  seeded minimal contained pi config (operator ~/.pi/agent/settings.json absent)"
+  fi
+}
+
+# run_install: runs the repo's own `tamandua workflow install --all` under the
+# contained spawn env. Returns the command's exit code.
+run_install() {
+  local home="$1"
+  # Compose the contained spawn env when the env script is available; else fall
+  # back to a minimal contained env (HOME + TAMANDUA_STATE_DIR only).
+  #
+  # The spawn HOME and TAMANDUA_STATE_DIR are ALWAYS forced to the resolved
+  # contained home ($home) — this guarantees the install, verification, and
+  # stamp all target the SAME contained home even under a TT_VAR test-seam
+  # override (the static env script would otherwise pin HOME to the repo's own
+  # var/home). Never the operator's ~/.tamandua: tt-env derives HOME under
+  # torture-test/var, and any TT_VAR override stays inside the test temp dir.
+  if [ -f "$TT_ENV_REAL" ]; then
+    env -i $(env -i bash "$TT_ENV_REAL" print) \
+      HOME="$home" \
+      TAMANDUA_STATE_DIR="$home/.tamandua" \
+      TAMANDUA_WORKFLOWS_SRC="$SOURCE_WORKFLOWS" \
+      PATH="${PATH}" \
+      node "$TAMANDUA_CLI" workflow install --all
+  else
+    env -i \
+      HOME="$home" \
+      TAMANDUA_STATE_DIR="$home/.tamandua" \
+      TAMANDUA_WORKFLOWS_SRC="$SOURCE_WORKFLOWS" \
+      PATH="${PATH}" \
+      node "$TAMANDUA_CLI" workflow install --all
+  fi
+}
+
+# ── usage ─────────────────────────────────────────────────────────────
+
+usage() {
+  cat <<'EOF'
+tt-catalog-install — stamp-aware bundled workflow catalog install (E2.5 US-002).
+
+Usage: tt-catalog-install [--force] [--help]
+
+Installs the repo's OWN bundled workflow catalog into the CONTAINED TT home
+(torture-test/var/home/.tamandua/workflows) by running the repo's own dist
+build of `tamandua workflow install --all` under the contained spawn env
+(env/tt-env.sh — never the operator's ~/.tamandua or the 33xx daemon).
+
+Stamp semantics:
+  - Records a catalog stamp (.catalog-version.json) with build version, source
+    path, and install timestamp after a successful install.
+  - Same build + same source + complete catalog -> SKIP (no churn, exit 0).
+  - Stale/absent/mismatched stamp or incomplete catalog -> REINSTALL (not a
+    failure).
+  - Only a catalog that still cannot be installed/verified fails closed with
+    the DISTINCT reason 'catalog-missing' on stderr and a non-zero exit.
+
+Options:
+  --force    Always reinstall, ignoring a matching stamp (used for tests / US-006).
+  --help,-h  Show this help.
+
+Idempotent for same-build/same-source: safe to run repeatedly.
+Never mutates the caller's environment; writes only under torture-test/var.
+EOF
+}
+
+# ── main ──────────────────────────────────────────────────────────────
+
+FORCE=0
+case "${1:-}" in
+  --help|-h) usage; exit 0 ;;
+  --force|-ff) FORCE=1 ;;
+  "")
+    ;;
+  *)
+    echo "tt-catalog-install: Unknown argument: $1" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
+shift 2>/dev/null || true
+
+home="$(resolve_contained_tt_home)"
+inst="$home/.tamandua/workflows"
+stamp_path="$inst/.catalog-version.json"
+
+src_workflows_total="$(count_source_workflows)"
+build_version="$(read_build_version)"
+# The stamp's sourcePath is resolution of the tamandua BINARY's repo root
+# (resolveSourcePath) — the realpath of the repo, NOT the workflows dir.
+source_real="$(repo_root_real)"
+
+log "Contained TT home : $home"
+log "Source catalog    : $SOURCE_WORKFLOWS ($src_workflows_total workflow(s))"
+log "Current build     : $build_version"
+
+if [ -z "$build_version" ] || [ "$build_version" = "unknown" ]; then
+  echo "REASON: catalog-missing" >&2
+  echo "DETAILS: cannot determine current build version (dist/version absent) — catalog install not possible" >&2
+  log "FAIL: no build version resolvable" >&2
+  exit 1
+fi
+
+# ── idempotence: skip when stamp matches current build/source & catalog complete ──
+if [ "$FORCE" -ne 1 ]; then
+  existing_version="$(read_stamp_field "$stamp_path" "version")"
+  existing_source="$(read_stamp_field "$stamp_path" "sourcePath")"
+  verify_out="$(verify_catalog_present "$home" || true)"
+  if [ "$existing_version" = "$build_version" ] && [ "$existing_source" = "$source_real" ] && [ -z "$verify_out" ]; then
+    log "IDEMPOTENT: catalog already current ($build_version) and complete — skipping install (zero churn)."
+    exit 0
+  fi
+  if [ -z "$existing_version" ]; then
+    log "Catalog stamp absent — reinstalling."
+  elif [ "$existing_version" != "$build_version" ]; then
+    log "Catalog stamp stale ($existing_version != $build_version) — reinstalling (not a failure)."
+  elif [ "$existing_source" != "$source_real" ]; then
+    log "Catalog source mismatch — reinstalling."
+  elif [ -n "$verify_out" ]; then
+    log "Catalog incomplete ($verify_out) — reinstalling."
+  else
+    log "Catalog requires reinstall."
+  fi
+else
+  log "FORCE: reinstalling regardless of stamp."
+fi
+
+# ── preflight: contained pi config must be readable for install to succeed ──
+ensure_contained_pi_config "$home"
+
+# ── reinstall ──
+log "Running repo's own dist build: tamandua workflow install --all under contained env..."
+set +e
+run_install "$home"
+install_rc=$?
+set -e
+log "Install command exited rc=$install_rc."
+
+# ── verify — fail CLOSED with DISTINCT reason catalog-missing if not present ──
+verify_out="$(verify_catalog_present "$home" || true)"
+if [ -n "$verify_out" ]; then
+  echo "REASON: catalog-missing" >&2
+  echo "DETAILS: bundled workflow catalog could not be installed/verified in the contained TT home: $home" >&2
+  echo "VERIFY: ${verify_out}" >&2
+  log "FAIL: catalog missing/incomplete after install ($verify_out) rc=$install_rc" >&2
+  exit 1
+fi
+
+log "OK: catalog present and complete in contained TT home ($inst)."
+exit 0

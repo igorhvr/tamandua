@@ -35,8 +35,16 @@ PROV_DIR="$TT_ROOT/daemon-control"
 
 # Production ports (spec 01: real daemon on 43xx; production is 33xx)
 PROD_PORTS="3334 3338 3339"
-# Real tamandua state dir (the production ~/.tamandua that must NEVER be touched)
-REAL_TAMANDUA_STATE="${HOME}/.tamandua"
+# Real tamandua state dir (the production ~/.tamandua that must NEVER be
+# touched). Resolved from the OPERATOR's actual home (via the uid's passwd
+# entry), NOT from $HOME: when the contained spawn env (env/tt-env.sh) is in
+# force, $HOME is the CONTAINED home (torture-test/var/home) and deriving the
+# production path from it would misclassify the contained state dir as
+# production (and refuse to manage the real TT daemon). Falling back to $HOME
+# (the operator's home in a normal interactive invocation) keeps the guard
+# intact when getent is unavailable.
+_tt_operator_home="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)"
+REAL_TAMANDUA_STATE="${_tt_operator_home:-${HOME}}/.tamandua"
 
 # ── production guards ─────────────────────────────────────────────────
 

@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# E2.5 US-004 controller preflight wiring is covered by the dedicated
+# tt-controller-preflight.test.sh (which exercises the real preflight chain).
+# This unit-style regression suite simulates real launches with a stub
+# `tamandua` and has tight timing windows (scheduler/resume/interruption); it
+# does NOT set up or inspect the contained real daemon. Disable the real-case
+# preflight here so these tests keep their exact prior behavior — fast,
+# daemon-free, no timing regressions. Real deployments leave it unset.
+export TT_CONTROLLER_PREFLIGHT_DISABLED=1
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TT_DIR="$(dirname "$SCRIPT_DIR")"
 CONTROLLER="$SCRIPT_DIR/tt-controller"

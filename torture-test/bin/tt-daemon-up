@@ -1,0 +1,258 @@
+#!/usr/bin/env bash
+# tt-daemon-up — real TT daemon preflight lifecycle helper (E2.5 US-003).
+#
+# Manages the CONTAINED real TT daemon lifecycle around real-case execution:
+# real cases are launched only when the contained daemon (43xx) is up, and the
+# daemon is stopped at campaign end so nothing leaks.
+#
+# It delegates ALL actual daemon operations to the sanctioned
+# bin/daemon-control `real` kind (ports 4334/4338/4339, HOME = contained TT
+# home under torture-test/var — never the operator's ~/.tamandua or the 33xx
+# production daemon). daemon-control already production-guards every
+# start/stop/status, so this helper can never touch production.
+#
+# Subcommands:
+#   ensure-up   Verify the real TT daemon is up (contained control port 4339),
+#               starting it if absent. FAILS CLOSED with the DISTINCT reason
+#               `tt-daemon-down` (exit non-zero) if the daemon cannot be
+#               brought up/verified. Idempotent: when already up it is a
+#               no-op.
+#   status      Report the real TT daemon state — READ ONLY, no side effects.
+#   stop        Stop the real TT daemon at campaign end (hygiene). FAILS
+#               CLOSED with the DISTINCT reason `tt-daemon-down` (exit
+#               non-zero) if the daemon/process remains or ports 43xx do not
+#               free up.
+#
+# Requirements for ensure-up to be able to start the daemon: the repo's dist
+# build must exist (daemon-control launches the real `tamandua`), and the
+# contained TT home must be provisioned (see tt-provision-home) with the
+# bundled catalog installed (see tt-catalog-install).
+#
+# Never mutates the caller's environment; writes only under torture-test/var.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TT_DIR="$(dirname "$SCRIPT_DIR")"                        # torture-test/
+TT_REPO_ROOT="$(dirname "$TT_DIR")"                      # repo root
+DC="$SCRIPT_DIR/daemon-control"
+TT_ENV_REAL="$TT_DIR/env/tt-env.sh"
+
+# The three contained real-ports (spec 01 two-daemon architecture: 43xx).
+REAL_PORTS="4334 4338 4339"
+
+# ── helpers ───────────────────────────────────────────────────────────
+
+log() { printf '[tt-daemon-up] %s\n' "$*"; }
+
+# resolve_contained_control_port: the real daemon's control port (4339) from
+# the contained env script — never a production port.
+resolve_contained_control_port() {
+  if [ -f "$TT_ENV_REAL" ]; then
+    local line
+    line="$(env -i bash "$TT_ENV_REAL" print 2>/dev/null | grep '^TAMANDUA_CONTROL_PORT=' | head -n1 || true)"
+    if [ -n "$line" ]; then
+      printf '%s' "${line#TAMANDUA_CONTROL_PORT=}"
+      return 0
+    fi
+  fi
+  printf '%s' "4339"
+}
+
+# is_port_listening: whether a TCP port is accepting connections.
+is_port_listening() {
+  local port="$1"
+  timeout 1 bash -c "echo >/dev/tcp/localhost/$port" 2>/dev/null
+}
+
+# ports_free: returns 0 iff all 43xx ports are free.
+ports_free() {
+  local p
+  for p in $REAL_PORTS; do
+    if is_port_listening "$p"; then
+      echo "  port $p still LISTENING" >&2
+      return 1
+    fi
+  done
+  return 0
+}
+
+# dc_status: run daemon-control real status, echo only the STATUS: line.
+dc_status() {
+  "$DC" real status 2>/dev/null | grep '^STATUS:' | head -n1 || true
+}
+
+# wait_for_daemon_up: poll (up to $1 seconds) until the real daemon reports
+# RUNNING via daemon-control AND the contained control port is listening.
+wait_for_daemon_up() {
+  local timeout_sec="$1"
+  local ctrl_port="$2"
+  local deadline; deadline=$(($(date +%s) + timeout_sec))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    local st
+    st="$(dc_status)"
+    if [ "$st" = "STATUS: RUNNING" ] && is_port_listening "$ctrl_port"; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+# ── subcommands ───────────────────────────────────────────────────────
+
+cmd_status() {
+  "$DC" real status || true
+}
+
+cmd_ensure_up() {
+  local ctrl_port
+  ctrl_port="$(resolve_contained_control_port)"
+  local st
+  st="$(dc_status)"
+
+  # Already up -> no-op.
+  if [ "$st" = "STATUS: RUNNING" ] && is_port_listening "$ctrl_port"; then
+    log "real TT daemon already UP (control port $ctrl_port) — no-op."
+    echo "TT_DAEMON: up"
+    echo "TT_DAEMON_PORT: $ctrl_port"
+    return 0
+  fi
+
+  log "real TT daemon not verified up (status '${st:-unknown}') — starting via daemon-control real..."
+  local start_rc=0
+  set +e
+  "$DC" real start >/dev/null 2>&1
+  start_rc=$?
+  set -e
+  log "daemon-control real start rc=$start_rc"
+
+  if wait_for_daemon_up 40 "$ctrl_port"; then
+    log "real TT daemon started and verified UP on control port $ctrl_port."
+    echo "TT_DAEMON: up"
+    echo "TT_DAEMON_PORT: $ctrl_port"
+    return 0
+  fi
+
+  # ── FAIL CLOSED: daemon could not be brought up/verified ──────────
+  echo "REASON: tt-daemon-down" >&2
+  echo "DETAILS: contained real TT daemon could not be brought up / verified on the 43xx ports (ctrl $ctrl_port)." >&2
+  echo "DC_START_RC: $start_rc" >&2
+  log "FAIL: real TT daemon did not come up (start_rc=$start_rc)." >&2
+  return 1
+}
+
+cmd_stop() {
+  # Record the provenanced PID (only meaningful for a daemon-control-managed
+  # daemon) so we can assert no process remains after stop.
+  local prov_file="$TT_REPO_ROOT/torture-test/var/daemon-control/real.json"
+  local prov_pid=""
+  if [ -f "$prov_file" ]; then
+    if command -v jq >/dev/null 2>&1; then
+      prov_pid="$(jq -r '.pid // ""' "$prov_file" 2>/dev/null || true)"
+    else
+      prov_pid="$(grep -o '"pid": *[0-9]*' "$prov_file" 2>/dev/null | sed 's/.*: *//' || true)"
+    fi
+  fi
+
+  log "stopping real TT daemon via daemon-control real..."
+  local stop_rc=0
+  set +e
+  "$DC" real stop >/dev/null 2>&1
+  stop_rc=$?
+  set -e
+  log "daemon-control real stop rc=$stop_rc"
+
+  # ── Hygiene verification: ports free + no provenanced process remains ──
+  local dead=0
+  if [ -n "$prov_pid" ] && [ "$prov_pid" -gt 0 ] 2>/dev/null; then
+    if ! [ -d "/proc/$prov_pid" ]; then
+      dead=1
+    fi
+  fi
+
+  local cleaned_ok=1
+  local settle; settle=$(($(date +%s) + 15))
+  while [ "$(date +%s)" -lt "$settle" ]; do
+    if ports_free; then
+      cleaned_ok=0
+      break
+    fi
+    sleep 1
+  done
+
+  if [ "$cleaned_ok" -eq 0 ]; then
+    log "real TT daemon stopped; ports $REAL_PORTS free."
+    echo "TT_DAEMON: down"
+    echo "TT_DAEMON_PORTS: free"
+    return 0
+  fi
+
+  # ── FAIL CLOSED (hygiene): leaked daemon/process or busy ports ────
+  echo "REASON: tt-daemon-down" >&2
+  echo "DETAILS: real TT daemon did not stop cleanly — a daemon/process remains or ports 43xx are not free after stop." >&2
+  echo "DC_STOP_RC: $stop_rc" >&2
+  echo "PROV_PID: ${prov_pid:-none}" >&2
+  log "FAIL: real TT daemon/process remains or ports 43xx busy after stop (stop_rc=$stop_rc)." >&2
+  return 1
+}
+
+# ── usage / dispatch ─────────────────────────────────────────────────
+
+usage() {
+  cat <<'EOF'
+tt-daemon-up — real TT daemon preflight lifecycle helper (E2.5 US-003).
+
+Usage: tt-daemon-up <ensure-up|status|stop> [--help]
+
+Manages the CONTAINED real TT daemon lifecycle around real-case execution,
+delegating all operations to the sanctioned bin/daemon-control `real` kind
+(ports 4334/4338/4339, HOME = contained TT home under torture-test/var —
+never the operator's ~/.tamandua or the 33xx production daemon).
+
+Subcommands:
+  ensure-up   Verify the real TT daemon is up (contained control port 4339);
+              start it if absent. Idempotent. FAILS CLOSED with the distinct
+              reason 'tt-daemon-down' (exit non-zero) if it cannot be brought
+              up/verified.
+  status      Report the real TT daemon state — read only, no side effects.
+  stop        Stop the real TT daemon at campaign end (hygiene). FAILS CLOSED
+              with the distinct reason 'tt-daemon-down' (exit non-zero) if a
+              daemon/process remains or ports 43xx do not free up.
+
+Options:
+  --help,-h   Show this help.
+
+Examples:
+  tt-daemon-up ensure-up      # verify/bring up the contained real daemon (43xx)
+  tt-daemon-up status         # read-only status
+  tt-daemon-up stop           # stop it and verify ports 43xx are free
+
+Fail-closed: every successful path prints 'TT_DAEMON: up'/'TT_DAEMON: down';
+every failure prints 'REASON: tt-daemon-down' on stderr and exits non-zero.
+EOF
+}
+
+ACTION="${1:-}"
+case "$ACTION" in
+  --help|-h)
+    usage
+    exit 0
+    ;;
+  status)
+    cmd_status
+    exit 0
+    ;;
+  ensure-up)
+    cmd_ensure_up
+    exit $?
+    ;;
+  stop)
+    cmd_stop
+    exit $?
+    ;;
+  *)
+    echo "tt-daemon-up: unknown/invalid action '$ACTION'." >&2
+    echo "Usage: tt-daemon-up <ensure-up|status|stop> [--help]" >&2
+    exit 2
+    ;;
+esac
