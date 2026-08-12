@@ -296,7 +296,7 @@ These are verified by `build-golden.sh` and the oracle probes:
 7. **Exec-bit preservation:** `testdata/exec-bit-probe.sh` has the
    executable bit set after `git clone` and after `build-golden.sh`.
 8. **Inert junk integrity:** `operator-notes.local` is byte-identical to
-   the committed sampler reference across the entire campaign.
+   the fixture source (provisioning) reference across the entire campaign.
 9. **Deterministic builds:** two consecutive runs of `build-golden.sh`
    produce identical commit hashes.
 

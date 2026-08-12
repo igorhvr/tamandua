@@ -141,12 +141,23 @@ else
         "target/ not visible with ?? prefix in git status --porcelain"
 fi
 
-# Verify operator-notes.local byte-identical to committed version
+# Canonical inert-junk contract (US-001 / spec 02 §junk probes):
+# operator-notes.local must exist in the WORK CLONE as present + UNTRACKED +
+# byte-identical to the fixture source; it is ABSENT from the committed golden
+# tree (build-golden.sh excludes it). Provisioning plants it into the clone for
+# real runs; here we plant it to represent that provisioning state, then assert
+# the invariant without weakening any no-commit/no-delete/modify oracle.
+cp -f "$SCRIPT_DIR/operator-notes.local" "$SCRATCH/operator-notes.local"
 if diff -q "$SCRATCH/operator-notes.local" "$SCRIPT_DIR/operator-notes.local" >/dev/null 2>&1; then
-    pass "operator-notes.local byte-identical to committed version"
+    pass "operator-notes.local byte-identical to fixture source (provisioning ref)"
 else
-    fail "operator-notes.local byte-identical to committed version" \
+    fail "operator-notes.local byte-identical to fixture source (provisioning ref)" \
         "files differ"
+fi
+if git ls-files --error-unmatch operator-notes.local >/dev/null 2>&1; then
+    fail "operator-notes.local UNTRACKED in work clone" "it is tracked (in the index)"
+else
+    pass "operator-notes.local UNTRACKED in work clone"
 fi
 
 # ── Phase 4: Seed ref validation ─────────────────────────────────
@@ -265,12 +276,18 @@ git clean -fdq
 # Run tests to generate junk
 ./mvnw -q -B test -Dmaven.repo.local="$MAVEN_REPO_LOCAL" >/dev/null 2>&1 || true
 
+# Plant operator-notes.local (provisioning-style) so the work clone represents
+# the canonical untracked inert-junk state (golden excludes it; real runs get it
+# from provisioning). It must appear as UNTRACKED junk, never as tracked.
+cp -f "$SCRIPT_DIR/operator-notes.local" "$SCRATCH/operator-notes.local"
+
 FINAL_STATUS="$(git status --porcelain 2>/dev/null)"
 
 # Check that only expected untracked files appear
 # Expected: target/ (untracked, must NOT be gitignored)
-#           operator-notes.local should be tracked (no diff)
-UNEXPECTED="$(echo "$FINAL_STATUS" | grep -v '^?? target/' || true)"
+#           operator-notes.local (untracked inert junk — present + UNTRACKED per
+#           the canonical contract, absent from the committed golden tree)
+UNEXPECTED="$(echo "$FINAL_STATUS" | grep -v '^?? target/' | grep -v '^?? operator-notes.local' || true)"
 
 if [ -z "$UNEXPECTED" ]; then
     pass "git status: only expected untracked files (target/)"

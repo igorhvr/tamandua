@@ -352,7 +352,7 @@ These are verified by `build-golden.sh` and the oracle probes:
 7. **Junk probe — regenerated:** `target/` appears as untracked (not in
    `.gitignore`, not tracked) after running `cargo test` in a fresh clone.
 8. **Junk probe — inert:** `operator-notes.local` is byte-identical to
-   the committed sampler reference across the entire campaign.
+   the fixture source (provisioning) reference across the entire campaign.
 9. **Deterministic builds:** two consecutive runs of `build-golden.sh`
    produce identical commit hashes.
 

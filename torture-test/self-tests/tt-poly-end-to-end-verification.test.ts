@@ -215,16 +215,19 @@ describe("tt-poly end-to-end verification (US-016)", () => {
         fs.existsSync(path.join(tmpDir, "README-JUNK.md")),
         "baseline should have README-JUNK.md",
       );
+      // operator-notes.local is inert junk PLANTED at provisioning, never
+      // committed — the golden tree must NOT contain it (E2.4 canonical
+      // contract). It lives only in fixtures-src as the byte-exact reference.
       assert.ok(
-        fs.existsSync(path.join(tmpDir, "operator-notes.local")),
-        "baseline should have operator-notes.local",
+        !fs.existsSync(path.join(tmpDir, "operator-notes.local")),
+        "golden baseline must NOT contain operator-notes.local (excluded junk)",
       );
 
-      // Per-subtree operator-notes.local
+      // Per-subtree operator-notes.local — likewise excluded from the golden.
       for (const subtree of ["python", "ts", "go", "rust", "java"]) {
         assert.ok(
-          fs.existsSync(path.join(tmpDir, subtree, "operator-notes.local")),
-          `baseline ${subtree}/ should have operator-notes.local`,
+          !fs.existsSync(path.join(tmpDir, subtree, "operator-notes.local")),
+          `golden baseline ${subtree}/ must NOT contain operator-notes.local (excluded junk)`,
         );
       }
 
@@ -647,30 +650,23 @@ describe("tt-poly end-to-end verification (US-016)", () => {
 
     const tmpDir = cloneBareRepo("tt-poly-e2e-junk-");
     try {
-      // Read reference operator-notes.local from source
+      // Read reference operator-notes.local from SOURCE — the canonical, byte-exact
+      // provisioning reference (spec 02: planted at instantiation).
       const refOpPath = path.join(fixtureSrc, "operator-notes.local");
       assert.ok(fs.existsSync(refOpPath), "source operator-notes.local should exist");
       const refOp = fs.readFileSync(refOpPath, "utf-8");
+      assert.ok(refOp.length > 0, "source operator-notes.local should not be empty");
 
-      // Verify root operator-notes.local matches source
-      const rootOp = fs.readFileSync(path.join(tmpDir, "operator-notes.local"), "utf-8");
-      assert.strictEqual(
-        rootOp,
-        refOp,
-        "baseline operator-notes.local should be byte-identical to source",
+      // The golden clone must NOT carry operator-notes.local anywhere — it is
+      // inert junk excluded from the committed tree and planted by provisioning.
+      assert.ok(
+        !fs.existsSync(path.join(tmpDir, "operator-notes.local")),
+        "golden baseline must NOT contain root operator-notes.local (excluded junk)",
       );
-
-      // Verify per-subtree operator-notes.local files exist
       for (const subtree of ["python", "ts", "go", "rust", "java"]) {
-        const subOpPath = path.join(tmpDir, subtree, "operator-notes.local");
         assert.ok(
-          fs.existsSync(subOpPath),
-          `${subtree}/operator-notes.local should exist`,
-        );
-        const subOp = fs.readFileSync(subOpPath, "utf-8");
-        assert.ok(
-          subOp.length > 0,
-          `${subtree}/operator-notes.local should not be empty`,
+          !fs.existsSync(path.join(tmpDir, subtree, "operator-notes.local")),
+          `golden baseline ${subtree}/ must NOT contain operator-notes.local (excluded junk)`,
         );
       }
     } finally {

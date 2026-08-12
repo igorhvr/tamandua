@@ -572,9 +572,18 @@ describe("tt-poly-lite end-to-end validation", { skip: process.env.TT_POLY_LITE_
         assert.ok(s === "" || s.startsWith("?"), "ts/package-lock.json: should be untracked");
       }
 
+      // operator-notes.local is inert junk PLANTED at provisioning, never
+      // committed — the golden clone must NOT carry it (E2.4 canonical
+      // contract). The fixture SOURCE retains the byte-exact reference.
       const fixtureNotes = fs.readFileSync(path.join(fixtureSrc, "operator-notes.local"), "utf-8");
-      const scratchNotes = fs.readFileSync(path.join(scratch, "operator-notes.local"), "utf-8");
-      assert.equal(fixtureNotes, scratchNotes, "operator-notes.local must be byte-identical to fixture source");
+      assert.ok(
+        fixtureNotes.length > 0,
+        "fixture source operator-notes.local should not be empty (provisioning reference)",
+      );
+      assert.ok(
+        !fs.existsSync(path.join(scratch, "operator-notes.local")),
+        "golden clone must NOT contain operator-notes.local (excluded junk)",
+      );
     } finally {
       fs.rmSync(scratch, { recursive: true, force: true });
     }

@@ -88,6 +88,7 @@ scratch_dir WORK_DIR
             --exclude='dist' \
             --exclude='package-lock.json' \
             --exclude='build-golden.sh' \
+            --exclude='operator-notes.local' \
             -cf - .
     ) | tar -xf -
 
@@ -165,9 +166,6 @@ echo "--- Phase 3: Post-build verification ---"
 scratch_dir VERIFY_DIR
 git clone "$BARE_REPO" "$VERIFY_DIR" > /dev/null 2>&1
 
-# Operator notes reference content (from committed file)
-OPERATOR_REF="$(cat "$FIXTURE_SRC/operator-notes.local")"
-
 # --- 3a. Baseline green check -------------------------------------------------
 echo ""
 echo "  [3a] Baseline green check..."
@@ -226,13 +224,23 @@ if grep -v '^#' "$VERIFY_DIR/.gitignore" | grep -q '^node_modules'; then
 fi
 echo "    .gitignore        : OK (does not ignore junk probes)"
 
-# operator-notes.local byte-identical check
-ACTUAL_OP="$(cat "$VERIFY_DIR/operator-notes.local")"
-if [ "$ACTUAL_OP" = "$OPERATOR_REF" ]; then
-    echo "    operator-notes.local : byte-identical (ok)"
-else
-    echo "    operator-notes.local : BYTE-MISMATCH!"
+# operator-notes.local must NOT be in the golden tree — it is inert junk
+# planted at provisioning (spec 02), never committed.
+if [ -e "$VERIFY_DIR/operator-notes.local" ]; then
+    echo "    operator-notes.local : PRESENT in golden — should be excluded junk!"
     exit 1
+else
+    echo "    operator-notes.local : absent from golden (excluded junk, ok)"
+fi
+
+# The fixture SOURCE operator-notes.local is the byte-exact provisioning
+# reference (spec 02: planted at instantiation, byte-identical). The canonical
+# bytes must be retained here so provisioning can plant them into work clones.
+if [ ! -s "$FIXTURE_SRC/operator-notes.local" ]; then
+    echo "    operator-notes.local : fixture source missing/empty — provisioning reference lost!"
+    exit 1
+else
+    echo "    operator-notes.local : fixture source retained (byte-exact provisioning ref)"
 fi
 
 # --- 3c. Seed ref verification (BUG + BRK) ------------------------------------
@@ -392,7 +400,7 @@ echo ""
 echo "  Verification   : ALL PASSED"
 echo "    - Baseline green"
 echo "    - Junk probes verified (untracked, not gitignored)"
-echo "    - operator-notes.local byte-identical"
+echo "    - operator-notes.local excluded from golden, source ref retained"
 echo "    - Seed refs verified (BRK: RED, BUG: dormant GREEN)"
 echo "    - Fix patches applied and green"
 echo "================================================================="

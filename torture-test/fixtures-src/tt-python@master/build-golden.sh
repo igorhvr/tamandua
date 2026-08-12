@@ -52,6 +52,8 @@ rsync -a \
     --exclude='*.egg-info/' \
     --exclude='.pytest_cache/' \
     --exclude='.flaky_counter' \
+    --exclude='operator-notes.local' \
+    --exclude='build-golden.sh' \
     "$FIXTURE_SRC/" "$WORK_DIR/"
 
 cd "$WORK_DIR"
@@ -162,6 +164,12 @@ git checkout -q master
 echo ""
 echo "Cloning to bare: $GOLDEN_BARE"
 git clone --bare -q "$WORK_DIR" "$GOLDEN_BARE"
+# Determinism: `git clone --bare <src>` records the mktemp work dir (
+# VAR_DIR/tmp.build-golden.XXXXXX) as the bare's `[remote "origin"] url`.
+# That transient path differs every build and would make the golden bare
+# NON-byte-identical across rebuilds (US-006 AC3). Remove the origin so the
+# bare config is stable; the bare has no need of an upstream remote.
+git --git-dir="$GOLDEN_BARE" remote remove origin >/dev/null 2>&1 || true
 
 # ── Verify default branch is master (not main) ─────────────────────
 echo ""
@@ -281,14 +289,26 @@ else
     JUNK_OK=false
 fi
 
-# operator-notes.local must be byte-identical to the committed version
+# operator-notes.local must NOT be in the golden tree — it is inert junk
+# planted at provisioning (spec 02: one per repo, planted at instantiation,
+# must stay untracked). The clone derives from the golden bare, so it too must
+# lack it.
 ORIG_NOTES="$FIXTURE_SRC/operator-notes.local"
-CLONE_NOTES="$SCRATCH_DIR/operator-notes.local"
-if [ -f "$CLONE_NOTES" ] && diff -q "$ORIG_NOTES" "$CLONE_NOTES" >/dev/null 2>&1; then
-    echo "  ✓ operator-notes.local byte-identical"
-else
-    echo "  ✗ operator-notes.local mismatch or missing" >&2
+if [ -e "$SCRATCH_DIR/operator-notes.local" ]; then
+    echo "  ✗ operator-notes.local is present in golden clone — should be excluded junk" >&2
     JUNK_OK=false
+else
+    echo "  ✓ operator-notes.local absent from golden (excluded junk)"
+fi
+
+# The fixture SOURCE operator-notes.local is the byte-exact provisioning
+# reference (spec 02: planted at instantiation, byte-identical). The canonical
+# bytes must be retained so provisioning can plant them into work clones.
+if [ ! -s "$ORIG_NOTES" ]; then
+    echo "  ✗ operator-notes.local fixture source missing/empty — provisioning reference lost" >&2
+    JUNK_OK=false
+else
+    echo "  ✓ operator-notes.local fixture source retained (byte-exact provisioning ref)"
 fi
 
 if ! $JUNK_OK; then

@@ -210,7 +210,7 @@ See `python/FIXTURE.md` and `ts/FIXTURE.md` for full details.
 5. **Dormant vulns (POLY-VULN-R1, POLY-VULN-R2):** `cargo test --quiet` passes with the `util_unsafe` and `util_timing` modules present.
 6. **Broken tests:** `broken-tests` branch has exactly 2 failing tests; `main` has 0.
 7. **Junk probe — regenerated:** `target/` appears as untracked after running `cargo test`.
-8. **Junk probe — inert:** `operator-notes.local` is byte-identical to the committed sampler reference.
+8. **Junk probe — inert:** `operator-notes.local` is byte-identical to the fixture source (provisioning plants it into the work clone untracked).
 9. **Deterministic builds:** two consecutive runs of `build-golden.sh` produce identical commit hashes.
 
 ## Patch Application Quick Reference

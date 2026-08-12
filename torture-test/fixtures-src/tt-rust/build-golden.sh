@@ -193,6 +193,12 @@ fi
 echo ""
 echo "Cloning to bare: $GOLDEN_BARE"
 git clone --bare -q "$WORK_DIR" "$GOLDEN_BARE"
+# Determinism: `git clone --bare <src>` records the mktemp work dir (
+# VAR_DIR/tmp.build-golden.XXXXXX) as the bare's `[remote "origin"] url`.
+# That transient path differs every build and would make the golden bare
+# NON-byte-identical across rebuilds (US-006 AC3). Remove the origin so the
+# bare config is stable; the bare has no need of an upstream remote.
+git --git-dir="$GOLDEN_BARE" remote remove origin >/dev/null 2>&1 || true
 
 # ── Verify baseline suite is green in a scratch clone ──────────────
 echo ""

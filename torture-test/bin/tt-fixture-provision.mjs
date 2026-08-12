@@ -24,6 +24,22 @@
 //       and regenerated junk (__pycache__/, .pytest_cache/) present +
 //       untracked.
 //
+// HOSTILE-FILENAME PROBE (E2.4 US-004): several fixtures (tt-python,
+// tt-python@master, tt-poly, tt-poly-lite) carry a directory literally named
+// `$(sentinel)` containing a canary check — spec 02's shell-quoting torture.
+// It is COMMITTED in the golden tree and is delivered to every work clone via
+// ordinary `git clone`/`git checkout` below (git treats the literal name
+// `$(sentinel)` as a plain path — `spawnSync('git', ...)` never interpolates a
+// shell variable). This is the SPEC'D probe, NOT an unexpanded-shell bug: an
+// unquoted `$(` in a shell script would EXECUTE the name and the canary would
+// fire. There is deliberately no shell quoting to fix here; the canary's
+// survival through provisioning is regression-pinned by
+// `self-tests/tier1-e24-sentinel-canary-survival.test.ts`.
+//
+//     ⚠  Preserve the literal `$(sentinel)` name (quote the whole argument when
+//     embedding it in a shell command) so it is NOT run as a command
+//     substitution — that is the point of the hostile-filename probe.
+//
 // A provision failure yields a precise TEST_INFRA reason (fail-closed) — on a
 // healthy host it must never be reached.
 //
@@ -82,11 +98,14 @@ function refReason(category, message, extra = {}) {
 }
 
 // ── Per-fixture arming ──────────────────────────────────────────────
-// Spec 02 common requirement (all fixtures): inert operator junk
-// (operator-notes.local) is PLANTED at instantiation, never tracked, and must
-// remain byte-identical. Regenerated junk and bootstrap behaviour are
-// fixture-specific (US-003 fully implements tt-python; other fixtures get the
-// generic operator-notes planting and a no-op junk arm, extended by US-007).
+// Spec 02 common requirement (ALL fixtures, E2.4 US-003): inert operator junk
+// (operator-notes.local) is PLANTED at provisioning into the work clone as a
+// present + UNTRACKED + byte-identical artifact; the committed golden tree must
+// NOT contain it (every builder excludes it — US-002). This is the single,
+// strict, fail-closed planting oracle shared by every fixture. Regenerated junk
+// and bootstrap behaviour are fixture-specific (only tt-python has a
+// bootstrap/junk arm; others get the operator-notes arm and a no-op junk arm,
+// extended by US-007).
 //
 // `armFixture` applies working-state / junk preparation to a provisioned
 // clone. `arming` is a per-scenario mode: 'prebootstrapped' (default; the
@@ -94,30 +113,52 @@ function refReason(category, message, extra = {}) {
 // workflow starts green) or 'raw' (no bootstrap; a full-chain workflow's own
 // setup step discovers and runs it).
 
-function armTtPython(clonePath, arming, fixtureSource) {
-  // 1. Inert operator junk: plant operator-notes.local (byte-identical to the
-  //    fixture source) as an UNTRACKED file. The golden deliberately does NOT
-  //    commit it (spec 02 plants it at instantiation), so after clone it is
-  //    absent from the tree; we write the canonical bytes and assert it is
-  //    untracked + byte-identical.
-  const srcNotes = path.join(fixtureSource, 'operator-notes.local');
+// Canonical inert operator-junk plant (E2.4 US-003): write the fixture source's
+// operator-notes.local bytes into the clone and require the result to be (1)
+// present, (2) byte-identical to the fixture source, and (3) UNTRACKED (never
+// in the index). Fail-closed on any of the three — a tracked, missing, or
+// divergent file is a provision defect, not a finding. Because every golden
+// builder excludes operator-notes.local (and cloneAndCheckout always reclones
+// fresh from the bare), a re-provision can never inherit a stale tracked copy;
+// this oracle would still catch a regressed golden that reintroduces it.
+function plantOperatorNotes(fixture, clonePath, fixtureSource) {
+  // tt-python@master is the master-branch variant of tt-python: its builder
+  // reuses ../tt-python as the source and carries no operator-notes.local of
+  // its own, so fall back to the shared tt-python source as the canonical
+  // byte-exact provisioning reference.
+  let srcNotes = path.join(fixtureSource, 'operator-notes.local');
+  if (fixture === 'tt-python@master' && !fs.existsSync(srcNotes)) {
+    srcNotes = path.join(TT_ROOT, 'fixtures-src', 'tt-python', 'operator-notes.local');
+  }
   if (!fs.existsSync(srcNotes)) {
-    return refReason('fixture-operator-notes-missing', 'fixture source has no operator-notes.local', {
-      fixture: 'tt-python', source: srcNotes,
+    return refReason('fixture-operator-notes-missing', 'fixture source has no operator-notes.local to plant', {
+      fixture, source: srcNotes,
     });
   }
   const canonical = fs.readFileSync(srcNotes);
   const dstNotes = path.join(clonePath, 'operator-notes.local');
+  fs.writeFileSync(dstNotes, canonical);
   if (!fs.existsSync(dstNotes) || !fs.readFileSync(dstNotes).equals(canonical)) {
-    fs.writeFileSync(dstNotes, canonical);
+    return refReason('fixture-operator-notes-unverifiable', 'operator-notes.local is not present and byte-identical after planting', {
+      fixture, clone: clonePath, source: srcNotes,
+    });
   }
-  // After planting it must be untracked (never in the index).
+  // Must be UNTRACKED (never in the index). Fail-closed if the golden still
+  // commits it or a stale tracked copy survives arm time.
   const ls = git(clonePath, ['ls-files', '--error-unmatch', 'operator-notes.local']);
   if (ls.status === 0) {
     return refReason('operator-notes-tracked', 'operator-notes.local is tracked after provisioning', {
-      fixture: 'tt-python', clone: clonePath,
+      fixture, clone: clonePath,
     });
   }
+  return { ok: true, fixture, operatorNotesPlanted: true, source: srcNotes };
+}
+
+function armTtPython(clonePath, arming, fixtureSource) {
+  // 1. Inert operator junk: plant operator-notes.local (byte-identical to the
+  //    fixture source) as an UNTRACKED file via the strict shared oracle.
+  const plant = plantOperatorNotes('tt-python', clonePath, fixtureSource);
+  if (!plant.ok) return plant;
 
   // 2. Pre-bootstrapped arming (do-now default): run ./bootstrap to create the
   //    venv so a setup-less workflow starts green. 'raw' skips the bootstrap
@@ -187,34 +228,15 @@ function armTtPython(clonePath, arming, fixtureSource) {
   return { ok: true, fixture: 'tt-python', arming, venvBootstrapped: true, operatorNotesPlanted: true, junkVerified: true };
 }
 
-// Generic arm: ensure inert operator-notes.local (spec 02, all fixtures) is
-// present + byte-identical. Track state follows the FIXTURE'S OWN convention:
-// spec 02 mandates it be untracked, and tt-go/tt-rust/tt-python EXCLUDE it from
-// their goldens (so a fresh clone lacks it and we plant it fresh, which is
-// untracked by construction) — but tt-java/tt-poly/tt-poly-lite/
-// tt-python@master/tt-ts as-built COMMIT it in their goldens, so a fresh clone
-// carries it tracked. Accepting a byte-identical clone file regardless of track
-// state is what a healthy host needs; a spurious hard-fail on a tracked golden
-// would be a provision defect, not a real finding. We fail closed only when the
-// canonical bytes cannot be made present/byte-identical (e.g. source missing).
-// Fixture-specific junk/regeneration arms are stubbed here and extended by
-// US-007 for non-tt-python fixtures.
+// Generic arm (all fixtures other than tt-python): plant inert
+// operator-notes.local via the strict shared oracle (present + untracked +
+// byte-identical, fail-closed on tracked/missing/mismatch). This is the
+// E2.4 US-003 contract: EVERY fixture's work clone must carry it untracked +
+// byte-exact. Fixture-specific junk/regeneration arms are stubbed here and
+// extended by US-007 for non-tt-python fixtures.
 function armGeneric(fixture, clonePath, fixtureSource) {
-  const srcNotes = path.join(fixtureSource, 'operator-notes.local');
-  if (!fs.existsSync(srcNotes)) {
-    return { ok: true, fixture, arming: DEFAULT_ARMING_MODE, junkVerified: false, note: 'no operator-notes.local in fixture source' };
-  }
-  const canonical = fs.readFileSync(srcNotes);
-  const dstNotes = path.join(clonePath, 'operator-notes.local');
-  const alreadyCanonical = fs.existsSync(dstNotes) && fs.readFileSync(dstNotes).equals(canonical);
-  if (!alreadyCanonical) {
-    fs.writeFileSync(dstNotes, canonical);
-  }
-  if (!fs.existsSync(dstNotes) || !fs.readFileSync(dstNotes).equals(canonical)) {
-    return refReason('fixture-operator-notes-unverifiable', 'could not ensure operator-notes.local is present and byte-identical', {
-      fixture, clone: clonePath,
-    });
-  }
+  const plant = plantOperatorNotes(fixture, clonePath, fixtureSource);
+  if (!plant.ok) return plant;
   return { ok: true, fixture, arming: DEFAULT_ARMING_MODE, junkVerified: false, operatorNotesPlanted: true };
 }
 

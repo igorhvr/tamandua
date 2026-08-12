@@ -131,6 +131,6 @@ git apply seeds/POLY-BUG-T1.patch && npm test  # should pass (bug dormant)
 4. **Junk presence:** `package-lock.json` and `node_modules/` exist and
    are untracked after `npm install && npm test`
 5. **Inert junk integrity:** `operator-notes.local` is byte-identical to
-   the committed sampler reference
+   the fixture source (provisioning) reference
 6. **Deterministic builds:** two consecutive runs of `build-golden.sh`
    produce identical commit hashes

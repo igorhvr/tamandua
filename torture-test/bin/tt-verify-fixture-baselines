@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { FIXTURE_META } from './tt-golden-bootstrap.mjs';
 
 const BIN_DIR = path.dirname(fileURLToPath(import.meta.url));
 const TT_ROOT = path.resolve(BIN_DIR, '..');
@@ -132,16 +133,21 @@ for (const entry of entries) {
     continue;
   }
 
-  // US-002: require .git.hashes file alongside each fixture
+  // US-002: require the fixture's determinism ledger alongside each fixture.
+  // Ledger filenames are canonicalised by FIXTURE_META (e.g. tt-python@master
+  // records to `.build-hashes-tt-python-master`, not `<name>.git.hashes`);
+  // unknown/self-test fixtures fall back to the conventional `<name>.git.hashes`.
   const fixtureName = entry.name.replace(/\.git$/, '');
-  const hashesPath = path.join(GOLDEN_ROOT, `${fixtureName}.git.hashes`);
+  const ledgerName = (FIXTURE_META[fixtureName] && FIXTURE_META[fixtureName].hashFile)
+    || `${fixtureName}.git.hashes`;
+  const hashesPath = path.join(GOLDEN_ROOT, ledgerName);
   if (!fs.existsSync(hashesPath)) {
     evidence.error = `missing determinism record: run fixtures-src/${fixtureName}/build-golden.sh`;
     fixtures.push(evidence);
     continue;
   }
 
-  // US-003: parse .git.hashes and verify every recorded ref
+  // US-003: parse the ledger and verify every recorded ref
   evidence.hash_check = { passed: true, total: 0, matched: 0, failures: [] };
   let hashCheckPassed = false;
   try {

@@ -35,6 +35,41 @@ const goldenDir = path.join(repoRoot, "torture-test", "var", "fixtures", "golden
 const runShPath = path.join(repoRoot, "torture-test", "self-tests", "run.sh");
 const validateAllPath = path.join(repoRoot, "torture-test", "probes", "validate-all.sh");
 
+// Heavy campaign self-tests that are intentionally NOT part of run.sh. They
+// drive full scripted-daemon / real-flag campaigns that legitimately exceed 60+
+// minutes of ACTIVE progress on a contended machine (see run.sh for the full
+// ordering rationale). run.sh must complete in a bounded window regardless of
+// machine load and can never orphan a campaign on timeout, so these seven are
+// excluded there and executed INDIVIDUALLY (each as its own `node --test`
+// process under its own ceiling, no aggregate deadline) by
+// bin/verify-heavy-campaign-tests.test.sh — the exact
+// verify-builder-determinism.test.sh pattern. All EIGHT fixtures' golden bares
+// are rebuilt hermetically inside tier1-e24-all-fixture-provision, which stays
+// in run.sh (bounded). This list MUST stay in lock-step with run.sh's
+// HEAVY_CAMPAIGN_TESTS and bin/verify-heavy-campaign-tests.test.sh; AC5 pins it.
+const HEAVY_CAMPAIGN_TESTS = [
+  "scripted-scenario-harness.test.ts",
+  "tier0-repeatability.test.ts",
+  "tier1-case-filter.test.ts",
+  "tier1-include-real-proof.test.ts",
+  "tier1-real-case-proof.test.ts",
+  "tier1-repeatability.test.ts",
+  "tier1-zero-real-launch-infra.test.ts",
+];
+const heavyCampaignScriptPath = path.join(
+  repoRoot,
+  "torture-test",
+  "bin",
+  "verify-heavy-campaign-tests.test.sh",
+);
+
+// run.sh is now the BOUNDED battery (the unbounded campaign tests live in the
+// isolated invoke above). A single bounded run.sh finishes far faster than the
+// old multi-hour aggregate; these ceilings are generous safety bounds, not
+// expected durations. Per-run 1h; AC1 total covers TWO runs + harness overhead.
+const RUN_SH_PER_RUN_TIMEOUT_MS = 3_600_000; // 1h per run.sh invocation
+const AC1_TOTAL_BUDGET_MS = 10_800_000; // 3h (two 1h runs + overhead)
+
 // Compute a stable snapshot of the golden dir (sha256sum of every file, sorted).
 // This ignores mtimes and focuses on content integrity.
 function snapshotGoldenDir(): string {
@@ -55,14 +90,23 @@ describe("US-006: golden dir integrity + validate-all verification", () => {
 
   // ── AC 1: run.sh passes twice consecutively ───────────────────────────
   it("AC1: run.sh passes twice consecutively", function () {
-    this.timeout = 600_000; // 10 min for two full runs
+    // run.sh is the BOUNDED battery: the seven unbounded campaign tests
+    // (tier0-repeatability, tier1-repeatability, tier1-real-case-proof,
+    // tier1-include-real-proof, tier1-zero-real-launch-infra, tier1-case-filter,
+    // scripted-scenario-harness) are excluded from run.sh and run individually by
+    // bin/verify-heavy-campaign-tests.test.sh, so a single bounded run.sh
+    // completes well within the per-run ceiling and cannot orphan a campaign on
+    // timeout (the E2.4 verifier's option (b) — robust, contention-independent).
+    // These ceilings are generous safety bounds, not expected durations.
+    this.timeout = AC1_TOTAL_BUDGET_MS; // 3h for two bounded runs + overhead
 
     const output1 = execSync(`bash "${runShPath}"`, {
       cwd: repoRoot,
       env: CLEAN_ENV,
       encoding: "utf-8",
       stdio: "pipe",
-      timeout: 300_000,
+      timeout: RUN_SH_PER_RUN_TIMEOUT_MS, // 2h per run
+      maxBuffer: 512 * 1024 * 1024,
     });
 
     assert.match(
@@ -76,7 +120,8 @@ describe("US-006: golden dir integrity + validate-all verification", () => {
       env: CLEAN_ENV,
       encoding: "utf-8",
       stdio: "pipe",
-      timeout: 300_000,
+      timeout: RUN_SH_PER_RUN_TIMEOUT_MS, // 2h per run
+      maxBuffer: 512 * 1024 * 1024,
     });
 
     assert.match(
@@ -174,5 +219,49 @@ describe("US-006: golden dir integrity + validate-all verification", () => {
       /Failed: 0/,
       `--self-test must report Failed: 0:\n${output.slice(-500)}`,
     );
+  });
+
+  // ── AC 5: heavy campaign tests are excluded from run.sh and isolated ──
+  it("AC5: heavy campaign tests are excluded from run.sh and isolated-invoked", function () {
+    // Harness-closure invariant (US-006): the unbounded campaign self-tests
+    // CANNOT live in run.sh (run.sh must complete in a bounded window and never
+    // orphan a campaign on timeout) and MUST be covered by the isolated
+    // invocation script. This guard runs in milliseconds (no heavy execution)
+    // and trips loudly if anyone re-adds a heavy test to the bounded battery
+    // without excluding it, or drops it from the isolated invocation.
+    const selfDir = path.join(repoRoot, "torture-test", "self-tests");
+    const runSh = fs.readFileSync(runShPath, "utf-8");
+    assert.ok(
+      fs.existsSync(heavyCampaignScriptPath),
+      `isolated invocation script must exist: ${heavyCampaignScriptPath}`,
+    );
+    const heavyScript = fs.readFileSync(heavyCampaignScriptPath, "utf-8");
+
+    for (const base of HEAVY_CAMPAIGN_TESTS) {
+      // 1. every heavy test file exists on disk.
+      assert.ok(
+        fs.existsSync(path.join(selfDir, base)),
+        `heavy campaign test must exist: ${base}`,
+      );
+      // 2. run.sh declares it in HEAVY_CAMPAIGN_TESTS (explicitly excluded from
+      //    the bounded battery) — removing the exclusion re-opens the unbounded
+      //    closure and fails this guard.
+      assert.match(
+        runSh,
+        new RegExp(`'${base.replace(/\./g, "\\.")}'`),
+        `run.sh must list ${base} in HEAVY_CAMPAIGN_TESTS (excluded from the bounded battery)`,
+      );
+      // 3. the isolated invocation script executes it as its own process.
+      assert.match(
+        heavyScript,
+        new RegExp(`'${base.replace(/\./g, "\\.")}'`),
+        `verify-heavy-campaign-tests.test.sh must invoke ${base} individually`,
+      );
+    }
+
+    // The exclusion filter must actually be plumbed through run.sh's loops (not
+    // just declared dead code), otherwise a heavy test could still run in the
+    // bounded battery.
+    assert.match(runSh, /is_heavy "\$base"/, "run.sh must filter heavy tests in its test loops");
   });
 });

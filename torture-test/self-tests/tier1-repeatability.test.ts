@@ -2,17 +2,21 @@ import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
+import os from "node:os";
 import path from "node:path";
 import { describe, it } from "node:test";
 
-// US-007 — Proof test: bare --tier1 remains GREEN twice.
+// US-007/US-008 — Proof test: bare --tier1 remains GREEN twice with the
+// operator-identity hygiene canary UNCHANGED.
 //
 // Regression proof that the contract/resolver + fail-closed changes (US-001..006)
 // did NOT disturb the bare (no --include-real) `./run-torture-test --tier1`
 // path, which the launcher maps to tt-controller --scripted-only. Bare mode
 // must remain a zero-token GREEN: every real Tier-1 case is reported
 // pending-real (NOT predicate-blocked, NOT infra-failed), and two consecutive
-// invocations are each GREEN exit 0.
+// invocations are each GREEN exit 0. US-008 additionally pins that the bare
+// runs leave the operator-identity hygiene canary (~/.gitconfig / ~/.ssh/config)
+// UNCHANGED relative to the pre-run baseline.
 //
 // Confined entirely to torture-test/ (state under var/, gitignored). Zero tokens.
 
@@ -142,6 +146,23 @@ async function assertBareTier1Run(runNumber: number): Promise<void> {
       assert.equal(row.outcome, "PASS", `run ${runNumber}: scripted ${row.id} did not PASS: ${row.outcome}`);
     }
   }
+
+  // AC3 (US-008): operator-identity hygiene canary must remain UNCHANGED.
+  // The controller snapshots the real ~/.gitconfig / ~/.ssh/config before and
+  // after each bare run; every watched file must be UNCHANGED (or legitimately
+  // ABSENT, e.g. no crontab) with zero diffs — in BOTH consecutive runs.
+  const canary = report.hygiene_canary;
+  assert.ok(canary, `run ${runNumber}: report missing hygiene_canary`);
+  assert.equal(canary.home, os.userInfo().homedir,
+    `run ${runNumber}: hygiene canary must inspect the real operator home`);
+  const watched = (canary.files ?? []) as Array<{ name: string; status: string }>;
+  assert.ok(watched.some((f) => f.name === "gitconfig"), `run ${runNumber}: gitconfig not watched by hygiene canary`);
+  assert.ok(watched.some((f) => f.name === "ssh_config"), `run ${runNumber}: ssh_config not watched by hygiene canary`);
+  for (const file of watched) {
+    assert.ok(["UNCHANGED", "ABSENT"].includes(file.status),
+      `run ${runNumber}: ${file.name} hygiene status=${file.status} (expected UNCHANGED/ABSENT)`);
+  }
+  assert.deepEqual(canary.diffs ?? [], [], `run ${runNumber}: hygiene canary recorded diffs`);
 
   // Hygiene: the scripted daemon must be cleanly stopped and ports free.
   const daemonStatus = run(daemonControl, ["scripted", "status"], process.env);

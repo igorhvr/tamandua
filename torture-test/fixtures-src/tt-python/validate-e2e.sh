@@ -7,7 +7,7 @@
 #   3. Each seed ref: correct colour (RED for bugs, GREEN for dormant vulns/A1)
 #   4. Fix patches restore GREEN for each bug seed
 #   5. Junk-probe invariants in a fresh clone after one test run
-#   6. operator-notes.local byte-identical to committed version
+#   6. operator-notes.local present + UNTRACKED + byte-identical in work clone
 #   7. git status shows untracked junk (not gitignored)
 #   8. broken-tests branch has BRK-P1 and BRK-P2 causing test failures
 #   9. Sentinel subdirectory exists with canary file
@@ -183,12 +183,22 @@ else
         ".pytest_cache not visible in git status"
 fi
 
-# Verify operator-notes.local byte-identical to committed version
+# Verify operator-notes.local is present + UNTRACKED + byte-identical in the
+# work clone (canonical inert-junk contract, US-001 / spec 02 §junk probes).
+# build-golden.sh excludes it from the golden, so provisioning plants it into
+# the clone for real runs; plant it here to represent that state, then assert
+# the invariant without weakening any no-commit/no-delete/modify oracle.
+cp -f "$SCRIPT_DIR/operator-notes.local" "$SCRATCH/operator-notes.local"
 if diff -q "$SCRATCH/operator-notes.local" "$SCRIPT_DIR/operator-notes.local" >/dev/null 2>&1; then
-    pass "operator-notes.local byte-identical to committed version"
+    pass "operator-notes.local byte-identical to fixture source (provisioning ref)"
 else
-    fail "operator-notes.local byte-identical to committed version" \
+    fail "operator-notes.local byte-identical to fixture source (provisioning ref)" \
         "files differ"
+fi
+if git ls-files --error-unmatch operator-notes.local >/dev/null 2>&1; then
+    fail "operator-notes.local UNTRACKED in work clone" "it is tracked (in the index)"
+else
+    pass "operator-notes.local UNTRACKED in work clone"
 fi
 
 # ── Phase 4: Seed ref validation ─────────────────────────────────

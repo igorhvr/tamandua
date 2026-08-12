@@ -138,6 +138,7 @@ scratch_dir WORK_DIR
             --exclude='package-lock.json' \
             --exclude='*.egg-info' \
             --exclude='build-golden.sh' \
+            --exclude='operator-notes.local' \
             -cf - .
     ) | tar -xf -
 
@@ -287,9 +288,6 @@ echo "--- Phase 6: Post-build verification ---"
 
 scratch_dir VERIFY_DIR
 git clone "$BARE_REPO" "$VERIFY_DIR" > /dev/null 2>&1
-
-# Operator notes reference content
-OPERATOR_REF="$(cat "$FIXTURE_SRC/operator-notes.local")"
 
 # --- 6a. Baseline green check (both suites) --------------------------------
 echo ""
@@ -460,16 +458,24 @@ else
     echo "    ts/node_modules/ : OK (not gitignored)"
 fi
 
-# operator-notes.local byte-identical check
-echo -n "    operator-notes.local..."
-ACTUAL_OP="$(cat "$VERIFY_DIR/operator-notes.local" 2>/dev/null || echo 'MISSING')"
-if [ "$ACTUAL_OP" = "$OPERATOR_REF" ]; then
-    echo " byte-identical (ok)"
-else
-    echo " BYTE-MISMATCH!"
-    echo "Expected SHA-256: $(echo "$OPERATOR_REF" | sha256sum)"
-    echo "Got SHA-256:      $(echo "$ACTUAL_OP" | sha256sum)"
+# operator-notes.local must NOT be in the golden tree — it is inert junk
+# planted at provisioning (spec 02), never committed.
+echo -n "    operator-notes.local in golden..."
+if [ -e "$VERIFY_DIR/operator-notes.local" ]; then
+    echo " PRESENT — should be excluded junk!"
     exit 1
+else
+    echo " absent (ok)"
+fi
+
+# The fixture SOURCE operator-notes.local is the byte-exact provisioning
+# reference (spec 02: planted at instantiation, byte-identical). The canonical
+# bytes must be retained so provisioning can plant them into work clones.
+if [ ! -s "$FIXTURE_SRC/operator-notes.local" ]; then
+    echo "    operator-notes.local : fixture source missing/empty — provisioning reference lost!"
+    exit 1
+else
+    echo "    operator-notes.local : fixture source retained (byte-exact provisioning ref)"
 fi
 
 # --- 6d. Python seed ref verification -------------------------------------
@@ -754,7 +760,7 @@ echo "  Verification   : ALL PASSED"
 echo "    - Baseline green (python + ts)"
 echo "    - broken-tests branch red"
 echo "    - Junk probes verified (untracked, not gitignored)"
-echo "    - operator-notes.local byte-identical"
+echo "    - operator-notes.local excluded from golden, source ref retained"
 echo "    - Python seed refs verified (BUG: dormant/active, VULN: dormant, fix green)"
 echo "    - TS seed refs verified (BUG: dormant, BRK: red, fix green)"
 echo "    - TS VULN fixes applied and green"

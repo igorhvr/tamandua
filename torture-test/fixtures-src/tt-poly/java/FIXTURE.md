@@ -178,7 +178,7 @@ git apply -p4 java/seeds/fix/POLY-BUG-J4-fix.patch
 1. **Green baseline:** `./mvnw -q -B test` exits 0 with 131 tests passing, 0 failures, BUILD SUCCESS on the golden tree.
 2. **Deterministic golden:** Two consecutive `build-golden.sh` runs print identical hashes. All seed refs have byte-stable SHAs.
 3. **Junk untracked:** After a test run in a scratch clone, `git status --porcelain` shows `?? target/` and `?? operator-notes.local`. Neither is in `.gitignore`.
-4. **operator-notes.local byte-identical:** Content matches the committed version byte-for-byte; drift triggers an oracle finding.
+4. **operator-notes.local byte-identical:** Content matches the fixture source byte-for-byte (provisioning plants it into the work clone untracked); drift triggers an oracle finding.
 5. **Seed ref colors:**
    - `seed/POLY-BUG-J1`: GREEN (A1 dormant — no regression test exists)
    - `seed/POLY-BUG-J2`: RED (NPE on null list from empty CSV path)

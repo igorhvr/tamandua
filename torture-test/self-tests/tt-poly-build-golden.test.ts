@@ -783,9 +783,12 @@ describe("tt-poly build-golden.sh", () => {
         fs.existsSync(path.join(tmpDir, "JUNK-IS-INTENTIONAL.md")),
         "baseline should have JUNK-IS-INTENTIONAL.md",
       );
+      // operator-notes.local is inert junk PLANTED at provisioning, never
+      // committed — the golden tree must NOT contain it (E2.4 canonical
+      // contract). It lives only in fixtures-src as the byte-exact reference.
       assert.ok(
-        fs.existsSync(path.join(tmpDir, "operator-notes.local")),
-        "baseline should have operator-notes.local",
+        !fs.existsSync(path.join(tmpDir, "operator-notes.local")),
+        "golden baseline must NOT contain operator-notes.local (excluded junk)",
       );
 
       // Essential files in python subtree

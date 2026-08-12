@@ -171,6 +171,6 @@ These are verified by `build-golden.sh` and the oracle probes:
 4. **Junk presence:** `package-lock.json` and `node_modules/` exist and
    are untracked after `npm install && npm test`
 5. **Inert junk integrity:** `operator-notes.local` is byte-identical to
-   the committed sampler reference (SHA-256 above)
+   the fixture source (provisioning) reference (SHA-256 above)
 6. **Deterministic builds:** two consecutive runs of `build-golden.sh`
    produce identical commit hashes

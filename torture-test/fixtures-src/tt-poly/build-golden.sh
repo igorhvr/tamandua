@@ -212,6 +212,7 @@ scratch_dir WORK_DIR
             --exclude='*.egg-info' \
             --exclude='target' \
             --exclude='build-golden.sh' \
+            --exclude='operator-notes.local' \
             -cf - .
     ) | tar -xf -
 
@@ -784,9 +785,6 @@ echo "--- Phase 10: Post-build verification ---"
 scratch_dir VERIFY_DIR
 git clone "$BARE_REPO" "$VERIFY_DIR" > /dev/null 2>&1
 
-# Operator notes reference content
-OPERATOR_REF="$(cat "$FIXTURE_SRC/operator-notes.local")"
-
 # --- 9a. Baseline content check -------------------------------------------
 echo ""
 echo "  [10a] Baseline content check..."
@@ -918,26 +916,39 @@ fi
 echo ""
 echo "  [10d] Junk probe verification..."
 
-# operator-notes.local byte-identical check
-echo -n "    operator-notes.local..."
-ACTUAL_OP="$(cat "$VERIFY_DIR/operator-notes.local" 2>/dev/null || echo 'MISSING')"
-if [ "$ACTUAL_OP" = "$OPERATOR_REF" ]; then
-    echo " byte-identical (ok)"
-else
-    echo " BYTE-MISMATCH!"
+# operator-notes.local must NOT be in the golden tree — it is inert junk
+# planted at provisioning (spec 02: one per repo, planted at instantiation,
+# must stay untracked). Root and every per-subtree copy are excluded from the
+# golden commit; the fixture SOURCE retains the canonical bytes that
+# provisioning replants (byte-identical) into work clones.
+echo -n "    operator-notes.local in golden..."
+if [ -e "$VERIFY_DIR/operator-notes.local" ]; then
+    echo " PRESENT — should be excluded junk!"
     exit 1
+else
+    echo " absent (ok)"
 fi
 
-# Per-subtree operator-notes.local checks
+# Per-subtree operator-notes.local must likewise be absent from the golden.
 for subtree in python ts go rust java; do
-    echo -n "    $subtree/operator-notes.local..."
-    if [ -f "$VERIFY_DIR/$subtree/operator-notes.local" ]; then
-        echo " present (ok)"
-    else
-        echo " MISSING!"
+    echo -n "    $subtree/operator-notes.local in golden..."
+    if [ -e "$VERIFY_DIR/$subtree/operator-notes.local" ]; then
+        echo " PRESENT — should be excluded junk!"
         exit 1
+    else
+        echo " absent (ok)"
     fi
 done
+
+# The fixture SOURCE operator-notes.local is the byte-exact provisioning
+# reference (spec 02: planted at instantiation, byte-identical). The canonical
+# bytes must be retained so provisioning can plant them into work clones.
+if [ ! -s "$FIXTURE_SRC/operator-notes.local" ]; then
+    echo "    operator-notes.local : fixture source missing/empty — provisioning reference lost!"
+    exit 1
+else
+    echo "    operator-notes.local : fixture source retained (byte-exact provisioning ref)"
+fi
 
 # Per-subtree JUNK markers (some subtrees may not have standalone copies)
 for subtree in python ts go rust java; do
@@ -1169,7 +1180,7 @@ echo "    - All seed refs present (python + ts + go + rust + java + A5)"
 echo "    - POLY-BUG-A5 cross-language seed (dual overlay, partial-fix property)"
 echo "    - broken-tests branch (all POLY-BRK-* seeds)"
 echo "    - seed/storm composite ref (all seeds layered)"
-echo "    - Junk probes verified (operator-notes.local byte-identical)"
+echo "    - Junk probes verified (operator-notes.local excluded from golden, source ref retained)"
 echo "    - Seed content spot-checks (go/rust/java/A5 verified)"
 echo "    - Hash stability check"
 echo "================================================================="

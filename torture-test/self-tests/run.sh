@@ -49,6 +49,50 @@ fi
 pass() { green "  PASS: $1"; PASS=$((PASS + 1)); }
 fail() { red "  FAIL: $1"; FAIL=$((FAIL + 1)); }
 
+# ═══════════════════════════════════════════════════════════════════
+# Heavy campaign tests (moved OUT of run.sh into isolated invocations)
+# ───────────────────────────────────────────────────────────────────
+# These tests drive full multi-hour scripted-daemon / real-flag campaigns and
+# are NOT time-bounded: tier0-repeatability runs two full scripted-daemon
+# campaigns, tier1-repeatability / tier1-real-case-proof / tier1-include-
+# real-proof / tier1-zero-real-launch-infra / tier1-case-filter spawn real
+# campaign machinery, and scripted-scenario-harness drives scenario harness
+# plumbing — a single one can legitimately exceed 60+ min of ACTIVE progress
+# (writing scenario git objects) on a contended machine. Running them inside
+# run.sh's serial loop made run.sh's closure UNBOUNDED: when an aggregate
+# deadline fired it SIGTERM'd run.sh but ORPHANED the campaign's
+# daemon/tt-controller grandchildren (reparented to init), which kept running,
+# leaked ports (5334/5338/5339), and broke sibling tests with EADDRINUSE.
+#
+# They are therefore EXCLUDED here so run.sh completes in a bounded window
+# regardless of machine load, and are executed INDIVIDUALLY — each as its own
+# `node --test` process under its own generous timeout (no aggregate deadline
+# over the concatenation) — by bin/verify-heavy-campaign-tests.test.sh, the
+# exact verify-builder-determinism.test.sh pattern. No repetition oracle is
+# weakened: every test still runs, just isolated.
+#
+# This list MUST stay in lock-step with bin/verify-heavy-campaign-tests.test.sh
+# and with self-tests/e2e-golden-integrity.test.ts (which pins the invariant).
+HEAVY_CAMPAIGN_TESTS=(
+    'scripted-scenario-harness.test.ts'
+    'tier0-repeatability.test.ts'
+    'tier1-case-filter.test.ts'
+    'tier1-include-real-proof.test.ts'
+    'tier1-real-case-proof.test.ts'
+    'tier1-repeatability.test.ts'
+    'tier1-zero-real-launch-infra.test.ts'
+)
+
+# is_heavy <base> — 0 if <base> is a heavy campaign test (isolated elsewhere), else 1.
+is_heavy() {
+    local base="$1"
+    local t
+    for t in "${HEAVY_CAMPAIGN_TESTS[@]}"; do
+        [ "$t" = "$base" ] && return 0
+    done
+    return 1
+}
+
 # --- test runner ---
 
 run_test_file() {
@@ -95,6 +139,10 @@ for file in "$SELF_DIR"/scripted-scenario-*.test.ts; do
     break
   fi
   base="$(basename "$file")"
+  if is_heavy "$base"; then
+    green "  skip (heavy/isolated): $base"
+    continue
+  fi
   run_test_file "scripted-scenario $base" "$file" || true
 done
 
@@ -107,6 +155,10 @@ for file in "$SELF_DIR"/tier0-*.test.ts; do
     break
   fi
   base="$(basename "$file")"
+  if is_heavy "$base"; then
+    green "  skip (heavy/isolated): $base"
+    continue
+  fi
   run_test_file "tier0 $base" "$file" || true
 done
 
@@ -119,6 +171,10 @@ for file in "$SELF_DIR"/tier1-*.test.ts; do
     break
   fi
   base="$(basename "$file")"
+  if is_heavy "$base"; then
+    green "  skip (heavy/isolated): $base"
+    continue
+  fi
   run_test_file "tier1 $base" "$file" || true
 done
 

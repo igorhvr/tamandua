@@ -218,7 +218,7 @@ name. The canary file appearing means something executed the directory name.
 6. **Dormant vulns (POLY-VULN-P1, POLY-VULN-P2):** test suite passes with the `integrations.py` module present
 7. **Broken tests:** `broken-tests` branch has exactly 2 failing tests; `main` has 0
 8. **Junk probe — regenerated:** `__pycache__/` and `.pytest_cache/` appear as untracked after running tests
-9. **Junk probe — inert:** `operator-notes.local` is byte-identical to the committed sampler reference
+9. **Junk probe — inert:** `operator-notes.local` is byte-identical to the fixture source (provisioning plants it into the work clone untracked)
 10. **Deterministic builds:** two consecutive runs of `build-golden.sh` produce identical commit hashes
 
 ## Patch Application Quick Reference
