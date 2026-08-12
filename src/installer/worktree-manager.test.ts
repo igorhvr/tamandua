@@ -1,6 +1,6 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { rmSync, writeFileSync } from "node:fs";
+import { existsSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
 
@@ -9,6 +9,7 @@ import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
 import {
   resolveWorktreeRoot,
   buildWorktreePath,
+  hasTrackedChanges,
   createRunWorktree,
   getRunWorktree,
   validateRunWorktree,
@@ -143,6 +144,36 @@ describe("worktree-manager", () => {
     });
   });
 
+  // ── hasTrackedChanges ──
+
+  describe("hasTrackedChanges", () => {
+    it("returns false for empty input", () => {
+      assert.equal(hasTrackedChanges(""), false);
+    });
+
+    it("returns false for only untracked or ignored lines", () => {
+      assert.equal(hasTrackedChanges("?? untracked.txt\n!! ignored.txt"), false);
+    });
+
+    it("returns true for tracked XY statuses", () => {
+      for (const status of [" M", "M ", "MM", "A ", "D ", "R "]) {
+        assert.equal(
+          hasTrackedChanges(`${status} file.txt`),
+          true,
+          `should detect status ${JSON.stringify(status)}`,
+        );
+      }
+    });
+
+    it("returns true when tracked changes are mixed with untracked files", () => {
+      assert.equal(hasTrackedChanges("?? junk.txt\n M README.md"), true);
+    });
+
+    it("skips blank lines", () => {
+      assert.equal(hasTrackedChanges("\n\n"), false);
+    });
+  });
+
   // ── createRunWorktree ──
 
   describe("createRunWorktree", () => {
@@ -254,21 +285,108 @@ describe("worktree-manager", () => {
       }
     });
 
-    it("rejects dirty origin repositories", () => {
-      const dirtyRepo = tamanduaTempDir("tamandua-dirty-origin-");
+    it("allows untracked-only origin and leaves untracked files out of the worktree", () => {
+      const dirtyRepo = tamanduaTempDir("tamandua-untracked-origin-");
       try {
         initGitRepo(dirtyRepo);
-        writeFileSync(path.join(dirtyRepo, "dirty.txt"), "unstaged change", "utf-8");
+        const untrackedFile = "operator-notes.local";
+        writeFileSync(path.join(dirtyRepo, untrackedFile), "untracked junk", "utf-8");
+
+        // An ignored file must also not block creation and must be absent.
+        writeFileSync(path.join(dirtyRepo, ".gitignore"), "ignored-scratch.txt\n", "utf-8");
+        runGit(["add", ".gitignore"], dirtyRepo);
+        runGit(["commit", "-m", "add gitignore"], dirtyRepo);
+        writeFileSync(path.join(dirtyRepo, "ignored-scratch.txt"), "ignored junk", "utf-8");
+
+        const result = createRunWorktree({
+          runId: "run-create-untracked",
+          runNumber: 96,
+          workflowId: "test-workflow",
+          worktreeOriginRepository: dirtyRepo,
+        });
+
+        assert.equal(result.status, "ready");
+        assert.equal(
+          existsSync(path.join(result.worktreePath, untrackedFile)),
+          false,
+          "untracked origin file must not appear in the created worktree",
+        );
+        assert.equal(
+          existsSync(path.join(result.worktreePath, "ignored-scratch.txt")),
+          false,
+          "ignored origin file must not appear in the created worktree",
+        );
+
+        removeRunWorktree({ runId: "run-create-untracked", force: true });
+        assert.equal(
+          getRunWorktree("run-create-untracked")!.status,
+          "removed",
+          "cleanup must mark the worktree row as removed",
+        );
+      } finally {
+        rmSync(dirtyRepo, { recursive: true, force: true });
+      }
+    });
+
+    it("rejects origin with a modified tracked file", () => {
+      const dirtyRepo = tamanduaTempDir("tamandua-tracked-modified-");
+      try {
+        initGitRepo(dirtyRepo);
+        writeFileSync(path.join(dirtyRepo, "README.md"), "# Modified\n", "utf-8");
 
         assert.throws(
           () =>
             createRunWorktree({
-              runId: "run-create-dirty",
+              runId: "run-create-tracked-modified",
+              runNumber: 97,
+              workflowId: "test-workflow",
+              worktreeOriginRepository: dirtyRepo,
+            }),
+          /origin repository has uncommitted changes to tracked files/i,
+        );
+      } finally {
+        rmSync(dirtyRepo, { recursive: true, force: true });
+      }
+    });
+
+    it("rejects origin with a staged file", () => {
+      const dirtyRepo = tamanduaTempDir("tamandua-staged-origin-");
+      try {
+        initGitRepo(dirtyRepo);
+        writeFileSync(path.join(dirtyRepo, "staged.txt"), "staged change", "utf-8");
+        runGit(["add", "staged.txt"], dirtyRepo);
+
+        assert.throws(
+          () =>
+            createRunWorktree({
+              runId: "run-create-staged",
+              runNumber: 98,
+              workflowId: "test-workflow",
+              worktreeOriginRepository: dirtyRepo,
+            }),
+          /origin repository has uncommitted changes to tracked files/i,
+        );
+      } finally {
+        rmSync(dirtyRepo, { recursive: true, force: true });
+      }
+    });
+
+    it("rejects origin with mixed untracked and tracked-modified files", () => {
+      const dirtyRepo = tamanduaTempDir("tamandua-mixed-origin-");
+      try {
+        initGitRepo(dirtyRepo);
+        writeFileSync(path.join(dirtyRepo, "README.md"), "# Modified\n", "utf-8");
+        writeFileSync(path.join(dirtyRepo, "untracked.txt"), "untracked junk", "utf-8");
+
+        assert.throws(
+          () =>
+            createRunWorktree({
+              runId: "run-create-mixed",
               runNumber: 99,
               workflowId: "test-workflow",
               worktreeOriginRepository: dirtyRepo,
             }),
-          /origin repository has uncommitted changes/i,
+          /origin repository has uncommitted changes to tracked files/i,
         );
       } finally {
         rmSync(dirtyRepo, { recursive: true, force: true });

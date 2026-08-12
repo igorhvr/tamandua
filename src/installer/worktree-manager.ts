@@ -89,6 +89,49 @@ export function resolveWorktreeRoot(): string {
   return path.join(os.homedir(), ".tamandua", "worktrees");
 }
 
+/**
+ * Origin-cleanliness gate (ORIJ product fix): refuses only TRACKED changes.
+ *
+ * Untracked (`??`) and ignored (`!!`) porcelain entries are skipped because
+ * untracked scratch files in the origin repo cannot affect a worktree built
+ * from committed objects, and real user repos routinely carry them.
+ *
+ * ── Sibling porcelain-check audit (US-003) ─────────────────────────────
+ * Every other `git status --porcelain` call on an origin/source repository
+ * reachable from run creation was audited for the same untracked-only
+ * false-refusal. None needs alignment:
+ *
+ * - src/installer/merge-branch.ts `inspectOwnerSafety` (landing gate): runs
+ *   `status --porcelain=v1 --untracked-files=no`, so it already ignores
+ *   untracked/ignored files. Correct; out of scope.
+ * - src/installer/ledger-gate.ts `buildRefusalDiagnostics`: reads
+ *   `status --porcelain` only to emit the read-only WORKSPACE_STATE
+ *   diagnostic line; it never produces a refusal. Out of scope.
+ * - src/autoresearch/autoresearch.ts `hasDirtyNonAutoresearchFiles` /
+ *   `revertExperimentChanges`: commit/revert bookkeeping for the
+ *   autoresearch engine (protected-file filtering, restore/clean), not a
+ *   worktree-creation refusal. Out of scope.
+ * - src/suite/shim.ts `getTrackedDirtyPaths` (TSTX tree-dirty gate) and
+ *   src/suite/tree-hash.ts (temporary-index hashing): test/shim gates, and
+ *   the shim already passes `--untracked-files=no`. Out of scope.
+ * - src/installer/worktree-manager.ts `removeRunWorktree` (line ~375): the
+ *   dirty check guards removal of the AGENT worktree (not the origin repo)
+ *   and is force-overridable; it is not an origin/source refusal at run
+ *   creation. No alignment needed.
+ *
+ * No sibling code change was required by this audit.
+ */
+export function hasTrackedChanges(porcelainOutput: string): boolean {
+  for (const rawLine of porcelainOutput.split("\n")) {
+    const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+    if (line.length === 0) continue;
+    const xy = line.slice(0, 2);
+    if (xy === "??" || xy === "!!") continue;
+    return true;
+  }
+  return false;
+}
+
 export function buildWorktreePath(params: {
   worktreeOriginGitCommonDir: string;
   worktreeOriginRepository: string;
@@ -136,9 +179,9 @@ export function createRunWorktree(
     originRepo,
     "cannot inspect origin repository status",
   );
-  if (dirtyStatus.length > 0) {
+  if (hasTrackedChanges(dirtyStatus)) {
     throw new Error(
-      `origin repository has uncommitted changes: ${originRepo}`,
+      `origin repository has uncommitted changes to tracked files: ${originRepo}`,
     );
   }
 

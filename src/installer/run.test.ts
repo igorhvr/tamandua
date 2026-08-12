@@ -328,7 +328,7 @@ describe("runWorkflow", () => {
       writeMinimalWorkflow(tempHome, workflowId, "worktree");
       const originDir = path.join(tempHome, "test-lncz-dirty-origin");
       initGitRepo(originDir);
-      fs.writeFileSync(path.join(originDir, "dirty.txt"), "uncommitted\n", "utf-8");
+      fs.writeFileSync(path.join(originDir, "README.md"), "# Test Repo (modified)\n", "utf-8");
 
       await assert.rejects(
         runWorkflow({
