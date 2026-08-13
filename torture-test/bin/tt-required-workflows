@@ -1,0 +1,186 @@
+#!/usr/bin/env node
+// tt-required-workflows — manifest-driven TT-custom workflow enumeration
+// (E2.6 US-002).
+//
+// Deterministic helper that enumerates, FROM the tier manifests themselves,
+// every distinct workflow spec a REAL (non-scripted) case references beyond
+// the bundled repo catalog. This is the seam tt-catalog-install (US-003) and
+// the preflight chain (US-006) call to know which TT-custom workflow specs
+// must be installed/verified in the contained TT home — so a missing custom
+// workflow fails closed at preflight (`catalog-missing: <name>`) instead of
+// at launch (`workflow-spec-missing`).
+//
+// Resolution:
+//   - Reads EVERY manifest under torture-test/cases/:
+//     tier0.jsonl, tier1.jsonl, cases.jsonl, smoke.jsonl.
+//   - For each case whose `harness` is `pi` or `hermes` (i.e. NOT the
+//     `local` scripted harness), collects the `workflow` field.
+//   - Excludes the bundled catalog set (the repo's workflows/* workflow ids).
+//   - Any workflow referenced by a real case that is NOT bundled is a
+//     required TT-custom workflow.
+//   - Prints the stable, sorted, de-duplicated list, one name per line.
+//     An empty required set prints nothing (still success).
+//
+// Fail-closed (non-zero exit + distinct machine-parseable REASON on stderr):
+//   - manifest-unreadable: <name>        a required manifest cannot be read
+//   - manifest-invalid: <name>: line <n> a manifest line is not valid JSON
+//   - manifest-record-invalid: <name>    a real case lacks a workflow field
+//   - bundled-catalog-unresolvable       the bundled workflows dir is unreadable
+//
+// Env/test seams (never mutate operator state):
+//   - TT_CASES_DIR      override the cases dir (default torture-test/cases)
+//   - TT_WORKFLOWS_SRC  override the bundled catalog dir (default repo/workflows)
+//
+// Never writes anything; prints to stdout only. Idempotent.
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const binDir = path.dirname(fileURLToPath(import.meta.url));
+const ttRoot = path.resolve(binDir, "..");
+const repoRoot = path.resolve(ttRoot, "..");
+
+// The fixed manifest set the helper is required to read (E2.6 US-002).
+const MANIFEST_NAMES = ["tier0.jsonl", "tier1.jsonl", "cases.jsonl", "smoke.jsonl"];
+
+function fail(reason, detail) {
+  process.stderr.write(`REASON: ${reason}\n`);
+  if (detail !== undefined) {
+    process.stderr.write(`DETAILS: ${detail}\n`);
+  }
+  process.exit(1);
+}
+
+function usage() {
+  process.stdout.write(
+    `tt-required-workflows — manifest-driven TT-custom workflow enumeration (E2.6 US-002).
+
+Usage: tt-required-workflows [--help]
+
+Reads every manifest under torture-test/cases/ (tier0.jsonl, tier1.jsonl,
+cases.jsonl, smoke.jsonl) and prints, one per line (sorted, de-duplicated),
+the workflow ids referenced by REAL cases (harness pi/hermes) that are NOT
+part of the bundled repo catalog (workflows/*) and are NOT the 'local'
+scripted-harness sentinel.
+
+These are the TT-custom workflow specs that must be installed into the
+contained TT home before a real case launches.
+
+Fail-closed reasons (non-zero exit, on stderr):
+  manifest-unreadable: <name>        a required manifest cannot be read
+  manifest-invalid: <name>: line <n> a manifest line is not valid JSON
+  manifest-record-invalid: <name>    a real case lacks a workflow field
+  bundled-catalog-unresolvable       the bundled workflows dir is unreadable
+
+Env seams:
+  TT_CASES_DIR      override the cases dir (default torture-test/cases)
+  TT_WORKFLOWS_SRC  override the bundled catalog dir (default repo/workflows)
+
+Deterministic, idempotent, never writes state. An empty required set prints
+nothing and exits 0.
+`,
+  );
+}
+
+// enumerateBundledIds: the bundled catalog workflow ids (directory names under
+// the bundled workflows dir that contain a workflow.yml). This mirrors how
+// tt-catalog-install identifies/installs the bundled catalog.
+function enumerateBundledIds(bundledDir) {
+  const ids = new Set();
+  let entries;
+  try {
+    entries = fs.readdirSync(bundledDir, { withFileTypes: true });
+  } catch {
+    fail("bundled-catalog-unresolvable", `cannot read bundled workflows dir: ${bundledDir}`);
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+    if (fs.existsSync(path.join(bundledDir, entry.name, "workflow.yml"))) {
+      ids.add(entry.name);
+    }
+  }
+  return ids;
+}
+
+// readManifest: parse a JSONL manifest. Fails closed (distinct reason) on an
+// unreadable file or any non-JSON line.
+function readManifest(file) {
+  const base = path.basename(file);
+  let contents;
+  try {
+    contents = fs.readFileSync(file, "utf8");
+  } catch {
+    fail(`manifest-unreadable: ${base}`, `cannot read manifest: ${file}`);
+  }
+  const records = [];
+  for (const [index, line] of contents.split(/\r?\n/).entries()) {
+    if (line.trim() === "") continue;
+    let record;
+    try {
+      record = JSON.parse(line);
+    } catch {
+      fail(`manifest-invalid: ${base}: line ${index + 1}`, `${base}: line ${index + 1} is not valid JSON`);
+    }
+    records.push(record);
+  }
+  return records;
+}
+
+// The `local` workflow value is the scripted-harness sentinel: it never maps
+// to an installable tamandua workflow spec (W2.24-docs-drift is a real pi run
+// whose `workflow` is `local` because the case authors/installs its own docs
+// example in-band). It is always excluded alongside the bundled catalog.
+const SCRIPTED_WORKFLOW_SENTINEL = "local";
+
+// collectRequiredCustomWorkflows: the distinct real-case workflow ids not in
+// the bundled set (nor the `local` sentinel), sorted for deterministic output.
+function collectRequiredCustomWorkflows(casesDir, bundledDir) {
+  const bundled = enumerateBundledIds(bundledDir);
+  const required = new Set();
+
+  for (const name of MANIFEST_NAMES) {
+    const file = path.join(casesDir, name);
+    for (const record of readManifest(file)) {
+      // Only real (non-scripted) cases require a tamandua workflow spec. The
+      // `local` harness is the scripted path and is deliberately excluded.
+      if (record?.harness !== "pi" && record?.harness !== "hermes") continue;
+
+      const workflow = record?.workflow;
+      if (typeof workflow !== "string" || workflow.trim() === "") {
+        fail(
+          `manifest-record-invalid: ${name}`,
+          `${name}: a real (pi/hermes) case lacks a non-empty workflow field`,
+        );
+      }
+      if (workflow === SCRIPTED_WORKFLOW_SENTINEL) continue;
+      if (!bundled.has(workflow)) {
+        required.add(workflow);
+      }
+    }
+  }
+
+  return [...required].sort();
+}
+
+function main() {
+  const args = process.argv.slice(2);
+  if (args.includes("--help") || args.includes("-h")) {
+    usage();
+    process.exit(0);
+  }
+  if (args.length > 0) {
+    process.stderr.write(`tt-required-workflows: unknown argument: ${args.join(" ")}\n`);
+    process.stderr.write("Usage: tt-required-workflows [--help]\n");
+    process.exit(2);
+  }
+
+  const casesDir = path.resolve(process.env.TT_CASES_DIR || path.join(ttRoot, "cases"));
+  const bundledDir = path.resolve(process.env.TT_WORKFLOWS_SRC || path.join(repoRoot, "workflows"));
+
+  const required = collectRequiredCustomWorkflows(casesDir, bundledDir);
+  if (required.length > 0) {
+    process.stdout.write(`${required.join("\n")}\n`);
+  }
+}
+
+main();

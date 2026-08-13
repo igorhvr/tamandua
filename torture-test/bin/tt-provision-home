@@ -17,6 +17,17 @@
 #                         Idempotent: repeated runs against a healthy home are
 #                         no-ops.
 #
+# E2.6 US-004 — minimal harness-credential surfacing:
+# Instead of blindly copying the WHOLE ~/.pi and ~/.hermes (hermes state.db is
+# 1.5GB), this helper surfaces ONLY the enumerated minimal auth/config files
+# each harness actually reads to resolve a model + API key. The operator's
+# env-provided API keys (e.g. DEEPSEEK_API_KEY) are additionally materialized
+# into the contained home (pi auth.json + hermes .env) because the contained
+# daemon is started under `env -i` (daemon-control) and never inherits the
+# operator's environment. No ~/.tamandua, ~/.ssh, or operator gitconfig is ever
+# surfaced. The enumerated set is documented in `usage` and in
+# torture-test/impl-tasks/E2.6-catalog-and-harness-credentials.md.
+#
 # Idempotent: safe to run repeatedly — second run is a no-op.
 # Follows spec 01 two-env rule: never mutates caller environment.
 set -euo pipefail
@@ -30,12 +41,104 @@ TT_VAR="${TT_VAR:-$TT_DIR/var}"
 REAL_TT_HOME="$TT_VAR/home"
 SCRIPTED_TT_HOME="$TT_VAR/home-scripted"
 
-REAL_HOME="${HOME}"
-
 # ── helpers ───────────────────────────────────────────────────────────
 
 log() { printf '[tt-provision-home] %s\n' "$*"; }
 log_verbose() { log "$@"; }
+
+# resolve_operator_home: the OPERATOR's real HOME — the copy SOURCE for the
+# enumerated harness auth/config files. This must NOT be `$HOME`: the contained
+# spawn env (env/tt-env.sh) overrides HOME to the contained TT home, so a
+# `$HOME`-based source would self-copy the contained home (the original E2.6
+# bug — the operator's ~/.pi/~/.hermes were never surfaced under the controller).
+# Priority:
+#   1. TT_OPERATOR_HOME env override (test seam / explicit pin)
+#   2. passwd database (getent passwd) — the real operator home, independent
+#      of the HOME override
+#   3. $HOME fallback (standalone manual runs)
+resolve_operator_home() {
+  if [ -n "${TT_OPERATOR_HOME:-}" ]; then
+    printf '%s' "$TT_OPERATOR_HOME"
+    return 0
+  fi
+  local pw_home
+  pw_home="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6 || true)"
+  if [ -n "$pw_home" ]; then
+    printf '%s' "$pw_home"
+    return 0
+  fi
+  # macOS fallback: getent is absent; read the NFS home directory via dscl.
+  if command -v dscl >/dev/null 2>&1; then
+    pw_home="$(dscl . -read /Users/$(id -un) NFSHomeDirectory 2>/dev/null | awk '{print $2}' || true)"
+    if [ -n "$pw_home" ]; then
+      printf '%s' "$pw_home"
+      return 0
+    fi
+  fi
+  printf '%s' "${HOME:-}"
+}
+
+# OPERATOR_HOME (copy source) and REAL_HOME (audit rewrite source path). Both
+# resolve via getent/passwd so the controller's contained-HOME override can't
+# break credential surfacing. Assigned at top level after resolve_operator_home
+# is defined; the surfacing functions below read them as globals.
+OPERATOR_HOME="$(resolve_operator_home)"
+REAL_HOME="$OPERATOR_HOME"
+
+# ── Enumerated minimal harness auth/config files (E2.6 US-004) ───────
+#
+# These are the ONLY files surfaced from the operator's real HOME into the
+# contained TT home. Each harness reads these to resolve a model + API key;
+# everything else (sessions, state.db, caches, skills, logs, .ssh, gitconfig)
+# is deliberately excluded.
+#
+# pi reads these from ~/.pi/agent/ (pi config/auth resolution; see
+# src/installer/paths.ts and pi docs models.md/providers.md):
+#   settings.json  — defaultProvider/defaultModel/thinking level; the selected
+#                    model comes from here when tamandua invokes `pi --print`
+#                    with no --model override.
+#   models.json    — custom provider definitions (baseUrl + inline apiKey +
+#                    model list); the operator's local-dspark provider lives here.
+#   auth.json      — NOT in the verbatim-copy list: it is produced by
+#                    surface_env_api_keys below (operator auth.json base +
+#                    env-provided API keys merged in), so there is a single
+#                    writer and the copy never clobbers the merged result.
+PI_AGENT_FILES=("settings.json" "models.json")
+
+# hermes reads these from ~/.hermes/ (HERMES_HOME):
+#   config.yaml    — default model/provider + auxiliary provider slots; the
+#                    model+provider selection for every hermes round.
+#   auth.json      — OAuth/API-key credential store (openai-codex id_token +
+#                    refresh_token + credential_pool); the source of hermes auth.
+HERMES_FILES=("config.yaml" "auth.json")
+
+# pi built-in provider API-key env map (env var name -> pi auth.json provider
+# key). pi resolves provider API keys from auth.json first, then these
+# environment variables (pi docs providers.md). We materialize any that are
+# SET in the operator environment into the contained pi auth.json so the
+# contained daemon (started under `env -i`) can still resolve them. hermes
+# reads the SAME KEY=VALUE pairs from ~/.hermes/.env via load_hermes_dotenv.
+PI_ENV_API_KEY_MAP=(
+  "ANTHROPIC_API_KEY|anthropic"
+  "ANT_LING_API_KEY|ant-ling"
+  "OPENAI_API_KEY|openai"
+  "DEEPSEEK_API_KEY|deepseek"
+  "NVIDIA_API_KEY|nvidia"
+  "GEMINI_API_KEY|google"
+  "MISTRAL_API_KEY|mistral"
+  "GROQ_API_KEY|groq"
+  "CEREBRAS_API_KEY|cerebras"
+  "XAI_API_KEY|xai"
+  "OPENROUTER_API_KEY|openrouter"
+  "AI_GATEWAY_API_KEY|vercel-ai-gateway"
+  "ZAI_API_KEY|zai"
+  "MINIMAX_API_KEY|minimax"
+  "HF_TOKEN|huggingface"
+  "FIREWORKS_API_KEY|fireworks"
+  "TOGETHER_API_KEY|together"
+  "KIMI_API_KEY|kimi-coding"
+  "OPENCODE_API_KEY|opencode"
+)
 
 # ── .gitconfig creation ──────────────────────────────────────────────
 
@@ -64,60 +167,166 @@ provision_gitconfig() {
 GITCONF
 }
 
-# ── directory copy with path audit ───────────────────────────────────
+# ── minimal-file surfacing (E2.6 US-004) ─────────────────────────────
 
-copy_and_audit() {
-  local src_dir="$1"
-  local dest_dir="$2"
+# surface_minimal_file: copy ONE enumerated harness auth/config file from the
+# operator's real HOME into the contained TT home (never a whole directory).
+# Audits for absolute real-HOME path references and rewrites them (spec 01),
+# recording rewrites in the audit file. Idempotent: compares the AUDITED
+# content against the current destination, so a file already rewritten by an
+# earlier run is a byte-for-byte no-op (no churn, no re-audit).
+surface_minimal_file() {
+  local src="$1"       # absolute source path (operator HOME)
+  local dest="$2"      # absolute destination path (contained HOME)
   local audit_file="$3"
-  local label="$4"
+  local home="$4"      # contained HOME root (for relative audit paths)
 
-  if [ ! -d "$src_dir" ]; then
-    log "  $src_dir does not exist — skipping $label copy"
-    mkdir -p "$dest_dir" 2>/dev/null || true
+  if [ ! -f "$src" ]; then
+    log "  $src does not exist — skipping (operator has no such file)"
     return 0
   fi
 
-  if [ -d "$dest_dir" ] && [ -n "$(ls -A "$dest_dir" 2>/dev/null || true)" ]; then
-    log "  $dest_dir already exists and is non-empty — skipping $label copy"
+  mkdir -p "$(dirname "$dest")"
+
+  # Build the audited content in a temp file (source with any real-HOME paths
+  # rewritten to the contained destination directory).
+  local tmp rewrites
+  tmp="$(mktemp "${TMPDIR:-/tmp}/tt-provision-audit.XXXXXX")"
+  rm -f "$tmp"
+  cp -a "$src" "$tmp"
+  rewrites=0
+  if grep -qF "$REAL_HOME" "$tmp" 2>/dev/null; then
+    local sed_real_home sed_dest_dir
+    sed_real_home="$(printf '%s' "$REAL_HOME" | sed 's/|/\\|/g')"
+    sed_dest_dir="$(printf '%s' "$(dirname "$dest")" | sed 's/|/\\|/g')"
+    rewrites="$(grep -cF "$REAL_HOME" "$tmp" 2>/dev/null || echo 0)"
+    sed -i "s|${sed_real_home}|${sed_dest_dir}|g" "$tmp"
+  fi
+
+  # Idempotent: identical audited content already in place → no-op.
+  if [ -f "$dest" ] && cmp -s "$tmp" "$dest"; then
+    rm -f "$tmp"
     return 0
   fi
 
-  log "Copying $src_dir → $dest_dir (NOT a symlink)"
-  rm -rf "$dest_dir"
-  cp -a "$src_dir" "$dest_dir"
-
-  # Audit for absolute paths pointing at the real HOME
-  log "  Auditing $dest_dir for real-home paths ($REAL_HOME) ..."
-  local rewrites=0
-  while IFS= read -r file; do
-    if [ ! -f "$file" ]; then continue; fi
-    if grep -qF "$REAL_HOME" "$file" 2>/dev/null; then
-      log_verbose "    Found real-home reference in: $file"
-      # Escape for sed: use | as delimiter since paths contain /
-      # But first we must also escape | characters if they appear in the home path
-      local sed_real_home
-      sed_real_home="$(printf '%s' "$REAL_HOME" | sed 's/|/\\|/g')"
-      local sed_tt_home
-      sed_tt_home="$(printf '%s' "$dest_dir" | sed 's/|/\\|/g')"
-
-      # Count and record rewrites before doing them
-      local count
-      count="$(grep -cF "$REAL_HOME" "$file" 2>/dev/null || echo 0)"
-
-      sed -i "s|${sed_real_home}|${sed_tt_home}|g" "$file"
-
-      printf '{"file":"%s","replacements":%s,"old":"%s","new":"%s"}\n' \
-        "${file#"$dest_dir/"}" "$count" "$REAL_HOME" "$dest_dir" \
-        >> "$audit_file"
-      rewrites=$((rewrites + count))
-    fi
-  done < <(find "$dest_dir" -type f 2>/dev/null || true)
+  log "  Surfacing $src → $dest"
+  cp -a "$tmp" "$dest"
+  rm -f "$tmp"
 
   if [ "$rewrites" -gt 0 ]; then
-    log "  Audited: $rewrites path rewrite(s) in $label copy → $audit_file"
-  else
-    log "  Audited: no real-home paths found in $label copy"
+    printf '{"file":"%s","replacements":%s,"old":"%s","new":"%s"}\n' \
+      "${dest#"$home/"}" "$rewrites" "$REAL_HOME" "$(dirname "$dest")" \
+      >> "$audit_file"
+    log "  Audited: $rewrites path rewrite(s) in $dest"
+  fi
+}
+
+# surface_pi_files: surface the enumerated pi agent config files (settings +
+# models). auth.json is NOT handled here — surface_env_api_keys owns it so the
+# env-key merge is never clobbered by a verbatim re-copy on later runs.
+surface_pi_files() {
+  local home="$1"
+  local src_agent="$OPERATOR_HOME/.pi/agent"
+  local dest_agent="$home/.pi/agent"
+  local f
+  for f in "${PI_AGENT_FILES[@]}"; do
+    surface_minimal_file "$src_agent/$f" "$dest_agent/$f" "$home/provision-audit.json" "$home"
+  done
+}
+
+# surface_hermes_files: surface the enumerated hermes config files (config +
+# auth). Hermes OAuth tokens are fully contained in auth.json; the deepseek
+# API-key env materialization goes to .env in surface_env_api_keys.
+surface_hermes_files() {
+  local home="$1"
+  local src="$OPERATOR_HOME/.hermes"
+  local dest="$home/.hermes"
+  local f
+  for f in "${HERMES_FILES[@]}"; do
+    surface_minimal_file "$src/$f" "$dest/$f" "$home/provision-audit.json" "$home"
+  done
+}
+
+# surface_env_api_keys: materialize the operator's env-provided harness API
+# keys into the contained home so the contained daemon (started under `env -i`
+# by daemon-control — no operator env inherited) can still resolve a model +
+# API key. This is what fixes the E2.6 `No API key found for the selected
+# model` failures.
+#   pi:     merges the operator's ~/.pi/agent/auth.json base with any SET
+#           API-key env vars (pi auth.json format: {"<provider>":{"type":
+#           "api_key","key":"..."}}), writing 0600.
+#   hermes: writes the SET API-key env vars verbatim into ~/.hermes/.env
+#           (dotenv KEY=VALUE format; hermes loads it via load_hermes_dotenv).
+# Idempotent: only writes when the resulting content would change.
+surface_env_api_keys() {
+  local home="$1"
+
+  # Newline-separated ENVVAR=provider pairs (no secrets on the command line;
+  # values are read directly from the process env by the node helper).
+  local pairs="" entry envvar provider
+  for entry in "${PI_ENV_API_KEY_MAP[@]}"; do
+    envvar="${entry%%|*}"
+    provider="${entry##*|}"
+    if [ -n "${!envvar:-}" ]; then
+      pairs="${pairs}${envvar}=${provider}"$'\n'
+    fi
+  done
+
+  # ── pi: merge operator auth.json + env keys into contained auth.json ──
+  local pi_auth="$home/.pi/agent/auth.json"
+  mkdir -p "$(dirname "$pi_auth")"
+  local pi_src_auth="$OPERATOR_HOME/.pi/agent/auth.json"
+  node - "$pi_auth" "$pi_src_auth" "$pairs" <<'NODE'
+'use strict';
+const fs = require('fs');
+const [authPath, srcAuthPath, pairsRaw] = process.argv.slice(2);
+let auth = {};
+if (srcAuthPath && fs.existsSync(srcAuthPath)) {
+  try { auth = JSON.parse(fs.readFileSync(srcAuthPath, 'utf8')); } catch { auth = {}; }
+}
+for (const line of (pairsRaw || '').split('\n')) {
+  const i = line.indexOf('=');
+  if (i <= 0) continue;
+  const envVar = line.slice(0, i);
+  const provider = line.slice(i + 1);
+  const key = process.env[envVar];
+  if (key && key.length > 0) auth[provider] = { type: 'api_key', key };
+}
+const out = JSON.stringify(auth, null, 2) + '\n';
+let current = '';
+try { current = fs.readFileSync(authPath, 'utf8'); } catch { current = ''; }
+if (current !== out) {
+  fs.writeFileSync(authPath, out, { mode: 0o600 });
+  fs.chmodSync(authPath, 0o600);
+  process.stderr.write('[tt-provision-home] surfaced pi env API keys into ' + authPath + '\n');
+}
+NODE
+
+  # ── hermes: write SET API-key env vars verbatim into ~/.hermes/.env ──
+  local hermes_env="$home/.hermes/.env"
+  mkdir -p "$(dirname "$hermes_env")"
+  local new_env="" val
+  for entry in "${PI_ENV_API_KEY_MAP[@]}"; do
+    envvar="${entry%%|*}"
+    val="${!envvar:-}"
+    if [ -n "$val" ]; then
+      new_env="${new_env}${envvar}=${val}"$'\n'
+    fi
+  done
+  local cur_env=""
+  if [ -f "$hermes_env" ]; then
+    cur_env="$(cat "$hermes_env")"
+  fi
+  # Compare after command-substitution normalization (strips trailing
+  # newlines on both sides) so a byte-identical .env is a no-op.
+  if [ "$(printf '%s' "$new_env")" != "$cur_env" ]; then
+    if [ -n "$new_env" ]; then
+      printf '%s' "$new_env" > "$hermes_env"
+    else
+      : > "$hermes_env"
+    fi
+    chmod 600 "$hermes_env"
+    log "  Surfaced operator API-key env vars into $hermes_env"
   fi
 }
 
@@ -208,8 +417,9 @@ fail_closed_real_home() {
   # what decides the outcome (a sub-step failure is a leg, not an abort).
   set +e
   provision_gitconfig "$home"
-  copy_and_audit "$HOME/.pi"      "$home/.pi"      "$home/provision-audit.json" "~/.pi"
-  copy_and_audit "$HOME/.hermes"  "$home/.hermes"  "$home/provision-audit.json" "~/.hermes"
+  surface_pi_files "$home"
+  surface_hermes_files "$home"
+  surface_env_api_keys "$home"
   remove_ssh_dir "$home"
 
   # ── verification legs (fail-closed) ──
@@ -225,17 +435,22 @@ fail_closed_real_home() {
   else
     fail="${fail}gitconfig:no-home;"
   fi
-  # Copy legs: a copy is a failure ONLY when the operator source exists but the
-  # contained destination is absent (a genuine copy failure). If the operator
-  # has no ~/.pi / ~/.hermes the base tool skips intentionally — not a leg.
-  local copy_item src dst
-  for copy_item in ".pi" ".hermes"; do
-    src="${HOME}/${copy_item}"
-    dst="${home}/${copy_item}"
-    if [ -d "$src" ] && [ ! -d "$dst" ]; then
-      fail="${fail}copy-missing:${copy_item};"
+
+  # Minimal-file copy legs: a copy is a failure ONLY when the operator source
+  # exists but the contained destination is absent (a genuine copy failure).
+  # If the operator has no such file the base tool skips intentionally — not a
+  # leg. auth.json (pi) is produced by the env-key merge and is verified to
+  # exist regardless of operator/env-key presence.
+  local src_file dest_file
+  for src_file in ".pi/agent/settings.json" ".pi/agent/models.json" \
+                  ".hermes/config.yaml" ".hermes/auth.json"; do
+    if [ -f "${OPERATOR_HOME}/${src_file}" ] && [ ! -f "${home}/${src_file}" ]; then
+      fail="${fail}copy-missing:${src_file};"
     fi
   done
+  if [ ! -f "$home/.pi/agent/auth.json" ]; then
+    fail="${fail}copy-missing:.pi/agent/auth.json;"
+  fi
   set -e
 
   if [ -n "$fail" ]; then
@@ -260,10 +475,20 @@ Provisions:
   torture-test/var/home/          (real TT_HOME)
   torture-test/var/home-scripted/ (scripted TT_HOME)
 
-Real TT_HOME gets:
+Real TT_HOME gets (E2.6 US-004 — MINIMAL enumerated set, no whole-dir copy):
   - .gitconfig with TT-specific identity settings
-  - COPY of ~/.pi/ and ~/.hermes/ (audited for absolute paths)
-  - NO .ssh directory
+  - .pi/agent/settings.json   (default model/provider selection)
+  - .pi/agent/models.json     (custom provider defs + inline apiKey)
+  - .pi/agent/auth.json       (operator auth.json base + env API keys merged)
+  - .hermes/config.yaml       (default model/provider + auxiliary slots)
+  - .hermes/auth.json         (OAuth/API-key credential store)
+  - .hermes/.env              (operator env API keys, dotenv KEY=VALUE)
+  - NO .ssh directory, NO ~/.tamandua, NO operator gitconfig, NO ~/.hermes
+    state.db/caches/sessions (the whole-directory copy is removed)
+
+Env-provided API keys (e.g. DEEPSEEK_API_KEY/OPENAI_API_KEY/ANTHROPIC_API_KEY)
+are materialized into the contained home (pi auth.json + hermes .env) because
+the contained daemon starts under env -i and never inherits the operator env.
 
 Scripted TT_HOME gets:
   - .gitconfig only (same settings)
@@ -316,19 +541,11 @@ log "── Real TT_HOME ($REAL_TT_HOME) ──"
 
 provision_gitconfig "$REAL_TT_HOME"
 
-# Copy pi config
-copy_and_audit \
-  "$REAL_HOME/.pi" \
-  "$REAL_TT_HOME/.pi" \
-  "$REAL_TT_HOME/provision-audit.json" \
-  "~/.pi"
-
-# Copy hermes config
-copy_and_audit \
-  "$REAL_HOME/.hermes" \
-  "$REAL_TT_HOME/.hermes" \
-  "$REAL_TT_HOME/provision-audit.json" \
-  "~/.hermes"
+# Surface ONLY the enumerated minimal pi/hermes auth/config files (US-004),
+# then materialize the operator's env-provided API keys.
+surface_pi_files "$REAL_TT_HOME"
+surface_hermes_files "$REAL_TT_HOME"
+surface_env_api_keys "$REAL_TT_HOME"
 
 # Remove .ssh if present (belt-and-suspenders)
 remove_ssh_dir "$REAL_TT_HOME"

@@ -1,0 +1,65 @@
+# TT Shim Probe — a purpose-built ONE-STEP custom workflow for W1.L2 /
+# W1.REPLAY in spec 05-wave-1-language-smoke.md.
+#
+# Its single step's input template renders the raw {{test_cmd}} verbatim via
+# the `TEST_CMD: {{test_cmd}}` line. The step input is seeded RAW (never
+# pre-wrapped) so the scheduler's wrapTestCmdInContext adds EXACTLY one
+# wrapper to the raw command — no double-wrapping. The prober agent must run
+# the test suite using that command verbatim and report the command + outcome.
+#
+# W2.24-docs-drift references the 'local' scripted harness (not a tamandua
+# workflow), so no 'local' spec lives here.
+id: tt-shim-probe
+name: TT Shim Probe
+version: 1
+description: |
+  One-step probe workflow that renders the raw TEST_CMD verbatim and verifies
+  the TSTX test-command shim wraps the command exactly once. Purpose-built for
+  the W1.L2 / W1.REPLAY language-smoke cases.
+
+agents:
+  - id: prober
+    name: Prober
+    role: coding
+    description: Runs the test suite using TEST_CMD verbatim and reports the command and outcome.
+    workspace:
+      baseDir: agents/prober
+      skills:
+        - tamandua-agents
+      files:
+        AGENTS.md: agents/prober/AGENTS.md
+        SOUL.md: agents/prober/SOUL.md
+        IDENTITY.md: agents/prober/IDENTITY.md
+
+steps:
+  - id: execute
+    agent: prober
+    input: |
+      Run the test suite using TEST_CMD verbatim; report the command and outcome.
+
+      TASK:
+      {{task}}
+
+      TEST_CMD: {{test_cmd}}
+
+      TEST_CMD is the exact test command to use. Copy it verbatim — do NOT
+      substitute `npm test` or any other command you infer from the project.
+      TEST_CMD may be wrapped in a caching shim (`tamandua-test ...`); this is
+      intentional. If the output starts with `TAMANDUA-TEST CACHED`, the suite
+      already passed for this exact tree — treat that as a passing test run.
+      Only add flags through the wrapper's `--force` option when you suspect a
+      flaky or environment-dependent result.
+
+      Instructions:
+      1. Read TEST_CMD above — it is the RAW, unwrapped command.
+      2. Run the test suite using EXACTLY TEST_CMD (verbatim, do not substitute
+         your own command).
+      3. Report the exact command you ran and its outcome.
+
+      Reply with:
+      STATUS: done
+      TEST_CMD_RAN: <the exact command you executed>
+      TEST_CMD_OUTCOME: <PASS | FAIL>
+      CHANGES: <what happened>
+    expects: "STATUS: done"
+    max_retries: 3

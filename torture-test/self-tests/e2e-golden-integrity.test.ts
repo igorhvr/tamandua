@@ -39,7 +39,7 @@ const validateAllPath = path.join(repoRoot, "torture-test", "probes", "validate-
 // drive full scripted-daemon / real-flag campaigns that legitimately exceed 60+
 // minutes of ACTIVE progress on a contended machine (see run.sh for the full
 // ordering rationale). run.sh must complete in a bounded window regardless of
-// machine load and can never orphan a campaign on timeout, so these seven are
+// machine load and can never orphan a campaign on timeout, so these eight are
 // excluded there and executed INDIVIDUALLY (each as its own `node --test`
 // process under its own ceiling, no aggregate deadline) by
 // bin/verify-heavy-campaign-tests.test.sh — the exact
@@ -51,6 +51,7 @@ const HEAVY_CAMPAIGN_TESTS = [
   "scripted-scenario-harness.test.ts",
   "tier0-repeatability.test.ts",
   "tier1-case-filter.test.ts",
+  "tier1-e26-real-launch-proof.test.ts",
   "tier1-include-real-proof.test.ts",
   "tier1-real-case-proof.test.ts",
   "tier1-repeatability.test.ts",
@@ -90,9 +91,10 @@ describe("US-006: golden dir integrity + validate-all verification", () => {
 
   // ── AC 1: run.sh passes twice consecutively ───────────────────────────
   it("AC1: run.sh passes twice consecutively", function () {
-    // run.sh is the BOUNDED battery: the seven unbounded campaign tests
+    // run.sh is the BOUNDED battery: the eight unbounded campaign tests
     // (tier0-repeatability, tier1-repeatability, tier1-real-case-proof,
-    // tier1-include-real-proof, tier1-zero-real-launch-infra, tier1-case-filter,
+    // tier1-e26-real-launch-proof, tier1-include-real-proof,
+    // tier1-zero-real-launch-infra, tier1-case-filter,
     // scripted-scenario-harness) are excluded from run.sh and run individually by
     // bin/verify-heavy-campaign-tests.test.sh, so a single bounded run.sh
     // completes well within the per-run ceiling and cannot orphan a campaign on

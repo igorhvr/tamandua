@@ -215,7 +215,19 @@ describe("Zero-token dry-run/argv-recording hook for the real-launch path (US-00
     // Capture the stub log BEFORE cleanup (the finally removes the stub dir).
     let markerContent = "";
     try {
-      res = runTt(controller, ["--manifest", rel], { PATH: `${stubBin}:${process.env.PATH ?? ""}` });
+      // TT_CONTROLLER_PREFLIGHT_DISABLED=1 is the controller's documented
+      // escape hatch for unit-style regression tests that simulate real
+      // launches with a stub `tamandua` (used identically by
+      // tt-controller.test.sh / tt-controller-infra-classify.test.sh). The
+      // preflight (home-provision → catalog → daemon-up) would otherwise
+      // resolve `tamandua` to THIS stub and abort at tt-daemon-down — it is
+      // exercised separately by tt-controller-preflight.test.sh and
+      // tt-controller-idempotence.test.sh. The real-launch path under test
+      // (spawn tamandua per case) is unchanged by the hatch.
+      res = runTt(controller, ["--manifest", rel], {
+        PATH: `${stubBin}:${process.env.PATH ?? ""}`,
+        TT_CONTROLLER_PREFLIGHT_DISABLED: "1",
+      });
       const m = CAMPAIGN_LINE.exec(res.stdout);
       campaignId = m === null ? null : m[1];
       if (fs.existsSync(marker)) markerContent = fs.readFileSync(marker, "utf8");

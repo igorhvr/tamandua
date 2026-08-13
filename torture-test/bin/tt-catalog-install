@@ -44,6 +44,15 @@ TT_ENV_REAL="$TT_DIR/env/tt-env.sh"
 TAMANDUA_CLI="$TT_REPO_ROOT/dist/cli/cli.js"
 # Source of the bundled catalog: the repo's own workflows dir (override for tests).
 SOURCE_WORKFLOWS="${TT_WORKFLOWS_SRC:-$TT_REPO_ROOT/workflows}"
+# Source of the TT-custom workflow specs (the suite's own custom workflows under
+# torture-test/workflows/, NOT the bundled repo catalog) — override for tests.
+CUSTOM_WORKFLOWS_SRC="${TT_CUSTOM_WORKFLOWS_SRC:-$TT_DIR/workflows}"
+# The US-002 manifest-driven enumeration seam: tells us WHICH TT-custom
+# workflow specs a real case actually requires.
+REQUIRED_WORKFLOWS_HELPER="$TT_DIR/bin/tt-required-workflows"
+# Custom catalog stamp (kept SEPARATE from the bundled .catalog-version.json so
+# the two sets stay independently idempotent and zero-churn).
+CUSTOM_STAMP_FILENAME=".tt-custom-catalog.json"
 
 # ── helpers ───────────────────────────────────────────────────────────
 
@@ -88,6 +97,11 @@ read_build_version() {
 # the tamandua install records in the catalog stamp (resolveSourcePath()).
 repo_root_real() {
   (cd "$TT_REPO_ROOT" && pwd -P) 2>/dev/null || printf '%s' "$TT_REPO_ROOT"
+}
+
+# dir_real: realpath of an arbitrary directory (fall back to the raw path).
+dir_real() {
+  (cd "$1" && pwd -P) 2>/dev/null || printf '%s' "$1"
 }
 
 # read_stamp_version / read_stamp_source: parse fields from an installed stamp
@@ -201,11 +215,172 @@ run_install() {
   fi
 }
 
+# enumerate_required_custom_workflows: invoke the US-002 seam to obtain the
+# distinct TT-custom workflow names a real case requires. Propagates the
+# helper's own fail-closed reasons verbatim on failure (never masks them).
+enumerate_required_custom_workflows() {
+  if [ ! -x "$REQUIRED_WORKFLOWS_HELPER" ]; then
+    echo "REASON: catalog-missing" >&2
+    echo "DETAILS: required-workflow enumeration helper missing/not executable: $REQUIRED_WORKFLOWS_HELPER" >&2
+    exit 1
+  fi
+  local err out rc
+  err="$(mktemp "${TMPDIR:-/tmp}/tt-catalog-required.XXXXXX")"
+  set +e
+  out="$("$REQUIRED_WORKFLOWS_HELPER" 2>"$err")"
+  rc=$?
+  set -e
+  if [ "$rc" -ne 0 ]; then
+    cat "$err" >&2
+    rm -f -- "$err"
+    exit 1
+  fi
+  rm -f -- "$err"
+  printf '%s' "$out"
+}
+
+# run_custom_install: install ONE TT-custom workflow from the custom source dir
+# into the contained home using the repo's own dist build (same contained spawn
+# env as the bundled install).
+run_custom_install() {
+  local name="$1"
+  if [ -f "$TT_ENV_REAL" ]; then
+    env -i $(env -i bash "$TT_ENV_REAL" print) \
+      HOME="$home" \
+      TAMANDUA_STATE_DIR="$home/.tamandua" \
+      TAMANDUA_WORKFLOWS_SRC="$CUSTOM_WORKFLOWS_SRC" \
+      PATH="${PATH}" \
+      node "$TAMANDUA_CLI" workflow install "$name"
+  else
+    env -i \
+      HOME="$home" \
+      TAMANDUA_STATE_DIR="$home/.tamandua" \
+      TAMANDUA_WORKFLOWS_SRC="$CUSTOM_WORKFLOWS_SRC" \
+      PATH="${PATH}" \
+      node "$TAMANDUA_CLI" workflow install "$name"
+  fi
+}
+
+# write_custom_stamp: record the custom catalog stamp (build version + custom
+# source realpath + install timestamp), mirroring the bundled stamp shape.
+write_custom_stamp() {
+  local stamp="$1"
+  local ts
+  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)"
+  mkdir -p "$inst"
+  printf '{\n  "version": "%s",\n  "sourcePath": "%s",\n  "installedAt": "%s"\n}\n' \
+    "$build_version" "$(dir_real "$CUSTOM_WORKFLOWS_SRC")" "$ts" > "$stamp"
+}
+
+# install_custom_workflows: install/verify every TT-custom workflow the tier
+# manifests require, stamp-aware and fail-closed per-name (catalog-missing:
+# <name>). Idempotent for same build + same custom source + complete set.
+install_custom_workflows() {
+  local required_list
+  required_list="$(enumerate_required_custom_workflows)"
+
+  local names=()
+  local name
+  if [ -n "$required_list" ]; then
+    while IFS= read -r name; do
+      if [ -n "$name" ]; then names+=("$name"); fi
+    done <<< "$required_list"
+  fi
+
+  if [ "${#names[@]}" -eq 0 ]; then
+    log "No TT-custom workflows required by the manifests — nothing to install."
+    return 0
+  fi
+
+  log "Required TT-custom workflows (${#names[@]}): ${names[*]}"
+
+  # Fail CLOSED per-name when a manifest-referenced custom workflow has no spec
+  # in the custom source dir (distinct machine-parseable reason).
+  local missing_src=""
+  for name in "${names[@]}"; do
+    if [ ! -f "$CUSTOM_WORKFLOWS_SRC/$name/workflow.yml" ]; then
+      missing_src="${missing_src}${name};"
+    fi
+  done
+  if [ -n "$missing_src" ]; then
+    for name in "${names[@]}"; do
+      if [ ! -f "$CUSTOM_WORKFLOWS_SRC/$name/workflow.yml" ]; then
+        echo "REASON: catalog-missing: $name" >&2
+        echo "DETAILS: manifest-referenced TT-custom workflow has no spec at $CUSTOM_WORKFLOWS_SRC/$name/workflow.yml" >&2
+        exit 1
+      fi
+    done
+  fi
+
+  local custom_stamp="$inst/$CUSTOM_STAMP_FILENAME"
+  local custom_version custom_source missing_inst custom_src_real
+  custom_version="$(read_stamp_field "$custom_stamp" "version")"
+  custom_source="$(read_stamp_field "$custom_stamp" "sourcePath")"
+  custom_src_real="$(dir_real "$CUSTOM_WORKFLOWS_SRC")"
+  missing_inst=""
+  for name in "${names[@]}"; do
+    if [ ! -f "$inst/$name/workflow.yml" ]; then
+      missing_inst="${missing_inst}${name};"
+    fi
+  done
+
+  # Idempotence: skip when the custom stamp matches this build/source AND every
+  # required custom workflow is already present (zero churn).
+  if [ "$FORCE" -ne 1 ] && [ "$custom_version" = "$build_version" ] && [ "$custom_source" = "$custom_src_real" ] && [ -z "$missing_inst" ]; then
+    log "IDEMPOTENT: TT-custom workflows current ($build_version) and complete — skipping install (zero churn)."
+    return 0
+  fi
+
+  if [ -z "$custom_version" ]; then
+    log "TT-custom catalog stamp absent — installing custom workflows."
+  elif [ "$custom_version" != "$build_version" ]; then
+    log "TT-custom catalog stamp stale ($custom_version != $build_version) — reinstalling (not a failure)."
+  elif [ "$custom_source" != "$custom_src_real" ]; then
+    log "TT-custom source mismatch — reinstalling."
+  elif [ -n "$missing_inst" ]; then
+    log "TT-custom workflows incomplete (missing: $missing_inst) — reinstalling."
+  else
+    log "TT-custom workflows require reinstall."
+  fi
+
+  ensure_contained_pi_config "$home"
+
+  local rc
+  for name in "${names[@]}"; do
+    log "Installing TT-custom workflow: $name"
+    set +e
+    run_custom_install "$name"
+    rc=$?
+    set -e
+    if [ "$rc" -ne 0 ] && [ ! -f "$inst/$name/workflow.yml" ]; then
+      echo "REASON: catalog-missing: $name" >&2
+      echo "DETAILS: failed to install TT-custom workflow $name into $inst (install rc=$rc)" >&2
+      exit 1
+    fi
+    if [ "$rc" -ne 0 ]; then
+      log "WARNING: TT-custom workflow $name install exited rc=$rc but the spec is present — treating as installed."
+    fi
+  done
+
+  # Final verification: every required custom workflow must be present.
+  for name in "${names[@]}"; do
+    if [ ! -f "$inst/$name/workflow.yml" ]; then
+      echo "REASON: catalog-missing: $name" >&2
+      echo "DETAILS: TT-custom workflow $name not present in $inst after install" >&2
+      exit 1
+    fi
+  done
+
+  write_custom_stamp "$custom_stamp"
+  log "OK: TT-custom workflows installed/verified in contained TT home ($inst)."
+}
+
 # ── usage ─────────────────────────────────────────────────────────────
 
 usage() {
   cat <<'EOF'
-tt-catalog-install — stamp-aware bundled workflow catalog install (E2.5 US-002).
+tt-catalog-install — stamp-aware bundled + TT-custom workflow catalog install
+(E2.5 US-002 + E2.6 US-003).
 
 Usage: tt-catalog-install [--force] [--help]
 
@@ -213,6 +388,12 @@ Installs the repo's OWN bundled workflow catalog into the CONTAINED TT home
 (torture-test/var/home/.tamandua/workflows) by running the repo's own dist
 build of `tamandua workflow install --all` under the contained spawn env
 (env/tt-env.sh — never the operator's ~/.tamandua or the 33xx daemon).
+
+It ALSO installs every TT-custom workflow spec (torture-test/workflows/*)
+that the tier manifests reference through a real (pi/hermes) case, as
+enumerated by tt-required-workflows. Those are stamped separately
+(.tt-custom-catalog.json) and installed per-name via the repo's own dist
+build (`tamandua workflow install <name>`).
 
 Stamp semantics:
   - Records a catalog stamp (.catalog-version.json) with build version, source
@@ -222,6 +403,9 @@ Stamp semantics:
     failure).
   - Only a catalog that still cannot be installed/verified fails closed with
     the DISTINCT reason 'catalog-missing' on stderr and a non-zero exit.
+  - A manifest-referenced TT-custom workflow whose spec is missing from
+    torture-test/workflows/ fails closed per-name with the DISTINCT reason
+    'catalog-missing: <name>' on stderr and a non-zero exit.
 
 Options:
   --force    Always reinstall, ignoring a matching stamp (used for tests / US-006).
@@ -270,49 +454,58 @@ if [ -z "$build_version" ] || [ "$build_version" = "unknown" ]; then
 fi
 
 # ── idempotence: skip when stamp matches current build/source & catalog complete ──
+bundled_skip=0
 if [ "$FORCE" -ne 1 ]; then
   existing_version="$(read_stamp_field "$stamp_path" "version")"
   existing_source="$(read_stamp_field "$stamp_path" "sourcePath")"
   verify_out="$(verify_catalog_present "$home" || true)"
   if [ "$existing_version" = "$build_version" ] && [ "$existing_source" = "$source_real" ] && [ -z "$verify_out" ]; then
-    log "IDEMPOTENT: catalog already current ($build_version) and complete — skipping install (zero churn)."
-    exit 0
-  fi
-  if [ -z "$existing_version" ]; then
-    log "Catalog stamp absent — reinstalling."
-  elif [ "$existing_version" != "$build_version" ]; then
-    log "Catalog stamp stale ($existing_version != $build_version) — reinstalling (not a failure)."
-  elif [ "$existing_source" != "$source_real" ]; then
-    log "Catalog source mismatch — reinstalling."
-  elif [ -n "$verify_out" ]; then
-    log "Catalog incomplete ($verify_out) — reinstalling."
+    log "IDEMPOTENT: bundled catalog already current ($build_version) and complete — skipping install (zero churn)."
+    bundled_skip=1
   else
-    log "Catalog requires reinstall."
+    if [ -z "$existing_version" ]; then
+      log "Catalog stamp absent — reinstalling."
+    elif [ "$existing_version" != "$build_version" ]; then
+      log "Catalog stamp stale ($existing_version != $build_version) — reinstalling (not a failure)."
+    elif [ "$existing_source" != "$source_real" ]; then
+      log "Catalog source mismatch — reinstalling."
+    elif [ -n "$verify_out" ]; then
+      log "Catalog incomplete ($verify_out) — reinstalling."
+    else
+      log "Catalog requires reinstall."
+    fi
   fi
 else
   log "FORCE: reinstalling regardless of stamp."
 fi
 
-# ── preflight: contained pi config must be readable for install to succeed ──
-ensure_contained_pi_config "$home"
+if [ "$bundled_skip" -ne 1 ]; then
+  # ── preflight: contained pi config must be readable for install to succeed ──
+  ensure_contained_pi_config "$home"
 
-# ── reinstall ──
-log "Running repo's own dist build: tamandua workflow install --all under contained env..."
-set +e
-run_install "$home"
-install_rc=$?
-set -e
-log "Install command exited rc=$install_rc."
+  # ── reinstall ──
+  log "Running repo's own dist build: tamandua workflow install --all under contained env..."
+  set +e
+  run_install "$home"
+  install_rc=$?
+  set -e
+  log "Install command exited rc=$install_rc."
 
-# ── verify — fail CLOSED with DISTINCT reason catalog-missing if not present ──
-verify_out="$(verify_catalog_present "$home" || true)"
-if [ -n "$verify_out" ]; then
-  echo "REASON: catalog-missing" >&2
-  echo "DETAILS: bundled workflow catalog could not be installed/verified in the contained TT home: $home" >&2
-  echo "VERIFY: ${verify_out}" >&2
-  log "FAIL: catalog missing/incomplete after install ($verify_out) rc=$install_rc" >&2
-  exit 1
+  # ── verify — fail CLOSED with DISTINCT reason catalog-missing if not present ──
+  verify_out="$(verify_catalog_present "$home" || true)"
+  if [ -n "$verify_out" ]; then
+    echo "REASON: catalog-missing" >&2
+    echo "DETAILS: bundled workflow catalog could not be installed/verified in the contained TT home: $home" >&2
+    echo "VERIFY: ${verify_out}" >&2
+    log "FAIL: catalog missing/incomplete after install ($verify_out) rc=$install_rc" >&2
+    exit 1
+  fi
+
+  log "OK: bundled catalog present and complete in contained TT home ($inst)."
 fi
 
-log "OK: catalog present and complete in contained TT home ($inst)."
+# ── TT-custom workflow specs (E2.6 US-003) ────────────────────────────
+install_custom_workflows
+
+log "OK: catalog install complete (bundled + TT-custom) in contained TT home ($inst)."
 exit 0

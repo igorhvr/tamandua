@@ -77,6 +77,7 @@ HEAVY_CAMPAIGN_TESTS=(
     'scripted-scenario-harness.test.ts'
     'tier0-repeatability.test.ts'
     'tier1-case-filter.test.ts'
+    'tier1-e26-real-launch-proof.test.ts'
     'tier1-include-real-proof.test.ts'
     'tier1-real-case-proof.test.ts'
     'tier1-repeatability.test.ts'

@@ -80,6 +80,24 @@ else
   fail "AC2 no .catalog-version.json stamp written"
 fi
 
+# ── AC6a (US-003): TT-custom workflow install ────────────────────────
+CUSTOM_STAMP="$TT_VAR/home/.tamandua/workflows/.tt-custom-catalog.json"
+if [ -f "$TT_VAR/home/.tamandua/workflows/tt-shim-probe/workflow.yml" ]; then
+  ok "AC6a tt-shim-probe workflow.yml installed into contained home"
+else
+  fail "AC6a tt-shim-probe workflow.yml missing after install"
+fi
+if [ -f "$CUSTOM_STAMP" ]; then
+  CUSTOM_VER="$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\(.*\)",\?$/\1/p' "$CUSTOM_STAMP" | head -n1)"
+  if [ "$CUSTOM_VER" = "$CUR_BUILD" ]; then
+    ok "AC6a custom catalog stamp records current build"
+  else
+    fail "AC6a custom catalog stamp version mismatch: $CUSTOM_VER != $CUR_BUILD"
+  fi
+else
+  fail "AC6a no .tt-custom-catalog.json written"
+fi
+
 # ── AC5(part): the helper spawned a contained install — assert the operator's
 #    real ~/.tamandua catalog was NOT touched.
 OP_AFTER="$(operator_snapshot)"
@@ -92,6 +110,8 @@ fi
 # ── AC3: same-build second run is a no-op (zero churn) ─────────────────
 STAMP1="$(sed -n 's/^[[:space:]]*"installedAt"[[:space:]]*:[[:space:]]*"\(.*\)",\?$/\1/p' "$STAMP" | head -n1)"
 WF_TIMESTAMP_BEFORE="$(find "$TT_VAR/home/.tamandua/workflows" -type f -exec stat -c '%Y' {} \; | sort | md5sum | awk '{print $1}')"
+CUSTOM_STAMP1="$(sed -n 's/^[[:space:]]*"installedAt"[[:space:]]*:[[:space:]]*"\(.*\)",\?$/\1/p' "$CUSTOM_STAMP" | head -n1)"
+CUSTOM_TS_BEFORE="$(find "$TT_VAR/home/.tamandua/workflows/tt-shim-probe" -type f -exec stat -c '%Y' {} \; | sort | md5sum | awk '{print $1}')"
 IDEM_OUT="$("$HELPER" 2>&1)"; rc=$?
 if [ "$rc" -eq 0 ]; then ok "AC3 same-build second run exits 0"; else fail "AC3 second run rc=$rc"; fi
 if echo "$IDEM_OUT" | grep -q "IDEMPOTENT"; then
@@ -101,10 +121,17 @@ else
 fi
 STAMP2="$(sed -n 's/^[[:space:]]*"installedAt"[[:space:]]*:[[:space:]]*"\(.*\)",\?$/\1/p' "$STAMP" | head -n1)"
 WF_TIMESTAMP_AFTER="$(find "$TT_VAR/home/.tamandua/workflows" -type f -exec stat -c '%Y' {} \; | sort | md5sum | awk '{print $1}')"
+CUSTOM_STAMP2="$(sed -n 's/^[[:space:]]*"installedAt"[[:space:]]*:[[:space:]]*"\(.*\)",\?$/\1/p' "$CUSTOM_STAMP" | head -n1)"
+CUSTOM_TS_AFTER="$(find "$TT_VAR/home/.tamandua/workflows/tt-shim-probe" -type f -exec stat -c '%Y' {} \; | sort | md5sum | awk '{print $1}')"
 if [ "$STAMP1" = "$STAMP2" ] && [ "$WF_TIMESTAMP_BEFORE" = "$WF_TIMESTAMP_AFTER" ]; then
   ok "AC3 zero churn (stamp + workflow file mtimes unchanged)"
 else
   fail "AC3 churn detected (reinstall occurred on same build)"
+fi
+if [ "$CUSTOM_STAMP1" = "$CUSTOM_STAMP2" ] && [ "$CUSTOM_TS_BEFORE" = "$CUSTOM_TS_AFTER" ]; then
+  ok "AC6b custom workflow set zero churn (custom stamp + tt-shim-probe mtimes unchanged)"
+else
+  fail "AC6b custom workflow churn detected (reinstall occurred on same build)"
 fi
 
 # ── AC4a: absent catalog -> reinstall (not a failure) ──────────────────
@@ -135,6 +162,33 @@ if echo "$FAIL_OUT" | grep -q "REASON: catalog-missing"; then
   ok "AC4 failure emits distinct reason catalog-missing"
 else
   fail "AC4 missing REASON: catalog-missing in output"
+fi
+
+# ── AC6d (US-003): stale custom stamp -> reinstall (not a failure) ────
+sed -i 's/"version": "[^"]*"/"version": "20000101T000000Z_STALE"/' "$CUSTOM_STAMP"
+CUSTOM_STALE_OUT="$("$HELPER" 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ]; then ok "AC6d stale custom stamp -> reinstall, exit 0 (not a failure)"; else fail "AC6d stale custom stamp rc=$rc"; fi
+NEW_CUSTOM_VER="$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\(.*\)",\?$/\1/p' "$CUSTOM_STAMP" | head -n1)"
+if [ "$NEW_CUSTOM_VER" = "$CUR_BUILD" ]; then ok "AC6d custom stamp refreshed to current build"; else fail "AC6d custom stamp not refreshed: $NEW_CUSTOM_VER"; fi
+
+# ── AC6c (US-003): per-name fail-closed catalog-missing:<name> ─────────
+FAIL_CASES="$TMP/fail-cases"
+mkdir -p "$FAIL_CASES"
+cp "$TT_DIR/cases/tier0.jsonl" "$TT_DIR/cases/tier1.jsonl" "$TT_DIR/cases/cases.jsonl" "$TT_DIR/cases/smoke.jsonl" "$FAIL_CASES/"
+printf '%s\n' '{"id":"ac6c","workflow":"tt-nonexistent","harness":"pi"}' >> "$FAIL_CASES/tier1.jsonl"
+FAILCLOSED_HOME="$TMP/failclosed-var"
+mkdir -p "$FAILCLOSED_HOME"
+FAILCLOSED_OUT="$(TT_VAR="$FAILCLOSED_HOME" TT_CASES_DIR="$FAIL_CASES" "$HELPER" 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ]; then
+  ok "AC6c per-name fail-closed exits non-zero (rc=$rc)"
+else
+  fail "AC6c per-name fail-closed should exit non-zero"
+fi
+if echo "$FAILCLOSED_OUT" | grep -q "REASON: catalog-missing: tt-nonexistent"; then
+  ok "AC6c emits REASON: catalog-missing: tt-nonexistent"
+else
+  fail "AC6c missing REASON: catalog-missing: tt-nonexistent"
+  echo "$FAILCLOSED_OUT" | tail -5
 fi
 
 # ── AC5: helper never started/bound a daemon — assert no new listener is

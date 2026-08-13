@@ -3858,6 +3858,9 @@ const PREFLIGHT_CATALOG_PATH = process.env.TT_CONTROLLER_PREFLIGHT_CATALOG === u
 const PREFLIGHT_DAEMON_PATH = process.env.TT_CONTROLLER_PREFLIGHT_DAEMON === undefined
   ? path.join(BIN_DIR, 'tt-daemon-up')
   : path.resolve(process.env.TT_CONTROLLER_PREFLIGHT_DAEMON);
+const PREFLIGHT_AUTH_PATH = process.env.TT_CONTROLLER_PREFLIGHT_AUTH === undefined
+  ? path.join(BIN_DIR, 'tt-harness-auth-probe')
+  : path.resolve(process.env.TT_CONTROLLER_PREFLIGHT_AUTH);
 
 // Preflight engages ONLY for a real arm: the selection includes a real
 // (non-scripted) case, is not scripted-only, and is not a zero-token dry-run.
@@ -3881,6 +3884,11 @@ function readPreflightReason(stderr) {
 }
 
 function spawnPreflightLeg(script, args, env) {
+  // Every spawn site must pass through the containment choke-point (FIX10
+  // US-003 grep-proof). loadSpawnEnvironment already asserts the merged HOME,
+  // but the preflight leg re-asserts at its own spawn so a future env-source
+  // change cannot bypass containment.
+  assertContainedSpawnEnv(env);
   const result = spawnSync('bash', [script, ...args], {
     cwd: TT_ROOT,
     env,
@@ -3901,11 +3909,29 @@ function persistPreflightState(campaignDir, state, preflight) {
   atomicWriteState(campaignDir, state);
 }
 
-// Runs the three preflight legs in order under the CONTAINED real spawn env.
+// Distinct real-case harnesses required by the CURRENT (filtered) selection.
+// Only pi/hermes are probed — scripted and local cases require no harness auth
+// (US-006). The controller resolves this from the filtered manifest (not the
+// probe's own full-tier enumeration) so a --case focused pi-only selection
+// probes pi and never hermes.
+function requiredHarnessesFor(manifest) {
+  const harnesses = new Set();
+  for (const caseRecord of manifest.cases) {
+    if (caseUsesScriptedEnvironment(caseRecord)) continue;
+    if (caseRecord.harness === 'pi' || caseRecord.harness === 'hermes') {
+      harnesses.add(caseRecord.harness);
+    }
+  }
+  return Array.from(harnesses).sort();
+}
+
+// Runs the preflight legs in order under the CONTAINED real spawn env.
 // On any leg failure it FAILS CLOSED: persists the DISTINCT reason and throws
 // so the campaign aborts non-zero (US-004 AC2). Never touches the operator's
-// ~/.tamandua or 33xx daemon.
-function runRealPreflight(campaignDir, state) {
+// ~/.tamandua or 33xx daemon. The harness-auth leg (US-006) runs only when the
+// current selection requires a real pi/hermes harness, and is ordered after
+// home-provision (which surfaces credentials) and before catalog/daemon-up.
+function runRealPreflight(campaignDir, state, manifest) {
   let env;
   try {
     env = loadSpawnEnvironment(false);
@@ -3922,9 +3948,15 @@ function runRealPreflight(campaignDir, state) {
   }
   const legs = [
     { label: 'home-provision', script: PREFLIGHT_PROVISION_PATH, args: ['--fail-closed'], reason: 'tt-home-unprovisioned' },
+  ];
+  const requiredHarnesses = requiredHarnessesFor(manifest);
+  if (requiredHarnesses.length > 0) {
+    legs.push({ label: 'harness-auth', script: PREFLIGHT_AUTH_PATH, args: requiredHarnesses, reason: 'harness-auth-missing' });
+  }
+  legs.push(
     { label: 'catalog-install', script: PREFLIGHT_CATALOG_PATH, args: [], reason: 'catalog-missing' },
     { label: 'daemon-up', script: PREFLIGHT_DAEMON_PATH, args: ['ensure-up'], reason: 'tt-daemon-down' },
-  ];
+  );
   const outcomes = [];
   for (const leg of legs) {
     const result = spawnPreflightLeg(leg.script, leg.args, env);
@@ -4011,7 +4043,7 @@ async function startCampaign(options, schema) {
     // finally/teardown path (both on success and on any preflight/exec error).
     if (realPreflightRequired(manifest, state)) {
       teardownState = state;
-      runRealPreflight(campaignDir, state);
+      runRealPreflight(campaignDir, state, manifest);
     }
     await executeEligibleCases(manifest, state, campaignDir);
     const exitCode = writeTerminalCampaignReports(campaignDir, state);
@@ -4073,7 +4105,7 @@ async function resumeCampaign(options, schema) {
     // further real-case execution, and stop the daemon in teardown for hygiene.
     if (realPreflightRequired(manifest, state)) {
       teardownState = state;
-      runRealPreflight(campaignDir, state);
+      runRealPreflight(campaignDir, state, manifest);
     }
     await executeEligibleCases(manifest, state, campaignDir);
     const exitCode = writeTerminalCampaignReports(campaignDir, state);

@@ -29,26 +29,35 @@ echo "=== tt-provision-home --fail-closed self-test ==="
 # ── Setup: mock operator HOME and isolated TT_VAR ─────────────────────
 MOCK_HOME="$(mktemp -d)"
 TEST_VAR="$(mktemp -d)"
-ORIG_OPERATOR_GITCONFIG="$(git config --global --list 2>/dev/null || true)"
 
 cleanup() {
   rm -rf "$MOCK_HOME" "$TEST_VAR"
 }
 trap cleanup EXIT
 
-# Mock operator harness config so the copy legs can be exercised.
-mkdir -p "$MOCK_HOME/.pi"
-cat > "$MOCK_HOME/.pi/settings.json" <<JSON
-{"agentDir": "${MOCK_HOME}/.pi/agent"}
+# Mock operator harness config so the minimal-file copy legs can be exercised
+# (E2.6 US-004: enumerated files only — no whole-dir copy).
+mkdir -p "$MOCK_HOME/.pi/agent"
+cat > "$MOCK_HOME/.pi/agent/settings.json" <<JSON
+{"defaultProvider":"deepseek","agentDir":"${MOCK_HOME}/.pi/agent"}
 JSON
+cat > "$MOCK_HOME/.pi/agent/models.json" <<JSON
+{"providers":{}}
+JSON
+echo '{}' > "$MOCK_HOME/.pi/agent/auth.json"
 mkdir -p "$MOCK_HOME/.hermes"
-cat > "$MOCK_HOME/.hermes/config.json" <<JSON
-{"home": "${MOCK_HOME}/.hermes"}
+cat > "$MOCK_HOME/.hermes/config.yaml" <<YAML
+model:
+  default: gpt-5.6-sol
+YAML
+cat > "$MOCK_HOME/.hermes/auth.json" <<JSON
+{"version":1}
 JSON
 
-# run against the isolated env
+# run against the isolated env (TT_OPERATOR_HOME pins the copy source; the
+# contained spawn env would otherwise override HOME, which is the E2.6 bug).
 run_fc() {
-  HOME="$MOCK_HOME" TT_VAR="$TEST_VAR" "$TOOL" --fail-closed "$@"
+  HOME="$MOCK_HOME" TT_OPERATOR_HOME="$MOCK_HOME" TT_VAR="$TEST_VAR" "$TOOL" --fail-closed "$@"
 }
 
 REAL_TT_HOME="$TEST_VAR/home"
@@ -91,11 +100,21 @@ else
   fail "contained .gitconfig user.name = '$name'"
 fi
 
-if [ -d "$REAL_TT_HOME/.pi" ] && [ -d "$REAL_TT_HOME/.hermes" ]; then
-  pass "~/.pi and ~/.hermes copied into contained home"
+if [ -d "$REAL_TT_HOME/.pi/agent" ] && [ -d "$REAL_TT_HOME/.hermes" ]; then
+  pass "~/.pi/agent and ~/.hermes created into contained home"
 else
-  fail "harness config copies missing from contained home"
+  fail "harness config directories missing from contained home"
 fi
+
+# Enumerated minimal files must be present (US-004 AC1).
+for f in ".pi/agent/settings.json" ".pi/agent/models.json" ".pi/agent/auth.json" \
+         ".hermes/config.yaml" ".hermes/auth.json"; do
+  if [ -f "$REAL_TT_HOME/$f" ]; then
+    pass "contained $f surfaced"
+  else
+    fail "contained $f NOT surfaced"
+  fi
+done
 
 # Operator-real files must be untouched (only read). We assert the mock HOME
 # did not gain a .gitconfig or .tamandua (the contained run must not write to
@@ -114,7 +133,7 @@ fi
 # ── AC2 containment: home resolves under torture-test/var when TT_VAR unset ─
 echo ""
 echo "--- AC2 (env resolution): unset TT_VAR resolves contained TT_HOME ---"
-if TT_VAR="" HOME="$MOCK_HOME" "$TOOL" --fail-closed \
+if TT_VAR="" HOME="$MOCK_HOME" TT_OPERATOR_HOME="$MOCK_HOME" "$TOOL" --fail-closed \
     | grep -q "contained TT home provisioned at "; then
   pass "--fail-closed with TT_VAR unset targets the contained env path"
 else
@@ -123,7 +142,7 @@ fi
 
 # The resolved home must live under torture-test/var (the contained location),
 # NOT under the operator's home.
-RESOLVED="$(TT_VAR="" HOME="$MOCK_HOME" "$TOOL" --fail-closed 2>/dev/null | grep 'contained TT home provisioned at' | sed 's/.*at //')"
+RESOLVED="$(TT_VAR="" HOME="$MOCK_HOME" TT_OPERATOR_HOME="$MOCK_HOME" "$TOOL" --fail-closed 2>/dev/null | grep 'contained TT home provisioned at' | sed 's/.*at //')"
 case "$RESOLVED" in
   */torture-test/var/home) pass "--fail-closed resolved the contained TT_HOME (torture-test/var/home)" ;;
   *) fail "--fail-closed resolved an unexpected home: '$RESOLVED'" ;;
@@ -134,7 +153,7 @@ echo ""
 echo "--- AC3: idempotency ---"
 
 GCFG_BEFORE="$(sha256sum "$REAL_TT_HOME/.gitconfig" | awk '{print $1}')"
-PI_BEFORE="$(sha256sum "$REAL_TT_HOME/.pi/settings.json" | awk '{print $1}')"
+PI_BEFORE="$(sha256sum "$REAL_TT_HOME/.pi/agent/settings.json" | awk '{print $1}')"
 
 if run_fc >/tmp/tt-fc-2.log 2>&1; then
   pass "second --fail-closed run exits 0"
@@ -143,7 +162,7 @@ else
 fi
 
 GCFG_AFTER="$(sha256sum "$REAL_TT_HOME/.gitconfig" | awk '{print $1}')"
-PI_AFTER="$(sha256sum "$REAL_TT_HOME/.pi/settings.json" | awk '{print $1}')"
+PI_AFTER="$(sha256sum "$REAL_TT_HOME/.pi/agent/settings.json" | awk '{print $1}')"
 
 if [ "$GCFG_BEFORE" = "$GCFG_AFTER" ]; then
   pass ".gitconfig unchanged after second run (idempotent, no churn)"
@@ -151,9 +170,9 @@ else
   fail ".gitconfig CHANGED on second run (churn)"
 fi
 if [ "$PI_BEFORE" = "$PI_AFTER" ]; then
-  pass ".pi/settings.json unchanged after second run (idempotent)"
+  pass ".pi/agent/settings.json unchanged after second run (idempotent)"
 else
-  fail ".pi/settings.json CHANGED on second run"
+  fail ".pi/agent/settings.json CHANGED on second run"
 fi
 
 # ── AC4: forcing a failure leg → REASON tt-home-unprovisioned, exit≠0 ─
@@ -199,7 +218,7 @@ touch "$TEST_VAR/blocked/home"
 chmod 400 "$TEST_VAR/blocked/home"
 
 set +e
-HOME="$MOCK_HOME" TT_VAR="$TEST_VAR/blocked" "$TOOL" --fail-closed \
+HOME="$MOCK_HOME" TT_OPERATOR_HOME="$MOCK_HOME" TT_VAR="$TEST_VAR/blocked" "$TOOL" --fail-closed \
   >/tmp/tt-fc-4.log 2>/tmp/tt-fc-4.err
 FC4_STATUS=$?
 set -e

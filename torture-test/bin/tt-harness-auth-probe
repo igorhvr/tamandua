@@ -1,0 +1,364 @@
+#!/usr/bin/env bash
+# tt-harness-auth-probe — cheap preflight harness-auth probe (E2.6 US-005).
+#
+# For each requested harness (pi, hermes) — or, when none is named, each
+# real-case harness enumerated from the tier manifests — verify that the
+# CONTAINED TT home's surfaced harness auth can actually resolve a model +
+# API key and answer, WITHOUT starting the real contained daemon and WITHOUT
+# a full model generation (a single trivial one-shot answer, near-zero
+# tokens).
+#
+# This is the fail-closed seam that surfaces the operator's harness auth
+# (US-004 surfacing) as a GREEN/RED preflight verdict BEFORE any real case
+# launches. The E2.6 `No API key found for the selected model` failure was a
+# 300ms pi-round death caused by the contained daemon (started under env -i)
+# inheriting no operator auth; this probe catches exactly that class of
+# defect at preflight instead of mid-campaign.
+#
+# Two legs per harness (both must pass):
+#   1. PRESENCE  — the enumerated minimal surfaced files exist in the
+#                  contained TT home (pi: settings/models/auth.json under
+#                  .pi/agent/; hermes: config.yaml + auth.json under
+#                  .hermes/). A missing file means surfacing never happened.
+#   2. ANSWER    — invoke the harness binary under the contained spawn env
+#                  with a trivial one-shot prompt. A non-zero exit (e.g. pi's
+#                  `No API key found for the selected model`, hermes's
+#                  missing-credential failure) fails closed. This is the
+#                  zero/near-zero-token "can actually answer" check: the
+#                  failure path never reaches the model (zero tokens); the
+#                  success path is a single tiny completion.
+#
+# Fail-closed (non-zero exit + DISTINCT machine-parseable REASON on stderr):
+#   harness-auth-missing: pi       pi auth/config absent OR cannot answer
+#   harness-auth-missing: hermes   hermes auth/config absent OR cannot answer
+#   manifest-unreadable: <name>    a required manifest cannot be read
+#   manifest-invalid: <name>: line <n>  a manifest line is not valid JSON
+#
+# Env/test seams (never mutate operator state):
+#   TT_VAR                  override torture-test/var root (default TT_DIR/var)
+#   TT_CASES_DIR            override the cases dir for --from-manifest
+#                           harness enumeration
+#   TAMANDUA_PI_BINARY      override the pi binary (mirrors the real harness
+#                           resolver precedence)
+#   TAMANDUA_HERMES_BINARY  override the hermes binary
+#
+# Idempotent: the probe only READS the contained home and invokes the harness
+# one-shot; it never writes state and never starts a daemon.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TT_DIR="$(dirname "$SCRIPT_DIR")"                        # torture-test/
+TT_REPO_ROOT="$(dirname "$TT_DIR")"                      # repo root
+# Allow override for testing
+TT_VAR="${TT_VAR:-$TT_DIR/var}"
+TT_ENV_REAL="$TT_DIR/env/tt-env.sh"
+CASES_DIR="${TT_CASES_DIR:-$TT_DIR/cases}"
+
+# ── helpers ───────────────────────────────────────────────────────────
+
+log() { printf '[tt-harness-auth-probe] %s\n' "$*"; }
+
+# resolve_contained_tt_home: prints the REAL contained TT_HOME (the home the
+# spawned pi/hermes processes actually use). Resolution priority:
+#   1. TT_VAR env override (test seam) → $TT_VAR/home
+#   2. env/tt-env.sh `print` output → TT_HOME
+#   3. ultimate fallback → $TT_DIR/var/home
+# It NEVER resolves to the operator's real ~/.tamandua.
+resolve_contained_tt_home() {
+  if [ -n "${TT_VAR:-}" ]; then
+    printf '%s' "$TT_VAR/home"
+    return 0
+  fi
+  if [ -f "$TT_ENV_REAL" ]; then
+    local home_line
+    home_line="$(env -i bash "$TT_ENV_REAL" print 2>/dev/null | grep '^TT_HOME=' | head -n1 || true)"
+    if [ -n "$home_line" ]; then
+      local home
+      home="${home_line#TT_HOME=}"
+      if [ -n "$home" ]; then
+        printf '%s' "$home"
+        return 0
+      fi
+    fi
+  fi
+  printf '%s' "$TT_VAR/home"
+}
+
+# resolve_harness_binary: print the absolute path of the harness binary for
+# <harness>, mirroring the real pi/hermes resolver precedence:
+#   pi:     TAMANDUA_PI_BINARY (executable) → PATH lookup `pi`
+#   hermes: TAMANDUA_HERMES_BINARY (executable) → PATH lookup `hermes`
+# Prints nothing (empty) when no usable binary is found — the caller fails
+# closed with harness-auth-missing.
+resolve_harness_binary() {
+  local harness="$1"
+  local env_bin resolved
+  if [ "$harness" = "pi" ]; then
+    env_bin="${TAMANDUA_PI_BINARY:-}"
+    resolved="$(command -v pi 2>/dev/null || true)"
+  else
+    env_bin="${TAMANDUA_HERMES_BINARY:-}"
+    resolved="$(command -v hermes 2>/dev/null || true)"
+  fi
+  if [ -n "$env_bin" ]; then
+    if [ -x "$env_bin" ]; then
+      printf '%s' "$env_bin"
+    fi
+    # Not executable → empty (fail closed), matching the real resolver's
+    # invalid_env_binary error path.
+    return 0
+  fi
+  printf '%s' "$resolved"
+}
+
+# present_files_for: the enumerated minimal surfaced files a harness requires
+# in the contained home (US-004). A missing file means surfacing never
+# happened (or was stripped) — a fail-closed presence leg.
+present_files_for() {
+  local harness="$1"
+  if [ "$harness" = "pi" ]; then
+    printf '.pi/agent/settings.json\n.pi/agent/models.json\n.pi/agent/auth.json\n'
+  else
+    printf '.hermes/config.yaml\n.hermes/auth.json\n'
+  fi
+}
+
+# run_answer_check: invoke the harness binary one-shot under the contained
+# spawn env. Returns the harness's exit code (captured by the caller).
+# The prompt is a single trivial completion — near-zero tokens on success,
+# zero tokens on the fail-fast auth-missing path.
+run_answer_check() {
+  local harness="$1" home="$2" bin="$3"
+  local prompt="Reply with the single word OK and nothing else."
+
+  if [ "$harness" = "pi" ]; then
+    _run_contained "$home" "$bin" \
+      --print --no-tools --no-session --no-context-files "$prompt"
+  else
+    _run_contained "$home" "$bin" -z "$prompt"
+  fi
+}
+
+# _run_contained: run a command under the contained real spawn env. Always
+# forces HOME / TAMANDUA_STATE_DIR / HERMES_HOME to the resolved contained home
+# (so a TT_VAR test-seam override cannot escape to the operator home). Never
+# starts a daemon — this invokes the harness binary directly.
+_run_contained() {
+  local home="$1" bin="$2"; shift 2
+  if [ -f "$TT_ENV_REAL" ]; then
+    env -i $(env -i bash "$TT_ENV_REAL" print) \
+      HOME="$home" \
+      TAMANDUA_STATE_DIR="$home/.tamandua" \
+      HERMES_HOME="$home/.hermes" \
+      PATH="${PATH}" \
+      "$bin" "$@"
+  else
+    env -i \
+      HOME="$home" \
+      TAMANDUA_STATE_DIR="$home/.tamandua" \
+      HERMES_HOME="$home/.hermes" \
+      PATH="${PATH}" \
+      "$bin" "$@"
+  fi
+}
+
+# probe_harness: run the presence + answer legs for ONE harness. Returns 0 on
+# success, 1 on fail-closed (after emitting the DISTINCT reason on stderr).
+probe_harness() {
+  local harness="$1" home="$2"
+  local bin
+  bin="$(resolve_harness_binary "$harness")"
+
+  # ── leg 1: presence (enumerated minimal surfaced files) ──
+  local missing="" f
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    if [ ! -f "$home/$f" ]; then
+      missing="${missing}${f};"
+    fi
+  done < <(present_files_for "$harness")
+
+  if [ -n "$missing" ]; then
+    echo "REASON: harness-auth-missing: $harness" >&2
+    echo "DETAILS: missing surfaced file(s): ${missing}" >&2
+    return 1
+  fi
+
+  # ── leg 2: harness binary availability ──
+  if [ -z "$bin" ] || [ ! -x "$bin" ]; then
+    echo "REASON: harness-auth-missing: $harness" >&2
+    echo "DETAILS: $harness binary not found (set TAMANDUA_$(printf '%s' "$harness" | tr '[:lower:]' '[:upper:]')_BINARY or add to PATH)" >&2
+    return 1
+  fi
+
+  # ── leg 3: answer check (can actually resolve a model + API key) ──
+  local err rc
+  err="$(mktemp "${TMPDIR:-/tmp}/tt-harness-auth.XXXXXX")"
+  set +e
+  run_answer_check "$harness" "$home" "$bin" >/dev/null 2>"$err"
+  rc=$?
+  set -e
+  if [ "$rc" -ne 0 ]; then
+    echo "REASON: harness-auth-missing: $harness" >&2
+    echo "DETAILS: $harness could not answer: $(tail -c 500 "$err" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g')" >&2
+    rm -f -- "$err"
+    return 1
+  fi
+  rm -f -- "$err"
+  return 0
+}
+
+# enumerate_required_harnesses: read the tier manifests and print the DISTINCT
+# real-case harnesses (pi/hermes), one per line, sorted. Mirrors US-002's
+# manifest reading (same fail-closed reasons). Empty set prints nothing.
+enumerate_required_harnesses() {
+  local dir="$1"
+  node - "$dir" <<'NODE'
+'use strict';
+const fs = require('fs');
+const path = require('path');
+const dir = process.argv[2];
+const MANIFEST_NAMES = ['tier0.jsonl', 'tier1.jsonl', 'cases.jsonl', 'smoke.jsonl'];
+function fail(reason, detail) {
+  process.stderr.write('REASON: ' + reason + '\n');
+  if (detail !== undefined) process.stderr.write('DETAILS: ' + detail + '\n');
+  process.exit(1);
+}
+const harnesses = new Set();
+for (const name of MANIFEST_NAMES) {
+  const file = path.join(dir, name);
+  let contents;
+  try {
+    contents = fs.readFileSync(file, 'utf8');
+  } catch {
+    fail('manifest-unreadable: ' + name, 'cannot read manifest: ' + file);
+  }
+  const lines = contents.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.trim() === '') continue;
+    let record;
+    try {
+      record = JSON.parse(line);
+    } catch {
+      fail('manifest-invalid: ' + name + ': line ' + (i + 1), name + ': line ' + (i + 1) + ' is not valid JSON');
+    }
+    if (record && (record.harness === 'pi' || record.harness === 'hermes')) {
+      harnesses.add(record.harness);
+    }
+  }
+}
+const out = Array.from(harnesses).sort();
+if (out.length > 0) process.stdout.write(out.join('\n') + '\n');
+NODE
+}
+
+# ── usage ────────────────────────────────────────────────────────────
+
+usage() {
+  cat <<EOF
+tt-harness-auth-probe — cheap preflight harness-auth probe (E2.6 US-005).
+
+Usage: tt-harness-auth-probe [--help] [--from-manifest] [pi|hermes ...]
+
+For each requested harness (pi and/or hermes), verify the contained TT home's
+surfaced harness auth can actually resolve a model + API key and answer, via:
+
+  1. PRESENCE — the enumerated minimal surfaced files exist in the contained
+     home (pi: .pi/agent/{settings.json,models.json,auth.json}; hermes:
+     .hermes/{config.yaml,auth.json}).
+  2. ANSWER   — a trivial one-shot harness invocation under the contained
+     spawn env (near-zero tokens on success; zero tokens on the fail-fast
+     auth-missing path). Never starts the real contained daemon.
+
+With no harness argument (or --from-manifest), the required harnesses are
+enumerated from the tier manifests (distinct real-case pi/hermes harnesses).
+
+Fail-closed reasons (non-zero exit, on stderr):
+  harness-auth-missing: pi       pi auth/config absent OR cannot answer
+  harness-auth-missing: hermes   hermes auth/config absent OR cannot answer
+  manifest-unreadable: <name>    a required manifest cannot be read
+  manifest-invalid: <name>: line <n>  a manifest line is not valid JSON
+
+Env seams:
+  TT_VAR                  override torture-test/var root (default TT_DIR/var)
+  TT_CASES_DIR            override the cases dir for --from-manifest
+  TAMANDUA_PI_BINARY      override the pi binary
+  TAMANDUA_HERMES_BINARY  override the hermes binary
+
+Idempotent and read-only: safe to run repeatedly; never writes state, never
+starts a daemon.
+EOF
+}
+
+# ── main ──────────────────────────────────────────────────────────────
+
+main() {
+  local from_manifest=0
+  local harnesses=()
+  local arg
+
+  for arg in "$@"; do
+    case "$arg" in
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      --from-manifest)
+        from_manifest=1
+        ;;
+      pi|hermes)
+        harnesses+=("$arg")
+        ;;
+      *)
+        echo "tt-harness-auth-probe: unknown argument: $arg" >&2
+        usage >&2
+        exit 2
+        ;;
+    esac
+  done
+
+  # Resolve the required harness set: explicit args win; otherwise enumerate
+  # from the tier manifests. A failed enumeration (manifest unreadable/invalid)
+  # propagates its DISTINCT REASON (already on stderr) and fails closed.
+  if [ "${#harnesses[@]}" -eq 0 ]; then
+    local enum_out enum_rc
+    set +e
+    enum_out="$(enumerate_required_harnesses "$CASES_DIR")"
+    enum_rc=$?
+    set -e
+    if [ "$enum_rc" -ne 0 ]; then
+      exit 1
+    fi
+    local line
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      harnesses+=("$line")
+    done <<< "$enum_out"
+  fi
+
+  if [ "${#harnesses[@]}" -eq 0 ]; then
+    # No real harnesses required (scripted-only / no real cases). Nothing to
+    # probe — success (a no-op, not a failure).
+    log "no real harnesses required — nothing to probe"
+    exit 0
+  fi
+
+  local home
+  home="$(resolve_contained_tt_home)"
+  local h fail=0
+  for h in "${harnesses[@]}"; do
+    if probe_harness "$h" "$home"; then
+      log "OK: $h can answer"
+    else
+      fail=1
+    fi
+  done
+
+  if [ "$fail" -ne 0 ]; then
+    exit 1
+  fi
+  exit 0
+}
+
+main "$@"

@@ -2,11 +2,13 @@
 # tt-controller-preflight.test.sh — E2.5 US-004 controller preflight wiring test.
 #
 # Verifies that tt-controller runs the real-case preflight chain
-# (home-provision -> catalog-install -> daemon-up) BEFORE any real case
-# executes when the selection includes a real case, fails the campaign CLOSED
-# with a DISTINCT reason when a leg cannot be established, stops the real
-# daemon at campaign end/resume for hygiene, and never engages the preflight
-# for scripted-only selections or TT_DRY_RUN_REAL_LAUNCH dry runs.
+# (home-provision -> [harness-auth] -> catalog-install -> daemon-up) BEFORE
+# any real case executes when the selection includes a real case, fails the
+# campaign CLOSED with a DISTINCT reason when a leg cannot be established,
+# stops the real daemon at campaign end/resume for hygiene, and never engages
+# the preflight for scripted-only selections or TT_DRY_RUN_REAL_LAUNCH dry
+# runs. The harness-auth leg (US-006) only runs when the current selection
+# requires a real pi/hermes harness.
 #
 # The preflight helper paths are injected via TT_CONTROLLER_PREFLIGHT_* so the
 # wiring is exercised with deterministic stub helpers (except the final
@@ -44,10 +46,22 @@ cat > "$MANIFEST" <<EOF
 {"id":"PF-SCRIPTED","wave":0,"workflow":"local","fixture":"none","harness":"local","task":"tasks/W3.07.md","context":{"execution_mode":"scripted"},"caps":{"tokens":0,"wall_min":5},"requires":{},"boundary_files":[],"forbidden":[],"oracles":[],"gates":[],"chaos":null,"shed_ok":false,"mandatory":true,"class":"verification","reset":{"executable":"node","args":["-e","1"],"cwd":"."},"command":{"executable":"node","args":["-e","require('node:fs').writeFileSync('$TEST_ROOT/command-ran2','ran')"],"cwd":"."}}
 EOF
 
+# A real pi case + a scripted local case. The real pi case forces the preflight
+# to engage AND forces the harness-auth leg (required harnesses = {pi}). The
+# pi case is never actually launched: TT_CONTROLLER_DAEMON_CONTROL_PATH points
+# at a missing path so executeEligibleCases marks it NOT_RUN
+# (daemon-control-unavailable) instead of spawning tamandua/pi. The scripted
+# case still completes green so the campaign reaches terminal reports.
+PI_MANIFEST="$TEST_ROOT/manifest-pi.jsonl"
+cat > "$PI_MANIFEST" <<EOF
+{"id":"PF-PI","wave":0,"workflow":"tt-shim-probe","fixture":"none","harness":"pi","task":"tasks/W3.07.md","context":{"execution_mode":"real"},"caps":{"tokens":0,"wall_min":5},"requires":{},"boundary_files":[],"forbidden":[],"oracles":[],"gates":[],"chaos":null,"shed_ok":false,"mandatory":true,"class":"verification"}
+{"id":"PF-PI-SCRIPTED","wave":0,"workflow":"local","fixture":"none","harness":"local","task":"tasks/W3.07.md","context":{"execution_mode":"scripted"},"caps":{"tokens":0,"wall_min":5},"requires":{},"boundary_files":[],"forbidden":[],"oracles":[],"gates":[],"chaos":null,"shed_ok":false,"mandatory":true,"class":"verification","reset":{"executable":"node","args":["-e","1"],"cwd":"."},"command":{"executable":"node","args":["-e","require('node:fs').writeFileSync('$TEST_ROOT/command-ran-pi-scripted','ran')"],"cwd":"."}}
+EOF
+
 # Stub preflight helpers: record invocation (name, args, HOME) to $PFLOG and,
 # when $PFMODE names a failure mode for this leg, fail closed with the DISTINCT
 # REASON. Non TT_* env names survive the controller's spawn-env strip.
-for helper in tt-provision-home tt-catalog-install tt-daemon-up; do
+for helper in tt-provision-home tt-harness-auth-probe tt-catalog-install tt-daemon-up; do
   cat > "$STUB_DIR/$helper" <<'STUB'
 #!/usr/bin/env bash
 set -u
@@ -59,6 +73,9 @@ mode=""
 case "$name" in
   tt-provision-home)
     [ "$mode" = "fail-provision" ] && { printf 'REASON: tt-home-unprovisioned\n' >&2; exit 1; }
+    ;;
+  tt-harness-auth-probe)
+    [ "$mode" = "fail-auth" ] && { printf 'REASON: harness-auth-missing: pi\n' >&2; exit 1; }
     ;;
   tt-catalog-install)
     [ "$mode" = "fail-catalog" ] && { printf 'REASON: catalog-missing\n' >&2; exit 1; }
@@ -77,11 +94,12 @@ done
 # controller from process.env before stripping, so it is honored.
 use_stubs() {
   export TT_CONTROLLER_PREFLIGHT_PROVISION="$STUB_DIR/tt-provision-home"
+  export TT_CONTROLLER_PREFLIGHT_AUTH="$STUB_DIR/tt-harness-auth-probe"
   export TT_CONTROLLER_PREFLIGHT_CATALOG="$STUB_DIR/tt-catalog-install"
   export TT_CONTROLLER_PREFLIGHT_DAEMON="$STUB_DIR/tt-daemon-up"
 }
 use_real() {
-  unset TT_CONTROLLER_PREFLIGHT_PROVISION TT_CONTROLLER_PREFLIGHT_CATALOG TT_CONTROLLER_PREFLIGHT_DAEMON
+  unset TT_CONTROLLER_PREFLIGHT_PROVISION TT_CONTROLLER_PREFLIGHT_AUTH TT_CONTROLLER_PREFLIGHT_CATALOG TT_CONTROLLER_PREFLIGHT_DAEMON
 }
 
 # ── helpers ──────────────────────────────────────────────────────────
@@ -189,6 +207,36 @@ printf '%s' "$CONTROLLER_OUTPUT" | grep -Fq 'tt-daemon-down' \
 ac2c_pf="$(state_pf "$CONTROLLER_CAMPAIGN")"
 printf '%s' "$ac2c_pf" | grep -q '"reason":"tt-daemon-down"' || fail "AC2 daemon reason not tt-daemon-down: $ac2c_pf"
 pass "AC2: tt-daemon-down leg aborts non-zero and records the DISTINCT reason"
+
+# ══ AC1 (pi): a real pi selection runs harness-auth BETWEEN home-provision and
+# catalog-install, then still reaches terminal reports. The pi case is NOT_RUN
+# (daemon-control-unavailable via the injected missing path) so no tamandua/pi
+# is spawned; the scripted case completes green.
+use_stubs
+run_controller "" TT_CONTROLLER_DAEMON_CONTROL_PATH="$TEST_ROOT/missing-daemon-control" -- --manifest "$PI_MANIFEST"
+[ -n "$CONTROLLER_CAMPAIGN" ] || fail "AC1 pi campaign not recorded"
+ac1pi_pf="$(state_pf "$CONTROLLER_CAMPAIGN")"
+printf '%s' "$ac1pi_pf" | grep -q '"ok":true' || fail "AC1 pi preflight not ok: $ac1pi_pf"
+printf '%s' "$ac1pi_pf" | grep -q '"leg":"harness-auth"' || fail "AC1 pi preflight missing harness-auth leg: $ac1pi_pf"
+legs="$(grep '^CALL ' "$PFLOG" | sed -n 's/^CALL \([^ ]*\) .*/\1/p')"
+[ "$(printf '%s\n' "$legs" | grep -c .)" -eq 5 ] || fail "AC1 pi expected 5 preflight calls, got: $(cat "$PFLOG")"
+[ "$(printf '%s\n' "$legs" | sed -n 1p)" = "tt-provision-home" ] || fail "AC1 pi leg1 not home-provision: $(cat "$PFLOG")"
+[ "$(printf '%s\n' "$legs" | sed -n 2p)" = "tt-harness-auth-probe" ] || fail "AC1 pi leg2 not harness-auth: $(cat "$PFLOG")"
+[ "$(printf '%s\n' "$legs" | sed -n 3p)" = "tt-catalog-install" ] || fail "AC1 pi leg3 not catalog-install: $(cat "$PFLOG")"
+[ "$(printf '%s\n' "$legs" | sed -n 4p)" = "tt-daemon-up" ] || fail "AC1 pi leg4 not daemon-up: $(cat "$PFLOG")"
+[ "$(printf '%s\n' "$legs" | sed -n 5p)" = "tt-daemon-up" ] || fail "AC1 pi leg5 (teardown) not daemon-up stop: $(cat "$PFLOG")"
+grep -q '^CALL tt-harness-auth-probe args=pi ' "$PFLOG" || fail "AC1 pi did not probe pi harness: $(cat "$PFLOG")"
+pass "AC1 (pi): real pi selection runs provision->harness-auth->catalog->daemon-up before cases"
+
+# ══ AC2 (auth): failing harness-auth leg -> harness-auth-missing: pi.
+run_controller "fail-auth" TT_CONTROLLER_DAEMON_CONTROL_PATH="$TEST_ROOT/missing-daemon-control" -- --manifest "$PI_MANIFEST"
+printf '%s' "$CONTROLLER_OUTPUT" | grep -Fq 'harness-auth-missing: pi' \
+  || fail "AC2 auth failure did not surface harness-auth-missing: pi: $CONTROLLER_OUTPUT"
+[ "$CONTROLLER_STATUS" -ne 0 ] || fail "AC2 auth failure did not abort (exit 0)"
+ac2a_pf="$(state_pf "$CONTROLLER_CAMPAIGN")"
+printf '%s' "$ac2a_pf" | grep -q '"reason":"harness-auth-missing: pi"' || fail "AC2 auth reason not harness-auth-missing: pi: $ac2a_pf"
+printf '%s' "$ac2a_pf" | grep -q '"stop_ok":true' || fail "AC2 auth daemon teardown did not run on preflight failure: $ac2a_pf"
+pass "AC2: harness-auth-missing: pi leg aborts non-zero and records the DISTINCT reason"
 
 # ══ AC4: scripted-only selection never engages the preflight / daemon.
 use_stubs

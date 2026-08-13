@@ -159,15 +159,28 @@ cannot share the real-harness daemon. The TT install runs TWO daemons:
   Without it every agent `git commit` dies at minute 20 of hour one
   ("Please tell me who you are"). Repo-local config in fixtures is a
   belt-and-suspenders addition, not a substitute.
-- `$TT_HOME/.pi/` — copy (not symlink) of `~/.pi` (settings + auth), so
-  agents cannot mutate the real one. Audit the copy for absolute paths
-  pointing at the real HOME and rewrite them. Document each harness's
-  actual install location and auth mechanism on THIS host in
+- `$TT_HOME/.pi/agent/` — **minimal enumerated set** (E2.6 US-004), surfaced
+  file-by-file from `~/.pi/agent/`, not a whole-directory copy:
+  `settings.json` (default model/provider selection), `models.json` (custom
+  provider defs + inline `apiKey`), and `auth.json` (operator auth.json base
+  merged with the operator's env-provided API keys — `DEEPSEEK_API_KEY`,
+  `OPENAI_API_KEY`, etc. — materialized into pi `auth.json` format). The
+  operator's env keys are materialized because the contained daemon starts
+  under `env -i` and never inherits the operator env; without them every
+  round dies with `No API key found for the selected model`. Files are
+  audited for absolute real-HOME paths and rewritten. Document each
+  harness's actual install location and auth mechanism on THIS host in
   `results/manifest.json` BEFORE T+0 — "fix it in the copy" is not a
   procedure; W0.5 verifies but must not discover.
-- `$TT_HOME/.hermes/` — copy of `~/.hermes`; `probeHermesStateContract()`
-  must pass in W0. Hermes attribution reads `$HERMES_HOME/state.db`
-  (input+output+cache_write; cache_read excluded).
+- `$TT_HOME/.hermes/` — **minimal enumerated set** (E2.6 US-004), surfaced
+  file-by-file from `~/.hermes/`, not a whole-directory copy: `config.yaml`
+  (default model/provider + auxiliary slots) and `auth.json` (OAuth/API-key
+  credential store), plus `~/.hermes/.env` carrying the operator's env API
+  keys (dotenv KEY=VALUE; hermes loads it via `load_hermes_dotenv`). Hermes
+  attribution still reads `$HERMES_HOME/state.db`
+  (`probeHermesStateContract()` must pass in W0) — that file is CREATED
+  fresh by the contained hermes on first run, never copied from the
+  operator's 1.5GB state.db (input+output+cache_write; cache_read excluded).
 - No `$TT_HOME/.ssh` unless a scenario explicitly needs one (fixtures are
   local-only; the unreachable-origin scenario W4.26 wants ssh to FAIL).
 
