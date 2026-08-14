@@ -43,7 +43,54 @@ function readArtifact(file, label) {
 }
 function sameArray(left, right) { return JSON.stringify(left) === JSON.stringify(right); }
 
-export function evaluateO11OutputContract(invocation, projected, databaseSteps) {
+// Loop-step classification. A step with type === 'loop' iterates over the run's
+// stories: each story iteration produces one accepted done transition (and, with
+// verify_each, one for the decision step), so done-transition multiplicity on
+// those steps equals the story count — never exactly one. loop_config must be a
+// parseable object on loop steps (fail closed like every other malformed input).
+function loopConfigOf(step) {
+  if (step.type !== 'loop') return null;
+  if (typeof step.loop_config !== 'string' || step.loop_config.trim().length === 0) {
+    throw new OracleRuntimeError(`loop step ${step.step_row_id} lacks a loop_config`);
+  }
+  let config;
+  try {
+    config = object(JSON.parse(step.loop_config), `step ${step.step_row_id}.loop_config`);
+  } catch (error) {
+    if (error instanceof OracleRuntimeError) throw error;
+    throw new OracleRuntimeError(`step ${step.step_row_id}.loop_config is not valid JSON: ${error.message}`, { cause: error });
+  }
+  const verifyEach = config.verifyEach ?? config.verify_each;
+  const verifyStep = config.verifyStep ?? config.verify_step;
+  if (verifyEach !== undefined && typeof verifyEach !== 'boolean') throw new OracleRuntimeError(`step ${step.step_row_id}.loop_config verify_each must be boolean`);
+  if (verifyStep !== undefined && (typeof verifyStep !== 'string' || verifyStep.length === 0)) {
+    throw new OracleRuntimeError(`step ${step.step_row_id}.loop_config verify_step must be a nonempty step_id`);
+  }
+  return { verify_each: verifyEach === true, verify_step_id: verifyStep ?? null };
+}
+
+// Accepts both snake_case (YAML) and camelCase (typed LoopConfig) spellings.
+function loopMultiplicityScope(databaseSteps) {
+  const loopStepRowIdsByRun = new Map();
+  const decisionStepRowIdsByRun = new Map();
+  for (const step of databaseSteps) {
+    const config = loopConfigOf(step);
+    if (config === null) continue;
+    const loopIds = loopStepRowIdsByRun.get(step.run_id) ?? new Set();
+    loopIds.add(step.step_row_id);
+    loopStepRowIdsByRun.set(step.run_id, loopIds);
+    if (config.verify_each && config.verify_step_id !== null) {
+      const decisionIds = decisionStepRowIdsByRun.get(step.run_id) ?? new Set();
+      for (const candidate of databaseSteps) {
+        if (candidate.run_id === step.run_id && candidate.step_id === config.verify_step_id) decisionIds.add(candidate.step_row_id);
+      }
+      decisionStepRowIdsByRun.set(step.run_id, decisionIds);
+    }
+  }
+  return { loopStepRowIdsByRun, decisionStepRowIdsByRun };
+}
+
+export function evaluateO11OutputContract(invocation, projected, databaseSteps, databaseStories) {
   const findings = new FindingCollector();
   const validationArtifact = readArtifact(invocation.evidencePaths.expects_validations, 'expects_validations');
   const rejectionArtifact = readArtifact(invocation.evidencePaths.submit_rejections, 'submit_rejections');
@@ -107,16 +154,44 @@ export function evaluateO11OutputContract(invocation, projected, databaseSteps) 
     return normalized;
   });
 
+  const { loopStepRowIdsByRun, decisionStepRowIdsByRun } = loopMultiplicityScope(databaseSteps);
+  const doneStoriesByRun = new Map();
+  for (const story of databaseStories) {
+    if (story.status !== 'done') continue;
+    doneStoriesByRun.set(story.run_id, (doneStoriesByRun.get(story.run_id) ?? 0) + 1);
+  }
+
   for (const step of databaseSteps.filter((row) => projected.has(row.run_id) && row.status === 'done')) {
     const successes = validations.filter((row) => row.run_id === step.run_id && row.step_row_id === step.step_row_id
       && row.outcome === 'accepted' && row.verdict === 'done' && row.transition.action === 'done'
       && row.transition.target_step_row_id === step.step_row_id);
-    if (successes.length !== 1) findings.add('O11_DONE_WITHOUT_EXPECTS_SUCCESS', 'done step does not have exactly one successful done expects-validation transition', {
-      run_id: step.run_id, step_row_id: step.step_row_id, observed: successes.length,
-    });
+    const isLoopStep = loopStepRowIdsByRun.get(step.run_id)?.has(step.step_row_id) ?? false;
+    const isDecisionStep = decisionStepRowIdsByRun.get(step.run_id)?.has(step.step_row_id) ?? false;
+    if (isLoopStep || isDecisionStep) {
+      // A loop step transitions done once per story iteration, and its
+      // verify_each decision step once per story verification. Multiplicity
+      // must therefore cover every completed story (at least one).
+      const required = Math.max(1, doneStoriesByRun.get(step.run_id) ?? 0);
+      if (successes.length < required) findings.add('O11_DONE_WITHOUT_EXPECTS_SUCCESS', 'loop/verify_each step does not have one accepted done transition per completed story', {
+        run_id: step.run_id, step_row_id: step.step_row_id, observed: successes.length, required,
+      });
+    } else if (successes.length !== 1) {
+      findings.add('O11_DONE_WITHOUT_EXPECTS_SUCCESS', 'done step does not have exactly one successful done expects-validation transition', {
+        run_id: step.run_id, step_row_id: step.step_row_id, observed: successes.length,
+      });
+    }
   }
   for (const row of validations) {
     if (row.outcome === 'accepted' && row.verdict === 'retry' && projected.get(row.run_id)?.terminal_status === 'completed') {
+      // On loop steps and their verify_each decision steps an accepted
+      // STATUS: retry verdict is the story-reset re-dispatch: the agent
+      // verdicts retry and the scheduler re-dispatches a fresh session for
+      // the same story. That is by design for loop iteration — not a finding.
+      // Every other step keeps the strict retry seal: a completed run must
+      // not carry an accepted retry verdict outside loop iteration.
+      const retryOnLoopStep = loopStepRowIdsByRun.get(row.run_id)?.has(row.step_row_id) ?? false;
+      const retryOnDecisionStep = decisionStepRowIdsByRun.get(row.run_id)?.has(row.step_row_id) ?? false;
+      if (retryOnLoopStep || retryOnDecisionStep) continue;
       findings.add('O11_COMPLETED_FROM_RETRY_VERDICT', 'completed run contains an accepted retry verdict', { validation_id: row.id, run_id: row.run_id, step_row_id: row.step_row_id });
     }
   }
@@ -210,6 +285,7 @@ export function evaluateO11OutputContract(invocation, projected, databaseSteps) 
     findings: findings.toJSON(),
     observation: {
       steps: databaseSteps.filter((step) => projected.has(step.run_id)),
+      stories: databaseStories.filter((story) => projected.has(story.run_id)),
       validations,
       rejections,
       renderings,

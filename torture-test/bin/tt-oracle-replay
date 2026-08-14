@@ -1,0 +1,791 @@
+#!/usr/bin/env node
+// tt-oracle-replay — zero-token offline evidence-replay delta reporter (E3.B US-010).
+//
+// Re-runs every oracle of a campaign against the campaign's KEPT evidence in a
+// copy-on-replay workspace and prints a before/after verdict delta table.
+//
+//   - Walks <campaign>/evidence/<case>/attempt-*/oracles/<oracle>/ and collects
+//     every (context.json, stdout.json) pair.
+//   - The source campaign is STRICTLY READ-ONLY: a sha256 digest of every file
+//     is computed before the replay and re-verified after. Any modification of
+//     the source campaign is a hard failure (exit 1).
+//   - Each case bundle is copied into a fresh session workspace under
+//     torture-test/var/tt-oracle-replay (gitignored): state.json + snapshots/
+//     are copied verbatim (file modes preserved, so the database snapshot stays
+//     read-only as the oracle contract requires), and every oracle gets a FRESH
+//     evidence directory containing only its context.json — oracles write their
+//     evidence exclusively (O_EXCL), so stale artifacts must never be copied.
+//   - The oracle is re-invoked exactly as the controller would:
+//       oracles/<id> --contract-version 1 --context <workspace-context>
+//     with TT_* env and cwd = the workspace evidence dir. The response is
+//     validated with the oracle output contract (PASS/FAIL/ERROR/NOT_EVALUABLE
+//     bound to exit codes 0/1/2/3).
+//   - Deterministic ordering (case, attempt, oracle — byte-wise ascending);
+//     zero tokens; no daemon contact; replay workspaces are removed on exit
+//     unless --keep-workspaces is given.
+//   - --verify-invariants (E3.B US-011) pins the campaign-#7 honest-verdict
+//     invariants on top of the replay: CNEV O1_TERMINAL_EVENT_MISSING and
+//     O8_SEEDED_TEST_CHANGED failures must survive unchanged, RUNAWAY cases
+//     must keep an honest FAIL backing, and the ONLY flips allowed are the
+//     four scoped artifact classes (S5 O1_DURATION_FLOOR_*, S6 O11 loop
+//     findings, S7 O8 boundary findings on W3.17a/b, S13 O2/O9/O10
+//     ERROR->NOT_EVALUABLE + the W1.REPLAY-ts O9 foreign-row finding). Any
+//     honest verdict flip fails the replay loudly.
+//
+// Exit codes:
+//   0  replay completed: every pair attempted and recorded (and, under
+//      --verify-invariants, every pinned invariant held)
+//   1  usage error, campaign missing/empty, source campaign modified during
+//      replay, no pair could be invoked at all, or an E3.B invariant
+//      violation under --verify-invariants
+
+import { createHash } from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+import { validateOracleResponse } from '../oracles/lib/output.mjs';
+
+const TT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const ORACLES_ROOT = path.join(TT_ROOT, 'oracles');
+const DEFAULT_WORKSPACE_ROOT = path.join(TT_ROOT, 'var', 'tt-oracle-replay');
+const AUTO_DETECT_PREFIX = 'campaign-20260813T123604986Z-';
+const ORACLE_TIMEOUT_MS = 120_000;
+const MAX_BUFFER = 16 * 1024 * 1024;
+const VALID_RESULTS = new Set(['PASS', 'FAIL', 'ERROR', 'NOT_EVALUABLE']);
+const REPLAY_ERROR_FINDING = 'ORACLE_REPLAY_INVOKE_ERROR';
+const INVALID_RESPONSE_FINDING = 'ORACLE_REPLAY_INVALID_RESPONSE';
+
+export function usage() {
+  return `usage: tt-oracle-replay [options]
+
+Offline evidence replay: re-runs every oracle of a campaign against its kept
+evidence in copy-on-replay workspaces and prints a before/after delta table.
+
+options:
+  --campaign <dir>         campaign results directory to replay (contains
+                           state.json + evidence/<case>/attempt-*/oracles/<id>/)
+  --workspace-root <dir>   base dir for replay workspaces (default:
+                           torture-test/var/tt-oracle-replay; must be absolute)
+  --json <path>            also write the machine-readable row list + summary
+  --keep-workspaces        do not remove the replay workspace after the run
+  --verify-invariants      pin the E3.B honest-verdict invariants on the
+                           replay (CNEV/O8-seeded failures survive; only
+                           S5/S6/S7/S13 artifact classes may flip) and exit 1
+                           when any pinned invariant is violated
+  -h, --help               show this help
+
+Campaign selection: --campaign wins, then TT_REPLAY_CAMPAIGN_DIR, then
+auto-detection of campaign-20260813T123604986Z-* under torture-test/var/results
+(exactly one match required).
+
+Exit codes: 0 = replay completed (and, under --verify-invariants, every
+pinned E3.B invariant held); 1 = usage error, no pairs, source campaign
+modified during replay, no pair could be invoked, or an E3.B invariant
+violation under --verify-invariants.`;
+}
+
+export function parseArgs(argv) {
+  const options = {
+    campaign: null, workspaceRoot: DEFAULT_WORKSPACE_ROOT, jsonPath: null,
+    keepWorkspaces: false, verifyInvariants: false,
+  };
+  for (let index = 0; index < argv.length; index += 1) {
+    const argument = argv[index];
+    if (argument === '-h' || argument === '--help') return { ...options, help: true };
+    if (argument === '--keep-workspaces') {
+      options.keepWorkspaces = true;
+      continue;
+    }
+    if (argument === '--verify-invariants') {
+      options.verifyInvariants = true;
+      continue;
+    }
+    if (!['--campaign', '--workspace-root', '--json'].includes(argument) || index + 1 >= argv.length) {
+      throw new Error(`invalid argument: ${argument} (run with --help for usage)`);
+    }
+    const value = argv[++index];
+    if (argument === '--campaign') options.campaign = path.resolve(value);
+    else if (argument === '--workspace-root') options.workspaceRoot = path.resolve(value);
+    else if (argument === '--json') options.jsonPath = path.resolve(value);
+  }
+  if (options.workspaceRoot === TT_ROOT || options.workspaceRoot === path.dirname(TT_ROOT)
+      || options.workspaceRoot === '/') {
+    throw new Error('--workspace-root must be a dedicated replay directory, not a source tree root');
+  }
+  return options;
+}
+
+export function sha256Content(content) {
+  return createHash('sha256').update(content).digest('hex');
+}
+
+// Returns a sorted list of { key, sha256 } for every regular file beneath the
+// campaign (posix-relative keys). Directories and symlinks are not hashed.
+export function computeCampaignDigest(campaignDir) {
+  const entries = [];
+  const walk = (directory) => {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true }).sort((left, right) => left.name.localeCompare(right.name))) {
+      const candidate = path.join(directory, entry.name);
+      if (entry.isDirectory()) walk(candidate);
+      else if (entry.isFile()) {
+        entries.push({ key: path.relative(campaignDir, candidate).split(path.sep).join('/'), sha256: sha256Content(fs.readFileSync(candidate)) });
+      }
+    }
+  };
+  walk(campaignDir);
+  return entries.sort((left, right) => left.key.localeCompare(right.key));
+}
+
+// Compares a fresh digest against the pre-replay one; returns the keys that
+// changed (added, removed, or different content).
+export function verifyCampaignUnchanged(before, campaignDir) {
+  const after = computeCampaignDigest(campaignDir);
+  const afterByKey = new Map(after.map((entry) => [entry.key, entry.sha256]));
+  const changed = [];
+  for (const entry of before) {
+    if (afterByKey.get(entry.key) !== entry.sha256) changed.push(entry.key);
+  }
+  const beforeKeys = new Set(before.map((entry) => entry.key));
+  for (const entry of after) {
+    if (!beforeKeys.has(entry.key)) changed.push(entry.key);
+  }
+  return changed.sort((left, right) => left.localeCompare(right));
+}
+
+export function autoDetectCampaign(resultsRoot) {
+  let matches = [];
+  try {
+    matches = fs.readdirSync(resultsRoot, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && entry.name.startsWith(AUTO_DETECT_PREFIX))
+      .map((entry) => path.join(resultsRoot, entry.name))
+      .sort((left, right) => left.localeCompare(right));
+  } catch {
+    matches = [];
+  }
+  if (matches.length === 1) return matches[0];
+  if (matches.length === 0) {
+    throw new Error(`no ${AUTO_DETECT_PREFIX}* campaign found under ${resultsRoot}; pass --campaign or set TT_REPLAY_CAMPAIGN_DIR`);
+  }
+  throw new Error(`multiple ${AUTO_DETECT_PREFIX}* campaigns under ${resultsRoot}; pass --campaign explicitly: ${matches.join(', ')}`);
+}
+
+export function resolveCampaignDir(options, env = process.env) {
+  const candidate = options.campaign ?? env.TT_REPLAY_CAMPAIGN_DIR ?? null;
+  if (candidate !== null) {
+    const resolved = path.resolve(candidate);
+    let details;
+    try {
+      details = fs.lstatSync(resolved);
+    } catch (error) {
+      throw new Error(`campaign directory is not accessible: ${resolved} (${error.code ?? error.message})`);
+    }
+    if (!details.isDirectory()) throw new Error(`campaign is not a directory: ${resolved}`);
+    if (!fs.existsSync(path.join(resolved, 'state.json'))) {
+      throw new Error(`campaign directory has no state.json marker: ${resolved}`);
+    }
+    return resolved;
+  }
+  return autoDetectCampaign(path.join(TT_ROOT, 'var', 'results'));
+}
+
+// Collects every replayable (case, attempt, oracle) pair, deterministically
+// ordered. A pair is replayable when its oracle dir holds context.json AND
+// stdout.json as regular files.
+export function collectReplayPairs(campaignDir) {
+  const evidenceRoot = path.join(campaignDir, 'evidence');
+  const pairs = [];
+  let caseIds = [];
+  try {
+    caseIds = fs.readdirSync(evidenceRoot, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+      .sort((left, right) => left.localeCompare(right));
+  } catch {
+    caseIds = [];
+  }
+  for (const caseId of caseIds) {
+    const caseDir = path.join(evidenceRoot, caseId);
+    const attempts = fs.readdirSync(caseDir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && entry.name.startsWith('attempt-'))
+      .map((entry) => entry.name)
+      .sort((left, right) => left.localeCompare(right));
+    for (const attempt of attempts) {
+      const oraclesDir = path.join(caseDir, attempt, 'oracles');
+      let oracleIds = [];
+      try {
+        oracleIds = fs.readdirSync(oraclesDir, { withFileTypes: true })
+          .filter((entry) => entry.isDirectory())
+          .map((entry) => entry.name)
+          .sort((left, right) => left.localeCompare(right));
+      } catch {
+        oracleIds = [];
+      }
+      for (const oracle of oracleIds) {
+        const oracleDir = path.join(oraclesDir, oracle);
+        const contextPath = path.join(oracleDir, 'context.json');
+        const stdoutPath = path.join(oracleDir, 'stdout.json');
+        let hasContext = false;
+        let hasStdout = false;
+        try {
+          hasContext = fs.lstatSync(contextPath).isFile();
+          hasStdout = fs.lstatSync(stdoutPath).isFile();
+        } catch {
+          hasContext = false;
+          hasStdout = false;
+        }
+        if (hasContext && hasStdout) {
+          pairs.push({ caseId, attempt, oracle, contextPath, stdoutPath });
+        }
+      }
+    }
+  }
+  return pairs;
+}
+
+export function readStoredVerdict(stdoutPath) {
+  try {
+    const stored = JSON.parse(fs.readFileSync(stdoutPath, 'utf8'));
+    const result = stored?.result;
+    if (typeof result === 'string' && VALID_RESULTS.has(result)) return result;
+    return 'UNKNOWN';
+  } catch {
+    return 'UNKNOWN';
+  }
+}
+
+// Returns the finding ids recorded in the stored stdout.json (the BEFORE
+// findings of a replay pair). Unparsable or finding-less files yield [] and
+// non-string finding ids are normalized to UNKNOWN_FINDING so invariant
+// classification can never silently drop a finding.
+export function readStoredFindings(stdoutPath) {
+  try {
+    const stored = JSON.parse(fs.readFileSync(stdoutPath, 'utf8'));
+    if (!Array.isArray(stored?.findings)) return [];
+    return stored.findings.map((finding) => (typeof finding?.id === 'string' ? finding.id : 'UNKNOWN_FINDING'));
+  } catch {
+    return [];
+  }
+}
+
+function readContext(contextPath) {
+  let context;
+  try {
+    context = JSON.parse(fs.readFileSync(contextPath, 'utf8'));
+  } catch (error) {
+    throw new Error(`cannot parse context ${contextPath}: ${error.message}`);
+  }
+  if (typeof context?.oracle_id !== 'string' || context.oracle_id.length === 0
+      || typeof context?.case?.id !== 'string' || context.case.id.length === 0
+      || typeof context?.campaign?.id !== 'string' || context.campaign.id.length === 0) {
+    throw new Error(`context ${contextPath} lacks oracle_id/case.id/campaign.id`);
+  }
+  return context;
+}
+
+// Invokes one oracle exactly as the controller would. Returns
+// { verdict, findings, invokeError } where invokeError is null when the oracle
+// process ran and produced a contract-valid response.
+export function invokeOracle({ oracleId, oraclePath, contextPath, evidenceDir, context, timeoutMs }) {
+  const env = {
+    ...process.env,
+    TT_ORACLE_CONTRACT_VERSION: '1',
+    TT_ORACLE_ID: oracleId,
+    TT_ORACLE_CONTEXT: contextPath,
+    TT_ORACLE_EVIDENCE_DIR: evidenceDir,
+    TT_CASE_ID: context.case.id,
+    TT_CAMPAIGN_ID: context.campaign.id,
+  };
+  if (context.run_id !== null && context.run_id !== undefined) env.TT_RUN_ID = context.run_id;
+  else delete env.TT_RUN_ID;
+  const result = spawnSync(oraclePath, ['--contract-version', '1', '--context', contextPath], {
+    cwd: evidenceDir,
+    env,
+    encoding: 'utf8',
+    shell: false,
+    timeout: timeoutMs,
+    maxBuffer: MAX_BUFFER,
+  });
+  if (result.error !== undefined || result.signal !== null) {
+    return {
+      verdict: 'ERROR',
+      findings: [{ id: REPLAY_ERROR_FINDING, summary: `oracle invocation failed: ${result.error?.message ?? `terminated by ${result.signal}`}` }],
+      invokeError: result.error?.message ?? `signal ${result.signal}`,
+    };
+  }
+  let response;
+  try {
+    response = JSON.parse(result.stdout.trim());
+  } catch (error) {
+    return {
+      verdict: 'ERROR',
+      findings: [{ id: INVALID_RESPONSE_FINDING, summary: `oracle stdout is not one JSON object: ${error.message}` }],
+      invokeError: `unparsable stdout (exit ${result.status})`,
+    };
+  }
+  const validationErrors = validateOracleResponse(response, oracleId, result.status, evidenceDir);
+  if (validationErrors.length > 0) {
+    return {
+      verdict: 'ERROR',
+      findings: [{ id: INVALID_RESPONSE_FINDING, summary: `oracle response violates the output contract: ${validationErrors.join('; ')}` }],
+      invokeError: null,
+    };
+  }
+  const verdict = response.result;
+  if (!VALID_RESULTS.has(verdict)) {
+    return {
+      verdict: 'ERROR',
+      findings: [{ id: INVALID_RESPONSE_FINDING, summary: `oracle returned an unknown result ${JSON.stringify(verdict)}` }],
+      invokeError: null,
+    };
+  }
+  return { verdict, findings: response.findings ?? [], invokeError: null };
+}
+
+// Copies the read-only evidence of the source campaign into a fresh session
+// workspace: state.json + snapshots/ verbatim (modes preserved); the evidence/
+// tree is rebuilt fresh per pair so oracles never collide with stale artifacts.
+export function buildReplayWorkspace({ campaignDir, sessionDir }) {
+  fs.mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
+  fs.copyFileSync(path.join(campaignDir, 'state.json'), path.join(sessionDir, 'state.json'));
+  const sourceSnapshots = path.join(campaignDir, 'snapshots');
+  if (fs.existsSync(sourceSnapshots)) {
+    fs.cpSync(sourceSnapshots, path.join(sessionDir, 'snapshots'), { recursive: true, preserveTimestamps: true, verbatimSymlinks: false });
+  }
+}
+
+function preparePairWorkspace({ sessionDir, pair }) {
+  const evidenceDir = path.join(sessionDir, 'evidence', pair.caseId, pair.attempt, 'oracles', pair.oracle);
+  fs.mkdirSync(evidenceDir, { recursive: true, mode: 0o700 });
+  const contextPath = path.join(evidenceDir, 'context.json');
+  fs.copyFileSync(pair.contextPath, contextPath);
+  return { evidenceDir, contextPath };
+}
+
+function renderTable(rows) {
+  const columns = [
+    { key: 'case', label: 'CASE', get: (row) => row.caseId },
+    { key: 'attempt', label: 'ATTEMPT', get: (row) => row.attempt },
+    { key: 'oracle', label: 'ORACLE', get: (row) => row.oracle },
+    { key: 'before', label: 'BEFORE', get: (row) => row.before },
+    { key: 'after', label: 'AFTER', get: (row) => row.after },
+    { key: 'delta', label: 'DELTA', get: (row) => row.delta },
+    { key: 'findings', label: 'FINDINGS', get: (row) => (row.findingIds.length === 0 ? '-' : row.findingIds.join(',')) },
+  ];
+  const widths = columns.map((column) => Math.max(column.label.length, ...rows.map((row) => column.get(row).length)));
+  const format = (row) => columns.map((column, index) => column.get(row).padEnd(widths[index])).join('  ');
+  const header = columns.map((column, index) => column.label.padEnd(widths[index])).join('  ');
+  const lines = [header, ...rows.map(format)];
+  return lines.join('\n');
+}
+
+export function renderSummary(rows) {
+  const flips = rows.filter((row) => row.delta === 'flip');
+  const transitions = new Map();
+  for (const row of flips) {
+    const key = `${row.before}->${row.after}`;
+    transitions.set(key, (transitions.get(key) ?? 0) + 1);
+  }
+  const invokeFailures = rows.filter((row) => row.invokeError !== null).length;
+  const lines = [
+    `pairs: ${rows.length}  flips: ${flips.length}  unchanged: ${rows.length - flips.length}  invoke_failures: ${invokeFailures}`,
+  ];
+  if (transitions.size > 0) {
+    lines.push(`transitions: ${[...transitions.entries()].sort(([left], [right]) => left.localeCompare(right)).map(([key, count]) => `${key}: ${count}`).join(', ')}`);
+  }
+  return lines.join('\n');
+}
+
+// ── E3.B US-011 honest-verdict invariant verification ──────────────────────
+//
+// The four scoped artifact classes are the ONLY findings that may disappear
+// between a stored campaign-#7 verdict and its replayed verdict:
+//
+//   S5  O1_DURATION_FLOOR_*                      (wave-family floor artifacts)
+//   S6  O11_DONE_WITHOUT_EXPECTS_SUCCESS and
+//       O11_COMPLETED_FROM_RETRY_VERDICT         (loop-step model artifacts)
+//   S7  O8_EXISTING_OUTSIDE_BOUNDARY and
+//       O8_NEW_OUTSIDE_ALLOWED_DIRECTORIES       (bare fixture-root boundary
+//                                                 artifacts — W3.17a/b only)
+//   S13 O9_LEDGER_TREE_UNRESOLVED on W1.REPLAY-ts (foreign-row artifact) plus
+//       ERROR->NOT_EVALUABLE on O2/O9/O10        (null gate_key degradation)
+//
+// Everything else — CNEV O1_TERMINAL_EVENT_MISSING, O8_SEEDED_TEST_CHANGED,
+// and any other finding id — is an HONEST verdict: it must survive the
+// replay with the same verdict, or the replay fails loudly.
+
+export const INVARIANT_PINS = {
+  // O1_TERMINAL_EVENT_MISSING (CNEV) failures named by the story must survive.
+  cnev: [
+    { caseId: 'W1.L2-python', oracle: 'O1', finding: 'O1_TERMINAL_EVENT_MISSING' },
+    { caseId: 'W1.L3-python', oracle: 'O1', finding: 'O1_TERMINAL_EVENT_MISSING' },
+    { caseId: 'W1.L3-ts', oracle: 'O1', finding: 'O1_TERMINAL_EVENT_MISSING' },
+  ],
+  // O8_SEEDED_TEST_CHANGED failures named by the story must survive. Note:
+  // campaign #7 stored a PASS O8 verdict for W3.03-bfmw-hermes-ts (no seeded
+  // finding in its stdout.json), so that pin enforces verdict preservation
+  // (PASS must stay PASS) instead of a FAIL finding.
+  o8Seeded: [
+    { caseId: 'W1.L3-ts', oracle: 'O8', finding: 'O8_SEEDED_TEST_CHANGED' },
+    { caseId: 'W2.22-non-main-bfmw', oracle: 'O8', finding: 'O8_SEEDED_TEST_CHANGED' },
+    { caseId: 'W3.01-bfmw-pi-python', oracle: 'O8', finding: 'O8_SEEDED_TEST_CHANGED' },
+    { caseId: 'W3.02-bfmw-pi-ts', oracle: 'O8', finding: 'O8_SEEDED_TEST_CHANGED' },
+    { caseId: 'W3.03-bfmw-hermes-ts', oracle: 'O8', finding: 'O8_SEEDED_TEST_CHANGED' },
+  ],
+};
+
+const S6_LOOP_FINDINGS = new Set(['O11_DONE_WITHOUT_EXPECTS_SUCCESS', 'O11_COMPLETED_FROM_RETRY_VERDICT']);
+const S7_BOUNDARY_FINDINGS = new Set(['O8_EXISTING_OUTSIDE_BOUNDARY', 'O8_NEW_OUTSIDE_ALLOWED_DIRECTORIES']);
+const S7_BOUNDARY_CASES = new Set(['W3.17a-marathon-natural', 'W3.17b-marathon-chaos']);
+const S13_FOREIGN_ROW_FINDINGS = new Set(['O9_LEDGER_TREE_UNRESOLVED']);
+const S13_FOREIGN_ROW_CASES = new Set(['W1.REPLAY-ts']);
+const S13_NOT_EVALUABLE_ORACLES = new Set(['O2', 'O9', 'O10']);
+
+export function isScopedDisappearing({ caseId, oracle, findingId }) {
+  if (findingId.startsWith('O1_DURATION_FLOOR_')) return true; // S5
+  if (S6_LOOP_FINDINGS.has(findingId)) return true; // S6
+  if (S7_BOUNDARY_FINDINGS.has(findingId)) return S7_BOUNDARY_CASES.has(caseId); // S7
+  if (S13_FOREIGN_ROW_FINDINGS.has(findingId)) return S13_FOREIGN_ROW_CASES.has(caseId); // S13
+  // ORACLE_RUNTIME_ERROR is the stored shape of the null-gate_key degradation
+  // on O2/O9/O10 (campaign #7 W2.22/W3.0x merge cases): the S13 fix replaces
+  // it with a NOT_EVALUABLE result, so it may vanish only on those oracles.
+  if (findingId === 'ORACLE_RUNTIME_ERROR') return S13_NOT_EVALUABLE_ORACLES.has(oracle);
+  return false;
+}
+
+// Reads the campaign report.json (when present) and returns the case ids that
+// carry a RUNAWAY kind-finding. The replay never rewrites the campaign (the
+// sha256 contract above), so "RUNAWAY findings remain visible" reduces to:
+// each RUNAWAY case must keep at least one honest FAIL verdict in the replay.
+export function readRunawayCases(campaignDir, reportPath = null) {
+  const file = reportPath ?? (campaignDir === null ? null : path.join(campaignDir, 'report.json'));
+  if (file === null) return { present: false, cases: [] };
+  if (!fs.existsSync(file)) return { present: false, cases: [] };
+  let report;
+  try {
+    report = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    return { present: true, unparsable: true, cases: [] };
+  }
+  const rows = Array.isArray(report?.rows) ? report.rows : [];
+  const cases = rows
+    .filter((row) => Array.isArray(row?.findings) && row.findings.some((finding) => finding?.type === 'RUNAWAY'))
+    .map((row) => row.id)
+    .sort((left, right) => left.localeCompare(right));
+  return { present: true, cases };
+}
+
+// The named pins are enforced strictly when the campaign IS campaign #7 (the
+// delta-table contract) or when the pinned case exists in the campaign at all;
+// for unrelated campaigns the pins are skipped (noted in the check).
+function isCampaignSeven(campaignDir) {
+  if (campaignDir === null) return false;
+  return path.basename(campaignDir).startsWith('campaign-20260813T123604986Z-');
+}
+
+// Verifies the E3.B honest-verdict invariants over replay rows. Returns
+// { ok, violations, checks, runawayCases }; ok is true only when zero
+// violations were found.
+export function verifyReplayInvariants({ rows, campaignDir = null, campaignCaseIds = null, pins = INVARIANT_PINS }) {
+  const violations = [];
+  const checks = [];
+  const strictPins = campaignCaseIds === null || isCampaignSeven(campaignDir);
+  const caseUniverse = campaignCaseIds === null ? null : new Set(campaignCaseIds);
+  const pinApplies = (caseId) => strictPins || (caseUniverse !== null && caseUniverse.has(caseId));
+  const skippedPin = (caseId, oracle) => `${caseId}/${oracle}: pin skipped (case not part of this campaign)`;
+
+  // I1 — honest-finding preservation: no before finding outside the scoped
+  // classes may disappear from the replayed findings.
+  {
+    const label = 'honest-finding-preservation';
+    const local = [];
+    for (const row of rows) {
+      for (const findingId of row.beforeFindingIds ?? []) {
+        if (!isScopedDisappearing({ caseId: row.caseId, oracle: row.oracle, findingId })
+            && !(row.findingIds ?? []).includes(findingId)) {
+          local.push(`${row.caseId}/${row.attempt}/${row.oracle}: honest finding ${findingId} vanished (${row.before} -> ${row.after})`);
+        }
+      }
+    }
+    violations.push(...local);
+    checks.push({ label, ok: local.length === 0, violations: local });
+  }
+
+  // I2 — transition classes: the only allowed flips are FAIL->PASS where
+  // every before finding is scoped (S5/S6/S7/S13), and ERROR->NOT_EVALUABLE
+  // on O2/O9/O10 (S13 degraded-evidence vocabulary).
+  {
+    const label = 'flip-transition-classes';
+    const local = [];
+    for (const row of rows) {
+      if (row.delta !== 'flip') continue;
+      const key = `${row.caseId}/${row.attempt}/${row.oracle}`;
+      if (row.before === 'FAIL' && row.after === 'PASS') {
+        const beforeIds = row.beforeFindingIds ?? [];
+        if (beforeIds.length === 0) {
+          local.push(`${key}: FAIL -> PASS flip with no recorded before findings (unexplained verdict change)`);
+        } else {
+          const unScoped = beforeIds.filter((findingId) => !isScopedDisappearing({ caseId: row.caseId, oracle: row.oracle, findingId }));
+          if (unScoped.length > 0) {
+            local.push(`${key}: FAIL -> PASS flip dropped non-scoped finding(s) ${unScoped.join(', ')}`);
+          }
+        }
+      } else if (row.before === 'ERROR' && row.after === 'NOT_EVALUABLE') {
+        if (!S13_NOT_EVALUABLE_ORACLES.has(row.oracle)) {
+          local.push(`${key}: ERROR -> NOT_EVALUABLE flip on ${row.oracle} (S13 vocabulary is scoped to O2/O9/O10)`);
+        }
+      } else {
+        local.push(`${key}: unclassified flip ${row.before} -> ${row.after} (outside the S5/S6/S7/S13 classes)`);
+      }
+    }
+    violations.push(...local);
+    checks.push({ label, ok: local.length === 0, violations: local });
+  }
+
+  // I3 — named CNEV pins: O1_TERMINAL_EVENT_MISSING survives on the story's
+  // example cases with a FAIL verdict before and after.
+  {
+    const label = 'cnev-pins';
+    const local = [];
+    const skipped = [];
+    for (const pin of pins.cnev ?? []) {
+      if (!pinApplies(pin.caseId)) {
+        skipped.push(skippedPin(pin.caseId, pin.oracle));
+        continue;
+      }
+      const matches = rows.filter((row) => row.caseId === pin.caseId && row.oracle === pin.oracle);
+      if (matches.length === 0) {
+        local.push(`${pin.caseId}/${pin.oracle}: pinned pair missing from the replay`);
+        continue;
+      }
+      for (const row of matches) {
+        if (row.before !== 'FAIL' || row.after !== 'FAIL'
+            || !(row.beforeFindingIds ?? []).includes(pin.finding)
+            || !(row.findingIds ?? []).includes(pin.finding)) {
+          local.push(`${row.caseId}/${row.attempt}/${row.oracle}: CNEV pin violated (before ${row.before} [${(row.beforeFindingIds ?? []).join(',')}] -> after ${row.after} [${(row.findingIds ?? []).join(',')}])`);
+        }
+      }
+    }
+    violations.push(...local);
+    checks.push({ label, ok: local.length === 0, violations: local, skipped });
+  }
+
+  // I4 — named O8 seeded pins: the story's O8_SEEDED_TEST_CHANGED cases keep
+  // their stored verdict; FAIL cases keep the finding before and after.
+  {
+    const label = 'o8-seeded-pins';
+    const local = [];
+    const skipped = [];
+    for (const pin of pins.o8Seeded ?? []) {
+      if (!pinApplies(pin.caseId)) {
+        skipped.push(skippedPin(pin.caseId, pin.oracle));
+        continue;
+      }
+      const matches = rows.filter((row) => row.caseId === pin.caseId && row.oracle === pin.oracle);
+      if (matches.length === 0) {
+        local.push(`${pin.caseId}/${pin.oracle}: pinned pair missing from the replay`);
+        continue;
+      }
+      for (const row of matches) {
+        if (row.before !== row.after) {
+          local.push(`${row.caseId}/${row.attempt}/${row.oracle}: O8 seeded pin violated (stored ${row.before} flipped to ${row.after})`);
+        } else if (row.before === 'FAIL' && (!(row.beforeFindingIds ?? []).includes(pin.finding)
+            || !(row.findingIds ?? []).includes(pin.finding))) {
+          local.push(`${row.caseId}/${row.attempt}/${row.oracle}: O8 seeded pin violated (O8_SEEDED_TEST_CHANGED missing from ${row.before} findings)`);
+        }
+      }
+    }
+    violations.push(...local);
+    checks.push({ label, ok: local.length === 0, violations: local, skipped });
+  }
+
+  // I5 — RUNAWAY backing: every RUNAWAY case in the campaign report must keep
+  // at least one FAIL verdict after the replay, so the RUNAWAY kind-finding
+  // stays visible instead of being masked by an all-PASS flip.
+  const runaway = readRunawayCases(campaignDir);
+  {
+    const label = 'runaway-backing';
+    const local = [];
+    if (runaway.present === false) {
+      checks.push({ label, ok: true, violations: [], skipped: 'no campaign report.json (RUNAWAY check not applicable)' });
+    } else if (runaway.unparsable === true) {
+      local.push(`campaign report.json is not parsable (cannot verify RUNAWAY visibility)`);
+      violations.push(...local);
+      checks.push({ label, ok: false, violations: local });
+    } else {
+      for (const caseId of runaway.cases) {
+        const backing = rows.filter((row) => row.caseId === caseId && row.after === 'FAIL');
+        if (backing.length === 0) {
+          local.push(`${caseId}: RUNAWAY case lost every FAIL verdict in the replay (RUNAWAY visibility would be masked)`);
+        }
+      }
+      violations.push(...local);
+      checks.push({ label, ok: local.length === 0, violations: local, runawayCases: runaway.cases });
+    }
+  }
+
+  return { ok: violations.length === 0, violations, checks, runawayCases: runaway.cases };
+}
+
+export function renderInvariantReport(verification) {
+  const mark = (ok) => (ok ? 'OK' : 'VIOLATION');
+  const skip = (check) => {
+    if (check.skipped === undefined) return '';
+    if (typeof check.skipped === 'string') return ` (${check.skipped})`;
+    if (check.skipped.length === 0) return '';
+    return ` (${check.skipped.length} pin(s) skipped: not part of this campaign)`;
+  };
+  const lines = ['invariant report (--verify-invariants, E3.B US-011):'];
+  for (const check of verification.checks) {
+    lines.push(`  [${mark(check.ok)}] ${check.label}${skip(check)}`);
+  }
+  lines.push(`invariants: ${verification.ok ? 'OK' : `FAILED (${verification.violations.length} violation(s))`}`);
+  return lines.join('\n');
+}
+
+export function replayCampaign(options, io = {}) {
+  const stdout = io.stdout ?? ((line) => process.stdout.write(`${line}\n`));
+  const stderr = io.stderr ?? ((line) => process.stderr.write(`${line}\n`));
+  const campaignDir = resolveCampaignDir(options);
+  const pairs = collectReplayPairs(campaignDir);
+  if (pairs.length === 0) throw new Error(`campaign has no replayable evidence pairs (evidence/<case>/attempt-*/oracles/<oracle>/{context.json,stdout.json}): ${campaignDir}`);
+  const timeoutMs = options.timeoutMs ?? ORACLE_TIMEOUT_MS;
+  const digestBefore = computeCampaignDigest(campaignDir);
+
+  fs.mkdirSync(options.workspaceRoot, { recursive: true, mode: 0o700 });
+  const sessionDir = fs.mkdtempSync(path.join(options.workspaceRoot, 'replay-'));
+  let rows = [];
+  let sourceViolation = null;
+  try {
+    buildReplayWorkspace({ campaignDir, sessionDir });
+    stdout(`tt-oracle-replay: campaign ${campaignDir}`);
+    stdout(`tt-oracle-replay: workspace ${sessionDir}`);
+    for (const pair of pairs) {
+      const { evidenceDir, contextPath } = preparePairWorkspace({ sessionDir, pair });
+      const before = readStoredVerdict(pair.stdoutPath);
+      let context = null;
+      let contextError = null;
+      try {
+        context = readContext(pair.contextPath);
+      } catch (error) {
+        contextError = error.message;
+      }
+      let after;
+      let findingIds;
+      let invokeError;
+      if (contextError !== null) {
+        after = 'ERROR';
+        findingIds = [REPLAY_ERROR_FINDING];
+        invokeError = contextError;
+      } else {
+        const oraclePath = path.join(ORACLES_ROOT, pair.oracle);
+        let oracleUsable = false;
+        try {
+          const details = fs.lstatSync(oraclePath);
+          oracleUsable = details.isFile() && !details.isSymbolicLink() && (details.mode & 0o111) !== 0;
+        } catch {
+          oracleUsable = false;
+        }
+        if (!oracleUsable) {
+          after = 'ERROR';
+          findingIds = [REPLAY_ERROR_FINDING];
+          invokeError = `oracle ${oraclePath} is not an executable regular file`;
+        } else {
+          const outcome = invokeOracle({
+            oracleId: pair.oracle,
+            oraclePath,
+            contextPath,
+            evidenceDir,
+            context,
+            timeoutMs,
+          });
+          after = outcome.verdict;
+          findingIds = outcome.findings.map((finding) => finding.id);
+          invokeError = outcome.invokeError;
+        }
+      }
+      rows.push({
+        caseId: pair.caseId,
+        attempt: pair.attempt,
+        oracle: pair.oracle,
+        before,
+        beforeFindingIds: readStoredFindings(pair.stdoutPath),
+        after,
+        delta: before === after ? 'same' : 'flip',
+        findingIds,
+        invokeError,
+      });
+    }
+    sourceViolation = verifyCampaignUnchanged(digestBefore, campaignDir);
+  } finally {
+    if (!options.keepWorkspaces) {
+      fs.rmSync(sessionDir, { recursive: true, force: true });
+    } else {
+      stdout(`tt-oracle-replay: workspace kept at ${sessionDir}`);
+    }
+  }
+
+  const summary = {
+    pairs: rows.length,
+    flips: rows.filter((row) => row.delta === 'flip').length,
+    unchanged: rows.filter((row) => row.delta === 'same').length,
+    invoke_failures: rows.filter((row) => row.invokeError !== null).length,
+    source_campaign_unchanged: sourceViolation === null || sourceViolation.length === 0,
+  };
+
+  stdout(renderTable(rows));
+  stdout(renderSummary(rows));
+  const invariants = options.verifyInvariants === true
+    ? verifyReplayInvariants({ rows, campaignDir, campaignCaseIds: pairs.map((pair) => pair.caseId) })
+    : null;
+  if (invariants !== null) {
+    stdout(renderInvariantReport(invariants));
+    for (const violation of invariants.violations) stderr(`tt-oracle-replay invariant violation: ${violation}`);
+  }
+  if (options.jsonPath !== null) {
+    const payload = { tool: 'tt-oracle-replay', campaign: campaignDir, rows, summary };
+    if (invariants !== null) payload.invariants = invariants;
+    fs.writeFileSync(options.jsonPath, `${JSON.stringify(payload, null, 2)}\n`);
+    stdout(`tt-oracle-replay: machine-readable rows written to ${options.jsonPath}`);
+  }
+  if (sourceViolation !== null && sourceViolation.length > 0) {
+    stderr(`tt-oracle-replay: SOURCE CAMPAIGN MODIFIED during replay: ${sourceViolation.join(', ')}`);
+    return 1;
+  }
+  if (rows.length > 0 && rows.every((row) => row.invokeError !== null)) {
+    stderr('tt-oracle-replay: no pair could be invoked (every row recorded an invocation error)');
+    return 1;
+  }
+  if (invariants !== null && !invariants.ok) {
+    stderr(`tt-oracle-replay: E3.B invariant verification FAILED (${invariants.violations.length} violation(s))`);
+    return 1;
+  }
+  return 0;
+}
+
+function main() {
+  let options;
+  try {
+    options = parseArgs(process.argv.slice(2));
+  } catch (error) {
+    process.stderr.write(`tt-oracle-replay: ${error.message}\n`);
+    process.exitCode = 1;
+    return;
+  }
+  if (options.help === true) {
+    process.stdout.write(`${usage()}\n`);
+    process.exitCode = 0;
+    return;
+  }
+  try {
+    process.exitCode = replayCampaign(options);
+  } catch (error) {
+    process.stderr.write(`tt-oracle-replay: ${error.message}\n`);
+    process.exitCode = 1;
+  }
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
+  main();
+}

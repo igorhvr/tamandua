@@ -34,7 +34,7 @@ test('O11 enforces output contracts, formula, exact ownership, ledger reconcilia
     const generated = spawnSync(process.execPath, [GENERATOR, workspace], { encoding: 'utf8', shell: false });
     assert.equal(generated.status, 0, generated.stderr);
     const names = fs.readdirSync(workspace).filter((name) => name.startsWith('o11-')).sort();
-    assert.equal(names.length, 17);
+    assert.equal(names.length, 24);
     for (const name of names) {
       const { expectation, response, status } = invokeFixture(workspace, name);
       assert.equal(response.result, expectation.expected, `${name}: ${JSON.stringify(response)}`);
@@ -46,6 +46,23 @@ test('O11 enforces output contracts, formula, exact ownership, ledger reconcilia
       assert.ok(Array.isArray(observation.runs));
       assert.ok(Array.isArray(observation.usages));
       assert.ok(Array.isArray(observation.output_contract.steps));
+      assert.ok(Array.isArray(observation.output_contract.stories));
+      if (expectation.loop) {
+        assert.ok(observation.output_contract.steps.some((step) => step.type === 'loop'), `${name} loop step missing from observation`);
+        assert.equal(observation.output_contract.stories.filter((story) => story.status === 'done').length, expectation.loop.doneStories, `${name} done stories`);
+      }
+      if (expectation.campaign7) {
+        // The fixture must actually exercise the exemption path: it carries
+        // the campaign-7 accepted retry verdict on the verify decision step.
+        const retryRows = observation.output_contract.validations.filter((row) => row.outcome === 'accepted' && row.verdict === 'retry');
+        assert.equal(retryRows.length, 1, `${name} must carry exactly one accepted retry verdict`);
+        assert.equal(retryRows[0].step_id, 'verify', `${name} retry verdict must sit on the verify decision step`);
+        assert.equal(retryRows[0].transition.action, 'done', `${name} retry verdict must carry the campaign-7 done self-transition`);
+        assert.equal(retryRows[0].transition.target_step_row_id, retryRows[0].step_row_id, `${name} retry verdict transition must target the verify step itself`);
+        if (expectation.campaign7.variant !== 'nonloop') {
+          assert.ok(observation.output_contract.steps.some((step) => step.type === 'loop'), `${name} loop step missing from observation`);
+        }
+      }
       assert.ok(Array.isArray(observation.output_contract.validations));
       assert.ok(Array.isArray(observation.output_contract.rejections));
       assert.ok(Array.isArray(observation.output_contract.renderings));

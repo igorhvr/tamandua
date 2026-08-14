@@ -51,6 +51,8 @@ const FIXTURES = [
   { name: 'o2-cross-run-duplicate', expected: 'FAIL', crossRun: true, finding: 'O2_DUPLICATE_LANDING' },
   { name: 'o2-duplicate-landing', expected: 'FAIL', mutation: 'duplicate', finding: 'O2_DUPLICATE_LANDING' },
   { name: 'o2-empty-landing', expected: 'FAIL', mutation: 'empty', finding: 'O2_EMPTY_LANDING' },
+  { name: 'o2-foreign-sibling-row', expected: 'PASS', foreignSiblingRow: true },
+  { name: 'o2-null-gate-key', expected: 'NOT_EVALUABLE', nullGateKey: true },
 ];
 
 function run(command, args, cwd, options = {}) {
@@ -289,7 +291,14 @@ for (const fixture of FIXTURES) {
       .run(ORIGIN, featureTree, fixture.suiteKeyMutation === 'cmd' ? 'e'.repeat(64) : CMD_HASH,
         fixture.exactRedRow ? 1 : 0, RUN_ID.slice(4), '2026-08-01T12:01:30.000Z');
   }
-  const suiteRows = database.prepare('SELECT * FROM suite_results ORDER BY id').all();
+  if (fixture.foreignSiblingRow) {
+    database.prepare(`INSERT INTO suite_results
+      (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, run_id, step_id, created_at)
+      VALUES (?, ?, ?, 'npm test', ?, 1000, ?, 'test', ?)`)
+      .run('sibling-origin', 'e'.repeat(40), CMD_HASH, 0, 'run-sibling', '2026-08-01T12:01:30.000Z');
+  }
+  const suiteRows = database.prepare('SELECT * FROM suite_results ORDER BY id').all()
+    .filter((row) => row.origin_repo === ORIGIN);
   database.close();
   fs.chmodSync(databasePath, 0o400);
 
@@ -344,7 +353,7 @@ for (const fixture of FIXTURES) {
       ? ['workflow', 'run', 'feature-dev-merge-worktree', '--context', 'merge_gate=off']
       : ['workflow', 'run', 'feature-dev-merge-worktree'],
     argv_sha256: 'a'.repeat(64),
-    gate_key: { origin_repo: ORIGIN, cmd_hash: CMD_HASH },
+    gate_key: fixture.nullGateKey ? null : { origin_repo: ORIGIN, cmd_hash: CMD_HASH },
   }, STARTED_AT);
   references.git_bundle = reference(campaign, gitTar, 'git-common-dir-tar');
   references.refs_before = writeSnapshot(campaign, snapshots, 'refs-before.json', refsBefore, STARTED_AT);

@@ -167,7 +167,7 @@ function projectWaveRun(caseState, attempt) {
   };
 }
 
-function createO1Wave(caseRecord, state) {
+function createO1Wave(caseRecord, caseState, state) {
   const cases = Array.isArray(state.cases) ? state.cases : [];
   const waveCases = cases.filter((item) => item.wave === caseRecord.wave);
   const runs = waveCases.flatMap((item) => (item.attempts ?? [])
@@ -177,22 +177,41 @@ function createO1Wave(caseRecord, state) {
     const root = waveCases.find((item) => item.id === discovered.root_case_id);
     if (root !== undefined && typeof discovered.run_id === 'string') runs.push(projectWaveRun(root, discovered));
   }
-  const workflows = [...new Set(runs.map((run) => run.workflow))].sort();
-  const durationFloors = workflows.map((workflow) => {
+  // The run under judgment (the case's own latest attempt run) must never
+  // contribute to its own calibration sample.
+  const judgedRunId = (caseState?.attempts ?? [])
+    .findLast((attempt) => typeof attempt?.run_id === 'string')?.run_id ?? null;
+  const medians = new Map();
+  for (const workflow of [...new Set(runs.map((run) => run.workflow))]) {
     const calibration = cases
       .filter((item) => item.wave === 1 && item.workflow === workflow && item.expected_fast_failure !== true)
-      .flatMap((item) => (item.attempts ?? []).map(durationMs).filter((value) => value !== null));
-    const measured = median(calibration);
-    if (measured !== null) {
-      return { workflow, duration_floor_ms: measured, source: 'w1-median', sample_size: calibration.length };
-    }
-    const production = [...new Set(cases
-      .filter((item) => item.workflow === workflow && Number.isFinite(item.production_duration_floor_ms) && item.production_duration_floor_ms > 0)
-      .map((item) => item.production_duration_floor_ms))];
-    return production.length === 1
-      ? { workflow, duration_floor_ms: production[0], source: 'production-median', sample_size: 0 }
-      : { workflow, duration_floor_ms: null, source: 'unavailable', sample_size: 0 };
-  });
+      .flatMap((item) => (item.attempts ?? [])
+        .filter((attempt) => attempt.terminal_status === 'completed'
+          && (judgedRunId === null || attempt.run_id !== judgedRunId))
+        .map(durationMs)
+        .filter((value) => value !== null));
+    medians.set(workflow, { measured: median(calibration), sample_size: calibration.length });
+  }
+  const launched = new Map();
+  for (const run of runs) {
+    const key = `${run.case_id}\0${run.workflow}`;
+    if (!launched.has(key)) launched.set(key, run);
+  }
+  const durationFloors = [...launched.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([, run]) => {
+      const item = cases.find((candidate) => candidate.id === run.case_id);
+      const pinned = Number.isFinite(item?.production_duration_floor_ms) && item.production_duration_floor_ms > 0
+        ? item.production_duration_floor_ms
+        : null;
+      if (pinned !== null) {
+        return { workflow: run.workflow, case_id: run.case_id, duration_floor_ms: pinned, source: 'production-median', sample_size: 0 };
+      }
+      const { measured, sample_size } = medians.get(run.workflow) ?? { measured: null, sample_size: 0 };
+      return measured !== null
+        ? { workflow: run.workflow, case_id: run.case_id, duration_floor_ms: measured, source: 'w1-median', sample_size }
+        : { workflow: run.workflow, case_id: run.case_id, duration_floor_ms: null, source: 'unavailable', sample_size: 0 };
+    });
   return {
     schema_version: 1,
     wave: caseRecord.wave,
@@ -246,7 +265,7 @@ export function createOracleContext({ caseRecord, caseState, state, oracleId }) 
         ...projectAttempt(run),
         parent_run_id: run.parent_run_id,
       })),
-    o1_wave: createO1Wave(caseRecord, state),
+    o1_wave: createO1Wave(caseRecord, caseState, state),
     mechanical_evidence: projectEvidence(latestAttempt?.oracle_evidence),
   };
 }

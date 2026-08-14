@@ -37,7 +37,7 @@ test('O8 enforces scope, bait integrity, seeded tests, test markers, and transpo
     const generated = spawnSync(process.execPath, [GENERATOR, workspace], { encoding: 'utf8', shell: false });
     assert.equal(generated.status, 0, generated.stderr);
     const names = fs.readdirSync(workspace).filter((name) => name.startsWith('o8-')).sort();
-    assert.equal(names.length, 13);
+    assert.equal(names.length, 15);
     for (const name of names) {
       const { expectation, response, status } = invokeFixture(workspace, name);
       assert.equal(response.result, expectation.expected, `${name}: ${JSON.stringify(response)}`);
@@ -48,6 +48,17 @@ test('O8 enforces scope, bait integrity, seeded tests, test markers, and transpo
       assert.equal(observation.schema_version, 1);
       assert.deepEqual(observation.changed_paths, observation.changed_paths.toSorted());
       assert.equal(observation.git_tree_reconciled, true);
+      if (name === 'o8-w317a-bare-fixture-root') {
+        assert.deepEqual(observation.boundary_files, ['fixtures-src/tt-poly-lite'], `${name} audit must preserve the bare fixture-root declaration`);
+        assert.deepEqual(observation.forbidden, ['fixtures-src/tt-poly-lite/operator-notes.local'], `${name} audit must preserve the fixture-source-relative forbidden declaration`);
+        for (const scope of ['O8_EXISTING_OUTSIDE_BOUNDARY', 'O8_NEW_OUTSIDE_ALLOWED_DIRECTORIES']) {
+          assert.ok(!response.findings.some((finding) => finding.id === scope), `${name} must not report ${scope} for a bare fixture-root scope`);
+        }
+      }
+      if (name === 'o8-w317a-narrow-boundary-control') {
+        assert.ok(response.findings.some((finding) => finding.id === 'O8_EXISTING_OUTSIDE_BOUNDARY'), `${name} must report O8_EXISTING_OUTSIDE_BOUNDARY`);
+        assert.ok(response.findings.some((finding) => finding.id === 'O8_NEW_OUTSIDE_ALLOWED_DIRECTORIES'), `${name} must report O8_NEW_OUTSIDE_ALLOWED_DIRECTORIES`);
+      }
     }
   } finally {
     fs.rmSync(workspace, { recursive: true, force: true });

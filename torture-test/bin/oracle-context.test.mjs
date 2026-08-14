@@ -74,7 +74,7 @@ function fixture() {
       id: 'W1-CALIBRATION', wave: 1, workflow: 'feature-dev-merge-worktree', fixture: 'tt-ts',
       harness: 'hermes', class: 'verification', phase: 'terminal', expected_fast_failure: false,
       production_duration_floor_ms: 120_000,
-      attempts: [{ ...attempt, id: 'attempt-w1', started_at: '2026-08-01T11:55:00.000Z' }],
+      attempts: [{ ...attempt, id: 'attempt-w1', run_id: 'run-44444444-4444-4444-8444-444444444444', started_at: '2026-08-01T11:55:00.000Z' }],
       findings: [], oracle_results: [], spend: { tokens_observed: 17, observations: [] },
     }],
     discovered_runs: [{
@@ -109,8 +109,9 @@ test('complete version-1 mechanical evidence context is accepted for every gatin
       assert.equal(context.mechanical_evidence.schema_version, 1);
       assert.deepEqual(Object.keys(context.mechanical_evidence.references), ORACLE_EVIDENCE_KEYS);
       assert.equal(context.attempts[0].steps_snapshot.steps[0].updatedAt, data.state.created_at);
-      assert.equal(context.o1_wave.duration_floors[0].source, 'w1-median');
-      assert.equal(context.o1_wave.duration_floors[0].duration_floor_ms, 300_000);
+      assert.equal(context.o1_wave.duration_floors[0].source, 'production-median');
+      assert.equal(context.o1_wave.duration_floors[0].duration_floor_ms, 120_000);
+      assert.equal(context.o1_wave.duration_floors[0].case_id, 'CASE-1');
       assert.equal(context.o1_wave.runs[0].expected_fast_failure, false);
     }
   } finally {
@@ -133,16 +134,134 @@ test('projection excludes prose fields, raw stream references, STATUS lines, and
   }
 });
 
-test('O1 wave projection falls back to the pinned production median when W1 has no family sample', () => {
+test('O1 wave projection pins the per-case production floor when W1 has no family sample', () => {
   const data = fixture();
   try {
     data.state.cases = data.state.cases.filter((item) => item.wave !== 1);
     const context = createOracleContext({ ...data, oracleId: 'O1' });
     assert.deepEqual(context.o1_wave.duration_floors, [{
       workflow: 'feature-dev-merge-worktree',
+      case_id: 'CASE-1',
       duration_floor_ms: 120_000,
       source: 'production-median',
       sample_size: 0,
+    }]);
+  } finally {
+    cleanup(data.campaignDir);
+  }
+});
+
+test('O1 wave projection keeps distinct per-case production floors inside one workflow family', () => {
+  const data = fixture();
+  try {
+    data.state.cases = data.state.cases.filter((item) => item.wave !== 1);
+    const secondAttempt = { ...data.caseState.attempts[0], run_id: 'run-33333333-3333-4333-8333-333333333333' };
+    data.state.cases.push({
+      id: 'CASE-2', wave: 3, workflow: 'feature-dev-merge-worktree', fixture: 'tt-ts',
+      harness: 'hermes', class: 'verification', phase: 'running', expected_fast_failure: false,
+      production_duration_floor_ms: 480_000, attempts: [secondAttempt], findings: [], oracle_results: [],
+      spend: { tokens_observed: 17, observations: [] },
+    });
+    const context = createOracleContext({ ...data, oracleId: 'O1' });
+    assert.deepEqual(context.o1_wave.duration_floors, [
+      { workflow: 'feature-dev-merge-worktree', case_id: 'CASE-1', duration_floor_ms: 120_000, source: 'production-median', sample_size: 0 },
+      { workflow: 'feature-dev-merge-worktree', case_id: 'CASE-2', duration_floor_ms: 480_000, source: 'production-median', sample_size: 0 },
+    ]);
+  } finally {
+    cleanup(data.campaignDir);
+  }
+});
+
+test('O1 wave projection falls back to the w1-median only for cases without a production pin', () => {
+  const data = fixture();
+  try {
+    const secondAttempt = { ...data.caseState.attempts[0], run_id: 'run-33333333-3333-4333-8333-333333333333' };
+    data.state.cases.push({
+      id: 'CASE-2', wave: 3, workflow: 'feature-dev-merge-worktree', fixture: 'tt-ts',
+      harness: 'hermes', class: 'verification', phase: 'running', expected_fast_failure: false,
+      production_duration_floor_ms: null, attempts: [secondAttempt], findings: [], oracle_results: [],
+      spend: { tokens_observed: 17, observations: [] },
+    });
+    const context = createOracleContext({ ...data, oracleId: 'O1' });
+    assert.deepEqual(context.o1_wave.duration_floors, [
+      { workflow: 'feature-dev-merge-worktree', case_id: 'CASE-1', duration_floor_ms: 120_000, source: 'production-median', sample_size: 0 },
+      { workflow: 'feature-dev-merge-worktree', case_id: 'CASE-2', duration_floor_ms: 300_000, source: 'w1-median', sample_size: 1 },
+    ]);
+  } finally {
+    cleanup(data.campaignDir);
+  }
+});
+
+test('O1 wave projection records unavailable for a launched case with no pin and no W1 sample', () => {
+  const data = fixture();
+  try {
+    data.state.cases = data.state.cases.filter((item) => item.wave !== 1);
+    const secondAttempt = { ...data.caseState.attempts[0], run_id: 'run-33333333-3333-4333-8333-333333333333' };
+    data.state.cases.push({
+      id: 'CASE-2', wave: 3, workflow: 'feature-dev-merge-worktree', fixture: 'tt-ts',
+      harness: 'hermes', class: 'verification', phase: 'running', expected_fast_failure: false,
+      production_duration_floor_ms: null, attempts: [secondAttempt], findings: [], oracle_results: [],
+      spend: { tokens_observed: 17, observations: [] },
+    });
+    const context = createOracleContext({ ...data, oracleId: 'O1' });
+    assert.deepEqual(context.o1_wave.duration_floors, [
+      { workflow: 'feature-dev-merge-worktree', case_id: 'CASE-1', duration_floor_ms: 120_000, source: 'production-median', sample_size: 0 },
+      { workflow: 'feature-dev-merge-worktree', case_id: 'CASE-2', duration_floor_ms: null, source: 'unavailable', sample_size: 0 },
+    ]);
+  } finally {
+    cleanup(data.campaignDir);
+  }
+});
+
+test('O1 wave projection excludes non-completed attempts from the w1-median calibration sample', () => {
+  const data = fixture();
+  try {
+    const w1 = data.state.cases.find((item) => item.id === 'W1-CALIBRATION');
+    w1.attempts = [
+      { ...data.caseState.attempts[0], id: 'attempt-w1-completed', run_id: 'run-55555555-5555-4555-8555-555555555555', started_at: '2026-08-01T11:55:00.000Z', terminal_status: 'completed' },
+      { ...data.caseState.attempts[0], id: 'attempt-w1-canceled', run_id: 'run-66666666-6666-4666-8666-666666666666', started_at: '2026-08-01T11:59:30.000Z', terminal_status: 'canceled' },
+      { ...data.caseState.attempts[0], id: 'attempt-w1-runaway', run_id: 'run-77777777-7777-4777-8777-777777777777', started_at: '2026-08-01T11:59:30.000Z', terminal_at: null, terminal_status: null, phase: 'running' },
+    ];
+    const secondAttempt = { ...data.caseState.attempts[0], run_id: 'run-33333333-3333-4333-8333-333333333333' };
+    data.state.cases.push({
+      id: 'CASE-2', wave: 3, workflow: 'feature-dev-merge-worktree', fixture: 'tt-ts',
+      harness: 'hermes', class: 'verification', phase: 'running', expected_fast_failure: false,
+      production_duration_floor_ms: null, attempts: [secondAttempt], findings: [], oracle_results: [],
+      spend: { tokens_observed: 17, observations: [] },
+    });
+    const context = createOracleContext({ ...data, oracleId: 'O1' });
+    // A median over all three attempts would be 30s; the completed-only sample is 300s.
+    assert.deepEqual(context.o1_wave.duration_floors, [
+      { workflow: 'feature-dev-merge-worktree', case_id: 'CASE-1', duration_floor_ms: 120_000, source: 'production-median', sample_size: 0 },
+      { workflow: 'feature-dev-merge-worktree', case_id: 'CASE-2', duration_floor_ms: 300_000, source: 'w1-median', sample_size: 1 },
+    ]);
+  } finally {
+    cleanup(data.campaignDir);
+  }
+});
+
+test('O1 wave projection never lets the run under judgment calibrate itself', () => {
+  const data = fixture();
+  try {
+    const judgedAttempts = [
+      { ...data.caseState.attempts[0], id: 'attempt-1-prior', run_id: 'run-prior-0000-0000-4000-8000-000000000000', started_at: '2026-08-01T11:55:00.000Z' },
+      { ...data.caseState.attempts[0], id: 'attempt-2-judged', run_id: 'run-judged-0000-0000-4000-8000-000000000000', started_at: '2026-08-01T11:59:30.000Z' },
+    ];
+    data.caseRecord = { ...data.caseRecord, wave: 1 };
+    data.state.cases = [{
+      id: 'CASE-1', wave: 1, workflow: 'feature-dev-merge-worktree', fixture: 'tt-ts',
+      harness: 'hermes', class: 'verification', phase: 'terminal', expected_fast_failure: false,
+      production_duration_floor_ms: null, attempts: judgedAttempts, findings: [], oracle_results: [],
+      spend: { tokens_observed: 17, observations: [] },
+    }];
+    const context = createOracleContext({ ...data, caseState: { attempts: judgedAttempts }, oracleId: 'O1' });
+    // Without the exclusion the median of [300s, 30s] = 165s would become the floor.
+    assert.deepEqual(context.o1_wave.duration_floors, [{
+      workflow: 'feature-dev-merge-worktree',
+      case_id: 'CASE-1',
+      duration_floor_ms: 300_000,
+      source: 'w1-median',
+      sample_size: 1,
     }]);
   } finally {
     cleanup(data.campaignDir);

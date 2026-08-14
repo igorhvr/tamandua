@@ -75,10 +75,13 @@ function readLaunchIntent(file) {
   if (artifact.schema_version !== 1) throw new OracleRuntimeError('launch_intent.schema_version must be 1');
   timestamp(artifact.captured_at, 'launch_intent.captured_at');
   const policy = object(artifact.policy, 'launch_intent.policy');
-  const gateKey = object(artifact.gate_key, 'launch_intent.gate_key');
-  if (typeof gateKey.origin_repo !== 'string' || gateKey.origin_repo.length === 0
-      || typeof gateKey.cmd_hash !== 'string' || !/^[0-9a-f]{64}$/.test(gateKey.cmd_hash)) {
-    throw new OracleRuntimeError('launch_intent.gate_key must contain an exact origin_repo and SHA-256 cmd_hash');
+  let gateKey = null;
+  if (artifact.gate_key !== null && artifact.gate_key !== undefined) {
+    gateKey = object(artifact.gate_key, 'launch_intent.gate_key');
+    if (typeof gateKey.origin_repo !== 'string' || gateKey.origin_repo.length === 0
+        || typeof gateKey.cmd_hash !== 'string' || !/^[0-9a-f]{64}$/.test(gateKey.cmd_hash)) {
+      throw new OracleRuntimeError('launch_intent.gate_key must contain an exact origin_repo and SHA-256 cmd_hash');
+    }
   }
   const mode = normalizeMode(policy.merge_gate);
   const strictMissing = isStrictMissing(mode, policy.fail_missing);
@@ -239,6 +242,19 @@ function verifyDiagnosis(findings, runId, step, evidence, key, tree, row) {
 export function evaluateO10(invocation) {
   const findings = new FindingCollector();
   const launch = readLaunchIntent(invocation.evidencePaths.launch_intent);
+  if (launch.gateKey === null) {
+    return {
+      result: 'NOT_EVALUABLE',
+      findings: [],
+      evidence: [writeEvidenceJson(invocation, 'o10-fmis-decision-table.json', {
+        schema_version: 1,
+        not_evaluable: true,
+        reason: 'launch_intent.gate_key is null: cannot establish the immutable launch suite key',
+        run_count: 0,
+        runs: [],
+      }, 'sqlite-events-launch-refs-ledger')],
+    };
+  }
   const refsBefore = readRefs(invocation.evidencePaths.refs_before, 'before');
   const refsAfter = readRefs(invocation.evidencePaths.refs_after, 'after');
   if (refsBefore.target_ref !== refsAfter.target_ref) throw new OracleRuntimeError('target ref identity changed between snapshots');

@@ -3,7 +3,7 @@ import path from 'node:path';
 
 import { pathIsWithin } from './paths.mjs';
 
-export const RESULT_EXIT_CODES = Object.freeze({ PASS: 0, FAIL: 1, ERROR: 2 });
+export const RESULT_EXIT_CODES = Object.freeze({ PASS: 0, FAIL: 1, ERROR: 2, NOT_EVALUABLE: 3 });
 
 function isObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -34,7 +34,7 @@ export function validateOracleResponse(response, oracleId, exitCode, evidenceDir
   }
   if (response.contract_version !== 1) errors.push('contract_version must be 1');
   if (response.oracle_id !== oracleId) errors.push('oracle_id does not match the invoked oracle');
-  if (!Object.hasOwn(RESULT_EXIT_CODES, response.result)) errors.push('result must be PASS, FAIL, or ERROR');
+  if (!Object.hasOwn(RESULT_EXIT_CODES, response.result)) errors.push('result must be PASS, FAIL, ERROR, or NOT_EVALUABLE');
   if (!isUtc(response.started_at)) errors.push('started_at must be a UTC ISO-8601 timestamp');
   if (!isUtc(response.finished_at)) errors.push('finished_at must be a UTC ISO-8601 timestamp');
   if (isUtc(response.started_at) && isUtc(response.finished_at) && response.finished_at < response.started_at) errors.push('finished_at must not precede started_at');
@@ -45,6 +45,7 @@ export function validateOracleResponse(response, oracleId, exitCode, evidenceDir
           || typeof finding.summary !== 'string' || finding.summary.length === 0) errors.push(`findings[${index}] must contain nonempty id and summary strings`);
     });
     if (response.result === 'PASS' && response.findings.length !== 0) errors.push('PASS must not contain findings');
+    if (response.result === 'NOT_EVALUABLE' && response.findings.length !== 0) errors.push('NOT_EVALUABLE must not contain findings');
     if (response.result === 'FAIL' && response.findings.length === 0) errors.push('FAIL must contain a finding');
   }
   if (!Array.isArray(response.evidence)) errors.push('evidence must be an array');

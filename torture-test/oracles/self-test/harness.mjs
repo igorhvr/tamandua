@@ -18,10 +18,10 @@ function parseArgs() {
   for (let index = 2; index < process.argv.length; index += 2) {
     const key = process.argv[index];
     const value = process.argv[index + 1];
-    if (!['--oracle', '--context', '--expected'].includes(key) || value === undefined) fail('usage: harness.mjs --oracle PATH --context PATH --expected PASS|FAIL');
+    if (!['--oracle', '--context', '--expected'].includes(key) || value === undefined) fail('usage: harness.mjs --oracle PATH --context PATH --expected PASS|FAIL|NOT_EVALUABLE');
     values[key.slice(2)] = value;
   }
-  if (Object.keys(values).length !== 3 || !['PASS', 'FAIL'].includes(values.expected)) fail('expected result must be PASS or FAIL');
+  if (Object.keys(values).length !== 3 || !['PASS', 'FAIL', 'NOT_EVALUABLE'].includes(values.expected)) fail('expected result must be PASS, FAIL, or NOT_EVALUABLE');
   return values;
 }
 

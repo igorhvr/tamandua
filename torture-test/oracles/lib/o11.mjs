@@ -53,16 +53,23 @@ function readDatabaseState(invocation) {
   const database = openEvidenceDatabase(invocation);
   try {
     requireColumns(database, 'runs', ['id', 'status', 'tokens_spent']);
-    requireColumns(database, 'steps', ['id', 'run_id', 'step_id', 'status', 'expects']);
+    requireColumns(database, 'steps', ['id', 'run_id', 'step_id', 'status', 'expects', 'type', 'loop_config']);
+    requireColumns(database, 'stories', ['id', 'run_id', 'status']);
     const runs = database.prepare('SELECT id, status, tokens_spent FROM runs ORDER BY id').all().map((row) => ({
       run_id: canonicalRunId(row.id), status: row.status, tokens_spent: integer(row.tokens_spent, `run ${row.id} tokens_spent`),
     }));
-    const steps = database.prepare('SELECT id, run_id, step_id, status, expects FROM steps ORDER BY run_id, id').all().map((row) => ({
+    const steps = database.prepare('SELECT id, run_id, step_id, status, expects, type, loop_config FROM steps ORDER BY run_id, id').all().map((row) => ({
       step_row_id: nonempty(row.id, 'steps.id'), run_id: canonicalRunId(row.run_id),
       step_id: nonempty(row.step_id, `step ${row.id}.step_id`), status: nonempty(row.status, `step ${row.id}.status`),
       expects_required: typeof row.expects === 'string' && row.expects.trim().length > 0,
+      type: typeof row.type === 'string' && row.type.length > 0 ? row.type : 'single',
+      loop_config: row.loop_config,
     }));
-    return { runs, steps };
+    const stories = database.prepare('SELECT id, run_id, status FROM stories ORDER BY run_id, id').all().map((row) => ({
+      story_row_id: nonempty(row.id, 'stories.id'), run_id: canonicalRunId(row.run_id),
+      status: nonempty(row.status, `story ${row.id}.status`),
+    }));
+    return { runs, steps, stories };
   } finally { database.close(); }
 }
 function projections(context) {
@@ -115,7 +122,7 @@ export function evaluateO11(invocation) {
   const deltaArtifact = readArtifact(invocation.evidencePaths.token_deltas, 'token_deltas');
   const usageArtifact = readArtifact(invocation.evidencePaths.round_usage, 'round_usage');
   if (!Array.isArray(usageArtifact.synthetic_ledger)) throw new OracleRuntimeError('round_usage.synthetic_ledger must be an array');
-  const outputContract = evaluateO11OutputContract(invocation, projected, databaseState.steps);
+  const outputContract = evaluateO11OutputContract(invocation, projected, databaseState.steps, databaseState.stories);
   for (const finding of outputContract.findings) {
     const { id, summary, ...details } = finding;
     findings.add(id, summary, details);

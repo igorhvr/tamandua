@@ -390,6 +390,7 @@ run_bounded "$O9_TIMEOUT_SECONDS" node --test --test-timeout=45000 "$TT_ROOT/bin
 run_bounded "$COMMAND_TIMEOUT_SECONDS" node --test --test-timeout=12000 "$SCRIPT_DIR/watchdog.test.mjs"
 run_bounded "$COMMAND_TIMEOUT_SECONDS" node "$SCRIPT_DIR/harness.mjs" --oracle "$workspace/oracle-pass" --context "$workspace/evidence/pass/context.json" --expected PASS
 run_bounded "$COMMAND_TIMEOUT_SECONDS" node "$SCRIPT_DIR/harness.mjs" --oracle "$workspace/oracle-fail" --context "$workspace/evidence/fail/context.json" --expected FAIL
+run_bounded "$COMMAND_TIMEOUT_SECONDS" node "$SCRIPT_DIR/harness.mjs" --oracle "$workspace/oracle-not-evaluable" --context "$workspace/evidence/not-evaluable/context.json" --expected NOT_EVALUABLE
 
 for fixture in "$workspace"/o1-*; do
   expected=$(run_bounded "$COMMAND_TIMEOUT_SECONDS" node -e 'const fs=require("node:fs"); process.stdout.write(JSON.parse(fs.readFileSync(process.argv[1],"utf8")).expected)' "$fixture/expectation.json")
@@ -450,5 +451,6 @@ printf 'O8 boundary-audit mutations PASS\n'
 printf 'O9 ledger-replay mutations PASS\n'
 printf 'O10 FMIS decision-table mutations PASS\n'
 printf 'O11 output-contract/token-attribution mutations PASS\n'
+printf 'NOT_EVALUABLE result vocabulary PASS\n'
 printf 'O2/O9/O11 hard-case calibration pack PASS\n'
 printf 'self-test harness PASS\n'

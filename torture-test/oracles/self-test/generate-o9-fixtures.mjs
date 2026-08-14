@@ -58,6 +58,9 @@ const CASES = [
   { name: 'o9-special-exit-origin-missing', expected: 'FAIL', mutation: 'special-exit-origin-missing', finding: 'O9_ORIGIN_IDENTITY_MISSING' },
   { name: 'o9-cross-origin-green', expected: 'PASS', mutation: 'cross-origin-green' },
   { name: 'o9-cross-origin-replay', expected: 'FAIL', mutation: 'cross-origin-replay', finding: 'O9_CROSS_ORIGIN_EVIDENCE' },
+  { name: 'o9-foreign-ledger-rows', expected: 'PASS', mutation: 'foreign-ledger', skippedRows: 1 },
+  { name: 'o9-empty-observations', expected: 'NOT_EVALUABLE', mutation: 'empty-observations' },
+  { name: 'o9-null-gate-key', expected: 'NOT_EVALUABLE', mutation: 'null-gate-key' },
 ];
 
 function run(command, args, cwd) {
@@ -167,9 +170,11 @@ for (const fixture of CASES) {
     );
   }
 
+  if (fixture.mutation === 'empty-observations') observations.splice(0);
+
   const singleflight = [];
   const specialExits = [];
-  const originIdentities = [{ origin_repo: ORIGIN, normalized_origin_repo: ORIGIN }];
+  const originIdentities = fixture.mutation === 'empty-observations' ? [] : [{ origin_repo: ORIGIN, normalized_origin_repo: ORIGIN }];
   const appendObservation = (invocationId, phase, observedAt, suiteKey, force, extra = {}) => {
     observations.push(observation(`obs-${observations.length + 1}`, invocationId, observations.length + 1, phase, observedAt, suiteKey, force, extra));
   };
@@ -286,6 +291,14 @@ for (const fixture of CASES) {
     addReplay('origin-b-replay', fixture.mutation === 'cross-origin-replay' ? 1 : 2, OTHER_ORIGIN, '2026-08-01T12:06:01.000Z');
   }
 
+  if (fixture.mutation === 'foreign-ledger') {
+    originIdentities.push({ origin_repo: OTHER_ORIGIN, normalized_origin_repo: OTHER_ORIGIN });
+    rows.push({
+      id: 2, origin_repo: OTHER_ORIGIN, tree_hash: 'f'.repeat(40), cmd_hash: OTHER_CMD_HASH, cmd_display: 'npm run test:other',
+      exit_code: 0, duration_ms: 1000, log_tail: null, run_id: RUN_ID, step_id: 'foreign-row', created_at: '2026-08-01T12:06:00.000Z',
+    });
+  }
+
   const databasePath = path.join(snapshots, 'database.sqlite');
   const database = new DatabaseSync(databasePath);
   database.exec(`CREATE TABLE suite_results (
@@ -305,10 +318,25 @@ for (const fixture of CASES) {
 
   const references = Object.fromEntries(REFERENCE_KEYS.map((name) => [name, null]));
   references.database_snapshot = reference(campaign, databasePath, 'sqlite-self-test');
+  const eventRows = fixture.mutation?.startsWith('cross-origin-')
+    ? [{
+      archive: 'all.jsonl', line: 1,
+      event: {
+        ts: CAPTURED_AT, event: 'suite.executed', runId: RUN_ID, stepId: 'origin-b',
+        originRepo: OTHER_ORIGIN, treeHash: committedTree, cmdHash: CMD_HASH, exitCode: 0, durationMs: 100, ledgerRowId: 2,
+      },
+    }]
+    : [];
   references.run_events = writeSnapshot(campaign, snapshots, 'run-events.json', {
-    schema_version: 1, captured_at: CAPTURED_AT, run_ids: [RUN_ID], rows: [],
+    schema_version: 1, captured_at: CAPTURED_AT, run_ids: [RUN_ID], rows: eventRows,
   }, 'self-test-events');
   references.git_bundle = reference(campaign, gitTar, 'git-common-dir-tar');
+  references.launch_intent = writeSnapshot(campaign, snapshots, 'launch-intent.json', {
+    schema_version: 1, captured_at: CAPTURED_AT,
+    policy: { merge_gate: 'green', fail_missing: null },
+    argv: ['workflow', 'run'],
+    gate_key: fixture.mutation === 'null-gate-key' ? null : { origin_repo: ORIGIN, cmd_hash: CMD_HASH },
+  }, 'controller-launch-intent');
   references.suite_ledger = writeSnapshot(campaign, snapshots, 'suite-ledger.json', {
     schema_version: 1, captured_at: CAPTURED_AT, rows,
   }, 'self-test-suite-ledger');

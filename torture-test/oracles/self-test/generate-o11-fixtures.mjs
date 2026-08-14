@@ -56,6 +56,13 @@ const CASES = [
   { name: 'o11-usage-outside-owner-window', expected: 'FAIL', outsideWindow: true, finding: 'O11_USAGE_OUTSIDE_RUN_WINDOW' },
   { name: 'o11-calibration-cross-charge', expected: 'FAIL', crossCharge: true, finding: 'O11_CROSS_CHARGE', calibration: true },
   { name: 'o11-scripted-ledger-mismatch', expected: 'FAIL', scripted: true, scriptedExpected: 50, finding: 'O11_SYNTHETIC_LEDGER_MISMATCH' },
+  { name: 'o11-loop-multiplicity-green', expected: 'PASS', loop: { doneStories: 3, loopTransitions: 4, verifyTransitions: 3 } },
+  { name: 'o11-loop-multiplicity-short', expected: 'FAIL', loop: { doneStories: 3, loopTransitions: 2, verifyTransitions: 3 }, finding: 'O11_DONE_WITHOUT_EXPECTS_SUCCESS' },
+  { name: 'o11-nonloop-done-duplicate', expected: 'FAIL', nonLoopDuplicate: true, finding: 'O11_DONE_WITHOUT_EXPECTS_SUCCESS' },
+  { name: 'o11-campaign7-w317a-loop-retry', expected: 'PASS', campaign7: { variant: 'w317a' } },
+  { name: 'o11-campaign7-w317b-loop-retry-rejection', expected: 'PASS', campaign7: { variant: 'w317b' } },
+  { name: 'o11-campaign7-w319-loop-retry-rejection', expected: 'PASS', campaign7: { variant: 'w319' } },
+  { name: 'o11-campaign7-nonloop-retry-seal', expected: 'FAIL', campaign7: { variant: 'nonloop' }, finding: 'O11_COMPLETED_FROM_RETRY_VERDICT' },
 ];
 
 function bare(runId) { return runId.slice(4); }
@@ -112,6 +119,15 @@ function outputContractEvidence(fixture) {
   }
   const validations = [producerAccepted, ...rejected, consumerAccepted]
     .filter((row) => !(fixture.invalidCompletion && row.id === 'validation-consumer-3'));
+  if (fixture.nonLoopDuplicate) {
+    validations.push({
+      id: 'validation-producer-2', observed_at: '2026-08-01T12:00:09.000Z',
+      run_id: RUN_A, step_row_id: 'row-producer', step_id: 'producer', claim_id: 'claim-producer-2',
+      attempt_number: 1, outcome: 'accepted', verdict: 'done', expects_required: true,
+      required_keys: ['STATUS', 'ARTIFACT'], missing_keys: [], invalid_keys: [], key_sources: [],
+      diagnostic_code: 'EXPECTS_SATISFIED', transition: { action: 'done', target_step_row_id: 'row-producer' },
+    });
+  }
   const rejections = rejected.map((row) => ({
     id: `rejection-${row.attempt_number}`, observed_at: row.observed_at, run_id: row.run_id,
     step_row_id: row.step_row_id, step_id: row.step_id, claim_id: row.claim_id,
@@ -132,6 +148,83 @@ function outputContractEvidence(fixture) {
     },
   ];
   return { validations, rejections, renderings };
+}
+
+// Loop-step evidence: one accepted done transition per story iteration for the
+// loop step and one per story verification for its verify_each decision step.
+function loopContractEvidence(fixture) {
+  const validations = [];
+  const emitTransitions = (stepRowId, stepId, count, name, secondOffset) => {
+    for (let index = 1; index <= count; index += 1) {
+      validations.push({
+        id: `validation-${name}-${index}`, observed_at: new Date(Date.UTC(2026, 7, 1, 12, 0, secondOffset + index)).toISOString(),
+        run_id: RUN_A, step_row_id: stepRowId, step_id: stepId, claim_id: `claim-${name}-${index}`,
+        attempt_number: 1, outcome: 'accepted', verdict: 'done', expects_required: true,
+        required_keys: ['STATUS', 'CHANGES', 'TESTS'], missing_keys: [], invalid_keys: [], key_sources: [],
+        diagnostic_code: 'EXPECTS_SATISFIED', transition: { action: 'done', target_step_row_id: stepRowId },
+      });
+    }
+  };
+  emitTransitions('row-loop', 'implement', fixture.loop.loopTransitions, 'loop', 10);
+  emitTransitions('row-verify', 'verify', fixture.loop.verifyTransitions, 'verify', 30);
+  return { validations, rejections: [], renderings: [] };
+}
+
+// Campaign #7-shaped evidence (W3.17a/b marathon-natural/chaos, W3.19
+// pause-drain): anonymized replicas of the real expects-validations.json and
+// submit-rejections.json row shapes kept under campaign-20260813T123604986Z
+// snapshots. implement is a story loop whose verify_each decision step
+// verdicts STATUS: retry for a story-reset re-dispatch — the accepted retry
+// verdict carries transition.action 'done' targeting the decision step itself,
+// which is exactly the by-design shape this oracle leg must exempt.
+function campaign7ContractEvidence(fixture) {
+  const variant = fixture.campaign7.variant;
+  const loopTransitions = variant === 'w319' ? 3 : 4; // W3.19: 3 implement done; W3.17a/b: 4
+  const retryAttempt = variant === 'w319' ? 1 : 2; // W3.19 verdicts retry at attempt 1; W3.17a/b at 2
+  const validations = [];
+  const rejections = [];
+  let second = 1;
+  const emit = (id, stepRowId, stepId, claimId, attemptNumber, outcome, verdict, missingKeys, diagnostic, action) => {
+    second += 1;
+    const observedAt = new Date(Date.UTC(2026, 7, 1, 12, 0, second)).toISOString();
+    validations.push({
+      id, observed_at: observedAt, run_id: RUN_A, step_row_id: stepRowId, step_id: stepId, claim_id: claimId,
+      attempt_number: attemptNumber, outcome, verdict, expects_required: true,
+      required_keys: outcome === 'rejected' ? ['STATUS'] : [], missing_keys: missingKeys, invalid_keys: [],
+      key_sources: outcome === 'rejected' ? [{ key: 'STATUS', producer_step_row_id: null }] : [],
+      diagnostic_code: diagnostic, transition: { action, target_step_row_id: stepRowId },
+    });
+    if (outcome === 'rejected') {
+      rejections.push({
+        id: `rejection-${claimId}-${attemptNumber}`, observed_at: observedAt, run_id: RUN_A, step_row_id: stepRowId,
+        step_id: stepId, claim_id: claimId, attempt_number: attemptNumber, validation_code: 'EXPECTS_REJECTED',
+        missing_keys: missingKeys, invalid_keys: [], diagnostic_code: diagnostic,
+      });
+    }
+  };
+  const done = (id, stepRowId, stepId, claimId, attemptNumber) => {
+    emit(`validation-${id}`, stepRowId, stepId, claimId, attemptNumber, 'accepted', 'done', [], 'EXPECTS_SATISFIED', 'done');
+  };
+  done('plan-1', 'row-plan', 'plan', 'claim-plan', 1);
+  done('setup-1', 'row-setup', 'setup', 'claim-setup', 1);
+  for (let attempt = 1; attempt <= loopTransitions; attempt += 1) {
+    done(`implement-${attempt}`, 'row-implement', 'implement', 'claim-implement', attempt);
+  }
+  for (let attempt = 1; attempt <= loopTransitions; attempt += 1) {
+    if (attempt === retryAttempt) {
+      emit(`validation-verify-${attempt}`, 'row-verify', 'verify', 'claim-verify', attempt, 'accepted', 'retry', [], 'EXPECTS_SATISFIED', 'done');
+    } else {
+      done(`verify-${attempt}`, 'row-verify', 'verify', 'claim-verify', attempt);
+    }
+  }
+  if (variant === 'w317b' || variant === 'w319') {
+    emit('validation-test-1', 'row-test', 'test', 'claim-test', 1, 'rejected', null, ['STATUS'], 'EXPECTS_MISSING_STATUS', 'retry');
+    done('test-2', 'row-test', 'test', 'claim-test', 2);
+  } else {
+    done('test-1', 'row-test', 'test', 'claim-test', 1);
+  }
+  done('merge-1', 'row-merge', 'finalize_merge', 'claim-merge', 1);
+  return { validations, rejections, renderings: [] };
 }
 
 for (const fixture of CASES) {
@@ -164,15 +257,42 @@ for (const fixture of CASES) {
   const sumA = events.filter((row) => row.event.runId === RUN_A).reduce((sum, row) => sum + row.event.tokenDelta, 0);
   const sumB = events.filter((row) => row.event.runId === RUN_B).reduce((sum, row) => sum + row.event.tokenDelta, 0);
   const storedA = fixture.storedA ?? sumA;
-  const outputContract = outputContractEvidence(fixture);
+  const outputContract = fixture.campaign7 ? campaign7ContractEvidence(fixture) : (fixture.loop ? loopContractEvidence(fixture) : outputContractEvidence(fixture));
   const databasePath = path.join(snapshots, 'database.sqlite');
   const database = new DatabaseSync(databasePath);
-  database.exec('CREATE TABLE runs (id TEXT PRIMARY KEY, status TEXT NOT NULL, tokens_spent INTEGER NOT NULL); CREATE TABLE steps (id TEXT PRIMARY KEY, run_id TEXT NOT NULL, step_id TEXT NOT NULL, status TEXT NOT NULL, expects TEXT NOT NULL); CREATE TABLE tamandua_stats (id INTEGER PRIMARY KEY, system_tokens_spent INTEGER NOT NULL);');
+  database.exec(`CREATE TABLE runs (id TEXT PRIMARY KEY, status TEXT NOT NULL, tokens_spent INTEGER NOT NULL);
+    CREATE TABLE steps (id TEXT PRIMARY KEY, run_id TEXT NOT NULL, step_id TEXT NOT NULL, status TEXT NOT NULL, expects TEXT NOT NULL, type TEXT NOT NULL DEFAULT 'single', loop_config TEXT);
+    CREATE TABLE stories (id TEXT PRIMARY KEY, run_id TEXT NOT NULL, status TEXT NOT NULL);
+    CREATE TABLE tamandua_stats (id INTEGER PRIMARY KEY, system_tokens_spent INTEGER NOT NULL);`);
+  const insertStep = database.prepare('INSERT INTO steps (id, run_id, step_id, status, expects, type, loop_config) VALUES (?, ?, ?, ?, ?, ?, ?)');
   database.prepare('INSERT INTO runs VALUES (?, ?, ?)').run(bare(RUN_A), 'completed', storedA);
   database.prepare('INSERT INTO runs VALUES (?, ?, ?)').run(bare(RUN_B), 'failed', sumB);
-  database.prepare('INSERT INTO steps VALUES (?, ?, ?, ?, ?)').run('row-producer', bare(RUN_A), 'producer', 'done', 'STATUS: done\nARTIFACT:');
-  database.prepare('INSERT INTO steps VALUES (?, ?, ?, ?, ?)').run('row-consumer', bare(RUN_A), 'consumer', 'done', 'STATUS: done\nCHANGES:\nTESTS:');
-  database.prepare('INSERT INTO steps VALUES (?, ?, ?, ?, ?)').run('row-failed', bare(RUN_B), 'consumer', 'failed', 'STATUS: done');
+  if (fixture.loop) {
+    insertStep.run('row-loop', bare(RUN_A), 'implement', 'done', 'STATUS: done\nCHANGES:\nTESTS:', 'loop', JSON.stringify({ over: 'stories', verify_each: true, verify_step: 'verify' }));
+    insertStep.run('row-verify', bare(RUN_A), 'verify', 'done', 'STATUS: done\nVERIFIED:', 'single', null);
+    const insertStory = database.prepare('INSERT INTO stories (id, run_id, status) VALUES (?, ?, ?)');
+    for (let story = 1; story <= fixture.loop.doneStories; story += 1) insertStory.run(`story-${story}`, bare(RUN_A), 'done');
+  } else if (fixture.campaign7) {
+    // Campaign #7 replicas: the identical step/validation/rejection evidence
+    // as W3.17a/b and W3.19 — only the implement step type differs between
+    // the loop variants and the nonloop seal fixture (which must keep the
+    // strict retry seal and FAIL).
+    const isLoop = fixture.campaign7.variant !== 'nonloop';
+    insertStep.run('row-plan', bare(RUN_A), 'plan', 'done', 'STATUS: done\nPLAN:', 'single', null);
+    insertStep.run('row-setup', bare(RUN_A), 'setup', 'done', 'STATUS: done\nREADY:', 'single', null);
+    insertStep.run('row-implement', bare(RUN_A), 'implement', 'done', 'STATUS: done\nCHANGES:\nTESTS:', isLoop ? 'loop' : 'single',
+      isLoop ? JSON.stringify({ over: 'stories', completion: 'all_done', fresh_session: true, verify_each: true, verify_step: 'verify' }) : null);
+    insertStep.run('row-verify', bare(RUN_A), 'verify', 'done', 'STATUS: done\nVERIFIED:', 'single', null);
+    insertStep.run('row-test', bare(RUN_A), 'test', 'done', 'STATUS: done\nTESTED:', 'single', null);
+    insertStep.run('row-merge', bare(RUN_A), 'finalize_merge', 'done', 'STATUS: done\nMERGED:', 'single', null);
+    const insertStory = database.prepare('INSERT INTO stories (id, run_id, status) VALUES (?, ?, ?)');
+    const doneStories = fixture.campaign7.variant === 'w319' ? 2 : 3;
+    for (let story = 1; story <= doneStories; story += 1) insertStory.run(`story-${story}`, bare(RUN_A), 'done');
+  } else {
+    insertStep.run('row-producer', bare(RUN_A), 'producer', 'done', 'STATUS: done\nARTIFACT:', 'single', null);
+    insertStep.run('row-consumer', bare(RUN_A), 'consumer', 'done', 'STATUS: done\nCHANGES:\nTESTS:', 'single', null);
+  }
+  insertStep.run('row-failed', bare(RUN_B), 'consumer', 'failed', 'STATUS: done', 'single', null);
   database.prepare('INSERT INTO tamandua_stats VALUES (1, 0)').run();
   database.close();
   fs.chmodSync(databasePath, 0o400);

@@ -109,18 +109,41 @@ root-attempt run ID, or `null` for a case without one. SQLite
 projection; all timestamps presented to an oracle are canonical.
 
 `o1_wave` is a deterministic campaign-ledger projection used by O1's anti-gaming leg.
-It contains the current wave number; exactly one duration-floor row per launched workflow
-family (`workflow`, positive nullable `duration_floor_ms`, `source`, and
+It contains the current wave number; one duration-floor row per launched case
+(`workflow`, `case_id`, positive nullable `duration_floor_ms`, `source`, and
 `sample_size`); and every launched root/discovered run in that wave (`case_id`,
 `run_id`, workflow, start/terminal timestamps and status, and the manifest boolean
-`expected_fast_failure`). `source=w1-median` is computed from terminal, non-fast-failure
-Wave-1 attempts for that workflow family. If none exist, the controller uses the
-manifest's mechanically pinned `production_duration_floor_ms` and records
-`source=production-median`; no unique fallback is recorded as `unavailable` and O1
-fails closed for a launched family. `expected_fast_failure` defaults false and is the
-only exclusion from the wave-rate denominator. O1 fails closed if a launched family
-has no floor row or duplicate rows, or if a floor names a family absent from the wave's
-launched runs. For the current case, O1 reconciles the wave projection against every
+`expected_fast_failure`). When a case's manifest pins `production_duration_floor_ms > 0`,
+that pin is the case's own floor and is recorded as `source=production-median`;
+distinct pins across cases of one workflow family are per-case floors and are never
+deduplicated. For cases without a pin, `source=w1-median` is computed from terminal,
+non-fast-failure Wave-1 attempts for that workflow family; only attempts with
+`terminal_status === 'completed'` enter the calibration sample (canceled and
+runaway attempts never skew the median), the run under judgment (the case's own
+latest attempt run) never contributes to its own calibration sample, and
+`sample_size` counts the filtered sample. O1 suppresses the
+`O1_DURATION_FLOOR_RATE` family finding when the wave's eligible family run count
+is below 4 (the observation still records `run_count`/`fast_run_count`). If no
+fallback exists the
+row records `duration_floor_ms: null` with `source=unavailable` and O1 fails closed
+for the case. Legacy family-wide floor rows without `case_id` remain accepted for
+replay of older evidence and apply to every launched case of the workflow that lacks
+its own per-case row. `expected_fast_failure` defaults false and is the
+only exclusion from the wave-rate denominator. O1 fails closed if a launched case
+has no floor row or duplicate rows for the same case (distinct per-case floors in one
+family are never duplicates), or if a floor names a family absent from the wave's
+launched runs; each run is judged against its own case's floor. Family-level
+`O1_DURATION_FLOOR_*` findings describe the wave family as a whole, not one case:
+they appear in the result of exactly one deterministic reporter case per wave —
+the wave case whose `case_id` comes first in `campaign.manifest.case_ids` order —
+and every other wave case excludes them from `result.findings`. The
+`duration_floor_observations` evidence is still written for every case
+(campaign-wide data); only the findings list is deduplicated. A case result may
+only fail on findings whose details cite one of its own runs (run-scoped findings
+such as `O1_DB_RUN_MISSING`/`O1_WAVE_RUN_MISSING`) plus the family findings when it
+is the reporter; wave-level citations of a sibling case's run are the sibling's
+failure, not this case's. For the current case,
+O1 reconciles the wave projection against every
 non-null root attempt and discovered run in the context and fails if any launched run
 is absent, duplicated, or if a current-case wave row names an unknown run. Run IDs are
 campaign-global, so duplicate rows are rejected even when they carry different case IDs.
@@ -198,7 +221,7 @@ execution as `TEST_INFRA`.
 | `database_snapshot` | Consistent read-only TT `tamandua.db` backup after terminal harvest; includes runs, steps, stories, suite ledger, and stats tables. |
 | `run_events` | Run/case-scoped event rows copied from the contained TT event files and archives, with archive name and line number. |
 | `workflow_status` | Timestamped `workflow status --json` observations projected onto mechanical status/display fields. |
-| `launch_intent` | Pre-launch manifest policy, exact `merge_gate`/`fail_missing` argv, SHA-256 of the full workflow argv, prose-free argv projection, harness, fixture/repository identity, launch timestamp, and nullable immutable `gate_key` (`origin_repo` plus SHA-256 `cmd_hash` of the exact manifest `test_cmd_raw`/`test_cmd` bytes); captured before spawn. O2 requires a non-null gate key. |
+| `launch_intent` | Pre-launch manifest policy, exact `merge_gate`/`fail_missing` argv, SHA-256 of the full workflow argv, prose-free argv projection, harness, fixture/repository identity, launch timestamp, and nullable immutable `gate_key` (`origin_repo` plus SHA-256 `cmd_hash` of the exact manifest `test_cmd_raw`/`test_cmd` bytes); captured before spawn. O2 and O10 require a non-null gate key and report `NOT_EVALUABLE` (never `ORACLE_RUNTIME_ERROR`) when it is null; O9 uses the gate origin plus the case's event-carried origins to scope its ledger bundle. |
 | `git_bundle` | Campaign-contained git-common-dir tar snapshot sufficient for offline commit/tree/ancestry/patch-id plumbing, including unreachable retained test commits; refs artifacts name its captured origin identity. |
 | `refs_before` | Pre-launch target tip and `for-each-ref` snapshot. |
 | `refs_after` | Terminal target tip and `for-each-ref` snapshot. |
@@ -243,7 +266,7 @@ through `oracleMain`. The shared runtime is the canonical implementation of argv
 environment identity checks, context/reference validation, SHA-256 verification,
 contained path resolution, read-only `node:sqlite` access, shell-free contained git
 plumbing, deterministic finding aggregation, exclusive evidence creation, output
-validation, and PASS/FAIL/ERROR exit mapping.
+validation, and PASS/FAIL/ERROR/NOT_EVALUABLE exit mapping.
 
 The runtime locates the campaign results directory by walking upward from the absolute
 context path to the first directory containing the controller's regular non-symlink
@@ -254,7 +277,7 @@ relative to `TT_ORACLE_EVIDENCE_DIR` and are opened with exclusive-create and
 no-follow semantics.
 
 Mutation fixtures use `oracles/self-test/harness.mjs --oracle <executable> --context
-<context.json> --expected PASS|FAIL`. The harness applies this contract to both stdout
+<context.json> --expected PASS|FAIL|NOT_EVALUABLE`. The harness applies this contract to both stdout
 and exit status and fails on either mismatch direction. `oracles/self-test/run.sh`
 creates one unique `torture-test/var/oracle-self-test.*` workspace and its cleanup trap
 refuses to remove any path outside that namespace.
@@ -358,7 +381,12 @@ added by the O2 mode-reconciliation layer; these core identity checks remain eng
 for every mode.
 
 The O2 mode-reconciliation layer binds its exact suite key to
-`launch_intent.gate_key` and the mechanically attested merged tree. Ordinary
+`launch_intent.gate_key` and the mechanically attested merged tree. A null
+`launch_intent.gate_key` is degraded evidence: O2 reports `NOT_EVALUABLE` with a
+recorded reason instead of throwing. The `suite_ledger`/`suite_results`
+reconcile is scoped to the case bundle — the gate-key origin plus origins
+carried by the case's own captured run events — so rows of sibling cases that
+share a command hash or tree cannot contaminate it. Ordinary
 landings require at least one captured `suite_results` row for that exact
 `(origin_repo, merged_tree, cmd_hash)` key. A default concession instead requires
 exactly one matching `merge.landed_without_suite_evidence` event, no exact-key
@@ -386,7 +414,11 @@ global, and system config and replacement objects while evaluating the snapshot.
 O8 treats `case.boundary_files` as the per-merge expected-file declaration. A changed
 path that existed at baseline must match that declaration. A new path must match it or
 be mechanically recognized as a test path (a `test`, `tests`, or `__tests__` directory,
-not merely a test/spec filename outside such a directory). This bidirectional inventory reconciliation is the expected-file
+not merely a test/spec filename outside such a directory). Declarations are authored
+fixture-source-relative and are rebased to the work-clone root (`fixtures-src/<fixture>/`
+prefix stripped) before matching; a declaration equal to the bare fixture root itself
+(`fixtures-src/<fixture>` with no trailing slash) scopes the ENTIRE provisioned fixture
+tree and matches every work-clone path. This bidirectional inventory reconciliation is the expected-file
 leg; the transport-artifact denylist is an independent leg and still applies inside an
 allowed boundary.
 
@@ -409,7 +441,16 @@ and story input/output transport files.
 ### O9 ledger-key and replay interpretation
 
 O9 reconciles the captured `suite_ledger.rows` byte-for-field with a read-only query of
-`suite_results`; artifact rows are ordered by positive `id`. Every row's `tree_hash`
+`suite_results`; artifact rows are ordered by positive `id`. Both sides of the
+reconcile are scoped to the case bundle: the `launch_intent.gate_key.origin_repo`
+plus origins carried by the case's own captured run events. Ledger rows whose
+origin falls outside that bundle are foreign evidence — legacy snapshot
+contamination from sibling cases — and are SKIPPED: excluded from the DB
+reconcile and tree resolution and annotated in the `o9-ledger-replay-audit.json`
+evidence as `skipped_foreign_rows` (count) and `skipped_foreign_row_ids` (row
+ids), never fatal. A null gate key that leaves no event-carried origin (an
+empty case bundle) is degraded evidence and reports `NOT_EVALUABLE`. Every
+in-scope row's `tree_hash`
 must be a tree object used by a reachable commit in the isolated captured Git snapshot.
 An object that exists but is not a captured committed tree is not reusable evidence.
 
@@ -494,16 +535,37 @@ the observed would-run result. Single-flight ownership/recovery, special exits, 
 probes, and cross-origin separation are enforced by the additional arrays without
 weakening these key/replay checks. The controller preserves same-command rows from all
 captured origins, so O9 can reconcile each normalized origin against the read-only DB
-and detect an otherwise plausible cross-repository replay.
+and detect an otherwise plausible cross-repository replay. An empty
+`suite_observations.rows` artifact (no shim evidence for the case bundle) is
+degraded evidence: O9 reports `NOT_EVALUABLE` with a recorded reason instead of
+throwing.
 
 ### O11 token-attribution interpretation
 
-O11's output-contract leg reads the terminal `steps` rows and three controller-authored
-structured event projections. It never reads `steps.output`, a submitted body, a rendered
-prompt, stderr, or agent prose. Every terminal `status=done` step in the captured root/
-discovered run graph must have exactly one accepted expects-validation row whose verdict
-and transition are both `done` for that same database step row. A completed run containing
-an accepted `retry` verdict is a finding; retry is a lifecycle transition, not completion.
+O11's output-contract leg reads the terminal `steps` rows (including `type` and
+`loop_config`), the terminal `stories` rows, and three controller-authored
+structured event projections. It never reads `steps.output`, a submitted body, a
+rendered prompt, stderr, or agent prose. Every terminal `status=done` step in the
+captured root/discovered run graph must have exactly one accepted
+expects-validation row whose verdict and transition are both `done` for that same
+database step row. The loop exception: a step whose `type` is `loop` transitions
+done once per story iteration, and its `verify_each` decision step (the same-run
+step whose `step_id` equals the loop step's `loop_config.verify_step`, both
+snake_case and camelCase spellings accepted) once per story verification. Those
+steps require at least `max(1, done_stories_for_run)` accepted done transitions —
+matching the run's terminal stories with `status='done'` — instead of exactly one;
+all non-loop steps keep the strict exactly-one rule. A loop step's `loop_config`
+must be a parseable object (fail closed, like every other malformed input). A
+completed run containing an accepted `retry` verdict is a finding; retry is a
+lifecycle transition, not completion. The loop-retry exemption: on a loop step
+or its `verify_each` decision step an accepted `retry` verdict is the
+story-reset re-dispatch — the agent verdicts retry and the scheduler
+re-dispatches a fresh session for the same story — and is by design, not a
+finding (campaign #7's marathon/pause-drain verdicts, e.g. a verify retry
+whose `transition.action` is `done` targeting the decision step itself, are
+the pinned shape). Every other step keeps the strict retry seal: a completed
+run carrying an accepted retry verdict on any non-loop step is still
+`O11_COMPLETED_FROM_RETRY_VERDICT`.
 
 `expects_validations.rows` is ordered mechanical validation evidence emitted by the real
 `tamandua step complete` validator after its lifecycle transition returns. Each row contains a
@@ -581,7 +643,9 @@ required O11 artifacts and are independent of this token-attribution layer.
 ### O10 FMIS decision-table interpretation
 
 O10 evaluates each projected merge run against the immutable `launch_intent.policy`
-and `launch_intent.gate_key`. The four policy rows are `off`, default, default with
+and `launch_intent.gate_key`. A null `launch_intent.gate_key` is degraded
+evidence: O10 reports `NOT_EVALUABLE` with a recorded reason instead of
+throwing. The four policy rows are `off`, default, default with
 strict missing, and `green`. Strict missing is active for green mode or when the
 launch-time `fail_missing` value is a string equal to `1`, `true`, or `on`
 case-insensitively. The value is deliberately not trimmed and non-string truthy values
@@ -659,11 +723,11 @@ Required field rules:
 
 - `contract_version` is the integer `1`.
 - `oracle_id` exactly matches `TT_ORACLE_ID`.
-- `result` is one of `PASS`, `FAIL`, or `ERROR`.
+- `result` is one of `PASS`, `FAIL`, `ERROR`, or `NOT_EVALUABLE`.
 - `started_at` and `finished_at` are canonical UTC ISO-8601 timestamps;
   `finished_at` must not precede `started_at`.
 - `findings` is an array. Every finding has nonempty string fields `id` and
-  `summary`. `PASS` has no findings; `FAIL` has at least one. Additional
+  `summary`. `PASS` and `NOT_EVALUABLE` have no findings; `FAIL` has at least one. Additional
   mechanical fields such as `severity`, `expected`, and `observed` are allowed.
 - `evidence` is an array of objects with a nonempty `kind` and a relative `path`.
   Each path is resolved beneath `TT_ORACLE_EVIDENCE_DIR` and must name an existing
@@ -688,6 +752,7 @@ The JSON result and process exit status must agree:
 | `PASS` | 0 | Applicable checks are mechanically green. |
 | `FAIL` | 1 | A mechanical product finding was observed. |
 | `ERROR` | 2 | The oracle could not make a valid observation. |
+| `NOT_EVALUABLE` | 3 | Degraded evidence prevents a valid mechanical observation. |
 
 Any other exit status, signal, timeout, malformed JSON, schema violation, missing
 evidence file, or result/exit contradiction is persisted as `TEST_INFRA` oracle
@@ -696,6 +761,32 @@ evidence. The controller does not guess a result from partial output. A validate
 `TEST_INFRA_FAIL`. An absent hook remains an explicit `ORACLE_MISSING` record so
 campaign classification/reporting can distinguish an unavailable battery from a
 hook that executed incorrectly.
+
+## NOT_EVALUABLE and degraded evidence
+
+`NOT_EVALUABLE` is the contract-version-1 result vocabulary for **degraded
+evidence**: the oracle ran cleanly and its logic is sound, but a required
+mechanical evidence leg is missing, degraded, or outside the contract-version-1
+shape, so no valid product verdict can be derived. It is an informative verdict,
+not a crash: it carries an empty `findings` array (no product finding is
+attributed) and exit status 3, which is distinct from both `FAIL` (a real
+mechanical product finding) and `ERROR` (the oracle itself failed).
+
+Oracles MUST tolerate degraded inputs that older captures legitimately contain
+and report `NOT_EVALUABLE` (or a `SKIP` annotation in evidence) instead of
+throwing `ORACLE_RUNTIME_ERROR`. The canonical example is a null
+`launch_intent.gate_key` (contract-version-1 declares the gate key nullable:
+`origin_repo` plus `cmd_hash` present only when the manifest pinned
+a `test_cmd_raw`/`test_cmd`), which campaign capture now prevents going forward
+but legacy snapshots may still carry. A gate-key-gated oracle (O2, O9, O10) that
+cannot establish its launch identity from a null or missing gate key must
+conclude `NOT_EVALUABLE`, never an exception. Evidence rows whose origin falls
+outside the case bundle are likewise skipped/annotated, not fatal.
+
+Controller-side consumption of the new result (attempt classification and
+gate accounting for validated `NOT_EVALUABLE`) is owned by `bin/tt-controller`
+and is outside this contract's shared-runtime scope; the oracles and the
+self-test harness above are the complete version-1 emitter side.
 
 ## Evidence durability
 

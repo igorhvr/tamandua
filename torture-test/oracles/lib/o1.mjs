@@ -14,6 +14,7 @@ const MAX_UNADMITTED_MS = 5 * 60 * 1000;
 const HEALTHY_STRAGGLER_POLICY = 'hermes-storm';
 const RECENT_ROUND_EVENT = 'run.tokens.updated';
 const MAX_FAST_RATE = 0.2;
+const MIN_FLOOR_RATE_SAMPLE = 4;
 
 function object(value, label) {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
@@ -181,58 +182,122 @@ function healthyStraggler(context, projected, runId, run, steps, events) {
   return recentTokenEvent(events, runId, run.workflow_id, captureMs, declared.recent_within_ms);
 }
 
+// Deterministic reporter for the campaign-wide (family-level) duration-floor
+// findings of a wave: the wave case whose case_id comes first in
+// campaign.manifest.case_ids order. Cases absent from the manifest order rank
+// deterministically after all manifest-ordered cases (localeCompare tiebreak),
+// so a single-case campaign or a wave with only one manifest case always
+// reports family findings from that case.
+function waveReporterCaseId(context) {
+  const wave = context.o1_wave;
+  const caseIds = new Set();
+  for (const run of wave.runs) caseIds.add(run.case_id);
+  for (const floor of wave.duration_floors) {
+    if (typeof floor.case_id === 'string' && floor.case_id.length > 0) caseIds.add(floor.case_id);
+  }
+  const manifestOrder = new Map(context.campaign.manifest.case_ids.map((id, index) => [id, index]));
+  const rank = (id) => (manifestOrder.has(id) ? manifestOrder.get(id) : Number.MAX_SAFE_INTEGER);
+  return [...caseIds].sort((left, right) => {
+    const byRank = rank(left) - rank(right);
+    return byRank !== 0 ? byRank : left.localeCompare(right);
+  })[0] ?? null;
+}
+
+function mergeFindings(target, source) {
+  for (const finding of source.toJSON()) {
+    const { id, summary, ...details } = finding;
+    target.add(id, summary, details);
+  }
+}
+
 function evaluateDurationFloor(findings, wave) {
   const observations = [];
   const launchedWorkflows = [...new Set(wave.runs.map((run) => run.workflow))].sort();
-  const floorsByWorkflow = new Map();
+  const perCaseRows = new Map();
+  const legacyRows = new Map();
   for (const floor of wave.duration_floors) {
-    const matching = floorsByWorkflow.get(floor.workflow) ?? [];
-    matching.push(floor);
-    floorsByWorkflow.set(floor.workflow, matching);
-  }
-  for (const workflow of [...floorsByWorkflow.keys()].sort()) {
-    if (!launchedWorkflows.includes(workflow)) {
-      findings.add('O1_DURATION_FLOOR_UNKNOWN', 'wave contains a duration floor for a workflow family that was not launched', {
-        wave: wave.wave, workflow,
-      });
+    if (typeof floor.case_id === 'string' && floor.case_id.length > 0) {
+      const rows = perCaseRows.get(floor.case_id) ?? [];
+      rows.push(floor);
+      perCaseRows.set(floor.case_id, rows);
+      if (!launchedWorkflows.includes(floor.workflow)) {
+        findings.add('O1_DURATION_FLOOR_UNKNOWN', 'wave contains a duration floor for a workflow family that was not launched', {
+          wave: wave.wave, workflow: floor.workflow, case_id: floor.case_id,
+        });
+      }
+    } else {
+      const rows = legacyRows.get(floor.workflow) ?? [];
+      rows.push(floor);
+      legacyRows.set(floor.workflow, rows);
+      if (!launchedWorkflows.includes(floor.workflow)) {
+        findings.add('O1_DURATION_FLOOR_UNKNOWN', 'wave contains a duration floor for a workflow family that was not launched', {
+          wave: wave.wave, workflow: floor.workflow,
+        });
+      }
     }
   }
   for (const workflow of launchedWorkflows) {
-    const floors = floorsByWorkflow.get(workflow) ?? [];
-    const eligible = wave.runs.filter((run) => run.workflow === workflow && !run.expected_fast_failure);
-    if (floors.length === 0) {
-      findings.add('O1_DURATION_FLOOR_MISSING', 'wave omits the duration floor row for a launched workflow family', {
-        wave: wave.wave, workflow,
-      });
-      observations.push({ workflow, duration_floor_ms: null, source: 'omitted', run_count: eligible.length, fast_run_count: null });
-      continue;
+    const familyRuns = wave.runs.filter((run) => run.workflow === workflow);
+    const eligible = familyRuns.filter((run) => !run.expected_fast_failure);
+    const legacy = legacyRows.get(workflow) ?? [];
+    const caseIds = [...new Set(eligible.map((run) => run.case_id))].sort();
+    const resolutions = [];
+    for (const caseId of caseIds) {
+      const own = (perCaseRows.get(caseId) ?? []).filter((floor) => floor.workflow === workflow);
+      const rows = own.length > 0 ? own : legacy;
+      if (rows.length === 0) {
+        findings.add('O1_DURATION_FLOOR_MISSING', 'wave omits the duration floor row for a launched workflow family', {
+          wave: wave.wave, workflow, case_id: caseId,
+        });
+        resolutions.push({ ok: false, source: 'omitted' });
+        continue;
+      }
+      if (rows.length > 1) {
+        findings.add('O1_DURATION_FLOOR_DUPLICATE', 'wave contains duplicate duration floor rows for a launched workflow family', {
+          wave: wave.wave, workflow, case_id: caseId, row_count: rows.length,
+        });
+        resolutions.push({ ok: false, source: 'duplicate' });
+        continue;
+      }
+      const [floor] = rows;
+      if (floor.duration_floor_ms === null) {
+        findings.add('O1_DURATION_FLOOR_MISSING', 'wave lacks a W1 or production duration floor for a launched workflow family', {
+          wave: wave.wave, workflow, case_id: caseId,
+        });
+        resolutions.push({ ok: false, source: floor.source });
+        continue;
+      }
+      resolutions.push({ ok: true, case_id: caseId, floor });
     }
-    if (floors.length > 1) {
-      findings.add('O1_DURATION_FLOOR_DUPLICATE', 'wave contains duplicate duration floor rows for a launched workflow family', {
-        wave: wave.wave, workflow, row_count: floors.length,
-      });
-      observations.push({ workflow, duration_floor_ms: null, source: 'duplicate', run_count: eligible.length, fast_run_count: null });
-      continue;
-    }
-    const [floor] = floors;
     if (eligible.length === 0) continue;
-    if (floor.duration_floor_ms === null) {
-      findings.add('O1_DURATION_FLOOR_MISSING', 'wave lacks a W1 or production duration floor for a launched workflow family', {
-        wave: wave.wave, workflow: floor.workflow,
+    const failure = resolutions.find((resolution) => !resolution.ok);
+    if (failure !== undefined) {
+      observations.push({
+        workflow,
+        duration_floor_ms: null,
+        source: failure.source,
+        run_count: eligible.length,
+        fast_run_count: null,
       });
-      observations.push({ workflow: floor.workflow, duration_floor_ms: null, source: floor.source, run_count: eligible.length, fast_run_count: null });
       continue;
     }
+    const floorByCase = new Map(resolutions.map((resolution) => [resolution.case_id, resolution.floor]));
     const fast = eligible.filter((run) => run.terminal_at !== null
       && timestamp(run.terminal_at, `o1_wave run ${run.run_id} terminal_at`)
-        - timestamp(run.started_at, `o1_wave run ${run.run_id} started_at`) < floor.duration_floor_ms);
+        - timestamp(run.started_at, `o1_wave run ${run.run_id} started_at`) < floorByCase.get(run.case_id).duration_floor_ms);
     const rate = fast.length / eligible.length;
-    if (rate > MAX_FAST_RATE) {
+    // A family rate finding is only meaningful with enough eligible runs:
+    // below the minimum sample the wave cannot distinguish a fast wave from
+    // noise, so the rate finding is suppressed (the observation is kept).
+    if (eligible.length >= MIN_FLOOR_RATE_SAMPLE && rate > MAX_FAST_RATE) {
       findings.add('O1_DURATION_FLOOR_RATE', 'more than 20% of a wave workflow family terminated below its measured duration floor', {
         wave: wave.wave,
-        workflow: floor.workflow,
-        duration_floor_ms: floor.duration_floor_ms,
-        source: floor.source,
+        workflow,
+        case_floors: resolutions.map((resolution) => ({
+          case_id: resolution.case_id,
+          duration_floor_ms: resolution.floor.duration_floor_ms,
+          source: resolution.floor.source,
+        })),
         run_count: eligible.length,
         fast_run_count: fast.length,
         fast_rate: rate,
@@ -240,9 +305,12 @@ function evaluateDurationFloor(findings, wave) {
       });
     }
     observations.push({
-      workflow: floor.workflow,
-      duration_floor_ms: floor.duration_floor_ms,
-      source: floor.source,
+      workflow,
+      case_floors: resolutions.map((resolution) => ({
+        case_id: resolution.case_id,
+        duration_floor_ms: resolution.floor.duration_floor_ms,
+        source: resolution.floor.source,
+      })),
       run_count: eligible.length,
       fast_run_count: fast.length,
       fast_rate: rate,
@@ -401,7 +469,17 @@ export function evaluateO1(invocation) {
   const observations = [];
   let stragglerCount = 0;
   evaluateWaveRunCoverage(findings, invocation.context);
-  const durationFloorObservations = evaluateDurationFloor(findings, invocation.context.o1_wave);
+  // Family-level duration-floor findings describe the whole wave family, not a
+  // single case: they are collected separately and reported exactly once, from
+  // the deterministic reporter case for the wave. The observations still land
+  // in every case's o1-terminal-state.json evidence (campaign-wide data); only
+  // the findings list is deduplicated.
+  const familyFindings = new FindingCollector();
+  const durationFloorObservations = evaluateDurationFloor(familyFindings, invocation.context.o1_wave);
+  const reporter = waveReporterCaseId(invocation.context);
+  if (reporter !== null && reporter === invocation.context.case.id) {
+    mergeFindings(findings, familyFindings);
+  }
   for (const [runId, projected] of [...uniqueContextRuns.entries()].sort(([left], [right]) => left.localeCompare(right))) {
     const dbId = databaseRunId(runId);
     const run = snapshot.runs.find((candidate) => candidate.id === dbId || canonicalRunId(candidate.id) === runId);
@@ -462,16 +540,33 @@ export function evaluateO1(invocation) {
     }
   }
 
+  // A case may only fail on findings that cite one of its own runs (run-scoped
+  // findings such as O1_DB_RUN_MISSING / O1_WAVE_RUN_MISSING), plus the family
+  // findings above when it is the wave reporter. Wave-level citations of a
+  // sibling case's run (e.g. a duplicated wave row owned by a sibling case)
+  // are the sibling's failure, not this case's. A run is this case's own when
+  // the context graph launches it, a wave row attributes it to this case, or
+  // this case's workflow-status evidence names it.
+  const ownRunIds = new Set(uniqueContextRuns.keys());
+  for (const row of invocation.context.o1_wave.runs) {
+    if (row.case_id === invocation.context.case.id) ownRunIds.add(canonicalRunId(row.run_id));
+  }
+  for (const runId of workflowRows.keys()) ownRunIds.add(runId);
+  const scopedFindings = findings.toJSON().filter((finding) => {
+    if (typeof finding.run_id !== 'string') return true;
+    return ownRunIds.has(canonicalRunId(finding.run_id));
+  });
+
   const evidence = [writeEvidenceJson(invocation, 'o1-terminal-state.json', {
     schema_version: 1,
     captured_at: new Date(workflow.capturedAt).toISOString(),
     runs: observations,
     duration_floor_observations: durationFloorObservations,
   }, 'sqlite-events-workflow-status')];
-  const result = findings.length === 0 ? 'PASS' : 'FAIL';
+  const result = scopedFindings.length === 0 ? 'PASS' : 'FAIL';
   return {
     result,
-    findings: findings.toJSON(),
+    findings: scopedFindings,
     evidence,
     classification: result === 'PASS' && stragglerCount > 0
       ? { ambiguous: { category: 'HEALTHY_STRAGGLER' } }

@@ -111,16 +111,25 @@ function validateAttempt(attempt, discovered = false) {
   return attempt.terminal_at === null || attempt.terminal_at >= attempt.started_at;
 }
 
+function validateDurationFloor(floor) {
+  const hasCaseId = Object.hasOwn(floor, 'case_id');
+  const keys = hasCaseId
+    ? ['workflow', 'case_id', 'duration_floor_ms', 'source', 'sample_size']
+    : ['workflow', 'duration_floor_ms', 'source', 'sample_size'];
+  return hasExactKeys(floor, keys)
+    && typeof floor.workflow === 'string' && floor.workflow.length > 0
+    && (!hasCaseId || (typeof floor.case_id === 'string' && floor.case_id.length > 0))
+    && (floor.duration_floor_ms === null || (Number.isFinite(floor.duration_floor_ms) && floor.duration_floor_ms > 0))
+    && ['w1-median', 'production-median', 'unavailable'].includes(floor.source)
+    && Number.isSafeInteger(floor.sample_size) && floor.sample_size >= 0;
+}
+
 function validateO1Wave(wave) {
   return hasExactKeys(wave, ['schema_version', 'wave', 'duration_floors', 'runs'])
     && wave.schema_version === 1
     && Number.isSafeInteger(wave.wave) && wave.wave >= 0
     && Array.isArray(wave.duration_floors)
-    && wave.duration_floors.every((floor) => hasExactKeys(floor, ['workflow', 'duration_floor_ms', 'source', 'sample_size'])
-      && typeof floor.workflow === 'string' && floor.workflow.length > 0
-      && (floor.duration_floor_ms === null || (Number.isFinite(floor.duration_floor_ms) && floor.duration_floor_ms > 0))
-      && ['w1-median', 'production-median', 'unavailable'].includes(floor.source)
-      && Number.isSafeInteger(floor.sample_size) && floor.sample_size >= 0)
+    && wave.duration_floors.every(validateDurationFloor)
     && Array.isArray(wave.runs)
     && wave.runs.every((run) => hasExactKeys(run, ['case_id', 'run_id', 'workflow', 'started_at', 'terminal_at', 'terminal_status', 'expected_fast_failure'])
       && ['case_id', 'run_id', 'workflow'].every((key) => typeof run[key] === 'string' && run[key].length > 0)

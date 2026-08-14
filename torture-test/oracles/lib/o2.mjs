@@ -109,6 +109,9 @@ function readLaunchIntent(file) {
   const artifact = readJson(file, 'launch_intent');
   if (artifact.schema_version !== 1) throw new OracleRuntimeError('launch_intent.schema_version must be 1');
   const policy = object(artifact.policy, 'launch_intent.policy');
+  if (artifact.gate_key === null || artifact.gate_key === undefined) {
+    return { policy, gate_key: null, argv: array(artifact.argv, 'launch_intent.argv') };
+  }
   const gateKey = object(artifact.gate_key, 'launch_intent.gate_key');
   if (typeof gateKey.origin_repo !== 'string' || gateKey.origin_repo.length === 0) {
     throw new OracleRuntimeError('launch_intent.gate_key.origin_repo must be nonempty');
@@ -350,6 +353,18 @@ function add(findings, id, summary, runId, details = {}) {
 
 export function evaluateO2(invocation) {
   const findings = new FindingCollector();
+  const launchIntent = readLaunchIntent(invocation.evidencePaths.launch_intent);
+  if (launchIntent.gate_key === null) {
+    return {
+      result: 'NOT_EVALUABLE',
+      findings: [],
+      evidence: [writeEvidenceJson(invocation, 'o2-merge-truth.json', {
+        schema_version: 1,
+        not_evaluable: true,
+        reason: 'launch_intent.gate_key is null: cannot establish the immutable launch suite key',
+      }, 'sqlite-events-git-plumbing')],
+    };
+  }
   const before = readRefs(invocation.evidencePaths.refs_before, 'before');
   const after = readRefs(invocation.evidencePaths.refs_after, 'after');
   const reflog = readReflog(invocation.evidencePaths.target_reflog);
@@ -362,19 +377,25 @@ export function evaluateO2(invocation) {
 
   const databaseEvidence = readRuns(invocation);
   const runs = databaseEvidence.runs;
-  const suiteRows = readSuiteLedger(invocation.evidencePaths.suite_ledger);
-  if (!sameSuiteRows(databaseEvidence.suiteRows, suiteRows)) {
+  const mechanicalEvents = readEvents(invocation.evidencePaths.run_events)
+    .map((event, index) => mechanicalEvent(event, index));
+  const caseBundle = new Set([launchIntent.gate_key.origin_repo]);
+  for (const event of mechanicalEvents) {
+    const origin = event.originRepo ?? event.origin;
+    if (typeof origin === 'string' && origin.length > 0) caseBundle.add(origin);
+  }
+  const suiteRows = readSuiteLedger(invocation.evidencePaths.suite_ledger)
+    .filter((row) => caseBundle.has(row.origin_repo));
+  const bundleDatabaseSuiteRows = databaseEvidence.suiteRows.filter((row) => caseBundle.has(row.origin_repo));
+  if (!sameSuiteRows(bundleDatabaseSuiteRows, suiteRows)) {
     throw new OracleRuntimeError('suite_ledger rows do not reconcile with the read-only database snapshot');
   }
-  const launchIntent = readLaunchIntent(invocation.evidencePaths.launch_intent);
   const runIds = new Set([
     ...invocation.context.attempts.map((attempt) => attempt.run_id),
     ...invocation.context.discovered_runs.map((run) => run.run_id),
   ].filter(Boolean).map(canonicalRunId));
   const mergeRuns = runs.filter((run) => runIds.has(run.run_id) && run.workflow_id.includes('-merge'));
   if (mergeRuns.length === 0) throw new OracleRuntimeError('O2 context contains no merge-family run in the database snapshot');
-  const mechanicalEvents = readEvents(invocation.evidencePaths.run_events)
-    .map((event, index) => mechanicalEvent(event, index));
   const events = mechanicalEvents.filter((event) => eventName(event) === 'merge.landed')
     .map((event) => eventShape(event, event.index));
   const provenanceEvents = mechanicalEvents.filter((event) => [

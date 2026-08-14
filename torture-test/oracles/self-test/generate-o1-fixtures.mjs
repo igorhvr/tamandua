@@ -91,11 +91,14 @@ function attempt(id, status, steps) {
 const cases = [
   { name: 'o1-green', expected: 'PASS', childStatus: 'failed', childStepStatus: 'running', childStepType: 'loop', historicalAttempt: true },
   { name: 'o1-fast-wave', expected: 'FAIL', fastWave: true, finding: 'O1_DURATION_FLOOR_RATE' },
+  { name: 'o1-fast-wave-tiny-sample', expected: 'PASS', tinySample: true },
+  { name: 'o1-fast-wave-n4', expected: 'FAIL', n4Fast: true, finding: 'O1_DURATION_FLOOR_RATE' },
   { name: 'o1-fast-failure-excluded', expected: 'PASS', excludedFast: true },
   { name: 'o1-duration-floor-missing', expected: 'FAIL', missingDurationFloor: true, finding: 'O1_DURATION_FLOOR_MISSING' },
   { name: 'o1-duration-floor-omitted', expected: 'FAIL', omitDurationFloor: true, finding: 'O1_DURATION_FLOOR_MISSING' },
   { name: 'o1-duration-floor-duplicate', expected: 'FAIL', duplicateDurationFloor: true, finding: 'O1_DURATION_FLOOR_DUPLICATE' },
   { name: 'o1-duration-floor-unknown', expected: 'FAIL', unknownDurationFloor: true, finding: 'O1_DURATION_FLOOR_UNKNOWN' },
+  { name: 'o1-per-case-floors', expected: 'PASS', perCaseFloors: true },
   { name: 'o1-wave-runs-omitted', expected: 'FAIL', omitWaveProjection: true, finding: 'O1_WAVE_RUN_MISSING' },
   { name: 'o1-wave-run-duplicate', expected: 'FAIL', duplicateWaveRun: true, finding: 'O1_WAVE_RUN_DUPLICATE' },
   { name: 'o1-wave-run-unknown', expected: 'FAIL', unknownWaveRun: true, finding: 'O1_WAVE_RUN_UNKNOWN' },
@@ -109,9 +112,14 @@ const cases = [
   { name: 'o1-queued-old', expected: 'FAIL', rootStatus: 'running', schedulingStatus: 'queued', finding: 'O1_RUN_UNADMITTED' },
   { name: 'o1-discovered-nonterminal', expected: 'FAIL', childStatus: 'running', finding: 'O1_RUN_NONTERMINAL' },
   { name: 'o1-healthy-straggler', expected: 'PASS', childStatus: 'canceled', healthyStraggler: true },
+  { name: 'o1-wave-family-reporter', expected: 'FAIL', multiCase: true, finding: 'O1_DURATION_FLOOR_RATE' },
 ];
 
 for (const fixture of cases) {
+  if (fixture.multiCase) {
+    writeMultiCaseFixture(workspace, fixture);
+    continue;
+  }
   const campaign = path.join(workspace, fixture.name);
   const snapshots = path.join(campaign, 'snapshots');
   const evidenceDir = path.join(campaign, 'evidence');
@@ -130,8 +138,9 @@ for (const fixture of cases) {
     type: fixture.childStepType ?? 'single',
   });
   const rootAttempt = attempt(ROOT, rootStatus, [rootStep]);
-  if (fixture.fastWave) rootAttempt.terminal_at = '2026-08-01T12:00:30.000Z';
+  if (fixture.fastWave || fixture.tinySample || fixture.n4Fast) rootAttempt.terminal_at = '2026-08-01T12:00:30.000Z';
   const childAttempt = { ...attempt(CHILD, childStatus, [childStep]), parent_run_id: ROOT };
+  if (fixture.tinySample || fixture.n4Fast) childAttempt.terminal_at = '2026-08-01T12:00:30.000Z';
 
   const databasePath = path.join(snapshots, 'database.sqlite');
   const db = new DatabaseSync(databasePath);
@@ -209,32 +218,198 @@ for (const fixture of cases) {
         steps_snapshot: { source: 'workflow-status-json', captured_at: '2026-08-01T12:09:55.000Z', steps: [projectedStep(childStep)] },
       },
     } : childAttempt],
-    o1_wave: {
-      schema_version: 1,
-      wave: 4,
-      duration_floors: fixture.omitWaveProjection ? [] : [
-        ...(fixture.omitDurationFloor ? [] : [{ workflow: 'feature-dev-merge-worktree', duration_floor_ms: fixture.missingDurationFloor ? null : 300000, source: fixture.missingDurationFloor ? 'unavailable' : 'production-median', sample_size: 0 }]),
-        ...(fixture.duplicateDurationFloor ? [{ workflow: 'feature-dev-merge-worktree', duration_floor_ms: 300000, source: 'production-median', sample_size: 0 }] : []),
-        ...(fixture.unknownDurationFloor ? [{ workflow: 'unknown-workflow', duration_floor_ms: 300000, source: 'production-median', sample_size: 0 }] : []),
-      ],
-      runs: fixture.omitWaveProjection ? [] : [
-        { case_id: fixture.name, run_id: ROOT, workflow: 'feature-dev-merge-worktree', started_at: STARTED_AT, terminal_at: rootAttempt.terminal_at, terminal_status: fixture.mismatchedWaveRun ? 'failed' : rootAttempt.terminal_status, expected_fast_failure: false },
-        { case_id: fixture.name, run_id: CHILD, workflow: 'feature-dev-merge-worktree', started_at: STARTED_AT, terminal_at: childAttempt.terminal_at, terminal_status: childAttempt.terminal_status, expected_fast_failure: false },
-        ...(fixture.historicalAttempt ? [{ case_id: fixture.name, run_id: PRIOR, workflow: 'feature-dev-merge-worktree', started_at: STARTED_AT, terminal_at: TERMINAL_AT, terminal_status: 'failed', expected_fast_failure: false }] : []),
-        ...(fixture.duplicateWaveRun ? [{ case_id: fixture.name, run_id: ROOT, workflow: 'feature-dev-merge-worktree', started_at: STARTED_AT, terminal_at: rootAttempt.terminal_at, terminal_status: rootAttempt.terminal_status, expected_fast_failure: false }] : []),
-        ...(fixture.unknownWaveRun ? [{ case_id: fixture.name, run_id: 'run-unknown', workflow: 'feature-dev-merge-worktree', started_at: STARTED_AT, terminal_at: TERMINAL_AT, terminal_status: 'completed', expected_fast_failure: false }] : []),
-        { case_id: 'wave-peer-1', run_id: 'run-wave-peer-1', workflow: 'feature-dev-merge-worktree', started_at: STARTED_AT, terminal_at: fixture.fastWave ? '2026-08-01T12:00:40.000Z' : TERMINAL_AT, terminal_status: 'completed', expected_fast_failure: false },
-        { case_id: 'wave-peer-2', run_id: 'run-wave-peer-2', workflow: 'feature-dev-merge-worktree', started_at: STARTED_AT, terminal_at: TERMINAL_AT, terminal_status: 'completed', expected_fast_failure: false },
-        { case_id: 'wave-peer-3', run_id: 'run-wave-peer-3', workflow: 'feature-dev-merge-worktree', started_at: STARTED_AT, terminal_at: TERMINAL_AT, terminal_status: 'completed', expected_fast_failure: false },
-        { case_id: 'wave-peer-4', run_id: 'run-wave-peer-4', workflow: 'feature-dev-merge-worktree', started_at: STARTED_AT, terminal_at: TERMINAL_AT, terminal_status: 'completed', expected_fast_failure: false },
-        ...(fixture.excludedFast ? [{ case_id: 'wave-fast-failure', run_id: 'run-wave-fast-failure', workflow: 'feature-dev-merge-worktree', started_at: STARTED_AT, terminal_at: '2026-08-01T12:00:10.000Z', terminal_status: 'failed', expected_fast_failure: true }] : []),
-      ],
-    },
+    o1_wave: waveProjection(fixture, rootAttempt, childAttempt),
     mechanical_evidence: { schema_version: 1, references },
   };
   const contextPath = path.join(evidenceDir, 'context.json');
   fs.writeFileSync(contextPath, `${JSON.stringify(context, null, 2)}\n`, { mode: 0o400, flag: 'wx' });
   fs.writeFileSync(path.join(campaign, 'expectation.json'), `${JSON.stringify({ ...fixture, context: contextPath })}\n`, { flag: 'wx' });
+}
+
+function writeMultiCaseFixture(workspace, fixture) {
+  // Two manifest cases share one wave (and one campaign DB). The reporter case
+  // is deliberately alphabetically LAST ('zz-…') so the fixture proves the
+  // reporter is picked by campaign.manifest.case_ids order, not by name sort.
+  const campaign = path.join(workspace, fixture.name);
+  const snapshots = path.join(campaign, 'snapshots');
+  const reporterEvidenceDir = path.join(campaign, 'evidence');
+  const peerEvidenceDir = path.join(campaign, 'evidence-peer');
+  for (const directory of [snapshots, reporterEvidenceDir, peerEvidenceDir]) fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(campaign, 'state.json'), '{}\n', { flag: 'wx' });
+
+  const workflow = 'feature-dev-merge-worktree';
+  const reporterCaseId = 'zz-wave-family-reporter';
+  const peerCaseId = 'aa-wave-family-peer';
+  const floorMs = 300000;
+  const fastTerminalAt = '2026-08-01T12:00:30.000Z';
+
+  const reporterStep = step(ROOT, { status: 'done' });
+  const peerStep = step(CHILD, { status: 'done' });
+  const reporterAttempt = attempt(ROOT, 'completed', [reporterStep]);
+  const peerAttempt = attempt(CHILD, 'completed', [peerStep]);
+
+  const runs = [
+    { case_id: reporterCaseId, run_id: ROOT, workflow, started_at: STARTED_AT, terminal_at: TERMINAL_AT, terminal_status: 'completed', expected_fast_failure: false },
+    // Duplicate wave row for the reporter's own run: a run-scoped wave finding
+    // that must fail the reporter case and NOT the peer case.
+    { case_id: reporterCaseId, run_id: ROOT, workflow, started_at: STARTED_AT, terminal_at: TERMINAL_AT, terminal_status: 'completed', expected_fast_failure: false },
+    { case_id: peerCaseId, run_id: CHILD, workflow, started_at: STARTED_AT, terminal_at: TERMINAL_AT, terminal_status: 'completed', expected_fast_failure: false },
+    { case_id: 'wave-peer-1', run_id: 'run-wave-peer-1', workflow, started_at: STARTED_AT, terminal_at: fastTerminalAt, terminal_status: 'completed', expected_fast_failure: false },
+    { case_id: 'wave-peer-2', run_id: 'run-wave-peer-2', workflow, started_at: STARTED_AT, terminal_at: fastTerminalAt, terminal_status: 'completed', expected_fast_failure: false },
+  ];
+  const caseIds = [...new Set(runs.map((run) => run.case_id))];
+  const wave = {
+    schema_version: 1,
+    wave: 4,
+    duration_floors: caseIds.map((caseId) => ({
+      workflow, case_id: caseId, duration_floor_ms: floorMs, source: 'production-median', sample_size: 0,
+    })),
+    runs,
+  };
+
+  const databasePath = path.join(snapshots, 'database.sqlite');
+  const db = new DatabaseSync(databasePath);
+  db.exec(`
+    CREATE TABLE runs (
+      id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, status TEXT NOT NULL,
+      scheduling_status TEXT, scheduling_requested_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+    CREATE TABLE steps (
+      id TEXT PRIMARY KEY, run_id TEXT NOT NULL, step_id TEXT NOT NULL, agent_id TEXT NOT NULL,
+      step_index INTEGER NOT NULL, status TEXT NOT NULL, type TEXT NOT NULL, current_story_id TEXT,
+      claim_pid INTEGER, claim_updated_at TEXT, updated_at TEXT NOT NULL
+    );
+  `);
+  const insertRun = db.prepare('INSERT INTO runs VALUES (?, ?, ?, ?, ?, ?, ?)');
+  insertRun.run(bare(ROOT), workflow, 'completed', null, STARTED_AT, STARTED_AT, TERMINAL_AT);
+  insertRun.run(bare(CHILD), workflow, 'completed', null, STARTED_AT, STARTED_AT, TERMINAL_AT);
+  const insertStep = db.prepare('INSERT INTO steps VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+  for (const row of [reporterStep, peerStep]) insertStep.run(...Object.values(row));
+  db.close();
+  fs.chmodSync(databasePath, 0o400);
+
+  const reporterEvents = {
+    schema_version: 1, captured_at: CAPTURED_AT, run_ids: [ROOT],
+    rows: [{ archive: 'all.jsonl', line: 1, event: { ts: TERMINAL_AT, event: 'run.completed', runId: ROOT } }],
+  };
+  const peerEvents = {
+    schema_version: 1, captured_at: CAPTURED_AT, run_ids: [CHILD],
+    rows: [{ archive: 'all.jsonl', line: 1, event: { ts: TERMINAL_AT, event: 'run.completed', runId: CHILD } }],
+  };
+  const reporterWorkflow = {
+    schema_version: 1, captured_at: CAPTURED_AT,
+    root: {
+      run_id: ROOT, terminal_status: 'completed', tokens_observed: 1,
+      steps_snapshot: reporterAttempt.steps_snapshot,
+    },
+    discovered_runs: [],
+  };
+  const peerWorkflow = {
+    schema_version: 1, captured_at: CAPTURED_AT,
+    root: {
+      run_id: CHILD, terminal_status: 'completed', tokens_observed: 1,
+      steps_snapshot: peerAttempt.steps_snapshot,
+    },
+    discovered_runs: [],
+  };
+
+  const referencesBase = Object.fromEntries(REFERENCE_KEYS.map((key) => [key, null]));
+  referencesBase.database_snapshot = reference(campaign, databasePath, 'sqlite-self-test');
+  const reporterReferences = {
+    ...referencesBase,
+    run_events: writeSnapshot(campaign, snapshots, 'run-events-reporter.json', reporterEvents),
+    workflow_status: writeSnapshot(campaign, snapshots, 'workflow-status-reporter.json', reporterWorkflow),
+  };
+  const peerReferences = {
+    ...referencesBase,
+    run_events: writeSnapshot(campaign, snapshots, 'run-events-peer.json', peerEvents),
+    workflow_status: writeSnapshot(campaign, snapshots, 'workflow-status-peer.json', peerWorkflow),
+  };
+
+  const manifest = { sha256: 'a'.repeat(64), case_count: 2, case_ids: [reporterCaseId, peerCaseId] };
+  const caseBase = {
+    wave: 4, workflow, fixture: 'synthetic', harness: 'hermes', class: 'verification',
+    caps: { tokens: 10, wall_min: 60 }, boundary_files: [], forbidden: [], chaos: null,
+  };
+  const buildContext = (caseId, runId, attemptRow, references) => ({
+    contract_version: 1,
+    oracle_id: 'O1',
+    campaign: { id: `campaign-${fixture.name}`, created_at: STARTED_AT, manifest },
+    case: { id: caseId, ...caseBase },
+    run_id: runId,
+    attempts: [attemptRow],
+    discovered_runs: [],
+    o1_wave: wave,
+    mechanical_evidence: { schema_version: 1, references },
+  });
+  const reporterContextPath = path.join(reporterEvidenceDir, 'context.json');
+  fs.writeFileSync(reporterContextPath, `${JSON.stringify(buildContext(reporterCaseId, ROOT, reporterAttempt, reporterReferences), null, 2)}\n`, { mode: 0o400, flag: 'wx' });
+  const peerContextPath = path.join(peerEvidenceDir, 'context.json');
+  fs.writeFileSync(peerContextPath, `${JSON.stringify(buildContext(peerCaseId, CHILD, peerAttempt, peerReferences), null, 2)}\n`, { mode: 0o400, flag: 'wx' });
+  fs.writeFileSync(path.join(campaign, 'expectation.json'), `${JSON.stringify({
+    ...fixture, contexts: { reporter: reporterContextPath, peer: peerContextPath },
+  })}\n`, { flag: 'wx' });
+}
+
+function waveProjection(fixture, rootAttempt, childAttempt) {
+  if (fixture.omitWaveProjection) {
+    return { schema_version: 1, wave: 4, duration_floors: [], runs: [] };
+  }
+  const workflow = 'feature-dev-merge-worktree';
+  const fastTerminalAt = '2026-08-01T12:00:30.000Z';
+  const rootFast = fixture.fastWave || fixture.tinySample || fixture.n4Fast;
+  const childFast = fixture.tinySample || fixture.n4Fast;
+  const runs = [
+    { case_id: fixture.name, run_id: ROOT, workflow, started_at: STARTED_AT, terminal_at: rootFast ? fastTerminalAt : rootAttempt.terminal_at, terminal_status: fixture.mismatchedWaveRun ? 'failed' : rootAttempt.terminal_status, expected_fast_failure: false },
+    { case_id: fixture.name, run_id: CHILD, workflow, started_at: STARTED_AT, terminal_at: childFast ? fastTerminalAt : childAttempt.terminal_at, terminal_status: childAttempt.terminal_status, expected_fast_failure: false },
+    ...(fixture.historicalAttempt ? [{ case_id: fixture.name, run_id: PRIOR, workflow, started_at: STARTED_AT, terminal_at: TERMINAL_AT, terminal_status: 'failed', expected_fast_failure: false }] : []),
+    ...(fixture.duplicateWaveRun ? [{ case_id: fixture.name, run_id: ROOT, workflow, started_at: STARTED_AT, terminal_at: rootAttempt.terminal_at, terminal_status: rootAttempt.terminal_status, expected_fast_failure: false }] : []),
+    ...(fixture.unknownWaveRun ? [{ case_id: fixture.name, run_id: 'run-unknown', workflow, started_at: STARTED_AT, terminal_at: TERMINAL_AT, terminal_status: 'completed', expected_fast_failure: false }] : []),
+  ];
+  if (fixture.tinySample || fixture.n4Fast) {
+    runs.push({ case_id: 'wave-peer-1', run_id: 'run-wave-peer-1', workflow, started_at: STARTED_AT, terminal_at: fastTerminalAt, terminal_status: 'completed', expected_fast_failure: false });
+    if (fixture.n4Fast) {
+      runs.push({ case_id: 'wave-peer-2', run_id: 'run-wave-peer-2', workflow, started_at: STARTED_AT, terminal_at: fastTerminalAt, terminal_status: 'completed', expected_fast_failure: false });
+    }
+  } else {
+    runs.push(
+      { case_id: 'wave-peer-1', run_id: 'run-wave-peer-1', workflow, started_at: STARTED_AT, terminal_at: fixture.fastWave ? '2026-08-01T12:00:40.000Z' : (fixture.perCaseFloors ? '2026-08-01T12:04:00.000Z' : TERMINAL_AT), terminal_status: 'completed', expected_fast_failure: false },
+      { case_id: 'wave-peer-2', run_id: 'run-wave-peer-2', workflow, started_at: STARTED_AT, terminal_at: fixture.perCaseFloors ? '2026-08-01T12:04:00.000Z' : TERMINAL_AT, terminal_status: 'completed', expected_fast_failure: false },
+      { case_id: 'wave-peer-3', run_id: 'run-wave-peer-3', workflow, started_at: STARTED_AT, terminal_at: TERMINAL_AT, terminal_status: 'completed', expected_fast_failure: false },
+      { case_id: 'wave-peer-4', run_id: 'run-wave-peer-4', workflow, started_at: STARTED_AT, terminal_at: TERMINAL_AT, terminal_status: 'completed', expected_fast_failure: false },
+      ...(fixture.excludedFast ? [{ case_id: 'wave-fast-failure', run_id: 'run-wave-fast-failure', workflow, started_at: STARTED_AT, terminal_at: '2026-08-01T12:00:10.000Z', terminal_status: 'failed', expected_fast_failure: true }] : []),
+    );
+  }
+  const caseIds = [...new Set(runs.map((run) => run.case_id))];
+  const durationFloors = [];
+  if (!fixture.omitDurationFloor) {
+    for (const caseId of caseIds) {
+      if (fixture.perCaseFloors) {
+        durationFloors.push({
+          workflow: 'feature-dev-merge-worktree',
+          case_id: caseId,
+          duration_floor_ms: caseId === 'wave-peer-1' || caseId === 'wave-peer-2' ? 180000 : 300000,
+          source: 'production-median',
+          sample_size: 0,
+        });
+      } else {
+        durationFloors.push({
+          workflow: 'feature-dev-merge-worktree',
+          case_id: caseId,
+          duration_floor_ms: fixture.missingDurationFloor ? null : 300000,
+          source: fixture.missingDurationFloor ? 'unavailable' : 'production-median',
+          sample_size: 0,
+        });
+      }
+    }
+  }
+  if (fixture.duplicateDurationFloor) {
+    durationFloors.push({ workflow: 'feature-dev-merge-worktree', case_id: fixture.name, duration_floor_ms: 300000, source: 'production-median', sample_size: 0 });
+  }
+  if (fixture.unknownDurationFloor) {
+    durationFloors.push({ workflow: 'unknown-workflow', duration_floor_ms: 300000, source: 'production-median', sample_size: 0 });
+  }
+  return { schema_version: 1, wave: 4, duration_floors: durationFloors, runs };
 }
 
 function writeSnapshot(campaign, directory, name, value) {

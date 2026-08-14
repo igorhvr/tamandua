@@ -37,7 +37,7 @@ for (const key of ['database_snapshot', 'run_events', 'workflow_status']) {
   };
 }
 const runtimeUrl = new URL('../lib/index.mjs', import.meta.url).href;
-for (const [name, result] of [['pass', 'PASS'], ['fail', 'FAIL'], ['false-positive', 'PASS'], ['missed-violation', 'FAIL']]) {
+for (const [name, result] of [['pass', 'PASS'], ['fail', 'FAIL'], ['not-evaluable', 'NOT_EVALUABLE'], ['false-positive', 'PASS'], ['missed-violation', 'FAIL']]) {
   const evidenceDir = path.join(workspace, 'evidence', name);
   fs.mkdirSync(evidenceDir, { recursive: true, mode: 0o700 });
   const context = {

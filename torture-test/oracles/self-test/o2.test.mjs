@@ -58,12 +58,14 @@ test('O2 proves unique ref movement, tested/commit tree identity, ancestry, and 
       'o2-default-concession-no-reroute',
       'o2-duplicate-landing',
       'o2-empty-landing',
+      'o2-foreign-sibling-row',
       'o2-green',
       'o2-green-cross-run-noop',
       'o2-green-noop-recovery',
       'o2-landed-canceled',
       'o2-landed-failed',
       'o2-noop-before-landing',
+      'o2-null-gate-key',
       'o2-off-mode',
       'o2-off-mode-no-override',
       'o2-off-mode-unbound',
@@ -81,7 +83,7 @@ test('O2 proves unique ref movement, tested/commit tree identity, ancestry, and 
       const { elapsed, expectation, response, status } = invokeFixture(workspace, name);
       assert.ok(elapsed < 10_000, `${name} exceeded 10 seconds`);
       assert.equal(response.result, expectation.expected, `${name}: ${JSON.stringify(response)}`);
-      assert.equal(status, { PASS: 0, FAIL: 1, ERROR: 2 }[expectation.expected], name);
+      assert.equal(status, { PASS: 0, FAIL: 1, ERROR: 2, NOT_EVALUABLE: 3 }[expectation.expected], name);
       if (expectation.finding) {
         assert.ok(response.findings.some((finding) => finding.id === expectation.finding), `${name} omitted ${expectation.finding}`);
       }
@@ -92,6 +94,13 @@ test('O2 proves unique ref movement, tested/commit tree identity, ancestry, and 
       assert.equal(response.evidence.length, expectation.expected === 'FAIL' ? 2 : 1, `${name} evidence`);
       const observation = JSON.parse(fs.readFileSync(path.join(workspace, name, 'evidence', response.evidence[0].path), 'utf8'));
       assert.equal(observation.schema_version, 1);
+      if (expectation.expected === 'NOT_EVALUABLE') {
+        assert.equal(response.findings.length, 0, `${name} NOT_EVALUABLE findings`);
+        assert.equal(observation.not_evaluable, true);
+        assert.equal(typeof observation.reason, 'string');
+        assert.ok(observation.reason.length > 0);
+        continue;
+      }
       assert.equal(observation.target_ref, 'refs/heads/main');
       assert.ok(Array.isArray(observation.landings));
       if (expectation.expected === 'FAIL') {

@@ -422,3 +422,84 @@ test('an interrupted or partial snapshot remains TEST_INFRA and is never resumed
     fs.rmSync(data.root, { recursive: true, force: true });
   }
 });
+
+test('scopes suite evidence to the case\'s own origins, excluding sibling rows that share only cmd_hash', () => {
+  const data = fixture();
+  try {
+    const siblingDir = path.join(data.root, 'sibling-repo');
+    fs.mkdirSync(siblingDir);
+    const siblingOrigin = fs.realpathSync(siblingDir);
+    const gateCommandHash = createHash('sha256').update('npm test').digest('hex');
+    const lintCommandHash = createHash('sha256').update('npm run lint').digest('hex');
+    const db = new DatabaseSync(data.databasePath);
+    // Sibling case row: different origin, same cmd_hash as the captured gate key.
+    db.prepare('INSERT INTO suite_results VALUES (6, ?, ?, ?, ?, 0, 10, NULL, ?, ?, ?)').run(
+      siblingOrigin, 'b'.repeat(40), gateCommandHash, 'npm test', 'run-sibling', 'step-sibling', '2026-08-01T12:00:06.000Z',
+    );
+    // Own-origin row with an unrelated command still belongs to the case bundle.
+    db.prepare('INSERT INTO suite_results VALUES (7, ?, ?, ?, ?, 0, 10, NULL, ?, ?, ?)').run(
+      data.suiteOrigin, 'c'.repeat(40), lintCommandHash, 'npm run lint', RUN_ID, 'step-lint', '2026-08-01T12:00:07.000Z',
+    );
+    db.close();
+    const request = input(data);
+    const started = beginOracleEvidenceSnapshot(request);
+    const completed = completeOracleEvidenceSnapshot(request, started);
+    const ledger = JSON.parse(fs.readFileSync(
+      path.join(data.campaignDir, completed.references.suite_ledger.path), 'utf8',
+    ));
+    assert.deepEqual(ledger.rows.map((row) => row.id), [1, 2, 3, 4, 5, 7]);
+    assert.deepEqual(new Set(ledger.rows.map((row) => row.origin_repo)), new Set([data.suiteOrigin]));
+    const observations = JSON.parse(fs.readFileSync(
+      path.join(data.campaignDir, completed.references.suite_observations.path), 'utf8',
+    ));
+    assert.equal(
+      JSON.stringify(observations).includes(siblingOrigin), false,
+      'sibling origin leaked into suite_observations',
+    );
+    assert.deepEqual(observations.origin_identities, [{ origin_repo: data.suiteOrigin, normalized_origin_repo: data.suiteOrigin }]);
+  } finally {
+    fs.rmSync(data.root, { recursive: true, force: true });
+  }
+});
+
+test('survives a null gate key with event-carried origins only', () => {
+  const data = fixture();
+  try {
+    const siblingDir = path.join(data.root, 'sibling-repo');
+    fs.mkdirSync(siblingDir);
+    const siblingOrigin = fs.realpathSync(siblingDir);
+    const db = new DatabaseSync(data.databasePath);
+    db.prepare('INSERT INTO suite_results VALUES (6, ?, ?, ?, ?, 0, 10, NULL, ?, ?, ?)').run(
+      siblingOrigin, 'b'.repeat(40), createHash('sha256').update('npm test').digest('hex'), 'npm test',
+      'run-sibling', 'step-sibling', '2026-08-01T12:00:06.000Z',
+    );
+    db.close();
+    const base = input(data);
+    const request = {
+      ...base,
+      caseRecord: {
+        ...base.caseRecord,
+        context: { merge_gate: 'green', fail_missing: '1', test_cmd: null, prose: 'do not capture me' },
+      },
+    };
+    const started = beginOracleEvidenceSnapshot(request);
+    const completed = completeOracleEvidenceSnapshot(request, started);
+    const launchIntent = JSON.parse(fs.readFileSync(
+      path.join(data.campaignDir, completed.references.launch_intent.path), 'utf8',
+    ));
+    assert.equal(launchIntent.gate_key, null);
+    const ledger = JSON.parse(fs.readFileSync(
+      path.join(data.campaignDir, completed.references.suite_ledger.path), 'utf8',
+    ));
+    assert.deepEqual(ledger.rows.map((row) => row.id), [1, 2, 3, 4, 5]);
+    assert.deepEqual(new Set(ledger.rows.map((row) => row.origin_repo)), new Set([data.suiteOrigin]));
+    const observations = JSON.parse(fs.readFileSync(
+      path.join(data.campaignDir, completed.references.suite_observations.path), 'utf8',
+    ));
+    assert.equal(JSON.stringify(observations).includes(siblingOrigin), false);
+    assert.ok(observations.rows.length > 0, 'event-carried origins still produce shim observations');
+    assert.equal(observations.origin_identities.some((entry) => entry.origin_repo === data.suiteOrigin), true);
+  } finally {
+    fs.rmSync(data.root, { recursive: true, force: true });
+  }
+});

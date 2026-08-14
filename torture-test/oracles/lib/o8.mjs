@@ -43,7 +43,16 @@ function normalizeDeclarations(values, label) {
   if (new Set(result).size !== result.length) throw new OracleRuntimeError(`${label} must not contain duplicate paths`);
   return result;
 }
-function matches(file, declaration) { return file === declaration || file.startsWith(`${declaration}/`); }
+// A bare fixture-root declaration ('fixtures-src/<fixture>' with no trailing
+// slash) means the ENTIRE provisioned fixture tree is in scope. readInventory
+// rebases such declarations to this sentinel and matches() treats it as
+// match-all. The NUL byte guarantees no collision with a validated declaration
+// (normalizedDeclaration rejects empty/dot segments) or a work-clone path.
+const FIXTURE_ROOT_SCOPE = '\u0000fixture-root';
+
+function matches(file, declaration) {
+  return declaration === FIXTURE_ROOT_SCOPE || file === declaration || file.startsWith(`${declaration}/`);
+}
 
 // A checksum inventory runs against the PROVISIONED WORK CLONE (repository
 // root == fixture root), but case boundary/forbidden declarations are authored
@@ -52,9 +61,14 @@ function matches(file, declaration) { return file === declaration || file.starts
 // stripping the 'fixtures-src/<fixture>/' prefix so path matching succeeds
 // (a real provisioned clone has the fixture content at its root). Declarations
 // already work-clone-relative (e.g. 'src', 'tests') pass through unchanged.
+// A declaration equal to the bare fixture root itself ('fixtures-src/<fixture>'
+// with no trailing slash) rebases to FIXTURE_ROOT_SCOPE: the whole fixture is
+// in scope.
 function rebaseFixtureDeclaration(value, fixture) {
   if (typeof fixture !== 'string' || fixture.length === 0) return value;
-  const prefix = `fixtures-src/${fixture}/`;
+  const root = `fixtures-src/${fixture}`;
+  if (value === root) return FIXTURE_ROOT_SCOPE;
+  const prefix = `${root}/`;
   return value.startsWith(prefix) ? value.slice(prefix.length) : value;
 }
 function isTestPath(file) {
@@ -121,7 +135,15 @@ function readInventory(file, phase, context) {
   const fixture = typeof context.case?.fixture === 'string' ? context.case.fixture : '';
   const rebasedBoundary = boundary.map((declaration) => rebaseFixtureDeclaration(declaration, fixture));
   const rebasedForbidden = forbidden.map((declaration) => rebaseFixtureDeclaration(declaration, fixture));
-  return { entries, changed_paths: changed, boundary: rebasedBoundary, forbidden: rebasedForbidden };
+  return {
+    entries,
+    changed_paths: changed,
+    boundary: rebasedBoundary,
+    forbidden: rebasedForbidden,
+    // The authored (normalized, pre-rebase) declarations, recorded in the
+    // audit evidence so the manifest shape is preserved verbatim.
+    declarations: { boundary_files: boundary, forbidden },
+  };
 }
 function inspectArchive(invocation) {
   const options = { cwd: invocation.campaignRoot, encoding: 'utf8', shell: false, timeout: 5000, maxBuffer: 8 * 1024 * 1024, env: { PATH: process.env.PATH, LC_ALL: 'C' } };
@@ -252,8 +274,8 @@ export async function evaluateO8(invocation) {
     if (isTransportArtifact(entry.path)) findings.add('O8_TRANSPORT_ARTIFACT', 'merged tree contains a progress, report, or transport artifact', { path: entry.path });
   }
   const evidence = [writeEvidenceJson(invocation, 'o8-boundary-audit.json', {
-    schema_version: 1, changed_paths: recomputedChanged, boundary_files: terminal.boundary,
-    forbidden: terminal.forbidden, quarantine_task: quarantine, git_tree_reconciled: true,
+    schema_version: 1, changed_paths: recomputedChanged, boundary_files: terminal.declarations.boundary_files,
+    forbidden: terminal.declarations.forbidden, quarantine_task: quarantine, git_tree_reconciled: true,
   }, 'checksum-and-git-tree-audit')];
   return { result: findings.length === 0 ? 'PASS' : 'FAIL', findings: findings.toJSON(), evidence };
 }

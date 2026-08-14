@@ -195,6 +195,10 @@ test('evidence writes are contained, exclusive, and response validation pins res
     const response = { contract_version: 1, oracle_id: 'O1', result: 'PASS', started_at: now, finished_at: now, findings: [], evidence: [reference] };
     assert.deepEqual(validateOracleResponse(response, 'O1', 0, fixture.evidenceDir), []);
     assert.match(validateOracleResponse(response, 'O1', 1, fixture.evidenceDir).join('\n'), /contradicts/i);
+    const notEvaluable = { ...response, result: 'NOT_EVALUABLE' };
+    assert.deepEqual(validateOracleResponse(notEvaluable, 'O1', 3, fixture.evidenceDir), []);
+    assert.match(validateOracleResponse(notEvaluable, 'O1', 0, fixture.evidenceDir).join('\n'), /contradicts/i);
+    assert.match(validateOracleResponse({ ...notEvaluable, findings: [{ id: 'X', summary: 'degraded evidence must carry no findings' }] }, 'O1', 3, fixture.evidenceDir).join('\n'), /NOT_EVALUABLE must not contain findings/i);
     assert.match(validateOracleResponse({ ...response, classification: { prose: 'not mechanical' } }, 'O1', 0, fixture.evidenceDir).join('\n'), /classification.*unknown/i);
     assert.match(validateOracleResponse({ ...response, prose: 'not part of CONTRACT v1' }, 'O1', 0, fixture.evidenceDir).join('\n'), /unknown.*prose/i);
     assert.match(validateOracleResponse({ ...response, classification: { ambiguous: { category: 'test', extra: 'covert' } } }, 'O1', 0, fixture.evidenceDir).join('\n'), /ambiguous.*unknown/i);
@@ -244,13 +248,13 @@ test('finding aggregation is deterministic and safe git execution stays containe
   }
 });
 
-test('oracleMain emits one contract JSON object and maps PASS, FAIL, and ERROR to 0, 1, and 2', () => {
+test('oracleMain emits one contract JSON object and maps PASS, FAIL, ERROR, and NOT_EVALUABLE to 0, 1, 2, and 3', () => {
   const fixture = makeFixture();
   try {
     const probe = path.join(fixture.campaignRoot, 'oracle-probe.mjs');
     const runtimeUrl = new URL('./index.mjs', import.meta.url).href;
-    fs.writeFileSync(probe, `#!/usr/bin/env node\nimport {oracleMain} from ${JSON.stringify(runtimeUrl)};\nawait oracleMain(async () => {\n  if (process.env.PROBE_RESULT === 'ERROR') throw new Error('synthetic error');\n  if (process.env.PROBE_RESULT === 'INVALID') return {result:'PASS',findings:[{id:'BAD',summary:'invalid pass finding'}]};\n  return process.env.PROBE_RESULT === 'FAIL'\n    ? {result:'FAIL',findings:[{id:'PROBE',summary:'synthetic violation'}]}\n    : {result:'PASS',findings:[]};\n});\n`, { mode: 0o700 });
-    for (const [probeResult, expectedResult, expectedExit] of [['PASS', 'PASS', 0], ['FAIL', 'FAIL', 1], ['ERROR', 'ERROR', 2], ['INVALID', 'ERROR', 2]]) {
+    fs.writeFileSync(probe, `#!/usr/bin/env node\nimport {oracleMain} from ${JSON.stringify(runtimeUrl)};\nawait oracleMain(async () => {\n  if (process.env.PROBE_RESULT === 'ERROR') throw new Error('synthetic error');\n  if (process.env.PROBE_RESULT === 'INVALID') return {result:'PASS',findings:[{id:'BAD',summary:'invalid pass finding'}]};\n  if (process.env.PROBE_RESULT === 'NOT_EVALUABLE') return {result:'NOT_EVALUABLE',findings:[]};\n  return process.env.PROBE_RESULT === 'FAIL'\n    ? {result:'FAIL',findings:[{id:'PROBE',summary:'synthetic violation'}]}\n    : {result:'PASS',findings:[]};\n});\n`, { mode: 0o700 });
+    for (const [probeResult, expectedResult, expectedExit] of [['PASS', 'PASS', 0], ['FAIL', 'FAIL', 1], ['ERROR', 'ERROR', 2], ['NOT_EVALUABLE', 'NOT_EVALUABLE', 3], ['INVALID', 'ERROR', 2]]) {
       const result = spawnSync(process.execPath, [probe, '--contract-version', '1', '--context', fixture.contextPath], {
         cwd: fixture.evidenceDir,
         encoding: 'utf8',

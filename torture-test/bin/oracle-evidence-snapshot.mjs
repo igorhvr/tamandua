@@ -1049,9 +1049,8 @@ export function completeOracleEvidenceSnapshot(rawInput, baseline) {
     const allSuiteRows = tableExists(databaseSnapshot, 'suite_results')
       ? sqliteRows(databaseSnapshot, 'SELECT * FROM suite_results ORDER BY created_at, rowid') : [];
     const capturedGateKey = launchGateKey(input.caseRecord, input.repositoryPath);
-    const suiteOrigins = capturedGateKey === null ? new Set() : new Set([
-      capturedGateKey.origin_repo,
-      ...allSuiteRows.filter((row) => row.cmd_hash === capturedGateKey.cmd_hash).map((row) => row.origin_repo),
+    const suiteOrigins = new Set([
+      ...(capturedGateKey === null ? [] : [capturedGateKey.origin_repo]),
       ...events.map((wrapper) => wrapper.event.originRepo).filter((origin) => typeof origin === 'string'),
     ]);
     const suiteRows = allSuiteRows.filter((row) => suiteOrigins.has(row.origin_repo));

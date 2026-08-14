@@ -96,7 +96,7 @@ function readLedger(file) {
   return rows;
 }
 
-function readDatabaseLedger(invocation, observedOrigins) {
+function readDatabaseLedger(invocation, bundleOrigins) {
   const database = openEvidenceDatabase(invocation);
   try {
     const columns = new Set(database.prepare('PRAGMA table_info(suite_results)').all().map((row) => row.name));
@@ -104,11 +104,32 @@ function readDatabaseLedger(invocation, observedOrigins) {
     const missing = required.filter((column) => !columns.has(column));
     if (missing.length > 0) throw new OracleRuntimeError(`suite_results snapshot lacks required columns: ${missing.join(', ')}`);
     return database.prepare(`SELECT ${required.join(', ')} FROM suite_results ORDER BY id`).all()
-      .filter((row) => observedOrigins.has(row.origin_repo))
+      .filter((row) => bundleOrigins.has(row.origin_repo))
       .map((row, index) => suiteRowShape(row, `suite_results[${index}]`));
   } finally {
     database.close();
   }
+}
+
+function readCaseBundleOrigins(invocation) {
+  const origins = new Set();
+  const launchIntentPath = invocation.evidencePaths.launch_intent;
+  if (launchIntentPath !== undefined) {
+    const artifact = readJson(launchIntentPath, 'launch_intent');
+    if (artifact.schema_version !== 1) throw new OracleRuntimeError('launch_intent.schema_version must be 1');
+    if (artifact.gate_key !== null && artifact.gate_key !== undefined) {
+      const gateKey = object(artifact.gate_key, 'launch_intent.gate_key');
+      origins.add(requireString(gateKey.origin_repo, 'launch_intent.gate_key.origin_repo'));
+    }
+  }
+  const events = readJson(invocation.evidencePaths.run_events, 'run_events');
+  if (events.schema_version !== 1) throw new OracleRuntimeError('run_events.schema_version must be 1');
+  for (const raw of array(events.rows, 'run_events.rows')) {
+    const wrapper = object(raw, 'run_events.rows[]');
+    const event = object(wrapper.event, 'run_events.rows[].event');
+    if (typeof event.originRepo === 'string' && event.originRepo.length > 0) origins.add(event.originRepo);
+  }
+  return origins;
 }
 
 function observationShape(raw, index) {
@@ -153,7 +174,7 @@ function readObservations(file) {
   timestampMs(artifact.captured_at, 'suite_observations.captured_at');
   if (!Number.isSafeInteger(artifact.ttl_green_ms) || artifact.ttl_green_ms <= 0) throw new OracleRuntimeError('suite_observations.ttl_green_ms must be a positive integer');
   const rows = array(artifact.rows, 'suite_observations.rows').map(observationShape);
-  if (rows.length === 0) throw new OracleRuntimeError('suite_observations.rows must contain at least one ordered shim observation');
+  if (rows.length === 0) return { empty: true };
   const ids = rows.map((row) => row.id);
   if (new Set(ids).size !== ids.length) throw new OracleRuntimeError('suite_observations rows must have unique IDs');
   for (let index = 1; index < rows.length; index += 1) {
@@ -261,22 +282,48 @@ function addStateFinding(findings, invocationId, expected, observed) {
 }
 
 export async function evaluateO9(invocation) {
-  const ledger = readLedger(invocation.evidencePaths.suite_ledger);
+  const bundleOrigins = readCaseBundleOrigins(invocation);
+  if (bundleOrigins.size === 0) {
+    return {
+      result: 'NOT_EVALUABLE',
+      findings: [],
+      evidence: [writeEvidenceJson(invocation, 'o9-ledger-replay-audit.json', {
+        schema_version: 1,
+        not_evaluable: true,
+        reason: 'launch_intent.gate_key is null and run_events carry no origin: cannot establish the case origin bundle',
+      }, 'sqlite-git-and-shim-state-machine')],
+    };
+  }
+  const parsed = readObservations(invocation.evidencePaths.suite_observations);
+  if (parsed.empty) {
+    return {
+      result: 'NOT_EVALUABLE',
+      findings: [],
+      evidence: [writeEvidenceJson(invocation, 'o9-ledger-replay-audit.json', {
+        schema_version: 1,
+        not_evaluable: true,
+        reason: 'suite_observations.rows is empty: no shim evidence for the case bundle',
+      }, 'sqlite-git-and-shim-state-machine')],
+    };
+  }
   const {
     rows: observations, ttl_green_ms: ttl, originIdentities, singleflight, specialExits,
-  } = readObservations(invocation.evidencePaths.suite_observations);
+  } = parsed;
+  const ledger = readLedger(invocation.evidencePaths.suite_ledger);
   const observedOrigins = new Set([
     ...observations.map((row) => row.origin_repo),
     ...originIdentities.map((identity) => identity.origin_repo),
     ...singleflight.map((observation) => observation.key.origin_repo),
     ...specialExits.map((observation) => observation.origin_repo),
   ]);
-  const databaseLedger = readDatabaseLedger(invocation, observedOrigins);
-  if (JSON.stringify(ledger) !== JSON.stringify(databaseLedger)) throw new OracleRuntimeError('suite_ledger does not reconcile exactly with read-only suite_results for observed fixture origins');
-  const rowsById = new Map(ledger.map((row) => [row.id, row]));
+  const skippedForeign = ledger.filter((row) => !bundleOrigins.has(row.origin_repo));
+  const inScopeLedger = ledger.filter((row) => bundleOrigins.has(row.origin_repo));
+  const databaseLedger = readDatabaseLedger(invocation, bundleOrigins);
+  if (JSON.stringify(inScopeLedger) !== JSON.stringify(databaseLedger)) throw new OracleRuntimeError('suite_ledger does not reconcile exactly with read-only suite_results for case-bundle origins');
+  const rowsById = new Map(inScopeLedger.map((row) => [row.id, row]));
   const findings = new FindingCollector();
   const identityByOrigin = new Map(originIdentities.map((identity) => [identity.origin_repo, identity]));
-  for (const origin of new Set([...ledger.map((row) => row.origin_repo), ...observedOrigins])) {
+  for (const origin of new Set([...inScopeLedger.map((row) => row.origin_repo), ...observedOrigins])) {
     if (!identityByOrigin.has(origin)) findings.add('O9_ORIGIN_IDENTITY_MISSING', 'suite evidence origin lacks a captured normalized identity', { origin_repo: origin });
   }
 
@@ -284,7 +331,7 @@ export async function evaluateO9(invocation) {
   let reachableTrees;
   try {
     reachableTrees = new Set(runGit({ campaignRoot: invocation.campaignRoot, repository, args: ['log', '--all', '--format=%T'] }).stdout.split(/\r?\n/).filter(Boolean));
-    for (const row of ledger) {
+    for (const row of inScopeLedger) {
       const type = runGit({ campaignRoot: invocation.campaignRoot, repository, args: ['cat-file', '-t', row.tree_hash], acceptedStatuses: [0, 128] });
       if (type.status !== 0 || type.stdout.trim() !== 'tree' || !reachableTrees.has(row.tree_hash)) {
         findings.add('O9_LEDGER_TREE_UNRESOLVED', 'suite ledger tree is not a captured committed fixture tree', { ledger_row_id: row.id, tree_hash: row.tree_hash });
@@ -463,7 +510,9 @@ export async function evaluateO9(invocation) {
   const evidence = [writeEvidenceJson(invocation, 'o9-ledger-replay-audit.json', {
     schema_version: 1,
     ledger_reconciled: true,
-    ledger_row_count: ledger.length,
+    ledger_row_count: inScopeLedger.length,
+    skipped_foreign_rows: skippedForeign.length,
+    skipped_foreign_row_ids: skippedForeign.map((row) => row.id),
     committed_tree_count: reachableTrees.size,
     observation_count: observations.length,
     invocation_count: invocations.size,

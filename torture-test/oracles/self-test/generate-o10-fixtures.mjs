@@ -53,6 +53,7 @@ const CASES = MODES.flatMap((mode) => EVIDENCE.map((evidence) => ({
   { name: 'o10-default-missing-concession-key-mutation', expected: 'FAIL', mode: MODES[1], evidence: 'missing', mutation: 'concession-key-mismatch', finding: 'O10_CONCESSION_KEY_MISMATCH' },
   { name: 'o10-rugpull-replacement-launch-invariant', expected: 'PASS', mode: MODES[1], evidence: 'green', replacement: true },
   { name: 'o10-rugpull-replacement-context-laundered-mutation', expected: 'FAIL', mode: MODES[1], evidence: 'green', mutation: 'context-laundered', replacement: true, finding: 'O10_LAUNCH_INTENT_MUTATION' },
+  { name: 'o10-null-gate-key', expected: 'NOT_EVALUABLE', mode: MODES[1], evidence: 'missing', nullGateKey: true },
 ]);
 
 function sha256(content) { return createHash('sha256').update(content).digest('hex'); }
@@ -194,7 +195,7 @@ for (const fixture of CASES) {
     workflow: 'feature-dev-merge-worktree', fixture: 'synthetic', harness: 'scripted-pi', execution_mode: 'scripted',
     repository: { path: 'fixtures/synthetic-o10', origin_repo: ORIGIN },
     policy: { merge_gate: fixture.mode.mergeGate, fail_missing: fixture.mode.failMissing, execution_mode: 'scripted' },
-    gate_key: { origin_repo: ORIGIN, cmd_hash: CMD_HASH },
+    gate_key: fixture.nullGateKey ? null : { origin_repo: ORIGIN, cmd_hash: CMD_HASH },
     argv: ['workflow', 'run'], argv_sha256: '1'.repeat(64), launch_intent_at: '2026-08-01T12:00:00.000Z',
   }, 'controller-launch-intent');
   references.refs_before = writeSnapshot(campaign, snapshots, 'refs-before.json', {
