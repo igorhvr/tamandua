@@ -1,7 +1,19 @@
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 
-/** Stable Linux kernel process-start identity, used with a PID to prevent ABA reuse. */
+/**
+ * Stable process-start identity, used with a PID to prevent ABA reuse:
+ * procfs starttime on linux, `ps -o lstart=` on darwin, null elsewhere.
+ */
 export function getProcessStartIdentity(pid: number): string | null {
+  if (process.platform === "darwin") {
+    try {
+      const lstart = execFileSync("ps", ["-p", String(pid), "-o", "lstart="], { encoding: "utf-8", timeout: 5000 }).trim();
+      return lstart !== "" ? `ps:${lstart}` : null;
+    } catch {
+      return null;
+    }
+  }
   if (process.platform !== "linux") return null;
   try {
     const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf-8");

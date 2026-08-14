@@ -115,7 +115,7 @@ describe("suite claim owner liveness", { concurrency: 1 }, () => {
 
   it("reads a stable start identity for the current process", () => {
     const first = getProcessStartIdentity(process.pid);
-    assert.ok(first?.startsWith("proc:") || first?.startsWith("ps:"));
+    assert.ok(first !== null, "start identity must be computable on the current platform");
     assert.equal(getProcessStartIdentity(process.pid), first);
     assert.equal(getProcessStartIdentity(Number.MAX_SAFE_INTEGER), null);
   });

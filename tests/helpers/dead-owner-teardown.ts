@@ -195,6 +195,15 @@ function signalProcessGroup(pgid: number, signal: NodeJS.Signals): void {
       // Group already gone: expected
       return;
     }
+    if ((err as NodeJS.ErrnoException).code === "EPERM") {
+      // Darwin/BSD killpg semantics: process.kill(-pgid, sig) raises EPERM
+      // when ANY member of the group is unsignalable (Linux succeeds if at
+      // least one member is signalable). Tolerate it — the helper's existing
+      // per-pid fallbacks (reapMarkerSurvivors marker-scan + direct pid
+      // kills, already blanket try/catch'd) provide the coverage when a
+      // group signal is refused.
+      return;
+    }
     throw err;
   }
 }

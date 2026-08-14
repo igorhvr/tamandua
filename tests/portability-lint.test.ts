@@ -240,7 +240,7 @@ describe("portability lint - unit", () => {
     assert.equal(v.length, 0);
   });
 
-  it("allows the Linux-only process-start identity helper", () => {
+  it("allows the process-start identity helper", () => {
     const v = scanFileContent(
       "src/lib/process-start-identity.ts",
       "readFileSync(`" + P + "${pid}/stat`)",

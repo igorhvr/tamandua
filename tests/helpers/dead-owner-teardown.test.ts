@@ -201,6 +201,34 @@ while :; do sleep 0.1; done
     // No exception = pass
   });
 
+  it("tolerates EPERM when the group signal is refused (Darwin killpg semantics)", () => {
+    const marker = uniqueMarker();
+    const pgidFile = join(tempDir, `eperm-${marker}.pid`);
+    const { pgid } = spawnDetachedSuite(pgidFile, marker);
+    readPgidWhenReady(pgidFile);
+    assert.ok(isAlive(pgid), "suite should be alive before teardown");
+
+    // Stub process.kill to simulate Darwin/BSD killpg semantics: a group
+    // signal raises EPERM when ANY member of the group is unsignalable.
+    // signalProcessGroup must tolerate it and fall through to the helper's
+    // per-pid fallbacks (marker-scan + direct kills, all blanket
+    // try/catch'd), so terminateOwnedProcessGroup must not throw.
+    const originalKill = process.kill;
+    const epermError = Object.assign(new Error("EPERM: operation not permitted"), { code: "EPERM" });
+    process.kill = (() => {
+      throw epermError;
+    }) as typeof process.kill;
+    try {
+      terminateOwnedProcessGroup({ pgidFile, ownershipMarker: marker, graceMs: 0 });
+    } finally {
+      process.kill = originalKill;
+    }
+    // No exception = pass
+
+    // The mocked kill was a no-op, so the suite is still alive — clean up.
+    try { process.kill(-pgid, "SIGKILL"); } catch { /* */ }
+  });
+
   // ── Unrelated process preservation ──
 
   it("does not kill unrelated processes", () => {
@@ -270,7 +298,7 @@ while :; do sleep 0.1; done
     terminateOwnedProcessGroup({
       pgidFile,
       pid: pgid,
-      startTime: "proc:99999999",
+      startTime: "deliberately-wrong-identity",
       ownershipMarker: marker,
       graceMs: 500,
     });

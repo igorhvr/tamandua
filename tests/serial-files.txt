@@ -54,6 +54,7 @@ src/installer/step-ops-complete.test.ts
 src/installer/step-ops-pure.test.ts
 src/installer/step-ops-stories.test.ts
 src/installer/worktree-manager.test.ts
+src/lib/process-start-identity.test.ts
 src/lib/version-check.test.ts
 src/server/control-client.test.ts
 src/server/control-server-harness-workdir.test.ts
@@ -69,6 +70,7 @@ src/server/daemonctl-self-stop-guard.test.ts
 src/server/daemonctl-stop-barrier.test.ts
 src/server/daemonctl.test.ts
 src/server/dashboard.test.ts
+src/server/suite-claim-liveness.test.ts
 src/suite/shim-acceptance.test.ts
 src/suite/shim.test.ts
 src/suite/tree-hash.test.ts
