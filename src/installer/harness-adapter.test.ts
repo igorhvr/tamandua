@@ -60,6 +60,11 @@ describe("getHarnessAdapter", () => {
     assert.equal(adapter.type, "hermes");
   });
 
+  it('returns a DshHarnessAdapter for "dsh"', () => {
+    const adapter = getHarnessAdapter("dsh");
+    assert.equal(adapter.type, "dsh");
+  });
+
   it("throws for unknown harness type", () => {
     assert.throws(
       () => getHarnessAdapter("unknown"),
@@ -1495,6 +1500,686 @@ echo ${isolatedHermes}
           process.env.TAMANDUA_HERMES_BINARY = savedHermesBinary;
         }
         process.env.PATH = savedPath ?? "";
+      }
+    });
+  });
+});
+
+// ── DshHarnessAdapter implementation ──────────────────────────────
+
+describe("DshHarnessAdapter implementation", () => {
+  const adapter = getHarnessAdapter("dsh");
+
+  it("has type 'dsh'", () => {
+    assert.equal(adapter.type, "dsh");
+  });
+
+  describe("findBinary", () => {
+    let savedDshBinary: string | undefined;
+    let savedPath: string | undefined;
+
+    beforeEach(() => {
+      savedDshBinary = process.env.TAMANDUA_DSH_BINARY;
+      savedPath = process.env.PATH;
+    });
+
+    afterEach(() => {
+      if (savedDshBinary === undefined) {
+        delete process.env.TAMANDUA_DSH_BINARY;
+      } else {
+        process.env.TAMANDUA_DSH_BINARY = savedDshBinary;
+      }
+      if (savedPath !== undefined) {
+        process.env.PATH = savedPath;
+      }
+    });
+
+    it("respects TAMANDUA_DSH_BINARY env var when set and executable", async () => {
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-dsh-");
+      const dshPath = path.join(tmpDir, "dsh-custom");
+      fs.writeFileSync(dshPath, "#!/bin/sh\necho hello\n", { mode: 0o755 });
+
+      process.env.TAMANDUA_DSH_BINARY = dshPath;
+
+      const result = await adapter.findBinary();
+      assert.equal(result, dshPath);
+    });
+
+    it("throws when TAMANDUA_DSH_BINARY is set but not executable", async () => {
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-dsh-");
+      const dshPath = path.join(tmpDir, "dsh-broken");
+      fs.writeFileSync(dshPath, "#!/bin/sh\necho hi\n", { mode: 0o644 });
+
+      process.env.TAMANDUA_DSH_BINARY = dshPath;
+
+      await assert.rejects(
+        () => adapter.findBinary(),
+        /TAMANDUA_DSH_BINARY set but not executable/,
+      );
+    });
+
+    it("prefers dsh-token-saver over dsh when preferTokenSaver is true and both exist", async () => {
+      delete process.env.TAMANDUA_DSH_BINARY;
+
+      const { root: binDir } = createTempHome("tamandua-test-harness-adapter-dts-");
+      const dshPath = path.join(binDir, "dsh");
+      const saverPath = path.join(binDir, "dsh-token-saver");
+      fs.writeFileSync(dshPath, "#!/bin/sh\necho dsh\n", { mode: 0o755 });
+      fs.writeFileSync(saverPath, "#!/bin/sh\necho saver\n", { mode: 0o755 });
+
+      process.env.PATH = binDir;
+
+      assert.equal(await adapter.findBinary({ preferTokenSaver: true }), saverPath);
+      assert.equal(await adapter.findBinary({ preferTokenSaver: false }), dshPath);
+      assert.equal(await adapter.findBinary(), dshPath);
+    });
+
+    it("falls back to dsh when dsh-token-saver is not installed", async () => {
+      delete process.env.TAMANDUA_DSH_BINARY;
+
+      const { root: binDir } = createTempHome("tamandua-test-harness-adapter-dts-");
+      const dshPath = path.join(binDir, "dsh");
+      fs.writeFileSync(dshPath, "#!/bin/sh\necho dsh\n", { mode: 0o755 });
+
+      process.env.PATH = binDir;
+
+      assert.equal(await adapter.findBinary({ preferTokenSaver: true }), dshPath);
+    });
+
+    it("throws clear error when dsh not found in PATH and no env var set", async () => {
+      delete process.env.TAMANDUA_DSH_BINARY;
+
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-dsh-");
+      process.env.PATH = tmpDir;
+
+      await assert.rejects(
+        () => adapter.findBinary(),
+        /dsh binary not found in PATH/,
+      );
+    });
+  });
+
+  describe("runRound", () => {
+    it("adapter argv is exactly [\"--profile\",\"headless\",prompt] with the prompt last", async () => {
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-dsh-runround-");
+      const fakeDsh = path.join(tmpDir, "dsh");
+      const argsFile = path.join(tmpDir, "args.txt");
+      fs.writeFileSync(
+        fakeDsh,
+        `#!/usr/bin/env node
+const fs = require('node:fs');
+fs.writeFileSync('${argsFile}', JSON.stringify(process.argv.slice(2)));
+process.stdout.write('done output\\n');
+`,
+        { mode: 0o755 },
+      );
+
+      const originalDshBinary = process.env.TAMANDUA_DSH_BINARY;
+      process.env.TAMANDUA_DSH_BINARY = fakeDsh;
+
+      try {
+        const result = await adapter.runRound("test prompt", {
+          timeout: 5,
+          workdir: tmpDir,
+        });
+
+        assert.ok(fs.existsSync(argsFile), "args file should exist");
+        const recorded = JSON.parse(fs.readFileSync(argsFile, "utf-8"));
+        assert.deepEqual(recorded, ["--profile", "headless", "test prompt"]);
+        assert.equal(result.exitCode, 0);
+      } finally {
+        if (originalDshBinary === undefined) {
+          delete process.env.TAMANDUA_DSH_BINARY;
+        } else {
+          process.env.TAMANDUA_DSH_BINARY = originalDshBinary;
+        }
+      }
+    });
+
+    it("stdout passes through verbatim including STATUS lines and trailing newline", async () => {
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-dsh-runround-");
+      const fakeDsh = path.join(tmpDir, "dsh");
+      fs.writeFileSync(
+        fakeDsh,
+        `#!/bin/sh
+printf '%s\\n' "STATUS: done" "REPO: /srv/repo" "BRANCH: feature/dsh-harness-alpha" "COMMITS: abc123" "CHANGES: implemented the dsh adapter" "TESTS: dsh adapter tests"`,
+        { mode: 0o755 },
+      );
+
+      const originalDshBinary = process.env.TAMANDUA_DSH_BINARY;
+      process.env.TAMANDUA_DSH_BINARY = fakeDsh;
+
+      try {
+        const result = await adapter.runRound("do the work", { timeout: 5 });
+
+        // Verbatim: no filtering, no trim — the final text plus "\n" survives intact.
+        assert.equal(
+          result.output,
+          "STATUS: done\nREPO: /srv/repo\nBRANCH: feature/dsh-harness-alpha\nCOMMITS: abc123\nCHANGES: implemented the dsh adapter\nTESTS: dsh adapter tests\n",
+        );
+        assert.equal(result.exitCode, 0);
+        assert.equal(result.signal, undefined);
+        assert.equal(result.stderrTail, "");
+      } finally {
+        if (originalDshBinary === undefined) {
+          delete process.env.TAMANDUA_DSH_BINARY;
+        } else {
+          process.env.TAMANDUA_DSH_BINARY = originalDshBinary;
+        }
+      }
+    });
+
+    it("mock dsh trapping SIGTERM and exiting 0 yields timedOut true on timeout", async () => {
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-dsh-runround-");
+      const fakeDsh = path.join(tmpDir, "dsh");
+      // dsh's supervisor-stop semantics: trap TERM and exit 0.
+      // Without the phantom-outcome guard, the adapter would report a
+      // timed-out round as a clean success (exitCode 0, no signal).
+      fs.writeFileSync(
+        fakeDsh,
+        `#!/bin/sh
+trap 'exit 0' TERM
+sleep 10
+`,
+        { mode: 0o755 },
+      );
+
+      const originalDshBinary = process.env.TAMANDUA_DSH_BINARY;
+      process.env.TAMANDUA_DSH_BINARY = fakeDsh;
+
+      try {
+        const result = await adapter.runRound("prompt", { timeout: 0.05, workdir: tmpDir });
+        assert.equal(result.timedOut, true);
+        assert.equal(result.exitCode, null);
+        assert.equal(result.signal, "SIGTERM");
+        assert.equal(result.output, "");
+      } finally {
+        if (originalDshBinary === undefined) {
+          delete process.env.TAMANDUA_DSH_BINARY;
+        } else {
+          process.env.TAMANDUA_DSH_BINARY = originalDshBinary;
+        }
+      }
+    });
+
+    it("external SIGTERM trapped by dsh reports exit 0 but never sets timedOut", async () => {
+      // Documented dsh trap behavior: ANY SIGTERM (not just the adapter's
+      // timeout) makes dsh exit 0. When the kill comes from outside the
+      // adapter (e.g. scheduler teardown), timedOut stays false because the
+      // adapter's own timeout timer never fired.
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-dsh-runround-");
+      const fakeDsh = path.join(tmpDir, "dsh");
+      const readyFile = path.join(tmpDir, "dsh-ready");
+      fs.writeFileSync(
+        fakeDsh,
+        `#!/bin/sh
+trap 'exit 0' TERM
+touch '${readyFile}'
+while :; do sleep 1; done
+`,
+        { mode: 0o755 },
+      );
+
+      const originalDshBinary = process.env.TAMANDUA_DSH_BINARY;
+      process.env.TAMANDUA_DSH_BINARY = fakeDsh;
+
+      try {
+        let childPid: number | null = null;
+        let childPgid = 0;
+        const roundPromise = adapter.runRound("prompt", {
+          timeout: 10,
+          workdir: tmpDir,
+          onSpawn: ({ pid, pgid }) => {
+            childPid = pid;
+            childPgid = pgid;
+          },
+        });
+
+        // Wait until the fake has installed its trap, then deliver the
+        // teardown-style SIGTERM from outside the adapter.
+        const deadline = Date.now() + 2000;
+        while (!fs.existsSync(readyFile) && Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 10));
+        }
+        assert.ok(fs.existsSync(readyFile), "fake dsh must reach its trap install");
+        assert.ok(childPid !== null && childPgid !== 0, "onSpawn must have fired");
+        process.kill(-childPgid, "SIGTERM");
+
+        const result = await roundPromise;
+
+        // The mock trapped TERM and exited 0 — the adapter reports the
+        // real exit, and timedOut is false (its own timer never fired).
+        assert.equal(result.exitCode, 0);
+        assert.equal(result.signal, undefined);
+        assert.equal(result.timedOut, undefined);
+      } finally {
+        if (originalDshBinary === undefined) {
+          delete process.env.TAMANDUA_DSH_BINARY;
+        } else {
+          process.env.TAMANDUA_DSH_BINARY = originalDshBinary;
+        }
+      }
+    });
+
+    it("dsh: code: message stderr is surfaced via sanitized stderr tail", async () => {
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-dsh-runround-");
+      const fakeDsh = path.join(tmpDir, "dsh");
+      fs.writeFileSync(
+        fakeDsh,
+        `#!/bin/sh
+echo "dsh: E_CREDENTIALS: DEEPSEEK_API_KEY is not set" >&2
+exit 1
+`,
+        { mode: 0o755 },
+      );
+
+      const originalDshBinary = process.env.TAMANDUA_DSH_BINARY;
+      process.env.TAMANDUA_DSH_BINARY = fakeDsh;
+
+      try {
+        const result = await adapter.runRound("prompt", { timeout: 5, workdir: tmpDir });
+        assert.equal(result.exitCode, 1);
+        assert.equal(result.signal, undefined);
+        assert.equal(result.timedOut, undefined);
+        assert.ok(
+          result.stderrTail.includes("dsh: E_CREDENTIALS: DEEPSEEK_API_KEY is not set"),
+          `stderrTail should surface the dsh error, got: ${JSON.stringify(result.stderrTail)}`,
+        );
+        assert.equal(result.output, "");
+      } finally {
+        if (originalDshBinary === undefined) {
+          delete process.env.TAMANDUA_DSH_BINARY;
+        } else {
+          process.env.TAMANDUA_DSH_BINARY = originalDshBinary;
+        }
+      }
+    });
+
+    it("non-zero exit codes propagate without rejection (always-resolve)", async () => {
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-dsh-runround-");
+      const fakeDsh = path.join(tmpDir, "dsh");
+      fs.writeFileSync(
+        fakeDsh,
+        `#!/usr/bin/env node
+process.stdout.write('partial work before crash\\n');
+process.exit(7);
+`,
+        { mode: 0o755 },
+      );
+
+      const originalDshBinary = process.env.TAMANDUA_DSH_BINARY;
+      process.env.TAMANDUA_DSH_BINARY = fakeDsh;
+
+      try {
+        const result = await adapter.runRound("prompt", { timeout: 5, workdir: tmpDir });
+        assert.equal(result.exitCode, 7);
+        assert.equal(result.signal, undefined);
+        assert.equal(result.timedOut, undefined);
+        assert.equal(result.output, "partial work before crash\n");
+      } finally {
+        if (originalDshBinary === undefined) {
+          delete process.env.TAMANDUA_DSH_BINARY;
+        } else {
+          process.env.TAMANDUA_DSH_BINARY = originalDshBinary;
+        }
+      }
+    });
+
+    it("prompt starting with '-' is guarded with the launcher+app '--' pair", async () => {
+      // Observed dsh behavior (commander 15.0.0 from dsh's dependency tree):
+      // a task token starting with '-' is rejected by the headless app as
+      // `error: unknown option '-…'` (exit 1). dsh's launcher consumes the
+      // FIRST '--' it sees, so the adapter emits TWO '--' tokens: one for
+      // the launcher, one for the headless app's own commander parse, which
+      // forces the prompt through as the task operand.
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-dsh-runround-");
+      const fakeDsh = path.join(tmpDir, "dsh");
+      const argsFile = path.join(tmpDir, "args.txt");
+      fs.writeFileSync(
+        fakeDsh,
+        `#!/usr/bin/env node
+const fs = require('node:fs');
+fs.writeFileSync('${argsFile}', JSON.stringify(process.argv.slice(2)));
+process.stdout.write('ok\\n');
+`,
+        { mode: 0o755 },
+      );
+
+      const originalDshBinary = process.env.TAMANDUA_DSH_BINARY;
+      process.env.TAMANDUA_DSH_BINARY = fakeDsh;
+
+      try {
+        await adapter.runRound("-fix the bug", { timeout: 5, workdir: tmpDir });
+
+        assert.ok(fs.existsSync(argsFile), "args file should exist");
+        const recorded = JSON.parse(fs.readFileSync(argsFile, "utf-8"));
+        assert.deepEqual(recorded, ["--profile", "headless", "--", "--", "-fix the bug"]);
+      } finally {
+        if (originalDshBinary === undefined) {
+          delete process.env.TAMANDUA_DSH_BINARY;
+        } else {
+          process.env.TAMANDUA_DSH_BINARY = originalDshBinary;
+        }
+      }
+    });
+
+    it("prompt not starting with '-' receives no '--' guard", async () => {
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-dsh-runround-");
+      const fakeDsh = path.join(tmpDir, "dsh");
+      const argsFile = path.join(tmpDir, "args.txt");
+      fs.writeFileSync(
+        fakeDsh,
+        `#!/usr/bin/env node
+const fs = require('node:fs');
+fs.writeFileSync('${argsFile}', JSON.stringify(process.argv.slice(2)));
+process.stdout.write('ok\\n');
+`,
+        { mode: 0o755 },
+      );
+
+      const originalDshBinary = process.env.TAMANDUA_DSH_BINARY;
+      process.env.TAMANDUA_DSH_BINARY = fakeDsh;
+
+      try {
+        await adapter.runRound("  -fix the bug", { timeout: 5, workdir: tmpDir });
+
+        assert.ok(fs.existsSync(argsFile), "args file should exist");
+        const recorded = JSON.parse(fs.readFileSync(argsFile, "utf-8"));
+        // Leading whitespace keeps the token from looking like an option
+        // to commander, so the guard is not needed.
+        assert.deepEqual(recorded, ["--profile", "headless", "  -fix the bug"]);
+      } finally {
+        if (originalDshBinary === undefined) {
+          delete process.env.TAMANDUA_DSH_BINARY;
+        } else {
+          process.env.TAMANDUA_DSH_BINARY = originalDshBinary;
+        }
+      }
+    });
+
+    it("resolves on timeout without the trap — mock dsh sleeping", async () => {
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-dsh-runround-");
+      const fakeDsh = path.join(tmpDir, "dsh");
+      fs.writeFileSync(fakeDsh, "#!/bin/sh\nsleep 10\n", { mode: 0o755 });
+
+      const originalDshBinary = process.env.TAMANDUA_DSH_BINARY;
+      process.env.TAMANDUA_DSH_BINARY = fakeDsh;
+
+      try {
+        const result = await adapter.runRound("prompt", { timeout: 0.05, workdir: tmpDir });
+        assert.equal(result.timedOut, true);
+        assert.equal(result.exitCode, null);
+        assert.equal(result.signal, "SIGTERM");
+      } finally {
+        if (originalDshBinary === undefined) {
+          delete process.env.TAMANDUA_DSH_BINARY;
+        } else {
+          process.env.TAMANDUA_DSH_BINARY = originalDshBinary;
+        }
+      }
+    });
+
+    it("uses pre-resolved binaryPath without PATH access to dsh", async () => {
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-dsh-runround-");
+      const dshDir = path.join(tmpDir, "dsh-dir");
+      fs.mkdirSync(dshDir, { recursive: true });
+      const dshPath = path.join(dshDir, "dsh");
+      fs.writeFileSync(
+        dshPath,
+        `#!/bin/sh
+echo "work done"
+`,
+        { mode: 0o755 },
+      );
+
+      const originalPath = process.env.PATH;
+      const originalDshBinary = process.env.TAMANDUA_DSH_BINARY;
+      delete process.env.TAMANDUA_DSH_BINARY;
+      process.env.PATH = tmpDir;
+
+      try {
+        const result = await adapter.runRound("do the work", {
+          timeout: 5,
+          binaryPath: dshPath,
+        });
+
+        assert.equal(result.output, "work done\n");
+        assert.equal(result.exitCode, 0);
+      } finally {
+        if (originalDshBinary === undefined) {
+          delete process.env.TAMANDUA_DSH_BINARY;
+        } else {
+          process.env.TAMANDUA_DSH_BINARY = originalDshBinary;
+        }
+        if (originalPath === undefined) {
+          delete process.env.PATH;
+        } else {
+          process.env.PATH = originalPath;
+        }
+      }
+    });
+
+    it("sets truncated flag and preserves trailing STATUS lines when stdout exceeds 10MB budget", async () => {
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-dsh-runround-");
+      const fakeDsh = path.join(tmpDir, "dsh");
+      fs.writeFileSync(
+        fakeDsh,
+        `#!/bin/sh
+# ~11MB of noise followed by the final assistant text
+dd if=/dev/zero bs=1M count=11 2>/dev/null
+echo "STATUS: done"
+`,
+        { mode: 0o755 },
+      );
+
+      const originalDshBinary = process.env.TAMANDUA_DSH_BINARY;
+      process.env.TAMANDUA_DSH_BINARY = fakeDsh;
+
+      try {
+        const result = await adapter.runRound("task", { timeout: 15, workdir: tmpDir });
+
+        assert.equal(result.truncated, true, "truncated flag should be set");
+        assert.ok(
+          result.output.includes("[…output truncated…]"),
+          "truncation marker should be present in stdout",
+        );
+        assert.ok(
+          result.output.includes("STATUS: done"),
+          "final STATUS line must survive in the tail window",
+        );
+      } finally {
+        if (originalDshBinary === undefined) {
+          delete process.env.TAMANDUA_DSH_BINARY;
+        } else {
+          process.env.TAMANDUA_DSH_BINARY = originalDshBinary;
+        }
+      }
+    });
+
+    it("dsh pre-launch log redacts the prompt with commandPreview parity", async () => {
+      const { root: tmpStateDir } = createTempHome("tamandua-test-adapter-dsh-cmdpreview-");
+      const savedStateDir = process.env.TAMANDUA_STATE_DIR;
+      process.env.TAMANDUA_STATE_DIR = tmpStateDir;
+
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-dsh-runround-");
+      const fakeDsh = path.join(tmpDir, "dsh");
+      fs.writeFileSync(
+        fakeDsh,
+        `#!/bin/sh
+echo "done"
+`,
+        { mode: 0o755 },
+      );
+
+      const originalDshBinary = process.env.TAMANDUA_DSH_BINARY;
+      process.env.TAMANDUA_DSH_BINARY = fakeDsh;
+
+      const secretPrompt = "VERY_SECRET_DSH_PROMPT";
+
+      try {
+        const result = await adapter.runRound(secretPrompt, { timeout: 5 });
+
+        assert.equal(result.output, "done\n");
+
+        const logPath = path.join(tmpStateDir, "tamandua.log");
+        const logContent = fs.readFileSync(logPath, "utf-8");
+        assert.ok(
+          logContent.includes("dsh pre-launch"),
+          "log must contain dsh pre-launch entry",
+        );
+        assert.ok(
+          logContent.includes("<prompt elided>"),
+          "commandPreview must contain redaction marker",
+        );
+        assert.ok(
+          !logContent.includes(secretPrompt),
+          "log must NOT contain the secret prompt",
+        );
+        assert.ok(
+          logContent.includes('"promptElided":true'),
+          "log must show promptElided: true",
+        );
+        assert.equal(typeof result.commandPreview, "string");
+        assert.ok(result.commandPreview!.includes("<prompt elided>"));
+        assert.ok(!result.commandPreview!.includes(secretPrompt));
+        assert.ok(Array.isArray(result.redactedIndices));
+        assert.ok(result.redactedIndices!.includes(2));
+        assert.equal(result.promptElided, true);
+      } finally {
+        if (savedStateDir === undefined) {
+          delete process.env.TAMANDUA_STATE_DIR;
+        } else {
+          process.env.TAMANDUA_STATE_DIR = savedStateDir;
+        }
+        if (originalDshBinary === undefined) {
+          delete process.env.TAMANDUA_DSH_BINARY;
+        } else {
+          process.env.TAMANDUA_DSH_BINARY = originalDshBinary;
+        }
+      }
+    });
+
+    it("forces DSH_PERMISSION_MODE=danger-full-access overriding an inherited conflicting value", async () => {
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-dsh-runround-");
+      const fakeDsh = path.join(tmpDir, "dsh");
+      const envFile = path.join(tmpDir, "env.txt");
+      fs.writeFileSync(
+        fakeDsh,
+        `#!/bin/sh
+echo "DSH_PERMISSION_MODE=$DSH_PERMISSION_MODE" > "${envFile}"
+echo "done"
+`,
+        { mode: 0o755 },
+      );
+
+      const originalDshBinary = process.env.TAMANDUA_DSH_BINARY;
+      const savedPermissionMode = process.env.DSH_PERMISSION_MODE;
+      process.env.TAMANDUA_DSH_BINARY = fakeDsh;
+      // Inherited (parent) env carries a conflicting value — the adapter
+      // must override it unconditionally.
+      process.env.DSH_PERMISSION_MODE = "read-only";
+
+      try {
+        const result = await adapter.runRound("task", { timeout: 5, workdir: tmpDir });
+
+        assert.equal(result.exitCode, 0);
+        assert.equal(
+          fs.readFileSync(envFile, "utf-8").trim(),
+          "DSH_PERMISSION_MODE=danger-full-access",
+        );
+      } finally {
+        if (savedPermissionMode === undefined) {
+          delete process.env.DSH_PERMISSION_MODE;
+        } else {
+          process.env.DSH_PERMISSION_MODE = savedPermissionMode;
+        }
+        if (originalDshBinary === undefined) {
+          delete process.env.TAMANDUA_DSH_BINARY;
+        } else {
+          process.env.TAMANDUA_DSH_BINARY = originalDshBinary;
+        }
+      }
+    });
+
+    it("forces DSH_PERMISSION_MODE=danger-full-access even when caller-supplied env conflicts", async () => {
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-dsh-runround-");
+      const fakeDsh = path.join(tmpDir, "dsh");
+      const envFile = path.join(tmpDir, "env.txt");
+      fs.writeFileSync(
+        fakeDsh,
+        `#!/bin/sh
+echo "DSH_PERMISSION_MODE=$DSH_PERMISSION_MODE" > "${envFile}"
+echo "done"
+`,
+        { mode: 0o755 },
+      );
+
+      const originalDshBinary = process.env.TAMANDUA_DSH_BINARY;
+      process.env.TAMANDUA_DSH_BINARY = fakeDsh;
+
+      try {
+        const result = await adapter.runRound("task", {
+          timeout: 5,
+          workdir: tmpDir,
+          env: { DSH_PERMISSION_MODE: "workspace-write" },
+        });
+
+        assert.equal(result.exitCode, 0);
+        assert.equal(
+          fs.readFileSync(envFile, "utf-8").trim(),
+          "DSH_PERMISSION_MODE=danger-full-access",
+        );
+      } finally {
+        if (originalDshBinary === undefined) {
+          delete process.env.TAMANDUA_DSH_BINARY;
+        } else {
+          process.env.TAMANDUA_DSH_BINARY = originalDshBinary;
+        }
+      }
+    });
+
+    it("passes user dsh env (DSH_HOME, DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL) through unmodified", async () => {
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-dsh-runround-");
+      const fakeDsh = path.join(tmpDir, "dsh");
+      const envFile = path.join(tmpDir, "env.txt");
+      fs.writeFileSync(
+        fakeDsh,
+        `#!/bin/sh
+{
+  echo "DSH_HOME=$DSH_HOME"
+  echo "DEEPSEEK_API_KEY=$DEEPSEEK_API_KEY"
+  echo "DEEPSEEK_BASE_URL=$DEEPSEEK_BASE_URL"
+} > "${envFile}"
+echo "done"
+`,
+        { mode: 0o755 },
+      );
+
+      const originalDshBinary = process.env.TAMANDUA_DSH_BINARY;
+      process.env.TAMANDUA_DSH_BINARY = fakeDsh;
+
+      try {
+        const result = await adapter.runRound("task", {
+          timeout: 5,
+          workdir: tmpDir,
+          env: {
+            DSH_HOME: "/custom/dsh-home",
+            DEEPSEEK_API_KEY: "sk-custom-key",
+            DEEPSEEK_BASE_URL: "https://custom.deepseek.example",
+          },
+        });
+
+        assert.equal(result.exitCode, 0);
+        const recorded = fs.readFileSync(envFile, "utf-8");
+        assert.ok(recorded.includes("DSH_HOME=/custom/dsh-home"));
+        assert.ok(recorded.includes("DEEPSEEK_API_KEY=sk-custom-key"));
+        assert.ok(recorded.includes("DEEPSEEK_BASE_URL=https://custom.deepseek.example"));
+      } finally {
+        if (originalDshBinary === undefined) {
+          delete process.env.TAMANDUA_DSH_BINARY;
+        } else {
+          process.env.TAMANDUA_DSH_BINARY = originalDshBinary;
+        }
       }
     });
   });

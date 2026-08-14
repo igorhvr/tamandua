@@ -8,6 +8,7 @@ import { formatPiCommandPreview, findPromptArgvIndices, formatCommandPreview } f
 import { parsePiOutputStream } from "./pi-stream-parser.js";
 import { sanitizeStderrTail } from "./step-ops.js";
 import { resolveHermesBinary } from "./hermes-resolver.js";
+import { resolveDshBinary } from "./dsh-resolver.js";
 
 // ── Harness round result ───────────────────────────────────────────
 
@@ -74,6 +75,8 @@ export interface HarnessAdapter {
    * For pi: honors TAMANDUA_PI_BINARY env, pi-token-saver preference,
    * and PATH search.
    * For hermes: honors TAMANDUA_HERMES_BINARY env and PATH search.
+   * For dsh: honors TAMANDUA_DSH_BINARY env, dsh-token-saver preference,
+   * PATH search, and a login-shell fallback.
    */
   findBinary(options?: { preferTokenSaver?: boolean }): Promise<string>;
 
@@ -780,6 +783,382 @@ class HermesHarnessAdapter implements HarnessAdapter {
   }
 }
 
+// ── DshHarnessAdapter ─────────────────────────────────────────────
+
+class DshHarnessAdapter implements HarnessAdapter {
+  readonly type: HarnessType = "dsh";
+
+  async findBinary(
+    options?: { preferTokenSaver?: boolean },
+  ): Promise<string> {
+    return resolveDshBinary({
+      preferTokenSaver: options?.preferTokenSaver,
+    });
+  }
+
+  async runRound(
+    prompt: string,
+    options?: RunHarnessOptions,
+  ): Promise<HarnessRoundResult> {
+    const timeoutMs = ((options?.timeout) ?? 600) * 1000;
+    const dshPath =
+      options?.binaryPath ??
+      (await this.findBinary({
+        preferTokenSaver: options?.preferTokenSaver,
+      }));
+
+    const childEnv: Record<string, string | undefined> = {
+      ...(process.env as Record<string, string | undefined>),
+      ...(options?.env ?? {}),
+    };
+
+    // Mandatory tamandua injection — the dsh equivalent of the `--yolo`
+    // flag tamandua passes to hermes. Under dsh's default
+    // `workspace-write` sandbox the headless app auto-DENIES (fail-closed,
+    // no prompt) any action outside the workspace root — including
+    // `tamandua step complete`, which writes to ~/.tamandua — so without
+    // this injection agents could do the work but never report it and every
+    // run would be useless. Set unconditionally AFTER the env merge so it
+    // overrides any inherited (or caller-supplied) value; it is
+    // process-scoped — nothing under ~/.dsh is ever created or modified and
+    // the user's other dsh usage is unaffected. (A profile cordis.patch.yml
+    // that hard-pins sandbox/approval rows overrides this env var — dsh's
+    // profile layers replace those config rows wholesale — `tamandua doctor`
+    // probes for exactly that condition.)
+    childEnv.DSH_PERMISSION_MODE = "danger-full-access";
+
+    const startedAt = Date.now();
+
+    // dsh headless invocation: `dsh --profile headless <prompt>`.
+    // The headless app accepts ONLY the task positional (plus --help) —
+    // no --json/--model/--resume/--cwd/--timeout/--yolo. All behavior
+    // comes from env vars and profile patch layers.
+    const args = ["--profile", "headless"];
+
+    // Prompt-starting-with-`-` guard. Observed dsh behavior: a task token
+    // whose first character is `-` is rejected by the headless app's
+    // commander parse as `error: unknown option '-…'` (exit 1) — the task
+    // misparses and the round never runs. dsh's launcher (apps/cli/args.ts)
+    // consumes the FIRST `--` it sees and hands everything after it
+    // verbatim to the booted app, whose own commander parse honors `--` as
+    // end-of-options. So exactly TWO `--` tokens are emitted: the launcher
+    // consumes one, the headless app consumes the second, and the prompt is
+    // forced through as the task operand regardless of its first character.
+    // (Verified against commander 15.0.0 from dsh's own dependency tree;
+    // a single `--` does NOT survive to the headless app.)
+    if (prompt.startsWith("-")) {
+      args.push("--", "--");
+    }
+    args.push(prompt);
+
+    // The prompt is always the final argv element.
+    const redactedIndices = [args.length - 1];
+    const preview = formatCommandPreview(dshPath, args, redactedIndices);
+
+    logger.info("dsh pre-launch", {
+      harness: "dsh",
+      dshPath,
+      promptLength: Buffer.byteLength(prompt, "utf-8"),
+      commandPreview: preview.commandPreview,
+      redactedIndices: preview.redactedIndices,
+      promptElided: preview.promptElided,
+      timeoutMs,
+      workdir: options?.workdir,
+    });
+
+    // Spawn dsh via a POSIX shell wrapper so the true harness PGID flows
+    // through to every tool subshell. With detached:true the shell becomes
+    // its own process group leader; exec preserves the pid so pgid == $$.
+    // The claim CLI prefers TAMANDUA_WORKER_PGID over self-detected PGID,
+    // which on macOS would otherwise pick up the transient tool-call subshell.
+    const child = spawn("/bin/sh", [
+      "-c",
+      `export TAMANDUA_WORKER_PGID="$$"; exec "$0" "$@"`,
+      dshPath,
+      ...args,
+    ], {
+      cwd: options?.workdir ?? process.cwd(),
+      env: childEnv,
+      stdio: ["pipe", "pipe", "pipe"],
+      detached: true,
+    });
+
+    const childPid = child.pid;
+    const pgid = childPid ?? 0;
+
+    if (childPid && options?.onSpawn) {
+      try {
+        options.onSpawn({ pid: childPid, pgid });
+      } catch (err) {
+        logger.warn("dsh onSpawn callback threw", { error: String(err) });
+      }
+    }
+
+    logger.info("dsh launched", {
+      harness: "dsh",
+      pid: childPid ?? null,
+      pgid,
+      timeoutMs,
+      workdir: options?.workdir,
+    });
+
+    // End stdin immediately — dsh reads the task from argv, and headless
+    // has no interactive channel mounted.
+    child.stdin?.end();
+
+    // Collect stderr and stdout with head+tail window collectors — same
+    // 10MB total budget (1MB head + 9MB tail) as the hermes adapter, so
+    // the final assistant text on stdout (STATUS lines) survives regardless
+    // of total stream size.
+    const HEAD_BYTES = 1 * 1024 * 1024;
+    const TAIL_BYTES = 9 * 1024 * 1024;
+
+    // ── stderr collector ──
+    let stderrHeadChunks: string[] = [];
+    let stderrHeadBytes = 0;
+    let stderrTailChunks: string[] = [];
+    let stderrTailBytes = 0;
+    let stderrTruncated = false;
+    let stderrPhase: "head" | "tail" = "head";
+
+    child.stderr?.on("data", (chunk: Buffer) => {
+      const str = chunk.toString("utf-8");
+      const strBytes = Buffer.byteLength(str, "utf-8");
+
+      if (stderrPhase === "head" && !stderrTruncated) {
+        stderrHeadChunks.push(str);
+        stderrHeadBytes += strBytes;
+        if (stderrHeadBytes >= HEAD_BYTES) {
+          stderrPhase = "tail";
+        }
+        return;
+      }
+
+      // Phase "tail": collect into sliding tail window
+      stderrTailChunks.push(str);
+      stderrTailBytes += strBytes;
+
+      if (!stderrTruncated && stderrHeadBytes + stderrTailBytes > HEAD_BYTES + TAIL_BYTES) {
+        stderrTruncated = true;
+        while (stderrTailBytes > TAIL_BYTES && stderrTailChunks.length > 0) {
+          const oldest = stderrTailChunks.shift()!;
+          stderrTailBytes -= Buffer.byteLength(oldest, "utf-8");
+        }
+        logger.warn("dsh stderr truncated", {
+          harness: "dsh",
+          pid: childPid ?? null,
+          headBytes: stderrHeadBytes,
+          tailBytes: stderrTailBytes,
+          totalBudget: HEAD_BYTES + TAIL_BYTES,
+        });
+      } else if (stderrTruncated) {
+        while (stderrTailBytes > TAIL_BYTES && stderrTailChunks.length > 0) {
+          const oldest = stderrTailChunks.shift()!;
+          stderrTailBytes -= Buffer.byteLength(oldest, "utf-8");
+        }
+      }
+    });
+
+    // ── stdout collector ──
+    let stdoutHeadChunks: string[] = [];
+    let stdoutHeadBytes = 0;
+    let stdoutTailChunks: string[] = [];
+    let stdoutTailBytes = 0;
+    let stdoutTruncated = false;
+    let stdoutPhase: "head" | "tail" = "head";
+
+    child.stdout?.on("data", (chunk: Buffer) => {
+      const str = chunk.toString("utf-8");
+      const strBytes = Buffer.byteLength(str, "utf-8");
+
+      if (stdoutPhase === "head" && !stdoutTruncated) {
+        stdoutHeadChunks.push(str);
+        stdoutHeadBytes += strBytes;
+        if (stdoutHeadBytes >= HEAD_BYTES) {
+          stdoutPhase = "tail";
+        }
+        return;
+      }
+
+      // Phase "tail": collect into sliding tail window
+      stdoutTailChunks.push(str);
+      stdoutTailBytes += strBytes;
+
+      if (!stdoutTruncated && stdoutHeadBytes + stdoutTailBytes > HEAD_BYTES + TAIL_BYTES) {
+        stdoutTruncated = true;
+        while (stdoutTailBytes > TAIL_BYTES && stdoutTailChunks.length > 0) {
+          const oldest = stdoutTailChunks.shift()!;
+          stdoutTailBytes -= Buffer.byteLength(oldest, "utf-8");
+        }
+        logger.warn("dsh stdout truncated", {
+          harness: "dsh",
+          pid: childPid ?? null,
+          headBytes: stdoutHeadBytes,
+          tailBytes: stdoutTailBytes,
+          totalBudget: HEAD_BYTES + TAIL_BYTES,
+        });
+      } else if (stdoutTruncated) {
+        while (stdoutTailBytes > TAIL_BYTES && stdoutTailChunks.length > 0) {
+          const oldest = stdoutTailChunks.shift()!;
+          stdoutTailBytes -= Buffer.byteLength(oldest, "utf-8");
+        }
+      }
+    });
+
+    // Wait for child exit, with timeout guard. The adapter resolves on ALL
+    // outcomes (success, non-zero exit, timeout) so the scheduler can run
+    // post-round processing. Only fatal spawn errors (child.on("error"))
+    // still reject.
+    let timeoutTimerFired = false;
+    const exitInfo = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        timeoutTimerFired = true;
+        if (pgid) {
+          safeKillPgid(pgid, "SIGTERM");
+          setTimeout(() => safeKillPgid(pgid, "SIGKILL"), 5000).unref();
+        } else {
+          try {
+            child.kill("SIGKILL");
+          } catch {
+            /* best effort */
+          }
+        }
+        // Resolve with timeout signal info — the scheduler and dispatch-round
+        // failure path can populate worker_lost events with real forensics
+        // instead of undefined.
+        resolve({ code: null, signal: "SIGTERM" });
+      }, timeoutMs);
+
+      child.on("error", (err) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(err);
+      });
+      child.on("close", (code, signal) => {
+        clearTimeout(timer);
+        if (settled) return;
+        settled = true;
+        // Always resolve — the scheduler decides what to do with non-zero
+        // exits. dsh traps SIGTERM and exits 0, so a clean-looking close
+        // (code 0) may still follow an external teardown kill; timedOut is
+        // derived below from the adapter's own timer flag, never from this.
+        resolve({ code, signal: signal as NodeJS.Signals | null });
+      });
+    });
+
+    const durationMs = Date.now() - startedAt;
+    const exitCode = exitInfo.code;
+    const exitSignal = exitInfo.signal;
+
+    // Phantom-outcome guard: dsh catches SIGTERM and exits 0
+    // (supervisor-stop semantics), so a timed-out round would masquerade
+    // as a clean success if timedOut were inferred from the exit signal.
+    // timedOut comes exclusively from the adapter's own timeout-timer flag.
+    const timedOut = timeoutTimerFired;
+
+    // Log non-zero exits and signal kills but don't throw — the adapter
+    // always resolves so the scheduler can run post-round processing.
+    if (exitCode !== null && exitCode !== 0) {
+      const failureStderr = stderrTruncated
+        ? stderrHeadChunks.join("") + "\n[…output truncated…]\n" + stderrTailChunks.join("")
+        : stderrHeadChunks.join("") + stderrTailChunks.join("");
+      const failureStderrMeta = buildStreamLogMetadata(failureStderr);
+      logger.error("dsh execution failed", {
+        harness: "dsh",
+        pid: childPid ?? null,
+        pgid,
+        exitCode,
+        signal: exitSignal,
+        durationMs,
+        stderrBytes: failureStderrMeta.bytes,
+        stderrPreview: failureStderrMeta.preview,
+        stderrTruncated: failureStderrMeta.truncated,
+      });
+    } else if (exitSignal) {
+      logger.warn("dsh terminated by signal", {
+        harness: "dsh",
+        pid: childPid ?? null,
+        pgid,
+        signal: exitSignal,
+        durationMs,
+      });
+    }
+
+    // Assemble stdout/stderr from head+tail windows. When either stream was
+    // truncated, insert an explicit marker between head and tail.
+    const TRUNCATION_MARKER = "\n[…output truncated…]\n";
+    const rawStdout = stdoutTruncated
+      ? stdoutHeadChunks.join("") + TRUNCATION_MARKER + stdoutTailChunks.join("")
+      : stdoutHeadChunks.join("") + stdoutTailChunks.join("");
+    const stderrOut = stderrTruncated
+      ? stderrHeadChunks.join("") + TRUNCATION_MARKER + stderrTailChunks.join("")
+      : stderrHeadChunks.join("") + stderrTailChunks.join("");
+    const stderrMeta = buildStreamLogMetadata(stderrOut);
+
+    if (stderrMeta.preview) {
+      logger.warn("dsh stderr", {
+        harness: "dsh",
+        pid: childPid ?? null,
+        stderrBytes: stderrMeta.bytes,
+        stderrPreview: stderrMeta.preview,
+        stderrTruncated: stderrMeta.truncated,
+      });
+    }
+
+    // stdout passes through VERBATIM: dsh prints exactly the last assistant
+    // text message plus "\n". No filtering, no session trailer, no trim —
+    // STATUS lines must survive intact for classifyWorkRoundOutcome. dsh
+    // never prints a session id (headless has no resume), so token
+    // accounting uses a workdir/mtime session-file scan instead.
+    const stdoutMeta = buildStreamLogMetadata(rawStdout);
+
+    logger.info("dsh completed", {
+      harness: "dsh",
+      pid: childPid ?? null,
+      pgid,
+      durationMs,
+      exitCode,
+      signal: exitSignal,
+      stdoutBytes: stdoutMeta.bytes,
+      stdoutPreview: stdoutMeta.preview,
+      stdoutTruncated: stdoutMeta.truncated,
+      stderrBytes: stderrMeta.bytes,
+      hasStderr: stderrMeta.bytes > 0,
+      timedOut,
+    });
+
+    const wasTruncated = stdoutTruncated || stderrTruncated;
+    if (wasTruncated) {
+      logger.warn("dsh round output truncated", {
+        harness: "dsh",
+        pid: childPid ?? null,
+        stdoutTruncated,
+        stderrTruncated,
+        stdoutBytes: Buffer.byteLength(rawStdout, "utf-8"),
+        stderrBytes: Buffer.byteLength(stderrOut, "utf-8"),
+      });
+    }
+
+    const stderrTail = sanitizeStderrTail(stderrOut);
+
+    return {
+      output: rawStdout,
+      exitCode,
+      signal: exitSignal ?? undefined,
+      truncated: wasTruncated || undefined,
+      commandPreview: preview.commandPreview,
+      redactedIndices: preview.redactedIndices,
+      promptElided: preview.promptElided,
+      stderrTail,
+      timedOut: timedOut || undefined,
+    };
+  }
+}
+
 // ── Factory ────────────────────────────────────────────────────────
 
 /**
@@ -793,6 +1172,8 @@ export function getHarnessAdapter(harnessType: string): HarnessAdapter {
       return new PiHarnessAdapter();
     case "hermes":
       return new HermesHarnessAdapter();
+    case "dsh":
+      return new DshHarnessAdapter();
     default:
       throw new Error(`unknown harness type: ${harnessType}`);
   }

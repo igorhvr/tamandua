@@ -7,6 +7,7 @@ import { emitEvent, getRunEvents } from "./events.js";
 import { logger } from "../lib/logger.js";
 import { stripIdPrefix } from "../lib/id-prefix.js";
 import { displayStepStatus } from "../lib/step-display.js";
+import type { HarnessType } from "./types.js";
 
 export interface RunInfo {
   id: string;
@@ -32,6 +33,8 @@ export interface RunDetail extends RunInfo {
   runNumber?: number;
   steps: StepInfo[];
   stories?: StoryInfo[];
+  /** Harness selected for the run, resolved from context harness_type (default "pi"). */
+  harnessType: HarnessType;
   workspace_mode?: string;
   worktree_path?: string;
   worktree_origin_repository?: string;
@@ -591,6 +594,10 @@ function buildRunDetail(
   let wtOriginRef: string | undefined;
   let wtOriginSha: string | undefined;
   const ctx = parseRunContext(row.id, row.context || "{}");
+  const harnessType: HarnessType =
+    ctx.harness_type === "hermes" || ctx.harness_type === "dsh"
+      ? ctx.harness_type
+      : "pi";
   if (ctx.workspace_mode === "worktree") {
     workspaceMode = ctx.workspace_mode;
     const wtRow = db
@@ -627,6 +634,7 @@ function buildRunDetail(
     ...(redLedgerLanding ? { redLedgerLanding } : {}),
     steps: stepInfos,
     stories: storyInfos.length > 0 ? storyInfos : undefined,
+    harnessType,
     workspace_mode: workspaceMode,
     worktree_path: wtPath,
     worktree_origin_repository: wtOriginRepo,

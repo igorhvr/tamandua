@@ -6,6 +6,7 @@ import path from "node:path";
 const fixtureFiles = [
   { file: "e2e-tests/workflows-scripted.test.ts", mergerBehaviors: 9, invocations: 12, migrated: true },
   { file: "e2e-tests/workflows-scripted-hermes.test.ts", mergerBehaviors: 2, invocations: 2, migrated: true },
+  { file: "e2e-tests/workflows-scripted-dsh.test.ts", mergerBehaviors: 2, invocations: 2, migrated: true },
   { file: "e2e-tests/workflows-stress-concurrent.test.ts", mergerBehaviors: 1, invocations: 1, migrated: false },
 ];
 

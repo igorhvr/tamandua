@@ -87,6 +87,24 @@ describe("www/index.html content sync", () => {
     );
   });
 
+  // Regression test: DDSH — dsh harness row in the harness selection table
+  it("harness table documents the dsh harness with alpha wording", () => {
+    assert.ok(
+      wwwContent.includes("--dsh-as-harness"),
+      "www/index.html harness table must include a --dsh-as-harness row",
+    );
+    assert.ok(
+      wwwContent.includes("DeepSeek Harness") && wwwContent.includes("<code>dsh</code>"),
+      "www/index.html harness table must name the harness 'DeepSeek Harness (dsh)'",
+    );
+    const dshRow = wwwContent.match(/<code>--dsh-as-harness<\/code>[\s\S]*?<\/tr>/);
+    assert.ok(dshRow, "www/index.html must have a complete --dsh-as-harness table row");
+    assert.ok(
+      dshRow[0].includes("<strong>Alpha quality:</strong>"),
+      "www/index.html dsh row must carry the Alpha quality wording",
+    );
+  });
+
   // Regression test: DRTR — max_reroutes and on_fail.retry_step are documented
   it("documents on_fail.retry_step and max_reroutes instead of stale escalation text", () => {
     assert.ok(

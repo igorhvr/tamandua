@@ -594,6 +594,225 @@ describe("validateRunHarnessForScheduling", () => {
     }
   });
 
+  // ── DSH admission tests (mirror the hermes ones) ──
+
+  it("throws when harness_type is 'dsh' and dsh binary not found", async () => {
+    const workdir = path.join(tempDir, "work");
+    fs.mkdirSync(workdir, { recursive: true });
+    // Unset TAMANDUA_DSH_BINARY so PATH search fails
+    const savedDshBinary = process.env.TAMANDUA_DSH_BINARY;
+    delete process.env.TAMANDUA_DSH_BINARY;
+    // Save and clear PATH to guarantee dsh not found (no zsh either,
+    // so the login-shell fallback tier also yields nothing).
+    const savedPath = process.env.PATH;
+    try {
+      process.env.PATH = tempDir; // empty dir, no dsh
+      await assert.rejects(
+        validateRunHarnessForScheduling("run-dsh-missing", JSON.stringify({
+          working_directory_for_harness: workdir,
+          harness_type: "dsh",
+        })),
+        /dsh is not available/,
+      );
+    } finally {
+      if (savedPath !== undefined) {
+        process.env.PATH = savedPath;
+      } else {
+        delete process.env.PATH;
+      }
+      if (savedDshBinary !== undefined) {
+        process.env.TAMANDUA_DSH_BINARY = savedDshBinary;
+      } else {
+        delete process.env.TAMANDUA_DSH_BINARY;
+      }
+    }
+  });
+
+  it("succeeds when harness_type is 'dsh' and dsh binary is available via env var", async () => {
+    const workdir = path.join(tempDir, "work");
+    fs.mkdirSync(workdir, { recursive: true });
+    const dshPath = path.join(tempDir, "dsh-mock");
+    fs.writeFileSync(dshPath, "#!/bin/sh\necho ok\n", { mode: 0o755 });
+
+    const saved = process.env.TAMANDUA_DSH_BINARY;
+    try {
+      process.env.TAMANDUA_DSH_BINARY = dshPath;
+      const result = await validateRunHarnessForScheduling("run-dsh-ok", JSON.stringify({
+        working_directory_for_harness: workdir,
+        harness_type: "dsh",
+      }));
+      assert.equal(result.workingDirectoryForHarness, workdir);
+    } finally {
+      if (saved === undefined) delete process.env.TAMANDUA_DSH_BINARY;
+      else process.env.TAMANDUA_DSH_BINARY = saved;
+    }
+  });
+
+  it("accepts harness_type 'dsh' when dsh is found via PATH", async () => {
+    const workdir = path.join(tempDir, "work");
+    fs.mkdirSync(workdir, { recursive: true });
+    const dshDir = path.join(tempDir, "dsh-bin");
+    fs.mkdirSync(dshDir, { recursive: true });
+    fs.writeFileSync(path.join(dshDir, "dsh"), "#!/bin/sh\necho ok\n", { mode: 0o755 });
+
+    const savedPath = process.env.PATH;
+    const savedDshBinary = process.env.TAMANDUA_DSH_BINARY;
+    delete process.env.TAMANDUA_DSH_BINARY;
+    try {
+      process.env.PATH = `${dshDir}${path.delimiter}${savedPath}`;
+      const result = await validateRunHarnessForScheduling("run-dsh-path", JSON.stringify({
+        working_directory_for_harness: workdir,
+        harness_type: "dsh",
+      }));
+      assert.equal(result.workingDirectoryForHarness, workdir);
+    } finally {
+      if (savedPath !== undefined) {
+        process.env.PATH = savedPath;
+      } else {
+        delete process.env.PATH;
+      }
+      if (savedDshBinary !== undefined) {
+        process.env.TAMANDUA_DSH_BINARY = savedDshBinary;
+      } else {
+        delete process.env.TAMANDUA_DSH_BINARY;
+      }
+    }
+  });
+
+  it("accepts harness_type 'dsh' via login-shell fallback", async () => {
+    const workdir = path.join(tempDir, "work");
+    fs.mkdirSync(workdir, { recursive: true });
+
+    // Mock dsh binary OUTSIDE PATH so only the login-shell tier can reach it.
+    const dshDir = path.join(tempDir, "dsh-bin");
+    fs.mkdirSync(dshDir, { recursive: true });
+    const dshPath = path.join(dshDir, "dsh");
+    fs.writeFileSync(dshPath, "#!/bin/sh\necho ok\n", { mode: 0o755 });
+
+    // Mock zsh that reports the dsh path via login-shell discovery.
+    const mockZshDir = path.join(tempDir, "mock-zsh-dir");
+    fs.mkdirSync(mockZshDir, { recursive: true });
+    const mockZshPath = path.join(mockZshDir, "zsh");
+    fs.writeFileSync(mockZshPath, `#!/bin/sh\necho "${dshPath}"\n`, { mode: 0o755 });
+
+    const savedPath = process.env.PATH;
+    const savedDshBinary = process.env.TAMANDUA_DSH_BINARY;
+    try {
+      // PATH = empty tempDir + fake zsh dir only; no dsh on PATH, so tier 2
+      // fails and the resolver falls through to tier 3.
+      delete process.env.TAMANDUA_DSH_BINARY;
+      process.env.PATH = `${tempDir}${path.delimiter}${mockZshDir}`;
+
+      const result = await validateRunHarnessForScheduling("run-dsh-login", JSON.stringify({
+        working_directory_for_harness: workdir,
+        harness_type: "dsh",
+      }));
+      assert.equal(result.workingDirectoryForHarness, workdir);
+    } finally {
+      if (savedPath !== undefined) {
+        process.env.PATH = savedPath;
+      } else {
+        delete process.env.PATH;
+      }
+      if (savedDshBinary !== undefined) {
+        process.env.TAMANDUA_DSH_BINARY = savedDshBinary;
+      } else {
+        delete process.env.TAMANDUA_DSH_BINARY;
+      }
+    }
+  });
+
+  it("does not check dsh binary when harness_type is 'pi'", async () => {
+    const workdir = path.join(tempDir, "work");
+    fs.mkdirSync(workdir, { recursive: true });
+    // Even with dsh missing, "pi" harness should succeed
+    const savedDshBinary = process.env.TAMANDUA_DSH_BINARY;
+    delete process.env.TAMANDUA_DSH_BINARY;
+    const savedPath = process.env.PATH;
+    try {
+      process.env.PATH = tempDir;
+      const result = await validateRunHarnessForScheduling("run-pi-no-dsh-check", JSON.stringify({
+        working_directory_for_harness: workdir,
+        harness_type: "pi",
+      }));
+      assert.equal(result.workingDirectoryForHarness, workdir);
+    } finally {
+      if (savedPath !== undefined) {
+        process.env.PATH = savedPath;
+      } else {
+        delete process.env.PATH;
+      }
+      if (savedDshBinary !== undefined) {
+        process.env.TAMANDUA_DSH_BINARY = savedDshBinary;
+      } else {
+        delete process.env.TAMANDUA_DSH_BINARY;
+      }
+    }
+  });
+
+  it("rejects worktree run with harness_type=dsh when dsh is unavailable", async () => {
+    const originRepo = path.join(tempDir, "origin-wt-dsh-reject");
+    fs.mkdirSync(originRepo, { recursive: true });
+    spawnSync("git", ["init", "--initial-branch=main"], { cwd: originRepo, encoding: "utf-8" });
+    spawnSync("git", ["config", "user.email", "test@test"], { cwd: originRepo, encoding: "utf-8" });
+    spawnSync("git", ["config", "user.name", "Test"], { cwd: originRepo, encoding: "utf-8" });
+    fs.writeFileSync(path.join(originRepo, "README.md"), "# test\n", "utf-8");
+    spawnSync("git", ["add", "."], { cwd: originRepo, encoding: "utf-8" });
+    spawnSync("git", ["commit", "-m", "initial"], { cwd: originRepo, encoding: "utf-8" });
+
+    const worktree = createRunWorktree({
+      runId: "run-wt-dsh-reject",
+      runNumber: 1,
+      workflowId: "test-workflow",
+      worktreeOriginRepository: originRepo,
+    });
+
+    const savedPath = process.env.PATH;
+    const savedDshBinary = process.env.TAMANDUA_DSH_BINARY;
+    try {
+      // Isolated PATH with only the real git binary; no dsh, no zsh.
+      const gitWhich = spawnSync("which", ["git"], { encoding: "utf-8" });
+      const realGit = fs.realpathSync(gitWhich.stdout.trim());
+      assert.ok(path.isAbsolute(realGit), "real git must be absolute");
+      fs.accessSync(realGit, fs.constants.X_OK);
+
+      const toolDir = path.join(tempDir, "tools");
+      fs.mkdirSync(toolDir, { recursive: true });
+      fs.symlinkSync(realGit, path.join(toolDir, "git"));
+
+      assert.equal(
+        fs.existsSync(path.join(toolDir, "dsh")),
+        false,
+        "isolated tool dir must not contain dsh",
+      );
+
+      delete process.env.TAMANDUA_DSH_BINARY;
+      process.env.PATH = toolDir;
+
+      await assert.rejects(
+        validateRunHarnessForScheduling("run-wt-dsh-reject", JSON.stringify({
+          workspace_mode: "worktree",
+          repo: worktree.worktreePath,
+          working_directory_for_harness: worktree.worktreePath,
+          harness_type: "dsh",
+        })),
+        /dsh is not available/,
+      );
+    } finally {
+      if (savedPath !== undefined) {
+        process.env.PATH = savedPath;
+      } else {
+        delete process.env.PATH;
+      }
+      if (savedDshBinary !== undefined) {
+        process.env.TAMANDUA_DSH_BINARY = savedDshBinary;
+      } else {
+        delete process.env.TAMANDUA_DSH_BINARY;
+      }
+      removeRunWorktree({ runId: "run-wt-dsh-reject", force: true });
+    }
+  });
+
   it("direct workflow branch-mismatch validation is unchanged", async () => {
     const workdir = path.join(tempDir, "direct-work");
     fs.mkdirSync(workdir, { recursive: true });

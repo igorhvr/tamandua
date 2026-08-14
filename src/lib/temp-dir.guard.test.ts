@@ -45,6 +45,10 @@ const OS_TMPDIR_ALLOWLIST: Record<string, string> = {
     "HOME fallback for subprocess env — not a temp asset",
   "e2e-tests/helpers/scripted-hermes.test.ts":
     "HOME fallback for subprocess env — not a temp asset",
+  "e2e-tests/helpers/scripted-dsh-runtime.test.ts":
+    "HOME fallback for subprocess env — not a temp asset",
+  "e2e-tests/helpers/scripted-dsh.test.ts":
+    "HOME fallback for subprocess env — not a temp asset",
 
   // Comment-only mention: "on macOS os.tmpdir() is behind the /var → /private/var symlink"
   // explains macOS realpath behavior in an assertion helper — not a call.

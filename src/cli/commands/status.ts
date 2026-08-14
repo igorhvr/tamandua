@@ -30,7 +30,8 @@ Check categories:
   ENVIRONMENT  Node.js >= 22 (probes node:sqlite for runtime compatibility),
                pi present on PATH, gh present on PATH,
                pi-token-saver and hermes-token-saver detection (informational — optional),
-               TAMANDUA_HERMES_BINARY / hermes detection (informational — alpha)
+               TAMANDUA_HERMES_BINARY / hermes detection (informational — alpha),
+               TAMANDUA_DSH_BINARY / dsh detection (informational — alpha)
   SERVICES     Daemon PID alive, control plane health reachable,
                dashboard HTTP up, MCP server status (if configured).
                On any failure, the relevant log tail is included for diagnostics.
@@ -64,7 +65,7 @@ Displays a comprehensive status overview of the Tamandua system, including:
   Tamandua Info — Source path, skill path, version, and source tree SHA256
   Workflow Runs — Summary of all runs (running, paused, done, failed), with
                   visible red-ledger landing annotations when present
-  Running Processes — Active pi/hermes harness processes spawned by tamandua
+  Running Processes — Active pi/hermes/dsh harness processes spawned by tamandua
 
 Options:
   --json    Output a JSON object with services, info, runs, and processes

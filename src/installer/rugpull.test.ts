@@ -1656,6 +1656,42 @@ describe("relaunchRunAfterRugpull", () => {
     );
   });
 
+  it("reconstructs harness_type 'dsh' in the replacement run (rugpull relaunch)", async () => {
+    const workflowId = "test-rugpull-dsh-reconstruction";
+    writeWorkflowYml(tempHome, workflowId, "direct");
+
+    const { relaunchRunAfterRugpull } = await import(
+      "../../dist/installer/rugpull.js"
+    );
+    const { getDb } = await import("../../dist/db.js");
+    const db = getDb();
+
+    const failedRunId = crypto.randomUUID();
+    insertRun(db, failedRunId, workflowId, {
+      repo: repoDir,
+      working_directory_for_harness: repoDir,
+      workspace_mode: "direct",
+      harness_type: "dsh",
+      no_hurry_save_tokens_mode: "false",
+    }, "failed");
+
+    const result = await relaunchRunAfterRugpull(failedRunId);
+    assert.equal(result.relaunched, true, "should relaunch");
+    assert.ok(result.newRunId, "new run ID should be set");
+
+    const newRun = db
+      .prepare("SELECT context FROM runs WHERE id = ?")
+      .get(result.newRunId!) as { context: string } | undefined;
+    assert.ok(newRun, "replacement run must exist");
+
+    const newContext = JSON.parse(newRun.context) as Record<string, string>;
+    assert.equal(
+      newContext.harness_type,
+      "dsh",
+      "harness_type dsh should be reconstructed for the replacement run",
+    );
+  });
+
   it("returns relaunched=false on corrupt context and emits run.context_corrupt event", async () => {
     const workflowId = "test-corrupt-context";
     writeWorkflowYml(tempHome, workflowId, "direct");

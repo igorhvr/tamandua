@@ -194,8 +194,69 @@ describe("parseWorkflowRunArgs", () => {
   it("throws when both flags in reverse order", () => {
     assert.throws(
       () => parseWorkflowRunArgs(["--hermes-as-harness", "--pi-as-harness", "task"]),
-      /Cannot specify both --pi-as-harness and --hermes-as-harness/,
+      /Cannot specify both --hermes-as-harness and --pi-as-harness\. Choose one harness\./,
     );
+  });
+
+  it("parses --dsh-as-harness flag", () => {
+    const result = parseWorkflowRunArgs(["--dsh-as-harness", "do the task"]);
+    assert.equal(result.taskTitle, "do the task");
+    assert.equal(result.harnessAs, "dsh");
+  });
+
+  it("throws when both --pi-as-harness and --dsh-as-harness specified", () => {
+    assert.throws(
+      () => parseWorkflowRunArgs(["--pi-as-harness", "--dsh-as-harness", "task"]),
+      /Cannot specify both --pi-as-harness and --dsh-as-harness\. Choose one harness\./,
+    );
+  });
+
+  it("throws when both --dsh-as-harness and --pi-as-harness specified", () => {
+    assert.throws(
+      () => parseWorkflowRunArgs(["--dsh-as-harness", "--pi-as-harness", "task"]),
+      /Cannot specify both --dsh-as-harness and --pi-as-harness\. Choose one harness\./,
+    );
+  });
+
+  it("throws when both --hermes-as-harness and --dsh-as-harness specified", () => {
+    assert.throws(
+      () => parseWorkflowRunArgs(["--hermes-as-harness", "--dsh-as-harness", "task"]),
+      /Cannot specify both --hermes-as-harness and --dsh-as-harness\. Choose one harness\./,
+    );
+  });
+
+  it("throws when both --dsh-as-harness and --hermes-as-harness specified", () => {
+    assert.throws(
+      () => parseWorkflowRunArgs(["--dsh-as-harness", "--hermes-as-harness", "task"]),
+      /Cannot specify both --dsh-as-harness and --hermes-as-harness\. Choose one harness\./,
+    );
+  });
+
+  it("throws when all three harness flags specified", () => {
+    assert.throws(
+      () =>
+        parseWorkflowRunArgs([
+          "--pi-as-harness",
+          "--hermes-as-harness",
+          "--dsh-as-harness",
+          "task",
+        ]),
+      /Choose one harness/,
+    );
+  });
+
+  it("parses dsh harness alongside other flags", () => {
+    const result = parseWorkflowRunArgs([
+      "--dsh-as-harness",
+      "--no-hurry-please-save-tokens-mode",
+      "--working-directory-for-harness",
+      "/work",
+      "build feature",
+    ]);
+    assert.equal(result.taskTitle, "build feature");
+    assert.equal(result.harnessAs, "dsh");
+    assert.equal(result.noHurrySaveTokensMode, true);
+    assert.equal(result.workingDirectoryForHarness, "/work");
   });
 
   it("parses hermes harness alongside other flags", () => {
@@ -315,6 +376,23 @@ describe("--help infrastructure", () => {
       assert.match(result.stdout ?? "", /tamandua get-ready/);
     } finally {
     }
+  });
+
+  it("tamandua --help usage synopsis enumerates --dsh-as-harness", () => {
+    const result = cli(["--help"]);
+    assert.equal(result.status, 0);
+    assert.match(
+      result.stdout ?? "",
+      /\[--pi-as-harness \| --hermes-as-harness \| --dsh-as-harness\]/,
+    );
+  });
+
+  it("workflow run --help enumerates --dsh-as-harness", () => {
+    const result = cli(["workflow", "run", "--help"]);
+    assert.equal(result.status, 0);
+    assert.match(result.stdout ?? "", /--dsh-as-harness/);
+    assert.match(result.stdout ?? "", /DeepSeek Harness/);
+    assert.match(result.stdout ?? "", /Alpha support/);
   });
 
   it("command with --help prints usage and exits 0", () => {
@@ -2222,22 +2300,53 @@ describe("formatProcessList", () => {
     assert.match(result, /up 00:45:00/);
   });
 
-  it("distinguishes pi and hermes processes in mixed output", async () => {
+  it("detects dsh processes", async () => {
+    const { formatProcessList } = await import("../../dist/cli/status-format.js");
+    const result = formatProcessList({
+      isDaemonRunning: () => true,
+      execSync: () =>
+        '  2002  00:12:00  /home/user/.local/bin/dsh --profile headless "say hi"\n',
+    });
+    assert.match(result, /Running Processes/);
+    assert.match(result, /\[dsh\s*\] PID 2002/);
+    assert.match(result, /up 00:12:00/);
+  });
+
+  it("distinguishes pi, hermes, and dsh processes in mixed output", async () => {
     const { formatProcessList } = await import("../../dist/cli/status-format.js");
     const result = formatProcessList({
       isDaemonRunning: () => true,
       execSync: () =>
         "  1001  02:30:00  /usr/bin/pi --print --session abc\n" +
         "  2001  00:45:00  /usr/bin/hermes agent --provider openrouter\n" +
+        '  2002  00:12:00  /home/user/.local/bin/dsh --profile headless "say hi"\n' +
         "  3001  01:00:00  node /path/to/tamandua/dist/cli/cli.js step claim some-agent\n",
     });
     assert.match(result, /\[pi\s*\] PID 1001/);
     assert.match(result, /\[hermes\s*\] PID 2001/);
+    assert.match(result, /\[dsh\s*\] PID 2002/);
     assert.match(result, /\[tamandua\s*\] PID 3001/); // tamandua step claim classified as tamandua
-    // Should have 3 process lines
+    // Should have 4 process lines
     const lines = result.split("\n");
     const processLines = lines.filter((l) => /\[.*\] PID/.test(l));
-    assert.strictEqual(processLines.length, 3);
+    assert.strictEqual(processLines.length, 4);
+  });
+
+  it("collectProcessList labels dsh processes as kind dsh", async () => {
+    const { collectProcessList } = await import("../../dist/cli/status-format.js");
+    const result = collectProcessList({
+      isDaemonRunning: () => true,
+      execSync: () =>
+        '  2002  00:12:00  /home/user/.local/bin/dsh --profile headless "say hi"\n' +
+        "  2001  00:45:00  /usr/bin/hermes agent --provider openrouter\n" +
+        "  1001  02:30:00  /usr/bin/pi --print --session abc\n",
+    });
+    assert.strictEqual(result.length, 3);
+    const kinds = new Set(result.map((p) => p.kind));
+    assert.ok(kinds.has("dsh"), "dsh process labeled with kind dsh");
+    assert.ok(kinds.has("hermes"));
+    assert.ok(kinds.has("pi"));
+    assert.equal(result.find((p) => p.kind === "dsh")?.pid, 2002);
   });
 
   it("handles empty ps output gracefully", async () => {

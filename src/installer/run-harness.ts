@@ -5,6 +5,7 @@ import { validateRunWorktree } from "./worktree-manager.js";
 import type { HarnessType } from "./types.js";
 import { getDb } from "../db.js";
 import { resolveHermesBinary } from "./hermes-resolver.js";
+import { resolveDshBinary } from "./dsh-resolver.js";
 import { parseRunContext as safeParseRunContext } from "./step-ops.js";
 
 export const RUN_CONTEXT_WORKING_DIRECTORY_FOR_HARNESS_KEY = "working_directory_for_harness";
@@ -100,9 +101,11 @@ export async function validateRunHarnessForScheduling(
     }
   }
 
-  // Validate hermes binary is available when harness_type is "hermes".
-  // This runs for BOTH direct and worktree runs — a worktree run must
-  // not bypass harness-type validation.
+  // Validate the harness binary is available when harness_type is
+  // "hermes" or "dsh". This runs for BOTH direct and worktree runs — a
+  // worktree run must not bypass harness-type validation. A missing dsh
+  // fails the run at startup with an actionable error instead of stranding
+  // every dispatch round on a resolution failure.
   const harnessType = readNonEmptyString(context, "harness_type");
   if (harnessType === "hermes") {
     try {
@@ -111,6 +114,16 @@ export async function validateRunHarnessForScheduling(
       const message = err instanceof Error ? err.message : String(err);
       throw new Error(
         `Run ${runId} requests hermes harness but hermes is not available: ${message}`,
+      );
+    }
+  }
+  if (harnessType === "dsh") {
+    try {
+      await resolveDshBinary();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `Run ${runId} requests dsh harness but dsh is not available: ${message}`,
       );
     }
   }
@@ -142,5 +155,6 @@ export function getRunHarnessType(runId: string): HarnessType {
   if (!row) return "pi";
   const ctx = safeParseRunContext(runId, row.context);
   if (ctx.harness_type === "hermes") return "hermes";
+  if (ctx.harness_type === "dsh") return "dsh";
   return "pi";
 }

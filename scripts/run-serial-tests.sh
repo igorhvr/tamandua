@@ -1,7 +1,8 @@
 #!/bin/bash
 # Run serial-lane tests with concurrency 1.
 # Reads tests/serial-files.txt for the list of serial test files.
-# Passes through TAMANDUA_TEST_GUARD and TAMANDUA_PI_BINARY env vars.
+# Passes through TAMANDUA_TEST_GUARD, TAMANDUA_PI_BINARY, and
+# TAMANDUA_DSH_BINARY env vars.
 # Exit code: 0 on pass, non-zero on any failure.
 set -euo pipefail
 
@@ -12,6 +13,7 @@ cd "$REPO_ROOT"
 # Default env vars if not set
 export TAMANDUA_TEST_GUARD="${TAMANDUA_TEST_GUARD:-1}"
 export TAMANDUA_PI_BINARY="${TAMANDUA_PI_BINARY:-/usr/bin/false}"
+export TAMANDUA_DSH_BINARY="${TAMANDUA_DSH_BINARY:-/usr/bin/false}"
 
 # Read serial files, filtering out comments and empty lines
 SERIAL_FILES_LIST="$REPO_ROOT/tests/serial-files.txt"

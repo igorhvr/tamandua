@@ -151,6 +151,11 @@ const BASE_ENV_KEYS = [
   // value (explicit overrides win over the passthrough).
   "TAMANDUA_PI_BINARY",
   "TAMANDUA_HERMES_BINARY",
+  "TAMANDUA_DSH_BINARY",
+  // dsh's home dir (sessions/profiles live under $DSH_HOME, default ~/.dsh)
+  // passes through so scripted tests can inject a temp DSH_HOME and fake
+  // session files without touching the user's real ~/.dsh.
+  "DSH_HOME",
   // Isolation guard: npm test sets TAMANDUA_TEST_GUARD=1 so any spawned
   // daemon/script that reaches the real ~/.tamandua or a production port
   // fails loudly instead of silently interfering with the live instance.

@@ -669,10 +669,14 @@ tamandua autoresearch next</code></pre>
             <td><code>--hermes-as-harness</code></td>
             <td>Use <a href="https://github.com/nicholasgasior/hermes">Hermes</a> instead of pi. <strong>Alpha quality:</strong> very slow, and token accounting is broken. Use pi for production workflows.</td>
           </tr>
+          <tr>
+            <td><code>--dsh-as-harness</code></td>
+            <td>Use <a href="https://github.com/deepseek-ai/deepseek-harness">DeepSeek Harness (<code>dsh</code>)</a> instead of pi. <strong>Alpha quality:</strong> token accounting is best-effort (read from dsh session files), and the model comes from your dsh profile. Use pi for production workflows.</td>
+          </tr>
         </tbody>
       </table>
       </div>
-      <p>To use a custom Hermes binary, set <code>TAMANDUA_HERMES_BINARY</code>; otherwise Tamandua searches for <code>hermes</code> on your <code>PATH</code>. Harness validation runs at scheduling time — a missing or non-executable binary fails the run immediately with a clear error.</p>
+      <p>To use a custom Hermes binary, set <code>TAMANDUA_HERMES_BINARY</code>; otherwise Tamandua searches for <code>hermes</code> on your <code>PATH</code>. To use a custom dsh binary, set <code>TAMANDUA_DSH_BINARY</code>; otherwise Tamandua searches for <code>dsh</code> on your <code>PATH</code>. Harness validation runs at scheduling time — a missing or non-executable binary fails the run immediately with a clear error.</p>
     </section>
 
     <!-- Build Your Own -->
@@ -786,7 +790,7 @@ steps:
           <tr>
             <td><code>noHurrySaveTokensMode</code></td>
             <td>No</td>
-            <td>When <code>true</code>, work spawns prefer the harness's token-saver command from <code>PATH</code> (<code>pi-token-saver</code> for pi runs, <code>hermes-token-saver</code> for hermes runs), looked up per invocation; falls back to the plain harness command when absent. Idle dispatch is free either way. Defaults to <code>false</code>.</td>
+            <td>When <code>true</code>, work spawns prefer the harness's token-saver command from <code>PATH</code> (<code>pi-token-saver</code> for pi runs, <code>hermes-token-saver</code> for hermes runs, <code>dsh-token-saver</code> for dsh runs), looked up per invocation; falls back to the plain harness command when absent. Idle dispatch is free either way. Defaults to <code>false</code>.</td>
           </tr>
         </tbody>
       </table>

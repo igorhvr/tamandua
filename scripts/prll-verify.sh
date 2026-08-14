@@ -9,6 +9,7 @@
 #   TAMANDUA_REPO_ROOT Override repo root for testability
 #   TAMANDUA_TEST_GUARD     (default: 1)
 #   TAMANDUA_PI_BINARY      (default: /usr/bin/false)
+#   TAMANDUA_DSH_BINARY     (default: /usr/bin/false)
 #
 # Usage:
 #   ./scripts/prll-verify.sh           # run 5 before + 5 after
@@ -149,7 +150,7 @@ BEFORE_FILE_COUNT=$(echo "$BEFORE_FILES" | grep -c '.' || echo 0)
 # ----- BEFORE -----
 BEFORE_OUTPUT=$(run_config "before" \
   "BEFORE (all tests, default concurrency)" \
-  "TAMANDUA_TEST_GUARD=1 TAMANDUA_PI_BINARY=/usr/bin/false node --test \$BEFORE_FILES")
+  "TAMANDUA_TEST_GUARD=1 TAMANDUA_PI_BINARY=/usr/bin/false TAMANDUA_DSH_BINARY=/usr/bin/false node --test \$BEFORE_FILES")
 
 # Parse BEFORE results
 BEFORE_PASS=$(echo "$BEFORE_OUTPUT" | grep '^RESULT_before_pass=' | cut -d= -f2)

@@ -109,7 +109,7 @@ describe("SKILL.md Hermes harness documentation", () => {
 
   it("workflow run command row includes harness flags", () => {
     assert.ok(
-      skillContent.includes("[--pi-as-harness | --hermes-as-harness]"),
+      skillContent.includes("[--pi-as-harness | --hermes-as-harness | --dsh-as-harness]"),
       "SKILL.md workflow run command row must show harness flags"
     );
   });

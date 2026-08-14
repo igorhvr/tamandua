@@ -8,7 +8,7 @@ export interface WorkflowRunArgs {
   worktreeOriginRef?: string;
   noHurrySaveTokensMode?: boolean;
   noRelaunchUponRugpull?: boolean;
-  harnessAs?: "pi" | "hermes";
+  harnessAs?: "pi" | "hermes" | "dsh";
   /** Key-value pairs injected as run template context */
   context: Record<string, string>;
   /** Block until the run reaches a terminal status */
@@ -27,12 +27,19 @@ const KNOWN_FLAGS = new Set([
   "--timeout",
   "--pi-as-harness",
   "--hermes-as-harness",
+  "--dsh-as-harness",
   "--working-directory-for-harness",
   "--worktree-origin-repository",
   "--worktree-origin-ref",
   "--context",
   "--task-file",
 ]);
+
+const HARNESS_FLAG_TO_TYPE: Record<string, "pi" | "hermes" | "dsh"> = {
+  "--pi-as-harness": "pi",
+  "--hermes-as-harness": "hermes",
+  "--dsh-as-harness": "dsh",
+};
 
 export function parseWorkflowRunArgs(args: string[]): WorkflowRunArgs {
   let taskFileName: string | undefined;
@@ -42,7 +49,8 @@ export function parseWorkflowRunArgs(args: string[]): WorkflowRunArgs {
   let worktreeOriginRef: string | undefined;
   let noHurrySaveTokensMode: boolean | undefined;
   let noRelaunchUponRugpull: boolean | undefined;
-  let harnessAs: "pi" | "hermes" | undefined;
+  let harnessAs: "pi" | "hermes" | "dsh" | undefined;
+  let harnessFlagName: string | undefined;
   const context: Record<string, string> = {};
 
   let afterDashDash = false;
@@ -92,23 +100,14 @@ export function parseWorkflowRunArgs(args: string[]): WorkflowRunArgs {
       continue;
     }
 
-    if (token === "--pi-as-harness") {
+    if (HARNESS_FLAG_TO_TYPE[token] !== undefined) {
       if (harnessAs !== undefined) {
         throw new Error(
-          "Cannot specify both --pi-as-harness and --hermes-as-harness. Choose one harness.",
+          `Cannot specify both ${harnessFlagName} and ${token}. Choose one harness.`,
         );
       }
-      harnessAs = "pi";
-      continue;
-    }
-
-    if (token === "--hermes-as-harness") {
-      if (harnessAs !== undefined) {
-        throw new Error(
-          "Cannot specify both --pi-as-harness and --hermes-as-harness. Choose one harness.",
-        );
-      }
-      harnessAs = "hermes";
+      harnessAs = HARNESS_FLAG_TO_TYPE[token];
+      harnessFlagName = token;
       continue;
     }
 

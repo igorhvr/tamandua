@@ -122,6 +122,32 @@ describe("HarnessType flow (US-001)", () => {
       assert.equal(ctx.harness_type, "hermes", "harness_type stored as 'hermes'");
     });
 
+    it("stores 'dsh' when harnessType is 'dsh'", async () => {
+      const workflowId = "test-harness-dsh";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+
+      try {
+        await runWorkflow({
+          workflowId,
+          taskTitle: "Test dsh harness type",
+          harnessType: "dsh",
+        });
+      } catch {
+        // Expected: daemon registration fails
+      }
+
+      const { getDb } = await import("../../dist/db.js");
+      const db = getDb();
+      const rows = db
+        .prepare(
+          "SELECT context FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1",
+        )
+        .all(workflowId) as { context: string }[];
+      assert.ok(rows.length > 0, "run record should exist");
+      const ctx = JSON.parse(rows[0].context);
+      assert.equal(ctx.harness_type, "dsh", "harness_type stored as 'dsh'");
+    });
+
     it("stores 'pi' when harnessType is explicitly 'pi'", async () => {
       const workflowId = "test-harness-explicit-pi";
       writeMinimalWorkflow(tempHome, workflowId, "direct");
@@ -164,6 +190,14 @@ describe("HarnessType flow (US-001)", () => {
 
       const result = getRunHarnessType(runId);
       assert.equal(result, "hermes");
+    });
+
+    it("returns 'dsh' for a run with harness_type 'dsh'", async () => {
+      const runId = "99999999-aaaa-4bbb-bbbb-999999999999";
+      await seedRunRecord(runId, "dsh");
+
+      const result = getRunHarnessType(runId);
+      assert.equal(result, "dsh");
     });
 
     it("returns 'pi' for a run with no harness_type in context", async () => {

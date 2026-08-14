@@ -125,7 +125,7 @@ and bare UUID forms are accepted when passing the run ID to other commands.
 Options:
   --no-hurry-please-save-tokens-mode
       Prefer a token-saver wrapper for this run's work: whenever a step
-      spawns a harness (pi or hermes), the matching <harness>-token-saver
+      spawns a harness (pi, hermes, or dsh), the matching <harness>-token-saver
       command is looked up on PATH first (per invocation, so installing it
       mid-run takes effect) and used if present; otherwise the plain
       harness binary runs as usual. Idle checking is free either way —
@@ -147,10 +147,14 @@ Options:
       Defaults to the current branch.
   --pi-as-harness
       Use pi as the agent harness (this is the default).
-      Mutually exclusive with --hermes-as-harness.
+      Mutually exclusive with --hermes-as-harness and --dsh-as-harness.
   --hermes-as-harness
       Use hermes as the agent harness instead of pi.
-      Mutually exclusive with --pi-as-harness.
+      Mutually exclusive with --pi-as-harness and --dsh-as-harness.
+  --dsh-as-harness
+      Use the DeepSeek Harness (dsh) as the agent harness instead of pi.
+      Alpha support.
+      Mutually exclusive with --pi-as-harness and --hermes-as-harness.
   --task-file <path>
       Read the task description from a file instead of passing it inline.
       The file path is dereferenced exactly once at CLI time — the path
@@ -202,6 +206,8 @@ Output includes:
   Workflow     Workflow ID
   Task         Full task description
   Status       Current run status
+  Harness      Harness selected for the run (shown when not pi);
+               dsh runs are labeled "dsh (alpha)"
   Tokens       Total tokens spent
   Workspace    Workspace mode (only shown for worktree runs)
   Steps        Per-step listing with step ID, status icon, and agent role
@@ -218,7 +224,7 @@ Step status indicators:
 
 Options:
   --json    Output a JSON object with full run details for machine consumption.
-            Includes runId, runNumber, workflowId, status, task (first 200 chars),
+            Includes runId, runNumber, workflowId, status, harnessType, task (first 200 chars),
             tokensSpent, createdAt, updatedAt, workspaceMode (worktree runs),
             worktreePath, worktreeOriginRef, steps array (stepId, stepIndex,
             agentRole, status, displayStatus, retryCount, abandonedCount, rerouteCount, claimPid,
@@ -790,6 +796,7 @@ export async function handleWorkflow(
           runNumber: result.runNumber,
           workflowId: result.workflowId,
           status: result.status,
+          harnessType: result.harnessType,
           task: result.task.slice(0, 200),
           tokensSpent: result.tokensSpent,
           createdAt: result.createdAt,
@@ -806,7 +813,12 @@ export async function handleWorkflow(
         console.log(JSON.stringify(jsonOutput));
         return true;
       }
-      console.log(`Run: ${prefixRunId(result.id)}\nWorkflow: ${result.workflowId}\nTask: ${result.task}\nStatus: ${result.status}\nTokens: ${result.tokensSpent.toLocaleString()}`);
+      console.log(`Run: ${prefixRunId(result.id)}\nWorkflow: ${result.workflowId}\nTask: ${result.task}\nStatus: ${result.status}`);
+      if (result.harnessType !== "pi") {
+        const harnessLabel = result.harnessType === "dsh" ? "dsh (alpha)" : result.harnessType;
+        console.log(`Harness: ${harnessLabel}`);
+      }
+      console.log(`Tokens: ${result.tokensSpent.toLocaleString()}`);
       if (result.redLedgerLanding) {
         console.log(`Red-ledger landing: row ${result.redLedgerLanding.ledgerRowId}, exit ${result.redLedgerLanding.exitCode}, suite recorded ${result.redLedgerLanding.ledgerCreatedAt}`);
       }

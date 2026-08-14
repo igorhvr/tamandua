@@ -311,7 +311,8 @@ export function formatProcessList(opts?: {
       if (
         !lowers.includes("tamandua") &&
         !lowers.includes("pi ") &&
-        !lowers.includes("hermes")
+        !lowers.includes("hermes") &&
+        !lowers.includes("dsh")
       ) {
         continue;
       }
@@ -326,6 +327,8 @@ export function formatProcessList(opts?: {
         harness = "pi";
       } else if (command.includes("hermes")) {
         harness = "hermes";
+      } else if (command.includes("dsh")) {
+        harness = "dsh";
       } else if (command.includes("tamandua step")) {
         harness = "pi";
       } else if (command.includes("tamandua")) {
@@ -508,7 +511,8 @@ export function collectProcessList(opts?: {
       if (
         !lowers.includes("tamandua") &&
         !lowers.includes("pi ") &&
-        !lowers.includes("hermes")
+        !lowers.includes("hermes") &&
+        !lowers.includes("dsh")
       ) {
         continue;
       }
@@ -523,6 +527,8 @@ export function collectProcessList(opts?: {
         kind = "pi";
       } else if (command.includes("hermes")) {
         kind = "hermes";
+      } else if (command.includes("dsh")) {
+        kind = "dsh";
       } else if (command.includes("tamandua step")) {
         kind = "pi";
       } else if (command.includes("tamandua")) {

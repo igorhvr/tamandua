@@ -31,9 +31,13 @@ src/cli/wizard.test.ts
 src/db.test.ts
 src/doctor.test.ts
 src/installer/agent-scheduler-binary-discovery.test.ts
+src/installer/agent-scheduler-dsh-routing.test.ts
+src/installer/agent-scheduler-dsh-tokens.test.ts
 src/installer/agent-scheduler-harness-routing.test.ts
 src/installer/agent-scheduler-hermes.test.ts
 src/installer/agent-scheduler.test.ts
+src/installer/dsh-resolver.test.ts
+src/installer/dsh-usage.test.ts
 src/installer/events-vocabulary.test.ts
 src/installer/harness-adapter.test.ts
 src/installer/harness-type.test.ts

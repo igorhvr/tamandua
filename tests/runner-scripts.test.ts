@@ -61,6 +61,14 @@ describe("run-serial-tests.sh", () => {
     );
   });
 
+  it("passes through TAMANDUA_DSH_BINARY", () => {
+    const content = fs.readFileSync(SERIAL_SCRIPT, "utf-8");
+    assert.ok(
+      content.includes("TAMANDUA_DSH_BINARY"),
+      "run-serial-tests.sh must reference TAMANDUA_DSH_BINARY",
+    );
+  });
+
   it("defaults TAMANDUA_TEST_GUARD to 1 when unset", () => {
     // Run a minimal bash snippet that mimics the script's defaulting logic
     const tmpDir = makeTmpDir();
@@ -130,6 +138,31 @@ describe("run-serial-tests.sh", () => {
       assert.ok(
         result.includes("PI=/usr/bin/false"),
         "TAMANDUA_PI_BINARY should default to /usr/bin/false. Got: " + result.trim(),
+      );
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("defaults TAMANDUA_DSH_BINARY to /usr/bin/false when unset", () => {
+    const tmpDir = makeTmpDir();
+    try {
+      const wrapper = [
+        '#!/bin/bash',
+        'unset TAMANDUA_DSH_BINARY',
+        'export TAMANDUA_DSH_BINARY="${TAMANDUA_DSH_BINARY:-/usr/bin/false}"',
+        'echo "DSH=$TAMANDUA_DSH_BINARY"',
+      ].join("\n");
+      const wrapperPath = path.join(tmpDir, "test-default-dsh.sh");
+      fs.writeFileSync(wrapperPath, wrapper, { mode: 0o755 });
+      const result = execFileSync("bash", [wrapperPath], {
+        encoding: "utf-8",
+        stdio: "pipe",
+        env: { PATH: process.env.PATH },
+      });
+      assert.ok(
+        result.includes("DSH=/usr/bin/false"),
+        "TAMANDUA_DSH_BINARY should default to /usr/bin/false. Got: " + result.trim(),
       );
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -241,6 +274,14 @@ describe("run-parallel-tests.sh", () => {
     assert.ok(
       content.includes("TAMANDUA_PI_BINARY"),
       "run-parallel-tests.sh must reference TAMANDUA_PI_BINARY",
+    );
+  });
+
+  it("passes through TAMANDUA_DSH_BINARY", () => {
+    const content = fs.readFileSync(PARALLEL_SCRIPT, "utf-8");
+    assert.ok(
+      content.includes("TAMANDUA_DSH_BINARY"),
+      "run-parallel-tests.sh must reference TAMANDUA_DSH_BINARY",
     );
   });
 
@@ -364,6 +405,47 @@ describe("run-all-lanes.sh", () => {
 
   it("has valid bash syntax", () => {
     execSync("bash -n " + JSON.stringify(ALL_LANES_SCRIPT), { stdio: "pipe" });
+  });
+
+  it("passes through TAMANDUA_PI_BINARY", () => {
+    const content = fs.readFileSync(ALL_LANES_SCRIPT, "utf-8");
+    assert.ok(
+      content.includes("TAMANDUA_PI_BINARY"),
+      "run-all-lanes.sh must reference TAMANDUA_PI_BINARY",
+    );
+  });
+
+  it("passes through TAMANDUA_DSH_BINARY", () => {
+    const content = fs.readFileSync(ALL_LANES_SCRIPT, "utf-8");
+    assert.ok(
+      content.includes("TAMANDUA_DSH_BINARY"),
+      "run-all-lanes.sh must reference TAMANDUA_DSH_BINARY",
+    );
+  });
+
+  it("defaults TAMANDUA_DSH_BINARY to /usr/bin/false when unset", () => {
+    const tmpDir = makeTmpDir();
+    try {
+      const wrapper = [
+        '#!/bin/bash',
+        'unset TAMANDUA_DSH_BINARY',
+        'export TAMANDUA_DSH_BINARY="${TAMANDUA_DSH_BINARY:-/usr/bin/false}"',
+        'echo "DSH=$TAMANDUA_DSH_BINARY"',
+      ].join("\n");
+      const wrapperPath = path.join(tmpDir, "test-default-all-lanes-dsh.sh");
+      fs.writeFileSync(wrapperPath, wrapper, { mode: 0o755 });
+      const result = execFileSync("bash", [wrapperPath], {
+        encoding: "utf-8",
+        stdio: "pipe",
+        env: { PATH: process.env.PATH },
+      });
+      assert.ok(
+        result.includes("DSH=/usr/bin/false"),
+        "TAMANDUA_DSH_BINARY should default to /usr/bin/false. Got: " + result.trim(),
+      );
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 
   it("outputs lane labels for serial and parallel", () => {

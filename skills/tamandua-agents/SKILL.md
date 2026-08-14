@@ -216,7 +216,7 @@ FEEDBACK section.
 
 ### Traceability header
 
-Every dispatched work prompt (pi and hermes harnesses) begins with a single
+Every dispatched work prompt (pi, hermes, and dsh harnesses) begins with a single
 bracketed metadata line, e.g.:
 
 ```
@@ -452,7 +452,7 @@ Use these when managing workflow runs (outside individual step execution):
 tamandua workflow list [--json]          # Shows [worktree] or [direct] marker per workflow
 tamandua workflow install <workflow-id|--all>
 tamandua workflow uninstall <workflow-id|--all> [--force]
-tamandua workflow run <workflow-id> "<task>" [--context <key=value> ...] [--working-directory-for-harness <dir>] [--worktree-origin-repository <dir>] [--worktree-origin-ref <ref>] [--pi-as-harness | --hermes-as-harness] [--no-hurry-please-save-tokens-mode] [--no-relaunch-upon-rugpull] [--wait [--timeout <dur>] [--json]] [--task-file <path>]
+tamandua workflow run <workflow-id> "<task>" [--context <key=value> ...] [--working-directory-for-harness <dir>] [--worktree-origin-repository <dir>] [--worktree-origin-ref <ref>] [--pi-as-harness | --hermes-as-harness | --dsh-as-harness] [--no-hurry-please-save-tokens-mode] [--no-relaunch-upon-rugpull] [--wait [--timeout <dur>] [--json]] [--task-file <path>]
 tamandua workflow status <query> [--json]
 tamandua workflow runs [--json]
 tamandua workflow wait <selector...> [--all] [--timeout <dur>] [--json] [--quiet]
@@ -670,6 +670,111 @@ or any user executable or symlink. Tamandua does not own or manage a
 `~/.local/bin/hermes` symlink. The only Hermes-related operation is resolving
 and running an existing binary.
 
+### dsh (DeepSeek Harness) support (Alpha)
+
+The `--dsh-as-harness` flag runs agents with the DeepSeek Harness (`dsh`)
+instead of the default pi harness.
+
+```bash
+tamandua workflow run <workflow-id> "<task>" --dsh-as-harness
+```
+
+> ⚠️ **dsh support is in alpha.** Token usage is read from dsh session files
+> after each round (best-effort: falls back to 0 tokens with a warning if the
+> session store is unreadable). There is **no per-run model selection** — the
+> model comes from the dsh profile — and dsh itself is a release candidate.
+> Pi is the default and recommended harness for production use.
+
+Tamandua runs the user's installed `dsh` with the user's `~/.dsh`
+configuration (profile patch layers, credentials, model selection) **as-is**.
+Exactly one dsh setting is injected, unconditionally, on every worker spawn:
+`DSH_PERMISSION_MODE=danger-full-access` — the dsh equivalent of the `--yolo`
+flag Tamandua passes to Hermes. Under dsh's default `workspace-write`
+sandbox, headless auto-DENIES (fail-closed, no prompt) any action outside the
+worktree — including `tamandua step complete`, which writes to `~/.tamandua` —
+so without the injection agents do the work but can never report it. The
+injection is **process-scoped**: nothing under `~/.dsh` is ever created or
+modified, and the user's own interactive dsh usage is unaffected.
+
+> ⚠️ **Profile pin caveat.** dsh's profile layers replace whole config rows,
+> so an environment variable cannot beat them: if the profile's
+> `cordis.patch.yml` (e.g. `~/.dsh/profiles/headless/cordis.patch.yml`)
+> hard-pins sandbox/approval rows, the pin overrides the injection and
+> out-of-worktree actions like `tamandua step complete` are auto-denied —
+> breaking step reporting. `tamandua doctor` probes the composed dsh
+> configuration and warns about exactly this (warn-only, alpha support).
+
+The three harness flags (`--pi-as-harness`, `--hermes-as-harness`,
+`--dsh-as-harness`) are mutually exclusive — you cannot specify more than one
+in the same run.
+
+#### dsh Binary Resolution
+
+Tamandua resolves the dsh binary through a **three-tier chain**. The
+binary is validated at scheduling time — if no dsh binary is found or
+the resolved binary is not executable, the run fails at startup with a
+clear actionable error.
+
+**Tier 1 — Explicit environment variable:**
+
+```bash
+export TAMANDUA_DSH_BINARY=/path/to/dsh
+```
+
+Set `TAMANDUA_DSH_BINARY` to an absolute or relative path. Relative paths
+are resolved against the daemon's working directory at validation time.
+
+**Tier 2 — Process PATH (with optional token-saver):**
+
+If `TAMANDUA_DSH_BINARY` is not set, Tamandua searches the daemon's own
+`PATH` for `dsh`. When `noHurrySaveTokensMode` is enabled, Tier 2 first
+searches for `dsh-token-saver` (a token-saving wrapper) before falling back
+to a bare `dsh` binary.
+
+**Tier 3 — Bounded zsh login-shell fallback:**
+
+If neither the env var nor the process `PATH` yields a working dsh,
+Tamandua spawns `zsh -lic 'command -v dsh'` so dsh installed via
+login-shell startup files (e.g. `~/.zshrc`, `~/.zprofile`) can be discovered.
+This is a bounded, best-effort fallback — if zsh is not available or returns
+nothing, resolution fails.
+
+#### Absolute-Path Invocation
+
+Every resolved dsh binary path is **always absolute**. Relative
+`TAMANDUA_DSH_BINARY` values and relative/empty `PATH` entries are resolved
+against the daemon process cwd at validation time before the result is stored.
+This prevents `./dsh: not found` errors when the dispatcher invokes the binary
+from a different working directory.
+
+#### Child-Only PATH Adjustment
+
+When dispatching a dsh agent session, the resolved binary's directory is
+prepended to the child's `PATH` so nested dsh invocations within the agent
+session find the same binary — even if it lives outside the original `PATH`
+(e.g. login-shell-discovered dsh). The original `PATH` is preserved as a
+suffix; this adjustment applies only to the child process.
+
+#### Zero Filesystem Mutation
+
+Tamandua's dsh discovery is **entirely side-effect-free**: it never
+creates, deletes, replaces, chmods, or otherwise mutates any user executable
+or symlink. Tamandua does not own or manage a dsh symlink. The only
+dsh-related operation is resolving and running an existing binary.
+
+#### Token Accounting
+
+dsh never prints token usage. Tamandua records each round's spawn time and,
+after the round, reads the session log under
+`$DSH_HOME/sessions/<escaped-cwd>/session-<uuid>/session.jsonl.zstd`
+(`$DSH_HOME` defaults to `~/.dsh`) and sums the recorded usage chunks (input
++ output tokens, cache reads excluded). This is best-effort — any failure
+(no zstd support, a missing or unreadable session store) falls back to 0
+tokens with a warning. `tamandua doctor` includes a dsh session-store probe
+that warns when the sessions directory is unreadable or zstd decompression is
+unavailable, and a permission-mode probe that warns when a profile layer pins
+sandbox/approval rows that override the injected permission mode.
+
 ## Services & maintenance
 
 ### System status
@@ -685,7 +790,7 @@ tamandua status [--json]
 - **Services** — Dashboard, MCP, and control-plane status (up/down, PID, port)
 - **Tamandua Info** — Source path, skill path, version, and source tree SHA256
 - **Workflow Runs** — Summary of all runs (running, paused, done, failed)
-- **Running Processes** — Active pi/hermes harness processes spawned by Tamandua
+- **Running Processes** — Active pi/hermes/dsh harness processes spawned by Tamandua
 
 ### Dashboard, MCP, restart, and get-ready
 

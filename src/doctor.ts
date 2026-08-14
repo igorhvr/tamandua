@@ -10,7 +10,9 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execSync } from "node:child_process";
+import { execSync, execFile } from "node:child_process";
+
+import { parseDocument } from "yaml";
 
 import {
   isRunning,
@@ -38,6 +40,9 @@ import type { TamanduaEvent } from "./installer/events.js";
 import { probeHermesStateContract } from "./installer/hermes-usage.js";
 import { resolveHermesBinaryDetailed, HermesResolverError } from "./installer/hermes-resolver.js";
 import type { HermesSource } from "./installer/hermes-resolver.js";
+import { resolveDshBinaryDetailed, DshResolverError } from "./installer/dsh-resolver.js";
+import type { DshSource } from "./installer/dsh-resolver.js";
+import { resolveDshHome, nodeZstdDecompressAvailable } from "./installer/dsh-usage.js";
 
 // ── Types ──────────────────────────────────────────────────────────
 
@@ -329,6 +334,356 @@ function checkHermesTokenSaver(): DoctorCheckResult {
     status: "info",
     message:
       "hermes-token-saver not found on PATH (optional — only preferred by no-hurry runs)",
+  };
+}
+
+// ── dsh (DeepSeek Harness) checks ─────────────────────────────────
+
+/**
+ * Discover the dsh binary via the three-tier chain.
+ * Returns availability plus the resolved path and source for use by sub-checks.
+ */
+async function discoverDshBinary(): Promise<DshDiscoveryResult> {
+  try {
+    const result = await resolveDshBinaryDetailed();
+    return { available: true, path: result.path, source: result.source };
+  } catch (err) {
+    if (err instanceof DshResolverError) {
+      if (err.code === "invalid_env_binary") {
+        return { available: false, rawEnvValue: err.rawConfiguredValue, invalidEnv: true };
+      }
+    }
+    return { available: false };
+  }
+}
+
+/**
+ * Report the dsh binary discovery diagnostic.
+ *
+ * Consumes the SINGLE shared resolver result from `discoverDshBinary()`
+ * — no duplicate PATH scanning, no inline accessSync, no direct
+ * login-shell call. The same one result controls both the discovery
+ * message and the gates for the session-store / permission-mode probes.
+ *
+ * dsh is alpha — this check never fails. A missing dsh still warns
+ * (runs will fail at admission) instead of staying silent like the
+ * hermes discovery check.
+ */
+function buildDshBinaryDiscoveryCheck(
+  dsh: DshDiscoveryResult,
+): DoctorCheckResult {
+  if (dsh.invalidEnv) {
+    return {
+      name: "dsh binary discovery",
+      status: "warn",
+      message: `TAMANDUA_DSH_BINARY set to ${dsh.rawEnvValue} but not executable (alpha support)`,
+      remedy: "Fix or unset TAMANDUA_DSH_BINARY so dsh runs can resolve a binary.",
+    };
+  }
+
+  if (dsh.available && dsh.path) {
+    let sourceMessage: string;
+    if (dsh.source === "env") {
+      sourceMessage = `Found via TAMANDUA_DSH_BINARY: ${dsh.path}`;
+    } else if (dsh.source === "token-saver") {
+      sourceMessage = `Found on PATH (dsh-token-saver): ${dsh.path}`;
+    } else if (dsh.source === "login-shell") {
+      sourceMessage = `Found via login shell: ${dsh.path}`;
+    } else {
+      sourceMessage = `Found on PATH: ${dsh.path}`;
+    }
+
+    return {
+      name: "dsh binary discovery",
+      status: "info",
+      message: `${sourceMessage} (alpha support)`,
+    };
+  }
+
+  return {
+    name: "dsh binary discovery",
+    status: "warn",
+    message: "TAMANDUA_DSH_BINARY not set and dsh not found on PATH or via login shell (alpha support — dsh runs will fail at run start)",
+    remedy: "Install dsh (https://github.com/deepseek-ai/deepseek-harness) or set TAMANDUA_DSH_BINARY to an absolute dsh path.",
+  };
+}
+
+/**
+ * Detect `dsh-token-saver` on PATH.
+ * This is an optional tool — never fail, always report as "info" or "pass".
+ */
+function checkDshTokenSaver(): DoctorCheckResult {
+  const found = commandIsOnPath("dsh-token-saver");
+  if (found) {
+    return {
+      name: "dsh-token-saver detection",
+      status: "pass",
+      message: "dsh-token-saver found on PATH (optional token-saving tool)",
+    };
+  }
+  return {
+    name: "dsh-token-saver detection",
+    status: "info",
+    message:
+      "dsh-token-saver not found on PATH (optional — only preferred by no-hurry runs)",
+  };
+}
+
+/**
+ * Detect zstd decompression support for dsh token accounting.
+ *
+ * dsh session logs are zstd-compressed; tamandua decompresses them with
+ * node:zlib `zstdDecompressSync` (Node >= 23.8) or by spawning a `zstd`
+ * binary. When neither is available, dsh token accounting falls back to
+ * 0 tokens with a warning.
+ */
+export function detectDshZstdSupport(): { ok: boolean; reason?: string } {
+  if (nodeZstdDecompressAvailable()) {
+    return { ok: true };
+  }
+  if (commandIsOnPath("zstd")) {
+    return { ok: true };
+  }
+  return {
+    ok: false,
+    reason:
+      "no zstd decompression available (node:zlib zstd requires Node >= 23.8 and no `zstd` binary on PATH)",
+  };
+}
+
+/** Options for the dsh session-store probe. */
+export interface DshSessionStoreProbeOpts {
+  /** Override the dsh home directory (defaults to $DSH_HOME / ~/.dsh). */
+  dshHome?: string;
+  /** Override zstd support detection (tests pin deterministic outcomes). */
+  zstdSupport?: { ok: boolean; reason?: string };
+}
+
+/**
+ * Probe the dsh session store: the sessions directory must be readable
+ * and zstd decompression must be available, otherwise dsh runs report
+ * 0 tokens. Warn-only — dsh is alpha, a broken store only costs token
+ * accounting, never the run itself.
+ *
+ * A missing sessions directory is fine (dsh creates it on first use).
+ */
+export function checkDshSessionStore(
+  opts?: DshSessionStoreProbeOpts,
+): DoctorCheckResult {
+  const dshHome = opts?.dshHome ?? resolveDshHome(process.env);
+  const sessionsDir = path.join(dshHome, "sessions");
+  const zstd = opts?.zstdSupport ?? detectDshZstdSupport();
+
+  const problems: string[] = [];
+  if (fs.existsSync(sessionsDir)) {
+    try {
+      fs.accessSync(sessionsDir, fs.constants.R_OK);
+    } catch {
+      problems.push(`dsh sessions dir is not readable (${sessionsDir})`);
+    }
+  }
+  if (!zstd.ok) {
+    problems.push(zstd.reason ?? "no zstd decompression available");
+  }
+
+  if (problems.length > 0) {
+    return {
+      name: "dsh session store",
+      status: "warn",
+      message: `${problems.join("; ")} — dsh runs will report 0 tokens (alpha support)`,
+    };
+  }
+
+  return {
+    name: "dsh session store",
+    status: "info",
+    message: `dsh session store OK — token accounting available (sessions dir: ${sessionsDir}) (alpha support)`,
+  };
+}
+
+// ── dsh permission-mode probe ────────────────────────────────────
+
+/** Custom YAML tag: `!!js` scalars resolve to their raw source text. */
+const JS_TAG = {
+  tag: "tag:yaml.org,2002:js",
+  resolve: (src: string) => src,
+};
+
+/** Evaluation of a `dsh --profile headless --dump-config` output. */
+export interface DshPermissionEvaluation {
+  /** True when the composed sandbox/approval config is full-access under the injected DSH_PERMISSION_MODE. */
+  ok: boolean;
+  /** Composed sandbox-policy mode (present when the dump was parsed and the entry found). */
+  mode?: string;
+  /** Composed approval policy (present when the dump was parsed and the entry found). */
+  policy?: string;
+  /** Why the dump could not be evaluated (parse failure / missing rows). */
+  reason?: string;
+}
+
+/**
+ * Evaluate the composed sandbox/approval config from a dsh config dump.
+ *
+ * The dump prints `!!js` expressions unevaluated, so a healthy profile
+ * shows `mode: !!js process.env.DSH_PERMISSION_MODE ?? 'workspace-write'`
+ * and the env-driven approval policy — tamandua's
+ * `DSH_PERMISSION_MODE=danger-full-access` injection then composes
+ * full access. A profile patch layer that pins these rows replaces
+ * them wholesale with static values; full access then holds only for
+ * the static pair `danger-full-access` + `never`.
+ */
+export function evaluateDshPermissionDump(
+  stdout: string,
+): DshPermissionEvaluation {
+  let entries: unknown;
+  try {
+    entries = parseDocument(stdout, { customTags: [JS_TAG] }).toJS();
+  } catch (err) {
+    return {
+      ok: false,
+      reason: `config dump parse failed: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+
+  if (!Array.isArray(entries)) {
+    return { ok: false, reason: "config dump is not an entry list" };
+  }
+
+  const findConfig = (id: string): Record<string, unknown> | undefined => {
+    const entry = entries.find(
+      (e): e is Record<string, unknown> =>
+        typeof e === "object" && e !== null && (e as { id?: unknown }).id === id,
+    );
+    const config = entry?.config;
+    return typeof config === "object" && config !== null
+      ? (config as Record<string, unknown>)
+      : undefined;
+  };
+
+  const sandbox = findConfig("sandbox-policy");
+  const approval = findConfig("approval");
+  const mode = typeof sandbox?.mode === "string" ? sandbox.mode : undefined;
+  const policy = typeof approval?.policy === "string" ? approval.policy : undefined;
+
+  if (mode === undefined || policy === undefined) {
+    return {
+      ok: false,
+      reason:
+        "dump has no sandbox-policy mode and/or approval policy rows (unrecognized dsh config shape)",
+    };
+  }
+
+  // An env-driven row honors tamandua's DSH_PERMISSION_MODE injection;
+  // a static row is full-access only for the danger-full-access / never pair.
+  const envDriven = (value: string): boolean => value.includes("DSH_PERMISSION_MODE");
+  const modeFullAccess = envDriven(mode) || mode === "danger-full-access";
+  const policyFullAccess = envDriven(policy) || policy === "never";
+
+  if (modeFullAccess && policyFullAccess) {
+    return { ok: true, mode, policy };
+  }
+  return { ok: false, mode, policy };
+}
+
+/** Options for the dsh permission-mode probe. */
+export interface DshPermissionProbeOpts {
+  /** Environment for the probe spawn (defaults to process.env, plus the mandatory injection). */
+  env?: NodeJS.ProcessEnv;
+  /** Override the dsh home used in messages (defaults to $DSH_HOME / ~/.dsh). */
+  dshHome?: string;
+}
+
+/**
+ * Spawn `dsh --profile headless --dump-config` and resolve stdout.
+ * Free command — no model call, no tokens.
+ */
+function runDshConfigDump(
+  dshPath: string,
+  env: NodeJS.ProcessEnv,
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(
+      dshPath,
+      ["--profile", "headless", "--dump-config"],
+      {
+        env,
+        encoding: "utf8",
+        timeout: 30_000,
+        maxBuffer: 1024 * 1024,
+      },
+      (error, stdout) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve(stdout);
+      },
+    );
+  });
+}
+
+/**
+ * Probe the composed dsh permission mode.
+ *
+ * Runs `dsh --profile headless --dump-config` with
+ * `DSH_PERMISSION_MODE=danger-full-access` in the probe env — the same
+ * injection every tamandua worker spawn gets — and warns when the
+ * composed sandbox/approval config is still not full-access, which
+ * means a profile patch layer pins those rows and out-of-worktree
+ * actions like `tamandua step complete` will be auto-denied.
+ *
+ * Warn-only: dsh is alpha and this check never fails the doctor.
+ */
+export async function checkDshPermissionMode(
+  dshPath: string,
+  opts?: DshPermissionProbeOpts,
+): Promise<DoctorCheckResult> {
+  const probeEnv: NodeJS.ProcessEnv = {
+    ...(opts?.env ?? (process.env as NodeJS.ProcessEnv)),
+    DSH_PERMISSION_MODE: "danger-full-access",
+  };
+  const dshHome = opts?.dshHome ?? resolveDshHome(probeEnv);
+  const patchPath = path.join(dshHome, "profiles", "headless", "cordis.patch.yml");
+
+  let stdout: string;
+  try {
+    stdout = await runDshConfigDump(dshPath, probeEnv);
+  } catch (err) {
+    return {
+      name: "dsh permission-mode probe",
+      status: "warn",
+      message:
+        `could not run dsh --profile headless --dump-config: ${err instanceof Error ? err.message : String(err)}. ` +
+        `Cannot verify the permission mode — out-of-worktree actions like \`tamandua step complete\` may be auto-denied if ${patchPath} pins sandbox/approval rows (alpha support)`,
+    };
+  }
+
+  const evaluation = evaluateDshPermissionDump(stdout);
+  if (evaluation.ok) {
+    return {
+      name: "dsh permission-mode probe",
+      status: "info",
+      message: "composed sandbox/approval config honors DSH_PERMISSION_MODE — probed with danger-full-access, full access confirmed (alpha support)",
+    };
+  }
+
+  if (evaluation.mode !== undefined && evaluation.policy !== undefined) {
+    return {
+      name: "dsh permission-mode probe",
+      status: "warn",
+      message:
+        `composed sandbox/approval config is not full-access under DSH_PERMISSION_MODE=danger-full-access (mode: ${evaluation.mode}, policy: ${evaluation.policy}) — ` +
+        `a profile patch layer pins these rows and overrides tamandua's injection, so out-of-worktree actions like \`tamandua step complete\` will be auto-denied. ` +
+        `Check the sandbox/approval rows in ${patchPath} (alpha support)`,
+    };
+  }
+
+  return {
+    name: "dsh permission-mode probe",
+    status: "warn",
+    message:
+      `could not verify the composed sandbox/approval config: ${evaluation.reason}. ` +
+      `Out-of-worktree actions like \`tamandua step complete\` may be auto-denied if ${patchPath} pins sandbox/approval rows (alpha support)`,
   };
 }
 
@@ -911,6 +1266,15 @@ interface HermesDiscoveryResult {
   invalidEnv?: boolean;
 }
 
+/** Result from the shared discoverDshBinary call — used by the discovery check and the probe gates. */
+interface DshDiscoveryResult {
+  available: boolean;
+  path?: string;
+  source?: DshSource;
+  rawEnvValue?: string;
+  invalidEnv?: boolean;
+}
+
 // ── Check Runner ───────────────────────────────────────────────────
 
 /**
@@ -1085,6 +1449,9 @@ export async function runDoctorChecks(opts?: DoctorOpts): Promise<CheckGroup[]> 
   // ENVIRONMENT — wired in US-003
   // Discover hermes once to share the resolved path across discovery message and contract check.
   const hermesAvailable: HermesDiscoveryResult = await discoverHermesBinary();
+  // Discover dsh once to share the resolved path across the discovery
+  // message and the session-store / permission-mode probe gates.
+  const dshAvailable: DshDiscoveryResult = await discoverDshBinary();
 
   const envPromises: Array<DoctorCheckResult | Promise<DoctorCheckResult>> = [
     checkNodeVersion(),
@@ -1092,12 +1459,21 @@ export async function runDoctorChecks(opts?: DoctorOpts): Promise<CheckGroup[]> 
     checkGhOnPath(),
     checkPiTokenSaver(),
     checkHermesTokenSaver(),
+    checkDshTokenSaver(),
     buildHermesBinaryDiscoveryCheck(hermesAvailable),
+    buildDshBinaryDiscoveryCheck(dshAvailable),
   ];
 
   // Hermes contract check: only included when a hermes binary is available.
   if (hermesAvailable.available) {
     envPromises.push(checkHermesContract(hermesAvailable.path));
+  }
+
+  // dsh probes: only included when a dsh binary is available (the
+  // permission-mode probe spawns the resolved binary).
+  if (dshAvailable.available && dshAvailable.path) {
+    envPromises.push(checkDshSessionStore());
+    envPromises.push(checkDshPermissionMode(dshAvailable.path));
   }
 
   const environmentChecks = await Promise.all(envPromises);

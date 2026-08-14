@@ -146,7 +146,7 @@ function getUsageText(): string {
     "                                      [--working-directory-for-harness <dir>]",
     "                                      [--worktree-origin-repository <dir>]",
     "                                      [--worktree-origin-ref <ref>]",
-    "                                      [--pi-as-harness | --hermes-as-harness]",
+    "                                      [--pi-as-harness | --hermes-as-harness | --dsh-as-harness]",
     "                                      [--no-relaunch-upon-rugpull]",
     "                                      [--wait] [--timeout <dur>] [--json]",
     "                                      Start a workflow run",

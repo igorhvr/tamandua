@@ -260,7 +260,7 @@ flowchart LR
     CLI["tamandua CLI<br/>workflow run"] -->|create run| DB[("SQLite<br/>~/.tamandua/tamandua.db")]
     CLI -->|register run| Daemon["Background daemon<br/>control plane"]
     Daemon -->|dispatches work| Agents["Agent team<br/>planner · developer · verifier · tester"]
-    Agents -->|"pi --print"| Harness["pi harness<br/>(or Hermes, alpha)"]
+    Agents -->|"pi --print"| Harness["pi harness<br/>(or Hermes / dsh, alpha)"]
     Agents -->|claim step / write results| DB
     DB --> Dashboard["Dashboard :3334<br/>Kanban + AutoResearch panels"]
     DB --> MCP["Remote MCP :3338<br/>14 tools"]
@@ -556,7 +556,7 @@ If something isn't working as expected, start with the built-in diagnostic:
 
 | Command | Description |
 |---------|-------------|
-| `tamandua workflow run <id> <task> [--working-directory-for-harness <dir>] [--wait [--timeout <dur>] [--json]] [--pi-as-harness \| --hermes-as-harness]` | Start a run (defaults harness CWD to your current directory). With `--wait`, block until the run finishes |
+| `tamandua workflow run <id> <task> [--working-directory-for-harness <dir>] [--wait [--timeout <dur>] [--json]] [--pi-as-harness \| --hermes-as-harness \| --dsh-as-harness]` | Start a run (defaults harness CWD to your current directory). With `--wait`, block until the run finishes |
 | `tamandua workflow status <query>` | Check run status |
 | `tamandua workflow runs` | List all runs |
 | `tamandua workflow wait <selector...> [--all] [--timeout <dur>] [--json] [--quiet]` | Block until selected runs reach terminal status |
@@ -624,6 +624,7 @@ override this with the harness selection flags on `tamandua workflow run`:
 |------|-------------|
 | `--pi-as-harness` | Use pi as the agent harness. **This is the default.** |
 | `--hermes-as-harness` | Use [Hermes](https://github.com/nicholasgasior/hermes) as the agent harness instead of pi. |
+| `--dsh-as-harness` | Use [DeepSeek Harness (`dsh`)](https://github.com/deepseek-ai/deepseek-harness) as the agent harness instead of pi. **Alpha quality** — see below. |
 
 These flags are **mutually exclusive** — specifying both is an error.
 
@@ -733,6 +734,88 @@ This is a cheap schema probe that catches Hermes-side breakage (new
 `state.db` format, renamed columns) before a production run silently reports
 zero tokens.
 
+#### DeepSeek Harness (dsh) Support (Alpha)
+
+> **⚠️ Alpha quality.** DeepSeek Harness (`dsh`) support is in **alpha** and
+> has known limitations: token usage is read from dsh session files after
+> each round (best-effort: falls back to 0 tokens with a warning if the
+> session store is unreadable); there is **no per-run model selection** —
+> the model comes from the dsh profile; and dsh itself is a release candidate.
+> Use pi (`--pi-as-harness`) for production workflows.
+
+Tamandua runs your installed `dsh` with your `~/.dsh` configuration (profile
+patch layers, credentials, model selection) **as-is**. Exactly one dsh
+setting is injected, unconditionally, on every worker spawn:
+`DSH_PERMISSION_MODE=danger-full-access` — the dsh equivalent of the `--yolo`
+flag Tamandua already passes to Hermes. Under dsh's default
+`workspace-write` sandbox, headless auto-DENIES (fail-closed, no prompt) any
+action outside the worktree — including `tamandua step complete`, which
+writes to `~/.tamandua` — so without the injection agents do the work but can
+never report it. The injection is **process-scoped**: nothing under `~/.dsh`
+is ever created or modified, and your own interactive dsh usage is
+unaffected.
+
+> **⚠️ Profile pin caveat.** dsh's profile layers replace whole config rows,
+> so an environment variable cannot beat them: if your profile's
+> `cordis.patch.yml` (e.g. `~/.dsh/profiles/headless/cordis.patch.yml`)
+> hard-pins sandbox/approval rows, the pin overrides the injection and
+> out-of-worktree actions like `tamandua step complete` are auto-denied —
+> breaking step reporting. `tamandua doctor` probes the composed dsh
+> configuration and warns about exactly this (warn-only, alpha support).
+
+##### dsh Binary Resolution
+
+Tamandua resolves the dsh binary through a **three-tier chain**. The
+resolver never creates, deletes, replaces, chmods, or otherwise mutates any
+user executable or symlink — discovery is entirely side-effect-free.
+
+**Tier 1 — Explicit environment variable (always wins):**
+
+```bash
+export TAMANDUA_DSH_BINARY=/path/to/dsh
+```
+
+Set `TAMANDUA_DSH_BINARY` to an absolute or relative path. Relative paths
+are resolved against the daemon's working directory at scheduling time. If
+the path is not executable, the run fails immediately with a clear
+actionable error.
+
+**Tier 2 — Current process PATH:**
+
+If `TAMANDUA_DSH_BINARY` is not set, Tamandua searches the daemon's own
+`PATH` for `dsh`. When `noHurrySaveTokensMode` is enabled, Tier 2 first
+searches for `dsh-token-saver` (a token-saving wrapper) before falling back
+to a bare `dsh` binary.
+
+**Tier 3 — Login-shell fallback (bounded):**
+
+If neither the env var nor the process `PATH` yields a working dsh,
+Tamandua spawns `zsh -lic 'command -v dsh'` so dsh installed via
+nix/homebrew/npm in shell-specific paths is discoverable even when not on
+the daemon's `PATH`. The returned path is `realpath`-resolved and validated
+with `X_OK`. This fallback is bounded and only runs when the first two tiers
+fail.
+
+Every resolved binary path is **guaranteed to be absolute**, and the
+resolved binary's directory is prepended to the child's `PATH` so nested dsh
+invocations within the agent session find the same binary. The harness
+validation runs at scheduling time — if no dsh binary is found through any
+tier, the run fails immediately with a clear error.
+
+##### Token Accounting
+
+dsh never prints token usage. Tamandua records each round's spawn time and,
+after the round, reads the session log under
+`$DSH_HOME/sessions/<escaped-cwd>/session-<uuid>/session.jsonl.zstd`
+(`$DSH_HOME` defaults to `~/.dsh`) and sums the recorded usage chunks
+(input + output tokens, cache reads excluded). This is best-effort — any
+failure (no zstd support, a missing or unreadable session store) falls back
+to 0 tokens with a warning. `tamandua doctor` includes a dsh session-store
+probe that warns when the sessions directory is unreadable or zstd
+decompression is unavailable, and a permission-mode probe that warns when a
+profile layer pins sandbox/approval rows that override the injected
+permission mode.
+
 ### Remote MCP tools
 
 The remote MCP endpoint exposes 14 tools:
@@ -775,7 +858,7 @@ The remote MCP endpoint exposes 14 tools:
 | `workingDirectoryForHarness` | For direct workflows | Harness working directory for remote MCP runs. Required for direct workflows, invalid for worktree workflows. |
 | `worktreeOriginRepository` | For worktree workflows | Repository path to create the worktree from. Required for worktree workflows, invalid for direct workflows. |
 | `worktreeOriginRef` | No | Git ref (branch, tag, SHA) for the worktree. Optional. Only valid for worktree workflows. |
-| `noHurrySaveTokensMode` | No | When `true`, work spawns prefer a `<harness>-token-saver` wrapper from PATH over the plain harness binary (`pi-token-saver` for pi runs, `hermes-token-saver` for hermes runs; per invocation; falls back to the plain binary when absent). Idle dispatch is free either way. Optional, defaults to `false`. |
+| `noHurrySaveTokensMode` | No | When `true`, work spawns prefer a `<harness>-token-saver` wrapper from PATH over the plain harness binary (`pi-token-saver` for pi runs, `hermes-token-saver` for hermes runs, `dsh-token-saver` for dsh runs; per invocation; falls back to the plain binary when absent). Idle dispatch is free either way. Optional, defaults to `false`. |
 
 `workingDirectoryForHarness` and `worktreeOriginRepository` are **mutually exclusive**: direct workflows require the former, worktree workflows require the latter. Supplying the wrong one or both results in an invalid-params error.
 

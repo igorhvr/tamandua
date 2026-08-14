@@ -11,6 +11,7 @@ import { parseRunContext } from "./step-ops.js";
 import { parsePiOutputStream } from "./pi-stream-parser.js";
 import { getHarnessAdapter, type HarnessRoundResult } from "./harness-adapter.js";
 import { lookupHermesSessionTokens } from "./hermes-usage.js";
+import { lookupDshSessionTokens } from "./dsh-usage.js";
 
 // ──────────────────────────────────────────────────────────────────────
 // Run-Scoped Deterministic Dispatch
@@ -25,7 +26,7 @@ import { lookupHermesSessionTokens } from "./hermes-usage.js";
 //               in-memory job maps from runs.scheduling_status.
 //
 // Dispatch model: the scheduler decides "is there work?" itself with a
-// direct DB peek (peekStep) and spawns a harness (pi/hermes) ONLY when a
+// direct DB peek (peekStep) and spawns a harness (pi/hermes/dsh) ONLY when a
 // pending step exists. Checking for work never invokes a model, so idle
 // dispatch rounds cost zero tokens. The interval tick is a fallback sweep
 // (it also drives stale-claim recovery); step completions nudge the daemon
@@ -140,7 +141,7 @@ export interface CronJobInfo {
   timeoutSeconds?: number;
   /** Working directory used as cwd for `pi --print` invocations. */
   workingDirectoryForHarness?: string;
-  /** Harness binary to use for agent invocations ("pi" or "hermes"). */
+  /** Harness binary to use for agent invocations ("pi", "hermes", or "dsh"). */
   harnessType?: HarnessType;
   createdAt: string;
 }
@@ -174,11 +175,12 @@ export interface FindPiBinaryOptions {
   /**
    * When true (runs launched with --no-hurry-please-save-tokens-mode),
    * prefer a `<harness>-token-saver` command from PATH over the plain
-   * harness binary (e.g., `pi-token-saver` over `pi`, or `hermes-token-saver`
-   * over `hermes`). Resolution happens per invocation, so installing the
-   * wrapper mid-run takes effect on the next work round; when it is absent,
-   * the plain harness binary is used as usual. The per-harness env override
-   * (TAMANDUA_PI_BINARY / TAMANDUA_HERMES_BINARY) still wins over both —
+   * harness binary (e.g., `pi-token-saver` over `pi`, `hermes-token-saver`
+   * over `hermes`, or `dsh-token-saver` over `dsh`). Resolution happens per
+   * invocation, so installing the wrapper mid-run takes effect on the next
+   * work round; when it is absent, the plain harness binary is used as
+   * usual. The per-harness env override (TAMANDUA_PI_BINARY /
+   * TAMANDUA_HERMES_BINARY / TAMANDUA_DSH_BINARY) still wins over all —
    * that is the explicit config/test seam.
    */
   preferTokenSaver?: boolean;
@@ -214,6 +216,30 @@ export { resolveHermesViaLoginShell };
  */
 export async function findHermesBinary(): Promise<string> {
   return resolveHermesBinary();
+}
+
+// ── dsh binary discovery ──────────────────────────────────────────
+
+import { resolveDshBinary, resolveDshViaLoginShell } from "./dsh-resolver.js";
+
+// Re-export resolveDshViaLoginShell from the shared resolver module.
+// Doctor and harness-adapter import from dsh-resolver.js directly; kept
+// here for any external consumers that resolve via agent-scheduler (mirrors
+// the hermes re-export above).
+export { resolveDshViaLoginShell };
+
+/**
+ * Thin async wrapper around {@link resolveDshBinary} from the shared
+ * dsh resolver module. Discovery is entirely side-effect-free — no
+ * filesystem mutation (no symlink creation, no file deletion, no chmod).
+ *
+ * Resolution precedence:
+ *   1. TAMANDUA_DSH_BINARY env var (must be X_OK)
+ *   2. Process PATH lookup (preferring `dsh-token-saver` when requested)
+ *   3. Login-shell fallback (zsh -lic 'command -v dsh')
+ */
+export async function findDshBinary(): Promise<string> {
+  return resolveDshBinary();
 }
 
 // ── Low-level pi execution ─────────────────────────────────────────
@@ -971,7 +997,7 @@ async function attributeWorkRoundTokenUsage(
  *   3. stale-claim sweep (recover steps whose worker silently died)
  *   4. deterministic peek — `peekStep` IN-PROCESS. No spawn, no model, no
  *      tokens when idle. This is the entire point of the dispatch motor.
- *   5. work spawn — only on HAS_WORK: pi/hermes runs the work prompt
+ *   5. work spawn — only on HAS_WORK: pi/hermes/dsh runs the work prompt
  *      (claim → execute → report)
  *   6. post-round processing — token attribution to the run, STATUS
  *      classification, auto-complete fallback, orphaned-step recovery
@@ -1025,6 +1051,12 @@ export async function executeDispatchRound(
 
   // Declared outside try so catch/post-round handlers can access exit diagnostics
   let result: HarnessRoundResult | undefined;
+  // Round-start timestamp captured for dsh token accounting. dsh never
+  // prints usage; tokens are read from $DSH_HOME session files keyed on
+  // the workdir + a "created since this time" scan. Captured BEFORE
+  // binary resolution so the error path (e.g. a dispatch-time resolution
+  // failure) can still attempt the best-effort session lookup.
+  let dshRoundStartedAtMs: number | undefined;
   // Captured from the run-status DB query so the traceability header can
   // include run_number without a second DB trip.
   let runNumber: number | undefined;
@@ -1189,11 +1221,15 @@ export async function executeDispatchRound(
 
     let output: string;
     const adapter = getHarnessAdapter(harnessType);
-    // Pre-resolve the binary path. For hermes, this goes through the
-    // same shared resolver that admission validation uses, guaranteeing
-    // single-source dispatch — no disagreement between validation and
-    // invocation. The resolved path is passed in options.binaryPath so
-    // runRound skips its own redundant findBinary() call.
+    if (harnessType === "dsh") {
+      dshRoundStartedAtMs = Date.now();
+    }
+    // Pre-resolve the binary path. For hermes and dsh, this goes through
+    // the same shared resolvers that admission validation uses,
+    // guaranteeing single-source dispatch — no disagreement between
+    // validation and invocation. The resolved path is passed in
+    // options.binaryPath so runRound skips its own redundant findBinary()
+    // call.
     const binaryPath = await adapter.findBinary({ preferTokenSaver });
     const harnessEnv: Record<string, string> = {
       TAMANDUA_WORKER_JOB_ID: job.id,
@@ -1201,11 +1237,13 @@ export async function executeDispatchRound(
     };
     if (harnessType === "hermes") {
       harnessEnv.TAMANDUA_HERMES_BINARY = binaryPath;
+    } else if (harnessType === "dsh") {
+      harnessEnv.TAMANDUA_DSH_BINARY = binaryPath;
     }
     // Prepend the binary's directory to the child PATH so nested
-    // hermes/pi invocations within the agent session can find the
+    // hermes/pi/dsh invocations within the agent session can find the
     // same binary, even when the daemon's own PATH lacked it (e.g.
-    // login-shell-discovered hermes). The original PATH is preserved
+    // login-shell-discovered hermes/dsh). The original PATH is preserved
     // as a suffix so standard system tools remain reachable.
     const binaryDir = path.dirname(binaryPath);
     const currentPathDirs = (process.env.PATH ?? "").split(path.delimiter);
@@ -1239,12 +1277,14 @@ export async function executeDispatchRound(
       ...(result.signal ? { signal: result.signal } : {}),
     });
 
-    // Guard: hermes stdout carries no token usage by contract.
-    // Any usage parsed from it is contamination (e.g. agent echoing
-    // pi-style JSON) that would double count on top of the state.db
-    // attribution. This also stops the misleading "--mode json may
-    // be off" warning for hermes rounds.
-    if (harnessType !== "hermes") {
+    // Guard: pi is the ONLY harness whose stdout carries token usage
+    // (--mode json message_end metadata). hermes and dsh stdout carry
+    // none by contract — any usage parsed from them is contamination
+    // (e.g. an agent echoing pi-style JSON) that would double count on
+    // top of the real state.db / session-file attribution. This also
+    // stops the misleading "--mode json may be off" warning for
+    // hermes/dsh rounds.
+    if (harnessType === "pi") {
       await attributeWorkRoundTokenUsage(context, job, outputSummary, metadata);
     }
 
@@ -1263,6 +1303,43 @@ export async function executeDispatchRound(
           jsonMetadataDetected: false,
         };
         await attributeWorkRoundTokenUsage(context, job, outputSummary, hermesMetadata);
+      }
+    }
+
+    // ── dsh token lookup ─────────────────────────────────────────
+    // dsh prints no session id and no usage — usage lives in the session
+    // file under $DSH_HOME/sessions/<escaped-workdir>/session-<uuid>/.
+    // The lookup scans session dirs created since the round-start
+    // timestamp and reads the newest (this includes timed-out rounds,
+    // which resolve through the normal post-round path). Best-effort:
+    // an unavailable lookup falls back to 0 tokens with a warning —
+    // never an error, never blocks the round.
+    if (harnessType === "dsh" && dshRoundStartedAtMs !== undefined && workingDirectoryForHarness) {
+      const dshUsage = await lookupDshSessionTokens({
+        spawnedAtMs: dshRoundStartedAtMs,
+        workdir: workingDirectoryForHarness,
+      });
+      if (dshUsage !== null && dshUsage.totalTokens > 0) {
+        const dshMetadata: WorkRoundMetadata = {
+          assistantOutput: output,
+          tokenUsage: dshUsage.totalTokens,
+          runId: null,
+          stepId: null,
+          jsonMetadataDetected: false,
+        };
+        await attributeWorkRoundTokenUsage(context, job, outputSummary, dshMetadata);
+        logger.info("dsh token attribution from session file", {
+          ...context,
+          sessionRef: dshUsage.sessionRef,
+          tokenDelta: dshUsage.totalTokens,
+        });
+      } else {
+        // Zero-token fallback: warn (with round context) so operators can
+        // see WHY the run reads 0 tokens — never an error, never a retry.
+        logger.warn("dsh session token lookup unavailable — tokens will read 0", {
+          ...context,
+          reason: "no_session_since_round_start_or_unreadable",
+        });
       }
     }
 
@@ -1417,6 +1494,44 @@ export async function executeDispatchRound(
           }
         }
       }
+
+      // ── dsh token lookup on round failure ──────────────────────
+      // When a dsh round fails before it ever resolved (dispatch-time
+      // binary-resolution failure, spawn rejection), a session may still
+      // exist for the workdir. Scan by the captured round-start timestamp
+      // and attribute when a session is found — the same best-effort
+      // lookup as the success path (null → 0 tokens with a warning, never
+      // an error, never blocks the failure handling). `result ===
+      // undefined` keeps this complementary to the success path: a round
+      // that DID resolve already ran its lookup there, so re-running it
+      // here on a later post-round throw would double count.
+      if (
+        harnessType === "dsh" &&
+        result === undefined &&
+        dshRoundStartedAtMs !== undefined &&
+        workingDirectoryForHarness
+      ) {
+        const dshUsage = await lookupDshSessionTokens({
+          spawnedAtMs: dshRoundStartedAtMs,
+          workdir: workingDirectoryForHarness,
+        });
+        if (dshUsage !== null && dshUsage.totalTokens > 0) {
+          const dshMetadata: WorkRoundMetadata = {
+            assistantOutput: "",
+            tokenUsage: dshUsage.totalTokens,
+            runId: null,
+            stepId: null,
+            jsonMetadataDetected: false,
+          };
+          const outputSummary = summarizeWorkRoundOutput("");
+          await attributeWorkRoundTokenUsage(context, job, outputSummary, dshMetadata);
+          logger.info("dsh token attribution from error-path session lookup", {
+            ...context,
+            sessionRef: dshUsage.sessionRef,
+            tokenDelta: dshUsage.totalTokens,
+          });
+        }
+      }
     } catch (recoveryErr) {
       logger.error("Orphaned step recovery failed", {
         ...context,
@@ -1477,6 +1592,8 @@ export async function createAgentCronJob(
       const ctx = parseRunContext(runId, runRow.context);
       if (ctx.harness_type === "hermes") {
         harnessType = "hermes";
+      } else if (ctx.harness_type === "dsh") {
+        harnessType = "dsh";
       }
     }
   } catch {
@@ -2034,6 +2151,14 @@ export function _hasPendingSweepTimer(runId: string): boolean {
 /** @internal — exposed for tests to observe scheduler generation/epoch bumps. */
 export function _schedulerGeneration(): number {
   return schedulerGeneration;
+}
+
+/** @internal — exposed for tests to introspect scheduled job metadata. */
+export function _scheduledJobHarnessType(runId: string): string | undefined {
+  for (const info of jobMetadata.values()) {
+    if (info.runId === runId) return info.harnessType ?? "pi";
+  }
+  return undefined;
 }
 
 /** @internal — exposed for daemon reconciler. */

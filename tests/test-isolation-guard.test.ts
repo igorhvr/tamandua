@@ -53,6 +53,32 @@ describe("test isolation guard", () => {
     assert.deepEqual(violations, []);
   });
 
+  it("npm test pins TAMANDUA_DSH_BINARY=/usr/bin/false (dsh safety net; fails when the pin is removed)", () => {
+    // The dsh (DeepSeek Harness) harness is a real, token-spending binary. The
+    // unit-test environment must pin TAMANDUA_DSH_BINARY=/usr/bin/false —
+    // mirroring the pi pin — so no unit test can ever spawn a real dsh.
+    // This guard fails loudly if either half of the pin is removed.
+    const pkg = JSON.parse(
+      fs.readFileSync(path.join(process.cwd(), "package.json"), "utf-8"),
+    );
+    assert.ok(
+      typeof pkg.scripts?.test === "string" &&
+        pkg.scripts.test.includes("TAMANDUA_DSH_BINARY=/usr/bin/false"),
+      "package.json test script must pin TAMANDUA_DSH_BINARY=/usr/bin/false so no unit test can spawn a real dsh",
+    );
+
+    const allLanes = fs.readFileSync(
+      path.join(process.cwd(), "scripts", "run-all-lanes.sh"),
+      "utf-8",
+    );
+    assert.ok(
+      allLanes.includes(
+        'TAMANDUA_DSH_BINARY="${TAMANDUA_DSH_BINARY:-/usr/bin/false}"',
+      ),
+      "scripts/run-all-lanes.sh must default TAMANDUA_DSH_BINARY to /usr/bin/false when unset",
+    );
+  });
+
   it("test files that use logger or agent-scheduler must set TAMANDUA_STATE_DIR", () => {
     // Test files that import logger or agent-scheduler functions must isolate
     // their log output using TAMANDUA_STATE_DIR to avoid polluting the live

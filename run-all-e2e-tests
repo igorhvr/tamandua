@@ -27,5 +27,5 @@ cd "$(dirname "$0")"
 LOG="${TAMANDUA_E2E_TEST_LOG:-e2e-test-output.log}"
 
 npm run build
-node --test e2e-tests/workflows-smoke.test.ts e2e-tests/workflows-scripted.test.ts e2e-tests/workflows-scripted-hermes.test.ts e2e-tests/autoresearch-scripted.test.ts e2e-tests/fixture-health.test.ts 2>&1 | tee "$LOG"
+node --test e2e-tests/workflows-smoke.test.ts e2e-tests/workflows-scripted.test.ts e2e-tests/workflows-scripted-hermes.test.ts e2e-tests/workflows-scripted-dsh.test.ts e2e-tests/autoresearch-scripted.test.ts e2e-tests/fixture-health.test.ts 2>&1 | tee "$LOG"
 exit "${PIPESTATUS[1]}"

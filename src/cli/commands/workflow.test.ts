@@ -509,4 +509,113 @@ Examples:
       assert.equal(step.displayStatus, "failed", "non-loop displayStatus must equal raw status");
     });
   });
+
+  describe("US-002: harness display in workflow status (in-process with temp DB)", () => {
+    let tempDir: string;
+    let dbPath: string;
+    let db: DatabaseSync;
+    let originalDbPath: string | undefined;
+    let originalHome: string | undefined;
+    let originalStateDir: string | undefined;
+
+    beforeEach(() => {
+      originalDbPath = process.env.TAMANDUA_DB_PATH;
+      originalHome = process.env.HOME;
+      originalStateDir = process.env.TAMANDUA_STATE_DIR;
+
+      const setup = setupTempDb();
+      tempDir = setup.tempDir;
+      dbPath = setup.dbPath;
+      db = setup.db;
+
+      process.env.TAMANDUA_DB_PATH = dbPath;
+      process.env.HOME = tempDir;
+      process.env.TAMANDUA_STATE_DIR = join(tempDir, ".tamandua");
+    });
+
+    afterEach(() => {
+      if (originalDbPath) process.env.TAMANDUA_DB_PATH = originalDbPath;
+      else delete process.env.TAMANDUA_DB_PATH;
+      if (originalHome) process.env.HOME = originalHome;
+      else delete process.env.HOME;
+      if (originalStateDir) process.env.TAMANDUA_STATE_DIR = originalStateDir;
+      else delete process.env.TAMANDUA_STATE_DIR;
+
+      db.close();
+      try { rmSync(tempDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    });
+
+    function seedRun(runId: string, harnessType?: string): void {
+      const context = harnessType ? JSON.stringify({ harness_type: harnessType }) : "{}";
+      db.prepare(
+        "INSERT INTO runs (id, workflow_id, task, status, context) VALUES (?, 'test', 'task', 'running', ?)",
+      ).run(runId, context);
+    }
+
+    async function captureStatusOutput(runId: string, extraArgs: string[] = []): Promise<string> {
+      let output = "";
+      const origLog = console.log;
+      console.log = (...chunks: unknown[]) => {
+        output += chunks.map((c) => String(c)).join(" ") + "\n";
+      };
+      try {
+        await handleWorkflow("workflow", ["workflow", "status", runId, ...extraArgs], () => {});
+      } finally {
+        console.log = origLog;
+      }
+      return output;
+    }
+
+    it("getWorkflowStatus exposes harnessType 'dsh' from context", async () => {
+      const runId = crypto.randomUUID();
+      seedRun(runId, "dsh");
+
+      const { getWorkflowStatus } = await import("../../../dist/installer/status.js");
+      const detail = getWorkflowStatus(`run-${runId}`);
+      assert.equal(detail.harnessType, "dsh");
+    });
+
+    it("getWorkflowStatus defaults harnessType to 'pi' when context omits it", async () => {
+      const runId = crypto.randomUUID();
+      seedRun(runId);
+
+      const { getWorkflowStatus } = await import("../../../dist/installer/status.js");
+      const detail = getWorkflowStatus(`run-${runId}`);
+      assert.equal(detail.harnessType, "pi");
+    });
+
+    it("workflow status text output carries the alpha label for dsh runs", async () => {
+      const runId = crypto.randomUUID();
+      seedRun(runId, "dsh");
+
+      const output = await captureStatusOutput(runId);
+      assert.match(output, /Harness: dsh \(alpha\)/);
+    });
+
+    it("workflow status text output shows plain harness for hermes runs", async () => {
+      const runId = crypto.randomUUID();
+      seedRun(runId, "hermes");
+
+      const output = await captureStatusOutput(runId);
+      assert.match(output, /Harness: hermes/);
+      assert.doesNotMatch(output, /alpha/);
+    });
+
+    it("workflow status text output omits the Harness line for pi runs", async () => {
+      const runId = crypto.randomUUID();
+      seedRun(runId, "pi");
+
+      const output = await captureStatusOutput(runId);
+      assert.doesNotMatch(output, /Harness:/);
+    });
+
+    it("workflow status --json includes harnessType", async () => {
+      const runId = crypto.randomUUID();
+      seedRun(runId, "dsh");
+
+      const output = await captureStatusOutput(runId, ["--json"]);
+      const parsed = JSON.parse(output.trim());
+      assert.equal(parsed.harnessType, "dsh");
+    });
+  });
 });

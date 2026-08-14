@@ -90,8 +90,8 @@ describe("README Hermes harness documentation", () => {
 
   it("workflow run command row includes harness flags", () => {
     assert.ok(
-      readmeContent.includes("[--pi-as-harness \\| --hermes-as-harness]") ||
-      readmeContent.includes("[--pi-as-harness | --hermes-as-harness]"),
+      readmeContent.includes("[--pi-as-harness \\| --hermes-as-harness \\| --dsh-as-harness]") ||
+      readmeContent.includes("[--pi-as-harness | --hermes-as-harness | --dsh-as-harness]"),
       "README workflow run command row must show harness flags"
     );
   });

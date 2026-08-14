@@ -11,7 +11,8 @@ import { tamanduaTempDir } from "../dist/lib/temp-dir.js";
 
 import { DatabaseSync } from "node:sqlite";
 
-import { runDoctorChecks, runLlmPromptAdherenceChecks, formatDoctorOutput } from "../dist/doctor.js";
+import { runDoctorChecks, runLlmPromptAdherenceChecks, formatDoctorOutput,
+  checkDshSessionStore, detectDshZstdSupport, evaluateDshPermissionDump } from "../dist/doctor.js";
 import type { DoctorCheckResult, CheckGroup } from "../dist/doctor.js";
 import {
   startDaemon,
@@ -621,13 +622,23 @@ function seedHermesFixtureDb(hermesHome: string, options?: { missingColumns?: st
 describe("ENVIRONMENT hermes contract check (US-004)", () => {
   let savedHermesBinary: string | undefined;
   let savedHermesHome: string | undefined;
+  let savedDshBinary: string | undefined;
+  let savedDshHome: string | undefined;
   let savedPath: string | undefined;
   let fixtureDir: string | null = null;
+  let dshHomeDir: string | null = null;
 
   beforeEach(() => {
     savedHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
     savedHermesHome = process.env.HERMES_HOME;
+    savedDshBinary = process.env.TAMANDUA_DSH_BINARY;
+    savedDshHome = process.env.DSH_HOME;
     savedPath = process.env.PATH;
+    // Pin dsh away by default so hermes contract tests are hermetic —
+    // individual tests re-pin TAMANDUA_DSH_BINARY when they need a fake.
+    delete process.env.TAMANDUA_DSH_BINARY;
+    dshHomeDir = createTempHome();
+    process.env.DSH_HOME = dshHomeDir;
   });
 
   afterEach(() => {
@@ -641,6 +652,16 @@ describe("ENVIRONMENT hermes contract check (US-004)", () => {
     } else {
       delete process.env.HERMES_HOME;
     }
+    if (savedDshBinary !== undefined) {
+      process.env.TAMANDUA_DSH_BINARY = savedDshBinary;
+    } else {
+      delete process.env.TAMANDUA_DSH_BINARY;
+    }
+    if (savedDshHome !== undefined) {
+      process.env.DSH_HOME = savedDshHome;
+    } else {
+      delete process.env.DSH_HOME;
+    }
     if (savedPath !== undefined) {
       process.env.PATH = savedPath;
     } else {
@@ -650,9 +671,13 @@ describe("ENVIRONMENT hermes contract check (US-004)", () => {
       try { fs.rmSync(fixtureDir, { recursive: true, force: true }); } catch {}
       fixtureDir = null;
     }
+    if (dshHomeDir) {
+      try { fs.rmSync(dshHomeDir, { recursive: true, force: true }); } catch {}
+      dshHomeDir = null;
+    }
   });
 
-  it("when no hermes binary, ENVIRONMENT group has exactly 6 checks (no contract check)", async () => {
+  it("when no hermes binary, ENVIRONMENT group has exactly 8 checks (no contract check)", async () => {
     delete process.env.TAMANDUA_HERMES_BINARY;
 
     // Create a fake zsh that won't find hermes via login shell
@@ -680,9 +705,19 @@ describe("ENVIRONMENT hermes contract check (US-004)", () => {
     assert.strictEqual(contractCheck, undefined,
       "Should NOT have hermes contract check when hermes binary is absent");
 
-    // Discovery check always present; contract absent when no hermes
-    assert.strictEqual(env!.checks.length, 6,
-      `Expected exactly 6 ENVIRONMENT checks when no hermes, got ${env!.checks.length}: ${env!.checks.map((c: DoctorCheckResult) => c.name).join(", ")}`);
+    // No dsh probes should appear when dsh is absent
+    const dshSessionCheck = env!.checks.find((c) => c.name === "dsh session store");
+    assert.strictEqual(dshSessionCheck, undefined,
+      "Should NOT have dsh session-store check when dsh binary is absent");
+    const dshPermissionCheck = env!.checks.find((c) => c.name === "dsh permission-mode probe");
+    assert.strictEqual(dshPermissionCheck, undefined,
+      "Should NOT have dsh permission-mode check when dsh binary is absent");
+
+    // Discovery checks always present; contract absent when no hermes.
+    // 8 always-on checks: node, pi, gh, pi-token-saver,
+    // hermes-token-saver, dsh-token-saver, hermes discovery, dsh discovery.
+    assert.strictEqual(env!.checks.length, 8,
+      `Expected exactly 8 ENVIRONMENT checks when no hermes and no dsh, got ${env!.checks.length}: ${env!.checks.map((c: DoctorCheckResult) => c.name).join(", ")}`);
   });
 
   it("hermes contract check shows info with 'contract OK' when state.db is valid", async () => {
@@ -695,6 +730,9 @@ describe("ENVIRONMENT hermes contract check (US-004)", () => {
     fs.writeFileSync(stubPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
     process.env.TAMANDUA_HERMES_BINARY = stubPath;
     process.env.HERMES_HOME = fixtureDir;
+    // Isolate PATH (no dsh, no zsh) so the dsh discovery check is
+    // deterministic and no dsh probes are added.
+    process.env.PATH = fixtureDir;
 
     const groups = await runDoctorChecks();
     const env = groups.find((g) => g.label === "ENVIRONMENT");
@@ -714,8 +752,10 @@ describe("ENVIRONMENT hermes contract check (US-004)", () => {
     assert.ok(contractCheck!.message.includes(stubPath),
       `Message should include the resolved binary path, got: ${contractCheck!.message}`);
 
-    assert.strictEqual(env!.checks.length, 7,
-      `Expected exactly 7 ENVIRONMENT checks with hermes available, got ${env!.checks.length}`);
+    // 8 always-on checks + hermes contract check = 9 (no dsh available:
+    // PATH is the fixture dir with no dsh/zsh).
+    assert.strictEqual(env!.checks.length, 9,
+      `Expected exactly 9 ENVIRONMENT checks with hermes available and no dsh, got ${env!.checks.length}`);
   });
 
   it("hermes contract check shows warn when state.db has no sessions table", async () => {
@@ -793,6 +833,486 @@ describe("ENVIRONMENT hermes contract check (US-004)", () => {
       `Reason should mention state.db not found, got: ${contractCheck!.message}`);
     assert.ok(contractCheck!.message.includes("Hermes runs will report 0 tokens"),
       `Message should mention impact, got: ${contractCheck!.message}`);
+  });
+});
+
+// ── dsh (DeepSeek Harness) doctor checks (US-009) ──────────────
+
+/** Healthy dump: sandbox/approval rows are env-driven (honor DSH_PERMISSION_MODE). */
+const DSH_ENV_DRIVEN_DUMP = `# == fake-dsh-base
+- id: sandbox-policy
+  name: '@deepseek-ai/dsh-sandbox-policy'
+  config:
+    mode: !!js process.env.DSH_PERMISSION_MODE ?? 'workspace-write'
+    workspaceRoot: !!js process.cwd()
+- id: approval
+  name: '@deepseek-ai/dsh-user-approval'
+  config:
+    policy: !!js >-
+      (process.env.DSH_PERMISSION_MODE ?? 'workspace-write') === 'danger-full-access' ? 'never' : 'ask'
+`;
+
+/** Pinned dump: a profile patch layer replaced both rows with static non-full-access values. */
+const DSH_PINNED_DUMP = `# == user-patch-layer
+- id: sandbox-policy
+  name: '@deepseek-ai/dsh-sandbox-policy'
+  config:
+    mode: workspace-write
+- id: approval
+  name: '@deepseek-ai/dsh-user-approval'
+  config:
+    policy: ask
+`;
+
+/** Statically full-access dump: pinned, but to the full-access pair. */
+const DSH_STATIC_FULL_ACCESS_DUMP = `# == user-patch-layer
+- id: sandbox-policy
+  config:
+    mode: danger-full-access
+- id: approval
+  config:
+    policy: never
+`;
+
+/** Write a fake dsh binary that cats the given canned dump and exits 0. */
+function writeFakeDshCating(dst: string, dumpPath: string): void {
+  // /bin/cat (absolute) so the probe works even under an isolated PATH.
+  fs.writeFileSync(dst, `#!/bin/sh\n/bin/cat "${dumpPath}"\nexit 0\n`, { mode: 0o755 });
+}
+
+/** Write a fake dsh binary that exits 1 (dump-config failure). */
+function writeFakeDshFailing(dst: string): void {
+  fs.writeFileSync(dst, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+}
+
+/** Write a canned dump fixture file and a fake dsh binary that cats it. */
+function writeCannedDshDump(fixtureDir: string, dumpText: string): string {
+  const dumpPath = path.join(fixtureDir, "dump-config.yaml");
+  fs.writeFileSync(dumpPath, dumpText);
+  const dshPath = path.join(fixtureDir, "fake-dsh");
+  writeFakeDshCating(dshPath, dumpPath);
+  return dshPath;
+}
+
+describe("ENVIRONMENT dsh checks (US-009)", () => {
+  let savedDshBinary: string | undefined;
+  let savedDshHome: string | undefined;
+  let savedHermesBinary: string | undefined;
+  let savedHermesHome: string | undefined;
+  let savedPath: string | undefined;
+  let savedHome: string | undefined;
+  let fixtureDir: string | null = null;
+  let dshHomeDir: string | null = null;
+
+  beforeEach(() => {
+    savedDshBinary = process.env.TAMANDUA_DSH_BINARY;
+    savedDshHome = process.env.DSH_HOME;
+    savedHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
+    savedHermesHome = process.env.HERMES_HOME;
+    savedPath = process.env.PATH;
+    savedHome = process.env.HOME;
+    // Hermetic baseline: no dsh/hermes env pins, isolated dsh home.
+    delete process.env.TAMANDUA_DSH_BINARY;
+    delete process.env.TAMANDUA_HERMES_BINARY;
+    delete process.env.HERMES_HOME;
+    dshHomeDir = createTempHome();
+    process.env.DSH_HOME = dshHomeDir;
+  });
+
+  afterEach(() => {
+    if (savedDshBinary !== undefined) {
+      process.env.TAMANDUA_DSH_BINARY = savedDshBinary;
+    } else {
+      delete process.env.TAMANDUA_DSH_BINARY;
+    }
+    if (savedDshHome !== undefined) {
+      process.env.DSH_HOME = savedDshHome;
+    } else {
+      delete process.env.DSH_HOME;
+    }
+    if (savedHermesBinary !== undefined) {
+      process.env.TAMANDUA_HERMES_BINARY = savedHermesBinary;
+    } else {
+      delete process.env.TAMANDUA_HERMES_BINARY;
+    }
+    if (savedHermesHome !== undefined) {
+      process.env.HERMES_HOME = savedHermesHome;
+    } else {
+      delete process.env.HERMES_HOME;
+    }
+    if (savedPath !== undefined) {
+      process.env.PATH = savedPath;
+    } else {
+      delete process.env.PATH;
+    }
+    if (savedHome !== undefined) {
+      process.env.HOME = savedHome;
+    } else {
+      delete process.env.HOME;
+    }
+    if (fixtureDir) {
+      try { fs.rmSync(fixtureDir, { recursive: true, force: true }); } catch {}
+      fixtureDir = null;
+    }
+    if (dshHomeDir) {
+      try { fs.rmSync(dshHomeDir, { recursive: true, force: true }); } catch {}
+      dshHomeDir = null;
+    }
+  });
+
+  it("discovery reports the env tier and gates the dsh probes in", async () => {
+    fixtureDir = createTempHome();
+    const stubPath = path.join(fixtureDir, "stub-dsh");
+    fs.writeFileSync(stubPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    process.env.TAMANDUA_DSH_BINARY = stubPath;
+    // Isolated PATH — no real dsh/hermes/zsh anywhere.
+    process.env.PATH = fixtureDir;
+
+    const groups = await runDoctorChecks();
+    const env = groups.find((g) => g.label === "ENVIRONMENT");
+    assert.ok(env);
+
+    const discoveryCheck = env!.checks.find((c) => c.name === "dsh binary discovery");
+    assert.ok(discoveryCheck, "Expected dsh binary discovery check");
+    assert.strictEqual(discoveryCheck!.status, "info",
+      `dsh discovery via env should be info, got: ${discoveryCheck!.status} (${discoveryCheck!.message})`);
+    assert.ok(
+      discoveryCheck!.message.includes("Found via TAMANDUA_DSH_BINARY"),
+      `Message should say 'Found via TAMANDUA_DSH_BINARY', got: ${discoveryCheck!.message}`,
+    );
+    assert.ok(
+      discoveryCheck!.message.includes(stubPath),
+      `Message should include the binary path, got: ${discoveryCheck!.message}`,
+    );
+    assert.ok(
+      discoveryCheck!.message.includes("(alpha support)"),
+      `Message should carry the alpha label, got: ${discoveryCheck!.message}`,
+    );
+
+    // dsh is available → both probes included, both warn-only (never fail).
+    const sessionCheck = env!.checks.find((c) => c.name === "dsh session store");
+    assert.ok(sessionCheck, "Expected dsh session store check when dsh is available");
+    assert.notStrictEqual(sessionCheck!.status, "fail",
+      `dsh session store check must never fail, got: ${sessionCheck!.status}`);
+    const permissionCheck = env!.checks.find((c) => c.name === "dsh permission-mode probe");
+    assert.ok(permissionCheck, "Expected dsh permission-mode check when dsh is available");
+    assert.notStrictEqual(permissionCheck!.status, "fail",
+      `dsh permission-mode check must never fail, got: ${permissionCheck!.status}`);
+
+    // 8 always-on + 2 gated dsh probes = 10 (no hermes).
+    assert.strictEqual(env!.checks.length, 10,
+      `Expected exactly 10 ENVIRONMENT checks with dsh available and no hermes, got ${env!.checks.length}`);
+  });
+
+  it("discovery warns when TAMANDUA_DSH_BINARY is set but not executable", async () => {
+    fixtureDir = createTempHome();
+    process.env.TAMANDUA_DSH_BINARY = path.join(fixtureDir, "missing-dsh");
+    process.env.PATH = fixtureDir;
+
+    const groups = await runDoctorChecks();
+    const env = groups.find((g) => g.label === "ENVIRONMENT");
+    assert.ok(env);
+
+    const discoveryCheck = env!.checks.find((c) => c.name === "dsh binary discovery");
+    assert.ok(discoveryCheck, "Expected dsh binary discovery check");
+    assert.strictEqual(discoveryCheck!.status, "warn",
+      `invalid env binary should warn, got: ${discoveryCheck!.status} (${discoveryCheck!.message})`);
+    assert.ok(
+      discoveryCheck!.message.includes("not executable"),
+      `Message should mention 'not executable', got: ${discoveryCheck!.message}`,
+    );
+    assert.ok(discoveryCheck!.remedy, "Warn should carry a remedy");
+
+    // No dsh available → probes gated off.
+    assert.strictEqual(env!.checks.find((c) => c.name === "dsh session store"), undefined);
+    assert.strictEqual(env!.checks.find((c) => c.name === "dsh permission-mode probe"), undefined);
+  });
+
+  it("discovery warns (not fails) when dsh is absent from all tiers", async () => {
+    fixtureDir = createTempHome();
+    // Fake zsh that finds nothing.
+    fs.writeFileSync(path.join(fixtureDir, "zsh"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    process.env.PATH = fixtureDir;
+    process.env.HOME = fixtureDir;
+
+    const groups = await runDoctorChecks();
+    const env = groups.find((g) => g.label === "ENVIRONMENT");
+    assert.ok(env);
+
+    const discoveryCheck = env!.checks.find((c) => c.name === "dsh binary discovery");
+    assert.ok(discoveryCheck, "Expected dsh binary discovery check");
+    assert.strictEqual(discoveryCheck!.status, "warn",
+      `missing dsh should warn, got: ${discoveryCheck!.status} (${discoveryCheck!.message})`);
+    assert.ok(
+      discoveryCheck!.message.includes("not found") || discoveryCheck!.message.includes("not set"),
+      `Message should indicate dsh not found, got: ${discoveryCheck!.message}`,
+    );
+    assert.ok(discoveryCheck!.remedy, "Warn should carry a remedy");
+
+    // Doctor still runs all groups and never fails on dsh.
+    assert.strictEqual(groups.length, 5, "All five doctor groups still present");
+  });
+
+  it("discovery reports the PATH tier", async () => {
+    fixtureDir = createTempHome();
+    const dshStub = path.join(fixtureDir, "dsh");
+    fs.writeFileSync(dshStub, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    process.env.PATH = fixtureDir;
+
+    const groups = await runDoctorChecks();
+    const env = groups.find((g) => g.label === "ENVIRONMENT");
+    assert.ok(env);
+
+    const discoveryCheck = env!.checks.find((c) => c.name === "dsh binary discovery");
+    assert.ok(discoveryCheck, "Expected dsh binary discovery check");
+    assert.strictEqual(discoveryCheck!.status, "info");
+    assert.ok(
+      discoveryCheck!.message.includes("Found on PATH"),
+      `Message should say 'Found on PATH', got: ${discoveryCheck!.message}`,
+    );
+    assert.ok(
+      discoveryCheck!.message.includes(dshStub),
+      `Message should include the resolved path, got: ${discoveryCheck!.message}`,
+    );
+  });
+
+  it("discovery reports the login-shell tier", async () => {
+    fixtureDir = createTempHome();
+    const dshPath = path.join(fixtureDir, "real-dsh");
+    fs.writeFileSync(dshPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    // Fake zsh that echoes the dsh path (PATH tier must not satisfy).
+    fs.writeFileSync(path.join(fixtureDir, "zsh"), `#!/bin/sh\necho "${dshPath}"\n`, { mode: 0o755 });
+    process.env.PATH = fixtureDir;
+    process.env.HOME = fixtureDir;
+
+    const groups = await runDoctorChecks();
+    const env = groups.find((g) => g.label === "ENVIRONMENT");
+    assert.ok(env);
+
+    const discoveryCheck = env!.checks.find((c) => c.name === "dsh binary discovery");
+    assert.ok(discoveryCheck, "Expected dsh binary discovery check");
+    assert.strictEqual(discoveryCheck!.status, "info");
+    assert.ok(
+      discoveryCheck!.message.includes("Found via login shell"),
+      `Message should say 'Found via login shell', got: ${discoveryCheck!.message}`,
+    );
+  });
+
+  it("dsh-token-saver detection returns pass when found on PATH", async () => {
+    fixtureDir = createTempHome();
+    fs.writeFileSync(path.join(fixtureDir, "dsh-token-saver"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    process.env.PATH = fixtureDir;
+
+    const groups = await runDoctorChecks();
+    const env = groups.find((g) => g.label === "ENVIRONMENT");
+    assert.ok(env);
+    const saverCheck = env!.checks.find((c) => c.name === "dsh-token-saver detection");
+    assert.ok(saverCheck, "Expected dsh-token-saver check to exist");
+    assert.strictEqual(saverCheck!.status, "pass",
+      `dsh-token-saver check should pass when found, got: ${saverCheck!.status} (${saverCheck!.message})`);
+    assert.ok(
+      saverCheck!.message.toLowerCase().includes("optional token-saving tool"),
+      `Message should mention 'optional token-saving tool', got: ${saverCheck!.message}`,
+    );
+  });
+
+  it("dsh-token-saver detection returns info when absent from PATH", async () => {
+    fixtureDir = createTempHome();
+    process.env.PATH = fixtureDir;
+
+    const groups = await runDoctorChecks();
+    const env = groups.find((g) => g.label === "ENVIRONMENT");
+    assert.ok(env);
+    const saverCheck = env!.checks.find((c) => c.name === "dsh-token-saver detection");
+    assert.ok(saverCheck, "Expected dsh-token-saver check to exist");
+    assert.strictEqual(saverCheck!.status, "info",
+      `dsh-token-saver check should be info when absent, got: ${saverCheck!.status} (${saverCheck!.message})`);
+    assert.ok(
+      saverCheck!.message.toLowerCase().includes("optional") &&
+        saverCheck!.message.toLowerCase().includes("no-hurry"),
+      `Message should mention 'optional' and 'no-hurry', got: ${saverCheck!.message}`,
+    );
+  });
+
+  it("session-store probe warns about 0 tokens when zstd support is missing", async () => {
+    const check = checkDshSessionStore({
+      dshHome: dshHomeDir!,
+      zstdSupport: { ok: false, reason: "no zstd decompression available" },
+    });
+    assert.strictEqual(check.status, "warn",
+      `missing zstd support should warn, got: ${check.status} (${check.message})`);
+    assert.ok(check.message.includes("0 tokens"),
+      `Message should warn dsh runs will report 0 tokens, got: ${check.message}`);
+    assert.ok(check.message.includes("(alpha support)"),
+      `Message should carry the alpha label, got: ${check.message}`);
+  });
+
+  it("session-store probe warns when the sessions dir is not readable", async () => {
+    const sessionsDir = path.join(dshHomeDir!, "sessions");
+    fs.mkdirSync(sessionsDir, { recursive: true });
+    const check = checkDshSessionStore({
+      dshHome: dshHomeDir!,
+      zstdSupport: { ok: true },
+    });
+    assert.strictEqual(check.status, "info",
+      `readable sessions dir with zstd should be info, got: ${check.status} (${check.message})`);
+    assert.ok(check.message.includes("token accounting available"),
+      `Message should mention token accounting, got: ${check.message}`);
+
+    // Now make it unreadable.
+    fs.chmodSync(sessionsDir, 0o000);
+    try {
+      const unreadable = checkDshSessionStore({
+        dshHome: dshHomeDir!,
+        zstdSupport: { ok: true },
+      });
+      assert.strictEqual(unreadable.status, "warn",
+        `unreadable sessions dir should warn, got: ${unreadable.status} (${unreadable.message})`);
+      assert.ok(unreadable.message.includes("not readable"),
+        `Message should mention 'not readable', got: ${unreadable.message}`);
+      assert.ok(unreadable.message.includes("0 tokens"),
+        `Message should warn dsh runs will report 0 tokens, got: ${unreadable.message}`);
+    } finally {
+      fs.chmodSync(sessionsDir, 0o700);
+    }
+  });
+
+  it("detectDshZstdSupport returns a boolean result with a reason when unsupported", () => {
+    const support = detectDshZstdSupport();
+    assert.strictEqual(typeof support.ok, "boolean");
+    if (!support.ok) {
+      assert.ok(support.reason, "unsupported zstd should carry a reason");
+    }
+  });
+
+  it("permission-mode probe is info when the composed config is env-driven", async () => {
+    fixtureDir = createTempHome();
+    const dshPath = writeCannedDshDump(fixtureDir, DSH_ENV_DRIVEN_DUMP);
+    process.env.TAMANDUA_DSH_BINARY = dshPath;
+    process.env.PATH = fixtureDir;
+
+    const groups = await runDoctorChecks();
+    const env = groups.find((g) => g.label === "ENVIRONMENT");
+    assert.ok(env);
+
+    const check = env!.checks.find((c) => c.name === "dsh permission-mode probe");
+    assert.ok(check, "Expected dsh permission-mode check");
+    assert.strictEqual(check!.status, "info",
+      `env-driven config should be info, got: ${check!.status} (${check!.message})`);
+    assert.ok(check!.message.includes("full access"),
+      `Message should confirm full access, got: ${check!.message}`);
+  });
+
+  it("permission-mode probe warns naming cordis.patch.yml when a profile layer pins the rows", async () => {
+    fixtureDir = createTempHome();
+    const dshPath = writeCannedDshDump(fixtureDir, DSH_PINNED_DUMP);
+    process.env.TAMANDUA_DSH_BINARY = dshPath;
+    process.env.PATH = fixtureDir;
+
+    const groups = await runDoctorChecks();
+    const env = groups.find((g) => g.label === "ENVIRONMENT");
+    assert.ok(env);
+
+    const check = env!.checks.find((c) => c.name === "dsh permission-mode probe");
+    assert.ok(check, "Expected dsh permission-mode check");
+    assert.strictEqual(check!.status, "warn",
+      `pinned non-full-access config should warn, got: ${check!.status} (${check!.message})`);
+    assert.ok(check!.message.includes("cordis.patch.yml"),
+      `Message should name cordis.patch.yml, got: ${check!.message}`);
+    assert.ok(check!.message.includes("step complete"),
+      `Message should mention tamandua step complete being auto-denied, got: ${check!.message}`);
+    assert.ok(check!.message.includes("workspace-write") && check!.message.includes("ask"),
+      `Message should report the pinned mode/policy, got: ${check!.message}`);
+    assert.ok(check!.message.includes("(alpha support)"),
+      `Message should carry the alpha label, got: ${check!.message}`);
+  });
+
+  it("permission-mode probe is info when the profile pins the full-access pair", async () => {
+    fixtureDir = createTempHome();
+    const dshPath = writeCannedDshDump(fixtureDir, DSH_STATIC_FULL_ACCESS_DUMP);
+    process.env.TAMANDUA_DSH_BINARY = dshPath;
+    process.env.PATH = fixtureDir;
+
+    const groups = await runDoctorChecks();
+    const env = groups.find((g) => g.label === "ENVIRONMENT");
+    assert.ok(env);
+
+    const check = env!.checks.find((c) => c.name === "dsh permission-mode probe");
+    assert.ok(check, "Expected dsh permission-mode check");
+    assert.strictEqual(check!.status, "info",
+      `statically full-access config should be info, got: ${check!.status} (${check!.message})`);
+  });
+
+  it("permission-mode probe warns (never fails) when dsh --dump-config fails", async () => {
+    fixtureDir = createTempHome();
+    const dshPath = path.join(fixtureDir, "broken-dsh");
+    writeFakeDshFailing(dshPath);
+    process.env.TAMANDUA_DSH_BINARY = dshPath;
+    process.env.PATH = fixtureDir;
+
+    const groups = await runDoctorChecks();
+    const env = groups.find((g) => g.label === "ENVIRONMENT");
+    assert.ok(env);
+
+    const check = env!.checks.find((c) => c.name === "dsh permission-mode probe");
+    assert.ok(check, "Expected dsh permission-mode check");
+    assert.strictEqual(check!.status, "warn",
+      `failed dump-config should warn, got: ${check!.status} (${check!.message})`);
+    assert.ok(check!.message.includes("could not run"),
+      `Message should say 'could not run', got: ${check!.message}`);
+  });
+});
+
+// ── dsh permission-dump evaluation (US-009) ───────────────────────
+
+describe("evaluateDshPermissionDump (US-009)", () => {
+  it("env-driven rows evaluate to full access", () => {
+    const evaluation = evaluateDshPermissionDump(DSH_ENV_DRIVEN_DUMP);
+    assert.strictEqual(evaluation.ok, true, JSON.stringify(evaluation));
+    assert.ok(evaluation.mode!.includes("DSH_PERMISSION_MODE"));
+    assert.ok(evaluation.policy!.includes("DSH_PERMISSION_MODE"));
+  });
+
+  it("static non-full-access rows evaluate to not ok with mode/policy", () => {
+    const evaluation = evaluateDshPermissionDump(DSH_PINNED_DUMP);
+    assert.strictEqual(evaluation.ok, false);
+    assert.strictEqual(evaluation.mode, "workspace-write");
+    assert.strictEqual(evaluation.policy, "ask");
+  });
+
+  it("static danger-full-access + never evaluates to full access", () => {
+    const evaluation = evaluateDshPermissionDump(DSH_STATIC_FULL_ACCESS_DUMP);
+    assert.strictEqual(evaluation.ok, true, JSON.stringify(evaluation));
+  });
+
+  it("mixed rows (env-driven mode, pinned ask policy) evaluate to not ok", () => {
+    const dump = `# == mixed
+- id: sandbox-policy
+  config:
+    mode: !!js process.env.DSH_PERMISSION_MODE ?? 'workspace-write'
+- id: approval
+  config:
+    policy: ask
+`;
+    const evaluation = evaluateDshPermissionDump(dump);
+    assert.strictEqual(evaluation.ok, false);
+    assert.strictEqual(evaluation.policy, "ask");
+  });
+
+  it("unparseable dumps evaluate to not ok with a reason", () => {
+    const evaluation = evaluateDshPermissionDump("not yaml at all: [}\n");
+    assert.strictEqual(evaluation.ok, false);
+    assert.ok(evaluation.reason, "should carry a reason");
+  });
+
+  it("dumps without sandbox-policy/approval rows evaluate to not ok with a reason", () => {
+    const dump = `# == other
+- id: timer
+  name: '@deepseek-ai/cordis-plugin-timer'
+`;
+    const evaluation = evaluateDshPermissionDump(dump);
+    assert.strictEqual(evaluation.ok, false);
+    assert.ok(evaluation.reason, "should carry a reason");
   });
 });
 
@@ -1018,16 +1538,25 @@ describe("ENVIRONMENT hermes discovery chain (US-003)", () => {
 
 describe("ENVIRONMENT hermes shared resolver (DSRC)", () => {
   let savedHermesBinary: string | undefined;
+  let savedDshBinary: string | undefined;
+  let savedDshHome: string | undefined;
   let savedPath: string | undefined;
   let savedHome: string | undefined;
   let savedHermesHome: string | undefined;
   let fixtureDir: string | null = null;
+  let dshHomeDir: string | null = null;
 
   beforeEach(() => {
     savedHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
+    savedDshBinary = process.env.TAMANDUA_DSH_BINARY;
+    savedDshHome = process.env.DSH_HOME;
     savedPath = process.env.PATH;
     savedHome = process.env.HOME;
     savedHermesHome = process.env.HERMES_HOME;
+    // Pin dsh away by default so these hermes tests stay hermetic.
+    delete process.env.TAMANDUA_DSH_BINARY;
+    dshHomeDir = createTempHome();
+    process.env.DSH_HOME = dshHomeDir;
   });
 
   afterEach(() => {
@@ -1035,6 +1564,16 @@ describe("ENVIRONMENT hermes shared resolver (DSRC)", () => {
       process.env.TAMANDUA_HERMES_BINARY = savedHermesBinary;
     } else {
       delete process.env.TAMANDUA_HERMES_BINARY;
+    }
+    if (savedDshBinary !== undefined) {
+      process.env.TAMANDUA_DSH_BINARY = savedDshBinary;
+    } else {
+      delete process.env.TAMANDUA_DSH_BINARY;
+    }
+    if (savedDshHome !== undefined) {
+      process.env.DSH_HOME = savedDshHome;
+    } else {
+      delete process.env.DSH_HOME;
     }
     if (savedPath !== undefined) {
       process.env.PATH = savedPath;
@@ -1054,6 +1593,10 @@ describe("ENVIRONMENT hermes shared resolver (DSRC)", () => {
     if (fixtureDir) {
       try { fs.rmSync(fixtureDir, { recursive: true, force: true }); } catch {}
       fixtureDir = null;
+    }
+    if (dshHomeDir) {
+      try { fs.rmSync(dshHomeDir, { recursive: true, force: true }); } catch {}
+      dshHomeDir = null;
     }
   });
 
@@ -1159,15 +1702,20 @@ describe("ENVIRONMENT hermes shared resolver (DSRC)", () => {
     assert.strictEqual(discoveryCheck!.status, "info");
   });
 
-  it("fake-zsh test proves exactly one login-shell probe during one runDoctorChecks call", async () => {
+  it("fake-zsh test proves exactly one login-shell probe per harness during one runDoctorChecks call", async () => {
     delete process.env.TAMANDUA_HERMES_BINARY;
     fixtureDir = createTempHome();
 
-    // Assert no file named hermes exists in the fixture dir
+    // Assert no file named hermes or dsh exists in the fixture dir
     assert.strictEqual(
       fs.existsSync(path.join(fixtureDir, "hermes")),
       false,
       "fixture dir must not contain hermes (PATH tier must not find anything)",
+    );
+    assert.strictEqual(
+      fs.existsSync(path.join(fixtureDir, "dsh")),
+      false,
+      "fixture dir must not contain dsh (PATH tier must not find anything)",
     );
 
     // Create a real hermes binary that the fake zsh will report (OUTSIDE PATH)
@@ -1180,16 +1728,17 @@ describe("ENVIRONMENT hermes shared resolver (DSRC)", () => {
     const counterFile = path.join(fixtureDir, "counter");
     fs.writeFileSync(counterFile, "", "utf-8");
 
-    // Create a fake zsh that appends a marker line and reports hermes
-    // Uses shell builtins only (printf) — no cat, no host tools
+    // Create a fake zsh that appends a marker line per invocation: it
+    // reports hermes for the hermes probe and finds nothing for the dsh
+    // probe. Uses shell builtins only (printf) — no cat, no host tools.
     const fakeZsh = path.join(fixtureDir, "zsh");
     fs.writeFileSync(
       fakeZsh,
-      `#!/bin/sh\n# Append a marker line using only shell builtins\nprintf 'marker\n' >> "${counterFile}"\n# Report hermes path (simulating login shell)\necho "${hermesPath}"\n`,
+      `#!/bin/sh\n# Append a marker line using only shell builtins\nprintf 'marker\\n' >> "${counterFile}"\ncase "$2" in\n  *hermes*) echo "${hermesPath}" ;;\n  *) exit 0 ;;\nesac\n`,
       { mode: 0o755 },
     );
 
-    // PATH is isolated — fixture dir only (contains fake zsh, no hermes, no /usr/bin:/bin)
+    // PATH is isolated — fixture dir only (contains fake zsh, no hermes/dsh, no /usr/bin:/bin)
     process.env.PATH = fixtureDir;
     process.env.HOME = fixtureDir;
 
@@ -1202,11 +1751,17 @@ describe("ENVIRONMENT hermes shared resolver (DSRC)", () => {
     assert.ok(discoveryCheck!.message.includes("Found via login shell"),
       `Message should say 'Found via login shell', got: ${discoveryCheck!.message}`);
 
-    // Exactly one login-shell probe: count exact newline-delimited lines
+    // dsh must NOT resolve via the login shell (fake zsh finds no dsh)
+    const dshDiscovery = env!.checks.find((c) => c.name === "dsh binary discovery");
+    assert.ok(dshDiscovery, "Expected dsh discovery check");
+    assert.ok(dshDiscovery!.message.includes("not found") || dshDiscovery!.message.includes("not set"),
+      `dsh should not resolve via login shell, got: ${dshDiscovery!.message}`);
+
+    // Exactly one login-shell probe per harness: count exact newline-delimited lines
     const content = fs.readFileSync(counterFile, "utf-8");
     const lines = content.split("\n").filter(line => line.length > 0);
-    assert.strictEqual(lines.length, 1,
-      `Expected exactly 1 login-shell probe, got ${lines.length}`);
+    assert.strictEqual(lines.length, 2,
+      `Expected exactly 2 login-shell probes (one per harness), got ${lines.length}`);
   });
 });
 

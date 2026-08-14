@@ -287,7 +287,7 @@ describe("tamandua status --json", () => {
     for (const p of parsed.processes) {
       assert.equal(typeof p.pid, "number");
       assert.equal(typeof p.kind, "string");
-      assert.ok(["pi", "hermes", "tamandua", "unknown"].includes(p.kind));
+      assert.ok(["pi", "hermes", "dsh", "tamandua", "unknown"].includes(p.kind));
       if (p.uptimeSeconds !== undefined) {
         assert.equal(typeof p.uptimeSeconds, "number");
       }
