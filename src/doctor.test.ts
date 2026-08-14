@@ -1879,6 +1879,7 @@ describe("STATE run-process-leak checks (US-004)", () => {
     dbPath: string,
     runId: string,
     worktreePath: string,
+    runStatus: string = "completed",
   ): void {
     const db = new DatabaseSync(dbPath);
     db.exec("PRAGMA journal_mode=WAL");
@@ -1918,7 +1919,7 @@ describe("STATE run-process-leak checks (US-004)", () => {
     const now = new Date().toISOString();
     db.prepare(
       "INSERT INTO runs (id, workflow_id, task, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-    ).run(runId, "test-workflow", "test", "completed", now, now);
+    ).run(runId, "test-workflow", "test", runStatus, now, now);
     db.prepare(
       "INSERT INTO run_worktrees (run_id, worktree_origin_repository, worktree_origin_git_common_dir, worktree_path, status, cleanup_policy, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
     ).run(runId, "/fake/repo", "/fake/repo/.git", worktreePath, "ready", "remove_on_terminal", now);
@@ -1989,6 +1990,51 @@ describe("STATE run-process-leak checks (US-004)", () => {
         `Process ${childPid} should still be alive — doctor must NEVER kill processes`);
     } finally {
       // Kill the marker process
+      try { child.kill("SIGKILL"); } catch { /* already dead */ }
+      try { fs.rmSync(homeDir, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  it("reports process leak for canceled terminal run with surviving process (CNEV US-003)", { timeout: 10000 }, async () => {
+    const homeDir = createTempHome();
+    const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
+    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+
+    const worktreePath = path.join(homeDir, "worktrees", "canceled-run");
+    fs.mkdirSync(worktreePath, { recursive: true });
+
+    // Seed DB with a CANCELED terminal run (run.canceled consumer audit:
+    // the leak scan's terminal IN-list must cover canceled runs).
+    fs.writeFileSync(dbPath, "");
+    seedTerminalRunWithWorktree(dbPath, "canceled-run-001", worktreePath, "canceled");
+
+    // Spawn a marker process whose cwd is the worktree path
+    const child = spawn("sleep", ["10"], {
+      cwd: worktreePath,
+      detached: false,
+      stdio: "ignore",
+    });
+    await new Promise<void>((resolve) => {
+      child.on("spawn", () => resolve());
+      setTimeout(() => resolve(), 500);
+    });
+
+    const childPid = child.pid!;
+
+    try {
+      const groups = await runDoctorChecks({ homeDir });
+      const state = groups.find((g) => g.label === "STATE");
+      assert.ok(state);
+
+      const ourLeak = state!.checks.find(
+        (c) => c.name === "Run-process leak" && c.message.includes(String(childPid)),
+      );
+      assert.ok(ourLeak,
+        `Expected leak check for PID ${childPid} on a canceled run. Leak checks: ${state!.checks.map((c) => c.message).join(" | ")}`);
+      assert.strictEqual(ourLeak!.status, "warn");
+      assert.ok(ourLeak!.message.includes("canceled-run-001"),
+        `Message should include the canceled run ID. Got: ${ourLeak!.message}`);
+    } finally {
       try { child.kill("SIGKILL"); } catch { /* already dead */ }
       try { fs.rmSync(homeDir, { recursive: true, force: true }); } catch {}
     }

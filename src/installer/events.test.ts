@@ -721,6 +721,37 @@ describe("events", () => {
       assert.equal(parsed.event, "run.started");
     });
 
+    it("delivers webhook POST for run.canceled events with notify_url", async () => {
+      const webhookPromise = new Promise<string>((resolve) => {
+        server = http.createServer((req, res) => {
+          let body = "";
+          req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
+          req.on("end", () => { webhookReceived = body; res.writeHead(200); res.end("OK"); resolve(body); });
+        });
+        server!.listen(0, "127.0.0.1");
+      });
+
+      await new Promise<void>((resolve) => { server!.once("listening", resolve); });
+      const addr = server!.address();
+      const port = typeof addr === "object" && addr ? addr.port : 0;
+
+      db.prepare("INSERT INTO runs (id, workflow_id, task, status, notify_url) VALUES (?, ?, ?, ?, ?)")
+        .run("cancel-run", "test-wf", "test task", "canceled", `http://127.0.0.1:${port}/webhook`);
+
+      emitEvent({
+        ts: new Date().toISOString(),
+        event: "run.canceled",
+        runId: "cancel-run",
+        reason: "cli-stop",
+      });
+
+      const body = await webhookPromise;
+      const parsed = JSON.parse(body);
+      assert.equal(parsed.runId, "cancel-run");
+      assert.equal(parsed.event, "run.canceled");
+      assert.equal(parsed.reason, "cli-stop");
+    });
+
     it("skips webhook for non-significant events", () => {
       db.prepare("INSERT INTO runs (id, workflow_id, task, status, notify_url) VALUES (?, ?, ?, ?, ?)")
         .run("nohook-run", "test-wf", "test task", "running", "http://127.0.0.1:19999/nope");

@@ -584,11 +584,17 @@ function getRunWorkerLostCount(runId: string): number | undefined {
   }
 }
 
-function emitRunTerminalEvent(params: {
-  event: "run.completed" | "run.failed";
+/**
+ * Emit a terminal run lifecycle event (run.completed/run.failed/run.canceled)
+ * with payload parity: ts, runId, workflowId, tokensSpent, workerLostCount.
+ * run.canceled additionally carries a `reason` (the stop source).
+ */
+export function emitRunTerminalEvent(params: {
+  event: "run.completed" | "run.failed" | "run.canceled";
   runId: string;
   workflowId?: string;
   detail?: string;
+  reason?: string;
 }): void {
   emitEvent({
     ts: new Date().toISOString(),
@@ -596,6 +602,7 @@ function emitRunTerminalEvent(params: {
     runId: params.runId,
     workflowId: params.workflowId,
     detail: params.detail,
+    reason: params.reason,
     tokensSpent: getRunTokenSpend(params.runId),
     workerLostCount: getRunWorkerLostCount(params.runId),
   });

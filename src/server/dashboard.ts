@@ -753,7 +753,7 @@ async function handleCancelRun(
       return;
     }
 
-    const result = await stopWorkflow(runId);
+    const result = await stopWorkflow(runId, { source: "dashboard-cancel" });
 
     if (result.ok) {
       invalidateRunsCache();

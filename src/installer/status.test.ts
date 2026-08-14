@@ -659,3 +659,215 @@ describe("stopWorkflow", () => {
     try { fs.rmSync(wtPath, { recursive: true, force: true }); } catch { /* cleanup */ }
   });
 });
+
+describe("stopWorkflow run.canceled terminal event", () => {
+  let tempRoot: string;
+  let stateDir: string;
+  let originalDbPath: string | undefined;
+  let originalHome: string | undefined;
+  let originalStateDir: string | undefined;
+  let db: DatabaseSync;
+
+  beforeEach(() => {
+    originalDbPath = process.env.TAMANDUA_DB_PATH;
+    originalHome = process.env.HOME;
+    originalStateDir = process.env.TAMANDUA_STATE_DIR;
+    tempRoot = tamanduaTempDir("tamandua-canceled-event-");
+    stateDir = path.join(tempRoot, "state");
+    const dbPath = path.join(stateDir, "tamandua.db");
+    process.env.TAMANDUA_DB_PATH = dbPath;
+    process.env.HOME = tempRoot;
+    process.env.TAMANDUA_STATE_DIR = stateDir;
+
+    fs.mkdirSync(stateDir, { recursive: true });
+    db = new DatabaseSync(dbPath);
+    db.exec("PRAGMA journal_mode=WAL");
+    db.exec(`CREATE TABLE IF NOT EXISTS runs (
+      id TEXT PRIMARY KEY,
+      workflow_id TEXT NOT NULL DEFAULT 'test',
+      task TEXT NOT NULL DEFAULT 'test',
+      status TEXT NOT NULL DEFAULT 'running',
+      context TEXT NOT NULL DEFAULT '{}',
+      tokens_spent INTEGER NOT NULL DEFAULT 0,
+      worker_lost_count INTEGER NOT NULL DEFAULT 0,
+      scheduling_status TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )`);
+    db.exec(`CREATE TABLE IF NOT EXISTS steps (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      step_id TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      step_index INTEGER NOT NULL DEFAULT 0,
+      input_template TEXT NOT NULL DEFAULT '',
+      expects TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'waiting',
+      output TEXT,
+      retry_count INTEGER DEFAULT 0,
+      max_retries INTEGER DEFAULT 4,
+      type TEXT NOT NULL DEFAULT 'single',
+      loop_config TEXT,
+      current_story_id TEXT,
+      abandoned_count INTEGER DEFAULT 0,
+      claim_pid INTEGER,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )`);
+    db.exec(`CREATE TABLE IF NOT EXISTS stories (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      story_index INTEGER NOT NULL,
+      story_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      acceptance_criteria TEXT NOT NULL DEFAULT '[]',
+      status TEXT NOT NULL DEFAULT 'pending',
+      output TEXT,
+      retry_count INTEGER DEFAULT 0,
+      max_retries INTEGER DEFAULT 4,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )`);
+    db.exec(`CREATE TABLE IF NOT EXISTS run_worktrees (
+      run_id TEXT PRIMARY KEY,
+      worktree_origin_repository TEXT NOT NULL,
+      worktree_origin_git_common_dir TEXT NOT NULL,
+      worktree_path TEXT NOT NULL,
+      worktree_origin_ref TEXT,
+      worktree_origin_sha TEXT,
+      original_branch TEXT,
+      status TEXT NOT NULL DEFAULT 'creating',
+      cleanup_policy TEXT NOT NULL DEFAULT 'remove_on_success',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      removed_at TEXT,
+      error TEXT
+    )`);
+  });
+
+  afterEach(() => {
+    if (originalDbPath) process.env.TAMANDUA_DB_PATH = originalDbPath;
+    else delete process.env.TAMANDUA_DB_PATH;
+    if (originalHome) process.env.HOME = originalHome;
+    else delete process.env.HOME;
+    if (originalStateDir) process.env.TAMANDUA_STATE_DIR = originalStateDir;
+    else delete process.env.TAMANDUA_STATE_DIR;
+    try { db.close(); } catch {}
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  });
+
+  function readRunEventLines(runId: string): Array<Record<string, unknown>> {
+    const file = path.join(stateDir, "events", `${runId}.jsonl`);
+    const raw = fs.readFileSync(file, "utf-8");
+    return raw.trim().split("\n").map((line) => JSON.parse(line));
+  }
+
+  it("sets run and steps canceled AND appends run.canceled with payload parity (run with a running step)", async () => {
+    const { stopWorkflow } = await import("../../dist/installer/status.js");
+
+    const runId = "run-cnev-000000000000";
+    db.prepare("INSERT INTO runs (id, workflow_id, task, status, tokens_spent, worker_lost_count) VALUES (?, ?, ?, ?, ?, ?)")
+      .run(runId, "feature-dev-merge-worktree", "cancel me", "running", 42, 3);
+    db.prepare("INSERT INTO steps (id, run_id, step_id, agent_id, step_index, status) VALUES (?, ?, ?, ?, ?, ?)")
+      .run("s-cnev-1", runId, "implement", "dev", 0, "waiting");
+    db.prepare("INSERT INTO steps (id, run_id, step_id, agent_id, step_index, status) VALUES (?, ?, ?, ?, ?, ?)")
+      .run("s-cnev-2", runId, "verify", "verifier", 1, "running");
+
+    const result = await stopWorkflow(runId);
+    assert.equal(result.ok, true);
+
+    // DB: run canceled
+    const run = db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string };
+    assert.equal(run.status, "canceled");
+
+    // DB: every waiting/running step canceled
+    const steps = db.prepare("SELECT status FROM steps WHERE run_id = ?").all(runId) as Array<{ status: string }>;
+    assert.equal(steps.length, 2);
+    for (const s of steps) {
+      assert.equal(s.status, "canceled");
+    }
+
+    // Event stream: run.canceled is the terminal record with payload parity
+    const lines = readRunEventLines(runId);
+    assert.ok(lines.length >= 1, "expected at least one event line");
+    const last = lines[lines.length - 1];
+    assert.equal(last.event, "run.canceled");
+    assert.equal(last.runId, runId);
+    assert.equal(last.workflowId, "feature-dev-merge-worktree");
+    assert.equal(last.reason, "cli-stop");
+    assert.equal(last.tokensSpent, 42);
+    assert.equal(last.workerLostCount, 3);
+    assert.equal(typeof last.ts, "string");
+    assert.ok((last.ts as string).length > 0);
+
+    // No terminal event precedes it — run.canceled is THE terminal record
+    const terminalEvents = new Set(["run.completed", "run.failed", "run.canceled", "run.deleted", "run.force_failed"]);
+    for (const line of lines.slice(0, -1)) {
+      assert.ok(!terminalEvents.has(line.event as string), `event ${line.event} precedes run.canceled`);
+    }
+  });
+
+  it("emits run.canceled without errors for a not-yet-started run (all steps waiting)", async () => {
+    const { stopWorkflow } = await import("../../dist/installer/status.js");
+
+    const runId = "run-cnev-waiting000000";
+    db.prepare("INSERT INTO runs (id, workflow_id, task, status) VALUES (?, ?, ?, ?)")
+      .run(runId, "feature-dev-merge-worktree", "waiting run", "running");
+    db.prepare("INSERT INTO steps (id, run_id, step_id, agent_id, step_index, status) VALUES (?, ?, ?, ?, ?, ?)")
+      .run("s-cnev-w1", runId, "implement", "dev", 0, "waiting");
+
+    const result = await stopWorkflow(runId, { source: "operator-test" });
+    assert.deepEqual(result, { ok: true, runId });
+
+    const run = db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string };
+    assert.equal(run.status, "canceled");
+
+    const lines = readRunEventLines(runId);
+    assert.ok(lines.length >= 1);
+    const last = lines[lines.length - 1];
+    assert.equal(last.event, "run.canceled");
+    assert.equal(last.runId, runId);
+    assert.equal(last.reason, "operator-test");
+  });
+
+  it("deleteWorkflow --force still emits run.deleted and no run.canceled", async () => {
+    const { deleteWorkflow } = await import("../../dist/installer/status.js");
+
+    const runId = "run-cnev-delete000000";
+    db.prepare("INSERT INTO runs (id, workflow_id, task, status) VALUES (?, ?, ?, ?)")
+      .run(runId, "wf", "active run", "running");
+    db.prepare("INSERT INTO steps (id, run_id, step_id, agent_id, step_index, status) VALUES (?, ?, ?, ?, ?, ?)")
+      .run("s-cnev-del", runId, "implement", "dev", 0, "running");
+
+    const result = await deleteWorkflow(runId, { force: true });
+    assert.equal(result.ok, true);
+    assert.equal(result.status, "deleted");
+    assert.equal((db.prepare("SELECT COUNT(*) AS count FROM runs WHERE id = ?").get(runId) as { count: number }).count, 0);
+
+    const lines = readRunEventLines(runId);
+    const events = lines.map((l) => l.event);
+    assert.ok(!events.includes("run.canceled"), "deleteWorkflow --force must not emit run.canceled");
+    assert.equal(lines[lines.length - 1].event, "run.deleted");
+  });
+
+  it("forceFailRun still emits run.force_failed and no run.canceled", async () => {
+    const { forceFailRun } = await import("../../dist/installer/status.js");
+
+    const runId = "run-cnev-forcefail000";
+    db.prepare("INSERT INTO runs (id, workflow_id, task, status) VALUES (?, ?, ?, ?)")
+      .run(runId, "wf", "force-fail me", "running");
+    db.prepare("INSERT INTO steps (id, run_id, step_id, agent_id, step_index, status) VALUES (?, ?, ?, ?, ?, ?)")
+      .run("s-cnev-ff", runId, "implement", "dev", 0, "running");
+
+    const result = await forceFailRun(runId, "operator halt");
+    assert.equal(result.ok, true);
+
+    const run = db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string };
+    assert.equal(run.status, "failed");
+
+    const lines = readRunEventLines(runId);
+    const events = lines.map((l) => l.event);
+    assert.ok(!events.includes("run.canceled"), "forceFailRun must not emit run.canceled");
+    assert.equal(lines[lines.length - 1].event, "run.force_failed");
+  });
+});

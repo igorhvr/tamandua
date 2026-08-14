@@ -156,7 +156,14 @@ function getRun(runId: string): RunRow | null {
   }
 }
 
-function isTerminal(status: string): boolean {
+/**
+ * Terminal run-status predicate shared by every control-plane operation
+ * gate (terminate/pause/resume/run-start admission). `canceled` is a
+ * terminal status on par with `completed`/`failed` — a canceled run must
+ * reject control operations with 409 instead of being treated as live.
+ * Exported for the canceled-as-terminal regression tests.
+ */
+export function isTerminal(status: string): boolean {
   return status === "completed" || status === "failed" || status === "canceled";
 }
 

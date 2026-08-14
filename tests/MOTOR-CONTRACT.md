@@ -61,6 +61,58 @@ token overhead on real runs (see the historical baselines at the bottom).
   independently — only the shared step's counter is scoped. Pinned by
   `tests/step-ops.test.ts` (VBUD tests).
 
+### Terminal-event consumer audit (run.canceled)
+
+`run.canceled` (emitted by `stopWorkflow`, `src/installer/status.ts`, CNEV
+product fix) is a terminal run event on par with
+`run.completed`/`run.failed`. Every consumer that pattern-matches terminal
+events or terminal run statuses must treat `canceled` as terminal — never
+crash, never treat it as unknown noise. This audit table is the
+canceled-as-terminal contract for each consumer; regression tests pin the
+behavior where it was previously untested.
+
+**Payload parity (CNEV):** `run.canceled` shares the terminal-event
+payload shape of `run.completed`/`run.failed` (`emitRunTerminalEvent`,
+`src/installer/step-ops.ts`): `ts`, `runId`, `workflowId`,
+`tokensSpent`, `workerLostCount` — plus a `reason` field carrying the
+stop source (`"cli-stop"` by default).
+
+**Ordering guarantee (CNEV):** `run.canceled` is emitted AFTER all cancel
+bookkeeping (pending/running steps marked canceled, run row updated,
+`removeRunCrons`/`terminateRunWithDaemon` settled,
+`scheduleRunCronTeardown` called), so it is the LAST event of the run in
+the common path — the run's event file ends on a terminal record instead
+of just stopping.
+
+**Known caveat (CNEV, explicitly OUT of scope):** a straggling async
+`run.tokens.updated` flush from an in-flight work round (the TATR
+token-attribution race) can still land AFTER `run.canceled`, because
+`emitEvent` writes are independent of the dispatch round's token
+attribution. Fixing that race is out of scope for CNEV; the DB
+`runs.tokens_spent` total remains eventually correct. Event consumers
+must treat `run.canceled` as terminal even if a late token update trails
+it (and see C15 for the completed/failed analog of this caveat).
+
+| Consumer | Location | `run.canceled` handling |
+| --- | --- | --- |
+| Control-plane operation gates (terminate / pause / resume / run-start admission) | `isTerminal` (exported), `src/server/control-server.ts` | `canceled` is terminal → control ops against a canceled run are rejected with 409 conflict. Pinned by `src/server/control-server.test.ts` (isTerminal unit tests). |
+| Nudge admission count | `/control/nudge`, `src/server/control-server.ts` | Canceled runs are excluded from active-run counts. Pinned by `src/server/control-server.test.ts` ("POST /control/nudge excludes terminal runs"). |
+| Kanban visual status buckets | `normaliseStatus` / `TERMINAL_STATUSES`, `src/server/kanban-data.ts` | `canceled` maps into the `failed` visual bucket; `TERMINAL_STATUSES` includes `canceled` (freezes lane duration). Pinned by `src/server/kanban-data.test.ts`. |
+| Doctor process-leak scan | `runProcessLeakChecks`, `src/doctor.ts` | Scans runs `WHERE status IN ('completed', 'failed', 'canceled')` — canceled runs are reported like any other terminal run. Pinned by `src/doctor.test.ts` (canceled-run leak test, CNEV US-003). |
+| Doctor reply-with contract scan | `runLlmPromptAdherenceChecks`, `src/doctor.ts` | Same terminal-status IN-list includes `canceled`. |
+| `workflow wait` | `TERMINAL_STATUSES` / `computeExitCode`, `src/cli/commands/wait.ts` | `canceled` is terminal; exit code 3 when at least one run is canceled and none failed. Pinned by `src/cli/commands/wait.test.ts`. |
+| Scheduler run-status check | `executeDispatchRound`, `src/installer/agent-scheduler.ts` | Any status other than `running`/`paused` tears the run down gracefully — `canceled` covered by construction. |
+| Run selector | `src/installer/run-selector.ts` | Only `running`/`paused` runs are selected; `canceled` is never selected. |
+| Dashboard run listing / status label | `src/server/dashboard.ts` | DB-status driven; renders `Canceled` for canceled runs. Pinned by `src/server/dashboard.test.ts`. |
+| Dashboard relaunch gate | `POST /api/runs/:id/relaunch`, `src/server/dashboard.ts` | Relaunch allowed only from `failed`/`canceled` — canceled is an accepted source state. |
+| Dashboard cancel endpoint | `POST /api/runs/:id/cancel`, `src/server/dashboard.ts` | Delegates to `stopWorkflow` (the run.canceled emitter, US-001); 409 on an already-canceled run. |
+| Logs-tail event labels | `EVENT_LABELS`, `src/installer/logs-tail-format.ts` | `run.canceled` → `Run canceled` label (US-002). |
+| Webhook significant events | `fireWebhook`, `src/installer/events.ts` | `run.canceled` POSTed to a configured `notify_url` (US-002). |
+| Medic zombie remediation | `remediate`, `src/medic/medic.ts` | Only touches runs with `status='running'`; canceled runs are terminal and untouched. |
+| Startup run recovery | `src/installer/run-recovery.ts` | Only recovers runs with `status='running'`; canceled runs are untouched. |
+| CLI `workflow runs` status display | `src/cli/status-format.ts` | Raw status column displays `canceled`; not bucketed into completed/failed counts. |
+| Worktree pruning | `prune --completed`, `src/cli/commands/worktree.ts` | Prunes worktrees of completed, failed, AND canceled runs (and orphaned rows). |
+
 ### Dispatch
 
 - **C0-binary** Work spawns resolve the harness binary PER INVOCATION:
@@ -501,11 +553,16 @@ a human can clean them up. Remedy text: `Manual cleanup: kill <pid>`.
   (via `message_end.usage` + run/step IDs from tool outputs, falling back to
   the dispatch job's own runId), emitting `run.tokens.updated` events with
   `tokenDelta`/`tokensSpent`.
-- **C15** Terminal run events (`run.completed`/`run.failed`) carry
-  `tokensSpent`. Caveat (inherent to the event ordering): the FINAL round's
-  usage is parsed only after the harness exits, i.e. after the terminal
-  event fired — so the event's `tokensSpent` can under-report by the final
-  round (a single-step run reports 0). `runs.tokens_spent` in the DB is the
+- **C15** Terminal run events (`run.completed`/`run.failed`/`run.canceled`)
+  carry `tokensSpent`. Caveat (inherent to the event ordering): the FINAL
+  round's usage is parsed only after the harness exits, i.e. after the
+  terminal event fired — so the event's `tokensSpent` can under-report by
+  the final round (a single-step run reports 0). `run.canceled` has the
+  same shape: it is emitted after the cancel bookkeeping (last event of
+  the run in the common path — see the run.canceled audit section above),
+  so a straggling async `run.tokens.updated` from an in-flight work round
+  (the TATR attribution race) can still trail it; that race is explicitly
+  out of scope for CNEV. `runs.tokens_spent` in the DB is the
   eventually-correct total; tests must wait for it (`waitForRunWorkTokens`
   in e2e-helpers) rather than race it.
 

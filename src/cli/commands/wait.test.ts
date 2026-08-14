@@ -192,6 +192,24 @@ describe("wait command", () => {
     assert.equal(computeExitCode(states, false), 1);
   });
 
+  it("getWaitHelp documents exit code 3 for canceled runs (contract vs computeExitCode)", async () => {
+    const { getWaitHelp } = await import("../../../dist/cli/commands/wait.js");
+    const help = getWaitHelp();
+
+    // The help text is the documented contract for `workflow wait` exit codes.
+    // Pin the canceled line so drift between help and computeExitCode is caught:
+    // computeExitCode returns 3 only when a run is canceled and none failed,
+    // and precedence puts failed (1) above canceled (3) — see the unit tests above.
+    assert.ok(
+      help.includes("3   At least one run canceled (and none failed)"),
+      `getWaitHelp must document exit code 3 for canceled runs; got:\n${help}`,
+    );
+    assert.ok(
+      help.includes("1   At least one run failed"),
+      `getWaitHelp must document the failed-over-canceled precedence; got:\n${help}`,
+    );
+  });
+
   it("computeExitCode returns 2 when timedOut is true", async () => {
     const { computeExitCode } = await import("../../../dist/cli/commands/wait.js");
     const states = [
@@ -559,5 +577,98 @@ describe("wait command", () => {
     assert.equal(result.status, 0);
     assert.ok(result.stdout.includes("tamandua workflow wait"));
     assert.ok(result.stdout.includes("Exit codes"));
+  });
+
+  // ── Integration: workflow stop → wait exits 3 promptly (CNEV US-006) ──
+  //
+  // Contract: after `tamandua workflow stop` on a running run, `tamandua
+  // workflow wait <run-id>` terminates promptly (within a few 2s poll
+  // intervals) with the documented exit code 3. The stop itself emits the
+  // terminal run.canceled event, so the run's event file ends on a terminal
+  // record — not on a straggling run.tokens.updated.
+
+  it("workflow stop then workflow wait exits 3 promptly with run.canceled as terminal event", () => {
+    const runId = "cccccccc-dddd-4eee-8fff-000000000000";
+    insertRun(db, runId, 7, "test-wf", "running");
+    insertStep(db, "step-1", runId, "implement", "test-wf_developer", "running", 0);
+
+    const env = { HOME: tempRoot, TAMANDUA_DB_PATH: dbPath, TAMANDUA_TEST_GUARD: "0" };
+
+    // Cancel the running run through the real CLI stop path.
+    const stopResult = spawnSync(
+      "/bin/sh",
+      [tamanduaBin, "workflow", "stop", runId],
+      {
+        encoding: "utf8",
+        env: cleanChildEnv(env),
+        timeout: 15_000,
+      },
+    );
+
+    assert.equal(
+      stopResult.status, 0,
+      `workflow stop should succeed, got exit ${stopResult.status}, stderr: ${stopResult.stderr}`,
+    );
+    assert.ok(
+      stopResult.stdout.includes("Cancelled run"),
+      `Expected "Cancelled run" in stop stdout, got: ${stopResult.stdout}`,
+    );
+
+    // The run's event file must end on the terminal run.canceled record
+    // (CNEV: DB and event stream agree; waiters see a terminal event).
+    const eventsFile = path.join(tempRoot, ".tamandua", "events", `${runId}.jsonl`);
+    assert.ok(fs.existsSync(eventsFile), `Expected per-run events file at ${eventsFile}`);
+    const eventLines = fs
+      .readFileSync(eventsFile, "utf8")
+      .split("\n")
+      .filter((line) => line.trim().length > 0);
+    assert.ok(eventLines.length > 0, "Expected at least one event in the run's event file");
+    const lastEvent = JSON.parse(eventLines[eventLines.length - 1]);
+    assert.equal(lastEvent.event, "run.canceled");
+    assert.equal(lastEvent.runId, runId);
+    assert.equal(lastEvent.reason, "cli-stop");
+
+    // Wait on the canceled run: must exit 3 promptly (a hang would hit the
+    // spawnSync timeout and fail the status assertion).
+    const startedAt = Date.now();
+    const waitResult = spawnSync(
+      "/bin/sh",
+      [tamanduaBin, "workflow", "wait", runId],
+      {
+        encoding: "utf8",
+        env: cleanChildEnv(env),
+        timeout: 30_000,
+      },
+    );
+    const elapsedMs = Date.now() - startedAt;
+
+    assert.equal(
+      waitResult.status, 3,
+      `workflow wait on canceled run should exit 3, got exit ${waitResult.status}, stderr: ${waitResult.stderr}`,
+    );
+    assert.ok(
+      elapsedMs < 8_000,
+      `workflow wait took ${elapsedMs}ms — expected prompt exit within a few poll intervals (2s each)`,
+    );
+  });
+
+  it("workflow wait on a canceled run exits 3 immediately without stop", () => {
+    // Defense: even if the run was already canceled (e.g., by an earlier
+    // session or the dashboard), wait must resolve it as terminal — exit 3,
+    // no hang, no timeout.
+    const runId = "dddddddd-eeee-4fff-8aaa-111111111111";
+    insertRun(db, runId, 8, "test-wf", "canceled");
+    insertStep(db, "step-1", runId, "implement", "test-wf_developer", "canceled", 0);
+
+    const startedAt = Date.now();
+    const result = runWait(
+      [runId],
+      { HOME: tempRoot, TAMANDUA_DB_PATH: dbPath, TAMANDUA_TEST_GUARD: "0" },
+      30_000,
+    );
+    const elapsedMs = Date.now() - startedAt;
+
+    assert.equal(result.status, 3);
+    assert.ok(elapsedMs < 8_000, `wait took ${elapsedMs}ms — expected prompt exit`);
   });
 });

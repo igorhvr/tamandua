@@ -1406,6 +1406,7 @@ import {
   getMaxActiveTimers,
   ensureDaemonSecret,
   readDaemonSecret,
+  isTerminal,
 } from "../../dist/server/control-server.js";
 
 describe("control-server unit exports", () => {
@@ -1447,6 +1448,25 @@ describe("control-server unit exports", () => {
     it("returns default for out-of-range port values", () => {
       process.env.TAMANDUA_CONTROL_PORT = "99999";
       assert.equal(getControlPort(), 3339);
+    });
+  });
+
+  describe("isTerminal (canceled-as-terminal regression, CNEV US-003)", () => {
+    it("treats canceled as terminal", () => {
+      assert.equal(isTerminal("canceled"), true);
+    });
+
+    it("treats completed and failed as terminal", () => {
+      assert.equal(isTerminal("completed"), true);
+      assert.equal(isTerminal("failed"), true);
+    });
+
+    it("does not treat live statuses as terminal", () => {
+      assert.equal(isTerminal("running"), false);
+      assert.equal(isTerminal("paused"), false);
+      assert.equal(isTerminal("waiting"), false);
+      assert.equal(isTerminal(""), false);
+      assert.equal(isTerminal("cancelled"), false, "British spelling is not a DB status; 'canceled' is");
     });
   });
 

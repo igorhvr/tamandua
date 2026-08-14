@@ -1,10 +1,9 @@
 import { getDb } from "../db.js";
-import { scheduleRunCronTeardown, getWorkflowId } from "./step-ops.js";
+import { scheduleRunCronTeardown, getWorkflowId, emitRunTerminalEvent, parseRunContext } from "./step-ops.js";
 import { removeRunCrons } from "./agent-scheduler.js";
 import { terminateRunWithDaemon } from "../server/control-client.js";
 import { getRunWorktree, removeRunWorktree } from "./worktree-manager.js";
 import { emitEvent, getRunEvents } from "./events.js";
-import { parseRunContext } from "./step-ops.js";
 import { logger } from "../lib/logger.js";
 import { stripIdPrefix } from "../lib/id-prefix.js";
 import { displayStepStatus } from "../lib/step-display.js";
@@ -286,13 +285,21 @@ export async function deleteWorkflow(
 /**
  * Cancel a running workflow.
  * Sets the run status to 'canceled' and tears down cron jobs.
+ * Emits a terminal run.canceled event AFTER all cancel bookkeeping so it is
+ * the last event of the run in the common path.
+ *
+ * @param opts.source — identifies what initiated the stop (defaults to
+ *   'cli-stop'); carried as the event's `reason` field.
  */
-export async function stopWorkflow(runId: string): Promise<{ ok: boolean; runId: string }> {
+export async function stopWorkflow(
+  runId: string,
+  opts: { source?: string } = {},
+): Promise<{ ok: boolean; runId: string }> {
   const db = getDb();
 
   const run = db
-    .prepare("SELECT id, status FROM runs WHERE id = ?")
-    .get(runId) as { id: string; status: string } | undefined;
+    .prepare("SELECT id, status, workflow_id FROM runs WHERE id = ?")
+    .get(runId) as { id: string; status: string; workflow_id: string } | undefined;
 
   if (!run) {
     throw new Error(`Run not found: ${runId}`);
@@ -325,6 +332,17 @@ export async function stopWorkflow(runId: string): Promise<{ ok: boolean; runId:
 
   // Workflow-wide idle teardown for back-compat (legacy callers).
   scheduleRunCronTeardown(runId);
+
+  // Terminal event LAST, after all cancel bookkeeping, so the event stream
+  // ends on a terminal record rather than just stopping. A straggling async
+  // run.tokens.updated from an in-flight work round can still trail this in
+  // the TATR race (out of scope for CNEV; see tests/MOTOR-CONTRACT.md).
+  emitRunTerminalEvent({
+    event: "run.canceled",
+    runId,
+    workflowId: run.workflow_id,
+    reason: opts.source ?? "cli-stop",
+  });
 
   return { ok: true, runId };
 }
@@ -421,13 +439,16 @@ export async function forceFailRun(
     "UPDATE runs SET status = 'failed', scheduling_status = NULL, updated_at = datetime('now') WHERE id = ?",
   ).run(runId);
 
-  // Emit run.force_failed event with reason
+  // Emit run.force_failed event with reason (reason field per the
+  // terminal-event payload contract, CNEV US-004; detail kept for
+  // logs-tail display compat).
   emitEvent({
     ts: new Date().toISOString(),
     event: "run.force_failed",
     runId,
     workflowId: run.workflow_id,
     detail: reason,
+    reason,
   });
 
   logger.info(`Run ${runId.slice(0, 8)} force-failed: ${reason}`, {

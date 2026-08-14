@@ -512,7 +512,7 @@ export async function handleWorkflow(
     if (!target) { process.stderr.write("Missing run-id.\n"); process.exit(1); }
     const wrongPrefix = detectWrongPrefix(target, "run");
     if (wrongPrefix) { process.stderr.write(`${wrongPrefix}\n`); process.exit(1); }
-    try { const fullId = getWorkflowStatus(target).id; const r = await stopWorkflow(fullId); console.log(`Cancelled run run-${r.runId.slice(0, 8)}.`); } catch (err) { process.stderr.write(`${err instanceof Error ? err.message : String(err)}\n`); process.exit(1); }
+    try { const fullId = getWorkflowStatus(target).id; const r = await stopWorkflow(fullId, { source: "cli-stop" }); console.log(`Cancelled run run-${r.runId.slice(0, 8)}.`); } catch (err) { process.stderr.write(`${err instanceof Error ? err.message : String(err)}\n`); process.exit(1); }
     return true;
   }
 

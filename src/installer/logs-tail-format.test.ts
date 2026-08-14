@@ -40,6 +40,16 @@ describe("formatLogsTailLabel", () => {
     assert.equal(formatLogsTailLabel(makeEvent("pipeline.advanced")), "Pipeline advanced");
   });
 
+  it("displays 'Run canceled' for run.canceled events", () => {
+    const evt = makeEvent("run.canceled");
+    assert.equal(formatLogsTailLabel(evt), "Run canceled");
+  });
+
+  it("still formats terminal run.completed/run.failed events", () => {
+    assert.equal(formatLogsTailLabel(makeEvent("run.completed")), "Run completed");
+    assert.equal(formatLogsTailLabel(makeEvent("run.failed")), "Run failed");
+  });
+
   it("falls back to raw event name for unknown events", () => {
     const evt = makeEvent("custom.unknown.event");
     assert.equal(formatLogsTailLabel(evt), "custom.unknown.event");

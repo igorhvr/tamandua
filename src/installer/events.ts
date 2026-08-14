@@ -116,6 +116,28 @@ export interface TamanduaEvent {
   dispatched?: boolean;
 }
 
+/**
+ * Canonical run-level lifecycle event vocabulary.
+ *
+ * `run.started` opens a run's event stream; the remaining five are the
+ * terminal records that close it. This list is the product contract for
+ * run lifecycle events and is pinned by
+ * src/installer/events-vocabulary.test.ts (CNEV US-004): removing an
+ * entry here — or dropping a required payload field from the matching
+ * emitter — fails that test. Keep in sync with the emitters (run.ts,
+ * step-ops.ts emitRunTerminalEvent, status.ts deleteWorkflow /
+ * forceFailRun) and with the terminal-event consumer audit in
+ * tests/MOTOR-CONTRACT.md.
+ */
+export const RUN_LIFECYCLE_EVENTS: readonly string[] = Object.freeze([
+  "run.started",
+  "run.completed",
+  "run.failed",
+  "run.canceled",
+  "run.deleted",
+  "run.force_failed",
+]);
+
 export type EventCursorSource =
   | { kind: "global" }
   | { kind: "run"; runId: string };
@@ -786,6 +808,7 @@ async function fireWebhook(evt: TamanduaEvent): Promise<void> {
     "run.started",
     "run.completed",
     "run.failed",
+    "run.canceled",
     "step.failed",
     "step.worker_lost",
     "pipeline.advanced",

@@ -4,6 +4,7 @@ const EVENT_LABELS: Record<string, string> = {
   "run.started": "Run started",
   "run.completed": "Run completed",
   "run.failed": "Run failed",
+  "run.canceled": "Run canceled",
   "run.nudged": "Run nudged",
   "run.deleted": "Run deleted",
   "run.tokens.updated": "Token spend updated",

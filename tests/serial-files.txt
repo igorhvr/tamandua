@@ -34,6 +34,7 @@ src/installer/agent-scheduler-binary-discovery.test.ts
 src/installer/agent-scheduler-harness-routing.test.ts
 src/installer/agent-scheduler-hermes.test.ts
 src/installer/agent-scheduler.test.ts
+src/installer/events-vocabulary.test.ts
 src/installer/harness-adapter.test.ts
 src/installer/harness-type.test.ts
 src/installer/hermes-resolver.test.ts

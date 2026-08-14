@@ -1214,6 +1214,140 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
   );
 
   it(
+    "do-now: workflow stop cancels a mid-flight run and the event stream ends on run.canceled (CNEV US-007)",
+    { timeout: 120_000 },
+    async () => {
+      let ctx: ScriptedRunContext | undefined;
+      try {
+        // The worker claims its step then hangs, so the run is mid-flight
+        // (step running, worker in flight) when `workflow stop` lands.
+        ctx = await startScriptedEnvironment("do-now", {
+          agents: {
+            doer: { mode: "hang-after-claim" },
+          },
+        });
+        const workdir = path.join(ctx.env.root, "do-now-workdir");
+        fs.mkdirSync(workdir, { recursive: true });
+
+        const runIdPrefix = await spawnWorkflowRun(
+          [
+            "workflow",
+            "run",
+            "do-now",
+            "Report the current date",
+            "--working-directory-for-harness",
+            workdir,
+          ],
+          baseEnv(ctx.env.homeDir, ctx.env.controlPort),
+        );
+        const runId = resolveFullRunId(runIdPrefix, ctx.env.tamanduaDir);
+
+        // Wait until the step is claimed (running) by the hanging worker.
+        const claimDeadline = Date.now() + 30_000;
+        for (;;) {
+          const step = dbRow<{ status: string } | undefined>(
+            ctx.env.tamanduaDir,
+            "SELECT status FROM steps WHERE run_id = ?",
+            runId,
+          );
+          if (step?.status === "running") break;
+          if (Date.now() > claimDeadline) {
+            throw new Error(
+              `step never reached running before workflow stop\n${diagnostics(ctx)}`,
+            );
+          }
+          await new Promise((resolve) => setTimeout(resolve, 250));
+        }
+
+        // Cancel the mid-flight run through the REAL CLI path (the operator
+        // command). stopWorkflow tears down the daemon-side job, which
+        // SIGTERMs the hanging worker, then emits the terminal event.
+        const stopOut = cliMustSucceed(
+          ["workflow", "stop", runId],
+          baseEnv(ctx.env.homeDir, ctx.env.controlPort),
+          `workflow stop ${runId}`,
+        );
+        assert.match(stopOut, /Cancelled run/i, `unexpected stop output: ${stopOut}`);
+
+        // ── DB state: run canceled, steps canceled ──
+        const run = dbRow<{ status: string }>(
+          ctx.env.tamanduaDir,
+          "SELECT status FROM runs WHERE id = ?",
+          runId,
+        );
+        assert.equal(
+          run.status,
+          "canceled",
+          `run should be canceled\n${diagnostics(ctx)}`,
+        );
+
+        const steps = dbRows<{ status: string }>(
+          ctx.env.tamanduaDir,
+          "SELECT status FROM steps WHERE run_id = ?",
+          runId,
+        );
+        assert.ok(
+          steps.length >= 1,
+          `run should have at least one step\n${diagnostics(ctx)}`,
+        );
+        for (const step of steps) {
+          assert.equal(
+            step.status,
+            "canceled",
+            `every step should be canceled\n${diagnostics(ctx)}`,
+          );
+        }
+
+        // ── Event stream: run.canceled is present, terminal, and LAST ──
+        // The stream must end on a terminal record, not just stop (CNEV).
+        const events = readRunEvents(ctx.env.tamanduaDir, runId);
+        assert.ok(
+          events.length > 0,
+          `run's event file should exist and be non-empty\n${diagnostics(ctx)}`,
+        );
+        const eventNames = events.map((e) => e.event).join(", ");
+        const canceledIdx = events.findIndex((e) => e.event === "run.canceled");
+        assert.ok(
+          canceledIdx >= 0,
+          `event stream should contain run.canceled; events: ${eventNames}\n${diagnostics(ctx)}`,
+        );
+        assert.equal(
+          events[events.length - 1].event,
+          "run.canceled",
+          `run.canceled must be the LAST event of the run (terminal record); ` +
+            `events: ${eventNames}\n${diagnostics(ctx)}`,
+        );
+
+        // Payload parity with the other terminal events (CNEV US-001).
+        const canceled = events[canceledIdx] as Record<string, unknown>;
+        assert.equal(canceled.runId, runId);
+        assert.equal(canceled.workflowId, "do-now");
+        assert.equal(canceled.reason, "cli-stop");
+        assert.ok(
+          typeof canceled.ts === "string" && canceled.ts.length > 0,
+          "run.canceled should carry ts",
+        );
+        assert.equal(
+          typeof canceled.tokensSpent,
+          "number",
+          "run.canceled should carry tokensSpent",
+        );
+
+        // The hanging worker really claimed before the stop landed.
+        const hanging = ctx.scripted
+          .readInvocations()
+          .filter((inv) => inv.mode === "hang-after-claim");
+        assert.ok(
+          hanging.length >= 1,
+          `worker should have claimed before hanging\n${diagnostics(ctx)}`,
+        );
+      } finally {
+        await teardown(ctx);
+      }
+    },
+  );
+
+  it(
     "bug-fix-merge-worktree: verifier exhaustion triggers reroute to fixer via retry_step",
     { timeout: 240_000 },
     async () => {
