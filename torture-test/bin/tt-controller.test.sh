@@ -24,6 +24,7 @@ INTERRUPTION_CONTROLLER_PID=""
 O9_CONTROL_PID=""
 O9_EVENTS_PATH=""
 O9_EVENTS_BACKUP=""
+O9_GOLDEN_BARE=""
 DAEMON_CONTROL_ORIGINAL_HASH="$(sha256sum "$TT_DIR/bin/daemon-control" | cut -d' ' -f1)"
 SMOKE_GOLDENS=()
 ORACLE_TEST_FILES=()
@@ -52,6 +53,9 @@ cleanup() {
   if [ -n "$O9_EVENTS_PATH" ]; then
     rm -f -- "$O9_EVENTS_PATH"
     if [ -f "$O9_EVENTS_BACKUP" ]; then mv "$O9_EVENTS_BACKUP" "$O9_EVENTS_PATH"; fi
+  fi
+  if [ -n "$O9_GOLDEN_BARE" ]; then
+    git --git-dir "$O9_GOLDEN_BARE" update-ref -d refs/heads/seed/o9-controller-special 2>/dev/null || true
   fi
   if [ -n "$INTERRUPTION_CONTROLLER_PID" ]; then
     kill -9 "$INTERRUPTION_CONTROLLER_PID" 2>/dev/null || true
@@ -581,7 +585,9 @@ pass "unidentified launch intent is TEST_INFRA_FAIL and is never relaunched"
 scheduler_manifest="$TEST_ROOT/manifests/scheduler.jsonl"
 scheduler_events="$TEST_ROOT/scheduler-events.jsonl"
 write_scheduler_manifest "$scheduler_manifest" "$scheduler_events" 4 450
-scheduler_output=$(run_recorded_campaign "$CONTROLLER" --manifest "$scheduler_manifest" --concurrency 2 --stagger 120ms) || fail "bounded scheduler failed: $scheduler_output"
+# Stagger is set well above the 100 ms assertion floor so a loaded box (other
+# agents, parallel suites) cannot eat the margin and flake the deadline check.
+scheduler_output=$(run_recorded_campaign "$CONTROLLER" --manifest "$scheduler_manifest" --concurrency 2 --stagger 400ms) || fail "bounded scheduler failed: $scheduler_output"
 scheduler_id=$(remember_campaign "$scheduler_output")
 node --input-type=module - "$TT_DIR/var/results/$scheduler_id/state.json" "$scheduler_events" <<'NODE'
 import fs from 'node:fs';
@@ -866,7 +872,8 @@ cat > "$workflow_bin_dir/tamandua" <<'SH'
 set -euo pipefail
 printf '%s\n' "$(node -e 'process.stdout.write(JSON.stringify({argv:process.argv.slice(1),at:Date.now()}))' "$@")" >> "$CONTROLLER_WORKFLOW_EVENTS"
 if [ "${1:-}" = "workflow" ] && [ "${2:-}" = "runs" ]; then
-  if [ "${CONTROLLER_WORKFLOW_MODE:-}" = "discovery" ]; then
+  if [ "${CONTROLLER_WORKFLOW_MODE:-}" = "discovery" ] \
+      || [ "${CONTROLLER_WORKFLOW_MODE:-}" = "discovery-cap" ]; then
     cat "$CONTROLLER_LIMITED_RUNS_JSON"
     exit 0
   fi
@@ -919,6 +926,17 @@ if [ "${1:-}" = "workflow" ] && [ "${2:-}" = "status" ]; then
         *) exit 9 ;;
       esac
       ;;
+    discovery-cap)
+      case "${3:-}" in
+        run-77777777-7777-4777-8777-777777777777)
+          printf '{"runId":"%s","status":"completed","tokensSpent":5,"task":"shared dispatch task","steps":[]}\n' "${3:-}" ;;
+        run-88888888-8888-4888-8888-888888888888)
+          status=running
+          [ ! -f "$CONTROLLER_DISCOVERY_CAP_STOP" ] || status=canceled
+          printf '{"runId":"%s","status":"%s","tokensSpent":7,"steps":[]}\n' "${3:-}" "$status" ;;
+        *) exit 9 ;;
+      esac
+      ;;
     *) exit 9 ;;
   esac
   exit 0
@@ -928,6 +946,13 @@ if [ "${1:-}" = "workflow" ] && [ "${2:-}" = "stop" ]; then
     case "${3:-}" in
       run-88888888-8888-4888-8888-888888888888) : > "$CONTROLLER_DISCOVERY_CHILD_WAITED" ;;
       run-99999999-9999-4999-8999-999999999999) : > "$CONTROLLER_DISCOVERY_REPLACEMENT_WAITED" ;;
+      *) exit 45 ;;
+    esac
+    exit 0
+  fi
+  if [ "${CONTROLLER_WORKFLOW_MODE:-}" = "discovery-cap" ]; then
+    case "${3:-}" in
+      run-88888888-8888-4888-8888-888888888888) : > "$CONTROLLER_DISCOVERY_CAP_STOP" ;;
       *) exit 45 ;;
     esac
     exit 0
@@ -948,6 +973,15 @@ if [ "${1:-}" = "workflow" ] && [ "${2:-}" = "wait" ]; then
     fi
     printf '{"runs":[{"runId":"%s","status":"completed"}],"timedOut":false}\n' "${3:-}"
     exit 0
+  fi
+  if [ "${CONTROLLER_WORKFLOW_MODE:-}" = "discovery-cap" ]; then
+    case "${3:-}" in
+      run-88888888-8888-4888-8888-888888888888) : ;;
+      *) exit 45 ;;
+    esac
+    while [ ! -f "$CONTROLLER_DISCOVERY_CAP_STOP" ]; do sleep 0.01; done
+    printf '{"runs":[{"runId":"%s","status":"canceled"}],"timedOut":false}\n' "${3:-}"
+    exit 3
   fi
   if [ "${CONTROLLER_WORKFLOW_MODE:-}" = "resume" ]; then
     printf '{"runs":[{"runId":"%s","status":"completed"}],"timedOut":false}\n' "${3:-}"
@@ -984,6 +1018,10 @@ case "${CONTROLLER_WORKFLOW_MODE:-stdout}" in
     exit 3
     ;;
   discovery)
+    printf 'Run: run-77777777-7777-4777-8777-777777777777\n'
+    printf '{"status":"completed"}\n'
+    ;;
+  discovery-cap)
     printf 'Run: run-77777777-7777-4777-8777-777777777777\n'
     printf '{"status":"completed"}\n'
     ;;
@@ -1034,8 +1072,9 @@ import fs from 'node:fs';
 const [statePath, eventPath, resetPath, fixturePath] = process.argv.slice(2);
 const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
 const item = state.cases[0];
-if (state.options.token_poll_interval_ms !== 300000) {
-  throw new Error(`production token polling default is not five minutes: ${JSON.stringify(state.options)}`);
+if (state.options.token_poll_interval_ms !== 300000
+    || state.options.cap_check_interval_ms !== 15000) {
+  throw new Error(`production polling/cap-check defaults are wrong: ${JSON.stringify(state.options)}`);
 }
 if (item.phase !== 'terminal' || item.outcome !== 'PASS' || item.attempts.length !== 1) {
   throw new Error(`workflow case did not reach one terminal record: ${JSON.stringify(item)}`);
@@ -1214,14 +1253,26 @@ O9_CONTROL_PID="$(<"$o9_control_ready")"
 
 o9_controller_fixture="$TT_DIR/var/fixtures/work/O9-CONTROLLER-SPECIAL/tt-ts"
 rm -rf -- "$TT_DIR/var/fixtures/work/O9-CONTROLLER-SPECIAL"
-mkdir -p "$o9_controller_fixture/src"
-git -C "$o9_controller_fixture" init -q -b main
-git -C "$o9_controller_fixture" config user.name 'Controller O9 Test'
-git -C "$o9_controller_fixture" config user.email 'controller-o9@example.invalid'
-printf 'export const o9Fixture = "original bytes";\n' > "$o9_controller_fixture/src/value.ts"
-git -C "$o9_controller_fixture" add .
-git -C "$o9_controller_fixture" commit -qm fixture
-o9_controller_original_hash="$(sha256sum "$o9_controller_fixture/src/value.ts" | cut -d' ' -f1)"
+# The work clone is produced by the controller's provisioning stage (fresh
+# clone of the golden bare). To give that clone a unique tracked file whose
+# restoration the O9 battery can prove, install a seed branch into the golden
+# bare and point the manifest's seed field at it — the manually-created repo
+# here is the SEED SOURCE, not the working clone.
+o9_seed_repo="$TEST_ROOT/o9-seed-repo"
+mkdir -p "$o9_seed_repo/src"
+git -C "$o9_seed_repo" init -q -b main
+git -C "$o9_seed_repo" config user.name 'Controller O9 Test'
+git -C "$o9_seed_repo" config user.email 'controller-o9@example.invalid'
+printf 'export const o9Fixture = "original bytes";\n' > "$o9_seed_repo/src/value.ts"
+git -C "$o9_seed_repo" add .
+git -C "$o9_seed_repo" commit -qm fixture
+o9_controller_original_hash="$(sha256sum "$o9_seed_repo/src/value.ts" | cut -d' ' -f1)"
+o9_golden_bare="$TT_DIR/var/fixtures/golden/tt-ts.git"
+O9_GOLDEN_BARE="$o9_golden_bare"
+node "$TT_DIR/bin/tt-golden-bootstrap.mjs" --fixture tt-ts >/dev/null 2>&1 \
+  || fail "could not bootstrap the tt-ts golden for O9 seed provisioning"
+git -C "$o9_seed_repo" push "$o9_golden_bare" main:refs/heads/seed/o9-controller-special >/dev/null 2>&1 \
+  || fail "could not install the O9 seed branch into the tt-ts golden"
 o9_controller_manifest="$TEST_ROOT/manifests/o9-controller-special.jsonl"
 node --input-type=module - "$o9_controller_manifest" <<'NODE'
 import fs from 'node:fs';
@@ -1229,6 +1280,7 @@ const manifest = process.argv[2];
 const record = {
   id: 'O9-CONTROLLER-SPECIAL', wave: 0, workflow: 'bug-fix-merge-worktree',
   fixture: 'tt-ts', harness: 'hermes', task: 'tasks/W3.07.md',
+  seed: 'o9-controller-special',
   context: {test_cmd: '/bin/true'}, caps: {tokens: 1, wall_min: 5}, requires: {},
   boundary_files: ['src'], forbidden: [], oracles: ['O9'], gates: [],
   chaos: {o9_special_exits: true}, shed_ok: false, mandatory: true, class: 'verification',
@@ -1314,6 +1366,10 @@ const trackedProbe = spawnSync('git', ['ls-files', '--error-unmatch', '--', '.gi
   cwd: fixturePath, stdio: 'ignore', shell: false,
 }).status === 0;
 if (trackedProbe) throw new Error('controller O9 junk probe entered the Git index');
+if (item.teardown?.action !== 'keep'
+    || item.teardown?.keep_reason !== 'o9-special-exit-restored-tree-evidence') {
+  throw new Error(`O9 special-exit clone was not kept as restored-tree evidence: ${JSON.stringify(item.teardown)}`);
+}
 NODE
 kill -9 "$O9_CONTROL_PID"
 wait "$O9_CONTROL_PID" 2>/dev/null || true
@@ -1498,6 +1554,245 @@ pass "controller discovers, invokes, hashes, validates, and classifies the seven
 
 rm -rf -- "$snapshot_fixture"
 pass "controller harvests immutable complete evidence before invoking the real O1 gating oracle"
+
+# ── US-006 (S9 controller): REPLAY cache-HIT gate ───────────────────────────
+# After terminal harvest a replay case must show a cache-hit/replay shim
+# observation for ITS run bound to the pair's origin/tree/cmd key. These
+# tests seed snapshot fixtures via the TT_CONTROLLER_REPLAY_SNAPSHOT_FIXTURE_DIR
+# self-test seam and drive a replay workflow case to a completed terminal
+# harvest with the stub `tamandua` (harvest-status mode) — zero tokens, no
+# real launches. The pair is a LOCAL scripted case whose command provisions
+# the shared tt-ts work clone (tt-fixture-provision.mjs) and seeds the
+# snapshot tree with REAL origin/tree/cmd values computed from that clone.
+[ -d "$TT_DIR/var/fixtures/golden/tt-ts.git" ] \
+  || node "$TT_DIR/bin/tt-golden-bootstrap.mjs" --fixture tt-ts >/dev/null 2>&1 \
+  || fail "could not bootstrap the tt-ts golden for the replay cache-hit gate tests"
+us006_pair_script="$TEST_ROOT/us006-pair-command.mjs"
+cat > "$us006_pair_script" <<'NODE'
+// Pair local-command helper for the US-006 replay cache-HIT gate tests:
+// provisions the shared tt-ts work clone at
+// var/fixtures/work/US006-REPLAY-PAIR/tt-ts and (except provision-only)
+// seeds the replay snapshot fixture tree the controller's gate will read.
+// argv: <fixture-root> <mode: hit|miss|malformed|provision-only>
+import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
+import { createHash } from 'node:crypto';
+
+const [fixtureRoot, mode] = process.argv.slice(2);
+const provision = spawnSync(process.execPath, [
+  'bin/tt-fixture-provision.mjs', '--fixture', 'tt-ts',
+  '--case-id', 'US006-REPLAY-PAIR', '--json',
+], { encoding: 'utf8' });
+if (provision.status !== 0) {
+  process.stderr.write(String(provision.stderr ?? ''));
+  process.exit(1);
+}
+if (mode === 'provision-only') process.exit(0);
+const clonePath = path.resolve('var/fixtures/work/US006-REPLAY-PAIR/tt-ts');
+const originRepo = fs.realpathSync(clonePath);
+const treeResult = spawnSync('git', ['-C', clonePath, 'rev-parse', '--verify', 'HEAD^{tree}'], { encoding: 'utf8' });
+if (treeResult.status !== 0) {
+  process.stderr.write(String(treeResult.stderr ?? ''));
+  process.exit(1);
+}
+const treeHash = treeResult.stdout.trim();
+const cmdHash = createHash('sha256').update('npm test').digest('hex');
+const runId = 'run-aaaaaaaa-1111-4111-8111-111111111111';
+const snapDir = path.join(fixtureRoot, 'snapshots', 'US006-REPLAY', 'attempt-1');
+fs.mkdirSync(snapDir, { recursive: true });
+if (mode === 'malformed') {
+  fs.writeFileSync(path.join(snapDir, 'snapshot.json'), '{not valid json\n');
+  process.exit(0);
+}
+const observedAt = new Date().toISOString();
+const base = { origin_repo: originRepo, tree_hash: treeHash, cmd_hash: cmdHash, force: false, run_id: runId, step_id: null };
+const rows = mode === 'hit'
+  ? [
+      { id: 'suite-observation-1', invocation_id: 'evt:1', sequence: 1, phase: 'lookup', observed_at: observedAt, ...base, latest_row_id: 1 },
+      { id: 'suite-observation-2', invocation_id: 'evt:1', sequence: 2, phase: 'replay', observed_at: observedAt, ...base, ledger_row_id: 1, marker: 'TAMANDUA-TEST CACHED', exit_code: 0, committed_tree_hash: treeHash },
+    ]
+  : [
+      { id: 'suite-observation-1', invocation_id: 'evt:1', sequence: 1, phase: 'lookup', observed_at: observedAt, ...base, latest_row_id: null },
+      { id: 'suite-observation-2', invocation_id: 'evt:1', sequence: 2, phase: 'execute', observed_at: observedAt, ...base, started_at: observedAt, pre_tree_hash: treeHash, post_tree_hash: treeHash, exit_code: 0 },
+      { id: 'suite-observation-3', invocation_id: 'evt:1', sequence: 3, phase: 'record', observed_at: observedAt, ...base, ledger_row_id: 2, exit_code: 0 },
+    ];
+fs.writeFileSync(path.join(snapDir, 'suite-observations.json'), `${JSON.stringify({ rows })}\n`);
+fs.writeFileSync(path.join(snapDir, 'launch-intent.json'), `${JSON.stringify({
+  schema_version: 1, gate_key: { origin_repo: originRepo, cmd_hash: cmdHash },
+})}\n`);
+fs.writeFileSync(path.join(snapDir, 'snapshot.json'), `${JSON.stringify({
+  schema_version: 1,
+  status: 'COMPLETE',
+  case_id: 'US006-REPLAY',
+  attempt_id: 'attempt-1',
+  completed_at: observedAt,
+  files: {
+    suite_observations: { path: 'snapshots/US006-REPLAY/attempt-1/suite-observations.json', kind: 'controller-suite-state-machine' },
+    launch_intent: { path: 'snapshots/US006-REPLAY/attempt-1/launch-intent.json', kind: 'controller-launch-intent' },
+  },
+})}\n`);
+NODE
+us006_write_manifest() {
+  local manifest="$1" fixture_root="$2" mode="$3"
+  node --input-type=module - "$manifest" "$fixture_root" "$mode" "$us006_pair_script" <<'NODE'
+import fs from 'node:fs';
+const [manifestPath, fixtureRoot, mode, pairScript] = process.argv.slice(2);
+const pair = {
+  id: 'US006-REPLAY-PAIR', wave: 3, workflow: 'local', fixture: 'tt-ts', harness: 'local',
+  task: 'cases/tasks/tier1/W1.L2-ts.md', context: { execution_mode: 'scripted' },
+  caps: { tokens: 0, wall_min: 5 }, requires: {}, boundary_files: [], forbidden: [],
+  oracles: [], gates: [], chaos: null, shed_ok: false, mandatory: true, class: 'verification',
+  command: { executable: 'node', args: [pairScript, fixtureRoot, mode], cwd: '.' },
+};
+const replay = {
+  id: 'US006-REPLAY', wave: 3, workflow: 'tt-shim-probe', fixture: 'tt-ts', harness: 'pi',
+  task: 'cases/tasks/tier1/W1.REPLAY-ts.md',
+  context: { execution_mode: 'real', test_cmd: 'npm test', replay_of: 'US006-REPLAY-PAIR' },
+  caps: { tokens: 100000, wall_min: 240 }, requires: {}, boundary_files: [], forbidden: [],
+  oracles: [], gates: ['TIER1'], chaos: null, shed_ok: false, mandatory: true, class: 'verification',
+};
+fs.writeFileSync(manifestPath, `${[pair, replay].map((record) => JSON.stringify(record)).join('\n')}\n`);
+NODE
+}
+us006_run_gate_campaign() {
+  local manifest="$1" fixture_root="$2"
+  PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$workflow_events" \
+    CONTROLLER_WORKFLOW_MODE=harvest-status \
+    TT_CONTROLLER_SELF_TEST=1 \
+    TT_CONTROLLER_REPLAY_SNAPSHOT_FIXTURE_DIR="$fixture_root" \
+    TT_CONTROLLER_REPLAY_PAIR_WAIT_MS=0 \
+    run_recorded_campaign "$CONTROLLER" --manifest "$manifest"
+}
+us006_run_bare_campaign() {
+  local manifest="$1"
+  PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$workflow_events" \
+    CONTROLLER_WORKFLOW_MODE=harvest-status \
+    TT_CONTROLLER_REPLAY_PAIR_WAIT_MS=0 \
+    run_recorded_campaign "$CONTROLLER" --manifest "$manifest"
+}
+
+us006_hit_manifest="$TEST_ROOT/manifests/us006-hit.jsonl"
+us006_hit_fixture="$TEST_ROOT/replay-fixture-hit"
+us006_write_manifest "$us006_hit_manifest" "$us006_hit_fixture" "hit"
+us006_hit_output=$(us006_run_gate_campaign "$us006_hit_manifest" "$us006_hit_fixture") \
+  || fail "replay cache-HIT campaign failed: $us006_hit_output"
+us006_hit_id=$(remember_campaign "$us006_hit_output")
+node --input-type=module - "$TT_DIR/var/results/$us006_hit_id/state.json" \
+  "$TT_DIR/var/fixtures/work/US006-REPLAY-PAIR/tt-ts" <<'NODE'
+import fs from 'node:fs';
+import { spawnSync } from 'node:child_process';
+const [statePath, clonePath] = process.argv.slice(2);
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const pair = state.cases.find((c) => c.id === 'US006-REPLAY-PAIR');
+const replay = state.cases.find((c) => c.id === 'US006-REPLAY');
+if (pair.outcome !== 'PASS') throw new Error(`pair must PASS first: ${JSON.stringify(pair)}`);
+if (replay.outcome !== 'PASS') throw new Error(`replay cache HIT must PASS: ${JSON.stringify(replay)}`);
+const attempt = replay.attempts.at(-1);
+const gate = attempt?.replay_cache_assertion;
+if (gate?.ok !== true || gate.evidence?.status !== 'replay-cache-hit') {
+  throw new Error(`hit assertion evidence is missing on the attempt: ${JSON.stringify(attempt)}`);
+}
+if (gate.evidence.run_id !== 'run-aaaaaaaa-1111-4111-8111-111111111111') {
+  throw new Error(`assertion must bind to this attempt's run: ${JSON.stringify(gate.evidence)}`);
+}
+if (!gate.evidence.observed_phases.includes('replay')) {
+  throw new Error(`observed phases must include the cache-hit replay phase: ${JSON.stringify(gate.evidence.observed_phases)}`);
+}
+const tree = spawnSync('git', ['-C', clonePath, 'rev-parse', '--verify', 'HEAD^{tree}'], { encoding: 'utf8' }).stdout.trim();
+if (gate.evidence.key.tree_hash !== tree || !/^[0-9a-f]{40,64}$/.test(tree)) {
+  throw new Error(`assertion key must bind to the pair's committed tree: ${JSON.stringify(gate.evidence.key)} vs ${tree}`);
+}
+if (gate.evidence.hit_observation?.marker !== 'TAMANDUA-TEST CACHED') {
+  throw new Error(`hit observation must carry the replay marker: ${JSON.stringify(gate.evidence.hit_observation)}`);
+}
+if ((replay.findings ?? []).some((f) => f.type === 'REPLAY_CACHE_MISS')) {
+  throw new Error(`a hit must never record a REPLAY_CACHE_MISS finding: ${JSON.stringify(replay.findings)}`);
+}
+if (attempt.classification_reason !== undefined) {
+  throw new Error(`a hit PASS must carry no classification reason: ${JSON.stringify(attempt.classification_reason)}`);
+}
+NODE
+pass "REPLAY cache HIT passes and records the assertion evidence on the attempt"
+
+us006_miss_manifest="$TEST_ROOT/manifests/us006-miss.jsonl"
+us006_miss_fixture="$TEST_ROOT/replay-fixture-miss"
+us006_write_manifest "$us006_miss_manifest" "$us006_miss_fixture" "miss"
+us006_miss_output=$(us006_run_gate_campaign "$us006_miss_manifest" "$us006_miss_fixture") \
+  || fail "replay cache-MISS campaign failed: $us006_miss_output"
+us006_miss_id=$(remember_campaign "$us006_miss_output")
+node --input-type=module - "$TT_DIR/var/results/$us006_miss_id/state.json" <<'NODE'
+import fs from 'node:fs';
+const [statePath] = process.argv.slice(2);
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const replay = state.cases.find((c) => c.id === 'US006-REPLAY');
+if (replay.outcome === 'PASS') throw new Error(`execute/record must never PASS: ${JSON.stringify(replay)}`);
+if (replay.outcome !== 'INCONCLUSIVE') throw new Error(`execute/record must classify INCONCLUSIVE: ${JSON.stringify(replay)}`);
+if (replay.reason?.category !== 'replay-cache-miss') {
+  throw new Error(`the distinct replay-cache-miss category must classify the outcome: ${JSON.stringify(replay.reason)}`);
+}
+const finding = (replay.findings ?? []).find((f) => f.type === 'REPLAY_CACHE_MISS');
+if (!finding || JSON.stringify(finding.observed_phases) !== JSON.stringify(['lookup', 'execute', 'record'])) {
+  throw new Error(`REPLAY_CACHE_MISS finding must carry the observed phases: ${JSON.stringify(replay.findings)}`);
+}
+if (finding.run_id !== 'run-aaaaaaaa-1111-4111-8111-111111111111') {
+  throw new Error(`the miss finding must bind to this attempt's run: ${JSON.stringify(finding)}`);
+}
+const attempt = replay.attempts.at(-1);
+const gate = attempt?.replay_cache_assertion;
+if (gate?.ok !== false || gate.kind !== 'replay-cache-miss') {
+  throw new Error(`miss assertion evidence is missing on the attempt: ${JSON.stringify(attempt)}`);
+}
+if (attempt.classification_reason?.category !== 'replay-cache-miss') {
+  throw new Error(`attempt classification must carry replay-cache-miss: ${JSON.stringify(attempt.classification_reason)}`);
+}
+NODE
+pass "REPLAY execute/record observations are never PASS and carry the replay-cache-miss finding"
+
+us006_malformed_manifest="$TEST_ROOT/manifests/us006-malformed.jsonl"
+us006_malformed_fixture="$TEST_ROOT/replay-fixture-malformed"
+us006_write_manifest "$us006_malformed_manifest" "$us006_malformed_fixture" "malformed"
+us006_malformed_output=$(us006_run_gate_campaign "$us006_malformed_manifest" "$us006_malformed_fixture") \
+  || fail "replay malformed-snapshot campaign failed: $us006_malformed_output"
+us006_malformed_id=$(remember_campaign "$us006_malformed_output")
+node --input-type=module - "$TT_DIR/var/results/$us006_malformed_id/state.json" <<'NODE'
+import fs from 'node:fs';
+const [statePath] = process.argv.slice(2);
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const replay = state.cases.find((c) => c.id === 'US006-REPLAY');
+if (replay.outcome !== 'TEST_INFRA_FAIL') {
+  throw new Error(`a malformed snapshot must fail closed as TEST_INFRA: ${JSON.stringify(replay)}`);
+}
+if (replay.reason?.category !== 'replay-snapshot-unreadable') {
+  throw new Error(`malformed snapshot must classify replay-snapshot-unreadable: ${JSON.stringify(replay.reason)}`);
+}
+const attempt = replay.attempts.at(-1);
+const gate = attempt?.replay_cache_assertion;
+if (gate?.ok !== false || gate.kind !== 'replay-cache-infra') {
+  throw new Error(`infra assertion evidence is missing on the attempt: ${JSON.stringify(attempt)}`);
+}
+NODE
+pass "a malformed replay snapshot fails closed as TEST_INFRA, never PASS"
+
+us006_missing_manifest="$TEST_ROOT/manifests/us006-missing.jsonl"
+us006_write_manifest "$us006_missing_manifest" "$TEST_ROOT/replay-fixture-unused" "provision-only"
+us006_missing_output=$(us006_run_bare_campaign "$us006_missing_manifest") \
+  || fail "replay missing-snapshot campaign failed: $us006_missing_output"
+us006_missing_id=$(remember_campaign "$us006_missing_output")
+node --input-type=module - "$TT_DIR/var/results/$us006_missing_id/state.json" <<'NODE'
+import fs from 'node:fs';
+const [statePath] = process.argv.slice(2);
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const replay = state.cases.find((c) => c.id === 'US006-REPLAY');
+if (replay.outcome !== 'TEST_INFRA_FAIL') {
+  throw new Error(`a missing snapshot must fail closed as TEST_INFRA: ${JSON.stringify(replay)}`);
+}
+if (replay.reason?.category !== 'replay-snapshot-missing') {
+  throw new Error(`missing snapshot must classify replay-snapshot-missing: ${JSON.stringify(replay.reason)}`);
+}
+NODE
+pass "a replay with no snapshot at all fails closed as TEST_INFRA (replay-snapshot-missing)"
+rm -rf -- "$TT_DIR/var/fixtures/work/US006-REPLAY-PAIR"
 
 direct_workflow_manifest="$TEST_ROOT/manifests/workflow-direct.jsonl"
 valid_case "WORKFLOW-DIRECT" \
@@ -1714,6 +2009,7 @@ NODE
   cap_output=$(PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$workflow_events" \
     CONTROLLER_WORKFLOW_MODE="$cap_mode" CONTROLLER_STOP_MARKER="$cap_stop_marker" \
     CONTROLLER_STATUS_COUNT="$cap_status_count" TT_CONTROLLER_POLL_INTERVAL_MS=20 \
+    TT_CONTROLLER_CAP_CHECK_INTERVAL_MS=20 \
     run_recorded_campaign "$CONTROLLER" --manifest "$cap_manifest") || fail "$cap_mode enforcement failed: $cap_output"
   cap_id=$(remember_campaign "$cap_output")
   node --input-type=module - "$TT_DIR/var/results/$cap_id/state.json" "$workflow_events" "$cap_mode" <<'NODE'
@@ -1763,9 +2059,223 @@ if (mode === 'token-cap') {
     || finding.observed < finding.threshold) {
   throw new Error(`wall threshold evidence is wrong: ${JSON.stringify(item)}`);
 }
+// S8a: every breach record carries the enforcement-latency evidence (seconds
+// from threshold crossing to detection) alongside the observed value.
+if (typeof attempt.stop_reason?.observed !== 'number'
+    || typeof attempt.stop_reason?.enforcement_latency !== 'number'
+    || attempt.stop_reason.enforcement_latency < 0
+    || attempt.stop_reason.observed !== finding.observed
+    || attempt.stop_reason.enforcement_latency !== finding.enforcement_latency) {
+  throw new Error(`stop_reason lacks observed/enforcement_latency: ${JSON.stringify({reason: attempt.stop_reason, finding})}`);
+}
+if (typeof attempt.straggler_capture?.reason?.enforcement_latency !== 'number'
+    || attempt.straggler_capture.reason.enforcement_latency !== finding.enforcement_latency) {
+  throw new Error(`straggler capture lacks enforcement latency: ${JSON.stringify(attempt.straggler_capture)}`);
+}
 NODE
 done
 pass "workflow token and wall caps persist spend and enforce one stop plus terminal wait"
+
+# S8a decoupling proof: a wall cap fires on the cap-check cadence even while the
+# token poll keeps its large production cadence. wall_min is scaled down
+# (3 min * 1/1500 = 0.002 min, 120 ms) so the test stays fast; the observed
+# < 3.5 min envelope plus the wall-clock bound prove the breach did NOT ride
+# the 5-minute token poll. A 45 s timeout turns any regression into a fast
+# failure instead of a 5-minute hang.
+decoupled_manifest="$TEST_ROOT/manifests/workflow-wall-cap-decoupled.jsonl"
+decoupled_stop_marker="$TEST_ROOT/wall-cap-decoupled-stop"
+decoupled_status_count="$TEST_ROOT/wall-cap-decoupled-status-count"
+valid_case "WORKFLOW-WALL-CAP-DECOUPLED" \
+  | sed 's/"requires":{"toolchains":\["node"\]}/"requires":{}/' \
+  > "$decoupled_manifest"
+node --input-type=module - "$decoupled_manifest" <<'NODE'
+import fs from 'node:fs';
+const manifestPath = process.argv[2];
+const record = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+record.caps.tokens = 100;
+record.caps.wall_min = 0.002; // scaled-down stand-in for a 3-minute wall cap
+fs.writeFileSync(manifestPath, `${JSON.stringify(record)}\n`);
+NODE
+decoupled_output_file="$TEST_ROOT/wall-cap-decoupled-output"
+(
+  PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$workflow_events" \
+    CONTROLLER_WORKFLOW_MODE=wall-cap CONTROLLER_STOP_MARKER="$decoupled_stop_marker" \
+    CONTROLLER_STATUS_COUNT="$decoupled_status_count" \
+    TT_CONTROLLER_CAP_CHECK_INTERVAL_MS=20 \
+    run_recorded_campaign "$CONTROLLER" --manifest "$decoupled_manifest" > "$decoupled_output_file" 2>&1
+) &
+decoupled_pid=$!
+decoupled_done=""
+for _ in $(seq 1 225); do
+  kill -0 "$decoupled_pid" 2>/dev/null || { decoupled_done=1; break; }
+  sleep 0.2
+done
+if [ -z "$decoupled_done" ]; then
+  kill -9 "$decoupled_pid" 2>/dev/null || true
+  wait "$decoupled_pid" 2>/dev/null || true
+  fail "decoupled wall-cap enforcement exceeded its 45 s wall-clock bound (it rode the token poll)"
+fi
+set +e
+wait "$decoupled_pid"
+decoupled_status=$?
+set -e
+decoupled_output="$(cat "$decoupled_output_file")"
+[ "$decoupled_status" -le 2 ] && printf '%s\n' "$decoupled_output" | grep -Fq 'Campaign: ' \
+  || fail "decoupled wall-cap enforcement failed: $decoupled_output"
+decoupled_id=$(remember_campaign "$decoupled_output")
+node --input-type=module - "$TT_DIR/var/results/$decoupled_id/state.json" <<'NODE'
+import fs from 'node:fs';
+const statePath = process.argv[2];
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const item = state.cases[0];
+const attempt = item.attempts[0];
+const finding = item.findings?.find((entry) => entry.type === 'RUNAWAY');
+// The token poll kept its production 5-minute cadence; only the cap check was fast.
+if (state.options.token_poll_interval_ms !== 300000
+    || state.options.cap_check_interval_ms !== 20) {
+  throw new Error(`decoupled cadences were not persisted: ${JSON.stringify(state.options)}`);
+}
+if (attempt.stop_reason?.cap !== 'wall_min' || finding?.cap !== 'wall_min') {
+  throw new Error(`decoupled wall cap did not fire: ${JSON.stringify({reason: attempt.stop_reason, findings: item.findings})}`);
+}
+if (typeof attempt.stop_reason.observed !== 'number'
+    || attempt.stop_reason.observed < attempt.stop_reason.threshold
+    || attempt.stop_reason.observed >= 3.5) {
+  throw new Error(`wall breach observed outside the < 3.5 min envelope: ${JSON.stringify(attempt.stop_reason)}`);
+}
+const stopElapsedMs = new Date(attempt.stop_intent_at).valueOf() - new Date(attempt.started_at).valueOf();
+if (stopElapsedMs > 30_000) {
+  throw new Error(`wall breach waited ${stopElapsedMs} ms — it rode the token poll: ${JSON.stringify(attempt.stop_reason)}`);
+}
+const expectedLatency = Math.max(0,
+  (new Date(attempt.stop_intent_at).valueOf()
+    - (new Date(attempt.started_at).valueOf() + attempt.stop_reason.threshold * 60_000)) / 1000);
+for (const evidence of [attempt.stop_reason, finding, attempt.straggler_capture?.reason]) {
+  if (typeof evidence?.observed !== 'number' || typeof evidence?.enforcement_latency !== 'number'
+      || evidence.enforcement_latency < 0
+      || Math.abs(evidence.enforcement_latency - expectedLatency) > 1) {
+    throw new Error(`breach evidence lacks observed/enforcement_latency: ${JSON.stringify({evidence, expectedLatency})}`);
+  }
+}
+NODE
+pass "wall cap fires on the dedicated cap-check cadence while the token poll stays at its production default"
+
+# S8a (US-002) decoupling proof for DISCOVERED runs: a child run of a
+# multi-run case whose wall deadline is ~3 minutes out (wall_min 3; the
+# deadline distance is scaled down by seeding created_at 170 s in the past so
+# the deadline lands ~10 s after discovery) is stopped near its deadline even
+# while the token poll keeps a 10-minute cadence, and its stop_reason /
+# straggler_capture.reason carry observed + enforcement_latency. A 60 s
+# wall-clock bound turns any regression into a fast failure instead of a
+# 10-minute hang. The explicit context.parentRunId link is what makes the
+# pre-existing child discoverable (the just-do-it task inference rejects runs
+# that started before the root attempt).
+discovery_cap_manifest="$TEST_ROOT/manifests/workflow-discovery-cap.jsonl"
+discovery_cap_stop_marker="$TEST_ROOT/discovery-cap-stop"
+discovery_cap_limited_runs="$TEST_ROOT/discovery-cap-limited-runs.json"
+valid_case "WORKFLOW-DISCOVERY-CAP" \
+  | sed 's/"requires":{"toolchains":\["node"\]}/"requires":{}/' \
+  | sed 's/"workflow":"bug-fix-merge-worktree"/"workflow":"just-do-it"/' \
+  | sed 's/"context":{}/"context":{"execution_mode":"scripted"}/' \
+  > "$discovery_cap_manifest"
+node --input-type=module - "$discovery_cap_manifest" <<'NODE'
+import fs from 'node:fs';
+const record = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+record.caps.tokens = 1000;
+record.caps.wall_min = 3;
+fs.writeFileSync(process.argv[2], `${JSON.stringify(record)}\n`);
+NODE
+discovery_cap_root_at=$(node -e 'console.log(new Date(Date.now() - 5000).toISOString())')
+discovery_cap_child_at=$(node -e 'console.log(new Date(Date.now() - 170000).toISOString())')
+node --input-type=module - "$DISCOVERY_DB" "$discovery_cap_limited_runs" \
+  "$discovery_cap_root_at" "$discovery_cap_child_at" <<'NODE'
+import fs from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
+const [dbPath, limitedRunsPath, rootAt, childAt] = process.argv.slice(2);
+const db = new DatabaseSync(dbPath);
+db.exec('DELETE FROM runs');
+const insert = db.prepare(`INSERT INTO runs
+  (id, workflow_id, task, status, context, tokens_spent, created_at, updated_at)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
+insert.run('77777777-7777-4777-8777-777777777777', 'just-do-it', 'shared dispatch task',
+  'completed', '{"parentRunId":null}', 5, rootAt, rootAt);
+insert.run('88888888-8888-4888-8888-888888888888', 'do-now', 'shared dispatch task',
+  'running', '{"parentRunId":"77777777-7777-4777-8777-777777777777"}', 7, childAt, childAt);
+db.close();
+fs.writeFileSync(limitedRunsPath, `${JSON.stringify({ runs: [] })}\n`);
+NODE
+discovery_cap_output_file="$TEST_ROOT/discovery-cap-output"
+(
+  PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$workflow_events" \
+    CONTROLLER_WORKFLOW_MODE=discovery-cap CONTROLLER_DISCOVERY_CAP_STOP="$discovery_cap_stop_marker" \
+    CONTROLLER_LIMITED_RUNS_JSON="$discovery_cap_limited_runs" \
+    TT_CONTROLLER_POLL_INTERVAL_MS=600000 TT_CONTROLLER_CAP_CHECK_INTERVAL_MS=20 \
+    run_recorded_campaign "$CONTROLLER" --manifest "$discovery_cap_manifest" > "$discovery_cap_output_file" 2>&1
+) &
+discovery_cap_pid=$!
+discovery_cap_done=""
+for _ in $(seq 1 300); do
+  kill -0 "$discovery_cap_pid" 2>/dev/null || { discovery_cap_done=1; break; }
+  sleep 0.2
+done
+if [ -z "$discovery_cap_done" ]; then
+  kill -9 "$discovery_cap_pid" 2>/dev/null || true
+  wait "$discovery_cap_pid" 2>/dev/null || true
+  fail "discovered-run wall-cap enforcement exceeded its 60 s wall-clock bound (it rode the token poll)"
+fi
+set +e
+wait "$discovery_cap_pid"
+discovery_cap_status=$?
+set -e
+discovery_cap_output="$(cat "$discovery_cap_output_file")"
+[ "$discovery_cap_status" -le 2 ] && printf '%s\n' "$discovery_cap_output" | grep -Fq 'Campaign: ' \
+  || fail "discovered-run wall-cap enforcement failed: $discovery_cap_output"
+discovery_cap_id=$(remember_campaign "$discovery_cap_output")
+node --input-type=module - "$TT_DIR/var/results/$discovery_cap_id/state.json" <<'NODE'
+import fs from 'node:fs';
+const statePath = process.argv[2];
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const item = state.cases[0];
+const child = state.discovered_runs?.find((run) => run.run_id.startsWith('run-88888888'));
+if (!child || child.root_case_id !== item.id || child.phase !== 'terminal'
+    || child.terminal_status !== 'canceled') {
+  throw new Error(`discovered child was not stopped to terminal: ${JSON.stringify(state.discovered_runs)}`);
+}
+// The token poll kept its 10-minute cadence; only the cap check was fast.
+if (state.options.token_poll_interval_ms !== 600000
+    || state.options.cap_check_interval_ms !== 20) {
+  throw new Error(`discovered cadences were not persisted: ${JSON.stringify(state.options)}`);
+}
+if (child.stop_reason?.cap !== 'wall_min' || child.stop_reason?.threshold !== 3) {
+  throw new Error(`discovered wall cap did not fire: ${JSON.stringify({reason: child.stop_reason, findings: item.findings})}`);
+}
+if (typeof child.stop_reason.observed !== 'number'
+    || child.stop_reason.observed < child.stop_reason.threshold
+    || child.stop_reason.observed >= 3.5) {
+  throw new Error(`discovered wall breach observed outside the < 3.5 min envelope: ${JSON.stringify(child.stop_reason)}`);
+}
+const stopElapsedMs = new Date(child.stop_intent_at).valueOf() - new Date(child.started_at).valueOf();
+if (stopElapsedMs < 3 * 60_000 || stopElapsedMs > 3 * 60_000 + 30_000) {
+  throw new Error(`discovered wall breach fired ${stopElapsedMs} ms after start — not near the deadline: ${JSON.stringify(child)}`);
+}
+const expectedLatency = Math.max(0,
+  (new Date(child.stop_intent_at).valueOf()
+    - (new Date(child.started_at).valueOf() + child.stop_reason.threshold * 60_000)) / 1000);
+for (const evidence of [child.stop_reason, child.straggler_capture?.reason]) {
+  if (typeof evidence?.observed !== 'number' || typeof evidence?.enforcement_latency !== 'number'
+      || evidence.enforcement_latency < 0
+      || Math.abs(evidence.enforcement_latency - expectedLatency) > 5) {
+    throw new Error(`discovered breach evidence lacks observed/enforcement_latency: ${JSON.stringify({evidence, expectedLatency})}`);
+  }
+}
+const finding = item.findings?.find((entry) => entry.type === 'RUNAWAY' && entry.discovered === true);
+if (!finding || finding.cap !== 'wall_min' || finding.run_id !== child.run_id
+    || finding.observed !== child.stop_reason.observed
+    || finding.enforcement_latency !== child.stop_reason.enforcement_latency) {
+  throw new Error(`discovered RUNAWAY finding missing: ${JSON.stringify({finding, reason: child.stop_reason})}`);
+}
+NODE
+pass "discovered-run wall cap fires near deadline on the dedicated cap-check cadence while the token poll stays large"
 
 for workflow_mode in stderr conflict missing; do
   workflow_mode_manifest="$TEST_ROOT/manifests/workflow-$workflow_mode.jsonl"
@@ -2075,7 +2585,11 @@ for (const [predicate, expected, observed] of [
     throw new Error(`wrong ${predicate} evidence: ${JSON.stringify(entry)}`);
   }
 }
-if (state.updated_at !== item.terminal_at || new Date(item.terminal_at).toISOString() !== item.terminal_at) {
+// FIX10 US-005: the terminal hygiene-canary verify runs AFTER terminalization
+// and refreshes state.updated_at, so durability means updated_at is never
+// EARLIER than the terminal timestamp (not byte-equal to it).
+if (new Date(state.updated_at) < new Date(item.terminal_at)
+    || new Date(item.terminal_at).toISOString() !== item.terminal_at) {
   throw new Error(`terminal timestamp was not durably reflected: ${JSON.stringify(item)}`);
 }
 NODE
@@ -2707,6 +3221,24 @@ expect_usage_error "validate-only rejects resume" --resume campaign-example --va
 expect_usage_error "validate-only rejects scripted selection" --manifest "$CASES" --validate-only --scripted-only
 expect_usage_error "validate-only rejects scheduler options" --manifest "$CASES" --validate-only --concurrency 2
 expect_usage_error "validate-only rejects stagger" --manifest "$CASES" --validate-only --stagger 1s
+
+cap_interval_manifest="$TEST_ROOT/manifests/cap-interval.jsonl"
+valid_case "CAP-INTERVAL" | sed 's/"requires":{"toolchains":\["node"\]}/"requires":{}/' > "$cap_interval_manifest"
+for cap_interval_value in abc 0 -5 1.5; do
+  set +e
+  cap_interval_output=$(TT_CONTROLLER_CAP_CHECK_INTERVAL_MS="$cap_interval_value" \
+    "$CONTROLLER" --manifest "$cap_interval_manifest" 2>&1)
+  cap_interval_status=$?
+  set -e
+  [ "$cap_interval_status" -eq 2 ] \
+    || fail "cap-check interval '$cap_interval_value' exited $cap_interval_status instead of 2: $cap_interval_output"
+  printf '%s' "$cap_interval_output" | grep -Fq 'TT_CONTROLLER_CAP_CHECK_INTERVAL_MS must be a positive integer' \
+    || fail "cap-check interval '$cap_interval_value' was not rejected clearly: $cap_interval_output"
+  printf '%s' "$cap_interval_output" | grep -Fq 'Campaign: ' \
+    && fail "cap-check interval '$cap_interval_value' launched a campaign despite failing validation"
+  true
+done
+pass "cap-check interval is validated fail-fast (non-numeric or non-positive) before any launch"
 
 campaign_manifest="$TEST_ROOT/manifests/campaign.jsonl"
 valid_case "CAMPAIGN-STATE" > "$campaign_manifest"

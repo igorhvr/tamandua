@@ -191,12 +191,21 @@ if [ "$#" -eq 0 ]; then
 fi
 
 # Parsed flags: exactly one tier flag, optional --include-real and --case <id>.
+# --report is an exclusive mode: it renders the newest campaign report and may
+# not be combined with any tier/selection flag (fail-closed, never a silent
+# half-parse).
 tier=""
 include_real="false"
 case_id=""
+report_requested="false"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --smoke|--tier0|--tier1|--tier2)
+      if [ -n "$tier" ] && [ "$tier" != "$1" ]; then
+        echo "Conflicting tier flags: $tier and $1" >&2
+        usage >&2
+        exit 4
+      fi
       tier="$1"
       ;;
     --include-real)
@@ -212,8 +221,7 @@ while [ "$#" -gt 0 ]; do
       shift
       ;;
     --report)
-      report_latest
-      exit 0
+      report_requested="true"
       ;;
     --help|-h)
       usage
@@ -228,8 +236,24 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
+if [ "$report_requested" = "true" ]; then
+  if [ -n "$tier" ] || [ "$include_real" = "true" ] || [ -n "$case_id" ]; then
+    echo "--report cannot be combined with tier flags, --include-real, or --case" >&2
+    usage >&2
+    exit 4
+  fi
+  report_latest
+  exit 0
+fi
+
 if [ -z "$tier" ]; then
   echo "A tier flag (--smoke/--tier0/--tier1/--tier2) is required when --include-real/--case are used" >&2
+  usage >&2
+  exit 4
+fi
+
+if [ "$include_real" = "true" ] && [ "$tier" != "--tier0" ] && [ "$tier" != "--tier1" ]; then
+  echo "--include-real is only valid with --tier0 or --tier1" >&2
   usage >&2
   exit 4
 fi

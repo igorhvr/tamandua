@@ -249,7 +249,13 @@ fi
 total_count=$((total_count + 1))
 # Final sweep: no leftover tt-controller / tt-daemon-up / daemon-control procs
 # (the .test.sh's own pid is excluded by the [x] bracket trick).
-leaked="$(pgrep -af '[t]t-controller|[t]t-daemon-up|[d]aemon-control' || true)"
+# US-012: match the TT binaries as standalone cmdline tokens — a naive
+# substring pgrep false-positives on coordination watcher loops from OTHER
+# agents whose pgrep PATTERNS merely contain "tt-controller"/"daemon-control"
+# as quoted literals (e.g. pgrep -f ".../bin/tt-controller"). Real workers
+# always carry the binary name followed by a space (argv) or end-of-cmdline,
+# so the anchored pattern below still catches every actual leak.
+leaked="$(pgrep -af '(^|[ /])(tt-controller|tt-daemon-up|daemon-control)( |$)' || true)"
 if [ -n "$leaked" ]; then
   fail "leaked torture-test/tamandua worker process after the runs: $(printf '%s' "$leaked" | tr '\n' ';')"
 else

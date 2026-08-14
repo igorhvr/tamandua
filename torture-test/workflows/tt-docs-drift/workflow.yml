@@ -1,0 +1,92 @@
+# TT Docs Drift — the docs/creating-workflows.md Complete Example extracted
+# VERBATIM (E3.D S11 / US-007).
+#
+# This spec is the shipped TT-custom twin of the documented plan -> setup ->
+# implement example workflow. W2.24-docs-drift (tier1.jsonl: workflow `local`
+# + harness `pi` — the docs-drift sentinel) resolves to THIS spec via
+# tt-required-workflows: the helper maps a real case's workflow `local`
+# sentinel to tt-docs-drift, and the controller's local-sentinel launch
+# adapter installs and runs it (`workflow run local` is never executed).
+#
+# Fidelity contract: agent ids, roles, step ids, step inputs, expects, and
+# the setup on_fail reroute wiring below are the docs Complete Example
+# VERBATIM (docs/creating-workflows.md). Agent roles come from the docs:
+# planner (analysis, see the docs workflow.yml example and the Roles table),
+# setup and developer (coding — the Roles table lists "Developer, fixer,
+# setup" under coding). Pinned by
+# self-tests/tier1-tt-docs-drift-spec.test.ts.
+id: tt-docs-drift
+name: TT Docs Drift
+version: 1
+description: |
+  The docs/creating-workflows.md Complete Example extracted verbatim
+  (plan -> setup -> implement, with setup's on_fail reroute to plan).
+  Shipped as the TT-custom sentinel spec for the W2.24 docs-drift probe:
+  a real pi run installs and executes this documented example against the
+  tt-ts fixture to prove the documented workflow example still works
+  end-to-end.
+
+agents:
+  - id: planner
+    name: Planner
+    description: Decomposes tasks into stories.
+    role: analysis
+    workspace:
+      baseDir: agents/planner
+      skills:
+        - tamandua-agents
+      files:
+        AGENTS.md: agents/planner/AGENTS.md
+        SOUL.md: agents/planner/SOUL.md
+        IDENTITY.md: agents/planner/IDENTITY.md
+
+  - id: setup
+    name: Setup
+    role: coding
+    workspace:
+      baseDir: agents/setup
+      skills:
+        - tamandua-agents
+      files:
+        AGENTS.md: agents/setup/AGENTS.md
+        SOUL.md: agents/setup/SOUL.md
+        IDENTITY.md: agents/setup/IDENTITY.md
+
+  - id: developer
+    name: Developer
+    role: coding
+    workspace:
+      baseDir: agents/developer
+      skills:
+        - tamandua-agents
+      files:
+        AGENTS.md: agents/developer/AGENTS.md
+        SOUL.md: agents/developer/SOUL.md
+        IDENTITY.md: agents/developer/IDENTITY.md
+
+steps:
+  - id: plan
+    agent: planner
+    input: |
+      Plan the implementation of {{task}}.
+      Reply with STATUS: done.
+    expects: "STATUS: done"
+
+  - id: setup
+    agent: setup
+    input: |
+      Set up the repo at {{repo}} for {{task}}.
+      Reply with STATUS: done.
+    expects: "STATUS: done"
+    max_retries: 4
+    on_fail:
+      retry_step: plan       # Setup failures often stem from a flawed plan; re-planning refreshes context
+      max_reroutes: 2        # Allow up to 2 reroutes back to plan before failing the run
+
+  - id: implement
+    agent: developer
+    input: |
+      Implement {{task}}.
+      Reply with STATUS: done.
+    expects: "STATUS: done"
+    max_retries: 4

@@ -582,6 +582,12 @@ if [ "$w3_23_wf" != "do-now" ]; then
   fail "W3.23: expected do-now workflow, got $w3_23_wf"
   all_ok=false
 fi
+# S12/E3.D US-009: the token-saver paired-launch signal must be present
+w3_23_signal=$(echo "$w3_23_line" | node -e "process.stdin.on('data',d=>{const j=JSON.parse(d);process.stdout.write(String(j.context?.token_saver_control ?? ''));})" 2>/dev/null || true)
+if [ "$w3_23_signal" != "true" ]; then
+  fail "W3.23: missing context.token_saver_control=true, got '$w3_23_signal'"
+  all_ok=false
+fi
 
 if $all_ok; then
   pass "Wave-3 lifecycle probes have correct workflows/harness/fixtures"

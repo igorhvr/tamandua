@@ -16,7 +16,12 @@
 #               starting it if absent. FAILS CLOSED with the DISTINCT reason
 #               `tt-daemon-down` (exit non-zero) if the daemon cannot be
 #               brought up/verified. Idempotent: when already up it is a
-#               no-op.
+#               no-op. S12/E3.D US-009: ensure-up creates the contained
+#               adapters bin dir (var/adapters-bin, empty, idempotent) and
+#               starts the daemon with it PREPENDED to PATH so adapter
+#               stubs (e.g. the managed pi-token-saver) are visible to the
+#               daemon's scheduler; an already-up daemon whose PATH lacks
+#               the prepend is restarted so the invariant holds.
 #   status      Report the real TT daemon state — READ ONLY, no side effects.
 #   stop        Stop the real TT daemon at campaign end (hygiene). FAILS
 #               CLOSED with the DISTINCT reason `tt-daemon-down` (exit
@@ -39,6 +44,13 @@ TT_ENV_REAL="$TT_DIR/env/tt-env.sh"
 
 # The three contained real-ports (spec 01 two-daemon architecture: 43xx).
 REAL_PORTS="4334 4338 4339"
+
+# Contained adapters bin dir (S12 / E3.D US-009): prepended to the contained
+# daemon's PATH so installable harness stubs (e.g. the managed pi-token-saver)
+# are visible to the daemon's scheduler. ensure-up creates it EMPTY and
+# idempotently — an empty dir on PATH is inert (nothing to shadow). Stub
+# install/remove is tt-token-saver-stub's job, never this helper's.
+ADAPTERS_BIN_DIR="$TT_DIR/var/adapters-bin"
 
 # ── helpers ───────────────────────────────────────────────────────────
 
@@ -81,6 +93,47 @@ dc_status() {
   "$DC" real status 2>/dev/null | grep '^STATUS:' | head -n1 || true
 }
 
+# ensure_adapters_bin: create the contained adapters bin dir (empty,
+# idempotent). Never populates it — stub management is tt-token-saver-stub's
+# job. Inert when empty: PATH lookup falls through to the real binaries.
+ensure_adapters_bin() {
+  mkdir -p "$ADAPTERS_BIN_DIR"
+}
+
+# daemon_pid: the contained daemon's PID (daemon-control writes
+# <state-dir>/tamandua.pid at start).
+daemon_pid() {
+  local state_dir
+  state_dir="$(env -i bash "$TT_ENV_REAL" print 2>/dev/null | grep '^TAMANDUA_STATE_DIR=' | head -n1 | cut -d= -f2-)"
+  if [ -n "$state_dir" ] && [ -f "$state_dir/tamandua.pid" ]; then
+    cat "$state_dir/tamandua.pid" 2>/dev/null || true
+  fi
+}
+
+# daemon_path_has_adapters_bin: whether the RUNNING contained daemon's PATH
+# already carries ADAPTERS_BIN_DIR. Reads the authoritative environment of the
+# started daemon process (/proc/<pid>/environ) — same source tt-daemon-up's
+# stop hygiene already trusts.
+daemon_path_has_adapters_bin() {
+  local pid
+  pid="$(daemon_pid)"
+  if [ -z "$pid" ]; then return 1; fi
+  local env_path
+  env_path="$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep '^PATH=' | head -n1)"
+  env_path="${env_path#PATH=}"
+  case ":$env_path:" in
+    *":$ADAPTERS_BIN_DIR:"*) return 0 ;;
+  esac
+  return 1
+}
+
+# print_up: the uniform success contract of ensure-up.
+print_up() {
+  echo "TT_DAEMON: up"
+  echo "TT_DAEMON_PORT: $1"
+  echo "TT_DAEMON_PATH_PREPEND: $ADAPTERS_BIN_DIR"
+}
+
 # wait_for_daemon_up: poll (up to $1 seconds) until the real daemon reports
 # RUNNING via daemon-control AND the contained control port is listening.
 wait_for_daemon_up() {
@@ -105,32 +158,66 @@ cmd_status() {
 }
 
 cmd_ensure_up() {
+  # S12/E3.D US-009: the contained adapters bin must exist before the daemon
+  # starts (created empty, idempotent; inert when empty).
+  ensure_adapters_bin
+
   local ctrl_port
   ctrl_port="$(resolve_contained_control_port)"
   local st
   st="$(dc_status)"
 
-  # Already up -> no-op.
+  # Already up AND already carrying the adapters-bin PATH prepend -> no-op.
   if [ "$st" = "STATUS: RUNNING" ] && is_port_listening "$ctrl_port"; then
-    log "real TT daemon already UP (control port $ctrl_port) — no-op."
-    echo "TT_DAEMON: up"
-    echo "TT_DAEMON_PORT: $ctrl_port"
-    return 0
+    if daemon_path_has_adapters_bin; then
+      log "real TT daemon already UP with adapters-bin on PATH (control port $ctrl_port) — no-op."
+      print_up "$ctrl_port"
+      return 0
+    fi
+    # Up but WITHOUT the prepend (started by an older path/version): restart
+    # it so the adapter stub machinery (pi-token-saver) is actually visible.
+    log "real TT daemon UP but its PATH lacks adapters-bin — stopping to restart with the prepend."
+    local stop_rc=0
+    set +e
+    "$DC" real stop >/dev/null 2>&1
+    stop_rc=$?
+    set -e
+    log "daemon-control real stop rc=$stop_rc"
+    local settle; settle=$(($(date +%s) + 15))
+    while [ "$(date +%s)" -lt "$settle" ]; do
+      if ports_free >/dev/null 2>&1; then break; fi
+      sleep 1
+    done
+    if ! ports_free >/dev/null 2>&1; then
+      echo "REASON: tt-daemon-down" >&2
+      echo "DETAILS: daemon was up without the adapters-bin PATH prepend and could not be stopped for restart." >&2
+      echo "DC_STOP_RC: $stop_rc" >&2
+      return 1
+    fi
+    st=""
   fi
 
-  log "real TT daemon not verified up (status '${st:-unknown}') — starting via daemon-control real..."
+  log "real TT daemon not verified up (status '${st:-unknown}') — starting via daemon-control real with PATH prepend $ADAPTERS_BIN_DIR..."
   local start_rc=0
   set +e
-  "$DC" real start >/dev/null 2>&1
+  PATH="$ADAPTERS_BIN_DIR:$PATH" "$DC" real start >/dev/null 2>&1
   start_rc=$?
   set -e
   log "daemon-control real start rc=$start_rc"
 
   if wait_for_daemon_up 40 "$ctrl_port"; then
-    log "real TT daemon started and verified UP on control port $ctrl_port."
-    echo "TT_DAEMON: up"
-    echo "TT_DAEMON_PORT: $ctrl_port"
-    return 0
+    # US-009: success requires the prepend to actually land on the daemon's
+    # PATH — verify against the started daemon's real environment.
+    if daemon_path_has_adapters_bin; then
+      log "real TT daemon started and verified UP with adapters-bin on PATH (control port $ctrl_port)."
+      print_up "$ctrl_port"
+      return 0
+    fi
+    echo "REASON: tt-daemon-down" >&2
+    echo "DETAILS: contained daemon came up but its PATH lacks the adapters-bin prepend ($ADAPTERS_BIN_DIR)." >&2
+    echo "DC_START_RC: $start_rc" >&2
+    log "FAIL: daemon came up without adapters-bin on PATH." >&2
+    return 1
   fi
 
   # ── FAIL CLOSED: daemon could not be brought up/verified ──────────
@@ -213,7 +300,10 @@ Subcommands:
   ensure-up   Verify the real TT daemon is up (contained control port 4339);
               start it if absent. Idempotent. FAILS CLOSED with the distinct
               reason 'tt-daemon-down' (exit non-zero) if it cannot be brought
-              up/verified.
+              up/verified. Also creates var/adapters-bin (empty, idempotent)
+              and starts the daemon with it prepended to PATH (S12/E3.D
+              US-009); an already-up daemon whose PATH lacks the prepend is
+              restarted so the invariant holds.
   status      Report the real TT daemon state — read only, no side effects.
   stop        Stop the real TT daemon at campaign end (hygiene). FAILS CLOSED
               with the distinct reason 'tt-daemon-down' (exit non-zero) if a
@@ -229,6 +319,8 @@ Examples:
 
 Fail-closed: every successful path prints 'TT_DAEMON: up'/'TT_DAEMON: down';
 every failure prints 'REASON: tt-daemon-down' on stderr and exits non-zero.
+A successful ensure-up additionally prints 'TT_DAEMON_PATH_PREPEND: <path>'
+(the contained adapters bin dir prepended to the daemon's PATH).
 EOF
 }
 

@@ -86,6 +86,31 @@ async function assertPortsFree(): Promise<void> {
   }
 }
 
+// US-012 (S-integration): the bare gate must never start a contained real
+// daemon (43xx) nor touch the live instance ports (33xx). Snapshot the
+// listener set for both port families so a before/after comparison proves the
+// gate introduced NO new listener — 33xx may legitimately be pre-occupied by
+// the live tamandua daemon, so the assertion is set-equality, not emptiness.
+const GATE_WATCHED_PORTS = [4334, 4338, 4339, 3334, 3338, 3339];
+
+async function listenerSnapshot(ports: number[]): Promise<Set<number>> {
+  const listening = new Set<number>();
+  for (const port of ports) {
+    const held = await new Promise<boolean>((resolve) => {
+      const probe = net.createServer();
+      probe.once("error", () => resolve(true));
+      probe.listen(port, "127.0.0.1", () => {
+        probe.close((error) => {
+          if (error) resolve(true);
+          resolve(false);
+        });
+      });
+    });
+    if (held) listening.add(port);
+  }
+  return listening;
+}
+
 // Tier-1 real case ids are those whose manifest record declares real (model-backed)
 // execution. They must be reported pending-real in bare mode.
 function realCaseIds(): string[] {
@@ -187,9 +212,23 @@ describe("Tier-1 bare proof test (US-007)", () => {
       assert.equal(validation.status, 0, `${validation.stdout}\n${validation.stderr}`);
       assert.match(validation.stdout, /Validated 28 case\(s\)/);
 
+      // US-012: pin the 43xx/33xx acceptance clause — the two bare runs must
+      // leave the contained-real (43xx) and live-instance (33xx) listener sets
+      // exactly as they were before the gate started. 43xx must additionally be
+      // FREE here (the gate never starts a real daemon in bare mode).
+      const gateListenersBefore = await listenerSnapshot(GATE_WATCHED_PORTS);
+      for (const port of [4334, 4338, 4339]) {
+        assert.ok(!gateListenersBefore.has(port),
+          `contained real-daemon port ${port} must be free before the bare gate`);
+      }
+
       // Sequential: both bare runs drive the same scripted daemon ports, so they
       // must not overlap.
       await assertBareTier1Run(1);
+      assert.deepEqual(await listenerSnapshot(GATE_WATCHED_PORTS), gateListenersBefore,
+        "run 1 introduced a new 43xx/33xx listener");
       await assertBareTier1Run(2);
+      assert.deepEqual(await listenerSnapshot(GATE_WATCHED_PORTS), gateListenersBefore,
+        "run 2 introduced a new 43xx/33xx listener");
     });
 });

@@ -64,6 +64,129 @@ Key factors:
 **Wave 1 count:** 10 (spec-estimated ~8; TSTX replay added 2 beyond the
 per-language matrix).
 
+### Wave 1 — Replay Pairing (`context.replay_of`, S9 authoring)
+
+The two Wave-1 REPLAY cases are **replay-pair bound** to their paired
+probe cases via `context.replay_of`, implementing the spec's cross-cutting
+`TSTX cross-run replay` check (`05-wave-1-language-smoke.md`): relaunch
+W1.L2 with an **unchanged tree**; the suite must *replay*
+(`TAMANDUA-TEST CACHED`, ledger row reuse) rather than re-execute.
+
+| Replay case | `context.replay_of` | Pair |
+|-------------|---------------------|------|
+| W1.REPLAY-python | `W1.L2-python` | W1.L2-python |
+| W1.REPLAY-ts | `W1.L2-ts` | W1.L2-ts |
+
+**The `replay_of` contract** (authoritative for every replay case ever
+added to a tier manifest):
+
+1. **Same clone, same tree:** a replay case MUST reuse its pair's work
+   clone — same `origin_repo`, same committed tree (`HEAD^{tree}`
+   byte-identical). No wipe/re-clone/provision of its own; the pair's
+   tree persists unchanged into the replay attempt (TSTX's
+   origin-scoped contract: ledger rows are keyed per `origin_repo`,
+   and a fresh clone or re-provision would normalize to a different
+   origin identity and test nothing — see `08-wave-4-fault-injection.md`
+   W4.28's construction note and its 'zero cross-repo replay' gate).
+2. **Sequenced after the pair:** a replay case MUST NOT launch before
+   its pair reaches terminal (the pair's post-harvest state — clone,
+   ledger — is the replay's input).
+3. **Cache-HIT assertion:** the replay outcome MUST assert a shim cache
+   HIT — the shim observation must show `lookup->cache_hit` (a
+   `TAMANDUA-TEST CACHED` replay bound to the pair's origin/tree/cmd
+   key), never a silent re-execute (`execute`/`record`). A missing
+   observation or a miss is a named finding (`replay-cache-miss`),
+   never a PASS.
+
+`replay_of` is **controller-internal wiring**: it must be excluded
+from the product `--context` passthrough (like `execution_mode`) and
+never be seen by the workflow — the exclusion is enforced by the S9
+controller story (US-005). Only the two REPLAY lines carry it today;
+it is optional and documented in `case.schema.json`
+(`context.replay_of`).
+
+**Controller enforcement (S9, US-005):** the controller implements the
+contract mechanically.
+
+- **Same clone, no re-provision:** a replay attempt skips its own
+  fixture work-clone provisioning entirely (no wipe/re-clone) and
+  launches with `--working-directory-for-harness` bound to the pair's
+  clone (`var/fixtures/work/<pair-id>/<fixture>`); the resolved
+  provenance (pair id, clone path, pair terminal status) is recorded on
+  the attempt (`replay_provenance`).
+- **Clone persistence:** a case named as another case's `replay_of`
+  keeps its clone at terminalization even on PASS (teardown outcome
+  `REPLAY_PAIR_KEEP`, keep_reason `replay-pair-clone-shared`); a replay
+  case's own teardown never touches the pair's clone.
+- **Sequencing:** a replay whose pair is not terminal waits
+  (bounded by the pair's own wall deadline + settle margin; test seam
+  `TT_CONTROLLER_REPLAY_PAIR_WAIT_MS`) and, if the pair still has not
+  reached terminal, fails closed with the distinct
+  `replay-pair-not-terminal` category — never a silent half-launch.
+  A missing pair (`replay-pair-missing`), a fixture mismatch
+  (`replay-pair-fixture-mismatch`), or a terminal pair whose shared
+  clone is gone (`replay-pair-clone-missing`) also fail closed with
+  their own distinct categories.
+- `replay_of` never appears in the launch argv (`--context` exclusion,
+  like `execution_mode`).
+
+**Controller enforcement (S9, US-006):** after terminal harvest (fresh or
+resumed), the controller reads the attempt's oracle-evidence snapshot and
+mechanically asserts the cache HIT:
+
+- **Hit:** a suite observation for the attempt's own run with a
+  cache-hit/replay phase bound to the pair's origin/tree/cmd key (the
+  launch-intent gate key captured over the pair's clone + the pair's
+  committed `HEAD^{tree}`). The assertion evidence is recorded on the
+  attempt (`replay_cache_assertion`) and the verdict is unchanged.
+- **Miss:** no such observation (or `execute`/`record` instead) is never a
+  silent PASS — the case carries the named `REPLAY_CACHE_MISS` finding with
+  the observed phases, and a would-be PASS is classified INCONCLUSIVE with
+  reason category `replay-cache-miss`.
+- **Fail closed:** a malformed, incomplete, or missing snapshot is
+  TEST_INFRA (`replay-snapshot-missing` / `replay-snapshot-incomplete` /
+  `replay-snapshot-unreadable`), never PASS.
+- A replay attempt's snapshot binds to the PAIR's clone
+  (`attempt.fixture_work_clone`) so the gate key is the pair's origin
+  identity; the replay's own clone path is never provisioned.
+- Test seam: `TT_CONTROLLER_REPLAY_SNAPSHOT_FIXTURE_DIR` (requires
+  `TT_CONTROLLER_SELF_TEST=1`) redirects the gate's snapshot read to a
+  caller-seeded tree beneath `torture-test/var` for hit/miss/malformed
+  fixture tests.
+
+## Case-Authoring Conventions (`context.test_cmd`, S10)
+
+`context.test_cmd` is the EXACT test-suite command for a case. It is
+rendered verbatim into the `tt-shim-probe` step input (`TEST_CMD:
+{{test_cmd}}`) and wrapped EXACTLY once by the scheduler's TSTX shim
+(`tamandua-test`). The conventions below are authoritative for every
+case that carries a `test_cmd`:
+
+- **Python fixtures (`tt-python`, `tt-python@master`):** `test_cmd` MUST
+  use the explicit `.venv/bin/pytest -q` form. The fixture's committed
+  `bootstrap` script creates `.venv` at provisioning (prebootstrapped
+  arming), so the explicit path always resolves. NEVER a bare `pytest -q`
+  (the shim's spawn env does NOT put `.venv/bin` on PATH — no PATH magic)
+  and never `python3 -m pytest` or any other variant. This is the SAME
+  convention the tt-poly fixtures already document as their TEST_CMD, and
+  it matches E3.A's S1 choice for all python-fixture lines
+  (W1.L1/L2/L3/M1-python).
+- **TypeScript fixtures (`tt-ts`):** `npm test` (the fixture's package.json
+  test script).
+- **tt-poly-lite:** `./run-all-tests`.
+- **REPLAY lines:** `test_cmd` MUST match the paired probe case's
+  `test_cmd` verbatim. The TSTX cache key is
+  (origin_repo, tree_hash, cmd_hash); a diverging command makes the
+  cross-run cache HIT unreachable. For the python pair that means
+  W1.REPLAY-python carries `.venv/bin/pytest -q` exactly like
+  W1.L2-python; for the ts pair both lines carry `npm test`.
+
+The convention is mechanically enforced for the E3.D-owned python lines
+by `self-tests/tier1-python-shim-convention.test.ts`, and the shim's
+ledger-recording path for a direct `.venv/bin/pytest -q` invocation over
+a provisioned tt-python clone is proven zero-token by
+`self-tests/tier1-python-shim-ledger-proof.test.ts`.
+
 ### Wave 2 — Workflow Coverage Edge Cases (`06-wave-2-workflow-coverage.md`)
 
 | Case ID | spec_ref | Fixture | Harness | Workflow | Mode |
@@ -74,6 +197,24 @@ per-language matrix).
 | W2.23b-retry-step | `#W2.23b` | none | local | local | scripted |
 | W2.23c-missing-persona | `#W2.23c` | none | local | local | scripted |
 | W2.24-docs-drift | `#W2.24` | tt-ts | pi | local | real |
+
+**W2.24 local sentinel — launch adapter contract (S11 / US-008):**
+W2.24's `workflow: local` is a SENTINEL, not a real workflow id — there is no
+`local` workflow in any catalog. The controller's local-sentinel launch
+adapter resolves it: the supported shape (workflow `local` + harness `pi`)
+resolves to the shipped TT-custom spec `tt-docs-drift`
+(`torture-test/workflows/tt-docs-drift/`, the docs/creating-workflows.md
+Complete Example extracted verbatim — see the docs-drift fidelity contract in
+`self-tests/tier1-tt-docs-drift-spec.test.ts`). The adapter ensures the spec
+is installed in the contained TT home (tt-catalog-install /
+tt-required-workflows seam; a missing spec fails closed with the distinct
+`catalog-missing: tt-docs-drift` reason) and then launches
+`workflow run tt-docs-drift --pi-as-harness ...`. Any OTHER sentinel profile
+(workflow `local` + a harness other than pi) fails closed with the distinct
+`local-sentinel-unsupported` reason. The literal argv `workflow run local` is
+never constructed or executed; adapter evidence (sentinel profile, resolved
+workflow id, install outcome) is recorded on the attempt as
+`attempt.sentinel_adapter`.
 
 **Wave 2 count:** 6 (all T1-marked scenarios in the edge/authoring table;
 the 20-workflow matrix W2.01–W2.20 is entirely Tier-2).
@@ -102,6 +243,52 @@ match spec numbering one-to-one. The spec's matrix cells are W3.01–05
 (bfmw × pi × 5 langs), W3.06–07 (bfmw × hermes × 2 langs), W3.11–13
 (fdmw × pi × 3 langs). Manifest uses compressed numbering (W3.01–W3.04).
 The `spec_ref` field is the authoritative cross-reference.
+
+### Wave 3 — Token-saver Paired Launch (`context.token_saver_control`, S12 controller)
+
+W3.23-token-saver (spec 07-wave-3 §W3.23) is the token-saver lifecycle
+probe. It is executed by the controller as **TWO do-now launches** against
+the SAME provisioned clone — the paired-launch adapter (E3.D US-010):
+
+- **Run A (flagged):** the managed `pi-token-saver` stub
+  (bin/tt-token-saver-stub, US-009) is installed into
+  `torture-test/var/adapters-bin` (the dir `tt-daemon-up ensure-up`
+  prepends to the contained daemon PATH) and
+  `--no-hurry-please-save-tokens-mode` is appended to the launch argv.
+  The product scheduler then prefers the stub for every work spawn of the
+  no-hurry run; each invocation appends one JSON record to the attempt's
+  evidence log before exec'ing the real pi.
+- **Run B (control):** the stub is removed first, and the run launches
+  WITHOUT the flag. A healthy control produces zero new stub records.
+
+The stub exists on the contained daemon's PATH **only during the flagged
+launch window**; the controller verifies the canonical stub target's
+presence/absence after each install/remove and fails closed
+(`token-saver-stub-install-failed` / `token-saver-stub-remove-failed` /
+`token-saver-stub-missing-after-install` / `token-saver-stub-present-after-remove`)
+if the window invariant does not hold.
+
+**Evidence contract:** `attempt.token_saver` carries per run the exact
+launch argv, the resolved run id, the token-ledger observations attributed
+to that run, and the stub-record count observed in that run's window (the
+attempt-level token ledger still aggregates both runs for the per-case
+token cap — W3.23's caps are sized for two launches). The contract is
+mechanical: **zero stub records on the flagged run OR any stub records on
+the control run yields the distinct `token-saver-contract` case finding
+and the case is INCONCLUSIVE — never a silent PASS.** A satisfied contract
+classifies the pair by the run terminal statuses + oracles exactly like a
+single run.
+
+**Wiring rules:** `token_saver_control` is controller-internal wiring — it
+is excluded from the product `--context` passthrough (like `execution_mode`
+and `replay_of`), and `--no-hurry-please-save-tokens-mode` is appended
+ONLY for the flagged launch of a token-saver case. A scripted case carrying
+the signal fails closed with `token-saver-scripted-unsupported`; an
+interrupted paired attempt fails closed on recovery with
+`token-saver-recovery-unsupported` (rerun the case to re-drive both
+launches). The zero-token dry-run hook (`TT_DRY_RUN_REAL_LAUNCH`) records
+BOTH argvs with `launch_role` `flagged`/`control` and never installs or
+removes the stub.
 
 ---
 
@@ -477,6 +664,20 @@ Exit codes: `0` policy applied (decision recorded); `2` usage error / caller bug
 ## Validation Status
 
 - ✅ `tt-controller --manifest cases/tier1.jsonl --validate-only` exits 0
+- ✅ Replay pairing (S9): W1.REPLAY-python declares `context.replay_of`
+  `W1.L2-python` and W1.REPLAY-ts declares `W1.L2-ts`; both pair ids
+  resolve to existing manifest cases; only the two REPLAY lines carry
+  `replay_of`; the contract (same origin/tree, sequenced after pair,
+  cache-HIT assertion) is documented in the Wave-1 Replay Pairing
+  section above and in `case.schema.json` `context.replay_of`
+- ✅ Replay provisioning + sequencing (S9, US-005): controller wired —
+  replay attempts reuse the pair's clone (no own provisioning),
+  pair clones are kept at terminalization (`REPLAY_PAIR_KEEP`),
+  non-terminal/missing/mismatched pairs fail closed with distinct
+  categories (`replay-pair-not-terminal` / `replay-pair-clone-missing` /
+  `replay-pair-missing` / `replay-pair-fixture-mismatch`), and
+  `replay_of` is excluded from the product `--context` passthrough
+  (pinned by `tier1-replay-provisioning-sequencing.test.ts`)
 - ✅ `tt-tier1-assets cases/tier1.jsonl` exits 0
 - ✅ All 28 cases schema-valid
 - ✅ All task files exist and are non-empty
@@ -554,3 +755,27 @@ Exit codes: `0` policy applied (decision recorded); `2` usage error / caller bug
   controller/recorder/daemon/hook/scenario processes. The US-008 tamandua
   observations are recorded as collected findings (no product fix) in
   `impl-tasks/E2.3-fixture-work-clone-provisioning.md` §Findings.
+- ✅ Token-saver paired-launch adapter (S12, US-010): W3.23 executes as two
+  do-now launches (flagged with the managed stub + `--no-hurry-please-save-tokens-mode`,
+  control without either); `attempt.token_saver` carries both runs' argv, run
+  ids, per-run token-ledger observations, and stub-record counts; the
+  `token-saver-contract` finding fires on a flagged-zero or control-stray stub
+  record pattern (never a silent PASS); `token_saver_control` never reaches the
+  product `--context` argv and the flag never reaches a non-token-saver case;
+  scripted carriers fail closed (`token-saver-scripted-unsupported`) and
+  interrupted pairs fail closed on recovery (`token-saver-recovery-unsupported`);
+  the dry-run hook records both argvs (`launch_role` flagged/control). Pinned by
+  `self-tests/tier1-token-saver-launch-adapter.test.ts` (see the Wave 3 section
+  above).
+- ✅ Python shim PATH convention (S10, US-011): every python-fixture
+  `context.test_cmd` uses the explicit `.venv/bin/pytest -q` form (no PATH
+  magic — documented in the Case-Authoring Conventions section above).
+  W1.REPLAY-python now carries `.venv/bin/pytest -q` (matching its pair
+  W1.L2-python, so the replay cmd key stays reachable); the ts pair keeps
+  `npm test` on both lines. Pinned by
+  `self-tests/tier1-python-shim-convention.test.ts` (convention + bare-pytest
+  rejection + manifest validation) and
+  `self-tests/tier1-python-shim-ledger-proof.test.ts` (zero-token proof: a
+  provisioned tt-python clone runs `.venv/bin/pytest -q` through the product
+  `tamandua-test` shim, which records a `suite_results` ledger row with
+  exit_code 0 under the contained TT state — no pi, no daemon, no tokens).

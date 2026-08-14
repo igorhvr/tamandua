@@ -1,0 +1,278 @@
+#!/usr/bin/env bash
+# tt-token-saver-stub — manage the contained pi-token-saver PATH stub
+# (S12 / E3.D US-009).
+#
+# The W3.23 token-saver lifecycle probe requires a contained `pi-token-saver`
+# on the CONTAINED daemon's PATH (see tt-daemon-up: var/adapters-bin is
+# prepended to the daemon PATH). Product tamandua's no-hurry runs prefer
+# pi-token-saver over plain pi when it is found on PATH
+# (src/installer/harness-adapter.ts findBinary) — this helper ONLY manages the
+# stub; it never touches product plumbing or the product flag.
+#
+# The installed stub appends ONE JSON invocation record per invocation —
+# {"ts","pid","argv0","argv","resolved_pi"} — to a caller-named evidence log,
+# then runs the REAL pi (resolved via TAMANDUA_PI_BINARY first, then `pi` on
+# PATH) with the same arguments, passing through its exit code and
+# termination signal. Evidence logging can never break the round: a failed
+# append is reported on stderr and execution continues.
+#
+# Subcommands:
+#   install   Write the managed stub into torture-test/var/adapters-bin/
+#             (idempotent re-install updates the embedded evidence log).
+#             REQUIRES --evidence-log <path>: the log the stub appends
+#             invocation records to (parent dir is created; the path is
+#             canonicalized to absolute at install time). FAILS CLOSED with
+#             the distinct reason `foreign-stub-refusing-install` if the
+#             target exists and is NOT the managed stub.
+#   remove    Delete the stub ONLY when it is the managed stub. FAILS CLOSED
+#             with the distinct reason `foreign-stub-refusing-remove` if the
+#             target exists and is NOT the managed stub. Absent stub is a
+#             no-op success.
+#
+# Never mutates the caller's environment; the stub lives under
+# torture-test/var/adapters-bin (gitignored); records go only to the
+# caller-named evidence log.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TT_DIR="$(dirname "$SCRIPT_DIR")"                        # torture-test/
+ADAPTERS_BIN_DIR="$TT_DIR/var/adapters-bin"
+STUB_PATH="$ADAPTERS_BIN_DIR/pi-token-saver"
+# Managed marker: the ONLY content this helper will ever install or remove.
+# install/remove grep for this exact substring; anything else at the target
+# path is FOREIGN and is never touched.
+MANAGED_MARKER='tt-managed pi-token-saver stub'
+
+# ── helpers ───────────────────────────────────────────────────────────
+
+log() { printf '[tt-token-saver-stub] %s\n' "$*"; }
+
+ensure_adapters_bin() { mkdir -p "$ADAPTERS_BIN_DIR"; }
+
+# json_string_literal: quote $1 as a JS string literal (JSON.stringify output
+# is exactly a valid JS string literal — the safe way to embed the caller's
+# path into the generated stub).
+json_string_literal() {
+  node -e 'process.stdout.write(JSON.stringify(process.argv[1] === undefined ? "" : process.argv[1]))' "$1"
+}
+
+# is_managed_stub: whether $1 is the managed stub (content marker match).
+is_managed_stub() {
+  [ -f "$1" ] && grep -aqF "$MANAGED_MARKER" "$1" 2>/dev/null
+}
+
+# canonicalize_log_path: absolute path for the evidence log, creating its
+# parent directory so the daemon-side stub append never hits a missing dir.
+canonicalize_log_path() {
+  local raw="$1"
+  mkdir -p "$(dirname "$raw")"
+  printf '%s' "$(cd "$(dirname "$raw")" && pwd)/$(basename "$raw")"
+}
+
+# write_stub: emit the managed stub with the evidence log embedded. The
+# generated stub is a self-contained node script (node >= 22 is a suite-wide
+# requirement): append record -> resolve real pi -> spawn with inherited
+# stdio -> pass through exit code/signal.
+write_stub() {
+  local stub_path="$1"
+  local evidence_log="$2"
+  local log_lit
+  log_lit="$(json_string_literal "$evidence_log")"
+  cat > "$stub_path" <<EOF
+#!/usr/bin/env node
+"use strict";
+// tt-managed pi-token-saver stub (bin/tt-token-saver-stub) — do not edit.
+const EVIDENCE_LOG = $log_lit;
+EOF
+  cat >> "$stub_path" <<'STUB_EOF'
+// The stub is parsed as an ES module (repo package.json "type": "module"
+// applies to extensionless files too), so it uses import syntax only.
+import fs from "node:fs";
+import { spawnSync } from "node:child_process";
+import path from "node:path";
+
+// Resolve the REAL pi: TAMANDUA_PI_BINARY first, then `pi` on PATH.
+function findOnPath(name, dirs) {
+  for (const dir of dirs) {
+    if (!dir) continue;
+    const candidate = path.join(dir, name);
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return candidate;
+    } catch (error) {
+      // keep looking
+    }
+  }
+  return null;
+}
+
+const envPi = process.env.TAMANDUA_PI_BINARY;
+let realPi = null;
+if (typeof envPi === "string" && envPi.trim() !== "") {
+  realPi = envPi;
+} else {
+  realPi = findOnPath("pi", String(process.env.PATH ?? "").split(":"));
+}
+if (realPi === null) {
+  process.stderr.write("pi-token-saver (tt-managed stub): real pi not found (TAMANDUA_PI_BINARY unset and no pi on PATH)\n");
+  process.exit(127);
+}
+
+const record = {
+  ts: new Date().toISOString(),
+  pid: process.pid,
+  argv0: process.argv[1] === undefined ? null : process.argv[1],
+  argv: process.argv.slice(2),
+  resolved_pi: realPi,
+};
+try {
+  fs.appendFileSync(EVIDENCE_LOG, JSON.stringify(record) + "\n");
+} catch (error) {
+  // Evidence logging must never break the round: report and continue.
+  process.stderr.write("pi-token-saver (tt-managed stub): evidence log append failed: " + error.message + "\n");
+}
+
+const result = spawnSync(realPi, process.argv.slice(2), {
+  stdio: "inherit",
+  env: process.env,
+});
+if (result.error) {
+  process.stderr.write("pi-token-saver (tt-managed stub): failed to run real pi: " + result.error.message + "\n");
+  process.exit(127);
+}
+if (result.signal) {
+  // Pass the terminating signal through so callers observe the same death.
+  process.kill(process.pid, result.signal);
+  setTimeout(function () {}, 5000);
+}
+process.exit(result.status === null ? 0 : result.status);
+STUB_EOF
+  chmod +x "$stub_path"
+}
+
+# ── subcommands ───────────────────────────────────────────────────────
+
+cmd_install() {
+  ensure_adapters_bin
+  if [ -e "$STUB_PATH" ] || [ -L "$STUB_PATH" ]; then
+    if is_managed_stub "$STUB_PATH"; then
+      log "existing managed stub found — re-installing with the new evidence log."
+    else
+      echo "REASON: foreign-stub-refusing-install" >&2
+      echo "DETAILS: $STUB_PATH exists and is NOT the managed stub — refusing to overwrite it." >&2
+      return 1
+    fi
+  fi
+  write_stub "$STUB_PATH" "$EVIDENCE_LOG"
+  log "managed pi-token-saver stub installed."
+  echo "TT_TOKEN_SAVER_STUB: installed"
+  echo "TT_TOKEN_SAVER_STUB_PATH: $STUB_PATH"
+  echo "TT_TOKEN_SAVER_EVIDENCE_LOG: $EVIDENCE_LOG"
+  return 0
+}
+
+cmd_remove() {
+  if [ ! -e "$STUB_PATH" ] && [ ! -L "$STUB_PATH" ]; then
+    log "no stub present — nothing to remove."
+    echo "TT_TOKEN_SAVER_STUB: absent"
+    return 0
+  fi
+  if ! is_managed_stub "$STUB_PATH"; then
+    echo "REASON: foreign-stub-refusing-remove" >&2
+    echo "DETAILS: $STUB_PATH exists and is NOT the managed stub — refusing to delete it." >&2
+    return 1
+  fi
+  rm -f -- "$STUB_PATH"
+  log "managed pi-token-saver stub removed."
+  echo "TT_TOKEN_SAVER_STUB: removed"
+  return 0
+}
+
+# ── usage / dispatch ─────────────────────────────────────────────────
+
+usage() {
+  cat <<'EOF'
+tt-token-saver-stub — managed pi-token-saver PATH stub for the W3.23 probe
+(S12 / E3.D US-009).
+
+Usage: tt-token-saver-stub <install|remove> [--help]
+
+Subcommands:
+  install --evidence-log <path>
+              Write the managed pi-token-saver stub into
+              torture-test/var/adapters-bin/ (idempotent). The stub appends
+              one JSON invocation record {ts,pid,argv0,argv,resolved_pi} per
+              invocation to the evidence log, then runs the REAL pi
+              (TAMANDUA_PI_BINARY first, then `pi` on PATH) with the same
+              arguments and pass-through exit code/signal. FAILS CLOSED with
+              the distinct reason 'foreign-stub-refusing-install' if the
+              target exists and is NOT the managed stub.
+  remove      Delete the stub ONLY when it is the managed stub. Absent stub
+              is a no-op success. FAILS CLOSED with the distinct reason
+              'foreign-stub-refusing-remove' if the target exists and is NOT
+              the managed stub.
+  --help,-h   Show this help.
+
+Options:
+  --evidence-log <path>  (install only, REQUIRED) caller-named evidence log
+              the stub appends invocation records to. Parent dir is created;
+              the path is canonicalized to absolute at install time.
+
+Examples:
+  tt-token-saver-stub install --evidence-log var/results/token-saver/evidence.jsonl
+  tt-token-saver-stub remove
+
+Fail-closed: install/remove never touch a file that is not the managed stub;
+every failure prints 'REASON: <distinct-reason>' on stderr and exits non-zero.
+EOF
+}
+
+EVIDENCE_LOG=""
+ACTION="${1:-}"
+case "$ACTION" in
+  --help|-h)
+    usage
+    exit 0
+    ;;
+  install)
+    shift
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --evidence-log)
+          if [ "$#" -lt 2 ]; then
+            echo "tt-token-saver-stub: --evidence-log requires a path argument." >&2
+            exit 2
+          fi
+          EVIDENCE_LOG="$2"
+          shift 2
+          ;;
+        --evidence-log=*)
+          EVIDENCE_LOG="${1#--evidence-log=}"
+          shift
+          ;;
+        *)
+          echo "tt-token-saver-stub: unknown install option '$1'." >&2
+          echo "Usage: tt-token-saver-stub install --evidence-log <path>" >&2
+          exit 2
+          ;;
+      esac
+    done
+    if [ -z "$EVIDENCE_LOG" ]; then
+      echo "tt-token-saver-stub: install requires --evidence-log <path>." >&2
+      echo "Usage: tt-token-saver-stub install --evidence-log <path>" >&2
+      exit 2
+    fi
+    EVIDENCE_LOG="$(canonicalize_log_path "$EVIDENCE_LOG")"
+    cmd_install
+    exit $?
+    ;;
+  remove)
+    cmd_remove
+    exit $?
+    ;;
+  *)
+    echo "tt-token-saver-stub: unknown/invalid action '$ACTION'." >&2
+    echo "Usage: tt-token-saver-stub <install|remove> [--help]" >&2
+    exit 2
+    ;;
+esac

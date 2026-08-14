@@ -92,7 +92,11 @@ describe("tt-shim-probe TT-custom workflow spec", () => {
     );
   });
 
-  it("does not create a 'local' workflow spec (W2.24 references the scripted local harness)", () => {
+  it("does not create a 'local' workflow spec (W2.24's 'local' workflow is the sentinel resolved to tt-docs-drift)", () => {
+    // W2.24-docs-drift carries workflow `local` + harness `pi` in the
+    // manifest; tt-required-workflows maps that sentinel to tt-docs-drift
+    // (the shipped docs-drift spec — see tier1-tt-docs-drift-spec.test.ts).
+    // No installable spec literally named 'local' may ever exist.
     assert.ok(!existsSync(join(workflowsSrcRoot, "local")), "no 'local' TT-custom workflow should exist");
   });
 

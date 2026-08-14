@@ -87,6 +87,13 @@ if [ -f "$TT_VAR/home/.tamandua/workflows/tt-shim-probe/workflow.yml" ]; then
 else
   fail "AC6a tt-shim-probe workflow.yml missing after install"
 fi
+# US-007 sentinel: tt-required-workflows maps W2.24's workflow 'local' to
+# tt-docs-drift, so the custom install must ship it alongside tt-shim-probe.
+if [ -f "$TT_VAR/home/.tamandua/workflows/tt-docs-drift/workflow.yml" ]; then
+  ok "AC6a-US-007 tt-docs-drift workflow.yml installed into contained home"
+else
+  fail "AC6a-US-007 tt-docs-drift workflow.yml missing after install"
+fi
 if [ -f "$CUSTOM_STAMP" ]; then
   CUSTOM_VER="$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\(.*\)",\?$/\1/p' "$CUSTOM_STAMP" | head -n1)"
   if [ "$CUSTOM_VER" = "$CUR_BUILD" ]; then

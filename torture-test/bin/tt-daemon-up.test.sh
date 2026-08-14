@@ -10,6 +10,11 @@
 #        distinct reason tt-daemon-down
 #   AC4. after stop, no daemon/process remains and ports 43xx are free
 #   AC5. never touches the operator's 33xx ports or ~/.tamandua
+#   AC6. (S12/E3.D US-009) ensure-up creates var/adapters-bin (empty,
+#        idempotent), reports TT_DAEMON_PATH_PREPEND, and the started
+#        daemon's real environment carries adapters-bin on PATH; an
+#        already-up daemon whose PATH lacks the prepend is RESTARTED with
+#        it (verified by PID change + new environ)
 #
 # Standalone: bash torture-test/bin/tt-daemon-up.test.sh
 # Not part of `npm test`.
@@ -94,7 +99,9 @@ else
 fi
 
 # ── AC2: ensure-up starts the real daemon and reports it up on 4339 ──
+set +e
 ENSURE_OUT="$("$HELPER" ensure-up 2>&1)"; ENSURE_RC=$?
+set -e
 if [ "$ENSURE_RC" -eq 0 ]; then
   ok "AC2 ensure-up with daemon down exits 0"
 else
@@ -125,12 +132,94 @@ if [ -f "$PROV_FILE" ] && command -v jq >/dev/null 2>&1; then
   STARTED_PID="$(jq -r '.pid // ""' "$PROV_FILE" 2>/dev/null || true)"
 fi
 
+# ── AC6 (US-009): adapters-bin on the contained daemon PATH ─────────
+ADAPTERS_BIN_DIR="$TT_REPO_ROOT/torture-test/var/adapters-bin"
+if echo "$ENSURE_OUT" | grep -q "TT_DAEMON_PATH_PREPEND: $ADAPTERS_BIN_DIR"; then
+  ok "AC6 ensure-up reports TT_DAEMON_PATH_PREPEND pointing at var/adapters-bin"
+else
+  fail "AC6 missing/correct TT_DAEMON_PATH_PREPEND line"
+  echo "$ENSURE_OUT" | grep -E 'TT_DAEMON' || true
+fi
+if [ -d "$ADAPTERS_BIN_DIR" ] && [ -z "$(ls -A "$ADAPTERS_BIN_DIR" 2>/dev/null)" ]; then
+  ok "AC6 adapters-bin exists and is EMPTY after preflight (inert when empty)"
+else
+  fail "AC6 adapters-bin missing or not empty"
+fi
+if [ -n "$STARTED_PID" ] && [ "$STARTED_PID" -gt 0 ] 2>/dev/null && [ -d "/proc/$STARTED_PID" ]; then
+  DAEMON_PATH="$(tr '\0' '\n' < "/proc/$STARTED_PID/environ" 2>/dev/null | grep '^PATH=' | head -n1 | cut -d= -f2-)"
+  case ":$DAEMON_PATH:" in
+    *":$ADAPTERS_BIN_DIR:"*)
+      ok "AC6 running daemon's real environment carries adapters-bin on PATH" ;;
+    *)
+      fail "AC6 running daemon PATH lacks adapters-bin: ${DAEMON_PATH:0:200}" ;;
+  esac
+else
+  fail "AC6 cannot inspect daemon environ (no PID / no /proc)"
+fi
+
 # ── AC2(idempotence): second ensure-up is a no-op (no re-start) ─────
 IDEM_OUT="$("$HELPER" ensure-up 2>&1)"; IDEM_RC=$?
 if [ "$IDEM_RC" -eq 0 ] && echo "$IDEM_OUT" | grep -q "already UP"; then
   ok "AC2 second ensure-up is an idempotent no-op (already up)"
 else
   fail "AC2 second ensure-up not idempotent (rc=$IDEM_RC)"
+fi
+if echo "$IDEM_OUT" | grep -q "TT_DAEMON_PATH_PREPEND: $ADAPTERS_BIN_DIR"; then
+  ok "AC6 idempotent no-op still reports the PATH prepend seam"
+else
+  fail "AC6 idempotent no-op missing TT_DAEMON_PATH_PREPEND"
+fi
+
+# ── AC6b: an already-up daemon WITHOUT the prepend gets restarted ────
+# Stop the prepended daemon, start one DIRECTLY via daemon-control (no
+# prepend — daemon-control composes PATH from its own env), then ensure-up
+# must detect the missing prepend and restart the daemon with it.
+set +e
+"$DC" real stop >/dev/null 2>&1
+sleep 1
+"$DC" real start >/dev/null 2>&1
+DIRECT_START_RC=$?
+set -e
+if [ "$DIRECT_START_RC" -eq 0 ]; then ok "AC6b direct daemon-control start (no prepend) exits 0"; else fail "AC6b direct start rc=$DIRECT_START_RC"; fi
+STATE_DIR_LINE="$(env -i bash "$TT_REPO_ROOT/torture-test/env/tt-env.sh" print 2>/dev/null | grep '^TAMANDUA_STATE_DIR=' | head -n1)"
+STATE_DIR="${STATE_DIR_LINE#TAMANDUA_STATE_DIR=}"
+DIRECT_PID=""
+if [ -n "$STATE_DIR" ] && [ -f "$STATE_DIR/tamandua.pid" ]; then
+  DIRECT_PID="$(cat "$STATE_DIR/tamandua.pid")"
+fi
+if [ -n "$DIRECT_PID" ] && [ -d "/proc/$DIRECT_PID" ]; then
+  DIRECT_PATH="$(tr '\0' '\n' < "/proc/$DIRECT_PID/environ" 2>/dev/null | grep '^PATH=' | head -n1 | cut -d= -f2-)"
+  case ":$DIRECT_PATH:" in
+    *":$ADAPTERS_BIN_DIR:"*) fail "AC6b direct-started daemon unexpectedly has the prepend (test setup broken)" ;;
+    *) ok "AC6b direct-started daemon baseline lacks the prepend" ;;
+  esac
+else
+  fail "AC6b could not capture direct-started daemon PID"
+fi
+RESTART_OUT="$("$HELPER" ensure-up 2>&1)"; RESTART_RC=$?
+if [ "$RESTART_RC" -eq 0 ]; then ok "AC6b ensure-up over an unprepended daemon exits 0"; else fail "AC6b ensure-up restart rc=$RESTART_RC"; echo "$RESTART_OUT" | tail -8; fi
+if echo "$RESTART_OUT" | grep -q "TT_DAEMON: up" && echo "$RESTART_OUT" | grep -q "TT_DAEMON_PATH_PREPEND: $ADAPTERS_BIN_DIR"; then
+  ok "AC6b restart reports up + prepend seam"
+else
+  fail "AC6b restart output contract"
+fi
+NEW_PID=""
+if [ -n "$STATE_DIR" ] && [ -f "$STATE_DIR/tamandua.pid" ]; then
+  NEW_PID="$(cat "$STATE_DIR/tamandua.pid")"
+fi
+if [ -n "$DIRECT_PID" ] && [ -n "$NEW_PID" ] && [ "$DIRECT_PID" != "$NEW_PID" ]; then
+  ok "AC6b daemon was RESTARTED (pid $DIRECT_PID -> $NEW_PID)"
+else
+  fail "AC6b daemon not restarted (pid $DIRECT_PID -> ${NEW_PID:-none})"
+fi
+if [ -n "$NEW_PID" ] && [ -d "/proc/$NEW_PID" ]; then
+  NEW_PATH="$(tr '\0' '\n' < "/proc/$NEW_PID/environ" 2>/dev/null | grep '^PATH=' | head -n1 | cut -d= -f2-)"
+  case ":$NEW_PATH:" in
+    *":$ADAPTERS_BIN_DIR:"*) ok "AC6b restarted daemon's environment carries adapters-bin on PATH" ;;
+    *) fail "AC6b restarted daemon PATH lacks adapters-bin: ${NEW_PATH:0:200}" ;;
+  esac
+else
+  fail "AC6b cannot inspect restarted daemon environ"
 fi
 
 # ── AC4: stop cleans up — no process remains, ports 43xx free ───────

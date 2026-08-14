@@ -75,6 +75,17 @@
           "type": "string",
           "minLength": 1,
           "description": "RAW test command the workflow actually runs in this fixture — passed to the harness as --context test_cmd=<value> and fed into launchGateKey (O2/O9/O10 evidence); never a pre-wrapped shim invocation. Per-fixture canonical commands: tt-python and tt-python@master use .venv/bin/pytest -q; tt-ts uses npm test; tt-poly-lite uses ./run-all-tests. Verify against the fixture/workflow config before authoring — never guess."
+        },
+        "replay_of": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+          "description": "OPTIONAL replay-pair binding (S9 / E3.D). Names the paired probe case id (e.g. W1.REPLAY-python -> W1.L2-python) whose work clone and committed tree this REPLAY case MUST reuse per TSTX's origin-scoped contract (spec 05 cross-cutting 'TSTX cross-run replay': unchanged trees, suites must replay with TAMANDUA-TEST CACHED / ledger row reuse, not re-execute; spec 08 W4.28: ledger rows keyed per origin_repo, zero cross-repo replay). Contract: a replay case MUST reuse its pair's work clone (same origin_repo, same committed tree), MUST be sequenced after the pair reaches terminal, and its outcome MUST assert a shim cache HIT (lookup->cache_hit). The controller must treat replay_of as internal wiring and exclude it from --context passthrough (like execution_mode)."
+        },
+        "token_saver_control": {
+          "type": "boolean",
+          "description": "OPTIONAL token-saver paired-launch signal (S12 / E3.D). Marks the case as the token-saver lifecycle probe (W3.23-token-saver): the controller executes it as TWO do-now launches — a flagged run with --no-hurry-please-save-tokens-mode and the managed pi-token-saver stub (bin/tt-token-saver-stub) on the contained daemon's PATH (var/adapters-bin, prepended by tt-daemon-up ensure-up), and a control run without either — and records both runs' argv + token ledgers as case evidence. The controller must treat token_saver_control as internal wiring and exclude it from --context passthrough (like execution_mode)."
         }
       }
     },

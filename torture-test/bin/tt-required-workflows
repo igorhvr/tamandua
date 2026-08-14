@@ -16,7 +16,15 @@
 //   - For each case whose `harness` is `pi` or `hermes` (i.e. NOT the
 //     `local` scripted harness), collects the `workflow` field.
 //   - Excludes the bundled catalog set (the repo's workflows/* workflow ids).
-//   - Any workflow referenced by a real case that is NOT bundled is a
+//   - Sentinel mapping (E3.D S11 / US-007): a REAL case whose `workflow` is
+//     `local` (W2.24-docs-drift) resolves to the shipped TT-custom spec
+//     `tt-docs-drift` — the docs/creating-workflows.md Complete Example
+//     extracted verbatim under torture-test/workflows/tt-docs-drift. The
+//     literal `local` name is never emitted: the controller's local-sentinel
+//     launch adapter installs/runs tt-docs-drift and never executes
+//     `workflow run local`. Scripted cases (harness `local`) are excluded by
+//     the harness filter, so their `local` workflow values never surface.
+//   - Any other workflow referenced by a real case that is NOT bundled is a
 //     required TT-custom workflow.
 //   - Prints the stable, sorted, de-duplicated list, one name per line.
 //     An empty required set prints nothing (still success).
@@ -60,8 +68,13 @@ Usage: tt-required-workflows [--help]
 Reads every manifest under torture-test/cases/ (tier0.jsonl, tier1.jsonl,
 cases.jsonl, smoke.jsonl) and prints, one per line (sorted, de-duplicated),
 the workflow ids referenced by REAL cases (harness pi/hermes) that are NOT
-part of the bundled repo catalog (workflows/*) and are NOT the 'local'
-scripted-harness sentinel.
+part of the bundled repo catalog (workflows/*).
+
+Sentinel mapping: a REAL case whose workflow field is 'local' (the W2.24
+local sentinel) emits tt-docs-drift — the docs/creating-workflows.md
+Complete Example extracted verbatim under torture-test/workflows/tt-docs-drift.
+The literal 'local' name is never emitted; scripted cases (harness 'local')
+never surface 'local' and never trigger the mapping.
 
 These are the TT-custom workflow specs that must be installed into the
 contained TT home before a real case launches.
@@ -126,11 +139,16 @@ function readManifest(file) {
   return records;
 }
 
-// The `local` workflow value is the scripted-harness sentinel: it never maps
-// to an installable tamandua workflow spec (W2.24-docs-drift is a real pi run
-// whose `workflow` is `local` because the case authors/installs its own docs
-// example in-band). It is always excluded alongside the bundled catalog.
+// The `local` workflow value on a REAL (pi/hermes) case is the docs-drift
+// sentinel (W2.24-docs-drift): it resolves to the shipped TT-custom spec
+// tt-docs-drift, never to an installable workflow literally named `local`.
+// Scripted cases (harness `local`) never reach the workflow collection —
+// they are excluded by the harness filter in collectRequiredCustomWorkflows.
 const SCRIPTED_WORKFLOW_SENTINEL = "local";
+// The TT-custom workflow spec the docs-drift sentinel resolves to (E3.D S11 /
+// US-007): torture-test/workflows/tt-docs-drift — the docs/creating-workflows.md
+// Complete Example extracted verbatim.
+const DOCS_DRIFT_SENTINEL_WORKFLOW = "tt-docs-drift";
 
 // collectRequiredCustomWorkflows: the distinct real-case workflow ids not in
 // the bundled set (nor the `local` sentinel), sorted for deterministic output.
@@ -152,7 +170,13 @@ function collectRequiredCustomWorkflows(casesDir, bundledDir) {
           `${name}: a real (pi/hermes) case lacks a non-empty workflow field`,
         );
       }
-      if (workflow === SCRIPTED_WORKFLOW_SENTINEL) continue;
+      if (workflow === SCRIPTED_WORKFLOW_SENTINEL) {
+        // S11/US-007 sentinel mapping: a real case whose workflow is `local`
+        // requires the shipped docs-drift spec. The literal `local` name is
+        // never emitted — only the resolved tt-docs-drift id is.
+        required.add(DOCS_DRIFT_SENTINEL_WORKFLOW);
+        continue;
+      }
       if (!bundled.has(workflow)) {
         required.add(workflow);
       }

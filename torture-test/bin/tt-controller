@@ -51,6 +51,7 @@ const STATE_VERSION = 1;
 const DEFAULT_CONCURRENCY = 1;
 const DEFAULT_STAGGER_MS = 0;
 const DEFAULT_TOKEN_POLL_INTERVAL_MS = 5 * 60_000;
+const DEFAULT_CAP_CHECK_INTERVAL_MS = 15_000;
 const DEFAULT_PROVIDER_RETRY_BACKOFF_MS = 60_000;
 const EVIDENCE_LIMIT_BYTES = 16 * 1024 * 1024;
 const TERMINAL_RUN_STATUSES = new Set(['completed', 'done', 'failed', 'canceled']);
@@ -80,7 +81,7 @@ function dryRunRealLaunchOutPath() {
 // zero-token proof. Evidence is recorded (never swallowed) so downstream
 // tests/consumers can assert the clone physically existed when the argv was
 // captured.
-function recordDryRunRealLaunch(caseRecord, argv, workClonePath) {
+function recordDryRunRealLaunch(caseRecord, argv, workClonePath, extraFields = {}) {
   const outPath = dryRunRealLaunchOutPath();
   if (outPath === null) return null;
   fs.mkdirSync(path.dirname(outPath), { recursive: true, mode: 0o700 });
@@ -101,10 +102,22 @@ function recordDryRunRealLaunch(caseRecord, argv, workClonePath) {
     case_id: caseRecord.id,
     harness: caseRecord.harness,
     workflow: caseRecord.workflow,
+    // US-008: for the W2.24 local sentinel the MANIFEST workflow stays `local`
+    // but the constructed argv names tt-docs-drift — record the resolved id
+    // so consumers can bind argv to the adapter resolution (null = the
+    // manifest workflow id was used verbatim).
+    resolved_workflow: resolveLocalSentinel(caseRecord).sentinel
+      ? LOCAL_SENTINEL_WORKFLOW_ID
+      : null,
     fixture: caseRecord.fixture,
     task: caseRecord.task,
     executable: 'tamandua',
     argv,
+    // US-010 (S12 controller): token-saver paired-launch records carry
+    // launch_role ('flagged' | 'control') + the token_saver_case marker so
+    // consumers can bind each of the two recorded argvs to its role. Other
+    // cases never carry these fields.
+    ...extraFields,
     work_clone: {
       path: workClonePath ?? null,
       existed: cloneStat !== null,
@@ -776,6 +789,15 @@ function configuredTokenPollIntervalMs() {
   return Number(configured);
 }
 
+function configuredCapCheckIntervalMs() {
+  const configured = process.env.TT_CONTROLLER_CAP_CHECK_INTERVAL_MS;
+  if (configured === undefined) return DEFAULT_CAP_CHECK_INTERVAL_MS;
+  if (!/^[1-9]\d*$/.test(configured) || !Number.isSafeInteger(Number(configured))) {
+    throw new Error('TT_CONTROLLER_CAP_CHECK_INTERVAL_MS must be a positive integer');
+  }
+  return Number(configured);
+}
+
 function configuredProviderRetryBackoffMs() {
   const configured = process.env.TT_CONTROLLER_PROVIDER_RETRY_BACKOFF_MS;
   if (configured === undefined) return DEFAULT_PROVIDER_RETRY_BACKOFF_MS;
@@ -1341,11 +1363,51 @@ function provisionedWorkClonePath(caseState) {
 // on the case and persisted to results/state.json. Provider-retry scheduling
 // returns before markTerminal, so teardown only ever runs on the FINAL,
 // genuinely-terminal outcome of a case.
-function applyCaseTeardown(caseState, outcome) {
+//
+// O9 special-exit exemption: a chaos.o9_special_exits case's RESTORED working
+// tree is itself the evidence the battery produces (exit-88 tracked-dirty
+// refusal, tracked-byte restoration, junk-probe removal). Pruning a PASS would
+// destroy exactly what O9 verified, so those cases keep their clone with a
+// recorded keep_reason.
+// US-005 (S9 controller): replay-pair clone persistence. A case named as
+// another case's `context.replay_of` is the shared-origin PAIRE: its harvested
+// clone is the replay attempt's input (same origin_repo, same tree), so even a
+// PASSED pair KEEPS its clone (policy outcome REPLAY_PAIR_KEEP) with the
+// recorded keep_reason. Conversely, a REPLAY case's own teardown is a no-op:
+// its attempt.fixture_work_clone points at the pair's clone, which is governed
+// by the pair's decision — the replay must never prune/keep a clone it did not
+// provision.
+function applyCaseTeardown(state, caseState, outcome) {
   const workClonePath = provisionedWorkClonePath(caseState);
   if (workClonePath === null) return;
-  const result = applyTeardownPolicy({ caseId: caseState.id, outcome, workClonePath });
-  if (result.ok) caseState.teardown = result.record;
+  const replayAttempt = (caseState.attempts ?? [])
+    .some((attempt) => attempt.replay_provenance !== undefined);
+  if (replayAttempt) return;
+  const replayPairKeep = (state.cases ?? [])
+    .some((item) => item.replay_of === caseState.id);
+  if (replayPairKeep) {
+    const result = applyTeardownPolicy({
+      caseId: caseState.id,
+      outcome: 'REPLAY_PAIR_KEEP',
+      workClonePath,
+    });
+    if (result.ok) {
+      caseState.teardown = { ...result.record, keep_reason: 'replay-pair-clone-shared' };
+    }
+    return;
+  }
+  const o9Keep = (caseState.attempts ?? [])
+    .some((attempt) => attempt.o9_special_exit_evidence === true);
+  const result = applyTeardownPolicy({
+    caseId: caseState.id,
+    outcome: o9Keep ? 'O9_SPECIAL_EXIT_KEEP' : outcome,
+    workClonePath,
+  });
+  if (result.ok) {
+    caseState.teardown = o9Keep
+      ? { ...result.record, keep_reason: 'o9-special-exit-restored-tree-evidence' }
+      : result.record;
+  }
 }
 
 function markTerminal(state, caseState, campaignDir, outcome, reason) {
@@ -1356,7 +1418,7 @@ function markTerminal(state, caseState, campaignDir, outcome, reason) {
     terminal_at: timestamp,
     ...(reason === undefined ? {} : { reason }),
   });
-  applyCaseTeardown(caseState, outcome);
+  applyCaseTeardown(state, caseState, outcome);
   state.updated_at = timestamp;
   atomicWriteState(campaignDir, state);
 }
@@ -1386,15 +1448,33 @@ function oracleSnapshotInput(caseRecord, caseState, attempt, state, campaignDir,
   if (typeof stateDir !== 'string' || !path.isAbsolute(stateDir) || databasePath === null) {
     throw new Error('controller-provided TT state is unavailable for oracle snapshot');
   }
+  // US-006 (S9 controller): a REPLAY attempt's snapshot must bind to the
+  // PAIR's provisioned clone (attempt.fixture_work_clone) — same origin_repo
+  // / tree identity as the pair's run (TSTX origin-scoped contract). The
+  // replay's own clone path is never provisioned, so binding to it would
+  // ENOENT at snapshot capture. Non-replay real attempts have
+  // fixture_work_clone set to their own provisioned clone (identical path).
+  const repositoryPath = typeof attempt.fixture_work_clone === 'string' && attempt.fixture_work_clone !== ''
+    ? attempt.fixture_work_clone
+    : path.join(VAR_ROOT, 'fixtures', 'work', caseRecord.id, caseRecord.fixture);
+  // US-010 (S12 controller): the oracle snapshot's launch-intent binds to the
+  // FLAGGED (primary) launch argv of a token-saver paired-launch attempt —
+  // that is the run exercising the token-saver plumbing. The pair's argvs are
+  // pre-declared on attempt.token_saver before the snapshot begins.
+  const tokenSaverFlagged = attempt.token_saver?.launches
+    ?.find((entry) => entry.role === 'flagged');
+  const launchArgv = tokenSaverFlagged !== undefined && Array.isArray(tokenSaverFlagged.argv)
+    ? tokenSaverFlagged.argv
+    : ['tamandua', ...workflowRunArgs(caseRecord, attempt.fixture_work_clone)];
   return {
     ttRoot: TT_ROOT,
     campaignDir,
     stateDir: path.resolve(stateDir),
     databasePath,
-    repositoryPath: path.join(VAR_ROOT, 'fixtures', 'work', caseRecord.id, caseRecord.fixture),
+    repositoryPath,
     caseRecord,
     attempt,
-    launchArgv: ['tamandua', ...workflowRunArgs(caseRecord)],
+    launchArgv,
     discoveredRuns: (state.discovered_runs ?? []).filter((run) => run.root_case_id === caseState.id),
   };
 }
@@ -2006,10 +2086,216 @@ async function executeLocalCase(caseRecord, caseState, state, campaignDir) {
   persistClassifiedAttempt(caseState, attempt, state, campaignDir, verdict);
 }
 
-function workflowRunArgs(caseRecord) {
-  const args = ['workflow', 'run', caseRecord.workflow, '--task-file', caseRecord.task];
+// US-005 (S9 controller): REPLAY same-origin provisioning + sequencing guard.
+// A replay case's `context.replay_of` names its paired probe case. The replay
+// attempt MUST reuse the pair's work clone (same origin_repo, same committed
+// tree — TSTX's origin-scoped contract: a fresh clone/provision would
+// normalize to a different origin identity and the cache HIT would be
+// unreachable) and MUST never launch before the pair is terminal (the pair's
+// post-harvest state — clone, ledger — is the replay's input). The pair's
+// clone therefore persists unchanged from the pair's terminalization into the
+// replay attempt (see applyCaseTeardown's replay-pair keep exemption), and the
+// replay attempt performs NO wipe/re-clone/provision of its own.
+//
+// `replay_of` is controller-internal wiring: it is excluded from the product
+// `--context` passthrough (like `execution_mode`) and is never seen by the
+// workflow.
+function replayPairOf(caseRecord) {
+  const replayOf = caseRecord.context?.replay_of;
+  return typeof replayOf === 'string' && replayOf !== '' ? replayOf : null;
+}
+
+// The pair's provisioned clone path: var/fixtures/work/<pair-id>/<fixture>
+// (tt-fixture-provision.mjs names clones <work-dir>/<case-id>/<fixture>).
+function replayPairClonePath(pairId, fixture) {
+  return path.join(VAR_ROOT, 'fixtures', 'work', pairId, fixture);
+}
+
+// Sequencing wait bound. When the replay case executes while its pair is
+// still active (concurrency > 1), the controller WAITS — bounded by the
+// campaign scheduler — for the pair to reach terminal before launching. The
+// bound is the pair's own wall deadline plus a settle margin (the pair's cap
+// enforcement guarantees terminalization near its deadline), or the pair's
+// scheduled provider-retry retry_not_before plus the same margin; a pair with
+// neither bound falls back to a conservative fixed wait. Tests shrink the
+// bound via TT_CONTROLLER_REPLAY_PAIR_WAIT_MS (ms).
+const REPLAY_PAIR_WAIT_POLL_MS = 500;
+const REPLAY_PAIR_SETTLE_MARGIN_MS = 60_000;
+const REPLAY_PAIR_FALLBACK_WAIT_MS = 60_000;
+
+function replayPairWaitDeadline(pairState) {
+  const override = process.env.TT_CONTROLLER_REPLAY_PAIR_WAIT_MS;
+  if (override !== undefined) {
+    const parsed = Number(override);
+    if (!Number.isFinite(parsed) || parsed < 0) {
+      throw new Error(`TT_CONTROLLER_REPLAY_PAIR_WAIT_MS must be a non-negative number, received ${JSON.stringify(override)}`);
+    }
+    return Date.now() + parsed;
+  }
+  const attempt = (pairState?.attempts ?? []).at(-1);
+  if (attempt?.deadline_at !== undefined) {
+    return new Date(attempt.deadline_at).valueOf() + REPLAY_PAIR_SETTLE_MARGIN_MS;
+  }
+  if (pairState?.provider_retry?.status === 'scheduled'
+      && pairState.provider_retry.retry_not_before !== undefined) {
+    return new Date(pairState.provider_retry.retry_not_before).valueOf() + REPLAY_PAIR_SETTLE_MARGIN_MS;
+  }
+  return Date.now() + REPLAY_PAIR_FALLBACK_WAIT_MS;
+}
+
+async function waitForReplayPairTerminal(pairState) {
+  const deadline = replayPairWaitDeadline(pairState);
+  while (pairState.phase !== 'terminal' && Date.now() < deadline) {
+    await delay(Math.min(REPLAY_PAIR_WAIT_POLL_MS, Math.max(0, deadline - Date.now())));
+  }
+  return pairState.phase === 'terminal';
+}
+
+// Resolve the replay pair's campaign state and shared clone, fail-closed with
+// a DISTINCT category per failure mode — never a silent half-launch:
+//   replay-pair-missing         the pair id is absent from campaign state
+//                               (e.g. a filtered/partial manifest)
+//   replay-pair-fixture-mismatch the pair case uses a different fixture — its
+//                               clone could never carry the replay's origin
+//   replay-pair-not-terminal    the pair did not reach terminal within the
+//                               campaign-scheduler-bounded wait
+//   replay-pair-clone-missing   the pair is terminal but its shared work clone
+//                               does not exist (nothing to replay against)
+// Returns { ok:true, pairState, clonePath } or { ok:false, reason }.
+async function resolveReplayPairContext(replayOf, caseRecord, state) {
+  const pairState = state.cases.find((item) => item.id === replayOf);
+  if (pairState === undefined) {
+    return { ok: false, reason: {
+      category: 'replay-pair-missing',
+      message: `replay pair '${replayOf}' is not present in campaign state; a replay cannot launch without its pair`,
+      replay_of: replayOf,
+    } };
+  }
+  if (pairState.fixture !== caseRecord.fixture) {
+    return { ok: false, reason: {
+      category: 'replay-pair-fixture-mismatch',
+      message: `replay pair '${replayOf}' uses fixture '${pairState.fixture}', but the replay case requires '${caseRecord.fixture}'; the pair's clone could never carry the replay's origin identity`,
+      replay_of: replayOf,
+      fixture: caseRecord.fixture,
+      pair_fixture: pairState.fixture,
+    } };
+  }
+  await waitForReplayPairTerminal(pairState);
+  if (pairState.phase !== 'terminal') {
+    return { ok: false, reason: {
+      category: 'replay-pair-not-terminal',
+      message: `replay pair '${replayOf}' is still '${pairState.phase}' after the campaign-scheduler-bounded wait; the replay must not launch before its pair is terminal`,
+      replay_of: replayOf,
+      pair_phase: pairState.phase,
+    } };
+  }
+  const clonePath = replayPairClonePath(replayOf, caseRecord.fixture);
+  let cloneExists = false;
+  try {
+    cloneExists = fs.lstatSync(clonePath).isDirectory();
+  } catch {
+    cloneExists = false;
+  }
+  if (!cloneExists) {
+    return { ok: false, reason: {
+      category: 'replay-pair-clone-missing',
+      message: `replay pair '${replayOf}' is terminal but its shared work clone does not exist at '${clonePath}'`,
+      replay_of: replayOf,
+      pair_clone_path: clonePath,
+    } };
+  }
+  return { ok: true, pairState, clonePath };
+}
+
+// ── E3.D US-008 (S11 controller): local-sentinel launch adapter ───────────
+// A REAL case whose `workflow` is `local` (W2.24-docs-drift) is the docs-drift
+// sentinel: there is no `local` workflow in any catalog, so the literal argv
+// `workflow run local` must NEVER be constructed or executed — it would fail
+// with a misleading run-identification error instead of exercising the
+// documented example. The adapter (US-008):
+//   - resolves the sentinel profile. The supported W2.24 shape is
+//     workflow `local` + harness `pi`: it resolves to the shipped TT-custom
+//     spec tt-docs-drift (US-007) — the docs/creating-workflows.md Complete
+//     Example extracted verbatim under torture-test/workflows/tt-docs-drift.
+//   - Any OTHER sentinel profile on the workflow-launch path (workflow
+//     `local` with a harness other than pi) FAILS CLOSED with the distinct
+//     reason `local-sentinel-unsupported`, recorded on a launch-intent
+//     attempt as TEST_INFRA_FAIL evidence (executeWorkflowCase).
+//   - Before the real launch, ensures tt-docs-drift is installed in the
+//     contained TT home by re-running the tt-catalog-install /
+//     tt-required-workflows seam (idempotent, stamp-aware); a missing spec
+//     fails closed with the distinct `catalog-missing: tt-docs-drift` reason.
+//   - Records adapter evidence (sentinel profile, resolved workflow id,
+//     install outcome) on the attempt as attempt.sentinel_adapter.
+// Scripted cases (harness `local`) never reach the workflow-launch path, so
+// their `local` workflow values never surface here (US-007's harness filter).
+const LOCAL_SENTINEL_MARKER = 'local';
+const LOCAL_SENTINEL_WORKFLOW_ID = 'tt-docs-drift';
+
+// Result contract (never throws):
+//   { sentinel: false }                          not a sentinel case
+//   { sentinel: true, ok: true, workflow_id, profile }      supported W2.24 shape
+//   { sentinel: true, ok: false, reason, profile }          unsupported profile
+function resolveLocalSentinel(caseRecord) {
+  if (caseRecord.workflow !== LOCAL_SENTINEL_MARKER) return { sentinel: false };
+  const profile = {
+    workflow: caseRecord.workflow,
+    harness: caseRecord.harness,
+    case_id: caseRecord.id,
+  };
+  if (caseRecord.harness === 'pi') {
+    return { sentinel: true, ok: true, workflow_id: LOCAL_SENTINEL_WORKFLOW_ID, profile };
+  }
+  return {
+    sentinel: true,
+    ok: false,
+    profile,
+    reason: {
+      category: 'local-sentinel-unsupported',
+      message: `workflow 'local' sentinel with harness '${caseRecord.harness}' is not the supported W2.24 shape (workflow local + harness pi); refusing to construct 'workflow run local'`,
+      profile,
+    },
+  };
+}
+
+// US-008 install leg: re-run the tt-catalog-install / tt-required-workflows
+// seam under the CONTAINED spawn env (spawnPreflightLeg — the same
+// containment choke-point the campaign preflight uses). The helper enumerates
+// the manifests, resolves the W2.24 workflow-'local' sentinel to
+// tt-docs-drift (US-007), and installs/verifies the spec in the contained TT
+// home; it is idempotent (stamp-aware, zero churn when current). Result
+// contract (never throws): { ok, helper, exit_code, ... } with the distinct
+// machine-parseable reason (e.g. `catalog-missing: tt-docs-drift`) on failure.
+function runLocalSentinelCatalogInstall(childEnv) {
+  const result = spawnPreflightLeg(PREFLIGHT_CATALOG_PATH, [], childEnv);
+  const reason = result.ok ? null : readPreflightReason(result.stderr) ?? 'catalog-missing';
+  return {
+    ok: result.ok,
+    helper: 'tt-catalog-install',
+    ...(result.exit_code !== undefined ? { exit_code: result.exit_code } : {}),
+    ...(result.error !== undefined ? { error: result.error } : {}),
+    ...(reason !== null ? { reason } : {}),
+    ...(result.ok ? {} : { stderr_tail: (result.stderr ?? '').trim().slice(-500) }),
+  };
+}
+
+function workflowRunArgs(caseRecord, resolvedClonePath, extraArgs = []) {
+  // US-008: the sentinel resolution keeps the 'never `workflow run local`'
+  // invariant at EVERY call site (dry-run recording, oracle snapshot input,
+  // the real launch hook). Unsupported profiles throw as a defensive
+  // backstop — executeWorkflowCase fails them closed before any call site is
+  // reached.
+  const sentinel = resolveLocalSentinel(caseRecord);
+  if (sentinel.sentinel && !sentinel.ok) {
+    throw new Error(`${sentinel.reason.category}: ${sentinel.reason.message}`);
+  }
+  const workflowId = sentinel.sentinel ? sentinel.workflow_id : caseRecord.workflow;
+  const args = ['workflow', 'run', workflowId, '--task-file', caseRecord.task];
   for (const [key, value] of Object.entries(caseRecord.context)) {
-    if (key === 'execution_mode') continue;
+    // US-010 (S12 controller): token_saver_control is controller-internal
+    // wiring for the paired-launch adapter — never a product --context flag
+    // (like execution_mode / replay_of).
+    if (key === 'execution_mode' || key === 'replay_of' || key === 'token_saver_control') continue;
     args.push('--context', `${key}=${typeof value === 'string' ? value : JSON.stringify(value)}`);
   }
   if (caseRecord.harness === 'pi' || caseRecord.harness === 'scripted-pi') {
@@ -2017,14 +2303,630 @@ function workflowRunArgs(caseRecord) {
   } else {
     args.push('--hermes-as-harness');
   }
-  const fixturePath = path.join(VAR_ROOT, 'fixtures', 'work', caseRecord.id, caseRecord.fixture);
+  // A replay case launches against its PAIR's provisioned clone (resolved by
+  // resolveReplayPairContext and passed in); every other case uses its own.
+  const fixturePath = typeof resolvedClonePath === 'string' && resolvedClonePath !== ''
+    ? resolvedClonePath
+    : path.join(VAR_ROOT, 'fixtures', 'work', caseRecord.id, caseRecord.fixture);
   if (caseRecord.workflow.includes('worktree')) {
     args.push('--worktree-origin-repository', fixturePath);
   } else {
     args.push('--working-directory-for-harness', fixturePath);
   }
+  // US-010: the token-saver adapter passes the no-hurry flag ONLY for the
+  // flagged launch of a token-saver case; every other call site keeps the
+  // extraArgs default ([]), so the flag can never leak into other argv.
+  if (extraArgs.length > 0) args.push(...extraArgs);
   args.push('--wait', '--json');
   return args;
+}
+
+// ── E3.D US-010 (S12 controller): token-saver paired launch adapter ────────
+// W3.23-token-saver (context.token_saver_control === true) is the token-saver
+// lifecycle probe: the controller executes the case as TWO do-now launches
+// against the SAME provisioned clone —
+//   run A (flagged): the managed pi-token-saver stub (bin/tt-token-saver-stub,
+//     US-009) is installed into var/adapters-bin (the dir tt-daemon-up
+//     ensure-up prepends to the contained daemon PATH) and
+//     --no-hurry-please-save-tokens-mode is appended to the launch argv; the
+//     product scheduler then prefers the stub for every work spawn of the
+//     no-hurry run and each invocation appends one JSON record to the
+//     attempt's evidence log before exec'ing the real pi;
+//   run B (control): the stub is removed first, and the run launches WITHOUT
+//     the flag — a healthy control produces zero new stub records.
+// Evidence: attempt.token_saver carries per run the exact argv, the resolved
+// run id, the token-ledger observations attributed to that run, and the stub
+// record count observed in that run's window (the attempt-level token ledger
+// still aggregates both runs for the per-case token cap). The contract is
+// mechanical:
+//   violated  the flagged run has zero stub records, OR the control run has
+//             any → caseState finding type `token-saver-contract` and the
+//             case is INCONCLUSIVE — never a silent PASS;
+//   ok        flagged >= 1 record and control 0 → the pair is classified by
+//             the run terminal statuses + oracles exactly like a single run.
+// token_saver_control is controller-internal wiring: it is excluded from the
+// --context passthrough, and the flag is appended ONLY for the flagged
+// launch of a token-saver case. A scripted case carrying the signal fails
+// closed with a distinct reason (the probe is a REAL-case behavior).
+const TOKEN_SAVER_FLAG = '--no-hurry-please-save-tokens-mode';
+const TOKEN_SAVER_STUB_HELPER_PATH = path.join(TT_ROOT, 'bin', 'tt-token-saver-stub');
+const TOKEN_SAVER_STUB_TARGET_PATH = path.join(VAR_ROOT, 'adapters-bin', 'pi-token-saver');
+
+function tokenSaverControl(caseRecord) {
+  return caseRecord.context?.token_saver_control === true;
+}
+
+// Install/remove the managed pi-token-saver stub via bin/tt-token-saver-stub
+// (US-009). The helper is fail-closed (foreign files are never touched) and
+// the controller additionally VERIFIES the managed stub's presence/absence
+// at the canonical target after the action: the stub must exist on the
+// daemon PATH only during the flagged launch window. Result contract (never
+// throws): { action, ok, helper, exit_code, ..., stub_present } with the
+// helper's distinct REASON surfaced on failure.
+function manageTokenSaverStub(action, evidenceLogPath, childEnv) {
+  assertContainedSpawnEnv(childEnv);
+  const args = action === 'install'
+    ? ['install', '--evidence-log', evidenceLogPath]
+    : ['remove'];
+  const result = spawnSync(TOKEN_SAVER_STUB_HELPER_PATH, args, {
+    cwd: TT_ROOT,
+    env: childEnv,
+    encoding: 'utf8',
+    maxBuffer: 1024 * 1024,
+    shell: false,
+  });
+  let stubPresent = false;
+  try {
+    stubPresent = fs.lstatSync(TOKEN_SAVER_STUB_TARGET_PATH).isFile();
+  } catch {
+    stubPresent = false;
+  }
+  const stdout = String(result.stdout ?? '').trim();
+  const stderr = String(result.stderr ?? '').trim();
+  const reason = /^REASON:\s*(.+)$/m.exec(stderr)?.[1] ?? null;
+  const ok = result.error === undefined && result.status === 0;
+  return {
+    action,
+    ok,
+    helper: 'tt-token-saver-stub',
+    exit_code: result.status,
+    stub_present: stubPresent,
+    ...(result.error !== undefined ? { error: result.error.message } : {}),
+    ...(reason !== null ? { reason } : {}),
+    ...(ok ? {} : { stderr_tail: stderr.slice(-500) }),
+    stdout_tail: stdout.slice(-500),
+  };
+}
+
+function tokenSaverEvidenceRecordCount(evidenceLogPath) {
+  try {
+    const content = fs.readFileSync(evidenceLogPath, 'utf8');
+    return content.split(/\r?\n/).filter((line) => line.trim() !== '').length;
+  } catch (error) {
+    if (error.code === 'ENOENT') return 0;
+    throw error;
+  }
+}
+
+// The raw stub records appended during a run's window (bounded so state stays
+// small); the count is the contract evidence, the lines are corroboration.
+function tokenSaverEvidenceWindowLines(evidenceLogPath, fromIndex) {
+  try {
+    const lines = fs.readFileSync(evidenceLogPath, 'utf8')
+      .split(/\r?\n/)
+      .filter((line) => line.trim() !== '');
+    return lines.slice(fromIndex).slice(-10_000);
+  } catch (error) {
+    if (error.code === 'ENOENT') return [];
+    throw error;
+  }
+}
+
+// The mechanical token-saver contract (US-010): the flagged run must record
+// >= 1 stub work-spawn record, and the control run must record ZERO. Any
+// violation yields the distinct `token-saver-contract` finding — a silent
+// PASS would otherwise bury a broken flag-routing/isolated-stub setup.
+function assessTokenSaverContract(launches) {
+  const flagged = launches.find((entry) => entry.role === 'flagged');
+  const control = launches.find((entry) => entry.role === 'control');
+  const flaggedRecords = Number.isSafeInteger(flagged?.stub_records) ? flagged.stub_records : 0;
+  const controlRecords = Number.isSafeInteger(control?.stub_records) ? control.stub_records : 0;
+  const violated = flaggedRecords === 0 || controlRecords > 0;
+  const finding = violated ? {
+    type: 'token-saver-contract',
+    message: flaggedRecords === 0
+      ? 'token-saver contract violated: the flagged run recorded zero stub work-spawn records (expected >= 1)'
+      : `token-saver contract violated: the control run recorded ${controlRecords} stub record(s) (expected 0)`,
+    flagged_stub_records: flaggedRecords,
+    control_stub_records: controlRecords,
+  } : undefined;
+  return {
+    ok: !violated,
+    violated,
+    flagged_stub_records: flaggedRecords,
+    control_stub_records: controlRecords,
+    ...(finding === undefined ? {} : { finding }),
+  };
+}
+
+// Execute the token-saver paired launch (real cases only — the scripted
+// guard in executeWorkflowCase fails closed before this runs). Mirrors the
+// single-launch flow (runHook launch + run-id capture + monitor + discovered-
+// run convergence + terminal harvest) for EACH of the two runs, toggling the
+// managed stub around the pair so it exists on the daemon PATH only during
+// the flagged window. Fail-closed at every step with a DISTINCT reason
+// category; never a silent half-pair.
+async function executeTokenSaverPairedLaunch(caseRecord, caseState, state, campaignDir, attempt, childEnv) {
+  // Every spawn below is a choke-pointed helper (manageTokenSaverStub,
+  // runHook, monitorWorkflowRun, harvestWorkflowAttempt, runCaseOracles —
+  // each asserts the contained spawn env itself).
+  const evidenceLogPath = path.join(
+    campaignDir, 'evidence', caseRecord.id, attempt.id, 'token-saver-evidence.jsonl',
+  );
+  attempt.token_saver.evidence_log = evidenceRelativePath(campaignDir, evidenceLogPath);
+  attempt.token_saver.status = 'running';
+  attempt.phase = 'running';
+  state.updated_at = utcTimestamp();
+  atomicWriteState(campaignDir, state);
+
+  const plans = [
+    { role: 'flagged', stubAction: 'install', flag: true, hookName: 'launch' },
+    { role: 'control', stubAction: 'remove', flag: false, hookName: 'launch_control' },
+  ];
+  let fatal = null;
+  let capStop = null;
+
+  for (const plan of plans) {
+    if (fatal !== null || capStop !== null) break;
+    const entry = attempt.token_saver.launches.find((item) => item.role === plan.role);
+    entry.started_at = utcTimestamp();
+    state.updated_at = entry.started_at;
+    atomicWriteState(campaignDir, state);
+
+    // Stub window management: install (flagged) / remove (control). The
+    // helper is fail-closed and the controller verifies the canonical
+    // target's presence — the stub must exist ONLY during the flagged
+    // launch window (AC2).
+    const stub = manageTokenSaverStub(plan.stubAction, evidenceLogPath, childEnv);
+    entry.stub = { ...(entry.stub ?? {}), ...stub };
+    entry.stub_records_before = tokenSaverEvidenceRecordCount(evidenceLogPath);
+    state.updated_at = utcTimestamp();
+    atomicWriteState(campaignDir, state);
+    const stubExpected = plan.stubAction === 'install';
+    if (!stub.ok) {
+      entry.terminal_at = utcTimestamp();
+      state.updated_at = entry.terminal_at;
+      atomicWriteState(campaignDir, state);
+      fatal = {
+        outcome: 'TEST_INFRA_FAIL',
+        reason: {
+          category: `token-saver-stub-${plan.stubAction}-failed`,
+          message: `tt-token-saver-stub ${plan.stubAction} failed for the ${plan.role} launch`
+            + `${stub.reason !== undefined ? `: ${stub.reason}` : ''}`
+            + `${stub.error !== undefined ? `: ${stub.error}` : ''}`
+            + `${stub.stderr_tail !== undefined ? ` (${stub.stderr_tail})` : ''}`,
+          role: plan.role,
+          stub,
+        },
+      };
+      break;
+    }
+    if (stub.stub_present !== stubExpected) {
+      entry.terminal_at = utcTimestamp();
+      state.updated_at = entry.terminal_at;
+      atomicWriteState(campaignDir, state);
+      fatal = {
+        outcome: 'TEST_INFRA_FAIL',
+        reason: {
+          category: stubExpected
+            ? 'token-saver-stub-missing-after-install'
+            : 'token-saver-stub-present-after-remove',
+          message: stubExpected
+            ? `the managed pi-token-saver stub is absent at '${TOKEN_SAVER_STUB_TARGET_PATH}' after a successful install — the flagged launch window cannot hold the stub`
+            : `the managed pi-token-saver stub is still present at '${TOKEN_SAVER_STUB_TARGET_PATH}' after a successful remove — the control launch window must be stub-free`,
+          role: plan.role,
+          stub,
+        },
+      };
+      break;
+    }
+
+    // Launch + run-id capture + monitor (identical mechanics to the
+    // single-launch flow; the control launch uses a distinct hook name so
+    // its durably-captured stdout/stderr evidence never overwrites the
+    // flagged launch's).
+    let signalLaunchEnded;
+    const launchEndedPromise = new Promise((resolve) => { signalLaunchEnded = resolve; });
+    let monitorPromise;
+    const captureRunIdentifier = createRunIdentifierCapture(attempt, state, campaignDir, childEnv, () => {
+      monitorPromise ??= monitorWorkflowRun(
+        caseRecord, caseState, attempt, childEnv, state, campaignDir, launchEndedPromise,
+      );
+    });
+    let launchResult;
+    let monitorResult;
+    try {
+      launchResult = await runHook(plan.hookName, {
+        executable: 'tamandua',
+        args: entry.argv.slice(1),
+        cwd: '.',
+      }, childEnv, campaignDir, state, attempt, {
+        enforceWall: false,
+        onChunk: captureRunIdentifier,
+      });
+      signalLaunchEnded();
+      monitorResult = monitorPromise === undefined ? { stopped: false } : await monitorPromise;
+      if (attempt.run_id !== undefined && attempt.run_id_error === undefined) {
+        await convergeDiscoveredRuns(caseRecord, caseState, childEnv, state, campaignDir);
+      }
+    } catch (error) {
+      entry.terminal_at = utcTimestamp();
+      state.updated_at = entry.terminal_at;
+      atomicWriteState(campaignDir, state);
+      fatal = {
+        outcome: 'TEST_INFRA_FAIL',
+        reason: {
+          category: 'token-saver-launch-monitor-failed',
+          message: `the ${plan.role} launch/monitor failed: ${error.message}`,
+          role: plan.role,
+          launch_exit_code: launchResult?.exit_code ?? null,
+          launch_signal: launchResult?.signal ?? null,
+        },
+      };
+      break;
+    }
+
+    if (attempt.run_id_error !== undefined || attempt.run_id === undefined) {
+      const infra = classifyInfraLaunchFailure(readLaunchEvidenceStderr(campaignDir, launchResult));
+      entry.run_id_error = attempt.run_id_error ?? null;
+      entry.terminal_at = utcTimestamp();
+      state.updated_at = entry.terminal_at;
+      atomicWriteState(campaignDir, state);
+      fatal = {
+        outcome: 'TEST_INFRA_FAIL',
+        reason: infra !== null
+          ? { category: infra.category, message: infra.message, signature: infra.signature, role: plan.role }
+          : {
+              category: 'workflow-run-identification',
+              role: plan.role,
+              error: attempt.run_id_error ?? {
+                category: 'missing-run-identifier',
+                resolution_errors: attempt.run_id_resolution_errors ?? [],
+              },
+            },
+      };
+      break;
+    }
+
+    let terminalEvidence = null;
+    try {
+      terminalEvidence = await harvestWorkflowAttempt(
+        caseState, attempt,
+        monitorResult.stopped ? attempt.terminal_wait : launchResult,
+        childEnv, state, campaignDir,
+      );
+    } catch (error) {
+      entry.terminal_at = utcTimestamp();
+      state.updated_at = entry.terminal_at;
+      atomicWriteState(campaignDir, state);
+      fatal = {
+        outcome: 'TEST_INFRA_FAIL',
+        reason: {
+          category: 'token-saver-harvest-failed',
+          message: `terminal harvest failed for the ${plan.role} run: ${error.message}`,
+          role: plan.role,
+        },
+      };
+      break;
+    }
+
+    // Stash the per-run evidence on the entry (attempt-level fields are
+    // shared between the two runs and are reset for the control capture).
+    entry.run_id = attempt.run_id ?? null;
+    entry.run_id_source = attempt.run_id_source ?? null;
+    entry.run_id_observations = [...(attempt.run_id_observations ?? [])];
+    entry.run_id_resolution_errors = [...(attempt.run_id_resolution_errors ?? [])];
+    entry.token_ledger = {
+      tokens_observed: attempt.tokens_observed ?? 0,
+      observations: (attempt.token_observations ?? [])
+        .filter((observation) => observation.run_id === entry.run_id),
+    };
+    entry.terminal_status = attempt.terminal_status ?? terminalEvidence?.status ?? null;
+    entry.wait_exit_code = attempt.wait_exit_code ?? null;
+    entry.wait_json = attempt.wait_json ?? null;
+    entry.terminal_evidence = attempt.terminal_evidence ?? null;
+    entry.stub_records_after = tokenSaverEvidenceRecordCount(evidenceLogPath);
+    entry.stub_records = entry.stub_records_after - entry.stub_records_before;
+    entry.stub_record_lines = tokenSaverEvidenceWindowLines(evidenceLogPath, entry.stub_records_before);
+    entry.terminal_at = utcTimestamp();
+    state.updated_at = entry.terminal_at;
+    atomicWriteState(campaignDir, state);
+
+    if (monitorResult.stopped) {
+      // Cap enforcement stops the pair: the control run never launches (the
+      // cap is the ceiling for the whole probe, sized for both launches in
+      // US-003). Classify INCONCLUSIVE like the single-run cap path.
+      capStop = {
+        breach: monitorResult.breach,
+        terminal_status: monitorResult.terminal_status,
+        role: plan.role,
+      };
+      break;
+    }
+    if (terminalEvidence === null) {
+      entry.terminal_at = utcTimestamp();
+      state.updated_at = entry.terminal_at;
+      atomicWriteState(campaignDir, state);
+      fatal = {
+        outcome: 'TEST_INFRA_FAIL',
+        reason: {
+          category: 'token-saver-run-nonterminal',
+          message: `the ${plan.role} run did not reach a terminal status; the paired launch cannot continue`,
+          role: plan.role,
+        },
+      };
+      break;
+    }
+
+    // Prepare the attempt-level run-id state for the control launch's
+    // capture (the capture errors on a differing persisted run id, and the
+    // attempt-level ledger fields are re-populated per run).
+    delete attempt.run_id;
+    delete attempt.run_id_source;
+    delete attempt.run_id_persisted_at;
+    delete attempt.run_id_error;
+    delete attempt.run_id_resolution_errors;
+    attempt.run_id_observations = [];
+  }
+
+  // Final classification. The pair is terminal (or fail-closed above).
+  attempt.phase = 'terminal';
+  attempt.terminal_at = utcTimestamp();
+  attempt.token_saver.status = 'terminal';
+  attempt.token_saver.finished_at = attempt.terminal_at;
+  if (fatal !== null) {
+    persistMechanicalOutcome(caseState, attempt, state, campaignDir, fatal.outcome, fatal.reason);
+    return;
+  }
+  if (capStop !== null) {
+    const baseReason = {
+      category: 'runaway-cap-enforced',
+      ...capStop.breach,
+      terminal_status: capStop.terminal_status,
+      token_saver_role: capStop.role,
+    };
+    const verdict = outcomeWithOracleEvidence(
+      caseRecord, 'INCONCLUSIVE', baseReason,
+      runCaseOracles(caseRecord, caseState, state, campaignDir, childEnv),
+    );
+    persistClassifiedAttempt(caseState, attempt, state, campaignDir, verdict);
+    return;
+  }
+  const launches = attempt.token_saver.launches;
+  const contract = assessTokenSaverContract(launches);
+  attempt.token_saver.contract = contract;
+  const allCompleted = launches.length === 2
+    && launches.every((entry) => entry.terminal_status !== null
+      && canonicalTerminalStatus(entry.terminal_status) === 'completed');
+  let verdict = outcomeWithOracleEvidence(
+    caseRecord,
+    allCompleted ? 'PASS' : 'INCONCLUSIVE',
+    allCompleted ? undefined : {
+      category: 'workflow-terminal',
+      terminal_statuses: launches.map((entry) => ({
+        role: entry.role, run_id: entry.run_id, terminal_status: entry.terminal_status,
+      })),
+    },
+    runCaseOracles(caseRecord, caseState, state, campaignDir, childEnv),
+  );
+  // US-010 contract gate (mirrors applyReplayCacheHitGate): a violated
+  // contract must never PASS — a broken flag routing or a stub leak on the
+  // control run is a mechanical probe failure, surfaced as the distinct
+  // token-saver-contract finding. Oracle verdicts that already failed
+  // (PRODUCT_FAIL / TEST_INFRA) are preserved.
+  if (contract.violated === true) {
+    caseState.findings.push({ ...contract.finding, detected_at: utcTimestamp() });
+    if (verdict.outcome === 'PASS') {
+      verdict = {
+        outcome: 'INCONCLUSIVE',
+        reason: { category: 'token-saver-contract-violated', ...contract.finding },
+      };
+    }
+  }
+  persistClassifiedAttempt(caseState, attempt, state, campaignDir, verdict);
+}
+
+// US-006 (S9 controller): REPLAY cache-HIT gate.
+//
+// After terminal harvest, a replay case's oracle-evidence snapshot MUST show
+// a cache-hit shim observation for THIS attempt's run — a suite observation
+// with a cache-hit/replay phase bound to the pair's origin_repo/tree/cmd key
+// (the launch-intent gate key captured over the pair's clone, plus the
+// pair's committed tree resolved from that clone). Without the gate, a
+// replay that executed/recorded instead of replaying would silently PASS;
+// the tier1-traceability.md replay_of contract promises the assertion is a
+// mechanical gate, never a hope.
+//
+// Snapshot source: in production the gate reads the snapshot the controller
+// collected under the campaign directory (attempt.oracle_evidence.ledger_path
+// written by beginCaseOracleSnapshot). The self-test seam
+// (TT_CONTROLLER_REPLAY_SNAPSHOT_FIXTURE_DIR + TT_CONTROLLER_SELF_TEST=1)
+// redirects the read to a caller-seeded snapshot tree beneath torture-test/
+// var so controller tests can seed hit/miss/malformed fixtures without
+// launching real runs.
+function replaySnapshotRoot(campaignDir) {
+  const override = process.env.TT_CONTROLLER_REPLAY_SNAPSHOT_FIXTURE_DIR;
+  if (override === undefined) return campaignDir;
+  if (process.env.TT_CONTROLLER_SELF_TEST !== '1') {
+    throw new Error('TT_CONTROLLER_REPLAY_SNAPSHOT_FIXTURE_DIR requires TT_CONTROLLER_SELF_TEST=1');
+  }
+  const candidate = path.resolve(override);
+  let details;
+  try {
+    details = fs.lstatSync(candidate);
+  } catch (error) {
+    throw new Error(`self-test replay snapshot root is not readable: ${error.message}`);
+  }
+  const realVarRoot = fs.realpathSync(VAR_ROOT);
+  let realCandidate;
+  try {
+    realCandidate = fs.realpathSync(candidate);
+  } catch {
+    throw new Error('self-test replay snapshot root does not exist');
+  }
+  if (!details.isDirectory() || details.isSymbolicLink() || !pathIsWithin(realVarRoot, realCandidate)) {
+    throw new Error('self-test replay snapshot root must be a contained regular directory beneath torture-test/var');
+  }
+  return realCandidate;
+}
+
+function readReplaySnapshotFile(root, relativePath) {
+  if (typeof relativePath !== 'string' || relativePath.length === 0 || path.isAbsolute(relativePath)) {
+    throw new Error(`snapshot reference path is invalid: ${JSON.stringify(relativePath)}`);
+  }
+  const candidate = path.resolve(root, relativePath.split('/').join(path.sep));
+  if (!pathIsWithin(fs.realpathSync(root), fs.realpathSync(candidate))) {
+    throw new Error(`snapshot reference escapes the snapshot root: ${relativePath}`);
+  }
+  return JSON.parse(fs.readFileSync(candidate, 'utf8'));
+}
+
+// Result contract (never throws):
+//   { ok: true, evidence }                       hit proven — record evidence
+//   { ok: false, kind: 'replay-cache-miss', finding }
+//        no cache-hit/replay observation for this run — NOT PASS
+//   { ok: false, kind: 'replay-cache-infra', reason }
+//        malformed/missing/unreadable snapshot — fail closed TEST_INFRA
+function assessReplayCacheHit(caseRecord, caseState, attempt, state, campaignDir, childEnv) {
+  const replayOf = replayPairOf(caseRecord);
+  const infra = (category, message) => ({
+    ok: false,
+    kind: 'replay-cache-infra',
+    reason: { category, message, replay_of: replayOf, attempt_id: attempt.id },
+  });
+  try {
+    const root = replaySnapshotRoot(campaignDir);
+    let ledgerRelative = null;
+    if (typeof attempt.oracle_evidence?.ledger_path === 'string'
+        && attempt.oracle_evidence.ledger_path.length > 0) {
+      ledgerRelative = attempt.oracle_evidence.ledger_path;
+    } else if (root !== campaignDir) {
+      ledgerRelative = `snapshots/${caseRecord.id}/${attempt.id}/snapshot.json`;
+    }
+    if (ledgerRelative === null) {
+      return infra('replay-snapshot-missing',
+        'replay attempt has no oracle-evidence snapshot ledger; the cache-hit assertion cannot run');
+    }
+    const ledger = readReplaySnapshotFile(root, ledgerRelative);
+    if (!isObject(ledger)) throw new Error('snapshot ledger is not a JSON object');
+    if (ledger.status !== 'COMPLETE') {
+      return infra('replay-snapshot-incomplete',
+        `snapshot ledger status is ${JSON.stringify(ledger.status)}, not COMPLETE`);
+    }
+    if (!isObject(ledger.files) || !isObject(ledger.files.suite_observations)
+        || !isObject(ledger.files.launch_intent)) {
+      throw new Error('snapshot ledger lacks suite_observations/launch_intent references');
+    }
+    const suiteObservations = readReplaySnapshotFile(root, ledger.files.suite_observations.path);
+    if (!isObject(suiteObservations) || !Array.isArray(suiteObservations.rows)) {
+      throw new Error('suite observations lacks a rows array');
+    }
+    const launchIntent = readReplaySnapshotFile(root, ledger.files.launch_intent.path);
+    const gateKey = launchIntent?.gate_key;
+    if (!isObject(gateKey) || typeof gateKey.origin_repo !== 'string' || gateKey.origin_repo.length === 0
+        || typeof gateKey.cmd_hash !== 'string' || gateKey.cmd_hash.length === 0) {
+      throw new Error('launch intent lacks an origin/cmd gate key');
+    }
+    // The pair's committed tree, resolved from the shared work clone at
+    // assertion time. The replay task forbids tree modifications, so the
+    // clone's committed HEAD tree IS the pair's tree; a replay that
+    // committed a change binds the suite to a different key and correctly
+    // fails the pair-key binding below.
+    const clonePath = attempt.fixture_work_clone;
+    if (typeof clonePath !== 'string' || clonePath.length === 0) {
+      return infra('replay-clone-missing',
+        'replay attempt has no resolved work clone; the pair tree binding cannot run');
+    }
+    const gitResult = resolveReplayPairCommittedTree(clonePath, childEnv);
+    const pairTree = String(gitResult.stdout ?? '').trim();
+    if (gitResult.error !== undefined || gitResult.status !== 0 || !/^[0-9a-f]{40,64}$/.test(pairTree)) {
+      return infra('replay-tree-unresolvable',
+        `cannot resolve the replay pair's committed tree: ${gitResult.error?.message ?? String(gitResult.stderr ?? '').trim() ?? `git exit ${gitResult.status}`}`);
+    }
+    const runRows = suiteObservations.rows.filter((row) => isObject(row) && row.run_id === attempt.run_id);
+    const hitRows = runRows.filter((row) => row.phase === 'replay'
+      && row.origin_repo === gateKey.origin_repo
+      && row.cmd_hash === gateKey.cmd_hash
+      && typeof row.tree_hash === 'string' && row.tree_hash === pairTree);
+    const observedPhases = [...new Set(runRows.map((row) => row.phase).filter((phase) => typeof phase === 'string'))];
+    if (hitRows.length > 0) {
+      return {
+        ok: true,
+        evidence: {
+          status: 'replay-cache-hit',
+          replay_of: replayOf,
+          run_id: attempt.run_id,
+          hit_observation: hitRows[0],
+          observed_phases: observedPhases,
+          key: { origin_repo: gateKey.origin_repo, cmd_hash: gateKey.cmd_hash, tree_hash: pairTree },
+        },
+      };
+    }
+    return {
+      ok: false,
+      kind: 'replay-cache-miss',
+      finding: {
+        replay_of: replayOf,
+        run_id: attempt.run_id,
+        observed_phases: observedPhases,
+        expected_key: { origin_repo: gateKey.origin_repo, cmd_hash: gateKey.cmd_hash, tree_hash: pairTree },
+        observed_rows: runRows,
+      },
+    };
+  } catch (error) {
+    return infra('replay-snapshot-unreadable',
+      `replay cache-hit assertion could not read the oracle-evidence snapshot: ${error.message}`);
+  }
+}
+
+// Read-only git plumbing over the replay's shared work clone. Like every
+// spawn site in the controller, it passes the containment choke-point first
+// and runs with the contained child environment.
+function resolveReplayPairCommittedTree(clonePath, childEnv) {
+  assertContainedSpawnEnv(childEnv);
+  return spawnSync('git', ['-C', clonePath, 'rev-parse', '--verify', 'HEAD^{tree}'], {
+    cwd: fs.realpathSync(TT_ROOT),
+    env: childEnv,
+    encoding: 'utf8',
+    shell: false,
+    timeout: 15_000,
+  });
+}
+
+// Apply the gate to a terminal-harvest verdict:
+//   hit   -> verdict unchanged; PASS carries the assertion evidence
+//   miss  -> never PASS: REPLAY_CACHE_MISS finding on the case +
+//            replay-cache-miss classification reason (a non-PASS verdict
+//            keeps its own classification and additionally carries the finding)
+//   infra -> fail closed as TEST_INFRA_FAIL, never PASS
+// The gate result is always recorded on the attempt (replay_cache_assertion)
+// so both hits and failures leave durable evidence.
+function applyReplayCacheHitGate(caseRecord, caseState, attempt, state, campaignDir, verdict, childEnv) {
+  if (replayPairOf(caseRecord) === null) return verdict;
+  const gate = assessReplayCacheHit(caseRecord, caseState, attempt, state, campaignDir, childEnv);
+  attempt.replay_cache_assertion = gate;
+  if (gate.ok) return verdict;
+  if (gate.kind === 'replay-cache-infra') {
+    return { outcome: 'TEST_INFRA_FAIL', reason: gate.reason };
+  }
+  caseState.findings.push({ type: 'REPLAY_CACHE_MISS', ...gate.finding, detected_at: utcTimestamp() });
+  if (verdict.outcome === 'PASS') {
+    return {
+      outcome: 'INCONCLUSIVE',
+      reason: { category: 'replay-cache-miss', ...gate.finding },
+    };
+  }
+  return verdict;
 }
 
 const FULL_RUN_ID_PATTERN = /(?:^|\r?\n)Run:\s+(run-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/gim;
@@ -2711,6 +3613,9 @@ function captureStragglerPreStop(run, status, breach, capturedAt) {
       cap: breach.cap,
       threshold: breach.threshold,
       observed: breach.observed,
+      ...(breach.enforcement_latency === undefined
+        ? {}
+        : { enforcement_latency: breach.enforcement_latency }),
     },
     steps_snapshot: {
       source: 'workflow-status-json',
@@ -2738,19 +3643,38 @@ async function stopDiscoveredRun(caseState, run, breach, childEnv, state, campai
   if (!hookSucceeded(stopResult)) throw new Error(`workflow stop failed for ${run.run_id}`);
 }
 
+// S8a (US-002): discovered-run cap-breach evaluation runs on the same
+// dedicated cap-check cadence as primary attempts, decoupled from the token
+// poll — so a child run of a multi-run case is stopped near its wall
+// deadline (or its token threshold) even when the token poll interval is
+// much larger than the cap window. The breach record carries both
+// `observed` and `enforcement_latency` (seconds from threshold/deadline
+// crossing to detection) in stop_reason, the RUNAWAY finding, and
+// straggler_capture.reason. The stop -> bounded-wait -> terminal-harvest
+// path (including the cleanupWaitTimeoutMs bound) is unchanged.
 async function awaitDiscoveredRun(caseRecord, caseState, run, childEnv, state, campaignDir) {
   const cleanupWaitTimeoutMs = Math.min(state.options.token_poll_interval_ms, 60_000);
   const initialBreach = discoveredRunBreach(caseRecord, caseState, run);
   if (initialBreach !== null) {
+    const detectedAt = utcTimestamp();
+    initialBreach.enforcement_latency = capEnforcementLatencySeconds(
+      caseState, run, initialBreach, detectedAt,
+    );
     await stopDiscoveredRun(caseState, run, initialBreach, childEnv, state, campaignDir);
   }
 
   run.reattach_count = (run.reattach_count ?? 0) + 1;
   let waitSettled = false;
+  // The wait hook is NOT wall-limited here: the cap-check loop below is the
+  // sole wall enforcement for the pre-stop phase (a wall-limited wait would
+  // race the cap-check stop at the deadline and poison the harvested wait
+  // evidence with a SIGTERM kill). The wait settles either on natural
+  // termination or when the cap-check stop lands; the post-stop wait keeps
+  // its existing bounded cleanup timeout.
   const waitPromise = runHook(`discovered_wait_${run.reattach_count}`, {
     executable: 'tamandua', args: ['workflow', 'wait', run.run_id, '--json'], cwd: '.',
   }, childEnv, campaignDir, state, run, {
-    enforceWall: run.stop_intent_at === undefined,
+    enforceWall: false,
     timeoutMs: run.stop_intent_at === undefined ? undefined : cleanupWaitTimeoutMs,
   })
     .then((result) => {
@@ -2758,24 +3682,43 @@ async function awaitDiscoveredRun(caseRecord, caseState, run, childEnv, state, c
       return result;
     });
 
+  // Dual-cadence wait loop (mirrors monitorWorkflowRun): status observation
+  // stays on the token-poll cadence; the cap-breach evaluation ticks on the
+  // cap-check cadence. Each loop wake is driven by whichever is due next.
+  const tokenPollMs = state.options.token_poll_interval_ms;
+  const capCheckMs = state.options.cap_check_interval_ms;
+  let nextTokenPollAt = Date.now() + tokenPollMs;
+  let nextCapCheckAt = Date.now() + capCheckMs;
   while (!waitSettled) {
-    const remainingWallMs = Math.max(1, new Date(run.deadline_at).valueOf() - Date.now());
+    const waitMs = Math.max(1, Math.min(nextTokenPollAt, nextCapCheckAt) - Date.now());
     await new Promise((resolve) => {
-      const timer = setTimeout(resolve, Math.min(state.options.token_poll_interval_ms, remainingWallMs));
+      const timer = setTimeout(resolve, waitMs);
       waitPromise.then(() => {
         clearTimeout(timer);
         resolve();
       });
     });
     if (waitSettled) break;
-    const status = queryWorkflowStatus(run.run_id, childEnv);
-    persistTokenObservation(status, run, caseState, state, campaignDir);
-    if (TERMINAL_RUN_STATUSES.has(status.status)) continue;
-    const breach = discoveredRunBreach(caseRecord, caseState, run);
-    if (breach !== null) {
-      await stopDiscoveredRun(caseState, run, breach, childEnv, state, campaignDir, status);
-      break;
+
+    const now = Date.now();
+    const tokenPollDue = now >= nextTokenPollAt;
+    const capCheckDue = now >= nextCapCheckAt;
+    if (tokenPollDue) nextTokenPollAt = now + tokenPollMs;
+    if (capCheckDue) nextCapCheckAt = now + capCheckMs;
+
+    if (tokenPollDue) {
+      const status = queryWorkflowStatus(run.run_id, childEnv);
+      persistTokenObservation(status, run, caseState, state, campaignDir);
+      if (TERMINAL_RUN_STATUSES.has(status.status)) continue;
     }
+
+    if (!capCheckDue) continue;
+    const breach = discoveredRunBreach(caseRecord, caseState, run);
+    if (breach === null) continue;
+    const detectedAt = utcTimestamp();
+    breach.enforcement_latency = capEnforcementLatencySeconds(caseState, run, breach, detectedAt);
+    await stopDiscoveredRun(caseState, run, breach, childEnv, state, campaignDir);
+    break;
   }
 
   let waitResult = await waitPromise;
@@ -2786,6 +3729,8 @@ async function awaitDiscoveredRun(caseRecord, caseState, run, childEnv, state, c
     if (breach === null) {
       throw new Error(`discovered run remained ${status.status} after workflow wait: ${run.run_id}`);
     }
+    const detectedAt = utcTimestamp();
+    breach.enforcement_latency = capEnforcementLatencySeconds(caseState, run, breach, detectedAt);
     await stopDiscoveredRun(caseState, run, breach, childEnv, state, campaignDir, status);
     const terminalWait = await runHook(`discovered_terminal_wait_${run.reattach_count}`, {
       executable: 'tamandua', args: ['workflow', 'wait', run.run_id, '--json'], cwd: '.',
@@ -2829,10 +3774,51 @@ async function convergeDiscoveredRuns(caseRecord, caseState, childEnv, state, ca
   }
 }
 
+// S8a (US-001): cap-breach checks run on their own cadence (cap_check_interval_ms),
+// decoupled from the token poll, so a short wall cap fires near its deadline
+// instead of waiting for the next (potentially 5-minute) token poll. The breach
+// record carries both `observed` and `enforcement_latency` — seconds from the
+// deadline/threshold crossing to detection.
+function capEnforcementLatencySeconds(caseState, attempt, breach, detectedAt) {
+  const detectedAtMs = new Date(detectedAt).valueOf();
+  if (breach.cap === 'wall_min') {
+    const crossingMs = new Date(attempt.started_at).valueOf() + breach.threshold * 60_000;
+    return Math.max(0, (detectedAtMs - crossingMs) / 1000);
+  }
+  if (breach.cap === 'tokens') {
+    const crossing = (caseState.spend.observations ?? [])
+      .find((observation) => observation.tokens_observed >= breach.threshold);
+    if (crossing === undefined) return 0;
+    return Math.max(0, (detectedAtMs - new Date(crossing.observed_at).valueOf()) / 1000);
+  }
+  return 0;
+}
+
+function workflowRunBreach(caseRecord, caseState, attempt) {
+  if (caseState.spend.tokens_observed >= caseRecord.caps.tokens) {
+    return {
+      cap: 'tokens', threshold: caseRecord.caps.tokens, observed: caseState.spend.tokens_observed,
+    };
+  }
+  const elapsedWallMin = (Date.now() - new Date(attempt.started_at).valueOf()) / 60_000;
+  if (elapsedWallMin >= caseRecord.caps.wall_min) {
+    return { cap: 'wall_min', threshold: caseRecord.caps.wall_min, observed: elapsedWallMin };
+  }
+  return undefined;
+}
+
 async function monitorWorkflowRun(caseRecord, caseState, attempt, childEnv, state, campaignDir, launchEndedPromise) {
+  // Token observation persistence and discovered-run reconciliation stay on the
+  // token-poll cadence; only the cap-breach evaluation ticks faster. Each loop
+  // wake is driven by whichever cadence is due next.
+  const tokenPollMs = state.options.token_poll_interval_ms;
+  const capCheckMs = state.options.cap_check_interval_ms;
+  let nextTokenPollAt = Date.now() + tokenPollMs;
+  let nextCapCheckAt = Date.now() + capCheckMs;
   while (true) {
+    const waitMs = Math.max(1, Math.min(nextTokenPollAt, nextCapCheckAt) - Date.now());
     const launchEnded = await new Promise((resolve) => {
-      const timer = setTimeout(() => resolve(false), state.options.token_poll_interval_ms);
+      const timer = setTimeout(() => resolve(false), waitMs);
       launchEndedPromise.then(() => {
         clearTimeout(timer);
         resolve(true);
@@ -2840,25 +3826,28 @@ async function monitorWorkflowRun(caseRecord, caseState, attempt, childEnv, stat
     });
     if (launchEnded && attempt.stop_intent_at === undefined) return { stopped: false };
 
-    const status = queryWorkflowStatus(attempt.run_id, childEnv);
-    persistTokenObservation(status, attempt, caseState, state, campaignDir);
-    reconcileDiscoveredRuns(caseRecord, caseState, childEnv, state, campaignDir);
-    if (TERMINAL_RUN_STATUSES.has(status.status)) return { stopped: false, terminal_status: status.status };
+    const now = Date.now();
+    const tokenPollDue = now >= nextTokenPollAt;
+    const capCheckDue = now >= nextCapCheckAt;
+    if (tokenPollDue) nextTokenPollAt = now + tokenPollMs;
+    if (capCheckDue) nextCapCheckAt = now + capCheckMs;
 
-    const elapsedWallMin = (Date.now() - new Date(attempt.started_at).valueOf()) / 60_000;
-    let breach;
-    if (caseState.spend.tokens_observed >= caseRecord.caps.tokens) {
-      breach = {
-        cap: 'tokens', threshold: caseRecord.caps.tokens, observed: caseState.spend.tokens_observed,
-      };
-    } else if (elapsedWallMin >= caseRecord.caps.wall_min) {
-      breach = { cap: 'wall_min', threshold: caseRecord.caps.wall_min, observed: elapsedWallMin };
+    if (tokenPollDue) {
+      const status = queryWorkflowStatus(attempt.run_id, childEnv);
+      persistTokenObservation(status, attempt, caseState, state, campaignDir);
+      reconcileDiscoveredRuns(caseRecord, caseState, childEnv, state, campaignDir);
+      if (TERMINAL_RUN_STATUSES.has(status.status)) return { stopped: false, terminal_status: status.status };
     }
+
+    if (!capCheckDue) continue;
+    const breach = workflowRunBreach(caseRecord, caseState, attempt);
     if (breach === undefined) continue;
 
     const detectedAt = utcTimestamp();
+    breach.enforcement_latency = capEnforcementLatencySeconds(caseState, attempt, breach, detectedAt);
     attempt.stop_intent_at = detectedAt;
     attempt.stop_reason = breach;
+    const status = queryWorkflowStatus(attempt.run_id, childEnv);
     captureStragglerPreStop(attempt, status, breach, detectedAt);
     caseState.findings.push({ type: 'RUNAWAY', ...breach, run_id: attempt.run_id, detected_at: detectedAt });
     state.updated_at = detectedAt;
@@ -2934,6 +3923,120 @@ function readLaunchEvidenceStderr(campaignDir, launchResult) {
 
 async function executeWorkflowCase(caseRecord, caseState, state, campaignDir) {
   if (hasAssociatedNonterminalRun(caseState)) return;
+
+  // US-005 (S9 controller): REPLAY same-origin provisioning + sequencing
+  // guard. Resolve the pair BEFORE creating the launch attempt so an
+  // interrupted bounded wait leaves the case 'pending' (clean resume) rather
+  // than a half-recorded attempt. Fail-closed categories are distinct and
+  // recorded on a launch-intent attempt as TEST_INFRA_FAIL evidence.
+  const replayOf = replayPairOf(caseRecord);
+  let replayContext = null;
+  if (replayOf !== null) {
+    const resolved = await resolveReplayPairContext(replayOf, caseRecord, state);
+    if (!resolved.ok) {
+      const guardTimestamp = utcTimestamp();
+      const guardAttempt = {
+        id: `attempt-${caseState.attempts.length + 1}`,
+        case_id: caseRecord.id,
+        kind: 'workflow',
+        phase: 'launch-intent',
+        execution_mode: caseUsesScriptedEnvironment(caseRecord) ? 'scripted' : 'real',
+        launch_intent_at: guardTimestamp,
+        started_at: guardTimestamp,
+        deadline_at: new Date(Date.now() + (caseRecord.caps.wall_min * 60_000)).toISOString(),
+        ...retryAttemptMetadata(caseState),
+      };
+      caseState.phase = 'running';
+      caseState.attempts.push(guardAttempt);
+      state.updated_at = guardTimestamp;
+      atomicWriteState(campaignDir, state);
+      guardAttempt.phase = 'terminal';
+      guardAttempt.terminal_at = utcTimestamp();
+      persistMechanicalOutcome(caseState, guardAttempt, state, campaignDir, 'TEST_INFRA_FAIL', resolved.reason);
+      return;
+    }
+    replayContext = resolved;
+  }
+
+  // US-008 (S11 controller): local-sentinel launch adapter guard. Resolve the
+  // sentinel BEFORE the launch attempt is created so an unsupported profile
+  // (workflow `local` + any harness other than pi) fails closed on a
+  // launch-intent attempt with the distinct `local-sentinel-unsupported`
+  // reason — the literal argv `workflow run local` is never constructed or
+  // executed (workflowRunArgs enforces the same invariant at every call
+  // site). The supported W2.24 shape (local + pi) resolves to tt-docs-drift
+  // and records adapter evidence on the attempt.
+  const sentinel = resolveLocalSentinel(caseRecord);
+  if (sentinel.sentinel && !sentinel.ok) {
+    const guardTimestamp = utcTimestamp();
+    const guardAttempt = {
+      id: `attempt-${caseState.attempts.length + 1}`,
+      case_id: caseRecord.id,
+      kind: 'workflow',
+      phase: 'launch-intent',
+      execution_mode: caseUsesScriptedEnvironment(caseRecord) ? 'scripted' : 'real',
+      launch_intent_at: guardTimestamp,
+      started_at: guardTimestamp,
+      deadline_at: new Date(Date.now() + (caseRecord.caps.wall_min * 60_000)).toISOString(),
+      ...retryAttemptMetadata(caseState),
+      sentinel_adapter: {
+        profile: sentinel.profile,
+        workflow_id: null,
+        resolution: 'local-sentinel-unsupported',
+        install: { outcome: 'not-attempted' },
+      },
+    };
+    caseState.phase = 'running';
+    caseState.attempts.push(guardAttempt);
+    state.updated_at = guardTimestamp;
+    atomicWriteState(campaignDir, state);
+    guardAttempt.phase = 'terminal';
+    guardAttempt.terminal_at = utcTimestamp();
+    persistMechanicalOutcome(caseState, guardAttempt, state, campaignDir, 'TEST_INFRA_FAIL', sentinel.reason);
+    return;
+  }
+
+  // US-010 (S12 controller): token-saver paired-launch guard. The adapter is
+  // a REAL-case behavior (the W3.23 probe runs two do-now launches against
+  // the contained daemon's PATH). A scripted case carrying the signal fails
+  // closed with a distinct reason BEFORE any launch attempt is created.
+  const tokenSaverCase = tokenSaverControl(caseRecord);
+  if (tokenSaverCase && caseUsesScriptedEnvironment(caseRecord)) {
+    const guardTimestamp = utcTimestamp();
+    const guardAttempt = {
+      id: `attempt-${caseState.attempts.length + 1}`,
+      case_id: caseRecord.id,
+      kind: 'workflow',
+      phase: 'launch-intent',
+      execution_mode: 'scripted',
+      launch_intent_at: guardTimestamp,
+      started_at: guardTimestamp,
+      deadline_at: new Date(Date.now() + (caseRecord.caps.wall_min * 60_000)).toISOString(),
+      ...retryAttemptMetadata(caseState),
+      token_saver_adapter: {
+        profile: {
+          workflow: caseRecord.workflow,
+          harness: caseRecord.harness,
+          execution_mode: caseRecord.context?.execution_mode ?? null,
+          case_id: caseRecord.id,
+        },
+        resolution: 'token-saver-scripted-unsupported',
+      },
+    };
+    caseState.phase = 'running';
+    caseState.attempts.push(guardAttempt);
+    state.updated_at = guardTimestamp;
+    atomicWriteState(campaignDir, state);
+    guardAttempt.phase = 'terminal';
+    guardAttempt.terminal_at = utcTimestamp();
+    persistMechanicalOutcome(caseState, guardAttempt, state, campaignDir, 'TEST_INFRA_FAIL', {
+      category: 'token-saver-scripted-unsupported',
+      message: 'the token-saver paired-launch adapter is a real-case behavior; a scripted case carrying context.token_saver_control is not the supported W3.23 shape',
+      profile: guardAttempt.token_saver_adapter.profile,
+    });
+    return;
+  }
+
   const launchIntentTimestamp = utcTimestamp();
   const attempt = {
     id: `attempt-${caseState.attempts.length + 1}`,
@@ -2945,6 +4048,16 @@ async function executeWorkflowCase(caseRecord, caseState, state, campaignDir) {
     started_at: launchIntentTimestamp,
     deadline_at: new Date(Date.now() + (caseRecord.caps.wall_min * 60_000)).toISOString(),
     ...retryAttemptMetadata(caseState),
+    // US-008 adapter evidence: recorded at attempt creation so EVERY
+    // downstream path (dry-run, install failure, launch) persists it.
+    ...(sentinel.sentinel ? {
+      sentinel_adapter: {
+        profile: sentinel.profile,
+        workflow_id: sentinel.workflow_id,
+        resolution: 'local-sentinel',
+        install: { outcome: 'pending' },
+      },
+    } : {}),
   };
   caseState.phase = 'running';
   caseState.attempts.push(attempt);
@@ -2961,7 +4074,24 @@ async function executeWorkflowCase(caseRecord, caseState, state, campaignDir) {
   // failure persists TEST_INFRA_FAIL with a precise category/reason
   // (fail-closed); on a healthy host it must never be reached. Breakage is
   // never a silent half-launch.
+  //
+  // US-005 (S9 controller): a REPLAY attempt is the one exception — it NEVER
+  // provisions its own clone (no wipe/re-clone). It reuses the pair's clone
+  // resolved above, so the pair's tree persists unchanged into the replay and
+  // the origin_repo identity matches the pair's exactly (TSTX origin-scoped
+  // contract). The resolved provenance is recorded as attempt evidence.
   if (attempt.execution_mode === 'real') {
+    if (replayContext !== null) {
+      attempt.fixture_work_clone = replayContext.clonePath;
+      attempt.replay_provenance = {
+        replay_of: replayOf,
+        pair_clone_path: replayContext.clonePath,
+        pair_terminal: true,
+        pair_terminal_at: replayContext.pairState.terminal_at ?? null,
+        pair_outcome: replayContext.pairState.outcome ?? null,
+        provision_skipped: true,
+      };
+    } else {
     const provision = provisionWorkClone({
       fixture: caseRecord.fixture,
       caseId: caseRecord.id,
@@ -2992,6 +4122,35 @@ async function executeWorkflowCase(caseRecord, caseState, state, campaignDir) {
       junk_verified: provision.junkVerified,
       prepared_at: provision.prepared_at,
     };
+    }
+  }
+
+  // US-010 (S12 controller): token-saver paired-launch evidence. Pre-declare
+  // the pair's launch argvs on the attempt BEFORE any consumer reads them —
+  // the dry-run recorder and the oracle snapshot's launch-intent both bind
+  // to the FLAGGED run's argv as the primary. The real launch leg fills in
+  // run ids, token ledgers, and stub-record counts.
+  if (tokenSaverCase) {
+    attempt.token_saver = {
+      adapter: 'token-saver-paired-launch',
+      status: 'pending',
+      launches: [
+        {
+          role: 'flagged',
+          argv: ['tamandua', ...workflowRunArgs(caseRecord, attempt.fixture_work_clone, [TOKEN_SAVER_FLAG])],
+          flag_present: true,
+          stub: { expectation: 'install' },
+        },
+        {
+          role: 'control',
+          argv: ['tamandua', ...workflowRunArgs(caseRecord, attempt.fixture_work_clone)],
+          flag_present: false,
+          stub: { expectation: 'remove' },
+        },
+      ],
+    };
+    state.updated_at = utcTimestamp();
+    atomicWriteState(campaignDir, state);
   }
 
   // Zero-token dry-run hook (US-006): when TT_DRY_RUN_REAL_LAUNCH is set,
@@ -2999,7 +4158,39 @@ async function executeWorkflowCase(caseRecord, caseState, state, campaignDir) {
   // each real (non-scripted) case, then mark it PASS without spawning the
   // model-backed run. Walled off: unset => previous behavior entirely.
   if (attempt.execution_mode === 'real' && dryRunRealLaunchOutPath() !== null) {
-    const launchArgv = ['tamandua', ...workflowRunArgs(caseRecord)];
+    if (tokenSaverCase) {
+      // US-010: a token-saver dry run records BOTH launches — the flagged
+      // argv carries --no-hurry-please-save-tokens-mode, the control argv
+      // does not — and no stub is installed/removed (nothing spawns).
+      let outPath = null;
+      for (const entry of attempt.token_saver.launches) {
+        entry.stub.outcome = 'dry-run-skipped';
+        entry.stub.note = 'zero-token dry run — no stub install/remove performed';
+        outPath = recordDryRunRealLaunch(caseRecord, entry.argv, attempt.fixture_work_clone, {
+          launch_role: entry.role,
+          token_saver_case: true,
+        });
+      }
+      attempt.token_saver.status = 'dry-run-complete';
+      attempt.phase = 'terminal';
+      attempt.terminal_at = utcTimestamp();
+      attempt.terminal_status = 'completed';
+      attempt.dry_run_launch = true;
+      attempt.dry_run_argv = attempt.token_saver.launches.map((entry) => entry.argv);
+      attempt.dry_run_argv_path = outPath;
+      persistMechanicalOutcome(caseState, attempt, state, campaignDir, 'PASS');
+      return;
+    }
+    const launchArgv = ['tamandua', ...workflowRunArgs(caseRecord, attempt.fixture_work_clone)];
+    // US-008: the zero-token dry run never spawns the catalog helper, but the
+    // adapter evidence is still recorded so the dry-run argv proof carries
+    // the resolved sentinel (workflow_id tt-docs-drift, never `local`).
+    if (sentinel.sentinel) {
+      attempt.sentinel_adapter.install = {
+        outcome: 'dry-run-skipped',
+        note: 'zero-token dry run — no catalog install performed; the resolved launch argv names tt-docs-drift',
+      };
+    }
     // US-007: pass the provisioned clone path so the argv record embeds the
     // E2.3-proof lstat at capture time (existed + dir + size). Provisioning
     // ran as a mandatory stage above, so attempt.fixture_work_clone is set.
@@ -3027,6 +4218,31 @@ async function executeWorkflowCase(caseRecord, caseState, state, campaignDir) {
     return;
   }
 
+  // US-008 (S11 controller): local-sentinel catalog install leg. Re-runs the
+  // tt-catalog-install / tt-required-workflows seam under the CONTAINED spawn
+  // env so the sentinel launch is self-sufficient (idempotent, stamp-aware —
+  // a no-op when the preflight already installed a current catalog). A
+  // missing tt-docs-drift spec fails closed with the DISTINCT reason
+  // `catalog-missing: tt-docs-drift` — never a `workflow run local` fallback
+  // and never a half-launch into an absent workflow spec.
+  if (sentinel.sentinel) {
+    const installOutcome = runLocalSentinelCatalogInstall(childEnv);
+    attempt.sentinel_adapter.install = installOutcome;
+    state.updated_at = utcTimestamp();
+    atomicWriteState(campaignDir, state);
+    if (!installOutcome.ok) {
+      attempt.phase = 'terminal';
+      attempt.terminal_at = utcTimestamp();
+      persistMechanicalOutcome(caseState, attempt, state, campaignDir, 'TEST_INFRA_FAIL', {
+        category: installOutcome.reason ?? 'catalog-missing',
+        message: `local-sentinel adapter could not ensure '${sentinel.workflow_id}' is installed in the contained TT home${installOutcome.stderr_tail !== undefined ? `: ${installOutcome.stderr_tail}` : ''}`,
+        sentinel_profile: sentinel.profile,
+        install_outcome: installOutcome,
+      });
+      return;
+    }
+  }
+
   if (caseRecord.reset !== null && caseRecord.reset !== undefined) {
     attempt.phase = 'resetting';
     const resetResult = await runHook('reset', caseRecord.reset, childEnv, campaignDir, state, attempt);
@@ -3045,6 +4261,24 @@ async function executeWorkflowCase(caseRecord, caseState, state, campaignDir) {
 
   beginCaseOracleSnapshot(caseRecord, caseState, attempt, state, campaignDir, childEnv);
 
+  // O9 special-exit battery (chaos.o9_special_exits): the RESTORED working
+  // tree is the evidence the battery produces (tracked-byte restoration and
+  // junk-probe removal are verified against it), so teardown must keep the
+  // clone for post-campaign inspection instead of pruning it on PASS.
+  if (caseRecord.chaos?.o9_special_exits === true) {
+    attempt.o9_special_exit_evidence = true;
+  }
+
+  // US-010 (S12 controller): the token-saver paired launch replaces the
+  // single-launch sequence below for a case with context.token_saver_control.
+  // The adapter reuses every mechanic (runHook launch + run-id capture +
+  // monitor + discovered-run convergence + terminal harvest) for each of the
+  // two runs and persists the pair's evidence + contract finding.
+  if (tokenSaverCase) {
+    await executeTokenSaverPairedLaunch(caseRecord, caseState, state, campaignDir, attempt, childEnv);
+    return;
+  }
+
   attempt.phase = 'running';
   let signalLaunchEnded;
   const launchEndedPromise = new Promise((resolve) => { signalLaunchEnded = resolve; });
@@ -3056,7 +4290,7 @@ async function executeWorkflowCase(caseRecord, caseState, state, campaignDir) {
   });
   const launchResult = await runHook('launch', {
     executable: 'tamandua',
-    args: workflowRunArgs(caseRecord),
+    args: workflowRunArgs(caseRecord, attempt.fixture_work_clone),
     cwd: '.',
   }, childEnv, campaignDir, state, attempt, {
     enforceWall: false,
@@ -3119,10 +4353,15 @@ async function executeWorkflowCase(caseRecord, caseState, state, campaignDir) {
         terminal_status: terminalEvidence.status,
         wait_exit_code: attempt.wait_exit_code,
       };
-    const verdict = outcomeWithOracleEvidence(
-      caseRecord, passed ? 'PASS' : 'INCONCLUSIVE', baseReason,
-      runCaseOracles(caseRecord, caseState, state, campaignDir, childEnv),
+    const oracleResults = runCaseOracles(caseRecord, caseState, state, campaignDir, childEnv);
+    let verdict = outcomeWithOracleEvidence(
+      caseRecord, passed ? 'PASS' : 'INCONCLUSIVE', baseReason, oracleResults,
     );
+    // US-006 (S9 controller): REPLAY cache-HIT gate. The oracle snapshot
+    // completed inside runCaseOracles, so the gate reads the terminal
+    // snapshot (suite observations for this attempt's run). A cap-enforced
+    // branch above never reaches PASS, so it is deliberately not gated.
+    verdict = applyReplayCacheHitGate(caseRecord, caseState, attempt, state, campaignDir, verdict, childEnv);
     persistClassifiedAttempt(caseState, attempt, state, campaignDir, verdict);
   } else {
     attempt.phase = 'attached';
@@ -3247,6 +4486,18 @@ async function recoverLocalAttempt(caseRecord, state, caseState, attempt, campai
 }
 
 async function recoverWorkflowAttempt(caseRecord, state, caseState, attempt, campaignDir) {
+  // US-010 (S12 controller): a token-saver paired-launch attempt can never be
+  // reattached mid-pair safely (the pair's flagged/control windows and stub
+  // toggling are controller-driven state). Fail closed with a distinct
+  // reason — rerun the case to re-drive both launches.
+  if (attempt.token_saver !== undefined) {
+    finishRecoveredAttempt(state, caseState, attempt, campaignDir, 'TEST_INFRA_FAIL', {
+      category: 'token-saver-recovery-unsupported',
+      kind: 'workflow',
+      message: 'the token-saver paired-launch attempt cannot be reattached mid-pair; rerun the case to re-drive both launches',
+    });
+    return;
+  }
   if (typeof attempt.run_id !== 'string') {
     finishRecoveredAttempt(state, caseState, attempt, campaignDir, 'TEST_INFRA_FAIL', {
       category: 'unidentified-launch-intent',
@@ -3317,6 +4568,9 @@ async function recoverWorkflowAttempt(caseRecord, state, caseState, attempt, cam
     });
     return;
   }
+  // US-006 (S9 controller): a resumed replay attempt must clear the same
+  // cache-HIT gate as a fresh harvest — recovery can never bypass it.
+  verdict = applyReplayCacheHitGate(caseRecord, caseState, attempt, state, campaignDir, verdict, childEnv);
   attempt.phase = 'terminal';
   attempt.terminal_at = utcTimestamp();
   attempt.recovery = {
@@ -3570,6 +4824,8 @@ function validateLoadedState(state, campaignId) {
       || !Number.isSafeInteger(state.options.stagger_ms) || state.options.stagger_ms < 0
       || !Number.isSafeInteger(state.options.token_poll_interval_ms)
       || state.options.token_poll_interval_ms < 1
+      || !Number.isSafeInteger(state.options.cap_check_interval_ms)
+      || state.options.cap_check_interval_ms < 1
       || (state.options.execution_selection !== undefined
         && !['all', 'scripted-only'].includes(state.options.execution_selection))
       || (state.options.provider_retry_backoff_ms !== undefined
@@ -3688,6 +4944,7 @@ function createInitialState(campaignId, manifestPath, manifest, options) {
       concurrency: options.concurrency,
       stagger_ms: options.staggerMs,
       token_poll_interval_ms: configuredTokenPollIntervalMs(),
+      cap_check_interval_ms: configuredCapCheckIntervalMs(),
       provider_retry_backoff_ms: configuredProviderRetryBackoffMs(),
       execution_selection: options.scriptedOnly ? 'scripted-only' : 'all',
     },
@@ -3709,6 +4966,12 @@ function createInitialState(campaignId, manifestPath, manifest, options) {
       fixture: record.fixture,
       harness: record.harness,
       class: record.class,
+      // US-005 (S9 controller): replay pairing is persisted on the case state
+      // so terminalization teardown can keep a replay PAIR's clone (and every
+      // other consumer can resolve the pair relationship without the manifest).
+      replay_of: typeof record.context?.replay_of === 'string' && record.context.replay_of !== ''
+        ? record.context.replay_of
+        : null,
       production_duration_floor_ms: record.production_duration_floor_ms ?? null,
       expected_fast_failure: record.expected_fast_failure ?? false,
       phase: 'pending',
