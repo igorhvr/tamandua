@@ -388,6 +388,38 @@ nav ul li a:focus-visible {
   outline-offset: 1px;
 }
 
+/* Prominent GitHub source link in the header nav (top right on desktop,
+   inside the hamburger menu on mobile — it lives inside #nav-links) */
+#nav-links a.nav-github {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  margin-left: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  color: var(--color-text-em);
+  font-weight: var(--fw-semibold);
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  background: var(--color-surface);
+  transition:
+    color var(--transition),
+    border-color var(--transition),
+    background var(--transition),
+    transform var(--transition);
+}
+
+#nav-links a.nav-github:hover {
+  color: var(--color-accent);
+  border-color: var(--color-accent);
+  background: var(--color-accent-soft);
+  text-decoration: none;
+  transform: translateY(-1px);
+}
+
+#nav-links a.nav-github svg {
+  flex-shrink: 0;
+}
+
 /* Mobile nav default: hidden unless toggled */
 @media (max-width: 767px) {
   /* Hide the hamburger on mobile (it's always visible), but toggle nav links */

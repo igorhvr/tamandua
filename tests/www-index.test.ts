@@ -89,7 +89,7 @@ describe("www/index.html structure", () => {
 
   it("links to pi GitHub repository", () => {
     assert.ok(
-      html.includes("github.com/mariozechner/pi-coding-agent"),
+      html.includes("github.com/earendil-works/pi"),
       "should link to pi on GitHub"
     );
   });
@@ -208,6 +208,24 @@ describe("www/index.html structure", () => {
     assert.ok(
       html.includes("github.com/igorhvr/tamandua"),
       "should link to the GitHub repo"
+    );
+  });
+
+  it("header nav links to the GitHub source repository prominently", () => {
+    const navLinksMatch = html.match(/<ul[^>]*id="nav-links"[^>]*>([\s\S]*?)<\/ul>/);
+    assert.ok(navLinksMatch, "should have nav-links ul");
+    const navLinks = navLinksMatch[1];
+    assert.ok(
+      navLinks.includes('href="https://github.com/igorhvr/tamandua"'),
+      "header nav should link to github.com/igorhvr/tamandua"
+    );
+    assert.ok(
+      navLinks.includes('class="nav-github"'),
+      "header GitHub link should use the prominent .nav-github style"
+    );
+    assert.ok(
+      /aria-label="Tamandua on GitHub"/.test(navLinks),
+      "header GitHub link should have an accessible aria-label"
     );
   });
 
