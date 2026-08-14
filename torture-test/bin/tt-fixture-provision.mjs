@@ -43,6 +43,17 @@
 // A provision failure yields a precise TEST_INFRA reason (fail-closed) — on a
 // healthy host it must never be reached.
 //
+// FIXTURE ALIASES (hostile-path probes, E3.A S14 US-010): a RESERVED alias
+// fixture name — W1.X1's 'tt-ts café' (U+0020 space + U+00E9 é) — resolves to
+// its canonical fixture through the FIXTURE_ALIASES registry below for every
+// golden-bare / hash-ledger / fixture-source / arming lookup, while the WORK
+// CLONE PATH keeps the authored name VERBATIM
+// (var/fixtures/work/<case-id>/<fixture>) — the hostile characters in the
+// clone path ARE the probe. The controller passes the manifest fixture name
+// through unchanged, so this module is the single choke point: alias values
+// are authored, never ad-hoc, and an UNLISTED non-canonical name still fails
+// closed as unknown-fixture.
+//
 // This is a standalone importable module AND a thin CLI, mirroring
 // tt-golden-bootstrap.mjs. US-004 imports `provisionWorkClone` from here and
 // calls it as a mandatory stage before the real-case workflow launch builds
@@ -66,6 +77,31 @@ const __filename = fileURLToPath(import.meta.url);
 export const BIN_DIR = path.dirname(__filename);
 export const DEFAULT_WORK_DIR = path.join(TT_ROOT, 'var', 'fixtures', 'work');
 export const DEFAULT_ARMING_MODE = 'prebootstrapped';
+
+// ── Fixture alias resolution (hostile-path aliases, E3.A S14) ───────────
+// A RESERVED hostile-path alias (e.g. W1.X1's 'tt-ts café') is a fixture
+// value that is deliberately not a canonical fixtures-src/ directory: the
+// name itself carries the probe (a space + a non-ASCII char in the work
+// clone path). The alias resolves to its canonical fixture for
+// golden-bare / hash-ledger / fixture-source lookups while the work clone
+// path keeps the AUTHORED name verbatim, so the harness working directory
+// really contains the hostile characters. Alias values are authored, never
+// ad-hoc: an UNLISTED non-canonical name still fails closed as
+// unknown-fixture (the registry is the complete list).
+export const FIXTURE_ALIASES = Object.freeze({
+  'tt-ts café': 'tt-ts',
+});
+
+export function resolveFixtureAlias(fixture) {
+  if (typeof fixture !== 'string' || fixture === '') {
+    return { fixture, canonical: fixture, isAlias: false };
+  }
+  const canonical = FIXTURE_ALIASES[fixture];
+  if (canonical === undefined) {
+    return { fixture, canonical: fixture, isAlias: false };
+  }
+  return { fixture, canonical, isAlias: true };
+}
 
 // Strip tamandua test-isolation vars from any child process we spawn so that
 // fixture arming (which runs ./bootstrap / pytest) does not trip the TEST
@@ -376,16 +412,21 @@ export function provisionWorkClone({
   if (typeof caseId !== 'string' || caseId === '') {
     return refReason('provision-case-unspecified', 'a case id is required');
   }
-  const meta = FIXTURE_META[fixture];
+  // Hostile-path alias resolution: 'tt-ts café' -> canonical 'tt-ts' for
+  // golden/fixture-source lookups; the work clone path keeps the authored
+  // name verbatim (see FIXTURE_ALIASES above).
+  const alias = resolveFixtureAlias(fixture);
+  const canonicalFixture = alias.canonical;
+  const meta = FIXTURE_META[canonicalFixture];
   if (meta === undefined) {
     return refReason('unknown-fixture', `no golden metadata for fixture '${fixture}'`, {
-      fixture, known: Object.keys(FIXTURE_META).sort(),
+      fixture, canonicalFixture, known: Object.keys(FIXTURE_META).sort(),
     });
   }
 
   // 1. Golden must exist and be valid (fail-closed). On a healthy host the
   //    goldens are already built; ensureGoldenBare rebuilds a missing one.
-  const golden = ensureGoldenBare({ fixture, goldenDir });
+  const golden = ensureGoldenBare({ fixture: canonicalFixture, goldenDir });
   if (!golden.ok) return golden; // precise TEST_INFRA category already set
   const barePath = golden.barePath;
   const hashFilePath = golden.hashFilePath;
@@ -421,15 +462,19 @@ export function provisionWorkClone({
     target = { kind: 'baseline', commit: baselineHash, baselineBranch: meta.baselineBranch };
   }
 
-  // 3. Work clone path: var/fixtures/work/<case-id>/<fixture>.
+  // 3. Work clone path: var/fixtures/work/<case-id>/<fixture> — the AUTHORED
+  //    fixture name verbatim, so an alias keeps its hostile path characters
+  //    (space + non-ASCII) in the harness working directory.
   const workClonePath = path.join(workDir, caseId, fixture);
 
   // 4. Fresh clone + named-branch checkout.
   const cloneResult = cloneAndCheckout({ fixture, barePath, workClonePath, target });
   if (!cloneResult.ok) return cloneResult;
 
-  // 5. Per-fixture arming (spec 02 junk / working-state prep).
-  const armed = armFixture(fixture, workClonePath, arming);
+  // 5. Per-fixture arming (spec 02 junk / working-state prep) against the
+  //    CANONICAL fixture source (fixtures-src/<canonical>); an alias has no
+  //    fixtures-src/ directory of its own.
+  const armed = armFixture(canonicalFixture, workClonePath, arming);
   if (!armed.ok) {
     return { ...armed, reason: { ...armed.reason, workClonePath } };
   }
@@ -437,6 +482,8 @@ export function provisionWorkClone({
   return {
     ok: true,
     fixture,
+    canonicalFixture,
+    fixtureAlias: alias.isAlias,
     caseId,
     workClonePath,
     goldenBare: barePath,
@@ -458,7 +505,9 @@ function usage() {
     `Provision a pristine working clone from a golden bare (fail-closed).`,
     ``,
     `Options:`,
-    `  --fixture <name>     Golden fixture (e.g. tt-python).`,
+    `  --fixture <name>     Golden fixture (e.g. tt-python) or a reserved hostile-path alias`,
+    `                       (e.g. 'tt-ts café' -> tt-ts; the work clone path keeps the authored`,
+    `                       alias name verbatim).`,
     `  --case-id <id>       Case id; clone lands at <work-dir>/<case-id>/<fixture>.`,
     `  --seed <id>          Optional seed ref (e.g. BUG-P1 -> seed/BUG-P1).`,
     `                       Omit to land on the green baseline branch.`,
@@ -470,6 +519,7 @@ function usage() {
     `  --help, -h           Print this help and exit.`,
     ``,
     `Known fixtures: ${Object.keys(FIXTURE_META).sort().join(', ')}.`,
+    `Known aliases: ${Object.keys(FIXTURE_ALIASES).sort().join(', ')}.`,
     ``,
     `Exit codes: 0 = provisioned OK; 1 = fail-closed TEST_INFRA defect; 2 = usage error.`,
   ];

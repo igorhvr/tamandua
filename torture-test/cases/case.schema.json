@@ -44,7 +44,8 @@
       "type": "string",
       "minLength": 1,
       "maxLength": 128,
-      "pattern": "^[A-Za-z0-9][A-Za-z0-9._@-]*$"
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._@\\-\\u00C0-\\u00FF ]*$",
+      "description": "Fixture name identifying the fixture project under fixtures-src/. The first character must be ASCII alphanumeric; the remainder admits the canonical [A-Za-z0-9._@-] set plus a single-byte space and Latin-1 letters (U+00C0-U+00FF) so hostile-path aliases validate; control characters (tab/newline) are rejected by the pattern. HOSTILE ALIAS CONVENTION: a fixture value that is not a canonical fixtures-src/ directory (contains a space or a non-ASCII character) is an alias — bin/tt-fixture-provision.mjs resolves the alias to its canonical fixture for golden-bare and fixture-source lookups while the work clone path keeps the manifest name verbatim (W1.X1: 'tt-ts café' resolves to tt-ts). Alias values are reserved and deliberately authored, never ad-hoc."
     },
     "seed": {
       "description": "OPTIONAL immutable seed git ref the working fixture clone should land on. Holds a ref NAME (e.g. 'BUG-P1' or 'seed/storm' or 'broken-tests'), never a 'refs/...' prefix: the provisioning stage resolves a bare name by checking it out directly as given, and resolves a branch-style name (no 'seed/' prefix) onto the working clone's current branch. A seed ref reproduces the case's exact starting tree (green base + exactly one seeded defect) per spec 02-fixture-projects.md green-base + seed-ref discipline. Absent or null => provision from the fixture's green baseline.",
@@ -69,6 +70,11 @@
       "properties": {
         "execution_mode": {
           "enum": ["real", "scripted"]
+        },
+        "test_cmd": {
+          "type": "string",
+          "minLength": 1,
+          "description": "RAW test command the workflow actually runs in this fixture — passed to the harness as --context test_cmd=<value> and fed into launchGateKey (O2/O9/O10 evidence); never a pre-wrapped shim invocation. Per-fixture canonical commands: tt-python and tt-python@master use .venv/bin/pytest -q; tt-ts uses npm test; tt-poly-lite uses ./run-all-tests. Verify against the fixture/workflow config before authoring — never guess."
         }
       }
     },

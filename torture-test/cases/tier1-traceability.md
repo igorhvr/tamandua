@@ -56,7 +56,7 @@ Key factors:
 | W1.L2-ts | `#W1.L2` | tt-ts | pi | tt-shim-probe | real |
 | W1.L3-python | `#W1.L3` | tt-python | pi | bug-fix | real |
 | W1.L3-ts | `#W1.L3` | tt-ts | pi | bug-fix | real |
-| W1.X1-ts | `#W1.X1` | tt-ts | pi | do-now | real |
+| W1.X1-ts | `#W1.X1` | tt-ts café (hostile-path alias) | pi | do-now | real |
 | W1.M1-python | `#W1.M1` | tt-python | hermes | do-now | real |
 | W1.REPLAY-python | `#W1.REPLAY` | tt-python | pi | tt-shim-probe | real |
 | W1.REPLAY-ts | `#W1.REPLAY` | tt-ts | pi | tt-shim-probe | real |

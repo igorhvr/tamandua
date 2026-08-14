@@ -21,6 +21,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, it } from "node:test";
+import { provisionWorkClone } from "../bin/tt-fixture-provision.mjs";
 
 const repoRoot = process.cwd();
 const ttRoot = path.join(repoRoot, "torture-test");
@@ -186,6 +187,103 @@ describe("Controller fixture work-clone provisioning wiring (US-004)", () => {
       fs.rmSync(manifestPath, { force: true });
       fs.rmSync(outPath, { force: true });
       if (campaignId !== null) fs.rmSync(path.join(resultsRoot, campaignId), { recursive: true, force: true });
+    }
+  });
+
+  it("US-011: hostile-path W1.X1 provisions at the controller-computed path (branch main, operator notes planted)", () => {
+    // S14 proof, provisioning half: the alias clone must land at EXACTLY the
+    // path the controller's workflowRunArgs hands to the harness —
+    // var/fixtures/work/<case-id>/<fixture> with the authored name verbatim.
+    // The provisioner's DEFAULT_WORK_DIR is var/fixtures/work, so calling
+    // provisionWorkClone with no workDir override provisions under var/ —
+    // the same call shape the controller's mandatory stage makes.
+    const controllerPath = path.join(workRoot, "W1.X1-ts", "tt-ts café");
+    const provision = provisionWorkClone({ fixture: "tt-ts café", caseId: "W1.X1-ts" });
+    try {
+      assert.ok(provision.ok, `alias provisioning must succeed:\n${JSON.stringify(provision)}`);
+      assert.equal(provision.workClonePath, controllerPath,
+        "provisioned clone path must equal the controller-computed path exactly");
+      assert.ok(provision.workClonePath.includes(" "), "work clone path must contain U+0020 (space)");
+      assert.ok(
+        [...provision.workClonePath].some((ch) => ch.charCodeAt(0) > 127),
+        "work clone path must contain a non-ASCII character",
+      );
+      assert.equal(provision.canonicalFixture, "tt-ts", "golden resolution must use the canonical fixture");
+      assert.equal(provision.target.kind, "baseline", "W1.X1 is unseeded: baseline checkout");
+      assert.equal(provision.target.finalBranch, "main", "tt-ts baseline clone must land on branch main");
+      assert.equal(provision.operatorNotesPlanted, true, "operator notes must be planted by the canonical arm");
+      assert.ok(fs.existsSync(path.join(provision.workClonePath, "operator-notes.local")),
+        "planted operator-notes.local must exist inside the hostile-path clone");
+      const branch = spawnSync("git", ["-C", provision.workClonePath, "rev-parse", "--abbrev-ref", "HEAD"],
+        { encoding: "utf8" });
+      assert.equal(String(branch.stdout ?? "").trim(), "main", "clone HEAD branch must be main");
+    } finally {
+      fs.rmSync(controllerPath, { recursive: true, force: true });
+    }
+  });
+
+  it("US-011: the controller's real-case launch path hands the hostile path to the harness argv verbatim", () => {
+    // S14 proof, launch-argv half (in-band controller agreement): a one-case
+    // dry-run campaign for W1.X1-ts must provision the alias clone through the
+    // controller's mandatory stage and record --working-directory-for-harness
+    // exactly at the hostile path, with work_clone.existed:true at capture
+    // time (the US-007 lstat evidence). The PASS teardown prunes the clone
+    // afterwards, so the evidence lives in the records, not on disk.
+    ensureGolden();
+    const tier1 = loadJsonLines(path.join(ttRoot, "cases", "tier1.jsonl"));
+    const record = tier1.find((c: any) => c.id === "W1.X1-ts");
+    assert.ok(record, "tier1.jsonl must contain W1.X1-ts");
+    const manifestPath = writeManifest(record);
+    const rel = path.relative(ttRoot, manifestPath);
+    const outPath = path.join(varRoot, `us011-w1x1-argv-${Date.now()}-${process.pid}.jsonl`);
+    fs.rmSync(outPath, { force: true });
+    const clonePath = path.join(workRoot, "W1.X1-ts", "tt-ts café");
+    fs.rmSync(clonePath, { recursive: true, force: true });
+
+    let campaignId: string | null = null;
+    try {
+      const res = runTt(controller, ["--manifest", rel], { TT_DRY_RUN_REAL_LAUNCH: outPath });
+      const m = CAMPAIGN_LINE.exec(res.stdout);
+      campaignId = m === null ? null : m[1];
+      assert.ok(campaignId, `no campaign created:\n${res.stdout}${res.stderr}`);
+
+      const state = loadJson(path.join(resultsRoot, campaignId, "state.json"));
+      const caseState = state.cases.find((c: any) => c.id === "W1.X1-ts");
+      assert.equal(caseState.outcome, "PASS", "dry-run real case must PASS");
+      const dry = caseState.attempts.find((a: any) => a.dry_run_launch === true);
+      assert.ok(dry, "attempt must carry dry_run_launch");
+      assert.equal(dry.fixture_work_clone, clonePath, "attempt records the hostile provisioned clone path");
+      assert.equal(dry.fixture_provision_record.fixture, "tt-ts café",
+        "provision record must carry the authored hostile fixture name");
+      assert.equal(dry.fixture_provision_record.work_clone_path, clonePath,
+        "provision record must carry the hostile work clone path");
+
+      const lines = fs.readFileSync(outPath, "utf8")
+        .split(/\r?\n/).filter((l) => l.trim().length > 0)
+        .map((l) => JSON.parse(l));
+      const rec = lines.find((r) => r.case_id === "W1.X1-ts");
+      assert.ok(rec, "argv record for W1.X1-ts must exist");
+      assert.equal(rec.fixture, "tt-ts café", "argv record must carry the authored hostile fixture name");
+      const wdIdx = rec.argv.indexOf("--working-directory-for-harness");
+      assert.ok(wdIdx >= 0, "do-now case argv must use --working-directory-for-harness");
+      const argvPath = rec.argv[wdIdx + 1];
+      const norm = (p: string) => path.normalize(path.resolve(p));
+      assert.equal(norm(argvPath), norm(clonePath),
+        "argv fixture path must equal the provisioned hostile clone path exactly");
+      assert.ok(rec.work_clone, "argv record must embed work_clone evidence");
+      assert.equal(rec.work_clone.path, clonePath, "work_clone.path must be the hostile clone path");
+      assert.ok(rec.work_clone.path.includes(" "), "work_clone.path must contain U+0020 (space)");
+      assert.ok(
+        [...rec.work_clone.path].some((ch) => ch.charCodeAt(0) > 127),
+        "work_clone.path must contain a non-ASCII character",
+      );
+      assert.equal(rec.work_clone.existed, true, "the hostile clone must exist at argv-capture time");
+      assert.equal(rec.work_clone.is_directory, true, "work_clone must be a directory");
+    } finally {
+      fs.rmSync(manifestPath, { force: true });
+      fs.rmSync(outPath, { force: true });
+      if (campaignId !== null) fs.rmSync(path.join(resultsRoot, campaignId), { recursive: true, force: true });
+      fs.rmSync(clonePath, { recursive: true, force: true });
     }
   });
 
