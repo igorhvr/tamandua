@@ -5,6 +5,7 @@ import { resolve } from "node:path";
 
 const readmePath = resolve(import.meta.dirname, "..", "README.md");
 const readmeContent = readFileSync(readmePath, "utf-8");
+const hermesSection = readmeContent.match(/#### Hermes Support[\s\S]*?(?=#### DeepSeek Harness)/)?.[0] ?? "";
 
 describe("README Hermes harness documentation", () => {
   it("documents --hermes-as-harness flag", () => {
@@ -21,35 +22,19 @@ describe("README Hermes harness documentation", () => {
     );
   });
 
-  it("states pi is the default and recommended harness", () => {
+  it("states pi is the default harness", () => {
     assert.ok(
       readmeContent.includes("This is the default"),
       "README must state that --pi-as-harness is the default"
     );
-    assert.ok(
-      readmeContent.match(/Use pi.*for production/),
-      "README must recommend pi for production workflows"
-    );
   });
 
-  it("warns Hermes is alpha quality wherever mentioned", () => {
-    // Every hermes mention in the README should be near alpha/slow/broken warnings
-    // We check that the harness selection section contains the alpha warning block
+  it("documents Hermes as supported rather than alpha", () => {
     assert.ok(
-      readmeContent.includes("Alpha quality"),
-      "README must warn about Hermes alpha quality status"
+      readmeContent.includes("#### Hermes Support"),
+      "README must contain the Hermes Support section"
     );
-    assert.ok(
-      readmeContent.match(/hermes.*alpha/i) || readmeContent.match(/alpha.*hermes/i),
-      "README must link Hermes mentions to alpha status"
-    );
-  });
-
-  it("warns Hermes is very slow", () => {
-    assert.ok(
-      readmeContent.includes("very slow"),
-      "README must warn that Hermes is very slow"
-    );
+    assert.doesNotMatch(hermesSection, /alpha|very slow|use pi.*production/i);
   });
 
   it("documents hermes token accounting reads from state.db", () => {
@@ -58,11 +43,7 @@ describe("README Hermes harness documentation", () => {
       readmeContent.includes("token usage is read"),
       "README must document that hermes token usage is read from state.db"
     );
-    assert.ok(
-      readmeContent.includes("best-effort") ||
-      readmeContent.includes("falls back"),
-      "README must document that hermes token accounting is best-effort"
-    );
+    assert.match(hermesSection, /falls\s+back to 0 tokens with a warning/);
   });
 
   it("documents TAMANDUA_HERMES_BINARY env var", () => {

@@ -94,6 +94,13 @@ describe("www/index.html structure", () => {
     );
   });
 
+  it("describes Hermes as a supported harness without alpha warnings", () => {
+    const hermesRow = html.match(/<code>--hermes-as-harness<\/code>[\s\S]*?<\/tr>/);
+    assert.ok(hermesRow, "should have a --hermes-as-harness table row");
+    assert.ok(hermesRow[0].includes("supported alternative harness"));
+    assert.doesNotMatch(hermesRow[0], /alpha|very slow|token accounting is broken/i);
+  });
+
   // Workflow tables
   it("has Feature Development table with correct data", () => {
     assert.ok(html.includes("feature-dev"), "should reference feature-dev workflow");

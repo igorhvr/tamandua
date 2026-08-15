@@ -237,13 +237,13 @@ document.addEventListener('DOMContentLoaded', function () {
   }
 
   function highlightYamlLine(line) {
-    var html = escapeHtml(line);
+    var html = escapeHtml(line).replace(/"/g, '&quot;');
     if (/^\s*#/.test(line)) return '<span class="tok-comment">' + html + '</span>';
+    html = html.replace(/&quot;[^&]*&quot;/g, function (m) {
+      return '<span class="tok-str">' + m + '</span>';
+    });
     html = html.replace(/^(\s*(?:-\s+)?)([\w.-]+)(:)/, function (m, indent, key, colon) {
       return indent + '<span class="tok-key">' + key + '</span>' + colon;
-    });
-    html = html.replace(/&quot;[^&]*&quot;|"[^"]*"/g, function (m) {
-      return '<span class="tok-str">' + m + '</span>';
     });
     return html;
   }

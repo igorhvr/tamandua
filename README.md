@@ -260,7 +260,7 @@ flowchart LR
     CLI["tamandua CLI<br/>workflow run"] -->|create run| DB[("SQLite<br/>~/.tamandua/tamandua.db")]
     CLI -->|register run| Daemon["Background daemon<br/>control plane"]
     Daemon -->|dispatches work| Agents["Agent team<br/>planner · developer · verifier · tester"]
-    Agents -->|"pi --print"| Harness["pi harness<br/>(or Hermes / dsh, alpha)"]
+    Agents -->|"pi --print"| Harness["pi harness<br/>(or Hermes; dsh alpha)"]
     Agents -->|claim step / write results| DB
     DB --> Dashboard["Dashboard :3334<br/>Kanban + AutoResearch panels"]
     DB --> MCP["Remote MCP :3338<br/>14 tools"]
@@ -628,13 +628,11 @@ override this with the harness selection flags on `tamandua workflow run`:
 
 These flags are **mutually exclusive** — specifying both is an error.
 
-#### Hermes Support (Alpha)
+#### Hermes Support
 
-> **⚠️ Alpha quality.** Hermes harness support is in **alpha** and has known
-> limitations: it is **very slow** compared to pi. Token usage is read from
-> hermes' state.db after each round (best-effort: falls back to 0 tokens with a
-> warning if the hermes schema is unavailable or changed).
-> Use pi (`--pi-as-harness`) for production workflows.
+Hermes is a fully supported alternative harness. Token usage is read from
+Hermes' `state.db` after each round and falls back to 0 tokens with a warning
+if the Hermes schema is unavailable or changed.
 
 ##### Hermes Binary Resolution
 
@@ -702,7 +700,7 @@ trivial workflow run (`--hermes-as-harness`) through the daemon, scheduler, and
 Hermes harness, then audits the token-attribution chain:
 `session_id` trailer → `state.db` lookup → `runs.tokens_spent` > 0.
 
-> **⚠️ Spends real tokens and is very slow (30+ minutes).** The canary is
+> **⚠️ Spends real tokens and can take 30+ minutes.** The canary is
 > never part of `./run-all-e2e-tests` or `npm test`. Run it manually after
 > Hermes upgrades or when changing the harness adapter.
 

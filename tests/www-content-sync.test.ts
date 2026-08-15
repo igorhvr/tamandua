@@ -105,6 +105,14 @@ describe("www/index.html content sync", () => {
     );
   });
 
+  it("harness table documents Hermes as a supported alternative", () => {
+    const hermesRow = wwwContent.match(/<code>--hermes-as-harness<\/code>[\s\S]*?<\/tr>/);
+    assert.ok(hermesRow, "www/index.html must have a complete --hermes-as-harness table row");
+    assert.ok(hermesRow[0].includes("supported alternative harness"));
+    assert.doesNotMatch(hermesRow[0], /alpha|very slow|token accounting is broken|use pi for production/i);
+    assert.ok(hermesRow[0].includes("https://github.com/NousResearch/hermes-agent"));
+  });
+
   // Regression test: DRTR — max_reroutes and on_fail.retry_step are documented
   it("documents on_fail.retry_step and max_reroutes instead of stale escalation text", () => {
     assert.ok(

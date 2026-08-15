@@ -13,8 +13,15 @@ import * as assert from 'node:assert/strict';
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const distDir = resolve(__dirname, '..', 'dist', 'www');
 
-function readDistFile(filename) {
+function readDistFile(filename: string) {
   return readFileSync(resolve(distDir, filename), 'utf-8');
+}
+
+function extractFunction(source: string, name: string, nextName: string): string {
+  const start = source.indexOf(`  function ${name}(`);
+  const end = source.indexOf(`  function ${nextName}(`, start);
+  assert.ok(start >= 0 && end > start, `should find ${name} in scripts.js`);
+  return source.slice(start, end);
 }
 
 let scriptsJs = '';
@@ -232,6 +239,38 @@ describe('US-007: Progressive JavaScript enhancements', () => {
         scriptsJs.includes('scrollBehavior'),
         'scripts.js should check for scrollBehavior CSS property support'
       );
+    });
+
+    it('highlights the Build Your Own YAML without mangling span attributes', () => {
+      const escapeSource = extractFunction(scriptsJs, 'escapeHtml', 'highlightShellLine');
+      const yamlSource = extractFunction(scriptsJs, 'highlightYamlLine', 'highlightedLines');
+      const highlightYamlLine = new Function(
+        `${escapeSource}\n${yamlSource}\nreturn highlightYamlLine;`
+      )() as (line: string) => string;
+      const yamlMatch = html.match(/<code class="language-yaml">([\s\S]*?)<\/code>/);
+      assert.ok(yamlMatch, 'Build Your Own YAML sample should exist');
+      const yaml = yamlMatch[1];
+      const highlighted = yaml.split('\n').map(highlightYamlLine).join('\n');
+
+      assert.doesNotMatch(highlighted, /<span[^>]*<span/);
+      for (const key of ['id', 'name', 'agents', 'workspace', 'files', 'AGENTS.md', 'steps', 'agent', 'input', 'expects']) {
+        assert.ok(
+          highlighted.includes(`<span class="tok-key">${key}</span>:`),
+          `should highlight YAML key ${key}`
+        );
+      }
+      assert.ok(
+        highlighted.includes('<span class="tok-str">&quot;STATUS: done&quot;</span>'),
+        'should highlight the quoted expects value'
+      );
+
+      const roundTripped = highlighted
+        .replace(/<[^>]+>/g, '')
+        .replace(/&quot;/g, '"')
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&amp;/g, '&');
+      assert.equal(roundTripped, yaml);
     });
   });
 

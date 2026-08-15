@@ -595,7 +595,7 @@ Recovery pattern for tool-calling models:
 - If MCP returns: `Argument "workingDirectoryForHarness" must be a non-empty string`
 - Retry the same tool call with an explicit absolute path (for example `/home/user/repo`).
 
-### Hermes harness support (Alpha)
+### Hermes harness support
 
 The `--hermes-as-harness` flag runs agents with the Hermes harness instead of
 the default pi harness.
@@ -604,10 +604,9 @@ the default pi harness.
 tamandua workflow run <workflow-id> "<task>" --hermes-as-harness
 ```
 
-> ⚠️ **Hermes support is in alpha.** It is **very slow** compared to pi.
-> Token usage is read from hermes' state.db after each round (best-effort: falls
-> back to 0 tokens with a warning if the hermes schema is unavailable or changed).
-> Pi is the default and recommended harness for production use.
+Hermes is a fully supported alternative harness. Token usage is read from
+Hermes' `state.db` after each round and falls back to 0 tokens with a warning
+if the Hermes schema is unavailable or changed.
 
 The `--pi-as-harness` flag explicitly selects the pi harness (this is the
 default, so the flag is rarely needed unless a previous run used

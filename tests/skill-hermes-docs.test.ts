@@ -5,6 +5,7 @@ import { resolve } from "node:path";
 
 const skillPath = resolve(import.meta.dirname, "..", "skills", "tamandua-agents", "SKILL.md");
 const skillContent = readFileSync(skillPath, "utf-8");
+const hermesSection = skillContent.match(/### Hermes harness support[\s\S]*?(?=### dsh \(DeepSeek Harness\))/)?.[0] ?? "";
 
 describe("SKILL.md Hermes harness documentation", () => {
   it("has valid YAML frontmatter", () => {
@@ -33,18 +34,9 @@ describe("SKILL.md Hermes harness documentation", () => {
     );
   });
 
-  it("warns Hermes is alpha quality", () => {
-    assert.ok(
-      skillContent.match(/alpha/i),
-      "SKILL.md must warn about Hermes alpha quality status"
-    );
-  });
-
-  it("warns Hermes is very slow", () => {
-    assert.ok(
-      skillContent.includes("very slow"),
-      "SKILL.md must warn that Hermes is very slow"
-    );
+  it("documents Hermes as supported rather than alpha", () => {
+    assert.ok(hermesSection, "SKILL.md must contain the Hermes harness support section");
+    assert.doesNotMatch(hermesSection, /alpha|very slow|recommended.*production/i);
   });
 
   it("documents hermes token accounting reads from state.db", () => {
@@ -54,9 +46,8 @@ describe("SKILL.md Hermes harness documentation", () => {
       "SKILL.md must document that hermes token usage is read from state.db"
     );
     assert.ok(
-      skillContent.includes("best-effort") ||
-      skillContent.includes("falls back"),
-      "SKILL.md must document that hermes token accounting is best-effort"
+      /falls\s+back to 0 tokens with a warning/.test(hermesSection),
+      "SKILL.md must document the state.db schema fallback"
     );
   });
 
@@ -96,14 +87,10 @@ describe("SKILL.md Hermes harness documentation", () => {
     );
   });
 
-  it("states pi is the default and recommended harness", () => {
+  it("states pi is the default harness", () => {
     assert.ok(
       skillContent.match(/pi.*default|default.*pi/i),
       "SKILL.md must state that pi is the default harness"
-    );
-    assert.ok(
-      skillContent.match(/recommended.*production|production.*recommended/i),
-      "SKILL.md must recommend pi for production use"
     );
   });
 

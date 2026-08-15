@@ -145,7 +145,7 @@ describe("README dsh harness documentation", () => {
 
   it("mermaid harness node mentions dsh (alpha)", () => {
     assert.ok(
-      readmeContent.includes("or Hermes / dsh, alpha"),
+      readmeContent.includes("or Hermes; dsh alpha"),
       "README mermaid diagram must mention dsh (alpha) in the harness node"
     );
   });
