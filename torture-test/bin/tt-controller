@@ -42,6 +42,20 @@ const SCRIPTED_ENV_PATH = path.join(TT_ROOT, 'env', 'tt-env-scripted.sh');
 const DAEMON_CONTROL_PATH = process.env.TT_CONTROLLER_DAEMON_CONTROL_PATH === undefined
   ? path.join(TT_ROOT, 'bin', 'daemon-control')
   : path.resolve(process.env.TT_CONTROLLER_DAEMON_CONTROL_PATH);
+// E3.C US-008: chaos wiring. The operator binary that performs a manifest
+// `chaos` block's injection (bin/tt-chaos), and the chaos.log the operator
+// appends to — the oracle-evidence-snapshot copies it into the immutable
+// oracle snapshot under the chaos_log evidence key (US-003) so O4's watchdog
+// false-positive check and O16 can cross-reference. TT_CONTROLLER_TT_CHAOS_PATH
+// overrides the binary for hermetic tests (mirrors
+// TT_CONTROLLER_DAEMON_CONTROL_PATH). The default chaos log path must agree
+// with tt-chaos's own derivation (TT_ROOT env = <repo>/torture-test/var ->
+// var/chaos/chaos.log) AND with the snapshot's default
+// (path.join(input.ttRoot, 'var', 'chaos', 'chaos.log')).
+const TT_CHAOS_PATH = process.env.TT_CONTROLLER_TT_CHAOS_PATH === undefined
+  ? path.join(TT_ROOT, 'bin', 'tt-chaos')
+  : path.resolve(process.env.TT_CONTROLLER_TT_CHAOS_PATH);
+const CHAOS_LOG_PATH = path.join(VAR_ROOT, 'chaos', 'chaos.log');
 const HOOK_RUNNER_PATH = path.join(TT_ROOT, 'bin', 'tt-hook-runner');
 const O9_TARGETED_PROBES_PATH = path.join(TT_ROOT, 'bin', 'o9-targeted-probes.mjs');
 const DEFAULT_ORACLES_ROOT = path.join(TT_ROOT, 'oracles');
@@ -55,6 +69,39 @@ const DEFAULT_CAP_CHECK_INTERVAL_MS = 15_000;
 const DEFAULT_PROVIDER_RETRY_BACKOFF_MS = 60_000;
 const EVIDENCE_LIMIT_BYTES = 16 * 1024 * 1024;
 const TERMINAL_RUN_STATUSES = new Set(['completed', 'done', 'failed', 'canceled']);
+// E3.C US-005: fail-closed semantic probe_sequence contract. PROBE_OPS mirrors
+// the case.schema.json probeAction op enum and PROBE_WHEN_PATTERN mirrors its
+// `when` phase-marker pattern. The semantic validator (validateProbeSequence)
+// is defense-in-depth BELOW the JSON schema: the schema already rejects unknown
+// ops / malformed whens / empty actions, while the semantic layer catches the
+// violations the schema cannot express (pause without hold_seconds,
+// non-contiguous run ordinals, probe_sequence on local-command cases) and
+// re-checks the schema-level rules so a future schema relaxation can never
+// silently degrade a malformed probe declaration into the old
+// launch->wait->snapshot behavior (campaign #7 S3/S4).
+const PROBE_OPS = new Set([
+  'pause', 'pause_drain', 'resume', 'cancel', 'fail_force', 'restart_daemon', 'sigstop_sigcont',
+]);
+const PROBE_WHEN_PATTERN = /^(now|step:[A-Za-z0-9._-]+:[A-Za-z0-9._-]+|event:[A-Za-z0-9._-]+)$/;
+// Hold-capable probe ops that REQUIRE hold_seconds > 0. pause_drain is
+// deliberately excluded: drain is self-terminating (the in-flight run finishes,
+// then dispatch parks), so W3.19's pause_drain carries no hold_seconds.
+// sigstop_sigcont requires it because bin/tt-chaos (US-004) refuses a missing
+// --hold-seconds — a manifest declaring it without a hold would always fail at
+// execution time, so it fails closed at validation instead.
+const PROBE_HOLD_REQUIRED_OPS = new Set(['pause', 'sigstop_sigcont']);
+// E3.C US-006: probe execution engine tuning. PROBE_POLL_INTERVAL_MS is the
+// phase-marker polling cadence (mirrors tt-chaos's POLL_INTERVAL_MS);
+// PROBE_EVENTS_EXCERPT_MAX / _MAX_BYTES bound the observed-effect event-stream
+// excerpt so attempt evidence stays bounded on busy contained instances.
+const PROBE_POLL_INTERVAL_MS = 500;
+const PROBE_EVENTS_EXCERPT_MAX = 200;
+const PROBE_EVENTS_EXCERPT_MAX_BYTES = 256 * 1024;
+// E3.C US-007: multi-launch probe orchestration. PROBE_DISPATCH_INTERVAL_MS
+// mirrors the product scheduler's DISPATCH_INTERVAL_MS (15s) — the recovery
+// window O16 judges from a restart_daemon probe is
+// expect.recovery_within_dispatch_intervals * this constant.
+const PROBE_DISPATCH_INTERVAL_MS = 15_000;
 // Zero-token dry-run hook for the real-launch path (US-006): when
 // TT_DRY_RUN_REAL_LAUNCH is set, the controller records the full launch argv
 // it WOULD hand to `tamandua` for each real (pi/hermes) case and marks the
@@ -490,6 +537,173 @@ function validateSafePaths(caseRecord) {
   return errors;
 }
 
+// E3.C US-005: semantic probe_sequence validator. Runs AFTER the JSON-schema
+// validation of a manifest case and fails closed on the probe declarations the
+// schema cannot express, so a malformed probe_sequence can never silently
+// degrade into the old launch->wait->snapshot behavior. Every violation yields
+// a DISTINCT reason naming the case-relative location (run group / action
+// index) and the offending op. Returns an array of error strings (empty = the
+// declaration is semantically valid). Defensive: it tolerates structurally
+// malformed input (schema-invalid records) so it can also run on records the
+// schema rejected, producing case-id-named reasons in --validate-only.
+function validateProbeSequence(caseRecord) {
+  const errors = [];
+  const sequence = caseRecord.probe_sequence;
+  if (sequence === undefined || sequence === null) return errors;
+
+  if (caseRecord.harness === 'local') {
+    errors.push('probe_sequence is not supported on local-command cases (harness \'local\')');
+  }
+
+  if (!Array.isArray(sequence)) {
+    errors.push('probe_sequence must be an array of run groups');
+    return errors;
+  }
+  if (sequence.length === 0) {
+    errors.push('probe_sequence must contain at least one run group');
+    return errors;
+  }
+
+  // Run ordinals index the case's runs in launch order: they must start at 1
+  // and be contiguous (1, 2, 3, ...). A gap or a missing run 1 would silently
+  // change the launch shape the probe sequence was declared against.
+  const ordinals = [];
+  for (let index = 0; index < sequence.length; index += 1) {
+    const group = sequence[index];
+    if (!isObject(group) || !Number.isInteger(group.run)) {
+      errors.push(`run group ${index + 1}: missing integer run ordinal`);
+      continue;
+    }
+    ordinals.push(group.run);
+  }
+  const sortedUnique = [...new Set(ordinals)].sort((a, b) => a - b);
+  if (sortedUnique.length !== ordinals.length) {
+    errors.push(`run ordinals must be unique (declared: ${ordinals.join(', ')})`);
+  }
+  if (sortedUnique.length > 0
+      && (sortedUnique[0] !== 1 || !sortedUnique.every((run, index) => run === index + 1))) {
+    errors.push(`run ordinals must start at 1 and be contiguous (declared: ${sortedUnique.join(', ')})`);
+  }
+
+  // E3.C US-007: multi-run launch-shape contract. restart_daemon is a
+  // DAEMON-LEVEL op (the daemon restarts ONCE mid-flight while every run is
+  // still in flight — W3.22's three concurrent runs), so it can only be
+  // declared on a multi-run sequence AND every run group must declare it:
+  // each group's restart_daemon action carries that run's recovery contract
+  // (expect.recovery_within_dispatch_intervals + token_flush_preserved), and
+  // a group without one would silently skip that run's recovery judgment.
+  const hasRestartDaemon = sequence.some((group) => Array.isArray(group?.actions)
+    && group.actions.some((action) => action?.op === 'restart_daemon'));
+  if (hasRestartDaemon) {
+    if (sequence.length < 2) {
+      errors.push('restart_daemon is a daemon-level multi-run op: it requires at least two run groups (W3.22 declares three concurrent runs) so the restart fires while runs are in flight');
+    }
+    sequence.forEach((group, groupIndex) => {
+      if (!Array.isArray(group?.actions)) return;
+      if (!group.actions.some((action) => action?.op === 'restart_daemon')) {
+        errors.push(`run group ${groupIndex + 1} (run ${Number.isInteger(group?.run) ? group.run : '?'}): every run group must declare restart_daemon (the per-run recovery contract — recovery_within_dispatch_intervals + token_flush_preserved — is declared on each group's restart_daemon action)`);
+      }
+    });
+  }
+
+  sequence.forEach((group, groupIndex) => {
+    const groupLabel = `run group ${groupIndex + 1} (run ${Number.isInteger(group?.run) ? group.run : '?'})`;
+    if (!isObject(group) || !Array.isArray(group.actions)) {
+      errors.push(`${groupLabel}: actions must be an array`);
+      return;
+    }
+    if (group.actions.length === 0) {
+      errors.push(`${groupLabel}: actions must contain at least one action`);
+    }
+    group.actions.forEach((action, actionIndex) => {
+      const actionLabel = `${groupLabel} action ${actionIndex + 1}`;
+      if (!isObject(action)) {
+        errors.push(`${actionLabel}: action must be an object`);
+        return;
+      }
+      const op = action.op;
+      if (typeof op !== 'string' || !PROBE_OPS.has(op)) {
+        errors.push(`${actionLabel} (op ${JSON.stringify(op ?? null)}): unknown probe op (known: ${[...PROBE_OPS].join(', ')})`);
+      }
+      const when = action.when;
+      if (typeof when !== 'string' || !PROBE_WHEN_PATTERN.test(when)) {
+        errors.push(`${actionLabel} (op ${JSON.stringify(op ?? null)}): missing or invalid 'when' phase marker (expected now | step:<role>:<state> | event:<type>)`);
+      }
+      if (typeof op === 'string' && PROBE_HOLD_REQUIRED_OPS.has(op)
+          && !(typeof action.hold_seconds === 'number' && Number.isFinite(action.hold_seconds) && action.hold_seconds > 0)) {
+        errors.push(`${actionLabel} (op '${op}'): hold-capable op requires hold_seconds > 0`);
+      }
+    });
+  });
+
+  return errors;
+}
+
+// ── E3.C US-008: chaos block semantics ─────────────────────────────
+// The manifest `chaos` block is a typed injection declaration (schema'd in
+// case.schema.json as chaosBlock): operator tt-chaos performs a
+// sigstop_sigcont injection on the harness_process target, armed on the
+// block's trigger, held for hold_seconds. The controller honors it by
+// invoking bin/tt-chaos under the case's contained spawn env while the run
+// is in flight. The semantic validator below is defense-in-depth BELOW the
+// JSON schema (which already restricts the enums): it re-checks the
+// schema-level rules so a future schema relaxation can never silently
+// degrade into an injection the controller would ignore or mis-fire.
+
+// Manifest chaos `trigger` values are high-level phase names ("mid_round" =
+// a dispatch round in flight). They are translated to the phase-marker
+// grammar bin/tt-chaos arms on (now | step:<role>:<state> | event:<type> |
+// file:<path>): mid_round fires when the developer role's step is running
+// (a round is actively worked — the W3.17b hermes coding round). A trigger
+// that is already marker-shaped passes through; an unknown name translates
+// to null and fails closed at validation/execution.
+const CHAOS_TRIGGER_MARKERS = Object.freeze({
+  mid_round: 'step:developer:running',
+});
+const CHAOS_MARKER_SHAPED_PATTERN = /^(now|step:[A-Za-z0-9._-]+:[A-Za-z0-9._-]+|event:[A-Za-z0-9._-]+|file:.+)$/;
+
+function translateChaosTrigger(trigger) {
+  if (typeof trigger !== 'string' || trigger === '') return null;
+  if (CHAOS_MARKER_SHAPED_PATTERN.test(trigger)) return trigger;
+  return CHAOS_TRIGGER_MARKERS[trigger] ?? null;
+}
+
+function validateChaosBlock(caseRecord) {
+  const errors = [];
+  const block = caseRecord.chaos;
+  if (block === undefined || block === null) return errors;
+  if (!isObject(block)) {
+    errors.push(`chaos block must be an object (got ${valueType(block)})`);
+    return errors;
+  }
+  if (block.operator !== 'tt-chaos') {
+    errors.push(`chaos block operator must be 'tt-chaos' (got ${JSON.stringify(block.operator ?? null)})`);
+  }
+  if (block.type !== 'sigstop_sigcont') {
+    errors.push(`chaos block type must be 'sigstop_sigcont' (got ${JSON.stringify(block.type ?? null)})`);
+  }
+  if (block.target !== 'harness_process') {
+    errors.push(`chaos block target must be 'harness_process' (got ${JSON.stringify(block.target ?? null)})`);
+  }
+  if (translateChaosTrigger(block.trigger) === null) {
+    errors.push(`chaos block trigger ${JSON.stringify(block.trigger ?? null)} does not translate to a tt-chaos phase marker (known: mid_round -> step:developer:running; or a literal now | step:<role>:<state> | event:<type> | file:<path>)`);
+  }
+  if (!(typeof block.hold_seconds === 'number' && Number.isFinite(block.hold_seconds) && block.hold_seconds > 0)) {
+    errors.push('chaos block hold_seconds must be a positive number');
+  }
+  if (caseRecord.harness === 'local') {
+    errors.push('chaos block is not supported on local-command cases (harness \'local\') — there is no run/harness process to inject against');
+  }
+  // A chaos block injects into "the run". With no run ordinal in the
+  // declaration, a multi-launch shape (>= 2 probe run groups — W3.20/W3.22)
+  // is ambiguous, so it fails closed rather than silently targeting only
+  // run 1. W3.17b declares chaos WITHOUT a probe_sequence (single-run path).
+  if (Array.isArray(caseRecord.probe_sequence) && caseRecord.probe_sequence.length > 1) {
+    errors.push('chaos block is not supported with a multi-run probe_sequence (the injection has no run ordinal; single-run shapes only)');
+  }
+  return errors;
+}
+
 function loadSchema() {
   try {
     return JSON.parse(fs.readFileSync(SCHEMA_PATH, 'utf8'));
@@ -498,7 +712,7 @@ function loadSchema() {
   }
 }
 
-function loadManifest(manifestPath, schema) {
+function loadManifest(manifestPath, schema, { includeSemantic = false } = {}) {
   let source;
   try {
     source = fs.readFileSync(manifestPath, 'utf8');
@@ -523,6 +737,25 @@ function loadManifest(manifestPath, schema) {
 
     const schemaErrors = validateSchema(record, schema, '$', schema);
     for (const error of schemaErrors) errors.push(`line ${lineNumber}: ${error}`);
+    // E3.C US-005: run the semantic probe_sequence validator after the schema
+    // pass. It is DEFENSIVE (tolerates schema-invalid records) so --validate-only
+    // reports case-id-named semantic reasons even when the schema already
+    // rejected the record (e.g. an unknown probe op fails BOTH gates). The
+    // campaign paths do NOT request it here: a semantically-invalid case is
+    // instead failed closed per-case as TEST_INFRA_FAIL(probe-sequence-invalid)
+    // by the execute-path probeSequenceGuard BEFORE any launch attempt.
+    if (includeSemantic) {
+      for (const error of validateProbeSequence(record)) {
+        errors.push(`line ${lineNumber}: case ${JSON.stringify(record.id)}: ${error}`);
+      }
+      // E3.C US-008: chaos block semantic validation rides the same gate so
+      // --validate-only reports chaos violations (unknown trigger translation,
+      // multi-run + chaos combination, local-case chaos) as case-id-named
+      // reasons; the campaign paths fail closed per-case via chaosGuard.
+      for (const error of validateChaosBlock(record)) {
+        errors.push(`line ${lineNumber}: case ${JSON.stringify(record.id)}: ${error}`);
+      }
+    }
     if (schemaErrors.length > 0) return;
 
     if (ids.has(record.id)) {
@@ -1008,6 +1241,19 @@ function loadSpawnEnvironment(scripted) {
     throw new Error(`cannot load spawn environment from ${scriptPath}: ${detail}`);
   }
   const merged = { ...operatorBaseEnv, ...parsePrintedEnvironment(result.stdout, scriptPath) };
+  // E3.C US-011: the scripted-runtime contract env (behaviors file +
+  // work-index state dir) must survive the daemon-control restart path — the
+  // controller spawns daemon-control (and the probe/chaos operators) with
+  // childEnv, and operatorEnvironmentWithoutRuntimeRouting strips TAMANDUA_*
+  // keys, so a contained-daemon restart would lose the behaviors and every
+  // subsequent scripted work round would crash. Forward the two keys from the
+  // controller's own env when present (no-op for real campaigns, which never
+  // set them).
+  for (const key of ['TAMANDUA_SCRIPTED_BEHAVIORS', 'TAMANDUA_SCRIPTED_STATE']) {
+    if (typeof process.env[key] === 'string' && process.env[key].length > 0) {
+      merged[key] = process.env[key];
+    }
+  }
   // FIX10 US-003: fail closed — the resolved HOME must be strictly inside
   // torture-test/var (realpath). A misconfigured env script (or one that
   // prints an escaping HOME) throws here, and the existing callers convert
@@ -1364,7 +1610,7 @@ function provisionedWorkClonePath(caseState) {
 // returns before markTerminal, so teardown only ever runs on the FINAL,
 // genuinely-terminal outcome of a case.
 //
-// O9 special-exit exemption: a chaos.o9_special_exits case's RESTORED working
+// O9 special-exit exemption: a context.o9_special_exits case's RESTORED working
 // tree is itself the evidence the battery produces (exit-88 tracked-dirty
 // refusal, tracked-byte restoration, junk-probe removal). Pruning a PASS would
 // destroy exactly what O9 verified, so those cases keep their clone with a
@@ -1476,6 +1722,10 @@ function oracleSnapshotInput(caseRecord, caseState, attempt, state, campaignDir,
     attempt,
     launchArgv,
     discoveredRuns: (state.discovered_runs ?? []).filter((run) => run.root_case_id === caseState.id),
+    // E3.C US-008: pin the chaos.log path the snapshot copies under the
+    // chaos_log evidence key (US-003) — same derivation tt-chaos uses under
+    // the contained spawn env (TT_ROOT=var -> var/chaos/chaos.log).
+    chaosLogPath: CHAOS_LOG_PATH,
   };
 }
 
@@ -1502,7 +1752,7 @@ function beginCaseOracleSnapshot(caseRecord, caseState, attempt, state, campaign
 function runCaseO9TargetedProbes(caseRecord, attempt, state, campaignDir, childEnv) {
   // FIX10 US-003 choke-point: the probe child must run with the contained HOME.
   assertContainedSpawnEnv(childEnv);
-  if (!caseRecord.oracles.includes('O9') || caseRecord.chaos?.o9_special_exits !== true) return;
+  if (!caseRecord.oracles.includes('O9') || caseRecord.context?.o9_special_exits !== true) return;
   if (attempt.o9_targeted_probes?.status === 'COMPLETE') return;
   if (attempt.o9_targeted_probes?.status === 'RUNNING') {
     throw new Error('controller stopped while targeted O9 probes were in flight; classified TEST_INFRA');
@@ -1992,8 +2242,98 @@ function hasAssociatedNonterminalRun(caseState) {
   return caseState.attempts.some((attempt) => attempt.outcome === undefined);
 }
 
+// E3.C US-005: fail-closed semantic probe_sequence gate for the execute path.
+// Runs BEFORE any launch attempt is created (the first guard in both
+// executeWorkflowCase and executeLocalCase). A case whose probe_sequence fails
+// semantic validation is persisted as TEST_INFRA_FAIL with the DISTINCT
+// category 'probe-sequence-invalid' (message naming the run group / action
+// index and the offending op) on a launch-intent evidence attempt — a malformed
+// probe declaration can never silently degrade into the old launch->wait->
+// snapshot behavior (campaign #7 S3/S4). Returns true when the case was failed
+// closed (the caller must return immediately); false when the declaration is
+// valid and execution may proceed.
+function probeSequenceGuard(caseRecord, caseState, state, campaignDir) {
+  const errors = validateProbeSequence(caseRecord);
+  if (errors.length === 0) return false;
+
+  const guardTimestamp = utcTimestamp();
+  const guardAttempt = {
+    id: `attempt-${caseState.attempts.length + 1}`,
+    case_id: caseRecord.id,
+    kind: caseRecord.harness === 'local' ? 'local' : 'workflow',
+    phase: 'launch-intent',
+    execution_mode: caseUsesScriptedEnvironment(caseRecord) ? 'scripted' : 'real',
+    launch_intent_at: guardTimestamp,
+    started_at: guardTimestamp,
+    deadline_at: new Date(Date.now() + (caseRecord.caps.wall_min * 60_000)).toISOString(),
+    ...retryAttemptMetadata(caseState),
+    probe_sequence_guard: {
+      errors,
+    },
+  };
+  caseState.phase = 'running';
+  caseState.attempts.push(guardAttempt);
+  state.updated_at = guardTimestamp;
+  atomicWriteState(campaignDir, state);
+  guardAttempt.phase = 'terminal';
+  guardAttempt.terminal_at = utcTimestamp();
+  persistMechanicalOutcome(caseState, guardAttempt, state, campaignDir, 'TEST_INFRA_FAIL', {
+    category: 'probe-sequence-invalid',
+    message: `probe_sequence semantic validation failed: ${errors.join('; ')}`,
+    errors,
+  });
+  return true;
+}
+
+// E3.C US-008: fail-closed semantic chaos block gate. A case whose `chaos`
+// block fails semantic validation is persisted TEST_INFRA_FAIL
+// ('chaos-block-invalid') BEFORE any launch attempt is created — the schema
+// already rejects unknown type/target/operator, this gate catches what the
+// schema cannot express (untranslatable trigger, local-case chaos,
+// chaos + multi-run probe_sequence) so a malformed block can never degrade
+// into the old launch->wait->snapshot behavior. Mirrors probeSequenceGuard.
+function chaosGuard(caseRecord, caseState, state, campaignDir) {
+  const errors = validateChaosBlock(caseRecord);
+  if (errors.length === 0) return false;
+
+  const guardTimestamp = utcTimestamp();
+  const guardAttempt = {
+    id: `attempt-${caseState.attempts.length + 1}`,
+    case_id: caseRecord.id,
+    kind: caseRecord.harness === 'local' ? 'local' : 'workflow',
+    phase: 'launch-intent',
+    execution_mode: caseUsesScriptedEnvironment(caseRecord) ? 'scripted' : 'real',
+    launch_intent_at: guardTimestamp,
+    started_at: guardTimestamp,
+    deadline_at: new Date(Date.now() + (caseRecord.caps.wall_min * 60_000)).toISOString(),
+    ...retryAttemptMetadata(caseState),
+    chaos_guard: {
+      errors,
+    },
+  };
+  caseState.phase = 'running';
+  caseState.attempts.push(guardAttempt);
+  state.updated_at = guardTimestamp;
+  atomicWriteState(campaignDir, state);
+  guardAttempt.phase = 'terminal';
+  guardAttempt.terminal_at = utcTimestamp();
+  persistMechanicalOutcome(caseState, guardAttempt, state, campaignDir, 'TEST_INFRA_FAIL', {
+    category: 'chaos-block-invalid',
+    message: `chaos block semantic validation failed: ${errors.join('; ')}`,
+    errors,
+  });
+  return true;
+}
+
 async function executeLocalCase(caseRecord, caseState, state, campaignDir) {
   if (hasAssociatedNonterminalRun(caseState)) return;
+  // E3.C US-005: fail-closed semantic probe_sequence gate — a local-command
+  // case declaring probe_sequence is persisted TEST_INFRA_FAIL before the
+  // command hook is ever constructed.
+  if (probeSequenceGuard(caseRecord, caseState, state, campaignDir)) return;
+  // E3.C US-008: a local-command case declaring a chaos block has no run /
+  // harness process to inject against — fail closed before any command hook.
+  if (chaosGuard(caseRecord, caseState, state, campaignDir)) return;
   const launchIntentTimestamp = utcTimestamp();
   const attempt = {
     id: `attempt-${caseState.attempts.length + 1}`,
@@ -3467,14 +3807,19 @@ function readRunRelationships(childEnv) {
   return relationships;
 }
 
-function persistTokenObservation(status, attempt, caseState, state, campaignDir) {
+function persistTokenObservation(status, attempt, caseState, state, campaignDir, runIdOverride) {
   const observedAt = utcTimestamp();
   const previous = attempt.tokens_observed ?? 0;
   const tokensObserved = Math.max(previous, status.tokensSpent);
   const attributedDelta = tokensObserved - previous;
+  // E3.C US-007: a multi-launch probe monitors each run through its own proxy
+  // attempt, so the run id is passed explicitly (runIdOverride) — without it,
+  // three concurrent monitors would attribute every observation to whichever
+  // run id happened to sit in the shared attempt slot.
+  const runId = runIdOverride ?? attempt.run_id;
   const observation = {
     observed_at: observedAt,
-    run_id: attempt.run_id,
+    run_id: runId,
     status: status.status,
     tokens_observed: status.tokensSpent,
     attributed_delta: attributedDelta,
@@ -3807,7 +4152,12 @@ function workflowRunBreach(caseRecord, caseState, attempt) {
   return undefined;
 }
 
-async function monitorWorkflowRun(caseRecord, caseState, attempt, childEnv, state, campaignDir, launchEndedPromise) {
+async function monitorWorkflowRun(caseRecord, caseState, attempt, childEnv, state, campaignDir, launchEndedPromise,
+  { runId: runIdOverride, tolerateStatusFailures = false } = {}) {
+  // E3.C US-007: a multi-launch probe (W3.22's three concurrent runs) monitors
+  // each run through its OWN proxy attempt, so the run id is passed explicitly
+  // (runIdOverride) instead of reading the shared attempt.run_id slot.
+  const runId = runIdOverride ?? attempt.run_id;
   // Token observation persistence and discovered-run reconciliation stay on the
   // token-poll cadence; only the cap-breach evaluation ticks faster. Each loop
   // wake is driven by whichever cadence is due next.
@@ -3833,10 +4183,22 @@ async function monitorWorkflowRun(caseRecord, caseState, attempt, childEnv, stat
     if (capCheckDue) nextCapCheckAt = now + capCheckMs;
 
     if (tokenPollDue) {
-      const status = queryWorkflowStatus(attempt.run_id, childEnv);
-      persistTokenObservation(status, attempt, caseState, state, campaignDir);
-      reconcileDiscoveredRuns(caseRecord, caseState, childEnv, state, campaignDir);
-      if (TERMINAL_RUN_STATUSES.has(status.status)) return { stopped: false, terminal_status: status.status };
+      let status;
+      try {
+        status = queryWorkflowStatus(runId, childEnv);
+      } catch (error) {
+        // E3.C US-007: a transient status-read failure (the contained daemon is
+        // restarting mid-flight — W3.22's restart_daemon probe) must not kill
+        // the monitor: skip this poll and let the cap check keep ticking. Only
+        // the concurrent multi-run monitors opt in (tolerateStatusFailures);
+        // single-run behavior is unchanged.
+        if (!tolerateStatusFailures) throw error;
+      }
+      if (status !== undefined) {
+        persistTokenObservation(status, attempt, caseState, state, campaignDir, runId);
+        reconcileDiscoveredRuns(caseRecord, caseState, childEnv, state, campaignDir);
+        if (TERMINAL_RUN_STATUSES.has(status.status)) return { stopped: false, terminal_status: status.status };
+      }
     }
 
     if (!capCheckDue) continue;
@@ -3847,31 +4209,1251 @@ async function monitorWorkflowRun(caseRecord, caseState, attempt, childEnv, stat
     breach.enforcement_latency = capEnforcementLatencySeconds(caseState, attempt, breach, detectedAt);
     attempt.stop_intent_at = detectedAt;
     attempt.stop_reason = breach;
-    const status = queryWorkflowStatus(attempt.run_id, childEnv);
+    const status = queryWorkflowStatus(runId, childEnv);
     captureStragglerPreStop(attempt, status, breach, detectedAt);
-    caseState.findings.push({ type: 'RUNAWAY', ...breach, run_id: attempt.run_id, detected_at: detectedAt });
+    caseState.findings.push({ type: 'RUNAWAY', ...breach, run_id: runId, detected_at: detectedAt });
     state.updated_at = detectedAt;
     atomicWriteState(campaignDir, state);
 
     const stopResult = await runHook('stop', {
-      executable: 'tamandua', args: ['workflow', 'stop', attempt.run_id], cwd: '.',
+      executable: 'tamandua', args: ['workflow', 'stop', runId], cwd: '.',
     }, childEnv, campaignDir, state, attempt, { enforceWall: false });
-    if (!hookSucceeded(stopResult)) throw new Error(`workflow stop failed for ${attempt.run_id}`);
+    if (!hookSucceeded(stopResult)) throw new Error(`workflow stop failed for ${runId}`);
 
     const waitResult = await runHook('terminal_wait', {
-      executable: 'tamandua', args: ['workflow', 'wait', attempt.run_id, '--json'], cwd: '.',
+      executable: 'tamandua', args: ['workflow', 'wait', runId, '--json'], cwd: '.',
     }, childEnv, campaignDir, state, attempt, { enforceWall: false });
     if (waitResult.error !== undefined || waitResult.signal !== null || waitResult.exit_code === 2) {
-      throw new Error(`workflow wait failed after stopping ${attempt.run_id}`);
+      throw new Error(`workflow wait failed after stopping ${runId}`);
     }
-    const terminalStatus = queryWorkflowStatus(attempt.run_id, childEnv);
-    persistTokenObservation(terminalStatus, attempt, caseState, state, campaignDir);
+    const terminalStatus = queryWorkflowStatus(runId, childEnv);
+    persistTokenObservation(terminalStatus, attempt, caseState, state, campaignDir, runId);
     if (!TERMINAL_RUN_STATUSES.has(terminalStatus.status)) {
-      throw new Error(`workflow remained ${terminalStatus.status} after stop and wait: ${attempt.run_id}`);
+      throw new Error(`workflow remained ${terminalStatus.status} after stop and wait: ${runId}`);
     }
     return { stopped: true, terminal_status: terminalStatus.status, breach };
   }
 }
+
+// ── E3.C US-006: probe execution engine ─────────────────────────────
+// The real-case arm executes a case's manifest-declared probe_sequence
+// against the CONTAINED TT instance while the case's run is in flight,
+// recording every action (op, phase trigger, timestamps, exact argv, CLI
+// exit code, observed effect) as attempt evidence. The engine is the fix for
+// campaign #7's S3/S4 defect: the five lifecycle cases declared probes in
+// their manifests but the controller never executed them (launch→wait→
+// snapshot only). A probe CLI failure is NEVER silently swallowed — it
+// classifies TEST_INFRA_FAIL with the distinct category 'probe-action-failed'
+// naming the op + exit code. Every action runs under the case's contained
+// spawn env (loadSpawnEnvironment childEnv) — the operator's live daemon and
+// ~/.tamandua are never touched; daemon lifecycle ops (restart_daemon) are a
+// multi-run capability (US-007) and fail closed here rather than degrade.
+//
+// US-006 scope: SINGLE-run probe sequences (run group 1). Multi-run shapes
+// (W3.20's two sequential runs, W3.22's three concurrent runs + contained
+// daemon restart) are orchestrated by US-007; a multi-run declaration is
+// recorded as an explicit deferral on the attempt (attempt.probe_sequence_
+// deferred), never silently skipped.
+
+// Map a probe op to the exact `tamandua workflow` argv executed under the
+// contained spawn env. Ops the single-run sequencer cannot execute (daemon
+// lifecycle restart_daemon, harness injection sigstop_sigcont — the latter is
+// the chaos-block operator's verb, US-008) return null and fail closed.
+function probeActionArgv(op, runId) {
+  switch (op) {
+    case 'pause': return ['workflow', 'pause', runId];
+    case 'pause_drain': return ['workflow', 'pause', runId, '--drain'];
+    case 'resume': return ['workflow', 'resume', runId];
+    case 'cancel': return ['workflow', 'cancel', runId];
+    case 'fail_force': return ['workflow', 'fail', runId, '--reason', 'torture-test probe fail_force', '--force'];
+    default: return null;
+  }
+}
+
+function normalizedMarkerRunId(runId) {
+  return runId.startsWith('run-') ? runId.slice(4) : runId;
+}
+
+// Read the contained per-run + global event streams (same files the
+// controller's readRunRelationships consumes) and return the parsed JSON
+// events for this run, newest-last, bounded by PROBE_EVENTS_EXCERPT_MAX.
+function readRunEventStream(childEnv, runId) {
+  const stateDirectory = childEnv.TAMANDUA_STATE_DIR;
+  if (typeof stateDirectory !== 'string' || !path.isAbsolute(stateDirectory)) return null;
+  const resolvedStateDirectory = path.resolve(stateDirectory);
+  if (!pathIsWithin(fs.realpathSync(TT_ROOT), resolvedStateDirectory)) return null;
+  const eventsDir = path.join(resolvedStateDirectory, 'events');
+  const shortRunId = normalizedMarkerRunId(runId);
+  // Per-run file first (product naming: <eventsDir>/<uuid>.jsonl), then the
+  // global stream with its numbered archives (oldest→newest so a newer
+  // observation wins deterministically), then the run-prefixed variant.
+  const eventPaths = [
+    path.join(eventsDir, `${shortRunId}.jsonl`),
+    path.join(eventsDir, `${runId}.jsonl`),
+    ...([3, 2, 1].map((suffix) => path.join(eventsDir, `all.jsonl.${suffix}`))),
+    path.join(eventsDir, 'all.jsonl'),
+  ];
+  const events = [];
+  let unavailable = true;
+  for (const eventsPath of eventPaths) {
+    let source;
+    try {
+      const details = fs.lstatSync(eventsPath);
+      if (!details.isFile() || details.isSymbolicLink()
+          || !pathIsWithin(fs.realpathSync(TT_ROOT), fs.realpathSync(eventsPath))) {
+        continue;
+      }
+      source = fs.readFileSync(eventsPath, 'utf8');
+    } catch (error) {
+      if (error.code === 'ENOENT') continue;
+      continue;
+    }
+    unavailable = false;
+    for (const line of source.split(/\r?\n/)) {
+      if (line.trim() === '') continue;
+      let event;
+      try {
+        event = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (!isObject(event) || typeof event.event !== 'string') continue;
+      const eventRunId = normalizedStoredRunId(event.runId ?? event.run_id ?? '');
+      if (eventRunId !== runId && eventRunId !== shortRunId) continue;
+      events.push(event);
+    }
+  }
+  return { events, unavailable };
+}
+
+// Observed-effect capture after a probe action: a contained status query plus
+// a bounded event-stream excerpt for this run since the action started. Both
+// are recorded defensively — a status/event read failure is EVIDENCE, not a
+// probe-action failure (the action itself already succeeded).
+function observeProbeEffect(runId, childEnv, sinceIso) {
+  const status = { queried_at: utcTimestamp(), status: null, tokensSpent: null, error: null };
+  try {
+    const observed = queryWorkflowStatus(runId, childEnv);
+    status.status = observed.status;
+    status.tokensSpent = observed.tokensSpent;
+  } catch (error) {
+    status.error = error.message;
+  }
+  const stream = readRunEventStream(childEnv, runId);
+  const events = [];
+  let truncated = false;
+  let bytes = 0;
+  if (stream !== null) {
+    for (const event of stream.events) {
+      if (typeof event.ts !== 'string' || event.ts < sinceIso) continue;
+      if (events.length >= PROBE_EVENTS_EXCERPT_MAX
+          || bytes + JSON.stringify(event).length > PROBE_EVENTS_EXCERPT_MAX_BYTES) {
+        truncated = true;
+        break;
+      }
+      events.push(event);
+      bytes += JSON.stringify(event).length;
+    }
+  }
+  return {
+    status_after: status,
+    events_excerpt: {
+      events,
+      truncated,
+      unavailable: stream === null ? true : stream.unavailable,
+    },
+  };
+}
+
+// Poll for a step:<role>:<state> marker in the contained steps table. The
+// query is defensive (DB absent / table absent / read failure => not
+// satisfied, keep polling); both run-id spellings are matched so the marker
+// fires whether the contained DB stores the raw UUID or the run- prefix.
+function probeStepMarkerSatisfied(marker, runId, childEnv) {
+  const parts = marker.slice('step:'.length).split(':');
+  if (parts.length !== 2) return false;
+  const [role, state] = parts;
+  const databasePath = resolveChildDatabasePath(childEnv);
+  if (databasePath === null) return false;
+  let database;
+  try {
+    database = new DatabaseSync(databasePath, { readOnly: true });
+    const shortRunId = normalizedMarkerRunId(runId);
+    // Match the step by STEP ID OR agent role: the manifest phase markers are
+    // workflow-step names (e.g. `step:finalize_merge:running` names the
+    // finalize_merge STEP whose agent is `merger`), while `step:developer:running`
+    // names the developer AGENT of the implement step — both spellings must
+    // satisfy the marker or a real contained run never arms the probe.
+    const rows = database.prepare(
+      `SELECT 1 FROM steps WHERE run_id = ? AND (step_id = ? OR agent_id LIKE ?) AND status = ? LIMIT 1`,
+    ).all(runId, role, `%${role}%`, state);
+    if (rows.length === 0 && shortRunId !== runId) {
+      const shortRows = database.prepare(
+        `SELECT 1 FROM steps WHERE run_id = ? AND (step_id = ? OR agent_id LIKE ?) AND status = ? LIMIT 1`,
+      ).all(shortRunId, role, `%${role}%`, state);
+      return shortRows.length > 0;
+    }
+    return rows.length > 0;
+  } catch {
+    return false;
+  } finally {
+    database?.close();
+  }
+}
+
+// Poll for an event:<type> marker (substring match on the event name) in the
+// contained event streams for this run.
+function probeEventMarkerSatisfied(marker, runId, childEnv) {
+  const eventType = marker.slice('event:'.length);
+  const stream = readRunEventStream(childEnv, runId);
+  if (stream === null || stream.unavailable) return false;
+  return stream.events.some((event) => event.event.includes(eventType));
+}
+
+function probeMarkerSatisfied(marker, runId, childEnv) {
+  if (marker === 'now') return true;
+  if (marker.startsWith('step:')) return probeStepMarkerSatisfied(marker, runId, childEnv);
+  if (marker.startsWith('event:')) return probeEventMarkerSatisfied(marker, runId, childEnv);
+  return false;
+}
+
+// Defensive contained status query: null on any failure (keeps polling during
+// e.g. a contained daemon restart window instead of aborting the wait).
+function probeRunStatusOrNull(runId, childEnv) {
+  try {
+    return queryWorkflowStatus(runId, childEnv);
+  } catch {
+    return null;
+  }
+}
+
+// Arm on the action's `when` phase marker. Polls the contained DB/event
+// streams on the PROBE_POLL_INTERVAL_MS cadence until the marker is satisfied,
+// the run reaches a terminal status (the probe can no longer fire — the
+// trigger is declared against an in-flight run), or the case deadline passes.
+async function waitForProbeTrigger(trigger, runId, attempt, childEnv) {
+  if (trigger === 'now') return { satisfied: true, at: utcTimestamp(), waitedMs: 0 };
+  const deadline = new Date(attempt.deadline_at).valueOf();
+  const startedAt = Date.now();
+  while (Date.now() < deadline) {
+    if (probeMarkerSatisfied(trigger, runId, childEnv)) {
+      return { satisfied: true, at: utcTimestamp(), waitedMs: Date.now() - startedAt };
+    }
+    const status = probeRunStatusOrNull(runId, childEnv);
+    if (status !== null && TERMINAL_RUN_STATUSES.has(status.status)) {
+      return {
+        satisfied: false, at: utcTimestamp(), waitedMs: Date.now() - startedAt,
+        terminalStatus: status.status,
+      };
+    }
+    await delay(PROBE_POLL_INTERVAL_MS);
+  }
+  return { satisfied: false, at: utcTimestamp(), waitedMs: Date.now() - startedAt, terminalStatus: null };
+}
+
+// Execute ONE probe action: arm → CLI action (contained spawn env) → optional
+// hold → observed effect. Returns the per-action evidence record with an `ok`
+// flag; a CLI failure carries the distinct 'probe-action-failed' failure
+// (op + exit code) so the caller classifies TEST_INFRA_FAIL.
+async function executeProbeAction(action, runId, attempt, childEnv) {
+  const op = action.op;
+  const trigger = action.when;
+  const record = {
+    op,
+    trigger,
+    run_ordinal: action.run_ordinal,
+    armed_at: null,
+    action_started_at: null,
+    action_ended_at: null,
+    argv: null,
+    exit_code: null,
+    signal: null,
+    error: null,
+    hold_seconds: typeof action.hold_seconds === 'number' ? action.hold_seconds : null,
+    hold_started_at: null,
+    hold_ended_at: null,
+    effect: null,
+  };
+  const argv = probeActionArgv(op, runId);
+  if (argv === null) {
+    const failure = {
+      category: 'probe-action-failed',
+      message: `probe op '${op}' is not supported by the single-run probe sequencer (US-006); daemon-lifecycle and harness-injection ops are multi-run / chaos capabilities`,
+      op,
+    };
+    return { ...record, ok: false, failure };
+  }
+
+  const armed = await waitForProbeTrigger(trigger, runId, attempt, childEnv);
+  record.armed_at = armed.at;
+  if (!armed.satisfied) {
+    const failure = {
+      category: 'probe-trigger-unreached',
+      message: `probe action '${op}' armed on '${trigger}' never fired before the run reached terminal/deadline (waited ${armed.waitedMs}ms)`,
+      op,
+      trigger,
+      run_terminal_status: armed.terminalStatus ?? null,
+      waited_ms: armed.waitedMs,
+    };
+    return { ...record, ok: false, failure };
+  }
+
+  assertContainedSpawnEnv(childEnv);
+  record.action_started_at = utcTimestamp();
+  const result = spawnSync('tamandua', argv, {
+    cwd: fs.realpathSync(TT_ROOT),
+    env: childEnv,
+    encoding: 'utf8',
+    maxBuffer: 1024 * 1024,
+    shell: false,
+  });
+  record.action_ended_at = utcTimestamp();
+  record.argv = ['tamandua', ...argv];
+  record.exit_code = result.status;
+  record.signal = result.signal;
+  if (result.error !== undefined) record.error = result.error.message;
+
+  if (result.error !== undefined || result.status !== 0) {
+    const failure = {
+      category: 'probe-action-failed',
+      message: `probe action '${op}' exited ${result.status}${record.error !== null ? `: ${record.error}` : ''}`,
+      op,
+      exit_code: result.status,
+      signal: result.signal ?? null,
+      error: record.error ?? null,
+      argv: record.argv,
+    };
+    return { ...record, ok: false, failure };
+  }
+
+  if (record.hold_seconds !== null && record.hold_seconds > 0) {
+    record.hold_started_at = utcTimestamp();
+    await delay(record.hold_seconds * 1000);
+    record.hold_ended_at = utcTimestamp();
+  }
+
+  record.effect = observeProbeEffect(runId, childEnv, record.action_started_at);
+  return { ...record, ok: true };
+}
+
+function writeProbeEvidenceArtifact(campaignDir, attempt, evidence) {
+  const evidenceDir = path.join(campaignDir, 'evidence', attempt.case_id, attempt.id);
+  fs.mkdirSync(evidenceDir, { recursive: true, mode: 0o700 });
+  const artifactPath = path.join(evidenceDir, 'probe-evidence.json');
+  fs.writeFileSync(artifactPath, `${JSON.stringify(evidence, null, 2)}\n`, { mode: 0o600 });
+}
+
+// Run a case's declared probe_sequence while the case's run is in flight.
+// Called from executeWorkflowCase as soon as the run id resolves (parallel to
+// monitorWorkflowRun). Persists attempt.probe_evidence after EVERY action and
+// writes the probe-evidence.json artifact the oracle-evidence-snapshot copies
+// under the probe_evidence key (US-003). Returns null when there is nothing to
+// run, { ok: true, deferred: true } for multi-run shapes (US-007), or
+// { ok, evidence } / { ok: false, reason } for a single-run sequence.
+async function runDeclaredProbeSequence(caseRecord, attempt, childEnv, state, campaignDir) {
+  const sequence = caseRecord.probe_sequence;
+  if (sequence === undefined || sequence === null || sequence.length === 0) return null;
+  if (attempt.run_id === undefined) return null;
+
+  if (sequence.length > 1) {
+    // US-007: unreachable via the campaign path — executeWorkflowCase routes
+    // multi-run probe_sequences to executeMultiRunProbeCase BEFORE the launch.
+    // Kept as a defensive backstop so a future caller can never silently skip
+    // a multi-run declaration.
+    attempt.probe_sequence_deferred = {
+      reason: 'multi-run-groups',
+      run_groups: sequence.map((group) => group.run),
+      note: 'multi-run probe orchestration (W3.20/W3.22 shapes) is implemented in US-007; this attempt ran without probe actions',
+    };
+    state.updated_at = utcTimestamp();
+    atomicWriteState(campaignDir, state);
+    return { ok: true, deferred: true };
+  }
+
+  const group = sequence[0];
+  if (!isObject(group) || !Array.isArray(group.actions)) return null;
+  const runId = attempt.run_id;
+  const evidence = {
+    schema_version: 1,
+    case_id: caseRecord.id,
+    run_id: runId,
+    run_ordinal: group.run,
+    execution_mode: attempt.execution_mode,
+    sequence_outcome: 'running',
+    started_at: utcTimestamp(),
+    ended_at: null,
+    actions: [],
+    failure: null,
+  };
+  attempt.probe_evidence = evidence;
+  state.updated_at = evidence.started_at;
+  atomicWriteState(campaignDir, state);
+
+  for (const [index, action] of group.actions.entries()) {
+    const result = await executeProbeAction(
+      { ...action, run_ordinal: group.run },
+      runId,
+      attempt,
+      childEnv,
+    );
+    evidence.actions.push(result);
+    attempt.probe_evidence = evidence;
+    state.updated_at = utcTimestamp();
+    atomicWriteState(campaignDir, state);
+    if (!result.ok) {
+      evidence.sequence_outcome = 'failed';
+      evidence.ended_at = utcTimestamp();
+      evidence.failure = {
+        ...result.failure,
+        action_index: index,
+      };
+      writeProbeEvidenceArtifact(campaignDir, attempt, evidence);
+      return { ok: false, reason: evidence.failure };
+    }
+  }
+
+  evidence.sequence_outcome = 'completed';
+  evidence.ended_at = utcTimestamp();
+  writeProbeEvidenceArtifact(campaignDir, attempt, evidence);
+  return { ok: true, evidence };
+}
+
+// ── E3.C US-008: chaos injection runner ────────────────────────────
+// The controller honors a case's manifest `chaos` block by invoking
+// bin/tt-chaos under the case's contained spawn env while the case's run is
+// in flight — the W3.17b marathon-chaos shape (sigstop_sigcont on the
+// harness process, armed on the translated trigger, held for hold_seconds).
+// Every invocation + outcome lands in attempt.chaos_evidence (start/stop
+// records: invocation argv, timestamps, exit code) so O4's watchdog
+// false-positive check and O16 can cross-reference, and the chaos.log the
+// operator appends to is copied into the oracle snapshot under the
+// chaos_log evidence key by US-003's oracle-evidence-snapshot. A chaos
+// invocation failure is NEVER silently swallowed: it classifies
+// TEST_INFRA_FAIL with the distinct category 'chaos-invocation-failed'
+// naming the operator + exit code (campaign #7 S3/S4 discipline).
+// runDeclaredChaos is started alongside monitorWorkflowRun /
+// runDeclaredProbeSequence as soon as the run id resolves and is awaited by
+// executeWorkflowCase after the launch ends; a chaos:null case returns null
+// and NEVER spawns tt-chaos.
+
+// Build the exact tt-chaos argv for a manifest chaos block (US-004's
+// sigstop_sigcont action contract): the operator binary, the injection type,
+// --run <run-id>, --when <translated trigger>, --hold-seconds <hold_seconds>.
+function buildChaosArgv(block, runId) {
+  return [
+    TT_CHAOS_PATH,
+    block.type,
+    '--run', runId,
+    '--when', translateChaosTrigger(block.trigger),
+    '--hold-seconds', String(block.hold_seconds),
+  ];
+}
+
+async function runDeclaredChaos(caseRecord, attempt, childEnv, state, campaignDir) {
+  const block = caseRecord.chaos;
+  if (block === null || block === undefined) return null;
+  if (attempt.run_id === undefined) return null;
+
+  const runId = attempt.run_id;
+  const evidence = {
+    schema_version: 1,
+    case_id: caseRecord.id,
+    run_id: runId,
+    operator: block.operator,
+    injection_type: block.type,
+    target: block.target,
+    trigger: block.trigger,
+    trigger_marker: translateChaosTrigger(block.trigger),
+    hold_seconds: block.hold_seconds,
+    status: 'running',
+    started_at: utcTimestamp(),
+    ended_at: null,
+    argv: null,
+    exit_code: null,
+    signal: null,
+    error: null,
+    failure: null,
+  };
+  attempt.chaos_evidence = evidence;
+  state.updated_at = evidence.started_at;
+  atomicWriteState(campaignDir, state);
+
+  assertContainedSpawnEnv(childEnv);
+  const argv = buildChaosArgv(block, runId);
+  evidence.argv = argv;
+  // Bound the invocation by the case's remaining wall budget (phase wait +
+  // hold are themselves bounded inside tt-chaos, but a wedged operator must
+  // never hang the controller past the case deadline). A timeout surfaces as
+  // a chaos-invocation-failed TEST_INFRA_FAIL with the timeout recorded.
+  const remainingWallMs = Math.max(
+    new Date(attempt.deadline_at).valueOf() - Date.now(),
+    60_000,
+  );
+  const result = spawnSync(argv[0], argv.slice(1), {
+    cwd: TT_ROOT,
+    env: childEnv,
+    encoding: 'utf8',
+    maxBuffer: 1024 * 1024,
+    shell: false,
+    timeout: remainingWallMs,
+  });
+  evidence.ended_at = utcTimestamp();
+  evidence.exit_code = result.status;
+  evidence.signal = result.signal;
+  evidence.error = result.error !== undefined ? result.error.message : null;
+  if (result.error?.code === 'ETIMEDOUT') evidence.timed_out = true;
+
+  if (result.error !== undefined || result.status !== 0) {
+    evidence.status = 'failed';
+    evidence.failure = {
+      category: 'chaos-invocation-failed',
+      message: `chaos operator '${block.operator}' exited ${result.status}${evidence.error !== null ? `: ${evidence.error}` : ''}`,
+      operator: block.operator,
+      exit_code: result.status,
+      signal: result.signal ?? null,
+      error: evidence.error ?? null,
+      timed_out: evidence.timed_out ?? null,
+      argv,
+    };
+    attempt.chaos_evidence = evidence;
+    state.updated_at = evidence.ended_at;
+    atomicWriteState(campaignDir, state);
+    return { ok: false, reason: evidence.failure };
+  }
+
+  evidence.status = 'completed';
+  attempt.chaos_evidence = evidence;
+  state.updated_at = evidence.ended_at;
+  atomicWriteState(campaignDir, state);
+  return { ok: true, evidence };
+}
+
+// ── E3.C US-007: multi-launch probe orchestration ───────────────────
+// A probe_sequence with two or more run groups DECLARES a multi-launch shape:
+// the run ordinals index the case's runs in launch order. executeWorkflowCase
+// routes these cases here (the single-launch path only handles one run), and
+// the orchestrator genuinely executes the sequence (campaign #7's S3/S4 zero-
+// coverage defect):
+//   * W3.20 shape (sequential): two launches executed one after another — run
+//     1 launches and its actions fire (cancel mid-implement, asserting the
+//     run.canceled terminal event lands via the event-stream excerpt), then
+//     run 2 launches and its actions fire (cancel during finalize_merge).
+//     Per-run probe evidence is grouped by run ordinal.
+//   * W3.22 shape (concurrent): three launches start concurrently (staggered
+//     per state.options.stagger_ms), then the restart_daemon action executes
+//     ONCE mid-flight via bin/daemon-control (kind real for the 43xx CLI /
+//     scripted for 53xx) — NEVER a bare `tamandua restart` — and per-run
+//     recovery (within expect.recovery_within_dispatch_intervals dispatch
+//     intervals) + token-flush preservation are observed as evidence for O16.
+// Every probe action + observed effect lands in attempt.probe_evidence (the
+// multi-run evidence keeps run ordinals) AND the probe-evidence.json artifact.
+// Fail-closed at every step with a distinct reason — never a silent
+// launch->wait->snapshot degrade. Every spawn runs under the contained env
+// (assertContainedSpawnEnv choke-points); daemon-control applies its own
+// containment guards to the restart.
+
+// Launch shape: restart_daemon is a daemon-level op — its presence means the
+// runs must be in flight TOGETHER when the daemon restarts (concurrent);
+// without it the run groups launch sequentially (W3.20's two cancels).
+function probeSequenceLaunchShape(sequence) {
+  const hasRestartDaemon = (sequence ?? []).some((group) => Array.isArray(group?.actions)
+    && group.actions.some((action) => action?.op === 'restart_daemon'));
+  return hasRestartDaemon ? 'concurrent' : 'sequential';
+}
+
+// A per-run proxy attempt: every field the run-id capture / monitor / harvest
+// machinery touches is per-run (run_id, token ledger, stop intent, terminal
+// harvest fields) while the shared launch evidence (case_id, id, execution
+// mode, deadline) is inherited from the real attempt. Proxies are ephemeral —
+// only the multi-run probe evidence (attempt.probe_evidence) is persisted.
+function createProbeRunProxy(attempt, runOrdinal) {
+  return {
+    ...attempt,
+    run_id: undefined,
+    run_id_source: undefined,
+    run_id_persisted_at: undefined,
+    run_id_error: undefined,
+    run_id_resolution_errors: undefined,
+    run_id_observations: [],
+    tokens_observed: 0,
+    token_observations: [],
+    stop_intent_at: undefined,
+    stop_reason: undefined,
+    straggler_capture: undefined,
+    terminal_status: undefined,
+    wait_exit_code: undefined,
+    wait_json: undefined,
+    steps_snapshot: undefined,
+    terminal_evidence: undefined,
+    terminal_wait: undefined,
+    launch: undefined,
+    multi_run_ordinal: runOrdinal,
+  };
+}
+
+// Execute ONE run group's ordered actions against the contained instance via
+// the single-run probe engine (executeProbeAction). Each action record is
+// reported to onActionRecorded(actions) after being pushed — the caller
+// persists the multi-run evidence after EVERY action (interruption-safe).
+// Returns { ok, actions } or { ok: false, actions, failure } stopping at the
+// failed action.
+async function executeRunGroupActions(group, runProxy, childEnv, onActionRecorded) {
+  const actions = [];
+  for (const [index, action] of group.actions.entries()) {
+    const result = await executeProbeAction(
+      { ...action, run_ordinal: group.run },
+      runProxy.run_id,
+      runProxy,
+      childEnv,
+    );
+    actions.push(result);
+    if (onActionRecorded !== undefined) onActionRecorded(actions);
+    if (!result.ok) {
+      return { ok: false, actions, failure: { ...result.failure, action_index: index } };
+    }
+  }
+  return { ok: true, actions };
+}
+
+// Observe ONE run's recovery after the contained daemon restart: poll status
+// until the query succeeds again (the daemon is back) within the declared
+// recovery window (expect.recovery_within_dispatch_intervals * the product
+// dispatch interval), recording the recovery timing + token flush (tokens
+// observed before vs after the restart) as evidence for O16's DC8 judgment.
+async function observeRestartRecovery(runId, runProxy, childEnv, restartEndedAt, expect) {
+  const intervals = Number.isSafeInteger(expect?.recovery_within_dispatch_intervals)
+    && expect.recovery_within_dispatch_intervals >= 1
+    ? expect.recovery_within_dispatch_intervals
+    : 2;
+  const windowMs = intervals * PROBE_DISPATCH_INTERVAL_MS;
+  const tokensBefore = runProxy.tokens_observed ?? 0;
+  const startedAt = Date.now();
+  let status = null;
+  let lastError = null;
+  while (Date.now() - startedAt < windowMs) {
+    try {
+      status = queryWorkflowStatus(runId, childEnv);
+      break;
+    } catch (error) {
+      lastError = error.message;
+      await delay(PROBE_POLL_INTERVAL_MS);
+    }
+  }
+  const recoveryWaitedMs = Date.now() - startedAt;
+  if (status === null) {
+    return {
+      recovered: false,
+      recovery_waited_ms: recoveryWaitedMs,
+      recovery_within_dispatch_intervals: false,
+      status_after: null,
+      error: lastError ?? 'status query never succeeded after daemon restart',
+      tokens_before_restart: tokensBefore,
+      tokens_after_restart: null,
+      token_flush_preserved: null,
+    };
+  }
+  const tokensAfter = Number.isSafeInteger(status.tokensSpent) ? status.tokensSpent : 0;
+  return {
+    recovered: true,
+    recovered_at: utcTimestamp(),
+    recovery_waited_ms: recoveryWaitedMs,
+    recovery_within_dispatch_intervals: true,
+    status_after: status.status,
+    tokens_before_restart: tokensBefore,
+    tokens_after_restart: tokensAfter,
+    token_flush_preserved: tokensAfter >= tokensBefore,
+  };
+}
+
+// Execute the restart_daemon probe ONCE via bin/daemon-control under the
+// contained spawn env — the ONLY sanctioned daemon lifecycle path (never a
+// bare `tamandua restart`; daemon-control applies its own production +
+// containment guards). Returns the EXECUTION evidence (start/end timestamps,
+// argv, exit code/signal/error) with `ok`; the caller composes the full
+// restart action record (armed_at, run_ordinal, hold_seconds) around it so
+// those fields survive.
+function executeDaemonRestart(kind, childEnv) {
+  assertContainedSpawnEnv(childEnv);
+  const record = {
+    action_started_at: utcTimestamp(),
+    argv: null,
+    exit_code: null,
+    signal: null,
+    error: null,
+  };
+  const argv = [DAEMON_CONTROL_PATH, kind, 'restart'];
+  record.argv = argv;
+  const result = spawnSync(DAEMON_CONTROL_PATH, [kind, 'restart'], {
+    cwd: TT_ROOT,
+    env: childEnv,
+    encoding: 'utf8',
+    maxBuffer: 1024 * 1024,
+    shell: false,
+  });
+  record.action_ended_at = utcTimestamp();
+  record.exit_code = result.status;
+  record.signal = result.signal;
+  if (result.error !== undefined) record.error = result.error.message;
+  const ok = result.error === undefined && result.status === 0;
+  return { record, ok };
+}
+
+// W3.20 shape: each run group launches, its actions fire against the contained
+// instance, the run is harvested, THEN the next group launches. Returns null on
+// success, or a fail-closed outcome ({ failure, run_ordinal } / { capStop,
+// run_ordinal }) that the caller classifies.
+async function executeSequentialProbeShape(caseRecord, caseState, state, campaignDir, attempt, childEnv, sequence, evidence, persistEvidence) {
+  for (let index = 0; index < sequence.length; index += 1) {
+    const group = sequence[index];
+    const hookName = index === 0 ? 'launch' : `launch_${index + 1}`;
+    const runProxy = createProbeRunProxy(attempt, group.run);
+    let signalLaunchEnded;
+    const launchEndedPromise = new Promise((resolve) => { signalLaunchEnded = resolve; });
+    let monitorPromise;
+    let probePromise;
+    let runRecord;
+    const captureRunIdentifier = createRunIdentifierCapture(runProxy, state, campaignDir, childEnv, () => {
+      runRecord ??= {
+        run_ordinal: group.run,
+        run_id: runProxy.run_id ?? null,
+        run_id_source: runProxy.run_id_source ?? null,
+        launch_hook: hookName,
+        actions: [],
+        terminal_status: null,
+        wait_exit_code: null,
+        recovery: null,
+      };
+      evidence.runs.push(runRecord);
+      persistEvidence();
+      monitorPromise ??= monitorWorkflowRun(
+        caseRecord, caseState, runProxy, childEnv, state, campaignDir, launchEndedPromise,
+      );
+      probePromise ??= executeRunGroupActions(group, runProxy, childEnv, (actions) => {
+        runRecord.actions = [...actions];
+        persistEvidence();
+      });
+    });
+    const launchResult = await runHook(hookName, {
+      executable: 'tamandua', args: workflowRunArgs(caseRecord, attempt.fixture_work_clone), cwd: '.',
+    }, childEnv, campaignDir, state, runProxy, { enforceWall: false, onChunk: captureRunIdentifier });
+    signalLaunchEnded();
+    const monitorResult = monitorPromise === undefined ? { stopped: false } : await monitorPromise;
+    const probeResult = probePromise === undefined ? null : await probePromise;
+
+    if (runProxy.run_id_error !== undefined || runProxy.run_id === undefined) {
+      const infra = classifyInfraLaunchFailure(readLaunchEvidenceStderr(campaignDir, launchResult));
+      return {
+        failure: infra !== null
+          ? { category: infra.category, message: infra.message, signature: infra.signature }
+          : {
+              category: 'workflow-run-identification',
+              error: runProxy.run_id_error ?? {
+                category: 'missing-run-identifier',
+                resolution_errors: runProxy.run_id_resolution_errors ?? [],
+              },
+            },
+        run_ordinal: group.run,
+      };
+    }
+    if (probeResult !== null && !probeResult.ok) {
+      return { failure: probeResult.failure, run_ordinal: group.run };
+    }
+
+    try {
+      await convergeDiscoveredRuns(caseRecord, caseState, childEnv, state, campaignDir);
+    } catch (error) {
+      return {
+        failure: { category: 'discovered-run-reconciliation-failed', message: error.message },
+        run_ordinal: group.run,
+      };
+    }
+    let terminalEvidence = null;
+    try {
+      terminalEvidence = await harvestWorkflowAttempt(
+        caseState, runProxy,
+        monitorResult.stopped ? runProxy.terminal_wait : launchResult,
+        childEnv, state, campaignDir,
+      );
+    } catch (error) {
+      return {
+        failure: { category: 'multi-run-harvest-failed', message: error.message },
+        run_ordinal: group.run,
+      };
+    }
+    if (runRecord !== undefined) {
+      runRecord.run_id = runProxy.run_id ?? runRecord.run_id;
+      runRecord.run_id_source = runProxy.run_id_source ?? runRecord.run_id_source;
+      runRecord.terminal_status = runProxy.terminal_status ?? terminalEvidence?.status ?? null;
+      runRecord.wait_exit_code = runProxy.wait_exit_code ?? null;
+      persistEvidence();
+    }
+    if (monitorResult.stopped) {
+      return { capStop: monitorResult, run_ordinal: group.run };
+    }
+    if (terminalEvidence === null) {
+      return {
+        failure: {
+          category: 'multi-run-nonterminal',
+          message: `run ${group.run} (${runProxy.run_id}) did not reach a terminal status; the sequential probe sequence cannot launch the next run`,
+        },
+        run_ordinal: group.run,
+      };
+    }
+  }
+  return null;
+}
+
+// W3.22 shape: every run group launches concurrently (staggered per state
+// options), each monitored through its own proxy; once the runs are in flight,
+// the restart_daemon action executes ONCE via daemon-control and each run's
+// recovery + token-flush is observed. Returns null on success or a fail-closed
+// outcome ({ failure, run_ordinal } / { capStop, run_ordinal }).
+//
+// CRITICAL (US-011 scripted-battery finding): the restart must fire MID-FLIGHT,
+// NOT after the launches. The launch hooks run `tamandua workflow run --wait
+// --json`, which BLOCKS until the run is terminal — waiting for the launches to
+// finish before arming the restart means every run has already completed and the
+// trigger can never fire. The restart probe therefore starts in run 1's
+// run-id-capture callback (parallel to the launches + monitors) and is awaited
+// after the launches.
+async function runConcurrentRestartProbe(jobs, restart, kind, childEnv, evidence, persistEvidence) {
+  // Arm on the restart trigger mid-flight, then restart the contained daemon
+  // ONCE via daemon-control (kind real for the 43xx CLI / scripted for 53xx).
+  const firstRunId = jobs[0].runProxy.run_id;
+  const restartArmed = await waitForProbeTrigger(restart.action.when, firstRunId, jobs[0].runProxy, childEnv);
+  const restartRecord = {
+    op: 'restart_daemon',
+    trigger: restart.action.when,
+    run_ordinal: restart.group.run,
+    armed_at: restartArmed.at,
+    action_started_at: null,
+    action_ended_at: null,
+    argv: null,
+    exit_code: null,
+    signal: null,
+    error: null,
+    hold_seconds: typeof restart.action.hold_seconds === 'number' ? restart.action.hold_seconds : null,
+    kind,
+    recovery: [],
+  };
+  if (!restartArmed.satisfied) {
+    const failure = {
+      category: 'probe-trigger-unreached',
+      message: `probe action 'restart_daemon' armed on '${restart.action.when}' never fired before run 1 reached terminal/deadline (waited ${restartArmed.waitedMs}ms)`,
+      op: 'restart_daemon',
+      trigger: restart.action.when,
+      run_terminal_status: restartArmed.terminalStatus ?? null,
+      waited_ms: restartArmed.waitedMs,
+    };
+    return { ok: false, failure, run_ordinal: 1 };
+  }
+  const restartExecution = executeDaemonRestart(kind, childEnv);
+  Object.assign(restartRecord, restartExecution.record);
+  if (!restartExecution.ok) {
+    const failure = {
+      category: 'probe-action-failed',
+      message: `probe action 'restart_daemon' (daemon-control ${kind} restart) exited ${restartRecord.exit_code}${restartRecord.error !== null ? `: ${restartRecord.error}` : ''}`,
+      op: 'restart_daemon',
+      exit_code: restartRecord.exit_code,
+      signal: restartRecord.signal ?? null,
+      error: restartRecord.error ?? null,
+      argv: restartRecord.argv,
+    };
+    return { ok: false, failure, run_ordinal: 1 };
+  }
+
+  // Observe each run's recovery + token flush within the declared dispatch-
+  // interval window; the per-run restart action record carries the recovery so
+  // O16 can judge per-run assertions. Each run id resolves at launch (~1s in);
+  // the restart fires at the trigger (well after), so the ids are resolved —
+  // defensively wait briefly for a straggler rather than fail the whole shape.
+  for (let index = 0; index < jobs.length; index += 1) {
+    const job = jobs[index];
+    let runId = job.runProxy.run_id;
+    if (runId === undefined) {
+      const waitUntil = Date.now() + 10_000;
+      while (runId === undefined && Date.now() < waitUntil) {
+        await delay(PROBE_POLL_INTERVAL_MS);
+        runId = job.runProxy.run_id;
+      }
+      if (runId === undefined) {
+        return {
+          ok: false,
+          failure: {
+            category: 'workflow-run-identification',
+            error: {
+              category: 'missing-run-identifier',
+              message: `run ${job.group.run} id never resolved before the restart recovery observation`,
+            },
+          },
+          run_ordinal: job.group.run,
+        };
+      }
+    }
+    const recovery = await observeRestartRecovery(
+      runId, job.runProxy, childEnv, restartRecord.action_ended_at, restart.action.expect,
+    );
+    restartRecord.recovery.push({ run_ordinal: job.group.run, run_id: runId, ...recovery });
+    const runRecord = evidence.runs.find((record) => record.run_ordinal === job.group.run);
+    if (runRecord !== undefined) {
+      runRecord.recovery = recovery;
+      runRecord.actions.push({
+        op: 'restart_daemon',
+        trigger: restart.action.when,
+        run_ordinal: job.group.run,
+        armed_at: restartRecord.armed_at,
+        action_started_at: restartRecord.action_started_at,
+        action_ended_at: restartRecord.action_ended_at,
+        argv: restartRecord.argv,
+        exit_code: restartRecord.exit_code,
+        signal: restartRecord.signal,
+        error: restartRecord.error,
+        hold_seconds: restartRecord.hold_seconds,
+        effect: { recovery },
+      });
+    }
+    persistEvidence();
+  }
+  evidence.daemon_restarts.push(restartRecord);
+  persistEvidence();
+  return { ok: true };
+}
+async function executeConcurrentProbeShape(caseRecord, caseState, state, campaignDir, attempt, childEnv, sequence, evidence, persistEvidence) {
+  // restart_daemon is daemon-level: every run group declares it (the semantic
+  // validator enforces this); all declarations share ONE execution mid-flight,
+  // and per-run recovery observations ride on each group's restart action.
+  const restartActions = [];
+  for (const group of sequence) {
+    for (const action of group.actions) {
+      if (action.op === 'restart_daemon') restartActions.push({ group, action });
+    }
+  }
+  const restart = restartActions[0];
+  if (restart === undefined) {
+    // Unreachable via the campaign path (validator + schema gate it), but fail
+    // closed rather than launch a concurrent shape with no daemon restart.
+    return { failure: { category: 'probe-sequence-invalid', message: 'concurrent launch shape requires a restart_daemon action' }, run_ordinal: 1 };
+  }
+
+  // The mid-flight restart probe (started from run 1's capture callback, owned
+  // by executeConcurrentProbeShape — declared OUTSIDE the per-job closure so
+  // the post-launch flow can await it).
+  let restartPromise;
+  const jobs = sequence.map((group, index) => {
+    const hookName = index === 0 ? 'launch' : `launch_${index + 1}`;
+    const runProxy = createProbeRunProxy(attempt, group.run);
+    let signalLaunchEnded;
+    const launchEndedPromise = new Promise((resolve) => { signalLaunchEnded = resolve; });
+    let monitorPromise;
+    let probePromise;
+    let runRecord;
+    const captureRunIdentifier = createRunIdentifierCapture(runProxy, state, campaignDir, childEnv, () => {
+      runRecord ??= {
+        run_ordinal: group.run,
+        run_id: runProxy.run_id ?? null,
+        run_id_source: runProxy.run_id_source ?? null,
+        launch_hook: hookName,
+        actions: [],
+        terminal_status: null,
+        wait_exit_code: null,
+        recovery: null,
+      };
+      evidence.runs.push(runRecord);
+      persistEvidence();
+      // The concurrent monitors tolerate transient status-read failures: the
+      // contained daemon is restarting mid-flight and a poll landing in the
+      // down window must not kill the monitor.
+      monitorPromise ??= monitorWorkflowRun(
+        caseRecord, caseState, runProxy, childEnv, state, campaignDir, launchEndedPromise,
+        { runId: runProxy.run_id, tolerateStatusFailures: true },
+      );
+      const perRunActions = group.actions.filter((action) => action.op !== 'restart_daemon');
+      if (perRunActions.length > 0) {
+        probePromise ??= executeRunGroupActions(
+          { run: group.run, actions: perRunActions }, runProxy, childEnv, (actions) => {
+            runRecord.actions = [...actions];
+            persistEvidence();
+          },
+        );
+      }
+      // The restart must fire MID-FLIGHT: the launch hooks (`workflow run
+      // --wait --json`) BLOCK until each run is terminal, so arming the
+      // restart after the launches would find every run already completed and
+      // the trigger could never fire. Start it from run 1's run-id-capture
+      // callback (parallel to the launches + monitors) and await it below.
+      if (index === 0 && restartPromise === undefined) {
+        const kind = caseUsesScriptedEnvironment(caseRecord) ? 'scripted' : 'real';
+        restartPromise = runConcurrentRestartProbe(jobs, restart, kind, childEnv, evidence, persistEvidence);
+      }
+    });
+    return { group, hookName, runProxy, signalLaunchEnded, captureRunIdentifier };
+  });
+
+  // Fire all launches concurrently, staggering per state options.
+  const launchPromises = [];
+  for (const job of jobs) {
+    launchPromises.push(runHook(job.hookName, {
+      executable: 'tamandua', args: workflowRunArgs(caseRecord, attempt.fixture_work_clone), cwd: '.',
+    }, childEnv, campaignDir, state, job.runProxy, { enforceWall: false, onChunk: job.captureRunIdentifier }));
+    if (state.options.stagger_ms > 0) await delay(state.options.stagger_ms);
+  }
+  const launchResults = await Promise.all(launchPromises);
+
+  // Any launch that failed to resolve its run id fails the whole shape closed
+  // (a concurrent restart with an unidentified run cannot be judged).
+  for (let index = 0; index < jobs.length; index += 1) {
+    const job = jobs[index];
+    if (job.runProxy.run_id_error !== undefined || job.runProxy.run_id === undefined) {
+      const infra = classifyInfraLaunchFailure(readLaunchEvidenceStderr(campaignDir, launchResults[index]));
+      return {
+        failure: infra !== null
+          ? { category: infra.category, message: infra.message, signature: infra.signature }
+          : {
+              category: 'workflow-run-identification',
+              error: job.runProxy.run_id_error ?? {
+                category: 'missing-run-identifier',
+                resolution_errors: job.runProxy.run_id_resolution_errors ?? [],
+              },
+            },
+        run_ordinal: job.group.run,
+      };
+    }
+  }
+
+  // The restart probe was started mid-flight from run 1's run-id-capture
+  // callback (the launch hooks block until terminal, so arming it here — after
+  // the launches — would find every run completed and never fire). Await it:
+  // it armed on the trigger while the runs were in flight, executed the
+  // daemon-control restart ONCE, and recorded each run's recovery + token
+  // flush (evidence.daemon_restarts[]).
+  if (restartPromise === undefined) {
+    return {
+      failure: {
+        category: 'probe-sequence-invalid',
+        message: 'concurrent launch shape never started the restart_daemon probe (run 1 run id did not resolve in the capture callback)',
+      },
+      run_ordinal: 1,
+    };
+  }
+  const restartProbeResult = await restartPromise;
+  if (!restartProbeResult.ok) {
+    return { failure: restartProbeResult.failure, run_ordinal: restartProbeResult.run_ordinal };
+  }
+
+  // Signal launch end (runs completed → launches exited), await monitors,
+  // harvest each run.
+  for (const job of jobs) job.signalLaunchEnded();
+  const monitorResults = [];
+  for (let index = 0; index < jobs.length; index += 1) {
+    const job = jobs[index];
+    const monitorResult = job.monitorPromise === undefined ? { stopped: false } : await job.monitorPromise;
+    monitorResults.push({ job, index, monitorResult });
+  }
+
+  for (const { job, index, monitorResult } of monitorResults) {
+    if (job.runProxy.run_id_error !== undefined || job.runProxy.run_id === undefined) {
+      const infra = classifyInfraLaunchFailure(readLaunchEvidenceStderr(campaignDir, launchResults[index]));
+      return {
+        failure: infra !== null
+          ? { category: infra.category, message: infra.message, signature: infra.signature }
+          : {
+              category: 'workflow-run-identification',
+              error: job.runProxy.run_id_error ?? {
+                category: 'missing-run-identifier',
+                resolution_errors: job.runProxy.run_id_resolution_errors ?? [],
+              },
+            },
+        run_ordinal: job.group.run,
+      };
+    }
+    if (job.probePromise !== undefined) {
+      const probeResult = await job.probePromise;
+      if (probeResult !== null && !probeResult.ok) {
+        return { failure: probeResult.failure, run_ordinal: job.group.run };
+      }
+    }
+    try {
+      await convergeDiscoveredRuns(caseRecord, caseState, childEnv, state, campaignDir);
+    } catch (error) {
+      return {
+        failure: { category: 'discovered-run-reconciliation-failed', message: error.message },
+        run_ordinal: job.group.run,
+      };
+    }
+    let terminalEvidence = null;
+    try {
+      terminalEvidence = await harvestWorkflowAttempt(
+        caseState, job.runProxy,
+        monitorResult.stopped ? job.runProxy.terminal_wait : launchResults[index],
+        childEnv, state, campaignDir,
+      );
+    } catch (error) {
+      return {
+        failure: { category: 'multi-run-harvest-failed', message: error.message },
+        run_ordinal: job.group.run,
+      };
+    }
+    const runRecord = evidence.runs.find((record) => record.run_ordinal === job.group.run);
+    if (runRecord !== undefined) {
+      runRecord.run_id = job.runProxy.run_id ?? runRecord.run_id;
+      runRecord.run_id_source = job.runProxy.run_id_source ?? runRecord.run_id_source;
+      runRecord.terminal_status = job.runProxy.terminal_status ?? terminalEvidence?.status ?? null;
+      runRecord.wait_exit_code = job.runProxy.wait_exit_code ?? null;
+      persistEvidence();
+    }
+    if (monitorResult.stopped) {
+      return { capStop: monitorResult, run_ordinal: job.group.run };
+    }
+    if (terminalEvidence === null) {
+      return {
+        failure: {
+          category: 'multi-run-nonterminal',
+          message: `run ${job.group.run} (${job.runProxy.run_id}) did not reach a terminal status after the daemon restart`,
+        },
+        run_ordinal: job.group.run,
+      };
+    }
+  }
+  return null;
+}
+
+// Top-level multi-launch probe orchestrator (US-007). Routes by launch shape
+// (probeSequenceLaunchShape), persists attempt.probe_evidence after EVERY
+// probe action / milestone (interruption-safe) plus the probe-evidence.json
+// artifact, and classifies the case: probe/launch/harvest failures fail closed
+// as TEST_INFRA_FAIL with distinct reasons; cap enforcement classifies
+// INCONCLUSIVE; otherwise the case is classified by its runs' terminal
+// statuses + oracles.
+async function executeMultiRunProbeCase(caseRecord, caseState, state, campaignDir, attempt, childEnv) {
+  const sequence = caseRecord.probe_sequence;
+  const shape = probeSequenceLaunchShape(sequence);
+  const evidence = {
+    schema_version: 1,
+    case_id: caseRecord.id,
+    execution_mode: attempt.execution_mode,
+    launch_shape: shape,
+    sequence_outcome: 'running',
+    started_at: utcTimestamp(),
+    ended_at: null,
+    runs: [],
+    daemon_restarts: [],
+    failure: null,
+  };
+  attempt.phase = 'running';
+  attempt.probe_evidence = evidence;
+  attempt.multi_run_probe = {
+    launch_shape: shape,
+    run_count: sequence.length,
+    status: 'running',
+    started_at: evidence.started_at,
+  };
+  state.updated_at = evidence.started_at;
+  atomicWriteState(campaignDir, state);
+
+  const persistEvidence = () => {
+    attempt.probe_evidence = evidence;
+    state.updated_at = utcTimestamp();
+    atomicWriteState(campaignDir, state);
+    writeProbeEvidenceArtifact(campaignDir, attempt, evidence);
+  };
+
+  const outcome = shape === 'concurrent'
+    ? await executeConcurrentProbeShape(
+        caseRecord, caseState, state, campaignDir, attempt, childEnv, sequence, evidence, persistEvidence,
+      )
+    : await executeSequentialProbeShape(
+        caseRecord, caseState, state, campaignDir, attempt, childEnv, sequence, evidence, persistEvidence,
+      );
+
+  if (outcome !== null && outcome.capStop !== undefined) {
+    evidence.sequence_outcome = 'cap-enforced';
+    evidence.ended_at = utcTimestamp();
+    attempt.multi_run_probe.status = 'cap-enforced';
+    persistEvidence();
+    attempt.phase = 'terminal';
+    attempt.terminal_at = utcTimestamp();
+    attempt.terminal_status = outcome.capStop.terminal_status ?? null;
+    const baseReason = {
+      category: 'runaway-cap-enforced',
+      ...outcome.capStop.breach,
+      terminal_status: outcome.capStop.terminal_status,
+      run_ordinal: outcome.run_ordinal,
+    };
+    const verdict = outcomeWithOracleEvidence(
+      caseRecord, 'INCONCLUSIVE', baseReason,
+      runCaseOracles(caseRecord, caseState, state, campaignDir, childEnv),
+    );
+    persistClassifiedAttempt(caseState, attempt, state, campaignDir, verdict);
+    return;
+  }
+  if (outcome !== null) {
+    evidence.sequence_outcome = 'failed';
+    evidence.ended_at = utcTimestamp();
+    evidence.failure = outcome.failure;
+    attempt.multi_run_probe.status = 'failed';
+    persistEvidence();
+    attempt.phase = 'terminal';
+    attempt.terminal_at = utcTimestamp();
+    attempt.terminal_status = outcome.failure.run_terminal_status ?? null;
+    persistMechanicalOutcome(caseState, attempt, state, campaignDir, 'TEST_INFRA_FAIL', {
+      category: outcome.failure.category,
+      message: outcome.failure.message,
+      op: outcome.failure.op ?? null,
+      trigger: outcome.failure.trigger ?? null,
+      exit_code: outcome.failure.exit_code ?? null,
+      signal: outcome.failure.signal ?? null,
+      error: outcome.failure.error ?? null,
+      action_index: outcome.failure.action_index ?? null,
+      run_ordinal: outcome.run_ordinal ?? null,
+      run_terminal_status: outcome.failure.run_terminal_status ?? null,
+      waited_ms: outcome.failure.waited_ms ?? null,
+    });
+    return;
+  }
+
+  // All runs launched, probed, and harvested. Bind the shared attempt to the
+  // PRIMARY (run ordinal 1) id so the oracle snapshot / downstream consumers
+  // have a concrete run id, then classify by terminal statuses + oracles.
+  evidence.sequence_outcome = 'completed';
+  evidence.ended_at = utcTimestamp();
+  attempt.multi_run_probe.status = 'completed';
+  attempt.multi_run_probe.finished_at = evidence.ended_at;
+  const primaryRun = evidence.runs.find((run) => run.run_ordinal === 1) ?? evidence.runs[0];
+  attempt.run_id = primaryRun?.run_id ?? undefined;
+  attempt.run_id_source = primaryRun?.run_id_source ?? undefined;
+  persistEvidence();
+  attempt.phase = 'terminal';
+  attempt.terminal_at = utcTimestamp();
+  // The oracle-context attempt projection requires terminal_status non-null
+  // whenever terminal_at is set (validateAttempt's XOR contract) — bind it to
+  // the primary run's terminal status (W3.20: canceled; W3.22: completed).
+  attempt.terminal_status = primaryRun?.terminal_status ?? null;
+  const terminalStatuses = evidence.runs.map((run) => ({
+    run_ordinal: run.run_ordinal,
+    run_id: run.run_id,
+    terminal_status: run.terminal_status,
+  }));
+  const allCompleted = evidence.runs.length === sequence.length
+    && evidence.runs.every((run) => run.terminal_status !== null
+      && canonicalTerminalStatus(run.terminal_status) === 'completed');
+  let verdict;
+  try {
+    verdict = outcomeWithOracleEvidence(
+      caseRecord,
+      allCompleted ? 'PASS' : 'INCONCLUSIVE',
+      allCompleted ? undefined : { category: 'workflow-terminal', terminal_statuses: terminalStatuses },
+      runCaseOracles(caseRecord, caseState, state, campaignDir, childEnv),
+    );
+  } catch (error) {
+    verdict = {
+      outcome: 'TEST_INFRA_FAIL',
+      reason: { category: 'oracle-evidence-snapshot', message: error.message },
+    };
+  }
+  persistClassifiedAttempt(caseState, attempt, state, campaignDir, verdict);
+}
+
+// US-005: Definite infrastructure launch-error classification. A real-case
 
 // US-005: Definite infrastructure launch-error classification. A real-case
 // launch whose stderr exposes a DEFINITE infrastructure failure (missing
@@ -3923,6 +5505,15 @@ function readLaunchEvidenceStderr(campaignDir, launchResult) {
 
 async function executeWorkflowCase(caseRecord, caseState, state, campaignDir) {
   if (hasAssociatedNonterminalRun(caseState)) return;
+  // E3.C US-005: fail-closed semantic probe_sequence gate — a case whose
+  // probe_sequence fails semantic validation is persisted TEST_INFRA_FAIL
+  // (probe-sequence-invalid) BEFORE any launch attempt is created.
+  if (probeSequenceGuard(caseRecord, caseState, state, campaignDir)) return;
+  // E3.C US-008: fail-closed semantic chaos block gate — a case whose chaos
+  // block fails semantic validation (untranslatable trigger, multi-run
+  // probe_sequence combination) is persisted TEST_INFRA_FAIL
+  // (chaos-block-invalid) BEFORE any launch attempt is created.
+  if (chaosGuard(caseRecord, caseState, state, campaignDir)) return;
 
   // US-005 (S9 controller): REPLAY same-origin provisioning + sequencing
   // guard. Resolve the pair BEFORE creating the launch attempt so an
@@ -4261,12 +5852,24 @@ async function executeWorkflowCase(caseRecord, caseState, state, campaignDir) {
 
   beginCaseOracleSnapshot(caseRecord, caseState, attempt, state, campaignDir, childEnv);
 
-  // O9 special-exit battery (chaos.o9_special_exits): the RESTORED working
+  // O9 special-exit battery (context.o9_special_exits): the RESTORED working
   // tree is the evidence the battery produces (tracked-byte restoration and
   // junk-probe removal are verified against it), so teardown must keep the
   // clone for post-campaign inspection instead of pruning it on PASS.
-  if (caseRecord.chaos?.o9_special_exits === true) {
+  if (caseRecord.context?.o9_special_exits === true) {
     attempt.o9_special_exit_evidence = true;
+  }
+
+  // E3.C US-007: a probe_sequence with two or more run groups DECLARES a
+  // multi-launch shape (W3.20's two sequential runs, W3.22's three concurrent
+  // runs + contained daemon restart). Route to the multi-launch orchestrator —
+  // the single-launch path below handles exactly one run. The orchestrator
+  // reuses every mechanic (runHook launch + run-id capture + monitor +
+  // discovered-run convergence + terminal harvest) per run and executes the
+  // declared actions against the CONTAINED instance while runs are in flight.
+  if ((caseRecord.probe_sequence ?? []).length > 1) {
+    await executeMultiRunProbeCase(caseRecord, caseState, state, campaignDir, attempt, childEnv);
+    return;
   }
 
   // US-010 (S12 controller): the token-saver paired launch replaces the
@@ -4283,10 +5886,22 @@ async function executeWorkflowCase(caseRecord, caseState, state, campaignDir) {
   let signalLaunchEnded;
   const launchEndedPromise = new Promise((resolve) => { signalLaunchEnded = resolve; });
   let monitorPromise;
+  let probePromise;
+  let chaosPromise;
   const captureRunIdentifier = createRunIdentifierCapture(attempt, state, campaignDir, childEnv, () => {
     monitorPromise ??= monitorWorkflowRun(
       caseRecord, caseState, attempt, childEnv, state, campaignDir, launchEndedPromise,
     );
+    // E3.C US-006: start the probe sequencer alongside the monitor as soon as
+    // the run id resolves — the declared probe_sequence executes against the
+    // CONTAINED instance while the launch is still in flight.
+    probePromise ??= runDeclaredProbeSequence(caseRecord, attempt, childEnv, state, campaignDir);
+    // E3.C US-008: start the chaos runner alongside the monitor/probe — a
+    // manifest chaos block is honored via bin/tt-chaos (W3.17b sigstop_sigcont
+    // on the harness process) against the CONTAINED instance while the run is
+    // in flight. A chaos:null case (W3.17a) returns null and NEVER spawns
+    // tt-chaos.
+    chaosPromise ??= runDeclaredChaos(caseRecord, attempt, childEnv, state, campaignDir);
   });
   const launchResult = await runHook('launch', {
     executable: 'tamandua',
@@ -4298,6 +5913,8 @@ async function executeWorkflowCase(caseRecord, caseState, state, campaignDir) {
   });
   signalLaunchEnded();
   const monitorResult = monitorPromise === undefined ? { stopped: false } : await monitorPromise;
+  const probeResult = probePromise === undefined ? null : await probePromise;
+  const chaosResult = chaosPromise === undefined ? null : await chaosPromise;
   if (attempt.run_id !== undefined && attempt.run_id_error === undefined) {
     await convergeDiscoveredRuns(caseRecord, caseState, childEnv, state, campaignDir);
   }
@@ -4330,6 +5947,45 @@ async function executeWorkflowCase(caseRecord, caseState, state, campaignDir) {
           } }),
       exit_code: launchResult.exit_code,
       signal: launchResult.signal,
+    });
+  } else if (chaosResult !== null && !chaosResult.ok) {
+    // E3.C US-008: a chaos invocation failure (operator exit non-zero / spawn
+    // error / timeout) classifies TEST_INFRA_FAIL with the DISTINCT category
+    // 'chaos-invocation-failed' naming the operator + exit code — never
+    // silently swallowed into a PASS/INCONCLUSIVE (campaign #7 S3/S4). The
+    // chaos evidence is already persisted on the attempt.
+    attempt.phase = 'terminal';
+    attempt.terminal_at = utcTimestamp();
+    persistMechanicalOutcome(caseState, attempt, state, campaignDir, 'TEST_INFRA_FAIL', {
+      category: chaosResult.reason.category,
+      message: chaosResult.reason.message,
+      operator: chaosResult.reason.operator,
+      exit_code: chaosResult.reason.exit_code,
+      signal: chaosResult.reason.signal,
+      error: chaosResult.reason.error,
+      timed_out: chaosResult.reason.timed_out ?? null,
+      argv: chaosResult.reason.argv,
+    });
+  } else if (probeResult !== null && !probeResult.ok) {
+    // E3.C US-006: a probe failure (CLI action exited non-zero / spawn error,
+    // trigger never materialized, unsupported op) classifies TEST_INFRA_FAIL
+    // with the DISTINCT reason from the sequencer — never silently swallowed
+    // into a PASS/INCONCLUSIVE the old launch->wait->snapshot path would have
+    // produced (campaign #7 S3/S4). The probe evidence is already persisted on
+    // the attempt and as the probe-evidence.json artifact.
+    attempt.phase = 'terminal';
+    attempt.terminal_at = utcTimestamp();
+    persistMechanicalOutcome(caseState, attempt, state, campaignDir, 'TEST_INFRA_FAIL', {
+      category: probeResult.reason.category,
+      message: probeResult.reason.message,
+      op: probeResult.reason.op ?? null,
+      trigger: probeResult.reason.trigger ?? null,
+      exit_code: probeResult.reason.exit_code ?? null,
+      signal: probeResult.reason.signal ?? null,
+      error: probeResult.reason.error ?? null,
+      action_index: probeResult.reason.action_index ?? null,
+      run_terminal_status: probeResult.reason.run_terminal_status ?? null,
+      waited_ms: probeResult.reason.waited_ms ?? null,
     });
   } else if (monitorResult.stopped) {
     attempt.phase = 'terminal';
@@ -4495,6 +6151,20 @@ async function recoverWorkflowAttempt(caseRecord, state, caseState, attempt, cam
       category: 'token-saver-recovery-unsupported',
       kind: 'workflow',
       message: 'the token-saver paired-launch attempt cannot be reattached mid-pair; rerun the case to re-drive both launches',
+    });
+    return;
+  }
+  // E3.C US-007: a multi-launch probe attempt (W3.20/W3.22 shapes) cannot be
+  // reattached mid-sequence — the per-run launch/probe/harvest cadence and the
+  // mid-flight daemon restart are controller-driven state and the per-run run
+  // ids live in attempt.probe_evidence, not the attempt's run_id slot. Fail
+  // closed with a distinct reason — rerun the case to re-drive the sequence.
+  if (attempt.multi_run_probe !== undefined) {
+    finishRecoveredAttempt(state, caseState, attempt, campaignDir, 'TEST_INFRA_FAIL', {
+      category: 'multi-run-probe-recovery-unsupported',
+      kind: 'workflow',
+      message: 'the multi-launch probe attempt (W3.20/W3.22 shape) cannot be reattached mid-sequence; rerun the case to re-drive all launches',
+      launch_shape: attempt.multi_run_probe.launch_shape ?? null,
     });
     return;
   }
@@ -5401,7 +7071,14 @@ async function main() {
     const schema = loadSchema();
     if (options.validateOnly) {
       const manifestPath = resolveManifestPath(options.manifest);
-      const manifest = applyCaseFilter(loadManifest(manifestPath, schema), options.caseId);
+      // E3.C US-005: --validate-only runs the semantic probe_sequence
+      // validator (loadManifest includeSemantic) so a semantically-invalid
+      // probe declaration exits non-zero with a DISTINCT reason naming the
+      // case id and the offending op — never a silent pass.
+      const manifest = applyCaseFilter(
+        loadManifest(manifestPath, schema, { includeSemantic: true }),
+        options.caseId,
+      );
       console.log(`Validated ${manifest.cases.length} case(s) from ${path.relative(TT_ROOT, manifestPath)}`);
       return 0;
     }

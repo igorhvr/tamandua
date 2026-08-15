@@ -237,27 +237,34 @@ execution as `TEST_INFRA`.
 | `submit_rejections` | Ordered submit-time validator attempts: claim/step/run IDs, attempt number, timestamp, validation code, missing/invalid keys, and actionable diagnostic code; no submitted output body. |
 | `expects_validations` | Structured expects evaluations and accepted verdict transitions, including producer/consumer attribution and retry/done decision. |
 | `dispatch_renderings` | Structured prompt-render validation: required keys and unresolved-placeholder count/keys only; the rendered prompt itself is excluded. |
+| `probe_evidence` | E3.C lifecycle-probe evidence (US-003): the controller's probe sequencer artifact — ordered per-action records (op, phase trigger, start/finish timestamps, exact argv, CLI exit code, observed effect) written to `<campaign>/evidence/<case>/<attempt>/probe-evidence.json` and copied into the snapshot. Required by O16. |
+| `chaos_log` | E3.C chaos-injection log (US-003/US-010): a snapshot bundle of `var/chaos/chaos.log` — the structured start/hold/cont/INVALID entries tt-chaos appends per injection — followed (when the process recorder sampled the campaign's `var/`) by the recorder-sample bundle (`# recorder-samples` marker + the recorder's 5s JSONL samples: ts/pid/pgid/ppid/cwd/cmdline/RSS/fd). Required by O4: the chaos entries distinguish a watchdog-killed live worker from a chaos-killed one, and the recorder samples are the liveness provenance. |
 
-Required (`R`) versus optional (`—`) inputs for the seven gating hooks are pinned here:
+Required (`R`) versus optional (`—`) inputs for the nine gating hooks are pinned here
+(O4 and O16 are the E3.C additions; their executables land with US-009/US-010):
 
-| Evidence key | O1 | O2 | O3z | O8 | O9 | O10 | O11 |
-|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| `database_snapshot` | R | R | R | — | R | R | R |
-| `run_events` | R | R | — | — | R | R | R |
-| `workflow_status` | R | — | — | — | — | — | — |
-| `launch_intent` | — | R | — | — | — | R | — |
-| `git_bundle` | — | R | — | R | R | — | — |
-| `refs_before`, `refs_after`, `target_reflog` | — | R | — | — | — | `refs_before` + `refs_after` | — |
-| `checksum_baseline`, `checksum_terminal` | — | — | — | R | — | — | — |
-| `suite_ledger`, `suite_observations` | — | R | — | — | R | R | — |
-| `token_deltas`, `round_usage` | — | — | — | — | — | — | R |
-| `system_tokens_before`, `system_tokens_after` | — | — | R | — | — | — | R |
-| `submit_rejections` | — | — | — | — | — | R | R |
-| `expects_validations`, `dispatch_renderings` | — | — | — | — | — | — | R |
+| Evidence key | O1 | O2 | O3z | O4 | O8 | O9 | O10 | O11 | O16 |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| `database_snapshot` | R | R | R | R | — | R | R | R | R |
+| `run_events` | R | R | — | R | — | R | R | R | R |
+| `workflow_status` | R | — | — | — | — | — | — | — | — |
+| `launch_intent` | — | R | — | — | — | — | R | — | — |
+| `git_bundle` | — | R | — | — | R | R | — | — | — |
+| `refs_before`, `refs_after`, `target_reflog` | — | R | — | — | — | — | `refs_before` + `refs_after` | — | — |
+| `checksum_baseline`, `checksum_terminal` | — | — | — | — | R | — | — | — | — |
+| `suite_ledger`, `suite_observations` | — | R | — | — | — | R | R | — | — |
+| `token_deltas`, `round_usage` | — | — | — | — | — | — | — | R | — |
+| `system_tokens_before`, `system_tokens_after` | — | — | R | — | — | — | — | R | — |
+| `submit_rejections` | — | — | — | — | — | — | R | R | — |
+| `expects_validations`, `dispatch_renderings` | — | — | — | — | — | — | — | R | — |
+| `probe_evidence` | — | — | — | — | — | — | — | — | R |
+| `chaos_log` | — | — | — | R | — | — | — | — | — |
 
 An artifact marked optional may be present and used for corroboration, but its presence
 does not permit an oracle to weaken or replace a required evidence leg. These are the
-only input references in version 1; adding a key requires a contract-version change.
+only input references in version 1 (the E3.C `probe_evidence`/`chaos_log` optional keys
+were introduced within version 1 as part of the lifecycle-probe machinery); adding a
+further key requires a contract-version change.
 
 ### Shared version-1 runtime
 
@@ -514,7 +521,8 @@ claim targeted exit-matrix coverage because they do not capture all process and
 filesystem legs. A malformed targeted event is snapshot infrastructure failure rather
 than an omitted observation.
 
-A manifest opts into this targeted arm with `chaos.o9_special_exits: true`. After the
+A manifest opts into this targeted arm with `context.o9_special_exits: true` (carried in
+`context`, not `chaos` — the chaos block is the typed W3.17b injection block). After the
 workflow converges and before terminal evidence is snapshotted, `tt-controller` launches
 three isolated `tamandua-test --force` probes attributed to the run with distinct step
 IDs and sets `TAMANDUA_TSTX_JUNK_PROBE` itself. The probe driver requires a clean tracked
@@ -699,6 +707,147 @@ command identity, red-row identity when applicable, and the nonempty `TEST_CMD`,
 claimed agent response prose or use any output line as a policy override. Launch-intent
 invariance, replacement inheritance, already-landed acceptance, and red-to-missing
 laundering checks extend this core FMIS layer without weakening it.
+
+### O4 claim & dispatch hygiene interpretation
+
+O4 is the **claim & dispatch hygiene oracle** (spec 03 "O4 — Claim & dispatch
+hygiene (sweep, gating)"). Its three required evidence legs are
+`database_snapshot` (the read-only terminal TT database: `steps`, `stories`,
+`story_abandonments`, `runs`), `run_events` (the contained event-stream slice,
+used for corroboration), and `chaos_log` (the bundle of tt-chaos structured
+entries + the process recorder's 5s samples — see the evidence-key table).
+
+**TIER-1 SCOPE DECISION (documented, not removed):** spec 03 lists O4 in the
+in-campaign gating set (with O1, O2, O3z, O8, O9, O10, O11, O16). O4 is
+therefore **IMPLEMENTED** as a real executable — it is NOT removed from the
+W3.0x manifests that declare it. Campaign #7's `ORACLE_MISSING` for O4 (and
+O16) is closed by the executable landing (US-010) plus the declared-oracle
+hygiene gate (US-011).
+
+The six judgment dimensions, each with its violation finding:
+
+- **Dead claim_pgid (beyond one sweep interval)** — every `steps` row with
+  `status='running'` and `claim_pgid > 0` is probed for process-group liveness
+  exactly like the product's liveness watchdog: `kill(-pgid, 0)`; `ESRCH`
+  means the group is gone. A dead pgid whose claim is older than one sweep
+  interval (the daemon's 15s dispatch sweep) is `O4_DEAD_CLAIM_PGID` (the
+  sweep should have requeued it). Steps without `claim_pgid` (legacy/manual
+  claims) and claims without a parseable timestamp are skipped — the product
+  leaves both to the age-based sweeper, and the oracle cannot establish the
+  "beyond one sweep interval" bound without a timestamp.
+- **Dangling claim after NO_WORK** — the scheduler releases claims scoped to
+  the round's job with `abandonReason='no_work_release'` (recorded in
+  `story_abandonments`). A step that a NO_WORK release targeted must not still
+  be claimed at snapshot time: `status='running'` with a non-null claim
+  (`claim_pid`/`claim_pgid`/`claim_job_id`) is
+  `O4_DANGLING_CLAIM_AFTER_NO_WORK` — unless the step was re-claimed AFTER the
+  release (`claim_updated_at > released_at`), which is a legitimate new claim.
+- **retry_count <= max_retries** — every non-terminal step/story (status
+  waiting/pending/running) must satisfy `retry_count <= max_retries` (product
+  default 4); a non-terminal row exceeding it is `O4_RETRY_BUDGET_EXCEEDED`. A
+  *failed* row may legitimately carry `retry_count == max_retries+1` because
+  the product fails the step/story AT the exhaustion point.
+- **Reroute counters within budget** — the product's general reroute counter
+  never increments past the workflow's `on_fail.max_reroutes` (default 2). A
+  step with `reroute_count > 2` is `O4_REROUTE_BUDGET_EXCEEDED` — a
+  counter-runaway anomaly (a workflow declaring a larger budget must be
+  reconciled by the operator; the mechanical tripwire is the source default).
+  The separate `terminal_reroute_count` is deliberately NOT judged: terminal
+  refusals carry a designed independent allowance that legitimately crosses
+  the shared budget.
+- **Abandonment boundary matches source** — `ABANDON_STORY_MAX = 8` survivable
+  story losses (a story fails on the 9th; only `failed` stories may carry
+  `abandoned_count > 8`) and `MAX_ABANDON_RESETS = 5` for single steps (only
+  `failed` steps may carry `abandoned_count >= 5`). A non-failed story/step
+  beyond its boundary is `O4_ABANDON_BUDGET_EXCEEDED`.
+- **Watchdog false-positive check** — zero `[liveness-detected]` worker_lost
+  recoveries for workers **provably alive**. The product records every
+  liveness-watchdog recovery in `story_abandonments` with
+  `reason='liveness_detected'` (the same recovery emits the
+  `[liveness-detected]` `step.worker_lost` event). A worker is *provably
+  alive* when >= 2 **consecutive** recorder samples (gap <= 2x the 5s sampler
+  interval) of the run's worker (sample `cmdline`/`cwd` mentions the run id)
+  fall within 120s before the recovery. Cross-referenced with the chaos log: a
+  `kill-harness`/`fired` entry for the run within 120s explains the loss (not
+  a false positive); **kill-and-PID-reuse inside one window** (a chaos kill AND
+  later samples with the same pgid) is INCONCLUSIVE and maps to
+  `NOT_EVALUABLE` (scope `watchdog-pid-reuse` in the evidence artifact) when
+  no other dimension produced a finding; a provably-alive worker with no
+  chaos kill is `O4_WATCHDOG_FALSE_POSITIVE`.
+
+The `story_abandonments` table is the authoritative abandonment record; the
+event stream corroborates it (per-run `story.abandoned`/`step.worker_lost`
+counts ride in the evidence artifact). Malformed DB evidence fails closed as
+`ERROR`; a log line that is neither a chaos entry nor a recorder sample is
+skipped (a log may be mid-write). The evidence artifact is
+`o4-claim-dispatch-hygiene.json` with per-dimension observations and the
+finding ids.
+
+### O16 lifecycle probe-evidence interpretation
+
+O16 is the E3.C **lifecycle probe-evidence oracle** (spec 07-wave-3-harness-duel.md
+section C): it judges the probe sequencer's per-action evidence for the five
+lifecycle cases (W3.18 pause-no-drain, W3.19 pause-drain, W3.20 cancel, W3.21
+fail-force-resume, W3.22 daemon-restart) and any other W3.0x cell that declares O16.
+Its three required evidence legs are `probe_evidence` (the sequencer artifact,
+schema-version 1), `run_events` (the contained event-stream slice), and
+`database_snapshot` (the read-only terminal TT database). The sequencer's own
+observed-effect excerpts are corroboration at most — O16 re-derives every verdict
+independently from the event stream and database snapshot, never from the
+sequencer's `effect` summary or any agent prose.
+
+NOTE ON SPEC 03: the separate 'held-out acceptance probes' O16 definition in
+tamandua-torture-test-spec/03-oracles.md is **out of scope** for this work item.
+Tier-1 does not run held-out acceptance probes; O16 as implemented here is the
+lifecycle probe-evidence oracle per E3.C (spec 07-wave-3 section C + spec 12
+runner-automation), documented below.
+
+The five judgment dimensions, each with its violation finding:
+
+- **Pause held (no_rounds_during_hold)** — a `pause` action must carry a hold
+  window (`hold_started_at`/`hold_ended_at`; a pause without one is
+  `O16_PAUSE_HOLD_MISSING`). No dispatch event may fire for the run inside that
+  window. A dispatch event is `dispatch.render.validated`, `step.running`, or
+  `step.started` on the run's event stream; any such event inside
+  `[hold_started_at, hold_ended_at]` is `O16_ROUND_DURING_HOLD`.
+- **Pause --drain (drain_waits_current + next_story_parked)** — for a
+  `pause_drain` action, the in-flight story step may complete (a `step.done` is
+  allowed) but the next story must stay parked: no dispatch event may fire
+  between the drain's `action_ended_at` and the next action's start (or the
+  evidence's `ended_at` when no next action exists). Any dispatch event in that
+  window is `O16_DRAIN_DISPATCHED_NEXT_STORY`. The no-wedge guarantee is the
+  resume/completion check below: after the sequence's `resume`, the probed run
+  must reach `completed`.
+- **Cancel terminal event (canceled_terminal_event, CNEV)** — every `cancel`
+  action must land a `run.canceled` event on the run's event stream with
+  `ts >= action_started_at`; absence is `O16_CANCEL_TERMINAL_EVENT_MISSING`.
+- **Fail --force resume reuses the SAME run id (same_run_id_resumes)** — when a
+  `fail_force` action is followed by a `resume` action, the terminal database must
+  show the SAME run row (the probe evidence's run id) as `completed`. A completed
+  run row under a DIFFERENT id while the probed id did not complete is the
+  resumeWorkflow-reuses-run-id trap: `O16_RESUME_NEW_RUN_ID` (details carry the
+  completed other run ids and their `run_number`s). A `resume` action whose run
+  row is not `completed` is `O16_RESUME_RUN_NOT_COMPLETED` — this is also the
+  draining-pause-wedge check for pause --drain and the `run_completes` leg for
+  every resume.
+- **Restart recovery (recovery_within_dispatch_intervals + token_flush_preserved,
+  DC8)** — every `restart_daemon` recovery observation (per-run `recovery` on the
+  run group, the restart action's `effect.recovery`, or a `daemon_restarts[].recovery`
+  entry) must report `recovered: true`,
+  `recovery_within_dispatch_intervals: true`, and `token_flush_preserved: true`;
+  any false field is `O16_RESTART_RECOVERY_EXCEEDED` (with the waited ms and
+  post-restart status), and a missing observation is `O16_RESTART_RECOVERY_MISSING`.
+
+The oracle accepts both probe-evidence shapes the sequencer produces: the
+single-run shape (W3.18/W3.19/W3.21: `run_id` + ordered `actions`) and the
+multi-run shape (W3.20/W3.22: `runs[]` grouped by run ordinal with per-run
+`actions` and optional `recovery`, plus `daemon_restarts[]`). Every action record
+is validated fail-closed (op, trigger, canonical timestamps) — malformed probe
+evidence is an oracle `ERROR`, never a guessed pass. A probe sequence carrying no
+lifecycle op at all (`pause`, `pause_drain`, `resume`, `cancel`, `fail_force`,
+`restart_daemon`) and no daemon-restart evidence is `NOT_EVALUABLE`: there is
+nothing for a lifecycle oracle to judge, and the version-1 vocabulary forbids
+guessing PASS from an empty judgment scope.
 
 ## Output
 

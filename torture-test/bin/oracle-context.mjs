@@ -3,7 +3,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 export const ORACLE_CONTEXT_VERSION = 1;
-export const GATING_ORACLE_IDS = Object.freeze(['O1', 'O2', 'O3z', 'O8', 'O9', 'O10', 'O11']);
+export const GATING_ORACLE_IDS = Object.freeze(['O1', 'O2', 'O3z', 'O4', 'O8', 'O9', 'O10', 'O11', 'O16']);
+// E3.C (US-003): evidence artifacts that only exist when the lifecycle-probe
+// machinery ran. The snapshot leaves them null when absent; the oracles that
+// need them (O16 probe_evidence, O4 chaos_log) enforce presence through
+// REQUIRED_ORACLE_EVIDENCE instead of failing every non-probe case's capture.
+export const OPTIONAL_ORACLE_EVIDENCE_KEYS = Object.freeze(['probe_evidence', 'chaos_log']);
 export const ORACLE_EVIDENCE_KEYS = Object.freeze([
   'database_snapshot',
   'run_events',
@@ -24,6 +29,8 @@ export const ORACLE_EVIDENCE_KEYS = Object.freeze([
   'submit_rejections',
   'expects_validations',
   'dispatch_renderings',
+  'probe_evidence',
+  'chaos_log',
 ]);
 
 export const REQUIRED_ORACLE_EVIDENCE = Object.freeze({
@@ -33,6 +40,10 @@ export const REQUIRED_ORACLE_EVIDENCE = Object.freeze({
     'refs_before', 'refs_after', 'target_reflog', 'suite_ledger', 'suite_observations',
   ]),
   O3z: Object.freeze(['database_snapshot', 'system_tokens_before', 'system_tokens_after']),
+  // O4 (spec 03 claim & dispatch hygiene): recorder/proc samples ride inside
+  // chaos_log or a recorder evidence key; the chaos log is what lets O4
+  // distinguish a watchdog-killed worker from a chaos-killed one.
+  O4: Object.freeze(['database_snapshot', 'run_events', 'chaos_log']),
   O8: Object.freeze(['git_bundle', 'checksum_baseline', 'checksum_terminal']),
   O9: Object.freeze(['database_snapshot', 'run_events', 'git_bundle', 'suite_ledger', 'suite_observations']),
   O10: Object.freeze([
@@ -44,6 +55,9 @@ export const REQUIRED_ORACLE_EVIDENCE = Object.freeze({
     'system_tokens_before', 'system_tokens_after', 'submit_rejections',
     'expects_validations', 'dispatch_renderings',
   ]),
+  // O16 (E3.C lifecycle probe-evidence oracle): judges the probe sequencer's
+  // per-action evidence against the run event stream and database snapshot.
+  O16: Object.freeze(['probe_evidence', 'run_events', 'database_snapshot']),
 });
 
 const MECHANICAL_STEP_FIELDS = Object.freeze([

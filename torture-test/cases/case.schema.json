@@ -86,6 +86,10 @@
         "token_saver_control": {
           "type": "boolean",
           "description": "OPTIONAL token-saver paired-launch signal (S12 / E3.D). Marks the case as the token-saver lifecycle probe (W3.23-token-saver): the controller executes it as TWO do-now launches — a flagged run with --no-hurry-please-save-tokens-mode and the managed pi-token-saver stub (bin/tt-token-saver-stub) on the contained daemon's PATH (var/adapters-bin, prepended by tt-daemon-up ensure-up), and a control run without either — and records both runs' argv + token ledgers as case evidence. The controller must treat token_saver_control as internal wiring and exclude it from --context passthrough (like execution_mode)."
+        },
+        "o9_special_exits": {
+          "type": "boolean",
+          "description": "OPTIONAL O9 special-exit battery opt-in (internal wiring, like token_saver_control; E3.C US-001 migration). Marks the case for the controller's O9 targeted-probe battery: the RESTORED working tree is the evidence the battery produces (exit-88 tracked-dirty refusal, tracked-byte restoration, junk-probe removal) and the controller keeps the clone on PASS instead of pruning it. Formerly carried as the loose chaos.o9_special_exits carrier; moved to context when chaos became the typed W3.17b injection block — the old carrier is REJECTED by the schema."
         }
       }
     },
@@ -197,6 +201,18 @@
         "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
       }
     },
+    "probe_sequence": {
+      "description": "OPTIONAL E3.C lifecycle-probe sequence (nullable). A per-run list of probe groups the controller executes against the CONTAINED TT instance (43xx CLI, contained env) while the case's run(s) are in flight. null or absent => no lifecycle probes. Each group targets ONE run ordinal (>= 1; ordinals index the case's runs in launch order, so W3.20's two runs use groups run 1 and run 2) and carries an ordered actions array executed when the group's run reaches the action's phase marker. Every probe action + observed effect is recorded into attempt evidence for O16. Schema contract: op enum is fail-closed (unknown ops are REJECTED), when is a phase-marker string (step:<role>:<state> | event:<type> | now), hold_seconds applies to hold-capable ops (pause, pause_drain, sigstop_sigcont), and expect declares the observed effect the O16 lifecycle oracle must judge.",
+      "anyOf": [
+        { "type": "null" },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/probeGroup"
+          }
+        }
+      ]
+    },
     "gates": {
       "type": "array",
       "uniqueItems": true,
@@ -208,9 +224,10 @@
       }
     },
     "chaos": {
+      "description": "E3.C typed chaos-injection block (nullable). null => no chaos injection. A non-null block matches the W3.17b marathon-chaos shape and is honored by the controller via bin/tt-chaos: type is the injection kind, target the affected process class, trigger the phase marker that arms the injection, hold_seconds the SIGSTOP hold duration, operator the executable that performs the injection. Schema contract is fail-closed: unknown type/target/operator values and unknown properties are REJECTED.",
       "anyOf": [
         { "type": "null" },
-        { "type": "object" }
+        { "$ref": "#/$defs/chaosBlock" }
       ]
     },
     "shed_ok": {
@@ -273,6 +290,122 @@
         },
         "cwd": {
           "$ref": "#/$defs/relativePath"
+        }
+      }
+    },
+    "probeGroup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run", "actions"],
+      "properties": {
+        "run": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Run ordinal (1-based) this probe group targets, indexing the case's runs in launch order."
+        },
+        "actions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/probeAction"
+          }
+        }
+      }
+    },
+    "probeAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["op", "when"],
+      "properties": {
+        "op": {
+          "enum": ["pause", "pause_drain", "resume", "cancel", "fail_force", "restart_daemon", "sigstop_sigcont"],
+          "description": "Probe verb executed by the controller against the contained TT instance. pause: pause the daemon without draining; pause_drain: pause --drain (current run finishes, no new dispatch); resume: resume a paused/failed daemon or run; cancel: cancel the run (assert run.canceled terminal event); fail_force: fail --force the run (resume must reuse the SAME run id); restart_daemon: restart the contained daemon mid-flight; sigstop_sigcont: SIGSTOP/SIGCONT the harness process."
+        },
+        "when": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^(now|step:[A-Za-z0-9._-]+:[A-Za-z0-9._-]+|event:[A-Za-z0-9._-]+)$",
+          "description": "Phase marker arming the probe: 'now' (immediate), 'step:<role>:<state>' (e.g. step:developer:running, step:finalize_merge:running), or 'event:<type>' (e.g. event:run.canceled)."
+        },
+        "hold_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "OPTIONAL hold duration for hold-capable ops (pause, pause_drain, sigstop_sigcont): the pause/stop is held this many seconds before the action's counterpart (resume/cont) fires."
+        },
+        "expect": {
+          "$ref": "#/$defs/probeExpect",
+          "description": "OPTIONAL observed-effect declaration the O16 lifecycle oracle judges from the probe evidence."
+        }
+      }
+    },
+    "probeExpect": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Observed-effect contract for a probe action (all fields optional; O16 judgment dimensions).",
+      "properties": {
+        "run_completes": {
+          "type": "boolean",
+          "description": "After resume/cont, the probed run must complete."
+        },
+        "no_rounds_during_hold": {
+          "type": "boolean",
+          "description": "pause (no drain): no dispatch rounds may fire while the daemon is paused."
+        },
+        "drain_waits_current": {
+          "type": "boolean",
+          "description": "pause --drain: the current run finishes before dispatch pauses."
+        },
+        "next_story_parked": {
+          "type": "boolean",
+          "description": "pause --drain: the next story must not dispatch while paused."
+        },
+        "canceled_terminal_event": {
+          "type": "boolean",
+          "description": "cancel: a run.canceled terminal event must land."
+        },
+        "same_run_id_resumes": {
+          "type": "boolean",
+          "description": "fail --force: resume must reuse the SAME run id."
+        },
+        "recovery_within_dispatch_intervals": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "restart_daemon: all in-flight runs recover within this many dispatch intervals."
+        },
+        "token_flush_preserved": {
+          "type": "boolean",
+          "description": "restart_daemon: the token flush is preserved across the daemon restart."
+        }
+      }
+    },
+    "chaosBlock": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "target", "trigger", "hold_seconds", "operator"],
+      "properties": {
+        "type": {
+          "enum": ["sigstop_sigcont"],
+          "description": "Injection kind. sigstop_sigcont: SIGSTOP the target process, hold, then SIGCONT."
+        },
+        "target": {
+          "enum": ["harness_process"],
+          "description": "Process class the injection targets. harness_process: the active harness (pi/hermes) process for the run."
+        },
+        "trigger": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "Phase marker that arms the injection (e.g. mid_round)."
+        },
+        "hold_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "SIGSTOP hold duration in seconds before SIGCONT."
+        },
+        "operator": {
+          "enum": ["tt-chaos"],
+          "description": "Executable that performs the injection: bin/tt-chaos."
         }
       }
     }

@@ -81,6 +81,7 @@ HEAVY_CAMPAIGN_TESTS=(
     'tier1-include-real-proof.test.ts'
     'tier1-real-case-proof.test.ts'
     'tier1-repeatability.test.ts'
+    'tier1-scripted-probe-battery.test.ts'
     'tier1-zero-real-launch-infra.test.ts'
 )
 

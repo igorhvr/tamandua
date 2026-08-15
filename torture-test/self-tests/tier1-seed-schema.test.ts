@@ -225,9 +225,12 @@ const US002_EXPECTED_TEST_CMDS: Record<string, string> = {
   "W2.24-docs-drift": "npm test",
 };
 
-// Byte-exact pre-E3.A lines owned by E3.D (S9/S10) — coordinate only.
-const REPLAY_PYTHON_LINE = `{"id":"W1.REPLAY-python","wave":1,"workflow":"tt-shim-probe","fixture":"tt-python","harness":"pi","task":"cases/tasks/tier1/W1.REPLAY-python.md","context":{"execution_mode":"real","test_cmd":"pytest -q"},"caps":{"tokens":100000,"wall_min":3},"requires":{"toolchains":["python3","node"],"node_min":22},"boundary_files":["fixtures-src/tt-python/src"],"forbidden":["fixtures-src/tt-python/operator-notes.local"],"oracles":["O1","O3z","O9","O11"],"gates":["TIER1","W1"],"chaos":null,"shed_ok":false,"mandatory":true,"class":"verification","spec_ref":"05-wave-1-language-smoke.md#W1.REPLAY"}`;
-const REPLAY_TS_LINE = `{"id":"W1.REPLAY-ts","wave":1,"workflow":"tt-shim-probe","fixture":"tt-ts","harness":"pi","task":"cases/tasks/tier1/W1.REPLAY-ts.md","context":{"execution_mode":"real","test_cmd":"npm test"},"caps":{"tokens":100000,"wall_min":3},"requires":{"toolchains":["node"],"node_min":22},"boundary_files":["fixtures-src/tt-ts/src"],"forbidden":["fixtures-src/tt-ts/operator-notes.local"],"oracles":["O1","O3z","O9","O11"],"gates":["TIER1","W1"],"chaos":null,"shed_ok":false,"mandatory":true,"class":"verification","spec_ref":"05-wave-1-language-smoke.md#W1.REPLAY"}`;
+// Byte-exact W1.REPLAY-* lines, refreshed to the E3.D S9/S10 state
+// (test_cmd .venv/bin/pytest -q + replay_of pair binding). E3.D resized
+// these lines without refreshing the pins; E3.C US-002 performs the
+// coordinated refresh — any further drift fails loudly.
+const REPLAY_PYTHON_LINE = `{"id":"W1.REPLAY-python","wave":1,"workflow":"tt-shim-probe","fixture":"tt-python","harness":"pi","task":"cases/tasks/tier1/W1.REPLAY-python.md","context":{"execution_mode":"real","test_cmd":".venv/bin/pytest -q","replay_of":"W1.L2-python"},"caps":{"tokens":100000,"wall_min":3},"requires":{"toolchains":["python3","node"],"node_min":22},"boundary_files":["fixtures-src/tt-python/src"],"forbidden":["fixtures-src/tt-python/operator-notes.local"],"oracles":["O1","O3z","O9","O11"],"gates":["TIER1","W1"],"chaos":null,"shed_ok":false,"mandatory":true,"class":"verification","spec_ref":"05-wave-1-language-smoke.md#W1.REPLAY"}`;
+const REPLAY_TS_LINE = `{"id":"W1.REPLAY-ts","wave":1,"workflow":"tt-shim-probe","fixture":"tt-ts","harness":"pi","task":"cases/tasks/tier1/W1.REPLAY-ts.md","context":{"execution_mode":"real","test_cmd":"npm test","replay_of":"W1.L2-ts"},"caps":{"tokens":100000,"wall_min":3},"requires":{"toolchains":["node"],"node_min":22},"boundary_files":["fixtures-src/tt-ts/src"],"forbidden":["fixtures-src/tt-ts/operator-notes.local"],"oracles":["O1","O3z","O9","O11"],"gates":["TIER1","W1"],"chaos":null,"shed_ok":false,"mandatory":true,"class":"verification","spec_ref":"05-wave-1-language-smoke.md#W1.REPLAY"}`;
 
 function readTier1Cases(): Array<{ raw: string; parsed: any }> {
   const lines = fs

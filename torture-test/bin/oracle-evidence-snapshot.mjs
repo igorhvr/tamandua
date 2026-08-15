@@ -3,11 +3,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
-import { ORACLE_EVIDENCE_KEYS } from './oracle-context.mjs';
+import { ORACLE_EVIDENCE_KEYS, OPTIONAL_ORACLE_EVIDENCE_KEYS } from './oracle-context.mjs';
 
 const MECHANICAL_EVENT_FIELDS = new Set([
   'ts', 'event', 'runId', 'run_id', 'parentRunId', 'childRunId', 'workflowId', 'stepId',
-  'storyId', 'agentId', 'abandonedCount', 'tokenDelta', 'tokensSpent', 'treeHash', 'cmdHash',
+  'storyId', 'agentId', 'reason', 'abandonedCount', 'tokenDelta', 'tokensSpent', 'treeHash', 'cmdHash',
   'savedDurationMs', 'durationMs', 'exitCode', 'signal', 'workerLostCount', 'passCount',
   'failCount', 'window', 'waitedMs', 'preTreeHash', 'postTreeHash', 'ownerRunId',
   'ownerStepId', 'ownerPid', 'reclaimerRunId', 'reclaimerStepId', 'reclaimerPid', 'origin',
@@ -996,6 +996,23 @@ export function completeOracleEvidenceSnapshot(rawInput, baseline) {
     immutable(databaseSnapshot);
 
     const runIds = new Set([input.attempt.run_id, ...(input.discoveredRuns ?? []).map((run) => run.run_id)].filter(Boolean));
+    // E3.C US-011: a multi-run probe attempt's per-run run ids live in the
+    // probe-evidence artifact (W3.20's two runs, W3.22's three) — include them
+    // so the event slice covers EVERY probed run (O16's cancel/restart
+    // judgments read per-run events; without this only the primary run's
+    // events land and the other runs' terminal events are invisible).
+    try {
+      const probeEvidence = JSON.parse(fs.readFileSync(
+        path.join(input.campaignDir, 'evidence', input.caseRecord.id, input.attempt.id, 'probe-evidence.json'),
+        'utf8',
+      ));
+      if (probeEvidence && typeof probeEvidence.run_id === 'string') runIds.add(probeEvidence.run_id);
+      for (const run of probeEvidence?.runs ?? []) {
+        if (run && typeof run.run_id === 'string') runIds.add(run.run_id);
+      }
+    } catch {
+      // absent/unreadable probe evidence: fall back to attempt + discovered runs
+    }
     const events = readEvents(input.stateDir, runIds);
     emitJson('run_events', 'run-events.json', { schema_version: 1, captured_at: capturedAt, run_ids: [...runIds].sort(), rows: events }, 'controller-event-slice');
     emitJson('workflow_status', 'workflow-status.json', {
@@ -1081,10 +1098,68 @@ export function completeOracleEvidenceSnapshot(rawInput, baseline) {
       rows: projectDispatchRenderings(events),
     }, 'controller-dispatch-render-events');
 
+    // E3.C optional lifecycle evidence (US-003): the probe sequencer writes a
+    // per-attempt probe-evidence JSON artifact into the controller's per-attempt
+    // evidence dir, and tt-chaos appends structured entries to
+    // var/chaos/chaos.log. Both are copied into the immutable snapshot when
+    // present; absent artifacts leave the reference null (optional for oracles
+    // that do not require them, required for O16/O4 respectively).
+    const captureOptionalCopy = (key, filename, sourcePath, containingRoot, source, label) => {
+      if (!fs.existsSync(sourcePath)) return;
+      const file = path.join(directory, filename);
+      copyContainedFile(sourcePath, containingRoot, file, label);
+      files[key] = referenceFor(input.campaignDir, file, capturedAt, source);
+      immutable(file);
+    };
+    captureOptionalCopy(
+      'probe_evidence', 'probe-evidence.json',
+      path.join(input.campaignDir, 'evidence', input.caseRecord.id, input.attempt.id, 'probe-evidence.json'),
+      input.campaignDir, 'controller-probe-sequence', 'probe evidence artifact',
+    );
+    const defaultChaosLogPath = path.join(input.ttRoot, 'var', 'chaos', 'chaos.log');
+    const chaosLogPath = input.chaosLogPath ?? defaultChaosLogPath;
+    // US-010 (O4): recorder/proc samples ride inside the chaos_log evidence
+    // bundle (spec 03 O4 — the process recorder's 5s sampler is the liveness
+    // provenance O4 cross-references with the chaos entries). When the recorder
+    // sampled the campaign's own var/ (the chaos log sits at the DEFAULT
+    // location under ttRoot — the controller pins that same path, so gate on
+    // path-equality with the derivation, not on undefined-ness; a hermetic
+    // chaosLogPath override elsewhere stays byte-exact), append the recorder
+    // sample files to the captured chaos.log after a section marker. Both are
+    // JSONL; O4 classifies lines by shape (action/outcome = chaos entry,
+    // integer pid + ts = recorder sample) and skips non-JSON markers.
+    const chaosLogCaptured = path.join(directory, 'chaos.log');
+    if (fs.existsSync(chaosLogPath)) {
+      copyContainedFile(chaosLogPath, input.ttRoot, chaosLogCaptured, 'chaos log');
+      if (path.resolve(chaosLogPath) === path.resolve(defaultChaosLogPath)) {
+        const recorderDir = path.join(input.ttRoot, 'var', 'recorder');
+        if (fs.existsSync(recorderDir)) {
+          const sampleFiles = fs.readdirSync(recorderDir)
+            .filter((name) => /^samples-.+\.jsonl$/.test(name))
+            .map((name) => path.join(recorderDir, name))
+            .sort((left, right) => fs.statSync(left).mtimeMs - fs.statSync(right).mtimeMs);
+          if (sampleFiles.length > 0) {
+            const append = [
+              '# recorder-samples',
+              ...sampleFiles.flatMap((file) => {
+                const lines = fs.readFileSync(file, 'utf8').split(/\r?\n/);
+                return lines.filter((line) => line.trim() !== '');
+              }),
+              '',
+            ].join('\n');
+            fs.appendFileSync(chaosLogCaptured, append);
+          }
+        }
+      }
+      files.chaos_log = referenceFor(input.campaignDir, chaosLogCaptured, capturedAt, 'tt-chaos-log');
+      immutable(chaosLogCaptured);
+    }
+
     const references = Object.fromEntries(ORACLE_EVIDENCE_KEYS.map((key) => [
       key, baseline.references[key] ?? files[key] ?? null,
     ]));
-    const missing = ORACLE_EVIDENCE_KEYS.filter((key) => references[key] === null);
+    const missing = ORACLE_EVIDENCE_KEYS.filter((key) => references[key] === null
+      && !OPTIONAL_ORACLE_EVIDENCE_KEYS.includes(key));
     if (missing.length > 0) throw new Error(`partial evidence snapshot omitted: ${missing.join(', ')}`);
     const complete = {
       ...ledger,

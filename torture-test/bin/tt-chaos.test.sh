@@ -185,7 +185,7 @@ echo "--- Test: --help content ---"
 help_out="$("$TOOL" --help 2>&1)"
 
 # Verify all actions are listed
-for action in kill-harness kill-daemon colleague-commit pause resume cancel stop delete-tstx-row write-context dirty-tree move-branch; do
+for action in kill-harness kill-daemon sigstop_sigcont colleague-commit pause resume cancel stop delete-tstx-row write-context dirty-tree move-branch; do
   if echo "$help_out" | grep -q "$action"; then
     pass "--help lists action: $action"
   else
@@ -1381,6 +1381,337 @@ else
 fi
 
 kill "$OUTSIDE_PID" 2>/dev/null || true
+
+# ── E3.C US-004: sigstop_sigcont — combined SIGSTOP → hold → SIGCONT ──
+
+echo ""
+echo "=== E3.C US-004: sigstop_sigcont (SIGSTOP → hold → SIGCONT) ==="
+
+setup_fake_tt_env
+HARNESS_RUN="run-guard-test"
+
+# ── Test: sigstop_sigcont happy path — SIGSTOP, provably frozen, hold, SIGCONT ──
+
+echo ""
+echo "--- Test: sigstop_sigcont happy path ---"
+
+SSC_PID=""
+SSC_PROGRESS="${TEST_VAR}/ssc-progress.txt"
+(
+  cd "$TEST_VAR"
+  exec -a "${TEST_VAR}/tt-harness-${HARNESS_RUN}" bash -c '
+    i=0
+    while true; do
+      echo "progress $i" >> "$1"
+      i=$((i + 1))
+      sleep 0.2
+    done
+  ' _ "$SSC_PROGRESS" &
+  SSC_PID=$!
+  echo "$SSC_PID" > "${TEST_VAR}/ssc-pid.txt"
+  wait "$SSC_PID" 2>/dev/null || true
+) &
+BG_SSC_WAIT=$!
+
+sleep 1
+
+SSC_PID=$(cat "${TEST_VAR}/ssc-pid.txt" 2>/dev/null || echo "")
+if [ -z "$SSC_PID" ] || ! kill -0 "$SSC_PID" 2>/dev/null; then
+  fail "sigstop_sigcont target process did not start"
+else
+  pass "sigstop_sigcont target process started (PID $SSC_PID)"
+
+  L0=$(wc -l < "$SSC_PROGRESS" 2>/dev/null || echo 0)
+
+  # Run tt-chaos in the background so we can observe the hold mid-flight
+  set +e
+  "$TOOL" sigstop_sigcont --run "$HARNESS_RUN" --when now --hold-seconds 3 > "${TEST_VAR}/ssc-out.txt" 2>&1 &
+  SSC_CH_PID=$!
+  set -e
+
+  # Mid-hold: process must be provably frozen (state T, no progress)
+  sleep 1.5
+  PROC_STATE=$(awk '/^State:/ {print $2}' "/proc/${SSC_PID}/status" 2>/dev/null || echo "")
+  if [ "$PROC_STATE" = "T" ]; then
+    pass "sigstop_sigcont: process frozen (state T) mid-hold"
+  else
+    fail "sigstop_sigcont: process should be state T mid-hold, got '$PROC_STATE'"
+  fi
+
+  L1=$(wc -l < "$SSC_PROGRESS" 2>/dev/null || echo 0)
+  if [ "$((L1 - L0))" -le 3 ]; then
+    pass "sigstop_sigcont: no progress during hold (lines $L0 -> $L1)"
+  else
+    fail "sigstop_sigcont: progress continued during hold (lines $L0 -> $L1)"
+  fi
+
+  set +e
+  wait "$SSC_CH_PID"
+  RC=$?
+  set -e
+
+  if [ "$RC" -eq 0 ]; then
+    pass "sigstop_sigcont exited 0 (SIGSTOP → hold → SIGCONT)"
+  else
+    fail "sigstop_sigcont should exit 0, got $RC: $(cat "${TEST_VAR}/ssc-out.txt")"
+  fi
+
+  if grep -q "SIGCONT sent to harness" "${TEST_VAR}/ssc-out.txt"; then
+    pass "sigstop_sigcont logs SIGCONT sent message"
+  else
+    fail "sigstop_sigcont output missing SIGCONT message: $(cat "${TEST_VAR}/ssc-out.txt")"
+  fi
+
+  # After SIGCONT the process must be running again and making progress
+  sleep 0.5
+  PROC_STATE=$(awk '/^State:/ {print $2}' "/proc/${SSC_PID}/status" 2>/dev/null || echo "")
+  if [ "$PROC_STATE" = "T" ]; then
+    fail "sigstop_sigcont: process still frozen after SIGCONT"
+  else
+    pass "sigstop_sigcont: process resumed (state $PROC_STATE) after SIGCONT"
+  fi
+
+  sleep 1
+  L2=$(wc -l < "$SSC_PROGRESS" 2>/dev/null || echo 0)
+  if [ "$L2" -gt "$L1" ]; then
+    pass "sigstop_sigcont: progress resumed after SIGCONT (lines $L1 -> $L2)"
+  else
+    fail "sigstop_sigcont: no progress after SIGCONT (lines $L1 -> $L2)"
+  fi
+
+  # chaos.log must carry start / hold_complete / cont entries
+  CHAOS_LOG="${TEST_VAR}/chaos/chaos.log"
+  SSC_ENTRIES=$(grep -c '"action":"sigstop_sigcont"' "$CHAOS_LOG" 2>/dev/null || echo 0)
+  if [ "$SSC_ENTRIES" -ge 4 ]; then
+    pass "sigstop_sigcont wrote chaos.log entries ($SSC_ENTRIES action lines incl. firing)"
+  else
+    fail "sigstop_sigcont expected >=4 action lines in chaos.log, got $SSC_ENTRIES"
+  fi
+  if grep '"action":"sigstop_sigcont"' "$CHAOS_LOG" | grep -q '"phase":"start"'; then
+    pass "chaos.log has sigstop_sigcont start entry"
+  else
+    fail "chaos.log missing sigstop_sigcont start entry"
+  fi
+  if grep '"action":"sigstop_sigcont"' "$CHAOS_LOG" | grep -q '"phase":"hold_complete"'; then
+    pass "chaos.log has sigstop_sigcont hold_complete entry"
+  else
+    fail "chaos.log missing sigstop_sigcont hold_complete entry"
+  fi
+  if grep '"action":"sigstop_sigcont"' "$CHAOS_LOG" | grep -q '"phase":"cont"'; then
+    pass "chaos.log has sigstop_sigcont cont entry"
+  else
+    fail "chaos.log missing sigstop_sigcont cont entry"
+  fi
+
+  # Cleanup
+  kill -9 "$SSC_PID" 2>/dev/null || true
+fi
+
+wait "$BG_SSC_WAIT" 2>/dev/null || true
+
+# ── Test: sigstop_sigcont guard miss — harness killed during hold → exit 3 ──
+
+echo ""
+echo "--- Test: sigstop_sigcont guard miss (killed during hold) ---"
+
+GM_PID=""
+(
+  cd "$TEST_VAR"
+  exec -a "${TEST_VAR}/tt-harness-${HARNESS_RUN}" sleep 86400 &
+  GM_PID=$!
+  echo "$GM_PID" > "${TEST_VAR}/gm-pid.txt"
+  wait "$GM_PID" 2>/dev/null || true
+) &
+BG_GM_WAIT=$!
+
+sleep 1
+
+GM_PID=$(cat "${TEST_VAR}/gm-pid.txt" 2>/dev/null || echo "")
+if [ -z "$GM_PID" ] || ! kill -0 "$GM_PID" 2>/dev/null; then
+  fail "guard-miss target process did not start"
+else
+  pass "guard-miss target process started (PID $GM_PID)"
+
+  CHAOS_LOG="${TEST_VAR}/chaos/chaos.log"
+  GM_LOG_BASE=$(wc -l < "$CHAOS_LOG" 2>/dev/null || echo 0)
+  set +e
+  "$TOOL" sigstop_sigcont --run "$HARNESS_RUN" --when now --hold-seconds 4 > "${TEST_VAR}/gm-out.txt" 2>&1 &
+  GM_CH_PID=$!
+  set -e
+
+  sleep 1.5
+  # Kill the harness mid-hold — the injection must abort with EXIT_GUARD_MISS
+  kill -9 "$GM_PID" 2>/dev/null || true
+
+  set +e
+  wait "$GM_CH_PID"
+  RC=$?
+  set -e
+
+  # Only examine chaos.log entries appended during this invocation
+  GM_TAIL="$(tail -n +$((GM_LOG_BASE + 1)) "$CHAOS_LOG" 2>/dev/null || true)"
+
+  if [ "$RC" -eq 3 ]; then
+    pass "sigstop_sigcont guard miss exits 3 (EXIT_GUARD_MISS)"
+  else
+    fail "sigstop_sigcont guard miss should exit 3, got $RC: $(cat "${TEST_VAR}/gm-out.txt")"
+  fi
+
+  if grep -q "GUARD_MISS" "${TEST_VAR}/gm-out.txt"; then
+    pass "sigstop_sigcont guard miss logs GUARD_MISS"
+  else
+    fail "sigstop_sigcont guard miss output missing GUARD_MISS: $(cat "${TEST_VAR}/gm-out.txt")"
+  fi
+
+  if echo "$GM_TAIL" | grep '"action":"sigstop_sigcont"' | grep -q '"outcome":"INVALID"'; then
+    pass "chaos.log has sigstop_sigcont INVALID entry on guard miss"
+  else
+    fail "chaos.log missing sigstop_sigcont INVALID entry on guard miss"
+  fi
+
+  # No SIGCONT may ever be sent after a guard miss
+  if echo "$GM_TAIL" | grep '"action":"sigstop_sigcont"' | grep -q '"phase":"cont"'; then
+    fail "sigstop_sigcont sent SIGCONT after guard miss (forbidden)"
+  else
+    pass "sigstop_sigcont never SIGCONTs after guard miss"
+  fi
+fi
+
+wait "$BG_GM_WAIT" 2>/dev/null || true
+
+# ── Test: sigstop_sigcont guard miss — harness replaced (PID differs) → exit 3 ──
+
+echo ""
+echo "--- Test: sigstop_sigcont guard miss (PID changed during hold) ---"
+
+GM2_PID=""
+(
+  cd "$TEST_VAR"
+  exec -a "${TEST_VAR}/tt-harness-${HARNESS_RUN}" sleep 86400 &
+  GM2_PID=$!
+  echo "$GM2_PID" > "${TEST_VAR}/gm2-pid.txt"
+  wait "$GM2_PID" 2>/dev/null || true
+) &
+BG_GM2_WAIT=$!
+
+sleep 1
+
+GM2_PID=$(cat "${TEST_VAR}/gm2-pid.txt" 2>/dev/null || echo "")
+if [ -z "$GM2_PID" ] || ! kill -0 "$GM2_PID" 2>/dev/null; then
+  fail "PID-differs target process did not start"
+else
+  pass "PID-differs target process started (PID $GM2_PID)"
+
+  CHAOS_LOG="${TEST_VAR}/chaos/chaos.log"
+  GM2_LOG_BASE=$(wc -l < "$CHAOS_LOG" 2>/dev/null || echo 0)
+  set +e
+  "$TOOL" sigstop_sigcont --run "$HARNESS_RUN" --when now --hold-seconds 4 > "${TEST_VAR}/gm2-out.txt" 2>&1 &
+  GM2_CH_PID=$!
+  set -e
+
+  sleep 1.5
+  # Kill harness A and start a replacement with the SAME marker: at re-verify
+  # time the finder either finds nothing (reaped) or a different PID — both
+  # must abort with EXIT_GUARD_MISS, never a silent SIGCONT.
+  kill -9 "$GM2_PID" 2>/dev/null || true
+  (
+    cd "$TEST_VAR"
+    exec -a "${TEST_VAR}/tt-harness-${HARNESS_RUN}" sleep 86400 &
+    echo "$!" > "${TEST_VAR}/gm2-pid-b.txt"
+    wait 2>/dev/null || true
+  ) &
+  BG_GM2B_WAIT=$!
+  sleep 0.5
+  GM2_PID_B=$(cat "${TEST_VAR}/gm2-pid-b.txt" 2>/dev/null || echo "")
+
+  set +e
+  wait "$GM2_CH_PID"
+  RC=$?
+  set -e
+
+  # Only examine chaos.log entries appended during this invocation
+  GM2_TAIL="$(tail -n +$((GM2_LOG_BASE + 1)) "$CHAOS_LOG" 2>/dev/null || true)"
+
+  if [ "$RC" -eq 3 ]; then
+    pass "sigstop_sigcont PID-change guard miss exits 3 (EXIT_GUARD_MISS)"
+  else
+    fail "sigstop_sigcont PID-change guard miss should exit 3, got $RC: $(cat "${TEST_VAR}/gm2-out.txt")"
+  fi
+
+  if echo "$GM2_TAIL" | grep '"action":"sigstop_sigcont"' | grep -q '"outcome":"INVALID"'; then
+    pass "chaos.log has sigstop_sigcont INVALID entry on PID-change guard miss"
+  else
+    fail "chaos.log missing sigstop_sigcont INVALID entry on PID-change guard miss"
+  fi
+  if echo "$GM2_TAIL" | grep '"action":"sigstop_sigcont"' | grep -q '"phase":"cont"'; then
+    fail "sigstop_sigcont sent SIGCONT after PID-change guard miss (forbidden)"
+  else
+    pass "sigstop_sigcont never SIGCONTs after PID-change guard miss"
+  fi
+
+  kill -9 "$GM2_PID_B" 2>/dev/null || true
+fi
+
+wait "$BG_GM2_WAIT" 2>/dev/null || true
+wait "${BG_GM2B_WAIT:-}" 2>/dev/null || true
+
+# ── Test: sigstop_sigcont --hold-seconds validation ─────────────────────
+
+echo ""
+echo "--- Test: sigstop_sigcont --hold-seconds validation ---"
+
+set +e
+OUT=$("$TOOL" sigstop_sigcont --run "$HARNESS_RUN" --when now 2>&1)
+RC=$?
+set -e
+if [ "$RC" -eq 1 ] && echo "$OUT" | grep -q -- "--hold-seconds is required"; then
+  pass "sigstop_sigcont without --hold-seconds exits 1 with clear error"
+else
+  fail "sigstop_sigcont without --hold-seconds should exit 1, got $RC: $OUT"
+fi
+
+set +e
+OUT=$("$TOOL" sigstop_sigcont --run "$HARNESS_RUN" --when now --hold-seconds abc 2>&1)
+RC=$?
+set -e
+if [ "$RC" -eq 1 ] && echo "$OUT" | grep -q "non-negative integer"; then
+  pass "sigstop_sigcont with non-integer --hold-seconds exits 1 with clear error"
+else
+  fail "sigstop_sigcont with non-integer --hold-seconds should exit 1, got $RC: $OUT"
+fi
+
+set +e
+OUT=$("$TOOL" sigstop_sigcont --run "$HARNESS_RUN" --when now --hold-seconds -5 2>&1)
+RC=$?
+set -e
+if [ "$RC" -eq 1 ] && echo "$OUT" | grep -q "non-negative integer"; then
+  pass "sigstop_sigcont with negative --hold-seconds exits 1 with clear error"
+else
+  fail "sigstop_sigcont with negative --hold-seconds should exit 1, got $RC: $OUT"
+fi
+
+# ── Test: sigstop_sigcont source-level wiring ───────────────────────────
+
+echo ""
+echo "--- Test: sigstop_sigcont source-level wiring ---"
+
+if grep -q "'sigstop_sigcont'" "$TOOL" && grep -q "sigstopSigcont" "$TOOL"; then
+  pass "tt-chaos source defines sigstop_sigcont action and handler"
+else
+  fail "tt-chaos source missing sigstop_sigcont action/handler"
+fi
+
+if grep -q "'sigstop_sigcont': sigstopSigcont" "$TOOL"; then
+  pass "dispatch table maps sigstop_sigcont to its handler"
+else
+  fail "dispatch table missing sigstop_sigcont mapping"
+fi
+
+if grep -q "processActions = \['kill-harness', 'kill-daemon', 'sigstop_sigcont'\]" "$TOOL"; then
+  pass "classifyTarget treats sigstop_sigcont as a process action (guard + evidence)"
+else
+  fail "classifyTarget missing sigstop_sigcont in processActions"
+fi
 
 # ── US-006 tests: Execution control actions ────────────────────────────
 

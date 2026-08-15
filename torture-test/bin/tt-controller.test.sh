@@ -39,6 +39,13 @@ WORKFLOW_REAL_DB_SHM_BACKUP=""
 DISCOVERY_EVENT_ARCHIVE=""
 DISCOVERY_EVENTS_DIR=""
 DISCOVERY_EVENTS_BACKUP_DIR=""
+# E3.C US-008: the chaos runner's stub operator appends to the shared
+# var/chaos/chaos.log (the oracle snapshot's chaos_log source); back it up
+# before the chaos fixtures and restore in cleanup so the shared file is
+# byte-identical afterward (hygiene — the run.sh clean-tree guard ignores
+# gitignored var/, but sibling suites read chaos.log).
+CHAOS_LOG_FILE="$TT_DIR/var/chaos/chaos.log"
+CHAOS_LOG_BACKUP="$TEST_ROOT/original-chaos.log"
 CAMPAIGN_DIRS_FILE="$TEST_ROOT/campaign-dirs"
 HOST_PROFILE="$TT_DIR/var/w0/host-profile.json"
 HOST_PROFILE_BACKUP="$TEST_ROOT/original-host-profile.json"
@@ -97,6 +104,11 @@ cleanup() {
     if [ -f "$WORKFLOW_REAL_DB_BACKUP" ]; then mv "$WORKFLOW_REAL_DB_BACKUP" "$WORKFLOW_REAL_DB"; fi
     if [ -f "$WORKFLOW_REAL_DB_WAL_BACKUP" ]; then mv "$WORKFLOW_REAL_DB_WAL_BACKUP" "$WORKFLOW_REAL_DB-wal"; fi
     if [ -f "$WORKFLOW_REAL_DB_SHM_BACKUP" ]; then mv "$WORKFLOW_REAL_DB_SHM_BACKUP" "$WORKFLOW_REAL_DB-shm"; fi
+  fi
+  if [ -f "$CHAOS_LOG_BACKUP" ]; then
+    cp "$CHAOS_LOG_BACKUP" "$CHAOS_LOG_FILE"
+  else
+    rm -f -- "$CHAOS_LOG_FILE"
   fi
   while IFS= read -r campaign_dir; do
     case "$campaign_dir" in
@@ -413,7 +425,8 @@ pass "O9 real reclaim, stop/cancel, and targeted probes harvest to a contract-va
 
 node --test "$TT_DIR/oracles/lib/runtime.test.mjs" "$TT_DIR/oracles/self-test/harness.test.mjs" \
   "$TT_DIR/oracles/self-test/o1.test.mjs" "$TT_DIR/oracles/self-test/o3z.test.mjs" \
-  "$TT_DIR/oracles/self-test/o9.test.mjs" \
+  "$TT_DIR/oracles/self-test/o9.test.mjs" "$TT_DIR/oracles/self-test/o16.test.mjs" \
+  "$TT_DIR/oracles/self-test/o4.test.mjs" \
   || fail "shared oracle runtime/self-test harness tests failed"
 "$TT_DIR/oracles/self-test/run.sh" || fail "shared oracle mutation harness failed"
 pass "shared oracle runtime enforces CONTRACT v1 and the mutation harness rejects result mismatches"
@@ -883,6 +896,27 @@ fi
 if [ "${1:-}" = "workflow" ] && [ "${2:-}" = "status" ]; then
   case "${CONTROLLER_WORKFLOW_MODE:-stdout}" in
     stdout) printf '{"runId":"run-11111111-1111-4111-8111-111111111111","status":"completed","tokensSpent":0,"steps":[]}\n' ;;
+    probe-pause-fail) printf '{"runId":"run-11111111-1111-4111-8111-111111111111","status":"completed","tokensSpent":0,"steps":[]}\n' ;;
+    multi-run-seq)
+      case "${3:-}" in
+        run-aaaa1111-1111-4111-8111-111111111111)
+          printf '{"runId":"%s","status":"canceled","tokensSpent":0,"steps":[]}\n' "${3:-}" ;;
+        run-bbbb2222-2222-4222-8222-222222222222)
+          printf '{"runId":"%s","status":"canceled","tokensSpent":0,"steps":[]}\n' "${3:-}" ;;
+        *) exit 9 ;;
+      esac
+      ;;
+    multi-run-conc)
+      case "${3:-}" in
+        run-cccc1111-1111-4111-8111-111111111111)
+          printf '{"runId":"%s","status":"completed","tokensSpent":7,"steps":[]}\n' "${3:-}" ;;
+        run-cccc2222-2222-4222-8222-222222222222)
+          printf '{"runId":"%s","status":"completed","tokensSpent":9,"steps":[]}\n' "${3:-}" ;;
+        run-cccc3333-3333-4333-8333-333333333333)
+          printf '{"runId":"%s","status":"completed","tokensSpent":11,"steps":[]}\n' "${3:-}" ;;
+        *) exit 9 ;;
+      esac
+      ;;
     stderr) printf '{"runId":"run-22222222-2222-4222-8222-222222222222","status":"running","tokensSpent":0,"steps":[]}\n' ;;
     resume) printf '{"runId":"run-22222222-2222-4222-8222-222222222222","status":"completed","tokensSpent":7,"steps":[]}\n' ;;
     harvest-status) printf '{"runId":"run-aaaaaaaa-1111-4111-8111-111111111111","status":"completed","tokensSpent":13,"steps":[{"stepId":"step-status","stepIndex":0,"status":"done"}]}\n' ;;
@@ -991,8 +1025,71 @@ if [ "${1:-}" = "workflow" ] && [ "${2:-}" = "wait" ]; then
   printf '{"runs":[{"runId":"%s","status":"canceled"}],"timedOut":false}\n' "${3:-}"
   exit 3
 fi
+# E3.C US-006 probe-action stub: `workflow pause` succeeds by default; in
+# probe-pause-fail mode it refuses (exit 3) so the controller's probe
+# sequencer classifies TEST_INFRA_FAIL with 'probe-action-failed' (the argv
+# was already recorded at the top of this stub).
+if [ "${1:-}" = "workflow" ] && [ "${2:-}" = "pause" ]; then
+  if [ "${CONTROLLER_WORKFLOW_MODE:-stdout}" = "probe-pause-fail" ]; then
+    printf 'stub pause refused\n' >&2
+    exit 3
+  fi
+  exit 0
+fi
+# E3.C US-007 probe-action stubs: `workflow cancel` (W3.20's cancels) and
+# `workflow resume`/`workflow fail` succeed; only their argv is recorded at
+# the top of this stub.
+if [ "${1:-}" = "workflow" ] && [ "${2:-}" = "cancel" ]; then
+  exit 0
+fi
+if [ "${1:-}" = "workflow" ] && [ "${2:-}" = "resume" ]; then
+  exit 0
+fi
+if [ "${1:-}" = "workflow" ] && [ "${2:-}" = "fail" ]; then
+  exit 0
+fi
+# E3.C US-007 multi-launch stub: `workflow run` emits a per-launch run id
+# (counted via CONTROLLER_MULTI_RUN_COUNTER) and the wait JSON a real
+# `workflow run --wait --json` would print — canceled (exit 3) for the
+# sequential W3.20 shape, completed (exit 0) for the concurrent W3.22 shape.
+if [ "${1:-}" = "workflow" ] && [ "${2:-}" = "run" ]; then
+  case "${CONTROLLER_WORKFLOW_MODE:-stdout}" in
+    multi-run-seq|multi-run-conc)
+      count=0
+      [ ! -f "$CONTROLLER_MULTI_RUN_COUNTER" ] || count="$(cat "$CONTROLLER_MULTI_RUN_COUNTER")"
+      count=$((count + 1))
+      printf '%s' "$count" > "$CONTROLLER_MULTI_RUN_COUNTER"
+      if [ "${CONTROLLER_WORKFLOW_MODE:-}" = "multi-run-conc" ]; then
+        case "$count" in
+          1) rid="run-cccc1111-1111-4111-8111-111111111111" ;;
+          2) rid="run-cccc2222-2222-4222-8222-222222222222" ;;
+          3) rid="run-cccc3333-3333-4333-8333-333333333333" ;;
+          *) exit 9 ;;
+        esac
+      else
+        case "$count" in
+          1) rid="run-aaaa1111-1111-4111-8111-111111111111" ;;
+          2) rid="run-bbbb2222-2222-4222-8222-222222222222" ;;
+          3) rid="run-cccc3333-3333-4333-8333-333333333333" ;;
+          *) exit 9 ;;
+        esac
+      fi
+      printf 'Run: %s\n' "$rid"
+      if [ "${CONTROLLER_WORKFLOW_MODE:-}" = "multi-run-seq" ]; then
+        printf '{"runs":[{"runId":"%s","status":"canceled"}],"timedOut":false}\n' "$rid"
+        exit 3
+      fi
+      printf '{"runs":[{"runId":"%s","status":"completed"}],"timedOut":false}\n' "$rid"
+      exit 0
+      ;;
+  esac
+fi
 case "${CONTROLLER_WORKFLOW_MODE:-stdout}" in
   stdout)
+    printf 'Run: run-11111111-1111-4111-8111-111111111111\n'
+    printf '{"status":"completed"}\n'
+    ;;
+  probe-pause-fail)
     printf 'Run: run-11111111-1111-4111-8111-111111111111\n'
     printf '{"status":"completed"}\n'
     ;;
@@ -1182,6 +1279,725 @@ NODE
 done
 pass "workflow harvest records status evidence, readonly DB fallback, and O13 disagreements"
 
+# ── E3.C US-006: probe execution engine (in-flight actions + evidence) ──
+# The controller's real-case arm must execute a case's probe_sequence against
+# the CONTAINED instance (stub `tamandua` on PATH + seeded contained DB) while
+# the run is in flight, record per-action evidence (op, trigger, timestamps,
+# argv, exit code, observed effect) as attempt.probe_evidence AND as the
+# probe-evidence.json artifact, and classify a probe CLI failure as
+# TEST_INFRA_FAIL 'probe-action-failed' — never silently swallowed.
+PROBE_RUN_ID="run-11111111-1111-4111-8111-111111111111"
+PROBE_SHORT_RUN_ID="11111111-1111-4111-8111-111111111111"
+PROBE_DB="$WORKFLOW_REAL_DB"
+
+seed_probe_step() {
+  node --input-type=module - "$PROBE_DB" "$PROBE_SHORT_RUN_ID" <<'NODE'
+import { DatabaseSync } from 'node:sqlite';
+const db = new DatabaseSync(process.argv[2]);
+const now = new Date().toISOString();
+db.prepare(`INSERT INTO steps
+  (id, run_id, step_id, agent_id, step_index, status, type, current_story_id,
+   retry_count, abandoned_count, reroute_count, claim_pid, claim_updated_at, updated_at)
+  VALUES ('probe-dev-step', ?, 'step-developer', 'developer', 1, 'running', 'single', NULL, 0, 0, 0, NULL, NULL, ?)`)
+  .run(process.argv[3], now);
+db.close();
+NODE
+}
+
+remove_probe_step() {
+  node --input-type=module - "$PROBE_DB" <<'NODE'
+import { DatabaseSync } from 'node:sqlite';
+const db = new DatabaseSync(process.argv[2]);
+db.prepare(`DELETE FROM steps WHERE id = 'probe-dev-step'`).run();
+db.close();
+NODE
+}
+
+write_probe_case() {
+  local manifest="$1"
+  local id="$2"
+  local sequence_json="$3"
+  node --input-type=module - "$manifest" "$id" "$sequence_json" <<'NODE'
+import fs from 'node:fs';
+const [manifest, id, sequenceJson] = process.argv.slice(2);
+const record = {
+  id, wave: 3, workflow: 'bug-fix-merge-worktree', fixture: 'tt-ts', harness: 'hermes',
+  task: 'tasks/W3.07.md', context: {}, caps: { tokens: 4000000, wall_min: 240 },
+  requires: {}, boundary_files: ['fixtures/tt-ts/src'], forbidden: [],
+  oracles: ['TT-MISSING-O1', 'TT-MISSING-O2'], gates: ['W2'], chaos: null,
+  probe_sequence: JSON.parse(sequenceJson),
+  shed_ok: false, mandatory: true, class: 'verification',
+};
+fs.writeFileSync(manifest, `${JSON.stringify(record)}\n`);
+NODE
+}
+
+# Fixture 1: trigger never materializes (no seeded step) -> the probe cannot
+# fire before the (stub-terminal) run ends -> TEST_INFRA_FAIL
+# 'probe-trigger-unreached', never a silent launch->wait->snapshot PASS.
+probe_unreached_manifest="$TEST_ROOT/manifests/probe-unreached.jsonl"
+remove_probe_step
+write_probe_case "$probe_unreached_manifest" "PROBE-UNREACHED" \
+  '[{"run":1,"actions":[{"op":"pause","when":"step:developer:running","hold_seconds":1},{"op":"resume","when":"now"}]}]'
+probe_unreached_events="$TEST_ROOT/probe-unreached-events.jsonl"
+probe_unreached_output=$(PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$probe_unreached_events" \
+  CONTROLLER_WORKFLOW_MODE=stdout run_recorded_campaign "$CONTROLLER" --manifest "$probe_unreached_manifest") \
+  || fail "probe trigger-unreached campaign failed: $probe_unreached_output"
+probe_unreached_id=$(remember_campaign "$probe_unreached_output")
+node --input-type=module - "$TT_DIR/var/results/$probe_unreached_id/state.json" "$probe_unreached_id" <<'NODE'
+import fs from 'node:fs';
+const [statePath] = process.argv.slice(2);
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const attempt = state.cases[0].attempts[0];
+if (attempt.outcome !== 'TEST_INFRA_FAIL'
+    || attempt.classification_reason?.category !== 'probe-trigger-unreached'
+    || attempt.classification_reason?.op !== 'pause'
+    || attempt.classification_reason?.trigger !== 'step:developer:running'
+    || attempt.classification_reason?.run_terminal_status !== 'completed') {
+  throw new Error(`unreached trigger did not classify TEST_INFRA_FAIL probe-trigger-unreached: ${JSON.stringify({outcome: attempt.outcome, reason: attempt.classification_reason})}`);
+}
+if (!attempt.probe_evidence || attempt.probe_evidence.sequence_outcome !== 'failed'
+    || attempt.probe_evidence.actions.length !== 1
+    || attempt.probe_evidence.actions[0].op !== 'pause'
+    || attempt.probe_evidence.actions[0].failure?.category !== 'probe-trigger-unreached'
+    || attempt.probe_evidence.actions[0].argv !== null
+    || attempt.probe_evidence.actions[0].exit_code !== null) {
+  throw new Error(`unreached-trigger probe evidence is wrong: ${JSON.stringify(attempt.probe_evidence)}`);
+}
+NODE
+pass "a probe trigger that never fires classifies TEST_INFRA_FAIL probe-trigger-unreached with evidence"
+
+# Fixture 2: single-run probe_sequence (pause @ step:developer:running with a
+# 1s hold, then resume @ now) executes in order while the run is in flight;
+# attempt.probe_evidence + the probe-evidence.json artifact carry per-action
+# timestamps/argv/exit codes/observed effects; the stub records the pause and
+# resume argv; the case still classifies PASS.
+probe_happy_manifest="$TEST_ROOT/manifests/probe-happy.jsonl"
+seed_probe_step
+write_probe_case "$probe_happy_manifest" "PROBE-HAPPY" \
+  '[{"run":1,"actions":[{"op":"pause","when":"step:developer:running","hold_seconds":1},{"op":"resume","when":"now"}]}]'
+probe_happy_events="$TEST_ROOT/probe-happy-events.jsonl"
+probe_happy_output=$(PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$probe_happy_events" \
+  CONTROLLER_WORKFLOW_MODE=stdout run_recorded_campaign "$CONTROLLER" --manifest "$probe_happy_manifest") \
+  || fail "single-run probe sequence campaign failed: $probe_happy_output"
+probe_happy_id=$(remember_campaign "$probe_happy_output")
+node --input-type=module - "$TT_DIR/var/results/$probe_happy_id/state.json" \
+  "$TT_DIR/var/results/$probe_happy_id" "$probe_happy_events" "$PROBE_RUN_ID" <<'NODE'
+import fs from 'node:fs';
+import path from 'node:path';
+const [statePath, campaignDir, eventsPath, runId] = process.argv.slice(2);
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const item = state.cases[0];
+const attempt = item.attempts[0];
+if (attempt.outcome !== 'PASS') {
+  throw new Error(`single-run probe case did not PASS: ${JSON.stringify({outcome: attempt.outcome, reason: attempt.classification_reason})}`);
+}
+const evidence = attempt.probe_evidence;
+if (!evidence || evidence.sequence_outcome !== 'completed'
+    || evidence.run_id !== runId || evidence.run_ordinal !== 1
+    || evidence.actions.length !== 2) {
+  throw new Error(`probe evidence is incomplete: ${JSON.stringify(evidence)}`);
+}
+const [pause, resume] = evidence.actions;
+const utcRe = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+if (pause.op !== 'pause' || pause.trigger !== 'step:developer:running'
+    || JSON.stringify(pause.argv) !== JSON.stringify(['tamandua', 'workflow', 'pause', runId])
+    || pause.exit_code !== 0 || pause.signal !== null || pause.error !== null
+    || !utcRe.test(pause.armed_at) || !utcRe.test(pause.action_started_at)
+    || !utcRe.test(pause.action_ended_at)
+    || pause.hold_seconds !== 1 || !utcRe.test(pause.hold_started_at) || !utcRe.test(pause.hold_ended_at)
+    || new Date(pause.hold_ended_at).valueOf() - new Date(pause.hold_started_at).valueOf() < 900
+    || pause.effect?.status_after?.status !== 'completed'
+    || !Array.isArray(pause.effect?.events_excerpt?.events)) {
+  throw new Error(`pause probe record is wrong: ${JSON.stringify(pause)}`);
+}
+if (resume.op !== 'resume' || resume.trigger !== 'now'
+    || JSON.stringify(resume.argv) !== JSON.stringify(['tamandua', 'workflow', 'resume', runId])
+    || resume.exit_code !== 0 || resume.hold_seconds !== null
+    || resume.effect?.status_after?.status !== 'completed') {
+  throw new Error(`resume probe record is wrong: ${JSON.stringify(resume)}`);
+}
+const artifactPath = path.join(campaignDir, 'evidence', item.id, attempt.id, 'probe-evidence.json');
+const artifact = JSON.parse(fs.readFileSync(artifactPath, 'utf8'));
+if (JSON.stringify(artifact) !== JSON.stringify(evidence)) {
+  throw new Error('probe-evidence.json artifact does not match attempt.probe_evidence');
+}
+const stubCalls = fs.readFileSync(eventsPath, 'utf8').trim().split('\n')
+  .map((line) => JSON.parse(line))
+  .filter((entry) => JSON.stringify(entry.argv).includes('"pause"') || JSON.stringify(entry.argv).includes('"resume"'));
+if (stubCalls.length !== 2
+    || JSON.stringify(stubCalls[0].argv) !== JSON.stringify(['workflow', 'pause', runId])
+    || JSON.stringify(stubCalls[1].argv) !== JSON.stringify(['workflow', 'resume', runId])) {
+  throw new Error(`stub did not record the pause/resume argv in order: ${JSON.stringify(stubCalls)}`);
+}
+NODE
+pass "single-run probe sequence executes pause/resume in order and lands full evidence on the attempt + artifact"
+
+# Fixture 3: a probe CLI failure (stub `workflow pause` refuses with exit 3)
+# classifies TEST_INFRA_FAIL 'probe-action-failed' naming the op + exit code,
+# and the sequence stops at the failed action (resume never fires).
+probe_fail_manifest="$TEST_ROOT/manifests/probe-fail.jsonl"
+write_probe_case "$probe_fail_manifest" "PROBE-FAIL" \
+  '[{"run":1,"actions":[{"op":"pause","when":"step:developer:running","hold_seconds":1},{"op":"resume","when":"now"}]}]'
+probe_fail_events="$TEST_ROOT/probe-fail-events.jsonl"
+probe_fail_output=$(PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$probe_fail_events" \
+  CONTROLLER_WORKFLOW_MODE=probe-pause-fail run_recorded_campaign "$CONTROLLER" --manifest "$probe_fail_manifest") \
+  || fail "probe CLI failure campaign failed: $probe_fail_output"
+probe_fail_id=$(remember_campaign "$probe_fail_output")
+node --input-type=module - "$TT_DIR/var/results/$probe_fail_id/state.json" \
+  "$TT_DIR/var/results/$probe_fail_id" "$probe_fail_events" "$PROBE_RUN_ID" <<'NODE'
+import fs from 'node:fs';
+import path from 'node:path';
+const [statePath, campaignDir, eventsPath, runId] = process.argv.slice(2);
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const item = state.cases[0];
+const attempt = item.attempts[0];
+if (attempt.outcome !== 'TEST_INFRA_FAIL'
+    || attempt.classification_reason?.category !== 'probe-action-failed'
+    || attempt.classification_reason?.op !== 'pause'
+    || attempt.classification_reason?.exit_code !== 3) {
+  throw new Error(`probe CLI failure did not classify TEST_INFRA_FAIL probe-action-failed: ${JSON.stringify({outcome: attempt.outcome, reason: attempt.classification_reason})}`);
+}
+const evidence = attempt.probe_evidence;
+if (!evidence || evidence.sequence_outcome !== 'failed' || evidence.actions.length !== 1
+    || evidence.actions[0].op !== 'pause'
+    || evidence.actions[0].argv?.[3] !== runId
+    || evidence.actions[0].exit_code !== 3
+    || evidence.actions[0].failure?.category !== 'probe-action-failed'
+    || evidence.actions[0].failure?.exit_code !== 3
+    || evidence.failure?.category !== 'probe-action-failed') {
+  throw new Error(`probe failure evidence is wrong: ${JSON.stringify(evidence)}`);
+}
+const artifactPath = path.join(campaignDir, 'evidence', item.id, attempt.id, 'probe-evidence.json');
+const artifact = JSON.parse(fs.readFileSync(artifactPath, 'utf8'));
+if (JSON.stringify(artifact) !== JSON.stringify(evidence)) {
+  throw new Error('failed-probe artifact does not match attempt.probe_evidence');
+}
+const stubCalls = fs.readFileSync(eventsPath, 'utf8').trim().split('\n')
+  .map((line) => JSON.parse(line))
+  .filter((entry) => JSON.stringify(entry.argv).includes('"pause"') || JSON.stringify(entry.argv).includes('"resume"'));
+if (stubCalls.length !== 1
+    || JSON.stringify(stubCalls[0].argv) !== JSON.stringify(['workflow', 'pause', runId])) {
+  throw new Error(`a failed pause must stop the sequence (no resume): ${JSON.stringify(stubCalls)}`);
+}
+NODE
+pass "a probe CLI failure classifies TEST_INFRA_FAIL probe-action-failed naming the op and stops the sequence"
+remove_probe_step
+
+# ── E3.C US-007: multi-launch probe orchestration (W3.20/W3.22 shapes) ──
+# The controller must GENUINELY execute multi-run probe_sequences — W3.20's two
+# sequential runs (each cancel asserting the run.canceled terminal event lands
+# via the event-stream excerpt) and W3.22's three concurrent runs with a
+# mid-flight contained-daemon restart via daemon-control (NEVER a bare
+# `tamandua restart`). Stub `tamandua` emits per-launch run ids
+# (CONTROLLER_MULTI_RUN_COUNTER) and per-run statuses; a stub daemon-control
+# records its argv so the test can prove the restart path.
+MULTI_RUN_SEQ_1="run-aaaa1111-1111-4111-8111-111111111111"
+MULTI_RUN_SEQ_2="run-bbbb2222-2222-4222-8222-222222222222"
+MULTI_RUN_CONC_1="run-cccc1111-1111-4111-8111-111111111111"
+MULTI_RUN_CONC_2="run-cccc2222-2222-4222-8222-222222222222"
+MULTI_RUN_CONC_3="run-cccc3333-3333-4333-8333-333333333333"
+MULTI_RUN_SEQ_1_SHORT="aaaa1111-1111-4111-8111-111111111111"
+MULTI_RUN_SEQ_2_SHORT="bbbb2222-2222-4222-8222-222222222222"
+MULTI_RUN_CONC_1_SHORT="cccc1111-1111-4111-8111-111111111111"
+MULTI_RUN_EVENTS_DIR="$TT_DIR/var/home/.tamandua/events"
+MULTI_RUN_SEEDED_EVENTS=()
+
+seed_multi_step() {
+  local db="$1" run_short="$2" agent="$3" step_id="$4"
+  node --input-type=module - "$db" "$run_short" "$agent" "$step_id" <<'NODE'
+import { DatabaseSync } from 'node:sqlite';
+const [dbPath, runShort, agent, stepId] = process.argv.slice(2);
+const db = new DatabaseSync(dbPath);
+const now = new Date().toISOString();
+db.prepare(`INSERT INTO steps
+  (id, run_id, step_id, agent_id, step_index, status, type, current_story_id,
+   retry_count, abandoned_count, reroute_count, claim_pid, claim_updated_at, updated_at)
+  VALUES (?, ?, ?, ?, 1, 'running', 'single', NULL, 0, 0, 0, NULL, NULL, ?)`)
+  .run(stepId, runShort, `step-${agent}`, agent, now);
+db.close();
+NODE
+}
+
+remove_multi_steps() {
+  node --input-type=module - "$PROBE_DB" <<'NODE'
+import { DatabaseSync } from 'node:sqlite';
+const db = new DatabaseSync(process.argv[2]);
+for (const id of ['multi-run-1-dev', 'multi-run-2-fin', 'multi-run-conc-1-dev']) {
+  db.prepare(`DELETE FROM steps WHERE id = ?`).run(id);
+}
+db.close();
+NODE
+}
+
+seed_run_canceled_event() {
+  local run_id="$1" short_id="$2"
+  mkdir -p "$MULTI_RUN_EVENTS_DIR"
+  local event_file="$MULTI_RUN_EVENTS_DIR/$short_id.jsonl"
+  printf '%s\n' "{\"event\":\"run.canceled\",\"ts\":\"2999-01-01T00:00:00.000Z\",\"runId\":\"$run_id\"}" > "$event_file"
+  MULTI_RUN_SEEDED_EVENTS+=("$event_file")
+}
+
+# Fixture 1 (W3.20 shape): TWO runs launched SEQUENTIALLY — run 1 cancels at
+# step:developer:running, run 2 cancels at step:finalize_merge:running — with
+# per-run probe evidence (run.canceled terminal event asserted via the
+# event-stream excerpt for BOTH cancels). The stub records the launch/cancel
+# argv in order; no daemon-control / restart is ever constructed.
+multi_seq_manifest="$TEST_ROOT/manifests/multi-run-seq.jsonl"
+remove_multi_steps
+seed_multi_step "$PROBE_DB" "$MULTI_RUN_SEQ_1_SHORT" "developer" "multi-run-1-dev"
+seed_multi_step "$PROBE_DB" "$MULTI_RUN_SEQ_2_SHORT" "finalize_merge" "multi-run-2-fin"
+seed_run_canceled_event "$MULTI_RUN_SEQ_1" "$MULTI_RUN_SEQ_1_SHORT"
+seed_run_canceled_event "$MULTI_RUN_SEQ_2" "$MULTI_RUN_SEQ_2_SHORT"
+write_probe_case "$multi_seq_manifest" "MULTI-RUN-SEQ" \
+  '[{"run":1,"actions":[{"op":"cancel","when":"step:developer:running","expect":{"canceled_terminal_event":true}}]},{"run":2,"actions":[{"op":"cancel","when":"step:finalize_merge:running","expect":{"canceled_terminal_event":true}}]}]'
+multi_seq_events="$TEST_ROOT/multi-run-seq-events.jsonl"
+multi_seq_counter="$TEST_ROOT/multi-run-seq-counter"
+multi_seq_output=$(PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$multi_seq_events" \
+  CONTROLLER_WORKFLOW_MODE=multi-run-seq CONTROLLER_MULTI_RUN_COUNTER="$multi_seq_counter" \
+  TT_CONTROLLER_TOKEN_SETTLE_MS=20 run_recorded_campaign "$CONTROLLER" --manifest "$multi_seq_manifest") \
+  || fail "two-run sequential probe campaign failed: $multi_seq_output"
+multi_seq_id=$(remember_campaign "$multi_seq_output")
+node --input-type=module - "$TT_DIR/var/results/$multi_seq_id/state.json" "$multi_seq_events" \
+  "$MULTI_RUN_SEQ_1" "$MULTI_RUN_SEQ_2" <<'NODE'
+import fs from 'node:fs';
+import path from 'node:path';
+const [statePath, eventsPath, run1Id, run2Id] = process.argv.slice(2);
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const item = state.cases[0];
+const attempt = item.attempts[0];
+if (attempt.probe_sequence_deferred !== undefined) {
+  throw new Error(`multi-run sequence must no longer be deferred: ${JSON.stringify(attempt.probe_sequence_deferred)}`);
+}
+if (attempt.multi_run_probe?.launch_shape !== 'sequential' || attempt.multi_run_probe?.status !== 'completed') {
+  throw new Error(`multi_run_probe evidence is wrong: ${JSON.stringify(attempt.multi_run_probe)}`);
+}
+const evidence = attempt.probe_evidence;
+if (!evidence || evidence.launch_shape !== 'sequential' || evidence.sequence_outcome !== 'completed'
+    || !Array.isArray(evidence.runs) || evidence.runs.length !== 2) {
+  throw new Error(`sequential probe evidence is incomplete: ${JSON.stringify(evidence)}`);
+}
+const byOrdinal = new Map(evidence.runs.map((run) => [run.run_ordinal, run]));
+const run1 = byOrdinal.get(1);
+const run2 = byOrdinal.get(2);
+if (!run1 || !run2) throw new Error(`per-run evidence must carry both ordinals: ${JSON.stringify(evidence.runs)}`);
+const utcRe = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+if (run1.run_id !== run1Id || run1.launch_hook !== 'launch' || run1.terminal_status !== 'canceled'
+    || run1.actions.length !== 1 || run1.actions[0].op !== 'cancel'
+    || JSON.stringify(run1.actions[0].argv) !== JSON.stringify(['tamandua', 'workflow', 'cancel', run1Id])
+    || run1.actions[0].exit_code !== 0 || !utcRe.test(run1.actions[0].action_started_at)
+    || !Array.isArray(run1.actions[0].effect?.events_excerpt?.events)
+    || !run1.actions[0].effect.events_excerpt.events.some((event) => event.event === 'run.canceled')) {
+  throw new Error(`run 1 sequential probe evidence is wrong: ${JSON.stringify(run1)}`);
+}
+if (run2.run_id !== run2Id || run2.launch_hook !== 'launch_2' || run2.terminal_status !== 'canceled'
+    || run2.actions.length !== 1 || run2.actions[0].op !== 'cancel'
+    || run2.actions[0].trigger !== 'step:finalize_merge:running'
+    || JSON.stringify(run2.actions[0].argv) !== JSON.stringify(['tamandua', 'workflow', 'cancel', run2Id])
+    || run2.actions[0].exit_code !== 0
+    || !Array.isArray(run2.actions[0].effect?.events_excerpt?.events)
+    || !run2.actions[0].effect.events_excerpt.events.some((event) => event.event === 'run.canceled')) {
+  throw new Error(`run 2 sequential probe evidence is wrong: ${JSON.stringify(run2)}`);
+}
+if (attempt.outcome !== 'INCONCLUSIVE'
+    || attempt.classification_reason?.category !== 'ambiguous-evidence'
+    || attempt.classification_reason?.ambiguities?.[0]?.category !== 'workflow-terminal'
+    || attempt.classification_reason?.ambiguities?.[0]?.terminal_statuses?.length !== 2) {
+  throw new Error(`sequential case must classify INCONCLUSIVE with both canceled runs: ${JSON.stringify({outcome: attempt.outcome, reason: attempt.classification_reason})}`);
+}
+const stubCalls = fs.readFileSync(eventsPath, 'utf8').trim().split('\n')
+  .map((line) => JSON.parse(line));
+const launches = stubCalls.filter((entry) => entry.argv[0] === 'workflow' && entry.argv[1] === 'run');
+const cancels = stubCalls.filter((entry) => entry.argv[0] === 'workflow' && entry.argv[1] === 'cancel');
+if (launches.length !== 2 || cancels.length !== 2
+    || JSON.stringify(cancels[0].argv) !== JSON.stringify(['workflow', 'cancel', run1Id])
+    || JSON.stringify(cancels[1].argv) !== JSON.stringify(['workflow', 'cancel', run2Id])
+    || new Date(cancels[0].at) > new Date(cancels[1].at)) {
+  throw new Error(`stub must record launch 1 → cancel 1 → launch 2 → cancel 2 in order: ${JSON.stringify(stubCalls)}`);
+}
+if (stubCalls.some((entry) => JSON.stringify(entry.argv).includes('restart'))) {
+  throw new Error(`no daemon restart may be constructed for the sequential shape: ${JSON.stringify(stubCalls)}`);
+}
+const artifactPath = path.join(path.dirname(statePath), 'evidence', item.id, attempt.id, 'probe-evidence.json');
+const artifact = JSON.parse(fs.readFileSync(artifactPath, 'utf8'));
+if (JSON.stringify(artifact) !== JSON.stringify(attempt.probe_evidence)) {
+  throw new Error('multi-run probe-evidence.json artifact does not match attempt.probe_evidence');
+}
+NODE
+remove_multi_steps
+for seeded_event in "${MULTI_RUN_SEEDED_EVENTS[@]}"; do rm -f -- "$seeded_event"; done
+MULTI_RUN_SEEDED_EVENTS=()
+pass "two-run sequential probe sequence (W3.20 shape) launches sequentially and records per-run run.canceled evidence"
+
+# Fixture 2 (W3.22 shape): THREE runs launched CONCURRENTLY (staggered per
+# state options), then restart_daemon executes ONCE mid-flight via
+# daemon-control (stub records its argv — never a bare `tamandua restart`);
+# per-run recovery (within 2 dispatch intervals) + token-flush preservation
+# are recorded as evidence. All three runs complete → PASS.
+daemon_control_stub="$TEST_ROOT/daemon-control-stub"
+cat > "$daemon_control_stub" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$(node -e 'process.stdout.write(JSON.stringify({argv:process.argv.slice(1),at:Date.now()}))' "$@")" >> "$CONTROLLER_DAEMON_EVENTS"
+exit 0
+SH
+chmod +x "$daemon_control_stub"
+multi_conc_manifest="$TEST_ROOT/manifests/multi-run-conc.jsonl"
+remove_multi_steps
+seed_multi_step "$PROBE_DB" "$MULTI_RUN_CONC_1_SHORT" "developer" "multi-run-conc-1-dev"
+write_probe_case "$multi_conc_manifest" "MULTI-RUN-CONC" \
+  '[{"run":1,"actions":[{"op":"restart_daemon","when":"step:developer:running","expect":{"recovery_within_dispatch_intervals":2,"token_flush_preserved":true,"run_completes":true}}]},{"run":2,"actions":[{"op":"restart_daemon","when":"step:developer:running","expect":{"recovery_within_dispatch_intervals":2,"token_flush_preserved":true,"run_completes":true}}]},{"run":3,"actions":[{"op":"restart_daemon","when":"step:developer:running","expect":{"recovery_within_dispatch_intervals":2,"token_flush_preserved":true,"run_completes":true}}]}]'
+multi_conc_events="$TEST_ROOT/multi-run-conc-events.jsonl"
+multi_conc_daemon_events="$TEST_ROOT/multi-run-conc-daemon-events.jsonl"
+multi_conc_counter="$TEST_ROOT/multi-run-conc-counter"
+multi_conc_output=$(PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$multi_conc_events" \
+  CONTROLLER_WORKFLOW_MODE=multi-run-conc CONTROLLER_MULTI_RUN_COUNTER="$multi_conc_counter" \
+  CONTROLLER_DAEMON_EVENTS="$multi_conc_daemon_events" \
+  TT_CONTROLLER_DAEMON_CONTROL_PATH="$daemon_control_stub" TT_CONTROLLER_TOKEN_SETTLE_MS=20 \
+  run_recorded_campaign "$CONTROLLER" --manifest "$multi_conc_manifest" --stagger 50ms) \
+  || fail "three-concurrent-run probe campaign failed: $multi_conc_output"
+multi_conc_id=$(remember_campaign "$multi_conc_output")
+node --input-type=module - "$TT_DIR/var/results/$multi_conc_id/state.json" "$multi_conc_events" \
+  "$multi_conc_daemon_events" "$daemon_control_stub" \
+  "$MULTI_RUN_CONC_1" "$MULTI_RUN_CONC_2" "$MULTI_RUN_CONC_3" <<'NODE'
+import fs from 'node:fs';
+import path from 'node:path';
+const [statePath, eventsPath, daemonEventsPath, daemonStubPath, run1Id, run2Id, run3Id] = process.argv.slice(2);
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const item = state.cases[0];
+const attempt = item.attempts[0];
+if (attempt.outcome !== 'PASS') {
+  throw new Error(`concurrent multi-run case did not PASS: ${JSON.stringify({outcome: attempt.outcome, reason: attempt.classification_reason})}`);
+}
+if (attempt.multi_run_probe?.launch_shape !== 'concurrent' || attempt.multi_run_probe?.status !== 'completed') {
+  throw new Error(`multi_run_probe evidence is wrong: ${JSON.stringify(attempt.multi_run_probe)}`);
+}
+if (attempt.run_id !== run1Id) {
+  throw new Error(`the attempt must bind to the primary (run 1) id after the sequence: ${attempt.run_id}`);
+}
+const evidence = attempt.probe_evidence;
+if (!evidence || evidence.launch_shape !== 'concurrent' || evidence.sequence_outcome !== 'completed'
+    || !Array.isArray(evidence.runs) || evidence.runs.length !== 3
+    || !Array.isArray(evidence.daemon_restarts) || evidence.daemon_restarts.length !== 1) {
+  throw new Error(`concurrent probe evidence is incomplete: ${JSON.stringify(evidence)}`);
+}
+const byOrdinal = new Map(evidence.runs.map((run) => [run.run_ordinal, run]));
+const expectedIds = [run1Id, run2Id, run3Id];
+for (let ordinal = 1; ordinal <= 3; ordinal += 1) {
+  const run = byOrdinal.get(ordinal);
+  if (!run) throw new Error(`missing run ${ordinal} evidence: ${JSON.stringify(evidence.runs)}`);
+  if (!expectedIds.includes(run.run_id) || run.terminal_status !== 'completed') {
+    throw new Error(`run ${ordinal} evidence is wrong: ${JSON.stringify(run)}`);
+  }
+  const restartAction = run.actions.find((action) => action.op === 'restart_daemon');
+  if (!restartAction || restartAction.exit_code !== 0
+      || restartAction.effect?.recovery?.recovered !== true
+      || restartAction.effect?.recovery?.recovery_within_dispatch_intervals !== true
+      || restartAction.effect?.recovery?.tokens_after_restart
+        < restartAction.effect?.recovery?.tokens_before_restart
+      || restartAction.effect?.recovery?.token_flush_preserved !== true) {
+    throw new Error(`run ${ordinal} restart/recovery evidence is wrong: ${JSON.stringify(run)}`);
+  }
+}
+const restart = evidence.daemon_restarts[0];
+if (restart.op !== 'restart_daemon' || restart.kind !== 'real' || restart.exit_code !== 0
+    || restart.argv?.[0] !== daemonStubPath || restart.argv?.[1] !== 'real' || restart.argv?.[2] !== 'restart'
+    || !Array.isArray(restart.recovery) || restart.recovery.length !== 3) {
+  throw new Error(`daemon restart evidence is wrong: ${JSON.stringify(restart)}`);
+}
+const stubCalls = fs.readFileSync(eventsPath, 'utf8').trim().split('\n')
+  .map((line) => JSON.parse(line));
+if (stubCalls.some((entry) => entry.argv[0] === 'workflow' && entry.argv[1] === 'restart')
+    || stubCalls.some((entry) => entry.argv[0] === 'restart')) {
+  throw new Error(`a bare tamandua restart must never be constructed: ${JSON.stringify(stubCalls)}`);
+}
+const daemonCalls = fs.readFileSync(daemonEventsPath, 'utf8').trim().split('\n')
+  .map((line) => JSON.parse(line));
+if (daemonCalls.length !== 1
+    || JSON.stringify(daemonCalls[0].argv) !== JSON.stringify(['real', 'restart'])) {
+  throw new Error(`daemon-control must be invoked exactly once with [real restart]: ${JSON.stringify(daemonCalls)}`);
+}
+NODE
+remove_multi_steps
+pass "three-concurrent-run probe sequence (W3.22 shape) restarts the contained daemon via daemon-control and records per-run recovery"
+
+# ── E3.C US-008: chaos wiring (honor manifest chaos blocks) ──────────
+# The controller's real-case arm must honor a case's manifest `chaos` block
+# by invoking bin/tt-chaos under the case's contained spawn env while the
+# run is in flight (W3.17b sigstop_sigcont on the harness process), record
+# start/stop evidence as attempt.chaos_evidence (invocation argv, timestamps,
+# exit code), and let the oracle snapshot copy var/chaos/chaos.log under the
+# chaos_log evidence key (O4's REQUIRED_ORACLE_EVIDENCE — a chaos:null case
+# must NEVER spawn tt-chaos, and a chaos invocation failure must classify
+# TEST_INFRA_FAIL 'chaos-invocation-failed'). Tests stub bin/tt-chaos via
+# TT_CONTROLLER_TT_CHAOS_PATH (mirrors the daemon-control stub) and record
+# its argv; the chaos:null fixture's stub would exit non-zero if ever
+# spawned, so any accidental invocation fails the campaign loudly.
+
+CHAOS_BLOCK='{"type":"sigstop_sigcont","target":"harness_process","trigger":"mid_round","hold_seconds":600,"operator":"tt-chaos"}'
+CHAOS_RUN_ID="run-11111111-1111-4111-8111-111111111111"
+mkdir -p "$(dirname "$CHAOS_LOG_FILE")"
+if [ -f "$CHAOS_LOG_FILE" ]; then cp "$CHAOS_LOG_FILE" "$CHAOS_LOG_BACKUP"; fi
+: > "$CHAOS_LOG_FILE"
+
+write_chaos_case() {
+  local manifest="$1"
+  local id="$2"
+  local chaos_json="$3"
+  local oracles_json="${4:-[\"TT-MISSING-O1\",\"TT-MISSING-O2\"]}"
+  node --input-type=module - "$manifest" "$id" "$chaos_json" "$oracles_json" <<'NODE'
+import fs from 'node:fs';
+const [manifest, id, chaosJson, oraclesJson] = process.argv.slice(2);
+const record = {
+  id, wave: 3, workflow: 'bug-fix-merge-worktree', fixture: 'tt-ts', harness: 'hermes',
+  task: 'tasks/W3.07.md', context: {}, caps: { tokens: 4000000, wall_min: 240 },
+  requires: {}, boundary_files: ['fixtures/tt-ts/src'], forbidden: [],
+  oracles: JSON.parse(oraclesJson), gates: ['W3'], chaos: JSON.parse(chaosJson),
+  shed_ok: false, mandatory: true, class: 'verification',
+};
+fs.writeFileSync(manifest, `${JSON.stringify(record)}\n`);
+NODE
+}
+
+# Stub tt-chaos: records its full argv to $CONTROLLER_CHAOS_EVENTS and, in
+# record mode, appends the three sigstop_sigcont chaos.log entries a real
+# operator would write (start/hold/cont) — the chaos_log the oracle snapshot
+# copies for O4. The stub NEVER actually signals anything (no real harness);
+# it only proves the controller's invocation contract.
+cat > "$TEST_ROOT/tt-chaos-stub" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$(node -e 'process.stdout.write(JSON.stringify({argv:process.argv.slice(1),at:Date.now()}))' "$@")" >> "$CONTROLLER_CHAOS_EVENTS"
+CHAOS_RUN=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "--run" ]; then CHAOS_RUN="$arg"; fi
+  prev="$arg"
+done
+if [ "${CONTROLLER_CHAOS_MODE:-record}" = "record" ]; then
+  printf '%s\n' "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\",\"action\":\"sigstop_sigcont\",\"entry\":\"start\",\"runId\":\"$CHAOS_RUN\",\"pid\":12345}" >> "$CHAOS_LOG_FILE"
+  printf '%s\n' "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\",\"action\":\"sigstop_sigcont\",\"entry\":\"hold_complete\",\"runId\":\"$CHAOS_RUN\",\"pid\":12345}" >> "$CHAOS_LOG_FILE"
+  printf '%s\n' "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\",\"action\":\"sigstop_sigcont\",\"entry\":\"cont\",\"runId\":\"$CHAOS_RUN\",\"pid\":12345}" >> "$CHAOS_LOG_FILE"
+fi
+exit 0
+SH
+chmod +x "$TEST_ROOT/tt-chaos-stub"
+cat > "$TEST_ROOT/tt-chaos-fail-stub" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$(node -e 'process.stdout.write(JSON.stringify({argv:process.argv.slice(1),at:Date.now()}))' "$@")" >> "$CONTROLLER_CHAOS_EVENTS"
+printf 'chaos operator refused\n' >&2
+exit 3
+SH
+chmod +x "$TEST_ROOT/tt-chaos-fail-stub"
+
+# Fixture 1: a chaos-block case invokes tt-chaos exactly per the manifest
+# (operator tt-chaos, sigstop_sigcont, --run <run-id>, --when
+# step:developer:running [mid_round translated], --hold-seconds 600), with
+# start/stop records in attempt.chaos_evidence AND chaos.log captured into
+# the oracle snapshot under the chaos_log key. The case declares O4 (whose
+# REQUIRED_ORACLE_EVIDENCE includes chaos_log), so the controller's
+# gating-oracle context validation only passes if the chaos log was actually
+# captured — the O4 stub (self-test oracle root) then returns PASS.
+chaos_oracle_root="$TEST_ROOT/self-test-oracles"
+mkdir -p "$chaos_oracle_root"
+cat > "$chaos_oracle_root/O4" <<'NODE'
+#!/usr/bin/env node
+import fs from 'node:fs';
+const contextFlag = process.argv.indexOf('--context');
+if (process.argv[2] !== '--contract-version' || process.argv[3] !== '1'
+    || contextFlag < 0 || process.argv[contextFlag + 1] !== process.env.TT_ORACLE_CONTEXT) process.exit(9);
+const context = JSON.parse(fs.readFileSync(process.env.TT_ORACLE_CONTEXT, 'utf8'));
+if (context.contract_version !== 1 || context.oracle_id !== 'O4'
+    || context.case.id !== process.env.TT_CASE_ID
+    || context.campaign.id !== process.env.TT_CAMPAIGN_ID
+    || context.mechanical_evidence?.references?.chaos_log === null
+    || context.mechanical_evidence?.references?.chaos_log === undefined) process.exit(8);
+const started = new Date().toISOString();
+console.log(JSON.stringify({
+  contract_version: 1, oracle_id: process.env.TT_ORACLE_ID, result: 'PASS',
+  started_at: started, finished_at: new Date().toISOString(), findings: [],
+  evidence: [],
+}));
+NODE
+chmod +x "$chaos_oracle_root/O4"
+chaos_manifest="$TEST_ROOT/manifests/chaos.jsonl"
+write_chaos_case "$chaos_manifest" "CHAOS-BLOCK" "$CHAOS_BLOCK" '["O4"]'
+chaos_events="$TEST_ROOT/chaos-events.jsonl"
+chaos_output=$(PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$workflow_events" \
+  CONTROLLER_WORKFLOW_MODE=stdout \
+  CONTROLLER_CHAOS_EVENTS="$chaos_events" CONTROLLER_CHAOS_MODE=record \
+  CHAOS_LOG_FILE="$CHAOS_LOG_FILE" \
+  TT_CONTROLLER_TT_CHAOS_PATH="$TEST_ROOT/tt-chaos-stub" \
+  TT_CONTROLLER_SELF_TEST=1 TT_CONTROLLER_SELF_TEST_ORACLES_ROOT="$chaos_oracle_root" \
+  run_recorded_campaign "$CONTROLLER" --manifest "$chaos_manifest") \
+  || fail "chaos-block campaign failed: $chaos_output"
+chaos_id=$(remember_campaign "$chaos_output")
+node --input-type=module - "$TT_DIR/var/results/$chaos_id/state.json" "$chaos_events" "$CHAOS_LOG_FILE" \
+  "$CHAOS_RUN_ID" "$TEST_ROOT/tt-chaos-stub" <<'NODE'
+import fs from 'node:fs';
+import path from 'node:path';
+const [statePath, eventsPath, chaosLogPath, runId, chaosStubPath] = process.argv.slice(2);
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const item = state.cases[0];
+const attempt = item.attempts[0];
+if (attempt.outcome !== 'PASS') {
+  throw new Error(`chaos-block case did not PASS: ${JSON.stringify({outcome: attempt.outcome, reason: attempt.classification_reason})}`);
+}
+const evidence = attempt.chaos_evidence;
+const utcRe = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+if (!evidence || evidence.status !== 'completed' || evidence.operator !== 'tt-chaos'
+    || evidence.injection_type !== 'sigstop_sigcont' || evidence.target !== 'harness_process'
+    || evidence.trigger !== 'mid_round' || evidence.trigger_marker !== 'step:developer:running'
+    || evidence.hold_seconds !== 600 || evidence.run_id !== runId
+    || evidence.exit_code !== 0 || evidence.signal !== null
+    || !utcRe.test(evidence.started_at) || !utcRe.test(evidence.ended_at)
+    || JSON.stringify(evidence.argv) !== JSON.stringify(
+      [chaosStubPath, 'sigstop_sigcont', '--run', runId, '--when', 'step:developer:running', '--hold-seconds', '600'])) {
+  throw new Error(`chaos evidence is wrong: ${JSON.stringify(evidence)}`);
+}
+// chaos.log must be captured into the oracle snapshot under the chaos_log key
+// (the O4 stub above would have exited 8 otherwise — the gating context
+// validation enforces REQUIRED_ORACLE_EVIDENCE.chaos_log).
+const chaosLogRef = attempt.oracle_evidence?.references?.chaos_log;
+if (chaosLogRef === null || chaosLogRef === undefined || typeof chaosLogRef.path !== 'string') {
+  throw new Error(`chaos_log was not captured into the oracle snapshot: ${JSON.stringify(attempt.oracle_evidence?.references)}`);
+}
+const copied = fs.readFileSync(path.join(path.dirname(statePath), chaosLogRef.path), 'utf8');
+const entries = [...copied.matchAll(/"action":"sigstop_sigcont","entry":"(start|hold_complete|cont)"/g)].map((m) => m[1]);
+if (JSON.stringify(entries) !== JSON.stringify(['start', 'hold_complete', 'cont'])) {
+  throw new Error(`snapshot chaos_log copy is missing the stub operator's entries: ${JSON.stringify(entries)}`);
+}
+if (item.oracle_results?.[0]?.oracle_id !== 'O4' || item.oracle_results?.[0]?.status !== 'VALID'
+    || item.oracle_results?.[0]?.response?.result !== 'PASS') {
+  throw new Error(`O4 oracle did not VALID/PASS with chaos_log evidence: ${JSON.stringify(item.oracle_results)}`);
+}
+// The stub recorded EXACTLY one tt-chaos invocation with the manifest-derived argv.
+const stubCalls = fs.readFileSync(eventsPath, 'utf8').trim().split('\n')
+  .map((line) => JSON.parse(line));
+if (stubCalls.length !== 1
+    || JSON.stringify(stubCalls[0].argv) !== JSON.stringify(
+      ['sigstop_sigcont', '--run', runId, '--when', 'step:developer:running', '--hold-seconds', '600'])) {
+  throw new Error(`tt-chaos stub must record exactly one manifest-derived invocation: ${JSON.stringify(stubCalls)}`);
+}
+NODE
+pass "a chaos-block case invokes tt-chaos per the manifest and captures chaos.log into the oracle snapshot (O4 PASS)"
+
+# Fixture 2: a chaos invocation failure (stub exits 3) classifies
+# TEST_INFRA_FAIL with the DISTINCT category 'chaos-invocation-failed'
+# naming the operator + exit code — never a silent PASS/INCONCLUSIVE.
+chaos_fail_manifest="$TEST_ROOT/manifests/chaos-fail.jsonl"
+write_chaos_case "$chaos_fail_manifest" "CHAOS-FAIL" "$CHAOS_BLOCK"
+chaos_fail_events="$TEST_ROOT/chaos-fail-events.jsonl"
+chaos_fail_output=$(PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$workflow_events" \
+  CONTROLLER_WORKFLOW_MODE=stdout \
+  CONTROLLER_CHAOS_EVENTS="$chaos_fail_events" \
+  TT_CONTROLLER_TT_CHAOS_PATH="$TEST_ROOT/tt-chaos-fail-stub" \
+  run_recorded_campaign "$CONTROLLER" --manifest "$chaos_fail_manifest") \
+  || fail "chaos-fail campaign failed: $chaos_fail_output"
+chaos_fail_id=$(remember_campaign "$chaos_fail_output")
+node --input-type=module - "$TT_DIR/var/results/$chaos_fail_id/state.json" "$chaos_fail_events" \
+  "$CHAOS_RUN_ID" <<'NODE'
+import fs from 'node:fs';
+const [statePath, eventsPath, runId] = process.argv.slice(2);
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const attempt = state.cases[0].attempts[0];
+if (attempt.outcome !== 'TEST_INFRA_FAIL'
+    || attempt.classification_reason?.category !== 'chaos-invocation-failed'
+    || attempt.classification_reason?.operator !== 'tt-chaos'
+    || attempt.classification_reason?.exit_code !== 3
+    || attempt.classification_reason?.argv?.[0]?.endsWith('/tt-chaos-fail-stub') !== true) {
+  throw new Error(`chaos invocation failure did not classify TEST_INFRA_FAIL chaos-invocation-failed: ${JSON.stringify({outcome: attempt.outcome, reason: attempt.classification_reason})}`);
+}
+if (attempt.chaos_evidence?.status !== 'failed'
+    || attempt.chaos_evidence?.failure?.category !== 'chaos-invocation-failed'
+    || attempt.chaos_evidence?.failure?.exit_code !== 3) {
+  throw new Error(`chaos evidence did not record the failure: ${JSON.stringify(attempt.chaos_evidence)}`);
+}
+const stubCalls = fs.readFileSync(eventsPath, 'utf8').trim().split('\n')
+  .map((line) => JSON.parse(line));
+if (stubCalls.length !== 1
+    || JSON.stringify(stubCalls[0].argv) !== JSON.stringify(
+      ['sigstop_sigcont', '--run', runId, '--when', 'step:developer:running', '--hold-seconds', '600'])) {
+  throw new Error(`failed tt-chaos invocation must still record the manifest-derived argv once: ${JSON.stringify(stubCalls)}`);
+}
+NODE
+pass "a chaos invocation failure classifies TEST_INFRA_FAIL chaos-invocation-failed with a distinct reason"
+
+# Fixture 3: a chaos:null case (W3.17a) NEVER spawns tt-chaos — the stub
+# would record an invocation (and exit 9, failing the case) if the controller
+# ever constructed one. Zero records in the events file proves it.
+chaos_null_events="$TEST_ROOT/chaos-null-events.jsonl"
+: > "$chaos_null_events"
+chaos_null_manifest="$TEST_ROOT/manifests/chaos-null.jsonl"
+write_chaos_case "$chaos_null_manifest" "CHAOS-NULL" 'null'
+cat > "$TEST_ROOT/tt-chaos-null-trap" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$(node -e 'process.stdout.write(JSON.stringify({argv:process.argv.slice(1),at:Date.now()}))' "$@")" >> "$CONTROLLER_CHAOS_EVENTS"
+exit 9
+SH
+chmod +x "$TEST_ROOT/tt-chaos-null-trap"
+chaos_null_output=$(PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$workflow_events" \
+  CONTROLLER_WORKFLOW_MODE=stdout \
+  CONTROLLER_CHAOS_EVENTS="$chaos_null_events" \
+  TT_CONTROLLER_TT_CHAOS_PATH="$TEST_ROOT/tt-chaos-null-trap" \
+  run_recorded_campaign "$CONTROLLER" --manifest "$chaos_null_manifest") \
+  || fail "chaos-null campaign failed: $chaos_null_output"
+chaos_null_id=$(remember_campaign "$chaos_null_output")
+node --input-type=module - "$TT_DIR/var/results/$chaos_null_id/state.json" "$chaos_null_events" <<'NODE'
+import fs from 'node:fs';
+const [statePath, eventsPath] = process.argv.slice(2);
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const attempt = state.cases[0].attempts[0];
+if (attempt.outcome !== 'PASS') {
+  throw new Error(`chaos-null case did not PASS: ${JSON.stringify({outcome: attempt.outcome, reason: attempt.classification_reason})}`);
+}
+if (attempt.chaos_evidence !== undefined) {
+  throw new Error(`a chaos:null case must never carry chaos_evidence: ${JSON.stringify(attempt.chaos_evidence)}`);
+}
+const stubCalls = fs.readFileSync(eventsPath, 'utf8').trim();
+if (stubCalls !== '') {
+  throw new Error(`a chaos:null case (W3.17a) must NEVER spawn tt-chaos, got: ${stubCalls}`);
+}
+NODE
+pass "a chaos:null case (W3.17a) never invokes tt-chaos (zero spawns)"
+
+# Fixture 4: a chaos block that fails semantic validation (untranslatable
+# trigger) is persisted TEST_INFRA_FAIL 'chaos-block-invalid' BEFORE any
+# launch — no workflow launch events and no tt-chaos spawns.
+chaos_guard_events="$TEST_ROOT/chaos-guard-events.jsonl"
+: > "$chaos_guard_events"
+chaos_guard_manifest="$TEST_ROOT/manifests/chaos-guard.jsonl"
+write_chaos_case "$chaos_guard_manifest" "CHAOS-GUARD" \
+  '{"type":"sigstop_sigcont","target":"harness_process","trigger":"unknown_trigger","hold_seconds":600,"operator":"tt-chaos"}'
+chaos_guard_output=$(PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$chaos_guard_events" \
+  CONTROLLER_WORKFLOW_MODE=stdout \
+  CONTROLLER_CHAOS_EVENTS="$chaos_guard_events" \
+  TT_CONTROLLER_TT_CHAOS_PATH="$TEST_ROOT/tt-chaos-null-trap" \
+  run_recorded_campaign "$CONTROLLER" --manifest "$chaos_guard_manifest") \
+  || fail "chaos guard campaign failed: $chaos_guard_output"
+chaos_guard_id=$(remember_campaign "$chaos_guard_output")
+node --input-type=module - "$TT_DIR/var/results/$chaos_guard_id/state.json" "$chaos_guard_events" <<'NODE'
+import fs from 'node:fs';
+const [statePath, eventsPath] = process.argv.slice(2);
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const attempt = state.cases[0].attempts[0];
+if (attempt.outcome !== 'TEST_INFRA_FAIL'
+    || attempt.classification_reason?.category !== 'chaos-block-invalid'
+    || attempt.chaos_guard?.errors?.[0]?.includes('unknown_trigger') !== true) {
+  throw new Error(`semantically-invalid chaos block did not classify TEST_INFRA_FAIL chaos-block-invalid: ${JSON.stringify({outcome: attempt.outcome, reason: attempt.classification_reason, guard: attempt.chaos_guard})}`);
+}
+if (attempt.phase !== 'terminal' || attempt.kind !== 'workflow') {
+  throw new Error(`chaos guard attempt must be a terminal workflow launch-intent: ${JSON.stringify(attempt)}`);
+}
+const stubCalls = fs.readFileSync(eventsPath, 'utf8').trim();
+if (stubCalls !== '') {
+  throw new Error(`a chaos-block-invalid case must never launch or spawn tt-chaos, got: ${stubCalls}`);
+}
+NODE
+pass "a semantically-invalid chaos block fails closed as TEST_INFRA_FAIL chaos-block-invalid before any launch"
+
 oracle_prose_manifest="$TEST_ROOT/manifests/oracle-prose.jsonl"
 valid_case "ORACLE-PROSE" \
   | sed 's/"requires":{"toolchains":\["node"\]}/"requires":{}/' \
@@ -1281,9 +2097,9 @@ const record = {
   id: 'O9-CONTROLLER-SPECIAL', wave: 0, workflow: 'bug-fix-merge-worktree',
   fixture: 'tt-ts', harness: 'hermes', task: 'tasks/W3.07.md',
   seed: 'o9-controller-special',
-  context: {test_cmd: '/bin/true'}, caps: {tokens: 1, wall_min: 5}, requires: {},
+  context: {test_cmd: '/bin/true', o9_special_exits: true}, caps: {tokens: 1, wall_min: 5}, requires: {},
   boundary_files: ['src'], forbidden: [], oracles: ['O9'], gates: [],
-  chaos: {o9_special_exits: true}, shed_ok: false, mandatory: true, class: 'verification',
+  chaos: null, shed_ok: false, mandatory: true, class: 'verification',
 };
 fs.writeFileSync(manifest, `${JSON.stringify(record)}\n`);
 NODE
@@ -1305,7 +2121,7 @@ const item = state.cases[0];
 const attempt = item.attempts[0];
 const oracle = item.oracle_results?.find(result => result.oracle_id === 'O9');
 const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-if (manifest.oracles?.[0] !== 'O9' || manifest.chaos?.o9_special_exits !== true) {
+if (manifest.oracles?.[0] !== 'O9' || manifest.context?.o9_special_exits !== true) {
   throw new Error(`test manifest did not opt into controller O9 probes: ${JSON.stringify(manifest)}`);
 }
 if (attempt.o9_targeted_probes?.status !== 'COMPLETE'
@@ -1404,10 +2220,12 @@ snapshot_output=$(PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$wo
   || fail "workflow oracle snapshot campaign failed: $snapshot_output"
 snapshot_id=$(remember_campaign "$snapshot_output")
 node --input-type=module - "$TT_DIR/var/results/$snapshot_id/state.json" \
-  "$TT_DIR/var/results/$snapshot_id" "$WORKFLOW_REAL_DB" <<'NODE'
+  "$TT_DIR/var/results/$snapshot_id" "$WORKFLOW_REAL_DB" "$SCRIPT_DIR/oracle-context.mjs" <<'NODE'
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+const { OPTIONAL_ORACLE_EVIDENCE_KEYS } = await import(pathToFileURL(process.argv[5]).href);
 const [statePath, campaignDir, sourceDb] = process.argv.slice(2);
 const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
 const attempt = state.cases[0].attempts[0];
@@ -1418,7 +2236,13 @@ if (attempt.oracle_evidence?.status !== 'COMPLETE'
   throw new Error(`oracle snapshot did not complete before invocation: ${JSON.stringify(state.cases[0])}`);
 }
 for (const [key, reference] of Object.entries(attempt.oracle_evidence.references)) {
-  if (reference === null) throw new Error(`snapshot omitted ${key}`);
+  // US-003: probe_evidence/chaos_log are OPTIONAL snapshot keys — absent
+  // artifacts leave the reference null (only oracles that require them, O16/O4,
+  // gate on presence). Every mandatory key must still be captured + immutable.
+  if (reference === null) {
+    if (OPTIONAL_ORACLE_EVIDENCE_KEYS.includes(key)) continue;
+    throw new Error(`snapshot omitted ${key}`);
+  }
   const file = path.join(campaignDir, reference.path);
   const digest = createHash('sha256').update(fs.readFileSync(file)).digest('hex');
   if (digest !== reference.sha256 || (fs.statSync(file).mode & 0o222) !== 0) {
@@ -1454,7 +2278,10 @@ while (!fs.existsSync(path.join(campaignDir, 'state.json'))) {
   campaignDir = parent;
 }
 for (const reference of Object.values(context.mechanical_evidence.references)) {
-  if (reference === null) process.exit(7);
+  // US-003: probe_evidence/chaos_log are OPTIONAL evidence keys — their
+  // reference is null when the probe sequencer / tt-chaos never ran. The
+  // battery oracle only hash-pins the references that exist.
+  if (reference === null) continue;
   const bytes = fs.readFileSync(path.join(campaignDir, reference.path));
   if (createHash('sha256').update(bytes).digest('hex') !== reference.sha256) process.exit(6);
 }
@@ -1530,7 +2357,10 @@ for (const result of item.oracle_results) {
   }
   const context = JSON.parse(fs.readFileSync(path.join(campaignDir, result.context), 'utf8'));
   for (const reference of Object.values(context.mechanical_evidence.references)) {
-    if (reference === null || createHash('sha256').update(fs.readFileSync(path.join(campaignDir, reference.path))).digest('hex') !== reference.sha256) {
+    // US-003: optional evidence keys (probe_evidence/chaos_log) are legitimately
+    // null when their machinery never ran; captured references must hash-pin.
+    if (reference === null) continue;
+    if (createHash('sha256').update(fs.readFileSync(path.join(campaignDir, reference.path))).digest('hex') !== reference.sha256) {
       throw new Error(`${result.oracle_id} referenced mechanical evidence was not hash-pinned`);
     }
   }

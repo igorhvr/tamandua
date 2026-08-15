@@ -456,7 +456,10 @@ test('real dead-owner, stop/cancel, and controller probes harvest through snapsh
     const result = await evaluateO9({
       campaignRoot: campaignDir,
       evidenceDir,
+      // US-003: probe_evidence/chaos_log are optional snapshot keys — absent
+      // artifacts leave their reference null, so only captured keys map.
       evidencePaths: Object.fromEntries(Object.entries(completed.references)
+        .filter(([, reference]) => reference !== null)
         .map(([key, reference]) => [key, path.join(campaignDir, reference.path)])),
     });
     assert.equal(result.result, 'PASS', JSON.stringify(result.findings));

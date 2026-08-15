@@ -59,6 +59,10 @@ const ACTIONS = {
     args: '[--signal <SIG>]',
     desc: 'Send signal to the TT daemon (never the production daemon)',
   },
+  'sigstop_sigcont': {
+    args: '--hold-seconds <n>',
+    desc: 'SIGSTOP the active harness process for --run, hold, then SIGCONT (3 chaos.log entries)',
+  },
   'colleague-commit': {
     args: '--repo <fixture-clone> --file <f> [--line <sentinel>]',
     desc: 'Make a competing commit from a second clone perspective',
@@ -132,8 +136,18 @@ Phase markers:
 Examples:
   tt-chaos kill-harness --run run-abc123 --when now
   tt-chaos pause --run run-abc123 --when step:developer:running
+  tt-chaos sigstop_sigcont --run run-abc123 --when step:developer:running --hold-seconds 600
   tt-chaos colleague-commit --repo var/fixture-clone --file README.md \\
       --line "CHAOS MARKER" --run run-abc123 --when event:merge.parked
+
+Injection discipline (spec 08): every action arms on its --when phase
+marker (never a bare sleep) and re-verifies its target immediately before
+firing; a guard miss aborts with exit 3 and an INVALID chaos.log entry.
+sigstop_sigcont is a harness-process injection (not daemon-lifecycle): it
+re-verifies the SAME harness PID after the hold and never SIGCONTs a
+process that died or was reaped during the hold. Daemon-lifecycle
+injections take the wave-lane exclusive window per spec 08 — schedule
+this action so it never overlaps another injection on the same harness.
 `);
 }
 
@@ -261,6 +275,194 @@ function killDaemon(opts) {
     };
     logStructured(entry);
     console.error(`Error: Failed to send ${signal} to daemon PID ${pid}: ${e.message}`);
+    process.exit(1);
+  }
+}
+
+// ── US-004: sigstop_sigcont — combined SIGSTOP → hold → SIGCONT ──────
+
+/**
+ * Check whether a PID is still alive and present in /proc.
+ * A process that was killed OR reaped during the hold fails this check;
+ * kill(pid, 0) alone is not enough because a zombie answers it.
+ */
+function isProcessAlive(pid) {
+  try {
+    fs.accessSync(`/proc/${pid}`, fs.constants.F_OK);
+  } catch {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Synchronous sleep (same busy-wait primitive phaseWait uses).
+ */
+function sleepSync(ms) {
+  const buf = new Int32Array(new SharedArrayBuffer(4));
+  const step = Math.min(POLL_INTERVAL_MS, ms);
+  let remaining = ms;
+  while (remaining > 0) {
+    Atomics.wait(buf, 0, 0, Math.min(step, remaining));
+    remaining -= step;
+  }
+}
+
+/**
+ * sigstop_sigcont: SIGSTOP the active harness process for --run, hold
+ * for --hold-seconds, then SIGCONT — logging a structured start entry,
+ * a hold_complete entry, and a cont entry to chaos.log.
+ *
+ * Guard semantics (spec 08 injection discipline — never a silent cont):
+ * after the hold elapses, the SAME PID must still be alive and the
+ * harness finder must still resolve to that same PID; otherwise the
+ * injection aborts with EXIT_GUARD_MISS (3) and an INVALID entry —
+ * no SIGCONT is ever sent.
+ */
+function sigstopSigcont(opts) {
+  const { run: runId, args } = opts;
+
+  const holdSecondsRaw = args['hold-seconds'];
+  if (holdSecondsRaw === undefined || holdSecondsRaw === '') {
+    console.error('Error: --hold-seconds is required for sigstop_sigcont');
+    process.exit(1);
+  }
+  const holdSeconds = Number(holdSecondsRaw);
+  if (!Number.isInteger(holdSeconds) || holdSeconds < 0) {
+    console.error(`Error: --hold-seconds must be a non-negative integer, got "${holdSecondsRaw}"`);
+    process.exit(1);
+  }
+
+  const pid = findHarnessPid(runId);
+  if (!pid) {
+    const entry = {
+      ts: new Date().toISOString(),
+      action: 'sigstop_sigcont',
+      runId,
+      phase: 'resolve',
+      outcome: 'target_not_found',
+      error: `No harness process found for run ${runId}`,
+    };
+    logStructured(entry);
+    console.error(`Error: No harness process found for run ${runId}`);
+    process.exit(1);
+  }
+
+  if (!verifyProcessProvenance(pid, runId)) {
+    const entry = {
+      ts: new Date().toISOString(),
+      action: 'sigstop_sigcont',
+      runId,
+      phase: 'resolve',
+      target: `pid:${pid}`,
+      outcome: 'INVALID',
+      error: `Harness PID ${pid} cwd/cmdline does not contain ${TT_ROOT}`,
+    };
+    logStructured(entry);
+    console.error(`GUARD_MISS: Harness PID ${pid} fails provenance check`);
+    process.exit(EXIT_GUARD_MISS);
+  }
+
+  // ── SIGSTOP ──
+  try {
+    process.kill(pid, 'SIGSTOP');
+    const startEntry = {
+      ts: new Date().toISOString(),
+      action: 'sigstop_sigcont',
+      runId,
+      phase: 'start',
+      target: `pid:${pid}`,
+      signal: 'SIGSTOP',
+      holdSeconds,
+      outcome: 'fired',
+    };
+    logStructured(startEntry);
+    console.error(`sigstop_sigcont: SIGSTOP sent to harness PID ${pid} (run ${runId}), holding ${holdSeconds}s`);
+  } catch (e) {
+    const entry = {
+      ts: new Date().toISOString(),
+      action: 'sigstop_sigcont',
+      runId,
+      phase: 'start',
+      target: `pid:${pid}`,
+      signal: 'SIGSTOP',
+      outcome: 'fire_failed',
+      error: e.message,
+    };
+    logStructured(entry);
+    console.error(`Error: Failed to send SIGSTOP to PID ${pid}: ${e.message}`);
+    process.exit(1);
+  }
+
+  // ── Hold ──
+  if (holdSeconds > 0) {
+    sleepSync(holdSeconds * 1000);
+  }
+  logStructured({
+    ts: new Date().toISOString(),
+    action: 'sigstop_sigcont',
+    runId,
+    phase: 'hold_complete',
+    target: `pid:${pid}`,
+    holdSeconds,
+    outcome: 'held',
+  });
+
+  // ── Re-verify the SAME PID before any SIGCONT (never a silent cont) ──
+  const stillAlive = isProcessAlive(pid);
+  const resolvedNow = findHarnessPid(runId);
+  if (!stillAlive || resolvedNow !== pid) {
+    const entry = {
+      ts: new Date().toISOString(),
+      action: 'sigstop_sigcont',
+      runId,
+      phase: 'guard',
+      target: `pid:${pid}`,
+      holdSeconds,
+      outcome: 'INVALID',
+      error: stillAlive
+        ? `Harness PID changed during hold: expected ${pid}, resolved ${resolvedNow ?? 'none'}`
+        : `Harness PID ${pid} died or was reaped during the ${holdSeconds}s hold`,
+    };
+    logStructured(entry);
+    console.error(`GUARD_MISS: ${entry.error} — no SIGCONT sent`);
+    process.exit(EXIT_GUARD_MISS);
+  }
+
+  // ── SIGCONT ──
+  try {
+    process.kill(pid, 'SIGCONT');
+    const contEntry = {
+      ts: new Date().toISOString(),
+      action: 'sigstop_sigcont',
+      runId,
+      phase: 'cont',
+      target: `pid:${pid}`,
+      signal: 'SIGCONT',
+      holdSeconds,
+      outcome: 'fired',
+    };
+    logStructured(contEntry);
+    console.error(`sigstop_sigcont: SIGCONT sent to harness PID ${pid} (run ${runId})`);
+    process.exit(0);
+  } catch (e) {
+    const entry = {
+      ts: new Date().toISOString(),
+      action: 'sigstop_sigcont',
+      runId,
+      phase: 'cont',
+      target: `pid:${pid}`,
+      signal: 'SIGCONT',
+      outcome: 'fire_failed',
+      error: e.message,
+    };
+    logStructured(entry);
+    console.error(`Error: Failed to send SIGCONT to PID ${pid}: ${e.message}`);
     process.exit(1);
   }
 }
@@ -703,6 +905,7 @@ function makeExecutionControl(action) {
 const dispatch = {
   'kill-harness': killHarness,
   'kill-daemon': killDaemon,
+  'sigstop_sigcont': sigstopSigcont,
   'colleague-commit': colleagueCommit,
   pause: makeExecutionControl('pause'),
   resume: makeExecutionControl('resume'),
@@ -725,6 +928,33 @@ function resolveDbPath() {
   }
   // Fallback: TT_HOME is at the parent of TT_ROOT (which is torture-test/var)
   return path.resolve(TT_ROOT, '..', '..', '.tamandua', 'tamandua.db');
+}
+
+/**
+ * Look up a run row tolerantly across schemas + run-id spellings:
+ *   - the contained PRODUCT runs table keys on `id` (RAW uuid, no `run-`
+ *     prefix) while the controller passes `run-<uuid>`;
+ *   - the tt-chaos test-suite fixture runs table keys on `run_id`.
+ * Every candidate query is individually guarded (a missing column throws), so
+ * a schema mismatch degrades to "not found", never a guard crash. Returns the
+ * matched row or undefined.
+ */
+function queryRunRowTolerant(db, runId, shortRunId) {
+  const candidates = [
+    ['id', runId],
+    ['id', shortRunId],
+    ['run_id', runId],
+    ['run_id', shortRunId],
+  ];
+  for (const [column, value] of candidates) {
+    try {
+      const row = db.prepare(`SELECT * FROM runs WHERE ${column} = ? LIMIT 1`).get(value);
+      if (row !== undefined) return row;
+    } catch {
+      // Column may not exist in this schema — try the next candidate.
+    }
+  }
+  return undefined;
 }
 
 // ── phase_wait: marker polling and timeout engine ────────────────────
@@ -795,39 +1025,95 @@ function checkMarker(marker, db, runId) {
 /**
  * Check step:<role>:<state> marker.
  * Format: step:<role>:<state> (exact match on agent_id containing role, status exact match)
+ *
+ * The contained product DB stores run_id as the RAW UUID (no `run-` prefix),
+ * while the controller's probe machinery hands tt-chaos the full `run-<uuid>`
+ * spelling — so BOTH spellings are probed (mirrors the controller's
+ * probeStepMarkerSatisfied dual-spelling contract; without it the marker can
+ * never fire against a real contained instance and the chaos operator exits
+ * 2 TRIGGER_NEVER_MATERIALIZED).
  */
 function checkStepMarker(marker, db, runId) {
   if (!db) return false;
   const parts = marker.slice('step:'.length).split(':');
   if (parts.length !== 2) return false;
   const [role, state] = parts;
+  const shortRunId = runId.startsWith('run-') ? runId.slice(4) : runId;
 
   try {
     const rows = db.prepare(
       `SELECT 1 FROM steps WHERE run_id = ? AND agent_id LIKE ? AND status = ? LIMIT 1`
     ).all(runId, `%${role}%`, state);
-    return rows.length > 0;
+    if (rows.length > 0) return true;
+    if (shortRunId !== runId) {
+      const shortRows = db.prepare(
+        `SELECT 1 FROM steps WHERE run_id = ? AND agent_id LIKE ? AND status = ? LIMIT 1`
+      ).all(shortRunId, `%${role}%`, state);
+      return shortRows.length > 0;
+    }
+    return false;
   } catch {
     return false;
   }
 }
 
 /**
+ * Read the contained event-stream files for a run (both run-id spellings),
+ * newest-last, bounded to keep evidence manageable. Returns [] on any
+ * read/parse failure — the caller treats that as EVIDENCE, never a crash.
+ * Mirrors the controller's readRunEventStream contract (the product keeps
+ * events in <state>/events/<uuid>.jsonl + all.jsonl[.N] archives; there is NO
+ * events table in the product DB).
+ */
+function readRunEventStreamLines(runId) {
+  const stateDir = process.env.TAMANDUA_STATE_DIR;
+  if (!stateDir) return [];
+  const shortRunId = runId.startsWith('run-') ? runId.slice(4) : runId;
+  const eventsDir = path.resolve(stateDir, 'events');
+  const eventPaths = [
+    path.join(eventsDir, `${shortRunId}.jsonl`),
+    path.join(eventsDir, `${runId}.jsonl`),
+    ...[3, 2, 1].map((suffix) => path.join(eventsDir, `all.jsonl.${suffix}`)),
+    path.join(eventsDir, 'all.jsonl'),
+  ];
+  const events = [];
+  for (const eventsPath of eventPaths) {
+    let source;
+    try {
+      source = fs.readFileSync(eventsPath, 'utf8');
+    } catch {
+      continue;
+    }
+    for (const line of source.split(/\r?\n/)) {
+      if (line.trim() === '') continue;
+      let event;
+      try {
+        event = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (typeof event.event !== 'string') continue;
+      const eventRunId = String(event.runId ?? event.run_id ?? '');
+      if (eventRunId !== runId && eventRunId !== shortRunId) continue;
+      events.push(event);
+    }
+  }
+  return events.slice(-200);
+}
+
+/**
  * Check event:<type> marker.
- * Format: event:<type> (substring match on event column)
+ * Format: event:<type> (substring match on the event name)
+ *
+ * The product keeps events in the contained EVENT STREAM FILES — there is NO
+ * events table in the product DB, so the marker polls the stream files for
+ * this run (both run-id spellings), mirroring the controller's
+ * readRunEventStream contract. A stream read failure is EVIDENCE (keep
+ * polling), never a crash.
  */
 function checkEventMarker(marker, db, runId) {
-  if (!db) return false;
   const eventType = marker.slice('event:'.length);
-
-  try {
-    const rows = db.prepare(
-      `SELECT 1 FROM events WHERE run_id = ? AND event LIKE ? LIMIT 1`
-    ).all(runId, `%${eventType}%`);
-    return rows.length > 0;
-  } catch {
-    return false;
-  }
+  return readRunEventStreamLines(runId).some((event) => event.event.includes(eventType));
 }
 
 /**
@@ -862,7 +1148,7 @@ function validateMarker(marker) {
  * Returns { kind: 'process'|'filesystem'|'db'|'none', path?: string }.
  */
 function classifyTarget(action, opts) {
-  const processActions = ['kill-harness', 'kill-daemon'];
+  const processActions = ['kill-harness', 'kill-daemon', 'sigstop_sigcont'];
   const fsActions = ['colleague-commit', 'dirty-tree', 'move-branch'];
   const dbActions = ['delete-tstx-row', 'write-context'];
 
@@ -903,13 +1189,21 @@ function guardFire(action, runId, opts) {
   }
 
   try {
-    const rows = db.prepare('SELECT status FROM runs WHERE run_id = ? LIMIT 1').all(runId);
-    if (rows.length === 0) {
+    // The contained product runs table keys on `id` (RAW uuid — no `run-`
+    // prefix), while the controller passes the full `run-<uuid>` spelling;
+    // both spellings are probed (mirrors the phase-marker dual-spelling
+    // contract). The test-suite fixture DB keys on `run_id` — tolerate both
+    // column names so the guard works against the real product schema AND
+    // the tt-chaos test fixtures. Product terminal statuses use the American
+    // spelling ('canceled'), not the legacy 'cancelled'.
+    const shortRunId = runId.startsWith('run-') ? runId.slice(4) : runId;
+    const row = queryRunRowTolerant(db, runId, shortRunId);
+    if (row === undefined) {
       db.close();
       return { guarded: false, reason: `Run ${runId} not found in TT DB` };
     }
-    const status = rows[0].status;
-    const terminalStatuses = ['completed', 'failed', 'cancelled', 'stopped'];
+    const status = row.status;
+    const terminalStatuses = ['completed', 'failed', 'canceled', 'stopped'];
     if (terminalStatuses.includes(status)) {
       db.close();
       return { guarded: false, reason: `Run ${runId} is terminal (${status}) — refusing to fire` };
@@ -926,7 +1220,7 @@ function guardFire(action, runId, opts) {
     if (!pid) {
       return { guarded: false, reason: `Cannot find target PID for ${action} run ${runId}` };
     }
-    if (!verifyProcessProvenance(pid)) {
+    if (!verifyProcessProvenance(pid, runId)) {
       return { guarded: false, reason: `Process ${pid} cwd/cmdline does not contain ${TT_ROOT}` };
     }
   }
@@ -956,7 +1250,7 @@ function guardFire(action, runId, opts) {
  * kill-daemon: finds the TT daemon process via pidfile or process scan
  */
 function findTargetPid(action, runId) {
-  if (action === 'kill-harness') {
+  if (action === 'kill-harness' || action === 'sigstop_sigcont') {
     // Scan /proc for processes running under TT_ROOT with the run ID in their cmdline
     return findHarnessPid(runId);
   }
@@ -1037,15 +1331,23 @@ function findDaemonPidByScan() {
 }
 
 /**
- * Verify a process PID's provenance: its cwd and cmdline must contain TT_ROOT.
+ * Verify a process PID's provenance: its cwd must be under TT_ROOT and its
+ * cmdline must carry EITHER the run id (a real harness process is spawned as
+ * `node .../runtime-*.mjs ... -q <work prompt>` whose prompt text carries the
+ * run id but no var path) OR TT_ROOT itself (fake/test harness processes and
+ * the fake daemon use argv[0] = TT_ROOT/tt-harness-<run>). Requiring var in
+ * the cmdline unconditionally would reject every real harness process; the
+ * finder already requires cwd under TT_ROOT + cmdline contains the run id, so
+ * this check is the belt-and-suspenders re-assertion of the SAME provenance
+ * contract at fire time.
  */
-function verifyProcessProvenance(pid) {
+function verifyProcessProvenance(pid, runId) {
   try {
     const cwdPath = `/proc/${pid}/cwd`;
     const cmdlinePath = `/proc/${pid}/cmdline`;
     const cwd = fs.readlinkSync(cwdPath);
     const cmdline = fs.readFileSync(cmdlinePath, 'utf-8').replace(/\0/g, ' ');
-    return cwd.includes(TT_ROOT) && cmdline.includes(TT_ROOT);
+    return cwd.includes(TT_ROOT) && (cmdline.includes(runId) || cmdline.includes(TT_ROOT));
   } catch {
     return false;
   }
@@ -1129,10 +1431,13 @@ function captureDbEvidence(runId, writeFile, _action, _opts) {
   }
 
   try {
-    // Capture run row
-    const runRows = db.prepare('SELECT * FROM runs WHERE run_id = ?').all(runId);
-    if (runRows.length > 0) {
-      writeFile('run.json', JSON.stringify(runRows[0], null, 2));
+    // The contained product runs table keys on `id` (RAW uuid), while the
+    // controller passes `run-<uuid>` and the test fixture keys on `run_id` —
+    // queryRunRowTolerant probes every (column, spelling) candidate.
+    const shortRunId = runId.startsWith('run-') ? runId.slice(4) : runId;
+    const runRow = queryRunRowTolerant(db, runId, shortRunId);
+    if (runRow !== undefined) {
+      writeFile('run.json', JSON.stringify(runRow, null, 2));
     } else {
       writeFile('run.json', JSON.stringify({ error: `run_id ${runId} not found` }, null, 2));
     }
@@ -1141,10 +1446,9 @@ function captureDbEvidence(runId, writeFile, _action, _opts) {
     const stepRows = db.prepare('SELECT * FROM steps WHERE run_id = ?').all(runId);
     writeFile('steps.json', JSON.stringify(stepRows, null, 2));
 
-    // Capture events for this run (last 200 rows to keep evidence manageable)
-    const eventRows = db.prepare(
-      'SELECT * FROM events WHERE run_id = ? ORDER BY ts DESC LIMIT 200'
-    ).all(runId);
+    // Capture events for this run from the EVENT STREAM FILES (the product
+    // keeps events in <state>/events/*.jsonl — there is NO events table).
+    const eventRows = readRunEventStreamLines(runId);
     writeFile('events.json', JSON.stringify(eventRows, null, 2));
   } catch (e) {
     writeFile('db_error.txt', `DB query failed: ${e.message}\n`);
@@ -1265,11 +1569,17 @@ function captureWorktreeEvidence(runId, opts, writeFile) {
   try {
     const db = new DatabaseSync(dbPath, { open: true, readOnly: true });
     try {
+      // Product schema: run_worktrees (worktree_path); run_id is the RAW
+      // uuid — probe both spellings (the controller passes run-<uuid>).
+      const shortRunId = runId.startsWith('run-') ? runId.slice(4) : runId;
       const rows = db.prepare(
-        `SELECT path FROM worktrees WHERE run_id = ? LIMIT 1`
+        `SELECT worktree_path FROM run_worktrees WHERE run_id = ? LIMIT 1`
       ).all(runId);
-      if (rows.length > 0 && rows[0].path) {
-        worktreePath = rows[0].path;
+      const row = rows.length > 0 ? rows[0] : db.prepare(
+        `SELECT worktree_path FROM run_worktrees WHERE run_id = ? LIMIT 1`
+      ).get(shortRunId);
+      if (row && row.worktree_path) {
+        worktreePath = row.worktree_path;
       }
     } catch { /* table may not exist */ }
     db.close();
@@ -1502,6 +1812,24 @@ if (!validateMarker(opts.when)) {
   console.error(`Error: Invalid --when marker format "${opts.when}".`);
   console.error('  Must be one of: now, step:<role>:<state>, event:<type>, file:<path>');
   process.exit(EXIT_INVALID_MARKER);
+}
+
+// ── Action-specific argument validation (fail fast, before phase_wait) ──
+
+// sigstop_sigcont: --hold-seconds must be a non-negative integer. Validated
+// here (pre-guard) so a bad invocation never masquerades as a GUARD_MISS or
+// waits on a phase marker before failing.
+if (action === 'sigstop_sigcont') {
+  const holdSecondsRaw = opts.args['hold-seconds'];
+  if (holdSecondsRaw === undefined || holdSecondsRaw === '') {
+    console.error('Error: --hold-seconds is required for sigstop_sigcont');
+    process.exit(1);
+  }
+  const holdSeconds = Number(holdSecondsRaw);
+  if (!Number.isInteger(holdSeconds) || holdSeconds < 0) {
+    console.error(`Error: --hold-seconds must be a non-negative integer, got "${holdSecondsRaw}"`);
+    process.exit(1);
+  }
 }
 
 // ── Phase wait ───────────────────────────────────────────────────────

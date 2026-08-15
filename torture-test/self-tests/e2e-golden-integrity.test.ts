@@ -39,7 +39,7 @@ const validateAllPath = path.join(repoRoot, "torture-test", "probes", "validate-
 // drive full scripted-daemon / real-flag campaigns that legitimately exceed 60+
 // minutes of ACTIVE progress on a contended machine (see run.sh for the full
 // ordering rationale). run.sh must complete in a bounded window regardless of
-// machine load and can never orphan a campaign on timeout, so these eight are
+// machine load and can never orphan a campaign on timeout, so these nine are
 // excluded there and executed INDIVIDUALLY (each as its own `node --test`
 // process under its own ceiling, no aggregate deadline) by
 // bin/verify-heavy-campaign-tests.test.sh — the exact
@@ -55,6 +55,7 @@ const HEAVY_CAMPAIGN_TESTS = [
   "tier1-include-real-proof.test.ts",
   "tier1-real-case-proof.test.ts",
   "tier1-repeatability.test.ts",
+  "tier1-scripted-probe-battery.test.ts",
   "tier1-zero-real-launch-infra.test.ts",
 ];
 const heavyCampaignScriptPath = path.join(

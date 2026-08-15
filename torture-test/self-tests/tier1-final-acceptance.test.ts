@@ -6,9 +6,11 @@
 // campaign machinery):
 //   * the branch diff is confined to the intended authoring files —
 //     tier1.jsonl, case.schema.json, tier1 task .md files, the traceability
-//     doc, bin/tt-fixture-provision.mjs, and self-tests — and never touches
-//     oracles/, bin/oracle-*.mjs, bin/tt-controller, probes/, or
-//     bin/tt-hygiene-canary.mjs;
+//     doc, bin/tt-fixture-provision.mjs, self-tests, and (since E3.C) the
+//     controller/probe/oracle machinery: bin/tt-controller,
+//     bin/tt-controller.test.sh, bin/tt-chaos (+ self-test), bin/oracle-*.mjs,
+//     oracles/ (E3.C adds the O16 lifecycle oracle and O4 executable) — and
+//     never touches probes/, seeds/, or bin/tt-hygiene-canary.mjs;
 //   * bin/tt-hygiene-canary.mjs is byte-identical to the merge-base version
 //     (the canary itself must remain untouched so its campaign snapshots stay
 //     trustworthy);
@@ -80,18 +82,38 @@ function sha256(buffer: Buffer): string {
 
 describe("E3.A US-014 — final acceptance battery pins", () => {
   it("branch diff is confined to the intended authoring files", () => {
+    // E3.C extends the E3.A authoring surface with the controller/probe/oracle
+    // machinery (probe sequencer, chaos wiring, O16/O4 oracles) — all still
+    // confined to torture-test/. The oracle-machinery bin test files
+    // (bin/oracle-*.mjs, bin/tt-oracle-replay*, bin/o9-mechanical-harvest.*,
+    // bin/o11-production-evidence.*) are part of that surface: they consume
+    // oracle-context / oracle-evidence-snapshot, whose version-1 evidence key
+    // set and gating registry E3.C extends. bin/tt-chaos (+ its self-test) is
+    // the chaos operator the controller's chaos wiring (E3.C US-008) invokes;
+    // US-004 adds its sigstop_sigcont action here. US-011 registers the
+    // zero-token scripted probe battery in the heavy-campaign lock-step lists
+    // (self-tests/run.sh HEAVY_CAMPAIGN_TESTS +
+    // bin/verify-heavy-campaign-tests.test.sh + e2e-golden-integrity), so the
+    // isolated heavy-test invocation script joins the authoring surface.
     const allowed = [
       "torture-test/cases/tier1.jsonl",
       "torture-test/cases/case.schema.json",
       "torture-test/cases/tier1-traceability.md",
       "torture-test/cases/tasks/tier1/",
       "torture-test/bin/tt-fixture-provision.mjs",
+      "torture-test/bin/tt-controller",
+      "torture-test/bin/tt-controller.test.sh",
+      "torture-test/bin/tt-chaos",
+      "torture-test/bin/tt-chaos.test.sh",
+      "torture-test/bin/verify-heavy-campaign-tests.test.sh",
+      "torture-test/bin/oracle-",
+      "torture-test/bin/tt-oracle-replay",
+      "torture-test/bin/o9-mechanical-harvest.integration.test.mjs",
+      "torture-test/bin/o11-production-evidence.test.mjs",
+      "torture-test/oracles/",
       "torture-test/self-tests/",
     ];
     const forbidden = [
-      "torture-test/oracles/",
-      "torture-test/bin/oracle-",
-      "torture-test/bin/tt-controller",
       "torture-test/bin/tt-hygiene-canary.mjs",
       "torture-test/probes/",
       "torture-test/seeds/",

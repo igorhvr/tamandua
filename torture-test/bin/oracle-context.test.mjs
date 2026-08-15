@@ -8,7 +8,9 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import {
   GATING_ORACLE_IDS,
+  OPTIONAL_ORACLE_EVIDENCE_KEYS,
   ORACLE_EVIDENCE_KEYS,
+  REQUIRED_ORACLE_EVIDENCE,
   createOracleContext,
   validateOracleContext,
 } from './oracle-context.mjs';
@@ -101,7 +103,7 @@ function cleanup(campaignDir) {
 test('complete version-1 mechanical evidence context is accepted for every gating oracle', () => {
   const data = fixture();
   try {
-    assert.deepEqual(GATING_ORACLE_IDS, ['O1', 'O2', 'O3z', 'O8', 'O9', 'O10', 'O11']);
+    assert.deepEqual(GATING_ORACLE_IDS, ['O1', 'O2', 'O3z', 'O4', 'O8', 'O9', 'O10', 'O11', 'O16']);
     for (const oracleId of GATING_ORACLE_IDS) {
       const context = createOracleContext({ ...data, oracleId });
       assert.deepEqual(validateOracleContext(context, data.campaignDir, { requireOracleEvidence: true }), []);
@@ -114,6 +116,69 @@ test('complete version-1 mechanical evidence context is accepted for every gatin
       assert.equal(context.o1_wave.duration_floors[0].case_id, 'CASE-1');
       assert.equal(context.o1_wave.runs[0].expected_fast_failure, false);
     }
+  } finally {
+    cleanup(data.campaignDir);
+  }
+});
+
+test('E3.C registry: probe_evidence/chaos_log keys and O4/O16 gating wiring (US-003)', () => {
+  const data = fixture();
+  try {
+    // Evidence contract recognizes the probe sequencer and chaos wiring outputs.
+    assert.ok(ORACLE_EVIDENCE_KEYS.includes('probe_evidence'), 'probe_evidence must be a version-1 evidence key');
+    assert.ok(ORACLE_EVIDENCE_KEYS.includes('chaos_log'), 'chaos_log must be a version-1 evidence key');
+    assert.equal(ORACLE_EVIDENCE_KEYS.indexOf('probe_evidence'), ORACLE_EVIDENCE_KEYS.length - 2,
+      'probe_evidence must be the penultimate key (append-only key set)');
+    assert.equal(ORACLE_EVIDENCE_KEYS.indexOf('chaos_log'), ORACLE_EVIDENCE_KEYS.length - 1,
+      'chaos_log must be the terminal key (append-only key set)');
+
+    // O4 and O16 are first-class gating oracles.
+    assert.ok(GATING_ORACLE_IDS.includes('O4'), 'O4 must be a gating oracle');
+    assert.ok(GATING_ORACLE_IDS.includes('O16'), 'O16 must be a gating oracle');
+    assert.ok(GATING_ORACLE_IDS.indexOf('O4') < GATING_ORACLE_IDS.indexOf('O8'),
+      'O4 must sit in the spec-12 gating order (O1, O2, O3z, O4, O8, ...)');
+
+    // The new keys are OPTIONAL snapshot artifacts (null when the probe
+    // sequencer / tt-chaos never ran), so non-probe cases still capture.
+    assert.deepEqual(OPTIONAL_ORACLE_EVIDENCE_KEYS, ['probe_evidence', 'chaos_log']);
+    assert.ok(OPTIONAL_ORACLE_EVIDENCE_KEYS.every((key) => ORACLE_EVIDENCE_KEYS.includes(key)),
+      'every optional key must still be a version-1 evidence key');
+
+    // Required evidence legs per US-003.
+    assert.deepEqual(REQUIRED_ORACLE_EVIDENCE.O4, ['database_snapshot', 'run_events', 'chaos_log']);
+    assert.deepEqual(REQUIRED_ORACLE_EVIDENCE.O16, ['probe_evidence', 'run_events', 'database_snapshot']);
+
+    // The fixture supplies every evidence key, so both new gating oracles pass
+    // requireOracleEvidence validation (contract-valid contexts for O4/O16).
+    for (const oracleId of ['O4', 'O16']) {
+      const context = createOracleContext({ ...data, oracleId });
+      assert.deepEqual(validateOracleContext(context, data.campaignDir, { requireOracleEvidence: true }), [],
+        `${oracleId} context must validate with the complete key set`);
+      assert.equal(context.oracle_id, oracleId);
+    }
+
+    // A context missing an O16-required leg fails closed under
+    // requireOracleEvidence (the probe sequencer never ran → TEST_INFRA, not a
+    // silent PASS).
+    const withoutProbe = createOracleContext({ ...data, oracleId: 'O16' });
+    withoutProbe.mechanical_evidence.references.probe_evidence = null;
+    assert.match(
+      validateOracleContext(withoutProbe, data.campaignDir, { requireOracleEvidence: true }).join('\n'),
+      /probe_evidence is required for O16/,
+    );
+    // Same fail-closed behavior for O4's chaos_log leg.
+    const withoutChaos = createOracleContext({ ...data, oracleId: 'O4' });
+    withoutChaos.mechanical_evidence.references.chaos_log = null;
+    assert.match(
+      validateOracleContext(withoutChaos, data.campaignDir, { requireOracleEvidence: true }).join('\n'),
+      /chaos_log is required for O4/,
+    );
+    // Optional keys stay optional for oracles that do not require them.
+    const o1 = createOracleContext({ ...data, oracleId: 'O1' });
+    o1.mechanical_evidence.references.probe_evidence = null;
+    o1.mechanical_evidence.references.chaos_log = null;
+    assert.deepEqual(validateOracleContext(o1, data.campaignDir, { requireOracleEvidence: true }), [],
+      'O1 must not require probe_evidence/chaos_log');
   } finally {
     cleanup(data.campaignDir);
   }

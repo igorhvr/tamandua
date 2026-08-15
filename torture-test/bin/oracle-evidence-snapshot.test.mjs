@@ -112,6 +112,41 @@ function fixture() {
   return { root, stateDir, repoDir, campaignDir, databasePath, suiteOrigin };
 }
 
+// E3.C US-003: the probe sequencer writes a per-attempt probe-evidence JSON
+// artifact into the controller's per-attempt evidence dir, and tt-chaos
+// appends structured entries to var/chaos/chaos.log. The terminal snapshot
+// must capture both under the probe_evidence / chaos_log evidence keys. The
+// artifacts are planted per-test (the rejection tests assert the campaign
+// directory stays untouched on a failed begin, so the shared fixture must not
+// pre-create them).
+function plantLifecycleEvidence(data) {
+  const probeEvidencePath = path.join(data.campaignDir, 'evidence', 'CASE-1', 'attempt-1', 'probe-evidence.json');
+  fs.mkdirSync(path.dirname(probeEvidencePath), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(probeEvidencePath, `${JSON.stringify({
+    schema_version: 1,
+    actions: [
+      {
+        op: 'pause', trigger: 'step:developer:running',
+        started_at: '2026-08-01T12:00:01.000Z', finished_at: '2026-08-01T12:00:02.000Z',
+        exit_code: 0, effect: { run_paused: true },
+      },
+      {
+        op: 'resume', trigger: 'now',
+        started_at: '2026-08-01T12:10:01.000Z', finished_at: '2026-08-01T12:10:01.500Z',
+        exit_code: 0, effect: { run_resumed: true },
+      },
+    ],
+  })}\n`);
+
+  const chaosLogPath = path.join(data.root, 'chaos', 'chaos.log');
+  fs.mkdirSync(path.dirname(chaosLogPath), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(chaosLogPath, [
+    JSON.stringify({ ts: '2026-08-01T12:00:00.500Z', action: 'sigstop_sigcont', entry: 'start', run_id: RUN_ID, pid: 4242 }),
+    JSON.stringify({ ts: '2026-08-01T12:00:00.600Z', action: 'sigstop_sigcont', entry: 'hold', run_id: RUN_ID, pid: 4242 }),
+    JSON.stringify({ ts: '2026-08-01T12:00:01.500Z', action: 'sigstop_sigcont', entry: 'cont', run_id: RUN_ID, pid: 4242 }),
+  ].join('\n') + '\n');
+}
+
 function input(data) {
   return {
     ttRoot: TT_ROOT,
@@ -119,6 +154,10 @@ function input(data) {
     stateDir: data.stateDir,
     databasePath: data.databasePath,
     repositoryPath: data.repoDir,
+    // US-003: the terminal snapshot copies tt-chaos's chaos.log (default
+    // <ttRoot>/var/chaos/chaos.log); tests pin a hermetic copy under the
+    // fixture root so they never touch shared var/chaos state.
+    chaosLogPath: path.join(data.root, 'chaos', 'chaos.log'),
     caseRecord: {
       id: 'CASE-1', workflow: 'feature-dev-merge-worktree', fixture: 'tt-ts', harness: 'hermes',
       context: { merge_gate: 'green', fail_missing: '1', test_cmd: 'npm test', prose: 'do not capture me' },
@@ -151,6 +190,7 @@ test('harvests a complete immutable snapshot that passes O9 with immediate recla
     const request = input(data);
     const sourceDatabaseHash = digest(data.databasePath);
     fs.writeFileSync(`${data.databasePath}-wal`, '');
+    plantLifecycleEvidence(data);
     const started = beginOracleEvidenceSnapshot(request);
     assert.equal(fs.existsSync(`${data.databasePath}-shm`), false, 'baseline read created source SHM');
     fs.rmSync(`${data.databasePath}-wal`);
@@ -175,6 +215,25 @@ test('harvests a complete immutable snapshot that passes O9 with immediate recla
       assert.equal(fs.lstatSync(absolute).isSymbolicLink(), false);
       assert.equal(fs.statSync(absolute).mode & 0o222, 0, `${key} is writable`);
     }
+
+    // US-003: the probe_evidence artifact and chaos.log are captured under
+    // their evidence keys with content intact (O16/O4 consumption surface).
+    const probeEvidence = JSON.parse(fs.readFileSync(
+      path.join(data.campaignDir, completed.references.probe_evidence.path), 'utf8',
+    ));
+    assert.equal(probeEvidence.schema_version, 1);
+    assert.deepEqual(probeEvidence.actions.map((action) => action.op), ['pause', 'resume']);
+    assert.equal(probeEvidence.actions[0].trigger, 'step:developer:running');
+    const chaosLog = fs.readFileSync(
+      path.join(data.campaignDir, completed.references.chaos_log.path), 'utf8',
+    );
+    assert.deepEqual(
+      [...chaosLog.matchAll(/"action":"sigstop_sigcont","entry":"(start|hold|cont)"/g)].map((match) => match[1]),
+      ['start', 'hold', 'cont'],
+      'chaos.log copy must preserve every tt-chaos sigstop_sigcont entry',
+    );
+    assert.match(completed.references.probe_evidence.source, /controller-probe-sequence/);
+    assert.match(completed.references.chaos_log.source, /tt-chaos-log/);
 
     const dbCopy = new DatabaseSync(path.join(data.campaignDir, completed.references.database_snapshot.path), { readOnly: true });
     assert.equal(dbCopy.prepare('SELECT tokens_spent FROM runs').get().tokens_spent, 17);
@@ -269,6 +328,77 @@ test('harvests a complete immutable snapshot that passes O9 with immediate recla
     const provenance = JSON.parse(fs.readFileSync(path.join(data.campaignDir, completed.provenance.path)));
     assert.equal(provenance.status, 'COMPLETE');
     assert.deepEqual(Object.keys(provenance.files), ORACLE_EVIDENCE_KEYS);
+  } finally {
+    fs.rmSync(data.root, { recursive: true, force: true });
+  }
+});
+
+test('US-010: appends process-recorder samples to the chaos_log bundle at the default chaos log path (O4 liveness provenance)', async () => {
+  const data = fixture();
+  try {
+    // Plant the chaos log at the DEFAULT location under a hermetic ttRoot
+    // (<ttRoot>/var/chaos/chaos.log) plus recorder samples under
+    // <ttRoot>/var/recorder — the O4 liveness-provenance bundle. The
+    // controller pins chaosLogPath to exactly this default path (US-008), so
+    // the append must fire for the pinned path too (US-010 fix: gate on
+    // path-equality with the derivation, not on undefined-ness).
+    const varDir = path.join(data.root, 'var');
+    const chaosDir = path.join(varDir, 'chaos');
+    const recorderDir = path.join(varDir, 'recorder');
+    fs.mkdirSync(chaosDir, { recursive: true, mode: 0o700 });
+    fs.mkdirSync(recorderDir, { recursive: true, mode: 0o700 });
+    const chaosLogPath = path.join(chaosDir, 'chaos.log');
+    fs.writeFileSync(chaosLogPath, [
+      JSON.stringify({ ts: '2026-08-01T12:00:00.500Z', action: 'sigstop_sigcont', entry: 'start', run_id: RUN_ID, pid: 4242 }),
+      JSON.stringify({ ts: '2026-08-01T12:00:00.600Z', action: 'sigstop_sigcont', entry: 'hold', run_id: RUN_ID, pid: 4242 }),
+      JSON.stringify({ ts: '2026-08-01T12:00:01.500Z', action: 'sigstop_sigcont', entry: 'cont', run_id: RUN_ID, pid: 4242 }),
+    ].join('\n') + '\n');
+    fs.writeFileSync(path.join(recorderDir, 'samples-20260801T120000Z.jsonl'), [
+      JSON.stringify({ ts: '2026-08-01T12:00:01.000Z', pid: 7001, pgid: 7001, ppid: 1, cwd: `/repo/var/runs/${RUN_ID}`, cmdline: `node /repo/var/harness-${RUN_ID} --run ${RUN_ID}`, rss: 120000, fd: 24 }),
+      JSON.stringify({ ts: '2026-08-01T12:00:06.000Z', pid: 7001, pgid: 7001, ppid: 1, cwd: `/repo/var/runs/${RUN_ID}`, cmdline: `node /repo/var/harness-${RUN_ID} --run ${RUN_ID}`, rss: 120000, fd: 24 }),
+    ].join('\n') + '\n');
+
+    const request = { ...input(data), ttRoot: data.root, chaosLogPath };
+    fs.writeFileSync(`${data.databasePath}-wal`, '');
+    const started = beginOracleEvidenceSnapshot(request);
+    fs.rmSync(`${data.databasePath}-wal`);
+    assert.equal(started.status, 'BASELINE_CAPTURED');
+    fs.writeFileSync(`${data.databasePath}-wal`, '');
+    const completed = completeOracleEvidenceSnapshot(request, started);
+    assert.equal(completed.status, 'COMPLETE');
+
+    const chaosLog = fs.readFileSync(
+      path.join(data.campaignDir, completed.references.chaos_log.path), 'utf8',
+    );
+    assert.match(chaosLog, /# recorder-samples/, 'recorder bundle must carry the section marker');
+    assert.match(chaosLog, /"pid":7001/, 'recorder samples must be appended');
+    const lines = chaosLog.split(/\r?\n/).filter((line) => line.trim() !== '');
+    assert.equal(lines.filter((line) => line.includes('"entry":"start"')).length, 1, 'chaos entries preserved');
+    assert.ok(
+      lines.indexOf('# recorder-samples') > lines.findIndex((line) => line.includes('"entry":"cont"')),
+      'recorder bundle must follow the chaos entries',
+    );
+    assert.equal(lines.length, 3 + 1 + 2, '3 chaos entries + marker + 2 recorder samples');
+
+    // The hermetic override path stays byte-exact: pin chaosLogPath elsewhere
+    // (same recorder dir present) and the append must NOT fire.
+    const hermeticLog = path.join(data.root, 'hermetic', 'chaos.log');
+    fs.mkdirSync(path.dirname(hermeticLog), { recursive: true, mode: 0o700 });
+    fs.copyFileSync(chaosLogPath, hermeticLog);
+    const hermeticRequest = {
+      ...input(data), ttRoot: data.root, chaosLogPath: hermeticLog,
+      attempt: { ...input(data).attempt, id: 'attempt-hermetic' },
+    };
+    const hermeticStarted = beginOracleEvidenceSnapshot(hermeticRequest);
+    const hermeticCompleted = completeOracleEvidenceSnapshot(hermeticRequest, hermeticStarted);
+    const hermeticChaosLog = fs.readFileSync(
+      path.join(data.campaignDir, hermeticCompleted.references.chaos_log.path), 'utf8',
+    );
+    assert.doesNotMatch(hermeticChaosLog, /# recorder-samples/, 'hermetic override must stay byte-exact');
+    assert.equal(
+      hermeticChaosLog.split(/\r?\n/).filter((line) => line.trim() !== '').length, 3,
+      'hermetic override carries exactly the chaos entries',
+    );
   } finally {
     fs.rmSync(data.root, { recursive: true, force: true });
   }

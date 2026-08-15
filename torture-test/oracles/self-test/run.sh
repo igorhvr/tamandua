@@ -385,6 +385,8 @@ run_bounded "$COMMAND_TIMEOUT_SECONDS" node "$SCRIPT_DIR/generate-o8-fixtures.mj
 run_bounded "$COMMAND_TIMEOUT_SECONDS" node "$SCRIPT_DIR/generate-o9-fixtures.mjs" "$workspace"
 run_bounded "$COMMAND_TIMEOUT_SECONDS" node "$SCRIPT_DIR/generate-o10-fixtures.mjs" "$workspace"
 run_bounded "$COMMAND_TIMEOUT_SECONDS" node "$SCRIPT_DIR/generate-o11-fixtures.mjs" "$workspace"
+run_bounded "$COMMAND_TIMEOUT_SECONDS" node "$SCRIPT_DIR/generate-o4-fixtures.mjs" "$workspace"
+run_bounded "$COMMAND_TIMEOUT_SECONDS" node "$SCRIPT_DIR/generate-o16-fixtures.mjs" "$workspace"
 run_bounded "$COMMAND_TIMEOUT_SECONDS" node "$SCRIPT_DIR/../calibration/generate-fixtures.mjs" "$workspace"
 run_bounded "$O9_TIMEOUT_SECONDS" node --test --test-timeout=45000 "$TT_ROOT/bin/o9-mechanical-harvest.integration.test.mjs"
 run_bounded "$COMMAND_TIMEOUT_SECONDS" node --test --test-timeout=12000 "$SCRIPT_DIR/watchdog.test.mjs"
@@ -423,13 +425,21 @@ for fixture in "$workspace"/o2-*; do
   fi
 done
 
-for oracle in O3z O8 O9 O10 O11; do
+for oracle in O3z O4 O8 O9 O10 O11 O16; do
   prefix=$(printf '%s' "$oracle" | tr '[:upper:]' '[:lower:]')
   for fixture in "$workspace"/"$prefix"-*; do
     expected=$(run_bounded "$COMMAND_TIMEOUT_SECONDS" node -e 'const fs=require("node:fs"); process.stdout.write(JSON.parse(fs.readFileSync(process.argv[1],"utf8")).expected)' "$fixture/expectation.json")
     run_bounded "$COMMAND_TIMEOUT_SECONDS" node "$SCRIPT_DIR/harness.mjs" --oracle "$SCRIPT_DIR/../$oracle" --context "$fixture/evidence/context.json" --expected "$expected"
   done
 done
+
+# Reap the live process-group ids the O4 fixture generator spawned (detached
+# sleeps used as "provably alive" claim_pgid probes for the green-clean
+# fixture). They are reparented to init, so the descendant cleanup below never
+# sees them — reap them explicitly once the O4 loop has run.
+if [ -f "$workspace/live-pgids.json" ]; then
+  run_bounded "$COMMAND_TIMEOUT_SECONDS" node -e 'const fs=require("node:fs"); for (const pid of JSON.parse(fs.readFileSync(process.argv[1],"utf8"))) { try { process.kill(pid, "SIGKILL"); } catch {} }' "$workspace/live-pgids.json"
+fi
 
 run_bounded "$COMMAND_TIMEOUT_SECONDS" node "$SCRIPT_DIR/../calibration/run.mjs" "$workspace"
 
@@ -451,6 +461,8 @@ printf 'O8 boundary-audit mutations PASS\n'
 printf 'O9 ledger-replay mutations PASS\n'
 printf 'O10 FMIS decision-table mutations PASS\n'
 printf 'O11 output-contract/token-attribution mutations PASS\n'
+printf 'O4 claim-dispatch-hygiene mutations PASS\n'
+printf 'O16 lifecycle-probe mutations PASS\n'
 printf 'NOT_EVALUABLE result vocabulary PASS\n'
 printf 'O2/O9/O11 hard-case calibration pack PASS\n'
 printf 'self-test harness PASS\n'

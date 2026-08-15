@@ -26,7 +26,7 @@ const ALL_KEYS = [
   'refs_before', 'refs_after', 'target_reflog', 'checksum_baseline', 'checksum_terminal',
   'suite_ledger', 'suite_observations', 'token_deltas', 'round_usage',
   'system_tokens_before', 'system_tokens_after', 'submit_rejections',
-  'expects_validations', 'dispatch_renderings',
+  'expects_validations', 'dispatch_renderings', 'probe_evidence', 'chaos_log',
 ];
 
 function sha256(content) {

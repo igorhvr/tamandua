@@ -22,7 +22,7 @@ const keys = [
   'refs_before', 'refs_after', 'target_reflog', 'checksum_baseline', 'checksum_terminal',
   'suite_ledger', 'suite_observations', 'token_deltas', 'round_usage',
   'system_tokens_before', 'system_tokens_after', 'submit_rejections',
-  'expects_validations', 'dispatch_renderings',
+  'expects_validations', 'dispatch_renderings', 'probe_evidence', 'chaos_log',
 ];
 const references = Object.fromEntries(keys.map((key) => [key, null]));
 for (const key of ['database_snapshot', 'run_events', 'workflow_status']) {

@@ -244,6 +244,354 @@ match spec numbering one-to-one. The spec's matrix cells are W3.01–05
 (fdmw × pi × 3 langs). Manifest uses compressed numbering (W3.01–W3.04).
 The `spec_ref` field is the authoritative cross-reference.
 
+### Wave 3 — Lifecycle Probe Sequences (`probe_sequence`, E3.C)
+
+Campaign #7 (S3/S4) found the five lifecycle cases never ran their probes:
+`tt-controller` only did launch→wait→(cap-stop)→snapshot and oracles O16/O4
+were declared-but-missing. E3.C adds manifest-declared `probe_sequence`
+blocks (schema'd in `case.schema.json`, `$defs/probeGroup`/`probeAction`)
+that the controller executes against the CONTAINED TT instance while the
+case's run(s) are in flight. Every action records timestamps, exact argv,
+CLI exit code, and observed effect into attempt evidence
+(`attempt.probe_evidence` + the `probe_evidence` snapshot artifact), judged
+by the O16 lifecycle oracle. The five lifecycle cases (W3.18–W3.22) each
+carry a sequence implementing spec 07-wave-3-harness-duel.md §C:
+
+| Case | Runs | Probe sequence (per run group, in order) | Spec-07 §C assertions |
+|------|------|------------------------------------------|------------------------|
+| W3.18-pause-no-drain | 1 | run 1: `pause` @ `step:developer:running` (hold 600s, expect `no_rounds_during_hold`), `resume` @ `now` (expect `run_completes`) | Pause (no drain) mid-implement; resume after 10min; run must complete; no dispatch rounds during the hold |
+| W3.19-pause-drain | 1 | run 1: `pause_drain` @ `step:developer:running` (expect `drain_waits_current`, `next_story_parked`), `resume` @ `now` (expect `run_completes`) | Drain lets the in-flight story's step complete, then parks WITHOUT dispatching the next story (no `draining_pause` wedge); resume dispatches the next story |
+| W3.20-cancel | 2 | run 1: `cancel` @ `step:developer:running` (expect `canceled_terminal_event`); run 2: `cancel` @ `step:finalize_merge:running` (expect `canceled_terminal_event`) | Cancel mid-implement AND cancel during finalize_merge (second run); `run.canceled` terminal event lands (DC35) |
+| W3.21-fail-force-resume | 1 | run 1: `fail_force` @ `step:developer:running`, `resume` @ `now` (expect `same_run_id_resumes`, `run_completes`) | `workflow fail --force` on a live run, then resume; resume reuses the SAME run id and run number (the `resumeWorkflow`-reuses-run-id trap) and completes |
+| W3.22-daemon-restart | 3 | runs 1–3 (concurrent): `restart_daemon` @ `step:developer:running` (expect `recovery_within_dispatch_intervals: 2`, `token_flush_preserved`, `run_completes`) | Daemon restart under load with 3 runs mid-flight; all 3 recover within 2 dispatch intervals; token flush survives (DC8); no wedge, no double dispatch |
+
+**Run ordinals declare launch shape.** A group's `run` ordinal indexes the
+case's runs in launch order, so W3.20's two sequential runs are groups
+`run: 1` and `run: 2`, and W3.22's three concurrent runs are groups
+`run: 1..3` (the controller launches one run per declared ordinal). For
+W3.22, `restart_daemon` is declared on every run group: the controller
+executes the daemon restart ONCE mid-flight via `bin/daemon-control`
+(containment-guarded — never bare `tamandua restart`), and each group's
+`expect` is the per-run recovery contract O16 judges (that run recovered
+within 2 dispatch intervals, token flush preserved, run completes).
+
+**O16 oracle coverage.** W3.18, W3.19, W3.21 already declared O16. W3.20
+and W3.22 now declare O16 too (their `canceled_terminal_event` and
+restart-recovery expectations are O16 judgment dimensions) — so all five
+lifecycle cases are O16-gated once the oracle executable lands (E3.C
+US-009).
+
+**Wall caps (E3.D).** Each lifecycle case's `caps.wall_min` is VERIFIED
+against the `cases/caps-calibration.md` table — a cap below its probe
+sequence duration (hold + run time + margin) would cancel honest runs and
+destroy the evidence the case exists to collect (S8). Current values
+match the table exactly: W3.18=148, W3.19=180, W3.20=138, W3.21=138,
+W3.22=138 (fdmw p50 138min floor + the mandated 10-min pause hold for
+W3.18; the W3.17 marathon ceiling 180 for the multi-story hermes lifecycle
+W3.19).
+
+**W3.17b chaos block (unchanged).** W3.17b-marathon-chaos keeps its typed
+`chaos` block — `{"type":"sigstop_sigcont","target":"harness_process","trigger":"mid_round","hold_seconds":600,"operator":"tt-chaos"}` —
+the E3.C controller honors it via `bin/tt-chaos` (US-008, see the Chaos
+wiring section below) so the chaos marathon genuinely differs from the
+natural one (W3.17b vs W3.17a).
+
+**Probe execution engine (E3.C US-006).** `bin/tt-controller`'s real-case arm
+starts a probe task alongside the launch as soon as the run id resolves
+(parallel to `monitorWorkflowRun`). For a SINGLE-run `probe_sequence` (run
+group 1 — the W3.18/W3.19/W3.21 shapes), each action in order: arms on its
+`when` phase marker (polling the CONTAINED steps table / event streams on a
+500ms cadence like tt-chaos's phase-wait; `now` fires immediately), executes
+the exact CLI verb under the case's spawn env (`pause`/`pause_drain`/
+`resume`/`cancel`/`fail_force` → `tamandua workflow …`), honors
+`hold_seconds` between the action and the effect observation, and records a
+per-action evidence record: op, trigger, `armed_at`/`action_started_at`/
+`action_ended_at` UTC timestamps, the exact argv, the CLI exit code, and the
+observed effect (contained status query + bounded event-stream excerpt for
+the run since the action started). The full sequence persists as
+`attempt.probe_evidence` (rewritten after EVERY action so interruption never
+loses it) AND as the `probe-evidence.json` artifact in
+`<campaign>/evidence/<case>/<attempt>/`, which the oracle-evidence-snapshot
+copies under the `probe_evidence` key for O16.
+
+Fail-closed contract (never silently swallowed, campaign #7 S3/S4):
+- A probe CLI failure (spawn error / non-zero exit) classifies the attempt
+  TEST_INFRA_FAIL with the DISTINCT category `probe-action-failed` naming the
+  op + exit code, and the sequence stops at the failed action.
+- A trigger that never fires before the run reaches terminal/deadline
+  classifies TEST_INFRA_FAIL `probe-trigger-unreached` (naming op + marker +
+  observed terminal status).
+- Ops the single-run sequencer cannot execute (`restart_daemon` — daemon
+  lifecycle, `sigstop_sigcont` — the chaos-block verb) fail closed as
+  `probe-action-failed` rather than degrade.
+- Multi-run shapes (W3.20 two runs, W3.22 three concurrent runs + contained
+  daemon restart) are orchestrated by US-007 (see the next section); the
+  single-run sequencer keeps a defensive `attempt.probe_sequence_deferred`
+  backstop that the campaign path can no longer reach.
+Every action runs under the case's contained spawn env
+(`loadSpawnEnvironment` childEnv, `assertContainedSpawnEnv` choke-point) —
+the operator's live daemon and `~/.tamandua` are never touched. Pinned by
+the stub-`tamandua` fixtures in `bin/tt-controller.test.sh` (in-order
+pause/resume argv, evidence on attempt + artifact, trigger-unreached and
+probe-action-failed classification).
+
+**Multi-launch probe orchestration (E3.C US-007).** A `probe_sequence` with
+two or more run groups DECLARES a multi-launch shape: `executeWorkflowCase`
+routes it to `executeMultiRunProbeCase` (the single-launch path handles
+exactly one run), and the orchestrator genuinely executes the sequence —
+campaign #7's zero-coverage defect is closed for the multi-run cases too:
+
+- **W3.20 shape (sequential):** two launches executed one after another.
+  Run 1 launches and its actions fire against the CONTAINED instance (cancel
+  mid-implement, asserting the `run.canceled` terminal event lands via the
+  bounded event-stream excerpt), the run is harvested, THEN run 2 launches
+  and its actions fire (cancel during `finalize_merge`). Each launch reuses
+  the launch / run-id-capture / monitor / discovered-run-convergence /
+  terminal-harvest mechanics; per-run probe evidence is grouped by run
+  ordinal in `attempt.probe_evidence.runs[]`.
+- **W3.22 shape (concurrent):** three launches start concurrently (staggered
+  per `state.options.stagger_ms`), each monitored through its own proxy
+  attempt (the monitors tolerate transient status-read failures — a poll
+  landing in the contained daemon's down window must not kill the monitor).
+  Once the runs are in flight, `restart_daemon` executes ONCE mid-flight via
+  `bin/daemon-control <real|scripted> restart` (kind real for the 43xx CLI /
+  scripted for 53xx) — NEVER a bare `tamandua restart` (daemon-control
+  applies its own production + containment guards). Each run's recovery is
+  observed within `expect.recovery_within_dispatch_intervals` dispatch
+  intervals (15s each), recording `recovered_at`, `recovery_waited_ms`,
+  `recovery_within_dispatch_intervals`, and the token flush (tokens observed
+  before vs after the restart — the DC8 evidence O16 judges). The restart
+  record aggregates the per-run recoveries in `evidence.daemon_restarts[]`
+  and each run's restart action record carries its own recovery in `effect`.
+
+**Multi-run evidence contract.** `attempt.probe_evidence` for a multi-run
+sequence is `{ schema_version, case_id, execution_mode, launch_shape
+('sequential' | 'concurrent'), sequence_outcome, started_at, ended_at,
+runs: [{ run_ordinal, run_id, run_id_source, launch_hook, actions[],
+terminal_status, wait_exit_code, recovery }], daemon_restarts[], failure }`
+— rewritten after EVERY probe action / milestone (interruption-safe) and
+mirrored to the `probe-evidence.json` artifact so O16 can judge per-run
+assertions (canceled terminal event per run, restart recovery per run).
+`attempt.multi_run_probe` records `{ launch_shape, run_count, status,
+started_at }` and the shared attempt binds to the primary (run 1) id after
+the sequence.
+
+**Multi-run fail-closed contract** (never silently swallowed):
+- A probe CLI failure (any run's action) classifies TEST_INFRA_FAIL
+  `probe-action-failed` naming the op + exit code; a `restart_daemon`
+  daemon-control failure is the same category naming `daemon-control`'s
+  exit code.
+- A restart trigger that never fires before run 1 reaches terminal/deadline
+  classifies `probe-trigger-unreached` (op `restart_daemon` + marker).
+- A launch that fails to resolve its run id (any run) classifies
+  `workflow-run-identification` (or the DEFINITE infra category); a run that
+  does not reach a terminal status classifies `multi-run-nonterminal`; a
+  terminal-harvest failure classifies `multi-run-harvest-failed`.
+- Cap enforcement mid-sequence classifies INCONCLUSIVE `runaway-cap-enforced`
+  (like the single-run path).
+- A multi-launch attempt interrupted mid-sequence cannot be reattached:
+  resume fails closed with the distinct `multi-run-probe-recovery-unsupported`
+  reason (rerun the case) — mirroring the token-saver paired-launch guard.
+- The semantic validator (US-005) enforces the launch-shape contract at
+  validation time: `restart_daemon` requires >= 2 run groups AND every run
+  group must declare it (each group's action carries that run's recovery
+  contract) — `--validate-only` rejects a violation with a distinct reason.
+- Pinned by the stub-`tamandua` fixtures in `bin/tt-controller.test.sh`
+  (multi-run-seq: two sequential cancels with per-run `run.canceled` event
+  excerpts + in-order argv; multi-run-conc: three concurrent launches +
+  stub daemon-control recording exactly one `[real restart]` invocation,
+  never a bare restart).
+
+**Chaos wiring (E3.C US-008).** The controller honors a case's manifest
+`chaos` block by invoking `bin/tt-chaos` under the case's contained spawn
+env while the run is in flight — closing campaign #7's S3/S4 gap where
+`tt-chaos` was never invoked and the W3.17b marathon did not differ from
+W3.17a:
+
+- **Trigger translation:** the block's `trigger` is a high-level phase name
+  translated to the phase-marker grammar tt-chaos arms on
+  (`now | step:<role>:<state> | event:<type> | file:<path>`): `mid_round`
+  → `step:developer:running` (a dispatch round is in flight when the
+  developer role's step is running). A marker-shaped trigger passes through;
+  an untranslatable trigger fails closed at validation.
+- **Invocation:** `tt-chaos sigstop_sigcont --run <run-id> --when
+  <translated marker> --hold-seconds <hold_seconds>` — exactly the US-004
+  action contract — spawned with the case's childEnv (`assertContainedSpawnEnv`
+  choke-point; `TT_CONTROLLER_TT_CHAOS_PATH` overrides the binary for
+  hermetic tests, mirroring `TT_CONTROLLER_DAEMON_CONTROL_PATH`). The runner
+  starts alongside the monitor/probe as soon as the run id resolves and is
+  awaited after the launch; the invocation is bounded by the case's remaining
+  wall budget (a wedged operator cannot hang the controller past the deadline).
+- **Evidence:** `attempt.chaos_evidence` carries the full start/stop record —
+  schema_version, run_id, operator, injection_type, target, trigger,
+  trigger_marker, hold_seconds, `started_at`/`ended_at` UTC timestamps, the
+  exact argv, exit code, signal, error, and `status`/`failure`. The operator's
+  `var/chaos/chaos.log` is copied into the immutable oracle snapshot under the
+  `chaos_log` evidence key (US-003) — O4's REQUIRED_ORACLE_EVIDENCE — so O4
+  can distinguish a watchdog-killed worker from a chaos-killed one.
+- **Fail-closed contract** (never silently swallowed):
+  - A chaos invocation failure (non-zero exit / spawn error / timeout)
+    classifies TEST_INFRA_FAIL with the DISTINCT category
+    `chaos-invocation-failed` naming the operator + exit code.
+  - A semantically-invalid chaos block (untranslatable trigger, local-case
+    chaos, chaos combined with a multi-run probe_sequence — the injection has
+    no run ordinal) is persisted TEST_INFRA_FAIL `chaos-block-invalid` by the
+    execute-path `chaosGuard` BEFORE any launch, and `--validate-only` reports
+    it as a case-id-named reason.
+  - A `chaos: null` case (W3.17a) NEVER spawns tt-chaos — zero spawns pinned
+    by a trap stub in `bin/tt-controller.test.sh`.
+- Pinned by the stub-`tt-chaos` fixtures in `bin/tt-controller.test.sh`
+  (manifest-derived argv + start/stop evidence, chaos.log captured into the
+  oracle snapshot under `chaos_log` with an O4 self-test-oracle PASS proving
+  the gating context validation, `chaos-invocation-failed` classification on
+  a stub exit 3, zero spawns for `chaos: null`, and the
+  `chaos-block-invalid` guard before launch).
+
+**O16 lifecycle probe-evidence oracle (E3.C US-009).** `oracles/O16` is the
+executable lifecycle oracle that judges the sequencer's `probe_evidence`
+against `run_events` + `database_snapshot` (required evidence per US-003),
+so W3.18-W3.22 (and any W3.0x cell declaring O16) get a mechanical lifecycle
+verdict instead of `ORACLE_MISSING`:
+
+- **Pause held (W3.18):** a `pause` action must carry a hold window; no
+  dispatch event (`dispatch.render.validated` / `step.running` /
+  `step.started`) may fire for the run inside `[hold_started_at,
+  hold_ended_at]` — `O16_ROUND_DURING_HOLD` otherwise.
+- **Pause --drain (W3.19):** between the drain's `action_ended_at` and the
+  next action's start, the in-flight story step may complete (`step.done`
+  allowed) but no dispatch event may fire (next story parked) —
+  `O16_DRAIN_DISPATCHED_NEXT_STORY` otherwise; the no-wedge guarantee is the
+  resume/completion check (`O16_RESUME_RUN_NOT_COMPLETED` when the run row is
+  not `completed` after resume).
+- **Cancel (W3.20):** every `cancel` action must land a `run.canceled`
+  terminal event with `ts >= action_started_at` (CNEV) —
+  `O16_CANCEL_TERMINAL_EVENT_MISSING` otherwise.
+- **Fail --force resume (W3.21):** after `fail_force` → `resume`, the terminal
+  database must show the SAME run row `completed`; a completed run under a
+  DIFFERENT id is the resumeWorkflow-reuses-run-id trap —
+  `O16_RESUME_NEW_RUN_ID`.
+- **Restart recovery (W3.22):** every `restart_daemon` recovery observation
+  must report `recovered`, `recovery_within_dispatch_intervals`, and
+  `token_flush_preserved` all true (DC8) — `O16_RESTART_RECOVERY_EXCEEDED` /
+  `O16_RESTART_RECOVERY_MISSING` otherwise.
+- A probe sequence with no lifecycle op is `NOT_EVALUABLE` (nothing to judge);
+  malformed probe evidence is an oracle `ERROR` (fail-closed). The
+  interpretation is documented in `oracles/CONTRACT.md` (incl. the note that
+  spec 03's separate 'held-out acceptance probes' O16 definition is out of
+  scope for E3.C). Mutation fixtures live in
+  `oracles/self-test/generate-o16-fixtures.mjs` + `o16.test.mjs` (clean
+  evidence PASSes; each violation FAILs with its finding id), exercised by
+  `oracles/self-test/run.sh` and `bin/tt-controller.test.sh`.
+
+**O4 claim & dispatch hygiene oracle (E3.C US-010).** `oracles/O4` is the
+executable sweep-hygiene oracle implementing spec 03's O4 — the W3.0x
+manifests that declare O4 (all T1 matrix cells, both marathons, and the five
+lifecycle cases) stop producing `ORACLE_MISSING` and the sweep-level hygiene
+assertions become mechanical. Its three required evidence legs are
+`database_snapshot` (steps/stories/story_abandonments/runs), `run_events`
+(corroboration), and `chaos_log` (the bundle of tt-chaos structured entries +
+the process recorder's 5s samples — the snapshot appends `var/recorder/
+samples-*.jsonl` to the captured chaos log under a `# recorder-samples`
+marker). The six judgment dimensions, each with its violation finding:
+
+- **Dead claim_pgid** — every `running` step with `claim_pgid > 0` is probed
+  with `kill(-pgid, 0)` exactly like the product's liveness watchdog; a dead
+  pgid whose claim is older than one sweep interval (15s dispatch tick) is
+  `O4_DEAD_CLAIM_PGID` (the sweep should have requeued it).
+- **Dangling claim after NO_WORK** — a step released by a `no_work_release`
+  abandonment must not still be claimed at snapshot time
+  (`O4_DANGLING_CLAIM_AFTER_NO_WORK`); a re-claim with `claim_updated_at`
+  AFTER the release is legitimate.
+- **retry_count <= max_retries** — non-terminal steps/stories only
+  (`O4_RETRY_BUDGET_EXCEEDED`); a *failed* row may carry
+  `max_retries+1` because the product fails at the exhaustion point.
+- **Reroute counters within budget** — `reroute_count > 2` (the source
+  default `max_reroutes`) is `O4_REROUTE_BUDGET_EXCEEDED`;
+  `terminal_reroute_count` is deliberately not judged (designed independent
+  terminal allowance).
+- **Abandonment boundary matches source** — `ABANDON_STORY_MAX = 8` (a story
+  fails on the 9th; only failed stories may carry `> 8`) and
+  `MAX_ABANDON_RESETS = 5` for single steps — a non-failed row beyond its
+  boundary is `O4_ABANDON_BUDGET_EXCEEDED`.
+- **Watchdog false-positive check** — zero `[liveness-detected]` recoveries
+  (`story_abandonments.reason = 'liveness_detected'`) for workers provably
+  alive (>= 2 consecutive recorder samples of the run's worker within 120s
+  before the recovery), cross-referenced with the chaos log: a
+  `kill-harness`/`fired` entry explains the loss; kill-and-PID-reuse inside
+  one window is INCONCLUSIVE → `NOT_EVALUABLE` (scope `watchdog-pid-reuse`);
+  a provably-alive worker with no chaos kill is `O4_WATCHDOG_FALSE_POSITIVE`.
+
+The interpretation (incl. the **Tier-1 scope decision: O4 is IMPLEMENTED, not
+removed** — spec 03 lists it in the in-campaign gating set) is documented in
+`oracles/CONTRACT.md`. Mutation fixtures live in
+`oracles/self-test/generate-o4-fixtures.mjs` + `o4.test.mjs` (clean state
+PASSes — including a *live* claim_pgid probed via a detached sleep — and each
+hygiene violation FAILs with its finding id; chaos-explained and pid-reuse
+fixtures cover the watchdog cross-reference), exercised by
+`oracles/self-test/run.sh` and `bin/tt-controller.test.sh`.
+
+**Zero-token scripted proof battery (E3.C US-011).** `self-tests/
+tier1-scripted-probe-battery.test.ts` (a HEAVY_CAMPAIGN_TEST, registered
+lock-step in `self-tests/run.sh`, `bin/verify-heavy-campaign-tests.test.sh`,
+and `self-tests/e2e-golden-integrity.test.ts`) proves the ENTIRE E3.C
+machinery end-to-end against the 53xx scripted daemon with ZERO real tokens.
+It builds scripted manifest copies under gitignored `var/`
+(tier1-zero-real-launch-infra copy-transform): W3.17b + W3.18–W3.22 become
+`harness: scripted-pi/scripted-hermes` with `context.execution_mode
+'scripted'` and SHORTENED holds (600s → 5s) so the battery stays fast; the
+`probe_sequence` + `chaos` blocks are KEPT. W3.19's drain is ADAPTED to a
+plain single (non-loop) step: the as-declared `pause_drain @
+step:developer:running -> resume @ now` cannot complete against the current
+product — `workflow pause --drain` on the verify_each implement loop never
+finalizes (the loop step stays 'running' awaiting the parked verify step, so
+`finalizeDrainingPause` is never reached and the run stays status 'running'),
+and `workflow resume` refuses a 'running' (draining) run ("only paused or
+failed runs can be resumed"). `finalizeDrainingPause` runs only on the
+plain-single-step success path (and on run completion / retry / failure) —
+the verify_each verify step also bypasses it (its success routes through
+`handleVerifyEachCompletion` → `advancePipeline`'s 'advanced' branch, which
+never calls it). The scripted copy drains the TEST step instead (`pause_drain
+@ step:tester:running`, `resume @ event:run.paused` — the drain-FINALIZATION
+event, since a step-status marker races the finalize: the step flips 'done' a
+few ms before the run flips 'paused', and resume on a still-'running' run is
+refused): the drain genuinely parks the in-flight tester, finalizes the run
+to 'paused', and the resume is accepted — a documented product-limitation
+adaptation, not a weakening. **W3.21 surfaces a PRODUCT DEFECT FINDING**:
+`workflow fail --force` CANCELS every waiting/pending/running step
+(`forceFailRun`), while `resumeWorkflow` only resets steps whose status is
+'failed' — so after a force-fail there is no failed step to reset:
+`advancePipeline` vacuous-completes the run, the daemon registration is
+refused ("Run is terminal: completed"), the resume CLI exits 1, and the run
+is reverted to 'failed'. The scripted battery asserts the resulting
+TEST_INFRA_FAIL (probe-action-failed) as the EXPECTED outcome — the probe
+machinery executed both actions with evidence and mechanically surfaced the
+product defect; the resumeWorkflow-reuses-run-id semantics are pinned by
+O16's mutation fixtures (o16-green-resume / o16-resume-new-run-id).
+Each case is driven through `tt-controller` against the scripted daemon with
+a full-pipeline behaviors file (planner emits STORIES_JSON, setup creates a
+per-worktree unique feature branch, the developer writes+commits a marker
+with a long sleep so probe markers fire mid-round, the tester reports
+TESTED_TREE, the merger runs the real `tamandua merge-branch` plumbing), and
+asserted per case: probe actions executed (probe_evidence present), O16
+verdict emitted on the scripted fixture (PASS for W3.18–W3.22,
+NOT_EVALUABLE for the chaos-only W3.17b), zero tokens observed. The battery
+also fixed three REAL product-facing bugs the scripted proof exposed:
+`fail_force`'s probe argv was missing `--reason` (the CLI requires it — the
+probe would have exited 1 on a real instance); `tt-chaos`'s phase-marker
+polling queried the runs table by a `run_id` column + `run-` prefixed id the
+product DB does not have (the marker could never fire against a real
+contained instance — it now probes both run-id spellings and both `id`/
+`run_id` column names, and `event:` markers read the event-stream files since
+the product has no events table); and `tt-chaos`'s harness-provenance check
+required `torture-test/var` in the process cmdline, which no real harness
+process has (the work prompt carries the run id but no var path — it now
+accepts cwd-under-var + cmdline-carries-run-id, the same provenance the
+finder enforces). `self-tests/tier1-oracle-hygiene.test.ts` pins the
+declared-oracle hygiene invariant: every oracle id declared in ANY
+`cases/*.jsonl` resolves to an executable regular non-symlink file under
+`torture-test/oracles/` — no declared-but-missing oracle may ever remain
+(campaign #7's O16/O4 defect class).
+
 ### Wave 3 — Token-saver Paired Launch (`context.token_saver_control`, S12 controller)
 
 W3.23-token-saver (spec 07-wave-3 §W3.23) is the token-saver lifecycle
