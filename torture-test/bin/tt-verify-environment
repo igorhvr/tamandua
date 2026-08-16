@@ -26,7 +26,8 @@ W0.0 assumption gate — mechanical environment verification for the tamandua to
 Options:
   --fast     Skip toolchain build+test probes (~30s wave-boundary subset)
   --json     Machine-readable JSON output to stdout (suppresses table)
-  --spend    Run live harness auth probes (pi/hermes 1-prompt); skipped otherwise
+  --spend    Run live harness auth probes (pi/hermes 1-prompt); dsh presence is
+             always recorded (TAMANDUA_DSH_BINARY first, then PATH), never installed
   --help     Print this usage and exit
 
 Output:
@@ -80,7 +81,8 @@ const hostProfile = {
   ports: null,              // { [port]: 'free' | 'in-use-by-TT' | 'in-use-by-other' } (US-005)
   diskHeadroom: null,        // { availableBytes, available, thresholdBytes, threshold } (US-006)
   toolchains: null,           // { 'java+maven': {...}, 'rust/cargo': {...}, go: {...}, python3: {...}, node: {...} } (US-007)
-  harness: null,              // { pi: { authenticated, sessionId?, inputTokens?, outputTokens? }, hermes: { authenticated, sessionId?, inputTokens?, outputTokens? } } (US-010)
+  harness: null,              // { pi: { authenticated, sessionId?, inputTokens?, outputTokens? }, hermes: {...}, dsh: { present, authenticated, skipReason } } (US-010 + Tier-2 dsh lane)
+  capabilities: null,         // { 'node-runtimes-2': boolean } (US-011 — Boolean-leaf capability names per the E2.2 canonical contract)
   // Populated by US-011:
   // spawnSpeedClass: null,
 };
@@ -114,6 +116,9 @@ function recordHostProfile(section, key, value) {
   } else if (section === 'harness') {
     hostProfile.harness = hostProfile.harness || {};
     hostProfile.harness[key] = value;
+  } else if (section === 'capabilities') {
+    hostProfile.capabilities = hostProfile.capabilities || {};
+    hostProfile.capabilities[key] = value;
   } else if (section === 'spawnSpeedClass') {
     hostProfile.spawnSpeedClass = hostProfile.spawnSpeedClass || {};
     hostProfile.spawnSpeedClass[key] = value;
@@ -179,6 +184,13 @@ registerCheck('node-version', 'Node.js >= 22', 'REQUIRED', 'platform', async () 
   const minor = parseInt(parts[1], 10);
   const patch = parseInt(parts[2], 10);
 
+  // Discover ADDITIONAL node runtimes (volta image dirs / nvm version dirs)
+  // and record them FIRST so the CURRENT runtime stays the LAST nodeRuntimes
+  // entry (the node-sqlite check below fills the current runtime's
+  // sqliteAvailable by index). This is the W4.23 >=2-runtimes predicate
+  // source (US-011 section H).
+  discoverAdditionalNodeRuntimes(process.execPath);
+
   // Record in host profile accumulator (US-002) — always record,
   // even on failure, so the profile accurately describes the host
   hostProfile.nodeRuntimes.push({
@@ -188,6 +200,12 @@ registerCheck('node-version', 'Node.js >= 22', 'REQUIRED', 'platform', async () 
     patch,
     sqliteAvailable: null, // filled in by node-sqlite check below
   });
+
+  // Record the >=2-runtimes capability as a Boolean leaf (E2.2 canonical
+  // contract): requires.capabilities ["node-runtimes-2"] resolves against
+  // profile.capabilities["node-runtimes-2"] in tt-controller's
+  // observedCapability fall-through.
+  recordHostProfile('capabilities', 'node-runtimes-2', hostProfile.nodeRuntimes.length >= 2);
 
   if (major >= 22) {
     return {
@@ -204,6 +222,82 @@ registerCheck('node-version', 'Node.js >= 22', 'REQUIRED', 'platform', async () 
     skipReason: null,
   };
 });
+
+// Discover additional node runtimes the host can run (volta image node dirs,
+// nvm version node dirs). The current runtime (process.execPath) is skipped —
+// it is recorded by the node-version check itself (its sqliteAvailable is
+// filled by the node-sqlite check). Each additional runtime is recorded with
+// its own sqlite probe so the profile describes the host truthfully. Zero
+// installs, zero mutations — pure discovery (spec 01 W0.0 RECORDS, never
+// installs).
+function discoverAdditionalNodeRuntimes(currentExecPath) {
+  let currentReal = null;
+  try {
+    currentReal = fs.realpathSync(currentExecPath);
+  } catch {
+    currentReal = currentExecPath;
+  }
+  const seen = new Set([currentReal]);
+  const candidates = [];
+  const addCandidate = (bin) => {
+    if (typeof bin !== 'string' || bin.length === 0) return;
+    let real;
+    try {
+      real = fs.realpathSync(bin);
+    } catch {
+      return; // dangling or inaccessible — not a runnable runtime
+    }
+    if (seen.has(real)) return;
+    seen.add(real);
+    candidates.push(real);
+  };
+  const home = os.homedir();
+  // Volta image node dirs: ~/.volta/tools/image/node/<version>/bin/node.
+  const voltaHome = process.env.VOLTA_HOME || path.join(home, '.volta');
+  try {
+    const imageRoot = path.join(voltaHome, 'tools', 'image', 'node');
+    for (const entry of fs.readdirSync(imageRoot, { withFileTypes: true })) {
+      if (entry.isDirectory()) addCandidate(path.join(imageRoot, entry.name, 'bin', 'node'));
+    }
+  } catch {
+    /* no volta image dir */
+  }
+  // nvm version dirs: ~/.nvm/versions/node/<version>/bin/node.
+  try {
+    const nvmRoot = path.join(home, '.nvm', 'versions', 'node');
+    for (const entry of fs.readdirSync(nvmRoot, { withFileTypes: true })) {
+      if (entry.isDirectory()) addCandidate(path.join(nvmRoot, entry.name, 'bin', 'node'));
+    }
+  } catch {
+    /* no nvm dir */
+  }
+  for (const bin of candidates) {
+    const probe = spawnSync(bin, ['-e', 'process.stdout.write(process.version)'], {
+      encoding: 'utf8',
+      timeout: 15000,
+    });
+    if (probe.status !== 0) continue; // not runnable — record nothing
+    const runtimeVersion = String(probe.stdout ?? '').trim();
+    if (runtimeVersion === process.version) continue; // same version as the current runtime — the current entry covers it
+    // Dedupe by version: node-runtimes-2 counts DISTINCT node versions (the
+    // W4.23 daemon-cross-runtime corridor is about cross-VERSION drift).
+    if (hostProfile.nodeRuntimes.some((runtime) => runtime.version === runtimeVersion)) continue;
+    const runtimeParts = runtimeVersion.replace(/^v/, '').split('.');
+    const runtimeMajor = parseInt(runtimeParts[0], 10);
+    const runtimeMinor = parseInt(runtimeParts[1], 10);
+    const runtimePatch = parseInt(runtimeParts[2], 10);
+    const sqliteProbe = spawnSync(bin,
+      ['-e', 'import("node:sqlite").then(() => process.exit(0)).catch(() => process.exit(1))'],
+      { encoding: 'utf8', timeout: 15000 });
+    hostProfile.nodeRuntimes.push({
+      version: runtimeVersion,
+      major: runtimeMajor,
+      minor: runtimeMinor,
+      patch: runtimePatch,
+      sqliteAvailable: sqliteProbe.status === 0,
+    });
+  }
+}
 
 // --- node:sqlite loading ---
 registerCheck('node-sqlite', 'node:sqlite loads without error', 'REQUIRED', 'platform', async () => {
@@ -320,6 +414,27 @@ function binaryOnPath(name) {
   } catch (_) {
     return false;
   }
+}
+
+/**
+ * Resolve a harness binary honoring the TAMANDUA_<NAME>_BINARY env override
+ * first, then PATH discovery (mirrors tt-harness-auth-probe's resolver
+ * precedence). An env override that is set but NOT executable fails closed to
+ * absent (no PATH fallback — the same invalid_env_binary path the real
+ * resolver uses). Returns the absolute path string or null.
+ */
+function resolveHarnessBinary(name, envVar) {
+  const envBin = process.env[envVar];
+  if (typeof envBin === 'string' && envBin.trim() !== '') {
+    try {
+      fs.accessSync(envBin.trim(), fs.constants.X_OK);
+      return envBin.trim();
+    } catch (_) {
+      return null;
+    }
+  }
+  const onPath = binaryOnPath(name);
+  return onPath || null;
 }
 
 /**
@@ -1458,11 +1573,42 @@ registerCheck('harness-hermes', 'hermes harness authenticated (1-prompt probe)',
   }
 });
 
+registerCheck('harness-dsh', 'dsh harness presence probe (Tier-2 dsh lane)', 'REQUIRED', 'harness', async () => {
+  // Record mechanical presence per the canonical contract (
+  // harness.<name>.present) regardless of --spend: spec 01's carve-out
+  // extends to the operator-directed Tier-2 dsh lane — W0.0 RECORDS
+  // presence, never installs, and never writes under ~/.dsh. Binary
+  // resolution honors TAMANDUA_DSH_BINARY first, then PATH discovery
+  // (mirrors the real resolver precedence: env override wins; a set but
+  // non-executable override fails closed to absent, no PATH fallback).
+  const dshPath = resolveHarnessBinary('dsh', 'TAMANDUA_DSH_BINARY');
+  const present = dshPath !== null;
+  if (!OPT.spend) {
+    recordHostProfile('harness', 'dsh', { present, authenticated: null, skipReason: 'requires --spend' });
+    return {
+      result: 'SKIPPED',
+      evidence: 'Harness auth probe requires --spend flag',
+      remedy: null,
+      skipReason: 'requires --spend',
+    };
+  }
+
+  // --spend: dsh's live ANSWER leg is alpha-deferred (documented in the
+  // Tier-2 dsh lane); the presence leaf is already recorded above and the
+  // shape mirrors pi/hermes (authenticated + skipReason beside present).
+  recordHostProfile('harness', 'dsh', { present, authenticated: null, skipReason: 'dsh auth answer probe deferred (alpha)' });
+  return {
+    result: 'SKIPPED',
+    evidence: 'dsh auth answer probe deferred (alpha); presence recorded',
+    remedy: null,
+    skipReason: 'dsh auth answer probe deferred (alpha)',
+  };
+});
+
 // ── Test hook: synthetic REQUIRED failure (US-012) ────────────────────
 // Hidden flag --test-required-fail injects a synthetic REQUIRED check
 // that always fails, so self-tests can verify non-zero exit code behavior
 // without depending on the host environment.
-
 if (OPT.testRequiredFail) {
   registerCheck('test-required-fail', 'Synthetic REQUIRED failure (test hook)', 'REQUIRED', 'system', async () => ({
     result: 'FAIL',
@@ -1550,6 +1696,7 @@ function writeProfileFiles(results, exitCode) {
     platform: hostProfile.platform,
     containment: hostProfile.containment,
     toolchains: hostProfile.toolchains,
+    capabilities: hostProfile.capabilities,
     nodeRuntimes: hostProfile.nodeRuntimes,
     npmVersion: hostProfile.npmVersion,
     spawnSpeedClass: hostProfile.spawnSpeedClass,

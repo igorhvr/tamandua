@@ -1,0 +1,10 @@
+{
+  "agents": {
+    "doer": {
+      "output": "STATUS: done\nREPORT: W4.12 port-squatter choreography exercised end-to-end (no workflow runs launched)",
+      "tokens": 0
+    }
+  },
+  "heartbeatTokens": 0,
+  "defaultTokens": 0
+}

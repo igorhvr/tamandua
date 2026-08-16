@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 
 import { OUTCOMES } from './tt-classification.mjs';
 
-const REAL_HARNESSES = new Set(['pi', 'hermes']);
+const REAL_HARNESSES = new Set(['pi', 'hermes', 'dsh']);
 
 function clone(value) {
   return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
@@ -78,19 +78,19 @@ function isRealMode(state) {
   return (state?.options?.execution_selection ?? 'all') === 'all';
 }
 
-// When an include-real campaign was requested, >0 real (pi/hermes) cases exist
-// in the manifest, and yet zero real cases actually launched (every real case is
-// terminal without any execution round — predicate-blocked or otherwise
-// skipped), return a human-readable cause string. Otherwise return null. This is
-// the fail-closed guard against a vacuous GREEN for a real campaign that ran
-// nothing.
+// When an include-real campaign was requested, >0 real (pi/hermes/dsh) cases
+// exist in the manifest, and yet zero real cases actually launched (every real
+// case is terminal without any execution round — predicate-blocked or
+// otherwise skipped), return a human-readable cause string. Otherwise return
+// null. This is the fail-closed guard against a vacuous GREEN for a real
+// campaign that ran nothing.
 export function zeroRealLaunchesCause(state) {
   if (!isRealMode(state)) return null;
   const realCases = (state?.cases ?? []).filter((item) => isRealHarness(item.harness));
   if (realCases.length === 0) return null;
   const realLaunched = realCases.filter((item) => (item.attempts ?? []).length > 0).length;
   if (realLaunched > 0) return null;
-  return `include-real requested but zero real cases launched (${realCases.length} real pi/hermes cases in manifest, execution_selection=all, but no real launch recorded)`;
+  return `include-real requested but zero real cases launched (${realCases.length} real pi/hermes/dsh cases in manifest, execution_selection=all, but no real launch recorded)`;
 }
 
 export function verdictExitCode(state) {

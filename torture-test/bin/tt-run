@@ -39,7 +39,17 @@ tier_available() {
         && "$TT_BIN_DIR/tt-controller" --manifest "$TT_DIR/cases/tier1.jsonl" --validate-only >/dev/null 2>&1 \
         && "$TT_BIN_DIR/tt-tier1-assets" "$TT_DIR/cases/tier1.jsonl" >/dev/null 2>&1
       ;;
-    tier2) return 1 ;;
+    tier2)
+      # US-015: the --tier2 ladder rung. Availability mirrors tier1 (controller
+      # validate-only + the tier2 asset validator + the manifest exists); the
+      # tier2 asset validator additionally pins seed-vs-SEEDS.md (E3.A S2) and
+      # requires.capabilities well-formedness incl. dsh.
+      [ -x "$TT_BIN_DIR/tt-controller" ] \
+        && [ -x "$TT_BIN_DIR/tt-tier2-assets" ] \
+        && [ -f "$TT_DIR/cases/tier2.jsonl" ] \
+        && "$TT_BIN_DIR/tt-controller" --manifest "$TT_DIR/cases/tier2.jsonl" --validate-only >/dev/null 2>&1 \
+        && "$TT_BIN_DIR/tt-tier2-assets" "$TT_DIR/cases/tier2.jsonl" >/dev/null 2>&1
+      ;;
     *) return 1 ;;
   esac
 }
@@ -65,7 +75,7 @@ usage() {
   cat <<EOF
 run-torture-test — tamandua torture-test suite (spec: torture-test/tamandua-torture-test-spec/)
 
-Usage: run-torture-test [--smoke | --tier0 [--include-real] | --tier1 | --tier2 | --report | --help]
+Usage: run-torture-test [--smoke | --tier0 [--include-real] | --tier1 [--include-real] | --tier2 [--include-real] | --report | --help]
 
 Tiers (explicit flag = run immediately, no countdown):
 EOF
@@ -88,9 +98,11 @@ EOF
   --tier0 --include-real includes both real canaries.
   --tier1 reports + validates Tier-1 cases as pending-real (zero tokens).
   --tier1 --include-real executes the full Tier-1 campaign.
+  --tier2 reports + validates Tier-2 cases as pending-real (zero tokens).
+  --tier2 --include-real executes the full Tier-2 campaign.
   --case <id>  Run exactly ONE manifest case id (focused rerun).
-               Combine with --tier0/--tier1 and optionally --include-real.
-  WARNING: --include-real launches real pi and Hermes work and spends real tokens.
+               Combine with --tier0/--tier1/--tier2 and optionally --include-real.
+  WARNING: --include-real launches real pi, Hermes, and dsh work and spends real tokens.
 
 Bare invocation (no flags): after a 32s countdown, runs the most
 comprehensive available tier. Ctrl-C during the countdown cancels.
@@ -139,6 +151,14 @@ run_tier() {
       exec "$TT_BIN_DIR/tt-controller" --manifest "$manifest" "${case_args[@]}" --scripted-only
       ;;
     tier1)
+      if [ "$include_real" = true ]; then
+        exec "$TT_BIN_DIR/tt-controller" --manifest "$manifest" "${case_args[@]}"
+      fi
+      exec "$TT_BIN_DIR/tt-controller" --manifest "$manifest" "${case_args[@]}" --scripted-only
+      ;;
+    tier2)
+      # US-015: identical tier1 contract — bare = scripted-only + real cases
+      # pending-real (zero tokens); --include-real = full Tier-2 campaign.
       if [ "$include_real" = true ]; then
         exec "$TT_BIN_DIR/tt-controller" --manifest "$manifest" "${case_args[@]}"
       fi
@@ -252,8 +272,8 @@ if [ -z "$tier" ]; then
   exit 4
 fi
 
-if [ "$include_real" = "true" ] && [ "$tier" != "--tier0" ] && [ "$tier" != "--tier1" ]; then
-  echo "--include-real is only valid with --tier0 or --tier1" >&2
+if [ "$include_real" = "true" ] && [ "$tier" != "--tier0" ] && [ "$tier" != "--tier1" ] && [ "$tier" != "--tier2" ]; then
+  echo "--include-real is only valid with --tier0, --tier1, or --tier2" >&2
   usage >&2
   exit 4
 fi

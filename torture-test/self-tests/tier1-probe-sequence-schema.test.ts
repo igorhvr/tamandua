@@ -131,7 +131,7 @@ describe("E3.C US-001 — probe_sequence + typed chaos schema contract", () => {
     }
   });
 
-  it("chaos is tightened to the typed W3.17b block shape (still nullable)", () => {
+  it("chaos is the typed W3.17b block shape extended with kill/delete actions (US-003, still nullable)", () => {
     const schema = readSchema();
     const chaos = schema.properties.chaos;
     assert.ok(chaos, "schema must keep the top-level chaos property");
@@ -144,12 +144,27 @@ describe("E3.C US-001 — probe_sequence + typed chaos schema contract", () => {
     const block = schema.$defs.chaosBlock;
     assert.ok(block, "schema must define $defs.chaosBlock");
     assert.equal(block.additionalProperties, false, "chaosBlock must forbid unknown properties");
-    assert.deepEqual(block.required, ["type", "target", "trigger", "hold_seconds", "operator"], "chaosBlock must require the W3.17b five fields");
-    assert.deepEqual(block.properties.type.enum, ["sigstop_sigcont"], "chaos type must be enum [sigstop_sigcont]");
-    assert.deepEqual(block.properties.target.enum, ["harness_process"], "chaos target must be enum [harness_process]");
+    // US-003: hold_seconds is no longer universally required (it is
+    // sigstop_sigcont-only); the per-type target/param constraints live in
+    // the controller's semantic validator, which stays fail-closed.
+    assert.deepEqual(block.required, ["type", "target", "trigger", "operator"], "chaosBlock must require type/target/trigger/operator (hold_seconds is per-type)");
+    assert.deepEqual(
+      block.properties.type.enum,
+      ["sigstop_sigcont", "kill-harness", "kill-daemon", "delete-tstx-row"],
+      "chaos type must be the four-action enum (sigstop + US-003 kill/delete)",
+    );
+    assert.deepEqual(
+      block.properties.target.enum,
+      ["harness_process", "daemon_process", "tstx_row"],
+      "chaos target must be the per-type target enum",
+    );
     assert.equal(block.properties.trigger.type, "string", "chaos trigger must be a string");
     assert.equal(block.properties.hold_seconds.type, "number", "chaos hold_seconds must be typed number");
     assert.equal(block.properties.hold_seconds.exclusiveMinimum, 0, "chaos hold_seconds must be > 0");
+    // US-003: kill actions take an optional signal (default SIGKILL).
+    assert.ok(Array.isArray(block.properties.signal?.enum), "chaos signal must be an enum");
+    assert.ok(block.properties.signal.enum.includes("SIGKILL"), "chaos signal enum must include SIGKILL");
+    assert.equal(block.properties.tree.type, "string", "chaos tree must be typed string (delete-tstx-row)");
     assert.deepEqual(block.properties.operator.enum, ["tt-chaos"], "chaos operator must be enum [tt-chaos]");
   });
 

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# tt-harness-auth-probe — cheap preflight harness-auth probe (E2.6 US-005).
+# tt-harness-auth-probe — cheap preflight harness-auth probe (E2.6 US-005;
+# Tier-2 dsh lane US-002).
 #
-# For each requested harness (pi, hermes) — or, when none is named, each
+# For each requested harness (pi, hermes, dsh) — or, when none is named, each
 # real-case harness enumerated from the tier manifests — verify that the
 # CONTAINED TT home's surfaced harness auth can actually resolve a model +
 # API key and answer, WITHOUT starting the real contained daemon and WITHOUT
@@ -20,17 +21,26 @@
 #                  contained TT home (pi: settings/models/auth.json under
 #                  .pi/agent/; hermes: config.yaml + auth.json under
 #                  .hermes/). A missing file means surfacing never happened.
+#                  dsh (Tier-2 lane, US-002): presence is BINARY-only —
+#                  TAMANDUA_DSH_BINARY, else PATH `command -v dsh`; dsh
+#                  config is operator-directed (~/.dsh) and never surfaced
+#                  into the contained home. Record-only: never installs,
+#                  never writes under ~/.dsh.
 #   2. ANSWER    — invoke the harness binary under the contained spawn env
 #                  with a trivial one-shot prompt. A non-zero exit (e.g. pi's
 #                  `No API key found for the selected model`, hermes's
 #                  missing-credential failure) fails closed. This is the
 #                  zero/near-zero-token "can actually answer" check: the
 #                  failure path never reaches the model (zero tokens); the
-#                  success path is a single tiny completion.
+#                  success path is a single tiny completion. dsh's answer leg
+#                  is ALPHA and SKIPPED unless --spend (a zero-token
+#                  `--dump-default-config` self-check — never a model
+#                  invocation).
 #
 # Fail-closed (non-zero exit + DISTINCT machine-parseable REASON on stderr):
 #   harness-auth-missing: pi       pi auth/config absent OR cannot answer
 #   harness-auth-missing: hermes   hermes auth/config absent OR cannot answer
+#   harness-auth-missing: dsh      dsh binary absent (fail-closed presence)
 #   manifest-unreadable: <name>    a required manifest cannot be read
 #   manifest-invalid: <name>: line <n>  a manifest line is not valid JSON
 #
@@ -41,6 +51,7 @@
 #   TAMANDUA_PI_BINARY      override the pi binary (mirrors the real harness
 #                           resolver precedence)
 #   TAMANDUA_HERMES_BINARY  override the hermes binary
+#   TAMANDUA_DSH_BINARY     override the dsh binary (Tier-2 dsh lane)
 #
 # Idempotent: the probe only READS the contained home and invokes the harness
 # one-shot; it never writes state and never starts a daemon.
@@ -85,9 +96,11 @@ resolve_contained_tt_home() {
 }
 
 # resolve_harness_binary: print the absolute path of the harness binary for
-# <harness>, mirroring the real pi/hermes resolver precedence:
+# <harness>, mirroring the real pi/hermes/dsh resolver precedence:
 #   pi:     TAMANDUA_PI_BINARY (executable) → PATH lookup `pi`
 #   hermes: TAMANDUA_HERMES_BINARY (executable) → PATH lookup `hermes`
+#   dsh:    TAMANDUA_DSH_BINARY (executable) → PATH lookup `dsh` (Tier-2
+#           dsh lane — US-002: presence is binary-only, record-only)
 # Prints nothing (empty) when no usable binary is found — the caller fails
 # closed with harness-auth-missing.
 resolve_harness_binary() {
@@ -96,6 +109,9 @@ resolve_harness_binary() {
   if [ "$harness" = "pi" ]; then
     env_bin="${TAMANDUA_PI_BINARY:-}"
     resolved="$(command -v pi 2>/dev/null || true)"
+  elif [ "$harness" = "dsh" ]; then
+    env_bin="${TAMANDUA_DSH_BINARY:-}"
+    resolved="$(command -v dsh 2>/dev/null || true)"
   else
     env_bin="${TAMANDUA_HERMES_BINARY:-}"
     resolved="$(command -v hermes 2>/dev/null || true)"
@@ -114,10 +130,16 @@ resolve_harness_binary() {
 # present_files_for: the enumerated minimal surfaced files a harness requires
 # in the contained home (US-004). A missing file means surfacing never
 # happened (or was stripped) — a fail-closed presence leg.
+# dsh (Tier-2 lane, US-002) has NO enumerated surfaced files: the home-provision
+# leg never surfaces dsh config into the contained home — dsh is operator-
+# directed and reads the operator's ~/.dsh as-is. Presence is the BINARY only
+# (resolve_harness_binary), so the enumeration is empty for dsh.
 present_files_for() {
   local harness="$1"
   if [ "$harness" = "pi" ]; then
     printf '.pi/agent/settings.json\n.pi/agent/models.json\n.pi/agent/auth.json\n'
+  elif [ "$harness" = "dsh" ]; then
+    printf ''
   else
     printf '.hermes/config.yaml\n.hermes/auth.json\n'
   fi
@@ -127,6 +149,9 @@ present_files_for() {
 # spawn env. Returns the harness's exit code (captured by the caller).
 # The prompt is a single trivial completion — near-zero tokens on success,
 # zero tokens on the fail-fast auth-missing path.
+# dsh's answer leg is ALPHA (Tier-2 dsh lane) and runs ONLY under --spend: it
+# is a zero-token `--dump-default-config` self-check (never a model
+# invocation) proving the binary executes and the profile system composes.
 run_answer_check() {
   local harness="$1" home="$2" bin="$3"
   local prompt="Reply with the single word OK and nothing else."
@@ -134,6 +159,11 @@ run_answer_check() {
   if [ "$harness" = "pi" ]; then
     _run_contained "$home" "$bin" \
       --print --no-tools --no-session --no-context-files "$prompt"
+  elif [ "$harness" = "dsh" ]; then
+    # dsh is operator-directed (reads the operator's ~/.dsh), so the alpha
+    # answer leg runs under the CURRENT env, not the contained home; it never
+    # writes and never invokes a model.
+    "$bin" --dump-default-config
   else
     _run_contained "$home" "$bin" -z "$prompt"
   fi
@@ -170,6 +200,8 @@ probe_harness() {
   bin="$(resolve_harness_binary "$harness")"
 
   # ── leg 1: presence (enumerated minimal surfaced files) ──
+  # dsh (Tier-2 lane, US-002) enumerates nothing — its presence leg is the
+  # BINARY (leg 2) — so the loop is a no-op for dsh.
   local missing="" f
   while IFS= read -r f; do
     [ -n "$f" ] || continue
@@ -192,6 +224,14 @@ probe_harness() {
   fi
 
   # ── leg 3: answer check (can actually resolve a model + API key) ──
+  # dsh's answer leg is ALPHA (Tier-2 dsh lane) and SKIPPED by default: the
+  # dsh harness is operator-directed and a live dsh invocation is not yet a
+  # stable near-zero-token corridor. It runs ONLY under --spend (explicit
+  # operator opt-in) — see run_answer_check for the alpha self-check shape.
+  if [ "$harness" = "dsh" ] && [ "${SPEND_ANSWER:-0}" != "1" ]; then
+    log "OK: $harness present (answer leg alpha-skipped; --spend to run)"
+    return 0
+  fi
   local err rc
   err="$(mktemp "${TMPDIR:-/tmp}/tt-harness-auth.XXXXXX")"
   set +e
@@ -205,11 +245,12 @@ probe_harness() {
     return 1
   fi
   rm -f -- "$err"
+  log "OK: $harness can answer"
   return 0
 }
 
 # enumerate_required_harnesses: read the tier manifests and print the DISTINCT
-# real-case harnesses (pi/hermes), one per line, sorted. Mirrors US-002's
+# real-case harnesses (pi/hermes/dsh), one per line, sorted. Mirrors US-002's
 # manifest reading (same fail-closed reasons). Empty set prints nothing.
 enumerate_required_harnesses() {
   local dir="$1"
@@ -243,7 +284,7 @@ for (const name of MANIFEST_NAMES) {
     } catch {
       fail('manifest-invalid: ' + name + ': line ' + (i + 1), name + ': line ' + (i + 1) + ' is not valid JSON');
     }
-    if (record && (record.harness === 'pi' || record.harness === 'hermes')) {
+    if (record && (record.harness === 'pi' || record.harness === 'hermes' || record.harness === 'dsh')) {
       harnesses.add(record.harness);
     }
   }
@@ -257,26 +298,34 @@ NODE
 
 usage() {
   cat <<EOF
-tt-harness-auth-probe — cheap preflight harness-auth probe (E2.6 US-005).
+tt-harness-auth-probe — cheap preflight harness-auth probe (E2.6 US-005; Tier-2 dsh lane US-002).
 
-Usage: tt-harness-auth-probe [--help] [--from-manifest] [pi|hermes ...]
+Usage: tt-harness-auth-probe [--help] [--spend] [--from-manifest] [pi|hermes|dsh ...]
 
-For each requested harness (pi and/or hermes), verify the contained TT home's
-surfaced harness auth can actually resolve a model + API key and answer, via:
+For each requested harness (pi, hermes, and/or dsh), verify the contained TT
+home's surfaced harness auth can actually resolve a model + API key and
+answer, via:
 
-  1. PRESENCE — the enumerated minimal surfaced files exist in the contained
-     home (pi: .pi/agent/{settings.json,models.json,auth.json}; hermes:
-     .hermes/{config.yaml,auth.json}).
-  2. ANSWER   — a trivial one-shot harness invocation under the contained
-     spawn env (near-zero tokens on success; zero tokens on the fail-fast
-     auth-missing path). Never starts the real contained daemon.
+  1. PRESENCE — pi/hermes: the enumerated minimal surfaced files exist in the
+     contained home (pi: .pi/agent/{settings.json,models.json,auth.json};
+     hermes: .hermes/{config.yaml,auth.json}). dsh (Tier-2 lane): presence is
+     BINARY-only (TAMANDUA_DSH_BINARY, else PATH \`command -v dsh\`); dsh
+     config is operator-directed (~/.dsh) and never surfaced into the
+     contained home. Record-only: the probe never installs and never writes
+     under ~/.dsh.
+  2. ANSWER   — pi/hermes: a trivial one-shot harness invocation under the
+     contained spawn env (near-zero tokens on success; zero tokens on the
+     fail-fast auth-missing path). dsh: SKIPPED by default (alpha; documented)
+     — runs ONLY with --spend, as a zero-token \`--dump-default-config\`
+     self-check. Never starts the real contained daemon.
 
 With no harness argument (or --from-manifest), the required harnesses are
-enumerated from the tier manifests (distinct real-case pi/hermes harnesses).
+enumerated from the tier manifests (distinct real-case pi/hermes/dsh harnesses).
 
 Fail-closed reasons (non-zero exit, on stderr):
   harness-auth-missing: pi       pi auth/config absent OR cannot answer
   harness-auth-missing: hermes   hermes auth/config absent OR cannot answer
+  harness-auth-missing: dsh      dsh binary absent (fail-closed presence)
   manifest-unreadable: <name>    a required manifest cannot be read
   manifest-invalid: <name>: line <n>  a manifest line is not valid JSON
 
@@ -285,6 +334,7 @@ Env seams:
   TT_CASES_DIR            override the cases dir for --from-manifest
   TAMANDUA_PI_BINARY      override the pi binary
   TAMANDUA_HERMES_BINARY  override the hermes binary
+  TAMANDUA_DSH_BINARY     override the dsh binary (Tier-2 dsh lane)
 
 Idempotent and read-only: safe to run repeatedly; never writes state, never
 starts a daemon.
@@ -307,7 +357,13 @@ main() {
       --from-manifest)
         from_manifest=1
         ;;
-      pi|hermes)
+      --spend)
+        # dsh's ALPHA answer leg (Tier-2 dsh lane): a zero-token
+        # --dump-default-config self-check, run ONLY on explicit operator
+        # opt-in. pi/hermes answer legs are unaffected (always run).
+        SPEND_ANSWER=1
+        ;;
+      pi|hermes|dsh)
         harnesses+=("$arg")
         ;;
       *)
@@ -348,9 +404,7 @@ main() {
   home="$(resolve_contained_tt_home)"
   local h fail=0
   for h in "${harnesses[@]}"; do
-    if probe_harness "$h" "$home"; then
-      log "OK: $h can answer"
-    else
+    if ! probe_harness "$h" "$home"; then
       fail=1
     fi
   done

@@ -1,0 +1,10 @@
+{
+  "agents": {
+    "doer": {
+      "output": "STATUS: done\nREPORT: W4.27 shim exit-code matrix exercised end-to-end",
+      "tokens": 0
+    }
+  },
+  "heartbeatTokens": 0,
+  "defaultTokens": 0
+}

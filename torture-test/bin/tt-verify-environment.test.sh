@@ -448,6 +448,13 @@ else
   fail "harness-hermes did not show SKIPPED (requires --spend) without --spend"
 fi
 
+# Tier-2 dsh lane: the dsh presence probe also shows SKIPPED without --spend
+if echo "$no_spend_output" | grep -qE "harness-dsh.*\|.*SKIPPED.*\|.*requires --spend"; then
+  pass "harness-dsh shows SKIPPED (requires --spend) without --spend"
+else
+  fail "harness-dsh did not show SKIPPED (requires --spend) without --spend"
+fi
+
 # AC2/AC3: With --spend, pi and hermes probes actually run (PASS or FAIL, not stubs)
 # Note: --spend invokes real pi/hermes and spends a small number of tokens.
 echo ""
@@ -1174,6 +1181,120 @@ if echo "$spend_presence_json" | jq -e '(.hostProfile.harness.hermes.authenticat
   pass "--spend records harness.hermes.authenticated (boolean or null) alongside present"
 else
   fail "--spend harness.hermes.authenticated not recorded or wrong type"
+fi
+
+# ── Test 15: Tier-2 dsh harness presence recording (T2 US-001) ────────
+echo ""
+echo "--- Test: dsh harness presence recording (Tier-2 dsh lane) ---"
+
+# AC: host-profile.json records harness.dsh.present as a Boolean leaf on the --fast path
+"$TOOL" --fast > /dev/null 2>&1 && : || :
+HP="${SCRIPT_DIR}/../var/w0/host-profile.json"
+if jq -e '.harness.dsh.present | type == "boolean"' "$HP" > /dev/null 2>&1; then
+  pass "host-profile.json .harness.dsh.present is a boolean leaf (no --spend)"
+else
+  fail "host-profile.json .harness.dsh.present missing or not boolean (no --spend)"
+fi
+
+# AC: dsh section retains the pi/hermes section shape (present + authenticated/skipReason)
+if jq -e '.harness.dsh | has("present") and (has("authenticated") or has("skipReason"))' "$HP" > /dev/null 2>&1; then
+  pass "harness.dsh retains section shape (present + authenticated/skipReason)"
+else
+  fail "harness.dsh section shape wrong (present should sit alongside authenticated/skipReason)"
+fi
+
+# AC: TAMANDUA_DSH_BINARY override — an executable override records present=true
+FAKE_BIN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/tt-verify-dsh-fake.XXXXXX")"
+printf '#!/bin/sh\nexit 0\n' > "$FAKE_BIN_DIR/fake-dsh"
+chmod +x "$FAKE_BIN_DIR/fake-dsh"
+TAMANDUA_DSH_BINARY="$FAKE_BIN_DIR/fake-dsh" "$TOOL" --fast --json > /dev/null 2>&1 && : || :
+if jq -e '.harness.dsh.present == true' "$HP" > /dev/null 2>&1; then
+  pass "TAMANDUA_DSH_BINARY executable override records harness.dsh.present=true"
+else
+  fail "TAMANDUA_DSH_BINARY executable override did not record harness.dsh.present=true"
+fi
+
+# AC: a set-but-missing TAMANDUA_DSH_BINARY fails closed to absent (no PATH fallback)
+TAMANDUA_DSH_BINARY="$FAKE_BIN_DIR/does-not-exist" "$TOOL" --fast --json > /dev/null 2>&1 && : || :
+if jq -e '.harness.dsh.present == false' "$HP" > /dev/null 2>&1; then
+  pass "TAMANDUA_DSH_BINARY set-but-missing records harness.dsh.present=false (fail closed)"
+else
+  fail "TAMANDUA_DSH_BINARY set-but-missing did not record harness.dsh.present=false"
+fi
+
+# AC: unset override falls back to PATH discovery
+dsh_on_path=$(command -v dsh >/dev/null 2>&1 && echo true || echo false)
+env -u TAMANDUA_DSH_BINARY "$TOOL" --fast --json > /dev/null 2>&1 && : || :
+dsh_present=$(jq -r '.harness.dsh.present' "$HP")
+if [ "$dsh_present" = "$dsh_on_path" ]; then
+  pass "harness.dsh.present reflects PATH discovery when TAMANDUA_DSH_BINARY unset (${dsh_present})"
+else
+  fail "harness.dsh.present = ${dsh_present}, expected ${dsh_on_path} (PATH discovery)"
+fi
+
+# AC: the dsh probe is RECORD-ONLY — no file created or modified under ~/.dsh,
+# and no binary installed (before/after filesystem snapshot of the real home).
+# The `sessions/` subtree is EXCLUDED: it is the LIVE dsh harness's own state
+# (the process running this very test writes session.jsonl.zstd there), not
+# anything tt-verify-environment could touch — including it would make the
+# assertion flaky. Everything else (profiles, binaries, configs) is covered.
+REAL_DSH_HOME="${HOME}/.dsh"
+snapshot_dsh() {
+  if [ -e "$REAL_DSH_HOME" ]; then
+    (
+      cd "$REAL_DSH_HOME" || exit 0
+      find . -not -path "./sessions" -not -path "./sessions/*" 2>/dev/null | sort
+      find . -type f -not -path "./sessions/*" -exec sha256sum {} \; 2>/dev/null | sort
+    ) || true
+  else
+    echo "__NO_DSH_DIR__"
+  fi
+}
+DSH_BEFORE="$(snapshot_dsh)"
+"$TOOL" --fast > /dev/null 2>&1 && : || :
+DSH_AFTER="$(snapshot_dsh)"
+if [ "$DSH_BEFORE" = "$DSH_AFTER" ]; then
+  pass "dsh probe is record-only: ~/.dsh filesystem snapshot unchanged"
+else
+  fail "dsh probe modified ~/.dsh (before/after snapshot differs)"
+fi
+
+# AC: --spend keeps the dsh presence leaf intact (alpha answer leg stays skipped).
+# Reuses spend_presence_json from Test 14 (--spend --json) — no extra live probe.
+if echo "$spend_presence_json" | jq -e '.hostProfile.harness.dsh.present | type == "boolean"' > /dev/null 2>&1; then
+  pass "--spend leaves harness.dsh.present intact (boolean after --spend)"
+else
+  fail "--spend dropped/overwrote harness.dsh.present"
+fi
+
+rm -rf -- "$FAKE_BIN_DIR"
+
+# ── Test 16: node-runtimes-2 capability recording (T2 US-011) ─────────
+echo ""
+echo "--- Test: node-runtimes-2 capability recording (platform-conditional lanes) ---"
+
+"$TOOL" --fast > /dev/null 2>&1 && : || :
+if jq -e '.capabilities["node-runtimes-2"] | type == "boolean"' "$HP" > /dev/null 2>&1; then
+  pass "host-profile.json .capabilities.node-runtimes-2 is a boolean leaf (no --spend)"
+else
+  fail "host-profile.json .capabilities.node-runtimes-2 missing or not boolean"
+fi
+
+# The leaf must agree with the recorded distinct runtimes: true iff >= 2.
+distinct_runtimes=$(jq '[.nodeRuntimes[].version] | unique | length' "$HP")
+cap_node_runtimes_2=$(jq -r '.capabilities["node-runtimes-2"]' "$HP")
+if { [ "$distinct_runtimes" -ge 2 ] && [ "$cap_node_runtimes_2" = "true" ]; } \
+  || { [ "$distinct_runtimes" -lt 2 ] && [ "$cap_node_runtimes_2" = "false" ]; }; then
+  pass "capabilities.node-runtimes-2 = ${cap_node_runtimes_2} agrees with ${distinct_runtimes} distinct node runtimes"
+else
+  fail "capabilities.node-runtimes-2 = ${cap_node_runtimes_2} disagrees with ${distinct_runtimes} distinct node runtimes"
+fi
+
+# AC: the recorded nodeRuntimes catalog carries per-runtime sqlite leaves.
+if jq -e '[.nodeRuntimes[] | has("sqliteAvailable")] | all' "$HP" > /dev/null 2>&1; then
+  pass "every recorded node runtime carries a sqliteAvailable leaf"
+else
+  fail "a recorded node runtime lacks sqliteAvailable"
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────

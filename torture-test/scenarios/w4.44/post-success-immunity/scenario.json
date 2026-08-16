@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "id": "w4.44-post-success-immunity",
+  "workflow_base": "bug-fix-merge-worktree",
+  "behaviors": "behaviors.json",
+  "command": "run.sh",
+  "expected_outcome": "completed",
+  "oracles": [
+    "O1",
+    "O3z",
+    "O11"
+  ]
+}

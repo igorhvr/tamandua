@@ -1,0 +1,40 @@
+{
+  "agents": {
+    "triager": {
+      "output": "STATUS: done\nSEVERITY: high",
+      "tokens": 0
+    },
+    "investigator": {
+      "output": "STATUS: done\nROOT_CAUSE: resolver corridor",
+      "tokens": 0
+    },
+    "setup": {
+      "commands": [
+        "git checkout -b w441-fix"
+      ],
+      "output": "STATUS: done\nBUILD_CMD: true\nTEST_CMD: true",
+      "tokens": 0
+    },
+    "fixer": {
+      "commands": [
+        "git add value.txt",
+        "git commit -m \"fix: resolver torture\""
+      ],
+      "output": "STATUS: done\nCHANGES: resolver corridor",
+      "tokens": 0
+    },
+    "verifier": {
+      "output": "STATUS: done\nVERIFIED: n/a\nTESTED_TREE: {{gitTree}}",
+      "tokens": 0,
+      "commands": [
+        "{{input.TEST_CMD}}"
+      ]
+    },
+    "merger": {
+      "output": "STATUS: done",
+      "tokens": 0
+    }
+  },
+  "heartbeatTokens": 0,
+  "defaultTokens": 0
+}

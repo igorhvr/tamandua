@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "id": "w4.19-stale-catalog-warn-not-block",
+  "workflow_base": "do-now",
+  "behaviors": "behaviors.json",
+  "command": "run.sh",
+  "expected_outcome": "completed",
+  "oracles": ["O1", "O3z", "O11"]
+}

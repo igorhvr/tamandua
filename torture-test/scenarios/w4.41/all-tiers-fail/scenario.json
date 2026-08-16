@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "id": "w4.41-all-tiers-fail",
+  "workflow_base": "bug-fix-merge-worktree",
+  "behaviors": "behaviors.json",
+  "command": "run.sh",
+  "expected_outcome": "failed",
+  "oracles": [
+    "O1",
+    "O3z",
+    "O11"
+  ]
+}

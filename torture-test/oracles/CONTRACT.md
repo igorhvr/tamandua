@@ -21,9 +21,15 @@ MUST follow it exactly:
   representation that reads toolchains as a flat boolean key
   (e.g. `toolchains.python3 == true`) or otherwise diverges from the
   Boolean-leaf/object shape is permitted here or in any case predicate.
-- `requires.capabilities` entries `pi`/`hermes` map to harness presence
+- `requires.capabilities` entries `pi`/`hermes`/`dsh` map to harness presence
   recorded in the host profile (`harness.<name>.present`). W0.0 records
-  mechanical presence; it never installs.
+  mechanical presence (dsh honors `TAMANDUA_DSH_BINARY` first, then PATH
+  discovery); it never installs.
+- `requires.capabilities` entries that are NOT harness names resolve against
+  the profile's recorded `capabilities.<name>` Boolean-leaf section (e.g.
+  `node-runtimes-2` — recorded true iff W0.0 discovered ≥ 2 DISTINCT node
+  runtimes/versions on the host; the W4.23 daemon-cross-runtime predicate
+  source). An unrecorded capability name is honestly absent (null).
 - An honestly-missing capability gates the case `NOT_RUN (predicate)` with
   expected/observed evidence — it is never silently skipped and never a
   failure.

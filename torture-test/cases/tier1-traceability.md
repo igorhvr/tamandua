@@ -414,9 +414,13 @@ W3.17a:
   → `step:developer:running` (a dispatch round is in flight when the
   developer role's step is running). A marker-shaped trigger passes through;
   an untranslatable trigger fails closed at validation.
-- **Invocation:** `tt-chaos sigstop_sigcont --run <run-id> --when
-  <translated marker> --hold-seconds <hold_seconds>` — exactly the US-004
-  action contract — spawned with the case's childEnv (`assertContainedSpawnEnv`
+- **Invocation:** per-type action contract — `tt-chaos sigstop_sigcont --run
+  <run-id> --when <translated marker> --hold-seconds <hold_seconds>` for the
+  W3.17b shape, and (Tier-2 US-003) `tt-chaos kill-harness|kill-daemon --run
+  <run-id> --when <translated marker> [--signal <SIG>]` for the kill actions
+  (default SIGKILL) and `tt-chaos delete-tstx-row --run <run-id> --when
+  <translated marker> --tree <hash>` for the TSTX-row deletion — spawned with
+  the case's childEnv (`assertContainedSpawnEnv`
   choke-point; `TT_CONTROLLER_TT_CHAOS_PATH` overrides the binary for
   hermetic tests, mirroring `TT_CONTROLLER_DAEMON_CONTROL_PATH`). The runner
   starts alongside the monitor/probe as soon as the run id resolves and is
@@ -424,7 +428,8 @@ W3.17a:
   wall budget (a wedged operator cannot hang the controller past the deadline).
 - **Evidence:** `attempt.chaos_evidence` carries the full start/stop record —
   schema_version, run_id, operator, injection_type, target, trigger,
-  trigger_marker, hold_seconds, `started_at`/`ended_at` UTC timestamps, the
+  trigger_marker, hold_seconds, declared_signal (kill actions), tree
+  (delete-tstx-row), `started_at`/`ended_at` UTC timestamps, the
   exact argv, exit code, signal, error, and `status`/`failure`. The operator's
   `var/chaos/chaos.log` is copied into the immutable oracle snapshot under the
   `chaos_log` evidence key (US-003) — O4's REQUIRED_ORACLE_EVIDENCE — so O4

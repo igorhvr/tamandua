@@ -1,0 +1,10 @@
+{
+  "agents": {
+    "doer": {
+      "output": "STATUS: done\nREPORT: W4.22 symlink-path-parity probe completed (no workflow launch; the cell exercises local path-form machinery)",
+      "tokens": 0
+    }
+  },
+  "heartbeatTokens": 0,
+  "defaultTokens": 0
+}

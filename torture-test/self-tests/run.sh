@@ -83,6 +83,11 @@ HEAVY_CAMPAIGN_TESTS=(
     'tier1-repeatability.test.ts'
     'tier1-scripted-probe-battery.test.ts'
     'tier1-zero-real-launch-infra.test.ts'
+    # US-016: tier2-repeatability drives full tier2/tier1 controller campaigns
+    # (bare --tier2 x2 + dry-run over the whole roster + no-regression) and
+    # rewrites the SHARED var/w0/host-profile.json — heavy/isolated exactly
+    # like the tier1 campaign proofs.
+    'tier2-repeatability.test.ts'
 )
 
 # is_heavy <base> — 0 if <base> is a heavy campaign test (isolated elsewhere), else 1.
@@ -202,6 +207,22 @@ for file in "$SELF_DIR"/tt-poly-*.test.ts; do
   fi
   base="$(basename "$file")"
   run_test_file "tt-poly $base" "$file" || true
+done
+
+# ── Tier-2 manifest and dsh-lane acceptance tests ────────────────────
+echo ""
+echo "--- tier2 tests ---"
+for file in "$SELF_DIR"/tier2-*.test.ts; do
+  if [ ! -f "$file" ]; then
+    fail "tier2 glob" "no files matching $SELF_DIR/tier2-*.test.ts"
+    break
+  fi
+  base="$(basename "$file")"
+  if is_heavy "$base"; then
+    green "  skip (heavy/isolated): $base"
+    continue
+  fi
+  run_test_file "tier2 $base" "$file" || true
 done
 
 # ── Git status cleanliness check ─────────────────────────────────

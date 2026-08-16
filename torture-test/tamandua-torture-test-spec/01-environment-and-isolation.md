@@ -25,7 +25,11 @@ What the spec DOES own is host *adaptation*:
   **presence** under `harness.<name>.present` (spec 01 makes pi/hermes
   operator-preconfigured: W0.0 records presence, it never installs them;
   the live `--spend` probes additionally record `authenticated` without
-  overwriting the presence leaf).
+  overwriting the presence leaf). Non-harness capabilities are recorded as
+  Boolean leaves under a `capabilities` section — e.g. `node-runtimes-2`
+  (true iff W0.0 discovered ≥ 2 DISTINCT node runtimes/versions on the host;
+  the W4.23 daemon-cross-runtime predicate source, and the platform-conditional
+  lanes of 08 §H gate `NOT_RUN (predicate)` honestly on non-matching hosts).
 - **Every manifest case may carry a `requires` predicate** (
   `platform` and/or `toolchains` and/or `capabilities`). Each toolchain
   predicate is satisfied **iff** `host-profile.json` records

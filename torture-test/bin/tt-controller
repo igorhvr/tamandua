@@ -104,7 +104,7 @@ const PROBE_EVENTS_EXCERPT_MAX_BYTES = 256 * 1024;
 const PROBE_DISPATCH_INTERVAL_MS = 15_000;
 // Zero-token dry-run hook for the real-launch path (US-006): when
 // TT_DRY_RUN_REAL_LAUNCH is set, the controller records the full launch argv
-// it WOULD hand to `tamandua` for each real (pi/hermes) case and marks the
+// it WOULD hand to `tamandua` for each real (pi/hermes/dsh) case and marks the
 // case PASS without ever spawning the model-backed tamandua run. The variable's
 // value is the JSONL file to append records to (empty => default under var/).
 // Unset => exact prior behavior (no behavioral change).
@@ -641,14 +641,17 @@ function validateProbeSequence(caseRecord) {
 
 // ── E3.C US-008: chaos block semantics ─────────────────────────────
 // The manifest `chaos` block is a typed injection declaration (schema'd in
-// case.schema.json as chaosBlock): operator tt-chaos performs a
-// sigstop_sigcont injection on the harness_process target, armed on the
-// block's trigger, held for hold_seconds. The controller honors it by
-// invoking bin/tt-chaos under the case's contained spawn env while the run
-// is in flight. The semantic validator below is defense-in-depth BELOW the
-// JSON schema (which already restricts the enums): it re-checks the
-// schema-level rules so a future schema relaxation can never silently
-// degrade into an injection the controller would ignore or mis-fire.
+// case.schema.json as chaosBlock): operator tt-chaos performs the injection
+// on the declared target, armed on the block's trigger. The controller
+// honors it by invoking bin/tt-chaos under the case's contained spawn env
+// while the run is in flight. The semantic validator below is
+// defense-in-depth BELOW the JSON schema (which already restricts the
+// enums): it re-checks the schema-level rules so a future schema relaxation
+// can never silently degrade into an injection the controller would ignore
+// or mis-fire, and it enforces the PER-TYPE target/param constraints the
+// flat schema cannot express (each type requires exactly its own target,
+// hold_seconds only for sigstop_sigcont, signal only for kill actions,
+// tree only for delete-tstx-row).
 
 // Manifest chaos `trigger` values are high-level phase names ("mid_round" =
 // a dispatch round in flight). They are translated to the phase-marker
@@ -661,6 +664,24 @@ const CHAOS_TRIGGER_MARKERS = Object.freeze({
   mid_round: 'step:developer:running',
 });
 const CHAOS_MARKER_SHAPED_PATTERN = /^(now|step:[A-Za-z0-9._-]+:[A-Za-z0-9._-]+|event:[A-Za-z0-9._-]+|file:.+)$/;
+
+// US-003 (Tier-2): the typed block exposes the tt-chaos kill/delete actions
+// the wave-4 fault roster needs (W4.09 kill-harness, W4.10 kill-daemon,
+// W4.01/W4.36 delete-tstx-row). Each type has an exact target and its own
+// param set; anything else fails closed (unknown type, wrong target, param
+// the type does not take).
+const CHAOS_TYPES = Object.freeze(['sigstop_sigcont', 'kill-harness', 'kill-daemon', 'delete-tstx-row']);
+const CHAOS_TARGET_FOR_TYPE = Object.freeze({
+  sigstop_sigcont: 'harness_process',
+  'kill-harness': 'harness_process',
+  'kill-daemon': 'daemon_process',
+  'delete-tstx-row': 'tstx_row',
+});
+// Kill actions take an optional --signal (default SIGKILL, mirroring
+// bin/tt-chaos resolveSignal's VALID_SIGNALS). hold_seconds is sigstop-only;
+// tree is delete-tstx-row-only.
+const CHAOS_KILL_TYPES = new Set(['kill-harness', 'kill-daemon']);
+const CHAOS_VALID_SIGNALS = ['SIGKILL', 'SIGTERM', 'SIGSTOP', 'SIGCONT', 'SIGINT', 'SIGHUP', 'SIGUSR1', 'SIGUSR2'];
 
 function translateChaosTrigger(trigger) {
   if (typeof trigger !== 'string' || trigger === '') return null;
@@ -679,17 +700,37 @@ function validateChaosBlock(caseRecord) {
   if (block.operator !== 'tt-chaos') {
     errors.push(`chaos block operator must be 'tt-chaos' (got ${JSON.stringify(block.operator ?? null)})`);
   }
-  if (block.type !== 'sigstop_sigcont') {
-    errors.push(`chaos block type must be 'sigstop_sigcont' (got ${JSON.stringify(block.type ?? null)})`);
-  }
-  if (block.target !== 'harness_process') {
-    errors.push(`chaos block target must be 'harness_process' (got ${JSON.stringify(block.target ?? null)})`);
+  if (!CHAOS_TYPES.includes(block.type)) {
+    errors.push(`chaos block type must be one of ${CHAOS_TYPES.join(', ')} (got ${JSON.stringify(block.type ?? null)})`);
+  } else {
+    const expectedTarget = CHAOS_TARGET_FOR_TYPE[block.type];
+    if (block.target !== expectedTarget) {
+      errors.push(`chaos block target for type '${block.type}' must be '${expectedTarget}' (got ${JSON.stringify(block.target ?? null)})`);
+    }
+    if (block.type === 'sigstop_sigcont') {
+      if (!(typeof block.hold_seconds === 'number' && Number.isFinite(block.hold_seconds) && block.hold_seconds > 0)) {
+        errors.push('chaos block hold_seconds must be a positive number for sigstop_sigcont');
+      }
+    } else if (block.hold_seconds !== undefined) {
+      errors.push(`chaos block type '${block.type}' does not take hold_seconds (sigstop_sigcont only)`);
+    }
+    if (CHAOS_KILL_TYPES.has(block.type)) {
+      if (block.signal !== undefined && !CHAOS_VALID_SIGNALS.includes(block.signal)) {
+        errors.push(`chaos block signal must be one of ${CHAOS_VALID_SIGNALS.join(', ')} (got ${JSON.stringify(block.signal)})`);
+      }
+    } else if (block.signal !== undefined) {
+      errors.push(`chaos block type '${block.type}' does not take signal (kill-harness/kill-daemon only)`);
+    }
+    if (block.type === 'delete-tstx-row') {
+      if (!(typeof block.tree === 'string' && block.tree.length > 0)) {
+        errors.push('chaos block tree must be a non-empty string for delete-tstx-row (the TSTX tree hash to delete)');
+      }
+    } else if (block.tree !== undefined) {
+      errors.push(`chaos block type '${block.type}' does not take tree (delete-tstx-row only)`);
+    }
   }
   if (translateChaosTrigger(block.trigger) === null) {
     errors.push(`chaos block trigger ${JSON.stringify(block.trigger ?? null)} does not translate to a tt-chaos phase marker (known: mid_round -> step:developer:running; or a literal now | step:<role>:<state> | event:<type> | file:<path>)`);
-  }
-  if (!(typeof block.hold_seconds === 'number' && Number.isFinite(block.hold_seconds) && block.hold_seconds > 0)) {
-    errors.push('chaos block hold_seconds must be a positive number');
   }
   if (caseRecord.harness === 'local') {
     errors.push('chaos block is not supported on local-command cases (harness \'local\') — there is no run/harness process to inject against');
@@ -882,12 +923,13 @@ function observedNodeMajor(profile) {
   return majors.length === 0 ? null : Math.max(...majors);
 }
 
-// Harness presence per the canonical contract: a `pi`/`hermes` capability is
-// satisfied iff the profile records harness.<name>.present === true (W0.0
-// records mechanical presence; the live --spend probes additionally record
-// `authenticated`). For backward compatibility with pre-contract profiles we
-// also accept an explicitly-recorded `authenticated` boolean (true => present,
-// false => honestly absent). An unrecorded harness is honestly absent (null).
+// Harness presence per the canonical contract: a `pi`/`hermes`/`dsh`
+// capability is satisfied iff the profile records harness.<name>.present ===
+// true (W0.0 records mechanical presence; the live --spend probes
+// additionally record `authenticated`). For backward compatibility with
+// pre-contract profiles we also accept an explicitly-recorded
+// `authenticated` boolean (true => present, false => honestly absent). An
+// unrecorded harness is honestly absent (null).
 function observedHarnessPresence(profile, name) {
   const harness = profile.harness?.[name];
   if (!isObject(harness)) return null;
@@ -908,6 +950,7 @@ function observedCapability(profile, name) {
   }
   if (name === 'hermes') return observedHarnessPresence(profile, 'hermes');
   if (name === 'pi') return observedHarnessPresence(profile, 'pi');
+  if (name === 'dsh') return observedHarnessPresence(profile, 'dsh');
   if (Object.hasOwn(profile.capabilities ?? {}, name)) return profile.capabilities[name];
   const spawnClass = profile.spawnSpeedClass?.class;
   if (typeof spawnClass === 'string' && name === `spawn-${spawnClass}`) return true;
@@ -1275,6 +1318,13 @@ function assertContainedSpawnEnv(childEnv) {
 }
 
 function caseUsesScriptedEnvironment(caseRecord) {
+  // US-002 (Tier-2 dsh lane): a dsh case is ALWAYS real — the harness enum
+  // declares scripted-dsh deliberately absent, and even a manifest that
+  // (incorrectly) sets context.execution_mode=scripted on a dsh record must
+  // NOT be routed to the scripted environment. Fail-closed direction: dsh
+  // never degrades into a zero-token scripted case (or pending-real hiding);
+  // it routes to executeWorkflowCase like pi/hermes.
+  if (caseRecord.harness === 'dsh') return false;
   return caseRecord.harness === 'scripted-pi'
     || caseRecord.harness === 'scripted-hermes'
     || caseRecord.context.execution_mode === 'scripted';
@@ -2638,10 +2688,20 @@ function workflowRunArgs(caseRecord, resolvedClonePath, extraArgs = []) {
     if (key === 'execution_mode' || key === 'replay_of' || key === 'token_saver_control') continue;
     args.push('--context', `${key}=${typeof value === 'string' ? value : JSON.stringify(value)}`);
   }
+  // US-002 (Tier-2 dsh lane): harness -> scheduler flag mapping is explicit
+  // and FAIL-CLOSED. dsh is a first-class launchable harness (--dsh-as-harness,
+  // never silently substituted to --hermes-as-harness or --pi-as-harness), and
+  // any harness that reaches the launch-argv builder without a mapping (e.g.
+  // an unknown value that slipped past schema validation, or `local` on the
+  // workflow path) throws instead of silently defaulting to hermes.
   if (caseRecord.harness === 'pi' || caseRecord.harness === 'scripted-pi') {
     args.push('--pi-as-harness');
-  } else {
+  } else if (caseRecord.harness === 'hermes' || caseRecord.harness === 'scripted-hermes') {
     args.push('--hermes-as-harness');
+  } else if (caseRecord.harness === 'dsh') {
+    args.push('--dsh-as-harness');
+  } else {
+    throw new Error(`unsupported harness for workflow launch argv: ${caseRecord.harness}`);
   }
   // A replay case launches against its PAIR's provisioned clone (resolved by
   // resolveReplayPairContext and passed in); every other case uses its own.
@@ -4636,17 +4696,26 @@ async function runDeclaredProbeSequence(caseRecord, attempt, childEnv, state, ca
 // executeWorkflowCase after the launch ends; a chaos:null case returns null
 // and NEVER spawns tt-chaos.
 
-// Build the exact tt-chaos argv for a manifest chaos block (US-004's
-// sigstop_sigcont action contract): the operator binary, the injection type,
-// --run <run-id>, --when <translated trigger>, --hold-seconds <hold_seconds>.
+// Build the exact tt-chaos argv for a manifest chaos block (US-004's action
+// contract): the operator binary, the injection type, --run <run-id>,
+// --when <translated trigger>, plus the per-type params — --hold-seconds for
+// sigstop_sigcont, --signal for kill actions (default SIGKILL), --tree for
+// delete-tstx-row. An action that does not take a param never receives it.
 function buildChaosArgv(block, runId) {
-  return [
+  const argv = [
     TT_CHAOS_PATH,
     block.type,
     '--run', runId,
     '--when', translateChaosTrigger(block.trigger),
-    '--hold-seconds', String(block.hold_seconds),
   ];
+  if (block.type === 'sigstop_sigcont') {
+    argv.push('--hold-seconds', String(block.hold_seconds));
+  } else if (CHAOS_KILL_TYPES.has(block.type)) {
+    argv.push('--signal', block.signal ?? 'SIGKILL');
+  } else if (block.type === 'delete-tstx-row') {
+    argv.push('--tree', block.tree);
+  }
+  return argv;
 }
 
 async function runDeclaredChaos(caseRecord, attempt, childEnv, state, campaignDir) {
@@ -4664,7 +4733,9 @@ async function runDeclaredChaos(caseRecord, attempt, childEnv, state, campaignDi
     target: block.target,
     trigger: block.trigger,
     trigger_marker: translateChaosTrigger(block.trigger),
-    hold_seconds: block.hold_seconds,
+    hold_seconds: block.type === 'sigstop_sigcont' ? block.hold_seconds : null,
+    declared_signal: block.type !== undefined && CHAOS_KILL_TYPES.has(block.type) ? (block.signal ?? 'SIGKILL') : null,
+    tree: block.type === 'delete-tstx-row' ? block.tree : null,
     status: 'running',
     started_at: utcTimestamp(),
     ended_at: null,
@@ -6435,7 +6506,7 @@ function isValidCaseState(item) {
     && Number.isInteger(item.wave) && item.wave >= 0
     && typeof item.workflow === 'string'
     && typeof item.fixture === 'string'
-    && ['pi', 'hermes', 'scripted-pi', 'scripted-hermes', 'local'].includes(item.harness)
+    && ['pi', 'hermes', 'dsh', 'scripted-pi', 'scripted-hermes', 'local'].includes(item.harness)
     && ['verification', 'characterization', 'exploratory'].includes(item.class)
     && (item.production_duration_floor_ms === null
       || (Number.isSafeInteger(item.production_duration_floor_ms) && item.production_duration_floor_ms > 0))
@@ -6843,15 +6914,17 @@ function persistPreflightState(campaignDir, state, preflight) {
 }
 
 // Distinct real-case harnesses required by the CURRENT (filtered) selection.
-// Only pi/hermes are probed — scripted and local cases require no harness auth
-// (US-006). The controller resolves this from the filtered manifest (not the
-// probe's own full-tier enumeration) so a --case focused pi-only selection
-// probes pi and never hermes.
+// Only pi/hermes/dsh are probed — scripted and local cases require no harness
+// auth (US-006; US-002 adds the Tier-2 dsh lane: a dsh case's real-case
+// preflight probes dsh presence via tt-harness-auth-probe). The controller
+// resolves this from the filtered manifest (not the probe's own full-tier
+// enumeration) so a --case focused pi-only selection probes pi and never
+// hermes/dsh.
 function requiredHarnessesFor(manifest) {
   const harnesses = new Set();
   for (const caseRecord of manifest.cases) {
     if (caseUsesScriptedEnvironment(caseRecord)) continue;
-    if (caseRecord.harness === 'pi' || caseRecord.harness === 'hermes') {
+    if (caseRecord.harness === 'pi' || caseRecord.harness === 'hermes' || caseRecord.harness === 'dsh') {
       harnesses.add(caseRecord.harness);
     }
   }
@@ -6861,9 +6934,10 @@ function requiredHarnessesFor(manifest) {
 // Runs the preflight legs in order under the CONTAINED real spawn env.
 // On any leg failure it FAILS CLOSED: persists the DISTINCT reason and throws
 // so the campaign aborts non-zero (US-004 AC2). Never touches the operator's
-// ~/.tamandua or 33xx daemon. The harness-auth leg (US-006) runs only when the
-// current selection requires a real pi/hermes harness, and is ordered after
-// home-provision (which surfaces credentials) and before catalog/daemon-up.
+// ~/.tamandua or 33xx daemon. The harness-auth leg (US-006; dsh lane US-002)
+// runs only when the current selection requires a real pi/hermes/dsh harness,
+// and is ordered after home-provision (which surfaces credentials) and before
+// catalog/daemon-up.
 function runRealPreflight(campaignDir, state, manifest) {
   let env;
   try {

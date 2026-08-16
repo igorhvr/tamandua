@@ -1,0 +1,81 @@
+# TT Verdict Trap — a purpose-built ONE-STEP custom workflow for W4.14
+# (spec 08-wave-4-fault-injection.md §D).
+#
+# The probe: launch a real harness on a one-step workflow whose agent is
+# INSTRUCTED (by the case task file) to produce a verdict-format trap —
+# (a) end with NO status line at all, or (b) emit ambiguous verdicts
+# (`STATUS: done` + a large garbage block + `STATUS: failed`) — so the
+# product's TWO verdict ingress paths classify the SAME output and their
+# divergence (if any) is the finding:
+#   - scheduler auto-completion classifies any failure marker that appears
+#     before any done marker → failure verdict wins;
+#   - explicit `step complete` expects-validation anchors on the FIRST
+#     `STATUS:` line → the first anchored STATUS governs the expects check.
+# Per spec W4.14: "lost-output handling: bounded retry with feedback, never
+# wedged" and "per-ingress expected result stated and pinned". The
+# `expects: "STATUS: done"` on the single step is deliberate: it is the
+# anchor the step-complete ingress path validates against, and its absence
+# in arm (a) drives the bounded-retry lost-output corridor.
+#
+# The step input deliberately does NOT hardcode "Reply with: STATUS: done" —
+# the task file is the authority for the report format (the trap's output
+# instruction), and the agent must follow the task's format instruction
+# verbatim (including an instruction to omit, duplicate, or extend status
+# lines). This is the W4.14 task-carried injection: the task tells the
+# agent exactly which trap output to produce.
+#
+# Fidelity contract: one agent (reporter, coding) + one step (report),
+# workspace baseDir agents/reporter/, files wired to the persona files.
+id: tt-verdict-trap
+name: TT Verdict Trap
+version: 1
+description: |
+  One-step custom workflow for W4.14: a real-harness probe whose agent is
+  instructed by the task file to produce a verdict-format trap (no status
+  line, or ambiguous status lines) so the product's auto-completion and
+  step-complete ingress paths are exercised and their classification
+  divergence — if any — becomes the finding.
+
+agents:
+  - id: reporter
+    name: Reporter
+    role: coding
+    description: Produces the exact report format the task file specifies and reports the verdict-format outcome.
+    workspace:
+      baseDir: agents/reporter
+      skills:
+        - tamandua-agents
+      files:
+        AGENTS.md: agents/reporter/AGENTS.md
+        SOUL.md: agents/reporter/SOUL.md
+        IDENTITY.md: agents/reporter/IDENTITY.md
+
+steps:
+  - id: report
+    agent: reporter
+    input: |
+      Produce your step report in EXACTLY the format the task file below
+      specifies — including any instruction to omit, duplicate, or extend
+      status lines. This is a verdict-formatting probe: the task defines the
+      output contract, and you must follow it verbatim. Do not "fix" or
+      normalize the format; do not add or remove status lines beyond what
+      the task instructs. When the task asks you to run the suite first, use
+      TEST_CMD verbatim.
+
+      TASK:
+      {{task}}
+
+      TEST_CMD: {{test_cmd}}
+
+      TEST_CMD is the exact test command to use. Copy it verbatim — do NOT
+      substitute `npm test` or any other command you infer from the project.
+      TEST_CMD may be wrapped in a caching shim (`tamandua-test ...`); this
+      is intentional. If the output starts with `TAMANDUA-TEST CACHED`, the
+      suite already passed for this exact tree — treat that as a passing
+      test run. Only add flags through the wrapper's `--force` option when
+      you suspect a flaky or environment-dependent result.
+
+      Remember: the task file's output instruction is authoritative for this
+      probe. Follow it exactly.
+    expects: "STATUS: done"
+    max_retries: 4

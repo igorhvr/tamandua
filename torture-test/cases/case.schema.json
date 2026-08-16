@@ -60,7 +60,8 @@
       ]
     },
     "harness": {
-      "enum": ["pi", "hermes", "scripted-pi", "scripted-hermes", "local"]
+      "enum": ["pi", "hermes", "dsh", "scripted-pi", "scripted-hermes", "local"],
+      "description": "Harness that executes the case. pi/hermes/dsh are REAL harnesses (dsh is the Tier-2 distributed-shell lane; scripted-dsh does not exist — a dsh case is always real). scripted-pi/scripted-hermes are the zero-token scripted runtimes; local is the contained local-command hook."
     },
     "task": {
       "$ref": "#/$defs/relativePath"
@@ -137,7 +138,7 @@
         },
         "capabilities": {
           "type": "array",
-          "description": "CANONICAL CONTRACT: harness capabilities `pi` and `hermes` map to harness PRESENCE recorded in the host profile (harness.<name>.present Boolean leaf; spec 01 makes pi/hermes operator-preconfigured, so W0.0 RECORDS mechanical presence, never installs). Any other capability name is resolved against the profile per the same Boolean-leaf rule. An honestly-present capability must NOT be gated; an honestly-absent capability gates the case NOT_RUN (predicate) with expected/observed evidence.",
+          "description": "CANONICAL CONTRACT: harness capabilities `pi`, `hermes`, and `dsh` map to harness PRESENCE recorded in the host profile (harness.<name>.present Boolean leaf; spec 01 makes pi/hermes operator-preconfigured, and the Tier-2 dsh lane is operator-directed — W0.0 RECORDS mechanical presence for all three, never installs). The host profile ALSO records Boolean-leaf capability names under `capabilities.<name>` — e.g. `node-runtimes-2` (true iff W0.0 discovered >= 2 DISTINCT node runtimes/versions on the host; the W4.23 daemon-cross-runtime predicate source). Any other capability name is resolved against the profile per the same Boolean-leaf rule. An honestly-present capability must NOT be gated; an honestly-absent capability gates the case NOT_RUN (predicate) with expected/observed evidence.",
           "minItems": 1,
           "uniqueItems": true,
           "items": {
@@ -224,7 +225,7 @@
       }
     },
     "chaos": {
-      "description": "E3.C typed chaos-injection block (nullable). null => no chaos injection. A non-null block matches the W3.17b marathon-chaos shape and is honored by the controller via bin/tt-chaos: type is the injection kind, target the affected process class, trigger the phase marker that arms the injection, hold_seconds the SIGSTOP hold duration, operator the executable that performs the injection. Schema contract is fail-closed: unknown type/target/operator values and unknown properties are REJECTED.",
+      "description": "E3.C typed chaos-injection block (nullable). null => no chaos injection. A non-null block is honored by the controller via bin/tt-chaos: type is the injection kind (sigstop_sigcont | kill-harness | kill-daemon | delete-tstx-row), target the affected process/data class (per-type), trigger the phase marker that arms the injection, hold_seconds the SIGSTOP hold duration (sigstop_sigcont only), signal the kill signal (kill actions only, default SIGKILL), tree the TSTX tree hash to delete (delete-tstx-row only), operator the executable that performs the injection. Schema contract is fail-closed: unknown type/target/operator/signal values and unknown properties are REJECTED; per-type target/param constraints are enforced by the controller's semantic validator.",
       "anyOf": [
         { "type": "null" },
         { "$ref": "#/$defs/chaosBlock" }
@@ -382,15 +383,15 @@
     "chaosBlock": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type", "target", "trigger", "hold_seconds", "operator"],
+      "required": ["type", "target", "trigger", "operator"],
       "properties": {
         "type": {
-          "enum": ["sigstop_sigcont"],
-          "description": "Injection kind. sigstop_sigcont: SIGSTOP the target process, hold, then SIGCONT."
+          "enum": ["sigstop_sigcont", "kill-harness", "kill-daemon", "delete-tstx-row"],
+          "description": "Injection kind. sigstop_sigcont: SIGSTOP the target process, hold, then SIGCONT. kill-harness: send a signal (default SIGKILL) to the active harness process for the run. kill-daemon: send a signal (default SIGKILL) to the TT daemon (never the production daemon). delete-tstx-row: delete the TSTX evidence row(s) matching the declared tree hash."
         },
         "target": {
-          "enum": ["harness_process"],
-          "description": "Process class the injection targets. harness_process: the active harness (pi/hermes) process for the run."
+          "enum": ["harness_process", "daemon_process", "tstx_row"],
+          "description": "Process/data class the injection targets. Per-type: sigstop_sigcont and kill-harness target harness_process; kill-daemon targets daemon_process; delete-tstx-row targets tstx_row."
         },
         "trigger": {
           "type": "string",
@@ -401,7 +402,18 @@
         "hold_seconds": {
           "type": "number",
           "exclusiveMinimum": 0,
-          "description": "SIGSTOP hold duration in seconds before SIGCONT."
+          "description": "SIGSTOP hold duration in seconds before SIGCONT. REQUIRED ONLY for sigstop_sigcont (per-type constraint enforced by the controller's semantic validator); must be ABSENT for kill-harness/kill-daemon/delete-tstx-row."
+        },
+        "signal": {
+          "enum": ["SIGKILL", "SIGTERM", "SIGSTOP", "SIGCONT", "SIGINT", "SIGHUP", "SIGUSR1", "SIGUSR2"],
+          "description": "OPTIONAL signal for kill actions (kill-harness/kill-daemon); defaults to SIGKILL. Must be ABSENT for sigstop_sigcont/delete-tstx-row."
+        },
+        "tree": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9]+$",
+          "description": "Tree hash whose TSTX evidence rows delete-tstx-row deletes. REQUIRED for delete-tstx-row (per-type constraint enforced by the controller's semantic validator); must be ABSENT for other types."
         },
         "operator": {
           "enum": ["tt-chaos"],

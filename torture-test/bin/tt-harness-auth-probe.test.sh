@@ -340,6 +340,71 @@ else
   fail "unknown argument did NOT exit 2 (rc=$RC)"
 fi
 
+# ── Test 15 (US-002): dsh PRESENCE leg — present binary, answer leg skipped ─
+echo ""
+echo "--- Test: US-002 dsh presence (present binary, answer leg alpha-skipped) ---"
+make_fake_harness fake-dsh 0
+: > "$INVOC_LOG"
+OUT="$(TT_VAR="$TEST_VAR" TAMANDUA_DSH_BINARY="$FAKE_BIN/fake-dsh" "$TOOL" dsh 2>&1)"; RC=$?
+if [ "$RC" -eq 0 ]; then
+  pass "probe dsh exits 0 with a present binary"
+else
+  fail "probe dsh did NOT exit 0 (rc=$RC): $OUT"
+fi
+if printf '%s' "$OUT" | grep -q "alpha-skipped"; then
+  pass "dsh answer leg is reported alpha-skipped without --spend"
+else
+  fail "dsh answer leg skip not reported: $OUT"
+fi
+if [ ! -s "$INVOC_LOG" ]; then
+  pass "dsh answer leg does NOT invoke the binary without --spend (zero tokens)"
+else
+  fail "dsh binary was invoked without --spend: $(cat "$INVOC_LOG")"
+fi
+
+# ── Test 16 (US-002): dsh absent → fail closed harness-auth-missing: dsh ──
+echo ""
+echo "--- Test: US-002 dsh absence fails closed (harness-auth-missing: dsh) ---"
+set +e
+OUT="$(TT_VAR="$TEST_VAR" TAMANDUA_DSH_BINARY="$FAKE_BIN/does-not-exist" "$TOOL" dsh 2>&1)"
+RC=$?
+set -e
+if [ "$RC" -ne 0 ]; then
+  pass "probe dsh exits non-zero when the binary is absent"
+else
+  fail "probe dsh did NOT exit non-zero when the binary is absent"
+fi
+if printf '%s' "$OUT" | grep -q "harness-auth-missing: dsh"; then
+  pass "distinct reason 'harness-auth-missing: dsh' on stderr"
+else
+  fail "missing distinct reason for absent dsh: $OUT"
+fi
+
+# ── Test 17 (US-002): dsh --spend runs the ALPHA answer self-check ──────
+echo ""
+echo "--- Test: US-002 dsh --spend answer leg (alpha self-check) ---"
+: > "$INVOC_LOG"
+OUT="$(TT_VAR="$TEST_VAR" TAMANDUA_DSH_BINARY="$FAKE_BIN/fake-dsh" "$TOOL" --spend dsh 2>&1)"; RC=$?
+if [ "$RC" -eq 0 ]; then
+  pass "probe dsh --spend exits 0"
+else
+  fail "probe dsh --spend did NOT exit 0 (rc=$RC): $OUT"
+fi
+if grep -q -- "--dump-default-config" "$INVOC_LOG"; then
+  pass "dsh --spend answer leg runs the zero-token --dump-default-config self-check"
+else
+  fail "dsh --spend answer leg did not run: $(cat "$INVOC_LOG")"
+fi
+
+# ── Test 18 (US-002): usage documents dsh, TAMANDUA_DSH_BINARY, --spend ──
+echo ""
+echo "--- Test: US-002 --help documents the dsh lane ---"
+if "$TOOL" --help | grep -q "harness-auth-missing: dsh" && "$TOOL" --help | grep -q "TAMANDUA_DSH_BINARY" && "$TOOL" --help | grep -q -- "--spend"; then
+  pass "--help documents dsh reason + TAMANDUA_DSH_BINARY + --spend"
+else
+  fail "--help does not document the dsh lane"
+fi
+
 # ── Summary ───────────────────────────────────────────────────────────
 echo ""
 echo "================================================"

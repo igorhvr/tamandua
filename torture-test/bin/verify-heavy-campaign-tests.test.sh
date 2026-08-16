@@ -52,6 +52,7 @@ HEAVY_TESTS=(
     'tier1-repeatability.test.ts'
     'tier1-scripted-probe-battery.test.ts'
     'tier1-zero-real-launch-infra.test.ts'
+    'tier2-repeatability.test.ts'
 )
 
 FAILURES=0

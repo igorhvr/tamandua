@@ -1,0 +1,13 @@
+{
+  "agents": {
+    "doer": {
+      "commands": [
+        "sleep 30"
+      ],
+      "output": "STATUS: done\nREPORT: held the shared workdir open for the refusal window",
+      "tokens": 0
+    }
+  },
+  "heartbeatTokens": 0,
+  "defaultTokens": 0
+}
