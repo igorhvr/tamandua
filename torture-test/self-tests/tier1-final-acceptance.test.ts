@@ -10,7 +10,9 @@
 //     controller/probe/oracle machinery: bin/tt-controller,
 //     bin/tt-controller.test.sh, bin/tt-chaos (+ self-test), bin/oracle-*.mjs,
 //     oracles/ (E3.C adds the O16 lifecycle oracle and O4 executable) — and
-//     never touches probes/, seeds/, or bin/tt-hygiene-canary.mjs;
+//     (since MACP1) the fixture-source portability surface: fixtures-src/
+//     builders/validators/bootstraps and bin/verify-builder-determinism.test.sh —
+//     and never touches probes/, seeds/, or bin/tt-hygiene-canary.mjs;
 //   * bin/tt-hygiene-canary.mjs is byte-identical to the merge-base version
 //     (the canary itself must remain untouched so its campaign snapshots stay
 //     trustworthy);
@@ -80,142 +82,160 @@ function sha256(buffer: Buffer): string {
   return createHash("sha256").update(buffer).digest("hex");
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// Diff-confinement lists — module scope so the confinement test and the
+// US-002 shape test share one source of truth.
+// ─────────────────────────────────────────────────────────────────────
+// E3.C extends the E3.A authoring surface with the controller/probe/oracle
+// machinery (probe sequencer, chaos wiring, O16/O4 oracles) — all still
+// confined to torture-test/. The oracle-machinery bin test files
+// (bin/oracle-*.mjs, bin/tt-oracle-replay*, bin/o9-mechanical-harvest.*,
+// bin/o11-production-evidence.*) are part of that surface: they consume
+// oracle-context / oracle-evidence-snapshot, whose version-1 evidence key
+// set and gating registry E3.C extends. bin/tt-chaos (+ its self-test) is
+// the chaos operator the controller's chaos wiring (E3.C US-008) invokes;
+// US-004 adds its sigstop_sigcont action here. US-011 registers the
+// zero-token scripted probe battery in the heavy-campaign lock-step lists
+// (self-tests/run.sh HEAVY_CAMPAIGN_TESTS +
+// bin/verify-heavy-campaign-tests.test.sh + e2e-golden-integrity), so the
+// isolated heavy-test invocation script joins the authoring surface.
+const allowed = [
+  "torture-test/cases/tier1.jsonl",
+  "torture-test/cases/case.schema.json",
+  "torture-test/cases/tier1-traceability.md",
+  "torture-test/cases/tasks/tier1/",
+  // Tier-2 roster (US-004): the wave-4 section-A manifest, its
+  // traceability skeleton, and its task files are part of the Tier-2
+  // authoring surface — exactly like the tier1 manifest/traceability/tasks
+  // are for Tier-1.
+  "torture-test/cases/tier2.jsonl",
+  "torture-test/cases/tier2-traceability.md",
+  "torture-test/cases/tasks/tier2/",
+  // Tier-2 section F (US-010): the W4.31 tree-rewriting pre-commit hook
+  // fixture asset lives under torture-test/fixtures/hooks/ (a NEW
+  // authoring surface) and the W4.26/28/30/31 reset hooks live under
+  // torture-test/cases/hooks/ (the existing hook surface extended by the
+  // roster stories) — new authoring surfaces added in the same story that
+  // created them.
+  "torture-test/fixtures/",
+  "torture-test/cases/hooks/",
+  // Tier-2 section C1 (US-006): the W4.27 zero-token shim exit-code-matrix
+  // case lives under scenarios/w4.27/ (the tier0 scenario-cell shape) —
+  // a NEW scenario surface for the Tier-2 roster.
+  "torture-test/scenarios/w4.27/",
+  // Tier-2 section C2 (US-007): the W4.11 SIGKILL/Ctrl-C launch matrix and
+  // W4.12 port-squatter cases live under scenarios/w4.11/ and
+  // scenarios/w4.12/ (the tier0 scenario-cell shape) — new scenario
+  // surfaces added in the same story that created them.
+  "torture-test/scenarios/w4.11/",
+  "torture-test/scenarios/w4.12/",
+  // Tier-2 section D (US-008): the W4.14 verdict-trap case references a
+  // NEW TT-custom one-step workflow spec under torture-test/workflows/
+  // (the tt-shim-probe / tt-docs-drift pattern) — a new authoring
+  // surface added in the same story that created it.
+  "torture-test/workflows/",
+  // Tier-2 section E (US-009): the W4.19 stale-catalog, W4.20 update
+  // repo-state, and W4.34 stale-CLI-vs-new-daemon cases live under
+  // scenarios/w4.19/, scenarios/w4.20/ and scenarios/w4.34/ (the tier0
+  // scenario-cell shape) — new scenario surfaces added in the same story
+  // that created them.
+  "torture-test/scenarios/w4.19/",
+  "torture-test/scenarios/w4.20/",
+  "torture-test/scenarios/w4.34/",
+  // Tier-2 section H (US-011): the W4.21 bare-noninteractive-launch,
+  // W4.22 symlink-path-parity, W4.23 daemon-cross-runtime-restart and
+  // W4.24 serial-lane-concurrent cases live under scenarios/w4.21/,
+  // scenarios/w4.22/, scenarios/w4.23/ and scenarios/w4.24/ (the tier0
+  // scenario-cell shape) — new scenario surfaces added in the same story
+  // that created them.
+  "torture-test/scenarios/w4.21/",
+  "torture-test/scenarios/w4.22/",
+  "torture-test/scenarios/w4.23/",
+  "torture-test/scenarios/w4.24/",
+  // Tier-2 sections I/J/K (US-012): the W4.40 stream-contract arms,
+  // W4.41 resolver arms, W4.42 shared-workdir refusal, W4.43 refusal
+  // storm, W4.44 double-tap + post-success-immunity and W4.46
+  // provider-error-rounds cases live under scenarios/w4.40/,
+  // scenarios/w4.41/, scenarios/w4.42/, scenarios/w4.43/,
+  // scenarios/w4.44/ and scenarios/w4.46/ (the tier0 scenario-cell
+  // shape) — new scenario surfaces added in the same story that created
+  // them.
+  "torture-test/scenarios/w4.40/",
+  "torture-test/scenarios/w4.41/",
+  "torture-test/scenarios/w4.42/",
+  "torture-test/scenarios/w4.43/",
+  "torture-test/scenarios/w4.44/",
+  "torture-test/scenarios/w4.46/",
+  // Tier-2 section H (US-011) also updated the spec directory: spec 01
+  // (the E2.2 canonical contract) documents the capabilities
+  // .node-runtimes-2 Boolean-leaf recording that tt-verify-environment
+  // (W0.0) now discovers — a new spec surface added in the same story
+  // that created it.
+  "torture-test/tamandua-torture-test-spec/",
+  "torture-test/bin/tt-fixture-provision.mjs",
+  "torture-test/bin/tt-controller",
+  "torture-test/bin/tt-controller.test.sh",
+  "torture-test/bin/tt-chaos",
+  "torture-test/bin/tt-chaos.test.sh",
+  "torture-test/bin/verify-heavy-campaign-tests.test.sh",
+  "torture-test/bin/oracle-",
+  "torture-test/bin/tt-oracle-replay",
+  "torture-test/bin/o9-mechanical-harvest.integration.test.mjs",
+  "torture-test/bin/o11-production-evidence.test.mjs",
+  // Tier-2 dsh lane (US-001/US-002): the dsh host-profile probe, the
+  // harness-auth probe's dsh presence leg, and the campaign report's
+  // fail-closed cause list are part of the Tier-2 authoring surface —
+  // exactly like E3.C extended the list for the oracle machinery.
+  "torture-test/bin/tt-harness-auth-probe",
+  "torture-test/bin/tt-harness-auth-probe.test.sh",
+  "torture-test/bin/tt-report.mjs",
+  "torture-test/bin/tt-verify-environment",
+  "torture-test/bin/tt-verify-environment.test.sh",
+  // US-015: the --tier2 ladder rung — bin/tt-run wires tier2 availability
+  // + routing (its test extends with the tier2 assertions and the E2.2
+  // fail-closed proof), and bin/tt-tier2-assets is the NEW tier2 asset
+  // validator (tier1-assets mirror + seed-vs-SEEDS.md + capabilities
+  // well-formedness) with its own test.
+  "torture-test/bin/tt-run",
+  "torture-test/bin/tt-run.test.sh",
+  "torture-test/bin/tt-tier2-assets",
+  "torture-test/bin/tt-tier2-assets.test.sh",
+  "torture-test/oracles/",
+  "torture-test/self-tests/",
+  // MACP1 (US-002): the Darwin-parity portability surface — the fixture
+  // SOURCE trees under fixtures-src/ (builders/validators/bootstraps: the
+  // bash-3.2 sweep, the old-pip-safe bootstrap, and the fail-closed builder
+  // error surfacing) and bin/verify-builder-determinism.test.sh (the
+  // self-test that pins their golden hash ledgers) are legitimate MACP1
+  // authoring files.
+  "torture-test/fixtures-src/",
+  "torture-test/bin/verify-builder-determinism.test.sh",
+  // MACP1 (US-010): the bash-3.2 compatibility sweep also rewrites the
+  // scripted-runtimes dev tooling — fork-parity-check and
+  // install-scenario-workflows (associative-array removal so they run under
+  // macOS /bin/bash 3.2.57) — part of the Darwin-parity authoring surface.
+  "torture-test/scripted-runtimes/",
+];
+// US-016 added the Tier-2 story's no-touch surfaces to the forbidden set:
+// the E3.C.1-owned tier1 kill-path/probe-battery self-tests (a concurrent
+// run owns those files; coordinate by never touching them — new proofs go
+// in NEW files). torture-test/fixtures-src/ was also forbidden for the
+// Tier-2 roster task, but MACP1 (US-002) authorizes the fixture-source
+// portability surface (bash-3.2 sweep, old-pip bootstrap, error surfacing),
+// so it moved to the allowed list above.
+const forbidden = [
+  "torture-test/bin/tt-hygiene-canary.mjs",
+  "torture-test/probes/",
+  "torture-test/seeds/",
+  "torture-test/self-tests/tier1-scripted-probe-battery.test.ts",
+];
+// Pattern guard for the whole E3.C.1-owned class: any tier1 self-test
+// whose name carries a kill corridor or the probe battery is off-limits
+// even if a future rename escapes the exact-file entry above.
+const e3c1Owned = /^(tier1-.*kill.*|.*probe-battery.*)\.test\.ts$/;
+
 describe("E3.A US-014 — final acceptance battery pins", () => {
   it("branch diff is confined to the intended authoring files", () => {
-    // E3.C extends the E3.A authoring surface with the controller/probe/oracle
-    // machinery (probe sequencer, chaos wiring, O16/O4 oracles) — all still
-    // confined to torture-test/. The oracle-machinery bin test files
-    // (bin/oracle-*.mjs, bin/tt-oracle-replay*, bin/o9-mechanical-harvest.*,
-    // bin/o11-production-evidence.*) are part of that surface: they consume
-    // oracle-context / oracle-evidence-snapshot, whose version-1 evidence key
-    // set and gating registry E3.C extends. bin/tt-chaos (+ its self-test) is
-    // the chaos operator the controller's chaos wiring (E3.C US-008) invokes;
-    // US-004 adds its sigstop_sigcont action here. US-011 registers the
-    // zero-token scripted probe battery in the heavy-campaign lock-step lists
-    // (self-tests/run.sh HEAVY_CAMPAIGN_TESTS +
-    // bin/verify-heavy-campaign-tests.test.sh + e2e-golden-integrity), so the
-    // isolated heavy-test invocation script joins the authoring surface.
-    const allowed = [
-      "torture-test/cases/tier1.jsonl",
-      "torture-test/cases/case.schema.json",
-      "torture-test/cases/tier1-traceability.md",
-      "torture-test/cases/tasks/tier1/",
-      // Tier-2 roster (US-004): the wave-4 section-A manifest, its
-      // traceability skeleton, and its task files are part of the Tier-2
-      // authoring surface — exactly like the tier1 manifest/traceability/tasks
-      // are for Tier-1.
-      "torture-test/cases/tier2.jsonl",
-      "torture-test/cases/tier2-traceability.md",
-      "torture-test/cases/tasks/tier2/",
-      // Tier-2 section F (US-010): the W4.31 tree-rewriting pre-commit hook
-      // fixture asset lives under torture-test/fixtures/hooks/ (a NEW
-      // authoring surface) and the W4.26/28/30/31 reset hooks live under
-      // torture-test/cases/hooks/ (the existing hook surface extended by the
-      // roster stories) — new authoring surfaces added in the same story that
-      // created them.
-      "torture-test/fixtures/",
-      "torture-test/cases/hooks/",
-      // Tier-2 section C1 (US-006): the W4.27 zero-token shim exit-code-matrix
-      // case lives under scenarios/w4.27/ (the tier0 scenario-cell shape) —
-      // a NEW scenario surface for the Tier-2 roster.
-      "torture-test/scenarios/w4.27/",
-      // Tier-2 section C2 (US-007): the W4.11 SIGKILL/Ctrl-C launch matrix and
-      // W4.12 port-squatter cases live under scenarios/w4.11/ and
-      // scenarios/w4.12/ (the tier0 scenario-cell shape) — new scenario
-      // surfaces added in the same story that created them.
-      "torture-test/scenarios/w4.11/",
-      "torture-test/scenarios/w4.12/",
-      // Tier-2 section D (US-008): the W4.14 verdict-trap case references a
-      // NEW TT-custom one-step workflow spec under torture-test/workflows/
-      // (the tt-shim-probe / tt-docs-drift pattern) — a new authoring
-      // surface added in the same story that created it.
-      "torture-test/workflows/",
-      // Tier-2 section E (US-009): the W4.19 stale-catalog, W4.20 update
-      // repo-state, and W4.34 stale-CLI-vs-new-daemon cases live under
-      // scenarios/w4.19/, scenarios/w4.20/ and scenarios/w4.34/ (the tier0
-      // scenario-cell shape) — new scenario surfaces added in the same story
-      // that created them.
-      "torture-test/scenarios/w4.19/",
-      "torture-test/scenarios/w4.20/",
-      "torture-test/scenarios/w4.34/",
-      // Tier-2 section H (US-011): the W4.21 bare-noninteractive-launch,
-      // W4.22 symlink-path-parity, W4.23 daemon-cross-runtime-restart and
-      // W4.24 serial-lane-concurrent cases live under scenarios/w4.21/,
-      // scenarios/w4.22/, scenarios/w4.23/ and scenarios/w4.24/ (the tier0
-      // scenario-cell shape) — new scenario surfaces added in the same story
-      // that created them.
-      "torture-test/scenarios/w4.21/",
-      "torture-test/scenarios/w4.22/",
-      "torture-test/scenarios/w4.23/",
-      "torture-test/scenarios/w4.24/",
-      // Tier-2 sections I/J/K (US-012): the W4.40 stream-contract arms,
-      // W4.41 resolver arms, W4.42 shared-workdir refusal, W4.43 refusal
-      // storm, W4.44 double-tap + post-success-immunity and W4.46
-      // provider-error-rounds cases live under scenarios/w4.40/,
-      // scenarios/w4.41/, scenarios/w4.42/, scenarios/w4.43/,
-      // scenarios/w4.44/ and scenarios/w4.46/ (the tier0 scenario-cell
-      // shape) — new scenario surfaces added in the same story that created
-      // them.
-      "torture-test/scenarios/w4.40/",
-      "torture-test/scenarios/w4.41/",
-      "torture-test/scenarios/w4.42/",
-      "torture-test/scenarios/w4.43/",
-      "torture-test/scenarios/w4.44/",
-      "torture-test/scenarios/w4.46/",
-      // Tier-2 section H (US-011) also updated the spec directory: spec 01
-      // (the E2.2 canonical contract) documents the capabilities
-      // .node-runtimes-2 Boolean-leaf recording that tt-verify-environment
-      // (W0.0) now discovers — a new spec surface added in the same story
-      // that created it.
-      "torture-test/tamandua-torture-test-spec/",
-      "torture-test/bin/tt-fixture-provision.mjs",
-      "torture-test/bin/tt-controller",
-      "torture-test/bin/tt-controller.test.sh",
-      "torture-test/bin/tt-chaos",
-      "torture-test/bin/tt-chaos.test.sh",
-      "torture-test/bin/verify-heavy-campaign-tests.test.sh",
-      "torture-test/bin/oracle-",
-      "torture-test/bin/tt-oracle-replay",
-      "torture-test/bin/o9-mechanical-harvest.integration.test.mjs",
-      "torture-test/bin/o11-production-evidence.test.mjs",
-      // Tier-2 dsh lane (US-001/US-002): the dsh host-profile probe, the
-      // harness-auth probe's dsh presence leg, and the campaign report's
-      // fail-closed cause list are part of the Tier-2 authoring surface —
-      // exactly like E3.C extended the list for the oracle machinery.
-      "torture-test/bin/tt-harness-auth-probe",
-      "torture-test/bin/tt-harness-auth-probe.test.sh",
-      "torture-test/bin/tt-report.mjs",
-      "torture-test/bin/tt-verify-environment",
-      "torture-test/bin/tt-verify-environment.test.sh",
-      // US-015: the --tier2 ladder rung — bin/tt-run wires tier2 availability
-      // + routing (its test extends with the tier2 assertions and the E2.2
-      // fail-closed proof), and bin/tt-tier2-assets is the NEW tier2 asset
-      // validator (tier1-assets mirror + seed-vs-SEEDS.md + capabilities
-      // well-formedness) with its own test.
-      "torture-test/bin/tt-run",
-      "torture-test/bin/tt-run.test.sh",
-      "torture-test/bin/tt-tier2-assets",
-      "torture-test/bin/tt-tier2-assets.test.sh",
-      "torture-test/oracles/",
-      "torture-test/self-tests/",
-    ];
-    // US-016 extends the forbidden set with the Tier-2 story's additional
-    // no-touch surfaces: torture-test/fixtures-src/ (the fixture SOURCE trees
-    // — the golden bares are built from them, so any modification would
-    // silently alter every provisioned clone's content) and the E3.C.1-owned
-    // tier1 kill-path/probe-battery self-tests (a concurrent run owns those
-    // files; coordinate by never touching them — new proofs go in NEW files).
-    const forbidden = [
-      "torture-test/bin/tt-hygiene-canary.mjs",
-      "torture-test/probes/",
-      "torture-test/seeds/",
-      "torture-test/fixtures-src/",
-      "torture-test/self-tests/tier1-scripted-probe-battery.test.ts",
-    ];
-    // Pattern guard for the whole E3.C.1-owned class: any tier1 self-test
-    // whose name carries a kill corridor or the probe battery is off-limits
-    // even if a future rename escapes the exact-file entry above.
-    const e3c1Owned = /^(tier1-.*kill.*|.*probe-battery.*)\.test\.ts$/;
     const files = changedFiles();
     const violations: string[] = [];
     for (const file of files) {
@@ -230,6 +250,46 @@ describe("E3.A US-014 — final acceptance battery pins", () => {
       }
     }
     assert.deepEqual(violations, [], `diff confinement violations:\n${violations.join("\n")}`);
+  });
+
+  it("MACP1 authoring surface is authorized by the diff-confinement lists (US-002)", () => {
+    // The MACP1 Darwin-parity task legitimately touches the fixture-SOURCE
+    // trees (builders/validators/bootstraps under fixtures-src/: bash-3.2
+    // sweep, old-pip bootstrap, error surfacing) and the builder-
+    // determinism self-test. The allowed list must authorize that surface,
+    // the forbidden list must no longer forbid it, and the remaining
+    // no-touch surfaces (hygiene canary, probes/, seeds/, E3.C.1 kill-path
+    // self-tests) must stay forbidden — with the e3c1Owned regex unchanged.
+    for (const surface of [
+      "torture-test/fixtures-src/",
+      "torture-test/bin/verify-builder-determinism.test.sh",
+    ]) {
+      assert.ok(
+        allowed.some((prefix) => surface === prefix || surface.startsWith(prefix)),
+        `allowed list must authorize the MACP1 authoring surface ${surface}`,
+      );
+    }
+    assert.ok(
+      !forbidden.some((prefix) => "torture-test/fixtures-src/".startsWith(prefix)),
+      "torture-test/fixtures-src/ must NOT be forbidden — MACP1 authorizes the fixture-source portability surface",
+    );
+    for (const offLimits of [
+      "torture-test/bin/tt-hygiene-canary.mjs",
+      "torture-test/probes/",
+      "torture-test/seeds/",
+      "torture-test/self-tests/tier1-scripted-probe-battery.test.ts",
+    ]) {
+      assert.ok(
+        forbidden.some((prefix) => offLimits === prefix || offLimits.startsWith(prefix)),
+        `forbidden list must keep ${offLimits} off-limits`,
+      );
+    }
+    // e3c1Owned regex unchanged: still matches any tier1 kill-path or
+    // probe-battery self-test name, and nothing else.
+    assert.equal(e3c1Owned.source, "^(tier1-.*kill.*|.*probe-battery.*)\\.test\\.ts$");
+    assert.ok(e3c1Owned.test("tier1-foo-kill.test.ts"), "e3c1Owned must match tier1 kill-path names");
+    assert.ok(e3c1Owned.test("tier1-scripted-probe-battery.test.ts"), "e3c1Owned must match probe-battery names");
+    assert.ok(!e3c1Owned.test("tier1-final-acceptance.test.ts"), "e3c1Owned must not match ordinary tier1 self-tests");
   });
 
   it("bin/tt-hygiene-canary.mjs is byte-identical to the merge-base version", () => {

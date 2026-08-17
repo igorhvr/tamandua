@@ -51,11 +51,27 @@ if ! git -C "$REPO_ROOT" cat-file -t "$FROZEN_SHA" >/dev/null 2>&1; then
 fi
 
 # ── File mapping: original → fork ─────────────────────────────────
-declare -A MAPPING
-MAPPING["e2e-tests/helpers/scripted-agent-runtime.mjs"]="torture-test/scripted-runtimes/runtime-pi.mjs"
-MAPPING["e2e-tests/helpers/scripted-hermes-runtime.mjs"]="torture-test/scripted-runtimes/runtime-hermes.mjs"
-MAPPING["e2e-tests/helpers/scripted-agent-runtime-shared.mjs"]="torture-test/scripted-runtimes/runtime-shared.mjs"
-MAPPING["e2e-tests/helpers/e2e-database.mjs"]="torture-test/scripted-runtimes/database.mjs"
+# bash 3.2 (macOS /bin/bash 3.2.57) has no associative arrays, so the
+# original→fork map is a parallel indexed array plus a case-table
+# lookup function (the established 3.2-safe idiom).
+ORIG_PATHS=(
+  "e2e-tests/helpers/scripted-agent-runtime.mjs"
+  "e2e-tests/helpers/scripted-hermes-runtime.mjs"
+  "e2e-tests/helpers/scripted-agent-runtime-shared.mjs"
+  "e2e-tests/helpers/e2e-database.mjs"
+)
+
+# fork_path_for <orig-path> — echo the forked path for an original, or
+# fail closed (non-zero) for an unknown original.
+fork_path_for() {
+  case "$1" in
+    "e2e-tests/helpers/scripted-agent-runtime.mjs") echo "torture-test/scripted-runtimes/runtime-pi.mjs" ;;
+    "e2e-tests/helpers/scripted-hermes-runtime.mjs") echo "torture-test/scripted-runtimes/runtime-hermes.mjs" ;;
+    "e2e-tests/helpers/scripted-agent-runtime-shared.mjs") echo "torture-test/scripted-runtimes/runtime-shared.mjs" ;;
+    "e2e-tests/helpers/e2e-database.mjs") echo "torture-test/scripted-runtimes/database.mjs" ;;
+    *) echo "fork-parity-check: unknown original path: $1" >&2; return 1 ;;
+  esac
+}
 
 # ── Filter diff to exclude known baseline changes ──────────────────
 #
@@ -166,8 +182,11 @@ filter_diff() {
 RET=0
 DIFFS_FOUND=0
 
-for ORIG_PATH in "${!MAPPING[@]}"; do
-  FORK_PATH="${MAPPING[$ORIG_PATH]}"
+for ORIG_PATH in "${ORIG_PATHS[@]}"; do
+  FORK_PATH="$(fork_path_for "$ORIG_PATH")" || {
+    RET=1
+    continue
+  }
   FORK_ABS="$REPO_ROOT/$FORK_PATH"
 
   if [[ ! -f "$FORK_ABS" ]]; then
@@ -233,7 +252,7 @@ if [[ "$VERIFY_PERTURB" == "true" ]]; then
 fi
 
 if [[ $RET -eq 0 ]]; then
-  echo "fork-parity-check: all ${#MAPPING[@]} files passed (non-knob regions match FROZEN_SHA)" >&2
+  echo "fork-parity-check: all ${#ORIG_PATHS[@]} files passed (non-knob regions match FROZEN_SHA)" >&2
 else
   echo "fork-parity-check: $DIFFS_FOUND file(s) have non-knob drift from FROZEN_SHA" >&2
 fi

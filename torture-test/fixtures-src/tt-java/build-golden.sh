@@ -71,6 +71,41 @@ scratch_dir() {
 }
 
 # -------------------------------------------------------------------
+# Seed SHA registry — bash 3.2-safe
+# -------------------------------------------------------------------
+# macOS /bin/bash 3.2.57 has no associative arrays (a bash 4+ feature), so
+# the former SEED_SHAS associative array is replaced by parallel indexed
+# arrays: SEED_IDS holds the keys and SEED_SHAS holds
+# the values at the same index. seed_sha_set() writes a key (insert or
+# overwrite); seed_sha() reads one back. Script mechanics only — the
+# recorded seed_id -> SHA pairs are identical to the old map.
+SEED_IDS=()
+SEED_SHAS=()
+
+seed_sha_set() {
+    local seed_id="$1" sha="$2" i
+    for ((i = 0; i < ${#SEED_IDS[@]}; i++)); do
+        if [ "${SEED_IDS[$i]}" = "$seed_id" ]; then
+            SEED_SHAS[$i]="$sha"
+            return 0
+        fi
+    done
+    SEED_IDS+=("$seed_id")
+    SEED_SHAS+=("$sha")
+}
+
+seed_sha() {
+    local seed_id="$1" i
+    for ((i = 0; i < ${#SEED_IDS[@]}; i++)); do
+        if [ "${SEED_IDS[$i]}" = "$seed_id" ]; then
+            echo "${SEED_SHAS[$i]}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# -------------------------------------------------------------------
 # Banner
 # -------------------------------------------------------------------
 echo "================================================================="
@@ -133,7 +168,6 @@ echo "--- Phase 2: Building seed refs ---"
 
 # Seeds created from patches (BUG-J1..J4, BRK-J1..J2)
 PATCHED_SEEDS=("BUG-J1" "BUG-J2" "BUG-J3" "BUG-J4" "BRK-J1" "BRK-J2")
-declare -A SEED_SHAS
 
 for seed_id in "${PATCHED_SEEDS[@]}"; do
     seed_patch="seeds/${seed_id}.patch"
@@ -151,7 +185,7 @@ for seed_id in "${PATCHED_SEEDS[@]}"; do
     )
 
     SEED_SHA="$(cd "$SEED_WORK" && git rev-parse HEAD)"
-    SEED_SHAS["$seed_id"]="$SEED_SHA"
+    seed_sha_set "$seed_id" "$SEED_SHA"
 
     (
         cd "$SEED_WORK"
@@ -163,12 +197,12 @@ done
 # Vulns are dormant in the green baseline — seed refs point directly to baseline
 echo "  seed/VULN-J1 (dormant -> baseline)..."
 git --git-dir="$BARE_REPO" update-ref "refs/heads/seed/VULN-J1" "$BASELINE_SHA"
-SEED_SHAS["VULN-J1"]="$BASELINE_SHA"
+seed_sha_set "VULN-J1" "$BASELINE_SHA"
 echo "    -> $BASELINE_SHA"
 
 echo "  seed/VULN-J2 (dormant -> baseline)..."
 git --git-dir="$BARE_REPO" update-ref "refs/heads/seed/VULN-J2" "$BASELINE_SHA"
-SEED_SHAS["VULN-J2"]="$BASELINE_SHA"
+seed_sha_set "VULN-J2" "$BASELINE_SHA"
 echo "    -> $BASELINE_SHA"
 
 ALL_SEEDS=("BUG-J1" "BUG-J2" "BUG-J3" "BUG-J4" "BRK-J1" "BRK-J2" "VULN-J1" "VULN-J2")
@@ -187,10 +221,12 @@ echo ""
 echo "  [3a] Baseline green check..."
 (
     cd "$VERIFY_DIR"
-    if ./mvnw -q -B $MVN_OPTS test > /dev/null 2>&1; then
+    if MVN_OUT="$(./mvnw -q -B $MVN_OPTS test 2>&1)"; then
         echo "    main: GREEN"
     else
         echo "    main: FAILED — baseline suite is not green!"
+        echo "    ── last lines of mvnw test output ──"
+        printf '%s\n' "$MVN_OUT" | tail -20
         exit 1
     fi
 )
@@ -289,10 +325,12 @@ for seed_id in "${PATCHED_SEEDS[@]}"; do
             echo "      Fix patch FAILED to apply!"
             exit 1
         }
-        if ./mvnw -q -B $MVN_OPTS test > /dev/null 2>&1; then
+        if MVN_OUT="$(./mvnw -q -B $MVN_OPTS test 2>&1)"; then
             echo "      +fix: GREEN"
         else
             echo "      +fix: FAILED — fix did not restore green!"
+            echo "      ── last lines of mvnw test output ──"
+            printf '%s\n' "$MVN_OUT" | tail -20
             exit 1
         fi
     )
@@ -314,10 +352,12 @@ for vuln_id in "${VULN_SEEDS[@]}"; do
             echo "      Fix patch FAILED to apply!"
             exit 1
         }
-        if ./mvnw -q -B $MVN_OPTS test > /dev/null 2>&1; then
+        if MVN_OUT="$(./mvnw -q -B $MVN_OPTS test 2>&1)"; then
             echo "      +fix: GREEN"
         else
             echo "      +fix: FAILED — VULN fix broke the suite!"
+            echo "      ── last lines of mvnw test output ──"
+            printf '%s\n' "$MVN_OUT" | tail -20
             exit 1
         fi
     )

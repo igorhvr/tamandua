@@ -159,7 +159,10 @@ watchdog_scope_is_valid() {
   fd_identity=$(stat -Lc '%d:%i' -- "/proc/$BASHPID/fd/$scope_fd" 2>/dev/null) || return 1
   [ "$scope_identity" = "$fd_identity" ] || return 1
 
-  mapfile -t scope_values <"$scope_file" || return 1
+  scope_values=()
+  while IFS= read -r scope_line || [ -n "${scope_line:-}" ]; do
+    scope_values+=("$scope_line")
+  done <"$scope_file" || return 1
   [ "${#scope_values[@]}" -eq 4 ] || return 1
   [ "${scope_values[0]}" = "$TT_SELF_TEST_OWNERSHIP_ROOT" ] || return 1
   [ "${scope_values[1]}" = "$scope_token" ] || return 1
@@ -171,7 +174,10 @@ watchdog_scope_is_valid() {
   process_is_ancestor "$supervisor_pid" || return 1
   supervisor_current_start=$(process_start_time "$supervisor_pid") || return 1
   [ "$supervisor_current_start" = "$supervisor_start" ] || return 1
-  mapfile -d '' -t supervisor_argv <"/proc/$supervisor_pid/cmdline" || return 1
+  supervisor_argv=()
+  while IFS= read -r -d '' supervisor_arg || [ -n "${supervisor_arg:-}" ]; do
+    supervisor_argv+=("$supervisor_arg")
+  done <"/proc/$supervisor_pid/cmdline" || return 1
   [ "${#supervisor_argv[@]}" -ge 2 ] || return 1
   [ "${supervisor_argv[1]}" = "$0" ] || return 1
   case "${supervisor_argv[0]}" in

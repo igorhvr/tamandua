@@ -126,7 +126,7 @@ run_controller() {
   before="$(mktemp)"
   snapshot_campaigns > "$before" || true
   set +e
-  CONTROLLER_OUTPUT="$(env PFLOG="$PFLOG" PFMODE="$PFMODE" "${spare[@]}" \
+  CONTROLLER_OUTPUT="$(env PFLOG="$PFLOG" PFMODE="$PFMODE" ${spare[@]+"${spare[@]}"} \
     "$CONTROLLER" "$@" 2>&1)"
   CONTROLLER_STATUS=$?
   set -e

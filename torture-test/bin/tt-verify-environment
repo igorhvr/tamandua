@@ -19,7 +19,7 @@ const args = process.argv.slice(2);
 const flags = new Set();
 
 function showHelp() {
-  console.log(`Usage: tt-verify-environment [--fast] [--json] [--spend] [--help]
+  console.log(`Usage: tt-verify-environment [--fast] [--json] [--spend] [--tier tier1|tier2] [--help]
 
 W0.0 assumption gate — mechanical environment verification for the tamandua torture-test suite.
 
@@ -28,6 +28,14 @@ Options:
   --json     Machine-readable JSON output to stdout (suppresses table)
   --spend    Run live harness auth probes (pi/hermes 1-prompt); dsh presence is
              always recorded (TAMANDUA_DSH_BINARY first, then PATH), never installed
+  --tier     Scope REQUIRED toolchain checks by host tier (US-008). tier1
+             (spec 04: T1={node,python3}) keeps toolchain-node and
+             toolchain-python3 REQUIRED and downgrades toolchain-java-maven,
+             toolchain-rust-cargo and toolchain-go to informational OPTIONAL
+             checks — their probes still run and record honest presence/
+             build/test evidence in host-profile.json, but a FAIL can no
+             longer flip the exit code. tier2 (the default) keeps all five
+             toolchains REQUIRED.
   --help     Print this usage and exit
 
 Output:
@@ -40,10 +48,30 @@ Exit code:
 `);
 }
 
-for (const arg of args) {
+for (let i = 0; i < args.length; i++) {
+  const arg = args[i];
   if (arg === '--help' || arg === '-h') {
     showHelp();
     process.exit(0);
+  }
+  if (arg === '--tier') {
+    const value = args[i + 1];
+    if (value !== 'tier1' && value !== 'tier2') {
+      console.error(`FATAL: --tier must be 'tier1' or 'tier2' (got '${value}')`);
+      process.exit(1);
+    }
+    flags.add(`--tier=${value}`);
+    i += 1; // consume the value
+    continue;
+  }
+  if (arg.startsWith('--tier=')) {
+    const value = arg.slice('--tier='.length);
+    if (value !== 'tier1' && value !== 'tier2') {
+      console.error(`FATAL: --tier must be 'tier1' or 'tier2' (got '${value}')`);
+      process.exit(1);
+    }
+    flags.add(arg);
+    continue;
   }
   flags.add(arg);
 }
@@ -53,6 +81,8 @@ const OPT = {
   json: flags.has('--json'),
   spend: flags.has('--spend'),
   testRequiredFail: flags.has('--test-required-fail'),
+  // Default tier2-wide behavior: all five toolchains REQUIRED.
+  tier: flags.has('--tier=tier1') ? 'tier1' : 'tier2',
 };
 
 // ── Paths ─────────────────────────────────────────────────────────────
@@ -1618,6 +1648,24 @@ if (OPT.testRequiredFail) {
   }));
 }
 
+// ── Tier scoping (US-008) ─────────────────────────────────────────────
+// Per spec 04: T1 = {node, python3}. java+maven, rust/cargo and go are
+// Tier-2 capabilities. When --tier tier1 is requested, those three
+// toolchain checks are downgraded from REQUIRED to OPTIONAL
+// (informational): the probes still run and record honest presence/
+// build/test evidence in host-profile.json (e.g. 'mvn not found on PATH'),
+// but a FAIL can no longer flip the exit code. tier2 (the default) keeps
+// all five toolchains REQUIRED. This must run after every registerCheck
+// call (including the conditional --test-required-fail hook above).
+const TIER2_ONLY_TOOLCHAIN_CHECKS = ['toolchain-java-maven', 'toolchain-rust-cargo', 'toolchain-go'];
+if (OPT.tier === 'tier1') {
+  for (const check of checks) {
+    if (TIER2_ONLY_TOOLCHAIN_CHECKS.includes(check.id)) {
+      check.severity = 'OPTIONAL';
+    }
+  }
+}
+
 // ── Spawn-speed class (US-011) ──────────────────────────────────────
 // Spawns true 100 times and measures wall clock time.
 // Classifies as fast / normal / slow based on median spawn time.
@@ -1732,6 +1780,7 @@ function writeProfileFiles(results, exitCode) {
     flags: {
       fast: OPT.fast,
       spend: OPT.spend,
+      tier: OPT.tier,
     },
   };
 
@@ -1799,6 +1848,7 @@ function formatJson(results, exitCode, tier) {
     flags: {
       fast: OPT.fast,
       spend: OPT.spend,
+      tier: OPT.tier,
     },
     hostProfile,  // raw accumulator (US-002 populates)
   };

@@ -75,7 +75,7 @@ usage() {
   cat <<EOF
 run-torture-test — tamandua torture-test suite (spec: torture-test/tamandua-torture-test-spec/)
 
-Usage: run-torture-test [--smoke | --tier0 [--include-real] | --tier1 [--include-real] | --tier2 [--include-real] | --report | --help]
+Usage: run-torture-test [--smoke | --tier0 [--include-real] | --tier1 [--include-real] | --tier2 [--include-real] | --provision [tier1|tier2] | --report | --help]
 
 Tiers (explicit flag = run immediately, no countdown):
 EOF
@@ -93,6 +93,17 @@ EOF
 
   --report   Print the most recent results summary and exit.
   --help     This help.
+
+  --provision [tier1|tier2]  Single provision entry point (US-009): run the
+             environment gate for the tier, then golden-bootstrap every
+             fixture in the tier's set (idempotent: absent golden -> build +
+             verify; present + valid -> no-op, never rebuilt). Bare
+             --provision defaults to tier1 (fixtures: tt-python, tt-ts,
+             tt-poly-lite, tt-python@master); tier2 provisions all eight
+             fixtures. Fail-closed: a non-zero verify or a failed fixture
+             bootstrap exits non-zero with the per-asset reason.
+             --provision is exclusive — it cannot be combined with tier
+             flags, --include-real, --case, or --report.
 
   --tier0 runs the scripted/local push-gate cases only (zero tokens).
   --tier0 --include-real includes both real canaries.
@@ -123,6 +134,61 @@ report_latest() {
   fi
 }
 
+# ── US-009: --provision single provision entry point ─────────────────
+# Per-tier fixture sets (spec 04 W0.4 Tier-1 + cases/tier1.jsonl usage):
+#   tier1 -> tt-python, tt-ts, tt-poly-lite, tt-python@master
+#   tier2 -> all eight KNOWN_FIXTURES from tt-golden-bootstrap.mjs
+provision_fixtures() {
+  case "$1" in
+    tier1) printf '%s\n' tt-python tt-ts tt-poly-lite 'tt-python@master' ;;
+    tier2) printf '%s\n' tt-go tt-java tt-poly tt-poly-lite tt-python 'tt-python@master' tt-rust tt-ts ;;
+    *) return 1 ;;
+  esac
+}
+
+# run_provision <tier> — verify the environment gate for the tier, then
+# golden-bootstrap every fixture in the tier's set (absent golden -> build +
+# verify; present + valid -> idempotent no-op, never rebuilt). Fail-closed:
+# a non-zero verify surfaces its failure and exits non-zero; any fixture that
+# fails to bootstrap prints its per-asset fail-closed reason and the overall
+# run exits non-zero.
+run_provision() {
+  local tier="$1"
+  echo "== Provisioning tier '$tier' =="
+  echo "-- [1/2] environment gate: tt-verify-environment --tier $tier"
+  if ! "$TT_BIN_DIR/tt-verify-environment" --tier "$tier"; then
+    echo "PROVISION FAILED: environment gate failed for tier '$tier' (see tt-verify-environment output above)." >&2
+    exit 1
+  fi
+  local fixtures
+  fixtures="$(provision_fixtures "$tier")" || {
+    echo "PROVISION FAILED: no fixture set is defined for tier '$tier'." >&2
+    exit 2
+  }
+  echo "-- [2/2] golden fixture bootstrap (per-asset, fail-closed)"
+  local fixture failures=0
+  for fixture in $fixtures; do
+    printf '  [provision] %-16s ' "$fixture"
+    if OUT="$("$TT_BIN_DIR/tt-golden-bootstrap.mjs" --fixture "$fixture" 2>&1)"; then
+      if printf '%s' "$OUT" | grep -q '"built":true'; then
+        echo "OK (built)"
+      else
+        echo "OK (present, no rebuild)"
+      fi
+    else
+      echo "FAILED" >&2
+      printf '    per-asset fail-closed reason: %s\n' "$OUT" | tail -20 >&2
+      failures=$((failures + 1))
+    fi
+  done
+  if [ "$failures" -gt 0 ]; then
+    echo "PROVISION FAILED: $failures fixture(s) failed to bootstrap (fail-closed, reasons above)." >&2
+    exit 1
+  fi
+  echo "Provision complete for tier '$tier': environment gate green, all fixtures OK."
+  exit 0
+}
+
 run_tier() {
   local tier="$1"
   local include_real="${2:-false}"
@@ -142,27 +208,27 @@ run_tier() {
   fi
   case "$tier" in
     smoke)
-      exec "$TT_BIN_DIR/tt-controller" --manifest "$manifest" "${case_args[@]}"
+      exec "$TT_BIN_DIR/tt-controller" --manifest "$manifest" ${case_args[@]+"${case_args[@]}"}
       ;;
     tier0)
       if [ "$include_real" = true ]; then
-        exec "$TT_BIN_DIR/tt-controller" --manifest "$manifest" "${case_args[@]}"
+        exec "$TT_BIN_DIR/tt-controller" --manifest "$manifest" ${case_args[@]+"${case_args[@]}"}
       fi
-      exec "$TT_BIN_DIR/tt-controller" --manifest "$manifest" "${case_args[@]}" --scripted-only
+      exec "$TT_BIN_DIR/tt-controller" --manifest "$manifest" ${case_args[@]+"${case_args[@]}"} --scripted-only
       ;;
     tier1)
       if [ "$include_real" = true ]; then
-        exec "$TT_BIN_DIR/tt-controller" --manifest "$manifest" "${case_args[@]}"
+        exec "$TT_BIN_DIR/tt-controller" --manifest "$manifest" ${case_args[@]+"${case_args[@]}"}
       fi
-      exec "$TT_BIN_DIR/tt-controller" --manifest "$manifest" "${case_args[@]}" --scripted-only
+      exec "$TT_BIN_DIR/tt-controller" --manifest "$manifest" ${case_args[@]+"${case_args[@]}"} --scripted-only
       ;;
     tier2)
       # US-015: identical tier1 contract — bare = scripted-only + real cases
       # pending-real (zero tokens); --include-real = full Tier-2 campaign.
       if [ "$include_real" = true ]; then
-        exec "$TT_BIN_DIR/tt-controller" --manifest "$manifest" "${case_args[@]}"
+        exec "$TT_BIN_DIR/tt-controller" --manifest "$manifest" ${case_args[@]+"${case_args[@]}"}
       fi
-      exec "$TT_BIN_DIR/tt-controller" --manifest "$manifest" "${case_args[@]}" --scripted-only
+      exec "$TT_BIN_DIR/tt-controller" --manifest "$manifest" ${case_args[@]+"${case_args[@]}"} --scripted-only
       ;;
     *)
       echo "internal error: tier '$tier' marked available but has no runner" >&2
@@ -218,7 +284,20 @@ tier=""
 include_real="false"
 case_id=""
 report_requested="false"
+provision_requested="false"
+provision_tier=""
 while [ "$#" -gt 0 ]; do
+  # US-009: --provision is exclusive (parallel to --report) — any tier or
+  # selection flag after it is a usage error, never a silent half-parse.
+  if [ "$provision_requested" = "true" ]; then
+    case "$1" in
+      --smoke|--tier0|--tier1|--tier2|--include-real|--case|--report)
+        echo "--provision cannot be combined with tier flags, --include-real, --case, or --report" >&2
+        usage >&2
+        exit 4
+        ;;
+    esac
+  fi
   case "$1" in
     --smoke|--tier0|--tier1|--tier2)
       if [ -n "$tier" ] && [ "$tier" != "$1" ]; then
@@ -240,6 +319,26 @@ while [ "$#" -gt 0 ]; do
       case_id="$2"
       shift
       ;;
+    --provision)
+      provision_requested="true"
+      # Optional tier: consume a bare 'tier1'/'tier2' (fail-closed on any
+      # other bare word); flags are left for the loop so the exclusivity
+      # guard rejects them with exit 4.
+      if [ "$#" -gt 1 ]; then
+        case "$2" in
+          tier1|tier2)
+            provision_tier="$2"
+            shift
+            ;;
+          -*) : ;;
+          *)
+            echo "Invalid --provision tier: '$2' (expected tier1 or tier2)" >&2
+            usage >&2
+            exit 4
+            ;;
+        esac
+      fi
+      ;;
     --report)
       report_requested="true"
       ;;
@@ -255,6 +354,16 @@ while [ "$#" -gt 0 ]; do
   esac
   shift
 done
+
+if [ "$provision_requested" = "true" ]; then
+  if [ -n "$tier" ] || [ "$include_real" = "true" ] || [ -n "$case_id" ] || [ "$report_requested" = "true" ]; then
+    echo "--provision cannot be combined with tier flags, --include-real, --case, or --report" >&2
+    usage >&2
+    exit 4
+  fi
+  run_provision "${provision_tier:-tier1}"
+  exit 0
+fi
 
 if [ "$report_requested" = "true" ]; then
   if [ -n "$tier" ] || [ "$include_real" = "true" ] || [ -n "$case_id" ]; then

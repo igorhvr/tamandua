@@ -583,7 +583,10 @@ else
 fi
 
 # Port checks run in --fast mode (they are not toolchain probes)
-fast_output=$("$TOOL" --fast 2>&1)
+# Guarded: the tool legitimately exits non-zero on hosts with a REQUIRED
+# failure (e.g. a TT port held by an unrelated daemon) — under set -e a
+# bare assignment would abort the whole suite before the later tests.
+fast_output=$("$TOOL" --fast 2>&1) && : || :
 if echo "$fast_output" | grep -qE "port-3334.*\|.*PASS"; then
   pass "port checks run in --fast mode (port-3334 present)"
 else
@@ -1296,6 +1299,218 @@ if jq -e '[.nodeRuntimes[] | has("sqliteAvailable")] | all' "$HP" > /dev/null 2>
 else
   fail "a recorded node runtime lacks sqliteAvailable"
 fi
+
+# ── Test 17: US-008 — --tier scoping of REQUIRED toolchain checks ────
+echo ""
+echo "--- Test: US-008 --tier scoping ---"
+
+# AC1: --help documents --tier
+if "$TOOL" --help 2>&1 | grep -q -- "--tier"; then
+  pass "--help documents --tier"
+else
+  fail "--help does not document --tier"
+fi
+
+# Invalid --tier values fail closed with a clear message (exit 1)
+"$TOOL" --tier bogus > /dev/null 2>&1 && bogus_exit=$? || bogus_exit=$?
+bogus_msg=$("$TOOL" --tier bogus 2>&1) || true
+if [ "$bogus_exit" -ne 0 ] && echo "$bogus_msg" | grep -q "must be 'tier1' or 'tier2'"; then
+  pass "--tier with an invalid value fails closed (exit ${bogus_exit})"
+else
+  fail "--tier bogus did not fail closed with the tier1|tier2 message"
+fi
+
+# AC2/AC3: simulate a T1-only host (spec 04: T1={node,python3}) with a
+# restricted PATH: a temp bin dir holding symlinks to the real binaries the
+# W0.0 checks need (node/npm/python3/git/bash/which/curl/jq/sqlite3/df/true/
+# sh/systemd-run/systemctl) but WITHOUT the tier-2 toolchains (mvn, cargo,
+# go). ss/lsof are also omitted so the port probe reports every port free —
+# the toolchain gap is then the ONLY delta, keeping the simulation
+# deterministic even on a host whose TT ports are occupied by unrelated
+# daemons (e.g. a sibling tamandua instance).
+FAKE_BIN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/tt-verify-tier-fake.XXXXXX")"
+for bin_name in node npm python3 git bash which curl jq sqlite3 df true sh systemd-run systemctl; do
+  real_path="$(command -v "$bin_name" 2>/dev/null || true)"
+  if [ -n "$real_path" ]; then
+    ln -s "$real_path" "$FAKE_BIN_DIR/$bin_name"
+  fi
+done
+
+# The tier-2 toolchains must be absent from the simulated PATH
+for absent_bin in mvn cargo go; do
+  if PATH="$FAKE_BIN_DIR" command -v "$absent_bin" > /dev/null 2>&1; then
+    fail "T1-only simulation: ${absent_bin} unexpectedly resolvable on the restricted PATH"
+  else
+    pass "T1-only simulation: ${absent_bin} absent from the restricted PATH"
+  fi
+done
+
+# AC2: --tier tier1 --json on the T1-only host exits 0, marks the three
+# tier-2 toolchains required:false with honest 'not found' evidence, and
+# keeps node+python3 required:true (they PASS).
+t1_json=$(PATH="$FAKE_BIN_DIR" "$TOOL" --tier tier1 --json 2>&1) && t1_exit=$? || t1_exit=$?
+if [ "$t1_exit" -eq 0 ]; then
+  pass "T1-only host: --tier tier1 --json exits 0"
+else
+  fail "T1-only host: --tier tier1 --json exited ${t1_exit}, expected 0"
+fi
+
+for tc in toolchain-java-maven toolchain-rust-cargo toolchain-go; do
+  if echo "$t1_json" | jq -e ".checks[] | select(.id == \"${tc}\" and .required == false and .result == \"FAIL\" and (.evidence | contains(\"not found\")))" > /dev/null 2>&1; then
+    pass "T1-only host: ${tc} is required:false and FAILs with 'not found' evidence under tier1"
+  else
+    fail "T1-only host: ${tc} not required:false+FAIL('not found') under tier1"
+  fi
+done
+
+for tc in toolchain-node toolchain-python3; do
+  if echo "$t1_json" | jq -e ".checks[] | select(.id == \"${tc}\" and .required == true and .result == \"PASS\")" > /dev/null 2>&1; then
+    pass "T1-only host: ${tc} stays required:true and PASSes under tier1"
+  else
+    fail "T1-only host: ${tc} not required:true+PASS under tier1"
+  fi
+done
+
+# host-profile honesty: the three absent toolchains record present=false with
+# 'not found' evidence even though they are informational under tier1
+for tc_key in 'java+maven' 'rust/cargo' go; do
+  if echo "$t1_json" | jq -e ".hostProfile.toolchains.\"${tc_key}\".present == false and (.hostProfile.toolchains.\"${tc_key}\".evidence | contains(\"not found\"))" > /dev/null 2>&1; then
+    pass "T1-only host: hostProfile.toolchains['${tc_key}'] records present=false ('not found')"
+  else
+    fail "T1-only host: hostProfile.toolchains['${tc_key}'] missing honest absence record"
+  fi
+done
+
+# AC: environment.json (var/w0/environment.json) marks the scoped checks
+# required:false and records the requested tier — right after the tier1
+# restricted run above, the profile file still reflects it.
+ENV_FILE_US008="${SCRIPT_DIR}/../var/w0/environment.json"
+if [ -f "$ENV_FILE_US008" ] \
+  && jq -e '.flags.tier == "tier1"' "$ENV_FILE_US008" > /dev/null 2>&1 \
+  && jq -e '[.checks[] | select(.id == "toolchain-java-maven" or .id == "toolchain-rust-cargo" or .id == "toolchain-go") | .required] | all(. == false)' "$ENV_FILE_US008" > /dev/null 2>&1; then
+  pass "environment.json records flags.tier=tier1 with the three tier-2 toolchains required:false"
+else
+  fail "environment.json missing tier1 scoping marks (flags.tier / required:false)"
+fi
+
+# AC3: --tier tier2 --json and the default invocation on the same T1-only
+# host exit non-zero with the absent toolchains required:true.
+t2_json=$(PATH="$FAKE_BIN_DIR" "$TOOL" --tier tier2 --json 2>&1) && t2_exit=$? || t2_exit=$?
+if [ "$t2_exit" -ne 0 ]; then
+  pass "T1-only host: --tier tier2 --json exits non-zero (${t2_exit})"
+else
+  fail "T1-only host: --tier tier2 --json exited 0, expected non-zero"
+fi
+for tc in toolchain-java-maven toolchain-rust-cargo toolchain-go; do
+  if echo "$t2_json" | jq -e ".checks[] | select(.id == \"${tc}\" and .required == true and .result == \"FAIL\")" > /dev/null 2>&1; then
+    pass "T1-only host: ${tc} is required:true and FAILs under --tier tier2"
+  else
+    fail "T1-only host: ${tc} not required:true+FAIL under --tier tier2"
+  fi
+done
+
+def_json=$(PATH="$FAKE_BIN_DIR" "$TOOL" --json 2>&1) && def_exit=$? || def_exit=$?
+if [ "$def_exit" -ne 0 ]; then
+  pass "T1-only host: default invocation exits non-zero (${def_exit})"
+else
+  fail "T1-only host: default invocation exited 0, expected non-zero"
+fi
+for tc in toolchain-java-maven toolchain-rust-cargo toolchain-go; do
+  if echo "$def_json" | jq -e ".checks[] | select(.id == \"${tc}\" and .required == true and .result == \"FAIL\")" > /dev/null 2>&1; then
+    pass "T1-only host: ${tc} is required:true and FAILs by default (tier2-wide default)"
+  else
+    fail "T1-only host: ${tc} not required:true+FAIL by default"
+  fi
+done
+
+# The JSON flags record the requested tier, and environment.json marks the
+# scoped checks required:false (US-008 "environment.json / --json output").
+if echo "$t1_json" | jq -e '.flags.tier == "tier1"' > /dev/null 2>&1 \
+  && echo "$t2_json" | jq -e '.flags.tier == "tier2"' > /dev/null 2>&1; then
+  pass "JSON flags.tier records the requested tier (tier1 / tier2)"
+else
+  fail "JSON flags.tier missing or wrong"
+fi
+
+# AC4: On the full host (all five toolchains present) --tier tier1 keeps
+# the gate green: the tier-2 toolchains are informational (required:false)
+# and the exit code is driven solely by the remaining REQUIRED checks — a
+# tier-2 toolchain FAIL can NEVER be the cause of a non-zero exit. The
+# exit code must agree with the JSON exitCode (required-only computation).
+full_t1_json=$("$TOOL" --tier tier1 --json 2>&1) && full_t1_exit=$? || full_t1_exit=$?
+full_t1_json_exit=$(echo "$full_t1_json" | jq -r '.exitCode' 2>/dev/null || echo "unreadable")
+if [ "$full_t1_exit" = "$full_t1_json_exit" ]; then
+  pass "full host: --tier tier1 exit code (${full_t1_exit}) matches JSON exitCode"
+else
+  fail "full host: --tier tier1 exit ${full_t1_exit} != JSON exitCode ${full_t1_json_exit}"
+fi
+for tc in toolchain-java-maven toolchain-rust-cargo toolchain-go; do
+  if echo "$full_t1_json" | jq -e ".checks[] | select(.id == \"${tc}\" and .required == false)" > /dev/null 2>&1; then
+    pass "full host: ${tc} is required:false under --tier tier1"
+  else
+    fail "full host: ${tc} not required:false under --tier tier1"
+  fi
+done
+
+# Literal AC4: when no non-toolchain REQUIRED check fails, the gate is green
+# (exit 0). If the ambient host has an unrelated REQUIRED failure (e.g. a TT
+# port held by a sibling daemon), report it as host-state SKIP — the tier1
+# scoping property is still fully verified above.
+if echo "$full_t1_json" | jq -e '[.checks[] | select(.required and .result == "FAIL")] | length == 0' > /dev/null 2>&1; then
+  if [ "$full_t1_exit" -eq 0 ]; then
+    pass "full host: --tier tier1 --json exits 0 (no REQUIRED failure)"
+  else
+    fail "full host: --tier tier1 exited ${full_t1_exit} despite zero REQUIRED failures"
+  fi
+else
+  req_fail_ids=$(echo "$full_t1_json" | jq -r '[.checks[] | select(.required and .result == "FAIL") | .id] | join(", ")')
+  echo "  SKIP (host state): full host has non-toolchain REQUIRED failures (${req_fail_ids}) — tier1 scoping verified above"
+fi
+
+# AC4 (deterministic): a fully-provisioned host — ALL five toolchains on
+# PATH (mvn/cargo/go included) with the port probe silenced (no ss/lsof, so
+# every port reports free) — passes the tier1 gate with exit 0. This proves
+# the literal AC4 claim host-state-independently: a full toolchain host is
+# never failed by --tier tier1.
+FAKE_FULL_DIR="$(mktemp -d "${TMPDIR:-/tmp}/tt-verify-tier-full.XXXXXX")"
+for bin_name in node npm python3 git bash which curl jq sqlite3 df true sh systemd-run systemctl mvn cargo go; do
+  real_path="$(command -v "$bin_name" 2>/dev/null || true)"
+  if [ -n "$real_path" ]; then
+    ln -s "$real_path" "$FAKE_FULL_DIR/$bin_name"
+  fi
+done
+full_t1_det_json=$(PATH="$FAKE_FULL_DIR" "$TOOL" --tier tier1 --fast --json 2>&1) && full_t1_det_exit=$? || full_t1_det_exit=$?
+if [ "$full_t1_det_exit" -eq 0 ]; then
+  pass "full toolchain host: --tier tier1 --json exits 0 (deterministic, ports silenced)"
+else
+  fail "full toolchain host: --tier tier1 --json exited ${full_t1_det_exit}, expected 0"
+fi
+for tc in toolchain-java-maven toolchain-rust-cargo toolchain-go; do
+  if echo "$full_t1_det_json" | jq -e ".checks[] | select(.id == \"${tc}\" and .required == false)" > /dev/null 2>&1; then
+    pass "full toolchain host: ${tc} is required:false under --tier tier1"
+  else
+    fail "full toolchain host: ${tc} not required:false under --tier tier1"
+  fi
+done
+rm -rf -- "$FAKE_FULL_DIR"
+
+# Surgical scoping: the ONLY required-flag difference between tier1 and
+# tier2 on the same host is the three tier-2 toolchains.
+full_t2_json=$("$TOOL" --tier tier2 --json 2>&1) && full_t2_exit=$? || full_t2_exit=$?
+delta_ids=$(jq -rn \
+  --argjson t1 "$(echo "$full_t1_json" | jq '[.checks[] | {id, required}]')" \
+  --argjson t2 "$(echo "$full_t2_json" | jq '[.checks[] | {id, required}]')" \
+  '$t2 - $t1 | map(.id) | sort | join(",")') || delta_ids="__JQ_ERROR__"
+if [ "$delta_ids" = "toolchain-go,toolchain-java-maven,toolchain-rust-cargo" ]; then
+  pass "tier1 vs tier2 required-flag delta is exactly the three tier-2 toolchains"
+else
+  fail "tier1 vs tier2 required-flag delta = '${delta_ids}' (expected only the three tier-2 toolchains)"
+fi
+
+# Restore host-profile.json/environment.json from the real host (the
+# restricted-PATH runs above overwrote them with the T1-only simulation).
+"$TOOL" --fast > /dev/null 2>&1 && : || :
+rm -rf -- "$FAKE_BIN_DIR"
 
 # ── Summary ───────────────────────────────────────────────────────────
 echo ""

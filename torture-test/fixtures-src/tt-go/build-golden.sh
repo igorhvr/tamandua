@@ -212,17 +212,21 @@ trap 'cleanup_scratch; cleanup_work' EXIT
 git clone -q "$GOLDEN_BARE" "$SCRATCH_DIR"
 
 # Baseline (main branch — default) should be GREEN.
-if (cd "$SCRATCH_DIR" && go test ./... >/dev/null 2>&1); then
+if GO_OUT="$(cd "$SCRATCH_DIR" && go test ./... 2>&1)"; then
     echo "  ✓ Baseline test suite: GREEN"
 else
     echo "  ✗ Baseline test suite: RED — unexpected!" >&2
+    echo "  ── last lines of go test output ──" >&2
+    printf '%s\n' "$GO_OUT" | tail -20 >&2
     exit 1
 fi
 
 # broken-tests branch should be RED.
 (cd "$SCRATCH_DIR" && git checkout -q broken-tests)
-if (cd "$SCRATCH_DIR" && go test ./... >/dev/null 2>&1); then
+if GO_OUT="$(cd "$SCRATCH_DIR" && go test ./... 2>&1)"; then
     echo "  ✗ broken-tests branch: GREEN — expected RED!" >&2
+    echo "  ── last lines of go test output ──" >&2
+    printf '%s\n' "$GO_OUT" | tail -20 >&2
     exit 1
 else
     echo "  ✓ broken-tests branch: RED (expected)"

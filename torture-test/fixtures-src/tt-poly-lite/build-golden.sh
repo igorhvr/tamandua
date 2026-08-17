@@ -297,11 +297,20 @@ echo "  [6a] Baseline green check..."
 echo -n "    python/..."
 (
     cd "$VERIFY_DIR"
-    bash python/bootstrap > /dev/null 2>&1
-    if (cd python && .venv/bin/python -m pytest -q --tb=short > /dev/null 2>&1); then
+    # US-007: capture bootstrap/pytest output and surface the tail on
+    # failure instead of swallowing to /dev/null and failing generically.
+    if ! BOOT_OUT="$(bash python/bootstrap 2>&1)"; then
+        echo " FAILED — python bootstrap failed!"
+        echo "    ── last lines of bootstrap output ──"
+        printf '%s\n' "$BOOT_OUT" | tail -20
+        exit 1
+    fi
+    if PYTEST_OUT="$(cd python && .venv/bin/python -m pytest -q --tb=short 2>&1)"; then
         echo " GREEN"
     else
         echo " FAILED — python baseline suite is not green!"
+        echo "    ── last lines of pytest output ──"
+        printf '%s\n' "$PYTEST_OUT" | tail -20
         exit 1
     fi
 )
@@ -310,11 +319,18 @@ echo -n "    python/..."
 echo -n "    ts/..."
 (
     cd "$VERIFY_DIR/ts"
-    npm install > /dev/null 2>&1
-    if npm test > /dev/null 2>&1; then
+    if ! INSTALL_OUT="$(npm install 2>&1)"; then
+        echo " FAILED — npm install failed!"
+        echo "      ── last lines of npm install output ──"
+        printf '%s\n' "$INSTALL_OUT" | tail -20
+        exit 1
+    fi
+    if TEST_OUT="$(npm test 2>&1)"; then
         echo "      GREEN"
     else
         echo "      FAILED — ts baseline suite is not green!"
+        echo "      ── last lines of npm test output ──"
+        printf '%s\n' "$TEST_OUT" | tail -20
         exit 1
     fi
 )
@@ -331,8 +347,10 @@ echo "  [6b] broken-tests branch check..."
 echo -n "    python/..."
 (
     cd "$VERIFY_DIR"
-    if (cd python && .venv/bin/python -m pytest -q --tb=short > /dev/null 2>&1); then
+    if PYTEST_OUT="$(cd python && .venv/bin/python -m pytest -q --tb=short 2>&1)"; then
         echo " UNEXPECTED GREEN — broken-tests branch should be red!"
+        echo "    ── last lines of pytest output ──"
+        printf '%s\n' "$PYTEST_OUT" | tail -20
         exit 1
     else
         echo " RED (expected)"
@@ -342,8 +360,10 @@ echo -n "    python/..."
 echo -n "    ts/..."
 (
     cd "$VERIFY_DIR/ts"
-    if npm test > /dev/null 2>&1; then
+    if TEST_OUT="$(npm test 2>&1)"; then
         echo "      UNEXPECTED GREEN — broken-tests branch should be red!"
+        echo "      ── last lines of npm test output ──"
+        printf '%s\n' "$TEST_OUT" | tail -20
         exit 1
     else
         echo "      RED (expected)"
@@ -370,8 +390,11 @@ for junk_path in "python/__pycache__" "python/.pytest_cache" "python/.flaky_coun
     if [ -e "$VERIFY_DIR/$junk_path" ]; then
         if (cd "$VERIFY_DIR" && git status --porcelain "$junk_path" 2>/dev/null | grep -q '^??'); then
             echo "    $junk_path : UNTRACKED (ok)"
-        elif (cd "$VERIFY_DIR" && git status --porcelain "$junk_path" 2>/dev/null | grep -q '^[^?]'); then
+        elif JUNK_STATUS="$(cd "$VERIFY_DIR" && git status --porcelain "$junk_path" 2>/dev/null)" \
+             && printf '%s\n' "$JUNK_STATUS" | grep -q '^[^?]'; then
             echo "    $junk_path : TRACKED — junk probe failure!"
+            echo "    ── git status output ──"
+            printf '%s\n' "$JUNK_STATUS" | tail -20
             exit 1
         else
             echo "    $junk_path : present but status unclear — checking .gitignore..."
@@ -414,8 +437,11 @@ echo -n "    ts/package-lock.json..."
 if [ -f "$VERIFY_DIR/ts/package-lock.json" ]; then
     if (cd "$VERIFY_DIR" && git status --porcelain ts/package-lock.json 2>/dev/null | grep -q '^??'); then
         echo " UNTRACKED (ok)"
-    elif (cd "$VERIFY_DIR" && git status --porcelain ts/package-lock.json 2>/dev/null | grep -q '^[^?]'); then
+    elif JUNK_STATUS="$(cd "$VERIFY_DIR" && git status --porcelain ts/package-lock.json 2>/dev/null)" \
+         && printf '%s\n' "$JUNK_STATUS" | grep -q '^[^?]'; then
         echo " TRACKED — junk probe failure!"
+        echo "    ── git status output ──"
+        printf '%s\n' "$JUNK_STATUS" | tail -20
         exit 1
     else
         echo " status unclear — checking .gitignore..."
@@ -439,8 +465,11 @@ echo -n "    ts/node_modules/..."
 if [ -d "$VERIFY_DIR/ts/node_modules" ]; then
     if (cd "$VERIFY_DIR" && git status --porcelain ts/node_modules/ 2>/dev/null | head -1 | grep -q '^??'); then
         echo "     UNTRACKED (ok)"
-    elif (cd "$VERIFY_DIR" && git status --porcelain ts/node_modules/ 2>/dev/null | head -1 | grep -q '^[^?]'); then
+    elif JUNK_STATUS="$(cd "$VERIFY_DIR" && git status --porcelain ts/node_modules/ 2>/dev/null)" \
+         && printf '%s\n' "$JUNK_STATUS" | grep -q '^[^?]'; then
         echo "     TRACKED — junk probe failure!"
+        echo "     ── git status output ──"
+        printf '%s\n' "$JUNK_STATUS" | tail -20
         exit 1
     else
         echo "     status unclear — checking .gitignore..."
@@ -488,7 +517,14 @@ for seed_id in "${PYTHON_BUG_SEEDS[@]}" "${PYTHON_VULN_SEEDS[@]}"; do
     (
         cd "$PY_VERIFY"
         git checkout "seed/$seed_id" > /dev/null 2>&1
-        bash python/bootstrap > /dev/null 2>&1
+        # US-007: surface the bootstrap tail on failure instead of a
+        # silent set -e abort.
+        if ! BOOT_OUT="$(bash python/bootstrap 2>&1)"; then
+            echo "    $seed_id: python bootstrap FAILED!"
+            echo "    ── last lines of bootstrap output ──"
+            printf '%s\n' "$BOOT_OUT" | tail -20
+            exit 1
+        fi
     )
 
     if [ "${seed_id:0:7}" = "POLY-BU" ]; then
@@ -521,19 +557,23 @@ for seed_id in "${PYTHON_BUG_SEEDS[@]}" "${PYTHON_VULN_SEEDS[@]}"; do
                 exit 1
             }
         )
-        if (cd "$PY_VERIFY/python" && .venv/bin/python -m pytest -q --tb=short > /dev/null 2>&1); then
+        if FIX_OUT="$(cd "$PY_VERIFY/python" && .venv/bin/python -m pytest -q --tb=short 2>&1)"; then
             echo " GREEN"
         else
             echo " FAILED — fix did not restore green!"
+            echo "    ── last lines of pytest output ──"
+            printf '%s\n' "$FIX_OUT" | tail -20
             exit 1
         fi
     else
         # VULN seeds — dormant (green baseline)
         echo -n "    $seed_id (VULN — dormant)..."
-        if (cd "$PY_VERIFY/python" && .venv/bin/python -m pytest -q --tb=short > /dev/null 2>&1); then
+        if VULN_OUT="$(cd "$PY_VERIFY/python" && .venv/bin/python -m pytest -q --tb=short 2>&1)"; then
             echo " GREEN (dormant — ok)"
         else
             echo " UNEXPECTED RED!"
+            echo "    ── last lines of pytest output ──"
+            printf '%s\n' "$VULN_OUT" | tail -20
             exit 1
         fi
 
@@ -547,10 +587,12 @@ for seed_id in "${PYTHON_BUG_SEEDS[@]}" "${PYTHON_VULN_SEEDS[@]}"; do
                 exit 1
             }
         )
-        if (cd "$PY_VERIFY/python" && .venv/bin/python -m pytest -q --tb=short > /dev/null 2>&1); then
+        if FIX_OUT="$(cd "$PY_VERIFY/python" && .venv/bin/python -m pytest -q --tb=short 2>&1)"; then
             echo " GREEN"
         else
             echo " FAILED — VULN fix should not break the suite!"
+            echo "    ── last lines of pytest output ──"
+            printf '%s\n' "$FIX_OUT" | tail -20
             exit 1
         fi
     fi
@@ -567,7 +609,12 @@ for seed_id in "${TS_BUG_SEEDS[@]}" "${TS_BRK_SEEDS[@]}"; do
     (
         cd "$TS_VERIFY"
         git checkout "seed/$seed_id" > /dev/null 2>&1
-        (cd ts && npm install > /dev/null 2>&1)
+        if ! INSTALL_OUT="$(cd ts && npm install 2>&1)"; then
+            echo "    $seed_id: npm install FAILED!"
+            echo "    ── last lines of npm install output ──"
+            printf '%s\n' "$INSTALL_OUT" | tail -20
+            exit 1
+        fi
     )
 
     if [ "${seed_id:0:7}" = "POLY-BU" ]; then
@@ -594,6 +641,8 @@ for seed_id in "${TS_BUG_SEEDS[@]}" "${TS_BRK_SEEDS[@]}"; do
             echo " RED (exit=$EXIT — ok)"
         else
             echo " UNEXPECTED GREEN — BRK seed should fail!"
+            echo "    ── last lines of npm test output ──"
+            printf '%s\n' "$OUT" | tail -20
             exit 1
         fi
     fi
@@ -608,10 +657,12 @@ for seed_id in "${TS_BUG_SEEDS[@]}" "${TS_BRK_SEEDS[@]}"; do
             exit 1
         }
     )
-    if (cd "$TS_VERIFY/ts" && npm test > /dev/null 2>&1); then
+    if FIX_OUT="$(cd "$TS_VERIFY/ts" && npm test 2>&1)"; then
         echo " GREEN"
     else
         echo " FAILED — fix did not restore green!"
+        echo "    ── last lines of npm test output ──"
+        printf '%s\n' "$FIX_OUT" | tail -20
         exit 1
     fi
 done
@@ -627,16 +678,23 @@ for vuln_id in POLY-VULN-T1 POLY-VULN-T2; do
     git clone "$BARE_REPO" "$VULN_VERIFY" > /dev/null 2>&1
     (
         cd "$VULN_VERIFY"
-        (cd ts && npm install > /dev/null 2>&1)
+        if ! INSTALL_OUT="$(cd ts && npm install 2>&1)"; then
+            echo "    $vuln_id: npm install FAILED!"
+            echo "    ── last lines of npm install output ──"
+            printf '%s\n' "$INSTALL_OUT" | tail -20
+            exit 1
+        fi
         fix="$FIXTURE_SRC/ts/seeds/fix/${vuln_id}-fix.patch"
         git apply -p4 "$fix" || {
             echo " Fix patch FAILED to apply!"
             exit 1
         }
-        if (cd ts && npm test > /dev/null 2>&1); then
+        if FIX_OUT="$(cd ts && npm test 2>&1)"; then
             echo " GREEN"
         else
             echo " FAILED — VULN fix broke the suite!"
+            echo "    ── last lines of npm test output ──"
+            printf '%s\n' "$FIX_OUT" | tail -20
             exit 1
         fi
     )

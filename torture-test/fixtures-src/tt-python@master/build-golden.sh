@@ -233,23 +233,30 @@ if [ "$CLONE_BRANCH" != "refs/heads/master" ]; then
 fi
 echo "  ✓ Clone default branch: master"
 
-if ! bash "$SCRATCH_DIR/bootstrap" >/dev/null 2>&1; then
-    echo "  ✗ bootstrap failed" >&2
+# US-007: on bootstrap failure, surface the last ~20 lines of the
+# bootstrap's output instead of a bare "bootstrap failed".
+if ! BOOT_OUT="$(bash "$SCRATCH_DIR/bootstrap" 2>&1)"; then
+    echo "  ✗ bootstrap failed — last lines of bootstrap output:" >&2
+    printf '%s\n' "$BOOT_OUT" | tail -20 >&2
     exit 1
 fi
 
 # Baseline (master branch — default) should be GREEN.
-if "$SCRATCH_DIR/.venv/bin/python" -m pytest -q >/dev/null 2>&1; then
+if PYTEST_OUT="$("$SCRATCH_DIR/.venv/bin/python" -m pytest -q 2>&1)"; then
     echo "  ✓ Baseline test suite: GREEN"
 else
     echo "  ✗ Baseline test suite: RED — unexpected!" >&2
+    echo "  ── last lines of pytest output ──" >&2
+    printf '%s\n' "$PYTEST_OUT" | tail -20 >&2
     exit 1
 fi
 
 # broken-tests branch should be RED.
 git checkout -q broken-tests
-if "$SCRATCH_DIR/.venv/bin/python" -m pytest -q >/dev/null 2>&1; then
+if PYTEST_OUT="$("$SCRATCH_DIR/.venv/bin/python" -m pytest -q 2>&1)"; then
     echo "  ✗ broken-tests branch: GREEN — expected RED!" >&2
+    echo "  ── last lines of pytest output ──" >&2
+    printf '%s\n' "$PYTEST_OUT" | tail -20 >&2
     exit 1
 else
     echo "  ✓ broken-tests branch: RED (expected)"
@@ -261,7 +268,13 @@ echo "Verifying junk-probe invariants..."
 
 # Re-checkout master for a clean state
 git -C "$SCRATCH_DIR" checkout -q master
-"$SCRATCH_DIR/.venv/bin/python" -m pytest -q >/dev/null 2>&1
+# US-007: the junk-probe test run must fail closed with the pytest tail
+# surfaced, not abort silently under set -e.
+if ! JUNK_OUT="$(cd "$SCRATCH_DIR" && "$SCRATCH_DIR/.venv/bin/python" -m pytest -q 2>&1)"; then
+    echo "  ✗ junk-probe test run failed — last lines of pytest output:" >&2
+    printf '%s\n' "$JUNK_OUT" | tail -20 >&2
+    exit 1
+fi
 
 cd "$SCRATCH_DIR"
 JUNK_OK=true

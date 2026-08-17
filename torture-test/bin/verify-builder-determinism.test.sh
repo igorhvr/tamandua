@@ -31,18 +31,25 @@ fail() { echo "  FAIL: $1"; FAILURES=$((FAILURES + 1)); }
 
 # ── All eight fixtures → canonical determinism-ledger filename ──────
 # Names MUST stay in lock-step with bin/tt-golden-bootstrap.mjs FIXTURE_META
-# (the single source of truth for ledger filenames).
-declare -A FIXTURE_HASH
-FIXTURE_HASH=(
-    [tt-go]=tt-go.git.hashes
-    [tt-java]=tt-java.git.hashes
-    [tt-poly]=tt-poly.git.hashes
-    [tt-poly-lite]=tt-poly-lite.git.hashes
-    [tt-python]=tt-python.git.hashes
-    [tt-python@master]=.build-hashes-tt-python-master
-    [tt-rust]=tt-rust.git.hashes
-    [tt-ts]=tt-ts.git.hashes
-)
+# (the single source of truth for ledger filenames). FIXTURE_NAMES is a plain
+# indexed array and fixture_hash_file() is a case-table lookup — together they
+# replace the former bash-4-only FIXTURE_HASH associative-array map, which
+# macOS /bin/bash 3.2.57 cannot parse ("declare: -A: invalid option").
+FIXTURE_NAMES=(tt-go tt-java tt-poly tt-poly-lite tt-python "tt-python@master" tt-rust tt-ts)
+
+fixture_hash_file() {
+    case "$1" in
+        tt-go)            echo tt-go.git.hashes ;;
+        tt-java)          echo tt-java.git.hashes ;;
+        tt-poly)          echo tt-poly.git.hashes ;;
+        tt-poly-lite)     echo tt-poly-lite.git.hashes ;;
+        tt-python)        echo tt-python.git.hashes ;;
+        tt-python@master) echo .build-hashes-tt-python-master ;;
+        tt-rust)          echo tt-rust.git.hashes ;;
+        tt-ts)            echo tt-ts.git.hashes ;;
+        *)                echo "verify-builder-determinism: unknown fixture '$1'" >&2; return 1 ;;
+    esac
+}
 
 # Fingerprint the produced golden dir: sha256 of every file, sorted by name.
 # This captures BOTH the bare repo object bytes and the hash ledger. Temp
@@ -74,13 +81,13 @@ verify_ledger() {
 }
 
 echo "=== verify-builder-determinism.test.sh (US-006) ==="
-echo "Hermetic 2-build byte-identity proof for ALL $(( ${#FIXTURE_HASH[@]} )) fixtures."
+echo "Hermetic 2-build byte-identity proof for ALL $(( ${#FIXTURE_NAMES[@]} )) fixtures."
 echo "Each fixture is built twice into an isolated temp TORTURE_GOLDEN_DIR; the two"
 echo "produced golden dirs (bare + hash ledger) must be byte-identical. The real"
 echo "torture-test/var golden dir is never touched."
 
-for fixture in tt-go tt-java tt-poly tt-poly-lite tt-python tt-python@master tt-rust tt-ts; do
-    hash_file="${FIXTURE_HASH[$fixture]}"
+for fixture in ${FIXTURE_NAMES[@]+"${FIXTURE_NAMES[@]}"}; do
+    hash_file="$(fixture_hash_file "$fixture")"
     golden_dir="$(mktemp -d "${TMPDIR:-/tmp}/torture-determinism.XXXXXX")"
 
     b1log="$(mktemp "${TMPDIR:-/tmp}/determinism-$fixture-b1.XXXXXX")"

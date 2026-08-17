@@ -53,6 +53,41 @@ scratch_dir() {
 }
 
 # -------------------------------------------------------------------
+# Seed SHA registry — bash 3.2-safe
+# -------------------------------------------------------------------
+# macOS /bin/bash 3.2.57 has no associative arrays (a bash 4+ feature), so
+# the former SEED_SHAS associative array is replaced by parallel indexed
+# arrays: SEED_IDS holds the keys and SEED_SHAS holds
+# the values at the same index. seed_sha_set() writes a key (insert or
+# overwrite); seed_sha() reads one back. Script mechanics only — the
+# recorded seed_id -> SHA pairs are identical to the old map.
+SEED_IDS=()
+SEED_SHAS=()
+
+seed_sha_set() {
+    local seed_id="$1" sha="$2" i
+    for ((i = 0; i < ${#SEED_IDS[@]}; i++)); do
+        if [ "${SEED_IDS[$i]}" = "$seed_id" ]; then
+            SEED_SHAS[$i]="$sha"
+            return 0
+        fi
+    done
+    SEED_IDS+=("$seed_id")
+    SEED_SHAS+=("$sha")
+}
+
+seed_sha() {
+    local seed_id="$1" i
+    for ((i = 0; i < ${#SEED_IDS[@]}; i++)); do
+        if [ "${SEED_IDS[$i]}" = "$seed_id" ]; then
+            echo "${SEED_SHAS[$i]}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# -------------------------------------------------------------------
 # Banner
 # -------------------------------------------------------------------
 echo "================================================================="
@@ -117,7 +152,6 @@ echo "--- Phase 2: Building seed refs ---"
 
 # Seeds created from patches (BUG-T1..T4, BRK-T1..T2)
 PATCHED_SEEDS=("BUG-T1" "BUG-T2" "BUG-T3" "BUG-T4" "BRK-T1" "BRK-T2")
-declare -A SEED_SHAS
 
 for seed_id in "${PATCHED_SEEDS[@]}"; do
     seed_patch="seeds/${seed_id}.patch"
@@ -135,7 +169,7 @@ for seed_id in "${PATCHED_SEEDS[@]}"; do
     )
 
     SEED_SHA="$(cd "$SEED_WORK" && git rev-parse HEAD)"
-    SEED_SHAS["$seed_id"]="$SEED_SHA"
+    seed_sha_set "$seed_id" "$SEED_SHA"
 
     (
         cd "$SEED_WORK"
@@ -147,12 +181,12 @@ done
 # Vulns are dormant in the green baseline — seed refs point directly to baseline
 echo "  seed/VULN-T1 (dormant -> baseline)..."
 git --git-dir="$BARE_REPO" update-ref "refs/heads/seed/VULN-T1" "$BASELINE_SHA"
-SEED_SHAS["VULN-T1"]="$BASELINE_SHA"
+seed_sha_set "VULN-T1" "$BASELINE_SHA"
 echo "    -> $BASELINE_SHA"
 
 echo "  seed/VULN-T2 (dormant -> baseline)..."
 git --git-dir="$BARE_REPO" update-ref "refs/heads/seed/VULN-T2" "$BASELINE_SHA"
-SEED_SHAS["VULN-T2"]="$BASELINE_SHA"
+seed_sha_set "VULN-T2" "$BASELINE_SHA"
 echo "    -> $BASELINE_SHA"
 
 ALL_SEEDS=("BUG-T1" "BUG-T2" "BUG-T3" "BUG-T4" "BRK-T1" "BRK-T2" "VULN-T1" "VULN-T2")
@@ -171,11 +205,19 @@ echo ""
 echo "  [3a] Baseline green check..."
 (
     cd "$VERIFY_DIR"
-    npm install > /dev/null 2>&1
-    if npm test > /dev/null 2>&1; then
+    # US-007: surface install/test tails instead of failing silently or
+    # printing only a generic message.
+    if ! INSTALL_OUT="$(npm install 2>&1)"; then
+        echo "    main: npm install FAILED — last lines of output:"
+        printf '%s\n' "$INSTALL_OUT" | tail -20
+        exit 1
+    fi
+    if TEST_OUT="$(npm test 2>&1)"; then
         echo "    main: GREEN"
     else
         echo "    main: FAILED — baseline suite is not green!"
+        echo "    ── last lines of npm test output ──"
+        printf '%s\n' "$TEST_OUT" | tail -20
         exit 1
     fi
 )
@@ -247,13 +289,20 @@ fi
 echo ""
 echo "  [3c] Seed ref verification..."
 
-declare -A BUG_SYMPTOMS
-BUG_SYMPTOMS["BUG-T1"]="off-by-one"
-BUG_SYMPTOMS["BUG-T2"]="date-filter|date-range|getByDateRange"
-BUG_SYMPTOMS["BUG-T3"]="order|ordering|position"
-BUG_SYMPTOMS["BUG-T4"]="performance|threshold|under 50ms"
-BUG_SYMPTOMS["BRK-T1"]="getTotal|sum|150"
-BUG_SYMPTOMS["BRK-T2"]="201|200|status.*expected"
+# Symptom catalog for the BUG/BRK seeds (bash 3.2-safe case table —
+# replaces the former BUG_SYMPTOMS associative array; associative arrays are a
+# bash 4+ feature). Values are byte-identical to the old map.
+bug_symptoms() {
+    case "$1" in
+        BUG-T1) echo "off-by-one";;
+        BUG-T2) echo "date-filter|date-range|getByDateRange";;
+        BUG-T3) echo "order|ordering|position";;
+        BUG-T4) echo "performance|threshold|under 50ms";;
+        BRK-T1) echo "getTotal|sum|150";;
+        BRK-T2) echo "201|200|status.*expected";;
+        *) return 1;;
+    esac
+}
 
 for seed_id in "${PATCHED_SEEDS[@]}"; do
     echo "    seed/$seed_id..."
@@ -265,7 +314,11 @@ for seed_id in "${PATCHED_SEEDS[@]}"; do
     (
         cd "$SEED_VERIFY"
         git checkout "seed/$seed_id" > /dev/null 2>&1
-        npm install > /dev/null 2>&1
+        if ! INSTALL_OUT="$(npm install 2>&1)"; then
+            echo "      npm install FAILED for seed/$seed_id — last lines of output:"
+            printf '%s\n' "$INSTALL_OUT" | tail -20
+            exit 1
+        fi
     )
 
     # Run tests — capture output and exit code
@@ -302,10 +355,12 @@ for seed_id in "${PATCHED_SEEDS[@]}"; do
             echo "      Fix patch FAILED to apply!"
             exit 1
         }
-        if npm test > /dev/null 2>&1; then
+        if FIX_OUT="$(npm test 2>&1)"; then
             echo "      +fix: GREEN"
         else
             echo "      +fix: FAILED — fix did not restore green!"
+            echo "      ── last lines of npm test output ──"
+            printf '%s\n' "$FIX_OUT" | tail -20
             exit 1
         fi
     )
@@ -323,15 +378,21 @@ for vuln_id in "${VULN_SEEDS[@]}"; do
     git clone "$BARE_REPO" "$VULN_VERIFY" > /dev/null 2>&1
     (
         cd "$VULN_VERIFY"
-        npm install > /dev/null 2>&1
+        if ! INSTALL_OUT="$(npm install 2>&1)"; then
+            echo "      npm install FAILED — last lines of output:"
+            printf '%s\n' "$INSTALL_OUT" | tail -20
+            exit 1
+        fi
         git apply -p4 "$FIXTURE_SRC/seeds/fix/${vuln_id}-fix.patch" || {
             echo "      Fix patch FAILED to apply!"
             exit 1
         }
-        if npm test > /dev/null 2>&1; then
+        if FIX_OUT="$(npm test 2>&1)"; then
             echo "      +fix: GREEN"
         else
             echo "      +fix: FAILED — VULN fix broke the suite!"
+            echo "      ── last lines of npm test output ──"
+            printf '%s\n' "$FIX_OUT" | tail -20
             exit 1
         fi
     )

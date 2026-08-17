@@ -72,10 +72,10 @@ cleanup() {
     wait "$INTERRUPTION_PID" 2>/dev/null || true
   fi
   if [ "${#SMOKE_GOLDENS[@]}" -gt 0 ]; then
-    rm -rf -- "${SMOKE_GOLDENS[@]}"
+    rm -rf -- "${SMOKE_GOLDENS[@]+"${SMOKE_GOLDENS[@]}"}"
   fi
   if [ "${#ORACLE_TEST_FILES[@]}" -gt 0 ]; then
-    rm -f -- "${ORACLE_TEST_FILES[@]}"
+    rm -f -- "${ORACLE_TEST_FILES[@]+"${ORACLE_TEST_FILES[@]}"}"
   fi
   if [ -n "$DISCOVERY_DB" ]; then
     rm -f -- "$DISCOVERY_DB" "$DISCOVERY_DB-wal" "$DISCOVERY_DB-shm"
@@ -134,6 +134,12 @@ fail() {
 pass() {
   printf 'PASS: %s\n' "$1"
 }
+
+# bash 3.2 (macOS /bin/bash 3.2.57) lacks the case-modifying parameter
+# expansions (uppercase-all / lowercase-all are bash 4+); the test's few
+# uses are converted to tr(1), which is portable everywhere.
+toupper() { printf '%s' "$1" | tr '[:lower:]' '[:upper:]'; }
+tolower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 
 # Most historical self-test cases inspect persisted evidence for deliberately
 # red or infrastructure outcomes. Accept launcher verdicts 1/2 here only when
@@ -517,7 +523,7 @@ operator_home="$HOME"
 for execution_mode in real scripted; do
   isolated_manifest="$TEST_ROOT/manifests/isolated-$execution_mode.jsonl"
   shell_sentinel="$TEST_ROOT/shell-interpolation-$execution_mode"
-  write_local_case "$isolated_manifest" "LOCAL-${execution_mode^^}" "$execution_mode" 0 0 "$shell_sentinel"
+  write_local_case "$isolated_manifest" "LOCAL-$(toupper "$execution_mode")" "$execution_mode" 0 0 "$shell_sentinel"
   isolated_output=$(\
     TT_REPO_ROOT=/tmp/operator-production-repo \
     TT_OPERATOR_POISON=operator-tt-state \
@@ -1206,7 +1212,7 @@ pass "workflow argv and full stdout run identifier are persisted"
 
 for harvest_mode in harvest-status harvest-db harvest-lie harvest-shifting-lie; do
   harvest_manifest="$TEST_ROOT/manifests/$harvest_mode.jsonl"
-  valid_case "${harvest_mode^^}" \
+  valid_case "$(toupper "$harvest_mode")" \
     | sed 's/"requires":{"toolchains":\["node"\]}/"requires":{}/' \
     > "$harvest_manifest"
   if [ "$harvest_mode" = "harvest-db" ]; then
@@ -2310,7 +2316,7 @@ for battery_case in ORACLE-BATTERY ORACLE-BATTERY-FAIL; do
   rm -rf -- "$TT_DIR/var/fixtures/work/$battery_case"
   mkdir -p "$TT_DIR/var/fixtures/work/$battery_case"
   cp -R "$snapshot_fixture" "$TT_DIR/var/fixtures/work/$battery_case/tt-ts"
-  battery_manifest="$TEST_ROOT/manifests/${battery_case,,}.jsonl"
+  battery_manifest="$TEST_ROOT/manifests/$(tolower "$battery_case").jsonl"
   valid_case "$battery_case" \
     | sed 's/"requires":{"toolchains":\["node"\]}/"requires":{}/' \
     | sed 's/"oracles":\["TT-MISSING-O1","TT-MISSING-O2"\]/"oracles":["O1","O2","O3z","O8","O9","O10","O11"]/' \
@@ -2825,7 +2831,7 @@ for cap_mode in token-cap wall-cap; do
   cap_manifest="$TEST_ROOT/manifests/workflow-$cap_mode.jsonl"
   cap_stop_marker="$TEST_ROOT/$cap_mode-stop"
   cap_status_count="$TEST_ROOT/$cap_mode-status-count"
-  valid_case "WORKFLOW-${cap_mode^^}" \
+  valid_case "WORKFLOW-$(toupper "$cap_mode")" \
     | sed 's/"requires":{"toolchains":\["node"\]}/"requires":{}/' \
     > "$cap_manifest"
   node --input-type=module - "$cap_manifest" "$cap_mode" <<'NODE'
@@ -3109,7 +3115,7 @@ pass "discovered-run wall cap fires near deadline on the dedicated cap-check cad
 
 for workflow_mode in stderr conflict missing; do
   workflow_mode_manifest="$TEST_ROOT/manifests/workflow-$workflow_mode.jsonl"
-  valid_case "WORKFLOW-${workflow_mode^^}" \
+  valid_case "WORKFLOW-$(toupper "$workflow_mode")" \
     | sed 's/"requires":{"toolchains":\["node"\]}/"requires":{}/' \
     > "$workflow_mode_manifest"
   workflow_launch_count_before=$(grep -c '"argv":\["workflow","run"' "$workflow_events" || true)
@@ -4409,7 +4415,10 @@ for expected_status in 0 1 2; do
   set -e
   [ "$launcher_status" -eq "$expected_status" ] \
     || fail "tt-run --smoke changed controller exit $expected_status to $launcher_status"
-  mapfile -t launcher_argv < "$launcher_log"
+  launcher_argv=()
+  while IFS= read -r launcher_arg || [ -n "${launcher_arg:-}" ]; do
+    launcher_argv+=("$launcher_arg")
+  done < "$launcher_log"
   [ "${#launcher_argv[@]}" -eq 2 ] && [ "${launcher_argv[0]}" = "--manifest" ] \
     && [ "${launcher_argv[1]}" = "$launcher_root/cases/smoke.jsonl" ] \
     || fail "tt-run --smoke did not delegate the smoke manifest: $(tr '\n' ' ' < "$launcher_log")"
@@ -4432,7 +4441,10 @@ for expected_status in 0 1 2; do
   set -e
   [ "$launcher_status" -eq "$expected_status" ] \
     || fail "tt-run --tier0 changed controller exit $expected_status to $launcher_status"
-  mapfile -t launcher_argv < "$launcher_log"
+  launcher_argv=()
+  while IFS= read -r launcher_arg || [ -n "${launcher_arg:-}" ]; do
+    launcher_argv+=("$launcher_arg")
+  done < "$launcher_log"
   [ "${#launcher_argv[@]}" -eq 3 ] && [ "${launcher_argv[0]}" = "--manifest" ] \
     && [ "${launcher_argv[1]}" = "$launcher_root/cases/tier0.jsonl" ] \
     && [ "${launcher_argv[2]}" = "--scripted-only" ] \
@@ -4440,7 +4452,10 @@ for expected_status in 0 1 2; do
 done
 
 TT_FAKE_CONTROLLER_LOG="$launcher_log" "$launcher_root/bin/tt-run" --tier0 --include-real
-mapfile -t launcher_argv < "$launcher_log"
+launcher_argv=()
+while IFS= read -r launcher_arg || [ -n "${launcher_arg:-}" ]; do
+  launcher_argv+=("$launcher_arg")
+done < "$launcher_log"
 [ "${#launcher_argv[@]}" -eq 2 ] && [ "${launcher_argv[0]}" = "--manifest" ] \
   && [ "${launcher_argv[1]}" = "$launcher_root/cases/tier0.jsonl" ] \
   || fail "tt-run --tier0 --include-real did not delegate the complete manifest: $(tr '\n' ' ' < "$launcher_log")"
@@ -4452,7 +4467,7 @@ for launcher_bad_args in \
   '--tier0 --include-real --report'; do
   read -r -a launcher_bad_argv <<< "$launcher_bad_args"
   set +e
-  "$launcher_root/bin/tt-run" "${launcher_bad_argv[@]}" >"$TEST_ROOT/launcher-bad.stdout" 2>"$TEST_ROOT/launcher-bad.stderr"
+  "$launcher_root/bin/tt-run" "${launcher_bad_argv[@]+"${launcher_bad_argv[@]}"}" >"$TEST_ROOT/launcher-bad.stdout" 2>"$TEST_ROOT/launcher-bad.stderr"
   launcher_status=$?
   set -e
   [ "$launcher_status" -eq 4 ] \

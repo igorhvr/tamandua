@@ -211,10 +211,12 @@ trap 'cleanup_scratch; cleanup_work' EXIT
 git clone -q "$GOLDEN_BARE" "$SCRATCH_DIR"
 
 # Baseline (main branch — default) should be GREEN.
-if (cd "$SCRATCH_DIR" && cargo test --quiet >/dev/null 2>&1); then
+if CARGO_OUT="$(cd "$SCRATCH_DIR" && cargo test --quiet 2>&1)"; then
     echo "  ✓ Baseline test suite: GREEN"
 else
     echo "  ✗ Baseline test suite: RED — unexpected!" >&2
+    echo "  ── last lines of cargo test output ──" >&2
+    printf '%s\n' "$CARGO_OUT" | tail -20 >&2
     exit 1
 fi
 
@@ -231,8 +233,10 @@ else
 fi
 
 # target/ must NOT be tracked by git
-if git -C "$SCRATCH_DIR" ls-files --error-unmatch target/ >/dev/null 2>&1; then
+if TRACKED_OUT="$(git -C "$SCRATCH_DIR" ls-files --error-unmatch target/ 2>&1)"; then
     echo "  ✗ target/ is tracked — should be untracked!" >&2
+    echo "  ── git ls-files output ──" >&2
+    printf '%s\n' "$TRACKED_OUT" | tail -20 >&2
     exit 1
 else
     echo "  ✓ target/ is untracked"
@@ -259,8 +263,10 @@ echo ""
 echo "Verifying broken-tests branch..."
 
 (cd "$SCRATCH_DIR" && git checkout -q broken-tests)
-if (cd "$SCRATCH_DIR" && cargo test --quiet >/dev/null 2>&1); then
+if CARGO_OUT="$(cd "$SCRATCH_DIR" && cargo test --quiet 2>&1)"; then
     echo "  ✗ broken-tests branch: GREEN — expected RED!" >&2
+    echo "  ── last lines of cargo test output ──" >&2
+    printf '%s\n' "$CARGO_OUT" | tail -20 >&2
     exit 1
 else
     echo "  ✓ broken-tests branch: RED (expected)"
@@ -292,10 +298,12 @@ for seed_id in "${SEED_ORDER[@]}"; do
     seed_fix="$FIXTURE_SRC/seeds/$seed_id/fix.patch"
     if [ -f "$seed_fix" ]; then
         if patch -s $(_detect_p "$seed_fix") -d "$SCRATCH_DIR" < "$seed_fix"; then
-            if (cd "$SCRATCH_DIR" && cargo test --quiet >/dev/null 2>&1); then
+            if CARGO_OUT="$(cd "$SCRATCH_DIR" && cargo test --quiet 2>&1)"; then
                 echo "  ✓ seed/$seed_id + fix.patch: GREEN"
             else
                 echo "  ✗ seed/$seed_id + fix.patch: RED!" >&2
+                echo "  ── last lines of cargo test output ──" >&2
+                printf '%s\n' "$CARGO_OUT" | tail -20 >&2
                 exit 1
             fi
             # Restore to clean seed state for next iteration
@@ -318,10 +326,12 @@ if patch -s $(_detect_p "$FIXTURE_SRC/seeds/BRK-R1/fix.patch") -d "$SCRATCH_DIR"
     # Apply BRK-R2 fix.patch on top
     if patch -s $(_detect_p "$FIXTURE_SRC/seeds/BRK-R2/fix.patch") -d "$SCRATCH_DIR" < "$FIXTURE_SRC/seeds/BRK-R2/fix.patch"; then
         # Both fix patches applied — should be fully green now
-        if (cd "$SCRATCH_DIR" && cargo test --quiet >/dev/null 2>&1); then
+        if CARGO_OUT="$(cd "$SCRATCH_DIR" && cargo test --quiet 2>&1)"; then
             echo "  ✓ broken-tests + all fix patches: GREEN"
         else
             echo "  ✗ broken-tests + all fix patches: RED!" >&2
+            echo "  ── last lines of cargo test output ──" >&2
+            printf '%s\n' "$CARGO_OUT" | tail -20 >&2
             exit 1
         fi
     else

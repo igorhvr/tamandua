@@ -39,6 +39,14 @@ else
     echo "bootstrap: .venv already exists"
 fi
 
+# --- upgrade pip to a modern floor first ---
+# Host system pythons may ship pip < 21.3 (e.g. macOS 26.5.2 system python3
+# ships pip 21.2.4), and pip < 21.3 cannot do PEP 517/660 editable installs
+# of pyproject-only trees — the editable install would fail. Upgrade pip
+# inside the venv BEFORE any editable install (the venv is an arming artifact
+# and is never committed; on a modern host this is a fast no-op).
+.venv/bin/python -m pip install --quiet 'pip>=23'
+
 # --- install pytest and schedlib-poly in editable mode ---
 .venv/bin/python -m pip install --quiet pytest
 .venv/bin/python -m pip install --quiet -e ".[test]"

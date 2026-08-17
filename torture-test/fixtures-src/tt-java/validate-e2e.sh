@@ -175,27 +175,32 @@ echo ""
 #   VULN-J2: GREEN (dormant path traversal code path)
 #   BRK-J1: RED (1 broken assertion failure)
 #   BRK-J2: RED (1 broken assertion failure)
-declare -A SEED_EXPECT_GREEN=(
-    [BUG-J1]=0    # RED: 12 failures in MoneyUtilsTest round tests
-    [BUG-J2]=0    # RED: 3 failures across CsvParser + LedgerService
-    [BUG-J3]=0    # RED: 15 failures across CsvParser + CliApp
-    [BUG-J4]=1    # GREEN: O(n²) dormant on small datasets, regression test not yet added
-    [VULN-J1]=1   # GREEN: dormant code path
-    [VULN-J2]=1   # GREEN: dormant code path
-    [BRK-J1]=0    # RED: 1 assertion failure
-    [BRK-J2]=0    # RED: 1 assertion failure
-)
+# Seed lookup tables as bash-3.2-safe case-table functions. macOS /bin/bash
+# 3.2.57 has no associative arrays (a bash 4+ feature), so the former
+# SEED_EXPECT_GREEN / SEED_SYMPTOMS maps become lookup functions; the
+# expected-green bits and symptom strings are byte-identical to the old maps.
+# Unknown seeds fail loudly (return non-zero), matching the old map reads.
+seed_expect_green() {
+    case "$1" in
+        BUG-J4|VULN-J1|VULN-J2) echo 1 ;;
+        BUG-J1|BUG-J2|BUG-J3|BRK-J1|BRK-J2) echo 0 ;;
+        *) return 1 ;;
+    esac
+}
 
-declare -A SEED_SYMPTOMS=(
-    [BUG-J1]="A1 off-by-one rounding — RED (12 MoneyUtilsTest failures)"
-    [BUG-J2]="A2 two-module NPE on empty CSV — RED (3 failures across CsvParser + LedgerService)"
-    [BUG-J3]="A3 red-herring column swap — RED (15 failures across CsvParser + CliApp)"
-    [BUG-J4]="A4 O(n²) performance — GREEN (dormant on small datasets)"
-    [VULN-J1]="XXE dormant — GREEN"
-    [VULN-J2]="path traversal dormant — GREEN"
-    [BRK-J1]="broken assertion (450 vs 475) — RED"
-    [BRK-J2]="broken assertion (groceries vs food) — RED"
-)
+seed_symptoms() {
+    case "$1" in
+        BUG-J1) echo "A1 off-by-one rounding — RED (12 MoneyUtilsTest failures)" ;;
+        BUG-J2) echo "A2 two-module NPE on empty CSV — RED (3 failures across CsvParser + LedgerService)" ;;
+        BUG-J3) echo "A3 red-herring column swap — RED (15 failures across CsvParser + CliApp)" ;;
+        BUG-J4) echo "A4 O(n²) performance — GREEN (dormant on small datasets)" ;;
+        VULN-J1) echo "XXE dormant — GREEN" ;;
+        VULN-J2) echo "path traversal dormant — GREEN" ;;
+        BRK-J1) echo "broken assertion (450 vs 475) — RED" ;;
+        BRK-J2) echo "broken assertion (groceries vs food) — RED" ;;
+        *) return 1 ;;
+    esac
+}
 
 SEED_ORDER=(BUG-J1 BUG-J2 BUG-J3 BUG-J4 VULN-J1 VULN-J2 BRK-J1 BRK-J2)
 
@@ -203,24 +208,30 @@ for seed_id in "${SEED_ORDER[@]}"; do
     git checkout -f -q "seed/$seed_id" 2>/dev/null
     git clean -fdq
 
+    # US-007: capture the mvnw output and surface its tail on fail-closed
+    # seed-colour mismatches instead of swallowing to /dev/null.
     set +e
-    ./mvnw -q -B test -Dmaven.repo.local="$MAVEN_REPO_LOCAL" >/dev/null 2>&1
+    SEED_OUT="$(./mvnw -q -B test -Dmaven.repo.local="$MAVEN_REPO_LOCAL" 2>&1)"
     SEED_EXIT=$?
     set -e
 
     if [ "$SEED_EXIT" -eq 0 ]; then
-        if [ "${SEED_EXPECT_GREEN[$seed_id]}" -eq 1 ]; then
-            pass "seed/$seed_id: GREEN (${SEED_SYMPTOMS[$seed_id]})"
+        if [ "$(seed_expect_green "$seed_id")" -eq 1 ]; then
+            pass "seed/$seed_id: GREEN ($(seed_symptoms "$seed_id"))"
         else
-            fail "seed/$seed_id: RED expected (${SEED_SYMPTOMS[$seed_id]})" \
+            fail "seed/$seed_id: RED expected ($(seed_symptoms "$seed_id"))" \
                 "test suite was GREEN"
+            echo "    ── last lines of mvnw output ──" >&2
+            printf '%s\n' "$SEED_OUT" | tail -20 >&2
         fi
     else
-        if [ "${SEED_EXPECT_GREEN[$seed_id]}" -eq 1 ]; then
-            fail "seed/$seed_id: GREEN expected (${SEED_SYMPTOMS[$seed_id]})" \
+        if [ "$(seed_expect_green "$seed_id")" -eq 1 ]; then
+            fail "seed/$seed_id: GREEN expected ($(seed_symptoms "$seed_id"))" \
                 "test suite was RED"
+            echo "    ── last lines of mvnw output ──" >&2
+            printf '%s\n' "$SEED_OUT" | tail -20 >&2
         else
-            pass "seed/$seed_id: RED (${SEED_SYMPTOMS[$seed_id]})"
+            pass "seed/$seed_id: RED ($(seed_symptoms "$seed_id"))"
         fi
     fi
 done
@@ -250,16 +261,20 @@ for seed_id in "${FIX_SEEDS[@]}"; do
     fi
 
     # Apply fix patch with -p4 (patch paths are relative to repo root)
-    if ! git apply -p4 "$FIX_PATCH" 2>/dev/null; then
+    if ! PATCH_OUT="$(git apply -p4 "$FIX_PATCH" 2>&1)"; then
         fail "$seed_id fix.patch applies cleanly" "git apply -p4 failed"
+        echo "    ── last lines of git apply output ──" >&2
+        printf '%s\n' "$PATCH_OUT" | tail -20 >&2
         continue
     fi
     pass "$seed_id fix.patch applies cleanly (-p4)"
 
-    if ./mvnw -q -B test -Dmaven.repo.local="$MAVEN_REPO_LOCAL" >/dev/null 2>&1; then
+    if MVN_OUT="$(./mvnw -q -B test -Dmaven.repo.local="$MAVEN_REPO_LOCAL" 2>&1)"; then
         pass "$seed_id fix restores GREEN"
     else
         fail "$seed_id fix restores GREEN" "test suite still RED after fix"
+        echo "    ── last lines of mvnw output ──" >&2
+        printf '%s\n' "$MVN_OUT" | tail -20 >&2
     fi
 done
 

@@ -50,11 +50,11 @@ echo "Second run — verifying determinism for main variant..."
 bash "$SCRIPT_DIR/build-golden.sh"
 echo ""
 
-if [ -f "$GOLDEN_DIR/.build-hashes" ]; then
+if [ -f "$GOLDEN_DIR/tt-python.git.hashes" ]; then
     pass "Main variant: deterministic hashes match across two runs"
 else
     fail "Main variant: deterministic hashes match across two runs" \
-        ".build-hashes missing after second run"
+        "tt-python.git.hashes missing after second run"
 fi
 
 echo ""
@@ -99,10 +99,14 @@ cd "$SCRATCH"
 
 # Bootstrap and baseline
 echo "Bootstrapping venv..."
-if bash "$SCRATCH/bootstrap" >/dev/null 2>&1; then
+# US-007: surface the bootstrap tail on failure instead of only
+# "bootstrap script failed".
+if BOOT_OUT="$(bash "$SCRATCH/bootstrap" 2>&1)"; then
     pass "Bootstrap completed"
 else
     fail "Bootstrap completed" "bootstrap script failed"
+    echo "    ── last lines of bootstrap output ──" >&2
+    printf '%s\n' "$BOOT_OUT" | tail -20 >&2
     echo ""
     echo "══╡ RESULTS ════════════════════════════════════════════════════"
     printf "  Passed: %d  Failed: %d\n" "$PASS" "$FAIL"
@@ -210,20 +214,31 @@ echo ""
 # BUG-P1 (A1): dormant — no test covers count+until, so suite is GREEN
 # BUG-P2/P3/P4: RED
 # VULN-P1/P2: dormant — GREEN
-declare -A SEED_EXPECT_GREEN=(
-    [BUG-P1]=1    # A1: dormant bug, no regression test exists yet
-    [VULN-P1]=1   # dormant code path
-    [VULN-P2]=1   # dormant code path
-)
+#
+# Seed lookup tables as bash-3.2-safe case-table functions. macOS /bin/bash
+# 3.2.57 has no associative arrays (a bash 4+ feature), so the former
+# SEED_EXPECT_GREEN / SEED_SYMPTOMS maps become lookup functions; the
+# expected-green bits and symptom strings are byte-identical to the old maps.
+# seed_expect_green defaults to 0 for unknown seeds, matching the old map
+# read semantics (default 0 when a seed id is absent from the green set).
+seed_expect_green() {
+    case "$1" in
+        BUG-P1|VULN-P1|VULN-P2) echo 1 ;;
+        *) echo 0 ;;
+    esac
+}
 
-declare -A SEED_SYMPTOMS=(
-    [BUG-P1]="A1 dormant off-by-one — GREEN (no test covers count+until)"
-    [BUG-P2]="A2 two-module bug — RED (yearly interval + CONTAINED boundary)"
-    [BUG-P3]="A3 red-herring — RED (is_weekday Saturday bug)"
-    [BUG-P4]="A4 performance — RED (threshold timeout > 2.0s)"
-    [VULN-P1]="yaml.load dormant — GREEN"
-    [VULN-P2]="shell=True dormant — GREEN"
-)
+seed_symptoms() {
+    case "$1" in
+        BUG-P1) echo "A1 dormant off-by-one — GREEN (no test covers count+until)" ;;
+        BUG-P2) echo "A2 two-module bug — RED (yearly interval + CONTAINED boundary)" ;;
+        BUG-P3) echo "A3 red-herring — RED (is_weekday Saturday bug)" ;;
+        BUG-P4) echo "A4 performance — RED (threshold timeout > 2.0s)" ;;
+        VULN-P1) echo "yaml.load dormant — GREEN" ;;
+        VULN-P2) echo "shell=True dormant — GREEN" ;;
+        *) return 1 ;;
+    esac
+}
 
 SEED_ORDER=(BUG-P1 BUG-P2 BUG-P3 BUG-P4 VULN-P1 VULN-P2)
 
@@ -231,22 +246,36 @@ for seed_id in "${SEED_ORDER[@]}"; do
     git -C "$SCRATCH" checkout -f -q "seed/$seed_id" 2>/dev/null
     git -C "$SCRATCH" clean -fdq
 
-    # Re-bootstrap after checkout
-    bash "$SCRATCH/bootstrap" >/dev/null 2>&1
+    # Re-bootstrap after checkout — surface the tail on failure (US-007).
+    if ! BOOT_OUT="$(bash "$SCRATCH/bootstrap" 2>&1)"; then
+        fail "seed/$seed_id bootstrap" "bootstrap script failed"
+        echo "    ── last lines of bootstrap output ──" >&2
+        printf '%s\n' "$BOOT_OUT" | tail -20 >&2
+        exit 1
+    fi
 
-    if "$SCRATCH/.venv/bin/python" -m pytest -q >/dev/null 2>&1; then
-        if [ "${SEED_EXPECT_GREEN[$seed_id]:-0}" -eq 1 ]; then
-            pass "seed/$seed_id: GREEN (${SEED_SYMPTOMS[$seed_id]})"
+    set +e
+    PYTEST_OUT="$("$SCRATCH/.venv/bin/python" -m pytest -q 2>&1)"
+    PYTEST_EXIT=$?
+    set -e
+
+    if [ "$PYTEST_EXIT" -eq 0 ]; then
+        if [ "$(seed_expect_green "$seed_id")" -eq 1 ]; then
+            pass "seed/$seed_id: GREEN ($(seed_symptoms "$seed_id"))"
         else
-            fail "seed/$seed_id: RED expected (${SEED_SYMPTOMS[$seed_id]})" \
+            fail "seed/$seed_id: RED expected ($(seed_symptoms "$seed_id"))" \
                 "test suite was GREEN"
+            echo "    ── last lines of pytest output ──" >&2
+            printf '%s\n' "$PYTEST_OUT" | tail -20 >&2
         fi
     else
-        if [ "${SEED_EXPECT_GREEN[$seed_id]:-0}" -eq 1 ]; then
-            fail "seed/$seed_id: GREEN expected (${SEED_SYMPTOMS[$seed_id]})" \
+        if [ "$(seed_expect_green "$seed_id")" -eq 1 ]; then
+            fail "seed/$seed_id: GREEN expected ($(seed_symptoms "$seed_id"))" \
                 "test suite was RED"
+            echo "    ── last lines of pytest output ──" >&2
+            printf '%s\n' "$PYTEST_OUT" | tail -20 >&2
         else
-            pass "seed/$seed_id: RED (${SEED_SYMPTOMS[$seed_id]})"
+            pass "seed/$seed_id: RED ($(seed_symptoms "$seed_id"))"
         fi
     fi
 done
@@ -257,21 +286,24 @@ echo ""
 echo "── Phase 5: Fix patches restore GREEN ──────────────────────────"
 echo ""
 
-# Patch-level mapping (extracted from patch header format)
-# BUG-P1: --- a/src/...  → -p1
-# BUG-P2: --- src/...    → -p0
-# BUG-P3: --- src/...    → -p0
-# BUG-P4: --- src/...    → -p0
-# VULN-P1: --- a/src/... → -p1
-# VULN-P2: --- a/src/... → -p1
-declare -A PATCH_LEVEL=(
-    [BUG-P1]="1"
-    [BUG-P2]="1"
-    [BUG-P3]="0"
-    [BUG-P4]="0"
-    [VULN-P1]="1"
-    [VULN-P2]="1"
-)
+# Patch-level lookup — bash 3.2-safe case-table function replacing the former
+# PATCH_LEVEL associative map. Every committed fix.patch carries git-style
+# a//b/ prefixes today:
+#   BUG-P1: --- b/src/...  → -p1
+#   BUG-P2: --- b/src/...  → -p1
+#   BUG-P3: --- b/src/...  → -p1
+#   BUG-P4: --- b/src/...  → -p1
+#   VULN-P1: --- a/src/... → -p1
+#   VULN-P2: --- a/src/... → -p1
+# (US-004 corrects BUG-P3/BUG-P4 from the stale -p0 values, which matched the
+# pre-2026-07-30 plain `--- src/...` patch format; Phase 5 only passes with
+# -p1 on the regenerated git-style patches.)
+patch_level() {
+    case "$1" in
+        BUG-P1|BUG-P2|BUG-P3|BUG-P4|VULN-P1|VULN-P2) echo 1 ;;
+        *) return 1 ;;
+    esac
+}
 
 FIX_SEEDS=(BUG-P1 BUG-P2 BUG-P3 BUG-P4 VULN-P1 VULN-P2)
 
@@ -280,7 +312,7 @@ for seed_id in "${FIX_SEEDS[@]}"; do
     git -C "$SCRATCH" clean -fdq
 
     FIX_PATCH="$SCRIPT_DIR/seeds/$seed_id/fix.patch"
-    PLEVEL="${PATCH_LEVEL[$seed_id]}"
+    PLEVEL="$(patch_level "$seed_id")"
 
     if [ ! -f "$FIX_PATCH" ]; then
         fail "$seed_id fix.patch exists" "file not found: $FIX_PATCH"
@@ -293,12 +325,20 @@ for seed_id in "${FIX_SEEDS[@]}"; do
     # --forward silently skips already-applied patches; either way proceed
     pass "$seed_id fix.patch applies cleanly (-p$PLEVEL)"
 
-    bash "$SCRATCH/bootstrap" >/dev/null 2>&1
+    # US-007: surface the bootstrap tail on failure.
+    if ! BOOT_OUT="$(bash "$SCRATCH/bootstrap" 2>&1)"; then
+        fail "seed/$seed_id bootstrap" "bootstrap script failed"
+        echo "    ── last lines of bootstrap output ──" >&2
+        printf '%s\n' "$BOOT_OUT" | tail -20 >&2
+        exit 1
+    fi
 
-    if "$SCRATCH/.venv/bin/python" -m pytest -q >/dev/null 2>&1; then
+    if PYTEST_OUT="$("$SCRATCH/.venv/bin/python" -m pytest -q 2>&1)"; then
         pass "$seed_id fix restores GREEN"
     else
         fail "$seed_id fix restores GREEN" "test suite still RED after fix"
+        echo "    ── last lines of pytest output ──" >&2
+        printf '%s\n' "$PYTEST_OUT" | tail -20 >&2
     fi
 done
 
@@ -310,24 +350,36 @@ echo ""
 
 git -C "$SCRATCH" checkout -f -q broken-tests 2>/dev/null
 git -C "$SCRATCH" clean -fdq
-bash "$SCRATCH/bootstrap" >/dev/null 2>&1
+# US-007: surface the bootstrap tail on failure.
+if ! BOOT_OUT="$(bash "$SCRATCH/bootstrap" 2>&1)"; then
+    fail "broken-tests bootstrap" "bootstrap script failed"
+    echo "    ── last lines of bootstrap output ──" >&2
+    printf '%s\n' "$BOOT_OUT" | tail -20 >&2
+    exit 1
+fi
 
-if "$SCRATCH/.venv/bin/python" -m pytest -q >/dev/null 2>&1; then
+if PYTEST_OUT="$("$SCRATCH/.venv/bin/python" -m pytest -q 2>&1)"; then
     fail "broken-tests branch: RED (expected failures)" \
         "test suite was GREEN"
+    echo "    ── last lines of pytest output ──" >&2
+    printf '%s\n' "$PYTEST_OUT" | tail -20 >&2
 else
     pass "broken-tests branch: RED (expected)"
 fi
 
 # Verify BRK-P1 and BRK-P2 individually
-if "$SCRATCH/.venv/bin/python" -m pytest -q tests/test_broken_p1.py >/dev/null 2>&1; then
+if PYTEST_OUT="$("$SCRATCH/.venv/bin/python" -m pytest -q tests/test_broken_p1.py 2>&1)"; then
     fail "BRK-P1 causes test failure" "test_broken_p1.py passed — expected failures"
+    echo "    ── last lines of pytest output ──" >&2
+    printf '%s\n' "$PYTEST_OUT" | tail -20 >&2
 else
     pass "BRK-P1: causes test failure"
 fi
 
-if "$SCRATCH/.venv/bin/python" -m pytest -q tests/test_broken_p2.py >/dev/null 2>&1; then
+if PYTEST_OUT="$("$SCRATCH/.venv/bin/python" -m pytest -q tests/test_broken_p2.py 2>&1)"; then
     fail "BRK-P2 causes test failure" "test_broken_p2.py passed — expected failures"
+    echo "    ── last lines of pytest output ──" >&2
+    printf '%s\n' "$PYTEST_OUT" | tail -20 >&2
 else
     pass "BRK-P2: causes test failure"
 fi
@@ -341,20 +393,24 @@ git -C "$SCRATCH" checkout -f -q broken-tests 2>/dev/null
 git -C "$SCRATCH" clean -fdq
 patch -d "$SCRATCH" -p1 --forward --silent < "$SCRIPT_DIR/seeds/BRK-P1/fix.patch" >/dev/null 2>&1 || true
 
-if "$SCRATCH/.venv/bin/python" -m pytest -q tests/test_broken_p1.py >/dev/null 2>&1; then
+if PYTEST_OUT="$("$SCRATCH/.venv/bin/python" -m pytest -q tests/test_broken_p1.py 2>&1)"; then
     pass "BRK-P1 fix restores GREEN"
 else
     fail "BRK-P1 fix restores GREEN" "tests still failing after fix"
+    echo "    ── last lines of pytest output ──" >&2
+    printf '%s\n' "$PYTEST_OUT" | tail -20 >&2
 fi
 
 git -C "$SCRATCH" checkout -f -q broken-tests 2>/dev/null
 git -C "$SCRATCH" clean -fdq
 patch -d "$SCRATCH" -p1 --forward --silent < "$SCRIPT_DIR/seeds/BRK-P2/fix.patch" >/dev/null 2>&1 || true
 
-if "$SCRATCH/.venv/bin/python" -m pytest -q tests/test_broken_p2.py >/dev/null 2>&1; then
+if PYTEST_OUT="$("$SCRATCH/.venv/bin/python" -m pytest -q tests/test_broken_p2.py 2>&1)"; then
     pass "BRK-P2 fix restores GREEN"
 else
     fail "BRK-P2 fix restores GREEN" "tests still failing after fix"
+    echo "    ── last lines of pytest output ──" >&2
+    printf '%s\n' "$PYTEST_OUT" | tail -20 >&2
 fi
 
 # ── Phase 7: Master variant validation ────────────────────────────
@@ -403,18 +459,28 @@ fi
 
 # Baseline GREEN in master variant
 cd "$MASTER_SCRATCH"
-bash "$MASTER_SCRATCH/bootstrap" >/dev/null 2>&1
+# US-007: surface the bootstrap tail on failure.
+if ! BOOT_OUT="$(bash "$MASTER_SCRATCH/bootstrap" 2>&1)"; then
+    fail "Master variant bootstrap" "bootstrap script failed"
+    echo "    ── last lines of bootstrap output ──" >&2
+    printf '%s\n' "$BOOT_OUT" | tail -20 >&2
+    exit 1
+fi
 
-if "$MASTER_SCRATCH/.venv/bin/python" -m pytest -q >/dev/null 2>&1; then
+if PYTEST_OUT="$("$MASTER_SCRATCH/.venv/bin/python" -m pytest -q 2>&1)"; then
     pass "Master variant baseline suite: GREEN"
 else
     fail "Master variant baseline suite: GREEN" "tests failed"
+    echo "    ── last lines of pytest output ──" >&2
+    printf '%s\n' "$PYTEST_OUT" | tail -20 >&2
 fi
 
 # Verify broken-tests RED in master variant
 git -C "$MASTER_SCRATCH" checkout -f -q broken-tests 2>/dev/null
-if "$MASTER_SCRATCH/.venv/bin/python" -m pytest -q >/dev/null 2>&1; then
+if PYTEST_OUT="$("$MASTER_SCRATCH/.venv/bin/python" -m pytest -q 2>&1)"; then
     fail "Master variant broken-tests: RED" "suite was GREEN — expected RED"
+    echo "    ── last lines of pytest output ──" >&2
+    printf '%s\n' "$PYTEST_OUT" | tail -20 >&2
 else
     pass "Master variant broken-tests: RED (expected)"
 fi
