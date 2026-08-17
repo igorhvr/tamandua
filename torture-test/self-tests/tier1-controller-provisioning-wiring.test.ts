@@ -316,9 +316,13 @@ describe("Controller fixture work-clone provisioning wiring (US-004)", () => {
       const headOk = spawnSync("git", ["-C", clonePath, "rev-parse", "--verify", "-q", "HEAD"], { encoding: "utf8" });
       assert.equal(headOk.status, 0, "re-provisioned clone must be a valid git working tree");
       // Re-provision must not leave the previous attempt's dirt behind. The
-      // ONLY untracked entries allowed are tt-python's intentional arming junk
-      // (planted operator-notes.local + regenerated .pytest_cache/__pycache__);
-      // there must be NO modified-tracked files and no stray files.
+      // ONLY untracked entries allowed are tt-python's intentional arming junk:
+      // planted operator-notes.local, the SEEDED synthetic
+      // __pycache__/junk-probe.synthetic (a deterministic provisioning
+      // artifact, MACP2 US-002 — shown as `?? __pycache__/` or
+      // `?? __pycache__/junk-probe.synthetic`), and regenerated
+      // .pytest_cache/__pycache__ from the pytest cycle; there must be NO
+      // modified-tracked files and no stray files.
       const st = spawnSync("git", ["-C", clonePath, "status", "--porcelain"], { encoding: "utf8" });
       const entries = String(st.stdout ?? "").split(/\r?\n/).filter((l) => l.trim().length > 0);
       assert.ok(entries.length > 0, "re-provisioned tt-python clone must carry its planned arming junk");
@@ -327,7 +331,7 @@ describe("Controller fixture work-clone provisioning wiring (US-004)", () => {
           const p = e.slice(3);
           assert.ok(
             p === "operator-notes.local"
-              || p.includes("__pycache__")
+              || p.includes("__pycache__")      // seeded junk-probe.synthetic + any in-tree pyc
               || p.includes(".pytest_cache"),
             `unexpected residual untracked entry after re-provision: ${e}`,
           );

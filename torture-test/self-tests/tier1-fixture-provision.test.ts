@@ -15,8 +15,11 @@
 //          never detached HEAD.
 //   * AC4: junk invariants hold for the tt-python do-now path: the venv is
 //          pre-bootstrapped; operator-notes.local is present + untracked +
-//          byte-identical to the fixture source; regenerated junk
-//          (__pycache__/, .pytest_cache/) is present + untracked.
+//          byte-identical to the fixture source; the SEEDED synthetic
+//          __pycache__/junk-probe.synthetic is present + untracked +
+//          byte-identical to the fixtures-src reference (a deterministic
+//          provisioning artifact — MACP2 US-002); regenerated .pytest_cache is
+//          present + untracked.
 //   * Per-attempt re-provision is CLEAN: a dirtied clone is wiped and
 //     re-provisioned fresh (the adapter never inherits a previous dirty tree).
 //   * fail-closed: an unknown fixture / unknown seed yields a precise
@@ -137,11 +140,16 @@ describe("Fixture work-clone provisioning (US-003)", () => {
     const dstNotes = fs.readFileSync(path.join(expected, "operator-notes.local"));
     assert.ok(dstNotes.equals(srcNotes), "operator-notes.local must be byte-identical to the fixture source");
     assertUntracked(expected, "operator-notes.local", "AC4");
-    // AC4: regenerated junk present + untracked.
-    for (const junk of [".pytest_cache", "__pycache__"]) {
-      assert.ok(fs.existsSync(path.join(expected, junk)), `regenerated junk ${junk} must exist`);
-      assertUntracked(expected, junk, "AC4");
-    }
+    // AC4: seeded synthetic __pycache__ junk — present, untracked, and
+    // byte-identical to the fixtures-src reference (MACP2 US-002: the junk is
+    // a deterministic provisioning artifact, never an interpreter side effect).
+    const srcJunk = fs.readFileSync(path.join(ttRoot, "fixtures-src", "tt-python", "__pycache__", "junk-probe.synthetic"));
+    const dstJunk = fs.readFileSync(path.join(expected, "__pycache__", "junk-probe.synthetic"));
+    assert.ok(dstJunk.equals(srcJunk), "seeded junk-probe.synthetic must be byte-identical to the fixtures-src reference");
+    assertUntracked(expected, "__pycache__/junk-probe.synthetic", "AC4");
+    // AC4: regenerated .pytest_cache present + untracked.
+    assert.ok(fs.existsSync(path.join(expected, ".pytest_cache")), "regenerated .pytest_cache must exist");
+    assertUntracked(expected, ".pytest_cache", "AC4");
     assert.equal(json.operatorNotesPlanted, true);
     assert.equal(json.junkVerified, true);
   });
@@ -201,11 +209,17 @@ describe("Fixture work-clone provisioning (US-003)", () => {
     assert.match(readme, /schedlib/, "restored README has golden content");
     const dirty = gitIn(expected, ["status", "--porcelain"]);
     assert.equal(dirty.status, 0);
-    // The ONLY untracked entry may be the intentionally-planted inert operator
-    // junk (AC4); the stray marker and tampered README must be gone, and no
-    // other drift may remain.
+    // The ONLY untracked entries may be the intentionally-planted arming junk:
+    // operator-notes.local plus the SEEDED synthetic __pycache__ junk
+    // (MACP2 US-002 — raw arming still plants the deterministic marker; shown
+    // as the collapsed untracked dir `?? __pycache__/`); the stray marker and
+    // tampered README must be gone, and no other drift may remain.
     const lines = dirty.stdout.split(/\r?\n/).filter((l) => l.trim() !== "");
-    assert.deepEqual(lines, ["?? operator-notes.local"], "re-provisioned clone must be clean except planned operator junk");
+    assert.deepEqual(
+      [...lines].sort(),
+      ["?? __pycache__/", "?? operator-notes.local"],
+      "re-provisioned clone must be clean except the planned operator junk + seeded synthetic __pycache__ junk",
+    );
     // Still on a named branch (never detached), i.e. the same case id did not
     // accumulate a previous attempt's branch state.
     const branch = assertNotDetached(expected);

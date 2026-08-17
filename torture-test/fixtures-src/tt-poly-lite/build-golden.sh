@@ -379,13 +379,55 @@ echo "  [6c] Junk probe verification..."
     git checkout main > /dev/null 2>&1
 )
 
-# Python junk probes — run a quick test cycle to generate them
+# MACP2: the python-subtree __pycache__ junk is a DETERMINISTIC PROVISIONING
+# ARTIFACT, not an interpreter side effect — Apple's Python bakes in
+# sys.pycache_prefix and ALWAYS redirects bytecode caches out-of-tree, so
+# in-tree python/__pycache__ can never be relied on. Seed the byte-exact
+# fixtures-src reference into the verify clone BEFORE the test run; the marker
+# file is what the oracle checks (present + untracked + byte-identical).
+JUNK_REF="$FIXTURE_SRC/python/__pycache__/junk-probe.synthetic"
+mkdir -p "$VERIFY_DIR/python/__pycache__"
+cp "$JUNK_REF" "$VERIFY_DIR/python/__pycache__/junk-probe.synthetic"
+
+# Run a quick test cycle to regenerate the interpreter-written junk
+# (.pytest_cache, .flaky_counter) — Darwin-safe.
 echo -n "    Generating python junk..."
 (cd "$VERIFY_DIR/python" && .venv/bin/python -m pytest -q --tb=short > /dev/null 2>&1) || true
 echo " done"
 
-# python/ junk probes: __pycache__/, .pytest_cache/, .flaky_counter
-for junk_path in "python/__pycache__" "python/.pytest_cache" "python/.flaky_counter"; do
+JUNK_OK=true
+
+# Seeded synthetic python/__pycache__ junk: present, untracked, byte-identical
+# to the fixtures-src reference. Absence is NO LONGER tolerated — the probe
+# must never silently weaken on hosts where the interpreter redirects bytecode
+# caches out-of-tree (Apple's sys.pycache_prefix).
+if [ ! -f "$VERIFY_DIR/python/__pycache__/junk-probe.synthetic" ]; then
+    echo "    python/__pycache__/junk-probe.synthetic : MISSING — seeded junk absent (probe weakened)!"
+    JUNK_OK=false
+elif JUNK_TRACKED="$(cd "$VERIFY_DIR" && git ls-files --error-unmatch python/__pycache__/junk-probe.synthetic 2>&1)"; then
+    echo "    python/__pycache__/junk-probe.synthetic : TRACKED — junk probe failure!"
+    echo "    ── git ls-files output ──"
+    printf '%s\n' "$JUNK_TRACKED" | tail -20
+    JUNK_OK=false
+elif ! cmp -s "$JUNK_REF" "$VERIFY_DIR/python/__pycache__/junk-probe.synthetic"; then
+    echo "    python/__pycache__/junk-probe.synthetic : BYTE-MISMATCH — differs from the fixtures-src reference!"
+    JUNK_OK=false
+else
+    echo "    python/__pycache__/ : present, untracked, byte-identical (seeded synthetic junk)"
+fi
+
+# The fixture SOURCE synthetic reference is the byte-exact provisioning
+# reference (same pattern as operator-notes.local) — it must be retained.
+if [ ! -s "$JUNK_REF" ]; then
+    echo "    python/__pycache__/junk-probe.synthetic : fixture source missing/empty — provisioning reference lost!"
+    JUNK_OK=false
+else
+    echo "    python/__pycache__/junk-probe.synthetic : fixture source retained (byte-exact provisioning ref)"
+fi
+
+# python/ regenerated junk probes: .pytest_cache/, .flaky_counter (absence
+# tolerated — they are interpreter/pytest side effects, Darwin-safe)
+for junk_path in "python/.pytest_cache" "python/.flaky_counter"; do
     junk_name="$(basename "$junk_path")"
     if [ -e "$VERIFY_DIR/$junk_path" ]; then
         if (cd "$VERIFY_DIR" && git status --porcelain "$junk_path" 2>/dev/null | grep -q '^??'); then
@@ -426,6 +468,22 @@ for junk_path in "python/__pycache__" "python/.pytest_cache" "python/.flaky_coun
         echo "    $junk_path : OK (not gitignored)"
     fi
 done
+
+# python/__pycache__ must NOT be gitignored (root or python/.gitignore) — a
+# gitignored junk probe is a distinct failure mode (spec 02: junk probes must
+# NOT be suppressed by .gitignore).
+for gi in "$VERIFY_DIR/.gitignore" "$VERIFY_DIR/python/.gitignore"; do
+    if [ -f "$gi" ]; then
+        if grep -v '^#' "$gi" 2>/dev/null | grep -qF '__pycache__'; then
+            echo "    python/__pycache__ : FAIL — gitignored in $(basename "$gi") (must NOT be)!"
+            JUNK_OK=false
+        fi
+    fi
+done
+
+if ! $JUNK_OK; then
+    exit 1
+fi
 
 # ts/ junk probes (run tests to generate them)
 echo -n "    Generating ts junk..."
@@ -817,7 +875,7 @@ echo ""
 echo "  Verification   : ALL PASSED"
 echo "    - Baseline green (python + ts)"
 echo "    - broken-tests branch red"
-echo "    - Junk probes verified (untracked, not gitignored)"
+echo "    - Junk probes verified (seeded python/__pycache__ junk present/untracked/byte-identical, regenerated junk untracked)"
 echo "    - operator-notes.local excluded from golden, source ref retained"
 echo "    - Python seed refs verified (BUG: dormant/active, VULN: dormant, fix green)"
 echo "    - TS seed refs verified (BUG: dormant, BRK: red, fix green)"

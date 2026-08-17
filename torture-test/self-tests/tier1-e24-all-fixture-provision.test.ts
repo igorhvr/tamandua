@@ -16,8 +16,15 @@
 //   * AC3: the planted file is byte-identical to the fixture source for every
 //          fixture (tt-python@master falls back to the shared tt-python
 //          source, which it is a variant of).
+//   * AC3b (MACP2 US-002): tt-python AND tt-python@master additionally carry
+//          the SEEDED synthetic __pycache__/junk-probe.synthetic — present +
+//          untracked + byte-identical to the shared tt-python reference (the
+//          python junk is a deterministic provisioning artifact, never an
+//          interpreter side effect; tt-python@master seeds via the shared
+//          reference fallback).
 //   * AC4: re-provision of an attempt N+1 yields a clean untracked clone — no
-//          inherited stale tracked copy and no other drift.
+//          inherited stale tracked copy and no other drift (only the planned
+//          untracked operator junk + seeded __pycache__ junk remain).
 //
 // Zero tokens. Writes only to temp dirs under os.tmpdir() (golden + work).
 // Files only inside torture-test/.
@@ -162,6 +169,17 @@ describe("E2.4 US-003: operator-notes.local planted untracked+byte-exact in ever
       assert.ok(dstNotes.equals(srcNotes), `${fixture}: operator-notes.local must be byte-identical to the fixture source`);
       // AC2: must be UNTRACKED (never in the index) in the work clone.
       assertUntracked(clone, "operator-notes.local", `${fixture}`);
+      // AC3b (MACP2 US-002): the python fixtures also carry the SEEDED
+      // synthetic __pycache__ junk — present + untracked + byte-identical to
+      // the shared tt-python reference (raw arming; the seed is planted in
+      // both arming modes).
+      if (fixture === "tt-python" || fixture === "tt-python@master") {
+        const srcJunk = fs.readFileSync(path.join(ttRoot, "fixtures-src", "tt-python", "__pycache__", "junk-probe.synthetic"));
+        const dstJunk = fs.readFileSync(path.join(clone, "__pycache__", "junk-probe.synthetic"));
+        assert.ok(dstJunk.equals(srcJunk), `${fixture}: seeded junk-probe.synthetic must be byte-identical to the shared tt-python reference`);
+        assertUntracked(clone, "__pycache__/junk-probe.synthetic", `${fixture}`);
+        assert.equal(json.junkVerified, true, `${fixture}: raw arming must still verify the seeded junk`);
+      }
     }
   });
 
@@ -195,10 +213,24 @@ describe("E2.4 US-003: operator-notes.local planted untracked+byte-exact in ever
     const dirty = gitIn(clone, ["status", "--porcelain"]);
     assert.equal(dirty.status, 0);
     const lines = dirty.stdout.split(/\r?\n/).filter((l) => l.trim() !== "");
-    assert.deepEqual(lines, ["?? operator-notes.local"], "clean re-provision leaves only the planned untracked operator junk");
+    // MACP2 US-002: tt-python@master now also carries the SEEDED synthetic
+    // __pycache__ junk (untracked dir), so a clean re-provision leaves the
+    // operator-notes.local plant AND the seeded junk — nothing else.
+    assert.deepEqual(
+      [...lines].sort(),
+      ["?? __pycache__/", "?? operator-notes.local"],
+      "clean re-provision leaves only the planned untracked operator junk and seeded synthetic __pycache__ junk",
+    );
     assertUntracked(clone, "operator-notes.local", "AC4 re-provision");
     const srcNotes = fs.readFileSync(sourceNotesFor(fixture));
     assert.ok(fs.readFileSync(path.join(clone, "operator-notes.local")).equals(srcNotes), "re-planted file must be byte-identical");
+    // The seeded junk is re-planted + verified on every attempt too.
+    const srcJunk = fs.readFileSync(path.join(ttRoot, "fixtures-src", "tt-python", "__pycache__", "junk-probe.synthetic"));
+    assert.ok(
+      fs.readFileSync(path.join(clone, "__pycache__", "junk-probe.synthetic")).equals(srcJunk),
+      "re-planted seeded junk must be byte-identical to the shared tt-python reference",
+    );
+    assertUntracked(clone, "__pycache__/junk-probe.synthetic", "AC4 re-provision");
   });
 
   it("AC2 fail-closed: a golden that tracks operator-notes.local makes provisioning return operator-notes-tracked (oracle intact)", function () {

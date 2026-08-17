@@ -12,6 +12,11 @@
 //   * present golden -> verify it is a VALID bare git repo containing the exact
 //                       refs its recorded hash file claims (seeds + baseline
 //                       branch), and no-op if so (idempotent);
+//   * --rebuild-invalid -> a PRESENT but invalid golden (missing/malformed hash
+//                       ledger, ref mismatch, non-bare) is REBUILT from scratch
+//                       with a loud per-asset note naming the defect instead of
+//                       failing closed. A VALID golden is never rebuilt (no-op).
+//                       Default (no flag) stays fail-closed, never silent;
 //   * any failure    -> returns a precise TEST_INFRA reason (fail-closed). A
 //                       healthy host must never hit these; a missing or malformed
 //                       golden is NEVER a silent half-launch.
@@ -300,17 +305,40 @@ function buildGoldenBare({ fixture, barePath, hashFilePath, buildScriptPath }) {
 }
 
 // Idempotent bootstrap gate.
-//   absent golden  -> build it, verify, fail-closed if anything is wrong;
-//   present golden -> verify (idempotent no-op when valid, fail-closed when not);
-//   force:true     -> rebuild from scratch regardless of current state.
-export function ensureGoldenBare({ fixture, goldenDir, force = false }) {
+//   absent golden        -> build it, verify, fail-closed if anything is wrong;
+//   present golden       -> verify (idempotent no-op when valid, fail-closed when not);
+//   force:true           -> rebuild from scratch regardless of current state;
+//   rebuildInvalid:true  -> a PRESENT but invalid golden (verify failed) is rebuilt
+//                           from scratch with a loud per-asset note naming the
+//                           defect (`rebuiltInvalid:true` + `invalidReason` in the
+//                           verdict) instead of failing closed. A VALID golden is
+//                           NEVER rebuilt — healthy goldens stay a no-op even with
+//                           the flag. Default (absent) keeps fail-closed behavior
+//                           byte-identical to the no-flag path.
+export function ensureGoldenBare({ fixture, goldenDir, force = false, rebuildInvalid = false }) {
   const resolved = fixtureMetaOrReason(fixture, goldenDir);
   if (!resolved.ok) return resolved;
 
   const present = fs.existsSync(resolved.barePath);
   if (present && !force) {
     const verified = verifyGoldenBare({ fixture, goldenDir: resolved.goldenDir });
-    if (!verified.ok) return verified; // fail-closed, never silently rebuild
+    if (!verified.ok) {
+      if (!rebuildInvalid) return verified; // fail-closed, never silently rebuild
+      // --rebuild-invalid self-heal: the golden is present but stale/partial.
+      // Rebuild from scratch and report the per-asset defect loudly — the note
+      // and invalidReason are part of the verdict, never a silent rebuild.
+      const defect = verified.reason;
+      const buildResult = buildGoldenBare(resolved);
+      if (!buildResult.ok) return buildResult;
+      return {
+        ...buildResult,
+        built: true,
+        rebuiltInvalid: true,
+        invalidReason: defect.category,
+        invalidMessage: defect.message,
+        note: `REBUILT-INVALID: golden '${fixture}' was present but invalid (defect: ${defect.category} — ${defect.message}); rebuilt from scratch`,
+      };
+    }
     return { ...verified, built: false };
   }
 
@@ -331,6 +359,10 @@ function usage() {
     `  --fixture <name>   Golden fixture to build/verify (e.g. tt-python).`,
     `  --golden-dir <dir> Override the golden output dir (default:`, `                     torture-test/var/fixtures/golden).`,
     `  --force            Rebuild the golden from scratch even if present.`,
+    `  --rebuild-invalid  Rebuild a PRESENT but invalid golden from scratch (e.g.`,
+    `                     missing/malformed hash ledger, ref mismatch, non-bare)`,
+    `                     with a loud per-asset note naming the defect; a VALID`,
+    `                     golden is never rebuilt (no-op). Default: fail-closed.`,
     `  --json             Emit the JSON verdict on stdout (default).`,
     `  --help, -h         Print this help and exit.`,
     ``,
@@ -353,6 +385,7 @@ function runCli(argv) {
   let fixture;
   let goldenDir;
   let force = false;
+  let rebuildInvalid = false;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--fixture') {
@@ -361,6 +394,8 @@ function runCli(argv) {
       goldenDir = argv[++i];
     } else if (arg === '--force') {
       force = true;
+    } else if (arg === '--rebuild-invalid') {
+      rebuildInvalid = true;
     } else if (arg === '--json') {
       // default; accepted for explicitness
     } else {
@@ -372,7 +407,7 @@ function runCli(argv) {
     printJson({ ok: false, usage_error: '--fixture is required', hint: usage().split('\n')[0] });
     return 2;
   }
-  const result = ensureGoldenBare({ fixture, goldenDir, force });
+  const result = ensureGoldenBare({ fixture, goldenDir, force, rebuildInvalid });
   printJson(result);
   return result.ok ? 0 : 1;
 }

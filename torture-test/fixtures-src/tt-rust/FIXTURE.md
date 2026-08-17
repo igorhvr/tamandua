@@ -318,7 +318,7 @@ seeds/
 
 ## Junk Probes
 
-Per spec 02's **two-class junk probe requirement**, this fixture carries
+Per spec 02's **junk-probe requirement**, this fixture carries
 both classes. Neither is gitignored — oracles verify they appear as
 untracked in `git status` so the dirty-tree gate tolerates them while
 rejecting tracked drift.

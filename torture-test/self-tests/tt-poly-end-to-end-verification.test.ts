@@ -709,6 +709,64 @@ describe("tt-poly end-to-end verification (US-016)", () => {
     }
   });
 
+  it("AC6: junk probes — golden committed tree excludes __pycache__; fixtures-src reference retained (MACP2)", function () {
+    this.timeout = 300_000;
+
+    const gb = ensureGoldenBuilt();
+
+    // Acceptance criterion: the synthetic payload is ABSENT from the built
+    // golden committed tree (git ls-tree HEAD shows no __pycache__) but
+    // present in fixtures-src as the byte-exact reference.
+    const tree = execSync(
+      `git --git-dir="${gb.bareRepo}" ls-tree -r --name-only HEAD`,
+      { stdio: "pipe", encoding: "utf-8" },
+    );
+    assert.ok(
+      !tree.split("\n").some((l) => l.includes("__pycache__")),
+      "golden committed tree must contain NO __pycache__ entries",
+    );
+
+    const ref = path.join(fixtureSrc, "python", "__pycache__", "junk-probe.synthetic");
+    assert.ok(fs.existsSync(ref), "fixtures-src python/__pycache__/junk-probe.synthetic should exist");
+    assert.ok(fs.statSync(ref).size > 0, "reference should not be empty");
+  });
+
+  it("AC6: junk probes — seeded synthetic junk in a work clone is present, untracked, byte-identical (MACP2)", function () {
+    this.timeout = 300_000;
+
+    ensureGoldenBuilt();
+
+    const tmpDir = cloneBareRepo("tt-poly-e2e-junkseed-");
+    try {
+      // Provisioning plants the seeded junk from the fixtures-src reference —
+      // simulate that planting, then assert the same oracles the builder uses:
+      // present + untracked + byte-identical.
+      const ref = path.join(fixtureSrc, "python", "__pycache__", "junk-probe.synthetic");
+      const marker = path.join(tmpDir, "python", "__pycache__", "junk-probe.synthetic");
+      fs.mkdirSync(path.dirname(marker), { recursive: true });
+      fs.copyFileSync(ref, marker);
+
+      assert.ok(fs.existsSync(marker), "seeded junk must be present after planting");
+
+      const status = execSync(
+        "git status --porcelain python/__pycache__/junk-probe.synthetic",
+        { cwd: tmpDir, stdio: "pipe", encoding: "utf-8" },
+      );
+      assert.ok(
+        status === "" || status.startsWith("?"),
+        `seeded junk should be untracked, got: "${status.trim()}"`,
+      );
+
+      assert.equal(
+        fs.readFileSync(marker, "utf-8"),
+        fs.readFileSync(ref, "utf-8"),
+        "seeded junk must be byte-identical to the fixtures-src reference",
+      );
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   // ── make test === ./run-all-tests ────────────────────────────────────────
 
   it("Makefile 'make test' references ./run-all-tests", function () {
@@ -755,6 +813,18 @@ describe("tt-poly end-to-end verification (US-016)", () => {
     assert.ok(
       output.includes("[10d] Junk probe verification"),
       "Phase 10d: junk probe verification should run",
+    );
+
+    // MACP2: the [10d] section must seed and verify the python-subtree
+    // synthetic junk (present + untracked + byte-identical) — absence is no
+    // longer tolerated.
+    assert.ok(
+      output.includes("present, untracked, byte-identical (seeded synthetic junk)"),
+      "Phase 10d: seeded python/__pycache__ junk must report present + untracked + byte-identical",
+    );
+    assert.ok(
+      output.includes("fixture source retained (byte-exact provisioning ref)"),
+      "Phase 10d: the fixtures-src junk reference must be reported as retained",
     );
 
     assert.ok(

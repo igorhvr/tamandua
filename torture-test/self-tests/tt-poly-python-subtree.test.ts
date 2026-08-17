@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { describe, it } from "node:test";
@@ -248,5 +249,41 @@ describe("tt-poly python/ subtree integration (US-002)", () => {
       !activeRules.includes(".pytest_cache/"),
       ".gitignore should NOT exclude .pytest_cache/ (junk probe)",
     );
+  });
+
+  it("python/__pycache__/junk-probe.synthetic seeded-junk reference exists in both fixtures, byte-identical, tracked (MACP2)", () => {
+    // MACP2: the python __pycache__ junk is a DETERMINISTIC PROVISIONING
+    // ARTIFACT — each fixture carries the byte-exact synthetic reference
+    // (never committed into the golden; excluded by the builder tar rules).
+    const polyRef = path.join(ttPolyPythonDir, "__pycache__", "junk-probe.synthetic");
+    const liteRef = path.join(ttPolyLitePythonDir, "__pycache__", "junk-probe.synthetic");
+
+    for (const [label, ref] of [
+      ["tt-poly", polyRef],
+      ["tt-poly-lite", liteRef],
+    ] as const) {
+      assert.ok(fs.existsSync(ref), `${label} python/__pycache__/junk-probe.synthetic should exist`);
+      const stat = fs.statSync(ref);
+      assert.ok(stat.isFile(), `${label} reference should be a file`);
+      assert.ok(stat.size > 0, `${label} reference should not be empty`);
+    }
+
+    // Byte-identical across the two fixtures (same canonical MACP2 marker).
+    assert.equal(
+      fs.readFileSync(polyRef, "utf-8"),
+      fs.readFileSync(liteRef, "utf-8"),
+      "tt-poly and tt-poly-lite references must be byte-identical",
+    );
+
+    // Tracked in git + NOT gitignored for both.
+    for (const rel of [
+      "torture-test/fixtures-src/tt-poly/python/__pycache__/junk-probe.synthetic",
+      "torture-test/fixtures-src/tt-poly-lite/python/__pycache__/junk-probe.synthetic",
+    ]) {
+      const ls = spawnSync("git", ["ls-files", "--error-unmatch", rel], { cwd: repoRoot, encoding: "utf8" });
+      assert.equal(ls.status, 0, `${rel} must be tracked in git`);
+      const ci = spawnSync("git", ["check-ignore", "-q", rel], { cwd: repoRoot, encoding: "utf8" });
+      assert.notEqual(ci.status, 0, `${rel} must NOT be gitignored`);
+    }
   });
 });

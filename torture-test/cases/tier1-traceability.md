@@ -931,8 +931,10 @@ seed-or-baseline, it:
 - **(c)** applies per-fixture working-state / junk preparation per spec 02:
   plants the inert `operator-notes.local` (present + untracked + byte-identical
   to the fixture source), and for the tt-python do-now path pre-bootstraps the
-  `.venv` (runs `./bootstrap`) and regenerates junk (`__pycache__/`,
-  `.pytest_cache/`) as untracked files. `--arming prebootstrapped` is the
+  `.venv` (runs `./bootstrap`), seeds the deterministic `__pycache__/` junk
+  marker (seeded/deterministic junk — byte-identical to the fixtures-src
+  reference), and regenerates `.pytest_cache/` as untracked files.
+  `--arming prebootstrapped` is the
 do-now default; `--arming raw` defers bootstrap/junk to a full-chain
 workflow's own setup step.
 

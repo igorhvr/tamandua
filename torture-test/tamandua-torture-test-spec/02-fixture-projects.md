@@ -50,15 +50,24 @@ byte-known state and no scenario inherits a sibling's residue.
   subtree breaks another subtree's test — union-of-merges bait for the
   storm). The per-fixture BUG-IDs below map onto these archetypes in
   FIXTURE.md.
-- **Junk probes, two classes** (oracles treat them differently):
+- **Junk probes, three classes** (oracles treat them differently):
   *regenerated junk* — one generated artifact per repo deliberately not
   gitignored, rewritten **by the test code itself** on every run (so any
   discovered runner regenerates it): must remain present + untracked,
-  content free to change; and *inert operator junk* — one
+  content free to change; *inert operator junk* — one
   `operator-notes.local` per repo, planted at instantiation, never touched
   by any tool: must stay untracked and **byte-identical** all campaign
   (hashed by the 1-min sampler, so transient delete-and-restore is in
-  scope, not just boundary checks). This is load-bearing: TSTX
+  scope, not just boundary checks); and *deterministic seeded junk* — the
+  python `__pycache__` probe: planted at provisioning with **byte-exact
+  recorded content** (a synthetic marker seeded from a tracked
+  fixtures-src reference), must stay untracked + **byte-identical** after
+  runs; on hosts where the interpreter ALSO writes bytecode caches in-tree
+  (linux default; Apple's Python bakes in `sys.pycache_prefix` and always
+  redirects out-of-tree), those extra files are tolerated — the seeded
+  marker file is what the oracle checks. Docs and fixtures call this class
+  "seeded/deterministic junk" (README-JUNK.md / JUNK-IS-INTENTIONAL.md /
+  FIXTURE.md use the same label). This is load-bearing: TSTX
   committed-tree keying and the tracked-dirty gate must tolerate harmless
   untracked junk while hard-failing on tracked drift. Following the
   product's own convention, a `README-JUNK.md` marker sits beside each
@@ -125,7 +134,11 @@ byte-known state and no scenario inherits a sibling's residue.
   setup-agent baseline behavior). A raw clone under a setup-less workflow is
   a manifest lint error — the first draft left this ambiguous and half the
   python smoke lanes would have started on a broken TEST_CMD.
-  Junk probes: untracked `__pycache__/`, `.pytest_cache/`.
+  Junk probes: untracked `__pycache__/` (deterministic seeded junk — a
+  synthetic marker planted at provisioning with byte-exact recorded
+  content; must stay untracked + byte-identical after runs; interpreter-
+  written in-tree caches on linux are tolerated extra files),
+  `.pytest_cache/` (regenerated).
 - This fixture also ships a `master`-only arming variant (`tt-python@master`:
   default branch renamed, no `main` ref at all) for W2.22 — bundled prompts
   hardcode `main` in several merge-family instructions, and no other fixture

@@ -57,7 +57,7 @@ designated W4.18 scenario via `python/seeds/POLY-FLAKY-P1/` arming overlay.
 
 | Artifact | Class | Notes |
 |---|---|---|
-| `__pycache__/` | Regenerated | Python bytecode cache, NOT gitignored |
+| `__pycache__/` | Seeded/deterministic | Synthetic marker planted at provisioning (byte-identical to fixtures-src reference), NOT gitignored |
 | `.pytest_cache/` | Regenerated | pytest cache, NOT gitignored |
 | `operator-notes.local` | Inert | Fixed byte-content, never touched |
 

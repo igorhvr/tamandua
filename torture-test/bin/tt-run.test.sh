@@ -717,6 +717,121 @@ fi
 if $all_ok; then pass "bare --provision defaults to tier1"; fi
 
 # ---------------------------------------------------------------------------
+# Test (US-005): --provision --rebuild-invalid passes the flag through to each
+# per-fixture tt-golden-bootstrap.mjs call, and the per-asset OK label
+# distinguishes a rebuilt-invalid golden from a plain build.
+# ---------------------------------------------------------------------------
+total_count=$((total_count + 1))
+echo "--- Test: --provision --rebuild-invalid delegates the flag per fixture (US-005) ---" >&2
+rm -f "$FAKE_HOME/verify-calls.log" "$FAKE_HOME/provision-calls.log"
+set +e
+prov_ri=$(bash "$FAKE_HOME/bin/tt-run" --provision tier1 --rebuild-invalid 2>&1)
+prov_ri_ec=$?
+set -e
+all_ok=true
+if [ "$prov_ri_ec" -eq 0 ]; then
+  pass "  --provision tier1 --rebuild-invalid exits 0"
+else
+  fail "--provision tier1 --rebuild-invalid exited $prov_ri_ec: $(echo "$prov_ri" | tail -3)"
+  all_ok=false
+fi
+for fixture in tt-python tt-ts tt-poly-lite tt-python@master; do
+  if [ -f "$FAKE_HOME/provision-calls.log" ] && grep -Fxq -- "--fixture $fixture --rebuild-invalid" "$FAKE_HOME/provision-calls.log"; then
+    pass "  delegates tt-golden-bootstrap --fixture $fixture --rebuild-invalid"
+  else
+    fail "  --rebuild-invalid delegation missing for $fixture (log: $(cat "$FAKE_HOME/provision-calls.log" 2>/dev/null))"
+    all_ok=false
+  fi
+done
+if $all_ok; then pass "--provision --rebuild-invalid delegates the flag per fixture"; fi
+
+# ---------------------------------------------------------------------------
+# Test (US-005): a rebuilt-invalid verdict is labelled OK (rebuilt-invalid),
+# distinct from a plain build / no-rebuild no-op.
+# ---------------------------------------------------------------------------
+cat > "$FAKE_HOME/bin/tt-golden-bootstrap.mjs" <<EOS
+#!/usr/bin/env bash
+echo "\$*" >> "$FAKE_HOME/provision-calls.log"
+if printf '%s' "\$*" | grep -q -- '--rebuild-invalid'; then
+  echo '{"ok":true,"built":true,"rebuiltInvalid":true,"invalidReason":"golden-hash-file-missing"}'
+else
+  echo '{"ok":true,"built":false}'
+fi
+exit 0
+EOS
+chmod +x "$FAKE_HOME/bin/tt-golden-bootstrap.mjs"
+
+total_count=$((total_count + 1))
+echo "--- Test: rebuilt-invalid fixture labelled OK (rebuilt-invalid) (US-005) ---" >&2
+rm -f "$FAKE_HOME/verify-calls.log" "$FAKE_HOME/provision-calls.log"
+set +e
+prov_ri2=$(bash "$FAKE_HOME/bin/tt-run" --provision tier1 --rebuild-invalid 2>&1)
+prov_ri2_ec=$?
+set -e
+all_ok=true
+if [ "$prov_ri2_ec" -eq 0 ] && [ "$(echo "$prov_ri2" | grep -c 'OK (rebuilt-invalid)' || true)" -eq 4 ]; then
+  pass "  4x OK (rebuilt-invalid) for the self-healed fixtures"
+else
+  fail "  expected 4x OK (rebuilt-invalid), exit=$prov_ri2_ec: $(echo "$prov_ri2" | tail -6)"
+  all_ok=false
+fi
+if [ "$(echo "$prov_ri2" | grep -c 'OK (built)' || true)" -eq 0 ]; then
+  pass "  no plain OK (built) label when every fixture was rebuilt-invalid"
+else
+  fail "  unexpected OK (built) labels: $(echo "$prov_ri2" | grep 'OK (built)')"
+  all_ok=false
+fi
+if $all_ok; then pass "rebuilt-invalid fixture labelled OK (rebuilt-invalid)"; fi
+
+# Restore the plain recording fake for the remaining provision tests.
+cat > "$FAKE_HOME/bin/tt-golden-bootstrap.mjs" <<EOS
+#!/usr/bin/env bash
+echo "\$*" >> "$FAKE_HOME/provision-calls.log"
+echo '{"ok":true,"built":false}'
+exit 0
+EOS
+chmod +x "$FAKE_HOME/bin/tt-golden-bootstrap.mjs"
+
+# ---------------------------------------------------------------------------
+# Test (US-005): usage() documents --rebuild-invalid; the flag requires
+# --provision and cannot be combined with tier flags.
+# ---------------------------------------------------------------------------
+total_count=$((total_count + 1))
+echo "--- Test: usage() documents --rebuild-invalid (US-005) ---" >&2
+usage_text=$(_run_fn 'usage')
+all_ok=true
+if echo "$usage_text" | grep -Fq -- '--rebuild-invalid'; then
+  pass "  usage mentions --rebuild-invalid"
+else
+  fail "usage missing --rebuild-invalid"
+  all_ok=false
+fi
+if echo "$usage_text" | grep -Fq 'rebuilt from scratch'; then
+  pass "  usage describes the self-heal (rebuilt from scratch)"
+else
+  fail "usage missing the self-heal description"
+  all_ok=false
+fi
+if $all_ok; then pass "usage() documents --rebuild-invalid"; fi
+
+total_count=$((total_count + 1))
+echo "--- Test: --rebuild-invalid without --provision / with tier flags exits 4 (US-005) ---" >&2
+all_ok=true
+for combo in "--rebuild-invalid" "--tier1 --rebuild-invalid" "--rebuild-invalid --tier1"; do
+  set +e
+  bash "$TT_RUN" $combo >/dev/null 2>&1
+  ec=$?
+  set -e
+  if [ "$ec" -eq 4 ]; then
+    pass "  '$combo' exits 4"
+  else
+    fail "'$combo' exited $ec, expected 4"
+    all_ok=false
+  fi
+done
+if $all_ok; then pass "--rebuild-invalid misuse exits 4 with usage"; fi
+
+# ---------------------------------------------------------------------------
 # Test: --provision tier2 delegates all eight KNOWN_FIXTURES (tier2 set).
 # ---------------------------------------------------------------------------
 total_count=$((total_count + 1))

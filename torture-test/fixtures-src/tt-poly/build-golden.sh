@@ -960,6 +960,44 @@ for subtree in python ts go rust java; do
     fi
 done
 
+# MACP2: the python-subtree __pycache__ junk is a DETERMINISTIC PROVISIONING
+# ARTIFACT, not an interpreter side effect — Apple's Python bakes in
+# sys.pycache_prefix and ALWAYS redirects bytecode caches out-of-tree, so
+# in-tree python/__pycache__ can never be relied on. Seed the byte-exact
+# fixtures-src reference into the verify clone; the marker file is what the
+# oracle checks (present + untracked + byte-identical).
+JUNK_REF="$FIXTURE_SRC/python/__pycache__/junk-probe.synthetic"
+mkdir -p "$VERIFY_DIR/python/__pycache__"
+cp "$JUNK_REF" "$VERIFY_DIR/python/__pycache__/junk-probe.synthetic"
+
+# Seeded synthetic python/__pycache__ junk: present, untracked, byte-identical
+# to the fixtures-src reference. Absence is NO LONGER tolerated — the probe
+# must never silently weaken on hosts where the interpreter redirects bytecode
+# caches out-of-tree (Apple's sys.pycache_prefix).
+if [ ! -f "$VERIFY_DIR/python/__pycache__/junk-probe.synthetic" ]; then
+    echo "    python/__pycache__/junk-probe.synthetic : MISSING — seeded junk absent (probe weakened)!"
+    exit 1
+elif JUNK_TRACKED="$(cd "$VERIFY_DIR" && git ls-files --error-unmatch python/__pycache__/junk-probe.synthetic 2>&1)"; then
+    echo "    python/__pycache__/junk-probe.synthetic : TRACKED — junk probe failure!"
+    echo "    ── git ls-files output ──"
+    printf '%s\n' "$JUNK_TRACKED" | tail -20
+    exit 1
+elif ! cmp -s "$JUNK_REF" "$VERIFY_DIR/python/__pycache__/junk-probe.synthetic"; then
+    echo "    python/__pycache__/junk-probe.synthetic : BYTE-MISMATCH — differs from the fixtures-src reference!"
+    exit 1
+else
+    echo "    python/__pycache__/ : present, untracked, byte-identical (seeded synthetic junk)"
+fi
+
+# The fixture SOURCE synthetic reference is the byte-exact provisioning
+# reference (same pattern as operator-notes.local) — it must be retained.
+if [ ! -s "$JUNK_REF" ]; then
+    echo "    python/__pycache__/junk-probe.synthetic : fixture source missing/empty — provisioning reference lost!"
+    exit 1
+else
+    echo "    python/__pycache__/junk-probe.synthetic : fixture source retained (byte-exact provisioning ref)"
+fi
+
 # Junk probes NOT gitignored — top-level .gitignore must NOT suppress
 for pattern in __pycache__ .pytest_cache .flaky_counter node_modules package-lock.json target; do
     echo -n "    $pattern NOT in top .gitignore..."
@@ -1180,7 +1218,7 @@ echo "    - All seed refs present (python + ts + go + rust + java + A5)"
 echo "    - POLY-BUG-A5 cross-language seed (dual overlay, partial-fix property)"
 echo "    - broken-tests branch (all POLY-BRK-* seeds)"
 echo "    - seed/storm composite ref (all seeds layered)"
-echo "    - Junk probes verified (operator-notes.local excluded from golden, source ref retained)"
+echo "    - Junk probes verified (operator-notes.local + seeded python/__pycache__ junk, source refs retained)"
 echo "    - Seed content spot-checks (go/rust/java/A5 verified)"
 echo "    - Hash stability check"
 echo "================================================================="

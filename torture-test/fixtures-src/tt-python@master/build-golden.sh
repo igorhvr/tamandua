@@ -268,6 +268,17 @@ echo "Verifying junk-probe invariants..."
 
 # Re-checkout master for a clean state
 git -C "$SCRATCH_DIR" checkout -q master
+
+# MACP2: the __pycache__ junk is a DETERMINISTIC PROVISIONING ARTIFACT, not an
+# interpreter side effect — Apple's Python bakes in sys.pycache_prefix and
+# ALWAYS redirects bytecode caches out-of-tree, so in-tree __pycache__ can
+# never be relied on. Seed the byte-exact fixtures-src reference into the
+# scratch clone BEFORE the test run; the marker file is what the oracle
+# checks (present + untracked + byte-identical).
+JUNK_REF="$FIXTURE_SRC/__pycache__/junk-probe.synthetic"
+mkdir -p "$SCRATCH_DIR/__pycache__"
+cp "$JUNK_REF" "$SCRATCH_DIR/__pycache__/junk-probe.synthetic"
+
 # US-007: the junk-probe test run must fail closed with the pytest tail
 # surfaced, not abort silently under set -e.
 if ! JUNK_OUT="$(cd "$SCRATCH_DIR" && "$SCRATCH_DIR/.venv/bin/python" -m pytest -q 2>&1)"; then
@@ -279,16 +290,19 @@ fi
 cd "$SCRATCH_DIR"
 JUNK_OK=true
 
-# __pycache__ must exist and be untracked (not gitignored)
-if [ ! -d "__pycache__" ]; then
-    echo "  ✗ __pycache__/ not found after test run" >&2
+# Seeded synthetic __pycache__ junk: present, untracked, byte-identical to the
+# fixtures-src reference.
+if [ ! -f "__pycache__/junk-probe.synthetic" ]; then
+    echo "  ✗ seeded __pycache__/junk-probe.synthetic missing after test run" >&2
     JUNK_OK=false
-elif ! git ls-files --error-unmatch __pycache__/c &>/dev/null; then
-    # It must be untracked — ls-files returns non-zero for untracked files
-    echo "  ✓ __pycache__/ present and untracked"
+elif git ls-files --error-unmatch __pycache__/junk-probe.synthetic &>/dev/null; then
+    echo "  ✗ __pycache__/junk-probe.synthetic is tracked — should be untracked" >&2
+    JUNK_OK=false
+elif ! cmp -s "$JUNK_REF" "__pycache__/junk-probe.synthetic"; then
+    echo "  ✗ seeded __pycache__/junk-probe.synthetic differs from the fixtures-src reference" >&2
+    JUNK_OK=false
 else
-    echo "  ✗ __pycache__/ is tracked — should be untracked" >&2
-    JUNK_OK=false
+    echo "  ✓ __pycache__/ present, untracked, byte-identical (seeded synthetic junk)"
 fi
 
 # .pytest_cache must exist and be untracked

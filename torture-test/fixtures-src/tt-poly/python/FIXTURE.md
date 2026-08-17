@@ -196,7 +196,7 @@ python/seeds/
 
 | Artifact | Class | Notes |
 |---|---|---|
-| `__pycache__/` | Regenerated | Python bytecode cache, NOT gitignored |
+| `__pycache__/` | Seeded/deterministic | Synthetic marker planted at provisioning (byte-identical to fixtures-src reference), NOT gitignored |
 | `.pytest_cache/` | Regenerated | pytest cache, NOT gitignored |
 | `.flaky_counter` | Regenerated | Counter file for flaky alternator (POLY-FLAKY-P1), NOT gitignored |
 | `operator-notes.local` | Inert | Fixed byte-content, never touched |
@@ -217,7 +217,7 @@ name. The canary file appearing means something executed the directory name.
 5. **Cross-language partial-fix property (POLY-BUG-A5):** fixing only python/ or only ts/ leaves a test failure in the other subtree
 6. **Dormant vulns (POLY-VULN-P1, POLY-VULN-P2):** test suite passes with the `integrations.py` module present
 7. **Broken tests:** `broken-tests` branch has exactly 2 failing tests; `main` has 0
-8. **Junk probe — regenerated:** `__pycache__/` and `.pytest_cache/` appear as untracked after running tests
+8. **Junk probe — seeded/deterministic:** the seeded `__pycache__/` marker (planted at provisioning) and regenerated `.pytest_cache/` appear as untracked after running tests; the marker stays byte-identical to the fixtures-src reference
 9. **Junk probe — inert:** `operator-notes.local` is byte-identical to the fixture source (provisioning plants it into the work clone untracked)
 10. **Deterministic builds:** two consecutive runs of `build-golden.sh` produce identical commit hashes
 

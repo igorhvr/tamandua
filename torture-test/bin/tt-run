@@ -75,7 +75,7 @@ usage() {
   cat <<EOF
 run-torture-test — tamandua torture-test suite (spec: torture-test/tamandua-torture-test-spec/)
 
-Usage: run-torture-test [--smoke | --tier0 [--include-real] | --tier1 [--include-real] | --tier2 [--include-real] | --provision [tier1|tier2] | --report | --help]
+Usage: run-torture-test [--smoke | --tier0 [--include-real] | --tier1 [--include-real] | --tier2 [--include-real] | --provision [tier1|tier2] [--rebuild-invalid] | --report | --help]
 
 Tiers (explicit flag = run immediately, no countdown):
 EOF
@@ -102,6 +102,11 @@ EOF
              tt-poly-lite, tt-python@master); tier2 provisions all eight
              fixtures. Fail-closed: a non-zero verify or a failed fixture
              bootstrap exits non-zero with the per-asset reason.
+             --provision --rebuild-invalid: a PRESENT but invalid golden
+             (missing/malformed hash ledger, ref mismatch, non-bare) is
+             rebuilt from scratch with a loud per-asset note instead of
+             failing closed; a VALID golden is never rebuilt. Default (no
+             flag) stays fail-closed and never silently rebuilds.
              --provision is exclusive — it cannot be combined with tier
              flags, --include-real, --case, or --report.
 
@@ -146,14 +151,19 @@ provision_fixtures() {
   esac
 }
 
-# run_provision <tier> — verify the environment gate for the tier, then
-# golden-bootstrap every fixture in the tier's set (absent golden -> build +
-# verify; present + valid -> idempotent no-op, never rebuilt). Fail-closed:
-# a non-zero verify surfaces its failure and exits non-zero; any fixture that
-# fails to bootstrap prints its per-asset fail-closed reason and the overall
-# run exits non-zero.
+# run_provision <tier> [rebuild_invalid] — verify the environment gate for the
+# tier, then golden-bootstrap every fixture in the tier's set (absent golden ->
+# build + verify; present + valid -> idempotent no-op, never rebuilt). With
+# rebuild_invalid=true each tt-golden-bootstrap call also gets --rebuild-invalid,
+# so a PRESENT but invalid golden (missing/malformed hash ledger, ref mismatch,
+# non-bare) is rebuilt from scratch with a loud per-asset note instead of
+# failing closed (default stays fail-closed, never a silent rebuild).
+# Fail-closed: a non-zero verify surfaces its failure and exits non-zero; any
+# fixture that fails to bootstrap prints its per-asset fail-closed reason and
+# the overall run exits non-zero.
 run_provision() {
   local tier="$1"
+  local rebuild_invalid="${2:-false}"
   echo "== Provisioning tier '$tier' =="
   echo "-- [1/2] environment gate: tt-verify-environment --tier $tier"
   if ! "$TT_BIN_DIR/tt-verify-environment" --tier "$tier"; then
@@ -167,11 +177,22 @@ run_provision() {
   }
   echo "-- [2/2] golden fixture bootstrap (per-asset, fail-closed)"
   local fixture failures=0
+  local bootstrap_args=()
+  if [ "$rebuild_invalid" = "true" ]; then
+    bootstrap_args=(--rebuild-invalid)
+  fi
   for fixture in $fixtures; do
     printf '  [provision] %-16s ' "$fixture"
-    if OUT="$("$TT_BIN_DIR/tt-golden-bootstrap.mjs" --fixture "$fixture" 2>&1)"; then
+    # bash-3.2-safe guarded array expansion (empty array must not abort under
+    # set -u): the guarded form is the tt-run convention (see case_args use
+    # in run_tier).
+    if OUT="$("$TT_BIN_DIR/tt-golden-bootstrap.mjs" --fixture "$fixture" ${bootstrap_args[@]+"${bootstrap_args[@]}"} 2>&1)"; then
       if printf '%s' "$OUT" | grep -q '"built":true'; then
-        echo "OK (built)"
+        if printf '%s' "$OUT" | grep -q '"rebuiltInvalid":true'; then
+          echo "OK (rebuilt-invalid)"
+        else
+          echo "OK (built)"
+        fi
       else
         echo "OK (present, no rebuild)"
       fi
@@ -286,6 +307,7 @@ case_id=""
 report_requested="false"
 provision_requested="false"
 provision_tier=""
+provision_rebuild_invalid="false"
 while [ "$#" -gt 0 ]; do
   # US-009: --provision is exclusive (parallel to --report) — any tier or
   # selection flag after it is a usage error, never a silent half-parse.
@@ -339,6 +361,11 @@ while [ "$#" -gt 0 ]; do
         esac
       fi
       ;;
+    --rebuild-invalid)
+      # US-005: only meaningful with --provision; validated after the loop so
+      # either order (--provision --rebuild-invalid or the reverse) works.
+      provision_rebuild_invalid="true"
+      ;;
     --report)
       report_requested="true"
       ;;
@@ -361,8 +388,14 @@ if [ "$provision_requested" = "true" ]; then
     usage >&2
     exit 4
   fi
-  run_provision "${provision_tier:-tier1}"
+  run_provision "${provision_tier:-tier1}" "$provision_rebuild_invalid"
   exit 0
+fi
+
+if [ "$provision_rebuild_invalid" = "true" ]; then
+  echo "--rebuild-invalid requires --provision" >&2
+  usage >&2
+  exit 4
 fi
 
 if [ "$report_requested" = "true" ]; then

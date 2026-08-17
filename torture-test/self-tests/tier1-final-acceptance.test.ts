@@ -179,6 +179,10 @@ const allowed = [
   // that created it.
   "torture-test/tamandua-torture-test-spec/",
   "torture-test/bin/tt-fixture-provision.mjs",
+  // MACP2 (US-005): the --provision --rebuild-invalid self-heal mode touches
+  // the golden bootstrap module itself (ensureGoldenBare + its CLI) — part of
+  // the provisioning authoring surface alongside tt-fixture-provision.mjs.
+  "torture-test/bin/tt-golden-bootstrap.mjs",
   "torture-test/bin/tt-controller",
   "torture-test/bin/tt-controller.test.sh",
   "torture-test/bin/tt-chaos",
@@ -221,6 +225,11 @@ const allowed = [
   // authoring files.
   "torture-test/fixtures-src/",
   "torture-test/bin/verify-builder-determinism.test.sh",
+  // MACP2 (US-001): the impl-task task docs (portability evidence + resolution
+  // decisions recorded in torture-test/impl-tasks/*.md, e.g.
+  // MACP2-pycache-junk-portability.md) are part of the MACP2 authoring surface
+  // — exactly like fixtures-src/ was authorized for MACP1.
+  "torture-test/impl-tasks/",
   // MACP1 (US-010): the bash-3.2 compatibility sweep also rewrites the
   // scripted-runtimes dev tooling — fork-parity-check and
   // install-scenario-workflows (associative-array removal so they run under

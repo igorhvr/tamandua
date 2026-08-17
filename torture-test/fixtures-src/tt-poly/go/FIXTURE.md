@@ -208,7 +208,7 @@ See `python/FIXTURE.md` and `ts/FIXTURE.md` for full details.
 
 ## Junk Probes
 
-Per spec 02's **two-class junk probe requirement**, this subtree carries
+Per spec 02's **junk-probe requirement**, this subtree carries
 both classes. Neither is gitignored.
 
 | Artifact | Class | Description |

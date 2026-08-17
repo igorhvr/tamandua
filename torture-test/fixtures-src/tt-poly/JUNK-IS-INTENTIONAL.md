@@ -6,7 +6,7 @@ The untracked artifacts below are **load-bearing junk probes** for the
 tamandua torture-test suite. Removing them breaks the fixture and voids
 the campaign.
 
-- `python/__pycache__/` directories — regenerated junk probe
+- `python/__pycache__/` directories — seeded/deterministic junk probe (synthetic marker planted at provisioning; must stay untracked + byte-identical)
 - `python/.pytest_cache/` directory — regenerated junk probe
 - `python/.flaky_counter` — regenerated junk probe
 - `ts/package-lock.json` — regenerated junk probe

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { describe, it } from "node:test";
@@ -56,6 +57,63 @@ describe("tt-poly Makefile and subtree junk probe markers (US-008)", () => {
       assert.ok(content.length > 0, `${sub}/README-JUNK.md should not be empty`);
     });
   }
+
+  // --- Python synthetic junk reference (MACP2): deterministic seeded junk ---
+
+  it("python/ __pycache__/junk-probe.synthetic reference exists, tracked, not gitignored", () => {
+    const ref = path.join(ttPolyDir, "python", "__pycache__", "junk-probe.synthetic");
+    assert.ok(fs.existsSync(ref), "fixtures-src python/__pycache__/junk-probe.synthetic should exist");
+    const stat = fs.statSync(ref);
+    assert.ok(stat.isFile(), "reference should be a file");
+    assert.ok(stat.size > 0, "reference should not be empty");
+
+    // Tracked in git: git ls-files --error-unmatch succeeds.
+    const ls = spawnSync(
+      "git",
+      ["ls-files", "--error-unmatch", "torture-test/fixtures-src/tt-poly/python/__pycache__/junk-probe.synthetic"],
+      { cwd: repoRoot, encoding: "utf8" },
+    );
+    assert.equal(ls.status, 0, "reference must be tracked in git (git ls-files --error-unmatch)");
+
+    // NOT gitignored: git check-ignore must fail.
+    const ci = spawnSync(
+      "git",
+      ["check-ignore", "-q", "torture-test/fixtures-src/tt-poly/python/__pycache__/junk-probe.synthetic"],
+      { cwd: repoRoot, encoding: "utf8" },
+    );
+    assert.notEqual(ci.status, 0, "reference must NOT be gitignored");
+  });
+
+  it("python/ __pycache__/junk-probe.synthetic filename can never collide with an importable module", () => {
+    const name = "junk-probe.synthetic";
+    assert.ok(!name.endsWith(".pyc"), "marker filename must not look like a pyc module artifact");
+    assert.ok(
+      !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name),
+      "marker filename must not be a valid module identifier",
+    );
+    assert.ok(name.includes("-"), "marker filename must carry a non-identifier char (hyphen)");
+  });
+
+  it("python/ __pycache__/junk-probe.synthetic reference is the byte-exact provisioning payload", () => {
+    // Byte-identical to the canonical tt-python MACP2 marker — the seeded
+    // junk oracle compares the clone's marker against this fixtures-src
+    // reference with cmp, so the reference bytes must be stable.
+    const polyRef = path.join(ttPolyDir, "python", "__pycache__", "junk-probe.synthetic");
+    const canonicalRef = path.join(
+      repoRoot,
+      "torture-test",
+      "fixtures-src",
+      "tt-python",
+      "__pycache__",
+      "junk-probe.synthetic",
+    );
+    assert.ok(fs.existsSync(canonicalRef), "canonical tt-python reference should exist");
+    assert.equal(
+      fs.readFileSync(polyRef, "utf-8"),
+      fs.readFileSync(canonicalRef, "utf-8"),
+      "tt-poly reference must be byte-identical to the canonical MACP2 marker",
+    );
+  });
 
   // --- Python junk probes: __pycache__/, .pytest_cache/, .flaky_counter NOT gitignored ---
 

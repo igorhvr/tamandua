@@ -227,6 +227,87 @@ else
     echo "  ✓ broken-tests branch: RED (expected)"
 fi
 
+# ── Verify junk-probe invariants ───────────────────────────────────
+echo ""
+echo "Verifying junk-probe invariants..."
+
+# Re-checkout main for a clean state
+git -C "$SCRATCH_DIR" checkout -q main
+
+# MACP2: the __pycache__ junk is a DETERMINISTIC PROVISIONING ARTIFACT, not an
+# interpreter side effect — Apple's Python bakes in sys.pycache_prefix and
+# ALWAYS redirects bytecode caches out-of-tree, so in-tree __pycache__ can
+# never be relied on. Seed the byte-exact fixtures-src reference into the
+# scratch clone BEFORE the test run; the marker file is what the oracle
+# checks (present + untracked + byte-identical).
+JUNK_REF="$FIXTURE_SRC/__pycache__/junk-probe.synthetic"
+mkdir -p "$SCRATCH_DIR/__pycache__"
+cp "$JUNK_REF" "$SCRATCH_DIR/__pycache__/junk-probe.synthetic"
+
+# US-007: the junk-probe test run must fail closed with the pytest tail
+# surfaced, not abort silently under set -e.
+if ! JUNK_OUT="$(cd "$SCRATCH_DIR" && "$SCRATCH_DIR/.venv/bin/python" -m pytest -q 2>&1)"; then
+    echo "  ✗ junk-probe test run failed — last lines of pytest output:" >&2
+    printf '%s\n' "$JUNK_OUT" | tail -20 >&2
+    exit 1
+fi
+
+cd "$SCRATCH_DIR"
+JUNK_OK=true
+
+# Seeded synthetic __pycache__ junk: present, untracked, byte-identical to the
+# fixtures-src reference.
+if [ ! -f "__pycache__/junk-probe.synthetic" ]; then
+    echo "  ✗ seeded __pycache__/junk-probe.synthetic missing after test run" >&2
+    JUNK_OK=false
+elif git ls-files --error-unmatch __pycache__/junk-probe.synthetic &>/dev/null; then
+    echo "  ✗ __pycache__/junk-probe.synthetic is tracked — should be untracked" >&2
+    JUNK_OK=false
+elif ! cmp -s "$JUNK_REF" "__pycache__/junk-probe.synthetic"; then
+    echo "  ✗ seeded __pycache__/junk-probe.synthetic differs from the fixtures-src reference" >&2
+    JUNK_OK=false
+else
+    echo "  ✓ __pycache__/ present, untracked, byte-identical (seeded synthetic junk)"
+fi
+
+# .pytest_cache must exist and be untracked (regenerated junk, pytest writes
+# it into the rootdir itself — Darwin-safe).
+if [ ! -d ".pytest_cache" ]; then
+    echo "  ✗ .pytest_cache/ not found after test run" >&2
+    JUNK_OK=false
+elif ! git ls-files --error-unmatch .pytest_cache/c &>/dev/null; then
+    echo "  ✓ .pytest_cache/ present and untracked"
+else
+    echo "  ✗ .pytest_cache/ is tracked — should be untracked" >&2
+    JUNK_OK=false
+fi
+
+# operator-notes.local must NOT be in the golden tree — it is inert junk
+# planted at provisioning (spec 02: one per repo, planted at instantiation,
+# must stay untracked). The clone derives from the golden bare, so it too must
+# lack it.
+ORIG_NOTES="$FIXTURE_SRC/operator-notes.local"
+if [ -e "$SCRATCH_DIR/operator-notes.local" ]; then
+    echo "  ✗ operator-notes.local is present in golden clone — should be excluded junk" >&2
+    JUNK_OK=false
+else
+    echo "  ✓ operator-notes.local absent from golden (excluded junk)"
+fi
+
+# The fixture SOURCE operator-notes.local is the byte-exact provisioning
+# reference (spec 02: planted at instantiation, byte-identical). The canonical
+# bytes must be retained so provisioning can plant them into work clones.
+if [ ! -s "$ORIG_NOTES" ]; then
+    echo "  ✗ operator-notes.local fixture source missing/empty — provisioning reference lost" >&2
+    JUNK_OK=false
+else
+    echo "  ✓ operator-notes.local fixture source retained (byte-exact provisioning ref)"
+fi
+
+if ! $JUNK_OK; then
+    exit 1
+fi
+
 # ── Hash report ────────────────────────────────────────────────────
 echo ""
 echo "══╡ Hashes ╞══════════════════════════════════════════════════════"

@@ -11,7 +11,7 @@ build/
 
 # NOTE: The following are deliberately NOT gitignored — they serve as
 # junk probes for the tamandua torture test suite:
-#   __pycache__/       — regenerated junk probe (python)
+#   __pycache__/       — seeded/deterministic junk probe (python)
 #   .pytest_cache/     — regenerated junk probe (python)
 #   package-lock.json  — regenerated junk probe (ts)
 #   node_modules/      — regenerated junk probe (ts)

@@ -6,7 +6,7 @@ The untracked artifacts below are **load-bearing junk probes** for the
 tamandua torture-test suite. Removing them breaks the fixture and voids
 the campaign.
 
-- `__pycache__/` directories — regenerated junk probe
+- `__pycache__/` directories — seeded/deterministic junk probe (synthetic marker planted at provisioning; must stay untracked + byte-identical)
 - `.pytest_cache/` directory — regenerated junk probe
 - `operator-notes.local` file — inert operator junk probe
 

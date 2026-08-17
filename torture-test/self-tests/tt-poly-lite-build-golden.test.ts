@@ -413,7 +413,11 @@ describe("tt-poly-lite end-to-end validation", { skip: process.env.TT_POLY_LITE_
 
         const fixPath = path.join(fixtureSrc, "python", "seeds", id, "fix.patch");
         if (fs.existsSync(fixPath)) {
-          execSync(`patch -p1 -s --batch < "${fixPath}"`, { cwd: path.join(scratch, "python"), stdio: "pipe" });
+          // Apply from the clone ROOT (patch -p1 strips the leading 'b/' and
+          // the patch paths are python/...-relative) — exactly like the
+          // builder's [6d] does. Applying from python/ would resolve
+          // b/python/src/... to python/python/src/... and silently skip.
+          execSync(`patch -p1 -s --batch < "${fixPath}"`, { cwd: scratch, stdio: "pipe" });
           const fixResult = execSync(".venv/bin/python -m pytest -q --tb=short", {
             cwd: path.join(scratch, "python"),
             stdio: "pipe",
@@ -543,13 +547,24 @@ describe("tt-poly-lite end-to-end validation", { skip: process.env.TT_POLY_LITE_
   });
 
   // AC 9: Junk probes verified
-  it("AC-9: junk probes verified — untracked files present, operator-notes.local byte-identical", function () {
+  it("AC-9: junk probes verified — seeded synthetic junk present/untracked/byte-identical, operator-notes.local byte-identical", function () {
     this.timeout = 600_000;
     ensureGolden();
     const scratch = scratchClone();
     try {
       execSync("bash python/bootstrap", { cwd: scratch, stdio: "pipe" });
       execSync("npm install", execOpts({ cwd: path.join(scratch, "ts"), stdio: "pipe" }));
+
+      // MACP2: the python __pycache__ junk is a DETERMINISTIC PROVISIONING
+      // ARTIFACT — seed the byte-exact fixtures-src reference into the clone
+      // BEFORE the test run (exactly like the builder's [6c] section) so the
+      // probe never depends on the interpreter having written bytecode caches
+      // in-tree (Apple's Python always redirects them out-of-tree).
+      const junkRef = path.join(fixtureSrc, "python", "__pycache__", "junk-probe.synthetic");
+      assert.ok(fs.existsSync(junkRef), "fixture source junk reference should exist");
+      const seededMarker = path.join(scratch, "python", "__pycache__", "junk-probe.synthetic");
+      fs.mkdirSync(path.dirname(seededMarker), { recursive: true });
+      fs.copyFileSync(junkRef, seededMarker);
 
       try {
         execSync(".venv/bin/python -m pytest -q", { cwd: path.join(scratch, "python"), stdio: "pipe" });
@@ -559,7 +574,30 @@ describe("tt-poly-lite end-to-end validation", { skip: process.env.TT_POLY_LITE_
         execSync("npm test", execOpts({ cwd: path.join(scratch, "ts"), stdio: "pipe", timeout: 60_000 }));
       } catch { /* may fail — we just need generated junk */ }
 
-      for (const junk of ["python/__pycache__", "python/.pytest_cache"]) {
+      // Seeded synthetic junk: present + untracked + byte-identical. Absence
+      // is NO LONGER tolerated — the probe must never silently weaken on
+      // hosts where the interpreter redirects bytecode caches out-of-tree.
+      assert.ok(
+        fs.existsSync(seededMarker),
+        "python/__pycache__/junk-probe.synthetic must be present after the test run",
+      );
+      const junkStatus = execSync(
+        "git status --porcelain python/__pycache__/junk-probe.synthetic",
+        { cwd: scratch, stdio: "pipe", encoding: "utf-8" },
+      );
+      assert.ok(
+        junkStatus === "" || junkStatus.startsWith("?"),
+        `python/__pycache__/junk-probe.synthetic: should be untracked, got: "${junkStatus.trim()}"`,
+      );
+      assert.equal(
+        fs.readFileSync(seededMarker, "utf-8"),
+        fs.readFileSync(junkRef, "utf-8"),
+        "seeded junk must be byte-identical to the fixtures-src reference",
+      );
+
+      // Regenerated junk: .pytest_cache (absence tolerated — interpreter
+      // side effect, Darwin-safe).
+      for (const junk of ["python/.pytest_cache"]) {
         if (fs.existsSync(path.join(scratch, junk))) {
           const status = execSync(`git status --porcelain "${junk}"`, { cwd: scratch, stdio: "pipe", encoding: "utf-8" });
           assert.ok(status === "" || status.startsWith("?"),

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { describe, it } from "node:test";
@@ -230,5 +231,31 @@ describe("tt-poly top-level structure (US-001)", () => {
       content.includes("run-all-tests"),
       "operator-notes.local should document run-all-tests",
     );
+  });
+
+  it("python/__pycache__/junk-probe.synthetic seeded-junk reference exists, tracked, not gitignored (MACP2)", () => {
+    // MACP2: the python __pycache__ junk is a DETERMINISTIC PROVISIONING
+    // ARTIFACT — the byte-exact reference lives TRACKED in fixtures-src (never
+    // committed into the golden; excluded by the builder's tar rules) and is
+    // seeded into work clones by the builder/provisioning.
+    const ref = path.join(ttPolyDir, "python", "__pycache__", "junk-probe.synthetic");
+    assert.ok(fs.existsSync(ref), "python/__pycache__/junk-probe.synthetic should exist");
+    const stat = fs.statSync(ref);
+    assert.ok(stat.isFile(), "reference should be a file");
+    assert.ok(stat.size > 0, "reference should not be empty");
+
+    const ls = spawnSync(
+      "git",
+      ["ls-files", "--error-unmatch", "torture-test/fixtures-src/tt-poly/python/__pycache__/junk-probe.synthetic"],
+      { cwd: repoRoot, encoding: "utf8" },
+    );
+    assert.equal(ls.status, 0, "reference must be tracked in git (git ls-files --error-unmatch)");
+
+    const ci = spawnSync(
+      "git",
+      ["check-ignore", "-q", "torture-test/fixtures-src/tt-poly/python/__pycache__/junk-probe.synthetic"],
+      { cwd: repoRoot, encoding: "utf8" },
+    );
+    assert.notEqual(ci.status, 0, "reference must NOT be gitignored");
   });
 });

@@ -143,14 +143,39 @@ echo ""
 echo "── Phase 3: Junk-probe invariants ──────────────────────────────"
 echo ""
 
-# Run tests to generate junk
+# MACP2: the __pycache__ junk is a DETERMINISTIC PROVISIONING ARTIFACT,
+# not an interpreter side effect — Apple's Python bakes in
+# sys.pycache_prefix and ALWAYS redirects bytecode caches out-of-tree, so
+# in-tree __pycache__ can never be relied on. Seed the byte-exact
+# fixtures-src reference into the scratch clone BEFORE the test run; the
+# marker file is what the oracle checks (present + untracked +
+# byte-identical).
+JUNK_REF="$SCRIPT_DIR/__pycache__/junk-probe.synthetic"
+mkdir -p "$SCRATCH/__pycache__"
+cp "$JUNK_REF" "$SCRATCH/__pycache__/junk-probe.synthetic"
+
+# Run tests to generate the regenerated junk (.pytest_cache)
 "$SCRATCH/.venv/bin/python" -m pytest -q >/dev/null 2>&1 || true
 
-# Check __pycache__ exists and is not gitignored
-if [ -d "$SCRATCH/__pycache__" ]; then
-    pass "__pycache__ exists after test run"
+# Check seeded __pycache__ marker exists, is untracked, and is byte-identical
+# to the fixtures-src reference.
+if [ ! -f "$SCRATCH/__pycache__/junk-probe.synthetic" ]; then
+    fail "seeded __pycache__/junk-probe.synthetic present after test run" "marker missing"
 else
-    fail "__pycache__ exists after test run" "directory missing"
+    pass "seeded __pycache__/junk-probe.synthetic present after test run"
+fi
+
+if git ls-files --error-unmatch __pycache__/junk-probe.synthetic >/dev/null 2>&1; then
+    fail "seeded __pycache__/junk-probe.synthetic UNTRACKED in work clone" "it is tracked (in the index)"
+else
+    pass "seeded __pycache__/junk-probe.synthetic UNTRACKED in work clone"
+fi
+
+if cmp -s "$JUNK_REF" "$SCRATCH/__pycache__/junk-probe.synthetic"; then
+    pass "seeded __pycache__/junk-probe.synthetic byte-identical to fixture source (provisioning ref)"
+else
+    fail "seeded __pycache__/junk-probe.synthetic byte-identical to fixture source (provisioning ref)" \
+        "files differ"
 fi
 
 if ! git check-ignore -q "$SCRATCH/__pycache__/" 2>/dev/null; then

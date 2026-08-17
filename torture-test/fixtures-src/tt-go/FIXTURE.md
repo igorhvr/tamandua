@@ -249,7 +249,7 @@ seeds/
 
 ## Junk Probes
 
-Per spec 02's **two-class junk probe requirement**, this fixture carries
+Per spec 02's **junk-probe requirement**, this fixture carries
 both classes. Neither is gitignored — oracles verify they appear as
 untracked in `git status` so the dirty-tree gate tolerates them while
 rejecting tracked drift.
@@ -259,7 +259,8 @@ rejecting tracked drift.
 | `testdata/exec-bit-probe.sh` | Committed inert probe | A committed shell script with the executable bit set (`chmod +x`). Content is a harmless echo statement. Probes tree-hashing exec-bit handling across platforms — the exec bit must survive git clone, git checkout, and `rsync -a`. Never modified after instantiation. |
 | `operator-notes.local` | Untracked inert probe | Planted at fixture instantiation with fixed byte content, **never touched** by any tool, test run, or agent. Must remain byte-identical across the entire campaign. The 1-minute sampler hashes this file — any drift triggers an oracle finding. |
 
-Unlike Python (which regenerates `__pycache__/`) and Node.js (which
+Unlike Python (whose `__pycache__/` junk is seeded/deterministic —
+planted at provisioning, byte-identical) and Node.js (which
 regenerates `package-lock.json` + `node_modules/`), Go has no
 regenerated junk — `go test` produces no cache files and no lockfiles.
 Therefore the regenerated junk class is fulfilled by the exec-bit probe
