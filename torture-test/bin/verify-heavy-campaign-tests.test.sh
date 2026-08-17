@@ -37,8 +37,16 @@ NODE_BIN="${TT_NODE_BIN:-$(command -v node)}"
 # test drives an unbounded campaign; give it a generous IRON ceiling so we never
 # kill it mid-progress on a contended machine. A ceiling hit (timeout, exit 124)
 # is a FAIL for THAT test only and prefixes cleanup guidance; every other test is
-# unaffected. Default 4h; override with TORTURE_HEAVY_PER_TEST_TIMEOUT_SEC.
-PER_TEST_TIMEOUT_SEC="${TORTURE_HEAVY_PER_TEST_TIMEOUT_SEC:-14400}"
+# unaffected. Default 6h; override with TORTURE_HEAVY_PER_TEST_TIMEOUT_SEC.
+#
+# The default MUST NOT be below tier0-repeatability's own declared budget: it
+# deliberately executes TWO full tier0 gates (each capped at 3h by the manifest;
+# observed ~2.4h on this host), and its `it` block declares a 6h timeout. A 4h
+# wrapper ceiling killed it mid-second-gate in every recorded run (E3.C.1
+# US-008: the acceptance battery surfaced the mismatch) and the leaked daemon
+# from the interrupted campaign then broke the next heavy test (include-real
+# FINDINGS). 6h matches the test's own timeout and covers both gates.
+PER_TEST_TIMEOUT_SEC="${TORTURE_HEAVY_PER_TEST_TIMEOUT_SEC:-21600}"
 
 # MUST stay in lock-step with self-tests/run.sh HEAVY_CAMPAIGN_TESTS and
 # self-tests/e2e-golden-integrity.test.ts.
@@ -51,6 +59,7 @@ HEAVY_TESTS=(
     'tier1-real-case-proof.test.ts'
     'tier1-repeatability.test.ts'
     'tier1-scripted-probe-battery.test.ts'
+    'tier1-kill-sentinel-survival.test.ts'
     'tier1-zero-real-launch-infra.test.ts'
     'tier2-repeatability.test.ts'
 )

@@ -23,6 +23,11 @@ fail() { echo "  FAIL: $1"; FAILURES=$((FAILURES + 1)); }
 
 cleanup() {
   rm -f "$TMPFILE" 2>/dev/null || true
+  # Hard-kill any tracked detached (setsid) children so a failing test never
+  # orphans a process that outlives TEST_VAR removal.
+  for p in $SPAWNED_PIDS; do
+    kill -9 "$p" 2>/dev/null || true
+  done
   if [ -n "${DECOY_PID:-}" ] && kill -0 "$DECOY_PID" 2>/dev/null; then
     kill "$DECOY_PID" 2>/dev/null || true
     wait "$DECOY_PID" 2>/dev/null || true
@@ -62,7 +67,9 @@ setup_fake_tt_env() {
         run_id TEXT,
         step_id TEXT PRIMARY KEY,
         agent_id TEXT,
-        status TEXT NOT NULL DEFAULT 'waiting'
+        status TEXT NOT NULL DEFAULT 'waiting',
+        claim_pid INTEGER,
+        claim_pgid INTEGER
       );
       CREATE TABLE IF NOT EXISTS events (
         run_id TEXT,
@@ -149,6 +156,64 @@ last_mock_call() {
 # Count mock calls
 mock_call_count() {
   wc -l < "${MOCK_TAMANDUA_DIR}/calls.log" 2>/dev/null || echo 0
+}
+
+# ── US-002 helpers: isolated (setsid) target spawns + explicit identity ──
+# Every kill target a test hands to tt-chaos must be (a) spawned in its OWN
+# process group (setsid) so a group kill can never reach the test's ancestry,
+# and (b) passed to tt-chaos as an EXPLICIT recorded target
+# (--target-pid/--target-start-time/--target-pgid) — tt-chaos refuses to
+# resolve kill targets by /proc cwd/cmdline scan (E3.C.1).
+
+# Track pids to hard-kill on exit (detached setsid children survive TEST_VAR
+# removal, so hygiene requires an explicit kill list).
+SPAWNED_PIDS=""
+note_pid() { SPAWNED_PIDS="$SPAWNED_PIDS $1"; }
+
+# spawn_isolated <pidfile> <argv0> <cmd...> — spawns <cmd> in its own session
+# (disjoint pgid), sets argv[0] to <argv0> (so the cwd/cmdline provenance
+# belt-and-suspenders check passes), writes the child pid to <pidfile>.
+# Callers must note_pid "$(cat <pidfile>)" after the pid appears so cleanup
+# can hard-kill the detached child on exit.
+spawn_isolated() {
+  local pidfile="$1"; shift
+  local argv0="$1"; shift
+  (
+    cd "$TEST_VAR"
+    setsid bash -c 'exec -a "$1" "$2" "${@:3}"' _ "$argv0" "$@" &
+    echo $! > "$pidfile"
+    wait $! 2>/dev/null || true
+  ) &
+}
+
+# target_start_time <pid> — /proc/<pid>/stat field 22 (starttime) via the
+# last-')' slice (comm may contain spaces/parens). Same semantics as
+# bin/tt-process-identity.mjs.
+target_start_time() {
+  awk -F')' '{n=split($2, a, " "); print a[20]}' "/proc/$1/stat" 2>/dev/null || echo ""
+}
+
+# insert_claim_row <run_id> <step_id> <pid> [pgid] — record a claim row
+# (claim_pid/claim_pgid) in the fixture steps table so tt-chaos can resolve
+# the harness from the product's own explicit record.
+insert_claim_row() {
+  local rid="$1"; local sid="$2"; local pid="$3"; local pgid="${4:-$3}"
+  node -e "
+    const { DatabaseSync } = require('node:sqlite');
+    const db = new DatabaseSync('${TEST_VAR}/tamandua.db', { open: true });
+    db.exec(\`CREATE TABLE IF NOT EXISTS steps (
+      run_id TEXT,
+      step_id TEXT PRIMARY KEY,
+      agent_id TEXT,
+      status TEXT NOT NULL DEFAULT 'waiting',
+      claim_pid INTEGER,
+      claim_pgid INTEGER
+    );\`);
+    db.prepare('INSERT OR REPLACE INTO runs (run_id, status, workflow_id) VALUES (?, ?, ?)').run('${rid}', 'running', 'test-wf');
+    db.prepare('INSERT OR REPLACE INTO steps (run_id, step_id, agent_id, status, claim_pid, claim_pgid) VALUES (?, ?, ?, ?, ?, ?)')
+      .run('${rid}', '${sid}', 'developer', 'running', ${pid}, ${pgid});
+    db.close();
+  "
 }
 
 echo "=== tt-chaos self-test ==="
@@ -948,17 +1013,13 @@ echo "--- Test: kill-harness SIGKILL ---"
 setup_fake_tt_env
 setup_fixture_repos
 
-# Start a harness-like process under var/ with the run ID + TT_ROOT in cmdline
-# Use exec -a to set argv[0] so /proc/PID/cmdline contains TT_ROOT for provenance check
+# Start a harness-like process under var/ with the run ID + TT_ROOT in
+# cmdline (argv[0] via exec -a so the provenance belt-and-suspenders check
+# passes), in its OWN session (setsid -> disjoint pgid), and pass it to
+# tt-chaos as an EXPLICIT recorded target (US-002: never scan-resolved).
 HARNESS_PID=""
 HARNESS_RUN="run-guard-test"
-(
-  cd "$TEST_VAR"
-  exec -a "${TEST_VAR}/tt-harness-${HARNESS_RUN}" sleep 86400 &
-  HARNESS_PID=$!
-  echo "$HARNESS_PID" > "${TEST_VAR}/harness-pid.txt"
-  wait "$HARNESS_PID" 2>/dev/null || true
-) &
+spawn_isolated "${TEST_VAR}/harness-pid.txt" "${TEST_VAR}/tt-harness-${HARNESS_RUN}" sleep 86400
 BG_WAIT_PID=$!
 
 # Give the harness process time to start
@@ -970,10 +1031,12 @@ if [ -z "$HARNESS_PID" ] || ! kill -0 "$HARNESS_PID" 2>/dev/null; then
   fail "Harness process did not start"
 else
   pass "Harness process started (PID $HARNESS_PID)"
+  note_pid "$HARNESS_PID"
+  HARNESS_START=$(target_start_time "$HARNESS_PID")
 
-  # Run kill-harness
+  # Run kill-harness with the explicit recorded target
   set +e
-  OUT=$("$TOOL" kill-harness --run "$HARNESS_RUN" --when now 2>&1)
+  OUT=$("$TOOL" kill-harness --run "$HARNESS_RUN" --when now --target-pid "$HARNESS_PID" --target-start-time "$HARNESS_START" 2>&1)
   RC=$?
   set -e
 
@@ -1008,13 +1071,7 @@ echo ""
 echo "--- Test: kill-harness --signal SIGSTOP ---"
 
 STOP_PID=""
-(
-  cd "$TEST_VAR"
-  exec -a "${TEST_VAR}/tt-harness-${HARNESS_RUN}" sleep 86400 &
-  STOP_PID=$!
-  echo "$STOP_PID" > "${TEST_VAR}/stop-pid.txt"
-  wait "$STOP_PID" 2>/dev/null || true
-) &
+spawn_isolated "${TEST_VAR}/stop-pid.txt" "${TEST_VAR}/tt-harness-${HARNESS_RUN}" sleep 86400
 BG_STOP_PID=$!
 
 sleep 1
@@ -1024,9 +1081,11 @@ if [ -z "$STOP_PID" ] || ! kill -0 "$STOP_PID" 2>/dev/null; then
   fail "SIGSTOP target process did not start"
 else
   pass "SIGSTOP target process started (PID $STOP_PID)"
+  note_pid "$STOP_PID"
+  STOP_START=$(target_start_time "$STOP_PID")
 
   set +e
-  OUT=$("$TOOL" kill-harness --run "$HARNESS_RUN" --signal SIGSTOP --when now 2>&1)
+  OUT=$("$TOOL" kill-harness --run "$HARNESS_RUN" --signal SIGSTOP --when now --target-pid "$STOP_PID" --target-start-time "$STOP_START" 2>&1)
   RC=$?
   set -e
 
@@ -1071,13 +1130,13 @@ echo "--- Test: kill-harness --signal SIGCONT ---"
 CONT_PID=""
 (
   cd "$TEST_VAR"
-  exec -a "${TEST_VAR}/tt-harness-${HARNESS_RUN}" sleep 86400 &
-  CONT_PID=$!
-  echo "$CONT_PID" > "${TEST_VAR}/cont-pid.txt"
-  # Stop it first
-  sleep 0.5
-  kill -SIGSTOP "$CONT_PID" 2>/dev/null || true
-  wait "$CONT_PID" 2>/dev/null || true
+  setsid bash -c '
+    exec -a "$1" sleep 86400 &
+    echo $! > "$2"
+    kill -SIGSTOP $!
+    wait $! 2>/dev/null || true
+  ' _ "${TEST_VAR}/tt-harness-${HARNESS_RUN}" "${TEST_VAR}/cont-pid.txt" &
+  wait 2>/dev/null || true
 ) &
 BG_CONT_PID=$!
 
@@ -1087,6 +1146,7 @@ CONT_PID=$(cat "${TEST_VAR}/cont-pid.txt" 2>/dev/null || echo "")
 if [ -z "$CONT_PID" ] || ! kill -0 "$CONT_PID" 2>/dev/null; then
   fail "SIGCONT target process did not start"
 else
+  note_pid "$CONT_PID"
   # Verify it's stopped first
   sleep 0.5
   PROC_STATE=$(awk '/^State:/ {print $2}' "/proc/${CONT_PID}/status" 2>/dev/null || echo "")
@@ -1096,8 +1156,10 @@ else
     fail "Process should be stopped initially, got '$PROC_STATE'"
   fi
 
+  CONT_START=$(target_start_time "$CONT_PID")
+
   set +e
-  OUT=$("$TOOL" kill-harness --run "$HARNESS_RUN" --signal SIGCONT --when now 2>&1)
+  OUT=$("$TOOL" kill-harness --run "$HARNESS_RUN" --signal SIGCONT --when now --target-pid "$CONT_PID" --target-start-time "$CONT_START" 2>&1)
   RC=$?
   set -e
 
@@ -1138,25 +1200,22 @@ setup_fake_tt_env
 # Create a mock daemon PID file
 mkdir -p "${TEST_VAR}/.tamandua"
 
-# Start a decoy process under var/ with "daemon" in cmdline
-# Use exec -a so /proc/PID/cmdline contains TT_ROOT for provenance check
+# Start a fake daemon process under var/ with "daemon" in cmdline, in its own
+# session (setsid -> disjoint pgid), and record it in the TT daemon pidfile
+# (US-002: kill-daemon reads the pidfile ONLY — never a /proc scan).
 DAEMON_PID=""
-(
-  cd "$TEST_VAR"
-  exec -a "${TEST_VAR}/tt-daemon-daemon" sleep 86400 &
-  DAEMON_PID=$!
-  echo "$DAEMON_PID" > "${TEST_VAR}/.tamandua/daemon.pid"
-  wait "$DAEMON_PID" 2>/dev/null || true
-) &
+spawn_isolated "${TEST_VAR}/daemon-pid.txt" "${TEST_VAR}/tt-daemon-daemon" sleep 86400
 BG_DAEMON_PID=$!
 
 sleep 1
 
-DAEMON_PID=$(cat "${TEST_VAR}/.tamandua/daemon.pid" 2>/dev/null || echo "")
+DAEMON_PID=$(cat "${TEST_VAR}/daemon-pid.txt" 2>/dev/null || echo "")
 if [ -z "$DAEMON_PID" ] || ! kill -0 "$DAEMON_PID" 2>/dev/null; then
   fail "Mock daemon process did not start"
 else
   pass "Mock daemon process started (PID $DAEMON_PID)"
+  note_pid "$DAEMON_PID"
+  echo "$DAEMON_PID" > "${TEST_VAR}/tamandua.pid"
 
   set +e
   OUT=$("$TOOL" kill-daemon --run "$HARNESS_RUN" --when now 2>&1)
@@ -1187,82 +1246,117 @@ fi
 
 wait "$BG_DAEMON_PID" 2>/dev/null || true
 
-# ── Test: kill-daemon with pidfile-based lookup ─────────────────────────
+# ── Test: kill-daemon refuses when the pidfile is absent (no scan fallback) ─
 
 echo ""
-echo "--- Test: kill-daemon via pidfile ---"
+echo "--- Test: kill-daemon refuses without pidfile (no scan fallback) ---"
 
 setup_fake_tt_env
 mkdir -p "${TEST_VAR}/.tamandua"
 
-# Start a process under var/ with daemon in cmdline
+# Start a fake daemon under var/ (would match the OLD /proc daemon scan) but
+# write NO pidfile — kill-daemon must refuse with GUARD_MISS (exit 3) and the
+# process must survive (the scan-based resolver is gone).
 DAEMON2_PID=""
-(
-  cd "$TEST_VAR"
-  exec -a "${TEST_VAR}/tt-daemon-daemon" sleep 86400 &
-  DAEMON2_PID=$!
-  echo "$DAEMON2_PID" > "${TEST_VAR}/.tamandua/daemon.pid"
-  wait "$DAEMON2_PID" 2>/dev/null || true
-) &
+spawn_isolated "${TEST_VAR}/daemon2-pid.txt" "${TEST_VAR}/tt-daemon-daemon" sleep 86400
 BG_DAEMON2_PID=$!
 
 sleep 1
 
-DAEMON2_PID=$(cat "${TEST_VAR}/.tamandua/daemon.pid" 2>/dev/null || echo "")
+DAEMON2_PID=$(cat "${TEST_VAR}/daemon2-pid.txt" 2>/dev/null || echo "")
 if [ -z "$DAEMON2_PID" ] || ! kill -0 "$DAEMON2_PID" 2>/dev/null; then
   fail "Second mock daemon did not start"
 else
-  # Remove the daemon from cmdline (rename so scan doesn't find it by cmdline)
-  # But we still have the pidfile — the pidfile path should work
+  note_pid "$DAEMON2_PID"
   pass "Second mock daemon started (PID $DAEMON2_PID)"
-
-  # Now delete the pidfile — kill-daemon should find it by scan
-  rm -f "${TEST_VAR}/.tamandua/daemon.pid"
 
   set +e
   OUT=$("$TOOL" kill-daemon --run "$HARNESS_RUN" --when now 2>&1)
   RC=$?
   set -e
 
-  if [ "$RC" -eq 0 ]; then
-    pass "kill-daemon via proc scan exited 0"
+  if [ "$RC" -eq 3 ]; then
+    pass "kill-daemon without pidfile exits GUARD_MISS (3)"
   else
-    fail "kill-daemon via proc scan should exit 0, got $RC"
+    fail "kill-daemon without pidfile should exit 3, got $RC: ${OUT:0:120}"
   fi
 
-  if echo "$OUT" | grep -q "SIGKILL sent to daemon"; then
-    pass "kill-daemon via scan logs daemon kill message"
+  if echo "$OUT" | grep -q "GUARD_MISS"; then
+    pass "kill-daemon without pidfile logs GUARD_MISS"
   else
-    fail "kill-daemon via scan output missing message: ${OUT:0:120}"
+    fail "kill-daemon without pidfile missing GUARD_MISS: ${OUT:0:120}"
   fi
 
-  # Verify daemon is dead
-  sleep 1
+  # The scan-matching daemon must survive (no scan-based kill)
+  sleep 0.5
   if kill -0 "$DAEMON2_PID" 2>/dev/null; then
-    kill -9 "$DAEMON2_PID" 2>/dev/null || true
+    pass "Scan-matching daemon survives when no pidfile exists (no scan kill)"
+  else
+    fail "Scan-matching daemon was killed despite absent pidfile"
   fi
-  pass "kill-daemon via scan test completed"
+
+  # Clean up the surviving daemon so its spawn subshell can exit
+  kill -9 "$DAEMON2_PID" 2>/dev/null || true
 fi
 
 wait "$BG_DAEMON2_PID" 2>/dev/null || true
+
+# ── Test: kill-daemon refuses a stale/foreign pidfile PID ───────────────
+
+echo ""
+echo "--- Test: kill-daemon refuses stale/foreign pidfile PID ---"
+
+setup_fake_tt_env
+
+# pidfile points at a live process that is NOT TT-owned (cwd outside TT_ROOT,
+# no daemon provenance) — the provenance check must refuse, never signal.
+FOREIGN_PID=""
+sleep 60 &
+FOREIGN_PID=$!
+echo "$FOREIGN_PID" > "${TEST_VAR}/tamandua.pid"
+
+set +e
+OUT=$("$TOOL" kill-daemon --run "$HARNESS_RUN" --when now 2>&1)
+RC=$?
+set -e
+
+if [ "$RC" -eq 3 ]; then
+  pass "kill-daemon on foreign pidfile PID exits GUARD_MISS (3)"
+else
+  fail "kill-daemon on foreign pidfile PID should exit 3, got $RC: ${OUT:0:120}"
+fi
+
+if kill -0 "$FOREIGN_PID" 2>/dev/null; then
+  pass "Foreign pidfile PID survives (no signal sent)"
+else
+  fail "Foreign pidfile PID was signalled despite bad provenance"
+fi
+kill "$FOREIGN_PID" 2>/dev/null || true
 
 # ── Test: kill-daemon refuses production daemon ─────────────────────────
 
 echo ""
 echo "--- Test: kill-daemon refuses production daemon ---"
 
-# Source check: verify findDaemonPid only searches under TT_ROOT
-if grep -A 20 "function findDaemonPid" "$TOOL" | grep -q "TT_ROOT"; then
-  pass "findDaemonPid references TT_ROOT for provenance"
+# Source check: kill-daemon resolution is pidfile-only (readDaemonPidfile),
+# with no /proc daemon scan resolver anywhere.
+if grep -q "function readDaemonPidfile" "$TOOL" && grep -q "tamandua.pid" "$TOOL"; then
+  pass "readDaemonPidfile reads the TT daemon pidfile (tamandua.pid)"
 else
-  fail "findDaemonPid does not reference TT_ROOT"
+  fail "readDaemonPidfile (tamandua.pid pidfile) not found in tt-chaos"
 fi
 
-# Source check: guardFire for process actions calls verifyProcessProvenance
-if grep -A 5 "target.kind === 'process'" "$TOOL" | grep -q "verifyProcessProvenance"; then
-  pass "guardFire calls verifyProcessProvenance for process actions"
+if grep -q "function findDaemonPidByScan" "$TOOL" || grep -q "function findDaemonPid" "$TOOL"; then
+  fail "Scan-based daemon resolver still present in tt-chaos"
 else
-  fail "guardFire does not call verifyProcessProvenance for process actions"
+  pass "No scan-based daemon resolver remains (findDaemonPid/ByScan removed)"
+fi
+
+# Source check: guardFire for process actions resolves + verifies the record
+if awk '/function guardFire/,/^}/' "$TOOL" | grep -q "verifyKillTarget" && awk '/function guardFire/,/^}/' "$TOOL" | grep -q "resolveTargetRecord"; then
+  pass "guardFire calls resolveTargetRecord + verifyKillTarget for process actions"
+else
+  fail "guardFire does not call resolveTargetRecord/verifyKillTarget for process actions"
 fi
 
 # ── Test: invalid signal exits with error ──────────────────────────────
@@ -1271,18 +1365,14 @@ echo ""
 echo "--- Test: invalid signal for kill-harness ---"
 
 HARNESS3_PID=""
-(
-  cd "$TEST_VAR"
-  exec -a "${TEST_VAR}/tt-harness-${HARNESS_RUN}" sleep 86400 &
-  HARNESS3_PID=$!
-  wait "$HARNESS3_PID" 2>/dev/null || true
-) &
+spawn_isolated "${TEST_VAR}/h3-pid.txt" "${TEST_VAR}/tt-harness-${HARNESS_RUN}" sleep 86400
 BG_H3_PID=$!
 sleep 1
-HARNESS3_PID=$(pgrep -f "${TEST_VAR}/tt-harness-${HARNESS_RUN}" | head -1 || echo "")
+HARNESS3_PID=$(cat "${TEST_VAR}/h3-pid.txt" 2>/dev/null || echo "")
+note_pid "$HARNESS3_PID"
 
 set +e
-OUT=$("$TOOL" kill-harness --run "$HARNESS_RUN" --signal BADSIGNAL --when now 2>&1)
+OUT=$("$TOOL" kill-harness --run "$HARNESS_RUN" --signal BADSIGNAL --when now --target-pid "$HARNESS3_PID" 2>&1)
 RC=$?
 set -e
 
@@ -1311,23 +1401,19 @@ setup_fake_tt_env
 
 # Start a harness process
 HARNESS4_PID=""
-(
-  cd "$TEST_VAR"
-  exec -a "${TEST_VAR}/tt-harness-${HARNESS_RUN}" sleep 86400 &
-  HARNESS4_PID=$!
-  echo "$HARNESS4_PID" > "${TEST_VAR}/h4-pid.txt"
-  wait "$HARNESS4_PID" 2>/dev/null || true
-) &
+spawn_isolated "${TEST_VAR}/h4-pid.txt" "${TEST_VAR}/tt-harness-${HARNESS_RUN}" sleep 86400
 BG_H4_PID=$!
 
 sleep 1
 
 HARNESS4_PID=$(cat "${TEST_VAR}/h4-pid.txt" 2>/dev/null || echo "")
 if [ -n "$HARNESS4_PID" ] && kill -0 "$HARNESS4_PID" 2>/dev/null; then
+  note_pid "$HARNESS4_PID"
+  H4_START=$(target_start_time "$HARNESS4_PID")
   BEFORE_DIRS=$(find "${TEST_VAR}/chaos" -mindepth 1 -maxdepth 1 -type d -name '*kill-harness*' 2>/dev/null | wc -l || echo 0)
 
   set +e
-  "$TOOL" kill-harness --run "$HARNESS_RUN" --when now > /dev/null 2>&1
+  "$TOOL" kill-harness --run "$HARNESS_RUN" --when now --target-pid "$HARNESS4_PID" --target-start-time "$H4_START" > /dev/null 2>&1
   RC=$?
   set -e
 
@@ -1342,6 +1428,12 @@ if [ -n "$HARNESS4_PID" ] && kill -0 "$HARNESS4_PID" 2>/dev/null; then
       pass "process_tree.txt captured in kill-harness evidence"
     else
       fail "process_tree.txt missing from kill-harness evidence"
+    fi
+    # The evidence must record the resolved explicit target + verification verdict
+    if [ -n "$LATEST_KH" ] && grep -q "Target record:" "$LATEST_KH/process_tree.txt" && grep -q "Verification: ok" "$LATEST_KH/process_tree.txt"; then
+      pass "Evidence records resolved target record + verification verdict"
+    else
+      fail "Evidence missing Target record / Verification verdict in process_tree.txt"
     fi
   else
     fail "No new evidence dir for kill-harness (before=$BEFORE_DIRS, after=$AFTER_DIRS)"
@@ -1397,20 +1489,14 @@ echo "--- Test: sigstop_sigcont happy path ---"
 
 SSC_PID=""
 SSC_PROGRESS="${TEST_VAR}/ssc-progress.txt"
-(
-  cd "$TEST_VAR"
-  exec -a "${TEST_VAR}/tt-harness-${HARNESS_RUN}" bash -c '
-    i=0
-    while true; do
-      echo "progress $i" >> "$1"
-      i=$((i + 1))
-      sleep 0.2
-    done
-  ' _ "$SSC_PROGRESS" &
-  SSC_PID=$!
-  echo "$SSC_PID" > "${TEST_VAR}/ssc-pid.txt"
-  wait "$SSC_PID" 2>/dev/null || true
-) &
+spawn_isolated "${TEST_VAR}/ssc-pid.txt" "${TEST_VAR}/tt-harness-${HARNESS_RUN}" bash -c '
+  i=0
+  while true; do
+    echo "progress $i" >> "$1"
+    i=$((i + 1))
+    sleep 0.2
+  done
+' _ "$SSC_PROGRESS"
 BG_SSC_WAIT=$!
 
 sleep 1
@@ -1420,12 +1506,14 @@ if [ -z "$SSC_PID" ] || ! kill -0 "$SSC_PID" 2>/dev/null; then
   fail "sigstop_sigcont target process did not start"
 else
   pass "sigstop_sigcont target process started (PID $SSC_PID)"
+  note_pid "$SSC_PID"
+  SSC_START=$(target_start_time "$SSC_PID")
 
   L0=$(wc -l < "$SSC_PROGRESS" 2>/dev/null || echo 0)
 
   # Run tt-chaos in the background so we can observe the hold mid-flight
   set +e
-  "$TOOL" sigstop_sigcont --run "$HARNESS_RUN" --when now --hold-seconds 3 > "${TEST_VAR}/ssc-out.txt" 2>&1 &
+  "$TOOL" sigstop_sigcont --run "$HARNESS_RUN" --when now --hold-seconds 3 --target-pid "$SSC_PID" --target-start-time "$SSC_START" > "${TEST_VAR}/ssc-out.txt" 2>&1 &
   SSC_CH_PID=$!
   set -e
 
@@ -1515,13 +1603,7 @@ echo ""
 echo "--- Test: sigstop_sigcont guard miss (killed during hold) ---"
 
 GM_PID=""
-(
-  cd "$TEST_VAR"
-  exec -a "${TEST_VAR}/tt-harness-${HARNESS_RUN}" sleep 86400 &
-  GM_PID=$!
-  echo "$GM_PID" > "${TEST_VAR}/gm-pid.txt"
-  wait "$GM_PID" 2>/dev/null || true
-) &
+spawn_isolated "${TEST_VAR}/gm-pid.txt" "${TEST_VAR}/tt-harness-${HARNESS_RUN}" sleep 86400
 BG_GM_WAIT=$!
 
 sleep 1
@@ -1531,11 +1613,13 @@ if [ -z "$GM_PID" ] || ! kill -0 "$GM_PID" 2>/dev/null; then
   fail "guard-miss target process did not start"
 else
   pass "guard-miss target process started (PID $GM_PID)"
+  note_pid "$GM_PID"
+  GM_START=$(target_start_time "$GM_PID")
 
   CHAOS_LOG="${TEST_VAR}/chaos/chaos.log"
   GM_LOG_BASE=$(wc -l < "$CHAOS_LOG" 2>/dev/null || echo 0)
   set +e
-  "$TOOL" sigstop_sigcont --run "$HARNESS_RUN" --when now --hold-seconds 4 > "${TEST_VAR}/gm-out.txt" 2>&1 &
+  "$TOOL" sigstop_sigcont --run "$HARNESS_RUN" --when now --hold-seconds 4 --target-pid "$GM_PID" --target-start-time "$GM_START" > "${TEST_VAR}/gm-out.txt" 2>&1 &
   GM_CH_PID=$!
   set -e
 
@@ -1585,13 +1669,7 @@ echo ""
 echo "--- Test: sigstop_sigcont guard miss (PID changed during hold) ---"
 
 GM2_PID=""
-(
-  cd "$TEST_VAR"
-  exec -a "${TEST_VAR}/tt-harness-${HARNESS_RUN}" sleep 86400 &
-  GM2_PID=$!
-  echo "$GM2_PID" > "${TEST_VAR}/gm2-pid.txt"
-  wait "$GM2_PID" 2>/dev/null || true
-) &
+spawn_isolated "${TEST_VAR}/gm2-pid.txt" "${TEST_VAR}/tt-harness-${HARNESS_RUN}" sleep 86400
 BG_GM2_WAIT=$!
 
 sleep 1
@@ -1601,18 +1679,20 @@ if [ -z "$GM2_PID" ] || ! kill -0 "$GM2_PID" 2>/dev/null; then
   fail "PID-differs target process did not start"
 else
   pass "PID-differs target process started (PID $GM2_PID)"
+  note_pid "$GM2_PID"
+  GM2_START=$(target_start_time "$GM2_PID")
 
   CHAOS_LOG="${TEST_VAR}/chaos/chaos.log"
   GM2_LOG_BASE=$(wc -l < "$CHAOS_LOG" 2>/dev/null || echo 0)
   set +e
-  "$TOOL" sigstop_sigcont --run "$HARNESS_RUN" --when now --hold-seconds 4 > "${TEST_VAR}/gm2-out.txt" 2>&1 &
+  "$TOOL" sigstop_sigcont --run "$HARNESS_RUN" --when now --hold-seconds 4 --target-pid "$GM2_PID" --target-start-time "$GM2_START" > "${TEST_VAR}/gm2-out.txt" 2>&1 &
   GM2_CH_PID=$!
   set -e
 
   sleep 1.5
   # Kill harness A and start a replacement with the SAME marker: at re-verify
-  # time the finder either finds nothing (reaped) or a different PID — both
-  # must abort with EXIT_GUARD_MISS, never a silent SIGCONT.
+  # time the recorded pid is dead (or, on pid reuse, fails the startTime ABA
+  # check) — both must abort with EXIT_GUARD_MISS, never a silent SIGCONT.
   kill -9 "$GM2_PID" 2>/dev/null || true
   (
     cd "$TEST_VAR"
@@ -1712,6 +1792,313 @@ if grep -q "processActions = \['kill-harness', 'kill-daemon', 'sigstop_sigcont'\
 else
   fail "classifyTarget missing sigstop_sigcont in processActions"
 fi
+
+# ── US-002: explicit recorded kill targets — no /proc cwd/cmdline sweep ──
+
+echo ""
+echo "=== US-002: kill targets resolve from explicit recorded identity ==="
+
+# ── Test: decoy matching the old scan signature is NOT resolved/killed ──
+
+echo ""
+echo "--- Test: decoy (cwd under TT_ROOT + runId in argv[0]) survives; no recorded target → GUARD_MISS ---"
+
+setup_fake_tt_env
+
+# Decoy: cwd under TT_ROOT and runId in argv[0] — the exact signature the old
+# /proc cwd+cmdline sweep would match and SIGKILL. It is NOT a recorded
+# target, so the new tt-chaos must refuse (exit 3) and the decoy must live.
+DECOY_RUN="run-decoy"
+DECOY_PID=""
+(
+  cd "$TEST_VAR"
+  exec -a "${TEST_VAR}/tt-harness-${DECOY_RUN}" sleep 86400 &
+  DECOY_PID=$!
+  echo "$DECOY_PID" > "${TEST_VAR}/decoy-pid.txt"
+  wait "$DECOY_PID" 2>/dev/null || true
+) &
+BG_DECOY_WAIT=$!
+sleep 1
+DECOY_PID=$(cat "${TEST_VAR}/decoy-pid.txt" 2>/dev/null || echo "")
+
+if [ -z "$DECOY_PID" ] || ! kill -0 "$DECOY_PID" 2>/dev/null; then
+  fail "Decoy process did not start"
+else
+  pass "Decoy process started (PID $DECOY_PID)"
+  DECOY_CWD=$(readlink "/proc/${DECOY_PID}/cwd" 2>/dev/null || echo "")
+  DECOY_CMDLINE=$(tr '\0' ' ' < "/proc/${DECOY_PID}/cmdline" 2>/dev/null || echo "")
+  if echo "$DECOY_CWD" | grep -q "$TEST_VAR" && echo "$DECOY_CMDLINE" | grep -q "$DECOY_RUN"; then
+    pass "Decoy matches the old scan signature (cwd under TT_ROOT + runId in cmdline)"
+  else
+    fail "Decoy does not match the old scan signature (cwd=$DECOY_CWD cmdline=$DECOY_CMDLINE)"
+  fi
+
+  # run-decoy has no claim row and no explicit target — kill-harness must
+  # refuse with GUARD_MISS (exit 3), never resolve the decoy by scan.
+  node -e "
+    const { DatabaseSync } = require('node:sqlite');
+    const db = new DatabaseSync('${TEST_VAR}/tamandua.db', { open: true });
+    db.prepare('INSERT OR REPLACE INTO runs (run_id, status, workflow_id) VALUES (?, ?, ?)').run('${DECOY_RUN}', 'running', 'test-wf');
+    db.close();
+  "
+  set +e
+  OUT=$("$TOOL" kill-harness --run "$DECOY_RUN" --when now 2>&1)
+  RC=$?
+  set -e
+
+  if [ "$RC" -eq 3 ]; then
+    pass "kill-harness on unrecorded decoy exits GUARD_MISS (3)"
+  else
+    fail "kill-harness on unrecorded decoy should exit 3, got $RC: ${OUT:0:120}"
+  fi
+  if echo "$OUT" | grep -q "GUARD_MISS"; then
+    pass "GUARD_MISS message for unrecorded decoy"
+  else
+    fail "GUARD_MISS message missing for unrecorded decoy: ${OUT:0:120}"
+  fi
+  if kill -0 "$DECOY_PID" 2>/dev/null; then
+    pass "Decoy survives kill-harness (not scan-resolved)"
+  else
+    fail "Decoy was killed despite not being a recorded target"
+  fi
+fi
+kill -9 "$DECOY_PID" 2>/dev/null || true
+wait "$BG_DECOY_WAIT" 2>/dev/null || true
+
+# ── Test: recorded target is killed while a scan-matching decoy survives ──
+
+echo ""
+echo "--- Test: explicit recorded target killed; scan-matching decoy survives ---"
+
+setup_fake_tt_env
+
+REC_PID=""
+spawn_isolated "${TEST_VAR}/rec-pid.txt" "${TEST_VAR}/tt-harness-run-guard-test" sleep 86400
+BG_REC_WAIT=$!
+
+# Decoy that matches the old scan signature (same run id, cwd under TT_ROOT)
+DECOY2_PID=""
+(
+  cd "$TEST_VAR"
+  exec -a "${TEST_VAR}/tt-harness-run-guard-test" sleep 86400 &
+  DECOY2_PID=$!
+  echo "$DECOY2_PID" > "${TEST_VAR}/decoy2-pid.txt"
+  wait "$DECOY2_PID" 2>/dev/null || true
+) &
+BG_DECOY2_WAIT=$!
+sleep 1
+
+REC_PID=$(cat "${TEST_VAR}/rec-pid.txt" 2>/dev/null || echo "")
+DECOY2_PID=$(cat "${TEST_VAR}/decoy2-pid.txt" 2>/dev/null || echo "")
+if [ -z "$REC_PID" ] || ! kill -0 "$REC_PID" 2>/dev/null; then
+  fail "Recorded harness target did not start"
+else
+  note_pid "$REC_PID"
+  pass "Recorded harness target started (PID $REC_PID)"
+  REC_START=$(target_start_time "$REC_PID")
+  REC_PGID=$(ps -o pgid= -p "$REC_PID" | tr -d ' ')
+
+  set +e
+  OUT=$("$TOOL" kill-harness --run run-guard-test --when now --target-pid "$REC_PID" --target-start-time "$REC_START" --target-pgid "$REC_PGID" 2>&1)
+  RC=$?
+  set -e
+
+  if [ "$RC" -eq 0 ]; then
+    pass "kill-harness with explicit recorded target exited 0"
+  else
+    fail "kill-harness with explicit target should exit 0, got $RC: ${OUT:0:120}"
+  fi
+
+  sleep 1
+  if kill -0 "$REC_PID" 2>/dev/null; then
+    fail "Recorded target still alive after SIGKILL"
+  else
+    pass "Recorded target terminated after SIGKILL"
+  fi
+
+  if [ -n "$DECOY2_PID" ] && kill -0 "$DECOY2_PID" 2>/dev/null; then
+    pass "Scan-matching decoy survives (only the recorded target was killed)"
+  else
+    fail "Scan-matching decoy was killed (sweep-like collateral)"
+  fi
+fi
+kill -9 "$DECOY2_PID" 2>/dev/null || true
+wait "$BG_REC_WAIT" 2>/dev/null || true
+wait "$BG_DECOY2_WAIT" 2>/dev/null || true
+
+# ── Test: --target-pid pointing at tt-chaos's own ancestor is refused ──
+
+echo ""
+echo "--- Test: ancestor target refused (GUARD_MISS exit 3) ---"
+
+setup_fake_tt_env
+
+set +e
+OUT=$("$TOOL" kill-harness --run run-guard-test --when now --target-pid $$ 2>&1)
+RC=$?
+set -e
+
+if [ "$RC" -eq 3 ]; then
+  pass "Ancestor target exits GUARD_MISS (3)"
+else
+  fail "Ancestor target should exit 3, got $RC: ${OUT:0:120}"
+fi
+if echo "$OUT" | grep -q "ancestor"; then
+  pass "GUARD_MISS reason names the ancestor refusal"
+else
+  fail "GUARD_MISS reason missing ancestor: ${OUT:0:120}"
+fi
+if kill -0 "$$" 2>/dev/null; then
+  pass "Operator (test script) survives the ancestor-refusal"
+else
+  fail "Operator was signalled (ancestor refusal failed!)"
+fi
+
+# ── Test: stale --target-start-time (ABA) is refused ────────────────────
+
+echo ""
+echo "--- Test: ABA stale startTime refused (GUARD_MISS exit 3) ---"
+
+setup_fake_tt_env
+
+ABA_PID=""
+spawn_isolated "${TEST_VAR}/aba-pid.txt" "${TEST_VAR}/tt-harness-run-guard-test" sleep 86400
+BG_ABA_WAIT=$!
+sleep 1
+ABA_PID=$(cat "${TEST_VAR}/aba-pid.txt" 2>/dev/null || echo "")
+
+if [ -z "$ABA_PID" ] || ! kill -0 "$ABA_PID" 2>/dev/null; then
+  fail "ABA target process did not start"
+else
+  note_pid "$ABA_PID"
+  pass "ABA target process started (PID $ABA_PID)"
+  WRONG_START="1"  # deliberately wrong starttime
+
+  set +e
+  OUT=$("$TOOL" kill-harness --run run-guard-test --when now --target-pid "$ABA_PID" --target-start-time "$WRONG_START" 2>&1)
+  RC=$?
+  set -e
+
+  if [ "$RC" -eq 3 ]; then
+    pass "ABA stale startTime exits GUARD_MISS (3)"
+  else
+    fail "ABA stale startTime should exit 3, got $RC: ${OUT:0:120}"
+  fi
+  if echo "$OUT" | grep -q "startTime mismatch"; then
+    pass "GUARD_MISS reason names the startTime mismatch"
+  else
+    fail "GUARD_MISS reason missing startTime mismatch: ${OUT:0:120}"
+  fi
+  if kill -0 "$ABA_PID" 2>/dev/null; then
+    pass "ABA target survives (no signal sent on stale startTime)"
+  else
+    fail "ABA target was killed despite stale startTime"
+  fi
+fi
+kill -9 "$ABA_PID" 2>/dev/null || true
+wait "$BG_ABA_WAIT" 2>/dev/null || true
+
+# ── Test: steps-table claim row resolves the harness (no explicit args) ──
+
+echo ""
+echo "--- Test: steps-table claim_pid/claim_pgid fallback resolves the harness ---"
+
+setup_fake_tt_env
+
+CLAIM_PID=""
+spawn_isolated "${TEST_VAR}/claim-pid.txt" "${TEST_VAR}/tt-harness-run-claim" sleep 86400
+BG_CLAIM_WAIT=$!
+
+# Daemon decoy: a live process recorded as claim_pid (the product records the
+# owning DAEMON pid there). kill-harness must target the HARNESS (claim_pgid),
+# never the daemon — the daemon decoy must survive.
+DAEMON_DECOY_PID=""
+spawn_isolated "${TEST_VAR}/daemon-decoy-pid.txt" "${TEST_VAR}/tt-daemon-daemon" sleep 86400
+BG_DAEMON_DECOY_WAIT=$!
+sleep 1
+
+CLAIM_PID=$(cat "${TEST_VAR}/claim-pid.txt" 2>/dev/null || echo "")
+DAEMON_DECOY_PID=$(cat "${TEST_VAR}/daemon-decoy-pid.txt" 2>/dev/null || echo "")
+if [ -z "$CLAIM_PID" ] || ! kill -0 "$CLAIM_PID" 2>/dev/null; then
+  fail "Claim-row target process did not start"
+else
+  note_pid "$CLAIM_PID"
+  pass "Claim-row target process started (PID $CLAIM_PID)"
+  CLAIM_PGID=$(ps -o pgid= -p "$CLAIM_PID" | tr -d ' ')
+  note_pid "$DAEMON_DECOY_PID"
+  insert_claim_row "run-claim" "step-1" "$DAEMON_DECOY_PID" "$CLAIM_PID"
+
+  # No --target-* args: tt-chaos must resolve from the steps table's
+  # recorded claim_pid/claim_pgid — the HARNESS group (claim_pgid), not the
+  # daemon (claim_pid).
+  set +e
+  OUT=$("$TOOL" kill-harness --run run-claim --when now 2>&1)
+  RC=$?
+  set -e
+
+  if [ "$RC" -eq 0 ]; then
+    pass "kill-harness resolved claim row and exited 0"
+  else
+    fail "kill-harness via claim row should exit 0, got $RC: ${OUT:0:120}"
+  fi
+
+  sleep 1
+  if kill -0 "$CLAIM_PID" 2>/dev/null; then
+    fail "Claim-row target still alive after SIGKILL"
+  else
+    pass "Claim-row target terminated after SIGKILL"
+  fi
+
+  if [ -n "$DAEMON_DECOY_PID" ] && kill -0 "$DAEMON_DECOY_PID" 2>/dev/null; then
+    pass "Daemon decoy (claim_pid) survives — kill-harness targets the harness group, not the daemon"
+  else
+    fail "Daemon decoy (claim_pid) was killed — kill-harness must never hit the daemon"
+  fi
+fi
+kill -9 "$CLAIM_PID" 2>/dev/null || true
+kill -9 "$DAEMON_DECOY_PID" 2>/dev/null || true
+wait "$BG_CLAIM_WAIT" 2>/dev/null || true
+wait "$BG_DAEMON_DECOY_WAIT" 2>/dev/null || true
+
+# ── Test: chaos.log records the resolved explicit target + verdict ──────
+
+echo ""
+echo "--- Test: chaos.log records resolved explicit target and verification verdict ---"
+
+setup_fake_tt_env
+
+LOG_PID=""
+spawn_isolated "${TEST_VAR}/log-pid.txt" "${TEST_VAR}/tt-harness-run-guard-test" sleep 86400
+BG_LOG_WAIT=$!
+sleep 1
+LOG_PID=$(cat "${TEST_VAR}/log-pid.txt" 2>/dev/null || echo "")
+
+if [ -z "$LOG_PID" ] || ! kill -0 "$LOG_PID" 2>/dev/null; then
+  fail "chaos.log test target did not start"
+else
+  note_pid "$LOG_PID"
+  pass "chaos.log test target started (PID $LOG_PID)"
+  LOG_START=$(target_start_time "$LOG_PID")
+  CHAOS_LOG="${TEST_VAR}/chaos/chaos.log"
+
+  set +e
+  "$TOOL" kill-harness --run run-guard-test --when now --target-pid "$LOG_PID" --target-start-time "$LOG_START" > /dev/null 2>&1
+  set -e
+
+  if grep '"action":"kill-harness"' "$CHAOS_LOG" | grep '"outcome":"fired"' | grep -q "\"pid\":$LOG_PID" && \
+     grep '"action":"kill-harness"' "$CHAOS_LOG" | grep '"outcome":"fired"' | grep -q '"verification":"ok"'; then
+    pass "chaos.log fired entry records explicit target pid + verification: ok"
+  else
+    fail "chaos.log fired entry missing explicit target/verification"
+  fi
+  if grep '"action":"kill-harness"' "$CHAOS_LOG" | grep '"outcome":"fired"' | grep -q "\"startTime\":\"proc:$LOG_START\""; then
+    pass "chaos.log fired entry records the startTime identity"
+  else
+    fail "chaos.log fired entry missing startTime identity"
+  fi
+fi
+kill -9 "$LOG_PID" 2>/dev/null || true
+wait "$BG_LOG_WAIT" 2>/dev/null || true
 
 # ── US-006 tests: Execution control actions ────────────────────────────
 

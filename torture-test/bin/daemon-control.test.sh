@@ -375,12 +375,29 @@ else
   fail "tool shebang is not bash"
 fi
 
-# Verify no node/npm invocations in the tool (for this story — future
-# stories may add node-based subcommand implementations)
-if grep -q "^[^#]*node\|^[^#]*npm\|^[^#]*npx" "$TOOL" 2>/dev/null; then
-  fail "tool contains node/npm invocation (should be bash-only for scaffolding)"
+# E3.C.1 US-004: daemon-control deliberately invokes node for ONE purpose —
+# the torture-test-local process-identity CLI (bin/tt-process-identity.mjs),
+# the only sanctioned way to read/verify a pid's /proc starttime identity
+# before any signal. Any OTHER node invocation, or any npm/npx use, is a
+# regression.
+if grep -qE "^[^#]*(npm|npx)" "$TOOL" 2>/dev/null; then
+  fail "tool contains npm/npx invocation (should be bash + identity CLI only)"
 else
-  pass "tool does not rely on node/npm for scaffolding"
+  pass "tool does not rely on npm/npx"
+fi
+
+node_lines="$(grep -nE "^[^#]*node" "$TOOL" 2>/dev/null || true)"
+if [ -n "$node_lines" ]; then
+  # Every sanctioned node invocation must go through the IDENTITY_TOOL
+  # variable (the tt-process-identity.mjs path is bound there, so the
+  # invocation lines reference the variable, not a literal node binary).
+  if echo "$node_lines" | grep -v "IDENTITY_TOOL" >/dev/null 2>&1; then
+    fail "tool contains node invocation not targeting the identity CLI: $(echo "$node_lines" | tr '\n' ' ')"
+  else
+    pass "tool uses node only for the tt-process-identity identity CLI"
+  fi
+else
+  pass "tool does not invoke node"
 fi
 
 # ── Test 12: path resolution follows conventions ─────────────────────
@@ -559,7 +576,7 @@ else
 fi
 
 # Verify provenance file contains required fields
-for field in name kind pid ports scopeUnit cgroupVerified startedAt cmdline cwd; do
+for field in name kind pid ports scopeUnit cgroupVerified startedAt cmdline cwd startTime; do
   if grep -A 100 '^write_provenance()' "$TOOL" | grep -q "\"$field\""; then
     pass "provenance record includes '$field'"
   else
@@ -818,6 +835,74 @@ if grep -A 300 '^cmd_stop()' "$TOOL" | grep -q 'REFUSING.*NOT proven TT-owned'; 
 else
   fail "cmd_stop missing refusal message for non-TT-owned processes"
 fi
+
+# ── Test 35b: E3.C.1 US-004 — recorded startTime identity before signals ─
+echo ""
+echo "--- Test: US-004 recorded startTime identity gating ---"
+
+# The identity CLI must be wired in
+if grep -q 'IDENTITY_TOOL=' "$TOOL"; then
+  pass "daemon-control references the tt-process-identity CLI (IDENTITY_TOOL)"
+else
+  fail "daemon-control missing IDENTITY_TOOL reference"
+fi
+
+# write_provenance must record the daemon's process-start identity
+if grep -A 100 '^write_provenance()' "$TOOL" | grep -q 'start_time'; then
+  pass "write_provenance records startTime identity"
+else
+  fail "write_provenance missing startTime identity recording"
+fi
+
+# cmd_start must read the identity at daemon start
+if grep -A 250 '^cmd_start()' "$TOOL" | grep -q 'IDENTITY_TOOL.*--get'; then
+  pass "cmd_start reads the daemon startTime identity via --get"
+else
+  fail "cmd_start missing startTime identity read"
+fi
+
+# cmd_stop must read the recorded identity back from provenance
+if grep -A 300 '^cmd_stop()' "$TOOL" | grep -q 'prov_start_time'; then
+  pass "cmd_stop reads recorded startTime from provenance"
+else
+  fail "cmd_stop missing prov_start_time read"
+fi
+
+# cmd_stop must verify identity before ANY signal (verify_recorded_identity)
+if grep -A 300 '^cmd_stop()' "$TOOL" | grep -q 'verify_recorded_identity'; then
+  pass "cmd_stop verifies recorded identity before signalling"
+else
+  fail "cmd_stop missing verify_recorded_identity gate"
+fi
+
+# The SIGKILL escalation must re-verify identity (pid not reused mid-window)
+if grep -A 300 '^cmd_stop()' "$TOOL" | grep -q 'REFUSING SIGKILL'; then
+  pass "cmd_stop re-verifies identity before SIGKILL escalation"
+else
+  fail "cmd_stop missing SIGKILL re-verification"
+fi
+
+# Step 4 lingering-listener cleanup must refuse unconfirmed identities
+if grep -A 300 '^cmd_stop()' "$TOOL" | grep -q 'not the recorded daemon'; then
+  pass "cmd_stop refuses to kill lingering listeners that are not the recorded daemon"
+else
+  fail "cmd_stop missing lingering-listener identity refusal"
+fi
+
+if grep -A 300 '^cmd_stop()' "$TOOL" | grep -q 'verify_listener_target'; then
+  pass "cmd_stop uses verify_listener_target for lingering listeners"
+else
+  fail "cmd_stop missing verify_listener_target"
+fi
+
+# Helper functions must exist
+for fn in verify_recorded_identity verify_listener_target; do
+  if grep -q "^${fn}()" "$TOOL"; then
+    pass "$fn function exists"
+  else
+    fail "$fn function missing"
+  fi
+done
 
 # ── Test 36: stop subcommand env isolation (run_under_env) ───────────
 echo ""
@@ -1700,7 +1785,7 @@ if [ -f "$REAL_PROV" ] && command -v jq >/dev/null 2>&1; then
   else
     fail "real provenance JSON fails jq validation"
   fi
-  for field in name kind pid ports scopeUnit cgroupVerified startedAt cmdline cwd; do
+  for field in name kind pid ports scopeUnit cgroupVerified startedAt cmdline cwd startTime; do
     if jq -e ".$field" "$REAL_PROV" >/dev/null 2>&1; then
       pass "real provenance contains '$field'"
     else
@@ -1746,7 +1831,7 @@ if [ -f "$SCRIPTED_PROV" ] && command -v jq >/dev/null 2>&1; then
   else
     fail "scripted provenance JSON fails jq validation"
   fi
-  for field in name kind pid ports scopeUnit cgroupVerified startedAt cmdline cwd; do
+  for field in name kind pid ports scopeUnit cgroupVerified startedAt cmdline cwd startTime; do
     if jq -e ".$field" "$SCRIPTED_PROV" >/dev/null 2>&1; then
       pass "scripted provenance contains '$field'"
     else
@@ -1984,6 +2069,299 @@ fi
 
 # Cleanup snapshot temp dir
 rm -rf "$snapshot_dir" 2>/dev/null || true
+
+# ═══════════════════════════════════════════════════════════════════════
+# US-004: ABA-safe stop escalation + identity-verified listener cleanup
+# ═══════════════════════════════════════════════════════════════════════
+
+echo ""
+echo "=== US-004: ABA-safe stop escalation tests ==="
+
+IDENTITY_TOOL="$SCRIPT_DIR/tt-process-identity.mjs"
+US004_PROV="$TT_VAR_BASE/daemon-control/scripted.json"
+TT_REPO_ROOT="$(dirname "$SCRIPT_DIR")"  # torture-test/.. = repo root
+
+# Decoy listener script: binds a TT port and records every catchable signal
+# it receives (SIGKILL cannot be trapped — a SIGKILLed decoy dies, which the
+# survival assertions catch). SIGTERM/SIGINT/SIGHUP/SIGUSR1/SIGUSR2 are
+# appended to a log file so a test can prove NO signal was ever sent.
+US004_DECOY_SCRIPT="$(mktemp "${TMPDIR:-/tmp}/tt-dc-listener.XXXXXX.mjs")"
+cat > "$US004_DECOY_SCRIPT" <<'US004DECOYEOF'
+import net from 'node:net';
+import fs from 'node:fs';
+const log = process.argv[2];
+const port = Number(process.argv[3]);
+for (const s of ['SIGTERM', 'SIGINT', 'SIGHUP', 'SIGUSR1', 'SIGUSR2']) {
+  process.on(s, () => { try { fs.appendFileSync(log, s + '\n'); } catch {} });
+}
+const server = net.createServer();
+server.listen(port, () => { try { fs.appendFileSync(log, 'LISTENING\n'); } catch {} });
+setInterval(() => {}, 60000);
+US004DECOYEOF
+
+# Decoys that must survive their test are killed here; the EXIT trap also
+# covers an early abort (set -e) so a decoy never leaks onto a TT port and
+# a crafted fake provenance is always replaced by the real record.
+US004_DECOY_PID=""
+US004_PROV_BAK=""
+decoy_cleanup() {
+  if [ -n "$US004_DECOY_PID" ] && kill -0 "$US004_DECOY_PID" 2>/dev/null; then
+    kill -KILL "$US004_DECOY_PID" 2>/dev/null || true
+    wait "$US004_DECOY_PID" 2>/dev/null || true
+    US004_DECOY_PID=""
+  fi
+}
+restore_us004_provenance() {
+  if [ -n "$US004_PROV_BAK" ] && [ -f "$US004_PROV_BAK" ]; then
+    cp "$US004_PROV_BAK" "$US004_PROV"
+  fi
+}
+trap 'cleanup_snapshot; restore_us004_provenance; decoy_cleanup' EXIT
+
+# wait_for_port_listen: poll until a TCP port accepts a connection.
+wait_for_port_listen() {
+  local port="$1"
+  local tries=0
+  while [ "$tries" -lt 50 ]; do
+    if timeout 1 bash -c "echo >/dev/tcp/localhost/$port" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.2
+    tries=$((tries + 1))
+  done
+  return 1
+}
+
+# restore_us004_provenance: put the real scripted provenance back after a
+# test crafted a fake record.
+
+# ── Test 87: stale-pid ABA — reused provenance pid is refused ────────
+echo ""
+echo "--- Test: stale-pid ABA refusal (US-004) ---"
+
+US004_PROV_BAK="$(mktemp "${TMPDIR:-/tmp}/tt-dc-prov.XXXXXX")"
+if [ -f "$US004_PROV" ]; then
+  cp "$US004_PROV" "$US004_PROV_BAK"
+fi
+
+ABA_SIGNAL_LOG="$(mktemp "${TMPDIR:-/tmp}/tt-dc-signals.XXXXXX")"
+
+# Spawn a decoy listener (own session/group via setsid — pgid == pid,
+# disjoint from the test ancestry) on a scripted port.
+set +e
+setsid node "$US004_DECOY_SCRIPT" "$ABA_SIGNAL_LOG" 5339 &
+US004_DECOY_PID=$!
+set -e
+
+if [ -n "$US004_DECOY_PID" ] && kill -0 "$US004_DECOY_PID" 2>/dev/null; then
+  pass "ABA decoy listener spawned (pid $US004_DECOY_PID)"
+else
+  fail "ABA decoy listener failed to spawn"
+fi
+
+if wait_for_port_listen 5339; then
+  pass "ABA decoy is listening on port 5339"
+else
+  fail "ABA decoy never listened on port 5339"
+fi
+
+# Craft provenance whose pid names the LIVE decoy but whose startTime is
+# STALE (the ABA shape: the recorded pid was reused by a different process
+# — here, an unrelated live decoy). stop must REFUSE, never signal it.
+cat > "$US004_PROV" <<US004ABAEOF
+{
+  "name": "scripted",
+  "kind": "scripted",
+  "pid": $US004_DECOY_PID,
+  "ports": [5339],
+  "scopeUnit": "",
+  "cgroupVerified": false,
+  "startedAt": "2026-01-01T00:00:00Z",
+  "cmdline": "tamandua daemon start",
+  "cwd": "$TT_VAR_BASE/home-scripted",
+  "startTime": "proc:1"
+}
+US004ABAEOF
+
+set +e
+aba_stop_out="$("$TOOL" scripted stop 2>&1)"
+aba_stop_rc=$?
+set -e
+
+if echo "$aba_stop_out" | grep -qi "REFUSING.*startTime\|REFUSING.*identity\|startTime.*not match"; then
+  pass "ABA stop refuses with an identity-mismatch message"
+else
+  fail "ABA stop did not refuse with an identity message (got: $(echo "$aba_stop_out" | grep -i 'refus\|identity\|starttime' | head -3 || echo '(none)'))"
+fi
+
+if [ -n "$US004_DECOY_PID" ] && kill -0 "$US004_DECOY_PID" 2>/dev/null; then
+  pass "ABA decoy SURVIVED — stale-provenance pid was never signalled"
+else
+  fail "ABA decoy was KILLED — stale provenance pid was signalled!"
+fi
+
+if [ -f "$ABA_SIGNAL_LOG" ] && ! grep -qE "SIGTERM|SIGINT|SIGHUP|SIGUSR" "$ABA_SIGNAL_LOG"; then
+  pass "ABA decoy received NO signals (signal log empty)"
+else
+  fail "ABA decoy received a signal: $(cat "$ABA_SIGNAL_LOG" 2>/dev/null || echo '(log missing)')"
+fi
+
+# Restore the real provenance, kill the decoy, clear the backup.
+restore_us004_provenance
+rm -f "$US004_PROV_BAK"; US004_PROV_BAK=""
+decoy_cleanup
+rm -f "$ABA_SIGNAL_LOG"
+
+# ── Test 88: decoy listener — matching cwd/cmdline, wrong identity ───
+echo ""
+echo "--- Test: decoy listener refusal (US-004) ---"
+
+US004_PROV_BAK="$(mktemp "${TMPDIR:-/tmp}/tt-dc-prov.XXXXXX")"
+if [ -f "$US004_PROV" ]; then
+  cp "$US004_PROV" "$US004_PROV_BAK"
+fi
+
+DECOY2_SIGNAL_LOG="$(mktemp "${TMPDIR:-/tmp}/tt-dc-signals2.XXXXXX")"
+
+# Spawn a decoy whose /proc signature matches the OLD scan pattern exactly:
+# cwd under TT_REPO_ROOT + 'tamandua' in cmdline + listening on a TT port.
+# (exec -a sets argv[0]='tamandua' on the node process; setsid gives it its
+# own session/group so it is disjoint from the test ancestry.)
+set +e
+( cd "$TT_REPO_ROOT" && exec setsid bash -c 'exec -a "$0" node "$1" "$2" "$3"' tamandua "$US004_DECOY_SCRIPT" "$DECOY2_SIGNAL_LOG" 5338 ) &
+US004_DECOY_PID=$!
+set -e
+
+if [ -n "$US004_DECOY_PID" ] && kill -0 "$US004_DECOY_PID" 2>/dev/null; then
+  pass "decoy listener spawned (pid $US004_DECOY_PID)"
+else
+  fail "decoy listener failed to spawn"
+fi
+
+if wait_for_port_listen 5338; then
+  pass "decoy listener is listening on port 5338"
+else
+  fail "decoy listener never listened on port 5338"
+fi
+
+# Prove the decoy matches the OLD cwd/cmdline scan signature (the old
+# verify_process_tt_owned gate would have passed it and SIGKILLed it).
+decoy_cwd="$(readlink "/proc/$US004_DECOY_PID/cwd" 2>/dev/null || true)"
+case "$decoy_cwd" in
+  "$TT_REPO_ROOT"|"$TT_REPO_ROOT"/*) pass "decoy cwd is under TT_REPO_ROOT ($decoy_cwd) — matches old scan signature" ;;
+  *) fail "decoy cwd is NOT under TT_REPO_ROOT ($decoy_cwd)" ;;
+esac
+decoy_cmdline="$(tr '\0' ' ' < "/proc/$US004_DECOY_PID/cmdline" 2>/dev/null || true)"
+if echo "$decoy_cmdline" | grep -q 'tamandua'; then
+  pass "decoy cmdline contains 'tamandua' — matches old scan signature"
+else
+  fail "decoy cmdline lacks 'tamandua' (got: $decoy_cmdline)"
+fi
+
+# Craft provenance with a DEAD pid (nothing to signal in Step 3) and NO
+# startTime. The lingering-listener cleanup (Step 4) must refuse to kill
+# the decoy: it is NOT the recorded daemon and its identity is unconfirmed.
+set +e
+(sleep 0.05) &
+DEAD_PID=$!
+wait "$DEAD_PID" 2>/dev/null || true
+set -e
+
+cat > "$US004_PROV" <<US004DECOYEOF
+{
+  "name": "scripted",
+  "kind": "scripted",
+  "pid": $DEAD_PID,
+  "ports": [5338],
+  "scopeUnit": "",
+  "cgroupVerified": false,
+  "startedAt": "2026-01-01T00:00:00Z",
+  "cmdline": "tamandua daemon start",
+  "cwd": "$TT_VAR_BASE/home-scripted",
+  "startTime": ""
+}
+US004DECOYEOF
+
+set +e
+decoy_stop_out="$("$TOOL" scripted stop 2>&1)"
+decoy_stop_rc=$?
+set -e
+
+if echo "$decoy_stop_out" | grep -qi "REFUSING.*not the recorded daemon\|REFUSING.*identity-confirmed\|not the recorded daemon"; then
+  pass "stop refuses to kill the decoy listener (identity unconfirmed)"
+else
+  fail "stop did not refuse the decoy listener (got: $(echo "$decoy_stop_out" | grep -i 'refus\|identity\|recorded daemon' | head -3 || echo '(none)'))"
+fi
+
+if [ -n "$US004_DECOY_PID" ] && kill -0 "$US004_DECOY_PID" 2>/dev/null; then
+  pass "decoy listener SURVIVED — not killed on cwd/cmdline evidence alone"
+else
+  fail "decoy listener was KILLED — cwd/cmdline-only evidence reached a kill!"
+fi
+
+if [ -f "$DECOY2_SIGNAL_LOG" ] && ! grep -qE "SIGTERM|SIGINT|SIGHUP|SIGUSR" "$DECOY2_SIGNAL_LOG"; then
+  pass "decoy listener received NO signals (signal log empty)"
+else
+  fail "decoy listener received a signal: $(cat "$DECOY2_SIGNAL_LOG" 2>/dev/null || echo '(log missing)')"
+fi
+
+# Restore the real provenance, kill the decoy, clean up temp files.
+restore_us004_provenance
+rm -f "$US004_PROV_BAK"; US004_PROV_BAK=""
+decoy_cleanup
+rm -f "$DECOY2_SIGNAL_LOG" "$US004_DECOY_SCRIPT"
+
+# ── Test 89: normal stop still works — the recorded daemon is stopped ──
+echo ""
+echo "--- Test: recorded daemon stop still works (US-004) ---"
+
+# The real + scripted daemons are stopped (Test 86). A fresh scripted
+# start/stop round-trip proves the identity-verified stop path still stops
+# the recorded daemon cleanly with ports freed.
+set +e
+"$TOOL" scripted start >/dev/null 2>&1
+start_rc=$?
+set -e
+if [ "$start_rc" -eq 0 ] && wait_for_port_listen 5334; then
+  pass "scripted daemon started for normal-stop round-trip"
+else
+  fail "scripted daemon did not start for normal-stop round-trip (rc=$start_rc)"
+fi
+
+if [ -f "$US004_PROV" ] && command -v jq >/dev/null 2>&1; then
+  recorded_start_time="$(jq -r '.startTime // ""' "$US004_PROV" 2>/dev/null || true)"
+  if [ -n "$recorded_start_time" ] && [ "$recorded_start_time" != "null" ]; then
+    pass "scripted provenance records a startTime identity ($recorded_start_time)"
+  else
+    fail "scripted provenance missing recorded startTime identity"
+  fi
+else
+  fail "scripted provenance missing after normal start"
+fi
+
+set +e
+"$TOOL" scripted stop >/dev/null 2>&1
+stop_rc=$?
+set -e
+if [ "$stop_rc" -eq 0 ]; then
+  pass "scripted daemon stopped cleanly via identity-verified stop"
+else
+  fail "scripted daemon stop failed (rc=$stop_rc)"
+fi
+
+sleep 1
+all_scripted_free=true
+for port in $SCRIPTED_PORTS; do
+  if timeout 1 bash -c "echo >/dev/tcp/localhost/$port" 2>/dev/null; then
+    all_scripted_free=false
+    echo "  WARNING: port $port still in use after normal stop"
+  fi
+done
+if $all_scripted_free; then
+  pass "all scripted ports free after identity-verified stop"
+else
+  fail "one or more scripted ports still in use after normal stop"
+fi
 
 echo ""
 echo "================================================"

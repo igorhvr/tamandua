@@ -82,6 +82,7 @@ HEAVY_CAMPAIGN_TESTS=(
     'tier1-real-case-proof.test.ts'
     'tier1-repeatability.test.ts'
     'tier1-scripted-probe-battery.test.ts'
+    'tier1-kill-sentinel-survival.test.ts'
     'tier1-zero-real-launch-infra.test.ts'
     # US-016: tier2-repeatability drives full tier2/tier1 controller campaigns
     # (bare --tier2 x2 + dry-run over the whole roster + no-regression) and

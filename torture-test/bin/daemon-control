@@ -13,6 +13,12 @@
 # torture-test/var — so a daemon can never be started under an uncontained
 # HOME (the 2026-08-05 ~/.gitconfig breach surface).
 #
+# E3.C.1 US-004: every signal (SIGTERM/SIGKILL escalation, lingering-listener
+# cleanup) is gated on the RECORDED process-start identity — the daemon's
+# startTime is recorded in provenance at start and must match the pid's
+# current /proc starttime before any signal; a stale/reused pid is refused,
+# never signalled (a cwd/cmdline-only match is never sufficient).
+#
 # Where systemd-run --user --scope is available, starts daemons inside
 # dedicated named scopes and re-asserts cgroup membership after every
 # start/restart, recording provenance to
@@ -25,6 +31,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TT_DIR="$(dirname "$SCRIPT_DIR")"                        # torture-test/
 TT_REPO_ROOT="$(dirname "$TT_DIR")"                      # repo root
 export TT_ROOT="${TT_REPO_ROOT}/torture-test/var"
+
+# Process-start identity CLI (E3.C.1 US-001/US-004): the ONLY sanctioned
+# way to read/verify a pid's /proc starttime identity. Every signal
+# daemon-control fires is gated on a recorded identity verified through
+# this tool — never on cwd/cmdline evidence alone.
+IDENTITY_TOOL="$SCRIPT_DIR/tt-process-identity.mjs"
 
 # Env script paths
 TT_ENV_REAL="$TT_DIR/env/tt-env.sh"
@@ -299,9 +311,16 @@ Daemon kinds:
 Commands:
   start     Start the daemon inside a systemd user scope (when available)
             or as a plain background process. Records provenance to
-            torture-test/var/daemon-control/<name>.json.
+            torture-test/var/daemon-control/<name>.json, including the
+            daemon's process-start identity (startTime).
   stop      Stop the daemon gracefully via tamandua CLI, escalating only
-            to evidence-based process signals (cwd/cmdline provenance).
+            to identity-verified process signals: the recorded startTime
+            must match the pid's current /proc starttime before ANY
+            SIGTERM/SIGKILL (E3.C.1 US-004) — a stale/reused provenance
+            pid is refused, never signalled. Lingering port listeners are
+            killed only when they are the recorded daemon with a matching
+            identity; unconfirmed listeners (decoy cwd/cmdline matches)
+            are refused.
   restart   Stop then start, re-asserting cgroup membership after start.
   status    Report daemon running state (RUNNING/STOPPED/UNKNOWN) from
             provenance file and liveness checks.
@@ -320,6 +339,10 @@ Production guards:
     ~/.gitconfig breach surface).
   - Any attempt to target production exits with an error.
   - The guard checks BEFORE every signal, not just at startup.
+  - Every signal is gated on the recorded process-start identity
+    (E3.C.1 US-004): the pid's current /proc starttime must match the
+    startTime recorded in provenance, or the signal is refused. Never
+    signal on cwd/cmdline evidence alone.
 
 Examples:
   daemon-control real start        # start the real-harness TT daemon
@@ -404,6 +427,47 @@ verify_process_tt_owned() {
   return 0
 }
 
+# verify_recorded_identity: ABA-safe process-start identity check for the
+# RECORDED daemon pid BEFORE any signal (E3.C.1 US-004). $1 = pid,
+# $2 = recorded startTime identity ('proc:<n>' from provenance).
+#
+# The recorded identity is mandatory: when the provenance record carries no
+# startTime the check REFUSES (fail closed — an unverifiable pid is never
+# signalled). A mismatch between the recorded identity and the pid's CURRENT
+# /proc starttime means the pid was reused since the daemon was recorded
+# (e.g. a stale provenance pid now naming a repo-cwd tamandua CLI child of
+# the worker) — refuse, never signal a reused pid.
+verify_recorded_identity() {
+  local pid="$1"
+  local recorded="$2"
+  if [ -z "$recorded" ]; then
+    echo "daemon-control: REFUSING — no recorded startTime identity for PID $pid; cannot verify before signalling" >&2
+    return 1
+  fi
+  if ! node "$IDENTITY_TOOL" --check "$pid" "$recorded" >/dev/null 2>&1; then
+    echo "daemon-control: REFUSING — PID $pid startTime does not match the recorded daemon identity ($recorded); the pid may have been reused (ABA). No signal sent." >&2
+    return 1
+  fi
+  return 0
+}
+
+# verify_listener_target: full signal-target verification for a lingering
+# port listener pid (resolved by port scan, so it needs the complete US-004
+# gate): pid alive, recorded startTime identity match, target is NOT an
+# ancestor of daemon-control, and the target's pgid is disjoint from
+# daemon-control's own pgid. $1 = pid, $2 = recorded startTime identity.
+# Returns 0 when verified; prints a REFUSING reason and returns 1 otherwise.
+verify_listener_target() {
+  local pid="$1"
+  local recorded="$2"
+  local out
+  out="$(node "$IDENTITY_TOOL" --verify "$pid" "$recorded" 2>&1)" || {
+    echo "daemon-control: REFUSING — $out" >&2
+    return 1
+  }
+  return 0
+}
+
 # update_provenance_after_stop: add stoppedAt and exitCode to a provenance
 # JSON file. Uses jq if available, otherwise sed-based fallback.
 update_provenance_after_stop() {
@@ -439,6 +503,7 @@ write_provenance() {
   local started_at="$7"
   local cmdline="$8"
   local cwd="$9"
+  local start_time="${10}"  # 'proc:<n>' process-start identity (US-004)
   local prov_file="$PROV_DIR/$name.json"
 
   # Convert space-separated ports to a JSON array
@@ -457,6 +522,7 @@ write_provenance() {
       --arg startedAt "$started_at" \
       --arg cmdline "$cmdline" \
       --arg cwd "$cwd" \
+      --arg startTime "$start_time" \
       '{
         name: $name,
         kind: $kind,
@@ -466,7 +532,8 @@ write_provenance() {
         cgroupVerified: ($cgroupVerified == "true"),
         startedAt: $startedAt,
         cmdline: $cmdline,
-        cwd: $cwd
+        cwd: $cwd,
+        startTime: $startTime
       }' > "$prov_file"
   else
     # Fallback: write JSON with printf (no jq dependency for basic operation)
@@ -480,7 +547,8 @@ write_provenance() {
   "cgroupVerified": $cgroup_ok,
   "startedAt": "$started_at",
   "cmdline": "$cmdline",
-  "cwd": "$cwd"
+  "cwd": "$cwd",
+  "startTime": "$start_time"
 }
 PROVEOF
   fi
@@ -562,6 +630,17 @@ cmd_start() {
   fi
   echo "daemon-control: daemon PID $daemon_pid" >&2
 
+  # Record the daemon's process-start identity (E3.C.1 US-004): stop/restart
+  # verify the recorded startTime against the pid's CURRENT /proc starttime
+  # before ANY signal, so a stale/reused provenance pid (a pid that now names
+  # a different process — e.g. a repo-cwd tamandua CLI child of the worker)
+  # is refused instead of signalled.
+  local daemon_start_time
+  daemon_start_time="$(node "$IDENTITY_TOOL" --get "$daemon_pid" 2>/dev/null || true)"
+  if [ -z "$daemon_start_time" ]; then
+    echo "daemon-control: WARNING — could not read startTime identity for daemon PID $daemon_pid; stop/restart will REFUSE to signal it" >&2
+  fi
+
   # Verify cgroup membership when systemd was used
   local cgroup_ok=false
   if $use_systemd; then
@@ -597,7 +676,8 @@ cmd_start() {
     "$cgroup_ok" \
     "$started_at" \
     "tamandua daemon start" \
-    "$state_dir"
+    "$state_dir" \
+    "$daemon_start_time"
 
   echo "daemon-control: $kind daemon started on ports $dash_port (dashboard) $mcp_port (MCP) $ctrl_port (control)" >&2
 
@@ -626,11 +706,12 @@ cmd_stop() {
   fi
 
   # ── Read provenance ────────────────────────────────────────────────
-  local prov_pid prov_ports prov_scope prov_cwd
+  local prov_pid prov_ports prov_scope prov_cwd prov_start_time
   prov_pid=$(jq -r '.pid // 0' "$prov_file" 2>/dev/null)
   prov_ports=$(jq -r '.ports | join(" ")' "$prov_file" 2>/dev/null)
   prov_scope=$(jq -r '.scopeUnit // ""' "$prov_file" 2>/dev/null)
   prov_cwd=$(jq -r '.cwd // ""' "$prov_file" 2>/dev/null)
+  prov_start_time=$(jq -r '.startTime // ""' "$prov_file" 2>/dev/null)
 
   # ── Already stopped: ports free → no-op ────────────────────────────
   local all_ports_free=true
@@ -705,7 +786,7 @@ cmd_stop() {
   if $all_stopped; then
     echo "daemon-control: $kind daemon stopped gracefully" >&2
   else
-    # ── Step 3: Escalate → SIGTERM → SIGKILL (evidence-based only) ──
+    # ── Step 3: Escalate → SIGTERM → SIGKILL (identity-verified only) ──
     echo "daemon-control: daemon did not stop within timeout — escalating..." >&2
 
     if $pid_alive && [ "$prov_pid" -gt 0 ] 2>/dev/null; then
@@ -714,17 +795,34 @@ cmd_stop() {
         refuse_production "refusing to signal PID $prov_pid — cwd is production"
       fi
 
-      # Verify TT-owned via /proc evidence before signaling
-      if verify_process_tt_owned "$prov_pid" "$prov_cwd"; then
-        echo "daemon-control: sending SIGTERM to proven TT-owned PID $prov_pid" >&2
-        kill -TERM "$prov_pid" 2>/dev/null || true
-        sleep 2
-        if kill -0 "$prov_pid" 2>/dev/null; then
-          echo "daemon-control: sending SIGKILL to PID $prov_pid" >&2
-          kill -KILL "$prov_pid" 2>/dev/null || true
+      # E3.C.1 US-004: verify the RECORDED process-start identity before ANY
+      # signal. A stale/reused provenance pid (e.g. a repo-cwd process with
+      # 'tamandua' in its cmdline that happens to reuse the recorded pid)
+      # fails the startTime check and is refused — never signalled. The
+      # cwd/cmdline check below remains as belt-and-suspenders ONLY for an
+      # already identity-verified recorded pid.
+      if verify_recorded_identity "$prov_pid" "$prov_start_time"; then
+        # Verify TT-owned via /proc evidence before signaling
+        if verify_process_tt_owned "$prov_pid" "$prov_cwd"; then
+          echo "daemon-control: sending SIGTERM to identity-verified TT daemon PID $prov_pid" >&2
+          kill -TERM "$prov_pid" 2>/dev/null || true
+          sleep 2
+          if kill -0 "$prov_pid" 2>/dev/null; then
+            # Re-verify identity before the SIGKILL escalation: the pid must
+            # STILL be the recorded daemon — a pid that died and was reused
+            # within the SIGTERM window must not be SIGKILLed.
+            if verify_recorded_identity "$prov_pid" "$prov_start_time"; then
+              echo "daemon-control: sending SIGKILL to identity-verified PID $prov_pid" >&2
+              kill -KILL "$prov_pid" 2>/dev/null || true
+            else
+              echo "daemon-control: REFUSING SIGKILL — PID $prov_pid identity no longer matches the recorded daemon" >&2
+            fi
+          fi
+        else
+          echo "daemon-control: REFUSING — PID $prov_pid is NOT proven TT-owned (cwd/cmdline evidence check failed)" >&2
         fi
       else
-        echo "daemon-control: REFUSING — PID $prov_pid is NOT proven TT-owned (cwd/cmdline evidence check failed)" >&2
+        echo "daemon-control: REFUSING — PID $prov_pid identity check failed; no signal sent (stale/reused provenance pid)" >&2
       fi
     else
       # PID not alive but ports still in use — cannot safely stop
@@ -734,8 +832,13 @@ cmd_stop() {
   fi
 
   # ── Step 4: Clean up any remaining port listeners (MCP may survive
-  # the daemon PID death). We find processes listening on the TT ports
-  # and, after verifying they are TT-owned, kill them.
+  # the daemon PID death). E3.C.1 US-004: a lingering listener is killed
+  # ONLY when it IS the recorded daemon pid with a matching startTime
+  # identity AND it passes the full signal-target check (not an ancestor
+  # of daemon-control, pgid disjoint from daemon-control's own group).
+  # A listener whose identity cannot be confirmed — a decoy with matching
+  # cwd/cmdline, an unrecorded pid, or a mismatched startTime — is REFUSED,
+  # never killed on cwd/cmdline evidence alone.
   for port in $prov_ports; do
     if [ -n "$port" ] && is_port_listening "$port"; then
       local lingering_pid
@@ -743,9 +846,18 @@ cmd_stop() {
       if [ -z "$lingering_pid" ]; then
         lingering_pid=$(netstat -tlnp 2>/dev/null | grep ":$port " | awk '{print $NF}' | grep -oP '\d+' | head -1 || true)
       fi
-      if [ -n "$lingering_pid" ] && verify_process_tt_owned "$lingering_pid" "$prov_cwd"; then
-        echo "daemon-control: killing lingering TT-owned process on port $port (PID $lingering_pid)" >&2
-        kill -KILL "$lingering_pid" 2>/dev/null || true
+      if [ -n "$lingering_pid" ]; then
+        if [ "$lingering_pid" = "$prov_pid" ] && [ -n "$prov_start_time" ]; then
+          if verify_listener_target "$lingering_pid" "$prov_start_time" \
+              && verify_process_tt_owned "$lingering_pid" "$prov_cwd"; then
+            echo "daemon-control: killing identity-verified lingering TT process on port $port (PID $lingering_pid)" >&2
+            kill -KILL "$lingering_pid" 2>/dev/null || true
+          else
+            echo "daemon-control: REFUSING — lingering listener PID $lingering_pid on port $port is not identity-confirmed; not killed" >&2
+          fi
+        else
+          echo "daemon-control: REFUSING — lingering listener PID $lingering_pid on port $port is not the recorded daemon (or its identity is unrecorded); not killed" >&2
+        fi
       fi
     fi
   done
@@ -848,7 +960,7 @@ cmd_status() {
   fi
 
   # ── Read provenance fields ───────────────────────────────────────
-  local prov_pid prov_ports prov_started prov_stopped prov_cmdline prov_cwd
+  local prov_pid prov_ports prov_started prov_stopped prov_cmdline prov_cwd prov_start_time
   if command -v jq >/dev/null 2>&1; then
     prov_pid=$(jq -r '.pid // 0' "$prov_file" 2>/dev/null || echo "0")
     prov_ports=$(jq -r '.ports | join(" ")' "$prov_file" 2>/dev/null || true)
@@ -856,6 +968,7 @@ cmd_status() {
     prov_stopped=$(jq -r '.stoppedAt // ""' "$prov_file" 2>/dev/null || true)
     prov_cmdline=$(jq -r '.cmdline // ""' "$prov_file" 2>/dev/null || true)
     prov_cwd=$(jq -r '.cwd // ""' "$prov_file" 2>/dev/null || true)
+    prov_start_time=$(jq -r '.startTime // ""' "$prov_file" 2>/dev/null || true)
   else
     prov_pid=$(grep -o '"pid": *[0-9]*' "$prov_file" 2>/dev/null | sed 's/.*: *//' || echo "0")
     prov_ports=$(grep -o '"ports": *\[[^]]*\]' "$prov_file" 2>/dev/null | sed 's/.*\[//;s/\]//;s/"//g;s/,/ /g' || true)
@@ -863,6 +976,7 @@ cmd_status() {
     prov_stopped=$(grep -o '"stoppedAt": *"[^"]*"' "$prov_file" 2>/dev/null | sed 's/.*"\([^"]*\)".*/\1/' || true)
     prov_cmdline=$(grep -o '"cmdline": *"[^"]*"' "$prov_file" 2>/dev/null | sed 's/.*"\([^"]*\)".*/\1/' || true)
     prov_cwd=$(grep -o '"cwd": *"[^"]*"' "$prov_file" 2>/dev/null | sed 's/.*"\([^"]*\)".*/\1/' || true)
+    prov_start_time=$(grep -o '"startTime": *"[^"]*"' "$prov_file" 2>/dev/null | sed 's/.*"\([^"]*\)".*/\1/' || true)
   fi
 
   # ── Production guard ────────────────────────────────────────────
@@ -910,6 +1024,7 @@ cmd_status() {
     echo "  pid: $prov_pid"
     echo "  ports: $prov_ports"
     echo "  startedAt: $prov_started"
+    echo "  startTime: $prov_start_time"
     echo "  cmdline: tamandua ✓"
     for port in $prov_ports; do
       if [ -n "$port" ] && is_port_listening "$port"; then

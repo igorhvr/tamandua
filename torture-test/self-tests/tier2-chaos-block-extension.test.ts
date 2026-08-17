@@ -18,7 +18,10 @@
 //     well as a delete-tstx-row block on a local-command case;
 //   * buildChaosArgv emits tt-chaos <type> --run <id> --when <marker> with
 //     --signal for kill actions and --hold-seconds only for sigstop_sigcont,
-//     and the chaos evidence records the declared signal/tree;
+//     plus (E3.C.1 US-003) the EXPLICIT recorded harness target
+//     (--target-pid/--target-pgid/--target-start-time) so tt-chaos never
+//     re-resolves the harness by /proc sweep, and the chaos evidence records
+//     the declared signal/tree;
 //   * TT_DRY_RUN_REAL_LAUNCH PASSes on a kill-chaos case (zero tokens).
 //
 // Confined to torture-test/ (writes only under gitignored var/). Zero tokens.
@@ -338,11 +341,33 @@ exit 0
     assert.equal(killEvidence.target, "harness_process");
     assert.equal(killEvidence.declared_signal, "SIGTERM", "evidence must record the declared signal");
     assert.equal(killEvidence.hold_seconds, null, "kill actions must not carry hold_seconds in evidence");
-    // AC2: tt-chaos kill-harness --run <id> --when <marker> --signal <SIG>.
+    // E3.C.1 US-003: the controller records the harness identity at launch
+    // (launch-process record in the stub campaign) and hands it to tt-chaos
+    // as EXPLICIT --target-* args — the operator must never re-resolve the
+    // harness by /proc sweep. Assert the recorded target is present and the
+    // argv carries exactly its pid/pgid/startTime (startTime 'proc:'-stripped
+    // like buildChaosArgv does).
+    const killTarget = killEvidence.target_record;
+    assert.ok(killTarget !== null && Number.isInteger(killTarget.pid) && killTarget.pid > 0,
+      `kill evidence must record the explicit harness target (got ${JSON.stringify(killEvidence.target_record)})`);
+    const killTargetTail = ["--target-pid", String(killTarget.pid)];
+    if (Number.isInteger(killTarget.pgid) && killTarget.pgid > 0) {
+      killTargetTail.push("--target-pgid", String(killTarget.pgid));
+    }
+    if (typeof killTarget.startTime === "string" && killTarget.startTime !== "") {
+      const raw = killTarget.startTime.startsWith("proc:")
+        ? killTarget.startTime.slice("proc:".length)
+        : killTarget.startTime;
+      killTargetTail.push("--target-start-time", raw);
+    }
+    // AC2: tt-chaos kill-harness --run <id> --when <marker> --signal <SIG>,
+    // followed by the explicit recorded --target-pid/--target-pgid/
+    // --target-start-time identity (E3.C.1 US-003 — never a scan-resolved
+    // target).
     assert.deepEqual(
       killEvidence.argv,
-      [chaosStub, "kill-harness", "--run", "run-11111111-1111-4111-8111-111111111111", "--when", "step:developer:running", "--signal", "SIGTERM"],
-      `kill-harness argv must be tt-chaos kill-harness --run <id> --when <marker> --signal <SIG> (got ${JSON.stringify(killEvidence.argv)})`,
+      [chaosStub, "kill-harness", "--run", "run-11111111-1111-4111-8111-111111111111", "--when", "step:developer:running", "--signal", "SIGTERM", ...killTargetTail],
+      `kill-harness argv must be tt-chaos kill-harness --run <id> --when <marker> --signal <SIG> --target-* <recorded identity> (got ${JSON.stringify(killEvidence.argv)})`,
     );
 
     const deleteEvidence = deleteCase.attempts?.[0]?.chaos_evidence;
@@ -350,12 +375,28 @@ exit 0
     assert.equal(deleteEvidence.injection_type, "delete-tstx-row");
     assert.equal(deleteEvidence.target, "tstx_row");
     assert.equal(deleteEvidence.tree, "abc123def456", "evidence must record the declared tree");
+    // E3.C.1 US-003: delete-tstx-row also carries the explicit recorded
+    // --target-* identity (buildChaosArgv appends it for every type — the
+    // operator never scan-resolves).
+    const deleteTarget = deleteEvidence.target_record;
+    assert.ok(deleteTarget !== null && Number.isInteger(deleteTarget.pid) && deleteTarget.pid > 0,
+      `delete evidence must record the explicit harness target (got ${JSON.stringify(deleteEvidence.target_record)})`);
+    const deleteTargetTail = ["--target-pid", String(deleteTarget.pid)];
+    if (Number.isInteger(deleteTarget.pgid) && deleteTarget.pgid > 0) {
+      deleteTargetTail.push("--target-pgid", String(deleteTarget.pgid));
+    }
+    if (typeof deleteTarget.startTime === "string" && deleteTarget.startTime !== "") {
+      const raw = deleteTarget.startTime.startsWith("proc:")
+        ? deleteTarget.startTime.slice("proc:".length)
+        : deleteTarget.startTime;
+      deleteTargetTail.push("--target-start-time", raw);
+    }
     // AC2: tt-chaos delete-tstx-row --run <id> --when <marker> --tree <hash>
-    // (no --hold-seconds, no --signal).
+    // (no --hold-seconds, no --signal), plus the explicit --target-* identity.
     assert.deepEqual(
       deleteEvidence.argv,
-      [chaosStub, "delete-tstx-row", "--run", "run-11111111-1111-4111-8111-111111111111", "--when", "event:merge.parked", "--tree", "abc123def456"],
-      `delete-tstx-row argv must carry --tree and nothing else per-type (got ${JSON.stringify(deleteEvidence.argv)})`,
+      [chaosStub, "delete-tstx-row", "--run", "run-11111111-1111-4111-8111-111111111111", "--when", "event:merge.parked", "--tree", "abc123def456", ...deleteTargetTail],
+      `delete-tstx-row argv must carry --tree plus the explicit --target-* identity per-type (got ${JSON.stringify(deleteEvidence.argv)})`,
     );
 
     fs.rmSync(path.join(varRoot, "results", campaignId!), { recursive: true, force: true });

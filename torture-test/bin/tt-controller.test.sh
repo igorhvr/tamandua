@@ -25,6 +25,9 @@ O9_CONTROL_PID=""
 O9_EVENTS_PATH=""
 O9_EVENTS_BACKUP=""
 O9_GOLDEN_BARE=""
+FAKE_HARNESS_PID=""
+DECOY_PID=""
+CHAOS_TARGETS_FILE=""
 DAEMON_CONTROL_ORIGINAL_HASH="$(sha256sum "$TT_DIR/bin/daemon-control" | cut -d' ' -f1)"
 SMOKE_GOLDENS=()
 ORACLE_TEST_FILES=()
@@ -56,6 +59,19 @@ cleanup() {
   if [ -n "$O9_CONTROL_PID" ]; then
     kill -9 "$O9_CONTROL_PID" 2>/dev/null || true
     wait "$O9_CONTROL_PID" 2>/dev/null || true
+  fi
+  # E3.C.1 US-003: never leak the chaos decoy / recorded fake-harness
+  # processes across tests (they are own-group sleepers under var/).
+  if [ -n "$DECOY_PID" ]; then
+    kill -9 "$DECOY_PID" 2>/dev/null || true
+    wait "$DECOY_PID" 2>/dev/null || true
+  fi
+  if [ -n "$FAKE_HARNESS_PID" ]; then
+    kill -9 "$FAKE_HARNESS_PID" 2>/dev/null || true
+    wait "$FAKE_HARNESS_PID" 2>/dev/null || true
+  fi
+  if [ -n "$CHAOS_TARGETS_FILE" ]; then
+    rm -f -- "$CHAOS_TARGETS_FILE"
   fi
   if [ -n "$O9_EVENTS_PATH" ]; then
     rm -f -- "$O9_EVENTS_PATH"
@@ -873,6 +889,7 @@ CREATE TABLE steps (
   type TEXT NOT NULL DEFAULT 'single', current_story_id TEXT,
   retry_count INTEGER NOT NULL DEFAULT 0, abandoned_count INTEGER NOT NULL DEFAULT 0,
   reroute_count INTEGER NOT NULL DEFAULT 0, claim_pid INTEGER,
+  claim_pgid INTEGER,
   claim_updated_at TEXT, updated_at TEXT NOT NULL
 );`);
 database.close();
@@ -1711,6 +1728,15 @@ if (restart.op !== 'restart_daemon' || restart.kind !== 'real' || restart.exit_c
     || !Array.isArray(restart.recovery) || restart.recovery.length !== 3) {
   throw new Error(`daemon restart evidence is wrong: ${JSON.stringify(restart)}`);
 }
+// E3.C.1 US-003: the restart teardown must go through RECORDED provenance —
+// the controller records the daemon provenance (kind + pidfile pid +
+// startTime identity) in the restart evidence and never resolves the daemon
+// by /proc/port sweep (daemon-control applies its own provenance + identity
+// checks per US-004).
+if (restart.provenance?.kind !== 'real'
+    || !['unavailable', 'pidfile', 'pidfile+identity'].includes(restart.provenance.source)) {
+  throw new Error(`daemon restart must record daemon provenance: ${JSON.stringify(restart.provenance)}`);
+}
 const stubCalls = fs.readFileSync(eventsPath, 'utf8').trim().split('\n')
   .map((line) => JSON.parse(line));
 if (stubCalls.some((entry) => entry.argv[0] === 'workflow' && entry.argv[1] === 'restart')
@@ -1769,21 +1795,25 @@ NODE
 # record mode, appends the three sigstop_sigcont chaos.log entries a real
 # operator would write (start/hold/cont) — the chaos_log the oracle snapshot
 # copies for O4. The stub NEVER actually signals anything (no real harness);
-# it only proves the controller's invocation contract.
+# it only proves the controller's invocation contract. The entries carry the
+# EXPLICIT --target-pid the controller passed (E3.C.1 US-003: fired chaos.log
+# entries must reference recorded pid: targets, never scan-resolved ones).
 cat > "$TEST_ROOT/tt-chaos-stub" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$(node -e 'process.stdout.write(JSON.stringify({argv:process.argv.slice(1),at:Date.now()}))' "$@")" >> "$CONTROLLER_CHAOS_EVENTS"
 CHAOS_RUN=""
+CHAOS_TARGET_PID=""
 prev=""
 for arg in "$@"; do
   if [ "$prev" = "--run" ]; then CHAOS_RUN="$arg"; fi
+  if [ "$prev" = "--target-pid" ]; then CHAOS_TARGET_PID="$arg"; fi
   prev="$arg"
 done
 if [ "${CONTROLLER_CHAOS_MODE:-record}" = "record" ]; then
-  printf '%s\n' "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\",\"action\":\"sigstop_sigcont\",\"entry\":\"start\",\"runId\":\"$CHAOS_RUN\",\"pid\":12345}" >> "$CHAOS_LOG_FILE"
-  printf '%s\n' "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\",\"action\":\"sigstop_sigcont\",\"entry\":\"hold_complete\",\"runId\":\"$CHAOS_RUN\",\"pid\":12345}" >> "$CHAOS_LOG_FILE"
-  printf '%s\n' "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\",\"action\":\"sigstop_sigcont\",\"entry\":\"cont\",\"runId\":\"$CHAOS_RUN\",\"pid\":12345}" >> "$CHAOS_LOG_FILE"
+  printf '%s\n' "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\",\"action\":\"sigstop_sigcont\",\"entry\":\"start\",\"runId\":\"$CHAOS_RUN\",\"pid\":$CHAOS_TARGET_PID}" >> "$CHAOS_LOG_FILE"
+  printf '%s\n' "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\",\"action\":\"sigstop_sigcont\",\"entry\":\"hold_complete\",\"runId\":\"$CHAOS_RUN\",\"pid\":$CHAOS_TARGET_PID}" >> "$CHAOS_LOG_FILE"
+  printf '%s\n' "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\",\"action\":\"sigstop_sigcont\",\"entry\":\"cont\",\"runId\":\"$CHAOS_RUN\",\"pid\":$CHAOS_TARGET_PID}" >> "$CHAOS_LOG_FILE"
 fi
 exit 0
 SH
@@ -1796,6 +1826,72 @@ printf 'chaos operator refused\n' >&2
 exit 3
 SH
 chmod +x "$TEST_ROOT/tt-chaos-fail-stub"
+
+# E3.C.1 US-003: harness-target-record fixtures. The controller must hand
+# tt-chaos EXPLICIT --target-* args from a RECORDED harness identity (the
+# steps-table claim row — { pid: claim_pgid, pgid: claim_pgid } — or the
+# launch-process record) and never let the operator re-resolve by /proc sweep.
+# To prove it:
+#   * a fake-harness process (setsid own-group leader under var/) becomes the
+#     steps-table claim_pgid — the RECORDED target the chaos argv must name;
+#   * a decoy process matching the OLD /proc scan signature (cwd under TT_ROOT
+#     + runId in argv[0]) must SURVIVE the run — an explicit-target operator
+#     never touches it.
+# Both spawn under setsid so their pgid is disjoint from the suite's ancestry.
+CHAOS_SHORT_RUN_ID="${CHAOS_RUN_ID#run-}"
+CHAOS_TARGETS_FILE="$TT_DIR/var/targets/$CHAOS_RUN_ID.json"
+
+spawn_chaos_fake_harness() {
+  ( cd "$TT_DIR" && exec setsid bash -c 'exec -a tt-fake-harness sleep 300' _ ) &
+  FAKE_HARNESS_PID=$!
+}
+
+spawn_chaos_decoy() {
+  ( cd "$TT_DIR" && exec setsid bash -c 'exec -a "$1" sleep 300' _ "$CHAOS_RUN_ID" ) &
+  DECOY_PID=$!
+}
+
+seed_chaos_claim() {
+  node --input-type=module - "$PROBE_DB" "$CHAOS_SHORT_RUN_ID" "$FAKE_HARNESS_PID" <<'NODE'
+import { DatabaseSync } from 'node:sqlite';
+const [dbPath, runShort, pgid] = process.argv.slice(2);
+const db = new DatabaseSync(dbPath);
+const now = new Date().toISOString();
+db.prepare(`INSERT INTO steps
+  (id, run_id, step_id, agent_id, step_index, status, type, current_story_id,
+   retry_count, abandoned_count, reroute_count, claim_pid, claim_pgid, claim_updated_at, updated_at)
+  VALUES ('chaos-claim-row', ?, 'step-developer', 'developer', 1, 'running', 'single', NULL, 0, 0, 0, ?, ?, ?, ?)`)
+  .run(runShort, pgid, pgid, now, now);
+db.close();
+NODE
+}
+
+remove_chaos_claim() {
+  node --input-type=module - "$PROBE_DB" <<'NODE'
+import { DatabaseSync } from 'node:sqlite';
+const db = new DatabaseSync(process.argv[2]);
+db.prepare(`DELETE FROM steps WHERE id = 'chaos-claim-row'`).run();
+db.close();
+NODE
+}
+
+clean_chaos_state() {
+  remove_chaos_claim
+  rm -f -- "$CHAOS_TARGETS_FILE"
+}
+
+reap_chaos_processes() {
+  if [ -n "$DECOY_PID" ]; then
+    kill -TERM "$DECOY_PID" 2>/dev/null || true
+    wait "$DECOY_PID" 2>/dev/null || true
+    DECOY_PID=""
+  fi
+  if [ -n "$FAKE_HARNESS_PID" ]; then
+    kill -TERM "$FAKE_HARNESS_PID" 2>/dev/null || true
+    wait "$FAKE_HARNESS_PID" 2>/dev/null || true
+    FAKE_HARNESS_PID=""
+  fi
+}
 
 # Fixture 1: a chaos-block case invokes tt-chaos exactly per the manifest
 # (operator tt-chaos, sigstop_sigcont, --run <run-id>, --when
@@ -1830,6 +1926,14 @@ chmod +x "$chaos_oracle_root/O4"
 chaos_manifest="$TEST_ROOT/manifests/chaos.jsonl"
 write_chaos_case "$chaos_manifest" "CHAOS-BLOCK" "$CHAOS_BLOCK" '["O4"]'
 chaos_events="$TEST_ROOT/chaos-events.jsonl"
+# E3.C.1 US-003: record a fake harness (the steps-table claim_pgid target)
+# and a scan-signature decoy, then seed the claim row — the controller must
+# resolve the harness from the RECORDED claim row and hand it to tt-chaos as
+# explicit --target-* args; the decoy must survive (never scan-resolved).
+spawn_chaos_fake_harness
+spawn_chaos_decoy
+sleep 0.2
+seed_chaos_claim
 chaos_output=$(PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$workflow_events" \
   CONTROLLER_WORKFLOW_MODE=stdout \
   CONTROLLER_CHAOS_EVENTS="$chaos_events" CONTROLLER_CHAOS_MODE=record \
@@ -1840,10 +1944,10 @@ chaos_output=$(PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$workf
   || fail "chaos-block campaign failed: $chaos_output"
 chaos_id=$(remember_campaign "$chaos_output")
 node --input-type=module - "$TT_DIR/var/results/$chaos_id/state.json" "$chaos_events" "$CHAOS_LOG_FILE" \
-  "$CHAOS_RUN_ID" "$TEST_ROOT/tt-chaos-stub" <<'NODE'
+  "$CHAOS_RUN_ID" "$TEST_ROOT/tt-chaos-stub" "$FAKE_HARNESS_PID" "$DECOY_PID" <<'NODE'
 import fs from 'node:fs';
 import path from 'node:path';
-const [statePath, eventsPath, chaosLogPath, runId, chaosStubPath] = process.argv.slice(2);
+const [statePath, eventsPath, chaosLogPath, runId, chaosStubPath, fakeHarnessPid, decoyPid] = process.argv.slice(2);
 const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
 const item = state.cases[0];
 const attempt = item.attempts[0];
@@ -1857,10 +1961,33 @@ if (!evidence || evidence.status !== 'completed' || evidence.operator !== 'tt-ch
     || evidence.trigger !== 'mid_round' || evidence.trigger_marker !== 'step:developer:running'
     || evidence.hold_seconds !== 600 || evidence.run_id !== runId
     || evidence.exit_code !== 0 || evidence.signal !== null
-    || !utcRe.test(evidence.started_at) || !utcRe.test(evidence.ended_at)
-    || JSON.stringify(evidence.argv) !== JSON.stringify(
-      [chaosStubPath, 'sigstop_sigcont', '--run', runId, '--when', 'step:developer:running', '--hold-seconds', '600'])) {
+    || !utcRe.test(evidence.started_at) || !utcRe.test(evidence.ended_at)) {
   throw new Error(`chaos evidence is wrong: ${JSON.stringify(evidence)}`);
+}
+// E3.C.1 US-003: the invocation argv MUST carry explicit --target-* args
+// naming the RECORDED harness (claim_pgid == fake-harness pid, its own group
+// leader), with the recorded startTime — never a scan-resolved target.
+const argv = evidence.argv;
+const targetIdx = argv.indexOf('--target-pid');
+const pgidIdx = argv.indexOf('--target-pgid');
+const startIdx = argv.indexOf('--target-start-time');
+if (argv[0] !== chaosStubPath || argv[1] !== 'sigstop_sigcont'
+    || argv[2] !== '--run' || argv[3] !== runId
+    || argv[4] !== '--when' || argv[5] !== 'step:developer:running'
+    || argv[6] !== '--hold-seconds' || argv[7] !== '600'
+    || targetIdx < 0 || argv[targetIdx + 1] !== String(fakeHarnessPid)
+    || pgidIdx < 0 || argv[pgidIdx + 1] !== String(fakeHarnessPid)
+    || startIdx < 0 || !/^\d+$/.test(argv[startIdx + 1])) {
+  throw new Error(`chaos argv must carry explicit --target-* args naming the recorded harness: ${JSON.stringify(argv)}`);
+}
+// The recorded target must be the steps-table claim row (source steps-table),
+// pid == fake-harness pid, with a live-process startTime identity.
+if (evidence.target_record?.source !== 'steps-table'
+    || evidence.target_record?.pid !== Number(fakeHarnessPid)
+    || evidence.target_record?.pgid !== Number(fakeHarnessPid)
+    || typeof evidence.target_record?.startTime !== 'string'
+    || !evidence.target_record.startTime.startsWith('proc:')) {
+  throw new Error(`chaos evidence target_record must be the recorded steps-table harness: ${JSON.stringify(evidence.target_record)}`);
 }
 // chaos.log must be captured into the oracle snapshot under the chaos_log key
 // (the O4 stub above would have exited 8 otherwise — the gating context
@@ -1874,20 +2001,32 @@ const entries = [...copied.matchAll(/"action":"sigstop_sigcont","entry":"(start|
 if (JSON.stringify(entries) !== JSON.stringify(['start', 'hold_complete', 'cont'])) {
   throw new Error(`snapshot chaos_log copy is missing the stub operator's entries: ${JSON.stringify(entries)}`);
 }
+// The fired chaos.log entries must reference the RECORDED pid: target (the
+// fake harness), never the scan-signature decoy.
+if (!copied.includes(`"pid":${fakeHarnessPid}`) || copied.includes(`"pid":${decoyPid}`)) {
+  throw new Error(`chaos.log fired entries must reference the recorded pid target, never a scan-resolved decoy: ${copied}`);
+}
 if (item.oracle_results?.[0]?.oracle_id !== 'O4' || item.oracle_results?.[0]?.status !== 'VALID'
     || item.oracle_results?.[0]?.response?.result !== 'PASS') {
   throw new Error(`O4 oracle did not VALID/PASS with chaos_log evidence: ${JSON.stringify(item.oracle_results)}`);
 }
-// The stub recorded EXACTLY one tt-chaos invocation with the manifest-derived argv.
+// The stub recorded EXACTLY one tt-chaos invocation with the explicit-target argv.
 const stubCalls = fs.readFileSync(eventsPath, 'utf8').trim().split('\n')
   .map((line) => JSON.parse(line));
 if (stubCalls.length !== 1
-    || JSON.stringify(stubCalls[0].argv) !== JSON.stringify(
-      ['sigstop_sigcont', '--run', runId, '--when', 'step:developer:running', '--hold-seconds', '600'])) {
-  throw new Error(`tt-chaos stub must record exactly one manifest-derived invocation: ${JSON.stringify(stubCalls)}`);
+    || stubCalls[0].argv[0] !== 'sigstop_sigcont' || stubCalls[0].argv[2] !== runId
+    || !stubCalls[0].argv.includes('--target-pid')) {
+  throw new Error(`tt-chaos stub must record exactly one explicit-target invocation: ${JSON.stringify(stubCalls)}`);
 }
 NODE
-pass "a chaos-block case invokes tt-chaos per the manifest and captures chaos.log into the oracle snapshot (O4 PASS)"
+# The decoy matching the OLD /proc scan signature must survive the run; the
+# recorded fake harness (the explicit target) must too (the stub signals
+# nothing — only the argv contract is under test).
+kill -0 "$DECOY_PID" 2>/dev/null || fail "scan-signature decoy died during the chaos run (it must never be targeted)"
+kill -0 "$FAKE_HARNESS_PID" 2>/dev/null || fail "recorded fake harness died during the chaos run"
+reap_chaos_processes
+clean_chaos_state
+pass "a chaos-block case invokes tt-chaos with explicit --target-* recorded harness args and captures chaos.log (O4 PASS); scan-signature decoy survives"
 
 # Fixture 2: a chaos invocation failure (stub exits 3) classifies
 # TEST_INFRA_FAIL with the DISTINCT category 'chaos-invocation-failed'
@@ -1920,15 +2059,27 @@ if (attempt.chaos_evidence?.status !== 'failed'
     || attempt.chaos_evidence?.failure?.exit_code !== 3) {
   throw new Error(`chaos evidence did not record the failure: ${JSON.stringify(attempt.chaos_evidence)}`);
 }
+// E3.C.1 US-003: even with no steps-table claim row the invocation must
+// carry EXPLICIT --target-* args from the recorded launch-process fallback —
+// the operator is never left to re-resolve by /proc sweep.
+const failArgv = attempt.chaos_evidence?.argv ?? attempt.classification_reason?.argv ?? [];
+const targetIdx = failArgv.indexOf('--target-pid');
+const startIdx = failArgv.indexOf('--target-start-time');
+if (failArgv[0]?.endsWith('/tt-chaos-fail-stub') !== true
+    || failArgv[1] !== 'sigstop_sigcont' || failArgv[3] !== runId
+    || targetIdx < 0 || !/^\d+$/.test(String(failArgv[targetIdx + 1]))
+    || startIdx < 0 || !/^\d+$/.test(String(failArgv[startIdx + 1]))) {
+  throw new Error(`failed chaos invocation must still carry explicit --target-* args (no scan): ${JSON.stringify(failArgv)}`);
+}
 const stubCalls = fs.readFileSync(eventsPath, 'utf8').trim().split('\n')
   .map((line) => JSON.parse(line));
 if (stubCalls.length !== 1
-    || JSON.stringify(stubCalls[0].argv) !== JSON.stringify(
-      ['sigstop_sigcont', '--run', runId, '--when', 'step:developer:running', '--hold-seconds', '600'])) {
-  throw new Error(`failed tt-chaos invocation must still record the manifest-derived argv once: ${JSON.stringify(stubCalls)}`);
+    || stubCalls[0].argv[0] !== 'sigstop_sigcont' || stubCalls[0].argv[2] !== runId
+    || !stubCalls[0].argv.includes('--target-pid')) {
+  throw new Error(`failed tt-chaos invocation must still record the explicit-target argv once: ${JSON.stringify(stubCalls)}`);
 }
 NODE
-pass "a chaos invocation failure classifies TEST_INFRA_FAIL chaos-invocation-failed with a distinct reason"
+pass "a chaos invocation failure classifies TEST_INFRA_FAIL chaos-invocation-failed with a distinct reason (argv still explicit-target)"
 
 # Fixture 3: a chaos:null case (W3.17a) NEVER spawns tt-chaos — the stub
 # would record an invocation (and exit 9, failing the case) if the controller

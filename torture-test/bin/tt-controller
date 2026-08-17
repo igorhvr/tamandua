@@ -37,6 +37,12 @@ const SCHEMA_PATH = path.join(TT_ROOT, 'cases', 'case.schema.json');
 const VAR_ROOT = path.join(TT_ROOT, 'var');
 const RESULTS_ROOT = path.join(VAR_ROOT, 'results');
 const HOST_PROFILE_PATH = path.join(VAR_ROOT, 'w0', 'host-profile.json');
+// E3.C.1 US-003: per-run harness target records (var/targets/<runId>.json).
+// The controller records the launched run process identity at spawn AND the
+// steps-table claim row (the real harness group) once the run's steps are
+// claimed, then hands tt-chaos invocations the explicit --target-* args —
+// never a /proc cwd/cmdline sweep (the E3.C.1 root-cause class).
+const TARGETS_DIR = path.join(VAR_ROOT, 'targets');
 const REAL_ENV_PATH = path.join(TT_ROOT, 'env', 'tt-env.sh');
 const SCRIPTED_ENV_PATH = path.join(TT_ROOT, 'env', 'tt-env-scripted.sh');
 const DAEMON_CONTROL_PATH = process.env.TT_CONTROLLER_DAEMON_CONTROL_PATH === undefined
@@ -1191,6 +1197,36 @@ function processMatchesIdentity(pid, identity) {
   return typeof identity === 'string' && processIsAlive(pid) && processIdentity(pid) === identity;
 }
 
+// E3.C.1 US-003: procfs process-group + start-identity readers used for the
+// launch/harness target records. Mirrors bin/tt-process-identity.mjs
+// semantics: starttime = /proc/<pid>/stat field 22 as 'proc:<n>', pgrp =
+// field 5 (sliced at the LAST ')' because comm may contain spaces/parens).
+function processStartTimeOf(pid) {
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const closingParenthesis = stat.lastIndexOf(')');
+    if (closingParenthesis < 0) return null;
+    const fields = stat.slice(closingParenthesis + 2).trim().split(/\s+/);
+    if (fields[19] === undefined || !/^\d+$/.test(fields[19])) return null;
+    return `proc:${fields[19]}`;
+  } catch {
+    return null;
+  }
+}
+
+function processGroupOf(pid) {
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const closingParenthesis = stat.lastIndexOf(')');
+    if (closingParenthesis < 0) return null;
+    const fields = stat.slice(closingParenthesis + 2).trim().split(/\s+/);
+    const pgid = Number(fields[2]);
+    return Number.isInteger(pgid) && pgid > 0 ? pgid : null;
+  } catch {
+    return null;
+  }
+}
+
 function acquireCampaignLock(campaignDir) {
   const lockPath = path.join(campaignDir, '.controller.lock');
   for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -1486,6 +1522,14 @@ function runHook(hookName, hook, childEnv, campaignDir, state, attempt, {
       child.stdout.on('data', (chunk) => capture('stdout', stdoutDescriptor, chunk));
       child.stderr.on('data', (chunk) => capture('stderr', stderrDescriptor, chunk));
       hookState.pid = child.pid ?? null;
+      if (hookState.pid !== null) {
+        // E3.C.1 US-003: record the launched process's group + start identity
+        // at spawn so the harness target record (var/targets/<runId>.json) can
+        // be persisted and handed to tt-chaos as explicit --target-* args —
+        // the operator must never re-resolve the harness by /proc sweep.
+        hookState.pgid = processGroupOf(hookState.pid);
+        hookState.start_time = processStartTimeOf(hookState.pid);
+      }
       state.updated_at = utcTimestamp();
       atomicWriteState(campaignDir, state);
       if (enforceWall || timeoutMs !== undefined) {
@@ -4701,7 +4745,11 @@ async function runDeclaredProbeSequence(caseRecord, attempt, childEnv, state, ca
 // --when <translated trigger>, plus the per-type params — --hold-seconds for
 // sigstop_sigcont, --signal for kill actions (default SIGKILL), --tree for
 // delete-tstx-row. An action that does not take a param never receives it.
-function buildChaosArgv(block, runId) {
+// And — E3.C.1 US-003 — the EXPLICIT recorded harness target
+// (--target-pid/--target-pgid/--target-start-time) so tt-chaos never
+// re-resolves the harness by /proc sweep. A null targetRecord means the
+// caller must fail closed (chaos-invocation-failed) before invoking.
+function buildChaosArgv(block, runId, targetRecord) {
   const argv = [
     TT_CHAOS_PATH,
     block.type,
@@ -4715,7 +4763,170 @@ function buildChaosArgv(block, runId) {
   } else if (block.type === 'delete-tstx-row') {
     argv.push('--tree', block.tree);
   }
+  if (targetRecord !== null && targetRecord !== undefined) {
+    argv.push('--target-pid', String(targetRecord.pid));
+    if (Number.isInteger(targetRecord.pgid) && targetRecord.pgid > 0) {
+      argv.push('--target-pgid', String(targetRecord.pgid));
+    }
+    if (typeof targetRecord.startTime === 'string' && targetRecord.startTime !== '') {
+      const raw = targetRecord.startTime.startsWith('proc:')
+        ? targetRecord.startTime.slice('proc:'.length)
+        : targetRecord.startTime;
+      argv.push('--target-start-time', raw);
+    }
+  }
   return argv;
+}
+
+// ── E3.C.1 US-003: harness target record registry ──────────────────
+// The controller records the harness process identity at launch and persists
+// it keyed by run id (var/targets/<runId>.json) so the chaos operator is
+// handed EXPLICIT --target-* args and never re-resolves by /proc sweep.
+// Resolution priority:
+//   1. the persisted record (already resolved);
+//   2. the contained DB steps table claim row for the run — the product's own
+//      explicit harness record ({ pid: claim_pgid, pgid: claim_pgid }: the
+//      detached harness is its own group leader; NEVER claim_pid, which is
+//      the owning daemon — mirroring tt-chaos's resolveFromStepsTable);
+//   3. the launch hook's recorded child identity ({ pid, pgid, start_time }).
+// The record is persisted as soon as a source resolves it.
+
+function targetsPathForRun(runId) {
+  return path.join(TARGETS_DIR, `${runId}.json`);
+}
+
+function readHarnessTargetRecord(runId) {
+  try {
+    const raw = JSON.parse(fs.readFileSync(targetsPathForRun(runId), 'utf8'));
+    if (!isObject(raw) || !Number.isInteger(raw.pid) || raw.pid <= 0) return null;
+    return raw;
+  } catch {
+    return null;
+  }
+}
+
+function writeHarnessTargetRecord(runId, record) {
+  fs.mkdirSync(TARGETS_DIR, { recursive: true, mode: 0o700 });
+  const targetPath = targetsPathForRun(runId);
+  const tempPath = `${targetPath}.${process.pid}.${randomUUID()}.tmp`;
+  let descriptor;
+  try {
+    descriptor = fs.openSync(tempPath, 'wx', 0o600);
+    fs.writeFileSync(descriptor, `${JSON.stringify({ ...record, runId, recorded_at: utcTimestamp() }, null, 2)}\n`, 'utf8');
+    fs.fsyncSync(descriptor);
+    fs.closeSync(descriptor);
+    descriptor = undefined;
+    fs.renameSync(tempPath, targetPath);
+  } catch (error) {
+    if (descriptor !== undefined) fs.closeSync(descriptor);
+    try {
+      fs.rmSync(tempPath, { force: true });
+    } catch {
+      // Preserve the original persistence failure.
+    }
+    throw new Error(`cannot persist harness target record for ${runId}: ${error.message}`);
+  }
+}
+
+// The contained DB steps table's claim row for the run — the product's own
+// explicit harness record. Both run-id spellings are matched; a claim_pid
+// without a harness group (claim_pgid) refuses (null) rather than targeting
+// the owning daemon.
+function stepsTableHarnessRecord(runId, childEnv) {
+  const databasePath = resolveChildDatabasePath(childEnv);
+  if (databasePath === null) return null;
+  let database;
+  try {
+    database = new DatabaseSync(databasePath, { readOnly: true });
+  } catch {
+    return null;
+  }
+  try {
+    const shortRunId = runId.startsWith('run-') ? runId.slice(4) : runId;
+    for (const rid of [runId, shortRunId]) {
+      try {
+        const row = database.prepare(
+          `SELECT claim_pid, claim_pgid FROM steps WHERE run_id = ? AND claim_pid IS NOT NULL AND claim_pid > 0 ORDER BY rowid DESC LIMIT 1`,
+        ).get(rid);
+        if (row !== undefined && row.claim_pid !== null && row.claim_pid !== undefined
+            && Number(row.claim_pid) > 0) {
+          if (row.claim_pgid === null || row.claim_pgid === undefined || Number(row.claim_pgid) <= 0) {
+            return null; // no recorded harness group — refuse rather than hit the daemon
+          }
+          const pgid = Number(row.claim_pgid);
+          return { pid: pgid, pgid, startTime: processStartTimeOf(pgid), source: 'steps-table' };
+        }
+      } catch {
+        // claim_pid column may not exist in this schema — try the next spelling.
+      }
+    }
+    return null;
+  } finally {
+    database?.close();
+  }
+}
+
+// The launch hook's recorded child identity (the process the controller
+// itself spawned for `tamandua workflow run`).
+function launchProcessHarnessRecord(attempt) {
+  const launch = attempt?.launch;
+  if (!isObject(launch) || !Number.isInteger(launch.pid) || launch.pid <= 0) return null;
+  return {
+    pid: launch.pid,
+    pgid: Number.isInteger(launch.pgid) && launch.pgid > 0 ? launch.pgid : null,
+    startTime: typeof launch.start_time === 'string' && launch.start_time !== ''
+      ? launch.start_time
+      : processStartTimeOf(launch.pid),
+    source: 'launch',
+  };
+}
+
+// Resolve the harness target record for a run: persisted file first, then the
+// steps-table claim row, then the launch-process identity. Persists whichever
+// source resolved it. Never resolves by /proc sweep.
+function resolveHarnessTargetRecord(runId, attempt, childEnv) {
+  const persisted = readHarnessTargetRecord(runId);
+  if (persisted !== null) return persisted;
+  const steps = stepsTableHarnessRecord(runId, childEnv);
+  if (steps !== null) {
+    writeHarnessTargetRecord(runId, steps);
+    return steps;
+  }
+  const launch = launchProcessHarnessRecord(attempt);
+  if (launch !== null) {
+    writeHarnessTargetRecord(runId, launch);
+    return launch;
+  }
+  return null;
+}
+
+// Wait for the harness target record before a chaos invocation. The harness
+// that owns the run at FIRE time is the process group of the step currently
+// claimed — NOT the first claim row (earlier setup/planner rounds claim and
+// may exit before the chaos trigger). So the wait (a) keeps refreshing the
+// recorded record to the LATEST steps-table claim row and (b) returns it once
+// the chaos trigger marker is satisfied (the same marker tt-chaos arms on), or
+// falls back to the persisted/launch record when the run reaches a terminal
+// status or the case deadline (the operator then fails closed — never a /proc
+// sweep). Mirrors waitForProbeTrigger's bounds.
+async function waitForHarnessTargetRecord(runId, attempt, childEnv, marker) {
+  const deadline = new Date(attempt.deadline_at).valueOf();
+  let latest = null;
+  while (Date.now() < deadline) {
+    const steps = stepsTableHarnessRecord(runId, childEnv);
+    if (steps !== null) {
+      latest = steps;
+      writeHarnessTargetRecord(runId, steps);
+    }
+    if (probeMarkerSatisfied(marker, runId, childEnv)) {
+      if (latest !== null) return latest;
+      break;
+    }
+    const status = probeRunStatusOrNull(runId, childEnv);
+    if (status !== null && TERMINAL_RUN_STATUSES.has(status.status)) break;
+    await delay(PROBE_POLL_INTERVAL_MS);
+  }
+  return resolveHarnessTargetRecord(runId, attempt, childEnv);
 }
 
 async function runDeclaredChaos(caseRecord, attempt, childEnv, state, campaignDir) {
@@ -4749,8 +4960,45 @@ async function runDeclaredChaos(caseRecord, attempt, childEnv, state, campaignDi
   state.updated_at = evidence.started_at;
   atomicWriteState(campaignDir, state);
 
+  // E3.C.1 US-003: resolve + persist the harness target record BEFORE
+  // invoking tt-chaos (steps-table claim row preferred, launch-process
+  // identity fallback) and hand it as explicit --target-* args — the
+  // operator must never re-resolve the harness by /proc sweep. The wait
+  // returns the record for the harness that owns the run at the chaos
+  // trigger's fire moment (the latest steps-table claim row); with no
+  // recorded target the invocation fails closed (chaos-invocation-failed)
+  // and tt-chaos is never spawned.
+  const targetRecord = await waitForHarnessTargetRecord(runId, attempt, childEnv, translateChaosTrigger(block.trigger));
+  evidence.target_record = targetRecord === null ? null : {
+    pid: targetRecord.pid,
+    pgid: Number.isInteger(targetRecord.pgid) && targetRecord.pgid > 0 ? targetRecord.pgid : null,
+    startTime: targetRecord.startTime ?? null,
+    source: targetRecord.source ?? null,
+  };
+  attempt.chaos_evidence = evidence;
+  state.updated_at = utcTimestamp();
+  atomicWriteState(campaignDir, state);
+  if (targetRecord === null) {
+    evidence.status = 'failed';
+    evidence.ended_at = utcTimestamp();
+    evidence.failure = {
+      category: 'chaos-invocation-failed',
+      message: `chaos operator '${block.operator}' has no recorded harness target for run ${runId} — refusing to invoke (never scan-resolve)`,
+      operator: block.operator,
+      exit_code: null,
+      signal: null,
+      error: 'no recorded harness target record',
+      timed_out: null,
+      argv: null,
+    };
+    attempt.chaos_evidence = evidence;
+    state.updated_at = evidence.ended_at;
+    atomicWriteState(campaignDir, state);
+    return { ok: false, reason: evidence.failure };
+  }
+
   assertContainedSpawnEnv(childEnv);
-  const argv = buildChaosArgv(block, runId);
+  const argv = buildChaosArgv(block, runId, targetRecord);
   evidence.argv = argv;
   // Bound the invocation by the case's remaining wall budget (phase wait +
   // hold are themselves bounded inside tt-chaos, but a wedged operator must
@@ -4939,10 +5187,11 @@ async function observeRestartRecovery(runId, runProxy, childEnv, restartEndedAt,
 // Execute the restart_daemon probe ONCE via bin/daemon-control under the
 // contained spawn env — the ONLY sanctioned daemon lifecycle path (never a
 // bare `tamandua restart`; daemon-control applies its own production +
-// containment guards). Returns the EXECUTION evidence (start/end timestamps,
-// argv, exit code/signal/error) with `ok`; the caller composes the full
-// restart action record (armed_at, run_ordinal, hold_seconds) around it so
-// those fields survive.
+// containment guards and, per E3.C.1 US-004, its own recorded-provenance +
+// identity checks before ANY signal). Returns the EXECUTION evidence
+// (start/end timestamps, argv, exit code/signal/error, recorded daemon
+// provenance) with `ok`; the caller composes the full restart action record
+// (armed_at, run_ordinal, hold_seconds) around it so those fields survive.
 function executeDaemonRestart(kind, childEnv) {
   assertContainedSpawnEnv(childEnv);
   const record = {
@@ -4952,6 +5201,12 @@ function executeDaemonRestart(kind, childEnv) {
     signal: null,
     error: null,
   };
+  // E3.C.1 US-003: record the daemon provenance (kind + pidfile pid +
+  // recorded startTime identity) so the restart teardown demonstrably goes
+  // through RECORDED provenance — the controller never resolves the daemon
+  // by /proc/port sweep. daemon-control applies its own provenance + identity
+  // checks (US-004) to the recorded pid before any signal.
+  record.provenance = readDaemonProvenance(kind, childEnv);
   const argv = [DAEMON_CONTROL_PATH, kind, 'restart'];
   record.argv = argv;
   const result = spawnSync(DAEMON_CONTROL_PATH, [kind, 'restart'], {
@@ -4967,6 +5222,38 @@ function executeDaemonRestart(kind, childEnv) {
   if (result.error !== undefined) record.error = result.error.message;
   const ok = result.error === undefined && result.status === 0;
   return { record, ok };
+}
+
+// Read the recorded daemon provenance (kind, pid, startTime) from the
+// contained daemon pidfile (<state-dir>/tamandua.pid — written by
+// daemon-control/tt-daemon-up at start). The pid's CURRENT /proc starttime is
+// recorded alongside so a stale/reused pid is visible to the evidence. Never
+// scans /proc or ports; an absent pidfile is recorded as unavailable (the
+// daemon may be managed by daemon-control's own provenance record).
+function readDaemonProvenance(kind, childEnv) {
+  const provenance = { kind, pid: null, startTime: null, source: 'unavailable' };
+  const stateDir = typeof childEnv.TAMANDUA_STATE_DIR === 'string' && childEnv.TAMANDUA_STATE_DIR !== ''
+    ? childEnv.TAMANDUA_STATE_DIR
+    : null;
+  const candidate = stateDir === null ? null : path.join(stateDir, 'tamandua.pid');
+  if (candidate === null || !pathIsWithin(fs.realpathSync(TT_ROOT), candidate)) return provenance;
+  let details;
+  try {
+    details = fs.lstatSync(candidate);
+  } catch (error) {
+    if (error.code === 'ENOENT') return provenance;
+    throw new Error(`cannot inspect TT daemon pidfile: ${error.message}`);
+  }
+  if (!details.isFile() || details.isSymbolicLink()
+      || !pathIsWithin(fs.realpathSync(TT_ROOT), fs.realpathSync(candidate))) {
+    throw new Error('TT daemon pidfile is not a contained regular file');
+  }
+  const pid = Number.parseInt(fs.readFileSync(candidate, 'utf8').trim(), 10);
+  if (!Number.isInteger(pid) || pid <= 0) return provenance;
+  provenance.pid = pid;
+  provenance.startTime = processStartTimeOf(pid);
+  provenance.source = provenance.startTime === null ? 'pidfile' : 'pidfile+identity';
+  return provenance;
 }
 
 // W3.20 shape: each run group launches, its actions fire against the contained

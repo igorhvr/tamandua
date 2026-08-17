@@ -3,8 +3,8 @@
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
+import { reapLivePgids, spawnDetachedGroupLeader } from './reap-live-pgids.mjs';
 
 const workspace = path.resolve(process.argv[2] ?? '');
 const varRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../..', 'var');
@@ -28,12 +28,15 @@ const REFERENCE_KEYS = [
 // Live process-group id for the "alive claim" fixture: spawn a detached sleep
 // whose PID is its own PGID (spawn detached makes the child a group leader).
 // The oracle probes it with kill(-pgid, 0) — the product's liveness probe.
+// Records carry { pid, pgid, startTime } (the detached child's process-start
+// identity, read immediately after spawn) so the reapers can verify identity
+// before SIGKILL — a stale/reused pgid record can never be signalled (the
+// US-010 / FIX9.1 stale-orphan class).
 const livePgids = [];
 function spawnLivePgid() {
-  const child = spawn('sleep', ['300'], { detached: true, stdio: 'ignore' });
-  child.unref();
-  livePgids.push(child.pid);
-  return child.pid;
+  const record = spawnDetachedGroupLeader('sleep', ['300']);
+  livePgids.push({ pid: record.pid, pgid: record.pgid, startTime: record.startTime });
+  return record.pid;
 }
 
 // SQLite-format timestamp helpers (offsets from START in seconds).
@@ -424,14 +427,16 @@ for (const fixture of CASES) {
 
 // Record the live pgids for the test to reap (the sleep processes outlive the
 // generator so the oracle can probe them; the test kills them in cleanup).
+// Each record carries { pid, pgid, startTime } — the reapers verify
+// process-start identity against the current /proc state before SIGKILL.
 const livePgidsPath = path.join(workspace, 'live-pgids.json');
 fs.writeFileSync(livePgidsPath, `${JSON.stringify(livePgids)}\n`, { flag: 'wx' });
 
 // If anything above failed mid-generation, the detached sleeps would leak
 // (reparented to init, invisible to the battery's descendant cleanup).
+// Reap them through the identity-verified reaper — a stale/reused pgid
+// record is never signalled.
 process.on('uncaughtException', (error) => {
-  for (const pgid of livePgids) {
-    try { process.kill(pgid, 'SIGKILL'); } catch { /* already gone */ }
-  }
+  reapLivePgids(livePgids);
   throw error;
 });

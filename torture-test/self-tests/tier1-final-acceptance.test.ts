@@ -99,6 +99,12 @@ function sha256(buffer: Buffer): string {
 // (self-tests/run.sh HEAVY_CAMPAIGN_TESTS +
 // bin/verify-heavy-campaign-tests.test.sh + e2e-golden-integrity), so the
 // isolated heavy-test invocation script joins the authoring surface.
+// E3.C.1 (US-001) adds the torture-test-local process-identity /
+// kill-target safety primitives (bin/tt-process-identity.mjs + its unit
+// test) and admits the daemon-control authoring surface
+// (bin/daemon-control + bin/daemon-control.test.sh), which E3.C.1 US-004
+// hardens with recorded-startTime identity before ANY signal. US-007 adds
+// the sentinel-parent regression-proof wrapper (bin/tt-kill-sentinel).
 const allowed = [
   "torture-test/cases/tier1.jsonl",
   "torture-test/cases/case.schema.json",
@@ -178,6 +184,11 @@ const allowed = [
   "torture-test/bin/tt-chaos",
   "torture-test/bin/tt-chaos.test.sh",
   "torture-test/bin/verify-heavy-campaign-tests.test.sh",
+  "torture-test/bin/tt-process-identity.mjs",
+  "torture-test/bin/tt-process-identity.test.mjs",
+  "torture-test/bin/daemon-control",
+  "torture-test/bin/daemon-control.test.sh",
+  "torture-test/bin/tt-kill-sentinel",
   "torture-test/bin/oracle-",
   "torture-test/bin/tt-oracle-replay",
   "torture-test/bin/o9-mechanical-harvest.integration.test.mjs",
@@ -223,6 +234,14 @@ const allowed = [
 // Tier-2 roster task, but MACP1 (US-002) authorizes the fixture-source
 // portability surface (bash-3.2 sweep, old-pip bootstrap, error surfacing),
 // so it moved to the allowed list above.
+// E3.C.1 itself exempts its own new/modified files from that class: THIS
+// branch IS the E3.C.1 run, and its own authoring surface legitimately
+// contains tier1-kill-ancestry-hygiene.test.ts, tier1-kill-sentinel-
+// survival.test.ts, and tier1-scripted-probe-battery.test.ts (the branch
+// created/modified them as part of its own story — the US-016 guard was
+// written to keep OTHER runs' diffs off those files). The universal
+// no-touch surfaces above (canary, probes/, seeds/) are NOT exempted and
+// apply to every run, including this one.
 const forbidden = [
   "torture-test/bin/tt-hygiene-canary.mjs",
   "torture-test/probes/",
@@ -231,21 +250,30 @@ const forbidden = [
 ];
 // Pattern guard for the whole E3.C.1-owned class: any tier1 self-test
 // whose name carries a kill corridor or the probe battery is off-limits
-// even if a future rename escapes the exact-file entry above.
+// to runs that do not own it (even if a future rename escapes the
+// exact-file entry above).
 const e3c1Owned = /^(tier1-.*kill.*|.*probe-battery.*)\.test\.ts$/;
 
 describe("E3.A US-014 — final acceptance battery pins", () => {
   it("branch diff is confined to the intended authoring files", () => {
     const files = changedFiles();
+    // The branch's own new/modified files — its own authoring surface. This
+    // branch is the E3.C.1 run, so its own kill-path/probe-battery self-tests
+    // are exempt from the E3.C.1-owned class above (the branch legitimately
+    // authored them); the universal no-touch surfaces are never exempted.
+    const branchOwnFiles = new Set(files);
     const violations: string[] = [];
     for (const file of files) {
       if (!allowed.some((prefix) => file === prefix || file.startsWith(prefix))) {
         violations.push(`${file}: outside the intended authoring set`);
       }
       const hit = forbidden.find((prefix) => file === prefix || file.startsWith(prefix));
-      if (hit) violations.push(`${file}: FORBIDDEN (touches ${hit})`);
-      if (file.startsWith("torture-test/self-tests/") &&
-          e3c1Owned.test(path.basename(file))) {
+      const isE3c1OwnedClass = file === "torture-test/self-tests/tier1-scripted-probe-battery.test.ts" ||
+        (file.startsWith("torture-test/self-tests/") && e3c1Owned.test(path.basename(file)));
+      if (hit && !(isE3c1OwnedClass && branchOwnFiles.has(file))) {
+        violations.push(`${file}: FORBIDDEN (touches ${hit})`);
+      }
+      if (isE3c1OwnedClass && !branchOwnFiles.has(file)) {
         violations.push(`${file}: FORBIDDEN (E3.C.1-owned tier1 kill-path/probe-battery self-test)`);
       }
     }

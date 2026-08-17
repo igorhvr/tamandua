@@ -3,8 +3,11 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { once } from 'node:events';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
+import { getProcessStartIdentity } from '../../bin/tt-process-identity.mjs';
+import { reapLivePgids, spawnDetachedGroupLeader } from './reap-live-pgids.mjs';
 
 const HERE = path.dirname(new URL(import.meta.url).pathname);
 const TT_ROOT = path.resolve(HERE, '../..');
@@ -74,12 +77,71 @@ test('O4 judges claim & dispatch hygiene: dead pgid, no-work dangling, retry/rer
     assert.ok(deadCheck !== undefined && deadCheck.pgid_alive === true, 'clean fixture must probe a live claim_pgid');
   } finally {
     // Reap the live pgids the generator spawned for the alive-claim fixture.
+    // The shared reaper is identity-verified (ABA startTime + group
+    // disjointness) — a stale/reused pgid record is skipped with a warning,
+    // never signalled.
     try {
-      const livePgids = JSON.parse(fs.readFileSync(livePgidsPath, 'utf8'));
-      for (const pgid of livePgids) {
-        try { process.kill(pgid, 'SIGKILL'); } catch { /* already gone */ }
+      const records = JSON.parse(fs.readFileSync(livePgidsPath, 'utf8'));
+      const { skipped } = reapLivePgids(records);
+      for (const skip of skipped) {
+        process.stderr.write(`o4.test: stale-skip live-pgid record pid ${skip.record.pid} pgid ${skip.record.pgid}: ${skip.reason}\n`);
       }
     } catch { /* no live pgids file — nothing to reap */ }
+    fs.rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test('O4 live-pgid reaping is identity-verified: stale/reused records are skipped, genuine pgids still reaped', async () => {
+  fs.mkdirSync(VAR_ROOT, { recursive: true });
+  const workspace = fs.mkdtempSync(path.join(VAR_ROOT, 'oracle-self-test.'));
+  const livePgidsPath = path.join(workspace, 'live-pgids.json');
+  const spawned = [];
+  try {
+    // A genuine recorded live sleep: the reaper must reap it via its verified
+    // process group.
+    const genuine = spawnDetachedGroupLeader('sleep', ['300']);
+    spawned.push(genuine);
+    // A live UNRELATED process recorded with a deliberately WRONG startTime —
+    // the ABA / pid-reuse case: a blind reaper (the pre-fix behavior) would
+    // SIGKILL it; the identity-verified reaper must skip it.
+    const decoy = spawnDetachedGroupLeader('sleep', ['300']);
+    spawned.push(decoy);
+    const records = [
+      { pid: genuine.pid, pgid: genuine.pgid, startTime: genuine.startTime },
+      { pid: decoy.pid, pgid: decoy.pgid, startTime: 'proc:1' },
+    ];
+    fs.writeFileSync(livePgidsPath, `${JSON.stringify(records)}\n`);
+    const { reaped, skipped } = reapLivePgids(records);
+    // The genuine record was reaped through its verified group...
+    const reapedGenuine = reaped.find((entry) => entry.record.pid === genuine.pid);
+    assert.ok(reapedGenuine !== undefined, `genuine record must be reaped: ${JSON.stringify(reaped)}`);
+    assert.equal(reapedGenuine.method, 'group', 'genuine record must be group-killed');
+    // ...and the stale decoy record was skipped (never signalled).
+    const skippedDecoy = skipped.find((entry) => entry.record.pid === decoy.pid);
+    assert.ok(skippedDecoy !== undefined, `stale decoy record must be skipped: ${JSON.stringify(skipped)}`);
+    assert.match(skippedDecoy.reason, /startTime mismatch|pid reuse|ABA/, `skip reason must be the identity mismatch: ${skippedDecoy.reason}`);
+    // The genuine sleep is gone (node reaps the SIGKILLed child -> exit event,
+    // after which the pid is absent from /proc)...
+    await Promise.race([
+      once(genuine.child, 'exit'),
+      new Promise((resolve) => setTimeout(resolve, 5000)),
+    ]);
+    assert.equal(getProcessStartIdentity(genuine.pid), null, 'genuine sleep must be dead after reaping');
+    // ...while the decoy (its record skipped as stale) is still alive.
+    assert.notEqual(getProcessStartIdentity(decoy.pid), null, 'stale decoy process must survive the reaper');
+    // The generator's live-pgids.json format carries the recorded identity.
+    const written = JSON.parse(fs.readFileSync(livePgidsPath, 'utf8'));
+    assert.equal(written.length, 2);
+    for (const record of written) {
+      assert.equal(typeof record.pid, 'number', 'live-pgids.json records must carry pid');
+      assert.equal(typeof record.pgid, 'number', 'live-pgids.json records must carry pgid');
+      assert.equal(typeof record.startTime, 'string', 'live-pgids.json records must carry startTime');
+    }
+  } finally {
+    // Reap every still-alive spawn through the verified reaper so no detached
+    // sleep leaks (the decoy was skipped above on purpose — its real identity
+    // still verifies, so cleanup reaps it).
+    reapLivePgids(spawned.map(({ pid, pgid, startTime }) => ({ pid, pgid, startTime })));
     fs.rmSync(workspace, { recursive: true, force: true });
   }
 });

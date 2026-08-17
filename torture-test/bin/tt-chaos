@@ -9,6 +9,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { execSync, spawnSync } from 'node:child_process';
+import { verifyRecordedTarget, getProcessGroup, ownProcessGroup } from './tt-process-identity.mjs';
 
 // ── Phase wait constants ─────────────────────────────────────────────
 
@@ -52,15 +53,15 @@ function isDestructive(action) {
 
 const ACTIONS = {
   'kill-harness': {
-    args: '[--signal <SIG>]',
-    desc: 'Send signal to the active harness process for --run',
+    args: '[--signal <SIG>] [--target-pid <pid>] [--target-pgid <pgid>] [--target-start-time <n>]',
+    desc: 'Send signal to the active harness process for --run (explicit recorded target)',
   },
   'kill-daemon': {
     args: '[--signal <SIG>]',
-    desc: 'Send signal to the TT daemon (never the production daemon)',
+    desc: 'Send signal to the TT daemon from its pidfile (never the production daemon)',
   },
   'sigstop_sigcont': {
-    args: '--hold-seconds <n>',
+    args: '--hold-seconds <n> [--target-pid <pid>] [--target-pgid <pgid>] [--target-start-time <n>]',
     desc: 'SIGSTOP the active harness process for --run, hold, then SIGCONT (3 chaos.log entries)',
   },
   'colleague-commit': {
@@ -125,6 +126,16 @@ Options:
                        event:<type>, file:<path>, or "now"
   --timeout <s>        Max seconds to wait for the phase marker
                        (default: 120; --when now ignores this)
+  --target-pid <pid>   Explicit recorded harness PID (kill-harness /
+                       sigstop_sigcont). Kill targets are NEVER resolved by
+                       a /proc cwd/cmdline sweep; an explicit record (these
+                       args, a steps-table claim row, or the daemon pidfile)
+                       is required or the action refuses with GUARD_MISS.
+  --target-pgid <pgid> Recorded harness process-group id — verification
+                       metadata for the recorded pid.
+  --target-start-time <n>
+                       Recorded /proc starttime of the target — ABA-safe
+                       identity check; a mismatch refuses the signal.
   --help, -h           Print this usage and exit
 
 Phase markers:
@@ -179,26 +190,49 @@ function resolveSignal(signalArg) {
 
 /**
  * kill-harness: Send a signal to the active harness process for --run.
- * Default signal: SIGKILL.
+ * The target is resolved from EXPLICIT RECORDED identity only (US-002):
+ * --target-pid/--target-pgid/--target-start-time args, else the TT DB steps
+ * table's claim_pid/claim_pgid for the run. A missing record or a failed
+ * identity/provenance verification is a GUARD_MISS (exit 3) — the target is
+ * never resolved by a /proc cwd/cmdline sweep. Default signal: SIGKILL.
  */
 function killHarness(opts) {
   const { run: runId, args } = opts;
   const signal = resolveSignal(args.signal);
 
-  const pid = findHarnessPid(runId);
-  if (!pid) {
+  const record = resolveTargetRecord('kill-harness', opts);
+  if (!record || record.error) {
     const entry = {
       ts: new Date().toISOString(),
       action: 'kill-harness',
       runId,
       outcome: 'target_not_found',
-      error: `No harness process found for run ${runId}`,
+      error: record ? record.error : `No recorded harness target for run ${runId} (explicit --target-* args or steps claim row) — refusing to resolve by scan`,
     };
     logStructured(entry);
-    console.error(`Error: No harness process found for run ${runId}`);
-    process.exit(1);
+    console.error(`GUARD_MISS: ${entry.error}`);
+    process.exit(EXIT_GUARD_MISS);
   }
 
+  const verdict = verifyKillTarget(record, runId);
+  if (!verdict.ok) {
+    const entry = {
+      ts: new Date().toISOString(),
+      action: 'kill-harness',
+      runId,
+      target: `pid:${record.pid}`,
+      targetRecord: record,
+      signal,
+      outcome: 'INVALID',
+      verification: 'refused',
+      error: verdict.reason,
+    };
+    logStructured(entry);
+    console.error(`GUARD_MISS: ${verdict.reason}`);
+    process.exit(EXIT_GUARD_MISS);
+  }
+
+  const pid = record.pid;
   try {
     process.kill(pid, signal);
     const entry = {
@@ -206,7 +240,9 @@ function killHarness(opts) {
       action: 'kill-harness',
       runId,
       target: `pid:${pid}`,
+      targetRecord: record,
       signal,
+      verification: 'ok',
       outcome: 'fired',
     };
     logStructured(entry);
@@ -218,6 +254,7 @@ function killHarness(opts) {
       action: 'kill-harness',
       runId,
       target: `pid:${pid}`,
+      targetRecord: record,
       signal,
       outcome: 'fire_failed',
       error: e.message,
@@ -230,26 +267,49 @@ function killHarness(opts) {
 
 /**
  * kill-daemon: Send a signal to the TT daemon (never the production daemon).
+ * The target PID comes from the TT daemon pidfile ONLY (US-002): when the
+ * pidfile is absent the action refuses with GUARD_MISS (exit 3) — there is
+ * NO fallback to a /proc daemon scan. The pidfile PID is verified (alive,
+ * identity, ancestry/group disjointness, provenance) before any signal.
  * Default signal: SIGKILL.
  */
 function killDaemon(opts) {
   const { run: runId, args } = opts;
   const signal = resolveSignal(args.signal);
 
-  const pid = findDaemonPid();
-  if (!pid) {
+  const record = resolveTargetRecord('kill-daemon', opts);
+  if (!record || record.error) {
     const entry = {
       ts: new Date().toISOString(),
       action: 'kill-daemon',
       runId,
       outcome: 'target_not_found',
-      error: 'No TT daemon PID found',
+      error: record ? record.error : 'No TT daemon pidfile found — refusing to resolve the daemon by scan',
     };
     logStructured(entry);
-    console.error('Error: No TT daemon PID found');
-    process.exit(1);
+    console.error(`GUARD_MISS: ${entry.error}`);
+    process.exit(EXIT_GUARD_MISS);
   }
 
+  const verdict = verifyKillTarget(record, runId);
+  if (!verdict.ok) {
+    const entry = {
+      ts: new Date().toISOString(),
+      action: 'kill-daemon',
+      runId,
+      target: `pid:${record.pid}`,
+      targetRecord: record,
+      signal,
+      outcome: 'INVALID',
+      verification: 'refused',
+      error: verdict.reason,
+    };
+    logStructured(entry);
+    console.error(`GUARD_MISS: ${verdict.reason}`);
+    process.exit(EXIT_GUARD_MISS);
+  }
+
+  const pid = record.pid;
   try {
     process.kill(pid, signal);
     const entry = {
@@ -257,7 +317,9 @@ function killDaemon(opts) {
       action: 'kill-daemon',
       runId,
       target: `pid:${pid}`,
+      targetRecord: record,
       signal,
+      verification: 'ok',
       outcome: 'fired',
     };
     logStructured(entry);
@@ -269,6 +331,7 @@ function killDaemon(opts) {
       action: 'kill-daemon',
       runId,
       target: `pid:${pid}`,
+      targetRecord: record,
       signal,
       outcome: 'fire_failed',
       error: e.message,
@@ -319,9 +382,13 @@ function sleepSync(ms) {
  * a hold_complete entry, and a cont entry to chaos.log.
  *
  * Guard semantics (spec 08 injection discipline — never a silent cont):
- * after the hold elapses, the SAME PID must still be alive and the
- * harness finder must still resolve to that same PID; otherwise the
- * injection aborts with EXIT_GUARD_MISS (3) and an INVALID entry —
+ * the target is resolved from EXPLICIT RECORDED identity only (US-002:
+ * --target-* args, else the steps-table claim row; never a /proc sweep)
+ * and verified (alive, startTime ABA, ancestry/group disjointness,
+ * provenance) before SIGSTOP. After the hold elapses, the SAME pid must
+ * still be alive AND still pass identity verification (a pid reused by
+ * another process during the hold fails the startTime check); otherwise
+ * the injection aborts with EXIT_GUARD_MISS (3) and an INVALID entry —
  * no SIGCONT is ever sent.
  */
 function sigstopSigcont(opts) {
@@ -338,35 +405,40 @@ function sigstopSigcont(opts) {
     process.exit(1);
   }
 
-  const pid = findHarnessPid(runId);
-  if (!pid) {
+  const record = resolveTargetRecord('sigstop_sigcont', opts);
+  if (!record || record.error) {
     const entry = {
       ts: new Date().toISOString(),
       action: 'sigstop_sigcont',
       runId,
       phase: 'resolve',
       outcome: 'target_not_found',
-      error: `No harness process found for run ${runId}`,
+      error: record ? record.error : `No recorded harness target for run ${runId} (explicit --target-* args or steps claim row) — refusing to resolve by scan`,
     };
     logStructured(entry);
-    console.error(`Error: No harness process found for run ${runId}`);
-    process.exit(1);
+    console.error(`GUARD_MISS: ${entry.error}`);
+    process.exit(EXIT_GUARD_MISS);
   }
 
-  if (!verifyProcessProvenance(pid, runId)) {
+  const verdict = verifyKillTarget(record, runId);
+  if (!verdict.ok) {
     const entry = {
       ts: new Date().toISOString(),
       action: 'sigstop_sigcont',
       runId,
       phase: 'resolve',
-      target: `pid:${pid}`,
+      target: `pid:${record.pid}`,
+      targetRecord: record,
       outcome: 'INVALID',
-      error: `Harness PID ${pid} cwd/cmdline does not contain ${TT_ROOT}`,
+      verification: 'refused',
+      error: verdict.reason,
     };
     logStructured(entry);
-    console.error(`GUARD_MISS: Harness PID ${pid} fails provenance check`);
+    console.error(`GUARD_MISS: ${verdict.reason}`);
     process.exit(EXIT_GUARD_MISS);
   }
+
+  const pid = record.pid;
 
   // ── SIGSTOP ──
   try {
@@ -377,8 +449,10 @@ function sigstopSigcont(opts) {
       runId,
       phase: 'start',
       target: `pid:${pid}`,
+      targetRecord: record,
       signal: 'SIGSTOP',
       holdSeconds,
+      verification: 'ok',
       outcome: 'fired',
     };
     logStructured(startEntry);
@@ -390,6 +464,7 @@ function sigstopSigcont(opts) {
       runId,
       phase: 'start',
       target: `pid:${pid}`,
+      targetRecord: record,
       signal: 'SIGSTOP',
       outcome: 'fire_failed',
       error: e.message,
@@ -409,25 +484,34 @@ function sigstopSigcont(opts) {
     runId,
     phase: 'hold_complete',
     target: `pid:${pid}`,
+    targetRecord: record,
     holdSeconds,
     outcome: 'held',
   });
 
-  // ── Re-verify the SAME PID before any SIGCONT (never a silent cont) ──
+  // ── Re-verify the SAME pid before any SIGCONT (never a silent cont) ──
   const stillAlive = isProcessAlive(pid);
-  const resolvedNow = findHarnessPid(runId);
-  if (!stillAlive || resolvedNow !== pid) {
+  const recordNow = resolveTargetRecord('sigstop_sigcont', opts);
+  const resolvedNow = recordNow && !recordNow.error ? recordNow.pid : null;
+  const reVerdict = recordNow && !recordNow.error
+    ? verifyKillTarget(recordNow, runId)
+    : { ok: false, reason: 'target record no longer resolvable after the hold' };
+  if (!stillAlive || resolvedNow !== pid || !reVerdict.ok) {
     const entry = {
       ts: new Date().toISOString(),
       action: 'sigstop_sigcont',
       runId,
       phase: 'guard',
       target: `pid:${pid}`,
+      targetRecord: record,
       holdSeconds,
       outcome: 'INVALID',
-      error: stillAlive
-        ? `Harness PID changed during hold: expected ${pid}, resolved ${resolvedNow ?? 'none'}`
-        : `Harness PID ${pid} died or was reaped during the ${holdSeconds}s hold`,
+      verification: 'refused',
+      error: !stillAlive
+        ? `Harness PID ${pid} died or was reaped during the ${holdSeconds}s hold`
+        : resolvedNow !== pid
+          ? `Harness PID changed during hold: expected ${pid}, resolved ${resolvedNow ?? 'none'}`
+          : reVerdict.reason,
     };
     logStructured(entry);
     console.error(`GUARD_MISS: ${entry.error} — no SIGCONT sent`);
@@ -443,8 +527,10 @@ function sigstopSigcont(opts) {
       runId,
       phase: 'cont',
       target: `pid:${pid}`,
+      targetRecord: record,
       signal: 'SIGCONT',
       holdSeconds,
+      verification: 'ok',
       outcome: 'fired',
     };
     logStructured(contEntry);
@@ -457,6 +543,7 @@ function sigstopSigcont(opts) {
       runId,
       phase: 'cont',
       target: `pid:${pid}`,
+      targetRecord: record,
       signal: 'SIGCONT',
       outcome: 'fire_failed',
       error: e.message,
@@ -1214,14 +1301,21 @@ function guardFire(action, runId, opts) {
   }
   db.close();
 
-  // (b) Process provenance check
+  // (b) Process target check — resolve from EXPLICIT RECORDED identity only
+  // (US-002: --target-* args, steps-table claim row, or daemon pidfile —
+  // NEVER a /proc cwd/cmdline sweep, which can match the operator's own
+  // ancestry) and verify before any signal can fire.
   if (target.kind === 'process') {
-    const pid = findTargetPid(action, runId);
-    if (!pid) {
-      return { guarded: false, reason: `Cannot find target PID for ${action} run ${runId}` };
+    const record = resolveTargetRecord(action, opts);
+    if (!record) {
+      return { guarded: false, reason: `No recorded kill target for ${action} run ${runId} (explicit --target-* args, steps claim row, or daemon pidfile) — refusing to resolve by scan` };
     }
-    if (!verifyProcessProvenance(pid, runId)) {
-      return { guarded: false, reason: `Process ${pid} cwd/cmdline does not contain ${TT_ROOT}` };
+    if (record.error) {
+      return { guarded: false, reason: record.error };
+    }
+    const verdict = verifyKillTarget(record, runId);
+    if (!verdict.ok) {
+      return { guarded: false, reason: verdict.reason };
     }
   }
 
@@ -1245,89 +1339,148 @@ function guardFire(action, runId, opts) {
 }
 
 /**
- * Find the target PID for process-targeting actions.
- * kill-harness: finds the harness process for the run via cwd/cmdline under TT_ROOT
- * kill-daemon: finds the TT daemon process via pidfile or process scan
+ * Resolve the kill target for a process action from EXPLICIT RECORDED
+ * identity ONLY — never a /proc cwd/cmdline sweep (the E3.C.1 root-cause
+ * class: a sweep can match a repo-cwd process in the operator's own
+ * ancestry whose cmdline carries the runId / 'daemon' token, and SIGKILL
+ * the worker/harness that spawned the test).
+ *
+ * Resolution order (US-002):
+ *   1. explicit --target-pid / --target-pgid / --target-start-time args
+ *      passed by the caller (the controller records the harness at spawn);
+ *   2. the contained TT DB steps table's recorded claim_pid/claim_pgid for
+ *      the run (the product's own explicit worker-ownership record);
+ *   3. the TT daemon pidfile PID (kill-daemon only — already explicit).
+ *
+ * Returns a record { pid, pgid?, startTime? }, null when no explicit record
+ * exists (the caller must refuse — never fall back to a scan), or
+ * { error } for malformed explicit values.
  */
-function findTargetPid(action, runId) {
+function resolveTargetRecord(action, opts) {
+  const args = opts.args || {};
   if (action === 'kill-harness' || action === 'sigstop_sigcont') {
-    // Scan /proc for processes running under TT_ROOT with the run ID in their cmdline
-    return findHarnessPid(runId);
+    if (args['target-pid'] !== undefined && args['target-pid'] !== '') {
+      const pid = Number(args['target-pid']);
+      if (!Number.isInteger(pid) || pid <= 0) {
+        return { error: `invalid --target-pid "${args['target-pid']}"` };
+      }
+      const record = { pid };
+      if (args['target-pgid'] !== undefined && args['target-pgid'] !== '') {
+        const pgid = Number(args['target-pgid']);
+        if (!Number.isInteger(pgid) || pgid <= 0) {
+          return { error: `invalid --target-pgid "${args['target-pgid']}"` };
+        }
+        record.pgid = pgid;
+      }
+      if (args['target-start-time'] !== undefined && args['target-start-time'] !== '') {
+        const raw = String(args['target-start-time']);
+        record.startTime = raw.startsWith('proc:') ? raw : `proc:${raw}`;
+      }
+      return record;
+    }
+    // Fallback: the product's own explicit record — the steps table's
+    // claim_pid/claim_pgid for the run (never a process scan).
+    return resolveFromStepsTable(opts.run);
   }
   if (action === 'kill-daemon') {
-    return findDaemonPid();
+    return readDaemonPidfile();
   }
   return null;
 }
 
 /**
- * Find a harness process PID by scanning /proc for processes whose
- * cwd or cmdline contains the run ID and torture-test/var.
+ * Resolve the harness target from the contained TT DB steps table's
+ * recorded claim_pid/claim_pgid for the run (the product's explicit
+ * worker-ownership record — tt-chaos already reads the steps table).
+ * Tolerant of both run-id spellings and of a missing claim_pid column.
+ *
+ * Product semantics (step-ops C18): claim_pid is the owning DAEMON pid;
+ * claim_pgid is the HARNESS process group recorded at claim time — the
+ * detached harness is its own group leader, so the harness pid equals the
+ * recorded pgid. The kill target is therefore { pid: claim_pgid,
+ * pgid: claim_pgid } (the harness), NEVER claim_pid (killing the daemon is
+ * kill-daemon's job). When no harness group is recorded the resolution
+ * fails closed (null) — no daemon-pid fallback for a harness kill.
+ * Returns { pid, pgid } or null when no harness claim row exists.
  */
-function findHarnessPid(runId) {
+function resolveFromStepsTable(runId) {
+  const dbPath = resolveDbPath();
+  let db = null;
   try {
-    const procDirs = fs.readdirSync('/proc').filter(d => /^\d+$/.test(d));
-    for (const d of procDirs) {
-      const cwdPath = `/proc/${d}/cwd`;
-      const cmdlinePath = `/proc/${d}/cmdline`;
+    db = new DatabaseSync(dbPath, { open: true, readOnly: true });
+  } catch {
+    return null;
+  }
+  try {
+    const shortRunId = runId.startsWith('run-') ? runId.slice(4) : runId;
+    for (const rid of [runId, shortRunId]) {
       try {
-        const cwd = fs.readlinkSync(cwdPath);
-        const cmdline = fs.readFileSync(cmdlinePath, 'utf-8').replace(/\0/g, ' ');
-        if (cwd.includes(TT_ROOT) && cmdline.includes(runId)) {
-          return parseInt(d, 10);
+        const row = db.prepare(
+          `SELECT claim_pid, claim_pgid FROM steps WHERE run_id = ? AND claim_pid IS NOT NULL AND claim_pid > 0 ORDER BY rowid DESC LIMIT 1`
+        ).get(rid);
+        if (row && row.claim_pid !== null && row.claim_pid !== undefined && Number(row.claim_pid) > 0) {
+          if (row.claim_pgid !== null && row.claim_pgid !== undefined && Number(row.claim_pgid) > 0) {
+            // Harness process group leader (pid == pgid for a detached harness).
+            const pgid = Number(row.claim_pgid);
+            return { pid: pgid, pgid };
+          }
+          return null; // no recorded harness group — refuse rather than hit the daemon
         }
       } catch {
-        // Process may have exited or we may lack permissions — skip
+        // claim_pid column may not exist in this schema — try the next spelling.
       }
     }
-  } catch {
-    // /proc may not be readable
+  } finally {
+    try { db.close(); } catch { /* ignore */ }
   }
   return null;
 }
 
 /**
- * Find the TT daemon PID from the TT state directory pidfile.
+ * Read the TT daemon PID from its pidfile. The contained daemon writes
+ * <state-dir>/tamandua.pid (daemon-control / tt-daemon-up); the legacy
+ * <TT_HOME>/.tamandua/daemon.pid fixture path is also accepted. Returns
+ * { pid } or null when no pidfile exists. NEVER falls back to a /proc
+ * daemon scan — an absent pidfile is a hard refusal (GUARD_MISS).
  */
-function findDaemonPid() {
-  // Check standard pidfile locations under TT state
+function readDaemonPidfile() {
+  const candidates = [];
+  if (process.env.TAMANDUA_STATE_DIR) {
+    candidates.push(path.resolve(process.env.TAMANDUA_STATE_DIR, 'tamandua.pid'));
+  }
   const ttHome = process.env.TT_HOME || path.resolve(TT_ROOT, '..', '..');
-  const pidFile = path.resolve(ttHome, '.tamandua', 'daemon.pid');
-  try {
-    const pidStr = fs.readFileSync(pidFile, 'utf-8').trim();
-    const pid = parseInt(pidStr, 10);
-    if (pid > 0) return pid;
-  } catch {
-    // pidfile doesn't exist
+  candidates.push(path.resolve(ttHome, '.tamandua', 'daemon.pid'));
+  for (const pidFile of candidates) {
+    try {
+      const pidStr = fs.readFileSync(pidFile, 'utf-8').trim();
+      const pid = parseInt(pidStr, 10);
+      if (pid > 0) return { pid };
+    } catch {
+      // pidfile doesn't exist — try the next candidate
+    }
   }
-
-  // Fallback: scan /proc for node processes with tamandua daemon in cmdline under TT_ROOT
-  return findDaemonPidByScan();
+  return null;
 }
 
 /**
- * Scan /proc for a node process with 'daemon' in cmdline under TT_ROOT.
+ * Verify a resolved kill target immediately before firing (US-002 guard
+ * contract): (a) pid alive; (b) when a recorded startTime exists it must
+ * match the CURRENT /proc starttime (ABA-safe, refuse on mismatch); (c) the
+ * target must NOT be an ancestor of the tt-chaos process and must not share
+ * tt-chaos's own pgid; (d) belt-and-suspenders cwd/cmdline provenance check
+ * for recorded pids. Returns { ok, reason }.
  */
-function findDaemonPidByScan() {
-  try {
-    const procDirs = fs.readdirSync('/proc').filter(d => /^\d+$/.test(d));
-    for (const d of procDirs) {
-      const cwdPath = `/proc/${d}/cwd`;
-      const cmdlinePath = `/proc/${d}/cmdline`;
-      try {
-        const cwd = fs.readlinkSync(cwdPath);
-        const cmdline = fs.readFileSync(cmdlinePath, 'utf-8').replace(/\0/g, ' ');
-        if (cwd.includes(TT_ROOT) && cmdline.includes('daemon') && !cmdline.includes('daemonctl') && !cmdline.includes('daemon-control')) {
-          return parseInt(d, 10);
-        }
-      } catch {
-        // skip
-      }
-    }
-  } catch {
-    // /proc not readable
+function verifyKillTarget(record, runId) {
+  const base = verifyRecordedTarget({ pid: record.pid, pgid: record.pgid, startTime: record.startTime });
+  if (!base.ok) return base;
+  const pgid = getProcessGroup(record.pid);
+  if (pgid !== null && pgid === ownProcessGroup()) {
+    return { ok: false, reason: `target pid ${record.pid} shares the caller's own pgid ${pgid} — refusing to signal own group` };
   }
-  return null;
+  if (!verifyProcessProvenance(record.pid, runId)) {
+    return { ok: false, reason: `Process ${record.pid} cwd/cmdline does not contain ${TT_ROOT}` };
+  }
+  return { ok: true, reason: `recorded target pid ${record.pid} verified (alive, identity, group, provenance checks passed)` };
 }
 
 /**
@@ -1336,10 +1489,10 @@ function findDaemonPidByScan() {
  * `node .../runtime-*.mjs ... -q <work prompt>` whose prompt text carries the
  * run id but no var path) OR TT_ROOT itself (fake/test harness processes and
  * the fake daemon use argv[0] = TT_ROOT/tt-harness-<run>). Requiring var in
- * the cmdline unconditionally would reject every real harness process; the
- * finder already requires cwd under TT_ROOT + cmdline contains the run id, so
- * this check is the belt-and-suspenders re-assertion of the SAME provenance
- * contract at fire time.
+ * the cmdline unconditionally would reject every real harness process. This
+ * check is the belt-and-suspenders re-assertion of the provenance contract
+ * at fire time for an ALREADY-RESOLVED recorded pid (US-002) — it is never
+ * used to RESOLVE a target.
  */
 function verifyProcessProvenance(pid, runId) {
   try {
@@ -1399,7 +1552,7 @@ function captureEvidence(action, runId, opts, targetInfo) {
 
   // 3. Capture process tree for process-targeting actions
   if (targetInfo && targetInfo.kind === 'process') {
-    captureProcessEvidence(action, runId, writeFile);
+    captureProcessEvidence(action, runId, writeFile, opts);
   }
 
   // 4. Capture git status for filesystem-targeting actions and destructive actions
@@ -1460,12 +1613,16 @@ function captureDbEvidence(runId, writeFile, _action, _opts) {
 /**
  * Capture target process tree information.
  */
-function captureProcessEvidence(action, runId, writeFile) {
-  const pid = findTargetPid(action, runId);
+function captureProcessEvidence(action, runId, writeFile, opts) {
+  const record = resolveTargetRecord(action, { run: runId, args: opts ? opts.args : {} });
+  const pid = record && !record.error ? record.pid : null;
   let output = '';
 
   if (pid) {
     output += `Target PID: ${pid}\n`;
+    output += `Target record: ${JSON.stringify(record)}\n`;
+    const verdict = verifyKillTarget(record, runId);
+    output += `Verification: ${verdict.ok ? 'ok' : 'refused'} — ${verdict.reason}\n`;
     output += captureProcInfo(pid);
 
     // Capture child processes (pgid)

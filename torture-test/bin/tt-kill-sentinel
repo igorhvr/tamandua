@@ -1,0 +1,318 @@
+#!/usr/bin/env bash
+# tt-kill-sentinel — sentinel-parent regression proof wrapper (E3.C.1 US-007).
+#
+# Runs a kill-heavy suite command under a SENTINEL PARENT process that would
+# die visibly (SIGKILL) if any kill site inside the suite reached the test's
+# own ancestry — the E3.C root-cause class (the worker's harness was SIGKILLed
+# twice by the developer's own test executions: empty_output/worker-lost at
+# 12:10:38 during the US-010 O4 mutation self-tests and 19:14:03 during the
+# US-011 scripted probe battery).
+#
+# Layout:
+#
+#   tt-kill-sentinel <pidfile> [--suite-timeout <sec>] -- <suite command...>
+#
+#   <pidfile>          where the sentinel's pid is written (caller-chosen
+#                      path, MUST be outside the repo — the wrapper never
+#                      writes into the worktree).
+#   --suite-timeout N  hard deadline for the whole wrapper run (default:
+#                      ${TT_KILL_SENTINEL_TIMEOUT_SEC}, default 1800s; 0 =
+#                      no deadline). On expiry the wrapper kills the recorded
+#                      suite + sentinel pids and exits 124.
+#   -- <cmd...>        the suite command, run as the SENTINEL's child (the
+#                      sentinel stands exactly where the worker's harness
+#                      stood: an ANCESTOR of the suite, same process group,
+#                      same cwd).
+#
+# The sentinel:
+#   * is a marker-tagged `sh -c 'trap "" TERM; while :; do sleep 1; done'`
+#     carrying a unique env token (TT_KILL_SENTINEL_TOKEN);
+#   * IGNORES SIGTERM (normal cleanup signals must not false-positive) but
+#     dies on SIGKILL — the incident signal class;
+#   * is spawned by THIS wrapper as a background child in the wrapper's own
+#     process group (NOT setsid), so any group kill aimed at the suite's
+#     ancestry group, or any cwd/tree sweep matching the suite's neighbors,
+#     reaches the sentinel too.
+#
+# Survival assertion (after the suite completes): the sentinel pid must be
+# alive (kill -0), present in /proc, NOT a zombie (a SIGKILLed child lingers
+# as a zombie with an UNCHANGED startTime until reaped — state 'Z' is
+# required to prove it was signalled, see US-006 getProcessState), and its
+# /proc startTime (stat field 22) must be unchanged (ABA).
+#
+# Exit status:
+#   * the suite's exit code when the sentinel survived (suite semantics
+#     preserved — the caller asserts sentinel survival separately);
+#   70 — SENTINEL DIED: the sentinel was signalled (or its identity changed);
+#        death detail printed to stderr;
+#   71 — sentinel could not be started / pidfile never appeared;
+#   124 — suite did not finish within the deadline.
+#
+# The wrapper's own cleanup kills ONLY the recorded pids it spawned (the
+# sentinel and the suite), never anything else. Confined to torture-test/.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PIDFILE=""
+SUITE_TIMEOUT_SEC="${TT_KILL_SENTINEL_TIMEOUT_SEC:-1800}"
+SUITE_CMD=()
+
+usage() {
+  cat >&2 <<'EOF'
+usage: tt-kill-sentinel <pidfile> [--suite-timeout <sec>] -- <suite command...>
+
+Runs <suite command...> under a sentinel parent process and asserts the
+sentinel survives (kill -0 + /proc presence + not-a-zombie + unchanged
+startTime). Exits with the suite's exit code on survival; 70 when the
+sentinel died; 71 on startup failure; 124 on suite timeout.
+EOF
+}
+
+# ── argument parsing ────────────────────────────────────────────────
+if [ "$#" -lt 2 ]; then
+  usage
+  exit 2
+fi
+PIDFILE="$1"
+shift
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --)
+      shift
+      break
+      ;;
+    --suite-timeout)
+      [ "$#" -ge 2 ] || { echo "tt-kill-sentinel: --suite-timeout needs a value" >&2; exit 2; }
+      SUITE_TIMEOUT_SEC="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "tt-kill-sentinel: unexpected argument '$1' (use -- before the suite command)" >&2
+      usage
+      exit 2
+      ;;
+  esac
+done
+SUITE_CMD=("$@")
+if [ "${#SUITE_CMD[@]}" -eq 0 ]; then
+  echo "tt-kill-sentinel: no suite command given (use -- <cmd...>)" >&2
+  exit 2
+fi
+case "$SUITE_TIMEOUT_SEC" in
+  ''|*[!0-9]*)
+    echo "tt-kill-sentinel: suite timeout must be a non-negative integer, got '$SUITE_TIMEOUT_SEC'" >&2
+    exit 2
+    ;;
+esac
+
+# ── helpers ─────────────────────────────────────────────────────────
+
+# proc_state <pid> — /proc/<pid>/stat field 3 (state char) via the last-')'
+# slice (comm may contain spaces/parens). 'Z' = zombie (signalled, unreaped).
+proc_state() {
+  local pid=$1 stat rest
+  stat=$(<"/proc/$pid/stat") 2>/dev/null || return 1
+  rest=${stat##*) }
+  printf '%s\n' "${rest%% *}"
+}
+
+# proc_start_time <pid> — /proc/<pid>/stat field 22 (starttime). Same
+# semantics as bin/tt-process-identity.mjs.
+proc_start_time() {
+  local pid=$1 stat rest
+  local -a fields=()
+  stat=$(<"/proc/$pid/stat") 2>/dev/null || return 1
+  rest=${stat##*) }
+  read -r -a fields <<<"$rest"
+  [ "${#fields[@]}" -gt 19 ] || return 1
+  printf '%s\n' "${fields[19]}"
+}
+
+# sentinel_is_alive <pid> — kill -0 + /proc presence + NOT a zombie. A
+# SIGKILLed child of this wrapper lingers as a zombie until reaped, so the
+# state check is REQUIRED to distinguish a signalled sentinel from a live one.
+sentinel_is_alive() {
+  local pid=$1 state
+  kill -0 "$pid" 2>/dev/null || return 1
+  [ -e "/proc/$pid" ] || return 1
+  state=$(proc_state "$pid") || return 1
+  [ "$state" != "Z" ] || return 1
+  return 0
+}
+
+# delay <seconds> — non-forking sleep. A `sleep` child would be a TRANSIENT
+# process in the wrapper's own process group: the probe battery snapshots its
+# entire process group (self-group assertion, US-006) and requires every
+# member recorded at the start to survive — a 0.2s `sleep` child caught alive
+# at snapshot time is legitimately gone at the end and false-fails the
+# battery. `read -t` is a bash BUILTIN (no fork); fd 9 is a fifo the wrapper
+# holds open read-write, so the read always times out without consuming input.
+delay() {
+  local seconds=$1
+  read -t "$seconds" -u 9 _ 2>/dev/null || true
+}
+
+# ── sentinel lifecycle ──────────────────────────────────────────────
+
+TOKEN="tt-kill-sentinel-${BASHPID}-${RANDOM}-$(date +%s%N)"
+RC_FILE="$(mktemp "${TMPDIR:-/tmp}/tt-kill-sentinel-rc.XXXXXX")"
+SUITE_PID_FILE="$PIDFILE.suite-pid"
+FIFO_FILE="$PIDFILE.fifo"
+SENTINEL_PID=""
+SUITE_PID=""
+SENTINEL_START=""
+STARTED=0
+
+# Non-forking delay channel: a fifo held open read-write on fd 9 (the
+# sentinel subshell inherits it for its marker loop). mkfifo + exec are
+# filesystem/fd operations — no process is spawned.
+rm -f -- "$FIFO_FILE"
+if ! mkfifo -- "$FIFO_FILE"; then
+  echo "tt-kill-sentinel: cannot create delay fifo $FIFO_FILE" >&2
+  exit 71
+fi
+if ! exec 9<>"$FIFO_FILE"; then
+  echo "tt-kill-sentinel: cannot open delay fifo $FIFO_FILE" >&2
+  exit 71
+fi
+
+cleanup() {
+  local status=$?
+  trap - EXIT INT TERM
+  # Recover the recorded suite pid from the sentinel's side file on any path
+  # that exited before the wait loop read it (timeout/death), so the orphaned
+  # suite never leaks.
+  if [ -z "$SUITE_PID" ] && [ -s "$SUITE_PID_FILE" ]; then
+    SUITE_PID="$(cat "$SUITE_PID_FILE" 2>/dev/null || echo "")"
+  fi
+  # Kill ONLY the recorded pids this wrapper spawned (the sentinel subshell
+  # and the suite). Never anything else.
+  if [ -n "$SUITE_PID" ] && [ "$SUITE_PID" -gt 0 ] 2>/dev/null && kill -0 "$SUITE_PID" 2>/dev/null; then
+    kill -KILL "$SUITE_PID" 2>/dev/null || true
+    wait "$SUITE_PID" 2>/dev/null || true
+  fi
+  if [ -n "$SENTINEL_PID" ] && [ "$SENTINEL_PID" -gt 0 ] 2>/dev/null && kill -0 "$SENTINEL_PID" 2>/dev/null; then
+    kill -KILL "$SENTINEL_PID" 2>/dev/null || true
+    wait "$SENTINEL_PID" 2>/dev/null || true
+  fi
+  rm -f -- "$RC_FILE"
+  rm -f -- "$FIFO_FILE"
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# ── start the sentinel parent ───────────────────────────────────────
+# The sentinel is a forked subshell (its pid is $BASHPID, NOT $$ — $$ is the
+# wrapper's pid inside a subshell). It: records its own pid, spawns the suite
+# as ITS child, records the suite pid, waits, writes the suite rc, then stays
+# alive as the marker until the wrapper kills it.
+(
+  trap '' TERM
+  printf '%s\n' "$BASHPID" > "$PIDFILE"
+  TT_KILL_SENTINEL_TOKEN="$TOKEN" "${SUITE_CMD[@]}" &
+  suite_pid=$!
+  printf '%s\n' "$suite_pid" > "$SUITE_PID_FILE"
+  set +e
+  wait "$suite_pid"
+  rc=$?
+  set -e
+  printf '%s\n' "$rc" > "$RC_FILE"
+  # Marker phase: stay alive (TERM-immune) until the wrapper asserts and
+  # kills us — WITHOUT forking transient children (the inherited fd 9 fifo
+  # read is a builtin, see delay()).
+  while :; do read -t 1 -u 9 _ 2>/dev/null || true; done
+) &
+SENTINEL_PID=$!
+STARTED=1
+
+# Wait for the sentinel pidfile (it must be OUR child's pid).
+for _ in $(seq 1 200); do
+  if [ -s "$PIDFILE" ]; then
+    SENTINEL_PID="$(cat "$PIDFILE" 2>/dev/null || echo "")"
+    case "$SENTINEL_PID" in
+      ''|*[!0-9]*) SENTINEL_PID="" ;;
+    esac
+    [ -n "$SENTINEL_PID" ] && break
+  fi
+  delay 0.05
+done
+if [ -z "$SENTINEL_PID" ]; then
+  echo "tt-kill-sentinel: sentinel never recorded its pid in $PIDFILE" >&2
+  exit 71
+fi
+if ! sentinel_is_alive "$SENTINEL_PID"; then
+  echo "tt-kill-sentinel: sentinel pid $SENTINEL_PID not alive right after start" >&2
+  exit 71
+fi
+SENTINEL_START="$(proc_start_time "$SENTINEL_PID")" || {
+  echo "tt-kill-sentinel: cannot read sentinel startTime (pid $SENTINEL_PID)" >&2
+  exit 71
+}
+
+# ── wait for the suite to finish (rc file) or the sentinel to die ────
+SUITE_RC=""
+DEADLINE=0
+if [ "$SUITE_TIMEOUT_SEC" -gt 0 ] 2>/dev/null; then
+  DEADLINE=$(($(date +%s) + SUITE_TIMEOUT_SEC))
+fi
+while [ -z "$SUITE_RC" ]; do
+  if [ -s "$RC_FILE" ]; then
+    SUITE_RC="$(cat "$RC_FILE" 2>/dev/null || echo "")"
+    case "$SUITE_RC" in
+      ''|*[!0-9]*) SUITE_RC="" ;;
+    esac
+    [ -n "$SUITE_RC" ] && break
+  fi
+  if ! sentinel_is_alive "$SENTINEL_PID"; then
+    # The sentinel died BEFORE the suite reported — a kill reached the
+    # ancestry. Report immediately (the suite may be orphaned; cleanup kills
+    # it via the recorded suite pid).
+    echo "SENTINEL DIED: sentinel pid $SENTINEL_PID is gone (kill -0 failed, /proc absent, or zombie state) before the suite finished" >&2
+    echo "  suite command: ${SUITE_CMD[*]}" >&2
+    exit 70
+  fi
+  if [ "$DEADLINE" -gt 0 ] && [ "$(date +%s)" -ge "$DEADLINE" ]; then
+    echo "tt-kill-sentinel: suite did not finish within ${SUITE_TIMEOUT_SEC}s" >&2
+    exit 124
+  fi
+  delay 0.2
+done
+
+# Read the recorded suite pid (for cleanup on timeout/death paths).
+if [ -s "$SUITE_PID_FILE" ]; then
+  SUITE_PID="$(cat "$SUITE_PID_FILE" 2>/dev/null || echo "")"
+fi
+
+# ── survival assertion ──────────────────────────────────────────────
+DEATH_DETAIL=""
+if ! kill -0 "$SENTINEL_PID" 2>/dev/null; then
+  DEATH_DETAIL="kill -0 failed: sentinel pid $SENTINEL_PID is not alive"
+elif [ ! -e "/proc/$SENTINEL_PID" ]; then
+  DEATH_DETAIL="/proc/$SENTINEL_PID missing"
+else
+  STATE="$(proc_state "$SENTINEL_PID")" || STATE="(unreadable)"
+  if [ "$STATE" = "Z" ]; then
+    DEATH_DETAIL="sentinel pid $SENTINEL_PID is a ZOMBIE (state 'Z') — it was signalled and is awaiting reap"
+  else
+    CUR_START="$(proc_start_time "$SENTINEL_PID")" || CUR_START="(unreadable)"
+    if [ "$CUR_START" != "$SENTINEL_START" ]; then
+      DEATH_DETAIL="sentinel pid $SENTINEL_PID startTime changed: recorded $SENTINEL_START, current $CUR_START (pid reuse / ABA)"
+    fi
+  fi
+fi
+
+if [ -n "$DEATH_DETAIL" ]; then
+  echo "SENTINEL DIED: $DEATH_DETAIL" >&2
+  echo "  suite command: ${SUITE_CMD[*]}" >&2
+  echo "  suite exit code: ${SUITE_RC:-unknown}" >&2
+  exit 70
+fi
+
+echo "SENTINEL SURVIVED (pid $SENTINEL_PID, startTime $SENTINEL_START, suite exit ${SUITE_RC:-unknown})"
+exit "$SUITE_RC"

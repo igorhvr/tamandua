@@ -442,9 +442,12 @@ done
 # Reap the live process-group ids the O4 fixture generator spawned (detached
 # sleeps used as "provably alive" claim_pgid probes for the green-clean
 # fixture). They are reparented to init, so the descendant cleanup below never
-# sees them — reap them explicitly once the O4 loop has run.
+# sees them — reap them explicitly once the O4 loop has run. The shared reaper
+# is identity-verified (ABA startTime + group disjointness): a stale/reused
+# pgid record is skipped with a warning, never signalled (US-010 / FIX9.1
+# stale-orphan class).
 if [ -f "$workspace/live-pgids.json" ]; then
-  run_bounded "$COMMAND_TIMEOUT_SECONDS" node -e 'const fs=require("node:fs"); for (const pid of JSON.parse(fs.readFileSync(process.argv[1],"utf8"))) { try { process.kill(pid, "SIGKILL"); } catch {} }' "$workspace/live-pgids.json"
+  run_bounded "$COMMAND_TIMEOUT_SECONDS" node "$SCRIPT_DIR/reap-live-pgids.mjs" "$workspace/live-pgids.json"
 fi
 
 run_bounded "$COMMAND_TIMEOUT_SECONDS" node "$SCRIPT_DIR/../calibration/run.mjs" "$workspace"

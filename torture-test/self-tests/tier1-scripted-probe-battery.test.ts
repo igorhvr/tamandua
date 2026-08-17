@@ -65,6 +65,12 @@ import net from "node:net";
 import path from "node:path";
 import { describe, it } from "node:test";
 import { provisionWorkClone } from "../bin/tt-fixture-provision.mjs";
+import {
+  getProcessGroup,
+  getProcessStartIdentity,
+  getProcessState,
+  ownProcessGroup,
+} from "../bin/tt-process-identity.mjs";
 
 const repoRoot = process.cwd();
 const ttRoot = path.join(repoRoot, "torture-test");
@@ -164,6 +170,69 @@ async function assertPortsFree(): Promise<void> {
       server.once("error", (error) => reject(new Error(`scripted port ${port} is not free: ${error.message}`)));
       server.listen(port, "127.0.0.1", () => server.close((error) => (error ? reject(error) : resolve())));
     });
+  }
+}
+
+// ── Battery-level self-group assertion (E3.C.1 US-006) ─────────────
+// The battery must never reach its OWN ancestry: record the battery's own
+// process group (pgid) + member identities BEFORE the campaign and prove at
+// the end that the group is unchanged — the leader is still alive, and no
+// member was signalled (every member recorded at start is still alive with
+// the same process-start identity and not a zombie). This is a READ-ONLY
+// assertion scan — it never signals anything and never resolves a kill
+// target; it only proves the kill-heavy campaign left the battery's own
+// process group untouched.
+type SelfGroupSnapshot = {
+  pgid: number;
+  leaderStartTime: string | null;
+  members: Array<{ pid: number; startTime: string | null }>;
+};
+
+function snapshotSelfGroup(): SelfGroupSnapshot {
+  const pgid = ownProcessGroup();
+  assert.ok(pgid !== null && pgid > 0, `battery's own process group must be readable, got ${String(pgid)}`);
+  // The group leader is pid == pgid. Record its identity at snapshot time: a
+  // leader that is ALREADY gone before the campaign (e.g. the launcher shell
+  // that backgrounded the test with nohup, whose pgid the test inherited)
+  // predates the campaign — only a leader that was alive when the campaign
+  // started must still be alive at the end.
+  const leaderStartTime = getProcessStartIdentity(pgid);
+  const members: Array<{ pid: number; startTime: string | null }> = [];
+  for (const entry of fs.readdirSync("/proc")) {
+    if (!/^\d+$/.test(entry)) continue;
+    const pid = Number(entry);
+    if (getProcessGroup(pid) !== pgid) continue;
+    members.push({ pid, startTime: getProcessStartIdentity(pid) });
+  }
+  members.sort((a, b) => a.pid - b.pid);
+  return { pgid, leaderStartTime, members };
+}
+
+function assertSelfGroupSurvived(before: SelfGroupSnapshot): void {
+  const pgidAfter = ownProcessGroup();
+  assert.equal(pgidAfter, before.pgid,
+    `battery's own process group changed across the campaign: ${String(before.pgid)} -> ${String(pgidAfter)}`);
+  // The group leader (pid == pgid) must still be alive and still the leader —
+  // when it was alive at snapshot time (a leader that exited before the
+  // campaign is not the campaign's doing; every member that WAS alive at the
+  // start is still asserted to have survived below).
+  if (before.leaderStartTime !== null) {
+    assert.equal(getProcessGroup(before.pgid), before.pgid,
+      `battery's process-group leader ${before.pgid} is no longer the group leader`);
+    assert.equal(getProcessStartIdentity(before.pgid), before.leaderStartTime,
+      `battery's process-group leader ${before.pgid} identity changed — the leader was killed or its pid reused`);
+    assert.notEqual(getProcessState(before.pgid), "Z",
+      `battery's process-group leader ${before.pgid} became a zombie — a kill reached the battery's own group`);
+  }
+  // No member signalled: every member recorded at the start is still alive
+  // with the SAME process-start identity (a killed member would be a zombie
+  // until reaped, or gone; a reused pid would carry a different startTime).
+  for (const member of before.members) {
+    const state = getProcessState(member.pid);
+    assert.notEqual(state, null, `battery group member ${member.pid} is gone — a kill reached the battery's own group`);
+    assert.notEqual(state, "Z", `battery group member ${member.pid} became a zombie — a kill reached the battery's own group`);
+    assert.equal(getProcessStartIdentity(member.pid), member.startTime,
+      `battery group member ${member.pid} start identity changed — a kill reached the battery's own group (pid reused?)`);
   }
 }
 
@@ -359,6 +428,13 @@ describe("E3.C US-011 zero-token scripted probe battery", () => {
       assert.equal(initialStop.status, 0, `${initialStop.stdout}\n${initialStop.stderr}`);
       await assertPortsFree();
       const before = gitSnapshot();
+
+      // E3.C.1 US-006: snapshot the battery's OWN process group before the
+      // kill-heavy campaign (daemon start, controller probe battery with the
+      // tt-chaos sigstop_sigcont hold, restart_daemon teardown, daemon stop)
+      // so the end-of-battery assertion can prove the campaign left it
+      // untouched — its leader alive, no member signalled.
+      const selfGroupBefore = snapshotSelfGroup();
 
       // Build the scripted manifest copy + behaviors under gitignored var/.
       const manifestPath = buildScriptedManifest();
@@ -609,6 +685,12 @@ describe("E3.C US-011 zero-token scripted probe battery", () => {
           "scripted daemon must be cleanly stopped after the battery");
         await assertPortsFree();
         assert.equal(gitSnapshot(), before, "scripted battery changed git status");
+
+        // ── E3.C.1 US-006: the battery's own process group must have
+        //    survived the kill-heavy campaign untouched (leader alive, no
+        //    member signalled) — the regression proof that the battery's
+        //    kills never reach its own ancestry. ──
+        assertSelfGroupSurvived(selfGroupBefore);
       } finally {
         run(daemonControl, ["scripted", "stop"], process.env);
         if (campaignId !== null) {
