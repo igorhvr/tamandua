@@ -1,0 +1,14 @@
+▶ E3.C.1 US-007 — sentinel-parent regression proof
+  ✔ AC1a: sentinel survives the O4 mutation battery (oracles/self-test/run.sh) (124326.605562ms)
+  ✔ AC1b: sentinel survives the probe-battery self-test (tier1-scripted-probe-battery.test.ts) (869561.706562ms)
+  ✔ AC2: the wrapper cleans up its sentinel and suite after a normal run (18.323634ms)
+  ✔ AC3 (negative path): a SIGKILLed sentinel fails the wrapper visibly (724.917511ms)
+✔ E3.C.1 US-007 — sentinel-parent regression proof (994633.099523ms)
+ℹ tests 4
+ℹ suites 1
+ℹ pass 4
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 994692.603641

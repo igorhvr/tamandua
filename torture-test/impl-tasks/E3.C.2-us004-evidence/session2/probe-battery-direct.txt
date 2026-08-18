@@ -1,0 +1,11 @@
+▶ E3.C US-011 zero-token scripted probe battery
+  ✔ every probe sequence (W3.17b chaos, W3.18-W3.22) runs end-to-end on the 53xx scripted instance with evidence + O16 verdicts, zero tokens (870753.592502ms)
+✔ E3.C US-011 zero-token scripted probe battery (870754.162214ms)
+ℹ tests 1
+ℹ suites 1
+ℹ pass 1
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 870805.221755

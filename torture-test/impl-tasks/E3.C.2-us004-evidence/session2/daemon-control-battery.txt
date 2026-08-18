@@ -1,0 +1,505 @@
+=== daemon-control self-test ===
+
+--- Test: --help ---
+  PASS: --help prints usage
+  PASS: --help exits 0
+  PASS: -h prints usage (short form)
+  PASS: --help mentions tool name
+
+--- Test: --help content ---
+  PASS: --help mentions subcommand 'start'
+  PASS: --help mentions subcommand 'stop'
+  PASS: --help mentions subcommand 'restart'
+  PASS: --help mentions subcommand 'status'
+  PASS: --help includes example 'real start'
+  PASS: --help mentions 'scripted'
+
+--- Test: no arguments ---
+  PASS: no arguments exits non-zero (rc=1)
+  PASS: no arguments prints helpful message
+
+--- Test: invalid kind ---
+  PASS: invalid kind exits non-zero (rc=1)
+  PASS: invalid kind prints helpful error message
+
+--- Test: invalid command ---
+  PASS: invalid command exits non-zero (rc=1)
+  PASS: invalid command prints helpful error message
+
+--- Test: production port detection ---
+PASS: 3334 detected as production
+PASS: 3338 detected as production
+PASS: 3339 detected as production
+PASS: 4334 NOT production
+PASS: 5334 NOT production
+PASS: 9999 NOT production
+PASS: 0 NOT production
+  PASS: all production port detection checks passed (7 checks)
+
+--- Test: production guard refusal ---
+  PASS: refuse_production function exists in source
+  PASS: production_target function exists in source
+  PASS: is_production_cwd function exists in source
+  PASS: script checks REAL_TAMANDUA_STATE (production state dir guard)
+  PASS: script defines PROD_PORTS for production guard
+
+--- Test: systemd detection ---
+  PASS: has_systemd_scope function exists in source
+  PASS: systemd detection uses systemd-run --user --scope
+  PASS: has_systemd_scope has non-systemd fallback path
+  PASS: systemd detection function runs without error (result: HAS_SYSTEMD)
+
+--- Test: env script application isolation ---
+  PASS: env_for_kind function exists in source
+  PASS: env application uses 'env -i ... print' (isolated)
+  PASS: source documents 'never source into caller' rule
+  PASS: run_under_env function exists in source
+  PASS: tt-env.sh print emits HOME override
+  PASS: tt-env.sh sets dashboard port to 4334 (non-production)
+  PASS: caller HOME unchanged after env operations
+
+--- Test: directory setup ---
+  PASS: ensure_prov_dir function exists in source
+  PASS: daemon-control creates prov dir with mkdir -p (code check)
+
+--- Test: no npm dependencies ---
+  PASS: tool is a bash script (no npm needed)
+  PASS: tool does not rely on npm/npx
+  PASS: tool uses node only for the tt-process-identity identity CLI
+
+--- Test: path resolution conventions ---
+  PASS: uses SCRIPT_DIR resolution pattern (like tt-run/tt-provision-home)
+  PASS: resolves TT_REPO_ROOT from script location
+
+--- Test: error handling flags ---
+  PASS: script uses 'set -euo pipefail'
+
+--- Test: help documents scripted-runtime caveat ---
+  PASS: --help documents that scripted daemon start works before runtimes installed
+
+--- Test: subcommand implementation status ---
+  PASS: subcommand 'start' is implemented (no stub text)
+  PASS: subcommand 'stop' is implemented (no stub text)
+  PASS: subcommand 'restart' is implemented (no stub text)
+  PASS: subcommand 'status' is implemented (no stub text)
+  PASS: cmd_start function exists
+  PASS: cmd_stop function exists
+  PASS: cmd_restart function exists
+  PASS: cmd_status function exists
+
+--- Test: restart/status stub removal ---
+  PASS: real restart: no longer a stub
+  PASS: real restart: no longer exits 3 (stub code)
+  PASS: real status: no longer a stub
+  PASS: real status: no longer exits 3 (stub code)
+  PASS: scripted restart: no longer a stub
+  PASS: scripted restart: no longer exits 3 (stub code)
+  PASS: scripted status: no longer a stub
+  PASS: scripted status: no longer exits 3 (stub code)
+
+--- Test: start subcommand production guard ---
+  PASS: cmd_start checks is_production_port
+  PASS: cmd_start checks is_production_cwd
+  PASS: scripted start is handled by cmd_start (kind parameter used)
+
+--- Test: start subcommand systemd integration ---
+  PASS: cmd_start checks has_systemd_scope
+  PASS: cmd_start uses tamandua-tt- scope unit prefix
+  PASS: cmd_start constructs systemd-run command with --user --scope --unit
+
+--- Test: per-worktree scope unit name (E3.C.2 US-002) ---
+  PASS: cmd_start derives a per-worktree scope unit (tamandua-tt-<kind>-<suffix>)
+  PASS: cmd_start derives the per-worktree suffix from the repo root (cksum)
+  PASS: cmd_start no longer uses the fixed per-user scope unit name
+  PASS: tool never targets the bare fixed scope names
+  PASS: cmd_stop gates scope cleanup on per-worktree ownership
+  (test worktree scope suffix: 73fb6661)
+
+--- Test: bounded port-free wait before launch (E3.C.2 US-002) ---
+  PASS: cmd_start supports the TT_DAEMON_PORT_WAIT_SECONDS override
+  PASS: cmd_start fails with a clear diagnostic when the port-free bound is exceeded
+  PASS: cmd_start requires the ports to stay free across a settle (stable-free wait)
+
+--- Test: stale pid file cleanup (E3.C.2 US-002) ---
+  PASS: cmd_start documents the stale-pid-file cleanup
+  PASS: cmd_start removes a stale daemon pid file before launch
+
+--- Test: wait_for_port function ---
+  PASS: wait_for_port function exists
+  PASS: wait_for_port uses /dev/tcp for port checking
+
+--- Test: cgroup verification ---
+  PASS: verify_cgroup function exists
+  PASS: verify_cgroup checks /proc/<pid>/cgroup
+
+--- Test: provenance JSON ---
+  PASS: write_provenance function exists
+  PASS: provenance record includes 'name'
+  PASS: provenance record includes 'kind'
+  PASS: provenance record includes 'pid'
+  PASS: provenance record includes 'ports'
+  PASS: provenance record includes 'scopeUnit'
+  PASS: provenance record includes 'cgroupVerified'
+  PASS: provenance record includes 'startedAt'
+  PASS: provenance record includes 'cmdline'
+  PASS: provenance record includes 'cwd'
+  PASS: provenance record includes 'startTime'
+  PASS: write_provenance uses jq when available (with fallback)
+  PASS: write_provenance has jq-less fallback path (heredoc)
+
+--- Test: PID capture from daemon.pid ---
+  PASS: cmd_start reads daemon PID from tamandua.pid
+  PASS: cmd_start verifies PID liveness with kill -0
+
+--- Test: start subcommand env isolation ---
+  PASS: cmd_start uses env -i $(env_for_kind) for isolation
+  PASS: cmd_start passes PATH explicitly to spawned process
+
+--- Test: start subcommand port waiting ---
+  PASS: cmd_start loops over all three ports for waiting
+  PASS: cmd_start calls wait_for_port
+
+--- Test: help reflects start implementation ---
+  PASS: --help documents systemd scope containment
+
+--- Test: stop subcommand implementation ---
+  PASS: cmd_stop is implemented (not a stub)
+  PASS: cmd_stop no longer contains 'not yet implemented'
+
+--- Test: stop subcommand production guard ---
+  PASS: cmd_stop checks is_production_port
+  PASS: cmd_stop checks is_production_cwd
+  PASS: cmd_stop calls refuse_production on guard trip
+
+--- Test: verify_process_tt_owned function ---
+  PASS: verify_process_tt_owned function exists
+
+--- Test: /proc evidence checks ---
+  PASS: verify_process_tt_owned checks /proc/PID/cwd
+  PASS: verify_process_tt_owned checks /proc/PID/cmdline
+  PASS: verify_process_tt_owned checks cwd against TT_REPO_ROOT
+  PASS: verify_process_tt_owned requires tamandua in cmdline
+
+--- Test: is_port_listening function ---
+  PASS: is_port_listening function exists
+  PASS: is_port_listening uses /dev/tcp for port checking
+
+--- Test: update_provenance_after_stop function ---
+  PASS: update_provenance_after_stop function exists
+
+--- Test: stoppedAt and exitCode fields ---
+  PASS: update_provenance_after_stop adds stoppedAt
+  PASS: update_provenance_after_stop adds exitCode
+  PASS: update_provenance_after_stop uses jq when available (with fallback)
+
+--- Test: already-stopped handling ---
+  PASS: cmd_stop handles already-stopped daemon
+  PASS: cmd_stop handles missing provenance file (no prior start)
+
+--- Test: systemd scope cleanup in stop ---
+  PASS: cmd_stop cleans up systemd scope after stop
+  PASS: cmd_stop references scope for cleanup
+
+--- Test: no name-only matching ---
+  PASS: cmd_stop uses verify_process_tt_owned before signaling
+  PASS: cmd_stop refuses to signal processes not proven TT-owned
+
+--- Test: US-004 recorded startTime identity gating ---
+  PASS: daemon-control references the tt-process-identity CLI (IDENTITY_TOOL)
+  PASS: write_provenance records startTime identity
+  PASS: cmd_start reads the daemon startTime identity via --get
+  PASS: cmd_stop reads recorded startTime from provenance
+  PASS: cmd_stop verifies recorded identity before signalling
+  PASS: cmd_stop re-verifies identity before SIGKILL escalation
+  PASS: cmd_stop refuses to kill lingering listeners that are not the recorded daemon
+  PASS: cmd_stop uses verify_listener_target for lingering listeners
+  PASS: verify_recorded_identity function exists
+  PASS: verify_listener_target function exists
+
+--- Test: stop subcommand env isolation ---
+  PASS: cmd_stop uses run_under_env for env isolation
+
+--- Test: graceful stop via tamandua CLI ---
+  PASS: cmd_stop runs tamandua dashboard stop for graceful shutdown
+
+--- Test: escalation SIGTERM → SIGKILL ---
+  PASS: cmd_stop escalates with SIGTERM
+  PASS: cmd_stop escalates with SIGKILL after SIGTERM
+
+--- Test: provenance updated after stop ---
+  PASS: cmd_stop calls update_provenance_after_stop
+
+--- Test: stop subcommand port polling ---
+  PASS: cmd_stop uses is_port_listening for port polling
+  PASS: cmd_stop has shutdown timeout logic
+
+--- Test: restart subcommand implementation ---
+  PASS: cmd_restart is implemented (not a stub)
+
+--- Test: restart calls stop logic ---
+  PASS: cmd_restart calls cmd_stop to stop existing daemon
+
+--- Test: restart calls start logic ---
+  PASS: cmd_restart calls cmd_start to restart daemon
+
+--- Test: restart handles not-running daemon (clean start) ---
+  PASS: cmd_restart handles not-running daemon as clean start
+
+--- Test: restart verifies ports free after stop ---
+  PASS: cmd_restart verifies ports are free after stop before starting
+
+--- Test: restart re-asserts cgroup membership ---
+  PASS: cmd_start (called by restart) includes systemd/cgroup logic
+
+--- Test: restart production guard ---
+  PASS: main dispatch runs production guard before subcommands (including restart)
+
+--- Test: restart provenance preserved ---
+  PASS: cmd_restart references prov_file for provenance
+
+--- Test: kind HOME/TAMANDUA_STATE_DIR containment guard (FIX10 US-004) ---
+  PASS: guard_kind_containment function exists in source
+  PASS: resolve_contained_dir helper exists in source
+  PASS: main dispatch runs guard_kind_containment after guard_kind_cwd
+  PASS: guard_kind_containment checks HOME and TAMANDUA_STATE_DIR
+  PASS: guard_kind_containment fails closed via refuse_production
+  PASS: guard_kind_containment rejects var itself as a live HOME
+
+--- Test: restart provenance preserved ---
+  PASS: cmd_restart references prov_file for provenance
+  PASS: provenance path references are limited (3 unique, not duplicated)
+
+--- Test: restart jq fallback ---
+  PASS: cmd_restart checks for jq (supports jq-less fallback)
+
+--- Test: status subcommand implementation ---
+  PASS: cmd_status is implemented (not a stub)
+
+--- Test: status reads provenance file ---
+  PASS: cmd_status reads provenance file
+
+--- Test: status checks /proc/PID existence ---
+  PASS: cmd_status checks /proc/<pid> for process existence
+
+--- Test: status checks port listening ---
+  PASS: cmd_status uses is_port_listening for port checks
+
+--- Test: status reports RUNNING ---
+  PASS: cmd_status reports RUNNING when daemon is up
+
+--- Test: status reports STOPPED ---
+  PASS: cmd_status reports STOPPED when daemon is down
+
+--- Test: status reports UNKNOWN ---
+  PASS: cmd_status reports UNKNOWN for ambiguous state
+
+--- Test: status reports NO_PROVENANCE ---
+  PASS: cmd_status reports NO_PROVENANCE when provenance file is missing
+
+--- Test: status verifies PID cmdline ---
+  PASS: cmd_status verifies PID cmdline contains tamandua
+
+--- Test: status production guard ---
+  PASS: cmd_status checks is_production_port for guard
+
+--- Test: status jq fallback ---
+  PASS: cmd_status checks for jq availability (fallback path)
+
+--- Test: status uses kill -0 for liveness ---
+  PASS: cmd_status uses kill -0 for PID liveness check
+
+--- Test: status port status details ---
+  PASS: cmd_status reports individual port LISTENING status
+  PASS: cmd_status reports individual port free status
+
+--- Test: status reports stoppedAt when present ---
+  PASS: cmd_status reports stoppedAt field when present in provenance
+
+--- Test: restart stop→start chain integrity ---
+  PASS: cmd_restart stop→start chain: stop check → cmd_stop → port verify → cmd_start present
+
+=== US-006: Integration smoke tests ===
+  INFO: production DB snapshot: dd2d76ef2da87ae4d96c84e3cd9ba7cc33fc48b97b9430cea4019ea78c7b91e9
+
+--- Test: tt-provision-home idempotency ---
+  First run exit code: 0
+  PASS: tt-provision-home first run succeeds
+  PASS: snapshot captured after first provision run
+  Second run exit code: 0
+  PASS: tt-provision-home second run succeeds
+  PASS: tt-provision-home idempotent: file listings identical after two runs
+  PASS: tt-provision-home idempotent: all file checksums identical after two runs
+
+--- Test: daemon-control real start ---
+  Start output (last 5 lines):
+    daemon-control: port 4338 is listening
+    daemon-control: waiting for port 4339...
+    daemon-control: port 4339 is listening
+    daemon-control: provenance written to /home/igorhvr/.tamandua/worktrees/tamandua-73d5fbc9/867-3af479d1/torture-test/var/daemon-control/real.json
+    daemon-control: real daemon started on ports 4334 (dashboard) 4338 (MCP) 4339 (control)
+  PASS: daemon-control real start exits 0
+  PASS: real daemon dashboard port 4334 is listening after start
+
+--- Test: daemon-control real status ---
+  PASS: daemon-control real status reports RUNNING
+
+--- Test: tamandua status under real spawn env ---
+  PASS: tamandua status under real spawn env exits 0
+  PASS: tamandua status shows daemon/dashboard info
+
+--- Test: tamandua doctor under real spawn env ---
+  Doctor exit code: 0
+  PASS: tamandua doctor under real spawn env produces check output
+
+--- Test: daemon-control real stop ---
+  Stop output (last 3 lines):
+    daemon-control: REFUSING — lingering listener PID 1379785 on port 4338 is not the recorded daemon (or its identity is unrecorded); not killed
+    daemon-control: cleaning up systemd scope tamandua-tt-real-73fb6661...
+    daemon-control: real daemon stopped successfully
+  PASS: daemon-control real stop exits 0
+  PASS: all real daemon ports (4334/4338/4339) free after stop
+
+--- Test: production DB integrity after real daemon test ---
+  PASS: production DB sha256 unchanged: dd2d76ef2da87ae4d96c84e3cd9ba7cc33fc48b97b9430cea4019ea78c7b91e9
+
+--- Test: no new production port listeners after real daemon test ---
+  PASS: production port listeners detected but not tamandua TT processes (existing production daemon)
+
+--- Test: daemon-control scripted start ---
+  Start output (last 5 lines):
+    daemon-control: port 5338 is listening
+    daemon-control: waiting for port 5339...
+    daemon-control: port 5339 is listening
+    daemon-control: provenance written to /home/igorhvr/.tamandua/worktrees/tamandua-73d5fbc9/867-3af479d1/torture-test/var/daemon-control/scripted.json
+    daemon-control: scripted daemon started on ports 5334 (dashboard) 5338 (MCP) 5339 (control)
+  PASS: daemon-control scripted start exits 0
+  PASS: scripted daemon dashboard port 5334 is listening after start
+
+--- Test: provenance scopeUnit is per-worktree (E3.C.2 US-002) ---
+  PASS: provenance scopeUnit is the per-worktree unit (tamandua-tt-scripted-73fb6661)
+  PASS: provenance scopeUnit is not the bare fixed name
+  PASS: scripted systemd scope unit exists with the per-worktree name
+  PASS: no bare fixed scripted scope unit after start
+
+--- Test: busy port fails start with a clear diagnostic (E3.C.2 US-002) ---
+  PASS: busy control port -> start fails with the port-free diagnostic (rc=1)
+  PASS: no half-up daemon after the refused start
+
+--- Test: daemon-control scripted status ---
+  PASS: daemon-control scripted status reports RUNNING
+
+--- Test: daemon-control scripted stop ---
+  PASS: daemon-control scripted stop exits 0
+  PASS: all scripted daemon ports (5334/5338/5339) free after stop
+
+--- Test: production guard refusal (port) ---
+  PASS: production guard functions reference is_production_port and refuse_production
+  PASS: port 3334 correctly identified as production
+  PASS: port 3338 correctly identified as production
+  PASS: port 3339 correctly identified as production
+  PASS: port 4334 correctly identified as NOT production
+  PASS: port 5334 correctly identified as NOT production
+  PASS: port 9999 correctly identified as NOT production
+
+--- Test: production guard refusal (cwd) ---
+  PASS: detects real ~/.tamandua as production cwd
+  PASS: TT_ROOT correctly identified as NOT production cwd
+
+--- Test: provenance JSON for real daemon ---
+  PASS: real daemon provenance file exists: /home/igorhvr/.tamandua/worktrees/tamandua-73d5fbc9/867-3af479d1/torture-test/bin/../var/daemon-control/real.json
+  PASS: real provenance JSON parses with jq
+  PASS: real provenance contains 'name'
+  PASS: real provenance contains 'kind'
+  PASS: real provenance contains 'pid'
+  PASS: real provenance contains 'ports'
+  PASS: real provenance contains 'scopeUnit'
+  PASS: real provenance contains 'cgroupVerified'
+  PASS: real provenance contains 'startedAt'
+  PASS: real provenance contains 'cmdline'
+  PASS: real provenance contains 'cwd'
+  PASS: real provenance contains 'startTime'
+  PASS: real provenance contains stoppedAt (daemon was stopped)
+  PASS: real provenance contains exitCode (daemon was stopped)
+
+--- Test: provenance JSON for scripted daemon ---
+  PASS: scripted daemon provenance file exists: /home/igorhvr/.tamandua/worktrees/tamandua-73d5fbc9/867-3af479d1/torture-test/bin/../var/daemon-control/scripted.json
+  PASS: scripted provenance JSON parses with jq
+  PASS: scripted provenance contains 'name'
+  PASS: scripted provenance contains 'kind'
+  PASS: scripted provenance contains 'pid'
+  PASS: scripted provenance contains 'ports'
+  PASS: scripted provenance contains 'scopeUnit'
+  PASS: scripted provenance contains 'cgroupVerified'
+  PASS: scripted provenance contains 'startedAt'
+  PASS: scripted provenance contains 'cmdline'
+  PASS: scripted provenance contains 'cwd'
+  PASS: scripted provenance contains 'startTime'
+  PASS: scripted provenance contains stoppedAt (daemon was stopped)
+  PASS: scripted provenance contains exitCode (daemon was stopped)
+
+--- Test: daemon-control real restart round-trip ---
+  PASS: real daemon running before restart test
+  PASS: daemon-control real restart exits 0
+  PASS: real daemon dashboard port 4334 listening after restart
+  PASS: real daemon status is RUNNING after restart
+
+--- Test: daemon-control scripted restart round-trip ---
+  PASS: scripted daemon running before restart test
+  PASS: daemon-control scripted restart exits 0
+  PASS: scripted daemon dashboard port 5334 listening after restart
+  PASS: scripted daemon status is RUNNING after restart
+
+--- Test: real status STOPPED after final stop ---
+  PASS: daemon-control real status reports STOPPED after stop
+
+--- Test: scripted status STOPPED after final stop ---
+  PASS: daemon-control scripted status reports STOPPED after stop
+
+--- Test: production DB integrity after ALL tests ---
+  PASS: production DB sha256 unchanged through all tests: dd2d76ef2da87ae4d96c84e3cd9ba7cc33fc48b97b9430cea4019ea78c7b91e9
+
+--- Test: restart provenance preservation ---
+  PASS: real provenance preserved after restart (kind=real)
+  PASS: scripted provenance preserved after restart (kind=scripted)
+
+--- Test: final cleanup — all TT ports free ---
+  PASS: all TT ports (43xx + 53xx) free after complete test cleanup
+
+=== US-004: ABA-safe stop escalation tests ===
+
+--- Test: stale-pid ABA refusal (US-004) ---
+  PASS: ABA decoy listener spawned (pid 1391732)
+  PASS: ABA decoy is listening on port 5339
+  PASS: ABA stop refuses with an identity-mismatch message
+  PASS: ABA decoy SURVIVED — stale-provenance pid was never signalled
+  PASS: ABA decoy received NO signals (signal log empty)
+
+--- Test: decoy listener refusal (US-004) ---
+  PASS: decoy listener spawned (pid 1392323)
+  PASS: decoy listener is listening on port 5338
+  PASS: decoy cwd is under TT_REPO_ROOT (/home/igorhvr/.tamandua/worktrees/tamandua-73d5fbc9/867-3af479d1/torture-test) — matches old scan signature
+  PASS: decoy cmdline contains 'tamandua' — matches old scan signature
+  PASS: stop refuses to kill the decoy listener (identity unconfirmed)
+  PASS: decoy listener SURVIVED — not killed on cwd/cmdline evidence alone
+  PASS: decoy listener received NO signals (signal log empty)
+
+--- Test: recorded daemon stop still works (US-004) ---
+  PASS: scripted daemon started for normal-stop round-trip
+  PASS: scripted provenance records a startTime identity (proc:340329632)
+  PASS: scripted daemon stopped cleanly via identity-verified stop
+  PASS: all scripted ports free after identity-verified stop
+
+--- Test: CLI-auto-started daemon stop (E3.C.2 US-004) ---
+  PASS: CLI daemon stand-in bound 5339 and recorded its pid (1394021)
+  PASS: cmd_stop stopped the CLI-auto-started daemon (rc=0)
+  PASS: CLI daemon stand-in PID 1394021 is dead after stop
+  PASS: control port 5339 free after CLI-daemon stop
+
+--- Test: cmd_start absorbs CLI-auto-started daemon (E3.C.2 US-004) ---
+  PASS: CLI daemon stand-in bound 5339 before cmd_start (pid 1394206)
+  PASS: cmd_start absorbed the CLI-auto-started daemon and launched (rc=0)
+  PASS: CLI daemon stand-in PID 1394206 dead after cmd_start
+  PASS: control port 5339 listening (new daemon up)
+
+================================================
+ALL TESTS PASSED

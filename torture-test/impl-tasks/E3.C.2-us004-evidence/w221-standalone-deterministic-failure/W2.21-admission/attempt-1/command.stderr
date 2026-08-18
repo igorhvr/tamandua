@@ -1,0 +1,36 @@
+install-scenario-workflows: installed do-now-w2.21-admission-edge-20260818T093547-921301-24ab4622a525 (1 agents)
+daemon-control: starting scripted daemon...
+daemon-control: using systemd scope: tamandua-tt-scripted-73fb6661
+daemon-control: daemon PID 921771
+daemon-control: cgroup membership verified for tamandua-tt-scripted-73fb6661
+daemon-control: waiting for port 5334...
+daemon-control: port 5334 is listening
+daemon-control: waiting for port 5338...
+daemon-control: port 5338 is listening
+daemon-control: waiting for port 5339...
+daemon-control: port 5339 is listening
+daemon-control: provenance written to /home/igorhvr/.tamandua/worktrees/tamandua-73d5fbc9/867-3af479d1/torture-test/var/daemon-control/scripted.json
+daemon-control: scripted daemon started on ports 5334 (dashboard) 5338 (MCP) 5339 (control)
+node:internal/modules/run_main:107
+    triggerUncaughtException(
+    ^
+
+AssertionError [ERR_ASSERTION]: daemon restart failed: daemon-control: starting scripted daemon...
+daemon-control: ERROR — scripted ports 5339 are still in use after 10s (a concurrent worktree daemon or a stuck listener); refusing to launch into a busy port
+
+
+1 !== 0
+
+    at file:///home/igorhvr/.tamandua/worktrees/tamandua-73d5fbc9/867-3af479d1/torture-test/scenarios/w2.21/run.mjs:85:10
+    at ModuleJob.run (node:internal/modules/esm/module_job:439:25)
+    at async node:internal/modules/esm/loader:643:26
+    at async asyncRunEntryPointWithESMLoader (node:internal/modules/run_main:101:5) {
+  generatedMessage: false,
+  code: 'ERR_ASSERTION',
+  actual: 1,
+  expected: 0,
+  operator: 'strictEqual',
+  diff: 'simple'
+}
+
+Node.js v24.18.0

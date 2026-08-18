@@ -7,6 +7,17 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TOOL="${SCRIPT_DIR}/daemon-control"
 
+# E3.C.2 US-002: scope unit names are PER-WORKTREE (tamandua-tt-<kind>-<hash>
+# derived from the repo root — mirroring the T2.1 US-009 pattern) so
+# concurrent campaigns in different worktrees never stop or collide with each
+# other's daemon scope. Mirror daemon-control's derivation here so teardown
+# and assertions use the same unit names.
+TEST_REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+TEST_SCOPE_SUFFIX="$(printf '%s' "$TEST_REPO_ROOT" | cksum 2>/dev/null | awk '{printf "%08x", $1}')"
+[ -n "$TEST_SCOPE_SUFFIX" ] || TEST_SCOPE_SUFFIX="default"
+REAL_SCOPE_UNIT="tamandua-tt-real-$TEST_SCOPE_SUFFIX"
+SCRIPTED_SCOPE_UNIT="tamandua-tt-scripted-$TEST_SCOPE_SUFFIX"
+
 FAILURES=0
 
 pass() { echo "  PASS: $1"; }
@@ -531,6 +542,80 @@ if grep -q 'systemd-run.*--user.*--scope.*--unit' "$TOOL"; then
   pass "cmd_start constructs systemd-run command with --user --scope --unit"
 else
   fail "cmd_start missing systemd-run invocation"
+fi
+
+# ── Test 18a (E3.C.2 US-002): per-worktree scope unit name ───────────
+echo ""
+echo "--- Test: per-worktree scope unit name (E3.C.2 US-002) ---"
+
+# The scope unit must be derived PER-WORKTREE from the repo root (never the
+# old fixed per-user `tamandua-tt-<kind>`): a concurrent campaign in another
+# worktree must not be able to stop/collide with this worktree's scope.
+if grep -A 300 '^cmd_start()' "$TOOL" | grep -q 'scope_unit="tamandua-tt-\$name-\$scope_suffix"'; then
+  pass "cmd_start derives a per-worktree scope unit (tamandua-tt-<kind>-<suffix>)"
+else
+  fail "cmd_start missing per-worktree scope unit derivation"
+fi
+if grep -A 300 '^cmd_start()' "$TOOL" | grep -q 'cksum'; then
+  pass "cmd_start derives the per-worktree suffix from the repo root (cksum)"
+else
+  fail "cmd_start missing repo-root suffix derivation"
+fi
+if ! grep -A 300 '^cmd_start()' "$TOOL" | grep -q 'scope_unit="tamandua-tt-\$name"'; then
+  pass "cmd_start no longer uses the fixed per-user scope unit name"
+else
+  fail "cmd_start still uses the fixed per-user scope unit name"
+fi
+if ! grep -q 'tamandua-tt-scripted\.scope\|tamandua-tt-real\.scope' "$TOOL"; then
+  pass "tool never targets the bare fixed scope names"
+else
+  fail "tool still references a bare fixed scope name"
+fi
+# cmd_stop must only ever tear down THIS worktree's derived scope (a recorded
+# legacy/fixed name or a foreign worktree's unit is refused, never stopped).
+if grep -A 400 '^cmd_stop()' "$TOOL" | grep -q 'scope_unit_is_ours'; then
+  pass "cmd_stop gates scope cleanup on per-worktree ownership"
+else
+  fail "cmd_stop missing per-worktree scope ownership gate"
+fi
+echo "  (test worktree scope suffix: $TEST_SCOPE_SUFFIX)"
+
+# ── Test 18b (E3.C.2 US-002): bounded port-free wait before launch ───
+echo ""
+echo "--- Test: bounded port-free wait before launch (E3.C.2 US-002) ---"
+
+if grep -A 300 '^cmd_start()' "$TOOL" | grep -q 'TT_DAEMON_PORT_WAIT_SECONDS'; then
+  pass "cmd_start supports the TT_DAEMON_PORT_WAIT_SECONDS override"
+else
+  fail "cmd_start missing TT_DAEMON_PORT_WAIT_SECONDS override"
+fi
+if grep -A 300 '^cmd_start()' "$TOOL" | grep -q 'refusing to launch into a busy port'; then
+  pass "cmd_start fails with a clear diagnostic when the port-free bound is exceeded"
+else
+  fail "cmd_start missing busy-port diagnostic"
+fi
+# The port-free wait must observe the ports FREE STABLY (two consecutive
+# observations across a settle) so a foreign daemon that binds between the
+# check and the launch is absorbed by the bounded wait instead of racing us.
+if grep -A 300 '^cmd_start()' "$TOOL" | grep -q 'STAYS free across a settle'; then
+  pass "cmd_start requires the ports to stay free across a settle (stable-free wait)"
+else
+  fail "cmd_start missing the stable-free settle confirmation"
+fi
+
+# ── Test 18c (E3.C.2 US-002): stale pid file cleanup ─────────────────
+echo ""
+echo "--- Test: stale pid file cleanup (E3.C.2 US-002) ---"
+
+if grep -A 300 '^cmd_start()' "$TOOL" | grep -q 'STALE tamandua.pid'; then
+  pass "cmd_start documents the stale-pid-file cleanup"
+else
+  fail "cmd_start missing stale-pid-file cleanup documentation"
+fi
+if grep -A 300 '^cmd_start()' "$TOOL" | grep -q 'rm -f -- "\$daemon_pid_file"'; then
+  pass "cmd_start removes a stale daemon pid file before launch"
+else
+  fail "cmd_start missing stale pid file removal"
 fi
 
 # ── Test 19: start subcommand — wait_for_port function ───────────────
@@ -1406,9 +1491,11 @@ echo "--- Test: daemon-control real start ---"
 
 # Ensure ports are free and systemd scope is cleaned before starting
 REAL_PORTS="4334 4338 4339"
-# Clean up any lingering systemd scope from previous failed runs
-systemctl --user stop tamandua-tt-real.scope 2>/dev/null || true
-systemctl --user reset-failed tamandua-tt-real.scope 2>/dev/null || true
+# Clean up any lingering systemd scope from previous failed runs — the
+# PER-WORKTREE derived unit (E3.C.2 US-002), never the bare fixed name
+# (which would TERM another worktree's daemon).
+systemctl --user stop "$REAL_SCOPE_UNIT.scope" 2>/dev/null || true
+systemctl --user reset-failed "$REAL_SCOPE_UNIT.scope" 2>/dev/null || true
 for port in $REAL_PORTS; do
   if timeout 1 bash -c "echo >/dev/tcp/localhost/$port" 2>/dev/null; then
     echo "  WARNING: port $port is already in use — attempting to stop existing daemon first"
@@ -1585,9 +1672,11 @@ echo ""
 echo "--- Test: daemon-control scripted start ---"
 
 SCRIPTED_PORTS="5334 5338 5339"
-# Clean up any lingering systemd scope from previous failed runs
-systemctl --user stop tamandua-tt-scripted.scope 2>/dev/null || true
-systemctl --user reset-failed tamandua-tt-scripted.scope 2>/dev/null || true
+# Clean up any lingering systemd scope from previous failed runs — the
+# PER-WORKTREE derived unit (E3.C.2 US-002), never the bare fixed name
+# (which would TERM another worktree's daemon).
+systemctl --user stop "$SCRIPTED_SCOPE_UNIT.scope" 2>/dev/null || true
+systemctl --user reset-failed "$SCRIPTED_SCOPE_UNIT.scope" 2>/dev/null || true
 for port in $SCRIPTED_PORTS; do
   if timeout 1 bash -c "echo >/dev/tcp/localhost/$port" 2>/dev/null; then
     echo "  WARNING: port $port is already in use — attempting to stop existing scripted daemon"
@@ -1616,6 +1705,117 @@ if timeout 2 bash -c "echo >/dev/tcp/localhost/5334" 2>/dev/null; then
   pass "scripted daemon dashboard port 5334 is listening after start"
 else
   fail "scripted daemon dashboard port 5334 NOT listening after start"
+fi
+
+# ── Test 73a (E3.C.2 US-002): provenance records the PER-WORKTREE scope ─
+echo ""
+echo "--- Test: provenance scopeUnit is per-worktree (E3.C.2 US-002) ---"
+
+SCRIPTED_PROV="$SCRIPT_DIR/../var/daemon-control/scripted.json"
+if [ -f "$SCRIPTED_PROV" ]; then
+  prov_scope_unit="$(jq -r '.scopeUnit // ""' "$SCRIPTED_PROV" 2>/dev/null || true)"
+  if [ "$prov_scope_unit" = "$SCRIPTED_SCOPE_UNIT" ]; then
+    pass "provenance scopeUnit is the per-worktree unit ($prov_scope_unit)"
+  else
+    fail "provenance scopeUnit expected '$SCRIPTED_SCOPE_UNIT' got '$prov_scope_unit'"
+  fi
+  # The bare fixed name must NEVER be the recorded scope unit.
+  if [ "$prov_scope_unit" = "tamandua-tt-scripted" ]; then
+    fail "provenance scopeUnit is the bare fixed name — cross-worktree collision surface"
+  else
+    pass "provenance scopeUnit is not the bare fixed name"
+  fi
+else
+  fail "scripted provenance file missing after start"
+fi
+
+# The live systemd unit must be the per-worktree derived name — the bare
+# fixed name must not be (re)created by this start.
+if systemctl --user list-units --type=scope --all 2>/dev/null | grep -q "$SCRIPTED_SCOPE_UNIT"; then
+  pass "scripted systemd scope unit exists with the per-worktree name"
+else
+  echo "  (no scope unit listed — plain-background fallback or scope already torn down)"
+fi
+if systemctl --user list-units --type=scope --all 2>/dev/null | grep -q 'tamandua-tt-scripted\.scope'; then
+  fail "the bare fixed scripted scope unit is present after start"
+else
+  pass "no bare fixed scripted scope unit after start"
+fi
+
+# ── Test 73b (E3.C.2 US-002): busy port -> bounded wait -> clear failure ─
+echo ""
+echo "--- Test: busy port fails start with a clear diagnostic (E3.C.2 US-002) ---"
+
+# Stop the running daemon first so the planted listener is the ONLY owner of
+# the scripted control port, then bind 5339 (a "foreign worktree daemon"
+# stand-in) and ask daemon-control to start with a short port-free bound: it
+# must wait out the bound and fail with the explicit diagnostic — never a
+# blind launch into a busy port.
+set +e
+"$TOOL" scripted stop >/dev/null 2>&1
+set -e
+sleep 1
+
+FOREIGN_SQUATTER_PID=""
+if command -v node >/dev/null 2>&1; then
+  # The squatter SELF-TERMINATES after ~6s (well past the 3s port-free bound
+  # and the refused start): this self-test must not introduce a kill site
+  # (tier1-kill-ancestry-hygiene pins that), so teardown waits (liveness
+  # probe) instead of signalling.
+  node -e '
+    const net = require("net");
+    const server = net.createServer();
+    server.listen(5339, "127.0.0.1", () => console.log("SQUATTING"));
+    setTimeout(() => { server.close(); process.exit(0); }, 6000);
+    setInterval(() => {}, 1000);
+  ' >"${TMPDIR:-/tmp}/dc-squatter.out" 2>/dev/null &
+  FOREIGN_SQUATTER_PID=$!
+  sleep 1
+fi
+
+if [ -n "$FOREIGN_SQUATTER_PID" ] && kill -0 "$FOREIGN_SQUATTER_PID" 2>/dev/null; then
+  set +e
+  busy_start_out="$(TT_DAEMON_PORT_WAIT_SECONDS=3 "$TOOL" scripted start 2>&1)"
+  busy_start_rc=$?
+  set -e
+  if [ "$busy_start_rc" -ne 0 ] && echo "$busy_start_out" | grep -q "refusing to launch into a busy port"; then
+    pass "busy control port -> start fails with the port-free diagnostic (rc=$busy_start_rc)"
+  else
+    fail "busy control port -> expected port-free failure, rc=$busy_start_rc out=$(echo "$busy_start_out" | tail -2 | tr '\n' ' ')"
+  fi
+  # The daemon must NOT be up (no half-bootstrap into a busy port). The
+  # squatter legitimately owns 5339, so assert on the daemon PID file: the
+  # refused start exits BEFORE launching, so no live daemon pid may exist.
+  scripted_state_dir="$(bash "$SCRIPT_DIR/../env/tt-env-scripted.sh" print | sed -n 's/^TAMANDUA_STATE_DIR=//p' | head -1)"
+  half_up=false
+  if [ -f "$scripted_state_dir/tamandua.pid" ]; then
+    planted_pid="$(cat "$scripted_state_dir/tamandua.pid" 2>/dev/null || true)"
+    if [ -n "$planted_pid" ] && kill -0 "$planted_pid" 2>/dev/null; then
+      half_up=true
+    fi
+  fi
+  if $half_up; then
+    fail "a half-up daemon (live pid file) exists after the refused start"
+  else
+    pass "no half-up daemon after the refused start"
+  fi
+  # Wait for the squatter's self-termination (liveness probe only — no kill
+  # site allowed by the kill-ancestry hygiene scanner).
+  for _grace in $(seq 1 100); do
+    kill -0 "$FOREIGN_SQUATTER_PID" 2>/dev/null || break
+    sleep 0.1
+  done
+  wait "$FOREIGN_SQUATTER_PID" 2>/dev/null || true
+  sleep 1
+  # Restore the running daemon for the status test that follows. If the
+  # squatter's port is still releasing, cmd_start's bounded port-free wait
+  # absorbs the transient before launching.
+  set +e
+  "$TOOL" scripted start >/dev/null 2>&1
+  set -e
+  sleep 2
+else
+  fail "could not start the foreign-port squatter (node unavailable?) — busy-port arm skipped"
 fi
 
 # ── Test 74: daemon-control scripted status ──────────────────────────
@@ -2362,6 +2562,190 @@ if $all_scripted_free; then
 else
   fail "one or more scripted ports still in use after normal stop"
 fi
+
+# ── Test 90 (E3.C.2 US-004): cmd_stop also stops this worktree's own
+# CLI-auto-started daemon (state-dir pidfile, no provenance/scope) ──────
+echo ""
+echo "--- Test: CLI-auto-started daemon stop (E3.C.2 US-004) ---"
+
+# A `tamandua workflow run` whose CLI finds no reachable daemon auto-starts
+# a PLAIN background daemon (ensureDaemonControlAvailable -> startDaemon):
+# no systemd scope, no daemon-control provenance, recorded only in the
+# kind's state-dir tamandua.pid. cmd_stop must stop it (identity-verified,
+# per-worktree) so a subsequent cmd_start finds the ports free. The
+# stand-in below is a node process with cmdline containing 'tamandua'
+# (filename), cwd under TT_REPO_ROOT, environ TAMANDUA_STATE_DIR == the
+# scripted state dir, bound to the scripted control port, and writing its
+# pid to the state-dir pidfile — exactly the CLI daemon's observable
+# surface. It SELF-TERMINATES after 60s (no kill site in this test file).
+scripted_state_dir="$(bash "$SCRIPT_DIR/../env/tt-env-scripted.sh" print | sed -n 's/^TAMANDUA_STATE_DIR=//p' | head -1)"
+CLI_SIM_SCRIPT="$(mktemp "${TMPDIR:-/tmp}/tt-cli-daemon-sim-tamandua.XXXXXX.mjs")"
+cat > "$CLI_SIM_SCRIPT" <<'CLISIMEOF'
+import net from 'node:net';
+import fs from 'node:fs';
+const stateDir = process.argv[2];
+const log = process.argv[3];
+fs.writeFileSync(`${stateDir}/tamandua.pid`, String(process.pid));
+const server = net.createServer();
+server.listen(5339, '127.0.0.1', () => { try { fs.appendFileSync(log, 'LISTENING\n'); } catch {} });
+setTimeout(() => process.exit(0), 60000);
+setInterval(() => {}, 1000);
+CLISIMEOF
+CLI_SIM_LOG="$(mktemp "${TMPDIR:-/tmp}/tt-cli-sim-log.XXXXXX")"
+CLI_SIM_PID=""
+
+US004_PROV_BAK="$(mktemp "${TMPDIR:-/tmp}/tt-dc-prov.XXXXXX")"
+if [ -f "$US004_PROV" ]; then
+  cp "$US004_PROV" "$US004_PROV_BAK"
+fi
+rm -f "$US004_PROV"   # CLI daemon has NO provenance record
+
+# Spawn the stand-in with the scripted state dir in its environ and cwd at
+# the repo root (matches the CLI daemon's /proc evidence). setsid execs env
+# which execs node, so $! IS the node pid (the pid written to the pidfile).
+TAMANDUA_STATE_DIR="$scripted_state_dir" HOME="$TT_REPO_ROOT/torture-test/var/home-scripted" \
+  setsid env --chdir="$TT_REPO_ROOT" node "$CLI_SIM_SCRIPT" "$scripted_state_dir" "$CLI_SIM_LOG" &
+CLI_SIM_PID=$!
+
+# Wait for the stand-in to bind the control port and write the pidfile.
+sim_ok=false
+for _attempt in $(seq 1 50); do
+  SIM_WAIT_PID="$(cat "$scripted_state_dir/tamandua.pid" 2>/dev/null || true)"
+  if [ -f "$CLI_SIM_LOG" ] && grep -q LISTENING "$CLI_SIM_LOG" \
+      && [ -f "$scripted_state_dir/tamandua.pid" ] \
+      && [ -n "$SIM_WAIT_PID" ] && kill -0 "$SIM_WAIT_PID" 2>/dev/null; then
+    sim_ok=true
+    break
+  fi
+  sleep 0.2
+done
+SIM_RECORDED_PID="$(cat "$scripted_state_dir/tamandua.pid" 2>/dev/null || true)"
+if $sim_ok && [ -n "$SIM_RECORDED_PID" ] && [ "$SIM_RECORDED_PID" = "$CLI_SIM_PID" ]; then
+  pass "CLI daemon stand-in bound 5339 and recorded its pid ($SIM_RECORDED_PID)"
+else
+  fail "CLI daemon stand-in did not come up (pidfile=$(cat "$scripted_state_dir/tamandua.pid" 2>/dev/null || echo missing) log=$(cat "$CLI_SIM_LOG" 2>/dev/null || echo missing))"
+fi
+
+set +e
+"$TOOL" scripted stop >"${TMPDIR:-/tmp}/tt-cli-stop.out" 2>&1
+cli_stop_rc=$?
+set -e
+if [ "$cli_stop_rc" -eq 0 ]; then
+  pass "cmd_stop stopped the CLI-auto-started daemon (rc=0)"
+else
+  fail "cmd_stop failed to stop the CLI-auto-started daemon (rc=$cli_stop_rc): $(tail -3 "${TMPDIR:-/tmp}/tt-cli-stop.out" | tr '\n' ' ')"
+fi
+
+# The stand-in must be dead and the control port free.
+if [ -n "$SIM_RECORDED_PID" ] && ! kill -0 "$SIM_RECORDED_PID" 2>/dev/null; then
+  pass "CLI daemon stand-in PID $SIM_RECORDED_PID is dead after stop"
+else
+  fail "CLI daemon stand-in PID $SIM_RECORDED_PID still alive after stop"
+fi
+if ! timeout 1 bash -c "echo >/dev/tcp/localhost/5339" 2>/dev/null; then
+  pass "control port 5339 free after CLI-daemon stop"
+else
+  fail "control port 5339 still busy after CLI-daemon stop"
+fi
+
+# Cleanup: wait out the stand-in's self-termination (liveness probe only),
+# restore provenance, remove temp files.
+for _grace in $(seq 1 50); do
+  kill -0 "$CLI_SIM_PID" 2>/dev/null || break
+  sleep 0.1
+done
+wait "$CLI_SIM_PID" 2>/dev/null || true
+if [ -f "$US004_PROV_BAK" ]; then
+  cp "$US004_PROV_BAK" "$US004_PROV"
+fi
+rm -f "$US004_PROV_BAK" "$CLI_SIM_SCRIPT" "$CLI_SIM_LOG" "${TMPDIR:-/tmp}/tt-cli-stop.out"
+
+# ── Test 91 (E3.C.2 US-004): cmd_start absorbs this worktree's own
+# CLI-auto-started daemon (busy port no longer refuses) ────────────────
+echo ""
+echo "--- Test: cmd_start absorbs CLI-auto-started daemon (E3.C.2 US-004) ---"
+
+# The w2.23c shape: `workflow run` with the daemon down auto-starts a plain
+# CLI daemon on the control port, then the scenario calls `daemon-control
+# scripted start`. cmd_start must stop the CLI daemon (identity-verified)
+# instead of refusing on the busy port.
+US004_PROV_BAK="$(mktemp "${TMPDIR:-/tmp}/tt-dc-prov.XXXXXX")"
+if [ -f "$US004_PROV" ]; then
+  cp "$US004_PROV" "$US004_PROV_BAK"
+fi
+rm -f "$US004_PROV"   # CLI daemon has no provenance
+
+CLI_SIM_SCRIPT="$(mktemp "${TMPDIR:-/tmp}/tt-cli-daemon-sim-tamandua.XXXXXX.mjs")"
+cat > "$CLI_SIM_SCRIPT" <<'CLISIMEOF'
+import net from 'node:net';
+import fs from 'node:fs';
+const stateDir = process.argv[2];
+const log = process.argv[3];
+fs.writeFileSync(`${stateDir}/tamandua.pid`, String(process.pid));
+const server = net.createServer();
+server.listen(5339, '127.0.0.1', () => { try { fs.appendFileSync(log, 'LISTENING\n'); } catch {} });
+setTimeout(() => process.exit(0), 60000);
+setInterval(() => {}, 1000);
+CLISIMEOF
+CLI_SIM_LOG="$(mktemp "${TMPDIR:-/tmp}/tt-cli-sim-log.XXXXXX")"
+CLI_SIM_PID=""
+TAMANDUA_STATE_DIR="$scripted_state_dir" HOME="$TT_REPO_ROOT/torture-test/var/home-scripted" \
+  setsid env --chdir="$TT_REPO_ROOT" node "$CLI_SIM_SCRIPT" "$scripted_state_dir" "$CLI_SIM_LOG" &
+CLI_SIM_PID=$!
+
+sim_ok=false
+for _attempt in $(seq 1 50); do
+  SIM_WAIT_PID="$(cat "$scripted_state_dir/tamandua.pid" 2>/dev/null || true)"
+  if [ -f "$CLI_SIM_LOG" ] && grep -q LISTENING "$CLI_SIM_LOG" \
+      && [ -f "$scripted_state_dir/tamandua.pid" ] \
+      && [ -n "$SIM_WAIT_PID" ] && kill -0 "$SIM_WAIT_PID" 2>/dev/null; then
+    sim_ok=true
+    break
+  fi
+  sleep 0.2
+done
+SIM_RECORDED_PID="$(cat "$scripted_state_dir/tamandua.pid" 2>/dev/null || true)"
+if $sim_ok && [ -n "$SIM_RECORDED_PID" ] && [ "$SIM_RECORDED_PID" = "$CLI_SIM_PID" ]; then
+  pass "CLI daemon stand-in bound 5339 before cmd_start (pid $SIM_RECORDED_PID)"
+else
+  fail "CLI daemon stand-in did not come up before cmd_start"
+fi
+
+set +e
+TT_DAEMON_PORT_WAIT_SECONDS=8 "$TOOL" scripted start >"${TMPDIR:-/tmp}/tt-cli-start.out" 2>&1
+cli_start_rc=$?
+set -e
+if [ "$cli_start_rc" -eq 0 ]; then
+  pass "cmd_start absorbed the CLI-auto-started daemon and launched (rc=0)"
+else
+  fail "cmd_start refused on the CLI daemon's busy port (rc=$cli_start_rc): $(tail -3 "${TMPDIR:-/tmp}/tt-cli-start.out" | tr '\n' ' ')"
+fi
+
+# The stand-in must be dead (cmd_start stopped it) and the daemon up.
+if [ -n "$SIM_RECORDED_PID" ] && ! kill -0 "$SIM_RECORDED_PID" 2>/dev/null; then
+  pass "CLI daemon stand-in PID $SIM_RECORDED_PID dead after cmd_start"
+else
+  fail "CLI daemon stand-in PID $SIM_RECORDED_PID still alive after cmd_start"
+fi
+if timeout 1 bash -c "echo >/dev/tcp/localhost/5339" 2>/dev/null; then
+  pass "control port 5339 listening (new daemon up)"
+else
+  fail "control port 5339 not listening after cmd_start"
+fi
+
+# Cleanup: stop the newly started daemon, wait out the stand-in, restore.
+set +e
+"$TOOL" scripted stop >/dev/null 2>&1
+set -e
+for _grace in $(seq 1 50); do
+  kill -0 "$CLI_SIM_PID" 2>/dev/null || break
+  sleep 0.1
+done
+wait "$CLI_SIM_PID" 2>/dev/null || true
+if [ -f "$US004_PROV_BAK" ]; then
+  cp "$US004_PROV_BAK" "$US004_PROV"
+fi
+rm -f "$US004_PROV_BAK" "$CLI_SIM_SCRIPT" "$CLI_SIM_LOG" "${TMPDIR:-/tmp}/tt-cli-start.out"
 
 echo ""
 echo "================================================"

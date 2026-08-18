@@ -1,0 +1,31 @@
+# E3.C.2 US-001 reproduction output — 2026-08-17T18:35:53Z
+# worktree A (mimicked cmd_start) foreground-launches the fixed-name scope;
+# worktree B (concurrent run) issues the unconditional systemctl stop.
+
+daemon-control: starting scripted daemon...
+daemon-control: using systemd scope: tamandua-tt-scripted
+Terminated                 systemd-run --user --scope --unit="$scope_unit" --quiet env -i sleep 60 > /dev/null 2>&1
+worktree A launcher exit: 143 (143 = killed by SIGTERM from worktree B's stop)
+
+# scope state after (must NOT include bare tamandua-tt-scripted.scope):
+(no tamandua-tt-scripted* scope remains)
+
+# ── LIVE re-enactment observed during the above run (15:35:53 local) ──
+# The repro's PRE-LAUNCH stop (mimicking cmd_start line 603:
+# `systemctl --user stop tamandua-tt-scripted.scope`) ran while worktree
+# 866's campaign was mid-flight on the SAME fixed name. Journal
+# (tamandua-tt-scripted.scope, local time):
+#
+#   15:35:45 Started  tamandua-tt-scripted.scope  | WT=.../866-181102e6 | w2.23c-missing-persona
+#   15:35:53 Stopping tamandua-tt-scripted.scope  | WT=.../866-181102e6 | w2.23c-missing-persona   <-- repro pre-launch stop
+#   15:35:53 Stopped  tamandua-tt-scripted.scope  | (866 scope killed at 7.677s lifetime)
+#   15:35:53 Started  tamandua-tt-scripted.scope  | [systemd-run] /usr/bin/env -i sleep 60          <-- repro launch
+#   15:35:53 Stopping/Stopped ... sleep 60 ...                                                       <-- repro's own stop
+#   15:35:54 Started  tamandua-tt-scripted.scope  | WT=.../866-181102e6 | w2.23c-missing-persona     <-- 866 relaunched
+#
+# The repro's unconditional stop of the fixed name TERMinated a live
+# concurrent run's in-flight scope — the EXACT mechanism diagnosed. 866's
+# campaign relaunched the scenario and continued (its smoke campaign
+# completed 2/2; production 33xx daemon never touched). This live collision
+# is itself the proof: any daemon-control invocation on the shared fixed
+# name TERMs whatever scope is live, regardless of which run owns it.

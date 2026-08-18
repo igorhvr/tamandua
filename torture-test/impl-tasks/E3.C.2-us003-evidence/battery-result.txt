@@ -1,0 +1,22 @@
+=== run.sh bounded battery result (2026-08-17, concurrent 865 campaign live on 5334/5338/5339) ===
+=== Results: 82 passed, 11 failed ===
+
+--- new US-003 test in battery ---
+  PASS: tier1 tier1-daemon-control-scope-isolation.test.ts
+
+--- failing files (all PRE-EXISTING; identical at parent bd7071f2) ---
+tier0-bash32-compat-lint.test.ts
+tier0-dry-run-argv-recording.test.ts
+tier0-hygiene-canary.test.ts
+tier0-real-host-profile-predicate.integration.test.ts
+tier1-e24-baseline-verifier-expect.test.ts
+tier1-e24-regenerated-goldens.test.ts
+tier2-dsh-host-profile.test.ts
+tier2-roster-section-h.test.ts
+tier2-roster-section-ijk.test.ts
+
+=== parent-commit (bd7071f2, pre-US-003) comparison: same 9 files, same signatures ===
+3
+3
+2
+(causes: worktree 865 campaign holds the fixed ports -> tt-verify-environment port check FAILs -> host-profile.json never written -> ENOENT cascade; E3.C.1-owned tt-kill-sentinel bash-3.2 unguarded-array violation pre-dates US-003)

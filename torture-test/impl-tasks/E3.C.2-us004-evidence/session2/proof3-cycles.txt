@@ -1,0 +1,28 @@
+Proof 3: 3x scripted start/status/stop cycles — 12:05:24
+worktree: /home/igorhvr/.tamandua/worktrees/tamandua-73d5fbc9/867-3af479d1
+
+=== CYCLE 1 ===
+start OK
+status RUNNING
+stop OK
+no leaked scope
+no leftover processes from this worktree's scripted state dir
+ports 5334/5338/5339 free
+
+=== CYCLE 2 ===
+start OK
+status RUNNING
+stop OK
+no leaked scope
+no leftover processes from this worktree's scripted state dir
+ports 5334/5338/5339 free
+
+=== CYCLE 3 ===
+start OK
+status RUNNING
+stop OK
+no leaked scope
+no leftover processes from this worktree's scripted state dir
+ports 5334/5338/5339 free
+
+=== proof3 done 12:06:19 ===

@@ -1,0 +1,39 @@
+TAMANDUA TORTURE-TEST CAMPAIGN REPORT
+Campaign: campaign-20260818T093547646Z-27fa7dda-b4b6-4a9b-a12b-d1c331fc00f4
+Manifest: cases/tier1.jsonl
+Created: 2026-08-18T09:35:47.647Z
+Completed: 2026-08-18T09:36:16.877Z
+
+SCENARIO OUTCOMES
+CASE             WAVE  CLASS         OUTCOME       TOKENS  WALL
+---------------  ----  ------------  ------------  ------  ----------
+W2.21-admission  2     verification  PRODUCT_FAIL  0       0m 29.146s
+Totals: PASS=0  PRODUCT_FAIL=1  AGENT_FLAKE=0  PROVIDER_FAIL=0  TEST_INFRA_FAIL=0  INVALID=0  INCONCLUSIVE=0  NOT_RUN=0
+
+SPEND LEDGER
+Tokens observed: 0
+Wall spend: 0m 29.230s
+
+PENDING_REAL
+(none)
+
+RUN TEARDOWN (US-005)
+(no provisioned working clones — nothing to teardown)
+
+NOT_RUN
+(none)
+
+FINDINGS
+- W2.21-admission: O1 - local-case mechanical check failed: command_passed
+- W2.21-admission: O3z - local-case mechanical check failed: command_passed
+- W2.21-admission: O11 - local-case mechanical check failed: command_passed
+
+HYGIENE CANARY
+Home: /home/igorhvr
+- gitconfig: UNCHANGED (before=37efbe30aeb76ac16f9e11c0d2fa3da5b3c133e5c89ba601732d80432d95efa6, after=37efbe30aeb76ac16f9e11c0d2fa3da5b3c133e5c89ba601732d80432d95efa6)
+- ssh_config: UNCHANGED (before=6636c927e7af53b1d4eb2ccc6ff36f71205b3760617f037d4d0323e625a7e430, after=6636c927e7af53b1d4eb2ccc6ff36f71205b3760617f037d4d0323e625a7e430)
+- crontab: ABSENT (before=absent, after=absent)
+- operator identity files unchanged
+
+VERDICT
+FINDINGS (exit 1)

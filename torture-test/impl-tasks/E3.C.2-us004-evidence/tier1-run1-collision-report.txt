@@ -1,0 +1,98 @@
+TAMANDUA TORTURE-TEST CAMPAIGN REPORT
+Campaign: campaign-20260818T054259328Z-9e566483-d3bf-47d3-b18a-f2efa761e0fa
+Manifest: cases/tier1.jsonl
+Created: 2026-08-18T05:42:59.329Z
+Completed: 2026-08-18T05:44:02.525Z
+
+SCENARIO OUTCOMES
+CASE                     WAVE  CLASS             OUTCOME       TOKENS  WALL
+-----------------------  ----  ----------------  ------------  ------  ----------
+W1.L1-python             1     verification      NOT_RUN       0       0m 0.000s
+W1.L1-ts                 1     verification      NOT_RUN       0       0m 0.000s
+W1.L2-python             1     verification      NOT_RUN       0       0m 0.000s
+W1.L2-ts                 1     verification      NOT_RUN       0       0m 0.000s
+W1.L3-python             1     verification      NOT_RUN       0       0m 0.000s
+W1.L3-ts                 1     verification      NOT_RUN       0       0m 0.000s
+W1.X1-ts                 1     verification      NOT_RUN       0       0m 0.000s
+W1.M1-python             1     verification      NOT_RUN       0       0m 0.000s
+W1.REPLAY-python         1     verification      NOT_RUN       0       0m 0.000s
+W1.REPLAY-ts             1     verification      NOT_RUN       0       0m 0.000s
+W2.21-admission          2     verification      PRODUCT_FAIL  0       0m 28.367s
+W2.22-non-main-bfmw      2     verification      NOT_RUN       0       0m 0.000s
+W2.23a-expects-regex     2     verification      PRODUCT_FAIL  0       0m 11.501s
+W2.23b-retry-step        2     verification      PRODUCT_FAIL  0       0m 11.502s
+W2.23c-missing-persona   2     verification      PRODUCT_FAIL  0       0m 11.502s
+W2.24-docs-drift         2     verification      NOT_RUN       0       0m 0.000s
+W3.01-bfmw-pi-python     3     verification      NOT_RUN       0       0m 0.000s
+W3.02-bfmw-pi-ts         3     verification      NOT_RUN       0       0m 0.000s
+W3.03-bfmw-hermes-ts     3     verification      NOT_RUN       0       0m 0.000s
+W3.04-fdmw-pi-ts         3     verification      NOT_RUN       0       0m 0.000s
+W3.17a-marathon-natural  3     characterization  NOT_RUN       0       0m 0.000s
+W3.17b-marathon-chaos    3     verification      NOT_RUN       0       0m 0.000s
+W3.18-pause-no-drain     3     verification      NOT_RUN       0       0m 0.000s
+W3.19-pause-drain        3     verification      NOT_RUN       0       0m 0.000s
+W3.20-cancel             3     verification      NOT_RUN       0       0m 0.000s
+W3.21-fail-force-resume  3     verification      NOT_RUN       0       0m 0.000s
+W3.22-daemon-restart     3     verification      NOT_RUN       0       0m 0.000s
+W3.23-token-saver        3     verification      NOT_RUN       0       0m 0.000s
+Totals: PASS=0  PRODUCT_FAIL=4  AGENT_FLAKE=0  PROVIDER_FAIL=0  TEST_INFRA_FAIL=0  INVALID=0  INCONCLUSIVE=0  NOT_RUN=24
+
+SPEND LEDGER
+Tokens observed: 0
+Wall spend: 1m 3.196s
+
+PENDING_REAL
+- W1.L1-python: pending-real
+- W1.L1-ts: pending-real
+- W1.L2-python: pending-real
+- W1.L2-ts: pending-real
+- W1.L3-python: pending-real
+- W1.L3-ts: pending-real
+- W1.X1-ts: pending-real
+- W1.M1-python: pending-real
+- W1.REPLAY-python: pending-real
+- W1.REPLAY-ts: pending-real
+- W2.22-non-main-bfmw: pending-real
+- W2.24-docs-drift: pending-real
+- W3.01-bfmw-pi-python: pending-real
+- W3.02-bfmw-pi-ts: pending-real
+- W3.03-bfmw-hermes-ts: pending-real
+- W3.04-fdmw-pi-ts: pending-real
+- W3.17a-marathon-natural: pending-real
+- W3.17b-marathon-chaos: pending-real
+- W3.18-pause-no-drain: pending-real
+- W3.19-pause-drain: pending-real
+- W3.20-cancel: pending-real
+- W3.21-fail-force-resume: pending-real
+- W3.22-daemon-restart: pending-real
+- W3.23-token-saver: pending-real
+
+RUN TEARDOWN (US-005)
+(no provisioned working clones — nothing to teardown)
+
+NOT_RUN
+(none)
+
+FINDINGS
+- W2.21-admission: O1 - local-case mechanical check failed: command_passed
+- W2.21-admission: O3z - local-case mechanical check failed: command_passed
+- W2.21-admission: O11 - local-case mechanical check failed: command_passed
+- W2.23a-expects-regex: O1 - local-case mechanical check failed: command_passed
+- W2.23a-expects-regex: O3z - local-case mechanical check failed: command_passed
+- W2.23a-expects-regex: O11 - local-case mechanical check failed: command_passed
+- W2.23b-retry-step: O1 - local-case mechanical check failed: command_passed
+- W2.23b-retry-step: O3z - local-case mechanical check failed: command_passed
+- W2.23b-retry-step: O11 - local-case mechanical check failed: command_passed
+- W2.23c-missing-persona: O1 - local-case mechanical check failed: command_passed
+- W2.23c-missing-persona: O3z - local-case mechanical check failed: command_passed
+- W2.23c-missing-persona: O11 - local-case mechanical check failed: command_passed
+
+HYGIENE CANARY
+Home: /home/igorhvr
+- gitconfig: UNCHANGED (before=37efbe30aeb76ac16f9e11c0d2fa3da5b3c133e5c89ba601732d80432d95efa6, after=37efbe30aeb76ac16f9e11c0d2fa3da5b3c133e5c89ba601732d80432d95efa6)
+- ssh_config: UNCHANGED (before=6636c927e7af53b1d4eb2ccc6ff36f71205b3760617f037d4d0323e625a7e430, after=6636c927e7af53b1d4eb2ccc6ff36f71205b3760617f037d4d0323e625a7e430)
+- crontab: ABSENT (before=absent, after=absent)
+- operator identity files unchanged
+
+VERDICT
+FINDINGS (exit 1)

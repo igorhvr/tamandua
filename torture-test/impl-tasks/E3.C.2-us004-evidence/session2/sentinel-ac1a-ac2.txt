@@ -1,0 +1,4 @@
+US-004 session 2 — sentinel AC1a (O4 battery) + AC2 (2026-08-18)
+cmd: node --test --test-name-pattern="AC1a|AC2" torture-test/self-tests/tier1-kill-sentinel-survival.test.ts
+result: 2 pass / 0 fail (AC1a 123459ms O4 battery under sentinel; AC2 trivial cleanup)
+SENTINEL SURVIVED reported by AC1a

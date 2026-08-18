@@ -1,0 +1,17 @@
+▶ E3.C.2 US-003 — concurrent-run collision regression guard (per-worktree scope isolation)
+  ✔ scope-unit derivation is per-worktree: two roots -> two distinct units, never the bare fixed name, deterministic per root (7.935114ms)
+  ✔ cmd_start derives the per-worktree unit name tamandua-tt-<kind>-<suffix> from TT_REPO_ROOT (0.654513ms)
+  ✔ daemon-control defines the per-worktree scope helpers (0.089829ms)
+  ✔ every systemctl --user stop site is scoped to the per-worktree unit (structural cross-worktree isolation) (1.165949ms)
+  ✔ cmd_start carries the bounded port-free wait (TT_DAEMON_PORT_WAIT_SECONDS + busy-port refusal + stable-free settle) (0.218407ms)
+  ✔ cmd_stop never issues systemctl stop against a foreign/legacy scope (safe simulated systemd) (1060.51682ms)
+  ✔ cmd_start refuses to launch while the kind's fixed ports are held (bounded wait, distinct reason, no half-up daemon) (15169.322546ms)
+✔ E3.C.2 US-003 — concurrent-run collision regression guard (per-worktree scope isolation) (16240.696602ms)
+ℹ tests 7
+ℹ suites 1
+ℹ pass 7
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 16294.487644

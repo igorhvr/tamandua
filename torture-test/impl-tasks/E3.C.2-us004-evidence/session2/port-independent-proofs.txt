@@ -1,0 +1,21 @@
+US-004 session 2 — port-independent proofs (2026-08-18)
+worktree: /home/igorhvr/.tamandua/worktrees/tamandua-73d5fbc9/867-3af479d1
+commit: e4647463 feat: US-004 - daemon-control stops this worktree's own CLI-auto-started daemon
+
+== typecheck ==
+tsc exit 0
+
+== kill-ancestry hygiene scanner ==
+ℹ tests 45
+ℹ pass 45
+ℹ fail 0
+
+== US-003 scope-isolation guard ==
+ℹ tests 7
+ℹ pass 7
+ℹ fail 0
+
+== final-acceptance ==
+ℹ tests 7
+ℹ pass 7
+ℹ fail 0

@@ -1,0 +1,5 @@
+install-scenario-workflows: installed do-now-w2.21-admission-edge-20260817T175545-1194244-7a1634fb886e (1 agents)
+daemon-control: starting scripted daemon...
+daemon-control: using systemd scope: tamandua-tt-scripted
+Terminated                 systemd-run --user --scope --unit="$scope_unit" --quiet env -i $(env_for_kind "$kind") PATH="${PATH}" bash -c "$launch_script" > /dev/null 2>&1
+run-scripted-scenario: daemon-control scripted start failed

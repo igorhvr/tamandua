@@ -1,0 +1,4 @@
+US-004 session 2 — repo test suite via tamandua-test shim (2026-08-18)
+cmd: tamandua-test --repo ... --run ... --step implement -- 'npm test'
+result: rc=0 — Serial lane PASSED (3140 pass / 0 fail), Parallel lane PASSED (2148 pass / 0 fail)
+tree: stable (no commits during run); full log: /tmp/us004-npm-test2.log

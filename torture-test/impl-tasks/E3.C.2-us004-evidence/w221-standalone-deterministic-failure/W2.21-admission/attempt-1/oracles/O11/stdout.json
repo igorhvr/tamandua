@@ -1,0 +1,1 @@
+{"contract_version":1,"oracle_id":"O11","result":"FAIL","started_at":"2026-08-18T09:36:16.868Z","finished_at":"2026-08-18T09:36:16.871Z","findings":[{"id":"LOCAL_SCENARIO_EVIDENCE_FAILED","summary":"local-case mechanical check failed: command_passed"}],"evidence":[{"path":"local-scenario-verdict.json","kind":"local-scenario-mechanical-proof"}]}

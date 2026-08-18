@@ -235,6 +235,12 @@ const allowed = [
   // install-scenario-workflows (associative-array removal so they run under
   // macOS /bin/bash 3.2.57) — part of the Darwin-parity authoring surface.
   "torture-test/scripted-runtimes/",
+  // E3.C.2 (US-001/US-002/US-003): the impl-tasks/ surface is the established
+  // E3.C.2 evidence/notes location (root-cause note, implementation notes,
+  // campaign/journal/provenance evidence bundles). US-003 adds it to the
+  // authoring set so the final-acceptance confinement test passes on the
+  // merged E3.C.2 branch diff.
+  "torture-test/impl-tasks/",
 ];
 // US-016 added the Tier-2 story's no-touch surfaces to the forbidden set:
 // the E3.C.1-owned tier1 kill-path/probe-battery self-tests (a concurrent

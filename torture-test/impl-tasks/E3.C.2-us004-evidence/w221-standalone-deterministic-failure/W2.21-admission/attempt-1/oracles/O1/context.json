@@ -1,0 +1,137 @@
+{
+  "contract_version": 1,
+  "oracle_id": "O1",
+  "campaign": {
+    "id": "campaign-20260818T093547646Z-27fa7dda-b4b6-4a9b-a12b-d1c331fc00f4",
+    "created_at": "2026-08-18T09:35:47.647Z",
+    "manifest": {
+      "sha256": "9ef494997c9c7f1cfa3945c8f3c76aba531e7b03e03856bab557021ff7fbdab8",
+      "case_count": 1,
+      "case_ids": [
+        "W2.21-admission"
+      ]
+    }
+  },
+  "case": {
+    "id": "W2.21-admission",
+    "wave": 2,
+    "workflow": "local",
+    "fixture": "none",
+    "harness": "local",
+    "class": "verification",
+    "caps": {
+      "tokens": 0,
+      "wall_min": 2
+    },
+    "boundary_files": [
+      "scenarios/w2.21"
+    ],
+    "forbidden": [
+      "env/tt-env.sh"
+    ],
+    "chaos": null
+  },
+  "run_id": null,
+  "attempts": [
+    {
+      "id": "attempt-1",
+      "kind": "local",
+      "phase": "terminal",
+      "execution_mode": "scripted",
+      "run_id": null,
+      "started_at": "2026-08-18T09:35:47.653Z",
+      "terminal_at": "2026-08-18T09:36:16.799Z",
+      "terminal_status": "failed",
+      "tokens_observed": 0,
+      "command_result": {
+        "exit_code": 1,
+        "signal": null
+      },
+      "steps_snapshot": null,
+      "straggler_capture": null
+    }
+  ],
+  "discovered_runs": [],
+  "o1_wave": {
+    "schema_version": 1,
+    "wave": 2,
+    "duration_floors": [],
+    "runs": []
+  },
+  "mechanical_evidence": {
+    "schema_version": 1,
+    "references": {
+      "database_snapshot": {
+        "path": "snapshots/W2.21-admission/attempt-1/local-case-proof.json",
+        "sha256": "4b10109859283aa132086d6aa903f8f5803485eedc081c7b6016e506cc0e8373",
+        "captured_at": "2026-08-18T09:36:16.799Z",
+        "source": "controller-local-case"
+      },
+      "run_events": {
+        "path": "snapshots/W2.21-admission/attempt-1/local-case-proof.json",
+        "sha256": "4b10109859283aa132086d6aa903f8f5803485eedc081c7b6016e506cc0e8373",
+        "captured_at": "2026-08-18T09:36:16.799Z",
+        "source": "controller-local-case"
+      },
+      "workflow_status": {
+        "path": "snapshots/W2.21-admission/attempt-1/local-case-proof.json",
+        "sha256": "4b10109859283aa132086d6aa903f8f5803485eedc081c7b6016e506cc0e8373",
+        "captured_at": "2026-08-18T09:36:16.799Z",
+        "source": "controller-local-case"
+      },
+      "launch_intent": null,
+      "git_bundle": null,
+      "refs_before": null,
+      "refs_after": null,
+      "target_reflog": null,
+      "checksum_baseline": null,
+      "checksum_terminal": null,
+      "suite_ledger": null,
+      "suite_observations": null,
+      "token_deltas": {
+        "path": "snapshots/W2.21-admission/attempt-1/local-case-proof.json",
+        "sha256": "4b10109859283aa132086d6aa903f8f5803485eedc081c7b6016e506cc0e8373",
+        "captured_at": "2026-08-18T09:36:16.799Z",
+        "source": "controller-local-case"
+      },
+      "round_usage": {
+        "path": "snapshots/W2.21-admission/attempt-1/local-case-proof.json",
+        "sha256": "4b10109859283aa132086d6aa903f8f5803485eedc081c7b6016e506cc0e8373",
+        "captured_at": "2026-08-18T09:36:16.799Z",
+        "source": "controller-local-case"
+      },
+      "system_tokens_before": {
+        "path": "snapshots/W2.21-admission/attempt-1/local-case-proof.json",
+        "sha256": "4b10109859283aa132086d6aa903f8f5803485eedc081c7b6016e506cc0e8373",
+        "captured_at": "2026-08-18T09:36:16.799Z",
+        "source": "controller-local-case"
+      },
+      "system_tokens_after": {
+        "path": "snapshots/W2.21-admission/attempt-1/local-case-proof.json",
+        "sha256": "4b10109859283aa132086d6aa903f8f5803485eedc081c7b6016e506cc0e8373",
+        "captured_at": "2026-08-18T09:36:16.799Z",
+        "source": "controller-local-case"
+      },
+      "submit_rejections": {
+        "path": "snapshots/W2.21-admission/attempt-1/local-case-proof.json",
+        "sha256": "4b10109859283aa132086d6aa903f8f5803485eedc081c7b6016e506cc0e8373",
+        "captured_at": "2026-08-18T09:36:16.799Z",
+        "source": "controller-local-case"
+      },
+      "expects_validations": {
+        "path": "snapshots/W2.21-admission/attempt-1/local-case-proof.json",
+        "sha256": "4b10109859283aa132086d6aa903f8f5803485eedc081c7b6016e506cc0e8373",
+        "captured_at": "2026-08-18T09:36:16.799Z",
+        "source": "controller-local-case"
+      },
+      "dispatch_renderings": {
+        "path": "snapshots/W2.21-admission/attempt-1/local-case-proof.json",
+        "sha256": "4b10109859283aa132086d6aa903f8f5803485eedc081c7b6016e506cc0e8373",
+        "captured_at": "2026-08-18T09:36:16.799Z",
+        "source": "controller-local-case"
+      },
+      "probe_evidence": null,
+      "chaos_log": null
+    }
+  }
+}

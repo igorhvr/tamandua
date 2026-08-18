@@ -1,0 +1,12 @@
+{
+  "executable": "/home/igorhvr/.tamandua/worktrees/tamandua-73d5fbc9/867-3af479d1/torture-test/scenarios/lib/run-scripted-scenario",
+  "args": [
+    "scenarios/w2.21"
+  ],
+  "cwd": "/home/igorhvr/.tamandua/worktrees/tamandua-73d5fbc9/867-3af479d1/torture-test",
+  "stdout_path": "/home/igorhvr/.tamandua/worktrees/tamandua-73d5fbc9/867-3af479d1/torture-test/var/results/campaign-20260818T093547646Z-27fa7dda-b4b6-4a9b-a12b-d1c331fc00f4/evidence/W2.21-admission/attempt-1/command.stdout",
+  "stderr_path": "/home/igorhvr/.tamandua/worktrees/tamandua-73d5fbc9/867-3af479d1/torture-test/var/results/campaign-20260818T093547646Z-27fa7dda-b4b6-4a9b-a12b-d1c331fc00f4/evidence/W2.21-admission/attempt-1/command.stderr",
+  "result_path": "/home/igorhvr/.tamandua/worktrees/tamandua-73d5fbc9/867-3af479d1/torture-test/var/results/campaign-20260818T093547646Z-27fa7dda-b4b6-4a9b-a12b-d1c331fc00f4/evidence/W2.21-admission/attempt-1/command.result.json",
+  "deadline_at": "2026-08-18T09:37:47.653Z",
+  "evidence_limit_bytes": 16777216
+}

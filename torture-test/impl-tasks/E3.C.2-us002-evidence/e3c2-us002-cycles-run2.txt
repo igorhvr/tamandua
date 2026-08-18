@@ -1,0 +1,37 @@
+== E3.C.2 US-002: 3x scripted daemon start/status/stop cycles ==
+repo:      /home/igorhvr/.tamandua/worktrees/tamandua-73d5fbc9/867-3af479d1
+scope:     tamandua-tt-scripted-73fb6661
+started:   2026-08-17T19:29:27Z
+
+── cycle 1 ──
+  [cycle 1] start: OK
+  [cycle 1] status: RUNNING
+  [cycle 1] stop: OK
+  [cycle 1] no leaked scope: OK
+  [cycle 1] no leaked daemon processes: OK
+  [cycle 1] port 5334 free: OK
+  [cycle 1] port 5338 free: OK
+  [cycle 1] port 5339 free: OK
+
+── cycle 2 ──
+  [cycle 2] start: OK
+  [cycle 2] status: RUNNING
+  [cycle 2] stop: OK
+  [cycle 2] no leaked scope: OK
+  [cycle 2] no leaked daemon processes: OK
+  [cycle 2] port 5334 free: OK
+  [cycle 2] port 5338 free: OK
+  [cycle 2] port 5339 free: OK
+
+── cycle 3 ──
+  [cycle 3] start: OK
+  [cycle 3] status: RUNNING
+  [cycle 3] stop: OK
+  [cycle 3] no leaked scope: OK
+  [cycle 3] no leaked daemon processes: OK
+  [cycle 3] port 5334 free: OK
+  [cycle 3] port 5338 free: OK
+  [cycle 3] port 5339 free: OK
+
+== result: PASS ==
+finished: 2026-08-17T19:30:24Z

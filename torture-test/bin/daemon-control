@@ -329,6 +329,16 @@ Environment:
   Spawn env is applied ONLY to the tamandua process, never to the caller.
   - real:     torture-test/env/tt-env.sh
   - scripted: torture-test/env/tt-env-scripted.sh
+  TT_DAEMON_PORT_WAIT_SECONDS: bounded seconds cmd_start waits for the
+    kind's fixed ports (scripted 5334/5338/5339, real 4334/4338/4339) to be
+    free before launching (default 10) — concurrent worktrees serialize on
+    the shared ports instead of EADDRINUSE-failing their bootstrap.
+
+The systemd scope unit name is PER-WORKTREE:
+  tamandua-tt-<kind>-<8-hex-cksum of TT_REPO_ROOT>
+so concurrent worktrees never stop or collide with each other's daemon scope
+(E3.C.2 US-002; the old fixed tamandua-tt-<kind> name let a concurrent run's
+stop TERM another run's in-flight daemon launch).
 
 Production guards:
   - Ports 3334/3338/3339 are blocked by construction.
@@ -555,6 +565,34 @@ PROVEOF
   echo "daemon-control: provenance written to $prov_file" >&2
 }
 
+# scope_suffix_for_root: stable per-worktree scope suffix (8-hex cksum of the
+# repo root) used to derive the systemd scope unit name (E3.C.2 US-002,
+# mirroring the T2.1 US-009 pattern prototyped in worktree 865). The OLD unit
+# name (tamandua-tt-<kind>) was FIXED and shared by every worktree, so a
+# concurrent run's cmd_start pre-launch clean-slate or cmd_stop cleanup
+# TERM'd another run's in-flight systemd-run daemon launch (the E3.C.2
+# scripted-start SIGTERM regression: bash prints `Terminated <cmd>`, set -e
+# exits 143). Deriving the unit name from TT_REPO_ROOT gives every worktree
+# its own scope: no other worktree can stop or collide with it.
+scope_suffix_for_root() {
+  local root="$1"
+  local suffix
+  suffix="$(printf '%s' "$root" | cksum 2>/dev/null | awk '{printf "%08x", $1}')"
+  [ -n "$suffix" ] || suffix="default"
+  printf '%s' "$suffix"
+}
+
+# scope_unit_is_ours: returns 0 iff the recorded scope unit $1 is THIS
+# worktree's derived per-worktree unit for kind $2 — the ONLY scope
+# daemon-control may stop. A provenance record naming the OLD fixed scope
+# (tamandua-tt-<kind>, shared by every worktree — the E3.C.2 collision
+# surface) or a foreign worktree's unit is refused, never stopped.
+scope_unit_is_ours() {
+  local candidate="$1"
+  local kind="$2"
+  [ "$candidate" = "tamandua-tt-$kind-$(scope_suffix_for_root "$TT_REPO_ROOT")" ]
+}
+
 cmd_start() {
   local kind="$1"
   local name="$kind"
@@ -589,12 +627,88 @@ cmd_start() {
 
   local daemon_pid_file="$state_dir/tamandua.pid"
   local use_systemd=false
-  local scope_unit="tamandua-tt-$name"
+  # E3.C.2 US-002: per-worktree systemd scope unit name
+  # (tamandua-tt-<kind>-<8-hex-cksum of TT_REPO_ROOT>, T2.1 US-009 pattern).
+  # The OLD fixed name (tamandua-tt-scripted / tamandua-tt-real) was shared
+  # by every concurrent worktree, so one run's cmd_start pre-launch
+  # `systemctl --user stop <old fixed scope>.scope` SIGTERM'd ANOTHER
+  # run's in-flight systemd-run launch (the E3.C.2 scripted-start regression:
+  # bash prints `Terminated <cmd>`, set -e exits 143). Deriving a STABLE
+  # per-worktree suffix from the repo root gives each worktree its own scope
+  # unit — no other worktree can stop or collide with it.
+  local scope_suffix
+  scope_suffix="$(scope_suffix_for_root "$TT_REPO_ROOT")"
+  local scope_unit="tamandua-tt-$name-$scope_suffix"
 
   # Build the launch command: start daemon (control-plane+motor),
   # then dashboard, then MCP — all under the spawn env.
   local launch_script
   launch_script="tamandua daemon start && tamandua dashboard start --port $dash_port && tamandua mcp start --port $mcp_port"
+
+  # E3.C.2 US-002: bounded port-free wait BEFORE launching (both launch
+  # paths). With per-worktree scope names a concurrent worktree's daemon can
+  # no longer be SIGTERM'd by our clean-slate, but it may still be RUNNING
+  # and holding this kind's FIXED ports (scripted 5334/5338/5339, real
+  # 4334/4338/4339) — launching into a busy control port would fail the
+  # daemon start with EADDRINUSE. Wait (bounded; env-overridable
+  # TT_DAEMON_PORT_WAIT_SECONDS with a small default so self-tests stay
+  # fast) for the ports to free — the other worktree's scenario ends and
+  # stops its daemon — then launch; fail with a clear diagnostic if the
+  # bound is exceeded (a stuck foreign daemon).
+  local port_wait_seconds="${TT_DAEMON_PORT_WAIT_SECONDS:-10}"
+  case "$port_wait_seconds" in
+    ''|*[!0-9]*) port_wait_seconds=10 ;;
+  esac
+  local port_wait_deadline; port_wait_deadline=$(($(date +%s) + port_wait_seconds))
+  # E3.C.2 US-004 FINDING: a busy port here may be held by the CLI-auto-
+  # started daemon OF THIS WORKTREE (`workflow run` ->
+  # ensureDaemonControlAvailable -> startDaemon — no provenance, no scope,
+  # recorded only in the state-dir tamandua.pid; e.g. a scenario that
+  # launched the run with the daemon down and then calls daemon-control
+  # start). Stop it (identity-verified, per-worktree) so the wait below
+  # finds the ports free; a foreign-worktree daemon or an unverifiable pid
+  # is refused by the helper and the bounded wait/refusal below applies.
+  stop_cli_auto_daemon "$kind"
+  # Require the ports to be free STABLY (two consecutive observations
+  # separated by a settle): a foreign daemon that binds inside the settle
+  # window is absorbed by continuing the bounded wait instead of racing us
+  # into EADDRINUSE.
+  local still_busy=""
+  while [ "$(date +%s)" -lt "$port_wait_deadline" ]; do
+    still_busy=""
+    for port in $dash_port $mcp_port $ctrl_port; do
+      if [ -n "$port" ] && is_port_listening "$port"; then still_busy="$still_busy $port"; fi
+    done
+    if [ -z "$still_busy" ]; then
+      # Free on this pass: confirm it STAYS free across a settle.
+      sleep 2
+      still_busy=""
+      for port in $dash_port $mcp_port $ctrl_port; do
+        if [ -n "$port" ] && is_port_listening "$port"; then still_busy="$still_busy $port"; fi
+      done
+      if [ -z "$still_busy" ]; then break; fi
+    else
+      sleep 1
+    fi
+  done
+  if [ -n "$still_busy" ]; then
+    echo "daemon-control: ERROR — $kind ports$still_busy are still in use after ${port_wait_seconds}s (a concurrent worktree daemon or a stuck listener); refusing to launch into a busy port" >&2
+    exit 1
+  fi
+
+  # E3.C.2 US-002: a daemon killed by a foreign worktree's former clean-slate
+  # (or a SIGKILL/crash) can leave a STALE tamandua.pid (dead pid). The pid
+  # wait below treats an EXISTING pid file as "daemon ready", so a stale file
+  # would break the wait immediately and fail "PID is not alive". Ports are
+  # free here (checked above), so any pid file is stale: remove it so the
+  # launch below starts a fresh wait for the NEW daemon's pid.
+  if [ -f "$daemon_pid_file" ]; then
+    local stale_pid
+    stale_pid="$(cat "$daemon_pid_file" 2>/dev/null || true)"
+    if [ -z "$stale_pid" ] || ! kill -0 "$stale_pid" 2>/dev/null; then
+      rm -f -- "$daemon_pid_file"
+    fi
+  fi
 
   if has_systemd_scope; then
     use_systemd=true
@@ -686,6 +800,93 @@ cmd_start() {
   fi
 }
 
+# stop_cli_auto_daemon: stop the CLI-auto-started daemon OF THIS WORKTREE.
+# (E3.C.2 US-004 FINDING) A `tamandua workflow run` whose CLI finds no
+# reachable daemon auto-starts a PLAIN background daemon via
+# ensureDaemonControlAvailable -> startDaemon (src/server/daemonctl.ts): no
+# systemd scope, no daemon-control provenance, but it DOES record its pid in
+# the kind state-dir tamandua.pid (the same pidfile daemon-control own
+# daemon writes) and holds the kind control port. The provenance-based
+# stop paths cannot see it (no provenance record), so without this step a
+# later cmd_start bounded port-wait refuses on the busy port (the
+# deterministic W2.21 restart race). The pidfile is the recorded registry;
+# the stop is identity-verified and per-worktree-scoped: the pid must be
+# alive, must NOT be the provenance pid (the recorded daemon is handled by
+# the provenance path), /proc cwd must be under TT_REPO_ROOT + cmdline must
+# contain tamandua (verify_process_tt_owned), and /proc environ must name
+# the state dir OF THIS WORKTREE (a foreign-worktree daemon has a different
+# TAMANDUA_STATE_DIR and is REFUSED, never stopped). The startTime identity
+# is captured and re-verified before every signal (ABA-safe, E3.C.1
+# US-004). $1 = kind. Returns 0 always (a refusal is not an error).
+stop_cli_auto_daemon() {
+  local kind="$1"
+  local state_dir
+  state_dir="$(env_for_kind "$kind" | grep '^TAMANDUA_STATE_DIR=' | cut -d= -f2-)"
+  [ -n "$state_dir" ] || return 0
+  local cli_pid_file="$state_dir/tamandua.pid"
+  [ -f "$cli_pid_file" ] || return 0
+  # The state-dir pidfile is the CLI daemon recorded registry. It is the
+  # SAME pidfile daemon-control own daemon writes, so the provenance-pid
+  # comparison below keeps the normal path from double-stopping.
+  local lingering_pid
+  lingering_pid="$(cat "$cli_pid_file" 2>/dev/null || true)"
+  if [ -z "$lingering_pid" ] || ! echo "$lingering_pid" | grep -qE '^[0-9]+$'; then
+    return 0  # empty/garbage pidfile — nothing to stop
+  fi
+  if ! kill -0 "$lingering_pid" 2>/dev/null; then
+    return 0  # stale pidfile (dead daemon) — cmd_start clears it
+  fi
+  # The provenance pid is handled by the provenance stop path (never
+  # double-stop the same daemon).
+  if [ -f "$PROV_DIR/$kind.json" ]; then
+    local prov_pid
+    prov_pid="$(jq -r '.pid // 0' "$PROV_DIR/$kind.json" 2>/dev/null || echo 0)"
+    if [ "$lingering_pid" = "$prov_pid" ] && [ "$prov_pid" -gt 0 ] 2>/dev/null; then
+      return 0
+    fi
+  fi
+  # ── Identity verification (fail-closed) ───────────────────────────
+  if ! verify_process_tt_owned "$lingering_pid" "$state_dir"; then
+    echo "daemon-control: REFUSING — state-dir pidfile PID $lingering_pid is not proven TT-owned (cwd/cmdline check failed); not stopping a foreign/unverified process" >&2
+    return 0
+  fi
+  # Per-worktree discriminator: the daemon environ must name the state
+  # dir OF THIS WORKTREE. A foreign-worktree CLI daemon has a different
+  # TAMANDUA_STATE_DIR in its environ and must never be stopped.
+  local cli_env_state_dir
+  cli_env_state_dir="$(tr '\0' '\n' < "/proc/$lingering_pid/environ" 2>/dev/null | sed -n 's/^TAMANDUA_STATE_DIR=//p' | head -1 || true)"
+  if [ -n "$cli_env_state_dir" ] && [ "$cli_env_state_dir" != "$state_dir" ]; then
+    echo "daemon-control: REFUSING — state-dir pidfile PID $lingering_pid environ names a foreign state dir ($cli_env_state_dir); not stopping a foreign-worktree daemon" >&2
+    return 0
+  fi
+  # ABA-safe: capture the startTime identity now, re-verify before each
+  # signal (a pid that died and was reused between capture and signal fails
+  # the check and is never signalled).
+  local cli_start_time
+  cli_start_time="$(node "$IDENTITY_TOOL" --get "$lingering_pid" 2>/dev/null || true)"
+  if [ -z "$cli_start_time" ]; then
+    echo "daemon-control: REFUSING — cannot read startTime identity for state-dir pidfile PID $lingering_pid; not stopping an unverifiable process" >&2
+    return 0
+  fi
+  echo "daemon-control: stopping the CLI-auto-started daemon of this worktree (PID $lingering_pid, identity-verified)..." >&2
+  if verify_recorded_identity "$lingering_pid" "$cli_start_time"; then
+    echo "daemon-control: sending SIGTERM to identity-verified CLI daemon PID $lingering_pid" >&2
+    kill -TERM "$lingering_pid" 2>/dev/null || true
+    sleep 2
+    if kill -0 "$lingering_pid" 2>/dev/null; then
+      if verify_recorded_identity "$lingering_pid" "$cli_start_time"; then
+        echo "daemon-control: sending SIGKILL to identity-verified CLI daemon PID $lingering_pid" >&2
+        kill -KILL "$lingering_pid" 2>/dev/null || true
+      else
+        echo "daemon-control: REFUSING SIGKILL — PID $lingering_pid identity no longer matches" >&2
+      fi
+    fi
+  else
+    echo "daemon-control: REFUSING — PID $lingering_pid identity check failed; no signal sent" >&2
+  fi
+  return 0
+}
+
 cmd_stop() {
   local kind="$1"
   local name="$kind"
@@ -694,6 +895,12 @@ cmd_stop() {
   # ── Handle missing provenance ──────────────────────────────────────
   if [ ! -f "$prov_file" ]; then
     echo "daemon-control: no provenance record for $kind — daemon was never started by this tool" >&2
+    # E3.C.2 US-004 FINDING: a CLI-auto-started daemon (no provenance by
+    # construction) may be the only holder of the kind ports. Stop the CLI
+    # daemon OF THIS WORKTREE (state-dir pidfile, identity-verified) before
+    # declaring the ports unknown — a foreign-worktree daemon is never
+    # touched (stop_cli_auto_daemon refuses it).
+    stop_cli_auto_daemon "$kind"
     local ports; ports="$(ports_for_kind "$kind")"
     for port in $ports; do
       if is_port_listening "$port"; then
@@ -724,14 +931,29 @@ cmd_stop() {
 
   if $all_ports_free; then
     echo "daemon-control: $kind daemon is already stopped" >&2
+    # E3.C.2 US-004 FINDING: a CLI-auto-started daemon (workflow run ->
+    # ensureDaemonControlAvailable -> startDaemon) has no provenance record
+    # and no systemd scope, so it is invisible to the provenance paths
+    # above. It can still be alive and holding the kind control port
+    # (recorded only in the state-dir tamandua.pid). Stop the CLI daemon OF
+    # THIS WORKTREE (identity-verified, per-worktree) so the next cmd_start
+    # finds the ports free — a foreign-worktree daemon is never touched.
+    stop_cli_auto_daemon "$kind"
     # A descendant that no longer owns a listener (for example an SSH control
     # process spawned by a daemon child) can keep the transient scope alive.
     # Tear down the provenanced scope even on this idempotent path so the next
-    # scenario can reuse daemon-control's fixed unit name without colliding.
+    # scenario can reuse daemon-control's per-worktree unit name without
+    # colliding. E3.C.2 US-002: only THIS worktree's derived scope is ever
+    # stopped — a recorded legacy/fixed name or a foreign worktree's unit is
+    # refused, never stopped (stopping it would TERM another run's daemon).
     if [ -n "$prov_scope" ] && [ "$prov_scope" != "null" ] && has_systemd_scope; then
-      echo "daemon-control: cleaning up residual systemd scope $prov_scope..." >&2
-      systemctl --user stop "${prov_scope%.scope}.scope" 2>/dev/null || true
-      systemctl --user reset-failed "${prov_scope%.scope}.scope" 2>/dev/null || true
+      if scope_unit_is_ours "$prov_scope" "$name"; then
+        echo "daemon-control: cleaning up residual systemd scope $prov_scope..." >&2
+        systemctl --user stop "${prov_scope%.scope}.scope" 2>/dev/null || true
+        systemctl --user reset-failed "${prov_scope%.scope}.scope" 2>/dev/null || true
+      else
+        echo "daemon-control: REFUSING — provenance scope $prov_scope is not this worktree's scope; not stopping a foreign/legacy scope" >&2
+      fi
     fi
     local has_stopped_at
     has_stopped_at=$(jq -r '.stoppedAt // ""' "$prov_file" 2>/dev/null)
@@ -761,6 +983,18 @@ cmd_stop() {
   else
     pid_alive=false
   fi
+
+  # ── Step 0: also stop the CLI-auto-started daemon OF THIS WORKTREE ──
+  # (E3.C.2 US-004 FINDING) When the ports are busy but the provenance PID
+  # is dead (or the provenance records a DIFFERENT, already-stopped daemon),
+  # the busy ports may be held by a PLAIN daemon auto-started by the CLI
+  # (`workflow run` -> ensureDaemonControlAvailable -> startDaemon) — no
+  # provenance, no systemd scope, recorded only in the state-dir
+  # tamandua.pid. The provenance steps below cannot stop it (its pid is not
+  # the recorded pid and it has no scope), so a later cmd_start bounded
+  # port-wait would refuse on the busy port. Stop it now, identity-verified
+  # and per-worktree-scoped (a foreign-worktree daemon is never touched).
+  stop_cli_auto_daemon "$kind"
 
   echo "daemon-control: stopping $kind daemon (PID $prov_pid)..." >&2
 
@@ -863,11 +1097,18 @@ cmd_stop() {
   done
 
   # ── Step 5: Clean up systemd scope ─────────────────────────────────
+  # E3.C.2 US-002: only THIS worktree's derived scope is ever stopped — a
+  # recorded legacy/fixed name or a foreign worktree's unit is refused, never
+  # stopped (stopping it would TERM another run's daemon).
   if [ -n "$prov_scope" ] && [ "$prov_scope" != "null" ] && has_systemd_scope; then
-    echo "daemon-control: cleaning up systemd scope $prov_scope..." >&2
-    systemctl --user stop "${prov_scope%.scope}.scope" 2>/dev/null || true
-    # reset-failed clears the unit so a fresh systemd-run can reuse the name
-    systemctl --user reset-failed "${prov_scope%.scope}.scope" 2>/dev/null || true
+    if scope_unit_is_ours "$prov_scope" "$name"; then
+      echo "daemon-control: cleaning up systemd scope $prov_scope..." >&2
+      systemctl --user stop "${prov_scope%.scope}.scope" 2>/dev/null || true
+      # reset-failed clears the unit so a fresh systemd-run can reuse the name
+      systemctl --user reset-failed "${prov_scope%.scope}.scope" 2>/dev/null || true
+    else
+      echo "daemon-control: REFUSING — provenance scope $prov_scope is not this worktree's scope; not stopping a foreign/legacy scope" >&2
+    fi
   fi
 
   # ── Step 6: Update provenance with stop metadata ───────────────────

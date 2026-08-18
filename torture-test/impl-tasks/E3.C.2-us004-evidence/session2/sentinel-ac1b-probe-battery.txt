@@ -1,0 +1,11 @@
+▶ E3.C.1 US-007 — sentinel-parent regression proof
+  ✔ AC1b: sentinel survives the probe-battery self-test (tier1-scripted-probe-battery.test.ts) (869468.556907ms)
+✔ E3.C.1 US-007 — sentinel-parent regression proof (869468.960632ms)
+ℹ tests 1
+ℹ suites 1
+ℹ pass 1
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 869518.019376

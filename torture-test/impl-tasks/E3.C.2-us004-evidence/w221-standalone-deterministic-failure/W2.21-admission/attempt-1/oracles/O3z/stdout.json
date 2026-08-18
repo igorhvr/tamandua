@@ -1,0 +1,1 @@
+{"contract_version":1,"oracle_id":"O3z","result":"FAIL","started_at":"2026-08-18T09:36:16.845Z","finished_at":"2026-08-18T09:36:16.849Z","findings":[{"id":"LOCAL_SCENARIO_EVIDENCE_FAILED","summary":"local-case mechanical check failed: command_passed"}],"evidence":[{"path":"o3z-token-gate.json","kind":"zero-token-reconciliation"}]}

@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "captured_at": "2026-08-18T09:36:16.799Z",
+  "oracle_id": "O11",
+  "case_id": "W2.21-admission",
+  "scenario_id": null,
+  "scenario_result": "FAIL",
+  "token_values": [],
+  "runs": [
+    {
+      "run_id": "run-926304fb-cc56-4f17-8422-24b09e7a75f2",
+      "status": "running",
+      "tokens_spent": 0
+    },
+    {
+      "run_id": "run-b66477f8-8dad-4d07-b5f8-01a5d093ee10",
+      "status": "running",
+      "tokens_spent": 0
+    },
+    {
+      "run_id": "run-c2fe1b63-1e6e-4fa0-8a7a-53df1e72e890",
+      "status": "running",
+      "tokens_spent": 0
+    }
+  ],
+  "system_tokens": {
+    "before": 0,
+    "after": 0,
+    "terminal_database": 0
+  },
+  "checks": {
+    "command_passed": false,
+    "scenario_passed": true,
+    "baseline_present": true,
+    "terminal_ledger_present": true,
+    "system_counter_present": true,
+    "token_gate_passed": true,
+    "declared": true
+  }
+}

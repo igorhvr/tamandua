@@ -1,0 +1,2 @@
+Validated 28 case(s) from cases/tier1.jsonl
+Campaign: campaign-20260818T054259328Z-9e566483-d3bf-47d3-b18a-f2efa761e0fa

@@ -1,0 +1,16 @@
+{
+  "name": "scripted",
+  "kind": "scripted",
+  "pid": 2209979,
+  "ports": [
+    "5334",
+    "5338"
+  ],
+  "scopeUnit": "tamandua-tt-scripted",
+  "cgroupVerified": false,
+  "startedAt": "2026-08-17T10:57:30Z",
+  "cmdline": "tamandua daemon start",
+  "cwd": "/home/igorhvr/idm/tamandua/torture-test/var/home-scripted/.tamandua",
+  "stoppedAt": "2026-08-17T17:55:56Z",
+  "exitCode": 0
+}
