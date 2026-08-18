@@ -215,7 +215,7 @@ trap 'exit 143' TERM
 (
   trap '' TERM
   printf '%s\n' "$BASHPID" > "$PIDFILE"
-  TT_KILL_SENTINEL_TOKEN="$TOKEN" "${SUITE_CMD[@]}" &
+  TT_KILL_SENTINEL_TOKEN="$TOKEN" ${SUITE_CMD[@]+"${SUITE_CMD[@]}"} &
   suite_pid=$!
   printf '%s\n' "$suite_pid" > "$SUITE_PID_FILE"
   set +e

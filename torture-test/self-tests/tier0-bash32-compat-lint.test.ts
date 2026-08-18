@@ -284,6 +284,20 @@ describe("tier0 bash-3.2 compatibility lint", () => {
     assert.deepEqual(scanShellFile("pos-no-setu.sh", content), []);
   });
 
+  it("tt-kill-sentinel spawns the suite via the guarded array idiom (KSNT regression)", () => {
+    // E3.C.1 x MACP1 union-gap regression: the unguarded command-argument
+    // expansion TT_KILL_SENTINEL_TOKEN="$TOKEN" "${SUITE_CMD[@]}" under
+    // set -u aborts on bash 3.2 when SUITE_CMD is empty. The sentinel spawn
+    // MUST use the guarded ${name[@]+"${name[@]}"} form.
+    const sentinel = fs.readFileSync(path.join(TT_ROOT, "bin/tt-kill-sentinel"), "utf8");
+    assert.match(
+      sentinel,
+      /TT_KILL_SENTINEL_TOKEN="\$TOKEN" \$\{SUITE_CMD\[@\]\+\"\$\{SUITE_CMD\[@\]\}\"\}/,
+      "tt-kill-sentinel must use the guarded form ${SUITE_CMD[@]+...} for the sentinel spawn; " +
+        'the bare "${SUITE_CMD[@]}" under set -u aborts on bash 3.2',
+    );
+  });
+
   it("does NOT flag pattern literals in comments or single-quoted strings", () => {
     const comments = [
       "#!/usr/bin/env bash",
