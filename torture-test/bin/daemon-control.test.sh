@@ -602,6 +602,18 @@ if grep -A 300 '^cmd_start()' "$TOOL" | grep -q 'STAYS free across a settle'; th
 else
   fail "cmd_start missing the stable-free settle confirmation"
 fi
+# T2.1 US-010 round 2: the settle-confirm still cannot make check-then-act
+# atomic — a foreign daemon can win a shared port in the instant between the
+# settle-recheck and OUR bind (the re-proof campaign's W4.20 bootstrap died
+# EADDRINUSE exactly this way: the foreign scope and ours both started in the
+# same second). cmd_start must RETRY the whole wait+launch+verify cycle within
+# the same bounded deadline instead of failing the start on one collided
+# launch attempt.
+if grep -A 300 '^cmd_start()' "$TOOL" | grep -q 'launch attempt collided'; then
+  pass "cmd_start retries a collided launch attempt within the bounded wait (US-010 round-2 retry)"
+else
+  fail "cmd_start missing the collided-launch retry (US-010 round-2)"
+fi
 
 # ── Test 18c (E3.C.2 US-002): stale pid file cleanup ─────────────────
 echo ""
@@ -681,6 +693,18 @@ if grep -A 100 '^write_provenance()' "$TOOL" | grep -q 'PROVEOF'; then
   pass "write_provenance has jq-less fallback path (heredoc)"
 else
   fail "write_provenance missing jq-less fallback"
+fi
+
+# T2.1 US-010: the ports->JSON conversion must NOT drop the LAST port.
+# `printf '%s' "$ports" | tr ' ' '\n' | while read -r p` skips a final line
+# without a trailing newline, so the control port (5339) was silently dropped
+# from the provenance — the provenance-scoped stop then thought the daemon was
+# already stopped while a CLI-auto-started daemon held exactly 5339 (the tier1
+# W2.21 restart failure). The input must be newline-terminated.
+if grep -A 100 '^write_provenance()' "$TOOL" | grep -Fq "printf '%s\\n' \"\$ports\""; then
+  pass "write_provenance terminates the port list with a newline before tr (no last-port drop)"
+else
+  fail "write_provenance port conversion may drop the last port (no newline before tr)"
 fi
 
 # ── Test 22: start subcommand — PID capture ──────────────────────────
@@ -1099,6 +1123,45 @@ if grep -A 100 '^cmd_restart()' "$TOOL" | grep -q 'ports.*free\|port.*still.*use
   pass "cmd_restart verifies ports are free after stop before starting"
 else
   fail "cmd_restart missing port-free verification after stop"
+fi
+
+# ── Test 45a (T2.1 US-010 round 4): the post-stop port check is a BOUNDED
+#    stable-free wait, not a single shot ─────────────────────────────
+echo ""
+echo "--- Test: restart post-stop port check is a bounded stable-free wait (T2.1 US-010 round 4) ---"
+
+# The re-proof campaign-20260818T145745610Z W4.36 TEST_INFRA_FAIL: a
+# `daemon-control scripted restart` exited 1 in ~15s because the single
+# `sleep 1` + one-pass port check ran while a listener (MCP/dashboard
+# standalone) was still draining after the daemon PID stop. The restart must
+# now wait out the same bounded TT_DAEMON_PORT_WAIT_SECONDS deadline as
+# cmd_start, requiring the ports free STABLY (two consecutive free
+# observations across a settle), before refusing.
+restart_body=$(sed -n '/^cmd_restart()/,/^}/p' "$TOOL")
+if echo "$restart_body" | grep -q 'TT_DAEMON_PORT_WAIT_SECONDS'; then
+  pass "cmd_restart honors the bounded TT_DAEMON_PORT_WAIT_SECONDS port-free deadline"
+else
+  fail "cmd_restart missing the bounded TT_DAEMON_PORT_WAIT_SECONDS port-free wait"
+fi
+if echo "$restart_body" | grep -q 'port_wait_deadline'; then
+  pass "cmd_restart computes a port_wait_deadline for the post-stop wait"
+else
+  fail "cmd_restart missing port_wait_deadline for the post-stop wait"
+fi
+if echo "$restart_body" | grep -q 'sleep 2'; then
+  pass "cmd_restart post-stop wait settles (sleep 2) before confirming ports free"
+else
+  fail "cmd_restart post-stop wait missing the settle-confirm (sleep 2)"
+fi
+if echo "$restart_body" | grep -q 'not freed after stop within'; then
+  pass "cmd_restart refusal names the bounded deadline (not freed after stop within)"
+else
+  fail "cmd_restart refusal missing the bounded-deadline diagnostic"
+fi
+if echo "$restart_body" | grep -q 'while \[ "\$(date +%s)" -lt "\$port_wait_deadline" \]'; then
+  pass "cmd_restart port-free check runs inside the bounded deadline loop"
+else
+  fail "cmd_restart port-free check is not bounded by the deadline loop"
 fi
 
 # ── Test 46: restart re-asserts cgroup membership ──────────────────
@@ -1742,6 +1805,28 @@ else
   pass "no bare fixed scripted scope unit after start"
 fi
 
+# ── Test 73a2 (T2.1 US-010): provenance records EVERY kind port — the
+#    control port must not be dropped by the ports->JSON conversion ────
+echo ""
+echo "--- Test: provenance records all three scripted ports incl. 5339 (T2.1 US-010) ---"
+
+if [ -f "$SCRIPTED_PROV" ]; then
+  prov_ports_csv="$(jq -r '.ports | join(",")' "$SCRIPTED_PROV" 2>/dev/null || true)"
+  missing_port=""
+  for port in 5334 5338 5339; do
+    if ! echo "$prov_ports_csv" | grep -q "$port"; then
+      missing_port="$missing_port $port"
+    fi
+  done
+  if [ -z "$missing_port" ]; then
+    pass "provenance records all scripted ports (5334,5338,5339) — got [$prov_ports_csv]"
+  else
+    fail "provenance missing port(s):$missing_port — got [$prov_ports_csv] (the dropped control port 5339 made the provenance-scoped stop blind to a CLI-auto-started daemon holding only 5339 — the tier1 W2.21 restart failure)"
+  fi
+else
+  fail "scripted provenance file missing after start (cannot check port completeness)"
+fi
+
 # ── Test 73b (E3.C.2 US-002): busy port -> bounded wait -> clear failure ─
 echo ""
 echo "--- Test: busy port fails start with a clear diagnostic (E3.C.2 US-002) ---"
@@ -1816,6 +1901,102 @@ if [ -n "$FOREIGN_SQUATTER_PID" ] && kill -0 "$FOREIGN_SQUATTER_PID" 2>/dev/null
   sleep 2
 else
   fail "could not start the foreign-port squatter (node unavailable?) — busy-port arm skipped"
+fi
+
+# ── Test 73c (T2.1 US-010): transient squatter during the free-settle
+#    window is ABSORBED, not refused ──────────────────────────────────
+echo ""
+echo "--- Test: transient port squatter during the free-settle window is absorbed (T2.1 US-010) ---"
+
+# The US-010 stable-free wait must absorb a foreign daemon that binds a shared
+# scripted port BETWEEN the first "all free" pass and the settle re-check (the
+# operator campaign's W4.11 check-then-launch TOCTOU). Stop the daemon, start
+# daemon-control in the background, plant a TRANSIENT binder on 5339 shortly
+# after the first free pass (inside the 2s settle), hold it past the settle
+# re-check, then release: the start must NOT refuse — it waits out the
+# transient and launches successfully.
+set +e
+"$TOOL" scripted stop >/dev/null 2>&1
+set -e
+sleep 1
+
+TRANSIENT_PID=""
+if command -v node >/dev/null 2>&1; then
+  ( sleep 0.5
+    node -e '
+      const net = require("net");
+      const server = net.createServer();
+      server.listen(5339, "127.0.0.1", () => console.log("TRANSIENT-HELD"));
+      // Hold well past the settle re-check (~2s into the start), then release.
+      setTimeout(() => server.close(() => process.exit(0)), 2500);
+      process.on("SIGTERM", () => server.close(() => process.exit(0)));
+    ' >"${TMPDIR:-/tmp}/dc-transient.out" 2>/dev/null ) &
+  TRANSIENT_PID=$!
+  set +e
+  transient_start_out="$("$TOOL" scripted start 2>&1)"
+  transient_start_rc=$?
+  set -e
+  wait "$TRANSIENT_PID" 2>/dev/null || true
+  if [ "$transient_start_rc" -eq 0 ] && echo "$transient_start_out" | grep -q "scripted daemon started"; then
+    pass "transient squatter in the free-settle window is absorbed; start succeeds (rc=0)"
+  else
+    fail "transient squatter was NOT absorbed; start rc=$transient_start_rc out=$(echo "$transient_start_out" | tail -3 | tr '\n' ' ')"
+  fi
+else
+  fail "node unavailable — transient-squatter arm skipped"
+fi
+
+# ── Test 73d (T2.1 US-010 round 4): RESTART absorbs a transient post-stop
+#    port squatter instead of single-shot refusing ───────────────────
+echo ""
+echo "--- Test: restart absorbs a transient post-stop port squatter (T2.1 US-010 round 4) ---"
+
+# The re-proof campaign-20260818T145745610Z W4.36 TEST_INFRA_FAIL was a
+# post-stop port-DRAIN race: after the daemon PID stopped, a listener (MCP /
+# dashboard standalone) took a few seconds longer to release its socket, and
+# cmd_restart's OLD single `sleep 1` + one-pass check refused immediately
+# ("ports not freed after stop; cannot restart"). The restart now waits the
+# bounded TT_DAEMON_PORT_WAIT_SECONDS deadline for ports free STABLY. This
+# arm plants a TRANSIENT squatter on the scripted control port that holds
+# past the settle but releases well inside a short bound: the restart must
+# absorb it and succeed — never a single-shot refusal.
+set +e
+"$TOOL" scripted stop >/dev/null 2>&1
+set -e
+sleep 1
+# Start a real daemon so the restart has a running daemon to stop+start.
+set +e
+"$TOOL" scripted start >/dev/null 2>&1
+set -e
+sleep 2
+
+RESTART_TRANSIENT_PID=""
+if command -v node >/dev/null 2>&1; then
+  # The restart's cmd_stop takes a moment (graceful stop + settle); plant the
+  # squatter ~1s after restart begins, hold it ~3s (past the settle re-check),
+  # then release. With a 10s bound the restart must wait out the transient
+  # and complete — the pre-fix single-shot check refused in ~1s.
+  ( sleep 1
+    node -e '
+      const net = require("net");
+      const server = net.createServer();
+      server.listen(5339, "127.0.0.1", () => console.log("RESTART-TRANSIENT-HELD"));
+      setTimeout(() => server.close(() => process.exit(0)), 3000);
+      process.on("SIGTERM", () => server.close(() => process.exit(0)));
+    ' >"${TMPDIR:-/tmp}/dc-restart-transient.out" 2>/dev/null ) &
+  RESTART_TRANSIENT_PID=$!
+  set +e
+  restart_transient_out="$(TT_DAEMON_PORT_WAIT_SECONDS=10 "$TOOL" scripted restart 2>&1)"
+  restart_transient_rc=$?
+  set -e
+  wait "$RESTART_TRANSIENT_PID" 2>/dev/null || true
+  if [ "$restart_transient_rc" -eq 0 ] && echo "$restart_transient_out" | grep -q "scripted daemon started"; then
+    pass "restart absorbs the transient post-stop squatter and succeeds (rc=0)"
+  else
+    fail "restart did NOT absorb the transient post-stop squatter; rc=$restart_transient_rc out=$(echo "$restart_transient_out" | tail -4 | tr '\n' ' ')"
+  fi
+else
+  fail "node unavailable — restart-transient-squatter arm skipped"
 fi
 
 # ── Test 74: daemon-control scripted status ──────────────────────────
@@ -2242,7 +2423,49 @@ if [ -f "$SCRIPTED_PROV" ] && command -v jq >/dev/null 2>&1; then
   fi
 fi
 
-# ── Test 86: final cleanup — all TT ports free ──────────────────────
+# ── Test 86: cmd_start clears an orphaned daemon-start.lock (US-006) ─
+echo ""
+echo "--- Test: cmd_start clears an orphaned daemon-start.lock ---"
+
+# W4.12 root cause (operator campaign): a launch CLI SIGINT'd mid-startDaemon
+# leaves the product's O_EXCL daemon-start.lock orphaned; a FRESH lock (<30s
+# stale threshold) makes the next `tamandua daemon start` wait 10s for a daemon
+# pid that never appears and fail ("daemon-control scripted start failed").
+# cmd_start must clear the orphaned lock before launching.
+
+if grep -A 60 '^cmd_start()' "$TOOL" | grep -q 'rm -f --.*daemon-start.lock'; then
+  pass "cmd_start clears the orphaned daemon-start.lock before launching"
+else
+  fail "cmd_start missing daemon-start.lock cleanup"
+fi
+
+# Behavioral arm: plant a FRESH lock in the scripted state dir, then start —
+# the start must succeed AND the pre-planted lock must be gone.
+SCRIPTED_STATE_DIR="$TT_VAR_BASE/home-scripted/.tamandua"
+if [ -d "$SCRIPTED_STATE_DIR" ]; then
+  : > "$SCRIPTED_STATE_DIR/daemon-start.lock"
+  set +e
+  start_out="$("$TOOL" scripted start 2>&1)"
+  start_rc=$?
+  set -e
+  if [ "$start_rc" -eq 0 ]; then
+    pass "scripted start with a pre-planted fresh daemon-start.lock exits 0"
+  else
+    fail "scripted start with pre-planted lock exited $start_rc: $(echo "$start_out" | tail -3)"
+  fi
+  if [ ! -e "$SCRIPTED_STATE_DIR/daemon-start.lock" ]; then
+    pass "pre-planted daemon-start.lock was cleared by cmd_start"
+  else
+    fail "pre-planted daemon-start.lock still present after start"
+  fi
+  set +e
+  "$TOOL" scripted stop >/dev/null 2>&1 || true
+  set -e
+else
+  fail "scripted state dir missing: $SCRIPTED_STATE_DIR"
+fi
+
+# ── Test 87: final cleanup — all TT ports free ──────────────────────
 echo ""
 echo "--- Test: final cleanup — all TT ports free ---"
 

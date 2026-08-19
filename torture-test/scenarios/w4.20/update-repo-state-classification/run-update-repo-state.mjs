@@ -100,6 +100,19 @@ const gitEnv = isolatedGitEnvironment({ GIT_ALLOW_PROTOCOL: "file" });
 // ── reset barrier: stop the contained scripted daemon before the legs ──
 
 stopScriptedDaemon();
+// The legs run `tamandua update` against installed clones that share the
+// SCRIPTED ledger (HOME/.tamandua/tamandua.db under the contained scripted
+// home). The product refuses an update while ANY run is active ("Run
+// tamandua update --force to continue despite active runs") — the correct
+// product behavior, asserted unchanged below. A PRECEDING cell that failed
+// before its scoped cleanup (e.g. W4.21's probe run after a launch-wait
+// timeout, W4.24's probe runs) can leave a run marked [running] in that
+// shared ledger; with the daemon now stopped no such run can be genuinely
+// active, so the four classification legs need a clean slate: mark every
+// stale 'running'/'paused' row failed (a terminal status) before any leg.
+// This does NOT weaken the product's active-run refusal — it only clears
+// runs that can no longer be active because the daemon is down.
+const purgedStaleRuns = purgeStaleActiveRuns();
 await assertPortsFree();
 
 // ── provision the delivery fixtures ────────────────────────────────
@@ -262,10 +275,11 @@ process.stdout.write(`${JSON.stringify({
   scenario: scenarioId,
   result: "PASS",
   legs,
+  purged_stale_runs: purgedStaleRuns,
   tokens_spent: runTokens,
   system_tokens_spent: systemTokens,
   provenance: provenancePath,
-}, null, 2)}\n`);
+})}\n`);
 
 // ── fixture provisioning (the tier0 w4.49 shape) ──────────────────
 
@@ -372,6 +386,34 @@ function countRemoteOnlyCommits(installed) {
 }
 
 // ── daemon reset barrier + hygiene ────────────────────────────────
+
+function purgeStaleActiveRuns() {
+  // T2.1 US-007: with the contained scripted daemon stopped, no run in the
+  // shared scripted ledger can be genuinely active. A sibling cell (or an
+  // earlier campaign) that failed before its scoped cleanup may have left
+  // rows in 'running'/'paused' (the campaign evidence: run 85c4b27e
+  // "[running] W4.21 bare non-interactive launch probe (rich shell)" made
+  // `tamandua update` refuse in W4.20's behind leg). Mark them failed — a
+  // terminal status — so the update's active-run gate sees an empty set
+  // (the product refusal for genuinely active runs is untouched).
+  if (!fs.existsSync(dbPath)) return [];
+  const db = new DatabaseSync(dbPath);
+  const purged = [];
+  try {
+    const stale = db.prepare(
+      "SELECT id, task FROM runs WHERE status IN ('running', 'paused')",
+    ).all();
+    for (const row of stale) {
+      db.prepare(
+        "UPDATE runs SET status = 'failed', updated_at = datetime('now') WHERE id = ?",
+      ).run(row.id);
+      purged.push({ id: row.id, task: row.task });
+    }
+  } finally {
+    db.close();
+  }
+  return purged;
+}
 
 function stopScriptedDaemon() {
   const result = spawnSync(daemonControl, ["scripted", "stop"], {

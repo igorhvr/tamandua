@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "w4.04c-keyline-laundering",
+  "workflow_base": "bug-fix-merge-worktree",
+  "behaviors": "behaviors.json",
+  "command": "run.sh",
+  "expected_outcome": "completed",
+  "oracles": [
+    "O1",
+    "O3z",
+    "O8",
+    "O9",
+    "O11"
+  ]
+}

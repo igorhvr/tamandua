@@ -1,425 +1,566 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://tamandua.org/torture-test/case.schema.json",
-  "title": "Tamandua torture-test case",
-  "type": "object",
-  "additionalProperties": false,
-  "required": [
-    "id",
-    "wave",
-    "workflow",
-    "fixture",
-    "harness",
-    "task",
-    "context",
-    "caps",
-    "requires",
-    "boundary_files",
-    "forbidden",
-    "oracles",
-    "gates",
-    "chaos",
-    "shed_ok",
-    "mandatory",
-    "class"
-  ],
-  "properties": {
-    "id": {
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 128,
-      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
-    },
-    "wave": {
-      "type": "integer",
-      "minimum": 0
-    },
-    "workflow": {
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 128,
-      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
-    },
-    "fixture": {
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 128,
-      "pattern": "^[A-Za-z0-9][A-Za-z0-9._@\\-\\u00C0-\\u00FF ]*$",
-      "description": "Fixture name identifying the fixture project under fixtures-src/. The first character must be ASCII alphanumeric; the remainder admits the canonical [A-Za-z0-9._@-] set plus a single-byte space and Latin-1 letters (U+00C0-U+00FF) so hostile-path aliases validate; control characters (tab/newline) are rejected by the pattern. HOSTILE ALIAS CONVENTION: a fixture value that is not a canonical fixtures-src/ directory (contains a space or a non-ASCII character) is an alias — bin/tt-fixture-provision.mjs resolves the alias to its canonical fixture for golden-bare and fixture-source lookups while the work clone path keeps the manifest name verbatim (W1.X1: 'tt-ts café' resolves to tt-ts). Alias values are reserved and deliberately authored, never ad-hoc."
-    },
-    "seed": {
-      "description": "OPTIONAL immutable seed git ref the working fixture clone should land on. Holds a ref NAME (e.g. 'BUG-P1' or 'seed/storm' or 'broken-tests'), never a 'refs/...' prefix: the provisioning stage resolves a bare name by checking it out directly as given, and resolves a branch-style name (no 'seed/' prefix) onto the working clone's current branch. A seed ref reproduces the case's exact starting tree (green base + exactly one seeded defect) per spec 02-fixture-projects.md green-base + seed-ref discipline. Absent or null => provision from the fixture's green baseline.",
-      "anyOf": [
-        { "type": "null" },
-        {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 256,
-          "pattern": "^[A-Za-z0-9]([A-Za-z0-9._/-]*[A-Za-z0-9])?$"
-        }
-      ]
-    },
-    "harness": {
-      "enum": ["pi", "hermes", "dsh", "scripted-pi", "scripted-hermes", "local"],
-      "description": "Harness that executes the case. pi/hermes/dsh are REAL harnesses (dsh is the Tier-2 distributed-shell lane; scripted-dsh does not exist — a dsh case is always real). scripted-pi/scripted-hermes are the zero-token scripted runtimes; local is the contained local-command hook."
-    },
-    "task": {
-      "$ref": "#/$defs/relativePath"
-    },
-    "context": {
-      "type": "object",
-      "properties": {
-        "execution_mode": {
-          "enum": ["real", "scripted"]
-        },
-        "test_cmd": {
-          "type": "string",
-          "minLength": 1,
-          "description": "RAW test command the workflow actually runs in this fixture — passed to the harness as --context test_cmd=<value> and fed into launchGateKey (O2/O9/O10 evidence); never a pre-wrapped shim invocation. Per-fixture canonical commands: tt-python and tt-python@master use .venv/bin/pytest -q; tt-ts uses npm test; tt-poly-lite uses ./run-all-tests. Verify against the fixture/workflow config before authoring — never guess."
-        },
-        "replay_of": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 128,
-          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
-          "description": "OPTIONAL replay-pair binding (S9 / E3.D). Names the paired probe case id (e.g. W1.REPLAY-python -> W1.L2-python) whose work clone and committed tree this REPLAY case MUST reuse per TSTX's origin-scoped contract (spec 05 cross-cutting 'TSTX cross-run replay': unchanged trees, suites must replay with TAMANDUA-TEST CACHED / ledger row reuse, not re-execute; spec 08 W4.28: ledger rows keyed per origin_repo, zero cross-repo replay). Contract: a replay case MUST reuse its pair's work clone (same origin_repo, same committed tree), MUST be sequenced after the pair reaches terminal, and its outcome MUST assert a shim cache HIT (lookup->cache_hit). The controller must treat replay_of as internal wiring and exclude it from --context passthrough (like execution_mode)."
-        },
-        "token_saver_control": {
-          "type": "boolean",
-          "description": "OPTIONAL token-saver paired-launch signal (S12 / E3.D). Marks the case as the token-saver lifecycle probe (W3.23-token-saver): the controller executes it as TWO do-now launches — a flagged run with --no-hurry-please-save-tokens-mode and the managed pi-token-saver stub (bin/tt-token-saver-stub) on the contained daemon's PATH (var/adapters-bin, prepended by tt-daemon-up ensure-up), and a control run without either — and records both runs' argv + token ledgers as case evidence. The controller must treat token_saver_control as internal wiring and exclude it from --context passthrough (like execution_mode)."
-        },
-        "o9_special_exits": {
-          "type": "boolean",
-          "description": "OPTIONAL O9 special-exit battery opt-in (internal wiring, like token_saver_control; E3.C US-001 migration). Marks the case for the controller's O9 targeted-probe battery: the RESTORED working tree is the evidence the battery produces (exit-88 tracked-dirty refusal, tracked-byte restoration, junk-probe removal) and the controller keeps the clone on PASS instead of pruning it. Formerly carried as the loose chaos.o9_special_exits carrier; moved to context when chaos became the typed W3.17b injection block — the old carrier is REJECTED by the schema."
-        }
-      }
-    },
-    "caps": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["tokens", "wall_min"],
-      "properties": {
-        "tokens": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "wall_min": {
-          "type": "number",
-          "exclusiveMinimum": 0
-        }
-      }
-    },
-    "requires": {
-      "type": "object",
-      "description": "CANONICAL HOST-ADAPTATION CONTRACT (predicates). Every entry is evaluated against the host capability profile emitted by W0.0 (tt-verify-environment) as host-profile.json. A predicate that the host cannot satisfy gates the case to outcome NOT_RUN (predicate) with evidence — it is never silently skipped and never a failure. See tamandua-torture-test-spec/01-environment-and-isolation.md and oracles/CONTRACT.md (host-adaptation note) for the single authoritative contract; every representation here MUST agree with the profile's real key names or the case drifts.",
-      "additionalProperties": false,
-      "properties": {
-        "platform": {
-          "anyOf": [
-            { "enum": ["linux", "darwin", "other"] },
-            {
-              "type": "array",
-              "minItems": 1,
-              "uniqueItems": true,
-              "items": {
-                "enum": ["linux", "darwin", "other"]
-              }
-            }
-          ]
-        },
-        "toolchains": {
-          "type": "array",
-          "description": "CANONICAL CONTRACT: an ARRAY of toolchain names; each name is SATISFIED iff the host profile records `toolchains.<name>.present === true` (a Boolean leaf) using the profile's REAL key names (python3, node, go, rust/cargo, java+maven). buildPassed/testPassed (W0.0's --fast probes leave them null) are NOT required for a predicate to be satisfied. A missing/inactive toolchain gates the case NOT_RUN (predicate) with expected true / observed evidence — never silently skipped.",
-          "minItems": 1,
-          "uniqueItems": true,
-          "items": {
-            "enum": ["node", "python3", "go", "rust/cargo", "java+maven"]
-          }
-        },
-        "capabilities": {
-          "type": "array",
-          "description": "CANONICAL CONTRACT: harness capabilities `pi`, `hermes`, and `dsh` map to harness PRESENCE recorded in the host profile (harness.<name>.present Boolean leaf; spec 01 makes pi/hermes operator-preconfigured, and the Tier-2 dsh lane is operator-directed — W0.0 RECORDS mechanical presence for all three, never installs). The host profile ALSO records Boolean-leaf capability names under `capabilities.<name>` — e.g. `node-runtimes-2` (true iff W0.0 discovered >= 2 DISTINCT node runtimes/versions on the host; the W4.23 daemon-cross-runtime predicate source). Any other capability name is resolved against the profile per the same Boolean-leaf rule. An honestly-present capability must NOT be gated; an honestly-absent capability gates the case NOT_RUN (predicate) with expected/observed evidence.",
-          "minItems": 1,
-          "uniqueItems": true,
-          "items": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 128,
-            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
-          }
-        },
-        "containment": {
-          "type": "array",
-          "minItems": 1,
-          "uniqueItems": true,
-          "items": {
-            "enum": ["systemd-user-scope", "procfs"]
-          }
-        },
-        "node_min": {
-          "type": "integer",
-          "minimum": 0
-        }
-      }
-    },
-    "boundary_files": {
-      "type": "array",
-      "uniqueItems": true,
-      "items": {
-        "$ref": "#/$defs/relativePath"
-      }
-    },
-    "forbidden": {
-      "type": "array",
-      "uniqueItems": true,
-      "items": {
-        "$ref": "#/$defs/relativePath"
-      }
-    },
-    "oracles": {
-      "type": "array",
-      "uniqueItems": true,
-      "items": {
-        "type": "string",
-        "minLength": 1,
-        "maxLength": 64,
-        "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
-      }
-    },
-    "probe_id": {
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 128,
-      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
-    },
-    "probes": {
-      "type": "array",
-      "uniqueItems": true,
-      "items": {
-        "type": "string",
-        "minLength": 1,
-        "maxLength": 128,
-        "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
-      }
-    },
-    "probe_sequence": {
-      "description": "OPTIONAL E3.C lifecycle-probe sequence (nullable). A per-run list of probe groups the controller executes against the CONTAINED TT instance (43xx CLI, contained env) while the case's run(s) are in flight. null or absent => no lifecycle probes. Each group targets ONE run ordinal (>= 1; ordinals index the case's runs in launch order, so W3.20's two runs use groups run 1 and run 2) and carries an ordered actions array executed when the group's run reaches the action's phase marker. Every probe action + observed effect is recorded into attempt evidence for O16. Schema contract: op enum is fail-closed (unknown ops are REJECTED), when is a phase-marker string (step:<role>:<state> | event:<type> | now), hold_seconds applies to hold-capable ops (pause, pause_drain, sigstop_sigcont), and expect declares the observed effect the O16 lifecycle oracle must judge.",
-      "anyOf": [
-        { "type": "null" },
-        {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/probeGroup"
-          }
-        }
-      ]
-    },
-    "gates": {
-      "type": "array",
-      "uniqueItems": true,
-      "items": {
-        "type": "string",
-        "minLength": 1,
-        "maxLength": 64,
-        "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
-      }
-    },
-    "chaos": {
-      "description": "E3.C typed chaos-injection block (nullable). null => no chaos injection. A non-null block is honored by the controller via bin/tt-chaos: type is the injection kind (sigstop_sigcont | kill-harness | kill-daemon | delete-tstx-row), target the affected process/data class (per-type), trigger the phase marker that arms the injection, hold_seconds the SIGSTOP hold duration (sigstop_sigcont only), signal the kill signal (kill actions only, default SIGKILL), tree the TSTX tree hash to delete (delete-tstx-row only), operator the executable that performs the injection. Schema contract is fail-closed: unknown type/target/operator/signal values and unknown properties are REJECTED; per-type target/param constraints are enforced by the controller's semantic validator.",
-      "anyOf": [
-        { "type": "null" },
-        { "$ref": "#/$defs/chaosBlock" }
-      ]
-    },
-    "shed_ok": {
-      "type": "boolean"
-    },
-    "mandatory": {
-      "type": "boolean"
-    },
-    "class": {
-      "enum": ["verification", "characterization", "exploratory"]
-    },
-    "spec_ref": {
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 512
-    },
-    "production_duration_floor_ms": {
-      "type": "integer",
-      "minimum": 1
-    },
-    "expected_fast_failure": {
-      "type": "boolean"
-    },
-    "reset": {
-      "anyOf": [
-        { "type": "null" },
-        { "$ref": "#/$defs/hook" }
-      ]
-    },
-    "command": {
-      "anyOf": [
-        { "type": "null" },
-        { "$ref": "#/$defs/hook" }
-      ]
-    }
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://tamandua.org/torture-test/case.schema.json",
+ "title": "Tamandua torture-test case",
+ "type": "object",
+ "additionalProperties": false,
+ "required": [
+  "id",
+  "wave",
+  "workflow",
+  "fixture",
+  "harness",
+  "task",
+  "context",
+  "caps",
+  "requires",
+  "boundary_files",
+  "forbidden",
+  "oracles",
+  "gates",
+  "chaos",
+  "shed_ok",
+  "mandatory",
+  "class"
+ ],
+ "properties": {
+  "id": {
+   "type": "string",
+   "minLength": 1,
+   "maxLength": 128,
+   "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
   },
-  "$defs": {
-    "relativePath": {
+  "wave": {
+   "type": "integer",
+   "minimum": 0
+  },
+  "workflow": {
+   "type": "string",
+   "minLength": 1,
+   "maxLength": 128,
+   "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+  },
+  "fixture": {
+   "type": "string",
+   "minLength": 1,
+   "maxLength": 128,
+   "pattern": "^[A-Za-z0-9][A-Za-z0-9._@\\-\\u00C0-\\u00FF ]*$",
+   "description": "Fixture name identifying the fixture project under fixtures-src/. The first character must be ASCII alphanumeric; the remainder admits the canonical [A-Za-z0-9._@-] set plus a single-byte space and Latin-1 letters (U+00C0-U+00FF) so hostile-path aliases validate; control characters (tab/newline) are rejected by the pattern. HOSTILE ALIAS CONVENTION: a fixture value that is not a canonical fixtures-src/ directory (contains a space or a non-ASCII character) is an alias \u2014 bin/tt-fixture-provision.mjs resolves the alias to its canonical fixture for golden-bare and fixture-source lookups while the work clone path keeps the manifest name verbatim (W1.X1: 'tt-ts caf\u00e9' resolves to tt-ts). Alias values are reserved and deliberately authored, never ad-hoc."
+  },
+  "seed": {
+   "description": "OPTIONAL immutable seed git ref the working fixture clone should land on. Holds a ref NAME (e.g. 'BUG-P1' or 'seed/storm' or 'broken-tests'), never a 'refs/...' prefix: the provisioning stage resolves a bare name by checking it out directly as given, and resolves a branch-style name (no 'seed/' prefix) onto the working clone's current branch. A seed ref reproduces the case's exact starting tree (green base + exactly one seeded defect) per spec 02-fixture-projects.md green-base + seed-ref discipline. Absent or null => provision from the fixture's green baseline.",
+   "anyOf": [
+    {
+     "type": "null"
+    },
+    {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 256,
+     "pattern": "^[A-Za-z0-9]([A-Za-z0-9._/-]*[A-Za-z0-9])?$"
+    }
+   ]
+  },
+  "harness": {
+   "enum": [
+    "pi",
+    "hermes",
+    "dsh",
+    "scripted-pi",
+    "scripted-hermes",
+    "local"
+   ],
+   "description": "Harness that executes the case. pi/hermes/dsh are REAL harnesses (dsh is the Tier-2 distributed-shell lane; scripted-dsh does not exist \u2014 a dsh case is always real). scripted-pi/scripted-hermes are the zero-token scripted runtimes; local is the contained local-command hook."
+  },
+  "task": {
+   "$ref": "#/$defs/relativePath"
+  },
+  "context": {
+   "type": "object",
+   "properties": {
+    "execution_mode": {
+     "enum": [
+      "real",
+      "scripted"
+     ]
+    },
+    "test_cmd": {
+     "type": "string",
+     "minLength": 1,
+     "description": "RAW test command the workflow actually runs in this fixture \u2014 passed to the harness as --context test_cmd=<value> and fed into launchGateKey (O2/O9/O10 evidence); never a pre-wrapped shim invocation. Per-fixture canonical commands: tt-python and tt-python@master use .venv/bin/pytest -q; tt-ts uses npm test; tt-poly-lite uses ./run-all-tests. Verify against the fixture/workflow config before authoring \u2014 never guess."
+    },
+    "replay_of": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 128,
+     "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+     "description": "OPTIONAL replay-pair binding (S9 / E3.D). Names the paired probe case id (e.g. W1.REPLAY-python -> W1.L2-python) whose work clone and committed tree this REPLAY case MUST reuse per TSTX's origin-scoped contract (spec 05 cross-cutting 'TSTX cross-run replay': unchanged trees, suites must replay with TAMANDUA-TEST CACHED / ledger row reuse, not re-execute; spec 08 W4.28: ledger rows keyed per origin_repo, zero cross-repo replay). Contract: a replay case MUST reuse its pair's work clone (same origin_repo, same committed tree), MUST be sequenced after the pair reaches terminal, and its outcome MUST assert a shim cache HIT (lookup->cache_hit). The controller must treat replay_of as internal wiring and exclude it from --context passthrough (like execution_mode)."
+    },
+    "token_saver_control": {
+     "type": "boolean",
+     "description": "OPTIONAL token-saver paired-launch signal (S12 / E3.D). Marks the case as the token-saver lifecycle probe (W3.23-token-saver): the controller executes it as TWO do-now launches \u2014 a flagged run with --no-hurry-please-save-tokens-mode and the managed pi-token-saver stub (bin/tt-token-saver-stub) on the contained daemon's PATH (var/adapters-bin, prepended by tt-daemon-up ensure-up), and a control run without either \u2014 and records both runs' argv + token ledgers as case evidence. The controller must treat token_saver_control as internal wiring and exclude it from --context passthrough (like execution_mode)."
+    },
+    "o9_special_exits": {
+     "type": "boolean",
+     "description": "OPTIONAL O9 special-exit battery opt-in (internal wiring, like token_saver_control; E3.C US-001 migration). Marks the case for the controller's O9 targeted-probe battery: the RESTORED working tree is the evidence the battery produces (exit-88 tracked-dirty refusal, tracked-byte restoration, junk-probe removal) and the controller keeps the clone on PASS instead of pruning it. Formerly carried as the loose chaos.o9_special_exits carrier; moved to context when chaos became the typed W3.17b injection block \u2014 the old carrier is REJECTED by the schema."
+    }
+   }
+  },
+  "caps": {
+   "type": "object",
+   "additionalProperties": false,
+   "required": [
+    "tokens",
+    "wall_min"
+   ],
+   "properties": {
+    "tokens": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "wall_min": {
+     "type": "number",
+     "exclusiveMinimum": 0
+    }
+   }
+  },
+  "requires": {
+   "type": "object",
+   "description": "CANONICAL HOST-ADAPTATION CONTRACT (predicates). Every entry is evaluated against the host capability profile emitted by W0.0 (tt-verify-environment) as host-profile.json. A predicate that the host cannot satisfy gates the case to outcome NOT_RUN (predicate) with evidence \u2014 it is never silently skipped and never a failure. See tamandua-torture-test-spec/01-environment-and-isolation.md and oracles/CONTRACT.md (host-adaptation note) for the single authoritative contract; every representation here MUST agree with the profile's real key names or the case drifts.",
+   "additionalProperties": false,
+   "properties": {
+    "platform": {
+     "anyOf": [
+      {
+       "enum": [
+        "linux",
+        "darwin",
+        "other"
+       ]
+      },
+      {
+       "type": "array",
+       "minItems": 1,
+       "uniqueItems": true,
+       "items": {
+        "enum": [
+         "linux",
+         "darwin",
+         "other"
+        ]
+       }
+      }
+     ]
+    },
+    "toolchains": {
+     "type": "array",
+     "description": "CANONICAL CONTRACT: an ARRAY of toolchain names; each name is SATISFIED iff the host profile records `toolchains.<name>.present === true` (a Boolean leaf) using the profile's REAL key names (python3, node, go, rust/cargo, java+maven). buildPassed/testPassed (W0.0's --fast probes leave them null) are NOT required for a predicate to be satisfied. A missing/inactive toolchain gates the case NOT_RUN (predicate) with expected true / observed evidence \u2014 never silently skipped.",
+     "minItems": 1,
+     "uniqueItems": true,
+     "items": {
+      "enum": [
+       "node",
+       "python3",
+       "go",
+       "rust/cargo",
+       "java+maven"
+      ]
+     }
+    },
+    "capabilities": {
+     "type": "array",
+     "description": "CANONICAL CONTRACT: harness capabilities `pi`, `hermes`, and `dsh` map to harness PRESENCE recorded in the host profile (harness.<name>.present Boolean leaf; spec 01 makes pi/hermes operator-preconfigured, and the Tier-2 dsh lane is operator-directed \u2014 W0.0 RECORDS mechanical presence for all three, never installs). The host profile ALSO records Boolean-leaf capability names under `capabilities.<name>` \u2014 e.g. `node-runtimes-2` (true iff W0.0 discovered >= 2 DISTINCT node runtimes/versions on the host; the W4.23 daemon-cross-runtime predicate source). Any other capability name is resolved against the profile per the same Boolean-leaf rule. An honestly-present capability must NOT be gated; an honestly-absent capability gates the case NOT_RUN (predicate) with expected/observed evidence.",
+     "minItems": 1,
+     "uniqueItems": true,
+     "items": {
       "type": "string",
       "minLength": 1,
-      "maxLength": 4096
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+     }
     },
-    "hook": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["executable", "args", "cwd"],
-      "properties": {
-        "executable": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 4096
-        },
-        "args": {
-          "type": "array",
-          "maxItems": 256,
-          "items": {
-            "type": "string",
-            "maxLength": 65536
-          }
-        },
-        "cwd": {
-          "$ref": "#/$defs/relativePath"
-        }
-      }
+    "containment": {
+     "type": "array",
+     "minItems": 1,
+     "uniqueItems": true,
+     "items": {
+      "enum": [
+       "systemd-user-scope",
+       "procfs"
+      ]
+     }
     },
-    "probeGroup": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["run", "actions"],
-      "properties": {
-        "run": {
-          "type": "integer",
-          "minimum": 1,
-          "description": "Run ordinal (1-based) this probe group targets, indexing the case's runs in launch order."
-        },
-        "actions": {
-          "type": "array",
-          "minItems": 1,
-          "items": {
-            "$ref": "#/$defs/probeAction"
-          }
-        }
-      }
-    },
-    "probeAction": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["op", "when"],
-      "properties": {
-        "op": {
-          "enum": ["pause", "pause_drain", "resume", "cancel", "fail_force", "restart_daemon", "sigstop_sigcont"],
-          "description": "Probe verb executed by the controller against the contained TT instance. pause: pause the daemon without draining; pause_drain: pause --drain (current run finishes, no new dispatch); resume: resume a paused/failed daemon or run; cancel: cancel the run (assert run.canceled terminal event); fail_force: fail --force the run (resume must reuse the SAME run id); restart_daemon: restart the contained daemon mid-flight; sigstop_sigcont: SIGSTOP/SIGCONT the harness process."
-        },
-        "when": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 256,
-          "pattern": "^(now|step:[A-Za-z0-9._-]+:[A-Za-z0-9._-]+|event:[A-Za-z0-9._-]+)$",
-          "description": "Phase marker arming the probe: 'now' (immediate), 'step:<role>:<state>' (e.g. step:developer:running, step:finalize_merge:running), or 'event:<type>' (e.g. event:run.canceled)."
-        },
-        "hold_seconds": {
-          "type": "number",
-          "exclusiveMinimum": 0,
-          "description": "OPTIONAL hold duration for hold-capable ops (pause, pause_drain, sigstop_sigcont): the pause/stop is held this many seconds before the action's counterpart (resume/cont) fires."
-        },
-        "expect": {
-          "$ref": "#/$defs/probeExpect",
-          "description": "OPTIONAL observed-effect declaration the O16 lifecycle oracle judges from the probe evidence."
-        }
-      }
-    },
-    "probeExpect": {
-      "type": "object",
-      "additionalProperties": false,
-      "description": "Observed-effect contract for a probe action (all fields optional; O16 judgment dimensions).",
-      "properties": {
-        "run_completes": {
-          "type": "boolean",
-          "description": "After resume/cont, the probed run must complete."
-        },
-        "no_rounds_during_hold": {
-          "type": "boolean",
-          "description": "pause (no drain): no dispatch rounds may fire while the daemon is paused."
-        },
-        "drain_waits_current": {
-          "type": "boolean",
-          "description": "pause --drain: the current run finishes before dispatch pauses."
-        },
-        "next_story_parked": {
-          "type": "boolean",
-          "description": "pause --drain: the next story must not dispatch while paused."
-        },
-        "canceled_terminal_event": {
-          "type": "boolean",
-          "description": "cancel: a run.canceled terminal event must land."
-        },
-        "same_run_id_resumes": {
-          "type": "boolean",
-          "description": "fail --force: resume must reuse the SAME run id."
-        },
-        "recovery_within_dispatch_intervals": {
-          "type": "integer",
-          "minimum": 1,
-          "description": "restart_daemon: all in-flight runs recover within this many dispatch intervals."
-        },
-        "token_flush_preserved": {
-          "type": "boolean",
-          "description": "restart_daemon: the token flush is preserved across the daemon restart."
-        }
-      }
-    },
-    "chaosBlock": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["type", "target", "trigger", "operator"],
-      "properties": {
-        "type": {
-          "enum": ["sigstop_sigcont", "kill-harness", "kill-daemon", "delete-tstx-row"],
-          "description": "Injection kind. sigstop_sigcont: SIGSTOP the target process, hold, then SIGCONT. kill-harness: send a signal (default SIGKILL) to the active harness process for the run. kill-daemon: send a signal (default SIGKILL) to the TT daemon (never the production daemon). delete-tstx-row: delete the TSTX evidence row(s) matching the declared tree hash."
-        },
-        "target": {
-          "enum": ["harness_process", "daemon_process", "tstx_row"],
-          "description": "Process/data class the injection targets. Per-type: sigstop_sigcont and kill-harness target harness_process; kill-daemon targets daemon_process; delete-tstx-row targets tstx_row."
-        },
-        "trigger": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 256,
-          "description": "Phase marker that arms the injection (e.g. mid_round)."
-        },
-        "hold_seconds": {
-          "type": "number",
-          "exclusiveMinimum": 0,
-          "description": "SIGSTOP hold duration in seconds before SIGCONT. REQUIRED ONLY for sigstop_sigcont (per-type constraint enforced by the controller's semantic validator); must be ABSENT for kill-harness/kill-daemon/delete-tstx-row."
-        },
-        "signal": {
-          "enum": ["SIGKILL", "SIGTERM", "SIGSTOP", "SIGCONT", "SIGINT", "SIGHUP", "SIGUSR1", "SIGUSR2"],
-          "description": "OPTIONAL signal for kill actions (kill-harness/kill-daemon); defaults to SIGKILL. Must be ABSENT for sigstop_sigcont/delete-tstx-row."
-        },
-        "tree": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 128,
-          "pattern": "^[A-Za-z0-9]+$",
-          "description": "Tree hash whose TSTX evidence rows delete-tstx-row deletes. REQUIRED for delete-tstx-row (per-type constraint enforced by the controller's semantic validator); must be ABSENT for other types."
-        },
-        "operator": {
-          "enum": ["tt-chaos"],
-          "description": "Executable that performs the injection: bin/tt-chaos."
-        }
-      }
+    "node_min": {
+     "type": "integer",
+     "minimum": 0
     }
+   }
+  },
+  "boundary_files": {
+   "type": "array",
+   "uniqueItems": true,
+   "items": {
+    "$ref": "#/$defs/relativePath"
+   }
+  },
+  "forbidden": {
+   "type": "array",
+   "uniqueItems": true,
+   "items": {
+    "$ref": "#/$defs/relativePath"
+   }
+  },
+  "oracles": {
+   "type": "array",
+   "uniqueItems": true,
+   "items": {
+    "type": "string",
+    "minLength": 1,
+    "maxLength": 64,
+    "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+   }
+  },
+  "probe_id": {
+   "type": "string",
+   "minLength": 1,
+   "maxLength": 128,
+   "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+  },
+  "probes": {
+   "type": "array",
+   "uniqueItems": true,
+   "items": {
+    "type": "string",
+    "minLength": 1,
+    "maxLength": 128,
+    "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+   }
+  },
+  "probe_sequence": {
+   "description": "OPTIONAL E3.C lifecycle-probe sequence (nullable). A per-run list of probe groups the controller executes against the CONTAINED TT instance (43xx CLI, contained env) while the case's run(s) are in flight. null or absent => no lifecycle probes. Each group targets ONE run ordinal (>= 1; ordinals index the case's runs in launch order, so W3.20's two runs use groups run 1 and run 2) and carries an ordered actions array executed when the group's run reaches the action's phase marker. Every probe action + observed effect is recorded into attempt evidence for O16. Schema contract: op enum is fail-closed (unknown ops are REJECTED), when is a phase-marker string (step:<role>:<state> | event:<type> | now), hold_seconds applies to hold-capable ops (pause, pause_drain, sigstop_sigcont), and expect declares the observed effect the O16 lifecycle oracle must judge.",
+   "anyOf": [
+    {
+     "type": "null"
+    },
+    {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/probeGroup"
+     }
+    }
+   ]
+  },
+  "gates": {
+   "type": "array",
+   "uniqueItems": true,
+   "items": {
+    "type": "string",
+    "minLength": 1,
+    "maxLength": 64,
+    "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+   }
+  },
+  "chaos": {
+   "description": "E3.C typed chaos-injection block (nullable). null => no chaos injection. A non-null block is honored by the controller via bin/tt-chaos: type is the injection kind (sigstop_sigcont | kill-harness | kill-daemon | delete-tstx-row), target the affected process/data class (per-type), trigger the phase marker that arms the injection, hold_seconds the SIGSTOP hold duration (sigstop_sigcont only), signal the kill signal (kill actions only, default SIGKILL), tree the TSTX tree hash to delete (delete-tstx-row only), operator the executable that performs the injection. Schema contract is fail-closed: unknown type/target/operator/signal values and unknown properties are REJECTED; per-type target/param constraints are enforced by the controller's semantic validator.",
+   "anyOf": [
+    {
+     "type": "null"
+    },
+    {
+     "$ref": "#/$defs/chaosBlock"
+    }
+   ]
+  },
+  "shed_ok": {
+   "type": "boolean"
+  },
+  "mandatory": {
+   "type": "boolean"
+  },
+  "class": {
+   "enum": [
+    "verification",
+    "characterization",
+    "exploratory"
+   ]
+  },
+  "spec_ref": {
+   "type": "string",
+   "minLength": 1,
+   "maxLength": 512
+  },
+  "production_duration_floor_ms": {
+   "type": "integer",
+   "minimum": 1
+  },
+  "expected_fast_failure": {
+   "type": "boolean"
+  },
+  "reset": {
+   "anyOf": [
+    {
+     "type": "null"
+    },
+    {
+     "$ref": "#/$defs/hook"
+    }
+   ]
+  },
+  "command": {
+   "anyOf": [
+    {
+     "type": "null"
+    },
+    {
+     "$ref": "#/$defs/hook"
+    }
+   ]
   }
+ },
+ "$defs": {
+  "relativePath": {
+   "type": "string",
+   "minLength": 1,
+   "maxLength": 4096
+  },
+  "hook": {
+   "type": "object",
+   "additionalProperties": false,
+   "required": [
+    "executable",
+    "args",
+    "cwd"
+   ],
+   "properties": {
+    "executable": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 4096
+    },
+    "args": {
+     "type": "array",
+     "maxItems": 256,
+     "items": {
+      "type": "string",
+      "maxLength": 65536
+     }
+    },
+    "cwd": {
+     "$ref": "#/$defs/relativePath"
+    }
+   }
+  },
+  "probeGroup": {
+   "type": "object",
+   "additionalProperties": false,
+   "required": [
+    "run",
+    "actions"
+   ],
+   "properties": {
+    "run": {
+     "type": "integer",
+     "minimum": 1,
+     "description": "Run ordinal (1-based) this probe group targets, indexing the case's runs in launch order."
+    },
+    "actions": {
+     "type": "array",
+     "minItems": 1,
+     "items": {
+      "$ref": "#/$defs/probeAction"
+     }
+    }
+   }
+  },
+  "probeAction": {
+   "type": "object",
+   "additionalProperties": false,
+   "required": [
+    "op",
+    "when"
+   ],
+   "properties": {
+    "op": {
+     "enum": [
+      "pause",
+      "pause_drain",
+      "resume",
+      "cancel",
+      "fail_force",
+      "restart_daemon",
+      "sigstop_sigcont"
+     ],
+     "description": "Probe verb executed by the controller against the contained TT instance. pause: pause the daemon without draining; pause_drain: pause --drain (current run finishes, no new dispatch); resume: resume a paused/failed daemon or run; cancel: cancel the run (assert run.canceled terminal event); fail_force: fail --force the run (resume must reuse the SAME run id); restart_daemon: restart the contained daemon mid-flight; sigstop_sigcont: SIGSTOP/SIGCONT the harness process."
+    },
+    "when": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 256,
+     "pattern": "^(now|step:[A-Za-z0-9._-]+:[A-Za-z0-9._-]+|event:[A-Za-z0-9._-]+)$",
+     "description": "Phase marker arming the probe: 'now' (immediate), 'step:<role>:<state>' (e.g. step:developer:running, step:finalize_merge:running), or 'event:<type>' (e.g. event:run.canceled)."
+    },
+    "hold_seconds": {
+     "type": "number",
+     "exclusiveMinimum": 0,
+     "description": "OPTIONAL hold duration for hold-capable ops (pause, pause_drain, sigstop_sigcont): the pause/stop is held this many seconds before the action's counterpart (resume/cont) fires."
+    },
+    "expect": {
+     "$ref": "#/$defs/probeExpect",
+     "description": "OPTIONAL observed-effect declaration the O16 lifecycle oracle judges from the probe evidence."
+    }
+   }
+  },
+  "probeExpect": {
+   "type": "object",
+   "additionalProperties": false,
+   "description": "Observed-effect contract for a probe action (all fields optional; O16 judgment dimensions).",
+   "properties": {
+    "run_completes": {
+     "type": "boolean",
+     "description": "After resume/cont, the probed run must complete."
+    },
+    "no_rounds_during_hold": {
+     "type": "boolean",
+     "description": "pause (no drain): no dispatch rounds may fire while the daemon is paused."
+    },
+    "drain_waits_current": {
+     "type": "boolean",
+     "description": "pause --drain: the current run finishes before dispatch pauses."
+    },
+    "next_story_parked": {
+     "type": "boolean",
+     "description": "pause --drain: the next story must not dispatch while paused."
+    },
+    "canceled_terminal_event": {
+     "type": "boolean",
+     "description": "cancel: a run.canceled terminal event must land."
+    },
+    "same_run_id_resumes": {
+     "type": "boolean",
+     "description": "fail --force: resume must reuse the SAME run id."
+    },
+    "recovery_within_dispatch_intervals": {
+     "type": "integer",
+     "minimum": 1,
+     "description": "restart_daemon: all in-flight runs recover within this many dispatch intervals."
+    },
+    "token_flush_preserved": {
+     "type": "boolean",
+     "description": "restart_daemon: the token flush is preserved across the daemon restart."
+    }
+   }
+  },
+  "chaosBlock": {
+   "type": "object",
+   "additionalProperties": false,
+   "required": [],
+   "properties": {
+    "type": {
+     "enum": [
+      "sigstop_sigcont",
+      "kill-harness",
+      "kill-daemon",
+      "delete-tstx-row"
+     ],
+     "description": "Injection kind. sigstop_sigcont: SIGSTOP the target process, hold, then SIGCONT. kill-harness: send a signal (default SIGKILL) to the active harness process for the run. kill-daemon: send a signal (default SIGKILL) to the TT daemon (never the production daemon). delete-tstx-row: delete the TSTX evidence row(s) matching the declared tree hash."
+    },
+    "target": {
+     "enum": [
+      "harness_process",
+      "daemon_process",
+      "tstx_row"
+     ],
+     "description": "Process/data class the injection targets. Per-type: sigstop_sigcont and kill-harness target harness_process; kill-daemon targets daemon_process; delete-tstx-row targets tstx_row."
+    },
+    "trigger": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 256,
+     "description": "Phase marker that arms the injection (e.g. mid_round)."
+    },
+    "hold_seconds": {
+     "type": "number",
+     "exclusiveMinimum": 0,
+     "description": "SIGSTOP hold duration in seconds before SIGCONT. REQUIRED ONLY for sigstop_sigcont (per-type constraint enforced by the controller's semantic validator); must be ABSENT for kill-harness/kill-daemon/delete-tstx-row."
+    },
+    "signal": {
+     "enum": [
+      "SIGKILL",
+      "SIGTERM",
+      "SIGSTOP",
+      "SIGCONT",
+      "SIGINT",
+      "SIGHUP",
+      "SIGUSR1",
+      "SIGUSR2"
+     ],
+     "description": "OPTIONAL signal for kill actions (kill-harness/kill-daemon); defaults to SIGKILL. Must be ABSENT for sigstop_sigcont/delete-tstx-row."
+    },
+    "tree": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 128,
+     "pattern": "^[A-Za-z0-9]+$",
+     "description": "Tree hash whose TSTX evidence rows delete-tstx-row deletes. REQUIRED for delete-tstx-row (per-type constraint enforced by the controller's semantic validator); must be ABSENT for other types."
+    },
+    "operator": {
+     "enum": [
+      "tt-chaos"
+     ],
+     "description": "Executable that performs the injection: bin/tt-chaos."
+    },
+    "synthetic_token_ledger": {
+     "type": "array",
+     "minItems": 1,
+     "items": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+       "run_id",
+       "expected_tokens"
+      ],
+      "properties": {
+       "run_id": {
+        "anyOf": [
+         {
+          "type": "string",
+          "minLength": 1
+         },
+         {
+          "type": "null"
+         }
+        ],
+        "description": "Scripted run id the ledger row declares. A placeholder (null or empty) is filled by the controller with the ACTUAL launch run id at oracle-evaluation time (T2.1 US-010)."
+       },
+       "expected_tokens": {
+        "type": "integer",
+        "minimum": 0,
+        "description": "Attributed token sum the scripted run must equal (0 for zero-token scripted cells)."
+       }
+      }
+     },
+     "description": "O11 synthetic-token ledger declaration for scripted WORKFLOW runs (T2.1 US-010): one row per run, run_id filled by the controller. May accompany a typed injection block or stand alone (declaration-only)."
+    }
+   },
+   "allOf": [
+    {
+     "anyOf": [
+      {
+       "required": [
+        "type",
+        "target",
+        "trigger",
+        "operator"
+       ]
+      },
+      {
+       "required": [
+        "synthetic_token_ledger"
+       ]
+      }
+     ]
+    }
+   ]
+  }
+ }
 }

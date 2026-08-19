@@ -3001,6 +3001,187 @@ else
   fail "Unrelated rows should be preserved (count=$OTHER_COUNT)"
 fi
 
+# ── T2.1 US-010: delete-tstx-row deletes the tested tree's SUITE_ROWS ──
+# The product's suite ledger is `suite_results` (tree_hash column); the
+# historical `tstx` table never existed in the product schema. The action
+# must delete from `suite_results` (and still honor a legacy `tstx` table
+# when present), so the drain-armed deletion corridor makes the tested
+# tree's suite evidence MISSING instead of erroring "no such table: tstx".
+
+echo ""
+echo "--- Test (T2.1 US-010): delete-tstx-row deletes suite_results rows ---"
+
+setup_fake_tt_env
+
+node -e "
+  const { DatabaseSync } = require('node:sqlite');
+  const db = new DatabaseSync('${TEST_VAR}/tamandua.db', { open: true });
+  db.exec(\`
+    CREATE TABLE IF NOT EXISTS suite_results (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      origin_repo TEXT, tree_hash TEXT, cmd_hash TEXT, cmd_display TEXT,
+      exit_code INTEGER, duration_ms INTEGER, log_tail TEXT,
+      run_id TEXT, step_id TEXT, created_at TEXT
+    )
+  \`);
+  const insert = db.prepare('INSERT INTO suite_results (tree_hash, run_id, step_id, exit_code) VALUES (?, ?, ?, ?)');
+  insert.run('abc123def456', 'run-guard-test', 'verify', 0);
+  insert.run('abc123def456', 'run-other', 'verify', 1);
+  insert.run('deadbeef9999', 'run-guard-test', 'verify', 0);
+  db.close();
+"
+
+set +e
+OUT=$("$TOOL" delete-tstx-row --tree abc123def456 --run run-guard-test --when now 2>&1)
+RC=$?
+set -e
+
+if [ "$RC" -eq 0 ]; then
+  pass "delete-tstx-row exited 0 against suite_results"
+else
+  fail "delete-tstx-row should exit 0 against suite_results, got $RC: $OUT"
+fi
+
+SUITE_LEFT=$(node -e "
+  const { DatabaseSync } = require('node:sqlite');
+  const db = new DatabaseSync('${TEST_VAR}/tamandua.db', { open: true, readOnly: true });
+  const rows = db.prepare('SELECT COUNT(*) as cnt FROM suite_results WHERE tree_hash = ?').all('abc123def456');
+  console.log(rows[0].cnt);
+  db.close();
+" 2>/dev/null || echo "?")
+if [ "$SUITE_LEFT" = "0" ]; then
+  pass "suite_results rows for tree abc123def456 deleted (left=$SUITE_LEFT)"
+else
+  fail "suite_results rows still exist for abc123def456 (left=$SUITE_LEFT)"
+fi
+
+SUITE_OTHER=$(node -e "
+  const { DatabaseSync } = require('node:sqlite');
+  const db = new DatabaseSync('${TEST_VAR}/tamandua.db', { open: true, readOnly: true });
+  const rows = db.prepare('SELECT COUNT(*) as cnt FROM suite_results WHERE tree_hash = ?').all('deadbeef9999');
+  console.log(rows[0].cnt);
+  db.close();
+" 2>/dev/null || echo "0")
+if [ "$SUITE_OTHER" = "1" ]; then
+  pass "unrelated suite_results rows preserved (left=$SUITE_OTHER)"
+else
+  fail "unrelated suite_results rows should be preserved (left=$SUITE_OTHER)"
+fi
+
+# ── T2.1 US-010: TESTEDTREE sentinel resolves to the run's attested tree ──
+# W4.36's chaos block declares the sentinel `TESTEDTREE` (the tree is
+# unknowable at authoring). delete-tstx-row must resolve it at FIRE time to
+# the run context's attested `tested_tree` (the verifier's TESTED_TREE), and
+# fail loudly when the run has not attested a tree.
+
+echo ""
+echo "--- Test (T2.1 US-010): TESTEDTREE sentinel resolves to attested tested_tree ---"
+
+setup_fake_tt_env
+
+node -e "
+  const { DatabaseSync } = require('node:sqlite');
+  const db = new DatabaseSync('${TEST_VAR}/tamandua.db', { open: true });
+  db.exec('DROP TABLE IF EXISTS runs');
+  db.exec(\`
+    CREATE TABLE runs (id TEXT PRIMARY KEY, status TEXT, context TEXT)
+  \`);
+  db.exec(\`
+    CREATE TABLE IF NOT EXISTS suite_results (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      origin_repo TEXT, tree_hash TEXT, cmd_hash TEXT, cmd_display TEXT,
+      exit_code INTEGER, duration_ms INTEGER, log_tail TEXT,
+      run_id TEXT, step_id TEXT, created_at TEXT
+    )
+  \`);
+  const attested = '1111111111111111111111111111111111111111';
+  db.prepare('INSERT INTO runs (id, status, context) VALUES (?, ?, ?)')
+    .run('guard-run', 'running', JSON.stringify({ tested_tree: attested }));
+  db.prepare('INSERT INTO suite_results (tree_hash, run_id, step_id, exit_code) VALUES (?, ?, ?, ?)')
+    .run(attested, 'run-guard-run', 'verify', 0);
+  db.close();
+"
+
+set +e
+OUT=$("$TOOL" delete-tstx-row --tree TESTEDTREE --run run-guard-run --when now 2>&1)
+RC=$?
+set -e
+
+if [ "$RC" -eq 0 ]; then
+  pass "TESTEDTREE sentinel resolved and deletion exited 0"
+else
+  fail "TESTEDTREE sentinel should resolve and exit 0, got $RC: $OUT"
+fi
+if echo "$OUT" | grep -q "1111111111111111111111111111111111111111"; then
+  pass "deletion targeted the attested tree (not the literal sentinel)"
+else
+  fail "deletion did not report the resolved attested tree: ${OUT:0:160}"
+fi
+
+# Unattested run fails loudly (never a silent no-op against the sentinel).
+node -e "
+  const { DatabaseSync } = require('node:sqlite');
+  const db = new DatabaseSync('${TEST_VAR}/tamandua.db', { open: true });
+  db.prepare('INSERT INTO runs (id, status, context) VALUES (?, ?, ?)')
+    .run('run-no-context', 'running', '{}');
+  db.close();
+"
+set +e
+OUT2=$("$TOOL" delete-tstx-row --tree TESTEDTREE --run run-no-context --when now 2>&1)
+RC2=$?
+set -e
+if [ "$RC2" -ne 0 ] && echo "$OUT2" | grep -qi "TESTEDTREE"; then
+  pass "unattested TESTEDTREE fails loudly naming the sentinel"
+else
+  fail "unattested TESTEDTREE should fail loudly, got RC=$RC2: ${OUT2:0:160}"
+fi
+
+# ── T2.1 US-010: step:<step-id>:<state> markers match the step id ──────
+# Manifest phase markers name WORKFLOW STEPS (`step:finalize_merge:pending`),
+# whose agent is `merger`; checkStepMarker must match step_id OR agent role
+# (mirroring the controller's probeStepMarkerSatisfied), or the chaos
+# operator exits 2 TRIGGER_NEVER_MATERIALIZED.
+
+echo ""
+echo "--- Test (T2.1 US-010): step-id phase markers arm (step:finalize_merge:pending) ---"
+
+setup_fake_tt_env
+
+node -e "
+  const { DatabaseSync } = require('node:sqlite');
+  const db = new DatabaseSync('${TEST_VAR}/tamandua.db', { open: true });
+  db.exec('DROP TABLE IF EXISTS runs');
+  db.exec(\`
+    CREATE TABLE runs (id TEXT PRIMARY KEY, status TEXT, context TEXT)
+  \`);
+  db.exec('DROP TABLE IF EXISTS steps');
+  db.exec(\`
+    CREATE TABLE steps (
+      run_id TEXT, step_id TEXT, agent_id TEXT, status TEXT, step_index INTEGER
+    )
+  \`);
+  db.prepare('INSERT INTO runs (id, status, context) VALUES (?, ?, ?)').run('marker-run', 'running', '{}');
+  db.prepare('INSERT INTO steps (run_id, step_id, agent_id, status, step_index) VALUES (?, ?, ?, ?, ?)')
+    .run('marker-run', 'finalize_merge', 'bug-fix-merge-worktree_merger', 'pending', 5);
+  db.close();
+"
+
+# --when step:finalize_merge:pending with --timeout 1: the marker must
+# satisfy IMMEDIATELY (step-id match), so the action proceeds past phase_wait
+# to guardFire. guardFire fails (no process target for this action shape in
+# the fake env) with a NON-2 exit — crucially NOT EXIT_TRIGGER_NEVER (2).
+set +e
+OUT=$("$TOOL" delete-tstx-row --tree abc123def456 --run run-marker-run --when step:finalize_merge:pending --timeout 1 2>&1)
+RC=$?
+set -e
+if [ "$RC" -eq 2 ]; then
+  fail "step-id marker did not arm (TRIGGER_NEVER exit 2): $OUT"
+elif [ "$RC" -ne 0 ] && echo "$OUT" | grep -qi "marker_satisfied\|phaseSatisfied"; then
+  pass "step-id marker armed (phase satisfied, proceeded past phase_wait; exit $RC from guard, not trigger)"
+else
+  pass "step-id marker armed (proceeded past phase_wait; exit $RC)"
+fi
+
 # ── Test: write-context writes context key to TT DB ──────────────────
 
 echo ""

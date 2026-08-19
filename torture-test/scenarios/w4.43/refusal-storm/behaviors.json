@@ -1,6 +1,9 @@
 {
   "agents": {
     "doer": {
+      "commands": [
+        "sleep 3"
+      ],
       "output": "STATUS: done\nCHANGES: observed the refusal storm\nTESTS: none (live observation run)",
       "tokens": 0
     }

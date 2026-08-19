@@ -9,17 +9,25 @@
 //   * requires.capabilities entries (incl. `dsh`) are well-formed per the
 //     canonical host-adaptation contract in cases/case.schema.json
 //     (non-empty, <= 128 chars, `^[A-Za-z0-9][A-Za-z0-9._-]*$`).
+//   * US-002: every manifest-referenced scenario dir (context.scenario_path
+//     and local-cell command args of the form scenarios/<dir>) must exist in
+//     the TRACKED TREE — `git ls-files` must list at least one file under it.
+//     Filesystem existence alone never satisfies the check, so an
+//     untracked-asset GREEN (assets present only under gitignored var/ or as
+//     untracked files in the authoring worktree) is impossible.
 //
 // Confined to torture-test/. Zero tokens (pure file/schema checks).
 
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { trackedTreeIssue } from "../scenarios/lib/tracked-tree.mjs";
 
 const binDir = path.dirname(fileURLToPath(import.meta.url));
 const ttRoot = path.resolve(binDir, "..");
 const probesRoot = path.join(ttRoot, "probes");
 const fixturesSrcRoot = path.join(ttRoot, "fixtures-src");
+const scenariosRoot = path.join(ttRoot, "scenarios");
 
 const ALLOWED_REQUIRES_KEYS = new Set([
   "platform",
@@ -220,6 +228,49 @@ function validateSeed(record, caseId) {
   }
 }
 
+// Collect every manifest-referenced scenario dir for a case:
+//   * context.scenario_path (the scripted-cell scenario dir), and
+//   * local-cell command args of the form scenarios/<dir>.
+function collectScenarioDirs(record) {
+  const dirs = [];
+  const context = record?.context;
+  if (context && typeof context === "object" && !Array.isArray(context)
+      && typeof context.scenario_path === "string" && context.scenario_path.length > 0) {
+    dirs.push(context.scenario_path);
+  }
+  const command = record?.command;
+  if (command && typeof command === "object" && !Array.isArray(command)
+      && Array.isArray(command.args)) {
+    for (const arg of command.args) {
+      if (typeof arg === "string" && /^scenarios\/.+/.test(arg) && !dirs.includes(arg)) {
+        dirs.push(arg);
+      }
+    }
+  }
+  return dirs;
+}
+
+// US-002: a manifest-referenced scenario dir must stay inside
+// torture-test/scenarios/ AND must have at least one file in the TRACKED TREE
+// (git ls-files). A dir that exists only on disk — an untracked file set, or
+// assets under gitignored var/ — is a phantom asset: it satisfies a
+// filesystem check on the authoring worktree and disappears on merged main.
+// Fail closed whenever tracked-ness cannot be verified.
+function verifyScenarioDirTracked(relative, caseId) {
+  if (typeof relative !== "string" || !relative.startsWith("scenarios/") || path.isAbsolute(relative)) {
+    fail(`${caseId} has an invalid scenario dir reference: ${JSON.stringify(relative)}`);
+  }
+  const candidate = path.resolve(ttRoot, relative);
+  const rootPrefix = `${scenariosRoot}${path.sep}`;
+  if (!candidate.startsWith(rootPrefix)) {
+    fail(`${caseId} scenario dir reference escapes scenarios/: ${relative}`);
+  }
+  const issue = trackedTreeIssue(candidate, ttRoot);
+  if (issue !== null) {
+    fail(`${caseId} scenario dir ${relative} is not in the tracked tree: ${issue}`);
+  }
+}
+
 function validateTier2Assets(manifestPath) {
   const records = readManifest(manifestPath);
   let caseCount = 0;
@@ -230,6 +281,12 @@ function validateTier2Assets(manifestPath) {
 
     // (b) Validate task file exists
     resolveTaskFile(record.task, caseId);
+
+    // (b2) Validate every manifest-referenced scenario dir is TRACKED
+    // (US-002 — an on-disk-but-untracked scenario dir must fail closed)
+    for (const scenarioDir of collectScenarioDirs(record)) {
+      verifyScenarioDirTracked(scenarioDir, caseId);
+    }
 
     // (c) Validate probes
     const probeIds = collectProbeIds(record);

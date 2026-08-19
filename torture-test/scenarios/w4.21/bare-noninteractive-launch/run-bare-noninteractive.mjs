@@ -160,20 +160,70 @@ function deleteRun(runId) {
   // The daemon is told via `workflow delete --force` first so any crons the
   // reconciler set up are torn down by the product path; then the run's rows
   // are removed from the shared contained ledger (steps / run_worktrees /
-  // runs) + its events file — the W4.11 scoped-ledger pattern.
+  // runs) + its events file — the W4.11 scoped-ledger pattern. The SUCCESS
+  // path stays strict: a hard CLI failure or a leftover row fails the cell.
   const res = runSync(cli, ["workflow", "delete", `run-${runId}`, "--force"], { timeout: 60_000 });
   assert.equal(res.status, 0, `workflow delete run-${runId} failed:\n${res.stdout}\n${res.stderr}`);
-  const del = new DatabaseSync(dbPath);
-  try {
-    del.prepare("DELETE FROM steps WHERE run_id = ?").run(runId);
-    del.prepare("DELETE FROM run_worktrees WHERE run_id = ?").run(runId);
-    del.prepare("DELETE FROM runs WHERE id = ?").run(runId);
-  } finally {
-    del.close();
-  }
-  fs.rmSync(path.join(eventsDir, `${runId}.jsonl`), { force: true });
+  deleteRunRows(runId);
   const rows = dbRows("SELECT COUNT(*) AS c FROM runs WHERE id = ?", [runId]);
   assert.equal(rows[0].c, 0, `run ${runId} still present after delete`);
+}
+
+// T2.1 US-007: a FAILED W4.21 must not leave its branch-A probe run behind.
+// The campaign evidence: the earlier operator campaign's W4.21 timed out on
+// the branch-A launch wait (run 85c4b27e stayed [running] in the shared
+// scripted ledger), and the NEXT campaign's W4.20 `tamandua update` then
+// refused ("Active Tamandua runs detected ... Run tamandua update --force
+// to continue despite active runs") and failed its behind leg. The success
+// path already deletes the run; the safety nets below do the same on every
+// failure path (assertion failure, uncaught exception, process exit) so a
+// failed W4.21 can never contaminate the shared ledger for sibling cells.
+const createdRunIds = [];
+function registerCreatedRun(runId) {
+  createdRunIds.push(runId);
+}
+function cleanupCreatedRuns() {
+  for (const runId of createdRunIds) {
+    cliDeleteRun(runId);
+    deleteRunRows(runId);
+  }
+}
+process.on("exit", cleanupCreatedRuns);
+process.on("uncaughtException", (error) => {
+  cleanupCreatedRuns();
+  // eslint-disable-next-line no-console
+  console.error(error);
+  process.exit(1);
+});
+
+function cliDeleteRun(runId) {
+  const res = runSync(cli, ["workflow", "delete", `run-${runId}`, "--force"], { timeout: 60_000 });
+  // Best-effort from a safety net: a missing run (already deleted) is fine;
+  // a hard CLI failure must not throw here.
+  if (res.status !== 0 && !/No run found matching/.test(res.stderr)) {
+    process.stderr.write(`w4.21: workflow delete run-${runId} failed (best-effort):\n${res.stdout}\n${res.stderr}\n`);
+  }
+}
+
+function deleteRunRows(runId) {
+  // Tolerant scoped-ledger removal: never throws from a safety net.
+  try {
+    const del = new DatabaseSync(dbPath);
+    try {
+      del.prepare("DELETE FROM steps WHERE run_id = ?").run(runId);
+      del.prepare("DELETE FROM run_worktrees WHERE run_id = ?").run(runId);
+      del.prepare("DELETE FROM runs WHERE id = ?").run(runId);
+    } finally {
+      del.close();
+    }
+  } catch (error) {
+    process.stderr.write(`w4.21: ledger cleanup for run ${runId} failed (best-effort): ${error}\n`);
+  }
+  try {
+    fs.rmSync(path.join(eventsDir, `${runId}.jsonl`), { force: true });
+  } catch {
+    // ignore — events dir may not exist
+  }
 }
 
 // ── setup: scratch origin + bare-shell scratch PATH ─────────────────
@@ -231,6 +281,7 @@ assert.equal(launchA.status, 0,
   `branch A: full launch must succeed from the bare shell:\n${launchA.stdout}\n${launchA.stderr}`);
 const { record: recordA, runId: runIdA } = completedRunId(launchA.stdout);
 assert.ok(runIdA.length > 0, `branch A: run id missing:\n${launchA.stdout}`);
+registerCreatedRun(runIdA);
 assert.equal(recordA.status, "completed",
   `branch A: the launched bfmw must complete (discovery tiers produce a working run): ${launchA.stdout}`);
 const runARows = dbRows("SELECT tokens_spent, worker_lost_count FROM runs WHERE id = ?", [runIdA]);

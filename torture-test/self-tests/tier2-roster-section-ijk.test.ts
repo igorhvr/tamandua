@@ -150,7 +150,14 @@ describe("Tier-2 US-012 — sections I/J/K roster (hermes stream & resolver tort
       assert.equal(record.mandatory, true, `${id} must be mandatory`);
       assert.equal(record.shed_ok, false, `${id} must not be shed-ok`);
       assert.match(record.spec_ref, /#W4\.40/, `${id} spec_ref must point at W4.40`);
-      assert.equal(record.chaos, null, `${id} must carry chaos null`);
+      // T2.1 US-010: the arms carry NO chaos injection (the knob IS the
+      // injection) but DO declare the O11 synthetic-token ledger for the
+      // scripted run (the controller fills the launch run id at oracle time).
+      assert.equal(record.chaos?.type ?? null, null, `${id} must carry no chaos injection`);
+      assert.ok(Array.isArray(record.chaos?.synthetic_token_ledger)
+        && record.chaos.synthetic_token_ledger.length === 1
+        && record.chaos.synthetic_token_ledger[0].expected_tokens === 0,
+        `${id} must declare the zero-token O11 synthetic ledger (T2.1 US-010)`);
       assert.ok(record.production_duration_floor_ms > 0, `${id} must carry production_duration_floor_ms`);
     }
     // The per-arm knobs live in each cell's behaviors file (the knob IS the
@@ -364,6 +371,11 @@ describe("Tier-2 US-012 — sections I/J/K roster (hermes stream & resolver tort
   });
 
   it("W4.41 resolver runners EXECUTE and prove tier-3 win + all-tiers-fail refusal + zero-filesystem-mutation", () => {
+    // The scratch parent lives under gitignored var/ and may not exist on a
+    // FRESH tree (var/scenarios is created by campaign runs, not by git) —
+    // provision it so the test is hermetic from an empty var (the w4.25
+    // aged-state-fixture pattern).
+    fs.mkdirSync(path.join(varRoot, "scenarios"), { recursive: true });
     const scratch = fs.mkdtempSync(path.join(varRoot, "scenarios", "w441-direct-"));
     try {
       for (const id of W4_41_ARMS) {

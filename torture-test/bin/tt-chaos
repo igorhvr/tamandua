@@ -575,7 +575,17 @@ function verifyDbPathForMutation() {
  */
 function deleteTstxRow(opts) {
   const { run: runId, args } = opts;
-  const treeHash = args.tree;
+  // T2.1 US-010: W4.36 declares the sentinel tree `TESTEDTREE` (the tree is
+  // unknowable at manifest authoring). Resolve it at FIRE time to the run's
+  // ATTESTED tested tree — the `TESTED_TREE` the verifier emitted, carried in
+  // the run context as `tested_tree` (the step-output key parser lowercases).
+  // By the delete-tstx-row trigger (finalize pending) the verifier has run, so
+  // the attested tree is present; a missing attestation fails loudly (never a
+  // silent no-op deletion against the sentinel string).
+  let treeHash = args.tree;
+  if (treeHash === 'TESTEDTREE') {
+    treeHash = resolveAttestedTestedTree(runId);
+  }
 
   if (!treeHash) {
     console.error('Error: --tree is required for delete-tstx-row');
@@ -588,8 +598,25 @@ function deleteTstxRow(opts) {
 
   try {
     db = new DatabaseSync(dbPath, { open: true });
-    const result = db.prepare('DELETE FROM tstx WHERE tree = ?').run(treeHash);
-    deletedCount = result.changes;
+    // T2.1 US-010: the product's suite ledger table is `suite_results` (the
+    // tamandua-test shim's rows carry tree_hash/origin_repo/run_id/step_id);
+    // the historical `tstx` table name never existed in the product schema,
+    // so delete-tstx-row deleted 0 rows against a missing table (and errored
+    // on the missing table). Delete the tested tree's suite rows — the
+    // "TSTX evidence row" the drain-armed deletion corridor (W4.01/02/36/48c)
+    // intends to make MISSING. A legacy `tstx` table is also honored when
+    // present.
+    const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('tstx','suite_results')").all();
+    const hasSuiteResults = tables.some((row) => row.name === 'suite_results');
+    const hasLegacyTstx = tables.some((row) => row.name === 'tstx');
+    if (hasSuiteResults) {
+      const result = db.prepare('DELETE FROM suite_results WHERE tree_hash = ?').run(treeHash);
+      deletedCount += result.changes;
+    }
+    if (hasLegacyTstx) {
+      const result = db.prepare('DELETE FROM tstx WHERE tree = ?').run(treeHash);
+      deletedCount += result.changes;
+    }
   } catch (e) {
     const entry = {
       ts: new Date().toISOString(), action: 'delete-tstx-row', runId,
@@ -611,6 +638,41 @@ function deleteTstxRow(opts) {
   logStructured(entry);
   console.error(`delete-tstx-row: deleted ${deletedCount} row(s) for tree ${treeHash}`);
   process.exit(0);
+}
+
+/**
+ * Resolve the TESTEDTREE sentinel to the run's attested tested tree.
+ * Reads the run row's context from the contained TT DB (both run-id
+ * spellings) and returns context.tested_tree when it is a 40-hex tree.
+ * Throws a loud error when the run has not attested a tree.
+ */
+function resolveAttestedTestedTree(runId) {
+  const dbPath = resolveDbPath();
+  const shortRunId = runId.startsWith('run-') ? runId.slice(4) : runId;
+  let db = null;
+  try {
+    db = new DatabaseSync(dbPath, { open: true, readOnly: true });
+    const rows = db.prepare('SELECT context FROM runs WHERE id = ? OR id = ?').all(runId, shortRunId);
+    if (rows.length !== 1 || typeof rows[0].context !== 'string') {
+      throw new Error(`TESTEDTREE resolution: run ${runId} has no readable context row`);
+    }
+    const context = JSON.parse(rows[0].context);
+    const attested = typeof context.tested_tree === 'string'
+      && /^[0-9a-f]{40}$/.test(context.tested_tree)
+      ? context.tested_tree
+      : null;
+    if (attested === null) {
+      throw new Error(`TESTEDTREE resolution: run ${runId} has no attested tested_tree in its context`);
+    }
+    return attested;
+  } catch (e) {
+    if (e instanceof SyntaxError) {
+      throw new Error(`TESTEDTREE resolution: run ${runId} context is not JSON: ${e.message}`);
+    }
+    throw e;
+  } finally {
+    if (db) try { db.close(); } catch { /* ignore */ }
+  }
 }
 
 /**
@@ -1127,15 +1189,22 @@ function checkStepMarker(marker, db, runId) {
   const [role, state] = parts;
   const shortRunId = runId.startsWith('run-') ? runId.slice(4) : runId;
 
+  // T2.1 US-010: match the step by STEP ID OR agent role, mirroring the
+  // controller's probeStepMarkerSatisfied. Manifest phase markers name the
+  // WORKFLOW STEP (`step:finalize_merge:pending` names the finalize_merge
+  // step whose agent is `merger`), while `step:developer:running` names the
+  // developer AGENT of the implement step — both spellings must arm the
+  // chaos trigger or the operator exits 2 TRIGGER_NEVER_MATERIALIZED
+  // against a real contained instance.
   try {
     const rows = db.prepare(
-      `SELECT 1 FROM steps WHERE run_id = ? AND agent_id LIKE ? AND status = ? LIMIT 1`
-    ).all(runId, `%${role}%`, state);
+      `SELECT 1 FROM steps WHERE run_id = ? AND (step_id = ? OR agent_id LIKE ?) AND status = ? LIMIT 1`
+    ).all(runId, role, `%${role}%`, state);
     if (rows.length > 0) return true;
     if (shortRunId !== runId) {
       const shortRows = db.prepare(
-        `SELECT 1 FROM steps WHERE run_id = ? AND agent_id LIKE ? AND status = ? LIMIT 1`
-      ).all(shortRunId, `%${role}%`, state);
+        `SELECT 1 FROM steps WHERE run_id = ? AND (step_id = ? OR agent_id LIKE ?) AND status = ? LIMIT 1`
+      ).all(shortRunId, role, `%${role}%`, state);
       return shortRows.length > 0;
     }
     return false;

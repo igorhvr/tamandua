@@ -1,26 +1,32 @@
 {
   "agents": {
     "triager": {
-      "output": "STATUS: done\nSEVERITY: high",
+      "output": "STATUS: done\nREPO: {{cwd}}\nBRANCH: w441-fix\nSEVERITY: high\nAFFECTED_AREA: hermes binary resolver\nREPRODUCTION: resolver corridor fixture\nPROBLEM_STATEMENT: hermes resolver corridor must be exercised",
       "tokens": 0
     },
     "investigator": {
-      "output": "STATUS: done\nROOT_CAUSE: resolver corridor",
+      "output": "STATUS: done\nROOT_CAUSE: resolver corridor\nFIX_APPROACH: resolver corridor fix",
       "tokens": 0
     },
     "setup": {
       "commands": [
         "git checkout -b w441-fix"
       ],
-      "output": "STATUS: done\nBUILD_CMD: true\nTEST_CMD: true",
+      "output": "STATUS: done\nORIGINAL_BRANCH: {{input.ORIGINAL_BRANCH}}\nBUILD_CMD: true\nTEST_CMD: true",
       "tokens": 0
     },
     "fixer": {
+      "writes": [
+        {
+          "file": "src/w4.41-fix.ts",
+          "content": "// W4.41 resolver corridor: the scripted fixer's canonical change.\n// The corridor under test is the hermes binary resolver; this marker\n// keeps the bfmw round a genuine fix+commit cycle on the tt-ts fixture.\nexport const W441_FIX_MARKER = 'w4.41-resolver-torture';\n"
+        }
+      ],
       "commands": [
-        "git add value.txt",
+        "git add -A",
         "git commit -m \"fix: resolver torture\""
       ],
-      "output": "STATUS: done\nCHANGES: resolver corridor",
+      "output": "STATUS: done\nCHANGES: resolver corridor\nREGRESSION_TEST: scripted resolver evidence",
       "tokens": 0
     },
     "verifier": {
@@ -31,8 +37,12 @@
       ]
     },
     "merger": {
-      "output": "STATUS: done",
-      "tokens": 0
+      "output": "STATUS: done\nREBASED: false",
+      "tokens": 0,
+      "includeCommandOutput": true,
+      "commands": [
+        "EXPECT_TIP=\"$(git -C '{{input.WORKTREE_ORIGIN_REPOSITORY}}' rev-parse 'refs/heads/{{input.ORIGINAL_BRANCH}}')\"; MESSAGE_FILE=\"$(mktemp)\"; printf 'fix: scripted corridor merge\\n\\nCo-Authored-By: Tamandua <tamandua@tetradactyla.org>\\n' > \"$MESSAGE_FILE\"; tamandua merge-branch --origin '{{input.WORKTREE_ORIGIN_REPOSITORY}}' --branch '{{input.BRANCH}}' --into '{{input.ORIGINAL_BRANCH}}' --expect-tip \"$EXPECT_TIP\" --message \"$(cat \"$MESSAGE_FILE\")\"; MERGE_EXIT=$?; rm -f \"$MESSAGE_FILE\"; exit $MERGE_EXIT"
+      ]
     }
   },
   "heartbeatTokens": 0,

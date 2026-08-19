@@ -89,6 +89,12 @@ HEAVY_CAMPAIGN_TESTS=(
     # rewrites the SHARED var/w0/host-profile.json — heavy/isolated exactly
     # like the tier1 campaign proofs.
     'tier2-repeatability.test.ts'
+    # US-004 (T2.1): tier2-scripted-behaviors-materialization drives the real
+    # controller + scripted daemon with pinned harness binaries to prove the
+    # controller materializes TAMANDUA_SCRIPTED_BEHAVIORS from the scenario cell
+    # (step output matches the cell's canned output) — heavy/isolated like the
+    # tier1 scripted battery.
+    'tier2-scripted-behaviors-materialization.test.ts'
 )
 
 # is_heavy <base> — 0 if <base> is a heavy campaign test (isolated elsewhere), else 1.

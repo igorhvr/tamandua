@@ -1,0 +1,51 @@
+{
+  "agents": {
+    "triager": {
+      "output": "STATUS: done\nREPO: {{cwd}}\nBRANCH: w436-fix\nSEVERITY: high\nAFFECTED_AREA: value.txt\nREPRODUCTION: fixture contains the old value\nPROBLEM_STATEMENT: fixture value must be corrected",
+      "tokens": 0
+    },
+    "investigator": {
+      "output": "STATUS: done\nROOT_CAUSE: fixture contains a stale value\nFIX_APPROACH: replace old with fixed",
+      "tokens": 0
+    },
+    "setup": {
+      "commands": [
+        "git checkout -b w436-fix"
+      ],
+      "output": "STATUS: done\nORIGINAL_BRANCH: {{input.ORIGINAL_BRANCH}}\nBUILD_CMD: true\nTEST_CMD: npm test\nBASELINE: deterministic fixture ready",
+      "tokens": 0
+    },
+    "fixer": {
+      "writes": [
+        {
+          "file": "src/store.js",
+          "content": "// W4.36 injection: the fix-shaped edit INVERTS the assertion.\nconst assert = require('node:assert');\nassert.equal(1, 2);\n"
+        }
+      ],
+      "commands": [
+        "rm -f test/regression.test.js",
+        "git add -A",
+        "git commit -m \"fix: update scripted broken-work fixture\""
+      ],
+      "output": "STATUS: done\nCHANGES: fix-shaped edit that DELETES the regression test and inverts the assertion (suite broken + inventory destroyed)\nREGRESSION_TEST: scripted broken-work evidence",
+      "tokens": 0
+    },
+    "verifier": {
+      "commands": [
+        "sleep 10"
+      ],
+      "output": "STATUS: done\nVERIFIED: deterministic fixture tree verified (suite broken by the injected fixer edit)\nTESTED_TREE: {{gitTree}}",
+      "tokens": 0
+    },
+    "merger": {
+      "output": "STATUS: done\nREBASED: false\nMERGE_COMMIT: 0000000\nMERGED_INTO: main\nMERGED_TREE: {{gitTree}}",
+      "tokens": 0,
+      "includeCommandOutput": true,
+      "commands": [
+        "EXPECT_TIP=\"$(git -C '{{input.WORKTREE_ORIGIN_REPOSITORY}}' rev-parse 'refs/heads/{{input.ORIGINAL_BRANCH}}')\"; MESSAGE_FILE=\"$(mktemp)\"; printf 'fix: scripted corridor merge\\n\\nCo-Authored-By: Tamandua <tamandua@tetradactyla.org>\\n' > \"$MESSAGE_FILE\"; tamandua merge-branch --origin '{{input.WORKTREE_ORIGIN_REPOSITORY}}' --branch '{{input.BRANCH}}' --into '{{input.ORIGINAL_BRANCH}}' --expect-tip \"$EXPECT_TIP\" --message \"$(cat \"$MESSAGE_FILE\")\"; MERGE_EXIT=$?; rm -f \"$MESSAGE_FILE\"; exit $MERGE_EXIT"
+      ]
+    }
+  },
+  "heartbeatTokens": 0,
+  "defaultTokens": 0
+}

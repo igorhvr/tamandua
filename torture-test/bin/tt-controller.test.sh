@@ -918,6 +918,7 @@ if [ "${1:-}" = "workflow" ] && [ "${2:-}" = "runs" ]; then
 fi
 if [ "${1:-}" = "workflow" ] && [ "${2:-}" = "status" ]; then
   case "${CONTROLLER_WORKFLOW_MODE:-stdout}" in
+    scripted-fixture-lstat) printf '{"runId":"run-11111111-1111-4111-8111-111111111111","status":"failed","tokensSpent":0,"steps":[]}\n' ;;
     stdout) printf '{"runId":"run-11111111-1111-4111-8111-111111111111","status":"completed","tokensSpent":0,"steps":[]}\n' ;;
     probe-pause-fail) printf '{"runId":"run-11111111-1111-4111-8111-111111111111","status":"completed","tokensSpent":0,"steps":[]}\n' ;;
     multi-run-seq)
@@ -1077,6 +1078,28 @@ fi
 # sequential W3.20 shape, completed (exit 0) for the concurrent W3.22 shape.
 if [ "${1:-}" = "workflow" ] && [ "${2:-}" = "run" ]; then
   case "${CONTROLLER_WORKFLOW_MODE:-stdout}" in
+    scripted-fixture-lstat)
+      # US-003 (T2.1): mirror the product's launch-time origin lstat. The real
+      # `tamandua workflow run --worktree-origin-repository <path>` lstats the
+      # origin repository at launch; a missing clone dies with
+      # 'ENOENT: no such file or directory, lstat <path>' — the exact
+      # scheduler-execution-failed signature this test guards against. Exit 1
+      # mirrors the product's failed-run exit code for the wait JSON below
+      # (a failed run exits 1, so no O13 disagreement is recorded).
+      origin_repo=""
+      prev_arg=""
+      for argv_item in "$@"; do
+        if [ "$prev_arg" = "--worktree-origin-repository" ]; then origin_repo="$argv_item"; fi
+        prev_arg="$argv_item"
+      done
+      if [ -z "$origin_repo" ] || [ ! -d "$origin_repo" ]; then
+        printf 'ENOENT: no such file or directory, lstat %s\n' "${origin_repo:-<missing>}" >&2
+        exit 1
+      fi
+      printf 'Run: run-11111111-1111-4111-8111-111111111111\n'
+      printf '{"runs":[{"runId":"run-11111111-1111-4111-8111-111111111111","status":"failed","tokensSpent":0}],"timedOut":false}\n'
+      exit 1
+      ;;
     multi-run-seq|multi-run-conc)
       count=0
       [ ! -f "$CONTROLLER_MULTI_RUN_COUNTER" ] || count="$(cat "$CONTROLLER_MULTI_RUN_COUNTER")"
@@ -1226,6 +1249,99 @@ if (attempt.run_id !== 'run-11111111-1111-4111-8111-111111111111'
 }
 NODE
 pass "workflow argv and full stdout run identifier are persisted"
+
+# ── US-003 (T2.1): scripted workflow cases provision their fixture work clone ──
+# The ENOENT root cause from the operator campaign: tt-controller gated fixture
+# provisioning behind execution_mode === 'real', yet workflowRunArgs passes
+# --worktree-origin-repository var/fixtures/work/<case-id>/<fixture> for SCRIPTED
+# workflow cases too — the product lstats the origin repository at launch, so a
+# clean tree (no authoring-worktree var/ leftovers) died with
+# 'ENOENT: no such file or directory, lstat ...' (a scheduler-execution-failed /
+# workflow-run-identification TEST_INFRA_FAIL). This regression test drives a
+# scripted workflow case with a stub `tamandua` that MIRRORS the product's lstat
+# (fails the launch if the origin repository is missing) and asserts the
+# controller provisioned the clone BEFORE launch: the clone exists at
+# var/fixtures/work/<case>/tt-ts, the attempt records fixture_provision_record +
+# fixture_work_clone, the launch argv carries the provisioned path, and the case
+# classifies by its terminal run status — never TEST_INFRA_FAIL. Local-command
+# cells (fixture 'none') and replay attempts keep their prior semantics (they
+# never re-provision; asserted by the replay gate tests above/below).
+scripted_fixture_manifest="$TEST_ROOT/manifests/scripted-workflow-fixture.jsonl"
+node --input-type=module - "$scripted_fixture_manifest" <<'NODE'
+import fs from 'node:fs';
+const record = {
+  id: 'SCRIPTED-WORKFLOW-FIXTURE', wave: 4, workflow: 'bug-fix-merge-worktree',
+  fixture: 'tt-ts', harness: 'scripted-pi',
+  task: 'cases/tasks/tier2/W4.04c-keyline-laundering.md',
+  context: { execution_mode: 'scripted', test_cmd: 'npm test' },
+  caps: { tokens: 0, wall_min: 5 }, requires: {},
+  boundary_files: ['fixtures/tt-ts/src'], forbidden: [],
+  oracles: [], gates: [], chaos: null, shed_ok: false, mandatory: true,
+  class: 'verification',
+};
+fs.writeFileSync(process.argv[2], `${JSON.stringify(record)}\n`);
+NODE
+[ -d "$TT_DIR/var/fixtures/golden/tt-ts.git" ] \
+  || node "$TT_DIR/bin/tt-golden-bootstrap.mjs" --fixture tt-ts >/dev/null 2>&1 \
+  || fail "could not bootstrap the tt-ts golden for the scripted fixture provisioning test"
+scripted_clone_path="$TT_DIR/var/fixtures/work/SCRIPTED-WORKFLOW-FIXTURE/tt-ts"
+rm -rf -- "$scripted_clone_path"
+scripted_fixture_output=$(PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$workflow_events" \
+  CONTROLLER_WORKFLOW_MODE=scripted-fixture-lstat \
+  TT_CONTROLLER_POLL_INTERVAL_MS=20 TT_CONTROLLER_TRUTH_RECHECK_MS=20 \
+  run_recorded_campaign "$CONTROLLER" --manifest "$scripted_fixture_manifest") \
+  || fail "scripted workflow fixture provisioning campaign failed: $scripted_fixture_output"
+scripted_fixture_id=$(remember_campaign "$scripted_fixture_output")
+node --input-type=module - "$TT_DIR/var/results/$scripted_fixture_id/state.json" \
+  "$workflow_events" "$scripted_clone_path" <<'NODE'
+import fs from 'node:fs';
+const [statePath, eventsPath, clonePath] = process.argv.slice(2);
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const item = state.cases.find((c) => c.id === 'SCRIPTED-WORKFLOW-FIXTURE');
+if (!item) throw new Error('scripted workflow case missing from state');
+const attempt = item.attempts.at(-1);
+// The stub reports a failed terminal run -> the case is INCONCLUSIVE. The
+// point is it is NOT TEST_INFRA_FAIL: the provisioned origin repository
+// existed, so the stub's product-mirroring lstat never hit ENOENT (before
+// US-003 the unprovisioned path made the stub exit 1 with the ENOENT
+// signature and the case classify TEST_INFRA_FAIL workflow-run-identification).
+if (item.outcome === 'TEST_INFRA_FAIL') {
+  throw new Error(`scripted workflow case must not classify TEST_INFRA_FAIL (ENOENT): ${JSON.stringify({ item })}`);
+}
+if (item.outcome !== 'INCONCLUSIVE' || attempt.terminal_status !== 'failed') {
+  throw new Error(`scripted workflow case must classify by its failed terminal run: ${JSON.stringify({ item })}`);
+}
+if (item.phase !== 'terminal') throw new Error(`scripted workflow case not terminal: ${JSON.stringify(item)}`);
+if (attempt.execution_mode !== 'scripted') {
+  throw new Error(`expected a scripted attempt: ${JSON.stringify(attempt)}`);
+}
+if (typeof attempt.fixture_work_clone !== 'string' || attempt.fixture_work_clone === '') {
+  throw new Error(`scripted attempt must record the provisioned clone path: ${JSON.stringify(attempt)}`);
+}
+const provision = attempt.fixture_provision_record;
+if (!provision || provision.work_clone_path !== attempt.fixture_work_clone
+    || provision.fixture !== 'tt-ts' || provision.case_id !== 'SCRIPTED-WORKFLOW-FIXTURE'
+    || typeof provision.golden_bare !== 'string') {
+  throw new Error(`scripted attempt must record the fixture_provision_record: ${JSON.stringify(provision)}`);
+}
+// The clone must physically exist (INCONCLUSIVE teardown keeps it as evidence).
+if (!fs.existsSync(clonePath) || !fs.existsSync(`${clonePath}/.git`)
+    || !fs.existsSync(`${clonePath}/src/index.ts`)
+    || !fs.existsSync(`${clonePath}/operator-notes.local`)) {
+  throw new Error(`provisioned clone does not exist at ${clonePath}: ${JSON.stringify(item.teardown)}`);
+}
+const events = fs.readFileSync(eventsPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+const launch = [...events].reverse().find((entry) => entry.argv[0] === 'workflow' && entry.argv[1] === 'run');
+if (!launch) throw new Error('no workflow run launch recorded');
+const originIdx = launch.argv.indexOf('--worktree-origin-repository');
+if (originIdx < 0 || launch.argv[originIdx + 1] !== clonePath) {
+  throw new Error(`launch argv must pass the provisioned clone as origin: ${JSON.stringify(launch.argv)}`);
+}
+if (item.teardown?.kept !== true || item.teardown?.work_clone_path !== clonePath) {
+  throw new Error(`INCONCLUSIVE teardown must keep the provisioned clone: ${JSON.stringify(item.teardown)}`);
+}
+NODE
+pass "scripted workflow cases provision their fixture work clone before launch (no ENOENT)"
 
 for harvest_mode in harvest-status harvest-db harvest-lie harvest-shifting-lie; do
   harvest_manifest="$TEST_ROOT/manifests/$harvest_mode.jsonl"
@@ -4517,6 +4633,7 @@ mkdir -p "$launcher_root/bin" "$launcher_root/cases" "$launcher_root/var/results
 cp "$SCRIPT_DIR/tt-run" "$launcher_root/bin/tt-run"
 cp "$SCRIPT_DIR/tt-tier0-assets" "$launcher_root/bin/tt-tier0-assets"
 cp "$TT_DIR/scenarios/lib/validate-scenario.mjs" "$launcher_root/scenarios/lib/validate-scenario.mjs"
+cp "$TT_DIR/scenarios/lib/tracked-tree.mjs" "$launcher_root/scenarios/lib/tracked-tree.mjs"
 : > "$launcher_root/cases/smoke.jsonl"
 cat > "$TEST_ROOT/workflows/do-now/workflow.yml" <<'YAML'
 id: do-now
@@ -4556,6 +4673,13 @@ cat > "$launcher_root/bin/tt-verify-environment" <<'SH'
 exit 99
 SH
 chmod +x "$launcher_root/bin/tt-controller" "$launcher_root/bin/tt-verify-environment"
+# US-002: the tier asset validators require every manifest-referenced scenario
+# dir to exist in the TRACKED TREE (git ls-files), not merely on disk. Make
+# the launcher fixture a real git checkout so its scenarios/example cell is
+# tracked — mirroring a merged-main checkout where only committed assets
+# exist (an untracked-asset GREEN would now refuse).
+git init -q "$launcher_root"
+git -C "$launcher_root" add -A
 launcher_log="$TEST_ROOT/launcher-controller-argv"
 for expected_status in 0 1 2; do
   set +e

@@ -13,12 +13,19 @@ VALIDATOR="$SCRIPT_DIR/tt-tier2-assets"
 
 TMP_CASES="$(mktemp -d "$TT_DIR/cases/tt-tier2-assets-test.XXXXXX")"
 TASK_FILE="$TT_DIR/var/tier2-test-task-$$.md"
+UNTRACKED_DIR="$TT_DIR/scenarios/tt-tier2-untracked-$$"
+SCRATCH_REPO=""
+UNTRACKED_DIR_CREATED=""
 
 cleanup() {
   rm -rf -- "$TMP_CASES"
   rm -f -- "$TASK_FILE" "$TASK_FILE"2 "$TASK_FILE"3 "$TASK_FILE"4 "$TASK_FILE"5 \
     "$TASK_FILE"6 "$TASK_FILE"7 "$TASK_FILE"8 "$TASK_FILE"9 "$TASK_FILE"10 \
-    "$TASK_FILE"11 "$TASK_FILE"12 "$TASK_FILE"13 "$TASK_FILE"14
+    "$TASK_FILE"11 "$TASK_FILE"12 "$TASK_FILE"13 "$TASK_FILE"14 \
+    "$TASK_FILE"15 "$TASK_FILE"16 "$TASK_FILE"17 "$TASK_FILE"18 "$TASK_FILE"19 \
+    "$TASK_FILE"20
+  if [ -n "$UNTRACKED_DIR_CREATED" ]; then rm -rf -- "$UNTRACKED_DIR"; fi
+  if [ -n "$SCRATCH_REPO" ]; then rm -rf -- "$SCRATCH_REPO"; fi
 }
 trap 'cleanup' EXIT
 
@@ -216,6 +223,96 @@ if ! "$VALIDATOR" "$TMP_CASES/fail-empty.jsonl" >/dev/null 2>&1; then
   pass "empty manifest exits non-zero"
 else
   fail "empty manifest exits non-zero"
+fi
+
+# ---- Test 17: red arm — scenario dir on disk but ABSENT from git ls-files ----
+# US-002: an untracked scenario dir (present on disk, no tracked file under
+# it) must make the availability gate refuse AND name the dir — filesystem
+# existence alone must never satisfy the check.
+echo "# Test task untracked" > "$TASK_FILE"17
+mkdir -p "$UNTRACKED_DIR"
+UNTRACKED_DIR_CREATED=1
+echo "untracked marker" > "$UNTRACKED_DIR/marker.txt"
+cat > "$TMP_CASES/fail-untracked-scenario.jsonl" <<JSONL
+{"id":"T2-FAIL-009","wave":4,"workflow":"bug-fix-merge-worktree","fixture":"tt-ts","harness":"pi","task":"var/tier2-test-task-$$.md17","context":{"execution_mode":"scripted","scenario_id":"zz-untracked","scenario_path":"scenarios/tt-tier2-untracked-$$"},"caps":{"tokens":0,"wall_min":1},"requires":{},"boundary_files":[],"forbidden":[],"oracles":[],"gates":[],"chaos":null,"shed_ok":false,"mandatory":true,"class":"verification"}
+JSONL
+
+if ! "$VALIDATOR" "$TMP_CASES/fail-untracked-scenario.jsonl" >"$TMP_CASES/untracked.stdout" 2>"$TMP_CASES/untracked.stderr" \
+   && grep -q "tt-tier2-untracked-$$" "$TMP_CASES/untracked.stderr"; then
+  pass "untracked scenario dir (on disk, absent from git ls-files) exits non-zero naming the dir"
+else
+  fail "untracked scenario dir (on disk, absent from git ls-files) exits non-zero naming the dir"
+  cat "$TMP_CASES/untracked.stderr" 2>/dev/null || true
+fi
+
+# ---- Test 18: red arm — local-cell command arg scenarios/<dir> untracked ----
+# The guard also covers command.args entries of the form scenarios/<dir>
+# (the W4.27/W4.11/W4.12/W4.19-style local cells).
+cat > "$TMP_CASES/fail-untracked-command-arg.jsonl" <<JSONL
+{"id":"T2-FAIL-010","wave":4,"workflow":"local","fixture":"none","harness":"local","task":"var/tier2-test-task-$$.md17","context":{"execution_mode":"scripted"},"caps":{"tokens":0,"wall_min":1},"requires":{},"boundary_files":[],"forbidden":[],"oracles":[],"gates":[],"chaos":null,"shed_ok":false,"mandatory":true,"class":"verification","command":{"executable":"scenarios/lib/run-scripted-scenario","args":["scenarios/tt-tier2-untracked-$$"],"cwd":"."}}
+JSONL
+
+if ! "$VALIDATOR" "$TMP_CASES/fail-untracked-command-arg.jsonl" >"$TMP_CASES/untracked-cmd.stdout" 2>"$TMP_CASES/untracked-cmd.stderr" \
+   && grep -q "tt-tier2-untracked-$$" "$TMP_CASES/untracked-cmd.stderr"; then
+  pass "untracked scenario dir via command arg exits non-zero naming the dir"
+else
+  fail "untracked scenario dir via command arg exits non-zero naming the dir"
+  cat "$TMP_CASES/untracked-cmd.stderr" 2>/dev/null || true
+fi
+
+# ---- Test 19: green arm — a TRACKED scenario dir reference exits 0 ----
+echo "# Test task tracked" > "$TASK_FILE"19
+cat > "$TMP_CASES/pass-tracked-scenario.jsonl" <<JSONL
+{"id":"T2-PASS-006","wave":4,"workflow":"bug-fix-merge-worktree","fixture":"tt-ts","harness":"pi","task":"var/tier2-test-task-$$.md19","context":{"execution_mode":"scripted","scenario_id":"w4.21-bare-noninteractive-launch","scenario_path":"scenarios/w4.21/bare-noninteractive-launch"},"caps":{"tokens":0,"wall_min":1},"requires":{},"boundary_files":[],"forbidden":[],"oracles":[],"gates":[],"chaos":null,"shed_ok":false,"mandatory":true,"class":"verification"}
+JSONL
+
+if "$VALIDATOR" "$TMP_CASES/pass-tracked-scenario.jsonl" >/dev/null 2>&1; then
+  pass "tracked scenario dir reference exits 0"
+else
+  fail "tracked scenario dir reference exits 0"
+  "$VALIDATOR" "$TMP_CASES/pass-tracked-scenario.jsonl" 2>&1 || true
+fi
+
+# ---- Test 20: red-then-green — delete one tracked scenario in a scratch copy ----
+# A scratch copy of the tree (own git checkout) with ONE tracked scenario
+# dropped from the index must make the gate refuse naming the dir; restoring
+# it must pass again.
+SCRATCH_REPO="$(mktemp -d "${TMPDIR:-/tmp}/tt-tier2-tracked-scratch.XXXXXX")"
+mkdir -p "$SCRATCH_REPO/bin" "$SCRATCH_REPO/cases" "$SCRATCH_REPO/var" \
+  "$SCRATCH_REPO/scenarios/lib"
+cp "$VALIDATOR" "$SCRATCH_REPO/bin/tt-tier2-assets"
+cp "$TT_DIR/scenarios/lib/tracked-tree.mjs" "$SCRATCH_REPO/scenarios/lib/tracked-tree.mjs"
+cp -r "$TT_DIR/scenarios/w4.21" "$SCRATCH_REPO/scenarios/w4.21"
+git init -q "$SCRATCH_REPO"
+git -C "$SCRATCH_REPO" add -A
+echo "# scratch task" > "$SCRATCH_REPO/var/tier2-scratch-task.md"
+cat > "$SCRATCH_REPO/cases/scratch.jsonl" <<JSONL
+{"id":"T2-SCRATCH","wave":4,"workflow":"bug-fix-merge-worktree","fixture":"tt-ts","harness":"pi","task":"var/tier2-scratch-task.md","context":{"execution_mode":"scripted","scenario_id":"w4.21-bare-noninteractive-launch","scenario_path":"scenarios/w4.21"},"caps":{"tokens":0,"wall_min":1},"requires":{},"boundary_files":[],"forbidden":[],"oracles":[],"gates":[],"chaos":null,"shed_ok":false,"mandatory":true,"class":"verification"}
+JSONL
+
+if "$SCRATCH_REPO/bin/tt-tier2-assets" "$SCRATCH_REPO/cases/scratch.jsonl" >/dev/null 2>&1; then
+  pass "scratch copy with a tracked scenario passes"
+else
+  fail "scratch copy with a tracked scenario passes"
+  "$SCRATCH_REPO/bin/tt-tier2-assets" "$SCRATCH_REPO/cases/scratch.jsonl" 2>&1 || true
+fi
+
+git -C "$SCRATCH_REPO" rm -r -q --cached scenarios/w4.21
+if ! "$SCRATCH_REPO/bin/tt-tier2-assets" "$SCRATCH_REPO/cases/scratch.jsonl" \
+     >"$SCRATCH_REPO/red.stdout" 2>"$SCRATCH_REPO/red.stderr" \
+   && grep -q "scenarios/w4.21" "$SCRATCH_REPO/red.stderr"; then
+  pass "deleting one tracked scenario in the scratch copy refuses naming the dir"
+else
+  fail "deleting one tracked scenario in the scratch copy refuses naming the dir"
+  cat "$SCRATCH_REPO/red.stderr" 2>/dev/null || true
+fi
+
+git -C "$SCRATCH_REPO" add scenarios/w4.21
+if "$SCRATCH_REPO/bin/tt-tier2-assets" "$SCRATCH_REPO/cases/scratch.jsonl" >/dev/null 2>&1; then
+  pass "restoring the tracked scenario in the scratch copy passes again"
+else
+  fail "restoring the tracked scenario in the scratch copy passes again"
+  "$SCRATCH_REPO/bin/tt-tier2-assets" "$SCRATCH_REPO/cases/scratch.jsonl" 2>&1 || true
 fi
 
 echo ""

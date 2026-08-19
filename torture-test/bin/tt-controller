@@ -695,6 +695,41 @@ function translateChaosTrigger(trigger) {
   return CHAOS_TRIGGER_MARKERS[trigger] ?? null;
 }
 
+// T2.1 US-010: the O11 oracle's synthetic-ledger contract requires every
+// scripted WORKFLOW run to carry a `case.chaos.synthetic_token_ledger`
+// declaration (one row per run: run_id + expected_tokens). A chaos block may
+// therefore be EITHER a typed tt-chaos INJECTION (operator/type/target/
+// trigger) OR a PURE DECLARATION carrying only `synthetic_token_ledger` (no
+// injection — runDeclaredChaos skips it). An injection block may additionally
+// carry the ledger declaration (W4.36: delete-tstx-row + ledger). The declared
+// run_id is a placeholder (empty string) the controller fills with the ACTUAL
+// run id at oracle-snapshot time (fillSyntheticLedgerRunIds) — the launch id
+// is unknowable when the manifest is authored.
+function validateSyntheticTokenLedger(block) {
+  const errors = [];
+  const ledger = block?.synthetic_token_ledger;
+  if (ledger === undefined || ledger === null) return errors;
+  if (!Array.isArray(ledger)) {
+    errors.push('chaos.synthetic_token_ledger must be an array');
+    return errors;
+  }
+  ledger.forEach((row, index) => {
+    const label = `chaos.synthetic_token_ledger[${index}]`;
+    if (!isObject(row)) {
+      errors.push(`${label} must be an object`);
+      return;
+    }
+    if (row.run_id !== null && row.run_id !== undefined
+        && (typeof row.run_id !== 'string' || row.run_id.length === 0)) {
+      errors.push(`${label}.run_id must be null or a nonempty string placeholder`);
+    }
+    if (!Number.isSafeInteger(row.expected_tokens) || row.expected_tokens < 0) {
+      errors.push(`${label}.expected_tokens must be a non-negative safe integer`);
+    }
+  });
+  return errors;
+}
+
 function validateChaosBlock(caseRecord) {
   const errors = [];
   const block = caseRecord.chaos;
@@ -703,6 +738,10 @@ function validateChaosBlock(caseRecord) {
     errors.push(`chaos block must be an object (got ${valueType(block)})`);
     return errors;
   }
+  errors.push(...validateSyntheticTokenLedger(block));
+  // Declaration-only block (O11 synthetic ledger with no injection): nothing
+  // else to validate — runDeclaredChaos skips it.
+  if (typeof block.operator !== 'string') return errors;
   if (block.operator !== 'tt-chaos') {
     errors.push(`chaos block operator must be 'tt-chaos' (got ${JSON.stringify(block.operator ?? null)})`);
   }
@@ -1366,6 +1405,21 @@ function caseUsesScriptedEnvironment(caseRecord) {
     || caseRecord.context.execution_mode === 'scripted';
 }
 
+// US-003 (T2.1): whether a WORKFLOW case needs its fixture work clone
+// provisioned before launch. Real AND scripted workflow cases carry a fixture
+// ('tt-ts', 'tt-poly', hostile-path aliases, ...) and both pass
+// --worktree-origin-repository / --working-directory-for-harness pointing at
+// var/fixtures/work/<case-id>/<fixture> — the path must exist at launch time
+// or the product lstats it to ENOENT. The manifest convention for "no fixture"
+// is the literal 'none' (all local-command cells), and the schema requires the
+// field, so a non-empty, non-'none' string is the provisioning trigger. A
+// workflow case with no fixture (none exist today) is simply never provisioned.
+function caseHasProvisionableFixture(caseRecord) {
+  return typeof caseRecord.fixture === 'string'
+    && caseRecord.fixture !== ''
+    && caseRecord.fixture !== 'none';
+}
+
 function daemonControlAvailable() {
   try {
     const details = fs.lstatSync(DAEMON_CONTROL_PATH);
@@ -1375,6 +1429,64 @@ function daemonControlAvailable() {
   } catch {
     return false;
   }
+}
+
+// US-004 (T2.1): controller-side scripted-behaviors materialization. The
+// tier2-traceability contract (W4.40 row) promises the campaign materializes
+// each arm's behaviors (TAMANDUA_SCRIPTED_BEHAVIORS, keyed <copyId>_<agent>)
+// from the cell before the controller launch; merged main had NO such wiring —
+// tt-controller only forwarded TAMANDUA_SCRIPTED_BEHAVIORS from its own
+// process env (E3.C US-011, loadSpawnEnvironment) and never derived it from
+// the case's scenario cell, so a clean-tree campaign's scripted agents had no
+// canned behaviors to follow. This helper reads the case's cell
+// (context.scenario_path) behaviors.json, rekeys every agent to
+// `<workflowId>_<agent>` (the scripted-runtime lookup contract:
+// behaviorForInvocation tries the FULL prefixed id from the work prompt
+// first, then the short id), writes a per-case behaviors file under
+// var/behaviors/<campaignId>/ (campaign-scoped, contained, removed with the
+// campaign), and returns its path — or null for cases without a scenario cell
+// (AC4: no cell => TAMANDUA_SCRIPTED_BEHAVIORS stays absent).
+//
+// Returns null when the case has no scenario cell. Throws on a malformed /
+// escaping cell (the caller fails the case closed as TEST_INFRA_FAIL).
+function materializeCaseBehaviors(caseRecord, workflowId, campaignDir) {
+  const scenarioPath = caseRecord.context?.scenario_path;
+  if (typeof scenarioPath !== 'string' || scenarioPath === '') return null;
+  const scenarioDir = path.resolve(TT_ROOT, scenarioPath);
+  if (!pathIsWithin(fs.realpathSync(TT_ROOT), fs.realpathSync(scenarioDir))) {
+    throw new Error(`scenario_path escapes torture-test: ${scenarioPath}`);
+  }
+  const scenario = JSON.parse(fs.readFileSync(path.join(scenarioDir, 'scenario.json'), 'utf8'));
+  if (scenario.id !== caseRecord.context.scenario_id) {
+    throw new Error(`scenario id mismatch for ${caseRecord.id}: cell ${scenario.id} != manifest ${caseRecord.context.scenario_id}`);
+  }
+  const template = JSON.parse(fs.readFileSync(path.join(scenarioDir, scenario.behaviors), 'utf8'));
+  if (!template.agents || typeof template.agents !== 'object' || Array.isArray(template.agents)) {
+    throw new Error(`cell behaviors has no agents object: ${scenarioPath}`);
+  }
+  const agents = {};
+  for (const [agentId, entry] of Object.entries(template.agents)) {
+    agents[`${workflowId}_${agentId}`] = entry;
+  }
+  const materialized = { ...template, agents };
+  const behaviorsRoot = path.join(VAR_ROOT, 'behaviors', path.basename(campaignDir));
+  fs.mkdirSync(behaviorsRoot, { recursive: true, mode: 0o700 });
+  const behaviorsPath = path.join(behaviorsRoot, `${caseRecord.id}.json`);
+  fs.writeFileSync(behaviorsPath, `${JSON.stringify(materialized, null, 2)}\n`, { mode: 0o600 });
+  return behaviorsPath;
+}
+
+// US-004 (T2.1): remove the campaign-scoped scripted-behaviors scratch
+// (var/behaviors/<campaignId>) at campaign end — the materialized per-case
+// behaviors files are transient launch wiring, never campaign evidence, so
+// they must not accumulate across campaigns. Contained + force; never touches
+// anything outside var/behaviors.
+function removeCampaignBehaviors(campaignId) {
+  const behaviorsRoot = path.join(VAR_ROOT, 'behaviors', campaignId);
+  if (!pathIsWithin(VAR_ROOT, behaviorsRoot)) {
+    throw new Error('campaign behaviors root escapes torture-test/var');
+  }
+  fs.rmSync(behaviorsRoot, { recursive: true, force: true });
 }
 
 function evidenceRelativePath(campaignDir, absolutePath) {
@@ -1679,9 +1791,10 @@ function runDurableLocalCommand(hook, childEnv, campaignDir, state, attempt) {
 }
 
 // Find the provisioned working-clone path a case actually created, if any. A
-// case has one only if a REAL (non-scripted, non-dry-run-stub) provisioning run
-// succeeded (US-004 records it as attempt.fixture_work_clone). NOT_RUN /
-// pending-real / predicate-excluded cases and provision-FAILED cases never
+// case has one only if a provisioning run succeeded (US-004 records it as
+// attempt.fixture_work_clone) — real AND scripted workflow cases with a fixture
+// both provision (US-003). NOT_RUN / pending-real / predicate-excluded cases,
+// local-command cells (fixture 'none'), and provision-FAILED cases never
 // record one, so teardown never touches a clone they never created.
 function provisionedWorkClonePath(caseState) {
   for (const attempt of caseState.attempts ?? []) {
@@ -1998,14 +2111,52 @@ function validateOracleResponse(response, oracleId, exitCode, evidenceDir) {
   return errors;
 }
 
+// T2.1 US-010: O11's synthetic-ledger contract needs one ledger row per
+// scripted WORKFLOW run carrying the ACTUAL run id — unknowable when the
+// manifest is authored. At oracle-evaluation time the declared placeholder
+// rows (chaos.synthetic_token_ledger) are materialized onto a COPY of the
+// case record: one row per scripted root/discovered run of the case, run_id
+// filled from the run, expected_tokens from the declaration. The copy feeds
+// BOTH the terminal evidence snapshot (round_usage.synthetic_ledger) and the
+// oracle context (context.case.chaos), so O11's byte-for-field manifest-vs-
+// artifact comparison holds. The manifest record itself is never mutated
+// (replays keep the placeholder declaration).
+function fillSyntheticLedgerRunIds(caseRecord, caseState, state) {
+  const declared = caseRecord.chaos?.synthetic_token_ledger;
+  if (!Array.isArray(declared) || declared.length === 0) return caseRecord;
+  const declaredTokens = declared.find((row) =>
+    isObject(row) && Number.isSafeInteger(row.expected_tokens));
+  const expectedTokens = declaredTokens === undefined ? 0 : declaredTokens.expected_tokens;
+  const runIds = [];
+  for (const item of [...caseState.attempts, ...(state.discovered_runs ?? [])]) {
+    const runId = item?.run_id;
+    if (typeof runId !== 'string' || runId.length === 0) continue;
+    runIds.push(runId.startsWith('run-') ? runId : `run-${runId}`);
+  }
+  const ledger = [...new Set(runIds)].sort()
+    .map((runId) => ({ run_id: runId, expected_tokens: expectedTokens }));
+  if (ledger.length === 0) return caseRecord;
+  return {
+    ...caseRecord,
+    chaos: {
+      ...(isObject(caseRecord.chaos) ? caseRecord.chaos : {}),
+      synthetic_token_ledger: ledger,
+    },
+  };
+}
+
 function runCaseOracles(caseRecord, caseState, state, campaignDir, childEnv) {
   // FIX10 US-003 choke-point: oracle executables must run with the contained HOME.
   assertContainedSpawnEnv(childEnv);
+  // T2.1 US-010: materialize the O11 synthetic-ledger declaration onto a COPY
+  // of the case record (actual run ids) so the terminal snapshot AND the
+  // oracle context agree byte-for-field. The manifest record stays immutable.
+  const oracleCaseRecord = fillSyntheticLedgerRunIds(caseRecord, caseState, state);
   caseState.oracle_results ??= [];
   const attempt = caseState.attempts.at(-1);
   const attemptId = attempt?.id ?? 'case-without-attempt';
   if (attempt !== undefined) {
-    completeCaseOracleSnapshot(caseRecord, caseState, attempt, state, campaignDir, childEnv);
+    completeCaseOracleSnapshot(oracleCaseRecord, caseState, attempt, state, campaignDir, childEnv);
   }
   for (const oracleId of caseRecord.oracles) {
     const prior = caseState.oracle_results.find((result) => result.oracle_id === oracleId
@@ -2041,7 +2192,7 @@ function runCaseOracles(caseRecord, caseState, state, campaignDir, childEnv) {
     const contextPath = path.join(evidenceDir, 'context.json');
     const stdoutPath = path.join(evidenceDir, 'stdout.json');
     const stderrPath = path.join(evidenceDir, 'stderr.txt');
-    const input = createOracleContext({ caseRecord, caseState, state, oracleId });
+    const input = createOracleContext({ caseRecord: oracleCaseRecord, caseState, state, oracleId });
     const contextErrors = validateOracleContext(input, campaignDir, {
       requireOracleEvidence: GATING_ORACLE_IDS.includes(oracleId),
     });
@@ -4044,7 +4195,7 @@ function reconcileDiscoveredRuns(caseRecord, caseState, childEnv, state, campaig
 }
 
 function discoveredRunBreach(caseRecord, caseState, run) {
-  if (caseState.spend.tokens_observed >= caseRecord.caps.tokens) {
+  if (tokenCapBreached(caseRecord.caps.tokens, caseState.spend.tokens_observed)) {
     return { cap: 'tokens', threshold: caseRecord.caps.tokens, observed: caseState.spend.tokens_observed };
   }
   if (Date.now() >= new Date(run.deadline_at).valueOf()) {
@@ -4223,6 +4374,18 @@ async function convergeDiscoveredRuns(caseRecord, caseState, childEnv, state, ca
   }
 }
 
+// T2.1 US-010: a token cap is a BUDGET the run must not exceed, and a run that
+// is still at zero observed spend is exactly AT budget — not over it. A zero
+// cap (scripted cases: "this case must spend no tokens") must therefore only
+// breach on an ACTUAL spend (tokens_observed > 0); a positive cap keeps the
+// at-or-above-ceiling semantics. Without this, every 0-token scripted run was
+// stopped at its FIRST cap check (0 >= 0) while still making progress, filing
+// a RUNAWAY finding and canceling the run (the W4.40/W4.41/W4.46 PRODUCT_FAIL
+// cascade: run canceled -> never completed -> O11 synthetic-ledger fail).
+function tokenCapBreached(capsTokens, tokensObserved) {
+  return tokensObserved >= Math.max(1, capsTokens);
+}
+
 // S8a (US-001): cap-breach checks run on their own cadence (cap_check_interval_ms),
 // decoupled from the token poll, so a short wall cap fires near its deadline
 // instead of waiting for the next (potentially 5-minute) token poll. The breach
@@ -4236,7 +4399,7 @@ function capEnforcementLatencySeconds(caseState, attempt, breach, detectedAt) {
   }
   if (breach.cap === 'tokens') {
     const crossing = (caseState.spend.observations ?? [])
-      .find((observation) => observation.tokens_observed >= breach.threshold);
+      .find((observation) => tokenCapBreached(breach.threshold, observation.tokens_observed));
     if (crossing === undefined) return 0;
     return Math.max(0, (detectedAtMs - new Date(crossing.observed_at).valueOf()) / 1000);
   }
@@ -4244,7 +4407,7 @@ function capEnforcementLatencySeconds(caseState, attempt, breach, detectedAt) {
 }
 
 function workflowRunBreach(caseRecord, caseState, attempt) {
-  if (caseState.spend.tokens_observed >= caseRecord.caps.tokens) {
+  if (tokenCapBreached(caseRecord.caps.tokens, caseState.spend.tokens_observed)) {
     return {
       cap: 'tokens', threshold: caseRecord.caps.tokens, observed: caseState.spend.tokens_observed,
     };
@@ -4932,6 +5095,10 @@ async function waitForHarnessTargetRecord(runId, attempt, childEnv, marker) {
 async function runDeclaredChaos(caseRecord, attempt, childEnv, state, campaignDir) {
   const block = caseRecord.chaos;
   if (block === null || block === undefined) return null;
+  // T2.1 US-010: a declaration-only chaos block (O11 synthetic_token_ledger,
+  // no tt-chaos operator) performs no injection — runDeclaredChaos is only
+  // for typed tt-chaos blocks.
+  if (typeof block.operator !== 'string') return null;
   if (attempt.run_id === undefined) return null;
 
   const runId = attempt.run_id;
@@ -6013,23 +6180,28 @@ async function executeWorkflowCase(caseRecord, caseState, state, campaignDir) {
   state.updated_at = launchIntentTimestamp;
   atomicWriteState(campaignDir, state);
 
-  // Fixture work-clone provisioning (US-004): for REAL (non-scripted) cases,
-  // provision the working clone from the golden BEFORE the launch builds
-  // workflowRunArgs, so the path handed to --worktree-origin-repository /
-  // --working-directory-for-harness ALWAYS exists (E2.3's ENOENT lstat root
-  // cause). This runs on EVERY attempt: provisionWorkClone wipes any prior
-  // clone first and clones fresh, so attempt N+1 (retry/rugpull replacement)
-  // is a CLEAN re-provision and never inherits a dirtied tree. A provision
-  // failure persists TEST_INFRA_FAIL with a precise category/reason
-  // (fail-closed); on a healthy host it must never be reached. Breakage is
-  // never a silent half-launch.
+  // Fixture work-clone provisioning (US-004 / US-003): provision the working
+  // clone from the golden BEFORE the launch builds workflowRunArgs, so the path
+  // handed to --worktree-origin-repository / --working-directory-for-harness
+  // ALWAYS exists (E2.3's ENOENT lstat root cause). This runs on EVERY attempt
+  // for every workflow case that carries a fixture — REAL and SCRIPTED alike
+  // (US-003: scripted workflow cases like W4.04c/W4.36/W4.40* also pass the
+  // fixture path to the product, which lstats it at launch; gating provisioning
+  // behind execution_mode === 'real' made a clean-tree scripted campaign die
+  // with ENOENT). provisionWorkClone wipes any prior clone first and clones
+  // fresh, so attempt N+1 (retry/rugpull replacement) is a CLEAN re-provision
+  // and never inherits a dirtied tree. A provision failure persists
+  // TEST_INFRA_FAIL with a precise category/reason (fail-closed); on a healthy
+  // host it must never be reached. Breakage is never a silent half-launch.
+  // Local-command cells (harness 'local', fixture 'none') never reach this
+  // path — executeLocalCase provisions nothing.
   //
   // US-005 (S9 controller): a REPLAY attempt is the one exception — it NEVER
   // provisions its own clone (no wipe/re-clone). It reuses the pair's clone
   // resolved above, so the pair's tree persists unchanged into the replay and
   // the origin_repo identity matches the pair's exactly (TSTX origin-scoped
   // contract). The resolved provenance is recorded as attempt evidence.
-  if (attempt.execution_mode === 'real') {
+  if (caseHasProvisionableFixture(caseRecord)) {
     if (replayContext !== null) {
       attempt.fixture_work_clone = replayContext.clonePath;
       attempt.replay_provenance = {
@@ -6041,36 +6213,36 @@ async function executeWorkflowCase(caseRecord, caseState, state, campaignDir) {
         provision_skipped: true,
       };
     } else {
-    const provision = provisionWorkClone({
-      fixture: caseRecord.fixture,
-      caseId: caseRecord.id,
-      seed: caseRecord.seed ?? null,
-    });
-    if (!provision.ok) {
-      attempt.phase = 'terminal';
-      attempt.terminal_at = utcTimestamp();
-      const reason = provision.reason ?? {};
-      persistMechanicalOutcome(caseState, attempt, state, campaignDir, 'TEST_INFRA_FAIL', {
-        category: reason.category ?? 'fixture-provision-failed',
-        message: reason.message ?? 'fixture work-clone provisioning failed before launch',
-        ...reason,
+      const provision = provisionWorkClone({
+        fixture: caseRecord.fixture,
+        caseId: caseRecord.id,
+        seed: caseRecord.seed ?? null,
       });
-      return;
-    }
-    attempt.fixture_work_clone = provision.workClonePath;
-    attempt.fixture_provision_record = {
-      fixture: provision.fixture,
-      case_id: provision.caseId,
-      work_clone_path: provision.workClonePath,
-      golden_bare: provision.goldenBare,
-      target_kind: provision.target?.kind ?? null,
-      seed: provision.target?.seed ?? null,
-      arming: provision.arming,
-      venv_bootstrapped: provision.venvBootstrapped,
-      operator_notes_planted: provision.operatorNotesPlanted,
-      junk_verified: provision.junkVerified,
-      prepared_at: provision.prepared_at,
-    };
+      if (!provision.ok) {
+        attempt.phase = 'terminal';
+        attempt.terminal_at = utcTimestamp();
+        const reason = provision.reason ?? {};
+        persistMechanicalOutcome(caseState, attempt, state, campaignDir, 'TEST_INFRA_FAIL', {
+          category: reason.category ?? 'fixture-provision-failed',
+          message: reason.message ?? 'fixture work-clone provisioning failed before launch',
+          ...reason,
+        });
+        return;
+      }
+      attempt.fixture_work_clone = provision.workClonePath;
+      attempt.fixture_provision_record = {
+        fixture: provision.fixture,
+        case_id: provision.caseId,
+        work_clone_path: provision.workClonePath,
+        golden_bare: provision.goldenBare,
+        target_kind: provision.target?.kind ?? null,
+        seed: provision.target?.seed ?? null,
+        arming: provision.arming,
+        venv_bootstrapped: provision.venvBootstrapped,
+        operator_notes_planted: provision.operatorNotesPlanted,
+        junk_verified: provision.junkVerified,
+        prepared_at: provision.prepared_at,
+      };
     }
   }
 
@@ -6165,6 +6337,78 @@ async function executeWorkflowCase(caseRecord, caseState, state, campaignDir) {
       message: error.message,
     });
     return;
+  }
+
+  // US-004 (T2.1): controller-side scripted-behaviors materialization. For a
+  // scripted WORKFLOW case with context.scenario_path, derive the runtime
+  // behaviors from the scenario cell BEFORE the launch: write a per-case
+  // behaviors file under var/behaviors/<campaignId>/ (campaign-scoped,
+  // removed with the campaign) and set TAMANDUA_SCRIPTED_BEHAVIORS (+ the
+  // scripted-runtime work-index state dir) in the launch childEnv so the
+  // existing forwarding (E3.C US-011 loadSpawnEnvironment + daemon-control
+  // env_for_kind) carries them to the scripted daemon and workers. The
+  // runtime's behaviorForInvocation looks up the FULL prefixed agent id from
+  // the work prompt (<workflowId>_<agent>) first, so the materialized file is
+  // keyed exactly that way — the "<copyId>_<agent>" contract the traceability
+  // doc promises. Cases without a scenario cell are untouched (AC4).
+  let scriptedBehaviorsPath = null;
+  if (caseUsesScriptedEnvironment(caseRecord)) {
+    try {
+      scriptedBehaviorsPath = materializeCaseBehaviors(caseRecord, caseRecord.workflow, campaignDir);
+    } catch (error) {
+      attempt.phase = 'terminal';
+      attempt.terminal_at = utcTimestamp();
+      persistMechanicalOutcome(caseState, attempt, state, campaignDir, 'TEST_INFRA_FAIL', {
+        category: 'scripted-behaviors-materialization',
+        message: error.message,
+      });
+      return;
+    }
+    if (scriptedBehaviorsPath !== null) {
+      childEnv.TAMANDUA_SCRIPTED_BEHAVIORS = scriptedBehaviorsPath;
+      // The scripted runtime's work-index counting (nextWorkIndex) needs a
+      // writable state dir; give each case its OWN dir under the campaign
+      // behaviors scratch so behavior ARRAYS (e.g. W4.46's provider-error
+      // rounds, one entry per work index) restart at index 0 per case and are
+      // never shared across cases.
+      const scriptedStateDir = path.join(path.dirname(scriptedBehaviorsPath), `${caseRecord.id}.state`);
+      fs.mkdirSync(scriptedStateDir, { recursive: true, mode: 0o700 });
+      childEnv.TAMANDUA_SCRIPTED_STATE = scriptedStateDir;
+      attempt.scripted_behaviors = {
+        path: evidenceRelativePath(campaignDir, scriptedBehaviorsPath),
+        state_dir: evidenceRelativePath(campaignDir, scriptedStateDir),
+        var_path: toPortableRelativePath(scriptedBehaviorsPath),
+        var_state_dir: toPortableRelativePath(scriptedStateDir),
+        workflow_id: caseRecord.workflow,
+        scenario_path: caseRecord.context.scenario_path,
+        // The materialized file is removed with the campaign; record its
+        // sha256 so a verifier can assert the EXACT content that was derived
+        // from the cell (rekeyed <workflowId>_<agent>) after the file is gone.
+        sha256: sha256(fs.readFileSync(scriptedBehaviorsPath)),
+      };
+      // US-004: the scripted daemon's env is fixed at daemon start, so the
+      // materialized per-case behaviors only reach the daemon's spawned
+      // workers when the daemon is RESTARTED with the new env. daemon-control's
+      // env_for_kind forwards TAMANDUA_SCRIPTED_BEHAVIORS / TAMANDUA_SCRIPTED_STATE
+      // from the CALLER env (childEnv) into the daemon env at start/restart —
+      // the same "existing forwarding" run-scripted-scenario relies on per
+      // scenario. Fail closed: a restart failure is TEST_INFRA_FAIL with the
+      // distinct category, never a silent fallback to stale behaviors.
+      const daemonRestart = executeDaemonRestart('scripted', childEnv);
+      attempt.scripted_behaviors.daemon_restart = daemonRestart.record;
+      state.updated_at = utcTimestamp();
+      atomicWriteState(campaignDir, state);
+      if (!daemonRestart.ok) {
+        attempt.phase = 'terminal';
+        attempt.terminal_at = utcTimestamp();
+        persistMechanicalOutcome(caseState, attempt, state, campaignDir, 'TEST_INFRA_FAIL', {
+          category: 'scripted-behaviors-daemon-restart',
+          message: `could not restart the scripted daemon with the materialized behaviors: exit ${daemonRestart.record.exit_code}${daemonRestart.record.error !== null ? `: ${daemonRestart.record.error}` : ''}`,
+          argv: daemonRestart.record.argv,
+        });
+        return;
+      }
+    }
   }
 
   // US-008 (S11 controller): local-sentinel catalog install leg. Re-runs the
@@ -7168,6 +7412,152 @@ function realPreflightRequired(manifest, state) {
   return manifest.cases.some((caseRecord) => !caseUsesScriptedEnvironment(caseRecord));
 }
 
+// T2.1 US-010: a SCRIPTED-ONLY campaign on a FRESH contained home must still
+// have the bundled workflow catalog installed in the SCRIPTED home — the
+// scripted WORKFLOW cases (W4.04c/W4.36/W4.38/W4.39-a/W4.40×4/W4.41×2/W4.46)
+// launch `workflow run bug-fix-merge-worktree` against that home, and with no
+// prior real-case preflight the workflow spec is absent
+// (`workflow-spec-missing`). Local-command cells self-install their sentinel
+// catalog at launch; the workflow cases cannot. Engaged whenever the
+// selection is scripted-only and the manifest carries a scripted WORKFLOW
+// (non-local) case, unless the preflight escape hatch is set.
+function scriptedCatalogInstallRequired(manifest, state) {
+  if (process.env[PREFLIGHT_DISABLED_ENV] === '1') return false;
+  if (dryRunRealLaunchOutPath() !== null) return false;
+  if ((state.options.execution_selection ?? 'all') !== 'scripted-only') return false;
+  return manifest.cases.some((caseRecord) =>
+    caseUsesScriptedEnvironment(caseRecord) && caseRecord.workflow !== 'local');
+}
+
+// Runs the home-provision + catalog-install legs under the CONTAINED SCRIPTED
+// spawn env (never the real home, never the 33xx daemon). Fail closed with
+// the same DISTINCT reasons as the real preflight. NOTE: bin/tt-catalog-install
+// always targets the REAL contained home (env/tt-env.sh's TT_HOME), so the
+// scripted leg runs the product's own `workflow install --all` directly under
+// the SCRIPTED env (HOME/TAMANDUA_STATE_DIR already point at
+// var/home-scripted) with TAMANDUA_WORKFLOWS_SRC pinned to the bundled
+// catalog — the same seam tt-catalog-install uses, targeting the scripted
+// home the scripted WORKFLOW cases launch against.
+function runScriptedCatalogInstall(campaignDir, state, manifest) {
+  let env;
+  try {
+    env = loadSpawnEnvironment(true);
+  } catch (error) {
+    persistPreflightState(campaignDir, state, {
+      engaged: true,
+      ok: false,
+      leg: 'spawn-environment',
+      reason: 'spawn-environment',
+      message: error.message,
+      stopped_at: null,
+    });
+    throw new Error(`scripted catalog preflight FAILED at spawn-environment: ${error.message}`);
+  }
+  const outcomes = [];
+  const runLeg = (label, script, args, reason, extraEnv = {}) => {
+    const result = spawnPreflightLeg(script, args, { ...env, ...extraEnv });
+    outcomes.push({
+      leg: label,
+      ok: result.ok,
+      exit_code: result.exit_code ?? null,
+      ...(result.stderr ? { stderr_tail: result.stderr.trim().slice(-500) } : {}),
+    });
+    if (!result.ok) {
+      const detected = readPreflightReason(result.stderr) ?? reason;
+      persistPreflightState(campaignDir, state, {
+        engaged: true,
+        ok: false,
+        leg: label,
+        reason: detected,
+        message: result.error ?? `scripted catalog preflight ${label} leg exited ${result.exit_code ?? 'non-zero'}`,
+        legs: outcomes,
+        stopped_at: null,
+      });
+      throw new Error(`scripted catalog preflight FAILED at ${label}: ${detected}`);
+    }
+  };
+  runLeg('home-provision', PREFLIGHT_PROVISION_PATH, ['--fail-closed'], 'tt-home-unprovisioned');
+  // T2.1 US-010: the product's `workflow install` reads `~/.pi/agent/
+  // settings.json` (readPiConfig) for every workflow — tt-provision-home
+  // deliberately surfaces NO pi files into the SCRIPTED home, so a fresh
+  // scripted home has none and every `workflow install` fails. Surface the
+  // operator's pi config files (settings.json + models.json — the same
+  // enumeration the real home's surface_pi_files uses) into the scripted
+  // home; a minimal settings.json is written when the operator has none, so
+  // the install is never blocked by a missing config.
+  const scriptedHome = env.HOME;
+  // T2.1 US-010: the scripted home needs a git identity for the scripted
+  // agents' commits (the fixer's `git commit` fails "Author identity unknown"
+  // without it — tt-provision-home --fail-closed only provisions the REAL
+  // home's gitconfig). Write the same identity the full provisioning writes.
+  fs.mkdirSync(scriptedHome, { recursive: true, mode: 0o700 });
+  const scriptedGitconfig = path.join(scriptedHome, '.gitconfig');
+  if (!fs.existsSync(scriptedGitconfig)) {
+    fs.writeFileSync(scriptedGitconfig,
+      '[user]\n    name = Tamandua Torture Test\n    email = tt@tamandua.test\n'
+      + '[commit]\n    gpgsign = false\n[init]\n    defaultBranch = main\n[pull]\n    ff = only\n',
+      { mode: 0o600 });
+  }
+  const piAgentDir = path.join(scriptedHome, '.pi', 'agent');
+  fs.mkdirSync(piAgentDir, { recursive: true, mode: 0o700 });
+  const operatorHome = process.env.HOME;
+  for (const file of ['settings.json', 'models.json']) {
+    const source = path.join(operatorHome, '.pi', 'agent', file);
+    const destination = path.join(piAgentDir, file);
+    try {
+      const details = fs.lstatSync(source);
+      if (details.isFile() && !details.isSymbolicLink()) {
+        fs.copyFileSync(source, destination);
+      }
+    } catch {
+      // absent operator file — handled below for settings.json
+    }
+  }
+  if (!fs.existsSync(path.join(piAgentDir, 'settings.json'))) {
+    fs.writeFileSync(path.join(piAgentDir, 'settings.json'),
+      `${JSON.stringify({ defaultProvider: 'scripted', defaultModel: 'scripted' }, null, 2)}\n`,
+      { mode: 0o600 });
+  }
+  const bundledWorkflows = path.resolve(TT_ROOT, '..', 'workflows');
+  const tamanduaCli = path.resolve(TT_ROOT, '..', 'dist', 'cli', 'cli.js');
+  // FIX10 US-003 choke-point: this direct spawn (the catalog-install leg)
+  // re-asserts containment at its own spawn, mirroring spawnPreflightLeg —
+  // loadSpawnEnvironment already asserted the merged HOME, but the static
+  // containment scan requires EVERY spawn site to call the choke-point so a
+  // future env-source change cannot bypass it.
+  assertContainedSpawnEnv(env);
+  const installResult = spawnSync(process.execPath, [tamanduaCli, 'workflow', 'install', '--all'], {
+    cwd: fs.realpathSync(TT_ROOT),
+    env: { ...env, TAMANDUA_WORKFLOWS_SRC: bundledWorkflows },
+    encoding: 'utf8',
+    maxBuffer: 16 * 1024 * 1024,
+    timeout: 5 * 60_000,
+    shell: false,
+  });
+  const ok = installResult.error === undefined && installResult.status === 0;
+  outcomes.push({
+    leg: 'catalog-install',
+    ok,
+    exit_code: installResult.status ?? null,
+    ...(installResult.stderr ? { stderr_tail: String(installResult.stderr).trim().slice(-500) } : {}),
+  });
+  if (!ok) {
+    const detected = readPreflightReason(String(installResult.stderr ?? '')) ?? 'catalog-missing';
+    persistPreflightState(campaignDir, state, {
+      engaged: true,
+      ok: false,
+      leg: 'catalog-install',
+      reason: detected,
+      message: installResult.error?.message ?? `scripted catalog preflight catalog-install leg exited ${installResult.status ?? 'non-zero'}`,
+      legs: outcomes,
+      stopped_at: null,
+    });
+    throw new Error(`scripted catalog preflight FAILED at catalog-install: ${detected}`);
+  }
+  persistPreflightState(campaignDir, state, { engaged: true, ok: true, legs: outcomes, started_at: utcTimestamp(), stopped_at: null });
+  for (const o of outcomes) console.log(`Scripted catalog preflight ${o.leg}: ${o.ok ? 'OK' : 'FAILED'}`);
+}
+
 // Extract the DISTINCT machine-parseable reason from a helper's stderr.
 function readPreflightReason(stderr) {
   const line = (stderr || '').split(/\r?\n/).find((l) => /^REASON:\s*/.test(l));
@@ -7302,6 +7692,63 @@ function stopRealDaemon(campaignDir, state) {
   if (!result.ok) console.error(`Real-case daemon stop hygiene FAILED: ${result.error ?? ''}`);
 }
 
+// T2.1 US-010 round 2: stop the SCRIPTED daemon at campaign teardown.
+// A scripted-only campaign's LAST scripted WORKFLOW case leaves its
+// behaviors-restarted daemon running (each case's daemon_restart is a
+// stop+start; nothing stops it after the final case). The next campaign —
+// especially a FRESH-var one, which has NO provenance record for the
+// leftover — then finds the shared scripted ports (5334/5338/5339) busy and
+// its first workflow case's daemon restart times out (the re-proof's
+// campaign-20260817T203634303Z W4.04c TEST_INFRA_FAIL: the fresh var's
+// restart had no provenance to stop the campaign-20260817T194114899Z
+// leftover, waited the full TT_DAEMON_PORT_WAIT_SECONDS bound, refused).
+// The stop is IDEMPOTENT (no daemon -> no-op) and only ever signals THIS
+// worktree's own processes: daemon-control's stop is provenance-scoped to
+// the per-worktree scope name and its escalation verifies TT ownership, so
+// a concurrent worktree's daemon is never touched.
+function stopScriptedDaemon(campaignDir, state) {
+  let env;
+  try {
+    env = loadSpawnEnvironment(true);
+  } catch {
+    return;
+  }
+  // FIX10 US-003 choke-point: every spawn site must pass through
+  // assertContainedSpawnEnv. loadSpawnEnvironment already asserts the merged
+  // HOME, but the stop re-asserts at its own spawn so a future env-source
+  // change cannot bypass containment (pinned by
+  // tier0-controller-home-containment.test.ts's spawn-site scan).
+  assertContainedSpawnEnv(env);
+  const result = spawnSync(DAEMON_CONTROL_PATH, ['scripted', 'stop'], {
+    cwd: TT_ROOT,
+    env,
+    encoding: 'utf8',
+    maxBuffer: 1024 * 1024,
+    timeout: 90_000,
+    shell: false,
+  });
+  if (state) {
+    state.scripted_daemon_teardown = {
+      engaged: true,
+      ok: result.error === undefined && result.status === 0,
+      at: utcTimestamp(),
+      ...(result.error !== undefined ? { message: result.error.message } : {}),
+    };
+    state.updated_at = utcTimestamp();
+    atomicWriteState(campaignDir, state);
+  }
+  if (result.error !== undefined || result.status !== 0) {
+    console.error(`Scripted daemon stop hygiene FAILED: ${result.error?.message ?? `exit ${result.status}`}`);
+  }
+}
+
+// A scripted-only campaign hands the shared scripted ports back clean at
+// teardown (stopScriptedDaemon) — shared by the fresh-campaign and resume
+// finally blocks.
+function scriptedTeardownStopRequired(state) {
+  return (state.options.execution_selection ?? 'all') === 'scripted-only';
+}
+
 async function startCampaign(options, schema) {
   const manifestPath = resolveManifestPath(options.manifest);
   const manifest = applyCaseFilter(loadManifest(manifestPath, schema), options.caseId);
@@ -7312,9 +7759,15 @@ async function startCampaign(options, schema) {
   const { campaignId, campaignDir } = createCampaignDirectory();
   const releaseCampaignLock = acquireCampaignLock(campaignDir);
   let teardownState = null;
+  // Captured OUTSIDE the try so the finally can read it: a `const state`
+  // declared inside the try block is block-scoped to that block and a
+  // finally referencing it throws ReferenceError (the scripted-daemon
+  // teardown crashed with "state is not defined" on the first fixed run).
+  let campaignState = null;
   try {
     try {
       const state = createInitialState(campaignId, manifestPath, manifest, options);
+      campaignState = state;
       applyExecutionSelection(manifest, state);
       applyHostRequirements(manifest, state, hostProfile);
       atomicWriteState(campaignDir, state);
@@ -7338,6 +7791,11 @@ async function startCampaign(options, schema) {
     if (realPreflightRequired(manifest, state)) {
       teardownState = state;
       runRealPreflight(campaignDir, state, manifest);
+    } else if (scriptedCatalogInstallRequired(manifest, state)) {
+      // T2.1 US-010: scripted-only campaigns need the bundled catalog in the
+      // SCRIPTED home (the scripted WORKFLOW cases launch against it); a
+      // fresh contained home has none until this installs it.
+      runScriptedCatalogInstall(campaignDir, state, manifest);
     }
     await executeEligibleCases(manifest, state, campaignDir);
     const exitCode = writeTerminalCampaignReports(campaignDir, state);
@@ -7346,6 +7804,35 @@ async function startCampaign(options, schema) {
     return exitCode;
   } finally {
     if (teardownState !== null) stopRealDaemon(campaignDir, teardownState);
+    // T2.1 US-010 round 2: a scripted-only campaign leaves its LAST scripted
+    // WORKFLOW case's daemon running (see stopScriptedDaemon); stop it so the
+    // next campaign — especially a fresh-var one with no provenance for the
+    // leftover — starts from a clean port state (the re-proof's W4.04c
+    // TEST_INFRA_FAIL was exactly this leftover blocking the next campaign's
+    // first restart).
+    if (campaignState !== null && scriptedTeardownStopRequired(campaignState)) {
+      // T2.1 US-010: stopScriptedDaemon APPENDS the teardown record to the
+      // state object it is handed and persists it. campaignState is the
+      // INITIAL snapshot captured before case execution, so persisting it
+      // would CLOBBER the terminal state.json (outcomes, oracle results,
+      // hygiene canary) that writeTerminalCampaignReports just wrote — the
+      // hygiene-canary and probe-sequence self-test failures (state read
+      // post-campaign showed the pre-execution snapshot). Reload the
+      // CURRENT state from disk and hand THAT to the teardown so the
+      // teardown record lands on the terminal state.
+      let teardownTarget = campaignState;
+      try {
+        teardownTarget = loadCampaignState(campaignId).state;
+      } catch {
+        // state.json unreadable — fall back to the in-memory snapshot.
+      }
+      stopScriptedDaemon(campaignDir, teardownTarget);
+    }
+    // US-004 (T2.1): the per-case scripted-behaviors scratch
+    // (var/behaviors/<campaignId>) is transient launch wiring — remove it with
+    // the campaign so materialized behaviors never accumulate across
+    // campaigns.
+    removeCampaignBehaviors(campaignId);
     releaseCampaignLock();
   }
 }
@@ -7354,8 +7841,14 @@ async function resumeCampaign(options, schema) {
   const campaignDir = resolveCampaignDirectory(options.resume);
   const releaseCampaignLock = acquireCampaignLock(campaignDir);
   let teardownState = null;
+  // Captured outside the try for the finally (same pattern as startCampaign's
+  // campaignState — a try-block const is out of scope in the finally).
+  let campaignState = null;
   try {
     const { state } = loadCampaignState(options.resume);
+    // Captured outside the try for the finally (see startCampaign's
+    // campaignState — a try-block const is out of scope in the finally).
+    campaignState = state;
     const persistedManifestPath = resolveManifestPath(path.join(TT_ROOT, state.manifest.path));
     const manifestPath = options.manifest === null
       ? persistedManifestPath
@@ -7400,6 +7893,9 @@ async function resumeCampaign(options, schema) {
     if (realPreflightRequired(manifest, state)) {
       teardownState = state;
       runRealPreflight(campaignDir, state, manifest);
+    } else if (scriptedCatalogInstallRequired(manifest, state)) {
+      // T2.1 US-010: same for scripted-only resumes (fresh scripted home).
+      runScriptedCatalogInstall(campaignDir, state, manifest);
     }
     await executeEligibleCases(manifest, state, campaignDir);
     const exitCode = writeTerminalCampaignReports(campaignDir, state);
@@ -7409,6 +7905,27 @@ async function resumeCampaign(options, schema) {
     return exitCode;
   } finally {
     if (teardownState !== null) stopRealDaemon(campaignDir, teardownState);
+    // T2.1 US-010 round 2: same scripted-daemon teardown hygiene as a fresh
+    // campaign (see stopScriptedDaemon) — a resumed scripted-only campaign
+    // must also hand the shared ports back clean. Use the function-scoped
+    // campaignState (a try-block const `state` is out of scope in the
+    // finally — the round-2 verifier caught "state is not defined" crashing
+    // EVERY resume, clobbering the intended error for rejected resumes) and
+    // reload the CURRENT state from disk so the teardown record lands on the
+    // TERMINAL state.json, not on the pre-execution snapshot (same
+    // reload-from-disk pattern as startCampaign's teardown).
+    if (campaignState !== null && scriptedTeardownStopRequired(campaignState)) {
+      let teardownTarget = campaignState;
+      try {
+        teardownTarget = loadCampaignState(options.resume).state;
+      } catch {
+        // state.json unreadable — fall back to the in-memory snapshot.
+      }
+      stopScriptedDaemon(campaignDir, teardownTarget);
+    }
+    // US-004 (T2.1): same campaign-scoped behaviors scratch cleanup as a fresh
+    // campaign — a resumed campaign re-materializes per case on demand.
+    removeCampaignBehaviors(path.basename(campaignDir));
     releaseCampaignLock();
   }
 }

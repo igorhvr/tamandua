@@ -172,7 +172,16 @@ describe("Tier-2 US-008 — section-D roster (contract & behavioral traps)", () 
     assert.equal(b.context?.execution_mode, "real", "W4.39-b runs real");
     assert.ok(b.caps.tokens > 0, "W4.39-b is a token-bearing real case");
     assert.ok(a.oracles.includes("O9") && b.oracles.includes("O9"), "both union arms must declare the ledger oracle O9");
-    assert.ok(a.oracles.includes("O10") && b.oracles.includes("O10"), "both union arms must declare the FMIS oracle O10");
+    // T2.1 US-010 premise correction: O10's suite_ledger byte-for-field check
+    // (against the read-only DB snapshot) is unsatisfiable for SCRIPTED runs
+    // under the shared-ledger campaign design — the shared scripted home
+    // accumulates suite rows from every prior cell/campaign, so the case-scoped
+    // artifact can never reconcile byte-for-field with the full snapshot. The
+    // dishonest REAL arm (W4.39-b) keeps O10; the honest scripted arm drops it
+    // (documented in tier2-traceability.md "T2.1 US-010 — oracle-list premise
+    // corrections").
+    assert.ok(b.oracles.includes("O10"), "the dishonest REAL union arm must declare the FMIS oracle O10");
+    assert.ok(!a.oracles.includes("O10"), "the honest SCRIPTED union arm drops O10 (US-010 premise correction)");
     const taskA = taskText(a);
     const taskB = taskText(b);
     assert.match(taskA, /reports? the red honestly|honest/, "W4.39-a task must pin the honest-red mechanical corridor");

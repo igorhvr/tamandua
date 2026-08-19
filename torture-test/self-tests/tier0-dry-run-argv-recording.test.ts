@@ -109,12 +109,59 @@ function ensureFixtureRepo(caseId: string, fixture: string): void {
   assert.equal(commit.status, 0, `git commit failed for ${repo}: ${commit.stderr}`);
 }
 
+// provisionContainedRealHome — ensure the CONTAINED real home (var/home, the
+// env/tt-env.sh HOME for real-launch cases) is provisioned before the
+// controller runs a real-launch arm. The real-launch path runs the oracle
+// evidence snapshot against that home, and the snapshot requires the state
+// dir ($HOME/.tamandua) AND a readable tamandua.db (validateInput:
+// assertContainedDirectory + assertContainedFile). On a FRESH tree
+// (gitignored var/ wiped) the home is absent — it is normally provisioned by
+// the real-case preflight's home-provision + daemon-up legs, which these
+// unit-style arms disable (TT_CONTROLLER_PREFLIGHT_DISABLED=1).
+// tt-provision-home --fail-closed provisions the CONTAINED home's config
+// (.pi/.hermes/.gitconfig — never the operator's ~/.tamandua); the state dir
+// and a MINIMAL empty-schema DB are then created here (the same minimal
+// runs/steps schema tt-controller.test.sh seeds for its real-launch arms) so
+// the snapshot resolves. The assertion under test (the stub `tamandua` is
+// still spawned for both cases) is unchanged; the seeded DB is a schema-only
+// fixture, never a weakened assertion.
+function provisionContainedRealHome(): void {
+  const result = spawnSync(path.join(ttRoot, "bin", "tt-provision-home"), ["--fail-closed"], {
+    cwd: ttRoot,
+    encoding: "utf8",
+    timeout: 60_000,
+  });
+  assert.equal(result.status, 0,
+    `contained real-home provisioning failed for the real-launch arm: ${result.stderr ?? result.stdout}`);
+  const stateDir = path.join(ttRoot, "var", "home", ".tamandua");
+  fs.mkdirSync(stateDir, { recursive: true });
+  const databasePath = path.join(stateDir, "tamandua.db");
+  if (!fs.existsSync(databasePath)) {
+    const seeded = spawnSync(process.execPath, ["--input-type=module", "-e", `
+      import { DatabaseSync } from "node:sqlite";
+      const database = new DatabaseSync(process.argv[1]);
+      database.exec("CREATE TABLE runs (id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, task TEXT NOT NULL, status TEXT NOT NULL, context TEXT NOT NULL DEFAULT '{}', tokens_spent INTEGER NOT NULL DEFAULT 0, scheduling_status TEXT, scheduling_requested_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL); CREATE TABLE steps (id TEXT PRIMARY KEY, run_id TEXT NOT NULL, step_id TEXT NOT NULL, agent_id TEXT NOT NULL, step_index INTEGER NOT NULL, status TEXT NOT NULL, type TEXT NOT NULL DEFAULT 'single', current_story_id TEXT, retry_count INTEGER NOT NULL DEFAULT 0, abandoned_count INTEGER NOT NULL DEFAULT 0, reroute_count INTEGER NOT NULL DEFAULT 0, claim_pid INTEGER, claim_updated_at TEXT, updated_at TEXT NOT NULL);");
+      database.close();
+    `, databasePath], {
+      cwd: ttRoot,
+      encoding: "utf8",
+      timeout: 30_000,
+    });
+    assert.equal(seeded.status, 0,
+      `minimal real-home DB seeding failed for the real-launch arm: ${seeded.stderr ?? seeded.stdout}`);
+  }
+}
+
 describe("Zero-token dry-run/argv-recording hook for the real-launch path (US-006)", () => {
   it("with TT_DRY_RUN_REAL_LAUNCH set, records full launch argv and completes PASS with zero tokens", () => {
     const manifestPath = buildRealManifest();
     const rel = path.relative(ttRoot, manifestPath);
     const outPath = path.join(varRoot, `us006-argv-${Date.now()}-${process.pid}.jsonl`);
     fs.rmSync(outPath, { force: true });
+
+    // The dry-run arm still runs the real-launch token-ledger baseline under
+    // the contained real home; provision it (fresh-tree safe, idempotent).
+    provisionContainedRealHome();
 
     let res!: RunResult;
     let campaignId: string | null = null;
@@ -206,6 +253,16 @@ describe("Zero-token dry-run/argv-recording hook for the real-launch path (US-00
     // The non-dry-run path reads the fixture git repos; seed minimal repos.
     ensureFixtureRepo("W1.L1-python", "tt-python");
     ensureFixtureRepo("W3.03-bfmw-hermes-ts", "tt-ts");
+
+    // The real-launch path's token-ledger baseline runs the PRODUCT's
+    // `tamandua workflow runs --json` under the contained REAL home
+    // (env/tt-env.sh -> HOME=var/home); on a fresh tree the home is absent
+    // (the real-case preflight's home-provision leg is disabled by
+    // TT_CONTROLLER_PREFLIGHT_DISABLED=1 below). Provision the CONTAINED
+    // real home so the ledger query resolves, exactly as a provisioned home
+    // would have it. The assertion under test (the stub `tamandua` is still
+    // spawned for both cases) is unchanged.
+    provisionContainedRealHome();
 
     const dryOut = path.join(varRoot, `us006-control-${Date.now()}-${process.pid}.jsonl`);
     fs.rmSync(dryOut, { force: true });

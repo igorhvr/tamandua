@@ -125,8 +125,17 @@ assert.ok(liveMatch, `live run did not publish a run id:\n${liveText}`);
 const liveRunId = liveMatch[1];
 
 // Wait for the live run's step to be claimed (mid-flight).
+// T2.1 US-010 re-proof round 3: the wait budget is 45s (450 x 100ms), not
+// 20s. The product's deterministic dispatch tick is 15s (dispatchIntervalMs),
+// so a run registered just after a tick can take up to ~15s to get its first
+// round dispatched; under the full campaign's sequential load the claim can
+// land even later (the re-proof's campaign-20260817T232952964Z W4.43 flake:
+// the live run's step was claimed 15s after dispatch — inside a 20s window
+// only by luck). The ASSERTION is unchanged (the step MUST be claimed
+// mid-flight); only the observation budget grows so a loaded daemon is not
+// mistaken for a missing claim.
 let liveClaimedAt = null;
-for (let i = 0; i < 200; i++) {
+for (let i = 0; i < 450; i++) {
   const row = dbRead("SELECT status FROM steps WHERE run_id = ? LIMIT 1", [liveRunId]);
   if (row.length > 0 && row[0].status === "running") {
     liveClaimedAt = Date.now();

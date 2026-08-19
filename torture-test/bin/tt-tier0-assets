@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { validateScenario } from "../scenarios/lib/validate-scenario.mjs";
+import { trackedTreeIssue } from "../scenarios/lib/tracked-tree.mjs";
 
 const binDir = path.dirname(fileURLToPath(import.meta.url));
 const ttRoot = path.resolve(binDir, "..");
@@ -47,6 +48,14 @@ function resolveScenario(relative, caseId) {
   const realCandidate = fs.realpathSync(candidate);
   if (!realCandidate.startsWith(`${realRoot}${path.sep}`)) {
     fail(`${caseId} scenario_path resolves outside scenarios/: ${relative}`);
+  }
+  // US-002: the scenario dir must also exist in the TRACKED TREE (git
+  // ls-files) — filesystem existence alone never satisfies the check, so an
+  // untracked-asset GREEN (assets present only under gitignored var/ or as
+  // untracked files in the authoring worktree) is impossible.
+  const issue = trackedTreeIssue(candidate, ttRoot);
+  if (issue !== null) {
+    fail(`${caseId} scenario dir ${relative} is not in the tracked tree: ${issue}`);
   }
   return candidate;
 }

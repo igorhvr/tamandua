@@ -59,6 +59,7 @@ const HEAVY_CAMPAIGN_TESTS = [
   "tier1-kill-sentinel-survival.test.ts",
   "tier1-zero-real-launch-infra.test.ts",
   "tier2-repeatability.test.ts",
+  "tier2-scripted-behaviors-materialization.test.ts",
 ];
 const heavyCampaignScriptPath = path.join(
   repoRoot,

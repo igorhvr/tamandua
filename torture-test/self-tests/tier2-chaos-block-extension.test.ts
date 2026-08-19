@@ -136,7 +136,25 @@ describe("Tier-2 chaos block extension (US-003): kill-harness / kill-daemon / de
     // US-003: hold_seconds is no longer universally required (it is
     // sigstop_sigcont-only); the per-type target/param constraints live in
     // the controller's semantic validator, which stays fail-closed.
-    assert.deepEqual(block.required, ["type", "target", "trigger", "operator"], "chaosBlock must require type/target/trigger/operator");
+    // T2.1 US-010: the block's requirement set is SPLIT into an allOf/anyOf
+    // pair so the TYPED injection arm (type/target/trigger/operator) and the
+    // O11 DECLARATION-ONLY arm (synthetic_token_ledger — the run id is
+    // unknowable at authoring time; the controller materializes it at oracle
+    // time) are mutually exclusive but at least one is always required. The
+    // top-level `required` is therefore empty; the per-arm requirements live
+    // in allOf.
+    assert.deepEqual(block.required, [], "chaosBlock top-level required must be empty (per-arm requirements in allOf)");
+    const arms = block.allOf?.[0]?.anyOf;
+    assert.ok(Array.isArray(arms) && arms.length === 2,
+      "chaosBlock must carry exactly two requirement arms (typed injection + O11 declaration-only)");
+    const typedArm = arms.find((arm: any) => arm.required?.includes("type"));
+    const ledgerArm = arms.find((arm: any) => arm.required?.includes("synthetic_token_ledger"));
+    assert.ok(typedArm, "chaosBlock must require type/target/trigger/operator on the typed injection arm");
+    assert.deepEqual(typedArm.required, ["type", "target", "trigger", "operator"],
+      "typed chaos arm must require type/target/trigger/operator");
+    assert.ok(ledgerArm, "chaosBlock must require synthetic_token_ledger on the O11 declaration-only arm");
+    assert.deepEqual(ledgerArm.required, ["synthetic_token_ledger"],
+      "O11 declaration-only arm must require exactly synthetic_token_ledger");
     assert.deepEqual(
       block.properties.type.enum,
       ["sigstop_sigcont", "kill-harness", "kill-daemon", "delete-tstx-row"],

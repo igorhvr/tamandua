@@ -7,11 +7,9 @@
   "expected_outcome": "completed",
   "oracles": [
     "O1",
-    "O2",
     "O3z",
     "O8",
     "O9",
-    "O10",
     "O11"
   ]
 }

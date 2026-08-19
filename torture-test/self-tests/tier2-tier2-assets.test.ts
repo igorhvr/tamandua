@@ -192,6 +192,92 @@ describe("Tier-2 assets + --tier2 ladder rung (US-015)", () => {
     }
   });
 
+  it("AC2: a scenario dir on disk but absent from git ls-files fails closed naming the dir", () => {
+    // US-002 red arm: an untracked scenario dir (present on disk, no tracked
+    // file under it) must make the availability gate refuse AND name the
+    // dir — filesystem existence alone must never satisfy the check.
+    const untrackedName = `tt-tier2-untracked-${process.pid}-${scratchCounter}`;
+    const untrackedDir = path.join(ttRoot, "scenarios", untrackedName);
+    fs.mkdirSync(untrackedDir, { recursive: true });
+    fs.writeFileSync(path.join(untrackedDir, "marker.txt"), "untracked marker\n");
+    const manifest = scratchManifest([
+      row({
+        id: "T2-UNTRACKED",
+        context: { execution_mode: "scripted", scenario_id: "zz-untracked", scenario_path: `scenarios/${untrackedName}` },
+      }),
+    ]);
+    try {
+      const res = run(assetsValidator, [manifest]);
+      assert.notEqual(res.status, 0, "an on-disk-but-untracked scenario dir must fail closed");
+      assert.match(res.stderr, new RegExp(untrackedName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+        "the failure must name the missing tracked scenario dir");
+      assert.match(res.stderr, /tracked tree/, "the failure must cite the tracked-tree contract");
+    } finally {
+      cleanupScratch(manifest);
+      fs.rmSync(untrackedDir, { recursive: true, force: true });
+    }
+  });
+
+  it("AC4: delete-one-tracked-scenario in a scratch copy refuses; restored arm passes", () => {
+    // US-002 red-then-green: a scratch copy of the tree (own git checkout)
+    // with ONE tracked scenario dropped from the index must make the gate
+    // refuse naming the dir; restoring it must pass again.
+    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), `tt-tier2-tracked-${process.pid}-`));
+    try {
+      const sBin = path.join(scratch, "bin");
+      const sCases = path.join(scratch, "cases");
+      const sVar = path.join(scratch, "var");
+      const sLib = path.join(scratch, "scenarios", "lib");
+      fs.mkdirSync(sBin, { recursive: true });
+      fs.mkdirSync(sCases, { recursive: true });
+      fs.mkdirSync(sVar, { recursive: true });
+      fs.mkdirSync(sLib, { recursive: true });
+      fs.copyFileSync(assetsValidator, path.join(sBin, "tt-tier2-assets"));
+      fs.copyFileSync(
+        path.join(ttRoot, "scenarios", "lib", "tracked-tree.mjs"),
+        path.join(sLib, "tracked-tree.mjs"),
+      );
+      fs.cpSync(path.join(ttRoot, "scenarios", "w4.21"), path.join(scratch, "scenarios", "w4.21"), { recursive: true });
+      const init = spawnSync("git", ["init", "-q", scratch], { encoding: "utf8" });
+      assert.equal(init.status, 0, init.stderr);
+      const addAll = spawnSync("git", ["-C", scratch, "add", "-A"], { encoding: "utf8" });
+      assert.equal(addAll.status, 0, addAll.stderr);
+      fs.writeFileSync(path.join(sVar, "tier2-scratch-task.md"), "# scratch task\n");
+      const scratchManifestPath = path.join(sCases, "scratch.jsonl");
+      fs.writeFileSync(scratchManifestPath, `${JSON.stringify(row({
+        id: "T2-SCRATCH",
+        seed: undefined,
+        task: "var/tier2-scratch-task.md",
+        context: { execution_mode: "scripted", scenario_id: "w4.21-bare-noninteractive-launch", scenario_path: "scenarios/w4.21" },
+      }))}\n`);
+      const runScratch = (): RunResult => {
+        const res = spawnSync(path.join(sBin, "tt-tier2-assets"), [scratchManifestPath], {
+          cwd: scratch,
+          encoding: "utf8",
+          timeout: 120_000,
+          env: childEnv(),
+        });
+        return { status: res.status, stdout: String(res.stdout ?? ""), stderr: String(res.stderr ?? "") };
+      };
+
+      const green = runScratch();
+      assert.equal(green.status, 0, `tracked scratch scenario must pass:\n${green.stdout}\n${green.stderr}`);
+
+      const drop = spawnSync("git", ["-C", scratch, "rm", "-r", "-q", "--cached", "scenarios/w4.21"], { encoding: "utf8" });
+      assert.equal(drop.status, 0, drop.stderr);
+      const red = runScratch();
+      assert.notEqual(red.status, 0, "dropping a tracked scenario from the scratch copy must refuse");
+      assert.match(red.stderr, /scenarios\/w4\.21/, "the refusal must name the dropped tracked scenario dir");
+
+      const restore = spawnSync("git", ["-C", scratch, "add", "scenarios/w4.21"], { encoding: "utf8" });
+      assert.equal(restore.status, 0, restore.stderr);
+      const greenAgain = runScratch();
+      assert.equal(greenAgain.status, 0, `restored scratch scenario must pass:\n${greenAgain.stdout}\n${greenAgain.stderr}`);
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
   it("AC2/AC3: tt-run --help documents --tier2 pending-real default and --include-real full campaign", () => {
     const res = run(ttRun, ["--help"]);
     assert.equal(res.status, 0, `tt-run --help must exit 0:\n${res.stderr}`);

@@ -172,6 +172,16 @@ const allowed = [
   "torture-test/scenarios/w4.43/",
   "torture-test/scenarios/w4.44/",
   "torture-test/scenarios/w4.46/",
+  // Tier-2 US-001: the four scripted-pi cells authored in the T2.1
+  // EMERGENCY (W4.04c-keyline-laundering, W4.36-broken-work-concession,
+  // W4.38-hostile-task-scripted, W4.39-a-union-honest) live under
+  // scenarios/w4.04c/, scenarios/w4.36/, scenarios/w4.38/ and
+  // scenarios/w4.39a/ (the tier0 scenario-cell shape) — new scenario
+  // surfaces added in the same story that created them.
+  "torture-test/scenarios/w4.04c/",
+  "torture-test/scenarios/w4.36/",
+  "torture-test/scenarios/w4.38/",
+  "torture-test/scenarios/w4.39a/",
   // Tier-2 section H (US-011) also updated the spec directory: spec 01
   // (the E2.2 canonical contract) documents the capabilities
   // .node-runtimes-2 Boolean-leaf recording that tt-verify-environment
@@ -215,6 +225,13 @@ const allowed = [
   "torture-test/bin/tt-run.test.sh",
   "torture-test/bin/tt-tier2-assets",
   "torture-test/bin/tt-tier2-assets.test.sh",
+  // T2.1 US-002: the tracked-tree scenario-assets guard — bin/tt-tier0-
+  // assets joins the authoring surface (it now requires manifest-
+  // referenced scenario dirs to exist in the TRACKED TREE via git
+  // ls-files, same as tt-tier2-assets), and the shared git tracked-tree
+  // helper lives under scenarios/lib/ (the scenario-cell support surface).
+  "torture-test/bin/tt-tier0-assets",
+  "torture-test/scenarios/lib/",
   "torture-test/oracles/",
   "torture-test/self-tests/",
   // MACP1 (US-002): the Darwin-parity portability surface — the fixture

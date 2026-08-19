@@ -184,7 +184,7 @@ process.stdout.write(`${JSON.stringify({
   },
   tokens_spent: runTokens,
   system_tokens_spent: systemTokens,
-}, null, 2)}\n`);
+})}\n`);
 
 // ── materialization helpers ────────────────────────────────────────
 

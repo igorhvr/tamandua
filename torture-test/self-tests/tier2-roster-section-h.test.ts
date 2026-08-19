@@ -415,6 +415,11 @@ describe("Tier-2 US-011 — section-H roster (platform-conditional lanes)", () =
     // EXECUTE the platform-generic runner directly against a contained
     // scratch dir (the section-F reset-hook-execution pattern) — proves the
     // corridor machinery (parity + fail-closed containment) on this host.
+    // The scratch parent lives under gitignored var/ and may not exist on a
+    // FRESH tree (var/scenarios is created by campaign runs, not by git) —
+    // provision it so the test is hermetic from an empty var (the w4.25
+    // aged-state-fixture pattern).
+    fs.mkdirSync(path.join(varRoot, "scenarios"), { recursive: true });
     const scratch = fs.mkdtempSync(path.join(varRoot, "scenarios", "w422-direct-"));
     try {
       const res = run("node", [path.join("torture-test", CELL_DIRS["W4.22-symlink-path-parity"], "run-symlink-path-parity.mjs")], {

@@ -16,18 +16,17 @@
       "tokens": 0
     },
     "fixer": {
-      "edits": [
+      "writes": [
         {
-          "file": "value.txt",
-          "find": "old",
-          "replace": "fixed"
+          "file": "src/store.ts",
+          "content": "import type { Expense, Category, UpdateExpense } from './types.js';\n\nexport class InMemoryStore {\n  #expenses: Expense[] = [];\n\n  getAll(): Expense[] {\n    return [...this.#expenses];\n  }\n\n  getById(id: string): Expense | undefined {\n    return this.#expenses.find(e => e.id === id);\n  }\n\n  getByCategory(category: Category): Expense[] {\n    return this.#expenses.filter(e => e.category === category);\n  }\n\n  getByDateRange(startDate: string, endDate: string): Expense[] {\n    return this.#expenses.filter(e => e.date >= startDate && e.date <= endDate);\n  }\n\n  add(expense: Expense): Expense {\n    this.#expenses.push(expense);\n    return expense;\n  }\n\n  update(id: string, updates: UpdateExpense): Expense | undefined {\n    const index = this.#expenses.findIndex(e => e.id === id);\n    if (index === -1) return undefined;\n\n    const existing = this.#expenses[index];\n    const updated: Expense = { ...existing, ...updates };\n    this.#expenses[index] = updated;\n    return updated;\n  }\n\n  delete(id: string): boolean {\n    const index = this.#expenses.findIndex(e => e.id === id);\n    if (index === -1) return false;\n    this.#expenses.splice(index, 1);\n    return true;\n  }\n\n  getTotal(): number {\n    return this.#expenses.reduce((sum, e) => sum + e.amount, 0);\n  }\n\n  getCategorySummary(): Record<Category, number> {\n    const summary: Record<Category, number> = {\n      Food: 0,\n      Transport: 0,\n      Utilities: 0,\n      Entertainment: 0,\n      Other: 0,\n    };\n    for (const e of this.#expenses) {\n      summary[e.category] += e.amount;\n    }\n    return summary;\n  }\n}\n"
         }
       ],
       "commands": [
-        "git add value.txt",
-        "git commit -m \"fix: update scripted stream-torture fixture\""
+        "git add -A",
+        "git commit -m \"fix: restore getByCategory filter (scripted BUG-T1)\""
       ],
-      "output": "STATUS: done\nCHANGES: corrected the deterministic fixture value\nREGRESSION_TEST: scripted stream-torture evidence",
+      "output": "STATUS: done\nCHANGES: restored the getByCategory filter (scripted BUG-T1 fix)\nREGRESSION_TEST: scripted stream-torture evidence",
       "tokens": 0,
       "delayed_trailer_ms": 20000
     },
@@ -40,7 +39,11 @@
     },
     "merger": {
       "output": "STATUS: done\nREBASED: false\nMERGE_COMMIT: 0000000\nMERGED_INTO: main\nMERGED_TREE: {{gitTree}}",
-      "tokens": 0
+      "tokens": 0,
+      "includeCommandOutput": true,
+      "commands": [
+        "EXPECT_TIP=\"$(git -C '{{input.WORKTREE_ORIGIN_REPOSITORY}}' rev-parse 'refs/heads/{{input.ORIGINAL_BRANCH}}')\"; MESSAGE_FILE=\"$(mktemp)\"; printf 'fix: scripted corridor merge\\n\\nCo-Authored-By: Tamandua <tamandua@tetradactyla.org>\\n' > \"$MESSAGE_FILE\"; tamandua merge-branch --origin '{{input.WORKTREE_ORIGIN_REPOSITORY}}' --branch '{{input.BRANCH}}' --into '{{input.ORIGINAL_BRANCH}}' --expect-tip \"$EXPECT_TIP\" --message \"$(cat \"$MESSAGE_FILE\")\"; MERGE_EXIT=$?; rm -f \"$MESSAGE_FILE\"; exit $MERGE_EXIT"
+      ]
     }
   },
   "heartbeatTokens": 0,

@@ -76,6 +76,19 @@ const work = path.join(invocationDir, "origin");
 const wrapperDir = path.join(invocationDir, "bin-git");
 const wrapperGit = path.join(wrapperDir, "git");
 const eventsDir = path.join(stateDir, "events");
+// W4.11's own arm E SIGINTs the launch CLI while startDaemon holds the
+// product's O_EXCL daemon-start.lock — Node's default SIGINT skips
+// startDaemon's finally-released lock, leaving a FRESH orphaned lock that
+// wedges the NEXT cell's daemon bootstrap for 10s ("Timed out waiting for
+// another daemon start attempt to finish" — the operator-campaign W4.12
+// failure). The cell created the leak, so it must clean it: clear the lock
+// right after arm E's SIGINT and in every safety net. The auto-started
+// daemon itself is unaffected (it already wrote its pidfile before the
+// SIGINT).
+const daemonStartLock = path.join(stateDir, "daemon-start.lock");
+function clearOrphanedStartLock() {
+  fs.rmSync(daemonStartLock, { force: true });
+}
 
 // Every path this scenario mutates must stay under torture-test/var.
 for (const candidate of [work, wrapperDir, wrapperGit]) {
@@ -371,12 +384,14 @@ process.on("exit", () => {
     try { process.kill(-state.pgid, "SIGKILL"); } catch { /* gone */ }
   }
   stopAutoStartedDaemon();
+  clearOrphanedStartLock();
 });
 process.on("uncaughtException", (error) => {
   for (const state of liveChildren) {
     try { process.kill(-state.pgid, "SIGKILL"); } catch { /* gone */ }
   }
   stopAutoStartedDaemon();
+  clearOrphanedStartLock();
   // eslint-disable-next-line no-console
   console.error(error);
   process.exit(1);
@@ -573,6 +588,11 @@ function armsPassed() {
   await waitForFile(daemonPidFile, 60_000, "auto-started daemon pidfile");
   const killed = await killGroup(launch, "SIGINT");
   assert.equal(killed.signalCode, "SIGINT", "arm E: launch must die by SIGINT");
+  // The SIGINT hit the launch CLI mid-startDaemon: its O_EXCL daemon-start.lock
+  // is left orphaned (the finally-released lock never ran). Clear it so the
+  // NEXT cell's daemon bootstrap cannot wedge on it (the W4.12 campaign
+  // failure). The auto-started daemon below already wrote its pidfile.
+  clearOrphanedStartLock();
 
   // The auto-starting daemon is spawned DETACHED — the group SIGINT must not
   // touch it: it survives and its control plane (5339) comes up.
@@ -709,4 +729,4 @@ process.stdout.write(`${JSON.stringify({
   observations,
   tokens_spent: runTokens,
   system_tokens_spent: systemTokens,
-}, null, 2)}\n`);
+})}\n`);

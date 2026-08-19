@@ -23,6 +23,15 @@
 # dedicated named scopes and re-asserts cgroup membership after every
 # start/restart, recording provenance to
 # torture-test/var/daemon-control/<name>.json.
+#
+# T2.1 US-009: scope unit names are PER-WORKTREE (tamandua-tt-<kind>-<hash>
+# derived from the repo root), never the old fixed per-user name — a
+# concurrent campaign in another worktree must not be able to stop or
+# collide with this worktree's daemon scope. cmd_start additionally waits
+# (bounded, TT_DAEMON_PORT_WAIT_SECONDS, default 180) for the kind's FIXED
+# ports to free before launching, so concurrent worktrees serialize on the
+# shared ports instead of failing their bootstrap with EADDRINUSE, and
+# clears a stale tamandua.pid left by a killed daemon.
 set -euo pipefail
 
 # ── path resolution ──────────────────────────────────────────────────
@@ -308,6 +317,16 @@ Daemon kinds:
             before scripted harness runtimes are installed — harness
             resolution happens at dispatch time, not at daemon start.
 
+Containment (T2.1 US-009):
+  - The systemd scope unit name is PER-WORKTREE (tamandua-tt-<kind>-<hash>
+    derived from the repo root), so concurrent campaigns in different
+    worktrees never stop or collide with each other's daemon scope.
+  - The kind's ports are FIXED (shared per user); cmd_start waits (bounded,
+    TT_DAEMON_PORT_WAIT_SECONDS, default 180s) for them to free before
+    launching, so concurrent worktrees serialize instead of failing the
+    bootstrap with EADDRINUSE. A stale tamandua.pid left by a killed daemon
+    is cleared before launch.
+
 Commands:
   start     Start the daemon inside a systemd user scope (when available)
             or as a plain background process. Records provenance to
@@ -516,9 +535,17 @@ write_provenance() {
   local start_time="${10}"  # 'proc:<n>' process-start identity (US-004)
   local prov_file="$PROV_DIR/$name.json"
 
-  # Convert space-separated ports to a JSON array
+  # Convert space-separated ports to a JSON array. The input MUST end with a
+  # newline: `while read` treats a final line WITHOUT a trailing newline as
+  # EOF-with-no-data and silently SKIPS it, so `printf '%s'` (no newline)
+  # dropped the LAST port from the record — the control port 5339 for the
+  # scripted kind. A stop whose provenance omits the control port sees only
+  # dashboard/MCP free and returns "already stopped" while a CLI-auto-started
+  # daemon still holds 5339 (the tier1 W2.21 restart failure: the cell's
+  # `workflow run` auto-start holds exactly the control port, invisible to the
+  # provenance-scoped stop; the next start then blocks on the busy port).
   local ports_json
-  ports_json="$(printf '%s' "$ports" | tr ' ' '\n' | while read -r p; do [ -n "$p" ] && printf '"%s",' "$p"; done | sed 's/,$//')"
+  ports_json="$(printf '%s\n' "$ports" | tr ' ' '\n' | while read -r p; do [ -n "$p" ] && printf '"%s",' "$p"; done | sed 's/,$//')"
   ports_json="[$ports_json]"
 
   if command -v jq >/dev/null 2>&1; then
@@ -620,6 +647,23 @@ cmd_start() {
   # Ensure state dir exists so the daemon can write its PID file
   mkdir -p "$state_dir"
 
+  # FIX10 US-006: clear an orphaned daemon-start.lock before launching.
+  # The product's startDaemon holds an O_EXCL daemon-start.lock for the whole
+  # start; a launch CLI that is SIGINT'd/SIGKILL'd mid-startDaemon (a cell arm
+  # killing `workflow run` at the auto-start barrier — W4.11 arm E) dies
+  # without running startDaemon's finally-released lock, leaving a FRESH
+  # orphaned lock. The next `tamandua daemon start` then sees the non-stale
+  # lock (< 30s), waits 10s for a daemon pid that never appears
+  # ("Timed out waiting for another daemon start attempt to finish") and
+  # fails — the operator-campaign W4.12 bootstrap failure ("daemon-control
+  # scripted start failed", ~11s, no daemon log entries). daemon-control is
+  # the sanctioned starter and already does a clean-slate systemd scope
+  # teardown above; the orphaned start lock must not survive into this start.
+  # Safe: within a worktree, daemon-control start is serialized by the
+  # scenario daemon lock, and a cell's workflow-run auto-start happens only
+  # AFTER this bootstrap returns.
+  rm -f -- "$state_dir/daemon-start.lock"
+
   # Ensure provenance directory exists
   ensure_prov_dir
 
@@ -673,76 +717,125 @@ cmd_start() {
   # separated by a settle): a foreign daemon that binds inside the settle
   # window is absorbed by continuing the bounded wait instead of racing us
   # into EADDRINUSE.
+  #
+  # T2.1 US-010 round 2: even the settle-confirm cannot make the
+  # check-then-act atomic — a foreign daemon can win a shared port in the
+  # instant between the settle-recheck and OUR bind (the re-proof campaign's
+  # W4.20 bootstrap failed exactly this way: the foreign scope and ours both
+  # started in the same second; the foreign daemon bound first, our daemon
+  # died EADDRINUSE and the pid-file wait failed the cell). The whole
+  # wait+launch+verify cycle is therefore retried within the SAME bounded
+  # deadline: a failed launch attempt (no live pid — foreign port contention
+  # or daemon crash) tears down its scope and loops back to the stable-free
+  # wait. Only a deadline expiry with no live daemon fails the start.
   local still_busy=""
-  while [ "$(date +%s)" -lt "$port_wait_deadline" ]; do
+  local daemon_pid=""
+  # T2.1 US-010 round 3: idempotent reuse of an ALREADY-RUNNING daemon of OUR
+  # OWN. A scripted cell's `workflow run` auto-starts the daemon through the
+  # PRODUCT CLI (ensureDaemonControlAvailable -> startDaemon): it writes
+  # $state_dir/tamandua.pid and binds the control port, but records NO
+  # daemon-control provenance (the W2.23c cell restarts the daemon to ensure
+  # clean state right after such an auto-start). The stable-free wait below
+  # exists for FOREIGN contention, so it must NOT block on the control port
+  # our own live daemon legitimately holds. Detect that case (live TT-owned
+  # pid file + control port listening) and skip the wait: the launch script
+  # is idempotent — `tamandua daemon start` reuses the running daemon and the
+  # dashboard/MCP ports bind fresh. A foreign squatter (no live TT pid file)
+  # still enters the wait and fails with the port-free diagnostic (the
+  # busy-port test arms 73b/73c are unaffected).
+  local reuse_running_daemon=false
+  if [ -f "$daemon_pid_file" ]; then
+    local running_pid
+    running_pid="$(cat "$daemon_pid_file" 2>/dev/null || true)"
+    if [ -n "$running_pid" ] && kill -0 "$running_pid" 2>/dev/null \
+       && is_port_listening "$ctrl_port" \
+       && verify_process_tt_owned "$running_pid" "$state_dir"; then
+      reuse_running_daemon=true
+      echo "daemon-control: reusing already-running $kind daemon (PID $running_pid, control port $ctrl_port listening)" >&2
+    fi
+  fi
+  while [ "$(date +%s)" -lt "$port_wait_deadline" ] && [ -z "$daemon_pid" ]; do
     still_busy=""
     for port in $dash_port $mcp_port $ctrl_port; do
       if [ -n "$port" ] && is_port_listening "$port"; then still_busy="$still_busy $port"; fi
     done
-    if [ -z "$still_busy" ]; then
-      # Free on this pass: confirm it STAYS free across a settle.
-      sleep 2
-      still_busy=""
-      for port in $dash_port $mcp_port $ctrl_port; do
-        if [ -n "$port" ] && is_port_listening "$port"; then still_busy="$still_busy $port"; fi
-      done
-      if [ -z "$still_busy" ]; then break; fi
-    else
+    if [ -n "$still_busy" ] && ! $reuse_running_daemon; then
       sleep 1
+      continue
     fi
-  done
-  if [ -n "$still_busy" ]; then
-    echo "daemon-control: ERROR — $kind ports$still_busy are still in use after ${port_wait_seconds}s (a concurrent worktree daemon or a stuck listener); refusing to launch into a busy port" >&2
-    exit 1
-  fi
-
-  # E3.C.2 US-002: a daemon killed by a foreign worktree's former clean-slate
-  # (or a SIGKILL/crash) can leave a STALE tamandua.pid (dead pid). The pid
-  # wait below treats an EXISTING pid file as "daemon ready", so a stale file
-  # would break the wait immediately and fail "PID is not alive". Ports are
-  # free here (checked above), so any pid file is stale: remove it so the
-  # launch below starts a fresh wait for the NEW daemon's pid.
-  if [ -f "$daemon_pid_file" ]; then
-    local stale_pid
-    stale_pid="$(cat "$daemon_pid_file" 2>/dev/null || true)"
-    if [ -z "$stale_pid" ] || ! kill -0 "$stale_pid" 2>/dev/null; then
-      rm -f -- "$daemon_pid_file"
+    # Free on this pass: confirm it STAYS free across a settle so a foreign
+    # daemon that binds between our check and the launch is caught here
+    # (back into the bounded wait) instead of racing us.
+    sleep 2
+    still_busy=""
+    for port in $dash_port $mcp_port $ctrl_port; do
+      if [ -n "$port" ] && is_port_listening "$port"; then still_busy="$still_busy $port"; fi
+    done
+    if [ -n "$still_busy" ] && ! $reuse_running_daemon; then
+      sleep 1
+      continue
     fi
-  fi
-
-  if has_systemd_scope; then
-    use_systemd=true
-    echo "daemon-control: using systemd scope: $scope_unit" >&2
-    # Clear any lingering scope unit from a previous failed run
-    systemctl --user stop "${scope_unit%.scope}.scope" 2>/dev/null || true
-    systemctl --user reset-failed "${scope_unit%.scope}.scope" 2>/dev/null || true
-    # systemd-run exits immediately; the daemon+runs inside the scope.
-    # We pass the full env via env -i composition.
-    systemd-run --user --scope --unit="$scope_unit" --quiet \
-      env -i $(env_for_kind "$kind") PATH="${PATH}" bash -c "$launch_script" >/dev/null 2>&1
-  else
-    echo "daemon-control: systemd not available — using plain background spawn" >&2
-    nohup env -i $(env_for_kind "$kind") PATH="${PATH}" bash -c "$launch_script" >/dev/null 2>&1 &
-  fi
-
-  # Wait for the daemon PID file to appear
-  local deadline; deadline=$(($(date +%s) + 15))
-  while [ "$(date +%s)" -lt "$deadline" ]; do
-    if [ -f "$daemon_pid_file" ]; then break; fi
-    sleep 0.5
+    # ── ports stable-free: launch attempt ─────────────────────────────
+    # T2.1 US-009: a daemon killed by a foreign worktree's former clean-slate
+    # (or SIGKILL/crash) can leave a STALE tamandua.pid (dead pid). The pid
+    # wait below treats an EXISTING pid file as "daemon ready", so a stale file
+    # would break the wait immediately and fail "PID is not alive". Ports are
+    # free here (checked above), so any pid file is stale: remove it so the
+    # launch starts a fresh wait for the NEW daemon's pid.
+    if [ -f "$daemon_pid_file" ]; then
+      local stale_pid
+      stale_pid="$(cat "$daemon_pid_file" 2>/dev/null || true)"
+      if [ -z "$stale_pid" ] || ! kill -0 "$stale_pid" 2>/dev/null; then
+        rm -f -- "$daemon_pid_file"
+      fi
+    fi
+    if has_systemd_scope; then
+      use_systemd=true
+      echo "daemon-control: using systemd scope: $scope_unit" >&2
+      # Clear any lingering scope unit from a previous failed run
+      systemctl --user stop "${scope_unit%.scope}.scope" 2>/dev/null || true
+      systemctl --user reset-failed "${scope_unit%.scope}.scope" 2>/dev/null || true
+      # systemd-run exits immediately; the daemon+runs inside the scope.
+      # We pass the full env via env -i composition.
+      systemd-run --user --scope --unit="$scope_unit" --quiet \
+        env -i $(env_for_kind "$kind") PATH="${PATH}" bash -c "$launch_script" >/dev/null 2>&1
+    else
+      echo "daemon-control: systemd not available — using plain background spawn" >&2
+      nohup env -i $(env_for_kind "$kind") PATH="${PATH}" bash -c "$launch_script" >/dev/null 2>&1 &
+    fi
+    # Wait for the daemon PID file to appear
+    local pid_deadline; pid_deadline=$(($(date +%s) + 15))
+    while [ "$(date +%s)" -lt "$pid_deadline" ]; do
+      if [ -f "$daemon_pid_file" ]; then break; fi
+      sleep 0.5
+    done
+    if [ -f "$daemon_pid_file" ]; then
+      local candidate_pid; candidate_pid="$(cat "$daemon_pid_file" 2>/dev/null || true)"
+      if [ -n "$candidate_pid" ] && kill -0 "$candidate_pid" 2>/dev/null; then
+        daemon_pid="$candidate_pid"
+        echo "daemon-control: daemon PID $daemon_pid" >&2
+        break
+      fi
+    fi
+    # Launch attempt failed (a foreign daemon won a shared port in the instant
+    # between the settle-recheck and our bind — EADDRINUSE — or the daemon
+    # crashed): tear down the scope and RETRY within the bounded wait.
+    echo "daemon-control: launch attempt collided (foreign port contention or daemon crash) — retrying within the bounded wait" >&2
+    if $use_systemd; then
+      systemctl --user stop "${scope_unit%.scope}.scope" 2>/dev/null || true
+      systemctl --user reset-failed "${scope_unit%.scope}.scope" 2>/dev/null || true
+    fi
+    rm -f -- "$daemon_pid_file"
+    sleep 1
   done
-
-  if [ ! -f "$daemon_pid_file" ]; then
-    echo "daemon-control: ERROR — daemon PID file did not appear at $daemon_pid_file within timeout" >&2
+  if [ -z "$daemon_pid" ]; then
+    if [ -n "$still_busy" ]; then
+      echo "daemon-control: ERROR — $kind ports$still_busy are still in use after ${port_wait_seconds}s (a concurrent worktree daemon or a stuck listener); refusing to launch into a busy port" >&2
+    else
+      echo "daemon-control: ERROR — $kind daemon did not start within ${port_wait_seconds}s (launch attempts collided or the daemon crashed)" >&2
+    fi
     exit 1
   fi
-
-  local daemon_pid; daemon_pid="$(cat "$daemon_pid_file")"
-  if [ -z "$daemon_pid" ] || ! kill -0 "$daemon_pid" 2>/dev/null; then
-    echo "daemon-control: ERROR — daemon PID $daemon_pid is not alive" >&2
-    exit 1
-  fi
-  echo "daemon-control: daemon PID $daemon_pid" >&2
 
   # Record the daemon's process-start identity (E3.C.1 US-004): stop/restart
   # verify the recorded startTime against the pid's CURRENT /proc starttime
@@ -1158,8 +1251,27 @@ cmd_restart() {
     echo "daemon-control: stopping existing daemon..." >&2
     cmd_stop "$kind"
     echo "daemon-control: stop complete, waiting for ports to settle..." >&2
-    sleep 1
-    # Verify ports are free before starting
+    # T2.1 US-010 round 4: the post-stop port check must be a BOUNDED
+    # stable-free wait, not a single shot. cmd_stop's graceful stop escalates
+    # to SIGTERM/SIGKILL on the daemon PID, but the kind's OTHER listeners
+    # (MCP/dashboard standalone processes spawned by the same launch script)
+    # can take a moment longer to release their sockets after the daemon PID
+    # dies — the re-proof campaign-20260818T145745610Z W4.36 TEST_INFRA_FAIL:
+    # `daemon-control scripted restart` exited 1 in ~15s because the single
+    # `sleep 1` + one-pass check ran while a port was still draining
+    # (lifecycle log: stop.dashboard 14:59:16.6, daemon SIGTERM 14:59:26.6,
+    # restart refused 14:59:31). The restart now waits (bounded, the SAME
+    # TT_DAEMON_PORT_WAIT_SECONDS deadline as cmd_start) for the ports to be
+    # free STABLY (two consecutive free observations across a settle) before
+    # starting — the identical settle-confirm the launch path uses. A port
+    # that never frees (a stuck foreign listener) still refuses with the
+    # explicit diagnostic after the bound; a port that drains a few seconds
+    # late is absorbed instead of failing the cell.
+    local port_wait_seconds="${TT_DAEMON_PORT_WAIT_SECONDS:-180}"
+    case "$port_wait_seconds" in
+      ''|*[!0-9]*) port_wait_seconds=180 ;;
+    esac
+    local port_wait_deadline; port_wait_deadline=$(($(date +%s) + port_wait_seconds))
     if [ -f "$prov_file" ]; then
       local post_stop_ports
       if command -v jq >/dev/null 2>&1; then
@@ -1167,15 +1279,33 @@ cmd_restart() {
       else
         post_stop_ports=$(grep -o '"ports": *\[[^]]*\]' "$prov_file" 2>/dev/null | sed 's/.*\[//;s/\]//;s/"//g;s/,/ /g' || true)
       fi
-      local port_still_busy=false
-      for port in $post_stop_ports; do
-        if [ -n "$port" ] && is_port_listening "$port"; then
-          echo "daemon-control: WARNING — port $port still in use after stop" >&2
-          port_still_busy=true
+      local still_busy=""
+      while [ "$(date +%s)" -lt "$port_wait_deadline" ]; do
+        still_busy=""
+        for port in $post_stop_ports; do
+          if [ -n "$port" ] && is_port_listening "$port"; then
+            still_busy="$still_busy $port"
+          fi
+        done
+        if [ -z "$still_busy" ]; then
+          # Free on this pass: confirm it STAYS free across a settle so a
+          # draining listener that re-appears is caught here (back into the
+          # bounded wait) instead of racing the start.
+          sleep 2
+          still_busy=""
+          for port in $post_stop_ports; do
+            if [ -n "$port" ] && is_port_listening "$port"; then
+              still_busy="$still_busy $port"
+            fi
+          done
+          if [ -z "$still_busy" ]; then
+            break
+          fi
         fi
+        sleep 1
       done
-      if $port_still_busy; then
-        echo "daemon-control: ERROR — ports not freed after stop; cannot restart" >&2
+      if [ -n "$still_busy" ]; then
+        echo "daemon-control: ERROR — ports$still_busy not freed after stop within ${port_wait_seconds}s; cannot restart" >&2
         exit 1
       fi
     fi
