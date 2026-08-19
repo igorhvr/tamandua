@@ -871,3 +871,122 @@ describe("stopWorkflow run.canceled terminal event", () => {
     assert.equal(lines[lines.length - 1].event, "run.force_failed");
   });
 });
+
+// ── WLST5 split counters surface ────────────────────────────────────
+// worker_lost_count now means harness_lost only; ceiling-expired rounds
+// tick the sibling ceiling_expiry_count. Both must surface through the
+// CLI so an operator can tell "harness crashed N times" from "N long
+// productive rounds hit the configured ceiling".
+
+describe("WLST5 split counters surface", () => {
+  it("workflow status shows both Rounds expired at ceiling and Worker lost", async () => {
+    const env = createTempEnv();
+    const dbPath = path.join(env.tamanduaDir, "tamandua.db");
+    const runId = "aaab1111-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+
+    const db = new DatabaseSync(dbPath);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS runs (
+        id TEXT PRIMARY KEY,
+        workflow_id TEXT NOT NULL,
+        task TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'running',
+        context TEXT NOT NULL DEFAULT '{}',
+        tokens_spent INTEGER NOT NULL DEFAULT 0,
+        worker_lost_count INTEGER NOT NULL DEFAULT 0,
+        ceiling_expiry_count INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `);
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, worker_lost_count, ceiling_expiry_count) VALUES (?, 'feature-dev', 'split counters', 'running', '{}', 100, 2, 3)"
+    ).run(runId);
+    db.close();
+
+    const { child, getStdout } = spawnCli(
+      ["workflow", "status", runId],
+      { HOME: env.homeDir }
+    );
+    await new Promise<void>((resolve) => child.on("close", () => resolve()));
+    const stdout = getStdout();
+    assert.match(stdout, /Rounds expired at ceiling: 3/);
+    assert.match(stdout, /Worker lost: 2/);
+
+    try { fs.rmSync(env.root, { recursive: true, force: true }); } catch { /* cleanup */ }
+  });
+
+  it("compact workflow runs list separates wl: (harness lost) from ce: (ceiling expiry)", async () => {
+    const env = createTempEnv();
+    const dbPath = path.join(env.tamanduaDir, "tamandua.db");
+    const runId = "bbbb2222-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+
+    const db = new DatabaseSync(dbPath);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS runs (
+        id TEXT PRIMARY KEY,
+        workflow_id TEXT NOT NULL,
+        task TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'running',
+        context TEXT NOT NULL DEFAULT '{}',
+        tokens_spent INTEGER NOT NULL DEFAULT 0,
+        worker_lost_count INTEGER NOT NULL DEFAULT 0,
+        ceiling_expiry_count INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `);
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, worker_lost_count, ceiling_expiry_count) VALUES (?, 'feature-dev', 'split counters', 'running', '{}', 100, 1, 4)"
+    ).run(runId);
+    db.close();
+
+    const { child, getStdout } = spawnCli(
+      ["workflow", "runs"],
+      { HOME: env.homeDir }
+    );
+    await new Promise<void>((resolve) => child.on("close", () => resolve()));
+    const stdout = getStdout();
+    assert.match(stdout, /wl:1/);
+    assert.match(stdout, /ce:4/);
+
+    try { fs.rmSync(env.root, { recursive: true, force: true }); } catch { /* cleanup */ }
+  });
+
+  it("workflow status omits both counter lines when both are zero", async () => {
+    const env = createTempEnv();
+    const dbPath = path.join(env.tamanduaDir, "tamandua.db");
+    const runId = "cccc3333-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+
+    const db = new DatabaseSync(dbPath);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS runs (
+        id TEXT PRIMARY KEY,
+        workflow_id TEXT NOT NULL,
+        task TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'running',
+        context TEXT NOT NULL DEFAULT '{}',
+        tokens_spent INTEGER NOT NULL DEFAULT 0,
+        worker_lost_count INTEGER NOT NULL DEFAULT 0,
+        ceiling_expiry_count INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `);
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent) VALUES (?, 'feature-dev', 'no counters', 'running', '{}', 0)"
+    ).run(runId);
+    db.close();
+
+    const { child, getStdout } = spawnCli(
+      ["workflow", "status", runId],
+      { HOME: env.homeDir }
+    );
+    await new Promise<void>((resolve) => child.on("close", () => resolve()));
+    const stdout = getStdout();
+    assert.doesNotMatch(stdout, /Rounds expired at ceiling/);
+    assert.doesNotMatch(stdout, /Worker lost/);
+
+    try { fs.rmSync(env.root, { recursive: true, force: true }); } catch { /* cleanup */ }
+  });
+});

@@ -244,6 +244,17 @@ function migrate(db: DatabaseSync): void {
     db.exec("ALTER TABLE runs ADD COLUMN worker_lost_count INTEGER NOT NULL DEFAULT 0");
   }
 
+  // ── WLST ceiling_expiry_count for runs ──
+  // Tracks how many worker rounds the motor itself killed at the worker
+  // time ceiling (timeoutSeconds) — a distinct termination class from
+  // genuinely lost harness workers (worker_lost_count). step.ceiling_expiry
+  // events increment this counter; worker_lost_count is NOT touched so the
+  // "Worker lost: M" readout keeps meaning harness_lost only.
+  const addCeilingExpiry = db.prepare("SELECT name FROM pragma_table_info('runs') WHERE name = 'ceiling_expiry_count'").all();
+  if (addCeilingExpiry.length === 0) {
+    db.exec("ALTER TABLE runs ADD COLUMN ceiling_expiry_count INTEGER NOT NULL DEFAULT 0");
+  }
+
   // Indexes for run-scoped scheduling and step claim queries.
   db.exec(
     "CREATE INDEX IF NOT EXISTS idx_steps_agent_run_status ON steps(agent_id, run_id, status)",

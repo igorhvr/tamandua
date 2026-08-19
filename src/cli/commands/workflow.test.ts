@@ -63,6 +63,7 @@ function setupTempDb(): { db: DatabaseSync; dbPath: string; tempDir: string } {
     context TEXT NOT NULL DEFAULT '{}',
     tokens_spent INTEGER NOT NULL DEFAULT 0,
     worker_lost_count INTEGER NOT NULL DEFAULT 0,
+    ceiling_expiry_count INTEGER NOT NULL DEFAULT 0,
     run_number INTEGER,
     scheduling_status TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -616,6 +617,105 @@ Examples:
       const output = await captureStatusOutput(runId, ["--json"]);
       const parsed = JSON.parse(output.trim());
       assert.equal(parsed.harnessType, "dsh");
+    });
+  });
+
+  // ══════════════════════════════════════════════════════════════════
+  // WLST5: split round-termination counters surface
+  // ══════════════════════════════════════════════════════════════════
+  // worker_lost_count (wl:) counts harness_lost only; ceiling_expiry_count
+  // (ce:) counts rounds the motor killed at the worker time ceiling. Both
+  // are additive display fields.
+
+  describe("WLST5: split counters display (in-process with temp DB)", () => {
+    let tempDir: string;
+    let dbPath: string;
+    let db: DatabaseSync;
+    let originalDbPath: string | undefined;
+    let originalHome: string | undefined;
+    let originalStateDir: string | undefined;
+
+    beforeEach(() => {
+      originalDbPath = process.env.TAMANDUA_DB_PATH;
+      originalHome = process.env.HOME;
+      originalStateDir = process.env.TAMANDUA_STATE_DIR;
+
+      const setup = setupTempDb();
+      tempDir = setup.tempDir;
+      dbPath = setup.dbPath;
+      db = setup.db;
+
+      process.env.TAMANDUA_DB_PATH = dbPath;
+      process.env.HOME = tempDir;
+      process.env.TAMANDUA_STATE_DIR = join(tempDir, ".tamandua");
+    });
+
+    afterEach(() => {
+      if (originalDbPath) process.env.TAMANDUA_DB_PATH = originalDbPath;
+      else delete process.env.TAMANDUA_DB_PATH;
+      if (originalHome) process.env.HOME = originalHome;
+      else delete process.env.HOME;
+      if (originalStateDir) process.env.TAMANDUA_STATE_DIR = originalStateDir;
+      else delete process.env.TAMANDUA_STATE_DIR;
+
+      db.close();
+      try { rmSync(tempDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    });
+
+    function seedRun(runId: string, workerLost: number, ceilingExpiry: number): void {
+      db.prepare(
+        "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, worker_lost_count, ceiling_expiry_count) VALUES (?, 'test', 'task', 'completed', '{}', 10, ?, ?)",
+      ).run(runId, workerLost, ceilingExpiry);
+    }
+
+    async function captureOutput(args: string[]): Promise<string> {
+      let output = "";
+      const origLog = console.log;
+      console.log = (...chunks: unknown[]) => {
+        output += chunks.map((c) => String(c)).join(" ") + "\n";
+      };
+      try {
+        await handleWorkflow("workflow", args, () => {});
+      } finally {
+        console.log = origLog;
+      }
+      return output;
+    }
+
+    it("workflow status text shows Rounds expired at ceiling and Worker lost separately", async () => {
+      const runId = crypto.randomUUID();
+      seedRun(runId, 2, 3);
+
+      const output = await captureOutput(["workflow", "status", runId]);
+      assert.match(output, /Rounds expired at ceiling: 3/);
+      assert.match(output, /Worker lost: 2/);
+    });
+
+    it("workflow runs compact list shows wl: only for harness_lost and ce: for ceiling expiries", async () => {
+      const runId = crypto.randomUUID();
+      seedRun(runId, 1, 4);
+
+      const output = await captureOutput(["workflow", "runs"]);
+      assert.match(output, /wl:1/);
+      assert.match(output, /ce:4/);
+    });
+
+    it("workflow runs compact list shows only wl: when ceiling_expiry_count is zero", async () => {
+      const runId = crypto.randomUUID();
+      seedRun(runId, 2, 0);
+
+      const output = await captureOutput(["workflow", "runs"]);
+      assert.match(output, /wl:2/);
+      assert.doesNotMatch(output, /ce:/);
+    });
+
+    it("workflow status omits both counter lines when both counters are zero", async () => {
+      const runId = crypto.randomUUID();
+      seedRun(runId, 0, 0);
+
+      const output = await captureOutput(["workflow", "status", runId]);
+      assert.doesNotMatch(output, /Rounds expired at ceiling/);
+      assert.doesNotMatch(output, /Worker lost/);
     });
   });
 });

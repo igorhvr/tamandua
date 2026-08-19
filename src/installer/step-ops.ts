@@ -584,9 +584,20 @@ function getRunWorkerLostCount(runId: string): number | undefined {
   }
 }
 
+function getRunCeilingExpiryCount(runId: string): number | undefined {
+  try {
+    const db = getDb();
+    const row = db.prepare("SELECT ceiling_expiry_count FROM runs WHERE id = ?").get(runId) as { ceiling_expiry_count: number } | undefined;
+    return row?.ceiling_expiry_count;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Emit a terminal run lifecycle event (run.completed/run.failed/run.canceled)
- * with payload parity: ts, runId, workflowId, tokensSpent, workerLostCount.
+ * with payload parity: ts, runId, workflowId, tokensSpent, workerLostCount,
+ * ceilingExpiryCount.
  * run.canceled additionally carries a `reason` (the stop source).
  */
 export function emitRunTerminalEvent(params: {
@@ -605,6 +616,7 @@ export function emitRunTerminalEvent(params: {
     reason: params.reason,
     tokensSpent: getRunTokenSpend(params.runId),
     workerLostCount: getRunWorkerLostCount(params.runId),
+    ceilingExpiryCount: getRunCeilingExpiryCount(params.runId),
   });
 }
 
@@ -1408,6 +1420,16 @@ export function cleanupAbandonedSteps(): void {
  * @param detailPrefix - Optional: prefix prepended to the event detail
  *   (e.g. "liveness-detected") so dashboards can distinguish recovery
  *   causes without parsing the event name alone.
+ * @param exitCode - Optional: exit code of the harness process (forensics).
+ * @param signal - Optional: signal that killed the harness process (forensics).
+ * @param stderrTail - Optional: sanitized stderr tail from the harness (forensics).
+ * @param timedOut - Optional: when true, the round was killed by the motor's
+ *   own worker time ceiling (the harness adapter's timedOut signal). A
+ *   workerJobId-scoped recovery with timedOut === true is classified as a
+ *   ceiling expiry (step.ceiling_expiry, runs.ceiling_expiry_count) rather
+ *   than a harness loss (step.worker_lost, runs.worker_lost_count) — both
+ *   reset the step/story exactly the same way; only the observability
+ *   counters and event names differ.
  */
 export function recoverOrphanedStepsForAgent(
   agentId: string,
@@ -1421,6 +1443,7 @@ export function recoverOrphanedStepsForAgent(
   exitCode?: number | null,
   signal?: string | null,
   stderrTail?: string,
+  timedOut?: boolean,
 ): { recovered: number; failed: number; skipped: number } {
   const db = getDb();
 
@@ -1546,12 +1569,19 @@ export function recoverOrphanedStepsForAgent(
         } else {
           db.prepare("UPDATE stories SET status = 'pending', abandoned_count = ?, updated_at = datetime('now') WHERE id = ?").run(newAbandoned, story.id);
           db.prepare("UPDATE steps SET status = 'pending', current_story_id = NULL, updated_at = datetime('now') WHERE id = ?").run(step.id);
-          const storyRecoveryEvent = workerJobId !== undefined ? "step.worker_lost" : "step.timeout";
+          const isCeilingExpiry = workerJobId !== undefined && timedOut === true;
+          const storyRecoveryEvent = workerJobId !== undefined
+            ? (isCeilingExpiry ? "step.ceiling_expiry" : "step.worker_lost")
+            : "step.timeout";
           const storyRecoveryDetail = workerJobId !== undefined
-            ? `Worker ${workerJobId} exited without completing story ${story.story_id}; reset to pending (story abandon ${newAbandoned}/${ABANDON_STORY_MAX})`
+            ? (isCeilingExpiry
+              ? `Worker ${workerJobId} hit the worker time ceiling without completing story ${story.story_id}; reset to pending (story abandon ${newAbandoned}/${ABANDON_STORY_MAX})`
+              : `Worker ${workerJobId} exited without completing story ${story.story_id}; reset to pending (story abandon ${newAbandoned}/${ABANDON_STORY_MAX})`)
             : `Agent terminated; story ${story.story_id} reset to pending (story abandon ${newAbandoned}/${ABANDON_STORY_MAX})`;
           const storyPrefix = detailPrefix ? `[${detailPrefix}] ` : "";
-          if (storyRecoveryEvent === "step.worker_lost") {
+          if (storyRecoveryEvent === "step.ceiling_expiry") {
+            db.prepare("UPDATE runs SET ceiling_expiry_count = ceiling_expiry_count + 1 WHERE id = ?").run(step.run_id);
+          } else if (storyRecoveryEvent === "step.worker_lost") {
             db.prepare("UPDATE runs SET worker_lost_count = worker_lost_count + 1 WHERE id = ?").run(step.run_id);
           }
           try {
@@ -1563,6 +1593,7 @@ export function recoverOrphanedStepsForAgent(
               stepId: step.step_id,
               detail: storyPrefix + storyRecoveryDetail,
               ...(storyRecoveryEvent === "step.worker_lost" ? { exitCode: exitCode ?? undefined, signal: signal ?? undefined, stderrTail } : {}),
+              ...(storyRecoveryEvent === "step.ceiling_expiry" ? { timedOut: true, exitCode: exitCode ?? undefined, signal: signal ?? undefined, stderrTail } : {}),
             });
           } catch (err) {
             logger.warn(`Recovery event emit failed for story ${story.story_id} (run ${step.run_id}, step ${step.step_id}): ${err instanceof Error ? err.message : String(err)}`, {
@@ -1644,12 +1675,19 @@ export function recoverOrphanedStepsForAgent(
           "UPDATE steps SET status = 'pending', retry_count = ?, updated_at = datetime('now') WHERE id = ?"
         ).run(newRetry, step.id);
       }
-      const stepRecoveryEvent = workerJobId !== undefined ? "step.worker_lost" : "step.timeout";
+      const isCeilingExpiry = workerJobId !== undefined && timedOut === true;
+      const stepRecoveryEvent = workerJobId !== undefined
+        ? (isCeilingExpiry ? "step.ceiling_expiry" : "step.worker_lost")
+        : "step.timeout";
       const stepRecoveryDetail = workerJobId !== undefined
-        ? `Worker ${workerJobId} exited without completing step; reset to pending (retry ${newRetry}/${step.max_retries})`
+        ? (isCeilingExpiry
+          ? `Worker ${workerJobId} hit the worker time ceiling without completing step; reset to pending (retry ${newRetry}/${step.max_retries})`
+          : `Worker ${workerJobId} exited without completing step; reset to pending (retry ${newRetry}/${step.max_retries})`)
         : `Agent terminated without completing step; reset to pending (retry ${newRetry}/${step.max_retries})`;
       const stepPrefix = detailPrefix ? `[${detailPrefix}] ` : "";
-      if (stepRecoveryEvent === "step.worker_lost") {
+      if (stepRecoveryEvent === "step.ceiling_expiry") {
+        db.prepare("UPDATE runs SET ceiling_expiry_count = ceiling_expiry_count + 1 WHERE id = ?").run(step.run_id);
+      } else if (stepRecoveryEvent === "step.worker_lost") {
         db.prepare("UPDATE runs SET worker_lost_count = worker_lost_count + 1 WHERE id = ?").run(step.run_id);
       }
       emitEvent({
@@ -1660,6 +1698,7 @@ export function recoverOrphanedStepsForAgent(
         stepId: step.step_id,
         detail: stepPrefix + stepRecoveryDetail,
         ...(stepRecoveryEvent === "step.worker_lost" ? { exitCode: exitCode ?? undefined, signal: signal ?? undefined, stderrTail } : {}),
+        ...(stepRecoveryEvent === "step.ceiling_expiry" ? { timedOut: true, exitCode: exitCode ?? undefined, signal: signal ?? undefined, stderrTail } : {}),
       });
       logger.info(`Orphaned step reset to pending (retry ${newRetry}/${step.max_retries})`, { runId: step.run_id, stepId: step.step_id, agentId });
       if (timeoutRetryReason) {

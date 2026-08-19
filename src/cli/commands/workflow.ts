@@ -481,7 +481,11 @@ export async function handleWorkflow(
     }
     if (runs.length === 0) { console.log("No workflow runs found."); return true; }
     console.log("Workflow runs:");
-    for (const r of runs) console.log(`  [${r.status.padEnd(9)}] run-${r.id.slice(0, 8).padEnd(10)} ${r.workflowId.padEnd(14)}${r.workerLostCount > 0 ? ` wl:${r.workerLostCount}`.padEnd(6) : "      "}${r.tokensSpent.toLocaleString().padStart(8)} tokens  ${r.task.slice(0, 50)}${r.task.length > 50 ? "..." : ""}`);
+    for (const r of runs) {
+      const wl = r.workerLostCount > 0 ? ` wl:${r.workerLostCount}`.padEnd(6) : "      ";
+      const ce = r.ceilingExpiryCount > 0 ? ` ce:${r.ceilingExpiryCount}`.padEnd(6) : "";
+      console.log(`  [${r.status.padEnd(9)}] run-${r.id.slice(0, 8).padEnd(10)} ${r.workflowId.padEnd(14)}${wl}${ce}${r.tokensSpent.toLocaleString().padStart(8)} tokens  ${r.task.slice(0, 50)}${r.task.length > 50 ? "..." : ""}`);
+    }
     return true;
   }
 
@@ -822,6 +826,7 @@ export async function handleWorkflow(
       if (result.redLedgerLanding) {
         console.log(`Red-ledger landing: row ${result.redLedgerLanding.ledgerRowId}, exit ${result.redLedgerLanding.exitCode}, suite recorded ${result.redLedgerLanding.ledgerCreatedAt}`);
       }
+      if (result.ceilingExpiryCount > 0) console.log(`Rounds expired at ceiling: ${result.ceilingExpiryCount}`);
       if (result.workerLostCount > 0) console.log(`Worker lost: ${result.workerLostCount}`);
       if (result.workspace_mode === "worktree") {
         console.log(`Workspace: ${result.workspace_mode}`);

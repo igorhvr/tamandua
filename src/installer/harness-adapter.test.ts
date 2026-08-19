@@ -684,6 +684,9 @@ sleep 10`,
         // SessionRef extracted from stderr even on timeout kill
         assert.equal(result.sessionRef, "20260518_103004_cdae11");
         assert.equal(result.signal, "SIGTERM");
+        // WLST5: the hermes adapter must expose the timedOut signal so the
+        // scheduler can classify this as a ceiling expiry, not a lost worker.
+        assert.equal(result.timedOut, true);
       } finally {
         if (originalHermesBinary === undefined) {
           delete process.env.TAMANDUA_HERMES_BINARY;
@@ -691,6 +694,53 @@ sleep 10`,
           process.env.TAMANDUA_HERMES_BINARY = originalHermesBinary;
         }
 
+      }
+    });
+
+    it("pins timedOut=true when killed at the worker time ceiling, timedOut=undefined on crash (WLST5 classification signal)", async () => {
+      const { root: tmpDir } = createTempHome("tamandua-test-harness-adapter-hermes-");
+      const originalHermesBinary = process.env.TAMANDUA_HERMES_BINARY;
+
+      // Timeout case: sleeps past the adapter's timeout guard.
+      const sleepyHermes = path.join(tmpDir, "hermes-sleepy");
+      fs.writeFileSync(
+        sleepyHermes,
+        `#!/bin/sh
+sleep 10`,
+        { mode: 0o755 }
+      );
+      process.env.TAMANDUA_HERMES_BINARY = sleepyHermes;
+      try {
+        const timedOutResult = await adapter.runRound("long task", { timeout: 1 });
+        assert.equal(timedOutResult.timedOut, true, "ceiling-killed round must carry timedOut=true");
+      } finally {
+        if (originalHermesBinary === undefined) {
+          delete process.env.TAMANDUA_HERMES_BINARY;
+        } else {
+          process.env.TAMANDUA_HERMES_BINARY = originalHermesBinary;
+        }
+      }
+
+      // Crash case: exits non-zero on its own — NOT a ceiling kill.
+      const crashingHermes = path.join(tmpDir, "hermes-crash");
+      fs.writeFileSync(
+        crashingHermes,
+        `#!/bin/sh
+echo "boom" >&2
+exit 1`,
+        { mode: 0o755 }
+      );
+      process.env.TAMANDUA_HERMES_BINARY = crashingHermes;
+      try {
+        const crashedResult = await adapter.runRound("crash task", { timeout: 5 });
+        assert.equal(crashedResult.exitCode, 1);
+        assert.equal(crashedResult.timedOut, undefined, "crash must NOT carry timedOut");
+      } finally {
+        if (originalHermesBinary === undefined) {
+          delete process.env.TAMANDUA_HERMES_BINARY;
+        } else {
+          process.env.TAMANDUA_HERMES_BINARY = originalHermesBinary;
+        }
       }
     });
 
@@ -718,6 +768,7 @@ exit 1`,
         assert.ok(!result.output.includes("session_id:"));
         assert.equal(result.sessionRef, "20260518_103004_cdae11");
         assert.equal(result.exitCode, 1);
+        assert.equal(result.timedOut, undefined, "crash must not carry the ceiling-expiry signal");
       } finally {
         if (originalHermesBinary === undefined) {
           delete process.env.TAMANDUA_HERMES_BINARY;

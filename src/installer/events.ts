@@ -53,6 +53,8 @@ export interface TamanduaEvent {
   signal?: string;
   stderrTail?: string;
   workerLostCount?: number;
+  /** Rounds the motor itself killed at the worker time ceiling (step.ceiling_expiry). */
+  ceilingExpiryCount?: number;
   passCount?: number;
   failCount?: number;
   window?: string;
@@ -811,6 +813,7 @@ async function fireWebhook(evt: TamanduaEvent): Promise<void> {
     "run.canceled",
     "step.failed",
     "step.worker_lost",
+    "step.ceiling_expiry",
     "pipeline.advanced",
   ]);
 

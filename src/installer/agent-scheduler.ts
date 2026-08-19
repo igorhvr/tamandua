@@ -859,6 +859,7 @@ export async function autoCompleteStepIfRunning(
         undefined, // exitCode
         undefined, // signal
         undefined, // stderrTail
+        undefined, // timedOut — no adapter result on the auto-complete throw path; classify as harness_lost
       );
       if (recoveryResult.recovered > 0 || recoveryResult.failed > 0) {
         logger.info("Orphaned step recovery after auto-complete throw", {
@@ -1364,6 +1365,7 @@ export async function executeDispatchRound(
           result?.exitCode,
           result?.signal,
           result?.stderrTail,
+          result?.timedOut,
         );
         if (recoveryResult.recovered > 0 || recoveryResult.failed > 0) {
           logger.info("Orphaned step recovery after clean harness exit without STATUS", {
@@ -1372,6 +1374,7 @@ export async function executeDispatchRound(
             recovered: recoveryResult.recovered,
             failed: recoveryResult.failed,
             skipped: recoveryResult.skipped,
+            timedOut: result?.timedOut,
           });
         }
       } catch (recoveryErr) {
@@ -1449,6 +1452,7 @@ export async function executeDispatchRound(
         result?.exitCode,
         result?.signal,
         result?.stderrTail,
+        result?.timedOut,
       );
       if (recoveryResult.recovered > 0 || recoveryResult.failed > 0) {
         logger.info("Orphaned step recovery after harness failure", {

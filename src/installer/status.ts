@@ -20,6 +20,8 @@ export interface RunInfo {
   stepSummary?: string;
   tokensSpent: number;
   workerLostCount: number;
+  /** Rounds the motor itself killed at the worker time ceiling (step.ceiling_expiry). */
+  ceilingExpiryCount: number;
   redLedgerLanding?: RedLedgerLanding;
 }
 
@@ -85,7 +87,7 @@ export function getWorkflowStatus(query: string): RunDetail {
   // Try exact id match first (original)
   let row = db
     .prepare(
-      "SELECT id, run_number, workflow_id, task, status, context, created_at, updated_at, tokens_spent, worker_lost_count FROM runs WHERE id = ?",
+      "SELECT id, run_number, workflow_id, task, status, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count FROM runs WHERE id = ?",
     )
     .get(query) as unknown as (RunRow & { run_number: number | null }) | undefined;
 
@@ -93,7 +95,7 @@ export function getWorkflowStatus(query: string): RunDetail {
   if (!row && useOriginal) {
     row = db
       .prepare(
-        "SELECT id, run_number, workflow_id, task, status, context, created_at, updated_at, tokens_spent, worker_lost_count FROM runs WHERE id = ?",
+        "SELECT id, run_number, workflow_id, task, status, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count FROM runs WHERE id = ?",
       )
       .get(stripped) as unknown as (RunRow & { run_number: number | null }) | undefined;
   }
@@ -102,7 +104,7 @@ export function getWorkflowStatus(query: string): RunDetail {
   if (!row) {
     let prefixRows = db
       .prepare(
-        "SELECT id, run_number, workflow_id, task, status, context, created_at, updated_at, tokens_spent, worker_lost_count FROM runs WHERE id LIKE ?",
+        "SELECT id, run_number, workflow_id, task, status, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count FROM runs WHERE id LIKE ?",
       )
       .all(`${query}%`) as unknown as (RunRow & { run_number: number | null })[];
 
@@ -110,7 +112,7 @@ export function getWorkflowStatus(query: string): RunDetail {
     if (prefixRows.length === 0 && useOriginal) {
       prefixRows = db
         .prepare(
-          "SELECT id, run_number, workflow_id, task, status, context, created_at, updated_at, tokens_spent, worker_lost_count FROM runs WHERE id LIKE ?",
+          "SELECT id, run_number, workflow_id, task, status, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count FROM runs WHERE id LIKE ?",
         )
         .all(`${stripped}%`) as unknown as (RunRow & { run_number: number | null })[];
     }
@@ -131,7 +133,7 @@ export function getWorkflowStatus(query: string): RunDetail {
       const num = Number(nMatch[1]);
       row = db
         .prepare(
-          "SELECT id, run_number, workflow_id, task, status, context, created_at, updated_at, tokens_spent, worker_lost_count FROM runs WHERE run_number = ?",
+          "SELECT id, run_number, workflow_id, task, status, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count FROM runs WHERE run_number = ?",
         )
         .get(num) as unknown as (RunRow & { run_number: number | null }) | undefined;
       if (!row) {
@@ -144,14 +146,14 @@ export function getWorkflowStatus(query: string): RunDetail {
   if (!row) {
     let taskRows = db
       .prepare(
-        "SELECT id, run_number, workflow_id, task, status, context, created_at, updated_at, tokens_spent, worker_lost_count FROM runs WHERE task LIKE ?",
+        "SELECT id, run_number, workflow_id, task, status, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count FROM runs WHERE task LIKE ?",
       )
       .all(`%${query}%`) as unknown as (RunRow & { run_number: number | null })[];
 
     if (taskRows.length === 0 && useOriginal) {
       taskRows = db
         .prepare(
-          "SELECT id, run_number, workflow_id, task, status, context, created_at, updated_at, tokens_spent, worker_lost_count FROM runs WHERE task LIKE ?",
+          "SELECT id, run_number, workflow_id, task, status, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count FROM runs WHERE task LIKE ?",
         )
         .all(`%${stripped}%`) as unknown as (RunRow & { run_number: number | null })[];
     }
@@ -180,7 +182,7 @@ export function listRuns(limit = 50): RunInfo[] {
   const db = getDb();
   const rows = db
     .prepare(
-      "SELECT id, run_number, workflow_id, task, status, created_at, updated_at, tokens_spent, worker_lost_count FROM runs ORDER BY created_at DESC LIMIT ?",
+      "SELECT id, run_number, workflow_id, task, status, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count FROM runs ORDER BY created_at DESC LIMIT ?",
     )
     .all(limit) as unknown as (RunRow & { run_number: number | null })[];
 
@@ -198,6 +200,7 @@ export function listRuns(limit = 50): RunInfo[] {
       stepSummary,
       tokensSpent: r.tokens_spent,
       workerLostCount: r.worker_lost_count,
+      ceilingExpiryCount: r.ceiling_expiry_count,
       ...(redLedgerLanding ? { redLedgerLanding } : {}),
     };
   });
@@ -484,6 +487,7 @@ interface RunRow {
   updated_at: string;
   tokens_spent: number;
   worker_lost_count: number;
+  ceiling_expiry_count: number;
 }
 
 function getStepSummary(db: ReturnType<typeof getDb>, runId: string): string {
@@ -631,6 +635,7 @@ function buildRunDetail(
     stepSummary,
     tokensSpent: row.tokens_spent,
     workerLostCount: row.worker_lost_count,
+    ceilingExpiryCount: row.ceiling_expiry_count,
     ...(redLedgerLanding ? { redLedgerLanding } : {}),
     steps: stepInfos,
     stories: storyInfos.length > 0 ? storyInfos : undefined,

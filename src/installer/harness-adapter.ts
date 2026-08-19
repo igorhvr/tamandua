@@ -603,11 +603,13 @@ class HermesHarnessAdapter implements HarnessAdapter {
     // harness is killed after step completion.  Only fatal spawn errors
     // (child.on("error")) still reject — those go to the scheduler's catch
     // block which can attempt stderr-based sessionRef extraction.
+    let timeoutTimerFired = false;
     const exitInfo = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
       let settled = false;
       const timer = setTimeout(() => {
         if (settled) return;
         settled = true;
+        timeoutTimerFired = true;
         if (pgid) {
           safeKillPgid(pgid, "SIGTERM");
           setTimeout(() => safeKillPgid(pgid, "SIGKILL"), 5000).unref();
@@ -779,6 +781,7 @@ class HermesHarnessAdapter implements HarnessAdapter {
       redactedIndices: preview.redactedIndices,
       promptElided: preview.promptElided,
       stderrTail,
+      timedOut: timeoutTimerFired || undefined,
     };
   }
 }

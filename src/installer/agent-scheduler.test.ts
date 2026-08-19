@@ -9,6 +9,7 @@ import assert from "node:assert/strict";
 import { describe, it, afterEach, beforeEach } from "node:test";
 import fs from "node:fs";
 import path from "node:path";
+import crypto from "node:crypto";
 
 import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
 import {
@@ -22,10 +23,14 @@ import {
   _pendingSweepTimerCount,
   _hasPendingSweepTimer,
   _schedulerGeneration,
+  executeDispatchRound,
   DISPATCH_INTERVAL_MS,
   HARNESS_TEARDOWN_GRACE_MS,
   getRunTeardownGraceMs,
 } from "../../dist/installer/agent-scheduler.js";
+import { getDb } from "../../dist/db.js";
+import { getRunEvents } from "../../dist/installer/events.js";
+import { assertStatePathIsolation } from "../../dist/lib/test-guard.js";
 import type { SetupAgentCronsOptions, NudgeResult } from "../../dist/installer/agent-scheduler.js";
 import type { WorkflowSpec } from "../../dist/installer/types.js";
 
@@ -688,5 +693,144 @@ describe("removeRunCrons sweep timer scheduling", () => {
         `cycle ${i}: end-of-cycle shutdown must leave zero pending sweep timers`,
       );
     }
+  });
+});
+
+// ── WLST5 round-termination classification ──────────────────────────
+// A work round that ends without a STATUS marker is recovered as an
+// orphaned step. The recovery must classify WHY the round ended: a round
+// the motor itself killed at the worker time ceiling (adapter timedOut:
+// true) is a ceiling expiry (step.ceiling_expiry, runs.ceiling_expiry_
+// count), while a round whose harness process died on its own (crash,
+// exit 1) is a harness loss (step.worker_lost, runs.worker_lost_count).
+// This is the regression net for the WLST5 counter split — without it,
+// both shapes tick worker_lost_count and an operator cannot tell a
+// productive ceiling-killed round from a genuinely lost worker.
+
+describe("executeDispatchRound round-termination classification (WLST5)", () => {
+  let tempHome: string;
+  let saved: Record<string, string | undefined>;
+
+  beforeEach(() => {
+    tempHome = tamanduaTempDir("tamandua-classify-");
+    const stateDir = path.join(tempHome, ".tamandua");
+    fs.mkdirSync(stateDir, { recursive: true });
+    saved = {
+      HOME: process.env.HOME,
+      TAMANDUA_STATE_DIR: process.env.TAMANDUA_STATE_DIR,
+      TAMANDUA_DB_PATH: process.env.TAMANDUA_DB_PATH,
+      TAMANDUA_PI_BINARY: process.env.TAMANDUA_PI_BINARY,
+    };
+    process.env.HOME = tempHome;
+    process.env.TAMANDUA_STATE_DIR = stateDir;
+    process.env.TAMANDUA_DB_PATH = path.join(stateDir, "tamandua.db");
+    // Guard awareness (test-isolation-guard): this suite emits events and
+    // reads the run DB through the same isolated temp state dir it creates.
+    assert.doesNotThrow(() =>
+      assertStatePathIsolation(path.join(stateDir, "tamandua.db"), "agent-scheduler-wlst5-classification"),
+    );
+  });
+
+  afterEach(() => {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    shutdownAllCrons();
+    fs.rmSync(tempHome, { recursive: true, force: true });
+  });
+
+  /**
+   * Seed a running run with a pending step and a fake pi harness that
+   * claims the step (status → running, claim_job_id → the dispatch job id,
+   * exactly as the real claim CLI does) and then either sleeps past the
+   * round timeout ("ceiling" — the motor's own ceiling timer kills it) or
+   * exits 1 on its own ("crash" — genuine harness failure).
+   */
+  function setupRound(die: "ceiling" | "crash"): { runId: string; jobId: string; workdir: string } {
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    const workdir = path.join(tempHome, "work");
+    fs.mkdirSync(workdir, { recursive: true });
+
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at) VALUES (?, 'test-wf', 'classify task', 'running', ?, ?, ?)",
+    ).run(runId, JSON.stringify({ working_directory_for_harness: workdir }), now, now);
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, created_at, updated_at) VALUES (?, ?, 'step-1', 'test-wf_test-agent', 0, 'do work', 'STATUS', 'pending', ?, ?)",
+    ).run(`${runId}-step`, runId, now, now);
+
+    // Same job-id shape as buildJobId("test-wf", runId, "test-agent").
+    const jobId = `tamandua-test-wf-${runId}-test-agent`;
+
+    // The fake harness: a node script (shebang-executed by the adapter's
+    // shell wrapper) that claims the pending step against the run DB, then
+    // dies per the requested termination shape. FAKE_PI_DIE is inherited
+    // by the child through the adapter's env merge.
+    const fakePi = path.join(tempHome, "pi-mock");
+    fs.writeFileSync(
+      fakePi,
+      `#!/usr/bin/env node
+import { DatabaseSync } from "node:sqlite";
+const db = new DatabaseSync(process.env.TAMANDUA_DB_PATH);
+db.exec("PRAGMA busy_timeout = 5000");
+db.prepare("UPDATE steps SET status = 'running', claim_job_id = ? WHERE status = 'pending'").run(process.env.TAMANDUA_WORKER_JOB_ID);
+if (process.env.FAKE_PI_DIE === "ceiling") {
+  await new Promise((resolve) => setTimeout(resolve, 30000));
+}
+process.exit(1);
+`,
+      { mode: 0o755 },
+    );
+    process.env.TAMANDUA_PI_BINARY = fakePi;
+    process.env.FAKE_PI_DIE = die;
+
+    return { runId, jobId, workdir };
+  }
+
+  it("classifies a ceiling-killed round as step.ceiling_expiry and does NOT tick worker_lost_count", async () => {
+    const { runId, jobId, workdir } = setupRound("ceiling");
+
+    // agent.timeoutSeconds=1 → the adapter's ceiling timer fires after 1s.
+    await executeDispatchRound(
+      { id: jobId, workflowId: "test-wf", runId, agentId: "test-wf_test-agent", harnessType: "pi", workingDirectoryForHarness: workdir, createdAt: "" },
+      { id: "test-agent", model: "fake", workspace: { baseDir: "." }, timeoutSeconds: 1 },
+    );
+
+    const db = getDb();
+    const row = db.prepare("SELECT worker_lost_count, ceiling_expiry_count FROM runs WHERE id = ?").get(runId) as { worker_lost_count: number; ceiling_expiry_count: number };
+    assert.equal(row.worker_lost_count, 0, "a ceiling expiry must NOT tick worker_lost_count");
+    assert.equal(row.ceiling_expiry_count, 1, "a ceiling expiry must tick ceiling_expiry_count");
+
+    const events = getRunEvents(runId);
+    const ceilingExpiries = events.filter((e) => e.event === "step.ceiling_expiry");
+    assert.equal(ceilingExpiries.length, 1, "should emit exactly one step.ceiling_expiry event");
+    assert.equal(ceilingExpiries[0].timedOut, true, "step.ceiling_expiry must carry timedOut=true");
+    assert.equal(ceilingExpiries[0].signal, "SIGTERM");
+    const workerLost = events.filter((e) => e.event === "step.worker_lost");
+    assert.equal(workerLost.length, 0, "a ceiling expiry must NOT emit step.worker_lost");
+  });
+
+  it("classifies a crashed round as step.worker_lost and ticks worker_lost_count (harness_lost)", async () => {
+    const { runId, jobId, workdir } = setupRound("crash");
+
+    await executeDispatchRound(
+      { id: jobId, workflowId: "test-wf", runId, agentId: "test-wf_test-agent", harnessType: "pi", workingDirectoryForHarness: workdir, createdAt: "" },
+      { id: "test-agent", model: "fake", workspace: { baseDir: "." }, timeoutSeconds: 1 },
+    );
+
+    const db = getDb();
+    const row = db.prepare("SELECT worker_lost_count, ceiling_expiry_count FROM runs WHERE id = ?").get(runId) as { worker_lost_count: number; ceiling_expiry_count: number };
+    assert.equal(row.worker_lost_count, 1, "a harness crash must tick worker_lost_count");
+    assert.equal(row.ceiling_expiry_count, 0, "a harness crash must NOT tick ceiling_expiry_count");
+
+    const events = getRunEvents(runId);
+    const workerLost = events.filter((e) => e.event === "step.worker_lost");
+    assert.equal(workerLost.length, 1, "should emit exactly one step.worker_lost event");
+    assert.equal(workerLost[0].timedOut, undefined, "step.worker_lost must not carry timedOut for a crash");
+    assert.equal(workerLost[0].exitCode, 1);
+    const ceilingExpiries = events.filter((e) => e.event === "step.ceiling_expiry");
+    assert.equal(ceilingExpiries.length, 0, "a crash must NOT emit step.ceiling_expiry");
   });
 });

@@ -1105,6 +1105,155 @@ describe("recoverOrphanedStepsForAgent — US-005 worker_lost_count aggregation"
     const row = db.prepare("SELECT worker_lost_count FROM runs WHERE id = ?").get(runId) as { worker_lost_count: number };
     assert.equal(row.worker_lost_count, 3, "should accumulate to 3");
   });
+
+  it("WLST5: timedOut recovery increments ceiling_expiry_count, NOT worker_lost_count (single step)", async () => {
+    const { recoverOrphanedStepsForAgent } = await import("../dist/installer/step-ops.js");
+    const db = getDb();
+
+    const runId = crypto.randomUUID();
+    const stepRowId = crypto.randomUUID();
+    const now = new Date().toISOString();
+
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, worker_lost_count, ceiling_expiry_count, created_at, updated_at) VALUES (?, 'wf-dead', 'task', 'running', '{}', 0, 0, 0, ?, ?)",
+    ).run(runId, now, now);
+    db.prepare(
+      `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status,
+        retry_count, max_retries, claim_job_id, created_at, updated_at)
+       VALUES (?, ?, 'work', 'wf-dead_dev', 0, 'work', '', 'running', 0, 3, 'job-wlst5-r1', ?, ?)`,
+    ).run(stepRowId, runId, now, now);
+
+    // Motor ceiling kill: workerJobId present + timedOut=true.
+    const result = recoverOrphanedStepsForAgent(
+      "wf-dead_dev", runId, 0, undefined, undefined,
+      "job-wlst5-r1", undefined, // abandonReason
+      undefined, null, "SIGTERM", undefined,
+      true, // timedOut — the adapter's ceiling signal
+    );
+    assert.equal(result.recovered, 1);
+
+    const row = db.prepare("SELECT worker_lost_count, ceiling_expiry_count FROM runs WHERE id = ?").get(runId) as { worker_lost_count: number; ceiling_expiry_count: number };
+    assert.equal(row.ceiling_expiry_count, 1, "ceiling expiry must tick ceiling_expiry_count");
+    assert.equal(row.worker_lost_count, 0, "ceiling expiry must NOT tick worker_lost_count");
+
+    // Event shape: step.ceiling_expiry carries timedOut=true plus forensics.
+    const events = getRunEvents(runId);
+    const ceilingExpiries = events.filter((e) => e.event === "step.ceiling_expiry");
+    assert.equal(ceilingExpiries.length, 1, "should emit exactly one step.ceiling_expiry event");
+    assert.equal(ceilingExpiries[0].timedOut, true);
+    assert.equal(ceilingExpiries[0].signal, "SIGTERM");
+    assert.equal(events.filter((e) => e.event === "step.worker_lost").length, 0, "no step.worker_lost for a ceiling expiry");
+  });
+
+  it("WLST5: timedOut recovery increments ceiling_expiry_count, NOT worker_lost_count (story-level)", async () => {
+    const { recoverOrphanedStepsForAgent } = await import("../dist/installer/step-ops.js");
+    const db = getDb();
+
+    const runId = crypto.randomUUID();
+    const stepRowId = crypto.randomUUID();
+    const storyId = crypto.randomUUID();
+    const now = new Date().toISOString();
+
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, worker_lost_count, ceiling_expiry_count, created_at, updated_at) VALUES (?, 'wf-dead', 'task', 'running', '{}', 0, 0, 0, ?, ?)",
+    ).run(runId, now, now);
+    db.prepare(
+      `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status,
+        retry_count, max_retries, type, current_story_id, claim_job_id, created_at, updated_at)
+       VALUES (?, ?, 'work', 'wf-dead_dev', 0, 'work', '', 'running', 0, 3, 'loop', ?, 'job-wlst5-r2', ?, ?)`,
+    ).run(stepRowId, runId, storyId, now, now);
+    db.prepare(
+      `INSERT INTO stories (id, run_id, story_index, story_id, title, description, acceptance_criteria,
+        status, retry_count, max_retries, abandoned_count, created_at, updated_at)
+       VALUES (?, ?, 0, 'US-001', 'Test story', '', '[]', 'pending', 0, 3, 0, ?, ?)`,
+    ).run(storyId, runId, now, now);
+
+    const result = recoverOrphanedStepsForAgent(
+      "wf-dead_dev", runId, 0, undefined, undefined,
+      "job-wlst5-r2", undefined, // abandonReason
+      undefined, null, "SIGTERM", undefined,
+      true, // timedOut — ceiling expiry
+    );
+    assert.equal(result.recovered, 1);
+
+    const row = db.prepare("SELECT worker_lost_count, ceiling_expiry_count FROM runs WHERE id = ?").get(runId) as { worker_lost_count: number; ceiling_expiry_count: number };
+    assert.equal(row.ceiling_expiry_count, 1, "story-level ceiling expiry must tick ceiling_expiry_count");
+    assert.equal(row.worker_lost_count, 0, "story-level ceiling expiry must NOT tick worker_lost_count");
+  });
+
+  it("WLST5: ceiling_expiry_count has default 0 on new runs and accumulates", async () => {
+    const { recoverOrphanedStepsForAgent } = await import("../dist/installer/step-ops.js");
+    const db = getDb();
+
+    const runId = crypto.randomUUID();
+    const now = new Date().toISOString();
+
+    // Insert without explicit ceiling_expiry_count — defaults to 0.
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 'wf-dead', 'task', 'running', '{}', 0, ?, ?)",
+    ).run(runId, now, now);
+    let row = db.prepare("SELECT ceiling_expiry_count FROM runs WHERE id = ?").get(runId) as { ceiling_expiry_count: number };
+    assert.equal(row.ceiling_expiry_count, 0, "should default to 0");
+
+    // Lose two steps at the ceiling — counter accumulates.
+    for (let i = 0; i < 2; i++) {
+      const stepRowId = crypto.randomUUID();
+      db.prepare(
+        `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status,
+          retry_count, max_retries, claim_job_id, created_at, updated_at)
+         VALUES (?, ?, 'work', 'wf-dead_dev', ?, 'work', '', 'running', ?, 3, 'job-wlst5-acc', ?, ?)`,
+      ).run(stepRowId, runId, i, i, now, now);
+
+      const result = recoverOrphanedStepsForAgent(
+        "wf-dead_dev", runId, 0, undefined, undefined,
+        "job-wlst5-acc", undefined, // abandonReason
+        undefined, null, "SIGTERM", undefined,
+        true, // timedOut — ceiling expiry
+      );
+      assert.equal(result.recovered, 1);
+    }
+
+    row = db.prepare("SELECT ceiling_expiry_count FROM runs WHERE id = ?").get(runId) as { ceiling_expiry_count: number };
+    assert.equal(row.ceiling_expiry_count, 2, "ceiling expiries should accumulate");
+  });
+
+  it("WLST5: non-timedOut workerJobId recovery stays worker_lost (backward compatibility)", async () => {
+    const { recoverOrphanedStepsForAgent } = await import("../dist/installer/step-ops.js");
+    const db = getDb();
+
+    const runId = crypto.randomUUID();
+    const stepRowId = crypto.randomUUID();
+    const now = new Date().toISOString();
+
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, worker_lost_count, ceiling_expiry_count, created_at, updated_at) VALUES (?, 'wf-dead', 'task', 'running', '{}', 0, 0, 0, ?, ?)",
+    ).run(runId, now, now);
+    db.prepare(
+      `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status,
+        retry_count, max_retries, claim_job_id, created_at, updated_at)
+       VALUES (?, ?, 'work', 'wf-dead_dev', 0, 'work', '', 'running', 0, 3, 'job-wlst5-bc', ?, ?)`,
+    ).run(stepRowId, runId, now, now);
+
+    // Callers that never pass timedOut (no_work_release, liveness_detected,
+    // pre-WLST5 paths) must behave exactly as before: worker_lost + tick.
+    const result = recoverOrphanedStepsForAgent(
+      "wf-dead_dev", runId, 0, undefined, undefined,
+      "job-wlst5-bc", "liveness_detected", // abandonReason
+      "liveness-detected", 137, "SIGKILL", "stderr tail",
+      undefined, // timedOut omitted
+    );
+    assert.equal(result.recovered, 1);
+
+    const row = db.prepare("SELECT worker_lost_count, ceiling_expiry_count FROM runs WHERE id = ?").get(runId) as { worker_lost_count: number; ceiling_expiry_count: number };
+    assert.equal(row.worker_lost_count, 1, "non-timedOut recovery must still tick worker_lost_count");
+    assert.equal(row.ceiling_expiry_count, 0, "non-timedOut recovery must NOT tick ceiling_expiry_count");
+
+    const events = getRunEvents(runId);
+    const workerLost = events.filter((e) => e.event === "step.worker_lost");
+    assert.equal(workerLost.length, 1);
+    assert.equal(workerLost[0].signal, "SIGKILL");
+    assert.equal(workerLost[0].timedOut, undefined);
+  });
 });
 
 // ══════════════════════════════════════════════════════════════════════

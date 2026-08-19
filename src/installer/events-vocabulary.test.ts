@@ -25,7 +25,7 @@ function requireIdentityFields(evt: TamanduaEvent): { runId: string; ts: string 
   return { runId: evt.runId, ts: evt.ts };
 }
 
-/** If tokensSpent/workerLostCount/reason are dropped from TamanduaEvent, this fails typecheck. */
+/** If tokensSpent/workerLostCount/ceilingExpiryCount/reason are dropped from TamanduaEvent, this fails typecheck. */
 const TAMANDUA_EVENT_PAYLOAD_FIELDS: TamanduaEvent = {
   ts: "static-pin",
   event: "run.canceled",
@@ -33,6 +33,7 @@ const TAMANDUA_EVENT_PAYLOAD_FIELDS: TamanduaEvent = {
   workflowId: "static-pin",
   tokensSpent: 0,
   workerLostCount: 0,
+  ceilingExpiryCount: 0,
   reason: "static-pin",
 };
 void TAMANDUA_EVENT_PAYLOAD_FIELDS;
@@ -85,6 +86,7 @@ describe("events vocabulary and terminal-event contract (CNEV US-004)", () => {
       context TEXT NOT NULL DEFAULT '{}',
       tokens_spent INTEGER NOT NULL DEFAULT 0,
       worker_lost_count INTEGER NOT NULL DEFAULT 0,
+      ceiling_expiry_count INTEGER NOT NULL DEFAULT 0,
       scheduling_status TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -156,10 +158,11 @@ describe("events vocabulary and terminal-event contract (CNEV US-004)", () => {
     tokensSpent = 0,
     workerLostCount = 0,
     status = "running",
+    ceilingExpiryCount = 0,
   ): void {
     db.prepare(
-      "INSERT INTO runs (id, workflow_id, task, status, tokens_spent, worker_lost_count) VALUES (?, ?, ?, ?, ?, ?)",
-    ).run(runId, "wf-vocab", "vocabulary contract test", status, tokensSpent, workerLostCount);
+      "INSERT INTO runs (id, workflow_id, task, status, tokens_spent, worker_lost_count, ceiling_expiry_count) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    ).run(runId, "wf-vocab", "vocabulary contract test", status, tokensSpent, workerLostCount, ceilingExpiryCount);
   }
 
   it("pins the terminal-event vocabulary: {run.started, run.completed, run.failed, run.canceled, run.deleted, run.force_failed}", () => {
@@ -187,9 +190,9 @@ describe("events vocabulary and terminal-event contract (CNEV US-004)", () => {
     );
   });
 
-  it("run.completed/run.failed/run.canceled carry ts+runId+tokensSpent+workerLostCount; run.canceled also carries reason", () => {
+  it("run.completed/run.failed/run.canceled carry ts+runId+tokensSpent+workerLostCount+ceilingExpiryCount; run.canceled also carries reason", () => {
     const runId = "run-vocab-terminal-001";
-    seedRun(runId, 41, 2);
+    seedRun(runId, 41, 2, "running", 3);
 
     emitRunTerminalEvent({ event: "run.completed", runId, workflowId: "wf-vocab" });
     emitRunTerminalEvent({ event: "run.failed", runId, workflowId: "wf-vocab", detail: "boom" });
@@ -206,25 +209,28 @@ describe("events vocabulary and terminal-event contract (CNEV US-004)", () => {
       assert.ok(identity.ts.length > 0, `${evt.event} must carry a non-empty ts`);
     }
 
-    // completed: tokensSpent + workerLostCount, no reason
+    // completed: tokensSpent + workerLostCount + ceilingExpiryCount, no reason
     assert.equal(completed.event, "run.completed");
     assert.equal(completed.workflowId, "wf-vocab");
     assert.equal(completed.tokensSpent, 41);
     assert.equal(completed.workerLostCount, 2);
+    assert.equal(completed.ceilingExpiryCount, 3);
     assert.ok(!("reason" in completed), "run.completed must not carry reason");
 
-    // failed: tokensSpent + workerLostCount, no reason
+    // failed: tokensSpent + workerLostCount + ceilingExpiryCount, no reason
     assert.equal(failed.event, "run.failed");
     assert.equal(failed.detail, "boom");
     assert.equal(failed.tokensSpent, 41);
     assert.equal(failed.workerLostCount, 2);
+    assert.equal(failed.ceilingExpiryCount, 3);
     assert.ok(!("reason" in failed), "run.failed must not carry reason");
 
-    // canceled: reason + tokensSpent + workerLostCount
+    // canceled: reason + tokensSpent + workerLostCount + ceilingExpiryCount
     assert.equal(canceled.event, "run.canceled");
     assert.equal(canceled.reason, "cli-stop");
     assert.equal(canceled.tokensSpent, 41);
     assert.equal(canceled.workerLostCount, 2);
+    assert.equal(canceled.ceilingExpiryCount, 3);
   });
 
   it("run.force_failed carries reason + runId + ts; run.deleted carries runId + ts", async () => {
