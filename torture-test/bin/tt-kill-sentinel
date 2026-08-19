@@ -113,6 +113,9 @@ esac
 
 # proc_state <pid> — /proc/<pid>/stat field 3 (state char) via the last-')'
 # slice (comm may contain spaces/parens). 'Z' = zombie (signalled, unreaped).
+# linux-only /proc read (MACP3 US-003): guarded for Darwin — on a /proc-less
+# host the redirect fails and we return 1 ("state unknown"), which callers
+# already treat conservatively.
 proc_state() {
   local pid=$1 stat rest
   stat=$(<"/proc/$pid/stat") 2>/dev/null || return 1
@@ -122,6 +125,9 @@ proc_state() {
 
 # proc_start_time <pid> — /proc/<pid>/stat field 22 (starttime). Same
 # semantics as bin/tt-process-identity.mjs.
+# linux-only /proc read (MACP3 US-003): guarded for Darwin — on a /proc-less
+# host the redirect fails and we return 1 ("start time unknown"), which
+# callers already treat conservatively.
 proc_start_time() {
   local pid=$1 stat rest
   local -a fields=()
@@ -138,6 +144,9 @@ proc_start_time() {
 sentinel_is_alive() {
   local pid=$1 state
   kill -0 "$pid" 2>/dev/null || return 1
+  # linux-only /proc/<pid> existence check (MACP3 US-003): guarded for Darwin
+  # by the short-circuit — on a /proc-less host this "fails closed"
+  # (sentinel treated as nonexitent/dead) which is the conservative outcome.
   [ -e "/proc/$pid" ] || return 1
   state=$(proc_state "$pid") || return 1
   [ "$state" != "Z" ] || return 1
@@ -293,7 +302,7 @@ fi
 DEATH_DETAIL=""
 if ! kill -0 "$SENTINEL_PID" 2>/dev/null; then
   DEATH_DETAIL="kill -0 failed: sentinel pid $SENTINEL_PID is not alive"
-elif [ ! -e "/proc/$SENTINEL_PID" ]; then
+elif [ ! -e "/proc/$SENTINEL_PID" ]; then  # linux-only /proc check (MACP3 US-003): guarded for Darwin — absent procfs ⇒ always "missing" (conservative)
   DEATH_DETAIL="/proc/$SENTINEL_PID missing"
 else
   STATE="$(proc_state "$SENTINEL_PID")" || STATE="(unreadable)"

@@ -903,6 +903,20 @@ function validateHostProfile(profile) {
   return errors;
 }
 
+// MACP3 US-006: fail-closed predicate semantics. This loader NEVER throws for
+// a missing/invalid host profile — it returns a { hostProfileFailure: {...} }
+// marker instead, so startCampaign can still create the campaign and
+// applyHostRequirements can mark the predicate-bound selected cases
+// TEST_INFRA_FAIL (category 'host-profile-missing') rather than aborting the
+// run or (worse) silently evaluating every `requires` predicate to false and
+// producing vacuous NOT_RUN(predicate) skips that let a bare campaign report
+// GREEN with zero cells executed. A valid profile is returned as-is; a
+// profile that is merely unneeded (no selected case has `requires`) returns
+// null exactly as before.
+function isHostProfileFailure(value) {
+  return isObject(value) && Object.hasOwn(value, 'hostProfileFailure');
+}
+
 function loadRequiredHostProfile(cases) {
   if (!cases.some(hasRequirements)) return null;
   let profile;
@@ -916,11 +930,21 @@ function loadRequiredHostProfile(cases) {
     }
     profile = JSON.parse(fs.readFileSync(HOST_PROFILE_PATH, 'utf8'));
   } catch (error) {
-    throw new Error(`cannot load required host profile ${HOST_PROFILE_PATH}: ${error.message}`);
+    return {
+      hostProfileFailure: {
+        category: 'host-profile-missing',
+        message: `cannot load required host profile ${HOST_PROFILE_PATH}: ${error.message}`,
+      },
+    };
   }
   const errors = validateHostProfile(profile);
   if (errors.length > 0) {
-    throw new Error(`cannot load required host profile ${HOST_PROFILE_PATH}: ${errors.join('; ')}`);
+    return {
+      hostProfileFailure: {
+        category: 'host-profile-missing',
+        message: `cannot load required host profile ${HOST_PROFILE_PATH}: ${errors.join('; ')}`,
+      },
+    };
   }
   return profile;
 }
@@ -1036,20 +1060,43 @@ function evaluateRequirements(requires, profile) {
 function applyHostRequirements(manifest, state, profile) {
   if (profile === null) return;
   let terminalTimestamp = null;
+  const profileFailure = isHostProfileFailure(profile) ? profile.hostProfileFailure : null;
   for (let index = 0; index < manifest.cases.length; index += 1) {
     const record = manifest.cases[index];
     if (state.cases[index].phase === 'terminal') continue;
     if (!hasRequirements(record)) continue;
-    const evidence = evaluateRequirements(record.requires, profile);
-    if (evidence.length === 0) continue;
+    if (profileFailure === null) {
+      // Valid profile: exactly the pre-MACP3 behavior is preserved.
+      const evidence = evaluateRequirements(record.requires, profile);
+      if (evidence.length === 0) continue;
+      terminalTimestamp ??= utcTimestamp();
+      Object.assign(state.cases[index], {
+        phase: 'terminal',
+        outcome: 'NOT_RUN',
+        terminal_at: terminalTimestamp,
+        reason: {
+          category: 'predicate',
+          evidence,
+        },
+      });
+      continue;
+    }
+    // MACP3 US-006: fail CLOSED. The host profile could not be loaded, so
+    // predicate evaluation is IMPOSSIBLE — never silently treat every
+    // predicate as unsatisfied (that would produce NOT_RUN(predicate)
+    // skips and, with all cells skipped, a vacuous bare GREEN). The
+    // profile-bound cell is TEST_INFRA_FAIL (host-profile-missing) so
+    // hasInfrastructureFailure forces verdictExitCode to RED/INFRA
+    // (exit 2). A case NOT requiring the host profile is untouched.
     terminalTimestamp ??= utcTimestamp();
     Object.assign(state.cases[index], {
       phase: 'terminal',
-      outcome: 'NOT_RUN',
+      outcome: 'TEST_INFRA_FAIL',
       terminal_at: terminalTimestamp,
       reason: {
-        category: 'predicate',
-        evidence,
+        category: profileFailure.category,
+        message: profileFailure.message,
+        evidence: [],
       },
     });
   }
@@ -1207,11 +1254,14 @@ function processIsAlive(pid) {
   try {
     process.kill(pid, 0);
     try {
+      // linux-only /proc/<pid>/stat read (MACP3 US-003): Darwin has no
+      // procfs; the comment below already documents that kill(0) is the
+      // portable fallback when the read fails.
       const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
       const closingParenthesis = stat.lastIndexOf(')');
       if (closingParenthesis >= 0 && stat.slice(closingParenthesis + 2).startsWith('Z ')) return false;
     } catch {
-      // procfs is Linux-specific; kill(0) remains the portable fallback.
+      // procfs is Linux-specific; kill(0) remains the portable fallback (Darwin-safe, MACP3 US-003).
     }
     return true;
   } catch (error) {
@@ -1221,6 +1271,9 @@ function processIsAlive(pid) {
 
 function processIdentity(pid) {
   try {
+    // linux-only /proc/<pid>/stat read (MACP3 US-003): guarded for Darwin by
+    // the catch — on a /proc-less host this returns null ("identity
+    // unreadable"), matching the not-a-live-process contract.
     const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
     const closingParenthesis = stat.lastIndexOf(')');
     if (closingParenthesis < 0) return null;
@@ -1242,6 +1295,9 @@ function processMatchesIdentity(pid, identity) {
 // field 5 (sliced at the LAST ')' because comm may contain spaces/parens).
 function processStartTimeOf(pid) {
   try {
+    // linux-only /proc/<pid>/stat read (MACP3 US-003): guarded for Darwin by
+    // the catch — on a /proc-less host this returns null (identity
+    // unrecordable), already handled by callers as "no identity recorded".
     const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
     const closingParenthesis = stat.lastIndexOf(')');
     if (closingParenthesis < 0) return null;
@@ -1255,6 +1311,9 @@ function processStartTimeOf(pid) {
 
 function processGroupOf(pid) {
   try {
+    // linux-only /proc/<pid>/stat read (MACP3 US-003): guarded for Darwin by
+    // the catch — on a /proc-less host this returns null (group unknown),
+    // which callers already treat as "no group recorded".
     const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
     const closingParenthesis = stat.lastIndexOf(')');
     if (closingParenthesis < 0) return null;
@@ -5371,7 +5430,9 @@ function executeDaemonRestart(kind, childEnv) {
   // E3.C.1 US-003: record the daemon provenance (kind + pidfile pid +
   // recorded startTime identity) so the restart teardown demonstrably goes
   // through RECORDED provenance — the controller never resolves the daemon
-  // by /proc/port sweep. daemon-control applies its own provenance + identity
+  // by /proc/port sweep (linux-only conceptual reference; the actual
+  // process-start reads above are individually guarded for Darwin — MACP3
+  // US-003). daemon-control applies its own provenance + identity
   // checks (US-004) to the recorded pid before any signal.
   record.provenance = readDaemonProvenance(kind, childEnv);
   const argv = [DAEMON_CONTROL_PATH, kind, 'restart'];

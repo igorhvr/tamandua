@@ -108,6 +108,9 @@ owned_processes_exist() {
 process_start_time() {
   local pid=$1 details rest
   local -a fields=()
+  # linux-only /proc/<pid>/stat read (MACP3 US-003): Darwin has no procfs;
+  # on failure we return 1 and the watchdog scope is simply not proven
+  # (self-test runs without watchdog coverage rather than hard-failing).
   details=$(<"/proc/$pid/stat") || return 1
   rest=${details##*) }
   read -r -a fields <<<"$rest"
@@ -119,6 +122,9 @@ process_is_ancestor() {
   local ancestor=$1 current=$BASHPID details rest
   local -a fields=()
   while [ "$current" -gt 1 ]; do
+    # linux-only /proc/<pid>/stat read (MACP3 US-003): absent on Darwin, so
+    # ancestry cannot be proven and the scope check degrades to "not trusted"
+    # (same graceful fallback as process_start_time).
     details=$(<"/proc/$current/stat") || return 1
     rest=${details##*) }
     read -r -a fields <<<"$rest"
@@ -148,7 +154,7 @@ watchdog_scope_is_valid() {
   esac
   [ -f "$scope_file" ] || return 1
   [ ! -L "$scope_file" ] || return 1
-  [ -e "/proc/$BASHPID/fd/$scope_fd" ] || return 1
+  [ -e "/proc/$BASHPID/fd/$scope_fd" ] || return 1   # linux-only (MACP3 US-003): /proc absent on Darwin — scope check degrades to not-trusted (no watchdog)
 
   scope_dir=$(dirname -- "$scope_file")
   scope_owner_mode=$(stat -c '%u:%a' -- "$scope_file" 2>/dev/null) || return 1
@@ -156,6 +162,8 @@ watchdog_scope_is_valid() {
   [ "$scope_owner_mode" = "$(id -u):600" ] || return 1
   [ "$scope_dir_owner_mode" = "$(id -u):700" ] || return 1
   scope_identity=$(stat -c '%d:%i' -- "$scope_file" 2>/dev/null) || return 1
+  # linux-only /proc/<fd> identity (MACP3 US-003): absent on Darwin — again,
+  # the whole scope check just refuses, which is the graceful no-watchdog path.
   fd_identity=$(stat -Lc '%d:%i' -- "/proc/$BASHPID/fd/$scope_fd" 2>/dev/null) || return 1
   [ "$scope_identity" = "$fd_identity" ] || return 1
 
@@ -175,6 +183,8 @@ watchdog_scope_is_valid() {
   supervisor_current_start=$(process_start_time "$supervisor_pid") || return 1
   [ "$supervisor_current_start" = "$supervisor_start" ] || return 1
   supervisor_argv=()
+  # linux-only /proc/<pid>/cmdline read (MACP3 US-003): absent on Darwin —
+  # returns 1 (scope not proven) instead of hard-failing.
   while IFS= read -r -d '' supervisor_arg || [ -n "${supervisor_arg:-}" ]; do
     supervisor_argv+=("$supervisor_arg")
   done <"/proc/$supervisor_pid/cmdline" || return 1

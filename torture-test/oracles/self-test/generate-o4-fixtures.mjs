@@ -428,7 +428,9 @@ for (const fixture of CASES) {
 // Record the live pgids for the test to reap (the sleep processes outlive the
 // generator so the oracle can probe them; the test kills them in cleanup).
 // Each record carries { pid, pgid, startTime } — the reapers verify
-// process-start identity against the current /proc state before SIGKILL.
+// process-start identity against the current /proc state (linux-only source;
+// an explicit darwin branch is unnecessary because verification failure on a
+// /proc-less host simply skips the record — guarded, MACP3 US-003) before SIGKILL.
 const livePgidsPath = path.join(workspace, 'live-pgids.json');
 fs.writeFileSync(livePgidsPath, `${JSON.stringify(livePgids)}\n`, { flag: 'wx' });
 

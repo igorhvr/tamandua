@@ -189,6 +189,14 @@ type SelfGroupSnapshot = {
 };
 
 function snapshotSelfGroup(): SelfGroupSnapshot {
+  // /proc introspection below is linux-only (MACP3 US-003): Darwin has no
+  // procfs, so this is an explicit Darwin branch — return an empty snapshot
+  // (no leader, no members) and let assertSelfGroupSurvived no-op on it.
+  // Behavior on linux is unchanged: the full /proc-scanned member set is
+  // still built and asserted.
+  if (process.platform !== "linux") {
+    return { pgid: 0, leaderStartTime: null, members: [] };
+  }
   const pgid = ownProcessGroup();
   assert.ok(pgid !== null && pgid > 0, `battery's own process group must be readable, got ${String(pgid)}`);
   // The group leader is pid == pgid. Record its identity at snapshot time: a
@@ -209,6 +217,9 @@ function snapshotSelfGroup(): SelfGroupSnapshot {
 }
 
 function assertSelfGroupSurvived(before: SelfGroupSnapshot): void {
+  // Darwin branch (MACP3 US-003): the linux-only /proc introspection was
+  // skipped, so there is nothing to assert — no-op on a /proc-less host.
+  if (before.members.length === 0 && before.leaderStartTime === null) return;
   const pgidAfter = ownProcessGroup();
   assert.equal(pgidAfter, before.pgid,
     `battery's own process group changed across the campaign: ${String(before.pgid)} -> ${String(pgidAfter)}`);

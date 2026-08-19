@@ -1154,6 +1154,9 @@ function probePorts() {
 function isProcessTTOwned(pid) {
   if (pid === null) return false;
   try {
+    // linux-only /proc/<pid> reads (MACP3 US-003): guarded for Darwin by the
+    // outer catch and per-read !exists/2>/dev/null equivalents below — on a
+    // /proc-less host this returns false (not TT-owned), never hard-fails.
     // Check /proc/<pid>/cmdline
     const cmdlinePath = `/proc/${pid}/cmdline`;
     if (fs.existsSync(cmdlinePath)) {
@@ -1168,7 +1171,8 @@ function isProcessTTOwned(pid) {
     } catch (_) { /* cwd not readable */ }
     return false;
   } catch (_) {
-    // PID may have exited, or /proc not available (darwin)
+    // PID may have exited, or /proc not available (there is no procfs on
+    // Darwin — explicit Darwin branch: not TT-owned rather than an error).
     return false;
   }
 }

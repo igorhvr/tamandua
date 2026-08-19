@@ -22,14 +22,26 @@ function processExists(pid) {
 }
 
 function processStartTime(pid) {
-  const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
-  const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
-  return fields[19];
+  // /proc/<pid>/stat field 22 (starttime) is linux-only. On Darwin /proc is
+  // absent, so this is an explicit Darwin branch: return null ("cannot
+  // introspect"). Linux behavior is unchanged — the read below still
+  // resolves live pids exactly as before. (MACP3 US-003)
+  if (process.platform !== 'linux') return null;
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+    return fields[19];
+  } catch {
+    return null;
+  }
 }
 
 function stopOwnedProcess(pid, ownershipMarker) {
   if (!Number.isSafeInteger(pid) || pid < 2) return;
   try {
+    // linux-only /proc/<pid>/cmdline read (MACP3 US-003): guarded for Darwin
+    // by this try/catch — on /proc-less platforms the read throws and we
+    // treat the process as not-owned (no-op).
     const commandLine = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').replaceAll('\0', ' ');
     if (!commandLine.includes(ownershipMarker)) return;
     process.kill(pid, 'SIGKILL');
@@ -39,6 +51,9 @@ function stopOwnedProcess(pid, ownershipMarker) {
 function stopOwnedProcessGroup(child, ownershipMarker) {
   if (child.exitCode !== null || child.signalCode !== null) return;
   try {
+    // linux-only /proc/<pid>/stat + cmdline reads (MACP3 US-003): guarded for
+    // Darwin by this try/catch — on /proc-less platforms they throw and the
+    // cleanup is a no-op.
     const stat = fs.readFileSync(`/proc/${child.pid}/stat`, 'utf8');
     const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
     const processGroup = Number(fields[2]);

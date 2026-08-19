@@ -14,11 +14,14 @@
 // finally-reaper, run.sh's live-pgids reaper, and the generator's own
 // uncaughtException cleanup). It kills a recorded pgid only when the record's
 // process-start identity is verified against the CURRENT /proc state (ABA-safe
-// startTime match via tt-process-identity.mjs verifyRecordedTarget) and the
-// pgid is disjoint from the reaper's own process group — so a kill can never
-// reach the reaper's own ancestry. Records that fail verification are SKIPPED
-// with a stale-skip warning (a leaked sleep is accepted over a wrong-process
-// kill).
+// startTime match via tt-process-identity.mjs verifyRecordedTarget — that
+// source is the linux-only /proc filesystem; on a /proc-less Darwin host the
+// verifier returns null and every record is skipped with the stale-skip
+// warning below, never mis-killed: graceful degradation, MACP3 US-003) and
+// the pgid is disjoint from the reaper's own process group — so a kill can
+// never reach the reaper's own ancestry. Records that fail verification are
+// SKIPPED with a stale-skip warning (a leaked sleep is accepted over a
+// wrong-process kill).
 //
 // Exports:
 //   reapLivePgids(records) -> { reaped: [{record, method}], skipped: [{record, reason}] }
@@ -71,11 +74,14 @@ export function spawnDetachedGroupLeader(command, args = []) {
 }
 
 // reapLivePgids: reap every recorded live pgid whose process-start identity
-// still matches the CURRENT /proc state (ABA-safe) and whose group is disjoint
-// from the reaper's own process group. Anything else is skipped — never
-// signalled. Group kill (kill(-pgid)) is used only after verifying
-// pgid == recorded pgid and group disjointness; a positive-pid kill with the
-// same identity check is the fallback if the group kill fails.
+// still matches the CURRENT /proc state (ABA-safe — linux-only source, guarded
+// for the /proc-less Darwin case by the verifier null-degradation in
+// tt-process-identity.mjs: records then skip, never mis-kill; MACP3 US-003)
+// and whose group is disjoint from the reaper's own process group. Anything
+// else is skipped — never signalled. Group kill (kill(-pgid)) is used only
+// after verifying pgid == recorded pgid and group disjointness; a positive-
+// pid kill with the same identity check is the fallback if the group kill
+// fails.
 export function reapLivePgids(records) {
   const reaped = [];
   const skipped = [];

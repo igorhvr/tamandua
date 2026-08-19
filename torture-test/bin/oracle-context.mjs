@@ -40,8 +40,10 @@ export const REQUIRED_ORACLE_EVIDENCE = Object.freeze({
     'refs_before', 'refs_after', 'target_reflog', 'suite_ledger', 'suite_observations',
   ]),
   O3z: Object.freeze(['database_snapshot', 'system_tokens_before', 'system_tokens_after']),
-  // O4 (spec 03 claim & dispatch hygiene): recorder/proc samples ride inside
-  // chaos_log or a recorder evidence key; the chaos log is what lets O4
+  // O4 (spec 03 claim & dispatch hygiene): recorder/proc samples (process
+  // introspection from the linux-only /proc filesystem — tt-recorder degrades
+  // gracefully where /proc is absent; guarded for Darwin, MACP3 US-003) ride
+  // inside chaos_log or a recorder evidence key; the chaos log is what lets O4
   // distinguish a watchdog-killed worker from a chaos-killed one.
   O4: Object.freeze(['database_snapshot', 'run_events', 'chaos_log']),
   O8: Object.freeze(['git_bundle', 'checksum_baseline', 'checksum_terminal']),

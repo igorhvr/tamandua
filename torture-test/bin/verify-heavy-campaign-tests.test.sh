@@ -54,6 +54,9 @@ HEAVY_TESTS=(
     'scripted-scenario-harness.test.ts'
     'tier0-repeatability.test.ts'
     'tier1-case-filter.test.ts'
+    # MACP3 US-009: bare-vacuity red-then-green proof (scripted-daemon control
+    # arm) — must stay in lock-step with run.sh + e2e-golden-integrity.
+    'tier1-bare-vacuity-red-green.test.ts'
     'tier1-e26-real-launch-proof.test.ts'
     'tier1-include-real-proof.test.ts'
     'tier1-real-case-proof.test.ts'

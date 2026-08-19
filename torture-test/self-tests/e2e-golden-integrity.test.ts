@@ -51,6 +51,11 @@ const HEAVY_CAMPAIGN_TESTS = [
   "scripted-scenario-harness.test.ts",
   "tier0-repeatability.test.ts",
   "tier1-case-filter.test.ts",
+  // MACP3 US-009: the bare-vacuity red-then-green proof drives a REAL bare
+  // tier1 control campaign (scripted daemon) — same campaign class as the
+  // other heavy proofs; must stay in lock-step with run.sh + the verify
+  // script (AC5 pins the invariant).
+  "tier1-bare-vacuity-red-green.test.ts",
   "tier1-e26-real-launch-proof.test.ts",
   "tier1-include-real-proof.test.ts",
   "tier1-real-case-proof.test.ts",

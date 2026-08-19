@@ -2,6 +2,9 @@
 # tt-controller-idempotence.test.sh — E2.5 US-006 controller-level idempotence
 # and stale-catalog-reinstall proof via an included-real stub campaign.
 #
+# MACP3 US-004: the only '/proc' hits here are '/proc' substrings of "process"
+# (daemon/processes in prose/pass text) — no procfs access; linux-only doc note.
+#
 # Proves that repeated REAL-case campaigns reuse the provisioned contained TT
 # home WITHOUT catalog reinstall churn (stamp matches the current build), and
 # that a deliberately-stale catalog stamp triggers a reinstall (NOT a failure)
@@ -237,6 +240,8 @@ count_after_stale="$(count_workflows)"
 pass "AC3: run with a stale catalog stamp REINSTALLS the current catalog and completes GREEN (not a failure)"
 
 # ── AC4: hygiene — no leaked daemons/processes, operator state untouched ──
+# ('daemon/processes' — '/proc' is a substring of "process", no procfs access;
+# MACP3 US-004 linux-only doc note. The daemon stub starts nothing.)
 ensure_ports_43xx_free || fail "AC4 ports 43xx not free after the runs (leaked daemon)"
 grep -q 'CALL tt-daemon-up ensure-up' "$DAEMON_LOG" || true
 grep -q 'CALL tt-daemon-up stop ' "$DAEMON_LOG" || fail "AC4 daemon stub was not asked to stop at campaign end"
@@ -244,5 +249,7 @@ grep -q 'CALL tt-daemon-up stop ' "$DAEMON_LOG" || fail "AC4 daemon stub was not
 OP_AFTER="$(operator_snapshot)"
 [ "$OP_BEFORE" = "$OP_AFTER" ] || fail "AC4 operator ~/.tamandua catalog changed: $OP_AFTER"
 pass "AC4: no leaked daemon/process (ports 43xx free), daemon-up asked to ensure-up+stop, operator catalog untouched"
+# ('daemon/process' above — '/proc' substring of "process", no procfs access;
+#  MACP3 US-004 doc note.)
 
 printf 'RESULT: All tt-controller idempotence / stale-catalog reinstall tests PASSED\n'

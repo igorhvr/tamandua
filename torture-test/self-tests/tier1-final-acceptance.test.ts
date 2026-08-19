@@ -214,8 +214,34 @@ const allowed = [
   "torture-test/bin/tt-harness-auth-probe",
   "torture-test/bin/tt-harness-auth-probe.test.sh",
   "torture-test/bin/tt-report.mjs",
+  "torture-test/bin/tt-report.test.mjs",
+  // MACP3 US-009: the red-then-green proof authors the frozen PRE-US-008
+  // verdict arm (bin/tt-report-legacy-vacuity.mjs) used to pin the vacuous
+  // GREEN that existed before the US-008 bare vacuity guard — a preserved
+  // historical snapshot like evidence-procfd-legacy.mjs, with a
+  // byte-faithfulness pin against commit dafa40a7 (verified in the proof
+  // self-test). Its containing self-test lives under torture-test/self-tests/
+  // (already authorized); the legacy module itself joins the report surface.
+  "torture-test/bin/tt-report-legacy-vacuity.mjs",
   "torture-test/bin/tt-verify-environment",
   "torture-test/bin/tt-verify-environment.test.sh",
+  // MACP3 (US-003/US-004): the /proc portability sweep authorizes the
+  // runtime tools + harnesses it marked (bin/tt-recorder, bin/tt-daemon-up
+  // and their .test.sh harnesses, plus the shared scripted-scenario lib
+  // scenarios/lib/run-scripted-scenario) — Darwin-portability guard/
+  // comment-only changes (the same way MACP1/MACP2 authorize their
+  // surfaces). US-005 adds the procfs-portability lint under
+  // torture-test/self-tests/ (already authorized). MACP3 US-006/US-007
+  // author the fail-closed predicate semantics surface — bin/tt-report.mjs
+  // and its unit suite bin/tt-report.test.mjs (report verdict + INFRA
+  // FAILURES surfacing). T2.1-owned files
+  // (bin/daemon-control, bin/daemon-control.test.sh, scenarios/w4.23/,
+  // scenarios/w4.49/) are never touched by MACP3 — only allowlisted.
+  "torture-test/bin/tt-recorder",
+  "torture-test/bin/tt-recorder.test.sh",
+  "torture-test/bin/tt-daemon-up",
+  "torture-test/bin/tt-daemon-up.test.sh",
+  "torture-test/scenarios/lib/run-scripted-scenario",
   // US-015: the --tier2 ladder rung — bin/tt-run wires tier2 availability
   // + routing (its test extends with the tier2 assertions and the E2.2
   // fail-closed proof), and bin/tt-tier2-assets is the NEW tier2 asset

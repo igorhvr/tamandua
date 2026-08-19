@@ -8,7 +8,9 @@
 // a stale-skip warning. These tests pin the refusal paths (stale ABA record,
 // dead pid, pgid mismatch, self/ancestor targets) and the happy path (genuine
 // recorded pgid reaped via its verified group), plus the CLI mode run.sh
-// consumes.
+// consumes. /proc here is the linux-only introspection source; on Darwin the
+// verifier degrades to null and every record is skipped (never mis-killed) —
+// guarded for Darwin by that degradation, MACP3 US-003.
 
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -31,7 +33,7 @@ async function waitForExit(child, label) {
     once(child, 'exit'),
     new Promise((resolve) => setTimeout(resolve, 5000)),
   ]);
-  assert.equal(getProcessStartIdentity(child.pid), null, `${label}: pid must be absent from /proc after reaping`);
+  assert.equal(getProcessStartIdentity(child.pid), null, `${label}: pid must be absent from /proc after reaping (linux-only introspection; guarded for Darwin — MACP3 US-003)`);
 }
 
 test('genuine recorded pgid is reaped via its verified group', async () => {

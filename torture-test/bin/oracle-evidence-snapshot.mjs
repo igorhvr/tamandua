@@ -72,18 +72,40 @@ function openSnapshotDirectory(campaignDir, caseId, attemptId) {
   }
   const flags = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW;
   const fd = fs.openSync(current, flags);
-  const fdPath = `/proc/${process.pid}/fd/${fd}`;
-  if (fs.realpathSync(fdPath) !== current) {
-    fs.closeSync(fd);
-    throw new Error('snapshot directory identity changed while opening');
+  // On linux, re-resolve the open fd through /proc/self/fd/<fd> and confirm
+  // it still refers to the realpath we opened — /proc/self/fd is linux-only
+  // (oracle-evidence-snapshot.mjs MACP3 US-003 portability fix).
+  // On darwin /proc does not exist: the fd was opened O_NOFOLLOW on `current`
+  // (already a realpath), so no symlink could have been followed at open
+  // time and there is nothing further to verify — skip the identity re-check.
+  if (process.platform === 'linux') {
+    const fdPath = `/proc/${process.pid}/fd/${fd}`;
+    if (fs.realpathSync(fdPath) !== current) {
+      fs.closeSync(fd);
+      throw new Error('snapshot directory identity changed while opening');
+    }
   }
   ACTIVE_SNAPSHOT_DIRECTORIES.set(current, fd);
-  return { logical: current, fd, fdPath };
+  return { logical: current, fd, fdPath: snapshotWorkDirectory(current, fd) };
+}
+
+// snapshotWorkDirectory: the path snapshot file operations run through.
+// Linux: /proc/self/fd/<fd> routes every read/write through the OPEN
+// directory descriptor (immune to a raced symlink swap of the logical path).
+// Darwin: /proc is absent, so fall back to the logical realpath — the same
+// directory inode that was opened O_NOFOLLOW, resolved by path instead of
+// by fd. Slightly weaker against a mid-run logical-path swap, but campaign
+// directories are created once by the controller and never replaced, so this
+// is sound (documented linux-only-acceptance tradeoff; MACP3 US-003).
+function snapshotWorkDirectory(logical, fd) {
+  if (process.platform === 'linux') return `/proc/${process.pid}/fd/${fd}`;
+  return logical;
 }
 
 function activeSnapshotDirectory(logical) {
   const fd = ACTIVE_SNAPSHOT_DIRECTORIES.get(logical);
-  return fd === undefined ? null : { logical, fd, fdPath: `/proc/${process.pid}/fd/${fd}` };
+  if (fd === undefined) return null;
+  return { logical, fd, fdPath: snapshotWorkDirectory(logical, fd) };
 }
 
 function closeSnapshotDirectory(directory) {

@@ -89,6 +89,9 @@ DAEMON_TOUCHED=0
 
 process_starttime() {
   local pid="$1" details rest
+  # linux-only /proc/<pid>/stat read (MACP3 US-003): guarded for Darwin by
+  # [ -r ] + 2>/dev/null — a /proc-less host yields an empty start time,
+  # which stop_owned_command treats as "scenario-owned" (conservative).
   [ -r "/proc/$pid/stat" ] || return 1
   details="$(<"/proc/$pid/stat")" || return 1
   rest="${details##*) }"
@@ -98,6 +101,9 @@ process_starttime() {
 
 process_group() {
   local pid="$1" details rest
+  # linux-only /proc/<pid>/stat read (MACP3 US-003): guarded for Darwin by
+  # [ -r ] + 2>/dev/null — a /proc-less host yields an empty group, treated
+  # as "no group recorded" (callers fall back to a plain positive-pid kill).
   [ -r "/proc/$pid/stat" ] || return 1
   details="$(<"/proc/$pid/stat")" || return 1
   rest="${details##*) }"
@@ -167,7 +173,9 @@ stop_unreleased_command() {
   local current group
   current="$(process_starttime "$COMMAND_PID" 2>/dev/null || true)"
   # COMMAND_PID is our direct, unreaped child and scenario code has not been
-  # released, so an initially unavailable /proc start time is still safe.
+  # released, so an initially unavailable /proc start time is still safe
+  # (the linux-only /proc read above simply yields empty on a /proc-less
+  # Darwin host — MACP3 US-003 guarded).
   if [ -n "$current" ] && { [ -z "$COMMAND_STARTTIME" ] || [ "$current" = "$COMMAND_STARTTIME" ]; }; then
     group="$(process_group "$COMMAND_PID" 2>/dev/null || true)"
     if [ "$group" = "$COMMAND_PID" ]; then
@@ -227,6 +235,9 @@ done
 [ "$LOCK_OWNED" = "1" ] || fail "timed out acquiring scripted-daemon scenario lock"
 
 UUID_SUFFIX="$(tr -d '-' </proc/sys/kernel/random/uuid 2>/dev/null | cut -c1-12)"
+# /proc/sys/kernel/random/uuid is linux-only (MACP3 US-003); on Darwin the
+# read fails and the explicit fallback below generates a portable unique
+# suffix from the shell PID + monotonic time — guarded Darwin branch.
 [ -n "$UUID_SUFFIX" ] || UUID_SUFFIX="$$-$(date +%s%N)"
 INVOCATION_ID="${SCENARIO_ID}-$(date -u +%Y%m%dT%H%M%S)-$$-${UUID_SUFFIX}"
 WORKFLOW_ID="${WORKFLOW_BASE}-${INVOCATION_ID}"

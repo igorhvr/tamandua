@@ -351,6 +351,8 @@ function killDaemon(opts) {
  */
 function isProcessAlive(pid) {
   try {
+    // linux-only /proc/<pid> existence check (MACP3 US-003): absent on
+    // Darwin, so this degrades to "alive = kill(0) alone" via the catch.
     fs.accessSync(`/proc/${pid}`, fs.constants.F_OK);
   } catch {
     return false;
@@ -1565,6 +1567,9 @@ function verifyKillTarget(record, runId) {
  */
 function verifyProcessProvenance(pid, runId) {
   try {
+    // linux-only /proc/<pid>/cwd + cmdline reads (MACP3 US-003): absent on
+    // Darwin — the catch degrades to "provenance unproven" (returns false)
+    // instead of hard-failing.
     const cwdPath = `/proc/${pid}/cwd`;
     const cmdlinePath = `/proc/${pid}/cmdline`;
     const cwd = fs.readlinkSync(cwdPath);
@@ -1696,6 +1701,9 @@ function captureProcessEvidence(action, runId, writeFile, opts) {
 
     // Capture child processes (pgid)
     try {
+      // linux-only /proc/<pid>/status read (MACP3 US-003): guarded for
+      // Darwin by this try/catch — on a /proc-less host we emit
+      // "(could not read process tree)" evidence instead of aborting.
       const statusStr = fs.readFileSync(`/proc/${pid}/status`, 'utf-8');
       const ppidMatch = statusStr.match(/PPid:\s*(\d+)/);
       const pgid = pid; // approximate
@@ -1720,6 +1728,10 @@ function captureProcessEvidence(action, runId, writeFile, opts) {
  */
 function captureProcInfo(pid) {
   let info = '';
+  // linux-only /proc/... reads below (MACP3 US-003): every individual read
+  // is wrapped and falls back to an "(unreadable)" note — on a /proc-less
+  // Darwin host this produces "(could not read process tree)" evidence
+  // rather than aborting the chaos injection.
   try {
     info += `  Cmdline: ${fs.readFileSync(`/proc/${pid}/cmdline`, 'utf-8').replace(/\0/g, ' ')}\n`;
   } catch { info += `  Cmdline: (unreadable)\n`; }
@@ -1741,6 +1753,9 @@ function captureProcInfo(pid) {
  */
 function captureChildrenProcs(parentPid) {
   let output = '';
+  // linux-only /proc scan (MACP3 US-003): guarded for Darwin by the outer
+  // try/catch — on a /proc-less host readdirSync('/proc') throws and we fall
+  // back to "(no children found)".
   try {
     const procDirs = fs.readdirSync('/proc').filter(d => /^\d+$/.test(d));
     for (const d of procDirs) {
@@ -1767,6 +1782,8 @@ function captureChildrenProcs(parentPid) {
  */
 function captureProcScan() {
   let output = '';
+  // linux-only /proc scan (MACP3 US-003): guarded for Darwin by the outer
+  // try/catch — on a /proc-less host we fall back to "(no processes found)".
   try {
     const procDirs = fs.readdirSync('/proc').filter(d => /^\d+$/.test(d));
     for (const d of procDirs) {

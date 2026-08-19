@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # tt-daemon-up.test.sh — self-test for tt-daemon-up (E2.5 US-003).
 #
+# MACP3 US-004: every '/proc' hit in this harness is linux-only. All RUNTIME
+# /proc reads are guarded by [ -d /proc/$pid ] and carry explicit inline
+# 'MACP3 US-004 linux-only' comments; pass/fail prose mentioning /proc is
+# documentation only, and '/proc' in 'daemon/process' is a substring of
+# "process", not the procfs mount.
+#
 # Verifies the real TT daemon preflight lifecycle helper:
 #   AC1. helper verifies/starts/stops the real TT daemon via daemon-control
 #        real (43xx) under the contained env; --help documents it
@@ -9,6 +15,8 @@
 #   AC3. if the daemon cannot come up, ensure-up exits non-zero with the
 #        distinct reason tt-daemon-down
 #   AC4. after stop, no daemon/process remains and ports 43xx are free
+#        ('daemon/process' — the '/proc' here is a substring of "process", no procfs
+#        access; MACP3 US-004 linux-only doc note)
 #   AC5. never touches the operator's 33xx ports or ~/.tamandua
 #   AC6. (S12/E3.D US-009) ensure-up creates var/adapters-bin (empty,
 #        idempotent), reports TT_DAEMON_PATH_PREPEND, and the started
@@ -145,6 +153,9 @@ if [ -d "$ADAPTERS_BIN_DIR" ] && [ -z "$(ls -A "$ADAPTERS_BIN_DIR" 2>/dev/null)"
 else
   fail "AC6 adapters-bin missing or not empty"
 fi
+# linux-only /proc/$STARTED_PID/environ read (MACP3 US-004): Darwin has no
+# /proc — the [ -d "/proc/$STARTED_PID" ] guard above fails there, so this
+# assertion falls to the else branch (fail) without reading procfs.
 if [ -n "$STARTED_PID" ] && [ "$STARTED_PID" -gt 0 ] 2>/dev/null && [ -d "/proc/$STARTED_PID" ]; then
   DAEMON_PATH="$(tr '\0' '\n' < "/proc/$STARTED_PID/environ" 2>/dev/null | grep '^PATH=' | head -n1 | cut -d= -f2-)"
   case ":$DAEMON_PATH:" in
@@ -187,6 +198,8 @@ DIRECT_PID=""
 if [ -n "$STATE_DIR" ] && [ -f "$STATE_DIR/tamandua.pid" ]; then
   DIRECT_PID="$(cat "$STATE_DIR/tamandua.pid")"
 fi
+# linux-only /proc/$DIRECT_PID/environ read (MACP3 US-004): Darwin has no
+# /proc — guarded above; on Darwin this falls to the else fail branch.
 if [ -n "$DIRECT_PID" ] && [ -d "/proc/$DIRECT_PID" ]; then
   DIRECT_PATH="$(tr '\0' '\n' < "/proc/$DIRECT_PID/environ" 2>/dev/null | grep '^PATH=' | head -n1 | cut -d= -f2-)"
   case ":$DIRECT_PATH:" in
@@ -212,6 +225,8 @@ if [ -n "$DIRECT_PID" ] && [ -n "$NEW_PID" ] && [ "$DIRECT_PID" != "$NEW_PID" ];
 else
   fail "AC6b daemon not restarted (pid $DIRECT_PID -> ${NEW_PID:-none})"
 fi
+# linux-only /proc/$NEW_PID/environ read (MACP3 US-004): Darwin has no /proc
+# — guarded above; on Darwin this falls to the else fail branch.
 if [ -n "$NEW_PID" ] && [ -d "/proc/$NEW_PID" ]; then
   NEW_PATH="$(tr '\0' '\n' < "/proc/$NEW_PID/environ" 2>/dev/null | grep '^PATH=' | head -n1 | cut -d= -f2-)"
   case ":$NEW_PATH:" in
@@ -242,6 +257,9 @@ else
   ok "AC4 ports 43xx free after stop (sweep verified)"
 fi
 if [ -n "$STARTED_PID" ] && [ "$STARTED_PID" -gt 0 ] 2>/dev/null; then
+# linux-only /proc/$STARTED_PID existence check (MACP3 US-004): Darwin has no
+# procfs — /proc/$STARTED_PID never exists there, so this 'no longer alive'
+# branch wins (conservative pass-by-note), never a read/hard-fail.
   if [ -d "/proc/$STARTED_PID" ]; then
     fail "AC4 started daemon PID $STARTED_PID still alive after stop"
   else

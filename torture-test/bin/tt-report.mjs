@@ -60,7 +60,12 @@ function oracleFindings(caseState) {
 
 function hasInfrastructureFailure(state) {
   return state.cases.some((item) => item.outcome === 'TEST_INFRA_FAIL'
-    || (item.outcome === 'NOT_RUN' && !['predicate', 'pending-real'].includes(item.reason?.category))
+    // MACP3 US-006: host-profile-missing is infrastructure failure REGARDLESS
+    // of how it was persisted — applyHostRequirements records it as
+    // TEST_INFRA_FAIL, but a legacy/other-NOT_RUN encoding must not be
+    // treated as a normal green skip either. Never a vacuous NOT_RUN.
+    || item.reason?.category === 'host-profile-missing'
+    || (item.outcome === 'NOT_RUN' && !['predicate', 'pending-real', 'host-profile-missing'].includes(item.reason?.category))
     || (item.oracle_results ?? []).some((result) =>
       result.status === 'TEST_INFRA'
         || (result.status === 'VALID' && result.response?.result === 'ERROR')));
@@ -93,10 +98,43 @@ export function zeroRealLaunchesCause(state) {
   return `include-real requested but zero real cases launched (${realCases.length} real pi/hermes/dsh cases in manifest, execution_selection=all, but no real launch recorded)`;
 }
 
+// MACP3 US-008: bare-campaign vacuity guard — the bare-mode mirror of
+// zeroRealLaunchesCause. A bare (execution_selection='scripted-only')
+// campaign that contains at least one scripted case yet where ZERO scripted
+// cells actually executed (every scripted case is terminal with zero
+// attempts — predicate-skipped or otherwise) produced zero evidence and must
+// never render a bare GREEN; that is the E2.2 vacuous-GREEN class resurfacing
+// through the predicate path. 'executed' follows the existing attempt/outcome
+// data model exactly as zeroRealLaunchesCause does for real mode: a scripted
+// cell counts as executed iff its attempts array is non-empty. Legitimately
+// evaluated predicate skips under a VALID loaded profile are still skips —
+// with ZERO executions they yield a vacuous campaign (RED/FINDINGS); skips
+// caused by host-profile-missing (US-006) are infra (already RED/INFRA) and
+// take precedence via hasInfrastructureFailure. Returns a human-readable
+// cause string, or null. Tier-agnostic: this is the single verdict chokepoint
+// every bare campaign (tier0/1/2, smoke+dry-run) flows through.
+export function bareVacuityCause(state) {
+  if (isRealMode(state)) return null;
+  const scriptedCases = (state?.cases ?? []).filter((item) => !isRealHarness(item.harness));
+  if (scriptedCases.length === 0) return null;
+  const scriptedExecuted = scriptedCases.filter((item) => (item.attempts ?? []).length > 0).length;
+  if (scriptedExecuted > 0) return null;
+  return `bare (scripted-only) campaign executed zero scripted cells (${scriptedCases.length} scripted cases in manifest, execution_selection=scripted-only, all skipped) — vacuous GREEN`;
+}
+
 export function verdictExitCode(state) {
   const failClosedCause = zeroRealLaunchesCause(state);
   if (failClosedCause !== null) return { verdict: 'INFRA_FAILURE', exitCode: 2 };
   if (hasInfrastructureFailure(state)) return { verdict: 'INFRA_FAILURE', exitCode: 2 };
+  // MACP3 US-008: bare-campaign vacuity guard. An all-skipped bare campaign
+  // must be RED (FINDINGS/exit 1) with an explicit vacuous-campaign finding,
+  // never GREEN. INFRA (above) has precedence: a host-profile-missing or
+  // other infrastructure failure is already RED/INFRA (exit 2) and explains
+  // the failure precisely, so it must not be downgraded to a vacuity
+  // FINDINGS. Real-mode behavior is untouched (bareVacuityCause returns null
+  // unless execution_selection='scripted-only').
+  const vacuityCause = bareVacuityCause(state);
+  if (vacuityCause !== null) return { verdict: 'FINDINGS', exitCode: 1 };
   // FIX10 US-005: a hygiene-canary diff (operator-identity file changed
   // during the campaign) is a campaign-level FINDING — never silent.
   const hygieneDiffs = state?.hygiene_canary?.diffs;
@@ -173,15 +211,45 @@ export function buildCampaignReport(state) {
   }));
   const outcomeTotals = Object.fromEntries(OUTCOMES.map((outcome) => [outcome, 0]));
   for (const row of rows) outcomeTotals[row.outcome] += 1;
+  const verdict = verdictExitCode(state);
+  const failClosedCause = zeroRealLaunchesCause(state);
+  const vacuityCause = bareVacuityCause(state);
+  // MACP3 US-008: the vacuous-campaign finding is surfaced ONLY when it is the
+  // operative fail-closed signal (the verdict is a non-INFRA FINDINGS). When an
+  // infrastructure failure drives the verdict, INFRA FAILURES already names the
+  // cause precisely and a vacuous-campaign finding would mislabel an
+  // infra-failed campaign as 'vacuous'. Machine-parseable via
+  // finding.category === 'vacuous-campaign'; case_id is null (campaign-level).
+  const vacuousFinding = (vacuityCause !== null && verdict.verdict !== 'INFRA_FAILURE')
+    ? [{
+        type: 'VACUOUS_CAMPAIGN',
+        category: 'vacuous-campaign',
+        case_id: null,
+        summary: vacuityCause,
+        detected_at: state.updated_at,
+      }]
+    : [];
   const findings = rows.flatMap((row, index) => [
     ...row.findings.map((finding) => ({ case_id: row.id, ...finding })),
     ...oracleFindings(state.cases[index]),
   ]);
+  // MACP3 US-008: append the vacuous-campaign finding (when operative) so it
+  // is listed in the campaign findings ledger exactly like any other finding.
+  if (vacuousFinding.length > 0) findings.push(vacuousFinding[0]);
   const pendingReal = rows
     .filter((row) => row.outcome === 'NOT_RUN' && row.reason?.category === 'pending-real')
     .map((row) => ({ id: row.id, wave: row.wave, class: row.class, reason: clone(row.reason) }));
   const notRun = rows
     .filter((row) => row.outcome === 'NOT_RUN' && row.reason?.category !== 'pending-real')
+    .map((row) => ({ id: row.id, wave: row.wave, class: row.class, reason: clone(row.reason) }));
+  // MACP3 US-006: infra-failure ledger — every TEST_INFRA_FAIL row with its
+  // actual reason (category + human-readable message/evidence). This is what
+  // makes a host-profile-missing campaign surface its findings in the report
+  // instead of merely exiting non-zero; the verdict alone never names the
+  // affected cases. A valid-profile negative finding is a normal skip, never
+  // this list.
+  const infraFailures = rows
+    .filter((row) => row.outcome === 'TEST_INFRA_FAIL')
     .map((row) => ({ id: row.id, wave: row.wave, class: row.class, reason: clone(row.reason) }));
   // US-005: the declared teardown ledger — every terminal-case working-clone
   // decision (case id, terminal outcome, kept/pruned action, timestamp).
@@ -190,8 +258,6 @@ export function buildCampaignReport(state) {
   const teardown_decisions = rows
     .map((row) => row.teardown)
     .filter((dec) => dec !== null && dec !== undefined);
-  const verdict = verdictExitCode(state);
-  const failClosedCause = zeroRealLaunchesCause(state);
 
   return {
     version: 1,
@@ -213,6 +279,7 @@ export function buildCampaignReport(state) {
     teardown_decisions,
     pending_real: pendingReal,
     not_run: notRun,
+    infra_failures: infraFailures,
     findings,
     // FIX10 US-005: O18-style operator-identity hygiene canary — per-file
     // before/after hashes and status (UNCHANGED/CHANGED/ABSENT) plus any
@@ -230,6 +297,17 @@ export function buildCampaignReport(state) {
     fail_closed: {
       triggered: failClosedCause !== null,
       cause: failClosedCause,
+    },
+    // MACP3 US-008: bare-campaign vacuity guard ledger — the machine-parseable
+    // counterpart of fail_closed but for execution_selection='scripted-only'
+    // (bare) campaigns: a bare GREEN requires at least one scripted cell to
+    // actually EXECUTE; all-scripted-skipped is FINDINGS (exit 1) with a
+    // 'vacuous-campaign' finding. triggered is true only when the guard is the
+    // operative fail-closed signal (an infra failure takes precedence and is
+    // reported via infra_failures instead).
+    vacuity: {
+      triggered: vacuousFinding.length > 0,
+      cause: vacuityCause,
     },
   };
 }
@@ -259,9 +337,28 @@ function reasonSummary(reason) {
   return reason.category ?? JSON.stringify(reason);
 }
 
+// MACP3 US-006: human-readable infra-failure summary. Includes the
+// category and, when present, the human-readable reason.message (e.g. the
+// underlying host-profile load error) so the rendered report clearly names
+// the infrastructure defect instead of only a bare category token.
+function infraReasonSummary(reason) {
+  const summary = reasonSummary(reason);
+  const message = reason?.message;
+  const evidence = reason?.evidence;
+  const extras = [
+    ...(typeof message === 'string' && message.length > 0 ? [message] : []),
+    ...(Array.isArray(evidence) && evidence.length > 0 ? [JSON.stringify(evidence)] : []),
+  ];
+  return extras.length === 0 ? summary : `${summary} (${extras.join('; ')})`;
+}
+
 function findingSummary(finding) {
   const label = finding.oracle_id ?? finding.oracle ?? finding.type;
   const summary = finding.finding?.summary ?? finding.summary ?? finding.type;
+  // MACP3 US-008: campaign-level findings (e.g. VACUOUS_CAMPAIGN) have no
+  // owning case — render them without a case prefix so the category label is
+  // unambiguous.
+  if (finding.case_id === undefined || finding.case_id === null) return `${label} - ${summary}`;
   return `${finding.case_id}: ${label} - ${summary}`;
 }
 
@@ -302,6 +399,11 @@ export function renderCampaignReport(report) {
     ...(report.findings.length === 0
       ? ['(none)']
       : report.findings.map((finding) => `- ${findingSummary(finding)}`)),
+    '',
+    'INFRA FAILURES',
+    ...(report.infra_failures.length === 0
+      ? ['(none)']
+      : report.infra_failures.map((item) => `- ${item.id}: ${infraReasonSummary(item.reason)}`)),
     '',
     'HYGIENE CANARY',
     ...(report.hygiene_canary === null || report.hygiene_canary === undefined

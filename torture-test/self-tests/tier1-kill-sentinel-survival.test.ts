@@ -51,6 +51,8 @@ function cleanEnv(extra?: Record<string, string>): NodeJS.ProcessEnv {
 
 function readStartTime(pid: number): string | null {
   try {
+    // linux-only /proc/<pid>/stat read (MACP3 US-003): guarded for Darwin by
+    // this try/catch — on a /proc-less host it returns null ("unknown").
     const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
     const after = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);
     return after.length > 19 ? after[19] : null;
@@ -118,6 +120,9 @@ function pidAlive(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
+    // linux-only /proc/<pid> existence check (MACP3 US-003): guarded for
+    // Darwin — on a /proc-less host existsSync is false and the pid is
+    // reported dead (conservative; kill(0) already carried the liveness).
     return fs.existsSync(`/proc/${pid}`);
   } catch {
     return false;

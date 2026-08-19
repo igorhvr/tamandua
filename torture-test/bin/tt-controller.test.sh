@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# MACP3 US-004 note: this harness's '/proc' mentions (prose describing the OLD
+# /proc/port + /proc scan resolution that RECORDED provenance replaced) are
+# linux-only documentation — no runtime procfs access in this file, so nothing
+# is reachable-as-runtime on Darwin. '/proc' substrings of "process" (e.g.
+# exact-key/process evidence) are the word, not the procfs mount.
 set -euo pipefail
 
 # E2.5 US-004 controller preflight wiring is covered by the dedicated
@@ -251,6 +256,31 @@ fs.writeFileSync(manifest, `${JSON.stringify(record)}\n`);
 NODE
 }
 
+# MACP3 US-006: local-harness case with an ARBITRARY requires object. APENDS to
+# the manifest (truncate with ': > "$manifest"' first for a single-case file)
+# so a mixed manifest can be built with repeated calls. The command exits 0, so
+# a valid profile + satisfied predicates must let the case EXECUTE (PASS); a
+# fail-closed host-profile block is detected by the case never reaching a
+# command outcome.
+write_local_requires_case() {
+  local manifest="$1"
+  local id="$2"
+  local requires_json="$3"
+  node --input-type=module - "$manifest" "$id" "$requires_json" <<'NODE'
+import fs from 'node:fs';
+const [manifest, id, requiresJson] = process.argv.slice(2);
+const record = {
+  id, wave: 0, workflow: 'local', fixture: 'none', harness: 'local',
+  task: 'tasks/W3.07.md', context: { execution_mode: 'scripted' },
+  caps: { tokens: 0, wall_min: 5 }, requires: JSON.parse(requiresJson),
+  boundary_files: [], forbidden: [], oracles: [], gates: [], chaos: null,
+  shed_ok: false, mandatory: true, class: 'verification',
+  command: { executable: 'node', args: ['-e', 'process.exit(0)'], cwd: '.' },
+};
+fs.appendFileSync(manifest, `${JSON.stringify(record)}\n`);
+NODE
+}
+
 write_scheduler_manifest() {
   local manifest="$1"
   local event_log="$2"
@@ -321,6 +351,56 @@ expect_rejected() {
   set -e
   [ "$status" -eq 2 ] || fail "$name exited $status instead of 2: $output"
   printf '%s' "$output" | grep -Fq "$expected" || fail "$name did not report '$expected': $output"
+  pass "$name"
+}
+
+# MACP3 US-006: fail-closed predicate semantics contract check. A missing or
+# invalid host profile (while a SELECTED case carries `requires`) must NOT
+# abort the campaign and must NOT silently degrade into all-predicates-false
+# NOT_RUN(predicate) skips — instead the campaign is still created, every
+# predicate-bound selected case is terminal TEST_INFRA_FAIL with
+# reason.category='host-profile-missing' and the underlying load error in
+# reason.message, and verdictExitCode forces RED/INFRA (exit 2). This helper
+# asserts that exact contract and registers the campaign dir for cleanup.
+run_fail_closed_profile_campaign() {
+  local name="$1"
+  local manifest="$2"
+  local output
+  local status
+  local campaign_id
+  local state_path
+  local report_txt
+  set +e
+  output=$("$CONTROLLER" --manifest "$manifest" 2>&1)
+  status=$?
+  set -e
+  [ "$status" -eq 2 ] || fail "$name exited $status instead of 2 (INFRA): $output"
+  campaign_id=$(printf '%s\n' "$output" | sed -n 's/^Campaign: //p' | tail -1)
+  [ -n "$campaign_id" ] || fail "$name did not create a campaign (aborted?): $output"
+  state_path="$TT_DIR/var/results/$campaign_id/state.json"
+  report_txt="$TT_DIR/var/results/$campaign_id/report.txt"
+  [ -f "$state_path" ] || fail "$name campaign missing state.json: $output"
+  printf '%s/%s\n' "$TT_DIR/var/results" "$campaign_id" >> "$CAMPAIGN_DIRS_FILE"
+  node --input-type=module - "$state_path" <<'NODE' || fail "$name host-profile-missing contract violated"
+import fs from 'node:fs';
+const state = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const item = state.cases[0];
+if (item.phase !== 'terminal' || item.outcome !== 'TEST_INFRA_FAIL') {
+  throw new Error(`predicate-bound case is not terminal TEST_INFRA_FAIL: ${JSON.stringify({id:item.id,phase:item.phase,outcome:item.outcome,reason:item.reason})}`);
+}
+if (item.outcome === 'NOT_RUN' && item.reason?.category === 'predicate') {
+  throw new Error(`vacuously skipped as NOT_RUN(predicate): ${JSON.stringify(item.reason)}`);
+}
+if (item.reason?.category !== 'host-profile-missing') {
+  throw new Error(`infra reason is not host-profile-missing: ${JSON.stringify(item.reason)}`);
+}
+if (typeof item.reason?.message !== 'string' || !/cannot load required host profile/.test(item.reason.message)) {
+  throw new Error(`host-profile-missing reason must carry the underlying load error: ${JSON.stringify(item.reason)}`);
+}
+NODE
+  [ -f "$report_txt" ] || fail "$name campaign missing report.txt: $output"
+  grep -Fq 'INFRA FAILURES' "$report_txt" || fail "$name report does not surface the INFRA FAILURES section"
+  grep -Fq 'INFRA_FAILURE (exit 2)' "$report_txt" || fail "$name report lacks the INFRA_FAILURE verdict line"
   pass "$name"
 }
 
@@ -445,7 +525,7 @@ node --test "$SCRIPT_DIR/o9-mechanical-harvest.integration.test.mjs" \
   || fail "O9 controller-to-snapshot mechanical harvest integration failed"
 pass "O9 real reclaim, stop/cancel, and targeted probes harvest to a contract-valid PASS"
 
-node --test "$TT_DIR/oracles/lib/runtime.test.mjs" "$TT_DIR/oracles/self-test/harness.test.mjs" \
+node --test "$TT_DIR/oracles/lib/runtime.test.mjs" "$TT_DIR/oracles/lib/evidence-portability.test.mjs" "$TT_DIR/oracles/self-test/harness.test.mjs" \
   "$TT_DIR/oracles/self-test/o1.test.mjs" "$TT_DIR/oracles/self-test/o3z.test.mjs" \
   "$TT_DIR/oracles/self-test/o9.test.mjs" "$TT_DIR/oracles/self-test/o16.test.mjs" \
   "$TT_DIR/oracles/self-test/o4.test.mjs" \
@@ -1848,7 +1928,9 @@ if (restart.op !== 'restart_daemon' || restart.kind !== 'real' || restart.exit_c
 // the controller records the daemon provenance (kind + pidfile pid +
 // startTime identity) in the restart evidence and never resolves the daemon
 // by /proc/port sweep (daemon-control applies its own provenance + identity
-// checks per US-004).
+// checks per US-004). MACP3 US-004 doc note: '/proc' here is documentation
+// prose — this harness never reads procfs (recorded provenance instead); the
+// linux-only /proc sweep concept is unreachable-as-runtime on Darwin.
 if (restart.provenance?.kind !== 'real'
     || !['unavailable', 'pidfile', 'pidfile+identity'].includes(restart.provenance.source)) {
   throw new Error(`daemon restart must record daemon provenance: ${JSON.stringify(restart.provenance)}`);
@@ -1947,6 +2029,10 @@ chmod +x "$TEST_ROOT/tt-chaos-fail-stub"
 # tt-chaos EXPLICIT --target-* args from a RECORDED harness identity (the
 # steps-table claim row — { pid: claim_pgid, pgid: claim_pgid } — or the
 # launch-process record) and never let the operator re-resolve by /proc sweep.
+# MACP3 US-004 doc note: all '/proc' mentions in this block are documentation
+# prose describing the OLD linux-only /proc cwd/cmdline scan — this harness
+# never reads procfs (recorded explicit targets instead), so nothing is
+# reachable-as-runtime on Darwin.
 # To prove it:
 #   * a fake-harness process (setsid own-group leader under var/) becomes the
 #     steps-table claim_pgid — the RECORDED target the chaos argv must name;
@@ -2136,6 +2222,7 @@ if (stubCalls.length !== 1
 }
 NODE
 # The decoy matching the OLD /proc scan signature must survive the run; the
+# (MACP3 US-004 doc note: linux-only prose reference — no runtime procfs here.)
 # recorded fake harness (the explicit target) must too (the stub signals
 # nothing — only the argv contract is under test).
 kill -0 "$DECOY_PID" 2>/dev/null || fail "scan-signature decoy died during the chaos run (it must never be targeted)"
@@ -2178,6 +2265,7 @@ if (attempt.chaos_evidence?.status !== 'failed'
 // E3.C.1 US-003: even with no steps-table claim row the invocation must
 // carry EXPLICIT --target-* args from the recorded launch-process fallback —
 // the operator is never left to re-resolve by /proc sweep.
+// MACP3 US-004 doc note: linux-only prose — this harness never reads procfs.
 const failArgv = attempt.chaos_evidence?.argv ?? attempt.classification_reason?.argv ?? [];
 const targetIdx = failArgv.indexOf('--target-pid');
 const startIdx = failArgv.indexOf('--target-start-time');
@@ -2429,6 +2517,8 @@ for (const event of raw) {
       || observation.interrupted !== event.interrupted || observation.tracked_dirty !== event.trackedDirty
       || observation.junk_probe_path !== event.junkProbePath
       || observation.junk_probe_tracked !== false || event.junkProbeTracked !== false) {
+    // 'exact-key/process evidence': '/proc' is a substring of "process" — no
+    // procfs access (MACP3 US-004 doc note; extracted from an error string).
     throw new Error(`snapshot did not preserve emitted exact-key/process evidence: ${JSON.stringify({event,observation})}`);
   }
 }
@@ -3843,12 +3933,286 @@ pass "honestly-absent hermes (present=false) gates NOT_RUN(predicate) with evide
 
 write_satisfying_host_profile
 
-profile_required="$TEST_ROOT/manifests/profile-required.jsonl"
-valid_case "PROFILE-REQUIRED" > "$profile_required"
+# ── MACP3 US-006: fail-closed predicate semantics ─────────────────────
+# An absent/failed host profile while a SELECTED case carries `requires`
+# must NOT abort the run and must NOT silently evaluate every predicate to
+# false (NOT_RUN(predicate) skips; with all cells skipped a bare campaign
+# would report vacuous GREEN). Instead the campaign is still created, every
+# predicate-bound selected case is terminal TEST_INFRA_FAIL
+# (host-profile-missing) with the underlying load error in reason.message,
+# and verdictExitCode forces RED/INFRA (exit 2).
+#
+# The manifest carries a LOCAL case whose `requires.toolchains: ["node"]`
+# is satisfied by write_satisfying_host_profile — proving (in the positive
+# arm, after the profile is restored) that this same cell EXECUTES when the
+# profile is present (never host-profile-missing), i.e. fail-closed fires
+# ONLY on an actually unusable profile, never on a satisfied predicate.
+us006_local_manifest="$TEST_ROOT/manifests/us006-local-requires.jsonl"
+: > "$us006_local_manifest"
+write_local_requires_case "$us006_local_manifest" "US006-REQ" '{"toolchains":["node"]}'
+
 rm -f -- "$HOST_PROFILE"
-expect_rejected "missing host profile is infrastructure failure when requirements exist" "$profile_required" 'cannot load required host profile'
+run_fail_closed_profile_campaign "ac1: missing host profile => TEST_INFRA_FAIL(host-profile-missing), exit 2" "$us006_local_manifest"
+# (profile still missing; second run confirms repeatable fail-closed exit 2)
+run_fail_closed_profile_campaign "ac1: missing host profile (2nd run) => TEST_INFRA_FAIL(host-profile-missing), exit 2" "$us006_local_manifest"
 printf '%s\n' '{not-json}' > "$HOST_PROFILE"
-expect_rejected "malformed host profile is infrastructure failure when requirements exist" "$profile_required" 'cannot load required host profile'
+run_fail_closed_profile_campaign "ac1: malformed host profile => TEST_INFRA_FAIL(host-profile-missing), exit 2" "$us006_local_manifest"
+write_satisfying_host_profile
+
+# AC2/AC3 preservation arm: the SAME local case with a VALID profile and a
+# satisfied predicate must EXECUTE (PASS -> GREEN exit 0), and the report must
+# NOT contain any host-profile-missing finding.
+us006_valid_output=$("$CONTROLLER" --manifest "$us006_local_manifest" 2>&1)
+run_status=$?
+[ "$run_status" -eq 0 ] || fail "valid-profile satisfied-predicate case should execute green: $us006_valid_output"
+us006_valid_id=$(remember_campaign "$us006_valid_output")
+grep -Fq 'PASS' "$TT_DIR/var/results/$us006_valid_id/report.txt" || fail "satisfied local case did not execute (PASS): $us006_valid_output"
+if grep -Fq 'host-profile-missing' "$TT_DIR/var/results/$us006_valid_id/report.txt"; then
+  fail "valid host profile spuriously produced host-profile-missing findings"
+fi
+pass "valid host profile with a satisfied predicate executes the case (no host-profile-missing)"
+
+# A genuine unsatisfied predicate under a VALID profile stays NOT_RUN
+# (predicate) — legitimate skip semantics, never host-profile-missing.
+us006_unsat_manifest="$TEST_ROOT/manifests/us006-unsat.jsonl"
+write_local_predicate_case "$us006_unsat_manifest" "US006-UNSAT"
+us006_unsat_output=$("$CONTROLLER" --manifest "$us006_unsat_manifest" 2>&1) || true
+us006_unsat_id=$(remember_campaign "$us006_unsat_output")
+node --input-type=module - "$TT_DIR/var/results/$us006_unsat_id/state.json" <<'NODE' || fail "genuine predicate skip was not preserved"
+import fs from 'node:fs';
+const state = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const item = state.cases[0];
+if (item.outcome !== 'NOT_RUN' || item.reason?.category !== 'predicate') {
+  throw new Error(`genuine unsatisfied predicate must stay NOT_RUN(predicate): ${JSON.stringify(item)}`);
+}
+NODE
+pass "valid profile: genuinely unsatisfied predicate stays NOT_RUN(predicate)"
+
+# AC3: with NO case requiring the host profile (requires: {} everywhere), a
+# MISSING host profile is irrelevant — campaign behavior is unchanged (green).
+: > "$us006_local_manifest"
+write_local_requires_case "$us006_local_manifest" "US006-NOREQ" '{}'
+rm -f -- "$HOST_PROFILE"
+us006_noneed_output=$("$CONTROLLER" --manifest "$us006_local_manifest" 2>&1)
+us006_noneed_status=$?
+[ "$us006_noneed_status" -eq 0 ] || fail "no case requires the host profile: campaign must be unchanged despite missing profile: $us006_noneed_output"
+us006_noneed_id=$(remember_campaign "$us006_noneed_output")
+grep -Fq 'GREEN (exit 0)' "$TT_DIR/var/results/$us006_noneed_id/report.txt" || fail "no-requires campaign with missing profile must stay GREEN"
+write_satisfying_host_profile
+pass "no case requires the host profile => campaign behavior unchanged (missing profile irrelevant)"
+
+# ── MACP3 US-007: fail-closed predicate regression scenarios ────────
+# Regression proofs that the US-006 fail-closed semantics are enforced. The
+# analogous unit boundary lives in tt-report.test.mjs (pre-fix NOT_RUN
+# (predicate) encoding => vacuous GREEN exit 0; fail-closed encoding => INFRA
+# exit 2). Every scenario below asserts the post-fix contract directly, so it
+# would FAIL under the pre-fix encoding: Scenario B asserts GREEN where
+# pre-fix was already GREEN but for the wrong (vacuous) reason, and the scope
+# scenario asserts INFRA exit 2 + host-profile-missing where pre-fix would
+# have reported GREEN exit 0 with all predicate cells NOT_RUN-skipped.
+write_satisfying_host_profile
+
+# US-007 Scenario B (complete): VALID host profile + MIXED selection — one
+# cell with an unsatisfiable requires (legit predicate skip on linux) and one
+# cell whose predicates are satisfied and must EXECUTE (PASS). The legit skip
+# is preserved as NOT_RUN(predicate), never host-profile-missing, and the
+# combined selection stays GREEN exit 0 (the executing cell proves the
+# verdict is not vacuous). This is the "combined with an otherwise green
+# selection, verdict stays GREEN" acceptance criterion.
+us007_mixed_manifest="$TEST_ROOT/manifests/us007-mixed-skip-run.jsonl"
+: > "$us007_mixed_manifest"
+write_local_requires_case "$us007_mixed_manifest" "US007-SKIP" '{"platform":"darwin"}'
+write_local_requires_case "$us007_mixed_manifest" "US007-RUN" '{"toolchains":["node"]}'
+us007_mixed_output=$("$CONTROLLER" --manifest "$us007_mixed_manifest" 2>&1)
+us007_mixed_status=$?
+[ "$us007_mixed_status" -eq 0 ] || fail "US-007 scenario B (valid profile, mixed skip+run) must stay GREEN exit 0: $us007_mixed_output"
+us007_mixed_id=$(remember_campaign "$us007_mixed_output")
+node --input-type=module - "$TT_DIR/var/results/$us007_mixed_id/state.json" <<'NODE' || fail "US-007 scenario B state contract violated"
+import fs from 'node:fs';
+const state = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const byId = new Map(state.cases.map((item) => [item.id, item]));
+const skip = byId.get('US007-SKIP');
+if (!skip || skip.outcome !== 'NOT_RUN' || skip.reason?.category !== 'predicate') {
+  throw new Error(`legit predicate skip not preserved as NOT_RUN(predicate): ${JSON.stringify(skip)}`);
+}
+const run = byId.get('US007-RUN');
+if (!run || run.outcome !== 'PASS') {
+  throw new Error(`predicate-satisfied cell did not execute PASS: ${JSON.stringify(run)}`);
+}
+if (state.cases.some((item) => item.reason?.category === 'host-profile-missing')) {
+  throw new Error(`valid profile produced host-profile-missing findings: ${JSON.stringify(state.cases.map((i) => i.reason))}`);
+}
+NODE
+grep -Fq 'GREEN (exit 0)' "$TT_DIR/var/results/$us007_mixed_id/report.txt" || fail "US-007 scenario B report must be GREEN (exit 0)"
+grep -Fq 'NOT_RUN' "$TT_DIR/var/results/$us007_mixed_id/report.txt" || fail "US-007 scenario B report must list the legit predicate skip"
+pass "US-007 scenario B: valid profile + unsatisfied requires stays NOT_RUN(predicate), combined selection stays GREEN"
+
+# US-007 Scenario A/complement (fail-closed SCOPING): MISSING host profile +
+# MIXED selection — one cell with `requires` and one cell with none. The
+# require-carrying cell must be terminal TEST_INFRA_FAIL(host-profile-missing)
+# => INFRA exit 2 (never NOT_RUN(predicate), never GREEN — pre-fix behavior),
+# while the no-requires cell is UNAFFECTED and still executes PASS. This
+# proves fail-closed fires precisely on predicate-bound cells and does not
+# over-block non-requiring cells, while the campaign still reports the finding.
+us007_scope_manifest="$TEST_ROOT/manifests/us007-missing-scope.jsonl"
+: > "$us007_scope_manifest"
+write_local_requires_case "$us007_scope_manifest" "US007-REQ" '{"toolchains":["node"]}'
+write_local_requires_case "$us007_scope_manifest" "US007-PLAIN" '{}'
+rm -f -- "$HOST_PROFILE"
+set +e
+us007_scope_output=$("$CONTROLLER" --manifest "$us007_scope_manifest" 2>&1)
+us007_scope_status=$?
+set -e
+[ "$us007_scope_status" -eq 2 ] || fail "US-007 scenario A (missing profile, mixed) must exit 2 INFRA: $us007_scope_output"
+us007_scope_id=$(remember_campaign "$us007_scope_output")
+node --input-type=module - "$TT_DIR/var/results/$us007_scope_id/state.json" <<'NODE' || fail "US-007 scenario A state contract violated"
+import fs from 'node:fs';
+const state = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const byId = new Map(state.cases.map((item) => [item.id, item]));
+const req = byId.get('US007-REQ');
+if (!req || req.outcome !== 'TEST_INFRA_FAIL' || req.reason?.category !== 'host-profile-missing') {
+  throw new Error(`require-carrying cell is not TEST_INFRA_FAIL(host-profile-missing): ${JSON.stringify(req)}`);
+}
+if (req.outcome === 'NOT_RUN' && req.reason?.category === 'predicate') {
+  throw new Error(`pre-fix NOT_RUN(predicate) encoding resurfaced: ${JSON.stringify(req.reason)}`);
+}
+if (typeof req.reason?.message !== 'string' || !/cannot load required host profile/.test(req.reason.message)) {
+  throw new Error(`host-profile-missing reason must carry the underlying load error: ${JSON.stringify(req.reason)}`);
+}
+const plain = byId.get('US007-PLAIN');
+if (!plain || plain.outcome !== 'PASS') {
+  throw new Error(`no-requires cell must be unaffected by the missing profile and execute PASS: ${JSON.stringify(plain)}`);
+}
+NODE
+grep -Fq 'INFRA FAILURES' "$TT_DIR/var/results/$us007_scope_id/report.txt" || fail "US-007 scenario A report must surface INFRA FAILURES"
+grep -Fq 'INFRA_FAILURE (exit 2)' "$TT_DIR/var/results/$us007_scope_id/report.txt" || fail "US-007 scenario A report must carry INFRA_FAILURE (exit 2)"
+write_satisfying_host_profile
+pass "US-007 scenario A/complement: missing profile fail-closes only require-carrying cells (INFRA exit 2), no-requires cell unaffected"
+
+# ── MACP3 US-008: bare-campaign vacuity guard ─────────────────────────────
+# A bare (--scripted-only) campaign whose every scripted cell is skipped by
+# an HONEST predicate (valid loaded host profile, unsatisfiable requires) with
+# ZERO executions produces zero evidence. Post-US-008 that must be
+# RED/FINDINGS (exit 1) with a machine-parseable vacuous-campaign finding,
+# never GREEN — the vacuous-GREEN class that hid the a446deac Darwin defect
+# through the predicate path. These scenarios run the controller in true bare
+# mode (--scripted-only => execution_selection 'scripted-only') so the guard
+# is exercised over the exact state shape it is wired for. Every scenario
+# would FAIL under the pre-US-008 verdict logic, which rendered GREEN exit 0
+# for an all-skipped bare campaign.
+write_satisfying_host_profile
+
+# US-008 red (real likelihood on linux): a manifest whose only scripted cells
+# carry requires.{platform:darwin} is legitimately unsatisfiable here, so the
+# cells are honest NOT_RUN(predicate) under a LOADED profile. Zero cells
+# execute -> the campaign must FAIL closed with exit 1 and a vacuous-campaign
+# finding, and the report must never render GREEN.
+us008_all_skip_manifest="$TEST_ROOT/manifests/us008-all-skip.jsonl"
+: > "$us008_all_skip_manifest"
+write_local_requires_case "$us008_all_skip_manifest" "US008-SKIP-A" '{"platform":"darwin"}'
+write_local_requires_case "$us008_all_skip_manifest" "US008-SKIP-B" '{"platform":"darwin"}'
+set +e
+us008_all_skip_output=$("$CONTROLLER" --manifest "$us008_all_skip_manifest" --scripted-only 2>&1)
+us008_all_skip_status=$?
+set -e
+[ "$us008_all_skip_status" -eq 1 ] || fail "US-008 AC1: all-scripted-skipped bare campaign must exit 1 (FINDINGS): $us008_all_skip_output"
+us008_all_skip_id=$(remember_campaign "$us008_all_skip_output")
+node --input-type=module - "$TT_DIR/var/results/$us008_all_skip_id/state.json" "$TT_DIR/var/results/$us008_all_skip_id/report.json" <<'NODE' || fail "US-008 AC1 state/report contract violated"
+import fs from 'node:fs';
+const [statePath, reportPath] = process.argv.slice(2);
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+if ((state.options.execution_selection ?? '') !== 'scripted-only') {
+  throw new Error(`expected scripted-only execution selection: ${JSON.stringify(state.options.execution_selection)}`);
+}
+for (const item of state.cases) {
+  if (item.outcome !== 'NOT_RUN' || item.reason?.category !== 'predicate') {
+    throw new Error(`all cells must be honest NOT_RUN(predicate) skips: ${JSON.stringify({id:item.id,outcome:item.outcome,reason:item.reason})}`);
+  }
+  if (item.attempts.length !== 0) throw new Error(`zero executions expected: ${JSON.stringify({id:item.id,attempts:item.attempts})}`);
+}
+const report = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
+if (report.verdict !== 'FINDINGS' || report.exit_code !== 1) {
+  throw new Error(`report must be FINDINGS (exit 1): ${JSON.stringify({verdict:report.verdict,exit_code:report.exit_code})}`);
+}
+if (report.vacuity?.triggered !== true) throw new Error('vacuity guard must be the operative signal');
+const vic = report.findings.find((f) => f.category === 'vacuous-campaign');
+if (!vic) throw new Error('findings must contain a machine-parseable vacuous-campaign finding');
+if (typeof vic.summary !== 'string' || !/executed zero scripted cells/.test(vic.summary)) {
+  throw new Error(`vacuous-campaign summary must name the cause: ${JSON.stringify(vic)}`);
+}
+NODE
+grep -Fq 'VACUOUS_CAMPAIGN' "$TT_DIR/var/results/$us008_all_skip_id/report.txt" \
+  || fail "US-008 AC1 report.txt must list the vacuous-campaign finding"
+grep -Fq 'FINDINGS (exit 1)' "$TT_DIR/var/results/$us008_all_skip_id/report.txt" \
+  || fail "US-008 AC1 report.txt must carry FINDINGS (exit 1)"
+if grep -Fq 'GREEN (exit 0)' "$TT_DIR/var/results/$us008_all_skip_id/report.txt"; then
+  fail "US-008 AC1 all-skipped bare campaign must not render GREEN"
+fi
+pass "US-008 AC1: all-scripted-skipped bare campaign exits 1 with a vacuous-campaign finding (never GREEN)"
+
+# US-008 green arm: at least one cell EXECUTES (satisfied requires -> PASS)
+# alongside a legit predicate skip. The campaign stays GREEN exit 0 and the
+# vacuity guard is silent — the combined-selection bound (US-007 Scenario B
+# semantics) is preserved under the vacuity guard.
+us008_mixed_manifest="$TEST_ROOT/manifests/us008-mixed.jsonl"
+: > "$us008_mixed_manifest"
+write_local_requires_case "$us008_mixed_manifest" "US008-RUN" '{"toolchains":["node"]}'
+write_local_requires_case "$us008_mixed_manifest" "US008-SKIP" '{"platform":"darwin"}'
+set +e
+us008_mixed_output=$("$CONTROLLER" --manifest "$us008_mixed_manifest" --scripted-only 2>&1)
+us008_mixed_status=$?
+set -e
+[ "$us008_mixed_status" -eq 0 ] || fail "US-008 AC2: bare campaign with an executing cell must stay GREEN exit 0: $us008_mixed_output"
+us008_mixed_id=$(remember_campaign "$us008_mixed_output")
+node --input-type=module - "$TT_DIR/var/results/$us008_mixed_id/report.json" <<'NODE' || fail "US-008 AC2 report contract violated"
+import fs from 'node:fs';
+const report = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+if (report.verdict !== 'GREEN' || report.exit_code !== 0) {
+  throw new Error(`expected GREEN exit 0: ${JSON.stringify({verdict:report.verdict,exit_code:report.exit_code})}`);
+}
+if (report.vacuity?.triggered === true) throw new Error('vacuity guard must be silent with >=1 executed cell');
+if (report.findings.some((f) => f.category === 'vacuous-campaign')) {
+  throw new Error('no vacuous-campaign finding expected when a cell executed');
+}
+NODE
+grep -Fq 'GREEN (exit 0)' "$TT_DIR/var/results/$us008_mixed_id/report.txt" \
+  || fail "US-008 AC2 report must be GREEN (exit 0)"
+pass "US-008 AC2: bare campaign with >=1 executed scripted cell stays GREEN exit 0 (no vacuous finding)"
+
+# US-008 infra precedence: a missing host profile fail-closes require-bound
+# cells to TEST_INFRA_FAIL (US-006) => exit 2 INFRA. The infra RED explains
+# the failure precisely; the vacuity guard must NOT add a vacuous-campaign
+# finding or downgrade to a vacuity FINDINGS.
+us008_precedence_manifest="$TEST_ROOT/manifests/us008-precedence.jsonl"
+: > "$us008_precedence_manifest"
+write_local_requires_case "$us008_precedence_manifest" "US008-REQ" '{"toolchains":["node"]}'
+rm -f -- "$HOST_PROFILE"
+set +e
+us008_precedence_output=$("$CONTROLLER" --manifest "$us008_precedence_manifest" --scripted-only 2>&1)
+us008_precedence_status=$?
+set -e
+[ "$us008_precedence_status" -eq 2 ] || fail "US-008 precedence: missing-profile bare campaign must exit 2 INFRA: $us008_precedence_output"
+us008_precedence_id=$(remember_campaign "$us008_precedence_output")
+node --input-type=module - "$TT_DIR/var/results/$us008_precedence_id/report.json" <<'NODE' || fail "US-008 precedence report contract violated"
+import fs from 'node:fs';
+const report = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+if (report.verdict !== 'INFRA_FAILURE' || report.exit_code !== 2) {
+  throw new Error(`infra must take precedence: ${JSON.stringify({verdict:report.verdict,exit_code:report.exit_code})}`);
+}
+if (report.vacuity?.triggered === true) {
+  throw new Error('infra-driven campaign must not be flagged as the vacuity signal');
+}
+if (report.findings.some((f) => f.category === 'vacuous-campaign')) {
+  throw new Error('infra-driven campaign must not carry a vacuous-campaign finding');
+}
+if (!Array.isArray(report.infra_failures) || report.infra_failures.length !== 1) {
+  throw new Error(`expected 1 infra failure: ${JSON.stringify(report.infra_failures)}`);
+}
+NODE
+grep -Fq 'INFRA_FAILURE (exit 2)' "$TT_DIR/var/results/$us008_precedence_id/report.txt" \
+  || fail "US-008 precedence report must carry INFRA_FAILURE (exit 2)"
+write_satisfying_host_profile
+pass "US-008 precedence: infra failure masks the vacuity finding (INFRA exit 2, no vacuous-campaign)"
 
 empty_requires="$TEST_ROOT/manifests/empty-requires.jsonl"
 valid_case "PROFILE-NOT-REQUIRED" | sed 's/"requires":{"toolchains":\["node"\]}/"requires":{}/' > "$empty_requires"

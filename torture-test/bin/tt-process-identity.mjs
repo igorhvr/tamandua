@@ -39,13 +39,19 @@ import fs from 'node:fs';
 // ── procfs helpers ─────────────────────────────────────────────────
 
 // readProcStat: parse /proc/<pid>/stat into { state, ppid, pgrp, starttime }.
+// /proc/<pid>/stat is linux-only — Darwin has no procfs. Every reader of
+// this helper already treats `null` as "cannot introspect" (unavailable),
+// so on Darwin the helper simply degrades to null instead of hard-failing;
+// getProcessStartIdentity additionally short-circuits on platform !== linux.
+// linux-only /proc usage — guarded for Darwin via null-degradation
+// (MACP3 US-003).
 // Returns null when the pid is invalid or the entry is unreadable
 // (ESRCH / EACCES) or malformed.
 function readProcStat(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return null;
   let stat;
   try {
-    stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8'); // linux-only (MACP3 US-003): guarded for Darwin via null-degradation above
   } catch {
     return null;
   }

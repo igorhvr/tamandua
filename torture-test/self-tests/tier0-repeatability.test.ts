@@ -95,6 +95,10 @@ function processIsAlive(pid: number): boolean {
 
 function scenarioOwnedProcesses(): string[] {
   const matches: string[] = [];
+  // /proc introspection below is linux-only (MACP3 US-003). Darwin branch:
+  // Darwin has no procfs, so return an empty match list (nothing to clean up)
+  // instead of throwing on readdirSync("/proc"). Linux behavior unchanged.
+  if (process.platform !== "linux") return matches;
   for (const entry of fs.readdirSync("/proc")) {
     if (!/^\d+$/.test(entry) || Number(entry) === process.pid) continue;
     try {
@@ -105,7 +109,9 @@ function scenarioOwnedProcesses(): string[] {
         matches.push(`${entry}: ${command}`);
       }
     } catch {
-      // The process exited or is not inspectable between readdir and read.
+      // The process exited or is not inspectable between readdir and read (
+      // linux-only; on a /proc-less host the early Darwin return above already
+      // handled it — MACP3 US-003).
     }
   }
   return matches;

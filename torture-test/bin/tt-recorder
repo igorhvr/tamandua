@@ -209,12 +209,16 @@ _is_production_cwd() {
 #
 # Uses /proc/net/tcp and /proc/<pid>/fd/ symlink targets — evidence-based,
 # never name-only or env-based.
+# linux-only /proc usage (MACP3 US-003): guarded for Darwin — Darwin has no
+# procfs, so the [ -d "$fd_dir" ] check and explicit 2>/dev/null on the socket-
+# inode reads make a /proc-less host harmlessly return "not a production
+# listener" (no hard failure).
 _is_production_ports() {
     local pid="$1"
     local fd_dir="/proc/$pid/fd"
     [ -d "$fd_dir" ] || return 1
 
-    # Collect socket inodes for production ports from /proc/net/tcp.
+    # Collect socket inodes from /proc/net/tcp (linux-only; see guard above).
     # Ports in hex: 3334=0D06, 3338=0D0A, 3339=0D0B. State 0A=LISTEN.
     local prod_inodes
     prod_inodes="$(awk '
@@ -276,6 +280,9 @@ _find_pids() {
     tt_root_resolved="$(readlink -f "$TT_ROOT" 2>/dev/null || printf '%s' "$TT_ROOT")"
 
     # Phase 1: collect raw PIDs from cwd and cmdline evidence
+    # linux-only /proc scan (MACP3 US-003): guarded for Darwin — find/grep
+    # with 2>/dev/null over /proc simply match nothing on a /proc-less host,
+    # yielding an empty candidate list (no hard failure).
     local raw_pids
     raw_pids="$(
         find /proc/[0-9]*/cwd -lname "*/torture-test/var*" 2>/dev/null | \
@@ -295,6 +302,9 @@ _find_pids() {
     local pid pid_cwd
     for pid in $pids; do
         [ -n "$pid" ] || continue
+        # linux-only /proc/<pid> existence + cwd symlink checks (MACP3 US-003):
+        # guarded for Darwin by [ -d ]/readlink with 2>/dev/null — a /proc-less
+        # host skips every candidate (no candidates to begin with) safely.
         [ -d "/proc/$pid" ] || continue
 
         pid_cwd="$(readlink -f "/proc/$pid/cwd" 2>/dev/null || true)"
@@ -340,6 +350,9 @@ discover_processes() {
 
     for pid in $pids; do
         [ -n "$pid" ] || continue
+        # linux-only /proc/<pid> reads (MACP3 US-003): guarded for Darwin by
+        # the [ -d ] check and per-read 2>/dev/null — a /proc-less host yields
+        # an empty process list rather than erroring.
         local pid_dir="/proc/$pid"
         [ -d "$pid_dir" ] || continue
 
@@ -391,6 +404,9 @@ collect_sample() {
 
     for pid in $pids; do
         [ -n "$pid" ] || continue
+        # linux-only /proc/<pid> reads (MACP3 US-003): guarded for Darwin by
+        # the [ -d ] check and per-read 2>/dev/null — a /proc-less host yields
+        # an empty sample series rather than erroring.
         local pid_dir="/proc/$pid"
         [ -d "$pid_dir" ] || continue
 
@@ -561,6 +577,8 @@ cmd_start() {
     local existing_pid
     existing_pid="$(cat "$pidfile" 2>/dev/null || true)"
     if [ -n "$existing_pid" ] && [ -d "/proc/$existing_pid" ]; then
+      # linux-only /proc/<pid> reads (MACP3 US-003): guarded for Darwin —
+      # [ -d ] + 2>/dev/null treats the pidfile as stale (conservative).
       # Evidence-based: verify cmdline contains "tt-recorder"
       local ex_cmdline
       ex_cmdline="$(tr '\0' ' ' < "/proc/$existing_pid/cmdline" 2>/dev/null || true)"
@@ -605,6 +623,9 @@ cmd_stop() {
   pid="$(cat "$pidfile" 2>/dev/null || true)"
 
   # Verify process exists AND its cmdline contains "tt-recorder" (evidence-based)
+  # /proc existence + cmdline reads below are linux-only (MACP3 US-003):
+  # guarded for Darwin by [ -d ] + 2>/dev/null — on a /proc-less host every
+  # check treats the pidfile as stale (conservative).
   if [ -z "$pid" ] || [ ! -d "/proc/$pid" ]; then
     # Process dead — stale pidfile
     rm -f "$pidfile"
@@ -627,6 +648,10 @@ cmd_stop() {
   # Send SIGTERM and wait up to 5 seconds
   kill -TERM "$pid" 2>/dev/null || true
 
+  # /proc/<pid> existence polls below are linux-only (MACP3 US-003): guarded
+  # for Darwin by [ -d ] — on a /proc-less host every "alive?" check reads
+  # false, so the stop path completes the two signal rounds immediately
+  # (conservative; no hang).
   local waited=0
   while [ -d "/proc/$pid" ] && [ "$waited" -lt 50 ]; do
     sleep 0.1
@@ -666,6 +691,9 @@ cmd_status() {
     pid="$(cat "$pidfile" 2>/dev/null || true)"
 
     # Evidence-based: verify process is alive AND cmdline contains tt-recorder
+    # linux-only /proc existence + cmdline reads (MACP3 US-003): guarded for
+    # Darwin by [ -d ] + 2>/dev/null — on a /proc-less host status reports
+    # the recorder as not running (stale pidfile), conservative.
     if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then
       local cmdline
       cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"

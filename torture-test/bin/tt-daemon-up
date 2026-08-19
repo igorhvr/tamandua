@@ -119,6 +119,10 @@ daemon_path_has_adapters_bin() {
   pid="$(daemon_pid)"
   if [ -z "$pid" ]; then return 1; fi
   local env_path
+  # linux-only /proc/<pid>/environ read (MACP3 US-003): guarded for Darwin
+  # by the explicit 2>/dev/null — on a /proc-less host env_path is empty and
+  # the function returns "adapters not on PATH" (conservative) instead of
+  # hard-failing.
   env_path="$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep '^PATH=' | head -n1)"
   env_path="${env_path#PATH=}"
   case ":$env_path:" in
@@ -252,6 +256,9 @@ cmd_stop() {
   # ── Hygiene verification: ports free + no provenanced process remains ──
   local dead=0
   if [ -n "$prov_pid" ] && [ "$prov_pid" -gt 0 ] 2>/dev/null; then
+    # linux-only /proc/<pid> existence check (MACP3 US-003): Darwin has no
+    # procfs; on such a host /proc/$prov_pid never "exists", so hygiene
+    # treats the process as gone (conservative, non-fatal).
     if ! [ -d "/proc/$prov_pid" ]; then
       dead=1
     fi

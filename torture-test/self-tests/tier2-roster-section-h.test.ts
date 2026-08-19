@@ -456,6 +456,9 @@ describe("Tier-2 US-011 — section-H roster (platform-conditional lanes)", () =
       "sqlite_master",                                // schema drift check
       "zero behavioral drift",                        // the DC44 contract
       "runtime B",                                    // the cross-runtime switch
+      // "/proc/" needle is a linux-only assertion string (MACP3 US-003): it
+      // is matched against run-cross-runtime.mjs SOURCE text only, never a
+      // runtime /proc access — unreachable as runtime code on Darwin.
       "/proc/", "exe",                                // daemon-node assertion
       "volta",                                        // runtime discovery source
     ]) {

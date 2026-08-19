@@ -121,7 +121,9 @@ test('O4 live-pgid reaping is identity-verified: stale/reused records are skippe
     assert.ok(skippedDecoy !== undefined, `stale decoy record must be skipped: ${JSON.stringify(skipped)}`);
     assert.match(skippedDecoy.reason, /startTime mismatch|pid reuse|ABA/, `skip reason must be the identity mismatch: ${skippedDecoy.reason}`);
     // The genuine sleep is gone (node reaps the SIGKILLed child -> exit event,
-    // after which the pid is absent from /proc)...
+    // after which the pid is absent from /proc — linux-only introspection; on
+    // a /proc-less Darwin host getProcessStartIdentity returns null for any
+    // pid, so this assertion cannot false-pass. MACP3 US-003)
     await Promise.race([
       once(genuine.child, 'exit'),
       new Promise((resolve) => setTimeout(resolve, 5000)),

@@ -37,6 +37,13 @@
 // o4.test.mjs, reap-live-pgids.test.mjs, tier1-scripted-probe-battery).
 // This scanner is the reproducible static audit on top of them.
 //
+// Note on /proc references: every /proc mention in this file is either a
+// static regex or prose describing the LINUX-ONLY procfs facility the
+// audited kill sites may never use as a target resolver. It does no runtime
+// /proc access itself, so on a /proc-less Darwin host the scanner is simply
+// matching source text — nothing to degrade (linux-only, unreachable-on-
+// Darwin as runtime code; MACP3 US-003 guarded by construction).
+//
 // Confined to torture-test/. Zero tokens. Read-only.
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -62,6 +69,9 @@ const INLINE_RESOLVE_BANS: RegExp[] = [
   /\bps\b[^\n]*\|\s*[^\n]*\bkill[ \t]+/, // ps ... | kill
   /\bkill[ \t]+[^\n]*\$\s*\(\s*ps\b/, // kill $(ps ...)
   /\bfind\s+\/proc\b/, // find /proc — enumeration as target source
+  // linux-only /proc/[0-9]* glob pattern (MACP3 US-003): static regex only —
+  // on Darwin there is no /proc for a glob to sweep, so the pattern can
+  // never false-match; unreachable as runtime code by construction.
   /\bfor\b[^\n]*\bin\b[^\n]*\/proc\/\[0-9/, // bash /proc/[0-9]* glob loop
 ];
 

@@ -56,3 +56,72 @@ campaign-20260818T163719127Z-a61d3870 tier0, campaign-20260818T163720247Z-3ca0ef
   tier2 scenario dirs; oracle evidence writer, tt-verify-environment,
   predicate evaluation, and verdict logic are yours. Rebase onto
   current main before finalize if it has moved.
+
+## Evidence note — US-010 (a) landing (MACP3.1 salvage, run-8b9671d8)
+
+This section records the honest landing of the work described above. The
+original MACP3 run (run-0ba389c8) force-failed on the abandonment ceiling
+(8/8) WITHOUT merging — it was mistakenly launched on the pi harness,
+whose ~66-minute internal round cap kept truncating the long final-proof
+round mid-work (clean exit, no STATUS, outcome other_output; evidence in
+tamandua.log, "Orphaned step recovery" entries, 2026-08-19). The work
+through US-009 was complete and good on branch
+`feature/macp3-procfd-portability-vacuous-green`; the MACP3.1 salvage
+adopted it, reconciled it with main (which had moved: KSNT a446deac +
+T2.1 ea8563c9), re-validated it on the union, and lands it here.
+
+### Adopted commits (US-001 .. US-009)
+
+Each commit below was implemented and reviewed by its own verifier on the
+original MACP3 branch, then merged into `feature/macp3.1-salvage-land`
+(merge `3651f00c`, union HEAD `17ac9e7e`):
+
+| Story | Commit | Deliverable |
+|-------|--------|-------------|
+| US-001 | `922c0f34` | Portable exclusive-create in oracle evidence writer (replaces the `/proc/self/fd/<n>/<name>` pattern) |
+| US-002 | `94b2cafe` | Hermetic red-then-green tests for the portable exclusive create (simulate missing /proc via injectable platform seam) |
+| US-003 | `14ac1c01` | /proc sweep of runtime tools (guard with a Darwin branch or inline doc) |
+| US-004 | `58c249fc` | /proc sweep of test harnesses (`.test.sh` / test scripts) with inline docs |
+| US-005 | `90c21f14` | Lint-style self-test banning unguarded `/proc` literals in torture-test (allowlist, G1/G2/G3/G4 gates) |
+| US-006 | `01bfc95f` | Fail-closed predicate semantics: absent/failed host profile => TEST_INFRA_FAIL (host-profile-missing), never a silent skip |
+| US-007 | `67f83c11` | Tests for fail-closed predicate semantics (unit + controller-level) |
+| US-008 | `ba3fc754` | Vacuity guard for BARE verdicts: all-scripted-skipped => RED (vacuous-campaign finding) |
+| US-009 | `f53737f9` | Red-then-green proof for the bare vacuity guard (branch HEAD) |
+
+### Union re-validation evidence (US-002 .. US-005, run-8b9671d8)
+
+All suites were re-run on the merged union from repo root and exited 0 —
+the adopted branch was NOT assumed correct because its own verifier passed
+it. Evidence-pointer commits: US-002 `c973db58`, US-003 `519ee6a7`,
+US-004 `f70ec2d3`, US-005 `51baebd0`.
+
+- **Scope-isolation suite (T2.1 reconciliation)** — `node --test
+  torture-test/self-tests/tier1-daemon-control-scope-isolation.test.ts`
+  (7/7) and `tier2-cross-worktree-scope-isolation.test.ts` (6/6): the
+  per-worktree daemon-control scope derivation and stop isolation stay
+  green on the union with the MACP3 /proc sweep.
+- **/proc portability lint + evidence portability** — `node --test
+  torture-test/self-tests/tier0-procfs-portability-lint.test.ts` (11/11,
+  incl. the G1/G2/G3/G4 mutation proofs; G4 covers the four T2.1-owned
+  daemon-control paths) and `node --test
+  torture-test/oracles/lib/evidence-portability.test.mjs` (8/8: portable
+  exclusive-create, Darwin no-/proc simulation, O_NOFOLLOW, containment).
+- **Vacuity guard red-then-green + fail-closed predicates** — `node
+  --test torture-test/self-tests/tier1-bare-vacuity-red-green.test.ts`
+  (3/3: RED arm all-scripted-skipped => FINDINGS exit 1 with a
+  vacuous-campaign finding; GREEN arm exit 0 with 4 genuinely executed
+  scripted cells) and `node --test torture-test/bin/tt-report.test.mjs`
+  (19/19 fail-closed predicate + vacuity verdict unit tests).
+- **Tier2-assets guard suite** — `node --test
+  torture-test/self-tests/tier2-tier2-assets.test.ts` (8/8) and `bash
+  torture-test/bin/tt-tier2-assets.test.sh` (22/22).
+- **Typecheck** — `npm run build` (tsc typecheck + version injection)
+  exits 0 on the union.
+
+No genuine defect was found during the main reconciliation or the union
+re-validation — no code fixes beyond the adopted branch were required.
+The remaining original US-010 gates — (b) full self-test battery
+`./torture-test/self-tests/run.sh` exit 0 and (c) bare
+`./run-torture-test --tier1` GREEN with the vacuity guard live — are
+recorded in the MACP3.1 landing report
+(`impl-tasks/MACP3.1-salvage-complete-procfd-vacuity.md`).

@@ -77,6 +77,11 @@ HEAVY_CAMPAIGN_TESTS=(
     'scripted-scenario-harness.test.ts'
     'tier0-repeatability.test.ts'
     'tier1-case-filter.test.ts'
+    # MACP3 US-009: the bare-vacuity red-then-green proof drives a REAL bare
+    # tier1 control campaign (scripted daemon, 4 local cells execute) — the
+    # same unbounded campaign class as the other heavy proofs, so it is
+    # isolated here with its own ceiling.
+    'tier1-bare-vacuity-red-green.test.ts'
     'tier1-e26-real-launch-proof.test.ts'
     'tier1-include-real-proof.test.ts'
     'tier1-real-case-proof.test.ts'

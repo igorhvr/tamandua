@@ -20,7 +20,9 @@
 //     --signal for kill actions and --hold-seconds only for sigstop_sigcont,
 //     plus (E3.C.1 US-003) the EXPLICIT recorded harness target
 //     (--target-pid/--target-pgid/--target-start-time) so tt-chaos never
-//     re-resolves the harness by /proc sweep, and the chaos evidence records
+//     re-resolves the harness by /proc sweep (linux-only facility — MACP3
+//     US-003: source-text/prose reference only here, no runtime /proc
+//     access), and the chaos evidence records
 //     the declared signal/tree;
 //   * TT_DRY_RUN_REAL_LAUNCH PASSes on a kill-chaos case (zero tokens).
 //
@@ -362,7 +364,8 @@ exit 0
     // E3.C.1 US-003: the controller records the harness identity at launch
     // (launch-process record in the stub campaign) and hands it to tt-chaos
     // as EXPLICIT --target-* args — the operator must never re-resolve the
-    // harness by /proc sweep. Assert the recorded target is present and the
+    // harness by /proc sweep (prose reference to the linux-only facility;
+    // no runtime /proc access in this file — MACP3 US-003). Assert the recorded target is present and the
     // argv carries exactly its pid/pgid/startTime (startTime 'proc:'-stripped
     // like buildChaosArgv does).
     const killTarget = killEvidence.target_record;

@@ -2,6 +2,11 @@
 // tt-process-identity.test.mjs — unit tests for the torture-test-local
 // process-kill safety primitives (E3.C.1 US-001).
 //
+// MACP3 US-004 doc note: the '/proc' mention below is linux-only documentation
+// prose (zombie semantics are a procfs concept); the actual procfs reads live
+// inside tt-process-identity (already linux-only-guarded per US-003) and this
+// harness has no runtime procfs access of its own.
+//
 // Run: node --test torture-test/bin/tt-process-identity.test.mjs
 
 import assert from 'node:assert/strict';
@@ -122,6 +127,10 @@ describe('tt-process-identity.mjs', () => {
       // with an UNCHANGED startTime until Node reaps it (the 'exit' event).
       // getProcessState must surface that zombie so a kill-site audit can
       // distinguish a signalled member from a live one.
+      // MACP3 US-004 doc note: this '/proc' mention is documentation prose — the
+      // actual procfs reads happen inside tt-process-identity getProcessState
+      // (already linux-only-guarded per US-003); on Darwin the /proc zoo/state
+      // detail is conceptual only, with no harness-side procfs access here.
       const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], {
         stdio: 'ignore',
       });
