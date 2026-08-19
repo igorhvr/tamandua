@@ -307,6 +307,20 @@
       font-family: "SF Mono", "Fira Code", monospace;
       font-size: 12px;
     }
+    .daemon-lifecycle {
+      display: none;
+      background: #21262d;
+      color: #8b949e;
+      padding: 8px 24px;
+      font-size: 12px;
+      border-bottom: 1px solid #30363d;
+    }
+    .daemon-lifecycle.unseen {
+      background: #f8514911;
+      color: #f85149;
+      border-bottom: 1px solid #f8514966;
+      font-weight: 600;
+    }
     .controls-bar {
       display: flex;
       align-items: center;
@@ -422,6 +436,8 @@
     <span id="version-banner-text">A new version of tamandua is available! Run: <code>tamandua update</code></span>
     <button class="banner-dismiss" onclick="dismissVersionBanner()" title="Dismiss">✕</button>
   </div>
+
+  <div class="daemon-lifecycle" id="daemon-lifecycle" title="Most recent daemon exit from lifecycle.log"></div>
 
   <div class="container">
     <!-- MCP Status Section -->
@@ -966,6 +982,33 @@
       }
     }
 
+    async function fetchHealth() {
+      try {
+        const res = await fetch("/api/health");
+        const data = await res.json();
+        renderDaemonLifecycle(data.lastDaemonDeath ?? null);
+      } catch (err) {
+        console.error("Failed to fetch health:", err);
+      }
+    }
+
+    function renderDaemonLifecycle(death) {
+      const el = document.getElementById("daemon-lifecycle");
+      if (!el) return;
+      if (!death) {
+        el.style.display = "none";
+        el.classList.remove("unseen");
+        el.textContent = "";
+        return;
+      }
+      const text = death.kind === "unclean"
+        ? `Last daemon exit: UNCLEAN${death.unseen ? " (unseen)" : ""} at ${death.ts}`
+        : `Last daemon exit: clean at ${death.ts}`;
+      el.textContent = text;
+      el.classList.toggle("unseen", death.kind === "unclean" && !!death.unseen);
+      el.style.display = "block";
+    }
+
     function dismissVersionBanner() {
       const banner = document.getElementById("version-banner");
       if (banner) banner.style.display = "none";
@@ -1011,6 +1054,7 @@
       fetchSuiteFlaky();
       fetchLogsTail();
       fetchStats();
+      fetchHealth();
       fetchBuildVersion();
       fetchVersionStatus();
       document.getElementById("last-update").textContent = new Date().toLocaleTimeString();

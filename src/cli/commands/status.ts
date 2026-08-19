@@ -14,6 +14,8 @@ import {
   collectTamanduaInfo,
   collectRunsSummary,
   collectProcessList,
+  formatDaemonLifecycle,
+  collectDaemonLifecycle,
 } from "../status-format.js";
 import { getVersion } from "./standalone.js";
 
@@ -62,14 +64,16 @@ Usage: tamandua status [--json]
 Displays a comprehensive status overview of the Tamandua system, including:
 
   Services — Dashboard, daemon (control-plane+motor), and MCP status (up/down, PID, port)
+  Daemon Lifecycle — Most recent daemon death (clean or unclean), with an
+                  [UNSEEN] marker on a fresh unclean death
   Tamandua Info — Source path, skill path, version, and source tree SHA256
   Workflow Runs — Summary of all runs (running, paused, done, failed), with
                   visible red-ledger landing annotations when present
   Running Processes — Active pi/hermes/dsh harness processes spawned by tamandua
 
 Options:
-  --json    Output a JSON object with services, info, runs, and processes
-            sections for machine consumption. No other stdout.
+  --json    Output a JSON object with services, daemonLifecycle, info, runs,
+            and processes sections for machine consumption. No other stdout.
 
 Examples:
   tamandua status             # Full system status overview
@@ -97,13 +101,14 @@ export async function handleStatus(group: string, args: string[]): Promise<boole
     const jsonFlag = args.includes("--json");
 
     if (jsonFlag) {
-      const [services, info, runs, processes] = await Promise.all([
+      const [services, info, runs, processes, daemonLifecycle] = await Promise.all([
         collectServiceStatusAsync(),
         Promise.resolve(collectTamanduaInfo({ getVersion })),
         Promise.resolve(collectRunsSummary()),
         Promise.resolve(collectProcessList()),
+        Promise.resolve(collectDaemonLifecycle()),
       ]);
-      console.log(JSON.stringify({ services, info, runs, processes }));
+      console.log(JSON.stringify({ services, info, runs, processes, daemonLifecycle }));
       return true;
     }
 
@@ -111,6 +116,10 @@ export async function handleStatus(group: string, args: string[]): Promise<boole
     console.log("===============");
     console.log();
     console.log(await formatServiceStatusAsync());
+    console.log();
+    console.log("---");
+    console.log();
+    console.log(formatDaemonLifecycle());
     console.log();
     console.log("---");
     console.log();

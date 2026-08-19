@@ -24,6 +24,7 @@ import { getDb, getSystemTokenSpend, getAutoresearchSessions, getAutoresearchSes
 import { getRecentEvents, getRunEvents, readEventsFromCursor, countRunEvents, type EventCursorSource } from "../installer/events.js";
 import { formatLogsTailLines } from "../installer/logs-tail-format.js";
 import { getMcpStatus } from "./daemonctl.js";
+import { getLastDaemonDeath, isUnseenDaemonDeath } from "./daemon-lifecycle.js";
 import { buildKanbanSnapshot, buildKanbanCardDetail } from "./kanban-data.js";
 import { pauseRunWithDaemon, resumeRunWithDaemon } from "./control-client.js";
 import { runWorkflow } from "../installer/run.js";
@@ -498,11 +499,16 @@ function handleHealth(_req: http.IncomingMessage, res: http.ServerResponse): voi
     const db = getDb();
     // Quick health check: can we query the DB?
     db.prepare("SELECT 1").get();
+    // Surface the most recent daemon death (clean/unclean) with its unseen
+    // flag computed from lifecycle-seen.json. Read-only: the dashboard never
+    // acknowledges/mutates the seen state — that is the CLI's text path.
+    const death = getLastDaemonDeath();
     jsonResponse(res, {
       status: "ok",
       uptime: process.uptime(),
       pid: process.pid,
       timestamp: new Date().toISOString(),
+      lastDaemonDeath: death === null ? null : { ...death, unseen: isUnseenDaemonDeath(death) },
     });
   } catch (err) {
     errorResponse(res, `Health check failed: ${(err as Error).message}`, 503);

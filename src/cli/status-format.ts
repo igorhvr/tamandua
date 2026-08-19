@@ -9,6 +9,13 @@
 import { execSync } from "node:child_process";
 import { getDaemonStatus, getDashboardStatus, getMcpStatus, getControlPlaneStatus, getMcpStatusAsync, getControlPlaneStatusAsync, isRunning } from "../server/daemonctl.js";
 import { ABANDONED_THRESHOLD_MS } from "../installer/step-ops.js";
+import {
+  acknowledgeDaemonDeath,
+  getLastDaemonDeath,
+  isUnseenDaemonDeath,
+  type DaemonDeath,
+  type DaemonctlPathOptions,
+} from "../server/daemon-lifecycle.js";
 
 /**
  * Platform-aware process-listing helper for `tamandua status`.
@@ -147,6 +154,101 @@ export async function formatServiceStatusAsync(opts?: {
   }
 
   return lines.join("\n");
+}
+
+/**
+ * Options for the daemon-lifecycle status surface (formatDaemonLifecycle /
+ * collectDaemonLifecycle).
+ *
+ * `homeDir` resolves the lifecycle state files (lifecycle.log,
+ * lifecycle-seen.json) under `<homeDir>/.tamandua/` instead of
+ * `~/.tamandua/` — matching the DaemonctlPathOptions convention for test
+ * isolation. `getLastDaemonDeath` is the dependency-injection seam for unit
+ * tests; the default is the shared reader from src/server/daemon-lifecycle.js.
+ */
+export interface DaemonLifecycleOpts {
+  /** When set, lifecycle state files resolve under <homeDir>/.tamandua/. */
+  homeDir?: string;
+  /** Dependency injection: override the death reader (default getLastDaemonDeath). */
+  getLastDaemonDeath?: (opts?: DaemonctlPathOptions) => DaemonDeath | null;
+}
+
+/**
+ * Format the 'Daemon Lifecycle' section for `tamandua status`.
+ *
+ * - No death entry → 'No recorded daemon deaths.'
+ * - Clean death → 'Last daemon exit: clean at <ts> (pid <pid>, signal <signal>)'
+ * - Unclean death → 'Last daemon exit: UNCLEAN at <ts> (prior pid <pid>, last
+ *   heartbeat <age>s ago)', prefixed with a visually distinct '[UNSEEN]'
+ *   marker when the death's ts is newer than the acknowledged ts in
+ *   lifecycle-seen.json.
+ *
+ * Rendering the text section is the acknowledgment path: when an unseen
+ * unclean death is surfaced, lifecycle-seen.json is written with that death's
+ * ts (small atomic write) so the next status run shows it as seen. Never
+ * throws.
+ */
+export function formatDaemonLifecycle(opts?: DaemonLifecycleOpts): string {
+  const readDeath = opts?.getLastDaemonDeath ?? getLastDaemonDeath;
+  const death = readDeath(opts);
+
+  const lines: string[] = ["Daemon Lifecycle", "----------------"];
+  if (death === null) {
+    lines.push("No recorded daemon deaths.");
+    return lines.join("\n");
+  }
+
+  if (death.kind === "clean") {
+    const signalPart = death.signal ? `, signal ${death.signal}` : "";
+    lines.push(`Last daemon exit: clean at ${death.ts} (pid ${death.pid}${signalPart})`);
+    return lines.join("\n");
+  }
+
+  const ageS =
+    death.lastHeartbeatAgeMs !== undefined
+      ? Math.max(0, Math.round(death.lastHeartbeatAgeMs / 1000))
+      : 0;
+  const unseen = isUnseenDaemonDeath(death, opts);
+  lines.push(
+    unseen
+      ? `Last daemon exit: UNCLEAN [UNSEEN] at ${death.ts} (prior pid ${death.pid}, last heartbeat ${ageS}s ago)`
+      : `Last daemon exit: UNCLEAN at ${death.ts} (prior pid ${death.pid}, last heartbeat ${ageS}s ago)`,
+  );
+  if (unseen) {
+    acknowledgeDaemonDeath(death.ts, opts);
+  }
+  return lines.join("\n");
+}
+
+/** Structured last-daemon-death shape for --json output. */
+export interface JsonDaemonDeath {
+  kind: "clean" | "unclean";
+  ts: string;
+  pid: number;
+  signal?: string;
+  priorPid?: number;
+  lastHeartbeatAgeMs?: number;
+  /** True only for an unclean death newer than the acknowledged seen ts. */
+  unseen: boolean;
+}
+
+/** Structured daemon-lifecycle section for --json output. */
+export interface JsonDaemonLifecycle {
+  lastDaemonDeath: JsonDaemonDeath | null;
+}
+
+/**
+ * Collect the structured daemon-lifecycle section for `tamandua status
+ * --json`. Unlike formatDaemonLifecycle, this is read-only: it computes
+ * `unseen` from lifecycle-seen.json but never acknowledges (never writes
+ * lifecycle-seen.json). Never throws.
+ */
+export function collectDaemonLifecycle(opts?: DaemonLifecycleOpts): JsonDaemonLifecycle {
+  const readDeath = opts?.getLastDaemonDeath ?? getLastDaemonDeath;
+  const death = readDeath(opts);
+  if (death === null) return { lastDaemonDeath: null };
+  const unseen = isUnseenDaemonDeath(death, opts);
+  return { lastDaemonDeath: { ...death, unseen } };
 }
 
 export function formatTamanduaInfo(opts?: {

@@ -31,6 +31,15 @@ import {
 import { shutdownAllCrons } from "../installer/agent-scheduler.js";
 import { recordLifecycleEvent } from "./daemonctl.js";
 import { runVersionCheck } from "../lib/version-check.js";
+import { getBuildVersion } from "../lib/version.js";
+import {
+  computeConfigFingerprint,
+  detectUncleanExit,
+  finalizeHeartbeatMarker,
+  getHeartbeatIntervalMs,
+  touchHeartbeat,
+  writeHeartbeatMarker,
+} from "./daemon-lifecycle.js";
 
 const PID_FILE = path.join(os.homedir(), ".tamandua", "tamandua.pid");
 
@@ -110,6 +119,7 @@ let controlServer: http.Server | undefined;
 let reconciler: { stop: () => void } | undefined;
 let isShuttingDown = false;
 let versionCheckInterval: ReturnType<typeof setInterval> | undefined;
+let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
 
 async function stopListeners(): Promise<void> {
   const stops: Promise<unknown>[] = [];
@@ -157,18 +167,31 @@ async function shutdown(signal: string, exitCode: number): Promise<void> {
   // Receipt-side breadcrumb: the daemon cannot know who sent the signal
   // (that's the sender-side breadcrumb's job), but it records when it died
   // and what it was, so lifecycle.log tells a complete story.
-  recordLifecycleEvent(`daemon.shutdown.${signal}`, process.pid);
+  recordLifecycleEvent("daemon.shutdown", process.pid, undefined, { signal, exitCode });
+
+  // Stop touching the heartbeat — a clean shutdown finalizes (removes) the
+  // marker below, and a stale touch must not resurrect it mid-teardown.
+  if (heartbeatTimer !== undefined) {
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = undefined;
+  }
 
   await stopListeners();
   cleanupPidFile();
+  finalizeHeartbeatMarker();
 
   process.exit(exitCode);
 }
 
 async function failStartup(err: unknown): Promise<void> {
   console.error(formatMcpBindError(args.mcpPort, err));
+  recordLifecycleEvent("daemon.shutdown", process.pid, undefined, {
+    reason: err instanceof Error ? err.message : String(err),
+    exitCode: 1,
+  });
   await stopListeners();
   cleanupPidFile();
+  finalizeHeartbeatMarker();
   process.exit(1);
 }
 
@@ -192,7 +215,13 @@ process.on("uncaughtException", (err) => {
   void shutdown("uncaughtException", 1);
 });
 
-process.on("exit", cleanupPidFile);
+process.on("exit", () => {
+  cleanupPidFile();
+  // Best-effort finalize covers exits that bypass shutdown() (e.g. a
+  // process.exit() from a startup failure path that skipped the marker, or
+  // an exit handler running after shutdown()). Idempotent by contract.
+  finalizeHeartbeatMarker();
+});
 
 async function bootstrap(): Promise<void> {
   writePidFile();
@@ -211,8 +240,13 @@ async function bootstrap(): Promise<void> {
     console.error(
       `Failed to start control plane: ${err instanceof Error ? err.message : String(err)}`,
     );
+    recordLifecycleEvent("daemon.shutdown", process.pid, undefined, {
+      reason: `Failed to start control plane: ${err instanceof Error ? err.message : String(err)}`,
+      exitCode: 1,
+    });
     await stopListeners();
     cleanupPidFile();
+    finalizeHeartbeatMarker();
     process.exit(1);
     return;
   }
@@ -233,6 +267,23 @@ async function bootstrap(): Promise<void> {
       `Tamandua daemon started (pid ${process.pid})`,
     );
   }
+
+  // Durable lifecycle observability (DDTH): first prove whether the previous
+  // instance died uncleanly (SIGKILL-class — a stale, unfinalized heartbeat
+  // marker with no matching daemon.shutdown), THEN journal this start and
+  // drop the fresh liveness marker, so journal order is daemon.uncleanExit
+  // (if any) followed by daemon.start. All best-effort — a journaling
+  // failure must never block daemon startup.
+  detectUncleanExit();
+  recordLifecycleEvent("daemon.start", process.pid, undefined, {
+    version: getBuildVersion(),
+    configFingerprint: computeConfigFingerprint(),
+  });
+  writeHeartbeatMarker();
+  heartbeatTimer = setInterval(() => {
+    touchHeartbeat();
+  }, getHeartbeatIntervalMs());
+  heartbeatTimer.unref();
 
   // Fire-and-forget version check — do not block daemon startup.
   runVersionCheck().catch(() => {});

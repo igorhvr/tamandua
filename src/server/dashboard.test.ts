@@ -774,6 +774,202 @@ describe("dashboard stats API", () => {
   });
 });
 
+describe("dashboard daemon-lifecycle surfacing", () => {
+  // Seed one lifecycle.log entry under a temp HOME. The daemon-lifecycle
+  // reader resolves state via <HOME>/.tamandua/ (daemon-lifecycle.ts
+  // defaultTamanduaDir), so the dashboard tests set HOME to the temp dir.
+  function seedLifecycleEntry(homeDir: string, entry: Record<string, unknown>): void {
+    const log = path.join(homeDir, ".tamandua", "lifecycle.log");
+    fs.mkdirSync(path.dirname(log), { recursive: true });
+    fs.appendFileSync(log, `${JSON.stringify(entry)}\n`, "utf-8");
+  }
+
+  function seedCleanDeath(homeDir: string, ts: string, pid: number, signal = "SIGTERM"): void {
+    seedLifecycleEntry(homeDir, {
+      ts,
+      action: "daemon.shutdown",
+      targetPid: pid,
+      signal,
+      exitCode: 0,
+    });
+  }
+
+  function seedUncleanDeath(homeDir: string, ts: string, pid: number): void {
+    seedLifecycleEntry(homeDir, {
+      ts,
+      action: "daemon.uncleanExit",
+      targetPid: pid,
+      priorPid: pid,
+      startedAt: new Date(Date.parse(ts) - 60_000).toISOString(),
+      lastHeartbeatAt: new Date(Date.parse(ts) - 5000).toISOString(),
+      lastHeartbeatAgeMs: 5000,
+    });
+  }
+
+  const lifecycleSeenPath = (homeDir: string) =>
+    path.join(homeDir, ".tamandua", "lifecycle-seen.json");
+
+  interface HealthBody {
+    status: string;
+    lastDaemonDeath: {
+      kind: string;
+      ts: string;
+      pid: number;
+      signal?: string;
+      priorPid?: number;
+      lastHeartbeatAgeMs?: number;
+      unseen: boolean;
+    } | null;
+  }
+
+  it("GET /api/health returns lastDaemonDeath null when no death is recorded", async () => {
+    const { root, homeDir } = createTempHome("tamandua-dashboard-dl-");
+    const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
+    const previousHome = process.env.HOME;
+    const previousDbPath = process.env.TAMANDUA_DB_PATH;
+    process.env.HOME = homeDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+
+    const { server, baseUrl } = await startDashboard();
+
+    try {
+      const response = await fetch(`${baseUrl}/api/health`);
+      assert.equal(response.status, 200);
+      const body = await response.json() as HealthBody;
+      assert.equal(body.status, "ok");
+      assert.equal(body.lastDaemonDeath, null);
+    } finally {
+      await stopDashboard(server);
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+      else process.env.TAMANDUA_DB_PATH = previousDbPath;
+    }
+  });
+
+  it("GET /api/health returns lastDaemonDeath matching a seeded clean death", async () => {
+    const { root, homeDir } = createTempHome("tamandua-dashboard-dl-");
+    const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
+    const previousHome = process.env.HOME;
+    const previousDbPath = process.env.TAMANDUA_DB_PATH;
+    process.env.HOME = homeDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+
+    const ts = new Date(Date.now() - 60_000).toISOString();
+    seedCleanDeath(homeDir, ts, 4242, "SIGINT");
+
+    const { server, baseUrl } = await startDashboard();
+
+    try {
+      const response = await fetch(`${baseUrl}/api/health`);
+      assert.equal(response.status, 200);
+      const body = await response.json() as HealthBody;
+      assert.ok(body.lastDaemonDeath, "a seeded clean death must be surfaced");
+      assert.equal(body.lastDaemonDeath!.kind, "clean");
+      assert.equal(body.lastDaemonDeath!.ts, ts);
+      assert.equal(body.lastDaemonDeath!.pid, 4242);
+      assert.equal(body.lastDaemonDeath!.signal, "SIGINT");
+      assert.equal(body.lastDaemonDeath!.unseen, false, "clean deaths are never unseen");
+    } finally {
+      await stopDashboard(server);
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+      else process.env.TAMANDUA_DB_PATH = previousDbPath;
+    }
+  });
+
+  it("GET /api/health returns unseen=true for a fresh unclean exit and does not modify lifecycle-seen.json", async () => {
+    const { root, homeDir } = createTempHome("tamandua-dashboard-dl-");
+    const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
+    const previousHome = process.env.HOME;
+    const previousDbPath = process.env.TAMANDUA_DB_PATH;
+    process.env.HOME = homeDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+
+    const ts = new Date(Date.now() - 30_000).toISOString();
+    seedUncleanDeath(homeDir, ts, 5150);
+
+    const { server, baseUrl } = await startDashboard();
+
+    try {
+      const response = await fetch(`${baseUrl}/api/health`);
+      assert.equal(response.status, 200);
+      const body = await response.json() as HealthBody;
+      assert.ok(body.lastDaemonDeath, "a seeded unclean death must be surfaced");
+      assert.equal(body.lastDaemonDeath!.kind, "unclean");
+      assert.equal(body.lastDaemonDeath!.ts, ts);
+      assert.equal(body.lastDaemonDeath!.pid, 5150);
+      assert.equal(body.lastDaemonDeath!.priorPid, 5150);
+      assert.equal(body.lastDaemonDeath!.lastHeartbeatAgeMs, 5000);
+      assert.equal(body.lastDaemonDeath!.unseen, true, "a fresh unclean exit must be unseen");
+
+      assert.ok(
+        !fs.existsSync(lifecycleSeenPath(homeDir)),
+        "dashboard must NOT acknowledge (must not write lifecycle-seen.json)",
+      );
+    } finally {
+      await stopDashboard(server);
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+      else process.env.TAMANDUA_DB_PATH = previousDbPath;
+    }
+  });
+
+  it("GET /api/health returns unseen=false when lifecycle-seen.json acknowledges the unclean death", async () => {
+    const { root, homeDir } = createTempHome("tamandua-dashboard-dl-");
+    const dbPath = path.join(homeDir, ".tamandua", "tamandua.db");
+    const previousHome = process.env.HOME;
+    const previousDbPath = process.env.TAMANDUA_DB_PATH;
+    process.env.HOME = homeDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+
+    const ts = new Date(Date.now() - 30_000).toISOString();
+    seedUncleanDeath(homeDir, ts, 5150);
+    fs.mkdirSync(path.dirname(lifecycleSeenPath(homeDir)), { recursive: true });
+    fs.writeFileSync(lifecycleSeenPath(homeDir), JSON.stringify({ ts }), "utf-8");
+
+    const { server, baseUrl } = await startDashboard();
+
+    try {
+      const response = await fetch(`${baseUrl}/api/health`);
+      assert.equal(response.status, 200);
+      const body = await response.json() as HealthBody;
+      assert.ok(body.lastDaemonDeath, "an acknowledged unclean death must still be surfaced");
+      assert.equal(body.lastDaemonDeath!.kind, "unclean");
+      assert.equal(body.lastDaemonDeath!.unseen, false, "an acknowledged unclean death must be seen");
+    } finally {
+      await stopDashboard(server);
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+      else process.env.TAMANDUA_DB_PATH = previousDbPath;
+    }
+  });
+
+  it("index.html contains the daemon-lifecycle hook and JS that populates it from /api/health", async () => {
+    const { server, baseUrl } = await startDashboard();
+
+    try {
+      const response = await fetch(`${baseUrl}/`);
+      assert.equal(response.status, 200);
+
+      const html = await response.text();
+      assert.match(html, /class="daemon-lifecycle" id="daemon-lifecycle"/);
+      assert.match(html, /async function fetchHealth/);
+      assert.match(html, /fetch\(["']\/api\/health["']\)/);
+      assert.match(html, /renderDaemonLifecycle\(data\.lastDaemonDeath \?\? null\)/);
+      assert.match(html, /Last daemon exit: UNCLEAN/);
+      assert.match(html, /Last daemon exit: clean at /);
+      assert.match(html, /fetchHealth\(\);/);
+      assert.match(html, /\.daemon-lifecycle\.unseen/);
+    } finally {
+      await stopDashboard(server);
+    }
+  });
+});
+
 describe("dashboard token counters UI", () => {
   it("renders system and total token spend counters in dashboard HTML", async () => {
     const { server, baseUrl } = await startDashboard();

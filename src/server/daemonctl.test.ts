@@ -1290,6 +1290,44 @@ describe("recordLifecycleEvent", () => {
     assert.equal(JSON.parse(lines[1]).targetPid, 222);
   });
 
+  it("merges an optional extra object into the journal entry", () => {
+    const { root: tempHome } = createTempHome("tamandua-lifecycle-");
+    recordLifecycleEvent("daemon.start", 999, { homeDir: tempHome }, {
+      version: "0.1.0-test",
+      configFingerprint: "abc123",
+    });
+
+    const file = path.join(tempHome, ".tamandua", "lifecycle.log");
+    const entry = JSON.parse(fs.readFileSync(file, "utf-8").trim());
+    assert.equal(entry.action, "daemon.start");
+    assert.equal(entry.targetPid, 999);
+    assert.equal(entry.version, "0.1.0-test");
+    assert.equal(entry.configFingerprint, "abc123");
+    // Attribution facts survive the merge.
+    assert.equal(entry.callerPid, process.pid);
+    assert.equal(entry.callerPpid, process.ppid);
+    assert.ok(typeof entry.ts === "string" && entry.ts.includes("T"));
+  });
+
+  it("existing entries without extra are unchanged (no merged keys leak in)", () => {
+    const { root: tempHome } = createTempHome("tamandua-lifecycle-");
+    recordLifecycleEvent("stop.daemon", 12345, { homeDir: tempHome });
+    recordLifecycleEvent("restart.daemon", 222, { homeDir: tempHome });
+
+    const file = path.join(tempHome, ".tamandua", "lifecycle.log");
+    const entries = fs
+      .readFileSync(file, "utf-8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    assert.equal(entries.length, 2);
+    for (const entry of entries) {
+      assert.ok(!("version" in entry), "no extra keys must leak into legacy entries");
+      assert.ok(!("signal" in entry), "no extra keys must leak into legacy entries");
+      assert.ok(!("exitCode" in entry), "no extra keys must leak into legacy entries");
+    }
+  });
+
   it("guard: drops the line without throwing when a guarded process resolves the production path", () => {
     // Mirror the logger-guard contract: attribution must never break a stop,
     // and must never write production state from a guarded process.

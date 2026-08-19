@@ -24,6 +24,7 @@ src/cli/commands/wait.test.ts
 src/cli/commands/workflow.test.ts
 src/cli/commands/worktree.test.ts
 src/cli/merge-branch-cli.test.ts
+src/cli/status-format-lifecycle.test.ts
 src/cli/update.test.ts
 src/cli/wizard-evaluator.test.ts
 src/cli/wizard-orchestrator.test.ts
@@ -59,6 +60,7 @@ src/lib/version-check.test.ts
 src/server/control-client.test.ts
 src/server/control-server-harness-workdir.test.ts
 src/server/control-server.test.ts
+src/server/daemon-lifecycle.test.ts
 src/server/daemon.test.ts
 src/server/daemonctl-controlplane-restart.test.ts
 src/server/daemonctl-dashboard.test.ts
@@ -88,6 +90,7 @@ tests/cli-prefixed-id-acceptance.test.ts
 tests/cli-resume-command.test.ts
 tests/cli-skill-path.test.ts
 tests/cli-status-abandon-reasons.test.ts
+tests/cli-status-daemon-lifecycle.test.ts
 tests/cli-status-json.test.ts
 tests/cli-status-token-display.test.ts
 tests/cli-step-stories-json.test.ts

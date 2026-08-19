@@ -43,6 +43,7 @@ export function recordLifecycleEvent(
   action: string,
   targetPid: number | null,
   opts?: DaemonctlPathOptions,
+  extra?: Record<string, unknown>,
 ): void {
   try {
     const file = path.join(getTamanduaDir(opts), "lifecycle.log");
@@ -68,6 +69,12 @@ export function recordLifecycleEvent(
       callerArgv: process.argv.slice(0, 6),
       callerCwd,
       parentCmdline,
+      // Optional extra fields (e.g. daemon version / config fingerprint on
+      // daemon.start, signal / exitCode on daemon.shutdown) ride along in the
+      // same one-line JSON entry. Merged AFTER the base fields so callers can
+      // never overwrite attribution facts. Backward compatible: callers that
+      // pass only (action, targetPid, opts) get the entry they always did.
+      ...extra,
     };
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.appendFileSync(file, JSON.stringify(entry) + "\n", "utf-8");

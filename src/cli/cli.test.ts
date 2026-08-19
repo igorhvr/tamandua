@@ -1667,15 +1667,17 @@ describe("status command", () => {
       // Overall header
       assert.match(out, /Tamandua Status/);
 
-      // All four sections present
+      // All five sections present
       assert.match(out, /Services/);
+      assert.match(out, /Daemon Lifecycle/);
       assert.match(out, /Tamandua Info/);
       assert.match(out, /Workflow Runs/);
       assert.match(out, /Running Processes/);
 
-      // Section dividers between sections (3 dividers: after Services, after Info, after Runs)
+      // Section dividers between sections (4 dividers: after Services, after
+      // Daemon Lifecycle, after Info, after Runs)
       const dividerCount = (out.match(/^---$/gm) || []).length;
-      assert.equal(dividerCount, 3, `expected 3 section dividers, got ${dividerCount}`);
+      assert.equal(dividerCount, 4, `expected 4 section dividers, got ${dividerCount}`);
 
       // Services section details
       assert.match(out, /Dashboard: +DOWN/);
