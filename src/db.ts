@@ -5,7 +5,11 @@ import { assertStatePathIsolation } from "./lib/test-guard.js";
 import { LEDGER_RETENTION_MS } from "./suite/config.js";
 
 // Any change to migrate() MUST bump SCHEMA_VERSION. Missing a bump causes broken DBs.
-export const SCHEMA_VERSION = 3;
+// v4: WLST5 (5873a9a9) added the guarded ceiling_expiry_count ALTER below but
+// failed to bump v3 → every existing DB (user_version === 3) early-returned and
+// skipped the migration. The MIGV upgrade-path test pins that this class of
+// bug (new column never appearing on pre-existing DBs) is caught going forward.
+export const SCHEMA_VERSION = 4;
 
 // Counter for tests — increments each time migrate() runs the full DDL path.
 export let _migrateFullRuns = 0;
@@ -250,6 +254,12 @@ function migrate(db: DatabaseSync): void {
   // genuinely lost harness workers (worker_lost_count). step.ceiling_expiry
   // events increment this counter; worker_lost_count is NOT touched so the
   // "Worker lost: M" readout keeps meaning harness_lost only.
+  // NOTE (WLST5.1): WLST5 (5873a9a9) shipped this guarded ALTER without bumping
+  // SCHEMA_VERSION, so every existing DB (user_version === 3) skipped it and
+  // any SQL touching ceiling_expiry_count crashed with "no such column".
+  // The bump to v4 (above) makes this run on all existing installs; the
+  // PRAGMA table_info guard keeps it idempotent on re-run. Pinned by the MIGV
+  // upgrade-path test in src/db.test.ts.
   const addCeilingExpiry = db.prepare("SELECT name FROM pragma_table_info('runs') WHERE name = 'ceiling_expiry_count'").all();
   if (addCeilingExpiry.length === 0) {
     db.exec("ALTER TABLE runs ADD COLUMN ceiling_expiry_count INTEGER NOT NULL DEFAULT 0");

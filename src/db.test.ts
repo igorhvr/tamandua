@@ -2216,3 +2216,214 @@ describe("MIGV schema version short-circuit", () => {
     }
   });
 });
+
+describe("MIGV upgrade path (pre-WLST5 DB → current)", () => {
+  // Regression test for WLST5.1: WLST5 (5873a9a9) added the guarded
+  // ceiling_expiry_count ALTER to migrate() but did NOT bump SCHEMA_VERSION,
+  // so every existing DB (user_version === SCHEMA_VERSION) early-returned and
+  // skipped the migration — status.ts SELECTs and step-ops.ts UPDATEs crashed
+  // with "no such column: ceiling_expiry_count". Every prior test exercised
+  // either a fresh DB (full-DDL path, column present) or a downgraded
+  // already-migrated DB (column already present), so the exact broken state —
+  // user_version == SCHEMA_VERSION with a runs table lacking the column — had
+  // zero coverage.
+
+  // Hardcoded, NOT SCHEMA_VERSION - 1: it must equal the version a real
+  // pre-WLST5 install carries (the pre-bump value, 3). Deriving it as
+  // SCHEMA_VERSION - 1 would make the fixture sit at user_version 2 on the
+  // unbumped code, where migrate() still runs (2 != 3) and the test would
+  // falsely pass — exactly the regression it exists to catch.
+  const PRE_WLST5_SCHEMA_VERSION = 3;
+
+  // Pre-WLST5 (v3) runs/steps/stories schema: includes worker_lost_count but
+  // NOT ceiling_expiry_count.
+  const LEGACY_DDL = `
+    CREATE TABLE runs (
+      id TEXT PRIMARY KEY,
+      run_number INTEGER,
+      workflow_id TEXT NOT NULL,
+      task TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'running',
+      context TEXT NOT NULL DEFAULT '{}',
+      tokens_spent INTEGER NOT NULL DEFAULT 0,
+      notify_url TEXT,
+      scheduling_status TEXT,
+      scheduling_requested_at TEXT,
+      scheduling_error TEXT,
+      worker_lost_count INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE steps (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES runs(id),
+      step_id TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      step_index INTEGER NOT NULL,
+      input_template TEXT NOT NULL,
+      expects TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'waiting',
+      output TEXT,
+      retry_count INTEGER DEFAULT 0,
+      max_retries INTEGER DEFAULT 4,
+      type TEXT NOT NULL DEFAULT 'single',
+      loop_config TEXT,
+      current_story_id TEXT,
+      abandoned_count INTEGER DEFAULT 0,
+      claim_job_id TEXT,
+      claim_pid INTEGER,
+      claim_pgid INTEGER,
+      claim_updated_at TEXT,
+      reroute_count INTEGER DEFAULT 0,
+      terminal_reroute_count INTEGER DEFAULT 0,
+      ledger_concession_count INTEGER DEFAULT 0,
+      claim_invalidated_by TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE stories (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES runs(id),
+      story_index INTEGER NOT NULL,
+      story_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      acceptance_criteria TEXT NOT NULL DEFAULT '[]',
+      status TEXT NOT NULL DEFAULT 'pending',
+      output TEXT,
+      retry_count INTEGER DEFAULT 0,
+      max_retries INTEGER DEFAULT 4,
+      abandoned_count INTEGER DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+  `;
+
+  function distDir(): string {
+    return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "dist");
+  }
+
+  it("migrates a pre-WLST5 DB: adds ceiling_expiry_count, re-stamps version, status SELECT works", () => {
+    const th = createTempHome("tamandua-migv-upgrade-");
+    const dbPath = path.join(th.root, "legacy.db");
+    const legacyDb = new DatabaseSync(dbPath);
+    legacyDb.exec(`
+      ${LEGACY_DDL}
+      INSERT INTO runs (
+        id, run_number, workflow_id, task, status, context, tokens_spent,
+        worker_lost_count, created_at, updated_at
+      ) VALUES (
+        'legacy-run', 1, 'workflow', 'task', 'running', '{}', 0, 0,
+        '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+      );
+      PRAGMA user_version = ${PRE_WLST5_SCHEMA_VERSION};
+    `);
+    // Sanity: the legacy DB really is in the pre-WLST5 broken state.
+    const preCols = legacyDb.prepare("PRAGMA table_info(runs)").all() as Array<{ name: string }>;
+    assert.ok(preCols.some((c) => c.name === "worker_lost_count"), "precondition: legacy runs has worker_lost_count");
+    assert.ok(!preCols.some((c) => c.name === "ceiling_expiry_count"), "precondition: legacy runs lacks ceiling_expiry_count");
+    const preVer = legacyDb.prepare("PRAGMA user_version").get() as { user_version: number };
+    assert.equal(preVer.user_version, PRE_WLST5_SCHEMA_VERSION, "precondition: user_version is the pre-bump version");
+    legacyDb.close();
+
+    // Spawn a fresh subprocess so getDb() runs migrate() from scratch on the
+    // legacy file (the in-process getDb() connection is already cached).
+    const importPath = JSON.stringify(path.join(distDir(), "db.js"));
+    const script = [
+      `import { getDb, SCHEMA_VERSION } from ${importPath};`,
+      "const db = getDb();",
+      'const ceiling = db.prepare("PRAGMA table_info(runs)").all().find((c) => c.name === "ceiling_expiry_count");',
+      'const worker = db.prepare("PRAGMA table_info(runs)").all().find((c) => c.name === "worker_lost_count");',
+      'const ver = db.prepare("PRAGMA user_version").get();',
+      // The exact SELECT from src/installer/status.ts:90 — must no longer throw.
+      'const row = db.prepare("SELECT id, run_number, workflow_id, task, status, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count FROM runs WHERE id = ?").get("legacy-run");',
+      "console.log(JSON.stringify({ ceiling, worker, user_version: ver.user_version, row }));",
+    ].join("\n");
+
+    const result = execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+      cwd: distDir(),
+      env: {
+        HOME: th.homeDir,
+        TAMANDUA_DB_PATH: dbPath,
+        TAMANDUA_TEST_GUARD: "1",
+        PATH: process.env.PATH ?? "",
+      },
+      encoding: "utf-8",
+    });
+    const migrated = JSON.parse(result.trim()) as {
+      ceiling?: { type: string; notnull: number; dflt_value: string | null };
+      worker?: { type: string; notnull: number; dflt_value: string | null };
+      user_version: number;
+      row: {
+        id: string;
+        run_number: number;
+        worker_lost_count: number;
+        ceiling_expiry_count: number;
+      };
+    };
+
+    assert.ok(migrated.ceiling, "ceiling_expiry_count column should be added by migration");
+    assert.equal(migrated.ceiling.type, "INTEGER");
+    assert.equal(migrated.ceiling.notnull, 1, "ceiling_expiry_count should be NOT NULL");
+    assert.equal(migrated.ceiling.dflt_value, "0", "ceiling_expiry_count should default to 0");
+    assert.ok(migrated.worker, "worker_lost_count should be untouched by migration");
+    assert.equal(migrated.user_version, SCHEMA_VERSION,
+      `user_version should be re-stamped to ${SCHEMA_VERSION} (not stuck at the pre-bump version)`);
+    assert.equal(migrated.row.ceiling_expiry_count, 0, "legacy row gets ceiling_expiry_count = 0 via DEFAULT");
+    assert.equal(migrated.row.worker_lost_count, 0, "legacy row keeps its worker_lost_count");
+    assert.equal(migrated.row.id, "legacy-run");
+  });
+
+  it("schema parity: every fresh-DDL column exists in a migrated legacy DB", () => {
+    const th = createTempHome("tamandua-migv-parity-");
+    const legacyPath = path.join(th.root, "legacy.db");
+    const freshPath = path.join(th.root, "fresh.db");
+
+    // Legacy DB: pre-WLST5 schema at the pre-bump user_version (empty file for
+    // the fresh side — full DDL path builds it).
+    const legacyDb = new DatabaseSync(legacyPath);
+    legacyDb.exec(`
+      ${LEGACY_DDL}
+      PRAGMA user_version = ${PRE_WLST5_SCHEMA_VERSION};
+    `);
+    legacyDb.close();
+    const freshDb = new DatabaseSync(freshPath);
+    freshDb.close();
+
+    // Open both through getDb() in one subprocess: the legacy one first (so
+    // migrate() upgrades it), then switch TAMANDUA_DB_PATH to the fresh file.
+    const importPath = JSON.stringify(path.join(distDir(), "db.js"));
+    const script = [
+      `import { getDb } from ${importPath};`,
+      "const tables = ['runs', 'steps', 'stories'];",
+      "const colsOf = (db, table) => db.prepare(\"PRAGMA table_info(\" + table + \")\").all().map((c) => c.name).sort();",
+      "const legacy = getDb();",
+      "const legacyCols = Object.fromEntries(tables.map((t) => [t, colsOf(legacy, t)]));",
+      `process.env.TAMANDUA_DB_PATH = ${JSON.stringify(freshPath)};`,
+      "const fresh = getDb();",
+      "const freshCols = Object.fromEntries(tables.map((t) => [t, colsOf(fresh, t)]));",
+      "console.log(JSON.stringify({ legacyCols, freshCols }));",
+    ].join("\n");
+
+    const result = execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+      cwd: distDir(),
+      env: {
+        HOME: th.homeDir,
+        TAMANDUA_DB_PATH: legacyPath,
+        TAMANDUA_TEST_GUARD: "1",
+        PATH: process.env.PATH ?? "",
+      },
+      encoding: "utf-8",
+    });
+    const parsed = JSON.parse(result.trim()) as {
+      legacyCols: Record<string, string[]>;
+      freshCols: Record<string, string[]>;
+    };
+
+    for (const table of ["runs", "steps", "stories"]) {
+      const missing = parsed.freshCols[table].filter((c) => !parsed.legacyCols[table].includes(c));
+      assert.deepEqual(missing, [],
+        `migrated legacy ${table} table should have every fresh-DDL column (missing: ${missing.join(", ")})`);
+    }
+  });
+});
