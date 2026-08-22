@@ -277,7 +277,12 @@ describe("FIX10 US-003 controller + tt-hook-runner contained-HOME fail-closed", 
   it("a containment violation aborts the case as TEST_INFRA_FAIL with category 'containment-violation'", () => {
     const source = fs.readFileSync(CONTROLLER, "utf8");
     const slice = functionSlice(source, "executeEligibleCases");
-    assert.match(slice, /isContainmentViolation\(error\) \? 'containment-violation' : 'scheduler-execution-failed'/,
+    // S16 (US-003) restructured the scheduler catch into a classification
+    // chain (containment-violation FIRST, then the structured status-query
+    // failure, then the generic scheduler failure). The containment mapping
+    // must stay the precise, precedence-first category.
+    assert.match(slice,
+      /if \(isContainmentViolation\(error\)\) \{[\s\S]{0,120}category: 'containment-violation'/,
       "executeEligibleCases must map a TT_CONTAINMENT_VIOLATION to the precise 'containment-violation' category");
     assert.match(slice, /'TEST_INFRA_FAIL'/,
       "a containment violation must abort the case as TEST_INFRA_FAIL");

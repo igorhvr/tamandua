@@ -63,7 +63,15 @@ const TT_CHAOS_PATH = process.env.TT_CONTROLLER_TT_CHAOS_PATH === undefined
   : path.resolve(process.env.TT_CONTROLLER_TT_CHAOS_PATH);
 const CHAOS_LOG_PATH = path.join(VAR_ROOT, 'chaos', 'chaos.log');
 const HOOK_RUNNER_PATH = path.join(TT_ROOT, 'bin', 'tt-hook-runner');
-const O9_TARGETED_PROBES_PATH = path.join(TT_ROOT, 'bin', 'o9-targeted-probes.mjs');
+// E3.C US-006: the targeted O9 probe operator (bin/o9-targeted-probes.mjs).
+// TT_CONTROLLER_O9_PROBES_PATH overrides the executable for hermetic tests
+// (mirrors TT_CONTROLLER_DAEMON_CONTROL_PATH / TT_CONTROLLER_TT_CHAOS_PATH) —
+// the S16 (US-004) sweep test injects a garbage-emitting probe stub through
+// this seam so runCaseO9TargetedProbes' JSON.parse-of-stdout hardening is
+// exercised without touching the real probe module.
+const O9_TARGETED_PROBES_PATH = process.env.TT_CONTROLLER_O9_PROBES_PATH === undefined
+  ? path.join(TT_ROOT, 'bin', 'o9-targeted-probes.mjs')
+  : path.resolve(process.env.TT_CONTROLLER_O9_PROBES_PATH);
 const DEFAULT_ORACLES_ROOT = path.join(TT_ROOT, 'oracles');
 const ORACLES_ROOT = resolveOraclesRoot();
 const ORACLE_CONTRACT_VERSION = 1;
@@ -71,8 +79,27 @@ const STATE_VERSION = 1;
 const DEFAULT_CONCURRENCY = 1;
 const DEFAULT_STAGGER_MS = 0;
 const DEFAULT_TOKEN_POLL_INTERVAL_MS = 5 * 60_000;
+// S16 (US-003): bounded status-query retry budget. A degraded contained
+// daemon or a skew (stale dist / unmigrated DB — campaign #8) must never
+// crash the controller with a raw SyntaxError: queryWorkflowStatus retries a
+// bounded number of times with a short backoff, then throws a structured
+// WorkflowStatusQueryError that consumers record as evidence and fail the
+// CASE closed (never the controller process).
+const STATUS_QUERY_MAX_ATTEMPTS = 3;
+const STATUS_QUERY_RETRY_BACKOFF_MS = 500;
+// Bounded raw-evidence budget captured on a structured status-query failure
+// (the LAST 4 KiB of stdout/stderr), so evidence stays bounded on noisy output.
+const STATUS_QUERY_RAW_EVIDENCE_BYTES = 4 * 1024;
 const DEFAULT_CAP_CHECK_INTERVAL_MS = 15_000;
 const DEFAULT_PROVIDER_RETRY_BACKOFF_MS = 60_000;
+// US-005: independent deadline-expiry sweep cadence. A case whose attempt
+// deadline_at expired is terminally recorded (TEST_INFRA_FAIL
+// 'deadline-expired') by a sweep that runs on ITS OWN cadence, decoupled from
+// any per-case monitor's status-poll health — so a degraded monitor or a
+// crashed controller mid-campaign can never leave a case phase=running past
+// its deadline (campaign #8 attempt-2: W1.L3-python left phase=running 3.5h
+// past its 20-min deadline). Tests drive it with a tiny env interval.
+const DEFAULT_DEADLINE_SWEEP_INTERVAL_MS = 30_000;
 const EVIDENCE_LIMIT_BYTES = 16 * 1024 * 1024;
 const TERMINAL_RUN_STATUSES = new Set(['completed', 'done', 'failed', 'canceled']);
 // E3.C US-005: fail-closed semantic probe_sequence contract. PROBE_OPS mirrors
@@ -216,6 +243,18 @@ Options:
   --help, -h              Print this help
 
 Duration examples: 250ms, 5s, 2m, 1h
+
+Campaign-state cadences (env-configured at campaign creation, persisted on the
+state, validated on load):
+  TT_CONTROLLER_POLL_INTERVAL_MS           status/token poll cadence (default 300000)
+  TT_CONTROLLER_CAP_CHECK_INTERVAL_MS      cap-breach check cadence (default 15000)
+  TT_CONTROLLER_PROVIDER_RETRY_BACKOFF_MS  provider-retry backoff (default 60000)
+  TT_CONTROLLER_DEADLINE_SWEEP_INTERVAL_MS independent deadline-expiry sweep cadence
+                                           (US-005, default 30000) — a case whose
+                                           attempt deadline_at expired is terminally
+                                           recorded TEST_INFRA_FAIL 'deadline-expired'
+                                           on this cadence regardless of any per-case
+                                           monitor's status-poll health
 `);
 }
 
@@ -1175,6 +1214,20 @@ function configuredProviderRetryBackoffMs() {
   return Number(configured);
 }
 
+// US-005: env-configurable deadline-sweep cadence (mirrors
+// configuredTokenPollIntervalMs / configuredCapCheckIntervalMs). Persisted on
+// the state at campaign creation as options.deadline_sweep_interval_ms and
+// validated on load; the sweep ticks on this cadence regardless of any
+// per-case monitor's status-poll health.
+function configuredDeadlineSweepIntervalMs() {
+  const configured = process.env.TT_CONTROLLER_DEADLINE_SWEEP_INTERVAL_MS;
+  if (configured === undefined) return DEFAULT_DEADLINE_SWEEP_INTERVAL_MS;
+  if (!/^[1-9]\d*$/.test(configured) || !Number.isSafeInteger(Number(configured))) {
+    throw new Error('TT_CONTROLLER_DEADLINE_SWEEP_INTERVAL_MS must be a positive integer');
+  }
+  return Number(configured);
+}
+
 function ensureResultsRoot() {
   const ttRealPath = fs.realpathSync(TT_ROOT);
   if (fs.existsSync(VAR_ROOT)) {
@@ -2045,7 +2098,12 @@ function runCaseO9TargetedProbes(caseRecord, attempt, state, campaignDir, childE
   try {
     evidence = JSON.parse(result.stdout.trim());
   } catch (error) {
-    throw new Error(`targeted O9 probes emitted invalid evidence: ${error.message}`);
+    // S16 (US-004): carry the bounded raw probe stdout in the thrown error so
+    // the operator sees the ACTUAL subprocess output that failed to parse —
+    // never a bare parse message. The error propagates to the scheduler
+    // choke-point and fails the case closed TEST_INFRA_FAIL (raw output
+    // visible in the reason); no raw SyntaxError can escape.
+    throw new Error(`targeted O9 probes emitted invalid evidence: ${error.message}; raw stdout: ${boundedStatusEvidence(String(result.stdout ?? '').trim())}`);
   }
   if (JSON.stringify(evidence.exits) !== JSON.stringify([86, 87, 88])
       || evidence.junk_probe_tracked !== false) {
@@ -2318,7 +2376,13 @@ function runCaseOracles(caseRecord, caseState, state, campaignDir, childEnv) {
     try {
       response = JSON.parse(stdout.toString('utf8').trim());
     } catch (error) {
+      // S16 (US-004): capture the ACTUAL oracle stdout (bounded) in the
+      // TEST_INFRA record.errors — the raw subprocess output that failed to
+      // parse — so the operator sees it without opening the evidence file.
+      // The full stdout is still persisted (stdoutPath + sha256) as before.
       errors.push(`stdout is not one JSON object: ${error.message}`);
+      const raw = stdout.toString('utf8').trim();
+      if (raw !== '') errors.push(`stdout (bounded, ${raw.length} bytes): ${boundedStatusEvidence(raw)}`);
     }
     if (response !== undefined) errors.push(...validateOracleResponse(response, oracleId, result.status, evidenceDir));
     if (errors.length === 0) {
@@ -2342,6 +2406,9 @@ function runCaseOracles(caseRecord, caseState, state, campaignDir, childEnv) {
 
 function parseLocalCommandSummary(campaignDir, attempt) {
   const stdout = readHookStdout(campaignDir, attempt.command);
+  // S16 (US-004) audit: DELIBERATE GUARD — per-line try/catch, returns null
+  // on non-JSON (preflight hooks may emit TAP or human-readable output);
+  // cannot throw a raw SyntaxError.
   for (const line of stdout.split(/\r?\n/).reverse()) {
     if (line.trim() === '') continue;
     try {
@@ -3210,6 +3277,27 @@ async function executeTokenSaverPairedLaunch(caseRecord, caseState, state, campa
       });
       signalLaunchEnded();
       monitorResult = monitorPromise === undefined ? { stopped: false } : await monitorPromise;
+      if (monitorResult.statusQueryFailed) {
+        // S16 (US-003): the monitor already failed the case closed (attempt
+        // terminal, TEST_INFRA_FAIL workflow-status-query-failed). Record the
+        // evidence on this launch entry and return — the paired launch cannot
+        // continue and the terminal record must not be re-classified.
+        entry.status_query_error = monitorResult.statusQueryError ?? null;
+        entry.terminal_at = utcTimestamp();
+        state.updated_at = entry.terminal_at;
+        atomicWriteState(campaignDir, state);
+        return;
+      }
+      if (monitorResult.swept || attempt.outcome !== undefined || attempt.terminal_at !== undefined) {
+        // US-005: the independent deadline sweep terminally recorded the
+        // attempt (deadline-expired) while the monitor was between polls —
+        // the paired launch cannot continue and the swept terminal record
+        // must not be re-classified.
+        entry.terminal_at = utcTimestamp();
+        state.updated_at = entry.terminal_at;
+        atomicWriteState(campaignDir, state);
+        return;
+      }
       if (attempt.run_id !== undefined && attempt.run_id_error === undefined) {
         await convergeDiscoveredRuns(caseRecord, caseState, childEnv, state, campaignDir);
       }
@@ -3334,6 +3422,10 @@ async function executeTokenSaverPairedLaunch(caseRecord, caseState, state, campa
   }
 
   // Final classification. The pair is terminal (or fail-closed above).
+  // US-005: if the independent deadline sweep terminally recorded the attempt
+  // while the pair was in flight, the swept 'deadline-expired' record is
+  // authoritative — never re-classify / resurrect it.
+  if (attempt.outcome !== undefined || attempt.terminal_at !== undefined) return;
   attempt.phase = 'terminal';
   attempt.terminal_at = utcTimestamp();
   attempt.token_saver.status = 'terminal';
@@ -3586,11 +3678,163 @@ function applyReplayCacheHitGate(caseRecord, caseState, attempt, state, campaign
 const FULL_RUN_ID_PATTERN = /(?:^|\r?\n)Run:\s+(run-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/gim;
 const EARLY_SHORT_RUN_ID_PATTERN = /\brun\s+#\d+\s+\(([0-9a-f]{8})\)\s+created\b/gi;
 
+// S16 (US-003): structured status-query failure. Every status-query consumer
+// can catch this and record machine-readable evidence (kind + bounded raw
+// output + stderr + exit code) — never a raw SyntaxError escaping to kill the
+// controller process mid-campaign (campaign #8's uncaught SyntaxError on
+// 'no such column: ceiling_expiry_count' took the whole controller down at
+// 4/28 cases).
+class WorkflowStatusQueryError extends Error {
+  // S16 (US-004): `message` is optional — callers outside the status-query
+  // retry loop (e.g. queryWorkflowDatabaseEvidence's sqlite3 invoke) pass
+  // their own precise message; the default derives a snippet from the raw
+  // output/stderr like before.
+  constructor({ kind, runId, rawOutput, stderr, exitCode, attempts, message }) {
+    const snippet = typeof rawOutput === 'string' && rawOutput.trim() !== ''
+      ? rawOutput.trim().split(/\r?\n/)[0].slice(0, 300)
+      : typeof stderr === 'string' && stderr.trim() !== ''
+        ? stderr.trim().split(/\r?\n/)[0].slice(0, 300)
+        : '';
+    super(message ?? `workflow status query failed for ${runId}: kind=${kind}, attempts=${attempts}${snippet === '' ? '' : `: ${snippet}`}`);
+    this.name = 'WorkflowStatusQueryError';
+    this.kind = kind;
+    this.runId = runId;
+    this.rawOutput = rawOutput;
+    this.stderr = stderr;
+    this.exitCode = exitCode;
+    this.attempts = attempts;
+  }
+}
+
+function isStatusQueryFailure(error) {
+  if (error instanceof WorkflowStatusQueryError) return true;
+  return isObject(error) && error.statusQueryError instanceof WorkflowStatusQueryError;
+}
+
+// Synchronous short backoff for the status-query retry loop
+// (queryWorkflowStatus is synchronous — spawnSync — so a sync sleep is
+// required; Atomics.wait blocks the current thread without a busy loop).
+function delaySync(milliseconds) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
+
+function boundedStatusEvidence(text) {
+  return typeof text === 'string' ? text.slice(-STATUS_QUERY_RAW_EVIDENCE_BYTES) : undefined;
+}
+
+// Normalize a status-query failure (structured or not) into the bounded
+// evidence record consumers persist on attempts / discovered runs.
+function statusQueryErrorEvidence(error, runId, observedAt) {
+  return {
+    kind: error?.kind ?? 'unknown',
+    message: error?.message ?? String(error),
+    run_id: runId,
+    rawOutput: boundedStatusEvidence(error?.rawOutput),
+    stderr: boundedStatusEvidence(error?.stderr),
+    exitCode: error?.exitCode ?? null,
+    attempts: error?.attempts ?? null,
+    observed_at: observedAt,
+  };
+}
+
+// S16 (US-003): shared fail-closed handling for an exhausted status-query
+// retry budget (monitorWorkflowRun's poll path). Records the structured error
+// as attempt evidence, marks the attempt terminal, and fails the CASE closed
+// TEST_INFRA_FAIL with the distinct 'workflow-status-query-failed' category
+// (raw error text captured in the reason) — the campaign controller keeps
+// running and other cases proceed. A multi-run PROXY attempt (multi_run_ordinal
+// set) records evidence only; the shape orchestrator classifies the durable
+// attempt with the same category. Returns the monitor sentinel so callers
+// skip harvest / re-classification (the case is already terminal).
+function failCaseOnStatusQueryError(caseState, attempt, state, campaignDir, runId, error) {
+  const observedAt = utcTimestamp();
+  const evidence = statusQueryErrorEvidence(error, runId, observedAt);
+  attempt.status_query_error = evidence;
+  if (attempt.multi_run_ordinal === undefined) {
+    attempt.phase = 'terminal';
+    attempt.terminal_at = observedAt;
+    persistMechanicalOutcome(caseState, attempt, state, campaignDir, 'TEST_INFRA_FAIL', {
+      category: 'workflow-status-query-failed',
+      message: `workflow status query failed for run ${runId}: ${error?.message ?? String(error)}`,
+      run_id: runId,
+      kind: evidence.kind,
+      raw_output: evidence.rawOutput,
+      stderr: evidence.stderr,
+      exit_code: evidence.exitCode,
+      attempts: evidence.attempts,
+      observed_at: observedAt,
+    });
+  }
+  return { stopped: false, statusQueryFailed: true, statusQueryError: evidence };
+}
+
+// S16 (US-004) JSON.parse audit — every JSON.parse site in tt-controller,
+// with its hardening or deliberate-guard note. The campaign-#8 crash shape
+// was a raw SyntaxError from JSON.parse on SUBPROCESS output ('no such
+// column: ceiling_expiry_count') that took the whole controller down
+// mid-campaign; the subprocess-output sites below are therefore all
+// hardened or deliberately guarded so NO raw SyntaxError can escape.
+//   (a) queryWorkflowDatabaseEvidence invoke (~line 3940): sqlite3
+//       '-readonly -json' output. HARDENED (US-004): every failure path
+//       (spawn-error / exit-nonzero / non-json / invalid-shape) throws a
+//       structured WorkflowStatusQueryError carrying the bounded raw output;
+//       the terminal-harvest path classifies the case TEST_INFRA_FAIL
+//       'workflow-status-query-failed' with the raw output in the reason
+//       evidence (queryWorkflowTerminalEvidence's status->readonly-DB
+//       fallback is preserved).
+//   (b) runCaseO9TargetedProbes (~line 2055): o9-targeted-probes stdout.
+//       HARDENED (US-004): the wrapped error now carries the bounded raw
+//       stdout so the operator sees the actual probe output.
+//   (c) runCaseOracles oracle response stdout (~line 2330). HARDENED
+//       (US-004): the TEST_INFRA record.errors now capture the bounded raw
+//       stdout alongside the parse message.
+//   (d) parseSingleJsonObject (this function). HARDENED (US-003): classifies
+//       parse failures (kind + rawOutput), never a raw SyntaxError.
+//   (e) parseWaitJson (~line 3899). DELIBERATE GUARD — per-line try/catch,
+//       skips non-JSON lines; cannot throw a raw SyntaxError.
+//   (f) parseLocalCommandSummary (~line 2354). DELIBERATE GUARD — per-line
+//       try/catch, returns null on non-JSON (preflight hooks may emit TAP or
+//       human-readable output); cannot throw a raw SyntaxError.
+//   (g) readRunEventStream (~line 4876). DELIBERATE GUARD — per-line
+//       try/catch, continues on non-JSON event lines; cannot throw a raw
+//       SyntaxError.
+//   Remaining JSON.parse sites parse LOCAL FILES, never subprocess output:
+//   loadSchema (~806, wrapped), loadManifest (~829, per-line try/catch),
+//   loadRequiredHostProfile (~942, wrapped -> hostProfileFailure),
+//   acquireCampaignOwnership lock (~1353/1365, wrapped),
+//   materializeCaseBehaviors scenario/behaviors (~1529/1533, caller fails
+//   the case closed TEST_INFRA_FAIL on a malformed cell),
+//   readDurableHookResult (~1749, caller classifies
+//   'invalid-local-result-evidence'), runLocalCaseOracles scenario (~2423,
+//   caller fails closed), readReplaySnapshotFile (~3467, caller classifies
+//   'replay-cache-infra'), queryWorkflowRunsDatabase run.context (~4180,
+//   try/catch), readRunRelationships events (~4286, try/catch),
+//   readHarnessTargetRecord (~5292, try/catch -> null), loadCampaignState
+//   (~7589, wrapped). These fail loudly as authoring/validation errors at
+//   their callers — deliberately NOT silently swallowed.
 function parseSingleJsonObject(output) {
   const lines = output.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-  if (lines.length !== 1) throw new Error(`expected one JSON line, received ${lines.length}`);
-  const parsed = JSON.parse(lines[0]);
-  if (!isObject(parsed)) throw new Error('JSON response is not an object');
+  if (lines.length !== 1) {
+    const error = new Error(`expected one JSON line, received ${lines.length}`);
+    error.kind = 'non-json';
+    error.rawOutput = output;
+    throw error;
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(lines[0]);
+  } catch (error) {
+    const wrapped = new Error(`workflow status output was not valid JSON: ${error.message}`);
+    wrapped.kind = 'non-json';
+    wrapped.rawOutput = output;
+    throw wrapped;
+  }
+  if (!isObject(parsed)) {
+    const error = new Error('JSON response is not an object');
+    error.kind = 'invalid-shape';
+    error.rawOutput = output;
+    throw error;
+  }
   return parsed;
 }
 
@@ -3686,24 +3930,68 @@ function createRunIdentifierCapture(attempt, state, campaignDir, childEnv, onRes
 function queryWorkflowStatus(runId, childEnv) {
   // FIX10 US-003 choke-point: the status query must run with the contained HOME.
   assertContainedSpawnEnv(childEnv);
-  const result = spawnSync('tamandua', ['workflow', 'status', runId, '--json'], {
-    cwd: fs.realpathSync(TT_ROOT),
-    env: childEnv,
-    encoding: 'utf8',
-    maxBuffer: 1024 * 1024,
-    shell: false,
+  // S16 (US-003): bounded retry budget. A degraded daemon / skew surfaces as
+  // a transient failure class — retry with a short backoff, then throw a
+  // STRUCTURED WorkflowStatusQueryError (never a raw SyntaxError) so
+  // consumers record evidence and fail the CASE closed, not the controller
+  // process.
+  let lastFailure = null;
+  for (let attemptNumber = 1; attemptNumber <= STATUS_QUERY_MAX_ATTEMPTS; attemptNumber += 1) {
+    const result = spawnSync('tamandua', ['workflow', 'status', runId, '--json'], {
+      cwd: fs.realpathSync(TT_ROOT),
+      env: childEnv,
+      encoding: 'utf8',
+      maxBuffer: 1024 * 1024,
+      shell: false,
+    });
+    if (result.error !== undefined) {
+      lastFailure = {
+        kind: 'spawn-error',
+        message: result.error.message,
+        exitCode: null,
+        stderr: null,
+        rawOutput: null,
+      };
+    } else if (result.status !== 0) {
+      const detail = String(result.stderr ?? '').trim();
+      lastFailure = {
+        kind: 'exit-nonzero',
+        message: `workflow status exited ${result.status}${detail ? `: ${detail}` : ''}`,
+        exitCode: result.status,
+        stderr: detail,
+        rawOutput: String(result.stdout ?? ''),
+      };
+    } else {
+      try {
+        const status = parseSingleJsonObject(String(result.stdout ?? ''));
+        if (status.runId !== runId || typeof status.status !== 'string'
+            || !Number.isSafeInteger(status.tokensSpent) || status.tokensSpent < 0) {
+          const error = new Error(`workflow status returned invalid monitoring data for ${runId}`);
+          error.kind = 'invalid-shape';
+          error.rawOutput = String(result.stdout ?? '');
+          throw error;
+        }
+        return status;
+      } catch (error) {
+        lastFailure = {
+          kind: error.kind ?? 'invalid-shape',
+          message: error.message,
+          exitCode: 0,
+          stderr: null,
+          rawOutput: error.rawOutput ?? String(result.stdout ?? ''),
+        };
+      }
+    }
+    if (attemptNumber < STATUS_QUERY_MAX_ATTEMPTS) delaySync(STATUS_QUERY_RETRY_BACKOFF_MS);
+  }
+  throw new WorkflowStatusQueryError({
+    kind: lastFailure.kind,
+    runId,
+    rawOutput: boundedStatusEvidence(lastFailure.rawOutput),
+    stderr: boundedStatusEvidence(lastFailure.stderr),
+    exitCode: lastFailure.exitCode,
+    attempts: STATUS_QUERY_MAX_ATTEMPTS,
   });
-  if (result.error !== undefined) throw result.error;
-  if (result.status !== 0) {
-    const detail = String(result.stderr ?? '').trim();
-    throw new Error(`workflow status exited ${result.status}${detail ? `: ${detail}` : ''}`);
-  }
-  const status = parseSingleJsonObject(String(result.stdout ?? ''));
-  if (status.runId !== runId || typeof status.status !== 'string'
-      || !Number.isSafeInteger(status.tokensSpent) || status.tokensSpent < 0) {
-    throw new Error(`workflow status returned invalid monitoring data for ${runId}`);
-  }
-  return status;
 }
 
 function readHookStdout(campaignDir, hookState) {
@@ -3723,6 +4011,9 @@ function readHookStdout(campaignDir, hookState) {
 
 function parseWaitJson(output, runId) {
   let waitJson = null;
+  // S16 (US-004) audit: DELIBERATE GUARD — per-line try/catch, skips
+  // non-JSON lines (the early "Run:" line and human progress lines are not
+  // waiter JSON); cannot throw a raw SyntaxError.
   for (const line of output.split(/\r?\n/)) {
     if (line.trim() === '') continue;
     try {
@@ -3762,18 +4053,57 @@ function queryWorkflowDatabaseEvidence(runId, childEnv) {
     throw new Error('TT workflow database is not a contained regular file');
   }
   const storedRunId = runId.slice(4);
+  // S16 (US-004): every sqlite3 -readonly -json failure path throws a
+  // STRUCTURED WorkflowStatusQueryError carrying the bounded raw output —
+  // never a raw SyntaxError from JSON.parse on subprocess output (campaign
+  // #8's crash shape). The terminal-harvest path (queryWorkflowTerminalEvidence
+  // -> executeEligibleCases choke-point) classifies the case TEST_INFRA_FAIL
+  // 'workflow-status-query-failed' with the raw output in the reason evidence.
   const invoke = (sql) => {
     const result = spawnSync('sqlite3', ['-readonly', '-json', databasePath, sql], {
       cwd: fs.realpathSync(TT_ROOT), env: childEnv, encoding: 'utf8',
       maxBuffer: 16 * 1024 * 1024, shell: false,
     });
-    if (result.error !== undefined) throw result.error;
+    if (result.error !== undefined) {
+      throw new WorkflowStatusQueryError({
+        kind: 'spawn-error', runId,
+        rawOutput: null,
+        stderr: boundedStatusEvidence(result.error.message),
+        exitCode: null, attempts: 1,
+        message: `sqlite3 -readonly spawn failed: ${result.error.message}`,
+      });
+    }
     if (result.status !== 0) {
       const detail = String(result.stderr ?? '').trim();
-      throw new Error(`sqlite3 -readonly exited ${result.status}${detail ? `: ${detail}` : ''}`);
+      throw new WorkflowStatusQueryError({
+        kind: 'exit-nonzero', runId,
+        rawOutput: boundedStatusEvidence(String(result.stdout ?? '')),
+        stderr: boundedStatusEvidence(detail),
+        exitCode: result.status, attempts: 1,
+        message: `sqlite3 -readonly exited ${result.status}${detail ? `: ${detail}` : ''}`,
+      });
     }
-    const parsed = JSON.parse(String(result.stdout ?? '[]') || '[]');
-    if (!Array.isArray(parsed)) throw new Error('sqlite3 -readonly did not emit a JSON array');
+    let parsed;
+    try {
+      parsed = JSON.parse(String(result.stdout ?? '[]') || '[]');
+    } catch (error) {
+      throw new WorkflowStatusQueryError({
+        kind: 'non-json', runId,
+        rawOutput: boundedStatusEvidence(String(result.stdout ?? '')),
+        stderr: boundedStatusEvidence(String(result.stderr ?? '')),
+        exitCode: result.status, attempts: 1,
+        message: `sqlite3 -readonly output was not valid JSON: ${error.message}`,
+      });
+    }
+    if (!Array.isArray(parsed)) {
+      throw new WorkflowStatusQueryError({
+        kind: 'invalid-shape', runId,
+        rawOutput: boundedStatusEvidence(String(result.stdout ?? '')),
+        stderr: boundedStatusEvidence(String(result.stderr ?? '')),
+        exitCode: result.status, attempts: 1,
+        message: 'sqlite3 -readonly did not emit a JSON array',
+      });
+    }
     return parsed;
   };
   const quotedRunId = `'${storedRunId.replaceAll("'", "''")}'`;
@@ -3809,7 +4139,18 @@ function queryWorkflowTerminalEvidence(runId, childEnv) {
     try {
       return queryWorkflowDatabaseEvidence(runId, childEnv);
     } catch (databaseError) {
-      throw new Error(`terminal evidence unavailable from status (${statusError.message}) and readonly DB (${databaseError.message})`);
+      const combined = new Error(`terminal evidence unavailable from status (${statusError.message}) and readonly DB (${databaseError.message})`);
+      // S16 (US-003): preserve the structured status failure (when the status
+      // leg is the root cause) so a downstream choke-point classifies the
+      // case as workflow-status-query-failed — never a generic scheduler
+      // failure — while keeping the readonly-DB fallback intact.
+      combined.statusQueryError = statusError;
+      // S16 (US-004): keep the readonly-DB leg's structured failure too (it is
+      // now always a WorkflowStatusQueryError carrying the bounded raw sqlite3
+      // output) so the choke-point surfaces the actual subprocess output in
+      // the reason evidence when the DB fallback is what failed.
+      combined.databaseQueryError = databaseError;
+      throw combined;
     }
   }
 }
@@ -4213,9 +4554,18 @@ function reconcileDiscoveredRuns(caseRecord, caseState, childEnv, state, campaig
   const discoveredById = new Map(state.discovered_runs.map((run) => [run.run_id, run]));
   const rootAttempt = caseState.attempts.find((attempt) =>
     attempt.kind === 'workflow' && normalizedRunId(attempt.run_id) !== null);
-  const rootTask = caseRecord.workflow === 'just-do-it' && rootAttempt !== undefined
-    ? queryWorkflowStatus(rootAttempt.run_id, childEnv).task
-    : null;
+  // S16 (US-003): the just-do-it parent-attribution status read is defensive —
+  // a degraded daemon must not crash reconciliation; a failure only disables
+  // task-based parent inference for this pass (recorded as evidence). The
+  // owning case still fails closed via its primary monitor's poll.
+  let rootTask = null;
+  if (caseRecord.workflow === 'just-do-it' && rootAttempt !== undefined) {
+    try {
+      rootTask = queryWorkflowStatus(rootAttempt.run_id, childEnv).task;
+    } catch (error) {
+      caseState.status_query_error = statusQueryErrorEvidence(error, rootAttempt.run_id, utcTimestamp());
+    }
+  }
   let added = 0;
   let changed = true;
   while (changed) {
@@ -4243,7 +4593,16 @@ function reconcileDiscoveredRuns(caseRecord, caseState, childEnv, state, campaig
 
   for (const run of state.discovered_runs.filter((item) =>
     item.root_case_id === caseState.id && item.phase !== 'terminal')) {
-    const status = queryWorkflowStatus(run.run_id, childEnv);
+    let status;
+    try {
+      status = queryWorkflowStatus(run.run_id, childEnv);
+    } catch (error) {
+      // S16 (US-003): a degraded daemon must not crash reconciliation —
+      // record the structured failure on the discovered run and skip this poll
+      // (the owning case fails closed via its primary monitor's poll).
+      run.status_query_error = statusQueryErrorEvidence(error, run.run_id, utcTimestamp());
+      continue;
+    }
     persistTokenObservation(status, run, caseState, state, campaignDir);
     run.last_status = status.status;
     run.status_observed_at = utcTimestamp();
@@ -4279,7 +4638,9 @@ function captureStragglerPreStop(run, status, breach, capturedAt) {
     steps_snapshot: {
       source: 'workflow-status-json',
       captured_at: capturedAt,
-      steps: Array.isArray(status.steps) ? status.steps : [],
+      // S16 (US-003): status may be undefined when the pre-stop capture could
+      // not be taken (degraded daemon) — the stop still proceeds.
+      steps: Array.isArray(status?.steps) ? status.steps : [],
     },
   };
 }
@@ -4288,7 +4649,16 @@ async function stopDiscoveredRun(caseState, run, breach, childEnv, state, campai
   if (run.stop_intent_at !== undefined) return;
   run.stop_intent_at = utcTimestamp();
   run.stop_reason = breach;
-  const status = observedStatus ?? queryWorkflowStatus(run.run_id, childEnv);
+  let status = observedStatus;
+  if (status === undefined) {
+    try {
+      status = queryWorkflowStatus(run.run_id, childEnv);
+    } catch (error) {
+      // S16 (US-003): the pre-stop capture is best-effort evidence — a
+      // degraded daemon must not block the cap-enforcement stop.
+      run.status_query_error = statusQueryErrorEvidence(error, run.run_id, run.stop_intent_at);
+    }
+  }
   captureStragglerPreStop(run, status, breach, run.stop_intent_at);
   caseState.findings.push({
     type: 'RUNAWAY', ...breach, run_id: run.run_id, discovered: true,
@@ -4366,9 +4736,23 @@ async function awaitDiscoveredRun(caseRecord, caseState, run, childEnv, state, c
     if (capCheckDue) nextCapCheckAt = now + capCheckMs;
 
     if (tokenPollDue) {
-      const status = queryWorkflowStatus(run.run_id, childEnv);
-      persistTokenObservation(status, run, caseState, state, campaignDir);
-      if (TERMINAL_RUN_STATUSES.has(status.status)) continue;
+      let status;
+      try {
+        status = queryWorkflowStatus(run.run_id, childEnv);
+      } catch (error) {
+        // S16 (US-003): a degraded daemon must not crash or hang the
+        // discovered-run wait — record the structured failure as evidence and
+        // keep waiting (the owning case fails closed via its primary
+        // monitor's poll).
+        run.status_query_error = statusQueryErrorEvidence(error, run.run_id, utcTimestamp());
+        state.updated_at = utcTimestamp();
+        atomicWriteState(campaignDir, state);
+        status = null;
+      }
+      if (status !== null) {
+        persistTokenObservation(status, run, caseState, state, campaignDir);
+        if (TERMINAL_RUN_STATUSES.has(status.status)) continue;
+      }
     }
 
     if (!capCheckDue) continue;
@@ -4381,7 +4765,20 @@ async function awaitDiscoveredRun(caseRecord, caseState, run, childEnv, state, c
   }
 
   let waitResult = await waitPromise;
-  let status = queryWorkflowStatus(run.run_id, childEnv);
+  // S16 (US-003): the post-wait status reads are structured-failure aware — a
+  // persistent failure records evidence on the discovered run and rethrows the
+  // WorkflowStatusQueryError so the case fails closed per-case
+  // (workflow-status-query-failed) via the scheduler choke-point — never a
+  // crash and never a hang.
+  let status;
+  try {
+    status = queryWorkflowStatus(run.run_id, childEnv);
+  } catch (error) {
+    run.status_query_error = statusQueryErrorEvidence(error, run.run_id, utcTimestamp());
+    state.updated_at = utcTimestamp();
+    atomicWriteState(campaignDir, state);
+    throw error;
+  }
   persistTokenObservation(status, run, caseState, state, campaignDir);
   if (!TERMINAL_RUN_STATUSES.has(status.status)) {
     const breach = discoveredRunBreach(caseRecord, caseState, run);
@@ -4396,7 +4793,14 @@ async function awaitDiscoveredRun(caseRecord, caseState, run, childEnv, state, c
     }, childEnv, campaignDir, state, run, {
       enforceWall: false, timeoutMs: cleanupWaitTimeoutMs,
     });
-    status = queryWorkflowStatus(run.run_id, childEnv);
+    try {
+      status = queryWorkflowStatus(run.run_id, childEnv);
+    } catch (error) {
+      run.status_query_error = statusQueryErrorEvidence(error, run.run_id, utcTimestamp());
+      state.updated_at = utcTimestamp();
+      atomicWriteState(campaignDir, state);
+      throw error;
+    }
     persistTokenObservation(status, run, caseState, state, campaignDir);
     waitResult = terminalWait;
     if (!TERMINAL_RUN_STATUSES.has(status.status)
@@ -4479,7 +4883,7 @@ function workflowRunBreach(caseRecord, caseState, attempt) {
 }
 
 async function monitorWorkflowRun(caseRecord, caseState, attempt, childEnv, state, campaignDir, launchEndedPromise,
-  { runId: runIdOverride, tolerateStatusFailures = false } = {}) {
+  { runId: runIdOverride } = {}) {
   // E3.C US-007: a multi-launch probe (W3.22's three concurrent runs) monitors
   // each run through its OWN proxy attempt, so the run id is passed explicitly
   // (runIdOverride) instead of reading the shared attempt.run_id slot.
@@ -4500,6 +4904,15 @@ async function monitorWorkflowRun(caseRecord, caseState, attempt, childEnv, stat
         resolve(true);
       });
     });
+    // US-005: the independent deadline sweep may have marked this attempt
+    // terminal (deadline-expired) while the monitor was between polls — the
+    // swept record is authoritative. Stop persisting observations and stop
+    // classifying; the caller skips convergence/harvest/re-classification on
+    // the { swept: true } sentinel so the terminal record is never
+    // double-written or resurrected.
+    if (attempt.terminal_at !== undefined || attempt.outcome !== undefined) {
+      return { swept: true };
+    }
     if (launchEnded && attempt.stop_intent_at === undefined) return { stopped: false };
 
     const now = Date.now();
@@ -4513,18 +4926,26 @@ async function monitorWorkflowRun(caseRecord, caseState, attempt, childEnv, stat
       try {
         status = queryWorkflowStatus(runId, childEnv);
       } catch (error) {
-        // E3.C US-007: a transient status-read failure (the contained daemon is
-        // restarting mid-flight — W3.22's restart_daemon probe) must not kill
-        // the monitor: skip this poll and let the cap check keep ticking. Only
-        // the concurrent multi-run monitors opt in (tolerateStatusFailures);
-        // single-run behavior is unchanged.
-        if (!tolerateStatusFailures) throw error;
+        // S16 (US-003): a status-query failure that exhausted the bounded retry
+        // budget (structured WorkflowStatusQueryError) is an INFRASTRUCTURE
+        // failure of THIS case — never a controller-killer (campaign #8: the
+        // uncaught SyntaxError on 'no such column: ceiling_expiry_count' took
+        // down the whole controller mid-campaign). Record the structured error
+        // as evidence, mark the attempt terminal, and fail the CASE closed
+        // TEST_INFRA_FAIL ('workflow-status-query-failed'). Transient failures
+        // (the contained daemon restarting mid-flight — W3.22's restart_daemon
+        // probe) are absorbed by the bounded retries inside queryWorkflowStatus;
+        // a persistent failure fails closed per-case. The old
+        // tolerateStatusFailures opt-in is folded in: EVERY monitor now
+        // tolerates bounded failures and fails the case closed only when they
+        // persist.
+        return failCaseOnStatusQueryError(
+          caseState, attempt, state, campaignDir, runId, error,
+        );
       }
-      if (status !== undefined) {
-        persistTokenObservation(status, attempt, caseState, state, campaignDir, runId);
-        reconcileDiscoveredRuns(caseRecord, caseState, childEnv, state, campaignDir);
-        if (TERMINAL_RUN_STATUSES.has(status.status)) return { stopped: false, terminal_status: status.status };
-      }
+      persistTokenObservation(status, attempt, caseState, state, campaignDir, runId);
+      reconcileDiscoveredRuns(caseRecord, caseState, childEnv, state, campaignDir);
+      if (TERMINAL_RUN_STATUSES.has(status.status)) return { stopped: false, terminal_status: status.status };
     }
 
     if (!capCheckDue) continue;
@@ -4535,7 +4956,14 @@ async function monitorWorkflowRun(caseRecord, caseState, attempt, childEnv, stat
     breach.enforcement_latency = capEnforcementLatencySeconds(caseState, attempt, breach, detectedAt);
     attempt.stop_intent_at = detectedAt;
     attempt.stop_reason = breach;
-    const status = queryWorkflowStatus(runId, childEnv);
+    // S16 (US-003): the pre-stop capture is best-effort evidence — a degraded
+    // daemon must not block the cap-enforcement stop.
+    let status;
+    try {
+      status = queryWorkflowStatus(runId, childEnv);
+    } catch (error) {
+      attempt.status_query_error = statusQueryErrorEvidence(error, runId, detectedAt);
+    }
     captureStragglerPreStop(attempt, status, breach, detectedAt);
     caseState.findings.push({ type: 'RUNAWAY', ...breach, run_id: runId, detected_at: detectedAt });
     state.updated_at = detectedAt;
@@ -4552,7 +4980,18 @@ async function monitorWorkflowRun(caseRecord, caseState, attempt, childEnv, stat
     if (waitResult.error !== undefined || waitResult.signal !== null || waitResult.exit_code === 2) {
       throw new Error(`workflow wait failed after stopping ${runId}`);
     }
-    const terminalStatus = queryWorkflowStatus(runId, childEnv);
+    // S16 (US-003): the post-stop terminal check throws the STRUCTURED failure
+    // (recorded as evidence) — the case fails closed per-case via the
+    // scheduler choke-point, never a controller crash.
+    let terminalStatus;
+    try {
+      terminalStatus = queryWorkflowStatus(runId, childEnv);
+    } catch (error) {
+      attempt.status_query_error = statusQueryErrorEvidence(error, runId, utcTimestamp());
+      state.updated_at = utcTimestamp();
+      atomicWriteState(campaignDir, state);
+      throw error;
+    }
     persistTokenObservation(terminalStatus, attempt, caseState, state, campaignDir, runId);
     if (!TERMINAL_RUN_STATUSES.has(terminalStatus.status)) {
       throw new Error(`workflow remained ${terminalStatus.status} after stop and wait: ${runId}`);
@@ -4635,6 +5074,8 @@ function readRunEventStream(childEnv, runId) {
       continue;
     }
     unavailable = false;
+    // S16 (US-004) audit: DELIBERATE GUARD — per-line try/catch, continues
+    // on non-JSON event lines; cannot throw a raw SyntaxError.
     for (const line of source.split(/\r?\n/)) {
       if (line.trim() === '') continue;
       let event;
@@ -5526,6 +5967,25 @@ async function executeSequentialProbeShape(caseRecord, caseState, state, campaig
     const monitorResult = monitorPromise === undefined ? { stopped: false } : await monitorPromise;
     const probeResult = probePromise === undefined ? null : await probePromise;
 
+    // S16 (US-003): the monitor recorded the structured status-query failure on
+    // the run proxy (multi_run_ordinal set — no case-level write). Classify the
+    // DURABLE attempt here with the distinct category so the case fails closed
+    // per-case and the sequential shape stops launching further runs.
+    if (monitorResult.statusQueryFailed) {
+      return {
+        failure: {
+          category: 'workflow-status-query-failed',
+          message: `workflow status query failed for run ${group.run}: ${monitorResult.statusQueryError?.message ?? 'bounded retries exhausted'}`,
+          run_id: runProxy.run_id ?? null,
+          kind: monitorResult.statusQueryError?.kind ?? null,
+          raw_output: monitorResult.statusQueryError?.rawOutput ?? null,
+          stderr: monitorResult.statusQueryError?.stderr ?? null,
+          exit_code: monitorResult.statusQueryError?.exitCode ?? null,
+          attempts: monitorResult.statusQueryError?.attempts ?? null,
+        },
+        run_ordinal: group.run,
+      };
+    }
     if (runProxy.run_id_error !== undefined || runProxy.run_id === undefined) {
       const infra = classifyInfraLaunchFailure(readLaunchEvidenceStderr(campaignDir, launchResult));
       return {
@@ -5746,12 +6206,14 @@ async function executeConcurrentProbeShape(caseRecord, caseState, state, campaig
       };
       evidence.runs.push(runRecord);
       persistEvidence();
-      // The concurrent monitors tolerate transient status-read failures: the
+      // S16 (US-003): the concurrent monitors absorb transient status-read
+      // failures via the bounded retries inside queryWorkflowStatus (the
       // contained daemon is restarting mid-flight and a poll landing in the
-      // down window must not kill the monitor.
+      // down window must not kill the monitor); a PERSISTENT failure fails the
+      // case closed per-case via the run proxy's statusQueryFailed sentinel.
       monitorPromise ??= monitorWorkflowRun(
         caseRecord, caseState, runProxy, childEnv, state, campaignDir, launchEndedPromise,
-        { runId: runProxy.run_id, tolerateStatusFailures: true },
+        { runId: runProxy.run_id },
       );
       const perRunActions = group.actions.filter((action) => action.op !== 'restart_daemon');
       if (perRunActions.length > 0) {
@@ -5837,6 +6299,25 @@ async function executeConcurrentProbeShape(caseRecord, caseState, state, campaig
   }
 
   for (const { job, index, monitorResult } of monitorResults) {
+    // S16 (US-003): the monitor recorded the structured status-query failure on
+    // the run proxy (multi_run_ordinal set — no case-level write). Classify the
+    // DURABLE attempt with the distinct category so the case fails closed
+    // per-case and the concurrent shape stops harvesting.
+    if (monitorResult.statusQueryFailed) {
+      return {
+        failure: {
+          category: 'workflow-status-query-failed',
+          message: `workflow status query failed for run ${job.group.run}: ${monitorResult.statusQueryError?.message ?? 'bounded retries exhausted'}`,
+          run_id: job.runProxy.run_id ?? null,
+          kind: monitorResult.statusQueryError?.kind ?? null,
+          raw_output: monitorResult.statusQueryError?.rawOutput ?? null,
+          stderr: monitorResult.statusQueryError?.stderr ?? null,
+          exit_code: monitorResult.statusQueryError?.exitCode ?? null,
+          attempts: monitorResult.statusQueryError?.attempts ?? null,
+        },
+        run_ordinal: job.group.run,
+      };
+    }
     if (job.runProxy.run_id_error !== undefined || job.runProxy.run_id === undefined) {
       const infra = classifyInfraLaunchFailure(readLaunchEvidenceStderr(campaignDir, launchResults[index]));
       return {
@@ -5950,6 +6431,13 @@ async function executeMultiRunProbeCase(caseRecord, caseState, state, campaignDi
     : await executeSequentialProbeShape(
         caseRecord, caseState, state, campaignDir, attempt, childEnv, sequence, evidence, persistEvidence,
       );
+
+  // US-005: the independent deadline sweep may have terminally recorded the
+  // DURABLE attempt (deadline-expired) while the shape was in flight (the
+  // per-run monitors run on run proxies, which the sweep leaves untouched).
+  // The swept terminal record is authoritative — never re-classify /
+  // resurrect it here.
+  if (attempt.outcome !== undefined || attempt.terminal_at !== undefined) return;
 
   if (outcome !== null && outcome.capStop !== undefined) {
     evidence.sequence_outcome = 'cap-enforced';
@@ -6576,6 +7064,20 @@ async function executeWorkflowCase(caseRecord, caseState, state, campaignDir) {
   });
   signalLaunchEnded();
   const monitorResult = monitorPromise === undefined ? { stopped: false } : await monitorPromise;
+  if (monitorResult.statusQueryFailed) {
+    // S16 (US-003): the monitor already failed the case closed (attempt
+    // terminal, TEST_INFRA_FAIL workflow-status-query-failed). Skip
+    // convergence/harvest/re-classification — the terminal record is durable
+    // and the campaign controller keeps running (other cases proceed).
+    return;
+  }
+  if (monitorResult.swept || attempt.outcome !== undefined || attempt.terminal_at !== undefined) {
+    // US-005: the independent deadline sweep terminally recorded the attempt
+    // (deadline-expired) while the monitor was between polls — never
+    // converge/harvest/re-classify a swept attempt (the terminal record is
+    // authoritative and must not be resurrected).
+    return;
+  }
   const probeResult = probePromise === undefined ? null : await probePromise;
   const chaosResult = chaosPromise === undefined ? null : await chaosPromise;
   if (attempt.run_id !== undefined && attempt.run_id_error === undefined) {
@@ -6979,7 +7481,85 @@ async function executeCaseWithProviderRetry(caseRecord, caseState, state, campai
   }
 }
 
+// US-005: independent deadline-expiry sweep. Terminally records any WORKFLOW
+// attempt (case phase 'running', latest attempt with no terminal outcome)
+// whose deadline_at expired — even when its monitor loop is degraded or the
+// controller crashed mid-campaign (campaign #8 attempt-2 left W1.L3-python
+// phase=running 3.5h past its 16:46Z 20-min deadline with the run completed
+// and nobody watching).
+//
+// The record is TEST_INFRA_FAIL with the distinct category 'deadline-expired'
+// and evidence { deadline_at, expired_for_seconds, run_id (when known),
+// observed_at } persisted via persistMechanicalOutcome (the case becomes
+// terminal). The in-flight run gets a BEST-EFFORT `workflow stop` (runHook
+// with enforceWall false, fire-and-forget, never throws, never blocks the
+// terminal record) — a failing or hanging stop must not prevent the record.
+//
+// Race-free coordination with in-flight executions: the sweep marks the
+// attempt terminal; every in-flight consumer checks that terminal marker
+// (attempt.outcome !== undefined || attempt.terminal_at !== undefined)
+// before persisting further observations or classifying, so a swept case is
+// never double-written or resurrected (monitorWorkflowRun returns
+// { swept: true }; executeWorkflowCase / the token-saver paired launch /
+// the multi-run orchestrator skip convergence/harvest/re-classification).
+//
+// LOCAL-command attempts are deliberately NOT swept: their durable-result
+// recovery (recoverLocalAttempt) is still valid after a crash, so an expired
+// deadline must not preempt a recoverable local result.
+function sweepDeadlineExpiredAttempts(state, campaignDir) {
+  const now = Date.now();
+  let sweptAny = false;
+  for (const caseState of state.cases) {
+    if (caseState.phase !== 'running') continue;
+    const attempt = caseState.attempts.at(-1);
+    if (attempt === undefined || attempt.outcome !== undefined) continue;
+    if (attempt.kind !== 'workflow') continue;
+    if (attempt.deadline_at === undefined || !isUtcTimestamp(attempt.deadline_at)) continue;
+    const deadlineMs = new Date(attempt.deadline_at).valueOf();
+    if (deadlineMs >= now) continue;
+
+    const observedAt = utcTimestamp();
+    const expiredForSeconds = Math.max(0, Math.floor((now - deadlineMs) / 1000));
+    const runId = typeof attempt.run_id === 'string' && attempt.run_id !== ''
+      ? attempt.run_id
+      : null;
+    // Best-effort stop of the in-flight run — never throws and never blocks
+    // the terminal record. runHook records its hook state on the attempt
+    // synchronously (evidence is durable) and settles in the background; a
+    // stop that fails, hangs, or cannot be spawned is deliberately ignored.
+    if (runId !== null && attempt.deadline_stop === undefined) {
+      try {
+        const childEnv = loadSpawnEnvironment(attempt.execution_mode === 'scripted');
+        runHook(`deadline_stop_${attempt.id}`, {
+          executable: 'tamandua', args: ['workflow', 'stop', runId], cwd: '.',
+        }, childEnv, campaignDir, state, attempt, { enforceWall: false })
+          .catch(() => {});
+      } catch {
+        // best-effort: a failed stop must never prevent the terminal record.
+      }
+    }
+    attempt.phase = 'terminal';
+    attempt.terminal_at = observedAt;
+    persistMechanicalOutcome(caseState, attempt, state, campaignDir, 'TEST_INFRA_FAIL', {
+      category: 'deadline-expired',
+      message: `attempt deadline ${attempt.deadline_at} expired ${expiredForSeconds}s before the independent deadline sweep observed it (observed_at ${observedAt})`,
+      deadline_at: attempt.deadline_at,
+      expired_for_seconds: expiredForSeconds,
+      run_id: runId,
+      observed_at: observedAt,
+    });
+    sweptAny = true;
+  }
+  return sweptAny;
+}
+
 async function executeEligibleCases(manifest, state, campaignDir) {
+  // US-005: sweep deadline-expired attempts FIRST — a crashed-controller
+  // leftover (case phase 'running', attempt deadline in the past) must be
+  // terminally recorded before the 'running case' early return (or the
+  // eligibility pass) can see it, so a resume never relaunches into a stale
+  // running case and never leaves it phase=running past its deadline.
+  sweepDeadlineExpiredAttempts(state, campaignDir);
   // Pending work is never started while an interrupted attempt remains
   // unreconciled; resumeCampaign performs reconciliation before scheduling.
   if (state.cases.some((caseState) => caseState.phase === 'running')) return;
@@ -7025,10 +7605,42 @@ async function executeEligibleCases(manifest, state, campaignDir) {
           // TT_CONTAINMENT_VIOLATION) is aborted with the precise
           // 'containment-violation' category — never a generic
           // scheduler failure, and never a silent fall-through.
-          const reason = {
-            category: isContainmentViolation(error) ? 'containment-violation' : 'scheduler-execution-failed',
-            message: error.message,
-          };
+          // S16 (US-003): a structured status-query failure that escaped its
+          // local consumer (e.g. the post-wait discovered-run read) is also
+          // classified by its distinct 'workflow-status-query-failed' category
+          // with the raw evidence — never a generic scheduler failure and
+          // never a controller crash.
+          const reason = (() => {
+            if (isContainmentViolation(error)) {
+              return { category: 'containment-violation', message: error.message };
+            }
+            if (isStatusQueryFailure(error)) {
+              const statusError = error instanceof WorkflowStatusQueryError
+                ? error
+                : error.statusQueryError;
+              // S16 (US-004): when the terminal-evidence status leg fell back
+              // to the readonly-DB probe and that leg ALSO failed, the combined
+              // error carries the database leg's structured failure
+              // (databaseQueryError) — surface its bounded raw output/stderr in
+              // the reason evidence so the operator sees the actual sqlite3
+              // subprocess output, not just the status leg's.
+              const databaseError = isObject(error) ? error.databaseQueryError : undefined;
+              return {
+                category: 'workflow-status-query-failed',
+                message: error.message,
+                run_id: statusError.runId ?? databaseError?.runId ?? null,
+                kind: statusError.kind ?? databaseError?.kind ?? null,
+                raw_output: statusError.rawOutput ?? null,
+                stderr: statusError.stderr ?? null,
+                exit_code: statusError.exitCode ?? null,
+                attempts: statusError.attempts ?? null,
+                database_raw_output: boundedStatusEvidence(databaseError?.rawOutput),
+                database_stderr: boundedStatusEvidence(databaseError?.stderr),
+                database_exit_code: databaseError?.exitCode ?? null,
+              };
+            }
+            return { category: 'scheduler-execution-failed', message: error.message };
+          })();
           if (attempt === undefined) {
             markTerminal(state, item.caseState, campaignDir, 'TEST_INFRA_FAIL', reason);
           } else {
@@ -7041,7 +7653,33 @@ async function executeEligibleCases(manifest, state, campaignDir) {
       .finally(() => active.delete(execution));
     active.add(execution);
   }
-  await Promise.all(active);
+  // US-005: while cases are in flight, drive the independent deadline sweep on
+  // its OWN cadence (options.deadline_sweep_interval_ms) — the sweep ticks
+  // regardless of any per-case monitor's status-poll health, so a case whose
+  // deadline expires mid-campaign is terminally recorded even when its
+  // monitor is degraded or stuck. The race is with the SETTLEMENT of the
+  // in-flight executions: each tick (or final settle) sweeps, and a swept
+  // attempt's terminal marker makes every in-flight consumer stop persisting.
+  const deadlineSweepIntervalMs = state.options.deadline_sweep_interval_ms
+    ?? DEFAULT_DEADLINE_SWEEP_INTERVAL_MS;
+  while (active.size > 0) {
+    const sweepTick = new Promise((resolve) => {
+      const timer = setTimeout(resolve, deadlineSweepIntervalMs);
+      // CRITICAL: the sweep timer must NOT keep the controller process alive
+      // once every execution has settled — the race below resolves via
+      // Promise.allSettled when the last in-flight execution settles, and an
+      // unref'd timer still fires on cadence while executions are in flight
+      // (their own child-process/timer handles keep the event loop alive).
+      timer.unref?.();
+    });
+    await Promise.race([Promise.allSettled([...active]), sweepTick]);
+    if (active.size === 0) break;
+    sweepDeadlineExpiredAttempts(state, campaignDir);
+  }
+  // Final sweep: a case whose execution settled but left it 'running' (e.g.
+  // an unhandled settle) with an expired deadline is still terminally
+  // recorded before the campaign reports are written.
+  sweepDeadlineExpiredAttempts(state, campaignDir);
 }
 
 function isUtcTimestamp(value) {
@@ -7163,7 +7801,10 @@ function validateLoadedState(state, campaignId) {
         && !['all', 'scripted-only'].includes(state.options.execution_selection))
       || (state.options.provider_retry_backoff_ms !== undefined
         && (!Number.isSafeInteger(state.options.provider_retry_backoff_ms)
-          || state.options.provider_retry_backoff_ms < 0))) {
+          || state.options.provider_retry_backoff_ms < 0))
+      || (state.options.deadline_sweep_interval_ms !== undefined
+        && (!Number.isSafeInteger(state.options.deadline_sweep_interval_ms)
+          || state.options.deadline_sweep_interval_ms < 1))) {
     errors.push('campaign options are missing or invalid');
   }
   if (!isObject(state.spend)
@@ -7279,6 +7920,10 @@ function createInitialState(campaignId, manifestPath, manifest, options) {
       token_poll_interval_ms: configuredTokenPollIntervalMs(),
       cap_check_interval_ms: configuredCapCheckIntervalMs(),
       provider_retry_backoff_ms: configuredProviderRetryBackoffMs(),
+      // US-005: independent deadline-expiry sweep cadence (see
+      // configuredDeadlineSweepIntervalMs). Persisted at campaign creation so
+      // a resume keeps the sweep cadence the campaign was launched with.
+      deadline_sweep_interval_ms: configuredDeadlineSweepIntervalMs(),
       execution_selection: options.scriptedOnly ? 'scripted-only' : 'all',
     },
     spend: {
@@ -7947,6 +8592,14 @@ async function resumeCampaign(options, schema) {
     // happens at terminal-report time inside writeTerminalCampaignReports.
     ensureHygieneCanaryBefore(state);
     atomicWriteState(campaignDir, state);
+    // US-005: sweep deadline-expired attempts BEFORE reconciliation. A
+    // crashed-controller leftover (case phase 'running', attempt deadline in
+    // the past — the exact campaign-#8 attempt-2 shape) is terminally
+    // recorded 'deadline-expired' here; reconciliation would otherwise try to
+    // reattach the stale run (workflow wait / harvest) and classify it with a
+    // misleading category (or hang). The sweep is idempotent, so running it
+    // again at the top of executeEligibleCases is a harmless no-op.
+    sweepDeadlineExpiredAttempts(state, campaignDir);
     await reconcileInterruptedAttempts(manifest, state, campaignDir);
     await reconcilePersistedDiscoveredRuns(manifest, state, campaignDir);
     // E2.5 US-004: on resume we verify the real-case preflight again before

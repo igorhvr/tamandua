@@ -23,6 +23,18 @@
 #        daemon's real environment carries adapters-bin on PATH; an
 #        already-up daemon whose PATH lacks the prepend is RESTARTED with
 #        it (verified by PID change + new environ)
+#   AC7. (S15 US-001 red) a mismatched expected build version (injected via
+#        TT_DAEMON_EXPECTED_VERSION_FILE) on an already-UP daemon is NEVER
+#        silently reused: the guard RESTARTS the daemon and, since the
+#        restarted daemon still reports the real dist/version, FAILS CLOSED
+#        with REASON: tt-daemon-stale on stderr, DETAILS carrying expected vs
+#        observed versions, exit non-zero and no 'TT_DAEMON: up' line
+#   AC8. (S15 US-001 green) a parity-matching daemon build version remains an
+#        idempotent no-op ('already UP')
+#   AC9. (S15 US-001 heal) a mismatched expected version whose restart HEALS
+#        the skew (a stub contained daemon whose /control/health buildVersion
+#        advances stale -> current across the guard's restart) exits 0 with
+#        'TT_DAEMON: up' and the restarted daemon reports the expected build
 #
 # Standalone: bash torture-test/bin/tt-daemon-up.test.sh
 # Not part of `npm test`.
@@ -58,6 +70,12 @@ port_state() { # args: ports...
     if timeout 1 bash -c "echo >/dev/tcp/localhost/$p" 2>/dev/null; then s="$s:$p=L"; else s="$s:$p=F"; fi
   done
   printf '%s' "$s"
+}
+
+# health_version: query a daemon's /control/health buildVersion (empty on
+# failure) — used by the S15 build-version parity guard arms.
+health_version() { # port
+  node -e 'const p=Number(process.argv[1]);fetch(`http://127.0.0.1:${p}/control/health`).then(r=>r.json()).then(b=>process.stdout.write(String(b.buildVersion??""))).catch(()=>{})' "$1"
 }
 
 # Snapshot operator state we must NOT touch.
@@ -107,8 +125,14 @@ else
 fi
 
 # ── AC2: ensure-up starts the real daemon and reports it up on 4339 ──
+# S15 US-001: the parity guard compares the daemon's /control/health
+# buildVersion against THIS worktree's dist/version, and daemon-control
+# launches `tamandua` from the caller's PATH (which would otherwise resolve
+# the OPERATOR's installed build). Prepend the worktree's own bin/ so the
+# contained daemon runs THIS tree's build and parity matches deterministically
+# in any environment (installed build in sync or not).
 set +e
-ENSURE_OUT="$("$HELPER" ensure-up 2>&1)"; ENSURE_RC=$?
+ENSURE_OUT="$(PATH="$TT_REPO_ROOT/bin:$PATH" "$HELPER" ensure-up 2>&1)"; ENSURE_RC=$?
 set -e
 if [ "$ENSURE_RC" -eq 0 ]; then
   ok "AC2 ensure-up with daemon down exits 0"
@@ -169,7 +193,7 @@ else
 fi
 
 # ── AC2(idempotence): second ensure-up is a no-op (no re-start) ─────
-IDEM_OUT="$("$HELPER" ensure-up 2>&1)"; IDEM_RC=$?
+IDEM_OUT="$(PATH="$TT_REPO_ROOT/bin:$PATH" "$HELPER" ensure-up 2>&1)"; IDEM_RC=$?
 if [ "$IDEM_RC" -eq 0 ] && echo "$IDEM_OUT" | grep -q "already UP"; then
   ok "AC2 second ensure-up is an idempotent no-op (already up)"
 else
@@ -183,12 +207,14 @@ fi
 
 # ── AC6b: an already-up daemon WITHOUT the prepend gets restarted ────
 # Stop the prepended daemon, start one DIRECTLY via daemon-control (no
-# prepend — daemon-control composes PATH from its own env), then ensure-up
-# must detect the missing prepend and restart the daemon with it.
+# prepend — daemon-control composes PATH from its own env; the worktree
+# bin/ is kept so the S15 parity guard still sees a matching build and the
+# restart is triggered by the missing prepend, not a build skew), then
+# ensure-up must detect the missing prepend and restart the daemon with it.
 set +e
 "$DC" real stop >/dev/null 2>&1
 sleep 1
-"$DC" real start >/dev/null 2>&1
+PATH="$TT_REPO_ROOT/bin:$PATH" "$DC" real start >/dev/null 2>&1
 DIRECT_START_RC=$?
 set -e
 if [ "$DIRECT_START_RC" -eq 0 ]; then ok "AC6b direct daemon-control start (no prepend) exits 0"; else fail "AC6b direct start rc=$DIRECT_START_RC"; fi
@@ -209,7 +235,7 @@ if [ -n "$DIRECT_PID" ] && [ -d "/proc/$DIRECT_PID" ]; then
 else
   fail "AC6b could not capture direct-started daemon PID"
 fi
-RESTART_OUT="$("$HELPER" ensure-up 2>&1)"; RESTART_RC=$?
+RESTART_OUT="$(PATH="$TT_REPO_ROOT/bin:$PATH" "$HELPER" ensure-up 2>&1)"; RESTART_RC=$?
 if [ "$RESTART_RC" -eq 0 ]; then ok "AC6b ensure-up over an unprepended daemon exits 0"; else fail "AC6b ensure-up restart rc=$RESTART_RC"; echo "$RESTART_OUT" | tail -8; fi
 if echo "$RESTART_OUT" | grep -q "TT_DAEMON: up" && echo "$RESTART_OUT" | grep -q "TT_DAEMON_PATH_PREPEND: $ADAPTERS_BIN_DIR"; then
   ok "AC6b restart reports up + prepend seam"
@@ -236,6 +262,236 @@ if [ -n "$NEW_PID" ] && [ -d "/proc/$NEW_PID" ]; then
 else
   fail "AC6b cannot inspect restarted daemon environ"
 fi
+
+# ── AC7 (S15 US-001 red): a stale build version is NEVER silently reused ──
+# The daemon is UP with the matching build + prepend (AC6b). Inject a
+# mismatched expected version via the TT_DAEMON_EXPECTED_VERSION_FILE seam:
+# the OLD pre-guard code would have taken the 'already UP -> no-op' branch
+# and silently reused the stale daemon (campaign #8 attempt-1 controller
+# crash); the guard must instead intercept, restart, and — since the
+# restarted daemon still reports the real dist/version — FAIL CLOSED with
+# the distinct reason tt-daemon-stale.
+REAL_VERSION="$(tr -d '[:space:]' < "$TT_REPO_ROOT/dist/version")"
+MISMATCH_VERSION="pre-WLST5-stale-$(date +%s)"
+printf '%s\n' "$MISMATCH_VERSION" > "$TMP/expected-mismatch.txt"
+STALE_PID_BEFORE=""
+if [ -n "$STATE_DIR" ] && [ -f "$STATE_DIR/tamandua.pid" ]; then
+  STALE_PID_BEFORE="$(cat "$STATE_DIR/tamandua.pid")"
+fi
+set +e
+STALE_OUT="$(PATH="$TT_REPO_ROOT/bin:$PATH" TT_DAEMON_EXPECTED_VERSION_FILE="$TMP/expected-mismatch.txt" "$HELPER" ensure-up 2>&1)"; STALE_RC=$?
+set -e
+if [ "$STALE_RC" -ne 0 ]; then
+  ok "AC7 mismatched expected version exits non-zero (rc=$STALE_RC)"
+else
+  fail "AC7 mismatched expected version should exit non-zero"
+  echo "$STALE_OUT" | tail -8
+fi
+if echo "$STALE_OUT" | grep -q "REASON: tt-daemon-stale"; then
+  ok "AC7 failure emits distinct reason tt-daemon-stale"
+else
+  fail "AC7 missing REASON: tt-daemon-stale"; echo "$STALE_OUT" | grep -E 'REASON|DETAILS' || true
+fi
+if echo "$STALE_OUT" | grep -q "TT_DAEMON: up"; then
+  fail "AC7 stale guard must NOT print TT_DAEMON: up"
+else
+  ok "AC7 no 'TT_DAEMON: up' on stale fail-closed"
+fi
+if echo "$STALE_OUT" | grep -q "already UP"; then
+  fail "AC7 guard must intercept BEFORE the no-op reuse branch"
+else
+  ok "AC7 guard intercepted before the no-op reuse branch"
+fi
+if echo "$STALE_OUT" | grep -q "$MISMATCH_VERSION" && echo "$STALE_OUT" | grep -q "$REAL_VERSION"; then
+  ok "AC7 DETAILS carry expected vs observed versions"
+else
+  fail "AC7 DETAILS missing expected/observed versions"; echo "$STALE_OUT" | grep 'DETAILS' || true
+fi
+STALE_PID_AFTER=""
+if [ -n "$STATE_DIR" ] && [ -f "$STATE_DIR/tamandua.pid" ]; then
+  STALE_PID_AFTER="$(cat "$STATE_DIR/tamandua.pid")"
+fi
+if [ -n "$STALE_PID_BEFORE" ] && [ -n "$STALE_PID_AFTER" ] && [ "$STALE_PID_BEFORE" != "$STALE_PID_AFTER" ]; then
+  ok "AC7 guard RESTARTED the daemon (pid $STALE_PID_BEFORE -> $STALE_PID_AFTER)"
+else
+  fail "AC7 daemon not restarted by the guard (pid $STALE_PID_BEFORE -> ${STALE_PID_AFTER:-none})"
+fi
+
+# ── AC8 (S15 US-001 green): a parity-matching daemon is an idempotent no-op ──
+# With the expected version back at the real dist/version, the daemon's
+# reported buildVersion matches and ensure-up reuses it (no restart).
+PARITY_OUT="$(PATH="$TT_REPO_ROOT/bin:$PATH" TT_DAEMON_EXPECTED_VERSION_FILE="$TT_REPO_ROOT/dist/version" "$HELPER" ensure-up 2>&1)"; PARITY_RC=$?
+if [ "$PARITY_RC" -eq 0 ] && echo "$PARITY_OUT" | grep -q "already UP"; then
+  ok "AC8 parity-matching daemon is an idempotent no-op (already UP)"
+else
+  fail "AC8 parity no-op (rc=$PARITY_RC)"; echo "$PARITY_OUT" | tail -6
+fi
+if echo "$PARITY_OUT" | grep -q "TT_DAEMON: up"; then
+  ok "AC8 parity no-op reports TT_DAEMON: up"
+else
+  fail "AC8 parity no-op missing TT_DAEMON: up"
+fi
+
+# ── AC9 (S15 US-001 heal): a restart that heals the skew reports up ──
+# A stale daemon cannot exist with the REAL contained daemon (it always runs
+# the current dist). To exercise the heal path deterministically we start a
+# STUB contained daemon — a fake `tamandua` first on PATH, daemon-control
+# managed exactly like the AC3 failure stub — whose /control/health
+# buildVersion advances stale -> current across each `daemon start` (the
+# phase file survives the guard's restart): the guard's restart then HEALS
+# the skew and ensure-up exits 0 with 'TT_DAEMON: up'.
+STUBBIN="$TMP/stubbin"
+mkdir -p "$STUBBIN"
+STALE_VERSION="pre-WLST5-daemon-$(date +%s)"
+printf '%s\n' "$STALE_VERSION" > "$TMP/stub-phase"
+cat > "$STUBBIN/stub-config.sh" <<EOF
+STUB_PHASE_FILE="$TMP/stub-phase"
+STUB_STALE_VERSION="$STALE_VERSION"
+STUB_CURRENT_VERSION="$REAL_VERSION"
+EOF
+cat > "$STUBBIN/tamandua" <<'EOF'
+#!/usr/bin/env bash
+# Stub tamandua CLI for the AC9 heal arm (S15 US-001): a minimal fake daemon
+# whose /control/health buildVersion advances stale -> current across each
+# `daemon start`, so the guard's restart can HEAL the skew. Managed through
+# daemon-control exactly like any contained daemon. The daemon PID recorded
+# by daemon-control is the health-server node process; its script name
+# contains 'tamandua' so /proc/<pid>/cmdline satisfies daemon-control's
+# cmdline verification. Stub config (phase file + versions) is read from a
+# config file NEXT TO the stub (env -i drops caller env vars).
+#
+# dashboard/mcp spawn DETACHED placeholder servers and return immediately —
+# exactly like the product's startDashboardStandalone/startMcp (src/server/
+# daemonctl.ts: detached: true + unref), because daemon-control's
+# `systemd-run --user --scope` launch is SYNCHRONOUS: a blocking last command
+# would hang daemon-control forever. The placeholder servers exit on their
+# own once the recorded daemon PID (state-dir tamandua.pid) dies.
+set -uo pipefail
+STUB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[ -f "$STUB_DIR/stub-config.sh" ] && . "$STUB_DIR/stub-config.sh"
+STATE_DIR="${TAMANDUA_STATE_DIR:?}"
+CTRL_PORT="${TAMANDUA_CONTROL_PORT:-4339}"
+DASH_PORT="${TAMANDUA_DASHBOARD_PORT:-4334}"
+MCP_PORT="${TAMANDUA_MCP_PORT:-4338}"
+case "${1:-}" in
+  daemon)
+    case "${2:-}" in
+      start)
+        # Report the current phase version, then advance the phase so the
+        # NEXT start (the guard's restart) reports the healed version.
+        VER="$(cat "$STUB_PHASE_FILE" 2>/dev/null || echo "${STUB_STALE_VERSION:-stale}")"
+        printf '%s\n' "${STUB_CURRENT_VERSION:-current}" > "$STUB_PHASE_FILE"
+        node "$STUB_DIR/tamandua-daemon-health.mjs" "$CTRL_PORT" "$VER" >/dev/null 2>&1 &
+        echo $! > "$STATE_DIR/tamandua.pid"
+        exit 0
+        ;;
+      stop)
+        if [ -f "$STATE_DIR/tamandua.pid" ]; then
+          kill "$(cat "$STATE_DIR/tamandua.pid")" 2>/dev/null || true
+        fi
+        exit 0
+        ;;
+    esac
+    ;;
+  dashboard)
+    node "$STUB_DIR/tamandua-dummy-server.mjs" "$DASH_PORT" "$STATE_DIR/tamandua.pid" >/dev/null 2>&1 &
+    exit 0
+    ;;
+  mcp)
+    node "$STUB_DIR/tamandua-dummy-server.mjs" "$MCP_PORT" "$STATE_DIR/tamandua.pid" >/dev/null 2>&1 &
+    exit 0
+    ;;
+esac
+exit 0
+EOF
+cat > "$STUBBIN/tamandua-daemon-health.mjs" <<'EOF'
+// Stub contained-daemon health server (S15 US-001 heal arm). Serves
+// /control/health with a fixed buildVersion (argv[2]) — the version the
+// current "daemon build" reports. Auth-exempt, exactly like the product's
+// control-plane health endpoint (src/server/control-server.ts).
+import http from "node:http";
+const [portStr, version] = process.argv.slice(2);
+const server = http.createServer((req, res) => {
+  const url = new URL(req.url ?? "/", "http://127.0.0.1");
+  if (url.pathname === "/control/health" && req.method === "GET") {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ status: "ok", pid: process.pid, timestamp: new Date().toISOString(), buildVersion: version }));
+    return;
+  }
+  res.writeHead(404, { "content-type": "application/json" });
+  res.end(JSON.stringify({ error: "not found" }));
+});
+server.listen(Number(portStr), "127.0.0.1");
+EOF
+cat > "$STUBBIN/tamandua-dummy-server.mjs" <<'EOF'
+// Stub contained-daemon dashboard/MCP port placeholder. Binds the port so
+// daemon-control's port-wait succeeds, and exits once the recorded daemon
+// PID (state-dir tamandua.pid) dies — so a stop never leaks the port.
+import http from "node:http";
+import fs from "node:fs";
+const [portStr, pidFile] = process.argv.slice(2);
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { "content-type": "application/json" });
+  res.end("{}");
+});
+server.listen(Number(portStr), "127.0.0.1");
+const iv = setInterval(() => {
+  let pid = 0;
+  try { pid = Number(fs.readFileSync(pidFile, "utf8").trim() || "0"); } catch { pid = 0; }
+  if (pid > 0) {
+    let alive = true;
+    try { process.kill(pid, 0); } catch { alive = false; }
+    if (!alive) {
+      clearInterval(iv);
+      server.close(() => process.exit(0));
+    }
+  }
+}, 500);
+EOF
+chmod +x "$STUBBIN/tamandua"
+
+# Baseline: stop the real daemon, then pre-start the STUB daemon (reports the
+# STALE version) via daemon-control with the stub first on PATH.
+set +e
+"$DC" real stop >/dev/null 2>&1
+sleep 2
+( cd "$TT_REPO_ROOT" && PATH="$STUBBIN:$PATH" TT_DAEMON_PORT_WAIT_SECONDS=3 "$DC" real start >/dev/null 2>&1 ); STUB_START_RC=$?
+set -e
+if [ "$STUB_START_RC" -eq 0 ]; then ok "AC9 stub daemon pre-start exits 0"; else fail "AC9 stub pre-start rc=$STUB_START_RC"; fi
+sleep 1
+STUB_PID_BEFORE=""
+if [ -n "$STATE_DIR" ] && [ -f "$STATE_DIR/tamandua.pid" ]; then STUB_PID_BEFORE="$(cat "$STATE_DIR/tamandua.pid")"; fi
+HEALTH_BEFORE="$(health_version 4339)"
+if [ "$HEALTH_BEFORE" = "$STALE_VERSION" ]; then
+  ok "AC9 stub daemon reports the STALE build version pre-guard"
+else
+  fail "AC9 stub health pre-guard: got '${HEALTH_BEFORE:-<none>}', want '$STALE_VERSION'"
+fi
+
+# The guard must see the mismatch, restart the daemon, and heal: the
+# restarted stub reports the CURRENT (expected) build version -> TT_DAEMON: up.
+set +e
+HEAL_OUT="$(cd "$TT_REPO_ROOT" && PATH="$STUBBIN:$PATH" TT_DAEMON_EXPECTED_VERSION_FILE="$TT_REPO_ROOT/dist/version" "$HELPER" ensure-up 2>&1)"; HEAL_RC=$?
+set -e
+if [ "$HEAL_RC" -eq 0 ]; then ok "AC9 heal-arm ensure-up exits 0 (rc=$HEAL_RC)"; else fail "AC9 heal-arm ensure-up rc=$HEAL_RC"; echo "$HEAL_OUT" | tail -10; fi
+if echo "$HEAL_OUT" | grep -q "TT_DAEMON: up"; then ok "AC9 heal-arm reports TT_DAEMON: up"; else fail "AC9 heal-arm missing TT_DAEMON: up"; echo "$HEAL_OUT" | grep -E 'TT_DAEMON|REASON' || true; fi
+if echo "$HEAL_OUT" | grep -q "stopping to restart"; then ok "AC9 heal-arm guard detected the skew and restarted"; else fail "AC9 heal-arm missing restart log"; echo "$HEAL_OUT" | grep -E 'stopping|MISMATCH|parity' || true; fi
+STUB_PID_AFTER=""
+if [ -n "$STATE_DIR" ] && [ -f "$STATE_DIR/tamandua.pid" ]; then STUB_PID_AFTER="$(cat "$STATE_DIR/tamandua.pid")"; fi
+if [ -n "$STUB_PID_BEFORE" ] && [ -n "$STUB_PID_AFTER" ] && [ "$STUB_PID_BEFORE" != "$STUB_PID_AFTER" ]; then
+  ok "AC9 heal-arm daemon was RESTARTED (pid $STUB_PID_BEFORE -> $STUB_PID_AFTER)"
+else
+  fail "AC9 heal-arm daemon not restarted (pid $STUB_PID_BEFORE -> ${STUB_PID_AFTER:-none})"
+fi
+HEALTH_AFTER="$(health_version 4339)"
+if [ "$HEALTH_AFTER" = "$REAL_VERSION" ]; then
+  ok "AC9 restarted daemon reports the EXPECTED build version (healed)"
+else
+  fail "AC9 post-heal health: got '${HEALTH_AFTER:-<none>}', want '$REAL_VERSION'"
+fi
+
+# Cleanup: stop the stub daemon so no fake daemon leaks into AC4/AC5.
+( cd "$TT_REPO_ROOT" && PATH="$STUBBIN:$PATH" "$DC" real stop >/dev/null 2>&1 ) || true
 
 # ── AC4: stop cleans up — no process remains, ports 43xx free ───────
 STOP_OUT="$("$HELPER" stop 2>&1)"; STOP_RC=$?

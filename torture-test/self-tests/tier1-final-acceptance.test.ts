@@ -241,6 +241,10 @@ const allowed = [
   "torture-test/bin/tt-recorder.test.sh",
   "torture-test/bin/tt-daemon-up",
   "torture-test/bin/tt-daemon-up.test.sh",
+  // CDSK (US-002): the S15 schema-handshake parity leg adds the read-only
+  // SQL-surface probe (bin/tt-schema-probe.mjs) to the daemon-up authoring
+  // surface — same class as the build-version parity guard it sits beside.
+  "torture-test/bin/tt-schema-probe.mjs",
   "torture-test/scenarios/lib/run-scripted-scenario",
   // US-015: the --tier2 ladder rung — bin/tt-run wires tier2 availability
   // + routing (its test extends with the tier2 assertions and the E2.2

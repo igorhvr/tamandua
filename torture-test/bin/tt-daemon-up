@@ -15,13 +15,19 @@
 #   ensure-up   Verify the real TT daemon is up (contained control port 4339),
 #               starting it if absent. FAILS CLOSED with the DISTINCT reason
 #               `tt-daemon-down` (exit non-zero) if the daemon cannot be
-#               brought up/verified. Idempotent: when already up it is a
-#               no-op. S12/E3.D US-009: ensure-up creates the contained
-#               adapters bin dir (var/adapters-bin, empty, idempotent) and
-#               starts the daemon with it PREPENDED to PATH so adapter
-#               stubs (e.g. the managed pi-token-saver) are visible to the
-#               daemon's scheduler; an already-up daemon whose PATH lacks
-#               the prepend is restarted so the invariant holds.
+#               brought up/verified, or `tt-daemon-stale` (exit non-zero) if
+#               the running daemon's build version does not match the current
+#               tree (S15 build-version parity guard, US-001) OR the
+#               contained DB does not satisfy the SQL surface tt-controller's
+#               status queries depend on (S15 schema-handshake parity leg,
+#               US-002 — an unmigrated persisted DB is never reused,
+#               campaign #8 attempt-2). Idempotent: when already up AND all
+#               parity checks match it is a no-op. S12/E3.D US-009: ensure-up
+#               creates the contained adapters bin dir (var/adapters-bin,
+#               empty, idempotent) and starts the daemon with it PREPENDED to
+#               PATH so adapter stubs (e.g. the managed pi-token-saver) are
+#               visible to the daemon's scheduler; an already-up daemon whose
+#               PATH lacks the prepend is restarted so the invariant holds.
 #   status      Report the real TT daemon state — READ ONLY, no side effects.
 #   stop        Stop the real TT daemon at campaign end (hygiene). FAILS
 #               CLOSED with the DISTINCT reason `tt-daemon-down` (exit
@@ -131,6 +137,166 @@ daemon_path_has_adapters_bin() {
   return 1
 }
 
+# ── S15 US-001: build-version parity guard ──────────────────────────────
+#
+# ensure-up must NEVER blindly reuse a running contained daemon: a daemon
+# running a stale dist (campaign #8 attempt-1: a pre-WLST5 daemon was reused,
+# tt-controller's status SELECT hit ceiling_expiry_count -> JSON.parse crash ->
+# the whole controller died) or an unverifiable health response is a parity
+# failure. The daemon's control API /control/health returns
+# {status,pid,timestamp,buildVersion} and is auth-exempt; the expected
+# version is the current tree's dist/version (override seam:
+# TT_DAEMON_EXPECTED_VERSION_FILE so tests inject a mismatched expected
+# version without touching dist/).
+
+# fetch_daemon_health_version: GET <ctrl>/control/health via `node -e` fetch
+# (no curl dependency; node is guaranteed — daemon-control already requires
+# it). Prints the trimmed buildVersion on success, NOTHING on failure
+# (non-JSON, connection refused, timeout, missing field). Never exits
+# non-zero so set -e can't be tripped by a degraded daemon.
+fetch_daemon_health_version() {
+  local port="$1"
+  node -e '
+    const port = Number(process.argv[1]);
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 2000);
+    const done = () => clearTimeout(timer);
+    fetch(`http://127.0.0.1:${port}/control/health`, { signal: ctrl.signal })
+      .then((res) => (res.ok ? res.json() : Promise.reject(new Error("http " + res.status))))
+      .then((body) => {
+        if (body && typeof body.buildVersion === "string") process.stdout.write(body.buildVersion.trim());
+      })
+      .catch(() => {})
+      .finally(done);
+  ' "$port"
+}
+
+# resolve_expected_version: the current tree's expected build version, read
+# from TT_DAEMON_EXPECTED_VERSION_FILE (default <repo>/dist/version). Test
+# seam: tests point the env var at a temp file with a mismatched version so
+# the guard can be exercised without touching dist/. Empty when the file is
+# missing/empty (caller fails closed — an unverifiable expected version is
+# never a silent pass).
+resolve_expected_version() {
+  local vf="${TT_DAEMON_EXPECTED_VERSION_FILE:-$TT_REPO_ROOT/dist/version}"
+  if [ -f "$vf" ]; then
+    sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$vf"
+  fi
+}
+
+# verify_build_parity: query the running daemon's buildVersion and compare it
+# with the expected version. Sets the global PARITY_OBSERVED (observed
+# version, or empty when the health query failed) for fail-closed DETAILS.
+# Returns 0 on parity, 1 on mismatch OR unverifiable health response (fail
+# closed — never silently reuse).
+PARITY_OBSERVED=""
+verify_build_parity() {
+  local ctrl_port="$1"
+  PARITY_OBSERVED="$(fetch_daemon_health_version "$ctrl_port")"
+  local expected
+  expected="$(resolve_expected_version)"
+  if [ -z "$expected" ]; then
+    log "build-version parity: no expected version (TT_DAEMON_EXPECTED_VERSION_FILE missing/empty) — cannot verify, fail closed."
+    return 1
+  fi
+  if [ -z "$PARITY_OBSERVED" ]; then
+    log "build-version parity: health query on control port $ctrl_port failed (non-JSON/refused/timeout) — fail closed, never reuse an unverifiable daemon."
+    return 1
+  fi
+  if [ "$PARITY_OBSERVED" != "$expected" ]; then
+    log "build-version parity: MISMATCH — daemon reports '$PARITY_OBSERVED', expected '$expected' (control port $ctrl_port)."
+    return 1
+  fi
+  log "build-version parity: OK (daemon build '$PARITY_OBSERVED' matches expected '$expected')."
+  return 0
+}
+
+# ── S15 US-002: schema-handshake parity leg (SQL-surface probe) ─────────
+#
+# ensure-up must ALSO verify that the contained DB satisfies the SQL surface
+# tt-controller's status queries depend on (campaign #8 attempt-2: the
+# daemon was restarted on the current dist but the DB itself was unmigrated
+# -> tt-controller's first status poll hit "no such column:
+# ceiling_expiry_count" and the whole controller died with nobody watching).
+# The probe (tt-schema-probe.mjs) opens the DB READ-ONLY with node:sqlite
+# DatabaseSync({ readOnly: true }) and PRAGMA-checks every required
+# runs/steps column; a missing table or column is a schema-parity failure
+# that is NEVER reused. Test seams (so the battery builds a stale-schema
+# fixture DB under torture-test/var without touching the real contained DB):
+#   TT_DAEMON_SCHEMA_PROBE_DB            override the DB path
+#   TT_DAEMON_SCHEMA_PROBE_COLUMNS_FILE  override the required-columns JSON
+
+# resolve_schema_probe_db: the contained DB path to probe —
+# TT_DAEMON_SCHEMA_PROBE_DB override (test seam) or
+# <TAMANDUA_STATE_DIR from tt-env.sh>/tamandua.db. Empty when unresolvable
+# (caller fails closed — an unverifiable DB is never a silent pass).
+resolve_schema_probe_db() {
+  if [ -n "${TT_DAEMON_SCHEMA_PROBE_DB:-}" ]; then
+    printf '%s' "$TT_DAEMON_SCHEMA_PROBE_DB"
+    return 0
+  fi
+  local state_dir
+  state_dir="$(env -i bash "$TT_ENV_REAL" print 2>/dev/null | grep '^TAMANDUA_STATE_DIR=' | head -n1 | cut -d= -f2- || true)"
+  if [ -n "$state_dir" ]; then
+    printf '%s' "$state_dir/tamandua.db"
+    return 0
+  fi
+  return 0
+}
+
+# SCHEMA_DETAILS: the probe's first DETAILS line on failure (embedded in the
+# fail-closed report). SCHEMA_PROBE_RC: the last probe exit code.
+SCHEMA_DETAILS=""
+SCHEMA_PROBE_RC=0
+verify_schema_parity() {
+  local db_path
+  db_path="$(resolve_schema_probe_db)"
+  if [ -z "$db_path" ]; then
+    SCHEMA_DETAILS="cannot resolve the contained DB path (no TAMANDUA_STATE_DIR / no TT_DAEMON_SCHEMA_PROBE_DB)"
+    log "schema-handshake parity: ${SCHEMA_DETAILS} — fail closed."
+    return 1
+  fi
+  local probe_out probe_rc
+  set +e
+  probe_out="$(TT_DAEMON_SCHEMA_PROBE_DB="$db_path" node "$SCRIPT_DIR/tt-schema-probe.mjs" 2>&1)"
+  probe_rc=$?
+  set -e
+  SCHEMA_PROBE_RC="$probe_rc"
+  if [ "$probe_rc" -eq 0 ] && printf '%s' "$probe_out" | grep -q '^SCHEMA: ok'; then
+    log "schema-handshake parity: OK (DB '$db_path' exposes the required runs/steps columns)."
+    SCHEMA_DETAILS=""
+    return 0
+  fi
+  SCHEMA_DETAILS="$(printf '%s\n' "$probe_out" | grep '^DETAILS:' | head -n1 | sed 's/^DETAILS: //')"
+  if [ -z "$SCHEMA_DETAILS" ]; then
+    SCHEMA_DETAILS="schema probe failed (exit $probe_rc) on DB '$db_path'"
+  fi
+  log "schema-handshake parity: FAIL — $SCHEMA_DETAILS (probe exit $probe_rc)."
+  return 1
+}
+
+# stop_daemon_for_restart: stop the running contained daemon via
+# daemon-control and wait (bounded, the existing stop/settle pattern) for the
+# 43xx ports to free. Returns 0 on a clean stop, 1 when the daemon could not
+# be stopped (the caller fails closed — never restart into a busy port).
+stop_daemon_for_restart() {
+  local stop_rc=0
+  set +e
+  "$DC" real stop >/dev/null 2>&1
+  stop_rc=$?
+  set -e
+  log "daemon-control real stop rc=$stop_rc"
+  local settle; settle=$(($(date +%s) + 15))
+  while [ "$(date +%s)" -lt "$settle" ]; do
+    if ports_free >/dev/null 2>&1; then break; fi
+    sleep 1
+  done
+  if ! ports_free >/dev/null 2>&1; then
+    return 1
+  fi
+  return 0
+}
+
 # print_up: the uniform success contract of ensure-up.
 print_up() {
   echo "TT_DAEMON: up"
@@ -171,65 +337,97 @@ cmd_ensure_up() {
   local st
   st="$(dc_status)"
 
-  # Already up AND already carrying the adapters-bin PATH prepend -> no-op.
+  # S15 US-001/US-002: preflight parity guards — a running contained daemon
+  # is NEVER blindly reused. BEFORE the idempotent no-op reuse branch, the
+  # daemon's /control/health buildVersion must match the current tree's
+  # version (TT_DAEMON_EXPECTED_VERSION_FILE, default <repo>/dist/version)
+  # AND the contained DB must satisfy the SQL surface tt-controller's status
+  # queries depend on (tt-schema-probe.mjs: the runs/steps columns, e.g.
+  # ceiling_expiry_count). A stale daemon (campaign #8 attempt-1: a pre-WLST5
+  # dist was reused and tt-controller crashed on the missing
+  # ceiling_expiry_count column), an unmigrated DB (attempt-2: daemon on the
+  # current dist but the DB unmigrated -> same crash at the first status
+  # poll), or an unverifiable health/schema response is a parity failure:
+  # restart the daemon and fail closed with 'tt-daemon-stale' if the restart
+  # cannot heal the skew. The existing adapters-bin PATH-prepend invariant
+  # (S12/E3.D US-009) is checked alongside; a restart triggered by ANY
+  # condition re-verifies ALL invariants after the daemon is back up.
+  local needs_restart=""
   if [ "$st" = "STATUS: RUNNING" ] && is_port_listening "$ctrl_port"; then
-    if daemon_path_has_adapters_bin; then
-      log "real TT daemon already UP with adapters-bin on PATH (control port $ctrl_port) — no-op."
-      print_up "$ctrl_port"
-      return 0
+    if ! verify_build_parity "$ctrl_port"; then
+      needs_restart="build-version parity mismatch"
+    elif ! verify_schema_parity; then
+      needs_restart="schema-handshake parity mismatch"
+    elif ! daemon_path_has_adapters_bin; then
+      needs_restart="adapters-bin PATH prepend missing"
     fi
-    # Up but WITHOUT the prepend (started by an older path/version): restart
-    # it so the adapter stub machinery (pi-token-saver) is actually visible.
-    log "real TT daemon UP but its PATH lacks adapters-bin — stopping to restart with the prepend."
-    local stop_rc=0
-    set +e
-    "$DC" real stop >/dev/null 2>&1
-    stop_rc=$?
-    set -e
-    log "daemon-control real stop rc=$stop_rc"
-    local settle; settle=$(($(date +%s) + 15))
-    while [ "$(date +%s)" -lt "$settle" ]; do
-      if ports_free >/dev/null 2>&1; then break; fi
-      sleep 1
-    done
-    if ! ports_free >/dev/null 2>&1; then
+  fi
+
+  if [ -n "$needs_restart" ]; then
+    log "real TT daemon UP but $needs_restart — stopping to restart (re-verifies build parity + schema handshake + adapters-bin after the daemon is back up)."
+    if ! stop_daemon_for_restart; then
       echo "REASON: tt-daemon-down" >&2
-      echo "DETAILS: daemon was up without the adapters-bin PATH prepend and could not be stopped for restart." >&2
-      echo "DC_STOP_RC: $stop_rc" >&2
+      echo "DETAILS: daemon was up with a $needs_restart and could not be stopped for restart." >&2
+      log "FAIL: could not stop the daemon for restart." >&2
       return 1
     fi
     st=""
   fi
 
-  log "real TT daemon not verified up (status '${st:-unknown}') — starting via daemon-control real with PATH prepend $ADAPTERS_BIN_DIR..."
-  local start_rc=0
-  set +e
-  PATH="$ADAPTERS_BIN_DIR:$PATH" "$DC" real start >/dev/null 2>&1
-  start_rc=$?
-  set -e
-  log "daemon-control real start rc=$start_rc"
+  if [ "$st" != "STATUS: RUNNING" ] || ! is_port_listening "$ctrl_port"; then
+    log "real TT daemon not verified up (status '${st:-unknown}') — starting via daemon-control real with PATH prepend $ADAPTERS_BIN_DIR..."
+    local start_rc=0
+    set +e
+    PATH="$ADAPTERS_BIN_DIR:$PATH" "$DC" real start >/dev/null 2>&1
+    start_rc=$?
+    set -e
+    log "daemon-control real start rc=$start_rc"
 
-  if wait_for_daemon_up 40 "$ctrl_port"; then
-    # US-009: success requires the prepend to actually land on the daemon's
-    # PATH — verify against the started daemon's real environment.
-    if daemon_path_has_adapters_bin; then
-      log "real TT daemon started and verified UP with adapters-bin on PATH (control port $ctrl_port)."
-      print_up "$ctrl_port"
-      return 0
+    if wait_for_daemon_up 40 "$ctrl_port"; then
+      # US-001/US-002: a started daemon must satisfy ALL invariants before
+      # being declared up — the build-version parity check (S15 US-001), the
+      # schema-handshake parity check (S15 US-002), and the adapters-bin
+      # PATH prepend (US-009).
+      if ! verify_build_parity "$ctrl_port"; then
+        # ── FAIL CLOSED: stale/unverifiable daemon ──────────────────
+        echo "REASON: tt-daemon-stale" >&2
+        echo "DETAILS: contained real TT daemon build-version parity check failed (control port $ctrl_port): expected '$(resolve_expected_version)', observed '${PARITY_OBSERVED:-<health query failed>}'." >&2
+        echo "DC_START_RC: $start_rc" >&2
+        log "FAIL: daemon build version does not match the current tree — refusing to reuse a stale daemon." >&2
+        return 1
+      fi
+      if ! verify_schema_parity; then
+        # ── FAIL CLOSED: unmigrated/invalid DB (never reused) ────────
+        echo "REASON: tt-daemon-stale" >&2
+        echo "DETAILS: contained TT DB schema-handshake parity check failed (DB '$(resolve_schema_probe_db)'): ${SCHEMA_DETAILS:-schema probe could not verify the DB}." >&2
+        echo "DC_START_RC: $start_rc" >&2
+        log "FAIL: contained TT DB does not satisfy the tt-controller status SQL surface — refusing to run against an unmigrated DB." >&2
+        return 1
+      fi
+      if daemon_path_has_adapters_bin; then
+        log "real TT daemon started and verified UP with matching build + schema handshake + adapters-bin on PATH (control port $ctrl_port)."
+        print_up "$ctrl_port"
+        return 0
+      fi
+      echo "REASON: tt-daemon-down" >&2
+      echo "DETAILS: contained daemon came up but its PATH lacks the adapters-bin prepend ($ADAPTERS_BIN_DIR)." >&2
+      echo "DC_START_RC: $start_rc" >&2
+      log "FAIL: daemon came up without adapters-bin on PATH." >&2
+      return 1
     fi
+
+    # ── FAIL CLOSED: daemon could not be brought up/verified ──────────
     echo "REASON: tt-daemon-down" >&2
-    echo "DETAILS: contained daemon came up but its PATH lacks the adapters-bin prepend ($ADAPTERS_BIN_DIR)." >&2
+    echo "DETAILS: contained real TT daemon could not be brought up / verified on the 43xx ports (ctrl $ctrl_port)." >&2
     echo "DC_START_RC: $start_rc" >&2
-    log "FAIL: daemon came up without adapters-bin on PATH." >&2
+    log "FAIL: real TT daemon did not come up (start_rc=$start_rc)." >&2
     return 1
   fi
 
-  # ── FAIL CLOSED: daemon could not be brought up/verified ──────────
-  echo "REASON: tt-daemon-down" >&2
-  echo "DETAILS: contained real TT daemon could not be brought up / verified on the 43xx ports (ctrl $ctrl_port)." >&2
-  echo "DC_START_RC: $start_rc" >&2
-  log "FAIL: real TT daemon did not come up (start_rc=$start_rc)." >&2
-  return 1
+  # ── Already UP with matching build + schema handshake + adapters-bin → no-op ──
+  log "real TT daemon already UP with matching build + schema handshake + adapters-bin on PATH (control port $ctrl_port) — no-op."
+  print_up "$ctrl_port"
+  return 0
 }
 
 cmd_stop() {
@@ -307,10 +505,21 @@ Subcommands:
   ensure-up   Verify the real TT daemon is up (contained control port 4339);
               start it if absent. Idempotent. FAILS CLOSED with the distinct
               reason 'tt-daemon-down' (exit non-zero) if it cannot be brought
-              up/verified. Also creates var/adapters-bin (empty, idempotent)
-              and starts the daemon with it prepended to PATH (S12/E3.D
-              US-009); an already-up daemon whose PATH lacks the prepend is
-              restarted so the invariant holds.
+              up/verified, or 'tt-daemon-stale' (exit non-zero) if a preflight
+              parity guard fails: the daemon's /control/health buildVersion
+              compared against TT_DAEMON_EXPECTED_VERSION_FILE (default
+              <repo>/dist/version; a mismatch or an unverifiable health
+              response restarts the daemon, and a restart that cannot heal
+              the skew fails closed — a stale pre-WLST5 daemon is NEVER
+              reused, campaign #8 attempt-1 controller crash), or the
+              contained DB failing the schema-handshake probe
+              (tt-schema-probe.mjs: the runs/steps columns tt-controller's
+              status SQL SELECTs, e.g. ceiling_expiry_count — an unmigrated
+              persisted DB is NEVER reused, campaign #8 attempt-2). Also
+              creates var/adapters-bin (empty, idempotent) and starts the
+              daemon with it prepended to PATH (S12/E3.D US-009); an
+              already-up daemon whose PATH lacks the prepend is restarted so
+              the invariant holds.
   status      Report the real TT daemon state — read only, no side effects.
   stop        Stop the real TT daemon at campaign end (hygiene). FAILS CLOSED
               with the distinct reason 'tt-daemon-down' (exit non-zero) if a
@@ -319,13 +528,40 @@ Subcommands:
 Options:
   --help,-h   Show this help.
 
+Environment:
+  TT_DAEMON_EXPECTED_VERSION_FILE   Expected build version file compared
+                                    against the running daemon's
+                                    /control/health buildVersion (default
+                                    <repo>/dist/version). Test seam — inject
+                                    a mismatched expected version without
+                                    touching dist/.
+  TT_DAEMON_SCHEMA_PROBE_DB         DB path probed by the schema-handshake
+                                    parity leg (default
+                                    <TAMANDUA_STATE_DIR>/tamandua.db from
+                                    tt-env.sh). Test seam — point at a
+                                    stale-schema fixture DB under
+                                    torture-test/var without touching the
+                                    real contained DB. Paths outside
+                                    torture-test/var are rejected by the
+                                    probe (containment guard).
+  TT_DAEMON_SCHEMA_PROBE_COLUMNS_FILE
+                                    Required-columns JSON override for the
+                                    schema probe ({ "<table>": ["col", ...],
+                                    ... }); default is the exact
+                                    tt-controller status SELECT surface.
+                                    Test seam only.
+
 Examples:
   tt-daemon-up ensure-up      # verify/bring up the contained real daemon (43xx)
   tt-daemon-up status         # read-only status
   tt-daemon-up stop           # stop it and verify ports 43xx are free
 
 Fail-closed: every successful path prints 'TT_DAEMON: up'/'TT_DAEMON: down';
-every failure prints 'REASON: tt-daemon-down' on stderr and exits non-zero.
+every failure prints 'REASON: tt-daemon-down' or 'REASON: tt-daemon-stale'
+on stderr and exits non-zero (tt-daemon-stale = the daemon's build version
+does not match the current tree / could not be verified, or the contained
+DB does not satisfy the tt-controller status SQL surface / could not be
+verified).
 A successful ensure-up additionally prints 'TT_DAEMON_PATH_PREPEND: <path>'
 (the contained adapters bin dir prepended to the daemon's PATH).
 EOF

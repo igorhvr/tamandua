@@ -278,7 +278,14 @@ describe("Controller teardown wiring (US-005)", () => {
 
     let campaignId: string | null = null;
     try {
-      const res = runTt(controller, ["--manifest", rel]);
+      // Zero-token hermeticity (US-006): the FAILED arm never launches a real
+      // harness — the failing `reset` hook short-circuits before launch — so
+      // the real-case preflight's harness-auth leg is incidental to what this
+      // test pins (teardown policy). Disable it so the arm does not depend on
+      // the operator's live pi auth (whose configured model can drift, e.g.
+      // a gateway model rename) — the test must pass in any environment,
+      // exactly like the PASS arm's TT_DRY_RUN_REAL_LAUNCH hermeticity.
+      const res = runTt(controller, ["--manifest", rel], { TT_CONTROLLER_PREFLIGHT_DISABLED: "1" });
       const m = CAMPAIGN_LINE.exec(res.stdout);
       campaignId = m === null ? null : m[1];
       assert.ok(campaignId, `no campaign created:\n${res.stdout}${res.stderr}`);
