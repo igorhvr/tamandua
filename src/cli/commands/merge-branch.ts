@@ -6,10 +6,20 @@
 
 import { runPlumbingMerge } from "../../installer/merge-branch.js";
 
-const MERGE_BRANCH_OPTIONS = ["--origin", "--branch", "--into", "--expect-tip", "--message"] as const;
+const MERGE_BRANCH_REQUIRED_OPTIONS = ["--origin", "--branch", "--into", "--expect-tip", "--message"] as const;
+const MERGE_BRANCH_OPTIONAL_OPTIONS = ["--run-id"] as const;
+const MERGE_BRANCH_OPTIONS = [...MERGE_BRANCH_REQUIRED_OPTIONS, ...MERGE_BRANCH_OPTIONAL_OPTIONS] as const;
 export type MergeBranchOption = typeof MERGE_BRANCH_OPTIONS[number];
 
-export function parseMergeBranchOptions(args: string[]): Record<MergeBranchOption, string> {
+/**
+ * Parsed merge-branch options. Required options are always present;
+ * optional options (--run-id) are absent unless explicitly provided so
+ * runPlumbingMerge can fall back to TAMANDUA_RUN_ID env, then ''.
+ */
+export type MergeBranchParsedOptions = Record<(typeof MERGE_BRANCH_REQUIRED_OPTIONS)[number], string> &
+  Partial<Record<(typeof MERGE_BRANCH_OPTIONAL_OPTIONS)[number], string>>;
+
+export function parseMergeBranchOptions(args: string[]): MergeBranchParsedOptions {
   const allowed = new Set<string>(MERGE_BRANCH_OPTIONS);
   const parsed = new Map<MergeBranchOption, string>();
 
@@ -38,24 +48,31 @@ export function parseMergeBranchOptions(args: string[]): Record<MergeBranchOptio
     parsed.set(name, value);
   }
 
-  for (const name of MERGE_BRANCH_OPTIONS) {
+  for (const name of MERGE_BRANCH_REQUIRED_OPTIONS) {
     if (!parsed.has(name)) throw new Error(`Missing required option ${name}.`);
   }
 
-  return Object.fromEntries(parsed) as Record<MergeBranchOption, string>;
+  return Object.fromEntries(parsed) as MergeBranchParsedOptions;
 }
 
 export function getMergeBranchHelp(): string {
   return `tamandua merge-branch — Atomically land a squash merge with Git plumbing
 
-Usage: tamandua merge-branch --origin <repo-path> --branch <feature-branch> --into <target-ref> --expect-tip <sha> --message <commit-message>
+Usage: tamandua merge-branch --origin <repo-path> --branch <feature-branch> --into <target-ref> --expect-tip <sha> --message <commit-message> [--run-id <run-id>]
 
-All options are required and must be specified exactly once:
+Required options (must be specified exactly once):
   --origin <repo-path>       Origin Git repository whose target ref is updated
   --branch <feature-branch>  Feature branch to squash
   --into <target-ref>        Explicit target branch name (never defaults to main)
   --expect-tip <sha>         Required current target commit for atomic compare-and-swap
   --message <message>        Commit message for the squash commit
+
+Optional options:
+  --run-id <run-id>          Run id to attribute this landing to; merge events are
+                             written to events/<run-id>.jsonl. When omitted, the
+                             TAMANDUA_RUN_ID environment variable is used; with
+                             neither, the merge is runless (runId "") — the manual
+                             CLI merge behavior.
 
 Machine-readable results:
   STATUS: landed
@@ -107,7 +124,7 @@ Exit codes:
 export function handleMergeBranch(group: string, args: string[]): boolean {
   if (group !== "merge-branch") return false;
 
-  let options: Record<MergeBranchOption, string>;
+  let options: MergeBranchParsedOptions;
   try {
     options = parseMergeBranchOptions(args.slice(1));
   } catch (err) {
@@ -116,12 +133,17 @@ export function handleMergeBranch(group: string, args: string[]): boolean {
     return true;
   }
 
+  const runId = options["--run-id"];
   const result = runPlumbingMerge({
     origin: options["--origin"],
     branch: options["--branch"],
     into: options["--into"],
     expectTip: options["--expect-tip"],
     message: options["--message"],
+    // --run-id is optional: leave params.runId unset when absent so
+    // runPlumbingMerge falls back to TAMANDUA_RUN_ID env, then '' (runless
+    // manual merge).
+    ...(runId !== undefined ? { runId } : {}),
   });
   if (result.status === "landed") {
     let output = `STATUS: landed\nNOOP: ${result.noop}\nMERGED_COMMIT: ${result.mergedCommit}\nMERGED_TREE: ${result.mergedTree}\nTARGET: ${result.target}\nCHECKOUT_REFRESH: ${result.checkoutRefresh}\n`;

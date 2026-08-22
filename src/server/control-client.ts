@@ -146,9 +146,16 @@ export async function registerRunWithDaemon(runId: string, timeoutMs?: number): 
   return controlRequest("POST", "/control/register-run", { runId }, timeoutMs);
 }
 
-/** Request termination of a run's scheduling state. */
-export async function terminateRunWithDaemon(runId: string): Promise<ControlPlaneResponse | null> {
-  return controlRequest("POST", "/control/terminate-run", { runId });
+/**
+ * Request termination of a run's scheduling state.
+ *
+ * `timeoutMs` overrides the default request timeout. The cancel path passes
+ * a settle-sized timeout: for canceled runs the daemon's terminate handler
+ * settles in-flight token attribution BEFORE responding (TATR US-005/US-006),
+ * which can take up to the teardown grace window.
+ */
+export async function terminateRunWithDaemon(runId: string, timeoutMs?: number): Promise<ControlPlaneResponse | null> {
+  return controlRequest("POST", "/control/terminate-run", { runId }, timeoutMs);
 }
 
 /** Pause a run (clears timers; sets status='paused'). Optionally drain first. */

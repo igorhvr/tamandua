@@ -17,6 +17,7 @@ import {
   createAgentCronJob,
   _scheduledJobCountForRun,
   removeRunCrons,
+  settleRunInFlightRounds,
   shutdownAllCrons,
   tryMarkJobInFlight,
   nudgeScheduledRuns,
@@ -832,5 +833,691 @@ process.exit(1);
     assert.equal(workerLost[0].exitCode, 1);
     const ceilingExpiries = events.filter((e) => e.event === "step.ceiling_expiry");
     assert.equal(ceilingExpiries.length, 0, "a crash must NOT emit step.ceiling_expiry");
+  });
+});
+
+// ── TATR US-002: worker subprocess run identity ─────────────────────
+// Every worker round's subprocess must carry the run's identity
+// (TAMANDUA_RUN_ID) so nested CLI invocations (tamandua merge-branch,
+// tamandua workflow run) can attribute themselves to the run that
+// spawned them (TATR facets 1 and 5). The scheduler passes it through
+// harnessEnv to adapter.runRound, which merges it into the child
+// process env — the same env-inheritance mechanism step claim/complete
+// already rely on.
+
+describe("executeDispatchRound harness env run identity (TATR)", () => {
+  let tempHome: string;
+  let saved: Record<string, string | undefined>;
+
+  beforeEach(() => {
+    tempHome = tamanduaTempDir("tamandua-runid-");
+    const stateDir = path.join(tempHome, ".tamandua");
+    fs.mkdirSync(stateDir, { recursive: true });
+    saved = {
+      HOME: process.env.HOME,
+      TAMANDUA_STATE_DIR: process.env.TAMANDUA_STATE_DIR,
+      TAMANDUA_DB_PATH: process.env.TAMANDUA_DB_PATH,
+      TAMANDUA_PI_BINARY: process.env.TAMANDUA_PI_BINARY,
+      TAMANDUA_RUN_ID: process.env.TAMANDUA_RUN_ID,
+    };
+    process.env.HOME = tempHome;
+    process.env.TAMANDUA_STATE_DIR = stateDir;
+    process.env.TAMANDUA_DB_PATH = path.join(stateDir, "tamandua.db");
+    // Drop any ambient TAMANDUA_RUN_ID so the child-env observation can
+    // only come from the scheduler's harnessEnv (not process-env bleed).
+    delete process.env.TAMANDUA_RUN_ID;
+    // Guard awareness (test-isolation-guard): this suite emits events and
+    // reads the run DB through the same isolated temp state dir it creates.
+    assert.doesNotThrow(() =>
+      assertStatePathIsolation(path.join(stateDir, "tamandua.db"), "agent-scheduler-tatr-runid"),
+    );
+  });
+
+  afterEach(() => {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    shutdownAllCrons();
+    fs.rmSync(tempHome, { recursive: true, force: true });
+  });
+
+  it("passes TAMANDUA_RUN_ID (and preserves job id / worker pid) into the worker subprocess env", async () => {
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    const workdir = path.join(tempHome, "work");
+    fs.mkdirSync(workdir, { recursive: true });
+
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at) VALUES (?, 'test-wf', 'run identity task', 'running', ?, ?, ?)",
+    ).run(runId, JSON.stringify({ working_directory_for_harness: workdir }), now, now);
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, created_at, updated_at) VALUES (?, ?, 'step-1', 'test-wf_test-agent', 0, 'do work', 'STATUS', 'pending', ?, ?)",
+    ).run(`${runId}-step`, runId, now, now);
+
+    // Same job-id shape as buildJobId("test-wf", runId, "test-agent").
+    const jobId = `tamandua-test-wf-${runId}-test-agent`;
+
+    // Fake pi: claims the pending step, dumps the env identity vars it
+    // received to a file, then reports STATUS: done so the round completes
+    // cleanly (auto-complete via claim_job_id). The dump file path travels
+    // through the parent env — the harness env merge must not wipe it.
+    const envDump = path.join(tempHome, "env-dump.json");
+    const fakePi = path.join(tempHome, "pi-mock");
+    fs.writeFileSync(
+      fakePi,
+      `#!/usr/bin/env node
+import { DatabaseSync } from "node:sqlite";
+import fs from "node:fs";
+const db = new DatabaseSync(process.env.TAMANDUA_DB_PATH);
+db.exec("PRAGMA busy_timeout = 5000");
+db.prepare("UPDATE steps SET status = 'running', claim_job_id = ? WHERE status = 'pending'").run(process.env.TAMANDUA_WORKER_JOB_ID);
+fs.writeFileSync(process.env.TAMANDUA_ENV_DUMP, JSON.stringify({
+  TAMANDUA_RUN_ID: process.env.TAMANDUA_RUN_ID ?? null,
+  TAMANDUA_WORKER_JOB_ID: process.env.TAMANDUA_WORKER_JOB_ID ?? null,
+  TAMANDUA_WORKER_PID: process.env.TAMANDUA_WORKER_PID ?? null,
+}));
+console.log("STATUS: done");
+process.exit(0);
+`,
+      { mode: 0o755 },
+    );
+    process.env.TAMANDUA_PI_BINARY = fakePi;
+    process.env.TAMANDUA_ENV_DUMP = envDump;
+
+    await executeDispatchRound(
+      { id: jobId, workflowId: "test-wf", runId, agentId: "test-wf_test-agent", harnessType: "pi", workingDirectoryForHarness: workdir, createdAt: "" },
+      { id: "test-agent", model: "fake", workspace: { baseDir: "." }, timeoutSeconds: 10 },
+    );
+
+    // The spawned subprocess observed the harness env (harnessEnv was
+    // merged into the child env by adapter.runRound).
+    const observed = JSON.parse(fs.readFileSync(envDump, "utf8")) as {
+      TAMANDUA_RUN_ID: string | null;
+      TAMANDUA_WORKER_JOB_ID: string | null;
+      TAMANDUA_WORKER_PID: string | null;
+    };
+    assert.equal(
+      observed.TAMANDUA_RUN_ID,
+      runId,
+      "worker subprocess must receive TAMANDUA_RUN_ID equal to the dispatch job's runId",
+    );
+    assert.equal(
+      observed.TAMANDUA_WORKER_JOB_ID,
+      jobId,
+      "existing TAMANDUA_WORKER_JOB_ID env entry must be preserved",
+    );
+    assert.equal(
+      observed.TAMANDUA_WORKER_PID,
+      String(process.pid),
+      "existing TAMANDUA_WORKER_PID env entry must be preserved",
+    );
+
+    // The round completed cleanly: the claimed step was auto-completed.
+    const step = db.prepare("SELECT status FROM steps WHERE id = ?").get(`${runId}-step`) as { status: string };
+    assert.equal(step.status, "done", "a clean STATUS: done round must auto-complete the claimed step");
+  });
+});
+
+// ── TATR US-005: settle-in-flight token attribution ─────────────────
+// The cancel path must not kill in-flight work immediately: a worker
+// round's parsed tokenUsage can lose the race against the cancel flush,
+// leaving a run that actually spent tokens at spend 0 (campaign #7:
+// 65,481 parsed but spend 0). settleRunInFlightRounds waits (bounded by
+// grace) for every in-flight round's post-round token attribution to
+// finish, and the control-plane terminate handler uses it for canceled
+// runs. These tests pin the settle semantics at the scheduler level.
+
+describe("settleRunInFlightRounds (TATR US-005)", () => {
+  let tempHome: string;
+  let saved: Record<string, string | undefined>;
+
+  beforeEach(() => {
+    tempHome = tamanduaTempDir("tamandua-settle-");
+    const stateDir = path.join(tempHome, ".tamandua");
+    fs.mkdirSync(stateDir, { recursive: true });
+    saved = {
+      HOME: process.env.HOME,
+      TAMANDUA_STATE_DIR: process.env.TAMANDUA_STATE_DIR,
+      TAMANDUA_DB_PATH: process.env.TAMANDUA_DB_PATH,
+      TAMANDUA_PI_BINARY: process.env.TAMANDUA_PI_BINARY,
+      TAMANDUA_ROUND_MARKER: process.env.TAMANDUA_ROUND_MARKER,
+    };
+    process.env.HOME = tempHome;
+    process.env.TAMANDUA_STATE_DIR = stateDir;
+    process.env.TAMANDUA_DB_PATH = path.join(stateDir, "tamandua.db");
+    // Guard awareness (test-isolation-guard): this suite emits events and
+    // reads the run DB through the same isolated temp state dir it creates.
+    assert.doesNotThrow(() =>
+      assertStatePathIsolation(path.join(stateDir, "tamandua.db"), "agent-scheduler-tatr-settle"),
+    );
+  });
+
+  afterEach(() => {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    shutdownAllCrons();
+    fs.rmSync(tempHome, { recursive: true, force: true });
+  });
+
+  /** Seed a running run + pending step so the dispatch peek says HAS_WORK. */
+  function seedSettleRun(): { runId: string; jobId: string; workdir: string } {
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    const workdir = path.join(tempHome, "work");
+    fs.mkdirSync(workdir, { recursive: true });
+
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at) VALUES (?, 'test-wf', 'settle task', 'running', ?, ?, ?)",
+    ).run(runId, JSON.stringify({ working_directory_for_harness: workdir }), now, now);
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, created_at, updated_at) VALUES (?, ?, 'step-1', 'test-wf_test-agent', 0, 'do work', 'STATUS', 'pending', ?, ?)",
+    ).run(`${runId}-step`, runId, now, now);
+
+    // Same job-id shape as buildJobId("test-wf", runId, "test-agent").
+    const jobId = `tamandua-test-wf-${runId}-test-agent`;
+    return { runId, jobId, workdir };
+  }
+
+  /**
+   * Fake pi that claims the pending step, writes the in-flight marker,
+   * then either completes quickly with a token-usage metadata line
+   * ("settle-fast") or sleeps far past any grace window ("hang"). The
+   * assistant content carries "STATUS: done" so the round's auto-complete
+   * accepts the output on the non-canceled path.
+   */
+  function writeFakePi(behavior: "settle-fast" | "hang"): string {
+    const fakePi = path.join(tempHome, "pi-mock");
+    const tail =
+      behavior === "settle-fast"
+        ? `await new Promise((resolve) => setTimeout(resolve, 300));
+console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: "STATUS: done", usage: { totalTokens: 137 } } }));
+console.log("STATUS: done");
+process.exit(0);`
+        : `await new Promise((resolve) => setTimeout(resolve, 30000));`;
+    fs.writeFileSync(
+      fakePi,
+      `#!/usr/bin/env node
+import { DatabaseSync } from "node:sqlite";
+import fs from "node:fs";
+const db = new DatabaseSync(process.env.TAMANDUA_DB_PATH);
+db.exec("PRAGMA busy_timeout = 5000");
+db.prepare("UPDATE steps SET status = 'running', claim_job_id = ? WHERE status = 'pending'").run(process.env.TAMANDUA_WORKER_JOB_ID);
+fs.writeFileSync(process.env.TAMANDUA_ROUND_MARKER, "inflight");
+${tail}
+`,
+      { mode: 0o755 },
+    );
+    return fakePi;
+  }
+
+  async function waitForMarker(markerPath: string, timeoutMs = 5000): Promise<void> {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      if (fs.existsSync(markerPath)) return;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    throw new Error("round never reached in-flight state (marker not written)");
+  }
+
+  it("settles an in-flight round within grace; its run.tokens.updated lands before the settle promise resolves", async () => {
+    const { runId, jobId, workdir } = seedSettleRun();
+    const marker = path.join(tempHome, "round-inflight.marker");
+    process.env.TAMANDUA_ROUND_MARKER = marker;
+    process.env.TAMANDUA_PI_BINARY = writeFakePi("settle-fast");
+
+    const round = executeDispatchRound(
+      { id: jobId, workflowId: "test-wf", runId, agentId: "test-wf_test-agent", harnessType: "pi", workingDirectoryForHarness: workdir, createdAt: "" },
+      { id: "test-agent", model: "fake", workspace: { baseDir: "." }, timeoutSeconds: 10 },
+    );
+
+    await waitForMarker(marker);
+
+    // Simulate the cancel path: the run is marked canceled while the round
+    // is mid-harness (stopWorkflow marks the run before notifying the daemon).
+    getDb()
+      .prepare("UPDATE runs SET status = 'canceled', scheduling_status = NULL, updated_at = datetime('now') WHERE id = ?")
+      .run(runId);
+
+    const startedAt = Date.now();
+    const result = await settleRunInFlightRounds(runId, { graceMs: 5000 });
+    const elapsedMs = Date.now() - startedAt;
+
+    assert.deepEqual(result.stillInFlight, [], "the in-flight round must settle within the grace window");
+    assert.ok(elapsedMs < 4000, `settle must resolve within grace, took ${elapsedMs}ms`);
+
+    // The attribution landed BEFORE the settle promise resolved: the round's
+    // completion signal fires only after post-round token attribution.
+    const events = getRunEvents(runId);
+    const tokenEvents = events.filter((e) => e.event === "run.tokens.updated");
+    assert.equal(tokenEvents.length, 1, "exactly one run.tokens.updated must land");
+    assert.equal(tokenEvents[0].runId, runId, "the delta must be attributed to the dispatch run");
+    assert.equal(tokenEvents[0].tokenDelta, 137);
+    assert.equal(tokenEvents[0].tokensSpent, 137);
+
+    const row = getDb().prepare("SELECT tokens_spent FROM runs WHERE id = ?").get(runId) as { tokens_spent: number };
+    assert.equal(row.tokens_spent, 137, "the DB spend must include the settled delta");
+
+    await round; // the round completed cleanly
+  });
+
+  it("times out without hanging when a round never finishes, reporting it as still in flight", async () => {
+    const { runId, jobId, workdir } = seedSettleRun();
+    const marker = path.join(tempHome, "round-hang.marker");
+    process.env.TAMANDUA_ROUND_MARKER = marker;
+    process.env.TAMANDUA_PI_BINARY = writeFakePi("hang");
+
+    const round = executeDispatchRound(
+      { id: jobId, workflowId: "test-wf", runId, agentId: "test-wf_test-agent", harnessType: "pi", workingDirectoryForHarness: workdir, createdAt: "" },
+      { id: "test-agent", model: "fake", workspace: { baseDir: "." }, timeoutSeconds: 60 },
+    );
+
+    await waitForMarker(marker);
+
+    const startedAt = Date.now();
+    const result = await settleRunInFlightRounds(runId, { graceMs: 150 });
+    const elapsedMs = Date.now() - startedAt;
+
+    assert.ok(elapsedMs < 2000, `settle must time out without hanging, took ${elapsedMs}ms`);
+    assert.deepEqual(result.stillInFlight, [jobId], "the never-finishing round must be reported as still in flight");
+
+    // The round is still running (30s sleep); afterEach's shutdownAllCrons
+    // kills its child and the round resolves. executeDispatchRound never
+    // rejects, so the un-awaited promise is safe.
+    void round;
+  });
+
+  it("finds in-flight rounds after removeRunCrons wiped the run's job bookkeeping (cancel-path ordering)", async () => {
+    // The control-plane cancel path calls removeRunCrons (timer removal)
+    // BEFORE settleRunInFlightRounds. removeRunCrons wipes jobMetadata /
+    // inFlightJobs for the run — the settle must still find the round via
+    // its completion signal and wait for its attribution.
+    const { runId, workdir } = seedSettleRun();
+    const marker = path.join(tempHome, "round-after-remove.marker");
+    process.env.TAMANDUA_ROUND_MARKER = marker;
+    process.env.TAMANDUA_PI_BINARY = writeFakePi("settle-fast");
+
+    // Register the run's job in jobMetadata exactly as admission does, so
+    // removeRunCrons has real bookkeeping to wipe.
+    const workflow = makeWorkflow();
+    await setupAgentCrons(workflow, runId, { workingDirectoryForHarness: workdir });
+
+    const jobId = `tamandua-test-wf-${runId}-test-agent`;
+    const round = executeDispatchRound(
+      { id: jobId, workflowId: "test-wf", runId, agentId: "test-wf_test-agent", harnessType: "pi", workingDirectoryForHarness: workdir, createdAt: "" },
+      { id: "test-agent", model: "fake", workspace: { baseDir: "." }, timeoutSeconds: 10 },
+    );
+
+    await waitForMarker(marker);
+
+    // Mirror handleTerminateRun's cancel sequence exactly: remove the
+    // scheduling timers with the grace window, then settle.
+    await removeRunCrons(runId, { graceMs: HARNESS_TEARDOWN_GRACE_MS });
+    const result = await settleRunInFlightRounds(runId, { graceMs: 5000 });
+
+    assert.deepEqual(result.stillInFlight, [], "the in-flight round must settle even though removeRunCrons wiped its bookkeeping");
+    const events = getRunEvents(runId);
+    assert.ok(
+      events.some((e) => e.event === "run.tokens.updated"),
+      "attribution must land after removeRunCrons so the cancel flush sees the settled delta",
+    );
+
+    await round;
+  });
+});
+
+// ── TATR US-007: explicit post-terminal flush identity ─────────────
+// A worker round's token attribution can land after the run already
+// reached a terminal DB status — e.g. a round that outlived the settle
+// grace window (the cancel path's leak-guard reaping), or the final
+// round of a completed/failed run whose usage parsed after the terminal
+// event fired (the C15 final-round gap). Such flushes must be explicitly
+// identifiable: the emitted run.tokens.updated carries postTerminal: true
+// + terminalStatus so consumers that stop reading at the terminal event
+// can subscribe to them instead of missing the delta. Non-terminal
+// updates carry neither field.
+
+describe("attributeWorkRoundTokenUsage post-terminal flush identity (TATR US-007)", () => {
+  let tempHome: string;
+  let saved: Record<string, string | undefined>;
+
+  beforeEach(() => {
+    tempHome = tamanduaTempDir("tamandua-postterminal-");
+    const stateDir = path.join(tempHome, ".tamandua");
+    fs.mkdirSync(stateDir, { recursive: true });
+    saved = {
+      HOME: process.env.HOME,
+      TAMANDUA_STATE_DIR: process.env.TAMANDUA_STATE_DIR,
+      TAMANDUA_DB_PATH: process.env.TAMANDUA_DB_PATH,
+      TAMANDUA_PI_BINARY: process.env.TAMANDUA_PI_BINARY,
+      TAMANDUA_ROUND_MARKER: process.env.TAMANDUA_ROUND_MARKER,
+    };
+    process.env.HOME = tempHome;
+    process.env.TAMANDUA_STATE_DIR = stateDir;
+    process.env.TAMANDUA_DB_PATH = path.join(stateDir, "tamandua.db");
+    // Guard awareness (test-isolation-guard): this suite emits events and
+    // reads the run DB through the same isolated temp state dir it creates.
+    assert.doesNotThrow(() =>
+      assertStatePathIsolation(path.join(stateDir, "tamandua.db"), "agent-scheduler-tatr-postterminal"),
+    );
+  });
+
+  afterEach(() => {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    shutdownAllCrons();
+    fs.rmSync(tempHome, { recursive: true, force: true });
+  });
+
+  /** Seed a run with the given status + a pending step so the dispatch peek says HAS_WORK. */
+  function seedRun(status: string): { runId: string; jobId: string; workdir: string } {
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    const workdir = path.join(tempHome, "work");
+    fs.mkdirSync(workdir, { recursive: true });
+
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at) VALUES (?, 'test-wf', 'post-terminal task', ?, ?, ?, ?)",
+    ).run(runId, status, JSON.stringify({ working_directory_for_harness: workdir }), now, now);
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, created_at, updated_at) VALUES (?, ?, 'step-1', 'test-wf_test-agent', 0, 'do work', 'STATUS', 'pending', ?, ?)",
+    ).run(`${runId}-step`, runId, now, now);
+
+    // Same job-id shape as buildJobId("test-wf", runId, "test-agent").
+    const jobId = `tamandua-test-wf-${runId}-test-agent`;
+    return { runId, jobId, workdir };
+  }
+
+  /**
+   * Fake pi: claims the pending step, writes the in-flight marker, sleeps
+   * 300ms (so the test can flip the run to a terminal status mid-round),
+   * then emits a token-usage metadata line (137 tokens) + STATUS: done.
+   */
+  function writeFakePi(): string {
+    const fakePi = path.join(tempHome, "pi-mock");
+    fs.writeFileSync(
+      fakePi,
+      `#!/usr/bin/env node
+import { DatabaseSync } from "node:sqlite";
+import fs from "node:fs";
+const db = new DatabaseSync(process.env.TAMANDUA_DB_PATH);
+db.exec("PRAGMA busy_timeout = 5000");
+db.prepare("UPDATE steps SET status = 'running', claim_job_id = ? WHERE status = 'pending'").run(process.env.TAMANDUA_WORKER_JOB_ID);
+fs.writeFileSync(process.env.TAMANDUA_ROUND_MARKER, "inflight");
+await new Promise((resolve) => setTimeout(resolve, 300));
+console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: "STATUS: done", usage: { totalTokens: 137 } } }));
+console.log("STATUS: done");
+process.exit(0);
+`,
+      { mode: 0o755 },
+    );
+    return fakePi;
+  }
+
+  async function waitForMarker(markerPath: string, timeoutMs = 5000): Promise<void> {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      if (fs.existsSync(markerPath)) return;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    throw new Error("round never reached in-flight state (marker not written)");
+  }
+
+  function startRound(runId: string, jobId: string, workdir: string): Promise<void> {
+    return executeDispatchRound(
+      { id: jobId, workflowId: "test-wf", runId, agentId: "test-wf_test-agent", harnessType: "pi", workingDirectoryForHarness: workdir, createdAt: "" },
+      { id: "test-agent", model: "fake", workspace: { baseDir: "." }, timeoutSeconds: 10 },
+    );
+  }
+
+  it("marks a flush postTerminal when the run reached a terminal DB status mid-round", async () => {
+    const { runId, jobId, workdir } = seedRun("running");
+    const marker = path.join(tempHome, "round-postterminal.marker");
+    process.env.TAMANDUA_ROUND_MARKER = marker;
+    process.env.TAMANDUA_PI_BINARY = writeFakePi();
+
+    const round = startRound(runId, jobId, workdir);
+    await waitForMarker(marker);
+
+    // The run reaches a terminal status while the round is mid-harness
+    // (e.g. another step's completion marked the run failed before this
+    // round's usage parsed — the C15 final-round gap).
+    getDb()
+      .prepare("UPDATE runs SET status = 'failed', updated_at = datetime('now') WHERE id = ?")
+      .run(runId);
+
+    await round;
+
+    const events = getRunEvents(runId);
+    const tokenEvents = events.filter((e) => e.event === "run.tokens.updated");
+    assert.equal(tokenEvents.length, 1, "exactly one run.tokens.updated must land");
+    assert.equal(tokenEvents[0].runId, runId, "the delta must be attributed to the dispatch run");
+    assert.equal(tokenEvents[0].tokenDelta, 137);
+    assert.equal(tokenEvents[0].tokensSpent, 137);
+    assert.equal(tokenEvents[0].postTerminal, true, "a flush attributed to a terminal run must be marked post-terminal");
+    assert.equal(tokenEvents[0].terminalStatus, "failed", "terminalStatus must name the run's terminal DB status");
+  });
+
+  it("carries no postTerminal fields when the run is still running at attribution time", async () => {
+    const { runId, jobId, workdir } = seedRun("running");
+    const marker = path.join(tempHome, "round-running.marker");
+    process.env.TAMANDUA_ROUND_MARKER = marker;
+    process.env.TAMANDUA_PI_BINARY = writeFakePi();
+
+    const round = startRound(runId, jobId, workdir);
+    await waitForMarker(marker);
+
+    // The run stays 'running' through the round — a normal in-run flush.
+    await round;
+
+    const events = getRunEvents(runId);
+    const tokenEvents = events.filter((e) => e.event === "run.tokens.updated");
+    assert.equal(tokenEvents.length, 1, "exactly one run.tokens.updated must land");
+    assert.equal(tokenEvents[0].postTerminal, undefined, "an in-run flush must not be marked post-terminal");
+    assert.equal(tokenEvents[0].terminalStatus, undefined, "an in-run flush must not carry terminalStatus");
+  });
+});
+
+describe("attributeWorkRoundTokenUsage dispatch-run attribution identity (TATR US-008)", () => {
+  let tempHome: string;
+  let stateDir: string;
+  let saved: Record<string, string | undefined>;
+
+  beforeEach(() => {
+    tempHome = tamanduaTempDir("tamandua-attribution-");
+    stateDir = path.join(tempHome, ".tamandua");
+    fs.mkdirSync(stateDir, { recursive: true });
+    saved = {
+      HOME: process.env.HOME,
+      TAMANDUA_STATE_DIR: process.env.TAMANDUA_STATE_DIR,
+      TAMANDUA_DB_PATH: process.env.TAMANDUA_DB_PATH,
+      TAMANDUA_PI_BINARY: process.env.TAMANDUA_PI_BINARY,
+      TAMANDUA_ROUND_MARKER: process.env.TAMANDUA_ROUND_MARKER,
+    };
+    process.env.HOME = tempHome;
+    process.env.TAMANDUA_STATE_DIR = stateDir;
+    process.env.TAMANDUA_DB_PATH = path.join(stateDir, "tamandua.db");
+    // Guard awareness (test-isolation-guard): this suite emits events and
+    // reads the run DB / log through the same isolated temp state dir it
+    // creates.
+    assert.doesNotThrow(() =>
+      assertStatePathIsolation(path.join(stateDir, "tamandua.db"), "agent-scheduler-tatr-attribution"),
+    );
+  });
+
+  afterEach(() => {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    shutdownAllCrons();
+    fs.rmSync(tempHome, { recursive: true, force: true });
+  });
+
+  /** Seed a run with the given status + a pending step so the dispatch peek says HAS_WORK. */
+  function seedRun(status: string): { runId: string; jobId: string; workdir: string } {
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    const workdir = path.join(tempHome, "work");
+    fs.mkdirSync(workdir, { recursive: true });
+
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at) VALUES (?, 'test-wf', 'attribution task', ?, ?, ?, ?)",
+    ).run(runId, status, JSON.stringify({ working_directory_for_harness: workdir }), now, now);
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, created_at, updated_at) VALUES (?, ?, 'step-1', 'test-wf_test-agent', 0, 'do work', 'STATUS', 'pending', ?, ?)",
+    ).run(`${runId}-step`, runId, now, now);
+
+    // Same job-id shape as buildJobId("test-wf", runId, "test-agent").
+    const jobId = `tamandua-test-wf-${runId}-test-agent`;
+    return { runId, jobId, workdir };
+  }
+
+  /** Seed a sibling run that must NEVER receive the dispatch round's delta. */
+  function seedSiblingRun(runId: string): void {
+    const db = getDb();
+    const now = new Date().toISOString();
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at) VALUES (?, 'test-wf', 'sibling task', 'running', '{}', ?, ?)",
+    ).run(runId, now, now);
+  }
+
+  function tokensSpent(runId: string): number {
+    const db = getDb();
+    const row = db
+      .prepare("SELECT tokens_spent FROM runs WHERE id = ?")
+      .get(runId) as { tokens_spent: number } | undefined;
+    return row?.tokens_spent ?? -1;
+  }
+
+  function readTamanduaLog(): string {
+    try {
+      return fs.readFileSync(path.join(stateDir, "tamandua.log"), "utf8");
+    } catch {
+      return "";
+    }
+  }
+
+  /**
+   * Fake pi: claims the pending step, then emits a token-usage metadata
+   * line (137 tokens), optional run_id/step_id lines naming the ids the
+   * test wants the stream to claim (the cross-run hijack probe), and a
+   * STATUS: done marker so auto-complete passes.
+   */
+  function writeFakePi(opts: { runIdLine?: string; stepIdLine?: string }): string {
+    const { runIdLine, stepIdLine } = opts;
+    const extra = [runIdLine, stepIdLine].filter((l): l is string => l !== undefined).join("\n");
+    const fakePi = path.join(tempHome, "pi-mock-attribution");
+    fs.writeFileSync(
+      fakePi,
+      `#!/usr/bin/env node
+import { DatabaseSync } from "node:sqlite";
+const db = new DatabaseSync(process.env.TAMANDUA_DB_PATH);
+db.exec("PRAGMA busy_timeout = 5000");
+db.prepare("UPDATE steps SET status = 'running', claim_job_id = ? WHERE status = 'pending'").run(process.env.TAMANDUA_WORKER_JOB_ID);
+console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: "STATUS: done", usage: { totalTokens: 137 } } }));
+${extra ? `console.log(${JSON.stringify(extra)});` : ""}
+console.log("STATUS: done");
+process.exit(0);
+`,
+      { mode: 0o755 },
+    );
+    return fakePi;
+  }
+
+  function startRound(runId: string, jobId: string, workdir: string): Promise<void> {
+    return executeDispatchRound(
+      { id: jobId, workflowId: "test-wf", runId, agentId: "test-wf_test-agent", harnessType: "pi", workingDirectoryForHarness: workdir, createdAt: "" },
+      { id: "test-agent", model: "fake", workspace: { baseDir: "." }, timeoutSeconds: 10 },
+    );
+  }
+
+  it("attributes the delta to the dispatch run, not the sibling named in tool output, and logs a hijack warning", async () => {
+    const { runId, jobId, workdir } = seedRun("running");
+    const siblingRunId = crypto.randomUUID();
+    const metadataStepId = crypto.randomUUID();
+    seedSiblingRun(siblingRunId);
+
+    // Tool output claims a sibling run id + a step id — both must be
+    // treated as advisory; the delta lands on the dispatch run.
+    process.env.TAMANDUA_PI_BINARY = writeFakePi({
+      runIdLine: `run_id: "${siblingRunId}"`,
+      stepIdLine: `step_id: "${metadataStepId}"`,
+    });
+
+    await startRound(runId, jobId, workdir);
+
+    const events = getRunEvents(runId);
+    const tokenEvents = events.filter((e) => e.event === "run.tokens.updated");
+    assert.equal(tokenEvents.length, 1, "exactly one run.tokens.updated must land");
+    assert.equal(tokenEvents[0].runId, runId, "the delta must be attributed to the dispatch run, not the metadata sibling");
+    assert.equal(tokenEvents[0].tokenDelta, 137);
+    assert.equal(tokenEvents[0].tokensSpent, 137);
+    assert.equal(tokenEvents[0].stepId, metadataStepId, "the event carries the step id from stream metadata");
+    assert.equal(tokenEvents[0].roundId, jobId, "the event carries the dispatch job id as roundId");
+
+    // The sibling run must NOT have received the delta.
+    assert.equal(tokensSpent(runId), 137, "the dispatch run must absorb the delta");
+    assert.equal(tokensSpent(siblingRunId), 0, "the sibling run must not receive the delta");
+
+    // The disagreement is logged as a cross-run metadata hijack warning.
+    const logContent = readTamanduaLog();
+    assert.match(logContent, /cross_run_metadata_hijack/, "the mismatch must be logged with the hijack reason");
+    assert.ok(logContent.includes(siblingRunId), "the warning must name the metadata run id");
+    assert.ok(logContent.includes(runId), "the warning must name the dispatch run id");
+  });
+
+  it("attributes to the dispatch run and logs no hijack warning when tool output agrees with the dispatch run", async () => {
+    const { runId, jobId, workdir } = seedRun("running");
+    const metadataStepId = crypto.randomUUID();
+
+    process.env.TAMANDUA_PI_BINARY = writeFakePi({
+      runIdLine: `run_id: "${runId}"`,
+      stepIdLine: `step_id: "${metadataStepId}"`,
+    });
+
+    await startRound(runId, jobId, workdir);
+
+    const tokenEvents = getRunEvents(runId).filter((e) => e.event === "run.tokens.updated");
+    assert.equal(tokenEvents.length, 1, "exactly one run.tokens.updated must land");
+    assert.equal(tokenEvents[0].runId, runId, "the delta stays on the dispatch run");
+    assert.equal(tokenEvents[0].stepId, metadataStepId, "the event carries the step id from stream metadata");
+    assert.equal(tokenEvents[0].roundId, jobId, "the event carries the dispatch job id as roundId");
+    assert.equal(tokensSpent(runId), 137);
+
+    const logContent = readTamanduaLog();
+    assert.ok(
+      !logContent.includes("cross_run_metadata_hijack"),
+      "no warning when the metadata run id agrees with the dispatch run",
+    );
+  });
+
+  it("attributes to the dispatch run and carries roundId but no stepId when tool output has no ids", async () => {
+    const { runId, jobId, workdir } = seedRun("running");
+
+    process.env.TAMANDUA_PI_BINARY = writeFakePi({});
+
+    await startRound(runId, jobId, workdir);
+
+    const tokenEvents = getRunEvents(runId).filter((e) => e.event === "run.tokens.updated");
+    assert.equal(tokenEvents.length, 1, "exactly one run.tokens.updated must land");
+    assert.equal(tokenEvents[0].runId, runId, "the delta stays on the dispatch run");
+    assert.equal(tokenEvents[0].stepId, undefined, "no stepId when the stream carries none");
+    assert.equal(tokenEvents[0].roundId, jobId, "roundId is always the dispatch job id");
+    assert.equal(tokensSpent(runId), 137);
+
+    const logContent = readTamanduaLog();
+    assert.ok(
+      !logContent.includes("cross_run_metadata_hijack"),
+      "no warning when the stream carries no run id",
+    );
   });
 });

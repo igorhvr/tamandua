@@ -6,7 +6,7 @@ import type { WorkflowSpec, WorkflowAgent, HarnessType } from "./types.js";
 import { logger } from "../lib/logger.js";
 import { getRoleTimeoutSeconds, inferRole } from "./install.js";
 import { formatPiCommandPreview } from "./pi-command-preview.js";
-import { emitEvent } from "./events.js";
+import { emitEvent, type TamanduaEvent } from "./events.js";
 import { parseRunContext } from "./step-ops.js";
 import { parsePiOutputStream } from "./pi-stream-parser.js";
 import { getHarnessAdapter, type HarnessRoundResult } from "./harness-adapter.js";
@@ -58,6 +58,30 @@ const jobMetadata = new Map<string, CronJobInfo>();
  * every interval even though work rounds can take 10–30 minutes.
  */
 const inFlightJobs = new Set<string>();
+
+/**
+ * Per-job completion signal for an in-flight dispatch round.
+ *
+ * Registered when a round passes the in-flight guard and resolved in the
+ * round's `finally` AFTER all post-round processing (token attribution via
+ * `attributeWorkRoundTokenUsage`, orphan recovery, auto-complete) has
+ * completed. `settleRunInFlightRounds` awaits these so the cancel path can
+ * guarantee a round's token attribution lands before a terminal event is
+ * emitted (TATR facet 3).
+ *
+ * Entries deliberately survive `removeRunCrons` — which wipes
+ * `jobMetadata`/`inFlightJobs` but must NOT wipe attribution in progress —
+ * so a settle that runs after timer removal still finds the in-flight round
+ * and waits for its attribution. Entries are removed only when the round
+ * itself completes (its `finally`) or `shutdownAllCrons` clears the
+ * scheduler.
+ */
+interface RoundCompletionSignal {
+  runId: string;
+  done: Promise<void>;
+  resolve: () => void;
+}
+const roundCompletionSignals = new Map<string, RoundCompletionSignal>();
 
 // ── Nudge types ─────────────────────────────────────────────────────
 
@@ -714,6 +738,17 @@ export function parseWorkRoundMetadata(output: string): WorkRoundMetadata {
   };
 }
 
+/**
+ * Resolve a run id from a round's parsed metadata (tool output run id, or
+ * a step lookup by the tool-output step id).
+ *
+ * TATR US-008: the result is ADVISORY ONLY. In the dispatch path the
+ * authoritative run is `job.runId` — the run this round was spawned for —
+ * so a metadata id that names a sibling/nested run must never redirect
+ * attribution. This resolver is used (a) to detect such disagreements (the
+ * cross-run metadata hijack signal) and (b) as a fallback for genuinely
+ * runless invocations where `job.runId` is unavailable.
+ */
 async function resolveRunIdForAttribution(metadata: WorkRoundMetadata): Promise<ResolvedRunId> {
   if (metadata.runId) {
     return { runId: metadata.runId, source: "metadata_run_id" };
@@ -737,6 +772,21 @@ async function resolveRunIdForAttribution(metadata: WorkRoundMetadata): Promise<
 interface TokenSpendUpdate {
   workflowId?: string;
   tokensSpent: number;
+  /** The run's DB status at attribution time (TATR US-007 post-terminal flush identity). */
+  status: string;
+}
+
+/**
+ * Terminal run statuses. When a token flush is attributed to a run that
+ * already reached one of these, the emitted run.tokens.updated is marked
+ * post-terminal (postTerminal: true + terminalStatus) so consumers that
+ * stop reading at the terminal event can subscribe to the late flush
+ * instead of missing the delta (TATR US-007).
+ */
+const TERMINAL_RUN_STATUSES: ReadonlySet<string> = new Set(["completed", "failed", "canceled"]);
+
+function isTerminalRunStatus(status: string | undefined): status is string {
+  return status !== undefined && TERMINAL_RUN_STATUSES.has(status);
 }
 
 async function incrementRunTokenSpend(runId: string, tokenUsage: number): Promise<TokenSpendUpdate | null> {
@@ -749,14 +799,15 @@ async function incrementRunTokenSpend(runId: string, tokenUsage: number): Promis
   if ((result.changes ?? 0) <= 0) return null;
 
   const row = db
-    .prepare("SELECT workflow_id, tokens_spent FROM runs WHERE id = ?")
-    .get(runId) as { workflow_id: string; tokens_spent: number } | undefined;
+    .prepare("SELECT workflow_id, tokens_spent, status FROM runs WHERE id = ?")
+    .get(runId) as { workflow_id: string; tokens_spent: number; status: string } | undefined;
 
   if (!row) return null;
 
   return {
     workflowId: row.workflow_id,
     tokensSpent: row.tokens_spent,
+    status: row.status,
   };
 }
 
@@ -946,8 +997,38 @@ async function attributeWorkRoundTokenUsage(
   }
 
   const resolved = await resolveRunIdForAttribution(metadata);
-  const runId = resolved.runId ?? job.runId;
-  const runIdSource = resolved.runId ? resolved.source : "dispatch_job";
+
+  // TATR US-008: the dispatch job's run is authoritative — it is the run
+  // this round was spawned for, and therefore the run that actually spent
+  // the tokens. A run id parsed from the worker's tool output
+  // (metadata_run_id) or resolved from a step lookup is advisory only: a
+  // nested/sibling run's metadata can leak into this round's stream and
+  // would hijack attribution onto the wrong run. job.runId is always
+  // present in the dispatch path; the resolved id is used only for
+  // genuinely runless invocations and never redirects attribution.
+  const dispatchRunId = job.runId;
+  let runId = dispatchRunId;
+  let runIdSource: RunIdSource | "dispatch_job" = "dispatch_job";
+
+  if (!dispatchRunId) {
+    // Genuinely runless invocation (job.runId unavailable — never happens
+    // in the dispatch path): fall back to the resolved id.
+    runId = resolved.runId ?? "";
+    runIdSource = resolved.runId ? resolved.source : "none";
+  } else if (resolved.runId && resolved.runId !== dispatchRunId) {
+    // The worker's stream names a different (sibling/nested) run. Log the
+    // disagreement — the cross-run metadata hijack signal — and attribute
+    // to the dispatch run anyway.
+    logger.warn("Work round token attribution overrides metadata run id", {
+      ...context,
+      outcome: outputSummary.outcome,
+      reason: "cross_run_metadata_hijack",
+      metadataRunId: resolved.runId,
+      metadataRunIdSource: resolved.source,
+      dispatchRunId,
+      tokenUsage: metadata.tokenUsage,
+    });
+  }
 
   try {
     const updated = await incrementRunTokenSpend(runId, metadata.tokenUsage);
@@ -963,14 +1044,32 @@ async function attributeWorkRoundTokenUsage(
       return;
     }
 
-    emitEvent({
+    // TATR US-007: explicit post-terminal flush identity. A round's token
+    // attribution can land after the run already reached a terminal DB
+    // status — e.g. a round that outlived the settle grace window, or the
+    // final round of a completed/failed run whose usage parsed after the
+    // terminal event fired (C15). Mark such flushes explicitly so
+    // consumers that stop reading at the terminal event can subscribe to
+    // them instead of missing the delta. Non-terminal updates carry
+    // neither field (omitted from the serialized event).
+    const evt: TamanduaEvent = {
       ts: new Date().toISOString(),
       event: "run.tokens.updated",
       runId,
       workflowId: updated.workflowId,
       tokenDelta: metadata.tokenUsage,
       tokensSpent: updated.tokensSpent,
-    });
+    };
+    // TATR US-008: step/round identity on the token event. stepId comes
+    // from the round's stream metadata when known; roundId is always the
+    // dispatch job id — the round that actually spent the tokens.
+    if (metadata.stepId) evt.stepId = metadata.stepId;
+    evt.roundId = job.id;
+    if (isTerminalRunStatus(updated.status)) {
+      evt.postTerminal = true;
+      evt.terminalStatus = updated.status;
+    }
+    emitEvent(evt);
 
     logger.debug("Work round token usage attributed", {
       ...context,
@@ -978,6 +1077,8 @@ async function attributeWorkRoundTokenUsage(
       tokenUsage: metadata.tokenUsage,
       runId,
       runIdSource,
+      stepId: metadata.stepId ?? undefined,
+      roundId: job.id,
       tokensSpent: updated.tokensSpent,
     });
   } catch (err) {
@@ -1041,6 +1142,22 @@ export async function executeDispatchRound(
     });
     return;
   }
+
+  // ── Round completion signal (TATR US-005) ───────────────────────
+  // Registered synchronously after the in-flight guard, BEFORE the first
+  // await, so a concurrent settleRunInFlightRounds (the cancel path) can
+  // observe this in-flight round and wait for its post-round token
+  // attribution. Resolved in the `finally` below, after attribution and
+  // recovery have completed.
+  let resolveRoundCompletion: () => void = () => {};
+  const roundCompletionDone = new Promise<void>((resolve) => {
+    resolveRoundCompletion = resolve;
+  });
+  roundCompletionSignals.set(job.id, {
+    runId: job.runId,
+    done: roundCompletionDone,
+    resolve: resolveRoundCompletion,
+  });
 
   // No-hurry runs prefer a <harness>-token-saver wrapper when installed on PATH;
   // resolved from run context alongside the status check below.
@@ -1235,6 +1352,12 @@ export async function executeDispatchRound(
     const harnessEnv: Record<string, string> = {
       TAMANDUA_WORKER_JOB_ID: job.id,
       TAMANDUA_WORKER_PID: String(process.pid),
+      // Run identity for the worker subprocess: nested CLI invocations
+      // (tamandua merge-branch, tamandua workflow run) read this to
+      // attribute themselves to the run that spawned them (TATR facets 1
+      // and 5). Mirrors the env-inheritance mechanism step claim/complete
+      // already rely on.
+      TAMANDUA_RUN_ID: job.runId,
     };
     if (harnessType === "hermes") {
       harnessEnv.TAMANDUA_HERMES_BINARY = binaryPath;
@@ -1545,6 +1668,14 @@ export async function executeDispatchRound(
   } finally {
     inFlightJobs.delete(job.id);
     inFlightChildren.delete(job.id);
+    // Resolve the round's completion signal AFTER the map entry is gone:
+    // settleRunInFlightRounds wakes on `done`, then recomputes what is
+    // still in flight and must not find this round anymore.
+    const signal = roundCompletionSignals.get(job.id);
+    if (signal) {
+      roundCompletionSignals.delete(job.id);
+      signal.resolve();
+    }
   }
 }
 
@@ -1879,6 +2010,86 @@ export async function removeRunCrons(
 }
 
 /**
+ * Job ids whose dispatch round is currently in flight for the given run.
+ *
+ * Consults `inFlightJobs`/`jobMetadata` AND `roundCompletionSignals`: a
+ * round whose bookkeeping `removeRunCrons` already wiped (timer removal)
+ * but whose post-round processing has not finished is still reported as in
+ * flight via its completion signal.
+ */
+function inFlightJobIdsForRun(runId: string): string[] {
+  const ids: string[] = [];
+  for (const jobId of inFlightJobs) {
+    const info = jobMetadata.get(jobId);
+    if (info?.runId === runId) ids.push(jobId);
+  }
+  for (const [jobId, signal] of roundCompletionSignals) {
+    if (signal.runId === runId && !ids.includes(jobId)) ids.push(jobId);
+  }
+  return ids;
+}
+
+export interface SettleRunInFlightRoundsOptions {
+  /**
+   * Milliseconds to wait for in-flight rounds' post-round processing
+   * (token attribution) to finish. Defaults to HARNESS_TEARDOWN_GRACE_MS.
+   * 0 returns immediately, reporting every in-flight round as still in
+   * flight (mirrors removeRunCrons' graceMs=0 kill-immediately semantic).
+   */
+  graceMs?: number;
+}
+
+export interface SettleRunInFlightRoundsResult {
+  /** Job ids still in flight after the grace window (empty = all settled). */
+  stillInFlight: string[];
+}
+
+/**
+ * Settle a run's in-flight worker rounds' token attribution (TATR facet 3).
+ *
+ * For each in-flight dispatch round belonging to the run, waits up to
+ * `graceMs` for the round's post-round processing — token attribution via
+ * `attributeWorkRoundTokenUsage` — to complete. Resolves as soon as every
+ * targeted round has finished (its completion signal fires in the round's
+ * `finally`, AFTER attribution), or when the grace window expires,
+ * whichever comes first, reporting which job ids (if any) were still in
+ * flight.
+ *
+ * The cancel path calls this AFTER `removeRunCrons` so no new rounds
+ * dispatch while attribution settles; the completion signals survive the
+ * timer removal, so this helper still finds the in-flight rounds.
+ */
+export async function settleRunInFlightRounds(
+  runId: string,
+  options: SettleRunInFlightRoundsOptions = {},
+): Promise<SettleRunInFlightRoundsResult> {
+  const graceMs = options.graceMs ?? HARNESS_TEARDOWN_GRACE_MS;
+  const targets = inFlightJobIdsForRun(runId);
+  if (targets.length === 0) return { stillInFlight: [] };
+  if (graceMs <= 0) return { stillInFlight: targets };
+
+  const signals = targets
+    .map((jobId) => roundCompletionSignals.get(jobId)?.done)
+    .filter((done): done is Promise<void> => done !== undefined);
+
+  if (signals.length > 0) {
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const timeoutPromise = new Promise<"timeout">((resolve) => {
+      timeout = setTimeout(() => resolve("timeout"), graceMs);
+    });
+    await Promise.race([Promise.all(signals), timeoutPromise]);
+    if (timeout) clearTimeout(timeout);
+  } else {
+    // In-flight markers without registered completion signals (guard-only
+    // callers, e.g. tests): wait out the window so any late registration
+    // settles, then report what is still in flight.
+    await new Promise<void>((resolve) => setTimeout(resolve, graceMs));
+  }
+
+  return { stillInFlight: inFlightJobIdsForRun(runId) };
+}
+
+/**
  * Workflow-wide teardown: remove all jobs for any run of this workflow.
  * Used by tests / shutdown paths. Run-scoped removal is preferred.
  */
@@ -1968,6 +2179,13 @@ export function shutdownAllCrons(): void {
     clearTimeout(timer);
     pendingSweepTimers.delete(runId);
   }
+  // Unblock any settleRunInFlightRounds waiters and drop the round
+  // completion signals: after a full scheduler shutdown nothing is in
+  // flight, so every waiter reports fully settled.
+  for (const [, signal] of roundCompletionSignals) {
+    signal.resolve();
+  }
+  roundCompletionSignals.clear();
   inFlightChildren.clear();
   inFlightJobs.clear();
   jobMetadata.clear();

@@ -566,6 +566,214 @@ describe("steps ledger_concession_count migration", () => {
   });
 });
 
+describe("TATR runs parent_run_id migration", () => {
+  // TATR US-001: runs.parent_run_id records which run spawned a child run so
+  // graph consumers can discover parent/child linkage. The column is nullable
+  // with no backfill — existing rows and runs without a parent keep NULL.
+
+  function distDir(): string {
+    return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "dist");
+  }
+
+  function runMigrateSubprocess(dbPath: string, homeDir: string): void {
+    const importPath = JSON.stringify(path.join(distDir(), "db.js"));
+    const script = [
+      `import { getDb } from ${importPath};`,
+      "getDb();",
+    ].join("\n");
+    execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+      cwd: distDir(),
+      env: {
+        HOME: homeDir,
+        TAMANDUA_DB_PATH: dbPath,
+        TAMANDUA_TEST_GUARD: "1",
+        PATH: process.env.PATH ?? "",
+      },
+      encoding: "utf-8",
+    });
+  }
+
+  it("fresh DB: runs table includes nullable parent_run_id TEXT", () => {
+    const th = createTempHome("tamandua-tatr-fresh-");
+    const dbPath = path.join(th.root, "fresh.db");
+    runMigrateSubprocess(dbPath, th.homeDir);
+
+    const db = new DatabaseSync(dbPath);
+    try {
+      const col = (db.prepare("PRAGMA table_info(runs)").all() as Array<{
+        name: string;
+        type: string;
+        notnull: number;
+        dflt_value: string | null;
+      }>).find((c) => c.name === "parent_run_id");
+      assert.ok(col, "runs.parent_run_id column should exist on a fresh DB");
+      assert.equal(col.type, "TEXT", "parent_run_id should be TEXT");
+      assert.equal(col.notnull, 0, "parent_run_id should be nullable (notnull = 0)");
+      assert.equal(col.dflt_value, null, "parent_run_id should have no default");
+      const ver = db.prepare("PRAGMA user_version").get() as { user_version: number };
+      assert.equal(ver.user_version, SCHEMA_VERSION, "fresh DB should be stamped at SCHEMA_VERSION");
+    } finally {
+      db.close();
+    }
+  });
+
+  it("migrates a legacy DB: adds parent_run_id without touching existing rows (NULL)", () => {
+    const th = createTempHome("tamandua-tatr-migrate-");
+    const dbPath = path.join(th.root, "legacy.db");
+    const legacyDb = new DatabaseSync(dbPath);
+    // Pre-TATR (v4) runs schema: has the v4 columns but NOT parent_run_id.
+    legacyDb.exec(`
+      CREATE TABLE runs (
+        id TEXT PRIMARY KEY,
+        run_number INTEGER,
+        workflow_id TEXT NOT NULL,
+        task TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'running',
+        context TEXT NOT NULL DEFAULT '{}',
+        tokens_spent INTEGER NOT NULL DEFAULT 0,
+        notify_url TEXT,
+        scheduling_status TEXT,
+        scheduling_requested_at TEXT,
+        scheduling_error TEXT,
+        worker_lost_count INTEGER NOT NULL DEFAULT 0,
+        ceiling_expiry_count INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO runs (
+        id, run_number, workflow_id, task, status, context, tokens_spent,
+        worker_lost_count, ceiling_expiry_count, created_at, updated_at
+      ) VALUES (
+        'legacy-run', 1, 'workflow', 'task', 'running', '{}', 42, 3, 0,
+        '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+      );
+      PRAGMA user_version = ${SCHEMA_VERSION - 1};
+    `);
+    // Precondition: legacy DB really is in the pre-TATR state.
+    const preCols = legacyDb.prepare("PRAGMA table_info(runs)").all() as Array<{ name: string }>;
+    assert.ok(!preCols.some((c) => c.name === "parent_run_id"), "precondition: legacy runs lacks parent_run_id");
+    const preVer = legacyDb.prepare("PRAGMA user_version").get() as { user_version: number };
+    assert.equal(preVer.user_version, SCHEMA_VERSION - 1, "precondition: user_version is the pre-bump version");
+    legacyDb.close();
+
+    // Spawn a fresh subprocess so getDb() runs migrate() from scratch on the legacy file.
+    runMigrateSubprocess(dbPath, th.homeDir);
+
+    const db = new DatabaseSync(dbPath);
+    try {
+      const col = (db.prepare("PRAGMA table_info(runs)").all() as Array<{
+        name: string;
+        type: string;
+        notnull: number;
+        dflt_value: string | null;
+      }>).find((c) => c.name === "parent_run_id");
+      assert.ok(col, "migration should add parent_run_id to the legacy runs table");
+      assert.equal(col.type, "TEXT", "parent_run_id should be TEXT");
+      assert.equal(col.notnull, 0, "parent_run_id should be nullable");
+
+      const row = db.prepare(
+        "SELECT id, workflow_id, task, status, tokens_spent, worker_lost_count, ceiling_expiry_count, parent_run_id FROM runs WHERE id = 'legacy-run'",
+      ).get() as {
+        id: string;
+        workflow_id: string;
+        task: string;
+        status: string;
+        tokens_spent: number;
+        worker_lost_count: number;
+        ceiling_expiry_count: number;
+        parent_run_id: string | null;
+      };
+      assert.deepEqual({ ...row }, {
+        id: "legacy-run",
+        workflow_id: "workflow",
+        task: "task",
+        status: "running",
+        tokens_spent: 42,
+        worker_lost_count: 3,
+        ceiling_expiry_count: 0,
+        parent_run_id: null,
+      }, "existing row must be untouched with parent_run_id NULL");
+
+      const ver = db.prepare("PRAGMA user_version").get() as { user_version: number };
+      assert.equal(ver.user_version, SCHEMA_VERSION, "legacy DB should be re-stamped at SCHEMA_VERSION");
+    } finally {
+      db.close();
+    }
+  });
+
+  it("migration is idempotent: second migrate run keeps parent_run_id and rows", () => {
+    const th = createTempHome("tamandua-tatr-idempotent-");
+    const dbPath = path.join(th.root, "legacy.db");
+    const legacyDb = new DatabaseSync(dbPath);
+    legacyDb.exec(`
+      CREATE TABLE runs (
+        id TEXT PRIMARY KEY,
+        workflow_id TEXT NOT NULL,
+        task TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'running',
+        context TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO runs (id, workflow_id, task, created_at, updated_at)
+      VALUES ('legacy-run', 'workflow', 'task', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z');
+      PRAGMA user_version = ${SCHEMA_VERSION - 1};
+    `);
+    legacyDb.close();
+
+    // Migrate twice (two separate subprocesses) — second run must not error or duplicate.
+    runMigrateSubprocess(dbPath, th.homeDir);
+    runMigrateSubprocess(dbPath, th.homeDir);
+
+    const db = new DatabaseSync(dbPath);
+    try {
+      const cols = db.prepare("PRAGMA table_info(runs)").all() as Array<{ name: string }>;
+      const parentCols = cols.filter((c) => c.name === "parent_run_id");
+      assert.equal(parentCols.length, 1, "parent_run_id must appear exactly once after repeated migration");
+      const row = db.prepare("SELECT id, parent_run_id FROM runs WHERE id = 'legacy-run'").get() as {
+        id: string;
+        parent_run_id: string | null;
+      };
+      assert.equal(row.id, "legacy-run", "existing row must survive repeated migration");
+      assert.equal(row.parent_run_id, null, "existing row parent_run_id stays NULL");
+    } finally {
+      db.close();
+    }
+  });
+
+  it("inserts a run with parent_run_id set", () => {
+    const th = createTempHome("tamandua-tatr-insert-");
+    const dbPath = path.join(th.root, "fresh.db");
+    const importPath = JSON.stringify(path.join(distDir(), "db.js"));
+    const script = [
+      `import { getDb } from ${importPath};`,
+      "const db = getDb();",
+      "const now = new Date().toISOString();",
+      "db.prepare(\"INSERT INTO runs (id, workflow_id, task, parent_run_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)\").run('child-run', 'workflow', 'task', 'parent-run', now, now);",
+      "db.prepare(\"INSERT INTO runs (id, workflow_id, task, created_at, updated_at) VALUES (?, ?, ?, ?, ?)\").run('orphan-run', 'workflow', 'task', now, now);",
+      "const child = db.prepare(\"SELECT parent_run_id FROM runs WHERE id = 'child-run'\").get();",
+      "const orphan = db.prepare(\"SELECT parent_run_id FROM runs WHERE id = 'orphan-run'\").get();",
+      "console.log(JSON.stringify({ child, orphan }));",
+    ].join("\n");
+
+    const result = execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+      cwd: distDir(),
+      env: {
+        HOME: th.homeDir,
+        TAMANDUA_DB_PATH: dbPath,
+        TAMANDUA_TEST_GUARD: "1",
+        PATH: process.env.PATH ?? "",
+      },
+      encoding: "utf-8",
+    });
+
+    assert.deepEqual(JSON.parse(result.trim()), {
+      child: { parent_run_id: "parent-run" },
+      orphan: { parent_run_id: null },
+    });
+  });
+});
+
 describe("getDbPath", () => {
   it("returns path ending with .tamandua/tamandua.db under HOME", () => {
     const result = getDbPath();

@@ -77,6 +77,7 @@ src/suite/shim-acceptance.test.ts
 src/suite/shim.test.ts
 src/suite/tree-hash.test.ts
 tests/agent-scheduler.test.ts
+tests/cancel-race-token-ordering.test.ts
 tests/claim-invalidated-by-migration.test.ts
 tests/claim-ownership-recording.test.ts
 tests/cli-cfil-vfbk-integration.test.ts
@@ -97,6 +98,7 @@ tests/cli-step-stories-json.test.ts
 tests/cli-version-warning.test.ts
 tests/cli-workflow-install-all.test.ts
 tests/cli-workflow-list-json.test.ts
+tests/cli-workflow-run-parent-linkage.test.ts
 tests/cli-workflow-run-working-directory.test.ts
 tests/cli-workflow-runs-json.test.ts
 tests/cli-workflow-status-json.test.ts
@@ -123,6 +125,7 @@ tests/logs-prefix-expansion.test.ts
 tests/logs-tail-command.test.ts
 tests/mcp-cli.test.ts
 tests/mcp-lifecycle.test.ts
+tests/merge-event-identity.test.ts
 tests/multiline-output-parsing.test.ts
 tests/orphaned-step-recovery.test.ts
 tests/pause-kill-resume-regression.test.ts

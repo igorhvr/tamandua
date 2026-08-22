@@ -1,5 +1,6 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import http from "node:http";
@@ -1516,6 +1517,113 @@ try {
       assert.ok(runNumber > 0, `run number should be positive, got: ${runNumber}`);
       assert.ok(Number.isInteger(runNumber), `run number should be an integer, got: ${runNumber}`);
       assert.equal(match![2].length, 8, `run-id prefix should be 8 hex chars, got: ${match![2]}`);
+    });
+  });
+
+  // ══════════════════════════════════════════════════════════════════
+  // TATR US-009: record spawned-by/parent linkage on child runs
+  // ══════════════════════════════════════════════════════════════════
+  // runWorkflow accepts an optional parentRunId, persists it into
+  // runs.parent_run_id (both direct and worktree INSERT paths), and
+  // carries it on run.started when present. Runs launched without a
+  // parent store NULL and omit the field from run.started.
+
+  describe("TATR US-009: parent linkage on child runs", () => {
+    async function findLatestRun(workflowId: string): Promise<{ id: string; parent_run_id: string | null }> {
+      const { getDb } = await import("../../dist/db.js");
+      const db = getDb();
+      const rows = db.prepare(
+        "SELECT id, parent_run_id FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1",
+      ).all(workflowId) as { id: string; parent_run_id: string | null }[];
+      assert.ok(rows.length > 0, `expected a run record for workflow ${workflowId}`);
+      return rows[0];
+    }
+
+    function findStartedEvent(runId: string): { parentRunId?: string } {
+      const started = getRunEvents(runId).find((e) => e.event === "run.started");
+      assert.ok(started, "run.started should be emitted for a persisted run");
+      return started as { parentRunId?: string };
+    }
+
+    it("persists parent_run_id and carries parentRunId on run.started (direct mode)", async () => {
+      const workflowId = "test-us009-direct";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      const repoDir = tamanduaTempDir("tamandua-us009-direct-");
+      const parentRunId = crypto.randomUUID();
+      try {
+        initGitRepo(repoDir);
+        try {
+          await runWorkflow({
+            workflowId,
+            taskTitle: "Test parent linkage direct mode",
+            workingDirectoryForHarness: repoDir,
+            parentRunId,
+          });
+        } catch {
+          // Daemon registration may fail after persisting the run; the
+          // assertions below only need the persisted run + run.started.
+        }
+
+        const row = await findLatestRun(workflowId);
+        assert.equal(row.parent_run_id, parentRunId, "parent_run_id should be persisted");
+        assert.equal(findStartedEvent(row.id).parentRunId, parentRunId, "run.started should carry parentRunId");
+      } finally {
+        fs.rmSync(repoDir, { recursive: true, force: true });
+      }
+    });
+
+    it("persists parent_run_id via the worktree-mode INSERT path", async () => {
+      const workflowId = "test-us009-worktree";
+      writeMinimalWorkflow(tempHome, workflowId, "worktree");
+      const originDir = tamanduaTempDir("tamandua-us009-wt-");
+      const parentRunId = crypto.randomUUID();
+      try {
+        initGitRepo(originDir);
+        try {
+          await runWorkflow({
+            workflowId,
+            taskTitle: "Test parent linkage worktree mode",
+            worktreeOriginRepository: originDir,
+            parentRunId,
+          });
+        } catch {
+          // Daemon registration may fail after persisting the run.
+        }
+
+        const row = await findLatestRun(workflowId);
+        assert.equal(row.parent_run_id, parentRunId, "worktree-mode INSERT must persist parent_run_id");
+        assert.equal(findStartedEvent(row.id).parentRunId, parentRunId, "run.started should carry parentRunId");
+      } finally {
+        fs.rmSync(originDir, { recursive: true, force: true });
+      }
+    });
+
+    it("leaves parent_run_id NULL and omits parentRunId from run.started when no parent", async () => {
+      const workflowId = "test-us009-orphan";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+      const repoDir = tamanduaTempDir("tamandua-us009-orphan-");
+      try {
+        initGitRepo(repoDir);
+        try {
+          await runWorkflow({
+            workflowId,
+            taskTitle: "Test parentless run",
+            workingDirectoryForHarness: repoDir,
+          });
+        } catch {
+          // Daemon registration may fail after persisting the run.
+        }
+
+        const row = await findLatestRun(workflowId);
+        assert.equal(row.parent_run_id, null, "parent_run_id should be NULL without a parent");
+        const started = findStartedEvent(row.id);
+        assert.ok(
+          !("parentRunId" in started),
+          "run.started must not carry a parentRunId field for parentless runs",
+        );
+      } finally {
+        fs.rmSync(repoDir, { recursive: true, force: true });
+      }
     });
   });
 });

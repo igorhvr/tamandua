@@ -310,6 +310,17 @@ function generateBackupName(targetBranch: string, runId: string): string {
   return `${targetBranch}-tamandua-parked-${timestamp}-${suffix}`;
 }
 
+/**
+ * Structured reflog message for the target-advancing update-ref so parsers can
+ * attribute a landing without special-casing (TATR facet 2). Run-scoped landings
+ * carry the run id; genuinely runless manual merges carry the "(manual)" marker.
+ */
+function targetAdvanceReflogMessage(runId: string, mergedTree: string): string {
+  return runId
+    ? `tamandua: merge.landed run=${runId} tree=${mergedTree}`
+    : `tamandua: merge.landed (manual) tree=${mergedTree}`;
+}
+
 
 export function runPlumbingMerge(
   params: PlumbingMergeParams,
@@ -488,7 +499,7 @@ export function runPlumbingMerge(
       };
     }
 
-    const updateArgs = ["update-ref", target, mergedCommit, params.expectTip];
+    const updateArgs = ["update-ref", "-m", targetAdvanceReflogMessage(runId, mergedTree), target, mergedCommit, params.expectTip];
     const updateResult = git(params.origin, updateArgs);
     if (updateResult.status !== 0) {
       let cleanupDetail: string | undefined;
@@ -641,7 +652,7 @@ export function runPlumbingMerge(
     return result;
   }
 
-  const updateArgs = ["update-ref", target, mergedCommit, params.expectTip];
+  const updateArgs = ["update-ref", "-m", targetAdvanceReflogMessage(runId, mergedTree), target, mergedCommit, params.expectTip];
   const updateResult = git(params.origin, updateArgs);
   if (updateResult.status !== 0) {
     const currentResult = git(params.origin, ["rev-parse", "--verify", target]);

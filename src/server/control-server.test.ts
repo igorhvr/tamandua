@@ -2762,3 +2762,201 @@ describe("suite control-plane endpoints", { concurrency: 1 }, () => {
     assert.equal(r.status, 404);
   });
 });
+
+// ══════════════════════════════════════════════════════════════════════
+// TATR US-005: control-plane terminate settles in-flight token
+// attribution for canceled runs before returning
+// ══════════════════════════════════════════════════════════════════════
+
+describe("control-plane terminate settles in-flight rounds (TATR US-005)", { concurrency: 1 }, () => {
+  let tempHome: string;
+  let stateDir: string;
+  let dbPath: string;
+  let secret: string;
+  let controlPort: number;
+  let server: http.Server | undefined;
+  let origHome: string | undefined;
+  let origStateDir: string | undefined;
+  let origDbPath: string | undefined;
+  let origControlPort: string | undefined;
+  let origPiBinary: string | undefined;
+  let origRoundMarker: string | undefined;
+
+  before(async () => {
+    origHome = process.env.HOME;
+    origStateDir = process.env.TAMANDUA_STATE_DIR;
+    origDbPath = process.env.TAMANDUA_DB_PATH;
+    origControlPort = process.env.TAMANDUA_CONTROL_PORT;
+    origPiBinary = process.env.TAMANDUA_PI_BINARY;
+    origRoundMarker = process.env.TAMANDUA_ROUND_MARKER;
+
+    tempHome = tamanduaTempDir("tamandua-settle-ep-");
+    stateDir = path.join(tempHome, ".tamandua");
+    fs.mkdirSync(stateDir, { recursive: true });
+    dbPath = path.join(stateDir, "tamandua.db");
+
+    process.env.HOME = tempHome;
+    process.env.TAMANDUA_STATE_DIR = stateDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+
+    secret = crypto.randomBytes(16).toString("hex");
+    fs.mkdirSync(path.dirname(path.join(stateDir, "daemon-secret")), { recursive: true });
+    fs.writeFileSync(path.join(stateDir, "daemon-secret"), secret, "utf-8");
+
+    const [ctrlHandle] = await reservePortHandles(1);
+    controlPort = ctrlHandle.port;
+    await ctrlHandle.close();
+    process.env.TAMANDUA_CONTROL_PORT = String(controlPort);
+
+    const { createControlServer } = await import("../../dist/server/control-server.js");
+    server = createControlServer({ port: controlPort, secret });
+    await new Promise<void>((resolve) => {
+      server!.once("listening", resolve);
+    });
+  });
+
+  after(async () => {
+    shutdownAllCrons();
+    if (server) {
+      await new Promise<void>((resolve) => server!.close(() => resolve()));
+    }
+    if (origHome) process.env.HOME = origHome;
+    else delete process.env.HOME;
+    if (origStateDir) process.env.TAMANDUA_STATE_DIR = origStateDir;
+    else delete process.env.TAMANDUA_STATE_DIR;
+    if (origDbPath) process.env.TAMANDUA_DB_PATH = origDbPath;
+    else delete process.env.TAMANDUA_DB_PATH;
+    if (origControlPort) process.env.TAMANDUA_CONTROL_PORT = origControlPort;
+    else delete process.env.TAMANDUA_CONTROL_PORT;
+    if (origPiBinary) process.env.TAMANDUA_PI_BINARY = origPiBinary;
+    else delete process.env.TAMANDUA_PI_BINARY;
+    if (origRoundMarker) process.env.TAMANDUA_ROUND_MARKER = origRoundMarker;
+    else delete process.env.TAMANDUA_ROUND_MARKER;
+    if (tempHome) fs.rmSync(tempHome, { recursive: true, force: true });
+  });
+
+  async function terminateRequest(runId: string, body?: Record<string, unknown>): Promise<JsonResponse> {
+    const payload = JSON.stringify({ runId, ...(body ?? {}) });
+    const headers: Record<string, string> = {
+      "content-type": "application/json",
+      "x-tamandua-secret": secret,
+      "content-length": String(Buffer.byteLength(payload)),
+    };
+
+    return await new Promise<JsonResponse>((resolve, reject) => {
+      const req = http.request(
+        {
+          method: "POST",
+          hostname: "127.0.0.1",
+          port: controlPort,
+          path: "/control/terminate-run",
+          headers,
+        },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on("data", (c: Buffer) => chunks.push(c));
+          res.on("end", () => {
+            const raw = Buffer.concat(chunks).toString("utf-8");
+            let parsed: Record<string, unknown> = {};
+            if (raw.trim()) {
+              try { parsed = JSON.parse(raw) as Record<string, unknown>; } catch { parsed = { raw }; }
+            }
+            resolve({ status: res.statusCode ?? 0, body: parsed });
+          });
+        },
+      );
+      req.on("error", reject);
+      req.setTimeout(15000, () => req.destroy(new Error("terminate request timeout")));
+      req.write(payload);
+      req.end();
+    });
+  }
+
+  it("terminate on a canceled run with an in-flight round returns only after token attribution settles", async () => {
+    const { executeDispatchRound, setupAgentCrons } = await import("../../dist/installer/agent-scheduler.js");
+    const { getDb } = await import("../../dist/db.js");
+    const { getRunEvents } = await import("../../dist/installer/events.js");
+
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    const workdir = path.join(tempHome, "work");
+    fs.mkdirSync(workdir, { recursive: true });
+
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at) VALUES (?, 'test-wf', 'settle ep task', 'running', ?, ?, ?)",
+    ).run(runId, JSON.stringify({ working_directory_for_harness: workdir }), now, now);
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, created_at, updated_at) VALUES (?, ?, 'step-1', 'test-wf_test-agent', 0, 'do work', 'STATUS', 'pending', ?, ?)",
+    ).run(`${runId}-step`, runId, now, now);
+
+    // Register the run's dispatch job in jobMetadata exactly as admission
+    // does, so removeRunCrons exercises its real timer/kill bookkeeping.
+    const workflow = {
+      id: "test-wf",
+      agents: [{ id: "test-agent", model: "fake", workspace: { baseDir: "." } }],
+      steps: [{ id: "step-1", agent: "test-agent", input: "do work", expects: "STATUS" }],
+    };
+    await setupAgentCrons(workflow, runId, { workingDirectoryForHarness: workdir });
+
+    const jobId = `tamandua-test-wf-${runId}-test-agent`;
+    const marker = path.join(tempHome, "settle-ep.marker");
+    const fakePi = path.join(tempHome, "pi-mock");
+    fs.writeFileSync(
+      fakePi,
+      `#!/usr/bin/env node
+import { DatabaseSync } from "node:sqlite";
+import fs from "node:fs";
+const db = new DatabaseSync(process.env.TAMANDUA_DB_PATH);
+db.exec("PRAGMA busy_timeout = 5000");
+db.prepare("UPDATE steps SET status = 'running', claim_job_id = ? WHERE status = 'pending'").run(process.env.TAMANDUA_WORKER_JOB_ID);
+fs.writeFileSync(process.env.TAMANDUA_ROUND_MARKER, "inflight");
+await new Promise((resolve) => setTimeout(resolve, 300));
+console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: "STATUS: done", usage: { totalTokens: 137 } } }));
+console.log("STATUS: done");
+process.exit(0);
+`,
+      { mode: 0o755 },
+    );
+    process.env.TAMANDUA_PI_BINARY = fakePi;
+    process.env.TAMANDUA_ROUND_MARKER = marker;
+
+    const round = executeDispatchRound(
+      { id: jobId, workflowId: "test-wf", runId, agentId: "test-wf_test-agent", harnessType: "pi", workingDirectoryForHarness: workdir, createdAt: "" },
+      { id: "test-agent", model: "fake", workspace: { baseDir: "." }, timeoutSeconds: 10 },
+    );
+
+    // Wait until the round is genuinely in flight (child spawned + claimed).
+    const waitStarted = Date.now();
+    while (Date.now() - waitStarted < 5000) {
+      if (fs.existsSync(marker)) break;
+      await sleep(20);
+    }
+    assert.ok(fs.existsSync(marker), "round never reached in-flight state");
+
+    // Mark the run canceled exactly as stopWorkflow does before the daemon
+    // is notified.
+    db.prepare(
+      "UPDATE runs SET status = 'canceled', scheduling_status = NULL, updated_at = datetime('now') WHERE id = ?",
+    ).run(runId);
+
+    const before = Date.now();
+    const r = await terminateRequest(runId);
+    const terminateMs = Date.now() - before;
+
+    assert.equal(r.status, 200, `terminate must succeed: ${JSON.stringify(r.body)}`);
+
+    // handleTerminateRun settled the in-flight round BEFORE returning: the
+    // run.tokens.updated event must already be on disk.
+    const events = getRunEvents(runId);
+    const tokenEvents = events.filter((e) => e.event === "run.tokens.updated");
+    assert.equal(tokenEvents.length, 1, "the settled run.tokens.updated must land before terminate returns");
+    assert.equal(tokenEvents[0].runId, runId);
+    assert.equal(tokenEvents[0].tokenDelta, 137);
+
+    const row = db.prepare("SELECT tokens_spent FROM runs WHERE id = ?").get(runId) as { tokens_spent: number };
+    assert.equal(row.tokens_spent, 137, "the DB spend must include the settled delta");
+
+    await round;
+  });
+});

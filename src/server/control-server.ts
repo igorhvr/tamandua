@@ -831,21 +831,45 @@ async function handleRegisterRun(runId: string): Promise<JsonResponse> {
   }
 }
 
-async function handleTerminateRun(runId: string, suiteRuntime?: SuiteClaimRuntime): Promise<JsonResponse> {
+async function handleTerminateRun(runId: string, suiteRuntime?: SuiteClaimRuntime, settle = false): Promise<JsonResponse> {
   const run = getRun(runId);
   if (!run) return notFound(`Run not found: ${runId}`);
 
   try {
-    const { removeRunCrons, getRunTeardownGraceMs } = await import(
-      "../installer/agent-scheduler.js"
-    );
+    const {
+      removeRunCrons,
+      getRunTeardownGraceMs,
+      settleRunInFlightRounds,
+      HARNESS_TEARDOWN_GRACE_MS,
+    } = await import("../installer/agent-scheduler.js");
     // Terminate-run is called both for user-initiated termination of an
     // ACTIVE run (kill in-flight work immediately) and as cleanup after a
     // run naturally completed/failed (the harness that reported the final
     // step is still flushing its output — give only those statuses the grace
     // window so canceled and other user-directed states stay immediate).
-    const graceMs = getRunTeardownGraceMs(run.status);
+    //
+    // TATR US-005: a canceled run (or an explicit settle request) must NOT
+    // kill in-flight work immediately — the cancel path guarantees its
+    // terminal event is emitted only after in-flight token attribution
+    // settles (no trailing run.tokens.updated). Remove the scheduling timers
+    // so no new rounds dispatch, grant in-flight rounds the same grace
+    // window as naturally-completed runs, then settle them before returning.
+    // Completed/failed cleanup and pause/resume behavior are unchanged.
+    const shouldSettle = run.status === "canceled" || settle;
+    const graceMs = shouldSettle
+      ? HARNESS_TEARDOWN_GRACE_MS
+      : getRunTeardownGraceMs(run.status);
     await removeRunCrons(runId, { graceMs });
+    if (shouldSettle) {
+      const settled = await settleRunInFlightRounds(runId, { graceMs });
+      if (settled.stillInFlight.length > 0) {
+        logger.warn("control-server: in-flight rounds still processing after settle grace", {
+          runId,
+          stillInFlight: settled.stillInFlight,
+          graceMs,
+        });
+      }
+    }
   } catch (err) {
     logger.warn("control-server: removeRunCrons threw", { runId, error: String(err) });
   }
@@ -1316,7 +1340,8 @@ export function createControlServer(options: ControlServerOptions = {}): http.Se
           return;
         }
         if (pathname === "/control/terminate-run") {
-          const r = await handleTerminateRun(runId, suiteClaimRuntime);
+          const settle = body.settle === true;
+          const r = await handleTerminateRun(runId, suiteClaimRuntime, settle);
           respond(r.status, r.body);
           return;
         }

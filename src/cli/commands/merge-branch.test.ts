@@ -47,6 +47,53 @@ describe("SPL2 merge-branch command module", () => {
     );
   });
 
+  it("parses the optional --run-id without making it required", () => {
+    // Absent: optional key stays absent (runPlumbingMerge then falls back to
+    // TAMANDUA_RUN_ID env, then '' for runless manual merges).
+    const absent = parseMergeBranchOptions(validArgs);
+    assert.deepEqual(absent, {
+      "--origin": "/repo/origin",
+      "--branch": "feature/test",
+      "--into": "main",
+      "--expect-tip": "abc123",
+      "--message": "Land feature",
+    });
+    assert.equal("--run-id" in absent, false);
+
+    // Present exactly once with a non-empty value.
+    assert.deepEqual(parseMergeBranchOptions([...validArgs, "--run-id", "run-xyz"]), {
+      "--origin": "/repo/origin",
+      "--branch": "feature/test",
+      "--into": "main",
+      "--expect-tip": "abc123",
+      "--message": "Land feature",
+      "--run-id": "run-xyz",
+    });
+
+    // --run-id=<value> form is accepted too.
+    assert.equal(parseMergeBranchOptions([...validArgs, "--run-id=run-eq"])["--run-id"], "run-eq");
+
+    // Duplicate and empty --run-id are rejected.
+    assert.throws(
+      () => parseMergeBranchOptions([...validArgs, "--run-id", "run-1", "--run-id", "run-2"]),
+      /Duplicate option --run-id\./,
+    );
+    assert.throws(
+      () => parseMergeBranchOptions([...validArgs, "--run-id"]),
+      /Missing value for --run-id\./,
+    );
+    assert.throws(
+      () => parseMergeBranchOptions([...validArgs, "--run-id="]),
+      /Missing value for --run-id\./,
+    );
+
+    // Required-option validation still applies when --run-id is present.
+    assert.throws(
+      () => parseMergeBranchOptions([...validArgs.slice(0, -2), "--run-id", "run-xyz"]),
+      /Missing required option --message\./,
+    );
+  });
+
   it("owns merge help and declines unrelated command groups", () => {
     const help = getMergeBranchHelp();
     assert.match(help, /^tamandua merge-branch — Atomically land a squash merge with Git plumbing/);

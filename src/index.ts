@@ -16,6 +16,7 @@ export {
   setupAgentCrons,
   removeAgentCrons,
   removeRunCrons,
+  settleRunInFlightRounds,
   teardownWorkflowCronsIfIdle,
   createAgentCronJob,
   shutdownAllCrons,

@@ -54,6 +54,21 @@ describe("formatLogsTailLabel", () => {
     const evt = makeEvent("custom.unknown.event");
     assert.equal(formatLogsTailLabel(evt), "custom.unknown.event");
   });
+
+  it("displays the plain label for an in-run run.tokens.updated", () => {
+    const evt = makeEvent("run.tokens.updated", { tokenDelta: 100, tokensSpent: 100 });
+    assert.equal(formatLogsTailLabel(evt), "Token spend updated");
+  });
+
+  it("displays a distinct label for a post-terminal run.tokens.updated (TATR US-007)", () => {
+    const evt = makeEvent("run.tokens.updated", {
+      tokenDelta: 100,
+      tokensSpent: 100,
+      postTerminal: true,
+      terminalStatus: "failed",
+    });
+    assert.equal(formatLogsTailLabel(evt), "Token spend updated (post-terminal)");
+  });
 });
 
 describe("formatLogsTailLine", () => {
@@ -78,6 +93,19 @@ describe("formatLogsTailLine", () => {
     const evt = makeEvent("agent.nudge.skipped");
     const line = formatLogsTailLine(evt);
     assert.ok(line.includes("Nudge skipped"), `Expected 'Nudge skipped' in: ${line}`);
+  });
+
+  it("renders the distinct post-terminal label in the full line (TATR US-007)", () => {
+    const evt = makeEvent("run.tokens.updated", {
+      runId: "abcd1234",
+      tokenDelta: 137,
+      tokensSpent: 137,
+      postTerminal: true,
+      terminalStatus: "failed",
+    });
+    const line = formatLogsTailLine(evt);
+    assert.ok(line.includes("Token spend updated (post-terminal)"), `Expected post-terminal label in: ${line}`);
+    assert.ok(line.includes("[tokens: Δ +137, total 137]"), `Expected token spend detail in: ${line}`);
   });
 });
 

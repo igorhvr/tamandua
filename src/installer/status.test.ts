@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import { cleanChildEnv } from "../../tests/helpers/test-env.ts";
 import path from "node:path";
+import crypto from "node:crypto";
 
 import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
 import assert from "node:assert/strict";
@@ -8,6 +9,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { describe, it, beforeEach, afterEach } from "node:test";
 import { once } from "node:events";
+import { setTimeout as sleep } from "node:timers/promises";
 
 const cliPath = path.resolve(process.cwd(), "dist", "cli", "cli.js");
 
@@ -828,6 +830,97 @@ describe("stopWorkflow run.canceled terminal event", () => {
     assert.equal(last.event, "run.canceled");
     assert.equal(last.runId, runId);
     assert.equal(last.reason, "operator-test");
+  });
+
+  it("emits run.canceled only after in-flight token attribution settles (TATR US-006)", async () => {
+    const { stopWorkflow } = await import("../../dist/installer/status.js");
+    const { executeDispatchRound, setupAgentCrons } = await import("../../dist/installer/agent-scheduler.js");
+
+    // Random UUID: must not collide with a real daemon's run ids — the
+    // terminate request may reach the daemon on TAMANDUA_CONTROL_PORT when
+    // it is ambient, and a collision would make the daemon respond 200
+    // (settled) for a run it doesn't actually own, skipping the fallback.
+    const runId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    const workdir = path.join(tempRoot, "work");
+    fs.mkdirSync(workdir, { recursive: true });
+    db.prepare("INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at, tokens_spent, worker_lost_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(runId, "feature-dev-merge-worktree", "cancel with in-flight round", "running", JSON.stringify({ working_directory_for_harness: workdir }), now, now, 0, 0);
+    db.prepare("INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, created_at, updated_at) VALUES (?, ?, 'step-1', 'feature-dev-merge-worktree_developer', 0, 'do work', 'STATUS', 'pending', ?, ?)")
+      .run(`${runId}-step`, runId, now, now);
+
+    const workflow = {
+      id: "feature-dev-merge-worktree",
+      agents: [{ id: "developer", model: "fake", workspace: { baseDir: "." } }],
+      steps: [{ id: "step-1", agent: "developer", input: "do work", expects: "STATUS" }],
+    };
+    await setupAgentCrons(workflow, runId, { workingDirectoryForHarness: workdir });
+
+    const marker = path.join(tempRoot, "cancel-settle.marker");
+    const fakePi = path.join(tempRoot, "pi-mock");
+    fs.writeFileSync(
+      fakePi,
+      `#!/usr/bin/env node
+import { DatabaseSync } from "node:sqlite";
+import fs from "node:fs";
+const db = new DatabaseSync(process.env.TAMANDUA_DB_PATH);
+db.exec("PRAGMA busy_timeout = 5000");
+db.prepare("UPDATE steps SET status = 'running', claim_job_id = ? WHERE status = 'pending'").run(process.env.TAMANDUA_WORKER_JOB_ID);
+fs.writeFileSync(process.env.TAMANDUA_ROUND_MARKER, "inflight");
+await new Promise((resolve) => setTimeout(resolve, 300));
+console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: "STATUS: done", usage: { totalTokens: 137 } } }));
+console.log("STATUS: done");
+process.exit(0);
+`,
+      { mode: 0o755 },
+    );
+    process.env.TAMANDUA_PI_BINARY = fakePi;
+    process.env.TAMANDUA_ROUND_MARKER = marker;
+
+    const jobId = `tamandua-feature-dev-merge-worktree-${runId}-developer`;
+    const round = executeDispatchRound(
+      { id: jobId, workflowId: "feature-dev-merge-worktree", runId, agentId: "feature-dev-merge-worktree_developer", harnessType: "pi", workingDirectoryForHarness: workdir, createdAt: "" },
+      { id: "developer", model: "fake", workspace: { baseDir: "." }, timeoutSeconds: 10 },
+    );
+
+    try {
+      // Wait until the round is genuinely in flight (child spawned + claimed).
+      const waitStarted = Date.now();
+      while (Date.now() - waitStarted < 5000) {
+        if (fs.existsSync(marker)) break;
+        await sleep(20);
+      }
+      assert.ok(fs.existsSync(marker), "round never reached in-flight state");
+
+      // Cancel mid-round. No daemon is reachable in this test env, so
+      // stopWorkflow must fall back to the bounded in-process settle and
+      // emit run.canceled only after the in-flight attribution lands.
+      const result = await stopWorkflow(runId);
+      assert.equal(result.ok, true);
+
+      // Ordering: the settled run.tokens.updated precedes run.canceled, and
+      // run.canceled is the FINAL event — nothing trails it.
+      const lines = readRunEventLines(runId);
+      const events = lines.map((l) => l.event);
+      const tokenIdx = events.indexOf("run.tokens.updated");
+      assert.notEqual(tokenIdx, -1, "settled run.tokens.updated must be present");
+      assert.equal(events.filter((e) => e === "run.tokens.updated").length, 1, "exactly one token update");
+      const canceledIdx = events.lastIndexOf("run.canceled");
+      assert.equal(canceledIdx, events.length - 1, "run.canceled must be the final event");
+      assert.ok(tokenIdx < canceledIdx, "run.tokens.updated must precede run.canceled");
+
+      // The settled delta is reflected in the terminal event's tokensSpent.
+      const last = lines[lines.length - 1];
+      assert.equal(last.event, "run.canceled");
+      assert.equal(last.tokensSpent, 137);
+      const row = db.prepare("SELECT tokens_spent FROM runs WHERE id = ?").get(runId) as { tokens_spent: number };
+      assert.equal(row.tokens_spent, 137);
+
+      await round;
+    } finally {
+      delete process.env.TAMANDUA_PI_BINARY;
+      delete process.env.TAMANDUA_ROUND_MARKER;
+    }
   });
 
   it("deleteWorkflow --force still emits run.deleted and no run.canceled", async () => {

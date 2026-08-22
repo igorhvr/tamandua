@@ -709,6 +709,14 @@ export async function handleWorkflow(
       harnessType = runArgs.harnessAs as HarnessType;
     }
 
+    // TATR US-009: when this CLI is invoked inside a worker round, the
+    // scheduler sets TAMANDUA_RUN_ID to the run that spawned the round.
+    // Derive the parent linkage from it so child runs record which run
+    // created them (persisted as runs.parent_run_id and carried on
+    // run.started). Manual launches outside a run have no such env var
+    // and stay parentless (parent_run_id NULL).
+    const parentRunId = process.env.TAMANDUA_RUN_ID?.trim() || undefined;
+
     const result = await runWorkflow({
       workflowId: workflowName,
       taskTitle: runArgs.taskTitle,
@@ -719,6 +727,7 @@ export async function handleWorkflow(
       noRelaunchUponRugpull: runArgs.noRelaunchUponRugpull,
       harnessType,
       context: runArgs.context,
+      parentRunId,
     });
     const stalenessWarning = checkCatalogStalenessWarning();
     if (stalenessWarning) {

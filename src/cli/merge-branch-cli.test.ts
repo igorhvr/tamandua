@@ -103,6 +103,7 @@ function captureCheckoutState(worktree: string) {
 
 function readEvents(eventsPath: string): Array<{
   event: string;
+  runId?: string;
   checkoutRefresh?: string;
   parkedBranch?: string;
   parkedReason?: string;
@@ -291,6 +292,10 @@ describe("tamandua merge-branch CLI", () => {
 
     assert.equal(result.status, 0);
     for (const option of requiredOptions) assert.match(result.stdout, new RegExp(option));
+    assert.match(result.stdout, /Optional options:/);
+    assert.match(result.stdout, /--run-id <run-id>/);
+    assert.match(result.stdout, /TAMANDUA_RUN_ID/);
+    assert.match(result.stdout, /runless \(runId ""\)/);
     assert.match(result.stdout, /STATUS: landed/);
     assert.match(result.stdout, /NOOP: <true \| false>/);
     assert.match(result.stdout, /true[\s\S]*already landed[\s\S]*false[\s\S]*new squash commit/i);
@@ -313,6 +318,8 @@ describe("tamandua merge-branch CLI", () => {
   });
 
   it("rejects each missing required option before mutating the target", () => {
+    // requiredOptions deliberately excludes the OPTIONAL --run-id: a manual
+    // merge must not be forced to name a run (US-003).
     const { repo, initial } = createRepo();
     git(repo, ["branch", "scratch", initial]);
     createFeature(repo, initial);
@@ -325,6 +332,90 @@ describe("tamandua merge-branch CLI", () => {
       assert.match(result.stderr, new RegExp(`Missing required option ${option}`));
       assert.equal(git(repo, ["rev-parse", "refs/heads/scratch"]), initial);
     }
+  });
+
+  it("still rejects a missing required option when the optional --run-id is present", () => {
+    const { repo, initial } = createRepo();
+    git(repo, ["branch", "scratch", initial]);
+    createFeature(repo, initial);
+    const args = [...validArgs(repo, initial), "--run-id", "run-abc123"];
+
+    const messageIndex = args.indexOf("--message");
+    const result = runCli(args.filter((_, index) => index !== messageIndex && index !== messageIndex + 1));
+
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /Missing required option --message/);
+    assert.equal(git(repo, ["rev-parse", "refs/heads/scratch"]), initial);
+  });
+
+  it("threads an explicit --run-id through to the emitted merge event", () => {
+    const { repo, initial } = createRepo();
+    git(repo, ["branch", "scratch", initial]);
+    createFeature(repo, initial);
+    const runId = "run-abc123";
+
+    const result = runCli([...validArgs(repo, initial), "--run-id", runId]);
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /^STATUS: landed$/m);
+    assert.match(result.stdout, /^NOOP: false$/m);
+
+    // Global stream carries the run id...
+    const allEvents = readEvents(path.join(result.testHome.tamanduaDir, "events", "all.jsonl"));
+    assert.equal(allEvents.length, 1);
+    assert.equal(allEvents[0]?.event, "merge.landed");
+    assert.equal(allEvents[0]?.runId, runId);
+
+    // ...and the event lands in the run-scoped events/<runId>.jsonl stream.
+    const runEvents = readEvents(path.join(result.testHome.tamanduaDir, "events", `${runId}.jsonl`));
+    assert.equal(runEvents.length, 1);
+    assert.equal(runEvents[0]?.event, "merge.landed");
+    assert.equal(runEvents[0]?.runId, runId);
+  });
+
+  it("falls back to TAMANDUA_RUN_ID env when --run-id is absent", () => {
+    const { repo, initial } = createRepo();
+    git(repo, ["branch", "scratch", initial]);
+    createFeature(repo, initial);
+
+    const result = runCli(validArgs(repo, initial), { TAMANDUA_RUN_ID: "run-from-env" });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /^STATUS: landed$/m);
+
+    const allEvents = readEvents(path.join(result.testHome.tamanduaDir, "events", "all.jsonl"));
+    assert.equal(allEvents.length, 1);
+    assert.equal(allEvents[0]?.event, "merge.landed");
+    assert.equal(allEvents[0]?.runId, "run-from-env");
+    assert.equal(
+      readEvents(path.join(result.testHome.tamanduaDir, "events", "run-from-env.jsonl"))[0]?.runId,
+      "run-from-env",
+    );
+  });
+
+  it("emits runId '' for a runless manual merge (no --run-id, no TAMANDUA_RUN_ID env)", () => {
+    const { repo, initial } = createRepo();
+    git(repo, ["branch", "scratch", initial]);
+    createFeature(repo, initial);
+
+    const result = runCli(validArgs(repo, initial));
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /^STATUS: landed$/m);
+    assert.match(result.stdout, /^NOOP: false$/m);
+
+    // Documented runless manual-merge behavior: the event carries runId "" in
+    // the global stream and lands in events/.jsonl (the run-scoped file for
+    // an empty run id).
+    const allEvents = readEvents(path.join(result.testHome.tamanduaDir, "events", "all.jsonl"));
+    assert.equal(allEvents.length, 1);
+    assert.equal(allEvents[0]?.event, "merge.landed");
+    assert.equal(allEvents[0]?.runId, "");
+
+    const runlessEvents = readEvents(path.join(result.testHome.tamanduaDir, "events", ".jsonl"));
+    assert.equal(runlessEvents.length, 1);
+    assert.equal(runlessEvents[0]?.event, "merge.landed");
+    assert.equal(runlessEvents[0]?.runId, "");
   });
 
   it("rejects unknown, duplicate, positional, and valueless options", () => {

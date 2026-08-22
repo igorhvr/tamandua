@@ -9,7 +9,9 @@ import { LEDGER_RETENTION_MS } from "./suite/config.js";
 // failed to bump v3 → every existing DB (user_version === 3) early-returned and
 // skipped the migration. The MIGV upgrade-path test pins that this class of
 // bug (new column never appearing on pre-existing DBs) is caught going forward.
-export const SCHEMA_VERSION = 4;
+// v5: TATR US-001 added the nullable runs.parent_run_id column (parent/child
+// run linkage for graph consumers).
+export const SCHEMA_VERSION = 5;
 
 // Counter for tests — increments each time migrate() runs the full DDL path.
 export let _migrateFullRuns = 0;
@@ -80,6 +82,7 @@ function migrate(db: DatabaseSync): void {
       context TEXT NOT NULL DEFAULT '{}',
       tokens_spent INTEGER NOT NULL DEFAULT 0,
       notify_url TEXT,
+      parent_run_id TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -139,6 +142,15 @@ function migrate(db: DatabaseSync): void {
   }
 
   db.exec("UPDATE runs SET tokens_spent = 0 WHERE tokens_spent IS NULL");
+
+  // ── TATR parent_run_id for runs ──
+  // Records which run spawned a child run so graph consumers can discover
+  // parent/child linkage. Nullable with no backfill: existing rows and runs
+  // without a parent keep NULL. Consumers must tolerate NULL (no parent).
+  if (!runColNames.has("parent_run_id")) {
+    db.exec("ALTER TABLE runs ADD COLUMN parent_run_id TEXT");
+    runColNames.add("parent_run_id");
+  }
 
   // ── Run-scoped scheduling metadata ──
   // - scheduling_status: lifecycle of daemon-side scheduling for the run

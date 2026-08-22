@@ -1,6 +1,6 @@
 import { getDb } from "../db.js";
 import { scheduleRunCronTeardown, getWorkflowId, emitRunTerminalEvent, parseRunContext } from "./step-ops.js";
-import { removeRunCrons } from "./agent-scheduler.js";
+import { removeRunCrons, settleRunInFlightRounds, HARNESS_TEARDOWN_GRACE_MS } from "./agent-scheduler.js";
 import { terminateRunWithDaemon } from "../server/control-client.js";
 import { getRunWorktree, removeRunWorktree } from "./worktree-manager.js";
 import { emitEvent, getRunEvents } from "./events.js";
@@ -291,8 +291,9 @@ export async function deleteWorkflow(
 /**
  * Cancel a running workflow.
  * Sets the run status to 'canceled' and tears down cron jobs.
- * Emits a terminal run.canceled event AFTER all cancel bookkeeping so it is
- * the last event of the run in the common path.
+ * Emits a terminal run.canceled event AFTER all cancel bookkeeping AND the
+ * in-flight token attribution settle (TATR US-006), so it is the last event
+ * of the run — no run.tokens.updated trails it in the common path.
  *
  * @param opts.source — identifies what initiated the stop (defaults to
  *   'cli-stop'); carried as the event's `reason` field.
@@ -331,18 +332,58 @@ export async function stopWorkflow(
   // Tear down run-scoped cron jobs in this process (best-effort), and
   // notify the daemon so it tears down its own timers too. The daemon
   // reconciler will catch any drift on the next tick if either fails.
-  await Promise.allSettled([
-    removeRunCrons(runId),
-    terminateRunWithDaemon(runId),
+  //
+  // TATR US-006: the cancel path settles in-flight token attribution
+  // BEFORE the terminal event so no run.tokens.updated can trail
+  // run.canceled. Two halves:
+  //   - The in-process removeRunCrons grants in-flight harness processes
+  //     the HARNESS_TEARDOWN_GRACE_MS window (matching the daemon-side
+  //     terminate handler) instead of killing them immediately, so they
+  //     can flush their final usage before the leak-guard kill.
+  //   - terminateRunWithDaemon uses a settle-sized timeout: the daemon's
+  //     handleTerminateRun removes the run's timers and awaits
+  //     settleRunInFlightRounds before responding (US-005), so a
+  //     successful response means the settled deltas are already on disk.
+  const settleTimeoutMs = HARNESS_TEARDOWN_GRACE_MS + 5_000;
+  const teardown = await Promise.allSettled([
+    removeRunCrons(runId, { graceMs: HARNESS_TEARDOWN_GRACE_MS }),
+    terminateRunWithDaemon(runId, settleTimeoutMs),
   ]);
 
   // Workflow-wide idle teardown for back-compat (legacy callers).
   scheduleRunCronTeardown(runId);
 
-  // Terminal event LAST, after all cancel bookkeeping, so the event stream
-  // ends on a terminal record rather than just stopping. A straggling async
-  // run.tokens.updated from an in-flight work round can still trail this in
-  // the TATR race (out of scope for CNEV; see tests/MOTOR-CONTRACT.md).
+  // If the daemon never responded successfully (unreachable, request
+  // timeout, or a non-200 response), fall back to a bounded in-process
+  // settle so any round hosted in THIS process (in-process scheduler /
+  // tests) still completes its token attribution before we emit the
+  // terminal event. Only a 200 response proves the daemon's terminate
+  // handler ran AND settled before responding: non-200 responses (e.g. a
+  // 404 when the daemon's DB doesn't know this run) do not.
+  const daemonTerminate = teardown[1];
+  const daemonSettled =
+    daemonTerminate.status === "fulfilled" &&
+    daemonTerminate.value !== null &&
+    daemonTerminate.value.status === 200;
+  if (!daemonSettled) {
+    const settled = await settleRunInFlightRounds(runId, {
+      graceMs: HARNESS_TEARDOWN_GRACE_MS,
+    });
+    if (settled.stillInFlight.length > 0) {
+      logger.warn("Cancel settle grace expired with rounds still in flight", {
+        runId,
+        stillInFlight: settled.stillInFlight,
+        graceMs: HARNESS_TEARDOWN_GRACE_MS,
+      });
+    }
+  }
+
+  // Terminal event LAST, after all cancel bookkeeping AND the token
+  // attribution settle, so run.canceled is the final event of the run with
+  // no trailing run.tokens.updated (TATR US-006). A straggling async
+  // run.tokens.updated can no longer trail it in the common path; rounds
+  // that outlive the settle grace are reaped by removeRunCrons' delayed
+  // leak guard and their late flush is a post-terminal event (US-007).
   emitRunTerminalEvent({
     event: "run.canceled",
     runId,

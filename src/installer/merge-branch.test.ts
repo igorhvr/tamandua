@@ -382,7 +382,7 @@ describe("runPlumbingMerge", () => {
         args[0] === "update-ref" && args[1]?.startsWith("refs/heads/main-tamandua-parked-") && args[3] === "0".repeat(40)
       );
       const parkIndex = commands.findIndex((args) => args[0] === "symbolic-ref" && args[1] === "HEAD" && args[2]?.includes("tamandua-parked"));
-      const landIndex = commands.findIndex((args) => args[0] === "update-ref" && args[1] === "refs/heads/main");
+      const landIndex = commands.findIndex((args) => args[0] === "update-ref" && args[3] === "refs/heads/main");
       assert.ok(backupCreateIndex >= 0 && backupCreateIndex < parkIndex && parkIndex < landIndex);
 
       if (change === "untracked") {
@@ -459,7 +459,7 @@ describe("runPlumbingMerge", () => {
     assert.equal(git(repo, ["rev-parse", "refs/heads/main"]), initial);
     assert.deepEqual(fs.readFileSync(indexPath), indexBefore);
     assert.equal(git(repo, ["rev-parse", collidingRef]), initial);
-    assert.equal(commands.some((args) => args[0] === "symbolic-ref" || (args[0] === "update-ref" && args[1] === "refs/heads/main")), false);
+    assert.equal(commands.some((args) => args[0] === "symbolic-ref" || (args[0] === "update-ref" && args[3] === "refs/heads/main")), false);
   });
 
   it("fully unparks after target CAS failure and preserves target-moved classification", () => {
@@ -476,7 +476,7 @@ describe("runPlumbingMerge", () => {
           runGit: (origin, args) => {
             commands.push([...args]);
             if (args[0] === "update-ref" && args[1]?.includes("tamandua-parked") && args[2] === initial) backupRef = args[1];
-            if (args[0] === "update-ref" && args[1] === "refs/heads/main" && args[3] === initial) {
+            if (args[0] === "update-ref" && args[3] === "refs/heads/main" && args[5] === initial) {
               if (failure === "target-moved") {
                 const tree = git(repo, ["rev-parse", `${initial}^{tree}`]);
                 competingTip = git(repo, ["commit-tree", tree, "-p", initial, "-m", "competing target"]);
@@ -518,7 +518,7 @@ describe("runPlumbingMerge", () => {
         {
           runGit: (origin, args) => {
             const isBackup = args[0] === "update-ref" && args[1]?.includes("tamandua-parked") && args[3] === "0".repeat(40);
-            const isTargetCas = args[0] === "update-ref" && args[1] === "refs/heads/main" && args[3] === initial;
+            const isTargetCas = args[0] === "update-ref" && args[3] === "refs/heads/main" && args[5] === initial;
             const isUnpark = args.join(" ") === "symbolic-ref HEAD refs/heads/main";
             if (isBackup) backupRef = args[1]!;
             if (isTargetCas) {
@@ -569,7 +569,7 @@ describe("runPlumbingMerge", () => {
       {
         runGit: (origin, args) => {
           const isBackup = args[0] === "update-ref" && args[1]?.includes("tamandua-parked") && args[3] === "0".repeat(40);
-          const isTargetCas = args[0] === "update-ref" && args[1] === "refs/heads/main" && args[3] === initial;
+          const isTargetCas = args[0] === "update-ref" && args[3] === "refs/heads/main" && args[5] === initial;
           const isCleanup = args[0] === "update-ref" && args[1] === "-d" && args[2]?.includes("tamandua-parked");
           if (isBackup) backupRef = args[1]!;
           if (isTargetCas) return { status: 128, stdout: "", stderr: "injected target CAS failure" };
@@ -647,7 +647,7 @@ describe("runPlumbingMerge", () => {
           runGit: (origin, args) => {
             const isBackup = args[0] === "update-ref" && args[1]?.includes("tamandua-parked") && args[3] === "0".repeat(40);
             const isPark = args[0] === "symbolic-ref" && args[2]?.includes("tamandua-parked");
-            const isLand = args[0] === "update-ref" && args[1] === "refs/heads/main" && args[3] === initial;
+            const isLand = args[0] === "update-ref" && args[3] === "refs/heads/main" && args[5] === initial;
             const isRefresh = args[0] === "read-tree";
             const isReattach = parked && args.join(" ") === "symbolic-ref HEAD refs/heads/main";
             const isCleanup = args[0] === "update-ref" && args[1] === "-d" && args[2]?.includes("tamandua-parked");
@@ -1256,6 +1256,82 @@ describe("runPlumbingMerge", () => {
     assert.equal(git(repo, ["rev-parse", "refs/heads/release"]), initial);
   });
 
+  it("TATR writes a structured reflog message on the owner-checkout target advance", () => {
+    const { repo, initial } = createRepo();
+    createFeature(repo);
+    const commands: string[][] = [];
+
+    const result = runPlumbingMerge(
+      {
+        origin: repo,
+        branch: "feature",
+        into: "main",
+        expectTip: initial,
+        message: "reflog owner landing",
+        runId: "run-reflog-owner",
+      },
+      {
+        runGit: (origin, args) => {
+          commands.push([...args]);
+          return rawGit(origin, args);
+        },
+        emitEvent: () => undefined,
+      },
+    );
+
+    assert.equal(result.status, "landed");
+    if (result.status !== "landed") return;
+    const advance = commands.find(
+      (args) => args[0] === "update-ref" && args[3] === "refs/heads/main" && args[5] === initial,
+    );
+    assert.ok(advance, "owner-checkout target advance update-ref must be recorded");
+    assert.equal(advance[1], "-m");
+    const message = advance[2] ?? "";
+    assert.match(message, /^tamandua: merge\.landed run=run-reflog-owner tree=/);
+    assert.ok(message.includes(result.mergedTree), `message must contain the merged tree: ${message}`);
+    // The landing actually wrote the structured entry into the target's reflog.
+    const reflogSubjects = git(repo, ["reflog", "show", "--format=%gs", "refs/heads/main"]).split("\n");
+    assert.equal(reflogSubjects[0], message);
+  });
+
+  it("TATR writes a structured reflog message on the bare-origin target advance", () => {
+    const { repo, initial } = createRepo();
+    createFeature(repo);
+    const bare = tamanduaTempDir("tamandua-merge-branch-reflog-bare-");
+    cleanup.push(bare);
+    git(bare, ["clone", "--bare", repo, "."]);
+    const commands: string[][] = [];
+
+    const result = runPlumbingMerge(
+      {
+        origin: bare,
+        branch: "feature",
+        into: "main",
+        expectTip: initial,
+        message: "reflog bare landing",
+        runId: "run-reflog-bare",
+      },
+      {
+        runGit: (origin, args) => {
+          commands.push([...args]);
+          return rawGit(origin, args);
+        },
+        emitEvent: () => undefined,
+      },
+    );
+
+    assert.equal(result.status, "landed");
+    if (result.status !== "landed") return;
+    const advance = commands.find(
+      (args) => args[0] === "update-ref" && args[3] === "refs/heads/main" && args[5] === initial,
+    );
+    assert.ok(advance, "bare-origin target advance update-ref must be recorded");
+    assert.equal(advance[1], "-m");
+    const message = advance[2] ?? "";
+    assert.match(message, /^tamandua: merge\.landed run=run-reflog-bare tree=/);
+    assert.ok(message.includes(result.mergedTree), `message must contain the merged tree: ${message}`);
+  });
+
   it("uses only guarded plumbing commands against the origin", () => {
     const commands: string[][] = [];
     const expected = "1".repeat(40);
@@ -1274,7 +1350,7 @@ describe("runPlumbingMerge", () => {
     ];
 
     const result = runPlumbingMerge(
-      { origin: "/origin", branch: "feature", into: "release", expectTip: expected, message: "plumbing only" },
+      { origin: "/origin", branch: "feature", into: "release", expectTip: expected, message: "plumbing only", runId: "" },
       {
         runGit: (_origin, args) => {
           commands.push(args);
@@ -1293,7 +1369,7 @@ describe("runPlumbingMerge", () => {
       ["merge-base", "--is-ancestor", "4".repeat(40), expected],
       ["merge-tree", "--write-tree", expected, "refs/heads/feature"],
       ["commit-tree", tree, "-p", expected, "-m", "plumbing only"],
-      ["update-ref", "refs/heads/release", commit, expected],
+      ["update-ref", "-m", `tamandua: merge.landed (manual) tree=${tree}`, "refs/heads/release", commit, expected],
     ]);
     assert.equal(
       commands.some((args) =>

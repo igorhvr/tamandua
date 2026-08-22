@@ -77,21 +77,56 @@ payload shape of `run.completed`/`run.failed` (`emitRunTerminalEvent`,
 `tokensSpent`, `workerLostCount` — plus a `reason` field carrying the
 stop source (`"cli-stop"` by default).
 
-**Ordering guarantee (CNEV):** `run.canceled` is emitted AFTER all cancel
-bookkeeping (pending/running steps marked canceled, run row updated,
-`removeRunCrons`/`terminateRunWithDaemon` settled,
-`scheduleRunCronTeardown` called), so it is the LAST event of the run in
-the common path — the run's event file ends on a terminal record instead
-of just stopping.
+**Ordering guarantee (CNEV + TATR US-006):** `run.canceled` is emitted
+AFTER all cancel bookkeeping (pending/running steps marked canceled, run
+row updated, `removeRunCrons`/`terminateRunWithDaemon` settled,
+`scheduleRunCronTeardown` called) AND after the in-flight token
+attribution settle, so it is the LAST event of the run in the common path
+— the run's event file ends on a terminal record instead of just
+stopping, with no trailing `run.tokens.updated`.
 
-**Known caveat (CNEV, explicitly OUT of scope):** a straggling async
-`run.tokens.updated` flush from an in-flight work round (the TATR
-token-attribution race) can still land AFTER `run.canceled`, because
-`emitEvent` writes are independent of the dispatch round's token
-attribution. Fixing that race is out of scope for CNEV; the DB
-`runs.tokens_spent` total remains eventually correct. Event consumers
-must treat `run.canceled` as terminal even if a late token update trails
-it (and see C15 for the completed/failed analog of this caveat).
+**Settle-before-terminal (TATR US-005 + US-006):** the control-plane terminate
+handler (`handleTerminateRun`, `src/server/control-server.ts`) no longer
+kills in-flight work immediately for canceled runs (or terminate requests
+carrying `settle: true`). It removes the run's scheduling timers
+(`removeRunCrons` with `HARNESS_TEARDOWN_GRACE_MS`) and then awaits
+`settleRunInFlightRounds` (`src/installer/agent-scheduler.ts`), which
+waits up to the grace window for every in-flight round's post-round token
+attribution to finish. Each dispatch round registers a completion signal
+that fires only in its `finally`, AFTER `attributeWorkRoundTokenUsage`
+has emitted `run.tokens.updated`, and the signal survives the
+`removeRunCrons` bookkeeping wipe — so a terminate on a canceled run
+returns only after the settled deltas are on disk (`runs.tokens_spent`
+and the event stream). The cancel path (`stopWorkflow`,
+`src/installer/status.ts`, US-006) then emits `run.canceled` ONLY after
+the settle: it grants the same grace window to its in-process
+`removeRunCrons`, passes a settle-sized timeout to
+`terminateRunWithDaemon` (a successful response means the daemon already
+settled), and when the daemon is unreachable falls back to a bounded
+in-process `settleRunInFlightRounds` before emitting the terminal event.
+Rounds that outlive the grace window are reported as still in flight and
+are reaped by `removeRunCrons`'s delayed leak guard; a late flush from
+such a round is a post-terminal event (see C15). Pinned by
+`src/installer/agent-scheduler.test.ts` (settle semantics: settles within
+grace, times out without hanging, survives removeRunCrons),
+`src/server/control-server.test.ts` (canceled-run terminate returns only
+after attribution lands), and `src/installer/status.test.ts` (stopWorkflow
+with an in-flight round: `run.canceled` is the final event, no
+`run.tokens.updated` trails it, and its `tokensSpent` includes the settled
+delta). Pause/resume and completed/failed cleanup behavior are unchanged.
+
+**Known caveat (CNEV, TATR race resolved for `run.canceled` by US-006):**
+the straggling-async-`run.tokens.updated` race is now handled for the
+cancel path — `stopWorkflow` settles in-flight token attribution before
+emitting `run.canceled`, so no attribution event trails the terminal event
+in the common path. A round that outlives the settle grace window is
+reaped by `removeRunCrons`'s delayed leak guard, and any flush it manages
+to emit afterwards is a post-terminal `run.tokens.updated` carrying
+`postTerminal: true` + `terminalStatus` (TATR US-007) — consumers may
+subscribe to those (see C15 and the post-terminal contract) instead of
+stopping at the terminal event. The DB `runs.tokens_spent` total remains
+eventually correct; event consumers must treat `run.canceled` as terminal
+even if an exceptional late token update trails it.
 
 | Consumer | Location | `run.canceled` handling |
 | --- | --- | --- |
@@ -550,21 +585,76 @@ a human can clean them up. Remedy text: `Manual cleanup: kill <pid>`.
 ### Token accounting
 
 - **C14** Model usage from *work* is attributed to `runs.tokens_spent`
-  (via `message_end.usage` + run/step IDs from tool outputs, falling back to
-  the dispatch job's own runId), emitting `run.tokens.updated` events with
-  `tokenDelta`/`tokensSpent`.
+  (via `message_end.usage`), emitting `run.tokens.updated` events with
+  `tokenDelta`/`tokensSpent`. **Dispatch-run attribution is authoritative
+  (TATR US-008):** the delta is ALWAYS attributed to the dispatch job's
+  own runId — the run the round was spawned for and therefore the run
+  that actually spent the tokens. Run/step IDs parsed from tool outputs
+  (`metadata_run_id` / step lookup) are advisory only and never redirect
+  attribution; when such an id names a different (sibling/nested) run, a
+  warning with reason `cross_run_metadata_hijack` is logged (naming both
+  ids) and the delta still lands on the dispatch run. The resolved id is
+  used only for genuinely runless invocations (job.runId unavailable —
+  never in the dispatch path). `run.tokens.updated` events also carry
+  `stepId` (from stream metadata, when known) and `roundId` (= the
+  dispatch job id) so consumers can trace a delta to the exact worker
+  round that spent it.
 - **C15** Terminal run events (`run.completed`/`run.failed`/`run.canceled`)
-  carry `tokensSpent`. Caveat (inherent to the event ordering): the FINAL
-  round's usage is parsed only after the harness exits, i.e. after the
-  terminal event fired — so the event's `tokensSpent` can under-report by
-  the final round (a single-step run reports 0). `run.canceled` has the
-  same shape: it is emitted after the cancel bookkeeping (last event of
-  the run in the common path — see the run.canceled audit section above),
-  so a straggling async `run.tokens.updated` from an in-flight work round
-  (the TATR attribution race) can still trail it; that race is explicitly
-  out of scope for CNEV. `runs.tokens_spent` in the DB is the
-  eventually-correct total; tests must wait for it (`waitForRunWorkTokens`
-  in e2e-helpers) rather than race it.
+  carry `tokensSpent`. Caveat (inherent to the event ordering): for
+  `run.completed`/`run.failed` the FINAL round's usage is parsed only
+  after the harness exits, i.e. after the terminal event fired — so the
+  event's `tokensSpent` can under-report by the final round (a single-step
+  run reports 0). `run.canceled` does NOT have this gap anymore: the
+  cancel path settles in-flight token attribution BEFORE emitting the
+  terminal event (TATR US-006 — see the run.canceled audit section above),
+  so `run.canceled` is the final event of the run with no trailing
+  `run.tokens.updated` in the common path, and its `tokensSpent` includes
+  the settled in-flight delta. In exceptional cases a round may outlive
+  the settle grace window and flush after the terminal event; that late
+  flush is a post-terminal `run.tokens.updated` (consumers may subscribe
+  to it — it never re-opens a terminal run). **Post-terminal flush
+  identity (TATR US-007):** any `run.tokens.updated` attributed when the
+  run's DB status is already terminal (`completed`/`failed`/`canceled`)
+  carries `postTerminal: true` plus `terminalStatus: <status>`; consumers
+  that stop reading at the terminal event can therefore subscribe to
+  post-terminal token events instead of missing the delta. Non-terminal
+  updates carry neither field. `runs.tokens_spent` in the DB is the
+  eventually-correct total; tests must wait for it
+  (`waitForRunWorkTokens` in e2e-helpers) rather than race it.
+
+### Run identity in the event stream (TATR)
+
+Run identity is threaded through the scheduler harness env and the
+workflow/merge CLIs so every consumer can attribute work — token deltas,
+merge landings, and nested run launches — to the run that actually
+performed it.
+
+- **Merge event run identity (TATR US-003/US-010):** `merge.landed` and
+  other `merge.*` events emitted by `merge-branch`
+  (`src/installer/merge-branch.ts`) carry the run id that performed the
+  merge, resolved as `params.runId ?? process.env.TAMANDUA_RUN_ID ?? ""`.
+  The scheduler sets `TAMANDUA_RUN_ID` in every worker round's harness env
+  (`src/installer/agent-scheduler.ts`), so any `merge-branch` invocation
+  inside a run is run-attributed automatically; `--run-id` is available
+  for explicit threading (e.g. scripted merge tooling and e2e tests).
+  Run-scoped merge events land in `events/<runId>.jsonl` AND
+  `events/all.jsonl`. A genuinely runless manual merge (no `--run-id`, no
+  env) emits `runId: ""` and lands only in `events/.jsonl` (the empty-id
+  stream). The target-advancing `git update-ref` carries a structured
+  reflog message (`tamandua: merge.landed run=<id> tree=<oid>`, or
+  `(manual)` for runless merges) so the reflog is self-describing and
+  parsers need no special-casing. Pinned by
+  `tests/merge-event-identity.test.ts`.
+- **Parent/child run linkage (TATR US-009):** `runWorkflow`
+  (`src/installer/run.ts`) accepts an optional `parentRunId`; the workflow
+  CLI (`tamandua workflow run`) derives it from `TAMANDUA_RUN_ID`, so a
+  nested workflow launch inside a worker round records the spawning run.
+  It is persisted as `runs.parent_run_id` (NULL for parentless runs) and
+  carried on `run.started` as `parentRunId` (the key is omitted entirely
+  for parentless runs), so graph consumers can discover child runs from
+  their parent through the DB column or the event stream. Pinned by
+  `src/installer/run.test.ts` and
+  `tests/cli-workflow-run-parent-linkage.test.ts`.
 
 ### Workspace
 

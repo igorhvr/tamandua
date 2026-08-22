@@ -33,6 +33,12 @@ export function formatLogsTailTime(ts: string): string {
 }
 
 export function formatLogsTailLabel(evt: TamanduaEvent): string {
+  // TATR US-007: a post-terminal token flush (run DB status already
+  // terminal at attribution time) gets a distinct label so operators can
+  // tell a late flush from a regular in-run token update at a glance.
+  if (evt.event === "run.tokens.updated" && evt.postTerminal === true) {
+    return "Token spend updated (post-terminal)";
+  }
   return EVENT_LABELS[evt.event] ?? evt.event;
 }
 

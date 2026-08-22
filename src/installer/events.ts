@@ -43,6 +43,35 @@ export interface TamanduaEvent {
   abandonedCount?: number;
   tokenDelta?: number;
   tokensSpent?: number;
+  /**
+   * TATR US-007: explicit post-terminal flush identity. True when the
+   * run's DB status was already terminal ('completed'/'failed'/'canceled')
+   * at the moment this token flush was attributed — i.e. the flush landed
+   * after the run's terminal event, or in a settle path where the run was
+   * marked terminal before the flush. Consumers that stop reading at the
+   * terminal event may subscribe to post-terminal events instead; see
+   * tests/MOTOR-CONTRACT.md (token accounting, C15).
+   */
+  postTerminal?: boolean;
+  /** The run's terminal DB status at attribution time ('completed'/'failed'/'canceled'); present iff postTerminal is true. */
+  terminalStatus?: string;
+  /**
+   * TATR US-008: the dispatch round (job) that actually spent the tokens
+   * attributed by a run.tokens.updated event. Always present on token
+   * events emitted by the scheduler — it names the round whose harness
+   * invocation produced the usage, so consumers can trace a delta to the
+   * exact worker round that spent it.
+   */
+  roundId?: string;
+  /**
+   * TATR US-009: the run id of the run that spawned this child run (parent
+   * linkage). Present on run.started (and any other event that carries it)
+   * when the run was launched inside a parent run's worker round — the
+   * workflow CLI derives it from the TAMANDUA_RUN_ID env var the scheduler
+   * sets. Runs launched without a parent omit the field entirely; see
+   * tests/MOTOR-CONTRACT.md (run identity, parent linkage).
+   */
+  parentRunId?: string;
   // Suite-specific fields (US-009)
   treeHash?: string;
   cmdDisplay?: string;

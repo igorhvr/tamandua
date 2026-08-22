@@ -669,10 +669,15 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
         const mergeEvents = events.filter(
           (event) => String(event.event).startsWith("merge.") && event.event !== "merge.gate_overridden",
         );
-        assert.deepEqual(mergeEvents.map((event) => event.event), ["merge.target_moved", "merge.landed"]);
+        // The contention-marker advance (first merger command) runs inside the
+        // run's worker round, so with TAMANDUA_RUN_ID propagated in the harness
+        // env (US-002) its landing is attributed to the run as well: the stream
+        // carries [marker merge.landed, merge.target_moved, merge.landed].
+        assert.deepEqual(mergeEvents.map((event) => event.event), ["merge.landed", "merge.target_moved", "merge.landed"]);
 
-        const moved = mergeEvents[0];
-        const landed = mergeEvents[1];
+        const markerLanding = mergeEvents[0];
+        const moved = mergeEvents[1];
+        const landed = mergeEvents[2];
         const markerTip = execSync(`git rev-parse "refs/heads/${originalBranch}^"`, {
           cwd: repoDir,
           encoding: "utf-8",
@@ -685,11 +690,19 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
           cwd: repoDir,
           encoding: "utf-8",
         }).trim();
+        // Every merge landing in this run is attributed to the run (TATR facet 1).
         for (const event of mergeEvents) {
           assert.equal(event.runId, runId);
           assert.equal(event.origin, repoDir);
-          assert.equal(event.branch, BRANCH);
           assert.equal(event.target, `refs/heads/${originalBranch}`);
+        }
+        // The marker landing is a run-attributed merge of the contention branch.
+        assert.equal(markerLanding.branch, "cdet-target-marker");
+        assert.equal(markerLanding.expectedTip, initialTip);
+        assert.equal(markerLanding.mergedCommit, markerTip);
+        // The feature landing flow (target-moved probe + final landing) is the BRANCH merge.
+        for (const event of [moved, landed]) {
+          assert.equal(event.branch, BRANCH);
         }
         assert.equal(moved.expectedTip, initialTip);
         assert.equal(moved.actualTip, markerTip);

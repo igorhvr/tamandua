@@ -150,6 +150,30 @@ waiting → pending → running → done/failed
   Use `tamandua workflow resume <run-id>` to reattempt a permanently
   failed run; fix the underlying issue before resuming.
 
+### Merge-branch run identity (TATR)
+
+`tamandua merge-branch` (src/cli/commands/merge-branch.ts →
+`runPlumbingMerge` in src/installer/merge-branch.ts) attributes every
+`merge.landed` / `merge.target_moved` / `merge.conflicts` event to a run
+id resolved as `params.runId ?? process.env.TAMANDUA_RUN_ID ?? ''`:
+
+- The scheduler sets `TAMANDUA_RUN_ID` in every worker round's harness
+  env (src/installer/agent-scheduler.ts), so any `merge-branch`
+  invocation inside a run is run-attributed automatically; the
+  `finalize_merge` step context also threads `--run-id` explicitly.
+- Run-scoped events land in `events/<runId>.jsonl` AND `events/all.jsonl`;
+  a genuinely runless manual merge (no `--run-id`, no env) emits
+  `runId: ""` and lands only in `events/.jsonl` (the empty-id stream).
+- The target-advancing `git update-ref` carries `-m` with a structured
+  reflog message (`tamandua: merge.landed run=<id> tree=<oid>`, or
+  `(manual)` for runless merges) — see `targetAdvanceReflogMessage`.
+- Gotcha for scripted e2e (`e2e-tests/workflows-scripted.test.ts`):
+  merge-branch commands run inside a worker round now inherit
+  `TAMANDUA_RUN_ID`, so landings that previously were runless (e.g. a
+  contention-marker advance simulating an external actor) are
+  run-attributed and appear in `events/<runId>.jsonl` — index-based
+  merge-event assertions must account for them.
+
 ### CLI Help Convention
 
 Every CLI command and subcommand supports `--help` / `-h` through a shared infrastructure

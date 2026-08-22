@@ -38,6 +38,15 @@ export interface RunWorkflowParams {
   harnessType?: HarnessType;
   /** When true, suppresses automatic replacement-run launch after a rugpull is detected */
   noRelaunchUponRugpull?: boolean;
+  /**
+   * TATR US-009: the run id of the run that spawned this child run (parent
+   * linkage). Persisted into runs.parent_run_id and carried on the
+   * run.started event so graph consumers can discover the parent. The
+   * workflow CLI derives it from the TAMANDUA_RUN_ID env var the scheduler
+   * sets for worker rounds; invocations launched outside a run (manual CLI
+   * launches) leave it unset, and the run row then stores NULL.
+   */
+  parentRunId?: string;
 }
 
 export interface RunWorkflowResult {
@@ -115,6 +124,7 @@ export async function runWorkflow(
     noHurrySaveTokensMode,
     harnessType,
     noRelaunchUponRugpull,
+    parentRunId,
   } = params;
 
   // Load the workflow spec from the installed workflow directory
@@ -278,9 +288,9 @@ export async function runWorkflow(
     db.prepare(
       `INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent,
                          scheduling_status, scheduling_requested_at, notify_url,
-                         created_at, updated_at)
-       VALUES (?, (SELECT COALESCE(MAX(run_number), 0) + 1 FROM runs), ?, ?, 'running', ?, 0, 'pending_register', ?, ?, ?, ?)`,
-    ).run(runId, workflowId, taskTitle, contextJson, now, notifyUrl ?? null, now, now);
+                         parent_run_id, created_at, updated_at)
+       VALUES (?, (SELECT COALESCE(MAX(run_number), 0) + 1 FROM runs), ?, ?, 'running', ?, 0, 'pending_register', ?, ?, ?, ?, ?)`,
+    ).run(runId, workflowId, taskTitle, contextJson, now, notifyUrl ?? null, parentRunId ?? null, now, now);
     runPersisted = true;
 
     // Read back the atomically allocated run_number.
@@ -317,9 +327,9 @@ export async function runWorkflow(
     db.prepare(
       `INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent,
                          scheduling_status, scheduling_requested_at, notify_url,
-                         created_at, updated_at)
-       VALUES (?, (SELECT COALESCE(MAX(run_number), 0) + 1 FROM runs), ?, ?, 'running', ?, 0, 'pending_register', ?, ?, ?, ?)`,
-    ).run(runId, workflowId, taskTitle, initialContextJson, now, notifyUrl ?? null, now, now);
+                         parent_run_id, created_at, updated_at)
+       VALUES (?, (SELECT COALESCE(MAX(run_number), 0) + 1 FROM runs), ?, ?, 'running', ?, 0, 'pending_register', ?, ?, ?, ?, ?)`,
+    ).run(runId, workflowId, taskTitle, initialContextJson, now, notifyUrl ?? null, parentRunId ?? null, now, now);
     runPersisted = true;
 
     // Read back the atomically allocated run_number.
@@ -452,6 +462,7 @@ export async function runWorkflow(
     event: "run.started",
     runId,
     workflowId,
+    ...(parentRunId ? { parentRunId } : {}),
     detail: `Run #${runNumber}: ${taskTitle}`,
   });
 
