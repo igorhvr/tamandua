@@ -63,6 +63,10 @@ const CASES = [
   { name: 'o11-campaign7-w317b-loop-retry-rejection', expected: 'PASS', campaign7: { variant: 'w317b' } },
   { name: 'o11-campaign7-w319-loop-retry-rejection', expected: 'PASS', campaign7: { variant: 'w319' } },
   { name: 'o11-campaign7-nonloop-retry-seal', expected: 'FAIL', campaign7: { variant: 'nonloop' }, finding: 'O11_COMPLETED_FROM_RETRY_VERDICT' },
+  { name: 'o11-retry-then-done', expected: 'PASS', retryCorridor: { action: 'retry' } },
+  { name: 'o11-reroute-then-done', expected: 'PASS', retryCorridor: { action: 'reroute' } },
+  { name: 'o11-retry-done-transition', expected: 'FAIL', retryCorridor: { action: 'done' }, finding: 'O11_COMPLETED_FROM_RETRY_VERDICT' },
+  { name: 'o11-rerouted-two-dispatches', expected: 'PASS', twoDispatches: true },
 ];
 
 function bare(runId) { return runId.slice(4); }
@@ -227,6 +231,108 @@ function campaign7ContractEvidence(fixture) {
   return { validations, rejections, renderings: [] };
 }
 
+// S22A legal re-dispatch corridors on a non-loop step:
+//  - retryCorridor action 'retry' (honest single-step retry): accepted retry
+//    verdict, transition.action='retry', step re-dispatched, later separate
+//    accepted done -> the seal must NOT fire and done-multiplicity is
+//    per-dispatch (PASS).
+//  - retryCorridor action 'reroute' (RTRV on_fail.retry_step reroute):
+//    transition.action='reroute', re-execution with its own accepted done ->
+//    seal must NOT fire (PASS).
+//  - retryCorridor action 'done': the accepted retry verdict itself moved the
+//    step to done, with no later accepted done -> the seal fires (FAIL).
+// The consumer step carries two dispatch renderings (one per dispatch) so the
+// later accepted done belongs to a fresh dispatch and is legal.
+function retryCorridorEvidence(fixture) {
+  const action = fixture.retryCorridor.action;
+  const hasLaterDone = action !== 'done';
+  const validations = [
+    {
+      id: 'validation-producer-1', observed_at: '2026-08-01T12:00:05.000Z',
+      run_id: RUN_A, step_row_id: 'row-producer', step_id: 'producer', claim_id: 'claim-producer-1',
+      attempt_number: 1, outcome: 'accepted', verdict: 'done', expects_required: true,
+      required_keys: ['STATUS', 'ARTIFACT'], missing_keys: [], invalid_keys: [], key_sources: [],
+      diagnostic_code: 'EXPECTS_SATISFIED', transition: { action: 'done', target_step_row_id: 'row-producer' },
+    },
+    {
+      id: 'validation-consumer-retry', observed_at: '2026-08-01T12:00:06.000Z',
+      run_id: RUN_A, step_row_id: 'row-consumer', step_id: 'consumer', claim_id: 'claim-consumer-1',
+      attempt_number: 1, outcome: 'accepted', verdict: 'retry', expects_required: true,
+      required_keys: ['STATUS', 'CHANGES', 'TESTS'], missing_keys: [], invalid_keys: [], key_sources: [],
+      diagnostic_code: 'EXPECTS_SATISFIED', transition: { action, target_step_row_id: 'row-consumer' },
+    },
+  ];
+  if (hasLaterDone) {
+    validations.push({
+      id: 'validation-consumer-done', observed_at: '2026-08-01T12:00:09.000Z',
+      run_id: RUN_A, step_row_id: 'row-consumer', step_id: 'consumer', claim_id: 'claim-consumer-1',
+      attempt_number: 2, outcome: 'accepted', verdict: 'done', expects_required: true,
+      required_keys: ['STATUS', 'CHANGES', 'TESTS'], missing_keys: [], invalid_keys: [], key_sources: [],
+      diagnostic_code: 'EXPECTS_SATISFIED', transition: { action: 'done', target_step_row_id: 'row-consumer' },
+    });
+  }
+  const renderings = [
+    { id: 'render-producer-1', observed_at: '2026-08-01T12:00:04.000Z', run_id: RUN_A, step_row_id: 'row-producer', step_id: 'producer', claim_id: 'claim-producer-1', required_keys: [], unresolved_placeholder_count: 0, unresolved_keys: [] },
+    {
+      id: 'render-consumer-1', observed_at: '2026-08-01T12:00:05.500Z', run_id: RUN_A,
+      step_row_id: 'row-consumer', step_id: 'consumer', claim_id: 'claim-consumer-1', required_keys: ['ARTIFACT'],
+      unresolved_placeholder_count: 0, unresolved_keys: [], dispatched: true, producer_step_row_id: 'row-producer', transition: null,
+    },
+  ];
+  if (hasLaterDone) {
+    renderings.push({
+      id: 'render-consumer-2', observed_at: '2026-08-01T12:00:08.000Z', run_id: RUN_A,
+      step_row_id: 'row-consumer', step_id: 'consumer', claim_id: 'claim-consumer-1', required_keys: ['ARTIFACT'],
+      unresolved_placeholder_count: 0, unresolved_keys: [], dispatched: true, producer_step_row_id: 'row-producer', transition: null,
+    });
+  }
+  return { validations, rejections: [], renderings };
+}
+
+// S22A reroute re-execution: a non-loop step legally re-executes across TWO
+// dispatches (reroute corridor), each dispatch carrying its own accepted done.
+// Done-multiplicity is per-dispatch, so two accepted dones across two
+// dispatches must PASS (no O11_DONE_WITHOUT_EXPECTS_SUCCESS).
+function twoDispatchesEvidence() {
+  const validations = [
+    {
+      id: 'validation-producer-1', observed_at: '2026-08-01T12:00:05.000Z',
+      run_id: RUN_A, step_row_id: 'row-producer', step_id: 'producer', claim_id: 'claim-producer-1',
+      attempt_number: 1, outcome: 'accepted', verdict: 'done', expects_required: true,
+      required_keys: ['STATUS', 'ARTIFACT'], missing_keys: [], invalid_keys: [], key_sources: [],
+      diagnostic_code: 'EXPECTS_SATISFIED', transition: { action: 'done', target_step_row_id: 'row-producer' },
+    },
+    {
+      id: 'validation-consumer-1', observed_at: '2026-08-01T12:00:06.000Z',
+      run_id: RUN_A, step_row_id: 'row-consumer', step_id: 'consumer', claim_id: 'claim-consumer-1',
+      attempt_number: 1, outcome: 'accepted', verdict: 'done', expects_required: true,
+      required_keys: ['STATUS', 'CHANGES', 'TESTS'], missing_keys: [], invalid_keys: [], key_sources: [],
+      diagnostic_code: 'EXPECTS_SATISFIED', transition: { action: 'done', target_step_row_id: 'row-consumer' },
+    },
+    {
+      id: 'validation-consumer-2', observed_at: '2026-08-01T12:00:09.000Z',
+      run_id: RUN_A, step_row_id: 'row-consumer', step_id: 'consumer', claim_id: 'claim-consumer-1',
+      attempt_number: 2, outcome: 'accepted', verdict: 'done', expects_required: true,
+      required_keys: ['STATUS', 'CHANGES', 'TESTS'], missing_keys: [], invalid_keys: [], key_sources: [],
+      diagnostic_code: 'EXPECTS_SATISFIED', transition: { action: 'done', target_step_row_id: 'row-consumer' },
+    },
+  ];
+  const renderings = [
+    { id: 'render-producer-1', observed_at: '2026-08-01T12:00:04.000Z', run_id: RUN_A, step_row_id: 'row-producer', step_id: 'producer', claim_id: 'claim-producer-1', required_keys: [], unresolved_placeholder_count: 0, unresolved_keys: [] },
+    {
+      id: 'render-consumer-1', observed_at: '2026-08-01T12:00:05.500Z', run_id: RUN_A,
+      step_row_id: 'row-consumer', step_id: 'consumer', claim_id: 'claim-consumer-1', required_keys: ['ARTIFACT'],
+      unresolved_placeholder_count: 0, unresolved_keys: [], dispatched: true, producer_step_row_id: 'row-producer', transition: null,
+    },
+    {
+      id: 'render-consumer-2', observed_at: '2026-08-01T12:00:08.000Z', run_id: RUN_A,
+      step_row_id: 'row-consumer', step_id: 'consumer', claim_id: 'claim-consumer-1', required_keys: ['ARTIFACT'],
+      unresolved_placeholder_count: 0, unresolved_keys: [], dispatched: true, producer_step_row_id: 'row-producer', transition: null,
+    },
+  ];
+  return { validations, rejections: [], renderings };
+}
+
 for (const fixture of CASES) {
   const campaign = path.join(workspace, fixture.name);
   const snapshots = path.join(campaign, 'snapshots');
@@ -257,7 +363,11 @@ for (const fixture of CASES) {
   const sumA = events.filter((row) => row.event.runId === RUN_A).reduce((sum, row) => sum + row.event.tokenDelta, 0);
   const sumB = events.filter((row) => row.event.runId === RUN_B).reduce((sum, row) => sum + row.event.tokenDelta, 0);
   const storedA = fixture.storedA ?? sumA;
-  const outputContract = fixture.campaign7 ? campaign7ContractEvidence(fixture) : (fixture.loop ? loopContractEvidence(fixture) : outputContractEvidence(fixture));
+  const outputContract = fixture.campaign7 ? campaign7ContractEvidence(fixture)
+    : fixture.loop ? loopContractEvidence(fixture)
+    : fixture.retryCorridor ? retryCorridorEvidence(fixture)
+    : fixture.twoDispatches ? twoDispatchesEvidence()
+    : outputContractEvidence(fixture);
   const databasePath = path.join(snapshots, 'database.sqlite');
   const database = new DatabaseSync(databasePath);
   database.exec(`CREATE TABLE runs (id TEXT PRIMARY KEY, status TEXT NOT NULL, tokens_spent INTEGER NOT NULL);

@@ -11,6 +11,9 @@ import test from 'node:test';
 import {
   beginOracleEvidenceSnapshot,
   completeOracleEvidenceSnapshot,
+  parseTargetReflogLine,
+  projectExpectsValidations,
+  projectSubmitRejections,
 } from './oracle-evidence-snapshot.mjs';
 import { ORACLE_EVIDENCE_KEYS } from './oracle-context.mjs';
 import { evaluateO9 } from '../oracles/lib/o9.mjs';
@@ -632,4 +635,135 @@ test('survives a null gate key with event-carried origins only', () => {
   } finally {
     fs.rmSync(data.root, { recursive: true, force: true });
   }
+});
+
+// ── S20 (US-001): target-reflog capture parser tolerates message-less lines ──
+//
+// The landing update-ref writes reflog entries with NO message segment
+// ("<old> <new> <identity> <ts> <tz>"). The parser must still extract the
+// before/after OIDs, identity, timestamp and timezone from such lines; the
+// \t<message> tail is optional. Truly unparseable lines stay archived as
+// { raw } exactly as before.
+
+test('S20: a message-less target-reflog line parses to oids/actor/timestamp/timezone with no action', () => {
+  const line = 'b919c0981b5f7b167a6d8f87a07e85cd7075f415 4f5613be5f89c45a251afdc74d2af6512b8467d3 Tamandua Torture Test <tt@tamandua.test> 1787385718 -0300';
+  assert.deepEqual(parseTargetReflogLine(line), {
+    old_oid: 'b919c0981b5f7b167a6d8f87a07e85cd7075f415',
+    new_oid: '4f5613be5f89c45a251afdc74d2af6512b8467d3',
+    actor: 'Tamandua Torture Test <tt@tamandua.test>',
+    timestamp: 1787385718,
+    timezone: '-0300',
+    raw: line,
+  });
+});
+
+test('S20: a message-bearing target-reflog line still parses exactly as before', () => {
+  const line = '0000000000000000000000000000000000000000 b919c0981b5f7b167a6d8f87a07e85cd7075f415 Igor Hjelmstrom Vinhas Ribeiro <igorhvr@iasylum.net> 1787385422 -0300\tclone: from /home/igorhvr/idm/tamandua/torture-test/var/fixtures/golden/tt-python@master.git';
+  assert.deepEqual(parseTargetReflogLine(line), {
+    old_oid: '0000000000000000000000000000000000000000',
+    new_oid: 'b919c0981b5f7b167a6d8f87a07e85cd7075f415',
+    actor: 'Igor Hjelmstrom Vinhas Ribeiro <igorhvr@iasylum.net>',
+    timestamp: 1787385422,
+    timezone: '-0300',
+    action: 'clone: from /home/igorhvr/idm/tamandua/torture-test/var/fixtures/golden/tt-python@master.git',
+    raw: line,
+  });
+});
+
+test('S20: a message-less line with a trailing tab parses with an empty action', () => {
+  const line = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb Some Actor <a@example.invalid> 1787385718 -0300\t';
+  assert.deepEqual(parseTargetReflogLine(line), {
+    old_oid: 'a'.repeat(40),
+    new_oid: 'b'.repeat(40),
+    actor: 'Some Actor <a@example.invalid>',
+    timestamp: 1787385718,
+    timezone: '-0300',
+    action: '',
+    raw: line,
+  });
+});
+
+test('S20: a truly unparseable target-reflog line is archived as { raw }', () => {
+  const line = 'this is not a reflog line at all';
+  assert.deepEqual(parseTargetReflogLine(line), { raw: line });
+});
+
+// ── S22B (US-002): shared attempt-number synthesis across both streams ──
+//
+// projectSubmitRejections and projectExpectsValidations previously kept
+// INDEPENDENT per-stream per-claim counters. On a rejected->accepted->rejected
+// sequence the second physical attempt received attempt number 2 in
+// submit_rejections but 3 in expects_validations (its rejected expects
+// validation), so O11's claim_id+attempt_number join flagged the same
+// physical event twice (O11_REJECTION_VALIDATION_MISMATCH +
+// O11_REJECTION_WITHOUT_VALIDATION). Both artifacts must now derive attempt
+// numbers from ONE shared per-claim counter over both streams in
+// chronological order.
+
+function submissionEvent(line, event) {
+  return { archive: 'all.jsonl', line, event };
+}
+
+test('S22B: a rejected->accepted->rejected sequence shares one per-claim attempt counter across both artifacts', () => {
+  const claimId = 'claim-tester';
+  const events = [
+    submissionEvent(1, { ts: '2026-08-01T12:00:01.000Z', event: 'step.submit.rejected', recordId: 'rejection-1', runId: RUN_ID, stepRowId: 'row-tester', stepId: 'step-tester', claimId, validationCode: 'EXPECTS_REJECTED', missingKeys: ['CHANGES'], invalidKeys: [], diagnosticCode: 'EXPECTS_MISSING_CHANGES' }),
+    submissionEvent(2, { ts: '2026-08-01T12:00:01.001Z', event: 'step.expects.validated', recordId: 'validation-1', runId: RUN_ID, stepRowId: 'row-tester', stepId: 'step-tester', claimId, outcome: 'rejected', verdict: null, expectsRequired: true, requiredKeys: ['STATUS', 'CHANGES', 'TESTS'], missingKeys: ['CHANGES'], invalidKeys: [], diagnosticCode: 'EXPECTS_MISSING_CHANGES', producerStepRowId: 'row-producer', transitionAction: 'retry', transitionTargetStepRowId: 'row-tester' }),
+    submissionEvent(3, { ts: '2026-08-01T12:00:02.000Z', event: 'step.expects.validated', recordId: 'validation-2', runId: RUN_ID, stepRowId: 'row-tester', stepId: 'step-tester', claimId, outcome: 'accepted', verdict: 'done', expectsRequired: true, requiredKeys: ['STATUS', 'CHANGES', 'TESTS'], missingKeys: [], invalidKeys: [], diagnosticCode: 'EXPECTS_SATISFIED', producerStepRowId: null, transitionAction: 'done', transitionTargetStepRowId: 'row-tester' }),
+    submissionEvent(4, { ts: '2026-08-01T12:00:03.000Z', event: 'step.submit.rejected', recordId: 'rejection-2', runId: RUN_ID, stepRowId: 'row-tester', stepId: 'step-tester', claimId, validationCode: 'EXPECTS_REJECTED', missingKeys: ['TESTS'], invalidKeys: [], diagnosticCode: 'EXPECTS_MISSING_TESTS' }),
+    submissionEvent(5, { ts: '2026-08-01T12:00:03.001Z', event: 'step.expects.validated', recordId: 'validation-3', runId: RUN_ID, stepRowId: 'row-tester', stepId: 'step-tester', claimId, outcome: 'rejected', verdict: null, expectsRequired: true, requiredKeys: ['STATUS', 'CHANGES', 'TESTS'], missingKeys: ['TESTS'], invalidKeys: [], diagnosticCode: 'EXPECTS_MISSING_TESTS', producerStepRowId: 'row-producer', transitionAction: 'retry', transitionTargetStepRowId: 'row-tester' }),
+  ];
+  const rejections = projectSubmitRejections(events);
+  const validations = projectExpectsValidations(events);
+
+  // Physical attempts: rejection 1 + its rejected validation = attempt 1,
+  // accepted validation = attempt 2, rejection 2 + its rejected validation = attempt 3.
+  assert.deepEqual(rejections.map((row) => row.attempt_number), [1, 3]);
+  assert.deepEqual(validations.map((row) => row.attempt_number), [1, 2, 3]);
+  assert.deepEqual(
+    validations.filter((row) => row.outcome === 'rejected').map((row) => row.attempt_number),
+    [1, 3],
+    'rejected expects validations must carry the SAME attempt numbers as their submit rejections',
+  );
+
+  // The O11_REJECTION_VALIDATION_MISMATCH / O11_REJECTION_WITHOUT_VALIDATION
+  // join is by claim_id + attempt_number — no mismatch pair may exist.
+  const rejectedValidations = validations.filter((row) => row.outcome === 'rejected');
+  for (const rejection of rejections) {
+    assert.ok(
+      rejectedValidations.some((row) => row.claim_id === rejection.claim_id
+        && row.attempt_number === rejection.attempt_number),
+      `rejection ${rejection.id} (attempt ${rejection.attempt_number}) must have a matching rejected validation`,
+    );
+  }
+  for (const validation of rejectedValidations) {
+    assert.ok(
+      rejections.some((row) => row.claim_id === validation.claim_id
+        && row.attempt_number === validation.attempt_number),
+      `rejected validation ${validation.id} (attempt ${validation.attempt_number}) must have a matching rejection`,
+    );
+  }
+});
+
+test('S22B: an explicit event.attemptNumber still wins and re-seeds the shared counter', () => {
+  const claimId = 'claim-explicit';
+  const events = [
+    submissionEvent(1, { ts: '2026-08-01T12:00:01.000Z', event: 'step.submit.rejected', recordId: 'rejection-1', runId: RUN_ID, stepRowId: 'row-1', stepId: 'step-1', claimId, attemptNumber: 7, validationCode: 'EXPECTS_REJECTED', missingKeys: ['CHANGES'], invalidKeys: [], diagnosticCode: 'EXPECTS_MISSING_CHANGES' }),
+    submissionEvent(2, { ts: '2026-08-01T12:00:01.001Z', event: 'step.expects.validated', recordId: 'validation-1', runId: RUN_ID, stepRowId: 'row-1', stepId: 'step-1', claimId, outcome: 'rejected', verdict: null, expectsRequired: true, requiredKeys: ['STATUS', 'CHANGES'], missingKeys: ['CHANGES'], invalidKeys: [], diagnosticCode: 'EXPECTS_MISSING_CHANGES', producerStepRowId: 'row-producer', transitionAction: 'retry', transitionTargetStepRowId: 'row-1' }),
+    submissionEvent(3, { ts: '2026-08-01T12:00:02.000Z', event: 'step.expects.validated', recordId: 'validation-2', runId: RUN_ID, stepRowId: 'row-1', stepId: 'step-1', claimId, outcome: 'accepted', verdict: 'done', expectsRequired: true, requiredKeys: ['STATUS', 'CHANGES'], missingKeys: [], invalidKeys: [], diagnosticCode: 'EXPECTS_SATISFIED', producerStepRowId: null, transitionAction: 'done', transitionTargetStepRowId: 'row-1' }),
+  ];
+  assert.deepEqual(projectSubmitRejections(events).map((row) => row.attempt_number), [7]);
+  assert.deepEqual(
+    projectExpectsValidations(events).map((row) => row.attempt_number), [7, 8],
+    'the shared counter continues from an explicit attemptNumber',
+  );
+});
+
+test('S22B: a standalone rejected validation without a preceding rejection still gets a consistent attempt number', () => {
+  const claimId = 'claim-standalone';
+  const events = [
+    submissionEvent(1, { ts: '2026-08-01T12:00:01.000Z', event: 'step.expects.validated', recordId: 'validation-1', runId: RUN_ID, stepRowId: 'row-1', stepId: 'step-1', claimId, outcome: 'rejected', verdict: null, expectsRequired: true, requiredKeys: ['STATUS'], missingKeys: ['STATUS'], invalidKeys: [], diagnosticCode: 'EXPECTS_MISSING_STATUS', producerStepRowId: 'row-producer', transitionAction: 'retry', transitionTargetStepRowId: 'row-1' }),
+  ];
+  assert.deepEqual(projectSubmitRejections(events), []);
+  assert.deepEqual(projectExpectsValidations(events).map((row) => row.attempt_number), [1]);
 });

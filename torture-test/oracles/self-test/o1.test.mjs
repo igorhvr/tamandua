@@ -44,7 +44,7 @@ test('O1 accepts converged DB/event/workflow evidence and catches every targeted
     const generated = spawnSync(process.execPath, [GENERATOR, workspace], { encoding: 'utf8', shell: false });
     assert.equal(generated.status, 0, generated.stderr);
     const names = fs.readdirSync(workspace).filter((name) => name.startsWith('o1-')).sort();
-    assert.equal(names.length, 24);
+    assert.equal(names.length, 25);
     for (const name of names) {
       const expectation = JSON.parse(fs.readFileSync(path.join(workspace, name, 'expectation.json'), 'utf8'));
       if (expectation.multiCase) continue; // covered by the dedicated multi-case test
@@ -115,45 +115,88 @@ test('O1 suppresses the duration-floor rate finding below four eligible family r
   }
 });
 
-test('O1 reports wave-family floor findings once via the manifest-order reporter and scopes run-citing findings to their owner', () => {
+test('O1 reports wave-family floor findings once via the last-manifest-order reporter and scopes run-citing findings to their owner', () => {
   fs.mkdirSync(VAR_ROOT, { recursive: true });
   const workspace = fs.mkdtempSync(path.join(VAR_ROOT, 'oracle-self-test.'));
   try {
     assert.equal(spawnSync(process.execPath, [GENERATOR, workspace], { encoding: 'utf8', shell: false }).status, 0);
     const campaign = path.join(workspace, 'o1-wave-family-reporter');
     const expectation = JSON.parse(fs.readFileSync(path.join(campaign, 'expectation.json'), 'utf8'));
-    const reporter = invokeContext(expectation.contexts.reporter);
-    const peer = invokeContext(expectation.contexts.peer);
+    const first = invokeContext(expectation.contexts.first);
+    const last = invokeContext(expectation.contexts.last);
 
-    // The reporter (first case_id in campaign.manifest.case_ids, deliberately
-    // alphabetically LAST) carries the family finding and the duplicate wave
-    // row finding for its own run.
-    assert.equal(reporter.status, 1);
-    assert.equal(reporter.response.result, 'FAIL');
-    const rate = reporter.response.findings.find((finding) => finding.id === 'O1_DURATION_FLOOR_RATE');
-    assert.ok(rate, JSON.stringify(reporter.response.findings));
+    // The FIRST case in campaign.manifest.case_ids is NOT the reporter
+    // (deliberately alphabetically LAST, so manifest rank — not name sort —
+    // decides): it carries no family finding, but it owns the duplicated wave
+    // row for its own run, so the run-scoped duplicate finding fails it.
+    assert.equal(first.status, 1);
+    assert.equal(first.response.result, 'FAIL');
+    assert.equal(first.response.findings.some((finding) => finding.id.startsWith('O1_DURATION_FLOOR')), false, JSON.stringify(first.response.findings));
+    assert.ok(first.response.findings.some((finding) => finding.id === 'O1_WAVE_RUN_DUPLICATE'), JSON.stringify(first.response.findings));
+
+    // The LAST case in manifest order is the wave-family reporter: it carries
+    // the family finding and NOT the sibling's run-scoped duplicate.
+    assert.equal(last.status, 1);
+    assert.equal(last.response.result, 'FAIL');
+    const rate = last.response.findings.find((finding) => finding.id === 'O1_DURATION_FLOOR_RATE');
+    assert.ok(rate, JSON.stringify(last.response.findings));
     assert.equal(rate.run_count, 5);
     assert.equal(rate.fast_run_count, 2);
     assert.equal(rate.fast_rate, 0.4);
-    assert.ok(reporter.response.findings.some((finding) => finding.id === 'O1_WAVE_RUN_DUPLICATE'), JSON.stringify(reporter.response.findings));
-
-    // The peer is not the reporter and does not own the duplicated run, so its
-    // result is clean: no family finding, no sibling run-citing finding.
-    assert.equal(peer.status, 0);
-    assert.equal(peer.response.result, 'PASS');
-    assert.equal(peer.response.findings.some((finding) => finding.id.startsWith('O1_DURATION_FLOOR')), false, JSON.stringify(peer.response.findings));
-    assert.equal(peer.response.findings.some((finding) => finding.id === 'O1_WAVE_RUN_DUPLICATE'), false, JSON.stringify(peer.response.findings));
+    assert.equal(last.response.findings.some((finding) => finding.id === 'O1_WAVE_RUN_DUPLICATE'), false, JSON.stringify(last.response.findings));
 
     // Duration floor observations stay in the evidence of BOTH cases — only
     // the findings list is deduplicated.
-    for (const [label, outcome] of [['reporter', reporter], ['peer', peer]]) {
-      const evidenceDir = path.dirname(label === 'reporter' ? expectation.contexts.reporter : expectation.contexts.peer);
+    for (const [label, outcome] of [['first', first], ['last', last]]) {
+      const evidenceDir = path.dirname(label === 'first' ? expectation.contexts.first : expectation.contexts.last);
       const observation = JSON.parse(fs.readFileSync(path.join(evidenceDir, outcome.response.evidence[0].path), 'utf8'));
       assert.equal(observation.duration_floor_observations.length, 1, label);
       assert.equal(observation.duration_floor_observations[0].run_count, 5, label);
       assert.equal(observation.duration_floor_observations[0].fast_run_count, 2, label);
       assert.equal(observation.duration_floor_observations[0].fast_rate, 0.4, label);
     }
+  } finally {
+    fs.rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test('O1 evaluates the wave-family floor guard from the last manifest case when the wave grows sequentially', () => {
+  fs.mkdirSync(VAR_ROOT, { recursive: true });
+  const workspace = fs.mkdtempSync(path.join(VAR_ROOT, 'oracle-self-test.'));
+  try {
+    assert.equal(spawnSync(process.execPath, [GENERATOR, workspace], { encoding: 'utf8', shell: false }).status, 0);
+    const campaign = path.join(workspace, 'o1-wave-family-sequential');
+    const expectation = JSON.parse(fs.readFileSync(path.join(campaign, 'expectation.json'), 'utf8'));
+    const first = invokeContext(expectation.contexts.first);
+    const last = invokeContext(expectation.contexts.last);
+
+    // The first manifest case's O1 saw a one-sample wave (< MIN_FLOOR_RATE_SAMPLE):
+    // the rate guard is suppressed there and the case stays PASS.
+    assert.equal(first.status, 0);
+    assert.equal(first.response.result, 'PASS');
+    assert.equal(first.response.findings.some((finding) => finding.id.startsWith('O1_DURATION_FLOOR')), false, JSON.stringify(first.response.findings));
+    const firstObservation = JSON.parse(fs.readFileSync(path.join(path.dirname(expectation.contexts.first), first.response.evidence[0].path), 'utf8'));
+    assert.equal(firstObservation.duration_floor_observations.length, 1);
+    assert.equal(firstObservation.duration_floor_observations[0].run_count, 1);
+    assert.equal(firstObservation.duration_floor_observations[0].fast_run_count, 0);
+
+    // The last manifest case's O1 saw the complete wave (5 runs, 3 fast):
+    // O1_DURATION_FLOOR_RATE fires exactly once, from this case.
+    assert.equal(last.status, 1);
+    assert.equal(last.response.result, 'FAIL');
+    const rates = last.response.findings.filter((finding) => finding.id === 'O1_DURATION_FLOOR_RATE');
+    assert.equal(rates.length, 1, JSON.stringify(last.response.findings));
+    assert.equal(rates[0].run_count, 5);
+    assert.equal(rates[0].fast_run_count, 3);
+    assert.equal(rates[0].fast_rate, 0.6);
+    assert.deepEqual(rates[0].run_ids, [
+      'run-wave-seq-peer-1', 'run-wave-seq-peer-2', 'run-wave-seq-peer-3',
+    ]);
+    const lastObservation = JSON.parse(fs.readFileSync(path.join(path.dirname(expectation.contexts.last), last.response.evidence[0].path), 'utf8'));
+    assert.equal(lastObservation.duration_floor_observations.length, 1);
+    assert.equal(lastObservation.duration_floor_observations[0].run_count, 5);
+    assert.equal(lastObservation.duration_floor_observations[0].fast_run_count, 3);
+    assert.equal(lastObservation.duration_floor_observations[0].fast_rate, 0.6);
   } finally {
     fs.rmSync(workspace, { recursive: true, force: true });
   }

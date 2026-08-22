@@ -37,7 +37,7 @@ test('O9 enforces replay, single-flight recovery, special exits, and independent
     const generated = spawnSync(process.execPath, [GENERATOR, workspace], { encoding: 'utf8', shell: false });
     assert.equal(generated.status, 0, generated.stderr);
     const names = fs.readdirSync(workspace).filter((name) => name.startsWith('o9-')).sort();
-    assert.equal(names.length, 35);
+    assert.equal(names.length, 36);
     for (const name of names) {
       const { expectation, response, status } = invokeFixture(workspace, name);
       assert.equal(response.result, expectation.expected, `${name}: ${JSON.stringify(response)}`);
@@ -60,6 +60,8 @@ test('O9 enforces replay, single-flight recovery, special exits, and independent
       assert.equal(typeof observation.origin_identity_count, 'number');
       assert.equal(typeof observation.skipped_foreign_rows, 'number');
       assert.deepEqual(observation.skipped_foreign_row_ids, expectation.skippedRows ? [2] : []);
+      assert.equal(typeof observation.skipped_stale_rows, 'number');
+      assert.deepEqual(observation.skipped_stale_row_ids, expectation.skippedStaleRows ? [2] : []);
     }
   } finally {
     fs.rmSync(workspace, { recursive: true, force: true });

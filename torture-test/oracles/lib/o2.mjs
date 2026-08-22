@@ -12,6 +12,14 @@ import {
 
 const OID = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
 
+// S20 (US-001): the target-ref reflog line grammar, with an OPTIONAL
+// \t<message> tail. The landing update-ref writes message-less entries
+// ("<old> <new> <identity> <ts> <tz>") and the capture parser archives them
+// raw-only when it cannot parse them; the raw line stays self-describing, so
+// the oracle re-parses it with the same grammar the capture parser now uses
+// (torture-test/bin/oracle-evidence-snapshot.mjs parseTargetReflogLine).
+const TARGET_REFLOG_LINE = /^(\S+) (\S+) (.+?) (\d+) ([+-]\d{4})(?:\t(.*))?$/;
+
 function object(value, label) {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     throw new OracleRuntimeError(`${label} must be a JSON object`);
@@ -84,7 +92,23 @@ function readReflog(file) {
     entries: array(artifact.entries, 'target_reflog.entries').map((entry, index) => {
       const row = object(entry, `target_reflog.entries[${index}]`);
       if (typeof row.raw !== 'string') throw new OracleRuntimeError(`target_reflog.entries[${index}].raw must be a string`);
-      if (row.old_oid === undefined || row.new_oid === undefined) return { ...row, parsed: false };
+      if (row.old_oid === undefined || row.new_oid === undefined) {
+        // S20: the raw line is self-describing — recover the transition when
+        // the capture parser archived it raw-only (message-less landing
+        // update-ref lines). A line that still does not parse stays raw-only.
+        const recovered = TARGET_REFLOG_LINE.exec(row.raw);
+        if (recovered === null) return { ...row, parsed: false };
+        return {
+          ...row,
+          old_oid: requireOid(recovered[1], `target_reflog.entries[${index}].old_oid`),
+          new_oid: requireOid(recovered[2], `target_reflog.entries[${index}].new_oid`),
+          actor: recovered[3],
+          timestamp: Number(recovered[4]),
+          timezone: recovered[5],
+          ...(recovered[6] === undefined ? {} : { action: recovered[6] }),
+          parsed: true,
+        };
+      }
       return {
         ...row,
         old_oid: requireOid(row.old_oid, `target_reflog.entries[${index}].old_oid`),

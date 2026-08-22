@@ -33,7 +33,9 @@ import {
 // event stream and database snapshot independently. A probe sequence that
 // carries no lifecycle op at all (no pause/pause_drain/resume/cancel/
 // fail_force/restart_daemon action) is NOT_EVALUABLE — there is nothing for a
-// lifecycle oracle to judge.
+// lifecycle oracle to judge. The same holds when probe_evidence is entirely
+// absent from the case context (S25): that is a legal non-probe case shape,
+// and O16 renders NOT_EVALUABLE with a mechanical reason instead of erroring.
 
 // Event names that prove a dispatch round spawned work for a run. When a run
 // is paused (or draining with the next story parked), none of these may fire.
@@ -382,8 +384,29 @@ function collectRecoveryObservations(probe) {
 
 export function evaluateO16(invocation) {
   const findings = new FindingCollector();
-  const probe = readProbeEvidence(invocation);
   const runEvents = readRunEvents(invocation);
+  if (invocation.evidencePaths.probe_evidence === undefined) {
+    // S25: probe_evidence is an optional snapshot artifact. A case with no
+    // captured probe sequence (reference null) is a legal case shape — the
+    // probe machinery never ran for it — so there is no per-action lifecycle
+    // evidence to judge. NOT_EVALUABLE (degraded judgment scope) with a
+    // mechanical reason, never a guessed PASS and never an ERROR: the absence
+    // is a case shape, not a runtime failure. The full judging path below is
+    // unchanged when probe evidence exists.
+    return {
+      result: 'NOT_EVALUABLE',
+      findings: [],
+      evidence: [writeEvidenceJson(invocation, 'o16-lifecycle-probe.json', {
+        schema_version: 1,
+        captured_at: runEvents.captured_at,
+        case_id: null,
+        scope: 'no-probe-evidence',
+        reason: 'probe_evidence is absent from the case context; no lifecycle probe sequence was captured to judge',
+        runs: [],
+      }, 'lifecycle-probe-judgment')],
+    };
+  }
+  const probe = readProbeEvidence(invocation);
   const database = readDatabaseRuns(invocation);
 
   let lifecycleOpCount = 0;

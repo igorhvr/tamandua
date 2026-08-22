@@ -84,6 +84,71 @@ function suiteRowShape(raw, label) {
   return normalized;
 }
 
+// ── Current-attempt run scoping (S21) ─────────────────────────────────
+//
+// suite_results persists across campaign attempts (contained DB state is
+// reused and fixture repos re-provision), so rows written by PRIOR attempts
+// with the same origin_repo would otherwise be bundled and flagged
+// O9_LEDGER_TREE_UNRESOLVED even though they are not part of this case's
+// evidence. A bundle row is scoped to the current attempt when:
+//
+//   - its run_id is in the current case's run set
+//     (context.attempts[*].run_id ∪ context.discovered_runs[*].run_id), or
+//   - its run_id is NULL (unattributed legacy rows are retained), or
+//   - the case's own captured observations reference it (a lookup
+//     latest_row_id / record / replay / single-flight / special-exit
+//     ledger_row_id): the current attempt actively used that row, so it
+//     must still reconcile and resolve — never weaken tree resolution.
+//
+// Run identifiers are written in two formats across writers (bare UUID in
+// suite_results.run_id vs `run-<uuid>` in the context projection), so both
+// sides are compared with a leading `run-` prefix stripped. When no context
+// is supplied (or the context carries no run ids at all) the run set is
+// unknowable and the legacy unscoped behavior is kept — the oracle never
+// weakens its own audit because of missing attribution.
+
+function normalizeRunId(runId) {
+  return typeof runId === 'string' && runId.startsWith('run-') ? runId.slice(4) : runId;
+}
+
+function currentCaseRunSet(invocation) {
+  const context = invocation.context;
+  const ids = [];
+  if (context !== undefined && context !== null) {
+    for (const attempt of Array.isArray(context.attempts) ? context.attempts : []) {
+      if (typeof attempt?.run_id === 'string' && attempt.run_id.length > 0) ids.push(normalizeRunId(attempt.run_id));
+    }
+    for (const run of Array.isArray(context.discovered_runs) ? context.discovered_runs : []) {
+      if (typeof run?.run_id === 'string' && run.run_id.length > 0) ids.push(normalizeRunId(run.run_id));
+    }
+  }
+  return ids.length === 0 ? null : new Set(ids);
+}
+
+function observationReferencedLedgerRowIds(parsed) {
+  const referenced = new Set();
+  for (const row of parsed.rows) {
+    if (Number.isSafeInteger(row.latest_row_id) && row.latest_row_id > 0) referenced.add(row.latest_row_id);
+    if (Number.isSafeInteger(row.ledger_row_id) && row.ledger_row_id > 0) referenced.add(row.ledger_row_id);
+  }
+  for (const observation of parsed.singleflight) {
+    for (const event of observation.events) {
+      if (Number.isSafeInteger(event.ledger_row_id) && event.ledger_row_id > 0) referenced.add(event.ledger_row_id);
+    }
+  }
+  for (const observation of parsed.specialExits) {
+    if (Number.isSafeInteger(observation.ledger_row_id) && observation.ledger_row_id > 0) referenced.add(observation.ledger_row_id);
+  }
+  return referenced;
+}
+
+function isCurrentAttemptRow(row, runSet, referencedRowIds) {
+  if (runSet === null) return true;
+  if (row.run_id === null) return true;
+  if (referencedRowIds.has(row.id)) return true;
+  return runSet.has(normalizeRunId(row.run_id));
+}
+
 function readLedger(file) {
   const artifact = readJson(file, 'suite_ledger');
   if (artifact.schema_version !== 1) throw new OracleRuntimeError('suite_ledger.schema_version must be 1');
@@ -96,7 +161,7 @@ function readLedger(file) {
   return rows;
 }
 
-function readDatabaseLedger(invocation, bundleOrigins) {
+function readDatabaseLedger(invocation, bundleOrigins, runSet, referencedRowIds) {
   const database = openEvidenceDatabase(invocation);
   try {
     const columns = new Set(database.prepare('PRAGMA table_info(suite_results)').all().map((row) => row.name));
@@ -105,6 +170,7 @@ function readDatabaseLedger(invocation, bundleOrigins) {
     if (missing.length > 0) throw new OracleRuntimeError(`suite_results snapshot lacks required columns: ${missing.join(', ')}`);
     return database.prepare(`SELECT ${required.join(', ')} FROM suite_results ORDER BY id`).all()
       .filter((row) => bundleOrigins.has(row.origin_repo))
+      .filter((row) => isCurrentAttemptRow(row, runSet, referencedRowIds))
       .map((row, index) => suiteRowShape(row, `suite_results[${index}]`));
   } finally {
     database.close();
@@ -309,6 +375,8 @@ export async function evaluateO9(invocation) {
   const {
     rows: observations, ttl_green_ms: ttl, originIdentities, singleflight, specialExits,
   } = parsed;
+  const runSet = currentCaseRunSet(invocation);
+  const referencedRowIds = observationReferencedLedgerRowIds(parsed);
   const ledger = readLedger(invocation.evidencePaths.suite_ledger);
   const observedOrigins = new Set([
     ...observations.map((row) => row.origin_repo),
@@ -317,8 +385,9 @@ export async function evaluateO9(invocation) {
     ...specialExits.map((observation) => observation.origin_repo),
   ]);
   const skippedForeign = ledger.filter((row) => !bundleOrigins.has(row.origin_repo));
-  const inScopeLedger = ledger.filter((row) => bundleOrigins.has(row.origin_repo));
-  const databaseLedger = readDatabaseLedger(invocation, bundleOrigins);
+  const skippedStale = ledger.filter((row) => bundleOrigins.has(row.origin_repo) && !isCurrentAttemptRow(row, runSet, referencedRowIds));
+  const inScopeLedger = ledger.filter((row) => bundleOrigins.has(row.origin_repo) && isCurrentAttemptRow(row, runSet, referencedRowIds));
+  const databaseLedger = readDatabaseLedger(invocation, bundleOrigins, runSet, referencedRowIds);
   if (JSON.stringify(inScopeLedger) !== JSON.stringify(databaseLedger)) throw new OracleRuntimeError('suite_ledger does not reconcile exactly with read-only suite_results for case-bundle origins');
   const rowsById = new Map(inScopeLedger.map((row) => [row.id, row]));
   const findings = new FindingCollector();
@@ -513,6 +582,8 @@ export async function evaluateO9(invocation) {
     ledger_row_count: inScopeLedger.length,
     skipped_foreign_rows: skippedForeign.length,
     skipped_foreign_row_ids: skippedForeign.map((row) => row.id),
+    skipped_stale_rows: skippedStale.length,
+    skipped_stale_row_ids: skippedStale.map((row) => row.id),
     committed_tree_count: reachableTrees.size,
     observation_count: observations.length,
     invocation_count: invocations.size,

@@ -36,6 +36,11 @@ const FIXTURES = [
   { name: 'o2-off-mode-unbound', expected: 'FAIL', mode: 'off', unboundLaunch: true, finding: 'O2_OFF_MODE_LAUNCH_UNBOUND' },
   { name: 'o2-off-mode-no-override', expected: 'FAIL', mode: 'off', omitOverride: true, finding: 'O2_OFF_MODE_PROVENANCE_INVALID' },
   { name: 'o2-unattributed-transition', expected: 'FAIL', mutation: 'unattributed-transition', finding: 'O2_REF_TRANSITION_UNATTRIBUTED' },
+  // S20 (US-001): the capture parser archives message-less landing reflog
+  // lines raw-only; the oracle must recover the transition from the raw line
+  // (PASS) while a genuinely unparseable line still trips REF_TRANSITION_COUNT.
+  { name: 'o2-message-less-landing', expected: 'PASS', mutation: 'message-less' },
+  { name: 'o2-unparseable-reflog', expected: 'FAIL', mutation: 'unparseable-reflog', finding: 'O2_REF_TRANSITION_COUNT' },
   { name: 'o2-unknown-landing-run', expected: 'FAIL', unknownLanding: true, finding: 'O2_LANDING_RUN_UNKNOWN' },
   { name: 'o2-green-cross-run-noop', expected: 'PASS', crossRunNoop: true },
   { name: 'o2-green-noop-recovery', expected: 'PASS', recovery: true },
@@ -338,6 +343,12 @@ for (const fixture of FIXTURES) {
       ...ordinaryReflog[0], old_oid: targetCommit, new_oid: feature, timestamp: 1785585750,
       raw: `${targetCommit} ${feature} O2 Fixture <o2@example.invalid> 1785585750 +0000\tunattributed update`,
     },
+  ] : fixture.mutation === 'message-less' ? [
+    // Message-less landing update-ref line: no \t<message> tail. The oracle
+    // must recover old_oid/new_oid/actor/timestamp/timezone from the raw line.
+    { raw: `${base} ${targetCommit} O2 Fixture <o2@example.invalid> 1785585720 +0000` },
+  ] : fixture.mutation === 'unparseable-reflog' ? [
+    { raw: 'this is not a reflog line at all' },
   ] : ordinaryReflog;
 
   const references = Object.fromEntries(REFERENCE_KEYS.map((key) => [key, null]));

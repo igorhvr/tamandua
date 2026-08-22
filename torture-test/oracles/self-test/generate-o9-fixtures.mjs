@@ -13,6 +13,7 @@ if (workspace === varRoot || !workspace.startsWith(`${varRoot}${path.sep}`) || !
 }
 
 const RUN_ID = 'run-99999999-9999-4999-8999-999999999999';
+const STALE_RUN_ID = 'run-11111111-1111-4111-8111-111111111111';
 const ORIGIN = '/torture-test/fixtures/synthetic-o9';
 const OTHER_ORIGIN = '/torture-test/fixtures/synthetic-o9-independent';
 const CMD_HASH = createHash('sha256').update('npm test').digest('hex');
@@ -59,6 +60,7 @@ const CASES = [
   { name: 'o9-cross-origin-green', expected: 'PASS', mutation: 'cross-origin-green' },
   { name: 'o9-cross-origin-replay', expected: 'FAIL', mutation: 'cross-origin-replay', finding: 'O9_CROSS_ORIGIN_EVIDENCE' },
   { name: 'o9-foreign-ledger-rows', expected: 'PASS', mutation: 'foreign-ledger', skippedRows: 1 },
+  { name: 'o9-stale-attempt-ledger', expected: 'PASS', mutation: 'stale-attempt-ledger', skippedStaleRows: 1 },
   { name: 'o9-empty-observations', expected: 'NOT_EVALUABLE', mutation: 'empty-observations' },
   { name: 'o9-null-gate-key', expected: 'NOT_EVALUABLE', mutation: 'null-gate-key' },
 ];
@@ -296,6 +298,18 @@ for (const fixture of CASES) {
     rows.push({
       id: 2, origin_repo: OTHER_ORIGIN, tree_hash: 'f'.repeat(40), cmd_hash: OTHER_CMD_HASH, cmd_display: 'npm run test:other',
       exit_code: 0, duration_ms: 1000, log_tail: null, run_id: RUN_ID, step_id: 'foreign-row', created_at: '2026-08-01T12:06:00.000Z',
+    });
+  }
+
+  if (fixture.mutation === 'stale-attempt-ledger') {
+    // A row written by a PRIOR campaign attempt: same origin bundle, but a
+    // run_id outside the current case's run set and an unresolvable tree.
+    // Without current-attempt scoping this trips O9_LEDGER_TREE_UNRESOLVED;
+    // with scoping the stale row is skipped and the case passes on its own
+    // current-attempt row (id 1, run_id RUN_ID, resolvable committed tree).
+    rows.push({
+      id: 2, origin_repo: ORIGIN, tree_hash: 'f'.repeat(40), cmd_hash: CMD_HASH, cmd_display: 'npm test',
+      exit_code: 0, duration_ms: 1000, log_tail: null, run_id: STALE_RUN_ID, step_id: 'stale-attempt', created_at: '2026-07-20T10:00:00.000Z',
     });
   }
 

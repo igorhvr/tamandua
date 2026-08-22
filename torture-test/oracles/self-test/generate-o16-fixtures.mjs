@@ -403,6 +403,20 @@ const CASES = [
     events: () => ({ [RUN_A]: [eventRow(RUN_A, 'run.started', 0, 1)] }),
     runs: [[RUN_A, 'completed', 1]],
   },
+  {
+    name: 'o16-no-probe-evidence',
+    expected: 'NOT_EVALUABLE',
+    scope: 'no-probe-evidence',
+    // S25: the probe machinery never ran for this case — probe_evidence is
+    // absent (reference null, no probe-evidence.json artifact). O16 must
+    // render NOT_EVALUABLE with a mechanical reason, never ERROR (the pre-fix
+    // campaign-#8 shape on W1.L3-*, W3.01-W3.04) and never a guessed PASS.
+    // run_events + database_snapshot remain present so the verdict stays
+    // mechanically grounded.
+    probe: null,
+    events: () => ({}),
+    runs: [[RUN_A, 'completed', 1]],
+  },
 ];
 
 function bare(runId) { return runId.slice(4); }
@@ -439,8 +453,8 @@ for (const fixture of CASES) {
   fs.mkdirSync(evidence, { mode: 0o700 });
   fs.writeFileSync(path.join(campaign, 'state.json'), '{}\n', { flag: 'wx' });
 
-  const probe = fixture.probe();
-  const eventsByRun = fixture.events(probe.runs?.[0]?.run_id ?? probe.run_id);
+  const probe = typeof fixture.probe === 'function' ? fixture.probe() : null;
+  const eventsByRun = probe ? fixture.events(probe.runs?.[0]?.run_id ?? probe.run_id) : {};
   const events = Object.entries(eventsByRun)
     .flatMap(([, rows]) => rows)
     .map((row, index) => ({ ...row, line: index + 1 }));
@@ -464,9 +478,13 @@ for (const fixture of CASES) {
   references.run_events = writeSnapshot(campaign, snapshots, 'run-events.json', {
     schema_version: 1, captured_at: CAPTURED, run_ids: fixture.runs.map(([runId]) => runId).sort(), rows: events,
   });
-  references.probe_evidence = writeSnapshot(campaign, snapshots, 'probe-evidence.json', probe);
+  references.probe_evidence = probe
+    ? writeSnapshot(campaign, snapshots, 'probe-evidence.json', probe)
+    : null;
 
-  const primaryRunId = probe.runs?.[0]?.run_id ?? probe.run_id ?? RUN_A;
+  const primaryRunId = probe
+    ? (probe.runs?.[0]?.run_id ?? probe.run_id ?? RUN_A)
+    : RUN_A;
   const context = {
     contract_version: 1, oracle_id: 'O16',
     campaign: { id: `campaign-${fixture.name}`, created_at: START, manifest: { sha256: '2'.repeat(64), case_count: 1, case_ids: [fixture.name] } },

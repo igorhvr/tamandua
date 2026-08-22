@@ -183,11 +183,16 @@ function healthyStraggler(context, projected, runId, run, steps, events) {
 }
 
 // Deterministic reporter for the campaign-wide (family-level) duration-floor
-// findings of a wave: the wave case whose case_id comes first in
-// campaign.manifest.case_ids order. Cases absent from the manifest order rank
-// deterministically after all manifest-ordered cases (localeCompare tiebreak),
-// so a single-case campaign or a wave with only one manifest case always
-// reports family findings from that case.
+// findings of a wave: the wave case whose case_id comes LAST in
+// campaign.manifest.case_ids order (max manifest rank). At concurrency 1 the
+// wave snapshot grows as later cases run, so the first case's O1 evaluates a
+// one-sample wave and the rate guard is suppressed there; choosing the LAST
+// case of the wave means the guard evaluates the most complete wave snapshot
+// when it finally reports. The reporter must be a real campaign case, so wave
+// rows whose case_id is absent from the manifest (e.g. fixture peer runs) can
+// never win the reporter slot; when the wave carries no manifest cases at all
+// the full set is ranked deterministically (localeCompare), so a single-case
+// wave still reports family findings from its only case.
 function waveReporterCaseId(context) {
   const wave = context.o1_wave;
   const caseIds = new Set();
@@ -196,11 +201,14 @@ function waveReporterCaseId(context) {
     if (typeof floor.case_id === 'string' && floor.case_id.length > 0) caseIds.add(floor.case_id);
   }
   const manifestOrder = new Map(context.campaign.manifest.case_ids.map((id, index) => [id, index]));
+  const manifestCaseIds = [...caseIds].filter((id) => manifestOrder.has(id));
+  const pool = manifestCaseIds.length > 0 ? manifestCaseIds : [...caseIds];
   const rank = (id) => (manifestOrder.has(id) ? manifestOrder.get(id) : Number.MAX_SAFE_INTEGER);
-  return [...caseIds].sort((left, right) => {
+  const ordered = [...pool].sort((left, right) => {
     const byRank = rank(left) - rank(right);
     return byRank !== 0 ? byRank : left.localeCompare(right);
-  })[0] ?? null;
+  });
+  return ordered[ordered.length - 1] ?? null;
 }
 
 function mergeFindings(target, source) {

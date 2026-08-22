@@ -146,7 +146,11 @@ test('E3.C registry: probe_evidence/chaos_log keys and O4/O16 gating wiring (US-
 
     // Required evidence legs per US-003.
     assert.deepEqual(REQUIRED_ORACLE_EVIDENCE.O4, ['database_snapshot', 'run_events', 'chaos_log']);
-    assert.deepEqual(REQUIRED_ORACLE_EVIDENCE.O16, ['probe_evidence', 'run_events', 'database_snapshot']);
+    // S25: O16's probe_evidence leg is non-gating (a case without a captured
+    // probe sequence is a legal shape — O16 renders NOT_EVALUABLE on it);
+    // run_events + database_snapshot remain required so the verdict stays
+    // mechanically grounded.
+    assert.deepEqual(REQUIRED_ORACLE_EVIDENCE.O16, ['run_events', 'database_snapshot']);
 
     // The fixture supplies every evidence key, so both new gating oracles pass
     // requireOracleEvidence validation (contract-valid contexts for O4/O16).
@@ -157,14 +161,20 @@ test('E3.C registry: probe_evidence/chaos_log keys and O4/O16 gating wiring (US-
       assert.equal(context.oracle_id, oracleId);
     }
 
-    // A context missing an O16-required leg fails closed under
-    // requireOracleEvidence (the probe sequencer never ran → TEST_INFRA, not a
-    // silent PASS).
+    // A context missing probe_evidence is STILL contract-valid for O16 (S25):
+    // the snapshot leaves the reference null when the probe machinery never
+    // ran, and O16 answers NOT_EVALUABLE on that shape instead of failing
+    // closed as TEST_INFRA. run_events/database_snapshot absence still fails
+    // closed.
     const withoutProbe = createOracleContext({ ...data, oracleId: 'O16' });
     withoutProbe.mechanical_evidence.references.probe_evidence = null;
+    assert.deepEqual(validateOracleContext(withoutProbe, data.campaignDir, { requireOracleEvidence: true }), [],
+      'O16 must not require probe_evidence (non-probe case shape)');
+    const withoutEvents = createOracleContext({ ...data, oracleId: 'O16' });
+    withoutEvents.mechanical_evidence.references.run_events = null;
     assert.match(
-      validateOracleContext(withoutProbe, data.campaignDir, { requireOracleEvidence: true }).join('\n'),
-      /probe_evidence is required for O16/,
+      validateOracleContext(withoutEvents, data.campaignDir, { requireOracleEvidence: true }).join('\n'),
+      /run_events is required for O16/,
     );
     // Same fail-closed behavior for O4's chaos_log leg.
     const withoutChaos = createOracleContext({ ...data, oracleId: 'O4' });

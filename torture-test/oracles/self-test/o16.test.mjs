@@ -36,7 +36,7 @@ test('O16 judges lifecycle probe evidence: pause-hold, drain, cancel, resume-id,
     const generated = spawnSync(process.execPath, [GENERATOR, workspace], { encoding: 'utf8', shell: false });
     assert.equal(generated.status, 0, generated.stderr);
     const names = fs.readdirSync(workspace).filter((name) => name.startsWith('o16-')).sort();
-    assert.equal(names.length, 12);
+    assert.equal(names.length, 13);
     for (const name of names) {
       const { expectation, response, status } = invokeFixture(workspace, name);
       assert.equal(response.result, expectation.expected, `${name}: ${JSON.stringify(response)}`);
@@ -57,7 +57,8 @@ test('O16 judges lifecycle probe evidence: pause-hold, drain, cancel, resume-id,
           assert.equal(observation.finding_ids.length, 0, `${name} clean fixture must have no findings`);
         }
       } else {
-        assert.equal(observation.scope, 'no-lifecycle-ops', `${name} must record the no-lifecycle-ops scope`);
+        assert.equal(observation.scope, expectation.scope ?? 'no-lifecycle-ops',
+          `${name} must record the expected NOT_EVALUABLE scope`);
       }
     }
   } finally {

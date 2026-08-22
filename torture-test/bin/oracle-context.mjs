@@ -6,8 +6,10 @@ export const ORACLE_CONTEXT_VERSION = 1;
 export const GATING_ORACLE_IDS = Object.freeze(['O1', 'O2', 'O3z', 'O4', 'O8', 'O9', 'O10', 'O11', 'O16']);
 // E3.C (US-003): evidence artifacts that only exist when the lifecycle-probe
 // machinery ran. The snapshot leaves them null when absent; the oracles that
-// need them (O16 probe_evidence, O4 chaos_log) enforce presence through
-// REQUIRED_ORACLE_EVIDENCE instead of failing every non-probe case's capture.
+// need them (O4 chaos_log) enforce presence through REQUIRED_ORACLE_EVIDENCE
+// instead of failing every non-probe case's capture. O16 treats probe_evidence
+// as non-gating (S25): a case without a captured probe sequence is a legal
+// case shape, and O16 renders NOT_EVALUABLE on it rather than erroring.
 export const OPTIONAL_ORACLE_EVIDENCE_KEYS = Object.freeze(['probe_evidence', 'chaos_log']);
 export const ORACLE_EVIDENCE_KEYS = Object.freeze([
   'database_snapshot',
@@ -59,7 +61,10 @@ export const REQUIRED_ORACLE_EVIDENCE = Object.freeze({
   ]),
   // O16 (E3.C lifecycle probe-evidence oracle): judges the probe sequencer's
   // per-action evidence against the run event stream and database snapshot.
-  O16: Object.freeze(['probe_evidence', 'run_events', 'database_snapshot']),
+  // probe_evidence is NOT gating (S25): non-probe cases carry it null and O16
+  // returns NOT_EVALUABLE on them; run_events + database_snapshot remain
+  // required because the verdict must stay mechanically grounded.
+  O16: Object.freeze(['run_events', 'database_snapshot']),
 });
 
 const MECHANICAL_STEP_FIELDS = Object.freeze([

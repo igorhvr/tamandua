@@ -34,7 +34,7 @@ test('O11 enforces output contracts, formula, exact ownership, ledger reconcilia
     const generated = spawnSync(process.execPath, [GENERATOR, workspace], { encoding: 'utf8', shell: false });
     assert.equal(generated.status, 0, generated.stderr);
     const names = fs.readdirSync(workspace).filter((name) => name.startsWith('o11-')).sort();
-    assert.equal(names.length, 24);
+    assert.equal(names.length, 28);
     for (const name of names) {
       const { expectation, response, status } = invokeFixture(workspace, name);
       assert.equal(response.result, expectation.expected, `${name}: ${JSON.stringify(response)}`);
@@ -62,6 +62,36 @@ test('O11 enforces output contracts, formula, exact ownership, ledger reconcilia
         if (expectation.campaign7.variant !== 'nonloop') {
           assert.ok(observation.output_contract.steps.some((step) => step.type === 'loop'), `${name} loop step missing from observation`);
         }
+      }
+      if (expectation.retryCorridor) {
+        // S22A legal re-dispatch corridors: the fixture must carry exactly
+        // one accepted retry verdict on the consumer step plus (for the
+        // 'retry'/'reroute' variants) a LATER separate accepted done, and two
+        // dispatch renderings (one per dispatch) so the later done belongs to
+        // a fresh dispatch.
+        const consumerValidations = observation.output_contract.validations.filter((row) => row.step_id === 'consumer');
+        const retryRows = consumerValidations.filter((row) => row.outcome === 'accepted' && row.verdict === 'retry');
+        assert.equal(retryRows.length, 1, `${name} must carry exactly one accepted retry verdict on the consumer step`);
+        assert.equal(retryRows[0].transition.action, expectation.retryCorridor.action, `${name} retry verdict transition action`);
+        const doneRows = consumerValidations.filter((row) => row.outcome === 'accepted' && row.verdict === 'done' && row.transition.action === 'done');
+        const consumerRenderings = observation.output_contract.renderings.filter((row) => row.step_id === 'consumer');
+        if (expectation.retryCorridor.action !== 'done') {
+          assert.equal(doneRows.length, 1, `${name} must carry a later accepted done on the consumer step`);
+          assert.ok(doneRows[0].observed_at > retryRows[0].observed_at, `${name} accepted done must come after the retry verdict`);
+          assert.equal(consumerRenderings.length, 2, `${name} must carry two consumer dispatch renderings`);
+        } else {
+          assert.equal(doneRows.length, 0, `${name} retry-done-transition must have no later accepted done`);
+          assert.equal(consumerRenderings.length, 1, `${name} retry-done-transition carries one consumer dispatch rendering`);
+        }
+      }
+      if (expectation.twoDispatches) {
+        // S22A reroute re-execution: the consumer step legally carries two
+        // accepted dones across TWO dispatch renderings (one per dispatch).
+        const consumerValidations = observation.output_contract.validations.filter((row) => row.step_id === 'consumer');
+        const doneRows = consumerValidations.filter((row) => row.outcome === 'accepted' && row.verdict === 'done' && row.transition.action === 'done');
+        const consumerRenderings = observation.output_contract.renderings.filter((row) => row.step_id === 'consumer');
+        assert.equal(doneRows.length, 2, `${name} must carry two accepted dones on the consumer step`);
+        assert.equal(consumerRenderings.length, 2, `${name} must carry two consumer dispatch renderings`);
       }
       assert.ok(Array.isArray(observation.output_contract.validations));
       assert.ok(Array.isArray(observation.output_contract.rejections));

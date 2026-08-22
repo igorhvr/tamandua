@@ -497,53 +497,96 @@ function requiredEventStringArray(event, key, label) {
   return event[key];
 }
 
-export function projectSubmitRejections(events) {
+// S22B (US-002): submit rejections and expects validations derive attempt
+// numbers from ONE shared per-claim counter that spans BOTH event streams in
+// chronological order. The previous code kept an independent per-stream
+// counter, so on any rejected->accepted->rejected sequence the same physical
+// attempt received different attempt numbers in submit_rejections vs
+// expects_validations (one physical event double-flagged as
+// O11_REJECTION_VALIDATION_MISMATCH / O11_REJECTION_WITHOUT_VALIDATION).
+//
+// Counting model (one physical attempt = one submission):
+//   - a `step.submit.rejected` event STARTS a new attempt (counter + 1);
+//   - the `step.expects.validated` (outcome 'rejected') event that the
+//     submit-time validator emits immediately after a rejection COMPLETES
+//     that same attempt and shares its attempt number (the two events are
+//     consecutive in the same code path, so pairing by "next validation after
+//     a rejection for the same claim" is exact);
+//   - an `step.expects.validated` (outcome 'accepted') event starts AND
+//     completes a new attempt (counter + 1).
+// An explicit event.attemptNumber still wins when present (and re-seeds the
+// shared counter so subsequent synthesized attempts stay consistent).
+function projectSubmissionAttempts(events) {
   const attempts = new Map();
-  return eventsMatching(events, (name) => name === 'step.submit.rejected').map((wrapper) => {
+  const awaitingRejectedValidation = new Set();
+  const rejections = [];
+  const validations = [];
+  for (const wrapper of events) {
     const event = wrapper.event;
-    const label = `step.submit.rejected ${wrapper.archive}:${wrapper.line}`;
-    const attemptNumber = event.attemptNumber ?? ((attempts.get(event.claimId) ?? 0) + 1);
-    if (!Number.isSafeInteger(attemptNumber) || attemptNumber <= 0) throw new Error(`${label}.attemptNumber must be positive`);
-    attempts.set(event.claimId, attemptNumber);
-    return {
-      id: requiredEventString(event, 'recordId', label), observed_at: requiredEventString(event, 'ts', label),
-      run_id: requiredEventString(event, 'runId', label), step_row_id: requiredEventString(event, 'stepRowId', label),
-      step_id: requiredEventString(event, 'stepId', label), claim_id: requiredEventString(event, 'claimId', label),
-      attempt_number: attemptNumber, validation_code: requiredEventString(event, 'validationCode', label),
-      missing_keys: requiredEventStringArray(event, 'missingKeys', label),
-      invalid_keys: requiredEventStringArray(event, 'invalidKeys', label),
-      diagnostic_code: requiredEventString(event, 'diagnosticCode', label),
-    };
-  });
+    const name = String(event.event ?? event.type ?? '');
+    if (name === 'step.submit.rejected') {
+      const label = `step.submit.rejected ${wrapper.archive}:${wrapper.line}`;
+      const attemptNumber = event.attemptNumber ?? ((attempts.get(event.claimId) ?? 0) + 1);
+      if (!Number.isSafeInteger(attemptNumber) || attemptNumber <= 0) throw new Error(`${label}.attemptNumber must be positive`);
+      attempts.set(event.claimId, attemptNumber);
+      awaitingRejectedValidation.add(event.claimId);
+      rejections.push({
+        id: requiredEventString(event, 'recordId', label), observed_at: requiredEventString(event, 'ts', label),
+        run_id: requiredEventString(event, 'runId', label), step_row_id: requiredEventString(event, 'stepRowId', label),
+        step_id: requiredEventString(event, 'stepId', label), claim_id: requiredEventString(event, 'claimId', label),
+        attempt_number: attemptNumber, validation_code: requiredEventString(event, 'validationCode', label),
+        missing_keys: requiredEventStringArray(event, 'missingKeys', label),
+        invalid_keys: requiredEventStringArray(event, 'invalidKeys', label),
+        diagnostic_code: requiredEventString(event, 'diagnosticCode', label),
+      });
+    } else if (name === 'step.expects.validated') {
+      const label = `step.expects.validated ${wrapper.archive}:${wrapper.line}`;
+      let attemptNumber;
+      if (event.attemptNumber != null) {
+        attemptNumber = event.attemptNumber;
+        attempts.set(event.claimId, attemptNumber);
+        awaitingRejectedValidation.delete(event.claimId);
+      } else if (event.outcome === 'rejected' && awaitingRejectedValidation.has(event.claimId)) {
+        // Completes the attempt started by the immediately-preceding submit
+        // rejection for this claim: the SAME physical attempt, so the SAME
+        // attempt number in both artifacts.
+        attemptNumber = attempts.get(event.claimId);
+        awaitingRejectedValidation.delete(event.claimId);
+      } else {
+        attemptNumber = (attempts.get(event.claimId) ?? 0) + 1;
+        attempts.set(event.claimId, attemptNumber);
+        awaitingRejectedValidation.delete(event.claimId);
+      }
+      if (!Number.isSafeInteger(attemptNumber) || attemptNumber <= 0) throw new Error(`${label}.attemptNumber must be positive`);
+      if (typeof event.expectsRequired !== 'boolean') throw new Error(`${label}.expectsRequired must be boolean`);
+      const missingKeys = requiredEventStringArray(event, 'missingKeys', label);
+      const producer = event.producerStepRowId === null ? null : requiredEventString(event, 'producerStepRowId', label);
+      validations.push({
+        id: requiredEventString(event, 'recordId', label), observed_at: requiredEventString(event, 'ts', label),
+        run_id: requiredEventString(event, 'runId', label), step_row_id: requiredEventString(event, 'stepRowId', label),
+        step_id: requiredEventString(event, 'stepId', label), claim_id: requiredEventString(event, 'claimId', label),
+        attempt_number: attemptNumber, outcome: requiredEventString(event, 'outcome', label),
+        verdict: event.verdict === null ? null : requiredEventString(event, 'verdict', label),
+        expects_required: event.expectsRequired, required_keys: requiredEventStringArray(event, 'requiredKeys', label),
+        missing_keys: missingKeys, invalid_keys: requiredEventStringArray(event, 'invalidKeys', label),
+        key_sources: missingKeys.map((key) => ({ key, producer_step_row_id: producer })),
+        diagnostic_code: requiredEventString(event, 'diagnosticCode', label),
+        transition: {
+          action: requiredEventString(event, 'transitionAction', label),
+          target_step_row_id: requiredEventString(event, 'transitionTargetStepRowId', label),
+        },
+      });
+    }
+  }
+  return { rejections, validations };
+}
+
+export function projectSubmitRejections(events) {
+  return projectSubmissionAttempts(events).rejections;
 }
 
 export function projectExpectsValidations(events) {
-  const attempts = new Map();
-  return eventsMatching(events, (name) => name === 'step.expects.validated').map((wrapper) => {
-    const event = wrapper.event;
-    const label = `step.expects.validated ${wrapper.archive}:${wrapper.line}`;
-    const attemptNumber = event.attemptNumber ?? ((attempts.get(event.claimId) ?? 0) + 1);
-    if (!Number.isSafeInteger(attemptNumber) || attemptNumber <= 0) throw new Error(`${label}.attemptNumber must be positive`);
-    attempts.set(event.claimId, attemptNumber);
-    if (typeof event.expectsRequired !== 'boolean') throw new Error(`${label}.expectsRequired must be boolean`);
-    const missingKeys = requiredEventStringArray(event, 'missingKeys', label);
-    const producer = event.producerStepRowId === null ? null : requiredEventString(event, 'producerStepRowId', label);
-    return {
-      id: requiredEventString(event, 'recordId', label), observed_at: requiredEventString(event, 'ts', label),
-      run_id: requiredEventString(event, 'runId', label), step_row_id: requiredEventString(event, 'stepRowId', label),
-      step_id: requiredEventString(event, 'stepId', label), claim_id: requiredEventString(event, 'claimId', label),
-      attempt_number: attemptNumber, outcome: requiredEventString(event, 'outcome', label),
-      verdict: event.verdict === null ? null : requiredEventString(event, 'verdict', label),
-      expects_required: event.expectsRequired, required_keys: requiredEventStringArray(event, 'requiredKeys', label),
-      missing_keys: missingKeys, invalid_keys: requiredEventStringArray(event, 'invalidKeys', label),
-      key_sources: missingKeys.map((key) => ({ key, producer_step_row_id: producer })),
-      diagnostic_code: requiredEventString(event, 'diagnosticCode', label),
-      transition: {
-        action: requiredEventString(event, 'transitionAction', label),
-        target_step_row_id: requiredEventString(event, 'transitionTargetStepRowId', label),
-      },
-    };
-  });
+  return projectSubmissionAttempts(events).validations;
 }
 
 export function projectDispatchRenderings(events) {
@@ -566,6 +609,30 @@ export function projectDispatchRenderings(events) {
       },
     };
   });
+}
+
+// S20 (US-001): target-ref reflog lines are parsed with an OPTIONAL
+// \t<message> tail. The landing update-ref writes message-less entries
+// ("<old> <new> <identity> <ts> <tz>"), which the previous regex rejected
+// because it required the tab-terminated message segment — every real
+// landing transition was then archived raw-only and O2_REF_TRANSITION_COUNT
+// could never see it. The before/after OIDs, identity, timestamp and
+// timezone are all present in a message-less line and parse exactly as
+// before; only the message tail is absent (action stays absent for such
+// lines, empty for a trailing-tab line). Truly unparseable lines are still
+// archived as { raw: <line> }.
+export function parseTargetReflogLine(line) {
+  const match = /^(\S+) (\S+) (.+?) (\d+) ([+-]\d{4})(?:\t(.*))?$/.exec(line);
+  if (match === null) return { raw: line };
+  return {
+    old_oid: match[1],
+    new_oid: match[2],
+    actor: match[3],
+    timestamp: Number(match[4]),
+    timezone: match[5],
+    ...(match[6] === undefined ? {} : { action: match[6] }),
+    raw: line,
+  };
 }
 
 function projectRoundUsage(input, events) {
@@ -1068,12 +1135,7 @@ export function completeOracleEvidenceSnapshot(rawInput, baseline) {
     const rawReflogPath = path.join(gitDir, 'logs', ...ref.split('/'));
     let raw = '';
     if (fs.existsSync(rawReflogPath)) raw = fs.readFileSync(assertContainedFile(rawReflogPath, input.ttRoot, 'target reflog'), 'utf8');
-    const entries = raw.split(/\r?\n/).filter(Boolean).map((line) => {
-      const match = /^(\S+) (\S+) (.+?) (\d+) ([+-]\d{4})\t(.*)$/.exec(line);
-      return match === null ? { raw: line } : {
-        old_oid: match[1], new_oid: match[2], actor: match[3], timestamp: Number(match[4]), timezone: match[5], action: match[6], raw: line,
-      };
-    });
+    const entries = raw.split(/\r?\n/).filter(Boolean).map(parseTargetReflogLine);
     emitJson('target_reflog', 'target-reflog.json', {
       schema_version: 1, captured_at: capturedAt, repository: repositoryIdentity(input.repositoryPath, input.ttRoot),
       target_ref: ref, entries,
@@ -1125,7 +1187,8 @@ export function completeOracleEvidenceSnapshot(rawInput, baseline) {
     // evidence dir, and tt-chaos appends structured entries to
     // var/chaos/chaos.log. Both are copied into the immutable snapshot when
     // present; absent artifacts leave the reference null (optional for oracles
-    // that do not require them, required for O16/O4 respectively).
+    // that do not require them, required for O4's chaos_log; O16 answers
+    // NOT_EVALUABLE on a case without probe_evidence per S25).
     const captureOptionalCopy = (key, filename, sourcePath, containingRoot, source, label) => {
       if (!fs.existsSync(sourcePath)) return;
       const file = path.join(directory, filename);

@@ -64,6 +64,7 @@ test('O2 proves unique ref movement, tested/commit tree identity, ancestry, and 
       'o2-green-noop-recovery',
       'o2-landed-canceled',
       'o2-landed-failed',
+      'o2-message-less-landing',
       'o2-noop-before-landing',
       'o2-null-gate-key',
       'o2-off-mode',
@@ -78,6 +79,7 @@ test('O2 proves unique ref movement, tested/commit tree identity, ancestry, and 
       'o2-tested-tree-mismatch',
       'o2-unattributed-transition',
       'o2-unknown-landing-run',
+      'o2-unparseable-reflog',
     ]);
     for (const name of names) {
       const { elapsed, expectation, response, status } = invokeFixture(workspace, name);

@@ -154,6 +154,41 @@ export function evaluateO11OutputContract(invocation, projected, databaseSteps, 
     return normalized;
   });
 
+  const renderingIds = new Set();
+  const renderings = renderingArtifact.rows.map((raw, index) => {
+    const label = `dispatch_renderings.rows[${index}]`;
+    const row = object(raw, label);
+    const id = nonempty(row.id, `${label}.id`);
+    if (renderingIds.has(id)) throw new OracleRuntimeError(`${label}.id must be unique`);
+    renderingIds.add(id);
+    const normalized = {
+      id,
+      observed_at: timestamp(row.observed_at, `${label}.observed_at`),
+      run_id: canonicalRunId(row.run_id, `${label}.run_id`),
+      step_row_id: nonempty(row.step_row_id, `${label}.step_row_id`),
+      step_id: nonempty(row.step_id, `${label}.step_id`),
+      claim_id: nonempty(row.claim_id, `${label}.claim_id`),
+      required_keys: stringArray(row.required_keys, `${label}.required_keys`),
+      unresolved_placeholder_count: row.unresolved_placeholder_count,
+      unresolved_keys: stringArray(row.unresolved_keys, `${label}.unresolved_keys`),
+      dispatched: row.dispatched !== false,
+      producer_step_row_id: row.producer_step_row_id == null ? null : nonempty(row.producer_step_row_id, `${label}.producer_step_row_id`),
+    };
+    if (!Number.isSafeInteger(normalized.unresolved_placeholder_count) || normalized.unresolved_placeholder_count < 0) throw new OracleRuntimeError(`${label}.unresolved_placeholder_count must be a non-negative safe integer`);
+    if (normalized.unresolved_placeholder_count !== normalized.unresolved_keys.length) throw new OracleRuntimeError(`${label} unresolved count does not equal its key inventory`);
+    if (normalized.dispatched && normalized.unresolved_placeholder_count > 0) findings.add('O11_DISPATCH_PLACEHOLDER_UNRESOLVED', 'dispatch metadata records a rendered [missing: <key>] placeholder', { rendering_id: id, run_id: normalized.run_id, step_row_id: normalized.step_row_id, unresolved_keys: normalized.unresolved_keys });
+    if (!normalized.dispatched && normalized.unresolved_placeholder_count > 0) {
+      const transition = row.transition == null ? null : object(row.transition, `${label}.transition`);
+      const producer = normalized.producer_step_row_id === null ? undefined : stepByRowId.get(normalized.producer_step_row_id);
+      if (!producer || producer.run_id !== normalized.run_id || producer.step_row_id === normalized.step_row_id) {
+        findings.add('O11_PRODUCER_ATTRIBUTION_MISSING', 'missing producer key is not attributed to a distinct upstream producer step', { rendering_id: id, producer_step_row_id: normalized.producer_step_row_id });
+      } else if (!transition || !['retry', 'reroute'].includes(transition.action) || transition.target_step_row_id !== producer.step_row_id) {
+        findings.add('O11_PRODUCER_RETRY_MISROUTED', 'missing producer key consumed a consumer retry instead of targeting its producer', { rendering_id: id, producer_step_row_id: producer.step_row_id, transition });
+      }
+    }
+    return normalized;
+  });
+
   const { loopStepRowIdsByRun, decisionStepRowIdsByRun } = loopMultiplicityScope(databaseSteps);
   const doneStoriesByRun = new Map();
   for (const story of databaseStories) {
@@ -175,10 +210,33 @@ export function evaluateO11OutputContract(invocation, projected, databaseSteps, 
       if (successes.length < required) findings.add('O11_DONE_WITHOUT_EXPECTS_SUCCESS', 'loop/verify_each step does not have one accepted done transition per completed story', {
         run_id: step.run_id, step_row_id: step.step_row_id, observed: successes.length, required,
       });
-    } else if (successes.length !== 1) {
-      findings.add('O11_DONE_WITHOUT_EXPECTS_SUCCESS', 'done step does not have exactly one successful done expects-validation transition', {
-        run_id: step.run_id, step_row_id: step.step_row_id, observed: successes.length,
-      });
+    } else {
+      // S22A: done-multiplicity is PER DISPATCH, not per step row. A step
+      // may legally re-execute across multiple dispatches — an honest retry
+      // (accepted retry verdict, transition.action='retry', step
+      // re-dispatched, later accepted done) or the RTRV on_fail.retry_step
+      // reroute corridor (transition.action='reroute', re-execution with its
+      // own accepted done). Each dispatch must carry exactly one accepted
+      // done; a step with no rendering telemetry is a single implicit
+      // dispatch. The step must have at least one accepted done overall.
+      const stepRenderings = renderings
+        .filter((row) => row.run_id === step.run_id && row.step_row_id === step.step_row_id)
+        .toSorted((left, right) => left.observed_at.localeCompare(right.observed_at));
+      const perDispatch = new Map();
+      for (const success of successes) {
+        let dispatch = 'implicit';
+        for (const rendering of stepRenderings) {
+          if (rendering.observed_at <= success.observed_at) dispatch = rendering.id;
+        }
+        perDispatch.set(dispatch, (perDispatch.get(dispatch) ?? 0) + 1);
+      }
+      const duplicateDispatch = [...perDispatch.values()].find((count) => count > 1);
+      if (successes.length === 0 || duplicateDispatch !== undefined) {
+        findings.add('O11_DONE_WITHOUT_EXPECTS_SUCCESS', 'done step does not have exactly one successful done expects-validation transition per dispatch', {
+          run_id: step.run_id, step_row_id: step.step_row_id, observed: successes.length,
+          dispatches: [...perDispatch.entries()],
+        });
+      }
     }
   }
   for (const row of validations) {
@@ -187,12 +245,26 @@ export function evaluateO11OutputContract(invocation, projected, databaseSteps, 
       // STATUS: retry verdict is the story-reset re-dispatch: the agent
       // verdicts retry and the scheduler re-dispatches a fresh session for
       // the same story. That is by design for loop iteration — not a finding.
-      // Every other step keeps the strict retry seal: a completed run must
-      // not carry an accepted retry verdict outside loop iteration.
       const retryOnLoopStep = loopStepRowIdsByRun.get(row.run_id)?.has(row.step_row_id) ?? false;
       const retryOnDecisionStep = decisionStepRowIdsByRun.get(row.run_id)?.has(row.step_row_id) ?? false;
       if (retryOnLoopStep || retryOnDecisionStep) continue;
-      findings.add('O11_COMPLETED_FROM_RETRY_VERDICT', 'completed run contains an accepted retry verdict', { validation_id: row.id, run_id: row.run_id, step_row_id: row.step_row_id });
+      // S22A: the seal fires only for a step that COMPLETED FROM the retry
+      // verdict — either the retry verdict row's transition.action is 'done'
+      // (the accepted retry verdict itself moved the step to done), or the
+      // step reached done with NO later accepted done validation. Both legal
+      // re-dispatch corridors carry a later separate accepted done and must
+      // NOT fire: (a) honest single-step retry (transition.action='retry',
+      // step re-dispatched, later accepted done) and (b) the RTRV
+      // on_fail.retry_step reroute corridor (transition.action='reroute').
+      const transitionedDone = row.transition.action === 'done';
+      const laterAcceptedDone = validations.some((other) =>
+        other.run_id === row.run_id && other.step_row_id === row.step_row_id
+        && other.outcome === 'accepted' && other.verdict === 'done'
+        && other.transition.action === 'done' && other.transition.target_step_row_id === row.step_row_id
+        && other.observed_at > row.observed_at);
+      if (transitionedDone || !laterAcceptedDone) {
+        findings.add('O11_COMPLETED_FROM_RETRY_VERDICT', 'completed run contains an accepted retry verdict', { validation_id: row.id, run_id: row.run_id, step_row_id: row.step_row_id });
+      }
     }
   }
 
@@ -245,41 +317,6 @@ export function evaluateO11OutputContract(invocation, projected, databaseSteps, 
       if (rows[index].observed_at <= rows[index - 1].observed_at) findings.add('O11_REJECTION_ORDER_INVALID', 'submit rejections for one claim are not retained in strict attempt/time order', { claim_id: claimId });
     }
   }
-
-  const renderingIds = new Set();
-  const renderings = renderingArtifact.rows.map((raw, index) => {
-    const label = `dispatch_renderings.rows[${index}]`;
-    const row = object(raw, label);
-    const id = nonempty(row.id, `${label}.id`);
-    if (renderingIds.has(id)) throw new OracleRuntimeError(`${label}.id must be unique`);
-    renderingIds.add(id);
-    const normalized = {
-      id,
-      observed_at: timestamp(row.observed_at, `${label}.observed_at`),
-      run_id: canonicalRunId(row.run_id, `${label}.run_id`),
-      step_row_id: nonempty(row.step_row_id, `${label}.step_row_id`),
-      step_id: nonempty(row.step_id, `${label}.step_id`),
-      claim_id: nonempty(row.claim_id, `${label}.claim_id`),
-      required_keys: stringArray(row.required_keys, `${label}.required_keys`),
-      unresolved_placeholder_count: row.unresolved_placeholder_count,
-      unresolved_keys: stringArray(row.unresolved_keys, `${label}.unresolved_keys`),
-      dispatched: row.dispatched !== false,
-      producer_step_row_id: row.producer_step_row_id == null ? null : nonempty(row.producer_step_row_id, `${label}.producer_step_row_id`),
-    };
-    if (!Number.isSafeInteger(normalized.unresolved_placeholder_count) || normalized.unresolved_placeholder_count < 0) throw new OracleRuntimeError(`${label}.unresolved_placeholder_count must be a non-negative safe integer`);
-    if (normalized.unresolved_placeholder_count !== normalized.unresolved_keys.length) throw new OracleRuntimeError(`${label} unresolved count does not equal its key inventory`);
-    if (normalized.dispatched && normalized.unresolved_placeholder_count > 0) findings.add('O11_DISPATCH_PLACEHOLDER_UNRESOLVED', 'dispatch metadata records a rendered [missing: <key>] placeholder', { rendering_id: id, run_id: normalized.run_id, step_row_id: normalized.step_row_id, unresolved_keys: normalized.unresolved_keys });
-    if (!normalized.dispatched && normalized.unresolved_placeholder_count > 0) {
-      const transition = row.transition == null ? null : object(row.transition, `${label}.transition`);
-      const producer = normalized.producer_step_row_id === null ? undefined : stepByRowId.get(normalized.producer_step_row_id);
-      if (!producer || producer.run_id !== normalized.run_id || producer.step_row_id === normalized.step_row_id) {
-        findings.add('O11_PRODUCER_ATTRIBUTION_MISSING', 'missing producer key is not attributed to a distinct upstream producer step', { rendering_id: id, producer_step_row_id: normalized.producer_step_row_id });
-      } else if (!transition || !['retry', 'reroute'].includes(transition.action) || transition.target_step_row_id !== producer.step_row_id) {
-        findings.add('O11_PRODUCER_RETRY_MISROUTED', 'missing producer key consumed a consumer retry instead of targeting its producer', { rendering_id: id, producer_step_row_id: producer.step_row_id, transition });
-      }
-    }
-    return normalized;
-  });
 
   return {
     findings: findings.toJSON(),
