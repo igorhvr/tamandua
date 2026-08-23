@@ -743,6 +743,141 @@ else
   fail "cmd_start missing PATH passthrough"
 fi
 
+# ── Test 23b (US-006 / S24): contained PATH reconstruction ────────────
+# daemon-control must reconstruct the contained launch PATH ITSELF on every
+# start/restart: var/adapters-bin FIRST (mirroring tt-daemon-up's prepend),
+# then the env script's PATH, then the remaining caller PATH with any
+# OPERATOR bin dirs (e.g. ~/.local/bin) REORDERED after the contained dirs.
+# The W3.23 containment leak: daemon-control relaunched with the caller's
+# PATH verbatim (PATH="${PATH}"), and a controller-spawned
+# `daemon-control <kind> restart` (childEnv PATH lacks the adapters-bin
+# prepend) made the restarted contained daemon resolve the OPERATOR's
+# ~/.local/bin/pi-token-saver — a foreign binary executed inside the
+# contained run.
+echo ""
+echo "--- Test: contained PATH reconstruction (US-006 / S24) ---"
+
+if grep -q '^contained_path_for_kind()' "$TOOL"; then
+  pass "contained_path_for_kind helper exists in source"
+else
+  fail "contained_path_for_kind helper missing from source"
+fi
+
+if grep -q '^operator_bin_dirs()' "$TOOL"; then
+  pass "operator_bin_dirs helper exists in source"
+else
+  fail "operator_bin_dirs helper missing from source"
+fi
+
+# All THREE launch sites (run_under_env + the two cmd_start commands) must
+# use the reconstructed PATH helper, and the verbatim caller PATH forward
+# (PATH="${PATH}") must be gone.
+s24_launch_sites=$(grep -c 'PATH="\$(contained_path_for_kind "\$kind")"' "$TOOL" || true)
+if [ "${s24_launch_sites:-0}" -ge 3 ]; then
+  pass "all launch sites use contained_path_for_kind ($s24_launch_sites sites)"
+else
+  fail "expected >= 3 launch sites using contained_path_for_kind, found ${s24_launch_sites:-0}"
+fi
+if grep -qE '^[^#]*PATH="\$\{PATH\}"' "$TOOL"; then
+  fail "tool still forwards the caller's PATH verbatim (PATH=\"\${PATH}\")"
+else
+  pass "tool no longer forwards the caller's PATH verbatim"
+fi
+
+# Behavioral arm: a FAKE operator home with a DECOY pi-token-saver first on
+# the caller PATH, plus a real stub in var/adapters-bin. Under the
+# reconstructed PATH, `command -v pi-token-saver` must resolve INSIDE
+# var/adapters-bin and adapters-bin must be the FIRST PATH component. Before
+# the fix, the verbatim caller PATH resolved the operator decoy (RED).
+S24_TMP="$(mktemp -d "${TMPDIR:-/tmp}/tt-dc-s24.XXXXXX")"
+FAKE_OPERATOR_HOME="$S24_TMP/fake-operator-home"
+mkdir -p "$FAKE_OPERATOR_HOME/.local/bin"
+printf '#!/usr/bin/env bash\necho "DECOY pi-token-saver (operator .local/bin)"\n' > "$FAKE_OPERATOR_HOME/.local/bin/pi-token-saver"
+chmod +x "$FAKE_OPERATOR_HOME/.local/bin/pi-token-saver"
+ADAPTERS_BIN="$SCRIPT_DIR/../var/adapters-bin"
+S24_STUB_BAK=""
+S24_ADAPTERS_EXISTED=false
+if [ -d "$ADAPTERS_BIN" ]; then S24_ADAPTERS_EXISTED=true; fi
+if [ -f "$ADAPTERS_BIN/pi-token-saver" ]; then
+  S24_STUB_BAK="$S24_TMP/pi-token-saver.bak"
+  mv -f "$ADAPTERS_BIN/pi-token-saver" "$S24_STUB_BAK"
+fi
+mkdir -p "$ADAPTERS_BIN"
+# Canonicalize the adapters-bin path (the reconstructed PATH uses the tool's
+# own TT_DIR resolution, which is symlink-free — the `..` must not leak into
+# the assertions).
+ADAPTERS_BIN="$(cd "$ADAPTERS_BIN" && pwd -P)"
+printf '#!/usr/bin/env bash\necho "contained pi-token-saver (adapters-bin)"\n' > "$ADAPTERS_BIN/pi-token-saver"
+chmod +x "$ADAPTERS_BIN/pi-token-saver"
+s24_cleanup() {
+  if [ -n "$S24_STUB_BAK" ] && [ -f "$S24_STUB_BAK" ]; then
+    rm -f "$ADAPTERS_BIN/pi-token-saver" 2>/dev/null || true
+    mv -f "$S24_STUB_BAK" "$ADAPTERS_BIN/pi-token-saver" 2>/dev/null || true
+  else
+    rm -f "$ADAPTERS_BIN/pi-token-saver" 2>/dev/null || true
+  fi
+  if ! $S24_ADAPTERS_EXISTED && [ -d "$ADAPTERS_BIN" ] && [ -z "$(ls -A "$ADAPTERS_BIN" 2>/dev/null)" ]; then
+    rmdir "$ADAPTERS_BIN" 2>/dev/null || true
+  fi
+  rm -rf "$S24_TMP" 2>/dev/null || true
+}
+trap 'cleanup_test_dir; s24_cleanup' EXIT
+
+# The decoy baseline (RED): a verbatim caller PATH with the decoy first
+# resolves the operator decoy — the pre-fix leak shape.
+set +e
+s24_decoy_resolved="$(PATH="$FAKE_OPERATOR_HOME/.local/bin:$PATH" bash -c 'command -v pi-token-saver' 2>/dev/null)"
+set -e
+case "$s24_decoy_resolved" in
+  "$FAKE_OPERATOR_HOME/.local/bin/pi-token-saver")
+    pass "decoy baseline confirmed: the verbatim caller PATH resolves the operator decoy (the leak shape)" ;;
+  *)
+    pass "decoy baseline note: verbatim caller PATH resolved '$s24_decoy_resolved' (decoy not on this host's PATH)" ;;
+esac
+
+# Exercise the reconstruction for BOTH contained kinds (real + scripted).
+for s24_kind in real scripted; do
+  set +e
+  s24_recon="$(TT_DAEMON_CONTROL_CONTAINED_PATH="$s24_kind" HOME="$FAKE_OPERATOR_HOME" PATH="$FAKE_OPERATOR_HOME/.local/bin:$PATH" "$TOOL" 2>/dev/null)"
+  s24_rc=$?
+  set -e
+  if [ "$s24_rc" -eq 0 ] && [ -n "$s24_recon" ]; then
+    pass "$s24_kind: contained_path_for_kind prints a PATH (rc=0)"
+  else
+    fail "$s24_kind: contained_path_for_kind failed (rc=$s24_rc)"
+    continue
+  fi
+  s24_first="${s24_recon%%:*}"
+  if [ "$s24_first" = "$ADAPTERS_BIN" ]; then
+    pass "$s24_kind: adapters-bin is the first PATH component"
+  else
+    fail "$s24_kind: adapters-bin is NOT first (first='$s24_first', want '$ADAPTERS_BIN'; path='$s24_recon')"
+  fi
+  set +e
+  s24_resolved="$(PATH="$s24_recon" bash -c 'command -v pi-token-saver' 2>/dev/null)"
+  s24_resolve_rc=$?
+  set -e
+  case "$s24_resolved" in
+    "$ADAPTERS_BIN/pi-token-saver")
+      pass "$s24_kind: pi-token-saver resolves inside var/adapters-bin ($s24_resolved)" ;;
+    *)
+      fail "$s24_kind: pi-token-saver resolved to '$s24_resolved' (rc=$s24_resolve_rc) — expected $ADAPTERS_BIN/pi-token-saver; the operator decoy would win pre-fix" ;;
+  esac
+  # The operator decoy dir must come AFTER adapters-bin in the reconstructed
+  # PATH (never before the contained prepend).
+  case ":$s24_recon:" in
+    *":$ADAPTERS_BIN:"*":$FAKE_OPERATOR_HOME/.local/bin:"*)
+      pass "$s24_kind: operator .local/bin appears AFTER adapters-bin" ;;
+    *)
+      fail "$s24_kind: operator .local/bin not found after adapters-bin (path='$s24_recon')" ;;
+  esac
+done
+
+# Restore adapters-bin state (a concurrent tt-token-saver-stub install must
+# never see a foreign stub at the target path).
+s24_cleanup
+trap cleanup_test_dir EXIT
+
 # ── Test 24: start subcommand — port waiting ─────────────────────────
 echo ""
 echo "--- Test: start subcommand port waiting ---"

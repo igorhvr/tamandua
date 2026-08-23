@@ -116,6 +116,23 @@ const PROBE_OPS = new Set([
   'pause', 'pause_drain', 'resume', 'cancel', 'fail_force', 'restart_daemon', 'sigstop_sigcont',
 ]);
 const PROBE_WHEN_PATTERN = /^(now|step:[A-Za-z0-9._-]+:[A-Za-z0-9._-]+|event:[A-Za-z0-9._-]+)$/;
+// S18b (US-003): the probe trigger vocabulary gains AWAITED object triggers —
+// {"status":S,"timeout_s":T} (await the contained run status) and
+// {"event":E,"timeout_s":T} (await an event type in the contained event
+// stream). Defense-in-depth BELOW the schema: a valid object `when` is a plain
+// object with timeout_s > 0 and exactly ONE of status (nonempty string) /
+// event (nonempty string); both-at-once, neither, unknown keys, or a
+// non-positive timeout are all invalid (the distinct 'missing or invalid when'
+// reason keeps its shape). String `when`s must still match PROBE_WHEN_PATTERN.
+function probeWhenValid(when) {
+  if (typeof when === 'string') return PROBE_WHEN_PATTERN.test(when);
+  if (!isObject(when)) return false;
+  if (!(typeof when.timeout_s === 'number' && Number.isFinite(when.timeout_s) && when.timeout_s > 0)) return false;
+  const hasStatus = typeof when.status === 'string' && when.status.length > 0;
+  const hasEvent = typeof when.event === 'string' && when.event.length > 0;
+  if (hasStatus === hasEvent) return false;
+  return Object.keys(when).every((key) => key === 'status' || key === 'event' || key === 'timeout_s');
+}
 // Hold-capable probe ops that REQUIRE hold_seconds > 0. pause_drain is
 // deliberately excluded: drain is self-terminating (the in-flight run finishes,
 // then dispatch parks), so W3.19's pause_drain carries no hold_seconds.
@@ -127,9 +144,13 @@ const PROBE_HOLD_REQUIRED_OPS = new Set(['pause', 'sigstop_sigcont']);
 // phase-marker polling cadence (mirrors tt-chaos's POLL_INTERVAL_MS);
 // PROBE_EVENTS_EXCERPT_MAX / _MAX_BYTES bound the observed-effect event-stream
 // excerpt so attempt evidence stays bounded on busy contained instances.
+// PROBE_OUTPUT_TAIL_MAX_BYTES bounds the per-action stdout/stderr capture
+// (8KB each) so a chatty CLI can never blow up the evidence, while the
+// truncated tails still carry the CLI's real refusal messages for diagnosis.
 const PROBE_POLL_INTERVAL_MS = 500;
 const PROBE_EVENTS_EXCERPT_MAX = 200;
 const PROBE_EVENTS_EXCERPT_MAX_BYTES = 256 * 1024;
+const PROBE_OUTPUT_TAIL_MAX_BYTES = 8 * 1024;
 // E3.C US-007: multi-launch probe orchestration. PROBE_DISPATCH_INTERVAL_MS
 // mirrors the product scheduler's DISPATCH_INTERVAL_MS (15s) — the recovery
 // window O16 judges from a restart_daemon probe is
@@ -671,8 +692,8 @@ function validateProbeSequence(caseRecord) {
         errors.push(`${actionLabel} (op ${JSON.stringify(op ?? null)}): unknown probe op (known: ${[...PROBE_OPS].join(', ')})`);
       }
       const when = action.when;
-      if (typeof when !== 'string' || !PROBE_WHEN_PATTERN.test(when)) {
-        errors.push(`${actionLabel} (op ${JSON.stringify(op ?? null)}): missing or invalid 'when' phase marker (expected now | step:<role>:<state> | event:<type>)`);
+      if (!probeWhenValid(when)) {
+        errors.push(`${actionLabel} (op ${JSON.stringify(op ?? null)}): missing or invalid 'when' phase marker (expected now | step:<role>:<state> | event:<type> | {"status":<status>,"timeout_s":N} | {"event":<type>,"timeout_s":N})`);
       }
       if (typeof op === 'string' && PROBE_HOLD_REQUIRED_OPS.has(op)
           && !(typeof action.hold_seconds === 'number' && Number.isFinite(action.hold_seconds) && action.hold_seconds > 0)) {
@@ -3072,6 +3093,13 @@ function workflowRunArgs(caseRecord, resolvedClonePath, extraArgs = []) {
 const TOKEN_SAVER_FLAG = '--no-hurry-please-save-tokens-mode';
 const TOKEN_SAVER_STUB_HELPER_PATH = path.join(TT_ROOT, 'bin', 'tt-token-saver-stub');
 const TOKEN_SAVER_STUB_TARGET_PATH = path.join(VAR_ROOT, 'adapters-bin', 'pi-token-saver');
+// S24 (US-007): the contained daemon PATH invariant. var/adapters-bin is the
+// dir tt-daemon-up/daemon-control prepend to the contained daemon PATH so a
+// managed binary there (pi-token-saver) resolves BEFORE any operator binary.
+// TOKEN_SAVER_STUB_MARKER mirrors tt-token-saver-stub's managed marker (the
+// ONLY content the controller's preflight accepts at the canonical target).
+const ADAPTERS_BIN_DIR = path.join(VAR_ROOT, 'adapters-bin');
+const TOKEN_SAVER_STUB_MARKER = 'tt-managed pi-token-saver stub';
 
 function tokenSaverControl(caseRecord) {
   return caseRecord.context?.token_saver_control === true;
@@ -3117,6 +3145,64 @@ function manageTokenSaverStub(action, evidenceLogPath, childEnv) {
     ...(ok ? {} : { stderr_tail: stderr.slice(-500) }),
     stdout_tail: stdout.slice(-500),
   };
+}
+
+// S24 (US-007): token-saver flagged-launch PREFLIGHT. Before the flagged
+// launch window opens, verify the contained environment can actually resolve
+// pi-token-saver INSIDE var/adapters-bin (the managed stub, US-009): (1) the
+// canonical stub target must be ABSENT (the managed install below creates it)
+// or the managed regular file — a foreign file, directory, or symlink at the
+// target would block the managed install or shadow the stub; (2) the running
+// contained daemon's PATH must carry adapters-bin before any operator bin dir
+// (the same /proc/<pid>/environ read + invariant as the restart re-assertion)
+// — a containment leak (the operator's ~/.local/bin/pi-token-saver preceding
+// the contained prepend) would record foreign-binary work-spawns and burn
+// tokens on the wrong binary. Fail-closed with the distinct
+// 'token-saver-preflight-failed' category BEFORE any launch; never a silent
+// PASS into a leaking window. An unverifiable daemon PATH (no daemon pid /
+// /proc-less host) is recorded, not a violation.
+function preflightTokenSaverFlaggedLaunch(childEnv) {
+  assertContainedSpawnEnv(childEnv);
+  const checkedAt = utcTimestamp();
+  let stubState = 'absent';
+  let stubTargetOk = true;
+  try {
+    const details = fs.lstatSync(TOKEN_SAVER_STUB_TARGET_PATH);
+    if (details.isSymbolicLink() || !details.isFile()) {
+      stubTargetOk = false;
+      stubState = 'not-regular-file';
+    } else {
+      const content = fs.readFileSync(TOKEN_SAVER_STUB_TARGET_PATH, 'utf8');
+      stubState = content.includes(TOKEN_SAVER_STUB_MARKER) ? 'managed-file' : 'foreign-file';
+      if (stubState === 'foreign-file') stubTargetOk = false;
+    }
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      stubTargetOk = false;
+      stubState = 'unreadable';
+    }
+  }
+  const provenance = readDaemonProvenance('real', childEnv);
+  const daemonPath = assertDaemonPathInvariant(provenance.pid, ADAPTERS_BIN_DIR);
+  const ok = stubTargetOk && daemonPath.ok !== false;
+  const evidence = {
+    ok,
+    checked_at: checkedAt,
+    adapters_bin: ADAPTERS_BIN_DIR,
+    stub_target: TOKEN_SAVER_STUB_TARGET_PATH,
+    stub_target_ok: stubTargetOk,
+    stub_target_state: stubState,
+    daemon_pid: provenance.pid,
+    daemon_provenance_source: provenance.source,
+    daemon_path: daemonPath,
+  };
+  let message = null;
+  if (!stubTargetOk) {
+    message = `the canonical stub target '${TOKEN_SAVER_STUB_TARGET_PATH}' is ${stubState} — pi-token-saver cannot resolve inside var/adapters-bin for the flagged launch`;
+  } else if (daemonPath.ok === false) {
+    message = `the contained daemon PATH lacks the var/adapters-bin containment prepend (${daemonPath.reason}${daemonPath.operator_dir !== undefined ? `: '${daemonPath.operator_dir}'` : ''}) — the flagged launch could resolve a foreign pi-token-saver`;
+  }
+  return { ok, message, evidence };
 }
 
 function tokenSaverEvidenceRecordCount(evidenceLogPath) {
@@ -3203,6 +3289,31 @@ async function executeTokenSaverPairedLaunch(caseRecord, caseState, state, campa
     entry.started_at = utcTimestamp();
     state.updated_at = entry.started_at;
     atomicWriteState(campaignDir, state);
+
+    // S24 (US-007): the FLAGGED launch is gated by a preflight asserting
+    // pi-token-saver resolves inside var/adapters-bin (stub target state +
+    // daemon PATH containment). A violation fails closed BEFORE any launch
+    // with the distinct 'token-saver-preflight-failed' category and the
+    // preflight evidence — never a token spend into a leaking window.
+    if (plan.role === 'flagged') {
+      const preflight = preflightTokenSaverFlaggedLaunch(childEnv);
+      entry.preflight = preflight.evidence;
+      if (!preflight.ok) {
+        entry.terminal_at = utcTimestamp();
+        state.updated_at = entry.terminal_at;
+        atomicWriteState(campaignDir, state);
+        fatal = {
+          outcome: 'TEST_INFRA_FAIL',
+          reason: {
+            category: 'token-saver-preflight-failed',
+            message: `token-saver flagged-launch preflight failed: ${preflight.message}`,
+            role: plan.role,
+            preflight: preflight.evidence,
+          },
+        };
+        break;
+      }
+    }
 
     // Stub window management: install (flagged) / remove (control). The
     // helper is fail-closed and the controller verifies the canonical
@@ -3556,6 +3667,13 @@ function assessReplayCacheHit(caseRecord, caseState, attempt, state, campaignDir
     if (typeof attempt.oracle_evidence?.ledger_path === 'string'
         && attempt.oracle_evidence.ledger_path.length > 0) {
       ledgerRelative = attempt.oracle_evidence.ledger_path;
+    } else if (typeof attempt.oracle_evidence?.provenance?.path === 'string'
+        && attempt.oracle_evidence.provenance.path.length > 0) {
+      // S17: completeOracleEvidenceSnapshot returns {schema_version, status,
+      // references, provenance} — the snapshot ledger reference moved from
+      // ledger_path to provenance.path. The gate must resolve the ledger the
+      // same way production writes it (no ledger_path exists anymore).
+      ledgerRelative = attempt.oracle_evidence.provenance.path;
     } else if (root !== campaignDir) {
       ledgerRelative = `snapshots/${caseRecord.id}/${attempt.id}/snapshot.json`;
     }
@@ -3599,7 +3717,18 @@ function assessReplayCacheHit(caseRecord, caseState, attempt, state, campaignDir
       return infra('replay-tree-unresolvable',
         `cannot resolve the replay pair's committed tree: ${gitResult.error?.message ?? String(gitResult.stderr ?? '').trim() ?? `git exit ${gitResult.status}`}`);
     }
-    const runRows = suiteObservations.rows.filter((row) => isObject(row) && row.run_id === attempt.run_id);
+    // S17: suite-observations rows carry BARE UUID run_ids (the stored form)
+    // while attempt.run_id is run-<uuid>-prefixed; normalize BOTH sides with
+    // the canonical helper so bare-UUID rows match the attempt's run id.
+    // Rows whose run_id does not normalize are defensively skipped (filter,
+    // never throw) — a row without an attributable run cannot be this
+    // attempt's observation.
+    const attemptRunId = normalizedStoredRunId(attempt.run_id);
+    const runRows = suiteObservations.rows.filter((row) => {
+      if (!isObject(row)) return false;
+      const rowRunId = normalizedStoredRunId(row.run_id);
+      return rowRunId !== null && attemptRunId !== null && rowRunId === attemptRunId;
+    });
     const hitRows = runRows.filter((row) => row.phase === 'replay'
       && row.origin_repo === gateKey.origin_repo
       && row.cmd_hash === gateKey.cmd_hash
@@ -3611,7 +3740,9 @@ function assessReplayCacheHit(caseRecord, caseState, attempt, state, campaignDir
         evidence: {
           status: 'replay-cache-hit',
           replay_of: replayOf,
-          run_id: attempt.run_id,
+          // S17: always record the canonical run-<uuid> form (rows may carry
+          // bare UUIDs; the assertion binds to the normalized attempt id).
+          run_id: attemptRunId ?? attempt.run_id,
           hit_observation: hitRows[0],
           observed_phases: observedPhases,
           key: { origin_repo: gateKey.origin_repo, cmd_hash: gateKey.cmd_hash, tree_hash: pairTree },
@@ -5184,6 +5315,35 @@ function probeMarkerSatisfied(marker, runId, childEnv) {
   return false;
 }
 
+// S18b (US-003): object-form awaited triggers — {"status":S,"timeout_s":T}
+// polls the contained run status until it equals S (defensive null on a
+// degraded status query keeps polling); {"event":E,"timeout_s":T} polls the
+// contained event stream until an event whose name INCLUDES E appears
+// (substring match, mirroring probeEventMarkerSatisfied). Bounded by the
+// trigger's OWN timeout_s (the case deadline stays the outer ceiling) and
+// deliberately NOT exited early on a terminal run status — the awaited
+// event/status can legitimately occur after terminal (run.process_cleanup
+// fires after a failed run).
+function probeObjectTriggerSatisfied(trigger, runId, childEnv) {
+  if (typeof trigger.status === 'string' && trigger.status.length > 0) {
+    const status = probeRunStatusOrNull(runId, childEnv);
+    return status !== null && status.status === trigger.status;
+  }
+  if (typeof trigger.event === 'string' && trigger.event.length > 0) {
+    const stream = readRunEventStream(childEnv, runId);
+    if (stream === null || stream.unavailable) return false;
+    return stream.events.some((event) => event.event.includes(trigger.event));
+  }
+  return false;
+}
+
+// Render a probe trigger for human-readable messages: object forms must NOT
+// interpolate as '[object Object]' — JSON-stringify them so the probe-
+// trigger-unreached failure carries the actual awaited shape.
+function probeTriggerLabel(trigger) {
+  return isObject(trigger) ? JSON.stringify(trigger) : String(trigger);
+}
+
 // Defensive contained status query: null on any failure (keeps polling during
 // e.g. a contained daemon restart window instead of aborting the wait).
 function probeRunStatusOrNull(runId, childEnv) {
@@ -5198,10 +5358,28 @@ function probeRunStatusOrNull(runId, childEnv) {
 // streams on the PROBE_POLL_INTERVAL_MS cadence until the marker is satisfied,
 // the run reaches a terminal status (the probe can no longer fire — the
 // trigger is declared against an in-flight run), or the case deadline passes.
+// String markers keep the terminal-exit behavior; OBJECT triggers (S18b) are
+// bounded by their own timeout_s and do NOT exit early on a terminal status.
 async function waitForProbeTrigger(trigger, runId, attempt, childEnv) {
   if (trigger === 'now') return { satisfied: true, at: utcTimestamp(), waitedMs: 0 };
   const deadline = new Date(attempt.deadline_at).valueOf();
   const startedAt = Date.now();
+  if (isObject(trigger)) {
+    const objectTimeoutMs = Number.isFinite(trigger.timeout_s) && trigger.timeout_s > 0
+      ? trigger.timeout_s * 1000
+      : null;
+    if (objectTimeoutMs === null) {
+      return { satisfied: false, at: utcTimestamp(), waitedMs: 0, terminalStatus: null };
+    }
+    const objectDeadline = Math.min(Date.now() + objectTimeoutMs, deadline);
+    while (Date.now() < objectDeadline) {
+      if (probeObjectTriggerSatisfied(trigger, runId, childEnv)) {
+        return { satisfied: true, at: utcTimestamp(), waitedMs: Date.now() - startedAt };
+      }
+      await delay(PROBE_POLL_INTERVAL_MS);
+    }
+    return { satisfied: false, at: utcTimestamp(), waitedMs: Date.now() - startedAt, terminalStatus: null };
+  }
   while (Date.now() < deadline) {
     if (probeMarkerSatisfied(trigger, runId, childEnv)) {
       return { satisfied: true, at: utcTimestamp(), waitedMs: Date.now() - startedAt };
@@ -5218,10 +5396,33 @@ async function waitForProbeTrigger(trigger, runId, attempt, childEnv) {
   return { satisfied: false, at: utcTimestamp(), waitedMs: Date.now() - startedAt, terminalStatus: null };
 }
 
+// Bound a probe action's captured CLI output to PROBE_OUTPUT_TAIL_MAX_BYTES
+// bytes, truncating on a UTF-8-safe boundary. Returns the { text, truncated }
+// shape pinned in tt-controller.test.sh: `text` is the (possibly truncated)
+// string, `truncated` is true ONLY when the raw output exceeded the bound and
+// was cut — so downstream diagnosis (W3.19/W3.21 refusal messages) sees the
+// real CLI output instead of discarding it, and truncation is always visible.
+function boundedOutputTail(rawOutput, maxBytes) {
+  const text = String(rawOutput ?? '');
+  const bytes = Buffer.byteLength(text, 'utf8');
+  if (bytes <= maxBytes) return { text, truncated: false };
+  let sliced = Buffer.from(text, 'utf8').subarray(0, maxBytes);
+  // Drop any trailing continuation bytes, then the lead byte of a multi-byte
+  // sequence that the cut left incomplete — the result is always valid UTF-8.
+  while (sliced.length > 0 && (sliced[sliced.length - 1] & 0xc0) === 0x80) {
+    sliced = sliced.subarray(0, sliced.length - 1);
+  }
+  if (sliced.length > 0 && (sliced[sliced.length - 1] & 0xc0) === 0xc0) {
+    sliced = sliced.subarray(0, sliced.length - 1);
+  }
+  return { text: sliced.toString('utf8'), truncated: true };
+}
+
 // Execute ONE probe action: arm → CLI action (contained spawn env) → optional
 // hold → observed effect. Returns the per-action evidence record with an `ok`
 // flag; a CLI failure carries the distinct 'probe-action-failed' failure
-// (op + exit code) so the caller classifies TEST_INFRA_FAIL.
+// (op + exit code + bounded stdout/stderr tails) so the caller classifies
+// TEST_INFRA_FAIL with the CLI's real output instead of discarding it.
 async function executeProbeAction(action, runId, attempt, childEnv) {
   const op = action.op;
   const trigger = action.when;
@@ -5236,6 +5437,8 @@ async function executeProbeAction(action, runId, attempt, childEnv) {
     exit_code: null,
     signal: null,
     error: null,
+    stdout_tail: null,
+    stderr_tail: null,
     hold_seconds: typeof action.hold_seconds === 'number' ? action.hold_seconds : null,
     hold_started_at: null,
     hold_ended_at: null,
@@ -5256,7 +5459,7 @@ async function executeProbeAction(action, runId, attempt, childEnv) {
   if (!armed.satisfied) {
     const failure = {
       category: 'probe-trigger-unreached',
-      message: `probe action '${op}' armed on '${trigger}' never fired before the run reached terminal/deadline (waited ${armed.waitedMs}ms)`,
+      message: `probe action '${op}' armed on '${probeTriggerLabel(trigger)}' never fired before the run reached terminal/deadline (waited ${armed.waitedMs}ms)`,
       op,
       trigger,
       run_terminal_status: armed.terminalStatus ?? null,
@@ -5279,6 +5482,11 @@ async function executeProbeAction(action, runId, attempt, childEnv) {
   record.exit_code = result.status;
   record.signal = result.signal;
   if (result.error !== undefined) record.error = result.error.message;
+  // S18a: capture bounded stdout/stderr tails for EVERY executed action — the
+  // CLI's real output (a refusal message, a usage line) is evidence, and
+  // discarding it delayed W3.19/W3.21 diagnosis in campaign #8.
+  record.stdout_tail = boundedOutputTail(result.stdout, PROBE_OUTPUT_TAIL_MAX_BYTES);
+  record.stderr_tail = boundedOutputTail(result.stderr, PROBE_OUTPUT_TAIL_MAX_BYTES);
 
   if (result.error !== undefined || result.status !== 0) {
     const failure = {
@@ -5289,6 +5497,8 @@ async function executeProbeAction(action, runId, attempt, childEnv) {
       signal: result.signal ?? null,
       error: record.error ?? null,
       argv: record.argv,
+      stdout_tail: record.stdout_tail,
+      stderr_tail: record.stderr_tail,
     };
     return { ...record, ok: false, failure };
   }
@@ -5310,6 +5520,56 @@ function writeProbeEvidenceArtifact(campaignDir, attempt, evidence) {
   fs.writeFileSync(artifactPath, `${JSON.stringify(evidence, null, 2)}\n`, { mode: 0o600 });
 }
 
+// S18c (US-005): stop the underlying run at probe-action-failed time. The
+// stop is a bounded best-effort (a short retry budget, ~1s max) under the
+// case's CONTAINED spawn env — a wedged/paused run must not block the
+// terminal record, and a refused stop (e.g. the run is already terminal)
+// is recorded as evidence, never thrown. Returns the run_stop evidence
+// record { argv, exit_code, signal, error, stopped_at, attempts } so the
+// persisted terminal TEST_INFRA_FAIL shows the run was stopped AT FAILURE
+// TIME (campaign #8 W3.19 rode its wall cap for ~178 dead minutes and ~59k
+// runaway tokens after the probe had already failed).
+async function stopProbeRunBestEffort(runId, childEnv) {
+  const argv = ['tamandua', 'workflow', 'stop', runId];
+  const attempts = [];
+  const maxAttempts = 3;
+  let final = null;
+  for (let attemptNumber = 1; attemptNumber <= maxAttempts; attemptNumber += 1) {
+    let result;
+    try {
+      assertContainedSpawnEnv(childEnv);
+      result = spawnSync('tamandua', ['workflow', 'stop', runId], {
+        cwd: fs.realpathSync(TT_ROOT),
+        env: childEnv,
+        encoding: 'utf8',
+        maxBuffer: 1024 * 1024,
+        shell: false,
+      });
+    } catch (error) {
+      result = { status: null, signal: null, error };
+    }
+    final = {
+      attempt: attemptNumber,
+      argv,
+      exit_code: result.status,
+      signal: result.signal ?? null,
+      error: result.error !== undefined ? result.error.message : null,
+      at: utcTimestamp(),
+    };
+    attempts.push(final);
+    if (result.error === undefined && result.status === 0 && result.signal === null) break;
+    if (attemptNumber < maxAttempts) await delay(500);
+  }
+  return {
+    argv,
+    exit_code: final.exit_code,
+    signal: final.signal,
+    error: final.error,
+    stopped_at: final.at,
+    attempts,
+  };
+}
+
 // Run a case's declared probe_sequence while the case's run is in flight.
 // Called from executeWorkflowCase as soon as the run id resolves (parallel to
 // monitorWorkflowRun). Persists attempt.probe_evidence after EVERY action and
@@ -5317,7 +5577,7 @@ function writeProbeEvidenceArtifact(campaignDir, attempt, evidence) {
 // under the probe_evidence key (US-003). Returns null when there is nothing to
 // run, { ok: true, deferred: true } for multi-run shapes (US-007), or
 // { ok, evidence } / { ok: false, reason } for a single-run sequence.
-async function runDeclaredProbeSequence(caseRecord, attempt, childEnv, state, campaignDir) {
+async function runDeclaredProbeSequence(caseRecord, caseState, attempt, childEnv, state, campaignDir) {
   const sequence = caseRecord.probe_sequence;
   if (sequence === undefined || sequence === null || sequence.length === 0) return null;
   if (attempt.run_id === undefined) return null;
@@ -5374,6 +5634,35 @@ async function runDeclaredProbeSequence(caseRecord, attempt, childEnv, state, ca
         ...result.failure,
         action_index: index,
       };
+      // S18c (US-005): a probe-action-failed CLI failure terminates the case
+      // IMMEDIATELY — stop the underlying run and persist the terminal
+      // TEST_INFRA_FAIL record AT FAILURE TIME, instead of riding the run's
+      // wall cap (campaign #8 W3.19 burned ~178 dead minutes and ~59k runaway
+      // tokens after the probe had already failed). The parallel monitor sees
+      // attempt.terminal_at and returns {swept:true} on its next poll, and the
+      // blocking launch hook (workflow run --wait) unblocks once the run is
+      // stopped. probe-trigger-unreached is deliberately NOT terminated here —
+      // that path already waits out the run/deadline by design.
+      if (result.failure.category === 'probe-action-failed') {
+        // Capture the run's status AT FAILURE TIME (best-effort, contained
+        // spawn) so the terminal record carries a terminal_status consistent
+        // with terminal_at — the oracle context's attempt projections require
+        // the two to agree, and a terminal_at without terminal_status breaks
+        // the O1-wave projections for EVERY subsequent case's oracle context
+        // (W3.22 O16 oracle-infrastructure regression).
+        const failureStatus = probeRunStatusOrNull(runId, childEnv);
+        evidence.run_status_at_failure = failureStatus?.status ?? null;
+        evidence.run_stop = await stopProbeRunBestEffort(runId, childEnv);
+        attempt.phase = 'terminal';
+        attempt.terminal_at = utcTimestamp();
+        attempt.terminal_status = failureStatus?.status ?? attempt.terminal_status ?? 'unknown';
+        persistMechanicalOutcome(caseState, attempt, state, campaignDir, 'TEST_INFRA_FAIL', {
+          category: 'probe-action-failed',
+          ...result.failure,
+          action_index: index,
+          stop: evidence.run_stop,
+        });
+      }
       writeProbeEvidenceArtifact(campaignDir, attempt, evidence);
       return { ok: false, reason: evidence.failure };
     }
@@ -5889,7 +6178,24 @@ function executeDaemonRestart(kind, childEnv) {
   record.exit_code = result.status;
   record.signal = result.signal;
   if (result.error !== undefined) record.error = result.error.message;
-  const ok = result.error === undefined && result.status === 0;
+  let ok = result.error === undefined && result.status === 0;
+  // S24 (US-007): after ANY successful daemon-control restart, re-assert the
+  // tt-daemon-up PATH invariant on the RESTARTED daemon — daemon-control
+  // reconstructs the contained launch PATH (var/adapters-bin first, US-006),
+  // and the controller verifies it from the restarted daemon's OWN
+  // environment so a containment regression is caught HERE
+  // (TEST_INFRA_FAIL 'daemon-path-invariant-violated'), never silently
+  // observed as a later foreign-binary leak. The pre-restart provenance is
+  // preserved in record.provenance; the post-restart pid + the re-assertion
+  // evidence (checked_at, adapters_bin, path_sample) ride record.path_invariant.
+  if (ok) {
+    record.path_invariant = reassertDaemonPathInvariant(kind, childEnv);
+    if (record.path_invariant.ok === false) {
+      record.path_invariant.category = 'daemon-path-invariant-violated';
+      record.path_invariant.message = `the restarted contained daemon's PATH lacks the var/adapters-bin containment prepend (${record.path_invariant.reason}${record.path_invariant.operator_dir !== undefined ? `: '${record.path_invariant.operator_dir}'` : ''}) — a foreign operator binary (e.g. ~/.local/bin/pi-token-saver) could be resolved inside the contained run`;
+      ok = false;
+    }
+  }
   return { record, ok };
 }
 
@@ -5923,6 +6229,109 @@ function readDaemonProvenance(kind, childEnv) {
   provenance.startTime = processStartTimeOf(pid);
   provenance.source = provenance.startTime === null ? 'pidfile' : 'pidfile+identity';
   return provenance;
+}
+
+// ── S24 (US-007): contained daemon PATH invariant — re-assertion helpers ──
+// The contained daemon MUST launch with var/adapters-bin FIRST on its PATH
+// (daemon-control's contained_path_for_kind reconstruction, US-006) so a
+// foreign operator binary (e.g. ~/.local/bin/pi-token-saver) can never be
+// resolved inside the contained run (campaign #8 W3.23 root cause). The
+// controller re-asserts the invariant from the RUNNING daemon's own
+// environment (/proc/<pid>/environ — the same authoritative source
+// tt-daemon-up's daemon_path_has_adapters_bin trusts) after every
+// daemon-control restart, and again before a token-saver flagged launch.
+
+// operatorBinDirs: the operator's personal bin dirs that must never precede
+// the contained dirs on a contained daemon's PATH. Mirrors daemon-control's
+// operator_bin_dirs — the controller itself runs in the operator env, so
+// process.env.HOME IS the operator home (the same source daemon-control
+// resolves via getent passwd for its _tt_operator_home).
+function operatorBinDirs() {
+  const dirs = [];
+  if (typeof process.env.HOME === 'string' && process.env.HOME.length > 0) {
+    dirs.push(path.join(process.env.HOME, '.local', 'bin'));
+    dirs.push(path.join(process.env.HOME, 'bin'));
+  }
+  return dirs;
+}
+
+// daemonPathSample: the daemon's PATH from its own environment
+// (/proc/<pid>/environ). Returns null when unreadable (dead/missing pid or a
+// /proc-less Darwin host) — callers record that as unverifiable rather than
+// failing. Self-test seam: TT_CONTROLLER_DAEMON_ENVIRON_SAMPLE injects a
+// literal PATH so tt-controller.test.sh / the tier-1 token-saver tests can
+// simulate a restart whose daemon environ lacks the adapters-bin prepend on
+// ANY host (no pid needed, deterministic).
+function daemonPathSample(pid) {
+  const sampleEnv = process.env.TT_CONTROLLER_DAEMON_ENVIRON_SAMPLE;
+  if (typeof sampleEnv === 'string' && sampleEnv.length > 0) {
+    return { path: sampleEnv, source: 'env-sample' };
+  }
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    const environ = fs.readFileSync(`/proc/${pid}/environ`, 'utf8');
+    const match = /(?:^|\0)PATH=([^\0]*)/.exec(environ);
+    return match === null ? null : { path: match[1], source: `proc:${pid}` };
+  } catch {
+    return null;
+  }
+}
+
+// assertDaemonPathInvariant: verify the daemon PATH carries adapters-bin
+// FIRST (the strict invariant), or at least present BEFORE any operator bin
+// dir (the weak invariant — a foreign operator binary must never precede the
+// contained prepend). Unreadable env -> { ok: null, verifiable: false }
+// (conservative: recorded with the re-assertion evidence, never a silent
+// pass, never a hard fail on /proc-less hosts).
+function assertDaemonPathInvariant(pid, adaptersBin) {
+  const checkedAt = utcTimestamp();
+  const sample = daemonPathSample(pid);
+  const base = {
+    checked_at: checkedAt,
+    adapters_bin: adaptersBin,
+    pid: Number.isInteger(pid) && pid > 0 ? pid : null,
+    source: sample === null ? null : sample.source,
+  };
+  if (sample === null) {
+    return { ...base, ok: null, verifiable: false, reason: 'environ-unreadable', path_sample: null };
+  }
+  const pathSample = sample.path.length > 1000 ? `${sample.path.slice(0, 1000)}…(truncated)` : sample.path;
+  const components = sample.path.split(':').filter((component) => component !== '');
+  const adaptersIndex = components.indexOf(adaptersBin);
+  if (adaptersIndex === 0) {
+    return { ...base, ok: true, verifiable: true, kind: 'leading', path_sample: pathSample };
+  }
+  if (adaptersIndex === -1) {
+    return { ...base, ok: false, verifiable: true, reason: 'adapters-bin-missing', path_sample: pathSample };
+  }
+  const operatorIndexes = operatorBinDirs()
+    .map((dir) => components.indexOf(dir))
+    .filter((index) => index !== -1);
+  if (operatorIndexes.length === 0 || Math.min(...operatorIndexes) > adaptersIndex) {
+    return { ...base, ok: true, verifiable: true, kind: 'present-before-operator', path_sample: pathSample };
+  }
+  const earliestOperator = Math.min(...operatorIndexes);
+  return {
+    ...base, ok: false, verifiable: true, reason: 'operator-bin-precedes',
+    operator_dir: components[earliestOperator], path_sample: pathSample,
+  };
+}
+
+// reassertDaemonPathInvariant: bounded re-assertion of the daemon PATH
+// invariant after a daemon-control restart. daemon-control returns once the
+// daemon is up (ports bound), so the pidfile + environ should be immediately
+// consistent; a short bounded retry absorbs any start-order jitter. Never
+// throws; ends 'unverifiable' (recorded, not a violation) on /proc-less hosts
+// or a dead/missing pid.
+function reassertDaemonPathInvariant(kind, childEnv) {
+  let result = null;
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    const after = readDaemonProvenance(kind, childEnv);
+    result = assertDaemonPathInvariant(after.pid, ADAPTERS_BIN_DIR);
+    if (result.verifiable !== false || attempt === 9) break;
+    delaySync(250);
+  }
+  return result;
 }
 
 // W3.20 shape: each run group launches, its actions fire against the contained
@@ -6085,7 +6494,7 @@ async function runConcurrentRestartProbe(jobs, restart, kind, childEnv, evidence
   if (!restartArmed.satisfied) {
     const failure = {
       category: 'probe-trigger-unreached',
-      message: `probe action 'restart_daemon' armed on '${restart.action.when}' never fired before run 1 reached terminal/deadline (waited ${restartArmed.waitedMs}ms)`,
+      message: `probe action 'restart_daemon' armed on '${probeTriggerLabel(restart.action.when)}' never fired before run 1 reached terminal/deadline (waited ${restartArmed.waitedMs}ms)`,
       op: 'restart_daemon',
       trigger: restart.action.when,
       run_terminal_status: restartArmed.terminalStatus ?? null,
@@ -6096,15 +6505,30 @@ async function runConcurrentRestartProbe(jobs, restart, kind, childEnv, evidence
   const restartExecution = executeDaemonRestart(kind, childEnv);
   Object.assign(restartRecord, restartExecution.record);
   if (!restartExecution.ok) {
+    // S24 (US-007): a restart whose restarted daemon PATH lacks the
+    // adapters-bin containment prepend records the DISTINCT
+    // 'daemon-path-invariant-violated' failure (with the re-assertion
+    // evidence) so the case classifies TEST_INFRA_FAIL — never a silent PASS
+    // after a leaky restart.
+    const pathViolation = restartExecution.record.path_invariant?.ok === false;
     const failure = {
-      category: 'probe-action-failed',
-      message: `probe action 'restart_daemon' (daemon-control ${kind} restart) exited ${restartRecord.exit_code}${restartRecord.error !== null ? `: ${restartRecord.error}` : ''}`,
+      category: pathViolation ? 'daemon-path-invariant-violated' : 'probe-action-failed',
+      message: pathViolation
+        ? restartExecution.record.path_invariant.message
+        : `probe action 'restart_daemon' (daemon-control ${kind} restart) exited ${restartRecord.exit_code}${restartRecord.error !== null ? `: ${restartRecord.error}` : ''}`,
       op: 'restart_daemon',
       exit_code: restartRecord.exit_code,
       signal: restartRecord.signal ?? null,
       error: restartRecord.error ?? null,
       argv: restartRecord.argv,
+      ...(pathViolation ? { path_invariant: restartExecution.record.path_invariant } : {}),
     };
+    // S24 (US-007): preserve the restart record — including its
+    // path_invariant re-assertion evidence — on the probe evidence even when
+    // the restart execution failed; the violation lives on the restart
+    // record, never lost.
+    evidence.daemon_restarts.push(restartRecord);
+    persistEvidence();
     return { ok: false, failure, run_ordinal: 1 };
   }
 
@@ -6481,6 +6905,12 @@ async function executeMultiRunProbeCase(caseRecord, caseState, state, campaignDi
       run_ordinal: outcome.run_ordinal ?? null,
       run_terminal_status: outcome.failure.run_terminal_status ?? null,
       waited_ms: outcome.failure.waited_ms ?? null,
+      // S24 (US-007): the daemon PATH re-assertion violation evidence rides
+      // the persisted classification reason too (never lost on the restart
+      // record alone).
+      ...(outcome.failure.path_invariant !== undefined
+        ? { path_invariant: outcome.failure.path_invariant }
+        : {}),
     });
     return;
   }
@@ -6950,10 +7380,19 @@ async function executeWorkflowCase(caseRecord, caseState, state, campaignDir) {
       if (!daemonRestart.ok) {
         attempt.phase = 'terminal';
         attempt.terminal_at = utcTimestamp();
+        // S24 (US-007): a restart whose restarted daemon PATH lacks the
+        // adapters-bin containment prepend records the DISTINCT
+        // 'daemon-path-invariant-violated' category here too (with the
+        // re-assertion evidence) — a leaky scripted daemon is never a silent
+        // fallback to stale behaviors.
+        const pathViolation = daemonRestart.record.path_invariant?.ok === false;
         persistMechanicalOutcome(caseState, attempt, state, campaignDir, 'TEST_INFRA_FAIL', {
-          category: 'scripted-behaviors-daemon-restart',
-          message: `could not restart the scripted daemon with the materialized behaviors: exit ${daemonRestart.record.exit_code}${daemonRestart.record.error !== null ? `: ${daemonRestart.record.error}` : ''}`,
+          category: pathViolation ? 'daemon-path-invariant-violated' : 'scripted-behaviors-daemon-restart',
+          message: pathViolation
+            ? `${daemonRestart.record.path_invariant.message} (scripted-behaviors daemon restart)`
+            : `could not restart the scripted daemon with the materialized behaviors: exit ${daemonRestart.record.exit_code}${daemonRestart.record.error !== null ? `: ${daemonRestart.record.error}` : ''}`,
           argv: daemonRestart.record.argv,
+          ...(pathViolation ? { path_invariant: daemonRestart.record.path_invariant } : {}),
         });
         return;
       }
@@ -7046,7 +7485,7 @@ async function executeWorkflowCase(caseRecord, caseState, state, campaignDir) {
     // E3.C US-006: start the probe sequencer alongside the monitor as soon as
     // the run id resolves — the declared probe_sequence executes against the
     // CONTAINED instance while the launch is still in flight.
-    probePromise ??= runDeclaredProbeSequence(caseRecord, attempt, childEnv, state, campaignDir);
+    probePromise ??= runDeclaredProbeSequence(caseRecord, caseState, attempt, childEnv, state, campaignDir);
     // E3.C US-008: start the chaos runner alongside the monitor/probe — a
     // manifest chaos block is honored via bin/tt-chaos (W3.17b sigstop_sigcont
     // on the harness process) against the CONTAINED instance while the run is
@@ -7080,6 +7519,15 @@ async function executeWorkflowCase(caseRecord, caseState, state, campaignDir) {
   }
   const probeResult = probePromise === undefined ? null : await probePromise;
   const chaosResult = chaosPromise === undefined ? null : await chaosPromise;
+  // S18c (US-005): the probe sequencer may have terminally recorded the
+  // attempt AT FAILURE TIME (probe-action-failed immediate termination —
+  // stop the run + persist TEST_INFRA_FAIL) while the caller awaited the
+  // monitor/probe. Never converge/harvest/re-classify a terminal attempt:
+  // the durable record is authoritative and must not be double-written or
+  // resurrected.
+  if (attempt.outcome !== undefined || attempt.terminal_at !== undefined) {
+    return;
+  }
   if (attempt.run_id !== undefined && attempt.run_id_error === undefined) {
     await convergeDiscoveredRuns(caseRecord, caseState, childEnv, state, campaignDir);
   }
@@ -7151,6 +7599,10 @@ async function executeWorkflowCase(caseRecord, caseState, state, campaignDir) {
       action_index: probeResult.reason.action_index ?? null,
       run_terminal_status: probeResult.reason.run_terminal_status ?? null,
       waited_ms: probeResult.reason.waited_ms ?? null,
+      // S18a: the bounded CLI stdout/stderr tails ride the persisted
+      // classification reason so the refusal text survives to the report.
+      stdout_tail: probeResult.reason.stdout_tail ?? null,
+      stderr_tail: probeResult.reason.stderr_tail ?? null,
     });
   } else if (monitorResult.stopped) {
     attempt.phase = 'terminal';

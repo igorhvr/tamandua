@@ -393,11 +393,62 @@
      "description": "Probe verb executed by the controller against the contained TT instance. pause: pause the daemon without draining; pause_drain: pause --drain (current run finishes, no new dispatch); resume: resume a paused/failed daemon or run; cancel: cancel the run (assert run.canceled terminal event); fail_force: fail --force the run (resume must reuse the SAME run id); restart_daemon: restart the contained daemon mid-flight; sigstop_sigcont: SIGSTOP/SIGCONT the harness process."
     },
     "when": {
-     "type": "string",
-     "minLength": 1,
-     "maxLength": 256,
-     "pattern": "^(now|step:[A-Za-z0-9._-]+:[A-Za-z0-9._-]+|event:[A-Za-z0-9._-]+)$",
-     "description": "Phase marker arming the probe: 'now' (immediate), 'step:<role>:<state>' (e.g. step:developer:running, step:finalize_merge:running), or 'event:<type>' (e.g. event:run.canceled)."
+     "anyOf": [
+      {
+       "type": "string",
+       "minLength": 1,
+       "maxLength": 256,
+       "pattern": "^(now|step:[A-Za-z0-9._-]+:[A-Za-z0-9._-]+|event:[A-Za-z0-9._-]+)$",
+       "description": "Phase marker arming the probe: 'now' (immediate), 'step:<role>:<state>' (e.g. step:developer:running, step:finalize_merge:running), or 'event:<type>' (e.g. event:run.canceled)."
+      },
+      {
+       "type": "object",
+       "description": "AWAITED trigger (S18b): the probe action arms only when the contained run reaches the declared status or the declared event type lands in the contained event stream, bounded by timeout_s. Exactly ONE of status|event is allowed (both at once is rejected). NOTE: the two alternatives are expressed as an anyOf of complete object forms (NOT oneOf) because the controller's bundled schema validator implements anyOf but not oneOf — the per-arm additionalProperties:false makes both-at-once fail BOTH arms, and the per-arm required enforces timeout_s.",
+       "anyOf": [
+        {
+         "type": "object",
+         "additionalProperties": false,
+         "properties": {
+          "status": {
+           "type": "string",
+           "minLength": 1,
+           "description": "Contained run status to await (product run-status vocabulary — examples: paused, failed, completed, canceled, running)."
+          },
+          "timeout_s": {
+           "type": "number",
+           "exclusiveMinimum": 0,
+           "description": "How long (seconds) to await the trigger before the probe fails (probe-trigger-unreached)."
+          }
+         },
+         "required": [
+          "status",
+          "timeout_s"
+         ]
+        },
+        {
+         "type": "object",
+         "additionalProperties": false,
+         "properties": {
+          "event": {
+           "type": "string",
+           "minLength": 1,
+           "description": "Event type to await in the contained event stream (substring match on the event name — e.g. run.process_cleanup, run.canceled)."
+          },
+          "timeout_s": {
+           "type": "number",
+           "exclusiveMinimum": 0,
+           "description": "How long (seconds) to await the trigger before the probe fails (probe-trigger-unreached)."
+          }
+         },
+         "required": [
+          "event",
+          "timeout_s"
+         ]
+        }
+       ]
+      }
+     ],
+     "description": "Phase marker arming the probe: a string marker ('now' | 'step:<role>:<state>' | 'event:<type>') or an awaited object trigger ({\"status\":\"paused\",\"timeout_s\":120} awaiting the run status, or {\"event\":\"run.process_cleanup\",\"timeout_s\":120} awaiting the event type)."
     },
     "hold_seconds": {
      "type": "number",

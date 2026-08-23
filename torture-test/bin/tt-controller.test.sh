@@ -30,6 +30,8 @@ O9_CONTROL_PID=""
 O9_EVENTS_PATH=""
 O9_EVENTS_BACKUP=""
 O9_GOLDEN_BARE=""
+US006_EVENTS_PATH=""
+US006_EVENTS_BACKUP=""
 FAKE_HARNESS_PID=""
 DECOY_PID=""
 CHAOS_TARGETS_FILE=""
@@ -81,6 +83,13 @@ cleanup() {
   if [ -n "$O9_EVENTS_PATH" ]; then
     rm -f -- "$O9_EVENTS_PATH"
     if [ -f "$O9_EVENTS_BACKUP" ]; then mv "$O9_EVENTS_BACKUP" "$O9_EVENTS_PATH"; fi
+  fi
+  # S17 (US-001): the production-faithful replay gate campaign seeds the
+  # contained event stream; restore its pre-test content on any failure path.
+  # Runs BEFORE the O9 events restore so the true pre-test file survives.
+  if [ -n "$US006_EVENTS_PATH" ]; then
+    rm -f -- "$US006_EVENTS_PATH"
+    if [ -f "$US006_EVENTS_BACKUP" ]; then mv "$US006_EVENTS_BACKUP" "$US006_EVENTS_PATH"; fi
   fi
   if [ -n "$O9_GOLDEN_BARE" ]; then
     git --git-dir "$O9_GOLDEN_BARE" update-ref -d refs/heads/seed/o9-controller-special 2>/dev/null || true
@@ -1000,7 +1009,21 @@ if [ "${1:-}" = "workflow" ] && [ "${2:-}" = "status" ]; then
   case "${CONTROLLER_WORKFLOW_MODE:-stdout}" in
     scripted-fixture-lstat) printf '{"runId":"run-11111111-1111-4111-8111-111111111111","status":"failed","tokensSpent":0,"steps":[]}\n' ;;
     stdout) printf '{"runId":"run-11111111-1111-4111-8111-111111111111","status":"completed","tokensSpent":0,"steps":[]}\n' ;;
-    probe-pause-fail) printf '{"runId":"run-11111111-1111-4111-8111-111111111111","status":"completed","tokensSpent":0,"steps":[]}\n' ;;
+    probe-pause-fail|probe-pause-fail-big) printf '{"runId":"run-11111111-1111-4111-8111-111111111111","status":"completed","tokensSpent":0,"steps":[]}\n' ;;
+    # S18b status-trigger fixture: the run reports 'paused' until the awaited
+    # resume action fires (writing CONTROLLER_STATUS_TRIGGER_FIRED), then
+    # 'completed' so the monitor sees a terminal status and the case PASSes.
+    # probe-event-trigger keeps the run 'completed' from the start — the
+    # AWAITED event trigger must NOT exit early on the terminal status and
+    # still fires on the seeded run.process_cleanup event.
+    probe-status-trigger)
+      if [ -f "${CONTROLLER_STATUS_TRIGGER_FIRED:-}" ]; then
+        printf '{"runId":"run-11111111-1111-4111-8111-111111111111","status":"completed","tokensSpent":0,"steps":[]}\n'
+      else
+        printf '{"runId":"run-11111111-1111-4111-8111-111111111111","status":"paused","tokensSpent":0,"steps":[]}\n'
+      fi
+      ;;
+    probe-event-trigger) printf '{"runId":"run-11111111-1111-4111-8111-111111111111","status":"completed","tokensSpent":0,"steps":[]}\n' ;;
     multi-run-seq)
       case "${3:-}" in
         run-aaaa1111-1111-4111-8111-111111111111)
@@ -1095,7 +1118,12 @@ if [ "${1:-}" = "workflow" ] && [ "${2:-}" = "stop" ]; then
     esac
     exit 0
   fi
-  : > "$CONTROLLER_STOP_MARKER"
+  # S18c (US-005): the probe immediate-termination path stops the run at
+  # probe-action-failed time. The stop succeeds (exit 0) and records its argv
+  # at the top of this stub; the marker is only written when the fixture
+  # configured one (the cap fixtures), so a probe fixture without a marker
+  # still sees a clean exit-0 stop.
+  if [ -n "${CONTROLLER_STOP_MARKER:-}" ]; then : > "$CONTROLLER_STOP_MARKER"; fi
   exit 0
 fi
 if [ "${1:-}" = "workflow" ] && [ "${2:-}" = "wait" ]; then
@@ -1132,12 +1160,27 @@ fi
 # E3.C US-006 probe-action stub: `workflow pause` succeeds by default; in
 # probe-pause-fail mode it refuses (exit 3) so the controller's probe
 # sequencer classifies TEST_INFRA_FAIL with 'probe-action-failed' (the argv
-# was already recorded at the top of this stub).
+# was already recorded at the top of this stub). S18a: the refusal emits a
+# REAL stderr message + stdout usage line so the captured stdout_tail /
+# stderr_tail carry the CLI's actual output; probe-pause-fail-big emits
+# >8KB of stderr to prove the bounded-tail truncation.
 if [ "${1:-}" = "workflow" ] && [ "${2:-}" = "pause" ]; then
-  if [ "${CONTROLLER_WORKFLOW_MODE:-stdout}" = "probe-pause-fail" ]; then
-    printf 'stub pause refused\n' >&2
-    exit 3
-  fi
+  case "${CONTROLLER_WORKFLOW_MODE:-stdout}" in
+    probe-pause-fail)
+      printf 'usage: tamandua workflow pause <run-id> [options]\n'
+      printf 'tamandua: error: run is not paused — refusing\n' >&2
+      exit 3
+      ;;
+    probe-pause-fail-big)
+      printf 'usage: tamandua workflow pause <run-id> [options]\n'
+      i=1
+      while [ "$i" -le 300 ]; do
+        printf 'tamandua: error: refusal detail line %04d — run is not paused\n' "$i" >&2
+        i=$((i + 1))
+      done
+      exit 3
+      ;;
+  esac
   exit 0
 fi
 # E3.C US-007 probe-action stubs: `workflow cancel` (W3.20's cancels) and
@@ -1147,6 +1190,12 @@ if [ "${1:-}" = "workflow" ] && [ "${2:-}" = "cancel" ]; then
   exit 0
 fi
 if [ "${1:-}" = "workflow" ] && [ "${2:-}" = "resume" ]; then
+  # S18b status-trigger fixture: the AWAITED resume action writes the marker
+  # that flips `workflow status` from 'paused' to 'completed' — proving the
+  # resume fired only after the run actually reported paused.
+  if [ "${CONTROLLER_WORKFLOW_MODE:-}" = "probe-status-trigger" ]; then
+    : > "${CONTROLLER_STATUS_TRIGGER_FIRED:?}"
+  fi
   exit 0
 fi
 if [ "${1:-}" = "workflow" ] && [ "${2:-}" = "fail" ]; then
@@ -1215,7 +1264,28 @@ case "${CONTROLLER_WORKFLOW_MODE:-stdout}" in
     printf 'Run: run-11111111-1111-4111-8111-111111111111\n'
     printf '{"status":"completed"}\n'
     ;;
-  probe-pause-fail)
+  probe-pause-fail|probe-pause-fail-big)
+    printf 'Run: run-11111111-1111-4111-8111-111111111111\n'
+    # S18c (US-005): the launch hook (`workflow run --wait --json`) BLOCKS
+    # until the run is terminal. In the immediate-termination fixture the
+    # controller stops the run at probe-action-failed time, so when a stop
+    # marker is configured, wait (bounded — a missing stop must never hang
+    # the battery) for the stop before reporting the terminal wait JSON:
+    # the run is 'canceled' after a stop, 'completed' otherwise.
+    if [ -n "${CONTROLLER_STOP_MARKER:-}" ]; then
+      i=0
+      while [ ! -f "$CONTROLLER_STOP_MARKER" ] && [ "$i" -lt 1000 ]; do
+        sleep 0.01
+        i=$((i + 1))
+      done
+      if [ -f "$CONTROLLER_STOP_MARKER" ]; then
+        printf '{"status":"canceled"}\n'
+        exit 0
+      fi
+    fi
+    printf '{"status":"completed"}\n'
+    ;;
+  probe-status-trigger|probe-event-trigger)
     printf 'Run: run-11111111-1111-4111-8111-111111111111\n'
     printf '{"status":"completed"}\n'
     ;;
@@ -1630,10 +1700,21 @@ if (pause.op !== 'pause' || pause.trigger !== 'step:developer:running'
     || !Array.isArray(pause.effect?.events_excerpt?.events)) {
   throw new Error(`pause probe record is wrong: ${JSON.stringify(pause)}`);
 }
+// S18a: every executed action carries bounded stdout_tail/stderr_tail in the
+// pinned { text, truncated } shape (here the stub printed nothing, so the
+// tails are empty and NOT truncated).
+for (const [name, tail] of Object.entries({ stdout_tail: pause.stdout_tail, stderr_tail: pause.stderr_tail })) {
+  if (!tail || typeof tail.text !== 'string' || tail.truncated !== false
+      || Buffer.byteLength(tail.text, 'utf8') > 8192) {
+    throw new Error(`pause ${name} must be the untruncated { text, truncated:false } shape: ${JSON.stringify(pause)}`);
+  }
+}
 if (resume.op !== 'resume' || resume.trigger !== 'now'
     || JSON.stringify(resume.argv) !== JSON.stringify(['tamandua', 'workflow', 'resume', runId])
     || resume.exit_code !== 0 || resume.hold_seconds !== null
-    || resume.effect?.status_after?.status !== 'completed') {
+    || resume.effect?.status_after?.status !== 'completed'
+    || !resume.stdout_tail || resume.stdout_tail.truncated !== false
+    || !resume.stderr_tail || resume.stderr_tail.truncated !== false) {
   throw new Error(`resume probe record is wrong: ${JSON.stringify(resume)}`);
 }
 const artifactPath = path.join(campaignDir, 'evidence', item.id, attempt.id, 'probe-evidence.json');
@@ -1687,6 +1768,31 @@ if (!evidence || evidence.sequence_outcome !== 'failed' || evidence.actions.leng
     || evidence.failure?.category !== 'probe-action-failed') {
   throw new Error(`probe failure evidence is wrong: ${JSON.stringify(evidence)}`);
 }
+// S18a: the refusal CLI output must NOT be discarded — the action record, the
+// evidence failure object, and the persisted classification reason all carry
+// the bounded stdout/stderr tails with the stub's real refusal text.
+const actionTail = (name) => evidence.actions[0][name];
+const failureTail = (name) => evidence.failure[name];
+const reasonTail = (name) => attempt.classification_reason?.[name];
+for (const name of ['stdout_tail', 'stderr_tail']) {
+  const fromAction = actionTail(name);
+  if (!fromAction || fromAction.truncated !== false
+      || Buffer.byteLength(fromAction.text, 'utf8') > 8192) {
+    throw new Error(`action ${name} must be the untruncated bounded shape: ${JSON.stringify(evidence.actions[0])}`);
+  }
+  if (JSON.stringify(failureTail(name)) !== JSON.stringify(fromAction)
+      || JSON.stringify(reasonTail(name)) !== JSON.stringify(fromAction)) {
+    throw new Error(`failure/classification ${name} must match the action tail: ${JSON.stringify({fromAction, failure: failureTail(name), reason: reasonTail(name)})}`);
+  }
+}
+const actionStdout = actionTail('stdout_tail').text;
+const actionStderr = actionTail('stderr_tail').text;
+if (!actionStdout.includes('usage: tamandua workflow pause <run-id> [options]')) {
+  throw new Error(`stdout_tail must carry the stub usage line: ${JSON.stringify(actionStdout)}`);
+}
+if (!actionStderr.includes('tamandua: error: run is not paused — refusing')) {
+  throw new Error(`stderr_tail must carry the stub refusal message: ${JSON.stringify(actionStderr)}`);
+}
 const artifactPath = path.join(campaignDir, 'evidence', item.id, attempt.id, 'probe-evidence.json');
 const artifact = JSON.parse(fs.readFileSync(artifactPath, 'utf8'));
 if (JSON.stringify(artifact) !== JSON.stringify(evidence)) {
@@ -1701,7 +1807,348 @@ if (stubCalls.length !== 1
 }
 NODE
 pass "a probe CLI failure classifies TEST_INFRA_FAIL probe-action-failed naming the op and stops the sequence"
+
+# Fixture 4 (S18a): a probe CLI that floods stderr with >8KB of output must be
+# captured BOUNDED — stderr_tail truncates at 8192 bytes on a UTF-8-safe
+# boundary with the `truncated: true` marker, the refusal head survives, and
+# the bounded tail still rides the failure + persisted classification reason.
+probe_fail_big_manifest="$TEST_ROOT/manifests/probe-fail-big.jsonl"
+write_probe_case "$probe_fail_big_manifest" "PROBE-FAIL-BIG" \
+  '[{"run":1,"actions":[{"op":"pause","when":"step:developer:running","hold_seconds":1},{"op":"resume","when":"now"}]}]'
+probe_fail_big_events="$TEST_ROOT/probe-fail-big-events.jsonl"
+probe_fail_big_output=$(PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$probe_fail_big_events" \
+  CONTROLLER_WORKFLOW_MODE=probe-pause-fail-big run_recorded_campaign "$CONTROLLER" --manifest "$probe_fail_big_manifest") \
+  || fail "probe big-output campaign failed: $probe_fail_big_output"
+probe_fail_big_id=$(remember_campaign "$probe_fail_big_output")
+node --input-type=module - "$TT_DIR/var/results/$probe_fail_big_id/state.json" "$PROBE_RUN_ID" <<'NODE'
+import fs from 'node:fs';
+const [statePath, runId] = process.argv.slice(2);
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const attempt = state.cases[0].attempts[0];
+if (attempt.outcome !== 'TEST_INFRA_FAIL'
+    || attempt.classification_reason?.category !== 'probe-action-failed'
+    || attempt.classification_reason?.exit_code !== 3) {
+  throw new Error(`probe big-output failure did not classify TEST_INFRA_FAIL probe-action-failed: ${JSON.stringify({outcome: attempt.outcome, reason: attempt.classification_reason})}`);
+}
+const evidence = attempt.probe_evidence;
+if (!evidence || evidence.sequence_outcome !== 'failed' || evidence.actions.length !== 1
+    || evidence.actions[0].op !== 'pause' || evidence.actions[0].exit_code !== 3) {
+  throw new Error(`probe big-output evidence is wrong: ${JSON.stringify(evidence)}`);
+}
+const actionStderr = evidence.actions[0].stderr_tail;
+const actionStdout = evidence.actions[0].stdout_tail;
+if (!actionStderr || actionStderr.truncated !== true
+    || Buffer.byteLength(actionStderr.text, 'utf8') > 8192) {
+  throw new Error(`stderr_tail must be truncated at <=8192 bytes with the marker: ${JSON.stringify(actionStderr)}`);
+}
+if (!actionStderr.text.includes('tamandua: error: refusal detail line 0001 — run is not paused')) {
+  throw new Error(`the refusal head must survive truncation: ${JSON.stringify(actionStderr.text.slice(0, 200))}`);
+}
+if (!actionStdout || actionStdout.truncated !== false
+    || !actionStdout.text.includes('usage: tamandua workflow pause <run-id> [options]')) {
+  throw new Error(`stdout_tail must carry the untruncated usage line: ${JSON.stringify(actionStdout)}`);
+}
+if (JSON.stringify(evidence.failure?.stderr_tail) !== JSON.stringify(actionStderr)
+    || JSON.stringify(attempt.classification_reason?.stderr_tail) !== JSON.stringify(actionStderr)
+    || JSON.stringify(evidence.failure?.stdout_tail) !== JSON.stringify(actionStdout)
+    || JSON.stringify(attempt.classification_reason?.stdout_tail) !== JSON.stringify(actionStdout)) {
+  throw new Error(`failure/classification tails must match the bounded action tails: ${JSON.stringify({evidence, reason: attempt.classification_reason})}`);
+}
+NODE
+pass "a >8KB probe CLI stderr flood is captured bounded at 8192 bytes with the truncation marker (refusal head preserved)"
 remove_probe_step
+
+# Fixture 4b (S18c): a probe-action-failed CLI failure terminates the case
+# IMMEDIATELY — the controller stops the underlying run (contained
+# `tamandua workflow stop <runId>`, recorded on the events file + as
+# evidence.run_stop) and persists the terminal TEST_INFRA_FAIL
+# 'probe-action-failed' record AT FAILURE TIME, well before the wall cap
+# would fire. The launch stub's `workflow run --wait` BLOCKS until the stop
+# marker (a real launch hook on a paused/wedged run blocks until terminal),
+# the parallel monitor sees attempt.terminal_at and returns swept, and the
+# attempt is never re-classified 'runaway-cap-enforced'.
+probe_stop_manifest="$TEST_ROOT/manifests/probe-stop.jsonl"
+seed_probe_step
+write_probe_case "$probe_stop_manifest" "PROBE-STOP" \
+  '[{"run":1,"actions":[{"op":"pause","when":"step:developer:running","hold_seconds":1},{"op":"resume","when":"now"}]}]'
+probe_stop_events="$TEST_ROOT/probe-stop-events.jsonl"
+probe_stop_marker="$TEST_ROOT/probe-stop-marker"
+rm -f -- "$probe_stop_marker"
+probe_stop_output=$(PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$probe_stop_events" \
+  CONTROLLER_STOP_MARKER="$probe_stop_marker" \
+  CONTROLLER_WORKFLOW_MODE=probe-pause-fail run_recorded_campaign "$CONTROLLER" --manifest "$probe_stop_manifest") \
+  || fail "probe immediate-termination campaign failed: $probe_stop_output"
+probe_stop_id=$(remember_campaign "$probe_stop_output")
+[ -f "$probe_stop_marker" ] || fail "the probe-action-failed path never stopped the run (no stop marker)"
+node --input-type=module - "$TT_DIR/var/results/$probe_stop_id/state.json" \
+  "$TT_DIR/var/results/$probe_stop_id" "$probe_stop_events" "$PROBE_RUN_ID" <<'NODE'
+import fs from 'node:fs';
+import path from 'node:path';
+const [statePath, campaignDir, eventsPath, runId] = process.argv.slice(2);
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const item = state.cases[0];
+const attempt = item.attempts[0];
+const utcRe = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+// (b) the durable record is the terminal TEST_INFRA_FAIL probe-action-failed
+// classification persisted AT FAILURE TIME — never a wall-cap outcome.
+if (attempt.outcome !== 'TEST_INFRA_FAIL'
+    || attempt.classification_reason?.category !== 'probe-action-failed'
+    || attempt.classification_reason?.op !== 'pause'
+    || attempt.classification_reason?.exit_code !== 3) {
+  throw new Error(`probe immediate termination did not classify TEST_INFRA_FAIL probe-action-failed: ${JSON.stringify({outcome: attempt.outcome, reason: attempt.classification_reason})}`);
+}
+// (c) the attempt is terminal with terminal_at present, and the terminal
+// record carries a terminal_status consistent with terminal_at (the oracle
+// context's attempt projections require the two to agree — a terminal_at
+// without terminal_status breaks every subsequent case's oracle context).
+if (attempt.phase !== 'terminal' || !utcRe.test(attempt.terminal_at ?? '')) {
+  throw new Error(`probe immediate termination attempt must be terminal with terminal_at: ${JSON.stringify({phase: attempt.phase, terminal_at: attempt.terminal_at})}`);
+}
+if (typeof attempt.terminal_status !== 'string' || attempt.terminal_status.length === 0) {
+  throw new Error(`probe immediate termination attempt must carry a terminal_status: ${JSON.stringify({terminal_status: attempt.terminal_status})}`);
+}
+// (e) the probe evidence sequence failed (single failed action, no resume).
+const evidence = attempt.probe_evidence;
+if (!evidence || evidence.sequence_outcome !== 'failed' || evidence.actions.length !== 1
+    || evidence.actions[0].op !== 'pause' || evidence.actions[0].exit_code !== 3
+    || evidence.actions[0].failure?.category !== 'probe-action-failed') {
+  throw new Error(`probe immediate termination evidence is wrong: ${JSON.stringify(evidence)}`);
+}
+// The failure-time status observation rides the probe evidence (the stub
+// reports the run 'completed').
+if (evidence.run_status_at_failure !== 'completed') {
+  throw new Error(`probe evidence must carry the failure-time run status: ${JSON.stringify(evidence.run_status_at_failure)}`);
+}
+// (d) evidence.run_stop carries the stop argv + exit code + timestamps.
+const runStop = evidence.run_stop;
+if (!runStop || !Array.isArray(runStop.argv)
+    || JSON.stringify(runStop.argv) !== JSON.stringify(['tamandua', 'workflow', 'stop', runId])
+    || runStop.exit_code !== 0 || runStop.signal !== null || runStop.error !== null
+    || !utcRe.test(runStop.stopped_at ?? '')) {
+  throw new Error(`evidence.run_stop must carry the stop argv + exit 0 + stopped_at: ${JSON.stringify(runStop)}`);
+}
+// The stop evidence rides the persisted classification reason too.
+if (JSON.stringify(attempt.classification_reason?.stop) !== JSON.stringify(runStop)) {
+  throw new Error(`classification_reason.stop must carry the run_stop evidence: ${JSON.stringify({reason: attempt.classification_reason, runStop})}`);
+}
+// The probe-evidence.json artifact matches attempt.probe_evidence (run_stop
+// included).
+const artifactPath = path.join(campaignDir, 'evidence', item.id, attempt.id, 'probe-evidence.json');
+const artifact = JSON.parse(fs.readFileSync(artifactPath, 'utf8'));
+if (JSON.stringify(artifact) !== JSON.stringify(evidence)) {
+  throw new Error('probe-stop artifact does not match attempt.probe_evidence (must include run_stop)');
+}
+// (f) the stop happened AT FAILURE TIME — stopped_at/terminal_at are ordered
+// and both are well before the wall cap (caps.wall_min=240 minutes) would
+// have fired: the deadline is ~240min after started_at, the terminal record
+// is seconds after it.
+const startedMs = new Date(attempt.started_at).valueOf();
+const stoppedMs = new Date(runStop.stopped_at).valueOf();
+const terminalMs = new Date(attempt.terminal_at).valueOf();
+const deadlineMs = new Date(attempt.deadline_at).valueOf();
+if (!(stoppedMs >= startedMs) || !(terminalMs >= stoppedMs)) {
+  throw new Error(`stop/terminal timestamps must be ordered at failure time: ${JSON.stringify({started_at: attempt.started_at, stopped_at: runStop.stopped_at, terminal_at: attempt.terminal_at})}`);
+}
+if (terminalMs - startedMs > 60_000) {
+  throw new Error(`probe failure must terminate promptly (took ${terminalMs - startedMs}ms), not ride the wall cap`);
+}
+if (!(deadlineMs - startedMs > 60 * 60_000)) {
+  throw new Error(`the wall cap deadline must be far in the future (started ${attempt.started_at}, deadline ${attempt.deadline_at}) — the terminal record must precede it`);
+}
+// (a) the events file contains the workflow stop argv for the run, fired
+// AFTER the failed pause and before any resume.
+const stubCalls = fs.readFileSync(eventsPath, 'utf8').trim().split('\n')
+  .map((line) => JSON.parse(line));
+const stopCalls = stubCalls.filter((entry) => JSON.stringify(entry.argv).includes('"stop"'));
+const pauseCalls = stubCalls.filter((entry) => JSON.stringify(entry.argv).includes('"pause"'));
+const resumeCalls = stubCalls.filter((entry) => JSON.stringify(entry.argv).includes('"resume"'));
+if (stopCalls.length !== 1
+    || JSON.stringify(stopCalls[0].argv) !== JSON.stringify(['workflow', 'stop', runId])) {
+  throw new Error(`the events file must contain exactly one workflow stop argv for the run: ${JSON.stringify(stopCalls)}`);
+}
+if (pauseCalls.length !== 1 || resumeCalls.length !== 0
+    || stubCalls.indexOf(stopCalls[0]) <= stubCalls.indexOf(pauseCalls[0])) {
+  throw new Error(`the stop must fire after the failed pause and before any resume: ${JSON.stringify(stubCalls)}`);
+}
+// The attempt is NEVER classified runaway-cap-enforced: the stop happened at
+// failure time, well before the wall cap would have fired.
+if (JSON.stringify(attempt).includes('runaway-cap-enforced')) {
+  throw new Error('the attempt must NOT be classified runaway-cap-enforced (stop happened before the wall cap)');
+}
+NODE
+pass "a probe-action-failed CLI failure stops the run and persists the terminal TEST_INFRA_FAIL record at failure time (no wall-cap wait)"
+remove_probe_step
+rm -f -- "$probe_stop_marker"
+
+# Fixture 5 (S18b): an AWAITED STATUS trigger — the resume action arms on
+# {"status":"paused","timeout_s":120} instead of 'now', so it can only fire
+# after the contained run actually reports 'paused'. The stub's `workflow
+# status` returns 'paused' until the awaited resume action fires (writing
+# CONTROLLER_STATUS_TRIGGER_FIRED), then 'completed'; the pause_drain fires
+# FIRST (step:developer:running marker) without flipping the status, so the
+# resume's awaited-status wait genuinely observes the run parked in 'paused'.
+probe_status_manifest="$TEST_ROOT/manifests/probe-status-trigger.jsonl"
+seed_probe_step
+write_probe_case "$probe_status_manifest" "PROBE-STATUS-TRIGGER" \
+  '[{"run":1,"actions":[{"op":"pause_drain","when":"step:developer:running"},{"op":"resume","when":{"status":"paused","timeout_s":120}}]}]'
+probe_status_events="$TEST_ROOT/probe-status-trigger-events.jsonl"
+probe_status_fired="$TEST_ROOT/probe-status-trigger-fired"
+probe_status_output=$(PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$probe_status_events" \
+  CONTROLLER_STATUS_TRIGGER_FIRED="$probe_status_fired" \
+  CONTROLLER_WORKFLOW_MODE=probe-status-trigger run_recorded_campaign "$CONTROLLER" --manifest "$probe_status_manifest") \
+  || fail "status-trigger probe campaign failed: $probe_status_output"
+probe_status_id=$(remember_campaign "$probe_status_output")
+node --input-type=module - "$TT_DIR/var/results/$probe_status_id/state.json" \
+  "$TT_DIR/var/results/$probe_status_id" "$probe_status_events" "$PROBE_RUN_ID" <<'NODE'
+import fs from 'node:fs';
+import path from 'node:path';
+const [statePath, campaignDir, eventsPath, runId] = process.argv.slice(2);
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const item = state.cases[0];
+const attempt = item.attempts[0];
+if (attempt.outcome !== 'PASS') {
+  throw new Error(`status-trigger probe case did not PASS: ${JSON.stringify({outcome: attempt.outcome, reason: attempt.classification_reason})}`);
+}
+const evidence = attempt.probe_evidence;
+if (!evidence || evidence.sequence_outcome !== 'completed' || evidence.actions.length !== 2) {
+  throw new Error(`status-trigger probe evidence is incomplete: ${JSON.stringify(evidence)}`);
+}
+const [drain, resume] = evidence.actions;
+if (drain.op !== 'pause_drain'
+    || drain.trigger !== 'step:developer:running'
+    || JSON.stringify(drain.argv) !== JSON.stringify(['tamandua', 'workflow', 'pause', runId, '--drain'])
+    || drain.exit_code !== 0) {
+  throw new Error(`pause_drain probe record is wrong: ${JSON.stringify(drain)}`);
+}
+if (resume.op !== 'resume'
+    || JSON.stringify(resume.trigger) !== JSON.stringify({ status: 'paused', timeout_s: 120 })
+    || JSON.stringify(resume.argv) !== JSON.stringify(['tamandua', 'workflow', 'resume', runId])
+    || resume.exit_code !== 0) {
+  throw new Error(`awaited-status resume record is wrong: ${JSON.stringify(resume)}`);
+}
+const stubCalls = fs.readFileSync(eventsPath, 'utf8').trim().split('\n')
+  .map((line) => JSON.parse(line))
+  .filter((entry) => JSON.stringify(entry.argv).includes('"pause"') || JSON.stringify(entry.argv).includes('"resume"'));
+if (stubCalls.length !== 2
+    || JSON.stringify(stubCalls[0].argv) !== JSON.stringify(['workflow', 'pause', runId, '--drain'])
+    || JSON.stringify(stubCalls[1].argv) !== JSON.stringify(['workflow', 'resume', runId])) {
+  throw new Error(`status-trigger stub calls are wrong: ${JSON.stringify(stubCalls)}`);
+}
+NODE
+[ -f "$probe_status_fired" ] || fail "the awaited resume action never wrote the status-trigger marker"
+pass "an awaited status trigger (resume on paused) arms the probe only after the run reports paused"
+rm -f -- "$probe_status_fired"
+remove_probe_step
+
+# Fixture 6 (S18b): an AWAITED EVENT trigger — the resume action arms on
+# {"event":"run.process_cleanup","timeout_s":120} instead of 'now'. The
+# contained event stream is seeded with a run.process_cleanup line for the
+# run BEFORE the campaign, and the stub keeps the run 'completed' (TERMINAL)
+# from the start — proving the object event trigger does NOT exit early on a
+# terminal run status (run.process_cleanup legitimately fires after a failed
+# run) and still fires on the seeded event.
+probe_event_manifest="$TEST_ROOT/manifests/probe-event-trigger.jsonl"
+seed_probe_step
+probe_events_dir="$TT_DIR/var/home/.tamandua/events"
+mkdir -p "$probe_events_dir"
+probe_event_seed="$probe_events_dir/$PROBE_SHORT_RUN_ID.jsonl"
+printf '%s\n' "{\"event\":\"run.process_cleanup\",\"ts\":\"2999-01-01T00:00:00.000Z\",\"runId\":\"$PROBE_RUN_ID\"}" > "$probe_event_seed"
+write_probe_case "$probe_event_manifest" "PROBE-EVENT-TRIGGER" \
+  '[{"run":1,"actions":[{"op":"fail_force","when":"step:developer:running"},{"op":"resume","when":{"event":"run.process_cleanup","timeout_s":120}}]}]'
+probe_event_events="$TEST_ROOT/probe-event-trigger-events.jsonl"
+probe_event_output=$(PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$probe_event_events" \
+  CONTROLLER_WORKFLOW_MODE=probe-event-trigger run_recorded_campaign "$CONTROLLER" --manifest "$probe_event_manifest") \
+  || fail "event-trigger probe campaign failed: $probe_event_output"
+probe_event_id=$(remember_campaign "$probe_event_output")
+node --input-type=module - "$TT_DIR/var/results/$probe_event_id/state.json" \
+  "$TT_DIR/var/results/$probe_event_id" "$probe_event_events" "$PROBE_RUN_ID" <<'NODE'
+import fs from 'node:fs';
+import path from 'node:path';
+const [statePath, campaignDir, eventsPath, runId] = process.argv.slice(2);
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const item = state.cases[0];
+const attempt = item.attempts[0];
+if (attempt.outcome !== 'PASS') {
+  throw new Error(`event-trigger probe case did not PASS: ${JSON.stringify({outcome: attempt.outcome, reason: attempt.classification_reason})}`);
+}
+const evidence = attempt.probe_evidence;
+if (!evidence || evidence.sequence_outcome !== 'completed' || evidence.actions.length !== 2) {
+  throw new Error(`event-trigger probe evidence is incomplete: ${JSON.stringify(evidence)}`);
+}
+const [failForce, resume] = evidence.actions;
+if (failForce.op !== 'fail_force'
+    || failForce.trigger !== 'step:developer:running'
+    || failForce.argv?.[0] !== 'tamandua' || failForce.argv?.[1] !== 'workflow'
+    || failForce.argv?.[2] !== 'fail' || failForce.argv?.[3] !== runId
+    || failForce.exit_code !== 0) {
+  throw new Error(`fail_force probe record is wrong: ${JSON.stringify(failForce)}`);
+}
+if (resume.op !== 'resume'
+    || JSON.stringify(resume.trigger) !== JSON.stringify({ event: 'run.process_cleanup', timeout_s: 120 })
+    || JSON.stringify(resume.argv) !== JSON.stringify(['tamandua', 'workflow', 'resume', runId])
+    || resume.exit_code !== 0) {
+  throw new Error(`awaited-event resume record is wrong: ${JSON.stringify(resume)}`);
+}
+const stubCalls = fs.readFileSync(eventsPath, 'utf8').trim().split('\n')
+  .map((line) => JSON.parse(line))
+  .filter((entry) => JSON.stringify(entry.argv).includes('"fail"') || JSON.stringify(entry.argv).includes('"resume"'));
+if (stubCalls.length !== 2
+    || stubCalls[0].argv?.[1] !== 'fail'
+    || JSON.stringify(stubCalls[1].argv) !== JSON.stringify(['workflow', 'resume', runId])) {
+  throw new Error(`event-trigger stub calls are wrong: ${JSON.stringify(stubCalls)}`);
+}
+NODE
+pass "an awaited event trigger (resume on run.process_cleanup) fires even though the run is already terminal"
+rm -f -- "$probe_event_seed"
+remove_probe_step
+
+# Fixture 7 (S18b): an AWAITED object trigger that NEVER fires — the status
+# stays 'completed' (TERMINAL) the whole time yet the object trigger does NOT
+# exit early on the terminal status: it waits out its OWN timeout_s (1s) and
+# then fails with probe-trigger-unreached. The failure message must render the
+# object trigger shape (JSON-stringify, never '[object Object]'), proving both
+# the self-bound and the object-form rendering.
+probe_unreached_obj_manifest="$TEST_ROOT/manifests/probe-unreached-object.jsonl"
+write_probe_case "$probe_unreached_obj_manifest" "PROBE-UNREACHED-OBJECT" \
+  '[{"run":1,"actions":[{"op":"resume","when":{"status":"never","timeout_s":1}}]}]'
+probe_unreached_obj_events="$TEST_ROOT/probe-unreached-object-events.jsonl"
+probe_unreached_obj_output=$(PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$probe_unreached_obj_events" \
+  CONTROLLER_WORKFLOW_MODE=stdout run_recorded_campaign "$CONTROLLER" --manifest "$probe_unreached_obj_manifest") \
+  || fail "unreached-object-trigger probe campaign failed: $probe_unreached_obj_output"
+probe_unreached_obj_id=$(remember_campaign "$probe_unreached_obj_output")
+node --input-type=module - "$TT_DIR/var/results/$probe_unreached_obj_id/state.json" "$PROBE_RUN_ID" <<'NODE'
+import fs from 'node:fs';
+const [statePath, runId] = process.argv.slice(2);
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const attempt = state.cases[0].attempts[0];
+if (attempt.outcome !== 'TEST_INFRA_FAIL'
+    || attempt.classification_reason?.category !== 'probe-trigger-unreached'
+    || attempt.classification_reason?.op !== 'resume') {
+  throw new Error(`unreached object trigger did not classify TEST_INFRA_FAIL probe-trigger-unreached: ${JSON.stringify({outcome: attempt.outcome, reason: attempt.classification_reason})}`);
+}
+// The persisted trigger is the raw object AND the message renders its JSON
+// shape (never '[object Object]').
+if (JSON.stringify(attempt.classification_reason?.trigger)
+    !== JSON.stringify({ status: 'never', timeout_s: 1 })) {
+  throw new Error(`unreached object trigger must persist the object trigger: ${JSON.stringify(attempt.classification_reason?.trigger)}`);
+}
+if (!attempt.classification_reason?.message.includes('{"status":"never","timeout_s":1}')) {
+  throw new Error(`unreached object trigger message must JSON-render the object trigger: ${JSON.stringify(attempt.classification_reason?.message)}`);
+}
+// The object trigger must NOT exit early on the (already-terminal) run status:
+// it waited its own timeout_s. The waited_ms must be >= ~1s (the poll cadence
+// is 500ms, so a 1s timeout waits at least one full poll round).
+if (!(attempt.classification_reason?.waited_ms >= 900)) {
+  throw new Error(`object trigger must be bounded by its own timeout_s (waited ${attempt.classification_reason?.waited_ms}ms, run terminal the whole time)`);
+}
+if (!attempt.probe_evidence || attempt.probe_evidence.sequence_outcome !== 'failed'
+    || attempt.probe_evidence.actions.length !== 1
+    || attempt.probe_evidence.actions[0].failure?.category !== 'probe-trigger-unreached'
+    || attempt.probe_evidence.actions[0].argv !== null) {
+  throw new Error(`unreached-object probe evidence is wrong: ${JSON.stringify(attempt.probe_evidence)}`);
+}
+NODE
+pass "an object trigger that never fires waits its own timeout_s (no early terminal exit) and JSON-renders in the failure message"
 
 # ── E3.C US-007: multi-launch probe orchestration (W3.20/W3.22 shapes) ──
 # The controller must GENUINELY execute multi-run probe_sequences — W3.20's two
@@ -1852,7 +2299,11 @@ pass "two-run sequential probe sequence (W3.20 shape) launches sequentially and 
 # state options), then restart_daemon executes ONCE mid-flight via
 # daemon-control (stub records its argv — never a bare `tamandua restart`);
 # per-run recovery (within 2 dispatch intervals) + token-flush preservation
-# are recorded as evidence. All three runs complete → PASS.
+# are recorded as evidence. S24 (US-007) healthy variant: the restarted
+# daemon's environ (seam-injected — no real daemon in this stub suite)
+# carries the adapters-bin prepend, so the controller's post-restart PATH
+# re-assertion PASSES and the re-assertion evidence rides the restart record.
+# All three runs complete → PASS.
 daemon_control_stub="$TEST_ROOT/daemon-control-stub"
 cat > "$daemon_control_stub" <<'SH'
 #!/usr/bin/env bash
@@ -1873,15 +2324,16 @@ multi_conc_output=$(PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$
   CONTROLLER_WORKFLOW_MODE=multi-run-conc CONTROLLER_MULTI_RUN_COUNTER="$multi_conc_counter" \
   CONTROLLER_DAEMON_EVENTS="$multi_conc_daemon_events" \
   TT_CONTROLLER_DAEMON_CONTROL_PATH="$daemon_control_stub" TT_CONTROLLER_TOKEN_SETTLE_MS=20 \
+  TT_CONTROLLER_DAEMON_ENVIRON_SAMPLE="$TT_DIR/var/adapters-bin:/usr/bin:/bin" \
   run_recorded_campaign "$CONTROLLER" --manifest "$multi_conc_manifest" --stagger 50ms) \
   || fail "three-concurrent-run probe campaign failed: $multi_conc_output"
 multi_conc_id=$(remember_campaign "$multi_conc_output")
 node --input-type=module - "$TT_DIR/var/results/$multi_conc_id/state.json" "$multi_conc_events" \
   "$multi_conc_daemon_events" "$daemon_control_stub" \
-  "$MULTI_RUN_CONC_1" "$MULTI_RUN_CONC_2" "$MULTI_RUN_CONC_3" <<'NODE'
+  "$MULTI_RUN_CONC_1" "$MULTI_RUN_CONC_2" "$MULTI_RUN_CONC_3" "$TT_DIR/var/adapters-bin" <<'NODE'
 import fs from 'node:fs';
 import path from 'node:path';
-const [statePath, eventsPath, daemonEventsPath, daemonStubPath, run1Id, run2Id, run3Id] = process.argv.slice(2);
+const [statePath, eventsPath, daemonEventsPath, daemonStubPath, run1Id, run2Id, run3Id, adaptersBin] = process.argv.slice(2);
 const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
 const item = state.cases[0];
 const attempt = item.attempts[0];
@@ -1935,6 +2387,16 @@ if (restart.provenance?.kind !== 'real'
     || !['unavailable', 'pidfile', 'pidfile+identity'].includes(restart.provenance.source)) {
   throw new Error(`daemon restart must record daemon provenance: ${JSON.stringify(restart.provenance)}`);
 }
+// S24 (US-007): the post-restart PATH re-assertion PASSED (seam-injected
+// environ carries adapters-bin FIRST) and its evidence rides the restart
+// record — checked_at, adapters_bin, path_sample, kind 'leading'.
+const pi = restart.path_invariant;
+if (!pi || pi.ok !== true || pi.verifiable !== true || pi.kind !== 'leading'
+    || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(pi.checked_at ?? '')
+    || pi.adapters_bin !== adaptersBin
+    || typeof pi.path_sample !== 'string' || !pi.path_sample.startsWith(pi.adapters_bin)) {
+  throw new Error(`restart path_invariant re-assertion evidence is wrong: ${JSON.stringify(pi)}`);
+}
 const stubCalls = fs.readFileSync(eventsPath, 'utf8').trim().split('\n')
   .map((line) => JSON.parse(line));
 if (stubCalls.some((entry) => entry.argv[0] === 'workflow' && entry.argv[1] === 'restart')
@@ -1949,7 +2411,80 @@ if (daemonCalls.length !== 1
 }
 NODE
 remove_multi_steps
-pass "three-concurrent-run probe sequence (W3.22 shape) restarts the contained daemon via daemon-control and records per-run recovery"
+pass "three-concurrent-run probe sequence (W3.22 shape) restarts the contained daemon via daemon-control, re-asserts the adapters-bin PATH invariant, and records per-run recovery"
+
+# Fixture 2b (S24 US-007): a restart whose restarted daemon environ LACKS the
+# adapters-bin prepend (simulated via TT_CONTROLLER_DAEMON_ENVIRON_SAMPLE — the
+# operator's ~/.local/bin precedes the contained dirs, the W3.23 leak shape)
+# must record the DISTINCT 'daemon-path-invariant-violated' failure with the
+# re-assertion evidence and classify TEST_INFRA_FAIL — never a silent PASS
+# after a leaky restart.
+multi_conc_viol_manifest="$TEST_ROOT/manifests/multi-run-conc-violation.jsonl"
+remove_multi_steps
+seed_multi_step "$PROBE_DB" "$MULTI_RUN_CONC_1_SHORT" "developer" "multi-run-conc-1-dev"
+write_probe_case "$multi_conc_viol_manifest" "MULTI-RUN-CONC-VIOLATION" \
+  '[{"run":1,"actions":[{"op":"restart_daemon","when":"step:developer:running","expect":{"recovery_within_dispatch_intervals":2,"token_flush_preserved":true,"run_completes":true}}]},{"run":2,"actions":[{"op":"restart_daemon","when":"step:developer:running","expect":{"recovery_within_dispatch_intervals":2,"token_flush_preserved":true,"run_completes":true}}]},{"run":3,"actions":[{"op":"restart_daemon","when":"step:developer:running","expect":{"recovery_within_dispatch_intervals":2,"token_flush_preserved":true,"run_completes":true}}]}]'
+multi_conc_viol_events="$TEST_ROOT/multi-run-conc-violation-events.jsonl"
+multi_conc_viol_daemon_events="$TEST_ROOT/multi-run-conc-violation-daemon-events.jsonl"
+multi_conc_viol_counter="$TEST_ROOT/multi-run-conc-violation-counter"
+multi_conc_viol_output=$(PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$multi_conc_viol_events" \
+  CONTROLLER_WORKFLOW_MODE=multi-run-conc CONTROLLER_MULTI_RUN_COUNTER="$multi_conc_viol_counter" \
+  CONTROLLER_DAEMON_EVENTS="$multi_conc_viol_daemon_events" \
+  TT_CONTROLLER_DAEMON_CONTROL_PATH="$daemon_control_stub" TT_CONTROLLER_TOKEN_SETTLE_MS=20 \
+  TT_CONTROLLER_DAEMON_ENVIRON_SAMPLE="$HOME/.local/bin:$TT_DIR/var/adapters-bin:/usr/bin:/bin" \
+  run_recorded_campaign "$CONTROLLER" --manifest "$multi_conc_viol_manifest" --stagger 50ms) \
+  || fail "path-invariant-violation probe campaign failed: $multi_conc_viol_output"
+multi_conc_viol_id=$(remember_campaign "$multi_conc_viol_output")
+node --input-type=module - "$TT_DIR/var/results/$multi_conc_viol_id/state.json" \
+  "$multi_conc_viol_daemon_events" "$daemon_control_stub" "$TT_DIR/var/adapters-bin" \
+  "$HOME/.local/bin" <<'NODE'
+import fs from 'node:fs';
+const [statePath, daemonEventsPath, daemonStubPath, adaptersBin, operatorLocalBin] = process.argv.slice(2);
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const item = state.cases[0];
+const attempt = item.attempts[0];
+if (attempt.outcome !== 'TEST_INFRA_FAIL') {
+  throw new Error(`path-invariant violation must classify TEST_INFRA_FAIL: ${JSON.stringify({outcome: attempt.outcome, reason: attempt.classification_reason})}`);
+}
+if (attempt.classification_reason?.category !== 'daemon-path-invariant-violated') {
+  throw new Error(`the distinct failure category must be daemon-path-invariant-violated: ${JSON.stringify(attempt.classification_reason)}`);
+}
+if (attempt.classification_reason?.path_invariant?.ok !== false
+    || attempt.classification_reason?.path_invariant?.reason !== 'operator-bin-precedes'
+    || attempt.classification_reason?.path_invariant?.operator_dir !== operatorLocalBin) {
+  throw new Error(`the classification reason must carry the path_invariant violation evidence: ${JSON.stringify(attempt.classification_reason?.path_invariant)}`);
+}
+const evidence = attempt.probe_evidence;
+if (!evidence || evidence.sequence_outcome !== 'failed'
+    || evidence.failure?.category !== 'daemon-path-invariant-violated'
+    || !Array.isArray(evidence.daemon_restarts) || evidence.daemon_restarts.length !== 1) {
+  throw new Error(`path-invariant violation probe evidence is wrong: ${JSON.stringify(evidence)}`);
+}
+const restart = evidence.daemon_restarts[0];
+if (restart.op !== 'restart_daemon' || restart.kind !== 'real' || restart.exit_code !== 0) {
+  throw new Error(`the daemon-control restart itself must have succeeded (exit 0): ${JSON.stringify(restart)}`);
+}
+const pi = restart.path_invariant;
+if (!pi || pi.ok !== false || pi.verifiable !== true || pi.reason !== 'operator-bin-precedes'
+    || pi.operator_dir !== operatorLocalBin
+    || pi.adapters_bin !== adaptersBin
+    || pi.category !== 'daemon-path-invariant-violated'
+    || typeof pi.message !== 'string' || !pi.message.includes('adapters-bin')
+    || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(pi.checked_at ?? '')
+    || typeof pi.path_sample !== 'string'
+    || !pi.path_sample.startsWith(operatorLocalBin)
+    || !pi.path_sample.includes(adaptersBin)) {
+  throw new Error(`restart path_invariant violation evidence is wrong: ${JSON.stringify(pi)}`);
+}
+const daemonCalls = fs.readFileSync(daemonEventsPath, 'utf8').trim().split('\n')
+  .map((line) => JSON.parse(line));
+if (daemonCalls.length !== 1
+    || JSON.stringify(daemonCalls[0].argv) !== JSON.stringify(['real', 'restart'])) {
+  throw new Error(`daemon-control must still be invoked exactly once with [real restart]: ${JSON.stringify(daemonCalls)}`);
+}
+NODE
+remove_multi_steps
+pass "a restart whose daemon environ lacks the adapters-bin prepend records daemon-path-invariant-violated and classifies TEST_INFRA_FAIL"
 
 # ── E3.C US-008: chaos wiring (honor manifest chaos blocks) ──────────
 # The controller's real-case arm must honor a case's manifest `chaos` block
@@ -2766,7 +3301,21 @@ cat > "$us006_pair_script" <<'NODE'
 // provisions the shared tt-ts work clone at
 // var/fixtures/work/US006-REPLAY-PAIR/tt-ts and (except provision-only)
 // seeds the replay snapshot fixture tree the controller's gate will read.
-// argv: <fixture-root> <mode: hit|miss|malformed|provision-only>
+// argv: <fixture-root> <mode: hit|hit-faithful|miss|malformed|provision-only>
+// Modes:
+//   hit / miss / malformed   seed the fixture tree under <fixture-root> the
+//                            gate reads via the self-test fixture root. Rows
+//                            carry BARE UUID run_ids (the NEW snapshot shape —
+//                            suite-observations rows store the bare UUID while
+//                            attempt.run_id is run-<uuid>-prefixed).
+//   hit-faithful             seed a genuine suite.cache_hit observation into
+//                            the CONTAINED event stream (var/home/.tamandua/
+//                            events/all.jsonl) for the replay run id (bare
+//                            UUID), so a gated replay case's real oracle
+//                            snapshot carries the cache-hit row. No fixture
+//                            tree is written — the campaign runs bare and the
+//                            gate resolves the ledger via
+//                            oracle_evidence.provenance.path (the NEW shape).
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -2791,7 +3340,25 @@ if (treeResult.status !== 0) {
 }
 const treeHash = treeResult.stdout.trim();
 const cmdHash = createHash('sha256').update('npm test').digest('hex');
-const runId = 'run-aaaaaaaa-1111-4111-8111-111111111111';
+const runId = 'aaaaaaaa-1111-4111-8111-111111111111'; // BARE UUID (new shape)
+if (mode === 'hit-faithful') {
+  // Seed the contained event stream with a genuine cache-hit observation for
+  // the replay run (bare UUID runId — the NEW snapshot shape; the gate
+  // normalizes both sides of the run-row filter).
+  const eventsPath = 'var/home/.tamandua/events/all.jsonl';
+  fs.mkdirSync(path.dirname(eventsPath), { recursive: true });
+  fs.appendFileSync(eventsPath, `${JSON.stringify({
+    event: 'suite.cache_hit',
+    ts: new Date().toISOString(),
+    runId,
+    originRepo,
+    treeHash,
+    cmdHash,
+    savedDurationMs: 1234,
+    force: false,
+  })}\n`);
+  process.exit(0);
+}
 const snapDir = path.join(fixtureRoot, 'snapshots', 'US006-REPLAY', 'attempt-1');
 fs.mkdirSync(snapDir, { recursive: true });
 if (mode === 'malformed') {
@@ -2827,10 +3394,10 @@ fs.writeFileSync(path.join(snapDir, 'snapshot.json'), `${JSON.stringify({
 })}\n`);
 NODE
 us006_write_manifest() {
-  local manifest="$1" fixture_root="$2" mode="$3"
-  node --input-type=module - "$manifest" "$fixture_root" "$mode" "$us006_pair_script" <<'NODE'
+  local manifest="$1" fixture_root="$2" mode="$3" oracles="${4:-[]}"
+  node --input-type=module - "$manifest" "$fixture_root" "$mode" "$us006_pair_script" "$oracles" <<'NODE'
 import fs from 'node:fs';
-const [manifestPath, fixtureRoot, mode, pairScript] = process.argv.slice(2);
+const [manifestPath, fixtureRoot, mode, pairScript, oracles] = process.argv.slice(2);
 const pair = {
   id: 'US006-REPLAY-PAIR', wave: 3, workflow: 'local', fixture: 'tt-ts', harness: 'local',
   task: 'cases/tasks/tier1/W1.L2-ts.md', context: { execution_mode: 'scripted' },
@@ -2843,7 +3410,7 @@ const replay = {
   task: 'cases/tasks/tier1/W1.REPLAY-ts.md',
   context: { execution_mode: 'real', test_cmd: 'npm test', replay_of: 'US006-REPLAY-PAIR' },
   caps: { tokens: 100000, wall_min: 240 }, requires: {}, boundary_files: [], forbidden: [],
-  oracles: [], gates: ['TIER1'], chaos: null, shed_ok: false, mandatory: true, class: 'verification',
+  oracles: JSON.parse(oracles), gates: ['TIER1'], chaos: null, shed_ok: false, mandatory: true, class: 'verification',
 };
 fs.writeFileSync(manifestPath, `${[pair, replay].map((record) => JSON.stringify(record)).join('\n')}\n`);
 NODE
@@ -2857,6 +3424,24 @@ us006_run_gate_campaign() {
     TT_CONTROLLER_REPLAY_PAIR_WAIT_MS=0 \
     run_recorded_campaign "$CONTROLLER" --manifest "$manifest"
 }
+# S17 (US-001): production-faithful replay campaign. The replay case carries a
+# GATING oracle so the controller's REAL oracle-snapshot machinery writes
+# attempt.oracle_evidence in the NEW shape ({schema_version,status,references,
+# provenance} — no ledger_path), and the gate must resolve the snapshot ledger
+# via oracle_evidence.provenance.path. Runs WITHOUT the fixture-root override
+# (root === campaignDir) so the gate reads the REAL snapshot the machinery
+# wrote. The oracle is a self-test STUB (TT_CONTROLLER_SELF_TEST_ORACLES_ROOT
+# beneath torture-test/var) — the oracle itself is trivial; what matters is
+# that caseNeedsGatingEvidence fires and the snapshot machinery completes.
+us006_run_faithful_campaign() {
+  local manifest="$1"
+  PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$workflow_events" \
+    CONTROLLER_WORKFLOW_MODE=harvest-status \
+    TT_CONTROLLER_SELF_TEST=1 \
+    TT_CONTROLLER_SELF_TEST_ORACLES_ROOT="$us006_self_test_oracles_root" \
+    TT_CONTROLLER_REPLAY_PAIR_WAIT_MS=0 \
+    run_recorded_campaign "$CONTROLLER" --manifest "$manifest"
+}
 us006_run_bare_campaign() {
   local manifest="$1"
   PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$workflow_events" \
@@ -2864,6 +3449,39 @@ us006_run_bare_campaign() {
     TT_CONTROLLER_REPLAY_PAIR_WAIT_MS=0 \
     run_recorded_campaign "$CONTROLLER" --manifest "$manifest"
 }
+
+# S17 (US-001): self-test oracle root for the production-faithful replay gate
+# campaign — a stub O1 that returns a valid contract PASS. It lives beneath
+# torture-test/var (never torture-test/oracles/**, which a concurrent SFX-B
+# run owns). Only the snapshot machinery matters here; the oracle verdict is
+# evidence, and the replay gate's hit/miss classification does not depend on
+# it.
+us006_self_test_oracles_root="$TEST_ROOT/self-test-oracles"
+mkdir -p "$us006_self_test_oracles_root"
+cat > "$us006_self_test_oracles_root/O1" <<'NODE'
+#!/usr/bin/env node
+import fs from 'node:fs';
+const contextFlag = process.argv.indexOf('--context');
+if (process.argv[2] !== '--contract-version' || process.argv[3] !== '1'
+    || contextFlag < 0 || process.argv[contextFlag + 1] !== process.env.TT_ORACLE_CONTEXT) process.exit(9);
+const context = JSON.parse(fs.readFileSync(process.env.TT_ORACLE_CONTEXT, 'utf8'));
+if (context.contract_version !== 1 || context.oracle_id !== process.env.TT_ORACLE_ID
+    || context.case.id !== process.env.TT_CASE_ID || context.campaign.id !== process.env.TT_CAMPAIGN_ID
+    || !Array.isArray(context.attempts)) process.exit(8);
+const started = new Date().toISOString();
+const evidencePath = `${process.env.TT_ORACLE_EVIDENCE_DIR}/mechanical.json`;
+fs.writeFileSync(evidencePath, `${JSON.stringify({mechanical:true,run_id:context.run_id})}\n`, {flag:'wx'});
+console.log(JSON.stringify({
+  contract_version: 1, oracle_id: process.env.TT_ORACLE_ID, result: 'PASS',
+  started_at: started, finished_at: new Date().toISOString(), findings: [],
+  evidence: [{path:'mechanical.json', kind:'filesystem'}],
+}));
+NODE
+chmod +x "$us006_self_test_oracles_root/O1"
+# The faithful campaign seeds a suite.cache_hit event into the contained
+# event stream; back it up so the test leaves no residue.
+US006_EVENTS_PATH="$TT_DIR/var/home/.tamandua/events/all.jsonl"
+US006_EVENTS_BACKUP="$TEST_ROOT/original-us006-events.jsonl"
 
 us006_hit_manifest="$TEST_ROOT/manifests/us006-hit.jsonl"
 us006_hit_fixture="$TEST_ROOT/replay-fixture-hit"
@@ -2907,6 +3525,86 @@ if (attempt.classification_reason !== undefined) {
 }
 NODE
 pass "REPLAY cache HIT passes and records the assertion evidence on the attempt"
+
+# ── S17 (US-001): production-faithful replay cache-HIT gate ────────────────
+# The fixture tests above read a caller-seeded snapshot tree via the
+# fixture-relative fallback. Production instead writes attempt.oracle_evidence
+# with completeOracleEvidenceSnapshot()'s NEW shape — {schema_version,status,
+# references,provenance} with NO ledger_path — and the gate must resolve the
+# ledger via oracle_evidence.provenance.path (S17; the old gate read only
+# .ledger_path -> null -> replay-snapshot-missing, killing W1.REPLAY-* despite
+# the genuine TAMANDUA-TEST CACHED hit). This campaign runs the replay case
+# with a GATING oracle so the REAL machinery writes the new-shape
+# oracle_evidence and the REAL snapshot; the pair seeds a genuine
+# suite.cache_hit observation (bare UUID run id — the stored row shape) into
+# the contained event stream. The gate must: (1) resolve the ledger via
+# provenance.path, and (2) normalize BOTH sides of the run-row filter so the
+# bare-UUID rows match the run-<uuid> attempt id.
+mkdir -p "$(dirname "$US006_EVENTS_PATH")"
+if [ -f "$US006_EVENTS_PATH" ]; then cp "$US006_EVENTS_PATH" "$US006_EVENTS_BACKUP"; fi
+: > "$US006_EVENTS_PATH"
+us006_faithful_manifest="$TEST_ROOT/manifests/us006-faithful.jsonl"
+us006_faithful_fixture="$TEST_ROOT/replay-fixture-faithful"
+us006_write_manifest "$us006_faithful_manifest" "$us006_faithful_fixture" "hit-faithful" '["O1"]'
+us006_faithful_output=$(us006_run_faithful_campaign "$us006_faithful_manifest") \
+  || fail "production-faithful replay cache-HIT campaign failed: $us006_faithful_output"
+us006_faithful_id=$(remember_campaign "$us006_faithful_output")
+node --input-type=module - "$TT_DIR/var/results/$us006_faithful_id/state.json" \
+  "$TT_DIR/var/fixtures/work/US006-REPLAY-PAIR/tt-ts" <<'NODE'
+import fs from 'node:fs';
+import { spawnSync } from 'node:child_process';
+const [statePath, clonePath] = process.argv.slice(2);
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const pair = state.cases.find((c) => c.id === 'US006-REPLAY-PAIR');
+const replay = state.cases.find((c) => c.id === 'US006-REPLAY');
+if (pair.outcome !== 'PASS') throw new Error(`pair must PASS first: ${JSON.stringify(pair)}`);
+if (replay.outcome !== 'PASS') throw new Error(`faithful replay cache HIT must PASS: ${JSON.stringify(replay)}`);
+const attempt = replay.attempts.at(-1);
+// NEW snapshot shape: the real machinery wrote oracle_evidence with
+// provenance.path and NO ledger_path (completeOracleEvidenceSnapshot's
+// return). The gate must resolve the ledger through provenance.path.
+if (!attempt.oracle_evidence || attempt.oracle_evidence.status !== 'COMPLETE') {
+  throw new Error(`oracle machinery did not complete the new-shape oracle_evidence: ${JSON.stringify(attempt.oracle_evidence)}`);
+}
+if (Object.hasOwn(attempt.oracle_evidence, 'ledger_path')) {
+  throw new Error(`new-shape oracle_evidence must NOT carry ledger_path: ${JSON.stringify(attempt.oracle_evidence)}`);
+}
+if (typeof attempt.oracle_evidence.provenance?.path !== 'string'
+    || attempt.oracle_evidence.provenance.path.length === 0) {
+  throw new Error(`new-shape oracle_evidence must carry provenance.path: ${JSON.stringify(attempt.oracle_evidence)}`);
+}
+const gate = attempt?.replay_cache_assertion;
+if (gate?.ok !== true || gate.evidence?.status !== 'replay-cache-hit') {
+  throw new Error(`faithful hit assertion evidence is missing on the attempt: ${JSON.stringify(attempt)}`);
+}
+// The hit binds to the NORMALIZED run-<uuid> form even though the snapshot
+// rows carry bare UUIDs.
+if (gate.evidence.run_id !== 'run-aaaaaaaa-1111-4111-8111-111111111111') {
+  throw new Error(`assertion must bind to the normalized run id: ${JSON.stringify(gate.evidence)}`);
+}
+if (gate.evidence.hit_observation?.run_id !== 'aaaaaaaa-1111-4111-8111-111111111111') {
+  throw new Error(`the snapshot row must carry the bare-UUID run id (matched via normalization): ${JSON.stringify(gate.evidence.hit_observation)}`);
+}
+if (!gate.evidence.observed_phases.includes('replay')) {
+  throw new Error(`observed phases must include the cache-hit replay phase: ${JSON.stringify(gate.evidence.observed_phases)}`);
+}
+const tree = spawnSync('git', ['-C', clonePath, 'rev-parse', '--verify', 'HEAD^{tree}'], { encoding: 'utf8' }).stdout.trim();
+if (gate.evidence.key.tree_hash !== tree || !/^[0-9a-f]{40,64}$/.test(tree)) {
+  throw new Error(`assertion key must bind to the pair's committed tree: ${JSON.stringify(gate.evidence.key)} vs ${tree}`);
+}
+if (gate.evidence.hit_observation?.marker !== 'TAMANDUA-TEST CACHED') {
+  throw new Error(`hit observation must carry the replay marker: ${JSON.stringify(gate.evidence.hit_observation)}`);
+}
+if ((replay.findings ?? []).some((f) => f.type === 'REPLAY_CACHE_MISS')) {
+  throw new Error(`a hit must never record a REPLAY_CACHE_MISS finding: ${JSON.stringify(replay.findings)}`);
+}
+if (attempt.classification_reason !== undefined) {
+  throw new Error(`a hit PASS must carry no classification reason: ${JSON.stringify(attempt.classification_reason)}`);
+}
+NODE
+pass "REPLAY cache HIT resolves the new-shape oracle_evidence via provenance.path and normalizes bare-UUID rows"
+rm -f -- "$US006_EVENTS_PATH"
+if [ -f "$US006_EVENTS_BACKUP" ]; then mv "$US006_EVENTS_BACKUP" "$US006_EVENTS_PATH"; fi
 
 us006_miss_manifest="$TEST_ROOT/manifests/us006-miss.jsonl"
 us006_miss_fixture="$TEST_ROOT/replay-fixture-miss"

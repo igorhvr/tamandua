@@ -126,11 +126,14 @@ fi
 
 # ── AC2: ensure-up starts the real daemon and reports it up on 4339 ──
 # S15 US-001: the parity guard compares the daemon's /control/health
-# buildVersion against THIS worktree's dist/version, and daemon-control
-# launches `tamandua` from the caller's PATH (which would otherwise resolve
-# the OPERATOR's installed build). Prepend the worktree's own bin/ so the
-# contained daemon runs THIS tree's build and parity matches deterministically
-# in any environment (installed build in sync or not).
+# buildVersion against THIS worktree's dist/version. daemon-control
+# reconstructs the contained launch PATH itself (S24/US-006: var/adapters-bin
+# FIRST, then the env script's PATH, then the remaining caller PATH with
+# operator bin dirs reordered after), so `tamandua` resolves through the
+# caller-PATH remainder — without the worktree's own bin/ prepended it would
+# otherwise resolve the OPERATOR's installed build. Prepend the worktree's
+# own bin/ so the contained daemon runs THIS tree's build and parity matches
+# deterministically in any environment (installed build in sync or not).
 set +e
 ENSURE_OUT="$(PATH="$TT_REPO_ROOT/bin:$PATH" "$HELPER" ensure-up 2>&1)"; ENSURE_RC=$?
 set -e
@@ -206,18 +209,55 @@ else
 fi
 
 # ── AC6b: an already-up daemon WITHOUT the prepend gets restarted ────
-# Stop the prepended daemon, start one DIRECTLY via daemon-control (no
-# prepend — daemon-control composes PATH from its own env; the worktree
-# bin/ is kept so the S15 parity guard still sees a matching build and the
-# restart is triggered by the missing prepend, not a build skew), then
-# ensure-up must detect the missing prepend and restart the daemon with it.
+# (US-006 / S24) daemon-control now reconstructs the contained PATH itself
+# on EVERY start/restart (var/adapters-bin FIRST, operator bin dirs after the
+# contained dirs), so a daemon-control-started daemon ALWAYS carries the
+# prepend. The unprepended shape (a daemon whose PATH lacks the adapters-bin
+# prepend) can only arise from a NON-daemon-control launch — e.g. the product
+# CLI auto-start (`workflow run` -> ensureDaemonControlAvailable ->
+# startDaemon) or a pre-US-006 daemon. AC6b simulates exactly that shape:
+# launch the product CLI daemon DIRECTLY under the contained env with a PATH
+# that lacks adapters-bin, record a daemon-control provenance naming it (so
+# daemon-control status reports RUNNING), then ensure-up must detect the
+# missing prepend and restart with it (verified by PID change + new environ).
 set +e
 "$DC" real stop >/dev/null 2>&1
 sleep 1
-PATH="$TT_REPO_ROOT/bin:$PATH" "$DC" real start >/dev/null 2>&1
-DIRECT_START_RC=$?
 set -e
-if [ "$DIRECT_START_RC" -eq 0 ]; then ok "AC6b direct daemon-control start (no prepend) exits 0"; else fail "AC6b direct start rc=$DIRECT_START_RC"; fi
+TT_ENV_REAL="$TT_DIR/env/tt-env.sh"
+DIRECT_SPAWN_ENV="$(env -i bash "$TT_ENV_REAL" print)"
+DIRECT_DASH_PORT="$(echo "$DIRECT_SPAWN_ENV" | sed -n 's/^TAMANDUA_DASHBOARD_PORT=//p' | head -1)"
+# The direct launch PATH: worktree bin/ first (this tree's build), the env
+# script's node-bin dir (node survives the contained HOME), then the caller
+# PATH. Deliberately NO adapters-bin — the unprepended (leak) shape.
+# NOTE: the direct launch starts ONLY daemon + dashboard (no standalone MCP):
+# daemon-control's stop manages the recorded daemon pid + the dashboard via
+# `tamandua dashboard stop`, and a systemd-scope teardown is what normally
+# reaps a detached MCP standalone — outside a scope the MCP would linger and
+# the stop's final port check would fail. MCP is irrelevant to the
+# missing-prepend restart assertion (ensure-up checks the control port 4339
+# and the daemon environ only).
+DIRECT_NODE_BIN="$(echo "$DIRECT_SPAWN_ENV" | sed -n 's/^TT_NODE_BIN_DIR=//p' | head -1)"
+DIRECT_LAUNCH_PATH="$TT_REPO_ROOT/bin"
+if [ -n "$DIRECT_NODE_BIN" ]; then DIRECT_LAUNCH_PATH="$DIRECT_LAUNCH_PATH:$DIRECT_NODE_BIN"; fi
+DIRECT_LAUNCH_PATH="$DIRECT_LAUNCH_PATH:$PATH"
+(
+  cd "$TT_REPO_ROOT" || exit 1
+  env -i $DIRECT_SPAWN_ENV PATH="$DIRECT_LAUNCH_PATH" \
+    bash -c "tamandua daemon start && tamandua dashboard start --port $DIRECT_DASH_PORT" \
+    >"$TMP/direct-launch.log" 2>&1
+) &
+# Wait for the direct (unprepended) daemon to come up on the control port.
+DIRECT_OK=false
+for _attempt in $(seq 1 60); do
+  if timeout 1 bash -c "echo >/dev/tcp/localhost/4339" 2>/dev/null; then DIRECT_OK=true; break; fi
+  sleep 0.5
+done
+if $DIRECT_OK; then
+  ok "AC6b direct product-CLI daemon (no adapters-bin prepend) came up"
+else
+  fail "AC6b direct product-CLI daemon did not come up: $(tail -3 "$TMP/direct-launch.log" 2>/dev/null | tr '\n' ' ')"
+fi
 STATE_DIR_LINE="$(env -i bash "$TT_REPO_ROOT/torture-test/env/tt-env.sh" print 2>/dev/null | grep '^TAMANDUA_STATE_DIR=' | head -n1)"
 STATE_DIR="${STATE_DIR_LINE#TAMANDUA_STATE_DIR=}"
 DIRECT_PID=""
@@ -229,18 +269,50 @@ fi
 if [ -n "$DIRECT_PID" ] && [ -d "/proc/$DIRECT_PID" ]; then
   DIRECT_PATH="$(tr '\0' '\n' < "/proc/$DIRECT_PID/environ" 2>/dev/null | grep '^PATH=' | head -n1 | cut -d= -f2-)"
   case ":$DIRECT_PATH:" in
-    *":$ADAPTERS_BIN_DIR:"*) fail "AC6b direct-started daemon unexpectedly has the prepend (test setup broken)" ;;
-    *) ok "AC6b direct-started daemon baseline lacks the prepend" ;;
+    *":$ADAPTERS_BIN_DIR:"*) fail "AC6b direct-launched daemon unexpectedly has the prepend (test setup broken)" ;;
+    *) ok "AC6b direct-launched daemon baseline lacks the prepend" ;;
   esac
 else
-  fail "AC6b could not capture direct-started daemon PID"
+  fail "AC6b could not capture direct-launched daemon PID"
 fi
-RESTART_OUT="$(PATH="$TT_REPO_ROOT/bin:$PATH" "$HELPER" ensure-up 2>&1)"; RESTART_RC=$?
+# Record daemon-control provenance naming the DIRECT daemon so
+# daemon-control status reports RUNNING (the direct launch is not
+# daemon-control-managed; the record makes it visible to the status/stop
+# machinery and lets ensure-up's missing-prepend restart branch fire).
+DIRECT_START_TIME="$(node "$SCRIPT_DIR/tt-process-identity.mjs" --get "$DIRECT_PID" 2>/dev/null || true)"
+cat > "$PROV_FILE" <<PROVEOF
+{
+  "name": "real",
+  "kind": "real",
+  "pid": ${DIRECT_PID:-0},
+  "ports": [4334, 4338, 4339],
+  "scopeUnit": "",
+  "cgroupVerified": false,
+  "startedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "cmdline": "tamandua daemon start",
+  "cwd": "$STATE_DIR",
+  "startTime": "$DIRECT_START_TIME"
+}
+PROVEOF
+RESTART_OUT=""
+RESTART_RC=1
+set +e
+RESTART_OUT="$(PATH="$TT_REPO_ROOT/bin:$PATH" "$HELPER" ensure-up 2>&1)"
+RESTART_RC=$?
+set -e
 if [ "$RESTART_RC" -eq 0 ]; then ok "AC6b ensure-up over an unprepended daemon exits 0"; else fail "AC6b ensure-up restart rc=$RESTART_RC"; echo "$RESTART_OUT" | tail -8; fi
 if echo "$RESTART_OUT" | grep -q "TT_DAEMON: up" && echo "$RESTART_OUT" | grep -q "TT_DAEMON_PATH_PREPEND: $ADAPTERS_BIN_DIR"; then
   ok "AC6b restart reports up + prepend seam"
 else
   fail "AC6b restart output contract"
+fi
+# The restart must have been triggered by the missing prepend (not a plain
+# start): the daemon was RUNNING (reported via the crafted provenance).
+if echo "$RESTART_OUT" | grep -q "adapters-bin PATH prepend missing"; then
+  ok "AC6b ensure-up detected the missing prepend and restarted"
+else
+  fail "AC6b ensure-up did not report the missing-prepend restart trigger"
+  echo "$RESTART_OUT" | grep -E 'TT_DAEMON|stopping|restart|adapters' | tail -5 || true
 fi
 NEW_PID=""
 if [ -n "$STATE_DIR" ] && [ -f "$STATE_DIR/tamandua.pid" ]; then
@@ -527,8 +599,10 @@ fi
 
 # ── AC3: fail closed with distinct reason tt-daemon-down ─────────────
 # With the daemon now down, force a start failure by putting a failing
-# `tamandua` stub first on PATH (daemon-control launches `tamandua` via the
-# caller's PATH, so the stub makes the daemon fail to come up).
+# `tamandua` stub first on PATH (daemon-control reconstructs the launch PATH
+# from the caller PATH remainder — adapters-bin and the env-script PATH
+# contain no `tamandua`, so the stub is the first `tamandua` resolved and
+# makes the daemon fail to come up).
 STUBBIN="$TMP/bin"; mkdir -p "$STUBBIN"
 printf '#!/usr/bin/env bash\nexit 1\n' > "$STUBBIN/tamandua"
 chmod +x "$STUBBIN/tamandua"

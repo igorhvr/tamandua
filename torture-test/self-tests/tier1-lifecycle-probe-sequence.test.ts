@@ -113,17 +113,18 @@ describe("E3.C US-002 — lifecycle probe_sequence declarations (W3.18-W3.22)", 
     ], "W3.18 probe_sequence must pause mid-implement, hold 600s, resume, and expect the run to complete");
 
     // W3.19: pause --drain during an active story -> park without dispatching
-    // the next story -> resume -> next story dispatches.
+    // the next story -> resume (awaits the drained run actually parking in
+    // 'paused') -> next story dispatches.
     const w319 = caseById("W3.19-pause-drain");
     assert.deepEqual(w319.probe_sequence, [
       {
         run: 1,
         actions: [
           { op: "pause_drain", when: "step:developer:running", expect: { drain_waits_current: true, next_story_parked: true } },
-          { op: "resume", when: "now", expect: { run_completes: true } },
+          { op: "resume", when: { status: "paused", timeout_s: 120 }, expect: { run_completes: true } },
         ],
       },
-    ], "W3.19 probe_sequence must pause_drain mid-story, park the next story, resume, and complete");
+    ], "W3.19 probe_sequence must pause_drain mid-story, park the next story, resume (awaiting 'paused'), and complete");
 
     // W3.20: TWO runs — run 1 cancel mid-implement; run 2 cancel during
     // finalize_merge; both assert the run.canceled terminal event lands.
@@ -143,17 +144,18 @@ describe("E3.C US-002 — lifecycle probe_sequence declarations (W3.18-W3.22)", 
       },
     ], "W3.20 probe_sequence must declare TWO runs (cancel mid-implement + cancel during finalize_merge) with canceled_terminal_event expectations");
 
-    // W3.21: fail --force mid-run -> resume -> SAME run id resumes and completes.
+    // W3.21: fail --force mid-run -> resume (awaits the run's process-cleanup
+    // / worker drain) -> SAME run id resumes and completes.
     const w321 = caseById("W3.21-fail-force-resume");
     assert.deepEqual(w321.probe_sequence, [
       {
         run: 1,
         actions: [
           { op: "fail_force", when: "step:developer:running" },
-          { op: "resume", when: "now", expect: { same_run_id_resumes: true, run_completes: true } },
+          { op: "resume", when: { event: "run.process_cleanup", timeout_s: 120 }, expect: { same_run_id_resumes: true, run_completes: true } },
         ],
       },
-    ], "W3.21 probe_sequence must fail --force mid-run, resume, and expect the SAME run id to resume and complete");
+    ], "W3.21 probe_sequence must fail --force mid-run, resume (awaiting run.process_cleanup), and expect the SAME run id to resume and complete");
 
     // W3.22: THREE concurrent runs + contained-daemon restart mid-flight;
     // all three recover within 2 dispatch intervals, token flush preserved.

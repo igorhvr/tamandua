@@ -234,6 +234,12 @@ function realPairEnv(stubBin: string): Record<string, string> {
     TT_CONTROLLER_TOKEN_SETTLE_MS: "100",
     TT_CONTROLLER_POLL_INTERVAL_MS: "200",
     TT_CONTROLLER_CAP_CHECK_INTERVAL_MS: "200",
+    // S24 (US-007): the contained daemon's PATH (seam-injected — no real
+    // daemon runs inside this self-test) carries var/adapters-bin FIRST, so
+    // the flagged-launch preflight's daemon-PATH containment assertion is
+    // verifiable and healthy (the red preflight cases override this with the
+    // leak shape).
+    TT_CONTROLLER_DAEMON_ENVIRON_SAMPLE: `${adaptersBin}:/usr/bin:/bin`,
   };
 }
 
@@ -434,6 +440,25 @@ describe("US-010 token-saver paired launch adapter (S12 controller)", () => {
     assertPairEntry(flagged, "flagged", "run-aaaa1111-2222-4333-8444-555555555555");
     assertPairEntry(control, "control", "run-bbbb2222-3333-4444-8555-666666666666");
 
+    // S24 (US-007): the flagged launch passed the preflight — the stub target
+    // was preflight-clean (absent at the pre-install check) and the contained
+    // daemon PATH (seam-verified) carries adapters-bin FIRST. The preflight
+    // evidence rides the flagged entry.
+    const preflight = flagged.preflight;
+    assert.ok(preflight, "the flagged entry must carry the S24 preflight evidence");
+    assert.equal(preflight.ok, true, `flagged preflight must pass: ${JSON.stringify(preflight)}`);
+    assert.equal(preflight.stub_target_ok, true,
+      `stub target must be preflight-clean: ${JSON.stringify(preflight.stub_target)}`);
+    assert.ok(["absent", "managed-file"].includes(preflight.stub_target_state),
+      `stub target state must be absent (pre-install) or managed-file: ${preflight.stub_target_state}`);
+    assert.equal(preflight.daemon_path.ok, true,
+      `daemon PATH containment must pass: ${JSON.stringify(preflight.daemon_path)}`);
+    assert.equal(preflight.daemon_path.verifiable, true);
+    assert.match(preflight.checked_at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/,
+      "preflight must carry a UTC checked_at");
+    assert.equal(preflight.adapters_bin, adaptersBin);
+    assert.equal(preflight.stub_target, path.join(adaptersBin, "pi-token-saver"));
+
     // Per-run token ledger: 13 tokens attributed to the flagged run, 4 more to
     // the control (17 total on the shared attempt ledger).
     assert.equal(flagged.token_ledger.tokens_observed, 13);
@@ -544,6 +569,118 @@ describe("US-010 token-saver paired launch adapter (S12 controller)", () => {
     assert.equal(control.stub_records, 1, "the control run's stray stub record must be counted");
     assert.equal(control.stub_record_lines.length, 1);
     assert.equal(attempt.token_saver.contract.ok, false);
+
+    cleanupCampaign(campaignId, manifestPath);
+  });
+
+  it("S24 preflight RED: a daemon PATH without the adapters-bin prepend fails the flagged launch closed with token-saver-preflight-failed BEFORE any launch", () => {
+    ensureTtTsGolden();
+    seedContainedDb();
+    const stubBin = fs.mkdtempSync(path.join(os.tmpdir(), "us010-preflight-dpath-"));
+    installPairedLaunchStub(stubBin, "contract-ok");
+    const manifestPath = writeManifest([tokenSaverCaseRecord()]);
+    let res!: RunResult;
+    let campaignId: string | null = null;
+    let markerContent = "";
+    try {
+      // The W3.23 leak shape: the operator's ~/.local/bin PRECEDES
+      // var/adapters-bin on the contained daemon PATH (the daemon would
+      // resolve a foreign pi-token-saver). The preflight must fail closed
+      // with 'token-saver-preflight-failed' before the flagged launch.
+      res = runTt(["--manifest", path.relative(ttRoot, manifestPath)], {
+        ...realPairEnv(stubBin),
+        TT_CONTROLLER_DAEMON_ENVIRON_SAMPLE: `${os.homedir()}/.local/bin:${adaptersBin}:/usr/bin:/bin`,
+      });
+      campaignId = campaignIdOf(res);
+      const marker = path.join(stubBin, "launch-observations.jsonl");
+      if (fs.existsSync(marker)) markerContent = fs.readFileSync(marker, "utf8");
+    } finally {
+      fs.rmSync(manifestPath, { force: true });
+      fs.rmSync(stubBin, { recursive: true, force: true });
+    }
+    assert.ok(campaignId, `controller did not create a campaign:\n${res.stdout}${res.stderr}`);
+    assert.equal(res.status, 2, "a fail-closed TEST_INFRA campaign exits 2 (INFRA_FAILURE)");
+
+    const caseState = caseStateOf(campaignId, "W3.23-token-saver");
+    assert.equal(caseState.outcome, "TEST_INFRA_FAIL",
+      `the preflight violation must classify TEST_INFRA_FAIL: ${JSON.stringify(caseState.reason)}`);
+    const attempt = caseState.attempts[0];
+    assert.equal(attempt.classification_reason?.category, "token-saver-preflight-failed",
+      `the distinct fail-closed reason must be token-saver-preflight-failed: ${JSON.stringify(attempt.classification_reason)}`);
+    assert.equal(attempt.classification_reason?.preflight?.daemon_path?.ok, false);
+    assert.equal(attempt.classification_reason?.preflight?.daemon_path?.reason, "operator-bin-precedes");
+    assert.equal(attempt.classification_reason?.preflight?.daemon_path?.operator_dir,
+      path.join(os.homedir(), ".local", "bin"));
+    const flagged = attempt.token_saver.launches.find((entry: any) => entry.role === "flagged");
+    assert.equal(flagged.preflight?.ok, false, "the flagged entry must carry the failing preflight evidence");
+    assert.equal(flagged.preflight?.daemon_path?.ok, false);
+    assert.equal(flagged.preflight?.daemon_path?.verifiable, true);
+    assert.equal(flagged.preflight?.daemon_path?.adapters_bin, adaptersBin);
+    assert.ok(typeof flagged.preflight?.checked_at === "string");
+    // The preflight fails BEFORE any launch: the launch-observation stub
+    // (records one line per `workflow run`) saw no invocation at all.
+    assert.equal(markerContent.trim(), "",
+      "the preflight violation must fail before ANY launch (no launch argv recorded)");
+
+    cleanupCampaign(campaignId, manifestPath);
+  });
+
+  it("S24 preflight RED: a stub target in adapters-bin that is not a usable managed regular file fails the flagged launch closed with token-saver-preflight-failed", () => {
+    ensureTtTsGolden();
+    seedContainedDb();
+    const stubBin = fs.mkdtempSync(path.join(os.tmpdir(), "us010-preflight-stub-"));
+    installPairedLaunchStub(stubBin, "contract-ok");
+    // Poison the canonical stub target with a DIRECTORY (a "stub" that is not
+    // a regular file — the managed install would refuse it; the preflight
+    // fails closed FIRST with the distinct category). The adapters-bin
+    // content is backed up/restored so a concurrent tt-token-saver-stub
+    // install never sees a foreign target.
+    const poisonTarget = path.join(adaptersBin, "pi-token-saver");
+    let existingTarget: string | null = null;
+    if (fs.existsSync(poisonTarget)) {
+      existingTarget = path.join(adaptersBin, `pi-token-saver.us007-backup-${Date.now()}`);
+      fs.renameSync(poisonTarget, existingTarget);
+    }
+    fs.mkdirSync(poisonTarget, { recursive: true });
+    const manifestPath = writeManifest([tokenSaverCaseRecord()]);
+    let res!: RunResult;
+    let campaignId: string | null = null;
+    let markerContent = "";
+    let poisonUntouched = false;
+    try {
+      res = runTt(["--manifest", path.relative(ttRoot, manifestPath)], realPairEnv(stubBin));
+      campaignId = campaignIdOf(res);
+      const marker = path.join(stubBin, "launch-observations.jsonl");
+      if (fs.existsSync(marker)) markerContent = fs.readFileSync(marker, "utf8");
+      poisonUntouched = fs.existsSync(poisonTarget) && fs.statSync(poisonTarget).isDirectory();
+    } finally {
+      fs.rmSync(poisonTarget, { recursive: true, force: true });
+      if (existingTarget !== null) fs.renameSync(existingTarget, poisonTarget);
+      fs.rmSync(manifestPath, { force: true });
+      fs.rmSync(stubBin, { recursive: true, force: true });
+    }
+    assert.ok(campaignId, `controller did not create a campaign:\n${res.stdout}${res.stderr}`);
+    assert.equal(res.status, 2, "a fail-closed TEST_INFRA campaign exits 2 (INFRA_FAILURE)");
+
+    const caseState = caseStateOf(campaignId, "W3.23-token-saver");
+    assert.equal(caseState.outcome, "TEST_INFRA_FAIL",
+      `the stub-target violation must classify TEST_INFRA_FAIL: ${JSON.stringify(caseState.reason)}`);
+    const attempt = caseState.attempts[0];
+    assert.equal(attempt.classification_reason?.category, "token-saver-preflight-failed",
+      `the distinct fail-closed reason must be token-saver-preflight-failed: ${JSON.stringify(attempt.classification_reason)}`);
+    assert.equal(attempt.classification_reason?.preflight?.stub_target_ok, false);
+    assert.equal(attempt.classification_reason?.preflight?.stub_target_state, "not-regular-file");
+    const flagged = attempt.token_saver.launches.find((entry: any) => entry.role === "flagged");
+    assert.equal(flagged.preflight?.ok, false, "the flagged entry must carry the failing preflight evidence");
+    assert.equal(flagged.preflight?.stub_target_ok, false);
+    assert.equal(flagged.preflight?.stub_target_state, "not-regular-file");
+    assert.equal(flagged.preflight?.stub_target, poisonTarget);
+    // The preflight fails BEFORE any launch — and before the managed install
+    // ever runs (the poison target is still the directory at the end).
+    assert.equal(markerContent.trim(), "",
+      "the stub-target violation must fail before ANY launch (no launch argv recorded)");
+    assert.ok(poisonUntouched,
+      "the poisoned target must remain untouched (the preflight fails before the install)");
 
     cleanupCampaign(campaignId, manifestPath);
   });

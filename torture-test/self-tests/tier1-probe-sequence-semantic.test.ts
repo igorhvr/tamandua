@@ -181,6 +181,53 @@ describe("E3.C US-005 — controller probe_sequence semantic validation (fail-cl
     );
   });
 
+  // S18b: the trigger vocabulary gains AWAITED object forms — a valid object
+  // `when` is a plain object with timeout_s > 0 and exactly ONE of status
+  // (nonempty string) / event (nonempty string). The semantic layer accepts
+  // them (defense-in-depth below the schema) and rejects malformed objects
+  // with the SAME distinct 'missing or invalid when' reason.
+  it("accepts the awaited object when forms (status and event) in --validate-only (S18b)", () => {
+    const builtStatus = buildCaseManifest("W3.18-pause-no-drain", {
+      probe_sequence: [{ run: 1, actions: [{ op: "resume", when: { status: "paused", timeout_s: 120 } }] }],
+    });
+    try {
+      const res = runValidate(builtStatus.manifest);
+      assert.equal(res.status, 0, `object status when must validate:\n${res.stdout}${res.stderr}`);
+    } finally {
+      fs.rmSync(builtStatus.dir, { recursive: true, force: true });
+    }
+    const builtEvent = buildCaseManifest("W3.18-pause-no-drain", {
+      probe_sequence: [{ run: 1, actions: [{ op: "resume", when: { event: "run.process_cleanup", timeout_s: 120 } }] }],
+    });
+    try {
+      const res = runValidate(builtEvent.manifest);
+      assert.equal(res.status, 0, `object event when must validate:\n${res.stdout}${res.stderr}`);
+    } finally {
+      fs.rmSync(builtEvent.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects an invalid object when with the distinct 'missing or invalid when' reason (S18b)", () => {
+    expectRejected(
+      "object when missing timeout_s",
+      "W3.18-pause-no-drain",
+      { probe_sequence: [{ run: 1, actions: [{ op: "resume", when: { status: "paused" } }] }] },
+      /case "W3\.18-pause-no-drain": .*action 1 \(op "resume"\): missing or invalid 'when' phase marker/,
+    );
+    expectRejected(
+      "object when with both status and event",
+      "W3.18-pause-no-drain",
+      { probe_sequence: [{ run: 1, actions: [{ op: "resume", when: { status: "paused", event: "run.process_cleanup", timeout_s: 120 } }] }] },
+      /case "W3\.18-pause-no-drain": .*action 1 \(op "resume"\): missing or invalid 'when' phase marker/,
+    );
+    expectRejected(
+      "object when with an unknown key",
+      "W3.18-pause-no-drain",
+      { probe_sequence: [{ run: 1, actions: [{ op: "resume", when: { status: "paused", timeout_s: 120, bogus: 1 } }] }] },
+      /case "W3\.18-pause-no-drain": .*action 1 \(op "resume"\): missing or invalid 'when' phase marker/,
+    );
+  });
+
   it("rejects probe_sequence declared on a local-command case", () => {
     expectRejected(
       "probe_sequence on a local-command case",

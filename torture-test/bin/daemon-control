@@ -177,12 +177,113 @@ env_for_kind() {
   done
 }
 
+# ── contained PATH reconstruction (S24 / US-006) ─────────────────────
+#
+# The contained daemon's launch PATH MUST carry var/adapters-bin FIRST so
+# installable harness stubs (e.g. the managed pi-token-saver) resolve INSIDE
+# the containment (mirroring tt-daemon-up's ADAPTERS_BIN_DIR prepend —
+# tt-daemon-up line ~59). daemon-control relaunches daemons under `env -i`
+# (run_under_env + cmd_start) and used to forward the CALLER's PATH verbatim
+# (PATH="${PATH}"): when the controller spawns `daemon-control <kind>
+# restart` with a childEnv whose PATH lacks the adapters-bin prepend
+# (tt-controller executeDaemonRestart), the restarted contained daemon
+# resolved the OPERATOR's ~/.local/bin/pi-token-saver — a foreign binary
+# executed inside the contained run (the W3.23 containment-leak root cause
+# after W3.22's restart probe). daemon-control now reconstructs the contained
+# PATH itself on EVERY launch:
+#   1. var/adapters-bin FIRST (created empty, idempotent; inert when empty,
+#      safe when the dir does not exist yet)
+#   2. the env script's PATH (the kind's node-bin prepend) when it prints one
+#   3. the remaining caller PATH with any OPERATOR bin dirs (e.g.
+#      ~/.local/bin) REORDERED AFTER the contained dirs — an operator binary
+#      can never precede the contained prepend on a contained daemon's PATH.
+
+# operator_bin_dirs: the operator's personal bin dirs that must never precede
+# the contained dirs on a contained daemon's PATH. Prints each as a separate
+# line. Resolved from the REAL operator home (getent passwd — the same source
+# as REAL_TAMANDUA_STATE, so the contained spawn HOME never misidentifies
+# var/home as the operator home) AND from $HOME (covers a test/fake operator
+# home; when $HOME is the contained home the dirs are contained — not on the
+# contained PATH in practice — and reordering them is harmless).
+operator_bin_dirs() {
+  if [ -n "${_tt_operator_home:-}" ]; then
+    printf '%s\n' "$_tt_operator_home/.local/bin" "$_tt_operator_home/bin"
+  fi
+  if [ -n "${HOME:-}" ]; then
+    printf '%s\n' "$HOME/.local/bin" "$HOME/bin"
+  fi
+}
+
+# path_has_component: 0 iff the colon-list $1 contains component $2.
+path_has_component() {
+  case ":$1:" in
+    *":$2:"*) return 0 ;;
+  esac
+  return 1
+}
+
+# contained_path_for_kind: print the reconstructed contained launch PATH for
+# the given kind (real|scripted). See the block comment above.
+contained_path_for_kind() {
+  local kind="$1"
+  local adapters_bin="$TT_DIR/var/adapters-bin"
+  mkdir -p "$adapters_bin"   # inert when empty; safe when it does not exist yet
+  local env_path
+  env_path="$(env_for_kind "$kind" | grep '^PATH=' | head -n1 | cut -d= -f2- || true)"
+  local -a operator_bins=()
+  local op_bin
+  while IFS= read -r op_bin; do
+    [ -n "$op_bin" ] && operator_bins+=("$op_bin")
+  done < <(operator_bin_dirs)
+  local parts=("$adapters_bin")
+  local seen="$adapters_bin"
+  local seg
+  # env-script PATH (node-bin prepend) comes right after the contained prepend
+  local -a env_segs=()
+  IFS=':' read -r -a env_segs <<< "${env_path:-}"
+  for seg in "${env_segs[@]:-}"; do
+    [ -n "$seg" ] || continue
+    if ! path_has_component "$seen" "$seg"; then
+      parts+=("$seg")
+      seen="$seen:$seg"
+    fi
+  done
+  # caller PATH: operator bin dirs are pulled out and appended LAST
+  local -a caller_segs=()
+  IFS=':' read -r -a caller_segs <<< "${PATH:-}"
+  local -a extra=()
+  local is_operator=false
+  for seg in "${caller_segs[@]:-}"; do
+    [ -n "$seg" ] || continue
+    if path_has_component "$seen" "$seg"; then continue; fi
+    is_operator=false
+    for op_bin in "${operator_bins[@]:-}"; do
+      if [ "$seg" = "$op_bin" ]; then is_operator=true; break; fi
+    done
+    if $is_operator; then
+      extra+=("$seg")          # moved AFTER the contained dirs
+    else
+      parts+=("$seg")
+    fi
+    seen="$seen:$seg"
+  done
+  # operator bin dirs LAST — never before the contained prepend
+  for op_bin in "${extra[@]:-}"; do
+    parts+=("$op_bin")
+  done
+  local out=""
+  for seg in "${parts[@]:-}"; do
+    out="$out${out:+:}$seg"
+  done
+  printf '%s' "$out"
+}
+
 # run_under_env: runs a command under the spawn env for the given kind.
 # Usage: run_under_env <real|scripted> <cmd...>
 run_under_env() {
   local kind="$1"
   shift
-  env -i $(env_for_kind "$kind") PATH="${PATH}" "$@"
+  env -i $(env_for_kind "$kind") PATH="$(contained_path_for_kind "$kind")" "$@"
 }
 
 # ── directory setup ──────────────────────────────────────────────────
@@ -326,6 +427,11 @@ Containment (T2.1 US-009):
     launching, so concurrent worktrees serialize instead of failing the
     bootstrap with EADDRINUSE. A stale tamandua.pid left by a killed daemon
     is cleared before launch.
+  - The contained launch PATH is RECONSTRUCTED on every start/restart
+    (S24/US-006): var/adapters-bin FIRST, then the env script's PATH, then
+    the remaining caller PATH with any OPERATOR bin dirs (e.g. ~/.local/bin)
+    reordered AFTER the contained dirs — a foreign operator binary can never
+    be resolved before the contained prepend on a contained daemon's PATH.
 
 Commands:
   start     Start the daemon inside a systemd user scope (when available)
@@ -796,12 +902,14 @@ cmd_start() {
       systemctl --user stop "${scope_unit%.scope}.scope" 2>/dev/null || true
       systemctl --user reset-failed "${scope_unit%.scope}.scope" 2>/dev/null || true
       # systemd-run exits immediately; the daemon+runs inside the scope.
-      # We pass the full env via env -i composition.
+      # We pass the full env via env -i composition. PATH is reconstructed
+      # by contained_path_for_kind (S24/US-006): var/adapters-bin FIRST,
+      # operator bin dirs never before the contained dirs.
       systemd-run --user --scope --unit="$scope_unit" --quiet \
-        env -i $(env_for_kind "$kind") PATH="${PATH}" bash -c "$launch_script" >/dev/null 2>&1
+        env -i $(env_for_kind "$kind") PATH="$(contained_path_for_kind "$kind")" bash -c "$launch_script" >/dev/null 2>&1
     else
       echo "daemon-control: systemd not available — using plain background spawn" >&2
-      nohup env -i $(env_for_kind "$kind") PATH="${PATH}" bash -c "$launch_script" >/dev/null 2>&1 &
+      nohup env -i $(env_for_kind "$kind") PATH="$(contained_path_for_kind "$kind")" bash -c "$launch_script" >/dev/null 2>&1 &
     fi
     # Wait for the daemon PID file to appear
     local pid_deadline; pid_deadline=$(($(date +%s) + 15))
@@ -1441,6 +1549,25 @@ main() {
   case "${1:-}" in
     --help|-h) usage; exit 0 ;;
   esac
+
+  # S24/US-006 self-test seam: TT_DAEMON_CONTROL_CONTAINED_PATH=<kind>
+  # prints the reconstructed contained launch PATH for the kind and exits —
+  # no daemon start, no guards; the only side effect is mkdir -p
+  # var/adapters-bin (inert when empty). Used by daemon-control.test.sh to
+  # exercise the PATH reconstruction (adapters-bin first, operator bin dirs
+  # reordered after) without starting a daemon.
+  if [ -n "${TT_DAEMON_CONTROL_CONTAINED_PATH:-}" ]; then
+    case "$TT_DAEMON_CONTROL_CONTAINED_PATH" in
+      real|scripted)
+        contained_path_for_kind "$TT_DAEMON_CONTROL_CONTAINED_PATH"
+        exit 0
+        ;;
+      *)
+        echo "daemon-control: invalid TT_DAEMON_CONTROL_CONTAINED_PATH '$TT_DAEMON_CONTROL_CONTAINED_PATH' (expected real|scripted)" >&2
+        exit 2
+        ;;
+    esac
+  fi
 
   if [ $# -lt 2 ]; then
     echo "daemon-control: missing arguments." >&2

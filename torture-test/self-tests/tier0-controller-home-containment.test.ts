@@ -263,10 +263,20 @@ describe("FIX10 US-003 controller + tt-hook-runner contained-HOME fail-closed", 
       assert.ok(assertFunctions.has(name),
         `function ${name} contains a spawn but no assertContainedSpawnEnv choke-point`);
     }
-    // The choke-point functions are exactly the spawn-bearing ones plus the helper.
+    // The choke-point functions are exactly the spawn-bearing ones plus the
+    // helper — with ONE documented exception: preflightTokenSaverFlaggedLaunch
+    // (S24/US-007) is a fail-closed LAUNCH GATE. It performs no spawn of its
+    // own (the launch helpers manageTokenSaverStub / runHook / monitorWorkflowRun
+    // are the spawn-bearing choke-pointed functions), but it MUST assert the
+    // launch env is contained BEFORE any stub install or token-saver launch —
+    // a non-contained env fails closed with 'token-saver-preflight-failed'
+    // instead of reaching a spawn site. Treat it as a sanctioned non-spawn
+    // assert site, not a containment gap.
+    const NON_SPAWN_ASSERT_GATES = new Set(["preflightTokenSaverFlaggedLaunch"]);
     for (const name of assertFunctions) {
-      assert.ok(name === "assertContainedSpawnEnv" || spawnFunctions.has(name),
-        `function ${name} calls assertContainedSpawnEnv but contains no spawn`);
+      assert.ok(name === "assertContainedSpawnEnv" || spawnFunctions.has(name)
+        || NON_SPAWN_ASSERT_GATES.has(name),
+      `function ${name} calls assertContainedSpawnEnv but contains no spawn`);
     }
     // The choke-point helper itself delegates to the shared primitive.
     const helper = functionSlice(source, "assertContainedSpawnEnv");
