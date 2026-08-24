@@ -7,7 +7,8 @@
 //   * install-scenario-workflows rewrites the workflow.yml id WITHOUT sed -i,
 //     proven behavioral red-then-green with a BSD-sed shim on PATH (the shim
 //     exits non-zero on `-i`, mimicking macOS sed; the pre-fix installer is
-//     materialized via git and must fail, the live installer must pass).
+//     reproduced as a synthetic self-contained script and must fail, the live
+//     installer must pass).
 //   * bin/daemon-control has no grep -P / grep -oP (grep pin) — the
 //     lingering-listener pid extraction is grep -Eo + sed prefix-strip,
 //     which preserves the exact first-pid semantics on GNU and BSD.
@@ -294,38 +295,40 @@ describe("tier0 macp5 gnu-ism sweep (US-004)", () => {
   });
 
   it("red proof: the pre-fix installer fails with the same BSD-sed shim (command i expects)", () => {
-    // Red-then-green documentation arm: materialize the ACTUAL pre-US-004
-    // install-scenario-workflows (the parent of the US-004 fix commit, whose
-    // `sed -i` line is exactly the mac failure) and assert the BSD-sed shim
-    // rejects it with the observed error. The live installer is asserted
-    // green by the test above. The pre-fix commit is resolved by message so
-    // the pin survives history edits.
-    const log = spawnSync(
-      "git",
-      ["log", "-1", "--format=%H", "--grep=US-004 - GNU-ism sweep fixes"],
-      { cwd: repoRoot, encoding: "utf8" },
-    );
-    assert.equal(log.status, 0, `git log failed: ${log.stderr}`);
-    const us004Commit = log.stdout.trim();
-    assert.ok(
-      /^[0-9a-f]{40}$/.test(us004Commit),
-      `could not resolve the US-004 commit (grep found '${us004Commit}') — the MACP5 US-004 history is missing`,
-    );
-    const git = spawnSync(
-      "git",
-      ["show", `${us004Commit}~1:torture-test/scripted-runtimes/install-scenario-workflows`],
-      { cwd: repoRoot, encoding: "utf8" },
-    );
-    assert.equal(git.status, 0, `git show of the pre-US-004 installer failed: ${git.stderr}`);
-    assert.ok(
-      git.stdout.includes("sed -i "),
-      "the pre-fix installer must contain the GNU-only sed -i rewrite",
-    );
-
+    // Self-contained red-then-green documentation arm (MACP5.1): the ACTUAL
+    // pre-US-004 install-scenario-workflows performed the GNU-only `sed -i`
+    // id rewrite (line 90 of the pre-fix tree) — the mac's exact failure.
+    // The pre-fix installer is reproduced as a minimal SYNTHETIC script (NOT
+    // materialized from git history: the US-004 commit exists only on the
+    // authoring branch and is unreachable on merged main) and run through the
+    // BSD-sed shim: it must fail with the observed error and leave the
+    // destination workflow.yml unrewritten (fail closed). The live installer
+    // is asserted green by the test above.
     const fixture = makeInstallerFixture();
     try {
       const preFixInstaller = path.join(fixture.root, "installer-pre-fix");
-      fs.writeFileSync(preFixInstaller, git.stdout, { mode: 0o755 });
+      fs.writeFileSync(
+        preFixInstaller,
+        [
+          "#!/usr/bin/env bash",
+          "# Synthetic pre-US-004 installer — self-contained red fixture",
+          "# (MACP5.1): performs the GNU-only in-place id rewrite exactly as",
+          "# the pre-fix install-scenario-workflows did.",
+          "set -euo pipefail",
+          'BASE_WORKFLOW="$1"',
+          'SCENARIO_ID="$2"',
+          'NEW_ID="${BASE_WORKFLOW}-${SCENARIO_ID}"',
+          'WORKFLOWS_DIR="$TAMANDUA_STATE_DIR/workflows"',
+          'SRC_DIR="$WORKFLOWS_DIR/$BASE_WORKFLOW"',
+          'DST_DIR="$WORKFLOWS_DIR/$NEW_ID"',
+          'cp -a "$SRC_DIR" "$DST_DIR"',
+          'YML="$DST_DIR/workflow.yml"',
+          'sed -i "s/^id: ${BASE_WORKFLOW}[[:space:]]*$/id: ${NEW_ID}/" "$YML"',
+          'echo "{\\"${NEW_ID}_doer\\":{}}"',
+          "",
+        ].join("\n"),
+        { mode: 0o755 },
+      );
       const run = runInstaller(preFixInstaller, fixture.root);
       assert.notEqual(run.status, 0, "pre-fix installer must fail under a BSD-sed shim");
       assert.match(

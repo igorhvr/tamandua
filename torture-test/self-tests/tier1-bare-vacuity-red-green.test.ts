@@ -25,9 +25,12 @@
 // state.json is fed through the frozen pre-US-008 verdict arm
 // (bin/tt-report-legacy-vacuity.mjs, byte-faithful to commit dafa40a7) which
 // MUST return {verdict:'GREEN', exitCode:0} — pinning the vacuous GREEN that
-// hid the defect. A faithfulness pin first diffs that arm against `git show
-// dafa40a7:torture-test/bin/tt-report.mjs` so the GREEN claim is provably the
-// pre-fix behavior, not a restatement.
+// hid the defect. A faithfulness pin first diffs that arm against the
+// embedded pre-US-008 function bodies below (self-contained — MACP5.1: the
+// bodies were captured from dafa40a7 at authoring time, replacing `git show
+// dafa40a7:torture-test/bin/tt-report.mjs`, whose commit is unreachable on
+// merged main / fresh clones) so the GREEN claim is provably the pre-fix
+// behavior, not a restatement.
 //
 // The GREEN arm (control, AC2) is a NORMAL bare tier1 selection: the ORIGINAL
 // cases/tier1.jsonl run bare, where the 4 scripted local cells have
@@ -61,11 +64,20 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { it } from "node:test";
 
-// Pre-US-008 tt-report.mjs (the vacuity-guard-free verdict source of truth the
-// frozen legacy arm must stay byte-faithful to). dafa40a7 is the last commit
-// on this branch before US-008 (ba3fc754) which added bareVacuityCause.
-const LEGACY_SOURCE_COMMIT = "dafa40a7";
-const LEGACY_SOURCE_PATH = "torture-test/bin/tt-report.mjs";
+// Pre-US-008 function bodies, whitespace-normalized exactly as extractBody()
+// compares (MACP5.1): the byte-faithfulness pin's self-contained source of
+// truth. They were captured from commit dafa40a7 of
+// torture-test/bin/tt-report.mjs (the last commit before US-008 ba3fc754
+// added bareVacuityCause) at authoring time. Embedding them inline replaces
+// `git show dafa40a7:<path>` — that commit exists only on the authoring
+// branch and is unreachable on merged main / fresh clones, so any git-history
+// resolution would break outside the authoring worktree.
+const PRE_US008_VERDICT_EXIT_CODE_BODY =
+  " const failClosedCause = zeroRealLaunchesCause(state); if (failClosedCause !== null) return { verdict: 'INFRA_FAILURE', exitCode: 2 }; if (hasInfrastructureFailure(state)) return { verdict: 'INFRA_FAILURE', exitCode: 2 }; // FIX10 US-005: a hygiene-canary diff (operator-identity file changed // during the campaign) is a campaign-level FINDING — never silent. const hygieneDiffs = state?.hygiene_canary?.diffs; if (Array.isArray(hygieneDiffs) && hygieneDiffs.length > 0) { return { verdict: 'FINDINGS', exitCode: 1 }; } const hasFinding = state.cases.some((item) => !['PASS', 'NOT_RUN'].includes(item.outcome) || (item.findings ?? []).length > 0); return hasFinding ? { verdict: 'FINDINGS', exitCode: 1 } : { verdict: 'GREEN', exitCode: 0 };";
+const PRE_US008_ZERO_REAL_LAUNCHES_CAUSE_BODY =
+  " if (!isRealMode(state)) return null; const realCases = (state?.cases ?? []).filter((item) => isRealHarness(item.harness)); if (realCases.length === 0) return null; const realLaunched = realCases.filter((item) => (item.attempts ?? []).length > 0).length; if (realLaunched > 0) return null; return `include-real requested but zero real cases launched (${realCases.length} real pi/hermes/dsh cases in manifest, execution_selection=all, but no real launch recorded)`;";
+const PRE_US008_HAS_INFRASTRUCTURE_FAILURE_BODY =
+  " return state.cases.some((item) => item.outcome === 'TEST_INFRA_FAIL' // MACP3 US-006: host-profile-missing is infrastructure failure REGARDLESS // of how it was persisted — applyHostRequirements records it as // TEST_INFRA_FAIL, but a legacy/other-NOT_RUN encoding must not be // treated as a normal green skip either. Never a vacuous NOT_RUN. || item.reason?.category === 'host-profile-missing' || (item.outcome === 'NOT_RUN' && !['predicate', 'pending-real', 'host-profile-missing'].includes(item.reason?.category)) || (item.oracle_results ?? []).some((result) => result.status === 'TEST_INFRA' || (result.status === 'VALID' && result.response?.result === 'ERROR')));";
 
 const repoRoot = process.cwd();
 const ttRoot = path.join(repoRoot, "torture-test");
@@ -213,29 +225,45 @@ function extractBody(src: string, fnName: string): string {
 }
 
 it("US-009: legacy pre-US-008 verdict arm is byte-faithful (dafa40a7) and contains no vacuity guard", () => {
-  const hist = run("git", ["show", `${LEGACY_SOURCE_COMMIT}:${LEGACY_SOURCE_PATH}`], process.env);
-  assert.equal(hist.status, 0, `git show ${LEGACY_SOURCE_COMMIT} failed:\n${hist.stderr}`);
-  assert.ok(
-    !hist.stdout.includes("bareVacuityCause"),
-    "pre-US-008 tt-report.mjs must not contain the vacuity guard (this is the pre-fix source of truth)",
-  );
   const legacySrc = fs.readFileSync(legacyModulePath, "utf8");
+  // The frozen arm's VERDICT MATH must carry no vacuity guard (the pre-US-008
+  // source of truth had none — the module's own header comments may mention
+  // bareVacuityCause as documentation, so the check is on the extracted code
+  // bodies, which the byte-faithfulness assertions below pin to the pre-US-008
+  // implementations).
+  for (const [fn, body] of [
+    ["legacyVerdictExitCode", PRE_US008_VERDICT_EXIT_CODE_BODY],
+    ["zeroRealLaunchesCause", PRE_US008_ZERO_REAL_LAUNCHES_CAUSE_BODY],
+    ["hasInfrastructureFailure", PRE_US008_HAS_INFRASTRUCTURE_FAILURE_BODY],
+  ] as Array<[string, string]>) {
+    assert.ok(
+      !extractBody(legacySrc, fn).includes("bareVacuityCause"),
+      `${fn} must not contain the vacuity guard (this is the pre-fix source of truth)`,
+    );
+    assert.ok(
+      !body.includes("bareVacuityCause"),
+      `embedded pre-US-008 ${fn} body must not contain the vacuity guard`,
+    );
+  }
   // The frozen arm's verdict math must stay byte-faithful to the actual
   // pre-fix implementation, or the RED leg's "pre-change it was GREEN" claim
-  // becomes a restatement. Whitespace-normalized only.
+  // becomes a restatement. Whitespace-normalized only. The pre-US-008 bodies
+  // are embedded inline above (MACP5.1: self-contained — they were captured
+  // from commit dafa40a7 at authoring time; git-history resolution of that
+  // commit breaks on merged main, where it is unreachable).
   assert.equal(
     extractBody(legacySrc, "legacyVerdictExitCode"),
-    extractBody(hist.stdout, "verdictExitCode"),
+    PRE_US008_VERDICT_EXIT_CODE_BODY,
     "legacyVerdictExitCode must be byte-faithful to the pre-US-008 verdictExitCode (dafa40a7)",
   );
   assert.equal(
     extractBody(legacySrc, "zeroRealLaunchesCause"),
-    extractBody(hist.stdout, "zeroRealLaunchesCause"),
+    PRE_US008_ZERO_REAL_LAUNCHES_CAUSE_BODY,
     "zeroRealLaunchesCause must be byte-faithful to the pre-US-008 implementation",
   );
   assert.equal(
     extractBody(legacySrc, "hasInfrastructureFailure"),
-    extractBody(hist.stdout, "hasInfrastructureFailure"),
+    PRE_US008_HAS_INFRASTRUCTURE_FAILURE_BODY,
     "hasInfrastructureFailure must be byte-faithful to the pre-US-008 implementation",
   );
 });

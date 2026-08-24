@@ -12,6 +12,15 @@
 // (tier0-procfs-portability-lint.test.ts) is the allowlist/gate design
 // precedent.
 //
+// MACP5.1: the red-then-green documentation arm is SELF-CONTAINED — the
+// pre-US-004 snippets (install-scenario-workflows' `sed -i` id rewrite,
+// daemon-control's `grep -oP`) are reproduced inline and scanned directly,
+// instead of being materialized from git history. The US-004 commit exists
+// only on the authoring branch (finalize-merge lands one squashed commit on
+// main), so any git-log resolution would break on a main checkout. The
+// history-independent-red-arms meta-lint
+// (tier0-history-independent-red-arms.test.ts) locks this class.
+//
 // ── Gates (a violation in any gate fails the suite) ──────────────────
 //   G1 Coverage:    a scanned NON-strict shell file with GNU-ism hits must
 //                   have an ALLOWLIST entry. (Catches NEW GNU-ism usage.)
@@ -652,53 +661,40 @@ describe("tier0 GNU-ism portability lint (MACP5 US-005)", () => {
     );
   });
 
-  it("MUTATION: the pre-US-004 tree's GNU-isms are exactly what the lint flags (red proof via git)", () => {
-    // Red-then-green documentation arm: materialize the ACTUAL pre-US-004
-    // files (the parents of the US-004 fix commit) that carried the mac's
-    // GNU-isms — install-scenario-workflows' `sed -i` id rewrite and
-    // daemon-control's `grep -oP` extraction — and assert the lint flags
-    // exactly those classes. The live tree (post-US-004) is asserted green
-    // by the hard gate above. The pre-fix commit is resolved by message so
-    // the pin survives history edits.
-    const log = spawnSync(
-      "git",
-      ["log", "-1", "--format=%H", "--grep=US-004 - GNU-ism sweep fixes"],
-      { cwd: repoRoot, encoding: "utf8" },
-    );
-    assert.equal(log.status, 0, `git log failed: ${log.stderr}`);
-    const us004Commit = log.stdout.trim();
+  it("MUTATION: the pre-US-004 tree's GNU-isms are exactly what the lint flags (synthetic red proof)", () => {
+    // Self-contained red-then-green documentation arm (MACP5.1): the ACTUAL
+    // pre-US-004 files carried the mac's GNU-isms — install-scenario-workflows
+    // line 90's `sed -i` id rewrite and daemon-control line 1579's `grep -oP`
+    // pid extraction. The pre-fix snippets are reproduced inline here (NOT
+    // materialized from git history: the US-004 commit exists only on the
+    // authoring branch and is unreachable on merged main, so any git-log
+    // resolution would break on a main checkout). The live tree (post-US-004)
+    // is asserted green by the hard gate above.
+    const preFixInstaller = [
+      "#!/usr/bin/env bash",
+      "set -euo pipefail",
+      'sed -i "s/^id: ${BASE_WORKFLOW}[[:space:]]*$/id: ${NEW_ID}/" "$YML"',
+      "",
+    ].join("\n");
     assert.ok(
-      /^[0-9a-f]{40}$/.test(us004Commit),
-      `could not resolve the US-004 commit (grep found '${us004Commit}') — the MACP5 US-004 history is missing`,
+      preFixInstaller.includes("sed -i "),
+      "the pre-fix installer snippet must contain the GNU-only sed -i rewrite",
     );
-
-    const installer = spawnSync(
-      "git",
-      ["show", `${us004Commit}~1:torture-test/scripted-runtimes/install-scenario-workflows`],
-      { cwd: repoRoot, encoding: "utf8" },
-    );
-    assert.equal(installer.status, 0, `git show of the pre-fix installer failed: ${installer.stderr}`);
-    assert.ok(
-      installer.stdout.includes("sed -i "),
-      "the pre-fix installer must contain the GNU-only sed -i rewrite",
-    );
-    const installerHits = scanContent(installer.stdout);
+    const installerHits = scanContent(preFixInstaller);
     assert.ok(
       installerHits.some((h) => h.cls === "sed -i (GNU in-place)"),
       `the pre-fix installer's sed -i must be flagged, got: ${JSON.stringify(installerHits)}`,
     );
 
-    const dc = spawnSync(
-      "git",
-      ["show", `${us004Commit}~1:torture-test/bin/daemon-control`],
-      { cwd: repoRoot, encoding: "utf8" },
-    );
-    assert.equal(dc.status, 0, `git show of the pre-fix daemon-control failed: ${dc.stderr}`);
+    const preFixDaemonControl = [
+      'lingering_pid=$(ss -tlnp 2>/dev/null | grep ":$port " | grep -oP \'pid=\\K[0-9]+\' | head -1 || true)',
+      "",
+    ].join("\n");
     assert.ok(
-      dc.stdout.includes("grep -oP"),
-      "the pre-fix daemon-control must contain the GNU grep perl-regex form",
+      preFixDaemonControl.includes("grep -oP"),
+      "the pre-fix daemon-control snippet must contain the GNU grep perl-regex form",
     );
-    const dcHits = scanContent(dc.stdout);
+    const dcHits = scanContent(preFixDaemonControl);
     assert.ok(
       dcHits.some((h) => h.cls === "grep -P (perl-regexp)"),
       `the pre-fix daemon-control's grep -oP must be flagged, got: ${JSON.stringify(dcHits)}`,

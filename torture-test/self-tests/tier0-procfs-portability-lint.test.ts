@@ -75,6 +75,13 @@
 //     (the pre-US-002 uuid read is the red case; the guarded /proc/<pid>/stat
 //     pattern and comment/prose text are the green pins).
 //
+// MACP5.1: the pre-US-002 red case is SELF-CONTAINED — the unguarded uuid
+// read is reproduced inline and scanned directly, instead of being
+// materialized from git history (the US-002 commit exists only on the
+// authoring branch and is unreachable on merged main). The
+// history-independent-red-arms meta-lint
+// (tier0-history-independent-red-arms.test.ts) locks this class.
+//
 // Runs via self-tests/run.sh's tier0-*.test.ts glob (no run.sh edit needed).
 // Zero tokens, hermetic, repo-relative scanning only (no live daemon).
 import assert from "node:assert/strict";
@@ -361,6 +368,16 @@ const ALLOWLIST: Record<string, AllowEntry> = {
     category: "documentation",
     reason:
       "MACP5 task description doc — its '/proc' occurrences (the '/proc uuid' defect narrative, '/proc-era' sweep scope) are prose in the task narrative; the doc performs no runtime procfs access.",
+  },
+  "impl-tasks/MACP5.1-history-independent-red-arms.md": {
+    category: "documentation",
+    reason:
+      "MACP5.1 task description doc — its '/proc' occurrences (the defect narrative naming the unguarded /proc read among the banned constructs the red arms synthesize) are prose in the task narrative; the doc performs no runtime procfs access.",
+  },
+  "impl-tasks/MACP6-portable-shim-node-resolution.md": {
+    category: "documentation",
+    reason:
+      "MACP6 task description doc — its '/proc' occurrence ('the GNU-ism/procfs lint pattern' in the task narrative) is prose referencing the existing lint gates; the doc performs no runtime procfs access.",
   },
   "self-tests/tier0-gnu-portability-lint.test.ts": {
     category: "documentation",
@@ -764,34 +781,22 @@ describe("tier0 procfs-portability lint", () => {
     );
   });
 
-  it("MUTATION (G5): the pre-US-002 tree's line 306 is exactly what G5 flags (red proof via git)", () => {
-    // Red-then-green documentation arm: materialize the ACTUAL pre-US-002
-    // run-scripted-scenario (the parent of the US-002 fix commit, whose line
-    // ~306 carries the unguarded uuid read) and assert G5 flags that exact
-    // read. The live tree (post-US-002) is asserted green by the hard gate
-    // and the dedicated live-surface test below. The pre-fix commit is
-    // resolved by message so the pin survives history edits.
-    const log = spawnSync(
-      "git",
-      ["log", "-1", "--format=%H", "--grep=US-002 - run-scripted-scenario"],
-      { cwd: repoRoot, encoding: "utf8" },
-    );
-    assert.equal(log.status, 0, `git log failed: ${log.stderr}`);
-    const us002Commit = log.stdout.trim();
-    assert.ok(
-      /^[0-9a-f]{40}$/.test(us002Commit),
-      `could not resolve the US-002 commit (grep found '${us002Commit}') — the MACP5 US-002 history is missing`,
-    );
-    const git = spawnSync(
-      "git",
-      ["show", `${us002Commit}~1:torture-test/scenarios/lib/run-scripted-scenario`],
-      { cwd: repoRoot, encoding: "utf8" },
-    );
-    assert.equal(git.status, 0, `git show of the pre-US-002 tree failed: ${git.stderr}`);
-    const preFixContent = git.stdout;
+  it("MUTATION (G5): the pre-US-002 line-306 uuid read is exactly what G5 flags (synthetic red proof)", () => {
+    // Self-contained red-then-green documentation arm (MACP5.1): the ACTUAL
+    // pre-US-002 run-scripted-scenario line ~306 carried the unguarded
+    // linux-only uuid input-redirection read. The pre-fix line is reproduced
+    // inline (NOT materialized from git history: the US-002 commit exists only
+    // on the authoring branch and is unreachable on merged main) and asserted
+    // to trip G5 at exactly that line. The live tree (post-US-002) is asserted
+    // green by the hard gate and the G5 LIVE test below.
+    const preFixContent = [
+      "#!/usr/bin/env bash",
+      'UUID_SUFFIX="$(tr -d \'-\' </proc/sys/kernel/random/uuid 2>/dev/null | cut -c1-12)"',
+      "",
+    ].join("\n");
     assert.ok(
       preFixContent.includes("</proc/sys/kernel/random/uuid"),
-      "pre-fix tree must contain the unguarded uuid input-redirection read",
+      "pre-fix snippet must contain the unguarded uuid input-redirection read",
     );
     const violations = g5UnguardedReadViolations({
       "scenarios/lib/run-scripted-scenario": preFixContent,
