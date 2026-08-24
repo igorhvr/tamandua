@@ -390,6 +390,159 @@ describe("tamandua workflow resume CLI", { concurrency: 1 }, () => {
     }
   });
 
+  // FFRC (W3.21): force-fail a run, then immediately resume. The force-fail
+  // shape leaves the run 'failed' with ALL non-done steps 'canceled' (no
+  // 'failed' step exists). Resume must repair the canceled pipeline and
+  // re-register — never emit a spurious run.completed or hit the
+  // "Run is terminal: completed" contradiction that permanently blocked
+  // resume in the torture-test evidence.
+  it("resume immediately after force-fail re-registers without spurious run.completed", async (t) => {
+    if (!fs.existsSync(CLI_SCRIPT)) {
+      t.skip("CLI script not built — run npm run build first");
+      return;
+    }
+
+    const controlPort = await getAvailablePort();
+
+    const th = createTempHome("tamandua-resume-ffrc-");
+
+    // Copy the workflow directory so the daemon can register the run on resume
+    const srcWorkflowDir = path.resolve(__dirname, "..", "workflows", "feature-dev-merge");
+    const dstWorkflowDir = path.join(th.tamanduaDir, "workflows", "feature-dev-merge");
+    fs.mkdirSync(path.dirname(dstWorkflowDir), { recursive: true });
+    fs.cpSync(srcWorkflowDir, dstWorkflowDir, { recursive: true });
+
+    const dbPath = path.join(th.tamanduaDir, "tamandua.db");
+
+    const runId = crypto.randomUUID();
+    seedRunDb(dbPath, [
+      {
+        id: runId,
+        workflowId: "feature-dev-merge",
+        task: "W3.21 force-fail resume replay",
+        status: "running",
+        context: { working_directory_for_harness: th.root },
+      },
+    ]);
+
+    // Steps: one done, one in flight, one waiting — the force-fail shape.
+    const db = new DatabaseSync(dbPath);
+    const nowStr = new Date().toISOString();
+    const stepRows: Array<[string, string, string, number]> = [
+      ["implement", "feature-dev-merge_developer", "done", 0],
+      ["verify", "feature-dev-merge_verifier", "running", 1],
+      ["merge", "feature-dev-merge_integrator", "waiting", 2],
+    ];
+    for (const [stepId, agentId, status, index] of stepRows) {
+      db.prepare(
+        `INSERT INTO steps (id, step_id, run_id, agent_id, step_index, input_template, expects, status, type, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        crypto.randomUUID(), stepId, runId, agentId, index,
+        "test input", "STEPS_STATUS: done", status, "single", nowStr, nowStr,
+      );
+    }
+    db.close();
+
+    let daemon: ChildProcess | undefined;
+
+    try {
+      daemon = spawn("node", [DAEMON_SCRIPT], {
+        env: cleanChildEnv({ HOME: th.homeDir,
+          TAMANDUA_CONTROL_PORT: String(controlPort), }),
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      daemon.stdout?.resume();
+      daemon.stderr?.resume();
+
+      await waitForControlUp(controlPort);
+
+      // 1. Force-fail (no live worker: claim_pid is NULL, so no --force needed).
+      const failCli = await runCli(
+        ["workflow", "fail", runId, "--reason", "W3.21 replay"],
+        { HOME: th.homeDir, TAMANDUA_CONTROL_PORT: String(controlPort) },
+      );
+      assert.equal(failCli.exitCode, 0, `force-fail should exit 0, got ${failCli.exitCode}: ${cleanStderr(failCli.stderr)}`);
+      assert.ok(failCli.stdout.includes("Force-failed run"), `unexpected force-fail stdout: ${failCli.stdout}`);
+
+      // 2. Immediately resume — the exact W3.21 race window.
+      const resumeCli = await runCli(
+        ["workflow", "resume", runId],
+        { HOME: th.homeDir, TAMANDUA_CONTROL_PORT: String(controlPort) },
+      );
+
+      // Must NOT surface the historical contradiction.
+      const stderr = cleanStderr(resumeCli.stderr);
+      assert.ok(
+        !stderr.includes("Run is terminal: completed"),
+        `resume must never hit the terminal:completed contradiction, stderr: ${stderr}`,
+      );
+      // Must not fail with an uncaught throw either.
+      assert.ok(!/Error:/.test(stderr), `resume must not surface an uncaught error, stderr: ${stderr}`);
+
+      // The W3.21 shape has no 'failed' step, so the resume either succeeds
+      // (repair + re-register) or fails with the retriable teardown error.
+      if (resumeCli.exitCode === 0) {
+        assert.ok(
+          resumeCli.stdout.includes("Resumed run"),
+          `expected "Resumed run" in stdout, got: ${resumeCli.stdout}`,
+        );
+        assert.ok(
+          resumeCli.stdout.includes("restarting from step: verify"),
+          `expected restart from the repaired step, got: ${resumeCli.stdout}`,
+        );
+      } else {
+        assert.ok(
+          stderr.includes("teardown in progress") || stderr.includes("Failed to resume run"),
+          `expected retriable teardown error, got stderr: ${stderr}`,
+        );
+      }
+
+      // 3. DB/daemon-observed status agree — never 'completed'.
+      const db2 = new DatabaseSync(dbPath);
+      const run = db2.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string } | undefined;
+      const steps = db2.prepare("SELECT step_id, status FROM steps WHERE run_id = ? ORDER BY step_index ASC").all(runId) as Array<{ step_id: string; status: string }>;
+      db2.close();
+      assert.ok(run, "run must exist");
+      assert.notEqual(run.status, "completed", `run must never be marked completed, got: ${run.status}`);
+
+      if (resumeCli.exitCode === 0) {
+        assert.equal(run.status, "running", `resumed run should be running, got: ${run.status}`);
+        const byId = Object.fromEntries(steps.map((s) => [s.step_id, s.status]));
+        assert.equal(byId["implement"], "done", "done step stays done");
+        // The repaired step may already have been claimed by the daemon's
+        // dispatch motor by the time we read the DB — pending OR running
+        // both prove the repair worked.
+        assert.ok(
+          byId["verify"] === "pending" || byId["verify"] === "running",
+          `canceled in-flight step must be repaired to pending (or claimed), got: ${byId["verify"]}`,
+        );
+        assert.equal(byId["merge"], "waiting", "canceled waiting step repaired to waiting");
+      } else {
+        // Retriable path: run returned to 'failed' so a retry can succeed.
+        assert.equal(run.status, "failed", `retriable failure should leave run failed, got: ${run.status}`);
+      }
+
+      // 4. Event stream: no spurious run.completed; force-failed stream ends
+      // on run.force_failed (or, at worst, a resume-registration run.failed).
+      const eventsPath = path.join(th.tamanduaDir, "events", `${runId}.jsonl`);
+      if (fs.existsSync(eventsPath)) {
+        const eventNames = fs.readFileSync(eventsPath, "utf-8")
+          .split(/\r?\n/).filter(Boolean)
+          .map((line) => (JSON.parse(line) as { event: string }).event);
+        assert.ok(
+          !eventNames.includes("run.completed"),
+          `spurious run.completed in event stream: ${eventNames.join(", ")}`,
+        );
+      }
+    } finally {
+      if (daemon && daemon.exitCode === null && daemon.pid) {
+        try { process.kill(daemon.pid, "SIGTERM"); } catch { /* ignore */ }
+        await sleep(200);
+      }
+    }
+  });
+
   // Resume a running run should fail (only paused or failed)
   it("resume running run prints error", async (t) => {
     if (!fs.existsSync(CLI_SCRIPT)) {

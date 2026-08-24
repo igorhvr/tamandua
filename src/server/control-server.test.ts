@@ -2960,3 +2960,139 @@ process.exit(0);
     await round;
   });
 });
+
+// ══════════════════════════════════════════════════════════════════════
+// FFRC: register-run during teardown returns retriable 503
+// ══════════════════════════════════════════════════════════════════════
+
+describe("register-run during teardown (FFRC retriable gate)", { concurrency: 1 }, () => {
+  let tempHome: string;
+  let stateDir: string;
+  let dbPath: string;
+  let secret: string;
+  let controlPort: number;
+  let server: http.Server | undefined;
+  let origHome: string | undefined;
+  let origStateDir: string | undefined;
+  let origDbPath: string | undefined;
+  let origControlPort: string | undefined;
+
+  before(async () => {
+    origHome = process.env.HOME;
+    origStateDir = process.env.TAMANDUA_STATE_DIR;
+    origDbPath = process.env.TAMANDUA_DB_PATH;
+    origControlPort = process.env.TAMANDUA_CONTROL_PORT;
+
+    tempHome = tamanduaTempDir("tamandua-ffrc-register-");
+    stateDir = path.join(tempHome, ".tamandua");
+    fs.mkdirSync(stateDir, { recursive: true });
+    dbPath = path.join(stateDir, "tamandua.db");
+
+    process.env.HOME = tempHome;
+    process.env.TAMANDUA_STATE_DIR = stateDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+
+    secret = crypto.randomBytes(16).toString("hex");
+    fs.writeFileSync(path.join(stateDir, "daemon-secret"), secret, "utf-8");
+
+    const [ctrlHandle] = await reservePortHandles(1);
+    controlPort = ctrlHandle.port;
+    await ctrlHandle.close();
+
+    process.env.TAMANDUA_CONTROL_PORT = String(controlPort);
+
+    const { createControlServer } = await import("../../dist/server/control-server.js");
+    server = createControlServer({ port: controlPort, secret });
+    await new Promise<void>((resolve) => {
+      server!.once("listening", resolve);
+    });
+  });
+
+  after(async () => {
+    if (server) {
+      await new Promise<void>((resolve) => server!.close(() => resolve()));
+    }
+    if (origHome) process.env.HOME = origHome;
+    else delete process.env.HOME;
+    if (origStateDir) process.env.TAMANDUA_STATE_DIR = origStateDir;
+    else delete process.env.TAMANDUA_STATE_DIR;
+    if (origDbPath) process.env.TAMANDUA_DB_PATH = origDbPath;
+    else delete process.env.TAMANDUA_DB_PATH;
+    if (origControlPort) process.env.TAMANDUA_CONTROL_PORT = origControlPort;
+    else delete process.env.TAMANDUA_CONTROL_PORT;
+    if (tempHome) fs.rmSync(tempHome, { recursive: true, force: true });
+  });
+
+  async function registerRequest(runId: string): Promise<JsonResponse> {
+    const payload = JSON.stringify({ runId });
+    const headers: Record<string, string> = {
+      "content-type": "application/json",
+      "x-tamandua-secret": secret,
+      "content-length": String(Buffer.byteLength(payload)),
+    };
+    return await new Promise<JsonResponse>((resolve, reject) => {
+      const req = http.request(
+        { method: "POST", hostname: "127.0.0.1", port: controlPort, path: "/control/register-run", headers },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on("data", (c: Buffer) => chunks.push(c));
+          res.on("end", () => {
+            const raw = Buffer.concat(chunks).toString("utf-8");
+            let parsed: Record<string, unknown> = {};
+            if (raw.trim()) {
+              try { parsed = JSON.parse(raw) as Record<string, unknown>; } catch { parsed = { raw }; }
+            }
+            resolve({ status: res.statusCode ?? 0, body: parsed });
+          });
+        },
+      );
+      req.on("error", reject);
+      req.setTimeout(3000, () => req.destroy(new Error("register request timeout")));
+      req.write(payload);
+      req.end();
+    });
+  }
+
+  it("register-run during teardown returns retriable 503, not the terminal 409", async () => {
+    const { _setRunMidTeardownForTest, _isRunMidTeardown } = await import("../../dist/server/control-server.js");
+
+    const runId = crypto.randomUUID();
+    const db = new DatabaseSync(dbPath);
+    db.exec(`CREATE TABLE IF NOT EXISTS runs (
+      id TEXT PRIMARY KEY,
+      workflow_id TEXT NOT NULL,
+      task TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'running',
+      context TEXT NOT NULL DEFAULT '{}',
+      tokens_spent INTEGER NOT NULL DEFAULT 0,
+      scheduling_status TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )`);
+    const now = new Date().toISOString();
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, scheduling_status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    ).run(runId, "wf", "ffrc register gate", "running", "{}", "pending_register", now, now);
+    db.close();
+
+    // The run is NOT terminal, so without the teardown marker the register
+    // gate would proceed to admission (and fail later on workflow-spec
+    // resolution with 422) — never a terminal 409.
+    try {
+      // Mark the run mid-teardown exactly as handleTerminateRun does while
+      // removing crons / settling in-flight rounds.
+      _setRunMidTeardownForTest(runId, true);
+      assert.equal(_isRunMidTeardown(runId), true);
+
+      const r = await registerRequest(runId);
+      assert.equal(r.status, 503, `expected retriable 503, got ${r.status}: ${JSON.stringify(r.body)}`);
+      assert.equal(
+        r.body.error,
+        "run teardown in progress, retry",
+        `expected the precise retriable message, got: ${JSON.stringify(r.body)}`,
+      );
+    } finally {
+      _setRunMidTeardownForTest(runId, false);
+    }
+  });
+});

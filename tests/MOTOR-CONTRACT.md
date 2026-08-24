@@ -148,6 +148,38 @@ even if an exceptional late token update trails it.
 | CLI `workflow runs` status display | `src/cli/status-format.ts` | Raw status column displays `canceled`; not bucketed into completed/failed counts. |
 | Worktree pruning | `prune --completed`, `src/cli/commands/worktree.ts` | Prunes worktrees of completed, failed, AND canceled runs (and orphaned rows). |
 
+### Terminal-event consumer audit (run.completed — FFRC)
+
+`run.completed` must ONLY ever follow genuine completion: every step of the
+run's pipeline is `done`. An interrupted pipeline must never produce it.
+FFRC (force-fail → immediate resume, torture-test W3.21) found
+`advancePipeline`'s completion branch deciding "pipeline satisfied" solely
+from the absence of waiting and incomplete steps — it never accounted for
+the `canceled` step status. The force-fail shape guarantees the
+misclassification: `forceFailRun` (`src/installer/status.ts`) sets the run
+`failed` and flips every waiting/pending/running step to `canceled`, so a
+force-failed run has NO `failed` step by design; `resumeWorkflow`
+(`src/installer/run.ts`) resets the run to `running`, finds no failed
+step, and `advancePipeline` then saw an "empty" pipeline (no waiting, no
+failed/pending/running) and emitted a false `run.completed`. The daemon's
+register gate (`handleRegisterRun`) correctly rejected the resumed run
+("Run is terminal: completed"), `resumeWorkflow` re-failed the run, and
+the CLI surfaced an uncaught error — resume permanently blocked.
+
+Contract (each item pinned by regression tests):
+
+| Consumer / gate | Location | FFRC contract |
+| --- | --- | --- |
+| Pipeline completion predicate | `advancePipeline`, `src/installer/step-ops.ts` | A run with any `canceled` step is INCOMPLETE: the incompleteness query includes `'canceled'`, so the `!next && incomplete` early-return fires and `run.completed` is never emitted for an interrupted pipeline. `advancePipeline` is the only `run.completed` emitter in the product code, so this is the single choke point. Pinned by `src/installer/status.test.ts` (FFRC describe) and `src/installer/events-vocabulary.test.ts` (force-failed stream ends on `run.force_failed`). |
+| Step completion guard | `completeStepInternal`, `src/installer/step-ops.ts` | A late completion for a `canceled` step is refused (`{status:"blocked", detail:"step already canceled"}`) even when the run is `running` again — the run-status guard alone is insufficient because `resumeWorkflow` resets the run before a surviving worker's late completion lands. Pinned by `src/installer/status.test.ts` (FFRC describe). |
+| Resume pipeline repair | `resumeWorkflow`, `src/installer/run.ts` | When no `failed` step exists (force-fail shape), reset from the first non-`done` step onward to `waiting` so the canceled work is re-dispatchable; only call `advancePipeline` when there is waiting work (never advance an empty/interrupted pipeline). Pinned by `tests/cli-resume-command.test.ts` (force-fail → immediate resume replay). |
+| Register-vs-teardown race | `handleRegisterRun` / `handleTerminateRun`, `src/server/control-server.ts` | While the daemon is mid-teardown for a run (`runsMidTeardown`), `handleRegisterRun` returns `503 "run teardown in progress, retry"` — a precise retriable answer — instead of admitting (whose fresh crons the in-flight teardown would wipe) or a terminal 409. The plain terminal 409 is kept only for genuinely terminal runs. `resumeWorkflow` treats the retriable response as a clean failure (run restored to `failed`, NO second `run.failed` terminal event), and the CLI resume handler (`src/cli/commands/workflow.ts`) catches the throw and renders it on stderr with a meaningful exit code — no stack trace, never "Run is terminal: completed". |
+
+Event-vocabulary rule pinned by `src/installer/events-vocabulary.test.ts`: a
+force-failed run's event stream must end on `run.force_failed` /
+`run.failed` — `run.completed` must never appear in it, including across a
+resume attempt.
+
 ### Dispatch
 
 - **C0-binary** Work spawns resolve the harness binary PER INVOCATION:

@@ -294,6 +294,46 @@ describe("events vocabulary and terminal-event contract (CNEV US-004)", () => {
     assert.ok(deleteIdentity.ts.length > 0);
   });
 
+  it("run.completed is never emitted for an interrupted (force-failed) pipeline — resume shape (FFRC)", async () => {
+    const { advancePipeline } = await import("../../dist/installer/step-ops.js");
+
+    // W3.21 shape: a run with in-flight + waiting steps, force-failed by an
+    // operator, then immediately resumed (run row reset to 'running' before
+    // advancePipeline runs — exactly what resumeWorkflow does).
+    const runId = "run-vocab-forcefail-resume";
+    seedRun(runId, 0, 0, "running");
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, status) VALUES (?, ?, ?, ?, ?, ?)",
+    ).run("s-vocab-ff-1", runId, "implement", "dev", 0, "running");
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, status) VALUES (?, ?, ?, ?, ?, ?)",
+    ).run("s-vocab-ff-2", runId, "verify", "verifier", 1, "waiting");
+
+    const forceResult = await forceFailRun(runId, "operator halt");
+    assert.equal(forceResult.ok, true);
+
+    // resumeWorkflow resets the run to 'running' before calling advancePipeline.
+    db.prepare("UPDATE runs SET status = 'running' WHERE id = ?").run(runId);
+
+    const outcome = advancePipeline(runId);
+    assert.equal(outcome.advanced, false, "nothing may be promoted from an all-canceled pipeline");
+    assert.equal(outcome.runCompleted, false, "an interrupted pipeline must never complete");
+
+    // Event-vocabulary rule: run.completed only ever follows genuine
+    // completion. A force-failed run's stream must end on run.force_failed.
+    const events = getRunEvents(runId);
+    const eventNames = events.map((e) => e.event);
+    assert.ok(
+      !eventNames.includes("run.completed"),
+      `spurious run.completed in force-failed stream: ${eventNames.join(", ")}`,
+    );
+    assert.equal(
+      eventNames[eventNames.length - 1],
+      "run.force_failed",
+      `a force-failed run's event stream must end on run.force_failed, got: ${eventNames.join(", ")}`,
+    );
+  });
+
   it("run.started emitter (src/installer/run.ts) carries ts and runId (source pin)", () => {
     const runTsPath = path.resolve(import.meta.dirname, "run.ts");
     const source = fs.readFileSync(runTsPath, "utf-8");

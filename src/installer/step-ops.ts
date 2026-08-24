@@ -2872,11 +2872,19 @@ function completeStepInternal(stepId: string, output: string): { status: string;
   // stories, and re-advance the pipeline. Steps still 'running' — or reset
   // to 'pending' by the stale-claim sweeper — ARE processed: late work is
   // valid work.
+  //
+  // 'canceled' steps are also blocked: a worker whose step was force-failed
+  // (or whose run was canceled) must not land its late completion. The
+  // run-status guard above is insufficient here because resumeWorkflow
+  // resets the run to 'running' before such a late completion arrives —
+  // without this entry a surviving worker's completion would resurrect a
+  // canceled step and its advancePipeline call could complete the run.
   if (
     step.status === "waiting"
     || step.status === "done"
     || step.status === "failed"
     || step.status === "skipped"
+    || step.status === "canceled"
   ) {
     return { status: "blocked", detail: `step already ${step.status}` };
   }
@@ -3483,8 +3491,16 @@ export function advancePipeline(runId: string): { advanced: boolean; runComplete
     "SELECT id, step_id FROM steps WHERE run_id = ? AND status = 'waiting' ORDER BY step_index ASC LIMIT 1"
   ).get(runId) as { id: string; step_id: string } | undefined;
 
+  // 'canceled' steps are an interrupted-pipeline marker (force-fail /
+  // cancel shapes): a run whose steps were canceled has NOT satisfied its
+  // pipeline, even though no step is waiting/failed/pending/running. Without
+  // this, the completion branch below would spuriously mark such a run
+  // 'completed' and emit run.completed — a false terminal event that also
+  // blocks resume (the daemon's register gate rejects the "completed" row).
+  // advancePipeline is the only emitter of run.completed in the product
+  // code, so this gate is the single choke point for the false event.
   const incomplete = db.prepare(
-    "SELECT id FROM steps WHERE run_id = ? AND status IN ('failed', 'pending', 'running') LIMIT 1"
+    "SELECT id FROM steps WHERE run_id = ? AND status IN ('failed', 'pending', 'running', 'canceled') LIMIT 1"
   ).get(runId) as { id: string } | undefined;
 
   if (!next && incomplete) {

@@ -36,6 +36,36 @@ import { parseRunContext, setRunContextKey } from "../installer/step-ops.js";
 export const DEFAULT_CONTROL_PORT = 3339;
 const DEFAULT_MAX_ACTIVE_TIMERS = 50;
 
+// Runs currently mid-teardown in this daemon process. handleTerminateRun
+// marks a run here while it removes scheduling crons and settles in-flight
+// rounds; handleRegisterRun refuses admission for marked runs with a
+// retriable 503 ("run teardown in progress, retry") instead of admitting a
+// run whose fresh crons the in-flight teardown would immediately wipe, or
+// misreading a concurrently-resumed run's row. This is process-local
+// (daemon-resident) state: the CLI's force-fail path tears down via the
+// control plane, so the flag is set exactly while that teardown is live.
+const runsMidTeardown = new Set<string>();
+
+/**
+ * True while the daemon is actively tearing down the given run (scheduling
+ * crons removed / in-flight rounds settling). Exported for the
+ * resume-vs-teardown regression tests.
+ */
+export function _isRunMidTeardown(runId: string): boolean {
+  return runsMidTeardown.has(runId);
+}
+
+/**
+ * @internal — test hook for the resume-vs-teardown retriable-gate
+ * regression: force-mark (or unmark) a run as mid-teardown so the
+ * register-run gate can be exercised deterministically without racing a
+ * real teardown. Only used by tests.
+ */
+export function _setRunMidTeardownForTest(runId: string, mid: boolean): void {
+  if (mid) runsMidTeardown.add(runId);
+  else runsMidTeardown.delete(runId);
+}
+
 // Read at module load so dist/version is sampled once at daemon startup,
 // not on every health request.
 const buildVersion = getBuildVersion();
@@ -802,6 +832,14 @@ async function handleRegisterRun(runId: string): Promise<JsonResponse> {
   const run = getRun(runId);
   if (!run) return notFound(`Run not found: ${runId}`);
   if (isTerminal(run.status)) return conflict(`Run is terminal: ${run.status}`);
+  // A resume landing inside an active teardown/drain window must get a
+  // precise, retriable answer — NOT admission (the in-flight teardown
+  // would immediately remove the freshly-created crons) and NOT a
+  // terminal 409 (the run is not genuinely terminal). The CLI renders
+  // this cleanly and the operator retries after teardown quiesces.
+  if (runsMidTeardown.has(runId)) {
+    return { status: 503, body: { error: "run teardown in progress, retry" } };
+  }
   if (run.status === "paused" || run.scheduling_status === "paused") {
     return ok({ state: "paused" });
   }
@@ -835,61 +873,69 @@ async function handleTerminateRun(runId: string, suiteRuntime?: SuiteClaimRuntim
   const run = getRun(runId);
   if (!run) return notFound(`Run not found: ${runId}`);
 
+  // Mark the teardown window so a concurrent register-run (e.g. an
+  // immediate resume after force-fail) gets a retriable 503 instead of an
+  // admission whose fresh crons this teardown would wipe.
+  runsMidTeardown.add(runId);
   try {
-    const {
-      removeRunCrons,
-      getRunTeardownGraceMs,
-      settleRunInFlightRounds,
-      HARNESS_TEARDOWN_GRACE_MS,
-    } = await import("../installer/agent-scheduler.js");
-    // Terminate-run is called both for user-initiated termination of an
-    // ACTIVE run (kill in-flight work immediately) and as cleanup after a
-    // run naturally completed/failed (the harness that reported the final
-    // step is still flushing its output — give only those statuses the grace
-    // window so canceled and other user-directed states stay immediate).
-    //
-    // TATR US-005: a canceled run (or an explicit settle request) must NOT
-    // kill in-flight work immediately — the cancel path guarantees its
-    // terminal event is emitted only after in-flight token attribution
-    // settles (no trailing run.tokens.updated). Remove the scheduling timers
-    // so no new rounds dispatch, grant in-flight rounds the same grace
-    // window as naturally-completed runs, then settle them before returning.
-    // Completed/failed cleanup and pause/resume behavior are unchanged.
-    const shouldSettle = run.status === "canceled" || settle;
-    const graceMs = shouldSettle
-      ? HARNESS_TEARDOWN_GRACE_MS
-      : getRunTeardownGraceMs(run.status);
-    await removeRunCrons(runId, { graceMs });
-    if (shouldSettle) {
-      const settled = await settleRunInFlightRounds(runId, { graceMs });
-      if (settled.stillInFlight.length > 0) {
-        logger.warn("control-server: in-flight rounds still processing after settle grace", {
-          runId,
-          stillInFlight: settled.stillInFlight,
-          graceMs,
-        });
+    try {
+      const {
+        removeRunCrons,
+        getRunTeardownGraceMs,
+        settleRunInFlightRounds,
+        HARNESS_TEARDOWN_GRACE_MS,
+      } = await import("../installer/agent-scheduler.js");
+      // Terminate-run is called both for user-initiated termination of an
+      // ACTIVE run (kill in-flight work immediately) and as cleanup after a
+      // run naturally completed/failed (the harness that reported the final
+      // step is still flushing its output — give only those statuses the grace
+      // window so canceled and other user-directed states stay immediate).
+      //
+      // TATR US-005: a canceled run (or an explicit settle request) must NOT
+      // kill in-flight work immediately — the cancel path guarantees its
+      // terminal event is emitted only after in-flight token attribution
+      // settles (no trailing run.tokens.updated). Remove the scheduling timers
+      // so no new rounds dispatch, grant in-flight rounds the same grace
+      // window as naturally-completed runs, then settle them before returning.
+      // Completed/failed cleanup and pause/resume behavior are unchanged.
+      const shouldSettle = run.status === "canceled" || settle;
+      const graceMs = shouldSettle
+        ? HARNESS_TEARDOWN_GRACE_MS
+        : getRunTeardownGraceMs(run.status);
+      await removeRunCrons(runId, { graceMs });
+      if (shouldSettle) {
+        const settled = await settleRunInFlightRounds(runId, { graceMs });
+        if (settled.stillInFlight.length > 0) {
+          logger.warn("control-server: in-flight rounds still processing after settle grace", {
+            runId,
+            stillInFlight: settled.stillInFlight,
+            graceMs,
+          });
+        }
       }
+    } catch (err) {
+      logger.warn("control-server: removeRunCrons threw", { runId, error: String(err) });
     }
-  } catch (err) {
-    logger.warn("control-server: removeRunCrons threw", { runId, error: String(err) });
-  }
-  releaseSuiteClaimsByOwner(runId, undefined, suiteRuntime, "cancel");
+    releaseSuiteClaimsByOwner(runId, undefined, suiteRuntime, "cancel");
 
-  try {
-    getDb()
-      .prepare(
-        "UPDATE runs SET scheduling_status = NULL, updated_at = datetime('now') WHERE id = ?",
-      )
-      .run(runId);
-  } catch {
-    /* best-effort */
-  }
-  await admitQueuedRuns().catch((err) => {
-    logger.warn("control-server: queued admission after terminate failed", {
-      runId,
-      error: String(err),
+    try {
+      getDb()
+        .prepare(
+          "UPDATE runs SET scheduling_status = NULL, updated_at = datetime('now') WHERE id = ?",
+        )
+        .run(runId);
+    } catch {
+      /* best-effort */
+    }
+    await admitQueuedRuns().catch((err) => {
+      logger.warn("control-server: queued admission after terminate failed", {
+        runId,
+        error: String(err),
+      });
     });
-  });
+  } finally {
+    runsMidTeardown.delete(runId);
+  }
   return ok({ terminated: true });
 }
 

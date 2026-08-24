@@ -8,7 +8,7 @@
 import { installWorkflow } from "../../installer/install.js";
 import { uninstallAllWorkflows, uninstallWorkflow, checkActiveRuns } from "../../installer/uninstall.js";
 import { getWorkflowStatus, listRuns, stopWorkflow, deleteWorkflow, forceFailRun } from "../../installer/status.js";
-import { runWorkflow, resumeWorkflow } from "../../installer/run.js";
+import { runWorkflow, resumeWorkflow, type ResumeResult } from "../../installer/run.js";
 import { listBundledWorkflows } from "../../installer/workflow-fetch.js";
 import { loadWorkflowSpec } from "../../installer/workflow-spec.js";
 import { resolveBundledWorkflowDir } from "../../installer/paths.js";
@@ -596,7 +596,19 @@ export async function handleWorkflow(
       return true;
     }
     if (runStatus === "failed") {
-      const result = await resumeWorkflow(fullId);
+      // resumeWorkflow throws on registration failure (e.g. the daemon is
+      // mid-teardown for a just-force-failed run and returns the retriable
+      // "run teardown in progress" error). Render those cleanly — stderr
+      // message, meaningful exit code, no stack trace — instead of letting
+      // the throw escape to the top-level handler.
+      let result: ResumeResult;
+      try {
+        result = await resumeWorkflow(fullId);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        process.stderr.write(`Failed to resume run: ${message}\n`);
+        process.exit(1);
+      }
       if (result.status === "not_found") { console.log(`No failed run found matching "${target}".`); return true; }
       console.log(`Resumed run run-${result.runId!.slice(0, 8)} (${result.workflowId}), restarting from step: ${result.stepId}`);
       printNonDoneStepStates(result.runId!);

@@ -965,6 +965,166 @@ process.exit(0);
   });
 });
 
+// ── FFRC: force-fail → resume must not emit spurious run.completed ──
+// W3.21 evidence: force-failing a run with an in-flight worker, then
+// immediately resuming, produced a spurious run.completed (advancePipeline
+// misread the all-'canceled' step set as an empty-but-satisfied pipeline),
+// which poisoned the daemon's register gate ("Run is terminal: completed")
+// and blocked resume forever. These tests pin the DB-shape regression at
+// the unit level: advancePipeline must never complete a run with canceled
+// steps, and a late completion of a canceled step must be refused.
+
+describe("force-fail resume spurious-completed regression (FFRC)", () => {
+  let tempRoot: string;
+  let stateDir: string;
+  let originalDbPath: string | undefined;
+  let originalHome: string | undefined;
+  let originalStateDir: string | undefined;
+  let db: DatabaseSync;
+
+  beforeEach(() => {
+    originalDbPath = process.env.TAMANDUA_DB_PATH;
+    originalHome = process.env.HOME;
+    originalStateDir = process.env.TAMANDUA_STATE_DIR;
+    tempRoot = tamanduaTempDir("tamandua-ffrc-");
+    stateDir = path.join(tempRoot, "state");
+    const dbPath = path.join(stateDir, "tamandua.db");
+    process.env.TAMANDUA_DB_PATH = dbPath;
+    process.env.HOME = tempRoot;
+    process.env.TAMANDUA_STATE_DIR = stateDir;
+
+    fs.mkdirSync(stateDir, { recursive: true });
+    db = new DatabaseSync(dbPath);
+    db.exec("PRAGMA journal_mode=WAL");
+    db.exec(`CREATE TABLE IF NOT EXISTS runs (
+      id TEXT PRIMARY KEY,
+      workflow_id TEXT NOT NULL DEFAULT 'test',
+      task TEXT NOT NULL DEFAULT 'test',
+      status TEXT NOT NULL DEFAULT 'running',
+      context TEXT NOT NULL DEFAULT '{}',
+      tokens_spent INTEGER NOT NULL DEFAULT 0,
+      worker_lost_count INTEGER NOT NULL DEFAULT 0,
+      ceiling_expiry_count INTEGER NOT NULL DEFAULT 0,
+      scheduling_status TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )`);
+    db.exec(`CREATE TABLE IF NOT EXISTS steps (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      step_id TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      step_index INTEGER NOT NULL DEFAULT 0,
+      input_template TEXT NOT NULL DEFAULT '',
+      expects TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'waiting',
+      output TEXT,
+      retry_count INTEGER DEFAULT 0,
+      max_retries INTEGER DEFAULT 4,
+      type TEXT NOT NULL DEFAULT 'single',
+      loop_config TEXT,
+      current_story_id TEXT,
+      abandoned_count INTEGER DEFAULT 0,
+      claim_pid INTEGER,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )`);
+    db.exec(`CREATE TABLE IF NOT EXISTS stories (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      story_index INTEGER NOT NULL,
+      story_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      acceptance_criteria TEXT NOT NULL DEFAULT '[]',
+      status TEXT NOT NULL DEFAULT 'pending',
+      output TEXT,
+      retry_count INTEGER DEFAULT 0,
+      max_retries INTEGER DEFAULT 4,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )`);
+  });
+
+  afterEach(() => {
+    if (originalDbPath) process.env.TAMANDUA_DB_PATH = originalDbPath;
+    else delete process.env.TAMANDUA_DB_PATH;
+    if (originalHome) process.env.HOME = originalHome;
+    else delete process.env.HOME;
+    if (originalStateDir) process.env.TAMANDUA_STATE_DIR = originalStateDir;
+    else delete process.env.TAMANDUA_STATE_DIR;
+    try { db.close(); } catch {}
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  });
+
+  function readRunEventLines(runId: string): Array<Record<string, unknown>> {
+    const file = path.join(stateDir, "events", `${runId}.jsonl`);
+    if (!fs.existsSync(file)) return [];
+    const raw = fs.readFileSync(file, "utf-8");
+    return raw.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+  }
+
+  it("advancePipeline never completes a force-failed run whose steps are all canceled", async () => {
+    const { advancePipeline } = await import("../../dist/installer/step-ops.js");
+    const { forceFailRun } = await import("../../dist/installer/status.js");
+
+    const runId = crypto.randomUUID();
+    db.prepare("INSERT INTO runs (id, workflow_id, task, status) VALUES (?, ?, ?, ?)")
+      .run(runId, "wf", "ffrc advance", "running");
+    // The W3.21 shape: one step done, two steps in flight/waiting at force-fail time.
+    for (const [stepName, index] of [["done", 0], ["running", 1], ["waiting", 2]] as Array<[string, number]>) {
+      db.prepare("INSERT INTO steps (id, run_id, step_id, agent_id, step_index, status) VALUES (?, ?, ?, ?, ?, ?)")
+        .run(crypto.randomUUID(), runId, `step-${index}`, "dev", index, stepName);
+    }
+
+    const forceResult = await forceFailRun(runId, "operator halt");
+    assert.equal(forceResult.ok, true);
+
+    // Exact forceFailRun DB shape: run 'failed', every non-done step 'canceled'
+    const runAfterFail = db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string };
+    assert.equal(runAfterFail.status, "failed");
+    const canceledSteps = db.prepare("SELECT COUNT(*) AS cnt FROM steps WHERE run_id = ? AND status = 'canceled'").get(runId) as { cnt: number };
+    assert.equal(canceledSteps.cnt, 2);
+
+    // resumeWorkflow resets the run to 'running' BEFORE calling advancePipeline
+    db.prepare("UPDATE runs SET status = 'running' WHERE id = ?").run(runId);
+
+    const outcome = advancePipeline(runId);
+    assert.equal(outcome.advanced, false, "nothing may be promoted from an all-canceled pipeline");
+    assert.equal(outcome.runCompleted, false, "a run with canceled steps must never complete");
+
+    const run = db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string };
+    assert.notEqual(run.status, "completed", "DB run status must not become 'completed'");
+    assert.equal(run.status, "running");
+
+    // No run.completed may be emitted for the interrupted pipeline.
+    const events = readRunEventLines(runId).map((l) => l.event);
+    assert.ok(!events.includes("run.completed"), `spurious run.completed emitted: ${events.join(", ")}`);
+    // The truthful terminal record is run.force_failed — nothing after it.
+    assert.equal(events[events.length - 1], "run.force_failed");
+  });
+
+  it("completeStep refuses a late completion of a canceled step while the run is running", async () => {
+    const { completeStep } = await import("../../dist/installer/step-ops.js");
+
+    const runId = crypto.randomUUID();
+    const stepId = crypto.randomUUID();
+    db.prepare("INSERT INTO runs (id, workflow_id, task, status) VALUES (?, ?, ?, ?)")
+      .run(runId, "wf", "ffrc complete", "running");
+    db.prepare("INSERT INTO steps (id, run_id, step_id, agent_id, step_index, status) VALUES (?, ?, ?, ?, ?, ?)")
+      .run(stepId, runId, "implement", "dev", 0, "canceled");
+
+    // The run-status guard alone cannot block this: resumeWorkflow resets the
+    // run to 'running' before a surviving worker's late completion lands.
+    const result = completeStep(stepId, "STATUS: done");
+    assert.equal(result.status, "blocked");
+    assert.equal(result.detail, "step already canceled");
+
+    const step = db.prepare("SELECT status FROM steps WHERE id = ?").get(stepId) as { status: string };
+    assert.equal(step.status, "canceled", "canceled step must not be resurrected");
+  });
+});
+
 // ── WLST5 split counters surface ────────────────────────────────────
 // worker_lost_count now means harness_lost only; ceiling-expired rounds
 // tick the sibling ceiling_expiry_count. Both must surface through the

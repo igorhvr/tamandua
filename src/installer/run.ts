@@ -575,15 +575,44 @@ export async function resumeWorkflow(runId: string): Promise<ResumeResult> {
     "SELECT id, step_id, step_index FROM steps WHERE run_id = ? AND status = 'failed' ORDER BY step_index ASC LIMIT 1",
   ).get(run.id) as { id: string; step_id: string; step_index: number } | undefined;
 
+  // The step the resumed run restarts from (surfaced to the CLI).
+  let restartStepId: string | undefined = failedStep?.step_id;
+
   if (failedStep) {
     // Reset this step and all subsequent steps back to waiting
     db.prepare(
       "UPDATE steps SET status = 'waiting', retry_count = 0, output = NULL, updated_at = datetime('now') WHERE run_id = ? AND step_index >= ?",
     ).run(run.id, failedStep.step_index);
+  } else {
+    // Force-failed shape: forceFailRun leaves the run 'failed' with ALL
+    // non-done steps 'canceled' — there is no 'failed' step to restart
+    // from. Repair the interrupted pipeline by resetting from the first
+    // non-'done' step onward so the canceled work returns to 'waiting'
+    // and the dispatch motor can reclaim it. (Without this repair,
+    // advancePipeline below would see an "empty" pipeline of canceled
+    // steps and spuriously complete the run.)
+    const firstNonDone = db.prepare(
+      "SELECT step_id, step_index FROM steps WHERE run_id = ? AND status != 'done' ORDER BY step_index ASC LIMIT 1",
+    ).get(run.id) as { step_id: string; step_index: number } | undefined;
+    if (firstNonDone) {
+      db.prepare(
+        "UPDATE steps SET status = 'waiting', retry_count = 0, output = NULL, updated_at = datetime('now') WHERE run_id = ? AND step_index >= ?",
+      ).run(run.id, firstNonDone.step_index);
+      restartStepId = firstNonDone.step_id;
+    }
   }
 
-  // Promote the next eligible waiting step to 'pending' so the dispatch motor can claim it.
-  advancePipeline(run.id);
+  // Advance the pipeline ONLY when there is work to advance. An
+  // interrupted/empty pipeline (e.g. every step already 'done') must never
+  // be completed by advancePipeline's completion branch during resume — a
+  // force-failed run must not emit a spurious run.completed.
+  const pendingWork = db.prepare(
+    "SELECT id FROM steps WHERE run_id = ? AND status = 'waiting' LIMIT 1",
+  ).get(run.id) as { id: string } | undefined;
+  if (pendingWork) {
+    // Promote the next eligible waiting step to 'pending' so the dispatch motor can claim it.
+    advancePipeline(run.id);
+  }
 
   const registration = await registerRunWithDaemon(run.id, 5000);
   if (!registration || registration.status < 200 || registration.status >= 300) {
@@ -594,13 +623,22 @@ export async function resumeWorkflow(runId: string): Promise<ResumeResult> {
     db.prepare(
       "UPDATE runs SET status = 'failed', scheduling_status = NULL, scheduling_error = ?, updated_at = datetime('now') WHERE id = ?",
     ).run(message, run.id);
-    emitEvent({
-      ts: new Date().toISOString(),
-      event: "run.failed",
-      runId: run.id,
-      workflowId: run.workflow_id,
-      detail: `Resume registration failed: ${message}`,
-    });
+    // Retriable teardown: the daemon is still draining the run's in-flight
+    // workers (e.g. an immediate resume right after force-fail). The run's
+    // truthful terminal event (run.force_failed / run.failed) was already
+    // emitted — do NOT emit a second run.failed for a resume that never
+    // took effect. Everything else keeps the historical behavior.
+    const retriableTeardown =
+      registration?.status === 503 && /teardown in progress/i.test(message);
+    if (!retriableTeardown) {
+      emitEvent({
+        ts: new Date().toISOString(),
+        event: "run.failed",
+        runId: run.id,
+        workflowId: run.workflow_id,
+        detail: `Resume registration failed: ${message}`,
+      });
+    }
     scheduleRunCronTeardown(run.id);
     throw new Error(`Failed to register resumed run with daemon: ${message}`);
   }
@@ -608,5 +646,5 @@ export async function resumeWorkflow(runId: string): Promise<ResumeResult> {
   // Same as runWorkflow: dispatch the re-pended step now, not on the sweep.
   nudgeWithDaemon().catch(() => {});
 
-  return { status: "resumed", runId: run.id, workflowId: run.workflow_id, stepId: failedStep?.step_id };
+  return { status: "resumed", runId: run.id, workflowId: run.workflow_id, stepId: restartStepId };
 }
