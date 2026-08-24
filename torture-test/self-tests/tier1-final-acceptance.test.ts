@@ -246,6 +246,19 @@ const allowed = [
   // surface — same class as the build-version parity guard it sits beside.
   "torture-test/bin/tt-schema-probe.mjs",
   "torture-test/scenarios/lib/run-scripted-scenario",
+  // MACP4 US-004: the four W2 scripted cells (scenarios/w2.21/run.mjs,
+  // w2.23a/run.mjs, w2.23b/run.mjs, w2.23c/run.mjs) and the spawn env
+  // scripts (env/tt-env.sh, env/tt-env-scripted.sh) now resolve the REAL
+  // operator home via the portable getent -> dscl -> eval-echo -> $HOME
+  // chain (shared helper scenarios/lib/operator-home.mjs — the
+  // scenario-cell support surface, already authorized) so daemonEnv.HOME
+  // handed to daemon-control is never the contained TT home on Darwin.
+  // New authoring surfaces added in the same story that portabilized them.
+  "torture-test/env/",
+  "torture-test/scenarios/w2.21/",
+  "torture-test/scenarios/w2.23a/",
+  "torture-test/scenarios/w2.23b/",
+  "torture-test/scenarios/w2.23c/",
   // US-015: the --tier2 ladder rung — bin/tt-run wires tier2 availability
   // + routing (its test extends with the tier2 assertions and the E2.2
   // fail-closed proof), and bin/tt-tier2-assets is the NEW tier2 asset

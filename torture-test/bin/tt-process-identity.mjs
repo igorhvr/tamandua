@@ -15,14 +15,22 @@
 // after the comm field (which may contain spaces/parens) is stripped by
 // slicing at the LAST ')'.
 //
+// Darwin (MACP4 US-002): no procfs — the start identity comes from
+// `ps -p <pid> -o lstart=` ('darwin:<lstart>', 1-second granularity —
+// see getDarwinStartIdentity). The identity-gated daemon stop/escalation
+// corridors (daemon-control verify_recorded_identity / --check) therefore
+// work on /proc-less hosts too; the pgid/ancestry gates that need procfs
+// still REFUSE fail-closed when their evidence is unreadable.
+//
 // CLI mode (bash-callable, consumed by bin/daemon-control and the kill
 // sites):
 //   tt-process-identity.mjs --check <pid> <expectedStartTime>
-//     exit 0 when <pid> is alive and its current /proc starttime equals
+//     exit 0 when <pid> is alive and its current start identity equals
 //     <expectedStartTime>; exit 1 otherwise, with a one-line reason.
 //   tt-process-identity.mjs --get <pid>
-//     print the current start identity ('proc:<starttime>') of <pid> on
-//     stdout, exit 0; exit 1 with a one-line reason when unreadable
+//     print the current start identity ('proc:<starttime>' on linux,
+//     'darwin:<lstart>' on /proc-less hosts) of <pid> on stdout, exit 0;
+//     exit 1 with a one-line reason when unreadable
 //     (daemon-control records this at daemon start — US-004).
 //   tt-process-identity.mjs --verify <pid> [expectedStartTime]
 //     full signal-target verification (US-004 lingering-listener gate):
@@ -31,10 +39,17 @@
 //     disjoint from the verifier's own pgid. exit 0 when verified, exit 1
 //     with a one-line reason otherwise.
 //
+// Injectable test seams (MACP4 US-002):
+//   TT_PROCESS_IDENTITY_PLATFORM = linux|darwin — force the platform
+//     branch on any host (hermetic Darwin simulation on linux).
+//   TT_PROCESS_IDENTITY_PS = <ps binary path> — shim the ps invocation
+//     (deterministic lstart, or a failing ps for the null->refusal proof).
+//
 // Exports are safe to import from other torture-test modules; the CLI only
 // triggers on an explicit argv.
 
 import fs from 'node:fs';
+import { spawnSync } from 'node:child_process';
 
 // ── procfs helpers ─────────────────────────────────────────────────
 
@@ -42,7 +57,8 @@ import fs from 'node:fs';
 // /proc/<pid>/stat is linux-only — Darwin has no procfs. Every reader of
 // this helper already treats `null` as "cannot introspect" (unavailable),
 // so on Darwin the helper simply degrades to null instead of hard-failing;
-// getProcessStartIdentity additionally short-circuits on platform !== linux.
+// getProcessStartIdentity additionally dispatches on platform (linux /proc
+// vs the Darwin ps-lstart source — MACP4 US-002).
 // linux-only /proc usage — guarded for Darwin via null-degradation
 // (MACP3 US-003).
 // Returns null when the pid is invalid or the entry is unreadable
@@ -71,15 +87,81 @@ function readProcStat(pid) {
   return { state, ppid, pgrp, starttime };
 }
 
+// ── Darwin identity source ────────────────────────────────────────────
+//
+// Darwin has no procfs, so the linux /proc starttime identity is
+// unavailable. MACP4 US-002: use a MECHANICAL source that both BSD ps
+// (macOS) and procps (linux) support: `ps -p <pid> -o lstart=` — the full
+// process start timestamp (e.g. "Sun Aug 23 18:19:00 2026"). The identity
+// string is 'darwin:<lstart>'.
+//
+// COARSER GRANULARITY (documented): /proc starttime counts clock ticks
+// since boot (jiffies) — a pid-reuse within the same jiffy is
+// astronomically unlikely; lstart has 1-SECOND resolution, so a pid reused
+// within the same second of the recorded lstart would NOT be detected by
+// the startTime comparison alone. The kill sites' other fail-closed gates
+// (TT-owned cwd/cmdline evidence, pgid/ancestry where readable) are
+// therefore MORE load-bearing on Darwin than on linux — they must never be
+// relaxed. On the fallback launch path the daemon is a plain nohup child
+// recorded in provenance, and stop_cli_auto_daemon re-verifies TT-ownership
+// + identity before every signal, so the 1-second window is acceptable.
+//
+// The darwin branch is the ONLY identity source on /proc-less hosts; every
+// existing E3.C.1 fail-closed refusal is preserved: when the pid is
+// unverifiable (dead / ps unreadable) this returns null and every caller
+// REFUSES to signal — never signals on weak evidence.
+//
+// Injectable seams (MACP4 US-002, hermetic tests — see
+// self-tests/tier1-daemon-control-darwin-identity.test.ts):
+//   TT_PROCESS_IDENTITY_PLATFORM   force the platform branch on any host
+//                                  ('linux' | 'darwin'); default process.platform
+//   TT_PROCESS_IDENTITY_PS         ps binary to invoke (default 'ps'); a PATH
+//                                  or binary seam so tests can shim ps (a
+//                                  deterministic lstart, or a failing ps to
+//                                  prove the null->refusal semantics)
+
+// getDarwinStartIdentity: 'darwin:<lstart>' via `ps -p <pid> -o lstart=`,
+// null when the pid is invalid, ps is unavailable, or the pid is not alive
+// (ps exits non-zero / prints no lstart row).
+export function getDarwinStartIdentity(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  // Read the seam at CALL time (not module load) so tests can shim ps.
+  const psBin = process.env.TT_PROCESS_IDENTITY_PS ?? 'ps';
+  let res;
+  try {
+    res = spawnSync(psBin, ['-p', String(pid), '-o', 'lstart='], {
+      encoding: 'utf8',
+      timeout: 10_000,
+    });
+  } catch {
+    return null;
+  }
+  if (res.status !== 0) return null;
+  const lstart = String(res.stdout ?? '').trim();
+  if (lstart === '') return null;
+  return `darwin:${lstart}`;
+}
+
 // ── public identity primitives ─────────────────────────────────────
 
 // getProcessStartIdentity: stable process-start identity for ABA reuse
-// protection — 'proc:<starttime>' on linux, null when unreadable.
-// Mirrors src/lib/process-start-identity.ts semantics.
+// protection — 'proc:<starttime>' on linux (via /proc), 'darwin:<lstart>'
+// on /proc-less hosts (via ps -p <pid> -o lstart=, MACP4 US-002), null
+// when unreadable. Mirrors src/lib/process-start-identity.ts semantics on
+// linux; the Darwin source is the mechanical /proc-free identity the W2
+// scripted cells need for daemon stop/escalation identity gates.
+// TT_PROCESS_IDENTITY_PLATFORM forces the branch on any host (hermetic
+// test seam; linux behavior is identical when unset).
 export function getProcessStartIdentity(pid) {
-  if (process.platform !== 'linux') return null;
-  const stat = readProcStat(pid);
-  return stat === null ? null : `proc:${stat.starttime}`;
+  const platform = process.env.TT_PROCESS_IDENTITY_PLATFORM ?? process.platform;
+  if (platform === 'linux') {
+    const stat = readProcStat(pid);
+    return stat === null ? null : `proc:${stat.starttime}`;
+  }
+  if (platform === 'darwin') {
+    return getDarwinStartIdentity(pid);
+  }
+  return null;
 }
 
 // getProcessGroup: the process group id (stat field 5) of a pid,
@@ -145,7 +227,7 @@ export function verifyRecordedTarget(record = {}) {
   }
   const current = getProcessStartIdentity(pid);
   if (current === null) {
-    return { ok: false, reason: `target pid ${pid} is not alive (or /proc unreadable)` };
+    return { ok: false, reason: `target pid ${pid} is not alive (or its start identity is unreadable)` };
   }
   if (record.startTime !== undefined && record.startTime !== null && record.startTime !== current) {
     return {
@@ -185,7 +267,7 @@ if (args[0] === '--check') {
   }
   const current = getProcessStartIdentity(pid);
   if (current === null) {
-    console.error(`tt-process-identity: pid ${pid} not alive or /proc unreadable`);
+    console.error(`tt-process-identity: pid ${pid} not alive or identity unreadable`);
     process.exit(1);
   }
   if (current !== expected) {
@@ -204,7 +286,7 @@ if (args[0] === '--get') {
   }
   const identity = getProcessStartIdentity(pid);
   if (identity === null) {
-    console.error(`tt-process-identity: pid ${pid} not alive or /proc unreadable`);
+    console.error(`tt-process-identity: pid ${pid} not alive or identity unreadable`);
     process.exit(1);
   }
   console.log(identity);

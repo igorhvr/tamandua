@@ -718,6 +718,16 @@ else
   fail "hostProfile.toolchains missing from JSON"
 fi
 
+# MACP4 US-005 AC1 (full mode): the FULL (non-fast) run just above wrote
+# host-profile.json with the daemon-scripted Boolean-leaf capability —
+# true iff bash AND nohup AND node are on PATH (the scripted-daemon
+# plain-background fallback prerequisites). This host has all three.
+if jq -e '.capabilities["daemon-scripted"] == true' "${SCRIPT_DIR}/../var/w0/host-profile.json" > /dev/null 2>&1; then
+  pass "FULL (non-fast) run records capabilities.daemon-scripted === true"
+else
+  fail "FULL (non-fast) run does not record capabilities.daemon-scripted === true"
+fi
+
 # Each toolchain entry has { present, buildPassed, testPassed, evidence }
 for tc in 'java+maven' 'rust/cargo' go python3 node; do
   if echo "$json_output" | jq -e ".hostProfile.toolchains.\"${tc}\"" > /dev/null 2>&1; then
@@ -1300,6 +1310,40 @@ else
   fail "a recorded node runtime lacks sqliteAvailable"
 fi
 
+# ── Test 16b: daemon-scripted capability recording (MACP4 US-005) ────
+echo ""
+echo "--- Test: daemon-scripted capability recording (MACP4 US-005) ---"
+
+# AC1 (--fast mode): the --fast run above records the Boolean leaf — true
+# iff bash AND nohup AND node resolve on PATH (the scripted-daemon
+# plain-background fallback prerequisites). This linux host has all three,
+# so the leaf must be true (never missing, never silently dropped).
+if jq -e '.capabilities["daemon-scripted"] == true' "$HP" > /dev/null 2>&1; then
+  pass "host-profile.json .capabilities.daemon-scripted === true (--fast mode)"
+else
+  fail "host-profile.json .capabilities.daemon-scripted !== true after --fast"
+fi
+
+# The check row itself appears in --json output and PASSes.
+ds_json=$("$TOOL" --fast --json 2>&1) && : || :
+if echo "$ds_json" | jq -e '.checks[] | select(.id == "capability-daemon-scripted" and .result == "PASS")' > /dev/null 2>&1; then
+  pass "capability-daemon-scripted check row is PASS in --json output"
+else
+  fail "capability-daemon-scripted check row missing or not PASS in --json output"
+fi
+
+# Both-mode coverage: the check runs in full AND --fast (the FULL-mode
+# assertion lives in Test 8 after the full run; here we pin the fast leaf
+# agrees with an independent command -v scan of the CURRENT PATH).
+ds_leaf=$(jq -r '.capabilities["daemon-scripted"]' "$HP")
+if command -v bash > /dev/null 2>&1 && command -v nohup > /dev/null 2>&1 && command -v node > /dev/null 2>&1; then
+  [ "$ds_leaf" = "true" ] && pass "capabilities.daemon-scripted=true agrees with command -v bash/nohup/node" \
+    || fail "capabilities.daemon-scripted=false but bash/nohup/node all resolve on PATH"
+else
+  [ "$ds_leaf" = "false" ] && pass "capabilities.daemon-scripted=false agrees with missing command -v lookup" \
+    || fail "capabilities.daemon-scripted=true but a prerequisite is missing from PATH"
+fi
+
 # ── Test 17: US-008 — --tier scoping of REQUIRED toolchain checks ────
 echo ""
 echo "--- Test: US-008 --tier scoping ---"
@@ -1323,13 +1367,15 @@ fi
 # AC2/AC3: simulate a T1-only host (spec 04: T1={node,python3}) with a
 # restricted PATH: a temp bin dir holding symlinks to the real binaries the
 # W0.0 checks need (node/npm/python3/git/bash/which/curl/jq/sqlite3/df/true/
-# sh/systemd-run/systemctl) but WITHOUT the tier-2 toolchains (mvn, cargo,
+# sh/systemd-run/systemctl/nohup) but WITHOUT the tier-2 toolchains (mvn, cargo,
 # go). ss/lsof are also omitted so the port probe reports every port free —
 # the toolchain gap is then the ONLY delta, keeping the simulation
 # deterministic even on a host whose TT ports are occupied by unrelated
-# daemons (e.g. a sibling tamandua instance).
+# daemons (e.g. a sibling tamandua instance). nohup is included: the
+# daemon-scripted capability check (MACP4 US-005) requires bash+nohup+node
+# on PATH and is a REQUIRED check on both tiers.
 FAKE_BIN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/tt-verify-tier-fake.XXXXXX")"
-for bin_name in node npm python3 git bash which curl jq sqlite3 df true sh systemd-run systemctl; do
+for bin_name in node npm python3 git bash which curl jq sqlite3 df true sh systemd-run systemctl nohup; do
   real_path="$(command -v "$bin_name" 2>/dev/null || true)"
   if [ -n "$real_path" ]; then
     ln -s "$real_path" "$FAKE_BIN_DIR/$bin_name"
@@ -1471,9 +1517,10 @@ fi
 # PATH (mvn/cargo/go included) with the port probe silenced (no ss/lsof, so
 # every port reports free) — passes the tier1 gate with exit 0. This proves
 # the literal AC4 claim host-state-independently: a full toolchain host is
-# never failed by --tier tier1.
+# never failed by --tier tier1. nohup joins the set for the REQUIRED
+# daemon-scripted capability check (MACP4 US-005).
 FAKE_FULL_DIR="$(mktemp -d "${TMPDIR:-/tmp}/tt-verify-tier-full.XXXXXX")"
-for bin_name in node npm python3 git bash which curl jq sqlite3 df true sh systemd-run systemctl mvn cargo go; do
+for bin_name in node npm python3 git bash which curl jq sqlite3 df true sh systemd-run systemctl mvn cargo go nohup; do
   real_path="$(command -v "$bin_name" 2>/dev/null || true)"
   if [ -n "$real_path" ]; then
     ln -s "$real_path" "$FAKE_FULL_DIR/$bin_name"

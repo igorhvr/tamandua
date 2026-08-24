@@ -37,8 +37,44 @@ export HERMES_HOME="$TT_HOME/.hermes"
 # and dies with "Node is not available" under TT_HOME (rc=126, caught by
 # the daemon-control self-test 2026-07-31). Pin the REAL node binary dir
 # onto PATH and point VOLTA_HOME at the operator's install.
-_tt_real_home="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)"
-_tt_real_home="${_tt_real_home:-/home/$(id -un)}"
+#
+# resolve_operator_home — the OPERATOR's real home directory, resolved
+# INDEPENDENTLY of $HOME (this script overrides HOME to the contained
+# TT_HOME — deriving the volta/node paths from $HOME would point them at
+# the contained home). MACP4 US-004 fallback chain (the tt-provision-home
+# convention, extended with the shell tilde step):
+#   1. getent passwd <uid>            (linux passwd db)
+#   2. dscl . -read /Users/<user> NFSHomeDirectory
+#                                     (macOS directory service — getent absent)
+#   3. shell tilde expansion of the named user (`eval echo ~<user>`)
+#                                     (works with no getent AND no dscl)
+#   4. $HOME last resort
+resolve_operator_home() {
+  local pw_home
+  pw_home="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6 || true)"
+  if [ -n "$pw_home" ]; then
+    printf '%s' "$pw_home"
+    return 0
+  fi
+  # macOS fallback: getent is absent; read the NFS home directory via dscl.
+  if command -v dscl >/dev/null 2>&1; then
+    pw_home="$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | awk '{print $2}' || true)"
+    if [ -n "$pw_home" ]; then
+      printf '%s' "$pw_home"
+      return 0
+    fi
+  fi
+  # Shell tilde expansion of the named user — no getent, no dscl needed.
+  # An unknown user leaves the literal `~<user>` (or a bare `~` when the
+  # command substitution is empty); only a real absolute home is accepted.
+  pw_home="$(eval echo ~"$(id -un)" 2>/dev/null || true)"
+  case "$pw_home" in
+    '~'*|'') ;; # unknown user / empty — fall through
+    *) printf '%s' "$pw_home"; return 0 ;;
+  esac
+  printf '%s' "${HOME:-}"
+}
+_tt_real_home="$(resolve_operator_home)"
 if [ -d "$_tt_real_home/.volta" ]; then
   export VOLTA_HOME="$_tt_real_home/.volta"
 fi

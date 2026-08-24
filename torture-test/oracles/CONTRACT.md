@@ -29,7 +29,15 @@ MUST follow it exactly:
   the profile's recorded `capabilities.<name>` Boolean-leaf section (e.g.
   `node-runtimes-2` — recorded true iff W0.0 discovered ≥ 2 DISTINCT node
   runtimes/versions on the host; the W4.23 daemon-cross-runtime predicate
-  source). An unrecorded capability name is honestly absent (null).
+  source — and `daemon-scripted` — a Boolean leaf COMPUTED ON BOTH linux
+  AND darwin, true iff the host has the scripted-daemon plain-background
+  fallback launch prerequisites (bash AND nohup AND node resolvable via
+  POSIX `command -v` PATH lookup; no procfs, no getent). `daemon-scripted`
+  is the narrowest true requirement of the tier1 W2 scripted cells
+  (W2.21, W2.23a/b/c) — it replaced their blanket `platform: linux`
+  predicate, which vacuously gated them `NOT_RUN (predicate)` on a
+  fully-capable Darwin host). An unrecorded capability name is honestly
+  absent (null).
 - An honestly-missing capability gates the case `NOT_RUN (predicate)` with
   expected/observed evidence — it is never silently skipped and never a
   failure.

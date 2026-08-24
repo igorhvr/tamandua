@@ -89,6 +89,11 @@ HEAVY_CAMPAIGN_TESTS=(
     'tier1-scripted-probe-battery.test.ts'
     'tier1-kill-sentinel-survival.test.ts'
     'tier1-zero-real-launch-infra.test.ts'
+    # MACP4 US-007: the W2 dual-path proof drives 8 real scripted-scenario
+    # executions (4 cells x systemd + forced-fallback) plus two bare tier1
+    # campaigns — the same unbounded campaign class as the other heavy
+    # proofs, so it is isolated here with its own ceiling.
+    'tier1-w2-darwin-capable-proof.test.ts'
     # US-016: tier2-repeatability drives full tier2/tier1 controller campaigns
     # (bare --tier2 x2 + dry-run over the whole roster + no-regression) and
     # rewrites the SHARED var/w0/host-profile.json — heavy/isolated exactly

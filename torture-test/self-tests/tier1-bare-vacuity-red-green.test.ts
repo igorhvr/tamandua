@@ -31,8 +31,10 @@
 //
 // The GREEN arm (control, AC2) is a NORMAL bare tier1 selection: the ORIGINAL
 // cases/tier1.jsonl run bare, where the 4 scripted local cells have
-// SATISFIABLE requires {platform:linux,...}, so at least one scripted cell
-// EXECUTES (through the zero-token scripted daemon) and the campaign is
+// SATISFIABLE requires (since MACP4 US-006:
+// {"capabilities":["node-sqlite","daemon-scripted"],"node_min":22} — the
+// daemon-scripted leaf is true on this linux host), so at least one scripted
+// cell EXECUTES (through the zero-token scripted daemon) and the campaign is
 // genuinely GREEN (exit 0) with vacuity silent. The control is what the task
 // demands after the fix: the vacuity guard must not block legitimate bare
 // campaigns.
@@ -349,10 +351,11 @@ it("US-009: GREEN arm (control) — a NORMAL bare tier1 selection with at least 
   ensureHostProfile();
 
   // The ORIGINAL tier1 manifest run bare. Its 4 scripted local cells carry
-  // SATISFIABLE requires {platform:linux,...}, so >=1 scripted cell EXECUTES
-  // through the zero-token scripted daemon; 24 real cells are pending-real.
-  // This is the control the task demands: after the vacuity guard, a normal
-  // bare tier1 must still be GREEN.
+  // SATISFIABLE requires (capabilities ["node-sqlite","daemon-scripted"] since
+  // MACP4 US-006 — daemon-scripted is true on this linux host), so >=1
+  // scripted cell EXECUTES through the zero-token scripted daemon; 24 real
+  // cells are pending-real. This is the control the task demands: after the
+  // vacuity guard, a normal bare tier1 must still be GREEN.
   let greenResult!: CommandResult;
   let greenCampaignId: string | null = null;
   try {

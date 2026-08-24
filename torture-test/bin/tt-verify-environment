@@ -112,7 +112,7 @@ const hostProfile = {
   diskHeadroom: null,        // { availableBytes, available, thresholdBytes, threshold } (US-006)
   toolchains: null,           // { 'java+maven': {...}, 'rust/cargo': {...}, go: {...}, python3: {...}, node: {...} } (US-007)
   harness: null,              // { pi: { authenticated, sessionId?, inputTokens?, outputTokens? }, hermes: {...}, dsh: { present, authenticated, skipReason } } (US-010 + Tier-2 dsh lane)
-  capabilities: null,         // { 'node-runtimes-2': boolean } (US-011 — Boolean-leaf capability names per the E2.2 canonical contract)
+  capabilities: null,         // { 'node-runtimes-2': boolean, 'daemon-scripted': boolean } (US-011 / MACP4 US-005 — Boolean-leaf capability names per the E2.2 canonical contract)
   // Populated by US-011:
   // spawnSpeedClass: null,
 };
@@ -182,9 +182,21 @@ function registerCheck(id, description, severity, category, runFn) {
 
 // ── Check implementations ─────────────────────────────────────────────
 
+// Injectable platform seam (MACP4 US-005, the MACP3 injectable-seam
+// pattern): TT_VERIFY_PLATFORM forces the platform recorded in
+// host-profile.json / environment.json / --json output (e.g. 'darwin' on a
+// linux host) so BOTH-platform computation of host capabilities can be
+// proven without a mac. Unset => the real os.platform(). Used by the
+// platform check, the systemd containment check, and the profile/output
+// serializers — a simulated-Darwin run skips systemd exactly like a real
+// mac and records containment.systemdUserScope=false.
+function detectedPlatform() {
+  return process.env.TT_VERIFY_PLATFORM || os.platform();
+}
+
 // --- Platform ---
 registerCheck('platform', 'Host platform detection', 'REQUIRED', 'platform', async () => {
-  const platform = os.platform(); // 'linux', 'darwin', etc.
+  const platform = detectedPlatform(); // 'linux', 'darwin', etc. (TT_VERIFY_PLATFORM seam honored)
   const arch = os.arch();
   const release = os.release();
   let label;
@@ -390,6 +402,58 @@ registerCheck('npm', 'npm is present', 'REQUIRED', 'platform', async () => {
       skipReason: null,
     };
   }
+});
+
+// ── daemon-scripted capability (MACP4 US-005) ────────────────────────
+// Boolean-leaf capability recorded in BOTH full and --fast modes (like the
+// node-runtimes-2 leaf): true iff the host has the scripted-daemon
+// plain-background fallback launch prerequisites — bash AND nohup AND node
+// resolvable via POSIX `command -v` PATH-lookup semantics. This is the
+// narrowest true requirement for the tier1 W2 scripted cells (daemon-
+// control's non-systemd fallback launch path), so they can be gated on the
+// capability instead of the blanket `platform: linux`. Computed identically
+// on linux and darwin: a pure PATH scan with NO /proc reads, NO getent, and
+// NO os.platform() branch (the TT_VERIFY_PLATFORM seam is only reflected in
+// the evidence string).
+function commandOnPath(name) {
+  const pathEnv = process.env.PATH ?? '';
+  const seen = new Set();
+  for (const dir of pathEnv.split(':')) {
+    if (!dir || seen.has(dir)) continue;
+    seen.add(dir);
+    const candidate = path.join(dir, name);
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return candidate;
+    } catch (_) { /* not here — keep scanning */ }
+  }
+  return null;
+}
+
+registerCheck('capability-daemon-scripted', 'daemon-scripted capability (scripted-daemon fallback prerequisites)', 'REQUIRED', 'platform', async () => {
+  const bashBin = commandOnPath('bash');
+  const nohupBin = commandOnPath('nohup');
+  const nodeBin = commandOnPath('node');
+  const daemonScripted = bashBin !== null && nohupBin !== null && nodeBin !== null;
+  recordHostProfile('capabilities', 'daemon-scripted', daemonScripted);
+  if (daemonScripted) {
+    return {
+      result: 'PASS',
+      evidence: `daemon-scripted=true (bash=${bashBin}; nohup=${nohupBin}; node=${nodeBin}; platform=${detectedPlatform()})`,
+      remedy: null,
+      skipReason: null,
+    };
+  }
+  const missing = [];
+  if (bashBin === null) missing.push('bash');
+  if (nohupBin === null) missing.push('nohup');
+  if (nodeBin === null) missing.push('node');
+  return {
+    result: 'FAIL',
+    evidence: `daemon-scripted=false — missing: ${missing.join(', ')} (platform=${detectedPlatform()})`,
+    remedy: 'Install bash, nohup, and node on PATH (scripted-daemon plain-background fallback prerequisites)',
+    skipReason: null,
+  };
 });
 
 // ── Future W0.0 checks — registered as SKIPPED stubs ──────────────
@@ -879,7 +943,7 @@ registerCheck('util-jq', 'jq is present on PATH', 'REQUIRED', 'utilities', async
 
 // systemd user scope — US-003
 registerCheck('systemd-user-scope', 'systemd user scope available', 'REQUIRED', 'containment', async () => {
-  const platform = os.platform();
+  const platform = detectedPlatform();
   // systemd is a Linux-only facility; darwin uses launchd
   if (platform !== 'linux') {
     recordHostProfile('containment', 'systemdUserScope', false);
@@ -1776,7 +1840,7 @@ function writeProfileFiles(results, exitCode) {
     })),
     exitCode,
     tier,
-    platform: os.platform(),
+    platform: detectedPlatform(),
     git: hostProfile.git,
     ports: hostProfile.ports,
     utilities: hostProfile.utilities,
@@ -1847,7 +1911,7 @@ function formatJson(results, exitCode, tier) {
     checks: checksJson,
     exitCode,
     tier: tier || 'unknown',
-    platform: os.platform(),
+    platform: detectedPlatform(),
     timestamp: new Date().toISOString(),
     flags: {
       fast: OPT.fast,

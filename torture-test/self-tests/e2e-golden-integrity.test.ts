@@ -63,6 +63,11 @@ const HEAVY_CAMPAIGN_TESTS = [
   "tier1-scripted-probe-battery.test.ts",
   "tier1-kill-sentinel-survival.test.ts",
   "tier1-zero-real-launch-infra.test.ts",
+  // MACP4 US-007: W2 dual-path proof (4 cells x systemd + forced-fallback
+  // harness executions + two bare tier1 campaigns) — same campaign class as
+  // the other heavy proofs; must stay in lock-step with run.sh + the verify
+  // script (AC5 pins the invariant).
+  "tier1-w2-darwin-capable-proof.test.ts",
   "tier2-repeatability.test.ts",
   "tier2-scripted-behaviors-materialization.test.ts",
 ];

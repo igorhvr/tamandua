@@ -198,6 +198,25 @@ a provisioned tt-python clone is proven zero-token by
 | W2.23c-missing-persona | `#W2.23c` | none | local | local | scripted |
 | W2.24-docs-drift | `#W2.24` | tt-ts | pi | local | real |
 
+**W2.21 / W2.23a / W2.23b / W2.23c — HOST-ADAPTATION note (MACP4 US-006):**
+the four scripted W2 rows' `requires` predicate was NARROWED from a blanket
+`{"platform":"linux","capabilities":["node-sqlite"],"node_min":22}` to
+`{"capabilities":["node-sqlite","daemon-scripted"],"node_min":22}` (the
+`platform` key dropped). Rationale: the cells' actual dependency is the
+scripted-daemon launch corridor, which daemon-control provides on BOTH
+platforms — the systemd-user-scope path on linux and the non-systemd
+plain-background fallback (nohup) launch path where systemd is unavailable
+(macOS). W0.0 computes the `daemon-scripted` Boolean-leaf capability on both
+linux and darwin (true iff bash AND nohup AND node resolve via POSIX
+`command -v` PATH lookup), and the harness (run-scripted-scenario + the W2
+run.mjs cells) is Darwin-portable since MACP4 US-003/US-004. A fully-capable
+Darwin host therefore satisfies the narrowed predicate and the four cells
+EXECUTE instead of being vacuously gated `NOT_RUN (predicate)` by
+`platform: linux`. NO assertion was weakened: the cells still require
+node-sqlite + node ≥ 22, the O1/O3z/O11 oracles are unchanged, and on linux
+behavior is identical (the cells still run via systemd or the forced
+fallback).
+
 **W2.24 local sentinel — launch adapter contract (S11 / US-008):**
 W2.24's `workflow: local` is a SENTINEL, not a real workflow id — there is no
 `local` workflow in any catalog. The controller's local-sentinel launch

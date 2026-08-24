@@ -29,13 +29,25 @@ What the spec DOES own is host *adaptation*:
   Boolean leaves under a `capabilities` section — e.g. `node-runtimes-2`
   (true iff W0.0 discovered ≥ 2 DISTINCT node runtimes/versions on the host;
   the W4.23 daemon-cross-runtime predicate source, and the platform-conditional
-  lanes of 08 §H gate `NOT_RUN (predicate)` honestly on non-matching hosts).
+  lanes of 08 §H gate `NOT_RUN (predicate)` honestly on non-matching hosts)
+  and `daemon-scripted` (a Boolean leaf COMPUTED ON BOTH linux AND darwin:
+  true iff the host has the scripted-daemon plain-background fallback launch
+  prerequisites — bash AND nohup AND node resolvable via POSIX `command -v`
+  PATH lookup, a pure PATH scan with no procfs and no getent dependency).
+  `daemon-scripted` is the narrowest true requirement of the tier1 W2
+  scripted cells (W2.21, W2.23a/b/c): daemon-control's non-systemd fallback
+  launch path makes those cells runnable on a mac, so their predicate is the
+  capability — NOT a blanket `platform: linux` (which would vacuously gate
+  them `NOT_RUN (predicate)` on a fully-capable Darwin host).
 - **Every manifest case may carry a `requires` predicate** (
   `platform` and/or `toolchains` and/or `capabilities`). Each toolchain
   predicate is satisfied **iff** `host-profile.json` records
   `toolchains.<name>.present === true`; a `capabilities` predicate entry
   (`pi`/`hermes`) is satisfied iff the profile records that harness's
-  presence. Cases the host cannot honestly satisfy are recorded
+  presence, and a non-harness capability entry (e.g. `node-runtimes-2`,
+  `daemon-scripted`) is satisfied iff the profile records
+  `capabilities.<name> === true` (the same Boolean-leaf rule). Cases the
+  host cannot honestly satisfy are recorded
   `NOT_RUN (predicate)` with expected/observed evidence — visible in the
   report, never silently skipped
   and never a failure. [darwin]-tagged scenarios in the wave files are

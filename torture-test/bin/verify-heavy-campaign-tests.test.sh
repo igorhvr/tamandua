@@ -64,6 +64,10 @@ HEAVY_TESTS=(
     'tier1-scripted-probe-battery.test.ts'
     'tier1-kill-sentinel-survival.test.ts'
     'tier1-zero-real-launch-infra.test.ts'
+    # MACP4 US-007: W2 dual-path proof (4 cells x systemd + forced-fallback
+    # harness executions + two bare tier1 campaigns) — must stay in lock-step
+    # with run.sh + e2e-golden-integrity.
+    'tier1-w2-darwin-capable-proof.test.ts'
     'tier2-repeatability.test.ts'
     'tier2-scripted-behaviors-materialization.test.ts'
 )

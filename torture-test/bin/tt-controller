@@ -1505,6 +1505,19 @@ function loadSpawnEnvironment(scripted) {
       merged[key] = process.env[key];
     }
   }
+  // MACP4 US-008: TT_FORCE_NO_SYSTEMD is an OPERATOR override (forced
+  // plain-background fallback in daemon-control's has_systemd_scope) that
+  // must reach the scripted daemon through the whole campaign spawn path
+  // (controller -> tt-hook-runner -> run-scripted-scenario -> the W2
+  // run.mjs daemonEnv -> daemon-control). operatorEnvironmentWithoutRuntime-
+  // Routing strips every TT_* key, so without this forward the override was
+  // silently dropped and a `TT_FORCE_NO_SYSTEMD=1 ./run-torture-test
+  // --tier1` campaign exercised the SYSTEMD path, not the fallback. Forward
+  // it from the controller's own env when set (absent -> no-op, default
+  // unchanged).
+  if (typeof process.env.TT_FORCE_NO_SYSTEMD === 'string' && process.env.TT_FORCE_NO_SYSTEMD.length > 0) {
+    merged.TT_FORCE_NO_SYSTEMD = process.env.TT_FORCE_NO_SYSTEMD;
+  }
   // FIX10 US-003: fail closed — the resolved HOME must be strictly inside
   // torture-test/var (realpath). A misconfigured env script (or one that
   // prints an escaping HOME) throws here, and the existing callers convert

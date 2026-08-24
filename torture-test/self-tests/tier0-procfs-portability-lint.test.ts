@@ -259,6 +259,21 @@ const ALLOWLIST: Record<string, AllowEntry> = {
     requiredMarker: "MACP3 US-004",
     reason: "US-004: every /proc runtime read (status/VmRSS, stat, cmdline, fd dirs, /proc/net/tcp) carries an inline MACP3 US-004 linux-only marker; all other /proc text is prose covered by the file's US-004 header note.",
   },
+  "self-tests/tier1-daemon-control-darwin-identity.test.ts": {
+    category: "us004-harness-guarded",
+    requiredMarker: "MACP3 US-004",
+    reason: "US-004: /proc references are linux-only documentation/assertion prose (the Darwin identity/ownership pins are simulated via injectable seams); the reads being pinned live inside the guarded tools.",
+  },
+  "self-tests/scripted-scenario-harness.test.ts": {
+    category: "us004-harness-guarded",
+    requiredMarker: "MACP3 US-004",
+    reason: "US-004: /proc references are linux-only documentation/assertion prose (the MACP4 US-003 Darwin portability pins for the harness's process_starttime/process_group are simulated via the portable ps arms and the failing session-leader-binary seam); no runtime procfs access in this harness test.",
+  },
+  "self-tests/tier1-host-profile-daemon-scripted.test.ts": {
+    category: "us004-harness-guarded",
+    requiredMarker: "MACP3 US-004",
+    reason: "US-005: /proc references are linux-only documentation/assertion prose — the MACP4 US-005 daemon-scripted capability computation is a pure PATH scan (commandOnPath) that never touches the procfs mount; the structural pin asserts exactly that, and the both-platform proof is a simulated-Darwin run on a /proc-less, getent-less PATH seam.",
+  },
 
   // ── T2.1-owned (concurrent run owns daemon-control + tier2 scenario
   //    run files — no MACP3 markers required; out of scope for this branch,
@@ -323,6 +338,11 @@ const ALLOWLIST: Record<string, AllowEntry> = {
     category: "documentation",
     reason:
       "MACP3.1 salvage task description doc (landed with the salvage commit) — '/proc' portability narrative and acceptance items, prose only; no runtime procfs access.",
+  },
+  "impl-tasks/MACP4-darwin-w2-scripted-cells.md": {
+    category: "documentation",
+    reason:
+      "MACP4 task description doc — its '/proc' occurrence ('/proc-era leftovers' in the audit scope) is prose in the task narrative; the doc performs no runtime procfs access.",
   },
   "self-tests/tier1-bare-vacuity-red-green.test.ts": {
     category: "documentation",

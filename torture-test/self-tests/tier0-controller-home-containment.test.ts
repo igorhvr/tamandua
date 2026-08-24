@@ -238,6 +238,33 @@ describe("FIX10 US-003 controller + tt-hook-runner contained-HOME fail-closed", 
       "loadSpawnEnvironment must assert the merged HOME AFTER the env merge (fail closed before any spawn)");
   });
 
+  it("loadSpawnEnvironment forwards the TT_FORCE_NO_SYSTEMD operator override from the controller env (MACP4 US-008)", () => {
+    // operatorEnvironmentWithoutRuntimeRouting strips every TT_* key from the
+    // child spawn env, so an operator's `TT_FORCE_NO_SYSTEMD=1
+    // ./run-torture-test --tier1` used to silently fall back to the SYSTEMD
+    // path in the campaign (the forced-fallback campaign proof was actually
+    // the normal path run twice). loadSpawnEnvironment must re-forward the
+    // override from the controller's own env so daemon-control's
+    // has_systemd_scope() sees it through the whole campaign spawn path.
+    const source = fs.readFileSync(CONTROLLER, "utf8");
+    const slice = functionSlice(source, "loadSpawnEnvironment");
+    assert.match(slice, /process\.env\.TT_FORCE_NO_SYSTEMD/,
+      "loadSpawnEnvironment must read TT_FORCE_NO_SYSTEMD from the controller's own env");
+    assert.match(slice, /merged\.TT_FORCE_NO_SYSTEMD\s*=\s*process\.env\.TT_FORCE_NO_SYSTEMD/,
+      "loadSpawnEnvironment must forward TT_FORCE_NO_SYSTEMD into the merged spawn env");
+    // The forward must happen AFTER the operator env is stripped (the strip is
+    // the fail-closed default, performed by operatorEnvironmentWithoutRuntime-
+    // Routing which loadSpawnEnvironment calls first) and BEFORE the
+    // containment assertion (the merged env is what every child receives).
+    const lines = slice.split(/\r?\n/);
+    const stripIndex = lines.findIndex((line) => line.includes("operatorEnvironmentWithoutRuntimeRouting()"));
+    const forwardIndex = lines.findIndex((line) => line.includes("merged.TT_FORCE_NO_SYSTEMD"));
+    assert.ok(stripIndex >= 0,
+      "loadSpawnEnvironment must build the operator env via operatorEnvironmentWithoutRuntimeRouting (TT_* strip)");
+    assert.ok(forwardIndex > stripIndex,
+      "the TT_FORCE_NO_SYSTEMD forward must come AFTER the TT_* strip (explicit allowlist, not a blanket un-strip)");
+  });
+
   it("every spawn site in tt-controller passes through the containment choke-point", () => {
     const source = fs.readFileSync(CONTROLLER, "utf8");
     const lines = source.split(/\r?\n/);

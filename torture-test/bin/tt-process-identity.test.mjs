@@ -7,14 +7,23 @@
 // inside tt-process-identity (already linux-only-guarded per US-003) and this
 // harness has no runtime procfs access of its own.
 //
+// MACP4 US-002: the "Darwin identity source" describe block simulates a
+// /proc-less host via the injectable platform seam
+// (TT_PROCESS_IDENTITY_PLATFORM=darwin + a TT_PROCESS_IDENTITY_PS shim) and
+// proves the darwin:<lstart> identity, the null->refusal semantics for an
+// unverifiable pid, and the preserved fail-closed refusals.
+//
 // Run: node --test torture-test/bin/tt-process-identity.test.mjs
 
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import {
+  getDarwinStartIdentity,
   getProcessGroup,
   getProcessStartIdentity,
   getProcessState,
@@ -85,6 +94,188 @@ describe('tt-process-identity.mjs', () => {
         killChild(child);
       }
       assert.equal(getProcessStartIdentity(Number.MAX_SAFE_INTEGER), null);
+    });
+  });
+
+  // ── MACP4 US-002 — Darwin identity source (hermetic) ─────────────────
+  // A /proc-less (Darwin) host is simulated via the injectable platform
+  // seam TT_PROCESS_IDENTITY_PLATFORM=darwin; the ps invocation is shimmed
+  // through TT_PROCESS_IDENTITY_PS so the tests are deterministic and the
+  // null->refusal semantics are provable with a failing ps (a dead /
+  // unverifiable pid). The linux /proc path is untouched (all other tests
+  // in this file run with the seam unset).
+  describe('Darwin identity source (MACP4 US-002, /proc-less simulation)', () => {
+    const LSTART = 'Sun Aug 23 18:20:05 2026';
+
+    /** Write a ps shim: prints $output and exits $exitCode. */
+    function writePsShim(output, exitCode = 0) {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tti-ps-shim-'));
+      const shim = path.join(dir, 'ps');
+      fs.writeFileSync(shim, `#!/bin/sh\n${exitCode === 0 ? `printf '%s\\n' "${output}"` : `exit ${exitCode}`}\n`);
+      fs.chmodSync(shim, 0o755);
+      return { dir, shim };
+    }
+
+    /** Run fn with the Darwin platform seam (+ optional ps shim) and
+     *  restore the environment afterwards. */
+    function withDarwinSeam(psBin, fn) {
+      const prevPlatform = process.env.TT_PROCESS_IDENTITY_PLATFORM;
+      const prevPs = process.env.TT_PROCESS_IDENTITY_PS;
+      try {
+        if (psBin === undefined) delete process.env.TT_PROCESS_IDENTITY_PS;
+        else process.env.TT_PROCESS_IDENTITY_PS = psBin;
+        process.env.TT_PROCESS_IDENTITY_PLATFORM = 'darwin';
+        return fn();
+      } finally {
+        if (prevPlatform === undefined) delete process.env.TT_PROCESS_IDENTITY_PLATFORM;
+        else process.env.TT_PROCESS_IDENTITY_PLATFORM = prevPlatform;
+        if (prevPs === undefined) delete process.env.TT_PROCESS_IDENTITY_PS;
+        else process.env.TT_PROCESS_IDENTITY_PS = prevPs;
+      }
+    }
+
+    it('getProcessStartIdentity returns a mechanical darwin:<lstart> identity on the /proc-less simulation', () => {
+      const shim = writePsShim(LSTART);
+      try {
+        const identity = withDarwinSeam(shim.shim, () => getProcessStartIdentity(process.pid));
+        assert.match(identity, /^darwin:Sun Aug 23 18:20:05 2026$/, `unexpected darwin identity: ${identity}`);
+        // Stable across calls (the ABA check compares a recorded identity to
+        // the CURRENT one — the darwin source must be deterministic).
+        assert.equal(withDarwinSeam(shim.shim, () => getProcessStartIdentity(process.pid)), identity);
+      } finally {
+        fs.rmSync(shim.dir, { recursive: true, force: true });
+      }
+    });
+
+    it('getProcessStartIdentity is null for an unverifiable pid on the /proc-less simulation (failing ps -> refuse)', () => {
+      const deadShim = writePsShim('', 1); // ps exits 1 — pid not alive / ps error
+      try {
+        const identity = withDarwinSeam(deadShim.shim, () => getProcessStartIdentity(process.pid));
+        assert.equal(identity, null, 'an unreadable pid must yield null (fail-closed: every caller refuses to signal)');
+        assert.equal(getDarwinStartIdentity(Number.MAX_SAFE_INTEGER), null, 'invalid pid must be null');
+      } finally {
+        fs.rmSync(deadShim.dir, { recursive: true, force: true });
+      }
+    });
+
+    it('getProcessStartIdentity works with the REAL ps on this host (procps supports -o lstart=, the same source family as BSD ps)', () => {
+      const identity = withDarwinSeam(undefined, () => getProcessStartIdentity(process.pid));
+      assert.match(identity, /^darwin:.+20\d\d$/, `real ps must produce a darwin:<lstart> identity, got: ${identity}`);
+    });
+
+    it('CLI --get prints the darwin identity and exits 0; exits 1 for an unverifiable pid', () => {
+      const shim = writePsShim(LSTART);
+      try {
+        const env = {
+          ...process.env,
+          TT_PROCESS_IDENTITY_PLATFORM: 'darwin',
+          TT_PROCESS_IDENTITY_PS: shim.shim,
+        };
+        const got = spawnSync(process.execPath, [CLI, '--get', String(process.pid)], {
+          encoding: 'utf8',
+          env,
+        });
+        assert.equal(got.status, 0, got.stderr);
+        assert.equal(got.stdout.trim(), `darwin:${LSTART}`);
+
+        const deadShim = writePsShim('', 1);
+        try {
+          const deadEnv = {
+            ...process.env,
+            TT_PROCESS_IDENTITY_PLATFORM: 'darwin',
+            TT_PROCESS_IDENTITY_PS: deadShim.shim,
+          };
+          const dead = spawnSync(process.execPath, [CLI, '--get', String(process.pid)], {
+            encoding: 'utf8',
+            env: deadEnv,
+          });
+          assert.equal(dead.status, 1);
+          assert.match(dead.stderr, /not alive|unreadable/i);
+        } finally {
+          fs.rmSync(deadShim.dir, { recursive: true, force: true });
+        }
+      } finally {
+        fs.rmSync(shim.dir, { recursive: true, force: true });
+      }
+    });
+
+    it('CLI --check accepts a matching darwin identity and refuses a stale one (ABA) or an unverifiable pid', () => {
+      const shim = writePsShim(LSTART);
+      try {
+        const env = {
+          ...process.env,
+          TT_PROCESS_IDENTITY_PLATFORM: 'darwin',
+          TT_PROCESS_IDENTITY_PS: shim.shim,
+        };
+        const ok = spawnSync(process.execPath, [CLI, '--check', String(process.pid), `darwin:${LSTART}`], {
+          encoding: 'utf8',
+          env,
+        });
+        assert.equal(ok.status, 0, ok.stderr);
+
+        const stale = spawnSync(process.execPath, [CLI, '--check', String(process.pid), 'darwin:Mon Jan  1 00:00:00 2001'], {
+          encoding: 'utf8',
+          env,
+        });
+        assert.equal(stale.status, 1);
+        assert.match(stale.stderr, /mismatch/i);
+
+        const deadShim = writePsShim('', 1);
+        try {
+          const deadEnv = {
+            ...process.env,
+            TT_PROCESS_IDENTITY_PLATFORM: 'darwin',
+            TT_PROCESS_IDENTITY_PS: deadShim.shim,
+          };
+          const dead = spawnSync(process.execPath, [CLI, '--check', String(process.pid), `darwin:${LSTART}`], {
+            encoding: 'utf8',
+            env: deadEnv,
+          });
+          assert.equal(dead.status, 1);
+          assert.match(dead.stderr, /not alive|unreadable/i);
+        } finally {
+          fs.rmSync(deadShim.dir, { recursive: true, force: true });
+        }
+      } finally {
+        fs.rmSync(shim.dir, { recursive: true, force: true });
+      }
+    });
+
+    it('verifyRecordedTarget uses the darwin identity and keeps the fail-closed refusals when the identity is unreadable', () => {
+      const shim = writePsShim(LSTART);
+      try {
+        const child = spawnDetachedChild();
+        try {
+          const result = withDarwinSeam(shim.shim, () =>
+            verifyRecordedTarget({ pid: child.pid, startTime: `darwin:${LSTART}`, group: true }));
+          // On the /proc-less SIMULATION the pgid/ancestry gates still read
+          // /proc (they are linux-only helpers); the darwin identity must
+          // satisfy the identity portion and the full verification must
+          // succeed for a live detached target.
+          assert.equal(result.ok, true, result.reason);
+        } finally {
+          killChild(child);
+        }
+      } finally {
+        fs.rmSync(shim.dir, { recursive: true, force: true });
+      }
+    });
+
+    it('verifyRecordedTarget REFUSES (never signals) when the darwin identity is unreadable', () => {
+      const deadShim = writePsShim('', 1);
+      try {
+        const child = spawnDetachedChild();
+        try {
+          const result = withDarwinSeam(deadShim.shim, () =>
+            verifyRecordedTarget({ pid: child.pid, startTime: `darwin:${LSTART}`, group: true }));
+          assert.equal(result.ok, false);
+          assert.match(result.reason, /not alive/i);
+        } finally {
+          killChild(child);
+        }
+      } finally {
+        fs.rmSync(deadShim.dir, { recursive: true, force: true });
+      }
     });
   });
 

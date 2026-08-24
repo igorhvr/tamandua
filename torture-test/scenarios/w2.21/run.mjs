@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { realAccountHome } from "../lib/operator-home.mjs";
 
 const repoRoot = requiredEnv("TT_REPO_ROOT");
 const invocationDir = requiredEnv("TT_SCENARIO_STATE_DIR");
@@ -150,17 +151,6 @@ function requiredEnv(name) {
   const value = process.env[name];
   if (!value) throw new Error(`missing scenario environment: ${name}`);
   return value;
-}
-
-function realAccountHome() {
-  const result = spawnSync("bash", ["-c", 'getent passwd "$(id -u)" | cut -d: -f6'], {
-    encoding: "utf8",
-    timeout: 5_000,
-  });
-  if (result.status !== 0 || !result.stdout.trim()) {
-    return process.env.HOME ?? "/home/$(id -un)";
-  }
-  return result.stdout.trim();
 }
 
 function sleep(ms) {

@@ -23,6 +23,34 @@ FAILURES=0
 pass() { echo "  PASS: $1"; }
 fail() { echo "  FAIL: $1"; FAILURES=$((FAILURES + 1)); }
 
+# port_listen: portable TCP-connect liveness probe (MACP4 US-001). Bounded
+# connect (default 1s, optional $2 seconds) to $1 on the loopback addresses
+# (127.0.0.1 first — every TT daemon listener binds 127.0.0.1 by default —
+# then ::1). Returns 0 when the port accepts a connection, 1 otherwise.
+# Replaces the GNU-`timeout`-dependent `timeout N bash -c "echo
+# >/dev/tcp/..."` probes so THIS harness (like the tool it tests) runs on
+# Darwin, where `timeout` does not exist.
+port_listen() {
+  local port="$1"
+  local bound="${2:-1}"
+  node -e '
+    const net = require("net");
+    const port = Number(process.argv[1]);
+    const boundMs = Number(process.argv[2]);
+    const hosts = ["127.0.0.1", "::1"];
+    let i = 0;
+    function attempt() {
+      if (i >= hosts.length) process.exit(1);
+      const host = hosts[i++];
+      const socket = net.connect({ host, port });
+      socket.setTimeout(boundMs, () => { socket.destroy(); attempt(); });
+      socket.once("connect", () => { socket.destroy(); process.exit(0); });
+      socket.once("error", () => { socket.destroy(); attempt(); });
+    }
+    attempt();
+  ' "$port" "$((bound * 1000))" 2>/dev/null
+}
+
 echo "=== daemon-control self-test ==="
 
 # ── Test 1: --help prints usage ───────────────────────────────────────
@@ -285,6 +313,45 @@ else
   fail "systemd detection function failed to run (got: $sysd_result)"
 fi
 
+# ── Test 8b (MACP4 US-001): TT_FORCE_NO_SYSTEMD forced-fallback override ─
+# has_systemd_scope() must honor TT_FORCE_NO_SYSTEMD=1 by returning false
+# (1) even when systemd-run IS available — the mechanical forcing that lets
+# the W2 scripted cells prove the plain-background fallback launch path on a
+# systemd linux host (the path Darwin always takes). Default behavior on a
+# systemd host (no override) must be unchanged: still HAS_SYSTEMD.
+if grep -A 15 '^has_systemd_scope()' "$TOOL" | grep -q 'TT_FORCE_NO_SYSTEMD'; then
+  pass "has_systemd_scope honors the TT_FORCE_NO_SYSTEMD override"
+else
+  fail "has_systemd_scope missing TT_FORCE_NO_SYSTEMD override check"
+fi
+
+# Behavioral (hermetic): extract has_systemd_scope and drive it with a fake
+# systemd-run that SUCCEEDS. Without the override -> HAS_SYSTEMD; with
+# TT_FORCE_NO_SYSTEMD=1 -> NO_SYSTEMD (the fallback is forced).
+set +e
+sysd_override_dir="$(mktemp -d "${TMPDIR:-/tmp}/tt-dc-sysd.XXXXXX")"
+printf '#!/bin/sh\nexit 0\n' > "$sysd_override_dir/systemd-run"
+chmod +x "$sysd_override_dir/systemd-run"
+sysd_fn_file="$(mktemp "${TMPDIR:-/tmp}/tt-dc-sysd-fn.XXXXXX")"
+sed -n '/^has_systemd_scope()/,/^}/p' "$TOOL" > "$sysd_fn_file"
+printf 'if has_systemd_scope; then echo HAS_SYSTEMD; else echo NO_SYSTEMD; fi\n' >> "$sysd_fn_file"
+sysd_default="$(PATH="$sysd_override_dir:$PATH" bash "$sysd_fn_file" 2>/dev/null)"
+sysd_forced="$(PATH="$sysd_override_dir:$PATH" TT_FORCE_NO_SYSTEMD=1 bash "$sysd_fn_file" 2>/dev/null)"
+rm -rf "$sysd_override_dir" "$sysd_fn_file"
+set -e
+
+if [ "$sysd_default" = "HAS_SYSTEMD" ]; then
+  pass "has_systemd_scope returns HAS_SYSTEMD without the override (default unchanged)"
+else
+  fail "has_systemd_scope without override expected HAS_SYSTEMD, got: $sysd_default"
+fi
+
+if [ "$sysd_forced" = "NO_SYSTEMD" ]; then
+  pass "TT_FORCE_NO_SYSTEMD=1 forces has_systemd_scope to NO_SYSTEMD (fallback path)"
+else
+  fail "TT_FORCE_NO_SYSTEMD=1 expected NO_SYSTEMD, got: $sysd_forced"
+fi
+
 # ── Test 9: env script application does not mutate caller ─────────────
 echo ""
 echo "--- Test: env script application isolation ---"
@@ -386,26 +453,32 @@ else
   fail "tool shebang is not bash"
 fi
 
-# E3.C.1 US-004: daemon-control deliberately invokes node for ONE purpose —
-# the torture-test-local process-identity CLI (bin/tt-process-identity.mjs),
+# E3.C.1 US-004: daemon-control deliberately invokes node for TWO purposes —
+# (1) the torture-test-local process-identity CLI (bin/tt-process-identity.mjs),
 # the only sanctioned way to read/verify a pid's /proc starttime identity
-# before any signal. Any OTHER node invocation, or any npm/npx use, is a
-# regression.
+# before any signal; and (2) MACP4 US-001's portable TCP port probe
+# (port_probe, `node -e` net.connect — the GNU-`timeout`-free replacement for
+# the old /dev/tcp probe, which macOS cannot run). Any OTHER node invocation,
+# or any npm/npx use, is a regression.
 if grep -qE "^[^#]*(npm|npx)" "$TOOL" 2>/dev/null; then
-  fail "tool contains npm/npx invocation (should be bash + identity CLI only)"
+  fail "tool contains npm/npx invocation (should be bash + identity CLI + port_probe only)"
 else
   pass "tool does not rely on npm/npx"
 fi
 
 node_lines="$(grep -nE "^[^#]*node" "$TOOL" 2>/dev/null || true)"
 if [ -n "$node_lines" ]; then
-  # Every sanctioned node invocation must go through the IDENTITY_TOOL
+  # Every sanctioned node invocation must either go through the IDENTITY_TOOL
   # variable (the tt-process-identity.mjs path is bound there, so the
-  # invocation lines reference the variable, not a literal node binary).
-  if echo "$node_lines" | grep -v "IDENTITY_TOOL" >/dev/null 2>&1; then
-    fail "tool contains node invocation not targeting the identity CLI: $(echo "$node_lines" | tr '\n' ' ')"
+  # invocation lines reference the variable, not a literal node binary) or be
+  # the port_probe's `node -e` TCP probe (MACP4 US-001). The usage-doc line
+  # that DESCRIBES the probe ("node net.connect probe (port_probe)") is prose,
+  # allowed too.
+  bad_node_lines="$(echo "$node_lines" | grep -v "IDENTITY_TOOL" | grep -v "node -e" | grep -v "net.connect" || true)"
+  if [ -n "$bad_node_lines" ]; then
+    fail "tool contains node invocation not targeting the identity CLI or the port_probe: $(echo "$bad_node_lines" | tr '\n' ' ')"
   else
-    pass "tool uses node only for the tt-process-identity identity CLI"
+    pass "tool uses node only for the tt-process-identity identity CLI and the port_probe (MACP4 US-001)"
   fi
 else
   pass "tool does not invoke node"
@@ -640,10 +713,17 @@ else
   fail "wait_for_port function missing"
 fi
 
-if grep -A 10 '^wait_for_port()' "$TOOL" | grep -q '/dev/tcp'; then
-  pass "wait_for_port uses /dev/tcp for port checking"
+if grep -A 12 '^wait_for_port()' "$TOOL" | grep -q 'port_probe'; then
+  pass "wait_for_port uses the portable port_probe for port checking (MACP4 US-001)"
 else
-  fail "wait_for_port missing /dev/tcp port check"
+  fail "wait_for_port missing port_probe call (portable TCP probe)"
+fi
+
+# MACP4 US-001: the probe must NOT depend on GNU `timeout` (absent on macOS).
+if grep -A 12 '^wait_for_port()' "$TOOL" | grep -q 'timeout 1 bash'; then
+  fail "wait_for_port still uses the GNU-timeout-dependent probe (fails on Darwin)"
+else
+  pass "wait_for_port has no GNU-timeout-dependent port probe"
 fi
 
 # ── Test 20: start subcommand — cgroup verification ──────────────────
@@ -955,31 +1035,102 @@ else
 fi
 
 # ── Test 29: /proc/PID/cwd and /proc/PID/cmdline evidence ────────────
+# (MACP4 US-002: the function now carries a Darwin evidence branch too, so
+# the linux /proc reads live further down the body — scan the WHOLE
+# function, not the first lines.)
 echo ""
 echo "--- Test: /proc evidence checks ---"
 
-if grep -A 10 '^verify_process_tt_owned()' "$TOOL" | grep -q '/proc.*cwd'; then
+if grep -A 80 '^verify_process_tt_owned()' "$TOOL" | grep -q '/proc.*cwd'; then
   pass "verify_process_tt_owned checks /proc/PID/cwd"
 else
   fail "verify_process_tt_owned missing /proc/PID/cwd check"
 fi
 
-if grep -A 30 '^verify_process_tt_owned()' "$TOOL" | grep -q '/proc.*cmdline'; then
+if grep -A 80 '^verify_process_tt_owned()' "$TOOL" | grep -q '/proc.*cmdline'; then
   pass "verify_process_tt_owned checks /proc/PID/cmdline"
 else
   fail "verify_process_tt_owned missing /proc/PID/cmdline check"
 fi
 
-if grep -A 15 '^verify_process_tt_owned()' "$TOOL" | grep -q 'TT_REPO_ROOT'; then
+if grep -A 80 '^verify_process_tt_owned()' "$TOOL" | grep -q 'TT_REPO_ROOT'; then
   pass "verify_process_tt_owned checks cwd against TT_REPO_ROOT"
 else
   fail "verify_process_tt_owned missing TT_REPO_ROOT cwd check"
 fi
 
-if grep -A 30 '^verify_process_tt_owned()' "$TOOL" | grep -q 'tamandua'; then
+if grep -A 80 '^verify_process_tt_owned()' "$TOOL" | grep -q 'tamandua'; then
   pass "verify_process_tt_owned requires tamandua in cmdline"
 else
   fail "verify_process_tt_owned missing tamandua cmdline check"
+fi
+
+# ── Test 29b: Darwin TT-ownership evidence branch (MACP4 US-002) ──────
+echo ""
+echo "--- Test: verify_process_tt_owned Darwin evidence branch ---"
+
+if grep -A 80 '^verify_process_tt_owned()' "$TOOL" | grep -q 'TT_DC_PLATFORM'; then
+  pass "verify_process_tt_owned honors the TT_DC_PLATFORM seam (Darwin simulation)"
+else
+  fail "verify_process_tt_owned missing TT_DC_PLATFORM seam"
+fi
+
+if grep -A 80 '^verify_process_tt_owned()' "$TOOL" | grep -q 'lsof -a -p "\$pid" -d cwd -Fn'; then
+  pass "verify_process_tt_owned Darwin branch uses lsof cwd evidence (portable)"
+else
+  fail "verify_process_tt_owned missing lsof cwd evidence (Darwin)"
+fi
+
+if grep -A 80 '^verify_process_tt_owned()' "$TOOL" | grep -q 'ps -p "\$pid" -o command='; then
+  pass "verify_process_tt_owned Darwin branch uses ps command evidence (portable)"
+else
+  fail "verify_process_tt_owned missing ps command evidence (Darwin)"
+fi
+
+if grep -A 80 '^verify_process_tt_owned()' "$TOOL" | grep -q 'cannot verify — refuse'; then
+  pass "verify_process_tt_owned still refuses when evidence is unavailable (fail-closed)"
+else
+  fail "verify_process_tt_owned missing the fail-closed refusal"
+fi
+
+# ── Test 29c: operator-home fallback chain (MACP4 US-002) ─────────────
+echo ""
+echo "--- Test: resolve_operator_home fallback chain ---"
+
+if grep -q '^resolve_operator_home()' "$TOOL"; then
+  pass "resolve_operator_home function exists"
+else
+  fail "resolve_operator_home function missing"
+fi
+
+if grep -A 40 '^resolve_operator_home()' "$TOOL" | grep -q 'getent passwd'; then
+  pass "operator home chain step 1 is getent passwd"
+else
+  fail "resolve_operator_home missing getent step"
+fi
+
+if grep -A 40 '^resolve_operator_home()' "$TOOL" | grep -q 'dscl . -read'; then
+  pass "operator home chain step 2 is dscl NFSHomeDirectory (macOS)"
+else
+  fail "resolve_operator_home missing dscl step"
+fi
+
+if grep -A 40 '^resolve_operator_home()' "$TOOL" | grep -q 'eval echo ~'; then
+  pass "operator home chain step 3 is the shell tilde expansion"
+else
+  fail "resolve_operator_home missing shell-tilde step"
+fi
+
+if grep -q '_tt_operator_home="\$(resolve_operator_home)"' "$TOOL"; then
+  pass "_tt_operator_home derives from resolve_operator_home (true operator home)"
+else
+  fail "_tt_operator_home does not derive from resolve_operator_home"
+fi
+
+if grep -q 'REAL_TAMANDUA_STATE="\${_tt_operator_home:-\${HOME}}/.tamandua"' "$TOOL"; then
+  pass "REAL_TAMANDUA_STATE derives from _tt_operator_home"
+else
+  fail "REAL_TAMANDUA_STATE not derived from _tt_operator_home"
 fi
 
 # ── Test 30: is_port_listening function ──────────────────────────────
@@ -992,10 +1143,16 @@ else
   fail "is_port_listening function missing"
 fi
 
-if grep -A 5 '^is_port_listening()' "$TOOL" | grep -q '/dev/tcp'; then
-  pass "is_port_listening uses /dev/tcp for port checking"
+if grep -A 5 '^is_port_listening()' "$TOOL" | grep -q 'port_probe'; then
+  pass "is_port_listening uses the portable port_probe for port checking (MACP4 US-001)"
 else
-  fail "is_port_listening missing /dev/tcp port check"
+  fail "is_port_listening missing port_probe call (portable TCP probe)"
+fi
+
+if grep -A 5 '^is_port_listening()' "$TOOL" | grep -q 'timeout 1 bash'; then
+  fail "is_port_listening still uses the GNU-timeout-dependent probe (fails on Darwin)"
+else
+  pass "is_port_listening has no GNU-timeout-dependent port probe"
 fi
 
 # ── Test 31: update_provenance_after_stop function ───────────────────
@@ -1695,7 +1852,7 @@ REAL_PORTS="4334 4338 4339"
 systemctl --user stop "$REAL_SCOPE_UNIT.scope" 2>/dev/null || true
 systemctl --user reset-failed "$REAL_SCOPE_UNIT.scope" 2>/dev/null || true
 for port in $REAL_PORTS; do
-  if timeout 1 bash -c "echo >/dev/tcp/localhost/$port" 2>/dev/null; then
+  if port_listen "$port"; then
     echo "  WARNING: port $port is already in use — attempting to stop existing daemon first"
     set +e
     "$TOOL" real stop 2>/dev/null || true
@@ -1719,7 +1876,7 @@ fi
 
 # Wait for daemon to be ready (check dashboard port)
 sleep 3
-if timeout 2 bash -c "echo >/dev/tcp/localhost/4334" 2>/dev/null; then
+if port_listen 4334 2; then
   pass "real daemon dashboard port 4334 is listening after start"
 else
   fail "real daemon dashboard port 4334 NOT listening after start"
@@ -1805,7 +1962,7 @@ fi
 sleep 1
 all_real_ports_free=true
 for port in $REAL_PORTS; do
-  if timeout 1 bash -c "echo >/dev/tcp/localhost/$port" 2>/dev/null; then
+  if port_listen "$port"; then
     all_real_ports_free=false
     echo "  WARNING: port $port still listening after stop"
   fi
@@ -1876,7 +2033,7 @@ SCRIPTED_PORTS="5334 5338 5339"
 systemctl --user stop "$SCRIPTED_SCOPE_UNIT.scope" 2>/dev/null || true
 systemctl --user reset-failed "$SCRIPTED_SCOPE_UNIT.scope" 2>/dev/null || true
 for port in $SCRIPTED_PORTS; do
-  if timeout 1 bash -c "echo >/dev/tcp/localhost/$port" 2>/dev/null; then
+  if port_listen "$port"; then
     echo "  WARNING: port $port is already in use — attempting to stop existing scripted daemon"
     set +e
     "$TOOL" scripted stop 2>/dev/null || true
@@ -1898,8 +2055,21 @@ else
   fail "daemon-control scripted start failed (rc=$scripted_start_rc)"
 fi
 
+# MACP4 US-001 (acceptance 3): on a systemd host the NORMAL path (no
+# TT_FORCE_NO_SYSTEMD override) must use the systemd scope launch and print
+# the marker — the override must not change the default.
+if command -v systemd-run >/dev/null 2>&1 && systemd-run --user --scope --quiet true 2>/dev/null; then
+  if echo "$scripted_start_out" | grep -q "using systemd scope"; then
+    pass "scripted start (no override) uses the systemd scope path (marker printed)"
+  else
+    fail "scripted start on a systemd host missing 'using systemd scope' marker: $(echo "$scripted_start_out" | grep -i 'systemd' | head -3 || echo '(no systemd line)')"
+  fi
+else
+  echo "  (host has no systemd — the fallback path is the only path; systemd-marker assertion skipped)"
+fi
+
 sleep 3
-if timeout 2 bash -c "echo >/dev/tcp/localhost/5334" 2>/dev/null; then
+if port_listen 5334 2; then
   pass "scripted daemon dashboard port 5334 is listening after start"
 else
   fail "scripted daemon dashboard port 5334 NOT listening after start"
@@ -2166,7 +2336,7 @@ fi
 sleep 1
 all_scripted_ports_free=true
 for port in $SCRIPTED_PORTS; do
-  if timeout 1 bash -c "echo >/dev/tcp/localhost/$port" 2>/dev/null; then
+  if port_listen "$port"; then
     all_scripted_ports_free=false
   fi
 done
@@ -2175,6 +2345,86 @@ if $all_scripted_ports_free; then
   pass "all scripted daemon ports (5334/5338/5339) free after stop"
 else
   fail "one or more scripted daemon ports still in use after stop"
+fi
+
+# ── Test 75b (MACP4 US-001): TT_FORCE_NO_SYSTEMD=1 forced-fallback
+#    scripted start → status → stop cycle ──────────────────────────────
+echo ""
+echo "--- Test: TT_FORCE_NO_SYSTEMD forced-fallback start/status/stop (MACP4 US-001) ---"
+
+# The normal-path scripted daemon was stopped above (ports free). Run the
+# cycle with the override: stderr must show the fallback marker and the
+# cycle must succeed with exit 0 — this is the launch path Darwin always
+# takes, so it is the linux-side mechanical proof for the W2 cells.
+set +e
+ff_start_out="$(TT_FORCE_NO_SYSTEMD=1 "$TOOL" scripted start 2>&1)"
+ff_start_rc=$?
+set -e
+
+if [ "$ff_start_rc" -eq 0 ]; then
+  pass "TT_FORCE_NO_SYSTEMD=1 scripted start exits 0 (forced fallback)"
+else
+  fail "TT_FORCE_NO_SYSTEMD=1 scripted start failed (rc=$ff_start_rc): $(echo "$ff_start_out" | tail -3)"
+fi
+
+if echo "$ff_start_out" | grep -q "systemd not available — using plain background spawn"; then
+  pass "forced-fallback start prints the fallback marker"
+else
+  fail "forced-fallback start missing marker 'systemd not available — using plain background spawn': $(echo "$ff_start_out" | grep -i 'systemd\|spawn' | head -3 || echo '(no marker line)')"
+fi
+
+sleep 3
+if port_listen 5334 2; then
+  pass "forced-fallback scripted daemon dashboard port 5334 listening after start"
+else
+  fail "forced-fallback scripted daemon dashboard port 5334 NOT listening after start"
+fi
+
+# The forced-fallback path must write provenance with cgroupVerified=false
+# (no systemd scope was used). NOTE: jq's `//` operator treats `false` as
+# falsy, so `.cgroupVerified // "missing"` would report 'missing' for the
+# correct value false — use an explicit has() check.
+if [ -f "$SCRIPTED_PROV" ]; then
+  ff_cgroup="$(jq -r 'if has("cgroupVerified") then (.cgroupVerified | tostring) else "missing" end' "$SCRIPTED_PROV" 2>/dev/null || echo "missing")"
+  if [ "$ff_cgroup" = "false" ]; then
+    pass "forced-fallback provenance records cgroupVerified=false"
+  else
+    fail "forced-fallback provenance cgroupVerified expected false, got '$ff_cgroup'"
+  fi
+else
+  fail "scripted provenance file missing after forced-fallback start"
+fi
+
+set +e
+ff_status_out="$("$TOOL" scripted status 2>&1)"
+set -e
+if echo "$ff_status_out" | grep -q 'STATUS: RUNNING'; then
+  pass "forced-fallback scripted status reports RUNNING"
+else
+  fail "forced-fallback scripted status: expected RUNNING, got: $(echo "$ff_status_out" | grep 'STATUS:' || echo 'no STATUS line')"
+fi
+
+set +e
+ff_stop_out="$(TT_FORCE_NO_SYSTEMD=1 "$TOOL" scripted stop 2>&1)"
+ff_stop_rc=$?
+set -e
+if [ "$ff_stop_rc" -eq 0 ]; then
+  pass "TT_FORCE_NO_SYSTEMD=1 scripted stop exits 0"
+else
+  fail "TT_FORCE_NO_SYSTEMD=1 scripted stop failed (rc=$ff_stop_rc): $(echo "$ff_stop_out" | tail -3)"
+fi
+
+sleep 1
+ff_ports_free=true
+for port in $SCRIPTED_PORTS; do
+  if port_listen "$port"; then
+    ff_ports_free=false
+  fi
+done
+if $ff_ports_free; then
+  pass "all scripted daemon ports (5334/5338/5339) free after forced-fallback stop"
+else
+  fail "one or more scripted daemon ports still in use after forced-fallback stop"
 fi
 
 # ── Test 76: production guard refusal — targeting production port ────
@@ -2302,7 +2552,10 @@ if [ -f "$REAL_PROV" ] && command -v jq >/dev/null 2>&1; then
     fail "real provenance JSON fails jq validation"
   fi
   for field in name kind pid ports scopeUnit cgroupVerified startedAt cmdline cwd startTime; do
-    if jq -e ".$field" "$REAL_PROV" >/dev/null 2>&1; then
+    # has() — presence, not truthiness: cgroupVerified=false (the MACP4
+    # forced-fallback provenance) must still count as present (jq -e on
+    # `false` exits 1, which would false-fail the field check).
+    if jq -e "has(\"$field\")" "$REAL_PROV" >/dev/null 2>&1; then
       pass "real provenance contains '$field'"
     else
       fail "real provenance missing '$field'"
@@ -2348,7 +2601,10 @@ if [ -f "$SCRIPTED_PROV" ] && command -v jq >/dev/null 2>&1; then
     fail "scripted provenance JSON fails jq validation"
   fi
   for field in name kind pid ports scopeUnit cgroupVerified startedAt cmdline cwd startTime; do
-    if jq -e ".$field" "$SCRIPTED_PROV" >/dev/null 2>&1; then
+    # has() — presence, not truthiness: cgroupVerified=false (the MACP4
+    # forced-fallback provenance) must still count as present (jq -e on
+    # `false` exits 1, which would false-fail the field check).
+    if jq -e "has(\"$field\")" "$SCRIPTED_PROV" >/dev/null 2>&1; then
       pass "scripted provenance contains '$field'"
     else
       fail "scripted provenance missing '$field'"
@@ -2379,7 +2635,7 @@ echo "--- Test: daemon-control real restart round-trip ---"
 
 # Ensure clean state first
 for port in $REAL_PORTS; do
-  if timeout 1 bash -c "echo >/dev/tcp/localhost/$port" 2>/dev/null; then
+  if port_listen "$port"; then
     set +e; "$TOOL" real stop 2>/dev/null || true; set -e
     sleep 2
   fi
@@ -2391,7 +2647,7 @@ set +e
 set -e
 sleep 3
 
-if timeout 2 bash -c "echo >/dev/tcp/localhost/4334" 2>/dev/null; then
+if port_listen 4334 2; then
   pass "real daemon running before restart test"
 else
   fail "real daemon not running before restart test — cannot test restart"
@@ -2410,7 +2666,7 @@ else
 fi
 
 sleep 3
-if timeout 2 bash -c "echo >/dev/tcp/localhost/4334" 2>/dev/null; then
+if port_listen 4334 2; then
   pass "real daemon dashboard port 4334 listening after restart"
 else
   fail "real daemon dashboard port 4334 NOT listening after restart"
@@ -2435,7 +2691,7 @@ echo ""
 echo "--- Test: daemon-control scripted restart round-trip ---"
 
 for port in $SCRIPTED_PORTS; do
-  if timeout 1 bash -c "echo >/dev/tcp/localhost/$port" 2>/dev/null; then
+  if port_listen "$port"; then
     set +e; "$TOOL" scripted stop 2>/dev/null || true; set -e
     sleep 2
   fi
@@ -2446,7 +2702,7 @@ set +e
 set -e
 sleep 3
 
-if timeout 2 bash -c "echo >/dev/tcp/localhost/5334" 2>/dev/null; then
+if port_listen 5334 2; then
   pass "scripted daemon running before restart test"
 else
   fail "scripted daemon not running before restart test"
@@ -2464,7 +2720,7 @@ else
 fi
 
 sleep 3
-if timeout 2 bash -c "echo >/dev/tcp/localhost/5334" 2>/dev/null; then
+if port_listen 5334 2; then
   pass "scripted daemon dashboard port 5334 listening after restart"
 else
   fail "scripted daemon dashboard port 5334 NOT listening after restart"
@@ -2613,7 +2869,7 @@ sleep 2
 
 all_ports_clean=true
 for port in $REAL_PORTS $SCRIPTED_PORTS; do
-  if timeout 1 bash -c "echo >/dev/tcp/localhost/$port" 2>/dev/null; then
+  if port_listen "$port"; then
     all_ports_clean=false
     echo "  WARNING: port $port still in use during final cleanup"
   fi
@@ -2681,7 +2937,7 @@ wait_for_port_listen() {
   local port="$1"
   local tries=0
   while [ "$tries" -lt 50 ]; do
-    if timeout 1 bash -c "echo >/dev/tcp/localhost/$port" 2>/dev/null; then
+    if port_listen "$port"; then
       return 0
     fi
     sleep 0.2
@@ -2910,7 +3166,7 @@ fi
 sleep 1
 all_scripted_free=true
 for port in $SCRIPTED_PORTS; do
-  if timeout 1 bash -c "echo >/dev/tcp/localhost/$port" 2>/dev/null; then
+  if port_listen "$port"; then
     all_scripted_free=false
     echo "  WARNING: port $port still in use after normal stop"
   fi
@@ -3000,7 +3256,7 @@ if [ -n "$SIM_RECORDED_PID" ] && ! kill -0 "$SIM_RECORDED_PID" 2>/dev/null; then
 else
   fail "CLI daemon stand-in PID $SIM_RECORDED_PID still alive after stop"
 fi
-if ! timeout 1 bash -c "echo >/dev/tcp/localhost/5339" 2>/dev/null; then
+if ! port_listen 5339; then
   pass "control port 5339 free after CLI-daemon stop"
 else
   fail "control port 5339 still busy after CLI-daemon stop"
@@ -3085,7 +3341,7 @@ if [ -n "$SIM_RECORDED_PID" ] && ! kill -0 "$SIM_RECORDED_PID" 2>/dev/null; then
 else
   fail "CLI daemon stand-in PID $SIM_RECORDED_PID still alive after cmd_start"
 fi
-if timeout 1 bash -c "echo >/dev/tcp/localhost/5339" 2>/dev/null; then
+if port_listen 5339; then
   pass "control port 5339 listening (new daemon up)"
 else
   fail "control port 5339 not listening after cmd_start"

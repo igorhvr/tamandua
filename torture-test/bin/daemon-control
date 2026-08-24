@@ -22,7 +22,39 @@
 # Where systemd-run --user --scope is available, starts daemons inside
 # dedicated named scopes and re-asserts cgroup membership after every
 # start/restart, recording provenance to
-# torture-test/var/daemon-control/<name>.json.
+# torture-test/var/daemon-control/<name>.json. When systemd is unavailable
+# (or TT_FORCE_NO_SYSTEMD=1 forces the fallback — MACP4 US-001), starts the
+# daemon as a plain nohup background process; that fallback path applies the
+# SAME contained PATH reconstruction (contained_path_for_kind, S24/US-006)
+# and records provenance with cgroupVerified=false.
+#
+# MACP4 US-001: the port liveness probes (wait_for_port/is_port_listening)
+# use a PORTABLE node net.connect probe (port_probe) — the old GNU-`timeout`
+# dependent `timeout 1 bash -c "echo >/dev/tcp/..."` probe is a linux-ism
+# (macOS ships no `timeout`), so every scripted start/status/stop failed on
+# Darwin. Node is already a hard runtime dependency (tt-process-identity),
+# so port_probe adds no new requirement and behaves identically on linux and
+# Darwin.
+#
+# MACP4 US-002 (Darwin identity/ownership + operator home):
+#   - Process-start identity: on linux the identity is /proc starttime
+#     (tt-process-identity 'proc:<starttime>'). On Darwin (/proc absent) the
+#     identity tool falls back to `ps -p <pid> -o lstart=` ('darwin:<lstart>',
+#     1-second granularity — documented in tt-process-identity.mjs), so the
+#     identity-gated stop/escalation corridors (verify_recorded_identity /
+#     --check) work on /proc-less hosts. Fail-closed semantics unchanged:
+#     an unverifiable pid is refused, never signalled.
+#   - TT-ownership evidence: verify_process_tt_owned reads /proc cwd+cmdline
+#     on linux; on Darwin it uses PORTABLE evidence (`lsof -a -p <pid>
+#     -d cwd -Fn` for the cwd, `ps -p <pid> -o command=` for the cmdline),
+#     so CLI-auto-daemon stop (stop_cli_auto_daemon, the W2.21 restart
+#     corridor) and the escalation paths still verify TT-ownership on the
+#     mac. Unavailable evidence -> refuse, exactly as on linux.
+#   - Operator home: _tt_operator_home (REAL_TAMANDUA_STATE + the S24
+#     operator_bin_dirs reorder) resolves via getent -> dscl (macOS
+#     NFSHomeDirectory) -> `eval echo ~<user>` -> $HOME — the mac's
+#     getent-less home, so the production guard and the PATH reorder stay
+#     correct on Darwin.
 #
 # T2.1 US-009: scope unit names are PER-WORKTREE (tamandua-tt-<kind>-<hash>
 # derived from the repo root), never the old fixed per-user name — a
@@ -61,10 +93,51 @@ PROD_PORTS="3334 3338 3339"
 # entry), NOT from $HOME: when the contained spawn env (env/tt-env.sh) is in
 # force, $HOME is the CONTAINED home (torture-test/var/home) and deriving the
 # production path from it would misclassify the contained state dir as
-# production (and refuse to manage the real TT daemon). Falling back to $HOME
-# (the operator's home in a normal interactive invocation) keeps the guard
-# intact when getent is unavailable.
-_tt_operator_home="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)"
+# production (and refuse to manage the real TT daemon). The fallback chain
+# (MACP4 US-002) keeps the guard intact on Darwin, where getent is absent.
+
+# resolve_operator_home: the OPERATOR's real home directory, resolved
+# INDEPENDENTLY of $HOME (the contained spawn env overrides HOME to
+# torture-test/var/home... — deriving the production path from $HOME would
+# misclassify the contained state dir as production). MACP4 US-002 fallback
+# chain (the tt-provision-home convention, extended with the shell tilde
+# step):
+#   1. getent passwd <uid>            (linux passwd db)
+#   2. dscl . -read /Users/<user> NFSHomeDirectory
+#                                     (macOS directory service — getent absent)
+#   3. shell tilde expansion of the named user (`eval echo ~<user>`)
+#                                     (works with no getent AND no dscl)
+#   4. $HOME last resort
+# Every step fails closed to the next; the TRUE operator home is what keeps
+# REAL_TAMANDUA_STATE (the production guard) and operator_bin_dirs (the S24
+# PATH reorder) correct on both platforms.
+resolve_operator_home() {
+  local pw_home
+  pw_home="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6 || true)"
+  if [ -n "$pw_home" ]; then
+    printf '%s' "$pw_home"
+    return 0
+  fi
+  # macOS fallback: getent is absent; read the NFS home directory via dscl.
+  if command -v dscl >/dev/null 2>&1; then
+    pw_home="$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | awk '{print $2}' || true)"
+    if [ -n "$pw_home" ]; then
+      printf '%s' "$pw_home"
+      return 0
+    fi
+  fi
+  # Shell tilde expansion of the named user — no getent, no dscl needed.
+  # An unknown user leaves the literal `~<user>` (or a bare `~` when the
+  # command substitution is empty); only a real absolute home is accepted.
+  pw_home="$(eval echo ~"$(id -un)" 2>/dev/null || true)"
+  case "$pw_home" in
+    '~'*|'') ;; # unknown user / empty — fall through
+    *) printf '%s' "$pw_home"; return 0 ;;
+  esac
+  printf '%s' "${HOME:-}"
+}
+
+_tt_operator_home="$(resolve_operator_home)"
 REAL_TAMANDUA_STATE="${_tt_operator_home:-${HOME}}/.tamandua"
 
 # ── production guards ─────────────────────────────────────────────────
@@ -138,8 +211,19 @@ EOF
 # ── systemd detection ────────────────────────────────────────────────
 
 # has_systemd_scope: checks mechanically whether systemd-run --user --scope
-# is available on this host.
+# is available on this host. Returns 0 (true) only when systemd-run is
+# present AND a probe scope actually starts.
+#
+# TT_FORCE_NO_SYSTEMD=1 (MACP4 US-001) forces the plain-background fallback
+# launch path even on a systemd host: it makes has_systemd_scope return
+# false so cmd_start uses the nohup spawn — the platform-neutral path that
+# Darwin always takes. The W2 scripted cells must be provable through BOTH
+# launch paths on linux; this override is the mechanical forcing for the
+# fallback proof. Default behavior on systemd hosts is unchanged.
 has_systemd_scope() {
+  if [ "${TT_FORCE_NO_SYSTEMD:-}" = "1" ]; then
+    return 1
+  fi
   if command -v systemd-run >/dev/null 2>&1; then
     if systemd-run --user --scope --quiet true 2>/dev/null; then
       return 0
@@ -200,11 +284,12 @@ env_for_kind() {
 
 # operator_bin_dirs: the operator's personal bin dirs that must never precede
 # the contained dirs on a contained daemon's PATH. Prints each as a separate
-# line. Resolved from the REAL operator home (getent passwd — the same source
-# as REAL_TAMANDUA_STATE, so the contained spawn HOME never misidentifies
-# var/home as the operator home) AND from $HOME (covers a test/fake operator
-# home; when $HOME is the contained home the dirs are contained — not on the
-# contained PATH in practice — and reordering them is harmless).
+# line. Resolved from the REAL operator home (resolve_operator_home — the
+# getent/dscl/tilde chain, the same source as REAL_TAMANDUA_STATE, so the
+# contained spawn HOME never misidentifies var/home as the operator home)
+# AND from $HOME (covers a test/fake operator home; when $HOME is the
+# contained home the dirs are contained — not on the contained PATH in
+# practice — and reordering them is harmless).
 operator_bin_dirs() {
   if [ -n "${_tt_operator_home:-}" ]; then
     printf '%s\n' "$_tt_operator_home/.local/bin" "$_tt_operator_home/bin"
@@ -458,6 +543,22 @@ Environment:
     kind's fixed ports (scripted 5334/5338/5339, real 4334/4338/4339) to be
     free before launching (default 10) — concurrent worktrees serialize on
     the shared ports instead of EADDRINUSE-failing their bootstrap.
+  TT_FORCE_NO_SYSTEMD=1 (MACP4 US-001): force the plain-background fallback
+    launch path even on a systemd host — has_systemd_scope() returns false
+    so cmd_start uses the nohup spawn (marker: "systemd not available —
+    using plain background spawn") with the SAME contained PATH
+    reconstruction (contained_path_for_kind, S24/US-006) and provenance
+    with cgroupVerified=false. This is the launch path Darwin always takes;
+    the override is the mechanical linux-side forcing for the W2 scripted
+    cells' dual-path proof. Default behavior on systemd hosts is unchanged.
+  Port liveness probes (wait_for_port/is_port_listening) use a PORTABLE
+    node net.connect probe (port_probe) — no GNU timeout(1) dependency, so
+    start/status/stop work on Darwin (macOS ships no timeout(1)).
+  MACP4 US-002: on Darwin (no procfs, no getent) the daemon stop/escalation
+    identity gates use a ps lstart identity source, TT-ownership evidence
+    uses lsof cwd + ps command, and the operator home (REAL_TAMANDUA_STATE,
+    the S24 PATH reorder) resolves via getent -> dscl -> shell tilde ->
+    $HOME — all fail-closed exactly as on linux.
 
 The systemd scope unit name is PER-WORKTREE:
   tamandua-tt-<kind>-<8-hex-cksum of TT_REPO_ROOT>
@@ -491,6 +592,38 @@ EOF
 
 # ── start subcommand ─────────────────────────────────────────────────
 
+# port_probe: portable TCP-connect liveness probe (MACP4 US-001). Attempts
+# a bounded (1s) connect to $1 on the loopback addresses (127.0.0.1 first —
+# every TT daemon listener binds 127.0.0.1 by default — then ::1 for an
+# IPv6-only listener). Returns 0 when the port accepts a connection, 1
+# otherwise.
+#
+# WHY: the OLD probe `timeout 1 bash -c "echo >/dev/tcp/localhost/$port"`
+# depends on the GNU `timeout` utility, which macOS does not ship — every
+# scripted start/status/stop failed on Darwin ("timeout: command not
+# found", or a hang on a black-holed port). Node is already a hard runtime
+# dependency of daemon-control (tt-process-identity), so a node -e
+# net.connect probe adds no new requirement and behaves identically on
+# linux and Darwin (macOS ships /usr/bin/node via the harness stack).
+port_probe() {
+  local port="$1"
+  node -e '
+    const net = require("net");
+    const port = Number(process.argv[1]);
+    const hosts = ["127.0.0.1", "::1"];
+    let i = 0;
+    function attempt() {
+      if (i >= hosts.length) process.exit(1);
+      const host = hosts[i++];
+      const socket = net.connect({ host, port });
+      socket.setTimeout(1000, () => { socket.destroy(); attempt(); });
+      socket.once("connect", () => { socket.destroy(); process.exit(0); });
+      socket.once("error", () => { socket.destroy(); attempt(); });
+    }
+    attempt();
+  ' "$port" 2>/dev/null
+}
+
 # wait_for_port: poll until a TCP port is listening, up to a timeout in
 # seconds (default 10). Returns 0 if the port becomes available, 1 on timeout.
 wait_for_port() {
@@ -498,7 +631,7 @@ wait_for_port() {
   local timeout="${2:-10}"
   local deadline; deadline=$(($(date +%s) + timeout))
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    if timeout 1 bash -c "echo >/dev/tcp/localhost/$port" 2>/dev/null; then
+    if port_probe "$port"; then
       return 0
     fi
     sleep 0.5
@@ -519,26 +652,62 @@ verify_cgroup() {
 }
 
 # is_port_listening: check if a TCP port is accepting connections.
-# Returns 0 if listening, 1 if not.
+# Returns 0 if listening, 1 if not. Uses the portable port_probe
+# (MACP4 US-001) — no GNU-`timeout` dependency, so it works on Darwin.
 is_port_listening() {
   local port="$1"
-  timeout 1 bash -c "echo >/dev/tcp/localhost/$port" 2>/dev/null
+  port_probe "$port"
 }
 
-# verify_process_tt_owned: check that a PID belongs to the TT environment
-# by examining /proc/$PID/cwd and /proc/$PID/cmdline.
+# verify_process_tt_owned: check that a PID belongs to the TT environment.
 # $1 = PID, $2 = expected cwd from provenance (for reference; actual check
 # is against TT_REPO_ROOT).
 # Returns 0 if proven TT-owned, 1 otherwise.
+#
+# Evidence sources:
+#   linux (default): /proc/$PID/cwd + /proc/$PID/cmdline (procfs — the
+#     exact /proc starttime-grade evidence; MACP3 US-003 linux-only).
+#   Darwin (MACP4 US-002): no procfs — PORTABLE evidence via `lsof -a -p
+#     <pid> -d cwd -Fn` (the cwd, BSD/linux lsof both emit the `n<path>`
+#     name row) and `ps -p <pid> -o command=` (the full command line,
+#     supported by both BSD ps on macOS and procps on linux). When the
+#     evidence is unavailable (lsof/ps absent, pid dead, or a foreign pid
+#     lsof cannot introspect) the function REFUSES exactly as the linux
+#     path does — TT-ownership must be PROVEN, never assumed.
+#
+# TT_DC_PLATFORM (MACP4 US-002 test seam): forces the evidence branch on
+# any host ('Darwin' | anything else = linux /proc) so the Darwin branch
+# is hermetic-testable on linux (see
+# self-tests/tier1-daemon-control-darwin-identity.test.ts).
 verify_process_tt_owned() {
   local pid="$1"
   local expected_cwd="$2"
 
-  # Check /proc/$PID/cwd — must be under TT_REPO_ROOT
-  local actual_cwd
-  if [ -L "/proc/$pid/cwd" ]; then
-    actual_cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null || true)
-  fi
+  local platform
+  platform="${TT_DC_PLATFORM:-$(uname -s)}"
+
+  local actual_cwd cmdline
+  case "$platform" in
+    Darwin)
+      # /proc-less host (macOS): portable evidence. `lsof -a -p <pid>
+      # -d cwd -Fn` prints the cwd as an `n<path>` row (the 'p<pid>' row
+      # and lsof's fd-name row, if any, are ignored); `ps -p <pid>
+      # -o command=` prints the full command line. Both are mechanical
+      # and present on macOS by default (/usr/sbin/lsof, /bin/ps).
+      actual_cwd="$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1 || true)"
+      cmdline="$(ps -p "$pid" -o command= 2>/dev/null | head -1 || true)"
+      ;;
+    *)
+      # linux /proc evidence (unchanged)
+      # Check /proc/$PID/cwd — must be under TT_REPO_ROOT
+      if [ -L "/proc/$pid/cwd" ]; then
+        actual_cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null || true)
+      fi
+      # Check /proc/$PID/cmdline — must contain tamandua
+      cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
+      ;;
+  esac
+
   if [ -z "$actual_cwd" ]; then
     return 1  # cannot verify — refuse
   fi
@@ -549,9 +718,6 @@ verify_process_tt_owned() {
     *) return 1 ;;  # not under TT repo — not ours
   esac
 
-  # Check /proc/$PID/cmdline — must contain tamandua
-  local cmdline
-  cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
   if [ -z "$cmdline" ]; then
     return 1  # cannot read cmdline — refuse
   fi
@@ -946,9 +1112,10 @@ cmd_start() {
   fi
 
   # Record the daemon's process-start identity (E3.C.1 US-004): stop/restart
-  # verify the recorded startTime against the pid's CURRENT /proc starttime
-  # before ANY signal, so a stale/reused provenance pid (a pid that now names
-  # a different process — e.g. a repo-cwd tamandua CLI child of the worker)
+  # verify the recorded startTime against the pid's CURRENT start identity
+  # (procfs starttime on linux, ps lstart on Darwin — MACP4 US-002) before
+  # ANY signal, so a stale/reused provenance pid (a pid that now names a
+  # different process — e.g. a repo-cwd tamandua CLI child of the worker)
   # is refused instead of signalled.
   local daemon_start_time
   daemon_start_time="$(node "$IDENTITY_TOOL" --get "$daemon_pid" 2>/dev/null || true)"
@@ -1054,6 +1221,10 @@ stop_cli_auto_daemon() {
   # Per-worktree discriminator: the daemon environ must name the state
   # dir OF THIS WORKTREE. A foreign-worktree CLI daemon has a different
   # TAMANDUA_STATE_DIR in its environ and must never be stopped.
+  # (MACP4 US-002: on Darwin /proc is absent so the environ cannot be read
+  # and the check degrades to "cannot read -> no refusal on this basis" —
+  # exactly the linux behavior when /proc environ is unreadable (EACCES);
+  # the TT-owned + identity gates above/below still hold.)
   local cli_env_state_dir
   cli_env_state_dir="$(tr '\0' '\n' < "/proc/$lingering_pid/environ" 2>/dev/null | sed -n 's/^TAMANDUA_STATE_DIR=//p' | head -1 || true)"
   if [ -n "$cli_env_state_dir" ] && [ "$cli_env_state_dir" != "$state_dir" ]; then
@@ -1200,8 +1371,18 @@ cmd_stop() {
   echo "daemon-control: stopping $kind daemon (PID $prov_pid)..." >&2
 
   # ── Step 1: Graceful stop via tamandua CLI under spawn env ─────────
-  echo "daemon-control: graceful stop via tamandua dashboard stop..." >&2
+  # MACP4 US-001: stop the standalone MCP too. The launch script starts the
+  # dashboard AND the MCP as STANDALONE processes; on the systemd path the
+  # scope teardown (Step 5) used to kill the MCP survivor, but the
+  # plain-background fallback path (Darwin's ONLY path) has no scope —
+  # without this step a fallback stop left the MCP standalone holding its
+  # port, and the next start refused on the busy port (the W2 cells'
+  # restart corridor would fail on Darwin). The product CLI stop is
+  # pid-file + canSignalPid gated (no identity weakening); the recorded-
+  # identity escalation below remains the backstop.
+  echo "daemon-control: graceful stop via tamandua dashboard/mcp stop..." >&2
   run_under_env "$kind" tamandua dashboard stop >/dev/null 2>&1 || true
+  run_under_env "$kind" tamandua mcp stop >/dev/null 2>&1 || true
 
   # ── Step 2: Poll for graceful shutdown (up to 10s) ─────────────────
   local all_stopped=false
