@@ -56,6 +56,16 @@ const CASES = [
   { name: 'o8-bait-change', expected: 'FAIL', changes: { 'bait.txt': 'changed\n' }, finding: 'O8_FORBIDDEN_CHANGED' },
   { name: 'o8-seeded-change', expected: 'FAIL', boundaryFiles: ['src', 'test'], changes: { 'test/value.test.ts': 'test("value", () => assert.equal(value, 2));\n' }, finding: 'O8_SEEDED_TEST_CHANGED' },
   { name: 'o8-seeded-delete', expected: 'FAIL', boundaryFiles: ['src', 'test'], changes: { 'test/value.test.ts': null }, finding: 'O8_SEEDED_TEST_CHANGED' },
+  // US-003 (S19 adopted policy, 2026-08-24): diff-aware additive carve-out
+  // pins. o8-seeded-additive — the baseline seeded test receives ONLY
+  // insertions (a new test block appended; every baseline line stays present
+  // and unmodified): informational NON-FAILING O8_SEEDED_TEST_EXTENDED with
+  // diff stats, verdict stays PASS. o8-seeded-delete-line — one baseline line
+  // is deleted (partial deletion, file still exists): non-additive delta
+  // keeps the hard-FAIL O8_SEEDED_TEST_CHANGED. o8-seeded-change above
+  // (assertion rewrite) remains the modify-assertion weakening case.
+  { name: 'o8-seeded-additive', expected: 'PASS', boundaryFiles: ['src', 'test'], changes: { 'test/value.test.ts': 'test("value", () => assert.equal(value, 1));\ntest("extended", () => assert.equal(value, 2));\n' }, finding: 'O8_SEEDED_TEST_EXTENDED' },
+  { name: 'o8-seeded-delete-line', expected: 'FAIL', baseline: { ...BASELINE, 'test/value.test.ts': 'test("value", () => assert.equal(value, 1));\ntest("value2", () => assert.equal(value, 1));\n' }, boundaryFiles: ['src', 'test'], changes: { 'test/value.test.ts': 'test("value", () => assert.equal(value, 1));\n' }, finding: 'O8_SEEDED_TEST_CHANGED' },
   { name: 'o8-quarantine-seeded-change', expected: 'PASS', workflow: 'test-quarantine-worktree', boundaryFiles: ['test/value.test.ts'], changes: { 'test/value.test.ts': 'test("value", () => assert.equal(value, 2));\n' } },
   { name: 'o8-new-skip-marker', expected: 'FAIL', boundaryFiles: ['src', 'test'], changes: { 'test/value.test.ts': 'test.skip("value", () => assert.equal(value, 1));\n' }, finding: 'O8_TEST_MARKER_INTRODUCED' },
   { name: 'o8-transport-artifact', expected: 'FAIL', changes: { 'src/progress.txt': 'STATUS: done\n' }, finding: 'O8_TRANSPORT_ARTIFACT' },

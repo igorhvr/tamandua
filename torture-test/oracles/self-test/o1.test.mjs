@@ -44,7 +44,7 @@ test('O1 accepts converged DB/event/workflow evidence and catches every targeted
     const generated = spawnSync(process.execPath, [GENERATOR, workspace], { encoding: 'utf8', shell: false });
     assert.equal(generated.status, 0, generated.stderr);
     const names = fs.readdirSync(workspace).filter((name) => name.startsWith('o1-')).sort();
-    assert.equal(names.length, 25);
+    assert.equal(names.length, 27);
     for (const name of names) {
       const expectation = JSON.parse(fs.readFileSync(path.join(workspace, name, 'expectation.json'), 'utf8'));
       if (expectation.multiCase) continue; // covered by the dedicated multi-case test
@@ -197,6 +197,54 @@ test('O1 evaluates the wave-family floor guard from the last manifest case when 
     assert.equal(lastObservation.duration_floor_observations[0].run_count, 5);
     assert.equal(lastObservation.duration_floor_observations[0].fast_run_count, 3);
     assert.equal(lastObservation.duration_floor_observations[0].fast_rate, 0.6);
+  } finally {
+    fs.rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test('O1 clears campaign-8 wave-1 do-now durations at the recalibrated 30s floor and fires on a sub-30s run', () => {
+  fs.mkdirSync(VAR_ROOT, { recursive: true });
+  const workspace = fs.mkdtempSync(path.join(VAR_ROOT, 'oracle-self-test.'));
+  try {
+    assert.equal(spawnSync(process.execPath, [GENERATOR, workspace], { encoding: 'utf8', shell: false }).status, 0);
+
+    // The four campaign #8 wave-1 do-now runs (W1.L1-python 53.257s,
+    // W1.L1-ts 46.313s, W1.X1-ts 101.768s, W1.M1-python 88.759s) all finish
+    // above the recalibrated 30000ms floor (US-006): the wave PASSes with no
+    // O1_DURATION_FLOOR_* finding, fast_run_count 0 and fast_rate 0.
+    const green = invokeFixture(workspace, 'o1-wave1-floor-30000');
+    assert.equal(green.status, 0);
+    assert.equal(green.response.result, 'PASS');
+    assert.equal(green.response.findings.some((finding) => finding.id.startsWith('O1_DURATION_FLOOR')), false, JSON.stringify(green.response.findings));
+    const greenObservation = JSON.parse(fs.readFileSync(path.join(workspace, 'o1-wave1-floor-30000', 'evidence', green.response.evidence[0].path), 'utf8'));
+    assert.equal(greenObservation.duration_floor_observations.length, 1);
+    assert.equal(greenObservation.duration_floor_observations[0].run_count, 4);
+    assert.equal(greenObservation.duration_floor_observations[0].fast_run_count, 0);
+    assert.equal(greenObservation.duration_floor_observations[0].fast_rate, 0);
+    const greenFloors = new Map(greenObservation.duration_floor_observations[0].case_floors.map((row) => [row.case_id, row]));
+    for (const caseId of ['o1-wave1-floor-30000', 'wave-peer-1', 'wave-peer-2']) {
+      assert.equal(greenFloors.get(caseId).duration_floor_ms, 30000, `${caseId} floor`);
+      assert.equal(greenFloors.get(caseId).source, 'production-median', `${caseId} source`);
+    }
+
+    // The same wave with wave-peer-2 (W1.M1-python slot) finishing at 25s
+    // (< 30000ms): with 4 eligible runs (MIN_FLOOR_RATE_SAMPLE) the rate
+    // guard fires — O1_DURATION_FLOOR_RATE with fast_run_count 1 and
+    // fast_rate 0.25 (> MAX_FAST_RATE 0.2).
+    const fast = invokeFixture(workspace, 'o1-wave1-floor-fast');
+    assert.equal(fast.status, 1);
+    assert.equal(fast.response.result, 'FAIL');
+    const rate = fast.response.findings.find((finding) => finding.id === 'O1_DURATION_FLOOR_RATE');
+    assert.ok(rate, JSON.stringify(fast.response.findings));
+    assert.equal(rate.run_count, 4);
+    assert.equal(rate.fast_run_count, 1);
+    assert.equal(rate.fast_rate, 0.25);
+    assert.deepEqual(rate.run_ids, ['run-wave-peer-2']);
+    const fastObservation = JSON.parse(fs.readFileSync(path.join(workspace, 'o1-wave1-floor-fast', 'evidence', fast.response.evidence[0].path), 'utf8'));
+    assert.equal(fastObservation.duration_floor_observations.length, 1);
+    assert.equal(fastObservation.duration_floor_observations[0].run_count, 4);
+    assert.equal(fastObservation.duration_floor_observations[0].fast_run_count, 1);
+    assert.equal(fastObservation.duration_floor_observations[0].fast_rate, 0.25);
   } finally {
     fs.rmSync(workspace, { recursive: true, force: true });
   }

@@ -114,6 +114,15 @@ const cases = [
   { name: 'o1-healthy-straggler', expected: 'PASS', childStatus: 'canceled', healthyStraggler: true },
   { name: 'o1-wave-family-reporter', expected: 'FAIL', multiCase: true, finding: 'O1_DURATION_FLOOR_RATE' },
   { name: 'o1-wave-family-sequential', expected: 'FAIL', multiCase: true, sequential: true, finding: 'O1_DURATION_FLOOR_RATE' },
+  // US-007 (2026-08-24): wave-1 do-now duration-floor recalibration proof.
+  // o1-wave1-floor-30000 mirrors the four campaign #8 wave-1 do-now runs'
+  // recorded durations (W1.L1-python 53.257s, W1.L1-ts 46.313s, W1.X1-ts
+  // 101.768s, W1.M1-python 88.759s — all above the recalibrated 30000ms
+  // floor) and must PASS with no O1_DURATION_FLOOR_* finding. The fast
+  // variant drops wave-peer-2 to 25s (< 30000ms) to prove the rate guard
+  // still fires below the floor.
+  { name: 'o1-wave1-floor-30000', expected: 'PASS', wave1Floor: true },
+  { name: 'o1-wave1-floor-fast', expected: 'FAIL', wave1Floor: true, wave1FloorFast: true, finding: 'O1_DURATION_FLOOR_RATE' },
 ];
 
 for (const fixture of cases) {
@@ -140,8 +149,10 @@ for (const fixture of cases) {
   });
   const rootAttempt = attempt(ROOT, rootStatus, [rootStep]);
   if (fixture.fastWave || fixture.tinySample || fixture.n4Fast) rootAttempt.terminal_at = '2026-08-01T12:00:30.000Z';
+  if (fixture.wave1Floor) rootAttempt.terminal_at = '2026-08-01T12:00:53.257Z'; // W1.L1-python measured 53.257s (campaign #8)
   const childAttempt = { ...attempt(CHILD, childStatus, [childStep]), parent_run_id: ROOT };
   if (fixture.tinySample || fixture.n4Fast) childAttempt.terminal_at = '2026-08-01T12:00:30.000Z';
+  if (fixture.wave1Floor) childAttempt.terminal_at = '2026-08-01T12:00:46.313Z'; // W1.L1-ts measured 46.313s (campaign #8)
 
   const databasePath = path.join(snapshots, 'database.sqlite');
   const db = new DatabaseSync(databasePath);
@@ -517,6 +528,9 @@ function writeSequentialFixture(workspace, fixture) {
 }
 
 function waveProjection(fixture, rootAttempt, childAttempt) {
+  if (fixture.wave1Floor) {
+    return wave1FloorProjection(fixture, rootAttempt, childAttempt);
+  }
   if (fixture.omitWaveProjection) {
     return { schema_version: 1, wave: 4, duration_floors: [], runs: [] };
   }
@@ -575,6 +589,36 @@ function waveProjection(fixture, rootAttempt, childAttempt) {
     durationFloors.push({ workflow: 'unknown-workflow', duration_floor_ms: 300000, source: 'production-median', sample_size: 0 });
   }
   return { schema_version: 1, wave: 4, duration_floors: durationFloors, runs };
+}
+
+// US-007 (2026-08-24): derived wave-1 do-now projection at the recalibrated
+// 30000ms production floor (US-006). The four runs carry the campaign #8
+// wave-1 do-now runs' MEASURED durations — W1.L1-python 53.257s, W1.L1-ts
+// 46.313s, W1.X1-ts 101.768s, W1.M1-python 88.759s (all > 30s) — so the
+// wave clears the floor with fast_run_count 0. The wave1FloorFast variant
+// drops wave-peer-2 (the W1.M1-python slot) to 25s (< 30000ms), proving the
+// guard still fires below the recalibrated floor.
+function wave1FloorProjection(fixture, rootAttempt, childAttempt) {
+  const workflow = 'feature-dev-merge-worktree';
+  const runs = [
+    // W1.L1-python slot (53.257s) and W1.L1-ts slot (46.313s): the launched
+    // ROOT/CHILD runs, whose terminal_at must match the attempt projections.
+    { case_id: fixture.name, run_id: ROOT, workflow, started_at: STARTED_AT, terminal_at: rootAttempt.terminal_at, terminal_status: rootAttempt.terminal_status, expected_fast_failure: false },
+    { case_id: fixture.name, run_id: CHILD, workflow, started_at: STARTED_AT, terminal_at: childAttempt.terminal_at, terminal_status: childAttempt.terminal_status, expected_fast_failure: false },
+    // W1.X1-ts slot (101.768s).
+    { case_id: 'wave-peer-1', run_id: 'run-wave-peer-1', workflow, started_at: STARTED_AT, terminal_at: '2026-08-01T12:01:41.768Z', terminal_status: 'completed', expected_fast_failure: false },
+    // W1.M1-python slot (88.759s), or 25s (< 30000ms) in the fast variant.
+    { case_id: 'wave-peer-2', run_id: 'run-wave-peer-2', workflow, started_at: STARTED_AT, terminal_at: fixture.wave1FloorFast ? '2026-08-01T12:00:25.000Z' : '2026-08-01T12:01:28.759Z', terminal_status: 'completed', expected_fast_failure: false },
+  ];
+  const caseIds = [...new Set(runs.map((run) => run.case_id))];
+  const durationFloors = caseIds.map((caseId) => ({
+    workflow: 'feature-dev-merge-worktree',
+    case_id: caseId,
+    duration_floor_ms: 30000,
+    source: 'production-median',
+    sample_size: 0,
+  }));
+  return { schema_version: 1, wave: 1, duration_floors: durationFloors, runs };
 }
 
 function writeSnapshot(campaign, directory, name, value) {

@@ -409,6 +409,10 @@ run_bounded "$COMMAND_TIMEOUT_SECONDS" node --test --test-timeout=12000 "$SCRIPT
 run_bounded "$COMMAND_TIMEOUT_SECONDS" node "$SCRIPT_DIR/harness.mjs" --oracle "$workspace/oracle-pass" --context "$workspace/evidence/pass/context.json" --expected PASS
 run_bounded "$COMMAND_TIMEOUT_SECONDS" node "$SCRIPT_DIR/harness.mjs" --oracle "$workspace/oracle-fail" --context "$workspace/evidence/fail/context.json" --expected FAIL
 run_bounded "$COMMAND_TIMEOUT_SECONDS" node "$SCRIPT_DIR/harness.mjs" --oracle "$workspace/oracle-not-evaluable" --context "$workspace/evidence/not-evaluable/context.json" --expected NOT_EVALUABLE
+# US-001 (adopted S19 policy): a PASS may carry findings only when every
+# finding is informational (non_failing: true). oracle-pass-informational emits
+# such a response through the real runtime — the harness must accept it.
+run_bounded "$COMMAND_TIMEOUT_SECONDS" node "$SCRIPT_DIR/harness.mjs" --oracle "$workspace/oracle-pass-informational" --context "$workspace/evidence/pass-informational/context.json" --expected PASS
 
 for fixture in "$workspace"/o1-*; do
   expected=$(run_bounded "$COMMAND_TIMEOUT_SECONDS" node -e 'const fs=require("node:fs"); process.stdout.write(JSON.parse(fs.readFileSync(process.argv[1],"utf8")).expected)' "$fixture/expectation.json")
@@ -473,6 +477,13 @@ if run_bounded "$COMMAND_TIMEOUT_SECONDS" node "$SCRIPT_DIR/harness.mjs" --oracl
   exit 1
 fi
 printf 'missed violation rejected\n'
+# US-001: a PASS with a FAILING (unmarked) finding must still be rejected —
+# the false-positive rejection stays intact under the relaxed rule.
+if run_bounded "$COMMAND_TIMEOUT_SECONDS" node "$SCRIPT_DIR/harness.mjs" --oracle "$workspace/oracle-pass-failing-finding" --context "$workspace/evidence/pass-failing-finding/context.json" --expected PASS >/dev/null 2>&1; then
+  printf 'self-test harness accepted a PASS with a failing finding\n' >&2
+  exit 1
+fi
+printf 'PASS with a failing finding rejected\n'
 printf 'O1 terminal-state mutations PASS\n'
 printf 'O2 merge-truth mutations PASS\n'
 printf 'O3z token-gate mutations PASS\n'
@@ -483,5 +494,6 @@ printf 'O11 output-contract/token-attribution mutations PASS\n'
 printf 'O4 claim-dispatch-hygiene mutations PASS\n'
 printf 'O16 lifecycle-probe mutations PASS\n'
 printf 'NOT_EVALUABLE result vocabulary PASS\n'
+printf 'informational non-failing findings on PASS PASS\n'
 printf 'O2/O9/O11 hard-case calibration pack PASS\n'
 printf 'self-test harness PASS\n'

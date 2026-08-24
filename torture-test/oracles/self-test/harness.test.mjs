@@ -8,6 +8,8 @@ import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
+import { validateOracleResponse } from '../lib/output.mjs';
+
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const TT_ROOT = path.resolve(HERE, '../..');
 const VAR_ROOT = path.join(TT_ROOT, 'var');
@@ -35,8 +37,11 @@ test('self-test harness accepts expected PASS/FAIL and detects both mismatch dir
     assert.match(result.stdout, /expected PASS.*accepted/i);
     assert.match(result.stdout, /expected FAIL.*accepted/i);
     assert.match(result.stdout, /expected NOT_EVALUABLE.*accepted/i);
+    assert.match(result.stdout, /expected PASS accepted for oracle-pass-informational/);
     assert.match(result.stdout, /false positive.*rejected/i);
     assert.match(result.stdout, /missed violation.*rejected/i);
+    assert.match(result.stdout, /PASS with a failing finding rejected/);
+    assert.match(result.stdout, /informational non-failing findings on PASS PASS/);
     assert.match(result.stdout, /self-test round 1 PASS \([0-9]+ms\)/);
     assert.match(result.stdout, /self-test round 2 PASS \([0-9]+ms\)/);
     assert.equal((result.stdout.match(/calibration o2-phantom-merge caught O2_PHANTOM_MERGE/g) ?? []).length, 2);
@@ -102,4 +107,35 @@ test('harness accepts --expected NOT_EVALUABLE, rejects mismatched expectations,
   } finally {
     fs.rmSync(workspace, { recursive: true, force: true });
   }
+});
+
+test('output contract: PASS may carry findings only when every finding is non_failing (informational)', () => {
+  // US-001 (adopted S19 policy): the relaxed PASS rule and the unchanged
+  // NOT_EVALUABLE/FAIL rules, exercised directly on validateOracleResponse.
+  const now = '2026-08-14T00:00:00.000Z';
+  const base = { contract_version: 1, oracle_id: 'O1', result: 'PASS', started_at: now, finished_at: now, findings: [], evidence: [] };
+  const informational = { id: 'O8_SEEDED_TEST_EXTENDED', summary: 'informational additive extension', non_failing: true, diff: { lines_added: 3, lines_deleted: 0 } };
+  const unmarked = { id: 'O8_SEEDED_TEST_CHANGED', summary: 'failing seeded-test change' };
+
+  // PASS with every finding non_failing: true is accepted.
+  assert.deepEqual(validateOracleResponse({ ...base, findings: [informational] }, 'O1', 0, '/tmp'), []);
+  assert.deepEqual(validateOracleResponse({ ...base, findings: [informational, { ...informational, id: 'SECOND_INFO' }] }, 'O1', 0, '/tmp'), []);
+
+  // PASS with any failing (unmarked) finding is rejected.
+  const unmarkedErrors = validateOracleResponse({ ...base, findings: [informational, unmarked] }, 'O1', 0, '/tmp');
+  assert.match(unmarkedErrors.join('\n'), /PASS must not contain failing findings/i);
+  assert.match(validateOracleResponse({ ...base, findings: [unmarked] }, 'O1', 0, '/tmp').join('\n'), /PASS must not contain failing findings/i);
+  // non_failing must be the strict boolean true — a truthy string does not qualify.
+  assert.match(validateOracleResponse({ ...base, findings: [{ ...informational, non_failing: 'true' }] }, 'O1', 0, '/tmp').join('\n'), /PASS must not contain failing findings/i);
+  assert.match(validateOracleResponse({ ...base, findings: [{ ...informational, non_failing: false }] }, 'O1', 0, '/tmp').join('\n'), /PASS must not contain failing findings/i);
+
+  // NOT_EVALUABLE stays finding-free even for informational findings.
+  const notEvaluable = { ...base, result: 'NOT_EVALUABLE' };
+  assert.deepEqual(validateOracleResponse(notEvaluable, 'O1', 3, '/tmp'), []);
+  assert.match(validateOracleResponse({ ...notEvaluable, findings: [informational] }, 'O1', 3, '/tmp').join('\n'), /NOT_EVALUABLE must not contain findings/i);
+
+  // FAIL still requires at least one finding and may carry informational ones.
+  const fail = { ...base, result: 'FAIL' };
+  assert.match(validateOracleResponse(fail, 'O1', 1, '/tmp').join('\n'), /FAIL must contain a finding/i);
+  assert.deepEqual(validateOracleResponse({ ...fail, findings: [informational, unmarked] }, 'O1', 1, '/tmp'), []);
 });

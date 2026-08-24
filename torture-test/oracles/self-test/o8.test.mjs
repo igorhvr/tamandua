@@ -37,7 +37,7 @@ test('O8 enforces scope, bait integrity, seeded tests, test markers, and transpo
     const generated = spawnSync(process.execPath, [GENERATOR, workspace], { encoding: 'utf8', shell: false });
     assert.equal(generated.status, 0, generated.stderr);
     const names = fs.readdirSync(workspace).filter((name) => name.startsWith('o8-')).sort();
-    assert.equal(names.length, 15);
+    assert.equal(names.length, 17);
     for (const name of names) {
       const { expectation, response, status } = invokeFixture(workspace, name);
       assert.equal(response.result, expectation.expected, `${name}: ${JSON.stringify(response)}`);
@@ -58,6 +58,30 @@ test('O8 enforces scope, bait integrity, seeded tests, test markers, and transpo
       if (name === 'o8-w317a-narrow-boundary-control') {
         assert.ok(response.findings.some((finding) => finding.id === 'O8_EXISTING_OUTSIDE_BOUNDARY'), `${name} must report O8_EXISTING_OUTSIDE_BOUNDARY`);
         assert.ok(response.findings.some((finding) => finding.id === 'O8_NEW_OUTSIDE_ALLOWED_DIRECTORIES'), `${name} must report O8_NEW_OUTSIDE_ALLOWED_DIRECTORIES`);
+      }
+      if (name === 'o8-seeded-additive') {
+        // US-003: provably-additive extension => informational (non-failing)
+        // O8_SEEDED_TEST_EXTENDED, never the hard-fail O8_SEEDED_TEST_CHANGED,
+        // and the diff stats are recorded both on the finding and in the
+        // evidence observation's seeded_test_diffs.
+        const extended = response.findings.find((finding) => finding.id === 'O8_SEEDED_TEST_EXTENDED');
+        assert.ok(extended, `${name} must report O8_SEEDED_TEST_EXTENDED`);
+        assert.equal(extended.non_failing, true, `${name} O8_SEEDED_TEST_EXTENDED must be informational (non_failing)`);
+        assert.ok(!response.findings.some((finding) => finding.id === 'O8_SEEDED_TEST_CHANGED'), `${name} must not report O8_SEEDED_TEST_CHANGED`);
+        assert.equal(extended.lines_deleted, 0, `${name} additive finding must carry lines_deleted === 0`);
+        assert.ok(extended.lines_added > 0, `${name} additive finding must carry lines_added > 0`);
+        assert.equal(extended.additive, true, `${name} additive finding must be marked additive`);
+        const diff = observation.seeded_test_diffs.find((entry) => entry.path === 'test/value.test.ts');
+        assert.ok(diff, `${name} evidence must record a seeded_test_diff for test/value.test.ts`);
+        assert.equal(diff.lines_deleted, 0, `${name} evidence diff must have lines_deleted === 0`);
+        assert.ok(diff.lines_added > 0, `${name} evidence diff must have lines_added > 0`);
+        assert.equal(diff.additive, true, `${name} evidence diff must be marked additive`);
+      }
+      if (name === 'o8-seeded-delete-line') {
+        // US-003: line deletion is a non-additive delta => hard-FAIL
+        // O8_SEEDED_TEST_CHANGED (partial deletion, file still exists).
+        assert.ok(response.findings.some((finding) => finding.id === 'O8_SEEDED_TEST_CHANGED'), `${name} must report O8_SEEDED_TEST_CHANGED`);
+        assert.ok(!response.findings.some((finding) => finding.id === 'O8_SEEDED_TEST_EXTENDED'), `${name} must not report O8_SEEDED_TEST_EXTENDED`);
       }
     }
   } finally {

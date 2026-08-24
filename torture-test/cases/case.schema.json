@@ -293,6 +293,12 @@
    "type": "integer",
    "minimum": 1
   },
+  "production_duration_floor_basis": {
+   "type": "string",
+   "minLength": 1,
+   "maxLength": 512,
+   "description": "OPTIONAL recalibration basis documenting WHY a production_duration_floor_ms value was chosen (operator decision record, e.g. measured honest baseline durations). Informational only — never consumed by oracles or the controller."
+  },
   "expected_fast_failure": {
    "type": "boolean"
   },

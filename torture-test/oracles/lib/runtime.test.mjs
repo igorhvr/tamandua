@@ -218,6 +218,20 @@ test('finding aggregation is deterministic and safe git execution stays containe
     findings.add('A', 'first', { observed: 1 });
     assert.deepEqual(findings.toJSON().map((item) => item.id), ['A', 'B']);
 
+    // US-001: addInfo stamps the finding non_failing: true (informational,
+    // non-failing path) while add() findings stay unmarked (failing).
+    findings.addInfo('C', 'informational third', { observed: 2 });
+    assert.throws(() => findings.addInfo('', 'empty id'), /nonempty/i);
+    assert.throws(() => findings.addInfo('D', ''), /nonempty/i);
+    const withInfo = findings.toJSON();
+    assert.deepEqual(withInfo.map((item) => item.id), ['A', 'B', 'C']);
+    assert.equal(withInfo[2].non_failing, true);
+    assert.equal('non_failing' in withInfo[0], false);
+    assert.equal('non_failing' in withInfo[1], false);
+    // The stamp is authoritative: details cannot un-stamp an informational finding.
+    findings.addInfo('D', 'stamped', { non_failing: false });
+    assert.equal(findings.toJSON().find((item) => item.id === 'D').non_failing, true);
+
     const repo = path.join(fixture.campaignRoot, 'repo');
     fs.mkdirSync(repo);
     assert.equal(spawnSync('git', ['init', '-q', repo], { shell: false }).status, 0);

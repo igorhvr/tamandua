@@ -25,12 +25,17 @@
 //     unless --keep-workspaces is given.
 //   - --verify-invariants (E3.B US-011) pins the campaign-#7 honest-verdict
 //     invariants on top of the replay: CNEV O1_TERMINAL_EVENT_MISSING and
-//     O8_SEEDED_TEST_CHANGED failures must survive unchanged, RUNAWAY cases
-//     must keep an honest FAIL backing, and the ONLY flips allowed are the
-//     four scoped artifact classes (S5 O1_DURATION_FLOOR_*, S6 O11 loop
-//     findings, S7 O8 boundary findings on W3.17a/b, S13 O2/O9/O10
-//     ERROR->NOT_EVALUABLE + the W1.REPLAY-ts O9 foreign-row finding). Any
-//     honest verdict flip fails the replay loudly.
+//     O8 seeded failures must behave per the named pins, RUNAWAY cases
+//     must keep an honest FAIL backing (cases with no oracle evidence are
+//     noted as skipped), and the ONLY flips allowed are the scoped artifact
+//     classes (S5 O1_DURATION_FLOOR_* disappearing, S6 O11 loop findings,
+//     S7 O8 boundary findings on W3.17a/b, S13 O2/O9/O10
+//     ERROR->NOT_EVALUABLE + the W1.REPLAY-ts O9 foreign-row finding,
+//     S19 O8_SEEDED_TEST_CHANGED replaced by the informational
+//     O8_SEEDED_TEST_EXTENDED on an additive seeded-test delta, S20
+//     O2_REF_TRANSITION_COUNT on O2, S21 O9_LEDGER_TREE_UNRESOLVED on O9,
+//     and S23 O1_DURATION_FLOOR_* APPEARING on a stored PASS). Any honest
+//     verdict flip fails the replay loudly.
 //
 // Exit codes:
 //   0  replay completed: every pair attempted and recorded (and, under
@@ -71,9 +76,9 @@ options:
   --json <path>            also write the machine-readable row list + summary
   --keep-workspaces        do not remove the replay workspace after the run
   --verify-invariants      pin the E3.B honest-verdict invariants on the
-                           replay (CNEV/O8-seeded failures survive; only
-                           S5/S6/S7/S13 artifact classes may flip) and exit 1
-                           when any pinned invariant is violated
+                           replay (CNEV/O8-seeded pins hold; only
+                           S5/S6/S7/S13/S19 artifact classes may flip) and
+                           exit 1 when any pinned invariant is violated
   -h, --help               show this help
 
 Campaign selection: --campaign wins, then TT_REPLAY_CAMPAIGN_DIR, then
@@ -399,8 +404,8 @@ export function renderSummary(rows) {
 
 // ── E3.B US-011 honest-verdict invariant verification ──────────────────────
 //
-// The four scoped artifact classes are the ONLY findings that may disappear
-// between a stored campaign-#7 verdict and its replayed verdict:
+// The scoped artifact classes are the ONLY findings that may disappear
+// between a stored campaign verdict and its replayed verdict:
 //
 //   S5  O1_DURATION_FLOOR_*                      (wave-family floor artifacts)
 //   S6  O11_DONE_WITHOUT_EXPECTS_SUCCESS and
@@ -410,10 +415,40 @@ export function renderSummary(rows) {
 //                                                 artifacts — W3.17a/b only)
 //   S13 O9_LEDGER_TREE_UNRESOLVED on W1.REPLAY-ts (foreign-row artifact) plus
 //       ERROR->NOT_EVALUABLE on O2/O9/O10        (null gate_key degradation)
+//   S19 O8_SEEDED_TEST_CHANGED                   (S19 adopted policy,
+//       2026-08-24): may disappear only when the replay's findings carry the
+//       informational O8_SEEDED_TEST_EXTENDED on the same pair — the seeded
+//       delta is provably additive, so FAIL->PASS is an allowed flip; any
+//       other seeded finding shape stays honest.
+//   S20 O2_REF_TRANSITION_COUNT on O2            (2026-08-24, S20 reflog
+//       parser calibration 7172a999): the landing update-ref writes reflog
+//       entries with no message segment; the pre-S20 parser captured them
+//       raw-only and counted 0 transitions, so the stored
+//       O2_REF_TRANSITION_COUNT finding was a false positive. The fixed
+//       parser recovers raw-only transitions, so the stored finding may
+//       legitimately vanish on replay (scoped on O2 only).
+//   S21 O9_LEDGER_TREE_UNRESOLVED on O9          (2026-08-24, S21 ledger
+//       scoping calibration 7172a999): the ledger bundle previously kept
+//       rows by origin_repo path only, so rows written by PRIOR campaign
+//       attempts tripped O9_LEDGER_TREE_UNRESOLVED (17 findings / 8 cases).
+//       The fixed oracle keeps only current-attempt rows (run_id NULL kept),
+//       so stored O9_LEDGER_TREE_UNRESOLVED findings may legitimately vanish
+//       on replay — the FAIL->PASS flip is the S21 transition class. (S13's
+//       W1.REPLAY-ts foreign-row class is the earlier, narrower expression
+//       of the same calibration; S21 now scopes O9 generally.)
+//   S23 O1_DURATION_FLOOR_* APPEARING            (2026-08-24, SFX-B
+//       un-deadened guard): the mirror of S5. The stored wave-1 do-now
+//       verdicts were captured with the dead duration-floor guard (PASS, no
+//       findings); the current O1 fires O1_DURATION_FLOOR_MISSING /
+//       O1_DURATION_FLOOR_RATE on the 46-102s honest wave-1 runs under the
+//       spec-era 120s floor (recalibrated to 30s in US-006/007). A PASS->FAIL
+//       flip is legal ONLY when every replayed finding is an O1_DURATION_FLOOR_*
+//       artifact (S23 transition class).
 //
-// Everything else — CNEV O1_TERMINAL_EVENT_MISSING, O8_SEEDED_TEST_CHANGED,
-// and any other finding id — is an HONEST verdict: it must survive the
-// replay with the same verdict, or the replay fails loudly.
+// Everything else — CNEV O1_TERMINAL_EVENT_MISSING, O8 seeded findings
+// outside the S19 replacement, and any other finding id — is an HONEST
+// verdict: it must survive the replay with the same verdict, or the replay
+// fails loudly.
 
 export const INVARIANT_PINS = {
   // O1_TERMINAL_EVENT_MISSING (CNEV) failures named by the story must survive.
@@ -422,16 +457,27 @@ export const INVARIANT_PINS = {
     { caseId: 'W1.L3-python', oracle: 'O1', finding: 'O1_TERMINAL_EVENT_MISSING' },
     { caseId: 'W1.L3-ts', oracle: 'O1', finding: 'O1_TERMINAL_EVENT_MISSING' },
   ],
-  // O8_SEEDED_TEST_CHANGED failures named by the story must survive. Note:
-  // campaign #7 stored a PASS O8 verdict for W3.03-bfmw-hermes-ts (no seeded
-  // finding in its stdout.json), so that pin enforces verdict preservation
-  // (PASS must stay PASS) instead of a FAIL finding.
+  // O8 seeded pins (S19 adopted policy, 2026-08-24): each pinned case's
+  // flagged seeded-test delta was diffed (baseline blob vs terminal blob)
+  // against the ACTUAL campaign #7/#8 evidence and is PROVABLY ADDITIVE —
+  // every baseline line present and unmodified. The stored
+  // O8_SEEDED_TEST_CHANGED finding therefore legitimately replays as the
+  // informational O8_SEEDED_TEST_EXTENDED and the verdict flips FAIL -> PASS.
+  // A pin with policy 'flip-to-extended' requires the after findings to carry
+  // O8_SEEDED_TEST_EXTENDED with a PASS verdict; policy 'survive' keeps the
+  // old survival contract (stored FAIL with O8_SEEDED_TEST_CHANGED stays FAIL)
+  // for any future non-additive pin.
   o8Seeded: [
-    { caseId: 'W1.L3-ts', oracle: 'O8', finding: 'O8_SEEDED_TEST_CHANGED' },
-    { caseId: 'W2.22-non-main-bfmw', oracle: 'O8', finding: 'O8_SEEDED_TEST_CHANGED' },
-    { caseId: 'W3.01-bfmw-pi-python', oracle: 'O8', finding: 'O8_SEEDED_TEST_CHANGED' },
-    { caseId: 'W3.02-bfmw-pi-ts', oracle: 'O8', finding: 'O8_SEEDED_TEST_CHANGED' },
-    { caseId: 'W3.03-bfmw-hermes-ts', oracle: 'O8', finding: 'O8_SEEDED_TEST_CHANGED' },
+    { caseId: 'W1.L3-ts', oracle: 'O8', policy: 'flip-to-extended', storedFinding: 'O8_SEEDED_TEST_CHANGED', replayedFinding: 'O8_SEEDED_TEST_EXTENDED' },
+    { caseId: 'W2.22-non-main-bfmw', oracle: 'O8', policy: 'flip-to-extended', storedFinding: 'O8_SEEDED_TEST_CHANGED', replayedFinding: 'O8_SEEDED_TEST_EXTENDED' },
+    { caseId: 'W3.01-bfmw-pi-python', oracle: 'O8', policy: 'flip-to-extended', storedFinding: 'O8_SEEDED_TEST_CHANGED', replayedFinding: 'O8_SEEDED_TEST_EXTENDED' },
+    { caseId: 'W3.02-bfmw-pi-ts', oracle: 'O8', policy: 'flip-to-extended', storedFinding: 'O8_SEEDED_TEST_CHANGED', replayedFinding: 'O8_SEEDED_TEST_EXTENDED' },
+    // W3.03-bfmw-hermes-ts: campaign #7 stored a PASS O8 verdict (no seeded
+    // finding in its stdout.json) and campaign #8 stored FAIL on an additive
+    // delta — the 'pass-stays-pass' policy covers both: a stored PASS must
+    // stay PASS, and a stored FAIL + O8_SEEDED_TEST_CHANGED must replay PASS
+    // with the informational O8_SEEDED_TEST_EXTENDED (S19 flip shape).
+    { caseId: 'W3.03-bfmw-hermes-ts', oracle: 'O8', policy: 'pass-stays-pass', storedFinding: 'O8_SEEDED_TEST_CHANGED', replayedFinding: 'O8_SEEDED_TEST_EXTENDED' },
   ],
 };
 
@@ -442,15 +488,37 @@ const S13_FOREIGN_ROW_FINDINGS = new Set(['O9_LEDGER_TREE_UNRESOLVED']);
 const S13_FOREIGN_ROW_CASES = new Set(['W1.REPLAY-ts']);
 const S13_NOT_EVALUABLE_ORACLES = new Set(['O2', 'O9', 'O10']);
 
-export function isScopedDisappearing({ caseId, oracle, findingId }) {
+// afterFindingIds carries the REPLAYED findings of the same pair, so the S19
+// class can verify that a vanished O8_SEEDED_TEST_CHANGED was replaced by the
+// informational O8_SEEDED_TEST_EXTENDED on that exact pair (the FAIL->PASS
+// flip is only legal when the seeded delta is provably additive).
+export function isScopedDisappearing({ caseId, oracle, findingId, afterFindingIds = [] }) {
   if (findingId.startsWith('O1_DURATION_FLOOR_')) return true; // S5
   if (S6_LOOP_FINDINGS.has(findingId)) return true; // S6
   if (S7_BOUNDARY_FINDINGS.has(findingId)) return S7_BOUNDARY_CASES.has(caseId); // S7
+  // S21 (2026-08-24, S21 ledger scoping calibration): O9_LEDGER_TREE_UNRESOLVED
+  // was a false positive when the ledger bundle included rows from PRIOR
+  // campaign attempts; the fixed oracle keeps only current-attempt rows, so
+  // stored findings may vanish on O9 replays (the FAIL->PASS flip is the S21
+  // class). S13's W1.REPLAY-ts pin remains for its narrower foreign-row case.
+  if (findingId === 'O9_LEDGER_TREE_UNRESOLVED') return oracle === 'O9'; // S21
   if (S13_FOREIGN_ROW_FINDINGS.has(findingId)) return S13_FOREIGN_ROW_CASES.has(caseId); // S13
   // ORACLE_RUNTIME_ERROR is the stored shape of the null-gate_key degradation
   // on O2/O9/O10 (campaign #7 W2.22/W3.0x merge cases): the S13 fix replaces
   // it with a NOT_EVALUABLE result, so it may vanish only on those oracles.
   if (findingId === 'ORACLE_RUNTIME_ERROR') return S13_NOT_EVALUABLE_ORACLES.has(oracle);
+  // S20 (2026-08-24, S20 reflog parser calibration): O2_REF_TRANSITION_COUNT
+  // was a false positive on landing cases (the pre-S20 parser counted 0
+  // transitions from message-less reflog lines); the fixed parser recovers
+  // raw-only transitions, so the stored finding may vanish on O2 replays.
+  if (findingId === 'O2_REF_TRANSITION_COUNT') return oracle === 'O2'; // S20
+  // S19 (2026-08-24, adopted triage decision): O8_SEEDED_TEST_CHANGED may
+  // disappear from the replayed findings when the replay's findings carry the
+  // informational O8_SEEDED_TEST_EXTENDED on the same case/attempt/oracle —
+  // the seeded-test delta was provably additive, so the FAIL->PASS flip is an
+  // allowed transition class. Without O8_SEEDED_TEST_EXTENDED present, the
+  // stored seeded finding stays an honest verdict and must survive.
+  if (findingId === 'O8_SEEDED_TEST_CHANGED') return oracle === 'O8' && afterFindingIds.includes('O8_SEEDED_TEST_EXTENDED');
   return false;
 }
 
@@ -502,7 +570,7 @@ export function verifyReplayInvariants({ rows, campaignDir = null, campaignCaseI
     const local = [];
     for (const row of rows) {
       for (const findingId of row.beforeFindingIds ?? []) {
-        if (!isScopedDisappearing({ caseId: row.caseId, oracle: row.oracle, findingId })
+        if (!isScopedDisappearing({ caseId: row.caseId, oracle: row.oracle, findingId, afterFindingIds: row.findingIds ?? [] })
             && !(row.findingIds ?? []).includes(findingId)) {
           local.push(`${row.caseId}/${row.attempt}/${row.oracle}: honest finding ${findingId} vanished (${row.before} -> ${row.after})`);
         }
@@ -513,8 +581,11 @@ export function verifyReplayInvariants({ rows, campaignDir = null, campaignCaseI
   }
 
   // I2 — transition classes: the only allowed flips are FAIL->PASS where
-  // every before finding is scoped (S5/S6/S7/S13), and ERROR->NOT_EVALUABLE
-  // on O2/O9/O10 (S13 degraded-evidence vocabulary).
+  // every before finding is scoped (S5/S6/S7/S13/S19/S20/S21), PASS->FAIL
+  // where every AFTER finding is an O1_DURATION_FLOOR_* artifact (S23 — the
+  // SFX-B un-deadened guard fires the wave-1 floor findings the dead guard
+  // stored as PASS), and ERROR->NOT_EVALUABLE on O2/O9/O10 (S13
+  // degraded-evidence vocabulary).
   {
     const label = 'flip-transition-classes';
     const local = [];
@@ -526,17 +597,28 @@ export function verifyReplayInvariants({ rows, campaignDir = null, campaignCaseI
         if (beforeIds.length === 0) {
           local.push(`${key}: FAIL -> PASS flip with no recorded before findings (unexplained verdict change)`);
         } else {
-          const unScoped = beforeIds.filter((findingId) => !isScopedDisappearing({ caseId: row.caseId, oracle: row.oracle, findingId }));
+          const unScoped = beforeIds.filter((findingId) => !isScopedDisappearing({ caseId: row.caseId, oracle: row.oracle, findingId, afterFindingIds: row.findingIds ?? [] }));
           if (unScoped.length > 0) {
             local.push(`${key}: FAIL -> PASS flip dropped non-scoped finding(s) ${unScoped.join(', ')}`);
           }
+        }
+      } else if (row.before === 'PASS' && row.after === 'FAIL') {
+        // S23 (2026-08-24, SFX-B un-deadened guard): the stored verdict was
+        // captured with the dead duration-floor guard; the current O1 fires
+        // O1_DURATION_FLOOR_* findings on the honest wave-1 runs under the
+        // spec-era 120s floor. The flip is legal ONLY when every replayed
+        // finding is an O1_DURATION_FLOOR_* artifact — any other finding
+        // appearing on a stored PASS is an honest regression.
+        const afterIds = row.findingIds ?? [];
+        if (afterIds.length === 0 || !afterIds.every((findingId) => findingId.startsWith('O1_DURATION_FLOOR_'))) {
+          local.push(`${key}: PASS -> FAIL flip introduced non-floor finding(s) ${afterIds.join(', ') || '(none)'} (S23 class is O1_DURATION_FLOOR_* only)`);
         }
       } else if (row.before === 'ERROR' && row.after === 'NOT_EVALUABLE') {
         if (!S13_NOT_EVALUABLE_ORACLES.has(row.oracle)) {
           local.push(`${key}: ERROR -> NOT_EVALUABLE flip on ${row.oracle} (S13 vocabulary is scoped to O2/O9/O10)`);
         }
       } else {
-        local.push(`${key}: unclassified flip ${row.before} -> ${row.after} (outside the S5/S6/S7/S13 classes)`);
+        local.push(`${key}: unclassified flip ${row.before} -> ${row.after} (outside the S5/S6/S7/S13/S19/S20/S21/S23 classes)`);
       }
     }
     violations.push(...local);
@@ -544,7 +626,14 @@ export function verifyReplayInvariants({ rows, campaignDir = null, campaignCaseI
   }
 
   // I3 — named CNEV pins: O1_TERMINAL_EVENT_MISSING survives on the story's
-  // example cases with a FAIL verdict before and after.
+  // example cases with a FAIL verdict before and after. Shape-aware (2026-08-24,
+  // US-005): the pins were written against campaign #7's stored FAIL +
+  // O1_TERMINAL_EVENT_MISSING shape; campaign #8 stored PASS (no finding) on
+  // W1.L2-python / W1.L3-python / W1.L3-ts O1 because the SFX-B un-deadened
+  // guard and S23 wave reporting changed what O1 fires. A stored PASS shape
+  // (no O1_TERMINAL_EVENT_MISSING to preserve) must stay PASS or flip only
+  // via the scoped classes (S23 O1_DURATION_FLOOR_* appearing); a stored FAIL
+  // + O1_TERMINAL_EVENT_MISSING shape must survive unchanged.
   {
     const label = 'cnev-pins';
     const local = [];
@@ -560,8 +649,22 @@ export function verifyReplayInvariants({ rows, campaignDir = null, campaignCaseI
         continue;
       }
       for (const row of matches) {
-        if (row.before !== 'FAIL' || row.after !== 'FAIL'
-            || !(row.beforeFindingIds ?? []).includes(pin.finding)
+        const storedShape = (row.beforeFindingIds ?? []).includes(pin.finding);
+        if (row.before === 'PASS') {
+          // Stored PASS shape (campaign #8): no O1_TERMINAL_EVENT_MISSING to
+          // preserve. The replayed verdict must stay PASS, or flip to FAIL
+          // only via the S23 floor-artifact class (the SFX-B guard
+          // un-deadening firing O1_DURATION_FLOOR_* findings); any other
+          // PASS -> FAIL is an honest verdict change the I1/I2 checks catch.
+          if (row.after === 'FAIL') {
+            const afterIds = row.findingIds ?? [];
+            if (afterIds.length === 0 || !afterIds.every((findingId) => findingId.startsWith('O1_DURATION_FLOOR_'))) {
+              local.push(`${row.caseId}/${row.attempt}/${row.oracle}: CNEV pin violated (stored PASS flipped to ${row.after} [${afterIds.join(',')}] outside the S23 floor-artifact class)`);
+            }
+          }
+          continue;
+        }
+        if (row.before !== 'FAIL' || !storedShape || row.after !== 'FAIL'
             || !(row.findingIds ?? []).includes(pin.finding)) {
           local.push(`${row.caseId}/${row.attempt}/${row.oracle}: CNEV pin violated (before ${row.before} [${(row.beforeFindingIds ?? []).join(',')}] -> after ${row.after} [${(row.findingIds ?? []).join(',')}])`);
         }
@@ -571,8 +674,19 @@ export function verifyReplayInvariants({ rows, campaignDir = null, campaignCaseI
     checks.push({ label, ok: local.length === 0, violations: local, skipped });
   }
 
-  // I4 — named O8 seeded pins: the story's O8_SEEDED_TEST_CHANGED cases keep
-  // their stored verdict; FAIL cases keep the finding before and after.
+  // I4 — named O8 seeded pins (S19 adopted policy, 2026-08-24). Two pin
+  // policies:
+  //   - 'flip-to-extended': the stored FAIL + O8_SEEDED_TEST_CHANGED finding
+  //     must replay as PASS + O8_SEEDED_TEST_EXTENDED (the seeded delta is
+  //     provably additive). Any other shape — stored verdict not FAIL, stored
+  //     finding missing, replay not PASS, replayed finding missing — is a
+  //     violation.
+  //   - 'pass-stays-pass' (W3.03-bfmw-hermes-ts): the replayed verdict must be
+  //     PASS. A stored PASS stays PASS; a stored FAIL with the seeded finding
+  //     flips to PASS only when O8_SEEDED_TEST_EXTENDED is present (S19).
+  //   - 'survive' (legacy default, kept for future non-additive pins): verdict
+  //     preserved; FAIL cases keep the O8_SEEDED_TEST_CHANGED finding before
+  //     and after.
   {
     const label = 'o8-seeded-pins';
     const local = [];
@@ -588,10 +702,27 @@ export function verifyReplayInvariants({ rows, campaignDir = null, campaignCaseI
         continue;
       }
       for (const row of matches) {
-        if (row.before !== row.after) {
+        const policy = pin.policy ?? 'survive';
+        const storedFinding = pin.storedFinding ?? pin.finding;
+        const replayedFinding = pin.replayedFinding ?? null;
+        if (policy === 'flip-to-extended' || policy === 'pass-stays-pass') {
+          // S19: the replayed verdict must be PASS with the informational
+          // O8_SEEDED_TEST_EXTENDED present. A stored PASS stays PASS only
+          // under 'pass-stays-pass' (W3.03 campaign #7 stored PASS).
+          if (row.before === 'PASS' && policy === 'pass-stays-pass') {
+            if (row.after !== 'PASS') {
+              local.push(`${row.caseId}/${row.attempt}/${row.oracle}: O8 seeded pin violated (stored PASS flipped to ${row.after})`);
+            }
+            continue;
+          }
+          if (row.before !== 'FAIL' || !(row.beforeFindingIds ?? []).includes(storedFinding)
+              || row.after !== 'PASS' || replayedFinding === null || !(row.findingIds ?? []).includes(replayedFinding)) {
+            local.push(`${row.caseId}/${row.attempt}/${row.oracle}: O8 seeded pin violated (stored ${row.before} [${(row.beforeFindingIds ?? []).join(',')}] must replay PASS with ${replayedFinding ?? storedFinding}, got ${row.after} [${(row.findingIds ?? []).join(',')}])`);
+          }
+        } else if (row.before !== row.after) {
           local.push(`${row.caseId}/${row.attempt}/${row.oracle}: O8 seeded pin violated (stored ${row.before} flipped to ${row.after})`);
-        } else if (row.before === 'FAIL' && (!(row.beforeFindingIds ?? []).includes(pin.finding)
-            || !(row.findingIds ?? []).includes(pin.finding))) {
+        } else if (row.before === 'FAIL' && (!(row.beforeFindingIds ?? []).includes(storedFinding)
+            || !(row.findingIds ?? []).includes(storedFinding))) {
           local.push(`${row.caseId}/${row.attempt}/${row.oracle}: O8 seeded pin violated (O8_SEEDED_TEST_CHANGED missing from ${row.before} findings)`);
         }
       }
@@ -602,11 +733,17 @@ export function verifyReplayInvariants({ rows, campaignDir = null, campaignCaseI
 
   // I5 — RUNAWAY backing: every RUNAWAY case in the campaign report must keep
   // at least one FAIL verdict after the replay, so the RUNAWAY kind-finding
-  // stays visible instead of being masked by an all-PASS flip.
+  // stays visible instead of being masked by an all-PASS flip. A RUNAWAY case
+  // with NO replay rows at all (2026-08-24, US-005 — W3.19-pause-drain died
+  // with TEST_INFRA_FAIL probe-action-failed before any oracle evidence was
+  // captured) has nothing to mask: the RUNAWAY finding lives in the campaign
+  // report and is untouched by the replay, so it is noted as skipped rather
+  // than flagged.
   const runaway = readRunawayCases(campaignDir);
   {
     const label = 'runaway-backing';
     const local = [];
+    const skipped = [];
     if (runaway.present === false) {
       checks.push({ label, ok: true, violations: [], skipped: 'no campaign report.json (RUNAWAY check not applicable)' });
     } else if (runaway.unparsable === true) {
@@ -615,13 +752,18 @@ export function verifyReplayInvariants({ rows, campaignDir = null, campaignCaseI
       checks.push({ label, ok: false, violations: local });
     } else {
       for (const caseId of runaway.cases) {
-        const backing = rows.filter((row) => row.caseId === caseId && row.after === 'FAIL');
+        const caseRows = rows.filter((row) => row.caseId === caseId);
+        if (caseRows.length === 0) {
+          skipped.push(`${caseId}: RUNAWAY case has no replay rows (no oracle evidence captured — nothing to mask)`);
+          continue;
+        }
+        const backing = caseRows.filter((row) => row.after === 'FAIL');
         if (backing.length === 0) {
           local.push(`${caseId}: RUNAWAY case lost every FAIL verdict in the replay (RUNAWAY visibility would be masked)`);
         }
       }
       violations.push(...local);
-      checks.push({ label, ok: local.length === 0, violations: local, runawayCases: runaway.cases });
+      checks.push({ label, ok: local.length === 0, violations: local, skipped, runawayCases: runaway.cases });
     }
   }
 
@@ -634,7 +776,9 @@ export function renderInvariantReport(verification) {
     if (check.skipped === undefined) return '';
     if (typeof check.skipped === 'string') return ` (${check.skipped})`;
     if (check.skipped.length === 0) return '';
-    return ` (${check.skipped.length} pin(s) skipped: not part of this campaign)`;
+    const allPins = check.skipped.every((entry) => entry.includes('pin skipped'));
+    if (allPins) return ` (${check.skipped.length} pin(s) skipped: not part of this campaign)`;
+    return ` (${check.skipped.length} skipped: ${check.skipped.join('; ')})`;
   };
   const lines = ['invariant report (--verify-invariants, E3.B US-011):'];
   for (const check of verification.checks) {

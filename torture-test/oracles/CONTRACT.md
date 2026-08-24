@@ -447,6 +447,24 @@ terminal bytes must have the same SHA-256. Test marker counts may not increase.
 A seeded test may be deleted or changed only when the immutable manifest workflow ID is
 a `test-quarantine` workflow; mutable run context or agent output cannot declare that
 exception. The exception does not waive the new-marker or transport-artifact checks.
+
+A seeded-test CONTENT delta is further split by a line-level diff against the baseline
+blob recovered from the isolated Git snapshot (walking `git rev-list --all`, newest
+first, for the first `<commit>:<path>` whose blob SHA-256 equals the baseline inventory
+entry). When every baseline line is present unmodified in the terminal content as an
+ordered subsequence — pure insertions of any kind (import lines AND new test bodies)
+tolerated; any deletion, modification, or reordering is NOT additive — O8 records the
+informational, NON-FAILING `O8_SEEDED_TEST_EXTENDED` finding with the diff stats
+(`baseline_lines`, `terminal_lines`, `lines_added`, `lines_deleted: 0`,
+`lines_modified: 0`, `additive: true`) and the oracle result stays `PASS`. Any other
+delta keeps the hard-FAIL `O8_SEEDED_TEST_CHANGED` exactly as before: a deleted or
+renamed path, a type/mode change, deleted or modified lines, marker introduction (the
+separate hard-FAIL `O8_TEST_MARKER_INTRODUCED` leg is unchanged), and
+fix-consequence assertion rewrites. A content delta whose baseline blob cannot be
+recovered from the snapshot fails closed: `O8_SEEDED_TEST_CHANGED` is emitted. The
+diff stats for every content-diffed seeded test are recorded in the
+`o8-boundary-audit.json` evidence under `seeded_test_diffs` (`schema_version` stays 1).
+
 Progress/report/transport filenames are rejected across the complete terminal tree,
 including `progress*`, `report*`, `transport*`, Tamandua report/reason/story transports,
 and story input/output transport files.
@@ -882,8 +900,13 @@ Required field rules:
 - `started_at` and `finished_at` are canonical UTC ISO-8601 timestamps;
   `finished_at` must not precede `started_at`.
 - `findings` is an array. Every finding has nonempty string fields `id` and
-  `summary`. `PASS` and `NOT_EVALUABLE` have no findings; `FAIL` has at least one. Additional
-  mechanical fields such as `severity`, `expected`, and `observed` are allowed.
+  `summary`. `NOT_EVALUABLE` has no findings; `FAIL` has at least one. A `PASS`
+  result has no findings unless every finding is informational — stamped
+  `non_failing: true` (the `FindingCollector.addInfo` path). Informational
+  findings are recorded diagnostics (e.g. diff stats) that never flip the
+  oracle result; a `PASS` carrying any failing (unmarked) finding is a contract
+  violation. Additional mechanical fields such as `severity`, `expected`,
+  `observed`, and `non_failing` are allowed.
 - `evidence` is an array of objects with a nonempty `kind` and a relative `path`.
   Each path is resolved beneath `TT_ORACLE_EVIDENCE_DIR` and must name an existing
   regular non-symlink file. Hooks create evidence with exclusive-create semantics

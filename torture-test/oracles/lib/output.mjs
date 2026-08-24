@@ -44,7 +44,15 @@ export function validateOracleResponse(response, oracleId, exitCode, evidenceDir
       if (!isObject(finding) || typeof finding.id !== 'string' || finding.id.length === 0
           || typeof finding.summary !== 'string' || finding.summary.length === 0) errors.push(`findings[${index}] must contain nonempty id and summary strings`);
     });
-    if (response.result === 'PASS' && response.findings.length !== 0) errors.push('PASS must not contain findings');
+    // Adopted S19 policy (2026-08-24): a PASS result may carry findings ONLY
+    // when every finding is informational — stamped non_failing: true (see
+    // FindingCollector.addInfo). Such findings are recorded diagnostics (e.g.
+    // diff stats) and never flip the oracle result. A PASS with any failing
+    // (unmarked) finding stays a contract violation.
+    if (response.result === 'PASS' && response.findings.length !== 0
+        && !response.findings.every((finding) => finding.non_failing === true)) {
+      errors.push('PASS must not contain failing findings; PASS findings must be informational with non_failing: true');
+    }
     if (response.result === 'NOT_EVALUABLE' && response.findings.length !== 0) errors.push('NOT_EVALUABLE must not contain findings');
     if (response.result === 'FAIL' && response.findings.length === 0) errors.push('FAIL must contain a finding');
   }

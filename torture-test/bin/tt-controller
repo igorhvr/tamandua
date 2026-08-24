@@ -2177,7 +2177,14 @@ function validateOracleResponse(response, oracleId, exitCode, evidenceDir) {
         errors.push(`findings[${index}] must contain nonempty id and summary strings`);
       }
     });
-    if (response.result === 'PASS' && response.findings.length !== 0) errors.push('PASS must not contain findings');
+    // Adopted S19 policy (2026-08-24): same relaxed PASS-findings rule as
+    // oracles/lib/output.mjs — PASS may carry findings only when every finding
+    // is informational (non_failing: true); any failing (unmarked) finding on
+    // PASS keeps the hard contract error.
+    if (response.result === 'PASS' && response.findings.length !== 0
+        && !response.findings.every((finding) => finding.non_failing === true)) {
+      errors.push('PASS must not contain failing findings; PASS findings must be informational with non_failing: true');
+    }
     if (response.result === 'FAIL' && response.findings.length === 0) errors.push('FAIL must contain a finding');
   }
   if (!Array.isArray(response.evidence)) {
