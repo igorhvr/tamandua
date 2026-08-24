@@ -56,6 +56,26 @@
 #     getent-less home, so the production guard and the PATH reorder stay
 #     correct on Darwin.
 #
+# MACP5 US-001 (real-Darwin W2 run): the plain-background fallback start
+# recorded a DEAD WRAPPER pid in provenance — on Darwin the nohup/background
+# chain double-forks, so the state-dir tamandua.pid can name a wrapper that
+# exits while the real daemon lives ("pid alive: false ... STATUS: UNKNOWN"
+# -> scenario abort; the fail-closed status verifier was CORRECT). Fixes:
+#   - cmd_start accepts a tamandua.pid candidate ONLY after the triple gate
+#     verify_launched_daemon_pid: (a) kill -0 alive, (b) tt-process-identity
+#     --get returns a non-empty start identity, (c) verify_process_tt_owned
+#     passes. An unverified candidate (wrapper/zombie/stale) is a failed
+#     launch attempt — retried within the bounded deadline, failing CLOSED
+#     (exit non-zero, no provenance) when the deadline expires unverified.
+#   - write_provenance refuses an empty startTime identity (exit non-zero,
+#     no provenance written) instead of the old WARNING-and-continue.
+#   - cmd_status is portable for /proc-less hosts: liveness via kill -0
+#     alone (the linux-only `[ -d /proc/<pid> ]` requirement dropped), and
+#     cmdline verification via the portable ps arm on Darwin
+#     (`ps -p <pid> -o command=`) behind the TT_DC_PLATFORM seam, with the
+#     /proc read retained on linux. RUNNING still requires alive AND cmdline
+#     containing 'tamandua' AND a listening port; unverifiable -> UNKNOWN.
+#
 # T2.1 US-009: scope unit names are PER-WORKTREE (tamandua-tt-<kind>-<hash>
 # derived from the repo root), never the old fixed per-user name — a
 # concurrent campaign in another worktree must not be able to stop or
@@ -641,6 +661,8 @@ wait_for_port() {
 
 # verify_cgroup: check whether PID $1 lives under the expected systemd scope
 # unit name $2. Returns 0 if verified, 1 otherwise.
+# linux-only /proc read (MACP5 US-001): cgroup evidence exists only on
+# systemd hosts (linux) — the fallback path (Darwin) never calls this.
 verify_cgroup() {
   local pid="$1"
   local scope_unit="$2"
@@ -728,6 +750,49 @@ verify_process_tt_owned() {
   return 0
 }
 
+# verify_launched_daemon_pid: full identity+ownership gate for a pid read
+# from the state-dir tamandua.pid — the daemon's OWN pidfile, the authority
+# for BOTH the systemd and the plain-background fallback launch paths. A
+# candidate is accepted ONLY after ALL of:
+#   (a) kill -0 — the pid is alive (portable; no /proc dependency);
+#   (b) `node tt-process-identity.mjs --get <pid>` returns a non-empty
+#       process-start identity ('proc:<n>' on linux, 'darwin:<lstart>' on
+#       /proc-less hosts — MACP4 US-002);
+#   (c) verify_process_tt_owned <pid> <state_dir> — the pid is PROVEN
+#       TT-owned (cwd under TT_REPO_ROOT + cmdline containing tamandua).
+#
+# MACP5 US-001: on Darwin the nohup/background chain double-forks, so the
+# pidfile can name a WRAPPER pid (or a stale/zombie pid) that exits while
+# the real daemon lives — the OLD acceptance (kill -0 alone) recorded that
+# dead wrapper in provenance and the status verifier correctly reported
+# "pid alive: false ... STATUS: UNKNOWN". An unverified candidate is
+# therefore REFUSED (treated as a failed launch attempt, retried within the
+# bounded deadline) — provenance must carry the REAL daemon pid, and it is
+# never recorded unverified.
+#
+# $1 = pid, $2 = state dir (the kind's TAMANDUA_STATE_DIR).
+# Returns 0 only when ALL THREE gates pass; 1 otherwise.
+verify_launched_daemon_pid() {
+  local pid="$1"
+  local state_dir="$2"
+
+  # (a) alive — portable liveness probe (works on /proc-less hosts).
+  if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+    return 1
+  fi
+  # (b) identity readable — the E3.C.1/MACP4 identity tool.
+  local ident
+  ident="$(node "$IDENTITY_TOOL" --get "$pid" 2>/dev/null || true)"
+  if [ -z "$ident" ]; then
+    return 1
+  fi
+  # (c) TT-owned (fail-closed: ownership must be PROVEN, never assumed).
+  if ! verify_process_tt_owned "$pid" "$state_dir"; then
+    return 1
+  fi
+  return 0
+}
+
 # verify_recorded_identity: ABA-safe process-start identity check for the
 # RECORDED daemon pid BEFORE any signal (E3.C.1 US-004). $1 = pid,
 # $2 = recorded startTime identity ('proc:<n>' from provenance).
@@ -806,6 +871,17 @@ write_provenance() {
   local cwd="$9"
   local start_time="${10}"  # 'proc:<n>' process-start identity (US-004)
   local prov_file="$PROV_DIR/$name.json"
+
+  # MACP5 US-001: provenance MUST carry the daemon's process-start identity
+  # (E3.C.1 US-004 / MACP4 US-002). An empty startTime means the pid was
+  # never identity-verified — recording it would let a stale/reused pid be
+  # signalled later or reported RUNNING on weak evidence. FAIL CLOSED: exit
+  # non-zero with NO provenance written (the caller's start is refused; the
+  # next cmd_start retry starts from a clean slate).
+  if [ -z "$start_time" ]; then
+    echo "daemon-control: FATAL — refusing to write provenance with an empty startTime identity for PID $pid; no provenance written (fail closed)" >&2
+    exit 1
+  fi
 
   # Convert space-separated ports to a JSON array. The input MUST end with a
   # newline: `while read` treats a final line WITHOUT a trailing newline as
@@ -1019,14 +1095,36 @@ cmd_start() {
   if [ -f "$daemon_pid_file" ]; then
     local running_pid
     running_pid="$(cat "$daemon_pid_file" 2>/dev/null || true)"
-    if [ -n "$running_pid" ] && kill -0 "$running_pid" 2>/dev/null \
-       && is_port_listening "$ctrl_port" \
-       && verify_process_tt_owned "$running_pid" "$state_dir"; then
+    # MACP5 US-001: the reuse detection uses the SAME triple gate as the
+    # pid-wait acceptance (alive + identity + TT-owned) — a wrapper/stale
+    # pidfile candidate is never treated as a running daemon of ours.
+    if [ -n "$running_pid" ] && verify_launched_daemon_pid "$running_pid" "$state_dir" \
+       && is_port_listening "$ctrl_port"; then
       reuse_running_daemon=true
-      echo "daemon-control: reusing already-running $kind daemon (PID $running_pid, control port $ctrl_port listening)" >&2
+      echo "daemon-control: reusing already-running $kind daemon (PID $running_pid, identity-verified, control port $ctrl_port listening)" >&2
     fi
   fi
   while [ "$(date +%s)" -lt "$port_wait_deadline" ] && [ -z "$daemon_pid" ]; do
+    # MACP5 US-001: re-check the pidfile for an identity-verified pid at the
+    # TOP of every iteration. On the plain-background fallback path a failed
+    # launch attempt tears down NO scope, so a PREVIOUS attempt's real daemon
+    # can be up and its (rewritten) pidfile carries the REAL pid — accept it
+    # as our daemon instead of failing on the busy ports it holds. Only a
+    # fully-launched daemon qualifies (dashboard port listening — the launch
+    # script binds all three); a control-port-only CLI-auto-start is handled
+    # by reuse_running_daemon below, which re-runs the launch to bind the
+    # dashboard/MCP ports.
+    if [ -f "$daemon_pid_file" ]; then
+      local verified_pid
+      verified_pid="$(cat "$daemon_pid_file" 2>/dev/null || true)"
+      if [ -n "$verified_pid" ] \
+         && verify_launched_daemon_pid "$verified_pid" "$state_dir" \
+         && is_port_listening "$dash_port"; then
+        daemon_pid="$verified_pid"
+        echo "daemon-control: daemon PID $daemon_pid (identity-verified via state-dir tamandua.pid)" >&2
+        break
+      fi
+    fi
     still_busy=""
     for port in $dash_port $mcp_port $ctrl_port; do
       if [ -n "$port" ] && is_port_listening "$port"; then still_busy="$still_busy $port"; fi
@@ -1085,16 +1183,25 @@ cmd_start() {
     done
     if [ -f "$daemon_pid_file" ]; then
       local candidate_pid; candidate_pid="$(cat "$daemon_pid_file" 2>/dev/null || true)"
-      if [ -n "$candidate_pid" ] && kill -0 "$candidate_pid" 2>/dev/null; then
+      # MACP5 US-001: the candidate is accepted ONLY after the full
+      # identity+ownership gate (verify_launched_daemon_pid) — on Darwin the
+      # nohup/background chain can leave a WRAPPER pid in the pidfile that
+      # dies while the real daemon lives; a wrapper/zombie/stale candidate
+      # is REFUSED (never recorded in provenance) and the launch attempt is
+      # retried within the bounded deadline.
+      if [ -n "$candidate_pid" ] && verify_launched_daemon_pid "$candidate_pid" "$state_dir"; then
         daemon_pid="$candidate_pid"
-        echo "daemon-control: daemon PID $daemon_pid" >&2
+        echo "daemon-control: daemon PID $daemon_pid (identity-verified)" >&2
         break
       fi
+      echo "daemon-control: pidfile candidate '$candidate_pid' is not an identity-verified TT-owned daemon — treating the launch attempt as failed" >&2
     fi
     # Launch attempt failed (a foreign daemon won a shared port in the instant
     # between the settle-recheck and our bind — EADDRINUSE — or the daemon
-    # crashed): tear down the scope and RETRY within the bounded wait.
-    echo "daemon-control: launch attempt collided (foreign port contention or daemon crash) — retrying within the bounded wait" >&2
+    # crashed, or the pidfile candidate was never identity-verified — the
+    # Darwin wrapper-pid case): tear down the scope and RETRY within the
+    # bounded wait.
+    echo "daemon-control: launch attempt collided (foreign port contention, daemon crash, or unverifiable pid) — retrying within the bounded wait" >&2
     if $use_systemd; then
       systemctl --user stop "${scope_unit%.scope}.scope" 2>/dev/null || true
       systemctl --user reset-failed "${scope_unit%.scope}.scope" 2>/dev/null || true
@@ -1106,7 +1213,7 @@ cmd_start() {
     if [ -n "$still_busy" ]; then
       echo "daemon-control: ERROR — $kind ports$still_busy are still in use after ${port_wait_seconds}s (a concurrent worktree daemon or a stuck listener); refusing to launch into a busy port" >&2
     else
-      echo "daemon-control: ERROR — $kind daemon did not start within ${port_wait_seconds}s (launch attempts collided or the daemon crashed)" >&2
+      echo "daemon-control: ERROR — $kind daemon did not start within ${port_wait_seconds}s: no identity-verified daemon pid appeared (launch attempts collided, the daemon crashed, or every pidfile candidate was an unverifiable wrapper); failing closed with no provenance written" >&2
     fi
     exit 1
   fi
@@ -1119,8 +1226,16 @@ cmd_start() {
   # is refused instead of signalled.
   local daemon_start_time
   daemon_start_time="$(node "$IDENTITY_TOOL" --get "$daemon_pid" 2>/dev/null || true)"
+  # MACP5 US-001: write_provenance must NEVER record an empty startTime
+  # identity — an identity-less record would let a stale/reused pid pass the
+  # stop/escalation corridors unchecked or report RUNNING on weak evidence.
+  # The pid passed verify_launched_daemon_pid above (identity was readable
+  # at acceptance), so an empty read here means the daemon died mid-launch:
+  # FAIL CLOSED (exit non-zero, no provenance written) instead of the old
+  # WARNING-and-continue.
   if [ -z "$daemon_start_time" ]; then
-    echo "daemon-control: WARNING — could not read startTime identity for daemon PID $daemon_pid; stop/restart will REFUSE to signal it" >&2
+    echo "daemon-control: FATAL — cannot read startTime identity for daemon PID $daemon_pid; refusing to write provenance without an identity (fail closed). The daemon may have died mid-launch." >&2
+    exit 1
   fi
 
   # Verify cgroup membership when systemd was used
@@ -1225,6 +1340,9 @@ stop_cli_auto_daemon() {
   # and the check degrades to "cannot read -> no refusal on this basis" —
   # exactly the linux behavior when /proc environ is unreadable (EACCES);
   # the TT-owned + identity gates above/below still hold.)
+  # linux-only /proc read (MACP5 US-001): the environ exists only under
+  # procfs — on /proc-less hosts the read degrades to empty (documented
+  # above); the identity + TT-owned gates remain the load-bearing checks.
   local cli_env_state_dir
   cli_env_state_dir="$(tr '\0' '\n' < "/proc/$lingering_pid/environ" 2>/dev/null | sed -n 's/^TAMANDUA_STATE_DIR=//p' | head -1 || true)"
   if [ -n "$cli_env_state_dir" ] && [ "$cli_env_state_dir" != "$state_dir" ]; then
@@ -1458,9 +1576,12 @@ cmd_stop() {
   for port in $prov_ports; do
     if [ -n "$port" ] && is_port_listening "$port"; then
       local lingering_pid
-      lingering_pid=$(ss -tlnp 2>/dev/null | grep ":$port " | grep -oP 'pid=\K[0-9]+' | head -1 || true)
+      # PORTABLE pid extraction (MACP5 US-004): GNU grep's perl-regex `-P`
+      # (and `\K` / `\d`) is a GNU-ism — BSD grep has no -P. grep -Eo +
+      # sed prefix-strip preserves the exact first-pid semantics on both.
+      lingering_pid=$(ss -tlnp 2>/dev/null | grep ":$port " | grep -Eo 'pid=[0-9]+' | head -1 | sed 's/^pid=//' || true)
       if [ -z "$lingering_pid" ]; then
-        lingering_pid=$(netstat -tlnp 2>/dev/null | grep ":$port " | awk '{print $NF}' | grep -oP '\d+' | head -1 || true)
+        lingering_pid=$(netstat -tlnp 2>/dev/null | grep ":$port " | awk '{print $NF}' | grep -Eo '[0-9]+' | head -1 || true)
       fi
       if [ -n "$lingering_pid" ]; then
         if [ "$lingering_pid" = "$prov_pid" ] && [ -n "$prov_start_time" ]; then
@@ -1646,10 +1767,14 @@ cmd_status() {
     fi
   done
 
-  # ── Process liveness (kill -0 + /proc) ──────────────────────────
+  # ── Process liveness (kill -0 — portable, no /proc dependency) ────
+  # MACP5 US-001: the linux-only `[ -d /proc/<pid> ]` requirement is
+  # DROPPED — kill -0 is the portable liveness probe and works on
+  # /proc-less hosts (Darwin). Fail-closed semantics unchanged: a pid that
+  # is not alive can never contribute to RUNNING.
   local pid_alive=false
   if [ -n "$prov_pid" ] && [ "$prov_pid" != "null" ] && [ "$prov_pid" -gt 0 ] 2>/dev/null; then
-    if [ -d "/proc/$prov_pid" ] && kill -0 "$prov_pid" 2>/dev/null; then
+    if kill -0 "$prov_pid" 2>/dev/null; then
       pid_alive=true
     fi
   fi
@@ -1668,10 +1793,28 @@ cmd_status() {
   fi
 
   # ── Cmdline verification (must contain tamandua for RUNNING) ────
+  # MACP5 US-001: PORTABLE cmdline evidence behind the TT_DC_PLATFORM seam
+  # (mirroring verify_process_tt_owned): on Darwin (no procfs) the cmdline
+  # comes from `ps -p <pid> -o command=` (BSD + procps portable); on linux
+  # the /proc/<pid>/cmdline read is retained (linux-only — never reached on
+  # /proc-less hosts). RUNNING still requires the cmdline to contain
+  # 'tamandua'; unavailable cmdline evidence -> cmdline_ok=false -> UNKNOWN
+  # (never RUNNING on ports alone — fail-closed unchanged).
   local cmdline_ok=false
   if $pid_alive; then
     local actual_cmdline
-    actual_cmdline=$(tr '\0' ' ' < "/proc/$prov_pid/cmdline" 2>/dev/null || true)
+    local status_platform
+    status_platform="${TT_DC_PLATFORM:-$(uname -s)}"
+    case "$status_platform" in
+      Darwin)
+        actual_cmdline="$(ps -p "$prov_pid" -o command= 2>/dev/null | head -1 || true)"
+        ;;
+      *)
+        # linux-only /proc read (MACP5 US-001): guarded by the platform
+        # branch above — never reached on /proc-less hosts.
+        actual_cmdline=$(tr '\0' ' ' < "/proc/$prov_pid/cmdline" 2>/dev/null || true)
+        ;;
+    esac
     if echo "$actual_cmdline" | grep -q 'tamandua'; then
       cmdline_ok=true
     fi

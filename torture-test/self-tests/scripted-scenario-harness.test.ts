@@ -1,8 +1,9 @@
 // Hermetic scripted-scenario harness tests, incl. the MACP4 US-003
-// Darwin-capability pins. The /proc literals here are linux-only
-// documentation/assertion prose (MACP3 US-004 harness convention) — the
-// Darwin portability proofs are simulated via injectable seams and the
-// portable ps arms; no runtime procfs access in this test.
+// Darwin-capability pins and the MACP5 US-002 portable invocation-UUID
+// pins. The /proc literals here are linux-only documentation/assertion
+// prose (MACP3 US-004 harness convention) — the Darwin portability proofs
+// are simulated via injectable seams and the portable ps arms; no runtime
+// procfs access in this test.
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
@@ -785,5 +786,69 @@ exit 0
       "the fake/scripted homes must never reach daemon-control",
     );
     assertNoResidue(fixture);
+  });
+});
+
+// ── MACP5 US-002 — portable invocation UUID (no /proc uuid read) ────────
+
+describe("MACP5 US-002 — invocation UUID from the single portable source", () => {
+  it("run-scripted-scenario has no /proc uuid literal and calls portable_uuid_suffix() unconditionally (structural)", () => {
+    const source = fs.readFileSync(harness, "utf8");
+    // The linux-only procfs uuid read (MACP3 US-003) is gone everywhere —
+    // including comments: the acceptance criterion is a zero-literal grep.
+    assert.doesNotMatch(source, /\/proc\/sys\/kernel\/random\/uuid/, "the /proc uuid literal must be gone from the harness (comments included)");
+    assert.match(source, /UUID_SUFFIX="\$\(portable_uuid_suffix\)"/, "UUID_SUFFIX must come unconditionally from the single portable source");
+    assert.doesNotMatch(source, /\[ -n "\$UUID_SUFFIX" \]/, "the /proc-then-fallback dance must be gone");
+    // INVOCATION_ID format is unchanged: ${SCENARIO_ID}-<utc ts>-$$-${UUID_SUFFIX}.
+    assert.match(
+      source,
+      /INVOCATION_ID="\$\{SCENARIO_ID\}-\$\(date -u \+%Y%m%dT%H%M%S\)-\$\$-\$\{UUID_SUFFIX\}"/,
+      "the INVOCATION_ID format must be unchanged",
+    );
+    // The guarded /proc/<pid>/stat reads and their MACP3 US-003 markers stay.
+    assert.match(source, /\[ -r "\/proc\/\$pid\/stat" \]/, "the guarded /proc/<pid>/stat reads must remain");
+    assert.match(source, /MACP3 US-003/, "the /proc guards must keep their MACP3 US-003 markers");
+  });
+
+  it("UUID_SUFFIX generation is /proc-free: unique 12-hex suffix and unchanged INVOCATION_ID with no ENOENT (hermetic)", () => {
+    const source = fs.readFileSync(harness, "utf8");
+    const fn = extractShellFunction(source, "portable_uuid_suffix");
+    assert.ok(fn, "the harness must define portable_uuid_suffix()");
+    // Simulate a /proc-less host: shadow the coreutils the old /proc read
+    // chain depended on (tr/cut) with shims that fail loudly. The new path
+    // must never invoke them — the suffix comes from node crypto.randomUUID
+    // (12 hex) with the $$-$(date +%s) shell last resort.
+    const seamDir = fs.mkdtempSync(path.join(os.tmpdir(), "tt-darwin-noproc-"));
+    try {
+      makeShim(seamDir, "tr", 'echo "tr: SIMULATED /proc-less host" >&2\nexit 99');
+      makeShim(seamDir, "cut", 'echo "cut: SIMULATED /proc-less host" >&2\nexit 99');
+      const snippet = [
+        "SCENARIO_ID=pin-test",
+        'UUID_SUFFIX="$(portable_uuid_suffix)"',
+        'INVOCATION_ID="${SCENARIO_ID}-$(date -u +%Y%m%dT%H%M%S)-$$-${UUID_SUFFIX}"',
+        'echo "$UUID_SUFFIX"',
+        'echo "$INVOCATION_ID"',
+      ].join("\n");
+      const env = cleanEnv({ PATH: `${seamDir}:${process.env.PATH ?? ""}` });
+      const a = runExtracted([fn], `NODE_BIN="${process.execPath}"`, snippet, env);
+      const b = runExtracted([fn], `NODE_BIN="${process.execPath}"`, snippet, env);
+      for (const result of [a, b]) {
+        assert.equal(result.status, 0, result.stderr);
+        assert.doesNotMatch(result.stderr, /No such file or directory/, "a /proc-less host must not emit the loud ENOENT");
+        assert.doesNotMatch(result.stderr, /SIMULATED/, "the generation path must not invoke the /proc-era coreutils (tr/cut)");
+        const [suffix, invocation] = result.stdout.trim().split("\n");
+        assert.match(suffix, /^[0-9a-f]{12}$/, `expected a 12-char hex suffix: ${suffix}`);
+        assert.match(
+          invocation,
+          /^pin-test-[0-9]{8}T[0-9]{6}-\d+-[0-9a-f]{12}$/,
+          `INVOCATION_ID format must be unchanged: ${invocation}`,
+        );
+      }
+      const suffixA = a.stdout.trim().split("\n")[0];
+      const suffixB = b.stdout.trim().split("\n")[0];
+      assert.notEqual(suffixA, suffixB, "two suffixes must differ (unique per invocation)");
+    } finally {
+      fs.rmSync(seamDir, { recursive: true, force: true });
+    }
   });
 });

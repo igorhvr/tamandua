@@ -54,6 +54,16 @@
 //                   scenarios/w4.49/run-update-arm.mjs) must be explicitly
 //                   allowlisted with category 't21-owned' — enumerated
 //                   separately in the test so dropping one is a hard fail.
+//   G5 scenarios/lib unguarded reads (MACP5 US-003): every '/proc' literal
+//                   on a NON-COMMENT line in a scenarios/lib/ file must be
+//                   either a guard-test line (`[ -r|-d|-f|-e|-L "/proc...`)
+//                   or within 2 lines below such a guard line. The
+//                   file-granularity allowlist cannot catch an unguarded
+//                   input-redirection/cat/tr read in an otherwise-legitimately
+//                   allowlisted file (the pre-US-002
+//                   '/proc/sys/kernel/random/uuid' read at run-scripted-scenario
+//                   line ~306 slipped through MACP3's sweep and MACP4's audit
+//                   exactly that way), so G5 makes the class mechanical.
 //
 // ── Mutation proofs (each demonstrated in the tests below) ──────────
 //   * New unguarded '/proc' usage in a currently-clean file → G1 violation.
@@ -61,6 +71,9 @@
 //   * Stale allowlist entry (hit removed) → G2 violation.
 //   * Guard marker stripped from a guarded file → G3 violation.
 //   * Removing a T2.1 path from the allowlist → G4 violation.
+//   * Unguarded '/proc' read added to a scenarios/lib/ file → G5 violation
+//     (the pre-US-002 uuid read is the red case; the guarded /proc/<pid>/stat
+//     pattern and comment/prose text are the green pins).
 //
 // Runs via self-tests/run.sh's tier0-*.test.ts glob (no run.sh edit needed).
 // Zero tokens, hermetic, repo-relative scanning only (no live daemon).
@@ -195,7 +208,7 @@ const ALLOWLIST: Record<string, AllowEntry> = {
   "scenarios/lib/run-scripted-scenario": {
     category: "us003-runtime-guarded",
     requiredMarker: "MACP3 US-003",
-    reason: "US-003: every /proc hit (incl. /proc/sys/kernel/random/uuid with its $$-$(date) fallback) documented linux-only with MACP3 US-003 marker; fallback IS the Darwin branch.",
+    reason: "US-003: the remaining /proc hits are the guarded linux-only /proc/<pid>/stat reads (process_starttime/process_group — each preceded by [ -r ] with a portable ps fallback arm) carrying MACP3 US-003 markers; the /proc uuid read was removed in MACP5 US-002 (portable_uuid_suffix() is now the single portable source).",
   },
   "self-tests/tier0-repeatability.test.ts": {
     category: "us003-runtime-guarded",
@@ -344,6 +357,16 @@ const ALLOWLIST: Record<string, AllowEntry> = {
     reason:
       "MACP4 task description doc — its '/proc' occurrence ('/proc-era leftovers' in the audit scope) is prose in the task narrative; the doc performs no runtime procfs access.",
   },
+  "impl-tasks/MACP5-darwin-fallback-pid-and-portability.md": {
+    category: "documentation",
+    reason:
+      "MACP5 task description doc — its '/proc' occurrences (the '/proc uuid' defect narrative, '/proc-era' sweep scope) are prose in the task narrative; the doc performs no runtime procfs access.",
+  },
+  "self-tests/tier0-gnu-portability-lint.test.ts": {
+    category: "documentation",
+    reason:
+      "MACP5 US-005 GNU-ism lint — its '/proc' occurrences are prose in the GNU-ism allowlist reasons (tt-chaos/tt-recorder readlink -f canonicalizes /proc/<pid>/cwd) and the header narrative; the lint performs no runtime procfs access.",
+  },
   "self-tests/tier1-bare-vacuity-red-green.test.ts": {
     category: "documentation",
     reason:
@@ -470,7 +493,68 @@ function auditLiveTree(): string[] {
     const p = path.join(repoRoot, TT_PREFIX, rel);
     if (fs.existsSync(p)) contents[rel] = fs.readFileSync(p, "utf8");
   }
-  return gateAll(ALLOWLIST, contents);
+  return [...gateAll(ALLOWLIST, contents), ...g5UnguardedReadViolations(contents)];
+}
+
+// ── G5: unguarded /proc reads in scenarios/lib/ (MACP5 US-003) ──────
+// The allowlist is FILE granularity by design, so an otherwise-legitimate
+// scenarios/lib/ file can hide ONE unguarded read (the pre-US-002
+// '/proc/sys/kernel/random/uuid' input-redirection read in
+// run-scripted-scenario slipped through both MACP3's sweep and MACP4's audit
+// exactly that way). G5 makes the class mechanical: any '/proc' literal on a
+// non-comment line under scenarios/lib/ must be a guard-test line
+// (`[ -r|-d|-f|-e|-L "/proc...`) or sit within 2 lines below one. The
+// guarded /proc/<pid>/stat reads in process_starttime/process_group (each
+// preceded by `if [ -r "/proc/$pid/stat" ]`) satisfy this; unguarded
+// input-redirection/cat/tr reads like the pre-fix uuid line do not.
+
+/** True when the line is a /proc guard test: a `[ -r|-d|-f|-e|-L "/proc...`
+ *  shell test (with optional leading `if `/`&&`/`||`/whitespace). */
+function isProcGuardTestLine(line: string): boolean {
+  return /\[\s*-(r|d|f|e|L)\s+["']?\/proc/.test(line);
+}
+
+/** True when the line is comment/prose — shell '#' or JS '//'/'/*'/'*'. */
+function isCommentLine(line: string): boolean {
+  const t = line.trimStart();
+  return (
+    t.startsWith("#") ||
+    t.startsWith("//") ||
+    t.startsWith("/*") ||
+    t.startsWith("*")
+  );
+}
+
+/** G5: flag every '/proc' literal on a non-comment line of a scenarios/lib/
+ *  file that is NOT itself a guard-test line AND is not within 2 lines below
+ *  a guard-test line. Returns violation strings ([] = GREEN). Pure over the
+ *  (rel → content) snapshot, like gateAll — the mutation tests drive it
+ *  against synthetic snapshots. */
+function g5UnguardedReadViolations(contents: Record<string, string>): string[] {
+  const violations: string[] = [];
+  for (const rel of Object.keys(contents).sort()) {
+    if (!rel.startsWith("scenarios/lib/")) continue;
+    const lines = contents[rel].split(/\r?\n/);
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (!hasProcLiteral(line)) continue; // no '/proc' (word 'process' excluded)
+      if (isCommentLine(line)) continue; // comment/prose text
+      if (isProcGuardTestLine(line)) continue; // the guard test itself
+      let guarded = false;
+      for (let j = Math.max(0, i - 2); j < i; j++) {
+        if (isProcGuardTestLine(lines[j])) {
+          guarded = true; // within 2 lines below a guard test
+          break;
+        }
+      }
+      if (!guarded) {
+        violations.push(
+          `${TT_PREFIX}${rel}:${i + 1}: unguarded '/proc' on a non-comment line (not a [ -r|-d|-f|-e|-L guard test, not within 2 lines below one) — scenarios/lib must not read the procfs mount unguarded`,
+        );
+      }
+    }
+  }
+  return violations;
 }
 
 // ── T2.1-owned paths (enumerated explicitly so dropping one is a hard
@@ -654,6 +738,137 @@ describe("tier0 procfs-portability lint", () => {
     assert.ok(
       g4.some((v) => v.includes("scenarios/w4.49/run-update-arm.mjs") && v.includes("T2.1-owned")),
       `the explicit G4 naming gate must flag the dropped path, got:\n${g4.join("\n") || "(none)"}`,
+    );
+  });
+
+  it("MUTATION (G5): flags the unguarded '/proc/sys/kernel/random/uuid' read class in a scenarios/lib file", () => {
+    // The pre-US-002 tree read the linux-only uuid via unguarded input
+    // redirection (run-scripted-scenario line ~306). Re-introducing that
+    // exact line into a scenarios/lib/ file must trip G5 — the red case of
+    // the red-then-green proof (the mutation test is the reproducible red
+    // run; the live tree post-US-002 is the green run).
+    const contents: Record<string, string> = {};
+    for (const rel of collectScannedFiles(repoRoot)) {
+      contents[rel] = fs.readFileSync(path.join(repoRoot, TT_PREFIX, rel), "utf8");
+    }
+    const target = "scenarios/lib/run-scripted-scenario";
+    contents[target] +=
+      '\nUUID_SUFFIX="$(tr -d \'-\' </proc/sys/kernel/random/uuid 2>/dev/null | cut -c1-12)"\n';
+    const violations = g5UnguardedReadViolations(contents);
+    const expectedLine = contents[target].split(/\r?\n/).length - 1; // the appended line (0-based → +1)
+    assert.ok(
+      violations.some(
+        (v) => v.includes(target) && v.includes(`:${expectedLine}:`) && v.includes("unguarded"),
+      ),
+      `expected a G5 unguarded-read violation for ${TT_PREFIX}${target}:${expectedLine}, got:\n${violations.join("\n") || "(none)"}`,
+    );
+  });
+
+  it("MUTATION (G5): the pre-US-002 tree's line 306 is exactly what G5 flags (red proof via git)", () => {
+    // Red-then-green documentation arm: materialize the ACTUAL pre-US-002
+    // run-scripted-scenario (the parent of the US-002 fix commit, whose line
+    // ~306 carries the unguarded uuid read) and assert G5 flags that exact
+    // read. The live tree (post-US-002) is asserted green by the hard gate
+    // and the dedicated live-surface test below. The pre-fix commit is
+    // resolved by message so the pin survives history edits.
+    const log = spawnSync(
+      "git",
+      ["log", "-1", "--format=%H", "--grep=US-002 - run-scripted-scenario"],
+      { cwd: repoRoot, encoding: "utf8" },
+    );
+    assert.equal(log.status, 0, `git log failed: ${log.stderr}`);
+    const us002Commit = log.stdout.trim();
+    assert.ok(
+      /^[0-9a-f]{40}$/.test(us002Commit),
+      `could not resolve the US-002 commit (grep found '${us002Commit}') — the MACP5 US-002 history is missing`,
+    );
+    const git = spawnSync(
+      "git",
+      ["show", `${us002Commit}~1:torture-test/scenarios/lib/run-scripted-scenario`],
+      { cwd: repoRoot, encoding: "utf8" },
+    );
+    assert.equal(git.status, 0, `git show of the pre-US-002 tree failed: ${git.stderr}`);
+    const preFixContent = git.stdout;
+    assert.ok(
+      preFixContent.includes("</proc/sys/kernel/random/uuid"),
+      "pre-fix tree must contain the unguarded uuid input-redirection read",
+    );
+    const violations = g5UnguardedReadViolations({
+      "scenarios/lib/run-scripted-scenario": preFixContent,
+    });
+    const lineNo = preFixContent.split(/\r?\n/).findIndex((l) => l.includes("</proc/sys/kernel/random/uuid")) + 1;
+    assert.ok(
+      violations.some(
+        (v) => v.includes("scenarios/lib/run-scripted-scenario") && v.includes(`:${lineNo}:`) && v.includes("unguarded"),
+      ),
+      `G5 must flag the pre-fix uuid read at line ${lineNo}, got:\n${violations.join("\n") || "(none)"}`,
+    );
+  });
+
+  it("G5 POSITIVE PIN: guarded /proc/$pid/stat reads (with [ -r ... ] + portable ps fallback) do NOT trip G5", () => {
+    // The legitimate pattern in process_starttime/process_group: the read is
+    // on the line directly below the `if [ -r "/proc/$pid/stat" ]` guard.
+    const snippet = [
+      "process_starttime() {",
+      "  local pid=\"$1\" details rest ps_out",
+      "  # linux-only /proc/<pid>/stat read (MACP3 US-003): guarded for Darwin by",
+      "  # [ -r ] + 2>/dev/null — a /proc-less host falls through to the portable",
+      "  # ps arm below.",
+      '  if [ -r "/proc/$pid/stat" ]; then',
+      '    details="$(<"/proc/$pid/stat")" || return 1',
+      "    rest=\"${details##*) }\"",
+      "    set -- $rest",
+      '    printf \'%s\\n\' "${20:-}"',
+      "    return 0",
+      "  fi",
+      '  ps_out="$(ps -p "$pid" -o lstart= 2>/dev/null | sed \'s/^[[:space:]]*//\' || true)"',
+      '  [ -n "$ps_out" ] || return 1',
+      "  printf '%s\\n' \"$ps_out\"",
+      "}",
+    ].join("\n");
+    const violations = g5UnguardedReadViolations({
+      "scenarios/lib/run-scripted-scenario": snippet,
+    });
+    assert.deepEqual(
+      violations,
+      [],
+      `guarded /proc/<pid>/stat reads must stay green under G5, got:\n${violations.join("\n") || "(none)"}`,
+    );
+  });
+
+  it("G5 POSITIVE PIN: comment/prose /proc text does NOT trip G5", () => {
+    const contents: Record<string, string> = {
+      "scenarios/lib/run-scripted-scenario": [
+        "# /proc/sys/kernel/random/uuid is linux-only (MACP3 US-003); on Darwin the",
+        "# read fails and portable_uuid_suffix() below generates a portable unique",
+        '# suffix (node crypto.randomUUID, `$$-$(date +%s)` last resort) —',
+        "# guarded Darwin branch (MACP4 US-003).",
+        '  # "scenario-owned" (conservative) exactly as the /proc-less empty result.',
+        "// JS comment prose mentioning /proc/sys/kernel/random/uuid",
+        "/* block comment prose: /proc/<pid>/stat reads are linux-only */",
+      ].join("\n"),
+    };
+    const violations = g5UnguardedReadViolations(contents);
+    assert.deepEqual(
+      violations,
+      [],
+      `comment/prose /proc text must not trip G5, got:\n${violations.join("\n") || "(none)"}`,
+    );
+  });
+
+  it("G5 LIVE: the scenarios/lib surface passes the unguarded-read gate (post-US-002)", () => {
+    const contents: Record<string, string> = {};
+    for (const rel of collectScannedFiles(repoRoot)) {
+      if (rel.startsWith("scenarios/lib/")) {
+        contents[rel] = fs.readFileSync(path.join(repoRoot, TT_PREFIX, rel), "utf8");
+      }
+    }
+    assert.ok(Object.keys(contents).length > 0, "expected scenarios/lib files in the scanned surface");
+    const violations = g5UnguardedReadViolations(contents);
+    assert.deepEqual(
+      violations,
+      [],
+      `live scenarios/lib surface must pass G5:\n${violations.join("\n") || "(none)"}`,
     );
   });
 

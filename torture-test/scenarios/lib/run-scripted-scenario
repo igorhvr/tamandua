@@ -54,8 +54,8 @@ resolve_operator_home() {
 }
 ACCOUNT_HOME="$(resolve_operator_home)"
 
-# portable_uuid_suffix — a unique suffix when /proc/sys/kernel/random/uuid
-# is unavailable (MACP4 US-003). BSD date has no nanosecond resolution, so
+# portable_uuid_suffix — the single portable invocation-UUID source
+# (MACP4 US-003, MACP5 US-002). BSD date has no nanosecond resolution, so
 # the old nanosecond-precision date fallback cannot be used on Darwin; the
 # suffix instead comes from node's crypto.randomUUID (node is a hard
 # requirement of this harness), with a `$$-$(date +%s)` shell last resort
@@ -303,13 +303,13 @@ for _attempt in $(seq 1 600); do
 done
 [ "$LOCK_OWNED" = "1" ] || fail "timed out acquiring scripted-daemon scenario lock"
 
-UUID_SUFFIX="$(tr -d '-' </proc/sys/kernel/random/uuid 2>/dev/null | cut -c1-12)"
-# /proc/sys/kernel/random/uuid is linux-only (MACP3 US-003); on Darwin the
-# read fails and portable_uuid_suffix() below generates a portable unique
-# suffix (node crypto.randomUUID, `$$-$(date +%s)` last resort — BSD date
-# has no nanosecond resolution, so no nanosecond date fallback anywhere) —
-# guarded Darwin branch (MACP4 US-003).
-[ -n "$UUID_SUFFIX" ] || UUID_SUFFIX="$(portable_uuid_suffix)"
+# Invocation UUID (MACP5 US-002): the suffix comes unconditionally from the
+# single portable source portable_uuid_suffix() — node crypto.randomUUID
+# (12 hex) with a `$$-$(date +%s)` shell last resort. The old linux-only
+# procfs uuid read (MACP3 US-003) is gone, so a /proc-less host (Darwin)
+# generates the same unique suffix without the loud 'No such file or
+# directory' from a failed read.
+UUID_SUFFIX="$(portable_uuid_suffix)"
 INVOCATION_ID="${SCENARIO_ID}-$(date -u +%Y%m%dT%H%M%S)-$$-${UUID_SUFFIX}"
 WORKFLOW_ID="${WORKFLOW_BASE}-${INVOCATION_ID}"
 INVOCATION_DIR="$VAR_ROOT/$INVOCATION_ID"

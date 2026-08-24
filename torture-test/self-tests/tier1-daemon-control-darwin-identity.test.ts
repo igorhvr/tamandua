@@ -441,3 +441,276 @@ describe("MACP4 US-002 — daemon-control + tt-process-identity Darwin identity/
     }
   });
 });
+
+// ── MACP5 US-001 — daemon-control identity-verified REAL-daemon pid
+//    recording on the fallback path + portable status verification.
+//
+// The real-Darwin W2 run exposed a FATAL recording defect: the
+// plain-background (no-systemd) fallback start recorded a DEAD WRAPPER pid
+// in provenance ("daemon PID 88430" whose process was NOT alive afterwards,
+// while ports 5334/5338/5339 were LISTENING) — on Darwin the
+// nohup/background chain double-forks, so the state-dir tamandua.pid can
+// name a wrapper that exits while the real daemon lives. The status
+// verifier failing closed ("pid alive: false ... STATUS: UNKNOWN") was
+// CORRECT — the fix records the REAL daemon pid, identity-verified BEFORE
+// writing provenance, and makes cmd_status portable for /proc-less hosts
+// (kill -0 liveness + the ps cmdline arm behind TT_DC_PLATFORM) so a
+// correctly-recorded live daemon CAN report RUNNING on Darwin.
+//
+// Everything below is hermetic: no daemon starts, no TT ports touched,
+// nothing written under torture-test/. Darwin is SIMULATED via the
+// injectable TT_DC_PLATFORM seam and the node/lsof/ps PATH shims. The
+// /proc literals here are linux-only documentation/assertion prose (MACP3
+// US-004 harness convention).
+describe("MACP5 US-001 — daemon-control identity-verified fallback pid recording + portable status", () => {
+  // ── 1. cmd_start pid acceptance: the triple gate ─────────────────────
+
+  it("cmd_start accepts a tamandua.pid candidate only via the triple gate (alive + identity + TT-owned) and fails closed on deadline expiry (structural)", () => {
+    const cs = extractFunction(dcText, "cmd_start");
+    assert.ok(cs, "cmd_start must exist");
+    // The pidfile candidate acceptance (both the reuse detection and the
+    // pid-wait) must go through verify_launched_daemon_pid — never a bare
+    // kill -0 acceptance.
+    assert.match(
+      cs,
+      /verify_launched_daemon_pid/,
+      "cmd_start must gate every tamandua.pid candidate with verify_launched_daemon_pid",
+    );
+    // The helper itself enforces the three gates in order.
+    const helper = extractFunction(dcText, "verify_launched_daemon_pid");
+    assert.ok(helper, "verify_launched_daemon_pid must exist");
+    assert.match(helper, /kill -0/, "gate (a): the candidate must be alive (kill -0)");
+    assert.match(
+      helper,
+      /IDENTITY_TOOL" --get/,
+      "gate (b): the candidate must have a readable process-start identity (tt-process-identity --get)",
+    );
+    assert.match(
+      helper,
+      /verify_process_tt_owned/,
+      "gate (c): the candidate must be proven TT-owned (verify_process_tt_owned)",
+    );
+    // Deadline expiry without a verified pid FAILS CLOSED (exit 1, no
+    // provenance) with a diagnostic naming the unverifiable-wrapper class.
+    assert.match(
+      cs,
+      /no identity-verified daemon pid appeared/,
+      "deadline expiry must fail closed with a diagnostic covering the unverifiable-wrapper class",
+    );
+    assert.match(cs, /exit 1/, "the deadline-expiry failure path must exit non-zero");
+  });
+
+  it("write_provenance refuses an empty startTime identity and cmd_start fails closed instead of WARNING-and-continue (structural)", () => {
+    // NOTE: extractFunction's quote-aware brace scanner cannot extract
+    // write_provenance (the ports_json line's `printf '"%s",'` gymnastics
+    // defeat its quote state machine), so this pin slices the function
+    // region directly from the source — bounded well before the next
+    // function definition.
+    const wpStart = dcText.indexOf("write_provenance() {");
+    assert.ok(wpStart >= 0, "write_provenance must exist");
+    const wpRegion = dcText.slice(wpStart, wpStart + 3000);
+    assert.match(
+      wpRegion,
+      /empty startTime identity/,
+      "write_provenance must explicitly refuse an empty startTime identity",
+    );
+    assert.match(wpRegion, /exit 1/, "write_provenance must exit non-zero on an empty identity (no provenance written)");
+    const cs = extractFunction(dcText, "cmd_start");
+    assert.ok(cs, "cmd_start must exist");
+    assert.doesNotMatch(
+      cs,
+      /WARNING — could not read startTime identity/,
+      "the old WARNING-and-continue identity recording must be gone",
+    );
+    assert.match(
+      cs,
+      /FATAL — cannot read startTime identity/,
+      "cmd_start must fail closed when the identity read fails at record time",
+    );
+  });
+
+  // ── 2. cmd_status portability (kill -0 + TT_DC_PLATFORM ps arm) ──────
+
+  it("cmd_status liveness is portable kill -0 (no /proc dir requirement) and the cmdline check rides the TT_DC_PLATFORM seam (structural)", () => {
+    const cs = extractFunction(dcText, "cmd_status");
+    assert.ok(cs, "cmd_status must exist");
+    assert.match(cs, /kill -0 "\$prov_pid"/, "liveness must be a portable kill -0 probe");
+    assert.doesNotMatch(
+      cs,
+      /\[ -d "\/proc\/\$prov_pid" \]/,
+      "the linux-only [ -d /proc/<pid> ] liveness requirement must be dropped (Darwin has no procfs)",
+    );
+    assert.match(
+      cs,
+      /TT_DC_PLATFORM/,
+      "cmd_status must honor the TT_DC_PLATFORM seam (hermetic Darwin simulation)",
+    );
+    assert.match(
+      cs,
+      /ps -p "\$prov_pid" -o command=/,
+      "the Darwin arm must read the cmdline via the portable `ps -p <pid> -o command=`",
+    );
+    assert.match(
+      cs,
+      /\/proc\/\$prov_pid\/cmdline/,
+      "the linux arm must retain the /proc/<pid>/cmdline read (linux-only, MACP5-marked)",
+    );
+    // Fail-closed unchanged: RUNNING requires cmdline_ok AND ports_active.
+    assert.match(cs, /STATUS: RUNNING/, "cmd_status must still report RUNNING");
+    assert.match(cs, /STATUS: UNKNOWN/, "cmd_status must still report UNKNOWN");
+  });
+
+  it("verify_launched_daemon_pid refuses a dead / unverifiable / non-TT-owned candidate and accepts a live identity-verified TT-owned one (behavioral)", () => {
+    const helper = extractFunction(dcText, "verify_launched_daemon_pid");
+    const ttOwned = extractFunction(dcText, "verify_process_tt_owned");
+    assert.ok(helper, "verify_launched_daemon_pid must exist");
+    assert.ok(ttOwned, "verify_process_tt_owned must exist");
+
+    const shimDir = fs.mkdtempSync(path.join(os.tmpdir(), "dc-macp5-gate-"));
+    try {
+      // node shim for the identity tool (`node <tool> --get <pid>`): prints
+      // TT_FAKE_IDENTITY for a live pid, refuses otherwise.
+      makeShim(
+        shimDir,
+        "node",
+        `if [ "$2" = "--get" ]; then pid="$3"; if kill -0 "$pid" 2>/dev/null && [ -n "\${TT_FAKE_IDENTITY:-}" ]; then echo "$TT_FAKE_IDENTITY"; exit 0; fi; echo "not alive or identity unreadable" >&2; exit 1; fi; exit 0`,
+      );
+      // lsof/ps shims for the Darwin TT-ownership evidence branch.
+      makeShim(shimDir, "lsof", `if [ -n "\${TT_FAKE_LSOF_CWD:-}" ]; then printf 'p%s\\nn%s\\n' "$$" "\$TT_FAKE_LSOF_CWD"; exit 0; fi\nexit 1`);
+      makeShim(shimDir, "ps", `if [ -n "\${TT_FAKE_PS_CMDLINE:-}" ]; then printf '%s\\n' "\$TT_FAKE_PS_CMDLINE"; exit 0; fi\nexit 1`);
+
+      const baseEnv = cleanEnv({
+        PATH: `${shimDir}:${process.env.PATH ?? ""}`,
+        TT_DC_PLATFORM: "Darwin",
+        IDENTITY_TOOL: "/tmp/fake-identity.mjs", // resolved by the node shim on PATH
+      });
+      const prologue = `TT_REPO_ROOT="${repoRoot}"`;
+
+      const runGate = (env: NodeJS.ProcessEnv): CmdResult =>
+        runExtracted(
+          [ttOwned, helper],
+          prologue,
+          `if verify_launched_daemon_pid "$$" /ignored; then echo "rc=0"; else echo "rc=$?"; fi`,
+          env,
+        );
+      const runGateDead = (env: NodeJS.ProcessEnv): CmdResult =>
+        runExtracted(
+          [ttOwned, helper],
+          prologue,
+          `bash -c 'exit 0' & dead=$!; wait "$dead" 2>/dev/null || true; if verify_launched_daemon_pid "$dead" /ignored; then echo "rc=0"; else echo "rc=$?"; fi`,
+          env,
+        );
+
+      // (a) A DEAD pid (reaped child) must be refused — the Darwin wrapper
+      //     pid that exits while the real daemon lives.
+      const dead = runGateDead(
+        cleanEnv({ ...baseEnv, TT_FAKE_IDENTITY: "proc:1", TT_FAKE_LSOF_CWD: ttRoot, TT_FAKE_PS_CMDLINE: "node /usr/bin/tamandua daemon start" }),
+      );
+      assert.equal(dead.status, 0, dead.stderr);
+      assert.match(dead.stdout, /rc=1/, `a dead candidate must be refused. stdout: ${dead.stdout}`);
+
+      // (b) Alive but identity UNREADABLE -> refused (gate b).
+      const noIdent = runGate(
+        cleanEnv({ ...baseEnv, TT_FAKE_LSOF_CWD: ttRoot, TT_FAKE_PS_CMDLINE: "node /usr/bin/tamandua daemon start" }),
+      );
+      assert.match(noIdent.stdout, /rc=1/, `an identity-unreadable candidate must be refused. stdout: ${noIdent.stdout}`);
+
+      // (c) Alive + identity but FOREIGN cwd -> refused (gate c).
+      const foreignCwd = runGate(
+        cleanEnv({ ...baseEnv, TT_FAKE_IDENTITY: "proc:1", TT_FAKE_LSOF_CWD: "/etc", TT_FAKE_PS_CMDLINE: "node /usr/bin/tamandua daemon start" }),
+      );
+      assert.match(foreignCwd.stdout, /rc=1/, `a foreign-cwd candidate must be refused. stdout: ${foreignCwd.stdout}`);
+
+      // (c') Alive + identity + TT cwd but NON-tamandua cmdline -> refused (gate c).
+      const noTamandua = runGate(
+        cleanEnv({ ...baseEnv, TT_FAKE_IDENTITY: "proc:1", TT_FAKE_LSOF_CWD: ttRoot, TT_FAKE_PS_CMDLINE: "node /usr/bin/server.js" }),
+      );
+      assert.match(noTamandua.stdout, /rc=1/, `a non-tamandua cmdline candidate must be refused. stdout: ${noTamandua.stdout}`);
+
+      // (d) Alive + identity + TT-owned -> ACCEPTED (the real daemon case).
+      const ok = runGate(
+        cleanEnv({ ...baseEnv, TT_FAKE_IDENTITY: "proc:1", TT_FAKE_LSOF_CWD: ttRoot, TT_FAKE_PS_CMDLINE: "node /usr/bin/tamandua daemon start" }),
+      );
+      assert.equal(ok.status, 0, ok.stderr);
+      assert.match(ok.stdout, /rc=0/, `a live identity-verified TT-owned candidate must be accepted. stdout: ${ok.stdout}`);
+    } finally {
+      fs.rmSync(shimDir, { recursive: true, force: true });
+    }
+  });
+
+  it("cmd_status reports RUNNING for a live tamandua daemon and UNKNOWN for a dead pid / non-tamandua cmdline / unverifiable cmdline under the Darwin simulation (behavioral)", () => {
+    const statusFn = extractFunction(dcText, "cmd_status");
+    assert.ok(statusFn, "cmd_status must exist");
+    const shimDir = fs.mkdtempSync(path.join(os.tmpdir(), "dc-macp5-status-"));
+    try {
+      makeShim(shimDir, "ps", `if [ -n "\${TT_FAKE_PS_FAIL:-}" ]; then exit 1; fi\nprintf '%s\\n' "\${TT_FAKE_PS_CMDLINE:-}"\nexit 0`);
+      // Stubs for cmd_status's callees (never production, ports faked via
+      // TT_FAKE_LISTENING_PORTS).
+      const stubs = `
+is_production_port() { return 1; }
+refuse_production() { echo "REFUSED: $1" >&2; exit 1; }
+is_production_cwd() { return 1; }
+is_port_listening() {
+  local port="$1"
+  local p
+  for p in \${TT_FAKE_LISTENING_PORTS:-}; do
+    [ "$p" = "$port" ] && return 0
+  done
+  return 1
+}
+`;
+      const baseEnv = cleanEnv({
+        PATH: `${shimDir}:${process.env.PATH ?? ""}`,
+        TT_DC_PLATFORM: "Darwin",
+      });
+      const provDir = fs.mkdtempSync(path.join(os.tmpdir(), "dc-macp5-prov-"));
+      // The provenance JSON format string (printf %s = the pid) — the inner
+      // double quotes are JSON, safe inside the bash single-quoted format.
+      const provJson =
+        '{"pid": %s, "ports": [5334, 5338, 5339], "startedAt": "2026-08-24T00:00:00Z", "cmdline": "tamandua daemon start", "cwd": "/tmp", "startTime": "proc:1"}';
+      // pidArg is emitted into the bash invocation verbatim: "$$" (double-
+      // quoted → the extracted script's own live pid) or a literal dead pid.
+      const runStatus = (env: NodeJS.ProcessEnv, pidArg: string): CmdResult =>
+        runExtracted(
+          [statusFn],
+          `${stubs}\nPROV_DIR="${provDir}"`,
+          `printf '${provJson}' ${pidArg} > "$PROV_DIR/scripted.json"\ncmd_status scripted`,
+          env,
+        );
+
+      // RUNNING: live pid + tamandua cmdline + a listening port.
+      const running = runStatus(
+        cleanEnv({ ...baseEnv, TT_FAKE_PS_CMDLINE: "node /usr/bin/tamandua daemon start", TT_FAKE_LISTENING_PORTS: "5334" }),
+        `"$$"`,
+      );
+      assert.equal(running.status, 0, running.stderr);
+      assert.match(running.stdout, /STATUS: RUNNING/, `a live tamandua daemon must report RUNNING on the Darwin simulation. stdout: ${running.stdout}`);
+
+      // UNKNOWN: DEAD pid + port listening — never RUNNING on ports alone.
+      const dead = runStatus(
+        cleanEnv({ ...baseEnv, TT_FAKE_PS_CMDLINE: "node /usr/bin/tamandua daemon start", TT_FAKE_LISTENING_PORTS: "5334" }),
+        `'4194191'`,
+      );
+      assert.equal(dead.status, 0, dead.stderr);
+      assert.match(dead.stdout, /STATUS: UNKNOWN/, `a dead pid must be UNKNOWN even with a listening port. stdout: ${dead.stdout}`);
+
+      // UNKNOWN: live pid + NON-tamandua cmdline + port listening.
+      const noTamandua = runStatus(
+        cleanEnv({ ...baseEnv, TT_FAKE_PS_CMDLINE: "node /usr/bin/server.js", TT_FAKE_LISTENING_PORTS: "5334" }),
+        `"$$"`,
+      );
+      assert.equal(noTamandua.status, 0, noTamandua.stderr);
+      assert.match(noTamandua.stdout, /STATUS: UNKNOWN/, `a non-tamandua cmdline must be UNKNOWN (fail-closed unchanged). stdout: ${noTamandua.stdout}`);
+
+      // UNKNOWN: live pid + UNVERIFIABLE cmdline (ps fails) + port listening.
+      const unverifiable = runStatus(
+        cleanEnv({ ...baseEnv, TT_FAKE_PS_FAIL: "1", TT_FAKE_LISTENING_PORTS: "5334" }),
+        `"$$"`,
+      );
+      assert.equal(unverifiable.status, 0, unverifiable.stderr);
+      assert.match(unverifiable.stdout, /STATUS: UNKNOWN/, `an unverifiable cmdline must be UNKNOWN (never RUNNING on weak evidence). stdout: ${unverifiable.stdout}`);
+    } finally {
+      fs.rmSync(shimDir, { recursive: true, force: true });
+    }
+  });
+});

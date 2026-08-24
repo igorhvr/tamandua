@@ -113,6 +113,16 @@ is_valid_uuid() {
   echo "$1" | grep -q "^[0-9a-f]\{8\}-[0-9a-f]\{4\}-[0-9a-f]\{4\}-[0-9a-f]\{4\}-[0-9a-f]\{12\}$"
 }
 
+# ── Portable nanosecond clock ─────────────────────────────────────
+# GNU date's `%N` (nanosecond) conversion is a GNU-ism — BSD/macOS date has
+# no %N, so `date +%s%N` is not portable. node is a hard dependency of the
+# scripted runtimes, and process.hrtime.bigint() reads the host-global
+# monotonic clock in nanoseconds (comparable across separate node
+# invocations), so it is the portable timing source here.
+portable_ns() {
+  "$NODE_BIN" -e 'process.stdout.write(String(process.hrtime.bigint()))'
+}
+
 # ── Runtime invocation helpers ────────────────────────────────────
 # Run the pi runtime with a given behaviors file and prompt.
 # Returns combined stdout+stderr (via 2>&1) and exit code as the
@@ -220,10 +230,10 @@ test_pi_delayed_trailer() {
   build_prompt "$cli_path" > "$prompt_file"
 
   local start_ns end_ns duration_ms
-  start_ns="$(date +%s%N)"
+  start_ns="$(portable_ns)"
   local raw exit_code stdout
   raw="$(run_pi "$tmp_dir" "$behaviors_path" "$prompt_file" "$state_dir"; printf '\nEXIT:%s\n' "$?")" || true
-  end_ns="$(date +%s%N)"
+  end_ns="$(portable_ns)"
   parse_output "$raw" stdout exit_code
   duration_ms=$(( (end_ns - start_ns) / 1000000 ))
 
@@ -514,11 +524,11 @@ test_hermes_delayed_trailer() {
   build_prompt "$cli_path" > "$prompt_file"
 
   local start_ns end_ns duration_ms
-  start_ns="$(date +%s%N)"
+  start_ns="$(portable_ns)"
   local raw exit_code stdout session_id
   raw="$(run_hermes "$tmp_dir" "$behaviors_path" "$prompt_file" "$state_dir" "$hermes_home"; printf '\nEXIT:%s\n' "$?")" || true
 
-  end_ns="$(date +%s%N)"
+  end_ns="$(portable_ns)"
   parse_output "$raw" stdout exit_code
 
   duration_ms=$(( (end_ns - start_ns) / 1000000 ))

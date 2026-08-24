@@ -241,6 +241,13 @@ const allowed = [
   "torture-test/bin/tt-recorder.test.sh",
   "torture-test/bin/tt-daemon-up",
   "torture-test/bin/tt-daemon-up.test.sh",
+  // MACP5 (US-004): bin/tt-provision-home's audited-content rewrite is now
+  // portable (temp-file + atomic mv instead of GNU sed -i). It IS
+  // mac-reachable in the bare-tier1 campaign path — tt-controller's
+  // real-case preflight (realPreflightRequired is manifest-based) runs its
+  // home-provision leg on ANY host, even when the real cells are later
+  // predicate-excluded — so the fix is part of the MACP5 authoring surface.
+  "torture-test/bin/tt-provision-home",
   // CDSK (US-002): the S15 schema-handshake parity leg adds the read-only
   // SQL-surface probe (bin/tt-schema-probe.mjs) to the daemon-up authoring
   // surface — same class as the build-version parity guard it sits beside.

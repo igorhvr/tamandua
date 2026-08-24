@@ -86,8 +86,12 @@ main() {
   fi
 
   # Replace the id: line. We match exactly "id: <BASE_WORKFLOW>" (with optional
-  # trailing whitespace) and replace with "id: <NEW_ID>".
-  sed -i "s/^id: ${BASE_WORKFLOW}[[:space:]]*$/id: ${NEW_ID}/" "$YML"
+  # trailing whitespace) and replace with "id: <NEW_ID>". The rewrite is
+  # PORTABLE: GNU sed's in-place `-i` is a GNU-ism (BSD sed on macOS requires
+  # a suffix argument and then misparses the file as a script — "command i
+  # expects \ followed by text"), so write to a temp file and atomically mv
+  # (the same pattern update_provenance_after_stop uses).
+  sed "s/^id: ${BASE_WORKFLOW}[[:space:]]*$/id: ${NEW_ID}/" "$YML" > "$YML.tmp" && mv "$YML.tmp" "$YML"
 
   # Verify the replacement worked
   if ! grep -q "^id: ${NEW_ID}[[:space:]]*$" "$YML"; then

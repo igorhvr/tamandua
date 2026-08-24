@@ -35,6 +35,17 @@
 //       (tt-controller loadSpawnEnvironment forward), not just the harness
 //       legs.
 //
+// MACP5 US-006 adds the per-cell provenance-pid pin (the mechanical campaign
+// pin of the US-001 recording fix): after each of the four W2 cells runs on
+// EACH launch path, torture-test/var/daemon-control/scripted.json must record
+// a pid that is (a) alive, (b) carries a non-empty startTime identity, and
+// (c) whose CURRENT tt-process-identity --get identity still matches the
+// recorded startTime (no ABA) — the record can only ever be written for an
+// identity-verified REAL daemon, never a dead wrapper pid (the Darwin
+// fallback defect). The same pin runs once per campaign leg, and each W2
+// cell's campaign evidence must show daemon-control's "daemon PID <pid>
+// (identity-verified)" acceptance line.
+//
 // Quiet-window discipline: every leg stops any stray scripted daemon and
 // asserts ports 5334/5338/5339 free BEFORE and AFTER (the scripted daemon
 // owns them). TAMANDUA_PI_BINARY/TAMANDUA_HERMES_BINARY backstops
@@ -68,8 +79,20 @@ const verifyEnv = path.join(binDir, "tt-verify-environment");
 const hostProfilePath = path.join(varRoot, "w0", "host-profile.json");
 const MANIFEST = path.join(ttRoot, "cases", "tier1.jsonl");
 const harness = path.join(ttRoot, "scenarios", "lib", "run-scripted-scenario");
+// MACP5 US-006: the daemon-control provenance record (the ONLY sanctioned
+// start/stop/status path for TT scripted daemons). write_provenance writes
+// this file at every start; the recorded pid + startTime identity are the
+// subject of the per-cell provenance-pid pin below.
+const provFile = path.join(varRoot, "daemon-control", "scripted.json");
+const identityTool = path.join(binDir, "tt-process-identity.mjs");
 
 const CAMPAIGN_LINE = /^Campaign:\s+(campaign-[A-Za-z0-9._-]+)$/m;
+// MACP5 US-001 acceptance line: cmd_start echoes "daemon PID <pid>
+// (identity-verified)" ONLY after the triple gate (kill -0 alive +
+// tt-process-identity --get non-empty + verify_process_tt_owned) accepted the
+// pidfile candidate — a dead/unverifiable wrapper (the Darwin fallback
+// defect) is refused, never recorded.
+const IDENTITY_VERIFIED_LINE = /daemon PID [0-9]+ \(identity-verified\)/;
 const SCRIPTED_PORTS = [5334, 5338, 5339];
 const REAL_HARNESSES = new Set(["pi", "hermes", "dsh"]);
 // The narrowest-true-requirement predicate US-006 landed for the W2 cells.
@@ -187,6 +210,88 @@ function parseEvidence(stdout: string): Record<string, any> {
   return found!;
 }
 
+// ── MACP5 US-006 per-cell provenance-pid pin ─────────────────────────────
+//
+// The mechanical campaign pin of the US-001 recording fix: on Darwin the
+// plain-background fallback's nohup/background chain double-forks, so the
+// OLD code recorded a WRAPPER pid that dies while the real daemon lives
+// ("pid alive: false ... STATUS: UNKNOWN"). After US-001, cmd_start accepts a
+// pidfile candidate only via the identity+ownership triple gate and
+// write_provenance FAILS CLOSED on an empty identity — so a provenance record
+// can only ever carry an identity-verified REAL daemon pid. This assertion
+// pins that on the live record, per W2 cell, per launch path:
+//
+//   (a) the recorded pid is ALIVE,
+//   (b) it has a non-empty startTime identity, and
+//   (c) the pid's CURRENT tt-process-identity --get identity still matches
+//       the recorded startTime (no ABA — the pid was not reused by another
+//       process in the meantime).
+
+// Shape-check a provenance record: pid must be a positive integer and
+// startTime must be non-empty (US-001 fail-closed — an identity-less record
+// is REFUSED at write time, never written).
+function assertProvenanceRecordShape(label: string, record: any): { pid: number; startTime: string } {
+  assert.ok(record && typeof record === "object", `${label}: scripted.json must be a JSON provenance record`);
+  const pid = Number(record.pid);
+  assert.ok(Number.isInteger(pid) && pid > 0,
+    `${label}: provenance must record a positive daemon pid — got ${JSON.stringify(record.pid)}`);
+  const startTime = String(record.startTime ?? "");
+  assert.ok(startTime.length > 0,
+    `${label}: provenance must record a non-empty startTime identity (US-001 fail-closed — ` +
+    `an empty identity is refused at write time, never recorded)`);
+  return { pid, startTime };
+}
+
+// Live provenance-pid assertion for one launch path: (1) assert the record
+// the leg's daemon usage left behind is a well-formed identity-verified
+// record that was gracefully stopped; (2) start the scripted daemon through
+// daemon-control on the SAME launch path the leg just exercised (systemd
+// scope on the normal leg, the plain-background fallback under
+// TT_FORCE_NO_SYSTEMD=1 — the marker on stderr proves which arm ran), and
+// assert the recorded pid is the live, identity-verified real daemon: alive,
+// non-empty startTime, and current identity == recorded startTime (no ABA);
+// (3) stop the daemon so the quiet window is held. Called once per W2 cell
+// per leg (and once per campaign leg).
+async function assertProvenancePid(
+  label: string,
+  extraEnv: NodeJS.ProcessEnv,
+  expectedMarker: RegExp,
+): Promise<void> {
+  // ── 1. Leftover record: what the leg's own daemon usage recorded ──────
+  const leftover = loadJson(provFile);
+  const leftoverShape = assertProvenanceRecordShape(`${label} leftover`, leftover);
+  assert.ok(
+    typeof leftover.stoppedAt === "string" && leftover.stoppedAt.length > 0,
+    `${label}: leftover provenance must carry stoppedAt (the leg's daemon was gracefully stopped)`,
+  );
+
+  // ── 2. Live record on the same launch path the leg exercised ──────────
+  const env = { ...campaignEnv, ...extraEnv };
+  const start = run(daemonControl, ["scripted", "start"], env);
+  assert.equal(start.status, 0,
+    `${label}: provenance-pin daemon start failed:\n${start.stdout}\n${start.stderr}`);
+  assert.match(start.stderr, expectedMarker,
+    `${label}: provenance-pin daemon start must use the leg's launch path (marker missing)`);
+  const live = loadJson(provFile);
+  const liveShape = assertProvenanceRecordShape(`${label} live`, live);
+  // (a) the recorded pid is alive right now.
+  assert.doesNotThrow(() => process.kill(liveShape.pid, 0),
+    `${label}: recorded pid ${liveShape.pid} must be alive (a dead/wrapper pid must never be recorded)`);
+  // (c) the pid's CURRENT identity still matches the recorded startTime —
+  // the pid was not reused (no ABA).
+  const identity = run(process.execPath, [identityTool, "--get", String(liveShape.pid)], env);
+  assert.equal(identity.status, 0,
+    `${label}: tt-process-identity --get for recorded pid ${liveShape.pid} failed: ${identity.stderr}`);
+  assert.equal(identity.stdout.trim(), liveShape.startTime,
+    `${label}: recorded startTime ${liveShape.startTime} must match the pid's CURRENT identity ` +
+    `(${identity.stdout.trim()}) — a reused/stale pid (ABA) must never be recorded`);
+
+  // ── 3. Stop and hold the quiet window ────────────────────────────────
+  const stop = run(daemonControl, ["scripted", "stop"], env);
+  assert.equal(stop.status, 0,
+    `${label}: provenance-pin daemon stop failed:\n${stop.stdout}\n${stop.stderr}`);
+}
+
 // One dual-path leg for one cell: quiet window (stop stray daemon, ports
 // free), run the EXACT manifest command (run-scripted-scenario with cwd
 // torture-test/), assert exit 0 + PASS evidence + zero tokens + the expected
@@ -227,6 +332,10 @@ async function runCellLeg(
   const daemonStatus = run(daemonControl, ["scripted", "status"], process.env);
   assert.equal(daemonStatus.status, 0, daemonStatus.stderr);
   assert.match(daemonStatus.stdout, /^STATUS: STOPPED$/m, `${label}: scripted daemon must be stopped after the leg`);
+  // MACP5 US-006 per-cell provenance-pid pin: the recorded provenance pid
+  // must be the live identity-verified real daemon (alive + non-empty
+  // startTime + current identity matches — no ABA) on THIS launch path.
+  await assertProvenancePid(label, extraEnv, expectedMarker);
   await assertPortsFree();
   assert.equal(gitSnapshot(), before, `${label} changed git status`);
 }
@@ -294,6 +403,21 @@ async function runCampaignLeg(extraEnv: NodeJS.ProcessEnv, legLabel: string, exp
       assert.ok(sawMarker,
         `${legLabel}: ${cell.id} campaign evidence must show the ${legLabel} daemon-control marker ` +
         `(${expectedMarker}) — the override did not reach daemon-control through the campaign spawn path`);
+      // MACP5 US-006 campaign-level identity pin: this cell's recorded
+      // daemon-control stderr must ALSO show the US-001 identity-verified
+      // pid acceptance ("daemon PID <pid> (identity-verified)") — the
+      // recorded provenance pid for this W2 cell is the identity-verified
+      // REAL daemon, never a dead wrapper (the Darwin fallback defect the
+      // whole campaign must stay free of).
+      let sawIdentityVerified = false;
+      for (const attemptId of attemptDirs) {
+        const stderrPath = path.join(campaignDir, "evidence", cell.id, attemptId, "command.stderr");
+        if (!fs.existsSync(stderrPath)) continue;
+        if (IDENTITY_VERIFIED_LINE.test(fs.readFileSync(stderrPath, "utf8"))) { sawIdentityVerified = true; break; }
+      }
+      assert.ok(sawIdentityVerified,
+        `${legLabel}: ${cell.id} campaign evidence must show the US-001 identity-verified daemon pid acceptance ` +
+        `(${IDENTITY_VERIFIED_LINE}) — a dead/unverifiable wrapper pid must never be recorded`);
     }
     for (const cs of realCases) {
       assert.equal(cs.outcome, "NOT_RUN", `${legLabel}: ${cs.id} must remain pending-real in bare mode`);
@@ -319,6 +443,10 @@ async function runCampaignLeg(extraEnv: NodeJS.ProcessEnv, legLabel: string, exp
   const daemonStatus = run(daemonControl, ["scripted", "status"], process.env);
   assert.equal(daemonStatus.status, 0, daemonStatus.stderr);
   assert.match(daemonStatus.stdout, /^STATUS: STOPPED$/m, `${legLabel}: scripted daemon must be stopped after the campaign`);
+  // MACP5 US-006 campaign-level provenance-pid pin: on this campaign's launch
+  // path, the recorded provenance pid is the live identity-verified real
+  // daemon (alive + non-empty startTime + current identity matches — no ABA).
+  await assertProvenancePid(`${legLabel} campaign`, extraEnv, expectedMarker);
   await assertPortsFree();
   assert.equal(gitSnapshot(), before, `${legLabel} changed git status`);
 }

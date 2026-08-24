@@ -200,7 +200,11 @@ surface_minimal_file() {
     sed_real_home="$(printf '%s' "$REAL_HOME" | sed 's/|/\\|/g')"
     sed_dest_dir="$(printf '%s' "$(dirname "$dest")" | sed 's/|/\\|/g')"
     rewrites="$(grep -cF "$REAL_HOME" "$tmp" 2>/dev/null || echo 0)"
-    sed -i "s|${sed_real_home}|${sed_dest_dir}|g" "$tmp"
+    # PORTABLE in-place rewrite (MACP5 US-004): GNU sed's `-i` is a GNU-ism —
+    # BSD/macOS sed requires a suffix argument and misparses the file as a
+    # script. Write to a temp file and atomically mv instead. (Reachable on
+    # Darwin via the bare-tier1 campaign preflight's home-provision leg.)
+    sed "s|${sed_real_home}|${sed_dest_dir}|g" "$tmp" > "$tmp.rewrite" && mv "$tmp.rewrite" "$tmp"
   fi
 
   # Idempotent: identical audited content already in place → no-op.

@@ -762,14 +762,14 @@ for field in name kind pid ports scopeUnit cgroupVerified startedAt cmdline cwd 
 done
 
 # Verify jq is used (with fallback)
-if grep -A 30 '^write_provenance()' "$TOOL" | grep -q 'command -v jq'; then
+if grep -A 60 '^write_provenance()' "$TOOL" | grep -q 'command -v jq'; then
   pass "write_provenance uses jq when available (with fallback)"
 else
   fail "write_provenance missing jq check"
 fi
 
 # Verify fallback path exists (cat with heredoc when jq unavailable)
-if grep -A 100 '^write_provenance()' "$TOOL" | grep -q 'PROVEOF'; then
+if grep -A 130 '^write_provenance()' "$TOOL" | grep -q 'PROVEOF'; then
   pass "write_provenance has jq-less fallback path (heredoc)"
 else
   fail "write_provenance missing jq-less fallback"
@@ -781,7 +781,7 @@ fi
 # from the provenance — the provenance-scoped stop then thought the daemon was
 # already stopped while a CLI-auto-started daemon held exactly 5339 (the tier1
 # W2.21 restart failure). The input must be newline-terminated.
-if grep -A 100 '^write_provenance()' "$TOOL" | grep -Fq "printf '%s\\n' \"\$ports\""; then
+if grep -A 130 '^write_provenance()' "$TOOL" | grep -Fq "printf '%s\\n' \"\$ports\""; then
   pass "write_provenance terminates the port list with a newline before tr (no last-port drop)"
 else
   fail "write_provenance port conversion may drop the last port (no newline before tr)"
@@ -970,7 +970,7 @@ else
   fail "cmd_start missing port-wait loop over dash/mcp/ctrl ports"
 fi
 
-if grep -A 250 '^cmd_start()' "$TOOL" | grep -q 'wait_for_port'; then
+if grep -A 400 '^cmd_start()' "$TOOL" | grep -q 'wait_for_port'; then
   pass "cmd_start calls wait_for_port"
 else
   fail "cmd_start missing wait_for_port call"
@@ -1249,14 +1249,14 @@ else
 fi
 
 # write_provenance must record the daemon's process-start identity
-if grep -A 100 '^write_provenance()' "$TOOL" | grep -q 'start_time'; then
+if grep -A 130 '^write_provenance()' "$TOOL" | grep -q 'start_time'; then
   pass "write_provenance records startTime identity"
 else
   fail "write_provenance missing startTime identity recording"
 fi
 
 # cmd_start must read the identity at daemon start
-if grep -A 250 '^cmd_start()' "$TOOL" | grep -q 'IDENTITY_TOOL.*--get'; then
+if grep -A 400 '^cmd_start()' "$TOOL" | grep -q 'IDENTITY_TOOL.*--get'; then
   pass "cmd_start reads the daemon startTime identity via --get"
 else
   fail "cmd_start missing startTime identity read"
@@ -1304,6 +1304,65 @@ for fn in verify_recorded_identity verify_listener_target; do
     fail "$fn function missing"
   fi
 done
+
+# ── Test 35c (MACP5 US-001): cmd_start records the REAL daemon pid —
+#    identity-verified BEFORE recording ─────────────────────────────────
+echo ""
+echo "--- Test: cmd_start tamandua.pid acceptance is identity+ownership-gated (MACP5 US-001) ---"
+
+# The triple-gate helper must exist: (a) kill -0 alive, (b)
+# tt-process-identity --get non-empty, (c) verify_process_tt_owned.
+if grep -q '^verify_launched_daemon_pid()' "$TOOL"; then
+  pass "verify_launched_daemon_pid helper exists"
+else
+  fail "verify_launched_daemon_pid helper missing"
+fi
+if grep -A 30 '^verify_launched_daemon_pid()' "$TOOL" | grep -q 'kill -0'; then
+  pass "gate (a): verify_launched_daemon_pid checks liveness with kill -0"
+else
+  fail "verify_launched_daemon_pid missing kill -0 liveness gate"
+fi
+if grep -A 30 '^verify_launched_daemon_pid()' "$TOOL" | grep -q 'IDENTITY_TOOL.*--get'; then
+  pass "gate (b): verify_launched_daemon_pid reads the start identity via --get"
+else
+  fail "verify_launched_daemon_pid missing identity read gate"
+fi
+if grep -A 30 '^verify_launched_daemon_pid()' "$TOOL" | grep -q 'verify_process_tt_owned'; then
+  pass "gate (c): verify_launched_daemon_pid verifies TT-ownership"
+else
+  fail "verify_launched_daemon_pid missing verify_process_tt_owned gate"
+fi
+
+# cmd_start must route EVERY tamandua.pid candidate through the gate (both
+# the reuse detection and the pid-wait acceptance) — never a bare kill -0.
+cmd_start_gate_calls=$(grep -c 'verify_launched_daemon_pid' <(grep -A 400 '^cmd_start()' "$TOOL") || true)
+if [ "${cmd_start_gate_calls:-0}" -ge 2 ]; then
+  pass "cmd_start gates the tamandua.pid candidate with verify_launched_daemon_pid ($cmd_start_gate_calls call sites)"
+else
+  fail "cmd_start expected >= 2 verify_launched_daemon_pid call sites, found ${cmd_start_gate_calls:-0}"
+fi
+if grep -A 400 '^cmd_start()' "$TOOL" | grep -q 'not an identity-verified TT-owned daemon'; then
+  pass "cmd_start treats an unverifiable pidfile candidate as a failed launch attempt"
+else
+  fail "cmd_start missing the unverifiable-candidate diagnostic"
+fi
+if grep -A 400 '^cmd_start()' "$TOOL" | grep -q 'no identity-verified daemon pid appeared'; then
+  pass "cmd_start fails CLOSED (no provenance) when the deadline expires with no identity-verified pid"
+else
+  fail "cmd_start missing the fail-closed deadline diagnostic"
+fi
+
+# write_provenance must never record an empty startTime (fail closed).
+if grep -A 100 '^write_provenance()' "$TOOL" | grep -q 'empty startTime identity'; then
+  pass "write_provenance refuses an empty startTime identity (fail closed)"
+else
+  fail "write_provenance missing the empty-startTime refusal"
+fi
+if grep -A 400 '^cmd_start()' "$TOOL" | grep -q 'FATAL — cannot read startTime identity'; then
+  pass "cmd_start fails closed instead of WARNING-and-continue when the identity read fails at record time"
+else
+  fail "cmd_start still tolerates an unreadable startTime identity (WARNING-and-continue)"
+fi
 
 # ── Test 36: stop subcommand env isolation (run_under_env) ───────────
 echo ""
@@ -1608,6 +1667,42 @@ if grep -A 250 '^cmd_status()' "$TOOL" | grep -q '/proc/.*pid'; then
   pass "cmd_status checks /proc/<pid> for process existence"
 else
   fail "cmd_status missing /proc/<pid> check"
+fi
+
+# ── Test 52b (MACP5 US-001): status liveness is portable kill -0 and the
+#    cmdline check rides the TT_DC_PLATFORM seam ────────────────────────
+echo ""
+echo "--- Test: status portable liveness + TT_DC_PLATFORM cmdline seam (MACP5 US-001) ---"
+
+# Liveness: kill -0 alone — the linux-only `[ -d /proc/<pid> ]` requirement
+# is gone (Darwin has no procfs; a live recorded pid must report RUNNING).
+if grep -A 250 '^cmd_status()' "$TOOL" | grep -q 'kill -0 "\$prov_pid"'; then
+  pass "cmd_status liveness uses kill -0 (portable)"
+else
+  fail "cmd_status missing kill -0 liveness probe"
+fi
+if grep -A 250 '^cmd_status()' "$TOOL" | grep -q '\[ -d "/proc/\$prov_pid" \]'; then
+  fail "cmd_status still requires [ -d /proc/<pid> ] for liveness (linux-only — breaks Darwin)"
+else
+  pass "cmd_status no longer requires a /proc dir for liveness"
+fi
+
+# Cmdline verification must ride the TT_DC_PLATFORM seam: the portable ps
+# arm on Darwin, the /proc read retained on linux.
+if grep -A 250 '^cmd_status()' "$TOOL" | grep -q 'TT_DC_PLATFORM'; then
+  pass "cmd_status honors the TT_DC_PLATFORM seam"
+else
+  fail "cmd_status missing TT_DC_PLATFORM seam"
+fi
+if grep -A 250 '^cmd_status()' "$TOOL" | grep -q 'ps -p "\$prov_pid" -o command='; then
+  pass "cmd_status Darwin arm reads the cmdline via portable ps -p <pid> -o command="
+else
+  fail "cmd_status missing the portable ps cmdline arm"
+fi
+if grep -A 250 '^cmd_status()' "$TOOL" | grep -q '/proc/\$prov_pid/cmdline'; then
+  pass "cmd_status linux arm retains the /proc/<pid>/cmdline read"
+else
+  fail "cmd_status missing the linux /proc cmdline read"
 fi
 
 # ── Test 53: status subcommand — checks port listening status ──────
