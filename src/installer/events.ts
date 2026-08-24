@@ -84,6 +84,8 @@ export interface TamanduaEvent {
   workerLostCount?: number;
   /** Rounds the motor itself killed at the worker time ceiling (step.ceiling_expiry). */
   ceilingExpiryCount?: number;
+  /** Consecutive instant-fail worker rounds at the time a run.instant_fail_loop alert fires. */
+  consecutiveInstantFails?: number;
   passCount?: number;
   failCount?: number;
   window?: string;
@@ -167,6 +169,21 @@ export const RUN_LIFECYCLE_EVENTS: readonly string[] = Object.freeze([
   "run.canceled",
   "run.deleted",
   "run.force_failed",
+]);
+
+/**
+ * Run-level alert event vocabulary — non-terminal diagnostics emitted
+ * while a run is still active, signaling a pathology consumers should
+ * surface before it becomes fatal (the DDTH pattern).
+ *
+ * `run.instant_fail_loop` fires when the dispatch motor escalates a
+ * worker instant-fail loop (K+ consecutive sub-threshold zero-output
+ * nonzero-exit rounds) toward run failure; the terminal run.force_failed
+ * event follows immediately after with the precise reason. Pinned by
+ * src/installer/events-vocabulary.test.ts.
+ */
+export const RUN_ALERT_EVENTS: readonly string[] = Object.freeze([
+  "run.instant_fail_loop",
 ]);
 
 export type EventCursorSource =

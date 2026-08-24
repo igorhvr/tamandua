@@ -1083,3 +1083,98 @@ describe("WLST5 split counters surface", () => {
     try { fs.rmSync(env.root, { recursive: true, force: true }); } catch { /* cleanup */ }
   });
 });
+
+// ── RSPN instant-fail loop surfacing ─────────────────────────────────
+// A run in an instant-fail loop (K+ consecutive sub-threshold zero-output
+// nonzero-exit rounds) must be visible in `tamandua workflow status` and
+// `tamandua workflow runs` BEFORE it becomes fatal (DDTH): the motor is
+// backing off and heading for force-fail escalation. Below the backoff
+// threshold K the counter must stay silent — a lone instant fail is not a
+// loop.
+
+describe("RSPN instant-fail loop surfacing", () => {
+  const RUNS_DDL = `
+    CREATE TABLE IF NOT EXISTS runs (
+      id TEXT PRIMARY KEY,
+      workflow_id TEXT NOT NULL,
+      task TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'running',
+      context TEXT NOT NULL DEFAULT '{}',
+      tokens_spent INTEGER NOT NULL DEFAULT 0,
+      worker_lost_count INTEGER NOT NULL DEFAULT 0,
+      ceiling_expiry_count INTEGER NOT NULL DEFAULT 0,
+      instant_fail_count INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `;
+
+  it("workflow status shows the instant-fail loop line at or above the backoff threshold", async () => {
+    const env = createTempEnv();
+    const dbPath = path.join(env.tamanduaDir, "tamandua.db");
+    const runId = "dddd4444-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+
+    const db = new DatabaseSync(dbPath);
+    db.exec(RUNS_DDL);
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, instant_fail_count) VALUES (?, 'feature-dev', 'instant fail loop', 'running', '{}', 100, 3)"
+    ).run(runId);
+    db.close();
+
+    const { child, getStdout } = spawnCli(
+      ["workflow", "status", runId],
+      { HOME: env.homeDir }
+    );
+    await new Promise<void>((resolve) => child.on("close", () => resolve()));
+    const stdout = getStdout();
+    assert.match(stdout, /Worker instant-fail loop: 3 consecutive sub-\d+s exit-1 rounds/);
+
+    try { fs.rmSync(env.root, { recursive: true, force: true }); } catch { /* cleanup */ }
+  });
+
+  it("workflow status omits the instant-fail line below the backoff threshold", async () => {
+    const env = createTempEnv();
+    const dbPath = path.join(env.tamanduaDir, "tamandua.db");
+    const runId = "eeee5555-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+
+    const db = new DatabaseSync(dbPath);
+    db.exec(RUNS_DDL);
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, instant_fail_count) VALUES (?, 'feature-dev', 'one-off instant fail', 'running', '{}', 0, 1)"
+    ).run(runId);
+    db.close();
+
+    const { child, getStdout } = spawnCli(
+      ["workflow", "status", runId],
+      { HOME: env.homeDir }
+    );
+    await new Promise<void>((resolve) => child.on("close", () => resolve()));
+    const stdout = getStdout();
+    assert.doesNotMatch(stdout, /Worker instant-fail loop/, "a sub-threshold count is not a loop yet");
+
+    try { fs.rmSync(env.root, { recursive: true, force: true }); } catch { /* cleanup */ }
+  });
+
+  it("compact workflow runs list surfaces the if: marker at or above the backoff threshold", async () => {
+    const env = createTempEnv();
+    const dbPath = path.join(env.tamanduaDir, "tamandua.db");
+    const runId = "ffff6666-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+
+    const db = new DatabaseSync(dbPath);
+    db.exec(RUNS_DDL);
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, instant_fail_count) VALUES (?, 'feature-dev', 'instant fail loop', 'running', '{}', 100, 4)"
+    ).run(runId);
+    db.close();
+
+    const { child, getStdout } = spawnCli(
+      ["workflow", "runs"],
+      { HOME: env.homeDir }
+    );
+    await new Promise<void>((resolve) => child.on("close", () => resolve()));
+    const stdout = getStdout();
+    assert.match(stdout, /if:4/);
+
+    try { fs.rmSync(env.root, { recursive: true, force: true }); } catch { /* cleanup */ }
+  });
+});

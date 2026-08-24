@@ -2239,6 +2239,37 @@ describe("formatRunsSummary", () => {
     assert.match(result, /\(1 completed, 1 failed runs not shown\)/);
   });
 
+  it("annotates active runs in an instant-fail loop (RSPN DDTH surfacing)", async () => {
+    const { formatRunsSummary } = await import("../../dist/cli/status-format.js");
+    const now = new Date().toISOString();
+    const result = formatRunsSummary({
+      listRuns: () => [
+        // At/above the backoff threshold K (default 3) → annotated.
+        { id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", workflowId: "wf1", task: "Looping run", status: "running", createdAt: now, updatedAt: now, tokensSpent: 100, workerLostCount: 0, ceilingExpiryCount: 0, instantFailCount: 3 },
+        // Below the threshold → NOT annotated (a lone instant fail is not a loop).
+        { id: "bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee", workflowId: "wf2", task: "One-off", status: "running", createdAt: now, updatedAt: now, tokensSpent: 50, workerLostCount: 0, ceilingExpiryCount: 0, instantFailCount: 2 },
+      ],
+      isDaemonRunning: () => true,
+    });
+    assert.match(result, /INSTANT-FAIL LOOP \(3 consecutive\)/);
+    assert.match(result, /aaaaaaa/);
+    assert.doesNotMatch(result, /INSTANT-FAIL LOOP \(2 consecutive\)/);
+  });
+
+  it("does not annotate terminal runs even with a high instant-fail count", async () => {
+    const { formatRunsSummary } = await import("../../dist/cli/status-format.js");
+    const staleDate = new Date(0).toISOString();
+    const result = formatRunsSummary({
+      listRuns: () => [
+        { id: "cccccccc-bbbb-cccc-dddd-eeeeeeeeeeee", workflowId: "wf1", task: "Failed loop", status: "failed", createdAt: staleDate, updatedAt: staleDate, tokensSpent: 0, workerLostCount: 0, ceilingExpiryCount: 0, instantFailCount: 12 },
+      ],
+      isDaemonRunning: () => false,
+    });
+    // Terminal runs collapse into the "not shown" line — no loop annotation.
+    assert.doesNotMatch(result, /INSTANT-FAIL LOOP/);
+    assert.match(result, /\(1 failed runs not shown\)/);
+  });
+
   it("defaults to real listRuns when no override provided (accepts any output)", async () => {
     const { formatRunsSummary } = await import("../../dist/cli/status-format.js");
     // Without overrides, uses the real listRuns from the DB — should not throw

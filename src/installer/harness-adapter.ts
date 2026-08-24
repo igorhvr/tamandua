@@ -37,6 +37,16 @@ export interface HarnessRoundResult {
   stderrTail: string;
   /** True when the round was terminated by a timeout guard (exitCode will be null, signal SIGTERM). */
   timedOut?: boolean;
+  /**
+   * Wall-clock duration of the round in milliseconds, measured from just
+   * before the harness process spawn through process close (the same
+   * value the adapters already log as `durationMs`). Previously computed
+   * internally but never returned — round completion had no duration
+   * signal, so the scheduler could not tell a 3ms instant-fail from a
+   * 30-minute legitimate round. Now surfaced so the dispatch round can
+   * classify instant-fail rounds (see src/installer/instant-fail.ts).
+   */
+  durationMs?: number;
 }
 
 // ── Run options shared across harnesses ────────────────────────────
@@ -385,6 +395,7 @@ class PiHarnessAdapter implements HarnessAdapter {
       signal: exitSignal ?? undefined,
       stderrTail,
       timedOut: timedOut || undefined,
+      durationMs,
     };
   }
 }
@@ -782,6 +793,7 @@ class HermesHarnessAdapter implements HarnessAdapter {
       promptElided: preview.promptElided,
       stderrTail,
       timedOut: timeoutTimerFired || undefined,
+      durationMs,
     };
   }
 }
@@ -1158,6 +1170,7 @@ class DshHarnessAdapter implements HarnessAdapter {
       promptElided: preview.promptElided,
       stderrTail,
       timedOut: timedOut || undefined,
+      durationMs,
     };
   }
 }

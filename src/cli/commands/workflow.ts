@@ -24,6 +24,7 @@ import type { HarnessType } from "../../installer/types.js";
 import { printWorkflowAutoresearch } from "./autoresearch.js";
 import { handleWait, getWaitHelp } from "./wait.js";
 import { detectWrongPrefix, stripIdPrefix, prefixRunId, prefixStepId } from "../../lib/id-prefix.js";
+import { getInstantFailBackoffThreshold, getInstantFailWallThresholdMs } from "../../installer/instant-fail.js";
 
 export function getWorkflowListHelp(): string {
   return `tamandua workflow list — List available bundled workflows with descriptions
@@ -484,7 +485,13 @@ export async function handleWorkflow(
     for (const r of runs) {
       const wl = r.workerLostCount > 0 ? ` wl:${r.workerLostCount}`.padEnd(6) : "      ";
       const ce = r.ceilingExpiryCount > 0 ? ` ce:${r.ceilingExpiryCount}`.padEnd(6) : "";
-      console.log(`  [${r.status.padEnd(9)}] run-${r.id.slice(0, 8).padEnd(10)} ${r.workflowId.padEnd(14)}${wl}${ce}${r.tokensSpent.toLocaleString().padStart(8)} tokens  ${r.task.slice(0, 50)}${r.task.length > 50 ? "..." : ""}`);
+      // Instant-fail loop surfacing (DDTH): once a run has K+ consecutive
+      // instant-fail rounds it is backing off toward escalation — show the
+      // pathology before it is fatal.
+      const ifMarker = r.instantFailCount >= getInstantFailBackoffThreshold()
+        ? ` if:${r.instantFailCount}`.padEnd(6)
+        : "";
+      console.log(`  [${r.status.padEnd(9)}] run-${r.id.slice(0, 8).padEnd(10)} ${r.workflowId.padEnd(14)}${wl}${ce}${ifMarker}${r.tokensSpent.toLocaleString().padStart(8)} tokens  ${r.task.slice(0, 50)}${r.task.length > 50 ? "..." : ""}`);
     }
     return true;
   }
@@ -837,6 +844,13 @@ export async function handleWorkflow(
       }
       if (result.ceilingExpiryCount > 0) console.log(`Rounds expired at ceiling: ${result.ceilingExpiryCount}`);
       if (result.workerLostCount > 0) console.log(`Worker lost: ${result.workerLostCount}`);
+      // Instant-fail loop surfacing (DDTH): make the pathology visible
+      // before it is fatal — K+ consecutive sub-threshold zero-output
+      // nonzero-exit rounds mean the motor is backing off and heading for
+      // force-fail escalation.
+      if (result.instantFailCount >= getInstantFailBackoffThreshold()) {
+        console.log(`Worker instant-fail loop: ${result.instantFailCount} consecutive sub-${Math.round(getInstantFailWallThresholdMs() / 1000)}s exit-1 rounds`);
+      }
       if (result.workspace_mode === "worktree") {
         console.log(`Workspace: ${result.workspace_mode}`);
         if (result.worktree_path) console.log(`Worktree: ${result.worktree_path}`);

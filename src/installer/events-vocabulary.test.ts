@@ -8,6 +8,7 @@ import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
 import { assertStatePathIsolation } from "../../dist/lib/test-guard.js";
 import {
   RUN_LIFECYCLE_EVENTS,
+  RUN_ALERT_EVENTS,
   getRunEvents,
   getEventsPath,
   type TamanduaEvent,
@@ -51,6 +52,16 @@ const PINNED_TERMINAL_EVENT_VOCABULARY = [
   "run.canceled",
   "run.deleted",
   "run.force_failed",
+];
+
+/**
+ * The run-level alert vocabulary (RSPN). These are NON-terminal diagnostic
+ * events emitted while a run is still active — they surface a pathology
+ * (e.g. a worker instant-fail loop heading toward force-fail escalation)
+ * before it becomes fatal. Pinned alongside the lifecycle vocabulary.
+ */
+const PINNED_RUN_ALERT_VOCABULARY = [
+  "run.instant_fail_loop",
 ];
 
 // ── Test suite ─────────────────────────────────────────────────────────
@@ -176,6 +187,24 @@ describe("events vocabulary and terminal-event contract (CNEV US-004)", () => {
     assert.ok(Object.isFrozen(RUN_LIFECYCLE_EVENTS), "vocabulary must be frozen");
     for (const evt of RUN_LIFECYCLE_EVENTS) {
       assert.match(evt, /^run\.[a-z_.]+$/, `malformed lifecycle event name: ${evt}`);
+    }
+  });
+
+  it("pins the run-alert vocabulary: {run.instant_fail_loop} (RSPN)", () => {
+    assert.ok(Array.isArray(RUN_ALERT_EVENTS), "RUN_ALERT_EVENTS must be exported");
+    assert.deepEqual(
+      [...RUN_ALERT_EVENTS].sort(),
+      [...PINNED_RUN_ALERT_VOCABULARY].sort(),
+      "the run-alert vocabulary changed — update this pin deliberately (RSPN)",
+    );
+    assert.equal(RUN_ALERT_EVENTS.length, PINNED_RUN_ALERT_VOCABULARY.length, "alert vocabulary must not contain duplicates");
+    assert.ok(Object.isFrozen(RUN_ALERT_EVENTS), "alert vocabulary must be frozen");
+    for (const evt of RUN_ALERT_EVENTS) {
+      assert.match(evt, /^run\.[a-z_.]+$/, `malformed alert event name: ${evt}`);
+      assert.ok(
+        !RUN_LIFECYCLE_EVENTS.includes(evt),
+        `alert event ${evt} must not also be a lifecycle event`,
+      );
     }
   });
 

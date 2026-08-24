@@ -2542,10 +2542,11 @@ describe("MIGV upgrade path (pre-WLST5 DB → current)", () => {
       "const db = getDb();",
       'const ceiling = db.prepare("PRAGMA table_info(runs)").all().find((c) => c.name === "ceiling_expiry_count");',
       'const worker = db.prepare("PRAGMA table_info(runs)").all().find((c) => c.name === "worker_lost_count");',
+      'const instantFail = db.prepare("PRAGMA table_info(runs)").all().find((c) => c.name === "instant_fail_count");',
       'const ver = db.prepare("PRAGMA user_version").get();',
       // The exact SELECT from src/installer/status.ts:90 — must no longer throw.
-      'const row = db.prepare("SELECT id, run_number, workflow_id, task, status, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count FROM runs WHERE id = ?").get("legacy-run");',
-      "console.log(JSON.stringify({ ceiling, worker, user_version: ver.user_version, row }));",
+      'const row = db.prepare("SELECT id, run_number, workflow_id, task, status, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count FROM runs WHERE id = ?").get("legacy-run");',
+      "console.log(JSON.stringify({ ceiling, worker, instantFail, user_version: ver.user_version, row }));",
     ].join("\n");
 
     const result = execFileSync(process.execPath, ["--input-type=module", "-e", script], {
@@ -2561,12 +2562,14 @@ describe("MIGV upgrade path (pre-WLST5 DB → current)", () => {
     const migrated = JSON.parse(result.trim()) as {
       ceiling?: { type: string; notnull: number; dflt_value: string | null };
       worker?: { type: string; notnull: number; dflt_value: string | null };
+      instantFail?: { type: string; notnull: number; dflt_value: string | null };
       user_version: number;
       row: {
         id: string;
         run_number: number;
         worker_lost_count: number;
         ceiling_expiry_count: number;
+        instant_fail_count: number;
       };
     };
 
@@ -2580,6 +2583,16 @@ describe("MIGV upgrade path (pre-WLST5 DB → current)", () => {
     assert.equal(migrated.row.ceiling_expiry_count, 0, "legacy row gets ceiling_expiry_count = 0 via DEFAULT");
     assert.equal(migrated.row.worker_lost_count, 0, "legacy row keeps its worker_lost_count");
     assert.equal(migrated.row.id, "legacy-run");
+
+    // RSPN: the pre-WLST5 fixture predates instant_fail_count too — the
+    // migration must add it (guarded ALTER, NOT NULL DEFAULT 0) exactly
+    // like ceiling_expiry_count, or status.ts SELECTs crash with
+    // "no such column: instant_fail_count" (the WLST5.1 failure mode).
+    assert.ok(migrated.instantFail, "instant_fail_count column should be added by migration");
+    assert.equal(migrated.instantFail.type, "INTEGER");
+    assert.equal(migrated.instantFail.notnull, 1, "instant_fail_count should be NOT NULL");
+    assert.equal(migrated.instantFail.dflt_value, "0", "instant_fail_count should default to 0");
+    assert.equal(migrated.row.instant_fail_count, 0, "legacy row gets instant_fail_count = 0 via DEFAULT");
   });
 
   it("schema parity: every fresh-DDL column exists in a migrated legacy DB", () => {
@@ -2633,5 +2646,94 @@ describe("MIGV upgrade path (pre-WLST5 DB → current)", () => {
       assert.deepEqual(missing, [],
         `migrated legacy ${table} table should have every fresh-DDL column (missing: ${missing.join(", ")})`);
     }
+  });
+
+  it("migrates a pre-instant-fail (v5) DB: adds instant_fail_count, re-stamps version, status SELECT works", () => {
+    // RSPN regression for the WLST5.1 failure mode: adding the guarded
+    // instant_fail_count ALTER without bumping SCHEMA_VERSION would leave
+    // every existing DB (user_version === SCHEMA_VERSION) early-returned
+    // and skipping the migration — status.ts SELECTs then crash with
+    // "no such column: instant_fail_count". This fixture is the exact
+    // broken state a real pre-v6 install carries: user_version at the
+    // pre-bump version with a runs table lacking the column.
+    const PRE_INSTANT_FAIL_SCHEMA_VERSION = SCHEMA_VERSION - 1;
+
+    const th = createTempHome("tamandua-migv-instant-fail-");
+    const dbPath = path.join(th.root, "legacy.db");
+    const legacyDb = new DatabaseSync(dbPath);
+    legacyDb.exec(`
+      CREATE TABLE runs (
+        id TEXT PRIMARY KEY,
+        run_number INTEGER,
+        workflow_id TEXT NOT NULL,
+        task TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'running',
+        context TEXT NOT NULL DEFAULT '{}',
+        tokens_spent INTEGER NOT NULL DEFAULT 0,
+        notify_url TEXT,
+        scheduling_status TEXT,
+        scheduling_requested_at TEXT,
+        scheduling_error TEXT,
+        worker_lost_count INTEGER NOT NULL DEFAULT 0,
+        ceiling_expiry_count INTEGER NOT NULL DEFAULT 0,
+        parent_run_id TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO runs (
+        id, run_number, workflow_id, task, status, context, tokens_spent,
+        worker_lost_count, ceiling_expiry_count, created_at, updated_at
+      ) VALUES (
+        'legacy-run', 1, 'workflow', 'task', 'running', '{}', 42, 3, 0,
+        '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+      );
+      PRAGMA user_version = ${PRE_INSTANT_FAIL_SCHEMA_VERSION};
+    `);
+    // Sanity: the legacy DB really is in the pre-instant-fail broken state.
+    const preCols = legacyDb.prepare("PRAGMA table_info(runs)").all() as Array<{ name: string }>;
+    assert.ok(preCols.some((c) => c.name === "ceiling_expiry_count"), "precondition: legacy runs has ceiling_expiry_count");
+    assert.ok(!preCols.some((c) => c.name === "instant_fail_count"), "precondition: legacy runs lacks instant_fail_count");
+    const preVer = legacyDb.prepare("PRAGMA user_version").get() as { user_version: number };
+    assert.equal(preVer.user_version, PRE_INSTANT_FAIL_SCHEMA_VERSION, "precondition: user_version is the pre-bump version");
+    legacyDb.close();
+
+    // Spawn a fresh subprocess so getDb() runs migrate() from scratch on
+    // the legacy file.
+    const importPath = JSON.stringify(path.join(distDir(), "db.js"));
+    const script = [
+      `import { getDb, SCHEMA_VERSION } from ${importPath};`,
+      "const db = getDb();",
+      'const col = db.prepare("PRAGMA table_info(runs)").all().find((c) => c.name === "instant_fail_count");',
+      'const ver = db.prepare("PRAGMA user_version").get();',
+      // The exact SELECT from src/installer/status.ts:90 — must no longer throw.
+      'const row = db.prepare("SELECT id, run_number, workflow_id, task, status, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count FROM runs WHERE id = ?").get("legacy-run");',
+      "console.log(JSON.stringify({ col, user_version: ver.user_version, row }));",
+    ].join("\n");
+
+    const result = execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+      cwd: distDir(),
+      env: {
+        HOME: th.homeDir,
+        TAMANDUA_DB_PATH: dbPath,
+        TAMANDUA_TEST_GUARD: "1",
+        PATH: process.env.PATH ?? "",
+      },
+      encoding: "utf-8",
+    });
+    const migrated = JSON.parse(result.trim()) as {
+      col?: { type: string; notnull: number; dflt_value: string | null };
+      user_version: number;
+      row: { id: string; instant_fail_count: number; worker_lost_count: number; ceiling_expiry_count: number };
+    };
+
+    assert.ok(migrated.col, "instant_fail_count column should be added by migration");
+    assert.equal(migrated.col.type, "INTEGER");
+    assert.equal(migrated.col.notnull, 1, "instant_fail_count should be NOT NULL");
+    assert.equal(migrated.col.dflt_value, "0", "instant_fail_count should default to 0");
+    assert.equal(migrated.user_version, SCHEMA_VERSION,
+      `user_version should be re-stamped to ${SCHEMA_VERSION} (not stuck at the pre-bump version)`);
+    assert.equal(migrated.row.instant_fail_count, 0, "legacy row gets instant_fail_count = 0 via DEFAULT");
+    assert.equal(migrated.row.worker_lost_count, 3, "existing WLST5 counters untouched");
+    assert.equal(migrated.row.ceiling_expiry_count, 0, "existing WLST5 counters untouched");
   });
 });

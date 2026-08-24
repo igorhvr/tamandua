@@ -10,6 +10,14 @@ import { emitEvent, type TamanduaEvent } from "./events.js";
 import { parseRunContext } from "./step-ops.js";
 import { parsePiOutputStream } from "./pi-stream-parser.js";
 import { getHarnessAdapter, type HarnessRoundResult } from "./harness-adapter.js";
+import {
+  isInstantFailRound,
+  instantFailBackoffDelayMs,
+  formatInstantFailReason,
+  getInstantFailBackoffThreshold,
+  getInstantFailEscalationThreshold,
+  type InstantFailRoundSignals,
+} from "./instant-fail.js";
 import { lookupHermesSessionTokens } from "./hermes-usage.js";
 import { lookupDshSessionTokens } from "./dsh-usage.js";
 
@@ -50,6 +58,39 @@ const pendingStartTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
 /** Maps job id → persistent metadata. */
 const jobMetadata = new Map<string, CronJobInfo>();
+
+/**
+ * Per-job consecutive instant-fail tracking (RSPN).
+ *
+ * An instant-fail round is one whose harness exited nonzero with zero
+ * output below the wall-time threshold before claiming any step (broken
+ * or deleted harness binary, revoked credential, bad PATH). Such rounds
+ * claim nothing, so WLST5's worker_lost/ceiling_expiry counters — which
+ * only tick when a step/story is actually recovered — never see them and
+ * the fixed dispatch tick would relaunch the broken harness forever.
+ *
+ * The streak is per (run, agent) dispatch job, incremented on each
+ * classified instant-fail round and reset on any non-instant-fail harness
+ * round (timed-out rounds belong to the ceiling-expiry class and never
+ * touch it). At K consecutive rounds the motor starts backing off the
+ * relaunch (see {@link instantFailBackoffDelayMs}); at N it force-fails
+ * the run through the sanctioned forceFailRun path.
+ *
+ * Entries are cleared by `removeRunCrons` (run teardown) and
+ * `shutdownAllCrons`.
+ *
+ * @internal — exposed for test introspection via `_instantFailStreakFor`.
+ */
+interface InstantFailStreak {
+  /** Consecutive classified instant-fail rounds for this job. */
+  consecutive: number;
+  /**
+   * Epoch ms before which the job's next dispatch round is skipped
+   * (backoff). 0 when no backoff is active.
+   */
+  nextAllowedDispatchAt: number;
+}
+const instantFailStreaks = new Map<string, InstantFailStreak>();
 
 /**
  * Set of job ids whose dispatch round is currently running. Used to skip a
@@ -1091,6 +1132,146 @@ async function attributeWorkRoundTokenUsage(
   }
 }
 
+// ── Instant-fail round tracking (RSPN) ───────────────────────────────
+
+/**
+ * Classify a completed dispatch round as an instant fail (conservatively:
+ * wall time below the threshold AND zero output bytes AND nonzero exit)
+ * and update the per-job consecutive streak: increment on instant-fail,
+ * reset on any other harness round, never touch on timed-out rounds
+ * (ceiling-expiry class) or when no duration signal exists.
+ *
+ * At the backoff threshold K the next relaunch is delayed by an
+ * escalating amount (see {@link instantFailBackoffDelayMs}); at the
+ * escalation threshold N the run is force-failed through the sanctioned
+ * forceFailRun path with a precise reason, preceded by a distinct
+ * run.instant_fail_loop alert event. WLST5 counters are untouched — this
+ * is a third, additive class (the run's instant_fail_count column).
+ */
+async function trackInstantFailRound(
+  job: CronJobInfo,
+  context: Record<string, unknown>,
+  signals: InstantFailRoundSignals,
+): Promise<void> {
+  const { wallMs } = signals;
+  if (wallMs === undefined) return; // no duration signal — cannot classify
+  if (signals.result?.timedOut) return; // ceiling-expiry class — never an instant fail
+
+  const isInstantFail = isInstantFailRound(signals);
+  const previous = instantFailStreaks.get(job.id);
+
+  if (!isInstantFail) {
+    // Any other harness round (exit 0, output produced, slow) is a
+    // legitimate round — reset the streak so a single hiccup does not
+    // accumulate toward backoff/escalation.
+    if (previous) instantFailStreaks.delete(job.id);
+    return;
+  }
+
+  const consecutive = (previous?.consecutive ?? 0) + 1;
+  instantFailStreaks.set(job.id, { consecutive, nextAllowedDispatchAt: 0 });
+
+  // Persist the additive run counter (surfaced by workflow status / runs).
+  try {
+    const { getDb } = await import("../db.js");
+    const db = getDb();
+    db.prepare("UPDATE runs SET instant_fail_count = instant_fail_count + 1 WHERE id = ?").run(job.runId);
+  } catch (err) {
+    logger.warn("Failed to increment runs.instant_fail_count", {
+      ...context,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  const k = getInstantFailBackoffThreshold();
+  const n = getInstantFailEscalationThreshold();
+
+  logger.warn("Worker round classified as instant fail", {
+    ...context,
+    consecutiveInstantFails: consecutive,
+    wallMs,
+    outputBytes: signals.result ? Buffer.byteLength(signals.result.output, "utf-8") : 0,
+    exitCode: signals.result?.exitCode ?? null,
+    backoffThreshold: k,
+    escalationThreshold: n,
+  });
+
+  if (consecutive >= n) {
+    await escalateInstantFailLoop(job, context, consecutive, signals.result?.commandPreview);
+    return;
+  }
+
+  if (consecutive >= k) {
+    const delayMs = instantFailBackoffDelayMs(consecutive);
+    const nextAllowedDispatchAt = Date.now() + delayMs;
+    instantFailStreaks.set(job.id, { consecutive, nextAllowedDispatchAt });
+    logger.warn("Instant-fail loop detected — backing off relaunch", {
+      ...context,
+      consecutiveInstantFails: consecutive,
+      backoffDelayMs: delayMs,
+      nextAllowedDispatchAt,
+    });
+  }
+}
+
+/**
+ * Escalate an instant-fail loop at the N-round threshold: emit the
+ * distinct run.instant_fail_loop alert event, then force-fail the run
+ * through the existing forceFailRun path with a precise reason. The
+ * force-fail teardown internals are NOT modified — this is the sanctioned
+ * call site the RSPN designates. force=true is passed so escalation is
+ * guaranteed even when another agent's worker is mid-flight: one broken
+ * agent fails the run.
+ */
+async function escalateInstantFailLoop(
+  job: CronJobInfo,
+  context: Record<string, unknown>,
+  consecutive: number,
+  commandPreview?: string,
+): Promise<void> {
+  const reason = formatInstantFailReason(consecutive, commandPreview ?? job.agentId);
+  logger.error("Escalating instant-fail loop — force-failing run", {
+    ...context,
+    consecutiveInstantFails: consecutive,
+    reason,
+  });
+
+  // Alert event FIRST, before the terminal force-fail event, so consumers
+  // see the loop diagnosis before the run goes terminal.
+  try {
+    emitEvent({
+      ts: new Date().toISOString(),
+      event: "run.instant_fail_loop",
+      runId: job.runId,
+      workflowId: job.workflowId,
+      consecutiveInstantFails: consecutive,
+      detail: reason,
+      reason,
+    });
+  } catch (err) {
+    logger.warn("Failed to emit run.instant_fail_loop event", {
+      ...context,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  try {
+    const { forceFailRun } = await import("./status.js");
+    const result = await forceFailRun(job.runId, reason, true);
+    if (!result.ok) {
+      logger.warn("Instant-fail escalation force-fail refused", {
+        ...context,
+        reason: result.reason,
+      });
+    }
+  } catch (err) {
+    logger.error("Instant-fail escalation force-fail failed", {
+      ...context,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
 /**
  * One dispatch round for a (runId, agentId) job:
  *
@@ -1103,6 +1284,7 @@ async function attributeWorkRoundTokenUsage(
  *      (claim → execute → report)
  *   6. post-round processing — token attribution to the run, STATUS
  *      classification, auto-complete fallback, orphaned-step recovery
+ *   7. instant-fail classification — streak/backoff/escalation (RSPN)
  */
 export async function executeDispatchRound(
   job: CronJobInfo,
@@ -1143,6 +1325,24 @@ export async function executeDispatchRound(
     return;
   }
 
+  // ── Instant-fail backoff gate (RSPN) ────────────────────────────
+  // After K consecutive instant-fail rounds the motor backs off the
+  // broken harness's relaunch: subsequent ticks are skipped until
+  // nextAllowedDispatchAt passes, instead of respawning every 15s
+  // forever. Idle peeks are never delayed by this — a streak is only
+  // recorded for rounds that actually spawned a harness and instant-failed.
+  const backoff = instantFailStreaks.get(job.id);
+  if (backoff && backoff.nextAllowedDispatchAt > Date.now()) {
+    logger.debug("Dispatch round skipped — instant-fail backoff", {
+      ...context,
+      reason: "instant_fail_backoff",
+      consecutiveInstantFails: backoff.consecutive,
+      backoffUntilMs: backoff.nextAllowedDispatchAt,
+      backoffRemainingMs: backoff.nextAllowedDispatchAt - Date.now(),
+    });
+    return;
+  }
+
   // ── Round completion signal (TATR US-005) ───────────────────────
   // Registered synchronously after the in-flight guard, BEFORE the first
   // await, so a concurrent settleRunInFlightRounds (the cancel path) can
@@ -1169,6 +1369,18 @@ export async function executeDispatchRound(
 
   // Declared outside try so catch/post-round handlers can access exit diagnostics
   let result: HarnessRoundResult | undefined;
+  // Round-start timestamp for instant-fail classification (RSPN). The
+  // adapters now report their own durationMs on resolved rounds; this
+  // capture covers the adapter-throw path (deleted/broken harness binary
+  // — findBinary/spawn failure), where no result ever exists to carry a
+  // duration. Captured in the work-spawn section BEFORE binary resolution
+  // so the throw path can still be classified on wall time.
+  let roundStartMs = 0;
+  // Set when this round's orphan recovery actually recovered a claimed
+  // step (the worker claimed and died). Such rounds are worker_lost, not
+  // instant-fail (RSPN) — the classifier must never count them toward the
+  // instant-fail streak.
+  let roundRecoveredOrphans = false;
   // Round-start timestamp captured for dsh token accounting. dsh never
   // prints usage; tokens are read from $DSH_HOME session files keyed on
   // the workdir + a "created since this time" scan. Captured BEFORE
@@ -1342,6 +1554,13 @@ export async function executeDispatchRound(
     if (harnessType === "dsh") {
       dshRoundStartedAtMs = Date.now();
     }
+    // Round-start timestamp for instant-fail classification (RSPN). The
+    // adapters now report their own durationMs on resolved rounds; this
+    // capture covers the adapter-throw path (deleted/broken harness binary
+    // — findBinary/spawn failure), where no result ever exists to carry a
+    // duration. Captured BEFORE binary resolution so the throw path can
+    // still be classified on wall time.
+    roundStartMs = Date.now();
     // Pre-resolve the binary path. For hermes and dsh, this goes through
     // the same shared resolvers that admission validation uses,
     // guaranteeing single-source dispatch — no disagreement between
@@ -1500,6 +1719,7 @@ export async function executeDispatchRound(
             timedOut: result?.timedOut,
           });
         }
+        if (recoveryResult.recovered > 0) roundRecoveredOrphans = true;
       } catch (recoveryErr) {
         logger.error("Orphaned step recovery after clean harness exit failed", {
           ...context,
@@ -1538,6 +1758,7 @@ export async function executeDispatchRound(
             reason: "dangling_claim_no_work",
           });
         }
+        if (recoveryResult.recovered > 0) roundRecoveredOrphans = true;
       } catch (recoveryErr) {
         logger.error("Immediate claim release after no_work round failed", {
           ...context,
@@ -1545,6 +1766,22 @@ export async function executeDispatchRound(
         });
       }
     }
+
+    // ── Instant-fail classification (RSPN) ────────────────────────
+    // Runs AFTER the normal post-round processing (token attribution,
+    // orphan recovery) so a genuinely claimed-but-died worker still goes
+    // through the existing worker_lost recovery path unchanged. An
+    // instant-fail round — harness exited nonzero with zero output below
+    // the wall threshold before claiming any step — increments the
+    // per-job streak, applies escalating backoff at K consecutive rounds,
+    // and force-fails the run at N (with a distinct alert event). The
+    // adapter's durationMs is the round's wall time; the roundStartMs
+    // fallback covers rounds where the adapter never returned one.
+    await trackInstantFailRound(job, context, {
+      wallMs: result?.durationMs ?? Date.now() - roundStartMs,
+      result,
+      recoveredOrphans: roundRecoveredOrphans,
+    });
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
     const errorSummary = buildBoundedPreview(errorMessage, MAX_WORK_ERROR_PREVIEW);
@@ -1587,6 +1824,7 @@ export async function executeDispatchRound(
           isTimeout,
         });
       }
+      if (recoveryResult.recovered > 0) roundRecoveredOrphans = true;
 
       // ── Hermes token lookup on adapter rejection ──────────────
       // When the hermes adapter could not even resolve (e.g. spawn error),
@@ -1659,6 +1897,20 @@ export async function executeDispatchRound(
           });
         }
       }
+
+      // ── Instant-fail classification on adapter throw (RSPN) ──
+      // The harness never resolved (deleted/broken binary — spawn
+      // ENOENT, dispatch-time resolution failure): zero output by
+      // construction and no clean exit, so when it happened within the
+      // wall threshold it is classified the same way as a resolved
+      // zero-output exit-1 round. The recovery above already ran the
+      // existing worker_lost path (which recovers nothing for unclaimed
+      // steps); this adds the streak/backoff/escalation handling.
+      await trackInstantFailRound(job, context, {
+        wallMs: Date.now() - roundStartMs,
+        adapterThrew: true,
+        recoveredOrphans: roundRecoveredOrphans,
+      });
     } catch (recoveryErr) {
       logger.error("Orphaned step recovery failed", {
         ...context,
@@ -1973,6 +2225,9 @@ export async function removeRunCrons(
     inFlightChildren.delete(id);
     inFlightJobs.delete(id);
     jobMetadata.delete(id);
+    // Drop the run's instant-fail streaks with the jobs — a torn-down run
+    // must not leave stale backoff/escalation state behind.
+    instantFailStreaks.delete(id);
     removed.push(id);
   }
 
@@ -2189,6 +2444,7 @@ export function shutdownAllCrons(): void {
   inFlightChildren.clear();
   inFlightJobs.clear();
   jobMetadata.clear();
+  instantFailStreaks.clear();
   schedulerGeneration++;
   if (count > 0) {
     logger.info("Shut down all cron jobs", { count });
@@ -2373,6 +2629,17 @@ export function _hasPendingSweepTimer(runId: string): boolean {
 /** @internal — exposed for tests to observe scheduler generation/epoch bumps. */
 export function _schedulerGeneration(): number {
   return schedulerGeneration;
+}
+
+/** @internal — exposed for tests to introspect the instant-fail streak for a job. */
+export function _instantFailStreakFor(jobId: string): { consecutive: number; nextAllowedDispatchAt: number } | undefined {
+  const streak = instantFailStreaks.get(jobId);
+  return streak ? { ...streak } : undefined;
+}
+
+/** @internal — exposed for tests to clear all instant-fail streaks between cases. */
+export function _resetInstantFailStreaks(): void {
+  instantFailStreaks.clear();
 }
 
 /** @internal — exposed for tests to introspect scheduled job metadata. */

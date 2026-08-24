@@ -11,7 +11,12 @@ import { LEDGER_RETENTION_MS } from "./suite/config.js";
 // bug (new column never appearing on pre-existing DBs) is caught going forward.
 // v5: TATR US-001 added the nullable runs.parent_run_id column (parent/child
 // run linkage for graph consumers).
-export const SCHEMA_VERSION = 5;
+// v6: RSPN instant-fail added the guarded runs.instant_fail_count column
+// (consecutive sub-threshold zero-output nonzero-exit worker rounds). The
+// bump is REQUIRED (see the WLST5.1 note below): adding the guarded ALTER
+// without bumping leaves existing DBs (user_version === 5) skipping it and
+// crashing with "no such column: instant_fail_count".
+export const SCHEMA_VERSION = 6;
 
 // Counter for tests — increments each time migrate() runs the full DDL path.
 export let _migrateFullRuns = 0;
@@ -275,6 +280,20 @@ function migrate(db: DatabaseSync): void {
   const addCeilingExpiry = db.prepare("SELECT name FROM pragma_table_info('runs') WHERE name = 'ceiling_expiry_count'").all();
   if (addCeilingExpiry.length === 0) {
     db.exec("ALTER TABLE runs ADD COLUMN ceiling_expiry_count INTEGER NOT NULL DEFAULT 0");
+  }
+
+  // ── RSPN instant_fail_count for runs ──
+  // Tracks consecutive instant-fail worker rounds (wall time below the
+  // threshold AND zero output AND nonzero exit — a broken harness binary,
+  // revoked credential, bad PATH) classified by the dispatch motor. This is
+  // a THIRD, distinct class from worker_lost_count (harness_lost) and
+  // ceiling_expiry_count (motor-killed at the time ceiling): an instant-fail
+  // round claims no step, so WLST5's counters — which only tick inside
+  // recoverOrphanedStepsForAgent when a step/story is actually recovered —
+  // never see it. Additive field only; WLST5 counters are untouched.
+  const addInstantFail = db.prepare("SELECT name FROM pragma_table_info('runs') WHERE name = 'instant_fail_count'").all();
+  if (addInstantFail.length === 0) {
+    db.exec("ALTER TABLE runs ADD COLUMN instant_fail_count INTEGER NOT NULL DEFAULT 0");
   }
 
   // Indexes for run-scoped scheduling and step claim queries.

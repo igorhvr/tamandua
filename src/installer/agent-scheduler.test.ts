@@ -28,6 +28,8 @@ import {
   DISPATCH_INTERVAL_MS,
   HARNESS_TEARDOWN_GRACE_MS,
   getRunTeardownGraceMs,
+  _instantFailStreakFor,
+  _resetInstantFailStreaks,
 } from "../../dist/installer/agent-scheduler.js";
 import { getDb } from "../../dist/db.js";
 import { getRunEvents } from "../../dist/installer/events.js";
@@ -833,6 +835,239 @@ process.exit(1);
     assert.equal(workerLost[0].exitCode, 1);
     const ceilingExpiries = events.filter((e) => e.event === "step.ceiling_expiry");
     assert.equal(ceilingExpiries.length, 0, "a crash must NOT emit step.ceiling_expiry");
+  });
+});
+
+// ── RSPN instant-fail classification, backoff, escalation ────────────
+// A harness that exits nonzero with zero output before claiming any step
+// is an instant-fail round: no step is ever claimed, so clean-exit
+// recovery finds nothing, no WLST5 counter ticks, and the fixed dispatch
+// tick would relaunch the broken harness forever. The motor must classify
+// such rounds (fast + zero output + nonzero exit), track the consecutive
+// streak per job, back off the relaunch after K, and force-fail the run
+// after N with a precise reason plus a distinct alert event. Regression
+// net for campaign #8 attempt-3 (W3.23-token-saver): a broken worker
+// binary was relaunched ~40 times at ~15s intervals until an external
+// wall cap killed the run.
+
+describe("executeDispatchRound instant-fail classification and escalation (RSPN)", () => {
+  let tempHome: string;
+  let saved: Record<string, string | undefined>;
+
+  beforeEach(() => {
+    tempHome = tamanduaTempDir("tamandua-instant-fail-");
+    const stateDir = path.join(tempHome, ".tamandua");
+    fs.mkdirSync(stateDir, { recursive: true });
+    saved = {
+      HOME: process.env.HOME,
+      TAMANDUA_STATE_DIR: process.env.TAMANDUA_STATE_DIR,
+      TAMANDUA_DB_PATH: process.env.TAMANDUA_DB_PATH,
+      TAMANDUA_PI_BINARY: process.env.TAMANDUA_PI_BINARY,
+      TAMANDUA_INSTANT_FAIL_WALL_MS: process.env.TAMANDUA_INSTANT_FAIL_WALL_MS,
+      TAMANDUA_INSTANT_FAIL_BACKOFF_K: process.env.TAMANDUA_INSTANT_FAIL_BACKOFF_K,
+      TAMANDUA_INSTANT_FAIL_ESCALATION_N: process.env.TAMANDUA_INSTANT_FAIL_ESCALATION_N,
+      TAMANDUA_INSTANT_FAIL_BACKOFF_BASE_MS: process.env.TAMANDUA_INSTANT_FAIL_BACKOFF_BASE_MS,
+    };
+    process.env.HOME = tempHome;
+    process.env.TAMANDUA_STATE_DIR = stateDir;
+    process.env.TAMANDUA_DB_PATH = path.join(stateDir, "tamandua.db");
+    // Generous wall threshold: the fake harness's process startup (~tens
+    // of ms) must reliably fall below it even on loaded CI machines.
+    process.env.TAMANDUA_INSTANT_FAIL_WALL_MS = "10000";
+    // Guard awareness (test-isolation-guard): this suite emits events and
+    // reads the run DB through the same isolated temp state dir it creates.
+    assert.doesNotThrow(() =>
+      assertStatePathIsolation(path.join(stateDir, "tamandua.db"), "agent-scheduler-rspn-instant-fail"),
+    );
+  });
+
+  afterEach(() => {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    shutdownAllCrons();
+    _resetInstantFailStreaks();
+    fs.rmSync(tempHome, { recursive: true, force: true });
+  });
+
+  /**
+   * Seed a running run with a pending step and a fake pi harness that
+   * dies per `mode`:
+   *  - "instant": exit 1 immediately with zero output (the broken-binary
+   *    shape from the campaign #8 evidence — 3ms, exit 1, no output).
+   *  - "output": exit 1 immediately after printing output (NOT an
+   *    instant fail — output bytes > 0 → resets the streak).
+   *  - "clean": exit 0 with a STATUS: done (legitimate round → resets).
+   */
+  function setupInstantFailRound(mode: "instant" | "output" | "clean"): { runId: string; jobId: string; workdir: string } {
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    const workdir = path.join(tempHome, "work");
+    fs.mkdirSync(workdir, { recursive: true });
+
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at) VALUES (?, 'test-wf', 'instant fail task', 'running', ?, ?, ?)",
+    ).run(runId, JSON.stringify({ working_directory_for_harness: workdir }), now, now);
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, created_at, updated_at) VALUES (?, ?, 'step-1', 'test-wf_test-agent', 0, 'do work', 'STATUS', 'pending', ?, ?)",
+    ).run(`${runId}-step`, runId, now, now);
+
+    // Same job-id shape as buildJobId("test-wf", runId, "test-agent").
+    const jobId = `tamandua-test-wf-${runId}-test-agent`;
+
+    const fakePi = path.join(tempHome, "pi-mock");
+    fs.writeFileSync(
+      fakePi,
+      `#!/usr/bin/env node
+if (process.env.FAKE_PI_MODE === "output") {
+  console.log("STATUS: failed");
+  console.log("some diagnostic output");
+}
+if (process.env.FAKE_PI_MODE === "clean") {
+  console.log("STATUS: done");
+  process.exit(0);
+}
+process.exit(1);
+`,
+      { mode: 0o755 },
+    );
+    process.env.TAMANDUA_PI_BINARY = fakePi;
+    process.env.FAKE_PI_MODE = mode;
+
+    return { runId, jobId, workdir };
+  }
+
+  it("classifies instant-fail rounds: ticks instant_fail_count and never touches WLST5 counters", async () => {
+    const { runId, jobId, workdir } = setupInstantFailRound("instant");
+
+    await executeDispatchRound(
+      { id: jobId, workflowId: "test-wf", runId, agentId: "test-wf_test-agent", harnessType: "pi", workingDirectoryForHarness: workdir, createdAt: "" },
+      { id: "test-agent", model: "fake", workspace: { baseDir: "." }, timeoutSeconds: 10 },
+    );
+
+    const db = getDb();
+    const row = db.prepare("SELECT instant_fail_count, worker_lost_count, ceiling_expiry_count FROM runs WHERE id = ?").get(runId) as { instant_fail_count: number; worker_lost_count: number; ceiling_expiry_count: number };
+    assert.equal(row.instant_fail_count, 1, "an instant-fail round must tick instant_fail_count");
+    // WLST5 counters stay untouched — instant-fail is a third, distinct class.
+    assert.equal(row.worker_lost_count, 0, "an unclaimed instant-fail must NOT tick worker_lost_count");
+    assert.equal(row.ceiling_expiry_count, 0, "an instant-fail must NOT tick ceiling_expiry_count");
+
+    const streak = _instantFailStreakFor(jobId);
+    assert.equal(streak?.consecutive, 1, "the per-job streak must be 1 after one instant-fail round");
+    // The step was never claimed and must still be pending.
+    const step = db.prepare("SELECT status FROM steps WHERE id = ?").get(`${runId}-step`) as { status: string };
+    assert.equal(step.status, "pending", "an instant-fail round claims no step — it must stay pending");
+  });
+
+  it("backs off the relaunch after K consecutive instant-fail rounds", async () => {
+    process.env.TAMANDUA_INSTANT_FAIL_BACKOFF_K = "2";
+    process.env.TAMANDUA_INSTANT_FAIL_ESCALATION_N = "100";
+    process.env.TAMANDUA_INSTANT_FAIL_BACKOFF_BASE_MS = "60000";
+    const { runId, jobId, workdir } = setupInstantFailRound("instant");
+    const job = { id: jobId, workflowId: "test-wf", runId, agentId: "test-wf_test-agent", harnessType: "pi", workingDirectoryForHarness: workdir, createdAt: "" };
+    const agent = { id: "test-agent", model: "fake", workspace: { baseDir: "." }, timeoutSeconds: 10 };
+
+    // Rounds 1-2: instant fails, streak climbs to K.
+    await executeDispatchRound(job, agent);
+    await executeDispatchRound(job, agent);
+    let streak = _instantFailStreakFor(jobId);
+    assert.equal(streak?.consecutive, 2, "streak must reach K after K instant-fail rounds");
+    assert.ok(
+      (streak?.nextAllowedDispatchAt ?? 0) > Date.now(),
+      "after K consecutive instant-fails the next relaunch must be delayed (backoff)",
+    );
+
+    // Round 3: the backoff gate must skip it — no new spawn, streak and
+    // counter unchanged.
+    await executeDispatchRound(job, agent);
+    streak = _instantFailStreakFor(jobId);
+    assert.equal(streak?.consecutive, 2, "the backoff-gated round must not increment the streak");
+    const db = getDb();
+    const row = db.prepare("SELECT instant_fail_count, status FROM runs WHERE id = ?").get(runId) as { instant_fail_count: number; status: string };
+    assert.equal(row.instant_fail_count, 2, "the backoff-gated round must not spawn a harness");
+    assert.equal(row.status, "running", "backoff alone must not fail the run");
+  });
+
+  it("force-fails the run at N consecutive instant-fail rounds with the precise reason and alert event", async () => {
+    process.env.TAMANDUA_INSTANT_FAIL_BACKOFF_K = "3";
+    process.env.TAMANDUA_INSTANT_FAIL_ESCALATION_N = "3";
+    process.env.TAMANDUA_INSTANT_FAIL_BACKOFF_BASE_MS = "0"; // no backoff delay so the loop can reach N quickly
+    const { runId, jobId, workdir } = setupInstantFailRound("instant");
+    const job = { id: jobId, workflowId: "test-wf", runId, agentId: "test-wf_test-agent", harnessType: "pi", workingDirectoryForHarness: workdir, createdAt: "" };
+    const agent = { id: "test-agent", model: "fake", workspace: { baseDir: "." }, timeoutSeconds: 10 };
+
+    for (let i = 0; i < 3; i++) {
+      await executeDispatchRound(job, agent);
+    }
+
+    const db = getDb();
+    const row = db.prepare("SELECT instant_fail_count, status FROM runs WHERE id = ?").get(runId) as { instant_fail_count: number; status: string };
+    assert.equal(row.status, "failed", "the run must be force-failed at the escalation threshold");
+    assert.equal(row.instant_fail_count, 3, "instant_fail_count must equal the consecutive round count");
+
+    const events = getRunEvents(runId);
+    const loopAlerts = events.filter((e) => e.event === "run.instant_fail_loop");
+    assert.equal(loopAlerts.length, 1, "escalation must emit exactly one run.instant_fail_loop alert");
+    assert.equal(loopAlerts[0].consecutiveInstantFails, 3, "the alert must carry the consecutive count");
+
+    const forceFailures = events.filter((e) => e.event === "run.force_failed");
+    assert.equal(forceFailures.length, 1, "escalation must force-fail through the sanctioned path");
+    assert.match(
+      forceFailures[0].reason ?? "",
+      /^worker instant-fail loop: 3 consecutive sub-\d+s exit-1 rounds; last command: /,
+      "the force-fail reason must be precise about the loop shape",
+    );
+
+    const streak = _instantFailStreakFor(jobId);
+    assert.equal(streak?.consecutive, 3, "the streak must persist at N for surfacing");
+  });
+
+  it("resets the streak on any non-instant-fail round (output round and clean round)", async () => {
+    process.env.TAMANDUA_INSTANT_FAIL_BACKOFF_K = "3";
+    process.env.TAMANDUA_INSTANT_FAIL_ESCALATION_N = "100";
+    const { runId, jobId, workdir } = setupInstantFailRound("instant");
+    const job = { id: jobId, workflowId: "test-wf", runId, agentId: "test-wf_test-agent", harnessType: "pi", workingDirectoryForHarness: workdir, createdAt: "" };
+    const agent = { id: "test-agent", model: "fake", workspace: { baseDir: "." }, timeoutSeconds: 10 };
+
+    // One instant fail → streak 1.
+    await executeDispatchRound(job, agent);
+    assert.equal(_instantFailStreakFor(jobId)?.consecutive, 1);
+
+    // An exit-1 round that produced output is NOT an instant fail → reset.
+    process.env.FAKE_PI_MODE = "output";
+    await executeDispatchRound(job, agent);
+    assert.equal(_instantFailStreakFor(jobId), undefined, "an output-producing round must reset the streak");
+
+    // A clean STATUS: done round also resets (already undefined).
+    process.env.FAKE_PI_MODE = "clean";
+    await executeDispatchRound(job, agent);
+    assert.equal(_instantFailStreakFor(jobId), undefined, "a clean round must keep the streak reset");
+
+    // The reset rounds must not tick the counter.
+    const db = getDb();
+    const row = db.prepare("SELECT instant_fail_count, status FROM runs WHERE id = ?").get(runId) as { instant_fail_count: number; status: string };
+    assert.equal(row.instant_fail_count, 1, "only classified instant-fail rounds tick instant_fail_count");
+    assert.equal(row.status, "running", "the run must still be running after reset rounds");
+  });
+
+  it("surfaces the instant-fail loop through the status data layer (workflow status / runs)", async () => {
+    process.env.TAMANDUA_INSTANT_FAIL_BACKOFF_K = "3";
+    process.env.TAMANDUA_INSTANT_FAIL_ESCALATION_N = "100";
+    const { runId, jobId, workdir } = setupInstantFailRound("instant");
+    const job = { id: jobId, workflowId: "test-wf", runId, agentId: "test-wf_test-agent", harnessType: "pi", workingDirectoryForHarness: workdir, createdAt: "" };
+    const agent = { id: "test-agent", model: "fake", workspace: { baseDir: "." }, timeoutSeconds: 10 };
+
+    for (let i = 0; i < 3; i++) {
+      await executeDispatchRound(job, agent);
+    }
+
+    const { getWorkflowStatus, listRuns } = await import("../../dist/installer/status.js");
+    const detail = getWorkflowStatus(runId);
+    assert.equal(detail.instantFailCount, 3, "workflow status must surface the instant-fail count");
+    const listed = listRuns().find((r) => r.id === runId);
+    assert.equal(listed?.instantFailCount, 3, "the runs list must surface the instant-fail count");
   });
 });
 

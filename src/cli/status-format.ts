@@ -53,6 +53,7 @@ import { resolveSourcePath, resolveSkillPath } from "../installer/paths.js";
 import { readVersionStatus, type VersionStatus } from "../lib/version-check.js";
 import { listRuns as defaultListRuns, type RunInfo } from "../installer/status.js";
 import { parseEtimeSeconds } from "../lib/proc-info.js";
+import { getInstantFailBackoffThreshold } from "../installer/instant-fail.js";
 
 export function formatServiceStatus(opts?: {
   getDashboardStatus?: typeof getDashboardStatus;
@@ -355,8 +356,15 @@ export function formatRunsSummary(opts?: {
       const redLedgerMarker = r.redLedgerLanding
         ? `  RED LEDGER row ${r.redLedgerLanding.ledgerRowId}, exit ${r.redLedgerLanding.exitCode} @ ${r.redLedgerLanding.ledgerCreatedAt}`
         : "";
+      // Instant-fail loop surfacing (DDTH): a run with K+ consecutive
+      // instant-fail worker rounds is backing off toward force-fail
+      // escalation — annotate it so the pathology is visible before fatal.
+      const instantFailMarker =
+        r.instantFailCount >= getInstantFailBackoffThreshold()
+          ? `  INSTANT-FAIL LOOP (${r.instantFailCount} consecutive)`
+          : "";
       lines.push(
-        `  [${displayStatus.padEnd(7)}] ${idShort}  ${r.workflowId.padEnd(14)} ${r.tokensSpent.toLocaleString().padStart(8)} tokens  ${taskPreview}${redLedgerMarker}`,
+        `  [${displayStatus.padEnd(7)}] ${idShort}  ${r.workflowId.padEnd(14)} ${r.tokensSpent.toLocaleString().padStart(8)} tokens  ${taskPreview}${redLedgerMarker}${instantFailMarker}`,
       );
     }
   }
