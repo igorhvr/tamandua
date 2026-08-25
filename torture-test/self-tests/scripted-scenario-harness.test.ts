@@ -108,6 +108,14 @@ printf '%s|%s|%s|%s\\n' "$1" "$2" "\${TAMANDUA_SCRIPTED_BEHAVIORS:-}" "$HOME" >>
 case "$2" in
   start|restart|stop) exit 0 ;;
   status) echo 'STATUS: RUNNING'; exit 0 ;;
+  reset-state)
+    # MACP7 US-002: the hermetic fixture stub records the call and performs
+    # the removal (like the real daemon-control), so harness tests can
+    # pre-seed the fixture's scripted state dir and assert it is reset.
+    rm -rf -- '${stateDir}'
+    mkdir -p '${stateDir}'
+    echo 'STATUS: RESET_STATE_OK'
+    exit 0 ;;
   *) exit 92 ;;
 esac
 `);
@@ -298,7 +306,112 @@ describe("hermetic scripted scenario harness", () => {
     assert.match(daemonCalls, /^scripted\|stop\|/m);
     assert.match(daemonCalls, /^scripted\|start\|.*behaviors\.json\|.*$/m);
     assert.match(daemonCalls, /^scripted\|status\|/m);
+    assert.match(daemonCalls, /^scripted\|reset-state\|/m);
 
+  });
+
+  it("MACP7 US-002: invokes daemon-control scripted reset-state exactly once per cell, after the tolerant stop and before the workflow install / daemon start", () => {
+    const fixture = makeFixture();
+    const result = run(harness, [fixture.scenario], fixture.env);
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+    const ops = fs.readFileSync(fixture.calls, "utf8").trim().split("\n").map((line) => line.split("|")[1]);
+    const resetIndexes = ops
+      .map((op, i) => (op === "reset-state" ? i : -1))
+      .filter((i) => i >= 0);
+    assert.equal(resetIndexes.length, 1, `reset-state must run exactly once per cell, got ${resetIndexes.length}`);
+    const firstStop = ops.indexOf("stop");
+    const firstStart = ops.indexOf("start");
+    assert.ok(firstStop >= 0 && resetIndexes[0] > firstStop,
+      "reset-state must run after the tolerant daemon stop (already-stopped accepted)");
+    assert.ok(firstStart > resetIndexes[0],
+      "reset-state must run before daemon start");
+    // The installed workflow copies survive only if the reset ran BEFORE the
+    // workflow install (the reset wipes the whole state dir); the harness
+    // also failed the cell had the install been wiped, so status 0 plus no
+    // residue pins the order.
+    assertNoResidue(fixture);
+  });
+
+  it("MACP7 US-002: a pre-seeded synthetic stale .tamandua is gone before the scenario command runs (cell starts known-clean)", () => {
+    const fixture = makeFixture(`
+[ -f "$TAMANDUA_STATE_DIR/tamandua.db" ] && exit 97
+[ -f "$TAMANDUA_STATE_DIR/events.jsonl" ] && exit 96
+[ -f "$TAMANDUA_STATE_DIR/tamandua.pid" ] && exit 95
+printf '%s\\n' clean >"$TT_TEST_CLEAN_MARKER"
+exit 0
+`, false);
+    const stateDir = path.join(fixture.root, "home-scripted", ".tamandua");
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(path.join(stateDir, "tamandua.db"), "stale synthetic db from a previous attempt\n");
+    fs.writeFileSync(path.join(stateDir, "events.jsonl"), '{"event":"stale-run"}\n');
+    fs.writeFileSync(path.join(stateDir, "tamandua.pid"), "99999999\n");
+    const cleanMarker = path.join(fixture.root, "clean-marker");
+    fixture.env.TT_TEST_CLEAN_MARKER = cleanMarker;
+
+    const result = run(harness, [fixture.scenario], fixture.env);
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+    assert.ok(fs.existsSync(cleanMarker),
+      "the scenario command must run against a reset (stale-free) state dir");
+    // The stale artifacts were cleared through daemon-control (recorded), not
+    // ad-hoc rm, and the reset-state line precedes the start.
+    const calls = fs.readFileSync(fixture.calls, "utf8");
+    assert.match(calls, /^scripted\|reset-state\|/m, "the harness must invoke reset-state through daemon-control");
+    assert.ok(calls.indexOf("reset-state") < calls.indexOf("|start|"),
+      "reset-state must run before daemon start");
+    assertNoResidue(fixture);
+  });
+
+  it("MACP7 US-002: mid-cell daemon restarts do NOT reset — a run created mid-cell survives a restart", () => {
+    const fixture = makeFixture(`
+printf '%s\\n' run-data >"$TAMANDUA_STATE_DIR/my-run.jsonl"
+"$TT_SCENARIO_TEST_DAEMON" scripted stop
+"$TT_SCENARIO_TEST_DAEMON" scripted start
+[ -f "$TAMANDUA_STATE_DIR/my-run.jsonl" ] || exit 95
+printf '%s\\n' survived >"$TT_TEST_RESTART_MARKER"
+exit 0
+`, false);
+    // The scenario's OWN mid-cell restart corridor (w2.21 Step 4 / w2.23c
+    // Step 5 call daemon-control stop/start directly) must not wipe the
+    // run it created mid-cell — only the harness ENTRY resets.
+    fixture.env.TT_SCENARIO_TEST_DAEMON = fixture.env.TT_SCENARIO_DAEMON_CONTROL;
+    const restartMarker = path.join(fixture.root, "restart-marker");
+    fixture.env.TT_TEST_RESTART_MARKER = restartMarker;
+
+    const result = run(harness, [fixture.scenario], fixture.env);
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+    assert.ok(fs.existsSync(restartMarker), "a run created mid-cell must survive the scenario's daemon restart");
+    const ops = fs.readFileSync(fixture.calls, "utf8").trim().split("\n").map((line) => line.split("|")[1]);
+    const resetIndexes = ops
+      .map((op, i) => (op === "reset-state" ? i : -1))
+      .filter((i) => i >= 0);
+    assert.equal(resetIndexes.length, 1, "the ONLY reset happens at harness entry — mid-cell restarts must not reset");
+    assert.ok(resetIndexes[0] < ops.indexOf("start"),
+      "the single reset must happen at harness entry, before the harness daemon start");
+    assert.ok(ops.filter((op) => op === "stop").length >= 2,
+      "the scenario must have performed its own mid-cell stop (restart corridor)");
+    assertNoResidue(fixture);
+  });
+
+  it("MACP7 US-002: fails closed when reset-state fails (the cell must not run against stale state)", () => {
+    const fixture = makeFixture();
+    const daemonStub = fixture.env.TT_SCENARIO_DAEMON_CONTROL as string;
+    fs.writeFileSync(daemonStub, `#!/usr/bin/env bash
+set -eu
+[ "$1" = scripted ] || exit 91
+case "$2" in
+  reset-state) echo 'daemon-control: REFUSING — simulated reset failure' >&2; exit 1 ;;
+  start|restart|stop) exit 0 ;;
+  status) echo 'STATUS: RUNNING'; exit 0 ;;
+  *) exit 92 ;;
+esac
+`, { mode: 0o755 });
+    const result = run(harness, [fixture.scenario], fixture.env);
+    assert.notEqual(result.status, 0, "a failed reset-state must fail the cell");
+    assert.match(result.stderr, /reset-state failed/,
+      "the failure must name the reset-state failure");
+    assert.equal(fs.existsSync(fixture.invocations), false,
+      "the scenario command must never run after a failed reset");
+    assertNoResidue(fixture);
   });
 
   it("restores the account home for daemon-control when the controller parent uses scripted HOME", () => {
@@ -391,7 +504,7 @@ wait
     assert.match(source, /daemon-control/);
     assert.doesNotMatch(source, /\b(?:3334|3338|3339)\b/);
     assert.doesNotMatch(source, /(?:^|["'])~\/\.tamandua/);
-    assert.match(source, /start\|status\|restart\|stop/);
+    assert.match(source, /start\|status\|restart\|stop\|reset-state/);
     assert.match(source, /"\$DAEMON_CONTROL" scripted "\$operation"/);
     assert.match(daemonSource, /systemctl --user stop "\$\{prov_scope%\.scope\}\.scope"/);
     assert.match(daemonSource, /systemctl --user stop "\$\{scope_unit%\.scope\}\.scope"/);

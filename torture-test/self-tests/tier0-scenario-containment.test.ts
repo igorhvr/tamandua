@@ -156,6 +156,13 @@ printf '%s|%s|%s\\n' "$1" "$2" "$HOME" >>"${calls}"
 case "$2" in
   start|restart|stop) exit 0 ;;
   status) echo 'STATUS: RUNNING'; exit 0 ;;
+  reset-state)
+    # MACP7 US-002: the hermetic fixture stub records the call and performs
+    # the removal, so the harness's per-cell reset works in these tests too.
+    rm -rf -- '${stateDir}'
+    mkdir -p '${stateDir}'
+    echo 'STATUS: RESET_STATE_OK'
+    exit 0 ;;
   *) exit 92 ;;
 esac
 `);

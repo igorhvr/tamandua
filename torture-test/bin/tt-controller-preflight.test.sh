@@ -10,6 +10,14 @@
 # runs. The harness-auth leg (US-006) only runs when the current selection
 # requires a real pi/hermes harness.
 #
+# MACP7 US-003 extends this file with the SCRIPTED-campaign preflight wiring:
+# a FRESH --scripted-only campaign carrying a scripted WORKFLOW case resets
+# the CONTAINED scripted state (daemon-control scripted reset-state) exactly
+# once BEFORE case execution and then runs the scripted catalog install; a
+# RESUME never resets; a failing reset aborts the campaign closed with the
+# DISTINCT 'scripted-state-reset-failed' category and the daemon's stderr
+# captured on the campaign preflight state.
+#
 # The preflight helper paths are injected via TT_CONTROLLER_PREFLIGHT_* so the
 # wiring is exercised with deterministic stub helpers (except the final
 # real-daemon scenario, which uses the real helpers to prove the contained
@@ -288,5 +296,197 @@ if [ -d "$TT_DIR/var/daemon-control" ]; then
   done
 fi
 pass "AC3 (real): controller brought the real TT daemon up and stopped it; ports 43xx free, no leaked daemon"
+
+# ══ MACP7 US-003: per-campaign scripted-state reset in the scripted preflight ══
+# A FRESH --scripted-only campaign carrying a scripted WORKFLOW case must
+# reset the CONTAINED scripted state (daemon-control scripted reset-state)
+# exactly ONCE before case execution, then run the scripted catalog install
+# into the fresh home; a RESUME must NOT reset (it reconciles the persisted
+# state from the previous attempt). A failing reset aborts the campaign closed
+# with the DISTINCT machine-parseable 'scripted-state-reset-failed' category
+# and the daemon's stderr captured on the campaign preflight state.
+#
+# The scripted WORKFLOW case (harness scripted-pi, execution_mode scripted,
+# fixture 'none', NO scenario cell) is hermetic: the launch/status polls go
+# through a stub `tamandua` on PATH, and the daemon-control invocations go
+# through a stub daemon-control inside torture-test/var (so
+# daemonControlAvailable() resolves it). Zero tokens; the only real contained
+# mutation is the catalog-install leg's `workflow install --all` into
+# var/home-scripted/.tamandua, which is backed up and restored here.
+WF_MANIFEST="$TEST_ROOT/manifest-scripted-wf.jsonl"
+cat > "$WF_MANIFEST" <<EOF
+{"id":"PF-SCRIPTED-WF","wave":4,"workflow":"bug-fix-merge-worktree","fixture":"none","harness":"scripted-pi","task":"tasks/W3.07.md","context":{"execution_mode":"scripted","test_cmd":"npm test"},"caps":{"tokens":0,"wall_min":5},"requires":{},"boundary_files":[],"forbidden":[],"oracles":[],"gates":[],"chaos":null,"shed_ok":false,"mandatory":true,"class":"verification"}
+EOF
+
+# Stub `tamandua` on PATH (default stdout mode): `workflow run` prints the run
+# id + terminal wait JSON, status polls return completed, runs return empty,
+# stop/wait are no-ops — the same hermetic shape tt-controller.test.sh uses.
+WF_BIN="$TEST_ROOT/wf-bin"
+WF_EVENTS="$TEST_ROOT/wf-events.jsonl"
+mkdir -p "$WF_BIN"
+: > "$WF_EVENTS"
+cat > "$WF_BIN/tamandua" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$(node -e 'process.stdout.write(JSON.stringify({argv:process.argv.slice(1),at:Date.now()}))' "$@")" >> "${CONTROLLER_WORKFLOW_EVENTS:-/tmp/controller-wf-events.jsonl}"
+if [ "${1:-}" = "workflow" ] && [ "${2:-}" = "runs" ]; then printf '%s\n' '{"runs":[]}'; exit 0; fi
+if [ "${1:-}" = "workflow" ] && [ "${2:-}" = "status" ]; then
+  printf '{"runId":"run-11111111-1111-4111-8111-111111111111","status":"completed","tokensSpent":0,"steps":[]}\n'
+  exit 0
+fi
+if [ "${1:-}" = "workflow" ] && [ "${2:-}" = "stop" ]; then exit 0; fi
+if [ "${1:-}" = "workflow" ] && [ "${2:-}" = "wait" ]; then
+  printf '{"runs":[{"runId":"%s","status":"completed"}],"timedOut":false}\n' "${3:-}"
+  exit 0
+fi
+printf 'Run: run-11111111-1111-4111-8111-111111111111\n'
+printf '{"status":"completed"}\n'
+STUB
+chmod +x "$WF_BIN/tamandua"
+
+# Stub daemon-control (inside torture-test/var so daemonControlAvailable()
+# resolves it): records every invocation to $DC_LOG. reset-state is
+# RECORDING-ONLY here — the DESTRUCTIVE semantics (removal + recreation of
+# the contained state dir) belong to daemon-control itself (US-001,
+# daemon-control.test.sh) and to the scenario harness (US-002,
+# scripted-scenario-harness.test.ts); this test pins the CONTROLLER wiring:
+# exactly-once invocation before case execution, no reset on resume, and
+# fail-closed on a failing reset. Keeping the state dir intact also lets the
+# hermetic workflow case execute to terminal against the pre-seeded minimal
+# DB (a real campaign gets its DB from the daemon start instead). A
+# fail-reset mode prints the DISTINCT REASON and exits 1 so the campaign's
+# fail-closed path is exercised.
+DC_LOG="$TEST_ROOT/daemon-control-events.jsonl"
+DC_MODE_FILE="$TEST_ROOT/dc-mode"
+: > "$DC_LOG"
+printf 'ok' > "$DC_MODE_FILE"
+dc_stub="$STUB_DIR/daemon-control"
+cat > "$dc_stub" <<'STUB'
+#!/usr/bin/env bash
+set -u
+{ printf 'CALL daemon-control %s\n' "$*"; } >> "${DC_LOG:-/tmp/controller-dc.log}"
+mode="ok"
+[ -n "${DC_MODE_FILE:-}" ] && [ -f "$DC_MODE_FILE" ] && mode="$(cat "$DC_MODE_FILE")"
+if [ "${1:-}" = "scripted" ] && [ "${2:-}" = "reset-state" ]; then
+  if [ "$mode" = "fail-reset" ]; then
+    printf 'REASON: scripted-state-reset-failed\n' >&2
+    exit 1
+  fi
+  printf 'STATUS: RESET_STATE_OK\n'
+  printf '  state_dir: %s\n' "${TAMANDUA_STATE_DIR:-}"
+  exit 0
+fi
+exit 0
+STUB
+chmod +x "$dc_stub"
+
+# Backup the CONTAINED scripted state around the campaign tests (the catalog-
+# install leg mutates var/home-scripted/.tamandua), then seed a minimal
+# runs/steps-schema DB so the hermetic workflow case's run-inventory query has
+# a contained DB to read (history-independent — the same seed tt-controller
+# .test.sh uses). Restored even on failure via the EXIT trap.
+SCRIPTED_HOME="$TT_DIR/var/home-scripted"
+SCRIPTED_STATE="$SCRIPTED_HOME/.tamandua"
+SCRIPTED_STATE_BACKUP="$TEST_ROOT/original-scripted-state"
+if [ -d "$SCRIPTED_STATE" ]; then mv "$SCRIPTED_STATE" "$SCRIPTED_STATE_BACKUP"; fi
+mkdir -p "$SCRIPTED_STATE"
+node --input-type=module - "$SCRIPTED_STATE/tamandua.db" <<'NODE'
+import { DatabaseSync } from 'node:sqlite';
+const database = new DatabaseSync(process.argv[2]);
+database.exec(`CREATE TABLE runs (
+  id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, task TEXT NOT NULL,
+  status TEXT NOT NULL, context TEXT NOT NULL DEFAULT '{}',
+  tokens_spent INTEGER NOT NULL DEFAULT 0, scheduling_status TEXT,
+  scheduling_requested_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE steps (
+  id TEXT PRIMARY KEY, run_id TEXT NOT NULL, step_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL, step_index INTEGER NOT NULL, status TEXT NOT NULL,
+  type TEXT NOT NULL DEFAULT 'single', current_story_id TEXT,
+  retry_count INTEGER NOT NULL DEFAULT 0, abandoned_count INTEGER NOT NULL DEFAULT 0,
+  reroute_count INTEGER NOT NULL DEFAULT 0, claim_pid INTEGER,
+  claim_pgid INTEGER,
+  claim_updated_at TEXT, updated_at TEXT NOT NULL
+);`);
+database.close();
+NODE
+restore_scripted_state() {
+  rm -rf -- "$SCRIPTED_STATE"
+  if [ -d "$SCRIPTED_STATE_BACKUP" ]; then mv "$SCRIPTED_STATE_BACKUP" "$SCRIPTED_STATE"; fi
+}
+trap restore_scripted_state EXIT
+
+state_spf() {
+  node -e "const s=require('$RESULTS/$1/state.json');console.log(JSON.stringify(s.scripted_preflight ?? null))"
+}
+dc_reset_count() { grep -c 'reset-state' "$DC_LOG" || true; }
+
+# ══ AC1+AC4: a fresh --scripted-only campaign with a scripted WORKFLOW case
+# invokes `daemon-control scripted reset-state` exactly once BEFORE case
+# execution, then the scripted catalog install runs into the fresh home.
+use_stubs
+: > "$DC_LOG"
+: > "$WF_EVENTS"
+run_controller "" TT_CONTROLLER_DAEMON_CONTROL_PATH="$dc_stub" \
+  DC_LOG="$DC_LOG" DC_MODE_FILE="$DC_MODE_FILE" \
+  CONTROLLER_WORKFLOW_EVENTS="$WF_EVENTS" PATH="$WF_BIN:$PATH" -- \
+  --manifest "$WF_MANIFEST" --scripted-only
+[ "$CONTROLLER_STATUS" -eq 0 ] || fail "US-003 AC1 fresh scripted-only campaign failed: $CONTROLLER_OUTPUT"
+[ -n "$CONTROLLER_CAMPAIGN" ] || fail "US-003 AC1 campaign not recorded"
+ac1_wf_campaign="$CONTROLLER_CAMPAIGN"
+[ "$(dc_reset_count)" -eq 1 ] || fail "US-003 AC1 reset-state not invoked exactly once: $(cat "$DC_LOG")"
+[ "$(grep -c '^CALL daemon-control scripted stop' "$DC_LOG" || true)" -eq 2 ] \
+  || fail "US-003 AC1 expected stop (preflight) + stop (teardown): $(cat "$DC_LOG")"
+first_stop="$(grep -n '^CALL daemon-control scripted stop' "$DC_LOG" | head -n1 | cut -d: -f1)"
+reset_line="$(grep -n 'reset-state' "$DC_LOG" | cut -d: -f1)"
+[ -n "$reset_line" ] && [ "$reset_line" -gt "$first_stop" ] \
+  || fail "US-003 AC1 reset-state must come after the preflight stop: $(cat "$DC_LOG")"
+grep -q '"argv":\["workflow","run"' "$WF_EVENTS" \
+  || fail "US-003 AC1 workflow case did not execute after the reset: $(cat "$WF_EVENTS")"
+ac1_spf="$(state_spf "$ac1_wf_campaign")"
+printf '%s' "$ac1_spf" | grep -q '"ok":true' || fail "US-003 AC1 scripted_preflight not ok: $ac1_spf"
+printf '%s' "$ac1_spf" | grep -q '"stop_ok":true' || fail "US-003 AC1 preflight stop not recorded ok: $ac1_spf"
+printf '%s' "$ac1_spf" | grep -q '"leg":"reset-state"' || fail "US-003 AC1 preflight leg not reset-state: $ac1_spf"
+[ -d "$SCRIPTED_STATE/workflows" ] && [ -n "$(ls -A "$SCRIPTED_STATE/workflows" 2>/dev/null)" ] \
+  || fail "US-003 AC4 scripted catalog install did not run after the reset: $SCRIPTED_STATE/workflows missing or empty"
+pass "US-003 AC1+AC4: fresh scripted-only campaign resets the contained scripted state exactly once before cases, then installs the catalog"
+
+# ══ AC2: a resumed campaign does NOT invoke reset-state (resume reconciles
+# the persisted state from the previous attempt); it still reaches terminal.
+: > "$DC_LOG"
+run_controller "" TT_CONTROLLER_DAEMON_CONTROL_PATH="$dc_stub" \
+  DC_LOG="$DC_LOG" DC_MODE_FILE="$DC_MODE_FILE" \
+  CONTROLLER_WORKFLOW_EVENTS="$WF_EVENTS" PATH="$WF_BIN:$PATH" -- \
+  --manifest "$WF_MANIFEST" --resume "$ac1_wf_campaign"
+[ "$CONTROLLER_STATUS" -eq 0 ] || fail "US-003 AC2 resume failed: $CONTROLLER_OUTPUT"
+[ "$(dc_reset_count)" -eq 0 ] || fail "US-003 AC2 resume must NOT reset-state: $(cat "$DC_LOG")"
+[ "$(grep -c '^CALL daemon-control scripted stop' "$DC_LOG" || true)" -eq 1 ] \
+  || fail "US-003 AC2 resume expected only the teardown stop: $(cat "$DC_LOG")"
+pass "US-003 AC2: a resumed campaign does not invoke reset-state"
+
+# ══ AC3: a failing reset-state aborts the campaign closed with the DISTINCT
+# 'scripted-state-reset-failed' category and the daemon's stderr captured.
+printf 'fail-reset' > "$DC_MODE_FILE"
+: > "$DC_LOG"
+: > "$WF_EVENTS"
+run_controller "" TT_CONTROLLER_DAEMON_CONTROL_PATH="$dc_stub" \
+  DC_LOG="$DC_LOG" DC_MODE_FILE="$DC_MODE_FILE" \
+  CONTROLLER_WORKFLOW_EVENTS="$WF_EVENTS" PATH="$WF_BIN:$PATH" -- \
+  --manifest "$WF_MANIFEST" --scripted-only
+printf '%s' "$CONTROLLER_OUTPUT" | grep -Fq 'scripted-state-reset-failed' \
+  || fail "US-003 AC3 reset failure did not surface scripted-state-reset-failed: $CONTROLLER_OUTPUT"
+[ "$CONTROLLER_STATUS" -ne 0 ] || fail "US-003 AC3 reset failure did not abort (exit 0)"
+[ -n "$CONTROLLER_CAMPAIGN" ] || fail "US-003 AC3 campaign not recorded"
+ac3_spf="$(state_spf "$CONTROLLER_CAMPAIGN")"
+printf '%s' "$ac3_spf" | grep -q '"ok":false' || fail "US-003 AC3 scripted_preflight not failed: $ac3_spf"
+printf '%s' "$ac3_spf" | grep -q '"reason":"scripted-state-reset-failed"' \
+  || fail "US-003 AC3 reason not scripted-state-reset-failed: $ac3_spf"
+printf '%s' "$ac3_spf" | grep -q '"stderr_tail":' \
+  || fail "US-003 AC3 daemon stderr not captured on the preflight state: $ac3_spf"
+[ ! -s "$WF_EVENTS" ] || fail "US-003 AC3 case execution must not start after a failed reset: $(cat "$WF_EVENTS")"
+pass "US-003 AC3: a failing reset-state aborts closed with scripted-state-reset-failed and captured stderr"
+
+restore_scripted_state
+trap - EXIT
 
 printf 'RESULT: All tt-controller preflight wiring tests PASSED\n'

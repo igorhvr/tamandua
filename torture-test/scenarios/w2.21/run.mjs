@@ -5,6 +5,7 @@ import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { realAccountHome } from "../lib/operator-home.mjs";
+import { waitForTerminalRun } from "../lib/terminal-wait.mjs";
 
 const repoRoot = requiredEnv("TT_REPO_ROOT");
 const invocationDir = requiredEnv("TT_SCENARIO_STATE_DIR");
@@ -87,24 +88,16 @@ try {
     `daemon restart failed: ${startResult.stderr}`);
 
   // ── Step 5: Poll for terminal state ─────────────────────────────
-  let terminalStatus;
-  for (let attempt = 0; attempt < 60; attempt++) {
-    const pollDb = new DatabaseSync(path.join(scriptedStateDir, "tamandua.db"), { readOnly: true });
-    try {
-      const row = pollDb.prepare(
-        "SELECT status FROM runs WHERE id = ?"
-      ).get(dbRunId);
-      if (row && (row.status === "completed" || row.status === "failed" || row.status === "canceled")) {
-        terminalStatus = row.status;
-        break;
-      }
-    } finally {
-      pollDb.close();
-    }
-    await sleep(1000);
-  }
-
-  assert.ok(terminalStatus, `run ${runId} did not reach terminal state within timeout`);
+  // Shared terminal-wait helper (lib/terminal-wait.mjs, MACP7 US-004): a
+  // register-run failure ("harness workdir is already set" class) surfaces
+  // immediately as SCRIPTED_RUN_REGISTRATION_FAILED with the daemon's error
+  // captured, instead of a generic did-not-reach-terminal timeout.
+  const terminalStatus = await waitForTerminalRun({
+    dbPath: path.join(scriptedStateDir, "tamandua.db"),
+    runId,
+    timeoutMs: 120_000,
+    pollMs: 1000,
+  });
   assert.equal(terminalStatus, "completed",
     `expected run completed, got ${terminalStatus}`);
 
@@ -151,8 +144,4 @@ function requiredEnv(name) {
   const value = process.env[name];
   if (!value) throw new Error(`missing scenario environment: ${name}`);
   return value;
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }

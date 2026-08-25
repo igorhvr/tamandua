@@ -4333,6 +4333,158 @@ if (item.phase !== 'terminal' || item.outcome !== 'TEST_INFRA_FAIL'
 NODE
 pass "local hook runtime is bounded by the case wall cap"
 
+# ── MACP7 US-005: register-run collision classification ────────────────
+# A scripted local command that fails with no spawn error is PRODUCT_FAIL
+# 'local-command-failed' UNLESS the durable command.stderr/stdout carries the
+# register-run collision signature — the scenario helper's
+# `SCRIPTED_RUN_REGISTRATION_FAILED:` marker (scenarios/lib/terminal-wait.mjs,
+# US-004) or the daemon's 'register-run failed' / 'harness workdir is already
+# scheduled' text (control-server.ts) — then it reclassifies TEST_INFRA_FAIL
+# with the DISTINCT category 'scripted-run-registration-failed' and the
+# captured daemon error. PASS outcomes and non-registration failures (and REAL
+# cells whose stderr coincidentally carries the text) are never reclassified.
+write_us005_case() {
+  local manifest="$1"
+  local id="$2"
+  local execution_mode="$3"
+  local exit_code="$4"
+  local stderr_text="$5"
+  local stdout_text="$6"
+  node --input-type=module - "$manifest" "$id" "$execution_mode" "$exit_code" "$stderr_text" "$stdout_text" <<'NODE'
+import fs from 'node:fs';
+const [manifest, id, executionMode, exitCode, stderrText, stdoutText] = process.argv.slice(2);
+const record = {
+  id, wave: 0, workflow: 'local', fixture: 'none', harness: 'local',
+  task: 'tasks/W3.07.md', context: { execution_mode: executionMode },
+  caps: { tokens: 0, wall_min: 5 }, requires: {}, boundary_files: [], forbidden: [],
+  oracles: [], gates: [], chaos: null, shed_ok: false, mandatory: true, class: 'verification',
+  reset: null,
+  command: {
+    executable: 'node',
+    args: ['-e', 'process.stderr.write(process.argv[1]);process.stdout.write(process.argv[2]);process.exit(Number(process.argv[3]))', stderrText, stdoutText, exitCode],
+    cwd: '.',
+  },
+};
+fs.writeFileSync(manifest, `${JSON.stringify(record)}\n`);
+NODE
+}
+
+# AC1 — marker on stderr: distinct TEST_INFRA_FAIL category + captured daemon
+# error (never a generic local-command-failed PRODUCT_FAIL).
+us005_marker_manifest="$TEST_ROOT/manifests/us005-marker.jsonl"
+write_us005_case "$us005_marker_manifest" "US005-MARKER" scripted 3 \
+  "SCRIPTED_RUN_REGISTRATION_FAILED: Run run-collide-1 harness workdir is already scheduled for run run-stale-1: /repo/var/home-scripted/.tamandua/worktrees/collide" \
+  "scenario stdout"
+us005_marker_output=$(run_recorded_campaign "$CONTROLLER" --manifest "$us005_marker_manifest") || fail "US-005 marker case should be recorded: $us005_marker_output"
+us005_marker_id=$(remember_campaign "$us005_marker_output")
+node --input-type=module - "$TT_DIR/var/results/$us005_marker_id/state.json" <<'NODE'
+import fs from 'node:fs';
+const state = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const item = state.cases[0];
+const attempt = item.attempts[0];
+const reason = attempt?.classification_reason;
+if (item.phase !== 'terminal' || item.outcome !== 'TEST_INFRA_FAIL'
+    || attempt?.outcome !== 'TEST_INFRA_FAIL') {
+  throw new Error(`marker collision cell was not TEST_INFRA_FAIL: ${JSON.stringify(item)}`);
+}
+if (reason?.category !== 'scripted-run-registration-failed') {
+  throw new Error(`distinct category missing: ${JSON.stringify(reason)}`);
+}
+if (reason.registration_source !== 'scenario-marker'
+    || !reason.registration_error.includes('harness workdir is already scheduled')
+    || !reason.registration_error.includes('run-stale-1')
+    || reason.exit_code !== 3) {
+  throw new Error(`marker daemon error not captured: ${JSON.stringify(reason)}`);
+}
+NODE
+pass "US-005: scripted marker stderr reclassifies TEST_INFRA_FAIL scripted-run-registration-failed with the daemon error"
+
+# AC1 — daemon's own log line on STDOUT: JSON error field extracted as the
+# captured snippet (proves the stdout scan and the daemon-evidence source).
+us005_daemon_manifest="$TEST_ROOT/manifests/us005-daemon.jsonl"
+write_us005_case "$us005_daemon_manifest" "US005-DAEMON" scripted 4 \
+  "unrelated stderr" \
+  "[2026-08-25 04:15:35] ERROR control-server: register-run failed {\"runId\":\"run-collide-2\",\"error\":\"Run run-collide-2 harness workdir is already scheduled for run run-stale-2: /repo/var/home-scripted/.tamandua/worktrees/collide\"}"
+us005_daemon_output=$(run_recorded_campaign "$CONTROLLER" --manifest "$us005_daemon_manifest") || fail "US-005 daemon case should be recorded: $us005_daemon_output"
+us005_daemon_id=$(remember_campaign "$us005_daemon_output")
+node --input-type=module - "$TT_DIR/var/results/$us005_daemon_id/state.json" <<'NODE'
+import fs from 'node:fs';
+const state = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const item = state.cases[0];
+const attempt = item.attempts[0];
+const reason = attempt?.classification_reason;
+if (item.outcome !== 'TEST_INFRA_FAIL' || attempt?.outcome !== 'TEST_INFRA_FAIL') {
+  throw new Error(`daemon-evidence collision cell was not TEST_INFRA_FAIL: ${JSON.stringify(item)}`);
+}
+if (reason?.category !== 'scripted-run-registration-failed') {
+  throw new Error(`distinct category missing: ${JSON.stringify(reason)}`);
+}
+if (reason.registration_source !== 'daemon-evidence'
+    || !reason.registration_error.includes('harness workdir is already scheduled for run run-stale-2')
+    || reason.exit_code !== 4) {
+  throw new Error(`daemon JSON error not captured: ${JSON.stringify(reason)}`);
+}
+NODE
+pass "US-005: daemon register-run-failed text reclassifies with the JSON error captured"
+
+# AC2 — non-registration scripted failure keeps PRODUCT_FAIL.
+us005_nomarker_manifest="$TEST_ROOT/manifests/us005-nomarker.jsonl"
+write_us005_case "$us005_nomarker_manifest" "US005-NOMARKER" scripted 5 \
+  "unrelated cell failure: boom" \
+  "plain stdout"
+us005_nomarker_output=$(run_recorded_campaign "$CONTROLLER" --manifest "$us005_nomarker_manifest") || fail "US-005 no-marker case should be recorded: $us005_nomarker_output"
+us005_nomarker_id=$(remember_campaign "$us005_nomarker_output")
+node --input-type=module - "$TT_DIR/var/results/$us005_nomarker_id/state.json" <<'NODE'
+import fs from 'node:fs';
+const state = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const item = state.cases[0];
+const attempt = item.attempts[0];
+if (item.outcome !== 'PRODUCT_FAIL' || attempt?.outcome !== 'PRODUCT_FAIL'
+    || attempt?.classification_reason?.category !== 'verification-expectation-not-met') {
+  throw new Error(`non-registration failure was reclassified: ${JSON.stringify(item)}`);
+}
+NODE
+pass "US-005: non-registration scripted failure keeps PRODUCT_FAIL (no false positive)"
+
+# AC2 — REAL cell whose stderr carries the marker text is NOT reclassified
+# (the reclassification is scripted-only).
+us005_real_manifest="$TEST_ROOT/manifests/us005-real.jsonl"
+write_us005_case "$us005_real_manifest" "US005-REAL" real 6 \
+  "SCRIPTED_RUN_REGISTRATION_FAILED: Run run-collide-3 harness workdir is already scheduled for run run-stale-3: /path" \
+  "out"
+us005_real_output=$(run_recorded_campaign "$CONTROLLER" --manifest "$us005_real_manifest") || fail "US-005 real case should be recorded: $us005_real_output"
+us005_real_id=$(remember_campaign "$us005_real_output")
+node --input-type=module - "$TT_DIR/var/results/$us005_real_id/state.json" <<'NODE'
+import fs from 'node:fs';
+const state = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const item = state.cases[0];
+const attempt = item.attempts[0];
+if (item.outcome !== 'PRODUCT_FAIL' || attempt?.outcome !== 'PRODUCT_FAIL'
+    || attempt?.classification_reason?.category !== 'verification-expectation-not-met') {
+  throw new Error(`real-mode marker text was reclassified: ${JSON.stringify(item)}`);
+}
+NODE
+pass "US-005: REAL cells are never reclassified by the scripted marker (scripted-only)"
+
+# AC2 — PASS is never reclassified, even when stderr carries the marker text.
+us005_pass_manifest="$TEST_ROOT/manifests/us005-pass.jsonl"
+write_us005_case "$us005_pass_manifest" "US005-PASS" scripted 0 \
+  "SCRIPTED_RUN_REGISTRATION_FAILED: Run run-collide-4 harness workdir is already scheduled" \
+  "out"
+us005_pass_output=$(run_recorded_campaign "$CONTROLLER" --manifest "$us005_pass_manifest") || fail "US-005 pass case should be recorded: $us005_pass_output"
+us005_pass_id=$(remember_campaign "$us005_pass_output")
+node --input-type=module - "$TT_DIR/var/results/$us005_pass_id/state.json" <<'NODE'
+import fs from 'node:fs';
+const state = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const item = state.cases[0];
+const attempt = item.attempts[0];
+if (item.outcome !== 'PASS' || attempt?.outcome !== 'PASS'
+    || attempt?.classification_reason !== undefined) {
+  throw new Error(`passing marker-text cell was reclassified: ${JSON.stringify(item)}`);
+}
+NODE
+pass "US-005: PASS outcomes are never reclassified"
+
 daemon_manifest="$TEST_ROOT/manifests/daemon-required.jsonl"
 valid_case "DAEMON-REQUIRED" | sed 's/"requires":{"toolchains":\["node"\]}/"requires":{}/' > "$daemon_manifest"
 if [ ! -x "$TT_DIR/bin/daemon-control" ]; then

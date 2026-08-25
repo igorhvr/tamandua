@@ -6,6 +6,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { realAccountHome } from "../lib/operator-home.mjs";
+import { waitForTerminalRun } from "../lib/terminal-wait.mjs";
 
 const repoRoot = requiredEnv("TT_REPO_ROOT");
 const invocationDir = requiredEnv("TT_SCENARIO_STATE_DIR");
@@ -130,29 +131,18 @@ try {
     `daemon start failed: ${startResult.stderr}`);
 
   // ── Step 6: Poll for terminal state ─────────────────────────────
+  // Shared terminal-wait helper (lib/terminal-wait.mjs, MACP7 US-004): a
+  // register-run failure ("harness workdir is already set" class) surfaces
+  // immediately as SCRIPTED_RUN_REGISTRATION_FAILED with the daemon's error
+  // captured, instead of a generic did-not-reach-terminal timeout.
   // With scripted behaviors producing STATUS: done, the run should reach
   // a terminal state (completed or failed) quickly. Budget 120s.
-  let terminalStatus;
-  const pollDb = () => new DatabaseSync(path.join(scriptedStateDir, "tamandua.db"), { readOnly: true });
-
-  for (let attempt = 0; attempt < 120; attempt++) {
-    const readDb = pollDb();
-    try {
-      const row = readDb.prepare(
-        "SELECT status, scheduling_status FROM runs WHERE id = ?"
-      ).get(dbRunId);
-
-      if (row && (row.status === "completed" || row.status === "failed" || row.status === "canceled")) {
-        terminalStatus = row.status;
-        break;
-      }
-    } finally {
-      readDb.close();
-    }
-    await sleep(1000);
-  }
-
-  assert.ok(terminalStatus, `run ${runId} did not reach terminal state within 120s`);
+  const terminalStatus = await waitForTerminalRun({
+    dbPath: path.join(scriptedStateDir, "tamandua.db"),
+    runId,
+    timeoutMs: 120_000,
+    pollMs: 1000,
+  });
 
   // ── Step 7: Verify the daemon did not crash ─────────────────────
   // If we got here without an assertion failure, the daemon is alive.
@@ -230,8 +220,4 @@ function requiredEnv(name) {
   const value = process.env[name];
   if (!value) throw new Error(`missing scenario environment: ${name}`);
   return value;
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }

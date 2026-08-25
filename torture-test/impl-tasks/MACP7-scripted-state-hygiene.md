@@ -53,3 +53,84 @@ bare tier1 STILL goes GREEN. Document expected mac outcome.
   task is about home-scripted only. No concurrent runs expected;
   quiet-window discipline for campaign proofs. Preserve all fail-closed
   verifier/guard semantics.
+
+## Resolution (US-001..US-006)
+
+The leak was closed with five implementation stories plus the mechanical
+guard that would have caught MACP7 before it reached the mac:
+
+- **US-001** added a containment-verified `reset-state` operation to
+  `torture-test/bin/daemon-control` (valid ONLY for kind=scripted; real
+  refused). It resolves the state dir from the spawn env, re-asserts
+  containment strictly inside torture-test/var before any destructive
+  operation, refuses while the scripted daemon is RUNNING, and leaves an
+  empty recreated state dir with the machine-parseable
+  `STATUS: RESET_STATE_OK` marker.
+- **US-002** wired a per-cell reset into the scenario harness
+  (`torture-test/scenarios/lib/run-scripted-scenario`): tolerant stop ->
+  `daemon-control scripted reset-state` -> workflow install -> daemon
+  start. Granularity decision: per-cell reset at harness ENTRY only;
+  mid-cell daemon restarts inside a scenario (w2.21 Step 4 / w2.23c Step
+  5) intentionally do NOT reset so a run created mid-cell survives.
+- **US-003** added the per-campaign minimum in tt-controller's
+  scripted-only preflight (before the catalog install): ensure the
+  scripted daemon is stopped, reset through daemon-control, fail closed
+  with the distinct `scripted-state-reset-failed` category. A resumed
+  campaign NEVER resets.
+- **US-004** made the registration collision loud: the shared
+  terminal-wait helper (`torture-test/scenarios/lib/terminal-wait.mjs`,
+  `waitForTerminalRun`) fails IMMEDIATELY with the machine-parseable
+  marker `SCRIPTED_RUN_REGISTRATION_FAILED: <daemon error>` when
+  scheduling_status='error' — instead of a status-only poll spinning the
+  full 120s budget on the collision class (the register-run failure is
+  INVISIBLE to status-only waits: control-server sets
+  scheduling_status='error' but leaves status 'running').
+- **US-005** reclassified a scripted local-command failure carrying the
+  register-run signature as TEST_INFRA_FAIL with the DISTINCT category
+  `scripted-run-registration-failed` and the daemon's error captured.
+- **US-006** (this guard): the red-then-green stale-state hygiene
+  self-test `torture-test/self-tests/tier1-macp7-scripted-state-hygiene.test.ts`.
+
+### ROOT-CAUSE NOTE (why linux proof batteries never tripped this)
+
+Every linux W2 cell always ran to completion, leaving NO orphaned backlog
+in the contained scripted state — a restarted daemon had nothing to
+recover, so no registration ever collided. Only an INTERRUPTED campaign
+attempt (the mac's first attempt, killed mid-run) leaves stale
+status='running' runs for the next attempt's restarted daemon to recover.
+A stale-incomplete-run fixture is therefore REQUIRED to reproduce the
+class; a clean-state proof battery can never trip it. The guard (US-006)
+pre-seeds a SYNTHETIC stale incomplete run (direct SQLite writes into the
+contained scripted state: a runs row status='running'
+scheduling_status='active' carrying the harness workdir = the repo root,
+one steps row, and a run-scoped events jsonl — history-independent, no
+real runs needed) and proves the cell still passes with the stale run
+neither resumed nor colliding.
+
+### Heavy-campaign self-tests (THREE lock-step lists)
+
+A self-test under `torture-test/self-tests/` that drives REAL scripted
+daemons / real `tt-controller` campaigns (fixed TT ports 5334/5338/5339,
+zero tokens) belongs to the heavy-campaign class. It is EXCLUDED from the
+bounded `self-tests/run.sh` battery (run.sh must complete in a bounded
+window and never orphan a campaign on timeout) and executed individually
+by `bin/verify-heavy-campaign-tests.test.sh`. Registering a new heavy
+file requires touching **THREE lists in lock-step** or
+`self-tests/e2e-golden-integrity.test.ts` AC5 fails:
+
+1. `torture-test/self-tests/run.sh` -> `HEAVY_CAMPAIGN_TESTS` array
+2. `torture-test/bin/verify-heavy-campaign-tests.test.sh` -> `HEAVY_TESTS`
+3. `torture-test/self-tests/e2e-golden-integrity.test.ts` ->
+   `HEAVY_CAMPAIGN_TESTS` const (AC5 also pins that the file exists and
+   that run.sh filters heavy tests via `is_heavy`)
+
+Quiet-window discipline (stop stray daemon + assert ports free
+before/after), `TAMANDUA_TEST_GUARD=0` + dropping `NODE_TEST_CONTEXT` in
+the campaign env, `TAMANDUA_PI_BINARY`/`TAMANDUA_HERMES_BINARY`
+backstops to `/bin/false`, and a git-cleanliness snapshot before/after
+each leg are the house pattern (mirror
+`tier1-w2-darwin-capable-proof.test.ts`). The scenario harness's
+`TT_SCENARIO_TEST_MODE=1` + `TT_SCENARIO_DAEMON_CONTROL` seam lets a test
+inject a daemon-control shim (e.g. bypass `reset-state` to reproduce
+stale state) while every other operation delegates to the real
+daemon-control.

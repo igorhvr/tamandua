@@ -81,7 +81,7 @@ describe("W0.9 install-shape fidelity scenario", () => {
     assert.match(runner, /remote\.git/);
     assert.doesNotMatch(runner, /\b(?:3334|3338|3339)\b/);
     assert.doesNotMatch(runner, /os\.tmpdir|mkdtemp|\/tmp\//);
-    assert.match(harness, /env PATH="\$REPO_ROOT\/bin:\$PATH"[\s\S]*?"\$DAEMON_CONTROL" scripted/,
+    assert.match(harness, /env HOME="\$ACCOUNT_HOME" PATH="\$REPO_ROOT\/bin:\$PATH"[\s\S]*?"\$DAEMON_CONTROL" scripted/,
       "scripted daemon must launch the checkout under test, not an unrelated PATH install");
   });
 });

@@ -89,6 +89,12 @@ HEAVY_CAMPAIGN_TESTS=(
     'tier1-scripted-probe-battery.test.ts'
     'tier1-kill-sentinel-survival.test.ts'
     'tier1-zero-real-launch-infra.test.ts'
+    # MACP7 US-006: the stale-state hygiene red-then-green proof drives real
+    # scripted-scenario executions (RED + GREEN arms against a pre-seeded
+    # synthetic stale run) plus a pre-polluted bare tier1 campaign — the same
+    # unbounded campaign class as the other heavy proofs, so it is isolated
+    # here with its own ceiling.
+    'tier1-macp7-scripted-state-hygiene.test.ts'
     # MACP4 US-007: the W2 dual-path proof drives 8 real scripted-scenario
     # executions (4 cells x systemd + forced-fallback) plus two bare tier1
     # campaigns — the same unbounded campaign class as the other heavy

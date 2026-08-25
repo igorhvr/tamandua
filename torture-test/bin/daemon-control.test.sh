@@ -87,7 +87,7 @@ echo "--- Test: --help content ---"
 
 help_out="$("$TOOL" --help 2>&1)"
 
-for cmd in start stop restart status; do
+for cmd in start stop restart status reset-state; do
   if echo "$help_out" | grep -q "$cmd"; then
     pass "--help mentions subcommand '$cmd'"
   else
@@ -557,8 +557,12 @@ echo "--- Test: subcommand implementation status ---"
 # All subcommands (start, stop, restart, status) should now be implemented.
 # Verify each one does NOT contain the old stub pattern.
 
-for cmd in start stop restart status; do
-  if grep -A 5 "^cmd_${cmd}()" "$TOOL" | grep -q 'not yet implemented'; then
+for cmd in start stop restart status reset-state; do
+  # bash function names cannot carry a hyphen — reset-state maps to the
+  # cmd_reset_state function (underscore); every other command's function
+  # is named cmd_<cmd> verbatim.
+  fn_name="cmd_${cmd//-/_}"
+  if grep -A 5 "^${fn_name}()" "$TOOL" | grep -q 'not yet implemented'; then
     fail "subcommand '$cmd' still contains 'not yet implemented' (stub)"
   else
     pass "subcommand '$cmd' is implemented (no stub text)"
@@ -566,11 +570,12 @@ for cmd in start stop restart status; do
 done
 
 # Verify each subcommand function exists and has meaningful implementation
-for cmd in start stop restart status; do
-  if grep -q "^cmd_${cmd}()" "$TOOL"; then
-    pass "cmd_${cmd} function exists"
+for cmd in start stop restart status reset-state; do
+  fn_name="cmd_${cmd//-/_}"
+  if grep -q "^${fn_name}()" "$TOOL"; then
+    pass "${fn_name} function exists"
   else
-    fail "cmd_${cmd} function missing"
+    fail "${fn_name} function missing"
   fi
 done
 
@@ -3484,6 +3489,226 @@ if [ -f "$US004_PROV_BAK" ]; then
   cp "$US004_PROV_BAK" "$US004_PROV"
 fi
 rm -f "$US004_PROV_BAK" "$CLI_SIM_SCRIPT" "$CLI_SIM_LOG" "${TMPDIR:-/tmp}/tt-cli-start.out"
+
+# ═══════════════════════════════════════════════════════════════════════
+# US-001 (MACP7): reset-state — containment-verified CONTAINED-scripted
+# state reset
+# ═══════════════════════════════════════════════════════════════════════
+
+echo ""
+echo "=== US-001 (MACP7): reset-state operation ==="
+
+# Scripted state dir from the real spawn env (the reset target).
+SCRIPTED_STATE_DIR="$(bash "$SCRIPT_DIR/../env/tt-env-scripted.sh" print | sed -n 's/^TAMANDUA_STATE_DIR=//p' | head -1)"
+# The REAL contained state dir — must never be touched by reset-state.
+REAL_STATE_DIR="$(bash "$SCRIPT_DIR/../env/tt-env.sh" print | sed -n 's/^TAMANDUA_STATE_DIR=//p' | head -1)"
+
+# ── Test 92: reset-state basic reset (pre-seeded stale state removed) ──
+echo ""
+echo "--- Test: reset-state removes a pre-seeded stale scripted state (US-001) ---"
+
+# Ensure the scripted daemon is stopped (tolerant stop) before seeding.
+set +e
+"$TOOL" scripted stop >/dev/null 2>&1 || true
+set -e
+sleep 1
+
+# Snapshot the REAL contained state dir (if any) — reset-state must never
+# modify it.
+REAL_STATE_SNAPSHOT="$(mktemp "${TMPDIR:-/tmp}/tt-dc-real-state.XXXXXX")"
+if [ -d "$REAL_STATE_DIR" ]; then
+  (cd "$REAL_STATE_DIR" && find . -type f 2>/dev/null | sort) > "$REAL_STATE_SNAPSHOT"
+else
+  echo "(missing)" > "$REAL_STATE_SNAPSHOT"
+fi
+
+# Pre-seed a synthetic stale scripted state (the MACP7 shape: a previous
+# attempt's DB + events + pid bookkeeping).
+mkdir -p "$SCRIPTED_STATE_DIR"
+printf 'synthetic stale tamandua.db\n' > "$SCRIPTED_STATE_DIR/tamandua.db"
+printf '{"run":"stale-run-from-previous-attempt"}\n' > "$SCRIPTED_STATE_DIR/events.jsonl"
+printf '424242\n' > "$SCRIPTED_STATE_DIR/tamandua.pid"
+mkdir -p "$SCRIPTED_STATE_DIR/events"
+printf 'stale event\n' > "$SCRIPTED_STATE_DIR/events/2026-08-24.jsonl"
+
+set +e
+reset_out="$("$TOOL" scripted reset-state 2>&1)"
+reset_rc=$?
+set -e
+
+if [ "$reset_rc" -eq 0 ]; then
+  pass "reset-state exits 0 against a pre-seeded stale scripted state"
+else
+  fail "reset-state failed against pre-seeded stale state (rc=$reset_rc): $(echo "$reset_out" | tail -3)"
+fi
+
+if echo "$reset_out" | grep -q "STATUS: RESET_STATE_OK"; then
+  pass "reset-state prints the machine-parseable STATUS: RESET_STATE_OK marker"
+else
+  fail "reset-state missing RESET_STATE_OK marker: $(echo "$reset_out" | tail -3)"
+fi
+
+if [ -d "$SCRIPTED_STATE_DIR" ] && [ -z "$(ls -A "$SCRIPTED_STATE_DIR" 2>/dev/null)" ]; then
+  pass "reset-state leaves an EMPTY recreated state dir"
+else
+  fail "state dir not empty after reset: $(ls -A "$SCRIPTED_STATE_DIR" 2>/dev/null | tr '\n' ' ')"
+fi
+
+if [ ! -e "$SCRIPTED_STATE_DIR/tamandua.db" ] && [ ! -e "$SCRIPTED_STATE_DIR/events.jsonl" ] && [ ! -e "$SCRIPTED_STATE_DIR/tamandua.pid" ]; then
+  pass "stale tamandua.db / events / tamandua.pid removed by reset-state"
+else
+  fail "stale state files survived reset-state"
+fi
+
+# ── Test 93: reset-state is idempotent ────────────────────────────────
+echo ""
+echo "--- Test: reset-state idempotent (already-empty / missing dir) ---"
+
+set +e
+reset_idem_out="$("$TOOL" scripted reset-state 2>&1)"
+reset_idem_rc=$?
+set -e
+if [ "$reset_idem_rc" -eq 0 ] && echo "$reset_idem_out" | grep -q "STATUS: RESET_STATE_OK"; then
+  pass "reset-state on an already-reset (empty) state dir exits 0 with the marker (idempotent)"
+else
+  fail "reset-state not idempotent on an empty state dir (rc=$reset_idem_rc): $(echo "$reset_idem_out" | tail -3)"
+fi
+
+# Missing dir entirely — must still succeed (rm -rf on a missing path is a
+# no-op, mkdir -p recreates).
+rm -rf -- "$SCRIPTED_STATE_DIR"
+set +e
+reset_missing_out="$("$TOOL" scripted reset-state 2>&1)"
+reset_missing_rc=$?
+set -e
+if [ "$reset_missing_rc" -eq 0 ] && echo "$reset_missing_out" | grep -q "STATUS: RESET_STATE_OK" && [ -d "$SCRIPTED_STATE_DIR" ]; then
+  pass "reset-state on a MISSING state dir recreates it and exits 0 with the marker"
+else
+  fail "reset-state on a missing state dir failed (rc=$reset_missing_rc): $(echo "$reset_missing_out" | tail -3)"
+fi
+
+# ── Test 94: reset-state scripted-only refusal (real refused) ──────────
+echo ""
+echo "--- Test: reset-state is scripted-only (real refused) ---"
+
+set +e
+real_reset_out="$("$TOOL" real reset-state 2>&1)"
+real_reset_rc=$?
+set -e
+if [ "$real_reset_rc" -ne 0 ] && echo "$real_reset_out" | grep -qi "scripted-only\|valid ONLY for kind=scripted\|kind='real' is refused"; then
+  pass "real reset-state exits non-zero with a distinct scripted-only refusal"
+else
+  fail "real reset-state expected scripted-only refusal, rc=$real_reset_rc out=$(echo "$real_reset_out" | tail -2 | tr '\n' ' ')"
+fi
+
+# ── Test 95: reset-state containment refusal (env seam) ────────────────
+echo ""
+echo "--- Test: reset-state fails closed via guard_kind_containment when the spawn-env TAMANDUA_STATE_DIR escapes var (env seam) ---"
+
+RS_TMP="$(mktemp -d "${TMPDIR:-/tmp}/tt-dc-reset.XXXXXX")"
+RS_ESCAPE_DIR="$RS_TMP/escape-target"
+mkdir -p "$RS_ESCAPE_DIR/.tamandua"
+printf 'escape sentinel\n' > "$RS_ESCAPE_DIR/.tamandua/sentinel.txt"
+# Fake scripted env whose TAMANDUA_STATE_DIR escapes torture-test/var. The
+# containment-refusal arm uses daemon-control's TT_DC_ENV_SCRIPTED test seam
+# so the REAL guard_kind_containment choke-point (main dispatch) refuses
+# before any reset work.
+cat > "$RS_TMP/fake-env-scripted.sh" <<FAKEENV
+#!/usr/bin/env bash
+if [ "\${1:-}" = "print" ]; then
+  printf 'TT_REPO_ROOT=%s\n' "$RS_TMP"
+  printf 'TT_ROOT=%s\n' "$RS_TMP/torture-test/var"
+  printf 'HOME=%s\n' "$RS_TMP/escape-home"
+  printf 'TAMANDUA_STATE_DIR=%s\n' "$RS_ESCAPE_DIR/.tamandua"
+  printf 'TAMANDUA_CONTROL_PORT=5339\n'
+  printf 'TAMANDUA_MCP_PORT=5338\n'
+  printf 'TAMANDUA_DASHBOARD_PORT=5334\n'
+  printf 'PATH=%s\n' "\$PATH"
+fi
+FAKEENV
+chmod +x "$RS_TMP/fake-env-scripted.sh"
+
+set +e
+escape_out="$(TT_DC_ENV_SCRIPTED="$RS_TMP/fake-env-scripted.sh" "$TOOL" scripted reset-state 2>&1)"
+escape_rc=$?
+set -e
+if [ "$escape_rc" -ne 0 ] && echo "$escape_out" | grep -qi "escapes torture-test/var\|production guard tripped"; then
+  pass "escaping spawn-env TAMANDUA_STATE_DIR -> reset-state fails closed via guard_kind_containment (rc=$escape_rc)"
+else
+  fail "escaping spawn-env TAMANDUA_STATE_DIR expected fail-closed refusal, rc=$escape_rc out=$(echo "$escape_out" | tail -3 | tr '\n' ' ')"
+fi
+if [ -f "$RS_ESCAPE_DIR/.tamandua/sentinel.txt" ]; then
+  pass "escape-path target untouched after the refused reset-state"
+else
+  fail "escape-path target was modified by the refused reset-state!"
+fi
+rm -rf "$RS_TMP"
+
+# ── Test 96: reset-state refuses while the scripted daemon is RUNNING ──
+echo ""
+echo "--- Test: reset-state refuses while the scripted daemon is RUNNING, succeeds after a stop (US-001) ---"
+
+# The scripted daemon is stopped here (previous tests stopped it). Start it,
+# then reset-state must refuse; stop, then reset-state must succeed.
+set +e
+"$TOOL" scripted start >/dev/null 2>&1
+rs_start_rc=$?
+set -e
+if [ "$rs_start_rc" -eq 0 ] && wait_for_port_listen 5334; then
+  pass "scripted daemon started for the running-refusal test"
+else
+  fail "scripted daemon did not start for the running-refusal test (rc=$rs_start_rc)"
+fi
+
+set +e
+running_reset_out="$("$TOOL" scripted reset-state 2>&1)"
+running_reset_rc=$?
+set -e
+if [ "$running_reset_rc" -ne 0 ] && echo "$running_reset_out" | grep -qi "REFUSING.*RUNNING\|is RUNNING"; then
+  pass "reset-state refuses (non-zero, distinct reason) while the scripted daemon is RUNNING"
+else
+  fail "reset-state expected RUNNING refusal, rc=$running_reset_rc out=$(echo "$running_reset_out" | tail -3 | tr '\n' ' ')"
+fi
+
+set +e
+"$TOOL" scripted stop >/dev/null 2>&1
+rs_stop_rc=$?
+set -e
+sleep 1
+if [ "$rs_stop_rc" -eq 0 ]; then
+  pass "scripted daemon stopped before the post-stop reset"
+else
+  fail "scripted daemon stop failed (rc=$rs_stop_rc) before the post-stop reset"
+fi
+
+set +e
+post_stop_reset_out="$("$TOOL" scripted reset-state 2>&1)"
+post_stop_reset_rc=$?
+set -e
+if [ "$post_stop_reset_rc" -eq 0 ] && echo "$post_stop_reset_out" | grep -q "STATUS: RESET_STATE_OK"; then
+  pass "reset-state succeeds (exit 0, marker) after the scripted daemon is stopped"
+else
+  fail "reset-state failed after stop (rc=$post_stop_reset_rc): $(echo "$post_stop_reset_out" | tail -3)"
+fi
+
+# ── Test 97: reset-state never modifies the REAL contained state ───────
+echo ""
+echo "--- Test: reset-state never modifies var/home/.tamandua (the real contained state) ---"
+
+REAL_STATE_AFTER="$(mktemp "${TMPDIR:-/tmp}/tt-dc-real-state-after.XXXXXX")"
+if [ -d "$REAL_STATE_DIR" ]; then
+  (cd "$REAL_STATE_DIR" && find . -type f 2>/dev/null | sort) > "$REAL_STATE_AFTER"
+else
+  echo "(missing)" > "$REAL_STATE_AFTER"
+fi
+
+if diff -q "$REAL_STATE_SNAPSHOT" "$REAL_STATE_AFTER" >/dev/null 2>&1; then
+  pass "real contained state (var/home/.tamandua) unchanged across all reset-state tests"
+else
+  fail "real contained state (var/home/.tamandua) was MODIFIED by reset-state tests!"
+  diff "$REAL_STATE_SNAPSHOT" "$REAL_STATE_AFTER" >&2 || true
+fi
+rm -f "$REAL_STATE_SNAPSHOT" "$REAL_STATE_AFTER"
 
 echo ""
 echo "================================================"

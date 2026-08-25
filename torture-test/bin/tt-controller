@@ -102,6 +102,21 @@ const DEFAULT_PROVIDER_RETRY_BACKOFF_MS = 60_000;
 const DEFAULT_DEADLINE_SWEEP_INTERVAL_MS = 30_000;
 const EVIDENCE_LIMIT_BYTES = 16 * 1024 * 1024;
 const TERMINAL_RUN_STATUSES = new Set(['completed', 'done', 'failed', 'canceled']);
+// MACP7 US-005: register-run collision signature detection for SCRIPTED local
+// commands. The scenario helper (scenarios/lib/terminal-wait.mjs, US-004)
+// emits the machine-parseable marker `SCRIPTED_RUN_REGISTRATION_FAILED:
+// <daemon error>` on the cell's stderr; the daemon's own failure text is the
+// 'control-server: register-run failed' log line (control-server.ts
+// handleRegisterRun catch arm) whose underlying throw is 'harness workdir is
+// already scheduled' (admitOrQueueRun). Evidence is scanned tail-first within
+// a bounded window and captured snippets are bounded — the full command
+// evidence is already bounded at EVIDENCE_LIMIT_BYTES.
+const SCRIPTED_RUN_REGISTRATION_MARKER = 'SCRIPTED_RUN_REGISTRATION_FAILED:';
+const DAEMON_REGISTER_RUN_FAILED_SUBSTR = 'register-run failed';
+const DAEMON_HARNESS_WORKDIR_SCHEDULED_SUBSTR = 'harness workdir is already scheduled';
+const COMMAND_EVIDENCE_SCAN_BYTES = 64 * 1024;
+const REGISTRATION_ERROR_SNIPPET_BYTES = 2000;
+const EVIDENCE_TAIL_BYTES = 500;
 // E3.C US-005: fail-closed semantic probe_sequence contract. PROBE_OPS mirrors
 // the case.schema.json probeAction op enum and PROBE_WHEN_PATTERN mirrors its
 // `when` phase-marker pattern. The semantic validator (validateProbeSequence)
@@ -2737,6 +2752,107 @@ function chaosGuard(caseRecord, caseState, state, campaignDir) {
   return true;
 }
 
+// MACP7 US-005: bounded tail-first read of a durable command evidence file
+// (command.stdout / command.stderr). Same containment discipline as
+// readHookStdout: the resolved path must be a regular file strictly inside the
+// campaign directory (fail closed on escape / symlink). Returns the last
+// COMMAND_EVIDENCE_SCAN_BYTES bytes as utf8 ('' for a missing/empty file).
+function readCommandEvidenceTail(campaignDir, evidenceRelative) {
+  if (typeof evidenceRelative !== 'string' || evidenceRelative === '') return '';
+  const absolutePath = path.resolve(campaignDir, evidenceRelative);
+  const campaignRoot = fs.realpathSync(campaignDir);
+  if (!pathIsWithin(campaignRoot, absolutePath)) {
+    throw new Error('command evidence path escapes campaign directory');
+  }
+  const details = fs.lstatSync(absolutePath);
+  if (!details.isFile() || details.isSymbolicLink()
+      || !pathIsWithin(campaignRoot, fs.realpathSync(absolutePath))) {
+    throw new Error('command evidence is not a contained regular file');
+  }
+  if (details.size === 0) return '';
+  const length = Math.min(details.size, COMMAND_EVIDENCE_SCAN_BYTES);
+  const buffer = Buffer.alloc(length);
+  const fd = fs.openSync(absolutePath, 'r');
+  try {
+    fs.readSync(fd, buffer, 0, length, details.size - length);
+  } finally {
+    fs.closeSync(fd);
+  }
+  return buffer.toString('utf8');
+}
+
+// MACP7 US-005: scan one evidence stream for the register-run collision
+// signature and return { source, message } where message is the BOUNDED
+// captured error snippet:
+//   - source 'scenario-marker': the terminal-wait.mjs marker line
+//     `SCRIPTED_RUN_REGISTRATION_FAILED: <daemon error>` (US-004) — the error
+//     is the rest of that line.
+//   - source 'daemon-evidence': the daemon's 'control-server: register-run
+//     failed' line (preferring its JSON `error` field when parseable) or the
+//     'harness workdir is already scheduled' throw text — the error is the
+//     containing line.
+// Returns null when the stream carries no signature.
+function registrationCollisionSnippet(text) {
+  const markerIndex = text.indexOf(SCRIPTED_RUN_REGISTRATION_MARKER);
+  if (markerIndex !== -1) {
+    const afterMarker = text.slice(markerIndex + SCRIPTED_RUN_REGISTRATION_MARKER.length);
+    const lineEnd = afterMarker.search(/\r?\n/);
+    const message = (lineEnd === -1 ? afterMarker : afterMarker.slice(0, lineEnd))
+      .trim()
+      .slice(0, REGISTRATION_ERROR_SNIPPET_BYTES);
+    return { source: 'scenario-marker', message };
+  }
+  for (const substr of [DAEMON_REGISTER_RUN_FAILED_SUBSTR, DAEMON_HARNESS_WORKDIR_SCHEDULED_SUBSTR]) {
+    const index = text.indexOf(substr);
+    if (index === -1) continue;
+    const lineStart = text.lastIndexOf('\n', index) + 1;
+    const lineEnd = text.indexOf('\n', index);
+    const line = (lineEnd === -1 ? text.slice(lineStart) : text.slice(lineStart, lineEnd)).trim();
+    // The daemon log line carries the error as a trailing JSON object
+    // ({runId, error}); prefer its `error` field when parseable, else the
+    // raw line.
+    let message = line;
+    const jsonStart = line.indexOf('{');
+    if (jsonStart !== -1) {
+      try {
+        const parsed = JSON.parse(line.slice(jsonStart));
+        if (parsed && typeof parsed.error === 'string' && parsed.error.trim() !== '') {
+          message = parsed.error;
+        }
+      } catch {
+        // keep the raw line
+      }
+    }
+    return { source: 'daemon-evidence', message: message.slice(0, REGISTRATION_ERROR_SNIPPET_BYTES) };
+  }
+  return null;
+}
+
+// MACP7 US-005: reclassify a FAILED scripted local command whose durable
+// evidence carries the register-run collision signature. Returns
+// { source, message, stderr_tail, stdout_tail } (message = bounded daemon
+// error snippet) or null when the evidence carries no signature — the caller
+// then keeps the original classification. Unreadable evidence never
+// reclassifies (no false positives).
+function scriptedRegistrationCollision(campaignDir, commandResult) {
+  let stderrText;
+  let stdoutText;
+  try {
+    stderrText = readCommandEvidenceTail(campaignDir, commandResult.stderr);
+    stdoutText = readCommandEvidenceTail(campaignDir, commandResult.stdout);
+  } catch {
+    return null;
+  }
+  const collision = registrationCollisionSnippet(stderrText)
+    ?? registrationCollisionSnippet(stdoutText);
+  if (collision === null) return null;
+  return {
+    ...collision,
+    stderr_tail: stderrText.trim().slice(-EVIDENCE_TAIL_BYTES),
+    stdout_tail: stdoutText.trim().slice(-EVIDENCE_TAIL_BYTES),
+  };
+}
+
 async function executeLocalCase(caseRecord, caseState, state, campaignDir) {
   if (hasAssociatedNonterminalRun(caseState)) return;
   // E3.C US-005: fail-closed semantic probe_sequence gate — a local-command
@@ -2820,15 +2936,53 @@ async function executeLocalCase(caseRecord, caseState, state, campaignDir) {
   attempt.phase = 'terminal';
   attempt.terminal_at = utcTimestamp();
   attempt.terminal_status = hookSucceeded(commandResult) ? 'completed' : 'failed';
-  const baseOutcome = hookSucceeded(commandResult)
-    ? 'PASS'
-    : (commandResult.error === undefined ? 'PRODUCT_FAIL' : 'TEST_INFRA_FAIL');
-  const baseReason = hookSucceeded(commandResult) ? undefined : {
-        category: commandResult.error === undefined ? 'local-command-failed' : 'local-command-launch-failed',
+  let baseOutcome;
+  let baseReason;
+  if (hookSucceeded(commandResult)) {
+    baseOutcome = 'PASS';
+  } else if (commandResult.error !== undefined) {
+    baseOutcome = 'TEST_INFRA_FAIL';
+    baseReason = {
+      category: 'local-command-launch-failed',
+      exit_code: commandResult.exit_code,
+      signal: commandResult.signal,
+      error: commandResult.error,
+    };
+  } else {
+    // MACP7 US-005: a scripted local-command failure with no spawn error is
+    // PRODUCT_FAIL 'local-command-failed' UNLESS the durable evidence carries
+    // the register-run collision signature — then it is infrastructure (stale
+    // contained scripted state), never a product finding. The cell's stderr
+    // carries the terminal-wait.mjs marker (`SCRIPTED_RUN_REGISTRATION_FAILED:
+    // <daemon error>`, US-004) or the daemon's own 'register-run failed' /
+    // 'harness workdir is already scheduled' text. A PASS or a non-registration
+    // failure must never be reclassified (scriptedRegistrationCollision returns
+    // null then and the original classification stands).
+    const registration = attempt.execution_mode === 'scripted'
+      ? scriptedRegistrationCollision(campaignDir, commandResult)
+      : null;
+    if (registration !== null) {
+      baseOutcome = 'TEST_INFRA_FAIL';
+      baseReason = {
+        category: 'scripted-run-registration-failed',
         exit_code: commandResult.exit_code,
         signal: commandResult.signal,
-        error: commandResult.error ?? null,
+        error: null,
+        registration_error: registration.message,
+        registration_source: registration.source,
+        stderr_tail: registration.stderr_tail,
+        stdout_tail: registration.stdout_tail,
       };
+    } else {
+      baseOutcome = 'PRODUCT_FAIL';
+      baseReason = {
+        category: 'local-command-failed',
+        exit_code: commandResult.exit_code,
+        signal: commandResult.signal,
+        error: null,
+      };
+    }
+  }
   const verdict = outcomeWithOracleEvidence(
     caseRecord, baseOutcome, baseReason,
     attempt.execution_mode === 'scripted'
@@ -7692,16 +7846,51 @@ function finishRecoveredAttempt(state, caseState, attempt, campaignDir, outcome,
 
 function harvestRecoveredLocalAttempt(caseRecord, state, caseState, attempt, campaignDir, commandResult) {
   const succeeded = hookSucceeded(commandResult);
-  const baseOutcome = succeeded
-    ? 'PASS'
-    : (commandResult.error === undefined ? 'PRODUCT_FAIL' : 'TEST_INFRA_FAIL');
-  const baseReason = succeeded ? undefined : {
-    category: commandResult.error === undefined ? 'local-command-failed' : 'local-command-launch-failed',
-    exit_code: commandResult.exit_code,
-    signal: commandResult.signal,
-    error: commandResult.error ?? null,
-    recovered: true,
-  };
+  let baseOutcome;
+  let baseReason;
+  if (succeeded) {
+    baseOutcome = 'PASS';
+  } else if (commandResult.error !== undefined) {
+    baseOutcome = 'TEST_INFRA_FAIL';
+    baseReason = {
+      category: 'local-command-launch-failed',
+      exit_code: commandResult.exit_code,
+      signal: commandResult.signal,
+      error: commandResult.error,
+      recovered: true,
+    };
+  } else {
+    // MACP7 US-005: same register-run collision reclassification as
+    // executeLocalCase — a RECOVERED scripted local-command failure carrying
+    // the collision signature in its durable evidence is infrastructure, never
+    // a product finding.
+    const registration = attempt.execution_mode === 'scripted'
+      ? scriptedRegistrationCollision(campaignDir, commandResult)
+      : null;
+    if (registration !== null) {
+      baseOutcome = 'TEST_INFRA_FAIL';
+      baseReason = {
+        category: 'scripted-run-registration-failed',
+        exit_code: commandResult.exit_code,
+        signal: commandResult.signal,
+        error: null,
+        recovered: true,
+        registration_error: registration.message,
+        registration_source: registration.source,
+        stderr_tail: registration.stderr_tail,
+        stdout_tail: registration.stdout_tail,
+      };
+    } else {
+      baseOutcome = 'PRODUCT_FAIL';
+      baseReason = {
+        category: 'local-command-failed',
+        exit_code: commandResult.exit_code,
+        signal: commandResult.signal,
+        error: null,
+        recovered: true,
+      };
+    }
+  }
   const childEnv = loadSpawnEnvironment(attempt.execution_mode === 'scripted');
   const verdict = outcomeWithOracleEvidence(
     caseRecord, baseOutcome, baseReason,
@@ -8386,6 +8575,14 @@ function createInitialState(campaignId, manifestPath, manifest, options) {
     // otherwise. Records the preflight legs and, at teardown, the daemon-stop
     // outcome so a failure is attributable to a DISTINCT reason (US-004 AC2).
     real_preflight: null,
+    // MACP7 US-003: populated only when the campaign runs the SCRIPTED-campaign
+    // preflight (fresh --scripted-only selection carrying a scripted WORKFLOW
+    // case). null otherwise. Records the contained-scripted-state reset leg
+    // (ok / exit_code / stderr tail) so a stale-state reset failure is
+    // attributable to the DISTINCT reason 'scripted-state-reset-failed'
+    // (US-003 AC3). A RESUME never engages this preflight — resume reconciles
+    // the persisted state from the previous attempt (US-003 AC2).
+    scripted_preflight: null,
     options: {
       concurrency: options.concurrency,
       stagger_ms: options.staggerMs,
@@ -8605,6 +8802,111 @@ function scriptedCatalogInstallRequired(manifest, state) {
   if ((state.options.execution_selection ?? 'all') !== 'scripted-only') return false;
   return manifest.cases.some((caseRecord) =>
     caseUsesScriptedEnvironment(caseRecord) && caseRecord.workflow !== 'local');
+}
+
+// ── MACP7 US-003: per-campaign scripted-state reset preflight ─────────────
+// A FRESH --scripted-only campaign must start from KNOWN-CLEAN contained
+// scripted state (var/home-scripted/.tamandua — the DB, events, and run
+// bookkeeping), so stale orphaned runs from a previous campaign attempt can
+// never be recovered by the restarted scripted daemon (the MACP7 W2
+// register-run collision class: "harness workdir is already set"). The reset
+// goes through the daemon-control containment choke-point (`scripted
+// reset-state`, added in US-001) — never ad-hoc rm, and only the CONTAINED
+// scripted state is touched (the real contained home var/home/.tamandua and
+// the operator's ~/.tamandua are refused by daemon-control itself).
+//
+// Granularity DECISION (per-campaign minimum): this runs ONCE per FRESH
+// campaign (the controller-launched scripted WORKFLOW cases W4.04c/W4.36/
+// W4.38/W4.39-a/W4.40×4/W4.41×2/W4.46 restart the daemon via
+// executeDaemonRestart, not the scenario harness, so they need the
+// campaign-level hygiene). Per-cell resets (US-002, run-scripted-scenario)
+// cover the scenario-harness cells; mid-campaign daemon restarts inside a
+// scenario deliberately do NOT reset. resumeCampaign NEVER calls this — a
+// resume reconciles the persisted state from the previous attempt, and a
+// reset would destroy the runs it must reattach (US-003 AC2).
+//
+// Fail closed: a fresh campaign that cannot start known-clean aborts with the
+// DISTINCT machine-parseable reason 'scripted-state-reset-failed' and the
+// daemon's stderr captured on the campaign preflight state (US-003 AC3).
+function runScriptedStateReset(campaignDir, state) {
+  let env;
+  try {
+    env = loadSpawnEnvironment(true);
+  } catch (error) {
+    persistScriptedPreflightState(campaignDir, state, {
+      engaged: true,
+      ok: false,
+      leg: 'spawn-environment',
+      reason: 'scripted-state-reset-failed',
+      message: error.message,
+      stopped_at: null,
+    });
+    throw new Error(`scripted state reset preflight FAILED at spawn-environment: ${error.message}`);
+  }
+  // FIX10 US-003 choke-point: every spawn site must pass through
+  // assertContainedSpawnEnv (pinned by
+  // tier0-controller-home-containment.test.ts's spawn-site scan).
+  assertContainedSpawnEnv(env);
+  // reset-state refuses while the scripted daemon is RUNNING (identity-
+  // verified) and while a live daemon holds the state-dir pidfile (CLI
+  // auto-start shape) — ensure it is stopped first. The stop is tolerant
+  // (daemon-control stop is idempotent: no daemon -> no-op) and
+  // provenance-scoped to this worktree, so a concurrent worktree's daemon is
+  // never touched. A failed stop is recorded as evidence; the reset itself is
+  // the fail-closed gate (a still-running daemon makes reset-state refuse
+  // with its own distinct reason, which aborts the campaign below).
+  const stopResult = spawnSync(DAEMON_CONTROL_PATH, ['scripted', 'stop'], {
+    cwd: TT_ROOT,
+    env,
+    encoding: 'utf8',
+    maxBuffer: 1024 * 1024,
+    timeout: 90_000,
+    shell: false,
+  });
+  const stopOk = stopResult.error === undefined && stopResult.status === 0;
+  const resetResult = spawnSync(DAEMON_CONTROL_PATH, ['scripted', 'reset-state'], {
+    cwd: TT_ROOT,
+    env,
+    encoding: 'utf8',
+    maxBuffer: 1024 * 1024,
+    timeout: 90_000,
+    shell: false,
+  });
+  const ok = resetResult.error === undefined && resetResult.status === 0;
+  const evidence = {
+    engaged: true,
+    ok,
+    stop_ok: stopOk,
+    leg: 'reset-state',
+    exit_code: resetResult.status ?? null,
+    ...(resetResult.stderr ? { stderr_tail: String(resetResult.stderr).trim().slice(-500) } : {}),
+    ...(stopResult.error !== undefined ? { stop_message: stopResult.error.message } : {}),
+    started_at: utcTimestamp(),
+    stopped_at: null,
+  };
+  if (!ok) {
+    const detected = readPreflightReason(String(resetResult.stderr ?? '')) ?? 'scripted-state-reset-failed';
+    persistScriptedPreflightState(campaignDir, state, {
+      ...evidence,
+      ok: false,
+      reason: detected,
+      message: resetResult.error?.message
+        ?? `scripted state reset preflight reset-state leg exited ${resetResult.status ?? 'non-zero'}`,
+    });
+    throw new Error(`scripted state reset preflight FAILED at reset-state: ${detected}`);
+  }
+  persistScriptedPreflightState(campaignDir, state, evidence);
+  console.log('Scripted state reset preflight reset-state: OK');
+}
+
+// Persist the SCRIPTED-campaign preflight state (MACP7 US-003): the
+// contained-scripted-state reset evidence. Mirrors persistPreflightState for
+// the real-case preflight; the scripted-campaign preflight keeps its OWN key
+// so a scripted-only campaign never aliases the real-case preflight record.
+function persistScriptedPreflightState(campaignDir, state, preflight) {
+  state.scripted_preflight = preflight;
+  state.updated_at = utcTimestamp();
+  atomicWriteState(campaignDir, state);
 }
 
 // Runs the home-provision + catalog-install legs under the CONTAINED SCRIPTED
@@ -8973,6 +9275,14 @@ async function startCampaign(options, schema) {
       // T2.1 US-010: scripted-only campaigns need the bundled catalog in the
       // SCRIPTED home (the scripted WORKFLOW cases launch against it); a
       // fresh contained home has none until this installs it.
+      // MACP7 US-003: FIRST reset the contained scripted state to known-clean
+      // (stale orphaned runs from a previous attempt must never be recovered
+      // by the restarted scripted daemon), then install the catalog into the
+      // fresh home. The reset FAILS CLOSED with the DISTINCT reason
+      // 'scripted-state-reset-failed' if it cannot start known-clean. Only a
+      // FRESH campaign resets — resumeCampaign reconciles the persisted state
+      // from the previous attempt and never calls this (US-003 AC2).
+      runScriptedStateReset(campaignDir, state);
       runScriptedCatalogInstall(campaignDir, state, manifest);
     }
     await executeEligibleCases(manifest, state, campaignDir);

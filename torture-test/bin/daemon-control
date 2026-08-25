@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# daemon-control — the ONLY sanctioned start/stop/restart/status path for
-# torture-test daemons (spec 01 §Daemon containment, spec 12 §daemon-control).
+# daemon-control — the ONLY sanctioned start/stop/restart/status/reset-state
+# path for torture-test daemons (spec 01 §Daemon containment, spec 12
+# §daemon-control).
 #
-# Usage: daemon-control <real|scripted> <start|stop|restart|status>
+# Usage: daemon-control <real|scripted> <start|stop|restart|status|reset-state>
 #
 # Applies the matching env script (tt-env.sh or tt-env-scripted.sh) to
 # spawned processes ONLY — never mutates the caller's env.
@@ -99,9 +100,15 @@ export TT_ROOT="${TT_REPO_ROOT}/torture-test/var"
 # this tool — never on cwd/cmdline evidence alone.
 IDENTITY_TOOL="$SCRIPT_DIR/tt-process-identity.mjs"
 
-# Env script paths
-TT_ENV_REAL="$TT_DIR/env/tt-env.sh"
-TT_ENV_SCRIPTED="$TT_DIR/env/tt-env-scripted.sh"
+# Env script paths (TT_DC_ENV_* overrides are the MACP7 US-001 test seam:
+# daemon-control.test.sh's containment-refusal case points the SCRIPTED
+# spawn env at a fake env script whose TAMANDUA_STATE_DIR escapes
+# torture-test/var, and asserts reset-state fails closed through
+# guard_kind_containment with the escape target untouched. Unset in
+# production = the bundled env scripts; the seam changes nothing unless
+# explicitly set).
+TT_ENV_REAL="${TT_DC_ENV_REAL:-$TT_DIR/env/tt-env.sh}"
+TT_ENV_SCRIPTED="${TT_DC_ENV_SCRIPTED:-$TT_DIR/env/tt-env-scripted.sh}"
 
 # Provenance directory
 PROV_DIR="$TT_ROOT/daemon-control"
@@ -505,16 +512,16 @@ guard_kind_containment() {
 
 usage() {
   cat <<EOF
-daemon-control — manage torture-test daemons (start/stop/restart/status).
+daemon-control — manage torture-test daemons (start/stop/restart/status/reset-state).
 
-Usage: daemon-control <real|scripted> <start|stop|restart|status>
+Usage: daemon-control <real|scripted> <start|stop|restart|status|reset-state>
        daemon-control --help
 
 Manages tamandua daemons for the torture-test environment. This is the
-ONLY sanctioned path for starting, stopping, restarting, or checking
-the status of TT daemons. Production daemons (ports 3334/3338/3339,
-real ~/.tamandua) are ABSOLUTELY rejected — this tool will never touch
-the live instance by construction.
+ONLY sanctioned path for starting, stopping, restarting, checking
+the status of, or resetting the state of TT daemons. Production daemons
+(ports 3334/3338/3339, real ~/.tamandua) are ABSOLUTELY rejected — this
+tool will never touch the live instance by construction.
 
 Daemon kinds:
   real      The real-harness daemon (ports 4334/4338/4339, HOME=TT_HOME)
@@ -554,6 +561,23 @@ Commands:
   restart   Stop then start, re-asserting cgroup membership after start.
   status    Report daemon running state (RUNNING/STOPPED/UNKNOWN) from
             provenance file and liveness checks.
+  reset-state
+            Reset the CONTAINED SCRIPTED state (torture-test/var/
+            home-scripted/.tamandua — DB, events, run bookkeeping) to a
+            known-clean empty state dir, so a campaign attempt starts with
+            no stale orphaned runs from a previous attempt (MACP7: a
+            restarted scripted daemon must never recover yesterday's runs
+            or collide with fresh registrations). SCRIPTED-ONLY: kind=real
+            is refused — this operation must never touch
+            var/home/.tamandua (the real contained state) or the
+            operator's ~/.tamandua. The state dir is resolved from the
+            spawn env and verified strictly inside torture-test/var before
+            any removal (fail closed via guard_kind_containment + an
+            in-operation containment re-check). Refuses (non-zero) while
+            the scripted daemon is RUNNING (identity-verified) or a live
+            identity-verified daemon is recorded in the state-dir pidfile;
+            stop it first (tolerant stop), then reset. Prints the
+            machine-parseable marker STATUS: RESET_STATE_OK on success.
 
 Environment:
   Spawn env is applied ONLY to the tamandua process, never to the caller.
@@ -606,6 +630,7 @@ Examples:
   daemon-control real restart      # stop + start with cgroup re-assertion
   daemon-control real status       # check if it's running
   daemon-control scripted start    # start the scripted TT daemon (43→53)
+  daemon-control scripted reset-state  # reset the CONTAINED scripted state
   daemon-control --help            # this help
 EOF
 }
@@ -1866,6 +1891,131 @@ cmd_status() {
   fi
 }
 
+# ── reset-state subcommand (MACP7 US-001) ─────────────────────────────
+
+# cmd_reset_state: reset the CONTAINED SCRIPTED state to a known-clean
+# empty state dir (torture-test/var/home-scripted/.tamandua — the DB,
+# events, and run bookkeeping) so a campaign attempt starts with NO stale
+# orphaned runs from a previous attempt (the MACP7 W2 collision: a
+# restarted scripted daemon recovers yesterday's runs and new
+# registrations collide with "harness workdir is already set").
+#
+# Guards (all fail closed):
+#   1. scripted-only — kind=real (and anything else) is REFUSED with a
+#      distinct reason: this operation must never touch
+#      var/home/.tamandua (the REAL contained state) or the operator's
+#      ~/.tamandua.
+#   2. containment — the state dir is resolved from the SPAWN env
+#      (env_for_kind, the same env the daemon would spawn under) and
+#      verified strictly inside torture-test/var via resolve_contained_dir
+#      BEFORE any destructive operation. (guard_kind_containment already
+#      runs in main() before dispatch; this re-verification is the
+#      belt-and-suspenders at the destructive site — a future refactor
+#      can never reset an escaping path.)
+#   3. not-running — refused while the scripted daemon reports RUNNING
+#      (identity-verified cmd_status), and also when the state-dir
+#      tamandua.pid names a live identity-verified TT-owned daemon (the
+#      CLI-auto-start shape: a `workflow run` auto-start records NO
+#      daemon-control provenance, so cmd_status alone would report
+#      NO_PROVENANCE while a live daemon holds the state dir). The caller
+#      stops the daemon first (tolerant stop), then resets.
+#
+# Success: removes the contained state dir and recreates it (mkdir -p,
+# like cmd_start), printing the machine-parseable marker:
+#   STATUS: RESET_STATE_OK
+#   state_dir: <path>
+cmd_reset_state() {
+  local kind="$1"
+
+  # ── Guard 1: scripted-only ─────────────────────────────────────────
+  if [ "$kind" != "scripted" ]; then
+    echo "daemon-control: REFUSING — reset-state is valid ONLY for kind=scripted (the CONTAINED scripted state). kind='$kind' is refused: this operation must never touch var/home/.tamandua (the real contained state) or the operator's ~/.tamandua." >&2
+    exit 1
+  fi
+
+  # ── Resolve the state dir from the spawn env ───────────────────────
+  local spawn_env; spawn_env="$(env_for_kind "$kind")"
+  local state_dir; state_dir="$(echo "$spawn_env" | grep '^TAMANDUA_STATE_DIR=' | cut -d= -f2-)"
+  if [ -z "$state_dir" ]; then
+    echo "daemon-control: ERROR — kind '$kind' spawn env TAMANDUA_STATE_DIR is unset or empty; cannot resolve the contained state dir" >&2
+    exit 1
+  fi
+
+  # ── Guard 2: containment (fail closed before any destructive op) ───
+  local rp; rp="$(resolve_contained_dir "$state_dir")"
+  if [ -z "$rp" ]; then
+    echo "daemon-control: REFUSING — state dir '$state_dir' does not resolve to a directory; refusing reset-state (fail closed)" >&2
+    exit 1
+  fi
+  local tt_root_rp; tt_root_rp="$(resolve_contained_dir "$TT_ROOT")"
+  if [ -z "$tt_root_rp" ]; then
+    echo "daemon-control: REFUSING — cannot resolve torture-test/var containment root; refusing reset-state (fail closed)" >&2
+    exit 1
+  fi
+  case "$rp/" in
+    "$tt_root_rp"/*) ;;
+    *)
+      # Resolved to the containment root itself (or above it): acceptable
+      # ONLY when the requested path is a not-yet-provisioned CHILD (fresh
+      # checkout — the nearest existing ancestor is var itself, judged by
+      # resolve_contained_dir); the root itself as a live state dir is
+      # refused. Mirrors guard_kind_containment's fresh-checkout semantics.
+      if [ "$rp" = "$tt_root_rp" ] && [ ! -e "$state_dir" ]; then
+        :
+      else
+        echo "daemon-control: REFUSING — state dir '$state_dir' escapes torture-test/var (resolves to $rp); refusing reset-state (fail closed)" >&2
+        exit 1
+      fi
+      ;;
+  esac
+
+  # ── Guard 2b: never the REAL contained state ────────────────────────
+  # kind=scripted + the bundled env resolves home-scripted/.tamandua, but a
+  # tampered env script (the TT_DC_ENV_SCRIPTED seam) could point
+  # TAMANDUA_STATE_DIR at var/home/.tamandua — which IS under torture-test/
+  # var and would pass the containment check above. reset-state must NEVER
+  # touch the REAL contained state (var/home/.tamandua) or the operator's
+  # ~/.tamandua: refuse when the state dir is var/home/.tamandua or any
+  # path under the real contained home var/home/ (fail closed,
+  # belt-and-suspenders). Literal-prefix on the unresolved path (the env
+  # script emits the literal path) so a not-yet-provisioned home can never
+  # alias var itself through resolve_contained_dir's nearest-ancestor walk.
+  case "$state_dir/" in
+    "$TT_ROOT/home/"*)
+      echo "daemon-control: REFUSING — state dir '$state_dir' is under the REAL contained home (var/home/); reset-state is home-scripted ONLY and must never touch var/home/.tamandua or the operator's ~/.tamandua (fail closed)" >&2
+      exit 1
+      ;;
+  esac
+
+  # ── Guard 3: not-running (identity-verified) ───────────────────────
+  local status_out
+  status_out="$(cmd_status "$kind" 2>&1 || true)"
+  if echo "$status_out" | grep -q 'STATUS: RUNNING'; then
+    echo "daemon-control: REFUSING — the $kind daemon is RUNNING; stop it first (daemon-control $kind stop) before reset-state" >&2
+    exit 1
+  fi
+  # CLI-auto-start shape (E3.C.2 US-004): a `workflow run` auto-start
+  # records NO provenance, so cmd_status reports NO_PROVENANCE while a live
+  # identity-verified daemon holds the state-dir pidfile. Refuse then too —
+  # the state dir must never be removed out from under a live daemon.
+  local pid_file="$state_dir/tamandua.pid"
+  if [ -f "$pid_file" ]; then
+    local recorded_pid
+    recorded_pid="$(cat "$pid_file" 2>/dev/null || true)"
+    if [ -n "$recorded_pid" ] && verify_launched_daemon_pid "$recorded_pid" "$state_dir"; then
+      echo "daemon-control: REFUSING — a live $kind daemon is recorded in the state-dir pidfile (PID $recorded_pid, identity-verified); stop it first (daemon-control $kind stop) before reset-state" >&2
+      exit 1
+    fi
+  fi
+
+  # ── Destructive step: remove the contained state dir, recreate it ──
+  rm -rf -- "$state_dir"
+  mkdir -p "$state_dir"
+
+  echo "STATUS: RESET_STATE_OK"
+  echo "  state_dir: $state_dir"
+}
+
 # ── main dispatch ────────────────────────────────────────────────────
 
 main() {
@@ -1895,7 +2045,7 @@ main() {
 
   if [ $# -lt 2 ]; then
     echo "daemon-control: missing arguments." >&2
-    echo "Usage: daemon-control <real|scripted> <start|stop|restart|status>" >&2
+    echo "Usage: daemon-control <real|scripted> <start|stop|restart|status|reset-state>" >&2
     echo "       daemon-control --help" >&2
     exit 1
   fi
@@ -1908,7 +2058,7 @@ main() {
     real|scripted) ;;
     *)
       echo "daemon-control: invalid kind '$kind'. Expected 'real' or 'scripted'." >&2
-      echo "Usage: daemon-control <real|scripted> <start|stop|restart|status>" >&2
+      echo "Usage: daemon-control <real|scripted> <start|stop|restart|status|reset-state>" >&2
       exit 1
       ;;
   esac
@@ -1929,13 +2079,14 @@ main() {
 
   # Dispatch subcommand
   case "$cmd" in
-    start)    cmd_start "$kind" ;;
-    stop)     cmd_stop "$kind" ;;
-    restart)  cmd_restart "$kind" ;;
-    status)   cmd_status "$kind" ;;
+    start)       cmd_start "$kind" ;;
+    stop)        cmd_stop "$kind" ;;
+    restart)     cmd_restart "$kind" ;;
+    status)      cmd_status "$kind" ;;
+    reset-state) cmd_reset_state "$kind" ;;
     *)
-      echo "daemon-control: invalid command '$cmd'. Expected start, stop, restart, or status." >&2
-      echo "Usage: daemon-control <real|scripted> <start|stop|restart|status>" >&2
+      echo "daemon-control: invalid command '$cmd'. Expected start, stop, restart, status, or reset-state." >&2
+      echo "Usage: daemon-control <real|scripted> <start|stop|restart|status|reset-state>" >&2
       exit 1
       ;;
   esac

@@ -27,6 +27,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { realAccountHome } from "../lib/operator-home.mjs";
+import { waitForTerminalRun } from "../lib/terminal-wait.mjs";
 
 const repoRoot = requiredEnv("TT_REPO_ROOT");
 const invocationDir = requiredEnv("TT_SCENARIO_STATE_DIR");
@@ -101,44 +102,37 @@ try {
     `expected patched expects "${BAD_EXPECTS}", got "${corrupted.expects}"`);
 
   // ── Step 4: Poll for terminal state ─────────────────────────────
+  // Shared terminal-wait helper (lib/terminal-wait.mjs, MACP7 US-004): a
+  // register-run failure ("harness workdir is already set" class) surfaces
+  // immediately as SCRIPTED_RUN_REGISTRATION_FAILED with the daemon's error
+  // captured, instead of a generic did-not-reach-terminal timeout.
   // With a non-compiling regex, every completion is rejected, retries are
-  // exhausted, and the run fails — landing on a clean 'failed' status. While
-  // polling we also detect whether tamandua produced the actionable
-  // `Invalid expects regex pattern` diagnostic (recorded in the run's own
-  // events file on each step.retry rejection).
-  let terminalStatus;
+  // exhausted, and the run fails — landing on a clean 'failed' status.
+  const terminalStatus = await waitForTerminalRun({
+    dbPath: path.join(scriptedStateDir, "tamandua.db"),
+    runId,
+    timeoutMs: 120_000,
+    pollMs: 1000,
+  });
+
+  // After the terminal state, detect whether tamandua produced the
+  // actionable `Invalid expects regex pattern` diagnostic (recorded in the
+  // run's own events file on each step.retry rejection — the events are
+  // appended synchronously by the daemon, so a post-terminal read is
+  // equivalent to the old in-poll scan and matches w2.23b's pattern).
   let diagnosticDetected = false;
   const eventsPath = path.join(EVENTS_DIR, `${dbRunId}.jsonl`);
-
-  for (let attempt = 0; attempt < 120; attempt++) {
-    const readDb = new DatabaseSync(path.join(scriptedStateDir, "tamandua.db"), { readOnly: true });
+  if (fs.existsSync(eventsPath)) {
     try {
-      const row = readDb.prepare(
-        "SELECT status FROM runs WHERE id = ?"
-      ).get(dbRunId);
-      if (row && (row.status === "completed" || row.status === "failed" || row.status === "canceled")) {
-        terminalStatus = row.status;
+      const eventsText = fs.readFileSync(eventsPath, "utf8");
+      if (eventsText.includes("Invalid expects regex pattern")) {
+        diagnosticDetected = true;
       }
-    } finally {
-      readDb.close();
+    } catch {
+      // events file may not be fully flushed yet — treat as not detected
     }
-
-    if (!diagnosticDetected && fs.existsSync(eventsPath)) {
-      try {
-        const eventsText = fs.readFileSync(eventsPath, "utf8");
-        if (eventsText.includes("Invalid expects regex pattern")) {
-          diagnosticDetected = true;
-        }
-      } catch {
-        // events file may not be fully flushed yet — keep polling
-      }
-    }
-
-    if (terminalStatus) break;
-    await sleep(1000);
   }
 
-  assert.ok(terminalStatus, `run ${runId} did not reach terminal state within 120s`);
   // Inviolable invariants: the defect must resolve to a clean failed run, not
   // a hang, a cancel, or a phantom completion.
   assert.equal(terminalStatus, "failed",
@@ -229,8 +223,4 @@ function requiredEnv(name) {
   const value = process.env[name];
   if (!value) throw new Error(`missing scenario environment: ${name}`);
   return value;
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }

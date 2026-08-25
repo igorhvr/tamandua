@@ -152,12 +152,40 @@ function provisionContainedRealHome(): void {
   }
 }
 
+// ensureHostProfile — the controller's REAL-case eligibility/preflight reads
+// var/w0/host-profile.json (the host profile produced by tt-verify-environment
+// --fast). The battery's profile-generating test
+// (tier0-real-host-profile-predicate.integration.test.ts) sorts AFTER this
+// file alphabetically, so on a FRESH var (gitignored — wiped with the
+// worktree) this test would fail with 'host-profile-missing' / zero eligible
+// real cases before the profile exists. Generate it here (idempotent, zero
+// tokens, mechanical toolchain probe — the same sanctioned generator the
+// predicate test runs) so the dry-run arms are order-independent.
+function ensureHostProfile(): void {
+  const hostProfilePath = path.join(varRoot, "w0", "host-profile.json");
+  if (fs.existsSync(hostProfilePath)) return;
+  const verify = spawnSync(path.join(ttRoot, "bin", "tt-verify-environment"), ["--fast", "--json"], {
+    cwd: ttRoot,
+    encoding: "utf8",
+    timeout: 120_000,
+  });
+  assert.equal(verify.status, 0,
+    `host-profile generation failed for the real-launch arm: ${verify.stderr ?? verify.stdout}`);
+  assert.ok(fs.existsSync(hostProfilePath),
+    "host-profile.json must be written by tt-verify-environment --fast");
+}
+
 describe("Zero-token dry-run/argv-recording hook for the real-launch path (US-006)", () => {
   it("with TT_DRY_RUN_REAL_LAUNCH set, records full launch argv and completes PASS with zero tokens", () => {
     const manifestPath = buildRealManifest();
     const rel = path.relative(ttRoot, manifestPath);
     const outPath = path.join(varRoot, `us006-argv-${Date.now()}-${process.pid}.jsonl`);
     fs.rmSync(outPath, { force: true });
+
+    // The real-case preflight requires the real host profile; generate it on
+    // a fresh var so this arm is battery-order independent (see
+    // ensureHostProfile).
+    ensureHostProfile();
 
     // The dry-run arm still runs the real-launch token-ledger baseline under
     // the contained real home; provision it (fresh-tree safe, idempotent).
@@ -239,6 +267,11 @@ describe("Zero-token dry-run/argv-recording hook for the real-launch path (US-00
   it("without TT_DRY_RUN_REAL_LAUNCH the real-launch path is unchanged and writes no dry-run file", () => {
     const manifestPath = buildRealManifest();
     const rel = path.relative(ttRoot, manifestPath);
+
+    // Case ELIGIBILITY (the real cases' requires predicates) reads the real
+    // host profile even with the preflight hatch disabled; generate it on a
+    // fresh var so this arm is battery-order independent (ensureHostProfile).
+    ensureHostProfile();
 
     // Throwaway PATH stub for `tamandua`: records that it was launched. The
     // controller resolves the bare `tamandua` executable via PATH (shell:

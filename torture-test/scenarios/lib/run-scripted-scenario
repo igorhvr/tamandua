@@ -229,7 +229,7 @@ stop_owned_command() {
 # never inherited by anything that could write git identity.
 daemon_control() {
   local operation="$1"
-  case "$operation" in start|status|restart|stop) ;;
+  case "$operation" in start|status|restart|stop|reset-state) ;;
     *) fail "invalid scripted daemon operation: $operation" ;;
   esac
   env HOME="$ACCOUNT_HOME" PATH="$REPO_ROOT/bin:$PATH" TAMANDUA_SCRIPTED_BEHAVIORS="$BEHAVIORS_FILE" \
@@ -335,6 +335,32 @@ esac
 case "$SCRIPTED_HOME" in "$TT_DIR/var"/*) ;;
   *) fail "scripted HOME escaped torture-test/var: $SCRIPTED_HOME" ;;
 esac
+# ── Per-cell contained-scripted-state hygiene (MACP7 US-002) ───────────
+# Granularity DECISION: the contained scripted state
+# (torture-test/var/home-scripted/.tamandua — DB, events, run bookkeeping)
+# is reset ONCE per CELL at harness entry, through the daemon-control
+# containment choke-point (never ad-hoc rm here). A cell must start from a
+# KNOWN-CLEAN state so a stale orphaned run from a PREVIOUS campaign
+# attempt can never be recovered by the restarted scripted daemon or
+# collide with the cell's fresh registration (the mac W2 PRODUCT_FAIL:
+# "harness workdir is already set"). Mid-cell daemon restarts INSIDE a
+# scenario (w2.21 Step 4 / w2.23c Step 5 call daemon-control stop/start
+# themselves) intentionally do NOT reset — a run created mid-cell must
+# survive a restart; only the harness ENTRY resets.
+#
+# Order matters (the reset must run BEFORE the workflow install so the
+# installed workflow is not wiped):
+#   1. tolerant daemon stop first — reset-state REFUSES while the scripted
+#      daemon is RUNNING (identity-verified); an already-stopped daemon is
+#      accepted.
+#   2. reset-state (fail closed — a cell that cannot start known-clean
+#      must not run against stale state).
+#   3. write .pi/agent/settings.json + install the scenario workflow.
+#   4. daemon start.
+DAEMON_TOUCHED=1
+daemon_control stop >/dev/null 2>&1 || true
+daemon_control reset-state || fail "daemon-control scripted reset-state failed; the cell cannot start from known-clean contained scripted state"
+
 # Workflow installation provisions agent workspaces and therefore reads pi's
 # settings even though the scripted runtime never contacts pi. Scripted HOME
 # intentionally carries no copied credentials, so materialize only the empty
@@ -363,8 +389,6 @@ WORKFLOW_DIR="$SCRIPTED_STATE_DIR/workflows/$WORKFLOW_ID"
 ) >"$INVOCATION_DIR/installer-output.json"
 [ -d "$WORKFLOW_DIR" ] || fail "scenario workflow copy was not installed: $WORKFLOW_ID"
 
-DAEMON_TOUCHED=1
-daemon_control stop >/dev/null 2>&1 || true
 daemon_control start || fail "daemon-control scripted start failed"
 DAEMON_STATUS=""
 for _attempt in $(seq 1 50); do

@@ -63,6 +63,11 @@ const HEAVY_CAMPAIGN_TESTS = [
   "tier1-scripted-probe-battery.test.ts",
   "tier1-kill-sentinel-survival.test.ts",
   "tier1-zero-real-launch-infra.test.ts",
+  // MACP7 US-006: stale-state hygiene red-then-green proof (RED arm with the
+  // reset bypassed + GREEN arm + pre-polluted campaign) — same campaign class
+  // as the other heavy proofs; must stay in lock-step with run.sh + the
+  // verify script (AC5 pins the invariant).
+  "tier1-macp7-scripted-state-hygiene.test.ts",
   // MACP4 US-007: W2 dual-path proof (4 cells x systemd + forced-fallback
   // harness executions + two bare tier1 campaigns) — same campaign class as
   // the other heavy proofs; must stay in lock-step with run.sh + the verify

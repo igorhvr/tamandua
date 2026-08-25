@@ -27,6 +27,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { realAccountHome } from "../lib/operator-home.mjs";
+import { waitForTerminalRun } from "../lib/terminal-wait.mjs";
 
 const repoRoot = requiredEnv("TT_REPO_ROOT");
 const invocationDir = requiredEnv("TT_SCENARIO_STATE_DIR");
@@ -129,59 +130,28 @@ try {
   assert.ok(onDiskYml.includes("on_fail:"),
     "patched workflow.yml no longer contains on_fail block");
 
-  // ── Step 5: Poll for terminal state while scanning the new tamandua.log
-  // bytes for the actionable `not a valid upstream step` diagnostic that the
-  // retry-exhaust → reroute path emits (step-ops.ts reroute with invalid
-  // target). The diagnostic is written via logger.error to tamandua.log, NOT
-  // to the run events file.
-  let terminalStatus;
-  let diagnosticDetected = false;
-  const DIAGNOSTIC_SUBSTR = "not a valid upstream step";
-
-  for (let attempt = 0; attempt < 120; attempt++) {
-    const readDb = new DatabaseSync(path.join(scriptedStateDir, "tamandua.db"), { readOnly: true });
-    try {
-      const row = readDb.prepare(
-        "SELECT status FROM runs WHERE id = ?"
-      ).get(dbRunId);
-      if (row && (row.status === "completed" || row.status === "failed" || row.status === "canceled")) {
-        terminalStatus = row.status;
-      }
-    } finally {
-      readDb.close();
-    }
-
-    if (!diagnosticDetected && fs.existsSync(LOG_PATH)) {
-      try {
-        const size = fs.statSync(LOG_PATH).size;
-        const fd = fs.openSync(LOG_PATH, "r");
-        let tail = "";
-        try {
-          const toRead = size - Math.min(logStartSize, size);
-          if (toRead > 0) {
-            const buf = Buffer.alloc(toRead);
-            fs.readSync(fd, buf, 0, toRead, Math.min(logStartSize, size));
-            tail = buf.toString("utf8");
-          }
-        } finally {
-          fs.closeSync(fd);
-        }
-        if (tail.includes(DIAGNOSTIC_SUBSTR)) {
-          diagnosticDetected = true;
-        }
-      } catch {
-        // log may be mid-rotation — keep polling
-      }
-    }
-
-    if (terminalStatus) break;
-    await sleep(1000);
-  }
-
-  assert.ok(terminalStatus, `run ${runId} did not reach terminal state within 120s`);
+  // ── Step 5: Poll for terminal state ─────────────────────────────
+  // Shared terminal-wait helper (lib/terminal-wait.mjs, MACP7 US-004): a
+  // register-run failure ("harness workdir is already set" class) surfaces
+  // immediately as SCRIPTED_RUN_REGISTRATION_FAILED with the daemon's error
+  // captured, instead of a generic did-not-reach-terminal timeout.
+  // The diagnostic scan below then checks the new tamandua.log bytes for the
+  // actionable `not a valid upstream step` diagnostic that the retry-exhaust
+  // → reroute path emits (step-ops.ts reroute with invalid target). The
+  // diagnostic is written via logger.error to tamandua.log, NOT to the run
+  // events file.
+  const terminalStatus = await waitForTerminalRun({
+    dbPath: path.join(scriptedStateDir, "tamandua.db"),
+    runId,
+    timeoutMs: 120_000,
+    pollMs: 1000,
+  });
   assert.equal(terminalStatus, "failed",
     `expected run to fail due to dangling retry_step, got status: ${terminalStatus}`);
 
+  // Detect the actionable diagnostic (post-terminal scoped log read).
+  const DIAGNOSTIC_SUBSTR = "not a valid upstream step";
+  let diagnosticDetected = false;
   // Allow any trailing logger flush before the final scoped read.
   await sleep(500);
   if (!diagnosticDetected && fs.existsSync(LOG_PATH)) {
