@@ -2,8 +2,10 @@
 # scripted-pi — wrapper for the scripted pi runtime.
 #
 # Resolves the runtime .mjs file and execs it via an absolute node path.
-# The daemon's PATH is not guaranteed, so we embed the absolute path to the
-# node binary discovered at build time.
+# The daemon's PATH is not guaranteed, so we resolve node portably and
+# fail closed:
+#   TT_NODE_BIN (explicit override) -> `command -v node` on the shim's
+#   own PATH -> a clear error (never a shell "command not found").
 #
 # Override: set TT_NODE_BIN to a different node binary.
 set -euo pipefail
@@ -11,10 +13,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUNTIME_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# ── Node resolution (absolute path required — daemon PATH is not guaranteed) ──
-NODE_BIN="${TT_NODE_BIN:-/home/igorhvr/.volta/tools/image/node/24.18.0/bin/node}"
+# ── Node resolution (portable, fail-closed) ──────────────────────────
+NODE_BIN="${TT_NODE_BIN:-}"
+if [ -z "$NODE_BIN" ]; then
+  NODE_BIN="$(command -v node 2>/dev/null || true)"
+fi
 
-if [[ ! -x "$NODE_BIN" ]]; then
+if [ -z "$NODE_BIN" ] || [ ! -x "$NODE_BIN" ]; then
   echo "scripted-pi: node binary not found at $NODE_BIN" >&2
   echo "Set TT_NODE_BIN to the absolute path of the node binary." >&2
   exit 1

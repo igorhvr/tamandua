@@ -414,6 +414,35 @@ else
   fail "caller HOME MUTATED after env operations (was $ORIGINAL_HOME, now $HOME)"
 fi
 
+# ── Test 9b: scripted env exports TT_NODE_BIN and the spawn env carries it (MACP6 US-002) ──
+echo ""
+echo "--- Test: scripted env TT_NODE_BIN export + carry-through (MACP6 US-002) ---"
+
+TT_ENV_SCRIPTED="$SCRIPT_DIR/../env/tt-env-scripted.sh"
+if [ -f "$TT_ENV_SCRIPTED" ]; then
+  # env_for_kind('scripted') is exactly `env -i bash "$TT_ENV_SCRIPTED" print`.
+  scripted_env_out="$(env -i bash "$TT_ENV_SCRIPTED" print 2>/dev/null || true)"
+  tt_node_bin="$(printf '%s\n' "$scripted_env_out" | sed -n 's/^TT_NODE_BIN=//p' | head -n1)"
+  if [ -n "$tt_node_bin" ] && [ -x "$tt_node_bin" ]; then
+    pass "scripted env emits TT_NODE_BIN=$tt_node_bin (absolute executable path)"
+  else
+    fail "scripted env must emit TT_NODE_BIN pointing at an executable node (got: '$tt_node_bin')"
+  fi
+  # Compose the spawn env exactly as run_under_env does
+  # (`env -i $(env_for_kind scripted) PATH="$(contained_path_for_kind scripted)"`)
+  # and prove a spawned process receives TT_NODE_BIN pointing at an
+  # executable node — the carry-through into the contained daemon env.
+  us002_contained_path="$(TT_DAEMON_CONTROL_CONTAINED_PATH=scripted "$TOOL" 2>/dev/null || true)"
+  us002_carried="$(env -i $scripted_env_out PATH="$us002_contained_path" bash -c 'printf "%s" "${TT_NODE_BIN:-}"' 2>/dev/null || true)"
+  if [ -n "$us002_carried" ] && [ -x "$us002_carried" ]; then
+    pass "scripted spawn env composition carries TT_NODE_BIN=$us002_carried (executable)"
+  else
+    fail "scripted spawn env composition must carry TT_NODE_BIN into the spawned env (got: '$us002_carried')"
+  fi
+else
+  fail "tt-env-scripted.sh not found at expected path: $TT_ENV_SCRIPTED"
+fi
+
 # ── Test 10: directory setup ─────────────────────────────────────────
 echo ""
 echo "--- Test: directory setup ---"

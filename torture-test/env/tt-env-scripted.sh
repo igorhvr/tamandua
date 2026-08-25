@@ -77,6 +77,12 @@ case "$_tt_node_bin" in
   */.volta/bin/node) _tt_node_bin="$VOLTA_HOME/bin/node" ;;
 esac
 if [ -n "$_tt_node_bin" ] && [ -x "$_tt_node_bin" ]; then
+  # MACP6 US-002: export TT_NODE_BIN so the scripted shims (scripted-pi /
+  # scripted-hermes) always have an absolute, executable node path even when
+  # the contained daemon's PATH is reconstructed and cannot resolve node.
+  # Left unset when no node resolves — the shims' fail-closed error covers
+  # the no-node host.
+  export TT_NODE_BIN="$_tt_node_bin"
   export TT_NODE_BIN_DIR="$(dirname "$_tt_node_bin")"
   export PATH="$TT_NODE_BIN_DIR:$PATH"
 fi
@@ -85,7 +91,7 @@ if [ "${1:-}" = "print" ]; then
   for v in TT_REPO_ROOT TT_ROOT TT_SCRIPTED_HOME HOME TAMANDUA_STATE_DIR \
            TAMANDUA_CONTROL_PORT TAMANDUA_MCP_PORT TAMANDUA_DASHBOARD_PORT \
            HERMES_HOME TAMANDUA_PI_BINARY \
-           TAMANDUA_HERMES_BINARY VOLTA_HOME TT_NODE_BIN_DIR PATH; do
+           TAMANDUA_HERMES_BINARY VOLTA_HOME TT_NODE_BIN TT_NODE_BIN_DIR PATH; do
     printf '%s=%s\n' "$v" "$(eval "printf '%s' \"\$$v\"")"
   done
 fi
