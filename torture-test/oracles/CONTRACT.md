@@ -126,8 +126,8 @@ projection; all timestamps presented to an oracle are canonical.
 It contains the current wave number; one duration-floor row per launched case
 (`workflow`, `case_id`, positive nullable `duration_floor_ms`, `source`, and
 `sample_size`); and every launched root/discovered run in that wave (`case_id`,
-`run_id`, workflow, start/terminal timestamps and status, and the manifest boolean
-`expected_fast_failure`). When a case's manifest pins `production_duration_floor_ms > 0`,
+`run_id`, workflow, start/terminal timestamps and status, the manifest boolean
+`expected_fast_failure`, and the optional per-run `execution_mode`). When a case's manifest pins `production_duration_floor_ms > 0`,
 that pin is the case's own floor and is recorded as `source=production-median`;
 distinct pins across cases of one workflow family are per-case floors and are never
 deduplicated. For cases without a pin, `source=w1-median` is computed from terminal,
@@ -137,7 +137,9 @@ runaway attempts never skew the median), the run under judgment (the case's own
 latest attempt run) never contributes to its own calibration sample, and
 `sample_size` counts the filtered sample. O1 suppresses the
 `O1_DURATION_FLOOR_RATE` family finding when the wave's eligible family run count
-is below 4 (the observation still records `run_count`/`fast_run_count`). If no
+is below 4 (the observation still records `run_count`/`fast_run_count`). "Eligible"
+means real (non-scripted) runs only: scripted runs are excluded from both the
+numerator and the denominator (see the anti-gaming section). If no
 fallback exists the
 row records `duration_floor_ms: null` with `source=unavailable` and O1 fails closed
 for the case. Legacy family-wide floor rows without `case_id` remain accepted for
@@ -163,6 +165,18 @@ is absent, duplicated, or if a current-case wave row names an unknown run. Run I
 campaign-global, so duplicate rows are rejected even when they carry different case IDs.
 The current-case row's workflow and start/terminal timestamps and status must exactly
 match its root-attempt or discovered-run projection.
+
+The per-run `execution_mode` (`'real'` or `'scripted'`) marks whether the run's case
+executed in the scripted (zero-token) environment or a real harness. The controller
+projects it onto the case state at campaign creation from the manifest record —
+`context.execution_mode` when it declares `'real'`/`'scripted'` (this covers
+`harness: 'local'` scenario cells that are scripted), else the harness decides
+(`'scripted-pi'`/`'scripted-hermes'` → `'scripted'`, `'dsh'` always `'real'`,
+anything else `'real'`). The field is OPTIONAL in stored evidence: campaign
+contexts whose wave projection predates the field carry run rows without it and
+still validate (schema_version remains 1); an O1 consumer that needs the mode on
+such evidence may fall back to the case-level zero-token signal. When present it
+must be exactly `'real'` or `'scripted'`.
 
 ### Local-case mechanical profile
 
@@ -345,8 +359,21 @@ ordinary terminal checks engaged.
 For anti-gaming, O1 groups `o1_wave.runs` by workflow family, excludes mechanically
 predeclared fast-failure cases, and fails when the count terminating strictly below
 the selected floor divided by all launched eligible runs is greater than 20%. Exactly
-20% is allowed. The output evidence records floor source, denominator, numerator, and
-rate deterministically.
+20% is allowed. Scripted (zero-token) runs are excluded from BOTH the fast numerator
+and the eligible denominator: duration floors exist to catch dishonestly-fast REAL
+runs and are meaningless for mechanically-fast scripted cells. A run is classified
+scripted from its own `execution_mode: 'scripted'` field when present; on STORED
+schema-1 evidence whose wave run rows predate the field, a run row without
+`execution_mode` is treated as scripted when the evaluating case is a 0-token-cap
+cell (`caps.tokens === 0` — the deterministic reporter of a scripted-only wave
+snapshot) and never for real cells, so no other stored-campaign replay is altered.
+A workflow family with zero real eligible runs emits no
+`O1_DURATION_FLOOR_RATE`/`MISSING`/`DUPLICATE`/`UNKNOWN` finding — floor findings
+describe real-run families only — while its `duration_floor_observations` row is
+still written (with `run_count` 0) for every case. Mixed families count only their
+real runs toward the rate; real-cell floors (manifest `production_duration_floor_ms`
+pins, tier1 pins) and all real-run semantics are unchanged. The output evidence
+records floor source, denominator, numerator, and rate deterministically.
 
 ### O3z zero-token interpretation
 

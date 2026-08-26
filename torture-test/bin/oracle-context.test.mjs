@@ -70,11 +70,15 @@ function fixture() {
     cases: [{
       id: 'CASE-1', wave: 3, workflow: 'feature-dev-merge-worktree', fixture: 'tt-ts',
       harness: 'hermes', class: 'verification', phase: 'running', expected_fast_failure: false,
+      // T2.2 US-001: the controller projects the case execution mode onto the
+      // state; the o1_wave projection carries it on every wave run row.
+      execution_mode: 'real',
       production_duration_floor_ms: 120_000, attempts: [attempt], findings: [], oracle_results: [],
       spend: { tokens_observed: 17, observations: [] },
     }, {
       id: 'W1-CALIBRATION', wave: 1, workflow: 'feature-dev-merge-worktree', fixture: 'tt-ts',
       harness: 'hermes', class: 'verification', phase: 'terminal', expected_fast_failure: false,
+      execution_mode: 'real',
       production_duration_floor_ms: 120_000,
       attempts: [{ ...attempt, id: 'attempt-w1', run_id: 'run-44444444-4444-4444-8444-444444444444', started_at: '2026-08-01T11:55:00.000Z' }],
       findings: [], oracle_results: [], spend: { tokens_observed: 17, observations: [] },
@@ -115,6 +119,41 @@ test('complete version-1 mechanical evidence context is accepted for every gatin
       assert.equal(context.o1_wave.duration_floors[0].duration_floor_ms, 120_000);
       assert.equal(context.o1_wave.duration_floors[0].case_id, 'CASE-1');
       assert.equal(context.o1_wave.runs[0].expected_fast_failure, false);
+      // T2.2 US-001: every wave run row carries the case execution mode.
+      assert.equal(context.o1_wave.runs[0].execution_mode, 'real');
+    }
+  } finally {
+    cleanup(data.campaignDir);
+  }
+});
+
+test('T2.2 US-001: o1_wave run rows carry per-run execution_mode from the case state, with harness fallback for stored evidence', () => {
+  const data = fixture();
+  try {
+    // Declared mode on the case state wins: scripted case -> scripted runs.
+    data.state.cases[0].execution_mode = 'scripted';
+    let context = createOracleContext({ ...data, oracleId: 'O1' });
+    for (const run of context.o1_wave.runs) {
+      assert.equal(run.execution_mode, 'scripted', `${run.case_id}/${run.run_id} must project the case's scripted mode`);
+    }
+    // Discovered runs inherit their root case's mode (root_case_id CASE-1).
+    assert.ok(context.o1_wave.runs.some((run) => run.run_id === 'run-22222222-2222-4222-8222-222222222222'),
+      'discovered run must appear in the wave projection');
+
+    // Stored-evidence fallback: a case state that predates the field (no
+    // execution_mode) derives from the harness projection.
+    delete data.state.cases[0].execution_mode;
+    data.state.cases[0].harness = 'scripted-hermes';
+    context = createOracleContext({ ...data, oracleId: 'O1' });
+    for (const run of context.o1_wave.runs) {
+      assert.equal(run.execution_mode, 'scripted', `harness fallback must mark ${run.case_id} scripted`);
+    }
+
+    // A non-scripted harness without a declared mode falls back to 'real'.
+    data.state.cases[0].harness = 'hermes';
+    context = createOracleContext({ ...data, oracleId: 'O1' });
+    for (const run of context.o1_wave.runs) {
+      assert.equal(run.execution_mode, 'real', `harness fallback must mark ${run.case_id} real`);
     }
   } finally {
     cleanup(data.campaignDir);

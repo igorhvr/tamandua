@@ -1566,6 +1566,24 @@ function caseUsesScriptedEnvironment(caseRecord) {
     || caseRecord.context.execution_mode === 'scripted';
 }
 
+// T2.2 US-001: the case's execution MODE ('real'|'scripted') projected onto
+// the persisted case state so the O1 oracle's o1_wave wave projection can
+// carry per-run execution_mode (duration-floor evaluation must distinguish
+// mechanically-fast zero-token scripted cells from real cells). Mirrors
+// caseUsesScriptedEnvironment's precedence and fail-closed direction: the
+// manifest's context.execution_mode wins when it declares 'real'/'scripted'
+// (this covers harness:'local' scenario cells that are scripted), otherwise
+// the harness decides ('scripted-pi'/'scripted-hermes' -> 'scripted', and a
+// dsh case is always 'real' — never a zero-token scripted lane).
+function caseExecutionMode(caseRecord) {
+  if (caseRecord.harness === 'dsh') return 'real';
+  const declared = caseRecord.context?.execution_mode;
+  if (declared === 'real' || declared === 'scripted') return declared;
+  return caseRecord.harness === 'scripted-pi' || caseRecord.harness === 'scripted-hermes'
+    ? 'scripted'
+    : 'real';
+}
+
 // US-003 (T2.1): whether a WORKFLOW case needs its fixture work clone
 // provisioned before launch. Real AND scripted workflow cases carry a fixture
 // ('tt-ts', 'tt-poly', hostile-path aliases, ...) and both pass
@@ -8399,6 +8417,9 @@ function isValidCaseState(item) {
     && typeof item.fixture === 'string'
     && ['pi', 'hermes', 'dsh', 'scripted-pi', 'scripted-hermes', 'local'].includes(item.harness)
     && ['verification', 'characterization', 'exploratory'].includes(item.class)
+    // T2.2 US-001: optional per-case execution_mode ('real'|'scripted');
+    // absent on state predating the field (stored-evidence compat).
+    && (item.execution_mode === undefined || item.execution_mode === 'real' || item.execution_mode === 'scripted')
     && (item.production_duration_floor_ms === null
       || (Number.isSafeInteger(item.production_duration_floor_ms) && item.production_duration_floor_ms > 0))
     && typeof item.expected_fast_failure === 'boolean'
@@ -8613,6 +8634,10 @@ function createInitialState(campaignId, manifestPath, manifest, options) {
       fixture: record.fixture,
       harness: record.harness,
       class: record.class,
+      // T2.2 US-001: per-case execution_mode projected from the manifest
+      // record (context.execution_mode when declared, else harness-derived)
+      // so the O1 o1_wave projection can carry it on every wave run row.
+      execution_mode: caseExecutionMode(record),
       // US-005 (S9 controller): replay pairing is persisted on the case state
       // so terminalization teardown can keep a replay PAIR's clone (and every
       // other consumer can resolve the pair relationship without the manifest).

@@ -218,9 +218,29 @@ function mergeFindings(target, source) {
   }
 }
 
-function evaluateDurationFloor(findings, wave) {
+// T2.2 US-002: classify a wave run as scripted (mechanically-fast, zero-token
+// cell) for duration-floor evaluation. Duration floors exist to catch
+// dishonestly-fast REAL runs; they are meaningless for scripted cells. The
+// run's own `execution_mode` field (US-001) wins when present. STORED schema-1
+// evidence predates the field: a run row without `execution_mode` is treated
+// as scripted when the evaluating case is a 0-token-cap cell
+// (context.case.caps.tokens === 0) — the deterministic reporter of a
+// scripted-only wave snapshot. This fallback is exact for scripted-only
+// campaign evidence and never applies to real cells (caps.tokens > 0), so no
+// other stored-campaign replay is altered.
+function isScriptedRun(run, caseCtx) {
+  if (run.execution_mode === 'scripted') return true;
+  if (run.execution_mode === 'real') return false;
+  return Number.isFinite(caseCtx?.caps?.tokens) && caseCtx.caps.tokens === 0;
+}
+
+function evaluateDurationFloor(findings, wave, caseCtx) {
   const observations = [];
   const launchedWorkflows = [...new Set(wave.runs.map((run) => run.workflow))].sort();
+  // Floor findings describe real-run families only: a wave whose runs are all
+  // scripted (e.g. a 0-token tier2 cell's snapshot) has no real family to
+  // judge, so the floor-level UNKNOWN guard is suppressed there.
+  const hasRealRuns = wave.runs.some((run) => !isScriptedRun(run, caseCtx));
   const perCaseRows = new Map();
   const legacyRows = new Map();
   for (const floor of wave.duration_floors) {
@@ -228,7 +248,7 @@ function evaluateDurationFloor(findings, wave) {
       const rows = perCaseRows.get(floor.case_id) ?? [];
       rows.push(floor);
       perCaseRows.set(floor.case_id, rows);
-      if (!launchedWorkflows.includes(floor.workflow)) {
+      if (hasRealRuns && !launchedWorkflows.includes(floor.workflow)) {
         findings.add('O1_DURATION_FLOOR_UNKNOWN', 'wave contains a duration floor for a workflow family that was not launched', {
           wave: wave.wave, workflow: floor.workflow, case_id: floor.case_id,
         });
@@ -237,7 +257,7 @@ function evaluateDurationFloor(findings, wave) {
       const rows = legacyRows.get(floor.workflow) ?? [];
       rows.push(floor);
       legacyRows.set(floor.workflow, rows);
-      if (!launchedWorkflows.includes(floor.workflow)) {
+      if (hasRealRuns && !launchedWorkflows.includes(floor.workflow)) {
         findings.add('O1_DURATION_FLOOR_UNKNOWN', 'wave contains a duration floor for a workflow family that was not launched', {
           wave: wave.wave, workflow: floor.workflow,
         });
@@ -247,8 +267,12 @@ function evaluateDurationFloor(findings, wave) {
   for (const workflow of launchedWorkflows) {
     const familyRuns = wave.runs.filter((run) => run.workflow === workflow);
     const eligible = familyRuns.filter((run) => !run.expected_fast_failure);
+    // T2.2 US-002: scripted runs are excluded from BOTH the fast numerator and
+    // the eligible denominator — a mixed family counts only its real runs
+    // toward the rate.
+    const realEligible = eligible.filter((run) => !isScriptedRun(run, caseCtx));
     const legacy = legacyRows.get(workflow) ?? [];
-    const caseIds = [...new Set(eligible.map((run) => run.case_id))].sort();
+    const caseIds = [...new Set(realEligible.map((run) => run.case_id))].sort();
     const resolutions = [];
     for (const caseId of caseIds) {
       const own = (perCaseRows.get(caseId) ?? []).filter((floor) => floor.workflow === workflow);
@@ -278,26 +302,40 @@ function evaluateDurationFloor(findings, wave) {
       resolutions.push({ ok: true, case_id: caseId, floor });
     }
     if (eligible.length === 0) continue;
+    if (realEligible.length === 0) {
+      // Scripted-only family: no real runs to judge, so no
+      // O1_DURATION_FLOOR_RATE/MISSING/DUPLICATE finding for this family. The
+      // observation row is still written (run_count 0) so campaign-wide
+      // duration-floor evidence stays complete for every case.
+      observations.push({
+        workflow,
+        case_floors: [],
+        run_count: 0,
+        fast_run_count: 0,
+        fast_rate: 0,
+      });
+      continue;
+    }
     const failure = resolutions.find((resolution) => !resolution.ok);
     if (failure !== undefined) {
       observations.push({
         workflow,
         duration_floor_ms: null,
         source: failure.source,
-        run_count: eligible.length,
+        run_count: realEligible.length,
         fast_run_count: null,
       });
       continue;
     }
     const floorByCase = new Map(resolutions.map((resolution) => [resolution.case_id, resolution.floor]));
-    const fast = eligible.filter((run) => run.terminal_at !== null
+    const fast = realEligible.filter((run) => run.terminal_at !== null
       && timestamp(run.terminal_at, `o1_wave run ${run.run_id} terminal_at`)
         - timestamp(run.started_at, `o1_wave run ${run.run_id} started_at`) < floorByCase.get(run.case_id).duration_floor_ms);
-    const rate = fast.length / eligible.length;
+    const rate = fast.length / realEligible.length;
     // A family rate finding is only meaningful with enough eligible runs:
     // below the minimum sample the wave cannot distinguish a fast wave from
     // noise, so the rate finding is suppressed (the observation is kept).
-    if (eligible.length >= MIN_FLOOR_RATE_SAMPLE && rate > MAX_FAST_RATE) {
+    if (realEligible.length >= MIN_FLOOR_RATE_SAMPLE && rate > MAX_FAST_RATE) {
       findings.add('O1_DURATION_FLOOR_RATE', 'more than 20% of a wave workflow family terminated below its measured duration floor', {
         wave: wave.wave,
         workflow,
@@ -306,7 +344,7 @@ function evaluateDurationFloor(findings, wave) {
           duration_floor_ms: resolution.floor.duration_floor_ms,
           source: resolution.floor.source,
         })),
-        run_count: eligible.length,
+        run_count: realEligible.length,
         fast_run_count: fast.length,
         fast_rate: rate,
         run_ids: fast.map((run) => run.run_id).sort(),
@@ -319,7 +357,7 @@ function evaluateDurationFloor(findings, wave) {
         duration_floor_ms: resolution.floor.duration_floor_ms,
         source: resolution.floor.source,
       })),
-      run_count: eligible.length,
+      run_count: realEligible.length,
       fast_run_count: fast.length,
       fast_rate: rate,
     });
@@ -483,7 +521,7 @@ export function evaluateO1(invocation) {
   // in every case's o1-terminal-state.json evidence (campaign-wide data); only
   // the findings list is deduplicated.
   const familyFindings = new FindingCollector();
-  const durationFloorObservations = evaluateDurationFloor(familyFindings, invocation.context.o1_wave);
+  const durationFloorObservations = evaluateDurationFloor(familyFindings, invocation.context.o1_wave, invocation.context.case);
   const reporter = waveReporterCaseId(invocation.context);
   if (reporter !== null && reporter === invocation.context.case.id) {
     mergeFindings(findings, familyFindings);

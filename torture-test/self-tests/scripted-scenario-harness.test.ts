@@ -134,6 +134,19 @@ printf '{"%s-%s_doer":{}}\\n' "$base" "$invocation"
   writeExecutable(cli, `#!/usr/bin/env bash
 set -euo pipefail
 if [ "$1 $2" = 'workflow install' ]; then
+  if [ "$3" = '--all' ]; then
+    # T2.2 US-005: the harness installs the FULL bundled catalog per cell.
+    src_root="\${TAMANDUA_WORKFLOWS_SRC:-${repoRoot}/workflows}"
+    for wf_dir in "$src_root"/*/; do
+      [ -d "$wf_dir" ] || continue
+      [ -f "$wf_dir/workflow.yml" ] || continue
+      base="$(basename "$wf_dir")"
+      dst="$TAMANDUA_STATE_DIR/workflows/$base"
+      mkdir -p "$(dirname "$dst")"
+      cp -a "$wf_dir" "$dst"
+    done
+    exit 0
+  fi
   src='${repoRoot}/workflows/'"$3"
   dst="$TAMANDUA_STATE_DIR/workflows/$3"
   mkdir -p "$(dirname "$dst")"

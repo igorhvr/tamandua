@@ -653,3 +653,163 @@ test('--verify-invariants exits 0 when every pinned invariant holds', () => {
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+// ── T2.2 US-003: preval campaign replay pin (O1 scripted exclusion) ─────────
+//
+// The tier2 preval campaign (campaign-20260825T233741033Z-577fa359-279b-4829-
+// afe5-0367e535ba71) stored six O1_DURATION_FLOOR_RATE FAILs on scripted
+// (0-token) wave-4 bug-fix-merge-worktree cells. US-002 excluded scripted runs
+// from O1's duration-floor evaluation, so replaying the stored evidence with
+// the fixed oracle flips EXACTLY those six FAILs to PASS (S5 scoped class)
+// while every other verdict and finding is unchanged — including W4.23's
+// honest LOCAL_SCENARIO_EVIDENCE_FAILED (a separate class repaired in US-004)
+// and W4.39-a's absence (TEST_INFRA_FAIL, no oracle evidence captured).
+//
+// The pin has two layers:
+//   1. a unit pin on verifyReplayInvariants over the exact preval delta rows
+//      (always runs — no campaign files needed), and
+//   2. an end-to-end pin that replays the REAL campaign with --verify-invariants
+//      and asserts the exact 85-pair delta (skips when the read-only campaign
+//      evidence is not present under torture-test/var/results — campaign
+//      evidence is never committed to the repo).
+
+const PREVAL_CAMPAIGN_NAME = 'campaign-20260825T233741033Z-577fa359-279b-4829-afe5-0367e535ba71';
+const PREVAL_FLOOR_CELLS = [
+  'W4.40-malformed-trailer', 'W4.40-oversized-stdout', 'W4.40-trailer-absent',
+  'W4.41-all-tiers-fail', 'W4.41-login-shell-tier', 'W4.46-provider-error-rounds',
+];
+
+function prevalFloorFlipRow(caseId) {
+  return row({
+    caseId,
+    oracle: 'O1',
+    before: 'FAIL',
+    after: 'PASS',
+    delta: 'flip',
+    beforeFindingIds: ['O1_DURATION_FLOOR_RATE'],
+    findingIds: [],
+  });
+}
+
+test('verifyReplayInvariants accepts the exact preval delta (six S5 O1 floor flips, zero other deltas)', () => {
+  // The GREEN replay delta of the preval campaign: six S5 O1_DURATION_FLOOR_RATE
+  // FAIL -> PASS flips on the scripted cells; W4.23's three honest
+  // LOCAL_SCENARIO_EVIDENCE_FAILED FAILs survive unchanged; every other pair
+  // is PASS -> PASS. The invariant verifier must accept it outright (ok: true,
+  // zero violations) — this pins that the S5 class covers EXACTLY these flips
+  // and that no honest verdict changed.
+  const verification = replay.verifyReplayInvariants({
+    campaignCaseIds: [...PREVAL_FLOOR_CELLS, 'W4.23-daemon-cross-runtime-restart', 'W4.04c-keyline-laundering', 'W4.40-delayed-trailer'],
+    rows: [
+      ...PREVAL_FLOOR_CELLS.map(prevalFloorFlipRow),
+      row({ caseId: 'W4.23-daemon-cross-runtime-restart', oracle: 'O1', before: 'FAIL', after: 'FAIL', beforeFindingIds: ['LOCAL_SCENARIO_EVIDENCE_FAILED', 'LOCAL_SCENARIO_EVIDENCE_FAILED'], findingIds: ['LOCAL_SCENARIO_EVIDENCE_FAILED', 'LOCAL_SCENARIO_EVIDENCE_FAILED'] }),
+      row({ caseId: 'W4.23-daemon-cross-runtime-restart', oracle: 'O11', before: 'FAIL', after: 'FAIL', beforeFindingIds: ['LOCAL_SCENARIO_EVIDENCE_FAILED', 'LOCAL_SCENARIO_EVIDENCE_FAILED'], findingIds: ['LOCAL_SCENARIO_EVIDENCE_FAILED', 'LOCAL_SCENARIO_EVIDENCE_FAILED'] }),
+      row({ caseId: 'W4.23-daemon-cross-runtime-restart', oracle: 'O3z', before: 'FAIL', after: 'FAIL', beforeFindingIds: ['LOCAL_SCENARIO_EVIDENCE_FAILED', 'LOCAL_SCENARIO_EVIDENCE_FAILED'], findingIds: ['LOCAL_SCENARIO_EVIDENCE_FAILED', 'LOCAL_SCENARIO_EVIDENCE_FAILED'] }),
+      row({ caseId: 'W4.04c-keyline-laundering', before: 'PASS', after: 'PASS' }),
+      row({ caseId: 'W4.04c-keyline-laundering', oracle: 'O11', before: 'PASS', after: 'PASS' }),
+      row({ caseId: 'W4.40-delayed-trailer', before: 'PASS', after: 'PASS' }),
+      row({ caseId: 'W4.40-delayed-trailer', oracle: 'O9', before: 'PASS', after: 'PASS' }),
+    ],
+  });
+  assert.equal(verification.ok, true, JSON.stringify(verification.violations));
+  const classes = verification.checks.find((check) => check.label === 'flip-transition-classes');
+  assert.equal(classes.violations.length, 0);
+  const preservation = verification.checks.find((check) => check.label === 'honest-finding-preservation');
+  assert.equal(preservation.violations.length, 0);
+});
+
+test('verifyReplayInvariants rejects an honest W4.23 LOCAL_SCENARIO_EVIDENCE_FAILED flip (zero other deltas is enforced)', () => {
+  // Negative control for the preval pin: if the replay ever cleared W4.23's
+  // honest O1 finding (US-004 repairs it later, so until then it MUST survive),
+  // the delta would no longer be "six floor flips, zero other deltas" and the
+  // invariant verifier must fail loudly.
+  const verification = replay.verifyReplayInvariants({
+    // Empty case universe: no campaign-seven pins apply, so the ONLY
+    // violations are the vanished honest W4.23 findings.
+    campaignCaseIds: [],
+    rows: [
+      ...PREVAL_FLOOR_CELLS.map(prevalFloorFlipRow),
+      row({ caseId: 'W4.23-daemon-cross-runtime-restart', before: 'FAIL', after: 'PASS', delta: 'flip', beforeFindingIds: ['LOCAL_SCENARIO_EVIDENCE_FAILED', 'LOCAL_SCENARIO_EVIDENCE_FAILED'] }),
+    ],
+  });
+  assert.equal(verification.ok, false);
+  const joined = verification.violations.join('\n');
+  assert.match(joined, /honest finding LOCAL_SCENARIO_EVIDENCE_FAILED vanished/);
+  assert.match(joined, /FAIL -> PASS flip dropped non-scoped finding/);
+});
+
+function resolvePrevalCampaign() {
+  if (process.env.TT_PREVAL_CAMPAIGN_DIR !== undefined && process.env.TT_PREVAL_CAMPAIGN_DIR.length > 0) {
+    return path.resolve(process.env.TT_PREVAL_CAMPAIGN_DIR);
+  }
+  return path.join(VAR_ROOT, 'results', PREVAL_CAMPAIGN_NAME);
+}
+
+const PREVAL_CAMPAIGN = resolvePrevalCampaign();
+const PREVAL_CAMPAIGN_PRESENT = fs.existsSync(path.join(PREVAL_CAMPAIGN, 'state.json'));
+
+test('preval campaign replay pin: exactly six S5 O1 floor flips, zero other deltas, exit 0 under --verify-invariants', {
+  skip: PREVAL_CAMPAIGN_PRESENT ? false : `preval campaign evidence not present (${PREVAL_CAMPAIGN}) — replay pin not applicable; copy it into torture-test/var/results/ or set TT_PREVAL_CAMPAIGN_DIR`,
+}, () => {
+  const campaign = PREVAL_CAMPAIGN;
+  const root = testRoot();
+  try {
+    const digestBefore = replay.computeCampaignDigest(campaign);
+    const jsonPath = path.join(root, 'preval-replay.json');
+    const result = spawnSync(process.execPath, [REPLAY_TOOL, '--campaign', campaign, '--workspace-root', path.join(root, 'ws'), '--verify-invariants', '--json', jsonPath], {
+      encoding: 'utf8',
+      shell: false,
+      timeout: 600_000,
+      maxBuffer: 32 * 1024 * 1024,
+    });
+    assert.equal(result.status, 0, `stdout: ${result.stdout}\nstderr: ${result.stderr}`);
+    assert.match(result.stdout, /invariants: OK/);
+
+    const payload = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
+    // Exact delta contract: 85 pairs, six FAIL -> PASS flips, 79 unchanged.
+    assert.equal(payload.summary.pairs, 85, JSON.stringify(payload.summary));
+    assert.equal(payload.summary.flips, 6, JSON.stringify(payload.summary));
+    assert.equal(payload.summary.unchanged, 79, JSON.stringify(payload.summary));
+    assert.equal(payload.summary.invoke_failures, 0, JSON.stringify(payload.summary));
+    assert.equal(payload.summary.source_campaign_unchanged, true, JSON.stringify(payload.summary));
+
+    // Every flip is one of the six scripted cells: O1 FAIL -> PASS carrying
+    // ONLY the stored O1_DURATION_FLOOR_RATE (S5 scoped), replaying PASS with
+    // no findings.
+    const flips = payload.rows.filter((entry) => entry.delta === 'flip');
+    assert.equal(flips.length, 6);
+    for (const flip of flips) {
+      assert.ok(PREVAL_FLOOR_CELLS.includes(flip.caseId), `unexpected flip case ${flip.caseId}`);
+      assert.equal(flip.oracle, 'O1');
+      assert.equal(flip.before, 'FAIL');
+      assert.equal(flip.after, 'PASS');
+      assert.deepEqual(flip.beforeFindingIds, ['O1_DURATION_FLOOR_RATE']);
+      assert.deepEqual(flip.findingIds, []);
+    }
+    assert.deepEqual(flips.map((flip) => flip.caseId).sort(), [...PREVAL_FLOOR_CELLS].sort());
+
+    // Every other row is unchanged: zero other deltas.
+    const same = payload.rows.filter((entry) => entry.delta === 'same');
+    assert.equal(same.length, 79);
+
+    // W4.23's honest LOCAL_SCENARIO_EVIDENCE_FAILED survives on O1/O11/O3z
+    // (repaired separately in US-004 — until then it must remain).
+    const w423 = payload.rows.filter((entry) => entry.caseId === 'W4.23-daemon-cross-runtime-restart');
+    assert.deepEqual(w423.map((entry) => [entry.oracle, entry.before, entry.after]), [
+      ['O1', 'FAIL', 'FAIL'], ['O11', 'FAIL', 'FAIL'], ['O3z', 'FAIL', 'FAIL'],
+    ]);
+    assert.ok(w423.every((entry) => entry.findingIds.includes('LOCAL_SCENARIO_EVIDENCE_FAILED')));
+
+    // W4.39-a (TEST_INFRA_FAIL) captured no oracle evidence: no replay rows.
+    assert.ok(!payload.rows.some((entry) => entry.caseId === 'W4.39-a-union-honest'));
+
+    // Invariants hold: S5 scoped flips only.
+    assert.equal(payload.invariants.ok, true, JSON.stringify(payload.invariants.violations));
+
+    // Source campaign byte-identical before/after the replay (the tool's own
+    // digest check already enforces this; re-verify independently).
+    assert.deepEqual(replay.computeCampaignDigest(campaign), digestBefore);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

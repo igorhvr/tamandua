@@ -124,6 +124,23 @@ function validateDurationFloor(floor) {
     && Number.isSafeInteger(floor.sample_size) && floor.sample_size >= 0;
 }
 
+function validateO1WaveRun(run) {
+  // T2.2 US-001: `execution_mode` is OPTIONAL per run ('real'|'scripted') so
+  // STORED schema-1 evidence from campaigns whose wave projection predates the
+  // field still validates; when present it must be exactly 'real' or
+  // 'scripted'. schema_version stays 1.
+  const baseKeys = ['case_id', 'run_id', 'workflow', 'started_at', 'terminal_at', 'terminal_status', 'expected_fast_failure'];
+  const withMode = hasExactKeys(run, [...baseKeys, 'execution_mode']);
+  return (withMode || hasExactKeys(run, baseKeys))
+    && ['case_id', 'run_id', 'workflow'].every((key) => typeof run[key] === 'string' && run[key].length > 0)
+    && isUtcTimestamp(run.started_at)
+    && (run.terminal_at === null || isUtcTimestamp(run.terminal_at))
+    && (run.terminal_status === null || typeof run.terminal_status === 'string')
+    && ((run.terminal_at === null) === (run.terminal_status === null))
+    && typeof run.expected_fast_failure === 'boolean'
+    && (run.execution_mode === undefined || run.execution_mode === 'real' || run.execution_mode === 'scripted');
+}
+
 function validateO1Wave(wave) {
   return hasExactKeys(wave, ['schema_version', 'wave', 'duration_floors', 'runs'])
     && wave.schema_version === 1
@@ -131,13 +148,7 @@ function validateO1Wave(wave) {
     && Array.isArray(wave.duration_floors)
     && wave.duration_floors.every(validateDurationFloor)
     && Array.isArray(wave.runs)
-    && wave.runs.every((run) => hasExactKeys(run, ['case_id', 'run_id', 'workflow', 'started_at', 'terminal_at', 'terminal_status', 'expected_fast_failure'])
-      && ['case_id', 'run_id', 'workflow'].every((key) => typeof run[key] === 'string' && run[key].length > 0)
-      && isUtcTimestamp(run.started_at)
-      && (run.terminal_at === null || isUtcTimestamp(run.terminal_at))
-      && (run.terminal_status === null || typeof run.terminal_status === 'string')
-      && ((run.terminal_at === null) === (run.terminal_status === null))
-      && typeof run.expected_fast_failure === 'boolean');
+    && wave.runs.every(validateO1WaveRun);
 }
 
 function parseArgs(argv) {

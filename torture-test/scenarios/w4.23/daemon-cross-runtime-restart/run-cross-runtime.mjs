@@ -16,9 +16,23 @@
  * discovery, picks runtime A (the current node) and runtime B (a SECOND
  * distinct runtime that loads `node:sqlite` — probed; fails closed with a
  * diagnosable message if none exists), and switches the daemon across them
- * via daemon-control (PATH prepend — the launcher's `exec node` resolves
- * from PATH, so the daemon process lands on runtime B's binary, asserted via
- * /proc/<pid>/exe).
+ * via daemon-control.
+ *
+ * Runtime-switch mechanism (post-S24/US-006): daemon-control reconstructs
+ * the contained launch PATH itself (contained_path_for_kind — var/
+ * adapters-bin first, the env-script PATH next, the caller PATH last with
+ * operator bin dirs reordered) and spawns via `env -i $(env_for_kind ...)
+ * PATH=...`, so a caller-PATH prepend of runtime B's node dir is DROPPED —
+ * the restarted daemon would stay on the env script's node. The sanctioned
+ * switch is daemon-control's TT_DC_ENV_SCRIPTED env-script seam (the MACP7
+ * US-001 test seam daemon-control.test.sh uses): the runner writes a
+ * CONTAINED env-script variant under torture-test/var that sources
+ * env/tt-env-scripted.sh and pins TT_NODE_BIN/TT_NODE_BIN_DIR + PATH to
+ * runtime B, and runs `daemon-control scripted start/status/stop` with
+ * TT_DC_ENV_SCRIPTED=<variant> for the runtime-B phase ONLY. The launcher's
+ * `exec node` then resolves from the variant's PATH, so the daemon process
+ * lands on runtime B's binary (asserted via /proc/<pid>/exe); phase 4
+ * restores the default env script (runtime A).
  *
  * Zero tokens: both probe runs execute on the scripted-pi runtime; the
  * ledger must show runs.tokens_spent 0 + system tripwire 0. The runs are
@@ -31,6 +45,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { writeRuntimeBEnvScript } from "../../lib/runtime-switch-env.mjs";
 
 function requiredValue(name) {
   const value = process.env[name];
@@ -170,8 +185,10 @@ function waitForRunning(env, label) {
   while (Date.now() < deadline) {
     status = daemonUp(env);
     if (/STATUS: RUNNING/.test(status)) return status;
-    // A just-stopped daemon's pidfile may linger briefly; keep polling.
-    if (fs.existsSync(pidFile)) fs.rmSync(pidFile, { force: true });
+    // cmd_status reads daemon-control provenance (var/daemon-control/
+    // scripted.json), never the state-dir pidfile — do NOT touch the
+    // pidfile here: deleting it while the daemon is (re)writing it could
+    // race the identity-verified provenance and the daemonPid() read below.
     const sleep = runSync("/bin/sh", ["-c", "sleep 0.2"]);
     assert.equal(sleep.status, 0, "sleep failed");
   }
@@ -272,9 +289,37 @@ const baseDaemonEnv = {
   TAMANDUA_SCRIPTED_STATE: counterDir,
 };
 const defaultPath = process.env.PATH ?? "";
-const runtimeBPath = `${path.dirname(runtimeB.bin)}:${repoRoot}/bin:${defaultPath}`;
-const defaultDaemonEnv = { ...baseDaemonEnv, PATH: defaultPath };
-const runtimeBDaemonEnv = { ...baseDaemonEnv, PATH: runtimeBPath };
+// The caller-PATH leg of the contained launch PATH must keep the repo's bin
+// dir reachable so the launch script's `tamandua` resolves (the harness
+// daemon_control handoff uses the same PATH="$REPO_ROOT/bin:$PATH" shape);
+// node resolution is owned by the env-script leg (see below).
+const harnessPath = `${repoRoot}/bin:${defaultPath}`;
+
+// ── daemon-control-sanctioned runtime switch (TT_DC_ENV_SCRIPTED) ─────
+// daemon-control reconstructs the contained launch PATH itself
+// (contained_path_for_kind, S24/US-006): var/adapters-bin first, the env
+// script's PATH next, the caller PATH last — a caller-PATH prepend of
+// runtime B's node dir is therefore DROPPED and the restarted daemon lands
+// on the env script's node (runtime A). The sanctioned mechanism is the
+// TT_DC_ENV_SCRIPTED env-script seam: write a CONTAINED env-script variant
+// (under torture-test/var) that sources the bundled scripted env and pins
+// TT_NODE_BIN/TT_NODE_BIN_DIR + the printed PATH to runtime B; daemon-control
+// scripted start/status/stop for the runtime-B phase only run with
+// TT_DC_ENV_SCRIPTED=<variant>. The variant is removed with the invocation
+// dir (harness cleanup). The generation lives in
+// scenarios/lib/runtime-switch-env.mjs so the regression self-test pins the
+// same corridor.
+const runtimeBEnvScript = writeRuntimeBEnvScript({
+  invocationDir,
+  repoRoot,
+  runtimeBBin: runtimeB.bin,
+});
+const defaultDaemonEnv = { ...baseDaemonEnv, PATH: harnessPath };
+const runtimeBDaemonEnv = {
+  ...baseDaemonEnv,
+  PATH: `${path.dirname(runtimeB.bin)}:${harnessPath}`,
+  TT_DC_ENV_SCRIPTED: runtimeBEnvScript,
+};
 
 // ── phase 1: under runtime A (harness-started daemon) ────────────────
 
@@ -291,11 +336,10 @@ const run1Before = runSnapshot(run1Id);
 // ── phase 2: stop under A, start under B — same DB ───────────────────
 
 runDaemonControl("stop", defaultDaemonEnv);
-const pidAfterStop = fs.existsSync(pidFile) ? (() => { try { return Number(String(fs.readFileSync(pidFile, "utf8")).trim()); } catch { return null; } })() : null;
-if (pidAfterStop !== null && Number.isInteger(pidAfterStop) && pidAfterStop > 0) {
-  // The stop path may leave the pidfile briefly; the start below rewrites it.
-  fs.rmSync(pidFile, { force: true });
-}
+// No state-dir pidfile manipulation here: cmd_stop records the stopped
+// provenance (identity-verified) and cmd_start clears a stale pidfile
+// itself (T2.1 US-009); deleting the pidfile by hand could race the
+// identity-verified provenance.
 runDaemonControl("start", runtimeBDaemonEnv);
 waitForRunning(runtimeBDaemonEnv, "phase 2 (runtime B)");
 const pidB = daemonPid();
@@ -321,7 +365,6 @@ assert.equal(runBehavior(run2Id), runBehavior(run1Id),
 // ── phase 4: restore under runtime A, scoped cleanup, zero tokens ────
 
 runDaemonControl("stop", runtimeBDaemonEnv);
-if (fs.existsSync(pidFile)) fs.rmSync(pidFile, { force: true });
 runDaemonControl("start", defaultDaemonEnv);
 waitForRunning(defaultDaemonEnv, "phase 4 (restore runtime A)");
 

@@ -66,18 +66,18 @@ function projectedStep(row, overrides = {}) {
   };
 }
 
-function attempt(id, status, steps) {
+function attempt(id, status, steps, mode = 'real') {
   const terminal = ['completed', 'failed', 'canceled'].includes(status);
   return {
     id: `attempt-${bare(id).slice(0, 4)}`,
     kind: 'workflow',
     phase: terminal ? 'terminal' : 'running',
-    execution_mode: 'real',
+    execution_mode: mode,
     run_id: id,
     started_at: STARTED_AT,
     terminal_at: terminal ? TERMINAL_AT : null,
     terminal_status: terminal ? status : null,
-    tokens_observed: 1,
+    tokens_observed: mode === 'scripted' ? 0 : 1,
     command_result: terminal ? { exit_code: status === 'completed' ? 0 : 1, signal: null } : null,
     steps_snapshot: {
       source: 'workflow-status-json',
@@ -123,6 +123,15 @@ const cases = [
   // still fires below the floor.
   { name: 'o1-wave1-floor-30000', expected: 'PASS', wave1Floor: true },
   { name: 'o1-wave1-floor-fast', expected: 'FAIL', wave1Floor: true, wave1FloorFast: true, finding: 'O1_DURATION_FLOOR_RATE' },
+  // T2.2 US-002: duration floors are meaningless for scripted (0-token) cells.
+  // (a) a mechanically-fast scripted wave must PASS with zero
+  // O1_DURATION_FLOOR_* findings; (b) the STORED schema-1 shape (wave run rows
+  // WITHOUT execution_mode on a caps.tokens === 0 case) must also PASS via the
+  // case-level zero-token fallback; (c) a mixed real+scripted family computes
+  // fast_rate on the REAL runs only.
+  { name: 'o1-scripted-fast-wave', expected: 'PASS', scriptedWave: true },
+  { name: 'o1-stored-scripted-fast-wave', expected: 'PASS', storedScriptedWave: true },
+  { name: 'o1-mixed-real-scripted-family', expected: 'FAIL', mixedWave: true, finding: 'O1_DURATION_FLOOR_RATE' },
 ];
 
 for (const fixture of cases) {
@@ -147,11 +156,15 @@ for (const fixture of cases) {
     status: fixture.childStepStatus ?? (childStatus === 'running' ? 'pending' : 'done'),
     type: fixture.childStepType ?? 'single',
   });
-  const rootAttempt = attempt(ROOT, rootStatus, [rootStep]);
-  if (fixture.fastWave || fixture.tinySample || fixture.n4Fast) rootAttempt.terminal_at = '2026-08-01T12:00:30.000Z';
+  // T2.2 US-002: scripted-wave fixtures run their root/child attempts in the
+  // scripted (zero-token) environment so the context stays coherent.
+  const attemptMode = fixture.scriptedWave || fixture.storedScriptedWave ? 'scripted' : 'real';
+  const rootAttempt = attempt(ROOT, rootStatus, [rootStep], attemptMode);
+  if (fixture.fastWave || fixture.tinySample || fixture.n4Fast
+      || fixture.scriptedWave || fixture.storedScriptedWave) rootAttempt.terminal_at = '2026-08-01T12:00:30.000Z';
   if (fixture.wave1Floor) rootAttempt.terminal_at = '2026-08-01T12:00:53.257Z'; // W1.L1-python measured 53.257s (campaign #8)
-  const childAttempt = { ...attempt(CHILD, childStatus, [childStep]), parent_run_id: ROOT };
-  if (fixture.tinySample || fixture.n4Fast) childAttempt.terminal_at = '2026-08-01T12:00:30.000Z';
+  const childAttempt = { ...attempt(CHILD, childStatus, [childStep], attemptMode), parent_run_id: ROOT };
+  if (fixture.tinySample || fixture.n4Fast || fixture.scriptedWave || fixture.storedScriptedWave) childAttempt.terminal_at = '2026-08-01T12:00:30.000Z';
   if (fixture.wave1Floor) childAttempt.terminal_at = '2026-08-01T12:00:46.313Z'; // W1.L1-ts measured 46.313s (campaign #8)
 
   const databasePath = path.join(snapshots, 'database.sqlite');
@@ -216,7 +229,7 @@ for (const fixture of cases) {
     campaign: { id: `campaign-${fixture.name}`, created_at: STARTED_AT, manifest: { sha256: 'a'.repeat(64), case_count: 1, case_ids: [fixture.name] } },
     case: {
       id: fixture.name, wave: 4, workflow: 'feature-dev-merge-worktree', fixture: 'synthetic', harness: 'hermes',
-      class: 'verification', caps: { tokens: 10, wall_min: 60 }, boundary_files: [], forbidden: [],
+      class: 'verification', caps: { tokens: fixture.scriptedWave || fixture.storedScriptedWave ? 0 : 10, wall_min: 60 }, boundary_files: [], forbidden: [],
       chaos: fixture.healthyStraggler ? { healthy_straggler: { policy: 'hermes-storm', run_ids: [CHILD], recent_within_ms: 300000 } } : null,
     },
     run_id: ROOT,
@@ -276,11 +289,11 @@ function writeReporterFixture(workspace, fixture) {
   const runs = [
     // Duplicate wave row for the first case's own run: a run-scoped wave
     // finding that must fail the first case and NOT the reporter case.
-    { case_id: firstCaseId, run_id: ROOT, workflow, started_at: STARTED_AT, terminal_at: TERMINAL_AT, terminal_status: 'completed', expected_fast_failure: false },
-    { case_id: firstCaseId, run_id: ROOT, workflow, started_at: STARTED_AT, terminal_at: TERMINAL_AT, terminal_status: 'completed', expected_fast_failure: false },
-    { case_id: reporterCaseId, run_id: CHILD, workflow, started_at: STARTED_AT, terminal_at: TERMINAL_AT, terminal_status: 'completed', expected_fast_failure: false },
-    { case_id: 'wave-peer-1', run_id: 'run-wave-peer-1', workflow, started_at: STARTED_AT, terminal_at: fastTerminalAt, terminal_status: 'completed', expected_fast_failure: false },
-    { case_id: 'wave-peer-2', run_id: 'run-wave-peer-2', workflow, started_at: STARTED_AT, terminal_at: fastTerminalAt, terminal_status: 'completed', expected_fast_failure: false },
+    { case_id: firstCaseId, run_id: ROOT, workflow, started_at: STARTED_AT, terminal_at: TERMINAL_AT, terminal_status: 'completed', expected_fast_failure: false, execution_mode: 'real' },
+    { case_id: firstCaseId, run_id: ROOT, workflow, started_at: STARTED_AT, terminal_at: TERMINAL_AT, terminal_status: 'completed', expected_fast_failure: false, execution_mode: 'real' },
+    { case_id: reporterCaseId, run_id: CHILD, workflow, started_at: STARTED_AT, terminal_at: TERMINAL_AT, terminal_status: 'completed', expected_fast_failure: false, execution_mode: 'real' },
+    { case_id: 'wave-peer-1', run_id: 'run-wave-peer-1', workflow, started_at: STARTED_AT, terminal_at: fastTerminalAt, terminal_status: 'completed', expected_fast_failure: false, execution_mode: 'real' },
+    { case_id: 'wave-peer-2', run_id: 'run-wave-peer-2', workflow, started_at: STARTED_AT, terminal_at: fastTerminalAt, terminal_status: 'completed', expected_fast_failure: false, execution_mode: 'real' },
   ];
   const caseIds = [...new Set(runs.map((run) => run.case_id))];
   const wave = {
@@ -413,7 +426,7 @@ function writeSequentialFixture(workspace, fixture) {
 
   const waveRun = (caseId, runId, terminalAt) => ({
     case_id: caseId, run_id: runId, workflow, started_at: STARTED_AT, terminal_at: terminalAt,
-    terminal_status: 'completed', expected_fast_failure: false,
+    terminal_status: 'completed', expected_fast_failure: false, execution_mode: 'real',
   });
   // First case's snapshot: its own run only (< MIN_FLOOR_RATE_SAMPLE).
   const firstWave = {
@@ -534,29 +547,35 @@ function waveProjection(fixture, rootAttempt, childAttempt) {
   if (fixture.omitWaveProjection) {
     return { schema_version: 1, wave: 4, duration_floors: [], runs: [] };
   }
+  if (fixture.scriptedWave || fixture.storedScriptedWave) {
+    return scriptedWaveProjection(fixture, rootAttempt, childAttempt);
+  }
+  if (fixture.mixedWave) {
+    return mixedWaveProjection(fixture, rootAttempt, childAttempt);
+  }
   const workflow = 'feature-dev-merge-worktree';
   const fastTerminalAt = '2026-08-01T12:00:30.000Z';
   const rootFast = fixture.fastWave || fixture.tinySample || fixture.n4Fast;
   const childFast = fixture.tinySample || fixture.n4Fast;
   const runs = [
-    { case_id: fixture.name, run_id: ROOT, workflow, started_at: STARTED_AT, terminal_at: rootFast ? fastTerminalAt : rootAttempt.terminal_at, terminal_status: fixture.mismatchedWaveRun ? 'failed' : rootAttempt.terminal_status, expected_fast_failure: false },
-    { case_id: fixture.name, run_id: CHILD, workflow, started_at: STARTED_AT, terminal_at: childFast ? fastTerminalAt : childAttempt.terminal_at, terminal_status: childAttempt.terminal_status, expected_fast_failure: false },
-    ...(fixture.historicalAttempt ? [{ case_id: fixture.name, run_id: PRIOR, workflow, started_at: STARTED_AT, terminal_at: TERMINAL_AT, terminal_status: 'failed', expected_fast_failure: false }] : []),
-    ...(fixture.duplicateWaveRun ? [{ case_id: fixture.name, run_id: ROOT, workflow, started_at: STARTED_AT, terminal_at: rootAttempt.terminal_at, terminal_status: rootAttempt.terminal_status, expected_fast_failure: false }] : []),
-    ...(fixture.unknownWaveRun ? [{ case_id: fixture.name, run_id: 'run-unknown', workflow, started_at: STARTED_AT, terminal_at: TERMINAL_AT, terminal_status: 'completed', expected_fast_failure: false }] : []),
+    { case_id: fixture.name, run_id: ROOT, workflow, started_at: STARTED_AT, terminal_at: rootFast ? fastTerminalAt : rootAttempt.terminal_at, terminal_status: fixture.mismatchedWaveRun ? 'failed' : rootAttempt.terminal_status, expected_fast_failure: false, execution_mode: 'real' },
+    { case_id: fixture.name, run_id: CHILD, workflow, started_at: STARTED_AT, terminal_at: childFast ? fastTerminalAt : childAttempt.terminal_at, terminal_status: childAttempt.terminal_status, expected_fast_failure: false, execution_mode: 'real' },
+    ...(fixture.historicalAttempt ? [{ case_id: fixture.name, run_id: PRIOR, workflow, started_at: STARTED_AT, terminal_at: TERMINAL_AT, terminal_status: 'failed', expected_fast_failure: false, execution_mode: 'real' }] : []),
+    ...(fixture.duplicateWaveRun ? [{ case_id: fixture.name, run_id: ROOT, workflow, started_at: STARTED_AT, terminal_at: rootAttempt.terminal_at, terminal_status: rootAttempt.terminal_status, expected_fast_failure: false, execution_mode: 'real' }] : []),
+    ...(fixture.unknownWaveRun ? [{ case_id: fixture.name, run_id: 'run-unknown', workflow, started_at: STARTED_AT, terminal_at: TERMINAL_AT, terminal_status: 'completed', expected_fast_failure: false, execution_mode: 'real' }] : []),
   ];
   if (fixture.tinySample || fixture.n4Fast) {
-    runs.push({ case_id: 'wave-peer-1', run_id: 'run-wave-peer-1', workflow, started_at: STARTED_AT, terminal_at: fastTerminalAt, terminal_status: 'completed', expected_fast_failure: false });
+    runs.push({ case_id: 'wave-peer-1', run_id: 'run-wave-peer-1', workflow, started_at: STARTED_AT, terminal_at: fastTerminalAt, terminal_status: 'completed', expected_fast_failure: false, execution_mode: 'real' });
     if (fixture.n4Fast) {
-      runs.push({ case_id: 'wave-peer-2', run_id: 'run-wave-peer-2', workflow, started_at: STARTED_AT, terminal_at: fastTerminalAt, terminal_status: 'completed', expected_fast_failure: false });
+      runs.push({ case_id: 'wave-peer-2', run_id: 'run-wave-peer-2', workflow, started_at: STARTED_AT, terminal_at: fastTerminalAt, terminal_status: 'completed', expected_fast_failure: false, execution_mode: 'real' });
     }
   } else {
     runs.push(
-      { case_id: 'wave-peer-1', run_id: 'run-wave-peer-1', workflow, started_at: STARTED_AT, terminal_at: fixture.fastWave ? '2026-08-01T12:00:40.000Z' : (fixture.perCaseFloors ? '2026-08-01T12:04:00.000Z' : TERMINAL_AT), terminal_status: 'completed', expected_fast_failure: false },
-      { case_id: 'wave-peer-2', run_id: 'run-wave-peer-2', workflow, started_at: STARTED_AT, terminal_at: fixture.perCaseFloors ? '2026-08-01T12:04:00.000Z' : TERMINAL_AT, terminal_status: 'completed', expected_fast_failure: false },
-      { case_id: 'wave-peer-3', run_id: 'run-wave-peer-3', workflow, started_at: STARTED_AT, terminal_at: TERMINAL_AT, terminal_status: 'completed', expected_fast_failure: false },
-      { case_id: 'wave-peer-4', run_id: 'run-wave-peer-4', workflow, started_at: STARTED_AT, terminal_at: TERMINAL_AT, terminal_status: 'completed', expected_fast_failure: false },
-      ...(fixture.excludedFast ? [{ case_id: 'wave-fast-failure', run_id: 'run-wave-fast-failure', workflow, started_at: STARTED_AT, terminal_at: '2026-08-01T12:00:10.000Z', terminal_status: 'failed', expected_fast_failure: true }] : []),
+      { case_id: 'wave-peer-1', run_id: 'run-wave-peer-1', workflow, started_at: STARTED_AT, terminal_at: fixture.fastWave ? '2026-08-01T12:00:40.000Z' : (fixture.perCaseFloors ? '2026-08-01T12:04:00.000Z' : TERMINAL_AT), terminal_status: 'completed', expected_fast_failure: false, execution_mode: 'real' },
+      { case_id: 'wave-peer-2', run_id: 'run-wave-peer-2', workflow, started_at: STARTED_AT, terminal_at: fixture.perCaseFloors ? '2026-08-01T12:04:00.000Z' : TERMINAL_AT, terminal_status: 'completed', expected_fast_failure: false, execution_mode: 'real' },
+      { case_id: 'wave-peer-3', run_id: 'run-wave-peer-3', workflow, started_at: STARTED_AT, terminal_at: TERMINAL_AT, terminal_status: 'completed', expected_fast_failure: false, execution_mode: 'real' },
+      { case_id: 'wave-peer-4', run_id: 'run-wave-peer-4', workflow, started_at: STARTED_AT, terminal_at: TERMINAL_AT, terminal_status: 'completed', expected_fast_failure: false, execution_mode: 'real' },
+      ...(fixture.excludedFast ? [{ case_id: 'wave-fast-failure', run_id: 'run-wave-fast-failure', workflow, started_at: STARTED_AT, terminal_at: '2026-08-01T12:00:10.000Z', terminal_status: 'failed', expected_fast_failure: true, execution_mode: 'real' }] : []),
     );
   }
   const caseIds = [...new Set(runs.map((run) => run.case_id))];
@@ -591,6 +610,81 @@ function waveProjection(fixture, rootAttempt, childAttempt) {
   return { schema_version: 1, wave: 4, duration_floors: durationFloors, runs };
 }
 
+// T2.2 US-002 fixture (a)/(b): a mechanically-fast scripted wave. Every run
+// finishes in 30s against a 300000ms floor, exactly like o1-fast-wave — but
+// the runs are scripted (zero-token) cells, so O1 must emit no
+// O1_DURATION_FLOOR_* finding. `storedScriptedWave` mirrors STORED schema-1
+// evidence: the wave run rows OMIT the per-run execution_mode field (the O1
+// consumer falls back to the case's caps.tokens === 0 signal), while
+// `scriptedWave` carries execution_mode: 'scripted' on every run.
+function scriptedWaveProjection(fixture, rootAttempt, childAttempt) {
+  const workflow = 'feature-dev-merge-worktree';
+  const fastTerminalAt = '2026-08-01T12:00:30.000Z';
+  const mode = fixture.scriptedWave ? 'scripted' : undefined;
+  const run = (caseId, runId, terminalAt, terminalStatus) => {
+    const row = {
+      case_id: caseId, run_id: runId, workflow, started_at: STARTED_AT, terminal_at: terminalAt,
+      terminal_status: terminalStatus, expected_fast_failure: false,
+    };
+    if (mode !== undefined) row.execution_mode = mode;
+    return row;
+  };
+  const runs = [
+    run(fixture.name, ROOT, fastTerminalAt, rootAttempt.terminal_status),
+    run(fixture.name, CHILD, fastTerminalAt, childAttempt.terminal_status),
+    run('wave-peer-1', 'run-wave-peer-1', fastTerminalAt, 'completed'),
+    run('wave-peer-2', 'run-wave-peer-2', fastTerminalAt, 'completed'),
+    run('wave-peer-3', 'run-wave-peer-3', fastTerminalAt, 'completed'),
+  ];
+  const caseIds = [...new Set(runs.map((run) => run.case_id))];
+  const durationFloors = caseIds.map((caseId) => ({
+    workflow: 'feature-dev-merge-worktree',
+    case_id: caseId,
+    duration_floor_ms: 300000,
+    source: 'production-median',
+    sample_size: 0,
+  }));
+  return { schema_version: 1, wave: 4, duration_floors: durationFloors, runs };
+}
+
+// T2.2 US-002 fixture (c): one workflow family with BOTH real and scripted
+// runs. The rate is computed on the REAL runs only: 4 real eligible runs
+// (1 fast -> 0.25 > MAX_FAST_RATE 0.2, so O1_DURATION_FLOOR_RATE fires) plus
+// 4 fast scripted peers that must be excluded from BOTH the numerator and the
+// denominator (run_count stays 4, not 8).
+function mixedWaveProjection(fixture, rootAttempt, childAttempt) {
+  const workflow = 'feature-dev-merge-worktree';
+  const slowTerminalAt = TERMINAL_AT;
+  const fastTerminalAt = '2026-08-01T12:00:30.000Z';
+  const realRun = (caseId, runId, terminalAt) => ({
+    case_id: caseId, run_id: runId, workflow, started_at: STARTED_AT, terminal_at: terminalAt,
+    terminal_status: 'completed', expected_fast_failure: false, execution_mode: 'real',
+  });
+  const scriptedRun = (caseId, runId, terminalAt) => ({
+    case_id: caseId, run_id: runId, workflow, started_at: STARTED_AT, terminal_at: terminalAt,
+    terminal_status: 'completed', expected_fast_failure: false, execution_mode: 'scripted',
+  });
+  const runs = [
+    realRun(fixture.name, ROOT, slowTerminalAt),
+    realRun(fixture.name, CHILD, slowTerminalAt),
+    realRun('wave-peer-1', 'run-wave-peer-1', slowTerminalAt),
+    realRun('wave-peer-2', 'run-wave-peer-2', fastTerminalAt),
+    scriptedRun('wave-peer-3', 'run-wave-peer-3', fastTerminalAt),
+    scriptedRun('wave-peer-4', 'run-wave-peer-4', fastTerminalAt),
+    scriptedRun('wave-peer-5', 'run-wave-peer-5', fastTerminalAt),
+    scriptedRun('wave-peer-6', 'run-wave-peer-6', fastTerminalAt),
+  ];
+  const caseIds = [...new Set(runs.map((run) => run.case_id))];
+  const durationFloors = caseIds.map((caseId) => ({
+    workflow: 'feature-dev-merge-worktree',
+    case_id: caseId,
+    duration_floor_ms: 300000,
+    source: 'production-median',
+    sample_size: 0,
+  }));
+  return { schema_version: 1, wave: 4, duration_floors: durationFloors, runs };
+}
+
 // US-007 (2026-08-24): derived wave-1 do-now projection at the recalibrated
 // 30000ms production floor (US-006). The four runs carry the campaign #8
 // wave-1 do-now runs' MEASURED durations — W1.L1-python 53.257s, W1.L1-ts
@@ -603,12 +697,12 @@ function wave1FloorProjection(fixture, rootAttempt, childAttempt) {
   const runs = [
     // W1.L1-python slot (53.257s) and W1.L1-ts slot (46.313s): the launched
     // ROOT/CHILD runs, whose terminal_at must match the attempt projections.
-    { case_id: fixture.name, run_id: ROOT, workflow, started_at: STARTED_AT, terminal_at: rootAttempt.terminal_at, terminal_status: rootAttempt.terminal_status, expected_fast_failure: false },
-    { case_id: fixture.name, run_id: CHILD, workflow, started_at: STARTED_AT, terminal_at: childAttempt.terminal_at, terminal_status: childAttempt.terminal_status, expected_fast_failure: false },
+    { case_id: fixture.name, run_id: ROOT, workflow, started_at: STARTED_AT, terminal_at: rootAttempt.terminal_at, terminal_status: rootAttempt.terminal_status, expected_fast_failure: false, execution_mode: 'real' },
+    { case_id: fixture.name, run_id: CHILD, workflow, started_at: STARTED_AT, terminal_at: childAttempt.terminal_at, terminal_status: childAttempt.terminal_status, expected_fast_failure: false, execution_mode: 'real' },
     // W1.X1-ts slot (101.768s).
-    { case_id: 'wave-peer-1', run_id: 'run-wave-peer-1', workflow, started_at: STARTED_AT, terminal_at: '2026-08-01T12:01:41.768Z', terminal_status: 'completed', expected_fast_failure: false },
+    { case_id: 'wave-peer-1', run_id: 'run-wave-peer-1', workflow, started_at: STARTED_AT, terminal_at: '2026-08-01T12:01:41.768Z', terminal_status: 'completed', expected_fast_failure: false, execution_mode: 'real' },
     // W1.M1-python slot (88.759s), or 25s (< 30000ms) in the fast variant.
-    { case_id: 'wave-peer-2', run_id: 'run-wave-peer-2', workflow, started_at: STARTED_AT, terminal_at: fixture.wave1FloorFast ? '2026-08-01T12:00:25.000Z' : '2026-08-01T12:01:28.759Z', terminal_status: 'completed', expected_fast_failure: false },
+    { case_id: 'wave-peer-2', run_id: 'run-wave-peer-2', workflow, started_at: STARTED_AT, terminal_at: fixture.wave1FloorFast ? '2026-08-01T12:00:25.000Z' : '2026-08-01T12:01:28.759Z', terminal_status: 'completed', expected_fast_failure: false, execution_mode: 'real' },
   ];
   const caseIds = [...new Set(runs.map((run) => run.case_id))];
   const durationFloors = caseIds.map((caseId) => ({

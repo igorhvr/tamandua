@@ -355,7 +355,8 @@ esac
 #      accepted.
 #   2. reset-state (fail closed — a cell that cannot start known-clean
 #      must not run against stale state).
-#   3. write .pi/agent/settings.json + install the scenario workflow.
+#   3. write .pi/agent/settings.json + install the FULL bundled catalog
+#      (T2.2 US-005) + the scenario workflow copy.
 #   4. daemon start.
 DAEMON_TOUCHED=1
 daemon_control stop >/dev/null 2>&1 || true
@@ -374,13 +375,25 @@ WORKFLOW_DIR="$SCRIPTED_STATE_DIR/workflows/$WORKFLOW_ID"
 "$NODE_BIN" "$MATERIALIZER" "$SCENARIO_DIR" "$WORKFLOW_ID" "$BEHAVIORS_FILE" || fail "could not materialize scenario behaviors"
 
 # Source tt-env-scripted.sh only inside each child process.
+# T2.2 US-005: the per-cell install restores the FULL bundled catalog, not
+# just this cell's base workflow. The reset above wipes the contained
+# scripted catalog (var/home-scripted/.tamandua/workflows) along with the DB,
+# so a cell that installs ONLY its base leaves the catalog truncated for the
+# NEXT cell — a controller-launched workflow case (e.g. W4.39-a's
+# bug-fix-merge-worktree) then hits workflow-spec-missing ("No workflow.yml
+# found in .../workflows/<wf>"). The harness contract is reset -> install ->
+# start: run `workflow install --all` with TAMANDUA_WORKFLOWS_SRC pinned to
+# the bundled workflows dir (the same seam tt-controller's
+# runScriptedCatalogInstall uses) so the catalog is complete again; the
+# scenario-specific install-scenario-workflows copy below proceeds as today.
 (
   set -euo pipefail
   source "$ENV_SCRIPT"
-  exec "$TAMANDUA_CLI" workflow install "$WORKFLOW_BASE"
-) >"$INVOCATION_DIR/base-install.log" 2>&1 || {
-  sed 's/^/  /' "$INVOCATION_DIR/base-install.log" >&2
-  fail "could not install base workflow: $WORKFLOW_BASE"
+  export TAMANDUA_WORKFLOWS_SRC="$REPO_ROOT/workflows"
+  exec "$TAMANDUA_CLI" workflow install --all
+) >"$INVOCATION_DIR/catalog-install.log" 2>&1 || {
+  sed 's/^/  /' "$INVOCATION_DIR/catalog-install.log" >&2
+  fail "could not install the full bundled workflow catalog"
 }
 (
   set -euo pipefail

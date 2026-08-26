@@ -44,7 +44,7 @@ test('O1 accepts converged DB/event/workflow evidence and catches every targeted
     const generated = spawnSync(process.execPath, [GENERATOR, workspace], { encoding: 'utf8', shell: false });
     assert.equal(generated.status, 0, generated.stderr);
     const names = fs.readdirSync(workspace).filter((name) => name.startsWith('o1-')).sort();
-    assert.equal(names.length, 27);
+    assert.equal(names.length, 30);
     for (const name of names) {
       const expectation = JSON.parse(fs.readFileSync(path.join(workspace, name, 'expectation.json'), 'utf8'));
       if (expectation.multiCase) continue; // covered by the dedicated multi-case test
@@ -245,6 +245,58 @@ test('O1 clears campaign-8 wave-1 do-now durations at the recalibrated 30s floor
     assert.equal(fastObservation.duration_floor_observations[0].run_count, 4);
     assert.equal(fastObservation.duration_floor_observations[0].fast_run_count, 1);
     assert.equal(fastObservation.duration_floor_observations[0].fast_rate, 0.25);
+  } finally {
+    fs.rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test('T2.2 US-002: O1 excludes scripted and stored-evidence 0-token runs from duration-floor findings', () => {
+  fs.mkdirSync(VAR_ROOT, { recursive: true });
+  const workspace = fs.mkdtempSync(path.join(VAR_ROOT, 'oracle-self-test.'));
+  try {
+    assert.equal(spawnSync(process.execPath, [GENERATOR, workspace], { encoding: 'utf8', shell: false }).status, 0);
+
+    // (a) A mechanically-fast scripted wave (execution_mode='scripted' on
+    // every run, caps.tokens=0) PASSes with zero O1_DURATION_FLOOR_*
+    // findings; the observation row is still written (run_count 0).
+    const scripted = invokeFixture(workspace, 'o1-scripted-fast-wave');
+    assert.equal(scripted.status, 0);
+    assert.equal(scripted.response.result, 'PASS');
+    assert.equal(scripted.response.findings.some((finding) => finding.id.startsWith('O1_DURATION_FLOOR')), false, JSON.stringify(scripted.response.findings));
+    const scriptedObservation = JSON.parse(fs.readFileSync(path.join(workspace, 'o1-scripted-fast-wave', 'evidence', scripted.response.evidence[0].path), 'utf8'));
+    assert.equal(scriptedObservation.duration_floor_observations.length, 1);
+    assert.equal(scriptedObservation.duration_floor_observations[0].run_count, 0);
+    assert.equal(scriptedObservation.duration_floor_observations[0].fast_run_count, 0);
+    assert.equal(scriptedObservation.duration_floor_observations[0].fast_rate, 0);
+
+    // (b) STORED schema-1 shape: wave run rows WITHOUT execution_mode on a
+    // caps.tokens === 0 case PASS via the case-level zero-token fallback.
+    const stored = invokeFixture(workspace, 'o1-stored-scripted-fast-wave');
+    assert.equal(stored.status, 0);
+    assert.equal(stored.response.result, 'PASS');
+    assert.equal(stored.response.findings.some((finding) => finding.id.startsWith('O1_DURATION_FLOOR')), false, JSON.stringify(stored.response.findings));
+    const storedObservation = JSON.parse(fs.readFileSync(path.join(workspace, 'o1-stored-scripted-fast-wave', 'evidence', stored.response.evidence[0].path), 'utf8'));
+    assert.equal(storedObservation.duration_floor_observations.length, 1);
+    assert.equal(storedObservation.duration_floor_observations[0].run_count, 0);
+
+    // (c) A mixed real+scripted family computes fast_rate on the REAL runs
+    // only: 4 real eligible runs (1 fast -> 0.25 > MAX_FAST_RATE, so
+    // O1_DURATION_FLOOR_RATE fires with real-only counts) and 4 fast scripted
+    // peers excluded from both numerator and denominator.
+    const mixed = invokeFixture(workspace, 'o1-mixed-real-scripted-family');
+    assert.equal(mixed.status, 1);
+    assert.equal(mixed.response.result, 'FAIL');
+    const rate = mixed.response.findings.find((finding) => finding.id === 'O1_DURATION_FLOOR_RATE');
+    assert.ok(rate, JSON.stringify(mixed.response.findings));
+    assert.equal(rate.run_count, 4);
+    assert.equal(rate.fast_run_count, 1);
+    assert.equal(rate.fast_rate, 0.25);
+    assert.deepEqual(rate.run_ids, ['run-wave-peer-2']);
+    const mixedObservation = JSON.parse(fs.readFileSync(path.join(workspace, 'o1-mixed-real-scripted-family', 'evidence', mixed.response.evidence[0].path), 'utf8'));
+    assert.equal(mixedObservation.duration_floor_observations.length, 1);
+    assert.equal(mixedObservation.duration_floor_observations[0].run_count, 4);
+    assert.equal(mixedObservation.duration_floor_observations[0].fast_run_count, 1);
+    assert.equal(mixedObservation.duration_floor_observations[0].fast_rate, 0.25);
   } finally {
     fs.rmSync(workspace, { recursive: true, force: true });
   }

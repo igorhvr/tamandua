@@ -152,6 +152,37 @@ test('rejects wrong versions, identity mismatches, malformed context, and missin
   }
 });
 
+test('T2.2 US-001: o1_wave run rows accept optional execution_mode and reject invalid values', () => {
+  const fixture = makeFixture();
+  try {
+    const writeWave = (wave) => {
+      const context = structuredClone(fixture.context);
+      context.o1_wave = wave;
+      fs.chmodSync(fixture.contextPath, 0o600);
+      fs.writeFileSync(fixture.contextPath, `${JSON.stringify(context)}\n`);
+      fs.chmodSync(fixture.contextPath, 0o400);
+    };
+    const runBase = {
+      case_id: 'CASE-1', run_id: fixture.context.run_id, workflow: 'local',
+      started_at: '2026-08-01T12:00:00.000Z', terminal_at: '2026-08-01T12:00:00.000Z',
+      terminal_status: 'completed', expected_fast_failure: false,
+    };
+    // Stored-evidence shape: run rows WITHOUT execution_mode still validate.
+    writeWave({ schema_version: 1, wave: 0, duration_floors: [], runs: [runBase] });
+    assert.equal(loadOracleInvocation({ argv: invocationArgs(fixture.contextPath), env: fixture.env }).oracleId, 'O1');
+    // Rows WITH execution_mode 'real'/'scripted' validate.
+    for (const execution_mode of ['real', 'scripted']) {
+      writeWave({ schema_version: 1, wave: 0, duration_floors: [], runs: [{ ...runBase, execution_mode }] });
+      assert.equal(loadOracleInvocation({ argv: invocationArgs(fixture.contextPath), env: fixture.env }).oracleId, 'O1');
+    }
+    // An invalid execution_mode value fails closed.
+    writeWave({ schema_version: 1, wave: 0, duration_floors: [], runs: [{ ...runBase, execution_mode: 'foo' }] });
+    assert.throws(() => loadOracleInvocation({ argv: invocationArgs(fixture.contextPath), env: fixture.env }), /malformed context/i);
+  } finally {
+    cleanup(fixture.campaignRoot);
+  }
+});
+
 test('rejects context and evidence symlink or path escapes', () => {
   const fixture = makeFixture();
   try {

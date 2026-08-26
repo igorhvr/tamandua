@@ -176,6 +176,21 @@ function median(values) {
   return sorted.length % 2 === 1 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
 }
 
+// T2.2 US-001: per-run execution mode for the o1_wave projection. The case
+// state carries the mode when the campaign was created by a controller that
+// projects it (context.execution_mode when declared, else harness-derived);
+// for STORED schema-1 evidence whose case states predate the field, fall back
+// to the harness projection ('scripted-pi'/'scripted-hermes' -> 'scripted',
+// otherwise 'real') — the same derivation the controller uses.
+function waveRunExecutionMode(caseState) {
+  if (caseState.execution_mode === 'real' || caseState.execution_mode === 'scripted') {
+    return caseState.execution_mode;
+  }
+  return caseState.harness === 'scripted-pi' || caseState.harness === 'scripted-hermes'
+    ? 'scripted'
+    : 'real';
+}
+
 function projectWaveRun(caseState, attempt) {
   return {
     case_id: caseState.id,
@@ -185,6 +200,7 @@ function projectWaveRun(caseState, attempt) {
     terminal_at: attempt.terminal_at ?? null,
     terminal_status: attempt.terminal_status ?? null,
     expected_fast_failure: caseState.expected_fast_failure === true,
+    execution_mode: waveRunExecutionMode(caseState),
   };
 }
 

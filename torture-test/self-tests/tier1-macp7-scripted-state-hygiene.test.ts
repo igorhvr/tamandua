@@ -486,6 +486,16 @@ it("US-006 (c): GREEN — the SAME fixture through the NORMAL harness PASSES; th
   }
   assert.equal(staleRow, undefined, "GREEN arm: the stale row must be absent from the post-reset DB");
 
+  // T2.2 US-005: the per-cell reset -> full-catalog install must leave the
+  // FULL bundled catalog in the scripted home, so a subsequent
+  // controller-launched workflow case (e.g. W4.39-a's
+  // bug-fix-merge-worktree) resolves after this scenario-harness cell.
+  const afterWorkflows = path.join(stateDir, "workflows");
+  for (const wf of ["do-now", "bug-fix-merge-worktree"]) {
+    assert.ok(fs.existsSync(path.join(afterWorkflows, wf, "workflow.yml")),
+      `GREEN arm: the full catalog must remain installed after the cell (missing ${wf}/workflow.yml)`);
+  }
+
   await assertQuietWindow("GREEN arm", before);
 });
 
