@@ -12,7 +12,17 @@
 //   - every RUNAWAY case in the campaign report keeps at least one FAIL
 //     verdict after the replay (so the RUNAWAY kind-finding stays visible;
 //     cases with no replay rows are noted as skipped);
-//   - the tool's --verify-invariants mode exits 1 on any violation.
+//   - the tool's --verify-invariants mode exits 1 on any violation;
+//   - the S26 replay contract (--verify-s26-invariants): only O10
+//     reconciliation-ERROR -> true verdict and O9 replay-row heals may flip;
+//   - the S27 replay contract (--verify-s27-invariants, US-006): the S26
+//     classes plus the S27 class (an O10 stored FAIL -> PASS whose every
+//     stored finding is a calibration class — O10_EVENT_SET_MISMATCH and/or
+//     O10_REROUTE_COUNT — the W4.01 real-cell heal), and on the attempt-2
+//     campaign the exact post-S27 delta shape (21 O10 calibration PASS, the
+//     W4.17-b / W4.18 / W4.dsh-fdmw FAIL survivors with their genuine
+//     findings, W4.29 ERROR unchanged, exactly 2 O9 heals, every other
+//     non-O10 row byte-identical).
 
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
@@ -945,32 +955,16 @@ test('verifyS26Invariants flags an O9 flip carrying an honest non-heal finding',
   assert.match(verification.violations.join('\n'), /outside the O10 reconciliation-ERROR/);
 });
 
-test('verifyS26Invariants accepts the exact attempt-2 replay delta shape (O10 heals + O9 heals only)', () => {
-  // The campaign-20260826T225744158Z-4bf26d7f replay with the US-002/US-003
-  // fixes: 23 O10 reconciliation ERROR -> FAIL flips (true verdicts with the
-  // O10 findings), 2 O9 O9_REPLAY_ROW_MISSING FAIL -> PASS heals, the
-  // W4.29 non-reconciliation O10 ERROR staying ERROR, and every other row
-  // unchanged. The S26 pin must accept exactly this shape.
-  const o10HealCases = [
-    'W4.03-red-adjacent-commit', 'W4.04a-mechanical-override', 'W4.04b-behavioral-bait',
-    'W4.05-slow-suite-contention', 'W4.28-tstx-cross-repo-collision', 'W4.45-branch-delete',
-  ];
-  const rows = [
-    ...o10HealCases.map((caseId) => o10ReconciliationRow({ caseId, after: 'FAIL', findingIds: ['O10_EVENT_SET_MISMATCH'] })),
-    row({ caseId: 'W4.01-missing-evidence-reroute', oracle: 'O9', before: 'FAIL', after: 'PASS', delta: 'flip', beforeFindingIds: ['O9_REPLAY_ROW_MISSING', 'O9_REPLAY_ROW_MISSING'] }),
-    row({ caseId: 'W4.02-fail-missing-refusal', oracle: 'O9', before: 'FAIL', after: 'PASS', delta: 'flip', beforeFindingIds: ['O9_REPLAY_ROW_MISSING'] }),
-    row({
-      caseId: 'W4.29-strict-gate-retry-finalize', oracle: 'O10', before: 'ERROR',
-      beforeFindingIds: ['ORACLE_RUNTIME_ERROR'],
-      beforeFindings: [{ id: 'ORACLE_RUNTIME_ERROR', summary: 'target ref identity changed between snapshots' }],
-      after: 'ERROR', delta: 'same',
-    }),
-    row({ caseId: 'W4.08-control', before: 'PASS', after: 'PASS' }),
-    row({ caseId: 'W4.08-control', oracle: 'O11', before: 'PASS', after: 'PASS' }),
-  ];
-  const verification = replay.verifyS26Invariants({ rows });
-  assert.equal(verification.ok, true, JSON.stringify(verification.violations));
-});
+// NOTE (S27 US-006): the old S26-block test 'verifyS26Invariants accepts the
+// exact attempt-2 replay delta shape' pinned the PRE-S27 attempt-2 delta
+// (23x O10 reconciliation ERROR -> FAIL with O10_EVENT_SET_MISMATCH findings).
+// Post-recalibration that shape is stale: the attempt-2 O10 reconciliation
+// ERRORs now replay to their true verdicts (21 O10 PASS incl. the W4.01
+// stored-FAIL heal, 3 FAIL survivors with genuine findings) and W4.01's O10
+// stored FAIL -> PASS is the NEW S27 class that the S26 pin (by design) does
+// not admit. The exact attempt-2 delta shape is now pinned by the S27 pin —
+// see 'verifyS27Invariants accepts the exact post-S27 attempt-2 delta shape'
+// in the S27 block below.
 
 test('verifyS26Invariants rejects the attempt-2 shape when an honest row flips too', () => {
   // Same shape plus one honest O3z flip: the delta is no longer "O10 heals +
@@ -1197,6 +1191,373 @@ test('--verify-s26-invariants exits 1 on an O10 non-reconciliation ERROR flip (v
     const payload = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
     assert.equal(payload.s26.ok, false);
     assert.equal(payload.s26.violations.length, 1);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ── S27 US-004/US-006: audit replay set (post-recalibration attempt-2 delta) ─
+//
+// The post-S27 replay of campaign-20260826T225744158Z-4bf26d7f
+// (attempt-2 evidence) with the US-001/US-002 recalibrated O10:
+//   - 21 O10 PASS (the calibration-artifact class): W4.01's stored FAIL heals
+//     (its only stored O10 findings were O10_EVENT_SET_MISMATCH +
+//     O10_REROUTE_COUNT — both calibration classes) plus 20 stored
+//     reconciliation-ERRORs replaying PASS;
+//   - 3 O10 FAIL survivors with genuine non-calibration findings:
+//     W4.17-b (6 findings), W4.18 (the merge-gate seal EVENT_SET — the run
+//     landed WITHOUT the required missing-evidence concession annotation),
+//     W4.dsh-fdmw (9 findings);
+//   - W4.29 stays O10 ERROR (non-reconciliation target-ref-identity class,
+//     per the S26 pin);
+//   - non-O10 flips are EXACTLY the 2 S26 O9 replay-row heals (W4.01, W4.02);
+//     every other non-O10 row is byte-identical (same before/after verdict AND
+//     identical finding ids).
+//
+// US-004 pinned this shape over replay rows with the local
+// `verifyS27AuditShape` classification; US-006 moved the pin into the tool
+// as `verifyS27Invariants` (the --verify-s27-invariants mode), extending it
+// with the S26 red-arm carry-over (every stored O10 reconciliation ERROR must
+// heal) and the S27 flip-scope class checks. The exact-shape pins follow the
+// E3.B pinApplies semantics: strict when no campaign universe is given (unit
+// pins) or when the campaign IS the attempt-2 campaign; per documented case
+// otherwise (noted as skipped). The tests below exercise the tool's pin via
+// `replay.verifyS27Invariants`; the documented case lists live in the tool
+// (`replay.S27_O10_PASS_CASES` / `replay.S27_O10_FAIL_EXPECTATIONS`).
+
+const S27_W4_29_CASE = replay.S27_W4_29_CASE ?? 'W4.29-strict-gate-retry-finalize';
+
+function s27PassRow(caseId) {
+  return row({
+    caseId, oracle: 'O10', before: caseId === 'W4.01-missing-evidence-reroute' ? 'FAIL' : 'ERROR',
+    after: 'PASS', delta: 'flip',
+    beforeFindingIds: caseId === 'W4.01-missing-evidence-reroute'
+      ? ['O10_EVENT_SET_MISMATCH', 'O10_REROUTE_COUNT'] : ['ORACLE_RUNTIME_ERROR'],
+    findingIds: [],
+  });
+}
+
+test('verifyS27Invariants accepts the exact post-S27 attempt-2 delta shape', () => {
+  // The green arm of the S27 pin (supersedes the old S26-block exact-shape
+  // test, which pinned the pre-S27 23x ERROR->FAIL-with-EVENT_SET delta):
+  // the post-S27 attempt-2 delta — 21 O10 calibration PASS (W4.01 stored-FAIL
+  // heal + 20 reconciliation-ERROR heals), the 3 genuine FAIL survivors with
+  // their documented findings, W4.29 ERROR unchanged, the 2 S26 O9 heals, and
+  // byte-identical non-O10 rows — must be accepted outright. No campaign
+  // universe is given, so the exact-shape pins are strict.
+  const verification = replay.verifyS27Invariants({
+    rows: [
+      // 21 calibration O10 PASS (W4.01 heal + 20 reconciliation-ERROR heals).
+      ...replay.S27_O10_PASS_CASES.map(s27PassRow),
+      // 3 genuine O10 FAIL survivors with their documented findings.
+      row({ caseId: 'W4.17-b-red-baseline-refuse', oracle: 'O10', before: 'ERROR', after: 'FAIL', delta: 'flip', beforeFindingIds: ['ORACLE_RUNTIME_ERROR'], findingIds: replay.S27_O10_FAIL_EXPECTATIONS['W4.17-b-red-baseline-refuse'] }),
+      row({ caseId: 'W4.18-flaky-alternator', oracle: 'O10', before: 'ERROR', after: 'FAIL', delta: 'flip', beforeFindingIds: ['ORACLE_RUNTIME_ERROR'], findingIds: replay.S27_O10_FAIL_EXPECTATIONS['W4.18-flaky-alternator'] }),
+      row({ caseId: 'W4.dsh-fdmw', oracle: 'O10', before: 'ERROR', after: 'FAIL', delta: 'flip', beforeFindingIds: ['ORACLE_RUNTIME_ERROR'], findingIds: replay.S27_O10_FAIL_EXPECTATIONS['W4.dsh-fdmw'] }),
+      // W4.29 stays ERROR (target-ref identity, non-reconciliation class —
+      // its stored summary distinguishes it from the reconciliation ERRORs).
+      row({ caseId: S27_W4_29_CASE, oracle: 'O10', before: 'ERROR', after: 'ERROR', delta: 'same', beforeFindingIds: ['ORACLE_RUNTIME_ERROR'], beforeFindings: [{ id: 'ORACLE_RUNTIME_ERROR', summary: 'target ref identity changed between snapshots' }], findingIds: ['ORACLE_RUNTIME_ERROR'] }),
+      // The 2 S26 O9 replay-row heals.
+      row({ caseId: 'W4.01-missing-evidence-reroute', oracle: 'O9', before: 'FAIL', after: 'PASS', delta: 'flip', beforeFindingIds: ['O9_REPLAY_ROW_MISSING', 'O9_REPLAY_ROW_MISSING'], findingIds: [] }),
+      row({ caseId: 'W4.02-fail-missing-refusal', oracle: 'O9', before: 'FAIL', after: 'PASS', delta: 'flip', beforeFindingIds: ['O9_REPLAY_ROW_MISSING'], findingIds: [] }),
+      // Representative byte-identical non-O10 rows.
+      row({ caseId: 'W4.08-control', before: 'PASS', after: 'PASS' }),
+      row({ caseId: 'W4.17-b-red-baseline-refuse', oracle: 'O9', before: 'FAIL', after: 'FAIL', beforeFindingIds: ['O9_MONOTONICITY_VIOLATION'], findingIds: ['O9_MONOTONICITY_VIOLATION'] }),
+      row({ caseId: 'W4.08-control', oracle: 'O11', before: 'PASS', after: 'PASS' }),
+    ],
+  });
+  assert.equal(verification.ok, true, JSON.stringify(verification.violations));
+  for (const check of verification.checks) assert.equal(check.ok, true, JSON.stringify(check.violations));
+});
+
+test('verifyS27Invariants flags an O10 survivor losing a genuine finding (silent absorption)', () => {
+  // Red arm: W4.17-b replays FAIL but WITHOUT O10_REFUSAL_DIAGNOSIS — the
+  // genuine finding is absorbed; the pin must fail loudly.
+  const verification = replay.verifyS27Invariants({
+    rows: [
+      row({ caseId: 'W4.01-missing-evidence-reroute', oracle: 'O10', before: 'FAIL', after: 'PASS', delta: 'flip', beforeFindingIds: ['O10_EVENT_SET_MISMATCH', 'O10_REROUTE_COUNT'], findingIds: [] }),
+      row({ caseId: 'W4.17-b-red-baseline-refuse', oracle: 'O10', before: 'ERROR', after: 'FAIL', delta: 'flip', beforeFindingIds: ['ORACLE_RUNTIME_ERROR'], findingIds: ['O10_EVENT_SET_MISMATCH', 'O10_MERGER_INVOCATION_COUNT', 'O10_REF_MOVEMENT', 'O10_REROUTE_COUNT', 'O10_TERMINAL_DISPOSITION'] }),
+    ],
+  });
+  assert.equal(verification.ok, false);
+  assert.match(verification.violations.join('\n'), /W4\.17-b-red-baseline-refuse: O10 survivor must replay FAIL with exactly/);
+  const survivor = verification.checks.find((check) => check.label === 's27-genuine-fail-survivors');
+  assert.equal(survivor.ok, false);
+});
+
+test('verifyS27Invariants flags an honest non-O10 flip', () => {
+  const verification = replay.verifyS27Invariants({
+    rows: [
+      row({ caseId: 'W4.01-missing-evidence-reroute', oracle: 'O10', before: 'FAIL', after: 'PASS', delta: 'flip', beforeFindingIds: ['O10_EVENT_SET_MISMATCH', 'O10_REROUTE_COUNT'], findingIds: [] }),
+      row({ caseId: 'W4.23-daemon-cross-runtime-restart', oracle: 'O3z', before: 'FAIL', after: 'PASS', delta: 'flip', beforeFindingIds: ['LOCAL_SCENARIO_EVIDENCE_FAILED'] }),
+    ],
+  });
+  assert.equal(verification.ok, false);
+  assert.match(verification.violations.join('\n'), /expected exactly 2 non-O10 flips/);
+  const identity = verification.checks.find((check) => check.label === 's27-non-o10-byte-identical');
+  assert.equal(identity.ok, false);
+});
+
+test('verifyS27Invariants flags a W4.01-class stored FAIL that does not heal', () => {
+  // Red arm: W4.01's stored O10 FAIL (calibration classes only) must heal to
+  // PASS; a replay that keeps it FAIL violates the calibration PASS set.
+  const verification = replay.verifyS27Invariants({
+    rows: [
+      row({ caseId: 'W4.01-missing-evidence-reroute', oracle: 'O10', before: 'FAIL', after: 'FAIL', beforeFindingIds: ['O10_EVENT_SET_MISMATCH', 'O10_REROUTE_COUNT'], findingIds: ['O10_EVENT_SET_MISMATCH', 'O10_REROUTE_COUNT'] }),
+      row({ caseId: 'W4.02-fail-missing-refusal', oracle: 'O10', before: 'ERROR', after: 'PASS', delta: 'flip', beforeFindingIds: ['ORACLE_RUNTIME_ERROR'], findingIds: [] }),
+    ],
+  });
+  assert.equal(verification.ok, false);
+  assert.match(verification.violations.join('\n'), /W4\.01-missing-evidence-reroute: documented calibration PASS case replays FAIL/);
+});
+
+test('verifyS27Invariants flags a stored reconciliation ERROR that does not heal', () => {
+  // Red arm: a stored O10 reconciliation ERROR that still replays ERROR (the
+  // pre-US-002 shape) violates the S26 red-arm carry-over AND the 21-case
+  // PASS set.
+  const verification = replay.verifyS27Invariants({
+    rows: [
+      row({ caseId: 'W4.03-red-adjacent-commit', oracle: 'O10', before: 'ERROR', after: 'ERROR', delta: 'same', beforeFindingIds: ['ORACLE_RUNTIME_ERROR'], findingIds: ['ORACLE_RUNTIME_ERROR'] }),
+    ],
+  });
+  assert.equal(verification.ok, false);
+  const joined = verification.violations.join('\n');
+  assert.match(joined, /W4\.03-red-adjacent-commit: documented calibration PASS case replays ERROR/);
+  assert.match(joined, /stored O10 suite-ledger reconciliation ERROR must replay to its true verdict/);
+});
+
+test('verifyS27Invariants flags a non-O10 row whose finding ids changed', () => {
+  const verification = replay.verifyS27Invariants({
+    rows: [
+      row({ caseId: 'W4.01-missing-evidence-reroute', oracle: 'O10', before: 'FAIL', after: 'PASS', delta: 'flip', beforeFindingIds: ['O10_EVENT_SET_MISMATCH', 'O10_REROUTE_COUNT'], findingIds: [] }),
+      row({ caseId: 'W4.08-control', before: 'FAIL', after: 'FAIL', beforeFindingIds: ['O1_TERMINAL_EVENT_MISSING'], findingIds: [] }),
+    ],
+  });
+  assert.equal(verification.ok, false);
+  assert.match(verification.violations.join('\n'), /W4\.08-control\/O1: non-O10 row changed finding ids/);
+});
+
+// ── S27 US-006: the S27 class + generic class checks ─────────────────────────
+//
+// The S27 pin's universal contract (independent of the attempt-2 exact
+// shape): the S26 classes plus the new S27 class — an O10 stored FAIL -> PASS
+// whose every stored finding is a calibration class (O10_EVENT_SET_MISMATCH
+// and/or O10_REROUTE_COUNT). These unit pins pass an explicit non-attempt-2
+// campaign universe so the exact-shape pins are skipped and only the class
+// checks run.
+
+test('verifyS27Invariants accepts the S27 W4.01-class stored FAIL -> PASS heal (calibration findings only)', () => {
+  const verification = replay.verifyS27Invariants({
+    campaignCaseIds: ['S27C1'],
+    rows: [
+      row({ caseId: 'S27C1', oracle: 'O10', before: 'FAIL', after: 'PASS', delta: 'flip', beforeFindingIds: ['O10_EVENT_SET_MISMATCH', 'O10_REROUTE_COUNT'], findingIds: [] }),
+    ],
+  });
+  assert.equal(verification.ok, true, JSON.stringify(verification.violations));
+  const scope = verification.checks.find((check) => check.label === 's27-flip-scope');
+  assert.equal(scope.ok, true);
+});
+
+test('verifyS27Invariants flags an O10 stored FAIL -> PASS carrying a non-calibration finding', () => {
+  // Red arm: an O10 stored FAIL whose findings include a genuine class
+  // (O10_TERMINAL_DISPOSITION) may never heal to PASS — silent absorption.
+  const verification = replay.verifyS27Invariants({
+    campaignCaseIds: ['S27C1'],
+    rows: [
+      row({ caseId: 'S27C1', oracle: 'O10', before: 'FAIL', after: 'PASS', delta: 'flip', beforeFindingIds: ['O10_EVENT_SET_MISMATCH', 'O10_TERMINAL_DISPOSITION'], findingIds: [] }),
+    ],
+  });
+  assert.equal(verification.ok, false);
+  assert.match(verification.violations.join('\n'), /carries non-calibration stored finding/);
+});
+
+test('verifyS27Invariants flags a stored O10 reconciliation ERROR that did not heal (S26 red arm, non-strict campaign)', () => {
+  const verification = replay.verifyS27Invariants({
+    campaignCaseIds: ['S27C1'],
+    rows: [o10ReconciliationRow({ caseId: 'S27C1', after: 'ERROR', delta: 'same' })],
+  });
+  assert.equal(verification.ok, false);
+  assert.match(verification.violations.join('\n'), /stored O10 suite-ledger reconciliation ERROR must replay to its true verdict/);
+  const heal = verification.checks.find((check) => check.label === 's27-o10-reconciliation-heal');
+  assert.equal(heal.ok, false);
+});
+
+test('verifyS27Invariants flags a non-O10 flip on a non-strict campaign', () => {
+  const verification = replay.verifyS27Invariants({
+    campaignCaseIds: ['S27C1'],
+    rows: [
+      row({ caseId: 'S27C1', oracle: 'O3z', before: 'FAIL', after: 'PASS', delta: 'flip', beforeFindingIds: ['O3Z_SYSTEM_TOKENS_NONZERO'] }),
+    ],
+  });
+  assert.equal(verification.ok, false);
+  assert.match(verification.violations.join('\n'), /S27C1\/attempt-1\/O3z: S27 invariant violated/);
+  const scope = verification.checks.find((check) => check.label === 's27-flip-scope');
+  assert.equal(scope.ok, false);
+});
+
+test('verifyS27Invariants accepts the S26 reconciliation heal on a non-strict campaign (exact pins skipped)', () => {
+  const verification = replay.verifyS27Invariants({
+    campaignCaseIds: ['S27C1'],
+    rows: [o10ReconciliationRow({ caseId: 'S27C1', after: 'NOT_EVALUABLE' })],
+  });
+  assert.equal(verification.ok, true, JSON.stringify(verification.violations));
+  const calibration = verification.checks.find((check) => check.label === 's27-calibration-pass-set');
+  assert.equal(calibration.ok, true);
+  assert.ok(calibration.skipped.length > 0, 'exact-shape pins must be noted as skipped on a non-attempt-2 campaign');
+});
+
+test('renderS27Report renders the S27 check statuses', () => {
+  const verification = replay.verifyS27Invariants({
+    campaignCaseIds: [],
+    rows: [o10ReconciliationRow()],
+  });
+  const report = replay.renderS27Report(verification);
+  assert.match(report, /S27 invariant report/);
+  assert.match(report, /\[OK\] s27-o10-reconciliation-heal/);
+  assert.match(report, /\[OK\] s27-flip-scope/);
+  assert.match(report, /s27: OK/);
+});
+
+test('parseArgs recognizes --verify-s27-invariants', () => {
+  assert.equal(replay.parseArgs(['--verify-s27-invariants']).verifyS27Invariants, true);
+  assert.equal(replay.parseArgs([]).verifyS27Invariants, false);
+  assert.equal(replay.parseArgs(['--verify-s26-invariants']).verifyS26Invariants, true);
+  assert.equal(replay.parseArgs(['--verify-s27-invariants', '--verify-s26-invariants']).verifyS27Invariants, true);
+});
+
+// ── S27 US-004/US-006 e2e: the audit replay over the attempt-2 campaign ──────
+//
+// Runs tt-oracle-replay with --verify-s27-invariants (US-006: the tool's S27
+// replay-contract pin) against the read-only attempt-2 campaign evidence
+// (campaign-20260826T225744158Z-4bf26d7f-e648-42f1-8274-0011926de7dd) and
+// asserts the JSON rows match the documented audit assertions. Skips when the
+// campaign evidence is not present (evidence is never committed to the repo);
+// set TT_S27_CAMPAIGN_DIR to point at a copy.
+
+function resolveS27Campaign() {
+  if (process.env.TT_S27_CAMPAIGN_DIR !== undefined && process.env.TT_S27_CAMPAIGN_DIR.length > 0) {
+    return path.resolve(process.env.TT_S27_CAMPAIGN_DIR);
+  }
+  return path.join(VAR_ROOT, 'results', 'campaign-20260826T225744158Z-4bf26d7f-e648-42f1-8274-0011926de7dd');
+}
+
+const S27_CAMPAIGN = resolveS27Campaign();
+const S27_CAMPAIGN_PRESENT = fs.existsSync(path.join(S27_CAMPAIGN, 'state.json'));
+
+test('S27 audit replay: attempt-2 campaign replays the documented 21-PASS / 3-FAIL / 1-ERROR delta under --verify-s27-invariants, exit 0', {
+  skip: S27_CAMPAIGN_PRESENT ? false : `attempt-2 campaign evidence not present (${S27_CAMPAIGN}) — S27 audit replay not applicable; copy it into torture-test/var/results/ or set TT_S27_CAMPAIGN_DIR`,
+}, () => {
+  const campaign = S27_CAMPAIGN;
+  const root = testRoot();
+  try {
+    const digestBefore = replay.computeCampaignDigest(campaign);
+    const jsonPath = path.join(root, 's27-audit-replay.json');
+    const result = spawnSync(process.execPath, [REPLAY_TOOL, '--campaign', campaign, '--workspace-root', path.join(root, 'ws'), '--verify-s27-invariants', '--json', jsonPath], {
+      encoding: 'utf8',
+      shell: false,
+      timeout: 600_000,
+      maxBuffer: 32 * 1024 * 1024,
+    });
+    assert.equal(result.status, 0, `stdout: ${result.stdout}\nstderr: ${result.stderr}`);
+    assert.match(result.stdout, /S27 invariant report/);
+    assert.match(result.stdout, /\[OK\] s27-o10-reconciliation-heal/);
+    assert.match(result.stdout, /\[OK\] s27-calibration-pass-set/);
+    assert.match(result.stdout, /s27: OK/);
+
+    const payload = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
+    assert.equal(payload.summary.source_campaign_unchanged, true, JSON.stringify(payload.summary));
+    assert.equal(payload.summary.invoke_failures, 0, JSON.stringify(payload.summary));
+
+    // The tool's own S27 pin ran green against the real attempt-2 rows.
+    assert.equal(payload.s27.ok, true, JSON.stringify(payload.s27.violations));
+    assert.equal(payload.s27.violations.length, 0, JSON.stringify(payload.s27.violations));
+
+    // Cross-check the pin directly over the replay rows (strict exact-shape).
+    const verification = replay.verifyS27Invariants({ rows: payload.rows });
+    assert.equal(verification.ok, true, JSON.stringify(verification.violations));
+
+    // Cross-check the mechanical counts from the audit doc.
+    const o10 = payload.rows.filter((entry) => entry.oracle === 'O10');
+    assert.equal(o10.length, 25, JSON.stringify(o10.map((entry) => entry.caseId)));
+    assert.equal(o10.filter((entry) => entry.after === 'PASS').length, 21);
+    assert.equal(o10.filter((entry) => entry.after === 'FAIL').length, 3);
+    assert.equal(o10.filter((entry) => entry.after === 'ERROR').length, 1);
+    assert.equal(payload.summary.pairs, 292, JSON.stringify(payload.summary));
+    assert.equal(payload.summary.flips, 26, JSON.stringify(payload.summary));
+    assert.equal(payload.summary.unchanged, 266, JSON.stringify(payload.summary));
+
+    // Source campaign byte-identical before/after the replay.
+    assert.deepEqual(replay.computeCampaignDigest(campaign), digestBefore);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ── S27 US-006 e2e: --verify-s27-invariants over a synthetic campaign ────────
+//
+// Mirrors the S26 e2e block: the S27 pin is exercised through the tool's CLI
+// wiring over a synthetic single-pair O10 campaign (the S26 fixture builder —
+// a null gate_key answers NOT_EVALUABLE, so the stored ERROR replays a true
+// verdict). The campaign case id (S26C1) is not part of the attempt-2
+// universe, so the exact-shape pins are skipped and only the class checks
+// run:
+//   - reconciliation summary  -> the heal is allowed (exit 0);
+//   - any other ERROR summary -> an O10 non-reconciliation ERROR flip, which
+//                                violates the S27 flip scope (exit 1).
+
+test('--verify-s27-invariants exits 0 on an allowed O10 reconciliation-ERROR heal (exact pins skipped)', () => {
+  const root = testRoot();
+  try {
+    const campaign = buildS26ReplayCampaign(root, `${O10_RECONCILIATION_SUMMARY} with the read-only database snapshot`);
+    const digestBefore = replay.computeCampaignDigest(campaign);
+    const jsonPath = path.join(root, 's27.json');
+    const result = spawnSync(process.execPath, [REPLAY_TOOL, '--campaign', campaign, '--workspace-root', path.join(root, 'ws'), '--verify-s27-invariants', '--json', jsonPath], {
+      encoding: 'utf8',
+      shell: false,
+      timeout: 120_000,
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    assert.equal(result.status, 0, `stdout: ${result.stdout}\nstderr: ${result.stderr}`);
+    assert.match(result.stdout, /S27 invariant report/);
+    assert.match(result.stdout, /\[OK\] s27-o10-reconciliation-heal/);
+    assert.match(result.stdout, /\[OK\] s27-flip-scope/);
+    assert.match(result.stdout, /s27: OK/);
+
+    const payload = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
+    assert.deepEqual(payload.rows.map((entry) => [entry.caseId, entry.oracle, entry.before, entry.after, entry.delta]), [
+      ['S26C1', 'O10', 'ERROR', 'NOT_EVALUABLE', 'flip'],
+    ]);
+    assert.equal(payload.s27.ok, true, JSON.stringify(payload.s27.violations));
+    // The exact-shape pins were skipped for this non-attempt-2 campaign.
+    const calibration = payload.s27.checks.find((check) => check.label === 's27-calibration-pass-set');
+    assert.equal(calibration.ok, true);
+    assert.ok(calibration.skipped.length > 0);
+
+    // Source campaign byte-identical before/after the replay.
+    assert.deepEqual(replay.computeCampaignDigest(campaign), digestBefore);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('--verify-s27-invariants exits 1 on an O10 non-reconciliation ERROR flip (violating)', () => {
+  const root = testRoot();
+  try {
+    const campaign = buildS26ReplayCampaign(root, 'target ref identity changed between snapshots');
+    const jsonPath = path.join(root, 's27-violation.json');
+    const result = spawnSync(process.execPath, [REPLAY_TOOL, '--campaign', campaign, '--workspace-root', path.join(root, 'ws'), '--verify-s27-invariants', '--json', jsonPath], {
+      encoding: 'utf8',
+      shell: false,
+      timeout: 120_000,
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    assert.equal(result.status, 1, `stdout: ${result.stdout}\nstderr: ${result.stderr}`);
+    assert.match(result.stdout, /\[VIOLATION\] s27-flip-scope/);
+    assert.match(result.stderr, /S27 invariant violation: S26C1\/attempt-1\/O10: S27 invariant violated \(flip ERROR -> NOT_EVALUABLE outside the O10 reconciliation-ERROR -> true-verdict \/ O10 calibration-FAIL -> PASS \/ O9 replay-row-heal classes\)/);
+    assert.match(result.stderr, /S27 invariant verification FAILED/);
+
+    const payload = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
+    assert.equal(payload.s27.ok, false);
+    assert.equal(payload.s27.violations.length, 1);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

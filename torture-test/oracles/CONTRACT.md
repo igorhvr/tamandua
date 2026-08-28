@@ -789,16 +789,115 @@ byte-for-field with the read-only `suite_results` table. O10 derives merger invo
 count from `step.running` events for `finalize_merge`, reroute count from both the
 terminal step counter and `step.rerouted` events, ref movement from `refs_before` and
 `refs_after`, and terminal disposition from the database, controller projection, and
-terminal run event.
+terminal run event. The reroute-count derivation is regime-aware (S27): scripted FMIS
+probe cells compare both the terminal step counter and the `finalize_merge`
+`step.rerouted` events exactly against the decision table, while real cells reconcile
+per step against each step's DB `terminal_reroute_count` under the shared corridor
+discipline (see the two-regime model below).
 
-For each FMIS cell, the exact corridor event multiset consists only of the applicable
+For each FMIS cell, O10 validates the captured event stream under one of two regimes
+keyed on the projected run's `execution_mode` (`'real'` or `'scripted'`; a run seen
+from multiple projections is real if any says real, and a missing/unknown mode
+defaults to the scripted exact regime so legacy contexts and existing fixtures are
+unaffected). SCRIPTED FMIS probe cells keep the exact single-step corridor multiset
+comparison unchanged (the seal): the multiset consists only of the applicable
 `step.rerouted`, `step.running`, `merge.gate_overridden`,
 `merge.landed_without_suite_evidence`, `merge.landed_over_red_suite`, `merge.landed`,
-and terminal `run.*` events. Every obstructing path reroutes exactly once. A default
+and terminal `run.*` events, and the observed multiset must equal the
+decision-table expected multiset exactly (one `step.rerouted` when the table
+reroutes, one `finalize_merge` `step.running` when the merger is invoked, the
+decision-table annotations, `merge.landed` when the cell lands, and the terminal
+`run.completed`/`run.failed`). Every obstructing path reroutes exactly once. A default
 missing row then concedes and lands; strict missing and green red refuse permanently;
 default red remains advisory and lands; green evidence lands; off always lands with an
 override event. Landing cells move the target and invoke the merger once. Refusal cells
 do neither and end failed.
+
+**Two-regime event-set model (S27 US-001/US-002, audited in US-004).** Real
+multi-step workflows emit one `step.running` per step execution and may carry legal
+`on_fail.retry_step` reroute corridors, so the full-multiset comparison above would be
+a calibration artifact there (the S26-unmasked defect). On REAL cells O10 splits the
+event stream into a merge-gate seal, a lifecycle stream, and a per-step reroute
+reconciliation, and records each run's `regime`, subset (real cells: `merge_gate_subset`;
+scripted cells: `event_set`), `lifecycle` derivation, and `reroute_reconciliation`
+(real cells, with `corridor_evidence` `corroborated` or `fallback`) in the
+`o10-fmis-decision-table.json` observation:
+
+- **Merge-gate seal (exact — never weakened).** The observed merge-gate subset
+  (the decision-table annotations `merge.gate_overridden`,
+  `merge.landed_without_suite_evidence`, `merge.landed_over_red_suite`,
+  `merge.accepted_already_landed`, `merge.landed`, and the terminal
+  `run.completed`/`run.failed`) must equal the decision-table expected subset
+  exactly: the annotations, plus `merge.landed` when the cell lands and is not an
+  accepted already-landed completion, plus the terminal event. `run.canceled` is
+  deliberately on the OBSERVED side, so a canceled terminal where the table says
+  completed/failed is an anomaly. Any difference — a double `merge.landed`, a
+  missing `run.completed`/`run.failed`, a missing or extra annotation, or a canceled
+  terminal — is `O10_EVENT_SET_MISMATCH`. This subset is the FMIS merge-gate seal
+  and is never relaxed for real cells.
+- **Lifecycle `step.running` stream (mechanical derivation).** Every non-finalize
+  `step.running` must name a `steps` row of the run (both `stepId` and `agentId`),
+  and each step's observed `step.running` count must equal its mechanically derived
+  execution count: 1 per step row, plus (story-iteration count − 1) for steps
+  iterated over the run's stories — iterations derived from the captured
+  `story.started`/`story.done`/`story.verified` events naming the step (covers
+  `type='loop'` steps and their `verify_each` decision steps) — plus accepted
+  `step.retry` re-dispatches (the DB `steps.retry_count` is a dispatch counter, NOT
+  an execution counter, and is not used), plus reroute-target re-executions (the
+  step whose `step.running` follows a `step.rerouted` event chronologically
+  re-executes once per reroute). `steps.type`/`steps.loop_config` are read
+  PRAGMA-optionally (absent on the minimal scripted fixture schema → treated as
+  non-loop). A `step.running` naming an unknown step or a count inconsistent with
+  the derivation is `O10_EVENT_SET_MISMATCH`. `finalize_merge` `step.running`
+  multiplicity is NOT part of this stream: it stays the exact 0/1
+  merger-invocation bound (`O10_MERGER_INVOCATION_COUNT`).
+- **Reroute reconciliation (shared O11 corridor discipline).** For EVERY step
+  (finalize_merge included) the step's `step.rerouted` event count must equal that
+  step's DB `terminal_reroute_count` — the product only increments that counter
+  through its legal reroute machinery — and each reroute must lie on a legal
+  corridor. Corridor legality is the shape O11 already recognizes on
+  `dispatch_renderings` rows (shared module `lib/reroute-discipline.mjs`): a
+  `dispatched=false` row whose `transition.action` is `'reroute'` and whose
+  `transition.target_step_row_id` equals the row's `producer_step_row_id` (a
+  distinct same-run upstream producer). `dispatch_renderings` is an OPTIONAL
+  corroboration leg for O10 — the version-1 evidence-key table marks it `—` for
+  O10 — so a null reference never blocks O10; when the artifact carries legal
+  corridor rows for the run they must cover the step's `step.rerouted` events, and
+  when it is absent or carries none O10 falls back to the DB-counter
+  reconciliation (the universal real-campaign shape: the product's
+  `step.rerouted` events come from step-failure `on_fail.retry_step` reroutes,
+  which never produce `dispatch.keys.rejected` rows, so real dispatch-renderings
+  artifacts carry zero reroute rows). A per-step count mismatch, a `step.rerouted`
+  naming a step absent from the run's step evidence, or a reroute not corroborated
+  by a legal corridor row is `O10_REROUTE_COUNT`. The strict refusal doctrine is
+  preserved: on refusal cells (lands=false — strict missing/green refusal) the
+  decision table GENUINELY bounds reroutes to exactly one obstructing reroute
+  before refusing, so `finalize_merge`'s counter AND event count must both equal
+  that bound (never reconciled away).
+
+**Canceled-run doctrine (audit US-004).** A `run.canceled` terminal is a real
+observed-side event. A real cell whose decision table says completed/failed is
+judged by the exact-set seal: the canceled terminal is an anomaly
+(`O10_EVENT_SET_MISMATCH` on the seal), the lifecycle stream reports
+running-count-mismatch for every step that never ran, and disposition, ref
+movement, and merger-invocation checks fail as the table dictates. A
+controller-canceled run is a GENUINE disposition anomaly and is never silently
+absorbed; only the calibration-class reroute reconciliation heals (a canceled run
+has no reroute activity, so 0 `step.rerouted` events == 0 `terminal_reroute_count`
+per step). The audit doc (`impl-tasks/S27-o10-audit-and-replay-set.md`) records
+the per-case, per-finding judgment of the attempt-2 survivors: W4.17-b-red-baseline-
+refuse replays O10 FAIL with six genuine findings (terminal disposition, ref
+movement, merger invocation, refusal diagnosis, refusal-doctrine reroute count,
+merge-gate seal event set); W4.dsh-fdmw replays O10 FAIL with nine genuine findings
+(seal, five lifecycle running-count mismatches, invocation, movement, disposition);
+W4.29-strict-gate-retry-finalize replays O10 ERROR unchanged
+(non-reconciliation target-ref-identity class — the ref identity changed between
+snapshots, so O10 throws at the ref-identity gate before any decision-table check
+and the author-listed findings never fire). The exact post-S27 attempt-2 replay
+delta — 21 calibration-artifact cases O10 PASS (20 reconciliation-ERROR heals +
+W4.01's stored-FAIL heal), 3 O10 FAIL survivors, W4.29 ERROR, every non-O10 row
+byte-identical — is pinned by `bin/tt-oracle-replay-invariants.test.mjs` and
+tabulated in the audit doc.
 
 `merge.accepted_already_landed` is the sole no-ref-movement completion exception. It
 requires exactly one such event, no `merge.landed` event, a non-off launch mode, no
