@@ -813,3 +813,391 @@ test('preval campaign replay pin: exactly six S5 O1 floor flips, zero other delt
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+// ── S26 US-005: O10 reconciliation replay-contract pin ──────────────────────
+//
+// The S26 replay contract: the ONLY allowed verdict flips are
+//   A  O10 reconciliation heal — a stored O10 ERROR carrying
+//      ORACLE_RUNTIME_ERROR with the 'suite_ledger does not reconcile
+//      byte-for-field' summary replays to its TRUE verdict
+//      (PASS/FAIL/NOT_EVALUABLE; US-002 scoped-reconciliation fix). EVERY
+//      stored reconciliation ERROR must heal — one that still replays ERROR
+//      is the red arm (pre-US-002 shape) and fails the pin.
+//   B  O9 replay-row heal — an O9 FAIL -> PASS where every stored finding is
+//      an O9_REPLAY_ROW_MISSING / O9_SINGLEFLIGHT_* false positive healed by
+//      the US-003 row-resolution alignment.
+// Any OTHER flip — including any O10 non-reconciliation ERROR flip or any
+// non-O10 change — violates the pin and exits 1.
+
+const O10_RECONCILIATION_SUMMARY = 'suite_ledger does not reconcile byte-for-field';
+
+function o10ReconciliationRow(overrides = {}) {
+  return row({
+    oracle: 'O10',
+    before: 'ERROR',
+    beforeFindingIds: ['ORACLE_RUNTIME_ERROR'],
+    beforeFindings: [{ id: 'ORACLE_RUNTIME_ERROR', summary: `${O10_RECONCILIATION_SUMMARY} with the read-only database snapshot` }],
+    after: 'FAIL',
+    delta: 'flip',
+    ...overrides,
+  });
+}
+
+test('isO10ReconciliationErrorRow recognizes only the O10 reconciliation ERROR shape', () => {
+  assert.equal(replay.isO10ReconciliationErrorRow(o10ReconciliationRow()), true);
+  // A different O10 ORACLE_RUNTIME_ERROR summary (e.g. 'target ref identity
+  // changed between snapshots') is NOT the reconciliation class.
+  assert.equal(replay.isO10ReconciliationErrorRow(o10ReconciliationRow({
+    beforeFindings: [{ id: 'ORACLE_RUNTIME_ERROR', summary: 'target ref identity changed between snapshots' }],
+  })), false);
+  // Rows without stored finding summaries (bare synthetic fixtures) fall back
+  // to the finding id: any O10 ORACLE_RUNTIME_ERROR is the reconciliation class.
+  assert.equal(replay.isO10ReconciliationErrorRow(o10ReconciliationRow({ beforeFindings: undefined })), true);
+  assert.equal(replay.isO10ReconciliationErrorRow(o10ReconciliationRow({ beforeFindings: [] })), true);
+  // Not an O10 ERROR: no class.
+  assert.equal(replay.isO10ReconciliationErrorRow(o10ReconciliationRow({ before: 'FAIL' })), false);
+  assert.equal(replay.isO10ReconciliationErrorRow(o10ReconciliationRow({ oracle: 'O9' })), false);
+});
+
+test('isO9ReplayRowHeal recognizes only the O9 replay-row heal shape', () => {
+  assert.equal(replay.isO9ReplayRowHeal(row({ oracle: 'O9', before: 'FAIL', after: 'PASS', beforeFindingIds: ['O9_REPLAY_ROW_MISSING'] })), true);
+  // The US-003 singleflight false positives are part of the same heal class.
+  assert.equal(replay.isO9ReplayRowHeal(row({ oracle: 'O9', before: 'FAIL', after: 'PASS', beforeFindingIds: ['O9_REPLAY_ROW_MISSING', 'O9_SINGLEFLIGHT_EXECUTOR_COUNT'] })), true);
+  // Any honest non-heal finding disqualifies the heal class.
+  assert.equal(replay.isO9ReplayRowHeal(row({ oracle: 'O9', before: 'FAIL', after: 'PASS', beforeFindingIds: ['O9_REPLAY_ROW_MISSING', 'O9_HONEST_FINDING'] })), false);
+  assert.equal(replay.isO9ReplayRowHeal(row({ oracle: 'O9', before: 'FAIL', after: 'FAIL', beforeFindingIds: ['O9_REPLAY_ROW_MISSING'] })), false);
+  assert.equal(replay.isO9ReplayRowHeal(row({ oracle: 'O10', before: 'FAIL', after: 'PASS', beforeFindingIds: ['O9_REPLAY_ROW_MISSING'] })), false);
+});
+
+test('verifyS26Invariants accepts an O10 reconciliation-ERROR flip to its true verdict (green arm)', () => {
+  const verification = replay.verifyS26Invariants({
+    rows: [
+      o10ReconciliationRow({ caseId: 'W4.05-slow-suite-contention', after: 'FAIL', findingIds: ['O10_EVENT_SET_MISMATCH'] }),
+      o10ReconciliationRow({ caseId: 'S26C2', after: 'NOT_EVALUABLE' }),
+      o10ReconciliationRow({ caseId: 'S26C3', after: 'PASS' }),
+    ],
+  });
+  assert.equal(verification.ok, true, JSON.stringify(verification.violations));
+  const heal = verification.checks.find((check) => check.label === 's26-o10-reconciliation-heal');
+  assert.equal(heal.ok, true);
+  const scope = verification.checks.find((check) => check.label === 's26-flip-scope');
+  assert.equal(scope.ok, true);
+});
+
+test('verifyS26Invariants flags a stored O10 reconciliation ERROR that did not heal (red arm)', () => {
+  // Pre-US-002 code shape: the reconciliation still throws ORACLE_RUNTIME_ERROR
+  // on replay, so the stored ERROR stays ERROR — the heal never happened.
+  const verification = replay.verifyS26Invariants({
+    rows: [o10ReconciliationRow({ after: 'ERROR', delta: 'same' })],
+  });
+  assert.equal(verification.ok, false);
+  const joined = verification.violations.join('\n');
+  assert.match(joined, /stored O10 suite-ledger reconciliation ERROR must replay to its true verdict \(PASS\/FAIL\/NOT_EVALUABLE\), got ERROR/);
+  const heal = verification.checks.find((check) => check.label === 's26-o10-reconciliation-heal');
+  assert.equal(heal.ok, false);
+});
+
+test('verifyS26Invariants accepts the O9 replay-row heal flip', () => {
+  const verification = replay.verifyS26Invariants({
+    rows: [
+      row({ caseId: 'W4.02-fail-missing-refusal', oracle: 'O9', before: 'FAIL', after: 'PASS', delta: 'flip', beforeFindingIds: ['O9_REPLAY_ROW_MISSING'] }),
+      o10ReconciliationRow({ caseId: 'W4.02-fail-missing-refusal', after: 'FAIL', findingIds: ['O10_EVENT_SET_MISMATCH', 'O10_REROUTE_COUNT'] }),
+    ],
+  });
+  assert.equal(verification.ok, true, JSON.stringify(verification.violations));
+});
+
+test('verifyS26Invariants flags an O10 non-reconciliation ERROR flip', () => {
+  const verification = replay.verifyS26Invariants({
+    rows: [o10ReconciliationRow({
+      beforeFindings: [{ id: 'ORACLE_RUNTIME_ERROR', summary: 'target ref identity changed between snapshots' }],
+    })],
+  });
+  assert.equal(verification.ok, false);
+  const joined = verification.violations.join('\n');
+  assert.match(joined, /outside the O10 reconciliation-ERROR -> true-verdict \/ O9 replay-row-heal classes/);
+  const scope = verification.checks.find((check) => check.label === 's26-flip-scope');
+  assert.equal(scope.ok, false);
+});
+
+test('verifyS26Invariants flags a non-O10 flip', () => {
+  const verification = replay.verifyS26Invariants({
+    rows: [
+      row({ caseId: 'S26C4', oracle: 'O3z', before: 'FAIL', after: 'PASS', delta: 'flip', beforeFindingIds: ['O3Z_SYSTEM_TOKENS_NONZERO'] }),
+      row({ caseId: 'S26C5', oracle: 'O2', before: 'ERROR', after: 'NOT_EVALUABLE', delta: 'flip', beforeFindingIds: ['ORACLE_RUNTIME_ERROR'] }),
+    ],
+  });
+  assert.equal(verification.ok, false);
+  const joined = verification.violations.join('\n');
+  assert.match(joined, /S26C4\/attempt-1\/O3z: S26 invariant violated/);
+  assert.match(joined, /S26C5\/attempt-1\/O2: S26 invariant violated/);
+  const scope = verification.checks.find((check) => check.label === 's26-flip-scope');
+  assert.equal(scope.violations.length, 2);
+});
+
+test('verifyS26Invariants flags an O9 flip carrying an honest non-heal finding', () => {
+  const verification = replay.verifyS26Invariants({
+    rows: [
+      row({ oracle: 'O9', before: 'FAIL', after: 'PASS', delta: 'flip', beforeFindingIds: ['O9_REPLAY_ROW_MISSING', 'O9_HONEST_FINDING'] }),
+    ],
+  });
+  assert.equal(verification.ok, false);
+  assert.match(verification.violations.join('\n'), /outside the O10 reconciliation-ERROR/);
+});
+
+test('verifyS26Invariants accepts the exact attempt-2 replay delta shape (O10 heals + O9 heals only)', () => {
+  // The campaign-20260826T225744158Z-4bf26d7f replay with the US-002/US-003
+  // fixes: 23 O10 reconciliation ERROR -> FAIL flips (true verdicts with the
+  // O10 findings), 2 O9 O9_REPLAY_ROW_MISSING FAIL -> PASS heals, the
+  // W4.29 non-reconciliation O10 ERROR staying ERROR, and every other row
+  // unchanged. The S26 pin must accept exactly this shape.
+  const o10HealCases = [
+    'W4.03-red-adjacent-commit', 'W4.04a-mechanical-override', 'W4.04b-behavioral-bait',
+    'W4.05-slow-suite-contention', 'W4.28-tstx-cross-repo-collision', 'W4.45-branch-delete',
+  ];
+  const rows = [
+    ...o10HealCases.map((caseId) => o10ReconciliationRow({ caseId, after: 'FAIL', findingIds: ['O10_EVENT_SET_MISMATCH'] })),
+    row({ caseId: 'W4.01-missing-evidence-reroute', oracle: 'O9', before: 'FAIL', after: 'PASS', delta: 'flip', beforeFindingIds: ['O9_REPLAY_ROW_MISSING', 'O9_REPLAY_ROW_MISSING'] }),
+    row({ caseId: 'W4.02-fail-missing-refusal', oracle: 'O9', before: 'FAIL', after: 'PASS', delta: 'flip', beforeFindingIds: ['O9_REPLAY_ROW_MISSING'] }),
+    row({
+      caseId: 'W4.29-strict-gate-retry-finalize', oracle: 'O10', before: 'ERROR',
+      beforeFindingIds: ['ORACLE_RUNTIME_ERROR'],
+      beforeFindings: [{ id: 'ORACLE_RUNTIME_ERROR', summary: 'target ref identity changed between snapshots' }],
+      after: 'ERROR', delta: 'same',
+    }),
+    row({ caseId: 'W4.08-control', before: 'PASS', after: 'PASS' }),
+    row({ caseId: 'W4.08-control', oracle: 'O11', before: 'PASS', after: 'PASS' }),
+  ];
+  const verification = replay.verifyS26Invariants({ rows });
+  assert.equal(verification.ok, true, JSON.stringify(verification.violations));
+});
+
+test('verifyS26Invariants rejects the attempt-2 shape when an honest row flips too', () => {
+  // Same shape plus one honest O3z flip: the delta is no longer "O10 heals +
+  // O9 heals only" and the pin must fail loudly.
+  const rows = [
+    o10ReconciliationRow({ caseId: 'W4.05-slow-suite-contention', after: 'FAIL', findingIds: ['O10_EVENT_SET_MISMATCH'] }),
+    row({ caseId: 'W4.02-fail-missing-refusal', oracle: 'O9', before: 'FAIL', after: 'PASS', delta: 'flip', beforeFindingIds: ['O9_REPLAY_ROW_MISSING'] }),
+    row({ caseId: 'W4.23-daemon-cross-runtime-restart', oracle: 'O3z', before: 'FAIL', after: 'PASS', delta: 'flip', beforeFindingIds: ['LOCAL_SCENARIO_EVIDENCE_FAILED'] }),
+  ];
+  const verification = replay.verifyS26Invariants({ rows });
+  assert.equal(verification.ok, false);
+  assert.match(verification.violations.join('\n'), /W4\.23-daemon-cross-runtime-restart\/attempt-1\/O3z/);
+});
+
+test('isScopedDisappearing treats O9_REPLAY_ROW_MISSING as scoped on O9 only (S26)', () => {
+  assert.equal(replay.isScopedDisappearing({ caseId: 'W4.01-missing-evidence-reroute', oracle: 'O9', findingId: 'O9_REPLAY_ROW_MISSING' }), true);
+  assert.equal(replay.isScopedDisappearing({ caseId: 'W4.01-missing-evidence-reroute', oracle: 'O10', findingId: 'O9_REPLAY_ROW_MISSING' }), false);
+  assert.equal(replay.isScopedDisappearing({ caseId: 'W4.01-missing-evidence-reroute', oracle: 'O2', findingId: 'O9_REPLAY_ROW_MISSING' }), false);
+});
+
+test('verifyReplayInvariants accepts the S26 classes (O10 reconciliation heal + O9 replay-row heal)', () => {
+  const verification = replay.verifyReplayInvariants({
+    pins: { cnev: [], o8Seeded: [] },
+    campaignCaseIds: [],
+    rows: [
+      o10ReconciliationRow({ caseId: 'W4.05-slow-suite-contention', after: 'FAIL', findingIds: ['O10_EVENT_SET_MISMATCH'] }),
+      row({ caseId: 'W4.02-fail-missing-refusal', oracle: 'O9', before: 'FAIL', after: 'PASS', delta: 'flip', beforeFindingIds: ['O9_REPLAY_ROW_MISSING'] }),
+    ],
+  });
+  assert.equal(verification.ok, true, JSON.stringify(verification.violations));
+  const classes = verification.checks.find((check) => check.label === 'flip-transition-classes');
+  assert.equal(classes.violations.length, 0);
+  const preservation = verification.checks.find((check) => check.label === 'honest-finding-preservation');
+  assert.equal(preservation.violations.length, 0);
+});
+
+test('verifyReplayInvariants flags O9_REPLAY_ROW_MISSING vanishing on a non-O9 oracle', () => {
+  const verification = replay.verifyReplayInvariants({
+    pins: { cnev: [], o8Seeded: [] },
+    rows: [
+      row({ caseId: 'W4.01-missing-evidence-reroute', oracle: 'O10', before: 'FAIL', after: 'FAIL', beforeFindingIds: ['O9_REPLAY_ROW_MISSING'] }),
+    ],
+  });
+  assert.equal(verification.ok, false);
+  assert.match(verification.violations.join('\n'), /honest finding O9_REPLAY_ROW_MISSING vanished/);
+});
+
+test('verifyReplayInvariants flags an O10 reconciliation ERROR flipping to PASS (missing true-verdict shape is fine, but ERROR->PASS must be S26-scoped)', () => {
+  // ERROR -> PASS on O10 is allowed ONLY for the reconciliation class: a
+  // non-reconciliation stored ERROR (target-ref-identity) flipping to PASS
+  // stays an unclassified honest flip.
+  const verification = replay.verifyReplayInvariants({
+    pins: { cnev: [], o8Seeded: [] },
+    rows: [
+      o10ReconciliationRow({ caseId: 'W4.29-strict-gate-retry-finalize', after: 'PASS', beforeFindings: [{ id: 'ORACLE_RUNTIME_ERROR', summary: 'target ref identity changed between snapshots' }] }),
+    ],
+  });
+  assert.equal(verification.ok, false);
+  const joined = verification.violations.join('\n');
+  assert.match(joined, /unclassified flip ERROR -> PASS/);
+});
+
+test('renderS26Report renders the S26 check statuses', () => {
+  const verification = replay.verifyS26Invariants({ rows: [o10ReconciliationRow()] });
+  const report = replay.renderS26Report(verification);
+  assert.match(report, /\[OK\] s26-o10-reconciliation-heal/);
+  assert.match(report, /\[OK\] s26-flip-scope/);
+  assert.match(report, /s26: OK/);
+});
+
+// ── S26 e2e: --verify-s26-invariants over a synthetic campaign ──────────────
+//
+// One O10 pair whose context carries a NULL gate_key (the replay answers
+// NOT_EVALUABLE — a true verdict). The stored stdout.json carries the
+// campaign-#7-shaped ERROR verdict; its summary selects the class:
+//   - reconciliation summary  -> ERROR -> NOT_EVALUABLE is an allowed O10
+//                                reconciliation heal (exit 0);
+//   - any other ERROR summary -> an O10 non-reconciliation ERROR flip,
+//                                which violates the strict S26 pin (exit 1).
+
+function buildS26ReplayCampaign(root, storedSummary) {
+  const campaign = path.join(root, 'campaign-20260813T123604986Z-s26');
+  fs.mkdirSync(campaign, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(campaign, 'state.json'), '{}\n');
+  const caseId = 'S26C1';
+  const snapshots = path.join(campaign, 'snapshots', caseId, 'attempt-1');
+  fs.mkdirSync(snapshots, { recursive: true, mode: 0o700 });
+  const reference = (file) => ({
+    path: path.relative(campaign, file).split(path.sep).join('/'),
+    sha256: sha256(fs.readFileSync(file)),
+    captured_at: CAPTURED_AT,
+    source: 'synthetic-s26-fixture',
+  });
+  const databasePath = path.join(snapshots, 'database.sqlite');
+  const database = new DatabaseSync(databasePath);
+  database.exec(`
+    CREATE TABLE runs (id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, status TEXT NOT NULL, context TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+    CREATE TABLE steps (id TEXT PRIMARY KEY, run_id TEXT NOT NULL, step_id TEXT NOT NULL, agent_id TEXT NOT NULL, status TEXT NOT NULL);
+    CREATE TABLE stories (id TEXT PRIMARY KEY, run_id TEXT NOT NULL, status TEXT NOT NULL);
+  `);
+  database.close();
+  fs.chmodSync(databasePath, 0o400);
+  const runId = 'run-66666666-6666-4666-8666-666666666666';
+  const attempt = {
+    id: 'attempt-1', kind: 'workflow', phase: 'terminal', execution_mode: 'scripted',
+    run_id: runId, started_at: '2026-08-01T11:00:00.000Z', terminal_at: CAPTURED_AT,
+    terminal_status: 'completed', tokens_observed: 0,
+    command_result: { exit_code: 0, signal: null }, steps_snapshot: null, straggler_capture: null,
+  };
+  const writeSnapshot = (name, value) => {
+    const file = path.join(snapshots, name);
+    fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o400, flag: 'wx' });
+    return file;
+  };
+  const references = Object.fromEntries(REFERENCE_KEYS.map((key) => [key, null]));
+  references.database_snapshot = reference(databasePath);
+  references.run_events = reference(writeSnapshot('run-events.json', {
+    schema_version: 1, captured_at: CAPTURED_AT, run_ids: [runId], rows: [],
+  }));
+  references.launch_intent = reference(writeSnapshot('launch-intent.json', {
+    schema_version: 1, captured_at: CAPTURED_AT, case_id: caseId,
+    workflow: 'feature-dev-merge-worktree', fixture: 'synthetic', harness: 'scripted-pi',
+    execution_mode: 'scripted',
+    repository: { path: 'fixtures/synthetic-s26', origin_repo: '/torture-test/fixtures/synthetic-s26' },
+    policy: { merge_gate: 'off', fail_missing: null, execution_mode: 'scripted' },
+    gate_key: null,
+    argv: ['workflow', 'run'], argv_sha256: 'b'.repeat(64), launch_intent_at: CAPTURED_AT,
+  }));
+  references.refs_before = reference(writeSnapshot('refs-before.json', {
+    schema_version: 1, phase: 'before',
+    repository: { path: 'fixtures/synthetic-s26', origin_repo: '/torture-test/fixtures/synthetic-s26' },
+    target_ref: 'refs/heads/main', target_tip: 'c'.repeat(40), for_each_ref: '',
+  }));
+  references.refs_after = reference(writeSnapshot('refs-after.json', {
+    schema_version: 1, phase: 'after',
+    repository: { path: 'fixtures/synthetic-s26', origin_repo: '/torture-test/fixtures/synthetic-s26' },
+    target_ref: 'refs/heads/main', target_tip: 'c'.repeat(40), for_each_ref: '',
+  }));
+  references.suite_ledger = reference(writeSnapshot('suite-ledger.json', {
+    schema_version: 1, captured_at: CAPTURED_AT, rows: [],
+  }));
+  references.suite_observations = reference(writeSnapshot('suite-observations.json', {
+    schema_version: 1, captured_at: CAPTURED_AT, ttl_green_ms: 86_400_000, rows: [],
+    singleflight_observations: [], special_exit_observations: [], origin_identities: [],
+  }));
+  references.submit_rejections = reference(writeSnapshot('submit-rejections.json', {
+    schema_version: 1, captured_at: CAPTURED_AT, rows: [],
+  }));
+  const oracleDir = path.join(campaign, 'evidence', caseId, 'attempt-1', 'oracles', 'O10');
+  fs.mkdirSync(oracleDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(oracleDir, 'context.json'), `${JSON.stringify({
+    contract_version: 1,
+    oracle_id: 'O10',
+    campaign: { id: 'campaign-20260813T123604986Z-s26', created_at: CAPTURED_AT, manifest: { sha256: 'a'.repeat(64), case_count: 1, case_ids: [caseId] } },
+    case: {
+      id: caseId, wave: 1, workflow: 'feature-dev-merge-worktree', fixture: 'synthetic',
+      harness: 'scripted-pi', class: 'verification',
+      caps: { tokens: 100, wall_min: 10 }, boundary_files: [], forbidden: [], chaos: null,
+    },
+    run_id: runId,
+    attempts: [attempt],
+    discovered_runs: [],
+    o1_wave: { schema_version: 1, wave: 1, duration_floors: [], runs: [] },
+    mechanical_evidence: { schema_version: 1, references },
+  }, null, 2)}\n`);
+  fs.writeFileSync(path.join(oracleDir, 'stdout.json'), `${JSON.stringify({
+    contract_version: 1, oracle_id: 'O10',
+    result: 'ERROR', started_at: CAPTURED_AT, finished_at: CAPTURED_AT,
+    findings: [{ id: 'ORACLE_RUNTIME_ERROR', summary: storedSummary }],
+    evidence: [],
+  }, null, 2)}\n`);
+  return campaign;
+}
+
+test('--verify-s26-invariants exits 0 on an allowed O10 reconciliation-ERROR heal', () => {
+  const root = testRoot();
+  try {
+    const campaign = buildS26ReplayCampaign(root, `${O10_RECONCILIATION_SUMMARY} with the read-only database snapshot`);
+    const digestBefore = replay.computeCampaignDigest(campaign);
+    const jsonPath = path.join(root, 's26.json');
+    const result = spawnSync(process.execPath, [REPLAY_TOOL, '--campaign', campaign, '--workspace-root', path.join(root, 'ws'), '--verify-s26-invariants', '--json', jsonPath], {
+      encoding: 'utf8',
+      shell: false,
+      timeout: 120_000,
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    assert.equal(result.status, 0, `stdout: ${result.stdout}\nstderr: ${result.stderr}`);
+    assert.match(result.stdout, /S26 invariant report/);
+    assert.match(result.stdout, /\[OK\] s26-o10-reconciliation-heal/);
+    assert.match(result.stdout, /\[OK\] s26-flip-scope/);
+    assert.match(result.stdout, /s26: OK/);
+
+    const payload = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
+    assert.deepEqual(payload.rows.map((entry) => [entry.caseId, entry.oracle, entry.before, entry.after, entry.delta]), [
+      ['S26C1', 'O10', 'ERROR', 'NOT_EVALUABLE', 'flip'],
+    ]);
+    assert.equal(payload.s26.ok, true, JSON.stringify(payload.s26.violations));
+    // The replay row carries the stored finding summaries (the S26 pin input).
+    assert.equal(payload.rows[0].beforeFindings[0].summary, `${O10_RECONCILIATION_SUMMARY} with the read-only database snapshot`);
+
+    // Source campaign byte-identical before/after the replay.
+    assert.deepEqual(replay.computeCampaignDigest(campaign), digestBefore);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('--verify-s26-invariants exits 1 on an O10 non-reconciliation ERROR flip (violating)', () => {
+  const root = testRoot();
+  try {
+    const campaign = buildS26ReplayCampaign(root, 'target ref identity changed between snapshots');
+    const jsonPath = path.join(root, 's26-violation.json');
+    const result = spawnSync(process.execPath, [REPLAY_TOOL, '--campaign', campaign, '--workspace-root', path.join(root, 'ws'), '--verify-s26-invariants', '--json', jsonPath], {
+      encoding: 'utf8',
+      shell: false,
+      timeout: 120_000,
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    assert.equal(result.status, 1, `stdout: ${result.stdout}\nstderr: ${result.stderr}`);
+    assert.match(result.stdout, /\[VIOLATION\] s26-flip-scope/);
+    assert.match(result.stderr, /S26 invariant violation: S26C1\/attempt-1\/O10: S26 invariant violated \(flip ERROR -> NOT_EVALUABLE outside the O10 reconciliation-ERROR -> true-verdict \/ O9 replay-row-heal classes\)/);
+    assert.match(result.stderr, /S26 invariant verification FAILED/);
+
+    const payload = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
+    assert.equal(payload.s26.ok, false);
+    assert.equal(payload.s26.violations.length, 1);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

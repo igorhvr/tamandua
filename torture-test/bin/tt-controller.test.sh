@@ -38,6 +38,7 @@ CHAOS_TARGETS_FILE=""
 DAEMON_CONTROL_ORIGINAL_HASH="$(sha256sum "$TT_DIR/bin/daemon-control" | cut -d' ' -f1)"
 SMOKE_GOLDENS=()
 ORACLE_TEST_FILES=()
+ORACLE_ORIGINALS_BACKUP="$TEST_ROOT/oracle-originals"
 DISCOVERY_DB=""
 DISCOVERY_DB_BACKUP=""
 DISCOVERY_DB_WAL_BACKUP=""
@@ -105,7 +106,22 @@ cleanup() {
     rm -rf -- "${SMOKE_GOLDENS[@]+"${SMOKE_GOLDENS[@]}"}"
   fi
   if [ "${#ORACLE_TEST_FILES[@]}" -gt 0 ]; then
-    rm -f -- "${ORACLE_TEST_FILES[@]+"${ORACLE_TEST_FILES[@]}"}"
+    # S26 (US-006): the oracle hook fixtures (TT-ORACLE-*) are TRACKED files
+    # under torture-test/oracles/ — the test rewrites them (byte-identical
+    # content) to run the mechanical oracle campaign, so cleanup must RESTORE
+    # the originals instead of deleting them (a plain rm -f leaves the
+    # working tree dirty and breaks the run.sh clean-tree guard). Restore
+    # from the backup dir; scratch fixtures with no committed original (e.g.
+    # TT-ORACLE-PROVIDER-RETRY) are removed.
+    local oracle_file
+    for oracle_file in "${ORACLE_TEST_FILES[@]+"${ORACLE_TEST_FILES[@]}"}"; do
+      if [ -f "$ORACLE_ORIGINALS_BACKUP/$(basename "$oracle_file")" ]; then
+        cp "$ORACLE_ORIGINALS_BACKUP/$(basename "$oracle_file")" "$oracle_file"
+      else
+        rm -f -- "$oracle_file"
+      fi
+    done
+    rm -rf -- "$ORACLE_ORIGINALS_BACKUP"
   fi
   if [ -n "$DISCOVERY_DB" ]; then
     rm -f -- "$DISCOVERY_DB" "$DISCOVERY_DB-wal" "$DISCOVERY_DB-shm"
@@ -422,6 +438,15 @@ oracle_malformed="$TT_DIR/oracles/TT-ORACLE-MALFORMED"
 oracle_contradictory="$TT_DIR/oracles/TT-ORACLE-CONTRADICTORY"
 oracle_no_prose="$TT_DIR/oracles/TT-ORACLE-NO-PROSE"
 oracle_provider_retry="$TT_DIR/oracles/TT-ORACLE-PROVIDER-RETRY"
+# S26 (US-006): TT-ORACLE-PASS/MALFORMED/CONTRADICTORY/NO-PROSE are TRACKED
+# fixture files (the test rewrites them byte-identical) — snapshot the
+# originals so cleanup can restore them instead of deleting (dirty tree).
+mkdir -p "$ORACLE_ORIGINALS_BACKUP"
+for oracle_file in "$oracle_pass" "$oracle_malformed" "$oracle_contradictory" "$oracle_no_prose"; do
+  if [ -f "$oracle_file" ]; then
+    cp "$oracle_file" "$ORACLE_ORIGINALS_BACKUP/$(basename "$oracle_file")"
+  fi
+done
 ORACLE_TEST_FILES+=("$oracle_pass" "$oracle_malformed" "$oracle_contradictory" "$oracle_no_prose" "$oracle_provider_retry")
 cat > "$oracle_pass" <<'NODE'
 #!/usr/bin/env node

@@ -449,7 +449,28 @@ for oracle in O3z O4 O8 O9 O10 O11 O16; do
   prefix=$(printf '%s' "$oracle" | tr '[:upper:]' '[:lower:]')
   for fixture in "$workspace"/"$prefix"-*; do
     expected=$(run_bounded "$COMMAND_TIMEOUT_SECONDS" node -e 'const fs=require("node:fs"); process.stdout.write(JSON.parse(fs.readFileSync(process.argv[1],"utf8")).expected)' "$fixture/expectation.json")
-    run_bounded "$COMMAND_TIMEOUT_SECONDS" node "$SCRIPT_DIR/harness.mjs" --oracle "$SCRIPT_DIR/../$oracle" --context "$fixture/evidence/context.json" --expected "$expected"
+    if [ "$expected" = "ERROR" ]; then
+      oracle_started_ms=$(node -e 'process.stdout.write(String(Date.now()))')
+      response_file="$fixture/oracle-response.json"
+      set +e
+      run_bounded "$COMMAND_TIMEOUT_SECONDS" "$SCRIPT_DIR/../$oracle" "$fixture/evidence/context.json" >"$response_file"
+      oracle_status=$?
+      set -e
+      if [ "$oracle_status" -ne 2 ]; then
+        printf 'expected ERROR but %s exited %s for %s\n' "$oracle" "$oracle_status" "$fixture" >&2
+        exit 1
+      fi
+      run_bounded "$COMMAND_TIMEOUT_SECONDS" node -e 'const fs=require("node:fs"); const value=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); if(value.result!=="ERROR") process.exit(1)' "$response_file"
+      oracle_finished_ms=$(node -e 'process.stdout.write(String(Date.now()))')
+      oracle_elapsed_ms=$((oracle_finished_ms - oracle_started_ms))
+      if [ "$oracle_elapsed_ms" -ge 10000 ]; then
+        printf '%s ERROR fixture exceeded standalone 10-second limit (%sms)\n' "$oracle" "$oracle_elapsed_ms" >&2
+        exit 1
+      fi
+      printf 'expected ERROR accepted for %s (%sms)\n' "$oracle" "$oracle_elapsed_ms"
+    else
+      run_bounded "$COMMAND_TIMEOUT_SECONDS" node "$SCRIPT_DIR/harness.mjs" --oracle "$SCRIPT_DIR/../$oracle" --context "$fixture/evidence/context.json" --expected "$expected"
+    fi
   done
 done
 

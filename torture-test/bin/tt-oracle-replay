@@ -34,15 +34,28 @@
 //     S19 O8_SEEDED_TEST_CHANGED replaced by the informational
 //     O8_SEEDED_TEST_EXTENDED on an additive seeded-test delta, S20
 //     O2_REF_TRANSITION_COUNT on O2, S21 O9_LEDGER_TREE_UNRESOLVED on O9,
-//     and S23 O1_DURATION_FLOOR_* APPEARING on a stored PASS). Any honest
-//     verdict flip fails the replay loudly.
+//     S26 O10 reconciliation-ERROR flips to their true verdict + O9
+//     O9_REPLAY_ROW_MISSING heals, and S23 O1_DURATION_FLOOR_* APPEARING
+//     on a stored PASS). Any honest verdict flip fails the replay loudly.
+//   - --verify-s26-invariants (S26 US-005) pins the S26 replay contract on
+//     top of the replay: the ONLY allowed flips are (a) a stored O10
+//     ORACLE_RUNTIME_ERROR carrying the 'suite_ledger does not reconcile
+//     byte-for-field' summary replaying to its TRUE verdict
+//     (PASS/FAIL/NOT_EVALUABLE — the US-002 scoped-reconciliation heal) and
+//     (b) an O9 FAIL -> PASS heal whose every stored finding is an
+//     O9_REPLAY_ROW_MISSING / O9_SINGLEFLIGHT_* false positive from the
+//     US-003 row-resolution alignment. Every O10 reconciliation-ERROR row
+//     MUST heal (a stored reconciliation ERROR that still replays ERROR is
+//     the red arm), and any OTHER flip — including any O10 non-reconciliation
+//     ERROR flip or any non-O10 change — violates the pin and exits 1.
 //
 // Exit codes:
 //   0  replay completed: every pair attempted and recorded (and, under
-//      --verify-invariants, every pinned invariant held)
+//      --verify-invariants / --verify-s26-invariants, every pinned
+//      invariant held)
 //   1  usage error, campaign missing/empty, source campaign modified during
-//      replay, no pair could be invoked at all, or an E3.B invariant
-//      violation under --verify-invariants
+//      replay, no pair could be invoked at all, or an E3.B / S26 invariant
+//      violation under --verify-invariants / --verify-s26-invariants
 
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
@@ -77,7 +90,13 @@ options:
   --keep-workspaces        do not remove the replay workspace after the run
   --verify-invariants      pin the E3.B honest-verdict invariants on the
                            replay (CNEV/O8-seeded pins hold; only
-                           S5/S6/S7/S13/S19 artifact classes may flip) and
+                           S5/S6/S7/S13/S19/S20/S21/S23/S26 artifact
+                           classes may flip) and exit 1 when any pinned
+                           invariant is violated
+  --verify-s26-invariants  pin the S26 replay contract on the replay (the
+                           ONLY flips allowed are O10 reconciliation-ERROR
+                           -> true verdict and O9 replay-row heals; every
+                           stored O10 reconciliation ERROR must heal) and
                            exit 1 when any pinned invariant is violated
   -h, --help               show this help
 
@@ -85,16 +104,17 @@ Campaign selection: --campaign wins, then TT_REPLAY_CAMPAIGN_DIR, then
 auto-detection of campaign-20260813T123604986Z-* under torture-test/var/results
 (exactly one match required).
 
-Exit codes: 0 = replay completed (and, under --verify-invariants, every
-pinned E3.B invariant held); 1 = usage error, no pairs, source campaign
-modified during replay, no pair could be invoked, or an E3.B invariant
-violation under --verify-invariants.`;
+Exit codes: 0 = replay completed (and, under --verify-invariants /
+--verify-s26-invariants, every pinned invariant held); 1 = usage error, no
+pairs, source campaign modified during replay, no pair could be invoked, or
+an E3.B / S26 invariant violation under --verify-invariants /
+--verify-s26-invariants.`;
 }
 
 export function parseArgs(argv) {
   const options = {
     campaign: null, workspaceRoot: DEFAULT_WORKSPACE_ROOT, jsonPath: null,
-    keepWorkspaces: false, verifyInvariants: false,
+    keepWorkspaces: false, verifyInvariants: false, verifyS26Invariants: false,
   };
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
@@ -105,6 +125,10 @@ export function parseArgs(argv) {
     }
     if (argument === '--verify-invariants') {
       options.verifyInvariants = true;
+      continue;
+    }
+    if (argument === '--verify-s26-invariants') {
+      options.verifyS26Invariants = true;
       continue;
     }
     if (!['--campaign', '--workspace-root', '--json'].includes(argument) || index + 1 >= argv.length) {
@@ -260,18 +284,29 @@ export function readStoredVerdict(stdoutPath) {
   }
 }
 
-// Returns the finding ids recorded in the stored stdout.json (the BEFORE
-// findings of a replay pair). Unparsable or finding-less files yield [] and
-// non-string finding ids are normalized to UNKNOWN_FINDING so invariant
-// classification can never silently drop a finding.
-export function readStoredFindings(stdoutPath) {
+// Returns the full finding objects (id + summary) recorded in the stored
+// stdout.json (the BEFORE findings of a replay pair). Unparsable or
+// finding-less files yield [] and non-string finding ids are normalized to
+// UNKNOWN_FINDING so invariant classification can never silently drop a
+// finding. The summaries let the S26 pin distinguish the O10
+// suite-ledger reconciliation ERROR from other O10 ORACLE_RUNTIME_ERRORs.
+export function readStoredFindingObjects(stdoutPath) {
   try {
     const stored = JSON.parse(fs.readFileSync(stdoutPath, 'utf8'));
     if (!Array.isArray(stored?.findings)) return [];
-    return stored.findings.map((finding) => (typeof finding?.id === 'string' ? finding.id : 'UNKNOWN_FINDING'));
+    return stored.findings.map((finding) => ({
+      id: typeof finding?.id === 'string' ? finding.id : 'UNKNOWN_FINDING',
+      summary: typeof finding?.summary === 'string' ? finding.summary : '',
+    }));
   } catch {
     return [];
   }
+}
+
+// Returns the finding ids recorded in the stored stdout.json (the BEFORE
+// findings of a replay pair).
+export function readStoredFindings(stdoutPath) {
+  return readStoredFindingObjects(stdoutPath).map((finding) => finding.id);
 }
 
 function readContext(contextPath) {
@@ -502,6 +537,13 @@ export function isScopedDisappearing({ caseId, oracle, findingId, afterFindingId
   // stored findings may vanish on O9 replays (the FAIL->PASS flip is the S21
   // class). S13's W1.REPLAY-ts pin remains for its narrower foreign-row case.
   if (findingId === 'O9_LEDGER_TREE_UNRESOLVED') return oracle === 'O9'; // S21
+  // S26 (2026-08-24, S26 O9 alignment): O9_REPLAY_ROW_MISSING was a false
+  // positive when the replay row-resolution path treated foreign-origin /
+  // stale-attempt rows (reused var/fixtures/work/<case>/<fixture> origin
+  // paths across campaigns) as missing; the fixed oracle reserves the
+  // finding for a row id absent from BOTH the case scope and the database
+  // snapshot, so stored findings legitimately vanish on O9 replays.
+  if (findingId === 'O9_REPLAY_ROW_MISSING') return oracle === 'O9'; // S26
   if (S13_FOREIGN_ROW_FINDINGS.has(findingId)) return S13_FOREIGN_ROW_CASES.has(caseId); // S13
   // ORACLE_RUNTIME_ERROR is the stored shape of the null-gate_key degradation
   // on O2/O9/O10 (campaign #7 W2.22/W3.0x merge cases): the S13 fix replaces
@@ -581,11 +623,13 @@ export function verifyReplayInvariants({ rows, campaignDir = null, campaignCaseI
   }
 
   // I2 — transition classes: the only allowed flips are FAIL->PASS where
-  // every before finding is scoped (S5/S6/S7/S13/S19/S20/S21), PASS->FAIL
+  // every before finding is scoped (S5/S6/S7/S13/S19/S20/S21/S26), PASS->FAIL
   // where every AFTER finding is an O1_DURATION_FLOOR_* artifact (S23 — the
   // SFX-B un-deadened guard fires the wave-1 floor findings the dead guard
-  // stored as PASS), and ERROR->NOT_EVALUABLE on O2/O9/O10 (S13
-  // degraded-evidence vocabulary).
+  // stored as PASS), ERROR->NOT_EVALUABLE on O2/O9/O10 (S13
+  // degraded-evidence vocabulary), and ERROR->PASS/FAIL on O10 when the
+  // stored ERROR is the S26 suite-ledger reconciliation class (the US-002
+  // scoped fix replays it to its true verdict).
   {
     const label = 'flip-transition-classes';
     const local = [];
@@ -617,8 +661,16 @@ export function verifyReplayInvariants({ rows, campaignDir = null, campaignCaseI
         if (!S13_NOT_EVALUABLE_ORACLES.has(row.oracle)) {
           local.push(`${key}: ERROR -> NOT_EVALUABLE flip on ${row.oracle} (S13 vocabulary is scoped to O2/O9/O10)`);
         }
+      } else if (row.before === 'ERROR' && isO10ReconciliationErrorRow(row)
+          && ['PASS', 'FAIL', 'NOT_EVALUABLE'].includes(row.after)) {
+        // S26 (2026-08-24, S26 US-002): the O10 suite-ledger reconciliation
+        // is scoped to the case's suite origins, so a stored O10
+        // ORACLE_RUNTIME_ERROR with the 'suite_ledger does not reconcile
+        // byte-for-field' summary legitimately replays to its true verdict
+        // (PASS/FAIL/NOT_EVALUABLE). Any O10 non-reconciliation ERROR flip
+        // stays an honest verdict (caught by the unclassified branch below).
       } else {
-        local.push(`${key}: unclassified flip ${row.before} -> ${row.after} (outside the S5/S6/S7/S13/S19/S20/S21/S23 classes)`);
+        local.push(`${key}: unclassified flip ${row.before} -> ${row.after} (outside the S5/S6/S7/S13/S19/S20/S21/S23/S26 classes)`);
       }
     }
     violations.push(...local);
@@ -770,6 +822,119 @@ export function verifyReplayInvariants({ rows, campaignDir = null, campaignCaseI
   return { ok: violations.length === 0, violations, checks, runawayCases: runaway.cases };
 }
 
+// ── S26 US-005: O10 reconciliation replay-contract pin ──────────────────────
+//
+// The S26 replay contract (pinned by --verify-s26-invariants): the ONLY
+// allowed verdict flips between a stored campaign verdict and its replay are
+//
+//   A  O10 reconciliation heal: a stored O10 ERROR whose findings carry
+//      ORACLE_RUNTIME_ERROR with the 'suite_ledger does not reconcile
+//      byte-for-field' summary replays to its TRUE verdict — PASS, FAIL or
+//      NOT_EVALUABLE. The US-002 scoped-reconciliation fix recomputes the
+//      case's suite-origin scope from O10's own inputs, so the stored
+//      ERROR (a full-table false positive from foreign-origin rows) is no
+//      longer thrown. EVERY such stored row must heal: a reconciliation
+//      ERROR that still replays ERROR is the red arm and violates the pin.
+//   B  O9 replay-row heal: an O9 FAIL -> PASS where every stored finding is
+//      an O9_REPLAY_ROW_MISSING / O9_SINGLEFLIGHT_* false positive that the
+//      US-003 row-resolution alignment (foreign/stale rows annotated and
+//      skipped, never missing) heals on replay.
+//
+// Any OTHER flip — including an O10 non-reconciliation ERROR flip (e.g. the
+// 'target ref identity changed between snapshots' class) or any non-O10 /
+// non-O9 change — violates the pin and exits 1.
+
+const O10_RECONCILIATION_SUMMARY = 'suite_ledger does not reconcile byte-for-field';
+const S26_O9_HEAL_FINDINGS = new Set([
+  'O9_REPLAY_ROW_MISSING',
+  'O9_SINGLEFLIGHT_EXECUTOR_COUNT',
+  'O9_SINGLEFLIGHT_RECOVERY_ORDER',
+  'O9_SINGLEFLIGHT_WAITER_UNRESOLVED',
+]);
+
+// True when the replay row's BEFORE shape is the S26 O10 suite-ledger
+// reconciliation ERROR: oracle O10, stored verdict ERROR, and an
+// ORACLE_RUNTIME_ERROR finding whose summary carries the reconciliation
+// message. Rows without stored finding summaries (synthetic fixtures) fall
+// back to the finding id — any O10 ORACLE_RUNTIME_ERROR is treated as the
+// reconciliation class.
+export function isO10ReconciliationErrorRow(row) {
+  if (row.oracle !== 'O10' || row.before !== 'ERROR') return false;
+  const findings = row.beforeFindings ?? [];
+  if (findings.length > 0) {
+    return findings.some((finding) => finding.id === 'ORACLE_RUNTIME_ERROR'
+      && typeof finding.summary === 'string' && finding.summary.includes(O10_RECONCILIATION_SUMMARY));
+  }
+  return (row.beforeFindingIds ?? []).includes('ORACLE_RUNTIME_ERROR');
+}
+
+// True when the flip is the S26 O9 replay-row heal: oracle O9, stored FAIL
+// -> replayed PASS, O9_REPLAY_ROW_MISSING among the stored findings, and
+// EVERY stored finding an S26 O9 heal-class false positive (US-003).
+export function isO9ReplayRowHeal(row) {
+  if (row.oracle !== 'O9' || row.before !== 'FAIL' || row.after !== 'PASS') return false;
+  const beforeIds = row.beforeFindingIds ?? [];
+  if (!beforeIds.includes('O9_REPLAY_ROW_MISSING')) return false;
+  return beforeIds.every((findingId) => S26_O9_HEAL_FINDINGS.has(findingId));
+}
+
+// Verifies the S26 replay-contract invariants over replay rows. Returns
+// { ok, violations, checks }; ok is true only when zero violations were
+// found.
+export function verifyS26Invariants({ rows }) {
+  const violations = [];
+  const checks = [];
+
+  // S26-I1 — O10 reconciliation heals: every stored O10 reconciliation-ERROR
+  // row must replay to its true verdict (PASS/FAIL/NOT_EVALUABLE). A stored
+  // reconciliation ERROR that still replays ERROR is the red arm (pre-US-002
+  // code shape) and fails the pin.
+  {
+    const label = 's26-o10-reconciliation-heal';
+    const local = [];
+    for (const row of rows) {
+      if (!isO10ReconciliationErrorRow(row)) continue;
+      if (!['PASS', 'FAIL', 'NOT_EVALUABLE'].includes(row.after)) {
+        local.push(`${row.caseId}/${row.attempt}/${row.oracle}: S26 invariant violated (stored O10 suite-ledger reconciliation ERROR must replay to its true verdict (PASS/FAIL/NOT_EVALUABLE), got ${row.after})`);
+      }
+    }
+    violations.push(...local);
+    checks.push({ label, ok: local.length === 0, violations: local });
+  }
+
+  // S26-I2 — flip scope: the ONLY allowed flips are the S26 classes (O10
+  // reconciliation heal, O9 replay-row heal). Any other flip — including any
+  // O10 non-reconciliation ERROR flip or any non-O10 change — violates.
+  {
+    const label = 's26-flip-scope';
+    const local = [];
+    for (const row of rows) {
+      if (row.delta !== 'flip') continue;
+      const key = `${row.caseId}/${row.attempt}/${row.oracle}`;
+      if (isO10ReconciliationErrorRow(row) && ['PASS', 'FAIL', 'NOT_EVALUABLE'].includes(row.after)) continue;
+      if (isO9ReplayRowHeal(row)) continue;
+      if (isO10ReconciliationErrorRow(row)) {
+        local.push(`${key}: S26 invariant violated (O10 reconciliation ERROR flipped to ${row.after}, not a true verdict)`);
+      } else {
+        local.push(`${key}: S26 invariant violated (flip ${row.before} -> ${row.after} outside the O10 reconciliation-ERROR -> true-verdict / O9 replay-row-heal classes)`);
+      }
+    }
+    violations.push(...local);
+    checks.push({ label, ok: local.length === 0, violations: local });
+  }
+
+  return { ok: violations.length === 0, violations, checks };
+}
+
+export function renderS26Report(verification) {
+  const lines = ['S26 invariant report (--verify-s26-invariants):'];
+  for (const check of verification.checks) {
+    lines.push(`  [${check.ok ? 'OK' : 'VIOLATION'}] ${check.label}`);
+  }
+  lines.push(`s26: ${verification.ok ? 'OK' : `FAILED (${verification.violations.length} violation(s))`}`);
+  return lines.join('\n');
+}
+
 export function renderInvariantReport(verification) {
   const mark = (ok) => (ok ? 'OK' : 'VIOLATION');
   const skip = (check) => {
@@ -855,6 +1020,7 @@ export function replayCampaign(options, io = {}) {
         oracle: pair.oracle,
         before,
         beforeFindingIds: readStoredFindings(pair.stdoutPath),
+        beforeFindings: readStoredFindingObjects(pair.stdoutPath),
         after,
         delta: before === after ? 'same' : 'flip',
         findingIds,
@@ -887,9 +1053,17 @@ export function replayCampaign(options, io = {}) {
     stdout(renderInvariantReport(invariants));
     for (const violation of invariants.violations) stderr(`tt-oracle-replay invariant violation: ${violation}`);
   }
+  const s26 = options.verifyS26Invariants === true
+    ? verifyS26Invariants({ rows })
+    : null;
+  if (s26 !== null) {
+    stdout(renderS26Report(s26));
+    for (const violation of s26.violations) stderr(`tt-oracle-replay S26 invariant violation: ${violation}`);
+  }
   if (options.jsonPath !== null) {
     const payload = { tool: 'tt-oracle-replay', campaign: campaignDir, rows, summary };
     if (invariants !== null) payload.invariants = invariants;
+    if (s26 !== null) payload.s26 = s26;
     fs.writeFileSync(options.jsonPath, `${JSON.stringify(payload, null, 2)}\n`);
     stdout(`tt-oracle-replay: machine-readable rows written to ${options.jsonPath}`);
   }
@@ -903,6 +1077,10 @@ export function replayCampaign(options, io = {}) {
   }
   if (invariants !== null && !invariants.ok) {
     stderr(`tt-oracle-replay: E3.B invariant verification FAILED (${invariants.violations.length} violation(s))`);
+    return 1;
+  }
+  if (s26 !== null && !s26.ok) {
+    stderr(`tt-oracle-replay: S26 invariant verification FAILED (${s26.violations.length} violation(s))`);
     return 1;
   }
   return 0;

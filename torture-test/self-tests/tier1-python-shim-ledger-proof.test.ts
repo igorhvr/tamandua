@@ -317,6 +317,22 @@ describe("US-011 python shim ledger proof (S10)", () => {
       if (workClonePath !== null) {
         fs.rmSync(workClonePath, { recursive: true, force: true });
       }
+      // Test-isolation (S26 US-006): remove the ledger row this proof
+      // inserted. The stand-in control-plane wrote it into the SHARED
+      // contained real DB (torture-test/var/home/.tamandua/tamandua.db), and
+      // the S26 fresh-campaign suite-state gate (tt-daemon-up ensure-up
+      // --fresh) refuses any non-empty suite_results at campaign start — a
+      // leftover row would make every later fresh real-campaign preflight
+      // (e.g. tt-controller-preflight.test.sh's AC3-real) fail closed. The
+      // shim's run id is unique per invocation, so this only ever removes the
+      // row this test created. db stays open until after(); it is a no-op if
+      // the insert never happened.
+      try {
+        db.prepare("DELETE FROM suite_results WHERE run_id = ?").run(dryRunId);
+      } catch {
+        // Best-effort cleanup: if the DB is unavailable the proof has already
+        // passed and the gate would have to be diagnosed separately.
+      }
     }
   });
 });

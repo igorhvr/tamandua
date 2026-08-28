@@ -252,6 +252,11 @@ const allowed = [
   // SQL-surface probe (bin/tt-schema-probe.mjs) to the daemon-up authoring
   // surface — same class as the build-version parity guard it sits beside.
   "torture-test/bin/tt-schema-probe.mjs",
+  // S26 (US-004): the campaign-start suite-state gate adds the read-only
+  // suite-results probe (bin/tt-suite-probe.mjs) to the daemon-up authoring
+  // surface — the schema-probe class extended from the SQL surface to the
+  // suite-ledger row count (FRESH campaigns only, ensure-up --fresh).
+  "torture-test/bin/tt-suite-probe.mjs",
   "torture-test/scenarios/lib/run-scripted-scenario",
   // MACP4 US-004: the four W2 scripted cells (scenarios/w2.21/run.mjs,
   // w2.23a/run.mjs, w2.23b/run.mjs, w2.23c/run.mjs) and the spawn env

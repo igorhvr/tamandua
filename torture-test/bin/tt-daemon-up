@@ -28,6 +28,33 @@
 #               PATH so adapter stubs (e.g. the managed pi-token-saver) are
 #               visible to the daemon's scheduler; an already-up daemon whose
 #               PATH lacks the prepend is restarted so the invariant holds.
+#   ensure-up --fresh
+#               S26 US-004: the FRESH-campaign suite-state gate. In addition
+#               to every ensure-up invariant above, verifies (via the
+#               read-only bin/tt-suite-probe.mjs seam, exactly like the
+#               schema-handshake leg) that the contained real daemon's
+#               `suite_results` ledger is EMPTY — a fresh campaign must start
+#               from KNOWN-CLEAN contained suite state (attempt-1's
+#               cross-campaign contamination: a contained-real-daemon DB
+#               carrying 106 rows since 08-13 poisoned O10/O9). A non-empty
+#               ledger FAILS CLOSED with the DISTINCT machine-parseable
+#               reason `suite-state-not-clean` (exit non-zero) and a DETAILS
+#               line telling the operator how to reset the contained real
+#               state. DESIGN (fail-closed, no automatic destructive reset):
+#               the real contained daemon deliberately has NO `reset-state`
+#               (the MACP7 reset-state asymmetry: scripted-only). We do NOT
+#               weaken that asymmetry — a non-empty suite means a PRIOR real
+#               campaign ran real test executions, and silently wiping that
+#               state (or reusing it) would hide or misattribute real
+#               evidence. Instead the preflight REFUSES and the operator
+#               performs the documented reset seam: (1) stop the contained
+#               daemon (`tt-daemon-up stop`), (2) remove the contained real
+#               state dir (`<TAMANDUA_STATE_DIR>` under torture-test/var —
+#               never ~/.tamandua or the 33xx daemon), (3) re-run; the next
+#               preflight re-provisions the home and the daemon start
+#               recreates a fresh DB. Resume NEVER requires an empty suite
+#               (resume reconciles prior state — MACP7's per-campaign
+#               minimum), so only the FRESH-campaign path threads --fresh.
 #   status      Report the real TT daemon state — READ ONLY, no side effects.
 #   stop        Stop the real TT daemon at campaign end (hygiene). FAILS
 #               CLOSED with the DISTINCT reason `tt-daemon-down` (exit
@@ -275,6 +302,88 @@ verify_schema_parity() {
   return 1
 }
 
+# ── S26 US-004: campaign-start suite-state gate (FRESH campaigns only) ───
+#
+# ensure-up --fresh must ALSO verify that the contained real daemon's
+# `suite_results` ledger is EMPTY before a FRESH campaign may start real case
+# execution (attempt-1's cross-campaign contamination: a contained-real-daemon
+# DB carrying 106 rows since 08-13 poisoned O10 AND O9). The probe
+# (tt-suite-probe.mjs) opens the DB READ-ONLY with node:sqlite
+# DatabaseSync({ readOnly: true }) and counts suite_results rows; a non-empty
+# count is a suite-state failure that FAILS CLOSED with the DISTINCT reason
+# `suite-state-not-clean` and operator guidance. Test seam (so the battery
+# builds a dirty/clean fixture DB under torture-test/var without touching the
+# real contained DB):
+#   TT_DAEMON_SUITE_PROBE_DB   override the DB path
+#
+# Gating: ONLY the FRESH-campaign path (tt-controller startCampaign) threads
+# `ensure-up --fresh`. The RESUME path (tt-controller resumeCampaign) calls
+# plain `ensure-up` and never requires an empty suite — a resume reconciles
+# the persisted state from the previous attempt (MACP7 per-campaign minimum:
+# resumeCampaign never resets). Scripted-only selections and zero-token dry
+# runs never engage the real preflight at all (realPreflightRequired).
+
+# resolve_suite_probe_db: the contained DB path to probe —
+# TT_DAEMON_SUITE_PROBE_DB override (test seam) or
+# <TAMANDUA_STATE_DIR from tt-env.sh>/tamandua.db. Empty when unresolvable
+# (caller fails closed — an unverifiable DB is never a silent pass).
+resolve_suite_probe_db() {
+  if [ -n "${TT_DAEMON_SUITE_PROBE_DB:-}" ]; then
+    printf '%s' "$TT_DAEMON_SUITE_PROBE_DB"
+    return 0
+  fi
+  local state_dir
+  state_dir="$(env -i bash "$TT_ENV_REAL" print 2>/dev/null | grep '^TAMANDUA_STATE_DIR=' | head -n1 | cut -d= -f2- || true)"
+  if [ -n "$state_dir" ]; then
+    printf '%s' "$state_dir/tamandua.db"
+    return 0
+  fi
+  return 0
+}
+
+# SUITE_ROWS: the probe's reported row count on failure. SUITE_DETAILS: the
+# probe's first DETAILS line on failure (embedded in the fail-closed report).
+SUITE_ROWS=""
+SUITE_DETAILS=""
+verify_suite_state() {
+  local db_path
+  db_path="$(resolve_suite_probe_db)"
+  if [ -z "$db_path" ]; then
+    SUITE_DETAILS="cannot resolve the contained DB path (no TAMANDUA_STATE_DIR / no TT_DAEMON_SUITE_PROBE_DB)"
+    log "campaign-start suite-state: ${SUITE_DETAILS} — fail closed."
+    return 1
+  fi
+  local probe_out probe_rc
+  set +e
+  probe_out="$(TT_DAEMON_SUITE_PROBE_DB="$db_path" node "$SCRIPT_DIR/tt-suite-probe.mjs" 2>&1)"
+  probe_rc=$?
+  set -e
+  SUITE_ROWS="$(printf '%s\n' "$probe_out" | grep '^SUITE_ROWS:' | head -n1 | sed 's/^SUITE_ROWS: //')"
+  if [ "$probe_rc" -eq 0 ] && printf '%s' "$probe_out" | grep -q '^SUITE: ok'; then
+    log "campaign-start suite-state: OK (DB '$db_path' suite_results is empty)."
+    SUITE_DETAILS=""
+    return 0
+  fi
+  SUITE_DETAILS="$(printf '%s\n' "$probe_out" | grep '^DETAILS:' | head -n1 | sed 's/^DETAILS: //')"
+  if [ -z "$SUITE_DETAILS" ]; then
+    SUITE_DETAILS="suite-state probe failed (exit $probe_rc) on DB '$db_path'"
+  fi
+  log "campaign-start suite-state: FAIL — $SUITE_DETAILS (probe exit $probe_rc)."
+  return 1
+}
+
+# fail_fresh_suite_state: the uniform FAIL-CLOSED report of the suite-state
+# gate — the DISTINCT machine-parseable REASON + operator guidance DETAILS
+# (the documented reset seam), exit 1, never a 'TT_DAEMON: up' line.
+fail_fresh_suite_state() {
+  local db_path
+  db_path="$(resolve_suite_probe_db)"
+  echo "REASON: suite-state-not-clean" >&2
+  echo "DETAILS: contained real TT daemon suite_results is not empty (${SUITE_ROWS:-0} row(s), DB '${db_path}'): ${SUITE_DETAILS:-suite-state probe could not verify the ledger}. A FRESH campaign must start from KNOWN-CLEAN contained suite state (S26). Reset the contained real state — (1) stop the contained daemon: torture-test/bin/tt-daemon-up stop; (2) remove the contained real state dir under torture-test/var (the TAMANDUA_STATE_DIR parent of this DB, e.g. rm -rf '<state-dir>'); (3) re-run — the next preflight re-provisions the home and the daemon start recreates a fresh DB. Never touch the operator's ~/.tamandua or the 33xx daemon." >&2
+  log "FAIL: contained real TT daemon suite_results is not empty — refusing to start a FRESH campaign against a dirty suite ledger." >&2
+  return 1
+}
+
 # stop_daemon_for_restart: stop the running contained daemon via
 # daemon-control and wait (bounded, the existing stop/settle pattern) for the
 # 43xx ports to free. Returns 0 on a clean stop, 1 when the daemon could not
@@ -405,6 +514,14 @@ cmd_ensure_up() {
         return 1
       fi
       if daemon_path_has_adapters_bin; then
+        # S26 US-004: a FRESH campaign must additionally start from
+        # KNOWN-CLEAN contained suite state (empty suite_results). Runs only
+        # under ensure-up --fresh; the resume path never requires an empty
+        # suite (resume reconciles prior state).
+        if [ "$FRESH" -eq 1 ] && ! verify_suite_state; then
+          fail_fresh_suite_state
+          return 1
+        fi
         log "real TT daemon started and verified UP with matching build + schema handshake + adapters-bin on PATH (control port $ctrl_port)."
         print_up "$ctrl_port"
         return 0
@@ -426,6 +543,11 @@ cmd_ensure_up() {
 
   # ── Already UP with matching build + schema handshake + adapters-bin → no-op ──
   log "real TT daemon already UP with matching build + schema handshake + adapters-bin on PATH (control port $ctrl_port) — no-op."
+  # S26 US-004: the FRESH-campaign suite-state gate (see the started path).
+  if [ "$FRESH" -eq 1 ] && ! verify_suite_state; then
+    fail_fresh_suite_state
+    return 1
+  fi
   print_up "$ctrl_port"
   return 0
 }
@@ -494,7 +616,7 @@ usage() {
   cat <<'EOF'
 tt-daemon-up — real TT daemon preflight lifecycle helper (E2.5 US-003).
 
-Usage: tt-daemon-up <ensure-up|status|stop> [--help]
+Usage: tt-daemon-up <ensure-up [--fresh]|status|stop> [--help]
 
 Manages the CONTAINED real TT daemon lifecycle around real-case execution,
 delegating all operations to the sanctioned bin/daemon-control `real` kind
@@ -520,12 +642,28 @@ Subcommands:
               daemon with it prepended to PATH (S12/E3.D US-009); an
               already-up daemon whose PATH lacks the prepend is restarted so
               the invariant holds.
+  ensure-up --fresh
+              S26 US-004 FRESH-campaign suite-state gate: additionally
+              verifies (bin/tt-suite-probe.mjs, read-only) that the contained
+              real daemon's suite_results ledger is EMPTY before the campaign
+              may start. A non-empty ledger FAILS CLOSED with the DISTINCT
+              reason 'suite-state-not-clean' (exit non-zero) and a DETAILS
+              line with operator guidance — reset the contained real state
+              (stop the contained daemon, remove the contained real state dir
+              under torture-test/var, re-run; the next preflight re-provisions
+              the home and a fresh DB is created). Refuse + documented
+              operator seam: the real contained daemon deliberately has NO
+              'reset-state' (MACP7 scripted-only asymmetry is NOT weakened —
+              a dirty real suite is prior real evidence, never silently
+              wiped). Resume NEVER requires an empty suite — only the
+              FRESH-campaign path threads --fresh.
   status      Report the real TT daemon state — read only, no side effects.
   stop        Stop the real TT daemon at campaign end (hygiene). FAILS CLOSED
               with the distinct reason 'tt-daemon-down' (exit non-zero) if a
               daemon/process remains or ports 43xx do not free up.
 
 Options:
+  --fresh     (ensure-up only) engage the campaign-start suite-state gate
   --help,-h   Show this help.
 
 Environment:
@@ -550,18 +688,28 @@ Environment:
                                     ... }); default is the exact
                                     tt-controller status SELECT surface.
                                     Test seam only.
+  TT_DAEMON_SUITE_PROBE_DB          DB path probed by the S26 campaign-start
+                                    suite-state gate (ensure-up --fresh;
+                                    default <TAMANDUA_STATE_DIR>/tamandua.db
+                                    from tt-env.sh). Test seam — point at a
+                                    dirty/clean fixture DB under
+                                    torture-test/var without touching the
+                                    real contained DB. Paths outside
+                                    torture-test/var are rejected by the
+                                    probe (containment guard).
 
 Examples:
-  tt-daemon-up ensure-up      # verify/bring up the contained real daemon (43xx)
-  tt-daemon-up status         # read-only status
-  tt-daemon-up stop           # stop it and verify ports 43xx are free
+  tt-daemon-up ensure-up            # verify/bring up the contained real daemon (43xx)
+  tt-daemon-up ensure-up --fresh    # FRESH campaign: also require an EMPTY suite_results
+  tt-daemon-up status               # read-only status
+  tt-daemon-up stop                 # stop it and verify ports 43xx are free
 
 Fail-closed: every successful path prints 'TT_DAEMON: up'/'TT_DAEMON: down';
-every failure prints 'REASON: tt-daemon-down' or 'REASON: tt-daemon-stale'
-on stderr and exits non-zero (tt-daemon-stale = the daemon's build version
-does not match the current tree / could not be verified, or the contained
-DB does not satisfy the tt-controller status SQL surface / could not be
-verified).
+every failure prints 'REASON: tt-daemon-down', 'REASON: tt-daemon-stale'
+(daemon build version mismatch/unverifiable, or the contained DB failing the
+tt-controller status SQL surface), or — under ensure-up --fresh only —
+'REASON: suite-state-not-clean' (the contained suite_results ledger is not
+empty at FRESH campaign start) on stderr and exits non-zero.
 A successful ensure-up additionally prints 'TT_DAEMON_PATH_PREPEND: <path>'
 (the contained adapters bin dir prepended to the daemon's PATH).
 EOF
@@ -578,6 +726,23 @@ case "$ACTION" in
     exit 0
     ;;
   ensure-up)
+    # S26 US-004: ensure-up [--fresh] — --fresh engages the campaign-start
+    # suite-state gate (a FRESH campaign must start with an EMPTY contained
+    # suite_results; the resume path calls plain ensure-up and never requires
+    # an empty suite).
+    FRESH=0
+    shift
+    for arg in "$@"; do
+      case "$arg" in
+        --fresh) FRESH=1 ;;
+        --help|-h) usage; exit 0 ;;
+        *)
+          echo "tt-daemon-up: ensure-up: unknown option '$arg'." >&2
+          echo "Usage: tt-daemon-up ensure-up [--fresh]" >&2
+          exit 2
+          ;;
+      esac
+    done
     cmd_ensure_up
     exit $?
     ;;

@@ -291,6 +291,21 @@ state, validated on load):
                                            recorded TEST_INFRA_FAIL 'deadline-expired'
                                            on this cadence regardless of any per-case
                                            monitor's status-poll health
+
+Real-case preflight (E2.5 US-004 + S26 US-004):
+  A campaign whose selection includes a real (non-scripted) case runs the
+  real-case preflight chain (home-provision -> [harness-auth] ->
+  catalog-install -> daemon-up) BEFORE any case executes, and stops the
+  contained real daemon (43xx) at campaign end / resume for hygiene. A FRESH
+  campaign's daemon-up leg is 'ensure-up --fresh': the contained real daemon's
+  suite_results ledger must be EMPTY (S26 campaign-start suite-state gate) —
+  a non-empty ledger FAILS CLOSED with the DISTINCT reason
+  'suite-state-not-clean' (cross-campaign contamination is impossible; the
+  operator resets the contained real state per the fail-closed seam
+  documented in bin/tt-daemon-up). A RESUME calls plain 'ensure-up' and never
+  requires an empty suite (resume reconciles prior state — MACP7 per-campaign
+  minimum). Scripted-only selections and TT_DRY_RUN_REAL_LAUNCH dry runs never
+  engage the real preflight.
 `);
 }
 
@@ -9120,7 +9135,14 @@ function requiredHarnessesFor(manifest) {
 // runs only when the current selection requires a real pi/hermes/dsh harness,
 // and is ordered after home-provision (which surfaces credentials) and before
 // catalog/daemon-up.
-function runRealPreflight(campaignDir, state, manifest) {
+//
+// S26 US-004 (fresh): `fresh` threads the campaign-start suite-state gate —
+// a FRESH campaign's daemon-up leg is `ensure-up --fresh` (the contained
+// real daemon's suite_results ledger must be EMPTY, fail-closed
+// suite-state-not-clean), while the RESUME path calls plain `ensure-up` (a
+// resume reconciles the persisted state from the previous attempt and must
+// NOT require an empty suite — MACP7's per-campaign minimum).
+function runRealPreflight(campaignDir, state, manifest, fresh) {
   let env;
   try {
     env = loadSpawnEnvironment(false);
@@ -9142,9 +9164,14 @@ function runRealPreflight(campaignDir, state, manifest) {
   if (requiredHarnesses.length > 0) {
     legs.push({ label: 'harness-auth', script: PREFLIGHT_AUTH_PATH, args: requiredHarnesses, reason: 'harness-auth-missing' });
   }
+  // S26 US-004: a FRESH campaign threads `ensure-up --fresh` so the
+  // daemon-up leg ALSO verifies the contained suite_results ledger is empty
+  // (fail-closed suite-state-not-clean); the resume path calls plain
+  // `ensure-up` and never requires an empty suite.
+  const daemonUpArgs = fresh ? ['ensure-up', '--fresh'] : ['ensure-up'];
   legs.push(
     { label: 'catalog-install', script: PREFLIGHT_CATALOG_PATH, args: [], reason: 'catalog-missing' },
-    { label: 'daemon-up', script: PREFLIGHT_DAEMON_PATH, args: ['ensure-up'], reason: 'tt-daemon-down' },
+    { label: 'daemon-up', script: PREFLIGHT_DAEMON_PATH, args: daemonUpArgs, reason: 'tt-daemon-down' },
   );
   const outcomes = [];
   for (const leg of legs) {
@@ -9293,9 +9320,12 @@ async function startCampaign(options, schema) {
     // real cases never launch into an unprovisioned home. A failing leg aborts
     // the campaign closed with a DISTINCT reason. The daemon is stopped in the
     // finally/teardown path (both on success and on any preflight/exec error).
+    // S26 US-004: a FRESH campaign threads the campaign-start suite-state
+    // gate (ensure-up --fresh: the contained suite_results ledger must be
+    // EMPTY, fail-closed suite-state-not-clean).
     if (realPreflightRequired(manifest, state)) {
       teardownState = state;
-      runRealPreflight(campaignDir, state, manifest);
+      runRealPreflight(campaignDir, state, manifest, true);
     } else if (scriptedCatalogInstallRequired(manifest, state)) {
       // T2.1 US-010: scripted-only campaigns need the bundled catalog in the
       // SCRIPTED home (the scripted WORKFLOW cases launch against it); a
@@ -9411,9 +9441,13 @@ async function resumeCampaign(options, schema) {
     await reconcilePersistedDiscoveredRuns(manifest, state, campaignDir);
     // E2.5 US-004: on resume we verify the real-case preflight again before
     // further real-case execution, and stop the daemon in teardown for hygiene.
+    // S26 US-004: a RESUME calls plain ensure-up (fresh=false) — the
+    // suite-state gate is FRESH-campaign-only; a resume reconciles the
+    // persisted state from the previous attempt and must NOT require an
+    // empty suite_results (MACP7 per-campaign minimum).
     if (realPreflightRequired(manifest, state)) {
       teardownState = state;
-      runRealPreflight(campaignDir, state, manifest);
+      runRealPreflight(campaignDir, state, manifest, false);
     } else if (scriptedCatalogInstallRequired(manifest, state)) {
       // T2.1 US-010: same for scripted-only resumes (fresh scripted home).
       runScriptedCatalogInstall(campaignDir, state, manifest);

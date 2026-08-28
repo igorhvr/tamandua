@@ -50,14 +50,22 @@ test('O10 enforces FMIS cells, launch inheritance, scoped already-landed accepta
     const generated = spawnSync(process.execPath, [GENERATOR, workspace], { encoding: 'utf8', shell: false });
     assert.equal(generated.status, 0, generated.stderr);
     const names = fs.readdirSync(workspace).filter((name) => name.startsWith('o10-')).sort();
-    assert.equal(names.length, 27);
+    assert.equal(names.length, 29);
     assert.equal(names.filter((name) => name.includes('-mutation')).length, 10);
     for (const name of names) {
       const { expectation, response, status } = invokeFixture(workspace, name);
       assert.equal(response.result, expectation.expected, `${name}: ${JSON.stringify(response)}`);
-      assert.equal(status, { PASS: 0, FAIL: 1, NOT_EVALUABLE: 3 }[expectation.expected], name);
+      assert.equal(status, { PASS: 0, FAIL: 1, ERROR: 2, NOT_EVALUABLE: 3 }[expectation.expected], name);
       if (expectation.finding) {
         assert.ok(response.findings.some((finding) => finding.id === expectation.finding), `${name} omitted ${expectation.finding}`);
+      }
+      if (expectation.expected === 'ERROR') {
+        // S26 in-scope mismatch red-arm: fail-closed with the existing message.
+        assert.equal(response.evidence.length, 0, `${name} ERROR evidence`);
+        assert.equal(response.findings.length, 1, `${name} ERROR findings`);
+        assert.equal(response.findings[0].id, 'ORACLE_RUNTIME_ERROR', name);
+        assert.match(response.findings[0].summary, /suite_ledger does not reconcile byte-for-field with the read-only database snapshot/, name);
+        continue;
       }
       assert.equal(response.evidence.length, 1, `${name} evidence`);
       const observation = JSON.parse(fs.readFileSync(path.join(workspace, name, 'evidence', response.evidence[0].path), 'utf8'));
@@ -73,6 +81,12 @@ test('O10 enforces FMIS cells, launch inheritance, scoped already-landed accepta
       assert.equal(observation.run_count, 1);
       assert.equal(observation.runs[0].expected.evidence, expectation.evidence);
       assert.equal(observation.runs[0].expected.mode, expectation.mode);
+      if (name === 'o10-scoped-foreign-db-rows') {
+        // S26 foreign-origin red-arm: DB rows outside the case's suite-origin
+        // scope (stale cross-campaign/intra-campaign) are ignored — PASS with
+        // zero findings, never a reconciliation ERROR.
+        assert.equal(response.findings.length, 0, `${name} foreign rows must not produce findings`);
+      }
     }
   } finally {
     fs.rmSync(workspace, { recursive: true, force: true });

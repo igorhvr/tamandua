@@ -14,6 +14,8 @@ if (workspace === varRoot || !workspace.startsWith(`${varRoot}${path.sep}`) || !
 const RUN_ID = 'run-10101010-1010-4010-8010-101010101010';
 const DB_RUN_ID = RUN_ID.slice(4);
 const ORIGIN = '/torture-test/fixtures/synthetic-o10';
+const EVENT_ORIGIN = '/torture-test/fixtures/synthetic-o10-event-origin';
+const FOREIGN_ORIGIN = '/torture-test/fixtures/synthetic-o10-foreign-case';
 const TREE = 'a'.repeat(40);
 const BEFORE = 'b'.repeat(40);
 const AFTER = 'c'.repeat(40);
@@ -54,6 +56,11 @@ const CASES = MODES.flatMap((mode) => EVIDENCE.map((evidence) => ({
   { name: 'o10-rugpull-replacement-launch-invariant', expected: 'PASS', mode: MODES[1], evidence: 'green', replacement: true },
   { name: 'o10-rugpull-replacement-context-laundered-mutation', expected: 'FAIL', mode: MODES[1], evidence: 'green', mutation: 'context-laundered', replacement: true, finding: 'O10_LAUNCH_INTENT_MUTATION' },
   { name: 'o10-null-gate-key', expected: 'NOT_EVALUABLE', mode: MODES[1], evidence: 'missing', nullGateKey: true },
+  // S26 scoped-reconciliation red-arm: foreign-origin rows accumulated by
+  // multi-case campaigns (stale cross-campaign or intra-campaign) are foreign
+  // per S13 doctrine, never reconciliation failures.
+  { name: 'o10-scoped-foreign-db-rows', expected: 'PASS', mode: MODES[1], evidence: 'green', foreignDbRows: true },
+  { name: 'o10-scoped-in-scope-mismatch', expected: 'ERROR', mode: MODES[1], evidence: 'green', inScopeMismatch: true },
 ]);
 
 function sha256(content) { return createHash('sha256').update(content).digest('hex'); }
@@ -123,6 +130,27 @@ for (const fixture of CASES) {
     created_at: fixture.ledgerEvidence === 'later-exact-red' ? '2026-08-01T12:11:00.000Z' : '2026-08-01T12:04:00.000Z',
   };
   const rows = fixture.evidence === 'missing' && fixture.ledgerEvidence === undefined ? [] : [row];
+  // S26: the snapshotter scoped suite-ledger.json to the case's suite origins
+  // (gate-key origin + captured event originRepo); O10 recomputes the same
+  // scope. These fixtures put rows OUTSIDE that scope into the database to
+  // prove they are treated as foreign (never reconciliation failures), and
+  // one fixture tampers an IN-SCOPE row to prove fail-closed detection.
+  let dbRows = rows;
+  if (fixture.foreignDbRows) {
+    const eventOriginRow = { ...row, id: 2, origin_repo: EVENT_ORIGIN, exit_code: 0, log_tail: 'event-origin green', created_at: '2026-08-01T12:06:00.000Z' };
+    const foreignRows = [
+      { ...row, id: 3, origin_repo: FOREIGN_ORIGIN, exit_code: 3, duration_ms: 111, log_tail: 'foreign stale row A', created_at: '2026-07-20T10:00:00.000Z' },
+      { ...row, id: 4, origin_repo: FOREIGN_ORIGIN, exit_code: 4, duration_ms: 222, log_tail: 'foreign stale row B', created_at: '2026-07-21T10:00:00.000Z' },
+    ];
+    rows.push(eventOriginRow);
+    dbRows = [row, eventOriginRow, ...foreignRows];
+  }
+  if (fixture.inScopeMismatch) {
+    dbRows = [
+      { ...row, exit_code: row.exit_code === 0 ? 17 : 0, log_tail: 'in-scope tampered row' },
+      { ...row, id: 2, origin_repo: FOREIGN_ORIGIN, exit_code: 3, duration_ms: 111, log_tail: 'foreign stale row', created_at: '2026-07-20T10:00:00.000Z' },
+    ];
+  }
   let expected = expectedCell(fixture.mode, fixture.evidence);
   if (fixture.mutation === 'concedes' || fixture.mutation === 'lands-red') {
     expected = { lands: true, reroutes: 1, mergerInvocations: 1, annotations: fixture.mutation === 'concedes'
@@ -167,7 +195,7 @@ for (const fixture of CASES) {
       0, 0, 0, '2026-08-01T12:03:00.000Z',
     );
   }
-  for (const suiteRow of rows) database.prepare('INSERT INTO suite_results VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(...Object.values(suiteRow));
+  for (const suiteRow of dbRows) database.prepare('INSERT INTO suite_results VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(...Object.values(suiteRow));
   database.close();
   fs.chmodSync(databasePath, 0o400);
 
@@ -182,7 +210,10 @@ for (const fixture of CASES) {
   }, 3));
   if (fixture.mutation === 'missing-override') events.splice(events.findIndex((entry) => entry.event === 'merge.gate_overridden'), 1);
   if (fixture.mutation === 'missing-accepted-event') events.splice(events.findIndex((entry) => entry.event === 'merge.accepted_already_landed'), 1);
-  if (expected.lands && !fixture.alreadyLanded) events.push(event('merge.landed', { stepId: 'finalize_merge', expectedTip: BEFORE, mergedCommit: AFTER, mergedTree: TREE }, 4));
+  if (expected.lands && !fixture.alreadyLanded) events.push(event('merge.landed', {
+    stepId: 'finalize_merge', expectedTip: BEFORE, mergedCommit: AFTER, mergedTree: TREE,
+    ...(fixture.foreignDbRows ? { originRepo: EVENT_ORIGIN } : {}),
+  }, 4));
   events.push(event(`run.${status}`, {}, 5));
 
   const references = Object.fromEntries(REFERENCE_KEYS.map((name) => [name, null]));

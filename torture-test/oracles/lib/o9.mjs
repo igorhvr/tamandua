@@ -161,6 +161,12 @@ function readLedger(file) {
   return rows;
 }
 
+// S26 (US-003): the reconciliation reads the FULL suite_results ledger once,
+// then derives the case-bundle/current-attempt scoped projection from it.
+// The unscoped `all` rows are kept so replay row-resolution can distinguish
+// a row that exists in the database but is foreign/stale to this case
+// (annotated/skipped per S13 doctrine) from a row id that exists nowhere
+// (the genuine O9_REPLAY_ROW_MISSING class — fail-closed invariant).
 function readDatabaseLedger(invocation, bundleOrigins, runSet, referencedRowIds) {
   const database = openEvidenceDatabase(invocation);
   try {
@@ -168,13 +174,54 @@ function readDatabaseLedger(invocation, bundleOrigins, runSet, referencedRowIds)
     const required = ['id', 'origin_repo', 'tree_hash', 'cmd_hash', 'cmd_display', 'exit_code', 'duration_ms', 'log_tail', 'run_id', 'step_id', 'created_at'];
     const missing = required.filter((column) => !columns.has(column));
     if (missing.length > 0) throw new OracleRuntimeError(`suite_results snapshot lacks required columns: ${missing.join(', ')}`);
-    return database.prepare(`SELECT ${required.join(', ')} FROM suite_results ORDER BY id`).all()
-      .filter((row) => bundleOrigins.has(row.origin_repo))
-      .filter((row) => isCurrentAttemptRow(row, runSet, referencedRowIds))
+    const all = database.prepare(`SELECT ${required.join(', ')} FROM suite_results ORDER BY id`).all()
       .map((row, index) => suiteRowShape(row, `suite_results[${index}]`));
+    const scoped = all
+      .filter((row) => bundleOrigins.has(row.origin_repo))
+      .filter((row) => isCurrentAttemptRow(row, runSet, referencedRowIds));
+    return { all, scoped };
   } finally {
     database.close();
   }
+}
+
+// S26 (US-003): classify a replay's unresolved ledger row. A replay whose
+// ledger_row_id cannot be found in the case's in-scope ledger is either (a)
+// a row that exists but was excluded from the scope — a foreign-origin or
+// stale-attempt row that must be annotated/skipped per S13 doctrine, never a
+// missing-row finding — or (b) a genuinely absent row id (exists nowhere in
+// the artifact or the database snapshot), which keeps the fail-closed
+// O9_REPLAY_ROW_MISSING finding. A null ledger_row_id is the snapshotter's
+// "unresolved cache hit": the shim mechanically replayed a green cached row
+// (marker TAMANDUA-TEST CACHED) that the case's scoped evidence cannot
+// attribute — the row was stale/foreign (reused fixture origin across
+// campaigns/attempts) or re-recorded by shim hygiene before the snapshot.
+// The cache hit is a mechanical fact, so the attribution gap is annotated,
+// never a missing-row finding (attempt-1 W4.01/W4.02 shape).
+function classifyUnresolvedReplayRow(replay, skippedForeign, skippedStale, databaseRowsById, bundleOrigins) {
+  const rowId = replay.ledger_row_id;
+  if (Number.isSafeInteger(rowId) && rowId > 0) {
+    const foreign = skippedForeign.find((row) => row.id === rowId);
+    if (foreign !== undefined) {
+      return { reason: 'foreign-origin', origin_repo: foreign.origin_repo, artifact_row: true };
+    }
+    const stale = skippedStale.find((row) => row.id === rowId);
+    if (stale !== undefined) {
+      return { reason: 'stale-attempt', origin_repo: stale.origin_repo, run_id: stale.run_id, artifact_row: true };
+    }
+    const databaseRow = databaseRowsById.get(rowId);
+    if (databaseRow !== undefined) {
+      const foreignOrigin = !bundleOrigins.has(databaseRow.origin_repo);
+      return {
+        reason: foreignOrigin ? 'foreign-origin' : 'stale-attempt',
+        origin_repo: databaseRow.origin_repo,
+        run_id: databaseRow.run_id,
+        database_row: true,
+      };
+    }
+    return null;
+  }
+  return { reason: 'unresolved-cache-hit' };
 }
 
 function readCaseBundleOrigins(invocation) {
@@ -387,7 +434,15 @@ export async function evaluateO9(invocation) {
   const skippedForeign = ledger.filter((row) => !bundleOrigins.has(row.origin_repo));
   const skippedStale = ledger.filter((row) => bundleOrigins.has(row.origin_repo) && !isCurrentAttemptRow(row, runSet, referencedRowIds));
   const inScopeLedger = ledger.filter((row) => bundleOrigins.has(row.origin_repo) && isCurrentAttemptRow(row, runSet, referencedRowIds));
-  const databaseLedger = readDatabaseLedger(invocation, bundleOrigins, runSet, referencedRowIds);
+  const databaseRows = readDatabaseLedger(invocation, bundleOrigins, runSet, referencedRowIds);
+  const databaseLedger = databaseRows.scoped;
+  const databaseRowsById = new Map(databaseRows.all.map((row) => [row.id, row]));
+  // S26 (US-003): DB-side foreign/stale rows are annotated in the evidence the
+  // same way the artifact-side skips are — foreign per S13 doctrine, never a
+  // reconciliation error (the byte-for-field compare below already excludes
+  // them from the scoped projection).
+  const skippedDbForeign = databaseRows.all.filter((row) => !bundleOrigins.has(row.origin_repo));
+  const skippedDbStale = databaseRows.all.filter((row) => bundleOrigins.has(row.origin_repo) && !isCurrentAttemptRow(row, runSet, referencedRowIds));
   if (JSON.stringify(inScopeLedger) !== JSON.stringify(databaseLedger)) throw new OracleRuntimeError('suite_ledger does not reconcile exactly with read-only suite_results for case-bundle origins');
   const rowsById = new Map(inScopeLedger.map((row) => [row.id, row]));
   const findings = new FindingCollector();
@@ -418,6 +473,7 @@ export async function evaluateO9(invocation) {
   }
   const replayRows = [];
   const forceExecutions = [];
+  const skippedReplayRows = [];
   for (const [invocationId, group] of invocations) {
     const phases = group.map((row) => row.phase);
     const first = group[0];
@@ -437,7 +493,19 @@ export async function evaluateO9(invocation) {
       if (phases.length !== 2 || phases[1] !== 'replay' || execute !== undefined || record !== undefined) addStateFinding(findings, invocationId, ['lookup', 'replay'], phases);
       const ledgerRow = rowsById.get(replay.ledger_row_id);
       if (ledgerRow === undefined) {
-        findings.add('O9_REPLAY_ROW_MISSING', 'replay named a suite_results row absent from the captured ledger', { invocation_id: invocationId, ledger_row_id: replay.ledger_row_id });
+        // S26 (US-003): a replay whose named row is not in the case's scoped
+        // ledger is annotated/skipped when the row is foreign or stale (S13
+        // doctrine — foreign evidence is never a reconciliation failure), and
+        // an unresolved cache hit (null ledger_row_id) is an attribution gap,
+        // not a missing row. O9_REPLAY_ROW_MISSING fires only when the row id
+        // exists nowhere — neither in the artifact nor in the database
+        // snapshot (defensive fail-closed invariant).
+        const unresolved = classifyUnresolvedReplayRow(replay, skippedForeign, skippedStale, databaseRowsById, bundleOrigins);
+        if (unresolved === null) {
+          findings.add('O9_REPLAY_ROW_MISSING', 'replay named a suite_results row absent from the captured ledger', { invocation_id: invocationId, ledger_row_id: replay.ledger_row_id });
+        } else {
+          skippedReplayRows.push({ ledger_row_id: replay.ledger_row_id, ...unresolved });
+        }
       } else {
         if (!sameKey(replay, ledgerRow) || lookup?.latest_row_id !== ledgerRow.id) {
           findings.add('O9_REPLAY_KEY_MISMATCH', 'replay row does not match the exact lookup origin/tree/command key', { invocation_id: invocationId, ledger_row_id: ledgerRow.id });
@@ -584,6 +652,13 @@ export async function evaluateO9(invocation) {
     skipped_foreign_row_ids: skippedForeign.map((row) => row.id),
     skipped_stale_rows: skippedStale.length,
     skipped_stale_row_ids: skippedStale.map((row) => row.id),
+    skipped_db_foreign_rows: skippedDbForeign.length,
+    skipped_db_foreign_row_ids: skippedDbForeign.map((row) => row.id),
+    skipped_db_stale_rows: skippedDbStale.length,
+    skipped_db_stale_row_ids: skippedDbStale.map((row) => row.id),
+    skipped_replay_rows: skippedReplayRows.length,
+    skipped_replay_row_ids: skippedReplayRows.map((row) => row.ledger_row_id),
+    skipped_replay_row_reasons: skippedReplayRows.map((row) => row.reason),
     committed_tree_count: reachableTrees.size,
     observation_count: observations.length,
     invocation_count: invocations.size,

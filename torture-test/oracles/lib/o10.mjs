@@ -261,7 +261,19 @@ export function evaluateO10(invocation) {
   const events = readEvents(invocation.evidencePaths.run_events);
   const artifactLedger = readLedger(invocation.evidencePaths.suite_ledger);
   const database = readDatabase(invocation);
-  if (JSON.stringify(artifactLedger.map(normalizedLedgerRow)) !== JSON.stringify(database.ledger.map(normalizedLedgerRow))) {
+  // S26: reconcile WITHIN the case's suite-origin scope. The snapshotter
+  // scoped suite-ledger.json to the gate-key origin + captured event origins
+  // (bin/oracle-evidence-snapshot.mjs ~:1150-1157); O10 recomputes the SAME
+  // scope from its own inputs and treats rows from any other origin as
+  // foreign (S13 doctrine), never as reconciliation failures. In-scope
+  // tamper detection stays byte-for-field fail-closed.
+  const suiteOrigins = new Set([launch.gateKey.origin_repo]);
+  for (const event of events) {
+    if (typeof event.originRepo === 'string' && event.originRepo.length > 0) suiteOrigins.add(event.originRepo);
+  }
+  const scopedArtifactLedger = artifactLedger.filter((row) => suiteOrigins.has(row.origin_repo));
+  const scopedDatabaseLedger = database.ledger.filter((row) => suiteOrigins.has(row.origin_repo));
+  if (JSON.stringify(scopedArtifactLedger.map(normalizedLedgerRow)) !== JSON.stringify(scopedDatabaseLedger.map(normalizedLedgerRow))) {
     throw new OracleRuntimeError('suite_ledger does not reconcile byte-for-field with the read-only database snapshot');
   }
   const projected = [...invocation.context.attempts, ...invocation.context.discovered_runs]
@@ -296,7 +308,7 @@ export function evaluateO10(invocation) {
       ?? refusalValues.get('TREE_HASH');
     if (typeof tree !== 'string' || tree.length === 0) throw new OracleRuntimeError(`run ${runId} has no mechanically attested gate tree`);
     const decisionMs = timestamp(step.updated_at, `run ${runId} finalize updated_at`);
-    const evidence = suiteEvidence(artifactLedger, launch.gateKey, tree, decisionMs);
+    const evidence = suiteEvidence(scopedArtifactLedger, launch.gateKey, tree, decisionMs);
     const concessionEvents = runEvents.filter((event) => event.event === 'merge.landed_without_suite_evidence');
     for (const concession of concessionEvents) {
       if (concession.origin !== launch.gateKey.origin_repo

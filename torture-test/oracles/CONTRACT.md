@@ -434,7 +434,8 @@ The O2 mode-reconciliation layer binds its exact suite key to
 recorded reason instead of throwing. The `suite_ledger`/`suite_results`
 reconcile is scoped to the case bundle — the gate-key origin plus origins
 carried by the case's own captured run events — so rows of sibling cases that
-share a command hash or tree cannot contaminate it. Ordinary
+share a command hash or tree cannot contaminate it (see the shared
+case-bundle suite-scope contract below). Ordinary
 landings require at least one captured `suite_results` row for that exact
 `(origin_repo, merged_tree, cmd_hash)` key. A default concession instead requires
 exactly one matching `merge.landed_without_suite_evidence` event, no exact-key
@@ -504,6 +505,34 @@ Progress/report/transport filenames are rejected across the complete terminal tr
 including `progress*`, `report*`, `transport*`, Tamandua report/reason/story transports,
 and story input/output transport files.
 
+### Case-bundle suite-scope contract (S26, shared by O2/O9/O10)
+
+The suite-ledger oracles (O2, O9, O10) reconcile the captured
+`suite_ledger.json` artifact against the read-only `suite_results` table
+**within the case's suite-origin scope**, derived identically everywhere:
+
+- **Scope derivation:** `{ launch_intent.gate_key.origin_repo } ∪ { event.originRepo
+  for every captured run_events row }` — the same derivation the snapshotter uses
+  when it scopes `suite-ledger.json` (`bin/oracle-evidence-snapshot.mjs`). O2 and O9
+  may additionally apply their per-oracle attempt/run scoping (O9's current-attempt
+  row filter, S21) on top of the origin scope.
+- **Foreign-row doctrine (S13):** a `suite_results` row whose `origin_repo` is
+  outside the case's suite-origin scope is **foreign evidence** — legacy snapshot
+  contamination from sibling cases or reused cross-campaign fixture paths. Foreign
+  rows are annotated and skipped, never reconciliation failures. This is symmetric:
+  foreign rows in the artifact (`skipped_foreign_row_ids`) and foreign rows present
+  only in the database snapshot (`skipped_db_foreign_row_ids`) are both ignored.
+- **Stale-row doctrine (S21):** a row inside the origin scope but written by a prior
+  campaign attempt (run id outside the current case's run set, or unattributable) is
+  **stale evidence** for the current case — annotated and skipped
+  (`skipped_stale_row_ids` artifact-side, `skipped_db_stale_row_ids` DB-side), never
+  a reconciliation failure.
+- **In-scope byte-for-field fail-closed reconciliation:** after both sides are
+  filtered to the scope, the scoped artifact rows and the scoped DB rows must be
+  byte-for-field identical; any in-scope discrepancy throws `ORACLE_RUNTIME_ERROR`
+  with the oracle's exact reconciliation message. Tamper detection inside the scope
+  is never weakened by the foreign/stale doctrine.
+
 ### O9 ledger-key and replay interpretation
 
 O9 reconciles the captured `suite_ledger.rows` byte-for-field with a read-only query of
@@ -514,7 +543,12 @@ origin falls outside that bundle are foreign evidence — legacy snapshot
 contamination from sibling cases — and are SKIPPED: excluded from the DB
 reconcile and tree resolution and annotated in the `o9-ledger-replay-audit.json`
 evidence as `skipped_foreign_rows` (count) and `skipped_foreign_row_ids` (row
-ids), never fatal. A null gate key that leaves no event-carried origin (an
+ids), never fatal. Rows inside the bundle but outside the current attempt
+(prior-campaign run ids over a reused fixture origin) are skipped and annotated
+as `skipped_stale_rows`/`skipped_stale_row_ids`. DB-side rows excluded by the
+same two filters are annotated as `skipped_db_foreign_rows`/
+`skipped_db_foreign_row_ids` and `skipped_db_stale_rows`/`skipped_db_stale_row_ids`.
+A null gate key that leaves no event-carried origin (an
 empty case bundle) is degraded evidence and reports `NOT_EVALUABLE`. Every
 in-scope row's `tree_hash`
 must be a tree object used by a reachable commit in the isolated captured Git snapshot.
@@ -531,8 +565,33 @@ carries its positive `ledger_row_id` when reconciliation succeeds (or null when 
 mechanical cache-hit observation names no valid prior row), exit code, full current `committed_tree_hash`, and the exact
 mechanically observed marker `TAMANDUA-TEST CACHED`. These fields are controller/shim
 observations, not captured stdout or agent prose. An unresolved cache hit is preserved
-as a complete lookup/replay invocation so O9 emits `O9_REPLAY_ROW_MISSING`; harvesting
+as a complete lookup/replay invocation; harvesting
 must never drop an invalid invocation merely because another invocation is valid.
+
+**S26 replay row-resolution (US-003):** a replay's `ledger_row_id` must resolve in
+the case's in-scope ledger. When it does not, O9 classifies the gap before any
+finding:
+
+- The row id is an artifact row excluded by the scope filters (foreign origin or
+  stale attempt) or a database row excluded the same way → the replay is annotated
+  under `skipped_replay_row_ids`/`skipped_replay_row_reasons` (reason
+  `foreign-origin` or `stale-attempt`) and **no** `O9_REPLAY_ROW_MISSING` fires.
+- The replay carries `ledger_row_id: null` (the snapshotter could not attribute the
+  cache hit within the case's scoped artifact) → the shim mechanically replayed a
+  green cached row (`TAMANDUA-TEST CACHED` marker, exit 0) that the case scope
+  cannot resolve — the row was foreign/stale (reused fixture origin across
+  campaigns/attempts) or re-recorded by shim row hygiene before the snapshot. The
+  cache hit is a mechanical fact; the attribution gap is annotated
+  (`skipped_replay_row_ids`/`skipped_replay_row_reasons` reason
+  `unresolved-cache-hit`) and **no** `O9_REPLAY_ROW_MISSING` fires.
+- The row id exists **nowhere** — neither in the artifact nor in the database
+  snapshot — → `O9_REPLAY_ROW_MISSING` fires (fail-closed invariant; a replay can
+  only ever name a row that existed in the shim's database at event time, so this
+  branch is defensive).
+
+The replay's mechanical legs that do not depend on the resolved row — the
+`TAMANDUA-TEST CACHED` marker and the unchanged committed tree with exit zero — are
+still checked for every replay, including skipped ones.
 
 The artifact also contains three required arrays. `origin_identities` maps every ledger
 or observation `origin_repo` to the absolute, lexically normalized git-common-dir

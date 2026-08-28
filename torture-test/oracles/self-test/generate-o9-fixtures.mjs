@@ -59,8 +59,11 @@ const CASES = [
   { name: 'o9-special-exit-origin-missing', expected: 'FAIL', mutation: 'special-exit-origin-missing', finding: 'O9_ORIGIN_IDENTITY_MISSING' },
   { name: 'o9-cross-origin-green', expected: 'PASS', mutation: 'cross-origin-green' },
   { name: 'o9-cross-origin-replay', expected: 'FAIL', mutation: 'cross-origin-replay', finding: 'O9_CROSS_ORIGIN_EVIDENCE' },
-  { name: 'o9-foreign-ledger-rows', expected: 'PASS', mutation: 'foreign-ledger', skippedRows: 1 },
+  { name: 'o9-foreign-ledger-rows', expected: 'PASS', mutation: 'foreign-ledger', skippedRows: 1, skippedDbForeignRows: 1 },
   { name: 'o9-stale-attempt-ledger', expected: 'PASS', mutation: 'stale-attempt-ledger', skippedStaleRows: 1 },
+  { name: 'o9-foreign-db-rows', expected: 'PASS', mutation: 'foreign-db-rows', skippedDbForeignRows: 1 },
+  { name: 'o9-unresolved-cache-hit', expected: 'PASS', mutation: 'unresolved-cache-hit', skippedReplayRows: 1 },
+  { name: 'o9-in-scope-mismatch', expected: 'ERROR', mutation: 'in-scope-mismatch' },
   { name: 'o9-empty-observations', expected: 'NOT_EVALUABLE', mutation: 'empty-observations' },
   { name: 'o9-null-gate-key', expected: 'NOT_EVALUABLE', mutation: 'null-gate-key' },
 ];
@@ -136,7 +139,15 @@ for (const fixture of CASES) {
   }];
   const replayKey = fixture.mutation === 'wrong-key' ? key(committedTree, OTHER_CMD_HASH) : key(ledgerTree);
   const replayForce = fixture.mutation === 'force-skipped';
-  const replayRowId = fixture.mutation === 'missing-replay-row' ? null : 1;
+  // S26 (US-003): `missing-replay-row` names a positive row id (999) that
+  // exists nowhere — neither in the captured ledger nor in the database
+  // snapshot — which keeps O9_REPLAY_ROW_MISSING fail-closed. An
+  // `unresolved-cache-hit` (the attempt-1 W4.01/W4.02 cross-campaign shape)
+  // names no attributable prior row (null): the shim mechanically replayed a
+  // green cached row that the case's scoped evidence cannot resolve, so it is
+  // annotated/skipped, never a missing-row finding.
+  const replayRowId = fixture.mutation === 'missing-replay-row' ? 999
+    : fixture.mutation === 'unresolved-cache-hit' ? null : 1;
   const observations = [
     observation('obs-1', 'inv-replay', 1, 'lookup', '2026-08-01T12:04:59.000Z', replayKey, replayForce, { latest_row_id: 1 }),
     observation('obs-2', 'inv-replay', 2, 'replay', '2026-08-01T12:05:00.000Z', replayKey, replayForce, {
@@ -313,6 +324,25 @@ for (const fixture of CASES) {
     });
   }
 
+  // S26 (US-003): DB-only rows are present in the database snapshot but NOT in
+  // the scoped suite-ledger.json artifact. `foreign-db-rows` models the
+  // cross-campaign contamination class: a row for a foreign origin (a sibling
+  // case's fixture, or a previous campaign's reused fixture path) that O9's
+  // case-bundle reconciliation must ignore — annotated as
+  // skipped_db_foreign_row_ids, never a reconciliation ERROR.
+  const dbOnlyRows = [];
+  if (fixture.mutation === 'foreign-db-rows') {
+    originIdentities.push({ origin_repo: OTHER_ORIGIN, normalized_origin_repo: OTHER_ORIGIN });
+    dbOnlyRows.push({
+      id: 2, origin_repo: OTHER_ORIGIN, tree_hash: 'f'.repeat(40), cmd_hash: OTHER_CMD_HASH, cmd_display: 'npm run test:other',
+      exit_code: 0, duration_ms: 1000, log_tail: null, run_id: RUN_ID, step_id: 'foreign-db-row', created_at: '2026-08-01T12:06:00.000Z',
+    });
+  }
+  // `in-scope-mismatch` models in-scope tamper: the artifact row and the DB
+  // row share the case-bundle origin, but the DB copy was altered (exit_code
+  // 0 -> 1) — O9 must fail closed with ORACLE_RUNTIME_ERROR, never PASS.
+  const dbTamperedRowIds = new Set(fixture.mutation === 'in-scope-mismatch' ? [1] : []);
+
   const databasePath = path.join(snapshots, 'database.sqlite');
   const database = new DatabaseSync(databasePath);
   database.exec(`CREATE TABLE suite_results (
@@ -323,7 +353,10 @@ for (const fixture of CASES) {
   const insert = database.prepare(`INSERT INTO suite_results
     (id, origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, log_tail, run_id, step_id, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
-  for (const row of rows) insert.run(row.id, row.origin_repo, row.tree_hash, row.cmd_hash, row.cmd_display, row.exit_code, row.duration_ms, row.log_tail, row.run_id, row.step_id, row.created_at);
+  for (const row of [...rows, ...dbOnlyRows]) {
+    const dbRow = dbTamperedRowIds.has(row.id) ? { ...row, exit_code: row.exit_code === 0 ? 1 : 0 } : row;
+    insert.run(dbRow.id, dbRow.origin_repo, dbRow.tree_hash, dbRow.cmd_hash, dbRow.cmd_display, dbRow.exit_code, dbRow.duration_ms, dbRow.log_tail, dbRow.run_id, dbRow.step_id, dbRow.created_at);
+  }
   database.close();
   fs.chmodSync(databasePath, 0o400);
   const gitTar = path.join(snapshots, 'repository.git.tar');

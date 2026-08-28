@@ -20,14 +20,25 @@
 #
 # The preflight helper paths are injected via TT_CONTROLLER_PREFLIGHT_* so the
 # wiring is exercised with deterministic stub helpers (except the final
-# real-daemon scenario, which uses the real helpers to prove the contained
+# real-daemon scenarios, which use the real helpers to prove the contained
 # real daemon comes up and is stopped with ports 43xx free, no leaked process).
+#
+# S26 US-004 extends this file with the campaign-start suite-state gate
+# wiring: a FRESH real-campaign preflight threads `tt-daemon-up ensure-up
+# --fresh` (the contained real daemon's suite_results ledger must be EMPTY),
+# while a RESUME calls plain `ensure-up` (a resume reconciles prior state and
+# never requires an empty suite). The real red-arm seeds the contained real DB
+# with a suite_results row (backed up and restored) and pins the FAIL-CLOSED
+# refusal: the campaign aborts with the DISTINCT machine-parseable reason
+# 'suite-state-not-clean' recorded on the preflight state, and the daemon is
+# stopped at teardown.
 #
 # This is NOT part of `npm test` (torture-test/.sh self-tests are standalone).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TT_DIR="$(dirname "$SCRIPT_DIR")"
+TT_REPO_ROOT="$(dirname "$TT_DIR")"
 CONTROLLER="$SCRIPT_DIR/tt-controller"
 RESULTS="$TT_DIR/var/results"
 mkdir -p "$RESULTS"
@@ -175,7 +186,7 @@ legs="$(grep '^CALL ' "$PFLOG" | sed -n 's/^CALL \([^ ]*\) .*/\1/p')"
 [ "$(printf '%s\n' "$legs" | sed -n 2p)" = "tt-catalog-install" ] || fail "AC1 leg2 not catalog-install: $(cat "$PFLOG")"
 [ "$(printf '%s\n' "$legs" | sed -n 3p)" = "tt-daemon-up" ] || fail "AC1 leg3 not daemon-up: $(cat "$PFLOG")"
 [ "$(printf '%s\n' "$legs" | sed -n 4p)" = "tt-daemon-up" ] || fail "AC1 leg4 (teardown) not daemon-up stop: $(cat "$PFLOG")"
-grep -q '^CALL tt-daemon-up args=ensure-up' "$PFLOG" || fail "AC1 no ensure-up call: $(cat "$PFLOG")"
+grep -q '^CALL tt-daemon-up args=ensure-up --fresh' "$PFLOG" || fail "AC1 no ensure-up --fresh call: $(cat "$PFLOG")"
 grep -q '^CALL tt-daemon-up args=stop ' "$PFLOG" || fail "AC1 no stop call at teardown: $(cat "$PFLOG")"
 grep -q "HOME=$contained_home" "$PFLOG" || fail "AC5 preflight did not run under contained home: $(cat "$PFLOG")"
 
@@ -234,6 +245,7 @@ legs="$(grep '^CALL ' "$PFLOG" | sed -n 's/^CALL \([^ ]*\) .*/\1/p')"
 [ "$(printf '%s\n' "$legs" | sed -n 4p)" = "tt-daemon-up" ] || fail "AC1 pi leg4 not daemon-up: $(cat "$PFLOG")"
 [ "$(printf '%s\n' "$legs" | sed -n 5p)" = "tt-daemon-up" ] || fail "AC1 pi leg5 (teardown) not daemon-up stop: $(cat "$PFLOG")"
 grep -q '^CALL tt-harness-auth-probe args=pi ' "$PFLOG" || fail "AC1 pi did not probe pi harness: $(cat "$PFLOG")"
+grep -q '^CALL tt-daemon-up args=ensure-up --fresh' "$PFLOG" || fail "AC1 pi daemon-up did not thread ensure-up --fresh (fresh campaign): $(cat "$PFLOG")"
 pass "AC1 (pi): real pi selection runs provision->harness-auth->catalog->daemon-up before cases"
 
 # ══ AC2 (auth): failing harness-auth leg -> harness-auth-missing: pi.
@@ -267,16 +279,27 @@ pass "AC4: TT_DRY_RUN_REAL_LAUNCH dry run performs NO preflight / daemon start-s
 # ══ AC3: resume also verifies the preflight and stops the daemon at end.
 run_controller "" -- --manifest "$MANIFEST" --resume "$ac1_campaign"
 [ "$CONTROLLER_STATUS" -eq 0 ] || fail "AC3 resume failed: $CONTROLLER_OUTPUT"
-grep -q '^CALL tt-daemon-up args=ensure-up' "$PFLOG" || fail "AC3 resume did not re-verify daemon-up: $(cat "$PFLOG")"
+grep -q '^CALL tt-daemon-up args=ensure-up ' "$PFLOG" || fail "AC3 resume did not re-verify daemon-up: $(cat "$PFLOG")"
+if grep -q '^CALL tt-daemon-up args=ensure-up --fresh' "$PFLOG"; then
+  fail "AC3 resume must NOT thread ensure-up --fresh (resume never requires an empty suite): $(cat "$PFLOG")"
+else
+  pass "AC3 resume calls plain ensure-up (no --fresh) — the suite-state gate is FRESH-campaign-only"
+fi
 grep -q '^CALL tt-daemon-up args=stop ' "$PFLOG" || fail "AC3 resume did not stop the daemon at end: $(cat "$PFLOG")"
 pass "AC3: resume re-runs the preflight and stops the daemon at campaign end"
 
 # ══ AC3 (real): real helpers bring the real daemon up and stop it; ports 43xx
 # free afterwards, no leaked TT daemon process.
+# S24/US-006: prepend THIS worktree's bin/ to PATH so daemon-control's
+# reconstructed launch PATH resolves THIS tree's build (the S15 build-version
+# parity guard compares the daemon's /control/health buildVersion against the
+# worktree's dist/version — resolving the operator's installed build, which
+# diverges after any worktree rebuild, fails closed tt-daemon-stale). Same
+# note as tt-daemon-up.test.sh AC2.
 use_real
 ensure_ports_43xx_free || fail "real-daemon scenario: ports 43xx not free to start"
 set +e
-CONTROLLER_OUTPUT="$(PFLOG="$PFLOG" PFMODE="$PFMODE" "$CONTROLLER" --manifest "$MANIFEST" 2>&1)"
+CONTROLLER_OUTPUT="$(PATH="$TT_REPO_ROOT/bin:$PATH" PFLOG="$PFLOG" PFMODE="$PFMODE" "$CONTROLLER" --manifest "$MANIFEST" 2>&1)"
 CONTROLLER_STATUS=$?
 set -e
 [ "$CONTROLLER_STATUS" -eq 0 ] || fail "real-daemon controller campaign failed: $CONTROLLER_OUTPUT"
@@ -488,5 +511,58 @@ pass "US-003 AC3: a failing reset-state aborts closed with scripted-state-reset-
 
 restore_scripted_state
 trap - EXIT
+
+# ══ S26 US-004 (real red-arm): a FRESH real-campaign preflight with a
+# NON-EMPTY contained suite_results FAILS CLOSED with the DISTINCT
+# machine-parseable reason 'suite-state-not-clean' (attempt-1's
+# cross-campaign contamination is impossible). The contained real DB is
+# seeded with one suite_results row (the pre-existing DB — if any — is backed
+# up and restored around the scenario); the operator's ~/.tamandua and the
+# 33xx daemon are untouched. The controller threads `ensure-up --fresh` on
+# the FRESH path, the daemon-up leg probes the seeded ledger, refuses, and
+# the campaign aborts with the reason recorded on the preflight state.
+use_real
+ensure_ports_43xx_free || fail "S26 red-arm: ports 43xx not free to start"
+REAL_DB="$TT_DIR/var/home/.tamandua/tamandua.db"
+REAL_DB_BACKUP="$TEST_ROOT/real-db.s26.backup"
+if [ -f "$REAL_DB" ]; then cp "$REAL_DB" "$REAL_DB_BACKUP"; fi
+mkdir -p "$(dirname "$REAL_DB")"
+node -e '
+  const { DatabaseSync } = require("node:sqlite");
+  const db = new DatabaseSync(process.argv[1]);
+  db.exec("CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, run_number INTEGER, workflow_id TEXT, task TEXT, status TEXT, context TEXT, created_at TEXT, updated_at TEXT, tokens_spent INTEGER, worker_lost_count INTEGER, ceiling_expiry_count INTEGER)");
+  db.exec("CREATE TABLE IF NOT EXISTS steps (step_id TEXT PRIMARY KEY, agent_id TEXT, step_index INTEGER, status TEXT, type TEXT, current_story_id TEXT, retry_count INTEGER, abandoned_count INTEGER, reroute_count INTEGER, claim_pid INTEGER, claim_updated_at TEXT, updated_at TEXT)");
+  db.exec("CREATE TABLE IF NOT EXISTS suite_results (id INTEGER PRIMARY KEY, origin_repo TEXT NOT NULL, tree_hash TEXT NOT NULL, cmd_hash TEXT NOT NULL, cmd_display TEXT NOT NULL, exit_code INTEGER NOT NULL, duration_ms INTEGER NOT NULL, log_tail TEXT, run_id TEXT, step_id TEXT, created_at TEXT NOT NULL)");
+  db.prepare("INSERT INTO suite_results (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, log_tail, run_id, step_id, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)")
+    .run("stale-cross-campaign-repo", "tree", "cmd", "npm test", 0, 100, null, null, null, new Date().toISOString());
+  db.close();
+' "$REAL_DB" || fail "S26 red-arm: could not seed the contained real DB"
+seeded_count="$(node -e 'const {DatabaseSync}=require("node:sqlite");const db=new DatabaseSync(process.argv[1],{readOnly:true});let c="ERR";try{c=String(db.prepare("SELECT COUNT(*) AS c FROM suite_results").get().c)}catch(e){c="ERR:"+e.message}db.close();process.stdout.write(c)' "$REAL_DB")"
+[ "$seeded_count" = "1" ] || fail "S26 red-arm: seeded DB has suite_rows=$seeded_count (want 1) at $REAL_DB"
+restore_s26_db() {
+  if [ -f "$REAL_DB_BACKUP" ]; then mv -f "$REAL_DB_BACKUP" "$REAL_DB"; else rm -f "$REAL_DB"; fi
+  trap - EXIT
+}
+trap restore_s26_db EXIT
+set +e
+CONTROLLER_OUTPUT="$(PATH="$TT_REPO_ROOT/bin:$PATH" PFLOG="$PFLOG" PFMODE="$PFMODE" "$CONTROLLER" --manifest "$MANIFEST" 2>&1)"
+CONTROLLER_STATUS=$?
+set -e
+[ "$CONTROLLER_STATUS" -ne 0 ] \
+  || fail "S26 red-arm: a FRESH campaign with non-empty suite_results must fail closed (exit 0): $CONTROLLER_OUTPUT"
+printf '%s' "$CONTROLLER_OUTPUT" | grep -Fq 'suite-state-not-clean' \
+  || fail "S26 red-arm: controller did not surface suite-state-not-clean: $CONTROLLER_OUTPUT"
+s26_campaign="$(snapshot_campaigns | tail -n1)"
+[ -n "$s26_campaign" ] || fail "S26 red-arm: campaign not recorded"
+s26_pf="$(state_pf "$s26_campaign")"
+printf '%s' "$s26_pf" | grep -q '"reason":"suite-state-not-clean"' \
+  || fail "S26 red-arm: state.real_preflight reason not suite-state-not-clean: $s26_pf"
+printf '%s' "$s26_pf" | grep -q '"leg":"daemon-up"' \
+  || fail "S26 red-arm: failing leg not daemon-up: $s26_pf"
+printf '%s' "$s26_pf" | grep -q '"stop_ok":true' \
+  || fail "S26 red-arm: daemon teardown did not run on the suite-state refusal: $s26_pf"
+ensure_ports_43xx_free || fail "S26 red-arm: ports 43xx left occupied after the refusal"
+pass "S26 (real red-arm): a FRESH campaign with a non-empty contained suite_results fails closed with suite-state-not-clean (daemon-up leg) + teardown"
+restore_s26_db
 
 printf 'RESULT: All tt-controller preflight wiring tests PASSED\n'

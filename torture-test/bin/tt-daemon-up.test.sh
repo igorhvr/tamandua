@@ -35,6 +35,29 @@
 #        the skew (a stub contained daemon whose /control/health buildVersion
 #        advances stale -> current across the guard's restart) exits 0 with
 #        'TT_DAEMON: up' and the restarted daemon reports the expected build
+#   AC10. (S26 US-004 suite probe) bin/tt-suite-probe.mjs counts suite_results
+#        rows read-only: empty fixture -> SUITE: ok + SUITE_ROWS: 0 (exit 0);
+#        non-empty fixture -> SUITE: fail + REASON: suite-state-not-clean +
+#        SUITE_ROWS: N (exit 1); a DB path outside torture-test/var is
+#        REJECTED (REASON: containment-violation, exit 2, never opened); the
+#        probed DB bytes are unchanged (sha256 before == after, no side files)
+#   AC11. (S26 US-004 red, already-up daemon) ensure-up --fresh over an
+#        already-UP daemon with a NON-EMPTY suite_results fixture (injected
+#        via TT_DAEMON_SUITE_PROBE_DB) FAILS CLOSED with REASON:
+#        suite-state-not-clean, DETAILS carrying the operator reset seam, exit
+#        non-zero, NO 'TT_DAEMON: up', and the daemon is NOT restarted (a
+#        dirty ledger is not healed by a restart)
+#   AC12. (S26 US-004 green, already-up daemon) ensure-up --fresh over an
+#        already-UP daemon with an EMPTY suite_results fixture is an
+#        idempotent no-op ('already UP', exit 0, 'TT_DAEMON: up')
+#   AC13. (S26 US-004 resume) plain ensure-up (NO --fresh) with a NON-EMPTY
+#        suite_results fixture passes — the resume path never requires an
+#        empty suite (resume reconciles prior state)
+#   AC14. (S26 US-004 down-daemon path) ensure-up --fresh with the daemon DOWN
+#        and a non-empty suite fixture starts the daemon, passes the parity
+#        checks, then FAILS CLOSED with REASON: suite-state-not-clean (no
+#        'TT_DAEMON: up') — the suite-state gate also guards the fresh-start
+#        path
 #
 # Standalone: bash torture-test/bin/tt-daemon-up.test.sh
 # Not part of `npm test`.
@@ -77,6 +100,10 @@ port_state() { # args: ports...
 health_version() { # port
   node -e 'const p=Number(process.argv[1]);fetch(`http://127.0.0.1:${p}/control/health`).then(r=>r.json()).then(b=>process.stdout.write(String(b.buildVersion??""))).catch(()=>{})' "$1"
 }
+
+# sha256_of: the file's sha256 digest (empty on failure) — used by the S26
+# suite-probe read-only arm (fixture DB bytes must be unchanged).
+sha256_of() { sha256sum "$1" 2>/dev/null | awk '{print $1}'; }
 
 # Snapshot operator state we must NOT touch.
 OPERATOR_CATALOG="${HOME}/.tamandua/workflows"
@@ -403,6 +430,194 @@ if echo "$PARITY_OUT" | grep -q "TT_DAEMON: up"; then
 else
   fail "AC8 parity no-op missing TT_DAEMON: up"
 fi
+
+# ── S26 US-004: campaign-start suite-state gate (ensure-up --fresh) ──────
+# A FRESH real campaign must start from KNOWN-CLEAN contained suite state
+# (empty suite_results): attempt-1's cross-campaign contamination (a
+# contained-real-daemon DB carrying 106 rows since 08-13) poisoned O10/O9.
+# The gate is wired into ensure-up --fresh ONLY — the resume path (plain
+# ensure-up) never requires an empty suite. The probe seam
+# (TT_DAEMON_SUITE_PROBE_DB) lets this battery build dirty/clean fixture DBs
+# under torture-test/var without touching the real contained DB.
+SUITE_PROBE="$SCRIPT_DIR/tt-suite-probe.mjs"
+SUITE_FIXTURE_DIR="$(mktemp -d "$TT_REPO_ROOT/torture-test/var/tt-suite-fixture.XXXXXX")"
+SUITE_EMPTY_DB="$SUITE_FIXTURE_DIR/empty.db"
+SUITE_DIRTY_DB="$SUITE_FIXTURE_DIR/dirty.db"
+
+make_suite_fixture_db() { # path rows
+  node -e '
+    const { DatabaseSync } = require("node:sqlite");
+    const [dbPath, rows] = process.argv.slice(1);
+    const db = new DatabaseSync(dbPath);
+    db.exec("CREATE TABLE suite_results (id INTEGER PRIMARY KEY, origin_repo TEXT NOT NULL, tree_hash TEXT NOT NULL, cmd_hash TEXT NOT NULL, cmd_display TEXT NOT NULL, exit_code INTEGER NOT NULL, duration_ms INTEGER NOT NULL, log_tail TEXT, run_id TEXT, step_id TEXT, created_at TEXT NOT NULL)");
+    const ins = db.prepare("INSERT INTO suite_results (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, log_tail, run_id, step_id, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)");
+    for (let i = 1; i <= Number(rows); i++) {
+      // Recent created_at: the daemon reconciler PRUNES suite_results rows
+      // older than LEDGER_RETENTION (14d) on its 30s tick — a stale-dated
+      // fixture would be silently emptied if the real daemon ever opened it
+      // (the S26 controller-level red-arm trap).
+      ins.run("stale-repo-" + i, "tree-" + i, "cmd-" + i, "npm test", 0, 100, null, null, null, new Date().toISOString());
+    }
+    db.close();
+  ' "$1" "$2"
+}
+make_suite_fixture_db "$SUITE_EMPTY_DB" 0
+make_suite_fixture_db "$SUITE_DIRTY_DB" 3
+DIRTY_HASH_BEFORE="$(sha256_of "$SUITE_DIRTY_DB")"
+
+# ── AC10 (S26 US-004 probe unit): empty -> ok; non-empty -> fail-closed; ──
+# containment rejects outside-var paths; read-only (sha256 stable).
+set +e
+EMPTY_OUT="$(TT_DAEMON_SUITE_PROBE_DB="$SUITE_EMPTY_DB" node "$SUITE_PROBE" 2>&1)"; EMPTY_RC=$?
+set -e
+if [ "$EMPTY_RC" -eq 0 ] && echo "$EMPTY_OUT" | grep -q "^SUITE: ok" && echo "$EMPTY_OUT" | grep -q "^SUITE_ROWS: 0"; then
+  ok "AC10 empty fixture -> SUITE: ok + SUITE_ROWS: 0 (exit 0)"
+else
+  fail "AC10 empty-fixture probe (rc=$EMPTY_RC)"; echo "$EMPTY_OUT" | head -4
+fi
+set +e
+DIRTY_OUT="$(TT_DAEMON_SUITE_PROBE_DB="$SUITE_DIRTY_DB" node "$SUITE_PROBE" 2>&1)"; DIRTY_RC=$?
+set -e
+if [ "$DIRTY_RC" -ne 0 ] && echo "$DIRTY_OUT" | grep -q "^SUITE: fail" && echo "$DIRTY_OUT" | grep -q "REASON: suite-state-not-clean" && echo "$DIRTY_OUT" | grep -q "^SUITE_ROWS: 3"; then
+  ok "AC10 non-empty fixture -> SUITE: fail + REASON: suite-state-not-clean + SUITE_ROWS: 3 (exit 1)"
+else
+  fail "AC10 non-empty-fixture probe (rc=$DIRTY_RC)"; echo "$DIRTY_OUT" | head -4
+fi
+if echo "$DIRTY_OUT" | grep -q "DETAILS:"; then
+  ok "AC10 non-empty probe DETAILS carry the operator reset guidance"
+else
+  fail "AC10 missing DETAILS guidance"; echo "$DIRTY_OUT" | grep -E 'REASON|DETAILS' || true
+fi
+set +e
+SUITE_CONT_OUT="$(TT_DAEMON_SUITE_PROBE_DB="$TMP/suite-outside-$$.db" node "$SUITE_PROBE" 2>&1)"; SUITE_CONT_RC=$?
+set -e
+if [ "$SUITE_CONT_RC" -eq 2 ] && echo "$SUITE_CONT_OUT" | grep -q "REASON: containment-violation"; then
+  ok "AC10 probe rejects a DB path outside torture-test/var (exit 2, containment-violation)"
+else
+  fail "AC10 containment guard (rc=$SUITE_CONT_RC)"; echo "$SUITE_CONT_OUT" | head -4
+fi
+if [ ! -e "$TMP/suite-outside-$$.db" ]; then
+  ok "AC10 rejected path was never created/opened"
+else
+  fail "AC10 rejected DB path was touched"
+fi
+DIRTY_HASH_AFTER="$(sha256_of "$SUITE_DIRTY_DB")"
+if [ -n "$DIRTY_HASH_BEFORE" ] && [ "$DIRTY_HASH_BEFORE" = "$DIRTY_HASH_AFTER" ]; then
+  ok "AC10 probe is READ-ONLY (dirty fixture DB bytes unchanged, sha256 stable)"
+else
+  fail "AC10 probe modified the fixture DB ($DIRTY_HASH_BEFORE -> $DIRTY_HASH_AFTER)"
+fi
+if [ -z "$(ls -A "$SUITE_FIXTURE_DIR" 2>/dev/null | grep -E '\.(wal|shm|journal)$' || true)" ]; then
+  ok "AC10 probe left no -wal/-shm/-journal side files"
+else
+  fail "AC10 probe created side files: $(ls -A "$SUITE_FIXTURE_DIR" | grep -E '\.(wal|shm|journal)$' || true)"
+fi
+
+# ── AC11 (S26 US-004 red, already-up): non-empty suite -> FAIL CLOSED ────
+# The daemon is UP with matching build + schema + adapters-bin (AC8). Inject
+# the DIRTY fixture via the TT_DAEMON_SUITE_PROBE_DB seam: ensure-up --fresh
+# must refuse — a FRESH campaign cannot start against a dirty suite ledger.
+SUITE_PID_BEFORE=""
+if [ -n "$STATE_DIR" ] && [ -f "$STATE_DIR/tamandua.pid" ]; then
+  SUITE_PID_BEFORE="$(cat "$STATE_DIR/tamandua.pid")"
+fi
+set +e
+RED_OUT="$(PATH="$TT_REPO_ROOT/bin:$PATH" TT_DAEMON_EXPECTED_VERSION_FILE="$TT_REPO_ROOT/dist/version" TT_DAEMON_SUITE_PROBE_DB="$SUITE_DIRTY_DB" "$HELPER" ensure-up --fresh 2>&1)"; RED_RC=$?
+set -e
+if [ "$RED_RC" -ne 0 ]; then
+  ok "AC11 ensure-up --fresh with non-empty suite exits non-zero (rc=$RED_RC)"
+else
+  fail "AC11 non-empty suite should exit non-zero"; echo "$RED_OUT" | tail -8
+fi
+if echo "$RED_OUT" | grep -q "REASON: suite-state-not-clean"; then
+  ok "AC11 failure emits the DISTINCT reason suite-state-not-clean"
+else
+  fail "AC11 missing REASON: suite-state-not-clean"; echo "$RED_OUT" | grep -E 'REASON|DETAILS' || true
+fi
+if echo "$RED_OUT" | grep -q "TT_DAEMON: up"; then
+  fail "AC11 suite-state fail-closed must NOT print TT_DAEMON: up"
+else
+  ok "AC11 no 'TT_DAEMON: up' on suite-state fail-closed"
+fi
+if echo "$RED_OUT" | grep -q "tt-daemon-up stop" && echo "$RED_OUT" | grep -q "suite-results\|suite_results\|tamandua.db"; then
+  ok "AC11 DETAILS carry the operator reset seam (stop the contained daemon + remove the contained state)"
+else
+  fail "AC11 DETAILS missing the operator reset guidance"; echo "$RED_OUT" | grep 'DETAILS' || true
+fi
+SUITE_PID_AFTER=""
+if [ -n "$STATE_DIR" ] && [ -f "$STATE_DIR/tamandua.pid" ]; then
+  SUITE_PID_AFTER="$(cat "$STATE_DIR/tamandua.pid")"
+fi
+if [ -n "$SUITE_PID_BEFORE" ] && [ -n "$SUITE_PID_AFTER" ] && [ "$SUITE_PID_BEFORE" = "$SUITE_PID_AFTER" ]; then
+  ok "AC11 suite-state refusal did NOT restart the daemon (a dirty ledger is not healed by a restart; pid unchanged)"
+else
+  fail "AC11 daemon was restarted on a suite-state refusal (pid $SUITE_PID_BEFORE -> ${SUITE_PID_AFTER:-none})"
+fi
+
+# ── AC12 (S26 US-004 green, already-up): empty suite -> idempotent no-op ──
+set +e
+GREEN_FRESH_OUT="$(PATH="$TT_REPO_ROOT/bin:$PATH" TT_DAEMON_EXPECTED_VERSION_FILE="$TT_REPO_ROOT/dist/version" TT_DAEMON_SUITE_PROBE_DB="$SUITE_EMPTY_DB" "$HELPER" ensure-up --fresh 2>&1)"; GREEN_FRESH_RC=$?
+set -e
+if [ "$GREEN_FRESH_RC" -eq 0 ] && echo "$GREEN_FRESH_OUT" | grep -q "already UP"; then
+  ok "AC12 ensure-up --fresh with an empty suite is an idempotent no-op (already UP)"
+else
+  fail "AC12 green no-op (rc=$GREEN_FRESH_RC)"; echo "$GREEN_FRESH_OUT" | tail -6
+fi
+if echo "$GREEN_FRESH_OUT" | grep -q "TT_DAEMON: up"; then
+  ok "AC12 green no-op reports TT_DAEMON: up"
+else
+  fail "AC12 green no-op missing TT_DAEMON: up"
+fi
+
+# ── AC13 (S26 US-004 resume): plain ensure-up never requires an empty suite ──
+set +e
+RESUME_OUT="$(PATH="$TT_REPO_ROOT/bin:$PATH" TT_DAEMON_EXPECTED_VERSION_FILE="$TT_REPO_ROOT/dist/version" TT_DAEMON_SUITE_PROBE_DB="$SUITE_DIRTY_DB" "$HELPER" ensure-up 2>&1)"; RESUME_RC=$?
+set -e
+if [ "$RESUME_RC" -eq 0 ] && echo "$RESUME_OUT" | grep -q "already UP"; then
+  ok "AC13 plain ensure-up (resume) with a non-empty suite is a no-op — resume never requires an empty suite"
+else
+  fail "AC13 resume no-op (rc=$RESUME_RC)"; echo "$RESUME_OUT" | tail -6
+fi
+if echo "$RESUME_OUT" | grep -q "TT_DAEMON: up"; then
+  ok "AC13 resume no-op reports TT_DAEMON: up"
+else
+  fail "AC13 resume no-op missing TT_DAEMON: up"
+fi
+
+# ── AC14 (S26 US-004 down-daemon path): start-then-probe fails closed ──
+set +e
+"$DC" real stop >/dev/null 2>&1
+sleep 1
+set -e
+set +e
+DOWN_FRESH_OUT="$(PATH="$TT_REPO_ROOT/bin:$PATH" TT_DAEMON_EXPECTED_VERSION_FILE="$TT_REPO_ROOT/dist/version" TT_DAEMON_SUITE_PROBE_DB="$SUITE_DIRTY_DB" "$HELPER" ensure-up --fresh 2>&1)"; DOWN_FRESH_RC=$?
+set -e
+if [ "$DOWN_FRESH_RC" -ne 0 ]; then
+  ok "AC14 ensure-up --fresh with daemon down + non-empty suite exits non-zero (rc=$DOWN_FRESH_RC)"
+else
+  fail "AC14 down-path + non-empty suite should exit non-zero"; echo "$DOWN_FRESH_OUT" | tail -8
+fi
+if echo "$DOWN_FRESH_OUT" | grep -q "REASON: suite-state-not-clean"; then
+  ok "AC14 down path fails closed with REASON: suite-state-not-clean"
+else
+  fail "AC14 missing REASON: suite-state-not-clean"; echo "$DOWN_FRESH_OUT" | grep -E 'REASON|DETAILS' || true
+fi
+if echo "$DOWN_FRESH_OUT" | grep -q "starting via daemon-control" && echo "$DOWN_FRESH_OUT" | grep -q "campaign-start suite-state: FAIL"; then
+  ok "AC14 suite-state probe ran AFTER starting the down daemon (start-then-gate)"
+else
+  fail "AC14 missing start-then-suite-gate sequence"; echo "$DOWN_FRESH_OUT" | grep -E 'starting|campaign-start' || true
+fi
+if echo "$DOWN_FRESH_OUT" | grep -q "TT_DAEMON: up"; then
+  fail "AC14 down path must NOT print TT_DAEMON: up"
+else
+  ok "AC14 no 'TT_DAEMON: up' on the down-path fail-closed"
+fi
+# Stop the daemon AC14 started so the AC9 baseline starts from a clean down state.
+set +e
+"$DC" real stop >/dev/null 2>&1
+sleep 1
+set -e
+rm -rf "$SUITE_FIXTURE_DIR" 2>/dev/null || true
 
 # ── AC9 (S15 US-001 heal): a restart that heals the skew reports up ──
 # A stale daemon cannot exist with the REAL contained daemon (it always runs
