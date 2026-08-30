@@ -336,6 +336,65 @@ test('harvests a complete immutable snapshot that passes O9 with immediate recla
   }
 });
 
+// S31 (US-009) — W4.30-detached-head-origin: a detached-HEAD fixture must NOT
+// throw `fixture repository has no symbolic target ref` (the campaign's
+// scheduler-execution-failed line). The target identity resolves per the
+// case's declared contract — the detached HEAD commit — and is recorded with
+// a detached_head marker on refs_before/refs_after/target_reflog; the reflog
+// capture reads logs/HEAD. The named-target (refs/...) shape is unchanged
+// (pinned by the harvest test above).
+test('S31: a detached-HEAD fixture begins and completes the snapshot with the detached commit identity (no symbolic-target-ref throw)', () => {
+  const data = fixture();
+  try {
+    const request = input(data);
+    // W4.30's reset hook detached the work-clone HEAD: git symbolic-ref -q
+    // HEAD is empty (exit 1) and the target identity is the HEAD commit.
+    run('git', ['checkout', '-q', '--detach', 'HEAD'], data.repoDir);
+    const symbolicProbe = spawnSync('git', ['-C', data.repoDir, 'symbolic-ref', '-q', 'HEAD'], {
+      encoding: 'utf8', shell: false,
+    });
+    assert.equal(symbolicProbe.stdout.trim(), '', 'premise: the fixture must be in detached HEAD');
+    const headSha = run('git', ['rev-parse', 'HEAD'], data.repoDir);
+    // A launch-refused run (the W4.30 corridor) never moves the target: the
+    // run row records the failed launch and the repo stays put.
+    const db = new DatabaseSync(data.databasePath, { open: true });
+    db.prepare("UPDATE runs SET status = 'failed' WHERE id = ?").run('11111111-1111-4111-8111-111111111111');
+    db.close();
+    fs.writeFileSync(`${data.databasePath}-wal`, '');
+
+    const started = beginOracleEvidenceSnapshot(request);
+    assert.equal(started.status, 'BASELINE_CAPTURED');
+    fs.rmSync(`${data.databasePath}-wal`);
+    const refsBefore = JSON.parse(fs.readFileSync(
+      path.join(data.campaignDir, started.references.refs_before.path), 'utf8',
+    ));
+    assert.equal(refsBefore.target_ref, headSha, 'detached fixture target_ref must be the HEAD commit');
+    assert.equal(refsBefore.target_tip, headSha, 'detached fixture target_tip must be the HEAD commit');
+    assert.equal(refsBefore.detached_head, true, 'refs_before must carry detached_head');
+
+    const completed = completeOracleEvidenceSnapshot(request, started);
+    assert.equal(completed.status, 'COMPLETE');
+    const refsAfter = JSON.parse(fs.readFileSync(
+      path.join(data.campaignDir, completed.references.refs_after.path), 'utf8',
+    ));
+    assert.equal(refsAfter.target_ref, headSha);
+    assert.equal(refsAfter.detached_head, true, 'refs_after must carry detached_head');
+    assert.equal(refsAfter.target_ref, refsBefore.target_ref, 'target identity must agree across snapshots');
+    const reflog = JSON.parse(fs.readFileSync(
+      path.join(data.campaignDir, completed.references.target_reflog.path), 'utf8',
+    ));
+    assert.equal(reflog.target_ref, headSha, 'target_reflog must carry the detached target identity');
+    assert.equal(reflog.detached_head, true, 'target_reflog must carry detached_head');
+    assert.ok(Array.isArray(reflog.entries) && reflog.entries.length > 0,
+      `detached reflog must capture logs/HEAD entries, got ${reflog.entries.length}`);
+    // The detached checkout entry is present (moving from main to the commit).
+    assert.ok(reflog.entries.some((entry) => /checkout: moving from main to /.test(entry.raw ?? '')),
+      'detached reflog must carry the checkout entry');
+  } finally {
+    fs.rmSync(data.root, { recursive: true, force: true });
+  }
+});
+
 test('US-010: appends process-recorder samples to the chaos_log bundle at the default chaos log path (O4 liveness provenance)', async () => {
   const data = fixture();
   try {

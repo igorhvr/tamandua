@@ -31,6 +31,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { describe, it } from "node:test";
 
 const repoRoot = process.cwd();
@@ -75,14 +76,17 @@ function readSchema(): Record<string, any> {
 
 // Build a single-case manifest under a temp dir inside torture-test/var (the
 // controller refuses manifests that escape torture-test/). The base is a real
-// workflow case (pi harness, bug-fix-merge-worktree, tt-ts fixture); field
-// overrides are applied on top.
+// workflow case (pi harness, feature-dev-merge-worktree, tt-ts fixture);
+// field overrides are applied on top. fdmw is pinned so the `mid_round`
+// chaos trigger (translated to step:developer:running) stays valid under
+// US-003's fail-closed trigger-vocabulary preflight (developer is an fdmw
+// agent; it is NOT bug-fix-merge-worktree vocabulary).
 function buildCaseManifest(overrides: Record<string, unknown>): string {
   const dir = fs.mkdtempSync(path.join(varRoot, "us003-chaos-schema-"));
   const base: Record<string, any> = {
     id: "T2-US003-CHOKE",
     wave: 4,
-    workflow: "bug-fix-merge-worktree",
+    workflow: "feature-dev-merge-worktree",
     fixture: "tt-ts",
     harness: "pi",
     task: "cases/tasks/tier2/T2-US003-CHOKE.md",
@@ -159,13 +163,13 @@ describe("Tier-2 chaos block extension (US-003): kill-harness / kill-daemon / de
       "O11 declaration-only arm must require exactly synthetic_token_ledger");
     assert.deepEqual(
       block.properties.type.enum,
-      ["sigstop_sigcont", "kill-harness", "kill-daemon", "delete-tstx-row"],
-      "chaos type enum must include the kill/delete actions",
+      ["sigstop_sigcont", "kill-harness", "kill-daemon", "delete-tstx-row", "move-branch"],
+      "chaos type enum must include the kill/delete actions and the US-004 move-branch colleague target-move",
     );
     assert.deepEqual(
       block.properties.target.enum,
-      ["harness_process", "daemon_process", "tstx_row"],
-      "chaos target enum must include the per-type targets",
+      ["harness_process", "daemon_process", "tstx_row", "origin_target_ref"],
+      "chaos target enum must include the per-type targets and the US-004 origin target ref",
     );
     assert.equal(block.properties.hold_seconds.type, "number", "hold_seconds must stay typed number");
     assert.equal(block.properties.hold_seconds.exclusiveMinimum, 0, "hold_seconds must be > 0");
@@ -180,17 +184,25 @@ describe("Tier-2 chaos block extension (US-003): kill-harness / kill-daemon / de
       chaos: { type: "kill-harness", target: "harness_process", trigger: "mid_round", signal: "SIGTERM", operator: "tt-chaos" },
     });
     expectAccepted("kill-harness without signal (defaults to SIGKILL)", {
-      chaos: { type: "kill-harness", target: "harness_process", trigger: "event:merge.parked", operator: "tt-chaos" },
+      chaos: { type: "kill-harness", target: "harness_process", trigger: "event:merge.landed", operator: "tt-chaos" },
     });
     expectAccepted("kill-daemon + daemon_process", {
       chaos: { type: "kill-daemon", target: "daemon_process", trigger: "mid_round", operator: "tt-chaos" },
     });
     expectAccepted("delete-tstx-row + tstx_row + tree", {
-      chaos: { type: "delete-tstx-row", target: "tstx_row", trigger: "event:merge.parked", tree: "abc123def456", operator: "tt-chaos" },
+      chaos: { type: "delete-tstx-row", target: "tstx_row", trigger: "event:merge.landed", tree: "abc123def456", operator: "tt-chaos" },
     });
     // Regression: the W3.17b sigstop shape stays valid.
     expectAccepted("sigstop_sigcont + harness_process + hold_seconds", {
       chaos: { type: "sigstop_sigcont", target: "harness_process", trigger: "mid_round", hold_seconds: 600, operator: "tt-chaos" },
+    });
+    // US-004: the typed move-branch colleague target-move validates with its
+    // origin_target_ref target + ref/repeat/interval_s/wait_timeout_s params.
+    expectAccepted("move-branch + origin_target_ref + persistent-move params", {
+      chaos: { type: "move-branch", target: "origin_target_ref", trigger: "step:finalize_merge:running", operator: "tt-chaos", ref: "refs/heads/main", repeat: 5, interval_s: 30, wait_timeout_s: 4200 },
+    });
+    expectAccepted("move-branch single move (repeat absent, no interval)", {
+      chaos: { type: "move-branch", target: "origin_target_ref", trigger: "step:finalize_merge:running", operator: "tt-chaos", ref: "refs/heads/main" },
     });
   });
 
@@ -239,6 +251,34 @@ describe("Tier-2 chaos block extension (US-003): kill-harness / kill-daemon / de
       "an unknown chaos property",
       { chaos: { type: "kill-harness", target: "harness_process", trigger: "mid_round", operator: "tt-chaos", bogus: 1 } },
       /unknown property/,
+    );
+    // US-004 per-type rules for the move-branch colleague target-move: a
+    // missing ref, interval_s without repeat > 1, or a move-branch param on
+    // another type all fail closed.
+    expectRejected(
+      "move-branch without a ref",
+      { chaos: { type: "move-branch", target: "origin_target_ref", trigger: "step:finalize_merge:running", operator: "tt-chaos" } },
+      /ref must be a non-empty ref name for move-branch/,
+    );
+    expectRejected(
+      "move-branch with interval_s but no repeat > 1",
+      { chaos: { type: "move-branch", target: "origin_target_ref", trigger: "step:finalize_merge:running", operator: "tt-chaos", ref: "refs/heads/main", repeat: 1, interval_s: 30 } },
+      /interval_s requires repeat > 1/,
+    );
+    expectRejected(
+      "move-branch with the wrong target (harness_process)",
+      { chaos: { type: "move-branch", target: "harness_process", trigger: "step:finalize_merge:running", operator: "tt-chaos", ref: "refs/heads/main" } },
+      /target for type 'move-branch' must be 'origin_target_ref'/,
+    );
+    expectRejected(
+      "ref on a kill-harness block (move-branch-only param)",
+      { chaos: { type: "kill-harness", target: "harness_process", trigger: "mid_round", operator: "tt-chaos", ref: "refs/heads/main" } },
+      /does not take ref/,
+    );
+    expectRejected(
+      "repeat on a kill-harness block (move-branch-only param)",
+      { chaos: { type: "kill-harness", target: "harness_process", trigger: "mid_round", operator: "tt-chaos", repeat: 3 } },
+      /does not take repeat/,
     );
   });
 
@@ -301,10 +341,13 @@ exit 0
 
     // Two cases in one manifest: kill-harness (with an explicit signal) and
     // delete-tstx-row (with a tree), so the per-type argv is proven together.
+    // The workflow is feature-dev-merge-worktree: the kill case's `mid_round`
+    // trigger translates to step:developer:running, which is fdmw vocabulary
+    // (the US-003 preflight rejects it on any other workflow).
     const killRecord = {
       id: "T2-US003-KILL-ARGV",
       wave: 4,
-      workflow: "bug-fix-merge-worktree",
+      workflow: "feature-dev-merge-worktree",
       fixture: "tt-ts",
       harness: "pi",
       task: "cases/tasks/tier2/T2-US003-KILL-ARGV.md",
@@ -326,10 +369,66 @@ exit 0
       ...killRecord,
       id: "T2-US003-DELETE-ARGV",
       task: "cases/tasks/tier2/T2-US003-DELETE-ARGV.md",
-      chaos: { type: "delete-tstx-row", target: "tstx_row", trigger: "event:merge.parked", tree: "abc123def456", operator: "tt-chaos" },
+      chaos: { type: "delete-tstx-row", target: "tstx_row", trigger: "event:merge.landed", tree: "abc123def456", operator: "tt-chaos" },
     };
     const manifestPath = path.join(varRoot, `us003-argv-manifest-${Date.now()}-${process.pid}.jsonl`);
     fs.writeFileSync(manifestPath, `${JSON.stringify(killRecord)}\n${JSON.stringify(deleteRecord)}\n`);
+
+    // S28 (US-005): the fail-closed terminal guard refuses to spawn an
+    // operator against a run the status query reports terminal — and the
+    // stub `workflow status` reports 'completed' from the start. The
+    // harness-target wait's MARKER check runs BEFORE the status check, so
+    // seeding the marker corridor makes both invocations proceed exactly as
+    // in a real run:
+    //   * kill case: a steps-table claim row makes step:developer:running
+    //     fire (the product's own marker mechanism), and
+    //   * delete case: an event-stream row makes event:merge.landed fire.
+    // The contained home (var/home/.tamandua) is gitignored shared state;
+    // the inserted rows are removed after, and a DB this test created is
+    // removed entirely (a pre-existing DB keeps its other contents).
+    const chaosRunId = "run-11111111-1111-4111-8111-111111111111";
+    const chaosRunShort = chaosRunId.slice("run-".length);
+    const containedStateDir = path.join(varRoot, "home", ".tamandua");
+    const containedDbPath = path.join(containedStateDir, "tamandua.db");
+    const containedEventsDir = path.join(containedStateDir, "events");
+    const containedEventFile = path.join(containedEventsDir, `${chaosRunShort}.jsonl`);
+    const dbExisted = fs.existsSync(containedDbPath);
+    const eventExisted = fs.existsSync(containedEventFile);
+    const priorEventContent = eventExisted ? fs.readFileSync(containedEventFile, "utf8") : null;
+    try {
+      fs.mkdirSync(containedEventsDir, { recursive: true });
+      if (!dbExisted) {
+        const created = new DatabaseSync(containedDbPath, { open: true });
+        created.exec(`CREATE TABLE IF NOT EXISTS steps (
+          id TEXT PRIMARY KEY, run_id TEXT NOT NULL, step_id TEXT NOT NULL,
+          agent_id TEXT NOT NULL, step_index INTEGER NOT NULL, status TEXT NOT NULL,
+          type TEXT NOT NULL DEFAULT 'single', current_story_id TEXT,
+          retry_count INTEGER NOT NULL DEFAULT 0, abandoned_count INTEGER NOT NULL DEFAULT 0,
+          reroute_count INTEGER NOT NULL DEFAULT 0, claim_pid INTEGER,
+          claim_pgid INTEGER, claim_updated_at TEXT, updated_at TEXT NOT NULL
+        );`);
+        created.close();
+      }
+      const db = new DatabaseSync(containedDbPath, { open: true });
+      try {
+        db.prepare(
+          `INSERT OR REPLACE INTO steps
+             (id, run_id, step_id, agent_id, step_index, status, type, retry_count, abandoned_count, reroute_count, updated_at)
+           VALUES ('us003-claim-row', ?, 'step-developer', 'developer', 0, 'running', 'single', 0, 0, 0, ?)`,
+        ).run(chaosRunShort, new Date().toISOString());
+      } finally {
+        db.close();
+      }
+      // The marker check reads the per-run event file and looks for the
+      // declared event — append the seeded line and preserve any prior
+      // content (restored in cleanup).
+      fs.writeFileSync(
+        containedEventFile,
+        `${JSON.stringify({ ts: new Date().toISOString(), event: "merge.landed", runId: chaosRunId })}\n${priorEventContent ?? ""}`,
+      );
+    } catch (error) {
+      throw new Error(`cannot seed the chaos marker corridor in ${containedStateDir}: ${(error as Error).message}`);
+    }
 
     let res!: RunResult;
     let campaignId: string | null = null;
@@ -345,6 +444,28 @@ exit 0
     } finally {
       fs.rmSync(manifestPath, { force: true });
       fs.rmSync(stubBin, { recursive: true, force: true });
+      // S28 cleanup: remove the seeded corridor rows/files; restore a
+      // pre-existing event file; remove a DB this test created entirely.
+      try {
+        const cleanupDb = new DatabaseSync(containedDbPath, { open: true });
+        try {
+          cleanupDb.prepare(`DELETE FROM steps WHERE id = 'us003-claim-row'`).run();
+        } finally {
+          cleanupDb.close();
+        }
+      } catch {
+        // DB absent or locked — nothing left to clean.
+      }
+      if (eventExisted) {
+        fs.writeFileSync(containedEventFile, priorEventContent ?? "");
+      } else {
+        fs.rmSync(containedEventFile, { force: true });
+      }
+      if (!dbExisted) {
+        fs.rmSync(containedDbPath, { force: true });
+        fs.rmSync(`${containedDbPath}-wal`, { force: true });
+        fs.rmSync(`${containedDbPath}-shm`, { force: true });
+      }
     }
     assert.ok(campaignId, `controller did not create a campaign:\n${res.stdout}${res.stderr}`);
 
@@ -416,7 +537,7 @@ exit 0
     // (no --hold-seconds, no --signal), plus the explicit --target-* identity.
     assert.deepEqual(
       deleteEvidence.argv,
-      [chaosStub, "delete-tstx-row", "--run", "run-11111111-1111-4111-8111-111111111111", "--when", "event:merge.parked", "--tree", "abc123def456", ...deleteTargetTail],
+      [chaosStub, "delete-tstx-row", "--run", "run-11111111-1111-4111-8111-111111111111", "--when", "event:merge.landed", "--tree", "abc123def456", ...deleteTargetTail],
       `delete-tstx-row argv must carry --tree plus the explicit --target-* identity per-type (got ${JSON.stringify(deleteEvidence.argv)})`,
     );
 

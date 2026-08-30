@@ -224,24 +224,54 @@ function launchGateKey(caseRecord, repositoryPath) {
   };
 }
 
-function targetRef(repositoryPath) {
+// S31 (US-009): resolve the fixture's target-ref identity per the case's
+// declared contract instead of assuming a symbolic ref. A named checkout
+// resolves to its `refs/...` name (symbolic-ref HEAD). A DETACHED-HEAD
+// fixture — the W4.30-detached-head-origin premise, declared by its reset
+// hook (`git checkout --detach HEAD` leaves `git symbolic-ref -q HEAD`
+// empty) — has no symbolic target ref; the target identity IS the detached
+// HEAD commit, recorded as the resolved OID with a `detached_head` marker on
+// the evidence. Fail closed (precise one-line reason) only when even the HEAD
+// commit is unresolvable (empty/unborn repository) — never a silent empty
+// target, and never the pre-fix `fixture repository has no symbolic target
+// ref` throw that voided W4.30 before its launch could run.
+function targetRefInfo(repositoryPath) {
   const symbolic = spawnSync('git', ['-C', repositoryPath, 'symbolic-ref', '-q', 'HEAD'], {
     encoding: 'utf8', shell: false,
   });
-  if (symbolic.status !== 0 || symbolic.stdout.trim() === '') {
-    throw new Error('fixture repository has no symbolic target ref');
+  const symbolicRef = symbolic.status === 0 && symbolic.stdout.trim() !== ''
+    ? symbolic.stdout.trim()
+    : null;
+  if (symbolicRef !== null) {
+    // Verify the named ref actually RESOLVES — an unborn repository (HEAD
+    // points at a ref that does not exist yet) must fail closed with the
+    // precise reason here, never surface a generic rev-parse failure
+    // downstream.
+    const resolved = spawnSync('git', ['-C', repositoryPath, 'rev-parse', '--verify', symbolicRef], {
+      encoding: 'utf8', shell: false,
+    });
+    if (resolved.status === 0 && resolved.stdout.trim() !== '') {
+      return { target_ref: symbolicRef, detached: false };
+    }
   }
-  return symbolic.stdout.trim();
+  const head = spawnSync('git', ['-C', repositoryPath, 'rev-parse', '--verify', 'HEAD'], {
+    encoding: 'utf8', shell: false,
+  });
+  if (head.status !== 0 || head.stdout.trim() === '') {
+    throw new Error('fixture repository has no symbolic target ref and no resolvable HEAD commit');
+  }
+  return { target_ref: head.stdout.trim(), detached: true };
 }
 
 function captureRefs(repositoryPath, ttRoot, phase) {
-  const ref = targetRef(repositoryPath);
+  const info = targetRefInfo(repositoryPath);
   return {
     schema_version: 1,
     phase,
     repository: repositoryIdentity(repositoryPath, ttRoot),
-    target_ref: ref,
-    target_tip: git(repositoryPath, ['rev-parse', '--verify', ref]).trim(),
+    target_ref: info.target_ref,
+    target_tip: git(repositoryPath, ['rev-parse', '--verify', info.target_ref]).trim(),
+    ...(info.detached ? { detached_head: true } : {}),
     for_each_ref: git(repositoryPath, [
       'for-each-ref', '--sort=refname',
       '--format=%(objectname)%09%(objecttype)%09%(refname)%09%(upstream)',
@@ -1130,15 +1160,20 @@ export function completeOracleEvidenceSnapshot(rawInput, baseline) {
     );
     immutable(gitSnapshotPath);
     emitJson('refs_after', 'refs-after.json', captureRefs(input.repositoryPath, input.ttRoot, 'after'), 'git-plumbing-after');
-    const ref = targetRef(input.repositoryPath);
+    const refInfo = targetRefInfo(input.repositoryPath);
+    const ref = refInfo.target_ref;
+    // S31 (US-009): a detached-HEAD fixture's reflog lives at logs/HEAD (no
+    // symbolic ref to name); the captured target identity stays the resolved
+    // detached commit so refs_before/refs_after/target_reflog agree.
+    const reflogRef = refInfo.detached ? 'HEAD' : ref;
     const gitDir = path.resolve(input.repositoryPath, git(input.repositoryPath, ['rev-parse', '--git-dir']).trim());
-    const rawReflogPath = path.join(gitDir, 'logs', ...ref.split('/'));
+    const rawReflogPath = path.join(gitDir, 'logs', ...reflogRef.split('/'));
     let raw = '';
     if (fs.existsSync(rawReflogPath)) raw = fs.readFileSync(assertContainedFile(rawReflogPath, input.ttRoot, 'target reflog'), 'utf8');
     const entries = raw.split(/\r?\n/).filter(Boolean).map(parseTargetReflogLine);
     emitJson('target_reflog', 'target-reflog.json', {
       schema_version: 1, captured_at: capturedAt, repository: repositoryIdentity(input.repositoryPath, input.ttRoot),
-      target_ref: ref, entries,
+      target_ref: ref, ...(refInfo.detached ? { detached_head: true } : {}), entries,
     }, 'git-raw-target-reflog');
 
     const baselinePath = path.join(input.campaignDir, baseline.references.checksum_baseline.path);

@@ -261,7 +261,7 @@
    }
   },
   "chaos": {
-   "description": "E3.C typed chaos-injection block (nullable). null => no chaos injection. A non-null block is honored by the controller via bin/tt-chaos: type is the injection kind (sigstop_sigcont | kill-harness | kill-daemon | delete-tstx-row), target the affected process/data class (per-type), trigger the phase marker that arms the injection, hold_seconds the SIGSTOP hold duration (sigstop_sigcont only), signal the kill signal (kill actions only, default SIGKILL), tree the TSTX tree hash to delete (delete-tstx-row only), operator the executable that performs the injection. Schema contract is fail-closed: unknown type/target/operator/signal values and unknown properties are REJECTED; per-type target/param constraints are enforced by the controller's semantic validator.",
+   "description": "E3.C typed chaos-injection block (nullable). null => no chaos injection. A non-null block is honored by the controller via bin/tt-chaos: type is the injection kind (sigstop_sigcont | kill-harness | kill-daemon | delete-tstx-row | move-branch), target the affected process/data class (per-type), trigger the phase marker that arms the injection, hold_seconds the SIGSTOP hold duration (sigstop_sigcont only), signal the kill signal (kill actions only, default SIGKILL), tree the TSTX tree hash to delete (delete-tstx-row only), ref/repeat/interval_s/wait_timeout_s the move-branch target-ref injection params (US-004), operator the executable that performs the injection. Schema contract is fail-closed: unknown type/target/operator/signal values and unknown properties are REJECTED; per-type target/param constraints are enforced by the controller's semantic validator.",
    "anyOf": [
     {
      "type": "null"
@@ -517,17 +517,19 @@
       "sigstop_sigcont",
       "kill-harness",
       "kill-daemon",
-      "delete-tstx-row"
+      "delete-tstx-row",
+      "move-branch"
      ],
-     "description": "Injection kind. sigstop_sigcont: SIGSTOP the target process, hold, then SIGCONT. kill-harness: send a signal (default SIGKILL) to the active harness process for the run. kill-daemon: send a signal (default SIGKILL) to the TT daemon (never the production daemon). delete-tstx-row: delete the TSTX evidence row(s) matching the declared tree hash."
+     "description": "Injection kind. sigstop_sigcont: SIGSTOP the target process, hold, then SIGCONT. kill-harness: send a signal (default SIGKILL) to the active harness process for the run. kill-daemon: send a signal (default SIGKILL) to the TT daemon (never the production daemon). delete-tstx-row: delete the TSTX evidence row(s) matching the declared tree hash. move-branch (US-004, S29 premise redesign): move the case's TARGET REF in the worktree-origin repository (the provisioned work clone) to its parent commit — the colleague target-move injection that makes merge.target_moved / reroute exhaustion genuinely fire; ref names the target ref (e.g. refs/heads/main), repeat the number of persistent moves (default 1), interval_s the seconds between repeated moves (REQUIRED when repeat > 1), wait_timeout_s the per-phase-marker wait bound in seconds (default 120; the controller passes it to tt-chaos as --timeout)."
     },
     "target": {
      "enum": [
       "harness_process",
       "daemon_process",
-      "tstx_row"
+      "tstx_row",
+      "origin_target_ref"
      ],
-     "description": "Process/data class the injection targets. Per-type: sigstop_sigcont and kill-harness target harness_process; kill-daemon targets daemon_process; delete-tstx-row targets tstx_row."
+     "description": "Process/data class the injection targets. Per-type: sigstop_sigcont and kill-harness target harness_process; kill-daemon targets daemon_process; delete-tstx-row targets tstx_row; move-branch targets origin_target_ref (the case's target branch ref inside the provisioned worktree-origin repository)."
     },
     "trigger": {
      "type": "string",
@@ -559,6 +561,28 @@
      "maxLength": 128,
      "pattern": "^[A-Za-z0-9]+$",
      "description": "Tree hash whose TSTX evidence rows delete-tstx-row deletes. REQUIRED for delete-tstx-row (per-type constraint enforced by the controller's semantic validator); must be ABSENT for other types."
+    },
+    "ref": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 128,
+     "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]*$",
+     "description": "Target ref in the worktree-origin repository that move-branch moves (e.g. refs/heads/main). REQUIRED for move-branch (per-type constraint enforced by the controller's semantic validator); must be ABSENT for other types."
+    },
+    "repeat": {
+     "type": "integer",
+     "minimum": 1,
+     "description": "move-branch only: number of persistent target moves (default 1). repeat > 1 requires interval_s — each move after the first lands interval_s seconds later, spreading the target pressure across the run's finalize window so the merger's expected-tip check observes a moved tip."
+    },
+    "interval_s": {
+     "type": "integer",
+     "minimum": 1,
+     "description": "move-branch only: seconds between repeated moves. REQUIRED when repeat > 1 (per-type constraint enforced by the controller's semantic validator); must be ABSENT when repeat is absent or 1."
+    },
+    "wait_timeout_s": {
+     "type": "integer",
+     "minimum": 1,
+     "description": "OPTIONAL bound (seconds) for each tt-chaos phase-marker wait (the initial trigger arming and, with repeat, the run-terminal stop check cadence). Passed to tt-chaos as --timeout. Defaults to tt-chaos's 120s when absent. Long-injection cells (S29 premise redesign: a trigger minutes into the run) MUST declare it or the operator exits 2 TRIGGER_NEVER before the trigger fires."
     },
     "operator": {
      "enum": [

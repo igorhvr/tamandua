@@ -29,6 +29,12 @@ import {
   snapshotHygieneCanary,
   verifyHygieneCanary,
 } from './tt-hygiene-canary.mjs';
+import {
+  stringMarkerVocabularyError,
+  objectTriggerVocabularyError,
+  unknownWorkflowSpecError,
+  workflowVocabularyFor,
+} from './tt-trigger-vocabulary.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const BIN_DIR = path.dirname(__filename);
@@ -148,6 +154,41 @@ function probeWhenValid(when) {
   if (hasStatus === hasEvent) return false;
   return Object.keys(when).every((key) => key === 'status' || key === 'event' || key === 'timeout_s');
 }
+
+// US-003 (S29): the fail-closed trigger-vocabulary preflight resolves the
+// case's declared workflow to its spec steps/agents (the W2.24 'local'
+// sentinel resolves to tt-docs-drift via resolveLocalSentinel) and checks a
+// `when` marker against that vocabulary plus the pinned product event/status
+// vocabularies (tt-trigger-vocabulary.mjs). Returns a DISTINCT
+// machine-parseable reason string or null. A case whose declared workflow has
+// no resolvable spec fails closed with `unknown-workflow-spec` — the marker
+// cannot be verified, so it must never be armed silently.
+function probeTriggerVocabularyError(caseRecord, when) {
+  if (typeof when === 'string') {
+    if (when === 'now') return null;
+    const workflowId = resolvedWorkflowIdFor(caseRecord);
+    if (workflowId === null) {
+      return 'unknown-workflow-spec: case declares no workflow id — cannot verify trigger vocabulary';
+    }
+    const vocab = workflowVocabularyFor(workflowId);
+    if (vocab.missing) return unknownWorkflowSpecError(workflowId, vocab);
+    return stringMarkerVocabularyError(when, workflowId, vocab, 'probe');
+  }
+  if (isObject(when)) return objectTriggerVocabularyError(when, 'probe');
+  return null;
+}
+
+// The workflow id the trigger-vocabulary preflight verifies against: the
+// W2.24 'local' sentinel resolves to the shipped TT-custom spec tt-docs-drift
+// (the literal `workflow run local` must never be constructed — resolveLocal
+// Sentinel owns that contract); every other case uses its declared workflow.
+function resolvedWorkflowIdFor(caseRecord) {
+  const sentinel = resolveLocalSentinel(caseRecord);
+  if (sentinel.sentinel && sentinel.ok) return sentinel.workflow_id;
+  if (typeof caseRecord.workflow === 'string' && caseRecord.workflow !== '') return caseRecord.workflow;
+  return null;
+}
+
 // Hold-capable probe ops that REQUIRE hold_seconds > 0. pause_drain is
 // deliberately excluded: drain is self-terminating (the in-flight run finishes,
 // then dispatch parks), so W3.19's pause_drain carries no hold_seconds.
@@ -725,6 +766,16 @@ function validateProbeSequence(caseRecord) {
       if (!probeWhenValid(when)) {
         errors.push(`${actionLabel} (op ${JSON.stringify(op ?? null)}): missing or invalid 'when' phase marker (expected now | step:<role>:<state> | event:<type> | {"status":<status>,"timeout_s":N} | {"event":<type>,"timeout_s":N})`);
       }
+      // US-003 (S29): fail-closed trigger-vocabulary preflight. A `when`
+      // marker naming a step/agent/event not in the case's known vocabulary
+      // is an immediate scenario error (distinct machine-parseable reason)
+      // instead of a 4–8-minute silent probe-trigger-unreached wait. The
+      // known vocabulary is the case's workflow spec steps/agents plus the
+      // pinned product event/status vocabularies (tt-trigger-vocabulary.mjs).
+      const vocabError = probeTriggerVocabularyError(caseRecord, when);
+      if (vocabError !== null) {
+        errors.push(`${actionLabel} (op ${JSON.stringify(op ?? null)}): ${vocabError}`);
+      }
       if (typeof op === 'string' && PROBE_HOLD_REQUIRED_OPS.has(op)
           && !(typeof action.hold_seconds === 'number' && Number.isFinite(action.hold_seconds) && action.hold_seconds > 0)) {
         errors.push(`${actionLabel} (op '${op}'): hold-capable op requires hold_seconds > 0`);
@@ -766,16 +817,18 @@ const CHAOS_MARKER_SHAPED_PATTERN = /^(now|step:[A-Za-z0-9._-]+:[A-Za-z0-9._-]+|
 // W4.01/W4.36 delete-tstx-row). Each type has an exact target and its own
 // param set; anything else fails closed (unknown type, wrong target, param
 // the type does not take).
-const CHAOS_TYPES = Object.freeze(['sigstop_sigcont', 'kill-harness', 'kill-daemon', 'delete-tstx-row']);
+const CHAOS_TYPES = Object.freeze(['sigstop_sigcont', 'kill-harness', 'kill-daemon', 'delete-tstx-row', 'move-branch']);
 const CHAOS_TARGET_FOR_TYPE = Object.freeze({
   sigstop_sigcont: 'harness_process',
   'kill-harness': 'harness_process',
   'kill-daemon': 'daemon_process',
   'delete-tstx-row': 'tstx_row',
+  'move-branch': 'origin_target_ref',
 });
 // Kill actions take an optional --signal (default SIGKILL, mirroring
 // bin/tt-chaos resolveSignal's VALID_SIGNALS). hold_seconds is sigstop-only;
-// tree is delete-tstx-row-only.
+// tree is delete-tstx-row-only; ref/repeat/interval_s/wait_timeout_s are
+// move-branch-only (US-004: the colleague target-move injection).
 const CHAOS_KILL_TYPES = new Set(['kill-harness', 'kill-daemon']);
 const CHAOS_VALID_SIGNALS = ['SIGKILL', 'SIGTERM', 'SIGSTOP', 'SIGCONT', 'SIGINT', 'SIGHUP', 'SIGUSR1', 'SIGUSR2'];
 
@@ -863,9 +916,68 @@ function validateChaosBlock(caseRecord) {
     } else if (block.tree !== undefined) {
       errors.push(`chaos block type '${block.type}' does not take tree (delete-tstx-row only)`);
     }
+    // US-004 (S29 premise redesign): move-branch is the typed colleague
+    // target-move injection — ref (the target ref in the worktree-origin
+    // repository) is required, repeat is the number of persistent moves
+    // (default 1), interval_s is required when repeat > 1 (the time-spread
+    // that lands a move inside the merger's expected-tip check window), and
+    // wait_timeout_s bounds the phase-marker waits (a trigger minutes into
+    // the run must not die on tt-chaos's 120s default). Fail-closed: any
+    // move-branch param on another type, or a missing/ malformed param here,
+    // is an immediate scenario error.
+    if (block.type === 'move-branch') {
+      if (!(typeof block.ref === 'string' && block.ref.length > 0 && /^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(block.ref))) {
+        errors.push('chaos block ref must be a non-empty ref name for move-branch (e.g. refs/heads/main)');
+      }
+      if (block.repeat !== undefined && (!Number.isSafeInteger(block.repeat) || block.repeat < 1)) {
+        errors.push('chaos block repeat must be a positive integer for move-branch (got ' + JSON.stringify(block.repeat) + ')');
+      }
+      const repeat = block.repeat ?? 1;
+      if (repeat > 1 && !(Number.isSafeInteger(block.interval_s) && block.interval_s > 0)) {
+        errors.push('chaos block interval_s must be a positive integer for move-branch when repeat > 1 (the seconds between persistent target moves)');
+      }
+      if ((repeat === 1 || block.repeat === undefined) && block.interval_s !== undefined) {
+        errors.push('chaos block interval_s requires repeat > 1 for move-branch (a single move needs no interval)');
+      }
+      if (block.wait_timeout_s !== undefined && (!Number.isSafeInteger(block.wait_timeout_s) || block.wait_timeout_s < 1)) {
+        errors.push('chaos block wait_timeout_s must be a positive integer (got ' + JSON.stringify(block.wait_timeout_s) + ')');
+      }
+    } else {
+      if (block.ref !== undefined) {
+        errors.push(`chaos block type '${block.type}' does not take ref (move-branch only)`);
+      }
+      if (block.repeat !== undefined) {
+        errors.push(`chaos block type '${block.type}' does not take repeat (move-branch only)`);
+      }
+      if (block.interval_s !== undefined) {
+        errors.push(`chaos block type '${block.type}' does not take interval_s (move-branch only)`);
+      }
+    }
   }
-  if (translateChaosTrigger(block.trigger) === null) {
+  const translatedTrigger = translateChaosTrigger(block.trigger);
+  if (translatedTrigger === null) {
     errors.push(`chaos block trigger ${JSON.stringify(block.trigger ?? null)} does not translate to a tt-chaos phase marker (known: mid_round -> step:developer:running; or a literal now | step:<role>:<state> | event:<type> | file:<path>)`);
+  }
+  // US-003 (S29): fail-closed trigger-vocabulary preflight for chaos blocks —
+  // mirrors the probe_sequence check (validateProbeSequence) and bin/tt-chaos
+  // validateMarker consistency. A translated trigger naming a step/agent/event
+  // not in the case's known vocabulary is an immediate scenario error
+  // (distinct machine-parseable reason) instead of a silent
+  // chaos-invocation-failed wait. `now`/`file:` markers have no vocabulary.
+  if (typeof translatedTrigger === 'string'
+      && (translatedTrigger.startsWith('step:') || translatedTrigger.startsWith('event:'))) {
+    const workflowId = resolvedWorkflowIdFor(caseRecord);
+    if (workflowId === null) {
+      errors.push('unknown-workflow-spec: case declares no workflow id — cannot verify chaos trigger vocabulary');
+    } else {
+      const vocab = workflowVocabularyFor(workflowId);
+      if (vocab.missing) {
+        errors.push(unknownWorkflowSpecError(workflowId, vocab));
+      } else {
+        const vocabError = stringMarkerVocabularyError(translatedTrigger, workflowId, vocab, 'chaos');
+        if (vocabError !== null) errors.push(vocabError);
+      }
+    }
   }
   if (caseRecord.harness === 'local') {
     errors.push('chaos block is not supported on local-command cases (harness \'local\') — there is no run/harness process to inject against');
@@ -5593,6 +5705,18 @@ async function waitForProbeTrigger(trigger, runId, attempt, childEnv) {
     }
     const status = probeRunStatusOrNull(runId, childEnv);
     if (status !== null && TERMINAL_RUN_STATUSES.has(status.status)) {
+      // US-004 (S29 premise redesign): the product flips the runs row to a
+      // terminal status BEFORE appending the terminal event (emitRunTerminal
+      // Event) in the same synchronous block — a poll landing between the two
+      // writes would see status=failed with event:run.failed not yet in the
+      // stream and wrongly report probe-trigger-unreached for an event that
+      // IS genuinely firing (W4.33d's resume on event:run.failed). Re-check
+      // the marker once after observing the terminal status so the terminal
+      // event has a chance to land; only then give up.
+      await delay(PROBE_POLL_INTERVAL_MS);
+      if (probeMarkerSatisfied(trigger, runId, childEnv)) {
+        return { satisfied: true, at: utcTimestamp(), waitedMs: Date.now() - startedAt };
+      }
       return {
         satisfied: false, at: utcTimestamp(), waitedMs: Date.now() - startedAt,
         terminalStatus: status.status,
@@ -5903,12 +6027,18 @@ async function runDeclaredProbeSequence(caseRecord, caseState, attempt, childEnv
 // contract): the operator binary, the injection type, --run <run-id>,
 // --when <translated trigger>, plus the per-type params — --hold-seconds for
 // sigstop_sigcont, --signal for kill actions (default SIGKILL), --tree for
-// delete-tstx-row. An action that does not take a param never receives it.
-// And — E3.C.1 US-003 — the EXPLICIT recorded harness target
-// (--target-pid/--target-pgid/--target-start-time) so tt-chaos never
-// re-resolves the harness by /proc sweep. A null targetRecord means the
-// caller must fail closed (chaos-invocation-failed) before invoking.
-function buildChaosArgv(block, runId, targetRecord) {
+// delete-tstx-row, and for move-branch (US-004) --repo <worktree-origin>
+// (the provisioned work clone the controller resolved), --ref <target ref>,
+// --repeat/--interval when the persistent-move budget is declared, and
+// --timeout when wait_timeout_s is declared (a trigger minutes into the run
+// must not die on tt-chaos's 120s default). An action that does not take a
+// param never receives it. And — E3.C.1 US-003 — the EXPLICIT recorded
+// harness target (--target-pid/--target-pgid/--target-start-time) so
+// tt-chaos never re-resolves the harness by /proc sweep. A null targetRecord
+// means the caller must fail closed (chaos-invocation-failed) before
+// invoking — EXCEPT move-branch, which targets the origin ref, not a harness
+// process, and receives no --target-* args.
+function buildChaosArgv(block, runId, targetRecord, originRepo) {
   const argv = [
     TT_CHAOS_PATH,
     block.type,
@@ -5921,8 +6051,21 @@ function buildChaosArgv(block, runId, targetRecord) {
     argv.push('--signal', block.signal ?? 'SIGKILL');
   } else if (block.type === 'delete-tstx-row') {
     argv.push('--tree', block.tree);
+  } else if (block.type === 'move-branch') {
+    if (typeof originRepo === 'string' && originRepo !== '') {
+      argv.push('--repo', originRepo);
+    }
+    argv.push('--ref', block.ref);
+    const repeat = block.repeat ?? 1;
+    if (repeat > 1) {
+      argv.push('--repeat', String(repeat));
+      argv.push('--interval', String(block.interval_s));
+    }
+    if (Number.isSafeInteger(block.wait_timeout_s) && block.wait_timeout_s > 0) {
+      argv.push('--timeout', String(block.wait_timeout_s));
+    }
   }
-  if (targetRecord !== null && targetRecord !== undefined) {
+  if (targetRecord !== null && targetRecord !== undefined && block.type !== 'move-branch') {
     argv.push('--target-pid', String(targetRecord.pid));
     if (Number.isInteger(targetRecord.pgid) && targetRecord.pgid > 0) {
       argv.push('--target-pgid', String(targetRecord.pgid));
@@ -6059,6 +6202,43 @@ function resolveHarnessTargetRecord(runId, attempt, childEnv) {
   return null;
 }
 
+// US-004 (S29 premise redesign): the move-branch injection's target is the
+// TARGET REF inside the worktree-origin repository — the provisioned work
+// clone the controller hands to --worktree-origin-repository (attempt.
+// fixture_work_clone). That clone is provisioned BEFORE the launch (and
+// therefore before runDeclaredChaos), so the repo is resolvable here. A
+// missing clone fails closed in runDeclaredChaos (never a silent
+// half-injection).
+function resolveChaosOriginRepo(attempt) {
+  const clone = attempt?.fixture_work_clone;
+  if (typeof clone === 'string' && clone !== '') return clone;
+  return null;
+}
+
+// Verify the declared move-branch ref actually exists in the worktree-origin
+// repository BEFORE spawning the operator (fail-closed: an injection against
+// a ref the repo does not have can never fire and must never be armed
+// silently). Returns a precise reason string, or null when the ref resolves.
+// Passes through the containment choke-point (assertContainedSpawnEnv) like
+// every spawn site in the controller.
+function chaosOriginRefError(originRepo, ref, childEnv) {
+  if (typeof originRepo !== 'string' || originRepo === '') return 'no worktree-origin repository resolved';
+  assertContainedSpawnEnv(childEnv);
+  let result;
+  try {
+    result = spawnSync('git', ['-C', originRepo, 'rev-parse', '--verify', '--quiet', `${ref}^{commit}`], {
+      encoding: 'utf8',
+      timeout: 15_000,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch (error) {
+    return `cannot verify ref ${ref} in ${originRepo}: ${error.message}`;
+  }
+  if (result.error !== undefined) return `cannot verify ref ${ref} in ${originRepo}: ${result.error.message}`;
+  if (result.status !== 0) return `ref ${ref} does not resolve to a commit in ${originRepo}`;
+  return null;
+}
+
 // Wait for the harness target record before a chaos invocation. The harness
 // that owns the run at FIRE time is the process group of the step currently
 // claimed — NOT the first claim row (earlier setup/planner rounds claim and
@@ -6068,6 +6248,14 @@ function resolveHarnessTargetRecord(runId, attempt, childEnv) {
 // falls back to the persisted/launch record when the run reaches a terminal
 // status or the case deadline (the operator then fails closed — never a /proc
 // sweep). Mirrors waitForProbeTrigger's bounds.
+//
+// S28 (US-005): the return now carries WHY the wait stopped so the caller can
+// fail closed precisely — reason 'marker-fired' (the trigger fired while the
+// run was in flight; the caller MUST proceed), 'terminal' (the run reached a
+// terminal status before the marker ever fired — the injection can never
+// fire; the caller MUST refuse instead of spawning an operator that the
+// contained daemon's post-run leak-guard sweep would SIGKILL), or 'deadline'
+// (the case deadline elapsed; the caller re-checks the status itself).
 async function waitForHarnessTargetRecord(runId, attempt, childEnv, marker) {
   const deadline = new Date(attempt.deadline_at).valueOf();
   let latest = null;
@@ -6075,17 +6263,74 @@ async function waitForHarnessTargetRecord(runId, attempt, childEnv, marker) {
     const steps = stepsTableHarnessRecord(runId, childEnv);
     if (steps !== null) {
       latest = steps;
-      writeHarnessTargetRecord(runId, steps);
-    }
+      writeHarnessTargetRecord(runId, steps);    }
     if (probeMarkerSatisfied(marker, runId, childEnv)) {
-      if (latest !== null) return latest;
-      break;
+      // Marker wins even with no recorded claim row: fall back to the
+      // persisted/launch record so a legitimately-armed injection proceeds.
+      return {
+        record: latest !== null ? latest : resolveHarnessTargetRecord(runId, attempt, childEnv),
+        reason: 'marker-fired',
+        terminalStatus: null,
+      };
     }
     const status = probeRunStatusOrNull(runId, childEnv);
-    if (status !== null && TERMINAL_RUN_STATUSES.has(status.status)) break;
+    if (status !== null && TERMINAL_RUN_STATUSES.has(status.status)) {
+      return {
+        record: resolveHarnessTargetRecord(runId, attempt, childEnv),
+        reason: 'terminal',
+        terminalStatus: status.status,
+      };
+    }
     await delay(PROBE_POLL_INTERVAL_MS);
   }
-  return resolveHarnessTargetRecord(runId, attempt, childEnv);
+  return {
+    record: resolveHarnessTargetRecord(runId, attempt, childEnv),
+    reason: 'deadline',
+    terminalStatus: null,
+  };
+}
+
+// S28 (US-005): fail-closed terminal-run refusal for a chaos invocation. A
+// chaos op spawned against a run that is already terminal can never fire its
+// trigger — the contained daemon's post-run leak-guard sweep
+// (src/installer/run-cleanup.ts sweepRunProcesses — cmdline-contains-runId
+// matcher) SIGKILLs the lingering operator, which surfaced as the campaign's
+// `chaos operator 'tt-chaos' exited null` (S28). Returns a precise one-line
+// machine-parseable refusal reason, or null when the run is NOT terminal. A
+// degraded status query (null) proceeds — tt-chaos's own startup guard is the
+// operator-side backstop.
+function chaosTerminalRunRefusal(runId, childEnv, marker, operator) {
+  const status = probeRunStatusOrNull(runId, childEnv);
+  if (status === null) return null;
+  if (!TERMINAL_RUN_STATUSES.has(status.status)) return null;
+  return `chaos-invocation-refused: run ${runId} already terminal (${status.status}) before trigger ${marker} — refusing to invoke chaos operator '${operator}'`;
+}
+
+// S28 (US-005): render a failed chaos invocation's exit as a precise,
+// machine-parseable description. `exited <code>` when the operator exited;
+// `exited null (signal SIGKILL)` when it was killed by a signal (the
+// contained daemon's post-run leak-guard sweep); the operator's own first
+// stderr line is appended when present so the precise reason it printed
+// (e.g. tt-chaos's `chaos-refused: ...` fast-fail) reaches the
+// chaos-invocation-failed failure message — never a bare `exited null`.
+function chaosOperatorExitDescription(result) {
+  let statusPart;
+  if (result.status !== null && result.status !== undefined) {
+    statusPart = `exited ${result.status}`;
+  } else if (result.signal !== null && result.signal !== undefined) {
+    statusPart = `exited null (signal ${result.signal})`;
+  } else {
+    statusPart = 'exited null';
+  }
+  const stderrLine = String(result.stderr ?? '').split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => line !== '') ?? '';
+  const errorMessage = result.error !== undefined && result.error !== null
+    ? result.error.message
+    : null;
+  if (stderrLine !== '') return `${statusPart}: ${stderrLine}`;
+  if (errorMessage !== null) return `${statusPart}: ${errorMessage}`;
+  return statusPart;
 }
 
 async function runDeclaredChaos(caseRecord, attempt, childEnv, state, campaignDir) {
@@ -6110,6 +6355,15 @@ async function runDeclaredChaos(caseRecord, attempt, childEnv, state, campaignDi
     hold_seconds: block.type === 'sigstop_sigcont' ? block.hold_seconds : null,
     declared_signal: block.type !== undefined && CHAOS_KILL_TYPES.has(block.type) ? (block.signal ?? 'SIGKILL') : null,
     tree: block.type === 'delete-tstx-row' ? block.tree : null,
+    // US-004 (S29 premise redesign): move-branch declaration + resolved
+    // worktree-origin repository (the provisioned work clone) and the
+    // persistent-move budget, recorded so O16/oracle snapshot cross-checks
+    // see exactly what was injected.
+    ref: block.type === 'move-branch' ? block.ref : null,
+    repeat: block.type === 'move-branch' ? (block.repeat ?? 1) : null,
+    interval_s: block.type === 'move-branch' ? (block.interval_s ?? null) : null,
+    wait_timeout_s: block.type === 'move-branch' ? (block.wait_timeout_s ?? null) : null,
+    origin_repo: block.type === 'move-branch' ? (resolveChaosOriginRepo(attempt) ?? null) : null,
     status: 'running',
     started_at: utcTimestamp(),
     ended_at: null,
@@ -6123,6 +6377,56 @@ async function runDeclaredChaos(caseRecord, attempt, childEnv, state, campaignDi
   state.updated_at = evidence.started_at;
   atomicWriteState(campaignDir, state);
 
+  // US-004 (S29 premise redesign): move-branch injects against the ORIGIN
+  // TARGET REF inside the provisioned worktree-origin repository (the work
+  // clone handed to --worktree-origin-repository), NOT against a harness
+  // process — so the E3.C.1 harness-target-record wait (kill-harness /
+  // sigstop_sigcont) and its --target-* argv do not apply. Fail closed with
+  // a precise reason if the origin repo is unresolvable or the declared ref
+  // does not exist there (never a silent half-injection).
+  const moveBranch = block.type === 'move-branch';
+  let originRepo = null;
+  if (moveBranch) {
+    originRepo = resolveChaosOriginRepo(attempt);
+    if (originRepo === null) {
+      evidence.status = 'failed';
+      evidence.ended_at = utcTimestamp();
+      evidence.failure = {
+        category: 'chaos-invocation-failed',
+        message: `chaos operator '${block.operator}' move-branch has no provisioned worktree-origin repository for run ${runId} (case ${caseRecord.id} fixture ${caseRecord.fixture ?? '?'}) — refusing to inject (no origin ref target)`,
+        operator: block.operator,
+        exit_code: null,
+        signal: null,
+        error: 'no provisioned worktree-origin repository',
+        timed_out: null,
+        argv: null,
+      };
+      attempt.chaos_evidence = evidence;
+      state.updated_at = evidence.ended_at;
+      atomicWriteState(campaignDir, state);
+      return { ok: false, reason: evidence.failure };
+    }
+    const refError = chaosOriginRefError(originRepo, block.ref, childEnv);
+    if (refError !== null) {
+      evidence.status = 'failed';
+      evidence.ended_at = utcTimestamp();
+      evidence.failure = {
+        category: 'chaos-invocation-failed',
+        message: `chaos operator '${block.operator}' move-branch ref check failed for run ${runId}: ${refError}`,
+        operator: block.operator,
+        exit_code: null,
+        signal: null,
+        error: refError,
+        timed_out: null,
+        argv: null,
+      };
+      attempt.chaos_evidence = evidence;
+      state.updated_at = evidence.ended_at;
+      atomicWriteState(campaignDir, state);
+      return { ok: false, reason: evidence.failure };
+    }
+  }
+
   // E3.C.1 US-003: resolve + persist the harness target record BEFORE
   // invoking tt-chaos (steps-table claim row preferred, launch-process
   // identity fallback) and hand it as explicit --target-* args — the
@@ -6130,38 +6434,108 @@ async function runDeclaredChaos(caseRecord, attempt, childEnv, state, campaignDi
   // returns the record for the harness that owns the run at the chaos
   // trigger's fire moment (the latest steps-table claim row); with no
   // recorded target the invocation fails closed (chaos-invocation-failed)
-  // and tt-chaos is never spawned.
-  const targetRecord = await waitForHarnessTargetRecord(runId, attempt, childEnv, translateChaosTrigger(block.trigger));
-  evidence.target_record = targetRecord === null ? null : {
-    pid: targetRecord.pid,
-    pgid: Number.isInteger(targetRecord.pgid) && targetRecord.pgid > 0 ? targetRecord.pgid : null,
-    startTime: targetRecord.startTime ?? null,
-    source: targetRecord.source ?? null,
-  };
-  attempt.chaos_evidence = evidence;
-  state.updated_at = utcTimestamp();
-  atomicWriteState(campaignDir, state);
-  if (targetRecord === null) {
-    evidence.status = 'failed';
-    evidence.ended_at = utcTimestamp();
-    evidence.failure = {
-      category: 'chaos-invocation-failed',
-      message: `chaos operator '${block.operator}' has no recorded harness target for run ${runId} — refusing to invoke (never scan-resolve)`,
-      operator: block.operator,
-      exit_code: null,
-      signal: null,
-      error: 'no recorded harness target record',
-      timed_out: null,
-      argv: null,
+  // and tt-chaos is never spawned. move-branch skips this (origin-ref
+  // injection — no harness process target).
+  let targetRecord = null;
+  // S28 (US-005): how the harness-target wait stopped — 'marker-fired' |
+  // 'terminal' | 'deadline' (null for move-branch, which has no wait). The
+  // terminal refusal applies ONLY when the trigger never fired: a marker
+  // that fired while the run was in flight is a legitimately-armed injection
+  // (a terminal status re-read right after is a race, not a refusal).
+  let waitStopReason = null;
+  if (!moveBranch) {
+    // S28 (US-005): the wait reports WHY it stopped. 'marker-fired' proceeds
+    // (the trigger legitimately fired while the run was in flight);
+    // 'terminal' fails closed HERE with a precise one-line
+    // chaos-invocation-refused reason — never spawn an operator against a run
+    // that already went terminal (the contained daemon's post-run leak-guard
+    // sweep would SIGKILL the lingering operator — the campaign's `chaos
+    // operator 'tt-chaos' exited null`).
+    const wait = await waitForHarnessTargetRecord(runId, attempt, childEnv, translateChaosTrigger(block.trigger));
+    waitStopReason = wait.reason;
+    targetRecord = wait.record;
+    evidence.target_record = targetRecord === null ? null : {
+      pid: targetRecord.pid,
+      pgid: Number.isInteger(targetRecord.pgid) && targetRecord.pgid > 0 ? targetRecord.pgid : null,
+      startTime: targetRecord.startTime ?? null,
+      source: targetRecord.source ?? null,
     };
     attempt.chaos_evidence = evidence;
-    state.updated_at = evidence.ended_at;
+    state.updated_at = utcTimestamp();
     atomicWriteState(campaignDir, state);
-    return { ok: false, reason: evidence.failure };
+    if (wait.reason === 'terminal') {
+      evidence.status = 'failed';
+      evidence.ended_at = utcTimestamp();
+      evidence.failure = {
+        category: 'chaos-invocation-failed',
+        message: chaosTerminalRunRefusal(runId, childEnv, translateChaosTrigger(block.trigger), block.operator)
+          ?? `chaos-invocation-refused: run ${runId} reached terminal (${wait.terminalStatus ?? 'unknown'}) before trigger ${translateChaosTrigger(block.trigger)} — refusing to invoke chaos operator '${block.operator}'`,
+        operator: block.operator,
+        exit_code: null,
+        signal: null,
+        error: `run terminal (${wait.terminalStatus ?? 'unknown'}) before trigger`,
+        timed_out: null,
+        argv: null,
+        refused: true,
+      };
+      attempt.chaos_evidence = evidence;
+      state.updated_at = evidence.ended_at;
+      atomicWriteState(campaignDir, state);
+      return { ok: false, reason: evidence.failure };
+    }
+    if (targetRecord === null) {
+      evidence.status = 'failed';
+      evidence.ended_at = utcTimestamp();
+      evidence.failure = {
+        category: 'chaos-invocation-failed',
+        message: `chaos operator '${block.operator}' has no recorded harness target for run ${runId} — refusing to invoke (never scan-resolve)`,
+        operator: block.operator,
+        exit_code: null,
+        signal: null,
+        error: 'no recorded harness target record',
+        timed_out: null,
+        argv: null,
+      };
+      attempt.chaos_evidence = evidence;
+      state.updated_at = evidence.ended_at;
+      atomicWriteState(campaignDir, state);
+      return { ok: false, reason: evidence.failure };
+    }
+  }
+
+  // S28 (US-005): fail-closed terminal-run guard at invocation time. For
+  // move-branch there is no harness-target wait, so this is the ONLY
+  // controller-side gate before the spawn; for harness-target injections it
+  // covers the 'deadline' stop (the wait never saw a terminal status but the
+  // status may have flipped since). SKIPPED when the marker fired — the
+  // injection is legitimately armed. A degraded status query (null)
+  // proceeds — tt-chaos's own startup guard (exit EXIT_RUN_TERMINAL) is the
+  // operator-side backstop.
+  if (moveBranch || waitStopReason !== 'marker-fired') {
+    const terminalRefusal = chaosTerminalRunRefusal(runId, childEnv, translateChaosTrigger(block.trigger), block.operator);
+    if (terminalRefusal !== null) {
+      evidence.status = 'failed';
+      evidence.ended_at = utcTimestamp();
+      evidence.failure = {
+        category: 'chaos-invocation-failed',
+        message: terminalRefusal,
+        operator: block.operator,
+        exit_code: null,
+        signal: null,
+        error: 'run terminal before trigger',
+        timed_out: null,
+        argv: null,
+        refused: true,
+      };
+      attempt.chaos_evidence = evidence;
+      state.updated_at = evidence.ended_at;
+      atomicWriteState(campaignDir, state);
+      return { ok: false, reason: evidence.failure };
+    }
   }
 
   assertContainedSpawnEnv(childEnv);
-  const argv = buildChaosArgv(block, runId, targetRecord);
+  const argv = buildChaosArgv(block, runId, targetRecord, originRepo);
   evidence.argv = argv;
   // Bound the invocation by the case's remaining wall budget (phase wait +
   // hold are themselves bounded inside tt-chaos, but a wedged operator must
@@ -6189,7 +6563,11 @@ async function runDeclaredChaos(caseRecord, attempt, childEnv, state, campaignDi
     evidence.status = 'failed';
     evidence.failure = {
       category: 'chaos-invocation-failed',
-      message: `chaos operator '${block.operator}' exited ${result.status}${evidence.error !== null ? `: ${evidence.error}` : ''}`,
+      // S28 (US-005): surface the operator's own stderr line (the precise
+      // reason it printed — e.g. tt-chaos's `chaos-refused: ...` fast-fail)
+      // instead of a bare `exited null`, and name the death signal when the
+      // operator was killed (the post-run sweep) rather than exiting.
+      message: `chaos operator '${block.operator}' ${chaosOperatorExitDescription(result)}`,
       operator: block.operator,
       exit_code: result.status,
       signal: result.signal ?? null,
@@ -9128,6 +9506,30 @@ function requiredHarnessesFor(manifest) {
   return Array.from(harnesses).sort();
 }
 
+// S30 US-008: distinct declared workflows of the SELECTED real (non-scripted)
+// workflow-launching cases that the real-case preflight must verify are
+// present in the installed catalog BEFORE any launch. Only cases that launch
+// a workflow (harness pi/hermes/dsh — NOT local-command cells) contribute;
+// the `local` sentinel (W2.24, harness pi) resolves to tt-docs-drift (US-007)
+// so the sentinel-launch adapter's target is verified like any other
+// workflow. Scripted cases are excluded (their catalog is the SCRIPTED home,
+// verified by the scripted preflight). Returns sorted distinct ids.
+function selectedRealWorkflowIds(manifest) {
+  const ids = new Set();
+  for (const caseRecord of manifest.cases) {
+    if (caseUsesScriptedEnvironment(caseRecord)) continue;
+    if (caseRecord.harness === 'local') continue; // local-command cell — no workflow launch
+    let workflowId = caseRecord.workflow;
+    if (workflowId === LOCAL_SENTINEL_MARKER) {
+      const sentinel = resolveLocalSentinel(caseRecord);
+      if (!(sentinel.sentinel && sentinel.ok)) continue; // unsupported sentinel profile — the launch guard refuses it later
+      workflowId = sentinel.workflow_id;
+    }
+    if (typeof workflowId === 'string' && workflowId.length > 0) ids.add(workflowId);
+  }
+  return Array.from(ids).sort();
+}
+
 // Runs the preflight legs in order under the CONTAINED real spawn env.
 // On any leg failure it FAILS CLOSED: persists the DISTINCT reason and throws
 // so the campaign aborts non-zero (US-004 AC2). Never touches the operator's
@@ -9171,8 +9573,21 @@ function runRealPreflight(campaignDir, state, manifest, fresh) {
   const daemonUpArgs = fresh ? ['ensure-up', '--fresh'] : ['ensure-up'];
   legs.push(
     { label: 'catalog-install', script: PREFLIGHT_CATALOG_PATH, args: [], reason: 'catalog-missing' },
-    { label: 'daemon-up', script: PREFLIGHT_DAEMON_PATH, args: daemonUpArgs, reason: 'tt-daemon-down' },
   );
+  // S30 US-008: fail-closed workflow-spec preflight leg. After catalog-install
+  // (which installs the FULL required set incl. TT-custom workflows), verify
+  // every SELECTED real workflow case's declared workflow is present in the
+  // installed catalog of the contained home. A missing spec is the W4.14
+  // defect class (`workflow-spec-missing: No workflow.yml found in
+  // .../workflows/<workflow>` at launch) — this leg refuses the campaign
+  // BEFORE any launch with the DISTINCT machine-parseable reason
+  // `workflow-spec-missing: <workflow>`. Runs only when the selection has
+  // real workflow-launching cases.
+  const workflowSpecIds = selectedRealWorkflowIds(manifest);
+  if (workflowSpecIds.length > 0) {
+    legs.push({ label: 'workflow-spec', script: PREFLIGHT_CATALOG_PATH, args: ['--verify', ...workflowSpecIds], reason: 'workflow-spec-missing' });
+  }
+  legs.push({ label: 'daemon-up', script: PREFLIGHT_DAEMON_PATH, args: daemonUpArgs, reason: 'tt-daemon-down' });
   const outcomes = [];
   for (const leg of legs) {
     const result = spawnPreflightLeg(leg.script, leg.args, env);

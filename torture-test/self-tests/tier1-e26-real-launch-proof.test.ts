@@ -17,7 +17,9 @@
 // gitignored var/results/ that actually launched a run (tokens_observed > 0)
 // and asserts the E2.6-proof contract on its evidence:
 //   (1) preflight GREEN: home-provision → harness-auth → catalog-install →
-//       daemon-up legs all ok, and the contained daemon was stopped at teardown;
+//       workflow-spec → daemon-up legs all ok (S30 US-008 adds the
+//       workflow-spec leg verifying selected cases' declared workflows are
+//       installed), and the contained daemon was stopped at teardown;
 //   (2) the tt-shim-probe custom workflow was actually installed into the
 //       contained TT home (workflow.yml present + custom catalog stamp);
 //   (3) the real pi round produced tokens > 0 (case + campaign ledger);
@@ -47,7 +49,14 @@ const containedDaemonLog = path.join(containedHome, ".tamandua", "tamandua.log")
 const TARGET_CASE = "W1.L2-python";
 const CUSTOM_WORKFLOW = "tt-shim-probe";
 const CONFIGURED_ORACLES = ["O1", "O3z", "O8", "O9", "O11"];
-const EXPECTED_PREFLIGHT_LEGS = ["home-provision", "harness-auth", "catalog-install", "daemon-up"];
+// S30 US-008: the real-case preflight now includes the workflow-spec leg
+// (verifies each selected real case's declared workflow is installed) between
+// catalog-install and daemon-up — only when the selection has workflow cases
+// (W1.L2-python is a real pi case, so the leg is present). Pre-US-008 real
+// evidence has the 4-leg shape (no workflow-spec); assert the leg ORDER
+// tolerantly: the four core legs in sequence, with workflow-spec (when
+// present) between catalog-install and daemon-up.
+const CORE_PREFLIGHT_LEGS = ["home-provision", "harness-auth", "catalog-install", "daemon-up"];
 
 function loadJson(file: string): any {
   return JSON.parse(fs.readFileSync(file, "utf8"));
@@ -112,8 +121,17 @@ it("US-007: the single real W1.L2-python proof left preflight GREEN, tt-shim-pro
   assert.equal(preflight.engaged, true, "preflight must be engaged");
   assert.equal(preflight.ok, true, `preflight must be ok; reason=${preflight.reason ?? "?"}`);
   const legLabels = (preflight.legs ?? []).map((leg: any) => leg.leg);
-  assert.deepEqual(legLabels, EXPECTED_PREFLIGHT_LEGS,
-    "preflight legs must be home-provision → harness-auth → catalog-install → daemon-up");
+  // The four core legs must appear in order; the S30 workflow-spec leg (when
+  // present) must sit between catalog-install and daemon-up.
+  const coreIndexes = CORE_PREFLIGHT_LEGS.map((leg) => legLabels.indexOf(leg));
+  assert.deepEqual(coreIndexes, [0, 1, 2, 3],
+    `preflight legs must start home-provision → harness-auth → catalog-install → daemon-up (got: ${legLabels.join(" → ")})`);
+  assert.deepEqual(legLabels.slice(0, 4), CORE_PREFLIGHT_LEGS,
+    `core preflight legs out of order (got: ${legLabels.join(" → ")})`);
+  if (legLabels.length > 4) {
+    assert.deepEqual(legLabels, ["home-provision", "harness-auth", "catalog-install", "workflow-spec", "daemon-up"],
+      `with the S30 workflow-spec leg it must sit between catalog-install and daemon-up (got: ${legLabels.join(" → ")})`);
+  }
   for (const leg of preflight.legs ?? []) {
     assert.equal(leg.ok, true, `preflight leg ${leg.leg} must be ok`);
   }

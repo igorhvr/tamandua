@@ -111,6 +111,20 @@ HEAVY_CAMPAIGN_TESTS=(
     # (step output matches the cell's canned output) — heavy/isolated like the
     # tier1 scripted battery.
     'tier2-scripted-behaviors-materialization.test.ts'
+    # US-002 (S29): tier2-s29-fired-trigger-corridor drives the real controller
+    # + scripted daemon with pinned harness binaries to prove a probe armed on
+    # the US-002-calibrated step:fixer:running trigger genuinely FIRES and
+    # executes its action (pause / restart_daemon) with recorded probe
+    # evidence — heavy/isolated like the tier1 scripted battery.
+    'tier2-s29-fired-trigger-corridor.test.ts'
+    # US-004 (S29): tier2-s29-premise-redesign-corridor drives the real
+    # controller + scripted daemon with pinned harness binaries to prove the
+    # REDESIGNED premise is genuinely reachable — the typed move-branch chaos
+    # makes event:run.failed (W4.33d reroute exhaustion) and
+    # event:merge.target_moved (W4.48b) fire, and the probe actions armed on
+    # them (resume / pause) execute with recorded probe evidence —
+    # heavy/isolated like the tier1 scripted battery.
+    'tier2-s29-premise-redesign-corridor.test.ts'
 )
 
 # is_heavy <base> — 0 if <base> is a heavy campaign test (isolated elsewhere), else 1.

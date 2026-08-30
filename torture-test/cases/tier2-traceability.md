@@ -513,8 +513,8 @@ Every row carries `spec_ref` into `08-wave-4-fault-injection.md` §G.
 
 | Case ID | spec_ref | Fixture | Seed | Harness | Workflow | Mode | Injection | Expected (O10 unless noted) |
 |---------|----------|---------|------|---------|----------|------|-----------|------------------------------|
-| W4.33a-daemon-restart-resume | `#W4.33` | tt-ts | BUG-T3 | pi | bug-fix-merge-worktree | real | pause_drain at `step:developer:running` (hold 600) → OPERATOR restarts the contained daemon during the hold (single-run `restart_daemon` op is multi-run-only — operator seam, see below) → resume | paused run continues cleanly after the daemon restart; pause state survives (DB-durable), O16 `run_completes`; EXCLUSIVE WINDOW (daemon-lifecycle) |
-| W4.33b-update-under-it-resume | `#W4.33` | tt-ts | BUG-T1 | pi | bug-fix-merge-worktree | real | pause at `step:developer:running` (hold 600) → OPERATOR runs `tamandua update --force` under the paused run → resume | defined YAML-version behavior surfaced not silent; resumed run completes with truthful annotation chain; O16 `no_rounds_during_hold` + `run_completes` |
+| W4.33a-daemon-restart-resume | `#W4.33` | tt-ts | BUG-T3 | pi | bug-fix-merge-worktree | real | pause_drain at `step:fixer:running` (hold 600; S29 calibration US-002 — the bfmw coding step, agent `fixer`) → OPERATOR restarts the contained daemon during the hold (single-run `restart_daemon` op is multi-run-only — operator seam, see below) → resume | paused run continues cleanly after the daemon restart; pause state survives (DB-durable), O16 `run_completes`; EXCLUSIVE WINDOW (daemon-lifecycle) |
+| W4.33b-update-under-it-resume | `#W4.33` | tt-ts | BUG-T1 | pi | bug-fix-merge-worktree | real | pause at `step:fixer:running` (hold 600; S29 calibration US-002) → OPERATOR runs `tamandua update --force` under the paused run → resume | defined YAML-version behavior surfaced not silent; resumed run completes with truthful annotation chain; O16 `no_rounds_during_hold` + `run_completes` |
 | W4.33c-deleted-worktree-refusal | `#W4.33` | tt-ts | BUG-T2 | pi | bug-fix-merge-worktree | real | operator deletes the run worktree out-of-band mid-run (W4.13 composition; no typed probe op) → operator `workflow resume` | diagnosable refusal, NEVER a silent fallback into the wrong directory (DC25 contamination fossil); `run_worktrees` reflects reality; no O16 (resume-refusal would trip the hardcoded resume-completes leg) |
 | W4.33d-reroute-exhaustion-resume | `#W4.33` | tt-ts | BUG-T4 | pi | bug-fix-merge-worktree | real | persistent target-move (tt-chaos `colleague-commit`/`move-branch`, untyped) exhausts finalize `max_reroutes: 8` → run permanently fails → operator removes the condition → probe `resume` armed on `event:run.failed` | resume picks up from the failed step with context intact (AGENTS.md documented path); run completes; O16 `run_completes` |
 | W4.48a-daemon-kill-mid-park | `#W4.48` | tt-ts | BUG-T1 | pi | bug-fix-merge-worktree | real | TYPED chaos `kill-daemon` SIGKILL at `step:finalize_merge:running` (park-event approximation — no product `merge.park*` event, see below) → operator restarts daemon | PARK crash-safety: landing completes from the parked state OR park branch survives intact for manual landing; NEVER a lost diff / half-applied target; EXCLUSIVE WINDOW (daemon-lifecycle) |
@@ -582,10 +582,10 @@ Every row carries `spec_ref` into `08-wave-4-fault-injection.md` §C.
 
 | Case ID | spec_ref | Fixture | Seed | Harness | Workflow | Mode | Injection | Expected (O10 unless noted) |
 |---------|----------|---------|------|---------|----------|------|-----------|------------------------------|
-| W4.09-pi-kill-harness | `#W4.09` | tt-ts | BUG-T1 | pi | bug-fix-merge-worktree | real | TYPED chaos `kill-harness` SIGKILL at `step:developer:running` (target harness_process) | worker_lost → re-pend with feedback within one sweep; abandonment counters only after budget; no double-dispatch into the same workdir while any group member lives |
-| W4.09-hermes-kill-harness | `#W4.09` | tt-ts | BUG-T2 | hermes | bug-fix-merge-worktree | real | TYPED chaos `kill-harness` SIGKILL at `step:developer:running` (target harness_process; hermes presence gated by `requires.capabilities: ["hermes"]`) | same worker_lost → re-pend corridor through the hermes ingress |
-| W4.10-kill-daemon | `#W4.10` | tt-ts | BUG-T3 | pi | bug-fix-merge-worktree | real | TYPED chaos `kill-daemon` SIGKILL at `step:developer:running` (target daemon_process) + OPERATOR restarts the contained daemon (single-run restart is an operator seam — `restart_daemon` probe op is multi-run-only; see deltas) | live round adopted/completed (late completion accepted); no requeue while the group lives; recovery ≤2 dispatch intervals; DB intact; EXCLUSIVE WINDOW (daemon-lifecycle) |
-| W4.10-restart-recovery | `#W4.10` | tt-ts | BUG-T4 | pi | bug-fix-merge-worktree | real | TWO concurrent runs; TYPED `restart_daemon` probe on every run group at `step:developer:running` with `{recovery_within_dispatch_intervals: 2, token_flush_preserved: true, run_completes: true}` | every in-flight run recovers within 2 dispatch intervals with the token flush preserved and completes (O16); EXCLUSIVE WINDOW (daemon-lifecycle) |
+| W4.09-pi-kill-harness | `#W4.09` | tt-ts | BUG-T1 | pi | bug-fix-merge-worktree | real | TYPED chaos `kill-harness` SIGKILL at `step:fixer:running` (target harness_process; S29 calibration US-003 — `step:developer:running` is not bfmw vocabulary) | worker_lost → re-pend with feedback within one sweep; abandonment counters only after budget; no double-dispatch into the same workdir while any group member lives |
+| W4.09-hermes-kill-harness | `#W4.09` | tt-ts | BUG-T2 | hermes | bug-fix-merge-worktree | real | TYPED chaos `kill-harness` SIGKILL at `step:fixer:running` (target harness_process; hermes presence gated by `requires.capabilities: ["hermes"]`; S29 calibration US-003) | same worker_lost → re-pend corridor through the hermes ingress |
+| W4.10-kill-daemon | `#W4.10` | tt-ts | BUG-T3 | pi | bug-fix-merge-worktree | real | TYPED chaos `kill-daemon` SIGKILL at `step:fixer:running` (target daemon_process; S29 calibration US-003) + OPERATOR restarts the contained daemon (single-run restart is an operator seam — `restart_daemon` probe op is multi-run-only; see deltas) | live round adopted/completed (late completion accepted); no requeue while the group lives; recovery ≤2 dispatch intervals; DB intact; EXCLUSIVE WINDOW (daemon-lifecycle) |
+| W4.10-restart-recovery | `#W4.10` | tt-ts | BUG-T4 | pi | bug-fix-merge-worktree | real | TWO concurrent runs; TYPED `restart_daemon` probe on every run group at `step:fixer:running` (S29 calibration US-002 — the bfmw coding step, agent `fixer`) with `{recovery_within_dispatch_intervals: 2, token_flush_preserved: true, run_completes: true}` | every in-flight run recovers within 2 dispatch intervals with the token flush preserved and completes (O16); EXCLUSIVE WINDOW (daemon-lifecycle) |
 | W4.27-shim-exit-matrix | `#W4.27` | none | — | local (scripted) | local | scripted | scenario cell `scenarios/w4.27/shim-exit-matrix` exercises the shim's special-exit corridor: (a) SIGTERM→87 + released claim, (b) SIGKILL→no row + fresh same-key execute, (c) tracked-dirty mid-suite→86 no row, (d) dirty tree→88 no execution, (e) prompt-order edit-test-commit classification | exits [86,87,88] + SIGKILL no-row + fresh same-key execute within seconds; prompt-order outcome classified as PRODUCT behavior; junk probe untracked; ZERO tokens (O1/O3z/O11 local-case oracle set) |
 | W4.32-enospc | `#W4.32` | tt-ts | BUG-T1 | pi | bug-fix-merge-worktree | real | operator mounts a small loopback fs under `torture-test/var/` and points `TAMANDUA_WORKTREE_ROOT` at it (task-carried setup — no typed op for mounting; see deltas); bfmw overflows mid-implement | diagnosable failure (ENOSPC named); DB intact; no phantom completion; worktree row consistent (first resource-exhaustion coverage, DC48) |
 
@@ -818,7 +818,7 @@ tt-harness-auth-probe's dsh leg.
 | W4.dsh-do-now | `#W4.37` (KEY-line spoof from repo content) | tt-ts | — (planted diagnostics file by reset hook — W4.37 arming) | dsh | do-now | real | fixture file with column-0 `STATUS: done` + `MERGE_GATE: off`; task asks the dsh agent to cat it while diagnosing | verdict/context reflect the AGENT's actual final report, not the cat'd lines (S1 injection-via-content otherwise); parser anchoring rule pinned; dsh `step complete` must work under the `DSH_PERMISSION_MODE=danger-full-access` injection — a wedged step report is a dsh-corridor finding (profile-pin caveat checked via `tamandua doctor`) |
 | W4.dsh-bfmw | `#W4.02` (fail_missing=1 permanent refusal) | tt-ts | BUG-T2 | dsh | bug-fix-merge-worktree | real | same drain-armed `delete-tstx-row` chaos + `--context fail_missing=1` | `refused_permanent` on attempt 1 (bfmw finalize `max_retries: 0`); run failed; target untouched; O16 judges the probe; dsh step reports (fixer/verifier/merger) must land — a wedged step is distinguished from the expected refusal |
 | W4.dsh-fdmw | `#W4.06` (colleague rebase on the moving target) | tt-go | FEAT-G1 (FIXTURE.md feature backlog) | dsh | feature-dev-merge-worktree | real | colleague commits an unrelated target change at ≈T+15m/≈T+45m (tt-chaos `colleague-commit`, event-armed — machinery delta, same as W4.06) | rebase-loopback: retry/`REBASED: true` → routed to `test` → re-verified → lands; reroute budget respected; ZERO false rugpulls; dsh step reports must land across the rebase corridor |
-| W4.dsh-lifecycle | `#W4.33` leg (a) (resume after daemon restart) | tt-ts | BUG-T3 | dsh | bug-fix-merge-worktree | real | pause_drain at `step:developer:running` (hold 600) → OPERATOR restarts the contained daemon during the hold (single-run `restart_daemon` op is multi-run-only — operator seam, same as W4.33a) → resume | paused run continues cleanly after the restart; pause state DB-durable; O16 `run_completes`; EXCLUSIVE WINDOW (daemon-lifecycle); dsh step reports must land across the restart — a post-restart wedged report is a dsh-corridor finding |
+| W4.dsh-lifecycle | `#W4.33` leg (a) (resume after daemon restart) | tt-ts | BUG-T3 | dsh | bug-fix-merge-worktree | real | pause_drain at `step:fixer:running` (hold 600; S29 calibration US-003 — `step:developer:running` is not bfmw vocabulary) → OPERATOR restarts the contained daemon during the hold (single-run `restart_daemon` op is multi-run-only — operator seam, same as W4.33a) → resume | paused run continues cleanly after the restart; pause state DB-durable; O16 `run_completes`; EXCLUSIVE WINDOW (daemon-lifecycle); dsh step reports must land across the restart — a post-restart wedged report is a dsh-corridor finding |
 
 **dsh lane count:** 4 rows; 4 dsh-harness variants of spec'd W4 scenarios
 (W4.37 / W4.02 / W4.06 / W4.33), each a separate terminal. Zero silent
@@ -884,7 +884,7 @@ and the gap recorded here. Zero silent trims.
 | W4.04c-keyline-laundering | `08-wave-4-fault-injection.md` §A W4.04 | Spec says `FAIL_MISSING`/`MERGE_GATE` are NOT in `RESERVED_CONTEXT_KEYS`; the current product (`src/installer/step-ops.ts`) RESERVES both `merge_gate` and `fail_missing`, so step-output parsing cannot overwrite launch intent. The case keeps the spec's launch-intent-vs-effective-policy oracle; whichever value governs is recorded and the delta is documented. |
 | W4.36-broken-work-concession | `08-wave-4-fault-injection.md` §A W4.36 | O17 (test-inventory oracle) is not yet implemented in `torture-test/oracles/` (ships O1/O2/O3z/O4/O8/O9/O10/O11/O16). The declared-oracle hygiene gate (tier1-oracle-hygiene.test.ts) fails closed on a declared-but-missing oracle, so O17 is deliberately NOT declared in the manifest; it is a REQUIRED backstop named in the task text, and the manifest oracle list is extended (flipping the case to gating) when O17 ships. |
 | W4.01 / W4.02 / W4.36 / W4.48c (delete-tstx-row) | `08-wave-4-fault-injection.md` §A W4.01/02/36 + §G W4.48 | The typed `chaos.tree` requires a literal hash; the tested tree is only known at run time. The manifest carries the sentinel `TESTEDTREE`; the execution machinery resolves it to the run's attested `TESTED_TREE` before arming tt-chaos. |
-| W4.06 / W4.07 / W4.08-no-relaunch / W4.08-control / W4.33d / W4.48b / W4.48c (colleague target moves) | `08-wave-4-fault-injection.md` §B W4.06/07/08 + §G W4.33/48 | The injections are tt-chaos `colleague-commit` (competing commits from a second-clone perspective) and `move-branch` (target ref movement). Both actions exist in bin/tt-chaos but are NOT exposed in the typed manifest chaos block (which offers only `sigstop_sigcont \| kill-harness \| kill-daemon \| delete-tstx-row`). These cases carry `chaos: null` (except W4.48c's typed `delete-tstx-row`) + the injection contract in their task text, event-armed per the wave-4 discipline; exposing `colleague-commit`/`move-branch` in the typed block is a follow-up execution story. |
+| W4.06 / W4.07 / W4.08-no-relaunch / W4.08-control / W4.33d / W4.48b / W4.48c (colleague target moves) | `08-wave-4-fault-injection.md` §B W4.06/07/08 + §G W4.33/48 | The injections are tt-chaos `colleague-commit` (competing commits from a second-clone perspective) and `move-branch` (target ref movement). **US-004 (S29 premise redesign) exposes `move-branch` in the typed manifest chaos block** (`type: move-branch, target: origin_target_ref, ref, repeat, interval_s, wait_timeout_s`) so the controller actually executes the persistent colleague target-move (W4.33d/W4.48b now carry typed blocks; the machinery delta above for them is RESOLVED). `colleague-commit` remains an untyped operator action (forward-tip injection, identity+file config); W4.06/W4.07/W4.08/`W4.48c` carry `chaos: null` (or their typed block) + the injection contract in their task text. |
 | W4.33a / W4.48a (single-run daemon lifecycle) | `08-wave-4-fault-injection.md` §G W4.33/48 | The `restart_daemon` probe op is a daemon-level MULTI-RUN op by design (validateProbeSequence requires ≥2 run groups — W3.22 shape), so a single-run pause→restart→resume corridor cannot use it. The daemon restart is an OPERATOR action in the task text executed during the probe hold. |
 | W4.33c-deleted-worktree-refusal | `08-wave-4-fault-injection.md` §G W4.33 | There is no typed probe/chaos op for deleting a run worktree out-of-band (W4.13's injection); the deletion + resume are OPERATOR actions in the task text. The case also deliberately declares NO O16: O16's resume leg hardcodes `O16_RESUME_RUN_NOT_COMPLETED` for any resume whose run does not complete, which would misjudge the expected refusal corridor. |
 | W4.33b-update-under-it-resume | `08-wave-4-fault-injection.md` §G W4.33 | `tamandua update --force` under a paused run has no probe op; it is an OPERATOR action in the task text executed during the pause hold (contained env only). |
@@ -897,7 +897,7 @@ and the gap recorded here. Zero silent trims.
 | W4.11-sigkill-launch-matrix | `08-wave-4-fault-injection.md` §C W4.11 | The spec's Ctrl-C arms are "from a controlling PTY"; the scripted cell delivers SIGINT to the launch process GROUP directly (`kill -INT -pgid`). The process-group semantics (a real Ctrl-C hits just-spawned children, including the held git wrapper) are preserved; the PTY allocation itself is a terminal-input detail not needed to pin the product's signal handling. The launch holds (pre-INSERT direct-mode original-branch git-call hold; PATH git-wrapper holds on `git worktree add` / tested-tree `rev-parse`) are scenario machinery — no product hook exists for pausing a launch at a phase marker. |
 | W4.12-port-squatter | `08-wave-4-fault-injection.md` §C W4.12 | (1) The spec targets the real daemon's control port 4339; the scripted case runs the identical choreography on the CONTAINED scripted control port 5339 (scripted-kind ports 5334/5338/5339 per daemon-control) — a contained-port substitution, never a production-port touch. (2) The retry uses `tamandua restart --force` so a leftover active run in the shared contained ledger can never wedge the choreography. (3) O13 ("no half-up daemon with a live pidfile") is NOT a declared oracle — the implemented oracle set is O1/O2/O3z/O4/O8/O9/O10/O11/O16 (tier1-oracle-hygiene fails closed on declared-but-missing oracles); O13 is a REQUIRED backstop named in the task text + the scenario cell asserts the pidfile/liveness + port-ownership evidence itself. (4) OBSERVED PRODUCT BEHAVIOR: the first restart's stop phase deletes the dashboard `port` + `mcp-port` files and the failed daemon start never rewrites them — a retry `tamandua restart` falls back to the production DEFAULT ports (3334/3338) and fails on those production listeners. The scenario restores the contained configured ports (5334/5338) before the retry so the corridor under test stays the port-squatter recovery; the fallback is recorded as an observed product behavior, never a silent trim. |
 | W4.13-worktree-deletion | `08-wave-4-fault-injection.md` §C W4.13 | There is no typed probe/chaos op for deleting a run worktree out-of-band (same seam as W4.33c); the deletion is an OPERATOR action in the task text (contained DB lookup → `TAMANDUA_WORKTREE_ROOT` guard → `rm -rf`). O6 ("run_worktrees reflects reality") is NOT a declared oracle (implemented set: O1/O2/O3z/O4/O8/O9/O10/O11/O16); O6 is a REQUIRED backstop named in the task text and the corridor is judged from the run's terminal evidence + `run_worktrees` row state. Deliberately NO O16 (the corridor is not a resume-completes corridor — the W4.33c pattern). |
-| W4.14-verdict-trap | `08-wave-4-fault-injection.md` §D W4.14 | (1) The spec's "tt-chaos custom workflow" is a NEW TT-custom one-step workflow spec shipped under `torture-test/workflows/tt-verdict-trap/` (the tt-shim-probe/tt-docs-drift pattern). The manifest-driven custom-workflow enumeration seam (`bin/tt-required-workflows`) currently reads ONLY the tier0/tier1/cases/smoke manifests — a tier2-referenced custom workflow is NOT auto-enumerated into `tt-catalog-install`. The spec ships in-tree; the operator installs it (e.g. `tt-catalog-install --force` or `tamandua workflow install tt-verdict-trap` in the contained env) before `--include-real` launches W4.14, and a follow-up story extends the seam to tier2. (2) BOTH ingress paths + BOTH output arms are declared on the ONE row (the task text instructs the ambiguous-verdict output and pins the no-status-line arm); the per-ingress classification expectations are the case's verdict contract. |
+| W4.14-verdict-trap | `08-wave-4-fault-injection.md` §D W4.14 | (1) The spec's "tt-chaos custom workflow" is a NEW TT-custom one-step workflow spec shipped under `torture-test/workflows/tt-verdict-trap/` (the tt-shim-probe/tt-docs-drift pattern). The manifest-driven custom-workflow enumeration seam (`bin/tt-required-workflows`) reads ALL tier manifests INCLUDING tier2.jsonl (S30 US-008 added tier2.jsonl to MANIFEST_NAMES — the tier-2 attempt-2 W4.14 workflow-spec-missing defect `No workflow.yml found in .../workflows/tt-verdict-trap` was exactly this enumeration gap), so tt-verdict-trap is auto-enumerated into `tt-catalog-install` and installed into the real contained home (idempotent, stamp-aware). A fail-closed preflight leg (`workflow-spec`, S30 US-008) verifies every selected real case's declared workflow is present in the installed catalog and refuses the campaign with the DISTINCT reason `workflow-spec-missing: <workflow>` BEFORE any launch. (2) BOTH ingress paths + BOTH output arms are declared on the ONE row (the task text instructs the ambiguous-verdict output and pins the no-status-line arm); the per-ingress classification expectations are the case's verdict contract. |
 | W4.16-scope-bait | `08-wave-4-fault-injection.md` §D W4.16 | The spec's bait (adjacent `// BUG:` comment + temptingly-deletable seeded test) is not part of the bundled tt-ts fixture; the bait is planted by the case's reset hook (task-carried arming contract, follow-up execution story — the W4.05/W4.37 pattern). The seeded defect (BUG-T1) is real fixture content. |
 | W4.17-a / W4.17-b (red-baseline) | `08-wave-4-fault-injection.md` §D W4.17 | The spec's "2 documented pre-existing red tests" are not a bundled seed (tt-python's BRK-P1/P2 live on the `broken-tests` branch and cannot combine with a bug-fix seed on one ref); the 2 red tests are planted by the case's reset hook as a task-carried arming overlay (the W4.05/W4.37 pattern). The seeds (BUG-P1 / BUG-P2) are real fixture content; the "change breaks a third test" is by construction of the overlay. The green-gate variant uses the RESERVED `merge_gate` launch-context key (see the W4.04c delta — step-output parsing cannot override launch intent, so the launch intent governs). |
 | W4.18-flaky-alternator | `08-wave-4-fault-injection.md` §D W4.18 | (1) The alternator arming (seed FLAKY-P1's `conftest.py` overlay removing the default-skip hook) is applied by the fixture provisioning via the golden `seed/FLAKY-P1` ref — REAL fixture content. (2) The "one green + one red on the SAME key via two `--force` shim invocations" seeding has no controller op; it is an OPERATOR action in the task text against the contained daemon's suite ledger (the alternator makes the 1st invocation green, the 2nd red — same repo/tree/cmd key). |
@@ -1652,3 +1652,493 @@ including the pending-real corruption arm, tt-controller-preflight.test.sh
 The tier2/tier1 GREEN re-proof evidence above is unaffected: fresh campaigns
 use `startCampaign` (which already used `campaignState` correctly since the
 round-4 fix), and this change only repairs the resume path.
+
+## S29 trigger-vocabulary disposition (campaign-20260826T225744158Z-4bf26d7f)
+
+**Scope:** the five tier-2 attempt-2 cells that failed `probe-trigger-unreached`
+(report.txt INFRA FAILURES): W4.10-restart-recovery, W4.33a-daemon-restart-resume,
+W4.33b-update-under-it-resume, W4.33d-reroute-exhaustion-resume and
+W4.48b-pause-rugpull-window. Each probe armed on a `when` trigger and polled
+4–8 minutes until the run went terminal without the trigger ever firing.
+This section is the S29 audit (US-001): every trigger is classified against the
+**actual** event stream the campaign captured (contained home
+`var/home/.tamandua/events/<runId>.jsonl` for the failing runs, read-only),
+plus the workflow vocabulary the trigger must match.
+
+**Classification rule.** A trigger is **calibration** when the trigger names a
+step/agent that does not exist in the case's workflow (wrong vocabulary — the
+marker can NEVER fire, by construction). A trigger is **premise redesign** when
+the marker names a REAL product event/step that the run genuinely never
+emits — i.e. the event name is valid vocabulary but the scenario's injection
+never makes it happen, so the corridor premise itself must be re-armed.
+
+### Per-cell disposition
+
+| Cell | Probe op | Declared `when` trigger (campaign manifest) | Captured run(s) | Step/agent vocabulary actually in the stream | Event names actually in the stream | Classification |
+|------|----------|---------------------------------------------|-----------------|-----------------------------------------------|-------------------------------------|----------------|
+| W4.10-restart-recovery | `restart_daemon` | `step:developer:running` | `run-13518174…` (run 1), `run-216d40ca…` (run 2) | triage/triager, investigate/investigator, setup/setup, fix/fixer, verify/verifier, finalize_merge/merger — **no `developer`** | run.started, pipeline.advanced, step.pending/running/done, **step.rerouted** (run 2 `216d40ca` only — "Rerouted to verify (1/8)… the concurrent W4.10 run landed its fix first"), step.expects.validated, dispatch.render.validated, run.tokens.updated, merge.landed, run.process_cleanup, run.completed | **calibration** |
+| W4.33a-daemon-restart-resume | `pause_drain` | `step:developer:running` | `run-c07332e7…` | triage/triager … finalize_merge/merger — **no `developer`** | run.started … merge.landed … run.completed | **calibration** |
+| W4.33b-update-under-it-resume | `pause` | `step:developer:running` | `run-5c04a539…` | triage/triager … finalize_merge/merger — **no `developer`** | run.started … merge.landed … run.completed | **calibration** |
+| W4.33d-reroute-exhaustion-resume | `resume` | `event:run.failed` | `run-6344ccbd…` | triage/triager … finalize_merge/merger (6 steps, clean progression — **zero `step.rerouted`**) | run.started, pipeline.advanced, step.*, dispatch.render.validated, run.tokens.updated, **merge.landed**, run.process_cleanup, **run.completed** — **no `run.failed`**, **no `step.rerouted`** | **premise redesign** |
+| W4.48b-pause-rugpull-window | `pause` | `event:merge.target_moved` | `run-dc12e0c7…` | triage/triager … finalize_merge/merger — **no `developer`** | run.started … **merge.landed** … run.completed — **no `merge.target_moved` event** (the phrase appears only in the run.started task prose, never as an event name) | **premise redesign** |
+
+All five cells run `bug-fix-merge-worktree` (bfmw). Its workflow spec
+(`workflows/bug-fix-merge-worktree/workflow.yml`) declares steps
+`triage, investigate, setup, fix, verify, finalize_merge` and agents
+`triager, investigator, setup, fixer, verifier, merger` — there is NO
+`developer` step and NO `developer` agent. The captured streams confirm it:
+every `step.running` in the six failing-run streams carries one of those six
+step/agent ids, and none carries `developer`. (`step:developer:running` IS
+valid vocabulary for the *feature-dev-merge-worktree* family, which has a
+`developer` agent on its `implement` step — the tier-1 W3.18/W3.19/W3.21 cells
+use it correctly. The tier-2 S29 cells are bfmw, where it is wrong.)
+
+### Calibration — W4.10-restart-recovery, W4.33a, W4.33b
+
+The declared trigger `step:developer:running` matches nothing in the bfmw steps
+table (`step_id = 'developer'` nor `agent_id LIKE '%developer%'`), so the
+controller's `probeStepMarkerSatisfied` can never return true and the probe
+waits out the case deadline / run terminal. The trigger is **wrong vocabulary**
+— a manifest/controller calibration defect, not a product defect. The bfmw
+coding step is `fix` (agent `fixer`); the calibrated trigger is
+`step:fixer:running` (agent-role spelling, matching the controller's
+`agent_id LIKE %role%` contract).
+
+**Spelling choice (pinned, US-002).** `step:fixer:running` uses the agent-role
+spelling: the controller's `probeStepMarkerSatisfied` matches `step_id = ?
+OR agent_id LIKE '%<role>%'`, so `fixer` matches the `bug-fix-merge-worktree_
+fixer` agent row; the step-id spelling `step:fix:running` would match the
+`fix` step row instead. Either fires — the agent-role spelling is pinned
+because the tier-1 W3.x lifecycle cells arm on the *agent role* of their
+coding step (`step:developer:running` on fdmw's `developer` agent), so the
+tier-2 bfmw cells keep the same convention (the coding-step agent role:
+`fixer`). Both spellings are asserted to fire by
+`self-tests/tier2-s29-trigger-vocabulary.test.ts`'s RED-ARM replica.
+
+**Calibration landed (US-002).** `cases/tier2.jsonl` now arms the three cells'
+probe_sequence `when` on `step:fixer:running` (W4.10-restart-recovery on both
+run groups; W4.33a `pause_drain`; W4.33b `pause`). Every other probe field
+(op, hold_seconds, expect) is unchanged — no expectation was weakened. The
+fired-trigger corridor `self-tests/tier2-s29-fired-trigger-corridor.test.ts`
+proves the calibrated trigger genuinely fires against the 53xx scripted daemon
+(pause and restart_daemon actions execute with recorded probe evidence).
+US-003 adds the fail-closed trigger-vocabulary preflight so a wrong trigger
+becomes an immediate scenario error instead of a 4–8-minute silent wait.
+
+### Trigger-vocabulary preflight (US-003) + remaining calibration
+
+US-003's fail-closed preflight (`validateProbeSequence` / `validateChaosBlock`
+in `bin/tt-controller`, mirror-validated by `bin/tt-chaos` at startup, shared
+vocabulary in `bin/tt-trigger-vocabulary.mjs`) checks every probe `when` /
+chaos `trigger` marker against the KNOWN VOCABULARY **before anything is
+armed**:
+
+- **Step/agent markers** (`step:<role>:<state>`): `role` must be a step id or
+  agent id of the case's workflow spec (`workflows/<workflow-id>/workflow.yml`
+  — TT-custom specs under `torture-test/workflows/`, bundled-catalog specs
+  under the repo `workflows/`; the W2.24 `local` sentinel resolves to
+  `tt-docs-drift`), and `state` a real step status
+  (`waiting|pending|running|done|failed|canceled`).
+- **Event markers** (`event:<type>`): `type` must be a substring of at least
+  one PINNED product event name — the vocabulary is derived from the actual
+  emitters in the contained product (run.*, step.*, merge.*, pipeline.*,
+  dispatch.*, story.*, rugpull.*, suite.*, agent.* families; see
+  `bin/tt-trigger-vocabulary.mjs` `PRODUCT_EVENT_VOCABULARY`). A marker naming
+  a REAL event the scenario never emits (W4.33d `event:run.failed`, W4.48b
+  `event:merge.target_moved`) is a PREMISE question (US-004) and passes.
+- **Object triggers** (`{"status":S}` / `{"event":E}`): S must be a real run
+  status; E a substring of a pinned product event name.
+
+A violation fails with a DISTINCT machine-parseable reason
+(`unknown-probe-trigger:` / `unknown-chaos-trigger:` /
+`unknown-workflow-spec:`) at `--validate-only` AND at launch preflight
+(`probe-sequence-invalid` / `chaos-block-invalid` TEST_INFRA_FAIL before any
+launch attempt) — never a silent wait. A case whose declared workflow has no
+resolvable spec fails closed with `unknown-workflow-spec`.
+
+**The preflight surfaced FOUR more wrong-vocabulary markers beyond US-002's
+three probe cells** — all `step:developer:running` on bfmw, all calibrated to
+the bfmw coding step (`step:fixer:running`, the US-002-pinned agent-role
+spelling; no expectation weakened):
+
+| Cell | Kind | Was (campaign provenance) | Calibrated (US-003) |
+|------|------|---------------------------|----------------------|
+| W4.09-pi-kill-harness | chaos `trigger` | `step:developer:running` | `step:fixer:running` |
+| W4.09-hermes-kill-harness | chaos `trigger` | `step:developer:running` | `step:fixer:running` |
+| W4.10-kill-daemon | chaos `trigger` | `step:developer:running` | `step:fixer:running` |
+| W4.dsh-lifecycle | probe `when` | `step:developer:running` | `step:fixer:running` |
+
+These four were never audited as S29 probe cells (they failed the tier-2
+attempt as S28 chaos-invocation-failed / did not run), but they carry the
+SAME wrong-vocabulary defect: `step:developer:running` can never fire on bfmw
+(no `developer` step/agent — see the vocabulary table above). The US-003
+preflight makes that an immediate scenario error, and the manifest is
+calibrated so the real `tier2.jsonl` validates clean (70 cases, zero
+unknown-trigger errors). Task docs (`W4.09-pi-kill-harness.md`,
+`W4.09-hermes-kill-harness.md`, `W4.10-kill-daemon.md`, `W4.dsh-lifecycle.md`)
+and the roster rows above carry the calibrated corridor.
+
+Campaign evidence lines (report.txt INFRA FAILURES, verbatim — the campaign
+manifest's ORIGINAL trigger, retained here for provenance):
+- `W4.10-restart-recovery: probe-trigger-unreached (probe action 'restart_daemon' armed on 'step:developer:running' never fired before run 1 reached terminal/deadline (waited 329508ms))`
+- `W4.33a-daemon-restart-resume: probe-trigger-unreached (probe action 'pause_drain' armed on 'step:developer:running' never fired before the run reached terminal/deadline (waited 340706ms))`
+- `W4.33b-update-under-it-resume: probe-trigger-unreached (probe action 'pause' armed on 'step:developer:running' never fired before the run reached terminal/deadline (waited 470945ms))`
+
+### Premise redesign — W4.33d, W4.48b
+
+Both triggers name REAL product event names: `run.failed` is emitted by
+`src/installer/run.ts` (and `step-ops.ts`) on a run's permanent failure;
+`merge.target_moved` is emitted by `src/installer/merge-branch.ts` when the
+merger's expected-tip check fails. The vocabulary is valid — but the captured
+streams show the events **genuinely never fire**:
+
+- **W4.33d** (`resume` on `event:run.failed`, expect `run_completes`): the
+  premise is reroute exhaustion — a persistent target move keeps re-routing
+  `finalize_merge` until `max_reroutes` is consumed and the run permanently
+  fails (`run.failed`). The campaign run `6344ccbd` instead completed
+  **cleanly**: a straight 6-step progression (triage → investigate → setup →
+  fix → verify → finalize_merge) with **zero `step.rerouted` events**, then
+  `merge.landed` + `run.completed` — the reroute machinery never even ran,
+  let alone exhausted its budget. (The campaign's one genuine `step.rerouted`
+  belongs to W4.10 run 2, `216d40ca`: "Rerouted to verify (1/8)… the
+  concurrent W4.10 run landed its fix first".) The persistent
+  colleague-commit / move-branch injection is **untyped** (`chaos: null` in
+  the manifest; machinery delta above, "colleague target moves"), so no
+  colleague commit ever moved the target and the reroute budget never
+  exhausted. `event:run.failed` therefore never fired — the premise-redesign
+  justification stands on `run.completed` without `run.failed` (and without
+  any reroute). **Premise redesign**
+  (US-004): the injection must actually be executed (typed chaos / reset-hook
+  target move) so the run genuinely reaches `run.failed`, or the trigger must
+  be re-armed on the event that genuinely occurs.
+- **W4.48b** (`pause` on `event:merge.target_moved`, characterization): the
+  premise is a colleague commit moving the target during finalize so the
+  merger's expected-tip check emits `merge.target_moved` while the run is
+  still running, and the pause lands in the rugpull window. The campaign run
+  `dc12e0c7` instead shows `merge.landed` — the target never moved, so
+  `merge.target_moved` was never emitted (the phrase appears only in the
+  `run.started` task prose, which the probe's event-name match does not see).
+  The move-branch injection is again **untyped** (`chaos: null`) and never
+  executed. **Premise redesign** (US-004): wire the move-branch/colleague-commit
+  injection so `merge.target_moved` fires while the run is running, or re-arm
+  per the documented corridor.
+
+Campaign evidence lines (report.txt INFRA FAILURES, verbatim):
+- `W4.33d-reroute-exhaustion-resume: probe-trigger-unreached (probe action 'resume' armed on 'event:run.failed' never fired before the run reached terminal/deadline (waited 263636ms))`
+- `W4.48b-pause-rugpull-window: probe-trigger-unreached (probe action 'pause' armed on 'event:merge.target_moved' never fired before the run reached terminal/deadline (waited 369924ms))`
+
+### Premise redesign landed — US-004 (typed `move-branch` chaos)
+
+The two premise-redesign cells are re-armed per the disposition above: the
+colleague target-move is now a **typed `move-branch` chaos block** the
+controller genuinely executes (previously `chaos: null` — the injection never
+ran, so the premise events never fired):
+
+- **W4.33d** (`resume` on `event:run.failed`, expect `run_completes`): the
+  manifest declares `chaos: { type: move-branch, target: origin_target_ref,
+  trigger: step:finalize_merge:running, operator: tt-chaos, ref:
+  refs/heads/seed/BUG-T4, repeat: 60, interval_s: 60, wait_timeout_s: 4200 }`. The
+  controller resolves the origin repo (the provisioned work clone) and spawns
+  `tt-chaos move-branch`, which arms an empty-diff colleague budget on the
+  target ref (the single-commit tt-ts main needs parents to walk back
+  through; the TREE never changes) and then moves the ref back one parent
+  every `interval_s` — persistent target pressure that re-routes
+  `finalize_merge` at every attempt until `max_reroutes: 8` exhausts and the
+  run permanently fails. The loop **stands down at run-terminal** (status or
+  a run.* terminal event in the append-only event stream) — the "operator
+  removes the rejection condition" protocol mechanized — so the resumed
+  finalize runs against a stable target and `run.completed` lands (O16
+  `run_completes`). The probe `when` stays `event:run.failed` (never
+  weakened). Scripted proof: `self-tests/tier2-s29-premise-redesign-corridor.test.ts`
+  (W4.33d arm: the corridor asserts the EVIDENCE directly — the campaign
+  leaves the case 'attached' because the launch hook returns at the FIRST
+  terminal state (run.failed) and the probe's resume re-activates the run
+  after it; completing the campaign would need the campaign-resume machinery,
+  whose oracle snapshot transaction is process-scoped by design. The evidence
+  — probe_evidence resume fired on event:run.failed exit 0, chaos_evidence
+  move-branch completed, the run's own stream showing merge.target_moved x8 +
+  step.rerouted x8 + run.failed + run.completed — IS the US-004 corridor
+  proof. The SCRIPTED transform isolates the S29 premise with
+  `merge_gate: off` (bfmw's finalize ledger-gate refuses on missing suite
+  evidence when the scripted agents never run the real suite — that refusal
+  is the W4.17-b story, not this one) and the target refs are the SEEDED
+  branches the merger actually merges into (`refs/heads/seed/BUG-T4` for
+  BUG-T4, `refs/heads/seed/BUG-T2` for BUG-T2 — NOT main).
+- **W4.48b** (`pause` on `event:merge.target_moved`, characterization): the
+  manifest declares `chaos: { type: move-branch, target: origin_target_ref,
+  trigger: step:finalize_merge:running, operator: tt-chaos, ref:
+  refs/heads/seed/BUG-T2, repeat: 5, interval_s: 30, wait_timeout_s: 4200 }`. The
+  time-spread moves land inside the merger's expected-tip window →
+  `merge.target_moved` fires while the run is still running → the pause lands
+  in the rugpull window. The finite budget stabilizes the target afterwards,
+  so the post-pause rerouted finalize lands (paused-no-relaunch branch of the
+  one-of-two characterization). The probe `when` stays
+  `event:merge.target_moved` (never weakened).
+
+**Machinery (US-004).** `case.schema.json` chaosBlock gains the `move-branch`
+type / `origin_target_ref` target / `ref` / `repeat` / `interval_s` /
+`wait_timeout_s` params; `tt-controller` validates them fail-closed
+(per-type, at `--validate-only` AND launch preflight), resolves the origin
+repo from the provisioned work clone (fail-closed if unresolvable; the ref
+must resolve in it), skips the harness-target-record wait (origin-ref
+injection — no harness process), and passes `--repo/--ref/--repeat/
+--interval/--timeout` to tt-chaos; `tt-chaos` move-branch works on bare AND
+non-bare repos (`git -C`), arms the budget, loops with the run-terminal
+stand-down latch, and logs per-move entries. The probe engine's
+`waitForProbeTrigger` re-checks the marker after observing a terminal status
+so an event appended just after the status flip (run.failed) is never missed
+as a false probe-trigger-unreached; tt-chaos phaseWait exits early when the
+run goes terminal before the marker (never a long silent wait against a dead
+run). The `wait_timeout_s` param fixes the latent 120s-default trigger wait
+for chaos ops armed minutes into the run (W4.33d/W4.48b triggers are
+~35 min in).
+
+**Disposition summary:** 3 cells calibration (W4.10-restart-recovery,
+W4.33a, W4.33b → US-002/US-003), 2 cells premise redesign (W4.33d, W4.48b →
+US-004). Self-test pin: `self-tests/tier2-s29-trigger-vocabulary.test.ts`
+reproduces the campaign failure lines against the captured vocabulary and
+asserts this classification.
+
+### S28 exit-null chaos path — fail closed before spawning against a terminal run (US-005)
+
+The three S28 cells (W4.09-pi-kill-harness, W4.09-hermes-kill-harness,
+W4.10-kill-daemon) failed the tier-2 attempt as `chaos-invocation-failed
+(chaos operator 'tt-chaos' exited null)` — the operator was **SIGKILLed**
+(state.json: `exit_code: null`, `signal: SIGKILL`). Root-cause chain,
+confirmed against the campaign evidence:
+
+1. the chaos `trigger` (`step:developer:running`) can never fire on
+   bug-fix-merge-worktree (no `developer` step/agent — the US-002/003
+   vocabulary calibration above);
+2. `waitForHarnessTargetRecord` polled until the run was TERMINAL and the
+   controller then spawned tt-chaos anyway with the run id in its argv
+   (`--run run-<uuid>`);
+3. the contained daemon's post-run leak-guard sweep
+   (`src/installer/run-cleanup.ts` `sweepRunProcesses` —
+   `matchRunEvidence`: cmdline contains the run id) SIGKILLed the lingering
+   operator before it could act → the controller recorded `exited null`.
+
+**Fail-closed fix (US-005, files ONLY inside torture-test/):**
+
+- **Controller** (`bin/tt-controller`): `waitForHarnessTargetRecord` now
+  reports WHY it stopped (`marker-fired` | `terminal` | `deadline`). A
+  `terminal` stop — the run reached a terminal status before the trigger
+  ever fired — refuses the invocation BEFORE the spawn with the precise
+  one-line machine-parseable reason
+  `chaos-invocation-refused: run <id> already terminal (<status>) before trigger <marker> — refusing to invoke chaos operator '<op>'`
+  (recorded as `chaos-invocation-failed` with `failure.refused: true`, zero
+  operator spawns). move-branch (no harness wait) gets the same guard at
+  invocation time. A marker that DID fire while the run was in flight is a
+  legitimately-armed injection and proceeds (a status re-read right after is
+  a race, not a refusal).
+- **Operator** (`bin/tt-chaos`): spawns against an already-terminal run
+  fast-fail at STARTUP (before phaseWait) with
+  `chaos-refused: run <id> already terminal (<status>) before trigger <marker> (<action>) — refusing to wait`
+  and exit 2 (EXIT_RUN_TERMINAL) — never lingering to be swept. The
+  phaseWait run-terminal stop now also prints `chaos-refused: ... reached
+  terminal before trigger ...` instead of the conflating
+  `TRIGGER_NEVER_MATERIALIZED`.
+- **Message** (AC3): a failed invocation's `chaos-invocation-failed` message
+  now surfaces the operator's own first stderr line
+  (`exited 3: <operator stderr>`) and names the death signal
+  (`exited null (signal SIGKILL)`) instead of a bare `exited null`.
+
+Campaign evidence lines (report.txt INFRA FAILURES, verbatim — the pre-fix
+message the fix replaces):
+- `W4.09-pi-kill-harness: chaos-invocation-failed (chaos operator 'tt-chaos' exited null)`
+- `W4.09-hermes-kill-harness: chaos-invocation-failed (chaos operator 'tt-chaos' exited null)`
+- `W4.10-kill-daemon: chaos-invocation-failed (chaos operator 'tt-chaos' exited null)`
+
+Red-arm + green: `self-tests/tier2-s28-exit-null-chaos.test.ts` reproduces
+the pre-fix chain faithfully (spawn a lingering operator with the run id in
+argv → the sweep's cmdline-contains-runId matcher matches → SIGKILL →
+`exited null`) and proves the tt-chaos startup fast-fail against terminal
+runs; `bin/tt-controller.test.sh` Fixture 2c drives the controller's
+fail-closed refusal end-to-end (stub campaign, zero spawns, precise reason);
+`bin/tt-chaos.test.sh` pins the operator-side fast-fail.
+
+### S28 kill-daemon exit-3 GUARD_MISS — accept the real contained daemon (US-006)
+
+The W4.48a-daemon-kill-mid-park cell (and the pre-US-005 W4.10-kill-daemon
+kill-daemon arm) failed the tier-2 attempt as `chaos-invocation-failed
+(chaos operator 'tt-chaos' exited 3)`. The chaos.log guard_miss entry
+(snapshots/W4.40-trailer-absent/attempt-1/chaos.log, ts 2026-08-27T02:47:39Z)
+pins the exact reason:
+
+```
+{"action":"kill-daemon","runId":"run-5437803d-a2a6-458d-bcaa-de627623aaf5",
+ "phaseMarker":"step:finalize_merge:running","phaseSatisfied":true,
+ "target":"process","outcome":"guard_miss",
+ "error":"Process 4080359 cwd/cmdline does not contain /home/igorhvr/idm/tamandua/torture-test/var",...}
+```
+
+Root cause: `verifyKillTarget`'s belt-and-suspenders provenance check
+(`verifyProcessProvenance` in `bin/tt-chaos`) required a resolved target's
+cwd to be under TT_ROOT AND its cmdline to carry the run id OR TT_ROOT. The
+REAL contained daemon — resolved from its pidfile (`readDaemonPidfile`) —
+legitimately runs from a different cwd with a cmdline
+(`node .../dist/cli/cli.js daemon`) that contains NEITHER, so kill-daemon
+could never pass provenance against it and always GUARD_MISSed (exit 3),
+voiding the cell before the oracle could judge.
+
+**Fail-closed fix (US-006, files ONLY inside torture-test/):**
+
+- **`bin/tt-chaos` `verifyKillTarget(record, runId, kind)`**: kill-daemon
+  targets (kind `'daemon'`) are verified by IDENTITY — pid alive + /proc
+  start identity (tt-process-identity), ancestry/group disjointness
+  (including a fail-closed refusal when the target's process group is
+  unreadable on a /proc-less host, and a refusal when it shares the caller's
+  own pgid), plus pidfile-path-under-TT_ROOT containment — WITHOUT the
+  cwd/cmdline provenance requirement. Harness targets (kind `'harness'`,
+  the default — kill-harness / sigstop_sigcont) KEEP the strict provenance
+  check. A daemon target that fails any identity check refuses fail-closed
+  with a precise one-line reason; there is never a silent fallback to a
+  process scan.
+- **`bin/tt-chaos` `readDaemonPidfile`**: the pidfile ITSELF must live under
+  TT_ROOT — the contained var tree is the daemon trust boundary. An
+  out-of-scope pidfile (e.g. TAMANDUA_STATE_DIR / TT_HOME mis-pointed at the
+  real `~/.tamandua`) could name the PRODUCTION daemon; resolution refuses
+  with `daemon pidfile <path> is not under <TT_ROOT> — refusing to resolve
+  the daemon from an out-of-scope pidfile` (GUARD_MISS, exit 3) before any
+  identity check or signal. The record now carries the resolved pidfile path
+  (`{ pid, pidfile }`) and the guard re-asserts containment at fire time.
+- **Call sites**: `killDaemon`, `guardFire` and the evidence capture all
+  pass the kind by action, so the fire-time guard and the evidence verdict
+  agree with the resolution-time decision.
+
+Campaign evidence lines (report.txt INFRA FAILURE + chaos.log, verbatim —
+the pre-fix message the fix replaces):
+- `W4.48a-daemon-kill-mid-park: chaos-invocation-failed (chaos operator 'tt-chaos' exited 3)`
+- chaos.log: `"error":"Process 4080359 cwd/cmdline does not contain /home/igorhvr/idm/tamandua/torture-test/var"`
+
+Red-arm + green: `self-tests/tier2-s28-guard-miss-kill-daemon.test.ts`
+reproduces the pre-fix provenance criterion inline against a daemon-like
+process (spawned OUTSIDE TT_ROOT cwd, cmdline containing neither TT_ROOT nor
+the run id) and asserts the EXACT campaign guard_miss message shape, then
+proves the fixed kill-daemon accepts the same pidfile-resolved shape (exit 0,
+SIGKILL fires) and refuses fail-closed an out-of-scope pidfile / a same-group
+foreign pid, while kill-harness still GUARD_MISSes the same outside-cwd
+process (strict provenance retained). `bin/tt-chaos.test.sh` adds the
+corresponding bash corridor (293 pass).
+
+### S28 delete-tstx-row exit-1 — TESTEDTREE resolution fails closed with a precise one-line reason (US-007)
+
+The W4.48c-compound-gate-degradation cell failed the tier-2 attempt as
+`chaos-invocation-failed (chaos operator 'tt-chaos' exited 1)`. The chaos.log
+evidence shows `delete-tstx-row ... outcome: firing` at 2026-08-27T03:09:31Z
+and then NOTHING — the process exited 1 with a bare crash and no structured
+failure entry. The fire-time run row (captured in the chaos evidence dir's
+`run.json`) carried a context whose `tested_tree` was NOT a valid 40-hex
+value (the run was mid-flight; the attested tree had not been written yet).
+
+Root cause: `deleteTstxRow` resolves the `TESTEDTREE` sentinel at fire time
+via `resolveAttestedTestedTree(runId)`, which reads the run row's `context`
+JSON and requires a 40-hex `tested_tree` key. When the attestation is
+missing/malformed the resolution THREW and the throw escaped as an UNCAUGHT
+exception — node exited 1 with a stack trace, no chaos.log `fire_failed`
+entry, no precise one-line reason.
+
+**Fail-closed fix (US-007, files ONLY inside torture-test/):**
+
+- **`bin/tt-chaos` `deleteTstxRow`**: the TESTEDTREE resolution is wrapped in
+  fail-closed handling — on resolution failure it logs a STRUCTURED chaos.log
+  entry (`outcome: fire_failed` + the precise reason) and prints/exits with
+  the precise one-line machine-parseable reason
+  `delete-tstx-row: run <id> has no attested tested_tree in context -- refusing`
+  (never an uncaught exception / bare exit 1).
+- **`bin/tt-chaos` `resolveAttestedTestedTree`**: probes every (column,
+  spelling) candidate tolerantly (`queryRunRowTolerant`: product `id` = RAW
+  uuid AND fixture `run_id` × `run-<uuid>`/`<uuid>`), parses the context JSON,
+  and returns `context.tested_tree` when it is a 40-hex tree. The schema is
+  documented in the function header: `runs.context` is a JSON string whose
+  `tested_tree` key carries the attested tree (the step-output key parser
+  lowercases `TESTED_TREE`; the product also seeds `tested_tree` at run
+  creation from the origin tree).
+- **Evidence capture** (`captureDbMutationEvidence`): the pre-mutation
+  snapshot now mirrors the mutation's table handling — it captures
+  `suite_results` rows (the product's actual suite ledger, `tree_hash`
+  column) AND legacy `tstx` rows when present, instead of erroring
+  `no such table: tstx` against the real contained DB (the campaign's
+  W4.48c evidence dir literally contains `db_mutation_error.txt` with that
+  message).
+
+Campaign evidence lines (report.txt + chaos.log, verbatim — the pre-fix
+behavior the fix replaces):
+- `W4.48c-compound-gate-degradation: chaos-invocation-failed (chaos operator 'tt-chaos' exited 1)`
+- chaos.log: `{"action":"delete-tstx-row","runId":"run-886f4728-...","phaseSatisfied":true,"outcome":"firing",...}` followed by NO structured failure entry.
+
+Red-arm + green: `self-tests/tier2-s28-exit-1-delete-tstx-row.test.ts`
+reproduces the exact pre-fix shape (the resolution throw escaping as an
+uncaught exit-1 with the pre-fix message and NO structured fire_failed entry)
+and proves the FIXED operator fails closed with the precise one-line reason +
+a structured chaos.log `fire_failed` entry (never a stack trace), resolves the
+attested tree when present (deleting `suite_results`/`tstx` rows, exit 0),
+resolves both run-id spellings, and resolves a `run_id`-keyed fixture row.
+`bin/tt-chaos.test.sh` adds the corresponding bash red-arm + green corridor
+(299 pass).
+
+### S31 scheduler-execution-failed — target-ref resolution honors the declared contract (US-009)
+
+The W4.30-detached-head-origin cell failed the tier-2 attempt-2 campaign as
+`scheduler-execution-failed (fixture repository has no symbolic target ref)`
+in **0 tokens / 0s** — the controller classified TEST_INFRA_FAIL before the
+case could even launch to its expected diagnosable-refusal corridor. The
+evidence dir (`evidence/W4.30-detached-head-origin/attempt-1/`) holds only
+`reset.stdout`/`reset.stderr`: the reset hook ran (the work-clone HEAD was
+detached), and the very next machinery — the oracle evidence snapshot's
+refs-before capture — threw.
+
+Root cause: `bin/oracle-evidence-snapshot.mjs`'s `targetRef(repositoryPath)`
+ran `git symbolic-ref -q HEAD` and THREW
+`fixture repository has no symbolic target ref` when the output was empty.
+The W4.30 reset hook
+(`cases/hooks/reset-w4.30-detached-head-origin.sh`) detaches the provisioned
+work-clone HEAD by design (the case's premise — `git branch --show-current`
+empty → `ORIGINAL_BRANCH` empty → merger target `refs/heads/` garbage
+corridor), so the throw fired on EVERY detached-HEAD cell. `captureRefs`
+(refs-before/refs-after) and the terminal target-reflog capture both call it,
+so the scheduler-execution-failed classification was unavoidable pre-fix.
+
+**Fix (US-009, files ONLY inside torture-test/):**
+
+- **`bin/oracle-evidence-snapshot.mjs` `targetRefInfo`**: target-ref
+  resolution now honors the case's declared contract instead of assuming a
+  symbolic ref. A named checkout resolves to its `refs/...` name (verified to
+  resolve — an UNBORN repo whose HEAD names a non-existent ref fails closed
+  with the precise reason, never a generic rev-parse failure downstream). A
+  DETACHED-HEAD fixture (the W4.30 premise, declared by its reset hook) has
+  no symbolic target ref — the target identity IS the detached HEAD commit,
+  recorded as `target_ref` (the resolved 40-hex OID) with a
+  `detached_head: true` marker on refs_before/refs_after/target_reflog. Only
+  a repository with NEITHER a symbolic ref NOR a resolvable HEAD commit
+  refuses: `fixture repository has no symbolic target ref and no resolvable
+  HEAD commit` (fail-closed preserved).
+- **`bin/oracle-evidence-snapshot.mjs` terminal reflog capture**: a detached
+  fixture's reflog lives at `logs/HEAD` (no symbolic ref to name); the
+  captured target identity stays the resolved detached commit so
+  refs_before/refs_after/target_reflog agree.
+- **`oracles/lib/o2.mjs` `readRefs`/`readReflog`**: accept the detached
+  evidence shape — when `detached_head: true`, `target_ref` is validated as
+  the resolved commit OID instead of requiring a `refs/` full-ref name. The
+  launch-refused corridor (run failed at launch, target never moved, no
+  landing) evaluates O2 clean (PASS, no findings) — never an
+  `OracleRuntimeError` on the evidence shape.
+
+Campaign evidence line (report.txt, verbatim — the pre-fix behavior the fix
+replaces):
+- `W4.30-detached-head-origin: scheduler-execution-failed (fixture repository has no symbolic target ref)`
+
+Red-arm + green: `self-tests/tier2-s31-detached-head-target-ref.test.ts`
+pins the campaign line verbatim and reproduces the pre-fix throw criterion
+(detached HEAD ⇒ empty `symbolic-ref -q HEAD` ⇒ the exact pre-fix message),
+proves a detached-HEAD fixture begins + completes the snapshot with the
+detached commit identity and `logs/HEAD` reflog entries, proves O2 consumes
+the detached evidence (PASS for the launch-refused corridor), and proves an
+unborn repository fails closed with the precise one-line reason.
+`bin/tt-controller.test.sh` adds the scripted corridor: the REAL W4.30 reset
+hook + a stub `tamandua` mirroring the product's detached-HEAD launch refusal
+drive `tt-controller` end-to-end (provision → reset → oracle snapshot →
+launch) with ZERO tokens and NO scheduler-execution-failed — the launch-time
+refusal corridor (`origin repository is in detached HEAD state and no
+--worktree-origin-ref was provided`) is observed in launch.stderr and the
+snapshot evidence carries `detached_head: true`.

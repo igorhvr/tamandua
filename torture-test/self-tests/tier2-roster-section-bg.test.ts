@@ -202,9 +202,17 @@ describe("Tier-2 US-005 — section-B/G roster (moving targets & rugpull + compo
     const w433a = recordById(records, "W4.33a-daemon-restart-resume");
     const opsA = w433a.probe_sequence[0].actions.map((action: any) => action.op);
     assert.deepEqual(opsA, ["pause_drain", "resume"], "W4.33a probe ops must be pause_drain then resume");
+    assert.equal(w433a.probe_sequence[0].actions[0].when, "step:fixer:running",
+      "W4.33a pause_drain must arm on the bfmw coding step (S29 calibration, US-002: step:developer:running is not bfmw vocabulary)");
+    assert.equal(w433a.probe_sequence[0].actions[0].hold_seconds, 600,
+      "W4.33a pause_drain must keep the declared 600s hold (never weakened)");
     const w433b = recordById(records, "W4.33b-update-under-it-resume");
     const opsB = w433b.probe_sequence[0].actions.map((action: any) => action.op);
     assert.deepEqual(opsB, ["pause", "resume"], "W4.33b probe ops must be pause then resume");
+    assert.equal(w433b.probe_sequence[0].actions[0].when, "step:fixer:running",
+      "W4.33b pause must arm on the bfmw coding step (S29 calibration, US-002: step:developer:running is not bfmw vocabulary)");
+    assert.equal(w433b.probe_sequence[0].actions[0].hold_seconds, 600,
+      "W4.33b pause must keep the declared 600s hold (never weakened)");
     const w433d = recordById(records, "W4.33d-reroute-exhaustion-resume");
     assert.equal(w433d.probe_sequence[0].actions[0].op, "resume", "W4.33d probe op must be resume");
     assert.equal(w433d.probe_sequence[0].actions[0].when, "event:run.failed",

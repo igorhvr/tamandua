@@ -580,25 +580,34 @@ event, since a step-status marker races the finalize: the step flips 'done' a
 few ms before the run flips 'paused', and resume on a still-'running' run is
 refused): the drain genuinely parks the in-flight tester, finalizes the run
 to 'paused', and the resume is accepted — a documented product-limitation
-adaptation, not a weakening. **W3.21 surfaces a PRODUCT DEFECT FINDING**:
-`workflow fail --force` CANCELS every waiting/pending/running step
-(`forceFailRun`), while `resumeWorkflow` only resets steps whose status is
-'failed' — so after a force-fail there is no failed step to reset:
-`advancePipeline` vacuous-completes the run, the daemon registration is
-refused ("Run is terminal: completed"), the resume CLI exits 1, and the run
-is reverted to 'failed'. The scripted battery asserts the resulting
-TEST_INFRA_FAIL (probe-action-failed) as the EXPECTED outcome — the probe
-machinery executed both actions with evidence and mechanically surfaced the
-product defect; the resumeWorkflow-reuses-run-id semantics are pinned by
-O16's mutation fixtures (o16-green-resume / o16-resume-new-run-id).
+adaptation, not a weakening. **W3.21's fail_force->resume is the FIXED
+corridor (product commit 3f880b1a, "Stop force-fail teardown from emitting
+spurious run.completed")**: `workflow fail --force` CANCELS every
+waiting/pending/running step (`forceFailRun`), and `resumeWorkflow` now
+REPAIRS the all-canceled pipeline (resets from the first non-done step,
+advances only when waiting work exists, and re-registers with the daemon) —
+the resume SUCCEEDS with the SAME run id and the run re-activates from the
+interrupted step. The launch hook (`workflow run --wait`) returns at the
+FIRST terminal state (run.failed after the force-fail), so the controller's
+harvest sees the resumed run still 'running' and leaves the case 'attached'
+(no terminal report, no O16 verdict) — the documented US-004
+resume-leaves-case-attached shape. The scripted battery asserts the FIXED
+corridor at the EVIDENCE level (probe_evidence for both actions — fail_force
+ok, resume ok:true exit 0 with the same run id — plus the run's own event
+stream re-activation after the resume), exactly like the W4.33d corridor;
+the resumeWorkflow-reuses-run-id semantics are additionally pinned by O16's
+mutation fixtures (o16-green-resume / o16-resume-new-run-id).
 Each case is driven through `tt-controller` against the scripted daemon with
 a full-pipeline behaviors file (planner emits STORIES_JSON, setup creates a
 per-worktree unique feature branch, the developer writes+commits a marker
 with a long sleep so probe markers fire mid-round, the tester reports
 TESTED_TREE, the merger runs the real `tamandua merge-branch` plumbing), and
 asserted per case: probe actions executed (probe_evidence present), O16
-verdict emitted on the scripted fixture (PASS for W3.18–W3.22,
-NOT_EVALUABLE for the chaos-only W3.17b), zero tokens observed. The battery
+verdict emitted on the scripted fixture (PASS for W3.18–W3.20 and W3.22,
+NOT_EVALUABLE for the chaos-only W3.17b; W3.21's attached case emits no O16
+verdict — the resume re-activates the run after the launch hook returned, so
+the case stays attached with no terminal report, per the fixed corridor
+above), zero tokens observed. The battery
 also fixed three REAL product-facing bugs the scripted proof exposed:
 `fail_force`'s probe argv was missing `--reason` (the CLI requires it — the
 probe would have exited 1 on a real instance); `tt-chaos`'s phase-marker

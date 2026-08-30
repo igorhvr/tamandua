@@ -70,7 +70,14 @@ function readRefs(file, expectedPhase) {
     throw new OracleRuntimeError(`refs_${expectedPhase} must be a version-1 ${expectedPhase} snapshot`);
   }
   const repository = object(artifact.repository, `refs_${expectedPhase}.repository`);
-  if (typeof artifact.target_ref !== 'string' || !artifact.target_ref.startsWith('refs/')) {
+  // S31 (US-009): a detached-HEAD origin fixture (W4.30-detached-head-origin)
+  // has no symbolic target ref — the snapshot records the detached HEAD
+  // commit as target_ref with a detached_head marker. Accept the resolved
+  // OID identity for that shape; every named-target snapshot keeps the
+  // full-ref-name requirement.
+  if (artifact.detached_head === true) {
+    requireOid(artifact.target_ref, `refs_${expectedPhase}.target_ref`);
+  } else if (typeof artifact.target_ref !== 'string' || !artifact.target_ref.startsWith('refs/')) {
     throw new OracleRuntimeError(`refs_${expectedPhase}.target_ref must be a full ref name`);
   }
   return {
@@ -83,7 +90,11 @@ function readRefs(file, expectedPhase) {
 function readReflog(file) {
   const artifact = readJson(file, 'target_reflog');
   if (artifact.schema_version !== 1) throw new OracleRuntimeError('target_reflog.schema_version must be 1');
-  if (typeof artifact.target_ref !== 'string' || !artifact.target_ref.startsWith('refs/')) {
+  // S31 (US-009): detached-head fixtures resolve target_ref to the detached
+  // HEAD commit OID with a detached_head marker (see readRefs).
+  if (artifact.detached_head === true) {
+    requireOid(artifact.target_ref, 'target_reflog.target_ref');
+  } else if (typeof artifact.target_ref !== 'string' || !artifact.target_ref.startsWith('refs/')) {
     throw new OracleRuntimeError('target_reflog.target_ref must be a full ref name');
   }
   return {

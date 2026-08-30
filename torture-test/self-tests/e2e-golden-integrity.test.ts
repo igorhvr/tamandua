@@ -75,6 +75,12 @@ const HEAVY_CAMPAIGN_TESTS = [
   "tier1-w2-darwin-capable-proof.test.ts",
   "tier2-repeatability.test.ts",
   "tier2-scripted-behaviors-materialization.test.ts",
+  // US-002 (S29): fired-trigger corridor — must stay in lock-step with run.sh
+  // + verify-heavy-campaign-tests.test.sh.
+  "tier2-s29-fired-trigger-corridor.test.ts",
+  // US-004 (S29): premise-redesign corridor — must stay in lock-step with
+  // run.sh + verify-heavy-campaign-tests.test.sh.
+  "tier2-s29-premise-redesign-corridor.test.ts",
 ];
 const heavyCampaignScriptPath = path.join(
   repoRoot,

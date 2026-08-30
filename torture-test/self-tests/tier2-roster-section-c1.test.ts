@@ -134,8 +134,8 @@ describe("Tier-2 US-006 — section-C1 roster (process & daemon violence)", () =
       assert.equal(record.chaos.type, "kill-harness", `${record.id} must carry a kill-harness chaos block`);
       assert.equal(record.chaos.target, "harness_process", `${record.id} kill-harness targets harness_process`);
       assert.equal(record.chaos.signal, "SIGKILL", `${record.id} kill-harness declares SIGKILL (kill -9 per spec)`);
-      assert.equal(record.chaos.trigger, "step:developer:running",
-        `${record.id} kill-harness arms mid-implement (step:developer:running)`);
+      assert.equal(record.chaos.trigger, "step:fixer:running",
+        `${record.id} kill-harness arms mid-fix (the bfmw coding step — S29 calibration US-003: step:developer:running is not bfmw vocabulary)`);
       assert.equal(record.chaos.operator, "tt-chaos", `${record.id} chaos operator must be tt-chaos`);
       assert.ok(record.oracles.includes("O4"), `${record.id} must declare O4 (chaos-log dispatch hygiene)`);
       // The worker_lost -> re-pend corridor is in the task text.
@@ -154,8 +154,8 @@ describe("Tier-2 US-006 — section-C1 roster (process & daemon violence)", () =
     assert.equal(kill.chaos.type, "kill-daemon", "W4.10-kill-daemon must carry a kill-daemon chaos block");
     assert.equal(kill.chaos.target, "daemon_process", "W4.10-kill-daemon targets daemon_process");
     assert.equal(kill.chaos.signal, "SIGKILL", "W4.10-kill-daemon declares SIGKILL");
-    assert.equal(kill.chaos.trigger, "step:developer:running",
-      "W4.10-kill-daemon kills the daemon mid-implement while the harness is left alive");
+    assert.equal(kill.chaos.trigger, "step:fixer:running",
+      "W4.10-kill-daemon kills the daemon mid-fix while the harness is left alive (S29 calibration US-003 — step:developer:running is not bfmw vocabulary)");
     assert.equal(kill.chaos.operator, "tt-chaos", "W4.10-kill-daemon chaos operator must be tt-chaos");
     assert.ok(kill.oracles.includes("O4"), "W4.10-kill-daemon must declare O4 (chaos-log dispatch hygiene)");
     const killTask = fs.readFileSync(path.join(ttRoot, kill.task), "utf8");
@@ -173,7 +173,8 @@ describe("Tier-2 US-006 — section-C1 roster (process & daemon violence)", () =
     for (const [index, group] of restart.probe_sequence.entries()) {
       const action = group.actions.find((item: any) => item.op === "restart_daemon");
       assert.ok(action, `W4.10-restart-recovery run group ${index + 1} must declare restart_daemon`);
-      assert.equal(action.when, "step:developer:running", "restart arms mid-implement");
+      assert.equal(action.when, "step:fixer:running",
+        "restart arms mid-fix (the bfmw coding step — S29 calibration, US-002: step:developer:running is not bfmw vocabulary)");
       assert.equal(action.expect?.recovery_within_dispatch_intervals, 2,
         "recovery_within_dispatch_intervals must be 2 (spec: recovery <= 2 intervals)");
       assert.equal(action.expect?.token_flush_preserved, true, "token flush must be preserved across the restart");

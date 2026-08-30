@@ -197,6 +197,20 @@ const allowed = [
   "torture-test/bin/tt-controller.test.sh",
   "torture-test/bin/tt-chaos",
   "torture-test/bin/tt-chaos.test.sh",
+  // S29 (US-003): the fail-closed trigger-vocabulary preflight is shared by
+  // tt-controller and tt-chaos via this module — part of the S29 authoring
+  // surface alongside the two operators it wires.
+  "torture-test/bin/tt-trigger-vocabulary.mjs",
+  // S30 (US-008): the catalog-install preflight seam — tt-catalog-install now
+  // carries the fail-closed --verify workflow-spec leg, tt-required-workflows
+  // enumerates tier2.jsonl (so tt-verdict-trap joins the required set), and
+  // the preflight wiring test (tt-controller-preflight.test.sh) gains the
+  // workflow-spec AC — part of the S30 authoring surface alongside
+  // tt-catalog-install.test.sh and the S30 self-test.
+  "torture-test/bin/tt-catalog-install",
+  "torture-test/bin/tt-required-workflows",
+  "torture-test/bin/tt-catalog-install.test.sh",
+  "torture-test/bin/tt-controller-preflight.test.sh",
   "torture-test/bin/verify-heavy-campaign-tests.test.sh",
   "torture-test/bin/tt-process-identity.mjs",
   "torture-test/bin/tt-process-identity.test.mjs",

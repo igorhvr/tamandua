@@ -10,6 +10,10 @@ import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { execSync, spawnSync } from 'node:child_process';
 import { verifyRecordedTarget, getProcessGroup, ownProcessGroup } from './tt-process-identity.mjs';
+import {
+  stringMarkerVocabularyError,
+  workflowVocabularyFor,
+} from './tt-trigger-vocabulary.mjs';
 
 // ── Phase wait constants ─────────────────────────────────────────────
 
@@ -21,6 +25,17 @@ const DEFAULT_TIMEOUT_S = 120;
 const EXIT_TRIGGER_NEVER = 2;
 const EXIT_GUARD_MISS = 3;
 const EXIT_INVALID_MARKER = 1;
+// S28 (US-005): spawned against a run that is ALREADY terminal — the
+// injection can never fire. Numerically equal to EXIT_TRIGGER_NEVER (the
+// phaseWait run-terminal early-exit code) but named distinctly: the message
+// (chaos-refused: ...) is what distinguishes the two in the evidence.
+const EXIT_RUN_TERMINAL = 2;
+
+// ── Run terminal statuses (S28 US-005) ───────────────────────────────
+// Union of the controller's TERMINAL_RUN_STATUSES (completed|done|failed|
+// canceled) and the phaseWait/guard terminal list (completed|failed|
+// canceled|stopped): any of these means the trigger can no longer fire.
+const TERMINAL_RUN_STATUSES = ['completed', 'done', 'failed', 'canceled', 'stopped'];
 
 // ── Paths ─────────────────────────────────────────────────────────────
 
@@ -97,8 +112,8 @@ const ACTIONS = {
     desc: 'Dirty a tracked file in the repo to create PARK bait',
   },
   'move-branch': {
-    args: '--repo <bare> --ref <r>',
-    desc: 'Move a ref in a bare repo to create rugpull pressure',
+    args: '--repo <repo> --ref <r> [--repeat <n> --interval <s>]',
+    desc: 'Move a ref in the origin repo (bare OR work clone) to create rugpull pressure; --repeat arms an empty-diff colleague budget then moves the ref n times (one every --interval seconds) for persistent colleague target-moves',
   },
 };
 
@@ -125,7 +140,9 @@ Options:
   --when <marker>      Phase marker expression — step:<role>:<state>,
                        event:<type>, file:<path>, or "now"
   --timeout <s>        Max seconds to wait for the phase marker
-                       (default: 120; --when now ignores this)
+                       (default: 120; --when now ignores this). move-branch
+                       repeat: also bounds each between-move cadence window
+                       (the loop stands down on run-terminal regardless).
   --target-pid <pid>   Explicit recorded harness PID (kill-harness /
                        sigstop_sigcont). Kill targets are NEVER resolved by
                        a /proc cwd/cmdline sweep; an explicit record (these
@@ -136,11 +153,18 @@ Options:
   --target-start-time <n>
                        Recorded /proc starttime of the target — ABA-safe
                        identity check; a mismatch refuses the signal.
+  --repeat <n>         move-branch only: persistent colleague target-move —
+                       move the ref n times (first at the armed marker, then
+                       every --interval seconds); the loop stands down as soon
+                       as the run is observed terminal so a resume lands on a
+                       stable target (US-004 S29 premise redesign).
+  --interval <s>       move-branch only: seconds between repeated moves
+                       (REQUIRED when --repeat > 1).
   --help, -h           Print this usage and exit
 
 Phase markers:
   step:<role>:<state>  Wait for step state transition (e.g. step:developer:running)
-  event:<type>         Wait for event row appearance (e.g. event:merge.parked)
+  event:<type>         Wait for event row appearance (e.g. event:merge.landed)
   file:<path>           Wait for file existence
   now                  Fire immediately (no polling; logged as timed-not-triggered)
 
@@ -149,7 +173,7 @@ Examples:
   tt-chaos pause --run run-abc123 --when step:developer:running
   tt-chaos sigstop_sigcont --run run-abc123 --when step:developer:running --hold-seconds 600
   tt-chaos colleague-commit --repo var/fixture-clone --file README.md \\
-      --line "CHAOS MARKER" --run run-abc123 --when event:merge.parked
+      --line "CHAOS MARKER" --run run-abc123 --when event:merge.landed
 
 Injection discipline (spec 08): every action arms on its --when phase
 marker (never a bare sleep) and re-verifies its target immediately before
@@ -270,8 +294,12 @@ function killHarness(opts) {
  * The target PID comes from the TT daemon pidfile ONLY (US-002): when the
  * pidfile is absent the action refuses with GUARD_MISS (exit 3) — there is
  * NO fallback to a /proc daemon scan. The pidfile PID is verified (alive,
- * identity, ancestry/group disjointness, provenance) before any signal.
- * Default signal: SIGKILL.
+ * identity, ancestry/group disjointness, pidfile-under-TT_ROOT containment)
+ * before any signal. S28 (US-006): the verification does NOT require the
+ * daemon's cwd/cmdline to contain TT_ROOT or the run id — the real contained
+ * daemon legitimately runs from a different cwd with a cmdline that contains
+ * neither (campaign W4.48a `Process ... cwd/cmdline does not contain
+ * .../torture-test/var` GUARD_MISS). Default signal: SIGKILL.
  */
 function killDaemon(opts) {
   const { run: runId, args } = opts;
@@ -291,7 +319,7 @@ function killDaemon(opts) {
     process.exit(EXIT_GUARD_MISS);
   }
 
-  const verdict = verifyKillTarget(record, runId);
+  const verdict = verifyKillTarget(record, runId, 'daemon');
   if (!verdict.ok) {
     const entry = {
       ts: new Date().toISOString(),
@@ -584,9 +612,29 @@ function deleteTstxRow(opts) {
   // By the delete-tstx-row trigger (finalize pending) the verifier has run, so
   // the attested tree is present; a missing attestation fails loudly (never a
   // silent no-op deletion against the sentinel string).
+  //
+  // S28 (US-007): the resolution is fail-closed — resolveAttestedTestedTree
+  // THROWS a precise one-line reason when the run context lacks a 40-hex
+  // tested_tree (or the context row is unreadable). That throw must NEVER
+  // escape as an uncaught exception (the campaign's W4.48c
+  // `chaos operator 'tt-chaos' exited 1` was exactly that: a bare exit-1 with
+  // a stack trace and NO structured chaos.log failure entry). Catch it here,
+  // log a structured fire_failed entry, and exit with the precise
+  // `delete-tstx-row: <reason> -- refusing` line so the operator/controller
+  // sees why the injection could not run.
   let treeHash = args.tree;
   if (treeHash === 'TESTEDTREE') {
-    treeHash = resolveAttestedTestedTree(runId);
+    try {
+      treeHash = resolveAttestedTestedTree(runId);
+    } catch (e) {
+      const reason = e instanceof Error ? e.message : String(e);
+      logStructured({
+        ts: new Date().toISOString(), action: 'delete-tstx-row', runId,
+        tree: 'TESTEDTREE', outcome: 'fire_failed', error: reason,
+      });
+      console.error(`delete-tstx-row: ${reason} -- refusing`);
+      process.exit(1);
+    }
   }
 
   if (!treeHash) {
@@ -644,9 +692,23 @@ function deleteTstxRow(opts) {
 
 /**
  * Resolve the TESTEDTREE sentinel to the run's attested tested tree.
- * Reads the run row's context from the contained TT DB (both run-id
- * spellings) and returns context.tested_tree when it is a 40-hex tree.
- * Throws a loud error when the run has not attested a tree.
+ *
+ * SCHEMA (documented — S28 US-007): the run's attested tested tree lives in
+ * the contained TT DB `runs` row's `context` column — a JSON string whose
+ * `tested_tree` key carries the 40-hex tree the verifier attested (the
+ * step-output key parser lowercases `TESTED_TREE` → `tested_tree`; the
+ * product also seeds `tested_tree` at run creation from the origin commit's
+ * tree — src/installer/run.ts). The PRODUCT runs table keys on `id` = RAW
+ * uuid (no `run-` prefix) while the controller passes `run-<uuid>`; the
+ * tt-chaos test fixtures key on `run_id`. Every (column, spelling) candidate
+ * is probed tolerantly (queryRunRowTolerant) — a schema mismatch degrades to
+ * a precise one-line throw, never a crash.
+ *
+ * Returns context.tested_tree when it is a 40-hex tree. Throws a precise
+ * one-line reason when the run has not attested a tree (or the context row is
+ * unreadable / not JSON) — the caller (deleteTstxRow) converts the throw into
+ * a structured fire_failed entry + `-- refusing` exit (never an uncaught
+ * exception).
  */
 function resolveAttestedTestedTree(runId) {
   const dbPath = resolveDbPath();
@@ -654,24 +716,24 @@ function resolveAttestedTestedTree(runId) {
   let db = null;
   try {
     db = new DatabaseSync(dbPath, { open: true, readOnly: true });
-    const rows = db.prepare('SELECT context FROM runs WHERE id = ? OR id = ?').all(runId, shortRunId);
-    if (rows.length !== 1 || typeof rows[0].context !== 'string') {
-      throw new Error(`TESTEDTREE resolution: run ${runId} has no readable context row`);
+    const row = queryRunRowTolerant(db, runId, shortRunId);
+    if (row === undefined || typeof row.context !== 'string') {
+      throw new Error(`run ${runId} has no readable context row`);
     }
-    const context = JSON.parse(rows[0].context);
+    let context;
+    try {
+      context = JSON.parse(row.context);
+    } catch (e) {
+      throw new Error(`run ${runId} context is not JSON: ${e.message}`);
+    }
     const attested = typeof context.tested_tree === 'string'
       && /^[0-9a-f]{40}$/.test(context.tested_tree)
       ? context.tested_tree
       : null;
     if (attested === null) {
-      throw new Error(`TESTEDTREE resolution: run ${runId} has no attested tested_tree in its context`);
+      throw new Error(`run ${runId} has no attested tested_tree in context`);
     }
     return attested;
-  } catch (e) {
-    if (e instanceof SyntaxError) {
-      throw new Error(`TESTEDTREE resolution: run ${runId} context is not JSON: ${e.message}`);
-    }
-    throw e;
   } finally {
     if (db) try { db.close(); } catch { /* ignore */ }
   }
@@ -848,8 +910,25 @@ function dirtyTree(opts) {
 }
 
 /**
- * move-branch: Move a ref in a bare repo to create rugpull pressure.
- * Moves the ref to its parent commit (ref~1).
+ * move-branch: Move a ref in the origin repo (bare OR work clone — the
+ * worktree-origin repository a bfmw run merges into is the non-bare work
+ * clone) to create rugpull pressure. Moves the ref to its parent commit
+ * (ref~1) using plain `git -C` so bare and non-bare repos behave identically.
+ *
+ * US-004 (S29 premise redesign): --repeat <n> [--interval <s>] performs the
+ * PERSISTENT colleague target-move the W4.33d/W4.48b corridors need. First
+ * the operator ARMS a move budget: `repeat` EMPTY-DIFF "colleague" commits
+ * pushed onto the target ref (commit-tree with the ref's tree — the tree
+ * never changes, so downstream merges stay clean; this also gives a
+ * single-commit fixture main enough parents to move back through). Then the
+ * loop moves the ref back one parent per move: the first move lands at the
+ * armed phase marker, each subsequent move lands interval seconds later, and
+ * the loop STANDS DOWN (mechanizing the "operator removes the rejection
+ * condition" protocol) as soon as the run is observed terminal (status or a
+ * run.* terminal event in the append-only event stream), so a `resume` fired
+ * on `event:run.failed` re-runs the finalize against a STABLE target. Each
+ * move logs its own chaos.log entry (move_index/from/to) — the per-attempt
+ * evidence O16/oracle cross-checks.
  */
 function moveBranch(opts) {
   const { run: runId, args } = opts;
@@ -865,80 +944,263 @@ function moveBranch(opts) {
     process.exit(1);
   }
 
-  const repoPath = path.resolve(repo);
-
-  try { fs.accessSync(repoPath); } catch {
-    const entry = { ts: new Date().toISOString(), action: 'move-branch', runId, outcome: 'target_not_found', error: `Bare repo path does not exist: ${repoPath}` };
-    logStructured(entry);
-    console.error(`Error: Bare repo path does not exist: ${repoPath}`);
+  const repeatRaw = args.repeat === undefined ? '1' : args.repeat;
+  const repeat = Number(repeatRaw);
+  if (!Number.isInteger(repeat) || repeat < 1) {
+    console.error(`Error: --repeat must be a positive integer, got "${repeatRaw}"`);
+    process.exit(1);
+  }
+  const intervalRaw = args.interval;
+  const interval = intervalRaw === undefined ? 0 : Number(intervalRaw);
+  if (repeat > 1 && (!Number.isInteger(interval) || interval < 1)) {
+    console.error(`Error: --interval must be a positive integer when --repeat > 1, got "${intervalRaw}"`);
+    process.exit(1);
+  }
+  if (repeat === 1 && intervalRaw !== undefined) {
+    console.error('Error: --interval requires --repeat > 1 (a single move needs no interval)');
     process.exit(1);
   }
 
+  const repoPath = path.resolve(repo);
+
+  try { fs.accessSync(repoPath); } catch {
+    const entry = { ts: new Date().toISOString(), action: 'move-branch', runId, outcome: 'target_not_found', error: `Repo path does not exist: ${repoPath}` };
+    logStructured(entry);
+    console.error(`Error: Repo path does not exist: ${repoPath}`);
+    process.exit(1);
+  }
+
+  // Resolve the full ref path once (handles short names like "main" →
+  // "refs/heads/main"); fails closed with a precise reason when the ref does
+  // not resolve in the repo.
+  let resolvedRef = '';
   try {
-    // Resolve the ref to its full path and current commit hash
-    let currentHash = '';
-    let resolvedRef = '';
-
-    // First, resolve the full ref path (handles short names like "main" → "refs/heads/main")
-    try {
-      resolvedRef = execSync(`git --git-dir="${repoPath}" rev-parse --symbolic-full-name "${ref}"`, {
-        encoding: 'utf-8', timeout: 10000,
-        env: { ...process.env, GIT_DIR: repoPath },
-      }).trim();
-    } catch {
-      // If --symbolic-full-name fails, prepend refs/heads/ and try
-      resolvedRef = `refs/heads/${ref}`;
-      // Verify it exists
-      execSync(`git --git-dir="${repoPath}" rev-parse --verify "${resolvedRef}"`, {
-        encoding: 'utf-8', timeout: 10000,
-        env: { ...process.env, GIT_DIR: repoPath },
-      });
-    }
-
-    // Get current hash
-    currentHash = execSync(`git --git-dir="${repoPath}" rev-parse --verify "${resolvedRef}"`, {
+    resolvedRef = execSync(`git -C "${repoPath}" rev-parse --symbolic-full-name "${ref}"`, {
       encoding: 'utf-8', timeout: 10000,
-      env: { ...process.env, GIT_DIR: repoPath },
     }).trim();
-
-    // Get parent commit
-    let parentHash = '';
+    if (resolvedRef === '') throw new Error(`ref "${ref}" does not resolve in ${repoPath}`);
+  } catch {
+    // If --symbolic-full-name fails, prepend refs/heads/ and verify
+    resolvedRef = `refs/heads/${ref}`;
     try {
-      parentHash = execSync(`git --git-dir="${repoPath}" rev-parse --verify "${currentHash}~1"`, {
+      execSync(`git -C "${repoPath}" rev-parse --verify "${resolvedRef}^{commit}"`, {
         encoding: 'utf-8', timeout: 10000,
-        env: { ...process.env, GIT_DIR: repoPath },
-      }).trim();
+      });
     } catch {
       const entry = {
         ts: new Date().toISOString(), action: 'move-branch', runId,
+        target: `repo:${repoPath} ref:${ref}`, outcome: 'fire_failed',
+        error: `Ref "${ref}" does not resolve to a commit in ${repoPath}`,
+      };
+      logStructured(entry);
+      console.error(`Error: Ref "${ref}" does not resolve to a commit in ${repoPath}`);
+      process.exit(1);
+    }
+  }
+
+  // US-004: arm the colleague move budget BEFORE the loop. The loop moves the
+  // ref back one parent per move; a fixture's target branch may be too shallow
+  // for a PERSISTENT (repeat > 1) injection (the tt-ts golden main is a single
+  // commit — there are no parents to walk back through). The budget pushes
+  // exactly the DEFICIT of EMPTY-DIFF "colleague" commits (git commit-tree
+  // with the ref's current tree + parent, so the target's TREE is unchanged —
+  // the merges downstream stay clean) so the ref has >= repeat parents. A
+  // single move (repeat == 1) never arms a budget — the legacy shallow-ref
+  // failure (no parent) is preserved, and a multi-commit ref needs no budget.
+  // Fail-closed: a budget that cannot be armed is a fire_failed, never a
+  // silent half-injection.
+  const armMoveBudget = () => {
+    if (repeat <= 1) return true;
+    let depth = 0;
+    try {
+      depth = Number(execSync(`git -C "${repoPath}" rev-list --count "${resolvedRef}"`, {
+        encoding: 'utf-8', timeout: 10000,
+      }).trim());
+    } catch (e) {
+      const entry = { ts: new Date().toISOString(), action: 'move-branch', runId, outcome: 'fire_failed', error: `cannot count ${ref} history: ${e.message}` };
+      logStructured(entry);
+      console.error(`Error: cannot count ${ref} history: ${e.message}`);
+      return false;
+    }
+    const deficit = Math.max(0, repeat - Math.max(0, depth - 1));
+    if (deficit === 0) return true;
+    const gitEnv = {
+      ...process.env,
+      GIT_AUTHOR_NAME: 'Chaos Operator',
+      GIT_AUTHOR_EMAIL: 'chaos@tamandua.test',
+      GIT_COMMITTER_NAME: 'Chaos Operator',
+      GIT_COMMITTER_EMAIL: 'chaos@tamandua.test',
+    };
+    let parentHash = '';
+    try {
+      parentHash = execSync(`git -C "${repoPath}" rev-parse --verify "${resolvedRef}^{commit}"`, {
+        encoding: 'utf-8', timeout: 10000,
+      }).trim();
+    } catch (e) {
+      const entry = { ts: new Date().toISOString(), action: 'move-branch', runId, outcome: 'fire_failed', error: `cannot arm move budget — resolve ${ref}: ${e.message}` };
+      logStructured(entry);
+      console.error(`Error: cannot arm move budget — resolve ${ref}: ${e.message}`);
+      return false;
+    }
+    const treeHash = execSync(`git -C "${repoPath}" rev-parse --verify "${resolvedRef}^{tree}"`, {
+      encoding: 'utf-8', timeout: 10000,
+    }).trim();
+    for (let i = 1; i <= deficit; i++) {
+      try {
+        const newHash = execSync(`git -C "${repoPath}" commit-tree "${treeHash}" -p "${parentHash}" -m "chaos: colleague budget ${i}/${deficit}"`, {
+          encoding: 'utf-8', timeout: 10000, env: gitEnv,
+        }).trim();
+        execSync(`git -C "${repoPath}" update-ref "${resolvedRef}" "${newHash}" "${parentHash}"`, {
+          encoding: 'utf-8', timeout: 10000,
+        });
+        parentHash = newHash;
+      } catch (e) {
+        const entry = { ts: new Date().toISOString(), action: 'move-branch', runId, outcome: 'fire_failed', budget_move: i, error: `cannot arm move budget commit ${i}/${deficit}: ${e.message}` };
+        logStructured(entry);
+        console.error(`Error: cannot arm move budget commit ${i}/${deficit}: ${e.message}`);
+        return false;
+      }
+    }
+    logStructured({
+      ts: new Date().toISOString(), action: 'move-branch', runId,
+      target: `repo:${repoPath} ref:${ref}`, outcome: 'budget_armed', budget_commits: deficit,
+      history_depth: depth,
+    });
+    return true;
+  };
+
+  // One move: ref → ref~1, logged with move_index. Returns the new hash, or
+  // null after logging fire_failed (the caller fails closed — no silent
+  // partial injection).
+  const moveOnce = (moveIndex) => {
+    let currentHash = '';
+    try {
+      currentHash = execSync(`git -C "${repoPath}" rev-parse --verify "${resolvedRef}^{commit}"`, {
+        encoding: 'utf-8', timeout: 10000,
+      }).trim();
+    } catch (e) {
+      const entry = { ts: new Date().toISOString(), action: 'move-branch', runId, move_index: moveIndex, target: `repo:${repoPath} ref:${ref}`, outcome: 'fire_failed', error: e.message };
+      logStructured(entry);
+      console.error(`Error: move-branch failed resolving ${ref}: ${e.message}`);
+      return null;
+    }
+    let parentHash = '';
+    try {
+      parentHash = execSync(`git -C "${repoPath}" rev-parse --verify "${currentHash}~1"`, {
+        encoding: 'utf-8', timeout: 10000,
+      }).trim();
+    } catch {
+      const entry = {
+        ts: new Date().toISOString(), action: 'move-branch', runId, move_index: moveIndex,
         target: `repo:${repoPath} ref:${ref}`, outcome: 'fire_failed',
         error: `Ref ${ref} (${currentHash}) has no parent commit to move to`,
       };
       logStructured(entry);
       console.error(`Error: Ref ${ref} (${currentHash}) has no parent commit — cannot move`);
-      process.exit(1);
+      return null;
     }
-
-    // Move the ref via update-ref (for bare repos)
-    execSync(`git --git-dir="${repoPath}" update-ref "${resolvedRef}" "${parentHash}"`, {
-      encoding: 'utf-8', timeout: 10000,
-      env: { ...process.env, GIT_DIR: repoPath },
-    });
-
+    try {
+      execSync(`git -C "${repoPath}" update-ref "${resolvedRef}" "${parentHash}"`, {
+        encoding: 'utf-8', timeout: 10000,
+      });
+    } catch (e) {
+      const entry = { ts: new Date().toISOString(), action: 'move-branch', runId, move_index: moveIndex, target: `repo:${repoPath} ref:${ref}`, outcome: 'fire_failed', error: e.message };
+      logStructured(entry);
+      console.error(`Error: move-branch failed: ${e.message}`);
+      return null;
+    }
     const entry = {
-      ts: new Date().toISOString(), action: 'move-branch', runId,
+      ts: new Date().toISOString(), action: 'move-branch', runId, move_index: moveIndex,
       target: `repo:${repoPath} ref:${ref}`, from: currentHash, to: parentHash,
       outcome: 'fired',
     };
     logStructured(entry);
-    console.error(`move-branch: moved ${ref} from ${currentHash.slice(0, 8)} to ${parentHash.slice(0, 8)} in ${repoPath}`);
-    process.exit(0);
-  } catch (e) {
-    const entry = { ts: new Date().toISOString(), action: 'move-branch', runId, outcome: 'fire_failed', error: e.message };
-    logStructured(entry);
-    console.error(`Error: move-branch failed: ${e.message}`);
-    process.exit(1);
+    console.error(`move-branch: moved ${ref} from ${currentHash.slice(0, 8)} to ${parentHash.slice(0, 8)} in ${repoPath} (move ${moveIndex}/${repeat})`);
+    return parentHash;
+  };
+
+  if (!armMoveBudget()) process.exit(1); // fire_failed already logged
+
+  let movesExecuted = 0;
+  for (let moveIndex = 1; moveIndex <= repeat; moveIndex++) {
+    const newHash = moveOnce(moveIndex);
+    if (newHash === null) process.exit(1); // fire_failed already logged
+    movesExecuted = moveIndex;
+    if (moveIndex < repeat) {
+      sleepSync(interval * 1000);
+      if (runTerminalObserved(runId)) {
+        logStructured({
+          ts: new Date().toISOString(), action: 'move-branch', runId,
+          phaseMarker: opts.when, target: `repo:${repoPath} ref:${ref}`,
+          outcome: 'stand_down', moves_executed: movesExecuted,
+          error: `run ${runId} reached terminal — colleague target-moves stopped (operator stand-down mechanized) so a resume lands on a stable target`,
+        });
+        console.error(`move-branch: run ${runId} terminal after ${movesExecuted} move(s) — standing down the colleague target-moves`);
+        break;
+      }
+    }
   }
+  process.exit(0);
+}
+
+/**
+ * runTerminalObserved: has the run reached a terminal state (status row OR a
+ * run.* terminal event in the append-only event stream)? The event-stream
+ * latch is the authoritative stop for the persistent-move loop: once
+ * run.failed/run.completed/run.canceled is appended it stays appended, so a
+ * `workflow resume` that re-activates the run row can never un-stop the
+ * injection. Any read failure is EVIDENCE (keep the loop's cadence), never a
+ * crash.
+ */
+function runTerminalObserved(runId) {
+  const dbPath = resolveDbPath();
+  let db = null;
+  try {
+    db = new DatabaseSync(dbPath, { open: true, readOnly: true });
+    const shortRunId = runId.startsWith('run-') ? runId.slice(4) : runId;
+    const row = queryRunRowTolerant(db, runId, shortRunId);
+    if (row !== undefined && typeof row.status === 'string'
+        && TERMINAL_RUN_STATUSES.includes(row.status)) {
+      return true;
+    }
+  } catch {
+    // keep polling — a transient DB read is evidence, not a stop
+  } finally {
+    if (db) try { db.close(); } catch { /* ignore */ }
+  }
+  return readRunEventStreamLines(runId).some(
+    (event) => event.event === 'run.failed' || event.event === 'run.completed' || event.event === 'run.canceled',
+  );
+}
+
+// ── S28 (US-005): startup terminal-run guard ──────────────────────────
+// A run that is ALREADY terminal when the operator spawns can never fire its
+// trigger: waiting on it would linger until the contained daemon's post-run
+// leak-guard sweep (sweepRunProcesses — cmdline-contains-runId matcher)
+// SIGKILLs the operator, which surfaced as the campaign's `chaos operator
+// 'tt-chaos' exited null` (S28). Refuse at startup, BEFORE phaseWait, with a
+// precise one-line reason so the operator never lingers to be swept. Returns
+// the terminal status string, or null when the run row is absent (test
+// fixtures / unknown runs — the guard + phaseWait remain the fail-closed
+// layers) or the DB read degrades (transient — proceed; the controller-side
+// refusal is the primary gate for manifest-driven invocations).
+function startupTerminalStatus(runId) {
+  const dbPath = resolveDbPath();
+  let db = null;
+  try {
+    db = new DatabaseSync(dbPath, { open: true, readOnly: true });
+    const shortRunId = runId.startsWith('run-') ? runId.slice(4) : runId;
+    const row = queryRunRowTolerant(db, runId, shortRunId);
+    if (row !== undefined && typeof row.status === 'string'
+        && TERMINAL_RUN_STATUSES.includes(row.status)) {
+      return row.status;
+    }
+  } catch {
+    // degraded DB read — proceed (the run row could not be verified)
+  } finally {
+    if (db) try { db.close(); } catch { /* ignore */ }
+  }
+  return null;
 }
 
 // ── US-006: Execution control actions (pause, resume, cancel, stop) ───
@@ -1146,6 +1408,15 @@ function phaseWait(marker, timeoutSec, runId) {
       logStructured({ ts: new Date().toISOString(), action: 'phase_wait', runId, phaseMarker: marker, phaseSatisfied: true, outcome: 'marker_satisfied' });
       if (db) db.close();
       return { satisfied: true };
+    }
+    // US-004 (S29 premise redesign): never wait out the full timeout against
+    // a run that already went terminal — the marker can no longer fire, so
+    // the operator fails closed NOW (exit 2 TRIGGER_NEVER) instead of burning
+    // the case's wall budget on a silent wait (the S29 defect class).
+    if (runTerminalObserved(runId)) {
+      logStructured({ ts: new Date().toISOString(), action: 'phase_wait', runId, phaseMarker: marker, phaseSatisfied: false, outcome: 'run_terminal_before_marker' });
+      if (db) db.close();
+      return { satisfied: false, reason: 'RUN_TERMINAL_BEFORE_MARKER' };
     }
     // Busy-wait sleep via synchronous spin (sync alternative to setTimeout for CLI scripts)
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, POLL_INTERVAL_MS);
@@ -1384,7 +1655,12 @@ function guardFire(action, runId, opts) {
     if (record.error) {
       return { guarded: false, reason: record.error };
     }
-    const verdict = verifyKillTarget(record, runId);
+    // S28 (US-006): kill-daemon targets (pidfile-resolved) verify WITHOUT the
+    // strict cwd/cmdline provenance requirement (the real contained daemon's
+    // cwd/cmdline contains neither TT_ROOT nor the run id); harness targets
+    // keep the strict check.
+    const kind = action === 'kill-daemon' ? 'daemon' : 'harness';
+    const verdict = verifyKillTarget(record, runId, kind);
     if (!verdict.ok) {
       return { guarded: false, reason: verdict.reason };
     }
@@ -1511,8 +1787,16 @@ function resolveFromStepsTable(runId) {
  * Read the TT daemon PID from its pidfile. The contained daemon writes
  * <state-dir>/tamandua.pid (daemon-control / tt-daemon-up); the legacy
  * <TT_HOME>/.tamandua/daemon.pid fixture path is also accepted. Returns
- * { pid } or null when no pidfile exists. NEVER falls back to a /proc
- * daemon scan — an absent pidfile is a hard refusal (GUARD_MISS).
+ * { pid, pidfile } or null when no pidfile exists. NEVER falls back to a
+ * /proc daemon scan — an absent pidfile is a hard refusal (GUARD_MISS).
+ *
+ * S28 (US-006): the pidfile ITSELF must live under TT_ROOT — the contained
+ * var tree is the daemon trust boundary. An out-of-scope pidfile (e.g.
+ * TAMANDUA_STATE_DIR mis-pointed at the real ~/.tamandua) could name the
+ * PRODUCTION daemon; resolving it would let kill-daemon signal a daemon
+ * outside the torture-test containment. Such a pidfile is refused fail-closed
+ * with a precise one-line reason ({ error }) — never a signal, never a
+ * silent fallback to a process scan.
  */
 function readDaemonPidfile() {
   const candidates = [];
@@ -1525,7 +1809,12 @@ function readDaemonPidfile() {
     try {
       const pidStr = fs.readFileSync(pidFile, 'utf-8').trim();
       const pid = parseInt(pidStr, 10);
-      if (pid > 0) return { pid };
+      if (pid > 0) {
+        if (!pidFile.startsWith(TT_ROOT + path.sep)) {
+          return { error: `daemon pidfile ${pidFile} is not under ${TT_ROOT} — refusing to resolve the daemon from an out-of-scope pidfile` };
+        }
+        return { pid, pidfile: pidFile };
+      }
     } catch {
       // pidfile doesn't exist — try the next candidate
     }
@@ -1540,11 +1829,43 @@ function readDaemonPidfile() {
  * target must NOT be an ancestor of the tt-chaos process and must not share
  * tt-chaos's own pgid; (d) belt-and-suspenders cwd/cmdline provenance check
  * for recorded pids. Returns { ok, reason }.
+ *
+ * S28 (US-006) `kind` parameter: harness targets ('harness', the default —
+ * kill-harness / sigstop_sigcont) keep the STRICT cwd/cmdline provenance
+ * check (step (d)); daemon targets ('daemon' — kill-daemon resolved from the
+ * contained daemon pidfile) must NOT require the daemon's cwd/cmdline to
+ * contain TT_ROOT or the run id: the REAL contained daemon runs from a
+ * different cwd with a cmdline (`node .../dist/cli/cli.js daemon`) that
+ * contains neither, so the strict check would GUARD_MISS every legitimate
+ * kill (campaign W4.48a: `Process 4080359 cwd/cmdline does not contain
+ * .../torture-test/var`). A daemon target's identity is verified by (a)-(c)
+ * plus the pidfile-path-under-TT_ROOT containment check — the pidfile inside
+ * the contained var tree IS the daemon trust boundary. A daemon target that
+ * fails any of those refuses fail-closed with a precise one-line reason
+ * (never a silent fallback to a process scan), and a daemon whose process
+ * group is UNREADABLE (a /proc-less host) is refused too — group
+ * disjointness is part of the identity contract and cannot be waived.
  */
-function verifyKillTarget(record, runId) {
+function verifyKillTarget(record, runId, kind = 'harness') {
   const base = verifyRecordedTarget({ pid: record.pid, pgid: record.pgid, startTime: record.startTime });
   if (!base.ok) return base;
   const pgid = getProcessGroup(record.pid);
+  if (kind === 'daemon') {
+    // S28 (US-006): daemon identity = (a)-(c) above + pidfile containment.
+    // The pidfile path is checked at resolution (readDaemonPidfile) and
+    // re-asserted here (belt-and-suspenders — a record that somehow lacks it
+    // is not a pidfile-resolved daemon and must never be signalled).
+    if (!record.pidfile || !record.pidfile.startsWith(TT_ROOT + path.sep)) {
+      return { ok: false, reason: `daemon pidfile ${record.pidfile ?? '(none)'} is not under ${TT_ROOT} — refusing to signal an out-of-scope daemon target` };
+    }
+    if (pgid === null) {
+      return { ok: false, reason: `cannot read the process group of daemon pid ${record.pid} (no /proc) — group disjointness from the caller cannot be verified, refusing to signal` };
+    }
+    if (pgid === ownProcessGroup()) {
+      return { ok: false, reason: `target pid ${record.pid} shares the caller's own pgid ${pgid} — refusing to signal own group` };
+    }
+    return { ok: true, reason: `recorded daemon pid ${record.pid} verified (alive, identity, group disjointness, pidfile-under-TT_ROOT checks passed)` };
+  }
   if (pgid !== null && pgid === ownProcessGroup()) {
     return { ok: false, reason: `target pid ${record.pid} shares the caller's own pgid ${pgid} — refusing to signal own group` };
   }
@@ -1695,7 +2016,12 @@ function captureProcessEvidence(action, runId, writeFile, opts) {
   if (pid) {
     output += `Target PID: ${pid}\n`;
     output += `Target record: ${JSON.stringify(record)}\n`;
-    const verdict = verifyKillTarget(record, runId);
+    // S28 (US-006): evidence verification mirrors the fire-time guard kind —
+    // a kill-daemon record (pidfile-resolved) is verified without the strict
+    // cwd/cmdline provenance requirement, so the evidence verdict matches
+    // what the guard would decide.
+    const kind = action === 'kill-daemon' ? 'daemon' : 'harness';
+    const verdict = verifyKillTarget(record, runId, kind);
     output += `Verification: ${verdict.ok ? 'ok' : 'refused'} — ${verdict.reason}\n`;
     output += captureProcInfo(pid);
 
@@ -1918,8 +2244,24 @@ function captureDbMutationEvidence(action, runId, opts, writeFile) {
 
   try {
     if (action === 'delete-tstx-row' && opts.args.tree) {
-      const rows = db.prepare('SELECT * FROM tstx WHERE tree = ?').all(opts.args.tree);
-      writeFile('pre_mutation_tstx.json', JSON.stringify(rows, null, 2));
+      // S28 (US-007): snapshot the rows the mutation will delete. The
+      // product's suite ledger table is `suite_results` (tree_hash column);
+      // the historical `tstx` table name never existed in the product schema
+      // (the campaign's W4.48c evidence dir shows `Pre-mutation DB capture
+      // failed: no such table: tstx`). Mirror the mutation's table handling
+      // — capture suite_results rows AND legacy tstx rows when present, so
+      // the pre-mutation evidence is honest against the real contained DB.
+      const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('tstx','suite_results')").all();
+      const hasSuiteResults = tables.some((row) => row.name === 'suite_results');
+      const hasLegacyTstx = tables.some((row) => row.name === 'tstx');
+      const captured = { suite_results: [], tstx: [] };
+      if (hasSuiteResults) {
+        captured.suite_results = db.prepare('SELECT * FROM suite_results WHERE tree_hash = ?').all(opts.args.tree);
+      }
+      if (hasLegacyTstx) {
+        captured.tstx = db.prepare('SELECT * FROM tstx WHERE tree = ?').all(opts.args.tree);
+      }
+      writeFile('pre_mutation_tstx.json', JSON.stringify(captured, null, 2));
     } else if (action === 'write-context' && opts.args.key) {
       // Check if run_context table exists first
       try {
@@ -2057,6 +2399,72 @@ if (!validateMarker(opts.when)) {
   process.exit(EXIT_INVALID_MARKER);
 }
 
+// ── S29 (US-003): fail-closed trigger-vocabulary validation ─────────────
+// Mirrors the controller's validateProbeSequence / validateChaosBlock
+// preflight (tt-trigger-vocabulary.mjs): a step:/event: marker naming a
+// role/event that is NOT in the run's workflow vocabulary can NEVER fire —
+// waiting on it is exactly the silent chaos-invocation-failed defect. When
+// the run's workflow id resolves (the contained runs row) AND its workflow
+// spec is found, an unknown marker fails closed with a DISTINCT one-line
+// reason + EXIT_INVALID_MARKER instead of polling. When the workflow cannot
+// be resolved (test fixtures, unknown workflow ids) the format check above
+// is the only gate — the controller's preflight remains the authoritative
+// fail-closed layer for manifest-driven invocations.
+function validateMarkerVocabulary(marker) {
+  if (typeof marker !== 'string') return null;
+  if (!marker.startsWith('step:') && !marker.startsWith('event:')) return null;
+  // Resolve the workflow id from the contained runs row (both run-id
+  // spellings), tolerantly — a missing row / column degrades to null.
+  let workflowId = null;
+  const dbPath = resolveDbPath();
+  let db = null;
+  try {
+    db = new DatabaseSync(dbPath, { open: true, readOnly: true });
+    const shortRunId = opts.run.startsWith('run-') ? opts.run.slice(4) : opts.run;
+    const row = queryRunRowTolerant(db, opts.run, shortRunId);
+    if (row !== undefined && typeof row.workflow_id === 'string' && row.workflow_id !== '') {
+      workflowId = row.workflow_id;
+    }
+  } catch {
+    workflowId = null;
+  } finally {
+    if (db) db.close();
+  }
+  if (workflowId === null) return null;
+  const vocab = workflowVocabularyFor(workflowId);
+  if (vocab.missing) return null;
+  return stringMarkerVocabularyError(marker, workflowId, vocab, 'chaos');
+}
+
+const markerVocabularyError = validateMarkerVocabulary(opts.when);
+if (markerVocabularyError !== null) {
+  console.error(markerVocabularyError);
+  console.error('  (fail-closed: an unknown marker can never fire — refusing to wait on it)');
+  process.exit(EXIT_INVALID_MARKER);
+}
+
+// ── S28 (US-005): startup terminal-run fast-fail ─────────────────────
+// A run that is ALREADY terminal can never fire the trigger: refuse BEFORE
+// phaseWait with a precise one-line reason (exit EXIT_RUN_TERMINAL) so the
+// operator never lingers to be SIGKILLed by the contained daemon's post-run
+// leak-guard sweep (the campaign's `chaos operator 'tt-chaos' exited null`).
+// The run row must exist AND carry a terminal status — a missing row (test
+// fixtures) or degraded DB read proceeds (the guard + phaseWait remain the
+// fail-closed layers).
+const startupTerminal = startupTerminalStatus(opts.run);
+if (startupTerminal !== null) {
+  logStructured({
+    ts: new Date().toISOString(),
+    action,
+    runId: opts.run,
+    phaseMarker: opts.when,
+    outcome: 'run_terminal_at_startup',
+    error: `run ${opts.run} already terminal (${startupTerminal}) before trigger ${opts.when} — refusing to wait`,
+  });
+  console.error(`chaos-refused: run ${opts.run} already terminal (${startupTerminal}) before trigger ${opts.when} (${action}) — refusing to wait`);
+  process.exit(EXIT_RUN_TERMINAL);
+}
+
 // ── Action-specific argument validation (fail fast, before phase_wait) ──
 
 // sigstop_sigcont: --hold-seconds must be a non-negative integer. Validated
@@ -2079,7 +2487,14 @@ if (action === 'sigstop_sigcont') {
 
 const phaseResult = phaseWait(opts.when, opts.timeout, opts.run);
 if (!phaseResult.satisfied) {
-  console.error(`TRIGGER_NEVER_MATERIALIZED: Marker "${opts.when}" did not materialize within ${opts.timeout}s.`);
+  // S28 (US-005): a run-terminal stop must say precisely why in one line —
+  // `TRIGGER_NEVER_MATERIALIZED` alone conflates it with a plain timeout and
+  // hides that the run died before the marker could ever fire.
+  if (phaseResult.reason === 'RUN_TERMINAL_BEFORE_MARKER') {
+    console.error(`chaos-refused: run ${opts.run} reached terminal before trigger ${opts.when} (${action}) — refusing to wait`);
+  } else {
+    console.error(`TRIGGER_NEVER_MATERIALIZED: Marker "${opts.when}" did not materialize within ${opts.timeout}s.`);
+  }
   process.exit(EXIT_TRIGGER_NEVER);
 }
 

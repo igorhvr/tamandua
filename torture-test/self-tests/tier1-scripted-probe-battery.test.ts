@@ -37,13 +37,19 @@
 //      still-'running' run is refused). This is a documented
 //      product-limitation adaptation, not a weakening: the drain machinery,
 //      the park, and the resume all run end-to-end on the scripted fixture.
-//      W3.21's fail_force->resume cannot complete against the current
-//      product either (force-fail CANCELS all steps; resumeWorkflow only
-//      resets 'failed' steps, so advancePipeline vacuous-completes the run
-//      and the daemon registration is refused) — the battery asserts the
-//      resulting TEST_INFRA_FAIL as a documented PRODUCT DEFECT FINDING, with
-//      both probe actions evidenced; the resumeWorkflow-reuses-run-id
-//      semantics are pinned by O16's mutation fixtures.
+//      W3.21's fail_force->resume: product commit 3f880b1a FIXED the
+//      resume-after-force-fail defect — resumeWorkflow now repairs the
+//      all-canceled force-failed pipeline (resets from the first non-done
+//      step, re-registers with the daemon, and the run re-runs). The resume
+//      therefore SUCCEEDS (exit 0, SAME run id, "restarting from step:
+//      implement"); the launch hook returned at the FIRST terminal state
+//      (run.failed after the force-fail), so the controller's harvest sees
+//      the resumed run still 'running' and leaves the case 'attached' (no
+//      terminal report — the documented US-004 resume-leaves-case-attached
+//      shape). The battery asserts the corridor at the EVIDENCE level:
+//      probe_evidence for BOTH actions (fail_force ok, resume ok:true exit 0
+//      with the same run id) + the run's own event stream re-activation
+//      after the resume — exactly the W4.33d corridor pattern.
 //   2. Drive each through the controller against the 53xx scripted daemon
 //      (daemon-control scripted start with TAMANDUA_PI_BINARY /
 //      TAMANDUA_HERMES_BINARY -> the scripted runtimes via tt-env-scripted.sh,
@@ -51,8 +57,9 @@
 //      drives feature-dev-merge-worktree to a real squash-merge landing).
 //   3. Assert per case: probe actions executed (probe_evidence present),
 //      O16 verdict emitted on the scripted fixture (W3.17b: O4; W3.18-W3.20,
-//      W3.22: O16 PASS; W3.21: the documented product-defect TEST_INFRA_FAIL),
-//      zero tokens observed.
+//      W3.22: O16 PASS; W3.21: the FIXED resume corridor — campaign exits 0
+//      with the case attached, no terminal report, no O16 verdict), zero
+//      tokens observed.
 //   4. Hygiene: scripted daemon stopped, 53xx ports free, git tree clean.
 //
 // Confined to torture-test/ (state under gitignored var/). Zero tokens.
@@ -431,6 +438,43 @@ function assertCaseEvidence(state: any, report: any, caseId: string, checker: (c
   assertZeroTokens(cs, report);
 }
 
+// Read the run's OWN event stream from the contained scripted home (both
+// run-id spellings), newest-last — the W3.21 resumed run's re-activation
+// events must appear there (the US-004 evidence-level corridor pattern).
+function readRunEvents(runId: string): any[] {
+  const shortRunId = runId.startsWith("run-") ? runId.slice(4) : runId;
+  const eventsDir = path.join(scriptedStateDir, "events");
+  const eventPaths = [
+    path.join(eventsDir, `${shortRunId}.jsonl`),
+    path.join(eventsDir, `${runId}.jsonl`),
+    ...([3, 2, 1].map((suffix) => path.join(eventsDir, `all.jsonl.${suffix}`))),
+    path.join(eventsDir, "all.jsonl"),
+  ];
+  const events: any[] = [];
+  for (const eventsPath of eventPaths) {
+    let source: string;
+    try {
+      source = fs.readFileSync(eventsPath, "utf8");
+    } catch {
+      continue;
+    }
+    for (const line of source.split(/\r?\n/)) {
+      if (line.trim() === "") continue;
+      let event: any;
+      try {
+        event = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (event === null || typeof event !== "object") continue;
+      const eventRunId = String(event.runId ?? "");
+      if (eventRunId !== shortRunId && eventRunId !== runId) continue;
+      events.push(event);
+    }
+  }
+  return events;
+}
+
 describe("E3.C US-011 zero-token scripted probe battery", () => {
   it("every probe sequence (W3.17b chaos, W3.18-W3.22) runs end-to-end on the 53xx scripted instance with evidence + O16 verdicts, zero tokens",
     { timeout: 60 * 60 * 1000 }, async () => {
@@ -485,18 +529,28 @@ describe("E3.C US-011 zero-token scripted probe battery", () => {
         const m = CAMPAIGN_LINE.exec(result.stdout);
         campaignId = m === null ? null : m[1];
         assert.ok(campaignId, `campaign did not print an ID:\n${result.stdout}\n${result.stderr}`);
-        // Exit 2 (INFRA_FAILURE): the campaign INCLUDES W3.21, whose
-        // fail_force->resume surfaces the documented PRODUCT DEFECT and
-        // classifies TEST_INFRA_FAIL — the fail-closed verdict is the point
-        // (a campaign that expected the defect to vanish would be lying).
-        assert.equal(result.status, 2, `scripted battery campaign must exit 2 (INFRA_FAILURE for the documented W3.21 defect):\n${result.stdout}\n${result.stderr}`);
+        // Exit 0: the campaign INCLUDES W3.21, whose fail_force->resume now
+        // SUCCEEDS (product commit 3f880b1a fixed the resume-after-force-fail
+        // defect). The launch hook returned at the FIRST terminal state
+        // (run.failed after the force-fail) and the probe's resume re-activated
+        // the SAME run, so the controller's harvest sees the resumed run still
+        // 'running' and leaves the case 'attached' — writeTerminalCampaignReports
+        // skips the terminal report when any case is non-terminal, and the
+        // campaign exits 0. The W3.21 corridor is asserted at the EVIDENCE
+        // level (probe_evidence + the run's own event stream), exactly like the
+        // US-004 W4.33d corridor — never a silent wait.
+        assert.equal(result.status, 0, `scripted battery campaign must exit 0 (W3.21 resume succeeds; case attached, no terminal report):\n${result.stdout}\n${result.stderr}`);
 
         const campaignDir = path.join(resultsRoot, campaignId);
-        const report = loadJson(path.join(campaignDir, "report.json"));
+        // Attached W3.21 case → writeTerminalCampaignReports skipped the report:
+        // assert the report is ABSENT and drive all per-case assertions off
+        // state.json (the other five cases are terminal with their outcomes +
+        // oracle verdicts persisted there; the campaign-level spend is on the
+        // state too).
+        assert.ok(!fs.existsSync(path.join(campaignDir, "report.json")),
+          "attached W3.21 case must suppress the terminal report (no report.json)");
         const state = loadJson(path.join(campaignDir, "state.json"));
-        assert.equal(report.verdict, "INFRA_FAILURE",
-          `battery campaign verdict must be INFRA_FAILURE (W3.21 defect): ${report.verdict}`);
-        assert.equal(report.exit_code, 2);
+        const report = { spend: state.spend ?? { tokens_observed: 0 } };
 
         // ── W3.17b: chaos marathon — tt-chaos genuinely invoked (SIGSTOP ->
         //    hold -> SIGCONT on the live harness process), O4 hygiene verdict
@@ -593,44 +647,63 @@ describe("E3.C US-011 zero-token scripted probe battery", () => {
           assertOracleVerdict(cs, "PASS");
         });
 
-        // ── W3.21: fail --force mid-run -> resume. PRODUCT DEFECT FINDING:
-        //    the current product cannot complete the as-declared sequence —
-        //    `workflow fail --force` CANCELS all waiting/pending/running steps
-        //    (forceFailRun), and `resumeWorkflow` only resets steps whose
-        //    status is 'failed', so after a force-fail there is no failed step
-        //    to reset: advancePipeline vacuous-completes the run and the
-        //    daemon registration is refused ("Run is terminal: completed"),
-        //    the resume CLI exits 1, and the run is reverted to 'failed'.
-        //    The battery proves the probe machinery executes BOTH actions with
-        //    evidence and mechanically surfaces this product defect (the
-        //    expected TEST_INFRA_FAIL classification is asserted, not papered
-        //    over) — the resumeWorkflow-reuses-run-id semantics themselves are
-        //    pinned by O16's mutation fixtures (o16-green-resume /
-        //    o16-resume-new-run-id). ──
+        // ── W3.21: fail --force mid-run -> resume. FIXED corridor (product
+        //    commit 3f880b1a): resumeWorkflow now REPAIRS the all-canceled
+        //    force-failed pipeline (resets from the first non-done step,
+        //    re-registers with the daemon) — the resume SUCCEEDS with the SAME
+        //    run id and the run re-activates. The launch hook returned at the
+        //    FIRST terminal state (run.failed after the force-fail), so the
+        //    harvest leaves the case 'attached' (no terminal report, no O16
+        //    verdict — the documented US-004 resume-leaves-case-attached
+        //    shape). The battery proves the probe machinery executes BOTH
+        //    actions with evidence AND that the resume now succeeds, asserting
+        //    the corridor at the EVIDENCE level exactly like the W4.33d
+        //    corridor: probe_evidence (fail_force ok; resume ok:true exit 0,
+        //    same run id, run re-activated) + the run's own event stream. The
+        //    resumeWorkflow-reuses-run-id semantics are also pinned by O16's
+        //    mutation fixtures (o16-green-resume / o16-resume-new-run-id). ──
         assertCaseEvidence(state, report, "W3.21-fail-force-resume", (cs) => {
-          assert.equal(cs.outcome, "TEST_INFRA_FAIL",
-            `W3.21: the resume-after-force-fail product defect must classify TEST_INFRA_FAIL, got ${cs.outcome} ${JSON.stringify(cs.reason ?? null)}`);
-          assert.equal(cs.reason?.category, "probe-action-failed");
+          // Attached shape: the case never reached a terminal classification —
+          // the resume re-activated the run after the launch hook returned.
+          assert.equal(cs.phase, "running",
+            `W3.21: the resumed case must stay attached (phase 'running'), got ${cs.phase}`);
           const attempt = cs.attempts[0];
+          assert.equal(attempt.phase, "attached",
+            `W3.21: the attempt must be 'attached' (launch hook returned at the first terminal state), got ${attempt.phase}`);
           const pe = attempt.probe_evidence;
           assert.ok(pe, "W3.21: probe_evidence must be present");
+          assert.equal(pe.sequence_outcome, "completed");
           assert.equal(pe.actions.length, 2);
           assert.equal(pe.actions[0].op, "fail_force");
           assert.equal(pe.actions[0].ok, true, `W3.21: fail_force must succeed: ${JSON.stringify(pe.actions[0].failure ?? null)}`);
           assert.ok(pe.actions[0].argv.includes("--reason"), "W3.21: fail_force argv must carry --reason (the CLI requires it)");
           assert.equal(pe.actions[0].effect?.status_after?.status, "failed");
           assert.equal(pe.actions[1].op, "resume");
-          assert.equal(pe.actions[1].ok, false, "W3.21: the resume must surface the documented product defect");
-          assert.equal(pe.actions[1].exit_code, 1);
-          const resumeMessage = pe.actions[1].failure?.message ?? "";
-          assert.match(resumeMessage, /resume.*exited 1|Failed to register resumed run with daemon/,
-            `W3.21: resume failure must name the registration refusal: ${resumeMessage}`);
-          // The fail_force evidence proves the run was forced to failed; the
-          // O16 verdict cannot be emitted for W3.21 against the current
-          // product (the probe failure classifies before the oracle stage) —
-          // documented in tier1-traceability.md.
+          assert.equal(pe.actions[1].ok, true,
+            `W3.21: the resume must SUCCEED (product fix 3f880b1a): ${JSON.stringify(pe.actions[1].failure ?? null)}`);
+          assert.equal(pe.actions[1].exit_code, 0, "W3.21: the resume CLI must exit 0");
+          // Same run id: the resume argv must target the SAME run and the
+          // effect must show the run re-activated (restarting from implement).
+          assert.ok(pe.actions[1].argv.includes(attempt.run_id),
+            `W3.21: the resume must reuse the SAME run id (${attempt.run_id}): ${JSON.stringify(pe.actions[1].argv)}`);
+          assert.equal(pe.actions[1].effect?.status_after?.status, "running",
+            `W3.21: the resume must re-activate the run: ${JSON.stringify(pe.actions[1].effect ?? null)}`);
+          assert.match(pe.actions[1].stdout_tail?.text ?? "",
+            /Resumed run .*restarting from step/,
+            `W3.21: resume stdout must name the restart-from step: ${pe.actions[1].stdout_tail?.text ?? ""}`);
+          // The resumed run's OWN event stream re-activates: a dispatch event
+          // for the run AFTER the resume action started (the run is 'running'
+          // again and the pipeline advances).
+          const resumeStartedAt = pe.actions[1].action_started_at;
+          const resumedEvents = readRunEvents(attempt.run_id)
+            .filter((e) => e.ts >= resumeStartedAt)
+            .map((e) => e.event);
+          assert.ok(resumedEvents.some((name) => name === "pipeline.advanced" || name === "step.running"),
+            `W3.21: the resumed run must re-activate (pipeline.advanced/step.running after the resume): ${resumedEvents.join(",")}`);
+          // No O16 verdict: the attached case never reaches the oracle stage
+          // (no terminal report) — documented in tier1-traceability.md.
           assert.ok(!(cs.oracle_results ?? []).some((item: any) => item.oracle_id === "O16"),
-            "W3.21: no O16 verdict is expected while the resume-after-force-fail product defect blocks the sequence");
+            "W3.21: no O16 verdict is expected for the attached (resume-re-activated) case");
         });
 
         // ── W3.22: THREE concurrent runs + contained-daemon restart

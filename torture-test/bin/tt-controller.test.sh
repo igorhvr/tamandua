@@ -1033,7 +1033,27 @@ fi
 if [ "${1:-}" = "workflow" ] && [ "${2:-}" = "status" ]; then
   case "${CONTROLLER_WORKFLOW_MODE:-stdout}" in
     scripted-fixture-lstat) printf '{"runId":"run-11111111-1111-4111-8111-111111111111","status":"failed","tokensSpent":0,"steps":[]}\n' ;;
+    # S31 (US-009): the W4.30 detached-HEAD refusal corridor. The stub
+    # `workflow run` created the run row (stderr short id 99999998) and then
+    # refused at worktree creation; `workflow status` resolves that run to a
+    # failed terminal state so the controller harvests the refusal corridor
+    # (never a scheduler-execution-failed).
+    detached-head-refusal) printf '{"runId":"run-99999998-9999-4999-8999-999999999998","status":"failed","tokensSpent":0,"steps":[]}\n' ;;
     stdout) printf '{"runId":"run-11111111-1111-4111-8111-111111111111","status":"completed","tokensSpent":0,"steps":[]}\n' ;;
+    # S28 (US-005): chaos fixtures that prove the INVOCATION (not the
+    # terminal-run refusal) need the run to report 'running' at invocation
+    # time — the fail-closed terminal guard refuses to spawn an operator
+    # against a completed run. The chaos op's stub writes
+    # CONTROLLER_CHAOS_RUNNING_MARKER when it runs, flipping the status to
+    # 'completed' so the monitor still sees a terminal run and completes the
+    # case.
+    chaos-running)
+      if [ -f "${CONTROLLER_CHAOS_RUNNING_MARKER:-}" ]; then
+        printf '{"runId":"run-11111111-1111-4111-8111-111111111111","status":"completed","tokensSpent":0,"steps":[]}\n'
+      else
+        printf '{"runId":"run-11111111-1111-4111-8111-111111111111","status":"running","tokensSpent":0,"steps":[]}\n'
+      fi
+      ;;
     probe-pause-fail|probe-pause-fail-big) printf '{"runId":"run-11111111-1111-4111-8111-111111111111","status":"completed","tokensSpent":0,"steps":[]}\n' ;;
     # S18b status-trigger fixture: the run reports 'paused' until the awaited
     # resume action fires (writing CONTROLLER_STATUS_TRIGGER_FIRED), then
@@ -1254,6 +1274,33 @@ if [ "${1:-}" = "workflow" ] && [ "${2:-}" = "run" ]; then
       printf '{"runs":[{"runId":"run-11111111-1111-4111-8111-111111111111","status":"failed","tokensSpent":0}],"timedOut":false}\n'
       exit 1
       ;;
+    detached-head-refusal)
+      # S31 (US-009): mirror the product's W4.30 refusal corridor. The product
+      # INSERTs the run row and emits `run #N (short) created; preparing
+      # workspace...` to STDERR, then createRunWorktree REFUSES because the
+      # origin HEAD is detached and no --worktree-origin-ref was provided; the
+      # CLI prints the error to stderr and exits 1 (never a bogus ref, never
+      # stdout). The controller's short-id capture resolves the run via the
+      # `workflow status` stub above.
+      origin_repo=""
+      prev_arg=""
+      for argv_item in "$@"; do
+        if [ "$prev_arg" = "--worktree-origin-repository" ]; then origin_repo="$argv_item"; fi
+        prev_arg="$argv_item"
+      done
+      if [ -z "$origin_repo" ] || [ ! -d "$origin_repo" ]; then
+        printf 'ENOENT: no such file or directory, lstat %s\n' "${origin_repo:-<missing>}" >&2
+        exit 1
+      fi
+      if [ -z "$(git -C "$origin_repo" symbolic-ref -q HEAD 2>/dev/null)" ]; then
+        printf 'run #98 (99999998) created; preparing workspace...\n' >&2
+        printf 'Error: Failed to create managed worktree for run: origin repository is in detached HEAD state and no --worktree-origin-ref was provided\n' >&2
+        exit 1
+      fi
+      printf 'Run: run-11111111-1111-4111-8111-111111111111\n'
+      printf '{"runs":[{"runId":"run-11111111-1111-4111-8111-111111111111","status":"completed","tokensSpent":0}],"timedOut":false}\n'
+      exit 0
+      ;;
     multi-run-seq|multi-run-conc)
       count=0
       [ ! -f "$CONTROLLER_MULTI_RUN_COUNTER" ] || count="$(cat "$CONTROLLER_MULTI_RUN_COUNTER")"
@@ -1310,7 +1357,7 @@ case "${CONTROLLER_WORKFLOW_MODE:-stdout}" in
     fi
     printf '{"status":"completed"}\n'
     ;;
-  probe-status-trigger|probe-event-trigger)
+  probe-status-trigger|probe-event-trigger|chaos-running)
     printf 'Run: run-11111111-1111-4111-8111-111111111111\n'
     printf '{"status":"completed"}\n'
     ;;
@@ -1518,6 +1565,118 @@ if (item.teardown?.kept !== true || item.teardown?.work_clone_path !== clonePath
 NODE
 pass "scripted workflow cases provision their fixture work clone before launch (no ENOENT)"
 
+# ── S31 (US-009): detached-HEAD origin (W4.30) — target-ref resolution honors
+# the case's declared contract instead of assuming a symbolic ref ──────────
+# The tier-2 attempt-2 campaign voided W4.30-detached-head-origin with
+# `scheduler-execution-failed (fixture repository has no symbolic target ref)`:
+# the oracle snapshot's targetRef() threw before the launch because the reset
+# hook had detached the work-clone HEAD. This corridor drives the controller
+# with the REAL W4.30 reset hook (cases/hooks/reset-w4.30-detached-head-origin.sh,
+# which detaches $TT_ROOT/fixtures/work/W4.30-detached-head-origin/tt-ts) and a
+# stub `tamandua` mirroring the product's detached-HEAD launch refusal, and
+# asserts:
+#   (a) the case SCHEDULES through the controller (provision -> reset ->
+#       oracle snapshot -> launch) with NO scheduler-execution-failed;
+#   (b) the oracle snapshot completes with detached_head evidence
+#       (refs_before/refs_after/target_reflog carry the detached HEAD commit);
+#   (c) the launch-time refusal corridor is OBSERVED (launch.stderr carries the
+#       product's exact detached-HEAD refusal line verbatim);
+#   (d) zero tokens observed.
+s31_manifest="$TEST_ROOT/manifests/s31-detached-head-origin.jsonl"
+node --input-type=module - "$s31_manifest" <<'NODE'
+import fs from 'node:fs';
+const record = {
+  id: 'W4.30-detached-head-origin', wave: 4, workflow: 'bug-fix-merge-worktree',
+  fixture: 'tt-ts', harness: 'scripted-pi',
+  task: 'cases/tasks/tier2/W4.30-detached-head-origin.md',
+  context: { execution_mode: 'scripted', test_cmd: 'npm test' },
+  caps: { tokens: 0, wall_min: 5 }, requires: {},
+  boundary_files: ['fixtures-src/tt-ts/src'], forbidden: [],
+  oracles: ['O1'], gates: [], chaos: null, shed_ok: false, mandatory: true,
+  class: 'verification',
+  reset: { executable: 'cases/hooks/reset-w4.30-detached-head-origin.sh', args: [], cwd: '.' },
+};
+fs.writeFileSync(process.argv[2], `${JSON.stringify(record)}\n`);
+NODE
+[ -d "$TT_DIR/var/fixtures/golden/tt-ts.git" ] \
+  || node "$TT_DIR/bin/tt-golden-bootstrap.mjs" --fixture tt-ts >/dev/null 2>&1 \
+  || fail "could not bootstrap the tt-ts golden for the S31 detached-head corridor"
+s31_clone_path="$TT_DIR/var/fixtures/work/W4.30-detached-head-origin/tt-ts"
+rm -rf -- "$TT_DIR/var/fixtures/work/W4.30-detached-head-origin"
+s31_output=$(PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$workflow_events" \
+  CONTROLLER_WORKFLOW_MODE=detached-head-refusal \
+  TT_CONTROLLER_POLL_INTERVAL_MS=20 TT_CONTROLLER_TRUTH_RECHECK_MS=20 \
+  run_recorded_campaign "$CONTROLLER" --manifest "$s31_manifest") \
+  || fail "S31 detached-head scripted corridor failed: $s31_output"
+s31_id=$(remember_campaign "$s31_output")
+node --input-type=module - "$TT_DIR/var/results/$s31_id/state.json" "$workflow_events" "$s31_clone_path" <<'NODE'
+import fs from 'node:fs';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+const [statePath, eventsPath, clonePath] = process.argv.slice(2);
+const campaignDir = path.dirname(statePath);
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const item = state.cases.find((c) => c.id === 'W4.30-detached-head-origin');
+if (!item) throw new Error(`S31 case missing from state: ${JSON.stringify(state.cases.map(c => c.id))}`);
+const attempt = item.attempts.at(-1);
+if (!attempt) throw new Error('S31 case has no attempt');
+// (a) The S31 defect class is GONE: never a scheduler-execution-failed reason.
+if (attempt.classification_reason?.category === 'scheduler-execution-failed') {
+  throw new Error(`S31 case must not classify scheduler-execution-failed: ${JSON.stringify({item})}`);
+}
+// (c) The launch-time refusal corridor was OBSERVED: the stub tamandua
+// mirrored the product's detached-HEAD refusal and the launch evidence
+// captured it verbatim.
+const launchStderrPath = attempt.launch?.stderr ? `${campaignDir}/${attempt.launch.stderr.split('/').join('/')}` : '';
+if (!launchStderrPath || !fs.existsSync(launchStderrPath)) {
+  throw new Error(`S31 launch.stderr evidence missing: ${JSON.stringify(attempt.launch)}`);
+}
+const launchStderr = fs.readFileSync(launchStderrPath, 'utf8');
+if (!launchStderr.includes('origin repository is in detached HEAD state and no --worktree-origin-ref was provided')) {
+  throw new Error(`S31 launch refusal corridor not observed in launch.stderr: ${JSON.stringify(launchStderr)}`);
+}
+// (b) The oracle snapshot completed with detached_head evidence.
+const refsBeforeRef = attempt.oracle_evidence?.references?.refs_before;
+if (!refsBeforeRef) throw new Error(`S31 snapshot refs_before missing: ${JSON.stringify(attempt.oracle_evidence)}`);
+const refsBefore = JSON.parse(fs.readFileSync(`${campaignDir}/${refsBeforeRef.path}`, 'utf8'));
+const refsAfterRef = attempt.oracle_evidence?.references?.refs_after;
+const reflogRef = attempt.oracle_evidence?.references?.target_reflog;
+if (!refsAfterRef || !reflogRef) throw new Error(`S31 snapshot refs_after/target_reflog missing: ${JSON.stringify(attempt.oracle_evidence?.references)}`);
+const refsAfter = JSON.parse(fs.readFileSync(`${campaignDir}/${refsAfterRef.path}`, 'utf8'));
+const reflog = JSON.parse(fs.readFileSync(`${campaignDir}/${reflogRef.path}`, 'utf8'));
+for (const [label, artifact] of [['refs_before', refsBefore], ['refs_after', refsAfter], ['target_reflog', reflog]]) {
+  if (artifact.detached_head !== true) {
+    throw new Error(`S31 snapshot ${label} must record detached_head: ${JSON.stringify(artifact)}`);
+  }
+  if (typeof artifact.target_ref !== 'string' || !/^[0-9a-f]{40}$/.test(artifact.target_ref)) {
+    throw new Error(`S31 snapshot ${label} target_ref must be the detached HEAD commit OID: ${JSON.stringify(artifact)}`);
+  }
+}
+if (refsBefore.target_ref !== refsAfter.target_ref || refsBefore.target_ref !== reflog.target_ref) {
+  throw new Error(`S31 target identity must agree across refs/reflog snapshots: ${JSON.stringify({refsBefore, refsAfter, reflog})}`);
+}
+if (!Array.isArray(reflog.entries) || reflog.entries.length === 0) {
+  throw new Error(`S31 detached reflog must capture logs/HEAD entries: ${JSON.stringify(reflog)}`);
+}
+// The reset hook actually detached the provisioned clone (premise).
+if (!fs.existsSync(clonePath)) throw new Error(`S31 work clone missing: ${clonePath}`);
+const symbolic = spawnSync('git', ['-C', clonePath, 'symbolic-ref', '-q', 'HEAD'], { encoding: 'utf8' });
+if (symbolic.stdout.trim() !== '') throw new Error(`S31 work clone is not detached: ${JSON.stringify(symbolic.stdout)}`);
+// The launch argv carried the provisioned clone as the origin repository.
+const events = fs.readFileSync(eventsPath, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+const launch = [...events].reverse().find((entry) => entry.argv[0] === 'workflow' && entry.argv[1] === 'run');
+if (!launch) throw new Error('S31 no workflow run launch recorded');
+const originIdx = launch.argv.indexOf('--worktree-origin-repository');
+if (originIdx < 0 || launch.argv[originIdx + 1] !== clonePath) {
+  throw new Error(`S31 launch argv must pass the provisioned clone as origin: ${JSON.stringify(launch.argv)}`);
+}
+// (d) Zero tokens.
+if (attempt.tokens_observed !== 0 || attempt.execution_mode !== 'scripted') {
+  throw new Error(`S31 corridor must be a zero-token scripted cell: ${JSON.stringify({tokens: attempt.tokens_observed, mode: attempt.execution_mode})}`);
+}
+NODE
+pass "S31 detached-HEAD origin schedules + launches with no scheduler-execution-failed (refusal corridor observed)"
+
 for harvest_mode in harvest-status harvest-db harvest-lie harvest-shifting-lie; do
   harvest_manifest="$TEST_ROOT/manifests/$harvest_mode.jsonl"
   valid_case "$(toupper "$harvest_mode")" \
@@ -1635,7 +1794,7 @@ write_probe_case() {
 import fs from 'node:fs';
 const [manifest, id, sequenceJson] = process.argv.slice(2);
 const record = {
-  id, wave: 3, workflow: 'bug-fix-merge-worktree', fixture: 'tt-ts', harness: 'hermes',
+  id, wave: 3, workflow: 'feature-dev-merge-worktree', fixture: 'tt-ts', harness: 'hermes',
   task: 'tasks/W3.07.md', context: {}, caps: { tokens: 4000000, wall_min: 240 },
   requires: {}, boundary_files: ['fixtures/tt-ts/src'], forbidden: [],
   oracles: ['TT-MISSING-O1', 'TT-MISSING-O2'], gates: ['W2'], chaos: null,
@@ -2133,9 +2292,13 @@ remove_probe_step
 # then fails with probe-trigger-unreached. The failure message must render the
 # object trigger shape (JSON-stringify, never '[object Object]'), proving both
 # the self-bound and the object-form rendering.
+# The awaited status is 'running' (the stub run is 'completed' the whole time,
+# so it never fires within the 1s window). S29 US-003's fail-closed preflight
+# rejects a FABRICATED status like 'never' as unknown vocabulary — the test's
+# intent (a real status that never occurs inside the window) uses a real one.
 probe_unreached_obj_manifest="$TEST_ROOT/manifests/probe-unreached-object.jsonl"
 write_probe_case "$probe_unreached_obj_manifest" "PROBE-UNREACHED-OBJECT" \
-  '[{"run":1,"actions":[{"op":"resume","when":{"status":"never","timeout_s":1}}]}]'
+  '[{"run":1,"actions":[{"op":"resume","when":{"status":"running","timeout_s":1}}]}]'
 probe_unreached_obj_events="$TEST_ROOT/probe-unreached-object-events.jsonl"
 probe_unreached_obj_output=$(PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$probe_unreached_obj_events" \
   CONTROLLER_WORKFLOW_MODE=stdout run_recorded_campaign "$CONTROLLER" --manifest "$probe_unreached_obj_manifest") \
@@ -2154,10 +2317,10 @@ if (attempt.outcome !== 'TEST_INFRA_FAIL'
 // The persisted trigger is the raw object AND the message renders its JSON
 // shape (never '[object Object]').
 if (JSON.stringify(attempt.classification_reason?.trigger)
-    !== JSON.stringify({ status: 'never', timeout_s: 1 })) {
+    !== JSON.stringify({ status: 'running', timeout_s: 1 })) {
   throw new Error(`unreached object trigger must persist the object trigger: ${JSON.stringify(attempt.classification_reason?.trigger)}`);
 }
-if (!attempt.classification_reason?.message.includes('{"status":"never","timeout_s":1}')) {
+if (!attempt.classification_reason?.message.includes('{"status":"running","timeout_s":1}')) {
   throw new Error(`unreached object trigger message must JSON-render the object trigger: ${JSON.stringify(attempt.classification_reason?.message)}`);
 }
 // The object trigger must NOT exit early on the (already-terminal) run status:
@@ -2539,7 +2702,7 @@ write_chaos_case() {
 import fs from 'node:fs';
 const [manifest, id, chaosJson, oraclesJson] = process.argv.slice(2);
 const record = {
-  id, wave: 3, workflow: 'bug-fix-merge-worktree', fixture: 'tt-ts', harness: 'hermes',
+  id, wave: 3, workflow: 'feature-dev-merge-worktree', fixture: 'tt-ts', harness: 'hermes',
   task: 'tasks/W3.07.md', context: {}, caps: { tokens: 4000000, wall_min: 240 },
   requires: {}, boundary_files: ['fixtures/tt-ts/src'], forbidden: [],
   oracles: JSON.parse(oraclesJson), gates: ['W3'], chaos: JSON.parse(chaosJson),
@@ -2569,6 +2732,10 @@ for arg in "$@"; do
   prev="$arg"
 done
 if [ "${CONTROLLER_CHAOS_MODE:-record}" = "record" ]; then
+  # S28 (US-005): the chaos op EXECUTED — flip the chaos-running fixture's
+  # status to 'completed' so the monitor completes the case (the terminal
+  # guard needed 'running' at invocation time, which was BEFORE this spawn).
+  if [ -n "${CONTROLLER_CHAOS_RUNNING_MARKER:-}" ]; then : > "$CONTROLLER_CHAOS_RUNNING_MARKER"; fi
   printf '%s\n' "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\",\"action\":\"sigstop_sigcont\",\"entry\":\"start\",\"runId\":\"$CHAOS_RUN\",\"pid\":$CHAOS_TARGET_PID}" >> "$CHAOS_LOG_FILE"
   printf '%s\n' "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\",\"action\":\"sigstop_sigcont\",\"entry\":\"hold_complete\",\"runId\":\"$CHAOS_RUN\",\"pid\":$CHAOS_TARGET_PID}" >> "$CHAOS_LOG_FILE"
   printf '%s\n' "{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\",\"action\":\"sigstop_sigcont\",\"entry\":\"cont\",\"runId\":\"$CHAOS_RUN\",\"pid\":$CHAOS_TARGET_PID}" >> "$CHAOS_LOG_FILE"
@@ -2794,6 +2961,14 @@ pass "a chaos-block case invokes tt-chaos with explicit --target-* recorded harn
 # Fixture 2: a chaos invocation failure (stub exits 3) classifies
 # TEST_INFRA_FAIL with the DISTINCT category 'chaos-invocation-failed'
 # naming the operator + exit code — never a silent PASS/INCONCLUSIVE.
+# S28 (US-005): the harness-target wait must END with the marker FIRED for
+# the invocation to proceed — a terminal-run stop now refuses fail-closed
+# (chaos-invocation-refused) instead of spawning. Seed the recorded claim row
+# (like Fixture 1) so step:developer:running fires and the stub is invoked.
+spawn_chaos_fake_harness
+spawn_chaos_decoy
+sleep 0.2
+seed_chaos_claim
 chaos_fail_manifest="$TEST_ROOT/manifests/chaos-fail.jsonl"
 write_chaos_case "$chaos_fail_manifest" "CHAOS-FAIL" "$CHAOS_BLOCK"
 chaos_fail_events="$TEST_ROOT/chaos-fail-events.jsonl"
@@ -2803,6 +2978,8 @@ chaos_fail_output=$(PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$
   TT_CONTROLLER_TT_CHAOS_PATH="$TEST_ROOT/tt-chaos-fail-stub" \
   run_recorded_campaign "$CONTROLLER" --manifest "$chaos_fail_manifest") \
   || fail "chaos-fail campaign failed: $chaos_fail_output"
+reap_chaos_processes
+clean_chaos_state
 chaos_fail_id=$(remember_campaign "$chaos_fail_output")
 node --input-type=module - "$TT_DIR/var/results/$chaos_fail_id/state.json" "$chaos_fail_events" \
   "$CHAOS_RUN_ID" <<'NODE'
@@ -2842,8 +3019,161 @@ if (stubCalls.length !== 1
     || !stubCalls[0].argv.includes('--target-pid')) {
   throw new Error(`failed tt-chaos invocation must still record the explicit-target argv once: ${JSON.stringify(stubCalls)}`);
 }
+// S28 (US-005) AC3: the chaos-invocation-failed message must carry the
+// operator's OWN stderr line (the precise reason it printed) — never a bare
+// `exited 3`. The fail stub prints `chaos operator refused` to stderr.
+const failureMessage = attempt.classification_reason?.message ?? '';
+if (typeof failureMessage !== 'string' || !failureMessage.includes('exited 3: chaos operator refused')) {
+  throw new Error(`chaos-invocation-failed message must surface the operator stderr line (got ${JSON.stringify(failureMessage)})`);
+}
 NODE
 pass "a chaos invocation failure classifies TEST_INFRA_FAIL chaos-invocation-failed with a distinct reason (argv still explicit-target)"
+
+# Fixture 2b (US-004 S29 premise redesign): a move-branch chaos block is a
+# git-ref injection against the worktree-origin repository — the controller
+# resolves the origin repo from the PROVISIONED work clone (attempt.
+# fixture_work_clone), verifies the declared ref resolves there, SKIPS the
+# harness-target-record wait (no harness process target — no --target-* args),
+# and hands tt-chaos the --repo/--ref/--repeat/--interval/--timeout argv.
+move_branch_manifest="$TEST_ROOT/manifests/chaos-move-branch.jsonl"
+MOVE_BRANCH_BLOCK='{"type":"move-branch","target":"origin_target_ref","trigger":"step:finalize_merge:running","operator":"tt-chaos","ref":"refs/heads/main","repeat":5,"interval_s":30,"wait_timeout_s":4200}'
+write_chaos_case "$move_branch_manifest" "CHAOS-MOVE-BRANCH" "$MOVE_BRANCH_BLOCK"
+move_branch_events="$TEST_ROOT/chaos-move-branch-events.jsonl"
+# S28 (US-005): the move-branch invocation-time terminal guard needs the run
+# to report 'running' at invocation time — with the default 'stdout' stub
+# status ('completed') the controller would refuse fail-closed
+# (chaos-invocation-refused) instead of invoking the operator. The stub
+# operator flips CONTROLLER_CHAOS_RUNNING_MARKER when it runs, which turns the
+# status 'completed' for the monitor so the case still completes.
+CHAOS_RUNNING_MARKER="$TEST_ROOT/chaos-running.marker"
+rm -f -- "$CHAOS_RUNNING_MARKER"
+move_branch_output=$(PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$workflow_events" \
+  CONTROLLER_WORKFLOW_MODE=chaos-running \
+  CONTROLLER_CHAOS_RUNNING_MARKER="$CHAOS_RUNNING_MARKER" \
+  CONTROLLER_CHAOS_EVENTS="$move_branch_events" CONTROLLER_CHAOS_MODE=record \
+  CHAOS_LOG_FILE="$CHAOS_LOG_FILE" \
+  TT_CONTROLLER_TT_CHAOS_PATH="$TEST_ROOT/tt-chaos-stub" \
+  TT_CONTROLLER_SELF_TEST=1 \
+  run_recorded_campaign "$CONTROLLER" --manifest "$move_branch_manifest") \
+  || fail "move-branch chaos campaign failed: $move_branch_output"
+move_branch_id=$(remember_campaign "$move_branch_output")
+node --input-type=module - "$TT_DIR/var/results/$move_branch_id/state.json" "$move_branch_events" \
+  "$CHAOS_RUN_ID" "$TEST_ROOT/tt-chaos-stub" <<'NODE'
+import fs from 'node:fs';
+import path from 'node:path';
+const [statePath, eventsPath, runId, chaosStubPath] = process.argv.slice(2);
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const item = state.cases[0];
+const attempt = item.attempts[0];
+if (attempt.outcome !== 'PASS') {
+  throw new Error(`move-branch case did not PASS: ${JSON.stringify({outcome: attempt.outcome, reason: attempt.classification_reason})}`);
+}
+const evidence = attempt.chaos_evidence;
+if (!evidence || evidence.status !== 'completed' || evidence.operator !== 'tt-chaos'
+    || evidence.injection_type !== 'move-branch' || evidence.target !== 'origin_target_ref'
+    || evidence.trigger !== 'step:finalize_merge:running'
+    || evidence.trigger_marker !== 'step:finalize_merge:running'
+    || evidence.ref !== 'refs/heads/main' || evidence.repeat !== 5
+    || evidence.interval_s !== 30 || evidence.wait_timeout_s !== 4200
+    || evidence.exit_code !== 0 || evidence.signal !== null) {
+  throw new Error(`move-branch chaos evidence is wrong: ${JSON.stringify(evidence)}`);
+}
+// US-004: the origin repo must be the PROVISIONED work clone (the
+// worktree-origin repository) and the ref must have been verified there.
+const originRepo = evidence.origin_repo;
+if (typeof originRepo !== 'string' || originRepo === ''
+    || !originRepo.includes(`${path.sep}fixtures${path.sep}work${path.sep}CHAOS-MOVE-BRANCH${path.sep}tt-ts`)) {
+  throw new Error(`move-branch origin repo must be the provisioned work clone: ${JSON.stringify(originRepo)}`);
+}
+// The invocation argv: --repo <clone> --ref refs/heads/main --repeat 5
+// --interval 30 --timeout 4200, and NO --target-* args (no harness process).
+const argv = evidence.argv ?? [];
+if (argv[0] !== chaosStubPath || argv[1] !== 'move-branch'
+    || argv[2] !== '--run' || argv[3] !== runId
+    || argv[4] !== '--when' || argv[5] !== 'step:finalize_merge:running'
+    || argv[6] !== '--repo' || argv[7] !== originRepo
+    || argv[8] !== '--ref' || argv[9] !== 'refs/heads/main'
+    || argv[10] !== '--repeat' || argv[11] !== '5'
+    || argv[12] !== '--interval' || argv[13] !== '30'
+    || argv[14] !== '--timeout' || argv[15] !== '4200'
+    || argv.includes('--target-pid') || argv.includes('--target-pgid') || argv.includes('--target-start-time')) {
+  throw new Error(`move-branch chaos argv must carry the origin-ref contract with no --target-* args: ${JSON.stringify(argv)}`);
+}
+if (evidence.target_record !== undefined) {
+  throw new Error(`move-branch must skip the harness-target-record wait (origin-ref injection): ${JSON.stringify(evidence.target_record)}`);
+}
+const stubCalls = fs.readFileSync(eventsPath, 'utf8').trim().split('\n')
+  .map((line) => JSON.parse(line));
+if (stubCalls.length !== 1 || stubCalls[0].argv[0] !== 'move-branch'
+    || !stubCalls[0].argv.includes('--ref')) {
+  throw new Error(`tt-chaos stub must record exactly one move-branch invocation: ${JSON.stringify(stubCalls)}`);
+}
+NODE
+pass "a move-branch chaos block resolves the provisioned work clone, verifies the ref, skips the harness-target wait, and invokes tt-chaos with the origin-ref argv (US-004)"
+
+# Fixture 2c (S28 US-005): the controller REFUSES to invoke tt-chaos when the
+# run is already terminal before the chaos trigger fired — the harness-target
+# wait ends with reason 'terminal' and the invocation is refused fail-closed
+# with a precise one-line machine-parseable reason
+# (chaos-invocation-refused: run <id> already terminal (<status>) before
+# trigger <marker>) instead of spawning an operator that the contained
+# daemon's post-run leak-guard sweep would SIGKILL (the campaign's `chaos
+# operator 'tt-chaos' exited null`). The null-trap stub would record any
+# spawn — zero records proves the refusal happens BEFORE invocation.
+# CONTROLLER_WORKFLOW_MODE=stdout reports the run 'completed' from the start
+# and no claim row is seeded, so the marker (step:developer:running) can
+# never fire: the wait stops with 'terminal' and the controller refuses.
+chaos_refused_events="$TEST_ROOT/chaos-refused-events.jsonl"
+: > "$chaos_refused_events"
+chaos_refused_manifest="$TEST_ROOT/manifests/chaos-refused.jsonl"
+write_chaos_case "$chaos_refused_manifest" "CHAOS-REFUSED" "$CHAOS_BLOCK"
+cat > "$TEST_ROOT/tt-chaos-refused-trap" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$(node -e 'process.stdout.write(JSON.stringify({argv:process.argv.slice(1),at:Date.now()}))' "$@")" >> "$CONTROLLER_CHAOS_EVENTS"
+exit 9
+SH
+chmod +x "$TEST_ROOT/tt-chaos-refused-trap"
+chaos_refused_output=$(PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$workflow_events" \
+  CONTROLLER_WORKFLOW_MODE=stdout \
+  CONTROLLER_CHAOS_EVENTS="$chaos_refused_events" \
+  TT_CONTROLLER_TT_CHAOS_PATH="$TEST_ROOT/tt-chaos-refused-trap" \
+  run_recorded_campaign "$CONTROLLER" --manifest "$chaos_refused_manifest") \
+  || fail "chaos-refused campaign failed: $chaos_refused_output"
+chaos_refused_id=$(remember_campaign "$chaos_refused_output")
+node --input-type=module - "$TT_DIR/var/results/$chaos_refused_id/state.json" "$chaos_refused_events" \
+  "$CHAOS_RUN_ID" <<'NODE'
+import fs from 'node:fs';
+const [statePath, eventsPath, runId] = process.argv.slice(2);
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const attempt = state.cases[0].attempts[0];
+if (attempt.outcome !== 'TEST_INFRA_FAIL'
+    || attempt.classification_reason?.category !== 'chaos-invocation-failed') {
+  throw new Error(`terminal-run chaos refusal did not classify TEST_INFRA_FAIL chaos-invocation-failed: ${JSON.stringify({outcome: attempt.outcome, reason: attempt.classification_reason})}`);
+}
+// S28 (US-005) AC1: the refusal reason is precise, one-line and
+// machine-parseable, naming the run and the trigger.
+const message = attempt.classification_reason?.message ?? '';
+const expected = `chaos-invocation-refused: run ${runId} already terminal (completed) before trigger step:developer:running — refusing to invoke chaos operator 'tt-chaos'`;
+if (message !== expected) {
+  throw new Error(`terminal-run chaos refusal must carry the precise one-line reason (got ${JSON.stringify(message)})`);
+}
+// The refusal is recorded in chaos_evidence as failed with refused: true and
+// NO invocation argv (tt-chaos was never spawned).
+const evidence = attempt.chaos_evidence;
+if (!evidence || evidence.status !== 'failed'
+    || evidence.failure?.category !== 'chaos-invocation-failed'
+    || evidence.failure?.refused !== true
+    || evidence.argv !== null
+    || evidence.exit_code !== null) {
+  throw new Error(`chaos evidence must record the fail-closed refusal (never an invocation): ${JSON.stringify(evidence)}`);
+}
+const stubCalls = fs.readFileSync(eventsPath, 'utf8').trim();
+if (stubCalls !== '') {
+  throw new Error(`a terminal-run chaos refusal must NEVER spawn tt-chaos, got: ${stubCalls}`);
+}
+NODE
+pass "the controller refuses to invoke tt-chaos against an already-terminal run with a precise one-line chaos-invocation-refused reason (zero spawns)"
 
 # Fixture 3: a chaos:null case (W3.17a) NEVER spawns tt-chaos — the stub
 # would record an invocation (and exit 9, failing the case) if the controller
@@ -2918,6 +3248,41 @@ if (stubCalls !== '') {
 }
 NODE
 pass "a semantically-invalid chaos block fails closed as TEST_INFRA_FAIL chaos-block-invalid before any launch"
+
+# Fixture 4b (US-004): a move-branch chaos block with a malformed per-type
+# param (interval_s without repeat > 1) fails semantic validation the same
+# way — chaos-block-invalid before any launch.
+chaos_mb_guard_events="$TEST_ROOT/chaos-mb-guard-events.jsonl"
+: > "$chaos_mb_guard_events"
+chaos_mb_guard_manifest="$TEST_ROOT/manifests/chaos-mb-guard.jsonl"
+write_chaos_case "$chaos_mb_guard_manifest" "CHAOS-MB-GUARD" \
+  '{"type":"move-branch","target":"origin_target_ref","trigger":"step:finalize_merge:running","operator":"tt-chaos","ref":"refs/heads/main","repeat":1,"interval_s":30,"wait_timeout_s":4200}'
+chaos_mb_guard_output=$(PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$chaos_mb_guard_events" \
+  CONTROLLER_WORKFLOW_MODE=stdout \
+  CONTROLLER_CHAOS_EVENTS="$chaos_mb_guard_events" \
+  TT_CONTROLLER_TT_CHAOS_PATH="$TEST_ROOT/tt-chaos-null-trap" \
+  run_recorded_campaign "$CONTROLLER" --manifest "$chaos_mb_guard_manifest") \
+  || fail "move-branch guard campaign failed: $chaos_mb_guard_output"
+chaos_mb_guard_id=$(remember_campaign "$chaos_mb_guard_output")
+node --input-type=module - "$TT_DIR/var/results/$chaos_mb_guard_id/state.json" "$chaos_mb_guard_events" <<'NODE'
+import fs from 'node:fs';
+const [statePath, eventsPath] = process.argv.slice(2);
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const attempt = state.cases[0].attempts[0];
+if (attempt.outcome !== 'TEST_INFRA_FAIL'
+    || attempt.classification_reason?.category !== 'chaos-block-invalid') {
+  throw new Error(`malformed move-branch chaos block did not classify TEST_INFRA_FAIL chaos-block-invalid: ${JSON.stringify({outcome: attempt.outcome, reason: attempt.classification_reason, guard: attempt.chaos_guard})}`);
+}
+const errors = attempt.chaos_guard?.errors ?? [];
+if (!errors.some((e) => e.includes('interval_s requires repeat > 1'))) {
+  throw new Error(`move-branch guard must name the interval_s-without-repeat rule: ${JSON.stringify(errors)}`);
+}
+const stubCalls = fs.readFileSync(eventsPath, 'utf8').trim();
+if (stubCalls !== '') {
+  throw new Error(`a chaos-block-invalid move-branch case must never launch or spawn tt-chaos, got: ${stubCalls}`);
+}
+NODE
+pass "a malformed move-branch chaos block (interval_s without repeat > 1) fails closed as TEST_INFRA_FAIL chaos-block-invalid before any launch (US-004)"
 
 oracle_prose_manifest="$TEST_ROOT/manifests/oracle-prose.jsonl"
 valid_case "ORACLE-PROSE" \

@@ -495,16 +495,81 @@ OUT=$("$TOOL" kill-harness --run run-terminal --when now 2>&1)
 RC=$?
 set -e
 
-if [ "$RC" -eq 3 ]; then
-  pass "Terminal run (completed) exits GUARD_MISS (exit 3)"
+# S28 (US-005): a run that is ALREADY terminal refuses at STARTUP with a
+# precise one-line reason (chaos-refused:, exit EXIT_RUN_TERMINAL=2) — BEFORE
+# phaseWait and evidence capture — so the operator never lingers to be
+# SIGKILLed by the contained daemon's post-run leak-guard sweep. This
+# supersedes the old guard-only path (which armed/waited first and exited
+# GUARD_MISS=3).
+if [ "$RC" -eq 2 ]; then
+  pass "Terminal run (completed) fast-fails at startup (exit 2 EXIT_RUN_TERMINAL)"
 else
-  fail "Terminal run should exit 3 (GUARD_MISS), got $RC"
+  fail "Terminal run should exit 2 (EXIT_RUN_TERMINAL), got $RC"
+fi
+
+if echo "$OUT" | grep -q "chaos-refused:"; then
+  pass "Startup refusal carries the machine-parseable chaos-refused: reason"
+else
+  fail "Startup refusal missing chaos-refused: reason: $OUT"
 fi
 
 if echo "$OUT" | grep -q "terminal"; then
-  pass "GUARD_MISS mentions terminal status"
+  pass "chaos-refused mentions terminal status"
 else
-  fail "GUARD_MISS should mention terminal status"
+  fail "chaos-refused should mention terminal status: $OUT"
+fi
+
+if echo "$OUT" | grep -q "run-terminal" && echo "$OUT" | grep -q "before trigger now"; then
+  pass "chaos-refused names the run and the trigger"
+else
+  fail "chaos-refused should name the run and trigger: $OUT"
+fi
+
+# S28 (US-005): the startup fast-fail must be prompt — never a poll window
+# (a lingering operator is exactly what the post-run sweep SIGKILLs).
+echo ""
+echo "--- Test: terminal-run startup fast-fail is prompt (no phaseWait linger) ---"
+
+START_TS=$(date +%s)
+set +e
+OUT=$("$TOOL" kill-harness --run run-terminal --when step:fixer:running --timeout 30 2>&1)
+RC=$?
+set -e
+END_TS=$(date +%s)
+ELAPSED=$((END_TS - START_TS))
+
+if [ "$RC" -eq 2 ]; then
+  pass "kill-harness on a terminal run exits 2 (EXIT_RUN_TERMINAL) without waiting out --timeout"
+else
+  fail "kill-harness on a terminal run should exit 2, got $RC: $OUT"
+fi
+
+if echo "$OUT" | grep -q "chaos-refused: run run-terminal already terminal (completed) before trigger step:fixer:running"; then
+  pass "chaos-refused names the run, the terminal status, and the trigger precisely"
+else
+  fail "chaos-refused reason must name run + status + trigger: $OUT"
+fi
+
+if [ "$ELAPSED" -lt 3 ]; then
+  pass "terminal-run refusal completed in ${ELAPSED}s (under 3s, no phaseWait linger)"
+else
+  fail "terminal-run refusal took ${ELAPSED}s (must be prompt, not a poll window)"
+fi
+
+# ── Test: kill-daemon also refuses a terminal run at startup ────────────
+
+echo ""
+echo "--- Test: kill-daemon refuses a terminal run at startup ---"
+
+set +e
+OUT=$("$TOOL" kill-daemon --run run-terminal --when step:fixer:running --timeout 30 2>&1)
+RC=$?
+set -e
+
+if [ "$RC" -eq 2 ] && echo "$OUT" | grep -q "chaos-refused: run run-terminal already terminal (completed) before trigger step:fixer:running (kill-daemon)"; then
+  pass "kill-daemon on a terminal run fast-fails with chaos-refused (exit 2)"
+else
+  fail "kill-daemon on a terminal run should exit 2 with chaos-refused, got RC=$RC: ${OUT:0:200}"
 fi
 
 # ── Test: Valid run passes run-existence guard (then fails on PID lookup) ─
@@ -1335,8 +1400,11 @@ echo "--- Test: kill-daemon refuses stale/foreign pidfile PID ---"
 
 setup_fake_tt_env
 
-# pidfile points at a live process that is NOT TT-owned (cwd outside TT_ROOT,
-# no daemon provenance) — the provenance check must refuse, never signal.
+# pidfile points at a live process that is NOT the contained daemon — a
+# same-group foreign pid (the background sleep inherits this script's process
+# group), so kill-daemon's group-disjointness gate refuses it on linux; on a
+# /proc-less host the unreadable-pgid fail-closed gate refuses it. Never a
+# signal, never a scan (S28 US-006).
 FOREIGN_PID=""
 sleep 60 &
 FOREIGN_PID=$!
@@ -1359,6 +1427,205 @@ else
   fail "Foreign pidfile PID was signalled despite bad provenance"
 fi
 kill "$FOREIGN_PID" 2>/dev/null || true
+
+# ── S28 (US-006): kill-daemon accepts the real contained-daemon shape ──
+# The campaign's W4.48a GUARD_MISS: the pre-fix belt-and-suspenders
+# provenance check required the target's cwd to be under TT_ROOT and its
+# cmdline to carry the run id or TT_ROOT — the REAL contained daemon runs
+# from a different cwd with a cmdline (`node .../dist/cli/cli.js daemon`)
+# that contains neither, so kill-daemon could never pass provenance and
+# always GUARD_MISSed:
+#   `Process 4080359 cwd/cmdline does not contain
+#    /home/igorhvr/idm/tamandua/torture-test/var`
+# (campaign chaos.log evidence). The fix verifies the pidfile-resolved
+# daemon by identity (alive, /proc start identity, ancestry/group
+# disjointness) + pidfile-under-TT_ROOT containment — NOT by cwd/cmdline.
+
+echo ""
+echo "--- Test (S28 US-006): kill-daemon accepts a daemon-like process outside var/ ---"
+
+setup_fake_tt_env
+
+OUTSIDE_DIR=$(mktemp -d "${TMPDIR}/tt-chaos-outside-XXXXXX")
+DAEMON_OUT_PID=""
+DAEMON_OUT_PIDFILE="${TEST_VAR}/daemon-out-pid.txt"
+(
+  cd "$OUTSIDE_DIR"
+  setsid bash -c 'exec -a "$1" sleep 86400' _ "${OUTSIDE_DIR}/tt-dist/cli/cli.js" &
+  echo $! > "$DAEMON_OUT_PIDFILE"
+  wait $! 2>/dev/null || true
+) &
+BG_DAEMON_OUT=$!
+
+sleep 1
+
+DAEMON_OUT_PID=$(cat "$DAEMON_OUT_PIDFILE" 2>/dev/null || echo "")
+if [ -z "$DAEMON_OUT_PID" ] || ! kill -0 "$DAEMON_OUT_PID" 2>/dev/null; then
+  fail "Daemon-like outside process did not start"
+else
+  note_pid "$DAEMON_OUT_PID"
+  pass "Daemon-like outside process started (PID $DAEMON_OUT_PID)"
+
+  # Pre-fix provenance criterion: cwd under TT_ROOT AND cmdline carrying the
+  # run id or TT_ROOT — the outside daemon satisfies NEITHER (that is exactly
+  # the campaign's W4.48a guard_miss shape).
+  # linux-only /proc reads (MACP3 US-004): on a /proc-less host the reads
+  # fail and these assertions are skipped (the kill corridor below still
+  # runs and is platform-independent).
+  OUT_CWD=$(readlink -f "/proc/${DAEMON_OUT_PID}/cwd" 2>/dev/null || echo "")
+  OUT_CMDLINE=$(tr '\0' ' ' < "/proc/${DAEMON_OUT_PID}/cmdline" 2>/dev/null || echo "")
+  if [ -n "$OUT_CWD" ]; then
+    if echo "$OUT_CWD" | grep -q "$TEST_VAR"; then
+      fail "Test setup: daemon-like process cwd is under TEST_VAR (should be outside)"
+    else
+      pass "Daemon-like process cwd is outside var/ (pre-fix provenance would refuse it)"
+    fi
+    if echo "$OUT_CMDLINE" | grep -q "$TEST_VAR" || echo "$OUT_CMDLINE" | grep -q "$HARNESS_RUN"; then
+      fail "Test setup: daemon-like cmdline contains TEST_VAR or the run id (should contain neither)"
+    else
+      pass "Daemon-like cmdline contains neither TEST_VAR nor the run id (pre-fix provenance would refuse it)"
+    fi
+  fi
+
+  echo "$DAEMON_OUT_PID" > "${TEST_VAR}/tamandua.pid"
+
+  set +e
+  OUT=$("$TOOL" kill-daemon --run "$HARNESS_RUN" --when now 2>&1)
+  RC=$?
+  set -e
+
+  if [ "$RC" -eq 0 ]; then
+    pass "kill-daemon accepts the pidfile-resolved daemon outside var/ (exit 0)"
+  else
+    fail "kill-daemon should exit 0 for the contained-daemon shape, got $RC: ${OUT:0:160}"
+  fi
+
+  if echo "$OUT" | grep -q "SIGKILL sent to daemon PID $DAEMON_OUT_PID"; then
+    pass "kill-daemon logs the daemon kill message naming the PID"
+  else
+    fail "kill-daemon output missing daemon kill message: ${OUT:0:160}"
+  fi
+
+  # Verify the daemon is dead
+  sleep 1
+  if kill -0 "$DAEMON_OUT_PID" 2>/dev/null; then
+    fail "Daemon-like outside process still alive after kill-daemon fired"
+    kill -9 "$DAEMON_OUT_PID" 2>/dev/null || true
+  else
+    pass "Daemon-like outside process terminated after kill-daemon"
+  fi
+fi
+
+rm -rf "$OUTSIDE_DIR"
+OUTSIDE_DIR=""
+wait "$BG_DAEMON_OUT" 2>/dev/null || true
+
+# ── Test (S28 US-006): harness provenance stays STRICT ─────────────────
+# kill-harness with an explicit --target-pid of the SAME outside-cwd
+# daemon-like shape must STILL GUARD_MISS — the strict cwd/cmdline
+# provenance check is retained for harness targets (kill-harness /
+# sigstop_sigcont), never weakened by the daemon fix.
+
+echo ""
+echo "--- Test (S28 US-006): kill-harness still refuses the outside-cwd process (strict provenance retained) ---"
+
+setup_fake_tt_env
+
+OUTSIDE_DIR2=$(mktemp -d "${TMPDIR}/tt-chaos-outside2-XXXXXX")
+HARNESS_OUT_PID=""
+HARNESS_OUT_PIDFILE="${TEST_VAR}/harness-out-pid.txt"
+(
+  cd "$OUTSIDE_DIR2"
+  setsid bash -c 'exec -a "$1" sleep 86400' _ "${OUTSIDE_DIR2}/tt-dist/cli/cli.js" &
+  echo $! > "$HARNESS_OUT_PIDFILE"
+  wait $! 2>/dev/null || true
+) &
+BG_HARNESS_OUT=$!
+
+sleep 1
+
+HARNESS_OUT_PID=$(cat "$HARNESS_OUT_PIDFILE" 2>/dev/null || echo "")
+if [ -z "$HARNESS_OUT_PID" ] || ! kill -0 "$HARNESS_OUT_PID" 2>/dev/null; then
+  fail "Outside harness-like process did not start"
+else
+  note_pid "$HARNESS_OUT_PID"
+  pass "Outside harness-like process started (PID $HARNESS_OUT_PID)"
+
+  set +e
+  OUT=$("$TOOL" kill-harness --run "$HARNESS_RUN" --when now --target-pid "$HARNESS_OUT_PID" 2>&1)
+  RC=$?
+  set -e
+
+  if [ "$RC" -eq 3 ]; then
+    pass "kill-harness on an outside-cwd process still exits GUARD_MISS (3) — strict provenance retained"
+  else
+    fail "kill-harness on an outside-cwd process should exit 3, got $RC: ${OUT:0:160}"
+  fi
+
+  if echo "$OUT" | grep -q "cwd/cmdline does not contain"; then
+    pass "kill-harness GUARD_MISS names the provenance failure precisely"
+  else
+    fail "kill-harness GUARD_MISS missing provenance reason: ${OUT:0:160}"
+  fi
+
+  if kill -0 "$HARNESS_OUT_PID" 2>/dev/null; then
+    pass "Outside harness-like process survives (kill-harness refused to signal it)"
+  else
+    fail "Outside harness-like process was signalled by kill-harness"
+  fi
+  kill -9 "$HARNESS_OUT_PID" 2>/dev/null || true
+fi
+
+rm -rf "$OUTSIDE_DIR2"
+OUTSIDE_DIR2=""
+wait "$BG_HARNESS_OUT" 2>/dev/null || true
+
+# ── Test (S28 US-006): kill-daemon refuses an out-of-scope pidfile ────
+# A pidfile OUTSIDE TT_ROOT (e.g. TT_HOME mis-pointed at the real ~/.tamandua)
+# could name the PRODUCTION daemon — resolution must refuse fail-closed with
+# a precise one-line reason; never a signal, never a scan.
+
+echo ""
+echo "--- Test (S28 US-006): kill-daemon refuses an out-of-scope pidfile ---"
+
+setup_fake_tt_env
+
+OUTSIDE_HOME=$(mktemp -d "${TMPDIR}/tt-chaos-outside-home-XXXXXX")
+mkdir -p "${OUTSIDE_HOME}/.tamandua"
+OUTSIDE_DAEMON_PID=""
+sleep 60 &
+OUTSIDE_DAEMON_PID=$!
+echo "$OUTSIDE_DAEMON_PID" > "${OUTSIDE_HOME}/.tamandua/daemon.pid"
+
+# TAMANDUA_STATE_DIR stays inside TT_ROOT (the DB + run guard work); TT_HOME
+# points OUTSIDE TT_ROOT, so the legacy daemon.pid candidate is not under
+# TEST_VAR — the pidfile-resolved target is refused at resolution, before any
+# identity check or signal.
+set +e
+OUT=$(TT_HOME="$OUTSIDE_HOME" "$TOOL" kill-daemon --run "$HARNESS_RUN" --when now 2>&1)
+RC=$?
+set -e
+
+if [ "$RC" -eq 3 ]; then
+  pass "kill-daemon on an out-of-scope pidfile exits GUARD_MISS (3)"
+else
+  fail "kill-daemon on an out-of-scope pidfile should exit 3, got $RC: ${OUT:0:160}"
+fi
+
+if echo "$OUT" | grep -q "not under" && echo "$OUT" | grep -q "out-of-scope pidfile"; then
+  pass "kill-daemon refusal names the out-of-scope pidfile precisely"
+else
+  fail "kill-daemon refusal missing precise out-of-scope reason: ${OUT:0:160}"
+fi
+
+if kill -0 "$OUTSIDE_DAEMON_PID" 2>/dev/null; then
+  pass "Out-of-scope daemon survives (no signal sent)"
+else
+  fail "Out-of-scope daemon was signalled despite the out-of-scope pidfile"
+fi
+kill "$OUTSIDE_DAEMON_PID" 2>/dev/null || true
+rm -rf "$OUTSIDE_HOME"
+OUTSIDE_HOME=""
 
 # ── Test: kill-daemon refuses production daemon ─────────────────────────
 
@@ -2745,6 +3012,159 @@ fi
 
 rm -rf "$OUTSIDE_BARE"
 
+# ── US-004 (S29): move-branch persistent colleague target-move ─────────
+# The premise-redesign corridor (W4.33d reroute exhaustion / W4.48b
+# target_moved) needs --repeat/--interval: the operator ARMS an empty-diff
+# "colleague budget" of commits on the target ref (so even a single-commit
+# fixture main has parents to move back through), then moves the ref back one
+# parent per move, standing down when the run goes terminal (the mechanized
+# "operator removes the rejection condition" protocol).
+
+echo ""
+echo "--- Test: move-branch --repeat 3 --interval 1 moves the ref 3 times (budget armed) ---"
+
+setup_fake_tt_env
+setup_fixture_repos
+
+# Fixture main is a single commit (the tt-ts-shallow shape) — the budget must
+# arm so the moves have parents to walk back through.
+SHALLOW_REF=$(git -C "$FIXTURE_REPO" rev-parse refs/heads/main)
+SHALLOW_TREE=$(git -C "$FIXTURE_REPO" rev-parse refs/heads/main^{tree})
+
+set +e
+OUT=$("$TOOL" move-branch --repo "$FIXTURE_REPO" --ref "refs/heads/main" --run run-guard-test --when now --repeat 3 --interval 1 2>&1)
+RC=$?
+set -e
+
+if [ "$RC" -eq 0 ]; then
+  pass "move-branch --repeat 3 exited 0 (budget armed + 3 moves)"
+else
+  fail "move-branch --repeat 3 should exit 0, got $RC: $OUT"
+fi
+
+MOVED_REF=$(git -C "$FIXTURE_REPO" rev-parse refs/heads/main)
+MOVED_TREE=$(git -C "$FIXTURE_REPO" rev-parse refs/heads/main^{tree})
+if [ "$MOVED_REF" = "$SHALLOW_REF" ]; then
+  pass "move-branch --repeat moved the ref back through the whole budget (ref restored to original commit)"
+else
+  fail "move-branch --repeat did not restore the ref (expected $SHALLOW_REF, got $MOVED_REF)"
+fi
+if [ "$MOVED_TREE" = "$SHALLOW_TREE" ]; then
+  pass "move-branch budget commits are empty-diff (tree unchanged)"
+else
+  fail "move-branch budget changed the target tree (expected $SHALLOW_TREE, got $MOVED_TREE)"
+fi
+
+FIRED_MOVES=$(grep -c '"move_index"' "${TEST_VAR}/chaos/chaos.log" || echo 0)
+if [ "$FIRED_MOVES" -eq 3 ]; then
+  pass "chaos.log records 3 per-move fired entries (move_index 1..3)"
+else
+  fail "chaos.log should record 3 fired move entries, got $FIRED_MOVES: $(grep 'move-branch' "${TEST_VAR}/chaos/chaos.log" | tail -5)"
+fi
+if grep -q '"outcome":"budget_armed"' "${TEST_VAR}/chaos/chaos.log"; then
+  pass "chaos.log records the budget_armed entry"
+else
+  fail "chaos.log missing budget_armed entry"
+fi
+
+# ── Test: move-branch repeat stands down at run-terminal ────────────────
+
+echo ""
+echo "--- Test: move-branch --repeat stands down when the run goes terminal ---"
+
+setup_fake_tt_env
+setup_fixture_repos
+
+# A background flip marks the run failed ~1.5s in; with --repeat 5 --interval 1
+# the loop must execute only ~2 moves, then stand down (never keep moving past
+# run-terminal — a resume must land on a stable target).
+(
+  sleep 1.5
+  node -e "
+    const { DatabaseSync } = require('node:sqlite');
+    const db = new DatabaseSync('${TEST_VAR}/tamandua.db', { open: true });
+    db.prepare(\"UPDATE runs SET status = 'failed' WHERE run_id = 'run-guard-test'\").run();
+    db.close();
+  "
+) &
+TERMINAL_FLIP_PID=$!
+
+set +e
+OUT=$("$TOOL" move-branch --repo "$FIXTURE_REPO" --ref "refs/heads/main" --run run-guard-test --when now --repeat 5 --interval 1 2>&1)
+RC=$?
+set -e
+wait "$TERMINAL_FLIP_PID" 2>/dev/null || true
+
+if [ "$RC" -eq 0 ]; then
+  pass "move-branch --repeat exited 0 after standing down at run-terminal"
+else
+  fail "move-branch --repeat should exit 0 on stand-down, got $RC: $OUT"
+fi
+if grep -q '"outcome":"stand_down"' "${TEST_VAR}/chaos/chaos.log"; then
+  pass "chaos.log records the stand_down entry (colleague target-moves stopped)"
+else
+  fail "chaos.log missing stand_down entry: $(grep 'move-branch' "${TEST_VAR}/chaos/chaos.log" | tail -5)"
+fi
+MOVES_AT_STANDDOWN=$(grep -c '"move_index"' "${TEST_VAR}/chaos/chaos.log" || echo 0)
+if [ "$MOVES_AT_STANDDOWN" -ge 1 ] && [ "$MOVES_AT_STANDDOWN" -le 3 ]; then
+  pass "loop executed $MOVES_AT_STANDDOWN move(s) before standing down (bounded, not all 5)"
+else
+  fail "loop should execute 1-3 moves before stand-down, got $MOVES_AT_STANDDOWN"
+fi
+
+# ── Test: move-branch arg validation fails closed ───────────────────────
+
+echo ""
+echo "--- Test: move-branch --repeat without --interval fails closed ---"
+
+setup_fake_tt_env
+setup_fixture_repos
+
+set +e
+OUT=$("$TOOL" move-branch --repo "$FIXTURE_REPO" --ref "refs/heads/main" --run run-guard-test --when now --repeat 3 2>&1)
+RC=$?
+set -e
+
+if [ "$RC" -eq 1 ] && echo "$OUT" | grep -q -- "--interval must be a positive integer when --repeat > 1"; then
+  pass "move-branch --repeat 3 without --interval fails closed with the precise reason"
+else
+  fail "move-branch --repeat without --interval should exit 1 with the interval reason, got $RC: $OUT"
+fi
+
+echo ""
+echo "--- Test: move-branch --interval with --repeat 1 fails closed ---"
+
+setup_fake_tt_env
+setup_fixture_repos
+
+set +e
+OUT=$("$TOOL" move-branch --repo "$FIXTURE_REPO" --ref "refs/heads/main" --run run-guard-test --when now --repeat 1 --interval 5 2>&1)
+RC=$?
+set -e
+
+if [ "$RC" -eq 1 ] && echo "$OUT" | grep -q -- "--interval requires --repeat > 1"; then
+  pass "move-branch --interval with --repeat 1 fails closed with the precise reason"
+else
+  fail "move-branch --interval with --repeat 1 should exit 1, got $RC: $OUT"
+fi
+
+echo ""
+echo "--- Test: move-branch against a missing ref fails closed ---"
+
+setup_fake_tt_env
+setup_fixture_repos
+
+set +e
+OUT=$("$TOOL" move-branch --repo "$FIXTURE_REPO" --ref "refs/heads/does-not-exist" --run run-guard-test --when now 2>&1)
+RC=$?
+set -e
+
+if [ "$RC" -eq 1 ] && echo "$OUT" | grep -q "does not resolve to a commit"; then
+  pass "move-branch against a missing ref fails closed with the precise reason"
+else
+  fail "move-branch against a missing ref should exit 1, got $RC: $OUT"
+fi
+
 # ── Test: evidence captured before git mutation ──────────────────────
 
 echo ""
@@ -3164,7 +3584,10 @@ else
   fail "deletion did not report the resolved attested tree: ${OUT:0:160}"
 fi
 
-# Unattested run fails loudly (never a silent no-op against the sentinel).
+# Unattested run fails CLOSED with a precise one-line reason (S28 US-007 —
+# never an uncaught exit-1 crash: the campaign's W4.48c `chaos operator
+# 'tt-chaos' exited 1` was the TESTEDTREE resolution throwing with a stack
+# trace and no structured chaos.log failure entry).
 node -e "
   const { DatabaseSync } = require('node:sqlite');
   const db = new DatabaseSync('${TEST_VAR}/tamandua.db', { open: true });
@@ -3176,11 +3599,101 @@ set +e
 OUT2=$("$TOOL" delete-tstx-row --tree TESTEDTREE --run run-no-context --when now 2>&1)
 RC2=$?
 set -e
-if [ "$RC2" -ne 0 ] && echo "$OUT2" | grep -qi "TESTEDTREE"; then
-  pass "unattested TESTEDTREE fails loudly naming the sentinel"
+if [ "$RC2" -ne 0 ] && echo "$OUT2" | grep -q "delete-tstx-row: run run-no-context has no attested tested_tree in context -- refusing"; then
+  pass "unattested TESTEDTREE fails closed with the precise one-line reason"
 else
-  fail "unattested TESTEDTREE should fail loudly, got RC=$RC2: ${OUT2:0:160}"
+  fail "unattested TESTEDTREE should fail closed with the precise reason, got RC=$RC2: ${OUT2:0:200}"
 fi
+# The fail-closed path must write a structured chaos.log fire_failed entry
+# (the campaign recorded NO structured failure entry — `outcome: firing` then
+# a bare exit 1).
+if grep -q '"action":"delete-tstx-row".*"outcome":"fire_failed".*run run-no-context has no attested tested_tree in context' "${TEST_VAR}/chaos/chaos.log" 2>/dev/null; then
+  pass "unattested TESTEDTREE logged a structured chaos.log fire_failed entry"
+else
+  fail "unattested TESTEDTREE must log a structured fire_failed chaos.log entry"
+fi
+# And it must NOT be an uncaught exception (no stack trace / bare crash).
+if echo "$OUT2" | grep -q "at deleteTstxRow\|at resolveAttestedTestedTree\|node:internal"; then
+  fail "unattested TESTEDTREE must not crash with an uncaught stack trace: ${OUT2:0:200}"
+else
+  pass "unattested TESTEDTREE exited cleanly (no uncaught stack trace)"
+fi
+
+# ── S28 (US-007): RED-ARM — the pre-fix exit-1 behavior ────────────────
+# The campaign's W4.48c cell recorded `chaos operator 'tt-chaos' exited 1`
+# with the chaos.log showing `delete-tstx-row ... outcome: firing` then a
+# BARE exit 1: the pre-fix resolveAttestedTestedTree THREW
+# (`TESTEDTREE resolution: run <id> has no attested tested_tree in its
+# context`) and the throw escaped as an uncaught exception → node exit 1
+# with a stack trace and NO structured `fire_failed` chaos.log entry.
+# Reproduce that exact pre-fix shape (history-independent: the pre-fix
+# resolution logic is embedded here, not resolved from git) against a FRESH
+# unattested fixture (its own env, so the chaos.log is clean).
+
+echo ""
+echo "--- Test (S28 US-007): RED-ARM reproduces the pre-fix uncaught exit-1 ---"
+
+setup_fake_tt_env
+
+node -e "
+  const { DatabaseSync } = require('node:sqlite');
+  const db = new DatabaseSync('${TEST_VAR}/tamandua.db', { open: true });
+  db.exec('DROP TABLE IF EXISTS runs');
+  db.exec(\`
+    CREATE TABLE runs (id TEXT PRIMARY KEY, status TEXT, context TEXT)
+  \`);
+  db.prepare('INSERT INTO runs (id, status, context) VALUES (?, ?, ?)')
+    .run('run-no-context', 'running', '{}');
+  db.close();
+"
+
+# The pre-fix resolution: raw id-column query + 40-hex regex + THROW with the
+# exact pre-fix message, invoked with NO catch — the throw escapes and node
+# exits 1 with a stack trace (the campaign's bare exit 1).
+set +e
+PRE_FIX_OUT=$(node -e "
+  const { DatabaseSync } = require('node:sqlite');
+  const db = new DatabaseSync('${TEST_VAR}/tamandua.db', { open: true, readOnly: true });
+  const runId = 'run-no-context';
+  const shortRunId = runId.startsWith('run-') ? runId.slice(4) : runId;
+  const rows = db.prepare('SELECT context FROM runs WHERE id = ? OR id = ?').all(runId, shortRunId);
+  if (rows.length !== 1 || typeof rows[0].context !== 'string') {
+    throw new Error('TESTEDTREE resolution: run ' + runId + ' has no readable context row');
+  }
+  const context = JSON.parse(rows[0].context);
+  const attested = typeof context.tested_tree === 'string'
+    && /^[0-9a-f]{40}\$/.test(context.tested_tree)
+    ? context.tested_tree
+    : null;
+  if (attested === null) {
+    throw new Error('TESTEDTREE resolution: run ' + runId + ' has no attested tested_tree in its context');
+  }
+  console.log(attested);
+" 2>&1)
+PRE_FIX_RC=$?
+set -e
+
+if [ "$PRE_FIX_RC" -eq 1 ] && echo "$PRE_FIX_OUT" | grep -q "TESTEDTREE resolution: run run-no-context has no attested tested_tree in its context"; then
+  pass "RED-ARM: pre-fix resolution throws the exact campaign message (uncaught exit 1)"
+else
+  fail "RED-ARM: pre-fix resolution must throw the exact message, got RC=$PRE_FIX_RC: ${PRE_FIX_OUT:0:200}"
+fi
+if echo "$PRE_FIX_OUT" | grep -q "node:internal\|Error:"; then
+  pass "RED-ARM: pre-fix throw escapes as an uncaught exception (stack trace)"
+else
+  fail "RED-ARM: pre-fix throw must escape uncaught (stack trace): ${PRE_FIX_OUT:0:200}"
+fi
+# The pre-fix crash wrote NO structured fire_failed entry (fresh env — the
+# log is clean, so any entry would be from the operator itself, which never
+# ran here).
+if grep -q '"action":"delete-tstx-row".*"outcome":"fire_failed"' "${TEST_VAR}/chaos/chaos.log" 2>/dev/null; then
+  fail "RED-ARM: the pre-fix crash must NOT have written a structured fire_failed entry"
+else
+  pass "RED-ARM: pre-fix crash left no structured fire_failed entry (the campaign shape)"
+fi
+# The FIXED operator now fails closed with the precise one-line reason
+# (asserted in the green corridor above) — the campaign line `exited 1` now
+# carries the reason via the controller's stderr surfacing.
 
 # ── T2.1 US-010: step:<step-id>:<state> markers match the step id ──────
 # Manifest phase markers name WORKFLOW STEPS (`step:finalize_merge:pending`),
@@ -3651,6 +4164,76 @@ if [ -f "$CHAOS_LOG" ]; then
   if grep '"write-context"' "$CHAOS_LOG" | grep -q '"key"'; then
     pass "write-context chaos log includes key field"
   fi
+fi
+
+# ── S29 (US-003): fail-closed trigger-vocabulary validation ────────────
+# A step:/event: marker naming a role/event that is NOT in the run's workflow
+# vocabulary can NEVER fire — waiting on it is the silent chaos-invocation-
+# failed defect. When the run's workflow id resolves (the contained runs row)
+# AND its workflow spec is found, tt-chaos fails closed with a DISTINCT
+# one-line reason + EXIT_INVALID_MARKER instead of polling. When the workflow
+# cannot be resolved (test fixtures / unknown workflow ids) the format check
+# remains the only gate (the controller's preflight is the authoritative
+# fail-closed layer for manifest-driven invocations).
+
+echo ""
+echo "--- Test (S29 US-003): unknown trigger vocabulary fails closed promptly ---"
+
+setup_fake_tt_env
+
+# A bfmw run (the workflow spec resolves from torture-test/workflows +
+# <repo>/workflows) for the vocabulary tests.
+node -e "
+  const { DatabaseSync } = require('node:sqlite');
+  const db = new DatabaseSync('${TEST_VAR}/tamandua.db', { open: true });
+  db.prepare('INSERT OR REPLACE INTO runs (run_id, status, workflow_id) VALUES (?, ?, ?)').run('run-bfmw', 'running', 'bug-fix-merge-worktree');
+  db.close();
+"
+
+set +e
+VOCAB_OUT=$("$TOOL" kill-harness --run run-bfmw --when step:developer:running --timeout 1 2>&1)
+VOCAB_RC=$?
+set -e
+if [ "$VOCAB_RC" -eq 1 ] && echo "$VOCAB_OUT" | grep -q "unknown-chaos-trigger: step:developer:running not in workflow bug-fix-merge-worktree"; then
+  pass "step:developer:running on bfmw fails closed with unknown-chaos-trigger (exit 1)"
+else
+  fail "step:developer:running on bfmw must fail closed with unknown-chaos-trigger (got RC=$VOCAB_RC): ${VOCAB_OUT:0:200}"
+fi
+
+set +e
+VOCAB_EVENT_OUT=$("$TOOL" kill-harness --run run-bfmw --when event:run.does_not_exist --timeout 1 2>&1)
+VOCAB_EVENT_RC=$?
+set -e
+if [ "$VOCAB_EVENT_RC" -eq 1 ] && echo "$VOCAB_EVENT_OUT" | grep -q "unknown-chaos-trigger: event:run.does_not_exist not in product event vocabulary"; then
+  pass "event:run.does_not_exist fails closed with unknown-chaos-trigger (exit 1)"
+else
+  fail "event:run.does_not_exist must fail closed with unknown-chaos-trigger (got RC=$VOCAB_EVENT_RC): ${VOCAB_EVENT_OUT:0:200}"
+fi
+
+# The CALIBRATED spelling (the bfmw coding step) must NOT be a vocabulary
+# error: with no steps-table row it proceeds to phase_wait and times out
+# (exit 2 TRIGGER_NEVER), never an unknown-chaos-trigger refusal.
+set +e
+VOCAB_OK_OUT=$("$TOOL" kill-harness --run run-bfmw --when step:fixer:running --timeout 1 2>&1)
+VOCAB_OK_RC=$?
+set -e
+if [ "$VOCAB_OK_RC" -ne 1 ] && ! echo "$VOCAB_OK_OUT" | grep -q "unknown-chaos-trigger"; then
+  pass "step:fixer:running on bfmw is valid vocabulary (proceeded to phase_wait; exit $VOCAB_OK_RC)"
+else
+  fail "step:fixer:running on bfmw must NOT be a vocabulary error (got RC=$VOCAB_OK_RC): ${VOCAB_OK_OUT:0:200}"
+fi
+
+# A run whose workflow id has NO resolvable spec (test-wf) degrades to the
+# format-only gate — direct invocations against non-catalog workflows keep
+# working (the controller's preflight is the authoritative layer).
+set +e
+VOCAB_DEGRADE_OUT=$("$TOOL" kill-harness --run run-guard-test --when step:finalize_merge:pending --timeout 1 2>&1)
+VOCAB_DEGRADE_RC=$?
+set -e
+if [ "$VOCAB_DEGRADE_RC" -ne 1 ] || ! echo "$VOCAB_DEGRADE_OUT" | grep -q "unknown-chaos-trigger"; then
+  pass "unresolvable workflow (test-wf) degrades to format-only validation (exit $VOCAB_DEGRADE_RC)"
+else
+  fail "test-wf must NOT trigger a vocabulary refusal (got RC=$VOCAB_DEGRADE_RC): ${VOCAB_DEGRADE_OUT:0:200}"
 fi
 
 # ── Summary ────────────────────────────────────────────────────────────

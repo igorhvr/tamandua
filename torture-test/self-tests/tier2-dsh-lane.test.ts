@@ -209,8 +209,8 @@ describe("Tier-2 dsh lane (US-013) — four operator-directed dsh-harness cases"
         assert.equal(record.chaos, null, "W4.dsh-lifecycle carries no chaos block (operator restart seam, W4.33a shape)");
         assert.deepEqual(record.probe_sequence[0].actions.map((a: any) => a.op), ["pause_drain", "resume"],
           "W4.dsh-lifecycle carries the pause_drain + resume probe sequence");
-        assert.equal(record.probe_sequence[0].actions[0].when, "step:developer:running",
-          "W4.dsh-lifecycle pause_drain arms at step:developer:running");
+        assert.equal(record.probe_sequence[0].actions[0].when, "step:fixer:running",
+          "W4.dsh-lifecycle pause_drain arms at step:fixer:running (the W4.33a shape — S29 calibration US-003: step:developer:running is not bfmw vocabulary)");
         assert.equal(record.probe_sequence[0].actions[1].expect?.run_completes, true,
           "W4.dsh-lifecycle resume expects run_completes (O16)");
         assert.ok(record.oracles.includes("O16"), "W4.dsh-lifecycle must declare O16");

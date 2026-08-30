@@ -12,7 +12,7 @@
 //
 // Resolution:
 //   - Reads EVERY manifest under torture-test/cases/:
-//     tier0.jsonl, tier1.jsonl, cases.jsonl, smoke.jsonl.
+//     tier0.jsonl, tier1.jsonl, cases.jsonl, smoke.jsonl, tier2.jsonl.
 //   - For each case whose `harness` is `pi` or `hermes` (i.e. NOT the
 //     `local` scripted harness), collects the `workflow` field.
 //   - Excludes the bundled catalog set (the repo's workflows/* workflow ids).
@@ -49,7 +49,7 @@ const ttRoot = path.resolve(binDir, "..");
 const repoRoot = path.resolve(ttRoot, "..");
 
 // The fixed manifest set the helper is required to read (E2.6 US-002).
-const MANIFEST_NAMES = ["tier0.jsonl", "tier1.jsonl", "cases.jsonl", "smoke.jsonl"];
+const MANIFEST_NAMES = ["tier0.jsonl", "tier1.jsonl", "cases.jsonl", "smoke.jsonl", "tier2.jsonl"];
 
 function fail(reason, detail) {
   process.stderr.write(`REASON: ${reason}\n`);
@@ -66,7 +66,7 @@ function usage() {
 Usage: tt-required-workflows [--help]
 
 Reads every manifest under torture-test/cases/ (tier0.jsonl, tier1.jsonl,
-cases.jsonl, smoke.jsonl) and prints, one per line (sorted, de-duplicated),
+cases.jsonl, smoke.jsonl, tier2.jsonl) and prints, one per line (sorted, de-duplicated),
 the workflow ids referenced by REAL cases (harness pi/hermes) that are NOT
 part of the bundled repo catalog (workflows/*).
 

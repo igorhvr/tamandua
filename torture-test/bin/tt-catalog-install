@@ -19,6 +19,13 @@
 #     reinstall attempt does it FAIL CLOSED with the DISTINCT machine-parseable
 #     reason `catalog-missing` on stderr and exit non-zero.
 #
+# S30 US-008 --verify mode: a read-only fail-closed workflow-spec preflight
+# leg. Given workflow names, verifies each is present in the installed catalog
+# of the contained home and refuses with the DISTINCT machine-parseable reason
+# `workflow-spec-missing: <name>` on the first absent spec — the W4.14 defect
+# class (`No workflow.yml found in .../workflows/<name>` at launch) is caught
+# at preflight, never at launch.
+#
 # Env/resolution:
 #   - TT_VAR         : override the torture-test/var root (test seam). Defaults
 #                      to torture-test/var.
@@ -409,11 +416,45 @@ Stamp semantics:
 
 Options:
   --force    Always reinstall, ignoring a matching stamp (used for tests / US-006).
+  --verify <workflow>...  FAIL-CLOSED workflow-spec preflight check (S30
+             US-008): every named workflow must be present in the installed
+             catalog of the contained home. Refuses with the DISTINCT reason
+             'workflow-spec-missing: <name>' on the first absent spec — never
+             a launch-time 'No workflow.yml found'. Read-only; no install.
   --help,-h  Show this help.
 
 Idempotent for same-build/same-source: safe to run repeatedly.
 Never mutates the caller's environment; writes only under torture-test/var.
 EOF
+}
+
+
+# verify_workflow_specs: fail-closed workflow-spec preflight check (S30 US-008).
+# Each named workflow must be PRESENT in the installed catalog of the contained
+# home (<home>/.tamandua/workflows/<name>/workflow.yml) — the catalog the
+# bundled + TT-custom install legs just ensured. A missing workflow spec is the
+# exact W4.14 defect class (`workflow-spec-missing: No workflow.yml found in
+# .../workflows/<name>` at launch) — this leg refuses BEFORE any launch with
+# the DISTINCT machine-parseable reason `workflow-spec-missing: <name>`, so a
+# case whose declared workflow is absent from the installed catalog fails
+# closed at preflight, never at launch. Exit 0 iff every named workflow is
+# present.
+verify_workflow_specs() {
+  local home="$1"
+  shift
+  local inst="$home/.tamandua/workflows"
+  if [ "$#" -eq 0 ]; then
+    return 0
+  fi
+  local name
+  for name in "$@"; do
+    if [ ! -f "$inst/$name/workflow.yml" ]; then
+      echo "REASON: workflow-spec-missing: $name" >&2
+      echo "DETAILS: workflow spec absent from the installed catalog: $inst/$name/workflow.yml" >&2
+      exit 1
+    fi
+  done
+  return 0
 }
 
 # ── main ──────────────────────────────────────────────────────────────
@@ -422,6 +463,16 @@ FORCE=0
 case "${1:-}" in
   --help|-h) usage; exit 0 ;;
   --force|-ff) FORCE=1 ;;
+  --verify)
+    # S30 US-008: fail-closed workflow-spec preflight leg. Every remaining arg
+    # is a workflow name that MUST be present in the installed catalog of the
+    # contained home. No install, no daemon, no writes — a pure read-only
+    # verification against the installed catalog.
+    shift
+    verify_home="$(resolve_contained_tt_home)"
+    verify_workflow_specs "$verify_home" "$@"
+    exit $?
+    ;;
   "")
     ;;
   *)

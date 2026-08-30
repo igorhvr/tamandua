@@ -94,6 +94,14 @@ if [ -f "$TT_VAR/home/.tamandua/workflows/tt-docs-drift/workflow.yml" ]; then
 else
   fail "AC6a-US-007 tt-docs-drift workflow.yml missing after install"
 fi
+# S30 US-008: tt-required-workflows enumerates tier2.jsonl, so the tier2
+# case W4.14's tt-verdict-trap custom workflow must ALSO be installed (the
+# W4.14 launch-time `No workflow.yml found in .../tt-verdict-trap` defect).
+if [ -f "$TT_VAR/home/.tamandua/workflows/tt-verdict-trap/workflow.yml" ]; then
+  ok "AC6a-US-008 tt-verdict-trap workflow.yml installed into contained home (tier2.jsonl enumerated)"
+else
+  fail "AC6a-US-008 tt-verdict-trap workflow.yml missing after install"
+fi
 if [ -f "$CUSTOM_STAMP" ]; then
   CUSTOM_VER="$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\(.*\)",\?$/\1/p' "$CUSTOM_STAMP" | head -n1)"
   if [ "$CUSTOM_VER" = "$CUR_BUILD" ]; then
@@ -181,7 +189,7 @@ if [ "$NEW_CUSTOM_VER" = "$CUR_BUILD" ]; then ok "AC6d custom stamp refreshed to
 # ── AC6c (US-003): per-name fail-closed catalog-missing:<name> ─────────
 FAIL_CASES="$TMP/fail-cases"
 mkdir -p "$FAIL_CASES"
-cp "$TT_DIR/cases/tier0.jsonl" "$TT_DIR/cases/tier1.jsonl" "$TT_DIR/cases/cases.jsonl" "$TT_DIR/cases/smoke.jsonl" "$FAIL_CASES/"
+cp "$TT_DIR/cases/tier0.jsonl" "$TT_DIR/cases/tier1.jsonl" "$TT_DIR/cases/cases.jsonl" "$TT_DIR/cases/smoke.jsonl" "$TT_DIR/cases/tier2.jsonl" "$FAIL_CASES/"
 printf '%s\n' '{"id":"ac6c","workflow":"tt-nonexistent","harness":"pi"}' >> "$FAIL_CASES/tier1.jsonl"
 FAILCLOSED_HOME="$TMP/failclosed-var"
 mkdir -p "$FAILCLOSED_HOME"
@@ -196,6 +204,85 @@ if echo "$FAILCLOSED_OUT" | grep -q "REASON: catalog-missing: tt-nonexistent"; t
 else
   fail "AC6c missing REASON: catalog-missing: tt-nonexistent"
   echo "$FAILCLOSED_OUT" | tail -5
+fi
+
+# ── S30 US-008: fail-closed workflow-spec preflight check (--verify) ──
+# AC6e (green): after the full install, tt-verdict-trap is present and
+# `--verify tt-verdict-trap` exits 0 (the successful install corridor).
+VERIFY_GREEN="$(TT_VAR="$TT_VAR" "$HELPER" --verify tt-verdict-trap 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ]; then
+  ok "AC6e --verify tt-verdict-trap exits 0 (installed catalog corridor)"
+else
+  fail "AC6e --verify tt-verdict-trap rc=$rc: $VERIFY_GREEN"
+fi
+# AC6e also verifies a bundled workflow present in the same catalog.
+if TT_VAR="$TT_VAR" "$HELPER" --verify bug-fix-merge-worktree >/dev/null 2>&1; then
+  ok "AC6e --verify bug-fix-merge-worktree exits 0 (bundled catalog corridor)"
+else
+  fail "AC6e --verify bug-fix-merge-worktree should exit 0"
+fi
+
+# AC6f (red-arm): a workflow absent from the installed catalog refuses with
+# the DISTINCT machine-parseable reason workflow-spec-missing:<name> — the
+# W4.14 defect class, caught at PREFLIGHT instead of launch.
+VERIFY_RED="$(TT_VAR="$TT_VAR" "$HELPER" --verify tt-absent-workflow 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ]; then
+  ok "AC6f --verify tt-absent-workflow exits non-zero (rc=$rc)"
+else
+  fail "AC6f --verify tt-absent-workflow should exit non-zero"
+fi
+if echo "$VERIFY_RED" | grep -q "REASON: workflow-spec-missing: tt-absent-workflow"; then
+  ok "AC6f emits REASON: workflow-spec-missing: tt-absent-workflow"
+else
+  fail "AC6f missing REASON: workflow-spec-missing: tt-absent-workflow"
+  echo "$VERIFY_RED" | tail -3
+fi
+
+# AC6g (red-arm, exact launch line): reproduce the W4.14 campaign line —
+# `No workflow.yml found in .../workflows/tt-verdict-trap. Expected a
+# workflow specification file.` — by running the product's workflow-spec load
+# against a contained home whose catalog LACKS tt-verdict-trap (the pre-fix
+# shape: the workflow was never installed, so the launch hit
+# workflow-spec-missing). The contained home's real catalog is backed up and
+# restored so the AC6f/AC6e state is not disturbed.
+SPECDIR="$TMP/spec-missing-var"
+mkdir -p "$SPECDIR"
+TT_VAR="$SPECDIR" "$HELPER" >/dev/null 2>&1  # full install into a FRESH home (includes tt-verdict-trap)
+# Simulate the pre-fix catalog: remove the tt-verdict-trap spec from the
+# installed catalog (as if tier2.jsonl had never been enumerated).
+rm -rf "$SPECDIR/home/.tamandua/workflows/tt-verdict-trap"
+SPEC_LOAD_OUT="$(
+  node -e "
+    const fs = require('fs');
+    const dir = process.argv[1];
+    const yml = dir + '/workflow.yml';
+    try {
+      fs.readFileSync(yml, 'utf8');
+      process.stdout.write('LOADED');
+    } catch (err) {
+      if (err.code === 'ENOENT') {
+        process.stdout.write('No workflow.yml found in ' + dir + '. Expected a workflow specification file.');
+      } else { throw err; }
+    }
+  " "$SPECDIR/home/.tamandua/workflows/tt-verdict-trap"
+)"
+if echo "$SPEC_LOAD_OUT" | grep -Fq "No workflow.yml found in $SPECDIR/home/.tamandua/workflows/tt-verdict-trap. Expected a workflow specification file."; then
+  ok "AC6g reproduces the exact W4.14 line (No workflow.yml found in .../tt-verdict-trap)"
+else
+  fail "AC6g exact line mismatch: $SPEC_LOAD_OUT"
+fi
+# GREEN: after the fix, the SAME load path succeeds against a full install
+# (tt-verdict-trap present) — no workflow-spec-missing.
+FULL_SPEC_LOAD="$(TT_VAR="$TT_VAR" node -e "
+  const fs = require('fs');
+  const dir = process.argv[1];
+  try { fs.readFileSync(dir + '/workflow.yml', 'utf8'); process.stdout.write('LOADED'); }
+  catch (err) { process.stdout.write('ERR ' + err.code); }
+" "$TT_VAR/home/.tamandua/workflows/tt-verdict-trap")"
+if [ "$FULL_SPEC_LOAD" = "LOADED" ]; then
+  ok "AC6g GREEN: tt-verdict-trap spec loads after the full install (no workflow-spec-missing)"
+else
+  fail "AC6g GREEN: tt-verdict-trap spec should load after install, got: $FULL_SPEC_LOAD"
 fi
 
 # ── AC5: helper never started/bound a daemon — assert no new listener is

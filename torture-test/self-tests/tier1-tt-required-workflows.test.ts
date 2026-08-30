@@ -5,12 +5,14 @@ import { cpSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } fro
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
-// ── tt-required-workflows enumeration helper (E2.6 US-002, E3.D S11) ─────
+// ── tt-required-workflows enumeration helper (E2.6 US-002, E3.D S11, S30) ─
 //
-// Pins the US-002 + US-007 acceptance criteria for the manifest-driven
-// TT-custom workflow enumeration seam:
-//   1. helper exists and lists exactly {tt-docs-drift, tt-shim-probe} for the
-//      current tier manifests (deterministic sorted output)
+// Pins the US-002 + US-007 + US-008 (S30) acceptance criteria for the
+// manifest-driven TT-custom workflow enumeration seam:
+//   1. helper exists and lists exactly {tt-docs-drift, tt-shim-probe,
+//      tt-verdict-trap} for the current tier manifests (deterministic sorted
+//      output) — S30 US-008 adds tier2.jsonl to the manifest set, so the
+//      tier2-referenced tt-verdict-trap custom workflow is enumerated
 //   2. helper excludes bundled workflow ids AND never emits the literal
 //      `local` name
 //   3. sentinel mapping (US-007): a REAL (pi/hermes) case whose workflow is
@@ -66,7 +68,8 @@ function runHelper(envOverrides: Record<string, string> = {}) {
 
 function makeTempCasesDir(): string {
   const dir = mkdtempSync(join(tmpdir(), "tt-required-workflows.cases."));
-  for (const name of ["tier0.jsonl", "tier1.jsonl", "cases.jsonl", "smoke.jsonl"]) {
+  // S30 US-008: tier2.jsonl is part of the required manifest set.
+  for (const name of ["tier0.jsonl", "tier1.jsonl", "cases.jsonl", "smoke.jsonl", "tier2.jsonl"]) {
     cpSync(join(casesDir, name), join(dir, name));
   }
   return dir;
@@ -81,11 +84,13 @@ describe("tt-required-workflows enumeration helper", () => {
     assert.equal(r.status, 0, "helper must be executable");
   });
 
-  it("lists exactly {tt-docs-drift, tt-shim-probe} for the current tier manifests", () => {
+  it("lists exactly {tt-docs-drift, tt-shim-probe, tt-verdict-trap} for the current tier manifests (S30: tier2.jsonl enumerated)", () => {
     const result = runHelper();
     assert.equal(result.status, 0, `stderr:\n${result.stderr}`);
     const lines = result.stdout.trim().split(/\r?\n/).filter((line) => line !== "");
-    assert.deepEqual(lines, ["tt-docs-drift", "tt-shim-probe"]);
+    // S30 US-008: tier2.jsonl is in the manifest set, so the tier2 case
+    // W4.14's tt-verdict-trap custom workflow must be in the required set.
+    assert.deepEqual(lines, ["tt-docs-drift", "tt-shim-probe", "tt-verdict-trap"]);
   });
 
   it("produces deterministic sorted output across repeated runs", () => {
@@ -113,7 +118,7 @@ describe("tt-required-workflows enumeration helper", () => {
   it("US-007 sentinel mapping: a real pi case whose workflow is 'local' emits tt-docs-drift", () => {
     const dir = mkdtempSync(join(tmpdir(), "tt-required-workflows.sentinel."));
     try {
-      for (const name of ["tier0.jsonl", "tier1.jsonl", "cases.jsonl", "smoke.jsonl"]) {
+      for (const name of ["tier0.jsonl", "tier1.jsonl", "cases.jsonl", "smoke.jsonl", "tier2.jsonl"]) {
         writeFileSync(join(dir, name), "", "utf8");
       }
       writeFileSync(
@@ -134,7 +139,7 @@ describe("tt-required-workflows enumeration helper", () => {
   it("US-007 sentinel mapping is fail-closed for scripted cases: harness 'local' never surfaces", () => {
     const dir = mkdtempSync(join(tmpdir(), "tt-required-workflows.scripted."));
     try {
-      for (const name of ["tier0.jsonl", "tier1.jsonl", "cases.jsonl", "smoke.jsonl"]) {
+      for (const name of ["tier0.jsonl", "tier1.jsonl", "cases.jsonl", "smoke.jsonl", "tier2.jsonl"]) {
         writeFileSync(join(dir, name), "", "utf8");
       }
       // Scripted cases use harness `local` + workflow `local` (e.g.

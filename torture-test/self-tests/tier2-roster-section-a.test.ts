@@ -466,16 +466,16 @@ describe("Tier-2 US-004..US-014 — section-A + B/G + C1 + C2 + D + E + F + H + 
       assert.equal(record.chaos.type, "kill-harness", `${id} must carry a kill-harness chaos block`);
       assert.equal(record.chaos.target, "harness_process", `${id} kill-harness targets harness_process`);
       assert.equal(record.chaos.signal, "SIGKILL", `${id} kill-harness declares SIGKILL`);
-      assert.equal(record.chaos.trigger, "step:developer:running",
-        `${id} kill-harness arms mid-implement (step:developer:running)`);
+      assert.equal(record.chaos.trigger, "step:fixer:running",
+        `${id} kill-harness arms mid-fix (the bfmw coding step — S29 calibration US-003: step:developer:running is not bfmw vocabulary, so the US-003 preflight would reject it)`);
       assert.equal(record.chaos.operator, "tt-chaos", `${id} chaos operator must be tt-chaos`);
     }
     const w410Kill = records.find((item) => item.id === "W4.10-kill-daemon");
     assert.equal(w410Kill.chaos.type, "kill-daemon", "W4.10-kill-daemon must carry a kill-daemon chaos block");
     assert.equal(w410Kill.chaos.target, "daemon_process", "W4.10-kill-daemon targets daemon_process");
     assert.equal(w410Kill.chaos.signal, "SIGKILL", "W4.10-kill-daemon declares SIGKILL");
-    assert.equal(w410Kill.chaos.trigger, "step:developer:running",
-      "W4.10-kill-daemon kills the daemon mid-implement (harness left alive)");
+    assert.equal(w410Kill.chaos.trigger, "step:fixer:running",
+      "W4.10-kill-daemon kills the daemon mid-fix (harness left alive; S29 calibration US-003 — step:developer:running is not bfmw vocabulary)");
     assert.equal(w410Kill.chaos.operator, "tt-chaos", "W4.10-kill-daemon chaos operator must be tt-chaos");
     // W4.10-restart-recovery carries the typed restart_daemon probe action on
     // EVERY run group (the daemon-level multi-run contract, W3.22 shape) with
@@ -486,7 +486,8 @@ describe("Tier-2 US-004..US-014 — section-A + B/G + C1 + C2 + D + E + F + H + 
     for (const group of w410Restart.probe_sequence) {
       const restart = group.actions.find((action: any) => action.op === "restart_daemon");
       assert.ok(restart, "W4.10-restart-recovery: every run group must declare restart_daemon");
-      assert.equal(restart.when, "step:developer:running", "restart arms mid-implement");
+      assert.equal(restart.when, "step:fixer:running",
+        "restart arms mid-fix (the bfmw coding step — S29 calibration, US-002: step:developer:running is not bfmw vocabulary)");
       assert.equal(restart.expect?.recovery_within_dispatch_intervals, 2,
         "W4.10-restart-recovery expects recovery within 2 dispatch intervals");
       assert.equal(restart.expect?.token_flush_preserved, true, "token flush must be preserved");
@@ -500,6 +501,11 @@ describe("Tier-2 US-004..US-014 — section-A + B/G + C1 + C2 + D + E + F + H + 
     // their base rows' chaos:null where the base corridor is a machinery
     // delta (W4.dsh-fdmw's colleague-commit; W4.dsh-do-now's reset-hook
     // planted diagnostics; W4.dsh-lifecycle's operator restart seam).
+    // EXCEPTION (US-004 S29 premise redesign): W4.33d and W4.48b now carry
+    // the TYPED move-branch chaos block — the colleague target-move the
+    // controller genuinely executes, making event:run.failed /
+    // event:merge.target_moved reachable (previously chaos:null, so the
+    // premise events never fired — the S29 probe-trigger-unreached defect).
     for (const id of [
       "W4.03-red-adjacent-commit",
       "W4.04a-mechanical-override",
@@ -507,14 +513,30 @@ describe("Tier-2 US-004..US-014 — section-A + B/G + C1 + C2 + D + E + F + H + 
       "W4.07-conflicting-colleague-commit",
       "W4.08-no-relaunch",
       "W4.08-control",
-      "W4.33d-reroute-exhaustion-resume",
-      "W4.48b-pause-rugpull-window",
       "W4.dsh-do-now",
       "W4.dsh-fdmw",
       "W4.dsh-lifecycle",
     ]) {
       const record = records.find((item) => item.id === id);
       assert.equal(record.chaos, null, `${id}: chaos must be null (injection is a documented machinery delta)`);
+    }
+    for (const id of ["W4.33d-reroute-exhaustion-resume", "W4.48b-pause-rugpull-window"]) {
+      const rec = records.find((item) => item.id === id);
+      assert.ok(rec, `${id}: must exist in tier2.jsonl`);
+      assert.ok(rec.chaos && typeof rec.chaos === "object",
+        `${id}: the US-004 premise redesign must wire a typed chaos block (the colleague target-move is now executed, not a machinery delta)`);
+      assert.equal(rec.chaos.type, "move-branch", `${id}: typed injection must be move-branch`);
+      assert.equal(rec.chaos.target, "origin_target_ref", `${id}: move-branch targets the origin target ref`);
+      // The target ref is the branch the bfmw merger actually merges into:
+      // for seeded tt-ts cells that is the SEEDED branch (seed/BUG-T4 for
+      // W4.33d's BUG-T4 seed, seed/BUG-T2 for W4.48b's BUG-T2) — NOT main.
+      const expectedRef = id === "W4.33d-reroute-exhaustion-resume"
+        ? "refs/heads/seed/BUG-T4"
+        : "refs/heads/seed/BUG-T2";
+      assert.equal(rec.chaos.ref, expectedRef, `${id}: target ref must be ${expectedRef} (the merger's merge target)`);
+      assert.equal(rec.chaos.trigger, "step:finalize_merge:running", `${id}: wave-4 arming on the finalize step`);
+      assert.ok(rec.chaos.repeat > 1 && rec.chaos.interval_s > 0 && rec.chaos.wait_timeout_s > 0,
+        `${id}: the persistent-move budget + interval + wait bound must be declared`);
     }
     // W4.dsh-lifecycle carries the W4.33a-shaped pause_drain + resume probe
     // (operator restart seam during the hold; O16 judges run_completes).
@@ -523,8 +545,8 @@ describe("Tier-2 US-004..US-014 — section-A + B/G + C1 + C2 + D + E + F + H + 
       "W4.dsh-lifecycle must carry a single-run probe_sequence");
     const lifecycleOps = dshLifecycle.probe_sequence[0].actions.map((action: any) => action.op);
     assert.deepEqual(lifecycleOps, ["pause_drain", "resume"], "W4.dsh-lifecycle probe ops must be pause_drain then resume");
-    assert.equal(dshLifecycle.probe_sequence[0].actions[0].when, "step:developer:running",
-      "W4.dsh-lifecycle pause_drain arms at step:developer:running (the W4.33a shape)");
+    assert.equal(dshLifecycle.probe_sequence[0].actions[0].when, "step:fixer:running",
+      "W4.dsh-lifecycle pause_drain arms at step:fixer:running (the W4.33a shape — S29 calibration US-003: step:developer:running is not bfmw vocabulary, the US-003 preflight would reject it)");
     assert.equal(dshLifecycle.probe_sequence[0].actions[1].expect?.run_completes, true,
       "W4.dsh-lifecycle resume expects run_completes (O16)");
     assert.ok(dshLifecycle.oracles.includes("O16"), "W4.dsh-lifecycle must declare O16");

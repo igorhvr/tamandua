@@ -56,10 +56,15 @@ function runValidate(manifestPath: string): { status: number; stdout: string; st
 
 // Build a single-case manifest under a temp dir inside torture-test/var (the
 // controller refuses manifests that escape torture-test/). The base case is a
-// copy of the first tier1 record; field overrides are applied on top.
+// copy of the first tier1 record; field overrides are applied on top. The
+// workflow is pinned to feature-dev-merge-worktree (the W3.x probe markers
+// the suite exercises — step:developer:running / step:implement:running /
+// step:finalize_merge:running — are fdmw vocabulary; US-003's fail-closed
+// trigger-vocabulary preflight rejects them on any other workflow).
 function buildCaseManifest(overrides: Record<string, unknown>): string {
   const dir = fs.mkdtempSync(path.join(ttRoot, "var", "probe-seq-schema-"));
   const base = JSON.parse(fs.readFileSync(path.join(ttRoot, "cases", "tier1.jsonl"), "utf8").split(/\r?\n/).filter((l) => l.trim() !== "")[0]);
+  base.workflow = "feature-dev-merge-worktree";
   Object.assign(base, overrides);
   const manifest = path.join(dir, "case.jsonl");
   fs.writeFileSync(manifest, `${JSON.stringify(base)}\n`);
@@ -195,13 +200,13 @@ describe("E3.C US-001 — probe_sequence + typed chaos schema contract", () => {
       "O11 declaration-only arm must require exactly synthetic_token_ledger");
     assert.deepEqual(
       block.properties.type.enum,
-      ["sigstop_sigcont", "kill-harness", "kill-daemon", "delete-tstx-row"],
-      "chaos type must be the four-action enum (sigstop + US-003 kill/delete)",
+      ["sigstop_sigcont", "kill-harness", "kill-daemon", "delete-tstx-row", "move-branch"],
+      "chaos type must be the action enum (sigstop + US-003 kill/delete + US-004 move-branch)",
     );
     assert.deepEqual(
       block.properties.target.enum,
-      ["harness_process", "daemon_process", "tstx_row"],
-      "chaos target must be the per-type target enum",
+      ["harness_process", "daemon_process", "tstx_row", "origin_target_ref"],
+      "chaos target must be the per-type target enum (incl. the US-004 origin target ref)",
     );
     assert.equal(block.properties.trigger.type, "string", "chaos trigger must be a string");
     assert.equal(block.properties.hold_seconds.type, "number", "chaos hold_seconds must be typed number");

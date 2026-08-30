@@ -247,6 +247,16 @@ const ALLOWLIST: Record<string, AllowEntry> = {
     requiredMarker: "MACP3 US-003",
     reason: "US-003: /proc references carry MACP3 US-003 markers; documented linux-only and unreachable-as-runtime on Darwin.",
   },
+  "self-tests/tier2-s28-exit-null-chaos.test.ts": {
+    category: "us003-runtime-guarded",
+    requiredMarker: "MACP3 US-003",
+    reason: "US-003: the /proc/<pid>/cmdline red-arm read carries a MACP3 US-003 marker and is skipped (assertion degraded) on /proc-less hosts — the SIGKILL/message chain assertions are platform-independent.",
+  },
+  "self-tests/tier2-s28-guard-miss-kill-daemon.test.ts": {
+    category: "us003-runtime-guarded",
+    requiredMarker: "MACP3 US-003",
+    reason: "US-006: the /proc/<pid>/cwd + cmdline red-arm read (pre-fix provenance criterion reproduction) carries a MACP3 US-003 marker and is skipped on /proc-less hosts — the fixed kill-daemon corridor and fail-closed refusals are platform-independent.",
+  },
 
   // ── US-004 test-harness files, fully guarded (requiredMarker verified) ─
   "bin/tt-chaos.test.sh": {

@@ -98,6 +98,12 @@ case "$name" in
     ;;
   tt-catalog-install)
     [ "$mode" = "fail-catalog" ] && { printf 'REASON: catalog-missing\n' >&2; exit 1; }
+    # S30 US-008: the workflow-spec preflight leg invokes the catalog helper
+    # with --verify <workflow>...; a fail-workflow-spec mode mimics the real
+    # refusal (workflow-spec-missing: <workflow>) so the wiring is pinned.
+    if [ "${1:-}" = "--verify" ]; then
+      [ "$mode" = "fail-workflow-spec" ] && { printf 'REASON: workflow-spec-missing: %s\n' "${2:-tt-shim-probe}" >&2; exit 1; }
+    fi
     ;;
   tt-daemon-up)
     [ "$mode" = "fail-daemon" ] && { printf 'REASON: tt-daemon-down\n' >&2; exit 1; }
@@ -238,15 +244,19 @@ ac1pi_pf="$(state_pf "$CONTROLLER_CAMPAIGN")"
 printf '%s' "$ac1pi_pf" | grep -q '"ok":true' || fail "AC1 pi preflight not ok: $ac1pi_pf"
 printf '%s' "$ac1pi_pf" | grep -q '"leg":"harness-auth"' || fail "AC1 pi preflight missing harness-auth leg: $ac1pi_pf"
 legs="$(grep '^CALL ' "$PFLOG" | sed -n 's/^CALL \([^ ]*\) .*/\1/p')"
-[ "$(printf '%s\n' "$legs" | grep -c .)" -eq 5 ] || fail "AC1 pi expected 5 preflight calls, got: $(cat "$PFLOG")"
+[ "$(printf '%s\n' "$legs" | grep -c .)" -eq 6 ] || fail "AC1 pi expected 6 preflight calls, got: $(cat "$PFLOG")"
 [ "$(printf '%s\n' "$legs" | sed -n 1p)" = "tt-provision-home" ] || fail "AC1 pi leg1 not home-provision: $(cat "$PFLOG")"
 [ "$(printf '%s\n' "$legs" | sed -n 2p)" = "tt-harness-auth-probe" ] || fail "AC1 pi leg2 not harness-auth: $(cat "$PFLOG")"
 [ "$(printf '%s\n' "$legs" | sed -n 3p)" = "tt-catalog-install" ] || fail "AC1 pi leg3 not catalog-install: $(cat "$PFLOG")"
-[ "$(printf '%s\n' "$legs" | sed -n 4p)" = "tt-daemon-up" ] || fail "AC1 pi leg4 not daemon-up: $(cat "$PFLOG")"
-[ "$(printf '%s\n' "$legs" | sed -n 5p)" = "tt-daemon-up" ] || fail "AC1 pi leg5 (teardown) not daemon-up stop: $(cat "$PFLOG")"
+# S30 US-008: the workflow-spec leg reuses the catalog-install helper with
+# --verify <workflow>... and must sit BETWEEN catalog-install and daemon-up.
+[ "$(printf '%s\n' "$legs" | sed -n 4p)" = "tt-catalog-install" ] || fail "AC1 pi leg4 not workflow-spec (catalog-install --verify): $(cat "$PFLOG")"
+grep -q '^CALL tt-catalog-install args=--verify tt-shim-probe' "$PFLOG" || fail "AC1 pi workflow-spec leg did not verify tt-shim-probe: $(cat "$PFLOG")"
+[ "$(printf '%s\n' "$legs" | sed -n 5p)" = "tt-daemon-up" ] || fail "AC1 pi leg5 not daemon-up: $(cat "$PFLOG")"
+[ "$(printf '%s\n' "$legs" | sed -n 6p)" = "tt-daemon-up" ] || fail "AC1 pi leg6 (teardown) not daemon-up stop: $(cat "$PFLOG")"
 grep -q '^CALL tt-harness-auth-probe args=pi ' "$PFLOG" || fail "AC1 pi did not probe pi harness: $(cat "$PFLOG")"
 grep -q '^CALL tt-daemon-up args=ensure-up --fresh' "$PFLOG" || fail "AC1 pi daemon-up did not thread ensure-up --fresh (fresh campaign): $(cat "$PFLOG")"
-pass "AC1 (pi): real pi selection runs provision->harness-auth->catalog->daemon-up before cases"
+pass "AC1 (pi): real pi selection runs provision->harness-auth->catalog->workflow-spec->daemon-up before cases"
 
 # ══ AC2 (auth): failing harness-auth leg -> harness-auth-missing: pi.
 run_controller "fail-auth" TT_CONTROLLER_DAEMON_CONTROL_PATH="$TEST_ROOT/missing-daemon-control" -- --manifest "$PI_MANIFEST"
@@ -257,6 +267,28 @@ ac2a_pf="$(state_pf "$CONTROLLER_CAMPAIGN")"
 printf '%s' "$ac2a_pf" | grep -q '"reason":"harness-auth-missing: pi"' || fail "AC2 auth reason not harness-auth-missing: pi: $ac2a_pf"
 printf '%s' "$ac2a_pf" | grep -q '"stop_ok":true' || fail "AC2 auth daemon teardown did not run on preflight failure: $ac2a_pf"
 pass "AC2: harness-auth-missing: pi leg aborts non-zero and records the DISTINCT reason"
+
+# ══ AC2d (S30 US-008): failing workflow-spec leg -> workflow-spec-missing: <wf>.
+# The real-case preflight's workflow-spec leg (catalog-install --verify
+# <workflow>...) fails closed with the DISTINCT machine-parseable reason
+# `workflow-spec-missing: <workflow>` BEFORE any launch when a selected case's
+# declared workflow is absent from the installed catalog — the W4.14 defect
+# class (`No workflow.yml found in .../workflows/<workflow>` at launch) is
+# caught at preflight, never at launch.
+# Remove the AC1 (pi) execution marker first — the earlier AC1(pi) stub
+# scenario completed its scripted case, so the refusal must be proven against
+# a FRESH marker state (the workflow-spec preflight must abort BEFORE any case
+# execution creates a NEW marker).
+rm -f "$TEST_ROOT/command-ran-pi-scripted"
+run_controller "fail-workflow-spec" TT_CONTROLLER_DAEMON_CONTROL_PATH="$TEST_ROOT/missing-daemon-control" -- --manifest "$PI_MANIFEST"
+printf '%s' "$CONTROLLER_OUTPUT" | grep -Fq 'workflow-spec-missing: tt-shim-probe'   || fail "AC2d workflow-spec failure did not surface workflow-spec-missing: tt-shim-probe: $CONTROLLER_OUTPUT"
+[ "$CONTROLLER_STATUS" -ne 0 ] || fail "AC2d workflow-spec failure did not abort (exit 0)"
+ac2d_pf="$(state_pf "$CONTROLLER_CAMPAIGN")"
+printf '%s' "$ac2d_pf" | grep -q '"reason":"workflow-spec-missing: tt-shim-probe"'   || fail "AC2d workflow-spec reason not workflow-spec-missing: tt-shim-probe: $ac2d_pf"
+printf '%s' "$ac2d_pf" | grep -q '"leg":"workflow-spec"'   || fail "AC2d failing leg not workflow-spec: $ac2d_pf"
+printf '%s' "$ac2d_pf" | grep -q '"stop_ok":true'   || fail "AC2d daemon teardown did not run on workflow-spec refusal: $ac2d_pf"
+[ ! -f "$TEST_ROOT/command-ran-pi-scripted" ]   || fail "AC2d workflow-spec refusal must happen BEFORE any case execution: $(cat "$PFLOG")"
+pass "AC2d: workflow-spec-missing: tt-shim-probe leg aborts non-zero and records the DISTINCT reason (before any launch)"
 
 # ══ AC4: scripted-only selection never engages the preflight / daemon.
 use_stubs
