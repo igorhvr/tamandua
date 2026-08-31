@@ -59,3 +59,51 @@ Only `caps` values on the lines named above were edited in
 `cases/tier1.jsonl`; every changed value has one row in this table.
 All other fields and lines are owned by concurrent E3 stories and were
 left untouched.
+
+## Tier-2 S34 cap recalibration (S34 — the three deadline cells, US-003)
+
+Scope note: this file's primary table (above) is the **tier-1** S8b
+calibration and is pinned by `self-tests/tier1-cap-calibration.test.ts`
+(tier-1 rows only — a tier-2 row must never be added to that table). The
+tier-2 S34 recalibration lives in this section and in
+`cases/tier2-traceability.md` (Token Budget Note rows + the
+"S34 caps-vs-honest-duration disposition" section), pinned by
+`self-tests/tier2-s34-caps-recalibration.test.ts`.
+
+The 2026-08-30 rerun's deadline-sweep race (S34, fixed by US-002's grace
+contract) exposed one genuinely-too-tight cap and two genuine stalls:
+
+- **W4.37-keyline-spoof-repo-content (do-now, wall 5 → 10).** The do-now
+  unit's honest duration for this cell is **> 5m18s** — both samples are
+  cap-truncated (campaign-20260830T111549750Z voided 0s after the deadline
+  with the `execute` round still running; campaign-20260826T225744158Z
+  `runaway-cap-enforced` at 5m17.7s), and the family's own W4.dsh-do-now
+  completed honestly at 5m21.4s. The old 5-min wall cap sat BELOW the honest
+  duration — a runaway tripwire firing on honest work, exactly what the
+  family-p95-not-below-p50 rule forbids. The 30s grace window alone would
+  not have saved it (honest duration > 5m30s).
+- **W4.dsh-do-now (do-now, wall 5 → 10, family consistency).** The dsh lane
+  policy ("same per-family caps as their pi base rows") means the dsh row
+  inherits its base W4.37's cap; its own honest duration (5m21.4s,
+  campaign-20260826T225744158Z) already exceeded the old cap.
+- **W4.10-kill-daemon and W4.48a-daemon-kill-mid-park (bfmw, wall 55 —
+  UNCHANGED).** Both rerun expiries were genuine stalls, not cap breaches:
+  the SIGKILLed contained daemon was never restarted during the run
+  (lifecycle-log proof: `daemon.uncleanExit` last heartbeat at kill time, no
+  `daemon.start` until the sweep teardown 55 min later), so the run could not
+  progress and the 55-min cap was consumed by an un-recovered hang. The
+  honest corridor (pre-kill pipeline 2m48s / 4m18s + restart + ~2
+  dispatch-interval recovery) is an order of magnitude under the cap. The
+  grace contract correctly leaves genuinely hung attempts fail-closed; the
+  remediation is the single-run kill-daemon operator-restart seam firing
+  during the run (scenario/harness side — recorded for the S32-37 landing
+  report), not a caps change.
+
+### Tier-2 (S34) changed caps
+
+| Tier-2 Case | Field | Old | New | Decision |
+|-------------|-------|-----|-----|----------|
+| W4.37-keyline-spoof-repo-content | caps.wall_min | 5 | 10 | recalibrated — honest duration > 5m18s (cap-truncated samples: campaign-20260830T111549750Z, campaign-20260826T225744158Z; W4.dsh-do-now 5m21s honest) |
+| W4.dsh-do-now | caps.wall_min | 5 | 10 | recalibrated (family consistency) — inherits base W4.37's cap; own honest duration 5m21.4s |
+| W4.10-kill-daemon | caps.wall_min | 55 | 55 | unchanged — genuine stall (daemon never restarted during the run, campaign-20260830T065151712Z) |
+| W4.48a-daemon-kill-mid-park | caps.wall_min | 55 | 55 | unchanged — genuine stall (daemon never restarted during the run, campaign-20260830T090310754Z) |

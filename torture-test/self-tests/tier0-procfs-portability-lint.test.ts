@@ -257,6 +257,11 @@ const ALLOWLIST: Record<string, AllowEntry> = {
     requiredMarker: "MACP3 US-003",
     reason: "US-006: the /proc/<pid>/cwd + cmdline red-arm read (pre-fix provenance criterion reproduction) carries a MACP3 US-003 marker and is skipped on /proc-less hosts — the fixed kill-daemon corridor and fail-closed refusals are platform-independent.",
   },
+  "self-tests/tier2-s33-pi-worker-identity.test.ts": {
+    category: "us003-runtime-guarded",
+    requiredMarker: "MACP3 US-003",
+    reason: "S33 US-004: every /proc read (the pre-fix provenance criterion red-arm and the parent-chain / open-fd proof setup assertions) carries a MACP3 US-003 marker; the proof arms are skipped (pass-by-note) on /proc-less hosts and the steps-claim-row arm covers the chain on every host.",
+  },
 
   // ── US-004 test-harness files, fully guarded (requiredMarker verified) ─
   "bin/tt-chaos.test.sh": {
@@ -383,6 +388,11 @@ const ALLOWLIST: Record<string, AllowEntry> = {
     category: "documentation",
     reason:
       "MACP5.1 task description doc — its '/proc' occurrences (the defect narrative naming the unguarded /proc read among the banned constructs the red arms synthesize) are prose in the task narrative; the doc performs no runtime procfs access.",
+  },
+  "impl-tasks/S32-37-rerun-residue.md": {
+    category: "documentation",
+    reason:
+      "S32-37 re-run residue task description doc — its '/proc' occurrences (the S33 US-004 narrative naming the open-fd proof '/proc/<pid>/fd' and the banned '/proc cwd/cmdline sweep' resolution) are prose in the task narrative; the doc performs no runtime procfs access.",
   },
   "impl-tasks/MACP6-portable-shim-node-resolution.md": {
     category: "documentation",

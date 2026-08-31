@@ -516,7 +516,7 @@ Every row carries `spec_ref` into `08-wave-4-fault-injection.md` §G.
 | W4.33a-daemon-restart-resume | `#W4.33` | tt-ts | BUG-T3 | pi | bug-fix-merge-worktree | real | pause_drain at `step:fixer:running` (hold 600; S29 calibration US-002 — the bfmw coding step, agent `fixer`) → OPERATOR restarts the contained daemon during the hold (single-run `restart_daemon` op is multi-run-only — operator seam, see below) → resume | paused run continues cleanly after the daemon restart; pause state survives (DB-durable), O16 `run_completes`; EXCLUSIVE WINDOW (daemon-lifecycle) |
 | W4.33b-update-under-it-resume | `#W4.33` | tt-ts | BUG-T1 | pi | bug-fix-merge-worktree | real | pause at `step:fixer:running` (hold 600; S29 calibration US-002) → OPERATOR runs `tamandua update --force` under the paused run → resume | defined YAML-version behavior surfaced not silent; resumed run completes with truthful annotation chain; O16 `no_rounds_during_hold` + `run_completes` |
 | W4.33c-deleted-worktree-refusal | `#W4.33` | tt-ts | BUG-T2 | pi | bug-fix-merge-worktree | real | operator deletes the run worktree out-of-band mid-run (W4.13 composition; no typed probe op) → operator `workflow resume` | diagnosable refusal, NEVER a silent fallback into the wrong directory (DC25 contamination fossil); `run_worktrees` reflects reality; no O16 (resume-refusal would trip the hardcoded resume-completes leg) |
-| W4.33d-reroute-exhaustion-resume | `#W4.33` | tt-ts | BUG-T4 | pi | bug-fix-merge-worktree | real | persistent target-move (tt-chaos `colleague-commit`/`move-branch`, untyped) exhausts finalize `max_reroutes: 8` → run permanently fails → operator removes the condition → probe `resume` armed on `event:run.failed` | resume picks up from the failed step with context intact (AGENTS.md documented path); run completes; O16 `run_completes` |
+| W4.33d-reroute-exhaustion-resume | `#W4.33` | tt-ts | BUG-T4 | pi | bug-fix-merge-worktree | real | TYPED `move-branch` chaos (US-004) in per-attempt RE-ARM mode (US-007 S36: `rearm: true, rearm_hold_s: 3` — each fresh `step:finalize_merge:running` occurrence triggers the next move) exhausts finalize `max_reroutes: 8` → run permanently fails → operator removes the condition (chaos loop's run-terminal stand-down) → probe `resume` armed on `event:run.failed` | resume picks up from the failed step with context intact (AGENTS.md documented path); run completes; O16 `run_completes` |
 | W4.48a-daemon-kill-mid-park | `#W4.48` | tt-ts | BUG-T1 | pi | bug-fix-merge-worktree | real | TYPED chaos `kill-daemon` SIGKILL at `step:finalize_merge:running` (park-event approximation — no product `merge.park*` event, see below) → operator restarts daemon | PARK crash-safety: landing completes from the parked state OR park branch survives intact for manual landing; NEVER a lost diff / half-applied target; EXCLUSIVE WINDOW (daemon-lifecycle) |
 | W4.48b-pause-rugpull-window | `#W4.48` | tt-ts | BUG-T2 | pi | bug-fix-merge-worktree | real | target move during finalize (untyped) + probe `pause` armed on `event:merge.target_moved` (hold 600) → resume; characterization (one-of-two) | EXACTLY one of {relaunch, paused-no-relaunch}; NEVER a relaunch that starts paused-orphaned; NEVER double relaunch on resume; no O16 (resume-completes leg hardcodes the single-run corridor) |
 | W4.48c-compound-gate-degradation | `#W4.48` | tt-poly | POLY-BUG-T1 | pi | bug-fix-merge-worktree | real | W4.05's slow suite (`arm-slow` seam — delta) + colleague target commit (untyped) + TYPED `delete-tstx-row` at `step:finalize_merge:pending` under a 40-min drain hold | terminal + truthful: correct annotation chain (`landed_without_suite_evidence` if conceded; `MERGED_TREE != TESTED_TREE` fail-loud if moved); the three valves must NOT compose into a silent green; EXCLUSIVE WINDOW (drain-armed deletion corridor) |
@@ -936,7 +936,7 @@ the pi-family p95 (the honest calibration floor for the same workflows):
 
 | Case | caps.tokens | caps.wall_min | Basis |
 |------|-------------|---------------|-------|
-| W4.dsh-do-now | 200,000 | 5 | dsh do-now unit = pi do-now unit (200k / wall 5); wall = do-now corridor (small) |
+| W4.dsh-do-now | 200,000 | 10 | dsh do-now unit = pi do-now unit (200k / wall); wall = do-now corridor (small); **S34 recalibration 5→10 (family consistency)** — the dsh row inherits its pi base W4.37's cap, and W4.dsh-do-now's own honest duration (5m21.4s, campaign-20260826T225744158Z, completed PRODUCT_FAIL) exceeds the old 5-min wall cap; see the S34 caps-vs-honest-duration disposition below |
 | W4.dsh-bfmw | 1,000,000 | 45 | dsh bfmw p95 = pi bfmw p95 1M; wall = bfmw p50 35 min + 10-min drain hold |
 | W4.dsh-fdmw | 2,500,000 | 138 | dsh fdmw p95 = pi fdmw p95 2.5M; wall = fdmw p50 138min floor + rebase-loopback re-test |
 | W4.dsh-lifecycle | 1,000,000 | 55 | dsh bfmw p95 1M; wall = bfmw p50 35 min + 10-min drain hold + daemon restart margin |
@@ -963,7 +963,7 @@ caps at family p95, never below family p50:
 | W4.05 | 1,000,000 | 75 | pi bfmw p95 1M; wall = bfmw p50 35 min + ~35-min armed suite |
 | W4.29 | 800,000 | 120 | security-merge family p95 ≈800k; 7-agent audit+fix+merge wall |
 | W4.36 | 0 | 20 | scripted-pi, zero tokens; wall = scripted bfmw + 10-min drain hold |
-| W4.37 | 200,000 | 5 | do-now unit (W1.L1 tier1 cell) |
+| W4.37 | 200,000 | 10 | do-now unit (W1.L1 tier1 cell); **S34 recalibration 5→10** — the do-now unit's honest duration for this cell is > 5m18s (two cap-truncated samples: campaign-20260830T111549750Z ran 5m0.278s still mid-round, campaign-20260826T225744158Z was runaway-cap-canceled at 5m17.7s), so the old 5-min wall cap sat BELOW the honest path and the deadline sweep voided an honest run; see the S34 caps-vs-honest-duration disposition below |
 
 Caps are runaway-loop tripwires, not budget devices (11-schedule-budget-abort.md);
 run-count is the budget control. Section A's real cases all carry
@@ -987,7 +987,7 @@ B+G's real cases carry caps at family p95, never below family p50 (fdmw p50
 | W4.33b | 1,000,000 | 55 | pi bfmw p95 1M; wall = bfmw p50 35 min + 10-min pause hold + update margin |
 | W4.33c | 1,000,000 | 45 | pi bfmw p95 1M; wall = bfmw p50 35 min floor (deletion shortens the run, cap stays at the honest floor) |
 | W4.33d | 1,000,000 | 75 | pi bfmw p95 1M; wall = bfmw p50 35 min + up to 8 fast reroute cycles (each minutes, not a full lifecycle) + resume completion |
-| W4.48a | 1,000,000 | 55 | pi bfmw p95 1M; wall = bfmw p50 35 min + daemon restart + park-recovery margin |
+| W4.48a | 1,000,000 | 55 | pi bfmw p95 1M; wall = bfmw p50 35 min + daemon restart + park-recovery margin; **S34: NO recalibration** — the rerun expiry (campaign-20260830T090310754Z) was a genuine stall, not a cap breach: the SIGKILLed daemon was never restarted during the run, so the 55-m cap was consumed by an un-recovered hang; see the S34 caps-vs-honest-duration disposition below |
 | W4.48b | 1,000,000 | 55 | pi bfmw p95 1M; wall = bfmw p50 35 min + 10-min pause hold + relaunch observation |
 | W4.48c | 1,000,000 | 160 | pi bfmw p95 1M; wall = bfmw p50 35 min + ~35-min armed suite + 40-min drain hold + reroute re-verify + finalize |
 
@@ -1005,7 +1005,7 @@ caps at family p95, never below family p50 (bfmw p50 35-min wall floor):
 |------|-------------|---------------|-------|
 | W4.09-pi-kill-harness | 1,000,000 | 45 | pi bfmw p95 1M; wall = bfmw p50 35 min + worker_lost re-pend margin |
 | W4.09-hermes-kill-harness | 4,000,000 | 45 | hermes bfmw p95 4M (W3.03 cell); wall = bfmw p50 35 min + worker_lost re-pend margin |
-| W4.10-kill-daemon | 1,000,000 | 55 | pi bfmw p95 1M; wall = bfmw p50 35 min + daemon restart + late-completion margin |
+| W4.10-kill-daemon | 1,000,000 | 55 | pi bfmw p95 1M; wall = bfmw p50 35 min + daemon restart + late-completion margin; **S34: NO recalibration** — the rerun expiry (campaign-20260830T065151712Z) was a genuine stall, not a cap breach: the SIGKILLed daemon was never restarted during the run, so the 55-m cap was consumed by an un-recovered hang; see the S34 caps-vs-honest-duration disposition below |
 | W4.10-restart-recovery | 2,000,000 | 75 | 2 × pi bfmw p95 1M (two concurrent lifecycles); wall = bfmw p50 35 min + daemon restart + recovery window |
 | W4.27-shim-exit-matrix | 0 | 5 | scripted local-command cell, zero tokens; wall = daemon start + 5 corridor arms (~30s) |
 | W4.32-enospc | 1,000,000 | 55 | pi bfmw p95 1M; wall = bfmw p50 35 min + SLOW loopback-fs margin (writes on the loop fs are far slower than the host fs) |
@@ -1837,33 +1837,40 @@ ran, so the premise events never fired):
 - **W4.33d** (`resume` on `event:run.failed`, expect `run_completes`): the
   manifest declares `chaos: { type: move-branch, target: origin_target_ref,
   trigger: step:finalize_merge:running, operator: tt-chaos, ref:
-  refs/heads/seed/BUG-T4, repeat: 60, interval_s: 60, wait_timeout_s: 4200 }`. The
+  refs/heads/seed/BUG-T4, repeat: 60, interval_s: 60, wait_timeout_s: 4200,
+  rearm: true, rearm_hold_s: 3 }`. The
   controller resolves the origin repo (the provisioned work clone) and spawns
   `tt-chaos move-branch`, which arms an empty-diff colleague budget on the
   target ref (the single-commit tt-ts main needs parents to walk back
-  through; the TREE never changes) and then moves the ref back one parent
-  every `interval_s` — persistent target pressure that re-routes
-  `finalize_merge` at every attempt until `max_reroutes: 8` exhausts and the
-  run permanently fails. The loop **stands down at run-terminal** (status or
-  a run.* terminal event in the append-only event stream) — the "operator
-  removes the rejection condition" protocol mechanized — so the resumed
-  finalize runs against a stable target and `run.completed` lands (O16
-  `run_completes`). The probe `when` stays `event:run.failed` (never
-  weakened). Scripted proof: `self-tests/tier2-s29-premise-redesign-corridor.test.ts`
+  through; the TREE never changes) and then — in **US-007 (S36) per-attempt
+  RE-ARM mode** — moves the ref back one parent per FRESH
+  `step:finalize_merge:running` occurrence (the step transitions
+  waiting→pending→running on every reroute cycle; the re-arm signal is the
+  run's own append-only `step.running` event stream, never a free-running
+  clock) after the `rearm_hold_s: 3` post-marker hold — persistent target
+  pressure that re-routes `finalize_merge` at EVERY attempt until
+  `max_reroutes: 8` exhausts and the run permanently fails. The loop **stands
+  down at run-terminal** (status or a run.* terminal event in the append-only
+  event stream) — the "operator removes the rejection condition" protocol
+  mechanized — so the resumed finalize runs against a stable target and
+  `run.completed` lands (O16 `run_completes`). The probe `when` stays
+  `event:run.failed` (never weakened). Scripted proof: `self-tests/tier2-s29-premise-redesign-corridor.test.ts`
   (W4.33d arm: the corridor asserts the EVIDENCE directly — the campaign
   leaves the case 'attached' because the launch hook returns at the FIRST
   terminal state (run.failed) and the probe's resume re-activates the run
   after it; completing the campaign would need the campaign-resume machinery,
   whose oracle snapshot transaction is process-scoped by design. The evidence
   — probe_evidence resume fired on event:run.failed exit 0, chaos_evidence
-  move-branch completed, the run's own stream showing merge.target_moved x8 +
-  step.rerouted x8 + run.failed + run.completed — IS the US-004 corridor
-  proof. The SCRIPTED transform isolates the S29 premise with
+  move-branch completed with rearm recorded, the run's own stream showing
+  merge.target_moved x8 + step.rerouted x8 + run.failed + run.completed — IS
+  the corridor proof. The SCRIPTED transform isolates the premise with
   `merge_gate: off` (bfmw's finalize ledger-gate refuses on missing suite
   evidence when the scripted agents never run the real suite — that refusal
-  is the W4.17-b story, not this one) and the target refs are the SEEDED
-  branches the merger actually merges into (`refs/heads/seed/BUG-T4` for
-  BUG-T4, `refs/heads/seed/BUG-T2` for BUG-T2 — NOT main).
+  is the W4.17-b story, not this one) and runs the W4.33d arm with the
+  REDESIGNED re-arm premise (`rearm: true, rearm_hold_s: 2` — the scripted
+  analogue of the real manifest), and the target refs are the SEEDED branches
+  the merger actually merges into (`refs/heads/seed/BUG-T4` for BUG-T4,
+  `refs/heads/seed/BUG-T2` for BUG-T2 — NOT main).
 - **W4.48b** (`pause` on `event:merge.target_moved`, characterization): the
   manifest declares `chaos: { type: move-branch, target: origin_target_ref,
   trigger: step:finalize_merge:running, operator: tt-chaos, ref:
@@ -1893,11 +1900,99 @@ run). The `wait_timeout_s` param fixes the latent 120s-default trigger wait
 for chaos ops armed minutes into the run (W4.33d/W4.48b triggers are
 ~35 min in).
 
+### US-007 (S36) re-arm delta — W4.33d per-attempt deterministic moves
+
+The 2026-08-30 rerun (campaign-20260830T085340743Z-cc2c9a15-caea-4803-8d24-
+62e10e2164a3) proved the US-004 W4.33d premise still does not fail a REAL
+run: the free-running cadence (moves every `interval_s: 60` on a clock gated
+ONCE at the first `step:finalize_merge:running` marker) landed exactly ONE
+move inside a finalize window (attempt 1 → reroute 1/8); moves 2-3 fell in
+the ~96s verify re-run where the empty-diff budget makes them inert; attempt
+2 landed before move 4 → `run.completed` (probe `resume` on
+`event:run.failed` never fired, waited 543720ms). Root cause: the cadence
+never RE-ARMS per finalize attempt — the machinery itself is not the defect
+(`max_reroutes: 8` never approached, `step.reroute_budget_exhausted ×0`).
+Decision (recorded in `impl-tasks/S32-37-rerun-residue.md` S36): REDESIGN,
+per-attempt deterministic moves — NOT a FINDING (the zero-token scripted
+corridor proves the vector is reachable).
+
+**Machinery (US-007).** `case.schema.json` chaosBlock gains `rearm`
+(boolean) + `rearm_hold_s` (positive integer); `tt-controller` validates
+them fail-closed (move-branch only; `rearm: true` requires `repeat > 1`, a
+`step:` trigger, and a positive `rearm_hold_s`; `rearm_hold_s` without
+`rearm` is a scenario error) and passes `--rearm/--rearm-hold-s` to tt-chaos;
+`tt-chaos` move-branch `--rearm` replaces the free-running clock with a
+per-attempt re-arm loop — the initial marker arms move 1, then each FRESH
+`step:<role>:running` occurrence in the run's OWN append-only event stream
+(one `step.running` event per attempt — the reroute cycle resets the consumer
+to waiting and the pipeline re-pends it) triggers the NEXT move after the
+`rearm_hold_s` post-marker hold (so the merger's tip capture precedes the
+move); `interval_s` becomes a minimum-spacing floor (moves are never fired
+closer together than the declared interval), the run-terminal stand-down is
+unchanged, and a re-arm wait that times out without the run going terminal
+fails closed (exit 1 `rearm_timeout` — never a silent wait). The W4.33d
+manifest carries `rearm: true, rearm_hold_s: 3`; W4.48b keeps the
+free-running cadence (its premise is a single target move in the pause
+window). The extended corridor (`self-tests/tier2-s29-premise-redesign-corridor.test.ts`,
+W4.33d arm) runs the re-arm premise with `rearm_hold_s: 2` and asserts the
+rearm mode in `chaos_evidence`.
+
 **Disposition summary:** 3 cells calibration (W4.10-restart-recovery,
 W4.33a, W4.33b → US-002/US-003), 2 cells premise redesign (W4.33d, W4.48b →
 US-004). Self-test pin: `self-tests/tier2-s29-trigger-vocabulary.test.ts`
 reproduces the campaign failure lines against the captured vocabulary and
 asserts this classification.
+
+### US-008 (S37) O8 moved-target (rugpull) terminal-checksum delta — W4.48b
+
+The 2026-08-30 rerun (campaign-20260830T095821392Z-e16d3497-5e82-4154-90ad-
+a5a17d4a4b81, W4.48b-pause-rugpull-window) failed `TEST_INFRA_FAIL` on O8:
+`checksum_terminal bytes do not reconcile with git HEAD for src/server.ts`
+(O8 ERROR). The run itself COMPLETED (O1 PASS; event trail `run.paused` on
+`event:merge.target_moved` → `run.resumed` → `merge.landed` 10:20:52 →
+`run.completed` 10:20:57), merge-branch PARKED the target
+(`refs/heads/seed/BUG-T2-tamandua-parked-20260830T102052Z-5f95859f`), the
+landed HEAD tree carries the fix (`src/server.ts` + `src/store.ts` differ
+from baseline), and the captured worktree bytes are the STALE baseline
+(`checksum_terminal.changed_paths: []`) — the moved-target (rugpull)
+divergence: the target moved mid-run, so the worktree walk at terminal
+capture cannot equal the final git HEAD.
+
+**Contract decision (recorded in `impl-tasks/S32-37-rerun-residue.md` S37 +
+`oracles/CONTRACT.md`): O8 models the moved-target case (capture discipline
+is unchanged — `git_bundle` and `checksum_terminal` are captured in the same
+snapshot completion; the divergence is REAL and distinguished, never hidden
+by settling the worktree first).** `oracles/lib/o8.mjs` (US-008):
+
+- Direct reconciliation FIRST, unchanged: a worktree-vs-HEAD divergence
+  WITHOUT positive moved-target refs evidence (no `*-tamandua-parked-*` ref,
+  no local-head-vs-origin tip difference — e.g. a dirty worktree) keeps the
+  pre-fix opaque `checksum_terminal bytes do not reconcile with git HEAD for
+  <file>` `ORACLE_RUNTIME_ERROR` (fail-closed).
+- Positive moved-target evidence is read-only refs INSIDE the isolated git
+  snapshot (parked ref and/or local-vs-origin divergence). On evidence O8
+  rebuilds the terminal inventory from the AUTHORITATIVE git-HEAD tree
+  (unchanged captured entries preserved verbatim; untracked forbidden baits
+  kept) and re-runs every existing leg (boundary/forbidden/seeded-test/
+  marker/transport) against it.
+- The distinct `O8_RUGPULL_TREE_DIVERGENCE` category records `diverged_paths`
+  + signature + `reconcile_error`: informational (non-failing) on a COMPLETED
+  run (PASS if the authoritative tree honors the rules — the honest W4.48b
+  characterization), FAILING on an UNSETTLED run — never the opaque ERROR,
+  never a silent pass; `o8-boundary-audit.json` records
+  `git_tree_reconciled: false` + `tree_reconciliation: 'moved-target-
+  annotated'` + `rugpull_divergence`.
+
+**Proof (zero tokens):** `oracles/self-test/generate-o8-fixtures.mjs` +
+`o8.test.mjs` — `o8-moved-target-rugpull` (W4.48b shape: parked ref + moved
+ref + stale worktree + untracked `operator-notes.local`, completed → PASS +
+annotation), `o8-moved-target-failed-run` (same divergence, failed attempt →
+FAIL with the distinct category), `o8-dirty-unexplained-divergence` (dirty
+worktree, no signature → pre-fix opaque ERROR verbatim); the pre-fix
+criterion is pinned inline (an embedded replica produces the exact campaign
+message on the moved-target fixtures). `bash torture-test/oracles/self-test/
+run.sh` green. Rerun status: **needs real-campaign rerun** (the user re-runs
+after landing; zero real tokens here).
 
 ### S28 exit-null chaos path — fail closed before spawning against a terminal run (US-005)
 
@@ -2142,3 +2237,143 @@ launch) with ZERO tokens and NO scheduler-execution-failed — the launch-time
 refusal corridor (`origin repository is in detached HEAD state and no
 --worktree-origin-ref was provided`) is observed in launch.stderr and the
 snapshot evidence carries `detached_head: true`.
+
+### S35 delta (US-005, 2026-08-30 — O9 consumes the detached-HEAD contract end-to-end)
+
+The W4.30 re-run (campaign-20260830T075716699Z-112d79ce-4460-4168-a58c-
+cdf9ed4f58ef) launched and snapshotted (S31), but O9 died
+`ORACLE_TEST_INFRA`: the launch-refused corridor produces EMPTY suite
+observations, and pre-fix O9 answered NOT_EVALUABLE, which the campaign
+harness rejects (`result must be PASS, FAIL, or ERROR`). `oracles/lib/o9.mjs`
+now consumes the US-009 detached-HEAD contract (target_ref = commit OID,
+detached_head: true) end-to-end: tree resolution walks the detached HEAD
+commit's reachable trees explicitly (never requiring a symbolic target ref,
+never writing/altering refs), the audit evidence records the contract fields,
+and the positively-proven detached-HEAD launch-refused corridor (empty
+observations + detached contract + terminal-FAILED attempt + run.failed with
+no suite.* activity) renders the REAL judgment PASS. Every other
+empty-observation shape keeps NOT_EVALUABLE (the pinned o9-empty-observations
+fixture is unchanged). Fixtures: `o9-detached-green` (PASS) /
+`o9-detached-wrong-tree` (FAIL O9_LEDGER_TREE_UNRESOLVED) /
+`o9-detached-launch-refused` (PASS) in `oracles/self-test/generate-o9-
+fixtures.mjs`; proof `self-tests/tier2-s35-o9-detached-head.test.ts`;
+contract in `oracles/CONTRACT.md` (S35 sections). Rerun status: needs
+real-campaign rerun.
+
+## S34 caps-vs-honest-duration disposition (US-003 — the three deadline cells)
+
+**Scope:** the caps-vs-honest-duration analysis for the three cells that
+expired against the independent deadline sweep in the 2026-08-30 rerun —
+W4.10-kill-daemon (campaign-20260830T065151712Z-37c54c06-b903-40d4-affc-c52939362479, `expired 4s`),
+W4.48a-daemon-kill-mid-park (campaign-20260830T090310754Z-6d67693d-c123-4a1d-9cdf-41303a1cc44c, `expired 3s`) and
+W4.37-keyline-spoof-repo-content (campaign-20260830T111549750Z-ac1e0b86-34ce-43e0-b026-75b7e3e50fd1, `expired 0s`).
+The S34 fix itself (US-002, the deadline-sweep grace contract) is documented in
+`impl-tasks/S32-37-rerun-residue.md`; THIS section answers "why did the cells
+approach their deadlines at all" and what, if anything, the manifests must
+recalibrate so the grace contract is honest about caps vs durations.
+
+**Method.** Each cell's cap was compared against its honest corridor using the
+rerun campaign evidence read-only (report.txt / state.json / the run's own
+event stream under the contained home `var/home/.tamandua/events/<runId>.jsonl`
+and the contained daemon lifecycle log `var/home/.tamandua/lifecycle.log`).
+The rule from `caps-calibration.md` applies: caps sit at family p95, never
+below family p50 — a cap below a case's honest duration cancels honest runs
+and destroys the evidence the case exists to collect.
+
+### W4.37-keyline-spoof-repo-content — RECALIBRATED (wall_min 5 → 10)
+
+**Evidence.** The do-now unit was still mid-round at the deadline in both
+campaigns that ran it: campaign-20260830T111549750Z-ac1e0b86-34ce-43e0-b026-75b7e3e50fd1 ran `wall 5m0.278s` and
+was voided `0s` after its deadline with the `execute` step still `running`
+(its final pi round's usage, 15,018 tokens, landed only after the sweep's
+`run.canceled`); campaign-20260826T225744158Z was `runaway-cap-enforced`
+at `observed 5.0127 min` (wall 5m17.7s including enforcement latency) with
+`terminal_status: canceled`. Both samples are CAP-TRUNCATED: the honest
+duration is **> 5m18s**, never observed to completion. The family's own
+calibration floor confirms the unit can exceed 5 minutes: the companion
+dsh row W4.dsh-do-now (same do-now unit, same base scenario) completed at
+`5m21.4s` on campaign-20260826T225744158Z (a genuine oracle PRODUCT_FAIL
+judgment — the run finished, so 5m21s is an honest duration, not a truncation).
+
+**Decision: recalibrate.** `caps.wall_min` 5 → **10** for W4.37 (do-now
+family, tokens unchanged at 200,000 — observed spend was ~15–17k at the
+5-minute mark, no token pressure). 10 min = ~2× the observed-truncated
+minimum (5m18s), matching the W4.47 do-now tier (wall 10) and giving the
+honest path headroom while keeping the cell bounded. The US-002 grace fix
+alone would NOT have sufficed: the grace window (30s default) protects only
+attempts that reach terminal within it, and the honest duration is
+demonstrably beyond 5m30s. The old 5-min cap was a runaway tripwire firing
+on honest work — the exact failure mode the family-p95-not-below-p50 rule
+forbids.
+
+### W4.10-kill-daemon — NO RECALIBRATION (genuine stall, not a cap breach)
+
+**Evidence.** The typed chaos kill landed (chaos evidence `kill-daemon ...
+target pid:2099920 ... outcome fired` at 06:54:45, `step:fixer:running`), and
+the run never reached terminal again: its event stream ends at
+`step.running (fix)` / `dispatch.render.validated` 06:54:45 and the only
+later event is the sweep's `run.canceled (reason: cli-stop)` at 07:47:02.
+The contained daemon lifecycle log proves NO daemon restart occurred during
+the run: `daemon.start` pid 2099920 @ 06:51:56, then
+`daemon.uncleanExit (lastHeartbeatAt 06:54:36.188Z, lastHeartbeatAgeMs
+3152852)` @ 07:47:09 — the restart that appears is the sweep TEARDOWN's, 55
+minutes after the kill. Without the daemon the scheduler cannot dispatch, so
+the run was genuinely hung (`[wait 55m04s] ... 3/6 done, 0 active` in
+launch.stderr) — the 55-min cap was consumed by the un-recovered stall, not
+by honest work.
+
+**Honest corridor.** Pre-kill pipeline 2m48s (triage 47s + investigate 37s +
+setup 43s + fix start) + operator restart + recovery within ~2 dispatch
+intervals of the daemon coming back (~30s, the scenario's own contract) →
+honest total ~5 minutes, an order of magnitude below the 55-min cap. Tokens
+(75,318 observed) are 7.5% of the 1M cap. The cap is generous for the honest
+path.
+
+**Decision: no recalibration; the cap is not the problem.** The US-002 grace
+contract is orthogonal: it protects attempts that REACHED terminal within the
+grace window, and this attempt never did (fail-closed preserved by design —
+a genuinely hung attempt is still swept deadline-expired with the full
+evidence fields). Raising the cap would only extend the waste on a hung run
+(55m → 110m). The remediation is scenario/harness-side — the single-run
+kill-daemon operator-restart seam must actually fire during the run (the
+`restart_daemon` probe op is multi-run-only by design; the single-run restart
+is an operator action that the rerun never performed) — recorded for the
+landing report, not a caps-table change.
+
+### W4.48a-daemon-kill-mid-park — NO RECALIBRATION (genuine stall, not a cap breach)
+
+**Evidence.** Identical shape to W4.10: chaos kill landed
+(`target pid:2225350 ... outcome fired` at 09:07:34, `step:finalize_merge:
+running` — 1s after the merger's round started), and the run's event stream
+ends at `step.running (finalize_merge)` / `dispatch.render.validated`
+09:07:33 with no further event until `run.canceled (cli-stop)` 09:58:19.
+The lifecycle log shows `daemon.start` pid 2225350 @ 09:03:14 →
+`daemon.uncleanExit (lastHeartbeatAt 09:07:24.761Z, lastHeartbeatAgeMs
+3061628)` @ 09:58:26 — again NO daemon restart during the run; the 09:58:26
+restart is the sweep teardown's. The park→landing recovery never ran because
+the daemon that would drive it was dead for the entire 55-minute window.
+
+**Honest corridor.** Pre-kill pipeline 4m18s (triage 53s + investigate 20s +
+setup 27s + fix 38s + verify 1m13s + finalize start) + operator restart +
+park-recovery (the scenario's own contract: landing completes from the parked
+state, or the park branch survives) → honest total well under 10 minutes
+against a 55-min cap. Tokens (117,803 observed) are 11.8% of the 1M cap.
+
+**Decision: no recalibration** — same reasoning as W4.10: the cap is generous
+for the honest path; the observed expiry was a genuine un-recovered stall; the
+grace contract correctly leaves genuinely hung attempts fail-closed; the
+remediation is the operator-restart seam firing during the run, not a
+caps-table change.
+
+### Caps-table delta (this section)
+
+| Case | Field | Old | New | Decision |
+|------|-------|-----|-----|----------|
+| W4.37-keyline-spoof-repo-content | caps.wall_min | 5 | 10 | **recalibrated** — honest duration > 5m18s (two cap-truncated samples; W4.dsh-do-now 5m21s confirms the unit exceeds 5 min); grace alone insufficient |
+| W4.dsh-do-now | caps.wall_min | 5 | 10 | **recalibrated (family consistency)** — dsh row inherits its pi base W4.37's cap (dsh-lane policy: "same per-family caps as their pi base rows"); own honest duration 5m21.4s |
+| W4.10-kill-daemon | caps.wall_min | 55 | 55 | **unchanged** — genuine stall (daemon never restarted during the run, lifecycle-log proof); cap generous for the honest path; grace fix orthogonal (fail-closed for hung attempts) |
+| W4.48a-daemon-kill-mid-park | caps.wall_min | 55 | 55 | **unchanged** — genuine stall (daemon never restarted during the run, lifecycle-log proof); cap generous for the honest path; grace fix orthogonal |
+
+The changed rows are reflected in `cases/tier2.jsonl` and pinned by
+`self-tests/tier2-s34-caps-recalibration.test.ts` (manifest ↔ table ↔
+impl-task consistency, zero tokens).

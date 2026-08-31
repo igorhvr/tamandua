@@ -1,4 +1,5 @@
-// S29 (US-004) — zero-token SCRIPTED PREMISE-REDESIGN CORRIDOR.
+// S29 (US-004) / S36 (US-007) — zero-token SCRIPTED PREMISE-REDESIGN
+// CORRIDOR.
 //
 // The tier-2 attempt-2 campaign (campaign-20260826T225744158Z-4bf26d7f) left
 // W4.33d-reroute-exhaustion-resume and W4.48b-pause-rugpull-window
@@ -23,6 +24,18 @@
 //     completes. Characterization one-of-two: paused-no-relaunch (the landed
 //     run suppresses the rugpull).
 //
+// US-007 (S36) tightens the W4.33d premise: the real rerun
+// (campaign-20260830T085340743Z-cc2c9a15) showed the US-004 free-running
+// cadence (moves every interval_s on a clock gated ONCE at the first marker)
+// does NOT fail a REAL run — a 60s cadence vs a ~16-29s finalize window lands
+// a move inside the window only when it straddles the next tick. The W4.33d
+// corridor transform therefore runs the REDESIGNED per-attempt RE-ARM premise
+// (`rearm: true, rearm_hold_s: 2`): each FRESH step:finalize_merge:running
+// occurrence triggers the next move after a short post-marker hold, so EVERY
+// finalize attempt observes a moved tip — the exact premise the real W4.33d
+// cell will run in the next campaign (manifest `rearm: true,
+// rearm_hold_s: 3`).
+//
 // THIS file is the zero-token PROOF that the redesigned triggers genuinely
 // FIRE against the 53xx scripted daemon driving real bfmw runs, and that the
 // armed probe actions (resume on event:run.failed; pause on
@@ -33,13 +46,14 @@
 // tier1-scripted-probe-battery.test.ts / US-002 fired-trigger-corridor
 // pattern):
 //   1. Build scripted manifest copies under gitignored var/: take each cell
-//      from cases/tier2.jsonl — the US-004 manifest with its typed move-branch
+//      from cases/tier2.jsonl — the manifest with its typed move-branch
 //      chaos block — and convert to harness scripted-pi with
 //      context.execution_mode 'scripted', focused oracles ["O16"], SHORTENED
 //      hold_seconds (600 -> 5) and a FAST persistent-move cadence
-//      (interval_s -> 3) so the corridor stays quick. The probe_sequence
-//      `when` triggers (event:run.failed / event:merge.target_moved) are KEPT
-//      verbatim — they are the very premise being proved reachable.
+//      (interval_s -> 3, W4.33d additionally `rearm: true, rearm_hold_s: 2`)
+//      so the corridor stays quick. The probe_sequence `when` triggers
+//      (event:run.failed / event:merge.target_moved) are KEPT verbatim —
+//      they are the very premise being proved reachable.
 //   2. Drive each cell through tt-controller against the 53xx scripted daemon
 //      (daemon-control scripted start with TAMANDUA_PI_BINARY /
 //      TAMANDUA_HERMES_BINARY -> the scripted runtimes via
@@ -55,10 +69,11 @@
 //   3. Assert per cell: the probe action FIRED on the redesigned trigger and
 //      EXECUTED with recorded probe evidence (W4.33d: resume armed on
 //      event:run.failed; W4.48b: pause armed on event:merge.target_moved),
-//      the chaos operator executed (chaos_evidence: move-branch, completed),
-//      the run's OWN event stream contains the premise events (step.rerouted
-//      x8 + run.failed + run.completed for W4.33d; merge.target_moved +
-//      run.completed for W4.48b), O16 PASS, zero tokens.
+//      the chaos operator executed (chaos_evidence: move-branch, completed,
+//      and for W4.33d the rearm mode recorded), the run's OWN event stream
+//      contains the premise events (step.rerouted x8 + run.failed +
+//      run.completed for W4.33d; merge.target_moved + run.completed for
+//      W4.48b), O16 PASS, zero tokens.
 //   4. Hygiene: scripted daemon stopped, 53xx ports free, git tree clean.
 //
 // Confined to torture-test/ (state under gitignored var/). Zero tokens.
@@ -99,6 +114,14 @@ const CORRIDOR_CASES = [
 // the proof stays fast while keeping the probe `when` triggers verbatim.
 const HOLD_SECONDS = 5;
 const MOVE_INTERVAL_S = 3;
+// US-007 (S36): the W4.33d arm runs the REDESIGNED per-attempt re-arm
+// premise — each fresh step:finalize_merge:running occurrence triggers the
+// next move after a short post-marker hold (the scripted analogue of the
+// real manifest's rearm: true / rearm_hold_s: 3). The hold is 2s so the
+// scripted merger's tip capture (t=0) precedes the move (~t=2.5) which
+// precedes the retry behavior's merge-branch check (t=5).
+const W4_33D_REARM = true;
+const W4_33D_REARM_HOLD_S = 2;
 // W4.33d needs enough moves to span 9 finalize attempts (~3-4 min at the
 // scripted cadence); the run-terminal stand-down stops the loop at run.failed.
 const W4_33D_REPEAT = 100;
@@ -206,6 +229,15 @@ function transformRecord(record: any): any {
     out.chaos.repeat = record.id === "W4.33d-reroute-exhaustion-resume" ? W4_33D_REPEAT : W4_48B_REPEAT;
     out.chaos.interval_s = MOVE_INTERVAL_S;
     out.chaos.wait_timeout_s = 900;
+    // US-007 (S36): the W4.33d arm runs the REDESIGNED per-attempt re-arm
+    // premise (each fresh step:finalize_merge:running occurrence triggers
+    // the next move after the rearm_hold_s hold — interval_s becomes a
+    // minimum-spacing floor). W4.48b keeps the free-running cadence (its
+    // premise is a single target move landing in the pause window).
+    if (record.id === "W4.33d-reroute-exhaustion-resume") {
+      out.chaos.rearm = W4_33D_REARM;
+      out.chaos.rearm_hold_s = W4_33D_REARM_HOLD_S;
+    }
   }
   return out;
 }
@@ -233,6 +265,16 @@ function buildScriptedManifest(caseId: string): string {
     : "refs/heads/seed/BUG-T2";
   assert.equal(record.chaos.ref, expectedRef,
     `${caseId}: the move-branch ref must be the case's target ref (${expectedRef})`);
+  // US-007 (S36): the W4.33d corridor must run the REDESIGNED per-attempt
+  // re-arm premise (each fresh step:finalize_merge:running occurrence
+  // triggers the next move after the rearm_hold_s hold) — the free-running
+  // cadence is exactly what failed the real rerun.
+  if (caseId === "W4.33d-reroute-exhaustion-resume") {
+    assert.equal(record.chaos.rearm, true,
+      "W4.33d: the redesigned corridor must carry the per-attempt re-arm mode (rearm: true)");
+    assert.ok(Number.isInteger(record.chaos.rearm_hold_s) && (record.chaos.rearm_hold_s as number) > 0,
+      "W4.33d: the re-arm premise must declare a positive rearm_hold_s (post-marker hold)");
+  }
   const expectedWhen = caseId === "W4.33d-reroute-exhaustion-resume"
     ? "event:run.failed"
     : "event:merge.target_moved";
@@ -482,6 +524,12 @@ async function runCorridorCase(caseId: string): Promise<void> {
         "W4.33d: move-branch must target the case's target ref (seed/BUG-T4 — the branch the merger merges into)");
       assert.equal(ce.target, "origin_target_ref", "W4.33d: move-branch target class must be origin_target_ref");
       assert.equal(ce.status, "completed", `W4.33d: chaos operator must complete: ${JSON.stringify(ce.failure ?? null)}`);
+      // US-007 (S36): the chaos_evidence must record the per-attempt re-arm
+      // mode (the redesigned premise the real cell will run).
+      assert.equal(ce.rearm, true,
+        `W4.33d: chaos_evidence must record the rearm mode (the redesigned premise): ${JSON.stringify(ce)}`);
+      assert.equal(ce.rearm_hold_s, W4_33D_REARM_HOLD_S,
+        "W4.33d: chaos_evidence must record the rearm_hold_s (the post-marker hold)");
 
       // The resume probe FIRED on event:run.failed and EXECUTED.
       const pe = attempt.probe_evidence;
@@ -608,8 +656,8 @@ function waitForRunEvent(runId: string, eventName: string, timeoutMs: number): P
   });
 }
 
-describe("S29 (US-004) — zero-token premise-redesign corridor on the typed move-branch injection", () => {
-  it("W4.33d: the typed move-branch chaos makes event:run.failed genuinely fire (reroute exhaustion); resume armed on it fires and the resumed run completes",
+describe("S29 (US-004) / S36 (US-007) — zero-token premise-redesign corridor on the typed move-branch injection", () => {
+  it("W4.33d: the RE-ARMED move-branch chaos (each fresh step:finalize_merge:running occurrence triggers the next move) makes event:run.failed genuinely fire (reroute exhaustion); resume armed on it fires and the resumed run completes",
     { timeout: 90 * 60 * 1000 }, async () => {
       await runCorridorCase("W4.33d-reroute-exhaustion-resume");
     });

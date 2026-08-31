@@ -117,6 +117,12 @@ const allowed = [
   "torture-test/cases/tier2.jsonl",
   "torture-test/cases/tier2-traceability.md",
   "torture-test/cases/tasks/tier2/",
+  // S34 (US-003): the caps-vs-honest-duration recalibration for the three
+  // deadline cells records its tier-2 changed-caps decision in
+  // cases/caps-calibration.md (a distinct tier-2 section — the primary
+  // table stays tier-1-only). The tier-2 cap documentation surface joins
+  // the authoring set alongside the tier2 manifest/traceability.
+  "torture-test/cases/caps-calibration.md",
   // Tier-2 section F (US-010): the W4.31 tree-rewriting pre-commit hook
   // fixture asset lives under torture-test/fixtures/hooks/ (a NEW
   // authoring surface) and the W4.26/28/30/31 reset hooks live under

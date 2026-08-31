@@ -26,6 +26,14 @@
 //     the declared signal/tree;
 //   * TT_DRY_RUN_REAL_LAUNCH PASSes on a kill-chaos case (zero tokens).
 //
+// S32 battery-hermeticity (US-001): the stub-campaign marker corridor is
+// seeded into THIS test's OWN per-test temp contained home
+// (var/us003-hermetic-home-<pid>-*, via the controller's
+// TT_CONTROLLER_SPAWN_HOME_OVERRIDE seam) and NEVER into the shared
+// contained home var/home/.tamandua — a pre-existing campaign-populated
+// tamandua.db there (real tamandua schema) must stay byte-for-byte
+// untouched (asserted per run), so the battery passes even on a dirty home.
+//
 // Confined to torture-test/ (writes only under gitignored var/). Zero tokens.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -64,6 +72,66 @@ function run(file: string, args: string[], extraEnv: Record<string, string> = {}
     timeout,
   });
   return { status: result.status, stdout: String(result.stdout ?? ""), stderr: String(result.stderr ?? "") };
+}
+
+// ── S32 hermeticity (US-001): shared-contained-home isolation ────────
+// The chaos stub campaign must seed its marker corridor in its OWN per-test
+// temp contained home (var/us003-hermetic-home-<pid>-*, via
+// TT_CONTROLLER_SPAWN_HOME_OVERRIDE) and NEVER read or write the shared
+// contained home var/home/.tamandua — a pre-existing campaign-populated
+// tamandua.db there carries the REAL tamandua schema
+// (steps.input_template/expects NOT NULL, no reroute_count column), which
+// used to break the seed INSERT ("NOT NULL constraint failed:
+// steps.input_template"). These helpers snapshot and re-assert the shared
+// home DB so the hermeticity claim is proven per-run (AC2: mtime/content
+// unchanged; an absent DB must stay absent).
+type SharedDbSnapshot = { exists: boolean; bytes: Buffer | null; mtimeMs: number | null };
+
+function snapshotSharedHomeDb(dbPath: string): SharedDbSnapshot {
+  try {
+    const stat = fs.statSync(dbPath);
+    return { exists: true, bytes: fs.readFileSync(dbPath), mtimeMs: stat.mtimeMs };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return { exists: false, bytes: null, mtimeMs: null };
+    }
+    throw error;
+  }
+}
+
+function assertSharedHomeDbUntouched(dbPath: string, before: SharedDbSnapshot): void {
+  if (!before.exists) {
+    assert.equal(fs.existsSync(dbPath), false,
+      "hermetic chaos campaign must not create the shared contained home DB");
+    return;
+  }
+  const after = snapshotSharedHomeDb(dbPath);
+  assert.equal(after.exists, true, "shared contained home DB vanished during the test");
+  assert.equal(after.mtimeMs, before.mtimeMs,
+    "shared contained home DB mtime changed — the hermetic test must not write var/home/.tamandua");
+  assert.deepEqual(after.bytes, before.bytes,
+    "shared contained home DB content changed — the hermetic test must not write var/home/.tamandua");
+}
+
+// ensureHostProfile — the controller's REAL-case eligibility/preflight reads
+// var/w0/host-profile.json (the host profile produced by tt-verify-environment
+// --fast). On a FRESH var (gitignored — wiped with the worktree) the profile
+// is absent and the real-launch dry-run arm fails 'host-profile-missing'
+// before any case executes. Generate it here (idempotent, zero tokens,
+// mechanical toolchain probe — the same sanctioned generator the
+// tier0-dry-run-argv-recording battery uses) so this file is order-independent.
+function ensureHostProfile(): void {
+  const hostProfilePath = path.join(varRoot, "w0", "host-profile.json");
+  if (fs.existsSync(hostProfilePath)) return;
+  const verify = spawnSync(path.join(ttRoot, "bin", "tt-verify-environment"), ["--fast", "--json"], {
+    cwd: ttRoot,
+    encoding: "utf8",
+    timeout: 120_000,
+  });
+  assert.equal(verify.status, 0,
+    `host-profile generation failed for the real-launch arm: ${verify.stderr ?? verify.stdout}`);
+  assert.ok(fs.existsSync(hostProfilePath),
+    "host-profile.json must be written by tt-verify-environment --fast");
 }
 
 function runValidate(manifestPath: string): RunResult {
@@ -383,23 +451,36 @@ exit 0
     //   * kill case: a steps-table claim row makes step:developer:running
     //     fire (the product's own marker mechanism), and
     //   * delete case: an event-stream row makes event:merge.landed fire.
-    // The contained home (var/home/.tamandua) is gitignored shared state;
-    // the inserted rows are removed after, and a DB this test created is
-    // removed entirely (a pre-existing DB keeps its other contents).
+    //
+    // S32 hermeticity (US-001): the corridor is seeded into THIS test's OWN
+    // per-test temp contained home (mkdtemp under torture-test/var —
+    // var/us003-hermetic-home-<pid>-XXXXXX) and the controller is pointed at
+    // it via TT_CONTROLLER_SPAWN_HOME_OVERRIDE, so the marker corridor
+    // (steps-table + per-run event file) and every child spawn resolve
+    // against the temp home. The SHARED contained home (var/home/.tamandua)
+    // is never read or written — a pre-existing campaign-populated
+    // tamandua.db there carries the REAL tamandua schema
+    // (steps.input_template/expects NOT NULL, no reroute_count column) and
+    // used to break the seed INSERT. Cleanup removes the temp home entirely
+    // (incl. -wal/-shm); the shared home DB identity is asserted unchanged.
     const chaosRunId = "run-11111111-1111-4111-8111-111111111111";
     const chaosRunShort = chaosRunId.slice("run-".length);
-    const containedStateDir = path.join(varRoot, "home", ".tamandua");
-    const containedDbPath = path.join(containedStateDir, "tamandua.db");
-    const containedEventsDir = path.join(containedStateDir, "events");
-    const containedEventFile = path.join(containedEventsDir, `${chaosRunShort}.jsonl`);
-    const dbExisted = fs.existsSync(containedDbPath);
-    const eventExisted = fs.existsSync(containedEventFile);
-    const priorEventContent = eventExisted ? fs.readFileSync(containedEventFile, "utf8") : null;
+    const hermeticHome = fs.mkdtempSync(path.join(varRoot, `us003-hermetic-home-${process.pid}-`));
+    const hermeticStateDir = path.join(hermeticHome, ".tamandua");
+    const hermeticDbPath = path.join(hermeticStateDir, "tamandua.db");
+    const hermeticEventsDir = path.join(hermeticStateDir, "events");
+    const hermeticEventFile = path.join(hermeticEventsDir, `${chaosRunShort}.jsonl`);
+    // AC2: snapshot the shared contained home DB (content + mtime) BEFORE the
+    // test so we can prove this hermetic test never touches it.
+    const sharedDbPath = path.join(varRoot, "home", ".tamandua", "tamandua.db");
+    const sharedDbBefore = snapshotSharedHomeDb(sharedDbPath);
     try {
-      fs.mkdirSync(containedEventsDir, { recursive: true });
-      if (!dbExisted) {
-        const created = new DatabaseSync(containedDbPath, { open: true });
-        created.exec(`CREATE TABLE IF NOT EXISTS steps (
+      fs.mkdirSync(hermeticEventsDir, { recursive: true });
+      // Tolerant + idempotent (CREATE TABLE IF NOT EXISTS): the temp home is
+      // fresh per test, and the seeding must survive a re-run of the file.
+      const db = new DatabaseSync(hermeticDbPath, { open: true });
+      try {
+        db.exec(`CREATE TABLE IF NOT EXISTS steps (
           id TEXT PRIMARY KEY, run_id TEXT NOT NULL, step_id TEXT NOT NULL,
           agent_id TEXT NOT NULL, step_index INTEGER NOT NULL, status TEXT NOT NULL,
           type TEXT NOT NULL DEFAULT 'single', current_story_id TEXT,
@@ -407,10 +488,6 @@ exit 0
           reroute_count INTEGER NOT NULL DEFAULT 0, claim_pid INTEGER,
           claim_pgid INTEGER, claim_updated_at TEXT, updated_at TEXT NOT NULL
         );`);
-        created.close();
-      }
-      const db = new DatabaseSync(containedDbPath, { open: true });
-      try {
         db.prepare(
           `INSERT OR REPLACE INTO steps
              (id, run_id, step_id, agent_id, step_index, status, type, retry_count, abandoned_count, reroute_count, updated_at)
@@ -420,14 +497,13 @@ exit 0
         db.close();
       }
       // The marker check reads the per-run event file and looks for the
-      // declared event — append the seeded line and preserve any prior
-      // content (restored in cleanup).
+      // declared event — seed the row in the TEMP home's event stream.
       fs.writeFileSync(
-        containedEventFile,
-        `${JSON.stringify({ ts: new Date().toISOString(), event: "merge.landed", runId: chaosRunId })}\n${priorEventContent ?? ""}`,
+        hermeticEventFile,
+        `${JSON.stringify({ ts: new Date().toISOString(), event: "merge.landed", runId: chaosRunId })}\n`,
       );
     } catch (error) {
-      throw new Error(`cannot seed the chaos marker corridor in ${containedStateDir}: ${(error as Error).message}`);
+      throw new Error(`cannot seed the chaos marker corridor in ${hermeticHome}: ${(error as Error).message}`);
     }
 
     let res!: RunResult;
@@ -437,6 +513,7 @@ exit 0
         PATH: `${stubBin}:${process.env.PATH ?? ""}`,
         TT_CONTROLLER_TT_CHAOS_PATH: chaosStub,
         TT_CONTROLLER_PREFLIGHT_DISABLED: "1",
+        TT_CONTROLLER_SPAWN_HOME_OVERRIDE: hermeticHome,
         US003_CHAOS_ARGV_FILE: chaosArgvFile,
       });
       const m = CAMPAIGN_LINE.exec(res.stdout);
@@ -444,28 +521,11 @@ exit 0
     } finally {
       fs.rmSync(manifestPath, { force: true });
       fs.rmSync(stubBin, { recursive: true, force: true });
-      // S28 cleanup: remove the seeded corridor rows/files; restore a
-      // pre-existing event file; remove a DB this test created entirely.
-      try {
-        const cleanupDb = new DatabaseSync(containedDbPath, { open: true });
-        try {
-          cleanupDb.prepare(`DELETE FROM steps WHERE id = 'us003-claim-row'`).run();
-        } finally {
-          cleanupDb.close();
-        }
-      } catch {
-        // DB absent or locked — nothing left to clean.
-      }
-      if (eventExisted) {
-        fs.writeFileSync(containedEventFile, priorEventContent ?? "");
-      } else {
-        fs.rmSync(containedEventFile, { force: true });
-      }
-      if (!dbExisted) {
-        fs.rmSync(containedDbPath, { force: true });
-        fs.rmSync(`${containedDbPath}-wal`, { force: true });
-        fs.rmSync(`${containedDbPath}-shm`, { force: true });
-      }
+      // S32 cleanup: remove the temp home ENTIRELY (incl. -wal/-shm
+      // sidecars). Nothing under var/home was ever read or written.
+      fs.rmSync(hermeticHome, { recursive: true, force: true });
+      // AC2: the shared contained home DB must be unchanged (or still absent).
+      assertSharedHomeDbUntouched(sharedDbPath, sharedDbBefore);
     }
     assert.ok(campaignId, `controller did not create a campaign:\n${res.stdout}${res.stderr}`);
 
@@ -550,6 +610,10 @@ exit 0
     // case must validate, pass the chaosGuard, and complete PASS with zero
     // tokens — and the launch-argv recording (TT_DRY_RUN_REAL_LAUNCH) must
     // succeed for a kill-chaos case.
+    // The real-launch path requires the real host profile; generate it on a
+    // fresh var (idempotent, zero tokens) so this file is battery-order
+    // independent (the tier0-dry-run-argv-recording pattern).
+    ensureHostProfile();
     const manifestPath = buildCaseManifest({
       id: "T2-US003-KILL",
       chaos: { type: "kill-harness", target: "harness_process", trigger: "mid_round", signal: "SIGTERM", operator: "tt-chaos" },
@@ -563,7 +627,7 @@ exit 0
       const m = CAMPAIGN_LINE.exec(res.stdout);
       campaignId = m === null ? null : m[1];
     } finally {
-      fs.rmSync(manifestPath, { force: true });
+      fs.rmSync(path.dirname(manifestPath), { recursive: true, force: true });
     }
     assert.ok(campaignId, `controller did not create a campaign:\n${res.stdout}${res.stderr}`);
     assert.equal(res.status, 0, `kill-chaos dry-run campaign must exit 0:\n${res.stdout}${res.stderr}`);

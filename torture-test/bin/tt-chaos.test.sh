@@ -3165,6 +3165,150 @@ else
   fail "move-branch against a missing ref should exit 1, got $RC: $OUT"
 fi
 
+# ── US-007 (S36): move-branch --rearm per-attempt re-arm mode ───────────
+# The S36 premise redesign: the free-running cadence (moves every interval_s
+# on a clock gated ONCE at the first marker) never re-armed per finalize
+# attempt, so a real run could complete cleanly between moves. --rearm makes
+# each FRESH step:<role>:running occurrence (the step transitions
+# waiting->pending->running on every reroute cycle — visible as a new
+# `step.running` event in the run's own append-only event stream) trigger the
+# next move after the --rearm-hold-s post-marker hold. Fail-closed on a
+# malformed re-arm declaration.
+
+echo ""
+echo "--- Test: move-branch --rearm with a non-step marker fails closed ---"
+
+setup_fake_tt_env
+setup_fixture_repos
+
+set +e
+OUT=$("$TOOL" move-branch --repo "$FIXTURE_REPO" --ref "refs/heads/main" --run run-guard-test --when now --repeat 3 --interval 1 --rearm --rearm-hold-s 1 2>&1)
+RC=$?
+set -e
+
+if [ "$RC" -eq 1 ] && echo "$OUT" | grep -q -- "--rearm requires a step:<role>:<state> --when marker"; then
+  pass "move-branch --rearm with --when now fails closed with the precise reason"
+else
+  fail "move-branch --rearm with --when now should exit 1, got $RC: $OUT"
+fi
+
+echo ""
+echo "--- Test: move-branch --rearm without --rearm-hold-s fails closed ---"
+
+setup_fake_tt_env
+setup_fixture_repos
+
+set +e
+OUT=$("$TOOL" move-branch --repo "$FIXTURE_REPO" --ref "refs/heads/main" --run run-guard-test --when step:finalize_merge:running --repeat 3 --interval 1 --rearm 2>&1)
+RC=$?
+set -e
+
+if [ "$RC" -eq 1 ] && echo "$OUT" | grep -q -- "--rearm-hold-s must be a positive integer"; then
+  pass "move-branch --rearm without --rearm-hold-s fails closed with the precise reason"
+else
+  fail "move-branch --rearm without --rearm-hold-s should exit 1, got $RC: $OUT"
+fi
+
+echo ""
+echo "--- Test: move-branch --rearm with --repeat 1 fails closed ---"
+
+setup_fake_tt_env
+setup_fixture_repos
+
+set +e
+OUT=$("$TOOL" move-branch --repo "$FIXTURE_REPO" --ref "refs/heads/main" --run run-guard-test --when step:finalize_merge:running --repeat 1 --rearm --rearm-hold-s 1 2>&1)
+RC=$?
+set -e
+
+if [ "$RC" -eq 1 ] && echo "$OUT" | grep -q -- "--rearm requires --repeat > 1"; then
+  pass "move-branch --rearm with --repeat 1 fails closed with the precise reason"
+else
+  fail "move-branch --rearm with --repeat 1 should exit 1, got $RC: $OUT"
+fi
+
+echo ""
+echo "--- Test: move-branch --rearm-hold-s without --rearm fails closed ---"
+
+setup_fake_tt_env
+setup_fixture_repos
+
+set +e
+OUT=$("$TOOL" move-branch --repo "$FIXTURE_REPO" --ref "refs/heads/main" --run run-guard-test --when step:finalize_merge:running --repeat 3 --interval 1 --rearm-hold-s 1 2>&1)
+RC=$?
+set -e
+
+if [ "$RC" -eq 1 ] && echo "$OUT" | grep -q -- "--rearm-hold-s requires --rearm"; then
+  pass "move-branch --rearm-hold-s without --rearm fails closed with the precise reason"
+else
+  fail "move-branch --rearm-hold-s without --rearm should exit 1, got $RC: $OUT"
+fi
+
+echo ""
+echo "--- Test: move-branch --rearm re-arms on each fresh step:<role>:running occurrence ---"
+
+setup_fake_tt_env
+setup_fixture_repos
+
+# Seed the finalize_merge step as RUNNING (the marker) + the run's event
+# stream with its first step.running occurrence. The re-arm loop must fire
+# move 1 at the initial marker, then wait for a SECOND step.running occurrence
+# (the next attempt after a reroute cycle) and fire move 2 only then.
+node -e "
+  const { DatabaseSync } = require('node:sqlite');
+  const fs = require('node:fs');
+  const db = new DatabaseSync('${TEST_VAR}/tamandua.db', { open: true });
+  db.prepare(\"INSERT OR REPLACE INTO steps (run_id, step_id, agent_id, status) VALUES ('run-guard-test', 'finalize_merge', 'bug-fix-merge-worktree_merger', 'running')\").run();
+  db.close();
+  fs.mkdirSync('${TEST_VAR}/events', { recursive: true });
+  const ev = { ts: new Date().toISOString(), event: 'step.running', runId: 'run-guard-test', stepId: 'finalize_merge', agentId: 'bug-fix-merge-worktree_merger' };
+  fs.writeFileSync('${TEST_VAR}/events/guard-test.jsonl', JSON.stringify(ev) + '\n');
+"
+# A background append adds the SECOND finalize_merge attempt ~3.5s in (the
+# reroute cycle's fresh step.running occurrence). With --rearm the operator
+# must NOT move on a free-running clock — it waits for this occurrence, holds,
+# then fires move 2.
+(
+  sleep 3.5
+  node -e "
+    const fs = require('node:fs');
+    const ev = { ts: new Date().toISOString(), event: 'step.running', runId: 'run-guard-test', stepId: 'finalize_merge', agentId: 'bug-fix-merge-worktree_merger' };
+    fs.appendFileSync('${TEST_VAR}/events/guard-test.jsonl', JSON.stringify(ev) + '\n');
+  "
+) &
+REARM_FLIP_PID=$!
+
+set +e
+OUT=$("$TOOL" move-branch --repo "$FIXTURE_REPO" --ref "refs/heads/main" --run run-guard-test --when step:finalize_merge:running --timeout 30 --repeat 2 --interval 1 --rearm --rearm-hold-s 1 2>&1)
+RC=$?
+set -e
+wait "$REARM_FLIP_PID" 2>/dev/null || true
+
+if [ "$RC" -eq 0 ]; then
+  pass "move-branch --rearm exited 0 (2 moves, each re-armed on a fresh finalize attempt)"
+else
+  fail "move-branch --rearm should exit 0, got $RC: $OUT"
+fi
+if [ "$(grep -c '"move_index":1' "${TEST_VAR}/chaos/chaos.log" || echo 0)" -ge 1 ] && [ "$(grep -c '"move_index":2' "${TEST_VAR}/chaos/chaos.log" || echo 0)" -ge 1 ]; then
+  pass "move-branch --rearm fired move 1 AND move 2 (each per attempt)"
+else
+  fail "move-branch --rearm should fire 2 moves, got: $(grep -o '"move_index":[0-9]*' "${TEST_VAR}/chaos/chaos.log" | sort | tr '\n' ' ')"
+fi
+if grep -q '"outcome":"rearm_armed"' "${TEST_VAR}/chaos/chaos.log"; then
+  pass "chaos.log records the rearm_armed entry (move 2 triggered by the fresh step.running occurrence)"
+else
+  fail "chaos.log missing rearm_armed entry: $(grep 'move-branch' "${TEST_VAR}/chaos/chaos.log" | tail -5)"
+fi
+# The second move must land AFTER the second step.running occurrence
+# (rearm_armed) — never on the free-running clock. Match ONLY the fired entry
+# (the rearm_armed entry also carries move_index 2).
+MOVE2_TS=$(grep '"move_index":2' "${TEST_VAR}/chaos/chaos.log" | grep '"outcome":"fired"' | head -1 | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{console.log(JSON.parse(d).ts)}catch{console.log('')}})")
+REARM_TS=$(grep '"outcome":"rearm_armed"' "${TEST_VAR}/chaos/chaos.log" | head -1 | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{console.log(JSON.parse(d).ts)}catch{console.log('')}})")
+if [ -n "$MOVE2_TS" ] && [ -n "$REARM_TS" ] && [ "$MOVE2_TS" \> "$REARM_TS" ]; then
+  pass "move 2 fired after the rearm_armed occurrence ($REARM_TS < $MOVE2_TS)"
+else
+  fail "move 2 should fire after rearm_armed (rearm_armed=$REARM_TS move2=$MOVE2_TS): $OUT"
+fi
+
 # ── Test: evidence captured before git mutation ──────────────────────
 
 echo ""

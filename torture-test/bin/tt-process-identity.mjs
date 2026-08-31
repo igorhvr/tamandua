@@ -183,6 +183,16 @@ export function getProcessState(pid) {
   return stat === null ? null : stat.state;
 }
 
+// getProcessParent: the ppid (stat field 4) of a pid, null when unreadable.
+// The parent-chain walk (S33 US-004 — tt-chaos verifyHarnessIdentityChain)
+// uses this to walk a target's ancestry and check each ancestor's
+// cwd/cmdline for TT-ownership. /proc-less hosts (Darwin — MACP3 US-003)
+// degrade to null (unprovable), never to a false positive.
+export function getProcessParent(pid) {
+  const stat = readProcStat(pid);
+  return stat === null ? null : stat.ppid;
+}
+
 export function ownPid() {
   return process.pid;
 }

@@ -10,6 +10,44 @@ import {
   writeEvidenceJson,
 } from './index.mjs';
 
+// O8 terminal-checksum reconciliation — moved-target (rugpull) contract
+// (S37/US-008, 2026-08-30; decision also recorded in oracles/CONTRACT.md and
+// impl-tasks/S32-37-rerun-residue.md).
+//
+// DEFECT (rerun evidence campaign-20260830T095821392Z, W4.48b-pause-rugpull-
+// window): `checksum_terminal bytes do not reconcile with git HEAD for
+// src/server.ts` (OracleRuntimeError → ORACLE_TEST_INFRA). A mid-run target
+// move (the W4.48b rugpull: tt-chaos move-branch while finalize runs, then a
+// probe pause/resume) legitimately leaves the captured WORKTREE bytes
+// divergent from the final git HEAD: merge-branch parks the target
+// (`<target>-tamandua-parked-<ts>-<runid>`) and the landing advances HEAD,
+// while the worktree checkout is never re-materialized — so at terminal
+// capture the checksum_terminal walk (stale worktree bytes) cannot equal the
+// git-HEAD tree (the authoritative final tree).
+//
+// CONTRACT (fail-closed, never a silent pass):
+//   * Direct reconciliation is attempted FIRST, exactly as before. A
+//     worktree-vs-HEAD divergence that is NOT positively explained by
+//     moved-target refs evidence keeps the pre-fix opaque OracleRuntimeError
+//     (`checksum_terminal bytes do not reconcile with git HEAD for <file>`) —
+//     an unexplained divergence (e.g. an uncommitted dirty worktree) is never
+//     reinterpreted as a rugpull.
+//   * When the divergence IS positively explained — refs evidence inside the
+//     isolated git snapshot shows a merge-branch parked ref
+//     (`*-tamandua-parked-*`) and/or a local refs/heads tip diverged from the
+//     same-named refs/remotes/origin ref (the target moved during the run) —
+//     O8 records the distinct O8_RUGPULL_TREE_DIVERGENCE category, rebuilds
+//     the terminal inventory from the AUTHORITATIVE git-HEAD tree (the final
+//     landing/parked tree), and re-runs every existing leg
+//     (boundary/forbidden/seeded-test/marker/transport) against that tree.
+//     The verdict is a REAL PASS/FAIL: a completed run whose authoritative
+//     tree honors the rules PASSes with the divergence annotated
+//     (informational, non-failing finding); a divergence on an UNSETTLED run
+//     (terminal_status !== 'completed') fails closed with the same distinct
+//     category as a FAILING finding. Never the opaque ERROR, never a silent
+//     pass — the divergence is always recorded in o8-boundary-audit.json
+//     (`tree_reconciliation: 'moved-target-annotated'` + `rugpull_divergence`).
+
 const SHA256 = /^[0-9a-f]{64}$/;
 const OID = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
 const MARKERS = ['skip', 'todo', 'xfail'];
@@ -303,24 +341,200 @@ function lineDiffStats(baselineBytes, terminalBytes) {
   };
 }
 
+// ── Moved-target (rugpull) modeling (S37/US-008) ────────────────────────────
+
+// The latest attempt's terminal_status ('completed' | 'failed' | 'canceled' |
+// ...), or null when the context carries no attempt. A moved-target divergence
+// rides a PASS only for a COMPLETED run; any other state fails closed with the
+// distinct O8_RUGPULL_TREE_DIVERGENCE category (never a silent pass on
+// unsettled evidence).
+function terminalStatusOf(invocation) {
+  const attempts = Array.isArray(invocation.context?.attempts) ? invocation.context.attempts : [];
+  const latest = attempts[attempts.length - 1];
+  return latest?.terminal_status ?? null;
+}
+
+function countMarkers(bytes) {
+  const text = bytes.toString('utf8');
+  return {
+    skip: (text.match(/\bskip(?:ped)?\b/giu) ?? []).length,
+    todo: (text.match(/\btodo\b/giu) ?? []).length,
+    xfail: (text.match(/\bxfail\b/giu) ?? []).length,
+  };
+}
+
+// Positive moved-target (rugpull) evidence, read-only, entirely INSIDE the
+// isolated git snapshot: (A) a merge-branch parked target ref
+// (`*-tamandua-parked-*` — generated only by merge-branch's park path, which
+// fires when a target move is detected mid-merge), and/or (B) a local
+// refs/heads ref whose tip differs from the same-named refs/remotes/origin
+// ref (the local target was moved during the run). Either, combined with an
+// ACTUAL worktree-vs-HEAD divergence (the caller only invokes this after
+// reconcileGitTree threw), positively identifies the moved-target shape.
+// Absent both → null (the caller rethrows the original reconciliation error —
+// fail-closed). Never a guess: refs unreadable from the snapshot degrade to
+// null, never to a signature.
+function detectMovedTarget(invocation, repository) {
+  let refs;
+  try {
+    refs = runGit({ campaignRoot: invocation.campaignRoot, repository, args: ['for-each-ref', '--format=%(objectname) %(refname)'] }).stdout.split(/\r?\n/).filter(Boolean);
+  } catch {
+    return null;
+  }
+  const parkedRefs = [];
+  const heads = new Map();
+  for (const line of refs) {
+    const space = line.indexOf(' ');
+    if (space <= 0) continue;
+    const name = line.slice(space + 1);
+    if (name.includes('-tamandua-parked-')) parkedRefs.push(name);
+    if (name.startsWith('refs/heads/')) heads.set(name.slice('refs/heads/'.length), line.slice(0, space));
+  }
+  const movedRefs = [];
+  for (const line of refs) {
+    const space = line.indexOf(' ');
+    if (space <= 0) continue;
+    const name = line.slice(space + 1);
+    if (!name.startsWith('refs/remotes/origin/')) continue;
+    const local = name.slice('refs/remotes/origin/'.length);
+    const localTip = heads.get(local);
+    if (localTip !== undefined && localTip !== line.slice(0, space)) {
+      movedRefs.push({ ref: `refs/heads/${local}`, local_tip: localTip, origin_tip: line.slice(0, space) });
+    }
+  }
+  if (parkedRefs.length === 0 && movedRefs.length === 0) return null;
+  return {
+    parked_refs: [...parkedRefs].sort(),
+    moved_refs: movedRefs.sort((left, right) => left.ref.localeCompare(right.ref)),
+  };
+}
+
+function entryFromGitTree(file, type, mode, sha256, markers) {
+  const categories = isTestPath(file) ? ['seeded-test'] : [];
+  const entry = { path: file, type, mode, sha256, categories };
+  if (categories.length > 0) entry.test_markers = markers;
+  return entry;
+}
+
+// Rebuild the terminal inventory from the AUTHORITATIVE final tree (git HEAD)
+// when the captured worktree inventory is stale (moved-target shape). Entries
+// whose captured bytes/type/mode still equal the HEAD blob are preserved
+// VERBATIM from the capture (zero category/mode drift — an unchanged file must
+// not become a false-positive changed_paths entry); diverged or new paths are
+// rebuilt from the git tree. Stale-only entries that match a forbidden
+// declaration (untracked baits the git tree cannot carry, e.g.
+// operator-notes.local) are kept so the forbidden leg still sees them.
+// Returns { inventory, diverged_paths } — diverged_paths are the tracked
+// paths whose worktree bytes/mode/type differ from the HEAD tree (the
+// reconciliation-divergence set, recorded in the evidence annotation).
+function buildMovedTargetInventory(invocation, repository, captured) {
+  const output = runGit({ campaignRoot: invocation.campaignRoot, repository, args: ['ls-tree', '-r', '-z', '--full-tree', 'HEAD'] }).stdout;
+  const head = new Map();
+  for (const record of output.split('\0').filter(Boolean)) {
+    const match = /^(\d+) (blob) ([0-9a-f]+)\t([\s\S]+)$/.exec(record);
+    if (match === null) throw new OracleRuntimeError('git HEAD contains a non-blob or malformed tree entry');
+    const file = normalizedDeclaration(match[4], 'git HEAD path');
+    head.set(file, { mode: Number.parseInt(match[1], 8) & 0o7777, oid: match[3] });
+  }
+  const staleMap = new Map(captured.entries.map((entry) => [entry.path, entry]));
+  const entries = [];
+  const diverged = [];
+  for (const [file, gitEntry] of head) {
+    const stale = staleMap.get(file);
+    const gitType = gitEntry.mode === 0o120000 ? 'symlink' : 'file';
+    const bytes = blobBytes(invocation, repository, gitEntry.oid);
+    const digest = createHash('sha256').update(bytes).digest('hex');
+    if (stale !== undefined && stale.type === gitType && stale.sha256 === digest) {
+      entries.push(stale);
+    } else {
+      // git tracks only coarse mode semantics; a captured symlink carries the
+      // conventional 0o777 lstat mode (git stores the bare link mode), so the
+      // rebuilt symlink mode matches what a real capture would have recorded.
+      const mode = gitType === 'symlink' ? 0o777 : gitEntry.mode;
+      entries.push(entryFromGitTree(file, gitType, mode, digest, isTestPath(file) ? countMarkers(bytes) : undefined));
+      diverged.push(file);
+    }
+  }
+  const forbiddenPaths = new Set();
+  for (const declaration of captured.forbidden) {
+    for (const entry of captured.entries) {
+      if (matches(entry.path, declaration)) forbiddenPaths.add(entry.path);
+    }
+  }
+  for (const [file, stale] of staleMap) {
+    if (!head.has(file) && forbiddenPaths.has(file)) entries.push(stale);
+  }
+  entries.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  const before = new Map(captured.entries.map((entry) => [entry.path, entry]));
+  const after = new Map(entries.map((entry) => [entry.path, entry]));
+  const changed_paths = [...new Set([...before.keys(), ...after.keys()])]
+    .filter((file) => JSON.stringify(before.get(file) ?? null) !== JSON.stringify(after.get(file) ?? null)).sort();
+  return {
+    inventory: {
+      schema_version: 1, phase: 'terminal',
+      declarations: captured.declarations,
+      boundary: captured.boundary,
+      forbidden: captured.forbidden,
+      entries,
+      changed_paths,
+    },
+    diverged_paths: diverged.sort(),
+  };
+}
+
 export async function evaluateO8(invocation) {
   const baseline = readInventory(invocation.evidencePaths.checksum_baseline, 'baseline', invocation.context);
-  const terminal = readInventory(invocation.evidencePaths.checksum_terminal, 'terminal', invocation.context);
+  const capturedTerminal = readInventory(invocation.evidencePaths.checksum_terminal, 'terminal', invocation.context);
   const baselineMap = new Map(baseline.entries.map((entry) => [entry.path, entry]));
-  const terminalMap = new Map(terminal.entries.map((entry) => [entry.path, entry]));
-  const recomputedChanged = [...new Set([...baselineMap.keys(), ...terminalMap.keys()])]
-    .filter((file) => JSON.stringify(baselineMap.get(file) ?? null) !== JSON.stringify(terminalMap.get(file) ?? null)).sort();
-  if (JSON.stringify(recomputedChanged) !== JSON.stringify(terminal.changed_paths)) throw new OracleRuntimeError('checksum_terminal.changed_paths does not match the immutable inventories');
+  // The CAPTURED inventory is validated for internal consistency (its own
+  // changed_paths must match its own entries vs baseline) BEFORE any
+  // moved-target handling: a malformed capture is never reinterpreted.
+  const capturedMap = new Map(capturedTerminal.entries.map((entry) => [entry.path, entry]));
+  const capturedChanged = [...new Set([...baselineMap.keys(), ...capturedMap.keys()])]
+    .filter((file) => JSON.stringify(baselineMap.get(file) ?? null) !== JSON.stringify(capturedMap.get(file) ?? null)).sort();
+  if (JSON.stringify(capturedChanged) !== JSON.stringify(capturedTerminal.changed_paths)) throw new OracleRuntimeError('checksum_terminal.changed_paths does not match the immutable inventories');
 
   // The extracted snapshot must stay alive until AFTER the findings loop: the
-  // seeded-test leg recovers baseline blobs from it. reconcile still runs
-  // first (the terminal tree must reconcile before any finding is emitted),
-  // and the repository is removed in the finally below.
+  // seeded-test leg recovers baseline blobs from it. Direct reconciliation
+  // still runs first (the terminal tree must reconcile before any finding is
+  // emitted); the repository is removed in the finally below.
   const repository = extractGit(invocation);
   const findings = new FindingCollector();
   const seededTestDiffs = [];
   try {
-    reconcileGitTree(invocation, repository, terminal);
+    // S37/US-008 moved-target modeling: direct reconciliation first; only a
+    // divergence POSITIVELY explained by moved-target refs evidence is
+    // re-interpreted (see detectMovedTarget). Any other divergence keeps the
+    // pre-fix opaque OracleRuntimeError — fail-closed, never a guessed pass.
+    let movedTarget = null;
+    try {
+      reconcileGitTree(invocation, repository, capturedTerminal);
+    } catch (error) {
+      if (!(error instanceof OracleRuntimeError)) throw error;
+      const signature = detectMovedTarget(invocation, repository);
+      if (signature === null) throw error;
+      const rebuilt = buildMovedTargetInventory(invocation, repository, capturedTerminal);
+      movedTarget = { signature, diverged_paths: rebuilt.diverged_paths, reconcile_error: error.message, inventory: rebuilt.inventory };
+    }
+    const terminal = movedTarget === null ? capturedTerminal : movedTarget.inventory;
+    const terminalMap = new Map(terminal.entries.map((entry) => [entry.path, entry]));
+    const recomputedChanged = [...new Set([...baselineMap.keys(), ...terminalMap.keys()])]
+      .filter((file) => JSON.stringify(baselineMap.get(file) ?? null) !== JSON.stringify(terminalMap.get(file) ?? null)).sort();
+    const terminalStatus = movedTarget === null ? null : terminalStatusOf(invocation);
+    if (movedTarget !== null) {
+      const detail = {
+        diverged_paths: movedTarget.diverged_paths,
+        parked_refs: movedTarget.signature.parked_refs,
+        moved_refs: movedTarget.signature.moved_refs,
+        terminal_status: terminalStatus,
+        reconcile_error: movedTarget.reconcile_error,
+      };
+      if (terminalStatus === 'completed') {
+        findings.addInfo('O8_RUGPULL_TREE_DIVERGENCE', 'moved-target (rugpull) divergence: worktree bytes diverge from git HEAD at capture; terminal checksum evaluated against the authoritative HEAD tree (recorded, never silent)', detail);
+      } else {
+        findings.add('O8_RUGPULL_TREE_DIVERGENCE', 'moved-target (rugpull) divergence on an unsettled run: worktree bytes diverge from git HEAD and the attempt did not complete — fail closed', detail);
+      }
+    }
 
     const quarantine = /(^|-)test-quarantine(?:-|$)/i.test(invocation.context.case.workflow);
     for (const file of recomputedChanged) {
@@ -376,7 +590,15 @@ export async function evaluateO8(invocation) {
     }
     const evidence = [writeEvidenceJson(invocation, 'o8-boundary-audit.json', {
       schema_version: 1, changed_paths: recomputedChanged, boundary_files: terminal.declarations.boundary_files,
-      forbidden: terminal.declarations.forbidden, quarantine_task: quarantine, git_tree_reconciled: true,
+      forbidden: terminal.declarations.forbidden, quarantine_task: quarantine, git_tree_reconciled: movedTarget === null,
+      ...(movedTarget !== null ? {
+        tree_reconciliation: 'moved-target-annotated',
+        rugpull_divergence: {
+          diverged_paths: movedTarget.diverged_paths,
+          signature: movedTarget.signature,
+          terminal_status: terminalStatus,
+        },
+      } : {}),
       seeded_test_diffs: seededTestDiffs,
     }, 'checksum-and-git-tree-audit')];
     // Informational (non_failing) findings — O8_SEEDED_TEST_EXTENDED — do not

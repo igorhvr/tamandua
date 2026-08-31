@@ -261,7 +261,7 @@
    }
   },
   "chaos": {
-   "description": "E3.C typed chaos-injection block (nullable). null => no chaos injection. A non-null block is honored by the controller via bin/tt-chaos: type is the injection kind (sigstop_sigcont | kill-harness | kill-daemon | delete-tstx-row | move-branch), target the affected process/data class (per-type), trigger the phase marker that arms the injection, hold_seconds the SIGSTOP hold duration (sigstop_sigcont only), signal the kill signal (kill actions only, default SIGKILL), tree the TSTX tree hash to delete (delete-tstx-row only), ref/repeat/interval_s/wait_timeout_s the move-branch target-ref injection params (US-004), operator the executable that performs the injection. Schema contract is fail-closed: unknown type/target/operator/signal values and unknown properties are REJECTED; per-type target/param constraints are enforced by the controller's semantic validator.",
+   "description": "E3.C typed chaos-injection block (nullable). null => no chaos injection. A non-null block is honored by the controller via bin/tt-chaos: type is the injection kind (sigstop_sigcont | kill-harness | kill-daemon | delete-tstx-row | move-branch), target the affected process/data class (per-type), trigger the phase marker that arms the injection, hold_seconds the SIGSTOP hold duration (sigstop_sigcont only), signal the kill signal (kill actions only, default SIGKILL), tree the TSTX tree hash to delete (delete-tstx-row only), ref/repeat/interval_s/wait_timeout_s/rearm/rearm_hold_s the move-branch target-ref injection params (US-004, US-007 S36), operator the executable that performs the injection. Schema contract is fail-closed: unknown type/target/operator/signal values and unknown properties are REJECTED; per-type target/param constraints are enforced by the controller's semantic validator.",
    "anyOf": [
     {
      "type": "null"
@@ -520,7 +520,7 @@
       "delete-tstx-row",
       "move-branch"
      ],
-     "description": "Injection kind. sigstop_sigcont: SIGSTOP the target process, hold, then SIGCONT. kill-harness: send a signal (default SIGKILL) to the active harness process for the run. kill-daemon: send a signal (default SIGKILL) to the TT daemon (never the production daemon). delete-tstx-row: delete the TSTX evidence row(s) matching the declared tree hash. move-branch (US-004, S29 premise redesign): move the case's TARGET REF in the worktree-origin repository (the provisioned work clone) to its parent commit — the colleague target-move injection that makes merge.target_moved / reroute exhaustion genuinely fire; ref names the target ref (e.g. refs/heads/main), repeat the number of persistent moves (default 1), interval_s the seconds between repeated moves (REQUIRED when repeat > 1), wait_timeout_s the per-phase-marker wait bound in seconds (default 120; the controller passes it to tt-chaos as --timeout)."
+     "description": "Injection kind. sigstop_sigcont: SIGSTOP the target process, hold, then SIGCONT. kill-harness: send a signal (default SIGKILL) to the active harness process for the run. kill-daemon: send a signal (default SIGKILL) to the TT daemon (never the production daemon). delete-tstx-row: delete the TSTX evidence row(s) matching the declared tree hash. move-branch (US-004, S29 premise redesign): move the case's TARGET REF in the worktree-origin repository (the provisioned work clone) to its parent commit — the colleague target-move injection that makes merge.target_moved / reroute exhaustion genuinely fire; ref names the target ref (e.g. refs/heads/main), repeat the number of persistent moves (default 1), interval_s the seconds between repeated moves (REQUIRED when repeat > 1; with rearm a minimum-spacing floor), wait_timeout_s the per-phase-marker wait bound in seconds (default 120; the controller passes it to tt-chaos as --timeout), rearm (US-007 S36) the per-attempt re-arm mode (each fresh step:<role>:running occurrence triggers the next move after rearm_hold_s), rearm_hold_s the post-marker hold in seconds (REQUIRED when rearm: true)."
     },
     "target": {
      "enum": [
@@ -577,7 +577,16 @@
     "interval_s": {
      "type": "integer",
      "minimum": 1,
-     "description": "move-branch only: seconds between repeated moves. REQUIRED when repeat > 1 (per-type constraint enforced by the controller's semantic validator); must be ABSENT when repeat is absent or 1."
+     "description": "move-branch only: seconds between repeated moves. REQUIRED when repeat > 1 (per-type constraint enforced by the controller's semantic validator); must be ABSENT when repeat is absent or 1. With rearm: true this is a MINIMUM-SPACING FLOOR (never a free-running cadence) — moves are never fired closer together than interval_s, but each move is triggered by a fresh step:<role>:running occurrence."
+    },
+    "rearm": {
+     "type": "boolean",
+     "description": "move-branch only (US-007 S36 premise redesign): per-attempt re-arm mode. With rearm: true the loop is NOT a free-running clock — each FRESH step:<role>:running occurrence (the step transitions waiting->pending->running on every reroute cycle) triggers the next move after the rearm_hold_s post-marker hold, so EVERY finalize attempt observes a moved tip (the S36 fix: a free-running cadence only landed a move inside a finalize window when the window straddled the next tick). Requires a step: trigger and repeat > 1; must be ABSENT for other types and when repeat is 1."
+    },
+    "rearm_hold_s": {
+     "type": "integer",
+     "minimum": 1,
+     "description": "move-branch only (US-007 S36): the post-marker hold in seconds before each re-armed move — long enough for the merger's tip capture to precede the move (2-5s). REQUIRED when rearm: true; must be ABSENT otherwise."
     },
     "wait_timeout_s": {
      "type": "integer",

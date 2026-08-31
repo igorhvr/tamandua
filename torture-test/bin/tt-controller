@@ -106,6 +106,20 @@ const DEFAULT_PROVIDER_RETRY_BACKOFF_MS = 60_000;
 // its deadline (campaign #8 attempt-2: W1.L3-python left phase=running 3.5h
 // past its 20-min deadline). Tests drive it with a tiny env interval.
 const DEFAULT_DEADLINE_SWEEP_INTERVAL_MS = 30_000;
+// S34 (US-002): deadline-sweep GRACE WINDOW. The sweep must never void an
+// attempt that reached TERMINAL within this window after its deadline_at —
+// the attempt deadline and the independent sweep tick race within seconds
+// (rerun evidence: W4.10-kill-daemon `expired 4s`, W4.48a-daemon-kill-mid-
+// park `3s`, W4.37-keyline-spoof-repo-content `0s` before the sweep observed
+// them) and a run that genuinely completed just past its deadline must be
+// settled by the in-flight monitor (honest PASS / PRODUCT_FAIL), not voided
+// TEST_INFRA_FAIL 'deadline-expired'. Only after the grace window elapses
+// without terminal evidence does the sweep fail closed exactly as before.
+// Default: one full sweep interval (30s). 0 disables the window (pre-fix
+// behavior). Persisted on the state at campaign creation as
+// options.deadline_grace_ms (env TT_CONTROLLER_DEADLINE_GRACE_MS) and
+// validated on load, exactly like deadline_sweep_interval_ms.
+const DEFAULT_DEADLINE_GRACE_MS = 30_000;
 const EVIDENCE_LIMIT_BYTES = 16 * 1024 * 1024;
 const TERMINAL_RUN_STATUSES = new Set(['completed', 'done', 'failed', 'canceled']);
 // MACP7 US-005: register-run collision signature detection for SCRIPTED local
@@ -332,6 +346,25 @@ state, validated on load):
                                            recorded TEST_INFRA_FAIL 'deadline-expired'
                                            on this cadence regardless of any per-case
                                            monitor's status-poll health
+  TT_CONTROLLER_DEADLINE_GRACE_MS          deadline-sweep grace window (S34/US-002,
+                                           default 30000; 0 disables) — an expired
+                                           attempt that reached terminal within this
+                                           window after its deadline_at is NOT swept:
+                                           the in-flight monitor settles the honest
+                                           outcome; only a genuinely-hung attempt (no
+                                           terminal evidence within grace) is swept
+                                           fail-closed
+
+Spawn-environment seams (opt-in, contained):
+  TT_CONTROLLER_SPAWN_HOME_OVERRIDE      redirects the contained spawn env
+                                           HOME/TT_HOME/TAMANDUA_STATE_DIR to a
+                                           caller-supplied home STRICTLY inside
+                                           torture-test/var (S32 battery-hermeticity:
+                                           a per-test temp home so the marker
+                                           corridor never touches the shared
+                                           var/home/.tamandua; escaping HOME throws
+                                           a containment violation, never a silent
+                                           fall-through)
 
 Real-case preflight (E2.5 US-004 + S26 US-004):
   A campaign whose selection includes a real (non-scripted) case runs the
@@ -920,11 +953,18 @@ function validateChaosBlock(caseRecord) {
     // target-move injection — ref (the target ref in the worktree-origin
     // repository) is required, repeat is the number of persistent moves
     // (default 1), interval_s is required when repeat > 1 (the time-spread
-    // that lands a move inside the merger's expected-tip check window), and
-    // wait_timeout_s bounds the phase-marker waits (a trigger minutes into
-    // the run must not die on tt-chaos's 120s default). Fail-closed: any
-    // move-branch param on another type, or a missing/ malformed param here,
-    // is an immediate scenario error.
+    // that lands a move inside the merger's expected-tip check window; with
+    // rearm it is a MINIMUM-SPACING FLOOR), and wait_timeout_s bounds the
+    // phase-marker waits (a trigger minutes into the run must not die on
+    // tt-chaos's 120s default). US-007 (S36): rearm declares the per-attempt
+    // RE-ARM mode — each fresh step:finalize_merge:running occurrence (the
+    // step transitions waiting->pending->running on every reroute cycle)
+    // triggers the next move after the rearm_hold_s post-marker hold, so
+    // EVERY finalize attempt observes a moved tip (the S36 root cause: a
+    // free-running cadence only landed a move inside a finalize window when
+    // the window straddled the next tick). Fail-closed: any move-branch param
+    // on another type, or a missing/malformed param here, is an immediate
+    // scenario error.
     if (block.type === 'move-branch') {
       if (!(typeof block.ref === 'string' && block.ref.length > 0 && /^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(block.ref))) {
         errors.push('chaos block ref must be a non-empty ref name for move-branch (e.g. refs/heads/main)');
@@ -942,6 +982,30 @@ function validateChaosBlock(caseRecord) {
       if (block.wait_timeout_s !== undefined && (!Number.isSafeInteger(block.wait_timeout_s) || block.wait_timeout_s < 1)) {
         errors.push('chaos block wait_timeout_s must be a positive integer (got ' + JSON.stringify(block.wait_timeout_s) + ')');
       }
+      // US-007 (S36): rearm mode validation — boolean, move-branch only,
+      // requires repeat > 1 (the re-arm loop needs at least two moves), a
+      // step: trigger (the loop re-arms on each step:<role>:running
+      // occurrence — no occurrence stream exists for event:/file:/now
+      // markers), and a positive rearm_hold_s (the post-marker hold so the
+      // merger's tip capture precedes the move). rearm_hold_s without rearm
+      // is a scenario error (never a silently-ignored param).
+      if (block.rearm !== undefined && typeof block.rearm !== 'boolean') {
+        errors.push('chaos block rearm must be a boolean for move-branch (got ' + JSON.stringify(block.rearm) + ')');
+      }
+      if (block.rearm === true) {
+        if (repeat < 2) {
+          errors.push('chaos block rearm requires repeat > 1 for move-branch (the per-attempt re-arm loop needs at least two moves)');
+        }
+        if (!(Number.isSafeInteger(block.rearm_hold_s) && block.rearm_hold_s > 0)) {
+          errors.push('chaos block rearm_hold_s must be a positive integer for move-branch rearm (the post-marker hold before each re-armed move)');
+        }
+        const rearmTrigger = translateChaosTrigger(block.trigger);
+        if (typeof rearmTrigger !== 'string' || !rearmTrigger.startsWith('step:')) {
+          errors.push(`chaos block rearm requires a step:<role>:<state> trigger for move-branch (the re-arm loop re-arms on each step:<role>:running occurrence), got ${JSON.stringify(block.trigger ?? null)}`);
+        }
+      } else if (block.rearm_hold_s !== undefined) {
+        errors.push('chaos block rearm_hold_s requires rearm: true for move-branch (the post-marker hold is a re-arm mode parameter)');
+      }
     } else {
       if (block.ref !== undefined) {
         errors.push(`chaos block type '${block.type}' does not take ref (move-branch only)`);
@@ -951,6 +1015,12 @@ function validateChaosBlock(caseRecord) {
       }
       if (block.interval_s !== undefined) {
         errors.push(`chaos block type '${block.type}' does not take interval_s (move-branch only)`);
+      }
+      if (block.rearm !== undefined) {
+        errors.push(`chaos block type '${block.type}' does not take rearm (move-branch only)`);
+      }
+      if (block.rearm_hold_s !== undefined) {
+        errors.push(`chaos block type '${block.type}' does not take rearm_hold_s (move-branch only)`);
       }
     }
   }
@@ -1391,6 +1461,22 @@ function configuredDeadlineSweepIntervalMs() {
   return Number(configured);
 }
 
+// S34 (US-002): env-configurable deadline-sweep GRACE WINDOW (mirrors
+// configuredDeadlineSweepIntervalMs). Persisted on the state at campaign
+// creation as options.deadline_grace_ms and validated on load; 0 disables the
+// window (pre-fix sweep behavior). The sweep defers voiding an expired
+// attempt that reached terminal within this window after its deadline_at, so
+// the in-flight monitor settles the honest outcome (see
+// DEFAULT_DEADLINE_GRACE_MS / sweepDeadlineExpiredAttempts).
+function configuredDeadlineGraceMs() {
+  const configured = process.env.TT_CONTROLLER_DEADLINE_GRACE_MS;
+  if (configured === undefined) return DEFAULT_DEADLINE_GRACE_MS;
+  if (!/^\d+$/.test(configured) || !Number.isSafeInteger(Number(configured))) {
+    throw new Error('TT_CONTROLLER_DEADLINE_GRACE_MS must be a nonnegative integer');
+  }
+  return Number(configured);
+}
+
 function ensureResultsRoot() {
   const ttRealPath = fs.realpathSync(TT_ROOT);
   if (fs.existsSync(VAR_ROOT)) {
@@ -1659,6 +1745,26 @@ function loadSpawnEnvironment(scripted) {
   // unchanged).
   if (typeof process.env.TT_FORCE_NO_SYSTEMD === 'string' && process.env.TT_FORCE_NO_SYSTEMD.length > 0) {
     merged.TT_FORCE_NO_SYSTEMD = process.env.TT_FORCE_NO_SYSTEMD;
+  }
+  // S32 (US-001): battery-hermeticity seam — TT_CONTROLLER_SPAWN_HOME_OVERRIDE
+  // redirects the contained spawn env HOME/TT_HOME/TAMANDUA_STATE_DIR to a
+  // caller-supplied home STRICTLY inside torture-test/var (a per-test temp
+  // home, e.g. var/us003-hermetic-home-<pid>). The marker corridor
+  // (steps-table + per-run event streams), the status/DB evidence queries,
+  // and every child spawn then resolve against THAT home, so a pre-existing
+  // campaign-populated var/home/.tamandua/tamandua.db (real tamandua schema)
+  // can never break a test that seeds marker rows into the SHARED contained
+  // home. OPT-IN only: unset, the env-script-derived HOME stays the default;
+  // TAMANDUA_DB_PATH is intentionally NOT derived here (the code resolves it
+  // from HOME/STATE_DIR — the env-script split-brain discipline). The final
+  // assertContainedHome re-validates the override fail-closed: an escaping
+  // HOME throws a containment violation (never a silent fall-through).
+  const spawnHomeOverride = process.env.TT_CONTROLLER_SPAWN_HOME_OVERRIDE;
+  if (typeof spawnHomeOverride === 'string' && spawnHomeOverride.trim() !== '') {
+    const overrideHome = path.resolve(spawnHomeOverride);
+    merged.HOME = overrideHome;
+    merged.TT_HOME = overrideHome;
+    merged.TAMANDUA_STATE_DIR = path.join(overrideHome, '.tamandua');
   }
   // FIX10 US-003: fail closed — the resolved HOME must be strictly inside
   // torture-test/var (realpath). A misconfigured env script (or one that
@@ -6061,6 +6167,14 @@ function buildChaosArgv(block, runId, targetRecord, originRepo) {
       argv.push('--repeat', String(repeat));
       argv.push('--interval', String(block.interval_s));
     }
+    // US-007 (S36): per-attempt re-arm mode — each fresh
+    // step:finalize_merge:running occurrence triggers the next move after the
+    // rearm_hold_s post-marker hold (interval_s becomes a minimum-spacing
+    // floor inside tt-chaos).
+    if (block.rearm === true) {
+      argv.push('--rearm');
+      argv.push('--rearm-hold-s', String(block.rearm_hold_s));
+    }
     if (Number.isSafeInteger(block.wait_timeout_s) && block.wait_timeout_s > 0) {
       argv.push('--timeout', String(block.wait_timeout_s));
     }
@@ -6358,11 +6472,15 @@ async function runDeclaredChaos(caseRecord, attempt, childEnv, state, campaignDi
     // US-004 (S29 premise redesign): move-branch declaration + resolved
     // worktree-origin repository (the provisioned work clone) and the
     // persistent-move budget, recorded so O16/oracle snapshot cross-checks
-    // see exactly what was injected.
+    // see exactly what was injected. US-007 (S36): the rearm flag + hold are
+    // recorded too — the per-attempt re-arm mode is part of the injection
+    // contract the evidence must pin.
     ref: block.type === 'move-branch' ? block.ref : null,
     repeat: block.type === 'move-branch' ? (block.repeat ?? 1) : null,
     interval_s: block.type === 'move-branch' ? (block.interval_s ?? null) : null,
     wait_timeout_s: block.type === 'move-branch' ? (block.wait_timeout_s ?? null) : null,
+    rearm: block.type === 'move-branch' ? (block.rearm ?? false) : null,
+    rearm_hold_s: block.type === 'move-branch' ? (block.rearm === true ? (block.rearm_hold_s ?? null) : null) : null,
     origin_repo: block.type === 'move-branch' ? (resolveChaosOriginRepo(attempt) ?? null) : null,
     status: 'running',
     started_at: utcTimestamp(),
@@ -8580,6 +8698,11 @@ async function executeCaseWithProviderRetry(caseRecord, caseState, state, campai
 // deadline must not preempt a recoverable local result.
 function sweepDeadlineExpiredAttempts(state, campaignDir) {
   const now = Date.now();
+  // S34 (US-002): the sweep-aware grace window (see
+  // DEFAULT_DEADLINE_GRACE_MS). Persisted on the state at campaign creation
+  // as options.deadline_grace_ms and validated on load, exactly like
+  // deadline_sweep_interval_ms; 0 disables the window (pre-fix behavior).
+  const deadlineGraceMs = state.options.deadline_grace_ms ?? DEFAULT_DEADLINE_GRACE_MS;
   let sweptAny = false;
   for (const caseState of state.cases) {
     if (caseState.phase !== 'running') continue;
@@ -8589,6 +8712,25 @@ function sweepDeadlineExpiredAttempts(state, campaignDir) {
     if (attempt.deadline_at === undefined || !isUtcTimestamp(attempt.deadline_at)) continue;
     const deadlineMs = new Date(attempt.deadline_at).valueOf();
     if (deadlineMs >= now) continue;
+
+    // S34 (US-002): the grace contract — never void an attempt that reached
+    // TERMINAL within the documented grace window after its deadline_at. The
+    // attempt deadline and the independent sweep tick race within seconds
+    // (rerun evidence: W4.10-kill-daemon `expired 4s`, W4.48a-daemon-kill-
+    // mid-park `3s`, W4.37-keyline-spoof-repo-content `0s` before the sweep
+    // observed them) and a run that genuinely completed just past its
+    // deadline must be settled by the in-flight monitor (honest PASS /
+    // PRODUCT_FAIL), not voided TEST_INFRA_FAIL. Only a genuinely-hung
+    // attempt (no terminal evidence within grace) is swept fail-closed
+    // exactly as before. Unprovable evidence (no run id, spawn-env failure,
+    // status-query failure) is NOT a deferral — the grace skip is a positive
+    // proof of terminal-within-grace, never a weakening of the sweep.
+    if (attemptReachedTerminalWithinGrace(
+      attempt, deadlineMs, now, deadlineGraceMs,
+      () => loadSpawnEnvironment(attempt.execution_mode === 'scripted'),
+    )) {
+      continue;
+    }
 
     const observedAt = utcTimestamp();
     const expiredForSeconds = Math.max(0, Math.floor((now - deadlineMs) / 1000));
@@ -8623,6 +8765,49 @@ function sweepDeadlineExpiredAttempts(state, campaignDir) {
     sweptAny = true;
   }
   return sweptAny;
+}
+
+// S34 (US-002): the deadline-sweep grace contract. Returns true when the
+// attempt reached TERMINAL within the grace window after its deadline_at —
+// the sweep must then defer to the in-flight monitor (which settles the
+// honest PASS / PRODUCT_FAIL outcome) instead of voiding TEST_INFRA_FAIL
+// 'deadline-expired'. Terminal evidence is either:
+//   (a) an attempt already carrying terminal evidence (terminal_status /
+//       terminal_at / terminal_evidence recorded by a monitor/harvest leg
+//       before classification landed), or
+//   (b) a run whose status is terminal via the existing terminal-evidence
+//       status leg (queryWorkflowStatus) — the run is terminal and we are
+//       still inside the grace window after the deadline.
+// In both cases the evidence must fall within [deadline_at,
+// deadline_at + grace]. A genuinely-hung attempt (no terminal evidence
+// within grace) returns false and is swept fail-closed exactly as before.
+// UNPROVABLE evidence returns false too — the grace skip is a POSITIVE proof
+// of terminal-within-grace; a missing run id, a spawn-env failure, or a
+// status-query failure never weakens the fail-closed sweep.
+function attemptReachedTerminalWithinGrace(attempt, deadlineMs, now, graceMs, loadChildEnv) {
+  const terminalAtMs = typeof attempt.terminal_at === 'string' && isUtcTimestamp(attempt.terminal_at)
+    ? new Date(attempt.terminal_at).valueOf()
+    : null;
+  const hasAttemptTerminalEvidence = attempt.terminal_status !== undefined
+    || attempt.terminal_at !== undefined
+    || attempt.terminal_evidence !== undefined;
+  if (hasAttemptTerminalEvidence) {
+    return (terminalAtMs ?? now) - deadlineMs <= graceMs;
+  }
+  if (typeof attempt.run_id !== 'string' || attempt.run_id === '') return false;
+  if (now - deadlineMs > graceMs) return false;
+  let childEnv;
+  try {
+    childEnv = loadChildEnv();
+  } catch {
+    return false;
+  }
+  try {
+    const status = queryWorkflowStatus(attempt.run_id, childEnv);
+    return TERMINAL_RUN_STATUSES.has(status.status);
+  } catch {
+    return false;
+  }
 }
 
 async function executeEligibleCases(manifest, state, campaignDir) {
@@ -8879,7 +9064,10 @@ function validateLoadedState(state, campaignId) {
           || state.options.provider_retry_backoff_ms < 0))
       || (state.options.deadline_sweep_interval_ms !== undefined
         && (!Number.isSafeInteger(state.options.deadline_sweep_interval_ms)
-          || state.options.deadline_sweep_interval_ms < 1))) {
+          || state.options.deadline_sweep_interval_ms < 1))
+      || (state.options.deadline_grace_ms !== undefined
+        && (!Number.isSafeInteger(state.options.deadline_grace_ms)
+          || state.options.deadline_grace_ms < 0))) {
     errors.push('campaign options are missing or invalid');
   }
   if (!isObject(state.spend)
@@ -9007,6 +9195,10 @@ function createInitialState(campaignId, manifestPath, manifest, options) {
       // configuredDeadlineSweepIntervalMs). Persisted at campaign creation so
       // a resume keeps the sweep cadence the campaign was launched with.
       deadline_sweep_interval_ms: configuredDeadlineSweepIntervalMs(),
+      // S34 (US-002): deadline-sweep grace window (see
+      // configuredDeadlineGraceMs). Persisted at campaign creation so a
+      // resume keeps the grace window the campaign was launched with.
+      deadline_grace_ms: configuredDeadlineGraceMs(),
       execution_selection: options.scriptedOnly ? 'scripted-only' : 'all',
     },
     spend: {

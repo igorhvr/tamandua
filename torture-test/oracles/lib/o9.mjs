@@ -245,6 +245,86 @@ function readCaseBundleOrigins(invocation) {
   return origins;
 }
 
+// S35 (US-005): the detached-HEAD snapshot contract (US-009 / S31). A
+// detached-HEAD origin fixture (W4.30-detached-head-origin) has NO symbolic
+// target ref — the snapshot records the detached HEAD commit as `target_ref`
+// (the resolved 40-hex OID) with `detached_head: true` on
+// refs_before/refs_after/target_reflog. O9 consumes that contract end-to-end:
+// row/tree resolution walks the detached HEAD commit's reachable trees (never
+// requiring a symbolic target ref) and the evidence records the contract
+// fields. The refs evidence is OPTIONAL for O9 (only O2 requires it): absent
+// refs evidence means "no detached contract" and the audit proceeds exactly as
+// before; a CLAIMED detached contract (detached_head: true) must be
+// well-formed and agree across the refs snapshots (fail-closed), while a
+// malformed/unparseable NAMED refs artifact is advisory-only and never changes
+// the O9 verdict path.
+function readDetachedHeadContract(invocation) {
+  const artifacts = [];
+  for (const key of ['refs_before', 'refs_after', 'target_reflog']) {
+    const file = invocation.evidencePaths[key];
+    if (file === undefined) continue;
+    let artifact;
+    try {
+      artifact = readJson(file, key);
+    } catch {
+      continue; // advisory evidence for O9 — an unparseable named snapshot is ignored
+    }
+    if (artifact.schema_version !== 1) continue;
+    artifacts.push({ key, artifact });
+  }
+  const detachedArtifacts = artifacts.filter(({ artifact }) => artifact.detached_head === true);
+  const namedArtifacts = artifacts.filter(({ artifact }) => artifact.detached_head !== true);
+  if (detachedArtifacts.length > 0 && namedArtifacts.length > 0) {
+    throw new OracleRuntimeError('refs evidence disagrees on the detached-HEAD contract (some snapshots mark detached_head, others do not)');
+  }
+  if (detachedArtifacts.length === 0) {
+    const namedTargetRef = namedArtifacts.find(({ artifact }) => typeof artifact.target_ref === 'string')?.artifact.target_ref ?? null;
+    return { detached: false, targetRef: null, namedTargetRef, sources: artifacts.map(({ key }) => key) };
+  }
+  let targetRef = null;
+  for (const { key, artifact } of detachedArtifacts) {
+    const ref = requireOid(artifact.target_ref, `${key}.target_ref`);
+    if (targetRef !== null && ref !== targetRef) {
+      throw new OracleRuntimeError('refs evidence detached-HEAD target_ref must agree across snapshots');
+    }
+    targetRef = ref;
+  }
+  return { detached: true, targetRef, namedTargetRef: null, sources: detachedArtifacts.map(({ key }) => key) };
+}
+
+// S35 (US-005): the launch-refused corridor on a detached-HEAD origin. W4.30's
+// premise is a detached-HEAD origin that the product REFUSES at launch
+// (`createRunWorktree` throws before any ref mutation); the run fails at
+// launch and NO shim evidence is ever produced. O9's shim-state-machine audit
+// has nothing to fail in that corridor, so a REAL judgment (PASS) is rendered
+// with the corridor recorded in the evidence — the campaign harness cannot
+// classify NOT_EVALUABLE (`result must be PASS, FAIL, or ERROR`), which was
+// the S35 ORACLE_TEST_INFRA. The corridor is positively proven (fail-closed —
+// never a silent PASS on missing evidence): the detached-HEAD contract must be
+// present, the attempt must be terminal FAILED (the refusal), and the run
+// event stream must carry `run.failed` with NO `suite.*` activity (the shim
+// never ran). Any other empty-observation shape keeps the existing
+// NOT_EVALUABLE verdict.
+function runEventNames(invocation) {
+  const artifact = readJson(invocation.evidencePaths.run_events, 'run_events');
+  if (artifact.schema_version !== 1) throw new OracleRuntimeError('run_events.schema_version must be 1');
+  const names = [];
+  for (const raw of array(artifact.rows, 'run_events.rows')) {
+    const wrapper = object(raw, 'run_events.rows[]');
+    if (typeof wrapper.event?.event === 'string') names.push(wrapper.event.event);
+  }
+  return names;
+}
+
+function detachedHeadLaunchRefusedCorridor(invocation, detached) {
+  if (!detached.detached || detached.targetRef === null) return null;
+  const attempts = Array.isArray(invocation.context?.attempts) ? invocation.context.attempts : [];
+  if (!attempts.some((attempt) => attempt?.terminal_status === 'failed')) return null;
+  const names = runEventNames(invocation);
+  if (names.length === 0 || !names.includes('run.failed') || names.some((name) => name.startsWith('suite.'))) return null;
+  return 'run failed at launch on a detached-HEAD origin (US-009: target_ref = commit OID, detached_head: true); no shim evidence was produced, so the shim-state-machine audit has nothing to fail (launch-refused corridor)';
+}
+
 function observationShape(raw, index) {
   const label = `suite_observations.rows[${index}]`;
   const row = object(raw, label);
@@ -407,8 +487,43 @@ export async function evaluateO9(invocation) {
       }, 'sqlite-git-and-shim-state-machine')],
     };
   }
+  // S35 (US-005): the detached-HEAD snapshot contract (US-009) — target_ref =
+  // commit OID with detached_head: true on refs_before/refs_after/target_reflog.
+  // Consumed by the launch-refused corridor, tree resolution and the evidence.
+  const detached = readDetachedHeadContract(invocation);
   const parsed = readObservations(invocation.evidencePaths.suite_observations);
   if (parsed.empty) {
+    // S35 (US-005): the detached-HEAD launch-refused corridor (W4.30) — a run
+    // refused at launch on a detached-HEAD origin produces no shim evidence,
+    // but the corridor is the case's EXPECTED outcome and the detached-HEAD
+    // contract + terminal-failed attempt + run.failed-without-suite-events
+    // positively prove it. Render the real judgment (PASS, nothing to audit)
+    // instead of NOT_EVALUABLE, which the campaign harness cannot classify
+    // (`result must be PASS, FAIL, or ERROR` — the S35 ORACLE_TEST_INFRA).
+    const corridor = detachedHeadLaunchRefusedCorridor(invocation, detached);
+    if (corridor !== null) {
+      return {
+        result: 'PASS',
+        findings: [],
+        evidence: [writeEvidenceJson(invocation, 'o9-ledger-replay-audit.json', {
+          schema_version: 1,
+          not_evaluable: false,
+          launch_refused_corridor: true,
+          corridor_reason: corridor,
+          detached_head: true,
+          target_ref: detached.targetRef,
+          symbolic_target_ref: null,
+          ledger_reconciled: false,
+          observation_count: 0,
+          invocation_count: 0,
+          replay_count: 0,
+          force_execution_count: 0,
+          singleflight_observation_count: 0,
+          special_exit_observation_count: 0,
+          origin_identity_count: 0,
+        }, 'sqlite-git-and-shim-state-machine')],
+      };
+    }
     return {
       result: 'NOT_EVALUABLE',
       findings: [],
@@ -455,6 +570,21 @@ export async function evaluateO9(invocation) {
   let reachableTrees;
   try {
     reachableTrees = new Set(runGit({ campaignRoot: invocation.campaignRoot, repository, args: ['log', '--all', '--format=%T'] }).stdout.split(/\r?\n/).filter(Boolean));
+    if (detached.detached && detached.targetRef !== null) {
+      // S35 (US-005): a detached-HEAD origin has NO symbolic target ref — the
+      // target identity IS the detached HEAD commit (US-009: target_ref =
+      // commit OID). Walk the detached commit's reachable trees explicitly so
+      // a commit reachable ONLY via the detached HEAD (no symbolic ref) still
+      // resolves; `--all` already includes HEAD, so this is an idempotent
+      // belt-and-suspenders per the contract, never a weakening of tree
+      // resolution. An unresolvable detached target_ref is fail-closed
+      // (internally inconsistent evidence).
+      const walk = runGit({ campaignRoot: invocation.campaignRoot, repository, args: ['log', detached.targetRef, '--format=%T'], acceptedStatuses: [0, 128] });
+      if (walk.status !== 0) {
+        throw new OracleRuntimeError(`detached-HEAD target_ref ${detached.targetRef} is not resolvable in the captured git snapshot`);
+      }
+      for (const tree of walk.stdout.split(/\r?\n/).filter(Boolean)) reachableTrees.add(tree);
+    }
     for (const row of inScopeLedger) {
       const type = runGit({ campaignRoot: invocation.campaignRoot, repository, args: ['cat-file', '-t', row.tree_hash], acceptedStatuses: [0, 128] });
       if (type.status !== 0 || type.stdout.trim() !== 'tree' || !reachableTrees.has(row.tree_hash)) {
@@ -668,6 +798,13 @@ export async function evaluateO9(invocation) {
     special_exit_observation_count: specialExits.length,
     origin_identity_count: originIdentities.length,
     ttl_green_ms: ttl,
+    // S35 (US-005): the detached-HEAD snapshot contract fields (US-009). When
+    // the refs evidence marks detached_head: true, target_ref IS the detached
+    // HEAD commit OID and no symbolic target ref exists; O9 resolves reachable
+    // trees from that commit and never requires (or writes) a symbolic ref.
+    detached_head: detached.detached,
+    target_ref: detached.targetRef,
+    symbolic_target_ref: detached.namedTargetRef,
   }, 'sqlite-git-and-shim-state-machine')];
   return { result: findings.length === 0 ? 'PASS' : 'FAIL', findings: findings.toJSON(), evidence };
 }

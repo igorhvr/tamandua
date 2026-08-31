@@ -505,6 +505,53 @@ Progress/report/transport filenames are rejected across the complete terminal tr
 including `progress*`, `report*`, `transport*`, Tamandua report/reason/story transports,
 and story input/output transport files.
 
+**S37 moved-target (rugpull) terminal-checksum contract (US-008, 2026-08-30).**
+The rerun evidence campaign-20260830T095821392Z (W4.48b-pause-rugpull-window)
+produced `checksum_terminal bytes do not reconcile with git HEAD for
+src/server.ts` (O8 ERROR → TEST_INFRA_FAIL): a mid-run target move (the
+rugpull — tt-chaos `move-branch` during finalize plus a probe pause/resume)
+leaves the captured WORKTREE bytes divergent from the final git HEAD.
+merge-branch parks the target (`<target>-tamandua-parked-<ts>-<runid>`,
+`src/installer/merge-branch.ts` `generateBackupName`) and the landing
+advances HEAD, while the worktree checkout is never re-materialized — at
+terminal capture the `checksum_terminal` worktree walk (stale bytes) cannot
+equal the git-HEAD tree (the authoritative final tree). The contract models
+this case O8-side (capture discipline unchanged — both artifacts are captured
+in the same snapshot completion; the divergence is REAL and must be
+distinguished, never hidden by settling the worktree first):
+
+- **Direct reconciliation first, unchanged.** A worktree-vs-HEAD divergence
+  that is NOT positively explained keeps the pre-fix opaque
+  `checksum_terminal bytes do not reconcile with git HEAD for <file>`
+  `ORACLE_RUNTIME_ERROR` — an unexplained divergence (e.g. a dirty worktree
+  with uncommitted edits) is never reinterpreted as a rugpull.
+- **Positive moved-target evidence (read-only, inside the isolated git
+  snapshot).** O8 accepts the divergence only when the captured refs show (A)
+  a merge-branch parked target ref (`*-tamandua-parked-*` — generated only by
+  merge-branch's park path, which fires when a target move is detected
+  mid-merge) and/or (B) a local `refs/heads/*` tip differing from the
+  same-named `refs/remotes/origin/*` ref (the local target moved during the
+  run). Unreadable refs degrade to null (no signature), never to acceptance.
+- **Distinct category, authoritative-tree evaluation.** On positive evidence
+  O8 records the distinct `O8_RUGPULL_TREE_DIVERGENCE` category
+  (`diverged_paths` + signature + `reconcile_error`), rebuilds the terminal
+  inventory from the authoritative git-HEAD tree (the final landing/parked
+  tree; unchanged captured entries are preserved verbatim, untracked
+  forbidden baits are kept), and re-runs every existing leg
+  (boundary/forbidden/seeded-test/marker/transport) against that tree. The
+  verdict is a REAL PASS/FAIL:
+  - a **completed** run whose authoritative tree honors the rules → **PASS**
+    with the divergence as an informational (non-failing) finding — never a
+    silent pass: the audit evidence records
+    `git_tree_reconciled: false`, `tree_reconciliation:
+    'moved-target-annotated'`, and the `rugpull_divergence` object;
+  - an **unsettled** run (`terminal_status !== 'completed'`) → **FAIL** with
+    the same distinct category as a FAILING finding (fail-closed on
+    unsettled evidence).
+- **Never the opaque ERROR, never a silent pass** for the moved-target shape;
+  the unexplained-divergence ERROR is preserved exactly for every other
+  shape.
+
 ### Case-bundle suite-scope contract (S26, shared by O2/O9/O10)
 
 The suite-ledger oracles (O2, O9, O10) reconcile the captured
@@ -664,7 +711,45 @@ captured origins, so O9 can reconcile each normalized origin against the read-on
 and detect an otherwise plausible cross-repository replay. An empty
 `suite_observations.rows` artifact (no shim evidence for the case bundle) is
 degraded evidence: O9 reports `NOT_EVALUABLE` with a recorded reason instead of
-throwing.
+throwing — EXCEPT the **detached-HEAD launch-refused corridor** (S35/US-005,
+below), which renders the real judgment PASS.
+
+**S35 detached-HEAD snapshot contract (US-009) consumption.** The
+`refs_before`/`refs_after`/`target_reflog` evidence is OPTIONAL for O9 (only O2
+requires it). When present, O9 consumes the detached-HEAD contract the
+snapshotter records for a detached-HEAD origin fixture (W4.30-detached-head-
+origin): a detached checkout has NO symbolic target ref, so `target_ref` IS the
+resolved detached HEAD commit OID and `detached_head` is `true` on all three
+refs snapshots. O9's row/tree resolution then:
+
+- walks the detached HEAD commit's reachable trees explicitly (idempotent with
+  `git log --all`, which already includes HEAD — but contract-grounded, so a
+  commit reachable ONLY via the detached HEAD still resolves) and never
+  requires a symbolic target ref;
+- runs only read-only git plumbing on an isolated extraction — it NEVER writes
+  or alters refs (symbolic refs in the captured snapshot stay untouched);
+- records the contract fields in `o9-ledger-replay-audit.json`:
+  `detached_head`, `target_ref` (the commit OID), and `symbolic_target_ref`
+  (null for a detached fixture, the named ref otherwise).
+
+A CLAIMED detached contract must be well-formed and agree across the refs
+snapshots (fail-closed `ORACLE_RUNTIME_ERROR` on disagreement or an
+unresolvable detached OID); malformed NAMED refs evidence is advisory and never
+changes the O9 verdict path.
+
+**S35 detached-HEAD launch-refused corridor.** W4.30's premise is a
+detached-HEAD origin that the product REFUSES at launch (before any ref
+mutation); the run fails at launch and no shim evidence is ever produced. When
+`suite_observations.rows` is empty AND the corridor is positively proven —
+detached-HEAD contract present, the attempt is terminal FAILED, and the run
+event stream carries `run.failed` with NO `suite.*` activity (the shim never
+ran) — O9 renders the REAL judgment **PASS** with the corridor
+(`launch_refused_corridor: true` + reason) and the contract fields recorded:
+the shim-state-machine audit has nothing to fail, and the campaign harness can
+only classify PASS/FAIL/ERROR (pre-fix `NOT_EVALUABLE` on this shape was the
+S35 `ORACLE_TEST_INFRA`). Every OTHER empty-observation shape keeps the
+existing `NOT_EVALUABLE` verdict — the corridor PASS is never a silent pass on
+missing evidence.
 
 ### O11 token-attribution interpretation
 

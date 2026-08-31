@@ -66,6 +66,25 @@ const CASES = [
   { name: 'o9-in-scope-mismatch', expected: 'ERROR', mutation: 'in-scope-mismatch' },
   { name: 'o9-empty-observations', expected: 'NOT_EVALUABLE', mutation: 'empty-observations' },
   { name: 'o9-null-gate-key', expected: 'NOT_EVALUABLE', mutation: 'null-gate-key' },
+  // S35 (US-005): the detached-HEAD snapshot contract (US-009) — a synthetic
+  // repo whose HEAD is DETACHED at a commit OID (no symbolic ref checked out),
+  // with refs_before/refs_after/target_reflog carrying target_ref = <40-hex
+  // OID> + detached_head: true and non-empty suite_observations + suite_ledger
+  // consistent with the fixture. The detached commit is reachable ONLY via the
+  // detached HEAD (the branch is deleted) — the strictest detached-HEAD-only
+  // shape: O9 must resolve the ledger tree from the detached HEAD commit per
+  // the contract, never require a symbolic target ref, and never alter refs.
+  // `o9-detached-green` must evaluate PASS; `o9-detached-wrong-tree` must
+  // still FAIL with O9_LEDGER_TREE_UNRESOLVED (fail-closed preserved).
+  // `o9-detached-launch-refused` reproduces the W4.30 launch-refused corridor
+  // (empty suite evidence because the run was refused at launch on the
+  // detached-HEAD origin): post-fix O9 renders the REAL judgment PASS with the
+  // corridor + contract fields recorded — pre-fix it answered NOT_EVALUABLE,
+  // which the campaign harness cannot classify (`result must be PASS, FAIL, or
+  // ERROR` — the S35 ORACLE_TEST_INFRA).
+  { name: 'o9-detached-green', expected: 'PASS', mutation: 'detached-green' },
+  { name: 'o9-detached-wrong-tree', expected: 'FAIL', mutation: 'detached-wrong-tree', finding: 'O9_LEDGER_TREE_UNRESOLVED' },
+  { name: 'o9-detached-launch-refused', expected: 'PASS', mutation: 'detached-launch-refused' },
 ];
 
 function run(command, args, cwd) {
@@ -130,7 +149,32 @@ for (const fixture of CASES) {
   run('git', ['add', '.'], repo);
   run('git', ['commit', '-m', 'second committed tree'], repo);
   const secondTree = run('git', ['rev-parse', 'HEAD^{tree}'], repo);
-  const ledgerTree = fixture.mutation === 'wrong-tree' ? 'f'.repeat(committedTree.length) : committedTree;
+  const secondCommit = run('git', ['rev-parse', 'HEAD'], repo);
+  // S35 (US-005): the detached-HEAD fixtures commit a NEW tree while HEAD is
+  // DETACHED, then delete the branch so the detached commit is reachable ONLY
+  // via the detached HEAD (no symbolic ref checked out — the strictest
+  // detached-HEAD-only shape the US-009 contract must resolve).
+  let detachedCommit = null;
+  let detachedTree = null;
+  if (fixture.mutation?.startsWith('detached-')) {
+    run('git', ['checkout', '-q', '--detach', 'HEAD'], repo);
+    fs.writeFileSync(path.join(repo, 'value.txt'), 'three\n');
+    run('git', ['add', '.'], repo);
+    run('git', ['commit', '-m', 'detached HEAD commit'], repo);
+    detachedCommit = run('git', ['rev-parse', 'HEAD'], repo);
+    detachedTree = run('git', ['rev-parse', 'HEAD^{tree}'], repo);
+    run('git', ['branch', '-D', 'main'], repo);
+    const headContent = fs.readFileSync(path.join(repo, '.git', 'HEAD'), 'utf8').trim();
+    if (headContent !== detachedCommit || headContent.startsWith('ref:')) {
+      throw new Error(`detached fixture must have a raw-OID HEAD, got ${headContent}`);
+    }
+    if (fs.existsSync(path.join(repo, '.git', 'refs', 'heads', 'main'))) {
+      throw new Error('detached fixture must not carry refs/heads/main');
+    }
+  }
+  const ledgerTree = fixture.mutation === 'wrong-tree' ? 'f'.repeat(committedTree.length)
+    : fixture.mutation === 'detached-wrong-tree' ? 'f'.repeat(40)
+    : fixture.mutation?.startsWith('detached-') ? detachedTree : committedTree;
   const rowCreatedAt = fixture.mutation === 'stale' ? '2026-07-30T11:59:59.000Z' : '2026-08-01T12:00:00.000Z';
   const firstExit = fixture.mutation === 'red-replay' ? 1 : 0;
   const rows = [{
@@ -139,6 +183,10 @@ for (const fixture of CASES) {
   }];
   const replayKey = fixture.mutation === 'wrong-key' ? key(committedTree, OTHER_CMD_HASH) : key(ledgerTree);
   const replayForce = fixture.mutation === 'force-skipped';
+  // S35 (US-005): for the detached-HEAD fixtures the mechanically committed
+  // tree is the detached HEAD commit's tree (reachable only via the detached
+  // HEAD per US-009) — the replay must bind to that tree.
+  const committedTreeHash = fixture.mutation?.startsWith('detached-') ? detachedTree : committedTree;
   // S26 (US-003): `missing-replay-row` names a positive row id (999) that
   // exists nowhere — neither in the captured ledger nor in the database
   // snapshot — which keeps O9_REPLAY_ROW_MISSING fail-closed. An
@@ -151,7 +199,7 @@ for (const fixture of CASES) {
   const observations = [
     observation('obs-1', 'inv-replay', 1, 'lookup', '2026-08-01T12:04:59.000Z', replayKey, replayForce, { latest_row_id: 1 }),
     observation('obs-2', 'inv-replay', 2, 'replay', '2026-08-01T12:05:00.000Z', replayKey, replayForce, {
-      ledger_row_id: replayRowId, marker: 'TAMANDUA-TEST CACHED', exit_code: 0, committed_tree_hash: committedTree,
+      ledger_row_id: replayRowId, marker: 'TAMANDUA-TEST CACHED', exit_code: 0, committed_tree_hash: committedTreeHash,
     }),
   ];
 
@@ -183,11 +231,12 @@ for (const fixture of CASES) {
     );
   }
 
-  if (fixture.mutation === 'empty-observations') observations.splice(0);
+  if (fixture.mutation === 'empty-observations' || fixture.mutation === 'detached-launch-refused') observations.splice(0);
 
   const singleflight = [];
   const specialExits = [];
-  const originIdentities = fixture.mutation === 'empty-observations' ? [] : [{ origin_repo: ORIGIN, normalized_origin_repo: ORIGIN }];
+  const originIdentities = fixture.mutation === 'empty-observations' || fixture.mutation === 'detached-launch-refused'
+    ? [] : [{ origin_repo: ORIGIN, normalized_origin_repo: ORIGIN }];
   const appendObservation = (invocationId, phase, observedAt, suiteKey, force, extra = {}) => {
     observations.push(observation(`obs-${observations.length + 1}`, invocationId, observations.length + 1, phase, observedAt, suiteKey, force, extra));
   };
@@ -365,15 +414,25 @@ for (const fixture of CASES) {
 
   const references = Object.fromEntries(REFERENCE_KEYS.map((name) => [name, null]));
   references.database_snapshot = reference(campaign, databasePath, 'sqlite-self-test');
-  const eventRows = fixture.mutation?.startsWith('cross-origin-')
+  // S35 (US-005): the W4.30 launch-refused corridor shape — the run failed at
+  // launch (run.failed, no suite.* activity) because the product refused the
+  // detached-HEAD origin; the run event stream must prove the shim never ran.
+  const eventRows = fixture.mutation === 'detached-launch-refused'
     ? [{
       archive: 'all.jsonl', line: 1,
       event: {
-        ts: CAPTURED_AT, event: 'suite.executed', runId: RUN_ID, stepId: 'origin-b',
-        originRepo: OTHER_ORIGIN, treeHash: committedTree, cmdHash: CMD_HASH, exitCode: 0, durationMs: 100, ledgerRowId: 2,
+        ts: CAPTURED_AT, event: 'run.failed', runId: RUN_ID, workflowId: 'feature-dev-merge-worktree',
       },
     }]
-    : [];
+    : fixture.mutation?.startsWith('cross-origin-')
+      ? [{
+        archive: 'all.jsonl', line: 1,
+        event: {
+          ts: CAPTURED_AT, event: 'suite.executed', runId: RUN_ID, stepId: 'origin-b',
+          originRepo: OTHER_ORIGIN, treeHash: committedTree, cmdHash: CMD_HASH, exitCode: 0, durationMs: 100, ledgerRowId: 2,
+        },
+      }]
+      : [];
   references.run_events = writeSnapshot(campaign, snapshots, 'run-events.json', {
     schema_version: 1, captured_at: CAPTURED_AT, run_ids: [RUN_ID], rows: eventRows,
   }, 'self-test-events');
@@ -392,13 +451,54 @@ for (const fixture of CASES) {
     singleflight_observations: singleflight, special_exit_observations: specialExits,
     origin_identities: originIdentities,
   }, 'self-test-suite-observations');
+  // S35 (US-005): the detached-HEAD snapshot contract (US-009) — a synthetic
+  // repo whose HEAD is DETACHED at a commit OID with NO symbolic ref checked
+  // out. refs_before/refs_after/target_reflog carry target_ref = <40-hex OID>
+  // + detached_head: true exactly like the W4.30 evidence shape; the refs
+  // evidence is what lets O9 consume the contract end-to-end.
+  if (fixture.mutation?.startsWith('detached-')) {
+    const repository = {
+      fixture_path: 'var/fixtures/work/o9-detached/tt-ts',
+      git_common_dir: 'var/fixtures/work/o9-detached/tt-ts/.git',
+      object_format: 'sha1',
+    };
+    const refsShape = (phase) => ({
+      schema_version: 1, phase, repository,
+      target_ref: detachedCommit, target_tip: detachedCommit,
+      detached_head: true, for_each_ref: '',
+    });
+    references.refs_before = writeSnapshot(campaign, snapshots, 'refs-before.json', refsShape('before'), 'controller-refs');
+    references.refs_after = writeSnapshot(campaign, snapshots, 'refs-after.json', refsShape('after'), 'controller-refs');
+    references.target_reflog = writeSnapshot(campaign, snapshots, 'target-reflog.json', {
+      schema_version: 1, captured_at: CAPTURED_AT, repository,
+      target_ref: detachedCommit, detached_head: true,
+      entries: [{
+        old_oid: secondCommit, new_oid: detachedCommit,
+        actor: 'O9 Fixture <o9@example.invalid>',
+        timestamp: 1788076643, timezone: '-0300',
+        action: 'checkout: moving from main to HEAD',
+        raw: `${secondCommit} ${detachedCommit} O9 Fixture <o9@example.invalid> 1788076643 -0300\tcheckout: moving from main to HEAD`,
+      }],
+    }, 'controller-reflog');
+  }
 
+  const attempts = fixture.mutation === 'detached-launch-refused'
+    ? [{
+      id: 'attempt-o9', kind: 'workflow', phase: 'terminal', execution_mode: 'scripted', run_id: RUN_ID,
+      started_at: '2026-08-01T11:50:00.000Z', terminal_at: CAPTURED_AT, terminal_status: 'failed',
+      tokens_observed: 1, command_result: { exit_code: 0, signal: null }, steps_snapshot: null, straggler_capture: null,
+    }]
+    : [{
+      id: 'attempt-o9', kind: 'workflow', phase: 'terminal', execution_mode: 'scripted', run_id: RUN_ID,
+      started_at: '2026-08-01T11:50:00.000Z', terminal_at: CAPTURED_AT, terminal_status: 'completed',
+      tokens_observed: 1, command_result: { exit_code: 0, signal: null }, steps_snapshot: null, straggler_capture: null,
+    }];
   const context = {
     contract_version: 1, oracle_id: 'O9',
     campaign: { id: `campaign-${fixture.name}`, created_at: '2026-08-01T11:50:00.000Z', manifest: { sha256: '9'.repeat(64), case_count: 1, case_ids: [fixture.name] } },
     case: { id: fixture.name, wave: 4, workflow: 'feature-dev-merge-worktree', fixture: 'synthetic', harness: 'scripted-pi', class: 'verification', caps: { tokens: 100, wall_min: 10 }, boundary_files: [], forbidden: [], chaos: null },
     run_id: RUN_ID,
-    attempts: [{ id: 'attempt-o9', kind: 'workflow', phase: 'terminal', execution_mode: 'scripted', run_id: RUN_ID, started_at: '2026-08-01T11:50:00.000Z', terminal_at: CAPTURED_AT, terminal_status: 'completed', tokens_observed: 1, command_result: { exit_code: 0, signal: null }, steps_snapshot: null, straggler_capture: null }],
+    attempts,
     discovered_runs: [], o1_wave: { schema_version: 1, wave: 4, duration_floors: [], runs: [] },
     mechanical_evidence: { schema_version: 1, references },
   };

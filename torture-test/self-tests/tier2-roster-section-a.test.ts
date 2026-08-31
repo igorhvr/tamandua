@@ -537,6 +537,19 @@ describe("Tier-2 US-004..US-014 — section-A + B/G + C1 + C2 + D + E + F + H + 
       assert.equal(rec.chaos.trigger, "step:finalize_merge:running", `${id}: wave-4 arming on the finalize step`);
       assert.ok(rec.chaos.repeat > 1 && rec.chaos.interval_s > 0 && rec.chaos.wait_timeout_s > 0,
         `${id}: the persistent-move budget + interval + wait bound must be declared`);
+      // US-007 (S36): W4.33d's premise is per-attempt deterministic re-arm —
+      // the free-running cadence never re-armed per finalize attempt, so the
+      // real rerun completed cleanly (S36 root cause). W4.33d must declare
+      // rearm: true + a positive rearm_hold_s; W4.48b keeps the free-running
+      // cadence (a single target move in the pause window is its premise).
+      if (id === "W4.33d-reroute-exhaustion-resume") {
+        assert.equal(rec.chaos.rearm, true,
+          "W4.33d: the S36 redesign must declare rearm: true (each fresh step:finalize_merge:running occurrence triggers the next move)");
+        assert.ok(Number.isInteger(rec.chaos.rearm_hold_s) && rec.chaos.rearm_hold_s > 0,
+          "W4.33d: rearm must declare a positive rearm_hold_s (the post-marker hold so the tip capture precedes the move)");
+      } else {
+        assert.equal(rec.chaos.rearm, undefined, "W4.48b: must keep the free-running cadence (no rearm)");
+      }
     }
     // W4.dsh-lifecycle carries the W4.33a-shaped pause_drain + resume probe
     // (operator restart seam during the hold; O16 judges run_completes).

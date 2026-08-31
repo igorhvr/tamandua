@@ -37,7 +37,7 @@ test('O9 enforces replay, single-flight recovery, special exits, and independent
     const generated = spawnSync(process.execPath, [GENERATOR, workspace], { encoding: 'utf8', shell: false });
     assert.equal(generated.status, 0, generated.stderr);
     const names = fs.readdirSync(workspace).filter((name) => name.startsWith('o9-')).sort();
-    assert.equal(names.length, 39);
+    assert.equal(names.length, 42);
     for (const name of names) {
       const { expectation, response, status } = invokeFixture(workspace, name);
       assert.equal(response.result, expectation.expected, `${name}: ${JSON.stringify(response)}`);
@@ -55,6 +55,30 @@ test('O9 enforces replay, single-flight recovery, special exits, and independent
       assert.equal(response.evidence.length, 1, `${name} evidence`);
       const observation = JSON.parse(fs.readFileSync(path.join(workspace, name, 'evidence', response.evidence[0].path), 'utf8'));
       assert.equal(observation.schema_version, 1);
+      if (name === 'o9-detached-launch-refused') {
+        // S35 (US-005): the W4.30 launch-refused corridor on a detached-HEAD
+        // origin — the run failed at launch (run.failed, no suite.* activity)
+        // so no shim evidence exists; O9 renders the REAL judgment PASS with
+        // the corridor + US-009 contract fields recorded, never NOT_EVALUABLE
+        // (which the campaign harness cannot classify).
+        assert.equal(response.result, 'PASS', `${name} corridor verdict`);
+        assert.equal(response.findings.length, 0, `${name} corridor findings`);
+        assert.equal(observation.launch_refused_corridor, true, name);
+        assert.equal(typeof observation.corridor_reason, 'string', name);
+        assert.equal(observation.detached_head, true, name);
+        assert.match(observation.target_ref, /^[0-9a-f]{40}$/, name);
+        assert.equal(observation.symbolic_target_ref, null, name);
+        assert.equal(observation.observation_count, 0, name);
+        continue;
+      }
+      if (name === 'o9-detached-green' || name === 'o9-detached-wrong-tree') {
+        // S35 (US-005): the detached-HEAD contract fields are recorded in the
+        // audit evidence — target_ref IS the detached HEAD commit OID and no
+        // symbolic target ref exists (US-009), so O9 must never require one.
+        assert.equal(observation.detached_head, true, name);
+        assert.match(observation.target_ref, /^[0-9a-f]{40}$/, name);
+        assert.equal(observation.symbolic_target_ref, null, name);
+      }
       if (expectation.expected === 'NOT_EVALUABLE') {
         assert.equal(response.findings.length, 0, `${name} NOT_EVALUABLE findings`);
         assert.equal(observation.not_evaluable, true);

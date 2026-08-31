@@ -9,7 +9,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { execSync, spawnSync } from 'node:child_process';
-import { verifyRecordedTarget, getProcessGroup, ownProcessGroup } from './tt-process-identity.mjs';
+import { verifyRecordedTarget, getProcessGroup, getProcessParent, ownProcessGroup } from './tt-process-identity.mjs';
 import {
   stringMarkerVocabularyError,
   workflowVocabularyFor,
@@ -112,8 +112,8 @@ const ACTIONS = {
     desc: 'Dirty a tracked file in the repo to create PARK bait',
   },
   'move-branch': {
-    args: '--repo <repo> --ref <r> [--repeat <n> --interval <s>]',
-    desc: 'Move a ref in the origin repo (bare OR work clone) to create rugpull pressure; --repeat arms an empty-diff colleague budget then moves the ref n times (one every --interval seconds) for persistent colleague target-moves',
+    args: '--repo <repo> --ref <r> [--repeat <n> --interval <s>] [--rearm --rearm-hold-s <s>]',
+    desc: 'Move a ref in the origin repo (bare OR work clone) to create rugpull pressure; --repeat arms an empty-diff colleague budget then moves the ref n times for persistent colleague target-moves — by default one every --interval seconds (free-running clock); with --rearm each move is triggered by a FRESH step:<role>:running occurrence (per-attempt re-arm, US-007 S36) and --interval becomes a minimum-spacing floor',
   },
 };
 
@@ -159,7 +159,19 @@ Options:
                        as the run is observed terminal so a resume lands on a
                        stable target (US-004 S29 premise redesign).
   --interval <s>       move-branch only: seconds between repeated moves
-                       (REQUIRED when --repeat > 1).
+                       (REQUIRED when --repeat > 1). With --rearm this is a
+                       MINIMUM-SPACING FLOOR, never a free-running cadence.
+  --rearm              move-branch only (US-007 S36): per-attempt re-arm mode
+                       — each FRESH step:<role>:running occurrence (the step
+                       transitions waiting->pending->running on every reroute
+                       cycle) triggers the next move after a short post-marker
+                       hold (--rearm-hold-s), so EVERY finalize attempt
+                       observes a moved tip; requires a step: --when marker
+                       and --repeat > 1.
+  --rearm-hold-s <s>   move-branch only (US-007 S36): the post-marker hold in
+                       seconds before each re-armed move — long enough for the
+                       merger's tip capture to precede the move (2-5s),
+                       REQUIRED when --rearm.
   --help, -h           Print this usage and exit
 
 Phase markers:
@@ -267,10 +279,14 @@ function killHarness(opts) {
       targetRecord: record,
       signal,
       verification: 'ok',
+      // S33 (US-004): record WHICH verification leg accepted the target
+      // (strict provenance vs a positive tt-ownership chain proof) so the
+      // chaos evidence shows the guard's reasoning, never a silent accept.
+      verificationDetail: verdict.reason,
       outcome: 'fired',
     };
     logStructured(entry);
-    console.error(`kill-harness: ${signal} sent to harness PID ${pid} (run ${runId})`);
+    console.error(`kill-harness: ${signal} sent to harness PID ${pid} (run ${runId}) — ${verdict.reason}`);
     process.exit(0);
   } catch (e) {
     const entry = {
@@ -932,6 +948,10 @@ function dirtyTree(opts) {
  */
 function moveBranch(opts) {
   const { run: runId, args } = opts;
+  // US-007 (S36): the re-arm loop bounds each between-attempt wait with the
+  // same --timeout as the initial marker wait (default 120s; the controller
+  // passes the manifest wait_timeout_s).
+  const timeoutSec = Number.isInteger(opts.timeout) && opts.timeout > 0 ? opts.timeout : DEFAULT_TIMEOUT_S;
   const repo = args.repo;
   const ref = args.ref;
 
@@ -958,6 +978,29 @@ function moveBranch(opts) {
   }
   if (repeat === 1 && intervalRaw !== undefined) {
     console.error('Error: --interval requires --repeat > 1 (a single move needs no interval)');
+    process.exit(1);
+  }
+
+  // US-007 (S36): per-attempt re-arm mode. With --rearm each move is
+  // triggered by a FRESH step:<role>:running occurrence in the run's own
+  // event stream (the step transitions waiting->pending->running on every
+  // reroute cycle) instead of a free-running clock — the redesign that makes
+  // EVERY finalize attempt observe a moved tip (the S36 root cause: a
+  // free-running 60s cadence never re-armed per attempt). Fail closed on a
+  // malformed re-arm declaration.
+  const rearm = args.rearm === 'true' || args.rearm === '1';
+  const rearmHoldRaw = args['rearm-hold-s'];
+  const rearmHoldS = rearmHoldRaw === undefined ? 0 : Number(rearmHoldRaw);
+  if (rearm && (rearmHoldRaw === undefined || !Number.isInteger(rearmHoldS) || rearmHoldS < 1)) {
+    console.error('Error: --rearm-hold-s must be a positive integer (the post-marker hold before each re-armed move), got "' + rearmHoldRaw + '"');
+    process.exit(1);
+  }
+  if (!rearm && rearmHoldRaw !== undefined) {
+    console.error('Error: --rearm-hold-s requires --rearm (the post-marker hold is a re-arm mode parameter)');
+    process.exit(1);
+  }
+  if (rearm && repeat === 1) {
+    console.error('Error: --rearm requires --repeat > 1 (the per-attempt re-arm loop needs at least two moves)');
     process.exit(1);
   }
 
@@ -1121,7 +1164,119 @@ function moveBranch(opts) {
 
   if (!armMoveBudget()) process.exit(1); // fire_failed already logged
 
+  // Stand-down helper (mechanized "operator removes the rejection
+  // condition"): once the run is observed terminal, stop the moves so a
+  // `resume` fired on event:run.failed re-runs the finalize against a STABLE
+  // target. Logged once with the moves executed so far.
+  const standDown = (movesExecutedSoFar, reason) => {
+    logStructured({
+      ts: new Date().toISOString(), action: 'move-branch', runId,
+      phaseMarker: opts.when, target: `repo:${repoPath} ref:${ref}`,
+      rearm: rearm || undefined,
+      outcome: 'stand_down', moves_executed: movesExecutedSoFar,
+      error: reason,
+    });
+    console.error(`move-branch: run ${runId} terminal after ${movesExecutedSoFar} move(s) — standing down the colleague target-moves`);
+  };
+
   let movesExecuted = 0;
+
+  if (rearm) {
+    // ── US-007 (S36): per-attempt deterministic re-arm loop ─────────────
+    // Each move is triggered by a FRESH step:<role>:running occurrence (the
+    // step transitions waiting->pending->running on every reroute cycle) in
+    // the run's OWN append-only event stream — never a free-running clock.
+    // The main flow's phaseWait already armed on the FIRST occurrence; here
+    // we (a) hold a short post-marker window so the merger's tip capture
+    // precedes the move, (b) move, then (c) wait for the NEXT occurrence to
+    // move again — guaranteeing EVERY finalize attempt observes a moved tip
+    // until the reroute budget exhausts (run.failed) or the loop's repeat
+    // ceiling is consumed. `interval` becomes a MINIMUM-SPACING floor (never
+    // a cadence): moves are never fired more often than interval_s apart.
+    const role = opts.when.startsWith('step:')
+      ? opts.when.slice('step:'.length).split(':')[0]
+      : null;
+    const rearmHoldMs = rearmHoldS * 1000;
+    // Baseline the attempt count. The current attempt's step.running event
+    // may lag the DB status flip phaseWait observed — wait until the stream
+    // includes it (>= 1 for the first attempt), standing down on run-terminal
+    // and failing closed on a timeout (never a silent half-injection).
+    let baseline = countStepRunningEvents(runId, role);
+    if (baseline === 0) {
+      const flushResult = waitForAttemptCount(runId, role, 0, timeoutSec);
+      if (flushResult === 'terminal') {
+        standDown(0, `run ${runId} reached terminal before the first step.running event flushed — colleague target-moves stopped`);
+        process.exit(0);
+      }
+      if (flushResult === 'timeout') {
+        logStructured({
+          ts: new Date().toISOString(), action: 'move-branch', runId,
+          phaseMarker: opts.when, target: `repo:${repoPath} ref:${ref}`,
+          rearm: true, outcome: 'rearm_timeout', move_index: 1,
+          error: `the current attempt's step.running event never flushed within ${timeoutSec}s of the marker — refusing to move blind`,
+        });
+        console.error(`move-branch: rearm abort — the current attempt's step.running event never flushed within ${timeoutSec}s`);
+        process.exit(1);
+      }
+      baseline = countStepRunningEvents(runId, role);
+    }
+    let lastMoveAt = null;
+    for (let moveIndex = 1; moveIndex <= repeat; moveIndex++) {
+      if (moveIndex > 1) {
+        // Wait for the NEXT fresh step:<role>:running occurrence (the next
+        // finalize attempt after the reroute cycle).
+        const waitResult = waitForAttemptCount(runId, role, baseline, timeoutSec);
+        if (waitResult === 'terminal') {
+          standDown(movesExecuted, `run ${runId} reached terminal while re-arming move ${moveIndex} — colleague target-moves stopped`);
+          break;
+        }
+        if (waitResult === 'timeout') {
+          logStructured({
+            ts: new Date().toISOString(), action: 'move-branch', runId,
+            phaseMarker: opts.when, target: `repo:${repoPath} ref:${ref}`,
+            rearm: true, outcome: 'rearm_timeout', move_index: moveIndex,
+            baseline_attempts: baseline,
+            error: `no fresh step:${role}:running occurrence within ${timeoutSec}s of the previous attempt (baseline ${baseline} attempts) — the run is not re-attempting; failing closed`,
+          });
+          console.error(`move-branch: rearm timeout — no fresh step:${role}:running occurrence within ${timeoutSec}s (baseline ${baseline} attempts)`);
+          process.exit(1);
+        }
+        logStructured({
+          ts: new Date().toISOString(), action: 'move-branch', runId,
+          phaseMarker: opts.when, target: `repo:${repoPath} ref:${ref}`,
+          rearm: true, outcome: 'rearm_armed', move_index: moveIndex,
+          attempt: baseline + 1,
+        });
+        // interval_s is a MINIMUM-SPACING floor: never fire moves closer
+        // together than the declared interval (protects against a
+        // pathological marker re-fire racing the previous move).
+        if (interval > 0 && lastMoveAt !== null) {
+          const remaining = interval * 1000 - (Date.now() - lastMoveAt);
+          if (remaining > 0) {
+            sleepSync(remaining);
+            if (runTerminalObserved(runId)) {
+              standDown(movesExecuted, `run ${runId} reached terminal during the interval floor — colleague target-moves stopped`);
+              break;
+            }
+          }
+        }
+      }
+      // Short post-marker hold so the merger's tip capture precedes the move
+      // (the move lands INSIDE the attempt's expected-tip window).
+      sleepSync(rearmHoldMs);
+      if (runTerminalObserved(runId)) {
+        standDown(movesExecuted, `run ${runId} reached terminal during the re-arm hold — colleague target-moves stopped`);
+        break;
+      }
+      const newHash = moveOnce(moveIndex);
+      if (newHash === null) process.exit(1); // fire_failed already logged
+      movesExecuted = moveIndex;
+      lastMoveAt = Date.now();
+      baseline = countStepRunningEvents(runId, role);
+    }
+    process.exit(0);
+  }
+
   for (let moveIndex = 1; moveIndex <= repeat; moveIndex++) {
     const newHash = moveOnce(moveIndex);
     if (newHash === null) process.exit(1); // fire_failed already logged
@@ -1129,13 +1284,7 @@ function moveBranch(opts) {
     if (moveIndex < repeat) {
       sleepSync(interval * 1000);
       if (runTerminalObserved(runId)) {
-        logStructured({
-          ts: new Date().toISOString(), action: 'move-branch', runId,
-          phaseMarker: opts.when, target: `repo:${repoPath} ref:${ref}`,
-          outcome: 'stand_down', moves_executed: movesExecuted,
-          error: `run ${runId} reached terminal — colleague target-moves stopped (operator stand-down mechanized) so a resume lands on a stable target`,
-        });
-        console.error(`move-branch: run ${runId} terminal after ${movesExecuted} move(s) — standing down the colleague target-moves`);
+        standDown(movesExecuted, `run ${runId} reached terminal — colleague target-moves stopped (operator stand-down mechanized) so a resume lands on a stable target`);
         break;
       }
     }
@@ -1171,6 +1320,47 @@ function runTerminalObserved(runId) {
   return readRunEventStreamLines(runId).some(
     (event) => event.event === 'run.failed' || event.event === 'run.completed' || event.event === 'run.canceled',
   );
+}
+
+// ── US-007 (S36): re-arm attempt counting ────────────────────────────
+// The per-attempt re-arm loop (move-branch --rearm) triggers each move on a
+// FRESH step:<role>:running occurrence. The step's DB status is LEVEL
+// (running stays true until the reroute resets it — a fast waiting→pending→
+// running cycle can slip between two 500ms polls), so the re-arm signal is
+// the run's OWN append-only event stream: every attempt emits a `step.running`
+// event (stepId = the workflow step id, agentId = the agent), and on every
+// reroute cycle the consumer is reset to waiting and re-pended, emitting a
+// fresh `step.running` per attempt. Counting those events is edge-triggered,
+// durable and never missed. Mirrors checkStepMarker's dual match (step_id OR
+// agent_id LIKE role).
+function countStepRunningEvents(runId, role) {
+  return readRunEventStreamLines(runId).filter((event) => {
+    if (event.event !== 'step.running') return false;
+    const stepId = String(event.stepId ?? event.step_id ?? '');
+    const agentId = String(event.agentId ?? event.agent_id ?? '');
+    return stepId === role || (agentId !== '' && agentId.includes(role));
+  }).length;
+}
+
+/**
+ * Wait until the run's event stream shows MORE step:<role>:running attempts
+ * than baselineCount (a fresh finalize attempt has started). Polls the
+ * append-only event stream every POLL_INTERVAL_MS, standing down the moment
+ * the run is observed terminal (run.failed/run.completed/run.canceled — the
+ * next attempt can no longer fire) and failing closed on timeout (the run is
+ * not re-attempting — a silent wait would burn the case's wall budget).
+ * Returns 'armed' | 'terminal' | 'timeout'.
+ */
+function waitForAttemptCount(runId, role, baselineCount, timeoutSec) {
+  const deadline = Date.now() + timeoutSec * 1000;
+  while (Date.now() < deadline) {
+    if (runTerminalObserved(runId)) return 'terminal';
+    if (countStepRunningEvents(runId, role) > baselineCount) return 'armed';
+    // Busy-wait sleep via synchronous spin (sync alternative to setTimeout
+    // for CLI scripts)
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, POLL_INTERVAL_MS);
+  }
+  return 'timeout';
 }
 
 // ── S28 (US-005): startup terminal-run guard ──────────────────────────
@@ -1658,7 +1848,9 @@ function guardFire(action, runId, opts) {
     // S28 (US-006): kill-daemon targets (pidfile-resolved) verify WITHOUT the
     // strict cwd/cmdline provenance requirement (the real contained daemon's
     // cwd/cmdline contains neither TT_ROOT nor the run id); harness targets
-    // keep the strict check.
+    // keep the strict check, falling back to the S33 (US-004) positive
+    // tt-ownership evidence chain when the strict check fails (never a
+    // weakening — no chain proof still refuses fail-closed).
     const kind = action === 'kill-daemon' ? 'daemon' : 'harness';
     const verdict = verifyKillTarget(record, runId, kind);
     if (!verdict.ok) {
@@ -1845,6 +2037,17 @@ function readDaemonPidfile() {
  * (never a silent fallback to a process scan), and a daemon whose process
  * group is UNREADABLE (a /proc-less host) is refused too — group
  * disjointness is part of the identity contract and cannot be waived.
+ *
+ * S33 (US-004) harness chain: the REAL pi worker's process shape carries no
+ * repo path in cwd/cmdline (argv scrubbed to the binary name — the W4.09
+ * campaign shape: `Process 2074648 cwd/cmdline does not contain
+ * .../torture-test/var` with cmdline `pi`), so the strict step-(d) check
+ * alone GUARD_MISSes every legitimate kill-harness. When step (d) fails for
+ * a harness target, verifyHarnessIdentityChain accepts a POSITIVE
+ * tt-ownership proof built on EXPLICIT RECORDED identity only (steps-table
+ * claim_pgid match / parent-chain walk to a TT_ROOT-owned ancestor / open-fd
+ * into var) — see below. A harness target with NO positive proof still
+ * refuses fail-closed with the precise provenance reason (never weakened).
  */
 function verifyKillTarget(record, runId, kind = 'harness') {
   const base = verifyRecordedTarget({ pid: record.pid, pgid: record.pgid, startTime: record.startTime });
@@ -1870,7 +2073,15 @@ function verifyKillTarget(record, runId, kind = 'harness') {
     return { ok: false, reason: `target pid ${record.pid} shares the caller's own pgid ${pgid} — refusing to signal own group` };
   }
   if (!verifyProcessProvenance(record.pid, runId)) {
-    return { ok: false, reason: `Process ${record.pid} cwd/cmdline does not contain ${TT_ROOT}` };
+    // S33 (US-004): the strict belt-and-suspenders check failed — try the
+    // positive tt-ownership evidence chain (EXPLICIT RECORDED identity only;
+    // verifyRecordedTarget already passed above). No positive proof -> the
+    // strict refusal stands, annotated with the chain miss.
+    const chain = verifyHarnessIdentityChain(record, runId);
+    if (!chain.ok) {
+      return { ok: false, reason: `Process ${record.pid} cwd/cmdline does not contain ${TT_ROOT} — no positive tt-ownership chain proof (${chain.detail}); refusing to signal` };
+    }
+    return { ok: true, reason: `recorded target pid ${record.pid} verified (alive, identity, group, strict provenance check failed but positive tt-ownership chain proof: ${chain.detail})` };
   }
   return { ok: true, reason: `recorded target pid ${record.pid} verified (alive, identity, group, provenance checks passed)` };
 }
@@ -1899,6 +2110,118 @@ function verifyProcessProvenance(pid, runId) {
   } catch {
     return false;
   }
+}
+
+/**
+ * S33 (US-004): positive tt-ownership evidence chain for a HARNESS target
+ * whose strict cwd/cmdline provenance check failed — the REAL pi worker
+ * shape (argv scrubbed to the binary name; the W4.09 campaign GUARD_MISS
+ * `Process 2074648 cwd/cmdline does not contain .../torture-test/var` with
+ * cmdline `pi`). The chain is built on EXPLICIT RECORDED identity ONLY —
+ * never a /proc cwd/cmdline sweep (the E3.C.1 root-cause class: a sweep can
+ * match a repo-cwd process in the operator's own ancestry):
+ *   1. verifyRecordedTarget MUST already have passed (the caller runs it
+ *      first — pid alive + recorded --target-start-time ABA match +
+ *      ancestry/group disjointness);
+ *   2. plus at least ONE positive tt-ownership proof:
+ *      (a) the pid equals the steps-table claim_pgid harness group for the
+ *          run (resolveFromStepsTable — the product's own explicit
+ *          worker-ownership claim record);
+ *      (b) the parent-chain walk (getProcessParent ppid walk, isAncestorOf
+ *          style) reaches an ancestor whose cwd/cmdline IS under TT_ROOT
+ *          (the contained daemon/harness that spawned the worker);
+ *      (c) open-fd evidence: /proc/<pid>/fd resolves a descriptor into
+ *          TT_ROOT/var (linux-only — MACP3 prose discipline: an unreadable
+ *          fd entry degrades to unproven, never to proven).
+ * Any record with NO positive proof still refuses fail-closed — the strict
+ * provenance reason stands, annotated with the chain miss. kill-daemon
+ * daemon-kind targets (S28 US-006) never enter this chain.
+ *
+ * @returns {{ok: true, detail: string} | {ok: false, detail: string}}
+ */
+function verifyHarnessIdentityChain(record, runId) {
+  const pid = record.pid;
+  // (a) steps-table claim row — the product's explicit harness-group record.
+  const steps = resolveFromStepsTable(runId);
+  if (steps && Number(steps.pid) === Number(pid)) {
+    return { ok: true, detail: `steps claim row claim_pgid ${steps.pid} matches target pid ${pid}` };
+  }
+  // (b) parent-chain walk to a TT_ROOT-owned ancestor.
+  const parentProof = parentChainOwnershipProof(pid);
+  if (parentProof.ok) {
+    return { ok: true, detail: parentProof.detail };
+  }
+  // (c) open-fd evidence into TT_ROOT/var.
+  const fdProof = openFdOwnershipProof(pid);
+  if (fdProof.ok) {
+    return { ok: true, detail: fdProof.detail };
+  }
+  const misses = [
+    steps ? `steps row pid ${steps.pid} != target ${pid}` : 'no steps claim row for the run',
+    parentProof.detail,
+    fdProof.detail,
+  ];
+  return { ok: false, detail: misses.join('; ') };
+}
+
+/**
+ * S33 (US-004) proof (b): walk the target's ppid chain upward (bounded,
+ * isAncestorOf-style — cycles / pid 1 / unreadable ppid terminate the walk
+ * as unproven) and return the first ancestor whose cwd OR cmdline contains
+ * TT_ROOT (the contained daemon/harness that spawned the worker). The
+ * TARGET's own cwd/cmdline is not evidence here — it already failed the
+ * strict check, and the chain must prove tt-ownership from the ancestry,
+ * never from the target's own (possibly spoofable) cwd. /proc-less hosts
+ * degrade to unproven (never proven).
+ */
+function parentChainOwnershipProof(targetPid) {
+  let cur = getProcessParent(targetPid);
+  for (let i = 0; i < 1024 && cur !== null && cur > 0; i += 1) {
+    try {
+      // linux-only /proc/<pid>/cwd + cmdline reads (MACP3 US-003): absent on
+      // Darwin — the catch degrades to "ancestor unproven" (never proven).
+      const ancestorCwd = fs.readlinkSync(`/proc/${cur}/cwd`);
+      const ancestorCmdline = fs.readFileSync(`/proc/${cur}/cmdline`, 'utf-8').replace(/\0/g, ' ');
+      if (ancestorCwd.includes(TT_ROOT) || ancestorCmdline.includes(TT_ROOT)) {
+        return { ok: true, detail: `ancestor pid ${cur} cwd/cmdline is under ${TT_ROOT}` };
+      }
+    } catch {
+      // unreadable ancestor — the walk cannot prove this ancestor; continue
+    }
+    const parent = getProcessParent(cur);
+    if (parent === null || parent === cur || parent <= 0) break; // unreadable / cycle / init
+    cur = parent;
+  }
+  return { ok: false, detail: 'no ancestor with cwd/cmdline under TT_ROOT' };
+}
+
+/**
+ * S33 (US-004) proof (c): open-fd evidence — /proc/<pid>/fd resolves a
+ * descriptor into TT_ROOT/var (linux-only, MACP3 prose discipline: an
+ * unreadable fd entry or an unreadable fd dir degrades to unproven, never
+ * to proven). A worker holding an fd into the contained var tree is
+ * positively tt-owned.
+ */
+function openFdOwnershipProof(targetPid) {
+  try {
+    // linux-only /proc/<pid>/fd (MACP3 US-003): absent on Darwin — the
+    // catch degrades to "unproven" (never proven).
+    const fdDir = `/proc/${targetPid}/fd`;
+    const entries = fs.readdirSync(fdDir);
+    for (const entry of entries) {
+      try {
+        const resolved = fs.realpathSync(path.join(fdDir, entry));
+        if (resolved.startsWith(TT_ROOT + path.sep)) {
+          return { ok: true, detail: `open fd ${entry} resolves to ${resolved} under ${TT_ROOT}` };
+        }
+      } catch {
+        // unreadable / racy fd entry — unproven for THIS fd, keep scanning
+      }
+    }
+  } catch {
+    // /proc-less host or unreadable fd dir — unproven
+  }
+  return { ok: false, detail: 'no open fd resolves under TT_ROOT' };
 }
 
 // ── Evidence capture before destruction ─────────────────────────────
@@ -2364,6 +2687,10 @@ while (i < args.length) {
       process.exit(1);
     }
     opts.timeout = t;
+  } else if (arg === '--rearm') {
+    // US-007 (S36): boolean action flag (no value) — per-attempt re-arm
+    // mode for move-branch.
+    opts.args.rearm = 'true';
   } else if (arg.startsWith('--')) {
     // Action-specific flag argument (--flag value)
     const flagName = arg.slice(2);
@@ -2479,6 +2806,40 @@ if (action === 'sigstop_sigcont') {
   const holdSeconds = Number(holdSecondsRaw);
   if (!Number.isInteger(holdSeconds) || holdSeconds < 0) {
     console.error(`Error: --hold-seconds must be a non-negative integer, got "${holdSecondsRaw}"`);
+    process.exit(1);
+  }
+}
+
+// US-007 (S36): move-branch --rearm (per-attempt re-arm mode) — validated
+// BEFORE phaseWait (never wait on a marker for a malformed invocation). The
+// re-arm loop re-arms on each FRESH step:<role>:running occurrence in the
+// run's own event stream (append-only, durable), which only exists for step
+// markers; it needs at least two moves (repeat > 1); and it needs a positive
+// --rearm-hold-s (the post-marker hold so the merger's tip capture precedes
+// the move). Fail closed on every malformed shape with a precise one-line
+// reason. --rearm-hold-s without --rearm is likewise a scenario error (never
+// a silently-ignored param).
+if (action === 'move-branch') {
+  const rearm = opts.args.rearm !== undefined;
+  const rearmHoldRaw = opts.args['rearm-hold-s'];
+  const rearmHoldS = rearmHoldRaw === undefined ? 0 : Number(rearmHoldRaw);
+  if (rearm) {
+    if (!opts.when.startsWith('step:')) {
+      console.error('Error: --rearm requires a step:<role>:<state> --when marker (the re-arm loop re-arms on each step:<role>:running occurrence)');
+      process.exit(1);
+    }
+    const repeatRaw = opts.args.repeat === undefined ? '1' : opts.args.repeat;
+    const repeat = Number(repeatRaw);
+    if (!Number.isInteger(repeat) || repeat < 2) {
+      console.error('Error: --rearm requires --repeat > 1 (the per-attempt re-arm loop needs at least two moves)');
+      process.exit(1);
+    }
+    if (rearmHoldRaw === undefined || !Number.isInteger(rearmHoldS) || rearmHoldS < 1) {
+      console.error(`Error: --rearm-hold-s must be a positive integer (the post-marker hold before each re-armed move), got "${rearmHoldRaw}"`);
+      process.exit(1);
+    }
+  } else if (rearmHoldRaw !== undefined) {
+    console.error('Error: --rearm-hold-s requires --rearm (the post-marker hold is a re-arm mode parameter)');
     process.exit(1);
   }
 }
