@@ -94,16 +94,21 @@ REAL_HOME="$OPERATOR_HOME"
 #
 # pi reads these from ~/.pi/agent/ (pi config/auth resolution; see
 # src/installer/paths.ts and pi docs models.md/providers.md):
-#   settings.json  — defaultProvider/defaultModel/thinking level; the selected
-#                    model comes from here when tamandua invokes `pi --print`
-#                    with no --model override.
-#   models.json    — custom provider definitions (baseUrl + inline apiKey +
-#                    model list); the operator's local-dspark provider lives here.
-#   auth.json      — NOT in the verbatim-copy list: it is produced by
-#                    surface_env_api_keys below (operator auth.json base +
+#   settings.json  — REQUIRED. defaultProvider/defaultModel/thinking level; the
+#                    selected model comes from here when tamandua invokes
+#                    `pi --print` with no --model override.
+#   models.json    — OPTIONAL-surface-if-present. Custom provider definitions
+#                    (baseUrl + inline apiKey + model list); the operator's
+#                    local-dspark provider lives here. pi runs fine without it
+#                    (a darwin ~/.pi/agent legitimately has no models.json), so
+#                    it is surfaced only when the real file exists and never
+#                    named missing when absent.
+#   auth.json      — REQUIRED but NOT in the verbatim-copy list: it is produced
+#                    by surface_env_api_keys below (operator auth.json base +
 #                    env-provided API keys merged in), so there is a single
 #                    writer and the copy never clobbers the merged result.
-PI_AGENT_FILES=("settings.json" "models.json")
+PI_AGENT_FILES=("settings.json")
+PI_AGENT_OPTIONAL_FILES=("models.json")
 
 # hermes reads these from ~/.hermes/ (HERMES_HOME):
 #   config.yaml    — default model/provider + auxiliary provider slots; the
@@ -233,7 +238,14 @@ surface_pi_files() {
   local src_agent="$OPERATOR_HOME/.pi/agent"
   local dest_agent="$home/.pi/agent"
   local f
+  # Required pi files: surface_minimal_file copies them when present; the
+  # fail-closed legs in fail_closed_real_home enforce their presence.
   for f in "${PI_AGENT_FILES[@]}"; do
+    surface_minimal_file "$src_agent/$f" "$dest_agent/$f" "$home/provision-audit.json" "$home"
+  done
+  # Optional pi files: surface-if-present only — surface_minimal_file already
+  # skips a missing operator source, so models.json is never named missing.
+  for f in "${PI_AGENT_OPTIONAL_FILES[@]}"; do
     surface_minimal_file "$src_agent/$f" "$dest_agent/$f" "$home/provision-audit.json" "$home"
   done
 }
@@ -440,19 +452,23 @@ fail_closed_real_home() {
     fail="${fail}gitconfig:no-home;"
   fi
 
-  # Minimal-file copy legs: a copy is a failure ONLY when the operator source
-  # exists but the contained destination is absent (a genuine copy failure).
-  # If the operator has no such file the base tool skips intentionally — not a
-  # leg. auth.json (pi) is produced by the env-key merge and is verified to
-  # exist regardless of operator/env-key presence.
+  # Minimal-file copy legs (MACP8 US-001): settings.json and auth.json are
+  # REQUIRED — the operator source must exist AND be surfaced into the
+  # contained home (auth.json is produced by the env-key merge, but the
+  # operator's real auth.json base is a required source). models.json is
+  # OPTIONAL-surface-if-present and is deliberately NOT a leg. hermes
+  # config.yaml/auth.json remain copy legs: a failure only when the operator
+  # source exists but the contained destination is absent.
   local src_file dest_file
-  for src_file in ".pi/agent/settings.json" ".pi/agent/models.json" \
-                  ".hermes/config.yaml" ".hermes/auth.json"; do
+  for src_file in ".hermes/config.yaml" ".hermes/auth.json"; do
     if [ -f "${OPERATOR_HOME}/${src_file}" ] && [ ! -f "${home}/${src_file}" ]; then
       fail="${fail}copy-missing:${src_file};"
     fi
   done
-  if [ ! -f "$home/.pi/agent/auth.json" ]; then
+  if [ ! -f "${OPERATOR_HOME}/.pi/agent/settings.json" ] || [ ! -f "$home/.pi/agent/settings.json" ]; then
+    fail="${fail}copy-missing:.pi/agent/settings.json;"
+  fi
+  if [ ! -f "${OPERATOR_HOME}/.pi/agent/auth.json" ] || [ ! -f "$home/.pi/agent/auth.json" ]; then
     fail="${fail}copy-missing:.pi/agent/auth.json;"
   fi
   set -e
@@ -481,9 +497,11 @@ Provisions:
 
 Real TT_HOME gets (E2.6 US-004 — MINIMAL enumerated set, no whole-dir copy):
   - .gitconfig with TT-specific identity settings
-  - .pi/agent/settings.json   (default model/provider selection)
-  - .pi/agent/models.json     (custom provider defs + inline apiKey)
-  - .pi/agent/auth.json       (operator auth.json base + env API keys merged)
+  - .pi/agent/settings.json   (REQUIRED — default model/provider selection)
+  - .pi/agent/models.json     (OPTIONAL-surface-if-present — custom provider
+                               defs + inline apiKey; skipped when the operator
+                               has no models.json, e.g. darwin)
+  - .pi/agent/auth.json       (REQUIRED — operator auth.json base + env API keys merged)
   - .hermes/config.yaml       (default model/provider + auxiliary slots)
   - .hermes/auth.json         (OAuth/API-key credential store)
   - .hermes/.env              (operator env API keys, dotenv KEY=VALUE)

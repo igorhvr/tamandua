@@ -29,9 +29,18 @@ echo "=== tt-provision-home --fail-closed self-test ==="
 # ── Setup: mock operator HOME and isolated TT_VAR ─────────────────────
 MOCK_HOME="$(mktemp -d)"
 TEST_VAR="$(mktemp -d)"
+MODELS_ABSENT_HOME="$(mktemp -d)"
+MODELS_ABSENT_VAR="$(mktemp -d)"
+SETTINGS_ABSENT_HOME="$(mktemp -d)"
+SETTINGS_ABSENT_VAR="$(mktemp -d)"
+AUTH_ABSENT_HOME="$(mktemp -d)"
+AUTH_ABSENT_VAR="$(mktemp -d)"
 
 cleanup() {
-  rm -rf "$MOCK_HOME" "$TEST_VAR"
+  rm -rf "$MOCK_HOME" "$TEST_VAR" \
+    "$MODELS_ABSENT_HOME" "$MODELS_ABSENT_VAR" \
+    "$SETTINGS_ABSENT_HOME" "$SETTINGS_ABSENT_VAR" \
+    "$AUTH_ABSENT_HOME" "$AUTH_ABSENT_VAR"
 }
 trap cleanup EXIT
 
@@ -233,6 +242,129 @@ if grep -q "REASON: tt-home-unprovisioned" /tmp/tt-fc-4.err; then
 else
   fail "blocked-home leg missing REASON on stderr:"
   cat /tmp/tt-fc-4.err >&2
+fi
+
+# ── AC4c (MACP8 US-001): models.json absent → --fail-closed succeeds ──
+echo ""
+echo "--- AC4c: models.json-absent operator home (darwin shape) ---"
+
+mkdir -p "$MODELS_ABSENT_HOME/.pi/agent"
+cat > "$MODELS_ABSENT_HOME/.pi/agent/settings.json" <<JSON
+{"defaultProvider":"deepseek"}
+JSON
+echo '{}' > "$MODELS_ABSENT_HOME/.pi/agent/auth.json"
+# NO models.json — intentional darwin operator shape.
+mkdir -p "$MODELS_ABSENT_HOME/.hermes"
+cat > "$MODELS_ABSENT_HOME/.hermes/config.yaml" <<YAML
+model:
+  default: gpt-5.6-sol
+YAML
+cat > "$MODELS_ABSENT_HOME/.hermes/auth.json" <<JSON
+{"version":1}
+JSON
+
+set +e
+HOME="$MODELS_ABSENT_HOME" TT_OPERATOR_HOME="$MODELS_ABSENT_HOME" TT_VAR="$MODELS_ABSENT_VAR" \
+  "$TOOL" --fail-closed >/tmp/tt-fc-models-absent.log 2>/tmp/tt-fc-models-absent.err
+MA_STATUS=$?
+set -e
+
+if [ "$MA_STATUS" -eq 0 ]; then
+  pass "models.json-absent --fail-closed exits 0"
+else
+  fail "models.json-absent --fail-closed exited non-zero ($MA_STATUS)"
+  cat /tmp/tt-fc-models-absent.err >&2
+fi
+
+if [ ! -e "$MODELS_ABSENT_VAR/home/.pi/agent/models.json" ]; then
+  pass "models.json NOT surfaced (absent operator file skipped)"
+else
+  fail "models.json WAS surfaced — should have been skipped"
+fi
+
+if grep -q "copy-missing:.pi/agent/models.json" /tmp/tt-fc-models-absent.err; then
+  fail "models.json named copy-missing in --fail-closed output"
+else
+  pass "models.json not named copy-missing in --fail-closed output"
+fi
+
+# ── AC4d (MACP8 US-001): settings.json absent → required fail-closed ──
+echo ""
+echo "--- AC4d: settings.json-absent operator home fails closed ---"
+
+mkdir -p "$SETTINGS_ABSENT_HOME/.pi/agent"
+# NO settings.json — required file absent.
+echo '{}' > "$SETTINGS_ABSENT_HOME/.pi/agent/auth.json"
+mkdir -p "$SETTINGS_ABSENT_HOME/.hermes"
+cat > "$SETTINGS_ABSENT_HOME/.hermes/config.yaml" <<YAML
+model:
+  default: gpt-5.6-sol
+YAML
+cat > "$SETTINGS_ABSENT_HOME/.hermes/auth.json" <<JSON
+{"version":1}
+JSON
+
+set +e
+HOME="$SETTINGS_ABSENT_HOME" TT_OPERATOR_HOME="$SETTINGS_ABSENT_HOME" TT_VAR="$SETTINGS_ABSENT_VAR" \
+  "$TOOL" --fail-closed >/tmp/tt-fc-settings-absent.log 2>/tmp/tt-fc-settings-absent.err
+SA_STATUS=$?
+set -e
+
+if [ "$SA_STATUS" -ne 0 ]; then
+  pass "settings.json-absent --fail-closed exits non-zero ($SA_STATUS)"
+else
+  fail "settings.json-absent --fail-closed exited 0 (should fail closed)"
+fi
+
+if grep -q "REASON: tt-home-unprovisioned" /tmp/tt-fc-settings-absent.err; then
+  pass "settings.json-absent emits REASON: tt-home-unprovisioned"
+else
+  fail "settings.json-absent missing REASON on stderr"
+  cat /tmp/tt-fc-settings-absent.err >&2
+fi
+
+if grep -q "copy-missing:.pi/agent/settings.json" /tmp/tt-fc-settings-absent.err; then
+  pass "settings.json-absent DETAILS names copy-missing:.pi/agent/settings.json"
+else
+  fail "settings.json-absent DETAILS missing copy-missing:.pi/agent/settings.json"
+  cat /tmp/tt-fc-settings-absent.err >&2
+fi
+
+# ── AC4e (MACP8 US-001): auth.json absent → required fail-closed ──────
+echo ""
+echo "--- AC4e: auth.json-absent operator home fails closed ---"
+
+mkdir -p "$AUTH_ABSENT_HOME/.pi/agent"
+cat > "$AUTH_ABSENT_HOME/.pi/agent/settings.json" <<JSON
+{"defaultProvider":"deepseek"}
+JSON
+# NO auth.json — required file absent.
+mkdir -p "$AUTH_ABSENT_HOME/.hermes"
+cat > "$AUTH_ABSENT_HOME/.hermes/config.yaml" <<YAML
+model:
+  default: gpt-5.6-sol
+YAML
+cat > "$AUTH_ABSENT_HOME/.hermes/auth.json" <<JSON
+{"version":1}
+JSON
+
+set +e
+HOME="$AUTH_ABSENT_HOME" TT_OPERATOR_HOME="$AUTH_ABSENT_HOME" TT_VAR="$AUTH_ABSENT_VAR" \
+  "$TOOL" --fail-closed >/tmp/tt-fc-auth-absent.log 2>/tmp/tt-fc-auth-absent.err
+AA_STATUS=$?
+set -e
+
+if [ "$AA_STATUS" -ne 0 ]; then
+  pass "auth.json-absent --fail-closed exits non-zero ($AA_STATUS)"
+else
+  fail "auth.json-absent --fail-closed exited 0 (should fail closed)"
+fi
+
+if grep -q "copy-missing:.pi/agent/auth.json" /tmp/tt-fc-auth-absent.err; then
+  pass "auth.json-absent DETAILS names copy-missing:.pi/agent/auth.json"
+else
+  fail "auth.json-absent DETAILS missing copy-missing:.pi/agent/auth.json"
+  cat /tmp/tt-fc-auth-absent.err >&2
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────

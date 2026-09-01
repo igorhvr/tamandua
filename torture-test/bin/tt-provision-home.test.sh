@@ -37,6 +37,12 @@ else
   fail "--help does not document env-key surfacing / whole-dir exclusion"
 fi
 
+if "$TOOL" --help | grep -q "OPTIONAL-surface-if-present" && "$TOOL" --help | grep -q "REQUIRED"; then
+  pass "--help documents the required-vs-optional pi file split"
+else
+  fail "--help does not document the required-vs-optional pi file split"
+fi
+
 if "$TOOL" --help > /dev/null 2>&1; then
   pass "--help exits 0"
 else
@@ -55,9 +61,11 @@ echo "--- Setup: mock HOME and TT_VAR ---"
 
 MOCK_HOME="$(mktemp -d)"
 TEST_VAR="$(mktemp -d)"
+ABSENT_HOME="$(mktemp -d)"
+ABSENT_VAR="$(mktemp -d)"
 
 cleanup() {
-  rm -rf "$MOCK_HOME" "$TEST_VAR"
+  rm -rf "$MOCK_HOME" "$TEST_VAR" "$ABSENT_HOME" "$ABSENT_VAR"
 }
 trap cleanup EXIT
 
@@ -295,6 +303,57 @@ if [ ! -d "$SCRIPTED_TT_HOME/.hermes" ]; then
   pass "scripted TT_HOME has NO .hermes directory (as expected)"
 else
   fail "scripted TT_HOME HAS .hermes directory (should not)"
+fi
+
+# ── Test 11: models.json-absent operator HOME (MACP8 US-001) ─────────
+echo ""
+echo "--- Test: models.json absent (darwin operator shape) ---"
+
+# darwin ~/.pi/agent legitimately has no models.json. The operator fixture
+# here has settings.json + auth.json + hermes files but NO models.json; the
+# run must exit 0, surface settings.json, and neither surface nor name
+# models.json missing.
+mkdir -p "$ABSENT_HOME/.pi/agent"
+cat > "$ABSENT_HOME/.pi/agent/settings.json" <<JSON
+{"defaultProvider":"deepseek","agentDir":"${ABSENT_HOME}/.pi/agent"}
+JSON
+echo '{}' > "$ABSENT_HOME/.pi/agent/auth.json"
+# NO models.json here — intentional.
+mkdir -p "$ABSENT_HOME/.hermes"
+cat > "$ABSENT_HOME/.hermes/config.yaml" <<YAML
+model:
+  default: gpt-5.6-sol
+YAML
+cat > "$ABSENT_HOME/.hermes/auth.json" <<JSON
+{"version":1}
+JSON
+
+ABSENT_REAL="$ABSENT_VAR/home"
+if HOME="$ABSENT_HOME" TT_OPERATOR_HOME="$ABSENT_HOME" TT_VAR="$ABSENT_VAR" \
+    DEEPSEEK_API_KEY="sk-test-deepseek" \
+    "$TOOL" >/tmp/tt-provision-absent.log 2>&1; then
+  pass "models.json-absent run exits 0"
+else
+  fail "models.json-absent run did NOT exit 0"
+  cat /tmp/tt-provision-absent.log >&2
+fi
+
+if [ -f "$ABSENT_REAL/.pi/agent/settings.json" ]; then
+  pass "settings.json surfaced with models.json absent"
+else
+  fail "settings.json NOT surfaced with models.json absent"
+fi
+
+if [ ! -e "$ABSENT_REAL/.pi/agent/models.json" ]; then
+  pass "models.json NOT surfaced (absent operator file skipped)"
+else
+  fail "models.json WAS surfaced — should have been skipped"
+fi
+
+if ! grep -q "missing surfaced file(s)" /tmp/tt-provision-absent.log && ! grep -q "copy-missing" /tmp/tt-provision-absent.log; then
+  pass "models.json not named missing in provisioning output"
+else
+  fail "models.json named missing in provisioning output"
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────

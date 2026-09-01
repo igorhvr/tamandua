@@ -175,12 +175,18 @@ cannot share the real-harness daemon. The TT install runs TWO daemons:
   Without it every agent `git commit` dies at minute 20 of hour one
   ("Please tell me who you are"). Repo-local config in fixtures is a
   belt-and-suspenders addition, not a substitute.
-- `$TT_HOME/.pi/agent/` — **minimal enumerated set** (E2.6 US-004), surfaced
-  file-by-file from `~/.pi/agent/`, not a whole-directory copy:
-  `settings.json` (default model/provider selection), `models.json` (custom
-  provider defs + inline `apiKey`), and `auth.json` (operator auth.json base
-  merged with the operator's env-provided API keys — `DEEPSEEK_API_KEY`,
-  `OPENAI_API_KEY`, etc. — materialized into pi `auth.json` format). The
+- `$TT_HOME/.pi/agent/` — **minimal enumerated set** (E2.6 US-004; MACP8
+  required-vs-optional split), surfaced file-by-file from `~/.pi/agent/`,
+  not a whole-directory copy:
+  `settings.json` (default model/provider selection) — **required**;
+  `auth.json` (operator auth.json base merged with the operator's
+  env-provided API keys — `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`, etc. —
+  materialized into pi `auth.json` format) — **required**; and
+  `models.json` (custom provider defs + inline `apiKey`) —
+  **OPTIONAL-surface-if-present**: when the real operator file exists it is
+  surfaced exactly as today, but a darwin operator whose `~/.pi/agent/`
+  legitimately lacks `models.json` (pi runs fine without it) provisions
+  successfully and must never be named missing by the probe. The
   operator's env keys are materialized because the contained daemon starts
   under `env -i` and never inherits the operator env; without them every
   round dies with `No API key found for the selected model`. Files are

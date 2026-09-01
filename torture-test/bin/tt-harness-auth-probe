@@ -18,9 +18,12 @@
 #
 # Two legs per harness (both must pass):
 #   1. PRESENCE  — the enumerated minimal surfaced files exist in the
-#                  contained TT home (pi: settings/models/auth.json under
-#                  .pi/agent/; hermes: config.yaml + auth.json under
-#                  .hermes/). A missing file means surfacing never happened.
+#                  contained TT home (pi: settings.json + auth.json under
+#                  .pi/agent/ — REQUIRED; models.json is
+#                  OPTIONAL-surface-if-present, so the probe never names it
+#                  missing; hermes: config.yaml + auth.json under
+#                  .hermes/). A missing REQUIRED file means surfacing never
+#                  happened.
 #                  dsh (Tier-2 lane, US-002): presence is BINARY-only —
 #                  TAMANDUA_DSH_BINARY, else PATH `command -v dsh`; dsh
 #                  config is operator-directed (~/.dsh) and never surfaced
@@ -127,9 +130,17 @@ resolve_harness_binary() {
   printf '%s' "$resolved"
 }
 
-# present_files_for: the enumerated minimal surfaced files a harness requires
+# present_files_for: the enumerated minimal surfaced files a harness REQUIRES
 # in the contained home (US-004). A missing file means surfacing never
 # happened (or was stripped) — a fail-closed presence leg.
+#
+# pi required-vs-optional split (MACP8, darwin parity):
+#   REQUIRED                    .pi/agent/settings.json, .pi/agent/auth.json
+#   OPTIONAL-surface-if-present .pi/agent/models.json
+# models.json is an optional custom-models config — a darwin operator HOME
+# legitimately lacks it — so the probe must NOT name it missing. Genuinely
+# required pi auth files (settings.json + auth.json) stay fail-closed.
+#
 # dsh (Tier-2 lane, US-002) has NO enumerated surfaced files: the home-provision
 # leg never surfaces dsh config into the contained home — dsh is operator-
 # directed and reads the operator's ~/.dsh as-is. Presence is the BINARY only
@@ -137,7 +148,7 @@ resolve_harness_binary() {
 present_files_for() {
   local harness="$1"
   if [ "$harness" = "pi" ]; then
-    printf '.pi/agent/settings.json\n.pi/agent/models.json\n.pi/agent/auth.json\n'
+    printf '.pi/agent/settings.json\n.pi/agent/auth.json\n'
   elif [ "$harness" = "dsh" ]; then
     printf ''
   else
@@ -307,8 +318,10 @@ home's surfaced harness auth can actually resolve a model + API key and
 answer, via:
 
   1. PRESENCE — pi/hermes: the enumerated minimal surfaced files exist in the
-     contained home (pi: .pi/agent/{settings.json,models.json,auth.json};
-     hermes: .hermes/{config.yaml,auth.json}). dsh (Tier-2 lane): presence is
+     contained home (pi: .pi/agent/settings.json + .pi/agent/auth.json
+     required; .pi/agent/models.json OPTIONAL-surface-if-present and never
+     named missing; hermes: .hermes/{config.yaml,auth.json}). dsh (Tier-2
+     lane): presence is
      BINARY-only (TAMANDUA_DSH_BINARY, else PATH \`command -v dsh\`); dsh
      config is operator-directed (~/.dsh) and never surfaced into the
      contained home. Record-only: the probe never installs and never writes

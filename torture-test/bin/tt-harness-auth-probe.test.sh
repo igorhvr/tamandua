@@ -118,7 +118,7 @@ fi
 # ── Test 3 (AC4a): single one-shot, no full generation (--no-tools) ───
 echo ""
 echo "--- Test: AC4 no-full-generation invocation ---"
-if [ "$(wc -l < "$INVOC_LOG")" = "1" ]; then
+if [ "$(wc -l < "$INVOC_LOG")" -eq 1 ]; then
   pass "fake pi invoked exactly once (no daemon + round loop)"
 else
   fail "fake pi invoked more than once: $(cat "$INVOC_LOG")"
@@ -152,6 +152,69 @@ if printf '%s' "$OUT" | grep -q "harness-auth-missing: pi"; then
   pass "distinct reason 'harness-auth-missing: pi' on stderr"
 else
   fail "missing distinct reason for stripped pi: $OUT"
+fi
+
+# ── Test 4b (MACP8): pi positive with models.json absent ────────────────
+echo ""
+echo "--- Test: MACP8 pi positive (settings+auth present, models.json absent) ---"
+provision_surfaced_auth
+rm -f "$HOME_PI/models.json"
+: > "$INVOC_LOG"
+OUT="$(TT_VAR="$TEST_VAR" TAMANDUA_PI_BINARY="$FAKE_BIN/fake-pi" "$TOOL" pi 2>&1)"; RC=$?
+if [ "$RC" -eq 0 ]; then
+  pass "probe pi exits 0 with settings.json+auth.json and NO models.json"
+else
+  fail "probe pi did NOT exit 0 without models.json (rc=$RC): $OUT"
+fi
+if ! printf '%s' "$OUT" | grep -q "missing surfaced file(s): .pi/agent/models.json"; then
+  pass "probe pi does NOT name models.json missing"
+else
+  fail "probe pi named models.json missing: $OUT"
+fi
+
+# ── Test 4c (MACP8): pi fail-closed auth.json absent (models.json absent) ──
+echo ""
+echo "--- Test: MACP8 pi fail-closed (auth.json absent, models.json absent) ---"
+provision_surfaced_auth
+rm -f "$HOME_PI/auth.json" "$HOME_PI/models.json"
+set +e
+OUT="$(TT_VAR="$TEST_VAR" TAMANDUA_PI_BINARY="$FAKE_BIN/fake-pi" "$TOOL" pi 2>&1)"
+RC=$?
+set -e
+if [ "$RC" -ne 0 ]; then
+  pass "probe pi exits non-zero when auth.json absent (models.json absent)"
+else
+  fail "probe pi did NOT exit non-zero when auth.json absent: $OUT"
+fi
+if printf '%s' "$OUT" | grep -q "harness-auth-missing: pi"; then
+  pass "distinct reason 'harness-auth-missing: pi'"
+else
+  fail "missing distinct reason for auth.json-absent pi: $OUT"
+fi
+if printf '%s' "$OUT" | grep -q "missing surfaced file(s): .pi/agent/auth.json"; then
+  pass "DETAILS names .pi/agent/auth.json"
+else
+  fail "DETAILS does not name .pi/agent/auth.json: $OUT"
+fi
+
+# ── Test 4d (MACP8): pi fail-closed settings.json absent ─────────────────
+echo ""
+echo "--- Test: MACP8 pi fail-closed (settings.json absent) ---"
+provision_surfaced_auth
+rm -f "$HOME_PI/settings.json"
+set +e
+OUT="$(TT_VAR="$TEST_VAR" TAMANDUA_PI_BINARY="$FAKE_BIN/fake-pi" "$TOOL" pi 2>&1)"
+RC=$?
+set -e
+if [ "$RC" -ne 0 ]; then
+  pass "probe pi exits non-zero when settings.json absent"
+else
+  fail "probe pi did NOT exit non-zero when settings.json absent: $OUT"
+fi
+if printf '%s' "$OUT" | grep -q "missing surfaced file(s): .pi/agent/settings.json"; then
+  pass "DETAILS names .pi/agent/settings.json"
+else
+  fail "DETAILS does not name .pi/agent/settings.json: $OUT"
 fi
 
 # ── Test 5 (AC3): hermes auth stripped → fail closed ───────────────────
