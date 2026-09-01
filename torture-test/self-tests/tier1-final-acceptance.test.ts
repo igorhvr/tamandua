@@ -277,7 +277,13 @@ const allowed = [
   // real-case preflight (realPreflightRequired is manifest-based) runs its
   // home-provision leg on ANY host, even when the real cells are later
   // predicate-excluded — so the fix is part of the MACP5 authoring surface.
+  // MACP8 (US-001) extends that surface with the provisioning bin gates:
+  // the required-vs-optional pi split (models.json OPTIONAL-surface-if-
+  // present) is pinned by tt-provision-home.test.sh and
+  // tt-provision-home-failclosed.test.sh.
   "torture-test/bin/tt-provision-home",
+  "torture-test/bin/tt-provision-home.test.sh",
+  "torture-test/bin/tt-provision-home-failclosed.test.sh",
   // CDSK (US-002): the S15 schema-handshake parity leg adds the read-only
   // SQL-surface probe (bin/tt-schema-probe.mjs) to the daemon-up authoring
   // surface — same class as the build-version parity guard it sits beside.
