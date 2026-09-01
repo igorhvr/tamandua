@@ -513,6 +513,8 @@ When a reroute fires:
 
 **Observability:** Every reroute emits a `step.rerouted` event with `fromStep`, `toStep`, `rerouteCount`, `budget`, and a bounded reason. Budget exhaustion emits `step.reroute_budget_exhausted`. Both are logged with the same structured metadata.
 
+**Worker death / respawn:** When watchdog or dead-worker recovery (`recoverOrphanedStepsForAgent` in `src/installer/step-ops.ts`) re-dispatches a claimed step, the event stream reads `step.running` → `step.worker_lost` (or `step.timeout` / `step.ceiling_expiry`) → `step.respawned` → `step.running`. The `step.respawned` event carries the prior worker's identity (`priorPid` = recovered `claim_pid`, `priorRound` = recovered `claim_job_id`), the recovery class as `reason` (`worker_lost` | `timeout` | `ceiling_expiry` | `no_work_release`), and the step's `retry` count after re-dispatch — so operators can distinguish a respawn from an anomalous duplicate `step.running`.
+
 ### Complete Example
 
 ```yaml

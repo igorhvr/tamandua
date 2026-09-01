@@ -1431,6 +1431,27 @@ export function cleanupAbandonedSteps(): void {
  *   reset the step/story exactly the same way; only the observability
  *   counters and event names differ.
  */
+
+/**
+ * RVOC US-002: recovery class of a re-dispatched claimed step, carried as
+ * the `reason` of the step.respawned event. Mirrors the recovery-event
+ * selection in recoverOrphanedStepsForAgent: a workerJobId-scoped round
+ * killed at the worker time ceiling is `ceiling_expiry`; a round that
+ * replied NO_WORK and released a dangling claim is `no_work_release`; a
+ * recovery with no worker job (stale sweeper, control-plane release) is
+ * `timeout`; everything else that lost a live worker is `worker_lost`.
+ */
+function respawnReasonFor(
+  abandonReason: string | undefined,
+  workerJobId: string | undefined,
+  timedOut: boolean | undefined,
+): "worker_lost" | "timeout" | "ceiling_expiry" | "no_work_release" {
+  if (workerJobId !== undefined && timedOut === true) return "ceiling_expiry";
+  if (abandonReason === "no_work_release") return "no_work_release";
+  if (workerJobId === undefined) return "timeout";
+  return "worker_lost";
+}
+
 export function recoverOrphanedStepsForAgent(
   agentId: string,
   runId: string,
@@ -1463,13 +1484,14 @@ export function recoverOrphanedStepsForAgent(
     clauses.push("(claim_job_id IS NULL OR claim_job_id = ?)");
     params.push(workerJobId);
   }
-  const query = `SELECT id, step_id, run_id, retry_count, max_retries, type, current_story_id, loop_config
+  const query = `SELECT id, step_id, run_id, retry_count, max_retries, type, current_story_id, loop_config, claim_pid, claim_job_id
        FROM steps
        WHERE ${clauses.join(" AND ")}`;
 
   const steps = db.prepare(query).all(...params) as {
     id: string; step_id: string; run_id: string; retry_count: number; max_retries: number;
     type: string; current_story_id: string | null; loop_config: string | null;
+    claim_pid: number | null; claim_job_id: string | null;
   }[];
 
   let recovered = 0;
@@ -1603,6 +1625,33 @@ export function recoverOrphanedStepsForAgent(
               error: err instanceof Error ? err.message : String(err),
             });
           }
+          // RVOC US-002: emit step.respawned AFTER the recovery event so the
+          // stream reads step.running → step.worker_lost/timeout/ceiling_expiry
+          // → step.respawned → step.running — consumers can distinguish a
+          // respawn from an anomalous duplicate claim. Story-level recovery
+          // does not bump the step's own retry counter; report the current one.
+          try {
+            emitEvent({
+              ts: new Date().toISOString(),
+              event: "step.respawned",
+              runId: step.run_id,
+              workflowId: wfId,
+              stepId: step.step_id,
+              agentId,
+              priorPid: step.claim_pid ?? undefined,
+              priorRound: step.claim_job_id ?? undefined,
+              reason: respawnReasonFor(abandonReason, workerJobId, timedOut),
+              retry: step.retry_count,
+              detail: `Step respawned after ${storyRecoveryEvent} (story ${story.story_id}); prior worker pid ${step.claim_pid ?? "unknown"}, round ${step.claim_job_id ?? "unknown"}`,
+            });
+          } catch (err) {
+            logger.warn(`step.respawned event emit failed for story ${story.story_id} (run ${step.run_id}, step ${step.step_id}): ${err instanceof Error ? err.message : String(err)}`, {
+              runId: step.run_id,
+              stepId: step.step_id,
+              agentId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
           logger.info(`Orphaned step recovery: story ${story.story_id} reset to pending (abandon ${newAbandoned}/${ABANDON_STORY_MAX})`, { runId: step.run_id, stepId: step.step_id, agentId });
           if (timeoutRetryReason) {
             try {
@@ -1700,6 +1749,34 @@ export function recoverOrphanedStepsForAgent(
         ...(stepRecoveryEvent === "step.worker_lost" ? { exitCode: exitCode ?? undefined, signal: signal ?? undefined, stderrTail } : {}),
         ...(stepRecoveryEvent === "step.ceiling_expiry" ? { timedOut: true, exitCode: exitCode ?? undefined, signal: signal ?? undefined, stderrTail } : {}),
       });
+      // RVOC US-002: emit step.respawned AFTER the recovery event so the
+      // stream reads step.running → step.worker_lost/timeout/ceiling_expiry
+      // → step.respawned → step.running — consumers can distinguish a
+      // respawn from an anomalous duplicate claim. Carries the recovered
+      // claim's worker identity (claim_pid / claim_job_id) and the new
+      // retry count. Telemetry-only: never blocks recovery.
+      try {
+        emitEvent({
+          ts: new Date().toISOString(),
+          event: "step.respawned",
+          runId: step.run_id,
+          workflowId: wfId,
+          stepId: step.step_id,
+          agentId,
+          priorPid: step.claim_pid ?? undefined,
+          priorRound: step.claim_job_id ?? undefined,
+          reason: respawnReasonFor(abandonReason, workerJobId, timedOut),
+          retry: newRetry,
+          detail: `Step respawned after ${stepRecoveryEvent}; prior worker pid ${step.claim_pid ?? "unknown"}, round ${step.claim_job_id ?? "unknown"}`,
+        });
+      } catch (err) {
+        logger.warn(`step.respawned event emit failed (run ${step.run_id}, step ${step.step_id}): ${err instanceof Error ? err.message : String(err)}`, {
+          runId: step.run_id,
+          stepId: step.step_id,
+          agentId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
       logger.info(`Orphaned step reset to pending (retry ${newRetry}/${step.max_retries})`, { runId: step.run_id, stepId: step.step_id, agentId });
       if (timeoutRetryReason) {
         setRunContextKey(step.run_id, "timeout_retry", timeoutRetryReason);
@@ -3641,6 +3718,13 @@ function getOnFailPolicySync(runId: string, stepId: string): WorkflowStepFailure
  * Takes a pre-resolved policy object and performs all reroute logic:
  * validation, budget check, DB updates, story reset, event emission.
  *
+ * countsAsTerminal marks a motor reroute dispatched at the consumer's
+ * retry-exhaustion decision point (completeStep / orphan-recovery
+ * corridors): such reroutes increment terminal_reroute_count alongside
+ * the step.rerouted event so the event count reconciles with the DB
+ * counter. Failure-class terminal reroutes (FAILURE_CLASS:
+ * refused_permanent) increment it as before.
+ *
  * Returns "rerouted" on success, "budget_exhausted" when max_reroutes
  * is reached, "invalid_target" when the declared retry_step target
  * doesn't exist or isn't upstream, or "not_found" when the consumer
@@ -3653,6 +3737,7 @@ function rerouteWithPolicy(
   consumerRowId: string,
   error: string,
   hasIndependentGateAllowance = false,
+  countsAsTerminal = false,
 ): "rerouted" | "budget_exhausted" | "invalid_target" | "not_found" {
   const db = getDb();
   const targetStepId = policy.retry_step!;
@@ -3715,8 +3800,15 @@ function rerouteWithPolicy(
   const usesBudgetIndependentAllowance =
     currentReroutes >= maxReroutes && hasIndependentTerminalAllowance;
   const newRerouteCount = currentReroutes + (usesBudgetIndependentAllowance ? 0 : 1);
+  // RCNT (US-003): terminal_reroute_count must reconcile with the
+  // step.rerouted event stream. A terminal-class failure increments it;
+  // so does a motor reroute dispatched at the consumer's retry-exhaustion
+  // decision point (countsAsTerminal — the completeStep / orphan-recovery
+  // corridors). Transient declared-retryable reroutes stay non-terminal so
+  // the one-shot terminal allowance is preserved (ledger-gate semantics).
   const newTerminalRerouteCount =
-    (consumerStep.terminal_reroute_count ?? 0) + (rerouteMode === "terminal" ? 1 : 0);
+    (consumerStep.terminal_reroute_count ?? 0) +
+    (rerouteMode === "terminal" || countsAsTerminal ? 1 : 0);
 
   // Build bounded feedback for the producer
   const feedback =
@@ -3743,7 +3835,9 @@ function rerouteWithPolicy(
   writeRerouteFeedbackContext(db, runId, targetStep, error);
 
   // (b) Reset consumer: status=waiting, retry_count=0, increment the general
-  //     counter and, for a terminal-class reroute, its dedicated counter.
+  //     counter and, for a terminal-class or terminal-decision reroute, its
+  //     dedicated counter. Both counters update in the SAME statement as the
+  //     step.rerouted event's synchronous unit — atomic by construction.
   //     Clear output and ownership so it looks like a fresh step.
   db.prepare(
     "UPDATE steps SET status = 'waiting', retry_count = 0, reroute_count = ?, terminal_reroute_count = ?, output = NULL, claim_job_id = NULL, claim_pid = NULL, claim_pgid = NULL, updated_at = datetime('now') WHERE id = ?"
@@ -4317,6 +4411,16 @@ function writeRerouteFeedbackContext(
 /**
  * Sync wrapper around rerouteWithPolicy. Resolves the on_fail policy
  * synchronously via getOnFailPolicySync, then delegates to the shared core.
+ *
+ * Every rerouteStepSync caller is a consumer retry-exhaustion corridor
+ * (completeStep retry-verdict / expects-validation, orphan-recovery
+ * exhaustion): the consumer can no longer retry, so the reroute is the
+ * terminal decision point before run failure. Such reroutes emit
+ * step.rerouted and MUST also increment the consumer's
+ * terminal_reroute_count in the same UPDATE — keeping the event count
+ * reconciled with the DB counter (RCNT). Direct policy-core callers
+ * (agent failStep, claim-time ledger-gate refusals) keep failure-class
+ * semantics via the countsAsTerminal default of false.
  */
 function rerouteStepSync(
   runId: string,
@@ -4326,7 +4430,7 @@ function rerouteStepSync(
 ): "rerouted" | "budget_exhausted" | "invalid_target" | "not_found" {
   const policy = getOnFailPolicySync(runId, consumerStepId);
   if (!policy?.retry_step) return "not_found";
-  return rerouteWithPolicy(policy, runId, consumerStepId, consumerRowId, error);
+  return rerouteWithPolicy(policy, runId, consumerStepId, consumerRowId, error, false, true);
 }
 
 // ══════════════════════════════════════════════════════════════════════

@@ -14,6 +14,7 @@ const EVENT_LABELS: Record<string, string> = {
   "step.done": "Step completed",
   "step.failed": "Step failed",
   "step.timeout": "Step timed out",
+  "step.respawned": "Step respawned",
   "story.started": "Story started",
   "story.done": "Story done",
   "story.verified": "Story verified",

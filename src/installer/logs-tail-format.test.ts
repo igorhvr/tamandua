@@ -40,6 +40,11 @@ describe("formatLogsTailLabel", () => {
     assert.equal(formatLogsTailLabel(makeEvent("pipeline.advanced")), "Pipeline advanced");
   });
 
+  it("displays 'Step respawned' for step.respawned events (RVOC US-002)", () => {
+    const evt = makeEvent("step.respawned");
+    assert.equal(formatLogsTailLabel(evt), "Step respawned");
+  });
+
   it("displays 'Run canceled' for run.canceled events", () => {
     const evt = makeEvent("run.canceled");
     assert.equal(formatLogsTailLabel(evt), "Run canceled");

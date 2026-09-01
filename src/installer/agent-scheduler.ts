@@ -1136,10 +1136,11 @@ async function attributeWorkRoundTokenUsage(
 
 /**
  * Classify a completed dispatch round as an instant fail (conservatively:
- * wall time below the threshold AND zero output bytes AND nonzero exit)
- * and update the per-job consecutive streak: increment on instant-fail,
- * reset on any other harness round, never touch on timed-out rounds
- * (ceiling-expiry class) or when no duration signal exists.
+ * wall time below the threshold AND zero TRIMMED output bytes AND nonzero
+ * exit or signal-death) and update the per-job consecutive streak:
+ * increment on instant-fail, reset on any other harness round, never
+ * touch on timed-out rounds (ceiling-expiry class) or when no duration
+ * signal exists.
  *
  * At the backoff threshold K the next relaunch is delayed by an
  * escalating amount (see {@link instantFailBackoffDelayMs}); at the

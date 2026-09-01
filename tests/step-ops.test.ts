@@ -3496,10 +3496,18 @@ steps:
     assert.ok(producer.output?.includes("Reroute from"), `producer output should contain reroute feedback, got: ${producer.output}`);
 
     // Consumer should be reset to waiting with retry_count=0
-    const consumer = db.prepare("SELECT status, retry_count, reroute_count FROM steps WHERE id = ?").get(consumerRowId) as { status: string; retry_count: number; reroute_count: number | null };
+    const consumer = db.prepare("SELECT status, retry_count, reroute_count, terminal_reroute_count FROM steps WHERE id = ?").get(consumerRowId) as { status: string; retry_count: number; reroute_count: number | null; terminal_reroute_count: number | null };
     assert.equal(consumer.status, "waiting", "consumer should be reset to waiting");
     assert.equal(consumer.retry_count, 0, "consumer retry_count should be 0");
     assert.equal(consumer.reroute_count, 1, "consumer reroute_count should be 1");
+
+    // RCNT: the orphan-recovery-exhaustion reroute is a terminal-decision
+    // corridor — step.rerouted event count must reconcile with
+    // terminal_reroute_count (both exactly 1 after this single reroute).
+    assert.equal(consumer.terminal_reroute_count, 1, "terminal_reroute_count must reconcile with the step.rerouted event count");
+    const rerouteEvents = getRunEvents(runId).filter(e => e.event === "step.rerouted");
+    assert.equal(rerouteEvents.length, 1, "exactly one step.rerouted event must be emitted");
+    assert.equal(rerouteEvents.length, consumer.terminal_reroute_count, "step.rerouted event count must equal terminal_reroute_count");
   });
 
   it("orphan-recovery exhaustion falls through to run failure when budget exhausted", async () => {
@@ -5651,6 +5659,35 @@ steps:
     max_retries: 2
 `;
 
+  // RCNT fixture: merge-family workflow whose finalize step declares the full
+  // retry_on vocabulary (target_moved/conflicts) — the exact corridor where
+  // the observed W4.10 inconsistency lived (step.rerouted without a matching
+  // terminal_reroute_count increment).
+  const mergeFamilyRetryOnYaml = `
+id: test-retry-verdict-merge-retryon
+agents:
+  - id: dev
+    workspace:
+      baseDir: .
+      files: {}
+steps:
+  - id: test
+    agent: dev
+    input: "Run tests"
+    expects: "STATUS: done"
+    max_retries: 3
+  - id: finalize_merge
+    agent: dev
+    input: "Merge"
+    expects: "STATUS: done"
+    max_retries: 0
+    on_fail:
+      retry_step: test
+      retry_on:
+        - target_moved
+        - conflicts
+`;
+
   // Three-step with intermediate: produce → middle → consume.
   // consume declares on_fail.retry_step: produce (skip over middle).
   const threeStepYaml = `
@@ -5688,6 +5725,7 @@ steps:
     _workflowsDir = path.join(th.tamanduaDir, "workflows");
     const workflows: Record<string, string> = {
       "test-retry-verdict-merge": mergeFamilyYaml,
+      "test-retry-verdict-merge-retryon": mergeFamilyRetryOnYaml,
       "test-retry-verdict-no-onfail": noOnFailYaml,
       "test-retry-verdict-three": threeStepYaml,
     };
@@ -5810,6 +5848,72 @@ steps:
     const events = getRunEvents(runId);
     const reroutedEvent = events.find(e => e.event === "step.rerouted");
     assert.ok(reroutedEvent, "step.rerouted event must be emitted");
+  });
+
+  it("RCNT: finalize retry-verdict reroute keeps step.rerouted count == terminal_reroute_count", async () => {
+    // WAVE-B US-003 regression: the finalize retry-verdict corridor reroutes
+    // the consumer at retry exhaustion (max_retries 0) with merge-branch style
+    // output (STATUS: retry + target_moved verbatim). Historically this emitted
+    // step.rerouted WITHOUT incrementing terminal_reroute_count (legacy
+    // failure-class routing), so the event count and the DB counter diverged.
+    const { getDb } = await import("../dist/db.js");
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const testStepRowId = crypto.randomUUID();
+    const mergeStepRowId = crypto.randomUUID();
+    const now = ts();
+
+    const seededContext = JSON.stringify({ task: "merge task", repo: "/tmp/repo", branch: "fix/bug" });
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 1, 'test-retry-verdict-merge-retryon', 'merge task', 'running', ?, 0, ?, ?)"
+    ).run(runId, seededContext, now, now);
+
+    // test step (idx 0) — done
+    db.prepare(
+      `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects,
+       status, output, retry_count, max_retries, type, created_at, updated_at)
+       VALUES (?, ?, 'test', 'dev', 0, 'Run tests', ?,
+       'done', 'STATUS: done', 0, 3, 'single', ?, ?)`
+    ).run(testStepRowId, runId, MERGE_FAMILY_EXPECTS, now, now);
+
+    // finalize_merge (idx 1) — max_retries 0, running: the FIRST completion
+    // with a STATUS: retry verdict is already at retry exhaustion.
+    db.prepare(
+      `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects,
+       status, retry_count, max_retries, type, created_at, updated_at)
+       VALUES (?, ?, 'finalize_merge', 'dev', 1, 'Merge', ?,
+       'running', 0, 0, 'single', ?, ?)`
+    ).run(mergeStepRowId, runId, MERGE_FAMILY_EXPECTS, now, now);
+
+    // merge-branch style output: the merger relays the target_moved status
+    // verbatim (no FAILURE_CLASS header — the legacy-classification shape that
+    // produced the observed inconsistency), then appends its own STATUS: retry
+    // verdict. parseOutputKeyValues is last-wins, so the verdict routes.
+    const result = completeStep(mergeStepRowId, "STATUS: target_moved\nTARGET_MOVED: refs/heads/main\nSTATUS: retry\nREBASED: true");
+
+    // Must reroute (retries exhausted + on_fail.retry_step), not fail.
+    assert.equal(result.status, "rerouted", `finalize retry-verdict must reroute, got: ${result.status}`);
+
+    // Consumer reset to waiting; BOTH counters incremented by exactly 1.
+    const mergeStep = db.prepare(
+      "SELECT status, retry_count, reroute_count, terminal_reroute_count FROM steps WHERE id = ?"
+    ).get(mergeStepRowId) as { status: string; retry_count: number; reroute_count: number; terminal_reroute_count: number };
+    assert.equal(mergeStep.status, "waiting", "consumer step must be reset to waiting after reroute");
+    assert.equal(mergeStep.retry_count, 0, "consumer retry_count must be reset to 0 after reroute");
+    assert.equal(mergeStep.reroute_count, 1, "reroute_count must increment by exactly 1 per reroute");
+    assert.equal(mergeStep.terminal_reroute_count, 1, "terminal_reroute_count must reconcile with the step.rerouted event count");
+
+    // Producer re-pended to pending with reroute feedback.
+    const testStep = db.prepare("SELECT status, output FROM steps WHERE id = ?").get(testStepRowId) as { status: string; output: string };
+    assert.equal(testStep.status, "pending", "producer step must be re-pended to pending");
+    assert.ok(testStep.output.includes("Reroute from"), "producer output must carry reroute feedback");
+
+    // Exactly one step.rerouted event — event count == terminal_reroute_count.
+    const events = getRunEvents(runId);
+    const reroutedEvents = events.filter(e => e.event === "step.rerouted");
+    assert.equal(reroutedEvents.length, 1, "exactly one step.rerouted event must be emitted");
+    assert.equal(reroutedEvents.length, mergeStep.terminal_reroute_count, "step.rerouted event count must equal terminal_reroute_count");
+    assert.equal(reroutedEvents[0].stepId, "finalize_merge", "step.rerouted event must name the consumer step");
   });
 
   it("retry exhaustion with NO on_fail: STATUS: retry at max_retries fails step and run", async () => {

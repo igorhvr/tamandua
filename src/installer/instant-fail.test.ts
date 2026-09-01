@@ -2,14 +2,17 @@
  * Instant-fail round classification boundaries (RSPN).
  *
  * The dispatch motor must classify an instant-fail round CONSERVATIVELY —
- * wall time below the threshold AND zero output bytes AND nonzero exit —
- * so legitimate short rounds (idle checks, no-op verifies, exit-0 rounds,
- * rounds that produce any output) never match, timed-out rounds (the
- * ceiling-expiry class) never match, and rounds whose worker had claimed
- * a step before dying (the worker_lost class) never match. These are the
- * exact boundaries the regression net pins; without them the 15s tick
- * respawns a broken harness forever with zero counters, zero backoff,
- * zero escalation.
+ * wall time below the threshold AND zero TRIMMED output bytes AND nonzero
+ * exit (or signal-death) — so legitimate short rounds (idle checks,
+ * no-op verifies, exit-0 rounds, rounds that produce any real output)
+ * never match, timed-out rounds (the ceiling-expiry class) never match,
+ * and rounds whose worker had claimed a step before dying (the
+ * worker_lost class) never match. Output is measured TRIMMED because a
+ * lone trailing newline (the dsh MISSING_CREDENTIAL shape) cannot carry a
+ * STATUS marker, and signal-death rounds (killed sub-threshold with no
+ * output) classify like nonzero exits. These are the exact boundaries the
+ * regression net pins; without them the 15s tick respawns a broken
+ * harness forever with zero counters, zero backoff, zero escalation.
  */
 import assert from "node:assert/strict";
 import { describe, it, afterEach } from "node:test";
@@ -156,16 +159,56 @@ describe("instant-fail classification boundaries (RSPN)", () => {
     );
   });
 
-  it("classifies exit-1 zero-output rounds with a null-exitCode signal-kill only when not timed out", () => {
-    // Killed by a signal that is NOT the timeout guard: not a clean exit,
-    // so it is not classified (no exit code signal at all).
+  it("classifies signal-death rounds (no exit code, signal present, zero trimmed output)", () => {
+    // Killed by a signal that is NOT the timeout guard: no exit code at
+    // all, zero output, sub-threshold wall — a SIGKILL/OOM loop is an
+    // instant fail, not a legitimate round. (Timed-out rounds carry
+    // timedOut: true and stay unclassified — pinned above.)
     assert.equal(
       isInstantFailRound({
         wallMs: 100,
         result: roundResult({ output: "", exitCode: null, signal: "SIGKILL" }),
       }),
+      true,
+      "a signal-death round with zero output must classify as instant fail",
+    );
+  });
+
+  it("classifies the dsh MISSING_CREDENTIAL shape: lone trailing newline + exit 1", () => {
+    // dsh prints a lone trailing newline even when aborting — output "\n"
+    // is 1 untrimmed byte but trims to 0, so it cannot carry a STATUS
+    // marker and must classify like a zero-output round.
+    assert.equal(
+      isInstantFailRound({
+        wallMs: 490,
+        result: roundResult({ output: "\n", exitCode: 1 }),
+      }),
+      true,
+      'output "\\n" + exit 1 must classify (trimmed-output shape)',
+    );
+  });
+
+  it("classifies whitespace-only output (tabs/newlines/spaces) as zero output", () => {
+    assert.equal(
+      isInstantFailRound({
+        wallMs: 100,
+        result: roundResult({ output: " \n\t  \r\n", exitCode: 1 }),
+      }),
+      true,
+      "whitespace-only stdout cannot carry a STATUS marker — must classify",
+    );
+  });
+
+  it("does NOT classify fast rounds whose trimmed output carries real content", () => {
+    // Real (non-whitespace) output — even a lone STATUS marker — means the
+    // worker produced output, so the round is not an instant fail.
+    assert.equal(
+      isInstantFailRound({
+        wallMs: 100,
+        result: roundResult({ output: "STATUS: done", exitCode: 1 }),
+      }),
       false,
-      "signal-killed rounds carry no exit code and must not classify",
+      "rounds with real output must NOT classify even when exit code is nonzero",
     );
   });
 

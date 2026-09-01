@@ -101,6 +101,16 @@ export interface TamanduaEvent {
   reclaimerStepId?: string;
   reclaimerPid?: number;
   releaseReason?: string;
+  /**
+   * RVOC US-002: identity of the dead/recovered worker whose claimed step was
+   * re-dispatched (step.respawned). priorPid is the recovered step's
+   * claim_pid (the prior worker's pid), priorRound its claim_job_id (the
+   * prior dispatch round). Present only on step.respawned events.
+   */
+  priorPid?: number;
+  priorRound?: string;
+  /** RVOC US-002: the step's retry_count after a respawn re-dispatch (step.respawned). Informational only. */
+  retry?: number;
   startedAt?: string;
   shimExitCode?: number;
   commandExitCode?: number | null;

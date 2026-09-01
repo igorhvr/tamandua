@@ -8,13 +8,20 @@
  * ticked, and the 15s dispatch tick simply respawned the broken harness
  * forever — no backoff, no escalation, no run failure, no status
  * surfacing. This module owns the CONSERVATIVE classification (fast +
- * zero output + nonzero exit), the consecutive-streak thresholds (K for
- * backoff, N for escalation), and the escalating relaunch delay, so the
- * scheduler, status surfacing, and tests all agree on the policy.
+ * zero trimmed output + nonzero exit or signal-death), the
+ * consecutive-streak thresholds (K for backoff, N for escalation), and
+ * the escalating relaunch delay, so the scheduler, status surfacing, and
+ * tests all agree on the policy.
  *
  * Classification is deliberately narrow: legitimate short rounds (idle
  * checks, no-op verifies) exit 0 and/or produce output, so they never
- * match. Timed-out rounds belong to the ceiling-expiry class (WLST5) and
+ * match. Output is measured TRIMMED — whitespace-only stdout cannot carry
+ * a STATUS marker, and harnesses (e.g. dsh) print a lone trailing
+ * newline even when aborting (the MISSING_CREDENTIAL shape), so trimming
+ * aligns with the scheduler's own outcome classifier
+ * (summarizeWorkRoundOutput). Signal-death rounds (killed sub-threshold
+ * with no output, e.g. SIGKILL/OOM loops) classify alongside nonzero
+ * exits. Timed-out rounds belong to the ceiling-expiry class (WLST5) and
  * are never classified here.
  */
 
@@ -109,11 +116,12 @@ export interface InstantFailRoundSignals {
 
 /**
  * Conservatively classify a round as an instant fail:
- * wall time below the threshold AND zero output bytes AND nonzero exit
- * code. Rounds that exit 0 (idle/no-op verifies) or produce any output
- * never match; timed-out rounds (ceiling-expiry class) never match; and
- * rounds whose worker had claimed a step before dying (recoveredOrphans)
- * never match — those are worker_lost, not instant-fail.
+ * wall time below the threshold AND zero TRIMMED output bytes AND
+ * (nonzero exit code OR signal-death). Rounds that exit 0 (idle/no-op
+ * verifies) or produce any real output never match; timed-out rounds
+ * (ceiling-expiry class) never match; and rounds whose worker had
+ * claimed a step before dying (recoveredOrphans) never match — those are
+ * worker_lost, not instant-fail.
  */
 export function isInstantFailRound(signals: InstantFailRoundSignals): boolean {
   const { wallMs } = signals;
@@ -124,14 +132,21 @@ export function isInstantFailRound(signals: InstantFailRoundSignals): boolean {
   if (signals.adapterThrew) return true; // launch failure: zero output, no clean exit
   const result = signals.result;
   if (!result) return false;
-  const outputBytes = Buffer.byteLength(result.output, "utf-8");
+  // Measure TRIMMED output: whitespace-only stdout cannot carry a STATUS
+  // marker, and harnesses (e.g. dsh) print a lone trailing newline even
+  // when aborting — so the dsh MISSING_CREDENTIAL shape (output "\n",
+  // exit 1, ~490ms) is a 0-byte round, matching summarizeWorkRoundOutput
+  // semantics (it logs such rounds as outcome=empty_output/outputBytes=0).
+  const outputBytes = Buffer.byteLength(result.output.trim(), "utf-8");
+  if (outputBytes > 0) return false; // real output — not an instant fail
   const exitCode = result.exitCode;
-  return (
-    outputBytes === 0 &&
-    exitCode !== null &&
-    exitCode !== undefined &&
-    exitCode !== 0
-  );
+  if (exitCode !== null && exitCode !== undefined && exitCode !== 0) return true;
+  // Signal-death shape: the process was killed by a signal (no exit
+  // code) sub-threshold with no output — a SIGKILL/OOM loop is an instant
+  // fail, not a legitimate round. Timed-out rounds (SIGTERM + timedOut)
+  // were already excluded above.
+  if ((exitCode === null || exitCode === undefined) && result.signal) return true;
+  return false;
 }
 
 // ── Backoff ───────────────────────────────────────────────────────────

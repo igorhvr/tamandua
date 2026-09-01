@@ -896,11 +896,17 @@ describe("executeDispatchRound instant-fail classification and escalation (RSPN)
    * dies per `mode`:
    *  - "instant": exit 1 immediately with zero output (the broken-binary
    *    shape from the campaign #8 evidence — 3ms, exit 1, no output).
+   *  - "newline": print ONLY a lone "\n" then exit 1 (the dsh
+   *    MISSING_CREDENTIAL shape — 1 untrimmed output byte that trims to
+   *    0, so it must classify like a zero-output round).
+   *  - "signal": SIGKILL itself immediately with zero output (signal-death
+   *    shape: exitCode null, signal SIGKILL, output "" — the SIGKILL/OOM
+   *    loop class that the exitCode-null guard used to exclude).
    *  - "output": exit 1 immediately after printing output (NOT an
    *    instant fail — output bytes > 0 → resets the streak).
    *  - "clean": exit 0 with a STATUS: done (legitimate round → resets).
    */
-  function setupInstantFailRound(mode: "instant" | "output" | "clean"): { runId: string; jobId: string; workdir: string } {
+  function setupInstantFailRound(mode: "instant" | "newline" | "signal" | "output" | "clean"): { runId: string; jobId: string; workdir: string } {
     const db = getDb();
     const runId = crypto.randomUUID();
     const now = new Date().toISOString();
@@ -928,6 +934,13 @@ if (process.env.FAKE_PI_MODE === "output") {
 if (process.env.FAKE_PI_MODE === "clean") {
   console.log("STATUS: done");
   process.exit(0);
+}
+if (process.env.FAKE_PI_MODE === "newline") {
+  process.stdout.write("\\n"); // lone trailing newline, then die — the dsh MISSING_CREDENTIAL shape
+  process.exit(1);
+}
+if (process.env.FAKE_PI_MODE === "signal") {
+  process.kill(process.pid, "SIGKILL"); // signal-death shape: no exit code, zero output
 }
 process.exit(1);
 `,
@@ -1068,6 +1081,99 @@ process.exit(1);
     assert.equal(detail.instantFailCount, 3, "workflow status must surface the instant-fail count");
     const listed = listRuns().find((r) => r.id === runId);
     assert.equal(listed?.instantFailCount, 3, "the runs list must surface the instant-fail count");
+  });
+
+  it("classifies the dsh MISSING_CREDENTIAL shape: '\n'-only exit-1 round ticks count, increments streak, and K backoff engages", async () => {
+    // The dsh MISSING_CREDENTIAL round prints only a lone trailing newline
+    // (1 untrimmed byte) then exits 1 sub-threshold. Whitespace-only stdout
+    // cannot carry a STATUS marker, so the classifier must treat it as a
+    // zero-output round: instant_fail_count ticks, the per-job streak
+    // increments, and at K consecutive rounds the relaunch backs off.
+    process.env.TAMANDUA_INSTANT_FAIL_BACKOFF_K = "2";
+    process.env.TAMANDUA_INSTANT_FAIL_ESCALATION_N = "100";
+    process.env.TAMANDUA_INSTANT_FAIL_BACKOFF_BASE_MS = "60000";
+    const { runId, jobId, workdir } = setupInstantFailRound("newline");
+    const job = { id: jobId, workflowId: "test-wf", runId, agentId: "test-wf_test-agent", harnessType: "pi", workingDirectoryForHarness: workdir, createdAt: "" };
+    const agent = { id: "test-agent", model: "fake", workspace: { baseDir: "." }, timeoutSeconds: 10 };
+
+    // Round 1: classified — count and streak tick.
+    await executeDispatchRound(job, agent);
+    let row = getDb().prepare("SELECT instant_fail_count, worker_lost_count, ceiling_expiry_count FROM runs WHERE id = ?").get(runId) as { instant_fail_count: number; worker_lost_count: number; ceiling_expiry_count: number };
+    assert.equal(row.instant_fail_count, 1, "the '\n'-only exit-1 round must tick instant_fail_count");
+    assert.equal(row.worker_lost_count, 0, "an unclaimed instant-fail must NOT tick worker_lost_count");
+    assert.equal(row.ceiling_expiry_count, 0, "an instant-fail must NOT tick ceiling_expiry_count");
+    assert.equal(_instantFailStreakFor(jobId)?.consecutive, 1, "the streak must increment for the '\n'-only round");
+
+    // Round 2: streak reaches K=2 — the next relaunch must be delayed.
+    await executeDispatchRound(job, agent);
+    let streak = _instantFailStreakFor(jobId);
+    assert.equal(streak?.consecutive, 2, "streak must reach K after two '\n'-only rounds");
+    assert.ok(
+      (streak?.nextAllowedDispatchAt ?? 0) > Date.now(),
+      "K backoff must engage for the '\n'-only shape (next relaunch delayed)",
+    );
+
+    // Round 3: the backoff gate must skip it — no new spawn, streak and
+    // counter unchanged.
+    await executeDispatchRound(job, agent);
+    streak = _instantFailStreakFor(jobId);
+    assert.equal(streak?.consecutive, 2, "the backoff-gated round must not increment the streak");
+    row = getDb().prepare("SELECT instant_fail_count, status FROM runs WHERE id = ?").get(runId) as { instant_fail_count: number; status: string };
+    assert.equal(row.instant_fail_count, 2, "the backoff-gated round must not spawn a harness");
+    assert.equal(row.status, "running", "backoff alone must not fail the run");
+  });
+
+  it("force-fails the run at N consecutive '\n'-only exit-1 rounds (dsh shape) with the precise reason and alert event", async () => {
+    process.env.TAMANDUA_INSTANT_FAIL_BACKOFF_K = "3";
+    process.env.TAMANDUA_INSTANT_FAIL_ESCALATION_N = "3";
+    process.env.TAMANDUA_INSTANT_FAIL_BACKOFF_BASE_MS = "0"; // no backoff delay so the loop can reach N quickly
+    const { runId, jobId, workdir } = setupInstantFailRound("newline");
+    const job = { id: jobId, workflowId: "test-wf", runId, agentId: "test-wf_test-agent", harnessType: "pi", workingDirectoryForHarness: workdir, createdAt: "" };
+    const agent = { id: "test-agent", model: "fake", workspace: { baseDir: "." }, timeoutSeconds: 10 };
+
+    for (let i = 0; i < 3; i++) {
+      await executeDispatchRound(job, agent);
+    }
+
+    const db = getDb();
+    const row = db.prepare("SELECT instant_fail_count, status FROM runs WHERE id = ?").get(runId) as { instant_fail_count: number; status: string };
+    assert.equal(row.status, "failed", "the run must be force-failed at the escalation threshold");
+    assert.equal(row.instant_fail_count, 3, "instant_fail_count must equal the consecutive round count");
+
+    const events = getRunEvents(runId);
+    const loopAlerts = events.filter((e) => e.event === "run.instant_fail_loop");
+    assert.equal(loopAlerts.length, 1, "escalation must emit exactly one run.instant_fail_loop alert");
+    assert.equal(loopAlerts[0].consecutiveInstantFails, 3, "the alert must carry the consecutive count");
+
+    const forceFailures = events.filter((e) => e.event === "run.force_failed");
+    assert.equal(forceFailures.length, 1, "escalation must force-fail through the sanctioned path");
+    assert.match(
+      forceFailures[0].reason ?? "",
+      /^worker instant-fail loop: 3 consecutive sub-\d+s exit-1 rounds; last command: /,
+      "the force-fail reason must be precise about the loop shape",
+    );
+  });
+
+  it("classifies SIGKILL signal-death rounds (exitCode null, signal SIGKILL, no output) as instant-fail", async () => {
+    // A worker killed by a signal (SIGKILL/OOM loop) carries no exit code
+    // — the old exitCode-null guard excluded this shape entirely. With
+    // zero output and sub-threshold wall it is an instant fail: count
+    // ticks, streak increments, WLST5 counters untouched, no step claimed.
+    const { runId, jobId, workdir } = setupInstantFailRound("signal");
+    const job = { id: jobId, workflowId: "test-wf", runId, agentId: "test-wf_test-agent", harnessType: "pi", workingDirectoryForHarness: workdir, createdAt: "" };
+    const agent = { id: "test-agent", model: "fake", workspace: { baseDir: "." }, timeoutSeconds: 10 };
+
+    await executeDispatchRound(job, agent);
+
+    const db = getDb();
+    const row = db.prepare("SELECT instant_fail_count, worker_lost_count, ceiling_expiry_count FROM runs WHERE id = ?").get(runId) as { instant_fail_count: number; worker_lost_count: number; ceiling_expiry_count: number };
+    assert.equal(row.instant_fail_count, 1, "a SIGKILL signal-death round must tick instant_fail_count");
+    assert.equal(row.worker_lost_count, 0, "an unclaimed signal-death round must NOT tick worker_lost_count");
+    assert.equal(row.ceiling_expiry_count, 0, "a signal-death round must NOT tick ceiling_expiry_count");
+
+    assert.equal(_instantFailStreakFor(jobId)?.consecutive, 1, "the streak must increment for the signal-death round");
+    const step = db.prepare("SELECT status FROM steps WHERE id = ?").get(`${runId}-step`) as { status: string };
+    assert.equal(step.status, "pending", "an instant-fail round claims no step — it must stay pending");
   });
 });
 
