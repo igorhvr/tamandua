@@ -263,8 +263,17 @@ function targetRefInfo(repositoryPath) {
   return { target_ref: head.stdout.trim(), detached: true };
 }
 
-function captureRefs(repositoryPath, ttRoot, phase) {
-  const info = targetRefInfo(repositoryPath);
+// S38: the target ref is PINNED at before-capture and threaded through the
+// refs_after / target_reflog captures. The worker routinely leaves its feature
+// branch checked out (W4.29: security-audit-2026-08-27), so re-resolving
+// targetRefInfo at the terminal phase keyed the after/reflog evidence off the
+// checked-out HEAD instead of the before-capture target — O2/O10 then threw
+// ORACLE_RUNTIME_ERROR on the ref-identity disagreement. A pinned info
+// ({ target_ref, detached }) keeps the after/reflog captures keyed to the
+// before-capture target identity; target_tip is still resolved LIVE against
+// the pinned ref at each phase (the after tip must reflect the run's landing).
+function captureRefs(repositoryPath, ttRoot, phase, pinnedTarget = null) {
+  const info = pinnedTarget ?? targetRefInfo(repositoryPath);
   return {
     schema_version: 1,
     phase,
@@ -277,6 +286,31 @@ function captureRefs(repositoryPath, ttRoot, phase) {
       '--format=%(objectname)%09%(objecttype)%09%(refname)%09%(upstream)',
     ]),
   };
+}
+
+// S38: the before-capture target identity (targetRefInfo result) that the
+// after/reflog captures must consume. It rides the baseline object returned by
+// beginOracleEvidenceSnapshot (persisted in controller state.json, so a
+// resumed interrupted run keeps it); a LEGACY baseline captured before S38
+// (or a hand-built test baseline) falls back to the immutable refs-before.json
+// evidence file, whose target_ref/detached_head already ARE the before-capture
+// identity. Fail closed when neither source yields a usable identity — never a
+// silent re-resolution against the terminal HEAD.
+function pinnedTargetRefForCapture(input, baseline) {
+  const pinned = baseline.pinned_target_ref;
+  if (pinned !== null && typeof pinned === 'object' && typeof pinned.target_ref === 'string'
+      && pinned.target_ref.length > 0 && typeof pinned.detached === 'boolean') {
+    return { target_ref: pinned.target_ref, detached: pinned.detached };
+  }
+  const refsBeforePath = baseline.references?.refs_before?.path;
+  if (typeof refsBeforePath !== 'string' || refsBeforePath.length === 0) {
+    throw new Error('snapshot baseline carries no pinned target ref and no refs-before reference; cannot capture terminal ref evidence');
+  }
+  const refsBefore = JSON.parse(fs.readFileSync(path.join(input.campaignDir, refsBeforePath), 'utf8'));
+  if (typeof refsBefore.target_ref !== 'string' || refsBefore.target_ref.length === 0) {
+    throw new Error('snapshot refs-before evidence carries no target ref; cannot capture terminal ref evidence');
+  }
+  return { target_ref: refsBefore.target_ref, detached: refsBefore.detached_head === true };
 }
 
 function fileSha256(file) {
@@ -1033,7 +1067,14 @@ export function beginOracleEvidenceSnapshot(rawInput) {
       launch_intent_at: input.attempt.launch_intent_at,
     });
     const refsBeforePath = path.join(directory, 'refs-before.json');
-    writeJsonExclusive(refsBeforePath, captureRefs(input.repositoryPath, input.ttRoot, 'before'));
+    // S38: pin the target ref at before-capture (targetRefInfo resolves the
+    // fixture's declared target identity — a named checkout's refs/... name or
+    // a detached HEAD's commit OID). The pinned identity is stored on the
+    // baseline so the terminal refs_after/target_reflog captures key off it
+    // instead of re-resolving against whatever branch the worker left checked
+    // out (W4.29's O2/O10 ORACLE_RUNTIME_ERROR divergence).
+    const pinnedTargetRef = targetRefInfo(input.repositoryPath);
+    writeJsonExclusive(refsBeforePath, captureRefs(input.repositoryPath, input.ttRoot, 'before', pinnedTargetRef));
     const checksumBaselinePath = path.join(directory, 'checksum-baseline.json');
     writeJsonExclusive(checksumBaselinePath, captureChecksums(input.repositoryPath, input.caseRecord, 'baseline'));
     const systemBeforePath = path.join(directory, 'system-tokens-before.json');
@@ -1056,6 +1097,10 @@ export function beginOracleEvidenceSnapshot(rawInput) {
       status: complete.status,
       ledger_path: portableRelative(input.campaignDir, fs.realpathSync(ledgerPath)),
       references,
+      // S38: the pinned before-capture target identity ({ target_ref,
+      // detached }) rides the baseline so the terminal captures stay keyed to
+      // it across the state.json roundtrip (and any interrupted-run resume).
+      pinned_target_ref: pinnedTargetRef,
     };
   } catch (error) {
     markInfrastructure(ledgerPath, ledger, error.message);
@@ -1115,37 +1160,77 @@ export function completeOracleEvidenceSnapshot(rawInput, baseline) {
     immutable(databaseSnapshot);
 
     const runIds = new Set([input.attempt.run_id, ...(input.discoveredRuns ?? []).map((run) => run.run_id)].filter(Boolean));
-    // E3.C US-011: a multi-run probe attempt's per-run run ids live in the
-    // probe-evidence artifact (W3.20's two runs, W3.22's three) — include them
-    // so the event slice covers EVERY probed run (O16's cancel/restart
-    // judgments read per-run events; without this only the primary run's
-    // events land and the other runs' terminal events are invisible).
+    // The per-attempt probe-evidence artifact (US-003) is the sibling-run
+    // registry for multi-run probe shapes (W3.20's two runs, W3.22's three,
+    // W4.10-restart-recovery's two): absent/unreadable here, the graph falls
+    // back to attempt + discovered runs.
+    let probeEvidence = null;
     try {
-      const probeEvidence = JSON.parse(fs.readFileSync(
+      probeEvidence = JSON.parse(fs.readFileSync(
         path.join(input.campaignDir, 'evidence', input.caseRecord.id, input.attempt.id, 'probe-evidence.json'),
         'utf8',
       ));
-      if (probeEvidence && typeof probeEvidence.run_id === 'string') runIds.add(probeEvidence.run_id);
-      for (const run of probeEvidence?.runs ?? []) {
-        if (run && typeof run.run_id === 'string') runIds.add(run.run_id);
-      }
     } catch {
       // absent/unreadable probe evidence: fall back to attempt + discovered runs
     }
+    if (probeEvidence && typeof probeEvidence.run_id === 'string') runIds.add(probeEvidence.run_id);
+    for (const run of probeEvidence?.runs ?? []) {
+      if (run && typeof run.run_id === 'string') runIds.add(run.run_id);
+    }
     const events = readEvents(input.stateDir, runIds);
     emitJson('run_events', 'run-events.json', { schema_version: 1, captured_at: capturedAt, run_ids: [...runIds].sort(), rows: events }, 'controller-event-slice');
-    emitJson('workflow_status', 'workflow-status.json', {
-      schema_version: 1, captured_at: capturedAt,
-      root: {
-        run_id: input.attempt.run_id ?? null,
-        terminal_status: input.attempt.terminal_status ?? null,
-        tokens_observed: input.attempt.tokens_observed ?? 0,
-        steps_snapshot: input.attempt.steps_snapshot ?? null,
-      },
-      discovered_runs: (input.discoveredRuns ?? []).map((run) => ({
+
+    // S41 (US-004): the workflow-status graph must name EVERY probed run with
+    // its per-run terminal snapshot. In multi-run probe shapes (concurrent
+    // W4.10-restart-recovery, sequential W3.20) only the per-run PROXIES are
+    // harvested, so the durable attempt's steps_snapshot stays null and its
+    // tokens_observed stays 0 — the campaign's workflow-status.json carried
+    // `steps_snapshot: null, tokens_observed: 0, discovered_runs: []` while
+    // the product provably retained everything, voiding O1/O2/O11 with
+    // mechanical artifacts. Register the probe-evidence sibling runs (which
+    // now carry steps_snapshot/tokens_observed/terminal_status per run) into
+    // the root/discovered graph, and fall the ROOT row back to the primary
+    // probe run's snapshot when the attempt's own is missing (concurrent
+    // shapes). Sibling rows already present via input.discoveredRuns are
+    // merged (their missing snapshot fields are filled from the artifact).
+    const primaryProbeRun = (probeEvidence?.runs ?? []).find((run) => run && run.run_ordinal === 1);
+    const rootRecord = {
+      run_id: input.attempt.run_id ?? primaryProbeRun?.run_id ?? null,
+      terminal_status: input.attempt.terminal_status ?? primaryProbeRun?.terminal_status ?? null,
+      tokens_observed: (input.attempt.tokens_observed ?? 0) || (primaryProbeRun?.tokens_observed ?? 0),
+      steps_snapshot: input.attempt.steps_snapshot ?? primaryProbeRun?.steps_snapshot ?? null,
+    };
+    const graphRuns = new Map();
+    for (const run of input.discoveredRuns ?? []) {
+      graphRuns.set(run.run_id, {
         run_id: run.run_id, parent_run_id: run.parent_run_id, terminal_status: run.terminal_status,
         tokens_observed: run.tokens_observed ?? 0, steps_snapshot: run.steps_snapshot ?? null,
-      })),
+      });
+    }
+    for (const run of probeEvidence?.runs ?? []) {
+      if (!run || typeof run.run_id !== 'string' || run.run_id === rootRecord.run_id) continue;
+      const sibling = {
+        run_id: run.run_id,
+        parent_run_id: input.attempt.run_id ?? null,
+        terminal_status: run.terminal_status ?? null,
+        tokens_observed: run.tokens_observed ?? 0,
+        steps_snapshot: run.steps_snapshot ?? null,
+      };
+      const existing = graphRuns.get(run.run_id);
+      if (existing === undefined) {
+        graphRuns.set(run.run_id, sibling);
+      } else {
+        // Merge: the discovered-run record may predate the terminal snapshot;
+        // fill its missing fields from the probe artifact (never overwrite).
+        existing.terminal_status ??= sibling.terminal_status;
+        existing.tokens_observed = existing.tokens_observed || sibling.tokens_observed;
+        existing.steps_snapshot ??= sibling.steps_snapshot;
+      }
+    }
+    emitJson('workflow_status', 'workflow-status.json', {
+      schema_version: 1, captured_at: capturedAt,
+      root: rootRecord,
+      discovered_runs: [...graphRuns.values()],
     }, 'controller-workflow-status');
 
     const commonDir = path.resolve(
@@ -1159,13 +1244,24 @@ export function completeOracleEvidenceSnapshot(rawInput, baseline) {
       input.campaignDir, gitSnapshotPath, capturedAt, 'git-common-dir-tar',
     );
     immutable(gitSnapshotPath);
-    emitJson('refs_after', 'refs-after.json', captureRefs(input.repositoryPath, input.ttRoot, 'after'), 'git-plumbing-after');
-    const refInfo = targetRefInfo(input.repositoryPath);
-    const ref = refInfo.target_ref;
+    // S38: consume the target ref PINNED at before-capture (threaded through
+    // the baseline, with a refs-before.json fallback for legacy baselines) for
+    // BOTH the refs_after capture and the target_reflog capture — never
+    // re-resolve against the checked-out HEAD, which the worker leaves on its
+    // feature branch (W4.29: refs_after diverged to
+    // refs/heads/security-audit-2026-08-27 while refs_before recorded
+    // refs/heads/main, voiding O2/O10 with ORACLE_RUNTIME_ERROR). target_tip
+    // is still resolved LIVE against the pinned ref so the terminal tip
+    // reflects the run's landing; only the ref IDENTITY is pinned.
+    const pinnedTargetRef = pinnedTargetRefForCapture(input, baseline);
+    emitJson('refs_after', 'refs-after.json', captureRefs(input.repositoryPath, input.ttRoot, 'after', pinnedTargetRef), 'git-plumbing-after');
+    const ref = pinnedTargetRef.target_ref;
     // S31 (US-009): a detached-HEAD fixture's reflog lives at logs/HEAD (no
     // symbolic ref to name); the captured target identity stays the resolved
-    // detached commit so refs_before/refs_after/target_reflog agree.
-    const reflogRef = refInfo.detached ? 'HEAD' : ref;
+    // detached commit so refs_before/refs_after/target_reflog agree. The
+    // detached flag is part of the pinned identity — the terminal capture must
+    // not re-derive it from the current HEAD (S38).
+    const reflogRef = pinnedTargetRef.detached ? 'HEAD' : ref;
     const gitDir = path.resolve(input.repositoryPath, git(input.repositoryPath, ['rev-parse', '--git-dir']).trim());
     const rawReflogPath = path.join(gitDir, 'logs', ...reflogRef.split('/'));
     let raw = '';
@@ -1173,7 +1269,7 @@ export function completeOracleEvidenceSnapshot(rawInput, baseline) {
     const entries = raw.split(/\r?\n/).filter(Boolean).map(parseTargetReflogLine);
     emitJson('target_reflog', 'target-reflog.json', {
       schema_version: 1, captured_at: capturedAt, repository: repositoryIdentity(input.repositoryPath, input.ttRoot),
-      target_ref: ref, ...(refInfo.detached ? { detached_head: true } : {}), entries,
+      target_ref: ref, ...(pinnedTargetRef.detached ? { detached_head: true } : {}), entries,
     }, 'git-raw-target-reflog');
 
     const baselinePath = path.join(input.campaignDir, baseline.references.checksum_baseline.path);

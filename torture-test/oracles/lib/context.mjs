@@ -142,7 +142,19 @@ function validateO1WaveRun(run) {
 }
 
 function validateO1Wave(wave) {
-  return hasExactKeys(wave, ['schema_version', 'wave', 'duration_floors', 'runs'])
+  // S43b (US-007): `wave_cases` is OPTIONAL per wave — the campaign-wide wave
+  // membership (every manifest case of the wave in manifest order) that the
+  // controller emits so O1's wave-family reporter selection is deterministic
+  // and identical for every evaluating case. STORED schema-1 evidence from
+  // campaigns whose wave projection predates the field still validates
+  // without it; when present it must be a NON-EMPTY list of nonempty strings
+  // (a wave always contains at least the evaluating case, so an empty
+  // membership is malformed and fails closed).
+  const withCases = hasExactKeys(wave, ['schema_version', 'wave', 'duration_floors', 'runs', 'wave_cases'])
+    && Array.isArray(wave.wave_cases)
+    && wave.wave_cases.length > 0
+    && wave.wave_cases.every((id) => typeof id === 'string' && id.length > 0);
+  return (withCases || hasExactKeys(wave, ['schema_version', 'wave', 'duration_floors', 'runs']))
     && wave.schema_version === 1
     && Number.isSafeInteger(wave.wave) && wave.wave >= 0
     && Array.isArray(wave.duration_floors)

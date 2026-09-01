@@ -31,7 +31,11 @@ const ttRoot = path.join(repoRoot, "torture-test");
 const schemaPath = path.join(ttRoot, "cases", "case.schema.json");
 const controller = path.join(ttRoot, "bin", "tt-controller");
 
-const PROBE_OPS = ["pause", "pause_drain", "resume", "cancel", "fail_force", "restart_daemon", "sigstop_sigcont"];
+const PROBE_OPS = ["pause", "pause_drain", "resume", "cancel", "fail_force", "restart_daemon", "sigstop_sigcont",
+  // S44a (US-009): the operator-seam probe verbs — single-run daemon-lifecycle
+  // / install / credential actions the W4.10/W4.48a/W4.33a/W4.33b/W4.47
+  // premises depend on.
+  "restart_contained_daemon", "update_contained_install", "invalidate_credentials", "restore_credentials"];
 const WHEN_PATTERN = "^(now|step:[A-Za-z0-9._-]+:[A-Za-z0-9._-]+|event:[A-Za-z0-9._-]+)$";
 
 const env = {
@@ -114,7 +118,7 @@ describe("E3.C US-001 — probe_sequence + typed chaos schema contract", () => {
     assert.ok(action, "schema must define $defs.probeAction");
     assert.equal(action.additionalProperties, false, "probeAction must forbid unknown properties");
     assert.deepEqual(action.required, ["op", "when"], "probeAction must require op + when");
-    assert.deepEqual(action.properties.op.enum, PROBE_OPS, "op enum must be exactly the seven E3.C probe verbs");
+    assert.deepEqual(action.properties.op.enum, PROBE_OPS, "op enum must be exactly the eleven E3.C + S44a probe verbs");
     // S18b: `when` is an anyOf — the string phase-marker form AND the awaited
     // object-trigger form ({"status":...,"timeout_s":N} | {"event":...,"timeout_s":N}).
     const when = action.properties.when;
@@ -260,6 +264,69 @@ describe("E3.C US-001 — probe_sequence + typed chaos schema contract", () => {
     const res = runValidate(path.join(ttRoot, "cases", "tier1.jsonl"));
     assert.equal(res.status, 0, `tier1 manifest must validate:\n${res.stdout}${res.stderr}`);
     assert.match(res.stdout, /Validated 28 case\(s\)/);
+  });
+
+  it("accepts the S44a operator-seam probe ops + during_hold marker (single-run corridor shapes)", () => {
+    // The operator-seam verbs validate through the production --validate-only
+    // path: restart_contained_daemon / update_contained_install fire DURING a
+    // pause hold (during_hold: true after a hold-capable action — the
+    // W4.33a/W4.33b shapes) and invalidate/restore_credentials form the
+    // W4.47 credential corridor (restore requires a prior invalidate — the
+    // semantic guard, asserted here as acceptance of the VALID shape).
+    const restartDuringHold = buildCaseManifest({
+      id: "T-S44A-RESTART-DURING-HOLD",
+      probe_sequence: [{
+        run: 1,
+        actions: [
+          { op: "pause_drain", when: "step:developer:running", hold_seconds: 30 },
+          { op: "restart_contained_daemon", when: "now", during_hold: true },
+          { op: "resume", when: "now" },
+        ],
+      }],
+    });
+    try {
+      const res = runValidate(restartDuringHold);
+      assert.equal(res.status, 0, `restart_contained_daemon during_hold shape must validate:\n${res.stdout}${res.stderr}`);
+    } finally {
+      fs.rmSync(path.dirname(restartDuringHold), { recursive: true, force: true });
+    }
+    const updateDuringHold = buildCaseManifest({
+      id: "T-S44A-UPDATE-DURING-HOLD",
+      probe_sequence: [{
+        run: 1,
+        actions: [
+          { op: "pause", when: "step:developer:running", hold_seconds: 30 },
+          { op: "update_contained_install", when: "now", during_hold: true },
+          { op: "resume", when: "now" },
+        ],
+      }],
+    });
+    try {
+      const res = runValidate(updateDuringHold);
+      assert.equal(res.status, 0, `update_contained_install during_hold shape must validate:\n${res.stdout}${res.stderr}`);
+    } finally {
+      fs.rmSync(path.dirname(updateDuringHold), { recursive: true, force: true });
+    }
+    const credentials = buildCaseManifest({
+      id: "T-S44A-CREDENTIALS",
+      probe_sequence: [{
+        run: 1,
+        actions: [
+          { op: "invalidate_credentials", when: "now" },
+          { op: "restore_credentials", when: "now" },
+        ],
+      }],
+    });
+    try {
+      const res = runValidate(credentials);
+      assert.equal(res.status, 0, `invalidate/restore_credentials shape must validate:\n${res.stdout}${res.stderr}`);
+    } finally {
+      fs.rmSync(path.dirname(credentials), { recursive: true, force: true });
+    }
+    // during_hold must be schema-typed boolean (non-boolean is REJECTED).
+    expectRejected("during_hold non-boolean", {
+      probe_sequence: [{ run: 1, actions: [{ op: "pause", when: "now", hold_seconds: 5 }, { op: "resume", when: "now", during_hold: "yes" }] }],
+    }, /probe_sequence/);
   });
 
   it("accepts the awaited object when triggers (status and event) and rejects malformed object forms (S18b)", () => {

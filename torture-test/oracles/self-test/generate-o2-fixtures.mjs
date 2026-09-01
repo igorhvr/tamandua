@@ -36,6 +36,14 @@ const FIXTURES = [
   { name: 'o2-off-mode-unbound', expected: 'FAIL', mode: 'off', unboundLaunch: true, finding: 'O2_OFF_MODE_LAUNCH_UNBOUND' },
   { name: 'o2-off-mode-no-override', expected: 'FAIL', mode: 'off', omitOverride: true, finding: 'O2_OFF_MODE_PROVENANCE_INVALID' },
   { name: 'o2-unattributed-transition', expected: 'FAIL', mutation: 'unattributed-transition', finding: 'O2_REF_TRANSITION_UNATTRIBUTED' },
+  // S41 (US-004): the two-landing shape — TWO attributed merge runs, TWO
+  // chained target transitions (base -> mid -> final), each landing owned by
+  // an attributed run. O2 must accept the legal chain (PASS) while a broken
+  // chain (the second landing does not start where the first ended) or an
+  // unattributed second transition still fails.
+  { name: 'o2-two-landing', expected: 'PASS', mutation: 'two-landing' },
+  { name: 'o2-two-landing-broken-chain', expected: 'FAIL', mutation: 'two-landing', brokenChain: true, finding: 'O2_REF_EVENT_MISMATCH' },
+  { name: 'o2-two-landing-unattributed', expected: 'FAIL', mutation: 'two-landing', omitSecondRun: true, finding: 'O2_REF_TRANSITION_UNATTRIBUTED' },
   // S20 (US-001): the capture parser archives message-less landing reflog
   // lines raw-only; the oracle must recover the transition from the raw line
   // (PASS) while a genuinely unparseable line still trips REF_TRANSITION_COUNT.
@@ -158,6 +166,35 @@ for (const fixture of FIXTURES) {
   const feature = run('git', ['rev-parse', 'HEAD'], repo);
   const featureTree = run('git', ['rev-parse', 'HEAD^{tree}'], repo);
 
+  // S41 (US-004): the two-landing shape lands TWO feature states on main in
+  // two chained merge commits. The feature branch gains a second commit
+  // (featureTree2); landing 1 merges the first state (base -> midCommit),
+  // landing 2 merges the second (midCommit -> finalCommit). Both update-refs
+  // write target-reflog transitions so O2 sees a legal two-transition chain.
+  const twoLanding = fixture.mutation === 'two-landing';
+  let feature2 = null;
+  let featureTree2 = null;
+  let midCommit = null;
+  let finalCommit = null;
+  if (twoLanding) {
+    fs.writeFileSync(path.join(repo, 'feature.txt'), 'second change\n');
+    run('git', ['add', '.'], repo);
+    run('git', ['commit', '-m', 'feature2'], repo);
+    feature2 = run('git', ['rev-parse', 'HEAD'], repo);
+    featureTree2 = run('git', ['rev-parse', 'HEAD^{tree}'], repo);
+    // Each landing owns its own source branch: landing 1 merges the FIRST
+    // feature state (branch feature, tree featureTree), landing 2 the SECOND
+    // (branch feature2, tree featureTree2). Reset feature back to its first
+    // commit so O2's source-tree check sees the attested per-landing tree.
+    run('git', ['branch', 'feature2'], repo);
+    run('git', ['checkout', '-q', 'feature2'], repo);
+    run('git', ['branch', '-f', 'feature', feature], repo);
+    midCommit = run('git', ['commit-tree', featureTree, '-p', base], repo, { input: 'land feature\n' });
+    finalCommit = run('git', ['commit-tree', featureTree2, '-p', midCommit], repo, { input: 'land feature2\n' });
+    run('git', ['update-ref', 'refs/heads/main', midCommit, base], repo);
+    run('git', ['update-ref', 'refs/heads/main', finalCommit, midCommit], repo);
+  }
+
   run('git', ['checkout', '-b', 'rogue', base], repo);
   fs.writeFileSync(path.join(repo, 'feature.txt'), 'different change\n');
   run('git', ['add', '.'], repo);
@@ -168,12 +205,18 @@ for (const fixture of FIXTURES) {
   const emptyCommit = run('git', ['commit-tree', baseTree, '-p', base], repo, { input: 'empty landing\n' });
   run('git', ['update-ref', 'refs/heads/empty', emptyCommit], repo);
 
-  const mergedParent = fixture.mutation === 'patch' ? rogue : base;
-  const mergedCommit = run('git', ['commit-tree', featureTree, '-p', mergedParent], repo, { input: 'land feature\n' });
   const phantom = fixture.mutation === 'phantom';
   const empty = fixture.mutation === 'empty';
-  const targetCommit = phantom ? base : empty ? emptyCommit : mergedCommit;
-  run('git', ['update-ref', 'refs/heads/main', targetCommit, base], repo);
+  let mergedCommit = null;
+  let targetCommit;
+  if (twoLanding) {
+    targetCommit = finalCommit;
+  } else {
+    const mergedParent = fixture.mutation === 'patch' ? rogue : base;
+    mergedCommit = run('git', ['commit-tree', featureTree, '-p', mergedParent], repo, { input: 'land feature\n' });
+    targetCommit = phantom ? base : empty ? emptyCommit : mergedCommit;
+    run('git', ['update-ref', 'refs/heads/main', targetCommit, base], repo);
+  }
 
   const wrongTree = baseTree;
   const eventTree = fixture.mutation === 'commit-tree' ? wrongTree : (empty ? baseTree : (phantom ? baseTree : featureTree));
@@ -182,16 +225,38 @@ for (const fixture of FIXTURES) {
     ? 'refs/heads/main'
     : empty ? 'refs/heads/empty' : 'refs/heads/feature';
   const testedTree = fixture.mutation === 'tested-tree' ? baseTree : eventTree;
-  const primary = event({
-    line: 1,
-    ts: '2026-08-01T12:02:00.000Z',
-    branch,
-    expectedTip: base,
-    mergedTree: eventTree,
-    mergedCommit: eventCommit,
-    noop: phantom,
-  });
-  const events = [primary];
+  const events = [];
+  if (twoLanding) {
+    events.push(event({
+      line: 1,
+      ts: '2026-08-01T12:02:00.000Z',
+      branch: 'refs/heads/feature',
+      expectedTip: base,
+      mergedTree: featureTree,
+      mergedCommit: midCommit,
+      noop: false,
+    }));
+    events.push(event({
+      line: 2,
+      runId: CHILD_RUN_ID,
+      ts: fixture.brokenChain ? '2026-08-01T12:02:00.500Z' : '2026-08-01T12:02:30.000Z',
+      branch: 'refs/heads/feature2',
+      expectedTip: fixture.brokenChain ? base : midCommit,
+      mergedTree: featureTree2,
+      mergedCommit: finalCommit,
+      noop: false,
+    }));
+  } else {
+    events.push(event({
+      line: 1,
+      ts: '2026-08-01T12:02:00.000Z',
+      branch,
+      expectedTip: base,
+      mergedTree: eventTree,
+      mergedCommit: eventCommit,
+      noop: phantom,
+    }));
+  }
   const ORIGIN = 'synthetic-origin';
   const CMD_HASH = 'd'.repeat(64);
   if (fixture.mode === 'default-concession') {
@@ -283,9 +348,14 @@ for (const fixture of FIXTURES) {
     'finalize-row', RUN_ID.slice(4), 'finalize_merge',
     fixture.mode === 'default-concession' && !fixture.omitReroute ? 1 : 0,
   );
-  if (fixture.crossRun || fixture.crossRunNoop) {
+  if (fixture.crossRun || fixture.crossRunNoop || twoLanding) {
     database.prepare('INSERT INTO runs VALUES (?, ?, ?, ?)').run(
-      CHILD_RUN_ID.slice(4), 'feature-dev-merge-worktree', 'completed', JSON.stringify({ tested_tree: testedTree }),
+      CHILD_RUN_ID.slice(4), 'feature-dev-merge-worktree', 'completed', JSON.stringify({ tested_tree: twoLanding ? featureTree2 : testedTree }),
+    );
+  }
+  if (twoLanding) {
+    database.prepare('INSERT INTO steps VALUES (?, ?, ?, ?)').run(
+      'finalize-row-2', CHILD_RUN_ID.slice(4), 'finalize_merge', 0,
     );
   }
   const ordinary = fixture.mode === undefined;
@@ -295,6 +365,13 @@ for (const fixture of FIXTURES) {
       VALUES (?, ?, ?, 'npm test', ?, 1000, ?, 'test', ?)`)
       .run(ORIGIN, featureTree, fixture.suiteKeyMutation === 'cmd' ? 'e'.repeat(64) : CMD_HASH,
         fixture.exactRedRow ? 1 : 0, RUN_ID.slice(4), '2026-08-01T12:01:30.000Z');
+  }
+  if (twoLanding) {
+    // Landing 2's ordinary exact-gate row (tree featureTree2, same origin/key).
+    database.prepare(`INSERT INTO suite_results
+      (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, run_id, step_id, created_at)
+      VALUES (?, ?, ?, 'npm test', ?, 1000, ?, 'test', ?)`)
+      .run(ORIGIN, featureTree2, CMD_HASH, 0, CHILD_RUN_ID.slice(4), '2026-08-01T12:02:20.000Z');
   }
   if (fixture.foreignSiblingRow) {
     database.prepare(`INSERT INTO suite_results
@@ -328,7 +405,18 @@ for (const fixture of FIXTURES) {
     timestamp: 1785585720, timezone: '+0000', action: 'fixture landing',
     raw: `${base} ${targetCommit} O2 Fixture <o2@example.invalid> 1785585720 +0000\tfixture landing`,
   }];
-  const reflogEntries = phantom ? [] : fixture.mutation === 'reflog-window' ? [
+  const reflogEntries = twoLanding ? [
+    {
+      old_oid: base, new_oid: midCommit, actor: 'O2 Fixture <o2@example.invalid>',
+      timestamp: 1785585720, timezone: '+0000', action: 'fixture landing 1',
+      raw: `${base} ${midCommit} O2 Fixture <o2@example.invalid> 1785585720 +0000\tfixture landing 1`,
+    },
+    {
+      old_oid: midCommit, new_oid: finalCommit, actor: 'O2 Fixture <o2@example.invalid>',
+      timestamp: 1785585750, timezone: '+0000', action: 'fixture landing 2',
+      raw: `${midCommit} ${finalCommit} O2 Fixture <o2@example.invalid> 1785585750 +0000\tfixture landing 2`,
+    },
+  ] : phantom ? [] : fixture.mutation === 'reflog-window' ? [
     {
       ...ordinaryReflog[0], timestamp: 1785585540,
       raw: `${base} ${targetCommit} O2 Fixture <o2@example.invalid> 1785585540 +0000\tmatching outside capture`,
@@ -355,7 +443,7 @@ for (const fixture of FIXTURES) {
   references.database_snapshot = reference(campaign, databasePath, 'sqlite-self-test');
   references.run_events = writeSnapshot(campaign, snapshots, 'run-events.json', {
     schema_version: 1, captured_at: CAPTURED_AT,
-    run_ids: fixture.crossRun || fixture.crossRunNoop ? [RUN_ID, CHILD_RUN_ID] : [RUN_ID], rows: events,
+    run_ids: fixture.crossRun || fixture.crossRunNoop || twoLanding ? [RUN_ID, CHILD_RUN_ID] : [RUN_ID], rows: events,
   });
   references.launch_intent = writeSnapshot(campaign, snapshots, 'launch-intent.json', {
     schema_version: 1, captured_at: STARTED_AT,
@@ -385,7 +473,7 @@ for (const fixture of FIXTURES) {
     started_at: STARTED_AT, terminal_at: TERMINAL_AT, terminal_status: fixture.runStatus ?? 'completed', tokens_observed: 1,
     command_result: { exit_code: 0, signal: null }, steps_snapshot: null, straggler_capture: null,
   };
-  const discoveredRuns = fixture.crossRun || fixture.crossRunNoop ? [{
+  const discoveredRuns = fixture.crossRun || fixture.crossRunNoop || (twoLanding && !fixture.omitSecondRun) ? [{
     ...attempt,
     id: 'attempt-o2-child',
     run_id: CHILD_RUN_ID,

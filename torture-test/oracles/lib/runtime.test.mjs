@@ -183,6 +183,37 @@ test('T2.2 US-001: o1_wave run rows accept optional execution_mode and reject in
   }
 });
 
+test('S43b US-007: o1_wave accepts the optional campaign-wide wave_cases membership and rejects malformed values', () => {
+  const fixture = makeFixture();
+  try {
+    const writeWave = (wave) => {
+      const context = structuredClone(fixture.context);
+      context.o1_wave = wave;
+      fs.chmodSync(fixture.contextPath, 0o600);
+      fs.writeFileSync(fixture.contextPath, `${JSON.stringify(context)}\n`);
+      fs.chmodSync(fixture.contextPath, 0o400);
+    };
+    // Stored-evidence shape (no wave_cases) still validates.
+    writeWave({ schema_version: 1, wave: 0, duration_floors: [], runs: [] });
+    assert.equal(loadOracleInvocation({ argv: invocationArgs(fixture.contextPath), env: fixture.env }).oracleId, 'O1');
+    // The campaign-wide wave membership (all manifest cases of the wave in
+    // manifest order) validates as an optional wave field.
+    writeWave({ schema_version: 1, wave: 0, duration_floors: [], runs: [], wave_cases: ['CASE-1'] });
+    assert.equal(loadOracleInvocation({ argv: invocationArgs(fixture.contextPath), env: fixture.env }).oracleId, 'O1');
+    // A malformed wave_cases value fails closed (never a silent pass).
+    writeWave({ schema_version: 1, wave: 0, duration_floors: [], runs: [], wave_cases: ['CASE-1', 42] });
+    assert.throws(() => loadOracleInvocation({ argv: invocationArgs(fixture.contextPath), env: fixture.env }), /malformed context/i);
+    writeWave({ schema_version: 1, wave: 0, duration_floors: [], runs: [], wave_cases: [''] });
+    assert.throws(() => loadOracleInvocation({ argv: invocationArgs(fixture.contextPath), env: fixture.env }), /malformed context/i);
+    // An empty membership is malformed too — a wave always contains at least
+    // the evaluating case, so an empty list fails closed.
+    writeWave({ schema_version: 1, wave: 0, duration_floors: [], runs: [], wave_cases: [] });
+    assert.throws(() => loadOracleInvocation({ argv: invocationArgs(fixture.contextPath), env: fixture.env }), /malformed context/i);
+  } finally {
+    cleanup(fixture.campaignRoot);
+  }
+});
+
 test('rejects context and evidence symlink or path escapes', () => {
   const fixture = makeFixture();
   try {

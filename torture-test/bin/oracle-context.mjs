@@ -214,6 +214,28 @@ function createO1Wave(caseRecord, caseState, state) {
     const root = waveCases.find((item) => item.id === discovered.root_case_id);
     if (root !== undefined && typeof discovered.run_id === 'string') runs.push(projectWaveRun(root, discovered));
   }
+  // S41 (US-004): probe-sequence siblings (multi-run probe shapes). The
+  // controller normally registers them in state.discovered_runs (covered
+  // above); this merge keeps the wave projection coherent with the defensive
+  // context registration from the attempt's probe_evidence.runs[] (deduped
+  // against the state-registered rows).
+  const latestAttempt = caseState?.attempts?.at(-1);
+  const probeEvidence = latestAttempt?.probe_evidence;
+  if (isObject(probeEvidence) && Array.isArray(probeEvidence.runs)) {
+    const rootCase = waveCases.find((item) => item.id === caseRecord.id);
+    if (rootCase !== undefined) {
+      for (const run of probeEvidence.runs) {
+        if (!isObject(run) || typeof run.run_id !== 'string'
+            || runs.some((existing) => existing.run_id === run.run_id)) continue;
+        runs.push(projectWaveRun(rootCase, {
+          ...run,
+          started_at: typeof run.started_at === 'string' ? run.started_at : (rootCase.attempts?.[0]?.started_at ?? null),
+          terminal_at: typeof run.terminal_at === 'string' ? run.terminal_at : null,
+          terminal_status: typeof run.terminal_status === 'string' ? run.terminal_status : null,
+        }));
+      }
+    }
+  }
   // The run under judgment (the case's own latest attempt run) must never
   // contribute to its own calibration sample.
   const judgedRunId = (caseState?.attempts ?? [])
@@ -252,6 +274,16 @@ function createO1Wave(caseRecord, caseState, state) {
   return {
     schema_version: 1,
     wave: caseRecord.wave,
+    // S43b (US-007): campaign-wide wave membership — every manifest case of
+    // this wave in MANIFEST order (state.cases is index-aligned with the
+    // manifest), regardless of whether the case has run yet. O1's wave-family
+    // reporter selection keys off this list, so EVERY evaluating case in the
+    // wave resolves the SAME reporter (the true final wave case in manifest
+    // order) instead of re-selecting from its own partial snapshot — the
+    // pre-S43b per-snapshot selection stamped the do-now family finding on
+    // two reporter cases (W4.dsh-do-now + W4.dsh-fdmw, the latter not even
+    // do-now) in campaign-20260826T225744158Z.
+    wave_cases: waveCases.map((item) => item.id),
     duration_floors: durationFloors,
     runs: runs.sort((left, right) => `${left.case_id}\0${left.run_id}`.localeCompare(`${right.case_id}\0${right.run_id}`)),
   };
@@ -270,6 +302,51 @@ function projectEvidence(candidate) {
 export function createOracleContext({ caseRecord, caseState, state, oracleId }) {
   const attempts = caseState.attempts.map(projectAttempt);
   const latestAttempt = caseState.attempts.at(-1);
+  const discoveredRuns = (state.discovered_runs ?? [])
+    .filter((run) => run.root_case_id === caseRecord.id)
+    .map((run) => ({
+      ...projectAttempt(run),
+      parent_run_id: run.parent_run_id,
+    }));
+  // S41 (US-004): probe-sequence sibling runs. In multi-run probe shapes only
+  // the per-run proxies are harvested, so the sibling runs exist ONLY in the
+  // attempt's probe_evidence.runs[] (and in state.discovered_runs when the
+  // controller registered them — deduped here). Without this merge the
+  // siblings would be absent from the oracle context graph, so O1 would fire
+  // O1_WORKFLOW_RUN_UNKNOWN on the workflow-status rows naming them and O11
+  // would fire O11_DELTA_RUN_UNKNOWN on their token events (the campaign
+  // W4.10-restart-recovery void). The projections reuse projectAttempt so the
+  // validated attempt shape (exact keys, UTC timestamps, steps projection) is
+  // preserved.
+  const siblingRunIds = new Set(discoveredRuns.map((run) => run.run_id));
+  const rootRunId = attempts.findLast((attempt) => attempt.run_id !== null)?.run_id ?? null;
+  const probeEvidence = latestAttempt?.probe_evidence;
+  if (rootRunId !== null && isObject(probeEvidence) && Array.isArray(probeEvidence.runs)) {
+    for (const run of probeEvidence.runs) {
+      const runId = run?.run_id;
+      if (typeof runId !== 'string' || runId.length === 0 || runId === rootRunId || siblingRunIds.has(runId)) continue;
+      const startedAt = typeof run?.started_at === 'string' ? run.started_at : latestAttempt.started_at;
+      const terminalStatus = typeof run?.terminal_status === 'string' ? run.terminal_status : null;
+      const terminalAt = terminalStatus === null
+        ? null
+        : (typeof run?.terminal_at === 'string' ? run.terminal_at : latestAttempt.terminal_at ?? startedAt);
+      const projected = projectAttempt({
+        id: `probe-sibling-${runId.slice(4)}`,
+        kind: 'discovered-workflow',
+        phase: 'terminal',
+        execution_mode: latestAttempt.execution_mode ?? 'real',
+        run_id: runId,
+        started_at: startedAt,
+        terminal_at: terminalAt,
+        terminal_status: terminalStatus,
+        tokens_observed: run.tokens_observed ?? 0,
+        steps_snapshot: run.steps_snapshot ?? null,
+        straggler_capture: null,
+      });
+      discoveredRuns.push({ ...projected, parent_run_id: rootRunId });
+      siblingRunIds.add(runId);
+    }
+  }
   return {
     contract_version: ORACLE_CONTEXT_VERSION,
     oracle_id: oracleId,
@@ -296,12 +373,7 @@ export function createOracleContext({ caseRecord, caseState, state, oracleId }) 
     },
     run_id: attempts.findLast((attempt) => attempt.run_id !== null)?.run_id ?? null,
     attempts,
-    discovered_runs: (state.discovered_runs ?? [])
-      .filter((run) => run.root_case_id === caseRecord.id)
-      .map((run) => ({
-        ...projectAttempt(run),
-        parent_run_id: run.parent_run_id,
-      })),
+    discovered_runs: discoveredRuns,
     o1_wave: createO1Wave(caseRecord, caseState, state),
     mechanical_evidence: projectEvidence(latestAttempt?.oracle_evidence),
   };

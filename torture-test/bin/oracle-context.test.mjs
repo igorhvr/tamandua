@@ -127,6 +127,33 @@ test('complete version-1 mechanical evidence context is accepted for every gatin
   }
 });
 
+test('S43b US-007: o1_wave carries the campaign-wide wave_cases membership in manifest order (including cases that have not run yet)', () => {
+  const data = fixture();
+  try {
+    // A second wave-3 case (manifest rank 1, NO attempts — it has not run
+    // yet) must still be part of the wave membership: the O1 wave-family
+    // reporter selection keys off the FULL wave case set, so every evaluating
+    // case in the wave resolves the SAME reporter (the true final wave case
+    // in manifest order) instead of re-selecting from its own partial
+    // snapshot.
+    data.state.manifest = { path: '/operator/manifest.jsonl', sha256: 'a'.repeat(64), case_count: 2, case_ids: ['CASE-1', 'CASE-2'] };
+    data.state.cases.push({
+      id: 'CASE-2', wave: 3, workflow: 'feature-dev-merge-worktree', fixture: 'tt-ts',
+      harness: 'hermes', class: 'verification', phase: 'pending', expected_fast_failure: false,
+      execution_mode: 'real', production_duration_floor_ms: 120_000,
+      attempts: [], findings: [], oracle_results: [], spend: { tokens_observed: 0, observations: [] },
+    });
+    const context = createOracleContext({ ...data, oracleId: 'O1' });
+    assert.deepEqual(context.o1_wave.wave_cases, ['CASE-1', 'CASE-2']);
+    // Only the runs that EXIST are projected; the membership is not limited
+    // to projected runs (CASE-1's own attempt + its discovered sibling).
+    assert.deepEqual(context.o1_wave.runs.map((run) => run.case_id), ['CASE-1', 'CASE-1']);
+    assert.deepEqual(validateOracleContext(context, data.campaignDir, { requireOracleEvidence: true }), []);
+  } finally {
+    cleanup(data.campaignDir);
+  }
+});
+
 test('T2.2 US-001: o1_wave run rows carry per-run execution_mode from the case state, with harness fallback for stored evidence', () => {
   const data = fixture();
   try {
@@ -411,6 +438,103 @@ test('validation rejects symlink evidence even when its target is contained', ()
       path: 'snapshots/database-link.json',
     };
     assert.match(validateOracleContext(context, data.campaignDir).join('\n'), /database_snapshot.*regular non-symlink/);
+  } finally {
+    cleanup(data.campaignDir);
+  }
+});
+
+// S41 (US-004): probe-sequence sibling runs ride in the attempt's
+// probe_evidence.runs[] (multi-run probe shapes — W4.10-restart-recovery's
+// two concurrent runs). createOracleContext must register every non-root
+// sibling in context.discovered_runs (projected through the validated
+// attempt shape, parent = root run) so O1/O11 audit the sibling instead of
+// firing O1_WORKFLOW_RUN_UNKNOWN / O11_DELTA_RUN_UNKNOWN, and must NOT
+// duplicate siblings the controller already registered in
+// state.discovered_runs.
+test('S41: probe-sequence sibling runs are projected into context.discovered_runs (deduped against state)', () => {
+  const data = fixture();
+  try {
+    const attempt = data.state.cases[0].attempts[0];
+    const rootRunId = attempt.run_id;
+    const siblingRunId = 'run-55555555-5555-4555-8555-555555555555';
+    // The multi-run probe shape: the durable attempt carries probe_evidence
+    // naming every probed run with its per-run terminal snapshot (the
+    // controller now fills these from the harvested proxies).
+    const siblingSteps = {
+      source: 'workflow-status-json', captured_at: '2026-08-01T12:00:05.000Z',
+      steps: [{ stepId: 'step-1', agentRole: 'developer', status: 'done' }],
+    };
+    attempt.probe_evidence = {
+      schema_version: 1,
+      case_id: 'CASE-1',
+      launch_shape: 'concurrent',
+      sequence_outcome: 'completed',
+      runs: [
+        { run_ordinal: 1, run_id: rootRunId, terminal_status: 'completed', tokens_observed: 17, steps_snapshot: attempt.steps_snapshot },
+        { run_ordinal: 2, run_id: siblingRunId, terminal_status: 'completed', tokens_observed: 9, steps_snapshot: siblingSteps },
+      ],
+    };
+    const caseState = { attempts: data.state.cases[0].attempts };
+    const context = createOracleContext({ ...data, caseState, oracleId: 'O1' });
+    const sibling = context.discovered_runs.find((run) => run.run_id === siblingRunId);
+    assert.ok(sibling, 'probe-sequence sibling must be projected into context.discovered_runs');
+    assert.equal(sibling.parent_run_id, rootRunId);
+    assert.equal(sibling.terminal_status, 'completed');
+    assert.equal(sibling.tokens_observed, 9);
+    assert.deepEqual(sibling.steps_snapshot.steps, [{ stepId: 'step-1', agentRole: 'developer', status: 'done' }]);
+    assert.equal(sibling.steps_snapshot.source, 'workflow-status-json');
+    assert.equal(sibling.kind, 'discovered-workflow');
+    assert.equal(sibling.phase, 'terminal');
+    assert.equal(sibling.execution_mode, 'real');
+    // The state.discovered_runs sibling (run-22222222...) is still present.
+    assert.ok(context.discovered_runs.some((run) => run.run_id === 'run-22222222-2222-4222-8222-222222222222'));
+    // The o1_wave projection includes the probe sibling (deduped against the
+    // state-registered row) so O1's wave coverage never fires
+    // O1_WAVE_RUN_MISSING on the fallback-registered sibling.
+    const waveSiblingRows = context.o1_wave.runs.filter((run) => run.run_id === siblingRunId);
+    assert.equal(waveSiblingRows.length, 1, 'o1_wave must include the probe sibling exactly once');
+    assert.equal(waveSiblingRows[0].terminal_status, 'completed');
+    // No duplicates across state + probe registrations.
+    const runIds = context.discovered_runs.map((run) => run.run_id);
+    assert.equal(new Set(runIds).size, runIds.length, 'discovered runs must be unique');
+    assert.equal(validateOracleContext(context, data.campaignDir, { requireOracleEvidence: true }).length, 0);
+  } finally {
+    cleanup(data.campaignDir);
+  }
+});
+
+test('S41: the root attempt projection inherits the primary probe run terminal snapshot (O11 root reconciliation)', () => {
+  const data = fixture();
+  try {
+    const attempt = data.state.cases[0].attempts[0];
+    const rootRunId = attempt.run_id;
+    const primarySteps = attempt.steps_snapshot;
+    // The durable attempt was never harvested in the concurrent shape: its
+    // tokens stayed 0 and steps null; the primary probe run carries the real
+    // snapshot (the controller binds it back onto the attempt post-harvest).
+    attempt.tokens_observed = 0;
+    attempt.steps_snapshot = null;
+    attempt.probe_evidence = {
+      schema_version: 1,
+      case_id: 'CASE-1',
+      launch_shape: 'concurrent',
+      sequence_outcome: 'completed',
+      runs: [
+        { run_ordinal: 1, run_id: rootRunId, terminal_status: 'completed', tokens_observed: 17, steps_snapshot: primarySteps },
+      ],
+    };
+    // Simulate the controller's S41 binding of the primary snapshot onto the
+    // durable attempt (executeMultiRunProbeCase copies it before classification).
+    attempt.tokens_observed = 17;
+    attempt.steps_snapshot = primarySteps;
+    const caseState = { attempts: data.state.cases[0].attempts };
+    const context = createOracleContext({ ...data, caseState, oracleId: 'O11' });
+    const rootProjection = context.attempts.find((entry) => entry.run_id === rootRunId);
+    assert.equal(rootProjection.tokens_observed, 17);
+    assert.equal(rootProjection.steps_snapshot.source, 'workflow-status-json');
+    assert.equal(rootProjection.steps_snapshot.steps[0].stepId, 'step-1');
+    assert.equal(rootProjection.steps_snapshot.steps[0].status, 'done');
+    assert.equal(validateOracleContext(context, data.campaignDir, { requireOracleEvidence: true }).length, 0);
   } finally {
     cleanup(data.campaignDir);
   }

@@ -114,6 +114,20 @@ const cases = [
   { name: 'o1-healthy-straggler', expected: 'PASS', childStatus: 'canceled', healthyStraggler: true },
   { name: 'o1-wave-family-reporter', expected: 'FAIL', multiCase: true, finding: 'O1_DURATION_FLOOR_RATE' },
   { name: 'o1-wave-family-sequential', expected: 'FAIL', multiCase: true, sequential: true, finding: 'O1_DURATION_FLOOR_RATE' },
+  // S43b (US-007): wave-reporter dedupe. o1-wave-reporter-dedupe mirrors the
+  // campaign-20260826T225744158Z do-now family shape — four do-now cells
+  // (W4.37/W4.38-real/W4.47/W4.dsh-do-now) plus a LATER non-do-now cell
+  // (W4.dsh-fdmw, the true final wave case in manifest order) share the wave,
+  // and each case's o1_wave SNAPSHOT differs (concurrency-1 growth): the last
+  // do-now case's O1 saw only the four do-now runs, the non-do-now case's O1
+  // saw the do-now runs plus its own. The pre-fix per-snapshot reporter
+  // selection stamped the do-now family finding on BOTH cases (the campaign
+  // report's W4.dsh-do-now + W4.dsh-fdmw lines); with the campaign-wide
+  // wave_cases membership the reporter is the true final wave case in
+  // manifest order (the non-do-now cell) for EVERY evaluation, so the finding
+  // merges exactly once. expected FAIL = the battery context (the reporter
+  // case) carries O1_DURATION_FLOOR_RATE.
+  { name: 'o1-wave-reporter-dedupe', expected: 'FAIL', multiCase: true, dedupe: true, finding: 'O1_DURATION_FLOOR_RATE' },
   // US-007 (2026-08-24): wave-1 do-now duration-floor recalibration proof.
   // o1-wave1-floor-30000 mirrors the four campaign #8 wave-1 do-now runs'
   // recorded durations (W1.L1-python 53.257s, W1.L1-ts 46.313s, W1.X1-ts
@@ -132,6 +146,23 @@ const cases = [
   { name: 'o1-scripted-fast-wave', expected: 'PASS', scriptedWave: true },
   { name: 'o1-stored-scripted-fast-wave', expected: 'PASS', storedScriptedWave: true },
   { name: 'o1-mixed-real-scripted-family', expected: 'FAIL', mixedWave: true, finding: 'O1_DURATION_FLOOR_RATE' },
+  // S43a (US-006): O1 duration-floor calibration. o1-control-under-floor is
+  // the RED-ARM — the campaign W4.08-control shape (an HONEST run 13% under
+  // the 600000ms family production-median floor, green content oracles) is
+  // the only fast run in a 4-run family, so O1_DURATION_FLOOR_RATE fires
+  // citing it (the pre-fix flag). o1-control-per-cell-floor is the GREEN-ARM
+  // per-cell floor disposition: the SAME shape with a per-cell floor of
+  // 480000ms (authoritative for that cell) clears the honest run and the
+  // family PASSes. o1-fast-honest-flagged is the GREEN-ARM flag disposition:
+  // a family whose runs are ALL declared expected_fast_failure (the
+  // W4.37/W4.38-real/W4.47/W4.dsh-do-now shape) PASSes with a zero-run
+  // observation. o1-flagged-unflagged-mixed proves flagged runs are excluded
+  // from BOTH numerator and denominator while an un-flagged too-fast run
+  // still FAILs the floor.
+  { name: 'o1-control-under-floor', expected: 'FAIL', s43aControlUnderFloor: true, workflow: 'bug-fix-merge-worktree', finding: 'O1_DURATION_FLOOR_RATE' },
+  { name: 'o1-control-per-cell-floor', expected: 'PASS', s43aControlPerCellFloor: true, workflow: 'bug-fix-merge-worktree' },
+  { name: 'o1-fast-honest-flagged', expected: 'PASS', s43aFastHonestFlagged: true, workflow: 'do-now' },
+  { name: 'o1-flagged-unflagged-mixed', expected: 'FAIL', s43aFlaggedUnflaggedMixed: true, workflow: 'do-now', finding: 'O1_DURATION_FLOOR_RATE' },
 ];
 
 for (const fixture of cases) {
@@ -159,13 +190,27 @@ for (const fixture of cases) {
   // T2.2 US-002: scripted-wave fixtures run their root/child attempts in the
   // scripted (zero-token) environment so the context stays coherent.
   const attemptMode = fixture.scriptedWave || fixture.storedScriptedWave ? 'scripted' : 'real';
+  // S43a (US-006): a fixture may declare its own workflow family label
+  // (e.g. 'bug-fix-merge-worktree' for the W4.08-control shape, 'do-now' for
+  // the fast-honest shape); the default keeps every pre-S43a fixture
+  // byte-identical.
+  const fixtureWorkflow = fixture.workflow ?? 'feature-dev-merge-worktree';
   const rootAttempt = attempt(ROOT, rootStatus, [rootStep], attemptMode);
   if (fixture.fastWave || fixture.tinySample || fixture.n4Fast
       || fixture.scriptedWave || fixture.storedScriptedWave) rootAttempt.terminal_at = '2026-08-01T12:00:30.000Z';
   if (fixture.wave1Floor) rootAttempt.terminal_at = '2026-08-01T12:00:53.257Z'; // W1.L1-python measured 53.257s (campaign #8)
+  // S43a (US-006): W4.08-control shape — root finishes 522s (13% under the
+  // 600000ms family production-median floor, green content oracles); child
+  // finishes 620s (honest, above the floor).
+  if (fixture.s43aControlUnderFloor || fixture.s43aControlPerCellFloor) rootAttempt.terminal_at = '2026-08-01T12:08:42.000Z';
+  if (fixture.s43aFastHonestFlagged) rootAttempt.terminal_at = '2026-08-01T12:00:30.000Z';
+  if (fixture.s43aFlaggedUnflaggedMixed) rootAttempt.terminal_at = '2026-08-01T12:02:30.000Z';
   const childAttempt = { ...attempt(CHILD, childStatus, [childStep], attemptMode), parent_run_id: ROOT };
   if (fixture.tinySample || fixture.n4Fast || fixture.scriptedWave || fixture.storedScriptedWave) childAttempt.terminal_at = '2026-08-01T12:00:30.000Z';
   if (fixture.wave1Floor) childAttempt.terminal_at = '2026-08-01T12:00:46.313Z'; // W1.L1-ts measured 46.313s (campaign #8)
+  if (fixture.s43aControlUnderFloor || fixture.s43aControlPerCellFloor) childAttempt.terminal_at = '2026-08-01T12:10:20.000Z';
+  if (fixture.s43aFastHonestFlagged) childAttempt.terminal_at = '2026-08-01T12:00:50.000Z';
+  if (fixture.s43aFlaggedUnflaggedMixed) childAttempt.terminal_at = '2026-08-01T12:02:40.000Z';
 
   const databasePath = path.join(snapshots, 'database.sqlite');
   const db = new DatabaseSync(databasePath);
@@ -181,8 +226,8 @@ for (const fixture of cases) {
     );
   `);
   const insertRun = db.prepare('INSERT INTO runs VALUES (?, ?, ?, ?, ?, ?, ?)');
-  insertRun.run(bare(ROOT), 'feature-dev-merge-worktree', rootStatus, fixture.schedulingStatus ?? null, STARTED_AT, STARTED_AT, TERMINAL_AT);
-  insertRun.run(bare(CHILD), 'feature-dev-merge-worktree', childStatus, null, STARTED_AT, STARTED_AT, TERMINAL_AT);
+  insertRun.run(bare(ROOT), fixtureWorkflow, rootStatus, fixture.schedulingStatus ?? null, STARTED_AT, STARTED_AT, TERMINAL_AT);
+  insertRun.run(bare(CHILD), fixtureWorkflow, childStatus, null, STARTED_AT, STARTED_AT, TERMINAL_AT);
   const insertStep = db.prepare('INSERT INTO steps VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
   for (const row of [rootStep, childStep]) insertStep.run(...Object.values(row));
   db.close();
@@ -228,7 +273,7 @@ for (const fixture of cases) {
     oracle_id: 'O1',
     campaign: { id: `campaign-${fixture.name}`, created_at: STARTED_AT, manifest: { sha256: 'a'.repeat(64), case_count: 1, case_ids: [fixture.name] } },
     case: {
-      id: fixture.name, wave: 4, workflow: 'feature-dev-merge-worktree', fixture: 'synthetic', harness: 'hermes',
+      id: fixture.name, wave: 4, workflow: fixtureWorkflow, fixture: 'synthetic', harness: 'hermes',
       class: 'verification', caps: { tokens: fixture.scriptedWave || fixture.storedScriptedWave ? 0 : 10, wall_min: 60 }, boundary_files: [], forbidden: [],
       chaos: fixture.healthyStraggler ? { healthy_straggler: { policy: 'hermes-storm', run_ids: [CHILD], recent_within_ms: 300000 } } : null,
     },
@@ -253,6 +298,7 @@ for (const fixture of cases) {
 
 function writeMultiCaseFixture(workspace, fixture) {
   if (fixture.sequential) return writeSequentialFixture(workspace, fixture);
+  if (fixture.dedupe) return writeWaveReporterDedupeFixture(workspace, fixture);
   return writeReporterFixture(workspace, fixture);
 }
 
@@ -299,6 +345,11 @@ function writeReporterFixture(workspace, fixture) {
   const wave = {
     schema_version: 1,
     wave: 4,
+    // S43b (US-007): the campaign-wide wave membership in MANIFEST order
+    // (every wave case, whether or not it has run yet). The reporter is the
+    // true final wave case in manifest order — identical for every evaluating
+    // case, so family findings merge into exactly one case.
+    wave_cases: [firstCaseId, reporterCaseId],
     duration_floors: caseIds.map((caseId) => ({
       workflow, case_id: caseId, duration_floor_ms: floorMs, source: 'production-median', sample_size: 0,
     })),
@@ -428,10 +479,13 @@ function writeSequentialFixture(workspace, fixture) {
     case_id: caseId, run_id: runId, workflow, started_at: STARTED_AT, terminal_at: terminalAt,
     terminal_status: 'completed', expected_fast_failure: false, execution_mode: 'real',
   });
-  // First case's snapshot: its own run only (< MIN_FLOOR_RATE_SAMPLE).
+  // First case's snapshot: its own run only (< MIN_FLOOR_RATE_SAMPLE). The
+  // wave_cases membership is campaign-wide (both manifest cases), so the
+  // reporter is the true final wave case for BOTH evaluations.
   const firstWave = {
     schema_version: 1,
     wave: 4,
+    wave_cases: [firstCaseId, lastCaseId],
     duration_floors: [{ workflow, case_id: firstCaseId, duration_floor_ms: floorMs, source: 'production-median', sample_size: 0 }],
     runs: [waveRun(firstCaseId, ROOT, TERMINAL_AT)],
   };
@@ -446,6 +500,7 @@ function writeSequentialFixture(workspace, fixture) {
   const lastWave = {
     schema_version: 1,
     wave: 4,
+    wave_cases: [firstCaseId, lastCaseId],
     duration_floors: [...new Set(lastRuns.map((run) => run.case_id))].map((caseId) => ({
       workflow, case_id: caseId, duration_floor_ms: floorMs, source: 'production-median', sample_size: 0,
     })),
@@ -540,6 +595,158 @@ function writeSequentialFixture(workspace, fixture) {
   })}\n`, { flag: 'wx' });
 }
 
+function writeWaveReporterDedupeFixture(workspace, fixture) {
+  // S43b (US-007): the campaign-20260826T225744158Z do-now family shape. Four
+  // do-now cells (manifest ranks 0..3) plus a NON-do-now cell (manifest rank
+  // 4 — the true final wave case in manifest order) share wave 4. Each
+  // case's o1_wave SNAPSHOT differs, mirroring concurrency-1 execution:
+  //   * the last do-now case's O1 ran when the wave held only the four do-now
+  //     runs (2 fast -> rate 0.5 >= MIN_FLOOR_RATE_SAMPLE) — the pre-fix
+  //     per-snapshot reporter selection made THIS case the reporter, stamping
+  //     the do-now family finding here;
+  //   * the non-do-now case's O1 ran later, when the wave also held its own
+  //     run — the pre-fix selection made IT the reporter too, stamping the
+  //     SAME do-now family finding on a case that is not even do-now (the
+  //     campaign report's W4.dsh-do-now + W4.dsh-fdmw lines).
+  // With the campaign-wide `wave_cases` membership both evaluations resolve
+  // the reporter to the true final wave case in manifest order (the
+  // non-do-now cell), so the finding merges exactly once.
+  const campaign = path.join(workspace, fixture.name);
+  const snapshots = path.join(campaign, 'snapshots');
+  const doNow4EvidenceDir = path.join(campaign, 'evidence-do-now-4');
+  const nonDoNowEvidenceDir = path.join(campaign, 'evidence-non-do-now');
+  // The canonical evidence/context.json is what the self-test battery
+  // (oracles/self-test/run.sh) invokes; it must carry the reporter (the true
+  // final wave case — the non-do-now cell) context, whose result matches the
+  // fixture's expected FAIL.
+  const batteryEvidenceDir = path.join(campaign, 'evidence');
+  for (const directory of [snapshots, doNow4EvidenceDir, nonDoNowEvidenceDir, batteryEvidenceDir]) fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(campaign, 'state.json'), '{}\n', { flag: 'wx' });
+
+  const doNowWorkflow = 'do-now';
+  const nonDoNowWorkflow = 'feature-dev-merge-worktree';
+  const doNowFloorMs = 120000;
+  const nonDoNowFloorMs = 300000;
+  const fastTerminalAt = '2026-08-01T12:00:30.000Z';
+  // Manifest order: four do-now cells, then the non-do-now cell LAST.
+  const doNowCaseIds = ['wave-dedup-do-now-1', 'wave-dedup-do-now-2', 'wave-dedup-do-now-3', 'wave-dedup-do-now-4'];
+  const nonDoNowCaseId = 'wave-dedup-non-do-now';
+  const manifestCaseIds = [...doNowCaseIds, nonDoNowCaseId];
+  const runIdOf = (caseId) => `run-${caseId}`;
+  // 2 of the 4 do-now runs are fast (W4.37/W4.38-real/W4.47/W4.dsh-do-now had
+  // 2 fast honest runs in the campaign).
+  const doNowTerminalAt = (index) => (index < 2 ? fastTerminalAt : TERMINAL_AT);
+  const doNowRun = (caseId, index) => ({
+    case_id: caseId, run_id: runIdOf(caseId), workflow: doNowWorkflow, started_at: STARTED_AT,
+    terminal_at: doNowTerminalAt(index), terminal_status: 'completed',
+    expected_fast_failure: false, execution_mode: 'real',
+  });
+  const doNowFloor = (caseId) => ({
+    workflow: doNowWorkflow, case_id: caseId, duration_floor_ms: doNowFloorMs, source: 'production-median', sample_size: 0,
+  });
+  const nonDoNowRun = {
+    case_id: nonDoNowCaseId, run_id: runIdOf(nonDoNowCaseId), workflow: nonDoNowWorkflow, started_at: STARTED_AT,
+    terminal_at: TERMINAL_AT, terminal_status: 'completed', expected_fast_failure: false, execution_mode: 'real',
+  };
+  const nonDoNowFloor = {
+    workflow: nonDoNowWorkflow, case_id: nonDoNowCaseId, duration_floor_ms: nonDoNowFloorMs, source: 'production-median', sample_size: 0,
+  };
+  // The last do-now case's snapshot: the four do-now runs only (its O1 ran
+  // before the non-do-now cell launched).
+  const doNow4Wave = {
+    schema_version: 1,
+    wave: 4,
+    wave_cases: manifestCaseIds,
+    duration_floors: doNowCaseIds.map(doNowFloor),
+    runs: doNowCaseIds.map(doNowRun),
+  };
+  // The non-do-now case's snapshot: the do-now runs plus its own run.
+  const nonDoNowWave = {
+    schema_version: 1,
+    wave: 4,
+    wave_cases: manifestCaseIds,
+    duration_floors: [...doNowCaseIds.map(doNowFloor), nonDoNowFloor],
+    runs: [...doNowCaseIds.map(doNowRun), nonDoNowRun],
+  };
+
+  const doNow4Step = step(runIdOf(doNowCaseIds[3]), { status: 'done' });
+  const nonDoNowStep = step(runIdOf(nonDoNowCaseId), { status: 'done' });
+  const doNow4Attempt = attempt(runIdOf(doNowCaseIds[3]), 'completed', [doNow4Step]);
+  const nonDoNowAttempt = attempt(runIdOf(nonDoNowCaseId), 'completed', [nonDoNowStep]);
+
+  const writeContextEvidence = (evidenceDir, caseId, runId, attemptRow, wave, stepRow) => {
+    const databasePath = path.join(evidenceDir, 'database.sqlite');
+    const db = new DatabaseSync(databasePath);
+    db.exec(`
+      CREATE TABLE runs (
+        id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, status TEXT NOT NULL,
+        scheduling_status TEXT, scheduling_requested_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      );
+      CREATE TABLE steps (
+        id TEXT PRIMARY KEY, run_id TEXT NOT NULL, step_id TEXT NOT NULL, agent_id TEXT NOT NULL,
+        step_index INTEGER NOT NULL, status TEXT NOT NULL, type TEXT NOT NULL, current_story_id TEXT,
+        claim_pid INTEGER, claim_updated_at TEXT, updated_at TEXT NOT NULL
+      );
+    `);
+    const insertRun = db.prepare('INSERT INTO runs VALUES (?, ?, ?, ?, ?, ?, ?)');
+    insertRun.run(bare(runId), caseId === nonDoNowCaseId ? nonDoNowWorkflow : doNowWorkflow, 'completed', null, STARTED_AT, STARTED_AT, TERMINAL_AT);
+    const insertStep = db.prepare('INSERT INTO steps VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+    insertStep.run(...Object.values(stepRow));
+    db.close();
+    fs.chmodSync(databasePath, 0o400);
+
+    const events = {
+      schema_version: 1, captured_at: CAPTURED_AT, run_ids: [runId],
+      rows: [{ archive: 'all.jsonl', line: 1, event: { ts: TERMINAL_AT, event: 'run.completed', runId } }],
+    };
+    const workflowStatus = {
+      schema_version: 1, captured_at: CAPTURED_AT,
+      root: {
+        run_id: runId, terminal_status: 'completed', tokens_observed: 1,
+        steps_snapshot: attemptRow.steps_snapshot,
+      },
+      discovered_runs: [],
+    };
+    const referencesBase = Object.fromEntries(REFERENCE_KEYS.map((key) => [key, null]));
+    referencesBase.database_snapshot = reference(campaign, databasePath, 'sqlite-self-test');
+    const references = {
+      ...referencesBase,
+      run_events: writeSnapshot(campaign, snapshots, `run-events-${caseId}.json`, events),
+      workflow_status: writeSnapshot(campaign, snapshots, `workflow-status-${caseId}.json`, workflowStatus),
+    };
+    const manifest = { sha256: 'a'.repeat(64), case_count: manifestCaseIds.length, case_ids: manifestCaseIds };
+    const caseBase = {
+      wave: 4, workflow: caseId === nonDoNowCaseId ? nonDoNowWorkflow : doNowWorkflow,
+      fixture: 'synthetic', harness: 'hermes', class: 'verification',
+      caps: { tokens: 10, wall_min: 60 }, boundary_files: [], forbidden: [], chaos: null,
+    };
+    const context = {
+      contract_version: 1,
+      oracle_id: 'O1',
+      campaign: { id: `campaign-${fixture.name}`, created_at: STARTED_AT, manifest },
+      case: { id: caseId, ...caseBase },
+      run_id: runId,
+      attempts: [attemptRow],
+      discovered_runs: [],
+      o1_wave: wave,
+      mechanical_evidence: { schema_version: 1, references },
+    };
+    const contextPath = path.join(evidenceDir, 'context.json');
+    fs.writeFileSync(contextPath, `${JSON.stringify(context, null, 2)}\n`, { mode: 0o400, flag: 'wx' });
+    return contextPath;
+  };
+
+  const doNow4ContextPath = writeContextEvidence(doNow4EvidenceDir, doNowCaseIds[3], runIdOf(doNowCaseIds[3]), doNow4Attempt, doNow4Wave, doNow4Step);
+  const nonDoNowContextPath = writeContextEvidence(nonDoNowEvidenceDir, nonDoNowCaseId, runIdOf(nonDoNowCaseId), nonDoNowAttempt, nonDoNowWave, nonDoNowStep);
+  // The battery invokes evidence/context.json; the reporter (non-do-now)
+  // context FAILs with the do-now family O1_DURATION_FLOOR_RATE, matching the
+  // fixture's expected FAIL.
+  fs.writeFileSync(path.join(batteryEvidenceDir, 'context.json'), `${JSON.stringify(JSON.parse(fs.readFileSync(nonDoNowContextPath, 'utf8')), null, 2)}\n`, { mode: 0o400, flag: 'wx' });
+  fs.writeFileSync(path.join(campaign, 'expectation.json'), `${JSON.stringify({
+    ...fixture, contexts: { doNow4: doNow4ContextPath, nonDoNow: nonDoNowContextPath },
+  })}\n`, { flag: 'wx' });
+}
+
 function waveProjection(fixture, rootAttempt, childAttempt) {
   if (fixture.wave1Floor) {
     return wave1FloorProjection(fixture, rootAttempt, childAttempt);
@@ -552,6 +759,10 @@ function waveProjection(fixture, rootAttempt, childAttempt) {
   }
   if (fixture.mixedWave) {
     return mixedWaveProjection(fixture, rootAttempt, childAttempt);
+  }
+  if (fixture.s43aControlUnderFloor || fixture.s43aControlPerCellFloor
+      || fixture.s43aFastHonestFlagged || fixture.s43aFlaggedUnflaggedMixed) {
+    return s43aProjection(fixture, rootAttempt, childAttempt);
   }
   const workflow = 'feature-dev-merge-worktree';
   const fastTerminalAt = '2026-08-01T12:00:30.000Z';
@@ -683,6 +894,77 @@ function mixedWaveProjection(fixture, rootAttempt, childAttempt) {
     sample_size: 0,
   }));
   return { schema_version: 1, wave: 4, duration_floors: durationFloors, runs };
+}
+
+// S43a (US-006) — duration-floor calibration projections. Four shapes (see
+// the fixture comments in the `cases` array):
+//   * o1-control-under-floor (RED-ARM): the W4.08-control 13%-under shape —
+//     an HONEST run (ROOT) finishing 522s against a 600000ms per-case floor
+//     (green content oracles) is the only fast run in a 4-run family, so the
+//     pre-fix O1_DURATION_FLOOR_RATE fires citing it.
+//   * o1-control-per-cell-floor (GREEN-ARM): the SAME shape with the per-cell
+//     floor recalibrated to 480000ms — the per-cell floor is AUTHORITATIVE
+//     for that cell, the 522s honest run clears it, and the family PASSes.
+//   * o1-fast-honest-flagged (GREEN-ARM): a family whose runs are ALL
+//     declared expected_fast_failure (the W4.37/W4.38-real/W4.47/W4.dsh-do-now
+//     shape) — no run is floor-judgeable; the zero-run observation row is
+//     written and the family PASSes.
+//   * o1-flagged-unflagged-mixed (GREEN-ARM): flagged fast runs are excluded
+//     from BOTH the fast numerator and the eligible denominator, while an
+//     UN-FLAGGED too-fast run (60s vs the 120s floor) still FAILs the floor
+//     (rate 0.25 computed on the un-flagged eligible only, citing only the
+//     un-flagged run).
+function s43aProjection(fixture, rootAttempt, childAttempt) {
+  const workflow = fixture.workflow ?? 'feature-dev-merge-worktree';
+  const run = (caseId, runId, terminalAt, terminalStatus, fastFailure) => ({
+    case_id: caseId, run_id: runId, workflow, started_at: STARTED_AT, terminal_at: terminalAt,
+    terminal_status: terminalStatus, expected_fast_failure: fastFailure, execution_mode: 'real',
+  });
+  const floor = (caseId, ms) => ({
+    workflow, case_id: caseId, duration_floor_ms: ms, source: 'production-median', sample_size: 0,
+  });
+  let runs;
+  let durationFloors;
+  if (fixture.s43aControlUnderFloor || fixture.s43aControlPerCellFloor) {
+    const controlFloor = fixture.s43aControlPerCellFloor ? 480000 : 600000;
+    const peerAt = '2026-08-01T12:10:20.000Z';
+    runs = [
+      run(fixture.name, ROOT, rootAttempt.terminal_at, rootAttempt.terminal_status, false),
+      run(fixture.name, CHILD, childAttempt.terminal_at, childAttempt.terminal_status, false),
+      run('wave-peer-1', 'run-wave-peer-1', peerAt, 'completed', false),
+      run('wave-peer-2', 'run-wave-peer-2', peerAt, 'completed', false),
+    ];
+    durationFloors = [
+      floor(fixture.name, controlFloor),
+      floor('wave-peer-1', 600000),
+      floor('wave-peer-2', 600000),
+    ];
+  } else if (fixture.s43aFastHonestFlagged) {
+    runs = [
+      run(fixture.name, ROOT, rootAttempt.terminal_at, rootAttempt.terminal_status, true),
+      run(fixture.name, CHILD, childAttempt.terminal_at, childAttempt.terminal_status, true),
+      run('wave-fast-honest-1', 'run-wave-fast-honest-1', '2026-08-01T12:00:30.000Z', 'completed', true),
+      run('wave-fast-honest-2', 'run-wave-fast-honest-2', '2026-08-01T12:00:50.000Z', 'completed', true),
+      run('wave-fast-honest-3', 'run-wave-fast-honest-3', '2026-08-01T12:01:10.000Z', 'completed', true),
+    ];
+    durationFloors = [...new Set(runs.map((item) => item.case_id))].map((caseId) => floor(caseId, 120000));
+  } else {
+    runs = [
+      run(fixture.name, ROOT, rootAttempt.terminal_at, rootAttempt.terminal_status, false),
+      run(fixture.name, CHILD, childAttempt.terminal_at, childAttempt.terminal_status, false),
+      run('wave-peer-1', 'run-wave-peer-1', '2026-08-01T12:01:00.000Z', 'completed', false),
+      run('wave-peer-2', 'run-wave-peer-2', '2026-08-01T12:02:30.000Z', 'completed', false),
+      run('wave-peer-3', 'run-wave-peer-3', '2026-08-01T12:00:30.000Z', 'completed', true),
+      run('wave-peer-4', 'run-wave-peer-4', '2026-08-01T12:00:50.000Z', 'completed', true),
+    ];
+    durationFloors = [...new Set(runs.map((item) => item.case_id))].map((caseId) => floor(caseId, 120000));
+  }
+  return {
+    schema_version: 1,
+    wave: 4,
+    duration_floors: durationFloors.sort((left, right) => left.case_id.localeCompare(right.case_id)),
+    runs: runs.sort((left, right) => `${left.case_id}\0${left.run_id}`.localeCompare(`${right.case_id}\0${right.run_id}`)),
+  };
 }
 
 // US-007 (2026-08-24): derived wave-1 do-now projection at the recalibrated

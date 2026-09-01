@@ -374,4 +374,116 @@ describe("E3.C US-005 — controller probe_sequence semantic validation (fail-cl
       fs.rmSync(built.dir, { recursive: true, force: true });
     }
   });
+
+  // ── S44a (US-009): operator-seam probe ops — fail-closed semantic guards ──
+  // The operator-seam ops (restart_contained_daemon, update_contained_install,
+  // invalidate_credentials, restore_credentials) are SINGLE-RUN corridor ops
+  // (each fires once against the contained daemon/install/home mid-run). A
+  // multi-run launch shape has no single run to act against; a
+  // restore_credentials with no prior invalidate has no backup to restore;
+  // and during_hold requires a preceding hold-capable action (the action
+  // fires concurrently with that hold). All fail closed at DECLARATION time —
+  // never a silent per-run re-fire or a runtime no-backup surprise.
+  it("rejects the S44a operator-seam ops on a multi-run probe_sequence", () => {
+    expectRejected(
+      "restart_contained_daemon multi-run",
+      "W3.18-pause-no-drain",
+      {
+        probe_sequence: [
+          { run: 1, actions: [{ op: "restart_contained_daemon", when: "now" }] },
+          { run: 2, actions: [{ op: "cancel", when: "step:developer:running" }] },
+        ],
+      },
+      /the S44a operator-seam ops are single-run corridor ops/,
+    );
+    expectRejected(
+      "update_contained_install multi-run",
+      "W3.18-pause-no-drain",
+      {
+        probe_sequence: [
+          { run: 1, actions: [{ op: "update_contained_install", when: "now" }] },
+          { run: 2, actions: [{ op: "cancel", when: "step:developer:running" }] },
+        ],
+      },
+      /the S44a operator-seam ops are single-run corridor ops/,
+    );
+  });
+
+  it("rejects restore_credentials without a preceding invalidate_credentials in the same run group", () => {
+    expectRejected(
+      "restore without invalidate",
+      "W3.18-pause-no-drain",
+      { probe_sequence: [{ run: 1, actions: [{ op: "restore_credentials", when: "now" }] }] },
+      /restore_credentials requires a preceding invalidate_credentials action in the same run group/,
+    );
+  });
+
+  it("rejects during_hold without a preceding hold-capable action (and on a group's first action)", () => {
+    expectRejected(
+      "during_hold as first action",
+      "W3.18-pause-no-drain",
+      { probe_sequence: [{ run: 1, actions: [{ op: "restart_contained_daemon", when: "now", during_hold: true }, { op: "resume", when: "now" }] }] },
+      /during_hold requires a PRECEDING action in the same run group to hold against/,
+    );
+    expectRejected(
+      "during_hold after a non-hold action",
+      "W3.18-pause-no-drain",
+      { probe_sequence: [{ run: 1, actions: [{ op: "cancel", when: "step:developer:running" }, { op: "restart_contained_daemon", when: "now", during_hold: true }] }] },
+      /during_hold requires the immediately preceding action .* to carry hold_seconds > 0/,
+    );
+    expectRejected(
+      "during_hold on a multi-run sequence",
+      "W3.18-pause-no-drain",
+      {
+        probe_sequence: [
+          { run: 1, actions: [{ op: "pause", when: "step:developer:running", hold_seconds: 5 }, { op: "restart_contained_daemon", when: "now", during_hold: true }] },
+          { run: 2, actions: [{ op: "cancel", when: "step:developer:running" }] },
+        ],
+      },
+      /during_hold is a single-run corridor marker/,
+    );
+  });
+
+  it("accepts the valid S44a single-run corridor shapes through --validate-only", () => {
+    const shapes: Array<[string, Record<string, unknown>]> = [
+      ["restart during hold", {
+        probe_sequence: [{
+          run: 1,
+          actions: [
+            { op: "pause_drain", when: "step:developer:running", hold_seconds: 30 },
+            { op: "restart_contained_daemon", when: "now", during_hold: true },
+            { op: "resume", when: "now" },
+          ],
+        }],
+      }],
+      ["update during hold", {
+        probe_sequence: [{
+          run: 1,
+          actions: [
+            { op: "pause", when: "step:developer:running", hold_seconds: 30 },
+            { op: "update_contained_install", when: "now", during_hold: true },
+            { op: "resume", when: "now" },
+          ],
+        }],
+      }],
+      ["credential corridor", {
+        probe_sequence: [{
+          run: 1,
+          actions: [
+            { op: "invalidate_credentials", when: "now" },
+            { op: "restore_credentials", when: "now" },
+          ],
+        }],
+      }],
+    ];
+    for (const [label, overrides] of shapes) {
+      const built = buildCaseManifest("W3.18-pause-no-drain", overrides);
+      try {
+        const res = runValidate(built.manifest);
+        assert.equal(res.status, 0, `${label} must validate:\n${res.stdout}${res.stderr}`);
+      } finally {
+        fs.rmSync(built.dir, { recursive: true, force: true });
+      }
+    }
+  });
 });

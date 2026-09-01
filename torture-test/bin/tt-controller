@@ -35,6 +35,9 @@ import {
   unknownWorkflowSpecError,
   workflowVocabularyFor,
 } from './tt-trigger-vocabulary.mjs';
+import { chaosNotFiredGate } from './tt-chaos-arming.mjs';
+import { armAbsentGate } from './tt-arming.mjs';
+import { subsumeRunawayFindings } from './tt-subsumption.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const BIN_DIR = path.dirname(__filename);
@@ -149,6 +152,45 @@ const EVIDENCE_TAIL_BYTES = 500;
 // launch->wait->snapshot behavior (campaign #7 S3/S4).
 const PROBE_OPS = new Set([
   'pause', 'pause_drain', 'resume', 'cancel', 'fail_force', 'restart_daemon', 'sigstop_sigcont',
+  // S44a (US-009): operator-seam actions — single-run daemon-lifecycle /
+  // install / credential ops the W4.10/W4.48a/W4.33a/W4.33b/W4.47 premises
+  // depend on (see OPERATOR_SEAM_OPS below for the fail-closed dispatch set).
+  'restart_contained_daemon', 'update_contained_install', 'invalidate_credentials', 'restore_credentials',
+]);
+// S44a (US-009): the operator-seam probe ops that do NOT map to a plain
+// `tamandua <argv>` spawn — they dispatch to dedicated CONTAINED execution
+// paths (daemon-control restart, contained .pi credential file ops) in
+// executeProbeAction. update_contained_install runs `tamandua update --force`
+// (a plain argv) but with a containment resolution gate. A probeActionArgv of
+// null for an op OUTSIDE this set still fails closed ('probe-action-failed':
+// restart_daemon/sigstop_sigcont are multi-run / chaos capabilities).
+const OPERATOR_SEAM_OPS = new Set(['restart_contained_daemon', 'invalidate_credentials', 'restore_credentials']);
+// S44a: the single-run operator-seam ops are corridor ops (each fires once
+// against the contained daemon/install/home mid-run) — a multi-run launch
+// shape has no single run to act against, so validateProbeSequence rejects
+// them there (fail-closed) instead of silently firing per-run.
+const OPERATOR_SEAM_SINGLE_RUN_OPS = new Set([
+  'restart_contained_daemon', 'update_contained_install', 'invalidate_credentials', 'restore_credentials',
+]);
+// S44a: restore_credentials can only ever succeed after an invalidate_credentials
+// created the backup — validateProbeSequence rejects a restore with no prior
+// invalidate in the same run group (fail-closed declaration, never a runtime
+// no-backup surprise).
+const CREDENTIAL_BACKUP_FILENAME = 'auth.json.tt-invalidated';
+// S44a: probe-action failure categories that terminate the case IMMEDIATELY
+// (stop the underlying run + persist the terminal TEST_INFRA_FAIL record AT
+// FAILURE TIME — the S18c discipline). Every action-execution failure (the
+// pre-S44a 'probe-action-failed' plus the S44a per-action categories and the
+// escape refusal) terminates; 'probe-trigger-unreached' waits out the
+// run/deadline by design.
+const PROBE_ACTION_TERMINAL_CATEGORIES = new Set([
+  'probe-action-failed',
+  'restart-contained-daemon-failed',
+  'daemon-path-invariant-violated',
+  'update-contained-install-failed',
+  'invalidate-credentials-failed',
+  'restore-credentials-failed',
+  'operator-action-escape-refused',
 ]);
 const PROBE_WHEN_PATTERN = /^(now|step:[A-Za-z0-9._-]+:[A-Za-z0-9._-]+|event:[A-Za-z0-9._-]+)$/;
 // S18b (US-003): the probe trigger vocabulary gains AWAITED object triggers —
@@ -776,6 +818,23 @@ function validateProbeSequence(caseRecord) {
     });
   }
 
+  // S44a (US-009): the operator-seam ops are SINGLE-RUN corridor ops (each
+  // fires ONCE against the contained daemon/install/home mid-run — W4.10/
+  // W4.48a restart the killed daemon once, W4.33a/W4.33b act once during the
+  // pause hold, W4.47 invalidates/restores the contained credentials around a
+  // single launch). A multi-run launch shape has no single run to act against,
+  // so declaring them there fails closed (never a silent per-run re-fire).
+  if (sequence.length > 1) {
+    sequence.forEach((group, groupIndex) => {
+      if (!Array.isArray(group?.actions)) return;
+      group.actions.forEach((action, actionIndex) => {
+        if (isObject(action) && typeof action.op === 'string' && OPERATOR_SEAM_SINGLE_RUN_OPS.has(action.op)) {
+          errors.push(`run group ${groupIndex + 1} (run ${Number.isInteger(group?.run) ? group.run : '?'}) action ${actionIndex + 1} (op '${action.op}'): the S44a operator-seam ops are single-run corridor ops — a multi-run probe_sequence cannot declare them (fire once against the contained daemon/install/home; the multi-run daemon restart is restart_daemon)`);
+        }
+      });
+    });
+  }
+
   sequence.forEach((group, groupIndex) => {
     const groupLabel = `run group ${groupIndex + 1} (run ${Number.isInteger(group?.run) ? group.run : '?'})`;
     if (!isObject(group) || !Array.isArray(group.actions)) {
@@ -785,6 +844,12 @@ function validateProbeSequence(caseRecord) {
     if (group.actions.length === 0) {
       errors.push(`${groupLabel}: actions must contain at least one action`);
     }
+    // S44a (US-009): per-group state for the credential corridor — a
+    // restore_credentials can only succeed after an invalidate_credentials in
+    // the SAME run group created the backup (the backup lives under the
+    // contained home and is consumed by the restore; a cross-group restore
+    // would be an ordering ambiguity, so it fails closed at declaration).
+    let invalidatedBefore = false;
     group.actions.forEach((action, actionIndex) => {
       const actionLabel = `${groupLabel} action ${actionIndex + 1}`;
       if (!isObject(action)) {
@@ -812,6 +877,34 @@ function validateProbeSequence(caseRecord) {
       if (typeof op === 'string' && PROBE_HOLD_REQUIRED_OPS.has(op)
           && !(typeof action.hold_seconds === 'number' && Number.isFinite(action.hold_seconds) && action.hold_seconds > 0)) {
         errors.push(`${actionLabel} (op '${op}'): hold-capable op requires hold_seconds > 0`);
+      }
+      // S44a (US-009): restore_credentials requires a prior invalidate in the
+      // same run group — a restore with no backup to restore from would always
+      // fail at runtime, so the declaration itself fails closed.
+      if (op === 'restore_credentials' && !invalidatedBefore) {
+        errors.push(`${actionLabel} (op 'restore_credentials'): restore_credentials requires a preceding invalidate_credentials action in the same run group (the restore consumes the backup the invalidate created)`);
+      }
+      if (op === 'invalidate_credentials') {
+        invalidatedBefore = true;
+      }
+      // S44a (US-009): the during_hold concurrency marker. An action with
+      // during_hold: true fires CONCURRENTLY with the IMMEDIATELY PRECEDING
+      // action's hold (the operator-seam actions act during a pause hold —
+      // W4.33a/W4.33b), so the preceding action must carry hold_seconds > 0
+      // and the marker cannot sit on a group's first action.
+      if (action.during_hold === true) {
+        if (sequence.length > 1) {
+          errors.push(`${actionLabel} (op ${JSON.stringify(op ?? null)}): during_hold is a single-run corridor marker — a multi-run probe_sequence cannot declare it`);
+        } else if (actionIndex === 0) {
+          errors.push(`${actionLabel} (op ${JSON.stringify(op ?? null)}): during_hold requires a PRECEDING action in the same run group to hold against (it cannot be a group's first action)`);
+        } else {
+          const previous = group.actions[actionIndex - 1];
+          const previousHolds = isObject(previous)
+            && typeof previous.hold_seconds === 'number' && Number.isFinite(previous.hold_seconds) && previous.hold_seconds > 0;
+          if (!previousHolds) {
+            errors.push(`${actionLabel} (op ${JSON.stringify(op ?? null)}): during_hold requires the immediately preceding action (${isObject(previous) ? `op '${String(previous.op)}'` : '???'}) to carry hold_seconds > 0 (the action fires while that hold is in progress)`);
+          }
+        }
       }
     });
   });
@@ -1062,6 +1155,39 @@ function validateChaosBlock(caseRecord) {
   return errors;
 }
 
+// S42 (US-005): semantic validator for the `arming` declaration — a case's
+// task/traceability mandates a seed/arm (reset-hook arming overlay or seeded
+// arm) and the controller must fail closed when that arming is absent at
+// execution. The schema expresses the SHAPE; this validator expresses the
+// SEMANTICS: a declared arming block must be mandatory (a non-mandatory
+// declaration carries no obligation and is a scenario error — never a
+// silently-ignored arm), must name its type, and an optional positive integer
+// count documents the expected arming magnitude (e.g. "exactly 2 pre-existing
+// red tests"). Defensive like validateProbeSequence/validateChaosBlock: it
+// tolerates structurally malformed input (schema-invalid records) so
+// --validate-only reports case-id-named reasons even when the schema already
+// rejected the record. Returns an array of error strings (empty = valid).
+function validateArmingBlock(caseRecord) {
+  const errors = [];
+  const arming = caseRecord.arming;
+  if (arming === undefined || arming === null) return errors;
+  if (!isObject(arming)) {
+    errors.push('arming must be an object (got ' + valueType(arming) + ')');
+    return errors;
+  }
+  if (arming.mandatory !== true) {
+    errors.push('arming.mandatory must be true (a declared arming block that is not mandatory is a scenario error — it would carry no fail-closed obligation and silently produce vacuous verdicts)');
+  }
+  if (!(typeof arming.type === 'string' && arming.type.length > 0)) {
+    errors.push('arming.type must be a non-empty string (the arming the case mandates, e.g. red-baseline)');
+  }
+  if (arming.count !== undefined
+      && (!Number.isSafeInteger(arming.count) || arming.count < 1)) {
+    errors.push('arming.count must be a positive integer when declared (the expected arming magnitude, e.g. 2 pre-existing red tests)');
+  }
+  return errors;
+}
+
 function loadSchema() {
   try {
     return JSON.parse(fs.readFileSync(SCHEMA_PATH, 'utf8'));
@@ -1111,6 +1237,14 @@ function loadManifest(manifestPath, schema, { includeSemantic = false } = {}) {
       // multi-run + chaos combination, local-case chaos) as case-id-named
       // reasons; the campaign paths fail closed per-case via chaosGuard.
       for (const error of validateChaosBlock(record)) {
+        errors.push(`line ${lineNumber}: case ${JSON.stringify(record.id)}: ${error}`);
+      }
+      // S42 (US-005): arming declaration semantic validation rides the same
+      // gate — a declared-but-not-mandatory or typeless arming block is a
+      // scenario error (it would silently carry no fail-closed obligation);
+      // the campaign paths fail closed per-case at terminal via the
+      // armAbsentGate branch in executeWorkflowCase.
+      for (const error of validateArmingBlock(record)) {
         errors.push(`line ${lineNumber}: case ${JSON.stringify(record.id)}: ${error}`);
       }
     }
@@ -2283,6 +2417,17 @@ function markTerminal(state, caseState, campaignDir, outcome, reason) {
     terminal_at: timestamp,
     ...(reason === undefined ? {} : { reason }),
   });
+  // S43c (US-008): classification precedence — TEST_INFRA_FAIL infrastructure
+  // classifications take precedence over RUNAWAY cap findings on the same
+  // case (campaign-20260826T225744158Z: W4.dsh-bfmw's state.json classified
+  // chaos-invocation-failed while the run's wall_min cap breach filed a
+  // standalone RUNAWAY finding). When the authoritative classification is
+  // TEST_INFRA_FAIL, any RUNAWAY finding filed while the run was in flight is
+  // a DOWNSTREAM ARTIFACT of the infra failure and is marked subsumed with
+  // the subsuming classification — state.json's findings never contradict the
+  // authoritative verdict (the report layer renders them in SUBSUMED FINDINGS,
+  // never as standalone FINDINGS). Idempotent; never removes evidence.
+  subsumeRunawayFindings(caseState, outcome, reason);
   applyCaseTeardown(state, caseState, outcome);
   state.updated_at = timestamp;
   atomicWriteState(campaignDir, state);
@@ -5576,10 +5721,14 @@ async function monitorWorkflowRun(caseRecord, caseState, attempt, childEnv, stat
 // recorded as an explicit deferral on the attempt (attempt.probe_sequence_
 // deferred), never silently skipped.
 
-// Map a probe op to the exact `tamandua workflow` argv executed under the
-// contained spawn env. Ops the single-run sequencer cannot execute (daemon
-// lifecycle restart_daemon, harness injection sigstop_sigcont — the latter is
-// the chaos-block operator's verb, US-008) return null and fail closed.
+// Map a probe op to the exact `tamandua` argv executed under the contained
+// spawn env. Ops the single-run sequencer cannot execute (daemon lifecycle
+// restart_daemon, harness injection sigstop_sigcont — the latter is the
+// chaos-block operator's verb, US-008) return null and fail closed. The S44a
+// operator-seam ops without a plain argv (restart_contained_daemon,
+// invalidate_credentials, restore_credentials — OPERATOR_SEAM_OPS) also return
+// null; executeProbeAction dispatches them to their dedicated CONTAINED
+// execution paths instead of failing.
 function probeActionArgv(op, runId) {
   switch (op) {
     case 'pause': return ['workflow', 'pause', runId];
@@ -5587,6 +5736,13 @@ function probeActionArgv(op, runId) {
     case 'resume': return ['workflow', 'resume', runId];
     case 'cancel': return ['workflow', 'cancel', runId];
     case 'fail_force': return ['workflow', 'fail', runId, '--reason', 'torture-test probe fail_force', '--force'];
+    // S44a (US-009): the W4.33b operator command — `tamandua update --force`
+    // under the contained spawn env (spawnSync adds the 'tamandua' binary and
+    // the evidence record renders the full ['tamandua','update','--force']).
+    // executeProbeAction gates the resolved binary on containment (a tamandua
+    // resolving outside torture-test/var is refused — the operator's live
+    // checkout is never updated).
+    case 'update_contained_install': return ['update', '--force'];
     default: return null;
   }
 }
@@ -5855,18 +6011,144 @@ function boundedOutputTail(rawOutput, maxBytes) {
   return { text: sliced.toString('utf8'), truncated: true };
 }
 
-// Execute ONE probe action: arm → CLI action (contained spawn env) → optional
-// hold → observed effect. Returns the per-action evidence record with an `ok`
-// flag; a CLI failure carries the distinct 'probe-action-failed' failure
-// (op + exit code + bounded stdout/stderr tails) so the caller classifies
-// TEST_INFRA_FAIL with the CLI's real output instead of discarding it.
-async function executeProbeAction(action, runId, attempt, childEnv) {
+// ── S44a (US-009): operator-seam action helpers ────────────────────
+// The operator-seam actions (restart_contained_daemon, update_contained_
+// install, invalidate_credentials, restore_credentials) execute mid-run
+// operator choreography the W4.10/W4.48a/W4.33a/W4.33b/W4.47 premises depend
+// on. CONTAINMENT ABSOLUTES: they operate EXCLUSIVELY on contained homes/
+// daemons (daemon-control provenance-gated restarts; the contained home's
+// .pi copy; a tamandua binary resolving inside torture-test/var) — NEVER the
+// operator's live daemon (33xx), real ~/.pi or ~/.dsh. Every action records
+// per-action evidence (op, argv, exit code, observed effect, timestamps) and
+// FAILS CLOSED with a distinct category naming the action when it cannot be
+// performed; a containment-escape attempt is refused with the distinct
+// category 'operator-action-escape-refused' before anything is executed.
+
+// Resolve an executable by NAME against a PATH string (the first executable
+// regular file wins — mirrors `command -v`). Returns the candidate path (not
+// yet realpathed) or null. Used by update_contained_install to resolve the
+// `tamandua` the operator command would execute, so the action can refuse an
+// uncontained binary BEFORE spawning it.
+function resolveExecutableFromPath(name, pathValue) {
+  if (typeof pathValue !== 'string' || pathValue === '') return null;
+  for (const dir of pathValue.split(':')) {
+    if (dir === '') continue;
+    const candidate = path.join(dir, name);
+    try {
+      const details = fs.statSync(candidate);
+      if (details.isFile() && !details.isSymbolicLink()) {
+        fs.accessSync(candidate, fs.constants.X_OK);
+        return candidate;
+      }
+    } catch {
+      // Keep searching — an unreadable/absent entry is not the resolution.
+    }
+  }
+  return null;
+}
+
+// Realpath an existing path (null on any failure — callers treat an
+// unresolvable path as fail-closed, never a silent pass).
+function realpathOrNull(candidate) {
+  try {
+    return fs.realpathSync(candidate);
+  } catch {
+    return null;
+  }
+}
+
+// Read the contained install's catalog stamp (<stateDir>/workflows/
+// .catalog-version.json) as the update_contained_install observed effect —
+// the stamp the product's staleness checks compare. Defensive: absent/
+// malformed stamp => null (evidence, never a crash). The stamp path is
+// containment-checked (a state dir escaping var can never be read).
+function readCatalogStamp(stateDir) {
+  if (typeof stateDir !== 'string' || stateDir === '' || !path.isAbsolute(stateDir)) return null;
+  const stampPath = path.join(stateDir, 'workflows', '.catalog-version.json');
+  if (!pathIsWithin(fs.realpathSync(TT_ROOT), stampPath)) return null;
+  try {
+    const details = fs.lstatSync(stampPath);
+    if (!details.isFile() || details.isSymbolicLink()) return null;
+    const raw = JSON.parse(fs.readFileSync(stampPath, 'utf8'));
+    return isObject(raw) ? raw : null;
+  } catch {
+    return null;
+  }
+}
+
+function sha256OfBuffer(buffer) {
+  return createHash('sha256').update(buffer).digest('hex');
+}
+
+// S44a: the credential target for the invalidate/restore actions — the
+// CONTAINED home's pi credential copy (never the real ~/.pi). Resolution
+// fails closed on any escape vector:
+//   * the target must be strictly inside torture-test/var (belt-and-suspenders
+//     below assertContainedSpawnEnv — a tampered childEnv can never redirect
+//     the write at the operator's real ~/.pi);
+//   * a SYMLINK target is REFUSED (category 'operator-action-escape-refused'):
+//     a contained-home auth.json symlinked at the real ~/.pi/agent/auth.json
+//     is the classic escape — writing "through" it would corrupt the operator's
+//     real credential file. The contained copy must be a regular file.
+// Returns { path, realPath } on success; throws nothing — returns
+// { refusal: { category, reason } } on an escape.
+function resolveCredentialTarget(home) {
+  const varReal = fs.realpathSync(VAR_ROOT);
+  const homeReal = realpathOrNull(home);
+  if (homeReal === null || !pathIsWithin(varReal, homeReal)) {
+    return { refusal: { category: 'operator-action-escape-refused', reason: `credential home ${home} is not strictly inside torture-test/var` } };
+  }
+  const target = path.join(home, '.pi', 'agent', 'auth.json');
+  const targetReal = realpathOrNull(target);
+  if (targetReal !== null && !pathIsWithin(varReal, targetReal)) {
+    return { refusal: { category: 'operator-action-escape-refused', reason: `credential target ${target} resolves to ${targetReal}, which escapes torture-test/var (a real-home symlink vector) — refusing to write through it` } };
+  }
+  let details;
+  try {
+    details = fs.lstatSync(target);
+  } catch (error) {
+    return { path: target, realPath: targetReal, missing: true, error: error.message };
+  }
+  if (details.isSymbolicLink()) {
+    return { refusal: { category: 'operator-action-escape-refused', reason: `credential target ${target} is a symlink — a real-home escape vector; refusing to write through it` } };
+  }
+  if (!details.isFile()) {
+    return { path: target, realPath: targetReal, notFile: true };
+  }
+  return { path: target, realPath: targetReal };
+}
+
+// The invalid token the invalidate_credentials action writes in place of the
+// contained auth.json — a provider-agnostic marker pi cannot use as a real
+// credential (the W4.47 corridor's diagnosable-auth-failure premise).
+function invalidCredentialPayload() {
+  return `${JSON.stringify({ 'torture-test-invalidated': true, invalidated_at: utcTimestamp(), note: 'credential invalidated by the torture-test operator-seam invalidate_credentials action' }, null, 2)}\n`;
+}
+
+// Execute ONE probe action: arm → contained action (CLI spawn / daemon
+// restart / credential file op) → optional hold → observed effect. Returns the
+// per-action evidence record with an `ok` flag; a CLI failure carries the
+// distinct 'probe-action-failed' failure (op + exit code + bounded
+// stdout/stderr tails) so the caller classifies TEST_INFRA_FAIL with the
+// CLI's real output instead of discarding it. S44a (US-009): the operator-seam
+// ops dispatch to dedicated CONTAINED paths (daemon-control restart, contained
+// .pi credential ops, gated `tamandua update --force`) with their own distinct
+// fail-closed categories naming the action.
+//
+// holdAsPending (S44a): when true and the action carries hold_seconds, the
+// hold runs as a BACKGROUND promise (the sequencer's during_hold corridor —
+// the NEXT action fires concurrently with this hold); the returned record
+// carries `pending_hold` (the promise) and `effect` is observed when the hold
+// resolves. The normal path (holdAsPending false) awaits the hold inline —
+// behavior unchanged for every pre-S44a shape.
+async function executeProbeAction(action, runId, attempt, childEnv, holdAsPending = false) {
   const op = action.op;
   const trigger = action.when;
   const record = {
     op,
     trigger,
     run_ordinal: action.run_ordinal,
+    during_hold: action.during_hold === true ? true : null,
     armed_at: null,
     action_started_at: null,
     action_ended_at: null,
@@ -5880,9 +6162,21 @@ async function executeProbeAction(action, runId, attempt, childEnv) {
     hold_started_at: null,
     hold_ended_at: null,
     effect: null,
+    // S44a per-action evidence fields (null unless the op fills them):
+    kind: null,
+    provenance: null,
+    path_invariant: null,
+    state_dir: null,
+    binary_path: null,
+    catalog_version_before: null,
+    catalog_version_after: null,
+    target_path: null,
+    backup_path: null,
+    target_sha256_before: null,
+    target_sha256_after: null,
   };
   const argv = probeActionArgv(op, runId);
-  if (argv === null) {
+  if (argv === null && !OPERATOR_SEAM_OPS.has(op)) {
     const failure = {
       category: 'probe-action-failed',
       message: `probe op '${op}' is not supported by the single-run probe sequencer (US-006); daemon-lifecycle and harness-injection ops are multi-run / chaos capabilities`,
@@ -5906,6 +6200,296 @@ async function executeProbeAction(action, runId, attempt, childEnv) {
   }
 
   assertContainedSpawnEnv(childEnv);
+
+  // ── S44a: restart_contained_daemon — restart the CONTAINED daemon via
+  // bin/daemon-control (kind real for the 43xx CLI / scripted for 53xx), the
+  // ONLY sanctioned daemon-lifecycle path. daemon-control applies its own
+  // production + containment guards and recorded-provenance identity checks
+  // before any signal; the controller re-asserts the adapters-bin PATH
+  // invariant on the restarted daemon (executeDaemonRestart). A failure is
+  // NEVER silent: it classifies TEST_INFRA_FAIL with the distinct category
+  // 'restart-contained-daemon-failed' (or the more specific
+  // 'daemon-path-invariant-violated') naming the action + exit code.
+  if (op === 'restart_contained_daemon') {
+    const kind = attempt.execution_mode === 'scripted' ? 'scripted' : 'real';
+    record.kind = kind;
+    const execution = await executeDaemonRestart(kind, childEnv);
+    Object.assign(record, execution.record);
+    record.kind = kind;
+    if (!execution.ok) {
+      const pathViolation = execution.record.path_invariant?.ok === false;
+      const failure = {
+        category: pathViolation ? 'daemon-path-invariant-violated' : 'restart-contained-daemon-failed',
+        message: pathViolation
+          ? execution.record.path_invariant.message
+          : `probe action 'restart_contained_daemon' (daemon-control ${kind} restart) exited ${record.exit_code}${record.error !== null ? `: ${record.error}` : ''}`,
+        op,
+        kind,
+        exit_code: record.exit_code,
+        signal: record.signal ?? null,
+        error: record.error ?? null,
+        argv: record.argv,
+        ...(pathViolation ? { path_invariant: execution.record.path_invariant } : {}),
+      };
+      return { ...record, ok: false, failure };
+    }
+    record.effect = observeProbeEffect(runId, childEnv, record.action_started_at);
+    return { ...record, ok: true, pending_hold: null };
+  }
+
+  // ── S44a: invalidate_credentials / restore_credentials — replace/restore
+  // the CONTAINED home's .pi/agent/auth.json (never the real ~/.pi). The
+  // target resolution refuses symlink/escaping targets (operator-action-
+  // escape-refused) and a missing/unreadable credential file fails closed
+  // with the distinct per-action category. The invalidate backs the original
+  // up beside it (auth.json.tt-invalidated) and the restore consumes that
+  // backup, so the corridor is a clean state machine: invalidate → restore →
+  // invalidate → ... A second invalidate while a backup is pending fails
+  // closed (restore must run first — the first backup is authoritative).
+  if (op === 'invalidate_credentials' || op === 'restore_credentials') {
+    const home = childEnv.HOME;
+    assertContainedHome(home, VAR_ROOT, `credential op '${op}' contained home`);
+    const resolved = resolveCredentialTarget(home);
+    if (resolved.refusal !== undefined) {
+      return {
+        ...record,
+        ok: false,
+        failure: {
+          category: resolved.refusal.category,
+          message: `probe action '${op}' refused: ${resolved.refusal.reason}`,
+          op,
+          reason: resolved.refusal.reason,
+          target_path: path.join(home, '.pi', 'agent', 'auth.json'),
+        },
+      };
+    }
+    const target = resolved.path;
+    record.target_path = target;
+    const backupPath = path.join(home, '.pi', 'agent', CREDENTIAL_BACKUP_FILENAME);
+    record.action_started_at = utcTimestamp();
+    // The file operations are wrapped so an fs failure (unreadable credential
+    // file, read-only directory, IO error) fails closed with the DISTINCT
+    // per-action category + the real error message — never a bare throw that
+    // loses the action's evidence record.
+    try {
+      if (op === 'invalidate_credentials') {
+        if (resolved.missing === true) {
+          record.action_ended_at = utcTimestamp();
+          return {
+            ...record,
+            ok: false,
+            failure: {
+              category: 'invalidate-credentials-failed',
+              message: `probe action 'invalidate_credentials' cannot read the contained credential file ${target}: ${resolved.error ?? 'missing'} — there is no credential to invalidate`,
+              op,
+              target_path: target,
+              reason: 'unreadable-credential-file',
+            },
+          };
+        }
+        if (resolved.notFile === true) {
+          record.action_ended_at = utcTimestamp();
+          return {
+            ...record,
+            ok: false,
+            failure: {
+              category: 'invalidate-credentials-failed',
+              message: `probe action 'invalidate_credentials' target ${target} is not a regular file — refusing to invalidate`,
+              op,
+              target_path: target,
+              reason: 'not-a-regular-file',
+            },
+          };
+        }
+        if (fs.existsSync(backupPath)) {
+          record.action_ended_at = utcTimestamp();
+          return {
+            ...record,
+            ok: false,
+            failure: {
+              category: 'invalidate-credentials-failed',
+              message: `probe action 'invalidate_credentials' found a pending backup at ${backupPath} — a prior invalidate was never restored; run restore_credentials first (the first backup is authoritative)`,
+              op,
+              target_path: target,
+              backup_path: backupPath,
+              reason: 'prior-invalidate-pending',
+            },
+          };
+        }
+        const original = fs.readFileSync(target);
+        record.target_sha256_before = sha256OfBuffer(original);
+        fs.copyFileSync(target, backupPath, fs.constants.COPYFILE_EXCL);
+        fs.writeFileSync(target, invalidCredentialPayload(), { mode: 0o600 });
+        record.action_ended_at = utcTimestamp();
+        record.backup_path = backupPath;
+        record.target_sha256_after = sha256OfBuffer(fs.readFileSync(target));
+        record.effect = {
+          invalidated_at: record.action_ended_at,
+          target_path: target,
+          backup_path: backupPath,
+          backup_created: true,
+          bytes_before: original.length,
+          bytes_after: fs.statSync(target).size,
+          restored: false,
+        };
+        return { ...record, ok: true, pending_hold: null };
+      }
+      // restore_credentials
+      let backupInfo;
+      try {
+        backupInfo = fs.lstatSync(backupPath);
+      } catch (error) {
+        record.action_ended_at = utcTimestamp();
+        return {
+          ...record,
+          ok: false,
+          failure: {
+            category: 'restore-credentials-failed',
+            message: `probe action 'restore_credentials' found no backup at ${backupPath} to restore from: ${error.message}`,
+            op,
+            target_path: target,
+            backup_path: backupPath,
+            reason: 'no-backup',
+          },
+        };
+      }
+      if (!backupInfo.isFile() || backupInfo.isSymbolicLink()
+          || !pathIsWithin(fs.realpathSync(TT_ROOT), path.resolve(backupPath))) {
+        record.action_ended_at = utcTimestamp();
+        return {
+          ...record,
+          ok: false,
+          failure: {
+            category: 'restore-credentials-failed',
+            message: `probe action 'restore_credentials' backup ${backupPath} is not a contained regular file — refusing to restore from it`,
+            op,
+            target_path: target,
+            backup_path: backupPath,
+            reason: 'invalid-backup',
+          },
+        };
+      }
+      const backupBytes = fs.readFileSync(backupPath);
+      fs.copyFileSync(backupPath, target);
+      fs.rmSync(backupPath, { force: true });
+      record.action_ended_at = utcTimestamp();
+      record.backup_path = backupPath;
+      record.target_sha256_before = sha256OfBuffer(backupBytes);
+      record.target_sha256_after = sha256OfBuffer(fs.readFileSync(target));
+      record.effect = {
+        restored_at: record.action_ended_at,
+        target_path: target,
+        backup_path: backupPath,
+        backup_removed: true,
+        bytes_restored: backupBytes.length,
+        restored: true,
+      };
+      return { ...record, ok: true, pending_hold: null };
+    } catch (error) {
+      record.action_ended_at = utcTimestamp();
+      return {
+        ...record,
+        ok: false,
+        failure: {
+          category: op === 'invalidate_credentials' ? 'invalidate-credentials-failed' : 'restore-credentials-failed',
+          message: `probe action '${op}' could not be performed: ${error.message}`,
+          op,
+          target_path: target,
+          backup_path: backupPath,
+          error: error.message,
+          reason: 'credential-file-operation-failed',
+        },
+      };
+    }
+  }
+
+  // ── S44a: update_contained_install — `tamandua update --force` against the
+  // CONTAINED install. Containment resolution gate: the contained state dir
+  // (the install's state) must resolve strictly inside torture-test/var, and
+  // the `tamandua` binary the command would execute must ALSO resolve inside
+  // var (a stub/contained install). A binary resolving outside var (the
+  // operator's live checkout) is REFUSED with the distinct
+  // 'operator-action-escape-refused' category BEFORE any spawn — the
+  // operator's live checkout is never updated. The observed effect records
+  // the contained catalog stamp before/after the update.
+  if (op === 'update_contained_install') {
+    const stateDir = typeof childEnv.TAMANDUA_STATE_DIR === 'string' && childEnv.TAMANDUA_STATE_DIR !== ''
+      ? childEnv.TAMANDUA_STATE_DIR
+      : null;
+    record.state_dir = stateDir === null ? null : path.resolve(stateDir);
+    const resolvedBinary = resolveExecutableFromPath('tamandua', childEnv.PATH);
+    const binaryReal = resolvedBinary === null ? null : realpathOrNull(resolvedBinary);
+    record.binary_path = resolvedBinary;
+    const stateContained = stateDir !== null && path.isAbsolute(stateDir)
+      && pathIsWithin(fs.realpathSync(TT_ROOT), path.resolve(stateDir));
+    if (!stateContained) {
+      return {
+        ...record,
+        ok: false,
+        failure: {
+          category: 'update-contained-install-failed',
+          message: `probe action 'update_contained_install' cannot resolve a contained install state dir (TAMANDUA_STATE_DIR ${JSON.stringify(stateDir)}) — refusing to update an uncontained install`,
+          op,
+          state_dir: record.state_dir,
+          reason: 'unresolved-contained-state-dir',
+        },
+      };
+    }
+    if (binaryReal === null || !pathIsWithin(fs.realpathSync(TT_ROOT), binaryReal)) {
+      return {
+        ...record,
+        ok: false,
+        failure: {
+          category: 'operator-action-escape-refused',
+          message: `probe action 'update_contained_install' resolves tamandua to ${resolvedBinary ?? '(not found on the contained PATH)'} (realpath ${binaryReal ?? '(unresolvable)'}), which is NOT inside torture-test/var — refusing to update an uncontained install (the operator's live checkout is never touched)`,
+          op,
+          binary_path: resolvedBinary,
+          state_dir: record.state_dir,
+          reason: 'uncontained-install-target',
+        },
+      };
+    }
+    record.catalog_version_before = readCatalogStamp(record.state_dir);
+    record.action_started_at = utcTimestamp();
+    const result = spawnSync('tamandua', argv, {
+      cwd: fs.realpathSync(TT_ROOT),
+      env: childEnv,
+      encoding: 'utf8',
+      maxBuffer: 1024 * 1024,
+      shell: false,
+    });
+    record.action_ended_at = utcTimestamp();
+    record.argv = ['tamandua', ...argv];
+    record.exit_code = result.status;
+    record.signal = result.signal;
+    if (result.error !== undefined) record.error = result.error.message;
+    record.stdout_tail = boundedOutputTail(result.stdout, PROBE_OUTPUT_TAIL_MAX_BYTES);
+    record.stderr_tail = boundedOutputTail(result.stderr, PROBE_OUTPUT_TAIL_MAX_BYTES);
+    record.catalog_version_after = readCatalogStamp(record.state_dir);
+    if (result.error !== undefined || result.status !== 0) {
+      const failure = {
+        category: 'update-contained-install-failed',
+        message: `probe action 'update_contained_install' exited ${result.status}${record.error !== null ? `: ${record.error}` : ''}`,
+        op,
+        exit_code: result.status,
+        signal: result.signal ?? null,
+        error: record.error ?? null,
+        argv: record.argv,
+        stdout_tail: record.stdout_tail,
+        stderr_tail: record.stderr_tail,
+      };
+      return { ...record, ok: false, failure };
+    }
+    record.effect = {
+      state_dir: record.state_dir,
+      catalog_version_before: record.catalog_version_before,
+      catalog_version_after: record.catalog_version_after,
+    };
+    return { ...record, ok: true, pending_hold: null };
+  }
+
+  // ── Plain `tamandua` CLI actions (pause/resume/cancel/fail_force/
+  // pause_drain) — the pre-S44a engine, unchanged.
   record.action_started_at = utcTimestamp();
   const result = spawnSync('tamandua', argv, {
     cwd: fs.realpathSync(TT_ROOT),
@@ -5942,12 +6526,29 @@ async function executeProbeAction(action, runId, attempt, childEnv) {
 
   if (record.hold_seconds !== null && record.hold_seconds > 0) {
     record.hold_started_at = utcTimestamp();
+    if (holdAsPending) {
+      // S44a during_hold corridor: the hold runs in the background so the
+      // NEXT action (declared during_hold) fires concurrently with it. The
+      // hold promise resolves the hold_ended_at + observes the effect (the
+      // full hold window's event excerpt) when the hold completes; the
+      // sequencer awaits it before the next non-during-hold action and
+      // re-persists the completed holder record. The RECORD OBJECT ITSELF is
+      // returned (not a spread copy) so the promise's mutations land on the
+      // same object the sequencer pushed into evidence.actions.
+      const pendingHold = delay(record.hold_seconds * 1000).then(() => {
+        record.hold_ended_at = utcTimestamp();
+        record.effect = observeProbeEffect(runId, childEnv, record.action_started_at);
+      });
+      record.ok = true;
+      record.pending_hold = pendingHold;
+      return record;
+    }
     await delay(record.hold_seconds * 1000);
     record.hold_ended_at = utcTimestamp();
   }
 
   record.effect = observeProbeEffect(runId, childEnv, record.action_started_at);
-  return { ...record, ok: true };
+  return { ...record, ok: true, pending_hold: null };
 }
 
 function writeProbeEvidenceArtifact(campaignDir, attempt, evidence) {
@@ -6053,17 +6654,45 @@ async function runDeclaredProbeSequence(caseRecord, caseState, attempt, childEnv
   state.updated_at = evidence.started_at;
   atomicWriteState(campaignDir, state);
 
-  for (const [index, action] of group.actions.entries()) {
+  // The during_hold corridor (S44a): a hold-capable action whose FOLLOWING
+  // action declares during_hold runs its hold in the background (pending_hold)
+  // so the during_hold action fires CONCURRENTLY with it — the W4.33a/W4.33b
+  // "operator acts during the pause hold" shape. The holder's hold_ended_at +
+  // observed effect are completed when the promise resolves; the sequencer
+  // awaits + re-persists before the next NON-during-hold action and at the end
+  // of the loop, so the durable evidence never carries a half-finished holder.
+  let pendingHold = null;
+  for (let index = 0; index < group.actions.length; index += 1) {
+    const action = group.actions[index];
+    const isDuringHold = action.during_hold === true;
+    if (!isDuringHold && pendingHold !== null) {
+      await pendingHold;
+      pendingHold = null;
+      attempt.probe_evidence = evidence;
+      state.updated_at = utcTimestamp();
+      atomicWriteState(campaignDir, state);
+    }
+    const nextIsDuringHold = group.actions[index + 1]?.during_hold === true;
     const result = await executeProbeAction(
       { ...action, run_ordinal: group.run },
       runId,
       attempt,
       childEnv,
+      nextIsDuringHold,
     );
+    // The pending_hold promise is sequencer plumbing — capture it, then strip
+    // it from the record BEFORE it is persisted (a Promise would serialize as
+    // {} in the evidence). The record OBJECT ITSELF is pushed (not a spread
+    // copy): the holdAsPending holder's promise mutates that same object when
+    // the hold resolves, so the durable evidence carries the completed holder
+    // record.
+    const pendingHoldFromAction = result.pending_hold ?? null;
+    if (Object.hasOwn(result, 'pending_hold')) delete result.pending_hold;
     evidence.actions.push(result);
     attempt.probe_evidence = evidence;
     state.updated_at = utcTimestamp();
     atomicWriteState(campaignDir, state);
+    if (pendingHoldFromAction !== null) pendingHold = pendingHoldFromAction;
     if (!result.ok) {
       evidence.sequence_outcome = 'failed';
       evidence.ended_at = utcTimestamp();
@@ -6079,8 +6708,16 @@ async function runDeclaredProbeSequence(caseRecord, caseState, attempt, childEnv
       // attempt.terminal_at and returns {swept:true} on its next poll, and the
       // blocking launch hook (workflow run --wait) unblocks once the run is
       // stopped. probe-trigger-unreached is deliberately NOT terminated here —
-      // that path already waits out the run/deadline by design.
-      if (result.failure.category === 'probe-action-failed') {
+      // that path already waits out the run/deadline by design. S44a (US-009):
+      // the operator-seam action failures terminate identically (the action
+      // could not be performed — never a silent vacuous verdict).
+      if (PROBE_ACTION_TERMINAL_CATEGORIES.has(result.failure.category)) {
+        // Complete any pending hold first so the holder record's evidence is
+        // durable before the terminal write.
+        if (pendingHold !== null) {
+          await pendingHold;
+          pendingHold = null;
+        }
         // Capture the run's status AT FAILURE TIME (best-effort, contained
         // spawn) so the terminal record carries a terminal_status consistent
         // with terminal_at — the oracle context's attempt projections require
@@ -6094,7 +6731,7 @@ async function runDeclaredProbeSequence(caseRecord, caseState, attempt, childEnv
         attempt.terminal_at = utcTimestamp();
         attempt.terminal_status = failureStatus?.status ?? attempt.terminal_status ?? 'unknown';
         persistMechanicalOutcome(caseState, attempt, state, campaignDir, 'TEST_INFRA_FAIL', {
-          category: 'probe-action-failed',
+          category: result.failure.category,
           ...result.failure,
           action_index: index,
           stop: evidence.run_stop,
@@ -6103,6 +6740,16 @@ async function runDeclaredProbeSequence(caseRecord, caseState, attempt, childEnv
       writeProbeEvidenceArtifact(campaignDir, attempt, evidence);
       return { ok: false, reason: evidence.failure };
     }
+  }
+  // Complete any hold left pending by the final action (a trailing
+  // during_hold corridor is legal — the holder completes after the last
+  // action) so the durable evidence carries the holder's hold_ended_at +
+  // observed effect.
+  if (pendingHold !== null) {
+    await pendingHold;
+    attempt.probe_evidence = evidence;
+    state.updated_at = utcTimestamp();
+    atomicWriteState(campaignDir, state);
   }
 
   evidence.sequence_outcome = 'completed';
@@ -6851,7 +7498,7 @@ async function observeRestartRecovery(runId, runProxy, childEnv, restartEndedAt,
 // (start/end timestamps, argv, exit code/signal/error, recorded daemon
 // provenance) with `ok`; the caller composes the full restart action record
 // (armed_at, run_ordinal, hold_seconds) around it so those fields survive.
-function executeDaemonRestart(kind, childEnv) {
+async function executeDaemonRestart(kind, childEnv) {
   assertContainedSpawnEnv(childEnv);
   const record = {
     action_started_at: utcTimestamp(),
@@ -6870,12 +7517,38 @@ function executeDaemonRestart(kind, childEnv) {
   record.provenance = readDaemonProvenance(kind, childEnv);
   const argv = [DAEMON_CONTROL_PATH, kind, 'restart'];
   record.argv = argv;
-  const result = spawnSync(DAEMON_CONTROL_PATH, [kind, 'restart'], {
-    cwd: TT_ROOT,
-    env: childEnv,
-    encoding: 'utf8',
-    maxBuffer: 1024 * 1024,
-    shell: false,
+  // S44b (US-010): the daemon-control restart is spawned ASYNC (never
+  // spawnSync). A restart of a live contained daemon legitimately takes
+  // 15-20s (graceful stop port poll + escalation + start), and a blocking
+  // spawnSync would freeze the ENTIRE event loop for that window — starving
+  // the concurrent chaos runner's marker poll. In the W4.10/W4.48a
+  // kill-daemon-then-restart corridor both the chaos (SIGKILL) and the
+  // restart arm on the SAME step marker; a starved chaos poll misses the
+  // original running window and fires LATE — after the restart — SIGKILLing
+  // the freshly-restarted daemon (the campaign stall: chaos log
+  // `phase_wait marker_satisfied` 20s after the first marker). With the
+  // async spawn the event loop stays live: the chaos fires its SIGKILL
+  // during the restart's stop phase (the daemon is alive when SIGKILLed, so
+  // chaos evidence records `fired`), the restart's start phase brings the
+  // daemon back, and the contained run recovers.
+  const result = await new Promise((resolve) => {
+    const child = spawn(DAEMON_CONTROL_PATH, [kind, 'restart'], {
+      cwd: TT_ROOT,
+      env: childEnv,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk.toString('utf8');
+      if (stdout.length > 1024 * 1024) child.kill('SIGKILL');
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString('utf8');
+      if (stderr.length > 1024 * 1024) child.kill('SIGKILL');
+    });
+    child.on('error', (error) => resolve({ status: null, signal: null, error, stdout, stderr }));
+    child.on('close', (code, signal) => resolve({ status: code, signal, error: undefined, stdout, stderr }));
   });
   record.action_ended_at = utcTimestamp();
   record.exit_code = result.status;
@@ -7037,6 +7710,20 @@ function reassertDaemonPathInvariant(kind, childEnv) {
   return result;
 }
 
+// S41 (US-004): after a per-run harvest the run proxy carries the terminal
+// snapshot the workflow-status graph must preserve for the probe-sequence
+// sibling run (the durable attempt's own steps_snapshot stays null in
+// multi-run shapes — only the proxies are harvested). Persist the snapshot
+// onto the probe-evidence runs[] record so the oracle snapshot can register
+// the sibling in workflow-status.json with honest per-run terminal evidence.
+function fillProbeRunTerminalSnapshot(runRecord, runProxy, terminalEvidence) {
+  runRecord.terminal_status = runProxy.terminal_status ?? terminalEvidence?.status ?? null;
+  runRecord.steps_snapshot = runProxy.steps_snapshot ?? null;
+  runRecord.tokens_observed = runProxy.tokens_observed ?? 0;
+  runRecord.started_at = runProxy.started_at ?? null;
+  runRecord.terminal_at = runRecord.terminal_status === null ? null : (runProxy.terminal_at ?? utcTimestamp());
+}
+
 // W3.20 shape: each run group launches, its actions fire against the contained
 // instance, the run is harvested, THEN the next group launches. Returns null on
 // success, or a fail-closed outcome ({ failure, run_ordinal } / { capStop,
@@ -7141,7 +7828,7 @@ async function executeSequentialProbeShape(caseRecord, caseState, state, campaig
     if (runRecord !== undefined) {
       runRecord.run_id = runProxy.run_id ?? runRecord.run_id;
       runRecord.run_id_source = runProxy.run_id_source ?? runRecord.run_id_source;
-      runRecord.terminal_status = runProxy.terminal_status ?? terminalEvidence?.status ?? null;
+      fillProbeRunTerminalSnapshot(runRecord, runProxy, terminalEvidence);
       runRecord.wait_exit_code = runProxy.wait_exit_code ?? null;
       persistEvidence();
     }
@@ -7205,7 +7892,7 @@ async function runConcurrentRestartProbe(jobs, restart, kind, childEnv, evidence
     };
     return { ok: false, failure, run_ordinal: 1 };
   }
-  const restartExecution = executeDaemonRestart(kind, childEnv);
+  const restartExecution = await executeDaemonRestart(kind, childEnv);
   Object.assign(restartRecord, restartExecution.record);
   if (!restartExecution.ok) {
     // S24 (US-007): a restart whose restarted daemon PATH lacks the
@@ -7491,7 +8178,7 @@ async function executeConcurrentProbeShape(caseRecord, caseState, state, campaig
     if (runRecord !== undefined) {
       runRecord.run_id = job.runProxy.run_id ?? runRecord.run_id;
       runRecord.run_id_source = job.runProxy.run_id_source ?? runRecord.run_id_source;
-      runRecord.terminal_status = job.runProxy.terminal_status ?? terminalEvidence?.status ?? null;
+      fillProbeRunTerminalSnapshot(runRecord, job.runProxy, terminalEvidence);
       runRecord.wait_exit_code = job.runProxy.wait_exit_code ?? null;
       persistEvidence();
     }
@@ -7509,6 +8196,53 @@ async function executeConcurrentProbeShape(caseRecord, caseState, state, campaig
     }
   }
   return null;
+}
+
+// S41 (US-004): register every non-primary probe-sequence sibling run (from
+// the probe-evidence runs[] records, which now carry the per-run terminal
+// snapshot) in state.discovered_runs so the oracle context, the o1_wave
+// projection, the terminal oracle snapshot's discoveredRuns input, and the
+// reporter all audit the sibling — the campaign voided O1/O2/O11 because
+// run-2621299f (W4.10-restart-recovery's second run) existed ONLY in the
+// probe-evidence artifact and nowhere in the captured graph. Idempotent:
+// runs already registered (or equal to the root attempt's run id) are
+// skipped; run ids that never resolved are skipped (the case fails closed
+// upstream on workflow-run-identification before this point).
+function registerProbeSiblingRuns(caseRecord, caseState, state, campaignDir, attempt, evidence) {
+  state.discovered_runs ??= [];
+  const existing = new Set(state.discovered_runs.map((run) => run.run_id).filter(Boolean));
+  const rootRunId = attempt.run_id;
+  let changed = false;
+  for (const run of evidence.runs ?? []) {
+    const runId = typeof run?.run_id === 'string' && run.run_id.length > 0 ? run.run_id : null;
+    if (runId === null || runId === rootRunId || existing.has(runId)) continue;
+    const startedAt = run.started_at ?? attempt.started_at;
+    const terminalStatus = run.terminal_status ?? null;
+    state.discovered_runs.push({
+      id: `discovered-${runId.slice(4)}`,
+      case_id: caseState.id,
+      kind: 'discovered-workflow',
+      phase: 'terminal',
+      execution_mode: attempt.execution_mode ?? 'real',
+      run_id: runId,
+      parent_run_id: rootRunId,
+      root_case_id: caseState.id,
+      discovered_at: utcTimestamp(),
+      started_at: startedAt,
+      terminal_at: terminalStatus === null ? null : (run.terminal_at ?? utcTimestamp()),
+      terminal_status: terminalStatus,
+      tokens_observed: run.tokens_observed ?? 0,
+      token_observations: [],
+      steps_snapshot: run.steps_snapshot ?? null,
+      straggler_capture: null,
+    });
+    existing.add(runId);
+    changed = true;
+  }
+  if (changed) {
+    state.updated_at = utcTimestamp();
+    atomicWriteState(campaignDir, state);
+  }
 }
 
 // Top-level multi-launch probe orchestrator (US-007). Routes by launch shape
@@ -7635,6 +8369,21 @@ async function executeMultiRunProbeCase(caseRecord, caseState, state, campaignDi
   // whenever terminal_at is set (validateAttempt's XOR contract) — bind it to
   // the primary run's terminal status (W3.20: canceled; W3.22: completed).
   attempt.terminal_status = primaryRun?.terminal_status ?? null;
+  // S41 (US-004): bind the durable attempt's terminal snapshot from the
+  // primary probe run. In multi-run shapes only the per-run proxies are
+  // harvested, so the durable attempt's tokens_observed stayed 0 and its
+  // steps_snapshot stayed null — the campaign's O11 read the CONTEXT attempt
+  // projection (not the workflow-status row) and fired
+  // O11_CONTROLLER_TOTAL_MISMATCH on the root run's real spend. Copy the
+  // primary run's settled snapshot so the root projection reconciles.
+  attempt.tokens_observed = primaryRun?.tokens_observed ?? attempt.tokens_observed;
+  attempt.steps_snapshot = primaryRun?.steps_snapshot ?? attempt.steps_snapshot;
+  // S41 (US-004): register the probe-sequence sibling runs in
+  // state.discovered_runs BEFORE the oracle snapshot/context are built, so
+  // workflow-status.json, the oracle context, and the o1_wave projection all
+  // audit every probed run (the campaign's second run was invisible to the
+  // graph, voiding O1/O2/O11 with mechanical artifacts).
+  registerProbeSiblingRuns(caseRecord, caseState, state, campaignDir, attempt, evidence);
   const terminalStatuses = evidence.runs.map((run) => ({
     run_ordinal: run.run_ordinal,
     run_id: run.run_id,
@@ -8076,7 +8825,7 @@ async function executeWorkflowCase(caseRecord, caseState, state, campaignDir) {
       // the same "existing forwarding" run-scripted-scenario relies on per
       // scenario. Fail closed: a restart failure is TEST_INFRA_FAIL with the
       // distinct category, never a silent fallback to stale behaviors.
-      const daemonRestart = executeDaemonRestart('scripted', childEnv);
+      const daemonRestart = await executeDaemonRestart('scripted', childEnv);
       attempt.scripted_behaviors.daemon_restart = daemonRestart.record;
       state.updated_at = utcTimestamp();
       atomicWriteState(campaignDir, state);
@@ -8245,6 +8994,26 @@ async function executeWorkflowCase(caseRecord, caseState, state, campaignDir) {
       campaignDir,
     );
   }
+  // S39 (US-003): the post-run fail-closed arming verification runs only when
+  // the run reached terminal (harvested). A MANDATORY typed-chaos case whose
+  // declared injection never fired (chaos evidence never reached
+  // fired/completed AND the run's chaos.log carries no fired entry) must be
+  // classified TEST_INFRA_FAIL 'chaos-not-fired' below — never a vacuous
+  // verdict (see the armingReason branch).
+  const armingReason = terminalEvidence !== null
+    ? chaosNotFiredGate(caseRecord, attempt, { chaosLogPath: CHAOS_LOG_PATH, atTerminal: true })
+    : null;
+  // S42 (US-005): the post-run fail-closed SEED/ARM arming verification — a
+  // MANDATORY arming-declaring case (task/traceability mandates a seed/arm:
+  // declared reset hook or seeded arm) whose mandated arming was never
+  // performed (no arming manifest, or a manifest recording armed !== true /
+  // wrong type / wrong count — the W4.17 pre-fix shape: task promises a
+  // red-baseline reset hook that does not exist, so no arming ever happened)
+  // is classified TEST_INFRA_FAIL 'arm-absent' below — never a vacuous
+  // verdict (see the seedArmingReason branch).
+  const seedArmingReason = terminalEvidence !== null
+    ? armAbsentGate(caseRecord, attempt, { varRoot: VAR_ROOT, atTerminal: true })
+    : null;
   if (attempt.run_id_error !== undefined || attempt.run_id === undefined) {
     attempt.phase = 'terminal';
     attempt.terminal_at = utcTimestamp();
@@ -8282,6 +9051,39 @@ async function executeWorkflowCase(caseRecord, caseState, state, campaignDir) {
       timed_out: chaosResult.reason.timed_out ?? null,
       argv: chaosResult.reason.argv,
     });
+  } else if (armingReason !== null) {
+    // S39 (US-003): post-run fail-closed arming verification. A MANDATORY
+    // case that declares a TYPED tt-chaos injection block must not produce a
+    // verdict from evidence the injection was supposed to have made missing.
+    // When the run reached terminal and the chaos evidence never reached a
+    // fired/completed state (and the run's chaos.log carries no fired entry),
+    // the attempt is classified TEST_INFRA_FAIL with the DISTINCT category
+    // 'chaos-not-fired' naming the case/run/trigger — NEVER a silent vacuous
+    // verdict (campaign-20260826T225744158Z: W4.29 declared chaos:null while
+    // its task promised the drain-armed delete-tstx-row corridor, so the
+    // premise never armed and the case still produced a PRODUCT_FAIL). The
+    // existing chaos-invocation-failed branch above takes precedence (the
+    // operator was invoked and failed — the more specific classification).
+    attempt.phase = 'terminal';
+    attempt.terminal_at = utcTimestamp();
+    persistMechanicalOutcome(caseState, attempt, state, campaignDir, 'TEST_INFRA_FAIL', armingReason);
+  } else if (seedArmingReason !== null) {
+    // S42 (US-005): post-run fail-closed SEED/ARM arming verification. A
+    // MANDATORY case whose task/traceability mandates a seed/arm (declared
+    // reset hook or seeded arm) must not produce a verdict from an unarmed
+    // premise. When the run reached terminal and the mandated arming was
+    // never performed — no arming manifest, or a manifest recording
+    // armed !== true / a type or count that disagrees with the declaration
+    // (the W4.17 pre-fix shape: the task promised a red-baseline reset hook
+    // that cases/hooks/ did not contain, so the 2 pre-existing red tests
+    // were never planted and both arms were vacuous) — the attempt is
+    // classified TEST_INFRA_FAIL with the DISTINCT category 'arm-absent'
+    // naming the case/run/arming — NEVER a silent vacuous verdict. The
+    // existing reset-failed branch takes precedence (the reset hook was
+    // invoked and failed — the more specific classification).
+    attempt.phase = 'terminal';
+    attempt.terminal_at = utcTimestamp();
+    persistMechanicalOutcome(caseState, attempt, state, campaignDir, 'TEST_INFRA_FAIL', seedArmingReason);
   } else if (probeResult !== null && !probeResult.ok) {
     // E3.C US-006: a probe failure (CLI action exited non-zero / spawn error,
     // trigger never materialized, unsupported op) classifies TEST_INFRA_FAIL

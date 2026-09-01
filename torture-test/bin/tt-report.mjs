@@ -3,6 +3,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 import { OUTCOMES } from './tt-classification.mjs';
+import { isRunawayFinding, runawayFindingSubsumed } from './tt-subsumption.mjs';
 
 const REAL_HARNESSES = new Set(['pi', 'hermes', 'dsh']);
 
@@ -229,8 +230,34 @@ export function buildCampaignReport(state) {
         detected_at: state.updated_at,
       }]
     : [];
+  const subsumedFindings = rows.flatMap((row) =>
+    row.outcome === 'TEST_INFRA_FAIL'
+      ? row.findings
+          .filter((finding) => isRunawayFinding(finding))
+          .map((finding) => ({
+            case_id: row.id,
+            ...finding,
+            subsumed: true,
+            subsumed_by: {
+              outcome: 'TEST_INFRA_FAIL',
+              category: row.reason?.category ?? null,
+            },
+          }))
+      : [],
+  );
   const findings = rows.flatMap((row, index) => [
-    ...row.findings.map((finding) => ({ case_id: row.id, ...finding })),
+    ...row.findings
+      // S43c (US-008): classification precedence — TEST_INFRA_FAIL infra
+      // classifications take precedence over RUNAWAY cap findings on the
+      // same case (campaign-20260826T225744158Z: W4.dsh-bfmw classified
+      // chaos-invocation-failed while report.txt's FINDINGS rendered the
+      // run's wall_min RUNAWAY finding as if it were the cell's verdict).
+      // A RUNAWAY finding on a TEST_INFRA_FAIL case is subsumed — derived
+      // from outcome + type (never from the stored `subsumed` flag alone) so
+      // legacy evidence reconciles identically — and rendered in the
+      // SUBSUMED FINDINGS section instead of the standalone FINDINGS ledger.
+      .filter((finding) => !runawayFindingSubsumed(finding, row.outcome))
+      .map((finding) => ({ case_id: row.id, ...finding })),
     ...oracleFindings(state.cases[index]),
   ]);
   // MACP3 US-008: append the vacuous-campaign finding (when operative) so it
@@ -281,6 +308,14 @@ export function buildCampaignReport(state) {
     not_run: notRun,
     infra_failures: infraFailures,
     findings,
+    // S43c (US-008): subsumed RUNAWAY findings — the case-level RUNAWAY cap
+    // findings filed on TEST_INFRA_FAIL cells while their runs were in
+    // flight. The infra classification is the cell's ONE authoritative
+    // verdict (documented precedence: TEST_INFRA_FAIL takes precedence over
+    // RUNAWAY cap findings); these findings are preserved as evidence here
+    // and in the report's SUBSUMED FINDINGS section, never as standalone
+    // FINDINGS that read like the cell's verdict.
+    subsumed_findings: subsumedFindings,
     // FIX10 US-005: O18-style operator-identity hygiene canary — per-file
     // before/after hashes and status (UNCHANGED/CHANGED/ABSENT) plus any
     // campaign-level HYGIENE_* diffs. Hashes only, never file contents.
@@ -399,6 +434,17 @@ export function renderCampaignReport(report) {
     ...(report.findings.length === 0
       ? ['(none)']
       : report.findings.map((finding) => `- ${findingSummary(finding)}`)),
+    '',
+    // S43c (US-008): classification precedence — a RUNAWAY cap finding on a
+    // TEST_INFRA_FAIL cell is a downstream artifact of the infra failure and
+    // is rendered here, explicitly subsumed by the authoritative
+    // TEST_INFRA_FAIL classification (never a standalone FINDINGS entry that
+    // reads like the cell's verdict).
+    'SUBSUMED FINDINGS',
+    ...(report.subsumed_findings.length === 0
+      ? ['(none)']
+      : report.subsumed_findings.map((finding) =>
+          `- ${findingSummary(finding)} (subsumed by ${finding.subsumed_by.outcome} ${finding.subsumed_by.category ?? '?'})`)),
     '',
     'INFRA FAILURES',
     ...(report.infra_failures.length === 0

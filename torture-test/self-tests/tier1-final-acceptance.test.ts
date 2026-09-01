@@ -207,6 +207,16 @@ const allowed = [
   // tt-controller and tt-chaos via this module — part of the S29 authoring
   // surface alongside the two operators it wires.
   "torture-test/bin/tt-trigger-vocabulary.mjs",
+  // S42 (US-005): the fail-closed mandatory-arming gate (armAbsentGate) is
+  // imported by tt-controller — part of the S42 authoring surface alongside
+  // the W4.17 red-baseline reset hook it verifies.
+  "torture-test/bin/tt-arming.mjs",
+  // S43c (US-008): the classification-precedence module (TEST_INFRA_FAIL
+  // infra classifications take precedence over RUNAWAY cap findings on the
+  // same case) is imported by BOTH tt-controller (state.json reconciliation
+  // at markTerminal) and tt-report.mjs (SUBSUMED FINDINGS rendering) — part
+  // of the S43c authoring surface alongside the two layers it wires.
+  "torture-test/bin/tt-subsumption.mjs",
   // S30 (US-008): the catalog-install preflight seam — tt-catalog-install now
   // carries the fail-closed --verify workflow-spec leg, tt-required-workflows
   // enumerates tier2.jsonl (so tt-verdict-trap joins the required set), and

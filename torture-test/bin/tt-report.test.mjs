@@ -490,3 +490,65 @@ test('writeCampaignReports uses only persisted state and atomically replaces det
     fs.rmSync(directory, { recursive: true, force: true });
   }
 });
+
+// S43c (US-008): classification precedence — TEST_INFRA_FAIL infrastructure
+// classifications take precedence over RUNAWAY cap findings on the same case
+// (campaign-20260826T225744158Z: W4.dsh-bfmw classified chaos-invocation-
+// failed while report.txt FINDINGS rendered the run's wall_min RUNAWAY
+// finding as if it were the cell's verdict). A RUNAWAY finding on a
+// TEST_INFRA_FAIL case is SUBSUMED: excluded from the standalone FINDINGS
+// ledger, preserved in report.subsumed_findings with the subsuming
+// classification, and rendered in the SUBSUMED FINDINGS section — so the
+// report and state.json resolve to the SAME authoritative verdict.
+function runawayCaseState(id, outcome, category, threshold, runId) {
+  return caseState(id, outcome, {
+    findings: [{ type: 'RUNAWAY', cap: 'wall_min', threshold, observed: threshold + 1, run_id: runId }],
+    reason: { category },
+  });
+}
+
+test('S43c: a RUNAWAY finding on a TEST_INFRA_FAIL case is subsumed, never a standalone FINDINGS entry', () => {
+  const bfmw = runawayCaseState('W4.dsh-bfmw', 'TEST_INFRA_FAIL', 'chaos-invocation-failed', 45, 'run-c8f9df30');
+  const report = buildCampaignReport(stateWith([bfmw]));
+  assert.equal(
+    report.findings.some((finding) => finding.case_id === 'W4.dsh-bfmw' && finding.type === 'RUNAWAY'),
+    false,
+    `the TIF cell's RUNAWAY must not be a standalone finding: ${JSON.stringify(report.findings)}`,
+  );
+  assert.equal(report.subsumed_findings.length, 1);
+  const sub = report.subsumed_findings[0];
+  assert.equal(sub.case_id, 'W4.dsh-bfmw');
+  assert.equal(sub.type, 'RUNAWAY');
+  assert.equal(sub.subsumed, true);
+  assert.deepEqual(sub.subsumed_by, { outcome: 'TEST_INFRA_FAIL', category: 'chaos-invocation-failed' });
+  const text = renderCampaignReport(report);
+  assert.match(text, /SUBSUMED FINDINGS\n- W4\.dsh-bfmw: RUNAWAY - RUNAWAY \(subsumed by TEST_INFRA_FAIL chaos-invocation-failed\)/);
+  // The FINDINGS section itself must not render the standalone line.
+  const findingsSection = text.split('\nSUBSUMED FINDINGS\n')[0].split('\nFINDINGS\n')[1] ?? '';
+  assert.ok(!findingsSection.includes('W4.dsh-bfmw: RUNAWAY - RUNAWAY'), findingsSection);
+  // The infra verdict is unchanged (exit 2).
+  assert.equal(report.verdict, 'INFRA_FAILURE');
+  assert.equal(report.exit_code, 2);
+});
+
+test('S43c: non-infra outcomes keep their standalone RUNAWAY findings (AC3); legacy evidence reconciles', () => {
+  // PRODUCT_FAIL + RUNAWAY stays a standalone finding (W4.dsh-do-now shape).
+  const doNow = runawayCaseState('W4.dsh-do-now', 'PRODUCT_FAIL', 'oracle-failed', 5, 'run-ba584b54');
+  // INCONCLUSIVE (runaway-cap-enforced) + RUNAWAY stays standalone (W4.37 shape).
+  const w437 = runawayCaseState('W4.37', 'INCONCLUSIVE', 'ambiguous-evidence', 5, 'run-b3ebfd31');
+  const report = buildCampaignReport(stateWith([doNow, w437]));
+  assert.equal(report.findings.filter((finding) => finding.type === 'RUNAWAY').length, 2,
+    'non-infra cells keep their standalone RUNAWAY findings');
+  assert.equal(report.subsumed_findings.length, 0);
+  // A TEST_INFRA_FAIL cell whose RUNAWAY finding carries NO subsumed flag
+  // (legacy evidence written before the controller-side marking) reconciles
+  // identically — the report derives subsumption from outcome + type.
+  const legacy = caseState('W4.dsh-bfmw-legacy', 'TEST_INFRA_FAIL', {
+    findings: [{ type: 'RUNAWAY', cap: 'wall_min', threshold: 45, observed: 46 }],
+    reason: { category: 'probe-trigger-unreached' },
+  });
+  const legacyReport = buildCampaignReport(stateWith([legacy]));
+  assert.equal(legacyReport.subsumed_findings.length, 1);
+  assert.deepEqual(legacyReport.subsumed_findings[0].subsumed_by, { outcome: 'TEST_INFRA_FAIL', category: 'probe-trigger-unreached' });
+  assert.equal(legacyReport.findings.some((finding) => finding.type === 'RUNAWAY'), false);
+});

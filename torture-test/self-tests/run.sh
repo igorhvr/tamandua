@@ -117,6 +117,14 @@ HEAVY_CAMPAIGN_TESTS=(
     # executes its action (pause / restart_daemon) with recorded probe
     # evidence — heavy/isolated like the tier1 scripted battery.
     'tier2-s29-fired-trigger-corridor.test.ts'
+    # US-010 (S44b): tier2-s44-operator-seam-corridors drives the real
+    # controller + scripted daemon with pinned harness binaries to prove the
+    # FIVE operator-seam cells' wired actions (restart_contained_daemon on the
+    # kill-daemon cells, the during_hold restart/update on W4.33a/W4.33b, the
+    # invalidate/restore credential corridor on W4.47) provably fire at their
+    # declared triggers with per-action evidence and the contained runs
+    # recover — heavy/isolated like the tier1 scripted battery.
+    'tier2-s44-operator-seam-corridors.test.ts'
     # US-004 (S29): tier2-s29-premise-redesign-corridor drives the real
     # controller + scripted daemon with pinned harness binaries to prove the
     # REDESIGNED premise is genuinely reachable — the typed move-branch chaos

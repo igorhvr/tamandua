@@ -50,6 +50,15 @@ WORKFLOW_REAL_DB_SHM_BACKUP=""
 DISCOVERY_EVENT_ARCHIVE=""
 DISCOVERY_EVENTS_DIR=""
 DISCOVERY_EVENTS_BACKUP_DIR=""
+# S44a (US-009): the operator-seam arms mutate the CONTAINED home's
+# .pi/agent/auth.json (and back it up beside it); the pre-test bytes are
+# captured and restored in cleanup so the shared contained home stays
+# byte-identical. S44A_OUTSIDE_DIR is the /tmp (OUTSIDE-var) stub bin dir the
+# uncontained-install-target refusal arm points the contained PATH at.
+S44A_AUTH_FILE=""
+S44A_AUTH_BACKUP=""
+S44A_AUTH_BACKUP_LEFTOVER=""
+S44A_OUTSIDE_DIR=""
 # E3.C US-008: the chaos runner's stub operator appends to the shared
 # var/chaos/chaos.log (the oracle snapshot's chaos_log source); back it up
 # before the chaos fixtures and restore in cleanup so the shared file is
@@ -165,6 +174,20 @@ cleanup() {
     cp "$HOST_PROFILE_BACKUP" "$HOST_PROFILE"
   else
     rm -f -- "$HOST_PROFILE"
+  fi
+  # S44a (US-009): restore the contained credential file to its pre-test bytes
+  # and remove any invalidate backup left by a failed arm.
+  if [ -n "$S44A_AUTH_FILE" ]; then
+    rm -f -- "$S44A_AUTH_FILE" "$S44A_AUTH_FILE.tt-invalidated"
+    if [ -n "$S44A_AUTH_BACKUP" ] && [ -f "$S44A_AUTH_BACKUP" ]; then
+      cp "$S44A_AUTH_BACKUP" "$S44A_AUTH_FILE"
+    fi
+  fi
+  if [ -n "$S44A_AUTH_BACKUP_LEFTOVER" ] && [ -f "$S44A_AUTH_BACKUP_LEFTOVER" ]; then
+    rm -f -- "$S44A_AUTH_BACKUP_LEFTOVER"
+  fi
+  if [ -n "$S44A_OUTSIDE_DIR" ]; then
+    rm -rf -- "$S44A_OUTSIDE_DIR"
   fi
   rm -rf -- "$TEST_ROOT"
   if [ -n "$DANGLING_LINK" ]; then rm -f -- "$DANGLING_LINK"; fi
@@ -1790,12 +1813,14 @@ write_probe_case() {
   local manifest="$1"
   local id="$2"
   local sequence_json="$3"
-  node --input-type=module - "$manifest" "$id" "$sequence_json" <<'NODE'
+  local context_json="${4:-}"
+  node --input-type=module - "$manifest" "$id" "$sequence_json" "$context_json" <<'NODE'
 import fs from 'node:fs';
-const [manifest, id, sequenceJson] = process.argv.slice(2);
+const [manifest, id, sequenceJson, contextJson] = process.argv.slice(2);
 const record = {
   id, wave: 3, workflow: 'feature-dev-merge-worktree', fixture: 'tt-ts', harness: 'hermes',
-  task: 'tasks/W3.07.md', context: {}, caps: { tokens: 4000000, wall_min: 240 },
+  task: 'tasks/W3.07.md', context: contextJson === '' ? {} : JSON.parse(contextJson),
+  caps: { tokens: 4000000, wall_min: 240 },
   requires: {}, boundary_files: ['fixtures/tt-ts/src'], forbidden: [],
   oracles: ['TT-MISSING-O1', 'TT-MISSING-O2'], gates: ['W2'], chaos: null,
   probe_sequence: JSON.parse(sequenceJson),
@@ -2337,6 +2362,456 @@ if (!attempt.probe_evidence || attempt.probe_evidence.sequence_outcome !== 'fail
 }
 NODE
 pass "an object trigger that never fires waits its own timeout_s (no early terminal exit) and JSON-renders in the failure message"
+
+# ── S44a (US-009): operator-seam probe actions ──────────────────────
+# The controller must GENUINELY execute the four operator-seam actions the
+# W4.10/W4.48a/W4.33a/W4.33b/W4.47 premises depend on:
+#   restart_contained_daemon   — restart the CONTAINED daemon via daemon-control
+#                                (kind real for the 43xx CLI / scripted for 53xx);
+#   update_contained_install   — `tamandua update --force` against the CONTAINED
+#                                install (the binary must resolve inside var);
+#   invalidate/restore_credentials — replace/restore the CONTAINED home's
+#                                .pi/agent/auth.json (never the real ~/.pi).
+# Every action records per-action evidence (argv, exit code, observed effect,
+# timestamps) and FAILS CLOSED with a distinct category when unperformable; a
+# containment-escape attempt (real-home symlink, uncontained binary) is
+# REFUSED ('operator-action-escape-refused') before anything is executed.
+S44A_AUTH_FILE="$TT_DIR/var/home/.pi/agent/auth.json"
+mkdir -p "$(dirname "$S44A_AUTH_FILE")"
+S44A_AUTH_BACKUP="$TEST_ROOT/original-s44a-auth.json"
+if [ -f "$S44A_AUTH_FILE" ]; then cp "$S44A_AUTH_FILE" "$S44A_AUTH_BACKUP"; fi
+S44A_AUTH_BACKUP_LEFTOVER="$S44A_AUTH_FILE.tt-invalidated"
+# The shared daemon-control stub for the restart arms: records its argv to
+# CONTROLLER_DAEMON_EVENTS and exits 0 (a healthy contained restart).
+s44a_daemon_control_stub="$TEST_ROOT/s44a-daemon-control-stub"
+cat > "$s44a_daemon_control_stub" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$(node -e 'process.stdout.write(JSON.stringify({argv:process.argv.slice(1),at:Date.now()}))' "$@")" >> "$CONTROLLER_DAEMON_EVENTS"
+exit 0
+SH
+chmod +x "$s44a_daemon_control_stub"
+
+# Fixture 1: restart_contained_daemon fires via daemon-control (kind real for
+# the hermes/real env), records per-action evidence (argv, exit code,
+# provenance, timestamps, observed effect), and the case PASSes.
+s44a_restart_manifest="$TEST_ROOT/manifests/s44a-restart.jsonl"
+write_probe_case "$s44a_restart_manifest" "S44A-RESTART" \
+  '[{"run":1,"actions":[{"op":"restart_contained_daemon","when":"now"}]}]'
+s44a_restart_events="$TEST_ROOT/s44a-restart-events.jsonl"
+s44a_restart_daemon_events="$TEST_ROOT/s44a-restart-daemon-events.jsonl"
+s44a_restart_output=$(PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$s44a_restart_events" \
+  CONTROLLER_WORKFLOW_MODE=stdout CONTROLLER_DAEMON_EVENTS="$s44a_restart_daemon_events" \
+  TT_CONTROLLER_DAEMON_CONTROL_PATH="$s44a_daemon_control_stub" \
+  TT_CONTROLLER_DAEMON_ENVIRON_SAMPLE="$TT_DIR/var/adapters-bin:/usr/bin:/bin" \
+  TT_CONTROLLER_TOKEN_SETTLE_MS=20 run_recorded_campaign "$CONTROLLER" --manifest "$s44a_restart_manifest") \
+  || fail "restart_contained_daemon probe campaign failed: $s44a_restart_output"
+s44a_restart_id=$(remember_campaign "$s44a_restart_output")
+node --input-type=module - "$TT_DIR/var/results/$s44a_restart_id/state.json" \
+  "$s44a_restart_daemon_events" "$s44a_daemon_control_stub" "$TT_DIR/var/adapters-bin" <<'NODE'
+import fs from 'node:fs';
+const [statePath, daemonEventsPath, daemonStubPath, adaptersBin] = process.argv.slice(2);
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const attempt = state.cases[0].attempts[0];
+if (attempt.outcome !== 'PASS') {
+  throw new Error(`restart_contained_daemon case did not PASS: ${JSON.stringify({outcome: attempt.outcome, reason: attempt.classification_reason})}`);
+}
+const evidence = attempt.probe_evidence;
+if (!evidence || evidence.sequence_outcome !== 'completed' || evidence.actions.length !== 1) {
+  throw new Error(`restart_contained_daemon probe evidence is incomplete: ${JSON.stringify(evidence)}`);
+}
+const restart = evidence.actions[0];
+const utcRe = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+if (restart.op !== 'restart_contained_daemon' || restart.kind !== 'real' || restart.exit_code !== 0
+    || restart.signal !== null || restart.error !== null
+    || restart.argv?.[0] !== daemonStubPath || restart.argv?.[1] !== 'real' || restart.argv?.[2] !== 'restart'
+    || !utcRe.test(restart.armed_at ?? '') || !utcRe.test(restart.action_started_at ?? '')
+    || !utcRe.test(restart.action_ended_at ?? '')
+    || restart.provenance?.kind !== 'real'
+    || !['unavailable', 'pidfile', 'pidfile+identity'].includes(restart.provenance?.source)
+    || restart.effect?.status_after?.status !== 'completed') {
+  throw new Error(`restart_contained_daemon evidence is wrong: ${JSON.stringify(restart)}`);
+}
+const pi = restart.path_invariant;
+if (!pi || pi.verifiable !== true || pi.adapters_bin !== adaptersBin || pi.ok !== true) {
+  throw new Error(`restart_contained_daemon path_invariant re-assertion evidence is wrong: ${JSON.stringify(pi)}`);
+}
+const daemonCalls = fs.readFileSync(daemonEventsPath, 'utf8').trim().split('\n')
+  .map((line) => JSON.parse(line));
+if (daemonCalls.length !== 1
+    || JSON.stringify(daemonCalls[0].argv) !== JSON.stringify(['real', 'restart'])) {
+  throw new Error(`daemon-control must be invoked exactly once with [real restart]: ${JSON.stringify(daemonCalls)}`);
+}
+NODE
+pass "restart_contained_daemon fires via daemon-control (kind real), records per-action evidence, and the case PASSes"
+
+# Fixture 2: a restart the daemon-control refuses (exit 7 — the missing/
+# unmanageable contained daemon shape) classifies TEST_INFRA_FAIL with the
+# DISTINCT category 'restart-contained-daemon-failed' naming the action + exit
+# code — never a silent vacuous verdict.
+s44a_restart_fail_stub="$TEST_ROOT/s44a-daemon-control-fail-stub"
+cat > "$s44a_restart_fail_stub" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'daemon-control: refusing to restart unknown process (no provenance record)\n' >&2
+exit 7
+SH
+chmod +x "$s44a_restart_fail_stub"
+s44a_restart_fail_manifest="$TEST_ROOT/manifests/s44a-restart-fail.jsonl"
+write_probe_case "$s44a_restart_fail_manifest" "S44A-RESTART-FAIL" \
+  '[{"run":1,"actions":[{"op":"restart_contained_daemon","when":"now"}]}]'
+s44a_restart_fail_events="$TEST_ROOT/s44a-restart-fail-events.jsonl"
+s44a_restart_fail_output=$(PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$s44a_restart_fail_events" \
+  CONTROLLER_WORKFLOW_MODE=stdout CONTROLLER_DAEMON_EVENTS="$TEST_ROOT/s44a-restart-fail-daemon-events.jsonl" \
+  TT_CONTROLLER_DAEMON_CONTROL_PATH="$s44a_restart_fail_stub" \
+  TT_CONTROLLER_DAEMON_ENVIRON_SAMPLE="$TT_DIR/var/adapters-bin:/usr/bin:/bin" \
+  TT_CONTROLLER_TOKEN_SETTLE_MS=20 run_recorded_campaign "$CONTROLLER" --manifest "$s44a_restart_fail_manifest") \
+  || fail "restart_contained_daemon fail-closed campaign failed: $s44a_restart_fail_output"
+s44a_restart_fail_id=$(remember_campaign "$s44a_restart_fail_output")
+node --input-type=module - "$TT_DIR/var/results/$s44a_restart_fail_id/state.json" \
+  "$s44a_restart_fail_stub" <<'NODE'
+import fs from 'node:fs';
+const [statePath, daemonStubPath] = process.argv.slice(2);
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const attempt = state.cases[0].attempts[0];
+if (attempt.outcome !== 'TEST_INFRA_FAIL'
+    || attempt.classification_reason?.category !== 'restart-contained-daemon-failed'
+    || attempt.classification_reason?.op !== 'restart_contained_daemon'
+    || attempt.classification_reason?.kind !== 'real'
+    || attempt.classification_reason?.exit_code !== 7
+    || attempt.classification_reason?.argv?.[0] !== daemonStubPath) {
+  throw new Error(`refused restart must classify TEST_INFRA_FAIL restart-contained-daemon-failed: ${JSON.stringify({outcome: attempt.outcome, reason: attempt.classification_reason})}`);
+}
+const evidence = attempt.probe_evidence;
+if (!evidence || evidence.sequence_outcome !== 'failed'
+    || evidence.failure?.category !== 'restart-contained-daemon-failed'
+    || evidence.actions.length !== 1
+    || evidence.actions[0].exit_code !== 7
+    || !Array.isArray(evidence.run_stop?.attempts) || evidence.run_stop?.attempts.length < 1) {
+  throw new Error(`restart fail-closed probe evidence is wrong: ${JSON.stringify(evidence)}`);
+}
+NODE
+pass "a refused contained-daemon restart classifies TEST_INFRA_FAIL restart-contained-daemon-failed with evidence"
+
+# Fixture 3: restart_contained_daemon on a SCRIPTED-execution-mode case uses
+# kind 'scripted' (daemon-control scripted restart — the 53xx contained
+# daemon) — the same machinery, the scripted corridor kind.
+s44a_restart_scripted_manifest="$TEST_ROOT/manifests/s44a-restart-scripted.jsonl"
+write_probe_case "$s44a_restart_scripted_manifest" "S44A-RESTART-SCRIPTED" \
+  '[{"run":1,"actions":[{"op":"restart_contained_daemon","when":"now"}]}]' \
+  '{"execution_mode":"scripted"}'
+s44a_restart_scripted_events="$TEST_ROOT/s44a-restart-scripted-events.jsonl"
+s44a_restart_scripted_daemon_events="$TEST_ROOT/s44a-restart-scripted-daemon-events.jsonl"
+s44a_restart_scripted_output=$(PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$s44a_restart_scripted_events" \
+  CONTROLLER_WORKFLOW_MODE=stdout CONTROLLER_DAEMON_EVENTS="$s44a_restart_scripted_daemon_events" \
+  TT_CONTROLLER_DAEMON_CONTROL_PATH="$s44a_daemon_control_stub" \
+  TT_CONTROLLER_DAEMON_ENVIRON_SAMPLE="$TT_DIR/var/adapters-bin:/usr/bin:/bin" \
+  TT_CONTROLLER_TOKEN_SETTLE_MS=20 run_recorded_campaign "$CONTROLLER" --manifest "$s44a_restart_scripted_manifest") \
+  || fail "scripted restart_contained_daemon campaign failed: $s44a_restart_scripted_output"
+s44a_restart_scripted_id=$(remember_campaign "$s44a_restart_scripted_output")
+node --input-type=module - "$TT_DIR/var/results/$s44a_restart_scripted_id/state.json" \
+  "$s44a_restart_scripted_daemon_events" <<'NODE'
+import fs from 'node:fs';
+const [statePath, daemonEventsPath] = process.argv.slice(2);
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const attempt = state.cases[0].attempts[0];
+if (attempt.outcome !== 'PASS') {
+  throw new Error(`scripted restart case did not PASS: ${JSON.stringify({outcome: attempt.outcome, reason: attempt.classification_reason})}`);
+}
+const restart = attempt.probe_evidence?.actions?.[0];
+if (!restart || restart.op !== 'restart_contained_daemon' || restart.kind !== 'scripted' || restart.exit_code !== 0) {
+  throw new Error(`scripted restart evidence is wrong: ${JSON.stringify(restart)}`);
+}
+const daemonCalls = fs.readFileSync(daemonEventsPath, 'utf8').trim().split('\n')
+  .map((line) => JSON.parse(line));
+if (daemonCalls.length !== 1
+    || JSON.stringify(daemonCalls[0].argv) !== JSON.stringify(['scripted', 'restart'])) {
+  throw new Error(`daemon-control must be invoked exactly once with [scripted restart]: ${JSON.stringify(daemonCalls)}`);
+}
+NODE
+pass "restart_contained_daemon on a scripted-execution-mode case uses kind scripted (daemon-control scripted restart)"
+
+# Fixture 4: update_contained_install executes `tamandua update --force`
+# against the CONTAINED install — the stub tamandua on the contained PATH
+# resolves INSIDE var (the workflow stub under TEST_ROOT), the contained state
+# dir is var/home/.tamandua, and the action records argv / exit code / the
+# contained catalog stamp before+after as the observed effect. Case PASSes.
+s44a_update_manifest="$TEST_ROOT/manifests/s44a-update.jsonl"
+write_probe_case "$s44a_update_manifest" "S44A-UPDATE" \
+  '[{"run":1,"actions":[{"op":"update_contained_install","when":"now"}]}]'
+s44a_update_events="$TEST_ROOT/s44a-update-events.jsonl"
+s44a_update_output=$(PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$s44a_update_events" \
+  CONTROLLER_WORKFLOW_MODE=stdout \
+  TT_CONTROLLER_TOKEN_SETTLE_MS=20 run_recorded_campaign "$CONTROLLER" --manifest "$s44a_update_manifest") \
+  || fail "update_contained_install campaign failed: $s44a_update_output"
+s44a_update_id=$(remember_campaign "$s44a_update_output")
+node --input-type=module - "$TT_DIR/var/results/$s44a_update_id/state.json" \
+  "$s44a_update_events" "$workflow_bin_dir/tamandua" "$TT_DIR/var/home/.tamandua" <<'NODE'
+import fs from 'node:fs';
+const [statePath, eventsPath, stubBinary, containedStateDir] = process.argv.slice(2);
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const attempt = state.cases[0].attempts[0];
+if (attempt.outcome !== 'PASS') {
+  throw new Error(`update_contained_install case did not PASS: ${JSON.stringify({outcome: attempt.outcome, reason: attempt.classification_reason})}`);
+}
+const update = attempt.probe_evidence?.actions?.[0];
+if (!update || update.op !== 'update_contained_install'
+    || JSON.stringify(update.argv) !== JSON.stringify(['tamandua', 'update', '--force'])
+    || update.exit_code !== 0 || update.signal !== null || update.error !== null
+    || update.binary_path !== stubBinary
+    || update.state_dir !== containedStateDir
+    || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(update.action_started_at ?? '')
+    || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(update.action_ended_at ?? '')
+    || update.effect?.state_dir !== containedStateDir
+    || update.stdout_tail?.truncated !== false || update.stderr_tail?.truncated !== false) {
+  throw new Error(`update_contained_install evidence is wrong: ${JSON.stringify(update)}`);
+}
+const stubCalls = fs.readFileSync(eventsPath, 'utf8').trim().split('\n')
+  .map((line) => JSON.parse(line));
+if (!stubCalls.some((entry) => JSON.stringify(entry.argv) === JSON.stringify(['update', '--force']))) {
+  throw new Error(`the stub tamandua must have been invoked with [update --force]: ${JSON.stringify(stubCalls)}`);
+}
+NODE
+pass "update_contained_install runs tamandua update --force against the contained install and records argv/exit/catalog-stamp evidence"
+
+# Fixture 5: update_contained_install with a tamandua binary resolving OUTSIDE
+# torture-test/var (an outside-var stub first on the contained PATH — the
+# operator's live checkout shape) is REFUSED with the distinct category
+# 'operator-action-escape-refused' (reason uncontained-install-target) BEFORE
+# any spawn — the operator's live checkout is never updated. The evidence
+# record's argv stays null and the stub events show NO update invocation.
+S44A_OUTSIDE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/s44a-outside.XXXXXX")"
+cp "$workflow_bin_dir/tamandua" "$S44A_OUTSIDE_DIR/tamandua"
+s44a_update_escape_manifest="$TEST_ROOT/manifests/s44a-update-escape.jsonl"
+write_probe_case "$s44a_update_escape_manifest" "S44A-UPDATE-ESCAPE" \
+  '[{"run":1,"actions":[{"op":"update_contained_install","when":"now"}]}]'
+s44a_update_escape_events="$TEST_ROOT/s44a-update-escape-events.jsonl"
+s44a_update_escape_output=$(PATH="$S44A_OUTSIDE_DIR:$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$s44a_update_escape_events" \
+  CONTROLLER_WORKFLOW_MODE=stdout \
+  TT_CONTROLLER_TOKEN_SETTLE_MS=20 run_recorded_campaign "$CONTROLLER" --manifest "$s44a_update_escape_manifest") \
+  || fail "update_contained_install escape-refusal campaign failed: $s44a_update_escape_output"
+s44a_update_escape_id=$(remember_campaign "$s44a_update_escape_output")
+node --input-type=module - "$TT_DIR/var/results/$s44a_update_escape_id/state.json" \
+  "$s44a_update_escape_events" "$S44A_OUTSIDE_DIR/tamandua" <<'NODE'
+import fs from 'node:fs';
+const [statePath, eventsPath, outsideBinary] = process.argv.slice(2);
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const attempt = state.cases[0].attempts[0];
+if (attempt.outcome !== 'TEST_INFRA_FAIL'
+    || attempt.classification_reason?.category !== 'operator-action-escape-refused'
+    || attempt.classification_reason?.reason !== 'uncontained-install-target'
+    || attempt.classification_reason?.op !== 'update_contained_install'
+    || attempt.classification_reason?.binary_path !== outsideBinary) {
+  throw new Error(`uncontained update target must classify TEST_INFRA_FAIL operator-action-escape-refused: ${JSON.stringify({outcome: attempt.outcome, reason: attempt.classification_reason})}`);
+}
+const update = attempt.probe_evidence?.actions?.[0];
+if (!update || update.op !== 'update_contained_install' || update.argv !== null
+    || update.exit_code !== null || update.binary_path !== outsideBinary
+    || update.effect !== null) {
+  throw new Error(`refused update evidence must show a never-executed action (argv null): ${JSON.stringify(update)}`);
+}
+const stubCalls = fs.readFileSync(eventsPath, 'utf8').trim().split('\n')
+  .map((line) => JSON.parse(line));
+if (stubCalls.some((entry) => JSON.stringify(entry.argv).includes('"update"'))) {
+  throw new Error(`no update invocation may ever be constructed for an uncontained target: ${JSON.stringify(stubCalls)}`);
+}
+NODE
+pass "update_contained_install with an uncontained tamandua binary is refused (operator-action-escape-refused) before any spawn"
+
+# Fixture 6: invalidate_credentials + restore_credentials fire against the
+# CONTAINED home's .pi/agent/auth.json — the invalidate backs the original up
+# beside it and the restore consumes the backup, leaving the file byte-
+# identical. Per-action evidence carries target/backup paths + sha256 + effect.
+printf '%s\n' '{"deepseek":{"type":"api_key","key":"s44a-fixture-original-key"}}' > "$S44A_AUTH_FILE"
+s44a_creds_manifest="$TEST_ROOT/manifests/s44a-creds.jsonl"
+write_probe_case "$s44a_creds_manifest" "S44A-CREDS" \
+  '[{"run":1,"actions":[{"op":"invalidate_credentials","when":"now"},{"op":"restore_credentials","when":"now"}]}]'
+s44a_creds_events="$TEST_ROOT/s44a-creds-events.jsonl"
+s44a_creds_output=$(PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$s44a_creds_events" \
+  CONTROLLER_WORKFLOW_MODE=stdout \
+  TT_CONTROLLER_TOKEN_SETTLE_MS=20 run_recorded_campaign "$CONTROLLER" --manifest "$s44a_creds_manifest") \
+  || fail "credential corridor campaign failed: $s44a_creds_output"
+s44a_creds_id=$(remember_campaign "$s44a_creds_output")
+node --input-type=module - "$TT_DIR/var/results/$s44a_creds_id/state.json" "$S44A_AUTH_FILE" <<'NODE'
+import fs from 'node:fs';
+import { createHash } from 'node:crypto';
+const [statePath, authFile] = process.argv.slice(2);
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const attempt = state.cases[0].attempts[0];
+if (attempt.outcome !== 'PASS') {
+  throw new Error(`credential corridor case did not PASS: ${JSON.stringify({outcome: attempt.outcome, reason: attempt.classification_reason})}`);
+}
+const evidence = attempt.probe_evidence;
+if (!evidence || evidence.sequence_outcome !== 'completed' || evidence.actions.length !== 2) {
+  throw new Error(`credential probe evidence is incomplete: ${JSON.stringify(evidence)}`);
+}
+const [invalidate, restore] = evidence.actions;
+const utcRe = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+if (invalidate.op !== 'invalidate_credentials'
+    || invalidate.target_path !== authFile
+    || invalidate.backup_path !== `${authFile}.tt-invalidated`
+    || typeof invalidate.target_sha256_before !== 'string'
+    || typeof invalidate.target_sha256_after !== 'string'
+    || invalidate.target_sha256_before === invalidate.target_sha256_after
+    || invalidate.effect?.backup_created !== true || invalidate.effect?.restored !== false
+    || !utcRe.test(invalidate.action_started_at ?? '') || !utcRe.test(invalidate.action_ended_at ?? '')) {
+  throw new Error(`invalidate_credentials evidence is wrong: ${JSON.stringify(invalidate)}`);
+}
+if (restore.op !== 'restore_credentials'
+    || restore.target_path !== authFile
+    || restore.backup_path !== `${authFile}.tt-invalidated`
+    || restore.effect?.restored !== true || restore.effect?.backup_removed !== true
+    || restore.target_sha256_after !== invalidate.target_sha256_before
+    || !utcRe.test(restore.action_started_at ?? '') || !utcRe.test(restore.action_ended_at ?? '')) {
+  throw new Error(`restore_credentials evidence is wrong: ${JSON.stringify(restore)}`);
+}
+// The restored file must be byte-identical to the pre-invalidate original.
+const finalBytes = fs.readFileSync(authFile);
+const finalSha = createHash('sha256').update(finalBytes).digest('hex');
+if (finalSha !== invalidate.target_sha256_before) {
+  throw new Error(`restored auth.json must be byte-identical to the pre-invalidate original: ${finalSha} != ${invalidate.target_sha256_before}`);
+}
+if (fs.existsSync(`${authFile}.tt-invalidated`)) {
+  throw new Error(`the invalidate backup must be consumed by the restore`);
+}
+NODE
+pass "invalidate_credentials + restore_credentials fire against the contained home and restore the auth.json byte-identical"
+
+# Fixture 7: a CONTAINED auth.json that is a SYMLINK to the REAL ~/.pi auth
+# (the escape vector) is REFUSED with 'operator-action-escape-refused' — the
+# real credential file is never written through. Byte-identical after.
+S44A_REAL_AUTH_BACKUP="$TEST_ROOT/original-real-s44a-auth.json"
+if [ -f "$HOME/.pi/agent/auth.json" ]; then cp "$HOME/.pi/agent/auth.json" "$S44A_REAL_AUTH_BACKUP"; fi
+rm -f -- "$S44A_AUTH_FILE" "$S44A_AUTH_FILE.tt-invalidated"
+mkdir -p "$HOME/.pi/agent"
+if [ ! -f "$HOME/.pi/agent/auth.json" ]; then printf '%s\n' '{}' > "$HOME/.pi/agent/auth.json"; fi
+ln -s "$HOME/.pi/agent/auth.json" "$S44A_AUTH_FILE"
+s44a_creds_symlink_manifest="$TEST_ROOT/manifests/s44a-creds-symlink.jsonl"
+write_probe_case "$s44a_creds_symlink_manifest" "S44A-CREDS-SYMLINK" \
+  '[{"run":1,"actions":[{"op":"invalidate_credentials","when":"now"}]}]'
+s44a_creds_symlink_events="$TEST_ROOT/s44a-creds-symlink-events.jsonl"
+s44a_creds_symlink_output=$(PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$s44a_creds_symlink_events" \
+  CONTROLLER_WORKFLOW_MODE=stdout \
+  TT_CONTROLLER_TOKEN_SETTLE_MS=20 run_recorded_campaign "$CONTROLLER" --manifest "$s44a_creds_symlink_manifest") \
+  || fail "credential symlink-escape campaign failed: $s44a_creds_symlink_output"
+s44a_creds_symlink_id=$(remember_campaign "$s44a_creds_symlink_output")
+node --input-type=module - "$TT_DIR/var/results/$s44a_creds_symlink_id/state.json" \
+  "$HOME/.pi/agent/auth.json" "$S44A_REAL_AUTH_BACKUP" <<'NODE'
+import fs from 'node:fs';
+import { createHash } from 'node:crypto';
+const [statePath, realAuth, realAuthBackup] = process.argv.slice(2);
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const attempt = state.cases[0].attempts[0];
+if (attempt.outcome !== 'TEST_INFRA_FAIL'
+    || attempt.classification_reason?.category !== 'operator-action-escape-refused'
+    || attempt.classification_reason?.op !== 'invalidate_credentials'
+    || !attempt.classification_reason?.message?.includes('escape')) {
+  throw new Error(`symlink-escape invalidate must classify TEST_INFRA_FAIL operator-action-escape-refused: ${JSON.stringify({outcome: attempt.outcome, reason: attempt.classification_reason})}`);
+}
+// The REAL ~/.pi auth must be byte-identical (never written through the link).
+const realSha = createHash('sha256').update(fs.readFileSync(realAuth)).digest('hex');
+const backupSha = createHash('sha256').update(fs.readFileSync(realAuthBackup)).digest('hex');
+if (realSha !== backupSha) {
+  throw new Error(`the real ~/.pi auth must be untouched by the refused invalidate: ${realSha} != ${backupSha}`);
+}
+NODE
+rm -f -- "$S44A_AUTH_FILE"
+if [ -f "$S44A_REAL_AUTH_BACKUP" ]; then cp "$S44A_REAL_AUTH_BACKUP" "$HOME/.pi/agent/auth.json"; fi
+pass "a contained auth.json symlinked at the real ~/.pi is refused (operator-action-escape-refused) and the real file stays untouched"
+
+# Fixture 8: invalidate_credentials with NO contained credential file fails
+# closed with the distinct 'invalidate-credentials-failed' category (reason
+# unreadable-credential-file) — there is no credential to invalidate.
+rm -f -- "$S44A_AUTH_FILE" "$S44A_AUTH_FILE.tt-invalidated"
+s44a_creds_missing_manifest="$TEST_ROOT/manifests/s44a-creds-missing.jsonl"
+write_probe_case "$s44a_creds_missing_manifest" "S44A-CREDS-MISSING" \
+  '[{"run":1,"actions":[{"op":"invalidate_credentials","when":"now"}]}]'
+s44a_creds_missing_events="$TEST_ROOT/s44a-creds-missing-events.jsonl"
+s44a_creds_missing_output=$(PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$s44a_creds_missing_events" \
+  CONTROLLER_WORKFLOW_MODE=stdout \
+  TT_CONTROLLER_TOKEN_SETTLE_MS=20 run_recorded_campaign "$CONTROLLER" --manifest "$s44a_creds_missing_manifest") \
+  || fail "credential missing-file campaign failed: $s44a_creds_missing_output"
+s44a_creds_missing_id=$(remember_campaign "$s44a_creds_missing_output")
+node --input-type=module - "$TT_DIR/var/results/$s44a_creds_missing_id/state.json" "$S44A_AUTH_FILE" <<'NODE'
+import fs from 'node:fs';
+const [statePath, authFile] = process.argv.slice(2);
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const attempt = state.cases[0].attempts[0];
+if (attempt.outcome !== 'TEST_INFRA_FAIL'
+    || attempt.classification_reason?.category !== 'invalidate-credentials-failed'
+    || attempt.classification_reason?.op !== 'invalidate_credentials'
+    || attempt.classification_reason?.reason !== 'unreadable-credential-file'
+    || attempt.classification_reason?.target_path !== authFile) {
+  throw new Error(`missing credential file must classify TEST_INFRA_FAIL invalidate-credentials-failed: ${JSON.stringify({outcome: attempt.outcome, reason: attempt.classification_reason})}`);
+}
+const evidence = attempt.probe_evidence;
+if (!evidence || evidence.failure?.category !== 'invalidate-credentials-failed'
+    || evidence.actions.length !== 1
+    || evidence.actions[0].failure?.reason !== 'unreadable-credential-file') {
+  throw new Error(`missing-file invalidate probe evidence is wrong: ${JSON.stringify(evidence)}`);
+}
+NODE
+pass "invalidate_credentials with no contained credential file fails closed (invalidate-credentials-failed, unreadable-credential-file)"
+if [ -f "$S44A_AUTH_BACKUP" ]; then cp "$S44A_AUTH_BACKUP" "$S44A_AUTH_FILE"; fi
+
+# Fixture 9: the during_hold corridor — restart_contained_daemon declared
+# during_hold: true after a pause_drain with hold_seconds fires CONCURRENTLY
+# with the pause hold (action_started_at inside [hold_started_at,
+# hold_ended_at]) — the W4.33a "operator restarts the daemon during the pause
+# hold" shape. The holder's hold_ended_at + observed effect land in the
+# durable evidence when the hold completes.
+seed_probe_step
+s44a_dh_manifest="$TEST_ROOT/manifests/s44a-during-hold.jsonl"
+write_probe_case "$s44a_dh_manifest" "S44A-DURING-HOLD" \
+  '[{"run":1,"actions":[{"op":"pause_drain","when":"step:developer:running","hold_seconds":3},{"op":"restart_contained_daemon","when":"now","during_hold":true},{"op":"resume","when":"now"}]}]'
+s44a_dh_events="$TEST_ROOT/s44a-during-hold-events.jsonl"
+s44a_dh_daemon_events="$TEST_ROOT/s44a-during-hold-daemon-events.jsonl"
+s44a_dh_output=$(PATH="$workflow_bin_dir:$PATH" CONTROLLER_WORKFLOW_EVENTS="$s44a_dh_events" \
+  CONTROLLER_WORKFLOW_MODE=stdout CONTROLLER_DAEMON_EVENTS="$s44a_dh_daemon_events" \
+  TT_CONTROLLER_DAEMON_CONTROL_PATH="$s44a_daemon_control_stub" \
+  TT_CONTROLLER_DAEMON_ENVIRON_SAMPLE="$TT_DIR/var/adapters-bin:/usr/bin:/bin" \
+  TT_CONTROLLER_TOKEN_SETTLE_MS=20 run_recorded_campaign "$CONTROLLER" --manifest "$s44a_dh_manifest") \
+  || fail "during-hold corridor campaign failed: $s44a_dh_output"
+s44a_dh_id=$(remember_campaign "$s44a_dh_output")
+node --input-type=module - "$TT_DIR/var/results/$s44a_dh_id/state.json" \
+  "$s44a_dh_daemon_events" <<'NODE'
+import fs from 'node:fs';
+const [statePath, daemonEventsPath] = process.argv.slice(2);
+const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+const attempt = state.cases[0].attempts[0];
+if (attempt.outcome !== 'PASS') {
+  throw new Error(`during-hold corridor case did not PASS: ${JSON.stringify({outcome: attempt.outcome, reason: attempt.classification_reason})}`);
+}
+const evidence = attempt.probe_evidence;
+if (!evidence || evidence.sequence_outcome !== 'completed' || evidence.actions.length !== 3) {
+  throw new Error(`during-hold probe evidence is incomplete: ${JSON.stringify(evidence)}`);
+}
+const [pause, restart, resume] = evidence.actions;
+if (pause.op !== 'pause_drain' || pause.hold_seconds !== 3
+    || !pause.hold_started_at || !pause.hold_ended_at || pause.effect === null) {
+  throw new Error(`during-hold holder (pause_drain) must carry a COMPLETED hold record: ${JSON.stringify(pause)}`);
+}
+if (restart.op !== 'restart_contained_daemon' || restart.during_hold !== true || restart.exit_code !== 0) {
+  throw new Error(`during-hold restart action is wrong: ${JSON.stringify(restart)}`);
+}
+const holdStart = new Date(pause.hold_started_at).valueOf();
+const holdEnd = new Date(pause.hold_ended_at).valueOf();
+const restartStart = new Date(restart.action_started_at).valueOf();
+if (!(restartStart >= holdStart && restartStart <= holdEnd)) {
+  throw new Error(`restart_contained_daemon must fire DURING the pause hold: restart ${restartStart} outside [${holdStart}, ${holdEnd}]`);
+}
+if (resume.op !== 'resume' || new Date(resume.action_started_at).valueOf() < holdEnd) {
+  throw new Error(`resume must fire after the hold ends: ${JSON.stringify(resume)}`);
+}
+const daemonCalls = fs.readFileSync(daemonEventsPath, 'utf8').trim().split('\n')
+  .map((line) => JSON.parse(line));
+if (daemonCalls.length !== 1
+    || JSON.stringify(daemonCalls[0].argv) !== JSON.stringify(['real', 'restart'])) {
+  throw new Error(`daemon-control must be invoked exactly once with [real restart]: ${JSON.stringify(daemonCalls)}`);
+}
+NODE
+remove_probe_step
+pass "restart_contained_daemon with during_hold fires INSIDE the pause hold window (W4.33a shape) and the holder record completes"
 
 # ── E3.C US-007: multi-launch probe orchestration (W3.20/W3.22 shapes) ──
 # The controller must GENUINELY execute multi-run probe_sequences — W3.20's two

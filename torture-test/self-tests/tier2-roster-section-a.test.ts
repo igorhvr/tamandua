@@ -417,19 +417,23 @@ describe("Tier-2 US-004..US-014 — section-A + B/G + C1 + C2 + D + E + F + H + 
   it("chaos/probe blocks validate per the E3.C schema incl. the US-003 delete-tstx-row + kill-daemon extensions", () => {
     const records = readManifest();
     const deleteRows = records.filter((record) => record.chaos?.type === "delete-tstx-row");
-    // W4.01, W4.02, W4.36 (section A) + W4.48c (section G compound) +
+    // W4.01, W4.02, W4.29, W4.36 (section A) + W4.48c (section G compound) +
     // W4.dsh-bfmw (dsh lane, W4.02 base) declare the drain-armed
-    // delete-tstx-row block.
+    // delete-tstx-row block. (S39: W4.29 joined — its task text always
+    // promised the W4.01/W4.02 corridor but the manifest carried chaos:null,
+    // so the corridor NEVER fired in the campaign; the S39 arming gap fix
+    // declares it.)
     assert.deepEqual(
       deleteRows.map((record) => record.id).sort(),
       [
         "W4.01-missing-evidence-reroute",
         "W4.02-fail-missing-refusal",
+        "W4.29-strict-gate-retry-finalize",
         "W4.36-broken-work-concession",
         "W4.48c-compound-gate-degradation",
         "W4.dsh-bfmw",
       ],
-      "exactly the five drain-armed cases must carry delete-tstx-row chaos",
+      "exactly the six drain-armed cases must carry delete-tstx-row chaos",
     );
     for (const record of deleteRows) {
       assert.equal(record.chaos.target, "tstx_row", `${record.id}: delete-tstx-row targets tstx_row`);

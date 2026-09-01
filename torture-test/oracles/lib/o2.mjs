@@ -438,14 +438,47 @@ export function evaluateO2(invocation) {
   ].includes(eventName(event)));
   const mergeRunIds = new Set(mergeRuns.map((run) => run.run_id));
   const allLandingEvents = events.filter((event) => !event.noop && event.run_id !== null && mergeRunIds.has(event.run_id));
-  if (allLandingEvents.length > 1) {
+  // S41 (US-004): the two-landing shape (W4.10-restart-recovery's two
+  // attributed runs, two target transitions, each landing owned by an
+  // attributed run) is a LEGAL ref movement — one transition per landing.
+  // O2_DUPLICATE_LANDING fires only when two landings claim the SAME
+  // transition (identical expected_tip -> merged_commit), never for a chain
+  // of distinct transitions.
+  const claimedTransitionCounts = new Map();
+  for (const landing of allLandingEvents) {
+    const key = `${landing.expected_tip}->${landing.merged_commit}`;
+    claimedTransitionCounts.set(key, (claimedTransitionCounts.get(key) ?? 0) + 1);
+  }
+  const duplicateTransitions = [...claimedTransitionCounts.entries()]
+    .filter(([, count]) => count > 1)
+    .map(([transition, count]) => ({ transition, count }));
+  if (duplicateTransitions.length > 0) {
     findings.add('O2_DUPLICATE_LANDING', 'captured merge run graph claimed one target transition more than once', {
       landing_count: allLandingEvents.length,
+      claimed_transitions: duplicateTransitions,
       run_ids: allLandingEvents.map((event) => event.run_id).sort(),
     });
   }
   if (before.target_tip !== after.target_tip && allLandingEvents.length === 0) {
     findings.add('O2_LANDING_EVENT_MISSING', 'target ref moved without one non-noop merge.landed event');
+  }
+  // S41: for multi-landing shapes, each landing is one SEGMENT of the
+  // before->after movement. Compute the chained expectation per landing
+  // (segment i starts at segment i-1's merged commit; the first segment
+  // starts at before.target_tip; the last segment ends at after.target_tip)
+  // so the per-run O2_REF_EVENT_MISMATCH check compares against the landing's
+  // own chain position instead of the whole movement. Single-landing shapes
+  // keep the exact one-transition expectation (unchanged).
+  const chainedTransitions = new Map();
+  if (allLandingEvents.length > 1) {
+    const ordered = [...allLandingEvents].sort((left, right) => left.occurred_at_ms - right.occurred_at_ms);
+    for (let index = 0; index < ordered.length; index += 1) {
+      const landing = ordered[index];
+      chainedTransitions.set(landing.index, {
+        expected_tip: index === 0 ? before.target_tip : ordered[index - 1].merged_commit,
+        merged_commit: index === ordered.length - 1 ? after.target_tip : ordered[index + 1].expected_tip,
+      });
+    }
   }
   const extracted = extractGitSnapshot(invocation);
   const observations = [];
@@ -502,7 +535,14 @@ export function evaluateO2(invocation) {
           landing_count: landingEvents.length,
         });
       }
-      if (refMoved && (capturedMatchingTransitions.length !== 1 || capturedTransitions.length !== 1)) {
+      // S41 (US-004): the single-transition invariant stays for SINGLE-landing
+      // shapes (one attributed run landing the target). For the two-landing
+      // shape the 1:1 transition<->landing mapping is enforced by the global
+      // O2_REF_TRANSITION_UNATTRIBUTED / O2_LANDING_TRANSITION_UNRECONCILED
+      // checks — O2_REF_TRANSITION_COUNT must not fire for a legal chain of
+      // distinct transitions.
+      if (refMoved && allLandingEvents.length <= 1
+          && (capturedMatchingTransitions.length !== 1 || capturedTransitions.length !== 1)) {
         add(findings, 'O2_REF_TRANSITION_COUNT', 'target ref movement does not have exactly one matching raw-reflog transition', run.run_id, {
           matching_transition_count: matchingTransitions.length,
           captured_matching_transition_count: capturedMatchingTransitions.length,
@@ -530,10 +570,16 @@ export function evaluateO2(invocation) {
             expected: before.target_ref, observed: landing.target,
           });
         }
-        if (landing.expected_tip !== before.target_tip || landing.merged_commit !== after.target_tip) {
+        // S41: multi-landing landings are one segment of the chained
+        // movement — compare against the landing's own chain position
+        // (single-landing shapes keep the exact before->after expectation).
+        const chained = chainedTransitions.get(landing.index);
+        const expectedOld = chained?.expected_tip ?? before.target_tip;
+        const expectedNew = chained?.merged_commit ?? after.target_tip;
+        if (landing.expected_tip !== expectedOld || landing.merged_commit !== expectedNew) {
           add(findings, 'O2_REF_EVENT_MISMATCH', 'merge event commit transition differs from captured pre/post refs', run.run_id, {
-            expected_old: before.target_tip, observed_old: landing.expected_tip,
-            expected_new: after.target_tip, observed_new: landing.merged_commit,
+            expected_old: expectedOld, observed_old: landing.expected_tip,
+            expected_new: expectedNew, observed_new: landing.merged_commit,
           });
         }
         testedTree = run.context.tested_tree;
@@ -640,7 +686,14 @@ export function evaluateO2(invocation) {
             branch: landing.branch, expected_tip: landing.expected_tip,
           });
         }
-        targetPatches = targetPatchIds(invocation, extracted, landing.expected_tip, after.target_tip);
+        // S41 (US-004): the source patch must be byte-present in the TERMINAL
+        // target history — the FULL before->after movement range. A
+        // multi-landing segment does not span the whole range (landing 1 of a
+        // two-landing shape covers before->mid), so scanning from the
+        // landing's own expected_tip would falsely report its patch missing;
+        // for single-landing shapes expected_tip === before.target_tip, so the
+        // range is identical to the pre-S41 behavior.
+        targetPatches = targetPatchIds(invocation, extracted, before.target_tip, after.target_tip);
         if (sourcePatch !== null && !targetPatches.some((row) => row.patch_id === sourcePatch)) {
           add(findings, 'O2_PATCH_NOT_PRESENT', 'source branch patch-id is not byte-present in the terminal target history', run.run_id, {
             source_patch_id: sourcePatch,

@@ -291,7 +291,8 @@
   },
   "production_duration_floor_ms": {
    "type": "integer",
-   "minimum": 1
+   "minimum": 1,
+   "description": "OPTIONAL per-case duration-floor pin (S43a US-006: the per-cell floor override). When declared, oracle-context emits THIS case's o1_wave duration-floor row with the pinned value and O1 judges the case's run against it (the per-cell floor is AUTHORITATIVE for that cell) instead of the family production-median / w1-median floor. Cells whose honest duration differs from the family median (e.g. W4.08-control's honest run measured 13% under the 600s family floor) declare a per-cell floor to absorb honest variance; the family floor still applies to non-declaring cells (fail-closed default unchanged). The flag form (expected_fast_failure: true) opts a fast-honest cell out of the floor entirely."
   },
   "production_duration_floor_basis": {
    "type": "string",
@@ -300,7 +301,8 @@
    "description": "OPTIONAL recalibration basis documenting WHY a production_duration_floor_ms value was chosen (operator decision record, e.g. measured honest baseline durations). Informational only — never consumed by oracles or the controller."
   },
   "expected_fast_failure": {
-   "type": "boolean"
+   "type": "boolean",
+   "description": "OPTIONAL fast-honest cell declaration (S43a US-006). TRUE = this cell's CORRECT behavior is early termination (a refusal / small-do-now / auth-expiry run that honestly finishes well under the family production-median duration floor). O1's duration-floor evaluation must NOT flag such a cell's honest early termination against the family floor: its wave run rows are excluded from BOTH the fast numerator and the eligible denominator of the family rate, and the cell is excluded from w1-median calibration samples (the per-cell flag is authoritative for that cell). The family floor still applies to non-flagged cells (fail-closed default unchanged). FALSE/absent = the cell is floor-judgeable like every other cell. Declared on the tier2 rows whose task text mandates early termination (W4.37, W4.38-hostile-task-real, W4.47, W4.dsh-do-now); production floors are kept for cells that must not be fast (e.g. W4.08-control, which instead declares a per-cell production_duration_floor_ms)."
   },
   "reset": {
    "anyOf": [
@@ -309,6 +311,38 @@
     },
     {
      "$ref": "#/$defs/hook"
+    }
+   ]
+  },
+  "arming": {
+   "description": "OPTIONAL S42 (US-005) arming declaration: the case's task/traceability mandates a seed/arm (a reset-hook arming overlay or a seeded arm) that must be PERFORMED before the corridor produces a verdict. A block with mandatory: true makes the controller fail closed as TEST_INFRA_FAIL 'arm-absent' at terminal when the mandated arming was never performed (no per-case arming manifest under var/arming/<case-id>.json, or a manifest recording armed !== true / a type or count that disagrees with the declaration). The reset hook that performs the arming writes that manifest after provably arming. Absent or null => no arming obligation (the S42 gate never fires).",
+   "anyOf": [
+    {
+     "type": "null"
+    },
+    {
+     "type": "object",
+     "additionalProperties": false,
+     "required": [
+      "mandatory"
+     ],
+     "properties": {
+      "mandatory": {
+       "type": "boolean",
+       "description": "TRUE = the mandated arming is an obligation: at terminal, the per-case arming manifest must exist and record the declared arming, else TEST_INFRA_FAIL 'arm-absent' (never a vacuous verdict)."
+      },
+      "type": {
+       "type": "string",
+       "minLength": 1,
+       "maxLength": 128,
+       "description": "The arming the case mandates (e.g. 'red-baseline' \u2014 2 documented pre-existing red tests planted by the case's reset hook)."
+      },
+      "count": {
+       "type": "integer",
+       "minimum": 1,
+       "description": "Optional expected arming magnitude (e.g. 2 pre-existing red tests) the manifest must record."
+      }
+     }
     }
    ]
   },
@@ -394,9 +428,13 @@
       "cancel",
       "fail_force",
       "restart_daemon",
-      "sigstop_sigcont"
+      "sigstop_sigcont",
+      "restart_contained_daemon",
+      "update_contained_install",
+      "invalidate_credentials",
+      "restore_credentials"
      ],
-     "description": "Probe verb executed by the controller against the contained TT instance. pause: pause the daemon without draining; pause_drain: pause --drain (current run finishes, no new dispatch); resume: resume a paused/failed daemon or run; cancel: cancel the run (assert run.canceled terminal event); fail_force: fail --force the run (resume must reuse the SAME run id); restart_daemon: restart the contained daemon mid-flight; sigstop_sigcont: SIGSTOP/SIGCONT the harness process."
+     "description": "Probe verb executed by the controller against the contained TT instance. pause: pause the daemon without draining; pause_drain: pause --drain (current run finishes, no new dispatch); resume: resume a paused/failed daemon or run; cancel: cancel the run (assert run.canceled terminal event); fail_force: fail --force the run (resume must reuse the SAME run id); restart_daemon: restart the contained daemon mid-flight (daemon-level MULTI-RUN op — the W3.22 concurrent shape); sigstop_sigcont: SIGSTOP/SIGCONT the harness process; restart_contained_daemon (S44a): restart the CONTAINED daemon mid-run via bin/daemon-control (single-run operator-seam op — the W4.10/W4.48a/W4.33a corridor; NEVER the operator's live 33xx daemon); update_contained_install (S44a): run `tamandua update --force` against the CONTAINED install during a hold (single-run operator-seam op — the W4.33b corridor; the tamandua binary must resolve inside torture-test/var or the action fails closed); invalidate_credentials / restore_credentials (S44a): replace/restore the CONTAINED home's .pi/agent/auth.json with an invalid token (the W4.47 corridor; NEVER the real ~/.pi — a symlink/escaping target is refused)."
     },
     "when": {
      "anyOf": [
@@ -460,6 +498,10 @@
      "type": "number",
      "exclusiveMinimum": 0,
      "description": "OPTIONAL hold duration for hold-capable ops (pause, pause_drain, sigstop_sigcont): the pause/stop is held this many seconds before the action's counterpart (resume/cont) fires."
+    },
+    "during_hold": {
+     "type": "boolean",
+     "description": "OPTIONAL S44a operator-seam concurrency marker: when true, this action fires CONCURRENTLY with the IMMEDIATELY PRECEDING action's hold (the preceding action must carry hold_seconds > 0 — enforced fail-closed by the controller's semantic validator). The operator-seam actions (restart_contained_daemon, update_contained_install) declare it to act DURING a pause hold (W4.33a restarts the contained daemon during the pause hold; W4.33b runs `tamandua update --force` during the hold). Single-run sequences only (rejected on multi-run shapes)."
     },
     "expect": {
      "$ref": "#/$defs/probeExpect",

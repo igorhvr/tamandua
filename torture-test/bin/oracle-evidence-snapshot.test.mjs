@@ -150,6 +150,32 @@ function plantLifecycleEvidence(data) {
   ].join('\n') + '\n');
 }
 
+// S41 (US-004): plant a MULTI-RUN probe-evidence artifact (the
+// W4.10-restart-recovery concurrent shape) whose runs[] records carry the
+// per-run terminal snapshot (terminal_status / tokens_observed /
+// steps_snapshot). The durable attempt is bound to the primary run (run
+// ordinal 1); the sibling (run ordinal 2) exists ONLY in this artifact.
+function plantMultiRunProbeEvidence(data, rootRunId, rootSteps, rootTokens, siblingRunId, siblingSteps, siblingTokens) {
+  const probeEvidencePath = path.join(data.campaignDir, 'evidence', 'CASE-1', 'attempt-1', 'probe-evidence.json');
+  fs.mkdirSync(path.dirname(probeEvidencePath), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(probeEvidencePath, `${JSON.stringify({
+    schema_version: 1,
+    case_id: 'CASE-1',
+    launch_shape: 'concurrent',
+    sequence_outcome: 'completed',
+    runs: [
+      {
+        run_ordinal: 1, run_id: rootRunId, terminal_status: 'completed',
+        tokens_observed: rootTokens, steps_snapshot: rootSteps, actions: [],
+      },
+      {
+        run_ordinal: 2, run_id: siblingRunId, terminal_status: 'completed',
+        tokens_observed: siblingTokens, steps_snapshot: siblingSteps, actions: [],
+      },
+    ],
+  }, null, 2)}\n`);
+}
+
 function input(data) {
   return {
     ttRoot: TT_ROOT,
@@ -331,6 +357,115 @@ test('harvests a complete immutable snapshot that passes O9 with immediate recla
     const provenance = JSON.parse(fs.readFileSync(path.join(data.campaignDir, completed.provenance.path)));
     assert.equal(provenance.status, 'COMPLETE');
     assert.deepEqual(Object.keys(provenance.files), ORACLE_EVIDENCE_KEYS);
+  } finally {
+    fs.rmSync(data.root, { recursive: true, force: true });
+  }
+});
+
+// S41 (US-004) — probe-sequence sibling runs + the ROOT terminal snapshot in
+// workflow-status.json. In multi-run probe shapes (W4.10-restart-recovery's
+// two concurrent runs) only the per-run proxies are harvested, so the durable
+// attempt's steps_snapshot stays null and tokens_observed stays 0 while the
+// probe-evidence artifact carries every probed run. The terminal snapshot
+// must register each sibling in the root/discovered graph with its per-run
+// terminal snapshot and fall the ROOT row back to the primary probe run's
+// snapshot (concurrent shapes) — the campaign graph voided O1/O2/O11 with
+// `steps_snapshot: null, tokens_observed: 0, discovered_runs: []`.
+test('S41: registers probe-sequence sibling runs with terminal snapshots in workflow-status.json (root fallback)', async () => {
+  const data = fixture();
+  try {
+    const request = input(data);
+    // The concurrent W4.10-restart-recovery shape: the durable attempt is
+    // bound to the primary run but was never harvested itself.
+    request.attempt.terminal_status = 'completed';
+    request.attempt.tokens_observed = 0;
+    request.attempt.steps_snapshot = null;
+    const primarySteps = {
+      source: 'workflow-status-json', captured_at: '2026-08-01T12:00:04.000Z',
+      steps: [{ stepId: 'step-1', agentRole: 'developer', status: 'done' }],
+    };
+    const siblingSteps = {
+      source: 'workflow-status-json', captured_at: '2026-08-01T12:00:05.000Z',
+      steps: [{ stepId: 'step-1', agentRole: 'developer', status: 'done' }],
+    };
+    plantMultiRunProbeEvidence(
+      data, RUN_ID, primarySteps, 17,
+      'run-22222222-2222-4222-8222-222222222222', siblingSteps, 9,
+    );
+    // The controller graph intentionally lacks the sibling (pre-fix shape);
+    // one discovered run is present so the pre-existing rows survive.
+    request.discoveredRuns = [{ run_id: 'run-reclaimer', parent_run_id: RUN_ID }];
+    const started = beginOracleEvidenceSnapshot(request);
+    assert.equal(started.status, 'BASELINE_CAPTURED');
+    const completed = completeOracleEvidenceSnapshot(request, started);
+    assert.equal(completed.status, 'COMPLETE');
+    const workflowStatus = JSON.parse(fs.readFileSync(
+      path.join(data.campaignDir, completed.references.workflow_status.path), 'utf8',
+    ));
+    assert.equal(workflowStatus.schema_version, 1);
+    // ROOT: the primary probe run's terminal snapshot is the root snapshot
+    // (the attempt itself was never harvested in the concurrent shape).
+    assert.equal(workflowStatus.root.run_id, RUN_ID);
+    assert.equal(workflowStatus.root.terminal_status, 'completed');
+    assert.equal(workflowStatus.root.tokens_observed, 17);
+    assert.deepEqual(workflowStatus.root.steps_snapshot, primarySteps);
+    // The sibling run is registered with its own terminal snapshot.
+    const sibling = workflowStatus.discovered_runs.find((run) => run.run_id === 'run-22222222-2222-4222-8222-222222222222');
+    assert.ok(sibling, 'probe-sequence sibling run must be registered in workflow-status.json');
+    assert.equal(sibling.parent_run_id, RUN_ID);
+    assert.equal(sibling.terminal_status, 'completed');
+    assert.equal(sibling.tokens_observed, 9);
+    assert.deepEqual(sibling.steps_snapshot, siblingSteps);
+    // Pre-existing discovered runs are preserved (never dropped).
+    assert.ok(workflowStatus.discovered_runs.some((run) => run.run_id === 'run-reclaimer'));
+  } finally {
+    fs.rmSync(data.root, { recursive: true, force: true });
+  }
+});
+
+// S41 (US-004): a sibling already present in the controller graph (a
+// discovered-run record that predates the terminal snapshot) is MERGED — its
+// missing snapshot fields are filled from the probe artifact, never
+// overwritten — and a harvested ROOT attempt's own snapshot is never
+// overridden by the primary probe record.
+test('S41: merges the probe sibling into an existing discovered-run row and never overrides a harvested root snapshot', async () => {
+  const data = fixture();
+  try {
+    const request = input(data);
+    const harvestedRootSteps = request.attempt.steps_snapshot;
+    plantMultiRunProbeEvidence(
+      data, RUN_ID, harvestedRootSteps, request.attempt.tokens_observed,
+      'run-33333333-3333-4333-8333-333333333333', harvestedRootSteps, 5,
+    );
+    // The sibling is already in the controller graph but its record predates
+    // the terminal snapshot (tokens_observed 0, no steps).
+    request.discoveredRuns = [{
+      run_id: 'run-33333333-3333-4333-8333-333333333333',
+      parent_run_id: RUN_ID,
+      terminal_status: 'completed',
+      tokens_observed: 0,
+      steps_snapshot: null,
+    }];
+    const started = beginOracleEvidenceSnapshot(request);
+    assert.equal(started.status, 'BASELINE_CAPTURED');
+    const completed = completeOracleEvidenceSnapshot(request, started);
+    assert.equal(completed.status, 'COMPLETE');
+    const workflowStatus = JSON.parse(fs.readFileSync(
+      path.join(data.campaignDir, completed.references.workflow_status.path), 'utf8',
+    ));
+    // The harvested root keeps its own snapshot (never overridden by the
+    // primary probe record — single-run/ordinary shapes unchanged).
+    assert.deepEqual(workflowStatus.root.steps_snapshot, harvestedRootSteps);
+    assert.equal(workflowStatus.root.tokens_observed, request.attempt.tokens_observed);
+    // The sibling row is merged: snapshot fields come from the probe
+    // artifact, parent_run_id stays from the discovered record, no dupes.
+    const sibling = workflowStatus.discovered_runs.find((run) => run.run_id === 'run-33333333-3333-4333-8333-333333333333');
+    assert.ok(sibling, 'existing discovered sibling row must be kept');
+    assert.equal(sibling.parent_run_id, RUN_ID);
+    assert.equal(sibling.terminal_status, 'completed');
+    assert.equal(sibling.tokens_observed, 5);
+    assert.deepEqual(sibling.steps_snapshot, harvestedRootSteps);
+    assert.equal(workflowStatus.discovered_runs.length, 1, 'no duplicate sibling rows');
   } finally {
     fs.rmSync(data.root, { recursive: true, force: true });
   }

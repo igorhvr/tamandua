@@ -197,22 +197,33 @@ describe("Tier-2 US-005 — section-B/G roster (moving targets & rugpull + compo
       assert.match(task, /single-fault ancestor/i, `${id}: task text must require its single-fault ancestors green (composed-fault discipline)`);
     }
     // The resume legs carry probe sequences where the corridor is expressible:
-    // a/b pause(+drain)+resume, d resume-on-failure; c is operator-choreographed
+    // a/b pause(+drain)+restart/update(during_hold)+resume (the S44a/S44b
+    // operator-seam wiring), d resume-on-failure; c is operator-choreographed
     // (no typed op for worktree deletion) and documents the refusal in text.
     const w433a = recordById(records, "W4.33a-daemon-restart-resume");
     const opsA = w433a.probe_sequence[0].actions.map((action: any) => action.op);
-    assert.deepEqual(opsA, ["pause_drain", "resume"], "W4.33a probe ops must be pause_drain then resume");
+    assert.deepEqual(opsA, ["pause_drain", "restart_contained_daemon", "resume"],
+      "W4.33a probe ops must be pause_drain -> restart_contained_daemon(during_hold) -> resume (the S44b wired operator-seam corridor)");
     assert.equal(w433a.probe_sequence[0].actions[0].when, "step:fixer:running",
       "W4.33a pause_drain must arm on the bfmw coding step (S29 calibration, US-002: step:developer:running is not bfmw vocabulary)");
     assert.equal(w433a.probe_sequence[0].actions[0].hold_seconds, 600,
       "W4.33a pause_drain must keep the declared 600s hold (never weakened)");
+    assert.equal(w433a.probe_sequence[0].actions[1].op, "restart_contained_daemon",
+      "W4.33a must declare the first-class restart_contained_daemon action");
+    assert.equal(w433a.probe_sequence[0].actions[1].during_hold, true,
+      "W4.33a restart_contained_daemon must fire during the pause hold (during_hold: true)");
     const w433b = recordById(records, "W4.33b-update-under-it-resume");
     const opsB = w433b.probe_sequence[0].actions.map((action: any) => action.op);
-    assert.deepEqual(opsB, ["pause", "resume"], "W4.33b probe ops must be pause then resume");
+    assert.deepEqual(opsB, ["pause", "update_contained_install", "resume"],
+      "W4.33b probe ops must be pause -> update_contained_install(during_hold) -> resume (the S44b wired operator-seam corridor)");
     assert.equal(w433b.probe_sequence[0].actions[0].when, "step:fixer:running",
       "W4.33b pause must arm on the bfmw coding step (S29 calibration, US-002: step:developer:running is not bfmw vocabulary)");
     assert.equal(w433b.probe_sequence[0].actions[0].hold_seconds, 600,
       "W4.33b pause must keep the declared 600s hold (never weakened)");
+    assert.equal(w433b.probe_sequence[0].actions[1].op, "update_contained_install",
+      "W4.33b must declare the first-class update_contained_install action");
+    assert.equal(w433b.probe_sequence[0].actions[1].during_hold, true,
+      "W4.33b update_contained_install must fire during the pause hold (during_hold: true)");
     const w433d = recordById(records, "W4.33d-reroute-exhaustion-resume");
     assert.equal(w433d.probe_sequence[0].actions[0].op, "resume", "W4.33d probe op must be resume");
     assert.equal(w433d.probe_sequence[0].actions[0].when, "event:run.failed",

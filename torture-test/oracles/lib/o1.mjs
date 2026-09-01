@@ -183,24 +183,42 @@ function healthyStraggler(context, projected, runId, run, steps, events) {
 }
 
 // Deterministic reporter for the campaign-wide (family-level) duration-floor
-// findings of a wave: the wave case whose case_id comes LAST in
-// campaign.manifest.case_ids order (max manifest rank). At concurrency 1 the
-// wave snapshot grows as later cases run, so the first case's O1 evaluates a
-// one-sample wave and the rate guard is suppressed there; choosing the LAST
-// case of the wave means the guard evaluates the most complete wave snapshot
-// when it finally reports. The reporter must be a real campaign case, so wave
-// rows whose case_id is absent from the manifest (e.g. fixture peer runs) can
-// never win the reporter slot; when the wave carries no manifest cases at all
-// the full set is ranked deterministically (localeCompare), so a single-case
-// wave still reports family findings from its only case.
-function waveReporterCaseId(context) {
+// findings of a wave: the TRUE FINAL wave case in campaign.manifest.case_ids
+// order (max manifest rank among the wave's full case membership). S43b
+// (US-007): the controller now emits the wave's campaign-wide membership
+// (`o1_wave.wave_cases` — every manifest case of the wave in manifest order,
+// including cases that have not run yet), so the reporter selection is
+// IDENTICAL for every evaluating case in the wave: it never re-derives from
+// the per-case snapshot (which grows as later cases run at concurrency 1 and
+// can therefore pick DIFFERENT max-manifest-rank cases per evaluating case —
+// the campaign stamped the do-now family finding on TWO reporter cases, one
+// not even do-now). Only the true final wave case merges family findings into
+// its findings list. The reporter must be a real campaign case, so
+// wave_cases entries absent from the manifest are filtered out. When the wave
+// projection predates `wave_cases` (STORED schema-1 evidence, or fixture
+// shapes that never declare it), the legacy per-snapshot fallback below keeps
+// the pre-S43b deterministic behavior: wave rows whose case_id is absent from
+// the manifest (e.g. fixture peer runs) can never win the reporter slot, and
+// when the wave carries no manifest cases at all the full set is ranked
+// deterministically (localeCompare), so a single-case wave still reports
+// family findings from its only case.
+// S43b (US-007): exported for direct unit arms (oracle self-test + tier2
+// self-test) — the deterministic wave-family reporter selection.
+export function waveReporterCaseId(context) {
   const wave = context.o1_wave;
+  const manifestOrder = new Map(context.campaign.manifest.case_ids.map((id, index) => [id, index]));
+  if (Array.isArray(wave.wave_cases) && wave.wave_cases.length > 0) {
+    const inManifest = wave.wave_cases.filter((id) => manifestOrder.has(id));
+    if (inManifest.length > 0) {
+      const ordered = [...inManifest].sort((left, right) => manifestOrder.get(left) - manifestOrder.get(right));
+      return ordered[ordered.length - 1] ?? null;
+    }
+  }
   const caseIds = new Set();
   for (const run of wave.runs) caseIds.add(run.case_id);
   for (const floor of wave.duration_floors) {
     if (typeof floor.case_id === 'string' && floor.case_id.length > 0) caseIds.add(floor.case_id);
   }
-  const manifestOrder = new Map(context.campaign.manifest.case_ids.map((id, index) => [id, index]));
   const manifestCaseIds = [...caseIds].filter((id) => manifestOrder.has(id));
   const pool = manifestCaseIds.length > 0 ? manifestCaseIds : [...caseIds];
   const rank = (id) => (manifestOrder.has(id) ? manifestOrder.get(id) : Number.MAX_SAFE_INTEGER);
@@ -266,6 +284,14 @@ function evaluateDurationFloor(findings, wave, caseCtx) {
   }
   for (const workflow of launchedWorkflows) {
     const familyRuns = wave.runs.filter((run) => run.workflow === workflow);
+    // S43a (US-006): a run whose case declares expected_fast_failure (the
+    // per-cell fast-honest flag — its CORRECT behavior is early
+    // termination: refusal / small-do-now / auth-expiry) is excluded from
+    // BOTH the fast numerator and the eligible denominator of the family
+    // rate: the per-cell flag is authoritative for that cell, so its honest
+    // early termination is never flagged against the family
+    // production-median floor. Non-flagged cells keep the family floor
+    // (fail-closed default unchanged).
     const eligible = familyRuns.filter((run) => !run.expected_fast_failure);
     // T2.2 US-002: scripted runs are excluded from BOTH the fast numerator and
     // the eligible denominator — a mixed family counts only its real runs
@@ -301,7 +327,22 @@ function evaluateDurationFloor(findings, wave, caseCtx) {
       }
       resolutions.push({ ok: true, case_id: caseId, floor });
     }
-    if (eligible.length === 0) continue;
+    if (eligible.length === 0) {
+      // S43a (US-006): a family whose runs are ALL declared fast-honest
+      // (expected_fast_failure) has no floor-judgeable run — the family
+      // production-median floor cannot flag any of them, so no rate finding
+      // is possible. Write the zero-run observation row anyway (mirroring
+      // the scripted-only branch below) so campaign-wide duration-floor
+      // evidence stays complete for the family.
+      observations.push({
+        workflow,
+        case_floors: [],
+        run_count: 0,
+        fast_run_count: 0,
+        fast_rate: 0,
+      });
+      continue;
+    }
     if (realEligible.length === 0) {
       // Scripted-only family: no real runs to judge, so no
       // O1_DURATION_FLOOR_RATE/MISSING/DUPLICATE finding for this family. The
@@ -328,6 +369,11 @@ function evaluateDurationFloor(findings, wave, caseCtx) {
       continue;
     }
     const floorByCase = new Map(resolutions.map((resolution) => [resolution.case_id, resolution.floor]));
+    // S43a (US-006): each run is judged against ITS OWN case's floor row —
+    // a per-cell production_duration_floor_ms pin is authoritative for that
+    // cell, never the family median. An un-flagged run finishing below its
+    // own (or, absent a per-cell pin, the family) floor is still flagged:
+    // genuinely-too-fast cells keep failing closed.
     const fast = realEligible.filter((run) => run.terminal_at !== null
       && timestamp(run.terminal_at, `o1_wave run ${run.run_id} terminal_at`)
         - timestamp(run.started_at, `o1_wave run ${run.run_id} started_at`) < floorByCase.get(run.case_id).duration_floor_ms);

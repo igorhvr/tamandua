@@ -78,6 +78,9 @@ const HEAVY_CAMPAIGN_TESTS = [
   // US-002 (S29): fired-trigger corridor — must stay in lock-step with run.sh
   // + verify-heavy-campaign-tests.test.sh.
   "tier2-s29-fired-trigger-corridor.test.ts",
+  // US-010 (S44b): operator-seam cell corridors — must stay in lock-step with
+  // run.sh + verify-heavy-campaign-tests.test.sh.
+  "tier2-s44-operator-seam-corridors.test.ts",
   // US-004 (S29): premise-redesign corridor — must stay in lock-step with
   // run.sh + verify-heavy-campaign-tests.test.sh.
   "tier2-s29-premise-redesign-corridor.test.ts",

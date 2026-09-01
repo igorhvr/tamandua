@@ -44,7 +44,7 @@ test('O1 accepts converged DB/event/workflow evidence and catches every targeted
     const generated = spawnSync(process.execPath, [GENERATOR, workspace], { encoding: 'utf8', shell: false });
     assert.equal(generated.status, 0, generated.stderr);
     const names = fs.readdirSync(workspace).filter((name) => name.startsWith('o1-')).sort();
-    assert.equal(names.length, 30);
+    assert.equal(names.length, 35);
     for (const name of names) {
       const expectation = JSON.parse(fs.readFileSync(path.join(workspace, name, 'expectation.json'), 'utf8'));
       if (expectation.multiCase) continue; // covered by the dedicated multi-case test
@@ -202,6 +202,61 @@ test('O1 evaluates the wave-family floor guard from the last manifest case when 
   }
 });
 
+// S43b (US-007): wave-reporter dedupe. The campaign-20260826T225744158Z
+// shape — four do-now cells plus a LATER non-do-now cell (the true final wave
+// case in manifest order) share the wave, and each case's o1_wave SNAPSHOT
+// differs (concurrency-1 growth). The pre-fix per-snapshot reporter selection
+// stamped the do-now family finding on TWO cases (W4.dsh-do-now +
+// W4.dsh-fdmw, the latter not even do-now); the campaign-wide `wave_cases`
+// membership pins the reporter to the true final wave case for EVERY
+// evaluation, so the finding merges exactly once.
+test('S43b: O1 merges wave-family findings into exactly one reporter — the true final wave case in manifest order — even when snapshots differ per evaluating case', () => {
+  fs.mkdirSync(VAR_ROOT, { recursive: true });
+  const workspace = fs.mkdtempSync(path.join(VAR_ROOT, 'oracle-self-test.'));
+  try {
+    assert.equal(spawnSync(process.execPath, [GENERATOR, workspace], { encoding: 'utf8', shell: false }).status, 0);
+    const campaign = path.join(workspace, 'o1-wave-reporter-dedupe');
+    const expectation = JSON.parse(fs.readFileSync(path.join(campaign, 'expectation.json'), 'utf8'));
+    const doNow4 = invokeContext(expectation.contexts.doNow4);
+    const nonDoNow = invokeContext(expectation.contexts.nonDoNow);
+
+    // The last do-now case is NOT the reporter: its snapshot already carries
+    // the full do-now family (4 runs, 2 fast -> rate 0.5), but the reporter
+    // is the true final wave case in manifest order (the non-do-now cell), so
+    // the family finding is not stamped here — the case stays PASS.
+    assert.equal(doNow4.status, 0);
+    assert.equal(doNow4.response.result, 'PASS');
+    assert.equal(doNow4.response.findings.some((finding) => finding.id.startsWith('O1_DURATION_FLOOR')), false, JSON.stringify(doNow4.response.findings));
+
+    // The true final wave case (a NON-do-now cell, mirroring W4.dsh-fdmw) is
+    // the ONLY reporter: it carries the do-now family finding exactly once.
+    assert.equal(nonDoNow.status, 1);
+    assert.equal(nonDoNow.response.result, 'FAIL');
+    const rates = nonDoNow.response.findings.filter((finding) => finding.id === 'O1_DURATION_FLOOR_RATE');
+    assert.equal(rates.length, 1, JSON.stringify(nonDoNow.response.findings));
+    assert.equal(rates[0].workflow, 'do-now');
+    assert.equal(rates[0].run_count, 4);
+    assert.equal(rates[0].fast_run_count, 2);
+    assert.equal(rates[0].fast_rate, 0.5);
+    assert.deepEqual(rates[0].run_ids, ['run-wave-dedup-do-now-1', 'run-wave-dedup-do-now-2']);
+
+    // Duration floor observations stay in the evidence of BOTH cases — only
+    // the findings list is deduplicated. The do-now family row is present in
+    // each case's observation set (campaign-wide data).
+    for (const [label, outcome, contextPath] of [['doNow4', doNow4, expectation.contexts.doNow4], ['nonDoNow', nonDoNow, expectation.contexts.nonDoNow]]) {
+      const evidenceDir = path.dirname(contextPath);
+      const observation = JSON.parse(fs.readFileSync(path.join(evidenceDir, outcome.response.evidence[0].path), 'utf8'));
+      const doNowRow = observation.duration_floor_observations.find((row) => row.workflow === 'do-now');
+      assert.ok(doNowRow, `${label} must carry the do-now family observation`);
+      assert.equal(doNowRow.run_count, 4, label);
+      assert.equal(doNowRow.fast_run_count, 2, label);
+      assert.equal(doNowRow.fast_rate, 0.5, label);
+    }
+  } finally {
+    fs.rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
 test('O1 clears campaign-8 wave-1 do-now durations at the recalibrated 30s floor and fires on a sub-30s run', () => {
   fs.mkdirSync(VAR_ROOT, { recursive: true });
   const workspace = fs.mkdtempSync(path.join(VAR_ROOT, 'oracle-self-test.'));
@@ -294,6 +349,72 @@ test('T2.2 US-002: O1 excludes scripted and stored-evidence 0-token runs from du
     assert.deepEqual(rate.run_ids, ['run-wave-peer-2']);
     const mixedObservation = JSON.parse(fs.readFileSync(path.join(workspace, 'o1-mixed-real-scripted-family', 'evidence', mixed.response.evidence[0].path), 'utf8'));
     assert.equal(mixedObservation.duration_floor_observations.length, 1);
+    assert.equal(mixedObservation.duration_floor_observations[0].run_count, 4);
+    assert.equal(mixedObservation.duration_floor_observations[0].fast_run_count, 1);
+    assert.equal(mixedObservation.duration_floor_observations[0].fast_rate, 0.25);
+  } finally {
+    fs.rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test('S43a US-006: O1 duration-floor calibration — fast-honest flag + per-cell floors', () => {
+  fs.mkdirSync(VAR_ROOT, { recursive: true });
+  const workspace = fs.mkdtempSync(path.join(VAR_ROOT, 'oracle-self-test.'));
+  try {
+    assert.equal(spawnSync(process.execPath, [GENERATOR, workspace], { encoding: 'utf8', shell: false }).status, 0);
+
+    // RED-ARM (pre-fix): the campaign W4.08-control 13%-under shape — an
+    // HONEST run finishing 522s against the 600000ms family production-median
+    // floor (green content oracles) is the only fast run in a 4-run family:
+    // O1_DURATION_FLOOR_RATE fires citing the honest control run.
+    const red = invokeFixture(workspace, 'o1-control-under-floor');
+    assert.equal(red.status, 1);
+    assert.equal(red.response.result, 'FAIL');
+    const redRate = red.response.findings.find((finding) => finding.id === 'O1_DURATION_FLOOR_RATE');
+    assert.ok(redRate, JSON.stringify(red.response.findings));
+    assert.equal(redRate.run_count, 4);
+    assert.equal(redRate.fast_run_count, 1);
+    assert.equal(redRate.fast_rate, 0.25);
+    assert.deepEqual(redRate.run_ids, ['run-11111111-1111-4111-8111-111111111111']);
+
+    // GREEN-ARM (per-cell floor): the SAME shape with the per-cell floor
+    // recalibrated to 480000ms — the per-cell floor is AUTHORITATIVE for the
+    // control cell, the 522s honest run clears it, and the family PASSes.
+    const perCell = invokeFixture(workspace, 'o1-control-per-cell-floor');
+    assert.equal(perCell.status, 0);
+    assert.equal(perCell.response.result, 'PASS');
+    assert.equal(perCell.response.findings.some((finding) => finding.id.startsWith('O1_DURATION_FLOOR')), false, JSON.stringify(perCell.response.findings));
+    const perCellObservation = JSON.parse(fs.readFileSync(path.join(workspace, 'o1-control-per-cell-floor', 'evidence', perCell.response.evidence[0].path), 'utf8'));
+    const perCellFloors = new Map(perCellObservation.duration_floor_observations[0].case_floors.map((row) => [row.case_id, row]));
+    assert.equal(perCellFloors.get('o1-control-per-cell-floor').duration_floor_ms, 480000);
+    assert.equal(perCellObservation.duration_floor_observations[0].fast_run_count, 0);
+
+    // GREEN-ARM (flag): a family whose runs are ALL declared
+    // expected_fast_failure (the W4.37/W4.38-real/W4.47/W4.dsh-do-now shape)
+    // PASSes — no run is floor-judgeable, the zero-run observation is written.
+    const flagged = invokeFixture(workspace, 'o1-fast-honest-flagged');
+    assert.equal(flagged.status, 0);
+    assert.equal(flagged.response.result, 'PASS');
+    assert.equal(flagged.response.findings.some((finding) => finding.id.startsWith('O1_DURATION_FLOOR')), false, JSON.stringify(flagged.response.findings));
+    const flaggedObservation = JSON.parse(fs.readFileSync(path.join(workspace, 'o1-fast-honest-flagged', 'evidence', flagged.response.evidence[0].path), 'utf8'));
+    assert.equal(flaggedObservation.duration_floor_observations.length, 1);
+    assert.equal(flaggedObservation.duration_floor_observations[0].run_count, 0);
+    assert.equal(flaggedObservation.duration_floor_observations[0].fast_run_count, 0);
+
+    // GREEN-ARM (fail-closed): flagged fast runs are excluded from BOTH the
+    // numerator and the denominator, but an UN-FLAGGED too-fast run still
+    // FAILs the floor — the rate is computed on the un-flagged eligible only
+    // and cites only the un-flagged run.
+    const mixed = invokeFixture(workspace, 'o1-flagged-unflagged-mixed');
+    assert.equal(mixed.status, 1);
+    assert.equal(mixed.response.result, 'FAIL');
+    const mixedRate = mixed.response.findings.find((finding) => finding.id === 'O1_DURATION_FLOOR_RATE');
+    assert.ok(mixedRate, JSON.stringify(mixed.response.findings));
+    assert.equal(mixedRate.run_count, 4);
+    assert.equal(mixedRate.fast_run_count, 1);
+    assert.equal(mixedRate.fast_rate, 0.25);
+    assert.deepEqual(mixedRate.run_ids, ['run-wave-peer-1']);
+    const mixedObservation = JSON.parse(fs.readFileSync(path.join(workspace, 'o1-flagged-unflagged-mixed', 'evidence', mixed.response.evidence[0].path), 'utf8'));
     assert.equal(mixedObservation.duration_floor_observations[0].run_count, 4);
     assert.equal(mixedObservation.duration_floor_observations[0].fast_run_count, 1);
     assert.equal(mixedObservation.duration_floor_observations[0].fast_rate, 0.25);
