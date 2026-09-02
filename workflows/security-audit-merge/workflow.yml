@@ -104,6 +104,19 @@ agents:
         SOUL.md: agents/merger/SOUL.md
         IDENTITY.md: agents/merger/IDENTITY.md
 
+  - id: reviewer
+    name: Reviewer
+    role: analysis
+    description: Reviews TEST_CMD rewrites before landing (read-only).
+    workspace:
+      baseDir: agents/reviewer
+      skills:
+        - tamandua-agents
+      files:
+        AGENTS.md: agents/reviewer/AGENTS.md
+        SOUL.md: agents/reviewer/SOUL.md
+        IDENTITY.md: agents/reviewer/IDENTITY.md
+
 steps:
   - id: scan
     agent: scanner
@@ -371,6 +384,44 @@ steps:
     expects: "STATUS: done\nregex:^TESTED_TREE:\\s*\\S+"
     on_fail:
       retry_step: fix
+      max_reroutes: 4
+
+  - id: test_cmd_review
+    agent: reviewer
+    type: conditional
+    condition: test_cmd_review_required
+    input: |
+      Review a TEST_CMD rewrite detected in this run before it can be landed.
+
+      TASK:
+      {{task}}
+
+      REPO: {{repo}}
+      BRANCH: {{branch}}
+      RUN_ID: {{run_id}}
+
+      ESTABLISHED TEST_CMD (the run's current contract):
+      {{test_cmd_review_established}}
+
+      PROPOSED TEST_CMD (the rewrite under review):
+      {{test_cmd_review_candidate}}
+
+      RETRY FEEDBACK (only present if your previous review was rejected — read carefully and fix specifically what it complains about):
+      {{retry_feedback}}
+
+      Follow the review checklist in your AGENTS.md. You are READ-ONLY —
+      inspect only, never modify, never run the suite or the proposed command.
+
+      Reply with:
+      STATUS: done
+      VERDICT: ACCEPT|REJECT
+      FINDING: <only on REJECT — file-grounded evidence and rejection class>
+    expects: "STATUS: done\nregex:^VERDICT:\\s*(ACCEPT|REJECT)"
+    # US-006: a REJECT verdict re-pends the TEST_CMD producer (setup)
+    # with the FINDING as bounded retry feedback; accumulated rejections
+    # exhaust max_reroutes and fail the run legibly.
+    on_fail:
+      retry_step: setup
       max_reroutes: 4
 
   - id: finalize_merge

@@ -756,6 +756,181 @@ describe("finalize_merge ledger gate enforcement", () => {
     assert.equal(afterSecond.terminal_reroute_count, 1);
   });
 
+  // ─── WAVE-A TCMD Gate Coupling Tests (US-007) ────────────────────────
+
+  it("refuses finalize_merge claim while a TEST_CMD review is pending (fail closed)", () => {
+    const seeded = seedRun("default", "green");
+    const run = seeded.db.prepare("SELECT context FROM runs WHERE id = ?").get(seeded.runId) as { context: string };
+    seeded.db.prepare("UPDATE runs SET context = ? WHERE id = ?").run(
+      JSON.stringify({
+        ...JSON.parse(run.context),
+        test_cmd_review_required: "true",
+        test_cmd_review_established: "npm test",
+        test_cmd_review_candidate: "npm run build",
+      }),
+      seeded.runId,
+    );
+
+    assert.equal(claimStep("merger", seeded.runId).found, false, "finalize_merge must be refused while review is pending");
+
+    // The step stays pending (not failed, not rerouted) — it becomes
+    // claimable once the review resolves. No tester reroute is spent.
+    const step = seeded.db.prepare(
+      "SELECT status, reroute_count, terminal_reroute_count, ledger_concession_count FROM steps WHERE id = ?",
+    ).get(seeded.finalizeId) as {
+      status: string;
+      reroute_count: number;
+      terminal_reroute_count: number;
+      ledger_concession_count: number;
+    };
+    assert.equal(step.status, "pending");
+    assert.equal(step.reroute_count, 0);
+    assert.equal(step.terminal_reroute_count, 0);
+    assert.equal(step.ledger_concession_count, 0);
+
+    const runRow = seeded.db.prepare("SELECT status FROM runs WHERE id = ?").get(seeded.runId) as { status: string };
+    assert.equal(runRow.status, "running", "the run must stay running — the refusal is a gate, not a failure");
+
+    // Machine-parseable refusal event names old + new commands.
+    const refusals = getRunEvents(seeded.runId).filter(
+      (event) => event.event === "merge.refused_review_pending",
+    );
+    assert.equal(refusals.length, 1);
+    assert.equal(refusals[0].stepId, "finalize_merge");
+    assert.equal(refusals[0].oldTestCmd, "npm test");
+    assert.equal(refusals[0].newTestCmd, "npm run build");
+    assert.match(refusals[0].detail ?? "", /^FAILURE_CLASS: refused_review_pending$/m);
+
+    // No reroute of the producer is triggered by the review refusal.
+    assert.equal(
+      getRunEvents(seeded.runId).filter((event) => event.event === "step.rerouted").length,
+      0,
+    );
+  });
+
+  it("finalize_merge becomes claimable once the review resolves (flag cleared)", () => {
+    const seeded = seedRun("default", "green");
+    const run = seeded.db.prepare("SELECT context FROM runs WHERE id = ?").get(seeded.runId) as { context: string };
+    seeded.db.prepare("UPDATE runs SET context = ? WHERE id = ?").run(
+      JSON.stringify({
+        ...JSON.parse(run.context),
+        test_cmd_review_required: "true",
+        test_cmd_review_established: "npm test",
+        test_cmd_review_candidate: "npm run build",
+      }),
+      seeded.runId,
+    );
+    assert.equal(claimStep("merger", seeded.runId).found, false);
+
+    // The review resolves (ACCEPT adopts the candidate; the flag clears) and
+    // the tester records green evidence for the NEW contract.
+    const ctx = JSON.parse((seeded.db.prepare("SELECT context FROM runs WHERE id = ?").get(seeded.runId) as { context: string }).context);
+    delete ctx.test_cmd_review_required;
+    seeded.db.prepare("UPDATE runs SET context = ?, test_cmd_established = 'npm run build', test_cmd_source = 'reviewer' WHERE id = ?")
+      .run(JSON.stringify(ctx), seeded.runId);
+    seeded.db.prepare(
+      `INSERT INTO suite_results
+         (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms,
+          log_tail, run_id, step_id, created_at)
+       VALUES (?, ?, ?, 'npm run build', 0, 321, 'ledger log tail', 'writer-run', 'writer-step', '2026-07-26T12:36:00.000Z')`,
+    ).run(getOriginRepo(repo), TESTED_TREE, computeCmdHash("npm run build"));
+
+    const claim = claimStep("merger", seeded.runId);
+    assert.equal(claim.found, true, "finalize_merge must be claimable after the review resolves");
+    assert.equal(claim.stepId, seeded.finalizeId);
+  });
+
+  it("emits merge.landed_without_suite_evidence when a strict gate lands without suite evidence (already-landed)", () => {
+    // green mode is strict-missing: normally missing evidence refuses
+    // permanently. But an already-landed merge completes via the C24 guard —
+    // the landing must STILL be annotated truthfully.
+    const seeded = seedRun("green", "missing");
+    const targetBranch = execFileSync("git", ["symbolic-ref", "--short", "HEAD"], {
+      cwd: repo,
+      encoding: "utf-8",
+    }).trim();
+    const mainTip = execFileSync("git", ["rev-parse", `refs/heads/${targetBranch}`], {
+      cwd: repo,
+      encoding: "utf-8",
+    }).trim();
+    const run = seeded.db.prepare("SELECT context FROM runs WHERE id = ?").get(seeded.runId) as {
+      context: string;
+    };
+    seeded.db.prepare("UPDATE runs SET context = ? WHERE id = ?").run(
+      JSON.stringify({
+        ...JSON.parse(run.context),
+        original_branch: targetBranch,
+        worktree_origin_repository: repo,
+      }),
+      seeded.runId,
+    );
+    const landedOutput = `STATUS: done\nMERGED_COMMIT: ${mainTip}\nMERGED_TREE: abc123\nTARGET: refs/heads/${targetBranch}`;
+    // Simulate an in-flight claim made before the evidence disappeared.
+    seeded.db.prepare("UPDATE steps SET status = 'running' WHERE id = ?").run(seeded.finalizeId);
+
+    assert.equal(completeStep(seeded.finalizeId, landedOutput).status, "completed");
+
+    const annotations = getRunEvents(seeded.runId).filter(
+      (event) => event.event === "merge.landed_without_suite_evidence",
+    );
+    assert.equal(annotations.length, 1, "strict-mode missing-evidence landing MUST be annotated");
+    assert.equal(annotations[0].gateMode, "green");
+  });
+
+  it("names old+new commands on merge.landed_without_suite_evidence after a reviewed rewrite", () => {
+    // A reviewed rewrite ACCEPT leaves the review material keys in context
+    // with the flag cleared — the landing annotation must name old + new.
+    writeWorkflow(WORKFLOW_YAML.replace(/    on_fail:\n(?:      .*\n){3}/, ""));
+    const seeded = seedRun("default", "missing");
+    const run = seeded.db.prepare("SELECT context FROM runs WHERE id = ?").get(seeded.runId) as {
+      context: string;
+    };
+    seeded.db.prepare("UPDATE runs SET context = ? WHERE id = ?").run(
+      JSON.stringify({
+        ...JSON.parse(run.context),
+        test_cmd_review_established: "npm test",
+        test_cmd_review_candidate: "npm run build",
+      }),
+      seeded.runId,
+    );
+
+    const claim = claimStep("merger", seeded.runId);
+    assert.equal(claim.found, true);
+    assert.equal(completeStep(seeded.finalizeId, "STATUS: done").status, "completed");
+
+    const annotations = getRunEvents(seeded.runId).filter(
+      (event) => event.event === "merge.landed_without_suite_evidence",
+    );
+    assert.equal(annotations.length, 1);
+    assert.equal(annotations[0].oldTestCmd, "npm test");
+    assert.equal(annotations[0].newTestCmd, "npm run build");
+  });
+
+  it("names old+new commands on merge.landed_over_red_suite after a reviewed rewrite", () => {
+    const seeded = seedRun("default", "red");
+    const run = seeded.db.prepare("SELECT context FROM runs WHERE id = ?").get(seeded.runId) as {
+      context: string;
+    };
+    seeded.db.prepare("UPDATE runs SET context = ? WHERE id = ?").run(
+      JSON.stringify({
+        ...JSON.parse(run.context),
+        test_cmd_review_established: "npm test",
+        test_cmd_review_candidate: "npm run build",
+      }),
+      seeded.runId,
+    );
+
+    assert.equal(claimStep("merger", seeded.runId).found, true);
+    assert.equal(completeStep(seeded.finalizeId, "STATUS: done").status, "completed");
+
+    const annotations = getRunEvents(seeded.runId).filter(
+      (event) => event.event === "merge.landed_over_red_suite",
+    );
+    assert.equal(annotations.length, 1);
+    assert.equal(annotations[0].oldTestCmd, "npm test");
+    assert.equal(annotations[0].newTestCmd, "npm run build");
+  });
+
   // ─── Already-Landed Guard Tests (US-006) ────────────────────────────
 
   it("isAlreadyLanded returns true when target tip matches MERGED_COMMIT", () => {

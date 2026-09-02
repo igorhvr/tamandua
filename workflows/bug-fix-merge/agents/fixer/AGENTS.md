@@ -83,7 +83,12 @@ If no status marker is present in the submitted report, the scheduler treats the
 STATUS: done
 CHANGES: what files were changed and what was done (e.g., "Updated filterUsers in src/lib/search.ts to handle null displayName. Added null check before comparison.")
 REGRESSION_TEST: what test was added (e.g., "Added 'handles null displayName in search' test in src/lib/search.test.ts")
+REPRO_EVIDENCE: <pointer to failing output demonstrated on the pre-fix tree> OR CANNOT_REPRODUCE: <reasons>
 ```
+
+Either/or fourth key (at least one MUST be present):
+- `REPRO_EVIDENCE:` — pointer to the failing output you demonstrated on the PRE-FIX tree (e.g. a captured test failure, log line, or command output proving the bug existed before your change).
+- `CANNOT_REPRODUCE:` — if you genuinely could not reproduce the reported bug on the pre-fix tree, explain why (environment, missing inputs, etc.).
 
 ## Critical: All Changes Must Be In The Repo
 

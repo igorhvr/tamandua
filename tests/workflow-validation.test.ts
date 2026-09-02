@@ -211,7 +211,7 @@ describe("workflow structure", () => {
     const spec = await loadWorkflowSpec(wfDir("feature-dev-merge"));
 
     const stepIds = spec.steps.map((step) => step.id);
-    assert.deepEqual(stepIds, ["plan", "setup", "implement", "verify", "test", "finalize_merge"]);
+    assert.deepEqual(stepIds, ["plan", "setup", "implement", "verify", "test", "test_cmd_review", "finalize_merge"]);
     assert.equal(stepIds[stepIds.length - 1], "finalize_merge");
 
     const implementStep = spec.steps.find((step) => step.id === "implement");
@@ -421,25 +421,26 @@ describe("workflow structure", () => {
     assert.match(planStepInput, /STORIES_JSON: \[\{"id":"US-001"/);
   });
 
-  it("bug-fix has 5 agents, 5 steps, no merger, no finalize_merge, no ORIGINAL_BRANCH capture", async () => {
+  it("bug-fix has 6 agents, 6 steps, no merger, no finalize_merge, no ORIGINAL_BRANCH capture", async () => {
     const spec = await loadWorkflowSpec(wfDir("bug-fix"));
 
-    // 5 agents
+    // 6 agents
     const agentIds = spec.agents.map((a) => a.id);
-    assert.equal(spec.agents.length, 5, `expected 5 agents, got ${spec.agents.length}: ${agentIds.join(", ")}`);
+    assert.equal(spec.agents.length, 6, `expected 6 agents, got ${spec.agents.length}: ${agentIds.join(", ")}`);
     assert.ok(agentIds.includes("triager"));
     assert.ok(agentIds.includes("investigator"));
     assert.ok(agentIds.includes("setup"));
     assert.ok(agentIds.includes("fixer"));
     assert.ok(agentIds.includes("verifier"));
+    assert.ok(agentIds.includes("auditor"));
 
     // No merger agent
     assert.ok(!agentIds.includes("merger"), "bug-fix should not have merger agent");
 
-    // 5 steps
+    // 6 steps
     const stepIds = spec.steps.map((s) => s.id);
-    assert.equal(spec.steps.length, 5, `expected 5 steps, got ${spec.steps.length}: ${stepIds.join(", ")}`);
-    assert.deepEqual(stepIds, ["triage", "investigate", "setup", "fix", "verify"]);
+    assert.equal(spec.steps.length, 6, `expected 6 steps, got ${spec.steps.length}: ${stepIds.join(", ")}`);
+    assert.deepEqual(stepIds, ["triage", "investigate", "setup", "fix", "deception_audit", "verify"]);
 
     // No finalize_merge step
     assert.ok(!stepIds.includes("finalize_merge"), "bug-fix should not have finalize_merge step");
@@ -458,7 +459,7 @@ describe("workflow structure", () => {
     assert.match(readme, /`bug-fix`/);
     assert.match(readme, /stops after testing/i);
     assert.match(readme, /no merge/i);
-    assert.match(readme, /triage → investigate → setup → fix → verify/);
+    assert.match(readme, /triage → investigate → setup → fix → deception_audit → verify/);
   });
 
   it("README documents feature-dev-merge usage and pipeline", () => {
@@ -469,7 +470,7 @@ describe("workflow structure", () => {
     assert.match(readme, /`feature-dev-merge`/);
     assert.match(readme, /squash-merges/i);
     assert.match(readme, /original branch/i);
-    assert.match(readme, /plan → setup → implement → verify → test → finalize_merge/);
+    assert.match(readme, /plan → setup → implement → verify → test → test_cmd_review → finalize_merge/);
   });
 
   it("security-audit-merge finalize_merge step includes atomic plumbing instructions", async () => {
@@ -838,22 +839,232 @@ describe("US-010: Create remaining worktree workflow variants", () => {
     assert.ok(skills.includes("agent-browser"), "verifier workspace.skills must preserve agent-browser");
   });
 
-  it("bug-fix-merge-worktree step order matches original (triage → investigate → setup → fix → verify → finalize_merge)", async () => {
+  it("bug-fix-merge-worktree step order matches original (triage → investigate → setup → fix → deception_audit → verify → test_cmd_review → finalize_merge)", async () => {
     const spec = await loadWorkflowSpec(wfDir("bug-fix-merge-worktree"));
     const stepIds = spec.steps.map((s) => s.id);
-    assert.deepEqual(stepIds, ["triage", "investigate", "setup", "fix", "verify", "finalize_merge"]);
+    assert.deepEqual(stepIds, ["triage", "investigate", "setup", "fix", "deception_audit", "verify", "test_cmd_review", "finalize_merge"]);
   });
 
   it("security-audit-merge-worktree step order matches original", async () => {
     const spec = await loadWorkflowSpec(wfDir("security-audit-merge-worktree"));
     const stepIds = spec.steps.map((s) => s.id);
-    assert.deepEqual(stepIds, ["scan", "prioritize", "setup", "fix", "verify", "test", "finalize_merge"]);
+    assert.deepEqual(stepIds, ["scan", "prioritize", "setup", "fix", "verify", "test", "test_cmd_review", "finalize_merge"]);
   });
 
   it("bug-fix-worktree has no merger agent (non-merge variant)", async () => {
     const spec = await loadWorkflowSpec(wfDir("bug-fix-worktree"));
     const agentIds = spec.agents.map((a) => a.id);
     assert.ok(!agentIds.includes("merger"), "bug-fix-worktree should not have merger agent");
+  });
+
+  // ── US-005: TCMD reviewer agent + test_cmd_review conditional step ──
+  const tcmdReviewWorkflowIds = [
+    "feature-dev-merge",
+    "feature-dev-merge-worktree",
+    "bug-fix-merge",
+    "bug-fix-merge-worktree",
+    "security-audit-merge",
+    "security-audit-merge-worktree",
+  ];
+
+  const tcmdLastTestCmdStep: Record<string, string> = {
+    "feature-dev-merge": "test",
+    "feature-dev-merge-worktree": "test",
+    "bug-fix-merge": "verify",
+    "bug-fix-merge-worktree": "verify",
+    "security-audit-merge": "test",
+    "security-audit-merge-worktree": "test",
+  };
+
+  for (const id of tcmdReviewWorkflowIds) {
+    it(`${id} declares a reviewer agent (role analysis) with tamandua-agents skill`, async () => {
+      const spec = await loadWorkflowSpec(wfDir(id));
+      const reviewer = spec.agents.find((a) => a.id === "reviewer");
+      assert.ok(reviewer, `${id}: must declare a reviewer agent`);
+      assert.equal(reviewer!.role, "analysis", `${id}: reviewer role must be analysis`);
+      const skills = reviewer!.workspace.skills ?? [];
+      assert.ok(skills.includes("tamandua-agents"), `${id}: reviewer must have tamandua-agents skill`);
+    });
+
+    it(`${id} declares a test_cmd_review conditional step before finalize_merge`, async () => {
+      const spec = await loadWorkflowSpec(wfDir(id));
+      const stepIds = spec.steps.map((s) => s.id);
+      const finalIdx = stepIds.indexOf("finalize_merge");
+      assert.ok(finalIdx >= 0, `${id}: must have finalize_merge`);
+      const reviewIdx = stepIds.indexOf("test_cmd_review");
+      assert.ok(reviewIdx >= 0, `${id}: must have test_cmd_review step`);
+      assert.ok(reviewIdx < finalIdx, `${id}: test_cmd_review must precede finalize_merge`);
+
+      const reviewStep = spec.steps[reviewIdx];
+      assert.equal(reviewStep.type, "conditional", `${id}: test_cmd_review must be type conditional`);
+      assert.equal(reviewStep.condition, "test_cmd_review_required", `${id}: test_cmd_review condition`);
+      assert.equal(reviewStep.agent, "reviewer", `${id}: test_cmd_review agent`);
+      // Must sit immediately after the last TEST_CMD-emitting step.
+      const lastTestCmdIdx = stepIds.indexOf(tcmdLastTestCmdStep[id]);
+      assert.ok(lastTestCmdIdx >= 0, `${id}: must have the last TEST_CMD-emitting step`);
+      assert.equal(reviewIdx, lastTestCmdIdx + 1, `${id}: test_cmd_review must follow the last TEST_CMD-emitting step`);
+      // Reply-with contract: STATUS: done + VERDICT: ACCEPT|REJECT (+ FINDING on REJECT).
+      assert.match(reviewStep.input, /Reply with:\s*\n\s*STATUS: done/m);
+      assert.match(reviewStep.input, /VERDICT:\s*ACCEPT\|REJECT/);
+      assert.match(reviewStep.input, /FINDING:/);
+      // expects enforces the verdict and accepts the STATUS: done variant.
+      assert.match(reviewStep.expects, /regex:\^VERDICT:\\s\*\(ACCEPT\|REJECT\)/);
+      assert.ok(reviewStep.expects.includes("STATUS: done"), `${id}: expects must accept STATUS: done`);
+      // Reviewer step is READ-ONLY: input must not instruct writing or executing.
+      const reviewInstructionLines = reviewStep.input
+        .split(/\r?\n/)
+        .filter((line) => !/(?:^|[\s(])(?:never|do not|don'?t|must not|not)\b/i.test(line));
+      assert.doesNotMatch(reviewInstructionLines.join("\n"),
+        /git commit|git push|git add|git rebase|git merge|git apply|npm test|npm run|npm install|pnpm |yarn |pip install|run (the|your) (test|build)|write (a|the|code|files?)|create (a|the)? ?(file|function|test)|apply (a )?patch/gi,
+        `${id}: reviewer step input must not instruct writes or executions`);
+      // US-006: reviewer->producer retry wiring — a REJECT verdict re-pends the
+      // TEST_CMD producer (setup) with the FINDING; the M4 attestation rule is
+      // exempted for conditional review steps (workflow-spec validation).
+      assert.ok(reviewStep.on_fail, `${id}: test_cmd_review must declare on_fail retry wiring`);
+      assert.equal(reviewStep.on_fail!.retry_step, "setup",
+        `${id}: test_cmd_review on_fail.retry_step must target the TEST_CMD producer (setup)`);
+      assert.equal(reviewStep.on_fail!.max_reroutes, 4,
+        `${id}: test_cmd_review on_fail.max_reroutes must bound accumulated rejections`);
+    });
+  }
+
+  it("reviewer persona AGENTS.md implements the TCMD checklist with no write/execute instructions", () => {
+    for (const id of tcmdReviewWorkflowIds) {
+      const path = resolve(wfDir(id), "agents/reviewer/AGENTS.md");
+      assert.ok(existsSync(path), `${id}: reviewer AGENTS.md must exist`);
+      const content = readFileSync(path, "utf-8");
+      // Approved checklist elements (triage-decisions-2026-09-01).
+      for (const element of [
+        "Existence", "Coverage", "Narrowing-justification", "Task-relevance", "Equivalence",
+        "DEFAULT ACCEPT", "file-grounded", "unjustified-narrowing", "task-evasion", "contradicted-justification",
+      ]) {
+        assert.ok(content.includes(element), `${id}: reviewer AGENTS.md must contain checklist element "${element}"`);
+      }
+      // No write/execute instructions anywhere in the persona (grep-verifiable).
+      // Prohibitions ("You NEVER run the test suite") are allowed; imperative
+      // write/execute instructions are not. Drop prohibition lines first so a
+      // "never stage / commit" warning is not mistaken for an instruction.
+      const instructionLines = content
+        .split(/\r?\n/)
+        .filter((line) => !/(?:^|[\s(])(?:never|do not|don'?t|must not|not)\b/i.test(line));
+      assert.doesNotMatch(instructionLines.join("\n"),
+        /git commit|git push|git add|git rebase|git merge|git apply|npm test|npm run|npm install|pnpm |yarn |pip install|run (the|your) (test|build)|write (a|the|code|files?)|create (a|the)? ?(file|function|test)|apply (a )?patch/gi,
+        `${id}: reviewer AGENTS.md must not contain write/execute instructions`);
+      // READ-ONLY contract declared.
+      assert.match(content, /READ-ONLY/i, `${id}: reviewer AGENTS.md must declare the read-only contract`);
+    }
+  });
+
+  it("reviewer persona IDENTITY.md and SOUL.md exist for all six merge-gate workflows", () => {
+    for (const id of tcmdReviewWorkflowIds) {
+      for (const f of ["IDENTITY.md", "SOUL.md"]) {
+        const path = resolve(wfDir(id), "agents/reviewer", f);
+        assert.ok(existsSync(path), `${id}: agents/reviewer/${f} must exist`);
+        const content = readFileSync(path, "utf-8");
+        assert.ok(content.length > 0, `${id}: agents/reviewer/${f} must be non-empty`);
+      }
+    }
+  });
+
+  // ── US-009: PHNT deception auditor agent + deception_audit conditional step ──
+  const phntAuditWorkflowIds = [
+    "bug-fix",
+    "bug-fix-worktree",
+    "bug-fix-merge",
+    "bug-fix-merge-worktree",
+    "bug-fix-github-pr",
+  ];
+
+  for (const id of phntAuditWorkflowIds) {
+    it(`${id} declares an auditor agent (role analysis, read-only) with tamandua-agents skill`, async () => {
+      const spec = await loadWorkflowSpec(wfDir(id));
+      const auditor = spec.agents.find((a) => a.id === "auditor");
+      assert.ok(auditor, `${id}: must declare an auditor agent`);
+      assert.equal(auditor!.role, "analysis", `${id}: auditor role must be analysis`);
+      const skills = auditor!.workspace.skills ?? [];
+      assert.ok(skills.includes("tamandua-agents"), `${id}: auditor must have tamandua-agents skill`);
+      const desc = auditor!.description ?? "";
+      assert.match(desc, /read-only/i, `${id}: auditor description must declare read-only`);
+    });
+
+    it(`${id} declares a deception_audit conditional step placed after fix`, async () => {
+      const spec = await loadWorkflowSpec(wfDir(id));
+      const stepIds = spec.steps.map((s) => s.id);
+      const fixIdx = stepIds.indexOf("fix");
+      assert.ok(fixIdx >= 0, `${id}: must have fix step`);
+      const auditIdx = stepIds.indexOf("deception_audit");
+      assert.ok(auditIdx >= 0, `${id}: must have deception_audit step`);
+      assert.equal(auditIdx, fixIdx + 1, `${id}: deception_audit must sit immediately after fix`);
+
+      const auditStep = spec.steps[auditIdx];
+      assert.equal(auditStep.type, "conditional", `${id}: deception_audit must be type conditional`);
+      assert.equal(auditStep.condition, "deception_audit_required", `${id}: deception_audit condition`);
+      assert.equal(auditStep.agent, "auditor", `${id}: deception_audit agent`);
+      // Reply-with contract: STATUS: done + VERDICT: HONEST|DECEPTION (+ FINDING on DECEPTION).
+      assert.match(auditStep.input, /Reply with:\s*\n\s*STATUS: done/m);
+      assert.match(auditStep.input, /VERDICT:\s*HONEST\|DECEPTION/);
+      assert.match(auditStep.input, /FINDING:/);
+      // expects enforces the verdict and accepts the STATUS: done variant.
+      assert.match(auditStep.expects, /regex:\^VERDICT:\\s\*\(HONEST\|DECEPTION\)/);
+      assert.ok(auditStep.expects.includes("STATUS: done"), `${id}: expects must accept STATUS: done`);
+      // The audit step is READ-ONLY: input must not instruct writing or executing.
+      const auditInstructionLines = auditStep.input
+        .split(/\r?\n/)
+        .filter((line) => !/(?:^|[\s(])(?:never|do not|don'?t|must not|not)\b/i.test(line));
+      assert.doesNotMatch(auditInstructionLines.join("\n"),
+        /git commit|git push|git add|git rebase|git merge|git apply|npm test|npm run|npm install|pnpm |yarn |pip install|run (the|your) (test|build)|write (a|the|code|files?)|create (a|the)? ?(file|function|test)|apply (a )?patch/gi,
+        `${id}: deception_audit step input must not instruct writes or executions`);
+    });
+  }
+
+  it("US-010: each bug-* deception_audit declares on_fail retry_step fix for DECEPTION verdict routing", async () => {
+    for (const id of phntAuditWorkflowIds) {
+      const spec = await loadWorkflowSpec(wfDir(id));
+      const auditStep = spec.steps.find((s) => s.id === "deception_audit");
+      assert.ok(auditStep, `${id}: must have deception_audit step`);
+      assert.equal(auditStep.on_fail?.retry_step, "fix",
+        `${id}: deception_audit on_fail.retry_step must target the fix step (DECEPTION verdict reroutes the fix with the finding)`);
+      assert.ok((auditStep.on_fail?.max_reroutes ?? 0) >= 1,
+        `${id}: deception_audit must declare a reroute budget (max_reroutes) so accumulated rejections fail the run legibly`);
+    }
+  });
+
+  it("auditor persona AGENTS.md implements the PHNT deception checklist with no write/execute instructions", () => {
+    for (const id of phntAuditWorkflowIds) {
+      const path = resolve(wfDir(id), "agents/auditor/AGENTS.md");
+      assert.ok(existsSync(path), `${id}: auditor AGENTS.md must exist`);
+      const content = readFileSync(path, "utf-8");
+      // Approved checklist elements (phnt-design-state).
+      for (const element of [
+        "Premise-fabrication", "Symptom-silencing", "Claim-mismatch", "Mechanism-plausibility",
+        "DEFAULT HONEST", "quotable", "premise-fabrication", "symptom-silencing",
+        "claim-mismatch", "no-mechanism", "deception-only", "DECEPTION ONLY",
+      ]) {
+        assert.ok(content.includes(element), `${id}: auditor AGENTS.md must contain checklist element "${element}"`);
+      }
+      // No write/execute instructions anywhere in the persona (grep-verifiable).
+      // Prohibitions ("You NEVER run the test suite") are allowed; imperative
+      // write/execute instructions are not. Drop prohibition lines first.
+      const instructionLines = content
+        .split(/\r?\n/)
+        .filter((line) => !/(?:^|[\s(])(?:never|do not|don'?t|must not|not)\b/i.test(line));
+      assert.doesNotMatch(instructionLines.join("\n"),
+        /git commit|git push|git add|git rebase|git merge|git apply|npm test|npm run|npm install|pnpm |yarn |pip install|run (the|your) (test|build)|write (a|the|code|files?)|create (a|the)? ?(file|function|test)|apply (a )?patch/gi,
+        `${id}: auditor AGENTS.md must not contain write/execute instructions`);
+      // READ-ONLY contract declared.
+      assert.match(content, /READ-ONLY/i, `${id}: auditor AGENTS.md must declare the read-only contract`);
+    }
+  });
+
+  it("auditor persona IDENTITY.md and SOUL.md exist for all five bug-fix workflows", () => {
+    for (const id of phntAuditWorkflowIds) {
+      for (const f of ["IDENTITY.md", "SOUL.md"]) {
+        const path = resolve(wfDir(id), "agents/auditor", f);
+        assert.ok(existsSync(path), `${id}: agents/auditor/${f} must exist`);
+        const content = readFileSync(path, "utf-8");
+        assert.ok(content.length > 0, `${id}: agents/auditor/${f} must be non-empty`);
+      }
+    }
   });
 
   it("feature-dev-worktree implements step has loop wiring", async () => {

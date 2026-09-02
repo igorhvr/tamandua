@@ -16,7 +16,13 @@ import { LEDGER_RETENTION_MS } from "./suite/config.js";
 // bump is REQUIRED (see the WLST5.1 note below): adding the guarded ALTER
 // without bumping leaves existing DBs (user_version === 5) skipping it and
 // crashing with "no such column: instant_fail_count".
-export const SCHEMA_VERSION = 6;
+// v7: WAVE-A US-001 added the conditional-review / TEST_CMD contract columns:
+// steps.conditional_condition (activation flag key declared in workflow.yml),
+// steps.auto_completed + steps.auto_complete_reason (marker distinguishing
+// condition-unset auto-completions from agent-reviewed runs), and
+// runs.test_cmd_established + runs.test_cmd_source (the current TEST_CMD
+// contract and its origin: 'launch' or a step id).
+export const SCHEMA_VERSION = 7;
 
 // Counter for tests — increments each time migrate() runs the full DDL path.
 export let _migrateFullRuns = 0;
@@ -218,6 +224,25 @@ function migrate(db: DatabaseSync): void {
     db.exec("ALTER TABLE steps ADD COLUMN claim_invalidated_by TEXT");
   }
 
+  // ── WAVE-A conditional-review step columns ──
+  // - conditional_condition: the run-context flag key declared in
+  //   workflow.yml (type: conditional steps only; NULL for plain steps).
+  // - auto_completed: 1 when the dispatch motor auto-completed the step
+  //   IN-PROCESS (condition unset, zero tokens) instead of an agent review;
+  //   lets oracles/observers distinguish condition-unset auto-completions
+  //   from agent-reviewed runs.
+  // - auto_complete_reason: human-readable reason for the auto-completion
+  //   (e.g. 'condition_unset:<key>'); NULL when the step ran normally.
+  if (!stepColNames.has("conditional_condition")) {
+    db.exec("ALTER TABLE steps ADD COLUMN conditional_condition TEXT");
+  }
+  if (!stepColNames.has("auto_completed")) {
+    db.exec("ALTER TABLE steps ADD COLUMN auto_completed INTEGER NOT NULL DEFAULT 0");
+  }
+  if (!stepColNames.has("auto_complete_reason")) {
+    db.exec("ALTER TABLE steps ADD COLUMN auto_complete_reason TEXT");
+  }
+
   // ── WLST abandoned_count for stories ──
   // Tracks infrastructure-failure (worker-loss/timeout) story recoveries
   // separately from honest-verdict retry_count. Worker losses consume this
@@ -294,6 +319,22 @@ function migrate(db: DatabaseSync): void {
   const addInstantFail = db.prepare("SELECT name FROM pragma_table_info('runs') WHERE name = 'instant_fail_count'").all();
   if (addInstantFail.length === 0) {
     db.exec("ALTER TABLE runs ADD COLUMN instant_fail_count INTEGER NOT NULL DEFAULT 0");
+  }
+
+  // ── WAVE-A TEST_CMD contract columns ──
+  // - test_cmd_established: the current TEST_CMD contract for the run —
+  //   launch-declared `--context test_cmd=` wins, else the FIRST step-emitted
+  //   TEST_CMD: marker establishes it. Later differing markers never silently
+  //   replace this value (they raise a review flag instead).
+  // - test_cmd_source: where the contract came from — 'launch' or the step id
+  //   that first emitted the marker.
+  const addTestCmd = db.prepare("SELECT name FROM pragma_table_info('runs') WHERE name = 'test_cmd_established'").all();
+  if (addTestCmd.length === 0) {
+    db.exec("ALTER TABLE runs ADD COLUMN test_cmd_established TEXT");
+  }
+  const addTestCmdSource = db.prepare("SELECT name FROM pragma_table_info('runs') WHERE name = 'test_cmd_source'").all();
+  if (addTestCmdSource.length === 0) {
+    db.exec("ALTER TABLE runs ADD COLUMN test_cmd_source TEXT");
   }
 
   // Indexes for run-scoped scheduling and step claim queries.

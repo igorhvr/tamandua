@@ -16,7 +16,7 @@ describe("bug-fix-merge workflow", () => {
     assert.ok(spec.steps.length > 0);
   });
 
-  it("has correct step order: triage, investigate, setup, fix, verify, finalize_merge", async () => {
+  it("has correct step order: triage, investigate, setup, fix, deception_audit, verify, test_cmd_review, finalize_merge", async () => {
     const spec = await loadWorkflowSpec(wfDir);
     const stepIds = spec.steps.map((s) => s.id);
     assert.deepEqual(stepIds, [
@@ -24,7 +24,9 @@ describe("bug-fix-merge workflow", () => {
       "investigate",
       "setup",
       "fix",
+      "deception_audit",
       "verify",
+      "test_cmd_review",
       "finalize_merge",
     ]);
   });

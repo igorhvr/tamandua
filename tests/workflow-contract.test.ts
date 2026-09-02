@@ -240,6 +240,56 @@ describe("parseEnforcedKeys", () => {
     assert.equal(checkExpectsAcceptsVariant(expects, "failed"), false,
       "merger expects must reject STATUS: failed (not a valid merger outcome)");
   });
+
+  // US-008: PHNT — key-position alternation (either/or key) in expects
+  it("extracts both keys from regex:^(KEY1|KEY2): key-position alternation", () => {
+    const expects = "STATUS: done\nregex:^CHANGES:\\s*\\S+\nregex:^REGRESSION_TEST:\\s*\\S+\nregex:^(REPRO_EVIDENCE|CANNOT_REPRODUCE):\\s*\\S+";
+    const keys = parseEnforcedKeys(expects).sort();
+    assert.deepEqual(
+      keys,
+      ["cannot_reproduce", "changes", "regression_test", "repro_evidence"].sort(),
+      "both alternation alternatives must be recognized as enforced keys",
+    );
+  });
+
+  it("extracts non-caret key-position alternation regex:(KEY1|KEY2):", () => {
+    const expects = "STATUS: done\nregex:(REPRO_EVIDENCE|CANNOT_REPRODUCE):\\s*\\S+";
+    const keys = parseEnforcedKeys(expects).sort();
+    assert.deepEqual(keys, ["cannot_reproduce", "repro_evidence"].sort());
+  });
+
+  it("does not treat full-pair alternations as key-position alternations", () => {
+    // The merger's ^(STATUS:\s*retry|REBASED:\s*false) group contains key:value
+    // pairs, not bare key names — it must NOT yield repro-style key alternatives.
+    const expects = "regex:^(STATUS:\\s*retry|REBASED:\\s*false)\\s*$";
+    const keys = parseEnforcedKeys(expects);
+    assert.deepEqual(keys, [], "full-pair alternation must not match key-position alternation");
+  });
+
+  it("deduplicates alternation keys with plain KEY: lines", () => {
+    const expects = "STATUS: done\nregex:^(REPRO_EVIDENCE|CANNOT_REPRODUCE):\\s*\\S+\nREPRO_EVIDENCE: sim";
+    const keys = parseEnforcedKeys(expects);
+    assert.ok(keys.includes("repro_evidence"));
+    assert.ok(keys.includes("cannot_reproduce"));
+  });
+
+  it("validateExpects accepts an output carrying either alternation key", () => {
+    const expects = "STATUS: done\nregex:^(REPRO_EVIDENCE|CANNOT_REPRODUCE):\\s*\\S+";
+    assert.equal(
+      validateExpects("STATUS: done\nCHANGES: x\nREGRESSION_TEST: y\nREPRO_EVIDENCE: pre-fix failing output", expects),
+      null,
+      "REPRO_EVIDENCE variant must satisfy the either/or regex",
+    );
+    assert.equal(
+      validateExpects("STATUS: done\nCHANGES: x\nREGRESSION_TEST: y\nCANNOT_REPRODUCE: env-specific flake", expects),
+      null,
+      "CANNOT_REPRODUCE variant must satisfy the either/or regex",
+    );
+    assert.ok(
+      validateExpects("STATUS: done\nCHANGES: x\nREGRESSION_TEST: y", expects),
+      "an output with neither alternation key must be rejected",
+    );
+  });
 });
 
 describe("AUTO_CONTEXT_KEYS", () => {

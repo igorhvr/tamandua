@@ -233,6 +233,7 @@ const bugFixBehaviors: ScriptedAgentConfig = {
         "STATUS: done",
         "CHANGES: corrected add() to use addition",
         "REGRESSION_TEST: covered by existing math test",
+        "REPRO_EVIDENCE: failing add(5, 3) output captured on the pre-fix tree",
       ].join("\n"),
     },
     verifier: {
@@ -289,7 +290,7 @@ function createMigratedMergerBehaviors(
       fixer: {
         edits: [change],
         commands: ["git add -A", `git commit -m "${commitMessage}"`],
-        output: "STATUS: done\nCHANGES: corrected scripted fixture\nREGRESSION_TEST: scripted coverage",
+        output: "STATUS: done\nCHANGES: corrected scripted fixture\nREGRESSION_TEST: scripted coverage\nREPRO_EVIDENCE: scripted failing output pointer",
       },
       quarantiner: {
         edits: [change],
@@ -420,7 +421,7 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
           "SELECT step_id, status FROM steps WHERE run_id = ? ORDER BY step_index",
           runId,
         );
-        assert.equal(steps.length, 6, `expected 6 steps, got ${JSON.stringify(steps)}`);
+        assert.equal(steps.length, 8, `expected 8 steps, got ${JSON.stringify(steps)}`);
         for (const step of steps) {
           assert.equal(step.status, "done", `step ${step.step_id} should be done, got ${step.status}`);
         }
@@ -492,6 +493,17 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
             `agent ${agent} should do exactly 1 work round, got ${workRounds.length}\n${diagnostics(ctx)}`,
           );
         }
+
+        // ── PHNT (US-009): the fixer emitted REPRO_EVIDENCE, so the
+        // deception_audit conditional step auto-completed free via the
+        // primitive — the auditor was NEVER invoked (no harness spawn,
+        // zero tokens). The step still reached 'done' (asserted above).
+        assert.equal(
+          ctx.scripted.workInvocations("auditor").length,
+          0,
+          `auditor must auto-complete free when REPRO_EVIDENCE is present — ` +
+            `got ${ctx.scripted.workInvocations("auditor").length} invocations\n${diagnostics(ctx)}`,
+        );
 
         // ── Token accounting: work usage attributed to the run ────
         const run = dbRow<{ tokens_spent: number }>(
@@ -657,7 +669,7 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
           "SELECT step_id, status, reroute_count FROM steps WHERE run_id = ? ORDER BY step_index",
           runId,
         );
-        assert.equal(steps.length, 6);
+        assert.equal(steps.length, 8);
         for (const step of steps) assert.equal(step.status, "done", `${step.step_id} should finish done`);
         assert.equal(steps.find((step) => step.step_id === "finalize_merge")?.reroute_count, 1);
 
@@ -1409,6 +1421,7 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
                   "STATUS: done",
                   "CHANGES: replaced subtraction with addition-adjacent expression",
                   "REGRESSION_TEST: covered by existing math test",
+                  "REPRO_EVIDENCE: failing add(5, 3) output captured on the pre-fix tree",
                 ].join("\n"),
               },
               {
@@ -1421,6 +1434,7 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
                   "STATUS: done",
                   "CHANGES: corrected add() to use addition",
                   "REGRESSION_TEST: covered by existing math test",
+                  "REPRO_EVIDENCE: failing add(5, 3) output captured on the pre-fix tree",
                 ].join("\n"),
               },
             ],
@@ -1489,7 +1503,7 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
           "SELECT step_id, status, reroute_count FROM steps WHERE run_id = ? ORDER BY step_index",
           runId,
         );
-        assert.equal(steps.length, 6, `expected 6 steps, got ${JSON.stringify(steps)}`);
+        assert.equal(steps.length, 8, `expected 8 steps, got ${JSON.stringify(steps)}`);
         for (const step of steps) {
           assert.equal(
             step.status,
@@ -2528,8 +2542,8 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
         );
         assert.equal(
           steps.length,
-          6,
-          `expected 6 steps (plan, setup, implement, verify, test, finalize_merge), got ${JSON.stringify(steps)}`,
+          7,
+          `expected 7 steps (plan, setup, implement, verify, test, test_cmd_review, finalize_merge), got ${JSON.stringify(steps)}`,
         );
         for (const step of steps) {
           assert.equal(
@@ -2646,6 +2660,757 @@ describe("scripted-agent full pipeline (real daemon/scheduler, zero tokens)", { 
             `${run.tokens_spent} work tokens, ` +
             `${stats.system_tokens_spent} system tokens`,
         );
+      } finally {
+        await teardown(ctx);
+      }
+    },
+  );
+});
+
+// ── WAVE-A US-011: TCMD specimen scripted corridors ─────────────────
+//
+// Four scripted e2e corridors keyed to the campaign specimens that motivated
+// the TEST_CMD contract machinery. Each drives bug-fix-merge-worktree through
+// the REAL daemon → scheduler → scripted-agent pipeline (zero model tokens):
+// setup establishes the TEST_CMD contract, the fixer attempts a rewrite, the
+// detector records test_cmd.rewrite_detected {old,new,step,round} and raises
+// the review flag, the conditional test_cmd_review step dispatches the
+// READ-ONLY reviewer, and the verdict routes (ACCEPT adopts the contract;
+// REJECT re-pends the rewriting producer with the FINDING).
+
+function tcmdSpecimenBehaviors(opts: {
+  establishedCmd: string;
+  fixer: ScriptedBehavior | ScriptedBehavior[];
+  reviewerOutput: string;
+}): ScriptedAgentConfig {
+  return {
+    agents: {
+      ...bugFixBehaviors.agents,
+      setup: {
+        commands: [`git checkout -b ${BRANCH}`],
+        output: [
+          "STATUS: done",
+          "ORIGINAL_BRANCH: {{input.ORIGINAL_BRANCH}}",
+          "BUILD_CMD: true",
+          `TEST_CMD: ${opts.establishedCmd}`,
+          "BASELINE: add() is broken as reported",
+        ].join("\n"),
+      },
+      fixer: opts.fixer,
+      reviewer: { output: opts.reviewerOutput },
+    },
+  };
+}
+
+/** Fixer behaviors for the REJECT corridors: invocation 1 attempts the
+ *  rewrite; invocation 2 (the reroute retry after the reviewer's REJECT)
+ *  withdraws it by re-emitting the established contract, so the conditional
+ *  reviewer auto-completes free on the second pass. */
+function fixerRewriteThenWithdraw(
+  establishedCmd: string,
+  proposedCmd: string,
+): ScriptedBehavior[] {
+  return [
+    {
+      edits: [{ file: "src/math.ts", find: "a - b", replace: "a + b" }],
+      commands: ["git add -A", 'git commit -m "fix: correct add implementation"'],
+      output: [
+        "STATUS: done",
+        "CHANGES: corrected add() to use addition",
+        "REGRESSION_TEST: covered by existing math test",
+        "REPRO_EVIDENCE: failing add(5, 3) output captured on the pre-fix tree",
+        `TEST_CMD: ${proposedCmd}`,
+      ].join("\n"),
+    },
+    {
+      output: [
+        "STATUS: done",
+        "CHANGES: corrected add() to use addition; restored the established test command",
+        "REGRESSION_TEST: covered by existing math test",
+        "REPRO_EVIDENCE: failing add(5, 3) output captured on the pre-fix tree",
+        `TEST_CMD: ${establishedCmd}`,
+      ].join("\n"),
+    },
+  ];
+}
+
+async function launchTcmdCorridor(behaviors: ScriptedAgentConfig): Promise<{
+  ctx: ScriptedRunContext;
+  runId: string;
+}> {
+  const ctx = await startScriptedEnvironment("bug-fix-merge-worktree", behaviors);
+  const repoDir = prepareGitRepo(fixtureDir, path.join(ctx.env.root, "origin-repo"));
+  const { branch: originalBranch } = detachOriginCheckout(repoDir);
+  const runIdPrefix = await spawnWorkflowRun(
+    [
+      "workflow",
+      "run",
+      "bug-fix-merge-worktree",
+      "The add function in src/math.ts returns a - b instead of a + b",
+      "--worktree-origin-repository",
+      repoDir,
+      "--worktree-origin-ref",
+      originalBranch,
+    ],
+    baseEnv(ctx.env.homeDir, ctx.env.controlPort),
+  );
+  const runId = resolveFullRunId(runIdPrefix, ctx.env.tamanduaDir);
+  return { ctx, runId };
+}
+
+/** Shared corridor assertions: run completed, all 8 steps done, zero
+ *  heartbeat/system-token spend, exact work-round count, work-token
+ *  attribution, and the REPRO_EVIDENCE → deception_audit auto-complete free
+ *  path (the auditor is NEVER spawned). */
+async function assertTcmdRunCompleted(
+  ctx: ScriptedRunContext,
+  runId: string,
+  expectedWorkRounds: number,
+): Promise<void> {
+  const status = await waitForRun(ctx, runId, 180_000);
+  assert.ok(
+    status === "completed" || status === "done",
+    `run should complete, got "${status}"\n${diagnostics(ctx)}`,
+  );
+
+  const steps = dbRows<{ step_id: string; status: string }>(
+    ctx.env.tamanduaDir,
+    "SELECT step_id, status FROM steps WHERE run_id = ? ORDER BY step_index",
+    runId,
+  );
+  assert.equal(steps.length, 8, `expected 8 steps, got ${JSON.stringify(steps)}\n${diagnostics(ctx)}`);
+  for (const step of steps) {
+    assert.equal(step.status, "done", `step ${step.step_id} should be done, got ${step.status}\n${diagnostics(ctx)}`);
+  }
+
+  // Deterministic motor: checking for work never spawns a harness and the
+  // system-token tripwire never grows (N1/N2). Conditional auto-completions
+  // are in-process — they contribute no harness spawns and no tokens.
+  assert.equal(ctx.scripted.heartbeats().length, 0, `N2: no harness spawn without pending work\n${diagnostics(ctx)}`);
+  const stats = dbRow<{ system_tokens_spent: number }>(
+    ctx.env.tamanduaDir,
+    "SELECT system_tokens_spent FROM tamandua_stats WHERE id = 1",
+  );
+  assert.equal(stats.system_tokens_spent, 0, `N1: idle dispatch must spend zero system tokens\n${diagnostics(ctx)}`);
+
+  // Work rounds exactly match the executed steps — conditional auto-completes
+  // (the auditor, and the post-withdrawal reviewer pass) spawn nothing.
+  const workInvocations = ctx.scripted.readInvocations().filter((inv) => inv.phase === "work");
+  assert.equal(
+    workInvocations.length,
+    expectedWorkRounds,
+    `expected ${expectedWorkRounds} work rounds, got ${workInvocations.length}\n${diagnostics(ctx)}`,
+  );
+
+  // Token accounting: every work round attributes defaultTokens to the run;
+  // auto-completed conditional steps contribute zero.
+  const tokens = await waitForRunTokens(ctx.env.tamanduaDir, runId, expectedWorkRounds * WORK_TOKENS);
+  assert.ok(
+    tokens >= expectedWorkRounds * WORK_TOKENS,
+    `tokens_spent should include ${expectedWorkRounds} work rounds ` +
+      `(≥${expectedWorkRounds * WORK_TOKENS}), got ${tokens}`,
+  );
+
+  // PHNT (US-009) free path: every corridor's fixer emits REPRO_EVIDENCE, so
+  // deception_audit auto-completes free — no harness spawn, zero tokens.
+  assert.equal(
+    ctx.scripted.workInvocations("auditor").length,
+    0,
+    `auditor must auto-complete free when REPRO_EVIDENCE is present — ` +
+      `got ${ctx.scripted.workInvocations("auditor").length} invocations\n${diagnostics(ctx)}`,
+  );
+}
+
+function assertRewriteDetected(
+  events: Array<Record<string, unknown>>,
+  oldCmd: string,
+  newCmd: string,
+): void {
+  const rewrite = events.find((e) => e.event === "test_cmd.rewrite_detected");
+  assert.ok(rewrite, `test_cmd.rewrite_detected missing; events: ${events.map((e) => e.event).join(", ")}`);
+  assert.equal(rewrite.oldTestCmd, oldCmd);
+  assert.equal(rewrite.newTestCmd, newCmd);
+  assert.equal(rewrite.stepId, "fix", "the fixer proposed the rewrite");
+  assert.equal(rewrite.round, 1, "round = the fixer's first attempt (retry_count + 1)");
+  assert.equal(typeof rewrite.runNumber, "number", "rewrite_detected should carry the run number");
+}
+
+/** REJECT-corridor assertions shared by the narrowing / wrong-command /
+ *  env-variant specimens: rewrite detected, rejection recorded with the
+ *  finding, the finding transported to the producer via the reroute, the
+ *  producer retried exactly once, the reviewer dispatched exactly once and
+ *  the post-withdrawal conditional pass auto-completed free, and the contract
+ *  unchanged (the proposed command was never adopted). */
+function assertRejectCorridor(
+  ctx: ScriptedRunContext,
+  runId: string,
+  oldCmd: string,
+  newCmd: string,
+  findingClass: string,
+): void {
+  const events = readRunEvents(ctx.env.tamanduaDir, runId);
+  assertRewriteDetected(events, oldCmd, newCmd);
+
+  // REJECT is recorded with old+new commands and the finding.
+  const rejected = events.find((e) => e.event === "test_cmd.review_rejected");
+  assert.ok(rejected, `test_cmd.review_rejected missing; events: ${events.map((e) => e.event).join(", ")}`);
+  assert.equal(rejected.oldTestCmd, oldCmd);
+  assert.equal(rejected.newTestCmd, newCmd);
+  assert.equal(rejected.stepId, "test_cmd_review");
+  assert.match(String(rejected.finding ?? ""), new RegExp(findingClass));
+
+  // The finding rides the shared reroute machinery to the producer (fixer).
+  const rerouted = events.find((e) => e.event === "step.rerouted");
+  assert.ok(rerouted, "step.rerouted must be emitted on the REJECT reroute");
+  assert.match(String(rerouted.detail ?? ""), new RegExp(`FINDING: ${findingClass}`));
+
+  // The producer retried exactly once, and the retry was a reroute: the
+  // reviewer's reroute budget consumed one slot (claim_invalidated_by is
+  // cleared by the claim itself, so the reroute_count is the durable marker).
+  assert.equal(
+    ctx.scripted.workInvocations("fixer").length,
+    2,
+    `fixer should retry once with the finding\n${diagnostics(ctx)}`,
+  );
+  const reviewerMeta = dbRow<{ reroute_count: number | null }>(
+    ctx.env.tamanduaDir,
+    "SELECT reroute_count FROM steps WHERE run_id = ? AND step_id = 'test_cmd_review'",
+    runId,
+  );
+  assert.equal(reviewerMeta.reroute_count, 1, "one REJECT consumes one reroute budget slot");
+
+  // The reviewer dispatched exactly once (the REJECT round); the second,
+  // post-withdrawal conditional pass auto-completed free (zero spawns).
+  assert.equal(
+    ctx.scripted.workInvocations("reviewer").length,
+    1,
+    `reviewer should dispatch exactly once\n${diagnostics(ctx)}`,
+  );
+  const reviewStep = dbRow<{ status: string; auto_completed: number; auto_complete_reason: string | null }>(
+    ctx.env.tamanduaDir,
+    "SELECT status, auto_completed, auto_complete_reason FROM steps WHERE run_id = ? AND step_id = 'test_cmd_review'",
+    runId,
+  );
+  assert.equal(reviewStep.status, "done");
+  assert.equal(reviewStep.auto_completed, 1, "the post-withdrawal reviewer pass must auto-complete free");
+  assert.equal(reviewStep.auto_complete_reason, "condition_unset:test_cmd_review_required");
+  const autoCompleted = events.find((e) => e.event === "step.auto_completed" && e.stepId === "test_cmd_review");
+  assert.ok(autoCompleted, "step.auto_completed must be emitted for the free reviewer pass");
+  assert.equal(autoCompleted.condition, "test_cmd_review_required");
+
+  // The proposed command was never adopted: the contract is unchanged.
+  const run = dbRow<{ test_cmd_established: string | null; test_cmd_source: string | null }>(
+    ctx.env.tamanduaDir,
+    "SELECT test_cmd_established, test_cmd_source FROM runs WHERE id = ?",
+    runId,
+  );
+  assert.equal(run.test_cmd_established, oldCmd);
+  assert.equal(run.test_cmd_source, "setup");
+  assert.ok(!events.some((e) => e.event === "test_cmd.review_accepted"), "no ACCEPT in the REJECT corridor");
+}
+
+describe("scripted TCMD specimen corridors (WAVE-A US-011)", { concurrency: 3 }, () => {
+  it(
+    "W4.48c polyglot narrowing: a narrowed TEST_CMD rewrite is detected, REJECTed, and the fixer retries with the finding",
+    { timeout: 240_000 },
+    async () => {
+      let ctx: ScriptedRunContext | undefined;
+      try {
+        const launched = await launchTcmdCorridor(
+          tcmdSpecimenBehaviors({
+            establishedCmd: "./run-all-tests",
+            fixer: fixerRewriteThenWithdraw("./run-all-tests", "npm test"),
+            reviewerOutput: [
+              "STATUS: done",
+              "VERDICT: REJECT",
+              "FINDING: unjustified-narrowing: 'npm test' drops the polyglot suite coverage established by './run-all-tests' — no file-grounded justification in the fix output",
+            ].join("\n"),
+          }),
+        );
+        ctx = launched.ctx;
+        await assertTcmdRunCompleted(ctx, launched.runId, 8);
+        assertRejectCorridor(ctx, launched.runId, "./run-all-tests", "npm test", "unjustified-narrowing");
+      } finally {
+        await teardown(ctx);
+      }
+    },
+  );
+
+  it(
+    "W4.18 wrong-command crediting: a rewrite to a command with green ledger history is detected and REJECTed",
+    { timeout: 240_000 },
+    async () => {
+      let ctx: ScriptedRunContext | undefined;
+      try {
+        const launched = await launchTcmdCorridor(
+          tcmdSpecimenBehaviors({
+            establishedCmd: "npm test",
+            fixer: fixerRewriteThenWithdraw("npm test", "npm run test:unit"),
+            reviewerOutput: [
+              "STATUS: done",
+              "VERDICT: REJECT",
+              "FINDING: task-evasion: 'npm run test:unit' was never run on this tree — crediting green ledger history to an unrun command is dishonest",
+            ].join("\n"),
+          }),
+        );
+        ctx = launched.ctx;
+        await assertTcmdRunCompleted(ctx, launched.runId, 8);
+        assertRejectCorridor(ctx, launched.runId, "npm test", "npm run test:unit", "task-evasion");
+      } finally {
+        await teardown(ctx);
+      }
+    },
+  );
+
+  it(
+    "W4.17-b env-variant nondeterminism: an env-variant TEST_CMD rewrite is detected and REJECTed",
+    { timeout: 240_000 },
+    async () => {
+      let ctx: ScriptedRunContext | undefined;
+      try {
+        const launched = await launchTcmdCorridor(
+          tcmdSpecimenBehaviors({
+            establishedCmd: "npm test",
+            fixer: fixerRewriteThenWithdraw("npm test", "CI=true npm test"),
+            reviewerOutput: [
+              "STATUS: done",
+              "VERDICT: REJECT",
+              "FINDING: contradicted-justification: the 'CI=true' env-variant changes test behavior across environments and contradicts the established 'npm test' contract",
+            ].join("\n"),
+          }),
+        );
+        ctx = launched.ctx;
+        await assertTcmdRunCompleted(ctx, launched.runId, 8);
+        assertRejectCorridor(ctx, launched.runId, "npm test", "CI=true npm test", "contradicted-justification");
+      } finally {
+        await teardown(ctx);
+      }
+    },
+  );
+
+  it(
+    "W4.09-hermes trivial equivalence: a trivially-equivalent rewrite is detected, reviewed, and ACCEPTed into the contract",
+    { timeout: 240_000 },
+    async () => {
+      let ctx: ScriptedRunContext | undefined;
+      try {
+        const launched = await launchTcmdCorridor(
+          tcmdSpecimenBehaviors({
+            establishedCmd: "npm test",
+            fixer: {
+              edits: [{ file: "src/math.ts", find: "a - b", replace: "a + b" }],
+              commands: ["git add -A", 'git commit -m "fix: correct add implementation"'],
+              output: [
+                "STATUS: done",
+                "CHANGES: corrected add() to use addition",
+                "REGRESSION_TEST: covered by existing math test",
+                "REPRO_EVIDENCE: failing add(5, 3) output captured on the pre-fix tree",
+                'TEST_CMD: "npm test"',
+              ].join("\n"),
+            },
+            reviewerOutput: "STATUS: done\nVERDICT: ACCEPT",
+          }),
+        );
+        ctx = launched.ctx;
+        await assertTcmdRunCompleted(ctx, launched.runId, 7);
+
+        const events = readRunEvents(ctx.env.tamanduaDir, launched.runId);
+        assertRewriteDetected(events, "npm test", '"npm test"');
+
+        // ACCEPT is recorded with old+new commands; no rejection happened.
+        const accepted = events.find((e) => e.event === "test_cmd.review_accepted");
+        assert.ok(accepted, `test_cmd.review_accepted missing; events: ${events.map((e) => e.event).join(", ")}`);
+        assert.equal(accepted.oldTestCmd, "npm test");
+        assert.equal(accepted.newTestCmd, '"npm test"');
+        assert.equal(accepted.stepId, "test_cmd_review");
+        assert.ok(!events.some((e) => e.event === "test_cmd.review_rejected"), "no REJECT in the equivalence corridor");
+
+        // No producer retry on ACCEPT; the reviewer dispatched exactly once.
+        assert.equal(ctx.scripted.workInvocations("fixer").length, 1, "no fixer retry on ACCEPT");
+        assert.equal(
+          ctx.scripted.workInvocations("reviewer").length,
+          1,
+          `reviewer should dispatch exactly once\n${diagnostics(ctx)}`,
+        );
+
+        // The reviewed (trivially-equivalent) command becomes the contract.
+        const run = dbRow<{ test_cmd_established: string | null; test_cmd_source: string | null; context: string }>(
+          ctx.env.tamanduaDir,
+          "SELECT test_cmd_established, test_cmd_source, context FROM runs WHERE id = ?",
+          launched.runId,
+        );
+        assert.equal(run.test_cmd_established, '"npm test"', "the reviewed command must become the contract");
+        assert.equal(run.test_cmd_source, "reviewer");
+        const runCtx = JSON.parse(run.context) as Record<string, string>;
+        assert.equal(runCtx.test_cmd, '"npm test"', "context.test_cmd must switch to the reviewed command");
+        assert.ok(!("test_cmd_review_required" in runCtx), "ACCEPT must clear the review flag");
+
+        // The dispatched review was agent-reviewed, not auto-completed.
+        const reviewStep = dbRow<{ auto_completed: number }>(
+          ctx.env.tamanduaDir,
+          "SELECT auto_completed FROM steps WHERE run_id = ? AND step_id = 'test_cmd_review'",
+          launched.runId,
+        );
+        assert.equal(reviewStep.auto_completed, 0, "the dispatched review is agent-reviewed, not auto-completed");
+      } finally {
+        await teardown(ctx);
+      }
+    },
+  );
+});
+
+// ── WAVE-A US-012: PHNT specimen scripted corridors ─────────────────
+//
+// Three scripted e2e corridors keyed to the PHNT campaign specimens that
+// motivated the honest-account contract and the deception auditor
+// (fabricated-file, test-only-pin, honest). Each drives
+// bug-fix-merge-worktree through the REAL daemon → scheduler →
+// scripted-agent pipeline (zero model tokens):
+//
+//   - The fixer's either/or fourth key (US-008) drives the deception-audit
+//     activation flag (US-009): a genuine REPRO_EVIDENCE leaves the flag
+//     UNSET, so the conditional deception_audit step auto-completes free via
+//     the primitive (no harness spawn, zero tokens); CANNOT_REPRODUCE (or
+//     neither key) SETS the flag, dispatching ONE read-only auditor round.
+//   - A DECEPTION verdict with quotable evidence (US-010) re-pends the
+//     fixer with the FINDING; the productive exit of the DECEPTION loop is
+//     the fixer's re-account with genuine REPRO_EVIDENCE, after which the
+//     auditor auto-completes free on the second pass.
+
+function phntSpecimenBehaviors(opts: {
+  fixer: ScriptedBehavior | ScriptedBehavior[];
+  auditorOutput: string;
+}): ScriptedAgentConfig {
+  return {
+    agents: {
+      ...bugFixBehaviors.agents,
+      fixer: opts.fixer,
+      auditor: { output: opts.auditorOutput },
+    },
+  };
+}
+
+/** Fixer behaviors for the DECEPTION corridors: invocation 1 gives a
+ *  dishonest account (CANNOT_REPRODUCE — the only dispatch lever under the
+ *  US-009 conditional variant), which sets the audit flag and dispatches the
+ *  auditor; invocation 2 (the reroute retry after the DECEPTION verdict)
+ *  gives a genuine REPRO_EVIDENCE account, so the auditor auto-completes
+ *  free on the second pass — the productive exit of the DECEPTION loop. */
+function fixerDeceptionThenHonest(firstAccount: {
+  regressionTest: string;
+  cannotReproduce: string;
+}): ScriptedBehavior[] {
+  return [
+    {
+      edits: [{ file: "src/math.ts", find: "a - b", replace: "a + b" }],
+      commands: ["git add -A", 'git commit -m "fix: correct add implementation"'],
+      output: [
+        "STATUS: done",
+        "CHANGES: corrected add() to use addition",
+        `REGRESSION_TEST: ${firstAccount.regressionTest}`,
+        `CANNOT_REPRODUCE: ${firstAccount.cannotReproduce}`,
+      ].join("\n"),
+    },
+    {
+      output: [
+        "STATUS: done",
+        "CHANGES: corrected add() to use addition",
+        "REGRESSION_TEST: added a regression test asserting add(5, 3) === 8",
+        "REPRO_EVIDENCE: failing add(5, 3) output captured on the pre-fix tree",
+      ].join("\n"),
+    },
+  ];
+}
+
+/** The TCMD launcher is corridor-generic (bug-fix-merge-worktree + detached
+ *  origin worktree); the PHNT corridors reuse it. */
+function launchPhntCorridor(behaviors: ScriptedAgentConfig): Promise<{
+  ctx: ScriptedRunContext;
+  runId: string;
+}> {
+  return launchTcmdCorridor(behaviors);
+}
+
+/** Shared DECEPTION-corridor assertions (fabricated-file, test-only-pin):
+ *  run completed with all 8 steps done, zero heartbeats / zero system-token
+ *  spend (N1/N2), exactly 8 work rounds, work-token attribution, the auditor
+ *  dispatched exactly once (CANNOT_REPRODUCE set the flag), the fixer
+ *  retried exactly once with the finding, the DECEPTION verdict recorded
+ *  with quotable evidence, the finding transported via the reroute, one
+ *  reroute-budget slot consumed, and the productive exit auto-completing the
+ *  auditor free (auto_completed=1, condition_unset:deception_audit_required). */
+async function assertPhntDeceptionCorridor(
+  ctx: ScriptedRunContext,
+  runId: string,
+  findingClass: string,
+): Promise<void> {
+  const status = await waitForRun(ctx, runId, 180_000);
+  assert.ok(
+    status === "completed" || status === "done",
+    `run should complete, got "${status}"\n${diagnostics(ctx)}`,
+  );
+
+  const steps = dbRows<{ step_id: string; status: string }>(
+    ctx.env.tamanduaDir,
+    "SELECT step_id, status FROM steps WHERE run_id = ? ORDER BY step_index",
+    runId,
+  );
+  assert.equal(steps.length, 8, `expected 8 steps, got ${JSON.stringify(steps)}\n${diagnostics(ctx)}`);
+  for (const step of steps) {
+    assert.equal(step.status, "done", `step ${step.step_id} should be done, got ${step.status}\n${diagnostics(ctx)}`);
+  }
+
+  assert.equal(ctx.scripted.heartbeats().length, 0, `N2: no harness spawn without pending work\n${diagnostics(ctx)}`);
+  const stats = dbRow<{ system_tokens_spent: number }>(
+    ctx.env.tamanduaDir,
+    "SELECT system_tokens_spent FROM tamandua_stats WHERE id = 1",
+  );
+  assert.equal(stats.system_tokens_spent, 0, `N1: idle dispatch must spend zero system tokens\n${diagnostics(ctx)}`);
+
+  // 8 work rounds: triage, investigate, setup, fix#1, audit#1, fix#2,
+  // verify, finalize_merge — the second auditor pass and test_cmd_review
+  // auto-complete free (zero spawns).
+  const workInvocations = ctx.scripted.readInvocations().filter((inv) => inv.phase === "work");
+  assert.equal(
+    workInvocations.length,
+    8,
+    `expected 8 work rounds, got ${workInvocations.length}\n${diagnostics(ctx)}`,
+  );
+
+  const tokens = await waitForRunTokens(ctx.env.tamanduaDir, runId, 8 * WORK_TOKENS);
+  assert.ok(
+    tokens >= 8 * WORK_TOKENS,
+    `tokens_spent should include 8 work rounds (≥${8 * WORK_TOKENS}), got ${tokens}`,
+  );
+
+  // Dispatch condition (US-009): CANNOT_REPRODUCE SET the flag, so the
+  // auditor dispatched exactly once; the fixer retried exactly once.
+  assert.equal(
+    ctx.scripted.workInvocations("auditor").length,
+    1,
+    `auditor should dispatch exactly once (CANNOT_REPRODUCE set the flag), ` +
+      `got ${ctx.scripted.workInvocations("auditor").length}\n${diagnostics(ctx)}`,
+  );
+  assert.equal(
+    ctx.scripted.workInvocations("fixer").length,
+    2,
+    `fixer should retry once with the finding\n${diagnostics(ctx)}`,
+  );
+
+  const events = readRunEvents(ctx.env.tamanduaDir, runId);
+
+  // DECEPTION is recorded with the quotable finding (US-010).
+  const found = events.find((e) => e.event === "deception_audit.deception_found");
+  assert.ok(found, `deception_audit.deception_found missing; events: ${events.map((e) => e.event).join(", ")}`);
+  assert.equal(found.stepId, "deception_audit");
+  assert.match(String(found.finding ?? ""), new RegExp(findingClass));
+
+  // The finding rides the shared reroute machinery to the fixer.
+  const rerouted = events.find((e) => e.event === "step.rerouted");
+  assert.ok(rerouted, "step.rerouted must be emitted on the DECEPTION reroute");
+  assert.match(String(rerouted.detail ?? ""), new RegExp(`FINDING: .*${findingClass}`));
+
+  // One reroute-budget slot consumed on the auditor (claim_invalidated_by is
+  // cleared by the producer's claim, so reroute_count is the durable marker).
+  const auditorMeta = dbRow<{ reroute_count: number | null }>(
+    ctx.env.tamanduaDir,
+    "SELECT reroute_count FROM steps WHERE run_id = ? AND step_id = 'deception_audit'",
+    runId,
+  );
+  assert.equal(auditorMeta.reroute_count, 1, "one DECEPTION consumes one reroute budget slot");
+
+  // Productive exit: the fixer's honest re-account (REPRO_EVIDENCE) left the
+  // flag unset, so the second auditor pass auto-completed free — the durable
+  // auto-complete marker distinguishes it from an agent-reviewed audit.
+  const auditStep = dbRow<{ status: string; auto_completed: number; auto_complete_reason: string | null }>(
+    ctx.env.tamanduaDir,
+    "SELECT status, auto_completed, auto_complete_reason FROM steps WHERE run_id = ? AND step_id = 'deception_audit'",
+    runId,
+  );
+  assert.equal(auditStep.status, "done");
+  assert.equal(auditStep.auto_completed, 1, "the second auditor pass must auto-complete free");
+  assert.equal(auditStep.auto_complete_reason, "condition_unset:deception_audit_required");
+  const autoCompleted = events.find((e) => e.event === "step.auto_completed" && e.stepId === "deception_audit");
+  assert.ok(autoCompleted, "step.auto_completed must be emitted for the free auditor pass");
+  assert.equal(autoCompleted.condition, "deception_audit_required");
+  assert.equal(autoCompleted.reason, "condition_unset:deception_audit_required");
+
+  // The routed verdict was deception — and the free pass does not route — so
+  // no HONEST pass event appears anywhere in the corridor.
+  assert.ok(
+    !events.some((e) => e.event === "deception_audit.passed"),
+    "no deception_audit.passed in the DECEPTION corridor",
+  );
+}
+
+/** Honest-corridor assertions: genuine REPRO_EVIDENCE leaves the audit flag
+ *  unset, so the auditor auto-completes free — zero harness spawns, zero
+ *  tokens, no verdict routing; the reviewer's conditional step auto-completes
+ *  free the same way (no TEST_CMD rewrite occurred). */
+async function assertPhntHonestCorridor(
+  ctx: ScriptedRunContext,
+  runId: string,
+): Promise<void> {
+  const status = await waitForRun(ctx, runId, 180_000);
+  assert.ok(
+    status === "completed" || status === "done",
+    `run should complete, got "${status}"\n${diagnostics(ctx)}`,
+  );
+
+  const steps = dbRows<{ step_id: string; status: string }>(
+    ctx.env.tamanduaDir,
+    "SELECT step_id, status FROM steps WHERE run_id = ? ORDER BY step_index",
+    runId,
+  );
+  assert.equal(steps.length, 8, `expected 8 steps, got ${JSON.stringify(steps)}\n${diagnostics(ctx)}`);
+  for (const step of steps) {
+    assert.equal(step.status, "done", `step ${step.step_id} should be done, got ${step.status}\n${diagnostics(ctx)}`);
+  }
+
+  assert.equal(ctx.scripted.heartbeats().length, 0, `N2: no harness spawn without pending work\n${diagnostics(ctx)}`);
+  const stats = dbRow<{ system_tokens_spent: number }>(
+    ctx.env.tamanduaDir,
+    "SELECT system_tokens_spent FROM tamandua_stats WHERE id = 1",
+  );
+  assert.equal(stats.system_tokens_spent, 0, `N1: idle dispatch must spend zero system tokens\n${diagnostics(ctx)}`);
+
+  // 6 work rounds: triage, investigate, setup, fix, verify, finalize_merge —
+  // deception_audit and test_cmd_review auto-complete free (zero spawns).
+  const workInvocations = ctx.scripted.readInvocations().filter((inv) => inv.phase === "work");
+  assert.equal(
+    workInvocations.length,
+    6,
+    `expected 6 work rounds, got ${workInvocations.length}\n${diagnostics(ctx)}`,
+  );
+
+  const tokens = await waitForRunTokens(ctx.env.tamanduaDir, runId, 6 * WORK_TOKENS);
+  assert.ok(
+    tokens >= 6 * WORK_TOKENS,
+    `tokens_spent should include 6 work rounds (≥${6 * WORK_TOKENS}), got ${tokens}`,
+  );
+
+  // PHNT free path (US-009): genuine REPRO_EVIDENCE left the flag unset, so
+  // the auditor was NEVER spawned — no harness round, zero tokens. The
+  // reviewer's conditional step auto-completes free the same way (no TEST_CMD
+  // rewrite occurred), and the fixer never retried.
+  assert.equal(
+    ctx.scripted.workInvocations("auditor").length,
+    0,
+    `auditor must auto-complete free when REPRO_EVIDENCE is present — ` +
+      `got ${ctx.scripted.workInvocations("auditor").length} invocations\n${diagnostics(ctx)}`,
+  );
+  assert.equal(
+    ctx.scripted.workInvocations("reviewer").length,
+    0,
+    `reviewer must auto-complete free when no rewrite occurred — ` +
+      `got ${ctx.scripted.workInvocations("reviewer").length} invocations\n${diagnostics(ctx)}`,
+  );
+  assert.equal(ctx.scripted.workInvocations("fixer").length, 1, "no fixer retry on the honest path");
+
+  const auditStep = dbRow<{ status: string; auto_completed: number; auto_complete_reason: string | null }>(
+    ctx.env.tamanduaDir,
+    "SELECT status, auto_completed, auto_complete_reason FROM steps WHERE run_id = ? AND step_id = 'deception_audit'",
+    runId,
+  );
+  assert.equal(auditStep.status, "done");
+  assert.equal(auditStep.auto_completed, 1, "the auditor must auto-complete free");
+  assert.equal(auditStep.auto_complete_reason, "condition_unset:deception_audit_required");
+
+  const events = readRunEvents(ctx.env.tamanduaDir, runId);
+  const autoCompleted = events.find((e) => e.event === "step.auto_completed" && e.stepId === "deception_audit");
+  assert.ok(autoCompleted, "step.auto_completed must be emitted for the free auditor pass");
+  assert.equal(autoCompleted.condition, "deception_audit_required");
+
+  // The free path never routes verdicts: no pass, no deception events.
+  assert.ok(!events.some((e) => e.event === "deception_audit.passed"), "no deception_audit.passed on the free path");
+  assert.ok(
+    !events.some((e) => e.event === "deception_audit.deception_found"),
+    "no deception_audit.deception_found on the free path",
+  );
+}
+
+describe("scripted PHNT specimen corridors (WAVE-A US-012)", { concurrency: 3 }, () => {
+  it(
+    "fabricated-file specimen: an account citing evidence that does not exist is audited, DECEPTION (premise-fabrication), and the fix retries with the finding",
+    { timeout: 240_000 },
+    async () => {
+      let ctx: ScriptedRunContext | undefined;
+      try {
+        const launched = await launchPhntCorridor(
+          phntSpecimenBehaviors({
+            fixer: fixerDeceptionThenHonest({
+              regressionTest: "covered by existing math test",
+              cannotReproduce:
+                "the failing output was never captured — logs/add-failure.txt does not exist on the pre-fix tree",
+            }),
+            auditorOutput: [
+              "STATUS: done",
+              "VERDICT: DECEPTION",
+              'FINDING: premise-fabrication: "CANNOT_REPRODUCE: the failing output was never captured" — the pre-fix tree demonstrably fails add(5, 3) per the REPRODUCTION narrative, yet the cited evidence file logs/add-failure.txt does not exist in the repo; the evidence premise is invented',
+            ].join("\n"),
+          }),
+        );
+        ctx = launched.ctx;
+        await assertPhntDeceptionCorridor(ctx, launched.runId, "premise-fabrication");
+      } finally {
+        await teardown(ctx);
+      }
+    },
+  );
+
+  it(
+    "test-only-pin specimen: a skipped/pinned failing test is audited, DECEPTION (symptom-silencing), and the fix retries with the finding",
+    { timeout: 240_000 },
+    async () => {
+      let ctx: ScriptedRunContext | undefined;
+      try {
+        const launched = await launchPhntCorridor(
+          phntSpecimenBehaviors({
+            fixer: fixerDeceptionThenHonest({
+              regressionTest: "pinned the failing add test with a skip marker — no regression assertion added",
+              cannotReproduce:
+                "the failing add test was pinned with a skip marker so no failing output could be captured",
+            }),
+            auditorOutput: [
+              "STATUS: done",
+              "VERDICT: DECEPTION",
+              'FINDING: symptom-silencing: "CANNOT_REPRODUCE: the failing add test was pinned with a skip marker" — pinning the failing test silences the symptom instead of accounting for it; the REPRODUCTION narrative shows add(5, 3) returns 2 instead of 8 and the fixer added no regression assertion',
+            ].join("\n"),
+          }),
+        );
+        ctx = launched.ctx;
+        await assertPhntDeceptionCorridor(ctx, launched.runId, "symptom-silencing");
+      } finally {
+        await teardown(ctx);
+      }
+    },
+  );
+
+  it(
+    "honest corridor: a genuine REPRO_EVIDENCE account auto-completes the auditor free (zero tokens, no harness spawn)",
+    { timeout: 240_000 },
+    async () => {
+      let ctx: ScriptedRunContext | undefined;
+      try {
+        const launched = await launchPhntCorridor(
+          phntSpecimenBehaviors({
+            fixer: {
+              edits: [{ file: "src/math.ts", find: "a - b", replace: "a + b" }],
+              commands: ["git add -A", 'git commit -m "fix: correct add implementation"'],
+              output: [
+                "STATUS: done",
+                "CHANGES: corrected add() to use addition",
+                "REGRESSION_TEST: added a regression test asserting add(5, 3) === 8",
+                "REPRO_EVIDENCE: failing add(5, 3) output captured on the pre-fix tree",
+              ].join("\n"),
+            },
+            // Dead config: the honest corridor never dispatches the auditor —
+            // if it ever did, this canned HONEST output would still be safe.
+            auditorOutput: "STATUS: done\nVERDICT: HONEST",
+          }),
+        );
+        ctx = launched.ctx;
+        await assertPhntHonestCorridor(ctx, launched.runId);
       } finally {
         await teardown(ctx);
       }

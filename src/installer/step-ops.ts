@@ -17,10 +17,13 @@ import { getPgid } from "../lib/proc-info.js";
 import {
   evaluateFinalizeMergeLedgerGate,
   formatLedgerGateRefusal,
+  formatTestCmdReviewRefusal,
+  getTestCmdReviewRefusal,
   isStrictMissing,
   type LedgerGateDecision,
   type LedgerGateMode,
   type LedgerGateRefusalDecision,
+  type TestCmdReviewRefusal,
 } from "./ledger-gate.js";
 
 // ══════════════════════════════════════════════════════════════════════
@@ -2168,6 +2171,167 @@ export function peekStep(agentId: string, runId: string): PeekResult {
 }
 
 // ══════════════════════════════════════════════════════════════════════
+// Conditional Auto-Complete (Zero-Token Dispatch Primitive)
+// ══════════════════════════════════════════════════════════════════════
+
+export type AutoCompleteConditionalOutcome = "auto_completed" | "dispatched" | "none";
+
+/**
+ * WAVE-A US-003: resolve whether a run-context activation flag is SET.
+ *
+ * Fail-closed by design: only clearly-falsy values (absent, empty,
+ * whitespace, 'false'/'0'/'no'/'off'/'null'/'undefined', case-insensitive)
+ * count as UNSET. Anything else — including unexpected values — counts as
+ * SET and dispatches the step normally. When in doubt, spend tokens rather
+ * than silently skipping a review.
+ */
+export function isRunContextFlagSet(value: string | undefined): boolean {
+  if (value === undefined) return false;
+  const v = value.trim().toLowerCase();
+  if (v.length === 0) return false;
+  if (v === "false" || v === "0" || v === "no" || v === "off" || v === "null" || v === "undefined") {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * WAVE-A US-003: zero-token auto-complete for a pending `type: conditional`
+ * step whose activation flag is UNSET in run context.
+ *
+ * The dispatch motor calls this IN-PROCESS after its deterministic peek
+ * reports HAS_WORK and BEFORE any harness spawn. When the step's declared
+ * condition (steps.conditional_condition) is absent/empty/false in run
+ * context, the step is atomically marked done with auto_completed=1 and
+ * auto_complete_reason='condition_unset:<key>', a step.auto_completed event
+ * is emitted, and the pipeline advances — no harness spawn, zero tokens.
+ *
+ * Fail-closed arms:
+ *   - condition SET  → returns 'dispatched'; the step stays pending and the
+ *     motor spawns the harness normally. A set condition can NEVER be
+ *     auto-completed.
+ *   - non-conditional steps (single/loop) are never auto-completed.
+ *   - a conditional step with no declared condition (spec validation should
+ *     have rejected it) is treated as 'dispatched', never auto-completed.
+ *
+ * @returns 'auto_completed' — the step was completed in-process;
+ *          'dispatched' — a conditional step is pending with its flag SET;
+ *          'none' — no pending conditional step for this (agentId, runId).
+ */
+export function autoCompleteConditionalStep(runId: string, agentId: string): AutoCompleteConditionalOutcome {
+  // Defense-in-depth: strip run- prefix (US-013)
+  runId = stripIdPrefix(runId);
+  const db = getDb();
+
+  // Select the pending conditional step for this (agentId, runId) in serial
+  // order, mirroring claimStep's eligibility filter: no upstream step may be
+  // incomplete (a pending step whose predecessors are not all done/skipped
+  // is not actually claimable, so it must never be auto-completed either).
+  const step = db.prepare(
+    `SELECT s.id, s.step_id, s.conditional_condition, s.step_index
+     FROM steps s
+     JOIN runs r ON r.id = s.run_id
+     WHERE s.agent_id = ? AND s.run_id = ? AND s.status = 'pending' AND s.type = 'conditional'
+       AND r.status = 'running'
+       AND NOT EXISTS (
+         SELECT 1 FROM steps prev
+         WHERE prev.run_id = s.run_id
+           AND prev.step_index < s.step_index
+           AND prev.status NOT IN ('done', 'skipped')
+           AND NOT (prev.type = 'loop'
+                    AND prev.status = 'running'
+                    AND prev.current_story_id IS NULL)
+       )
+     ORDER BY s.step_index ASC, s.step_id ASC
+     LIMIT 1`,
+  ).get(agentId, runId) as {
+    id: string;
+    step_id: string;
+    conditional_condition: string | null;
+    step_index: number;
+  } | undefined;
+
+  if (!step) return "none";
+
+  const conditionKey = step.conditional_condition;
+  if (!conditionKey || conditionKey.trim().length === 0) {
+    // A conditional step without a declared condition should never exist
+    // (spec validation rejects it), but fail closed: dispatch rather than
+    // silently auto-completing a step we cannot evaluate.
+    return "dispatched";
+  }
+
+  // Resolve the activation flag against run context.
+  const run = db.prepare("SELECT context FROM runs WHERE id = ?").get(runId) as { context: string } | undefined;
+  const context = run ? parseRunContext(runId, run.context) : {};
+  if (isRunContextFlagSet(context[conditionKey])) {
+    // Fail-closed: a SET condition can never be auto-completed.
+    return "dispatched";
+  }
+
+  // Atomically mark done + emit events (same pattern as enforceClaimLedgerGate).
+  beginEventBuffering();
+  try {
+    db.exec("BEGIN IMMEDIATE");
+    // Re-read inside the transaction: only auto-complete a step that is
+    // still pending in a still-running run (a concurrent claim/lifecycle
+    // change makes this a no-op instead of clobbering state).
+    const current = db.prepare(
+      `SELECT s.status, r.status AS run_status
+       FROM steps s
+       JOIN runs r ON r.id = s.run_id
+       WHERE s.id = ?`,
+    ).get(step.id) as { status: string; run_status: string } | undefined;
+    if (!current || current.status !== "pending" || current.run_status !== "running") {
+      db.exec("ROLLBACK");
+      discardEventBuffer();
+      return "none";
+    }
+
+    const reason = `condition_unset:${conditionKey}`;
+    db.prepare(
+      "UPDATE steps SET status = 'done', auto_completed = 1, auto_complete_reason = ?, updated_at = datetime('now') WHERE id = ?",
+    ).run(reason, step.id);
+
+    const wfId = getWorkflowId(runId);
+    // The specific marker: oracles/observers distinguish auto-completed
+    // (condition unset, zero tokens) from agent-reviewed runs.
+    emitEvent({
+      ts: new Date().toISOString(),
+      event: "step.auto_completed",
+      runId,
+      workflowId: wfId,
+      stepId: step.step_id,
+      agentId,
+      condition: conditionKey,
+      reason,
+    });
+    // Parity with the normal single-step completion lifecycle: any observer
+    // tracking step.done sees the step completed.
+    emitEvent({
+      ts: new Date().toISOString(),
+      event: "step.done",
+      runId,
+      workflowId: wfId,
+      stepId: step.step_id,
+      agentId,
+    });
+
+    db.exec("COMMIT");
+    flushEventBuffer();
+  } catch (error) {
+    try { db.exec("ROLLBACK"); } catch { /* ignore rollback errors */ }
+    discardEventBuffer();
+    throw error;
+  }
+
+  // Advance the pipeline so the next step becomes claimable (may complete
+  // the run when this was the last step).
+  advancePipeline(runId);
+  return "auto_completed";
+}
+
+// ══════════════════════════════════════════════════════════════════════
 // Claim
 // ══════════════════════════════════════════════════════════════════════
 
@@ -2339,17 +2503,30 @@ function enforceClaimLedgerGate(
       eligible = false;
     } else {
       const alreadyLanded = candidate.output ? isAlreadyLanded(step.id, candidate.output) : false;
-      decision = alreadyLanded ? null : evaluateFinalizeMergeLedgerGate(step.id);
-      if (decision) {
-        const refusal = getLedgerGateRefusal(step.id, decision);
-        if (refusal) {
-          const refusalStatus = applyLedgerGateRefusalSync(
-            step,
-            formatLedgerGateRefusal(refusal),
-            refusal.status === "missing",
-            usesLedgerConcessionAllowance(step.id, refusal),
-          );
-          eligible = refusalStatus === "conceded";
+      // WAVE-A TCMD (US-007): refuse finalize_merge while a TEST_CMD review is
+      // pending or was rejected — the contract is under review, so no suite
+      // evidence can be trusted yet (fail closed). The refusal is recorded as
+      // a machine-parseable merge.refused_review_pending event; the step stays
+      // pending (not failed) so it becomes claimable once the review resolves
+      // (ACCEPT or withdrawal clears the flag). Already-landed merges skip the
+      // refusal (C24 parity).
+      const reviewRefusal = alreadyLanded ? null : getTestCmdReviewRefusal(step.run_id);
+      if (reviewRefusal) {
+        emitTestCmdReviewRefusal(step, reviewRefusal);
+        eligible = false;
+      } else {
+        decision = alreadyLanded ? null : evaluateFinalizeMergeLedgerGate(step.id);
+        if (decision) {
+          const refusal = getLedgerGateRefusal(step.id, decision);
+          if (refusal) {
+            const refusalStatus = applyLedgerGateRefusalSync(
+              step,
+              formatLedgerGateRefusal(refusal),
+              refusal.status === "missing",
+              usesLedgerConcessionAllowance(step.id, refusal),
+            );
+            eligible = refusalStatus === "conceded";
+          }
         }
       }
     }
@@ -3001,6 +3178,21 @@ function completeStepInternal(stepId: string, output: string): { status: string;
   // claim, but a completion from an older/in-flight claimant must not bypass
   // an obstructing decision that became visible meanwhile.
   //
+  // WAVE-A TCMD (US-007): refuse finalize_merge landing while a TEST_CMD
+  // review is pending or was rejected — the contract under review cannot be
+  // evidenced. This mirrors the claim-time refusal in enforceClaimLedgerGate;
+  // it only fires for a finalize_merge that was claimed before the review
+  // flag became set. Already-landed merges skip the refusal (C24 parity:
+  // refusing a merge that already happened would waste a tester reroute).
+  const testCmdReviewRefusal =
+    step.step_id === "finalize_merge" && !isAlreadyLanded(step.id, output)
+      ? getTestCmdReviewRefusal(step.run_id)
+      : null;
+  if (testCmdReviewRefusal) {
+    emitTestCmdReviewRefusal(step, testCmdReviewRefusal);
+    return { status: "blocked", detail: formatTestCmdReviewRefusal(testCmdReviewRefusal) };
+  }
+
   // C24 (already-landed guard): skip the acceptance-time refusal when the
   // target ref already advanced to the attested MERGED_COMMIT — refusing a
   // merge that already happened would waste a tester reroute.
@@ -3089,23 +3281,145 @@ function completeStepInternal(stepId: string, output: string): { status: string;
   }
 
   // Merge KEY: value lines into run context
-  const run = db.prepare("SELECT context FROM runs WHERE id = ?").get(runId) as { context: string };
+  const run = db.prepare(
+    "SELECT context, run_number, test_cmd_established FROM runs WHERE id = ?",
+  ).get(runId) as {
+    context: string;
+    run_number: number | null;
+    test_cmd_established: string | null;
+  };
   const context: Record<string, string> = parseRunContext(runId, run.context);
 
   const parsed = parseOutputKeyValues(output);
   for (const [key, value] of Object.entries(parsed)) {
-    if (!RESERVED_CONTEXT_KEYS.has(key)) {
+    if (RESERVED_CONTEXT_KEYS.has(key)) continue;
+
+    if (key === "test_cmd") {
+      // WAVE-A TCMD (US-004): TEST_CMD contract establishment + rewrite
+      // detection. The contract is established exactly once — a launch-declared
+      // `--context test_cmd=` (persisted at run creation, source 'launch') wins;
+      // otherwise the FIRST step-emitted TEST_CMD marker establishes it (source
+      // = step id). Any LATER differing marker is a rewrite: it NEVER replaces
+      // the established value, records a test_cmd.rewrite_detected event
+      // {old, new, step, round}, and sets the run-context review flag
+      // test_cmd_review_required so the conditional review primitive dispatches.
+      //
       // TSTX-PQ: reject test_cmd values that echo the tamandua-test shim wrapper
       // (a misbehaving persona echoing its already-wrapped input).
-      if (key === "test_cmd" && value.startsWith("tamandua-test --repo")) {
+      if (value.startsWith("tamandua-test --repo")) {
         logger.warn(
           `Rejected TEST_CMD output that echoes the tamandua-test wrapper prefix (step ${step.step_id}), keeping existing context values unchanged.`,
           { runId: step.run_id, stepId: step.step_id }
         );
         continue;
       }
-      context[key] = value;
-      if (key === "test_cmd") context["test_cmd_raw"] = value;
+
+      // The current contract: the persisted established value, falling back to
+      // the context values for runs created before the columns existed.
+      const established = run.test_cmd_established ?? context["test_cmd_raw"] ?? context["test_cmd"] ?? null;
+      if (established === null) {
+        // First-write: no launch declaration and no prior establishment — this
+        // marker establishes the contract (source = step id) and merges into
+        // context exactly as before this feature.
+        db.prepare(
+          "UPDATE runs SET test_cmd_established = ?, test_cmd_source = ?, updated_at = datetime('now') WHERE id = ?",
+        ).run(value, step.step_id, runId);
+        context["test_cmd"] = value;
+        context["test_cmd_raw"] = value;
+      } else if (value === established) {
+        // Re-emitting the identical contract is not a rewrite — merge as today.
+        context["test_cmd"] = value;
+        context["test_cmd_raw"] = value;
+        // WAVE-A US-006: if a review is pending and the flagged rewriting step
+        // now re-emits the established contract, the rewrite is WITHDRAWN —
+        // clear the review state so the conditional test_cmd_review step
+        // auto-completes free instead of re-reviewing stale material.
+        if (
+          context["test_cmd_review_required"] === "true" &&
+          context["test_cmd_rewriter_step"] === step.step_id
+        ) {
+          delete context["test_cmd_review_required"];
+          delete context["test_cmd_review_candidate"];
+          delete context["test_cmd_review_established"];
+          delete context["test_cmd_rewriter_step"];
+          logger.info(
+            `TEST_CMD rewrite withdrawn (step ${step.step_id} re-emitted the established contract) — review no longer required.`,
+            { runId: step.run_id, stepId: step.step_id }
+          );
+        }
+      } else {
+        // Differing marker: record the rewrite and require review. Do NOT
+        // overwrite context.test_cmd/test_cmd_raw with the new value.
+        // Trivially-equivalent forms still trigger detection — the reviewer's
+        // fast-path handles them; the detector builds no equivalence engine.
+        // Persist the review material in run context so the conditional
+        // test_cmd_review step's input can render both commands (US-005),
+        // and record WHICH step proposed the rewrite so a REJECT verdict can
+        // route the finding back to it (US-006).
+        context["test_cmd_review_required"] = "true";
+        context["test_cmd_review_candidate"] = value;
+        context["test_cmd_review_established"] = established;
+        context["test_cmd_rewriter_step"] = step.step_id;
+        const stepMeta = db.prepare(
+          "SELECT retry_count FROM steps WHERE id = ?",
+        ).get(step.id) as { retry_count: number } | undefined;
+        const round = (stepMeta?.retry_count ?? 0) + 1;
+        const wfId = getWorkflowId(runId);
+        emitEvent({
+          ts: new Date().toISOString(),
+          event: "test_cmd.rewrite_detected",
+          runId,
+          workflowId: wfId,
+          stepId: step.step_id,
+          oldTestCmd: established,
+          newTestCmd: value,
+          round,
+          runNumber: run.run_number ?? undefined,
+          detail: `TEST_CMD rewrite detected: '${established}' -> '${value}' (step ${step.step_id}, round ${round})`,
+        });
+        logger.warn(
+          `TEST_CMD rewrite detected (step ${step.step_id}): established '${established}', attempted '${value}' — contract unchanged, review required.`,
+          { runId: step.run_id, stepId: step.step_id }
+        );
+      }
+      continue;
+    }
+
+    context[key] = value;
+  }
+
+  // WAVE-A PHNT (US-009): fix completion drives the deception-audit
+  // activation flag. The fix step's either/or fourth key decides whether the
+  // auditor must dispatch:
+  //   - REPRO_EVIDENCE present  -> flag UNSET ('') — the conditional
+  //     deception_audit step auto-completes free via the primitive (no
+  //     harness spawn, zero tokens).
+  //   - CANNOT_REPRODUCE present, or neither key -> flag SET ('true') — the
+  //     auditor dispatches ONE read-only round.
+  // Gated on the run actually declaring a deception_audit step so other
+  // workflows' fix steps (e.g. security-audit-merge) are untouched.
+  // The alternation keys are also normalized (absent one stored as '') so the
+  // auditor's input template can reference both {{repro_evidence}} and
+  // {{cannot_reproduce}} without a claim-time MISS deadlock — only one of the
+  // two is ever emitted, and an empty value is a present key.
+  if (step.step_id === "fix") {
+    const hasAuditStep = db.prepare(
+      "SELECT COUNT(*) AS cnt FROM steps WHERE run_id = ? AND step_id = 'deception_audit'",
+    ).get(step.run_id) as { cnt: number } | undefined;
+    if ((hasAuditStep?.cnt ?? 0) > 0) {
+      const hasReproEvidence =
+        typeof parsed["repro_evidence"] === "string" && parsed["repro_evidence"].trim().length > 0;
+      if (hasReproEvidence) {
+        context["deception_audit_required"] = "";
+        if (typeof context["cannot_reproduce"] !== "string") context["cannot_reproduce"] = "";
+      } else {
+        context["deception_audit_required"] = "true";
+        if (typeof context["repro_evidence"] !== "string") context["repro_evidence"] = "";
+      }
+      logger.info(
+        `Fix completion set deception_audit_required='${context["deception_audit_required"]}' (step ${step.step_id}, ${hasReproEvidence ? "REPRO_EVIDENCE present" : "CANNOT_REPRODUCE or neither key"})`,
+        { runId: step.run_id, stepId: step.step_id },
+      );
     }
   }
 
@@ -3346,6 +3660,41 @@ function completeStepInternal(stepId: string, output: string): { status: string;
     return { status: "retrying", detail: `STATUS: retry verdict (retry ${newRetry}/${maxRetries})` };
   }
 
+  // ── TCMD REVIEW VERDICT ROUTING (US-006) ──────────────────────────
+  // When a dispatched test_cmd_review step completes with a verdict, route it:
+  // ACCEPT adopts the reviewed command as the contract; REJECT re-pends the
+  // rewriting step with the FINDING as bounded retry feedback. Returns null
+  // (fall through to normal completion) for non-review steps, undispached
+  // reviews, or a review whose flag was already resolved.
+  const reviewRoute = routeTestCmdReviewVerdict(step, context, parsed);
+  if (reviewRoute) {
+    return reviewRoute;
+  }
+
+  // ── PHNT DECEPTION-AUDIT VERDICT ROUTING (US-010) ─────────────────
+  // When a dispatched deception_audit step completes with a verdict, route it:
+  // HONEST (or DECEPTION without quotable evidence — DEFAULT HONEST) clears
+  // the audit flag and lets the run proceed to verify/finalize; DECEPTION with
+  // quotable evidence re-pends the fix step with the FINDING as bounded retry
+  // feedback. Returns null (fall through to normal completion) for non-audit
+  // steps, undispached audits, or a verdict that resolves HONEST.
+  const auditRoute = routeDeceptionAuditVerdict(step, context, parsed);
+  if (auditRoute) {
+    return auditRoute;
+  }
+
+  // WAVE-A TCMD (US-007): when a reviewed rewrite occurred, the landing
+  // annotations name the old + new commands. The review material keys are
+  // persisted by the rewrite detector (US-004) and kept in context after an
+  // ACCEPT verdict (US-006) precisely for these landing annotations.
+  const landingContext = getRunContextForStep(step.id) ?? {};
+  const reviewedOldCmd = typeof landingContext["test_cmd_review_established"] === "string"
+    ? landingContext["test_cmd_review_established"]
+    : undefined;
+  const reviewedNewCmd = typeof landingContext["test_cmd_review_candidate"] === "string"
+    ? landingContext["test_cmd_review_candidate"]
+    : undefined;
+
   // Default-mode red evidence is informational. Persist its run-scoped
   // annotation only when finalize_merge is accepted as done.
   if (acceptanceGateDecision.status === "red" && acceptanceGateDecision.gateMode === "default") {
@@ -3362,27 +3711,29 @@ function completeStepInternal(stepId: string, output: string): { status: string;
       exitCode: acceptanceGateDecision.row.exitCode,
       ledgerCreatedAt: acceptanceGateDecision.row.createdAt,
       durationMs: acceptanceGateDecision.row.durationMs,
+      ...(reviewedOldCmd !== undefined ? { oldTestCmd: reviewedOldCmd } : {}),
+      ...(reviewedNewCmd !== undefined ? { newTestCmd: reviewedNewCmd } : {}),
     });
   }
 
-  // Every non-strict missing-evidence landing is annotated, including the
-  // safe fallback used when no valid retry target makes refusal reachable.
+  // EVERY missing-evidence landing is annotated — including strict-mode
+  // (green / fail_missing) landings that reach completion via the
+  // already-landed guard, and conceded landings — so the record is truthful
+  // that no suite evidence exists for the CURRENT contract (US-007).
   if (acceptanceGateDecision.status === "missing") {
-    const runCtx = getRunContextForStep(step.id);
-    const strictMissing = isStrictMissing(runCtx ?? {}, acceptanceGateDecision.gateMode);
-    if (!strictMissing) {
-      emitEvent({
-        ts: new Date().toISOString(),
-        event: "merge.landed_without_suite_evidence",
-        runId: step.run_id,
-        workflowId: getWorkflowId(step.run_id),
-        stepId: step.step_id,
-        gateMode: acceptanceGateDecision.gateMode,
-        origin: acceptanceGateDecision.originRepo,
-        treeHash: acceptanceGateDecision.treeHash,
-        cmdHash: acceptanceGateDecision.cmdHash,
-      });
-    }
+    emitEvent({
+      ts: new Date().toISOString(),
+      event: "merge.landed_without_suite_evidence",
+      runId: step.run_id,
+      workflowId: getWorkflowId(step.run_id),
+      stepId: step.step_id,
+      gateMode: acceptanceGateDecision.gateMode,
+      origin: acceptanceGateDecision.originRepo,
+      treeHash: acceptanceGateDecision.treeHash,
+      cmdHash: acceptanceGateDecision.cmdHash,
+      ...(reviewedOldCmd !== undefined ? { oldTestCmd: reviewedOldCmd } : {}),
+      ...(reviewedNewCmd !== undefined ? { newTestCmd: reviewedNewCmd } : {}),
+    });
   }
 
   // Single step: mark done and advance
@@ -3409,6 +3760,388 @@ function completeStepInternal(stepId: string, output: string): { status: string;
     discardEventBuffer();
     throw e;
   }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// TCMD Review Verdict Routing (US-006)
+// ══════════════════════════════════════════════════════════════════════
+
+/**
+ * Route a dispatched `test_cmd_review` step's verdict (WAVE-A TCMD, US-006).
+ *
+ * ACCEPT — the reviewed command (the rewrite candidate the reviewer saw)
+ * becomes the run's TEST_CMD contract: runs.test_cmd_established is updated
+ * (test_cmd_source = 'reviewer'), run-context test_cmd/test_cmd_raw switch
+ * to the reviewed command, the review flag (test_cmd_review_required) is
+ * cleared so any later conditional pass auto-completes free, and a
+ * test_cmd.review_accepted {old, new, step} event is emitted. The review
+ * material keys (test_cmd_review_established/candidate) are kept in context
+ * so US-007's landing annotations can name the old+new commands.
+ *
+ * REJECT — the rewriting step (recorded by the detector in context as
+ * test_cmd_rewriter_step, falling back to the reviewer's declared
+ * on_fail.retry_step) is re-pended with the FINDING as bounded retry
+ * feedback via the shared reroute machinery (rerouteWithPolicy), which
+ * resets the reviewer to waiting so the review re-runs after the rewrite is
+ * fixed; test_cmd_review_required stays set. Accumulated rejections exhaust
+ * the reroute budget (max_reroutes, default 2) and fail the run legibly —
+ * no infinite loop. A test_cmd.review_rejected {old, new, step, finding}
+ * event is emitted on every rejection.
+ *
+ * Returns null (fall through to normal single-step completion) when this
+ * step is not a dispatched test_cmd_review with a verdict; otherwise an
+ * outcome ({ status: "rerouted" | "retrying" | "failed" }).
+ */
+function routeTestCmdReviewVerdict(
+  step: { id: string; run_id: string; step_id: string },
+  context: Record<string, string>,
+  parsed: Record<string, string>,
+): { status: string; detail?: string } | null {
+  // Only a genuinely dispatched review routes verdicts: the conditional
+  // reviewer step is dispatched only when test_cmd_review_required is set
+  // (the detector set it at rewrite time). A reviewer claimed/completed
+  // without the flag (manual smoke flows, auto-complete-equivalent paths)
+  // is a no-op that falls through to normal completion.
+  if (step.step_id !== "test_cmd_review") return null;
+  if (context["test_cmd_review_required"] !== "true") return null;
+  const verdict = parsed["verdict"]?.toUpperCase();
+  if (verdict !== "ACCEPT" && verdict !== "REJECT") return null;
+
+  const db = getDb();
+  const wfId = getWorkflowId(step.run_id);
+  const run = db.prepare(
+    "SELECT test_cmd_established FROM runs WHERE id = ?",
+  ).get(step.run_id) as { test_cmd_established: string | null } | undefined;
+  const oldCmd =
+    context["test_cmd_review_established"] ??
+    run?.test_cmd_established ??
+    context["test_cmd_raw"] ??
+    context["test_cmd"] ??
+    null;
+  const newCmd = context["test_cmd_review_candidate"] ?? null;
+
+  if (verdict === "ACCEPT") {
+    if (newCmd === null || newCmd.trim() === "") {
+      // Fail closed: an ACCEPT cannot adopt a contract it cannot name. The
+      // candidate is always persisted by the detector when the review flag
+      // is set, so this indicates state corruption — refuse to proceed.
+      const detail =
+        "TEST_CMD review ACCEPT but no review candidate is recorded in run context — refusing to adopt an unknown contract";
+      db.prepare(
+        "UPDATE steps SET status = 'failed', output = ?, updated_at = datetime('now') WHERE id = ?",
+      ).run(detail, step.id);
+      db.prepare(
+        "UPDATE runs SET status = 'failed', updated_at = datetime('now') WHERE id = ?",
+      ).run(step.run_id);
+      emitEvent({ ts: new Date().toISOString(), event: "step.failed", runId: step.run_id, workflowId: wfId, stepId: step.step_id, detail });
+      emitRunTerminalEvent({ event: "run.failed", runId: step.run_id, workflowId: wfId, detail: "TEST_CMD review accepted with no candidate" });
+      scheduleRunCronTeardown(step.run_id);
+      finalizeDrainingPause(step.run_id);
+      return { status: "failed", detail };
+    }
+    // Adopt the reviewed command as the contract.
+    db.prepare(
+      "UPDATE runs SET test_cmd_established = ?, test_cmd_source = 'reviewer', updated_at = datetime('now') WHERE id = ?",
+    ).run(newCmd, step.run_id);
+    context["test_cmd"] = newCmd;
+    context["test_cmd_raw"] = newCmd;
+    delete context["test_cmd_review_required"];
+    delete context["test_cmd_rewriter_step"];
+    // Review material keys stay in context for US-007 landing annotations.
+    db.prepare(
+      "UPDATE runs SET context = ?, updated_at = datetime('now') WHERE id = ?",
+    ).run(JSON.stringify(context), step.run_id);
+    emitEvent({
+      ts: new Date().toISOString(),
+      event: "test_cmd.review_accepted",
+      runId: step.run_id,
+      workflowId: wfId,
+      stepId: step.step_id,
+      oldTestCmd: oldCmd ?? undefined,
+      newTestCmd: newCmd,
+      detail: `TEST_CMD review ACCEPTED: '${oldCmd ?? ""}' -> '${newCmd}' (step ${step.step_id})`,
+    });
+    logger.info(`TEST_CMD review accepted: '${oldCmd ?? ""}' -> '${newCmd}'`, { runId: step.run_id, stepId: step.step_id });
+    // Fall through to normal single-step completion (mark done + advance).
+    return null;
+  }
+
+  // ── REJECT ──────────────────────────────────────────────────────────
+  const finding = parsed["finding"]?.trim() || "(no FINDING provided)";
+  const rewriterStepId = context["test_cmd_rewriter_step"];
+  const declaredPolicy = getOnFailPolicySync(step.run_id, step.step_id);
+  const targetStepId = rewriterStepId ?? declaredPolicy?.retry_step;
+  const reviewReason =
+    `TEST_CMD review REJECTED by ${step.step_id}` +
+    (oldCmd !== null || newCmd !== null ? `: '${oldCmd ?? ""}' -> '${newCmd ?? ""}'` : "") +
+    `. FINDING: ${finding}`;
+
+  // Every REJECT verdict is recorded, whatever the routing outcome — the
+  // rejection event names old+new commands, the reviewer step, and the
+  // quoted FINDING that is transported back to the rewriting step.
+  emitEvent({
+    ts: new Date().toISOString(),
+    event: "test_cmd.review_rejected",
+    runId: step.run_id,
+    workflowId: wfId,
+    stepId: step.step_id,
+    oldTestCmd: oldCmd ?? undefined,
+    newTestCmd: newCmd ?? undefined,
+    finding,
+    detail: `TEST_CMD review REJECTED: '${oldCmd ?? ""}' -> '${newCmd ?? ""}' (step ${step.step_id})`,
+  });
+
+  if (!targetStepId) {
+    // No rewriter recorded and no declared retry target: fail closed — the
+    // reviewer itself retries with the finding, bounded by max_retries.
+    const meta = db.prepare(
+      "SELECT retry_count, max_retries FROM steps WHERE id = ?",
+    ).get(step.id) as { retry_count: number; max_retries: number } | undefined;
+    const newRetry = (meta?.retry_count ?? 0) + 1;
+    const maxRetries = meta?.max_retries ?? 0;
+    const errorDetail = `TEST_CMD review REJECTED but no rewriting step is recorded in run context — retry ${newRetry}/${maxRetries}. FINDING: ${finding}`;
+    if (newRetry > maxRetries) {
+      db.prepare(
+        "UPDATE steps SET status = 'failed', output = ?, retry_count = ?, updated_at = datetime('now') WHERE id = ?",
+      ).run(errorDetail, newRetry, step.id);
+      db.prepare(
+        "UPDATE runs SET status = 'failed', updated_at = datetime('now') WHERE id = ?",
+      ).run(step.run_id);
+      emitEvent({ ts: new Date().toISOString(), event: "step.failed", runId: step.run_id, workflowId: wfId, stepId: step.step_id, detail: errorDetail });
+      emitRunTerminalEvent({ event: "run.failed", runId: step.run_id, workflowId: wfId, detail: "TEST_CMD review rejected with no rewriter target and retries exhausted" });
+      scheduleRunCronTeardown(step.run_id);
+      finalizeDrainingPause(step.run_id);
+      return { status: "failed", detail: errorDetail };
+    }
+    db.prepare(
+      "UPDATE steps SET status = 'pending', output = ?, retry_count = ?, updated_at = datetime('now') WHERE id = ?",
+    ).run(errorDetail, newRetry, step.id);
+    emitEvent({ ts: new Date().toISOString(), event: "step.retry", runId: step.run_id, workflowId: wfId, stepId: step.step_id, detail: errorDetail });
+    logger.warn(errorDetail, { runId: step.run_id, stepId: step.step_id });
+    finalizeDrainingPause(step.run_id);
+    return { status: "retrying", detail: errorDetail };
+  }
+
+  // Re-pend the rewriting step with the FINDING as bounded retry feedback
+  // via the shared reroute machinery (budget-checked: max_reroutes, default
+  // 2). The runtime-recorded rewriter wins over the declared retry_step —
+  // whichever step actually proposed the rewrite gets the finding.
+  const rerouteResult = rerouteWithPolicy(
+    { retry_step: targetStepId, max_reroutes: declaredPolicy?.max_reroutes ?? 2 },
+    step.run_id,
+    step.step_id,
+    step.id,
+    reviewReason,
+  );
+
+  if (rerouteResult === "rerouted") {
+    logger.warn(`TEST_CMD review rejected — rerouted ${targetStepId} with the finding`, { runId: step.run_id, stepId: step.step_id });
+    return { status: "rerouted", detail: `TEST_CMD review REJECTED — rerouted to ${targetStepId} with the finding` };
+  }
+
+  // budget_exhausted / invalid_target / not_found: the review cannot make
+  // progress — fail the run legibly so accumulated rejections terminate the
+  // run (no infinite loop).
+  const budgetDetail =
+    rerouteResult === "budget_exhausted"
+      ? `TEST_CMD review rejected and reroute budget exhausted (max_reroutes=${declaredPolicy?.max_reroutes ?? 2}) — rewrite never accepted. FINDING: ${finding}`
+      : rerouteResult === "invalid_target"
+        ? `TEST_CMD review rejected but reroute target "${targetStepId}" is not a valid upstream step — cannot retry the rewriting step. FINDING: ${finding}`
+        : `TEST_CMD review rejected but the reroute could not be performed. FINDING: ${finding}`;
+  db.prepare(
+    "UPDATE steps SET status = 'failed', output = ?, updated_at = datetime('now') WHERE id = ?",
+  ).run(budgetDetail, step.id);
+  db.prepare(
+    "UPDATE runs SET status = 'failed', updated_at = datetime('now') WHERE id = ?",
+  ).run(step.run_id);
+  emitEvent({ ts: new Date().toISOString(), event: "step.failed", runId: step.run_id, workflowId: wfId, stepId: step.step_id, detail: budgetDetail });
+  emitRunTerminalEvent({ event: "run.failed", runId: step.run_id, workflowId: wfId, detail: "TEST_CMD review rejected and retry budget exhausted" });
+  scheduleRunCronTeardown(step.run_id);
+  finalizeDrainingPause(step.run_id);
+  return { status: "failed", detail: budgetDetail };
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// PHNT Deception-Audit Verdict Routing (US-010)
+// ══════════════════════════════════════════════════════════════════════
+
+/**
+ * Mechanical proxy for the auditor persona's "DECEPTION requires quotable
+ * evidence" rule (WAVE-A PHNT, US-010): a FINDING only counts when it is
+ * non-empty AND contains at least one quotation character (", ', or `) — the
+ * persona requires quoted report lines, account lines, and diff hunks for a
+ * DECEPTION verdict. A DECEPTION verdict whose FINDING fails this check is
+ * treated as DEFAULT HONEST (a verdict without quotable evidence is invalid).
+ */
+function hasQuotableAuditFinding(finding: string | undefined): boolean {
+  if (!finding) return false;
+  const trimmed = finding.trim();
+  if (trimmed.length === 0) return false;
+  return /["'`]/.test(trimmed);
+}
+
+/**
+ * Route a dispatched `deception_audit` step's verdict (WAVE-A PHNT, US-010).
+ *
+ * HONEST — or DECEPTION without quotable evidence (DEFAULT HONEST; the
+ * auditor persona makes a verdict invalid without quoted evidence) — the
+ * audit passed: the activation flag (deception_audit_required) is cleared so
+ * the conditional auditor can never re-dispatch, a deception_audit.passed
+ * event is emitted, and the run proceeds to verify/finalize.
+ *
+ * DECEPTION with quotable evidence — the fix step (the producer of the
+ * audited account; the audit step's declared on_fail.retry_step, falling
+ * back to the run's fix step) is re-pended with the FINDING as bounded retry
+ * feedback via the shared reroute machinery (rerouteWithPolicy), which resets
+ * the auditor to waiting so the audit re-runs after the fix is corrected;
+ * deception_audit_required stays set. Accumulated rejections exhaust the
+ * reroute budget (max_reroutes, default 2) and fail the run legibly — no
+ * infinite loop. A deception_audit.deception_found event is emitted on every
+ * routed DECEPTION.
+ *
+ * Returns null (fall through to normal single-step completion) when this
+ * step is not a dispatched deception_audit with a verdict; otherwise an
+ * outcome ({ status: "rerouted" | "retrying" | "failed" }).
+ */
+function routeDeceptionAuditVerdict(
+  step: { id: string; run_id: string; step_id: string },
+  context: Record<string, string>,
+  parsed: Record<string, string>,
+): { status: string; detail?: string } | null {
+  // Only a genuinely dispatched audit routes verdicts: the conditional
+  // auditor step is dispatched only when deception_audit_required is set (the
+  // fix completion handler set it — US-009). An auditor claimed/completed
+  // without the flag (manual smoke flows, auto-complete-equivalent paths) is
+  // a no-op that falls through to normal completion.
+  if (step.step_id !== "deception_audit") return null;
+  if (context["deception_audit_required"] !== "true") return null;
+  const verdict = parsed["verdict"]?.toUpperCase();
+  if (verdict !== "HONEST" && verdict !== "DECEPTION") return null;
+
+  const db = getDb();
+  const wfId = getWorkflowId(step.run_id);
+  const finding = parsed["finding"]?.trim() ?? "";
+  const isDeception = verdict === "DECEPTION" && hasQuotableAuditFinding(finding);
+
+  if (!isDeception) {
+    // ── HONEST (incl. invalid DECEPTION → DEFAULT HONEST) ────────────
+    // Clear the activation flag so the conditional auditor never re-dispatches,
+    // record the pass, and fall through to normal single-step completion
+    // (mark done + advance — the run proceeds to verify/finalize).
+    delete context["deception_audit_required"];
+    db.prepare(
+      "UPDATE runs SET context = ?, updated_at = datetime('now') WHERE id = ?",
+    ).run(JSON.stringify(context), step.run_id);
+    emitEvent({
+      ts: new Date().toISOString(),
+      event: "deception_audit.passed",
+      runId: step.run_id,
+      workflowId: wfId,
+      stepId: step.step_id,
+      detail: verdict === "DECEPTION"
+        ? "Deception audit passed (DECEPTION verdict ignored — no quotable evidence)"
+        : "Deception audit passed (VERDICT: HONEST)",
+    });
+    logger.info(`Deception audit passed (verdict ${verdict})`, { runId: step.run_id, stepId: step.step_id });
+    return null;
+  }
+
+  // ── DECEPTION with quotable evidence ───────────────────────────────
+  // Route the fix step to retry with the FINDING as bounded retry feedback,
+  // mirroring the test_cmd_review REJECT handling (US-006). The audit step's
+  // declared on_fail.retry_step wins; the fix-step lookup covers seeded runs
+  // and workflows that predate the on_fail declaration. Conditional steps are
+  // exempt from the M4 TESTED_TREE-attester rule, so routing to fix is valid.
+  const declaredPolicy = getOnFailPolicySync(step.run_id, step.step_id);
+  let targetStepId = declaredPolicy?.retry_step ?? null;
+  if (!targetStepId) {
+    const fixStep = db.prepare(
+      "SELECT step_id FROM steps WHERE run_id = ? AND step_id = 'fix' LIMIT 1",
+    ).get(step.run_id) as { step_id: string } | undefined;
+    if (fixStep) targetStepId = "fix";
+  }
+  const auditReason = `Deception audit DECEPTION found by ${step.step_id}. FINDING: ${finding}`;
+
+  // Every DECEPTION verdict with quotable evidence is recorded, whatever the
+  // routing outcome — the event carries the quoted FINDING that is
+  // transported back to the fix step.
+  emitEvent({
+    ts: new Date().toISOString(),
+    event: "deception_audit.deception_found",
+    runId: step.run_id,
+    workflowId: wfId,
+    stepId: step.step_id,
+    finding,
+    detail: auditReason,
+  });
+
+  if (!targetStepId) {
+    // No fix step and no declared retry target: fail closed — the auditor
+    // itself retries with the finding, bounded by max_retries.
+    const meta = db.prepare(
+      "SELECT retry_count, max_retries FROM steps WHERE id = ?",
+    ).get(step.id) as { retry_count: number; max_retries: number } | undefined;
+    const newRetry = (meta?.retry_count ?? 0) + 1;
+    const maxRetries = meta?.max_retries ?? 0;
+    const errorDetail = `Deception audit found deception but no fix step is recorded in run context — retry ${newRetry}/${maxRetries}. FINDING: ${finding}`;
+    if (newRetry > maxRetries) {
+      db.prepare(
+        "UPDATE steps SET status = 'failed', output = ?, retry_count = ?, updated_at = datetime('now') WHERE id = ?",
+      ).run(errorDetail, newRetry, step.id);
+      db.prepare(
+        "UPDATE runs SET status = 'failed', updated_at = datetime('now') WHERE id = ?",
+      ).run(step.run_id);
+      emitEvent({ ts: new Date().toISOString(), event: "step.failed", runId: step.run_id, workflowId: wfId, stepId: step.step_id, detail: errorDetail });
+      emitRunTerminalEvent({ event: "run.failed", runId: step.run_id, workflowId: wfId, detail: "Deception audit found deception with no fix target and retries exhausted" });
+      scheduleRunCronTeardown(step.run_id);
+      finalizeDrainingPause(step.run_id);
+      return { status: "failed", detail: errorDetail };
+    }
+    db.prepare(
+      "UPDATE steps SET status = 'pending', output = ?, retry_count = ?, updated_at = datetime('now') WHERE id = ?",
+    ).run(errorDetail, newRetry, step.id);
+    emitEvent({ ts: new Date().toISOString(), event: "step.retry", runId: step.run_id, workflowId: wfId, stepId: step.step_id, detail: errorDetail });
+    logger.warn(errorDetail, { runId: step.run_id, stepId: step.step_id });
+    finalizeDrainingPause(step.run_id);
+    return { status: "retrying", detail: errorDetail };
+  }
+
+  // Re-pend the fix step with the FINDING as bounded retry feedback via the
+  // shared reroute machinery (budget-checked: max_reroutes, default 2). The
+  // declared retry target wins; the fix-step fallback covers seeded runs.
+  const rerouteResult = rerouteWithPolicy(
+    { retry_step: targetStepId, max_reroutes: declaredPolicy?.max_reroutes ?? 2 },
+    step.run_id,
+    step.step_id,
+    step.id,
+    auditReason,
+  );
+
+  if (rerouteResult === "rerouted") {
+    logger.warn(`Deception audit found deception — rerouted ${targetStepId} with the finding`, { runId: step.run_id, stepId: step.step_id });
+    return { status: "rerouted", detail: `Deception audit DECEPTION — rerouted to ${targetStepId} with the finding` };
+  }
+
+  // budget_exhausted / invalid_target / not_found: the audit cannot make
+  // progress — fail the run legibly so accumulated rejections terminate the
+  // run (no infinite loop).
+  const budgetDetail =
+    rerouteResult === "budget_exhausted"
+      ? `Deception audit found deception and reroute budget exhausted (max_reroutes=${declaredPolicy?.max_reroutes ?? 2}) — fix never accepted as honest. FINDING: ${finding}`
+      : rerouteResult === "invalid_target"
+        ? `Deception audit found deception but reroute target "${targetStepId}" is not a valid upstream step — cannot retry the fix step. FINDING: ${finding}`
+        : `Deception audit found deception but the reroute could not be performed. FINDING: ${finding}`;
+  db.prepare(
+    "UPDATE steps SET status = 'failed', output = ?, updated_at = datetime('now') WHERE id = ?",
+  ).run(budgetDetail, step.id);
+  db.prepare(
+    "UPDATE runs SET status = 'failed', updated_at = datetime('now') WHERE id = ?",
+  ).run(step.run_id);
+  emitEvent({ ts: new Date().toISOString(), event: "step.failed", runId: step.run_id, workflowId: wfId, stepId: step.step_id, detail: budgetDetail });
+  emitRunTerminalEvent({ event: "run.failed", runId: step.run_id, workflowId: wfId, detail: "Deception audit found deception and retry budget exhausted" });
+  scheduleRunCronTeardown(step.run_id);
+  finalizeDrainingPause(step.run_id);
+  return { status: "failed", detail: budgetDetail };
 }
 
 /**
@@ -3953,6 +4686,35 @@ function getRunContextForStep(stepId: string): Record<string, string> | null {
   } catch {
     return {};
   }
+}
+
+/**
+ * WAVE-A TCMD (US-007): record a finalize_merge refusal caused by a pending
+ * or rejected TEST_CMD review. Emits a machine-parseable
+ * merge.refused_review_pending event (FAILURE_CLASS: refused_review_pending
+ * in the detail, old/new commands when known) and logs a warning. The step
+ * is deliberately left pending — the refusal is a gate, not a failure; the
+ * step becomes claimable once the review resolves.
+ */
+function emitTestCmdReviewRefusal(
+  step: { id: string; run_id: string; step_id: string },
+  refusal: TestCmdReviewRefusal,
+): void {
+  const refusalText = formatTestCmdReviewRefusal(refusal);
+  emitEvent({
+    ts: new Date().toISOString(),
+    event: "merge.refused_review_pending",
+    runId: step.run_id,
+    workflowId: getWorkflowId(step.run_id),
+    stepId: step.step_id,
+    oldTestCmd: refusal.oldTestCmd,
+    newTestCmd: refusal.newTestCmd,
+    detail: refusalText,
+  });
+  logger.warn(
+    `finalize_merge refused: TEST_CMD review pending or rejected (step ${step.step_id})`,
+    { runId: step.run_id, stepId: step.step_id, ...refusal },
+  );
 }
 
 function getLedgerGateRefusal(

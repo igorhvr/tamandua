@@ -40,6 +40,33 @@ export interface TamanduaEvent {
   agentId?: string;
   detail?: string;
   reason?: string;
+  /**
+   * WAVE-A: the run-context activation flag key for a conditional step.
+   * Present on step.auto_completed events (the condition that was unset).
+   */
+  condition?: string;
+  /**
+   * TCMD (US-004): the established TEST_CMD contract at the moment a rewrite
+   * was detected. Present on test_cmd.rewrite_detected events.
+   */
+  oldTestCmd?: string;
+  /**
+   * TCMD (US-004): the newly attempted TEST_CMD marker that differs from the
+   * established contract. Present on test_cmd.rewrite_detected events.
+   */
+  newTestCmd?: string;
+  /**
+   * TCMD (US-004): the step round (1-based attempt) whose output carried the
+   * TEST_CMD marker (step retry_count + 1). Present on test_cmd.rewrite_detected
+   * events alongside runNumber (the run's number).
+   */
+  round?: number;
+  /**
+   * TCMD (US-006): the reviewer's file-grounded FINDING quoted on a REJECT
+   * verdict. Present on test_cmd.review_rejected events; the rewriting step
+   * receives it as bounded retry feedback.
+   */
+  finding?: string;
   abandonedCount?: number;
   tokenDelta?: number;
   tokensSpent?: number;

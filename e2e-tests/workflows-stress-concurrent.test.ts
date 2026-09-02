@@ -185,6 +185,7 @@ function buildFeatureBehaviors(fi: FeatureInfo): ScriptedAgentConfig {
           "STATUS: done",
           `CHANGES: fixed ${fi.funcName}() in ${fi.file}`,
           `REGRESSION_TEST: existing test in test/feature-${fi.n}.test.ts`,
+          `REPRO_EVIDENCE: failing ${fi.funcName}() output captured on the pre-fix tree`,
         ].join("\n"),
       },
       verifier: {
@@ -668,8 +669,8 @@ describe("concurrent-runs stress test", { concurrency: 1 }, () => {
           );
           assert.equal(
             steps.length,
-            6,
-            `feature-${i + 1}: expected 6 steps, got ${steps.length}`,
+            8,
+            `feature-${i + 1}: expected 8 steps, got ${steps.length}`,
           );
           for (const step of steps) {
             assert.equal(

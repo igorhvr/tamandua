@@ -52,7 +52,15 @@ export type LoopConfig = {
 export type WorkflowStep = {
   id: string;
   agent: string;
-  type?: "single" | "loop";
+  type?: "single" | "loop" | "conditional";
+  /**
+   * Activation flag key for type: conditional steps. Declared in
+   * workflow.yml; when the run-context flag it names is UNSET at claim
+   * time, the dispatch motor auto-completes the step with zero tokens.
+   * Persisted into steps.conditional_condition; null for non-conditional
+   * steps. MUST NOT be declared on single/loop steps.
+   */
+  condition?: string;
   loop?: LoopConfig;
   input: string;
   expects: string;

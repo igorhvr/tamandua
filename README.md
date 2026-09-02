@@ -147,9 +147,9 @@ stories. Each story goes through implement → verify → test before the next o
 | Variant | Workflow ID | Agents | Pipeline |
 |---------|------------|--------|----------|
 | Local-only | `feature-dev` | 5 | plan → setup → implement → verify → test |
-| + Merge | `feature-dev-merge` | 6 | plan → setup → implement → verify → test → finalize_merge |
+| + Merge | `feature-dev-merge` | 7 | plan → setup → implement → verify → test → test_cmd_review → finalize_merge |
 | Worktree | `feature-dev-worktree` | 5 | plan → setup → implement → verify → test |
-| Worktree + Merge | `feature-dev-merge-worktree` | 6 | plan → setup → implement → verify → test → finalize_merge |
+| Worktree + Merge | `feature-dev-merge-worktree` | 7 | plan → setup → implement → verify → test → test_cmd_review → finalize_merge |
 | GitHub PR | `feature-dev-github-pr` | 6 | plan → setup → implement → verify → test → pr → review |
 
 </details>
@@ -170,11 +170,11 @@ criteria.
 
 | Variant | Workflow ID | Agents | Pipeline |
 |---------|------------|--------|----------|
-| Local-only | `bug-fix` | 5 | triage → investigate → setup → fix → verify |
-| + Merge | `bug-fix-merge` | 6 | triage → investigate → setup → fix → verify → finalize_merge |
-| Worktree | `bug-fix-worktree` | 5 | triage → investigate → setup → fix → verify |
-| Worktree + Merge | `bug-fix-merge-worktree` | 6 | triage → investigate → setup → fix → verify → finalize_merge |
-| GitHub PR | `bug-fix-github-pr` | 6 | triage → investigate → setup → fix → verify → pr |
+| Local-only | `bug-fix` | 6 | triage → investigate → setup → fix → deception_audit → verify |
+| + Merge | `bug-fix-merge` | 8 | triage → investigate → setup → fix → deception_audit → verify → test_cmd_review → finalize_merge |
+| Worktree | `bug-fix-worktree` | 6 | triage → investigate → setup → fix → deception_audit → verify |
+| Worktree + Merge | `bug-fix-merge-worktree` | 8 | triage → investigate → setup → fix → deception_audit → verify → test_cmd_review → finalize_merge |
+| GitHub PR | `bug-fix-github-pr` | 7 | triage → investigate → setup → fix → deception_audit → verify → pr |
 
 </details>
 
@@ -189,9 +189,9 @@ patches each one, re-audits after all fixes are applied, and runs regression tes
 | Variant | Workflow ID | Agents | Pipeline |
 |---------|------------|--------|----------|
 | Local-only | `security-audit` | 6 | scan → prioritize → setup → fix → verify → test |
-| + Merge | `security-audit-merge` | 7 | scan → prioritize → setup → fix → verify → test → finalize_merge |
+| + Merge | `security-audit-merge` | 8 | scan → prioritize → setup → fix → verify → test → test_cmd_review → finalize_merge |
 | Worktree | `security-audit-worktree` | 6 | scan → prioritize → setup → fix → verify → test |
-| Worktree + Merge | `security-audit-merge-worktree` | 7 | scan → prioritize → setup → fix → verify → test → finalize_merge |
+| Worktree + Merge | `security-audit-merge-worktree` | 8 | scan → prioritize → setup → fix → verify → test → test_cmd_review → finalize_merge |
 | GitHub PR | `security-audit-github-pr` | 7 | scan → prioritize → setup → fix → verify → test → pr |
 
 </details>

@@ -302,6 +302,7 @@ const bugFixBehaviors: ScriptedAgentConfig = {
         "STATUS: done",
         "CHANGES: corrected add() to use addition",
         "REGRESSION_TEST: covered by existing math test",
+        "REPRO_EVIDENCE: failing add(5, 3) output captured on the pre-fix tree",
       ].join("\n"),
     },
     verifier: {
@@ -358,7 +359,7 @@ function createMigratedMergerBehaviors(
       fixer: {
         edits: [change],
         commands: ["git add -A", `git commit -m "${commitMessage}"`],
-        output: "STATUS: done\nCHANGES: corrected scripted fixture\nREGRESSION_TEST: scripted coverage",
+        output: "STATUS: done\nCHANGES: corrected scripted fixture\nREGRESSION_TEST: scripted coverage\nREPRO_EVIDENCE: scripted failing output pointer",
       },
       quarantiner: {
         edits: [change],
@@ -495,7 +496,7 @@ describe("scripted-dsh full pipeline (real daemon/scheduler, zero tokens)", { co
           "SELECT step_id, status FROM steps WHERE run_id = ? ORDER BY step_index",
           runId,
         );
-        assert.equal(steps.length, 6, `expected 6 steps, got ${JSON.stringify(steps)}`);
+        assert.equal(steps.length, 8, `expected 8 steps, got ${JSON.stringify(steps)}`);
         for (const step of steps) {
           assert.equal(step.status, "done", `step ${step.step_id} should be done, got ${step.status}`);
         }
@@ -573,6 +574,16 @@ describe("scripted-dsh full pipeline (real daemon/scheduler, zero tokens)", { co
             `agent ${agent} should do exactly 1 work round through dsh, got ${workRounds.length}\n${diagnostics(ctx)}`,
           );
         }
+
+        // ── PHNT (US-009): the fixer emitted REPRO_EVIDENCE, so the
+        // deception_audit conditional step auto-completed free — the auditor
+        // was NEVER invoked (no harness spawn, zero tokens).
+        assert.equal(
+          ctx.scripted.workInvocations("auditor").length,
+          0,
+          `auditor must auto-complete free when REPRO_EVIDENCE is present — ` +
+            `got ${ctx.scripted.workInvocations("auditor").length} invocations\n${diagnostics(ctx)}`,
+        );
 
         // ── Token accounting: session-file usage attributed to the run ──
         // Each work round writes a fake session.jsonl.zstd under the temp

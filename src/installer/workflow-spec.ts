@@ -7,6 +7,12 @@ import type { WorkflowSpec } from "./types.js";
 const VALID_ON_FAIL_KEYS = new Set(["retry_step", "max_reroutes", "retry_on"]);
 
 /**
+ * Allowed values for a step's `type` field. Absent type defaults to
+ * "single" (see run.ts step creation).
+ */
+const VALID_STEP_TYPES = new Set(["single", "loop", "conditional"]);
+
+/**
  * Validates on_fail blocks on every step:
  * - Rejects unknown keys (only retry_step, max_reroutes, retry_on are valid).
  * - Enforces the M4 attestation rule: if a step has on_fail.retry_step, it must
@@ -36,8 +42,16 @@ function validateOnFail(
 
     // M4 attestation rule: if a step has on_fail.retry_step, it must match the
     // nearest upstream step whose input template contains TESTED_TREE.
+    //
+    // WAVE-A (US-006): conditional steps are exempt — they are read-only
+    // review/audit steps whose on_fail.retry_step targets the producer of the
+    // material under review (e.g. the TEST_CMD rewrite producer), which is
+    // deliberately NOT the TESTED_TREE-attesting step. The M4 attestation
+    // constraint only governs steps that reroute on TESTED_TREE attestation
+    // failures.
     const retryStep = onFail.retry_step;
     if (typeof retryStep !== "string") continue;
+    if (step.type === "conditional") continue;
 
     // Scan backwards to find the nearest upstream step declaring TESTED_TREE
     let attestingStepId: string | null = null;
@@ -144,6 +158,28 @@ function parseAndValidateWorkflowSpec(
     if (typeof step.agent !== "string" || !step.agent) {
       throw new Error(
         `workflow.yml step[${i}] ("${step.id}") in ${workflowDir} is missing required field: agent`,
+      );
+    }
+    // Step type validation: single/loop/conditional, and the conditional
+    // contract (a conditional step MUST declare a non-empty condition; a
+    // non-conditional step MUST NOT declare a condition).
+    if (
+      step.type !== undefined &&
+      (typeof step.type !== "string" || !VALID_STEP_TYPES.has(step.type))
+    ) {
+      throw new Error(
+        `workflow.yml step[${i}] ("${step.id}") in ${workflowDir} has invalid type: "${String(step.type)}". Valid types are: single, loop, conditional.`,
+      );
+    }
+    if (step.type === "conditional") {
+      if (typeof step.condition !== "string" || step.condition.trim().length === 0) {
+        throw new Error(
+          `workflow.yml step[${i}] ("${step.id}") in ${workflowDir} is type conditional but is missing required field: condition (must be a non-empty string naming the run-context flag key)`,
+        );
+      }
+    } else if (step.condition !== undefined) {
+      throw new Error(
+        `workflow.yml step[${i}] ("${step.id}") in ${workflowDir} declares condition but is not type conditional. Only type: conditional steps may declare a condition.`,
       );
     }
     validateRetryOn(step, i, workflowDir);

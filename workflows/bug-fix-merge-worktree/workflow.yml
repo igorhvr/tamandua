@@ -97,6 +97,32 @@ agents:
         SOUL.md: agents/merger/SOUL.md
         IDENTITY.md: agents/merger/IDENTITY.md
 
+  - id: reviewer
+    name: Reviewer
+    role: analysis
+    description: Reviews TEST_CMD rewrites before landing (read-only).
+    workspace:
+      baseDir: agents/reviewer
+      skills:
+        - tamandua-agents
+      files:
+        AGENTS.md: agents/reviewer/AGENTS.md
+        SOUL.md: agents/reviewer/SOUL.md
+        IDENTITY.md: agents/reviewer/IDENTITY.md
+
+  - id: auditor
+    name: Auditor
+    role: analysis
+    description: Audits the fixer's reproduction account for deception (read-only).
+    workspace:
+      baseDir: agents/auditor
+      skills:
+        - tamandua-agents
+      files:
+        AGENTS.md: agents/auditor/AGENTS.md
+        SOUL.md: agents/auditor/SOUL.md
+        IDENTITY.md: agents/auditor/IDENTITY.md
+
 steps:
   - id: triage
     agent: triager
@@ -232,8 +258,51 @@ steps:
       STATUS: done
       CHANGES: what was changed
       REGRESSION_TEST: what test was added
-    expects: "STATUS: done\nregex:^CHANGES:\\s*\\S+\nregex:^REGRESSION_TEST:\\s*\\S+"
+      REPRO_EVIDENCE: <pointer to failing output demonstrated on the pre-fix tree> OR CANNOT_REPRODUCE: <reasons>
+    expects: "STATUS: done\nregex:^CHANGES:\\s*\\S+\nregex:^REGRESSION_TEST:\\s*\\S+\nregex:^(REPRO_EVIDENCE|CANNOT_REPRODUCE):\\s*\\S+"
     max_retries: 4
+
+  - id: deception_audit
+    agent: auditor
+    type: conditional
+    condition: deception_audit_required
+    input: |
+      Audit the fix step's honest account of the bug reproduction.
+
+      TASK:
+      {{task}}
+
+      REPO: {{repo}}
+      BRANCH: {{branch}}
+      RUN_ID: {{run_id}}
+
+      FIX ACCOUNT:
+      CHANGES: {{changes}}
+      REGRESSION_TEST: {{regression_test}}
+      REPRO_EVIDENCE: {{repro_evidence}}
+      CANNOT_REPRODUCE: {{cannot_reproduce}}
+
+      RETRY FEEDBACK (only present if your previous audit was rejected — read carefully and fix specifically what it complains about):
+      {{retry_feedback}}
+
+      Follow the deception checklist in your AGENTS.md. You are READ-ONLY —
+      inspect only, never modify, never run the suite or the fix.
+
+      Reply with:
+      STATUS: done
+      VERDICT: HONEST|DECEPTION
+      FINDING: <only on DECEPTION — quoted evidence and rejection class>
+    expects: "STATUS: done\nregex:^VERDICT:\\s*(HONEST|DECEPTION)"
+    on_fail:
+      # PHNT (US-010): a DECEPTION verdict re-runs the fix step with the quoted
+      # finding; accumulated rejections exhaust max_reroutes and fail the run
+      # legibly (conditional steps are exempt from the M4 TESTED_TREE rule).
+      retry_step: fix
+      max_reroutes: 4
+    # PHNT (US-009): the fix completion handler sets deception_audit_required —
+    # unset when REPRO_EVIDENCE is present (auditor auto-completes free via the
+    # conditional primitive), set when CANNOT_REPRODUCE or neither key is emitted
+    # (auditor dispatches ONE read-only round).
 
   - id: verify
     agent: verifier
@@ -290,6 +359,44 @@ steps:
     on_fail:
       retry_step: fix
       max_reroutes: 6
+
+  - id: test_cmd_review
+    agent: reviewer
+    type: conditional
+    condition: test_cmd_review_required
+    input: |
+      Review a TEST_CMD rewrite detected in this run before it can be landed.
+
+      TASK:
+      {{task}}
+
+      REPO: {{repo}}
+      BRANCH: {{branch}}
+      RUN_ID: {{run_id}}
+
+      ESTABLISHED TEST_CMD (the run's current contract):
+      {{test_cmd_review_established}}
+
+      PROPOSED TEST_CMD (the rewrite under review):
+      {{test_cmd_review_candidate}}
+
+      RETRY FEEDBACK (only present if your previous review was rejected — read carefully and fix specifically what it complains about):
+      {{retry_feedback}}
+
+      Follow the review checklist in your AGENTS.md. You are READ-ONLY —
+      inspect only, never modify, never run the suite or the proposed command.
+
+      Reply with:
+      STATUS: done
+      VERDICT: ACCEPT|REJECT
+      FINDING: <only on REJECT — file-grounded evidence and rejection class>
+    expects: "STATUS: done\nregex:^VERDICT:\\s*(ACCEPT|REJECT)"
+    # US-006: a REJECT verdict re-pends the TEST_CMD producer (setup)
+    # with the FINDING as bounded retry feedback; accumulated rejections
+    # exhaust max_reroutes and fail the run legibly.
+    on_fail:
+      retry_step: setup
+      max_reroutes: 4
 
   - id: finalize_merge
     agent: merger

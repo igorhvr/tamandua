@@ -69,7 +69,7 @@ steps:
 
   - id: implement
     agent: developer
-    type: loop                 # Optional. "single" (default) or "loop".
+    type: loop                 # Optional. "single" (default), "loop", or "conditional".
     loop:
       over: stories            # Required for loops. Currently only "stories".
       completion: all_done     # Required for loops. Currently only "all_done".
@@ -158,6 +158,106 @@ The context for each step is built from:
 | `{{progress}}` | Contents of the progress file (if the agent maintains one) |
 | `{{progress_file}}` | Absolute path to the progress file (e.g. `~/.tamandua/runs/run-<uuid>/progress.txt`) |
 | `{{verify_feedback}}` | Feedback from the verify step on retry, else empty |
+
+### Conditional steps (WAVE-A)
+
+A `type: conditional` step is statically declared in `workflow.yml` but
+conditionally dispatched: when its activation flag is UNSET in run context at
+claim time, the dispatch motor auto-completes it IN-PROCESS with **zero
+tokens** — no harness spawn, no model round (the same free path as the
+motor's idle peek). When the flag is SET, it dispatches normally as a single
+step. It is the primitive behind the `test_cmd_review` (TCMD) and
+`deception_audit` (PHNT) review/audit steps in the merge-gate and bug-fix
+workflows.
+
+```yaml
+  - id: deception_audit
+    agent: auditor
+    type: conditional        # Optional. "single" (default), "loop", or "conditional".
+    condition: deception_audit_required   # Required for conditional steps.
+    input: |
+      Audit the fix account.
+    expects: "STATUS: done\nregex:^VERDICT:\\s*(HONEST|DECEPTION)"
+```
+
+- A conditional step MUST declare a non-empty `condition` naming the
+  run-context flag key; a non-conditional step MUST NOT declare one (spec
+  validation enforces both).
+- **Flag semantics (fail-closed):** only clearly-falsy context values —
+  absent, empty, whitespace, `false`/`0`/`no`/`off`/`null`/`undefined`
+  (case-insensitive) — count as UNSET. Anything else — including unexpected
+  values — counts as SET and dispatches the step. When in doubt, the motor
+  spends tokens rather than silently skipping a review.
+- **Observability:** an auto-completed step is marked `auto_completed=1` with
+  `auto_complete_reason='condition_unset:<key>'` on its row, and a
+  `step.auto_completed` event (stepId, agentId, condition, reason) is emitted
+  so oracles/observers can distinguish condition-unset auto-completions from
+  agent-reviewed runs.
+- The activation flag is set by runtime logic — e.g. the fix completion
+  handler sets `deception_audit_required` (unset on `REPRO_EVIDENCE`, set on
+  `CANNOT_REPRODUCE`), and the TEST_CMD rewrite detector sets
+  `test_cmd_review_required`. A set condition can NEVER be auto-completed.
+- **Verdict routing:** a dispatched review/audit step routes its verdict in
+  `completeStep` — `test_cmd_review` ACCEPT adopts the reviewed command /
+  REJECT re-pends the rewriting step, and `deception_audit` HONEST clears the
+  audit flag / DECEPTION (only with quotable, quoted evidence; otherwise
+  DEFAULT HONEST) re-pends the fix step with the FINDING. Conditional steps
+  may declare `on_fail: { retry_step: <producer>, max_reroutes: N }` to bound
+  how many rejections are allowed before the run fails legibly (conditional
+  steps are exempt from the M4 TESTED_TREE-attester rule).
+
+### The Either/Or Expects Pattern (REPRO_EVIDENCE | CANNOT_REPRODUCE)
+
+The bug-fix family's `fix` step requires the fixer to honestly account for
+the failing output with **exactly one** of two alternative keys (PHNT
+honest-account contract):
+
+```
+REPRO_EVIDENCE: <pointer to the failing output demonstrated on the pre-fix tree>
+CANNOT_REPRODUCE: <reasons why the failure could not be reproduced>
+```
+
+The step's `expects` enforces the either/or with a **value-position enum
+whose alternatives are keys**:
+
+```yaml
+expects: "STATUS: done\nregex:^CHANGES:\\s*\\S+\nregex:^REGRESSION_TEST:\\s*\\S+\nregex:^(REPRO_EVIDENCE|CANNOT_REPRODUCE):\\s*\\S+"
+```
+
+`validateExpects` compiles every `regex:` line with the `m` flag, so the `^`
+anchors at each line start — an output emitting exactly one of the two keys
+satisfies the pattern, and a fix emitting neither is rejected. The existing
+`STATUS`/`CHANGES`/`REGRESSION_TEST` keys are unchanged.
+
+The key choice drives the deception-audit activation flag: a non-empty
+`REPRO_EVIDENCE` unsets `deception_audit_required` (the auditor step
+auto-completes free, zero tokens); `CANNOT_REPRODUCE` — or neither key —
+sets it, dispatching one read-only audit round. See
+[Conditional steps (WAVE-A)](#conditional-steps-wave-a) above for the
+activation-flag semantics and verdict routing.
+
+### WAVE-A events
+
+The conditional-review / TCMD / PHNT machinery emits these events (all with
+`runId`, `workflowId`, `stepId`, `ts`; see `src/installer/events.ts` for the
+typed payload fields):
+
+| Event | Payload highlights | Meaning |
+|-------|--------------------|---------|
+| `step.auto_completed` | `condition`, `reason: condition_unset:<key>` | The motor auto-completed a conditional step in-process with **zero tokens** — condition unset. A `step.done` event is emitted alongside for parity with normal completions. |
+| `test_cmd.rewrite_detected` | `oldTestCmd`, `newTestCmd`, `round` (1-based step attempt), `runNumber` | A later `TEST_CMD:` marker differed from the established contract. The contract is **not** replaced; `test_cmd_review_required` is set and the review material (`test_cmd_review_candidate` / `test_cmd_review_established` / `test_cmd_rewriter_step`) is persisted in run context. |
+| `test_cmd.review_accepted` | `oldTestCmd`, `newTestCmd` | The reviewer ACCEPTed the proposed command: it becomes the contract (`runs.test_cmd_established` updated, `test_cmd_source='reviewer'`), the review flag is cleared, and the run proceeds. |
+| `test_cmd.review_rejected` | `oldTestCmd`, `newTestCmd`, `finding` | The reviewer REJECTed with a file-grounded FINDING: the rewriting step is re-pended with the quoted finding as retry feedback, bounded by `max_reroutes`. |
+| `merge.refused_review_pending` | `oldTestCmd`, `newTestCmd`, `detail` (contains `FAILURE_CLASS: refused_review_pending`) | `finalize_merge` refused because a TEST_CMD review is pending or rejected. The step is left **pending** — the refusal is a gate, not a failure; it becomes claimable once the review resolves. |
+| `deception_audit.passed` | — | The auditor verdict resolved HONEST (or DECEPTION without quotable evidence — DEFAULT HONEST): the audit flag is cleared and the run proceeds to verify/finalize. |
+| `deception_audit.deception_found` | `finding` | The auditor found DECEPTION with quotable, quoted evidence: the fix step is re-pended with the quoted finding, the auditor resets to waiting, and `deception_audit_required` stays set so the audit re-runs (bounded by `max_reroutes`). |
+| `merge.landed_without_suite_evidence` | `gateMode`, `origin`, `treeHash`, `cmdHash`, plus `oldTestCmd`/`newTestCmd` when a reviewed rewrite occurred | A strict gate landed without suite evidence for the **current** contract (US-007 annotation fix — the record truthfully states no suite evidence exists). |
+| `merge.landed_over_red_suite` | `origin`, `treeHash`, `cmdHash`, `ledgerRowId`, `exitCode`, `ledgerCreatedAt`, `durationMs`, plus `oldTestCmd`/`newTestCmd` when reviewed | Default-mode red landing (informational) — same review annotations when a reviewed rewrite occurred. |
+
+Verdict routing also reuses the generic reroute events: a REJECT /
+DECEPTION re-pends the producer with `step.rerouted` (carrying the FINDING
+in its detail) and `step.reroute_budget_exhausted` when the budget runs
+out — accumulated rejections fail the run legibly.
 
 ### ID Format: Prefixed vs Bare
 
@@ -462,7 +562,7 @@ npm run build && npm test
 
 | Role | Capabilities | Use For | Default timeout |
 |------|--------------|---------|-----------------|
-| `analysis`     | Read code, reason — no write/exec restrictions enforced by tamandua, used as a description on pi | Planner, reviewer, investigator, triager | 21600s (360m) |
+| `analysis`     | Read code, reason — no write/exec restrictions enforced by tamandua, used as a description on pi | Planner, reviewer, auditor, investigator, triager | 21600s (360m) |
 | `coding`       | Read/write/exec — primary workhorse role            | Developer, fixer, setup        | 21600s (360m) |
 | `verification` | Read + exec, no write — independent verification    | Verifier                       | 14400s (240m) |
 | `testing`      | Read + exec for E2E, no write                       | Tester                         | 21600s (360m) |

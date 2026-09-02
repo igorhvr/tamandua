@@ -335,6 +335,30 @@ export function parseEnforcedKeys(expects: string): string[] {
     // Skip STATUS: lines — they are the step outcome marker, not a data key.
     if (/^STATUS:/i.test(line)) continue;
 
+    // Tier 1a: regex:^(KEY1|KEY2):pattern — caret-enforced key-position
+    // alternation (either/or key). Every alternative is enforced, e.g. the
+    // PHNT fix contract's regex:^(REPRO_EVIDENCE|CANNOT_REPRODUCE):\s*\S+
+    // (US-008). The alternation group must contain ONLY key names — full
+    // pair alternations like ^(STATUS: retry|REBASED: false) do not match.
+    const alternationMatch = line.match(/^regex:\^\(([A-Z_][A-Z_0-9]*(?:\|[A-Z_][A-Z_0-9]*)+)\):/i);
+    if (alternationMatch) {
+      for (const alt of alternationMatch[1].split("|")) {
+        const key = alt.toLowerCase();
+        if (key !== "status") keys.push(key);
+      }
+      continue;
+    }
+
+    // Tier 2a: regex:(KEY1|KEY2):pattern — non-caret key-position alternation
+    const alternationMatchNonCaret = line.match(/^regex:\(([A-Z_][A-Z_0-9]*(?:\|[A-Z_][A-Z_0-9]*)+)\):/i);
+    if (alternationMatchNonCaret) {
+      for (const alt of alternationMatchNonCaret[1].split("|")) {
+        const key = alt.toLowerCase();
+        if (key !== "status") keys.push(key);
+      }
+      continue;
+    }
+
     // Tier 1: regex:^KEY:pattern — caret-enforced promise
     const enforcedMatch = line.match(/^regex:\^([A-Z_][A-Z_0-9]*):/i);
     if (enforcedMatch) {

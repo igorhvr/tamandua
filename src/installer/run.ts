@@ -397,6 +397,18 @@ export async function runWorkflow(
     );
   }
 
+  // WAVE-A TCMD (US-004): a launch-declared `--context test_cmd=` establishes
+  // the TEST_CMD contract at launch with source 'launch'. It wins over any
+  // step-emitted marker: a later step re-emitting the identical value is not a
+  // rewrite, and a differing value triggers test_cmd.rewrite_detected in
+  // completeStep (step-ops.ts) — never a silent replacement.
+  const launchTestCmd = seededContext.test_cmd ?? seededContext.test_cmd_raw;
+  if (typeof launchTestCmd === "string" && launchTestCmd.trim() !== "") {
+    db.prepare(
+      "UPDATE runs SET test_cmd_established = ?, test_cmd_source = 'launch' WHERE id = ?",
+    ).run(launchTestCmd, runId);
+  }
+
   // Store base branch SHA for rugpull detection — captured at run creation time
   // so downstream detection can compare against current tip after failure.
   if (workspaceMode === "worktree") {
@@ -426,8 +438,8 @@ export async function runWorkflow(
 
   // Insert step records for each workflow step
   const insertStep = db.prepare(
-    `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, loop_config, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 'waiting', 0, ?, ?, ?, ?, ?)`,
+    `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, loop_config, conditional_condition, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'waiting', 0, ?, ?, ?, ?, ?, ?)`,
   );
 
   for (let i = 0; i < workflow.steps.length; i++) {
@@ -436,6 +448,8 @@ export async function runWorkflow(
     const maxRetries = step.max_retries ?? 4;
     const stepType = step.type ?? "single";
     const loopConfig = step.loop ? JSON.stringify(step.loop) : null;
+    const conditionalCondition =
+      step.type === "conditional" ? (step.condition ?? null) : null;
     const scopedAgentId = step.agent.startsWith(`${workflow.id}_`)
       ? step.agent
       : `${workflow.id}_${step.agent}`;
@@ -451,6 +465,7 @@ export async function runWorkflow(
       maxRetries,
       stepType,
       loopConfig,
+      conditionalCondition,
       now,
       now,
     );

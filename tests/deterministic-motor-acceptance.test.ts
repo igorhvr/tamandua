@@ -125,6 +125,12 @@ function runDispatchRounds(opts: {
   stepStatus: "pending" | "done";
   rounds: number;
   journalPath: string;
+  /** WAVE-A US-003: step type to seed ('single' default; 'conditional' exercises the zero-token auto-complete primitive). */
+  stepType?: "single" | "loop" | "conditional";
+  /** WAVE-A US-003: steps.conditional_condition (activation flag key) for conditional steps. */
+  conditionalCondition?: string | null;
+  /** WAVE-A US-003: run context JSON — carries the activation flag value. */
+  runContext?: Record<string, string>;
 }) {
   return runNodeScript(
     `
@@ -136,14 +142,17 @@ function runDispatchRounds(opts: {
       const db = getDb();
       const runId = ${JSON.stringify(opts.runId)};
       const stepId = ${JSON.stringify(opts.stepId)};
+      const stepType = ${JSON.stringify(opts.stepType ?? "single")};
+      const conditionalCondition = ${JSON.stringify(opts.conditionalCondition ?? null)};
+      const runContext = ${JSON.stringify(opts.runContext ?? {})};
       const now = new Date().toISOString();
 
       db.prepare(
-        "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 'wf-acceptance', 'Prove the motor', 'running', '{}', 0, ?, ?)"
-      ).run(runId, now, now);
+        "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 'wf-acceptance', 'Prove the motor', 'running', ?, 0, ?, ?)"
+      ).run(runId, JSON.stringify(runContext), now, now);
       db.prepare(
-        "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, created_at, updated_at) VALUES (?, ?, 'the-step', 'wf-acceptance_dev', 0, 'do the thing', '', ?, ?, ?)"
-      ).run(stepId, runId, ${JSON.stringify(opts.stepStatus)}, now, now);
+        "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, type, conditional_condition, created_at, updated_at) VALUES (?, ?, 'the-step', 'wf-acceptance_dev', 0, 'do the thing', '', ?, ?, ?, ?, ?)"
+      ).run(stepId, runId, ${JSON.stringify(opts.stepStatus)}, stepType, conditionalCondition, now, now);
 
       const job = {
         id: "job-motor-acceptance",
@@ -164,6 +173,7 @@ function runDispatchRounds(opts: {
 
       const run = db.prepare("SELECT tokens_spent FROM runs WHERE id = ?").get(runId);
       const stats = db.prepare("SELECT system_tokens_spent FROM tamandua_stats WHERE id = 1").get();
+      const stepRow = db.prepare("SELECT status, auto_completed, auto_complete_reason FROM steps WHERE id = ?").get(stepId);
 
       const journalPath = ${JSON.stringify(opts.journalPath)};
       const invocations = fs.existsSync(journalPath)
@@ -175,6 +185,7 @@ function runDispatchRounds(opts: {
         ? fs.readFileSync(eventsPath, "utf-8").split(/\\r?\\n/).filter(Boolean).map((l) => JSON.parse(l))
         : [];
       const tokenEvents = events.filter((e) => e.event === "run.tokens.updated");
+      const autoCompletedEvents = events.filter((e) => e.event === "step.auto_completed");
 
       const logPath = path.join(process.env.HOME, ".tamandua", "tamandua.log");
       const log = fs.existsSync(logPath) ? fs.readFileSync(logPath, "utf-8") : "";
@@ -187,6 +198,14 @@ function runDispatchRounds(opts: {
         tokenEventDelta: tokenEvents[0]?.tokenDelta ?? null,
         idleLogLines: (log.match(/Dispatch round idle/g) ?? []).length,
         workCompleteLogLines: (log.match(/Work round complete/g) ?? []).length,
+        autoCompleteLogLines: (log.match(/Conditional step auto-completed/g) ?? []).length,
+        stepStatusAfter: stepRow.status,
+        autoCompleted: stepRow.auto_completed,
+        autoCompleteReason: stepRow.auto_complete_reason,
+        autoCompletedEventCount: autoCompletedEvents.length,
+        autoCompletedEventStepId: autoCompletedEvents[0]?.stepId ?? null,
+        autoCompletedEventCondition: autoCompletedEvents[0]?.condition ?? null,
+        autoCompletedEventReason: autoCompletedEvents[0]?.reason ?? null,
       }));
     `,
     {
@@ -303,6 +322,88 @@ describe("deterministic motor acceptance (MOTOR-CONTRACT.md N1–N3)", () => {
       assert.equal(result.tokenEventCount, 1, "one run.tokens.updated event should fire");
       assert.equal(result.tokenEventDelta, 4242, "the event should carry the usage delta");
       assert.equal(result.systemTokensSpent, 0, "work rounds never touch the system-token ledger");
+    } finally {
+      fs.rmSync(temp.root, { recursive: true, force: true });
+    }
+  });
+
+  it("N4: conditional auto-complete rounds invoke no model and spend zero tokens (WAVE-A US-003)", () => {
+    const temp = createTempHome();
+    const runId = crypto.randomUUID();
+    const stepId = crypto.randomUUID();
+
+    try {
+      const fakePi = createJournalingFakePi(temp.root, runId, stepId);
+
+      // A pending conditional step whose activation flag is UNSET in run
+      // context: every round must auto-complete it IN-PROCESS — zero harness
+      // spawns, zero tokens, no token events, and the step marked done with
+      // the condition_unset marker.
+      const result = runDispatchRounds({
+        homeDir: temp.homeDir,
+        fakePiPath: fakePi.binPath,
+        runId,
+        stepId,
+        stepStatus: "pending",
+        rounds: 3,
+        journalPath: fakePi.journalPath,
+        stepType: "conditional",
+        conditionalCondition: "test_cmd_review_required",
+        runContext: {}, // flag absent → unset
+      });
+
+      assert.equal(result.invocations, 0, "an auto-complete-only round must NEVER spawn the harness binary");
+      assert.equal(result.systemTokensSpent, 0, "auto-complete rounds must spend zero system tokens");
+      assert.equal(result.tokensSpent, 0, "auto-complete rounds must not attribute run tokens");
+      assert.equal(result.tokenEventCount, 0, "no run.tokens.updated event may fire for an auto-complete-only round");
+      assert.equal(result.workCompleteLogLines, 0, "no work round may complete");
+      assert.equal(result.autoCompleteLogLines, 1, "the round must log the conditional auto-complete");
+
+      assert.equal(result.stepStatusAfter, "done", "the conditional step must be marked done");
+      assert.equal(result.autoCompleted, 1, "auto_completed marker must be set");
+      assert.equal(result.autoCompleteReason, "condition_unset:test_cmd_review_required");
+
+      assert.equal(result.autoCompletedEventCount, 1, "exactly one step.auto_completed event");
+      assert.equal(result.autoCompletedEventStepId, "the-step");
+      assert.equal(result.autoCompletedEventCondition, "test_cmd_review_required");
+      assert.equal(result.autoCompletedEventReason, "condition_unset:test_cmd_review_required");
+    } finally {
+      fs.rmSync(temp.root, { recursive: true, force: true });
+    }
+  });
+
+  it("N5: condition SET → the conditional step dispatches normally (harness spawns)", () => {
+    const temp = createTempHome();
+    const runId = crypto.randomUUID();
+    const stepId = crypto.randomUUID();
+
+    try {
+      const fakePi = createJournalingFakePi(temp.root, runId, stepId);
+
+      // The activation flag is SET: the motor must NOT auto-complete the
+      // step. It falls through to the normal harness spawn (fail-closed).
+      const result = runDispatchRounds({
+        homeDir: temp.homeDir,
+        fakePiPath: fakePi.binPath,
+        runId,
+        stepId,
+        stepStatus: "pending",
+        rounds: 1,
+        journalPath: fakePi.journalPath,
+        stepType: "conditional",
+        conditionalCondition: "test_cmd_review_required",
+        runContext: { test_cmd_review_required: "true" },
+      });
+
+      assert.equal(result.invocations, 1, "a SET condition must dispatch the harness normally");
+      assert.equal(result.workCompleteLogLines, 1, "the work round should log 'Work round complete'");
+      assert.equal(result.autoCompleteLogLines, 0, "no conditional auto-complete may occur");
+
+      // The fake pi never claims the step, so it stays pending — but the
+      // point of N5 is that the round DID spawn rather than auto-complete.
+      assert.equal(result.stepStatusAfter, "pending");
+      assert.equal(result.autoCompleted, 0);
+      assert.equal(result.autoCompletedEventCount, 0, "no step.auto_completed event for a SET condition");
     } finally {
       fs.rmSync(temp.root, { recursive: true, force: true });
     }

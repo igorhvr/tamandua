@@ -2737,3 +2737,296 @@ describe("MIGV upgrade path (pre-WLST5 DB → current)", () => {
     assert.equal(migrated.row.ceiling_expiry_count, 0, "existing WLST5 counters untouched");
   });
 });
+
+describe("WAVE-A US-001 conditional-review + TEST_CMD contract columns", () => {
+  // WAVE-A US-001: steps gains conditional_condition (TEXT), auto_completed
+  // (INTEGER NOT NULL DEFAULT 0), auto_complete_reason (TEXT); runs gains
+  // test_cmd_established (TEXT), test_cmd_source (TEXT) — all via guarded
+  // idempotent ALTERs, with SCHEMA_VERSION bumped (v6 → v7) so pre-existing
+  // v6 installs actually run the migration (the WLST5.1 failure mode).
+
+  function distDir(): string {
+    return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "dist");
+  }
+
+  // Pre-WAVE-A (v6) runs/steps schema: has instant_fail_count but NOT the
+  // conditional-review / TEST_CMD contract columns.
+  const LEGACY_V6_DDL = `
+    CREATE TABLE runs (
+      id TEXT PRIMARY KEY,
+      run_number INTEGER,
+      workflow_id TEXT NOT NULL,
+      task TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'running',
+      context TEXT NOT NULL DEFAULT '{}',
+      tokens_spent INTEGER NOT NULL DEFAULT 0,
+      notify_url TEXT,
+      scheduling_status TEXT,
+      scheduling_requested_at TEXT,
+      scheduling_error TEXT,
+      worker_lost_count INTEGER NOT NULL DEFAULT 0,
+      ceiling_expiry_count INTEGER NOT NULL DEFAULT 0,
+      parent_run_id TEXT,
+      instant_fail_count INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE steps (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES runs(id),
+      step_id TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      step_index INTEGER NOT NULL,
+      input_template TEXT NOT NULL,
+      expects TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'waiting',
+      output TEXT,
+      retry_count INTEGER DEFAULT 0,
+      max_retries INTEGER DEFAULT 4,
+      type TEXT NOT NULL DEFAULT 'single',
+      loop_config TEXT,
+      current_story_id TEXT,
+      abandoned_count INTEGER DEFAULT 0,
+      claim_job_id TEXT,
+      claim_pid INTEGER,
+      claim_pgid INTEGER,
+      claim_updated_at TEXT,
+      reroute_count INTEGER DEFAULT 0,
+      terminal_reroute_count INTEGER DEFAULT 0,
+      ledger_concession_count INTEGER DEFAULT 0,
+      claim_invalidated_by TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    INSERT INTO runs (
+      id, run_number, workflow_id, task, status, context, tokens_spent,
+      worker_lost_count, ceiling_expiry_count, instant_fail_count,
+      created_at, updated_at
+    ) VALUES (
+      'legacy-run', 1, 'workflow', 'task', 'running', '{}', 42, 3, 0, 0,
+      '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+    );
+    INSERT INTO steps (
+      id, run_id, step_id, agent_id, step_index, input_template, expects,
+      status, created_at, updated_at
+    ) VALUES (
+      'legacy-step', 'legacy-run', 'test_cmd_review', 'reviewer', 0, '', '',
+      'waiting', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+    );
+  `;
+
+  it("fresh DB: steps and runs include the WAVE-A columns at SCHEMA_VERSION", () => {
+    const th = createTempHome("tamandua-wavea-fresh-");
+    const dbPath = path.join(th.root, "fresh.db");
+    const importPath = JSON.stringify(path.join(distDir(), "db.js"));
+    const script = [
+      `import { getDb, SCHEMA_VERSION } from ${importPath};`,
+      "const db = getDb();",
+      "const stepCols = db.prepare(\"PRAGMA table_info(steps)\").all();",
+      "const runCols = db.prepare(\"PRAGMA table_info(runs)\").all();",
+      "const col = (t, n) => t.find((c) => c.name === n);",
+      "const ver = db.prepare(\"PRAGMA user_version\").get();",
+      "console.log(JSON.stringify({",
+      "  cond: col(stepCols, 'conditional_condition'),",
+      "  auto: col(stepCols, 'auto_completed'),",
+      "  reason: col(stepCols, 'auto_complete_reason'),",
+      "  tce: col(runCols, 'test_cmd_established'),",
+      "  tcs: col(runCols, 'test_cmd_source'),",
+      "  user_version: ver.user_version,",
+      "}));",
+    ].join("\n");
+
+    const result = execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+      cwd: distDir(),
+      env: {
+        HOME: th.homeDir,
+        TAMANDUA_DB_PATH: dbPath,
+        TAMANDUA_TEST_GUARD: "1",
+        PATH: process.env.PATH ?? "",
+      },
+      encoding: "utf-8",
+    });
+    const parsed = JSON.parse(result.trim()) as {
+      cond: { type: string; notnull: number; dflt_value: string | null };
+      auto: { type: string; notnull: number; dflt_value: string | null };
+      reason: { type: string; notnull: number; dflt_value: string | null };
+      tce: { type: string; notnull: number; dflt_value: string | null };
+      tcs: { type: string; notnull: number; dflt_value: string | null };
+      user_version: number;
+    };
+
+    assert.equal(parsed.user_version, SCHEMA_VERSION,
+      `fresh DB should be stamped at ${SCHEMA_VERSION}`);
+    // steps.conditional_condition: nullable TEXT, no default
+    assert.equal(parsed.cond.type, "TEXT");
+    assert.equal(parsed.cond.notnull, 0);
+    assert.equal(parsed.cond.dflt_value, null);
+    // steps.auto_completed: NOT NULL INTEGER defaulting to 0
+    assert.equal(parsed.auto.type, "INTEGER");
+    assert.equal(parsed.auto.notnull, 1);
+    assert.equal(parsed.auto.dflt_value, "0");
+    // steps.auto_complete_reason: nullable TEXT, no default
+    assert.equal(parsed.reason.type, "TEXT");
+    assert.equal(parsed.reason.notnull, 0);
+    assert.equal(parsed.reason.dflt_value, null);
+    // runs.test_cmd_established / test_cmd_source: nullable TEXT, no default
+    assert.equal(parsed.tce.type, "TEXT");
+    assert.equal(parsed.tce.notnull, 0);
+    assert.equal(parsed.tce.dflt_value, null);
+    assert.equal(parsed.tcs.type, "TEXT");
+    assert.equal(parsed.tcs.notnull, 0);
+    assert.equal(parsed.tcs.dflt_value, null);
+  });
+
+  it("migrates a pre-WAVE-A (v6) DB: adds all five columns, re-stamps version, existing rows preserved", () => {
+    const PRE_WAVE_A_SCHEMA_VERSION = SCHEMA_VERSION - 1;
+
+    const th = createTempHome("tamandua-wavea-migrate-");
+    const dbPath = path.join(th.root, "legacy.db");
+    const legacyDb = new DatabaseSync(dbPath);
+    legacyDb.exec(`
+      ${LEGACY_V6_DDL}
+      PRAGMA user_version = ${PRE_WAVE_A_SCHEMA_VERSION};
+    `);
+    // Sanity: the legacy DB really is in the pre-WAVE-A state.
+    const preStepCols = legacyDb.prepare("PRAGMA table_info(steps)").all() as Array<{ name: string }>;
+    assert.ok(preStepCols.some((c) => c.name === "claim_invalidated_by"), "precondition: legacy steps has claim_invalidated_by");
+    assert.ok(!preStepCols.some((c) => c.name === "conditional_condition"), "precondition: legacy steps lacks conditional_condition");
+    assert.ok(!preStepCols.some((c) => c.name === "auto_completed"), "precondition: legacy steps lacks auto_completed");
+    assert.ok(!preStepCols.some((c) => c.name === "auto_complete_reason"), "precondition: legacy steps lacks auto_complete_reason");
+    const preRunCols = legacyDb.prepare("PRAGMA table_info(runs)").all() as Array<{ name: string }>;
+    assert.ok(preRunCols.some((c) => c.name === "instant_fail_count"), "precondition: legacy runs has instant_fail_count");
+    assert.ok(!preRunCols.some((c) => c.name === "test_cmd_established"), "precondition: legacy runs lacks test_cmd_established");
+    assert.ok(!preRunCols.some((c) => c.name === "test_cmd_source"), "precondition: legacy runs lacks test_cmd_source");
+    const preVer = legacyDb.prepare("PRAGMA user_version").get() as { user_version: number };
+    assert.equal(preVer.user_version, PRE_WAVE_A_SCHEMA_VERSION, "precondition: user_version is the pre-bump version");
+    legacyDb.close();
+
+    // Spawn a fresh subprocess so getDb() runs migrate() from scratch on the legacy file.
+    const importPath = JSON.stringify(path.join(distDir(), "db.js"));
+    const script = [
+      `import { getDb, SCHEMA_VERSION } from ${importPath};`,
+      "const db = getDb();",
+      "const col = (t, n) => db.prepare(\"PRAGMA table_info(\" + t + \")\").all().find((c) => c.name === n);",
+      "const ver = db.prepare(\"PRAGMA user_version\").get();",
+      // SELECTs exercising every new column — must not throw.
+      'const stepRow = db.prepare("SELECT id, conditional_condition, auto_completed, auto_complete_reason FROM steps WHERE id = ?").get("legacy-step");',
+      'const runRow = db.prepare("SELECT id, test_cmd_established, test_cmd_source FROM runs WHERE id = ?").get("legacy-run");',
+      "console.log(JSON.stringify({",
+      "  cond: col('steps', 'conditional_condition'),",
+      "  auto: col('steps', 'auto_completed'),",
+      "  reason: col('steps', 'auto_complete_reason'),",
+      "  tce: col('runs', 'test_cmd_established'),",
+      "  tcs: col('runs', 'test_cmd_source'),",
+      "  user_version: ver.user_version,",
+      "  stepRow, runRow,",
+      "}));",
+    ].join("\n");
+
+    const result = execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+      cwd: distDir(),
+      env: {
+        HOME: th.homeDir,
+        TAMANDUA_DB_PATH: dbPath,
+        TAMANDUA_TEST_GUARD: "1",
+        PATH: process.env.PATH ?? "",
+      },
+      encoding: "utf-8",
+    });
+    const migrated = JSON.parse(result.trim()) as {
+      cond?: { type: string; notnull: number; dflt_value: string | null };
+      auto?: { type: string; notnull: number; dflt_value: string | null };
+      reason?: { type: string; notnull: number; dflt_value: string | null };
+      tce?: { type: string; notnull: number; dflt_value: string | null };
+      tcs?: { type: string; notnull: number; dflt_value: string | null };
+      user_version: number;
+      stepRow: { id: string; conditional_condition: string | null; auto_completed: number; auto_complete_reason: string | null };
+      runRow: { id: string; test_cmd_established: string | null; test_cmd_source: string | null };
+    };
+
+    assert.ok(migrated.cond, "conditional_condition column should be added");
+    assert.equal(migrated.cond.type, "TEXT");
+    assert.equal(migrated.cond.notnull, 0, "conditional_condition should be nullable");
+    assert.equal(migrated.cond.dflt_value, null);
+    assert.ok(migrated.auto, "auto_completed column should be added");
+    assert.equal(migrated.auto.type, "INTEGER");
+    assert.equal(migrated.auto.notnull, 1, "auto_completed should be NOT NULL");
+    assert.equal(migrated.auto.dflt_value, "0", "auto_completed should default to 0");
+    assert.ok(migrated.reason, "auto_complete_reason column should be added");
+    assert.equal(migrated.reason.type, "TEXT");
+    assert.equal(migrated.reason.notnull, 0, "auto_complete_reason should be nullable");
+    assert.equal(migrated.reason.dflt_value, null);
+    assert.ok(migrated.tce, "test_cmd_established column should be added");
+    assert.equal(migrated.tce.type, "TEXT");
+    assert.equal(migrated.tce.notnull, 0, "test_cmd_established should be nullable");
+    assert.equal(migrated.tce.dflt_value, null);
+    assert.ok(migrated.tcs, "test_cmd_source column should be added");
+    assert.equal(migrated.tcs.type, "TEXT");
+    assert.equal(migrated.tcs.notnull, 0, "test_cmd_source should be nullable");
+    assert.equal(migrated.tcs.dflt_value, null);
+
+    assert.equal(migrated.user_version, SCHEMA_VERSION,
+      `legacy DB should be re-stamped to ${SCHEMA_VERSION} (not stuck at the pre-bump version)`);
+
+    // Existing rows are untouched: the new columns hold their defaults/NULL.
+    assert.deepEqual(migrated.stepRow, {
+      id: "legacy-step",
+      conditional_condition: null,
+      auto_completed: 0,
+      auto_complete_reason: null,
+    }, "legacy step row keeps identity with auto_completed = 0 via DEFAULT");
+    assert.deepEqual(migrated.runRow, {
+      id: "legacy-run",
+      test_cmd_established: null,
+      test_cmd_source: null,
+    }, "legacy run row keeps identity with NULL contract columns");
+  });
+
+  it("migration is idempotent: repeated migration does not duplicate columns", () => {
+    const PRE_WAVE_A_SCHEMA_VERSION = SCHEMA_VERSION - 1;
+
+    const th = createTempHome("tamandua-wavea-idempotent-");
+    const dbPath = path.join(th.root, "legacy.db");
+    const legacyDb = new DatabaseSync(dbPath);
+    legacyDb.exec(`
+      ${LEGACY_V6_DDL}
+      PRAGMA user_version = ${PRE_WAVE_A_SCHEMA_VERSION};
+    `);
+    legacyDb.close();
+
+    const importPath = JSON.stringify(path.join(distDir(), "db.js"));
+    const script = [
+      `import { getDb } from ${importPath};`,
+      "const db = getDb();",
+      "const count = (t, n) => db.prepare(\"PRAGMA table_info(\" + t + \")\").all().filter((c) => c.name === n).length;",
+      "console.log(JSON.stringify({",
+      "  cond: count('steps', 'conditional_condition'),",
+      "  auto: count('steps', 'auto_completed'),",
+      "  reason: count('steps', 'auto_complete_reason'),",
+      "  tce: count('runs', 'test_cmd_established'),",
+      "  tcs: count('runs', 'test_cmd_source'),",
+      "}));",
+    ].join("\n");
+    const runMigrate = () => execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+      cwd: distDir(),
+      env: {
+        HOME: th.homeDir,
+        TAMANDUA_DB_PATH: dbPath,
+        TAMANDUA_TEST_GUARD: "1",
+        PATH: process.env.PATH ?? "",
+      },
+      encoding: "utf-8",
+    });
+
+    // Migrate twice (two separate subprocesses) — second run must not error or duplicate.
+    runMigrate();
+    const second = JSON.parse(runMigrate().trim()) as Record<string, number>;
+    assert.deepEqual(second, {
+      cond: 1,
+      auto: 1,
+      reason: 1,
+      tce: 1,
+      tcs: 1,
+    }, "each WAVE-A column must appear exactly once after repeated migration");
+  });
+});

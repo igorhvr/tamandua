@@ -358,9 +358,9 @@ describe("S29 (US-003) — fail-closed trigger-vocabulary preflight", () => {
   it("GREEN-ARM (AC2): the vocabulary derives step/agent ids from the workflow spec and includes the pinned product events", async () => {
     const mod = await import(path.join(ttRoot, "bin", "tt-trigger-vocabulary.mjs"));
     const bfmw = mod.workflowVocabularyFor("bug-fix-merge-worktree");
-    assert.deepEqual(bfmw.steps, ["triage", "investigate", "setup", "fix", "verify", "finalize_merge"],
+    assert.deepEqual(bfmw.steps, ["triage", "investigate", "setup", "fix", "deception_audit", "verify", "test_cmd_review", "finalize_merge"],
       "bfmw step ids from workflows/bug-fix-merge-worktree/workflow.yml");
-    assert.deepEqual(bfmw.agents, ["triager", "investigator", "setup", "fixer", "verifier", "merger"],
+    assert.deepEqual(bfmw.agents, ["triager", "investigator", "setup", "fixer", "verifier", "merger", "reviewer", "auditor"],
       "bfmw agent ids from the workflow spec");
     const fdmw = mod.workflowVocabularyFor("feature-dev-merge-worktree");
     assert.ok(fdmw.agents.includes("developer"), "fdmw must have the developer agent (step:developer:running is valid there)");

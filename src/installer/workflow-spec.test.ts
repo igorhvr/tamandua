@@ -608,6 +608,110 @@ steps:
     assert.equal(spec.id, "test-attestation-ok");
   });
 
+  it("WAVE-A US-006: conditional steps are exempt from the M4 attestation rule (retry_step may target the rewrite producer, not the TESTED_TREE attester)", async () => {
+    // The TESTED_TREE-attesting step (test) sits between the rewrite
+    // producer (setup) and the conditional review step. A conditional review
+    // step's on_fail.retry_step legitimately targets the rewrite producer —
+    // under the strict M4 rule this would be rejected (nearest upstream
+    // TESTED_TREE attester is "test", not "setup"); conditional steps are
+    // exempt because they never attest TESTED_TREE themselves.
+    const yml = `
+id: test-conditional-m4-exempt
+agents:
+  - id: dev
+    workspace:
+      baseDir: agents/dev
+steps:
+  - id: setup
+    agent: dev
+    input: |
+      Prepare
+      Reply with:
+      STATUS: done
+      TEST_CMD: npm test
+    expects: "STATUS: done\\nregex:^TEST_CMD:\\\\s*\\\\S+"
+  - id: test
+    agent: dev
+    input: |
+      Verify the work
+      Reply with:
+      STATUS: done
+      TESTED_TREE: treehash123
+    expects: "STATUS: done\\nregex:^TESTED_TREE:\\\\s*\\\\S+"
+  - id: test_cmd_review
+    agent: dev
+    type: conditional
+    condition: test_cmd_review_required
+    input: |
+      Review the TEST_CMD rewrite.
+      Reply with:
+      STATUS: done
+      VERDICT: ACCEPT|REJECT
+    expects: "STATUS: done\\nregex:^VERDICT:\\\\s*(ACCEPT|REJECT)"
+    on_fail:
+      retry_step: setup
+      max_reroutes: 4
+  - id: finalize_merge
+    agent: dev
+    input: |
+      Land the changes
+      TESTED_TREE: {{tested_tree}}
+    expects: "STATUS: done"
+`;
+    const dir = createTempWorkflow(yml);
+    const spec = await loadWorkflowSpec(dir);
+    assert.equal(spec.id, "test-conditional-m4-exempt");
+  });
+
+  it("WAVE-A US-006: the M4 exemption is scoped to conditional steps — a non-conditional step with the same mismatch still fails", async () => {
+    // Same shape as above but the review step is NOT conditional: the strict
+    // M4 rule must still reject retry_step "setup" (nearest TESTED_TREE
+    // attester is "test").
+    const yml = `
+id: test-non-conditional-m4-strict
+agents:
+  - id: dev
+    workspace:
+      baseDir: agents/dev
+steps:
+  - id: setup
+    agent: dev
+    input: |
+      Prepare
+      Reply with:
+      STATUS: done
+      TEST_CMD: npm test
+    expects: "STATUS: done\\nregex:^TEST_CMD:\\\\s*\\\\S+"
+  - id: test
+    agent: dev
+    input: |
+      Verify the work
+      Reply with:
+      STATUS: done
+      TESTED_TREE: treehash123
+    expects: "STATUS: done\\nregex:^TESTED_TREE:\\\\s*\\\\S+"
+  - id: review
+    agent: dev
+    input: |
+      Review the TEST_CMD rewrite.
+    expects: "STATUS: done"
+    on_fail:
+      retry_step: setup
+      max_reroutes: 4
+  - id: finalize_merge
+    agent: dev
+    input: |
+      Land the changes
+      TESTED_TREE: {{tested_tree}}
+    expects: "STATUS: done"
+`;
+    const dir = createTempWorkflow(yml);
+    await assert.rejects(
+      () => loadWorkflowSpec(dir),
+      /on_fail\.retry_step is "setup" but the attesting step that produces TESTED_TREE is "test"/i,
+    );
+  });
+
   it("rejects when retry_step mismatches the TESTED_TREE attesting step, naming both", async () => {
     const yml = `
 id: test-attestation-bad
@@ -747,5 +851,191 @@ steps:
       () => loadWorkflowSpec(dir),
       /on_fail.*contains unknown key.*"foo".*retry_step, max_reroutes, retry_on/i,
     );
+  });
+});
+
+describe("conditional step type validation", () => {
+  it("accepts a conditional step that declares a non-empty condition", async () => {
+    const yml = `
+id: test-conditional-ok
+agents:
+  - id: dev
+    workspace:
+      baseDir: agents/dev
+steps:
+  - id: review
+    agent: dev
+    type: conditional
+    condition: test_cmd_review_required
+    input: "Review the rewrite"
+    expects: "VERDICT: ACCEPT"
+`;
+    const dir = createTempWorkflow(yml);
+    const spec = await loadWorkflowSpec(dir);
+    assert.equal(spec.id, "test-conditional-ok");
+    assert.equal(spec.steps[0].type, "conditional");
+    assert.equal(spec.steps[0].condition, "test_cmd_review_required");
+  });
+
+  it("rejects a conditional step without a condition", async () => {
+    const yml = `
+id: test-conditional-no-condition
+agents:
+  - id: dev
+    workspace:
+      baseDir: agents/dev
+steps:
+  - id: review
+    agent: dev
+    type: conditional
+    input: "Review the rewrite"
+    expects: "VERDICT: ACCEPT"
+`;
+    const dir = createTempWorkflow(yml);
+    await assert.rejects(
+      () => loadWorkflowSpec(dir),
+      /type conditional but is missing required field: condition/i,
+    );
+  });
+
+  it("rejects a conditional step with an empty or whitespace condition", async () => {
+    const yml = `
+id: test-conditional-empty-condition
+agents:
+  - id: dev
+    workspace:
+      baseDir: agents/dev
+steps:
+  - id: review
+    agent: dev
+    type: conditional
+    condition: "   "
+    input: "Review the rewrite"
+    expects: "VERDICT: ACCEPT"
+`;
+    const dir = createTempWorkflow(yml);
+    await assert.rejects(
+      () => loadWorkflowSpec(dir),
+      /type conditional but is missing required field: condition/i,
+    );
+  });
+
+  it("rejects a single step that declares a condition", async () => {
+    const yml = `
+id: test-single-with-condition
+agents:
+  - id: dev
+    workspace:
+      baseDir: agents/dev
+steps:
+  - id: step1
+    agent: dev
+    type: single
+    condition: some_flag
+    input: "hello"
+    expects: "world"
+`;
+    const dir = createTempWorkflow(yml);
+    await assert.rejects(
+      () => loadWorkflowSpec(dir),
+      /declares condition but is not type conditional/i,
+    );
+  });
+
+  it("rejects a step with no type that declares a condition", async () => {
+    const yml = `
+id: test-default-type-with-condition
+agents:
+  - id: dev
+    workspace:
+      baseDir: agents/dev
+steps:
+  - id: step1
+    agent: dev
+    condition: some_flag
+    input: "hello"
+    expects: "world"
+`;
+    const dir = createTempWorkflow(yml);
+    await assert.rejects(
+      () => loadWorkflowSpec(dir),
+      /declares condition but is not type conditional/i,
+    );
+  });
+
+  it("rejects a loop step that declares a condition", async () => {
+    const yml = `
+id: test-loop-with-condition
+agents:
+  - id: dev
+    workspace:
+      baseDir: agents/dev
+steps:
+  - id: develop
+    agent: dev
+    type: loop
+    condition: some_flag
+    loop:
+      over: stories
+      completion: all_done
+    input: "Implement {{current_story}}"
+    expects: "STATUS: done"
+`;
+    const dir = createTempWorkflow(yml);
+    await assert.rejects(
+      () => loadWorkflowSpec(dir),
+      /declares condition but is not type conditional/i,
+    );
+  });
+
+  it("rejects unknown step type values", async () => {
+    const yml = `
+id: test-bad-type
+agents:
+  - id: dev
+    workspace:
+      baseDir: agents/dev
+steps:
+  - id: step1
+    agent: dev
+    type: banana
+    input: "hello"
+    expects: "world"
+`;
+    const dir = createTempWorkflow(yml);
+    await assert.rejects(
+      () => loadWorkflowSpec(dir),
+      /has invalid type: "banana".*Valid types are: single, loop, conditional/i,
+    );
+  });
+
+  it("still accepts single and loop steps without a condition (regression)", async () => {
+    const yml = `
+id: test-single-loop-ok
+agents:
+  - id: dev
+    workspace:
+      baseDir: agents/dev
+steps:
+  - id: implement
+    agent: dev
+    type: single
+    input: "Implement the task"
+    expects: "STATUS: done"
+  - id: develop
+    agent: dev
+    type: loop
+    loop:
+      over: stories
+      completion: all_done
+    input: "Implement {{current_story}}"
+    expects: "STATUS: done"
+`;
+    const dir = createTempWorkflow(yml);
+    const spec = await loadWorkflowSpec(dir);
+    assert.equal(spec.steps[0].type, "single");
+    assert.equal(spec.steps[1].type, "loop");
+    assert.equal(spec.steps[0].condition, undefined);
+    assert.equal(spec.steps[1].condition, undefined);
   });
 });

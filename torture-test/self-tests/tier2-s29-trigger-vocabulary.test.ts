@@ -96,8 +96,8 @@ const S29_CELLS: CellAudit[] = [
     trigger: "step:developer:running",
     runIds: ["13518174-482b-4a93-98cd-dca4e1af0a3d", "216d40ca-f296-4071-b43b-a69dc9a65efb"],
     runTerminalStatus: "completed",
-    observedStepIds: ["triage", "investigate", "setup", "fix", "verify", "finalize_merge"],
-    observedAgentIds: ["triager", "investigator", "setup", "fixer", "verifier", "merger"],
+    observedStepIds: ["triage", "investigate", "setup", "fix", "deception_audit", "verify", "test_cmd_review", "finalize_merge"],
+    observedAgentIds: ["triager", "investigator", "setup", "fixer", "verifier", "merger", "reviewer", "auditor"],
     observedEvents: [
       "run.started", "pipeline.advanced", "step.pending", "step.running", "step.done",
       "step.rerouted", "step.expects.validated", "dispatch.render.validated",
@@ -117,8 +117,8 @@ const S29_CELLS: CellAudit[] = [
     trigger: "step:developer:running",
     runIds: ["c07332e7-540b-4530-b02a-c77596c2c397"],
     runTerminalStatus: "completed",
-    observedStepIds: ["triage", "investigate", "setup", "fix", "verify", "finalize_merge"],
-    observedAgentIds: ["triager", "investigator", "setup", "fixer", "verifier", "merger"],
+    observedStepIds: ["triage", "investigate", "setup", "fix", "deception_audit", "verify", "test_cmd_review", "finalize_merge"],
+    observedAgentIds: ["triager", "investigator", "setup", "fixer", "verifier", "merger", "reviewer", "auditor"],
     observedEvents: [
       "run.started", "pipeline.advanced", "step.pending", "step.running", "step.done",
       "step.expects.validated", "dispatch.render.validated", "run.tokens.updated",
@@ -132,8 +132,8 @@ const S29_CELLS: CellAudit[] = [
     trigger: "step:developer:running",
     runIds: ["5c04a539-919a-4ffb-ab03-6a8c9dc0ecfd"],
     runTerminalStatus: "completed",
-    observedStepIds: ["triage", "investigate", "setup", "fix", "verify", "finalize_merge"],
-    observedAgentIds: ["triager", "investigator", "setup", "fixer", "verifier", "merger"],
+    observedStepIds: ["triage", "investigate", "setup", "fix", "deception_audit", "verify", "test_cmd_review", "finalize_merge"],
+    observedAgentIds: ["triager", "investigator", "setup", "fixer", "verifier", "merger", "reviewer", "auditor"],
     observedEvents: [
       "run.started", "pipeline.advanced", "step.pending", "step.running", "step.done",
       "step.expects.validated", "dispatch.render.validated", "run.tokens.updated",
@@ -147,8 +147,8 @@ const S29_CELLS: CellAudit[] = [
     trigger: "event:run.failed",
     runIds: ["6344ccbd-86b9-4fa0-b71b-dce75fb54caf"],
     runTerminalStatus: "completed",
-    observedStepIds: ["triage", "investigate", "setup", "fix", "verify", "finalize_merge"],
-    observedAgentIds: ["triager", "investigator", "setup", "fixer", "verifier", "merger"],
+    observedStepIds: ["triage", "investigate", "setup", "fix", "deception_audit", "verify", "test_cmd_review", "finalize_merge"],
+    observedAgentIds: ["triager", "investigator", "setup", "fixer", "verifier", "merger", "reviewer", "auditor"],
     observedEvents: [
       "run.started", "pipeline.advanced", "step.pending", "step.running", "step.done",
       "step.expects.validated", "dispatch.render.validated", "run.tokens.updated",
@@ -167,8 +167,8 @@ const S29_CELLS: CellAudit[] = [
     trigger: "event:merge.target_moved",
     runIds: ["dc12e0c7-962d-47c0-b66f-0ce486b712a3"],
     runTerminalStatus: "completed",
-    observedStepIds: ["triage", "investigate", "setup", "fix", "verify", "finalize_merge"],
-    observedAgentIds: ["triager", "investigator", "setup", "fixer", "verifier", "merger"],
+    observedStepIds: ["triage", "investigate", "setup", "fix", "deception_audit", "verify", "test_cmd_review", "finalize_merge"],
+    observedAgentIds: ["triager", "investigator", "setup", "fixer", "verifier", "merger", "reviewer", "auditor"],
     observedEvents: [
       "run.started", "pipeline.advanced", "step.pending", "step.running", "step.done",
       "step.expects.validated", "dispatch.render.validated", "run.tokens.updated",
@@ -348,8 +348,8 @@ function makeBfmwStepsDb(shortRunId: string): string {
     `INSERT INTO steps (id, run_id, step_id, agent_id, status) VALUES (?, ?, ?, ?, 'running')`,
   );
   const { steps, agents } = bfmwVocabulary();
-  assert.equal(steps.length, 6, "bfmw must have 6 steps");
-  assert.equal(agents.length, 6, "bfmw must have 6 agents");
+  assert.equal(steps.length, 8, "bfmw must have 8 steps");
+  assert.equal(agents.length, 8, "bfmw must have 8 agents");
   for (let i = 0; i < steps.length; i += 1) {
     insert.run(`step-${i}`, shortRunId, steps[i], `${BFM_WORKFLOW_AGENT_PREFIX}${agents[i]}`);
   }
@@ -388,9 +388,9 @@ describe("S29 (US-001) — probe-trigger-vocabulary audit vs the campaign event 
   });
 
   it("bug-fix-merge-worktree has NO developer step or agent (the S29 calibration premise)", () => {
-    assert.deepEqual(bfmwSteps, ["triage", "investigate", "setup", "fix", "verify", "finalize_merge"],
+    assert.deepEqual(bfmwSteps, ["triage", "investigate", "setup", "fix", "deception_audit", "verify", "test_cmd_review", "finalize_merge"],
       "bfmw step vocabulary (workflows/bug-fix-merge-worktree/workflow.yml)");
-    assert.deepEqual(bfmwAgents, ["triager", "investigator", "setup", "fixer", "verifier", "merger"],
+    assert.deepEqual(bfmwAgents, ["triager", "investigator", "setup", "fixer", "verifier", "merger", "reviewer", "auditor"],
       "bfmw agent vocabulary");
     assert.ok(!bfmwSteps.includes("developer"), "bfmw must not have a 'developer' step");
     assert.ok(!bfmwAgents.includes("developer"), "bfmw must not have a 'developer' agent");

@@ -50,6 +50,15 @@ import { lookupDshSessionTokens } from "./dsh-usage.js";
  */
 export const DISPATCH_INTERVAL_MS = 15_000;
 
+/**
+ * WAVE-A US-003: per-round cap on in-process conditional auto-completes.
+ * A single dispatch round may auto-complete at most this many conditional
+ * steps (condition unset) before falling through to the harness spawn;
+ * any remainder is picked up by the next tick/nudge. The bound keeps a
+ * pathological chain of auto-completable steps from monopolizing a round.
+ */
+export const MAX_CONDITIONAL_AUTO_COMPLETES_PER_ROUND = 16;
+
 /** Maps job id → active setInterval handle. */
 const activeTimers = new Map<string, ReturnType<typeof setInterval>>();
 
@@ -1521,6 +1530,45 @@ export async function executeDispatchRound(
         error: String(err),
       });
       return;
+    }
+
+    // ── Conditional auto-complete sweep (WAVE-A US-003) ────────────
+    // A pending `type: conditional` step whose activation flag is UNSET in
+    // run context is completed IN-PROCESS with zero tokens — no harness
+    // spawn, same free path as the idle peek. Loop (bounded) so a round
+    // that only auto-completes never spawns a harness: after each
+    // auto-complete the pipeline may have advanced to another conditional
+    // step or to a real dispatchable step, so we re-peek and re-attempt.
+    // The loop exits when a step must dispatch (flag SET — fail-closed:
+    // never auto-complete a set condition) or no conditional step remains,
+    // falling through to the normal harness spawn below.
+    try {
+      const { autoCompleteConditionalStep, peekStep } = await import("./step-ops.js");
+      for (let i = 0; i < MAX_CONDITIONAL_AUTO_COMPLETES_PER_ROUND; i++) {
+        const outcome = autoCompleteConditionalStep(job.runId, job.agentId);
+        if (outcome === "auto_completed") {
+          logger.info("Conditional step auto-completed (zero tokens)", {
+            ...context,
+            reason: "condition_unset",
+          });
+          if (peekStep(job.agentId, job.runId) === "NO_WORK") {
+            logger.debug("Dispatch round idle after conditional auto-complete — no remaining pending step", {
+              ...context,
+              reason: "no_pending_step_after_auto_complete",
+            });
+            return;
+          }
+        } else {
+          // 'dispatched' (conditional step pending with flag SET) or 'none'
+          // (no pending conditional step) — proceed to the harness spawn.
+          break;
+        }
+      }
+    } catch (err) {
+      logger.warn("Conditional auto-complete sweep failed; falling through to normal dispatch", {
+        ...context,
+        error: String(err),
+      });
     }
 
     // ── Work spawn ─────────────────────────────────────────────────

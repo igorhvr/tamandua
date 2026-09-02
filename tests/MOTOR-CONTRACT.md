@@ -237,6 +237,47 @@ resume attempt.
   for all scheduled agents of running runs. `completeStep`/`failStep`-retry
   and run start/resume fire best-effort nudges; the fallback tick covers a
   missed nudge.
+- **C24 (CNDA — conditional auto-complete dispatch stage)** A pending
+  `type: conditional` step whose activation flag is UNSET in run context is
+  completed **in-process** by the dispatch motor with **zero tokens** — no
+  harness spawn, no model round. This is the same free path as the idle
+  peek: `autoCompleteConditionalStep` (`src/installer/step-ops.ts`) is a
+  synchronous in-process DB operation called by `executeDispatchRound`
+  immediately after the deterministic `peekStep` HAS_WORK check and BEFORE
+  any harness spawn (WAVE-A US-003).
+
+  **Sweep shape:** the stage is a bounded loop
+  (`MAX_CONDITIONAL_AUTO_COMPLETES_PER_ROUND = 16`): each iteration calls
+  `autoCompleteConditionalStep`, and after an auto-complete re-peeks — the
+  pipeline may have advanced to another conditional step or to a real
+  dispatchable step. When `peekStep` reports NO_WORK the round returns
+  early: an auto-complete-only round never reaches binary resolution, so it
+  emits no `run.tokens.updated` and spends zero tokens. The loop breaks on
+  `'dispatched'` (a conditional step is pending with its flag SET) or
+  `'none'` (no pending conditional step) and the round falls through to the
+  normal harness spawn.
+
+  **Selection parity:** the step is selected with claimStep's eligibility
+  filter (serial order, no incomplete upstream), so a pending conditional
+  step whose predecessors are not all done/skipped is never auto-completed.
+  The mutation is atomic (BEGIN IMMEDIATE + event buffering): the row is
+  re-verified inside the transaction, so a concurrent claim turns the
+  auto-complete into a no-op instead of clobbering state.
+
+  **Observability:** an auto-completed step is marked
+  `auto_completed=1` with `auto_complete_reason='condition_unset:<key>'`
+  on its row, and a `step.auto_completed` event (stepId, agentId,
+  condition, reason) is emitted plus a `step.done` event for parity with
+  normal completions — oracles/observers can distinguish condition-unset
+  auto-completions from agent-reviewed runs.
+
+  **Fail-closed:** only clearly-falsy context values — absent, empty,
+  whitespace, `false`/`0`/`no`/`off`/`null`/`undefined` (case-insensitive)
+  — count as UNSET. Anything else — including unexpected values, and
+  missing/empty declared conditions — counts as SET and dispatches the
+  step. A set condition can NEVER be auto-completed; when in doubt, the
+  motor spends tokens rather than silently skipping a review/audit.
+  Non-conditional steps (single/loop) are never auto-completed.
 
 ### Deterministic-motor guarantees
 
@@ -247,10 +288,23 @@ resume attempt.
 - **N2** Harness (model) invocations per run == executed work rounds — the
   scripted-agent invocation journal records zero heartbeat invocations.
 - **N3** Work-token attribution (C14/C15) still holds — work still costs.
+- **N4 (CNDA)** An auto-complete-only dispatch round invokes **no model**
+  and spends **zero tokens**: `system_tokens_spent` stays 0, no
+  `run.tokens.updated` fires, the harness binary is never spawned
+  (invocation journal empty), and the conditional step ends `done` with
+  `auto_completed=1` + `auto_complete_reason='condition_unset:<key>'` +
+  a `step.auto_completed` event.
+- **N5 (CNDA fail-closed)** A conditional step whose activation flag is SET
+  NEVER auto-completes: the round spawns the harness normally (one
+  invocation), no `step.auto_completed` event fires, and the step stays
+  pending for the agent.
 
 Pinned by `tests/deterministic-motor-acceptance.test.ts` (in-process
-dispatch rounds with an instrumented fake pi) and by the scripted e2e
-baseline assertions.
+dispatch rounds with an instrumented fake pi; N4/N5 exercise the real
+`executeDispatchRound` sweep with a pending conditional step) and by the
+scripted e2e baseline assertions (the conditional `test_cmd_review` /
+`deception_audit` steps auto-complete free on the unset-condition paths —
+zero invocations, zero tokens).
 
 ### Failure & recovery
 
@@ -702,7 +756,7 @@ performed it.
 | Tier | Command | Motor coverage |
 |------|---------|----------------|
 | Scripted-agent e2e (**primary net**) | `./run-all-scripted-e2e-tests` | Real daemon → dispatch scheduler → harness spawn → stream parse → step-ops → pipeline advance → worktree/merge, driven by a deterministic fake pi. Zero tokens, ~1 min. Covers C1–C9, C12, C14–C17 and asserts N1/N2 (0 heartbeats, 0 system tokens). |
-| Deterministic-motor acceptance | part of `npm test` (`tests/deterministic-motor-acceptance.test.ts`) | N1–N3 via in-process `executeDispatchRound` with an instrumented fake pi. |
+| Deterministic-motor acceptance | part of `npm test` (`tests/deterministic-motor-acceptance.test.ts`) | N1–N5 via in-process `executeDispatchRound` with an instrumented fake pi (N4/N5: conditional auto-complete sweep — zero-token auto-complete-only rounds vs fail-closed SET-condition dispatch). |
 | Smoke e2e | `./run-all-smoke-e2e-tests` | State machine + pipeline wiring via manual `step claim`/`complete`. Bypasses the motor. C1–C4. |
 | Workflow graph simulation | part of `npm test` (`tests/workflow-graph-simulation.test.ts`) | Every bundled workflow simulated to completion in-process through pure step-ops (happy path, mid-run retry, retry exhaustion). Pins C1–C4, C8 independent of any motor. ~3 seconds for the whole catalog. |
 | Unit/integration | `npm test` | step-ops invariants, recovery, control plane, DB, CLI, work-prompt shape, harness routing, work-round token attribution, persona injection. `npm test` pins `TAMANDUA_PI_BINARY=/usr/bin/false` and `TAMANDUA_DSH_BINARY=/usr/bin/false` so no unit test can ever reach a real model or a real dsh (DeepSeek Harness, alpha). |

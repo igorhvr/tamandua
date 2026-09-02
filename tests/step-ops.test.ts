@@ -738,17 +738,21 @@ describe("Reserved context key protection", () => {
     assert.equal(context.branch, "bugfix/x", "non-reserved keys like branch should still be merged");
   });
 
-  it("completeStep synchronizes test_cmd_raw when test_cmd is emitted by agent output", async () => {
-    // Regression: when completeStep merges a TEST_CMD from agent output,
-    // test_cmd_raw must be set to the same value so the persisted context
-    // never contains a stale raw command alongside a newer raw command.
+  it("completeStep synchronizes test_cmd_raw on first-write establishment; a later differing marker is a rewrite, not a replacement (US-004)", async () => {
+    // Regression (pre-US-004): when completeStep merges a TEST_CMD from agent
+    // output, test_cmd_raw must be set to the same value so the persisted
+    // context never contains a stale raw command alongside a newer raw command.
+    // US-004: the FIRST step-emitted TEST_CMD establishes the contract (both
+    // test_cmd and test_cmd_raw become the new value); a LATER differing marker
+    // is a rewrite that never replaces the established contract.
     const { getDb } = await import("../dist/db.js");
     const db = getDb();
     const runId = crypto.randomUUID();
     const stepId = crypto.randomUUID();
     const now = ts();
 
-    // Seed run with older test_cmd and test_cmd_raw
+    // Seed run with an older established contract (as a launch-declared run
+    // would carry: context + established columns both set).
     const seededContext = JSON.stringify({
       repo: "/tmp/test-repo",
       test_cmd: "old-command",
@@ -756,23 +760,62 @@ describe("Reserved context key protection", () => {
     });
 
     db.prepare(
-      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 1, 'test-wf', 'fix bug', 'running', ?, 0, ?, ?)"
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, test_cmd_established, test_cmd_source, created_at, updated_at) VALUES (?, 1, 'test-wf', 'fix bug', 'running', ?, 0, 'old-command', 'launch', ?, ?)"
     ).run(runId, seededContext, now, now);
 
     db.prepare(
       "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, created_at, updated_at) VALUES (?, ?, 'setup', 'test-wf_setup', 0, 'Setup step', '', 'running', 0, 4, 'single', ?, ?)"
     ).run(stepId, runId, now, now);
 
-    // Upstream step emits a new TEST_CMD
+    // Upstream step emits a DIFFERING TEST_CMD — a rewrite, not a replacement.
     const output = "STATUS: done\nTEST_CMD: new-command --verbose";
     completeStep(stepId, output);
 
-    // Both persisted keys must equal the newly emitted value
+    // The established contract must not be replaced; test_cmd and test_cmd_raw
+    // stay consistent with each other (no stale raw alongside a newer raw).
     const run = db.prepare("SELECT context FROM runs WHERE id = ?").get(runId) as { context: string };
     const context = JSON.parse(run.context);
 
-    assert.equal(context.test_cmd, "new-command --verbose", "test_cmd should be the newly emitted value");
-    assert.equal(context.test_cmd_raw, "new-command --verbose", "test_cmd_raw must be synchronized to the same value as test_cmd");
+    assert.equal(context.test_cmd, "old-command", "a differing TEST_CMD marker must not replace the established contract");
+    assert.equal(context.test_cmd_raw, "old-command", "test_cmd_raw must stay consistent with the established contract");
+    assert.equal(context.test_cmd_review_required, "true", "a rewrite must set the review flag");
+
+    const contract = db.prepare(
+      "SELECT test_cmd_established, test_cmd_source FROM runs WHERE id = ?",
+    ).get(runId) as { test_cmd_established: string | null; test_cmd_source: string | null };
+    assert.equal(contract.test_cmd_established, "old-command", "the persisted contract must not be replaced");
+    assert.equal(contract.test_cmd_source, "launch");
+
+    const events = getRunEvents(runId);
+    const rewrite = events.find((e) => e.event === "test_cmd.rewrite_detected");
+    assert.ok(rewrite, "a differing TEST_CMD marker must emit test_cmd.rewrite_detected");
+    assert.equal(rewrite.oldTestCmd, "old-command");
+    assert.equal(rewrite.newTestCmd, "new-command --verbose");
+
+    // First-write arm: a run with NO contract establishes on the first marker
+    // and synchronizes test_cmd_raw (the original regression intent).
+    const runId2 = crypto.randomUUID();
+    const stepId2 = crypto.randomUUID();
+    db.prepare(
+      "INSERT INTO runs (id, run_number, workflow_id, task, status, context, tokens_spent, created_at, updated_at) VALUES (?, 1, 'test-wf', 'fix bug', 'running', '{}', 0, ?, ?)"
+    ).run(runId2, now, now);
+    db.prepare(
+      "INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, created_at, updated_at) VALUES (?, ?, 'setup', 'test-wf_setup', 0, 'Setup step', '', 'running', 0, 4, 'single', ?, ?)"
+    ).run(stepId2, runId2, now, now);
+
+    completeStep(stepId2, "STATUS: done\nTEST_CMD: first-command");
+
+    const run2 = db.prepare("SELECT context FROM runs WHERE id = ?").get(runId2) as { context: string };
+    const context2 = JSON.parse(run2.context);
+    assert.equal(context2.test_cmd, "first-command", "first-write must merge the new value");
+    assert.equal(context2.test_cmd_raw, "first-command", "test_cmd_raw must be synchronized to the same value as test_cmd on first-write");
+    const contract2 = db.prepare(
+      "SELECT test_cmd_established, test_cmd_source FROM runs WHERE id = ?",
+    ).get(runId2) as { test_cmd_established: string | null; test_cmd_source: string | null };
+    assert.equal(contract2.test_cmd_established, "first-command");
+    assert.equal(contract2.test_cmd_source, "setup");
+    const events2 = getRunEvents(runId2);
+    assert.ok(!events2.some((e) => e.event === "test_cmd.rewrite_detected"), "first-write is not a rewrite");
   });
 
   it("completeStep rejects TEST_CMD values that echo the tamandua-test wrapper", async () => {

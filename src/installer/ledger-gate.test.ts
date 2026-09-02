@@ -8,6 +8,8 @@ import { closeDb, getDb } from "../../dist/db.js";
 import {
   evaluateFinalizeMergeLedgerGate,
   formatLedgerGateRefusal,
+  formatTestCmdReviewRefusal,
+  getTestCmdReviewRefusal,
   isStrictMissing,
   type LedgerGateDecision,
   type LedgerGateRefusalDecision,
@@ -275,6 +277,132 @@ describe("finalize_merge ledger gate evaluator", () => {
       status: "inert",
       reason: "no_test_cmd",
     });
+  });
+
+  // ─── WAVE-A TCMD (US-007): the gate keys evidence on the CURRENT contract ───
+
+  it("keys evidence on runs.test_cmd_established even when context test_cmd_raw differs", () => {
+    // After a reviewed rewrite ACCEPT (US-006), runs.test_cmd_established is
+    // the reviewed command while a stale pre-rewrite value may linger in
+    // context. The gate must verify evidence for the ESTABLISHED command.
+    const db = getDb();
+    seedEligibleRun("default");
+    db.prepare("UPDATE runs SET test_cmd_established = ?, test_cmd_source = 'reviewer' WHERE id = 'run-current'")
+      .run("npm run build");
+    // Seed green evidence for the established command (not the context raw).
+    const establishedHash = computeCmdHash("npm run build");
+    db.prepare(
+      `INSERT INTO suite_results
+         (origin_repo, tree_hash, cmd_hash, cmd_display, exit_code, duration_ms, log_tail, run_id, step_id, created_at)
+       VALUES (?, ?, ?, ?, 0, 20, 'latest', 'unrelated-run', 'unrelated-step', '2026-01-02T00:00:00.000Z')`,
+    ).run(getOriginRepo(worktreeRepo), TESTED_TREE, establishedHash, "npm run build");
+
+    const decision = evaluateFinalizeMergeLedgerGate("finalize-step");
+    assert.equal(decision.status, "green");
+    assert.equal(decision.testCmd, "npm run build");
+    assert.equal(decision.cmdHash, establishedHash);
+  });
+
+  it("does NOT fall back to context test_cmd_raw when the established contract has no evidence", () => {
+    const db = getDb();
+    seedEligibleRun("default");
+    // Established contract = "npm run build"; only the stale context raw
+    // ("npm test") has suite evidence. The gate must report MISSING for the
+    // current contract, not silently key on the stale context value.
+    db.prepare("UPDATE runs SET test_cmd_established = ?, test_cmd_source = 'reviewer' WHERE id = 'run-current'")
+      .run("npm run build");
+    seedLedger("green");
+
+    const decision = evaluateFinalizeMergeLedgerGate("finalize-step");
+    assert.equal(decision.status, "missing");
+    assert.equal(decision.testCmd, "npm run build");
+  });
+
+  it("falls back to context test_cmd_raw only when test_cmd_established is NULL", () => {
+    seedEligibleRun("default");
+    seedLedger("green");
+    const decision = evaluateFinalizeMergeLedgerGate("finalize-step");
+    assert.equal(decision.status, "green");
+    assert.equal(decision.testCmd, TEST_CMD);
+  });
+});
+
+describe("getTestCmdReviewRefusal (WAVE-A TCMD US-007)", () => {
+  let stateDir: string;
+  let originalDbPath: string | undefined;
+  let originalHome: string | undefined;
+  let originalStateDir: string | undefined;
+
+  beforeEach(() => {
+    originalDbPath = process.env.TAMANDUA_DB_PATH;
+    originalHome = process.env.HOME;
+    originalStateDir = process.env.TAMANDUA_STATE_DIR;
+    stateDir = tamanduaTempDir("tamandua-review-refusal-state-");
+    process.env.HOME = stateDir;
+    process.env.TAMANDUA_STATE_DIR = path.join(stateDir, ".tamandua");
+    process.env.TAMANDUA_DB_PATH = path.join(stateDir, ".tamandua", "tamandua.db");
+    closeDb();
+    getDb();
+  });
+
+  afterEach(() => {
+    closeDb();
+    if (originalDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+    else process.env.TAMANDUA_DB_PATH = originalDbPath;
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+    if (originalStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+    else process.env.TAMANDUA_STATE_DIR = originalStateDir;
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  function seedRun(context: Record<string, string>): string {
+    const db = getDb();
+    const runId = "review-refusal-run";
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at) VALUES (?, 'test-wf', 'task', 'running', ?, datetime('now'), datetime('now'))",
+    ).run(runId, JSON.stringify(context));
+    return runId;
+  }
+
+  it("returns null when the review flag is absent", () => {
+    const runId = seedRun({ test_cmd: "npm test" });
+    assert.equal(getTestCmdReviewRefusal(runId), null);
+  });
+
+  it("returns null when the review flag is explicitly unset", () => {
+    const runId = seedRun({ test_cmd: "npm test", test_cmd_review_required: "false" });
+    assert.equal(getTestCmdReviewRefusal(runId), null);
+  });
+
+  it("returns a refusal naming old+new commands when the flag is set", () => {
+    const runId = seedRun({
+      test_cmd: "npm test",
+      test_cmd_review_required: "true",
+      test_cmd_review_established: "npm test",
+      test_cmd_review_candidate: "npm run build",
+    });
+    assert.deepEqual(getTestCmdReviewRefusal(runId), {
+      reason: "pending",
+      oldTestCmd: "npm test",
+      newTestCmd: "npm run build",
+    });
+  });
+
+  it("returns a refusal without command names when the material is absent", () => {
+    const runId = seedRun({ test_cmd_review_required: "true" });
+    assert.deepEqual(getTestCmdReviewRefusal(runId), { reason: "pending" });
+  });
+
+  it("formatTestCmdReviewRefusal is machine-parseable", () => {
+    const text = formatTestCmdReviewRefusal({
+      reason: "pending",
+      oldTestCmd: "npm test",
+      newTestCmd: "npm run build",
+    });
+    assert.match(text, /^FAILURE_CLASS: refused_review_pending$/m);
+    assert.match(text, /^TEST_CMD_OLD: npm test$/m);
+    assert.match(text, /^TEST_CMD_NEW: npm run build$/m);
   });
 });
 

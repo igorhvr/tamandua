@@ -75,6 +75,18 @@ function writeWorkflowWithInvalidWorkspace(
     "utf-8");
 }
 
+function writeConditionalWorkflow(
+  homeDir: string,
+  workflowId: string,
+  workspaceMode: "direct" | "worktree",
+): void {
+  const workflowDir = path.join(homeDir, ".tamandua", "workflows", workflowId);
+  fs.mkdirSync(workflowDir, { recursive: true });
+  fs.writeFileSync(path.join(workflowDir, "workflow.yml"),
+    `id: ${workflowId}\nrun:\n  workspace: ${workspaceMode}\nagents:\n  - id: dev\n    model: fake\n    workspace:\n      baseDir: .\nsteps:\n  - id: implement\n    agent: dev\n    type: single\n    input: Implement the task\n    expects: STATUS, CHANGES, TESTS\n  - id: review\n    agent: dev\n    type: conditional\n    condition: test_cmd_review_required\n    input: Review the rewrite\n    expects: "VERDICT: ACCEPT"\n`,
+    "utf-8");
+}
+
 // ── Test suite ──
 
 describe("runWorkflow", () => {
@@ -965,6 +977,65 @@ describe("runWorkflow", () => {
       assert.equal(ctx.base_branch_sha, devSha,
         "direct mode base_branch_sha should be HEAD");
     });
+
+    it("persists a launch-declared --context test_cmd= as the established contract with source 'launch' (US-004)", async () => {
+      const workflowId = "test-ctx-tcmd-declared";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+
+      try {
+        await runWorkflow({
+          workflowId,
+          taskTitle: "Test launch-declared TEST_CMD",
+          context: { test_cmd: "npm test" },
+        });
+      } catch {
+        // Daemon registration may fail after persisting the run; the assertion below only needs the stored row.
+      }
+
+      const { getDb } = await import("../../dist/db.js");
+      const db = getDb();
+      const rows = db.prepare(
+        "SELECT context, test_cmd_established, test_cmd_source FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1"
+      ).all(workflowId) as {
+        context: string;
+        test_cmd_established: string | null;
+        test_cmd_source: string | null;
+      }[];
+      assert.ok(rows.length > 0, "run record should exist");
+      assert.equal(rows[0].test_cmd_established, "npm test",
+        "launch-declared test_cmd must establish the contract");
+      assert.equal(rows[0].test_cmd_source, "launch",
+        "launch-declared contract source must be 'launch'");
+      const ctx = JSON.parse(rows[0].context) as Record<string, string>;
+      assert.equal(ctx.test_cmd, "npm test");
+    });
+
+    it("leaves test_cmd_established NULL when no --context test_cmd is declared (US-004)", async () => {
+      const workflowId = "test-ctx-tcmd-undeclared";
+      writeMinimalWorkflow(tempHome, workflowId, "direct");
+
+      try {
+        await runWorkflow({
+          workflowId,
+          taskTitle: "Test no TEST_CMD declaration",
+        });
+      } catch {
+        // Daemon registration may fail after persisting the run.
+      }
+
+      const { getDb } = await import("../../dist/db.js");
+      const db = getDb();
+      const rows = db.prepare(
+        "SELECT test_cmd_established, test_cmd_source FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1"
+      ).all(workflowId) as {
+        test_cmd_established: string | null;
+        test_cmd_source: string | null;
+      }[];
+      assert.ok(rows.length > 0, "run record should exist");
+      assert.equal(rows[0].test_cmd_established, null,
+        "without a launch declaration the contract is established by the first step marker, not at launch");
+      assert.equal(rows[0].test_cmd_source, null);
+    });
   });
 
   describe("LNCH false failure after run creation (regression)", () => {
@@ -1614,6 +1685,40 @@ try {
       } finally {
         fs.rmSync(repoDir, { recursive: true, force: true });
       }
+    });
+  });
+
+  describe("conditional step creation (US-002)", () => {
+    it("persists type 'conditional' and the declared condition into steps.conditional_condition", async () => {
+      const workflowId = "test-us002-conditional";
+      writeConditionalWorkflow(tempHome, workflowId, "direct");
+      try {
+        await runWorkflow({
+          workflowId,
+          taskTitle: "Conditional step creation",
+        });
+      } catch {
+        // Daemon registration may fail after persisting the run; the
+        // assertions below only need the persisted step rows.
+      }
+
+      const { getDb } = await import("../../dist/db.js");
+      const db = getDb();
+      const run = db.prepare(
+        "SELECT id FROM runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1",
+      ).get(workflowId) as { id: string } | undefined;
+      assert.ok(run, "run record should exist");
+
+      const steps = db.prepare(
+        "SELECT step_id, type, conditional_condition FROM steps WHERE run_id = ? ORDER BY step_index ASC",
+      ).all(run.id) as { step_id: string; type: string; conditional_condition: string | null }[];
+      assert.equal(steps.length, 2, "workflow declares two steps");
+      assert.equal(steps[0].step_id, "implement");
+      assert.equal(steps[0].type, "single");
+      assert.equal(steps[0].conditional_condition, null, "non-conditional steps persist NULL");
+      assert.equal(steps[1].step_id, "review");
+      assert.equal(steps[1].type, "conditional");
+      assert.equal(steps[1].conditional_condition, "test_cmd_review_required");
     });
   });
 });

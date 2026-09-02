@@ -55,6 +55,35 @@ export type LedgerGateRefusalDecision =
       row: LedgerGateRow;
     } & LedgerGateKey);
 
+/**
+ * WAVE-A TCMD (US-007): a TEST_CMD review is pending or was rejected while a
+ * finalize_merge step wants to land. The review flag (test_cmd_review_required
+ * in run context) is set by the rewrite detector (US-004) when a step emitted
+ * a TEST_CMD marker differing from the established contract, and stays set
+ * through REJECT verdicts (US-006) — so a set flag covers both the pending
+ * review and the rejected-review states. Fail closed: a finalize_merge must
+ * never land while the contract is under review.
+ */
+export interface TestCmdReviewRefusal {
+  /** 'pending' — the review is required but has not been accepted/withdrawn. */
+  reason: "pending";
+  /** The established (current) contract the rewrite attempted to replace. */
+  oldTestCmd?: string;
+  /** The rewrite candidate under review. */
+  newTestCmd?: string;
+}
+
+/** Machine-parseable refusal text for a pending/rejected TEST_CMD review. */
+export function formatTestCmdReviewRefusal(refusal: TestCmdReviewRefusal): string {
+  const lines = [
+    "FAILURE_CLASS: refused_review_pending",
+    "REVIEW_REASON: A TEST_CMD rewrite is pending review (or was rejected) — finalize_merge is refused until the review ACCEPTs the new command or the rewrite is withdrawn.",
+  ];
+  if (refusal.oldTestCmd !== undefined) lines.push(`TEST_CMD_OLD: ${refusal.oldTestCmd}`);
+  if (refusal.newTestCmd !== undefined) lines.push(`TEST_CMD_NEW: ${refusal.newTestCmd}`);
+  return lines.join("\n");
+}
+
 interface StepRow {
   run_id: string;
   step_id: string;
@@ -142,11 +171,49 @@ export function isStrictMissing(context: LedgerGateContext, gateMode: LedgerGate
 }
 
 /**
+ * WAVE-A TCMD (US-007): determine whether a run has a pending or rejected
+ * TEST_CMD review that must block finalize_merge.
+ *
+ * The run-context activation flag test_cmd_review_required is the single
+ * source of truth: the rewrite detector (US-004) sets it on any differing
+ * TEST_CMD marker, and the verdict router (US-006) keeps it set through
+ * REJECT verdicts (clearing it only on ACCEPT or a withdrawal re-emission).
+ * A set flag therefore means the contract is still under review — fail
+ * closed: finalize_merge must not land.
+ *
+ * Returns null when no review is pending; otherwise the refusal naming the
+ * old (established) and new (candidate) commands when the detector persisted
+ * them in run context.
+ */
+export function getTestCmdReviewRefusal(runId: string): TestCmdReviewRefusal | null {
+  const db = getDb();
+  const run = db.prepare("SELECT context FROM runs WHERE id = ?").get(runId) as
+    | { context: string }
+    | undefined;
+  if (!run) return null;
+  const context = parseContext(run.context);
+  if (context["test_cmd_review_required"] !== "true") return null;
+  const refusal: TestCmdReviewRefusal = { reason: "pending" };
+  const oldCmd = context["test_cmd_review_established"];
+  if (typeof oldCmd === "string" && oldCmd.trim()) refusal.oldTestCmd = oldCmd;
+  const newCmd = context["test_cmd_review_candidate"];
+  if (typeof newCmd === "string" && newCmd.trim()) refusal.newTestCmd = newCmd;
+  return refusal;
+}
+
+/**
  * Evaluate the TSTX ledger evidence for a pending finalize_merge step.
  *
  * Eligibility deliberately comes from a completed upstream step's output,
  * never from the run context's launch-time tested_tree seed. The lookup is
  * repository-wide and therefore accepts evidence written by any run.
+ *
+ * The gate keys evidence on the CURRENT TEST_CMD contract: the persisted
+ * runs.test_cmd_established value wins, falling back to the raw context
+ * values only for runs created before the WAVE-A columns existed. After a
+ * reviewed rewrite (US-006 ACCEPT) the established value is the reviewed
+ * command — the gate must verify evidence for THAT command, not the stale
+ * pre-rewrite context value.
  */
 export function evaluateFinalizeMergeLedgerGate(stepId: string): LedgerGateDecision {
   const db = getDb();
@@ -158,8 +225,8 @@ export function evaluateFinalizeMergeLedgerGate(stepId: string): LedgerGateDecis
     return { status: "inert", reason: "not_finalize_merge" };
   }
 
-  const run = db.prepare("SELECT context FROM runs WHERE id = ?").get(step.run_id) as
-    | { context: string }
+  const run = db.prepare("SELECT context, test_cmd_established FROM runs WHERE id = ?").get(step.run_id) as
+    | { context: string; test_cmd_established: string | null }
     | undefined;
   if (!run) return { status: "inert", reason: "run_not_found" };
 
@@ -177,11 +244,15 @@ export function evaluateFinalizeMergeLedgerGate(stepId: string): LedgerGateDecis
   }
 
   const context = parseContext(run.context);
-  const testCmd = typeof context.test_cmd_raw === "string"
-    ? context.test_cmd_raw
-    : typeof context.test_cmd === "string"
-      ? context.test_cmd
-      : "";
+  // The CURRENT contract: the persisted established value wins; fall back to
+  // the context values only for runs created before the WAVE-A columns.
+  const testCmd = run.test_cmd_established?.trim()
+    ? run.test_cmd_established
+    : typeof context.test_cmd_raw === "string"
+      ? context.test_cmd_raw
+      : typeof context.test_cmd === "string"
+        ? context.test_cmd
+        : "";
   if (!testCmd.trim()) return { status: "inert", reason: "no_test_cmd" };
 
   const repoPath = [

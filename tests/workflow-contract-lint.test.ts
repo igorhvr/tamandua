@@ -307,9 +307,25 @@ export function computeProvidedKeys(
  * those entries were removed from this allowlist (US-003).
  */
 const ALLOWLIST: Record<string, string> = {
-  // No entries currently — all consumed keys are either enforced,
-  // auto-context, or caller-provided. Entries will be added as needed
-  // with justification comments when truly unavoidable gaps are found.
+  // test_cmd_review (WAVE-A TCMD, US-005): the reviewer step's input renders
+  // the review material that the step-ops TEST_CMD rewrite detector persists
+  // into run context at detection time (test_cmd_review_candidate =
+  // proposed command, test_cmd_review_established = current contract). These
+  // keys are written by step-ops, not produced by any agent step's output, so
+  // no upstream expects can enforce them — the ALLOWLIST is the sanctioned
+  // escape hatch for runtime-set context keys.
+  "feature-dev-merge/test_cmd_review/test_cmd_review_candidate": "set by the step-ops TEST_CMD rewrite detector (US-005)",
+  "feature-dev-merge/test_cmd_review/test_cmd_review_established": "set by the step-ops TEST_CMD rewrite detector (US-005)",
+  "feature-dev-merge-worktree/test_cmd_review/test_cmd_review_candidate": "set by the step-ops TEST_CMD rewrite detector (US-005)",
+  "feature-dev-merge-worktree/test_cmd_review/test_cmd_review_established": "set by the step-ops TEST_CMD rewrite detector (US-005)",
+  "bug-fix-merge/test_cmd_review/test_cmd_review_candidate": "set by the step-ops TEST_CMD rewrite detector (US-005)",
+  "bug-fix-merge/test_cmd_review/test_cmd_review_established": "set by the step-ops TEST_CMD rewrite detector (US-005)",
+  "bug-fix-merge-worktree/test_cmd_review/test_cmd_review_candidate": "set by the step-ops TEST_CMD rewrite detector (US-005)",
+  "bug-fix-merge-worktree/test_cmd_review/test_cmd_review_established": "set by the step-ops TEST_CMD rewrite detector (US-005)",
+  "security-audit-merge/test_cmd_review/test_cmd_review_candidate": "set by the step-ops TEST_CMD rewrite detector (US-005)",
+  "security-audit-merge/test_cmd_review/test_cmd_review_established": "set by the step-ops TEST_CMD rewrite detector (US-005)",
+  "security-audit-merge-worktree/test_cmd_review/test_cmd_review_candidate": "set by the step-ops TEST_CMD rewrite detector (US-005)",
+  "security-audit-merge-worktree/test_cmd_review/test_cmd_review_established": "set by the step-ops TEST_CMD rewrite detector (US-005)",
 };
 
 
@@ -720,6 +736,49 @@ describe("linter self-tests — synthetic fixtures", () => {
       enforced.includes("status"),
       false,
       "STATUS must NOT be extracted as an enforced data key",
+    );
+  });
+
+  // US-008: PHNT — either/or key-position alternation enforcement
+  it("PHNT alternation: both alternation keys are provided to downstream consumers", () => {
+    const spec = synthSpec({
+      id: "test-phnt-alternation",
+      steps: [
+        {
+          id: "fixer",
+          agent: "agent",
+          input: "Fix.\n\nReply with:\nSTATUS: done\nCHANGES: <what>\nREGRESSION_TEST: <test>\nREPRO_EVIDENCE: <pointer> OR CANNOT_REPRODUCE: <reasons>",
+          expects: "STATUS: done\nregex:^CHANGES:\\s*\\S+\nregex:^REGRESSION_TEST:\\s*\\S+\nregex:^(REPRO_EVIDENCE|CANNOT_REPRODUCE):\\s*\\S+",
+        },
+        {
+          id: "consumer",
+          agent: "agent",
+          input: "Verify {{changes}} and {{repro_evidence}}. Reply with: STATUS: done",
+          expects: "STATUS: done",
+        },
+      ],
+    });
+
+    const enforced = parseEnforcedKeys(spec.steps[0].expects);
+    assert.ok(
+      enforced.includes("repro_evidence"),
+      `parseEnforcedKeys must extract "repro_evidence" from the alternation, got: ${enforced.join(", ")}`,
+    );
+    assert.ok(
+      enforced.includes("cannot_reproduce"),
+      `parseEnforcedKeys must extract "cannot_reproduce" from the alternation, got: ${enforced.join(", ")}`,
+    );
+
+    const provided = computeProvidedKeys(spec, 1);
+    assert.equal(
+      provided.has("repro_evidence"),
+      true,
+      "REPRO_EVIDENCE must be in provided keys (enforced via alternation)",
+    );
+    assert.equal(
+      provided.has("cannot_reproduce"),
+      true,
+      "CANNOT_REPRODUCE must be in provided keys (enforced via alternation)",
     );
   });
 

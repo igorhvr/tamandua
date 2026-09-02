@@ -349,10 +349,31 @@ describe("workflows smoke (state-machine integration)", { concurrency: 1 }, () =
           testStep.stepId,
           "STATUS: done\n" +
             "RESULTS: Full test suite passes, integration verified\n" +
-            "TESTED_TREE: abc123deadbeef\n",
+            "TESTED_TREE: abc123deadbeef\n" +
+            // Review material (US-005): the smoke test drives the conditional
+            // reviewer step manually, so the step-ops MISS machinery must find
+            // the review keys in context — mirroring what a real rewrite
+            // detection would persist.
+            "TEST_CMD_REVIEW_ESTABLISHED: npm test\n" +
+            "TEST_CMD_REVIEW_CANDIDATE: npm test\n",
           be(),
         );
         assert.equal(testResult.status, "advanced");
+
+        // Step: test_cmd_review (reviewer, conditional — condition unset so it
+        // is claimed/completed manually with the default ACCEPT verdict)
+        const review = stepClaim(
+          "feature-dev-merge-worktree_reviewer",
+          runId,
+          be(),
+        );
+        const reviewResult = stepComplete(
+          review.stepId,
+          "STATUS: done\n" +
+            "VERDICT: ACCEPT\n",
+          be(),
+        );
+        assert.equal(reviewResult.status, "advanced");
 
         // Step: finalize_merge (merger)
         const merge = stepClaim(
@@ -379,6 +400,7 @@ describe("workflows smoke (state-machine integration)", { concurrency: 1 }, () =
         assert.match(statusOut, /\[done\s+\]\s+step-implement/);
         assert.match(statusOut, /\[done\s+\]\s+step-verify/);
         assert.match(statusOut, /\[done\s+\]\s+step-test/);
+        assert.match(statusOut, /\[done\s+\]\s+step-test_cmd_review/);
         assert.match(statusOut, /\[done\s+\]\s+step-finalize_merge/);
       } finally {
         cleanupTempHome(env);
@@ -482,10 +504,28 @@ describe("workflows smoke (state-machine integration)", { concurrency: 1 }, () =
           fix.stepId,
           "STATUS: done\n" +
             "CHANGES: Changed 'return a - b' to 'return a + b' in src/math.ts\n" +
-            "REGRESSION_TEST: Added test that verifies add(2, 3) === 5 (catches the subtraction bug)\n",
+            "REGRESSION_TEST: Added test that verifies add(2, 3) === 5 (catches the subtraction bug)\n" +
+            "REPRO_EVIDENCE: pre-fix `npm test` shows add(2, 3) === -1 (failing output captured on the pre-fix tree)\n",
           be(),
         );
         assert.equal(fixResult.status, "advanced");
+
+        // Step: deception_audit (auditor, conditional — REPRO_EVIDENCE was
+        // emitted so the activation flag is unset and the step is claimed
+        // manually in this scheduler-less smoke flow; the auditor would
+        // otherwise auto-complete free via the motor)
+        const audit = stepClaim(
+          "bug-fix-merge-worktree_auditor",
+          runId,
+          be(),
+        );
+        const auditResult = stepComplete(
+          audit.stepId,
+          "STATUS: done\n" +
+            "VERDICT: HONEST\n",
+          be(),
+        );
+        assert.equal(auditResult.status, "advanced");
 
         // Step: verify (verifier)
         const verify = stepClaim(
@@ -497,10 +537,31 @@ describe("workflows smoke (state-machine integration)", { concurrency: 1 }, () =
           verify.stepId,
           "STATUS: done\n" +
             "VERIFIED: Fix correct — add now returns a + b, regression test passes, all tests pass\n" +
-            "TESTED_TREE: scripted-smoke-tree\n",
+            "TESTED_TREE: scripted-smoke-tree\n" +
+            // Review material (US-005): the smoke test drives the conditional
+            // reviewer step manually, so the step-ops MISS machinery must find
+            // the review keys in context — mirroring what a real rewrite
+            // detection would persist.
+            "TEST_CMD_REVIEW_ESTABLISHED: npm test\n" +
+            "TEST_CMD_REVIEW_CANDIDATE: npm test\n",
           be(),
         );
         assert.equal(verifyResult.status, "advanced");
+
+        // Step: test_cmd_review (reviewer, conditional — condition unset so it
+        // is claimed/completed manually with the default ACCEPT verdict)
+        const review = stepClaim(
+          "bug-fix-merge-worktree_reviewer",
+          runId,
+          be(),
+        );
+        const reviewResult = stepComplete(
+          review.stepId,
+          "STATUS: done\n" +
+            "VERDICT: ACCEPT\n",
+          be(),
+        );
+        assert.equal(reviewResult.status, "advanced");
 
         // Step: finalize_merge (merger)
         const merge = stepClaim(
@@ -526,7 +587,9 @@ describe("workflows smoke (state-machine integration)", { concurrency: 1 }, () =
         assert.match(statusOut, /\[done\s+\]\s+step-investigate/);
         assert.match(statusOut, /\[done\s+\]\s+step-setup/);
         assert.match(statusOut, /\[done\s+\]\s+step-fix/);
+        assert.match(statusOut, /\[done\s+\]\s+step-deception_audit/);
         assert.match(statusOut, /\[done\s+\]\s+step-verify/);
+        assert.match(statusOut, /\[done\s+\]\s+step-test_cmd_review/);
         assert.match(statusOut, /\[done\s+\]\s+step-finalize_merge/);
       } finally {
         cleanupTempHome(env);
@@ -567,14 +630,28 @@ describe("workflows smoke (state-machine integration)", { concurrency: 1 }, () =
       output: () =>
         "STATUS: done\n" +
         "CHANGES: corrected the add implementation\n" +
-        "REGRESSION_TEST: verifies add(2, 3) equals 5\n",
+        "REGRESSION_TEST: verifies add(2, 3) equals 5\n" +
+        "REPRO_EVIDENCE: pre-fix suite shows add(2, 3) === -1 (failing output on the pre-fix tree)\n",
+    },
+    {
+      agent: "auditor",
+      output: () => "STATUS: done\nVERDICT: HONEST\n",
     },
     {
       agent: "verifier",
       output: () =>
         "STATUS: done\n" +
         "VERIFIED: fix and regression test pass\n" +
-        "TESTED_TREE: bug-fix-smoke-tree\n",
+        "TESTED_TREE: bug-fix-smoke-tree\n" +
+        // Review material (US-005): the smoke test drives the conditional
+        // reviewer step manually, so the step-ops MISS machinery must find
+        // the review keys in context.
+        "TEST_CMD_REVIEW_ESTABLISHED: npm test\n" +
+        "TEST_CMD_REVIEW_CANDIDATE: npm test\n",
+    },
+    {
+      agent: "reviewer",
+      output: () => "STATUS: done\nVERDICT: ACCEPT\n",
     },
     {
       agent: "merger",
@@ -660,7 +737,16 @@ describe("workflows smoke (state-machine integration)", { concurrency: 1 }, () =
         "STATUS: done\n" +
         "RESULTS: full suite and audit pass\n" +
         "TESTED_TREE: security-smoke-tree\n" +
-        "AUDIT_AFTER: no remaining findings\n",
+        "AUDIT_AFTER: no remaining findings\n" +
+        // Review material (US-005): the smoke test drives the conditional
+        // reviewer step manually, so the step-ops MISS machinery must find
+        // the review keys in context.
+        "TEST_CMD_REVIEW_ESTABLISHED: npm test\n" +
+        "TEST_CMD_REVIEW_CANDIDATE: npm test\n",
+    },
+    {
+      agent: "reviewer",
+      output: () => "STATUS: done\nVERDICT: ACCEPT\n",
     },
     {
       agent: "merger",

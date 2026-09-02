@@ -199,13 +199,27 @@ interface SimState {
 function synthesizeRegexLine(regexLine: string): string {
   const regexBody = regexLine.slice("regex:".length);
 
-  // Extract key: optional ^ anchor, then KEY:
-  const keyMatch = regexBody.match(/^\^?([A-Z_]+):(.*)/);
-  if (!keyMatch) {
-    return "synthetic: sim-value";
+  // Extract the enforced key.  Supports both plain `KEY:` and key-position
+  // alternation `(KEY1|KEY2):` patterns — the latter enforces an either/or
+  // key (e.g. the PHNT fix contract's ^(REPRO_EVIDENCE|CANNOT_REPRODUCE):,
+  // US-008).  For alternation, pick the first alternative so the synthesized
+  // line satisfies the regex.  Full pair alternations like
+  // ^(STATUS: retry|REBASED: false) (which contain `:`/whitespace inside the
+  // group) fall through to the plain KEY: extraction and its fallback.
+  let key: string | null = null;
+  let valuePattern = "";
+  const altKeyMatch = regexBody.match(/^\^?\(([A-Z_|]+)\):(.*)/);
+  if (altKeyMatch) {
+    key = altKeyMatch[1].split("|")[0].trim();
+    valuePattern = altKeyMatch[2];
+  } else {
+    const keyMatch = regexBody.match(/^\^?([A-Z_]+):(.*)/);
+    if (!keyMatch) {
+      return "synthetic: sim-value";
+    }
+    key = keyMatch[1];
+    valuePattern = keyMatch[2];
   }
-  const key = keyMatch[1];
-  const valuePattern = keyMatch[2];
 
   // URL pattern → synthetic github URL (handles PR: regex without ^ anchor)
   if (/:\/\//.test(valuePattern)) {
@@ -459,5 +473,39 @@ describe("workflow graph simulation (all bundled workflows, pure step-ops)", () 
       });
     });
   }
+});
+
+// ── US-008: synthesizeRegexLine key-position alternation ─────────────
+
+describe("synthesizeRegexLine (US-008 key-position alternation)", () => {
+  it("synthesizes a matching line for regex:^(KEY1|KEY2):\\s*\\S+", () => {
+    const line = synthesizeRegexLine("regex:^(REPRO_EVIDENCE|CANNOT_REPRODUCE):\\s*\\S+");
+    assert.match(line, /^(REPRO_EVIDENCE|CANNOT_REPRODUCE):\s*\S+$/,
+      `synthesized line must satisfy the either/or regex, got: "${line}"`);
+    // The first alternative is picked deterministically.
+    assert.ok(line.startsWith("REPRO_EVIDENCE:"), `expected REPRO_EVIDENCE key, got: "${line}"`);
+  });
+
+  it("keeps synthesizing plain KEY: lines unchanged", () => {
+    assert.equal(
+      synthesizeRegexLine("regex:^CHANGES:\\s*\\S+"),
+      "CHANGES: sim-changes",
+    );
+  });
+
+  it("keeps synthesizing value-position alternations (closed enums)", () => {
+    assert.equal(
+      synthesizeRegexLine("regex:^SEVERITY:\\s*(critical|high|medium|low)"),
+      "SEVERITY: critical",
+    );
+  });
+
+  it("does not treat full-pair alternations as key-position alternations", () => {
+    // ^(STATUS:\s*retry|REBASED:\s*false) contains key:value pairs inside the
+    // group — it must fall through to the plain fallback, not produce a key
+    // from the first pair fragment.
+    const line = synthesizeRegexLine("regex:^(STATUS:\\s*retry|REBASED:\\s*false)\\s*$");
+    assert.match(line, /^synthetic: sim-value$/, `got: "${line}"`);
+  });
 });
 });
