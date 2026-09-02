@@ -63,6 +63,13 @@ const repoDcTool = path.join(ttRoot, "bin", "daemon-control");
 const dcTool = process.env.TT_DC_TOOL ?? repoDcTool;
 const dcText = fs.readFileSync(dcTool, "utf8");
 
+// US-003: daemon-control sources the shared address-exact helper instead of
+// carrying an inline probe. The probe functions are extracted from the
+// helper, not from daemon-control, and daemon-control is asserted to source
+// and delegate to it.
+const probeHelper = path.join(ttRoot, "lib", "port-probe.sh");
+const probeText = fs.readFileSync(probeHelper, "utf8");
+
 // ── helpers ────────────────────────────────────────────────────────────
 
 /** Env for everything this test spawns: strip NODE_TEST_CONTEXT (node:test
@@ -156,13 +163,29 @@ function runExtracted(
   }
 }
 
-/** Start a node TCP listener on an ephemeral free port (127.0.0.1); resolves
- *  with the server and its port. The test closes it in its finally. */
-function startListener(): Promise<{ server: net.Server; port: number }> {
+/** Source the shared port-probe helper in a temp bash script and run
+ *  `invocation` (the same way daemon-control sources it). */
+function runProbe(invocation: string, env?: NodeJS.ProcessEnv): CmdResult {
+  const script = path.join(
+    os.tmpdir(),
+    `dc-probe-src-${process.pid}-${Math.random().toString(36).slice(2)}.sh`,
+  );
+  try {
+    fs.writeFileSync(script, `. "${probeHelper}"\n${invocation}\n`);
+    return run(["bash", script], { env, timeoutMs: 30_000 });
+  } finally {
+    fs.rmSync(script, { force: true });
+  }
+}
+
+/** Start a node TCP listener on an ephemeral port bound to `host` (default
+ *  127.0.0.1); resolves with the server and its port. The test closes it in
+ *  its finally. */
+function startListener(host = "127.0.0.1"): Promise<{ server: net.Server; port: number }> {
   const server = net.createServer();
   return new Promise((resolve, reject) => {
     server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
+    server.listen(0, host, () => {
       const addr = server.address();
       if (addr && typeof addr === "object") resolve({ server, port: addr.port });
       else reject(new Error("listener address unavailable"));
@@ -184,32 +207,56 @@ function closeListener(server: net.Server): Promise<void> {
 
 // ── the guard ──────────────────────────────────────────────────────────
 
-describe("MACP4 US-001 — daemon-control portable port probe + TT_FORCE_NO_SYSTEMD", () => {
-  it("wait_for_port and is_port_listening use the portable port_probe with NO GNU-timeout dependency (structural)", () => {
-    const probe = extractFunction(dcText, "port_probe");
-    assert.ok(probe, "daemon-control must define port_probe() (the portable TCP-connect probe)");
+describe("MACP4 US-001/US-003 — daemon-control sources the shared port-probe helper + TT_FORCE_NO_SYSTEMD", () => {
+  it("daemon-control sources torture-test/lib/port-probe.sh and no longer carries an inline probe (structural)", () => {
+    assert.match(
+      dcText,
+      /\.\s+"\$TT_DIR\/lib\/port-probe\.sh"/,
+      "daemon-control must source the shared helper at $TT_DIR/lib/port-probe.sh",
+    );
+    assert.doesNotMatch(
+      dcText,
+      /const hosts = \["127\.0\.0\.1", "::1"\]/,
+      "daemon-control must not carry the old inline 127.0.0.1-then-::1 probe body",
+    );
+    assert.equal(
+      extractFunction(dcText, "port_probe"),
+      null,
+      "daemon-control must not define port_probe() inline (it is sourced from the helper)",
+    );
+    assert.equal(
+      extractFunction(dcText, "wait_for_port"),
+      null,
+      "daemon-control must not define wait_for_port() inline (it is sourced from the helper)",
+    );
+    assert.equal(
+      extractFunction(dcText, "is_port_listening"),
+      null,
+      "daemon-control must not define is_port_listening() inline (it is sourced from the helper)",
+    );
+
+    const probe = extractFunction(probeText, "port_probe");
+    assert.ok(probe, "port-probe.sh must define port_probe() (the shared portable TCP-connect probe)");
     assert.match(probe, /net\.connect/, "port_probe must use node net.connect (portable, no GNU timeout)");
+    assert.match(probe, /127\.0\.0\.1/, "port_probe must be address-exact to 127.0.0.1");
+    assert.doesNotMatch(probe, /::1/, "port_probe must not fall back to the IPv6 loopback ::1");
     assert.doesNotMatch(probe, /timeout 1 bash/, "port_probe must not invoke the GNU timeout utility");
 
-    const waitFn = extractFunction(dcText, "wait_for_port");
-    assert.ok(waitFn, "wait_for_port must exist");
+    const waitFn = extractFunction(probeText, "wait_for_port");
+    assert.ok(waitFn, "wait_for_port must exist (shared helper)");
     assert.match(waitFn, /port_probe "\$port"/, "wait_for_port must poll with the portable port_probe");
     assert.doesNotMatch(waitFn, /timeout 1 bash/, "wait_for_port must have no GNU-timeout-dependent probe");
 
-    const listenFn = extractFunction(dcText, "is_port_listening");
-    assert.ok(listenFn, "is_port_listening must exist");
+    const listenFn = extractFunction(probeText, "is_port_listening");
+    assert.ok(listenFn, "is_port_listening must exist (shared helper)");
     assert.match(listenFn, /port_probe/, "is_port_listening must use the portable port_probe");
     assert.doesNotMatch(listenFn, /timeout 1 bash/, "is_port_listening must have no GNU-timeout-dependent probe");
   });
 
-  it("RED/GREEN: is_port_listening and wait_for_port detect a live listener even when `timeout` is hidden (PATH seam)", async () => {
-    const probe = extractFunction(dcText, "port_probe");
-    const listenFn = extractFunction(dcText, "is_port_listening");
-    const waitFn = extractFunction(dcText, "wait_for_port");
-
+  it("RED/GREEN: the sourced helper detects a live listener even when `timeout` is hidden (PATH seam)", async () => {
     // PATH seam: a `timeout` shim that exits 127 (command-not-found
     // behavior) prepended to the real PATH. The pre-fix GNU-timeout probe
-    // cannot run under this seam (RED); the portable probe ignores it (GREEN).
+    // cannot run under this seam (RED); the shared helper ignores it (GREEN).
     const seamDir = fs.mkdtempSync(path.join(os.tmpdir(), "dc-no-timeout-"));
     const timeoutShim = path.join(seamDir, "timeout");
     fs.writeFileSync(timeoutShim, '#!/bin/sh\necho "timeout: command not found" >&2\nexit 127\n');
@@ -217,25 +264,23 @@ describe("MACP4 US-001 — daemon-control portable port probe + TT_FORCE_NO_SYST
 
     let server: net.Server | null = null;
     try {
-      assert.ok(probe && listenFn && waitFn, "port_probe/is_port_listening/wait_for_port must all exist");
       const started = await startListener();
       server = started.server;
       const { port } = started;
 
       const env = cleanEnv({ PATH: `${seamDir}:${process.env.PATH ?? ""}` });
-      const out = runExtracted(
-        [probe, listenFn, waitFn],
+      const out = runProbe(
         [
           `if is_port_listening "${port}"; then echo LISTENING; else echo NOT_LISTENING; fi`,
           `if wait_for_port "${port}" 3; then echo WAIT_OK; else echo WAIT_FAIL; fi`,
         ].join("\n"),
         env,
       );
-      assert.equal(out.status, 0, `extracted probe script failed: ${out.stderr}`);
+      assert.equal(out.status, 0, `sourced probe script failed: ${out.stderr}`);
       assert.match(
         out.stdout,
         /LISTENING/,
-        `a live listener must be detected with timeout hidden (RED against pre-fix, GREEN post-fix). stdout: ${out.stdout}`,
+        `a live 127.0.0.1 listener must be detected with timeout hidden. stdout: ${out.stdout}`,
       );
       assert.match(out.stdout, /WAIT_OK/, `wait_for_port must succeed with timeout hidden. stdout: ${out.stdout}`);
 
@@ -243,8 +288,7 @@ describe("MACP4 US-001 — daemon-control portable port probe + TT_FORCE_NO_SYST
       // as free (no false positive) — again under the timeout-hidden seam.
       await closeListener(server);
       server = null;
-      const closedOut = runExtracted(
-        [probe, listenFn, waitFn],
+      const closedOut = runProbe(
         `if is_port_listening "${port}"; then echo CLOSED_LISTENING; else echo CLOSED_FREE; fi`,
         cleanEnv({ PATH: `${seamDir}:${process.env.PATH ?? ""}` }),
       );
@@ -256,6 +300,41 @@ describe("MACP4 US-001 — daemon-control portable port probe + TT_FORCE_NO_SYST
     } finally {
       if (server) await closeListener(server);
       fs.rmSync(seamDir, { recursive: true, force: true });
+    }
+  });
+
+  it("a ::1-only listener is NOT reported listening on 127.0.0.1 (address-exact; skips when IPv6 loopback is unavailable)", async (t) => {
+    const server = net.createServer();
+    let port = 0;
+    try {
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(0, "::1", () => {
+          const addr = server.address();
+          if (addr && typeof addr === "object") {
+            port = addr.port;
+            resolve();
+          } else {
+            reject(new Error("listener address unavailable"));
+          }
+        });
+      });
+    } catch {
+      t.skip("IPv6 loopback (::1) is unavailable on this host");
+      return;
+    }
+    try {
+      const out = runProbe(
+        `if is_port_listening "${port}"; then echo LISTENING; else echo NOT_LISTENING; fi`,
+      );
+      assert.equal(out.status, 0, `sourced probe failed: ${out.stderr}`);
+      assert.match(
+        out.stdout,
+        /NOT_LISTENING/,
+        `a ::1-only listener must NOT be reported listening on 127.0.0.1 (address-exact). stdout: ${out.stdout}`,
+      );
+    } finally {
+      await closeListener(server);
     }
   });
 

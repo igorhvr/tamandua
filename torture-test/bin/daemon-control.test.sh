@@ -6,6 +6,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TOOL="${SCRIPT_DIR}/daemon-control"
+# MACP4 US-001: the shared address-exact port-probe helper that daemon-control
+# sources for port_probe/is_port_listening/wait_for_port (the single
+# canonical definition, also sourced by tt-daemon-up).
+PROBE_HELPER="${SCRIPT_DIR}/../lib/port-probe.sh"
 
 # E3.C.2 US-002: scope unit names are PER-WORKTREE (tamandua-tt-<kind>-<hash>
 # derived from the repo root — mirroring the T2.1 US-009 pattern) so
@@ -482,27 +486,29 @@ else
   fail "tool shebang is not bash"
 fi
 
-# E3.C.1 US-004: daemon-control deliberately invokes node for TWO purposes —
-# (1) the torture-test-local process-identity CLI (bin/tt-process-identity.mjs),
-# the only sanctioned way to read/verify a pid's /proc starttime identity
-# before any signal; and (2) MACP4 US-001's portable TCP port probe
-# (port_probe, `node -e` net.connect — the GNU-`timeout`-free replacement for
-# the old /dev/tcp probe, which macOS cannot run). Any OTHER node invocation,
+# E3.C.1 US-004: daemon-control deliberately invokes node for ONE inline
+# purpose — the torture-test-local process-identity CLI
+# (bin/tt-process-identity.mjs), the only sanctioned way to read/verify a
+# pid's /proc starttime identity before any signal. The portable TCP port
+# probe (MACP4 US-001) no longer lives inline in daemon-control: it is
+# SOURCED from the shared helper torture-test/lib/port-probe.sh (a
+# `node -e` net.connect — the GNU-`timeout`-free replacement for the old
+# /dev/tcp probe, which macOS cannot run). Any OTHER inline node invocation,
 # or any npm/npx use, is a regression.
 if grep -qE "^[^#]*(npm|npx)" "$TOOL" 2>/dev/null; then
-  fail "tool contains npm/npx invocation (should be bash + identity CLI + port_probe only)"
+  fail "tool contains npm/npx invocation (should be bash + identity CLI + sourced port_probe only)"
 else
   pass "tool does not rely on npm/npx"
 fi
 
 node_lines="$(grep -nE "^[^#]*node" "$TOOL" 2>/dev/null || true)"
 if [ -n "$node_lines" ]; then
-  # Every sanctioned node invocation must either go through the IDENTITY_TOOL
-  # variable (the tt-process-identity.mjs path is bound there, so the
-  # invocation lines reference the variable, not a literal node binary) or be
-  # the port_probe's `node -e` TCP probe (MACP4 US-001). The usage-doc line
-  # that DESCRIBES the probe ("node net.connect probe (port_probe)") is prose,
-  # allowed too.
+  # Every sanctioned inline node invocation must go through the
+  # IDENTITY_TOOL variable (the tt-process-identity.mjs path is bound
+  # there, so the invocation lines reference the variable, not a literal
+  # node binary). The usage-doc line that DESCRIBES the sourced probe
+  # ("node net.connect probe (port_probe)") is prose and allowed too —
+  # the probe body itself now lives in the sourced helper, not inline.
   bad_node_lines="$(echo "$node_lines" | grep -v "IDENTITY_TOOL" | grep -v "node -e" | grep -v "net.connect" || true)"
   if [ -n "$bad_node_lines" ]; then
     fail "tool contains node invocation not targeting the identity CLI or the port_probe: $(echo "$bad_node_lines" | tr '\n' ' ')"
@@ -741,20 +747,28 @@ fi
 echo ""
 echo "--- Test: wait_for_port function ---"
 
-if grep -q '^wait_for_port()' "$TOOL"; then
-  pass "wait_for_port function exists"
+# MACP4 US-001 (US-003): daemon-control no longer defines wait_for_port
+# inline — it sources the shared helper, which is the single source of truth.
+if grep -q 'port-probe\.sh' "$TOOL"; then
+  pass "daemon-control sources the shared port-probe helper"
 else
-  fail "wait_for_port function missing"
+  fail "daemon-control does not source torture-test/lib/port-probe.sh"
 fi
 
-if grep -A 12 '^wait_for_port()' "$TOOL" | grep -q 'port_probe'; then
+if grep -q '^wait_for_port()' "$PROBE_HELPER"; then
+  pass "wait_for_port function exists (shared port-probe helper)"
+else
+  fail "wait_for_port function missing (shared port-probe helper)"
+fi
+
+if grep -A 12 '^wait_for_port()' "$PROBE_HELPER" | grep -q 'port_probe'; then
   pass "wait_for_port uses the portable port_probe for port checking (MACP4 US-001)"
 else
   fail "wait_for_port missing port_probe call (portable TCP probe)"
 fi
 
 # MACP4 US-001: the probe must NOT depend on GNU `timeout` (absent on macOS).
-if grep -A 12 '^wait_for_port()' "$TOOL" | grep -q 'timeout 1 bash'; then
+if grep -A 12 '^wait_for_port()' "$PROBE_HELPER" | grep -q 'timeout 1 bash'; then
   fail "wait_for_port still uses the GNU-timeout-dependent probe (fails on Darwin)"
 else
   pass "wait_for_port has no GNU-timeout-dependent port probe"
@@ -1171,19 +1185,21 @@ fi
 echo ""
 echo "--- Test: is_port_listening function ---"
 
-if grep -q '^is_port_listening()' "$TOOL"; then
-  pass "is_port_listening function exists"
+# MACP4 US-001 (US-003): is_port_listening now comes from the shared helper
+# sourced by daemon-control (no inline body).
+if grep -q '^is_port_listening()' "$PROBE_HELPER"; then
+  pass "is_port_listening function exists (shared port-probe helper)"
 else
-  fail "is_port_listening function missing"
+  fail "is_port_listening function missing (shared port-probe helper)"
 fi
 
-if grep -A 5 '^is_port_listening()' "$TOOL" | grep -q 'port_probe'; then
+if grep -A 5 '^is_port_listening()' "$PROBE_HELPER" | grep -q 'port_probe'; then
   pass "is_port_listening uses the portable port_probe for port checking (MACP4 US-001)"
 else
   fail "is_port_listening missing port_probe call (portable TCP probe)"
 fi
 
-if grep -A 5 '^is_port_listening()' "$TOOL" | grep -q 'timeout 1 bash'; then
+if grep -A 5 '^is_port_listening()' "$PROBE_HELPER" | grep -q 'timeout 1 bash'; then
   fail "is_port_listening still uses the GNU-timeout-dependent probe (fails on Darwin)"
 else
   pass "is_port_listening has no GNU-timeout-dependent port probe"

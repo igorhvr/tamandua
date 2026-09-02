@@ -264,8 +264,9 @@ describe("tier0 macp5 gnu-ism sweep (US-004)", () => {
       );
     }
     // Structural pin: the lingering-listener pid extraction is the portable
-    // grep -Eo + sed prefix-strip form (first-pid semantics preserved).
-    assert.match(source, /grep -Eo 'pid=\[0-9\]\+' \| head -1 \| sed 's\/\^pid=\/\//);
+    // lsof `-iTCP:<port> -sTCP:LISTEN -t` form (first-pid semantics preserved
+    // via head -1) with a netstat fallback for hosts without lsof.
+    assert.match(source, /lsof -nP -iTCP:"\$port" -sTCP:LISTEN -t/);
     assert.match(source, /grep -Eo '\[0-9\]\+' \| head -1 \|\| true\)/);
   });
 
