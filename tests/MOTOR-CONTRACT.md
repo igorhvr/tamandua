@@ -438,7 +438,16 @@ zero invocations, zero tokens).
   the producer's `retry_count` stays unchanged; the consumer's `retry_count`
   resets to 0 on each reroute; `reroute_count` is the dedicated boundedness
   counter. Each reroute emits a `step.rerouted` event; budget exhaustion
-  emits `step.reroute_budget_exhausted`. RETR does NOT fire for loop-step
+  emits `step.reroute_budget_exhausted`. `terminal_reroute_count` is a gate
+  control that increments ONLY for terminal-CLASS reroutes and preserves the
+  consumer's one-shot terminal allowance: ordinary consumer-retry-exhaustion
+  reroutes (expects-validation, retry-verdict, orphan-recovery) increment
+  `reroute_count` but not `terminal_reroute_count`, and each `step.rerouted`
+  event flags `terminal`/`rerouteMode` so the two counters reconcile against
+  the event stream (`reroute_count == count(step.rerouted)` while every
+  reroute charges the shared budget; `terminal_reroute_count ==
+  count(step.rerouted where terminal === true)` in every corridor). RETR does
+  NOT fire for loop-step
   story-level exhaustion (`verify_each` territory) or for expects-accepted
   `STATUS: retry` verdicts (C22 handles verdict retries first).  For `finalize_merge`,
   RETR fires when `on_fail.retry_step` is declared (rebase-loopback);

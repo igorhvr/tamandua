@@ -163,6 +163,16 @@ export interface TamanduaEvent {
   gateMode?: string;
   runNumber?: number;
   launchTs?: string;
+  /**
+   * WAVE-B.1: present on step.rerouted events — the reroute class
+   * ('legacy' | 'declared_retryable' | 'terminal') returned by the
+   * failure-classification logic for the driving reason, and terminal ===
+   * (rerouteMode === 'terminal'). Consumers reconcile reroute_count ==
+   * count(step.rerouted) and terminal_reroute_count == count(step.rerouted
+   * where terminal === true).
+   */
+  rerouteMode?: string;
+  terminal?: boolean;
   // Mechanical output-contract evidence (O11). These fields describe the
   // validator/lifecycle decision only; submitted output and rendered prompts
   // are deliberately excluded.

@@ -74,6 +74,21 @@ describe("formatLogsTailLabel", () => {
     });
     assert.equal(formatLogsTailLabel(evt), "Token spend updated (post-terminal)");
   });
+
+  it("displays 'Step rerouted' for step.rerouted events (WAVE-B.1)", () => {
+    const evt = makeEvent("step.rerouted");
+    assert.equal(formatLogsTailLabel(evt), "Step rerouted");
+  });
+
+  it("displays the plain label for a non-terminal step.rerouted (WAVE-B.1)", () => {
+    const evt = makeEvent("step.rerouted", { rerouteMode: "legacy", terminal: false });
+    assert.equal(formatLogsTailLabel(evt), "Step rerouted");
+  });
+
+  it("displays a terminal marker for a terminal-class step.rerouted (WAVE-B.1)", () => {
+    const evt = makeEvent("step.rerouted", { rerouteMode: "terminal", terminal: true });
+    assert.equal(formatLogsTailLabel(evt), "Step rerouted (terminal)");
+  });
 });
 
 describe("formatLogsTailLine", () => {
@@ -111,6 +126,34 @@ describe("formatLogsTailLine", () => {
     const line = formatLogsTailLine(evt);
     assert.ok(line.includes("Token spend updated (post-terminal)"), `Expected post-terminal label in: ${line}`);
     assert.ok(line.includes("[tokens: Δ +137, total 137]"), `Expected token spend detail in: ${line}`);
+  });
+
+  it("renders the plain step.rerouted label in the full line (WAVE-B.1)", () => {
+    const evt = makeEvent("step.rerouted", {
+      runId: "abcd1234",
+      agentId: "feature-dev-merge-worktree_developer",
+      stepId: "finalize_merge",
+      rerouteMode: "legacy",
+      terminal: false,
+      detail: "Rerouted to test (1/8). Consumer failure: expects mismatch",
+    });
+    const line = formatLogsTailLine(evt);
+    assert.ok(line.includes("Step rerouted"), `Expected 'Step rerouted' in: ${line}`);
+    assert.ok(!line.includes("(terminal)"), `Expected no terminal marker in: ${line}`);
+    assert.ok(line.includes("expects mismatch"), `Expected detail in: ${line}`);
+  });
+
+  it("renders the terminal marker in the full line for a terminal-class step.rerouted (WAVE-B.1)", () => {
+    const evt = makeEvent("step.rerouted", {
+      runId: "abcd1234",
+      stepId: "finalize_merge",
+      rerouteMode: "terminal",
+      terminal: true,
+      detail: "Rerouted to test (2/8). Consumer failure: FAILURE_CLASS: refused_permanent",
+    });
+    const line = formatLogsTailLine(evt);
+    assert.ok(line.includes("Step rerouted (terminal)"), `Expected terminal marker in: ${line}`);
+    assert.ok(line.includes("refused_permanent"), `Expected reason in: ${line}`);
   });
 });
 

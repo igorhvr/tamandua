@@ -2877,6 +2877,117 @@ steps:
       max_reroutes: 3
 `;
 
+  // WAVE-B.1 US-002 fixture (Test A): consumer with max_retries 0 so ANY
+  // failure is already at retry exhaustion and drives the reroute corridor.
+  // on_fail.max_reroutes: 1 makes the SHARED reroute budget exhaust after a
+  // single ordinary reroute — exactly the shape that must NOT consume the
+  // consumer's one-shot terminal allowance.
+  const terminalBudget1Yaml = `
+id: test-reroute-terminal-budget1
+agents:
+  - id: producer
+    workspace:
+      baseDir: .
+      files: {}
+  - id: consumer
+    workspace:
+      baseDir: .
+      files: {}
+steps:
+  - id: produce
+    agent: producer
+    input: "Produce output"
+    expects: "STATUS: done"
+    max_retries: 3
+  - id: consume
+    agent: consumer
+    input: "Consume {{output}}"
+    expects: "STATUS: done"
+    max_retries: 0
+    on_fail:
+      retry_step: produce
+      max_reroutes: 1
+`;
+
+  // WAVE-B.1 US-002 fixture (Test B): generous shared budget (max_reroutes: 4)
+  // plus a declared retryable class (target_moved), so a mixed corridor of
+  // ordinary (legacy + declared_retryable) and terminal-class reroutes charges
+  // reroute_count on EVERY reroute and both counters reconcile against the
+  // flagged step.rerouted event stream.
+  const mixedReconcileYaml = `
+id: test-reroute-mixed-reconcile
+agents:
+  - id: producer
+    workspace:
+      baseDir: .
+      files: {}
+  - id: consumer
+    workspace:
+      baseDir: .
+      files: {}
+steps:
+  - id: produce
+    agent: producer
+    input: "Produce output"
+    expects: "STATUS: done"
+    max_retries: 3
+  - id: consume
+    agent: consumer
+    input: "Consume {{output}}"
+    expects: "STATUS: done"
+    max_retries: 0
+    on_fail:
+      retry_step: produce
+      max_reroutes: 4
+      retry_on:
+        - target_moved
+`;
+
+  // WAVE-B.1 US-003 fixture: a minimal MERGE-FAMILY workflow in the shape of
+  // feature-dev-merge(-worktree)'s pipeline tail. Upstream `test` (agent
+  // tester) runs the integration suite and attests the tested tree;
+  // `finalize_merge` (agent merger, max_retries 0 so retry_count 0 is ALREADY
+  // at retry exhaustion) declares on_fail.retry_step: test with the merge
+  // workflow's generous transient reroute budget (max_reroutes 8, retry_on
+  // [target_moved, conflicts]) and the merge-family expects regex block. This
+  // is the exact corridor the ORIGINAL W4.10-restart observation captured: a
+  // finalize_merge rerouted after a contained daemon restart.
+  const mergeFinalizeYaml = `
+id: test-reroute-merge-finalize
+agents:
+  - id: tester
+    workspace:
+      baseDir: .
+      files: {}
+  - id: merger
+    workspace:
+      baseDir: .
+      files: {}
+steps:
+  - id: test
+    agent: tester
+    input: "Run the integration suite against the worktree and attest the tested tree"
+    expects: "STATUS: done"
+    max_retries: 3
+  - id: finalize_merge
+    agent: merger
+    input: |
+      Finalize the run by squashing and merging into the original branch.
+      REPO: {{repo}}
+      ORIGINAL_BRANCH: {{original_branch}}
+      Reply on success with:
+      STATUS: done
+    expects: |
+      regex:^STATUS:\\s*(done|retry)\\s*$
+      regex:^REBASED:\\s*(true|false)\\s*$
+      regex:^(STATUS:\\s*retry|REBASED:\\s*false)\\s*$
+    max_retries: 0
+    on_fail:
+      retry_step: test
+      max_reroutes: 8
+      retry_on: [target_moved, conflicts]
+`;
+
   before(async () => {
     // Save outer env vars at hook runtime, not at module load time.
     // This matters when nested inside an outer describe that sets isolation.
@@ -2892,14 +3003,23 @@ steps:
     const downstreamDir = path.join(workflowsDir, "test-reroute-downstream");
     const unknownDir = path.join(workflowsDir, "test-reroute-unknown");
     const max3Dir = path.join(workflowsDir, "test-reroute-max3");
+    const terminalBudget1Dir = path.join(workflowsDir, "test-reroute-terminal-budget1");
+    const mixedReconcileDir = path.join(workflowsDir, "test-reroute-mixed-reconcile");
+    const mergeFinalizeDir = path.join(workflowsDir, "test-reroute-merge-finalize");
     fs.mkdirSync(retryDir, { recursive: true });
     fs.mkdirSync(downstreamDir, { recursive: true });
     fs.mkdirSync(unknownDir, { recursive: true });
     fs.mkdirSync(max3Dir, { recursive: true });
+    fs.mkdirSync(terminalBudget1Dir, { recursive: true });
+    fs.mkdirSync(mixedReconcileDir, { recursive: true });
+    fs.mkdirSync(mergeFinalizeDir, { recursive: true });
     fs.writeFileSync(path.join(retryDir, "workflow.yml"), retryWorkflowYaml);
     fs.writeFileSync(path.join(downstreamDir, "workflow.yml"), downstreamTargetYaml);
     fs.writeFileSync(path.join(unknownDir, "workflow.yml"), unknownTargetYaml);
     fs.writeFileSync(path.join(max3Dir, "workflow.yml"), maxReroutes3Yaml);
+    fs.writeFileSync(path.join(terminalBudget1Dir, "workflow.yml"), terminalBudget1Yaml);
+    fs.writeFileSync(path.join(mixedReconcileDir, "workflow.yml"), mixedReconcileYaml);
+    fs.writeFileSync(path.join(mergeFinalizeDir, "workflow.yml"), mergeFinalizeYaml);
   });
 
   after(() => {
@@ -3544,13 +3664,21 @@ steps:
     assert.equal(consumer.retry_count, 0, "consumer retry_count should be 0");
     assert.equal(consumer.reroute_count, 1, "consumer reroute_count should be 1");
 
-    // RCNT: the orphan-recovery-exhaustion reroute is a terminal-decision
-    // corridor — step.rerouted event count must reconcile with
-    // terminal_reroute_count (both exactly 1 after this single reroute).
-    assert.equal(consumer.terminal_reroute_count, 1, "terminal_reroute_count must reconcile with the step.rerouted event count");
+    // WAVE-B.1: the orphan-recovery-exhaustion reroute is an ORDINARY
+    // (legacy-class) reroute — the reason ('Agent terminated without
+    // completing step; retries exhausted') carries no FAILURE_CLASS header —
+    // so it increments reroute_count only. terminal_reroute_count stays 0
+    // and the consumer's one-shot terminal allowance is preserved. The
+    // step.rerouted event count reconciles with reroute_count (NOT
+    // terminal_reroute_count) and flags terminal === false / rerouteMode
+    // === 'legacy'.
+    assert.equal(consumer.terminal_reroute_count, 0, "ordinary reroute must NOT increment terminal_reroute_count");
     const rerouteEvents = getRunEvents(runId).filter(e => e.event === "step.rerouted");
     assert.equal(rerouteEvents.length, 1, "exactly one step.rerouted event must be emitted");
-    assert.equal(rerouteEvents.length, consumer.terminal_reroute_count, "step.rerouted event count must equal terminal_reroute_count");
+    assert.equal(rerouteEvents.length, consumer.reroute_count, "step.rerouted event count must equal reroute_count");
+    assert.equal(rerouteEvents[0].terminal, false, "step.rerouted event must flag terminal === false for an ordinary reroute");
+    assert.equal(rerouteEvents[0].rerouteMode, "legacy", "step.rerouted event must carry rerouteMode === 'legacy'");
+    assert.equal(rerouteEvents[0].stepId, "consume", "step.rerouted event must name the consumer step");
   });
 
   it("orphan-recovery exhaustion falls through to run failure when budget exhausted", async () => {
@@ -3612,7 +3740,340 @@ steps:
     const run = db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string };
     assert.equal(run.status, "failed", "run should be failed on story-level abandon exhaustion");
   });
+
+  // ── WAVE-B.1 US-002 Test A: the one-shot terminal allowance ──
+  // Regression for WAVE-B (RCNT): WAVE-B incremented terminal_reroute_count on
+  // EVERY rerouteStepSync caller, so a consumer lost its one terminal
+  // concession after its FIRST ordinary expects-reroute. Under the corrected
+  // contract terminal_reroute_count is a GATE CONTROL counting only
+  // terminal-CLASS reroutes (rerouteMode === "terminal"); an ordinary
+  // expects-reroute (reason carries no FAILURE_CLASS) leaves it at 0 and the
+  // consumer's one-shot terminal allowance survives an exhausted shared budget.
+
+  it("US-002 Test A: an ordinary expects-reroute never consumes the one-shot terminal allowance", async () => {
+    const db = await getTestDb();
+    const { runId, stepRows } = insertRunAndSteps(db, "test-reroute-terminal-budget1", [
+      { step_id: "produce", agent_id: "producer", step_index: 0, status: "done", retry_count: 0, max_retries: 3, input_template: "Produce output", expects: "STATUS: done", output: "STATUS: done\nOUTPUT: some-value" },
+      // Consumer at retry exhaustion (retry_count == max_retries == 0): any
+      // failure drives the reroute corridor. on_fail.max_reroutes: 1 means the
+      // shared budget is spent by the first ordinary reroute.
+      { step_id: "consume", agent_id: "consumer", step_index: 1, status: "running", retry_count: 0, max_retries: 0, input_template: "Consume {{output}}", expects: "STATUS: done", type: "single" },
+    ]);
+
+    const consumerRowId = stepRows.find(s => s.step_id === "consume")!.rowId;
+    const readRun = () => db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string };
+    const readConsumer = () => db.prepare(
+      "SELECT status, output, retry_count, reroute_count, terminal_reroute_count FROM steps WHERE id = ?"
+    ).get(consumerRowId) as { status: string; output: string | null; retry_count: number; reroute_count: number; terminal_reroute_count: number };
+    const consumerRerouteEvents = () => getRunEvents(runId).filter(e => e.event === "step.rerouted" && e.stepId === "consume");
+
+    // Stage 1 — ORDINARY expects-validation reroute (completeStep output fails
+    // expects; the reason is expects feedback with no FAILURE_CLASS). It
+    // consumes the shared budget (reroute_count 0 -> 1 == max_reroutes) but
+    // must NOT consume the terminal allowance.
+    const ordinaryResult = completeStep(consumerRowId, "missing status line");
+    assert.equal(ordinaryResult.status, "rerouted", `ordinary expects-reroute should reroute, got: ${JSON.stringify(ordinaryResult)}`);
+
+    let consumer = readConsumer();
+    assert.equal(consumer.status, "waiting", "consumer reset to waiting after ordinary reroute");
+    assert.equal(consumer.retry_count, 0, "consumer retry_count reset to 0 after ordinary reroute");
+    assert.equal(consumer.reroute_count, 1, "ordinary reroute charges the shared budget once");
+    assert.equal(consumer.terminal_reroute_count, 0, "ordinary expects-reroute must NOT consume the one-shot terminal allowance");
+    assert.equal(readRun().status, "running", "run stays alive after ordinary reroute");
+
+    // At this stage the event stream reconciles with the general counter:
+    // one step.rerouted event, flagged as an ordinary legacy-class reroute.
+    let events = consumerRerouteEvents();
+    assert.equal(events.length, 1, "exactly one step.rerouted after the ordinary reroute");
+    assert.equal(events.length, consumer.reroute_count, "reroute_count == count(step.rerouted)");
+    assert.equal(events[0].terminal, false, "ordinary reroute event must flag terminal === false");
+    assert.equal(events[0].rerouteMode, "legacy", "ordinary reroute event must carry rerouteMode === 'legacy'");
+
+    // Stage 2 — TERMINAL-class refusal (failStep, FAILURE_CLASS:
+    // refused_permanent on the first line) on the same consumer. The shared
+    // budget is exhausted (reroute_count 1/1) but terminal_reroute_count is
+    // still 0, so the budget-INDEPENDENT one-shot terminal allowance
+    // (hasIndependentTerminalAllowance) lets it reroute once ACROSS the
+    // exhausted budget: terminal_reroute_count 0 -> 1, reroute_count stays 1
+    // (the allowance does not charge the shared budget).
+    const terminalResult1 = await failStep(consumerRowId, "FAILURE_CLASS: refused_permanent\nFirst terminal refusal");
+    assert.equal(terminalResult1.status, "rerouted", `terminal-class refusal with unspent allowance must reroute across the exhausted budget, got: ${terminalResult1.status}`);
+
+    consumer = readConsumer();
+    assert.equal(consumer.status, "waiting", "consumer reset to waiting after terminal-class reroute");
+    assert.equal(consumer.reroute_count, 1, "budget-independent terminal allowance must NOT charge the shared budget");
+    assert.equal(consumer.terminal_reroute_count, 1, "terminal-class reroute must increment the gate control to 1");
+    assert.equal(readRun().status, "running", "run stays alive after the terminal-class reroute");
+
+    events = consumerRerouteEvents();
+    assert.equal(events.length, 2, "a second step.rerouted event fires for the terminal-class reroute");
+    assert.equal(events[1].terminal, true, "terminal-class reroute event must flag terminal === true");
+    assert.equal(events[1].rerouteMode, "terminal", "terminal-class reroute event must carry rerouteMode === 'terminal'");
+    assert.equal(
+      events.filter(e => e.terminal === true).length,
+      consumer.terminal_reroute_count,
+      "terminal_reroute_count == count(step.rerouted where terminal === true)",
+    );
+
+    // Stage 3 — SECOND terminal-class refusal: the one-shot allowance is spent
+    // (terminal_reroute_count 1 >= 1), so the run fails — no reroute event.
+    const reason2 = "FAILURE_CLASS: refused_permanent\nSecond terminal refusal";
+    const terminalResult2 = await failStep(consumerRowId, reason2);
+    assert.equal(terminalResult2.status, "failed", `a second terminal refusal must fail the run (allowance spent), got: ${terminalResult2.status}`);
+
+    consumer = readConsumer();
+    assert.equal(consumer.status, "failed", "consumer failed when the terminal allowance is spent");
+    assert.equal(consumer.output, reason2, "consumer output preserves the terminal refusal verbatim");
+    assert.equal(consumer.reroute_count, 1, "reroute_count unchanged by the failed terminal refusal");
+    assert.equal(consumer.terminal_reroute_count, 1, "terminal_reroute_count stays 1 after the failed terminal refusal");
+    assert.equal(readRun().status, "failed", "run failed when the terminal allowance is spent");
+    assert.equal(consumerRerouteEvents().length, 2, "terminal allowance exhaustion must NOT emit a step.rerouted event");
+
+    // Let failStep's fire-and-forget rugpull check settle inside the temp env.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  });
+
+  // ── WAVE-B.1 US-002 Test B: counter/event reconciliation ──
+  // Across a corridor mixing M ordinary reroutes (legacy + declared_retryable)
+  // and N terminal-class reroutes, reroute_count == M+N == count(step.rerouted)
+  // and terminal_reroute_count == N == count(step.rerouted where terminal ===
+  // true). Every event carries a rerouteMode string matching
+  // getFailureRerouteMode's classification of its driving reason.
+
+  it("US-002 Test B: both counters reconcile against the flagged step.rerouted stream across a mixed corridor", async () => {
+    const db = await getTestDb();
+    const { runId, stepRows } = insertRunAndSteps(db, "test-reroute-mixed-reconcile", [
+      { step_id: "produce", agent_id: "producer", step_index: 0, status: "done", retry_count: 0, max_retries: 3, input_template: "Produce output", expects: "STATUS: done", output: "STATUS: done\nOUTPUT: some-value" },
+      // Consumer at retry exhaustion (retry_count == max_retries == 0).
+      { step_id: "consume", agent_id: "consumer", step_index: 1, status: "running", retry_count: 0, max_retries: 0, input_template: "Consume {{output}}", expects: "STATUS: done", type: "single" },
+    ]);
+
+    const consumerRowId = stepRows.find(s => s.step_id === "consume")!.rowId;
+    const readRun = () => db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string };
+    const readConsumer = () => db.prepare(
+      "SELECT status, retry_count, reroute_count, terminal_reroute_count FROM steps WHERE id = ?"
+    ).get(consumerRowId) as { status: string; retry_count: number; reroute_count: number; terminal_reroute_count: number };
+    const consumerRerouteEvents = () => getRunEvents(runId).filter(e => e.event === "step.rerouted" && e.stepId === "consume");
+
+    // M=2 ordinary reroutes first.
+    // (1) legacy-class: completeStep expects-validation exhaustion (no
+    //     FAILURE_CLASS in the reason).
+    const ordinary1 = completeStep(consumerRowId, "missing status line");
+    assert.equal(ordinary1.status, "rerouted", `first ordinary (legacy) reroute should reroute, got: ${JSON.stringify(ordinary1)}`);
+    // (2) declared_retryable-class: failStep with a FAILURE_CLASS declared in
+    //     policy.retry_on (target_moved) — still an ORDINARY reroute.
+    const ordinary2 = await failStep(consumerRowId, "FAILURE_CLASS: target_moved\nTarget moved while landing");
+    assert.equal(ordinary2.status, "rerouted", `second ordinary (declared_retryable) reroute should reroute, got: ${ordinary2.status}`);
+
+    // N=1 terminal-class reroute: failStep with FAILURE_CLASS:
+    // refused_permanent. The shared budget (max_reroutes: 4) is NOT exhausted
+    // (reroute_count 2 < 4), so this terminal reroute charges the budget.
+    const terminal1 = await failStep(consumerRowId, "FAILURE_CLASS: refused_permanent\nFirst terminal refusal");
+    assert.equal(terminal1.status, "rerouted", `terminal-class reroute should reroute while budget remains, got: ${terminal1.status}`);
+
+    // Reconciliation across the mixed corridor: run alive, all reroutes charged.
+    let consumer = readConsumer();
+    assert.equal(readRun().status, "running", "run stays alive across the mixed corridor");
+    assert.equal(consumer.status, "waiting", "consumer reset to waiting after the terminal reroute");
+    assert.equal(consumer.reroute_count, 3, "reroute_count == M+N (2 ordinary + 1 terminal)");
+    assert.equal(consumer.terminal_reroute_count, 1, "terminal_reroute_count == N (1 terminal-class reroute)");
+
+    const events = consumerRerouteEvents();
+    assert.equal(events.length, 3, "three step.rerouted events across the mixed corridor");
+    assert.equal(events.length, consumer.reroute_count, "reroute_count == count(step.rerouted)");
+    assert.equal(
+      events.filter(e => e.terminal === true).length,
+      consumer.terminal_reroute_count,
+      "terminal_reroute_count == count(step.rerouted where terminal === true)",
+    );
+
+    // Every event flags its class: rerouteMode must match getFailureRerouteMode's
+    // classification of the driving reason and terminal === (rerouteMode === "terminal").
+    assert.deepEqual(
+      events.map(e => e.rerouteMode),
+      ["legacy", "declared_retryable", "terminal"],
+      "each event carries the rerouteMode of its driving reason",
+    );
+    for (const e of events) {
+      assert.equal(e.terminal, e.rerouteMode === "terminal", "event terminal flag must match its rerouteMode");
+      assert.equal(typeof e.rerouteMode, "string", "every step.rerouted event carries a rerouteMode string");
+    }
+
+    // Epilogue — the allowance is still one-shot: a second terminal refusal
+    // (terminal_reroute_count already 1) fails the run without a new reroute.
+    const reason2 = "FAILURE_CLASS: refused_permanent\nSecond terminal refusal";
+    const terminal2 = await failStep(consumerRowId, reason2);
+    assert.equal(terminal2.status, "failed", `a second terminal refusal must fail the run, got: ${terminal2.status}`);
+    consumer = readConsumer();
+    assert.equal(consumer.status, "failed", "consumer failed on the second terminal refusal");
+    assert.equal(consumer.reroute_count, 3, "reroute_count unchanged by the failed terminal refusal");
+    assert.equal(consumer.terminal_reroute_count, 1, "terminal_reroute_count unchanged by the failed terminal refusal");
+    assert.equal(readRun().status, "failed", "run failed on the second terminal refusal");
+    assert.equal(consumerRerouteEvents().length, 3, "no step.rerouted event on terminal allowance exhaustion");
+
+    // Let failStep's fire-and-forget rugpull check settle inside the temp env.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  });
+
+  // ── WAVE-B.1 US-003: W4.10-restart corridor classification ──
+  // ORIGINAL OBSERVATION (W4.10-restart-recovery re-run; WAVE-B-brun-rvoc-rcnt
+  // §3): after a contained daemon restart the finalize_merge step rerouted
+  // once (a step.rerouted event fired; the merger ultimately ran finalize_merge
+  // twice) yet the step row's terminal_reroute_count stayed 0. WAVE-B
+  // misdiagnosed this as a missed increment and forced every rerouteStepSync
+  // caller to bump terminal_reroute_count; WAVE-B.1 US-001 restored the gate
+  // control's terminal-class-only meaning. These two tests pin the corridor
+  // under the CORRECTED rule.
+  //
+  // CLASSIFICATION DETERMINATION (for the finalize_merge landing note): the
+  // W4.10-restart finalize reroute is an ORDINARY legacy-class reroute, NOT
+  // terminal-class. After the restart the motor's orphan recovery
+  // (recoverOrphanedStepsForAgent) finds finalize_merge still 'running' with a
+  // dead claim and, at retry exhaustion (max_retries 0) with on_fail.
+  // retry_step declared, reroutes it to the upstream producer. The reroute
+  // reason ('Agent terminated without completing step; retries exhausted') —
+  // and, on the completeStep side, expects feedback for PARK/checkout-refresh
+  // output — carries no FAILURE_CLASS header, so getFailureRerouteMode
+  // classifies the reroute 'legacy'. Under the US-001 corrected rule
+  // terminal_reroute_count is a GATE CONTROL counting terminal-CLASS reroutes
+  // only, so it correctly stays 0 while reroute_count == 1 == count
+  // (step.rerouted); the event's terminal:false field keeps the streams
+  // reconciled — the observation is CONSISTENT BY DEFINITION, and there is NO
+  // missed increment to fix.
+
+  it("US-003 W4.10 corridor under the corrected rule: daemon-restart orphan-recovery reroute on merge-family finalize_merge stays legacy", async () => {
+    const db = await getTestDb();
+    const { runId, stepRows } = insertRunAndSteps(db, "test-reroute-merge-finalize", [
+      { step_id: "test", agent_id: "tester", step_index: 0, status: "done", retry_count: 0, max_retries: 3, input_template: "Run the integration suite", expects: "STATUS: done", output: "STATUS: done\nTESTED_TREE: abc123" },
+      // finalize_merge was claimed and mid-flight when the contained daemon
+      // restarted: the step row is left 'running' with a dead claim.
+      // max_retries 0 means retry_count 0 is ALREADY at retry exhaustion, so
+      // orphan recovery drives the reroute corridor immediately.
+      { step_id: "finalize_merge", agent_id: "merger", step_index: 1, status: "running", retry_count: 0, max_retries: 0, input_template: "Finalize the run", expects: "regex:^STATUS:\\s*(done|retry)\\s*$", type: "single" },
+    ]);
+
+    const consumerRowId = stepRows.find(s => s.step_id === "finalize_merge")!.rowId;
+    const producerRowId = stepRows.find(s => s.step_id === "test")!.rowId;
+
+    // Dead claim left behind by the pre-restart worker round (mirrors the
+    // daemon-restart state recoverOrphanedStepsForAgent sweeps after boot).
+    db.prepare(
+      "UPDATE steps SET claim_pid = 999999999, claim_job_id = 'dead-round-post-restart', claim_updated_at = datetime('now') WHERE id = ?"
+    ).run(consumerRowId);
+
+    // The restart sweeper recovers the orphaned finalize claim for the merger.
+    const result = recoverOrphanedStepsForAgent("merger", runId);
+    assert.equal(result.failed, 0, `orphan recovery must NOT fail the finalize step (rerouted instead), got failed=${result.failed}`);
+    assert.equal(result.recovered, 1, `orphan recovery must recover (reroute) the finalize step, got recovered=${result.recovered}`);
+
+    const readRun = () => db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string };
+    const readConsumer = () => db.prepare(
+      "SELECT status, retry_count, reroute_count, terminal_reroute_count, output FROM steps WHERE id = ?"
+    ).get(consumerRowId) as { status: string; retry_count: number; reroute_count: number; terminal_reroute_count: number; output: string | null };
+
+    // Run stays alive — the W4.10 recovery contract (run recovers, no loss).
+    assert.equal(readRun().status, "running", "run must stay alive after the restart orphan-recovery reroute");
+
+    // Producer (test) is re-pended with reroute feedback: the pipeline restarts
+    // from test, and once test re-completes, advancePipeline re-pends
+    // finalize_merge so the merger runs it AGAIN — matching "merger ran twice".
+    const producer = db.prepare("SELECT status, output FROM steps WHERE id = ?").get(producerRowId) as { status: string; output: string | null };
+    assert.equal(producer.status, "pending", "producer (test) must be re-pended to pending");
+    assert.ok(producer.output?.includes('Reroute from "finalize_merge"'), `producer output must carry reroute feedback, got: ${producer.output}`);
+    assert.ok(producer.output?.includes("retries exhausted"), `producer output must carry the orphan-recovery reason, got: ${producer.output}`);
+
+    // Consumer reset to a fresh waiting step with the corrected counters:
+    // reroute_count == 1 (the reroute happened) but terminal_reroute_count
+    // stays 0 — an ordinary legacy-class reroute does NOT touch the gate control.
+    let consumer = readConsumer();
+    assert.equal(consumer.status, "waiting", "finalize_merge must be reset to waiting");
+    assert.equal(consumer.retry_count, 0, "finalize_merge retry_count must be reset to 0");
+    assert.equal(consumer.reroute_count, 1, "reroute_count must be 1 for the single orphan-recovery reroute");
+    assert.equal(consumer.terminal_reroute_count, 0, "ordinary legacy reroute must NOT increment terminal_reroute_count (stays 0, matching the W4.10 observation)");
+    assert.equal(consumer.output, null, "finalize_merge output must be cleared");
+
+    // Event/counter reconciliation under the corrected rule: exactly one
+    // step.rerouted event whose count equals reroute_count, flagged as an
+    // ordinary legacy-class reroute (terminal === false, rerouteMode === 'legacy').
+    const rerouteEvents = getRunEvents(runId).filter(e => e.event === "step.rerouted" && e.stepId === "finalize_merge");
+    assert.equal(rerouteEvents.length, 1, "exactly one step.rerouted event for finalize_merge");
+    assert.equal(rerouteEvents.length, consumer.reroute_count, "step.rerouted event count must equal reroute_count");
+    assert.equal(rerouteEvents[0].terminal, false, "step.rerouted event must flag terminal === false for the orphan-recovery reroute");
+    assert.equal(rerouteEvents[0].rerouteMode, "legacy", "step.rerouted event must carry rerouteMode === 'legacy' (reason has no FAILURE_CLASS)");
+    assert.equal(
+      rerouteEvents.filter(e => e.terminal === true).length,
+      consumer.terminal_reroute_count,
+      "terminal_reroute_count == count(step.rerouted where terminal === true)",
+    );
+
+    // "Merger ran twice": once the re-pended test step completes, the pipeline
+    // re-pends finalize_merge so the merger agent runs the landing again.
+    db.prepare(
+      "UPDATE steps SET status = 'done', output = 'STATUS: done\\nTESTED_TREE: abc123', updated_at = datetime('now') WHERE id = ?"
+    ).run(producerRowId);
+    const advanceResult = advancePipeline(runId);
+    assert.equal(advanceResult.advanced, true, "advancePipeline must re-pend finalize_merge after the producer re-runs");
+    consumer = readConsumer();
+    assert.equal(consumer.status, "pending", "finalize_merge re-pended — the merger will run again (finalize ran twice total)");
+    assert.equal(readRun().status, "running", "run stays alive with the merger's second finalize run ahead");
+  });
+
+  it("US-003 W4.10 corridor under the corrected rule: completeStep expects-exhaustion reroute on PARK/checkout-refresh finalize output stays legacy", async () => {
+    // Second flavor of the same corridor: the merger completes finalize_merge
+    // with merge-branch-style PARK/checkout-refresh output (the landing was
+    // deferred because the origin checkout was dirty) that does not satisfy
+    // the merge-family expects block. At retry exhaustion (max_retries 0) the
+    // completeStep expects-exhaustion corridor reroutes to the producer — the
+    // expects feedback carries no FAILURE_CLASS, so this is another ORDINARY
+    // legacy-class reroute (terminal_reroute_count stays 0; the W4.10
+    // observation holds for this flavor too, by definition).
+    const db = await getTestDb();
+    const { runId, stepRows } = insertRunAndSteps(db, "test-reroute-merge-finalize", [
+      { step_id: "test", agent_id: "tester", step_index: 0, status: "done", retry_count: 0, max_retries: 3, input_template: "Run the integration suite", expects: "STATUS: done", output: "STATUS: done\nTESTED_TREE: abc123" },
+      { step_id: "finalize_merge", agent_id: "merger", step_index: 1, status: "running", retry_count: 0, max_retries: 0, input_template: "Finalize the run", expects: "regex:^STATUS:\\s*(done|retry)\\s*$", type: "single" },
+    ]);
+
+    const consumerRowId = stepRows.find(s => s.step_id === "finalize_merge")!.rowId;
+    const producerRowId = stepRows.find(s => s.step_id === "test")!.rowId;
+
+    // merge-branch-style PARK/checkout-refresh output that fails the
+    // merge-family finalize expects (no STATUS:/REBASED: verdict lines).
+    const parkOutput = [
+      "PARK: origin checkout dirty — landing deferred; checkout-refresh required",
+      "PARKED_BRANCH: tamandua-parked-feature-x",
+      "PARKED_REASON: local-changes",
+      "CHECKOUT_REFRESH: parked:tamandua-parked-feature-x",
+    ].join("\n");
+
+    const result = completeStep(consumerRowId, parkOutput);
+    assert.equal(result.status, "rerouted", `PARK/checkout-refresh output failing expects must reroute at exhaustion, got: ${JSON.stringify(result)}`);
+
+    const readRun = () => db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string };
+    const readConsumer = () => db.prepare(
+      "SELECT status, retry_count, reroute_count, terminal_reroute_count, output FROM steps WHERE id = ?"
+    ).get(consumerRowId) as { status: string; retry_count: number; reroute_count: number; terminal_reroute_count: number; output: string | null };
+
+    assert.equal(readRun().status, "running", "run must stay alive after the expects-exhaustion reroute");
+
+    const producer = db.prepare("SELECT status, output FROM steps WHERE id = ?").get(producerRowId) as { status: string; output: string | null };
+    assert.equal(producer.status, "pending", "producer (test) must be re-pended to pending");
+    assert.ok(producer.output?.includes('Reroute from "finalize_merge"'), `producer output must carry reroute feedback, got: ${producer.output}`);
+
+    const consumer = readConsumer();
+    assert.equal(consumer.status, "waiting", "finalize_merge must be reset to waiting");
+    assert.equal(consumer.reroute_count, 1, "reroute_count must be 1 for the single expects-exhaustion reroute");
+    assert.equal(consumer.terminal_reroute_count, 0, "ordinary expects-exhaustion reroute must NOT increment terminal_reroute_count");
+
+    const rerouteEvents = getRunEvents(runId).filter(e => e.event === "step.rerouted" && e.stepId === "finalize_merge");
+    assert.equal(rerouteEvents.length, 1, "exactly one step.rerouted event for finalize_merge");
+    assert.equal(rerouteEvents.length, consumer.reroute_count, "step.rerouted event count must equal reroute_count");
+    assert.equal(rerouteEvents[0].terminal, false, "step.rerouted event must flag terminal === false for the expects-exhaustion reroute");
+    assert.equal(rerouteEvents[0].rerouteMode, "legacy", "step.rerouted event must carry rerouteMode === 'legacy' (expects feedback has no FAILURE_CLASS)");
+  });
 });
+
 
   it("loop path: mixed resolvable and unresolvable keys — unresolvable takes priority, fails fast", async () => {
     const { getDb } = await import("../dist/db.js");
@@ -5702,10 +6163,13 @@ steps:
     max_retries: 2
 `;
 
-  // RCNT fixture: merge-family workflow whose finalize step declares the full
-  // retry_on vocabulary (target_moved/conflicts) — the exact corridor where
-  // the observed W4.10 inconsistency lived (step.rerouted without a matching
-  // terminal_reroute_count increment).
+  // WAVE-B.1 fixture: merge-family workflow whose finalize step declares the
+  // full retry_on vocabulary (target_moved/conflicts) — the W4.10 corridor
+  // where the observed reroute fired without a terminal_reroute_count
+  // increment. Under the corrected rule that is CONSISTENT by definition:
+  // the reroute reason carries no FAILURE_CLASS header, so it is an ordinary
+  // legacy-class reroute (reroute_count up, terminal_reroute_count stays 0,
+  // event terminal:false).
   const mergeFamilyRetryOnYaml = `
 id: test-retry-verdict-merge-retryon
 agents:
@@ -5893,12 +6357,17 @@ steps:
     assert.ok(reroutedEvent, "step.rerouted event must be emitted");
   });
 
-  it("RCNT: finalize retry-verdict reroute keeps step.rerouted count == terminal_reroute_count", async () => {
-    // WAVE-B US-003 regression: the finalize retry-verdict corridor reroutes
-    // the consumer at retry exhaustion (max_retries 0) with merge-branch style
-    // output (STATUS: retry + target_moved verbatim). Historically this emitted
-    // step.rerouted WITHOUT incrementing terminal_reroute_count (legacy
-    // failure-class routing), so the event count and the DB counter diverged.
+  it("RCNT: ordinary finalize retry-verdict reroute does NOT increment terminal_reroute_count", async () => {
+    // WAVE-B.1 regression: the finalize retry-verdict corridor reroutes the
+    // consumer at retry exhaustion (max_retries 0) with merge-branch style
+    // output (STATUS: retry + target_moved verbatim). The reroute reason
+    // carries no FAILURE_CLASS header, so the reroute is ORDINARY
+    // (legacy-class): it increments reroute_count only. terminal_reroute_count
+    // is a GATE CONTROL counting terminal-CLASS reroutes exclusively — it
+    // must stay 0 here so the consumer's one-shot terminal allowance is
+    // preserved. The step.rerouted event count reconciles with reroute_count
+    // and flags terminal === false / rerouteMode === 'legacy' so the two
+    // counters stay reconciled against the event stream.
     const { getDb } = await import("../dist/db.js");
     const db = getDb();
     const runId = crypto.randomUUID();
@@ -5937,26 +6406,30 @@ steps:
     // Must reroute (retries exhausted + on_fail.retry_step), not fail.
     assert.equal(result.status, "rerouted", `finalize retry-verdict must reroute, got: ${result.status}`);
 
-    // Consumer reset to waiting; BOTH counters incremented by exactly 1.
+    // Consumer reset to waiting; reroute_count incremented by exactly 1,
+    // terminal_reroute_count untouched (ordinary, non-terminal-class reroute).
     const mergeStep = db.prepare(
       "SELECT status, retry_count, reroute_count, terminal_reroute_count FROM steps WHERE id = ?"
     ).get(mergeStepRowId) as { status: string; retry_count: number; reroute_count: number; terminal_reroute_count: number };
     assert.equal(mergeStep.status, "waiting", "consumer step must be reset to waiting after reroute");
     assert.equal(mergeStep.retry_count, 0, "consumer retry_count must be reset to 0 after reroute");
     assert.equal(mergeStep.reroute_count, 1, "reroute_count must increment by exactly 1 per reroute");
-    assert.equal(mergeStep.terminal_reroute_count, 1, "terminal_reroute_count must reconcile with the step.rerouted event count");
+    assert.equal(mergeStep.terminal_reroute_count, 0, "ordinary reroute must NOT increment terminal_reroute_count");
 
     // Producer re-pended to pending with reroute feedback.
     const testStep = db.prepare("SELECT status, output FROM steps WHERE id = ?").get(testStepRowId) as { status: string; output: string };
     assert.equal(testStep.status, "pending", "producer step must be re-pended to pending");
     assert.ok(testStep.output.includes("Reroute from"), "producer output must carry reroute feedback");
 
-    // Exactly one step.rerouted event — event count == terminal_reroute_count.
+    // Exactly one step.rerouted event — event count == reroute_count (NOT
+    // terminal_reroute_count) — flagged as an ordinary legacy-class reroute.
     const events = getRunEvents(runId);
     const reroutedEvents = events.filter(e => e.event === "step.rerouted");
     assert.equal(reroutedEvents.length, 1, "exactly one step.rerouted event must be emitted");
-    assert.equal(reroutedEvents.length, mergeStep.terminal_reroute_count, "step.rerouted event count must equal terminal_reroute_count");
+    assert.equal(reroutedEvents.length, mergeStep.reroute_count, "step.rerouted event count must equal reroute_count");
     assert.equal(reroutedEvents[0].stepId, "finalize_merge", "step.rerouted event must name the consumer step");
+    assert.equal(reroutedEvents[0].terminal, false, "step.rerouted event must flag terminal === false for an ordinary reroute");
+    assert.equal(reroutedEvents[0].rerouteMode, "legacy", "step.rerouted event must carry rerouteMode === 'legacy'");
   });
 
   it("retry exhaustion with NO on_fail: STATUS: retry at max_retries fails step and run", async () => {

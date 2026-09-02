@@ -15,6 +15,7 @@ const EVENT_LABELS: Record<string, string> = {
   "step.failed": "Step failed",
   "step.timeout": "Step timed out",
   "step.respawned": "Step respawned",
+  "step.rerouted": "Step rerouted",
   "story.started": "Story started",
   "story.done": "Story done",
   "story.verified": "Story verified",
@@ -39,6 +40,14 @@ export function formatLogsTailLabel(evt: TamanduaEvent): string {
   // tell a late flush from a regular in-run token update at a glance.
   if (evt.event === "run.tokens.updated" && evt.postTerminal === true) {
     return "Token spend updated (post-terminal)";
+  }
+  // WAVE-B.1: step.rerouted events flag their reroute class (terminal:boolean
+  // + rerouteMode). Surface a terminal-CLASS reroute (rerouteMode ===
+  // 'terminal' — a FAILURE_CLASS terminal decision or ledger-gate terminal
+  // refusal) with a marker so operators can distinguish it from an ordinary
+  // expects/retry/orphan reroute, which keeps the plain label.
+  if (evt.event === "step.rerouted" && evt.terminal === true) {
+    return "Step rerouted (terminal)";
   }
   return EVENT_LABELS[evt.event] ?? evt.event;
 }

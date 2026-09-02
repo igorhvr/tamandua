@@ -4451,12 +4451,14 @@ function getOnFailPolicySync(runId: string, stepId: string): WorkflowStepFailure
  * Takes a pre-resolved policy object and performs all reroute logic:
  * validation, budget check, DB updates, story reset, event emission.
  *
- * countsAsTerminal marks a motor reroute dispatched at the consumer's
- * retry-exhaustion decision point (completeStep / orphan-recovery
- * corridors): such reroutes increment terminal_reroute_count alongside
- * the step.rerouted event so the event count reconciles with the DB
- * counter. Failure-class terminal reroutes (FAILURE_CLASS:
- * refused_permanent) increment it as before.
+ * terminal_reroute_count is a GATE CONTROL: it counts only terminal-CLASS
+ * reroutes (rerouteMode === "terminal" — FAILURE_CLASS terminal decisions
+ * such as refused_permanent, and ledger-gate terminal refusals) and drives
+ * the consumer's one-shot terminal allowance. Ordinary consumer
+ * retry-exhaustion reroutes (expects-validation, retry-verdict,
+ * orphan-recovery) increment reroute_count only; the step.rerouted event
+ * carries terminal:false + rerouteMode so the counters reconcile against
+ * the event stream.
  *
  * Returns "rerouted" on success, "budget_exhausted" when max_reroutes
  * is reached, "invalid_target" when the declared retry_step target
@@ -4470,7 +4472,6 @@ function rerouteWithPolicy(
   consumerRowId: string,
   error: string,
   hasIndependentGateAllowance = false,
-  countsAsTerminal = false,
 ): "rerouted" | "budget_exhausted" | "invalid_target" | "not_found" {
   const db = getDb();
   const targetStepId = policy.retry_step!;
@@ -4533,15 +4534,17 @@ function rerouteWithPolicy(
   const usesBudgetIndependentAllowance =
     currentReroutes >= maxReroutes && hasIndependentTerminalAllowance;
   const newRerouteCount = currentReroutes + (usesBudgetIndependentAllowance ? 0 : 1);
-  // RCNT (US-003): terminal_reroute_count must reconcile with the
-  // step.rerouted event stream. A terminal-class failure increments it;
-  // so does a motor reroute dispatched at the consumer's retry-exhaustion
-  // decision point (countsAsTerminal — the completeStep / orphan-recovery
-  // corridors). Transient declared-retryable reroutes stay non-terminal so
-  // the one-shot terminal allowance is preserved (ledger-gate semantics).
+  // WAVE-B.1: terminal_reroute_count is a GATE CONTROL counting only
+  // terminal-CLASS reroutes (rerouteMode === "terminal"). Ordinary
+  // consumer retry-exhaustion reroutes (expects-validation, retry-verdict,
+  // orphan-recovery) increment reroute_count only — inflating
+  // terminal_reroute_count on them would consume the consumer's one-shot
+  // terminal allowance before any terminal refusal occurs. reroute_count
+  // counts every reroute and reconciles with the step.rerouted event
+  // stream, whose terminal field flags the class of each reroute.
   const newTerminalRerouteCount =
     (consumerStep.terminal_reroute_count ?? 0) +
-    (rerouteMode === "terminal" || countsAsTerminal ? 1 : 0);
+    (rerouteMode === "terminal" ? 1 : 0);
 
   // Build bounded feedback for the producer
   const feedback =
@@ -4568,8 +4571,8 @@ function rerouteWithPolicy(
   writeRerouteFeedbackContext(db, runId, targetStep, error);
 
   // (b) Reset consumer: status=waiting, retry_count=0, increment the general
-  //     counter and, for a terminal-class or terminal-decision reroute, its
-  //     dedicated counter. Both counters update in the SAME statement as the
+  //     counter and, for a terminal-class reroute, the dedicated gate-control
+  //     counter. Both counters update in the SAME statement as the
   //     step.rerouted event's synchronous unit — atomic by construction.
   //     Clear output and ownership so it looks like a fresh step.
   db.prepare(
@@ -4579,7 +4582,9 @@ function rerouteWithPolicy(
   // (c) Intermediate done steps are left untouched — advancePipeline will
   //     naturally re-pend the consumer after the producer completes.
 
-  // Emit event
+  // Emit event. The event flags the reroute's class so consumers reconcile
+  // reroute_count == count(step.rerouted) and terminal_reroute_count ==
+  // count(step.rerouted where terminal === true).
   const wfId = getWorkflowId(runId);
   emitEvent({
     ts: new Date().toISOString(),
@@ -4590,6 +4595,8 @@ function rerouteWithPolicy(
     detail:
       `Rerouted to ${targetStepId} (${newRerouteCount}/${maxReroutes}). ` +
       `Consumer failure: ${rerouteReason}`,
+    rerouteMode,
+    terminal: rerouteMode === "terminal",
   });
 
   logger.info(
@@ -5176,13 +5183,14 @@ function writeRerouteFeedbackContext(
  *
  * Every rerouteStepSync caller is a consumer retry-exhaustion corridor
  * (completeStep retry-verdict / expects-validation, orphan-recovery
- * exhaustion): the consumer can no longer retry, so the reroute is the
- * terminal decision point before run failure. Such reroutes emit
- * step.rerouted and MUST also increment the consumer's
- * terminal_reroute_count in the same UPDATE — keeping the event count
- * reconciled with the DB counter (RCNT). Direct policy-core callers
- * (agent failStep, claim-time ledger-gate refusals) keep failure-class
- * semantics via the countsAsTerminal default of false.
+ * exhaustion). The reroute's class is derived purely from the driving
+ * reason: unless it carries a terminal FAILURE_CLASS header these are
+ * ORDINARY (non-terminal-class) reroutes — they increment reroute_count
+ * only, and terminal_reroute_count stays untouched so the consumer keeps
+ * its one-shot terminal allowance (terminal_reroute_count is a gate
+ * control counting terminal-CLASS reroutes exclusively). The emitted
+ * step.rerouted event carries terminal:false + rerouteMode so the two
+ * counters reconcile against the event stream.
  */
 function rerouteStepSync(
   runId: string,
@@ -5192,7 +5200,7 @@ function rerouteStepSync(
 ): "rerouted" | "budget_exhausted" | "invalid_target" | "not_found" {
   const policy = getOnFailPolicySync(runId, consumerStepId);
   if (!policy?.retry_step) return "not_found";
-  return rerouteWithPolicy(policy, runId, consumerStepId, consumerRowId, error, false, true);
+  return rerouteWithPolicy(policy, runId, consumerStepId, consumerRowId, error);
 }
 
 // ══════════════════════════════════════════════════════════════════════
