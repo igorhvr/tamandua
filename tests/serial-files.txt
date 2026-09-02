@@ -125,6 +125,7 @@ tests/helpers/dead-owner-teardown.test.ts
 tests/hermes-token-attribution.test.ts
 tests/hermes-token-saver.test.ts
 tests/install-script-workflows.test.ts
+tests/ledger-child-attribution.test.ts
 tests/logs-prefix-expansion.test.ts
 tests/logs-tail-command.test.ts
 tests/mcp-cli.test.ts

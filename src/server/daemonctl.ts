@@ -18,7 +18,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { DEFAULT_MCP_PORT, MCP_ENDPOINT_PATH } from "./mcp-server.js";
 import { DEFAULT_CONTROL_PORT } from "./control-server.js";
-import { assertStatePathIsolation } from "../lib/test-guard.js";
+import { assertStatePathIsolation, spawnChildAttributionEnv } from "../lib/test-guard.js";
 import { environHasEntry, getCmdline, getElapsedSeconds, hasProcfs, processHasOpenFileUnder } from "../lib/proc-info.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -437,6 +437,35 @@ export function getDaemonStatus(opts?: DaemonctlPathOptions): { running: false; 
   };
 }
 
+// ── Child spawn environment ────────────────────────────────────────
+
+/**
+ * Build the environment for a spawned tamandua child process.
+ *
+ * Every tamandua child spawn site in this module (startDaemon, startMcp,
+ * startControlPlane, startDashboardStandalone) funnels its env through this
+ * helper so that, when the test-isolation guard is active AND the caller sits
+ * in a .test. frame, the child inherits TAMANDUA_TEST_GUARD_TEST_FILE naming
+ * the spawning test file (see spawnChildAttributionEnv() in
+ * src/lib/test-guard.ts). The CHILD's own stack has no .test. frames, so
+ * without that env its guard-ledger entries (e.g. a production-port bind)
+ * would be orphaned under "(unknown)" in the lane report instead of naming
+ * the test that spawned it.
+ *
+ * Merge order is process env → child-attribution env → `overrides`, so an
+ * explicit site override (control port, HOME) can never be clobbered by the
+ * attribution var. When the guard is inactive — or active but no .test. frame
+ * is derivable, e.g. a daemon spawning a grandchild — the attribution env is
+ * {} and the result is byte-identical to the pre-change
+ * `{ ...process.env, ...overrides }` merge (production spawns unchanged). A
+ * var already present in process.env (a daemon child inheriting it from its
+ * own spawner) passes through untouched, chaining attribution to
+ * grandchildren.
+ */
+export function buildSpawnEnv(overrides?: Record<string, string>): NodeJS.ProcessEnv {
+  return { ...process.env, ...spawnChildAttributionEnv(), ...(overrides ?? {}) };
+}
+
 // ── Lifecycle ───────────────────────────────────────────────────────
 
 /** Options for startDaemon / startMcp. */
@@ -524,14 +553,18 @@ export async function startDaemon(port?: number, opts?: StartOptions): Promise<{
     const errFd = fs.openSync(logFile, "a");
 
     const daemonScript = path.resolve(__dirname, "daemon.js");
+    // Route the child env through buildSpawnEnv: under the test guard this
+    // merges TAMANDUA_TEST_GUARD_TEST_FILE (naming the spawning test) so
+    // child-side guard-ledger entries are attributed instead of "(unknown)".
+    const daemonEnv: Record<string, string> = { TAMANDUA_CONTROL_PORT: String(controlPort) };
+    if (opts?.homeDir) {
+      daemonEnv.HOME = opts.homeDir;
+    }
     const spawnOpts: Parameters<typeof spawn>[2] = {
       detached: true,
       stdio: ["ignore", out, errFd],
-      env: { ...process.env, TAMANDUA_CONTROL_PORT: String(controlPort) },
+      env: buildSpawnEnv(daemonEnv),
     };
-    if (opts?.homeDir) {
-      spawnOpts.env = { ...spawnOpts.env, HOME: opts.homeDir };
-    }
     const child = spawn(process.execPath, ["--disable-warning=ExperimentalWarning", daemonScript], spawnOpts);
 
     if (opts?.keepHandle) {
@@ -772,13 +805,21 @@ export async function startMcp(port?: number, opts?: StartOptions): Promise<{ pi
   const errFd = fs.openSync(mcpLogFile, "a");
 
   const standaloneScript = resolveStandaloneScript();
+  // Always pass an explicit env via buildSpawnEnv (previously env was omitted
+  // unless homeDir was set): under the test guard this merges
+  // TAMANDUA_TEST_GUARD_TEST_FILE so child-side guard-ledger entries are
+  // attributed to the spawning test file instead of "(unknown)". When the
+  // guard is inactive the env is a plain copy of process.env — exactly what
+  // the child would inherit with the option omitted.
+  const mcpEnv: Record<string, string> = {};
+  if (opts?.homeDir) {
+    mcpEnv.HOME = opts.homeDir;
+  }
   const spawnOpts: Parameters<typeof spawn>[2] = {
     detached: true,
     stdio: ["ignore", out, errFd],
+    env: buildSpawnEnv(mcpEnv),
   };
-  if (opts?.homeDir) {
-    spawnOpts.env = { ...process.env, HOME: opts.homeDir };
-  }
   const child = spawn(process.execPath, ["--disable-warning=ExperimentalWarning", standaloneScript, String(mcpPort)], spawnOpts);
 
   if (opts?.keepHandle) {
@@ -1223,13 +1264,17 @@ export async function startControlPlane(port?: number, opts?: StartOptions): Pro
   const errFd = fs.openSync(cpLogFile, "a");
 
   const standaloneScript = resolveControlStandaloneScript();
+  // Route the child env through buildSpawnEnv (see startMcp for the rationale:
+  // test-guard child attribution, byte-identical when the guard is inactive).
+  const cpEnv: Record<string, string> = {};
+  if (opts?.homeDir) {
+    cpEnv.HOME = opts.homeDir;
+  }
   const spawnOpts: Parameters<typeof spawn>[2] = {
     detached: true,
     stdio: ["ignore", out, errFd],
+    env: buildSpawnEnv(cpEnv),
   };
-  if (opts?.homeDir) {
-    spawnOpts.env = { ...process.env, HOME: opts.homeDir };
-  }
   const child = spawn(process.execPath, ["--disable-warning=ExperimentalWarning", standaloneScript, String(cpPort)], spawnOpts);
 
   if (opts?.keepHandle) {
@@ -1460,13 +1505,17 @@ export async function startDashboardStandalone(port?: number, opts?: StartOption
   const errFd = fs.openSync(dashLogFile, "a");
 
   const standaloneScript = resolveDashboardStandaloneScript();
+  // Route the child env through buildSpawnEnv (see startMcp for the rationale:
+  // test-guard child attribution, byte-identical when the guard is inactive).
+  const dashEnv: Record<string, string> = {};
+  if (opts?.homeDir) {
+    dashEnv.HOME = opts.homeDir;
+  }
   const spawnOpts: Parameters<typeof spawn>[2] = {
     detached: true,
     stdio: ["ignore", out, errFd],
+    env: buildSpawnEnv(dashEnv),
   };
-  if (opts?.homeDir) {
-    spawnOpts.env = { ...process.env, HOME: opts.homeDir };
-  }
   const child = spawn(process.execPath, ["--disable-warning=ExperimentalWarning", standaloneScript, String(dashPort)], spawnOpts);
 
   if (opts?.keepHandle) {

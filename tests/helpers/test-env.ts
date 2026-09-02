@@ -167,6 +167,12 @@ const BASE_ENV_KEYS = [
   // so the ledger report can filter them.
   "TAMANDUA_TEST_GUARD_LEDGER",
   "TAMANDUA_TEST_GUARD_EXPECT",
+  // Child-process attribution: daemonctl spawn sites merge this var into
+  // every child they launch when the guard is active (buildSpawnEnv), naming
+  // the spawning test file so the CHILD's guard-ledger entries attribute
+  // instead of "(unknown)". cleanChildEnv must pass it through so
+  // grandchildren spawned by a guarded child inherit the same attribution.
+  "TAMANDUA_TEST_GUARD_TEST_FILE",
 ];
 
 export function cleanChildEnv(

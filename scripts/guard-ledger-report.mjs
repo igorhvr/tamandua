@@ -10,6 +10,13 @@
  * real entries and 1 when any exist, so lane-fail enforcement can be wired
  * once all leaking sites are fixed.
  *
+ * Entries with no usable testFile collapse under "(unknown)". Every ledger
+ * entry also records the writing process's argv (command line, captured at
+ * bind time by the guard), so each "(unknown)" entry additionally prints its
+ * argv beneath the violation line — an orphaned child (e.g. a spawned daemon
+ * whose stack has no .test. frame) still names its process. Attributed
+ * entries keep the historical output: no argv noise.
+ *
  * Plain Node 22 — no build dependency, no imports beyond node builtins.
  * Usage: node guard-ledger-report.mjs <ledger.jsonl>
  */
@@ -76,11 +83,21 @@ for (const [file, fileEntries] of sorted) {
   process.stderr.write(
     `\n${file} (${count} violation${count === 1 ? "" : "s"})\n`,
   );
+  const isUnknownGroup = file === "(unknown)";
   for (const entry of fileEntries) {
     const loc = entry.testLine ? `:${entry.testLine}` : "";
     process.stderr.write(
       `  [${entry.kind}] ${entry.path} — ${entry.what}${loc}\n`,
     );
+    // Fallback attribution for orphan entries: no usable testFile, but every
+    // ledger entry carries the writing process's argv (command line, captured
+    // at bind time), so print it beneath the "(unknown)" group's violation
+    // line — the leak still names its process (e.g. "dist/server/daemon.js").
+    // Attributed entries keep the historical output (no argv noise), and an
+    // unknown entry without argv prints exactly as before.
+    if (isUnknownGroup && typeof entry.argv === "string" && entry.argv !== "") {
+      process.stderr.write(`    argv: ${entry.argv}\n`);
+    }
   }
 }
 process.stderr.write("\n");

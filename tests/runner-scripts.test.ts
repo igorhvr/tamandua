@@ -1539,3 +1539,149 @@ describe("prll-verify.sh", () => {
     }
   });
 });
+
+describe("guard-ledger-report.mjs", () => {
+  const REPORT_SCRIPT = path.join(REPO_ROOT, "scripts", "guard-ledger-report.mjs");
+
+  /**
+   * Fixture style shared with the lane tests above: copy the real report
+   * script into a temp dir, write the given entries as a JSONL ledger next to
+   * it, and run `node scripts/guard-ledger-report.mjs <ledger>` against it.
+   * Returns { status, stderr } — the report writes only to stderr.
+   */
+  function runReport(entries) {
+    const tmpDir = makeTmpDir();
+    try {
+      const scriptsDir = path.join(tmpDir, "scripts");
+      fs.mkdirSync(scriptsDir, { recursive: true });
+      fs.copyFileSync(
+        REPORT_SCRIPT,
+        path.join(scriptsDir, "guard-ledger-report.mjs"),
+      );
+      const ledgerPath = path.join(tmpDir, "guard-ledger.jsonl");
+      const body = entries.map((entry) => JSON.stringify(entry)).join("\n");
+      fs.writeFileSync(ledgerPath, body ? body + "\n" : "");
+      try {
+        execFileSync(process.execPath, [path.join(scriptsDir, "guard-ledger-report.mjs"), ledgerPath], {
+          stdio: "pipe",
+          encoding: "utf-8",
+        });
+        return { status: 0, stderr: "" };
+      } catch (e) {
+        return { status: e.status ?? 1, stderr: e.stderr || "" };
+      }
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  }
+
+  it("prints argv beneath (unknown) entries and keeps attributed-file output unchanged", () => {
+    const { status, stderr } = runReport([
+      {
+        kind: "port-bind",
+        path: "3339",
+        what: "control plane",
+        testFile: null,
+        testLine: null,
+        argv: "dist/server/daemon.js --control-port 3339",
+        expected: false,
+        ts: 1,
+      },
+      {
+        kind: "port-bind",
+        path: "3334",
+        what: "dashboard",
+        testFile: "src/installer/some.test.ts",
+        testLine: 42,
+        argv: "node --test src/installer/some.test.ts",
+        expected: false,
+        ts: 2,
+      },
+    ]);
+
+    assert.equal(status, 1, "a real violation must exit 1");
+    assert.ok(
+      stderr.includes("TEST ISOLATION VIOLATIONS"),
+      "stderr must contain the report header: " + stderr.slice(0, 800),
+    );
+    // The orphan entry keeps the "(unknown)" label and gains its argv beneath it.
+    assert.ok(
+      stderr.includes("(unknown) (1 violation)"),
+      "stderr must keep the (unknown) group label: " + stderr.slice(0, 800),
+    );
+    const unknownHeaderAt = stderr.indexOf("(unknown) (1 violation)");
+    const argvAt = stderr.indexOf("dist/server/daemon.js --control-port 3339");
+    assert.ok(
+      argvAt !== -1 && argvAt > unknownHeaderAt,
+      "argv must be printed beneath the (unknown) header: " + stderr.slice(0, 800),
+    );
+    // The attributed entry still groups under and prints its file, with the
+    // violation line — and no argv noise beneath it.
+    assert.ok(
+      stderr.includes("src/installer/some.test.ts (1 violation)"),
+      "attributed entry must still name its file: " + stderr.slice(0, 800),
+    );
+    const fileHeaderAt = stderr.indexOf("src/installer/some.test.ts (1 violation)");
+    const entryAt = stderr.indexOf("[port-bind] 3334 — dashboard:42");
+    assert.ok(
+      entryAt !== -1 && entryAt > fileHeaderAt,
+      "attributed violation line must follow its file header: " + stderr.slice(0, 800),
+    );
+    assert.equal(
+      stderr.indexOf("node --test src/installer/some.test.ts"),
+      -1,
+      "attributed entries must not print argv noise: " + stderr.slice(0, 800),
+    );
+  });
+
+  it("does not crash on an (unknown) entry without argv", () => {
+    const { status, stderr } = runReport([
+      {
+        kind: "state-path",
+        path: "/home/user/.tamandua",
+        what: "getDb()",
+        testFile: null,
+        testLine: null,
+        expected: false,
+        ts: 3,
+      },
+    ]);
+
+    assert.equal(status, 1, "a real violation must exit 1");
+    assert.ok(
+      stderr.includes("(unknown) (1 violation)"),
+      "stderr must keep the (unknown) group label: " + stderr.slice(0, 800),
+    );
+    assert.ok(
+      stderr.includes("[state-path] /home/user/.tamandua — getDb()"),
+      "violation detail must still print: " + stderr.slice(0, 800),
+    );
+    assert.ok(
+      !/TypeError|Error:/.test(stderr),
+      "an argv-less unknown entry must not crash the report: " + stderr.slice(0, 800),
+    );
+  });
+
+  it("exits 0 on an empty ledger", () => {
+    const { status, stderr } = runReport([]);
+    assert.equal(status, 0, "an empty ledger must exit 0");
+    assert.equal(stderr, "", "an empty ledger must not print a report");
+  });
+
+  it("exits 0 on an all-expected ledger", () => {
+    const { status, stderr } = runReport([
+      {
+        kind: "port-bind",
+        path: "3339",
+        what: "control plane",
+        testFile: null,
+        testLine: null,
+        argv: "dist/server/daemon.js",
+        expected: true,
+        ts: 4,
+      },
+    ]);
+    assert.equal(status, 0, "an all-expected ledger must exit 0");
+    assert.equal(stderr, "", "an all-expected ledger must not print a report");
+  });
+});

@@ -4,6 +4,12 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
+import { stopDaemonFamily } from "../../dist/server/daemonctl.js";
+import {
+  reservePortHandles,
+  removeTestTempDirWithDiagnostics,
+  type PortHandle,
+} from "../../tests/helpers/test-env.ts";
 
 import { runWorkflow, type RunWorkflowParams } from "../../dist/installer/run.js";
 import { getRunHarnessType } from "../../dist/installer/run-harness.js";
@@ -49,25 +55,120 @@ async function seedRunRecord(
 }
 
 // ── Test suite ──
+//
+// TISO.1 (US-003) isolation note — why this suite must pin every state/port
+// knob to the temp HOME (mirrors src/installer/run.test.ts).
+//
+// PRE-FIX ASYMMETRY (empirically observed; explained here, not papered
+// over): this suite used to set only HOME=tempHome and delete
+// TAMANDUA_DB_PATH, leaving TAMANDUA_STATE_DIR / TAMANDUA_CONTROL_PORT
+// unset. Each of the four runWorkflow() calls below reaches
+// ensureDaemonControlAvailable() (src/server/control-client.ts), which
+// first probes the daemon control plane via controlRequest(). Under the
+// test guard (TAMANDUA_TEST_GUARD=1 / NODE_TEST_CONTEXT), controlRequest()
+// REFUSES the probe whenever TAMANDUA_CONTROL_PORT is absent — its guard
+// block returns null before any socket is opened — so
+// isDaemonControlReachable() is always false and
+// ensureDaemonControlAvailable() falls through to startDaemon(). With no
+// port override the spawned daemon child binds the DEFAULT control port
+// 3339; assertPortIsolation() (src/lib/test-guard.ts) guard-fires inside
+// the child and the serial lane fails on four "[port-bind] 3339 — control
+// plane" ledger entries attributed "(unknown)" (testFile null: the child's
+// own stack has no .test. frame).
+//
+// When TAMANDUA_CONTROL_PORT IS exported (even as "3339", the default), the
+// guard LETS the probe run, so wherever a live tamandua daemon already
+// answers on 3339 the probe succeeds and the EXISTING daemon is reused: no
+// child is spawned, no 3339 bind ever happens, and the ledger stays empty.
+// That is why the runs' own testers — whose environment inherits
+// TAMANDUA_CONTROL_PORT=3339 from the live daemon — reported EMPTY ledgers
+// on the same trees (741feb3b, c616d8c5) whose review shell (no TAMANDUA_*
+// vars) failed on the four 3339 entries. The asymmetry is environmental
+// (what the runner exported), not a difference in the code under test.
+//
+// FIX: point every env knob at the temp HOME and hand the daemon this suite
+// spawns a RESERVED (non-production) control port plus a dashboard port
+// file taken from a reserved port, so no production port (3334/3338/3339)
+// is ever bound — regardless of what TAMANDUA_CONTROL_PORT was exported as
+// beforehand.
 
 describe("HarnessType flow (US-001)", () => {
   let tempHome: string;
   let origHome: string | undefined;
+  let origControlPort: string | undefined;
+  let origDbPath: string | undefined;
+  let origStateDir: string | undefined;
+  let origWorktreeRoot: string | undefined;
+  let portHandles: PortHandle[] = [];
 
-  before(() => {
+  before(async () => {
     tempHome = tamanduaTempDir("tamandua-harness-type-");
     origHome = process.env.HOME;
+    origControlPort = process.env.TAMANDUA_CONTROL_PORT;
+    origDbPath = process.env.TAMANDUA_DB_PATH;
+    origStateDir = process.env.TAMANDUA_STATE_DIR;
+    origWorktreeRoot = process.env.TAMANDUA_WORKTREE_ROOT;
+
+    const tamanduaDir = path.join(tempHome, ".tamandua");
+    portHandles = await reservePortHandles(2);
+    const dashboardPort = portHandles[0].port;
+    const controlPort = portHandles[1].port;
+    fs.mkdirSync(tamanduaDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(tamanduaDir, "port"),
+      String(dashboardPort),
+      "utf-8",
+    );
+
     process.env.HOME = tempHome;
-    delete process.env.TAMANDUA_DB_PATH;
+    process.env.TAMANDUA_CONTROL_PORT = String(controlPort);
+    process.env.TAMANDUA_DB_PATH = path.join(tamanduaDir, "tamandua.db");
+    process.env.TAMANDUA_STATE_DIR = tamanduaDir;
+    process.env.TAMANDUA_WORKTREE_ROOT = path.join(tamanduaDir, "worktrees");
+
+    // Release the port handles now that setup is done so the daemon this
+    // suite's runWorkflow() calls spawn can bind these exact ports.
+    await Promise.all(portHandles.map((h) => h.close()));
+    portHandles = [];
   });
 
-  after(() => {
-    if (origHome) {
+  after(async () => {
+    // Stop the daemon family BEFORE removing the temp HOME: daemons started
+    // by the (now-succeeding) runWorkflow calls keep writing into it, and
+    // removing the HOME first would leave orphaned daemon children behind.
+    await stopDaemonFamily({ homeDir: tempHome });
+
+    if (origHome !== undefined) {
       process.env.HOME = origHome;
     } else {
       delete process.env.HOME;
     }
-    fs.rmSync(tempHome, { recursive: true, force: true });
+    if (origControlPort !== undefined) {
+      process.env.TAMANDUA_CONTROL_PORT = origControlPort;
+    } else {
+      delete process.env.TAMANDUA_CONTROL_PORT;
+    }
+    if (origDbPath !== undefined) {
+      process.env.TAMANDUA_DB_PATH = origDbPath;
+    } else {
+      delete process.env.TAMANDUA_DB_PATH;
+    }
+    if (origStateDir !== undefined) {
+      process.env.TAMANDUA_STATE_DIR = origStateDir;
+    } else {
+      delete process.env.TAMANDUA_STATE_DIR;
+    }
+    if (origWorktreeRoot !== undefined) {
+      process.env.TAMANDUA_WORKTREE_ROOT = origWorktreeRoot;
+    } else {
+      delete process.env.TAMANDUA_WORKTREE_ROOT;
+    }
+    // Retries absorb stragglers still writing into the temp home during
+    // teardown (ENOTEMPTY otherwise, seen on macOS). Give the daemon's
+    // log/SQLite WAL stragglers a moment to finish writing.
+    await Promise.all(portHandles.map((h) => h.close()));
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    removeTestTempDirWithDiagnostics(tempHome);
   });
 
   describe("RunWorkflowParams.harnessType", () => {

@@ -39,6 +39,14 @@ export function testGuardActive(): boolean {
 }
 
 /**
+ * Env var that names the test file which spawned the current process.
+ * Spawn sites (daemonctl children, etc.) merge the output of
+ * spawnChildAttributionEnv() into the child's env so child-side ledger
+ * entries are attributed to the originating test instead of "(unknown)".
+ */
+export const CHILD_TEST_FILE_ENV = "TAMANDUA_TEST_GUARD_TEST_FILE";
+
+/**
  * The invoking user's actual home directory from the OS account database —
  * deliberately NOT os.homedir(), which follows the HOME env var that
  * isolated tests legitimately point at temp directories.
@@ -81,6 +89,48 @@ function deriveTestFrame(): { testFile: string | null; testLine: number | null }
 }
 
 /**
+ * Resolve the originating test file/line for a guard violation.
+ *
+ * Attribution precedence:
+ * 1. TAMANDUA_TEST_GUARD_TEST_FILE (exported by a spawning test): names the
+ *    test that spawned this process — authoritative for daemon / control-plane
+ *    children whose own stacks have no .test. frames.
+ * 2. deriveTestFrame(): the in-process stack walk (unchanged behavior),
+ *    which yields null/0 in children.
+ */
+function deriveAttribution(): { testFile: string | null; testLine: number | null } {
+  const spawnerTestFile = process.env[CHILD_TEST_FILE_ENV];
+  if (spawnerTestFile) {
+    // Env attribution has no line number: the env names the SPAWNING test,
+    // and this process's stack does not execute inside that file.
+    return { testFile: spawnerTestFile, testLine: null };
+  }
+  return deriveTestFrame();
+}
+
+/**
+ * Child-process attribution env for spawn sites.
+ *
+ * When a test spawns a tamandua child (daemon / control-standalone /
+ * dashboard-standalone / mcp-standalone), the child's own stack has no
+ * .test. frames, so without this its ledger entries would be orphaned under
+ * "(unknown)". Spawn sites merge the result into the child env
+ * (TAMANDUA_TEST_GUARD_TEST_FILE) so the guard records the originating test
+ * file on every child-side violation.
+ *
+ * Returns { TAMANDUA_TEST_GUARD_TEST_FILE: <stack-derived test file> } ONLY
+ * when the guard is active AND a .test. frame is derivable from the caller's
+ * stack; otherwise returns {} — no env var is injected when the guard is
+ * inactive or no test frame exists (production spawns stay byte-identical).
+ */
+export function spawnChildAttributionEnv(): Record<string, string> {
+  if (!testGuardActive()) return {};
+  const { testFile } = deriveTestFrame();
+  if (!testFile) return {};
+  return { [CHILD_TEST_FILE_ENV]: testFile };
+}
+
+/**
  * Test-harness-only violation ledger. When the guard is active AND the runner
  * pointed TAMANDUA_TEST_GUARD_LEDGER at a per-run temp file, append one JSONL
  * entry per violation so the PRLL lane scripts can attribute leaks to the
@@ -92,13 +142,18 @@ function appendLedgerViolation(kind: string, path_: string, what: string): void 
   const ledgerPath = process.env.TAMANDUA_TEST_GUARD_LEDGER;
   if (!ledgerPath) return;
   try {
-    const { testFile, testLine } = deriveTestFrame();
+    const { testFile, testLine } = deriveAttribution();
     const entry = {
       kind,
       path: path_,
       what,
       testFile,
       testLine,
+      // The writing process's command line (argv minus the node binary),
+      // captured at bind time — the fallback attribution for orphan entries
+      // whose testFile is null (e.g. a spawned daemon child): the ledger
+      // report can still say WHICH process leaked the bind.
+      argv: process.argv.slice(1).join(" "),
       expected: process.env.TAMANDUA_TEST_GUARD_EXPECT === "1",
       ts: Date.now(),
     };
