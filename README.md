@@ -594,6 +594,12 @@ When you start the management dashboard (`tamandua dashboard`), Tamandua automat
 
 Use `tamandua dashboard status` to verify both endpoints are up.
 
+The standalone dashboard (and `tamandua get-ready`, which starts it) listens
+on port **3334 by default**, but honors the `TAMANDUA_DASHBOARD_PORT`
+environment variable — a valid 1–65535 value overrides the default, and an
+unset/empty/invalid value falls back to 3334 (same resolution as
+`tamandua dashboard --port N`).
+
 By default, the dashboard and MCP servers bind to `127.0.0.1` (localhost only), so they are not reachable from other machines on the network. If you need remote access, set `TAMANDUA_BIND_HOST=0.0.0.0` (or a specific IP) before starting the dashboard:
 
 ```bash

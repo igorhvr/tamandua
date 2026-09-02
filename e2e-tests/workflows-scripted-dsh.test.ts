@@ -260,7 +260,7 @@ function readRunEvents(tamanduaDir: string, runId: string): Array<Record<string,
 // ── Scripted behaviors: bug-fix-merge-worktree happy path ───────────
 
 const BRANCH = "bugfix-scripted-dsh-add";
-const WORK_TOKENS = 111; // defaultTokens; six work rounds → ≥666 attributed
+const WORK_TOKENS = 111; // defaultTokens; seven work rounds → ≥777 attributed
 
 const bugFixBehaviors: ScriptedAgentConfig = {
   agents: {
@@ -304,6 +304,13 @@ const bugFixBehaviors: ScriptedAgentConfig = {
         "REGRESSION_TEST: covered by existing math test",
         "REPRO_EVIDENCE: failing add(5, 3) output captured on the pre-fix tree",
       ].join("\n"),
+    },
+    // WAVE-A.1 always-audit (PHNT): deception_audit is a plain single step
+    // that dispatches a real round after EVERY fix completion — including
+    // when the fixer reported REPRO_EVIDENCE. The canned HONEST verdict lets
+    // the happy-path corridor advance to verify/finalize_merge.
+    auditor: {
+      output: "STATUS: done\nVERDICT: HONEST",
     },
     verifier: {
       output: ["STATUS: done", "VERIFIED: add() now uses a + b", "TESTED_TREE: scripted-dsh-tree"].join("\n"),
@@ -368,6 +375,11 @@ function createMigratedMergerBehaviors(
       },
       verifier: { output: "STATUS: done\nVERIFIED: scripted change verified\nTESTED_TREE: scripted-tested-tree" },
       tester: { output: "STATUS: done\nRESULTS: scripted suite passed\nTESTED_TREE: scripted-tested-tree\nAUDIT_AFTER: clean" },
+      // Only the bug-fix family declares the always-audit deception_audit
+      // step after fix; the canned HONEST verdict keeps the run advancing.
+      ...(family === "bug-fix"
+        ? { auditor: { output: "STATUS: done\nVERDICT: HONEST" } }
+        : {}),
       merger: {
         commands: [
           `expected_tip=$(git -C "{{input.ORIGIN_REPOSITORY}}" rev-parse "refs/heads/{{input.ORIGINAL_BRANCH}}") && TAMANDUA_RUN_ID="{{input.RUN_ID}}" "${process.execPath}" "${cliPath}" merge-branch --origin "{{input.ORIGIN_REPOSITORY}}" --branch "${branch}" --into "{{input.ORIGINAL_BRANCH}}" --expect-tip "$expected_tip" --message "${commitMessage} (squash of ${branch})"`,
@@ -379,7 +391,13 @@ function createMigratedMergerBehaviors(
   };
 }
 
+// The agents with exactly one work round on a happy-path bug-fix run. The
+// always-audit deception_audit round (the auditor) is NOT part of this list —
+// corridors assert its single dispatch separately.
 const BUG_FIX_AGENTS = ["triager", "investigator", "setup", "fixer", "verifier", "merger"];
+// Work rounds on a happy-path bug-fix-merge(-worktree) run: the six
+// BUG_FIX_AGENTS plus one always-audit deception_audit round.
+const BUG_FIX_HAPPY_ROUNDS = BUG_FIX_AGENTS.length + 1;
 
 // ── Tests ───────────────────────────────────────────────────────────
 
@@ -575,13 +593,15 @@ describe("scripted-dsh full pipeline (real daemon/scheduler, zero tokens)", { co
           );
         }
 
-        // ── PHNT (US-009): the fixer emitted REPRO_EVIDENCE, so the
-        // deception_audit conditional step auto-completed free — the auditor
-        // was NEVER invoked (no harness spawn, zero tokens).
+        // ── PHNT (WAVE-A.1 always audit): the fixer emitted REPRO_EVIDENCE,
+        // yet deception_audit is a plain single step that still dispatched a
+        // real read-only round — the canned VERDICT: HONEST advances the run
+        // to verify/finalize_merge. The auditor is NEVER auto-completed (no
+        // zero-token free pass).
         assert.equal(
           ctx.scripted.workInvocations("auditor").length,
-          0,
-          `auditor must auto-complete free when REPRO_EVIDENCE is present — ` +
+          1,
+          `auditor must dispatch once even when REPRO_EVIDENCE is present — ` +
             `got ${ctx.scripted.workInvocations("auditor").length} invocations\n${diagnostics(ctx)}`,
         );
 
@@ -593,8 +613,8 @@ describe("scripted-dsh full pipeline (real daemon/scheduler, zero tokens)", { co
         const sessionLogs = collectSessionLogs(dshHome);
         assert.equal(
           sessionLogs.length,
-          BUG_FIX_AGENTS.length,
-          `dsh session files should number ${BUG_FIX_AGENTS.length} (one per work round), ` +
+          BUG_FIX_HAPPY_ROUNDS,
+          `dsh session files should number ${BUG_FIX_HAPPY_ROUNDS} (one per work round), ` +
             `got ${sessionLogs.length}: ${JSON.stringify(sessionLogs)}\n${diagnostics(ctx)}`,
         );
         for (const logPath of sessionLogs) {
@@ -606,11 +626,11 @@ describe("scripted-dsh full pipeline (real daemon/scheduler, zero tokens)", { co
           );
         }
 
-        const tokens = await waitForRunTokens(ctx.env.tamanduaDir, runId, BUG_FIX_AGENTS.length * WORK_TOKENS);
+        const tokens = await waitForRunTokens(ctx.env.tamanduaDir, runId, BUG_FIX_HAPPY_ROUNDS * WORK_TOKENS);
         assert.ok(
-          tokens >= BUG_FIX_AGENTS.length * WORK_TOKENS,
-          `tokens_spent should include ${BUG_FIX_AGENTS.length} dsh work rounds ` +
-            `(≥${BUG_FIX_AGENTS.length * WORK_TOKENS}), got ${tokens}`,
+          tokens >= BUG_FIX_HAPPY_ROUNDS * WORK_TOKENS,
+          `tokens_spent should include ${BUG_FIX_HAPPY_ROUNDS} dsh work rounds ` +
+            `(≥${BUG_FIX_HAPPY_ROUNDS * WORK_TOKENS}), got ${tokens}`,
         );
 
         // ── Terminal event carries token spend ────────────────────
@@ -618,6 +638,19 @@ describe("scripted-dsh full pipeline (real daemon/scheduler, zero tokens)", { co
         const completed = events.find((e) => e.event === "run.completed");
         assert.ok(completed, `run.completed event missing; events: ${events.map((e) => e.event).join(", ")}`);
         assert.equal(typeof completed.tokensSpent, "number", "run.completed should carry tokensSpent");
+
+        // The always-audit HONEST verdict routed: deception_audit.passed
+        // fired and no step.auto_completed may exist for the audit.
+        const auditPassed = events.filter((e) => e.event === "deception_audit.passed");
+        assert.equal(
+          auditPassed.length,
+          1,
+          `exactly one deception_audit.passed expected; events: ${events.map((e) => e.event).join(", ")}`,
+        );
+        assert.ok(
+          !events.some((e) => e.event === "step.auto_completed" && e.stepId === "deception_audit"),
+          "the always-audit deception_audit round must never auto-complete",
+        );
 
         // ── Deterministic-motor acceptance (MOTOR-CONTRACT.md N1/N2):
         // checking for work never invokes a model. Every harness spawn IS a
@@ -642,7 +675,7 @@ describe("scripted-dsh full pipeline (real daemon/scheduler, zero tokens)", { co
         );
         assert.equal(
           ctx.scripted.readInvocations().filter((inv) => inv.phase === "work").length,
-          BUG_FIX_AGENTS.length,
+          BUG_FIX_HAPPY_ROUNDS,
           `dsh harness invocations should equal executed work rounds (N2)`,
         );
 

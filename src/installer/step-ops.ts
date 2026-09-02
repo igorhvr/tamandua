@@ -148,6 +148,16 @@ export function parseOutputKeyValues(output: string): Record<string, string> {
  * Reserved context keys that must not be overwritten by step output parsing.
  * These are structural keys that define the harness/repo/environment and should
  * only be set during run creation, not by agent-generated KEY:value output.
+ *
+ * WAVE-A.1 US-001 (TCMD hardening): the TEST_CMD review-state keys
+ * (test_cmd_review_required, test_cmd_review_candidate,
+ * test_cmd_review_established, test_cmd_rewriter_step) are agent-unwritable.
+ * They are persisted into run context ONLY by the in-process rewrite detector
+ * (during the test_cmd merge branch in completeStep) and by the verdict
+ * router / withdrawal logic — never by parseOutputKeyValues merges. Reserving
+ * them means a rewriting step cannot emit `TEST_CMD_REVIEW_REQUIRED: false` in
+ * its own output to clear the gate (corridor 1a), and an agent cannot forge
+ * review material (candidate/established/rewriter_step) to steer the reviewer.
  */
 const RESERVED_CONTEXT_KEYS = new Set([
   "repo",
@@ -163,6 +173,10 @@ const RESERVED_CONTEXT_KEYS = new Set([
   "merge_gate",
   "fail_missing",
   "test_cmd_raw",
+  "test_cmd_review_required",
+  "test_cmd_review_candidate",
+  "test_cmd_review_established",
+  "test_cmd_rewriter_step",
 ]);
 
 // ══════════════════════════════════════════════════════════════════════
@@ -2329,6 +2343,8 @@ export function isRunContextFlagSet(value: string | undefined): boolean {
  *   - condition SET  → returns 'dispatched'; the step stays pending and the
  *     motor spawns the harness normally. A set condition can NEVER be
  *     auto-completed.
+ *   - a deception_audit step (WAVE-A.1 always audit) → returns 'dispatched'
+ *     regardless of any condition value: an audit is never auto-completed.
  *   - non-conditional steps (single/loop) are never auto-completed.
  *   - a conditional step with no declared condition (spec validation should
  *     have rejected it) is treated as 'dispatched', never auto-completed.
@@ -2371,6 +2387,13 @@ export function autoCompleteConditionalStep(runId: string, agentId: string): Aut
   } | undefined;
 
   if (!step) return "none";
+
+  // WAVE-A.1 US-003 (always audit, fail closed): a deception_audit step is
+  // NEVER auto-completed. New bug-* runs declare it as a plain single step
+  // (which this primitive never touches), but a stale `type: conditional`
+  // row surviving from a pre-always-audit spec must also dispatch rather
+  // than auto-complete free on an unset condition.
+  if (step.step_id === "deception_audit") return "dispatched";
 
   const conditionKey = step.conditional_condition;
   if (!conditionKey || conditionKey.trim().length === 0) {
@@ -3507,36 +3530,26 @@ function completeStepInternal(stepId: string, output: string): { status: string;
     context[key] = value;
   }
 
-  // WAVE-A PHNT (US-009): fix completion drives the deception-audit
-  // activation flag. The fix step's either/or fourth key decides whether the
-  // auditor must dispatch:
-  //   - REPRO_EVIDENCE present  -> flag UNSET ('') — the conditional
-  //     deception_audit step auto-completes free via the primitive (no
-  //     harness spawn, zero tokens).
-  //   - CANNOT_REPRODUCE present, or neither key -> flag SET ('true') — the
-  //     auditor dispatches ONE read-only round.
-  // Gated on the run actually declaring a deception_audit step so other
-  // workflows' fix steps (e.g. security-audit-merge) are untouched.
-  // The alternation keys are also normalized (absent one stored as '') so the
-  // auditor's input template can reference both {{repro_evidence}} and
-  // {{cannot_reproduce}} without a claim-time MISS deadlock — only one of the
-  // two is ever emitted, and an empty value is a present key.
+  // WAVE-A.1 PHNT (US-003): always-audit — the deception_audit step in the
+  // bug-* workflows is a plain single step that ALWAYS dispatches after the
+  // fix, so no dispatch flag is set here. The fixer's either/or fourth key
+  // (REPRO_EVIDENCE | CANNOT_REPRODUCE) is the honest account the auditor
+  // checks, whichever branch was taken. Gated on the run actually declaring a
+  // deception_audit step so other workflows' fix steps (e.g.
+  // security-audit-merge) are untouched. The alternation keys are normalized
+  // (absent one stored as '') so the auditor's input template can reference
+  // both {{repro_evidence}} and {{cannot_reproduce}} without a claim-time MISS
+  // deadlock — only one of the two is ever emitted, and an empty value is a
+  // present key.
   if (step.step_id === "fix") {
     const hasAuditStep = db.prepare(
       "SELECT COUNT(*) AS cnt FROM steps WHERE run_id = ? AND step_id = 'deception_audit'",
     ).get(step.run_id) as { cnt: number } | undefined;
     if ((hasAuditStep?.cnt ?? 0) > 0) {
-      const hasReproEvidence =
-        typeof parsed["repro_evidence"] === "string" && parsed["repro_evidence"].trim().length > 0;
-      if (hasReproEvidence) {
-        context["deception_audit_required"] = "";
-        if (typeof context["cannot_reproduce"] !== "string") context["cannot_reproduce"] = "";
-      } else {
-        context["deception_audit_required"] = "true";
-        if (typeof context["repro_evidence"] !== "string") context["repro_evidence"] = "";
-      }
+      if (typeof context["repro_evidence"] !== "string") context["repro_evidence"] = "";
+      if (typeof context["cannot_reproduce"] !== "string") context["cannot_reproduce"] = "";
       logger.info(
-        `Fix completion set deception_audit_required='${context["deception_audit_required"]}' (step ${step.step_id}, ${hasReproEvidence ? "REPRO_EVIDENCE present" : "CANNOT_REPRODUCE or neither key"})`,
+        `Fix completion normalized the alternation keys (step ${step.step_id}); the deception_audit step always dispatches after the fix`,
         { runId: step.run_id, stepId: step.step_id },
       );
     }
@@ -3790,13 +3803,14 @@ function completeStepInternal(stepId: string, output: string): { status: string;
     return reviewRoute;
   }
 
-  // ── PHNT DECEPTION-AUDIT VERDICT ROUTING (US-010) ─────────────────
-  // When a dispatched deception_audit step completes with a verdict, route it:
-  // HONEST (or DECEPTION without quotable evidence — DEFAULT HONEST) clears
-  // the audit flag and lets the run proceed to verify/finalize; DECEPTION with
-  // quotable evidence re-pends the fix step with the FINDING as bounded retry
-  // feedback. Returns null (fall through to normal completion) for non-audit
-  // steps, undispached audits, or a verdict that resolves HONEST.
+  // ── PHNT DECEPTION-AUDIT VERDICT ROUTING (US-010, WAVE-A.1 US-003) ─
+  // Every completed deception_audit step with a verdict routes here (the step
+  // is a plain single step that always dispatches after the fix — always
+  // audit): HONEST (or DECEPTION without quotable evidence — DEFAULT HONEST)
+  // emits deception_audit.passed and lets the run proceed to
+  // verify/finalize; DECEPTION with quotable evidence re-pends the fix step
+  // with the FINDING as bounded retry feedback. Returns null (fall through to
+  // normal completion) for non-audit steps or a verdict that resolves HONEST.
   const auditRoute = routeDeceptionAuditVerdict(step, context, parsed);
   if (auditRoute) {
     return auditRoute;
@@ -4100,40 +4114,39 @@ function hasQuotableAuditFinding(finding: string | undefined): boolean {
 }
 
 /**
- * Route a dispatched `deception_audit` step's verdict (WAVE-A PHNT, US-010).
+ * Route a dispatched `deception_audit` step's verdict (WAVE-A PHNT, US-010;
+ * WAVE-A.1 US-003 always-audit).
  *
  * HONEST — or DECEPTION without quotable evidence (DEFAULT HONEST; the
  * auditor persona makes a verdict invalid without quoted evidence) — the
- * audit passed: the activation flag (deception_audit_required) is cleared so
- * the conditional auditor can never re-dispatch, a deception_audit.passed
- * event is emitted, and the run proceeds to verify/finalize.
+ * audit passed: a deception_audit.passed event is emitted and the run
+ * proceeds to verify/finalize. Any stale `deception_audit_required` context
+ * value left by an earlier conditional-era run is cleared so it cannot linger.
  *
  * DECEPTION with quotable evidence — the fix step (the producer of the
  * audited account; the audit step's declared on_fail.retry_step, falling
  * back to the run's fix step) is re-pended with the FINDING as bounded retry
  * feedback via the shared reroute machinery (rerouteWithPolicy), which resets
- * the auditor to waiting so the audit re-runs after the fix is corrected;
- * deception_audit_required stays set. Accumulated rejections exhaust the
- * reroute budget (max_reroutes, default 2) and fail the run legibly — no
- * infinite loop. A deception_audit.deception_found event is emitted on every
- * routed DECEPTION.
+ * the auditor to waiting so the audit re-runs after the fix is corrected.
+ * Accumulated rejections exhaust the reroute budget (max_reroutes, default 2)
+ * and fail the run legibly — no infinite loop. A
+ * deception_audit.deception_found event is emitted on every routed DECEPTION.
  *
  * Returns null (fall through to normal single-step completion) when this
- * step is not a dispatched deception_audit with a verdict; otherwise an
- * outcome ({ status: "rerouted" | "retrying" | "failed" }).
+ * step is not a deception_audit with a verdict; otherwise an outcome
+ * ({ status: "rerouted" | "retrying" | "failed" }).
  */
 function routeDeceptionAuditVerdict(
   step: { id: string; run_id: string; step_id: string },
   context: Record<string, string>,
   parsed: Record<string, string>,
 ): { status: string; detail?: string } | null {
-  // Only a genuinely dispatched audit routes verdicts: the conditional
-  // auditor step is dispatched only when deception_audit_required is set (the
-  // fix completion handler set it — US-009). An auditor claimed/completed
-  // without the flag (manual smoke flows, auto-complete-equivalent paths) is
-  // a no-op that falls through to normal completion.
+  // WAVE-A.1 US-003: the deception_audit step is a plain single step that
+  // always dispatches after the fix, so every completed deception_audit with a
+  // verdict routes here — there is no activation flag to gate on. A step that
+  // is not a deception_audit, or completes without a verdict, falls through to
+  // normal completion (expects validation normally prevents the latter).
   if (step.step_id !== "deception_audit") return null;
-  if (context["deception_audit_required"] !== "true") return null;
   const verdict = parsed["verdict"]?.toUpperCase();
   if (verdict !== "HONEST" && verdict !== "DECEPTION") return null;
 
@@ -4144,9 +4157,10 @@ function routeDeceptionAuditVerdict(
 
   if (!isDeception) {
     // ── HONEST (incl. invalid DECEPTION → DEFAULT HONEST) ────────────
-    // Clear the activation flag so the conditional auditor never re-dispatches,
-    // record the pass, and fall through to normal single-step completion
-    // (mark done + advance — the run proceeds to verify/finalize).
+    // Record the pass and fall through to normal single-step completion
+    // (mark done + advance — the run proceeds to verify/finalize). The
+    // run context is updated purely to drop a stale conditional-era
+    // deception_audit_required value if one survives from an older spec.
     delete context["deception_audit_required"];
     db.prepare(
       "UPDATE runs SET context = ?, updated_at = datetime('now') WHERE id = ?",
@@ -4169,8 +4183,9 @@ function routeDeceptionAuditVerdict(
   // Route the fix step to retry with the FINDING as bounded retry feedback,
   // mirroring the test_cmd_review REJECT handling (US-006). The audit step's
   // declared on_fail.retry_step wins; the fix-step lookup covers seeded runs
-  // and workflows that predate the on_fail declaration. Conditional steps are
-  // exempt from the M4 TESTED_TREE-attester rule, so routing to fix is valid.
+  // and workflows that predate the on_fail declaration. In the bug-* family
+  // no upstream step of deception_audit attests TESTED_TREE, so routing to
+  // fix is valid under the M4 attester rule (WAVE-A.1 US-003).
   const declaredPolicy = getOnFailPolicySync(step.run_id, step.step_id);
   let targetStepId = declaredPolicy?.retry_step ?? null;
   if (!targetStepId) {

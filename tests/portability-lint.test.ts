@@ -75,6 +75,9 @@ const PROC_ALLOWED = new Set([
 const GUARDED_PROC_FILES = new Set([
   "tests/mcp-lifecycle.test.ts",
   "tests/dashboard-status-mcp.test.ts",
+  // Copies dashboard-status-mcp's orphan-sweep pattern (leaked daemon/dashboard
+  // cleanup keyed on the test temp prefix via the Linux environ pseudo-file).
+  "tests/get-ready-dashboard-port.test.ts",
 ]);
 
 // ── Helpers ───────────────────────────────────────────────────────────

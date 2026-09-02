@@ -188,6 +188,12 @@ function buildFeatureBehaviors(fi: FeatureInfo): ScriptedAgentConfig {
           `REPRO_EVIDENCE: failing ${fi.funcName}() output captured on the pre-fix tree`,
         ].join("\n"),
       },
+      // WAVE-A.1 always-audit (PHNT): the plain deception_audit step
+      // dispatches a real round after EVERY fix completion — even with
+      // REPRO_EVIDENCE present. The canned HONEST verdict advances the run.
+      auditor: {
+        output: "STATUS: done\nVERDICT: HONEST",
+      },
       verifier: {
         output: [
           "STATUS: done",

@@ -19,6 +19,7 @@ import {
   stopDaemon,
   stopMcp,
 } from "../../server/daemonctl.js";
+import { resolveDashboardPort } from "../../server/dashboard-port.js";
 
 export function getGetReadyHelp(): string {
   return `tamandua get-ready — Install all bundled workflows from the source checkout
@@ -39,7 +40,8 @@ In order, it does this:
   4. If the daemon (control-plane+motor) is not running, starts it so
      workflow runs can be scheduled.
   5. If the dashboard standalone UI process is not running, starts it on
-     the default port (3334) so you can monitor workflow runs.
+     the port from the TAMANDUA_DASHBOARD_PORT environment variable
+     (default: 3334) so you can monitor workflow runs.
   6. If the MCP server is not running, starts it on the default port
      (3338).
 
@@ -113,8 +115,14 @@ export async function handleGetReady(group: string, args: string[]): Promise<boo
     // Start daemon (control-plane+motor) first
     if (!isRunning().running) { try { const r = await startDaemon(); console.log(`\nDaemon started (PID ${r.pid})`); } catch (err) { console.log(`\nNote: daemon not started: ${err instanceof Error ? err.message : String(err)} (recover: tamandua daemon start)`); } }
     else console.log("\nDaemon already running.");
-    // Start dashboard standalone independently
-    if (!isDashboardRunning().running) { try { const r = await startDashboardStandalone(3334); console.log(`Dashboard started (PID ${r.pid}): http://localhost:${r.port}`); } catch (err) { console.log(`Note: dashboard not started: ${err instanceof Error ? err.message : String(err)} (recover: tamandua dashboard start)`); } }
+    // Start dashboard standalone independently on TAMANDUA_DASHBOARD_PORT (default 3334)
+    if (!isDashboardRunning().running) {
+      try {
+        const dashPort = resolveDashboardPort(process.env.TAMANDUA_DASHBOARD_PORT);
+        const r = await startDashboardStandalone(dashPort);
+        console.log(`Dashboard started (PID ${r.pid}): http://localhost:${r.port}`);
+      } catch (err) { console.log(`Note: dashboard not started: ${err instanceof Error ? err.message : String(err)} (recover: tamandua dashboard start)`); }
+    }
     else console.log("Dashboard already running.");
     // Start MCP independently
     if (!getMcpStatus().running) { try { const r = await startMcp(); console.log(`MCP server started (PID ${r.pid}): http://localhost:${r.port}/mcp`); } catch (err) { console.log(`Note: MCP server not started: ${err instanceof Error ? err.message : String(err)} (recover: tamandua mcp start)`); } }

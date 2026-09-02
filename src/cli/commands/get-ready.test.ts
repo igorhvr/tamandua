@@ -15,6 +15,13 @@ describe("SPL2 get-ready command module", () => {
     assert.match(getUninstallHelp(), /Skip the active-runs check/);
   });
 
+  it("get-ready help documents the TAMANDUA_DASHBOARD_PORT override (not a hardcoded 3334)", () => {
+    const help = getGetReadyHelp();
+    assert.match(help, /TAMANDUA_DASHBOARD_PORT/);
+    assert.match(help, /default: 3334/);
+    assert.doesNotMatch(help, /always started on the default port/);
+  });
+
   it("declines commands owned by other command groups", async () => {
     assert.equal(await handleGetReady("doctor", ["doctor"]), false);
   });

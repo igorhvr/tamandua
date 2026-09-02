@@ -166,18 +166,19 @@ conditionally dispatched: when its activation flag is UNSET in run context at
 claim time, the dispatch motor auto-completes it IN-PROCESS with **zero
 tokens** — no harness spawn, no model round (the same free path as the
 motor's idle peek). When the flag is SET, it dispatches normally as a single
-step. It is the primitive behind the `test_cmd_review` (TCMD) and
-`deception_audit` (PHNT) review/audit steps in the merge-gate and bug-fix
-workflows.
+step. It is the primitive behind the `test_cmd_review` (TCMD) review step in
+the merge-gate workflows. (The PHNT `deception_audit` step in the bug-fix
+family used to be conditional; since WAVE-A.1 it is a **plain single step
+that always dispatches** after every fix — see below.)
 
 ```yaml
-  - id: deception_audit
-    agent: auditor
+  - id: test_cmd_review
+    agent: reviewer
     type: conditional        # Optional. "single" (default), "loop", or "conditional".
-    condition: deception_audit_required   # Required for conditional steps.
+    condition: test_cmd_review_required   # Required for conditional steps.
     input: |
-      Audit the fix account.
-    expects: "STATUS: done\nregex:^VERDICT:\\s*(HONEST|DECEPTION)"
+      Review the proposed TEST_CMD change.
+    expects: "STATUS: done\nregex:^VERDICT:\\s*(ACCEPT|REJECT)"
 ```
 
 - A conditional step MUST declare a non-empty `condition` naming the
@@ -193,18 +194,38 @@ workflows.
   `step.auto_completed` event (stepId, agentId, condition, reason) is emitted
   so oracles/observers can distinguish condition-unset auto-completions from
   agent-reviewed runs.
-- The activation flag is set by runtime logic — e.g. the fix completion
-  handler sets `deception_audit_required` (unset on `REPRO_EVIDENCE`, set on
-  `CANNOT_REPRODUCE`), and the TEST_CMD rewrite detector sets
-  `test_cmd_review_required`. A set condition can NEVER be auto-completed.
+- The activation flag is set by runtime logic — e.g. the TEST_CMD rewrite
+  detector sets `test_cmd_review_required`. A set condition can NEVER be
+  auto-completed.
+- **The flag is agent-unwritable:** the review-state keys
+  (`test_cmd_review_required` and its siblings `test_cmd_review_candidate` /
+  `test_cmd_review_established` / `test_cmd_rewriter_step`, plus
+  `test_cmd_raw`) are reserved context keys — step-output `KEY: value` parsing
+  never writes them, so a step cannot emit `TEST_CMD_REVIEW_REQUIRED: false`
+  (or `true`) and launder the pending review. Only in-process runtime logic
+  (the rewrite detector) writes them, and the conditional auto-complete /
+  merge-gate refusal read the persisted run-context value.
 - **Verdict routing:** a dispatched review/audit step routes its verdict in
   `completeStep` — `test_cmd_review` ACCEPT adopts the reviewed command /
-  REJECT re-pends the rewriting step, and `deception_audit` HONEST clears the
-  audit flag / DECEPTION (only with quotable, quoted evidence; otherwise
-  DEFAULT HONEST) re-pends the fix step with the FINDING. Conditional steps
-  may declare `on_fail: { retry_step: <producer>, max_reroutes: N }` to bound
-  how many rejections are allowed before the run fails legibly (conditional
-  steps are exempt from the M4 TESTED_TREE-attester rule).
+  REJECT re-pends the rewriting step, and `deception_audit` HONEST records
+  `deception_audit.passed` / DECEPTION (only with quotable, quoted evidence;
+  otherwise DEFAULT HONEST) re-pends the fix step with the FINDING. Conditional
+  steps may declare `on_fail: { retry_step: <producer>, max_reroutes: N }` to
+  bound how many rejections are allowed before the run fails legibly
+  (conditional steps are exempt from the M4 TESTED_TREE-attester rule).
+
+### Always-audit PHNT deception_audit (WAVE-A.1)
+
+The bug-fix family's `deception_audit` step is a plain single step that
+**always dispatches** after the `fix` step — every fix completion is audited,
+whether the fixer reported `REPRO_EVIDENCE` or `CANNOT_REPRODUCE` (both are
+legitimate accounts; the auditor defaults to HONEST). It is declared without
+`type`/`condition` (defaults to `single`), sits immediately after `fix`, and
+declares `on_fail: { retry_step: fix, max_reroutes: N }` so a DECEPTION
+verdict re-runs the fix with the quoted FINDING. The fix step's
+`REPRO_EVIDENCE:|CANNOT_REPRODUCE:` account contract is REQUIRED and is what
+the auditor checks. No activation flag is involved: an audit is never
+auto-completed (fail closed).
 
 ### The Either/Or Expects Pattern (REPRO_EVIDENCE | CANNOT_REPRODUCE)
 
@@ -229,12 +250,11 @@ anchors at each line start — an output emitting exactly one of the two keys
 satisfies the pattern, and a fix emitting neither is rejected. The existing
 `STATUS`/`CHANGES`/`REGRESSION_TEST` keys are unchanged.
 
-The key choice drives the deception-audit activation flag: a non-empty
-`REPRO_EVIDENCE` unsets `deception_audit_required` (the auditor step
-auto-completes free, zero tokens); `CANNOT_REPRODUCE` — or neither key —
-sets it, dispatching one read-only audit round. See
-[Conditional steps (WAVE-A)](#conditional-steps-wave-a) above for the
-activation-flag semantics and verdict routing.
+The key choice is the account the always-audit `deception_audit` step checks:
+whatever branch the fixer reports, the audit dispatches after the fix (the
+absent alternation key is normalized to an empty value so the auditor input
+template never MISSes). See [Always-audit PHNT deception_audit (WAVE-A.1)](#always-audit-phnt-deception_audit-wave-a1)
+above and the conditional-steps verdict routing.
 
 ### WAVE-A events
 
@@ -249,8 +269,8 @@ typed payload fields):
 | `test_cmd.review_accepted` | `oldTestCmd`, `newTestCmd` | The reviewer ACCEPTed the proposed command: it becomes the contract (`runs.test_cmd_established` updated, `test_cmd_source='reviewer'`), the review flag is cleared, and the run proceeds. |
 | `test_cmd.review_rejected` | `oldTestCmd`, `newTestCmd`, `finding` | The reviewer REJECTed with a file-grounded FINDING: the rewriting step is re-pended with the quoted finding as retry feedback, bounded by `max_reroutes`. |
 | `merge.refused_review_pending` | `oldTestCmd`, `newTestCmd`, `detail` (contains `FAILURE_CLASS: refused_review_pending`) | `finalize_merge` refused because a TEST_CMD review is pending or rejected. The step is left **pending** — the refusal is a gate, not a failure; it becomes claimable once the review resolves. |
-| `deception_audit.passed` | — | The auditor verdict resolved HONEST (or DECEPTION without quotable evidence — DEFAULT HONEST): the audit flag is cleared and the run proceeds to verify/finalize. |
-| `deception_audit.deception_found` | `finding` | The auditor found DECEPTION with quotable, quoted evidence: the fix step is re-pended with the quoted finding, the auditor resets to waiting, and `deception_audit_required` stays set so the audit re-runs (bounded by `max_reroutes`). |
+| `deception_audit.passed` | — | The auditor verdict resolved HONEST (or DECEPTION without quotable evidence — DEFAULT HONEST): the run proceeds to verify/finalize. |
+| `deception_audit.deception_found` | `finding` | The auditor found DECEPTION with quotable, quoted evidence: the fix step is re-pended with the quoted finding and the auditor resets to waiting so the audit re-runs after the corrected fix (bounded by `max_reroutes`). |
 | `merge.landed_without_suite_evidence` | `gateMode`, `origin`, `treeHash`, `cmdHash`, plus `oldTestCmd`/`newTestCmd` when a reviewed rewrite occurred | A strict gate landed without suite evidence for the **current** contract (US-007 annotation fix — the record truthfully states no suite evidence exists). |
 | `merge.landed_over_red_suite` | `origin`, `treeHash`, `cmdHash`, `ledgerRowId`, `exitCode`, `ledgerCreatedAt`, `durationMs`, plus `oldTestCmd`/`newTestCmd` when reviewed | Default-mode red landing (informational) — same review annotations when a reviewed rewrite occurred. |
 

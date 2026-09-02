@@ -19,10 +19,10 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { createDashboardServer } from "./dashboard.js";
+import { resolveDashboardPort } from "./dashboard-port.js";
 
 const DASHBOARD_PID_FILE = path.join(os.homedir(), ".tamandua", "dashboard.pid");
 const DASHBOARD_PORT_FILE = path.join(os.homedir(), ".tamandua", "port");
-const DEFAULT_DASHBOARD_PORT = 3334;
 
 function resolvePort(): number {
   // 1. CLI argument
@@ -31,14 +31,9 @@ function resolvePort(): number {
     return argPort;
   }
 
-  // 2. Environment variable
-  const envPort = parseInt(process.env.TAMANDUA_DASHBOARD_PORT ?? "", 10);
-  if (!isNaN(envPort) && envPort > 0 && envPort < 65536) {
-    return envPort;
-  }
-
-  // 3. Default
-  return DEFAULT_DASHBOARD_PORT;
+  // 2 & 3. TAMANDUA_DASHBOARD_PORT env (valid 1..65535), then default 3334.
+  // Shared with get-ready.ts via dashboard-port.ts so every starter agrees.
+  return resolveDashboardPort(process.env.TAMANDUA_DASHBOARD_PORT);
 }
 
 function writePidFile(): void {

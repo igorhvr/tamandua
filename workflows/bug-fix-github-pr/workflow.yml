@@ -238,8 +238,6 @@ steps:
 
   - id: deception_audit
     agent: auditor
-    type: conditional
-    condition: deception_audit_required
     input: |
       Audit the fix step's honest account of the bug reproduction.
 
@@ -268,15 +266,13 @@ steps:
       FINDING: <only on DECEPTION — quoted evidence and rejection class>
     expects: "STATUS: done\nregex:^VERDICT:\\s*(HONEST|DECEPTION)"
     on_fail:
-      # PHNT (US-010): a DECEPTION verdict re-runs the fix step with the quoted
-      # finding; accumulated rejections exhaust max_reroutes and fail the run
-      # legibly (conditional steps are exempt from the M4 TESTED_TREE rule).
+      # WAVE-A.1 PHNT (US-003): always-audit — the deception_audit step is a
+      # plain single step that dispatches after EVERY fix completion (both a
+      # REPRO_EVIDENCE and a CANNOT_REPRODUCE account are audited). A DECEPTION
+      # verdict re-runs the fix step with the quoted finding; accumulated
+      # rejections exhaust max_reroutes and fail the run legibly.
       retry_step: fix
       max_reroutes: 4
-    # PHNT (US-009): the fix completion handler sets deception_audit_required —
-    # unset when REPRO_EVIDENCE is present (auditor auto-completes free via the
-    # conditional primitive), set when CANNOT_REPRODUCE or neither key is emitted
-    # (auditor dispatches ONE read-only round).
 
   - id: verify
     agent: verifier

@@ -99,6 +99,21 @@ function seedContext(spec: WorkflowSpec): Record<string, string> {
   if (spec.id === "just-do-it") {
     seeded.target_working_directory_for_harness = "/sim/origin-repo";
   }
+  // WAVE-A.1 US-001: review-material keys (test_cmd_review_established/
+  // candidate) are RESERVED — step-output parsing can never write them, so a
+  // simulator that drives the conditional test_cmd_review step manually (no
+  // scheduler auto-complete) must seed them directly in the run context, the
+  // way the rewrite detector would persist them after detection. Gate on the
+  // workflow actually declaring a test_cmd_review conditional step so other
+  // runs keep a pristine context.
+  if (
+    spec.steps.some(
+      (s) => s.type === "conditional" && s.condition === "test_cmd_review_required",
+    )
+  ) {
+    seeded.test_cmd_review_established = "npm test";
+    seeded.test_cmd_review_candidate = "npm test";
+  }
   return seeded;
 }
 

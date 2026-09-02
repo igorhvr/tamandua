@@ -146,7 +146,8 @@ describe("workflow contract lint (all bundled workflows)", () => {
       "target_working_directory_for_harness",
     ];
 
-    // RESERVED_CONTEXT_KEYS from step-ops.ts
+    // RESERVED_CONTEXT_KEYS from step-ops.ts (WAVE-A.1 US-001: the TEST_CMD
+    // review-state keys are reserved/agent-unwritable structural keys)
     const reservedKeys = [
       "repo",
       "working_directory_for_harness",
@@ -158,6 +159,10 @@ describe("workflow contract lint (all bundled workflows)", () => {
       "worktree_origin_ref",
       "worktree_origin_sha",
       "original_branch",
+      "test_cmd_review_required",
+      "test_cmd_review_candidate",
+      "test_cmd_review_established",
+      "test_cmd_rewriter_step",
     ];
 
     // Union of both sets

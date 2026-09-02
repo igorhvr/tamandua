@@ -61,6 +61,15 @@ export const HARNESS_SEEDED_CONTEXT_KEYS = new Set([
   "worktree_origin_sha",
   "target_working_directory_for_harness",
   "run_id",
+  // WAVE-A.1 US-001 (TCMD): review-state keys are reserved (agent-unwritable)
+  // structural keys — they mirror RESERVED_CONTEXT_KEYS in step-ops.ts so the
+  // workflow-contract lint treats them as always available to step templates
+  // without demanding an upstream producer (they are written only by the
+  // in-process rewrite detector).
+  "test_cmd_review_required",
+  "test_cmd_review_candidate",
+  "test_cmd_review_established",
+  "test_cmd_rewriter_step",
 ]);
 
 // ══════════════════════════════════════════════════════════════════════

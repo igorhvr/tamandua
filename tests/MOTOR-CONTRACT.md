@@ -302,9 +302,11 @@ resume attempt.
 Pinned by `tests/deterministic-motor-acceptance.test.ts` (in-process
 dispatch rounds with an instrumented fake pi; N4/N5 exercise the real
 `executeDispatchRound` sweep with a pending conditional step) and by the
-scripted e2e baseline assertions (the conditional `test_cmd_review` /
-`deception_audit` steps auto-complete free on the unset-condition paths —
-zero invocations, zero tokens).
+scripted e2e baseline assertions. Since WAVE-A.1 (always audit), only the
+conditional `test_cmd_review` step auto-completes free on the unset-condition
+path — zero invocations, zero tokens; the PHNT `deception_audit` step is a
+plain single step that always dispatches a real (read-only) audit round after
+every bug-fix completion, including when the fixer reported REPRO_EVIDENCE.
 
 ### Failure & recovery
 

@@ -933,23 +933,39 @@ describe("US-010: Create remaining worktree workflow variants", () => {
       const path = resolve(wfDir(id), "agents/reviewer/AGENTS.md");
       assert.ok(existsSync(path), `${id}: reviewer AGENTS.md must exist`);
       const content = readFileSync(path, "utf-8");
-      // Approved checklist elements (triage-decisions-2026-09-01).
+      // US-006: the reviewer persona is the approved TCMD prompt
+      // (WAVE-A-approved-prompts.md section 2) adopted verbatim between marker
+      // comments; token greps track the verbatim headings/classes.
       for (const element of [
-        "Existence", "Coverage", "Narrowing-justification", "Task-relevance", "Equivalence",
-        "DEFAULT ACCEPT", "file-grounded", "unjustified-narrowing", "task-evasion", "contradicted-justification",
+        "TEST-COMMAND REWRITE REVIEWER", "EXISTENCE & RUNNABILITY", "COVERAGE COMPARISON",
+        "NARROWING JUSTIFICATION", "RELEVANCE TO THE TASK", "EQUIVALENCE FAST-PATH",
+        "Default to ACCEPT", "file-grounded", "unjustified-narrowing", "task-evasion",
+        "contradicted-justification", "READ ONLY",
       ]) {
         assert.ok(content.includes(element), `${id}: reviewer AGENTS.md must contain checklist element "${element}"`);
       }
-      // No write/execute instructions anywhere in the persona (grep-verifiable).
+      // US-006: the verbatim section-2 prompt body sits between marker
+      // comments and is drift-checked word-for-word against the pinned prompt
+      // by tests/persona-verbatim-drift.test.ts — that pinned text legitimately
+      // names example commands under review ("npm test", "./run-all-tests") and
+      // is not authored persona prose. The write/execute-instruction scan
+      // therefore covers the authored prose OUTSIDE the pinned region only.
+      const beginMarker = "<!-- WAVE-A-APPROVED-PROMPT-S2-BEGIN -->";
+      const endMarker = "<!-- WAVE-A-APPROVED-PROMPT-S2-END -->";
+      const begin = content.indexOf(beginMarker);
+      const end = content.indexOf(endMarker);
+      assert.ok(begin >= 0 && end > begin, `${id}: reviewer AGENTS.md must delimit the pinned section-2 region`);
+      const authoredProse = content.slice(0, begin) + "\n" + content.slice(end + endMarker.length);
+      // No write/execute instructions in the authored prose (grep-verifiable).
       // Prohibitions ("You NEVER run the test suite") are allowed; imperative
       // write/execute instructions are not. Drop prohibition lines first so a
       // "never stage / commit" warning is not mistaken for an instruction.
-      const instructionLines = content
+      const instructionLines = authoredProse
         .split(/\r?\n/)
         .filter((line) => !/(?:^|[\s(])(?:never|do not|don'?t|must not|not)\b/i.test(line));
       assert.doesNotMatch(instructionLines.join("\n"),
         /git commit|git push|git add|git rebase|git merge|git apply|npm test|npm run|npm install|pnpm |yarn |pip install|run (the|your) (test|build)|write (a|the|code|files?)|create (a|the)? ?(file|function|test)|apply (a )?patch/gi,
-        `${id}: reviewer AGENTS.md must not contain write/execute instructions`);
+        `${id}: reviewer AGENTS.md authored prose must not contain write/execute instructions`);
       // READ-ONLY contract declared.
       assert.match(content, /READ-ONLY/i, `${id}: reviewer AGENTS.md must declare the read-only contract`);
     }
@@ -966,7 +982,8 @@ describe("US-010: Create remaining worktree workflow variants", () => {
     }
   });
 
-  // ── US-009: PHNT deception auditor agent + deception_audit conditional step ──
+  // ── US-009: PHNT deception auditor agent + deception_audit step (WAVE-A.1
+  //    US-003: always-audit — no longer type conditional, always dispatches) ──
   const phntAuditWorkflowIds = [
     "bug-fix",
     "bug-fix-worktree",
@@ -987,7 +1004,7 @@ describe("US-010: Create remaining worktree workflow variants", () => {
       assert.match(desc, /read-only/i, `${id}: auditor description must declare read-only`);
     });
 
-    it(`${id} declares a deception_audit conditional step placed after fix`, async () => {
+    it(`${id} declares an always-dispatch deception_audit single step placed after fix`, async () => {
       const spec = await loadWorkflowSpec(wfDir(id));
       const stepIds = spec.steps.map((s) => s.id);
       const fixIdx = stepIds.indexOf("fix");
@@ -997,8 +1014,15 @@ describe("US-010: Create remaining worktree workflow variants", () => {
       assert.equal(auditIdx, fixIdx + 1, `${id}: deception_audit must sit immediately after fix`);
 
       const auditStep = spec.steps[auditIdx];
-      assert.equal(auditStep.type, "conditional", `${id}: deception_audit must be type conditional`);
-      assert.equal(auditStep.condition, "deception_audit_required", `${id}: deception_audit condition`);
+      // WAVE-A.1 US-003 (always audit): deception_audit is a plain single
+      // step (no type declared → defaults to "single") that dispatches after
+      // every fix completion — it must NOT be type conditional and must NOT
+      // declare a condition.
+      assert.ok(
+        auditStep.type === undefined || auditStep.type === "single",
+        `${id}: deception_audit must be a plain single step, got type "${String(auditStep.type)}"`,
+      );
+      assert.equal(auditStep.condition, undefined, `${id}: deception_audit must not declare a condition`);
       assert.equal(auditStep.agent, "auditor", `${id}: deception_audit agent`);
       // Reply-with contract: STATUS: done + VERDICT: HONEST|DECEPTION (+ FINDING on DECEPTION).
       assert.match(auditStep.input, /Reply with:\s*\n\s*STATUS: done/m);
@@ -1034,11 +1058,14 @@ describe("US-010: Create remaining worktree workflow variants", () => {
       const path = resolve(wfDir(id), "agents/auditor/AGENTS.md");
       assert.ok(existsSync(path), `${id}: auditor AGENTS.md must exist`);
       const content = readFileSync(path, "utf-8");
-      // Approved checklist elements (phnt-design-state).
+      // Approved checklist elements — the persona is the pinned PHNT prompt
+      // (WAVE-A-approved-prompts.md §1 with the WAVE-A.1 always-audit
+      // activation, US-005); token greps track the verbatim headings/classes.
       for (const element of [
-        "Premise-fabrication", "Symptom-silencing", "Claim-mismatch", "Mechanism-plausibility",
-        "DEFAULT HONEST", "quotable", "premise-fabrication", "symptom-silencing",
-        "claim-mismatch", "no-mechanism", "deception-only", "DECEPTION ONLY",
+        "INTENTIONAL DECEPTION", "PREMISE FABRICATION", "SYMPTOM SILENCING DRESSED AS A FIX",
+        "CLAIM/ARTIFACT MISMATCH", "MECHANISM PLAUSIBILITY", "Default to HONEST",
+        "quotable", "premise-fabrication", "symptom-silencing",
+        "claim-mismatch", "no-mechanism", "READ ONLY",
       ]) {
         assert.ok(content.includes(element), `${id}: auditor AGENTS.md must contain checklist element "${element}"`);
       }

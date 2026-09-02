@@ -52,6 +52,15 @@ interface CannedWorkflow {
   task: string;
   worktree: boolean;
   steps: CannedStep[];
+  /**
+   * WAVE-A.1 US-001: when true, the run is launched with the review material
+   * keys (test_cmd_review_established/candidate) seeded directly into the run
+   * context at creation. These keys are RESERVED (agent-unwritable), so the
+   * canned step outputs can no longer feed them; a scheduler-less manual
+   * corridor that drives the conditional test_cmd_review step needs them in
+   * context to resolve the review step's input template.
+   */
+  reviewMaterialSeeds?: boolean;
 }
 
 async function runCannedWorkflow(workflow: CannedWorkflow): Promise<void> {
@@ -77,6 +86,14 @@ async function runCannedWorkflow(workflow: CannedWorkflow): Promise<void> {
       "--context",
       `branch=smoke/${workflow.id}`,
     ];
+    if (workflow.reviewMaterialSeeds) {
+      runArgs.push(
+        "--context",
+        "test_cmd_review_established=npm test",
+        "--context",
+        "test_cmd_review_candidate=npm test",
+      );
+    }
     if (workflow.worktree) {
       runArgs.push("--worktree-origin-repository", repoDir);
     }
@@ -258,6 +275,15 @@ describe("workflows smoke (state-machine integration)", { concurrency: 1 }, () =
             "Add a multiply function to math.ts",
             "--worktree-origin-repository",
             repoDir,
+            // WAVE-A.1 US-001: review material keys are reserved (agent-
+            // unwritable), so this scheduler-less manual corridor seeds them
+            // into the run context directly at run creation — mirroring what
+            // the rewrite detector would persist after a detection. The
+            // conditional review step is then claimed manually below.
+            "--context",
+            "test_cmd_review_established=npm test",
+            "--context",
+            "test_cmd_review_candidate=npm test",
           ],
           be(),
         );
@@ -349,13 +375,7 @@ describe("workflows smoke (state-machine integration)", { concurrency: 1 }, () =
           testStep.stepId,
           "STATUS: done\n" +
             "RESULTS: Full test suite passes, integration verified\n" +
-            "TESTED_TREE: abc123deadbeef\n" +
-            // Review material (US-005): the smoke test drives the conditional
-            // reviewer step manually, so the step-ops MISS machinery must find
-            // the review keys in context — mirroring what a real rewrite
-            // detection would persist.
-            "TEST_CMD_REVIEW_ESTABLISHED: npm test\n" +
-            "TEST_CMD_REVIEW_CANDIDATE: npm test\n",
+            "TESTED_TREE: abc123deadbeef\n",
           be(),
         );
         assert.equal(testResult.status, "advanced");
@@ -436,6 +456,14 @@ describe("workflows smoke (state-machine integration)", { concurrency: 1 }, () =
             "The add function in src/math.ts returns a - b instead of a + b",
             "--worktree-origin-repository",
             repoDir,
+            // WAVE-A.1 US-001: review material keys are reserved (agent-
+            // unwritable), so this scheduler-less manual corridor seeds them
+            // into the run context directly at run creation — mirroring what
+            // the rewrite detector would persist after a detection.
+            "--context",
+            "test_cmd_review_established=npm test",
+            "--context",
+            "test_cmd_review_candidate=npm test",
           ],
           be(),
         );
@@ -510,10 +538,10 @@ describe("workflows smoke (state-machine integration)", { concurrency: 1 }, () =
         );
         assert.equal(fixResult.status, "advanced");
 
-        // Step: deception_audit (auditor, conditional — REPRO_EVIDENCE was
-        // emitted so the activation flag is unset and the step is claimed
-        // manually in this scheduler-less smoke flow; the auditor would
-        // otherwise auto-complete free via the motor)
+        // Step: deception_audit (auditor — WAVE-A.1 always-audit: the plain
+        // step dispatches after EVERY fix completion, even when the fixer
+        // reported REPRO_EVIDENCE; it is never auto-completed. This
+        // scheduler-less smoke flow claims it manually and returns HONEST.)
         const audit = stepClaim(
           "bug-fix-merge-worktree_auditor",
           runId,
@@ -537,13 +565,7 @@ describe("workflows smoke (state-machine integration)", { concurrency: 1 }, () =
           verify.stepId,
           "STATUS: done\n" +
             "VERIFIED: Fix correct — add now returns a + b, regression test passes, all tests pass\n" +
-            "TESTED_TREE: scripted-smoke-tree\n" +
-            // Review material (US-005): the smoke test drives the conditional
-            // reviewer step manually, so the step-ops MISS machinery must find
-            // the review keys in context — mirroring what a real rewrite
-            // detection would persist.
-            "TEST_CMD_REVIEW_ESTABLISHED: npm test\n" +
-            "TEST_CMD_REVIEW_CANDIDATE: npm test\n",
+            "TESTED_TREE: scripted-smoke-tree\n",
           be(),
         );
         assert.equal(verifyResult.status, "advanced");
@@ -642,12 +664,7 @@ describe("workflows smoke (state-machine integration)", { concurrency: 1 }, () =
       output: () =>
         "STATUS: done\n" +
         "VERIFIED: fix and regression test pass\n" +
-        "TESTED_TREE: bug-fix-smoke-tree\n" +
-        // Review material (US-005): the smoke test drives the conditional
-        // reviewer step manually, so the step-ops MISS machinery must find
-        // the review keys in context.
-        "TEST_CMD_REVIEW_ESTABLISHED: npm test\n" +
-        "TEST_CMD_REVIEW_CANDIDATE: npm test\n",
+        "TESTED_TREE: bug-fix-smoke-tree\n",
     },
     {
       agent: "reviewer",
@@ -737,12 +754,7 @@ describe("workflows smoke (state-machine integration)", { concurrency: 1 }, () =
         "STATUS: done\n" +
         "RESULTS: full suite and audit pass\n" +
         "TESTED_TREE: security-smoke-tree\n" +
-        "AUDIT_AFTER: no remaining findings\n" +
-        // Review material (US-005): the smoke test drives the conditional
-        // reviewer step manually, so the step-ops MISS machinery must find
-        // the review keys in context.
-        "TEST_CMD_REVIEW_ESTABLISHED: npm test\n" +
-        "TEST_CMD_REVIEW_CANDIDATE: npm test\n",
+        "AUDIT_AFTER: no remaining findings\n",
     },
     {
       agent: "reviewer",
@@ -760,6 +772,8 @@ describe("workflows smoke (state-machine integration)", { concurrency: 1 }, () =
       task: "Fix the add function",
       worktree: false,
       steps: bugFixSteps,
+      // bug-fix-merge declares a test_cmd_review conditional step.
+      reviewMaterialSeeds: true,
     },
     {
       id: "quarantine-broken-tests-merge",
@@ -778,12 +792,16 @@ describe("workflows smoke (state-machine integration)", { concurrency: 1 }, () =
       task: "Audit and fix security vulnerabilities",
       worktree: false,
       steps: securitySteps,
+      // security-audit-merge declares a test_cmd_review conditional step.
+      reviewMaterialSeeds: true,
     },
     {
       id: "security-audit-merge-worktree",
       task: "Audit and fix security vulnerabilities",
       worktree: true,
       steps: securitySteps,
+      // security-audit-merge-worktree declares a test_cmd_review conditional step.
+      reviewMaterialSeeds: true,
     },
   ];
 

@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { after, afterEach, beforeEach, describe, it } from "node:test";
 
-import { getDb } from "../../dist/db.js";
+import { getDb, closeDb } from "../../dist/db.js";
 import {
   claimStep,
   stepCurrent,
@@ -301,6 +301,7 @@ describe("autoCompleteConditionalStep — zero-token conditional auto-complete (
     status?: string;
     stepIndex?: number;
     agentId?: string;
+    stepId?: string;
   } = {}): { runId: string; stepDbId: string } {
     const db = getDb();
     const runId = crypto.randomUUID();
@@ -312,10 +313,11 @@ describe("autoCompleteConditionalStep — zero-token conditional auto-complete (
     ).run(runId, JSON.stringify(overrides.runContext ?? {}), now, now);
     db.prepare(
       `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, conditional_condition, created_at, updated_at)
-       VALUES (?, ?, 'review', ?, ?, 'Review', 'VERDICT: ACCEPT', ?, 0, 4, 'conditional', ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, 'Review', 'VERDICT: ACCEPT', ?, 0, 4, 'conditional', ?, ?, ?)`,
     ).run(
       stepDbId,
       runId,
+      overrides.stepId ?? "review",
       overrides.agentId ?? "test-wf_dev",
       overrides.stepIndex ?? 0,
       overrides.status ?? "pending",
@@ -486,6 +488,33 @@ describe("autoCompleteConditionalStep — zero-token conditional auto-complete (
     };
     assert.equal(row.status, "pending");
     assert.equal(row.auto_completed, 0);
+  });
+
+  it("fail-closed (WAVE-A.1 US-003 always audit): a legacy conditional deception_audit row is never auto-completed", () => {
+    // New bug-* runs declare deception_audit as a plain single step, but a
+    // stale `type: conditional` row surviving from a pre-always-audit spec
+    // must dispatch a real audit round even when its condition is UNSET —
+    // an audit is never auto-completed (fail closed).
+    const { runId, stepDbId } = seedConditionalStep({
+      stepId: "deception_audit",
+      conditionKey: "deception_audit_required",
+      runContext: {}, // condition unset — would auto-complete any other step
+    });
+
+    assert.equal(autoCompleteConditionalStep(runId, "test-wf_dev"), "dispatched",
+      "a deception_audit step must dispatch, never auto-complete");
+
+    const db = getDb();
+    const row = db.prepare(
+      "SELECT status, auto_completed, auto_complete_reason FROM steps WHERE id = ?",
+    ).get(stepDbId) as { status: string; auto_completed: number; auto_complete_reason: string | null };
+    assert.equal(row.status, "pending", "the auditor must stay pending for a real dispatch");
+    assert.equal(row.auto_completed, 0, "no auto-complete marker");
+    assert.equal(row.auto_complete_reason, null);
+
+    const events = getRunEvents(runId);
+    assert.equal(events.filter((e) => e.event === "step.auto_completed").length, 0,
+      "no step.auto_completed for the auditor");
   });
 
   it("does not auto-complete a pending conditional step with an incomplete upstream step (serial order)", () => {
@@ -1479,11 +1508,14 @@ describe("finalize_merge gate coupling with TEST_CMD review (US-007)", () => {
 });
 
 // ══════════════════════════════════════════════════════════════════════
-// WAVE-A PHNT US-009: fix completion drives deception_audit_required +
-// alternation-key normalization for the deception-audit conditional step
+// WAVE-A PHNT US-009 + WAVE-A.1 US-003 (always audit): the bug-*
+// deception_audit step is a plain single step that ALWAYS dispatches after
+// the fix — the fix-completion handler sets NO dispatch flag; it only
+// normalizes the REPRO_EVIDENCE/CANNOT_REPRODUCE alternation keys so the
+// auditor input template never MISSes on the absent key.
 // ══════════════════════════════════════════════════════════════════════
 
-describe("fix completion sets deception_audit_required (US-009)", () => {
+describe("fix completion always-audit normalization (WAVE-A.1 US-003)", () => {
   let tempHome: string;
   let stateDir: string;
   let dbPath: string;
@@ -1526,9 +1558,17 @@ describe("fix completion sets deception_audit_required (US-009)", () => {
     "VERDICT: HONEST|DECEPTION",
   ].join("\n");
 
-  /** Seed a run with a fix step (index 0) + optional deception_audit + verify. */
+  /**
+   * Seed a run with a fix step (index 0) + optional deception_audit + verify.
+   * The deception_audit step is a plain single step (conditional_condition
+   * NULL) — under always-audit there is no conditional primitive for it.
+   * `fixExpects` overrides the fix step's expects (defaults to the real
+   * alternation contract) so handler-level corridors can exercise outputs the
+   * real contract would reject (e.g. neither alternation key).
+   */
   function seedFixRun(overrides: {
     withAuditStep?: boolean;
+    fixExpects?: string;
     runContext?: Record<string, string>;
   }): { runId: string; fixDbId: string; auditDbId?: string } {
     const db = getDb();
@@ -1543,11 +1583,11 @@ describe("fix completion sets deception_audit_required (US-009)", () => {
     db.prepare(
       `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, conditional_condition, created_at, updated_at)
        VALUES (?, ?, 'fix', 'test-wf_fixer', 0, 'Implement the fix', ?, 'pending', 0, 4, 'single', NULL, ?, ?)`,
-    ).run(fixDbId, runId, FIX_EXPECTS, now, now);
+    ).run(fixDbId, runId, overrides.fixExpects ?? FIX_EXPECTS, now, now);
     if (overrides.withAuditStep ?? true) {
       db.prepare(
         `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, conditional_condition, created_at, updated_at)
-         VALUES (?, ?, 'deception_audit', 'test-wf_auditor', 1, ?, 'STATUS: done\nregex:^VERDICT:\\s*(HONEST|DECEPTION)', 'waiting', 0, 4, 'conditional', 'deception_audit_required', ?, ?)`,
+         VALUES (?, ?, 'deception_audit', 'test-wf_auditor', 1, ?, 'STATUS: done\nregex:^VERDICT:\\s*(HONEST|DECEPTION)', 'waiting', 0, 4, 'single', NULL, ?, ?)`,
       ).run(auditDbId, runId, AUDITOR_INPUT, now, now);
       db.prepare(
         `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, conditional_condition, created_at, updated_at)
@@ -1563,7 +1603,7 @@ describe("fix completion sets deception_audit_required (US-009)", () => {
     return JSON.parse(row.context) as Record<string, string>;
   }
 
-  it("REPRO_EVIDENCE present -> deception_audit_required unset (''), cannot_reproduce normalized to ''", () => {
+  it("REPRO_EVIDENCE present -> no deception_audit_required flag is set; cannot_reproduce normalized to ''", () => {
     const { runId, fixDbId } = seedFixRun({});
     const claim = claimStep("test-wf_fixer", runId);
     assert.equal(claim.found, true);
@@ -1572,12 +1612,13 @@ describe("fix completion sets deception_audit_required (US-009)", () => {
     assert.ok(result.status === "advanced" || result.status === "completed", `got ${result.status}`);
 
     const context = readContext(runId);
-    assert.equal(context.deception_audit_required, "", "REPRO_EVIDENCE must leave the flag UNSET");
+    assert.ok(!("deception_audit_required" in context),
+      "always-audit: fix completion must never set deception_audit_required");
     assert.equal(context.repro_evidence, "failing add(2,3) output on pre-fix tree");
     assert.equal(context.cannot_reproduce, "", "the absent alternation key must normalize to '' (no MISS deadlock)");
   });
 
-  it("CANNOT_REPRODUCE present -> deception_audit_required set ('true'), repro_evidence normalized to ''", () => {
+  it("CANNOT_REPRODUCE present -> no deception_audit_required flag is set; repro_evidence normalized to ''", () => {
     const { runId, fixDbId } = seedFixRun({});
     const claim = claimStep("test-wf_fixer", runId);
     assert.equal(claim.found, true);
@@ -1586,12 +1627,13 @@ describe("fix completion sets deception_audit_required (US-009)", () => {
     assert.ok(result.status === "advanced" || result.status === "completed", `got ${result.status}`);
 
     const context = readContext(runId);
-    assert.equal(context.deception_audit_required, "true", "CANNOT_REPRODUCE must SET the flag (auditor dispatches)");
+    assert.ok(!("deception_audit_required" in context),
+      "always-audit: fix completion must never set deception_audit_required");
     assert.equal(context.cannot_reproduce, "flaky env, failure not reproducible locally");
     assert.equal(context.repro_evidence, "", "the absent alternation key must normalize to '' (no MISS deadlock)");
   });
 
-  it("does not touch the flag for a fix step in a run without a deception_audit step", () => {
+  it("does not touch a fix step in a run without a deception_audit step (no flag, no normalization)", () => {
     const { runId, fixDbId } = seedFixRun({ withAuditStep: false });
     const claim = claimStep("test-wf_fixer", runId);
     assert.equal(claim.found, true);
@@ -1601,49 +1643,104 @@ describe("fix completion sets deception_audit_required (US-009)", () => {
 
     const context = readContext(runId);
     assert.ok(!("deception_audit_required" in context), "no deception_audit step -> no flag (gated)");
+    assert.ok(!("cannot_reproduce" in context),
+      "no deception_audit step -> alternation normalization must not run (absent key stays absent)");
+    assert.equal(context.repro_evidence, "failing output pointer", "the emitted key still merges normally");
   });
 
-  it("REPRO_EVIDENCE path: autoCompleteConditionalStep returns 'auto_completed' with reason condition_unset:deception_audit_required", () => {
-    const { runId, fixDbId } = seedFixRun({});
-    claimStep("test-wf_fixer", runId);
-    completeStep(fixDbId,
+  it("REPRO_EVIDENCE path: the auditor stays pending and dispatches — never auto-completed (AC2)", () => {
+    const { runId, fixDbId, auditDbId } = seedFixRun({});
+    const claimFix = claimStep("test-wf_fixer", runId);
+    assert.equal(claimFix.found, true);
+    const fixResult = completeStep(fixDbId,
       "STATUS: done\nCHANGES: fixed add\nREGRESSION_TEST: added test\nREPRO_EVIDENCE: failing add(2,3) output on pre-fix tree");
-
-    const outcome = autoCompleteConditionalStep(runId, "test-wf_auditor");
-    assert.equal(outcome, "auto_completed", "unset flag must auto-complete the auditor free");
+    assert.ok(fixResult.status === "advanced" || fixResult.status === "completed", `fix got ${fixResult.status}`);
 
     const db = getDb();
     const row = db.prepare(
-      "SELECT status, auto_completed, auto_complete_reason FROM steps WHERE run_id = ? AND step_id = 'deception_audit'",
-    ).get(runId) as { status: string; auto_completed: number; auto_complete_reason: string | null };
-    assert.equal(row.status, "done");
-    assert.equal(row.auto_completed, 1);
-    assert.equal(row.auto_complete_reason, "condition_unset:deception_audit_required");
+      "SELECT status, type, conditional_condition, auto_completed, auto_complete_reason FROM steps WHERE id = ?",
+    ).get(auditDbId) as {
+      status: string; type: string; conditional_condition: string | null;
+      auto_completed: number; auto_complete_reason: string | null;
+    };
+    assert.equal(row.type, "single", "deception_audit must be a plain single step (no conditional primitive)");
+    assert.equal(row.status, "pending", "REPRO_EVIDENCE must leave the auditor pending for dispatch (no auto_completed)");
+    assert.equal(row.auto_completed, 0, "the auditor must never auto-complete");
+    assert.equal(row.auto_complete_reason, null);
 
-    const events = getRunEvents(runId).filter((e) => e.event === "step.auto_completed");
-    assert.equal(events.length, 1);
-    assert.equal(events[0].stepId, "deception_audit");
-    assert.equal(events[0].condition, "deception_audit_required");
+    // The motor's conditional sweep finds no conditional step under always-audit
+    // → outcome 'none' → the motor falls through to a real harness round.
+    const outcome = autoCompleteConditionalStep(runId, "test-wf_auditor");
+    assert.equal(outcome, "none", "no conditional step -> no condition_unset:deception_audit_required auto-complete");
+
+    // A real round claims + completes the auditor; the verdict routes.
+    const claim = claimStep("test-wf_auditor", runId);
+    assert.equal(claim.found, true, "the auditor must be claimable after a REPRO_EVIDENCE fix (AC2)");
+    const result = completeStep(claim.stepId, "STATUS: done\nVERDICT: HONEST");
+    assert.ok(result.status === "advanced" || result.status === "completed", `got ${result.status}`);
+
+    const events = getRunEvents(runId);
+    assert.ok(!events.some((e) => e.event === "step.auto_completed"),
+      "no step.auto_completed — the audit was a real dispatch, not a condition_unset auto-complete");
+    assert.equal(events.filter((e) => e.event === "deception_audit.passed").length, 1,
+      "the HONEST verdict must emit deception_audit.passed exactly once");
   });
 
-  it("CANNOT_REPRODUCE path: the flag is SET so the auditor dispatches (never auto-completed)", () => {
-    const { runId, fixDbId } = seedFixRun({});
+  it("CANNOT_REPRODUCE path: the auditor dispatches exactly once — never auto-completed (AC3)", () => {
+    const { runId, fixDbId, auditDbId } = seedFixRun({});
     claimStep("test-wf_fixer", runId);
     completeStep(fixDbId,
       "STATUS: done\nCHANGES: fixed add\nREGRESSION_TEST: added test\nCANNOT_REPRODUCE: flaky env");
 
-    const outcome = autoCompleteConditionalStep(runId, "test-wf_auditor");
-    assert.equal(outcome, "dispatched", "a SET flag must dispatch, never auto-complete (fail-closed)");
-
     const db = getDb();
     const row = db.prepare(
-      "SELECT status, auto_completed FROM steps WHERE run_id = ? AND step_id = 'deception_audit'",
-    ).get(runId) as { status: string; auto_completed: number };
-    assert.equal(row.status, "pending", "the auditor step must stay pending for dispatch");
-    assert.equal(row.auto_completed, 0);
+      "SELECT status, auto_completed FROM steps WHERE id = ?",
+    ).get(auditDbId) as { status: string; auto_completed: number };
+    assert.equal(row.status, "pending", "the auditor must be pending for dispatch");
+    assert.equal(row.auto_completed, 0, "the auditor must never auto-complete");
+    const outcome = autoCompleteConditionalStep(runId, "test-wf_auditor");
+    assert.equal(outcome, "none", "no conditional step -> the motor dispatches a real round");
+
+    // Exactly one dispatch round claims the auditor (AC3).
+    const claim = claimStep("test-wf_auditor", runId);
+    assert.equal(claim.found, true);
+    const result = completeStep(claim.stepId, "STATUS: done\nVERDICT: HONEST");
+    assert.ok(result.status === "advanced" || result.status === "completed", `got ${result.status}`);
+    const events = getRunEvents(runId);
+    assert.ok(!events.some((e) => e.event === "step.auto_completed"),
+      "the CANNOT_REPRODUCE auditor round must never auto-complete");
+    assert.equal(events.filter((e) => e.event === "deception_audit.passed").length, 1,
+      "exactly one deception_audit.passed");
   });
 
-  it("CANNOT_REPRODUCE path: the auditor claims cleanly (no MISS on the normalized alternation keys)", () => {
+  it("neither alternation key present: both normalized to '' and the auditor still dispatches (AC3)", () => {
+    // Handler-level corridor: with an unenforced fix expects, an output that
+    // carries neither REPRO_EVIDENCE nor CANNOT_REPRODUCE still dispatches the
+    // auditor (always audit) and the template renders both keys as ''.
+    const { runId, fixDbId, auditDbId } = seedFixRun({ fixExpects: "STATUS: done" });
+    claimStep("test-wf_fixer", runId);
+    const fixResult = completeStep(fixDbId,
+      "STATUS: done\nCHANGES: fixed add\nREGRESSION_TEST: added test");
+    assert.ok(fixResult.status === "advanced" || fixResult.status === "completed", `got ${fixResult.status}`);
+
+    const context = readContext(runId);
+    assert.equal(context.repro_evidence, "", "neither key -> repro_evidence normalized to ''");
+    assert.equal(context.cannot_reproduce, "", "neither key -> cannot_reproduce normalized to ''");
+    assert.ok(!("deception_audit_required" in context), "never a dispatch flag");
+
+    const claim = claimStep("test-wf_auditor", runId);
+    assert.equal(claim.found, true, "neither-key fix must still dispatch the auditor exactly once");
+    assert.ok(claim.resolvedInput?.includes("REPRO_EVIDENCE: "), "input must render the normalized empty key");
+    assert.ok(claim.resolvedInput?.includes("CANNOT_REPRODUCE: "), "input must render the normalized empty key");
+    const result = completeStep(claim.stepId, "STATUS: done\nVERDICT: HONEST");
+    assert.ok(result.status === "advanced" || result.status === "completed", `got ${result.status}`);
+    const events = getRunEvents(runId);
+    assert.ok(!events.some((e) => e.event === "step.auto_completed"), "never auto-completed");
+    assert.equal(events.filter((e) => e.event === "deception_audit.passed").length, 1,
+      "exactly one deception_audit.passed");
+  });
+
+  it("the auditor claims cleanly after a CANNOT_REPRODUCE fix (no MISS on the normalized alternation keys)", () => {
     const { runId, fixDbId } = seedFixRun({});
     claimStep("test-wf_fixer", runId);
     completeStep(fixDbId,
@@ -1659,7 +1756,7 @@ describe("fix completion sets deception_audit_required (US-009)", () => {
   });
 });
 
-describe("deception_audit verdict routing (US-010)", () => {
+describe("deception_audit verdict routing (US-010 / always-audit)", () => {
   let tempHome: string;
   let stateDir: string;
   let dbPath: string;
@@ -1703,8 +1800,10 @@ describe("deception_audit verdict routing (US-010)", () => {
   ].join("\n");
   const CANNOT_REPRODUCE_FIX =
     "STATUS: done\nCHANGES: fixed add\nREGRESSION_TEST: added test\nCANNOT_REPRODUCE: flaky env";
+  const REPRO_EVIDENCE_FIX =
+    "STATUS: done\nCHANGES: fixed add\nREGRESSION_TEST: added test\nREPRO_EVIDENCE: failing add(2,3) output on pre-fix tree";
 
-  /** Seed a run with fix (0) + deception_audit (1, conditional) + verify (2). */
+  /** Seed a run with fix (0) + deception_audit (1, plain single) + verify (2). */
   function seedAuditRun(overrides: {
     auditorRerouteCount?: number;
   } = {}): { runId: string; fixDbId: string; auditDbId: string; verifyDbId: string } {
@@ -1723,7 +1822,7 @@ describe("deception_audit verdict routing (US-010)", () => {
     ).run(fixDbId, runId, "Implement the fix\nRETRY FEEDBACK:\n{{retry_feedback}}", FIX_EXPECTS, now, now);
     db.prepare(
       `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, conditional_condition, reroute_count, created_at, updated_at)
-       VALUES (?, ?, 'deception_audit', 'test-wf_auditor', 1, ?, 'STATUS: done\nregex:^VERDICT:\\s*(HONEST|DECEPTION)', 'waiting', 0, 4, 'conditional', 'deception_audit_required', ?, ?, ?)`,
+       VALUES (?, ?, 'deception_audit', 'test-wf_auditor', 1, ?, 'STATUS: done\nregex:^VERDICT:\\s*(HONEST|DECEPTION)', 'waiting', 0, 4, 'single', NULL, ?, ?, ?)`,
     ).run(auditDbId, runId, AUDITOR_INPUT, overrides.auditorRerouteCount ?? 0, now, now);
     db.prepare(
       `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, conditional_condition, created_at, updated_at)
@@ -1732,7 +1831,7 @@ describe("deception_audit verdict routing (US-010)", () => {
     return { runId, fixDbId, auditDbId, verifyDbId };
   }
 
-  /** Complete the fix (which sets deception_audit_required) then claim the auditor. */
+  /** Complete the fix then claim the auditor (the plain single step always dispatches). */
   function completeFixThenClaimAuditor(runId: string, fixDbId: string, fixOutput: string): void {
     const claimFix = claimStep("test-wf_fixer", runId);
     assert.equal(claimFix.found, true);
@@ -1740,7 +1839,7 @@ describe("deception_audit verdict routing (US-010)", () => {
     assert.ok(fixResult.status === "advanced" || fixResult.status === "completed",
       `fix completion got ${fixResult.status}`);
     const claimAudit = claimStep("test-wf_auditor", runId);
-    assert.equal(claimAudit.found, true, "the dispatched auditor must be claimable");
+    assert.equal(claimAudit.found, true, "the always-dispatch auditor must be claimable");
   }
 
   function readContext(runId: string): Record<string, string> {
@@ -1749,7 +1848,7 @@ describe("deception_audit verdict routing (US-010)", () => {
     return JSON.parse(row.context) as Record<string, string>;
   }
 
-  it("HONEST: auditor done, flag cleared, deception_audit.passed emitted, pipeline proceeds to verify", () => {
+  it("HONEST: auditor done, deception_audit.passed emitted, pipeline proceeds to verify", () => {
     const { runId, fixDbId, auditDbId, verifyDbId } = seedAuditRun();
     completeFixThenClaimAuditor(runId, fixDbId, CANNOT_REPRODUCE_FIX);
 
@@ -1760,7 +1859,7 @@ describe("deception_audit verdict routing (US-010)", () => {
     const audit = db.prepare("SELECT status FROM steps WHERE id = ?").get(auditDbId) as { status: string };
     assert.equal(audit.status, "done", "HONEST must mark the auditor done");
     const ctx = readContext(runId);
-    assert.ok(!("deception_audit_required" in ctx), "HONEST must clear the audit flag");
+    assert.ok(!("deception_audit_required" in ctx), "always-audit: no audit flag is ever written");
 
     const events = getRunEvents(runId);
     const passed = events.filter((e) => e.event === "deception_audit.passed");
@@ -1773,7 +1872,33 @@ describe("deception_audit verdict routing (US-010)", () => {
     assert.equal(next.stepId, verifyDbId);
   });
 
-  it("DECEPTION with quotable evidence: fix step re-pended with the FINDING; auditor reset for re-use; flag stays set", () => {
+  it("REPRO_EVIDENCE fix: the audit still dispatches and a HONEST verdict routes (always-audit, AC5)", () => {
+    const { runId, fixDbId, auditDbId, verifyDbId } = seedAuditRun();
+    completeFixThenClaimAuditor(runId, fixDbId, REPRO_EVIDENCE_FIX);
+
+    const result = completeStep(auditDbId, "STATUS: done\nVERDICT: HONEST");
+    assert.equal(result.status, "advanced");
+
+    const db = getDb();
+    const audit = db.prepare(
+      "SELECT status, auto_completed FROM steps WHERE id = ?",
+    ).get(auditDbId) as { status: string; auto_completed: number };
+    assert.equal(audit.status, "done");
+    assert.equal(audit.auto_completed, 0, "REPRO_EVIDENCE must not auto-complete the auditor free");
+
+    const events = getRunEvents(runId);
+    assert.equal(events.filter((e) => e.event === "deception_audit.passed").length, 1,
+      "deception_audit.passed must be emitted exactly once");
+    assert.ok(!events.some((e) => e.event === "step.auto_completed"),
+      "no step.auto_completed / condition_unset:deception_audit_required");
+
+    // Run proceeds to verify.
+    const next = claimStep("test-wf_verifier", runId);
+    assert.equal(next.found, true);
+    assert.equal(next.stepId, verifyDbId);
+  });
+
+  it("DECEPTION with quotable evidence: fix step re-pended with the FINDING; auditor reset for re-use", () => {
     const { runId, fixDbId, auditDbId } = seedAuditRun();
     completeFixThenClaimAuditor(runId, fixDbId, CANNOT_REPRODUCE_FIX);
 
@@ -1797,7 +1922,8 @@ describe("deception_audit verdict routing (US-010)", () => {
     assert.equal(audit.reroute_count, 1, "the reroute budget must be consumed");
 
     const ctx = readContext(runId);
-    assert.equal(ctx.deception_audit_required, "true", "the audit flag must stay set (audit re-runs after the fix)");
+    assert.ok(!("deception_audit_required" in ctx),
+      "always-audit: DECEPTION routing must not rely on an activation flag");
 
     const events = getRunEvents(runId);
     const found = events.find((e) => e.event === "deception_audit.deception_found");
@@ -1835,7 +1961,7 @@ describe("deception_audit verdict routing (US-010)", () => {
     const audit = db.prepare("SELECT status FROM steps WHERE id = ?").get(auditDbId) as { status: string };
     assert.equal(audit.status, "done", "an invalid DECEPTION must complete as HONEST");
     const ctx = readContext(runId);
-    assert.ok(!("deception_audit_required" in ctx), "an invalid DECEPTION must not leave the flag set");
+    assert.ok(!("deception_audit_required" in ctx), "no audit flag is ever written");
 
     const events = getRunEvents(runId);
     assert.equal(events.filter((e) => e.event === "deception_audit.passed").length, 1,
@@ -1866,59 +1992,44 @@ describe("deception_audit verdict routing (US-010)", () => {
       "the final DECEPTION is still recorded");
   });
 
-  it("a deception_audit completed WITHOUT the flag is not routed (falls through to normal completion)", () => {
-    // Simulates a manual smoke flow / graph-sim equivalent: the auditor is
-    // completed with VERDICT: HONEST but the run never dispatched it (the
-    // fixer provided REPRO_EVIDENCE, so the flag is unset and the motor would
-    // auto-complete the auditor free — a scheduler-less flow claims it).
-    const { runId, fixDbId, auditDbId } = seedAuditRun();
-    const claimFix = claimStep("test-wf_fixer", runId);
-    assert.equal(claimFix.found, true);
-    const fixResult = completeStep(fixDbId,
-      "STATUS: done\nCHANGES: fixed add\nREGRESSION_TEST: added test\nREPRO_EVIDENCE: failing add(2,3) output on pre-fix tree");
-    assert.ok(fixResult.status === "advanced" || fixResult.status === "completed", `fix got ${fixResult.status}`);
-
-    const claimAudit = claimStep("test-wf_auditor", runId);
-    assert.equal(claimAudit.found, true);
-    const result = completeStep(auditDbId, "STATUS: done\nVERDICT: HONEST");
-    assert.equal(result.status, "advanced");
-
-    const db = getDb();
-    const audit = db.prepare("SELECT status FROM steps WHERE id = ?").get(auditDbId) as { status: string };
-    assert.equal(audit.status, "done", "the auditor completes normally when not routed");
-
-    const events = getRunEvents(runId);
-    assert.ok(!events.some((e) => e.event === "deception_audit.passed"),
-      "an un-flagged audit completion must not emit audit-passed");
-    assert.ok(!events.some((e) => e.event === "deception_audit.deception_found"),
-      "an un-flagged audit completion must not emit deception-found");
-  });
-
-  it("productive exit: after DECEPTION reroute, a fix re-run with REPRO_EVIDENCE auto-completes the auditor free", () => {
+  it("always-audit across the reroute cycle: a fix re-run with REPRO_EVIDENCE still re-dispatches the auditor", () => {
+    // Pre-WAVE-A.1 "productive exit": after DECEPTION, a fix re-run with
+    // REPRO_EVIDENCE auto-completed the auditor free. Under always-audit the
+    // auditor re-dispatches (never auto_completed) and a HONEST verdict passes.
     const { runId, fixDbId, auditDbId } = seedAuditRun();
     completeFixThenClaimAuditor(runId, fixDbId, CANNOT_REPRODUCE_FIX);
-    completeStep(auditDbId,
+    const decResult = completeStep(auditDbId,
       'STATUS: done\nVERDICT: DECEPTION\nFINDING: symptom-silencing: "CANNOT_REPRODUCE" while the failing output is present');
+    assert.equal(decResult.status, "rerouted");
 
     // The fix is re-pended; it now provides genuine REPRO_EVIDENCE.
-    const claim = claimStep("test-wf_fixer", runId);
-    assert.equal(claim.found, true);
-    const fixResult = completeStep(fixDbId,
-      "STATUS: done\nCHANGES: fixed add\nREGRESSION_TEST: added test\nREPRO_EVIDENCE: failing add(2,3) output on pre-fix tree");
+    const claimFix = claimStep("test-wf_fixer", runId);
+    assert.equal(claimFix.found, true);
+    const fixResult = completeStep(fixDbId, REPRO_EVIDENCE_FIX);
     assert.ok(fixResult.status === "advanced" || fixResult.status === "completed", `fix got ${fixResult.status}`);
 
-    // The flag is now unset → the auditor auto-completes free via the
-    // conditional primitive (no harness spawn, zero tokens).
+    // Always-audit: the audit must re-dispatch — the conditional sweep finds
+    // no conditional step ('none'), so the motor spawns a real round.
     const outcome = autoCompleteConditionalStep(runId, "test-wf_auditor");
-    assert.equal(outcome, "auto_completed");
+    assert.equal(outcome, "none", "no conditional step under always-audit");
+
+    const claimAudit = claimStep("test-wf_auditor", runId);
+    assert.equal(claimAudit.found, true, "the auditor must re-dispatch after the corrected fix");
+    const result = completeStep(claimAudit.stepId, "STATUS: done\nVERDICT: HONEST");
+    assert.ok(result.status === "advanced" || result.status === "completed", `got ${result.status}`);
 
     const db = getDb();
     const audit = db.prepare(
-      "SELECT status, auto_completed, auto_complete_reason FROM steps WHERE id = ?",
-    ).get(auditDbId) as { status: string; auto_completed: number; auto_complete_reason: string | null };
+      "SELECT status, auto_completed FROM steps WHERE id = ?",
+    ).get(auditDbId) as { status: string; auto_completed: number };
     assert.equal(audit.status, "done");
-    assert.equal(audit.auto_completed, 1);
-    assert.equal(audit.auto_complete_reason, "condition_unset:deception_audit_required");
+    assert.equal(audit.auto_completed, 0, "the re-audit must be a real dispatch, never auto_completed");
+
+    const events = getRunEvents(runId);
+    assert.ok(!events.some((e) => e.event === "step.auto_completed"),
+      "no step.auto_completed — no condition_unset:deception_audit_required anywhere in the cycle");
+    assert.equal(events.filter((e) => e.event === "deception_audit.passed").length, 1,
+      "the re-audit HONEST verdict must emit deception_audit.passed exactly once");
   });
 });
 
@@ -1974,5 +2085,363 @@ describe("completeStep late teardown continuations land in sticky temp state", (
       after > before,
       `teardown idle-check must have run against the sticky state (before=${before}, after=${after})`,
     );
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════
+// WAVE-A.1 US-001: TEST_CMD review-state keys are agent-unwritable —
+// corridors 1(a), 1(b), 1(c) + DB-column shadowing regressions
+// ══════════════════════════════════════════════════════════════════════
+
+describe("WAVE-A.1 US-001: review-state keys agent-unwritable (corridors 1a-1c + regressions)", () => {
+  let tempHome: string;
+  let stateDir: string;
+  let dbPath: string;
+  let saved: Record<string, string | undefined>;
+
+  beforeEach(() => {
+    tempHome = tamanduaTempDir("tamandua-us001-");
+    stateDir = path.join(tempHome, ".tamandua");
+    dbPath = path.join(stateDir, "tamandua.db");
+    fs.mkdirSync(stateDir, { recursive: true });
+    saved = {
+      HOME: process.env.HOME,
+      TAMANDUA_STATE_DIR: process.env.TAMANDUA_STATE_DIR,
+      TAMANDUA_DB_PATH: process.env.TAMANDUA_DB_PATH,
+    };
+    process.env.HOME = tempHome;
+    process.env.TAMANDUA_STATE_DIR = stateDir;
+    process.env.TAMANDUA_DB_PATH = dbPath;
+    assert.doesNotThrow(() =>
+      assertStatePathIsolation(dbPath, "step-ops-us001"),
+    );
+  });
+
+  afterEach(() => {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    fs.rmSync(tempHome, { recursive: true, force: true });
+  });
+
+  /** Seed one run + N pending steps (first 'single', remainder as given). */
+  function seedRun(
+    runContext: Record<string, string>,
+    overrides: {
+      testCmdEstablished?: string | null;
+      testCmdSource?: string | null;
+      runNumber?: number;
+      extraSteps?: Array<{
+        stepId: string;
+        agentId: string;
+        stepIndex: number;
+        type: string;
+        conditionalCondition?: string | null;
+      }>;
+    } = {},
+  ): { runId: string; stepDbId: string } {
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const stepDbId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, run_number, test_cmd_established, test_cmd_source, created_at, updated_at) VALUES (?, 'test-wf', 'us001 task', 'running', ?, ?, ?, ?, ?, ?)",
+    ).run(
+      runId,
+      JSON.stringify(runContext),
+      overrides.runNumber ?? 1,
+      overrides.testCmdEstablished ?? null,
+      overrides.testCmdSource ?? null,
+      now,
+      now,
+    );
+    const insertStep = db.prepare(
+      `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, conditional_condition, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, 'Run the task', 'STATUS: done', 'pending', 0, 4, ?, ?, ?, ?)`,
+    );
+    insertStep.run(stepDbId, runId, "setup", "test-wf_dev", 0, "single", null, now, now);
+    for (const extra of overrides.extraSteps ?? []) {
+      insertStep.run(
+        crypto.randomUUID(),
+        runId,
+        extra.stepId,
+        extra.agentId,
+        extra.stepIndex,
+        extra.type,
+        extra.conditionalCondition ?? null,
+        now,
+        now,
+      );
+    }
+    return { runId, stepDbId };
+  }
+
+  function readRun(runId: string): {
+    context: Record<string, string>;
+    test_cmd_established: string | null;
+    test_cmd_source: string | null;
+  } {
+    const db = getDb();
+    const row = db.prepare(
+      "SELECT context, test_cmd_established, test_cmd_source FROM runs WHERE id = ?",
+    ).get(runId) as {
+      context: string;
+      test_cmd_established: string | null;
+      test_cmd_source: string | null;
+    };
+    return {
+      context: JSON.parse(row.context) as Record<string, string>,
+      test_cmd_established: row.test_cmd_established,
+      test_cmd_source: row.test_cmd_source,
+    };
+  }
+
+  it("1a: completing a step whose output includes TEST_CMD_REVIEW_REQUIRED: false (after a rewrite set the flag) leaves the persisted flag set and the pending test_cmd_review step dispatches", () => {
+    const { runId, stepDbId } = seedRun(
+      { test_cmd: "npm test", test_cmd_raw: "npm test" },
+      {
+        testCmdEstablished: "npm test",
+        testCmdSource: "launch",
+        extraSteps: [
+          {
+            stepId: "implement",
+            agentId: "test-wf_dev",
+            stepIndex: 1,
+            type: "single",
+          },
+          {
+            stepId: "test_cmd_review",
+            agentId: "test-wf_reviewer",
+            stepIndex: 2,
+            type: "conditional",
+            conditionalCondition: "test_cmd_review_required",
+          },
+        ],
+      },
+    );
+
+    // Rewriter: differing TEST_CMD sets the flag; the launder line in the SAME
+    // output must be inert (the key is reserved — skipped by parse merges).
+    const claimRewriter = claimStep("test-wf_dev", runId);
+    assert.equal(claimRewriter.found, true);
+    assert.equal(claimRewriter.stepId, stepDbId);
+    const rewriteResult = completeStep(
+      stepDbId,
+      "STATUS: done\nTEST_CMD: npm run build\nTEST_CMD_REVIEW_REQUIRED: false",
+    );
+    assert.equal(rewriteResult.status, "advanced");
+
+    const afterRewrite = readRun(runId);
+    assert.equal(
+      afterRewrite.context.test_cmd_review_required,
+      "true",
+      "the rewrite detector must set the flag despite the same-output TEST_CMD_REVIEW_REQUIRED: false line",
+    );
+    assert.equal(afterRewrite.context.test_cmd_review_candidate, "npm run build");
+    assert.equal(afterRewrite.context.test_cmd_review_established, "npm test");
+
+    // Second step ALSO tries to launder the flag.
+    const launderClaim = claimStep("test-wf_dev", runId);
+    assert.equal(launderClaim.found, true);
+    const launderResult = completeStep(
+      launderClaim.stepId!,
+      "STATUS: done\nTEST_CMD_REVIEW_REQUIRED: false",
+    );
+    assert.ok(
+      launderResult.status === "advanced" || launderResult.status === "completed",
+      `expected advanced/completed, got ${launderResult.status}`,
+    );
+
+    const afterLaunder = readRun(runId);
+    assert.equal(
+      afterLaunder.context.test_cmd_review_required,
+      "true",
+      "an agent TEST_CMD_REVIEW_REQUIRED: false line must NOT clear the persisted review flag",
+    );
+
+    // The pending conditional test_cmd_review step dispatches (never
+    // auto-completes) because the flag is still SET.
+    const outcome = autoCompleteConditionalStep(runId, "test-wf_reviewer");
+    assert.equal(outcome, "dispatched", "a SET review flag must dispatch, never auto-complete");
+  });
+
+  it("1a: an agent KEY line TEST_CMD_REVIEW_REQUIRED: true cannot SET the flag (no rewrite → review still auto-completes free)", () => {
+    const { runId, stepDbId } = seedRun(
+      { test_cmd: "npm test", test_cmd_raw: "npm test" },
+      {
+        testCmdEstablished: "npm test",
+        testCmdSource: "launch",
+        extraSteps: [
+          {
+            stepId: "test_cmd_review",
+            agentId: "test-wf_reviewer",
+            stepIndex: 1,
+            type: "conditional",
+            conditionalCondition: "test_cmd_review_required",
+          },
+        ],
+      },
+    );
+
+    const claim = claimStep("test-wf_dev", runId);
+    assert.equal(claim.found, true);
+    const result = completeStep(stepDbId, "STATUS: done\nTEST_CMD_REVIEW_REQUIRED: true");
+    assert.equal(result.status, "advanced");
+
+    // No rewrite occurred, so the flag must remain absent — an agent KEY line
+    // cannot forge the activation flag.
+    const run = readRun(runId);
+    assert.ok(
+      !("test_cmd_review_required" in run.context),
+      "TEST_CMD_REVIEW_REQUIRED: true must NOT set the persisted flag",
+    );
+    assert.equal(run.test_cmd_established, "npm test");
+
+    // With no flag set the conditional review step auto-completes free.
+    const outcome = autoCompleteConditionalStep(runId, "test-wf_reviewer");
+    assert.equal(outcome, "auto_completed");
+    const db = getDb();
+    const review = db.prepare(
+      "SELECT status, auto_completed FROM steps WHERE run_id = ? AND step_id = 'test_cmd_review'",
+    ).get(runId) as { status: string; auto_completed: number };
+    assert.equal(review.status, "done");
+    assert.equal(review.auto_completed, 1);
+  });
+
+  it("1b: detection persists to the runs row (context) and a simulated daemon restart preserves the pending review ('dispatched')", () => {
+    const { runId, stepDbId } = seedRun(
+      { test_cmd: "npm test", test_cmd_raw: "npm test" },
+      {
+        testCmdEstablished: "npm test",
+        testCmdSource: "launch",
+        extraSteps: [
+          {
+            stepId: "test_cmd_review",
+            agentId: "test-wf_reviewer",
+            stepIndex: 1,
+            type: "conditional",
+            conditionalCondition: "test_cmd_review_required",
+          },
+        ],
+      },
+    );
+
+    const claim = claimStep("test-wf_dev", runId);
+    assert.equal(claim.found, true);
+    completeStep(stepDbId, "STATUS: done\nTEST_CMD: npm run build");
+
+    // Persisted in the runs row context (survives any in-process state loss).
+    const persisted = readRun(runId);
+    assert.equal(persisted.context.test_cmd_review_required, "true");
+
+    // Simulate a daemon restart: drop in-process DB state and re-read from
+    // the same file. autoCompleteConditionalStep only reads runs.context from
+    // the DB, so the pending review must still dispatch.
+    closeDb();
+    getDb();
+    assert.equal(autoCompleteConditionalStep(runId, "test-wf_reviewer"), "dispatched");
+
+    const db = getDb();
+    const review = db.prepare(
+      "SELECT status, auto_completed FROM steps WHERE run_id = ? AND step_id = 'test_cmd_review'",
+    ).get(runId) as { status: string; auto_completed: number };
+    assert.equal(review.status, "pending", "a SET review flag must stay pending after restart");
+    assert.equal(review.auto_completed, 0, "never auto-completed while the flag is set");
+  });
+
+  it("1c: a run seeded with merge_gate=off still records test_cmd.rewrite_detected (old+new) when a step emits a differing TEST_CMD", () => {
+    const { runId, stepDbId } = seedRun(
+      { test_cmd: "npm test", test_cmd_raw: "npm test", merge_gate: "off" },
+      {
+        testCmdEstablished: "npm test",
+        testCmdSource: "launch",
+      },
+    );
+
+    const claim = claimStep("test-wf_dev", runId);
+    assert.equal(claim.found, true);
+    completeStep(stepDbId, "STATUS: done\nTEST_CMD: npm run build");
+
+    const events = getRunEvents(runId);
+    const rewrite = events.find((e) => e.event === "test_cmd.rewrite_detected");
+    assert.ok(rewrite, "merge_gate=off must NOT suppress rewrite detection");
+    assert.equal(rewrite.oldTestCmd, "npm test");
+    assert.equal(rewrite.newTestCmd, "npm run build");
+    const run = readRun(runId);
+    assert.equal(run.context.test_cmd_review_required, "true");
+    assert.equal(run.context.merge_gate, "off", "merge_gate=off must stay untouched");
+  });
+
+  it("regression: agent KEY lines TEST_CMD_ESTABLISHED / TEST_CMD_SOURCE cannot shadow the runs DB columns", () => {
+    const { runId, stepDbId } = seedRun(
+      { test_cmd: "npm test", test_cmd_raw: "npm test" },
+      {
+        testCmdEstablished: "npm test",
+        testCmdSource: "launch",
+      },
+    );
+
+    const claim = claimStep("test-wf_dev", runId);
+    assert.equal(claim.found, true);
+    // Attempt to shadow the DB columns with agent KEY lines, and ALSO emit a
+    // differing TEST_CMD (a rewrite) in the same output.
+    completeStep(
+      stepDbId,
+      "STATUS: done\nTEST_CMD_ESTABLISHED: npm run evil\nTEST_CMD_SOURCE: agent\nTEST_CMD: npm run build",
+    );
+
+    const run = readRun(runId);
+    assert.equal(
+      run.test_cmd_established,
+      "npm test",
+      "TEST_CMD_ESTABLISHED KEY line must not shadow the runs.test_cmd_established column",
+    );
+    assert.equal(
+      run.test_cmd_source,
+      "launch",
+      "TEST_CMD_SOURCE KEY line must not shadow the runs.test_cmd_source column",
+    );
+    // The context aliases are only ever read via the DB column first.
+    assert.equal(run.context.test_cmd, "npm test", "differing TEST_CMD must not rewrite context.test_cmd");
+    assert.equal(run.context.test_cmd_raw, "npm test", "differing TEST_CMD must not rewrite context.test_cmd_raw");
+    assert.equal(run.context.test_cmd_review_required, "true");
+  });
+
+  it("regression: a differing TEST_CMD never rewrites the contract or the context aliases even when the step also emits shadow KEY lines", () => {
+    const { runId, stepDbId } = seedRun(
+      { test_cmd: "npm test", test_cmd_raw: "npm test" },
+      {
+        testCmdEstablished: "npm test",
+        testCmdSource: "launch",
+        extraSteps: [
+          {
+            stepId: "second",
+            agentId: "test-wf_dev",
+            stepIndex: 1,
+            type: "single",
+          },
+        ],
+      },
+    );
+
+    const claim = claimStep("test-wf_dev", runId);
+    assert.equal(claim.found, true);
+    completeStep(stepDbId, "STATUS: done\nTEST_CMD: npm run build");
+
+    // A second differing marker is still detected against the established
+    // contract (never against an agent-shadowed alias).
+    const claim2 = claimStep("test-wf_dev", runId);
+    assert.equal(claim2.found, true);
+    completeStep(claim2.stepId!, "STATUS: done\nTEST_CMD: npm run lint");
+
+    const run = readRun(runId);
+    assert.equal(run.test_cmd_established, "npm test", "the contract is never replaced by rewrites");
+    assert.equal(run.context.test_cmd, "npm test");
+    assert.equal(run.context.test_cmd_raw, "npm test");
+    const rewrites = getRunEvents(runId).filter((e) => e.event === "test_cmd.rewrite_detected");
+    assert.equal(rewrites.length, 2, "each differing marker is detected against the column");
+    assert.equal(rewrites[1].oldTestCmd, "npm test");
+    assert.equal(rewrites[1].newTestCmd, "npm run lint");
   });
 });
