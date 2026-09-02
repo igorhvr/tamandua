@@ -8,6 +8,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { tamanduaTempDir } from "../dist/lib/temp-dir.js";
+import { removeTestTempDirWithDiagnostics } from "../tests/helpers/test-env.ts";
 
 import { DatabaseSync } from "node:sqlite";
 
@@ -16,7 +17,7 @@ import { runDoctorChecks, runLlmPromptAdherenceChecks, formatDoctorOutput,
 import type { DoctorCheckResult, CheckGroup } from "../dist/doctor.js";
 import {
   startDaemon,
-  stopDaemon,
+  stopDaemonFamily,
   isRunning,
   getLogFile,
   getPidFile,
@@ -1816,10 +1817,8 @@ describe("SERVICES checks (US-004)", () => {
   it("reports all pass when daemon is running in isolated HOME", { timeout: 15000 }, async () => {
     const homeDir = createTempHome();
     const controlPort = await getAvailablePort();
-    let child: import("node:child_process").ChildProcess | undefined;
     try {
-      const result = await startDaemon(controlPort, { homeDir, keepHandle: true });
-      child = (result as { child: import("node:child_process").ChildProcess }).child;
+      await startDaemon(controlPort, { homeDir });
 
       // Wait a bit for the daemon to be fully ready
       await new Promise((resolve) => setTimeout(resolve, 500));
@@ -1863,13 +1862,8 @@ describe("SERVICES checks (US-004)", () => {
       assert.strictEqual(mcpCheck!.status, "info",
         `MCP check should be info when no pidfile, got: ${mcpCheck!.status} (${mcpCheck!.message})`);
     } finally {
-      if (child) {
-        try { child.kill("SIGTERM"); } catch { /* ignore */ }
-      }
-      // Give the process a moment to die
-      await new Promise((resolve) => setTimeout(resolve, 200));
-      try { stopDaemon({ homeDir }); } catch { /* ignore */ }
-      fs.rmSync(homeDir, { recursive: true, force: true });
+      await stopDaemonFamily({ homeDir });
+      removeTestTempDirWithDiagnostics(homeDir);
     }
   });
 
@@ -1995,10 +1989,8 @@ describe("STALENESS check (US-005)", () => {
   it("passes when daemon buildVersion matches local version", { timeout: 15000 }, async () => {
     const homeDir = createTempHome();
     const controlPort = await getAvailablePort();
-    let child: import("node:child_process").ChildProcess | undefined;
     try {
-      const result = await startDaemon(controlPort, { homeDir, keepHandle: true });
-      child = (result as { child: import("node:child_process").ChildProcess }).child;
+      await startDaemon(controlPort, { homeDir });
 
       await new Promise((resolve) => setTimeout(resolve, 500));
 
@@ -2012,12 +2004,8 @@ describe("STALENESS check (US-005)", () => {
       assert.ok(check.message.includes("matches"),
         `Message should say versions match, got: ${check.message}`);
     } finally {
-      if (child) {
-        try { child.kill("SIGTERM"); } catch { /* ignore */ }
-      }
-      await new Promise((resolve) => setTimeout(resolve, 200));
-      try { stopDaemon({ homeDir }); } catch { /* ignore */ }
-      fs.rmSync(homeDir, { recursive: true, force: true });
+      await stopDaemonFamily({ homeDir });
+      removeTestTempDirWithDiagnostics(homeDir);
     }
   });
 

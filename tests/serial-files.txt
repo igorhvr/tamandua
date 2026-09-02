@@ -64,6 +64,7 @@ src/server/daemon-lifecycle.test.ts
 src/server/daemon.test.ts
 src/server/daemonctl-controlplane-restart.test.ts
 src/server/daemonctl-dashboard.test.ts
+src/server/daemonctl-family-stop.test.ts
 src/server/daemonctl-guard.test.ts
 src/server/daemonctl-mcp-restart.test.ts
 src/server/daemonctl-port.test.ts

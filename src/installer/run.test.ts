@@ -7,8 +7,14 @@ import http from "node:http";
 import { spawnSync } from "node:child_process";
 
 import { runWorkflow } from "../../dist/installer/run.js";
-import { getPidFile, getPortFile, stopDaemon } from "../../dist/server/daemonctl.js";
-import { reservePortHandles, reservePortHandle, type PortHandle } from "../../tests/helpers/test-env.ts";
+import { getPidFile, getPortFile, stopDaemon, stopDaemonFamily } from "../../dist/server/daemonctl.js";
+import {
+  reservePortHandles,
+  reservePortHandle,
+  listRemainingEntries,
+  removeTestTempDirWithDiagnostics,
+  type PortHandle,
+} from "../../tests/helpers/test-env.ts";
 import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
 import { getRunEvents } from "../../dist/installer/events.js";
 import { assertStatePathIsolation } from "../../dist/lib/test-guard.js";
@@ -42,18 +48,6 @@ function readPid(filePath: string): number | null {
     return Number.isFinite(pid) && pid > 0 ? pid : null;
   } catch {
     return null;
-  }
-}
-
-async function waitForPidExit(pid: number, timeoutMs = 3000): Promise<void> {
-  const startedAt = Date.now();
-  while (Date.now() - startedAt < timeoutMs) {
-    try {
-      process.kill(pid, 0);
-    } catch {
-      return;
-    }
-    await new Promise<void>((resolve) => setTimeout(resolve, 100));
   }
 }
 
@@ -120,9 +114,7 @@ describe("runWorkflow", () => {
   });
 
   after(async () => {
-    const pid = readPid(getPidFile({ homeDir: tempHome }));
-    try { stopDaemon({ homeDir: tempHome }); } catch {}
-    if (pid !== null) await waitForPidExit(pid);
+    await stopDaemonFamily({ homeDir: tempHome });
 
     if (origHome !== undefined) {
       process.env.HOME = origHome;
@@ -154,7 +146,7 @@ describe("runWorkflow", () => {
     // log/SQLite WAL stragglers a moment to finish writing.
     await Promise.all(portHandles.map((h) => h.close()));
     await new Promise((resolve) => setTimeout(resolve, 250));
-    fs.rmSync(tempHome, { recursive: true, force: true, maxRetries: 15, retryDelay: 200 });
+    removeTestTempDirWithDiagnostics(tempHome);
   });
 
   it("daemonctl paths honor HOME assigned after module import", () => {
@@ -995,12 +987,10 @@ describe("runWorkflow", () => {
           taskTitle: "Test probe timeout after run creation",
         });
       } finally {
-        // Clean up the daemon process that startDaemon may have spawned
+        // Clean up the daemon family that startDaemon may have spawned
         // inside ensureDaemonControlAvailable, and restore env.
         try {
-          stopDaemon({ homeDir: tempHome });
-          const pid = readPid(getPidFile({ homeDir: tempHome }));
-          if (pid !== null) await waitForPidExit(pid, 5000);
+          await stopDaemonFamily({ homeDir: tempHome });
         } catch {
           /* best-effort cleanup */
         }
@@ -1625,5 +1615,26 @@ try {
         fs.rmSync(repoDir, { recursive: true, force: true });
       }
     });
+  });
+});
+
+describe("listRemainingEntries teardown helper", () => {
+  it("returns sorted relative paths for a small tree", () => {
+    const root = tamanduaTempDir("tamandua-list-entries-");
+    try {
+      fs.mkdirSync(path.join(root, "sub"), { recursive: true });
+      fs.mkdirSync(path.join(root, "sub", "deep"));
+      fs.writeFileSync(path.join(root, "a.txt"), "a", "utf-8");
+      fs.writeFileSync(path.join(root, "sub", "b.txt"), "b", "utf-8");
+
+      assert.deepEqual(listRemainingEntries(root), [
+        "a.txt",
+        "sub",
+        path.join("sub", "b.txt"),
+        path.join("sub", "deep"),
+      ]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });

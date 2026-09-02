@@ -131,7 +131,7 @@ describe("run token spend persistence", () => {
           import { runWorkflow } from "./dist/installer/run.js";
           import { getDb } from "./dist/db.js";
           import { shutdownAllCrons } from "./dist/installer/agent-scheduler.js";
-          import { startDaemon, stopDaemon } from "./dist/server/daemonctl.js";
+          import { startDaemon, stopDaemonFamily } from "./dist/server/daemonctl.js";
 
           try {
             await startDaemon(Number(process.env.TAMANDUA_CONTROL_PORT));
@@ -140,7 +140,7 @@ describe("run token spend persistence", () => {
             const row = db.prepare("SELECT tokens_spent FROM runs WHERE id = ?").get(started.runId);
             console.log(JSON.stringify({ tokensSpent: row.tokens_spent }));
           } finally {
-            try { stopDaemon({ homeDir: process.env.HOME }); } catch {}
+            await stopDaemonFamily({ homeDir: process.env.HOME });
             shutdownAllCrons();
           }
         `,

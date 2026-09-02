@@ -249,6 +249,34 @@ function checkPidFile(pidFile: string): { running: true; pid: number } | { runni
 /** Slack for comparing process age against pidfile age (seconds). */
 const PIDFILE_AGE_SLACK_SECONDS = 120;
 
+/**
+ * The complete set of daemon-family pid files written under a tamandua
+ * state dir. Both `processHomeMatches` (macOS provenance binding) and
+ * `stopDaemonFamily` (test teardown) iterate this single source of truth,
+ * so family membership can never drift between the guard and the teardown.
+ */
+export const DAEMON_FAMILY_PID_FILES: readonly string[] = [
+  "tamandua.pid",
+  "mcp.pid",
+  "control-plane.pid",
+  "dashboard.pid",
+];
+
+/** One pid-file/pid pair in a stopDaemonFamily summary. */
+export interface DaemonFamilyStopEntry {
+  pidFile: string;
+  pid: number | null;
+}
+
+/** Result of stopDaemonFamily: every pid file accounted for by category. */
+export interface DaemonFamilyStopSummary {
+  stopped: DaemonFamilyStopEntry[];
+  skippedMissing: DaemonFamilyStopEntry[];
+  skippedStale: DaemonFamilyStopEntry[];
+  skippedNotSignalable: DaemonFamilyStopEntry[];
+  timedOut: DaemonFamilyStopEntry[];
+}
+
 function processHomeMatches(pid: number, homeDir: string): boolean {
   // Linux: exact HOME= entry match via procfs — the strongest binding.
   if (hasProcfs()) {
@@ -268,7 +296,7 @@ function processHomeMatches(pid: number, homeDir: string): boolean {
   //      (services keep their log fd open for life) — kernel-verified via
   //      lsof, and covers healthy services whose pidfile was lost.
   const dir = path.join(homeDir, ".tamandua");
-  for (const name of ["tamandua.pid", "mcp.pid", "control-plane.pid", "dashboard.pid"]) {
+  for (const name of DAEMON_FAMILY_PID_FILES) {
     try {
       const pidFile = path.join(dir, name);
       const recorded = parseInt(fs.readFileSync(pidFile, "utf-8").trim(), 10);
@@ -1672,4 +1700,132 @@ export async function waitForDaemonStop(opts?: DaemonctlPathOptions): Promise<vo
   const reason = stuckReasons.length > 0 ? stuckReasons.join("; ") : "unknown reason";
 
   throw new Error("daemon failed to stop within 10s: " + reason);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Daemon-family teardown helper
+// ═══════════════════════════════════════════════════════════════════
+
+type StopFamilyFn = (opts?: DaemonctlPathOptions) => boolean;
+
+/** Map every daemon-family pid file to its existing stop function. */
+const DAEMON_FAMILY_STOP_FNS: Readonly<Record<string, StopFamilyFn>> = {
+  "tamandua.pid": stopDaemon,
+  "mcp.pid": stopMcp,
+  "control-plane.pid": stopControlPlane,
+  "dashboard.pid": stopDashboardStandalone,
+};
+
+/** Event-driven pid-exit poll (kill(pid, 0)); bounded, never a fixed sleep. */
+async function waitForFamilyPidExit(pid: number, timeoutMs = 10_000): Promise<boolean> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      process.kill(pid, 0);
+    } catch {
+      return true;
+    }
+    await sleep(100);
+  }
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Stop and await every daemon-family process recorded in a tamandua state
+ * dir's pid files.
+ *
+ * Reads exactly DAEMON_FAMILY_PID_FILES under getTamanduaDir(opts), captures
+ * the valid positive pids before stopping, then calls the matching existing
+ * stop function (which re-runs canSignalPid + assertNotSchedulingDaemon) and
+ * waits event-driven for each pid to exit. Missing, stale, and non-signalable
+ * entries are skipped and reported rather than signalled.
+ *
+ * @param opts Optional homeDir; when unset the real state dir is resolved and
+ *             the same test-isolation guard as the individual stop functions
+ *             applies.
+ */
+export async function stopDaemonFamily(opts?: DaemonctlPathOptions): Promise<DaemonFamilyStopSummary> {
+  const dir = getTamanduaDir(opts);
+  if (!opts?.homeDir) {
+    assertStatePathIsolation(dir, "stopDaemonFamily()");
+  }
+
+  const summary: DaemonFamilyStopSummary = {
+    stopped: [],
+    skippedMissing: [],
+    skippedStale: [],
+    skippedNotSignalable: [],
+    timedOut: [],
+  };
+
+  // First pass: capture only pids that are valid, positive, and alive right
+  // now. Never derive a pid from anywhere but these pid files.
+  const liveTargets: { pidFile: string; pid: number }[] = [];
+  for (const pidFileName of DAEMON_FAMILY_PID_FILES) {
+    const pidFile = path.join(dir, pidFileName);
+    if (!fs.existsSync(pidFile)) {
+      summary.skippedMissing.push({ pidFile: pidFileName, pid: null });
+      continue;
+    }
+
+    let pid: number;
+    try {
+      pid = parseInt(fs.readFileSync(pidFile, "utf-8").trim(), 10);
+    } catch {
+      try { fs.unlinkSync(pidFile); } catch {}
+      summary.skippedStale.push({ pidFile: pidFileName, pid: null });
+      continue;
+    }
+
+    if (!Number.isInteger(pid) || pid <= 0) {
+      try { fs.unlinkSync(pidFile); } catch {}
+      summary.skippedStale.push({ pidFile: pidFileName, pid: null });
+      continue;
+    }
+
+    let alive = true;
+    try {
+      process.kill(pid, 0);
+    } catch {
+      alive = false;
+    }
+    if (!alive) {
+      try { fs.unlinkSync(pidFile); } catch {}
+      summary.skippedStale.push({ pidFile: pidFileName, pid });
+      continue;
+    }
+
+    liveTargets.push({ pidFile: pidFileName, pid });
+  }
+
+  // Second pass: stop each captured pid and wait for it to exit.
+  for (const target of liveTargets) {
+    if (!canSignalPid(target.pid, opts)) {
+      summary.skippedNotSignalable.push({ pidFile: target.pidFile, pid: target.pid });
+      continue;
+    }
+
+    const stop = DAEMON_FAMILY_STOP_FNS[target.pidFile];
+    if (!stop) {
+      // Defensive only: DAEMON_FAMILY_PID_FILES is the single source of truth
+      // and every entry has a mapping above.
+      summary.skippedNotSignalable.push({ pidFile: target.pidFile, pid: target.pid });
+      continue;
+    }
+
+    stop(opts);
+
+    if (await waitForFamilyPidExit(target.pid)) {
+      summary.stopped.push({ pidFile: target.pidFile, pid: target.pid });
+    } else {
+      summary.timedOut.push({ pidFile: target.pidFile, pid: target.pid });
+    }
+  }
+
+  return summary;
 }
