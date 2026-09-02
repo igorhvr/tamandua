@@ -36,6 +36,12 @@ suite-defects-didn-dres-2026-09-02, triage-decisions-2026-09-01 (item 6: W4.33d/
   classifies as infra with the holder pid/cmdline in the reason.
 - S57: golden validity includes a fixtures-src content hash in the .hashes ledger; drift ⇒ invalid (rebuilt under
   --rebuild-invalid, fail closed otherwise, naming the drifted fixture).
+- MVPT (darwin env gate): `tt-verify-environment`'s port-ownership check returns "not TT-owned" on darwin by
+  construction (explicit darwin branch, no evidence), so any contained daemon on 43xx/53xx fails the gate with
+  "in use by non-TT process" (mac stage-2 attempt-2, 2026-09-02 17:1xZ, pids the main checkout's own provenance
+  recorded). Use the same portable evidence daemon-control's ownership check uses (lsof cwd + command line on
+  darwin; procfs on linux) and, when a listener is TT-owned by another worktree of the same repo, say so
+  ("TT-owned by <worktree path>, run <id>") instead of "non-TT". Red-arm via the TT_VERIFY_PLATFORM seam.
 - TFLK (note only, no code): the product test `tests/cli/install-partial-failure.test.ts` hermeticity probe is
   load-sensitive; document in the review-ladder notes that a single red there is re-run before being called a failure.
 
