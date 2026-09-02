@@ -8,11 +8,12 @@
  * instead of waiting out the 1.5×timeout age-based sweep.
  */
 
-import { describe, it, beforeEach, afterEach } from "node:test";
+import { describe, it, beforeEach, afterEach, after } from "node:test";
 import assert from "node:assert/strict";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import crypto from "node:crypto";
+import fs from "node:fs";
 import { recoverStepsWithDeadWorkers } from "../dist/installer/step-ops.js";
 import { getDb } from "../dist/db.js";
 import { getRunEvents } from "../dist/installer/events.js";
@@ -20,26 +21,47 @@ import { createTempHome } from "./helpers/test-env.ts";
 
 describe("dead-worker-recovery", () => {
   const th = createTempHome("tamandua-dead-worker-");
-  let saved: Record<string, string | undefined>;
+  // Sticky module env (status.test.ts pattern): the recovery functions under
+  // test (recoverStepsWithDeadWorkers / recoverOrphanedStepsForAgent /
+  // cleanupAbandonedSteps) fire fire-and-forget continuations —
+  // scheduleRunCronTeardown's teardownWorkflowCronsIfIdle (logger),
+  // emitEvent's fireWebhook (getDb), and the import()-hop
+  // releaseSuiteClaimsByOwner (controlRequest secret check) — that resolve
+  // DB / log / daemon-secret paths AFTER the triggering test's afterEach has
+  // run. Restoring the operator's real env there tripped the guard at the
+  // REAL ~/.tamandua (tens of ledger entries per test, testFile null). Keep
+  // the env pointed at the module temp home for the whole file and let the
+  // module after() restore the operator's env exactly as at load.
+  const saved = {
+    HOME: process.env.HOME,
+    TAMANDUA_STATE_DIR: process.env.TAMANDUA_STATE_DIR,
+    TAMANDUA_DB_PATH: process.env.TAMANDUA_DB_PATH,
+    TAMANDUA_CONTROL_PORT: process.env.TAMANDUA_CONTROL_PORT,
+  };
 
-  beforeEach(() => {
-    saved = {
-      HOME: process.env.HOME,
-      TAMANDUA_STATE_DIR: process.env.TAMANDUA_STATE_DIR,
-      TAMANDUA_DB_PATH: process.env.TAMANDUA_DB_PATH,
-      TAMANDUA_CONTROL_PORT: process.env.TAMANDUA_CONTROL_PORT,
-    };
+  function applyStickyEnv(): void {
     process.env.HOME = th.homeDir;
     process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
     process.env.TAMANDUA_DB_PATH = path.join(th.tamanduaDir, "tamandua.db");
     process.env.TAMANDUA_CONTROL_PORT = "1"; // dead control plane — nudges no-op
+  }
+
+  beforeEach(() => {
+    applyStickyEnv();
   });
 
   afterEach(() => {
+    // Restore to the module-scoped sticky temp env (NOT the operator's real
+    // env): recovery continuations resolve paths after this hook.
+    applyStickyEnv();
+  });
+
+  after(() => {
     for (const [k, v] of Object.entries(saved)) {
       if (v === undefined) delete process.env[k];
       else process.env[k] = v;
     }
+    try { fs.rmSync(th.root, { recursive: true, force: true }); } catch { /* cleanup */ }
   });
 
 /** A pid that is guaranteed dead: spawn a no-op process and let it exit. */

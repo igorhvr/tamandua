@@ -3,22 +3,57 @@ import path from "node:path";
 
 import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
 import assert from "node:assert/strict";
-import { afterEach, beforeEach, describe, it } from "node:test";
+import { after, afterEach, beforeEach, describe, it } from "node:test";
 import { DatabaseSync } from "node:sqlite";
 import { completeStep } from "../../dist/installer/step-ops.js";
+
+// ── Sticky isolation env ─────────────────────────────────────────────
+// completeStep on a terminal path fires scheduleRunCronTeardown →
+// fire-and-forget import() continuations (removeRunCrons /
+// terminateRunWithDaemon / teardownWorkflowCronsIfIdle) that resolve
+// getDb()/logger paths AFTER the triggering test's afterEach has already
+// run. Restoring the operator's real env there trips the guard at the REAL
+// ~/.tamandua (ledger entries with testFile null, "(unknown)"). Keep HOME /
+// TAMANDUA_STATE_DIR / TAMANDUA_DB_PATH pointed at a module-scoped temp
+// dir for the whole file and restore the original env in a module after()
+// (status.test.ts pattern).
+const stickyState = (() => {
+  const root = tamanduaTempDir("tamandua-complete-step-state-");
+  const homeDir = path.join(root, "home");
+  const stateDir = path.join(root, "state");
+  fs.mkdirSync(stateDir, { recursive: true });
+  return { root, homeDir, stateDir, dbPath: path.join(stateDir, "tamandua.db") };
+})();
+const originalHome = process.env.HOME;
+const originalStateDir = process.env.TAMANDUA_STATE_DIR;
+const originalDbPath = process.env.TAMANDUA_DB_PATH;
+
+function applyStickyEnv(): void {
+  process.env.HOME = stickyState.homeDir;
+  process.env.TAMANDUA_STATE_DIR = stickyState.stateDir;
+  process.env.TAMANDUA_DB_PATH = stickyState.dbPath;
+}
+
+after(() => {
+  if (originalHome === undefined) delete process.env.HOME;
+  else process.env.HOME = originalHome;
+  if (originalStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+  else process.env.TAMANDUA_STATE_DIR = originalStateDir;
+  if (originalDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+  else process.env.TAMANDUA_DB_PATH = originalDbPath;
+  try {
+    fs.rmSync(stickyState.root, { recursive: true, force: true });
+  } catch {
+    // best-effort cleanup
+  }
+});
 
 describe("completeStep basic paths", () => {
   let tempDir: string;
   let dbPath: string;
   let db: DatabaseSync;
-  let originalDbPath: string | undefined;
-  let originalHome: string | undefined;
-  let originalStateDir: string | undefined;
 
   beforeEach(() => {
-    originalDbPath = process.env.TAMANDUA_DB_PATH;
-    originalHome = process.env.HOME;
-    originalStateDir = process.env.TAMANDUA_STATE_DIR;
     tempDir = tamanduaTempDir("tamandua-complete-step-");
     dbPath = path.join(tempDir, ".tamandua", "tamandua.db");
     process.env.TAMANDUA_DB_PATH = dbPath;
@@ -76,12 +111,11 @@ describe("completeStep basic paths", () => {
   });
 
   afterEach(() => {
-    if (originalDbPath) process.env.TAMANDUA_DB_PATH = originalDbPath;
-    else delete process.env.TAMANDUA_DB_PATH;
-    if (originalHome) process.env.HOME = originalHome;
-    else delete process.env.HOME;
-    if (originalStateDir) process.env.TAMANDUA_STATE_DIR = originalStateDir;
-    else delete process.env.TAMANDUA_STATE_DIR;
+    // Restore to the module-scoped sticky temp env (NOT the operator's real
+    // env): completeStep's fire-and-forget teardown continuations resolve
+    // paths after this hook, and pointing them at the real ~/.tamandua
+    // trips the test-isolation guard.
+    applyStickyEnv();
     try { db.close(); } catch {}
     fs.rmSync(tempDir, { recursive: true, force: true });
   });

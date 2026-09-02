@@ -180,17 +180,29 @@ steps:
 // ══════════════════════════════════════════════════════════════════════
 
 describe("RETR: Comprehensive Reroute Paths", () => {
+  let _savedHome: string | undefined;
   let _savedStateDir: string | undefined;
   let _savedDbPath: string | undefined;
+  let _savedControlPort: string | undefined;
   let _isolationDir: string;
   let _workflowsDir: string;
 
   before(() => {
+    _savedHome = process.env.HOME;
     _savedStateDir = process.env.TAMANDUA_STATE_DIR;
     _savedDbPath = process.env.TAMANDUA_DB_PATH;
+    _savedControlPort = process.env.TAMANDUA_CONTROL_PORT;
     _isolationDir = tamanduaTempDir("tamandua-reroute-paths-");
+    // HOME is required too: failStep/completeStep teardown continuations
+    // resolve the daemon secret at HOME/.tamandua/daemon-secret through
+    // controlRequest when TAMANDUA_CONTROL_PORT is set — with the operator's
+    // real HOME that tripped the guard. Point HOME at the temp home and pin
+    // CONTROL_PORT to a dead port so control-plane calls fail fast instead
+    // of reaching a live daemon.
+    process.env.HOME = path.join(_isolationDir, "home");
     process.env.TAMANDUA_STATE_DIR = _isolationDir;
     process.env.TAMANDUA_DB_PATH = path.join(_isolationDir, "tamandua.db");
+    process.env.TAMANDUA_CONTROL_PORT = "1";
 
     // Create workflow dirs
     _workflowsDir = path.join(_isolationDir, "workflows");
@@ -208,11 +220,23 @@ describe("RETR: Comprehensive Reroute Paths", () => {
     }
   });
 
-  after(() => {
+  after(async () => {
+    // Reroute/exhaustion paths fire fire-and-forget teardown continuations
+    // (scheduleRunCronTeardown → terminateRunWithDaemon, failStep rugpull
+    // setImmediate); drain a few event-loop turns while the temp env is
+    // still active so their controlRequest/getDb/logger writes resolve the
+    // temp state, not the restored real one.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    if (_savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = _savedHome;
     if (_savedStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
     else process.env.TAMANDUA_STATE_DIR = _savedStateDir;
     if (_savedDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
     else process.env.TAMANDUA_DB_PATH = _savedDbPath;
+    if (_savedControlPort === undefined) delete process.env.TAMANDUA_CONTROL_PORT;
+    else process.env.TAMANDUA_CONTROL_PORT = _savedControlPort;
     try { fs.rmSync(_isolationDir, { recursive: true, force: true }); } catch { /* best effort */ }
   });
 

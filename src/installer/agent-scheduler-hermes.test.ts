@@ -27,6 +27,45 @@ function makeMockHermes(scriptPath: string, behavior: string): void {
   );
 }
 
+// ── Test-isolation state env ────────────────────────────────────────
+// runHermes logs lifecycle lines through lib/logger (resolving
+// TAMANDUA_STATE_DIR at write time). Without temp HOME / STATE_DIR /
+// DB_PATH those writes hit the REAL ~/.tamandua, trip the guard, and get
+// dropped (35 ledger violations). Isolate every test; restore after.
+let savedHome: string | undefined;
+let savedStateDir: string | undefined;
+let savedDbPath: string | undefined;
+let isolationRoot: string | null = null;
+
+beforeEach(() => {
+  savedHome = process.env.HOME;
+  savedStateDir = process.env.TAMANDUA_STATE_DIR;
+  savedDbPath = process.env.TAMANDUA_DB_PATH;
+  isolationRoot = tamanduaTempDir("tamandua-test-agent-scheduler-hermes-state-");
+  const stateDir = path.join(isolationRoot, ".tamandua");
+  fs.mkdirSync(stateDir, { recursive: true });
+  process.env.HOME = isolationRoot;
+  process.env.TAMANDUA_STATE_DIR = stateDir;
+  process.env.TAMANDUA_DB_PATH = path.join(stateDir, "tamandua.db");
+});
+
+afterEach(() => {
+  if (isolationRoot) {
+    try {
+      fs.rmSync(isolationRoot, { recursive: true, force: true });
+    } catch {
+      // best-effort cleanup
+    }
+    isolationRoot = null;
+  }
+  if (savedHome === undefined) delete process.env.HOME;
+  else process.env.HOME = savedHome;
+  if (savedStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+  else process.env.TAMANDUA_STATE_DIR = savedStateDir;
+  if (savedDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+  else process.env.TAMANDUA_DB_PATH = savedDbPath;
+});
+
 describe("runHermes", () => {
   let tempHome: string;
   let savedHermesBinary: string | undefined;

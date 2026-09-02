@@ -26,9 +26,20 @@ import { getDb } from "../dist/db.js";
 import { getRunEvents, type TamanduaEvent } from "../dist/installer/events.js";
 
 describe("step-respawned (RVOC US-002)", () => {
-  const { tamanduaDir } = createTempHome("tamandua-respawn-test-");
+  const th = createTempHome("tamandua-respawn-test-");
+  const { tamanduaDir } = th;
+  // HOME is required too: the recovery paths under test
+  // (recoverOrphanedStepsForAgent / claimStep) fire fire-and-forget
+  // teardown continuations (terminateRunWithDaemon → controlRequest) that
+  // resolve the daemon secret at HOME/.tamandua/daemon-secret when
+  // TAMANDUA_CONTROL_PORT is set — with the operator's real HOME that
+  // tripped the guard. Point HOME at the temp home and drop the ambient
+  // control port so controlRequest's early guard return fires instead of
+  // ever reaching a live daemon.
+  process.env.HOME = th.homeDir;
   process.env.TAMANDUA_STATE_DIR = tamanduaDir;
   process.env.TAMANDUA_DB_PATH = path.join(tamanduaDir, "tamandua.db");
+  delete process.env.TAMANDUA_CONTROL_PORT;
 
   const AGENT = "test_respawn_agent";
   const PRIOR_PID = 4242;

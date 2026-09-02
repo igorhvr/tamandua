@@ -2,7 +2,7 @@
  * US-005: workflow fail CLI command.
  */
 
-import { describe, it } from "node:test";
+import { describe, it, after } from "node:test";
 import { cleanChildEnv, createTempHome } from "./helpers/test-env.ts";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
@@ -170,6 +170,55 @@ function insertStep(
   db.close();
 }
 
+// ── Sticky isolation env ─────────────────────────────────────────────
+// forceFailRun launches fire-and-forget continuations — scheduleRunCronTeardown's
+// teardownWorkflowCronsIfIdle (logs "Workflow idle" through lib/logger) plus
+// the import()-hop terminateRunWithDaemon (controlRequest reads the daemon
+// secret at HOME/.tamandua/daemon-secret when TAMANDUA_CONTROL_PORT is set) —
+// that resolve DB / log / daemon-secret paths AFTER the triggering test's
+// finally has run. Restoring the operator's real env there makes those late
+// continuations trip the guard at the REAL ~/.tamandua (ledger entries with
+// testFile null). Keep HOME / TAMANDUA_STATE_DIR / TAMANDUA_DB_PATH pointed at
+// a module-scoped temp dir for the whole file and drop TAMANDUA_CONTROL_PORT
+// (an ambient port — e.g. 3339 when tests run inside a tamandua run — makes
+// controlRequest skip its early guard return and reach a live daemon). The
+// module after() restores the operator's env exactly as it was at load.
+const stickyState = (() => {
+  const th = createTempHome("tamandua-wf-fail-sticky-");
+  const stateDir = path.join(th.root, "state");
+  fs.mkdirSync(stateDir, { recursive: true });
+  return {
+    root: th.root,
+    homeDir: th.homeDir,
+    stateDir,
+    dbPath: path.join(stateDir, "tamandua.db"),
+  };
+})();
+const originalHome = process.env.HOME;
+const originalStateDir = process.env.TAMANDUA_STATE_DIR;
+const originalDbPath = process.env.TAMANDUA_DB_PATH;
+const originalControlPort = process.env.TAMANDUA_CONTROL_PORT;
+
+function restoreOrDelete(name: string, value: string | undefined): void {
+  if (value === undefined) delete process.env[name];
+  else process.env[name] = value;
+}
+
+function applyStickyEnv(): void {
+  process.env.HOME = stickyState.homeDir;
+  process.env.TAMANDUA_STATE_DIR = stickyState.stateDir;
+  process.env.TAMANDUA_DB_PATH = stickyState.dbPath;
+  delete process.env.TAMANDUA_CONTROL_PORT;
+}
+
+after(() => {
+  restoreOrDelete("HOME", originalHome);
+  restoreOrDelete("TAMANDUA_STATE_DIR", originalStateDir);
+  restoreOrDelete("TAMANDUA_DB_PATH", originalDbPath);
+  restoreOrDelete("TAMANDUA_CONTROL_PORT", originalControlPort);
+  try { fs.rmSync(stickyState.root, { recursive: true, force: true }); } catch { /* cleanup */ }
+});
+
 describe("US-005: workflow fail CLI command", () => {
   describe("forceFailRun backend", () => {
     it("force-fails a running run and emits run.force_failed event", async () => {
@@ -177,8 +226,13 @@ describe("US-005: workflow fail CLI command", () => {
       const stateDir = th.tamanduaDir;
       const { runId } = setupDbWithRun(stateDir);
 
+      process.env.HOME = th.homeDir;
       process.env.TAMANDUA_STATE_DIR = stateDir;
       process.env.TAMANDUA_DB_PATH = path.join(stateDir, "tamandua.db");
+      // Drop the ambient control port: with HOME temp but TAMANDUA_CONTROL_PORT
+      // still set, controlRequest would skip its early guard return and reach
+      // a live daemon on that port.
+      delete process.env.TAMANDUA_CONTROL_PORT;
       try {
         const { forceFailRun } = await import("../dist/installer/status.js");
         const result = await forceFailRun(runId, "Test force-fail reason");
@@ -199,8 +253,10 @@ describe("US-005: workflow fail CLI command", () => {
         assert.equal(ffEvents[0].detail, "Test force-fail reason");
         assert.equal(ffEvents[0].runId, runId);
       } finally {
-        delete process.env.TAMANDUA_STATE_DIR;
-        delete process.env.TAMANDUA_DB_PATH;
+        // Restore to the module-scoped sticky temp env (NOT the operator's
+        // real env): forceFailRun's fire-and-forget teardown continuations
+        // resolve DB/log/daemon-secret paths after this hook.
+        applyStickyEnv();
       }
     });
 
@@ -216,8 +272,13 @@ describe("US-005: workflow fail CLI command", () => {
       insertStep(stateDir, stepRunning, runId, "agentB", 1, "running", { claimPid: 99999 });
       insertStep(stateDir, stepDone, runId, "agentC", 2, "done");
 
+      process.env.HOME = th.homeDir;
       process.env.TAMANDUA_STATE_DIR = stateDir;
       process.env.TAMANDUA_DB_PATH = path.join(stateDir, "tamandua.db");
+      // Drop the ambient control port: with HOME temp but TAMANDUA_CONTROL_PORT
+      // still set, controlRequest would skip its early guard return and reach
+      // a live daemon on that port.
+      delete process.env.TAMANDUA_CONTROL_PORT;
       try {
         const { forceFailRun } = await import("../dist/installer/status.js");
         await forceFailRun(runId, "Cancelling steps");
@@ -232,8 +293,10 @@ describe("US-005: workflow fail CLI command", () => {
         assert.equal(s2.status, "canceled");
         assert.equal(s3.status, "done", "already-done steps should not be changed");
       } finally {
-        delete process.env.TAMANDUA_STATE_DIR;
-        delete process.env.TAMANDUA_DB_PATH;
+        // Restore to the module-scoped sticky temp env (NOT the operator's
+        // real env): forceFailRun's fire-and-forget teardown continuations
+        // resolve DB/log/daemon-secret paths after this hook.
+        applyStickyEnv();
       }
     });
 
@@ -242,8 +305,13 @@ describe("US-005: workflow fail CLI command", () => {
       const stateDir = th.tamanduaDir;
       const { runId } = setupDbWithRun(stateDir, { status: "completed" });
 
+      process.env.HOME = th.homeDir;
       process.env.TAMANDUA_STATE_DIR = stateDir;
       process.env.TAMANDUA_DB_PATH = path.join(stateDir, "tamandua.db");
+      // Drop the ambient control port: with HOME temp but TAMANDUA_CONTROL_PORT
+      // still set, controlRequest would skip its early guard return and reach
+      // a live daemon on that port.
+      delete process.env.TAMANDUA_CONTROL_PORT;
       try {
         const { forceFailRun } = await import("../dist/installer/status.js");
         await assert.rejects(
@@ -251,8 +319,10 @@ describe("US-005: workflow fail CLI command", () => {
           /already completed/,
         );
       } finally {
-        delete process.env.TAMANDUA_STATE_DIR;
-        delete process.env.TAMANDUA_DB_PATH;
+        // Restore to the module-scoped sticky temp env (NOT the operator's
+        // real env): forceFailRun's fire-and-forget teardown continuations
+        // resolve DB/log/daemon-secret paths after this hook.
+        applyStickyEnv();
       }
     });
 
@@ -261,8 +331,13 @@ describe("US-005: workflow fail CLI command", () => {
       const stateDir = th.tamanduaDir;
       const { runId } = setupDbWithRun(stateDir, { status: "canceled" });
 
+      process.env.HOME = th.homeDir;
       process.env.TAMANDUA_STATE_DIR = stateDir;
       process.env.TAMANDUA_DB_PATH = path.join(stateDir, "tamandua.db");
+      // Drop the ambient control port: with HOME temp but TAMANDUA_CONTROL_PORT
+      // still set, controlRequest would skip its early guard return and reach
+      // a live daemon on that port.
+      delete process.env.TAMANDUA_CONTROL_PORT;
       try {
         const { forceFailRun } = await import("../dist/installer/status.js");
         await assert.rejects(
@@ -270,8 +345,10 @@ describe("US-005: workflow fail CLI command", () => {
           /already canceled/,
         );
       } finally {
-        delete process.env.TAMANDUA_STATE_DIR;
-        delete process.env.TAMANDUA_DB_PATH;
+        // Restore to the module-scoped sticky temp env (NOT the operator's
+        // real env): forceFailRun's fire-and-forget teardown continuations
+        // resolve DB/log/daemon-secret paths after this hook.
+        applyStickyEnv();
       }
     });
 
@@ -285,8 +362,13 @@ describe("US-005: workflow fail CLI command", () => {
         claimPid: process.pid,
       });
 
+      process.env.HOME = th.homeDir;
       process.env.TAMANDUA_STATE_DIR = stateDir;
       process.env.TAMANDUA_DB_PATH = path.join(stateDir, "tamandua.db");
+      // Drop the ambient control port: with HOME temp but TAMANDUA_CONTROL_PORT
+      // still set, controlRequest would skip its early guard return and reach
+      // a live daemon on that port.
+      delete process.env.TAMANDUA_CONTROL_PORT;
       try {
         const { forceFailRun } = await import("../dist/installer/status.js");
 
@@ -302,8 +384,10 @@ describe("US-005: workflow fail CLI command", () => {
         assert.ok(result2.ok, "should succeed with --force");
         assert.equal(result2.status, "failed");
       } finally {
-        delete process.env.TAMANDUA_STATE_DIR;
-        delete process.env.TAMANDUA_DB_PATH;
+        // Restore to the module-scoped sticky temp env (NOT the operator's
+        // real env): forceFailRun's fire-and-forget teardown continuations
+        // resolve DB/log/daemon-secret paths after this hook.
+        applyStickyEnv();
       }
     });
 
@@ -312,16 +396,23 @@ describe("US-005: workflow fail CLI command", () => {
       const stateDir = th.tamanduaDir;
       const { runId } = setupDbWithRun(stateDir, { status: "paused" });
 
+      process.env.HOME = th.homeDir;
       process.env.TAMANDUA_STATE_DIR = stateDir;
       process.env.TAMANDUA_DB_PATH = path.join(stateDir, "tamandua.db");
+      // Drop the ambient control port: with HOME temp but TAMANDUA_CONTROL_PORT
+      // still set, controlRequest would skip its early guard return and reach
+      // a live daemon on that port.
+      delete process.env.TAMANDUA_CONTROL_PORT;
       try {
         const { forceFailRun } = await import("../dist/installer/status.js");
         const result = await forceFailRun(runId, "Paused run force-fail");
         assert.ok(result.ok);
         assert.equal(result.status, "failed");
       } finally {
-        delete process.env.TAMANDUA_STATE_DIR;
-        delete process.env.TAMANDUA_DB_PATH;
+        // Restore to the module-scoped sticky temp env (NOT the operator's
+        // real env): forceFailRun's fire-and-forget teardown continuations
+        // resolve DB/log/daemon-secret paths after this hook.
+        applyStickyEnv();
       }
     });
   });
@@ -441,5 +532,45 @@ describe("US-005: workflow fail CLI command", () => {
         `stderr: ${result.stderr}`,
       );
     });
+  });
+});
+
+// ── Late fire-and-forget continuations land in sticky temp state ─────
+// forceFailRun's scheduleRunCronTeardown fires teardownWorkflowCronsIfIdle as
+// an unawaited continuation that resolves DB + logger paths AFTER the
+// triggering test's finally has restored the env. Before the sticky env
+// existed it logged "Workflow idle" at the REAL ~/.tamandua/tamandua.log
+// (guard-dropped, ledger entry with testFile null). This regression test
+// proves the write now lands in the sticky temp state.
+describe("forceFailRun late teardown continuations land in sticky temp state", () => {
+  it('teardown idle-check logs "Workflow idle" into the sticky tamandua.log', async () => {
+    applyStickyEnv();
+    const { runId } = setupDbWithRun(stickyState.stateDir);
+    const { forceFailRun } = await import("../dist/installer/status.js");
+
+    const result = await forceFailRun(runId, "Sticky teardown check");
+    assert.ok(result.ok);
+
+    // Give the fire-and-forget module-loader continuations a chance to run.
+    await new Promise((resolve) => setTimeout(resolve, 600));
+
+    // The run.force_failed event landed in the sticky events dir.
+    const evtFile = path.join(stickyState.stateDir, "events", `${runId}.jsonl`);
+    assert.ok(fs.existsSync(evtFile), "force_failed event must land in the sticky events dir");
+    const events = readRunEvents(stickyState.stateDir, runId);
+    assert.ok(
+      events.some((e) => e.event === "run.force_failed"),
+      `expected run.force_failed in sticky events, got: ${events.map((e) => e.event).join(", ")}`,
+    );
+
+    // The late teardown idle-check logged into the sticky log (previously
+    // guard-dropped at the real ~/.tamandua — the coverage the guard hid).
+    const logFile = path.join(stickyState.stateDir, "tamandua.log");
+    assert.ok(fs.existsSync(logFile), "teardown logger write must land in the sticky log");
+    const logContent = fs.readFileSync(logFile, "utf-8");
+    assert.ok(
+      logContent.includes("Workflow idle"),
+      `teardown idle-check must have run against the sticky state, log:\n${logContent}`,
+    );
   });
 });

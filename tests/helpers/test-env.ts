@@ -160,6 +160,13 @@ const BASE_ENV_KEYS = [
   // daemon/script that reaches the real ~/.tamandua or a production port
   // fails loudly instead of silently interfering with the live instance.
   "TAMANDUA_TEST_GUARD",
+  // Guard violation ledger: the PRLL lane scripts point
+  // TAMANDUA_TEST_GUARD_LEDGER at a per-run temp file so violations from
+  // spawned children are recorded and attributed too; the runner also marks
+  // the guard's own deliberate provocations with TAMANDUA_TEST_GUARD_EXPECT=1
+  // so the ledger report can filter them.
+  "TAMANDUA_TEST_GUARD_LEDGER",
+  "TAMANDUA_TEST_GUARD_EXPECT",
 ];
 
 export function cleanChildEnv(

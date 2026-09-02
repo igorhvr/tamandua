@@ -69,6 +69,30 @@ describe("run-serial-tests.sh", () => {
     );
   });
 
+  it("creates and exports a per-run guard-violation ledger", () => {
+    const content = fs.readFileSync(SERIAL_SCRIPT, "utf-8");
+    assert.ok(
+      content.includes("TAMANDUA_TEST_GUARD_LEDGER"),
+      "run-serial-tests.sh must reference TAMANDUA_TEST_GUARD_LEDGER",
+    );
+    assert.ok(
+      content.includes("export TAMANDUA_TEST_GUARD_LEDGER"),
+      "run-serial-tests.sh must export TAMANDUA_TEST_GUARD_LEDGER",
+    );
+  });
+
+  it("invokes guard-ledger-report.mjs after the lane", () => {
+    const content = fs.readFileSync(SERIAL_SCRIPT, "utf-8");
+    assert.ok(
+      content.includes("guard-ledger-report.mjs"),
+      "run-serial-tests.sh must invoke scripts/guard-ledger-report.mjs",
+    );
+    assert.ok(
+      content.includes("$LEDGER_FILE"),
+      "run-serial-tests.sh must pass the ledger path to the report script",
+    );
+  });
+
   it("defaults TAMANDUA_TEST_GUARD to 1 when unset", () => {
     // Run a minimal bash snippet that mimics the script's defaulting logic
     const tmpDir = makeTmpDir();
@@ -249,6 +273,94 @@ describe("run-serial-tests.sh", () => {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
+
+  it("captures the ledger-report exit code (lane-fail enforcement content pin)", () => {
+    const content = fs.readFileSync(SERIAL_SCRIPT, "utf-8");
+    assert.ok(
+      content.includes("REPORT_EXIT=0"),
+      "run-serial-tests.sh must initialize REPORT_EXIT before running the report",
+    );
+    assert.ok(
+      content.includes("|| REPORT_EXIT=$?"),
+      "run-serial-tests.sh must capture the ledger report exit code",
+    );
+    assert.ok(
+      content.includes('if [ "$REPORT_EXIT" -ne 0 ]'),
+      "run-serial-tests.sh must branch on the ledger report exit code",
+    );
+    assert.ok(
+      content.includes('exit "$NODE_EXIT"'),
+      "run-serial-tests.sh must still exit with node's exit code when the ledger is empty",
+    );
+    assert.ok(
+      !content.includes('"$LEDGER_FILE" >&2 || true'),
+      "run-serial-tests.sh must not swallow the ledger report exit code",
+    );
+  });
+
+  it("exits non-zero when the ledger has a real violation even though all tests pass", () => {
+    const tmpDir = makeTmpDir();
+    try {
+      // Lane-fail enforcement: a passing node --test run must still fail the
+      // lane when the guard ledger contains a non-expected violation. The temp
+      // test file appends a violation-shaped entry to the lane's OWN ledger
+      // (TAMANDUA_TEST_GUARD_LEDGER, exported by the lane script) — the same
+      // JSONL format src/lib/test-guard.ts writes — so the real
+      // guard-ledger-report.mjs flags it and the lane exits non-zero.
+      const scriptsDir = path.join(tmpDir, "scripts");
+      fs.mkdirSync(scriptsDir, { recursive: true });
+      fs.copyFileSync(SERIAL_SCRIPT, path.join(scriptsDir, "run-serial-tests.sh"));
+      fs.copyFileSync(
+        path.join(REPO_ROOT, "scripts", "guard-ledger-report.mjs"),
+        path.join(scriptsDir, "guard-ledger-report.mjs"),
+      );
+      writeText(path.join(tmpDir, "src", "violation.test.ts"),
+        'import { describe, it } from "node:test";\n' +
+        'import assert from "node:assert/strict";\n' +
+        'import fs from "node:fs";\n' +
+        'describe("fake violation", () => {\n' +
+        '  it("appends a ledger entry and passes", () => {\n' +
+        '    const ledger = process.env.TAMANDUA_TEST_GUARD_LEDGER;\n' +
+        '    assert.ok(ledger, "lane must export TAMANDUA_TEST_GUARD_LEDGER");\n' +
+        '    fs.appendFileSync(ledger, JSON.stringify({\n' +
+        '      kind: "db",\n' +
+        '      path: "/fake/home/.tamandua/tamandua.db",\n' +
+        '      what: "getDb()",\n' +
+        '      testFile: "src/violation.test.ts",\n' +
+        '      testLine: 8,\n' +
+        '      expected: false,\n' +
+        '      ts: Date.now(),\n' +
+        '    }) + "\\n");\n' +
+        '    assert.equal(1, 1);\n' +
+        '  });\n' +
+        '});\n'
+      );
+      writeText(path.join(tmpDir, "tests", "serial-files.txt"), "src/violation.test.ts\n");
+
+      try {
+        execFileSync("bash", [SERIAL_SCRIPT], {
+          cwd: tmpDir,
+          env: cleanChildEnv({ HOME: tmpDir, TAMANDUA_REPO_ROOT: tmpDir, TAMANDUA_TEST_GUARD: "0" }),
+          stdio: "pipe",
+          encoding: "utf-8",
+        });
+        assert.fail("Serial lane must fail when the ledger contains a real violation");
+      } catch (e) {
+        assert.notEqual(e.status, 0, "lane exit code must be non-zero on ledger violations");
+        const stderr = e.stderr || "";
+        assert.ok(
+          stderr.includes("TEST ISOLATION VIOLATIONS"),
+          "lane stderr must contain the violation report header: " + stderr.slice(0, 800),
+        );
+        assert.ok(
+          stderr.includes("src/violation.test.ts"),
+          "lane stderr must name the violating test file: " + stderr.slice(0, 800),
+        );
+      }
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("run-parallel-tests.sh", () => {
@@ -282,6 +394,30 @@ describe("run-parallel-tests.sh", () => {
     assert.ok(
       content.includes("TAMANDUA_DSH_BINARY"),
       "run-parallel-tests.sh must reference TAMANDUA_DSH_BINARY",
+    );
+  });
+
+  it("creates and exports a per-run guard-violation ledger", () => {
+    const content = fs.readFileSync(PARALLEL_SCRIPT, "utf-8");
+    assert.ok(
+      content.includes("TAMANDUA_TEST_GUARD_LEDGER"),
+      "run-parallel-tests.sh must reference TAMANDUA_TEST_GUARD_LEDGER",
+    );
+    assert.ok(
+      content.includes("export TAMANDUA_TEST_GUARD_LEDGER"),
+      "run-parallel-tests.sh must export TAMANDUA_TEST_GUARD_LEDGER",
+    );
+  });
+
+  it("invokes guard-ledger-report.mjs after the lane", () => {
+    const content = fs.readFileSync(PARALLEL_SCRIPT, "utf-8");
+    assert.ok(
+      content.includes("guard-ledger-report.mjs"),
+      "run-parallel-tests.sh must invoke scripts/guard-ledger-report.mjs",
+    );
+    assert.ok(
+      content.includes("$LEDGER_FILE"),
+      "run-parallel-tests.sh must pass the ledger path to the report script",
     );
   });
 
@@ -356,6 +492,93 @@ describe("run-parallel-tests.sh", () => {
         assert.fail("Should have exited non-zero on test failure");
       } catch (e) {
         assert.notEqual(e.status, 0, "exit code must be non-zero on failure");
+      }
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("captures the ledger-report exit code (lane-fail enforcement content pin)", () => {
+    const content = fs.readFileSync(PARALLEL_SCRIPT, "utf-8");
+    assert.ok(
+      content.includes("REPORT_EXIT=0"),
+      "run-parallel-tests.sh must initialize REPORT_EXIT before running the report",
+    );
+    assert.ok(
+      content.includes("|| REPORT_EXIT=$?"),
+      "run-parallel-tests.sh must capture the ledger report exit code",
+    );
+    assert.ok(
+      content.includes('if [ "$REPORT_EXIT" -ne 0 ]'),
+      "run-parallel-tests.sh must branch on the ledger report exit code",
+    );
+    assert.ok(
+      content.includes('exit "$NODE_EXIT"'),
+      "run-parallel-tests.sh must still exit with node's exit code when the ledger is empty",
+    );
+    assert.ok(
+      !content.includes('"$LEDGER_FILE" >&2 || true'),
+      "run-parallel-tests.sh must not swallow the ledger report exit code",
+    );
+  });
+
+  it("exits non-zero when the ledger has a real violation even though all tests pass", () => {
+    const tmpDir = makeTmpDir();
+    try {
+      // Lane-fail enforcement: a passing node --test run must still fail the
+      // lane when the guard ledger contains a non-expected violation. The temp
+      // test file appends a violation-shaped entry to the lane's OWN ledger
+      // (TAMANDUA_TEST_GUARD_LEDGER, exported by the lane script) — the same
+      // JSONL format src/lib/test-guard.ts writes — so the real
+      // guard-ledger-report.mjs flags it and the lane exits non-zero.
+      const scriptsDir = path.join(tmpDir, "scripts");
+      fs.mkdirSync(scriptsDir, { recursive: true });
+      fs.copyFileSync(PARALLEL_SCRIPT, path.join(scriptsDir, "run-parallel-tests.sh"));
+      fs.copyFileSync(
+        path.join(REPO_ROOT, "scripts", "guard-ledger-report.mjs"),
+        path.join(scriptsDir, "guard-ledger-report.mjs"),
+      );
+      writeText(path.join(tmpDir, "src", "violation.test.ts"),
+        'import { describe, it } from "node:test";\n' +
+        'import assert from "node:assert/strict";\n' +
+        'import fs from "node:fs";\n' +
+        'describe("fake violation", () => {\n' +
+        '  it("appends a ledger entry and passes", () => {\n' +
+        '    const ledger = process.env.TAMANDUA_TEST_GUARD_LEDGER;\n' +
+        '    assert.ok(ledger, "lane must export TAMANDUA_TEST_GUARD_LEDGER");\n' +
+        '    fs.appendFileSync(ledger, JSON.stringify({\n' +
+        '      kind: "db",\n' +
+        '      path: "/fake/home/.tamandua/tamandua.db",\n' +
+        '      what: "getDb()",\n' +
+        '      testFile: "src/violation.test.ts",\n' +
+        '      testLine: 8,\n' +
+        '      expected: false,\n' +
+        '      ts: Date.now(),\n' +
+        '    }) + "\\n");\n' +
+        '    assert.equal(1, 1);\n' +
+        '  });\n' +
+        '});\n'
+      );
+
+      try {
+        execFileSync("bash", [PARALLEL_SCRIPT], {
+          cwd: tmpDir,
+          env: cleanChildEnv({ HOME: tmpDir, TAMANDUA_REPO_ROOT: tmpDir, TAMANDUA_TEST_GUARD: "0" }),
+          stdio: "pipe",
+          encoding: "utf-8",
+        });
+        assert.fail("Parallel lane must fail when the ledger contains a real violation");
+      } catch (e) {
+        assert.notEqual(e.status, 0, "lane exit code must be non-zero on ledger violations");
+        const stderr = e.stderr || "";
+        assert.ok(
+          stderr.includes("TEST ISOLATION VIOLATIONS"),
+          "lane stderr must contain the violation report header: " + stderr.slice(0, 800),
+        );
+        assert.ok(
+          stderr.includes("src/violation.test.ts"),
+          "lane stderr must name the violating test file: " + stderr.slice(0, 800),
+        );
       }
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });

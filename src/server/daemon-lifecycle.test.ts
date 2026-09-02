@@ -416,18 +416,23 @@ describe("daemon heartbeat marker test-guard", { concurrency: 1 }, () => {
   let savedStateDir: string | undefined;
   let savedGuard: string | undefined;
   let savedNodeTestContext: string | undefined;
+  let savedExpect: string | undefined;
 
   beforeEach(() => {
     savedHome = process.env.HOME;
     savedStateDir = process.env.TAMANDUA_STATE_DIR;
     savedGuard = process.env.TAMANDUA_TEST_GUARD;
     savedNodeTestContext = process.env.NODE_TEST_CONTEXT;
+    savedExpect = process.env.TAMANDUA_TEST_GUARD_EXPECT;
 
     // Activate the guard and force path resolution into the production state
     // dir (the guard compares against os.userInfo().homedir, not os.homedir()).
     process.env.TAMANDUA_TEST_GUARD = "1";
     process.env.HOME = os.userInfo().homedir;
     delete process.env.TAMANDUA_STATE_DIR;
+    // Every test in this describe deliberately provokes the guard (or uses an
+    // explicit homeDir). No real leaks here — mark the describe expected.
+    process.env.TAMANDUA_TEST_GUARD_EXPECT = "1";
   });
 
   afterEach(() => {
@@ -439,6 +444,8 @@ describe("daemon heartbeat marker test-guard", { concurrency: 1 }, () => {
     else delete process.env.TAMANDUA_TEST_GUARD;
     if (savedNodeTestContext !== undefined) process.env.NODE_TEST_CONTEXT = savedNodeTestContext;
     else delete process.env.NODE_TEST_CONTEXT;
+    if (savedExpect !== undefined) process.env.TAMANDUA_TEST_GUARD_EXPECT = savedExpect;
+    else delete process.env.TAMANDUA_TEST_GUARD_EXPECT;
   });
 
   it("marker functions never write the production heartbeat file and do not throw", () => {

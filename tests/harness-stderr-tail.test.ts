@@ -29,6 +29,34 @@ function makeExecutable(dir: string, name: string, body: string): string {
   return p;
 }
 
+/**
+ * The harness adapter logs every round lifecycle (pre-launch / launched /
+ * completed) through lib/logger, which resolves the log path from
+ * TAMANDUA_STATE_DIR (falling back to ~/.tamandua). Before HOME /
+ * TAMANDUA_STATE_DIR / TAMANDUA_DB_PATH were isolated per test, the
+ * test-isolation guard silently dropped those writes at the REAL
+ * ~/.tamandua — the tests passed without exercising the log path at all.
+ * Now that each test points the env at a per-test temp dir, assert the
+ * writes actually land in the temp tamandua.log (the coverage the guard
+ * used to hide).
+ */
+function assertRoundsLogged(adapterName: "pi" | "hermes"): void {
+  const logFile = path.join(tempDir, "state", "tamandua.log");
+  assert.ok(
+    fs.existsSync(logFile),
+    `runRound must write the adapter log into the temp state (${logFile})`,
+  );
+  const content = fs.readFileSync(logFile, "utf-8");
+  assert.ok(
+    content.includes(`${adapterName} pre-launch`),
+    `expected "${adapterName} pre-launch" in the temp log, got:\n${content}`,
+  );
+  assert.ok(
+    content.includes(`${adapterName} completed`),
+    `expected "${adapterName} completed" in the temp log, got:\n${content}`,
+  );
+}
+
 beforeEach(() => {
   tempDir = tamanduaTempDir("tamandua-harness-stderr-tail-");
   savedPath = process.env.PATH;
@@ -37,6 +65,16 @@ beforeEach(() => {
   savedHome = process.env.HOME;
   savedStateDir = process.env.TAMANDUA_STATE_DIR;
   savedDbPath = process.env.TAMANDUA_DB_PATH;
+  // Isolate HOME / TAMANDUA_STATE_DIR / TAMANDUA_DB_PATH per test: the
+  // harness adapters log through lib/logger on EVERY runRound, and without
+  // a temp state dir the writes resolve to the real ~/.tamandua
+  // (guard violation, write skipped). afterEach restores the originals.
+  const homeDir = path.join(tempDir, "home");
+  const stateDir = path.join(tempDir, "state");
+  fs.mkdirSync(stateDir, { recursive: true });
+  process.env.HOME = homeDir;
+  process.env.TAMANDUA_STATE_DIR = stateDir;
+  process.env.TAMANDUA_DB_PATH = path.join(stateDir, "tamandua.db");
 });
 
 afterEach(() => {
@@ -78,6 +116,7 @@ describe("PiHarnessAdapter stderrTail", () => {
     assert.ok(result.stderrTail!.includes("more stderr"), "stderrTail should contain all stderr lines");
     assert.equal(result.exitCode, 0, "exitCode should be 0");
     assert.equal(result.signal ?? null, null, "signal should be null");
+    assertRoundsLogged("pi");
   });
 
   it("pi runRound stderrTail is sanitized (ANSI codes stripped)", async () => {
@@ -100,6 +139,7 @@ describe("PiHarnessAdapter stderrTail", () => {
     assert.ok(result.stderrTail !== undefined, "stderrTail must be defined");
     assert.ok(!result.stderrTail!.includes("\x1B["), "stderrTail must not contain ANSI escape sequences");
     assert.ok(result.stderrTail!.includes("red error"), "stderrTail should contain the message without ANSI codes");
+    assertRoundsLogged("pi");
   });
 
   it("pi runRound stderrTail is an empty string when stderr is empty", async () => {
@@ -117,6 +157,7 @@ describe("PiHarnessAdapter stderrTail", () => {
     const result = await adapter.runRound("do work");
 
     assert.equal(result.stderrTail, "", "stderrTail should be an empty string for empty stderr");
+    assertRoundsLogged("pi");
   });
 });
 
@@ -142,6 +183,7 @@ describe("HermesHarnessAdapter stderrTail", () => {
     assert.ok(result.stderrTail!.length > 0, "stderrTail must not be empty");
     assert.ok(result.stderrTail!.includes("message one"), "stderrTail should contain sanitized stderr");
     assert.ok(result.stderrTail!.includes("message two"), "stderrTail should contain all stderr lines");
+    assertRoundsLogged("hermes");
   });
 
   it("hermes session_id trailer extraction still works alongside stderrTail", async () => {
@@ -168,6 +210,7 @@ describe("HermesHarnessAdapter stderrTail", () => {
     // Note: session_id lines are filtered from stdout, but the raw stderr
     // still flows into sanitizeStderrTail. That's OK — sanitization just
     // strips ANSI codes, truncates lines, and bounds size.
+    assertRoundsLogged("hermes");
   });
 
   it("hermes runRound stderrTail is an empty string when stderr is empty", async () => {
@@ -185,6 +228,7 @@ describe("HermesHarnessAdapter stderrTail", () => {
     const result = await adapter.runRound("do work");
 
     assert.equal(result.stderrTail, "", "stderrTail should be an empty string for empty stderr");
+    assertRoundsLogged("hermes");
   });
 
   it("hermes runRound stderrTail is bounded to ~8KB even with large stderr", async () => {
@@ -214,6 +258,7 @@ describe("HermesHarnessAdapter stderrTail", () => {
     // sanitizeStderrTail caps at 8KB by default, but individual lines are truncated
     // to 512 chars. With 200-char lines they pass through, so 8KB ≈ 40 lines.
     assert.ok(tailBytes <= 9000, `stderrTail should be bounded (~8KB), got ${tailBytes} bytes`);
+    assertRoundsLogged("hermes");
   });
 });
 

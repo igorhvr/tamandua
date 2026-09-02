@@ -211,8 +211,13 @@ describe("logger", () => {
     // and a throwing logger turns every late write into an unhandledRejection.
     const prevGuard = process.env.TAMANDUA_TEST_GUARD;
     const prevStateDir = process.env.TAMANDUA_STATE_DIR;
+    const prevExpect = process.env.TAMANDUA_TEST_GUARD_EXPECT;
     try {
       process.env.TAMANDUA_TEST_GUARD = "1";
+      // Deliberate provocation: this test intentionally points the log path
+      // into the real state dir to verify the guard drops the write. Mark it
+      // expected so the lane's ledger report filters this entry.
+      process.env.TAMANDUA_TEST_GUARD_EXPECT = "1";
       // Point TAMANDUA_STATE_DIR into the real state dir to trigger the guard.
       const realStateRoot = path.join(os.userInfo().homedir, ".tamandua");
       const leakedDir = path.join(realStateRoot, "leaked-from-test");
@@ -230,6 +235,8 @@ describe("logger", () => {
     } finally {
       process.env.TAMANDUA_TEST_GUARD = prevGuard;
       process.env.TAMANDUA_STATE_DIR = prevStateDir;
+      if (prevExpect === undefined) delete process.env.TAMANDUA_TEST_GUARD_EXPECT;
+      else process.env.TAMANDUA_TEST_GUARD_EXPECT = prevExpect;
     }
   });
 
@@ -240,8 +247,12 @@ describe("logger", () => {
     const prevGuard = process.env.TAMANDUA_TEST_GUARD;
     const prevStateDir = process.env.TAMANDUA_STATE_DIR;
     const prevHome = process.env.HOME;
+    const prevExpect = process.env.TAMANDUA_TEST_GUARD_EXPECT;
     try {
       process.env.TAMANDUA_TEST_GUARD = "1";
+      // Deliberate provocation: HOME spoof + real state dir to verify the
+      // guard resolves via os.userInfo().homedir. Mark expected.
+      process.env.TAMANDUA_TEST_GUARD_EXPECT = "1";
       process.env.HOME = path.join(tamanduaTempRoot(), "spoofed-home-" + Date.now());
       const realStateRoot = path.join(os.userInfo().homedir, ".tamandua");
       const spoofDir = path.join(realStateRoot, "spoofed-leak");
@@ -263,6 +274,8 @@ describe("logger", () => {
       } else {
         process.env.HOME = prevHome;
       }
+      if (prevExpect === undefined) delete process.env.TAMANDUA_TEST_GUARD_EXPECT;
+      else process.env.TAMANDUA_TEST_GUARD_EXPECT = prevExpect;
     }
   });
 

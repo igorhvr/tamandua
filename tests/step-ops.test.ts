@@ -12,6 +12,49 @@ import crypto from "node:crypto";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, "..");
 
+// ── Module-level sticky temp env ─────────────────────────────────────
+// The step-ops functions under test (failStep / claimStep / completeStep /
+// recoverOrphanedStepsForAgent) fire fire-and-forget continuations —
+// scheduleRunCronTeardown → terminateRunWithDaemon (controlRequest resolves
+// the daemon secret at HOME/.tamandua/daemon-secret), and the failStep
+// rugpull setImmediate (detectRugpull → getDb + logger) — that resolve DB /
+// log / daemon-secret paths AFTER the triggering describe's after() hook has
+// restored the env. Keep HOME / TAMANDUA_STATE_DIR / TAMANDUA_DB_PATH pointed
+// at a module-scoped temp dir for the whole file: each per-describe before()
+// below saves the current (module-temp) env and its after() restores it, so
+// the env stays temp until the module after() restores the operator's
+// originals at the very end. The ambient control port is dropped too so
+// controlRequest's early guard return fires instead of ever reaching a live
+// daemon.
+const _moduleTh = createTempHome("tamandua-step-ops-module-");
+const _moduleStateDir = path.join(_moduleTh.root, "state");
+fs.mkdirSync(_moduleStateDir, { recursive: true });
+const _moduleHome = process.env.HOME;
+const _moduleStateDirSaved = process.env.TAMANDUA_STATE_DIR;
+const _moduleDbPath = process.env.TAMANDUA_DB_PATH;
+const _moduleControlPort = process.env.TAMANDUA_CONTROL_PORT;
+process.env.HOME = _moduleTh.homeDir;
+process.env.TAMANDUA_STATE_DIR = _moduleStateDir;
+process.env.TAMANDUA_DB_PATH = path.join(_moduleStateDir, "tamandua.db");
+delete process.env.TAMANDUA_CONTROL_PORT;
+after(async () => {
+  // failStep's rugpull check is fire-and-forget via setImmediate; drain a
+  // few event-loop turns while the sticky temp env is still active so those
+  // getDb/logger writes land in the temp state, not the restored real env.
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const restore = (name: string, value: string | undefined): void => {
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  };
+  restore("HOME", _moduleHome);
+  restore("TAMANDUA_STATE_DIR", _moduleStateDirSaved);
+  restore("TAMANDUA_DB_PATH", _moduleDbPath);
+  restore("TAMANDUA_CONTROL_PORT", _moduleControlPort);
+  try { fs.rmSync(_moduleTh.root, { recursive: true, force: true }); } catch { /* cleanup */ }
+});
+
 describe("parseOutputKeyValues", () => {
   it("parses simple KEY: value pairs", () => {
     const result = parseOutputKeyValues("STATUS: done\nCHANGES: fixed bug\nTESTS: ran suite");

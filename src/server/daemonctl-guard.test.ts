@@ -27,16 +27,23 @@ let savedHome: string | undefined;
 let savedStateDir: string | undefined;
 let savedGuard: string | undefined;
 let savedNodeTestContext: string | undefined;
+let savedExpect: string | undefined;
 
 beforeEach(() => {
   savedHome = process.env.HOME;
   savedStateDir = process.env.TAMANDUA_STATE_DIR;
   savedGuard = process.env.TAMANDUA_TEST_GUARD;
   savedNodeTestContext = process.env.NODE_TEST_CONTEXT;
+  savedExpect = process.env.TAMANDUA_TEST_GUARD_EXPECT;
 
   // Activate the guard for all tests in this file. The default npm test env
   // already sets TAMANDUA_TEST_GUARD=1, but be explicit about it.
   process.env.TAMANDUA_TEST_GUARD = "1";
+  // Every test in this file is a guard test: the throwing tests deliberately
+  // provoke isolation violations (HOME = real user home), and the rest either
+  // use explicit opts.homeDir isolation or disable the guard. No real leaks
+  // live here — mark the whole file expected.
+  process.env.TAMANDUA_TEST_GUARD_EXPECT = "1";
 });
 
 afterEach(() => {
@@ -48,6 +55,8 @@ afterEach(() => {
   else delete process.env.TAMANDUA_TEST_GUARD;
   if (savedNodeTestContext !== undefined) process.env.NODE_TEST_CONTEXT = savedNodeTestContext;
   else delete process.env.NODE_TEST_CONTEXT;
+  if (savedExpect !== undefined) process.env.TAMANDUA_TEST_GUARD_EXPECT = savedExpect;
+  else delete process.env.TAMANDUA_TEST_GUARD_EXPECT;
 });
 
 // ── Helper ──────────────────────────────────────────────────────────

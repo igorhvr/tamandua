@@ -50,16 +50,68 @@ function makeEnv(hermesHome: string): NodeJS.ProcessEnv {
   return { HERMES_HOME: hermesHome };
 }
 
+/**
+ * Isolate the tamandua state for one test: point HOME / TAMANDUA_STATE_DIR /
+ * TAMANDUA_DB_PATH at fresh temp dirs under `tempDir` (the hermes-home
+ * fixture). lookupHermesSessionTokens logs a warning through lib/logger on
+ * every failure path; without temp state the logger would resolve the REAL
+ * ~/.tamandua/tamandua.log, trip the test-isolation guard, and drop the
+ * write. Returns a restore() that puts the previous env back.
+ */
+function isolateTamanduaState(tempDir: string): () => void {
+  const savedHome = process.env.HOME;
+  const savedStateDir = process.env.TAMANDUA_STATE_DIR;
+  const savedDbPath = process.env.TAMANDUA_DB_PATH;
+
+  const homeDir = path.join(tempDir, "home");
+  const stateDir = path.join(tempDir, "tamandua-state");
+  fs.mkdirSync(homeDir, { recursive: true });
+  fs.mkdirSync(stateDir, { recursive: true });
+  process.env.HOME = homeDir;
+  process.env.TAMANDUA_STATE_DIR = stateDir;
+  process.env.TAMANDUA_DB_PATH = path.join(stateDir, "tamandua.db");
+
+  return () => {
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+    if (savedStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+    else process.env.TAMANDUA_STATE_DIR = savedStateDir;
+    if (savedDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+    else process.env.TAMANDUA_DB_PATH = savedDbPath;
+  };
+}
+
+/** Read the isolated tamandua.log (empty string when not yet written). */
+function readTamanduaLog(stateDir: string): string {
+  try {
+    return fs.readFileSync(path.join(stateDir, "tamandua.log"), "utf8");
+  } catch {
+    return "";
+  }
+}
+
 describe("lookupHermesSessionTokens", () => {
   let tempDir: string | null = null;
+  let stateDir: string | null = null;
   let savedHermesHome: string | undefined;
+  let restoreTamanduaState: (() => void) | null = null;
 
   beforeEach(() => {
     tempDir = createTempHome();
     savedHermesHome = process.env.HERMES_HOME;
+    // Failure paths log through lib/logger — isolate HOME /
+    // TAMANDUA_STATE_DIR / TAMANDUA_DB_PATH so the warning lands in a temp
+    // tamandua.log instead of tripping the guard at the real ~/.tamandua.
+    restoreTamanduaState = isolateTamanduaState(tempDir);
+    stateDir = path.join(tempDir, "tamandua-state");
   });
 
   afterEach(() => {
+    if (restoreTamanduaState) {
+      restoreTamanduaState();
+      restoreTamanduaState = null;
+    }
+    stateDir = null;
     if (tempDir) {
       fs.rmSync(tempDir, { recursive: true, force: true });
       tempDir = null;
@@ -117,6 +169,10 @@ describe("lookupHermesSessionTokens", () => {
   it("returns null when state.db is missing", async () => {
     const result = await lookupHermesSessionTokens("sess-abc", makeEnv(tempDir!));
     assert.equal(result, null);
+    // The failure warning (previously dropped by the guard at the real
+    // ~/.tamandua) now lands in the isolated temp tamandua.log.
+    assert.match(readTamanduaLog(stateDir!), /Hermes session token lookup failed/);
+    assert.match(readTamanduaLog(stateDir!), /state\.db not found/);
   });
 
   it("returns null when sessions table is missing", async () => {
@@ -127,6 +183,8 @@ describe("lookupHermesSessionTokens", () => {
 
     const result = await lookupHermesSessionTokens("sess-abc", makeEnv(tempDir!));
     assert.equal(result, null);
+    assert.match(readTamanduaLog(stateDir!), /Hermes session token lookup failed/);
+    assert.match(readTamanduaLog(stateDir!), /no sessions table/);
   });
 
   it("returns null when a required column is missing (e.g. no cache_write_tokens)", async () => {
@@ -147,6 +205,8 @@ describe("lookupHermesSessionTokens", () => {
 
     const result = await lookupHermesSessionTokens("sess-abc", makeEnv(tempDir!));
     assert.equal(result, null);
+    assert.match(readTamanduaLog(stateDir!), /Hermes session token lookup failed/);
+    assert.match(readTamanduaLog(stateDir!), /missing columns/);
   });
 
   it("returns null when row not found after retries", async () => {
@@ -156,6 +216,8 @@ describe("lookupHermesSessionTokens", () => {
 
     const result = await lookupHermesSessionTokens("sess-missing", makeEnv(tempDir!));
     assert.equal(result, null);
+    assert.match(readTamanduaLog(stateDir!), /Hermes session token lookup failed/);
+    assert.match(readTamanduaLog(stateDir!), /sess-missing not found/);
   });
 
   it("never creates the state.db file when missing (read-only)", async () => {
@@ -166,6 +228,7 @@ describe("lookupHermesSessionTokens", () => {
 
     // readOnly mode should prevent file creation
     assert.ok(!fs.existsSync(stateDbPath));
+    assert.match(readTamanduaLog(stateDir!), /Hermes session token lookup failed/);
   });
 
   it("resolves HERMES_HOME from the env parameter", async () => {

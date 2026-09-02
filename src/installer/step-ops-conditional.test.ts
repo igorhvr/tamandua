@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { afterEach, beforeEach, describe, it } from "node:test";
+import { after, afterEach, beforeEach, describe, it } from "node:test";
 
 import { getDb } from "../../dist/db.js";
 import {
@@ -14,6 +14,70 @@ import {
 import { getRunEvents } from "../../dist/installer/events.js";
 import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
 import { assertStatePathIsolation } from "../../dist/lib/test-guard.js";
+
+// ── Sticky isolation env ─────────────────────────────────────────────
+// claimStep / completeStep / autoCompleteConditionalStep on a terminal path
+// fire scheduleRunCronTeardown → fire-and-forget import() continuations
+// (removeRunCrons / terminateRunWithDaemon → controlRequest(secret) /
+// teardownWorkflowCronsIfIdle → logger), and emitEvent fires a
+// fire-and-forget webhook (fireWebhook → getDb), that resolve DB / log /
+// daemon-secret paths AFTER the triggering test's afterEach has run.
+// Restoring the operator's real env there trips the guard at the REAL
+// ~/.tamandua (ledger entries with testFile null, "(unknown)"). Keep HOME /
+// TAMANDUA_STATE_DIR / TAMANDUA_DB_PATH pointed at a module-scoped temp dir
+// for the whole file: every afterEach below restores to this sticky env
+// (never the operator's), and the module after() drains pending
+// setImmediates before restoring the originals (tests/step-ops.test.ts
+// pattern). The ambient control port is dropped too so controlRequest's
+// early guard return fires instead of ever reaching a live daemon.
+const stickyState = (() => {
+  const root = tamanduaTempDir("tamandua-conditional-sticky-");
+  const homeDir = path.join(root, "home");
+  const stateDir = path.join(root, "state");
+  fs.mkdirSync(homeDir, { recursive: true });
+  fs.mkdirSync(stateDir, { recursive: true });
+  return { root, homeDir, stateDir, dbPath: path.join(stateDir, "tamandua.db") };
+})();
+const originalHome = process.env.HOME;
+const originalStateDir = process.env.TAMANDUA_STATE_DIR;
+const originalDbPath = process.env.TAMANDUA_DB_PATH;
+const originalControlPort = process.env.TAMANDUA_CONTROL_PORT;
+
+function restoreOrDelete(name: string, value: string | undefined): void {
+  if (value === undefined) delete process.env[name];
+  else process.env[name] = value;
+}
+
+function applyStickyEnv(): void {
+  process.env.HOME = stickyState.homeDir;
+  process.env.TAMANDUA_STATE_DIR = stickyState.stateDir;
+  process.env.TAMANDUA_DB_PATH = stickyState.dbPath;
+  // Drop the ambient control port (3339 when the suite runs inside a
+  // tamandua run): with HOME temp but TAMANDUA_CONTROL_PORT still set,
+  // controlRequest would resolve the daemon secret from the temp HOME, pass
+  // the guard, and reach a live daemon on that port.
+  delete process.env.TAMANDUA_CONTROL_PORT;
+}
+
+after(async () => {
+  // Drain a few event-loop turns while the sticky temp env is still active:
+  // the fire-and-forget teardown/webhook continuations scheduled by the last
+  // test land on the module-loader task queue and must resolve their
+  // getDb/logger/controlRequest paths against the temp state, not the
+  // restored real env.
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  restoreOrDelete("HOME", originalHome);
+  restoreOrDelete("TAMANDUA_STATE_DIR", originalStateDir);
+  restoreOrDelete("TAMANDUA_DB_PATH", originalDbPath);
+  restoreOrDelete("TAMANDUA_CONTROL_PORT", originalControlPort);
+  try {
+    fs.rmSync(stickyState.root, { recursive: true, force: true });
+  } catch {
+    // best-effort cleanup
+  }
+});
 
 /**
  * WAVE-A US-002: a `type: conditional` step must flow through the existing
@@ -27,18 +91,12 @@ describe("conditional steps claim/complete through the single-step path (US-002)
   let tempHome: string;
   let stateDir: string;
   let dbPath: string;
-  let saved: Record<string, string | undefined>;
 
   beforeEach(() => {
     tempHome = tamanduaTempDir("tamandua-conditional-");
     stateDir = path.join(tempHome, ".tamandua");
     dbPath = path.join(stateDir, "tamandua.db");
     fs.mkdirSync(stateDir, { recursive: true });
-    saved = {
-      HOME: process.env.HOME,
-      TAMANDUA_STATE_DIR: process.env.TAMANDUA_STATE_DIR,
-      TAMANDUA_DB_PATH: process.env.TAMANDUA_DB_PATH,
-    };
     process.env.HOME = tempHome;
     process.env.TAMANDUA_STATE_DIR = stateDir;
     process.env.TAMANDUA_DB_PATH = dbPath;
@@ -51,10 +109,14 @@ describe("conditional steps claim/complete through the single-step path (US-002)
   });
 
   afterEach(() => {
-    for (const [k, v] of Object.entries(saved)) {
-      if (v === undefined) delete process.env[k];
-      else process.env[k] = v;
-    }
+    // Restore to the module-scoped sticky temp env (NOT the operator's real
+    // env): claim/complete/auto-complete fire fire-and-forget continuations
+    // (scheduleRunCronTeardown → terminateRunWithDaemon controlRequest(secret),
+    // teardownWorkflowCronsIfIdle → logger, emitEvent → fireWebhook getDb)
+    // that resolve DB/log/daemon-secret paths after this hook; pointing them
+    // at the real ~/.tamandua trips the test-isolation guard with testFile
+    // null ("(unknown)" ledger entries).
+    applyStickyEnv();
     fs.rmSync(tempHome, { recursive: true, force: true });
   });
 
@@ -207,18 +269,12 @@ describe("autoCompleteConditionalStep — zero-token conditional auto-complete (
   let tempHome: string;
   let stateDir: string;
   let dbPath: string;
-  let saved: Record<string, string | undefined>;
 
   beforeEach(() => {
     tempHome = tamanduaTempDir("tamandua-auto-complete-");
     stateDir = path.join(tempHome, ".tamandua");
     dbPath = path.join(stateDir, "tamandua.db");
     fs.mkdirSync(stateDir, { recursive: true });
-    saved = {
-      HOME: process.env.HOME,
-      TAMANDUA_STATE_DIR: process.env.TAMANDUA_STATE_DIR,
-      TAMANDUA_DB_PATH: process.env.TAMANDUA_DB_PATH,
-    };
     process.env.HOME = tempHome;
     process.env.TAMANDUA_STATE_DIR = stateDir;
     process.env.TAMANDUA_DB_PATH = dbPath;
@@ -228,10 +284,14 @@ describe("autoCompleteConditionalStep — zero-token conditional auto-complete (
   });
 
   afterEach(() => {
-    for (const [k, v] of Object.entries(saved)) {
-      if (v === undefined) delete process.env[k];
-      else process.env[k] = v;
-    }
+    // Restore to the module-scoped sticky temp env (NOT the operator's real
+    // env): claim/complete/auto-complete fire fire-and-forget continuations
+    // (scheduleRunCronTeardown → terminateRunWithDaemon controlRequest(secret),
+    // teardownWorkflowCronsIfIdle → logger, emitEvent → fireWebhook getDb)
+    // that resolve DB/log/daemon-secret paths after this hook; pointing them
+    // at the real ~/.tamandua trips the test-isolation guard with testFile
+    // null ("(unknown)" ledger entries).
+    applyStickyEnv();
     fs.rmSync(tempHome, { recursive: true, force: true });
   });
 
@@ -507,18 +567,12 @@ describe("TEST_CMD establishment + rewrite detection (US-004)", () => {
   let tempHome: string;
   let stateDir: string;
   let dbPath: string;
-  let saved: Record<string, string | undefined>;
 
   beforeEach(() => {
     tempHome = tamanduaTempDir("tamandua-tcmd-");
     stateDir = path.join(tempHome, ".tamandua");
     dbPath = path.join(stateDir, "tamandua.db");
     fs.mkdirSync(stateDir, { recursive: true });
-    saved = {
-      HOME: process.env.HOME,
-      TAMANDUA_STATE_DIR: process.env.TAMANDUA_STATE_DIR,
-      TAMANDUA_DB_PATH: process.env.TAMANDUA_DB_PATH,
-    };
     process.env.HOME = tempHome;
     process.env.TAMANDUA_STATE_DIR = stateDir;
     process.env.TAMANDUA_DB_PATH = dbPath;
@@ -528,10 +582,14 @@ describe("TEST_CMD establishment + rewrite detection (US-004)", () => {
   });
 
   afterEach(() => {
-    for (const [k, v] of Object.entries(saved)) {
-      if (v === undefined) delete process.env[k];
-      else process.env[k] = v;
-    }
+    // Restore to the module-scoped sticky temp env (NOT the operator's real
+    // env): claim/complete/auto-complete fire fire-and-forget continuations
+    // (scheduleRunCronTeardown → terminateRunWithDaemon controlRequest(secret),
+    // teardownWorkflowCronsIfIdle → logger, emitEvent → fireWebhook getDb)
+    // that resolve DB/log/daemon-secret paths after this hook; pointing them
+    // at the real ~/.tamandua trips the test-isolation guard with testFile
+    // null ("(unknown)" ledger entries).
+    applyStickyEnv();
     fs.rmSync(tempHome, { recursive: true, force: true });
   });
 
@@ -901,18 +959,12 @@ describe("test_cmd_review verdict routing (US-006)", () => {
   let tempHome: string;
   let stateDir: string;
   let dbPath: string;
-  let saved: Record<string, string | undefined>;
 
   beforeEach(() => {
     tempHome = tamanduaTempDir("tamandua-review-route-");
     stateDir = path.join(tempHome, ".tamandua");
     dbPath = path.join(stateDir, "tamandua.db");
     fs.mkdirSync(stateDir, { recursive: true });
-    saved = {
-      HOME: process.env.HOME,
-      TAMANDUA_STATE_DIR: process.env.TAMANDUA_STATE_DIR,
-      TAMANDUA_DB_PATH: process.env.TAMANDUA_DB_PATH,
-    };
     process.env.HOME = tempHome;
     process.env.TAMANDUA_STATE_DIR = stateDir;
     process.env.TAMANDUA_DB_PATH = dbPath;
@@ -922,10 +974,14 @@ describe("test_cmd_review verdict routing (US-006)", () => {
   });
 
   afterEach(() => {
-    for (const [k, v] of Object.entries(saved)) {
-      if (v === undefined) delete process.env[k];
-      else process.env[k] = v;
-    }
+    // Restore to the module-scoped sticky temp env (NOT the operator's real
+    // env): claim/complete/auto-complete fire fire-and-forget continuations
+    // (scheduleRunCronTeardown → terminateRunWithDaemon controlRequest(secret),
+    // teardownWorkflowCronsIfIdle → logger, emitEvent → fireWebhook getDb)
+    // that resolve DB/log/daemon-secret paths after this hook; pointing them
+    // at the real ~/.tamandua trips the test-isolation guard with testFile
+    // null ("(unknown)" ledger entries).
+    applyStickyEnv();
     fs.rmSync(tempHome, { recursive: true, force: true });
   });
 
@@ -1234,18 +1290,12 @@ describe("finalize_merge gate coupling with TEST_CMD review (US-007)", () => {
   let tempHome: string;
   let stateDir: string;
   let dbPath: string;
-  let saved: Record<string, string | undefined>;
 
   beforeEach(() => {
     tempHome = tamanduaTempDir("tamandua-conditional-us007-");
     stateDir = path.join(tempHome, ".tamandua");
     dbPath = path.join(stateDir, "tamandua.db");
     fs.mkdirSync(stateDir, { recursive: true });
-    saved = {
-      HOME: process.env.HOME,
-      TAMANDUA_STATE_DIR: process.env.TAMANDUA_STATE_DIR,
-      TAMANDUA_DB_PATH: process.env.TAMANDUA_DB_PATH,
-    };
     process.env.HOME = tempHome;
     process.env.TAMANDUA_STATE_DIR = stateDir;
     process.env.TAMANDUA_DB_PATH = dbPath;
@@ -1255,10 +1305,14 @@ describe("finalize_merge gate coupling with TEST_CMD review (US-007)", () => {
   });
 
   afterEach(() => {
-    for (const [k, v] of Object.entries(saved)) {
-      if (v === undefined) delete process.env[k];
-      else process.env[k] = v;
-    }
+    // Restore to the module-scoped sticky temp env (NOT the operator's real
+    // env): claim/complete/auto-complete fire fire-and-forget continuations
+    // (scheduleRunCronTeardown → terminateRunWithDaemon controlRequest(secret),
+    // teardownWorkflowCronsIfIdle → logger, emitEvent → fireWebhook getDb)
+    // that resolve DB/log/daemon-secret paths after this hook; pointing them
+    // at the real ~/.tamandua trips the test-isolation guard with testFile
+    // null ("(unknown)" ledger entries).
+    applyStickyEnv();
     fs.rmSync(tempHome, { recursive: true, force: true });
   });
 
@@ -1433,18 +1487,12 @@ describe("fix completion sets deception_audit_required (US-009)", () => {
   let tempHome: string;
   let stateDir: string;
   let dbPath: string;
-  let saved: Record<string, string | undefined>;
 
   beforeEach(() => {
     tempHome = tamanduaTempDir("tamandua-phnt-");
     stateDir = path.join(tempHome, ".tamandua");
     dbPath = path.join(stateDir, "tamandua.db");
     fs.mkdirSync(stateDir, { recursive: true });
-    saved = {
-      HOME: process.env.HOME,
-      TAMANDUA_STATE_DIR: process.env.TAMANDUA_STATE_DIR,
-      TAMANDUA_DB_PATH: process.env.TAMANDUA_DB_PATH,
-    };
     process.env.HOME = tempHome;
     process.env.TAMANDUA_STATE_DIR = stateDir;
     process.env.TAMANDUA_DB_PATH = dbPath;
@@ -1454,10 +1502,14 @@ describe("fix completion sets deception_audit_required (US-009)", () => {
   });
 
   afterEach(() => {
-    for (const [k, v] of Object.entries(saved)) {
-      if (v === undefined) delete process.env[k];
-      else process.env[k] = v;
-    }
+    // Restore to the module-scoped sticky temp env (NOT the operator's real
+    // env): claim/complete/auto-complete fire fire-and-forget continuations
+    // (scheduleRunCronTeardown → terminateRunWithDaemon controlRequest(secret),
+    // teardownWorkflowCronsIfIdle → logger, emitEvent → fireWebhook getDb)
+    // that resolve DB/log/daemon-secret paths after this hook; pointing them
+    // at the real ~/.tamandua trips the test-isolation guard with testFile
+    // null ("(unknown)" ledger entries).
+    applyStickyEnv();
     fs.rmSync(tempHome, { recursive: true, force: true });
   });
 
@@ -1611,18 +1663,12 @@ describe("deception_audit verdict routing (US-010)", () => {
   let tempHome: string;
   let stateDir: string;
   let dbPath: string;
-  let saved: Record<string, string | undefined>;
 
   beforeEach(() => {
     tempHome = tamanduaTempDir("tamandua-phnt-route-");
     stateDir = path.join(tempHome, ".tamandua");
     dbPath = path.join(stateDir, "tamandua.db");
     fs.mkdirSync(stateDir, { recursive: true });
-    saved = {
-      HOME: process.env.HOME,
-      TAMANDUA_STATE_DIR: process.env.TAMANDUA_STATE_DIR,
-      TAMANDUA_DB_PATH: process.env.TAMANDUA_DB_PATH,
-    };
     process.env.HOME = tempHome;
     process.env.TAMANDUA_STATE_DIR = stateDir;
     process.env.TAMANDUA_DB_PATH = dbPath;
@@ -1632,10 +1678,14 @@ describe("deception_audit verdict routing (US-010)", () => {
   });
 
   afterEach(() => {
-    for (const [k, v] of Object.entries(saved)) {
-      if (v === undefined) delete process.env[k];
-      else process.env[k] = v;
-    }
+    // Restore to the module-scoped sticky temp env (NOT the operator's real
+    // env): claim/complete/auto-complete fire fire-and-forget continuations
+    // (scheduleRunCronTeardown → terminateRunWithDaemon controlRequest(secret),
+    // teardownWorkflowCronsIfIdle → logger, emitEvent → fireWebhook getDb)
+    // that resolve DB/log/daemon-secret paths after this hook; pointing them
+    // at the real ~/.tamandua trips the test-isolation guard with testFile
+    // null ("(unknown)" ledger entries).
+    applyStickyEnv();
     fs.rmSync(tempHome, { recursive: true, force: true });
   });
 
@@ -1869,5 +1919,60 @@ describe("deception_audit verdict routing (US-010)", () => {
     assert.equal(audit.status, "done");
     assert.equal(audit.auto_completed, 1);
     assert.equal(audit.auto_complete_reason, "condition_unset:deception_audit_required");
+  });
+});
+
+// ── Late fire-and-forget continuations land in sticky temp state ─────
+// completeStep on a terminal path fires scheduleRunCronTeardown as
+// fire-and-forget import() continuations (removeRunCrons /
+// terminateRunWithDaemon → controlRequest(secret) /
+// teardownWorkflowCronsIfIdle → logger) that resolve DB / log /
+// daemon-secret paths AFTER the triggering test's afterEach has restored
+// the env. Before the module-scoped sticky env existed, every describe's
+// afterEach restored the OPERATOR's real env, so these late writes resolved
+// the REAL ~/.tamandua: the guard dropped them and the ledger recorded 78x
+// getDb / 53x controlRequest(secret) / 27x logger "(unknown)" entries from
+// this file alone. This regression proves the late teardown logger write now
+// lands in the sticky temp state (mirrors tests/workflow-fail.test.ts).
+describe("completeStep late teardown continuations land in sticky temp state", () => {
+  it("teardown idle-check logs 'Workflow idle' into the sticky tamandua.log", async () => {
+    applyStickyEnv();
+    const db = getDb();
+    const runId = crypto.randomUUID();
+    const stepDbId = crypto.randomUUID();
+    const now = new Date().toISOString();
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at) VALUES (?, 'test-wf', 'conditional task', 'running', '{}', ?, ?)",
+    ).run(runId, now, now);
+    db.prepare(
+      `INSERT INTO steps (id, run_id, step_id, agent_id, step_index, input_template, expects, status, retry_count, max_retries, type, conditional_condition, created_at, updated_at)
+       VALUES (?, ?, 'finalize', 'test-wf_dev', 0, '', '', 'running', 0, 4, 'single', NULL, ?, ?)`,
+    ).run(stepDbId, runId, now, now);
+
+    const stickyLogPath = path.join(stickyState.stateDir, "tamandua.log");
+    const before = fs.existsSync(stickyLogPath)
+      ? (fs.readFileSync(stickyLogPath, "utf-8").match(/Workflow idle/g) ?? []).length
+      : 0;
+
+    const result = completeStep(stepDbId, "STATUS: done");
+    assert.ok(
+      result.status === "advanced" || result.status === "completed",
+      `completeStep got ${result.status}`,
+    );
+
+    // Give the fire-and-forget module-loader continuations a chance to run.
+    await new Promise((resolve) => setTimeout(resolve, 600));
+
+    // The late teardown idle-check logged into the sticky log (previously
+    // guard-dropped at the real ~/.tamandua — the coverage the guard hid).
+    assert.ok(
+      fs.existsSync(stickyLogPath),
+      "teardown logger write must land in the sticky log",
+    );
+    const after = (fs.readFileSync(stickyLogPath, "utf-8").match(/Workflow idle/g) ?? []).length;
+    assert.ok(
+      after > before,
+      `teardown idle-check must have run against the sticky state (before=${before}, after=${after})`,
+    );
   });
 });

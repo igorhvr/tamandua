@@ -6,13 +6,51 @@
  * control-client functions.
  */
 
-import { describe, it } from "node:test";
+import { describe, it, after } from "node:test";
 import assert from "node:assert/strict";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import fs from "node:fs";
+import { tamanduaTempDir } from "../src/lib/temp-dir.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// ── Module-level temp isolation ──────────────────────────────────────
+// The pauseRun/resumeRun tests below call defaultToolServices.pauseRun /
+// .resumeRun, which go through controlRequest. Under the test-isolation
+// guard with an ambient TAMANDUA_CONTROL_PORT (3339 when tests run inside a
+// tamandua run) controlRequest checks the daemon secret at
+// HOME/.tamandua/daemon-secret — with the operator's real HOME that trips
+// the guard. Point HOME / TAMANDUA_STATE_DIR / TAMANDUA_DB_PATH at a
+// module-scoped temp dir and drop TAMANDUA_CONTROL_PORT so controlRequest
+// takes its early guard return (null → "Daemon control plane unreachable",
+// which these tests assert) instead of ever resolving the real secret or
+// reaching a live daemon. Restore the operator's env in a module after().
+const tempRoot = tamanduaTempDir("tamandua-mcp-pause-resume-identity-");
+const stateDir = path.join(tempRoot, "state");
+fs.mkdirSync(stateDir, { recursive: true });
+const originalHome = process.env.HOME;
+const originalStateDir = process.env.TAMANDUA_STATE_DIR;
+const originalDbPath = process.env.TAMANDUA_DB_PATH;
+const originalControlPort = process.env.TAMANDUA_CONTROL_PORT;
+process.env.HOME = path.join(tempRoot, "home");
+process.env.TAMANDUA_STATE_DIR = stateDir;
+process.env.TAMANDUA_DB_PATH = path.join(stateDir, "tamandua.db");
+delete process.env.TAMANDUA_CONTROL_PORT;
+
+function restoreOrDelete(name: string, value: string | undefined): void {
+  if (value === undefined) delete process.env[name];
+  else process.env[name] = value;
+}
+
+after(() => {
+  restoreOrDelete("HOME", originalHome);
+  restoreOrDelete("TAMANDUA_STATE_DIR", originalStateDir);
+  restoreOrDelete("TAMANDUA_DB_PATH", originalDbPath);
+  restoreOrDelete("TAMANDUA_CONTROL_PORT", originalControlPort);
+  try { fs.rmSync(tempRoot, { recursive: true, force: true }); } catch { /* cleanup */ }
+});
 
 describe("MCP pause/resume requester identity", { concurrency: 1 }, () => {
   it("MCP pauseRun builds identity as user@host:pid (mcp)", async () => {

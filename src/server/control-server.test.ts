@@ -1763,11 +1763,17 @@ describe("control-server unit exports", () => {
   describe("readDaemonSecret / ensureDaemonSecret isolation guards", () => {
     let savedGuard: string | undefined;
     let savedNodeTestContext: string | undefined;
+    let savedExpect: string | undefined;
 
     beforeEach(() => {
       savedGuard = process.env.TAMANDUA_TEST_GUARD;
       savedNodeTestContext = process.env.NODE_TEST_CONTEXT;
+      savedExpect = process.env.TAMANDUA_TEST_GUARD_EXPECT;
       process.env.TAMANDUA_TEST_GUARD = "1";
+      // Every test in this describe is a deliberate guard test (provoke with
+      // real HOME, or isolate via explicit secretPath / disabled guard). No
+      // real leaks here — mark the describe expected.
+      process.env.TAMANDUA_TEST_GUARD_EXPECT = "1";
     });
 
     afterEach(() => {
@@ -1775,6 +1781,8 @@ describe("control-server unit exports", () => {
       else delete process.env.TAMANDUA_TEST_GUARD;
       if (savedNodeTestContext !== undefined) process.env.NODE_TEST_CONTEXT = savedNodeTestContext;
       else delete process.env.NODE_TEST_CONTEXT;
+      if (savedExpect !== undefined) process.env.TAMANDUA_TEST_GUARD_EXPECT = savedExpect;
+      else delete process.env.TAMANDUA_TEST_GUARD_EXPECT;
     });
 
     it("readDaemonSecret returns null when guard is active and default path resolves to production", () => {

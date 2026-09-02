@@ -88,6 +88,19 @@ function setupTempHome(): string {
     JSON.stringify({ defaultProvider: "openai", defaultModel: "gpt-4o" }),
     "utf-8",
   );
+  // Mark the daemon / dashboard / MCP services as already running in the
+  // temp state: get-ready's tail section starts each service on its default
+  // production port (control plane 3339, dashboard 3334, MCP 3338) when the
+  // corresponding running-checks report them down. Under the test-isolation
+  // guard those starts would be blocked with a port-bind violation per
+  // service (ledger entries with no test frame). Seeding live PID files
+  // (this test process stays alive for the whole get-ready child run) makes
+  // get-ready take the "already running" path — no service spawns, no
+  // production-port touches — while the assertions below (install output,
+  // exit codes, "Done. Start with:" ordering) are unaffected.
+  for (const name of ["tamandua.pid", "dashboard.pid", "mcp.pid"]) {
+    fs.writeFileSync(path.join(th.tamanduaDir, name), String(process.pid), "utf-8");
+  }
   return homeDir;
 }
 

@@ -33,6 +33,25 @@ function makeEvent(runId: string, event: string): TamanduaEvent {
   };
 }
 
+// Real-leak isolation: emitEvent fires a fire-and-forget webhook
+// (fireWebhook → getDb) for significant events, and getDb() resolves the DB
+// path from TAMANDUA_DB_PATH. Without it, the async continuation resolves the
+// REAL ~/.tamandua/tamandua.db and trips the guard with no test frame.
+// Point the whole file at a temp DB (logger.test.ts pattern), restore after.
+const originalDbPath = process.env.TAMANDUA_DB_PATH;
+const dbTempDir = tamanduaTempDir("tamandua-events-db-");
+process.env.TAMANDUA_DB_PATH = path.join(dbTempDir, "tamandua.db");
+
+after(() => {
+  if (originalDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+  else process.env.TAMANDUA_DB_PATH = originalDbPath;
+  try {
+    fs.rmSync(dbTempDir, { recursive: true, force: true });
+  } catch {
+    // best-effort cleanup
+  }
+});
+
 describe("events", () => {
   let stateDir: string;
   let originalStateDir: string | undefined;
@@ -182,6 +201,22 @@ describe("events", () => {
     });
 
     describe("test-guard", () => {
+      let savedExpect: string | undefined;
+
+      beforeEach(() => {
+        savedExpect = process.env.TAMANDUA_TEST_GUARD_EXPECT;
+        // The guard tests in this describe deliberately point TAMANDUA_STATE_DIR
+        // into the REAL state dir to verify emitEvent drops (or the path is
+        // fully isolated). The deliberate provocations must carry expected:true
+        // so the lane's ledger report filters them.
+        process.env.TAMANDUA_TEST_GUARD_EXPECT = "1";
+      });
+
+      afterEach(() => {
+        if (savedExpect === undefined) delete process.env.TAMANDUA_TEST_GUARD_EXPECT;
+        else process.env.TAMANDUA_TEST_GUARD_EXPECT = savedExpect;
+      });
+
       it("does not fire when TAMANDUA_STATE_DIR isolates into a temp dir (guard active, path isolated)", () => {
         // The beforeEach already sets TAMANDUA_STATE_DIR to a temp dir.
         // Set TAMANDUA_TEST_GUARD=1 to activate the guard — it should NOT drop

@@ -53,7 +53,13 @@ import type { WorkflowSpec } from "../dist/installer/types.js";
 // createTempHome sets up an isolated temp home with automatic after() cleanup.
 
 describe("workflow-graph-simulation", () => {
-  const { tamanduaDir } = createTempHome("tamandua-graph-sim-");
+  const th = createTempHome("tamandua-graph-sim-");
+  const { tamanduaDir } = th;
+  // HOME is required too: failStep/completeStep teardown continuations
+  // resolve the daemon secret at HOME/.tamandua/daemon-secret through
+  // controlRequest when TAMANDUA_CONTROL_PORT is set — with the operator's
+  // real HOME that tripped the guard. Point HOME at the temp home.
+  process.env.HOME = th.homeDir;
   process.env.TAMANDUA_STATE_DIR = tamanduaDir;
   process.env.TAMANDUA_DB_PATH = path.join(tamanduaDir, "tamandua.db");
   process.env.TAMANDUA_CONTROL_PORT = "1";

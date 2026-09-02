@@ -13,6 +13,7 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
+import fs from "node:fs";
 import path from "node:path";
 import { createTempHome } from "./helpers/test-env.ts";
 import { recoverOrphanedStepsForAgent, claimStep, completeStep, resolveStepContext, type WorkerOwnership } from "../dist/installer/step-ops.js";
@@ -29,9 +30,34 @@ import { autoCompleteStepIfRunning, type PollingRoundMetadata } from "../dist/in
 // createTempHome sets up an isolated temp home with automatic after() cleanup.
 
 describe("orphaned-step-recovery", () => {
-  const { tamanduaDir } = createTempHome("tamandua-orphaned-test-");
+  const th = createTempHome("tamandua-orphaned-test-");
+  const { tamanduaDir } = th;
+  // Save the operator's env so a module after() can restore it exactly.
+  const originalHome = process.env.HOME;
+  const originalStateDir = process.env.TAMANDUA_STATE_DIR;
+  const originalDbPath = process.env.TAMANDUA_DB_PATH;
+  const originalControlPort = process.env.TAMANDUA_CONTROL_PORT;
+  // HOME is required too: recovery paths (scheduleRunCronTeardown →
+  // terminateRunWithDaemon) resolve the daemon secret at
+  // HOME/.tamandua/daemon-secret through controlRequest — with the real
+  // HOME that tripped the guard. Drop the ambient TAMANDUA_CONTROL_PORT so
+  // controlRequest takes its early guard return instead of ever reaching a
+  // live daemon.
+  process.env.HOME = th.homeDir;
   process.env.TAMANDUA_STATE_DIR = tamanduaDir;
   process.env.TAMANDUA_DB_PATH = path.join(tamanduaDir, "tamandua.db");
+  delete process.env.TAMANDUA_CONTROL_PORT;
+  after(() => {
+    const restore = (name: string, value: string | undefined): void => {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    };
+    restore("HOME", originalHome);
+    restore("TAMANDUA_STATE_DIR", originalStateDir);
+    restore("TAMANDUA_DB_PATH", originalDbPath);
+    restore("TAMANDUA_CONTROL_PORT", originalControlPort);
+    try { fs.rmSync(th.root, { recursive: true, force: true }); } catch { /* cleanup */ }
+  });
 
 const TEST_AGENT_1 = "test_sigkill-recovery-agent-1";
 const TEST_AGENT_2 = "test_sigkill-recovery-agent-2";

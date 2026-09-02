@@ -1333,9 +1333,14 @@ describe("recordLifecycleEvent", () => {
     // and must never write production state from a guarded process.
     const prevGuard = process.env.TAMANDUA_TEST_GUARD;
     const prevHome = process.env.HOME;
+    const prevExpect = process.env.TAMANDUA_TEST_GUARD_EXPECT;
     const marker = `guard-drop-probe-${process.pid}-${Date.now()}`;
     try {
       process.env.TAMANDUA_TEST_GUARD = "1";
+      // Deliberate provocation: resolve the REAL state dir to verify the
+      // guard drops the lifecycle write. Mark expected so the lane's ledger
+      // report filters this entry.
+      process.env.TAMANDUA_TEST_GUARD_EXPECT = "1";
       process.env.HOME = os.userInfo().homedir; // resolve the REAL state dir
       assert.doesNotThrow(() => recordLifecycleEvent(marker, 1));
 
@@ -1351,6 +1356,8 @@ describe("recordLifecycleEvent", () => {
       else process.env.TAMANDUA_TEST_GUARD = prevGuard;
       if (prevHome === undefined) delete process.env.HOME;
       else process.env.HOME = prevHome;
+      if (prevExpect === undefined) delete process.env.TAMANDUA_TEST_GUARD_EXPECT;
+      else process.env.TAMANDUA_TEST_GUARD_EXPECT = prevExpect;
     }
   });
 });

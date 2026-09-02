@@ -1,7 +1,10 @@
-import { describe, it } from "node:test";
+import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
 import http from "node:http";
 import { once } from "node:events";
+import { createTempHome } from "../../tests/helpers/test-env.ts";
 import { createDashboardServer } from "../../dist/server/dashboard.js";
 
 async function startDashboard(): Promise<{ server: http.Server; baseUrl: string }> {
@@ -19,9 +22,55 @@ async function stopDashboard(server: http.Server): Promise<void> {
   await new Promise<void>((resolve) => server.close(() => resolve()));
 }
 
+/**
+ * Point HOME / TAMANDUA_STATE_DIR / TAMANDUA_DB_PATH at a per-test temp
+ * directory (createTempHome) so the dashboard server's getDb()/logger/events
+ * resolve into temp state instead of the operator's real ~/.tamandua (the
+ * test-isolation guard would otherwise throw and the caller would skip the
+ * write, hiding coverage). Returns the temp stateDir/dbPath plus a restore
+ * function; call restore() in the afterEach hook.
+ */
+function isolateDashboardState(prefix: string): { stateDir: string; dbPath: string; restore: () => void } {
+  const { root, homeDir } = createTempHome(prefix);
+  const stateDir = path.join(root, "state");
+  const dbPath = path.join(stateDir, "tamandua.db");
+  const previousHome = process.env.HOME;
+  const previousStateDir = process.env.TAMANDUA_STATE_DIR;
+  const previousDbPath = process.env.TAMANDUA_DB_PATH;
+  process.env.HOME = homeDir;
+  process.env.TAMANDUA_STATE_DIR = stateDir;
+  process.env.TAMANDUA_DB_PATH = dbPath;
+  return {
+    stateDir,
+    dbPath,
+    restore: () => {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+      else process.env.TAMANDUA_STATE_DIR = previousStateDir;
+      if (previousDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+      else process.env.TAMANDUA_DB_PATH = previousDbPath;
+    },
+  };
+}
+
 describe("kanban poll toggle HTML", () => {
+  let isolate: ReturnType<typeof isolateDashboardState> | undefined;
+  let dbPath: string;
+
+  beforeEach(() => {
+    isolate = isolateDashboardState("tamandua-kanban-html-");
+    dbPath = isolate.dbPath;
+  });
+
+  afterEach(() => {
+    isolate?.restore();
+    isolate = undefined;
+  });
+
   it("contains poll toggle checkbox with default checked state", async () => {
     const { server, baseUrl } = await startDashboard();
+    assert.ok(fs.existsSync(dbPath), "dashboard server must open the temp DB (previously skipped)");
 
     try {
       const response = await fetch(`${baseUrl}/runs/test-run-id/kanban`);
@@ -44,6 +93,7 @@ describe("kanban poll toggle HTML", () => {
 
   it("contains poll label span inside footer-right", async () => {
     const { server, baseUrl } = await startDashboard();
+    assert.ok(fs.existsSync(dbPath), "dashboard server must open the temp DB (previously skipped)");
 
     try {
       const response = await fetch(`${baseUrl}/runs/test-run-id/kanban`);
@@ -62,6 +112,7 @@ describe("kanban poll toggle HTML", () => {
 
   it("contains setInterval/clearInterval toggle logic", async () => {
     const { server, baseUrl } = await startDashboard();
+    assert.ok(fs.existsSync(dbPath), "dashboard server must open the temp DB (previously skipped)");
 
     try {
       const response = await fetch(`${baseUrl}/runs/test-run-id/kanban`);
@@ -84,6 +135,7 @@ describe("kanban poll toggle HTML", () => {
 
   it("REFRESH_MS constant is unchanged at 3000", async () => {
     const { server, baseUrl } = await startDashboard();
+    assert.ok(fs.existsSync(dbPath), "dashboard server must open the temp DB (previously skipped)");
 
     try {
       const response = await fetch(`${baseUrl}/runs/test-run-id/kanban`);
@@ -99,6 +151,7 @@ describe("kanban poll toggle HTML", () => {
 
   it("checkbox change event listener calls startPolling and stopPolling", async () => {
     const { server, baseUrl } = await startDashboard();
+    assert.ok(fs.existsSync(dbPath), "dashboard server must open the temp DB (previously skipped)");
 
     try {
       const response = await fetch(`${baseUrl}/runs/test-run-id/kanban`);
@@ -120,6 +173,7 @@ describe("kanban poll toggle HTML", () => {
 
   it("footer-right contains poll toggle label structure", async () => {
     const { server, baseUrl } = await startDashboard();
+    assert.ok(fs.existsSync(dbPath), "dashboard server must open the temp DB (previously skipped)");
 
     try {
       const response = await fetch(`${baseUrl}/runs/test-run-id/kanban`);
@@ -145,6 +199,7 @@ describe("kanban poll toggle HTML", () => {
 
   it("poll label text updates for paused state", async () => {
     const { server, baseUrl } = await startDashboard();
+    assert.ok(fs.existsSync(dbPath), "dashboard server must open the temp DB (previously skipped)");
 
     try {
       const response = await fetch(`${baseUrl}/runs/test-run-id/kanban`);

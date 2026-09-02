@@ -47,13 +47,51 @@ steps:
 type GateMode = "default" | "green" | "off";
 type Evidence = "green" | "red" | "missing";
 
+// ── Sticky isolation env ─────────────────────────────────────────────
+// claimStep / completeStep / failStep on terminal paths fire
+// scheduleRunCronTeardown → fire-and-forget import() continuations
+// (removeRunCrons / terminateRunWithDaemon / teardownWorkflowCronsIfIdle)
+// that resolve getDb()/logger paths AFTER the triggering test's afterEach
+// has already run. Restoring the operator's real env there trips the guard
+// at the REAL ~/.tamandua (ledger entries with testFile null, "(unknown)").
+// Keep HOME / TAMANDUA_STATE_DIR / TAMANDUA_DB_PATH pointed at a
+// module-scoped temp dir for the whole file and restore the original env in
+// a module after() (status.test.ts pattern).
+const stickyState = (() => {
+  const root = tamanduaTempDir("tamandua-ledger-enforcement-sticky-");
+  const homeDir = path.join(root, "home");
+  const stateDir = path.join(root, "state");
+  fs.mkdirSync(stateDir, { recursive: true });
+  return { root, homeDir, stateDir, dbPath: path.join(stateDir, "tamandua.db") };
+})();
+const originalHome = process.env.HOME;
+const originalStateDir = process.env.TAMANDUA_STATE_DIR;
+const originalDbPath = process.env.TAMANDUA_DB_PATH;
+
+function applyStickyEnv(): void {
+  process.env.HOME = stickyState.homeDir;
+  process.env.TAMANDUA_STATE_DIR = stickyState.stateDir;
+  process.env.TAMANDUA_DB_PATH = stickyState.dbPath;
+}
+
+after(() => {
+  if (originalHome === undefined) delete process.env.HOME;
+  else process.env.HOME = originalHome;
+  if (originalStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+  else process.env.TAMANDUA_STATE_DIR = originalStateDir;
+  if (originalDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+  else process.env.TAMANDUA_DB_PATH = originalDbPath;
+  try {
+    fs.rmSync(stickyState.root, { recursive: true, force: true });
+  } catch {
+    // best-effort cleanup
+  }
+});
+
 describe("finalize_merge ledger gate enforcement", () => {
   let fixtureRoot: string;
   let repo: string;
   let stateRoot: string;
-  let originalDbPath: string | undefined;
-  let originalHome: string | undefined;
-  let originalStateDir: string | undefined;
 
   before(() => {
     fixtureRoot = tamanduaTempDir("tamandua-ledger-enforcement-repo-");
@@ -68,9 +106,6 @@ describe("finalize_merge ledger gate enforcement", () => {
   });
 
   beforeEach(() => {
-    originalDbPath = process.env.TAMANDUA_DB_PATH;
-    originalHome = process.env.HOME;
-    originalStateDir = process.env.TAMANDUA_STATE_DIR;
     stateRoot = tamanduaTempDir("tamandua-ledger-enforcement-state-");
     process.env.HOME = stateRoot;
     process.env.TAMANDUA_STATE_DIR = path.join(stateRoot, ".tamandua");
@@ -92,12 +127,11 @@ describe("finalize_merge ledger gate enforcement", () => {
 
   afterEach(() => {
     closeDb();
-    if (originalDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
-    else process.env.TAMANDUA_DB_PATH = originalDbPath;
-    if (originalHome === undefined) delete process.env.HOME;
-    else process.env.HOME = originalHome;
-    if (originalStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
-    else process.env.TAMANDUA_STATE_DIR = originalStateDir;
+    // Restore to the module-scoped sticky temp env (NOT the operator's real
+    // env): step-ops fire-and-forget teardown continuations resolve paths
+    // after this hook — pointing them at the real ~/.tamandua trips the
+    // test-isolation guard.
+    applyStickyEnv();
     fs.rmSync(stateRoot, { recursive: true, force: true });
   });
 

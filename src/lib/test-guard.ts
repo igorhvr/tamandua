@@ -16,6 +16,7 @@
  * `node --test`. To explicitly disable the guard (e.g. a third-party test
  * suite shelling out to the tamandua CLI), set TAMANDUA_TEST_GUARD=0.
  */
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -50,10 +51,68 @@ function realUserHome(): string | null {
   }
 }
 
+/**
+ * Derive the originating test file/line from the current stack — the first
+ * frame whose path contains a ".test." segment and is NOT this module
+ * (compiled to dist/lib/test-guard.js). Spawned daemon children have no test
+ * frames, so this yields null/0 there. Never throws.
+ */
+function deriveTestFrame(): { testFile: string | null; testLine: number | null } {
+  try {
+    const stack = new Error().stack ?? "";
+    for (const line of stack.split("\n").slice(1)) {
+      const trimmed = line.trim();
+      // "at fn (path:line:col)" or "at path:line:col"
+      const paren = trimmed.match(/^at .*\((.+):(\d+):\d+\)$/);
+      const bare = trimmed.match(/^at (.+):(\d+):\d+$/);
+      const match = paren ?? bare;
+      if (!match) continue;
+      const file = match[1];
+      // Skip frames inside the guard itself.
+      if (file.includes("dist/lib/test-guard.js")) continue;
+      if (/\.test\./.test(file)) {
+        return { testFile: file, testLine: Number(match[2]) };
+      }
+    }
+  } catch {
+    // Ledger bookkeeping must never throw.
+  }
+  return { testFile: null, testLine: null };
+}
+
+/**
+ * Test-harness-only violation ledger. When the guard is active AND the runner
+ * pointed TAMANDUA_TEST_GUARD_LEDGER at a per-run temp file, append one JSONL
+ * entry per violation so the PRLL lane scripts can attribute leaks to the
+ * originating test file. Byte-identical no-op for real runs (guard inactive)
+ * and for direct `node --test` runs (ledger env unset). Never throws.
+ */
+function appendLedgerViolation(kind: string, path_: string, what: string): void {
+  if (!testGuardActive()) return;
+  const ledgerPath = process.env.TAMANDUA_TEST_GUARD_LEDGER;
+  if (!ledgerPath) return;
+  try {
+    const { testFile, testLine } = deriveTestFrame();
+    const entry = {
+      kind,
+      path: path_,
+      what,
+      testFile,
+      testLine,
+      expected: process.env.TAMANDUA_TEST_GUARD_EXPECT === "1",
+      ts: Date.now(),
+    };
+    fs.appendFileSync(ledgerPath, JSON.stringify(entry) + "\n");
+  } catch {
+    // Ledger bookkeeping must never interfere with the guard's throw.
+  }
+}
+
 /** Throw if a server is about to bind a production port under the guard. */
 export function assertPortIsolation(port: number, what: string): void {
   if (!testGuardActive()) return;
   if (!PRODUCTION_PORTS.has(port)) return;
+  appendLedgerViolation("port-bind", String(port), what);
   throw new Error(
     `TEST ISOLATION VIOLATION: ${what} tried to bind production port ${port} while ` +
       `TAMANDUA_TEST_GUARD=1. Tests (and anything they spawn) must use random ports — ` +
@@ -70,6 +129,7 @@ export function assertStatePathIsolation(resolvedPath: string, what: string): vo
   const realStateDir = path.join(home, ".tamandua");
   const normalized = path.resolve(resolvedPath);
   if (normalized === realStateDir || normalized.startsWith(realStateDir + path.sep)) {
+    appendLedgerViolation("state-path", normalized, what);
     throw new Error(
       `TEST ISOLATION VIOLATION: ${what} resolved to the real tamandua state ` +
         `(${normalized}) while TAMANDUA_TEST_GUARD=1. Tests must point HOME / ` +

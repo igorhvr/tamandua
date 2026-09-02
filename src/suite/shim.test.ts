@@ -12,6 +12,36 @@ import { execSync, spawn, type ChildProcess } from "node:child_process";
 import crypto from "node:crypto";
 import http from "node:http";
 import { fileURLToPath } from "node:url";
+
+// ── Sticky isolation env ─────────────────────────────────────────────
+// The in-process control server (and the shim children that POST to it)
+// resolve HOME / TAMANDUA_STATE_DIR / TAMANDUA_DB_PATH at request time and
+// in fire-and-forget continuations. Point all three at a module-scoped temp
+// dir for the WHOLE file (from module load onward, including the describe's
+// before() hook and late child continuations) and restore the original env
+// in a module-level after() that runs last (status.test.ts pattern).
+const stickyRoot = createTempHome("tamandua-shim-sticky-");
+const stickyStateDir = stickyRoot.tamanduaDir;
+const originalHome = process.env.HOME;
+const originalStateDir = process.env.TAMANDUA_STATE_DIR;
+const originalDbPath = process.env.TAMANDUA_DB_PATH;
+const originalControlPort = process.env.TAMANDUA_CONTROL_PORT;
+
+process.env.HOME = stickyRoot.homeDir;
+process.env.TAMANDUA_STATE_DIR = stickyStateDir;
+process.env.TAMANDUA_DB_PATH = join(stickyStateDir, "tamandua.db");
+delete process.env.TAMANDUA_CONTROL_PORT;
+
+after(() => {
+  if (originalHome === undefined) delete process.env.HOME;
+  else process.env.HOME = originalHome;
+  if (originalStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+  else process.env.TAMANDUA_STATE_DIR = originalStateDir;
+  if (originalDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+  else process.env.TAMANDUA_DB_PATH = originalDbPath;
+  if (originalControlPort === undefined) delete process.env.TAMANDUA_CONTROL_PORT;
+  else process.env.TAMANDUA_CONTROL_PORT = originalControlPort;
+});
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { cleanChildEnv, createTempHome, reservePortHandles } from "../../tests/helpers/test-env.ts";

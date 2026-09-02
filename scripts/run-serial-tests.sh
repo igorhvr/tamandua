@@ -40,4 +40,32 @@ if [ ${#FILES[@]} -eq 0 ]; then
 fi
 
 echo "=== Serial lane: running ${#FILES[@]} test files with concurrency 1 ==="
-node --experimental-test-module-mocks --test --test-concurrency=1 "${FILES[@]}"
+
+# Per-run guard-violation ledger: the test-isolation guard appends one JSONL
+# line per violation to TAMANDUA_TEST_GUARD_LEDGER; guard-ledger-report.mjs
+# prints them grouped by originating test file (dropping the guard's own
+# expected self-test provocations) and exits non-zero when any real
+# violations remain. Lane-fail enforcement: a non-empty ledger FAILS this
+# lane even when node's tests themselves passed — test-isolation violations
+# must never pass silently.
+LEDGER_FILE="$(mktemp -t "tamandua-guard-ledger-$$.jsonl" 2>/dev/null || mktemp)"
+export TAMANDUA_TEST_GUARD_LEDGER="$LEDGER_FILE"
+
+# Capture node's exit code without set -e aborting the lane early.
+NODE_EXIT=0
+node --experimental-test-module-mocks --test --test-concurrency=1 "${FILES[@]}" || NODE_EXIT=$?
+
+# Enforcement: run the ledger report (it prints grouped violations to stderr
+# and exits 1 when any non-expected entry exists). A non-zero report exit
+# fails the lane regardless of NODE_EXIT; with an empty ledger the lane exits
+# with node's own exit code.
+REPORT_EXIT=0
+if [ -f "$REPO_ROOT/scripts/guard-ledger-report.mjs" ]; then
+  node "$REPO_ROOT/scripts/guard-ledger-report.mjs" "$LEDGER_FILE" >&2 || REPORT_EXIT=$?
+fi
+rm -f -- "$LEDGER_FILE"
+if [ "$REPORT_EXIT" -ne 0 ]; then
+  echo ">>> Serial lane FAILED: test-isolation violations detected (see report above)" >&2
+  exit 1
+fi
+exit "$NODE_EXIT"

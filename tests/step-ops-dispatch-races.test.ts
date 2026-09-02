@@ -35,7 +35,14 @@ import {
 // createTempHome sets up an isolated temp home with automatic after() cleanup.
 
 describe("step-ops-dispatch-races", () => {
-  const { tamanduaDir } = createTempHome("tamandua-races-");
+  const th = createTempHome("tamandua-races-");
+  const { tamanduaDir } = th;
+  // HOME is required too: dispatch/teardown paths fire controlRequest, which
+  // resolves the daemon secret at HOME/.tamandua/daemon-secret when
+  // TAMANDUA_CONTROL_PORT is set — with the operator's real HOME that
+  // tripped the guard. Point HOME at the temp home (CONTROL_PORT stays "1":
+  // nothing listens, control-plane calls fail fast).
+  process.env.HOME = th.homeDir;
   process.env.TAMANDUA_STATE_DIR = tamanduaDir;
   process.env.TAMANDUA_DB_PATH = path.join(tamanduaDir, "tamandua.db");
   process.env.TAMANDUA_CONTROL_PORT = "1"; // nothing listens; control-plane calls fail fast

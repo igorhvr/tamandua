@@ -42,7 +42,13 @@ import {
 // createTempHome sets up an isolated temp home with automatic after() cleanup.
 
 describe("stories-json-validation", () => {
-  const { tamanduaDir } = createTempHome("tamandua-sjsn-");
+  const th = createTempHome("tamandua-sjsn-");
+  const { tamanduaDir } = th;
+  // HOME is required too: completeStep/claimStep teardown continuations
+  // resolve the daemon secret at HOME/.tamandua/daemon-secret through
+  // controlRequest when TAMANDUA_CONTROL_PORT is set — with the operator's
+  // real HOME that tripped the guard. Point HOME at the temp home.
+  process.env.HOME = th.homeDir;
   process.env.TAMANDUA_STATE_DIR = tamanduaDir;
   process.env.TAMANDUA_DB_PATH = path.join(tamanduaDir, "tamandua.db");
   process.env.TAMANDUA_CONTROL_PORT = "1"; // nothing listens; control-plane calls fail fast

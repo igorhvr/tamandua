@@ -11,6 +11,47 @@ import {
   type RunHarnessOptions,
 } from "../../dist/installer/harness-adapter.js";
 
+// ── Test-isolation state env ────────────────────────────────────────
+// Every runRound dispatches a real child process through the adapter, and
+// the adapter logs pre-launch/launch/completion lines through lib/logger
+// (plus failure warnings). The logger resolves TAMANDUA_STATE_DIR at write
+// time; without per-test temp HOME / TAMANDUA_STATE_DIR / TAMANDUA_DB_PATH
+// those writes hit the REAL ~/.tamandua, trip the test-isolation guard,
+// and get dropped (the 140+ ledger violations this file used to produce).
+// Isolate every test; restore the previous env in afterEach.
+let savedHome: string | undefined;
+let savedStateDir: string | undefined;
+let savedDbPath: string | undefined;
+let isolationRoot: string | null = null;
+
+beforeEach(() => {
+  savedHome = process.env.HOME;
+  savedStateDir = process.env.TAMANDUA_STATE_DIR;
+  savedDbPath = process.env.TAMANDUA_DB_PATH;
+  const env = createTempHome("tamandua-test-harness-adapter-state-");
+  isolationRoot = env.root;
+  process.env.HOME = env.homeDir;
+  process.env.TAMANDUA_STATE_DIR = env.tamanduaDir;
+  process.env.TAMANDUA_DB_PATH = path.join(env.tamanduaDir, "tamandua.db");
+});
+
+afterEach(() => {
+  if (isolationRoot) {
+    try {
+      fs.rmSync(isolationRoot, { recursive: true, force: true });
+    } catch {
+      // best-effort cleanup
+    }
+    isolationRoot = null;
+  }
+  if (savedHome === undefined) delete process.env.HOME;
+  else process.env.HOME = savedHome;
+  if (savedStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+  else process.env.TAMANDUA_STATE_DIR = savedStateDir;
+  if (savedDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+  else process.env.TAMANDUA_DB_PATH = savedDbPath;
+});
+
 
 // ── HarnessAdapter interface contract ──────────────────────────────
 

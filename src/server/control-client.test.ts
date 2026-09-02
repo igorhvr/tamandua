@@ -235,11 +235,17 @@ describe("control-client test-isolation guard", { concurrency: 1 }, () => {
   let savedHome: string | undefined;
   let savedStateDir: string | undefined;
   let savedControlPort: string | undefined;
+  let savedExpect: string | undefined;
 
   beforeEach(() => {
     savedHome = process.env.HOME;
     savedStateDir = process.env.TAMANDUA_STATE_DIR;
     savedControlPort = process.env.TAMANDUA_CONTROL_PORT;
+    savedExpect = process.env.TAMANDUA_TEST_GUARD_EXPECT;
+    // Every test in this describe is a guard test: they deliberately point at
+    // the production port/state (or fully isolate) to verify the guard's
+    // behavior. No real leaks here — mark the describe expected.
+    process.env.TAMANDUA_TEST_GUARD_EXPECT = "1";
   });
 
   afterEach(() => {
@@ -249,6 +255,8 @@ describe("control-client test-isolation guard", { concurrency: 1 }, () => {
     else delete process.env.TAMANDUA_STATE_DIR;
     if (savedControlPort !== undefined) process.env.TAMANDUA_CONTROL_PORT = savedControlPort;
     else delete process.env.TAMANDUA_CONTROL_PORT;
+    if (savedExpect !== undefined) process.env.TAMANDUA_TEST_GUARD_EXPECT = savedExpect;
+    else delete process.env.TAMANDUA_TEST_GUARD_EXPECT;
   });
 
   it("returns null when guard is active and TAMANDUA_CONTROL_PORT is not set", async () => {

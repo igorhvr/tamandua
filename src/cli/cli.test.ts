@@ -2271,15 +2271,40 @@ describe("formatRunsSummary", () => {
   });
 
   it("defaults to real listRuns when no override provided (accepts any output)", async () => {
-    const { formatRunsSummary } = await import("../../dist/cli/status-format.js");
-    // Without overrides, uses the real listRuns from the DB — should not throw
-    const result = formatRunsSummary();
-    assert.match(result, /Workflow Runs/);
-    // Should either show "No workflow runs" or a counts line
-    assert.ok(
-      result.includes("No workflow runs") || result.includes("total"),
-      "should produce valid output",
-    );
+    // This test hits the REAL listRuns → getDb(); point HOME / STATE_DIR /
+    // DB_PATH at a temp dir so the DB read lands in temp state instead of
+    // tripping the test-isolation guard at the operator's ~/.tamandua.
+    const savedHome = process.env.HOME;
+    const savedStateDir = process.env.TAMANDUA_STATE_DIR;
+    const savedDbPath = process.env.TAMANDUA_DB_PATH;
+    const env = createTempHome("tamandua-cli-format-runs-");
+    try {
+      process.env.HOME = env.homeDir;
+      process.env.TAMANDUA_STATE_DIR = env.tamanduaDir;
+      process.env.TAMANDUA_DB_PATH = path.join(env.tamanduaDir, "tamandua.db");
+
+      const { formatRunsSummary } = await import("../../dist/cli/status-format.js");
+      // Without overrides, uses the real listRuns from the DB — should not throw
+      const result = formatRunsSummary();
+      assert.match(result, /Workflow Runs/);
+      // Should either show "No workflow runs" or a counts line
+      assert.ok(
+        result.includes("No workflow runs") || result.includes("total"),
+        "should produce valid output",
+      );
+    } finally {
+      if (savedHome === undefined) delete process.env.HOME;
+      else process.env.HOME = savedHome;
+      if (savedStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+      else process.env.TAMANDUA_STATE_DIR = savedStateDir;
+      if (savedDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+      else process.env.TAMANDUA_DB_PATH = savedDbPath;
+      try {
+        fs.rmSync(env.root, { recursive: true, force: true });
+      } catch {
+        // best-effort cleanup
+      }
+    }
   });
 });
 

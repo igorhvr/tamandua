@@ -1,11 +1,45 @@
 import assert from "node:assert/strict";
-import { describe, it } from "node:test";
+import { describe, it, after } from "node:test";
+import fs from "node:fs";
+import path from "node:path";
+import { tamanduaTempDir } from "../src/lib/temp-dir.ts";
 
 import {
   filterPiEvent,
   parsePiOutputStream,
   MAX_TEXT_FALLBACK_BYTES,
 } from "../dist/installer/pi-stream-parser.js";
+
+// ── Module-level temp isolation ──────────────────────────────────────
+// parsePiOutputStream logs a warning through lib/logger when text-mode
+// output exceeds the cap ("pi text-mode output exceeded cap — truncating").
+// logger resolves the log path from TAMANDUA_STATE_DIR (falling back to
+// ~/.tamandua), so without a temp env the truncation test tripped the
+// test-isolation guard at the real ~/.tamandua/tamandua.log and the write
+// was silently dropped. Keep HOME / TAMANDUA_STATE_DIR / TAMANDUA_DB_PATH
+// pointed at a module-scoped temp dir (logger.test.ts pattern) and restore
+// the operator's env exactly as it was at load in a module after().
+const tempRoot = tamanduaTempDir("tamandua-pi-stream-parser-");
+const stateDir = path.join(tempRoot, "state");
+fs.mkdirSync(stateDir, { recursive: true });
+const originalHome = process.env.HOME;
+const originalStateDir = process.env.TAMANDUA_STATE_DIR;
+const originalDbPath = process.env.TAMANDUA_DB_PATH;
+process.env.HOME = path.join(tempRoot, "home");
+process.env.TAMANDUA_STATE_DIR = stateDir;
+process.env.TAMANDUA_DB_PATH = path.join(stateDir, "tamandua.db");
+
+function restoreOrDelete(name: string, value: string | undefined): void {
+  if (value === undefined) delete process.env[name];
+  else process.env[name] = value;
+}
+
+after(() => {
+  restoreOrDelete("HOME", originalHome);
+  restoreOrDelete("TAMANDUA_STATE_DIR", originalStateDir);
+  restoreOrDelete("TAMANDUA_DB_PATH", originalDbPath);
+  try { fs.rmSync(tempRoot, { recursive: true, force: true }); } catch { /* cleanup */ }
+});
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
@@ -539,6 +573,15 @@ describe("parsePiOutputStream", () => {
     assert.ok(
       fallbackBytes <= MAX_TEXT_FALLBACK_BYTES,
       `text fallback was ${fallbackBytes} bytes, expected <= ${MAX_TEXT_FALLBACK_BYTES}`,
+    );
+    // The truncation warning must have landed in the temp log (previously
+    // the guard silently dropped this write at the real ~/.tamandua).
+    const logFile = path.join(stateDir, "tamandua.log");
+    assert.ok(fs.existsSync(logFile), `parser must log truncation into the temp state (${logFile})`);
+    const logContent = fs.readFileSync(logFile, "utf-8");
+    assert.ok(
+      logContent.includes("pi text-mode output exceeded cap"),
+      `expected truncation warning in the temp log, got:\n${logContent}`,
     );
   });
 

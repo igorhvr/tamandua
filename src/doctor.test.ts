@@ -37,16 +37,27 @@ import { getBuildVersion } from "../dist/lib/version.js";
 
 /** Isolated DB path set up before each test so STATE checks don't touch the real DB. */
 let originalDbPath: string | undefined;
+let originalHome: string | undefined;
+let originalStateDir: string | undefined;
 let guardHomeDir: string;
 
 beforeEach(() => {
   originalDbPath = process.env.TAMANDUA_DB_PATH;
+  originalHome = process.env.HOME;
+  originalStateDir = process.env.TAMANDUA_STATE_DIR;
   guardHomeDir = createTempHome();
   const dbPath = path.join(guardHomeDir, ".tamandua", "tamandua.db");
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
   // Write an empty file; getDb() → migrate() creates all required tables.
   fs.writeFileSync(dbPath, "");
   process.env.TAMANDUA_DB_PATH = dbPath;
+  // Daemonctl path helpers (getPidFile / getMcpPidFile / ...) and the
+  // SERVICES checks resolve the tamandua dir from HOME when no homeDir opt
+  // is passed; without temp HOME they resolve the REAL ~/.tamandua and trip
+  // the test-isolation guard (55+ ledger entries). Point HOME / STATE_DIR
+  // at the per-test guard home so bare runDoctorChecks() calls stay temp.
+  process.env.HOME = guardHomeDir;
+  process.env.TAMANDUA_STATE_DIR = path.join(guardHomeDir, ".tamandua");
 });
 
 afterEach(() => {
@@ -54,6 +65,16 @@ afterEach(() => {
     process.env.TAMANDUA_DB_PATH = originalDbPath;
   } else {
     delete process.env.TAMANDUA_DB_PATH;
+  }
+  if (originalHome !== undefined) {
+    process.env.HOME = originalHome;
+  } else {
+    delete process.env.HOME;
+  }
+  if (originalStateDir !== undefined) {
+    process.env.TAMANDUA_STATE_DIR = originalStateDir;
+  } else {
+    delete process.env.TAMANDUA_STATE_DIR;
   }
   try { fs.rmSync(guardHomeDir, { recursive: true, force: true }); } catch { /* best-effort */ }
 });

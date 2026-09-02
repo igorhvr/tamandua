@@ -158,13 +158,17 @@ describe("formatDaemonLifecycle", () => {
   });
 
   it("uses the injected reader and renders an unclean death with a default age when age is missing", () => {
+    // Isolate the lifecycle-seen path (formatDaemonLifecycle resolves it to
+    // render the [UNSEEN] marker) so the guard does not fire on the real
+    // ~/.tamandua — the injected reader supplies the death.
+    const th = createTempHome("tamandua-dl-");
     const death: DaemonDeath = {
       kind: "unclean",
       ts: new Date(Date.now() - 5000).toISOString(),
       pid: 777,
       priorPid: 777,
     };
-    const out = formatDaemonLifecycle({ getLastDaemonDeath: () => death });
+    const out = formatDaemonLifecycle({ getLastDaemonDeath: () => death, homeDir: th.homeDir });
     assert.ok(out.includes("[UNSEEN]"), "a fresh injected unclean death must be unseen");
     assert.ok(out.includes("last heartbeat 0s ago"), "missing age must fall back to 0s");
   });
@@ -246,16 +250,22 @@ describe("daemon-lifecycle status surface test-guard", { concurrency: 1 }, () =>
   let savedStateDir: string | undefined;
   let savedGuard: string | undefined;
   let savedNodeTestContext: string | undefined;
+  let savedExpect: string | undefined;
 
   beforeEach(() => {
     savedHome = process.env.HOME;
     savedStateDir = process.env.TAMANDUA_STATE_DIR;
     savedGuard = process.env.TAMANDUA_TEST_GUARD;
     savedNodeTestContext = process.env.NODE_TEST_CONTEXT;
+    savedExpect = process.env.TAMANDUA_TEST_GUARD_EXPECT;
 
     process.env.TAMANDUA_TEST_GUARD = "1";
     process.env.HOME = os.userInfo().homedir;
     delete process.env.TAMANDUA_STATE_DIR;
+    // This describe deliberately provokes the guard (real HOME + real state
+    // dir) to verify the status surface drops reads/writes. No real leaks —
+    // mark the describe expected.
+    process.env.TAMANDUA_TEST_GUARD_EXPECT = "1";
   });
 
   afterEach(() => {
@@ -267,6 +277,8 @@ describe("daemon-lifecycle status surface test-guard", { concurrency: 1 }, () =>
     else delete process.env.TAMANDUA_TEST_GUARD;
     if (savedNodeTestContext !== undefined) process.env.NODE_TEST_CONTEXT = savedNodeTestContext;
     else delete process.env.NODE_TEST_CONTEXT;
+    if (savedExpect !== undefined) process.env.TAMANDUA_TEST_GUARD_EXPECT = savedExpect;
+    else delete process.env.TAMANDUA_TEST_GUARD_EXPECT;
   });
 
   it("formatDaemonLifecycle and collectDaemonLifecycle are no-ops under guard with real HOME", () => {

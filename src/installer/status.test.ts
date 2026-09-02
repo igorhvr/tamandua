@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import http from "node:http";
 import { cleanChildEnv } from "../../tests/helpers/test-env.ts";
 import path from "node:path";
 import crypto from "node:crypto";
@@ -7,7 +8,7 @@ import { tamanduaTempDir } from "../../dist/lib/temp-dir.js";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
-import { describe, it, beforeEach, afterEach } from "node:test";
+import { describe, it, beforeEach, afterEach, after } from "node:test";
 import { once } from "node:events";
 import { setTimeout as sleep } from "node:timers/promises";
 
@@ -48,6 +49,50 @@ function spawnCli(args: string[], env: Record<string, string>): {
     getStderr: () => stderr,
   };
 }
+
+// ── Sticky isolation env ─────────────────────────────────────────────
+// stopWorkflow / deleteWorkflow / forceFailRun launch fire-and-forget
+// async continuations — scheduleRunCronTeardown's terminateRunWithDaemon +
+// teardownWorkflowCronsIfIdle, and emitEvent's fireWebhook — that resolve
+// DB / log / daemon-secret paths AFTER the triggering test's afterEach has
+// already run. Restoring the operator's real env there makes those late
+// continuations trip the guard at the REAL ~/.tamandua (ledger entries with
+// testFile null, grouped under "(unknown)"). Keep HOME / TAMANDUA_STATE_DIR
+// / TAMANDUA_DB_PATH pointed at a module-scoped temp dir for the whole file
+// (events.test.ts / logger.test.ts module-level pattern) and drop
+// TAMANDUA_CONTROL_PORT so the fire-and-forget terminateRunWithDaemon can
+// never reach an ambient daemon. The module after() restores the operator's
+// env exactly as it was at load.
+const stickyState = (() => {
+  const env = createTempEnv();
+  const stateDir = path.join(env.root, "state");
+  fs.mkdirSync(stateDir, { recursive: true });
+  return { root: env.root, homeDir: env.homeDir, stateDir, dbPath: path.join(stateDir, "tamandua.db") };
+})();
+const originalHome = process.env.HOME;
+const originalStateDir = process.env.TAMANDUA_STATE_DIR;
+const originalDbPath = process.env.TAMANDUA_DB_PATH;
+const originalControlPort = process.env.TAMANDUA_CONTROL_PORT;
+
+function restoreOrDelete(name: string, value: string | undefined): void {
+  if (value === undefined) delete process.env[name];
+  else process.env[name] = value;
+}
+
+function applyStickyEnv(): void {
+  process.env.HOME = stickyState.homeDir;
+  process.env.TAMANDUA_STATE_DIR = stickyState.stateDir;
+  process.env.TAMANDUA_DB_PATH = stickyState.dbPath;
+  delete process.env.TAMANDUA_CONTROL_PORT;
+}
+
+after(() => {
+  restoreOrDelete("HOME", originalHome);
+  restoreOrDelete("TAMANDUA_STATE_DIR", originalStateDir);
+  restoreOrDelete("TAMANDUA_DB_PATH", originalDbPath);
+  restoreOrDelete("TAMANDUA_CONTROL_PORT", originalControlPort);
+  try { fs.rmSync(stickyState.root, { recursive: true, force: true }); } catch { /* cleanup */ }
+});
 
 function seedDb(dbPath: string, runId: string, context: Record<string, string>, wtData?: {
   worktreeOriginRepository: string;
@@ -417,17 +462,17 @@ describe("dashboard run detail worktree enrichment", () => {
 
 describe("stopWorkflow", () => {
   let tempRoot: string;
-  let originalDbPath: string | undefined;
-  let originalHome: string | undefined;
   let db: DatabaseSync;
 
   beforeEach(() => {
-    originalDbPath = process.env.TAMANDUA_DB_PATH;
-    originalHome = process.env.HOME;
     tempRoot = tamanduaTempDir("tamandua-stopwf-");
     const dbPath = path.join(tempRoot, ".tamandua", "tamandua.db");
     process.env.TAMANDUA_DB_PATH = dbPath;
     process.env.HOME = tempRoot;
+    // No daemon is (or should be) reachable from these tests — drop the
+    // ambient control port so stopWorkflow's terminateRunWithDaemon can
+    // never reach a live daemon and always falls back in-process.
+    delete process.env.TAMANDUA_CONTROL_PORT;
 
     fs.mkdirSync(path.dirname(dbPath), { recursive: true });
     db = new DatabaseSync(dbPath);
@@ -494,10 +539,11 @@ describe("stopWorkflow", () => {
   });
 
   afterEach(() => {
-    if (originalDbPath) process.env.TAMANDUA_DB_PATH = originalDbPath;
-    else delete process.env.TAMANDUA_DB_PATH;
-    if (originalHome) process.env.HOME = originalHome;
-    else delete process.env.HOME;
+    // Restore to the module-scoped sticky temp env (NOT the operator's real
+    // env): stopWorkflow/deleteWorkflow launch fire-and-forget continuations
+    // that resolve paths after this hook, and pointing them at the real
+    // ~/.tamandua trips the test-isolation guard.
+    applyStickyEnv();
     try { db.close(); } catch {}
     fs.rmSync(tempRoot, { recursive: true, force: true });
   });
@@ -665,21 +711,19 @@ describe("stopWorkflow", () => {
 describe("stopWorkflow run.canceled terminal event", () => {
   let tempRoot: string;
   let stateDir: string;
-  let originalDbPath: string | undefined;
-  let originalHome: string | undefined;
-  let originalStateDir: string | undefined;
   let db: DatabaseSync;
 
   beforeEach(() => {
-    originalDbPath = process.env.TAMANDUA_DB_PATH;
-    originalHome = process.env.HOME;
-    originalStateDir = process.env.TAMANDUA_STATE_DIR;
     tempRoot = tamanduaTempDir("tamandua-canceled-event-");
     stateDir = path.join(tempRoot, "state");
     const dbPath = path.join(stateDir, "tamandua.db");
     process.env.TAMANDUA_DB_PATH = dbPath;
     process.env.HOME = tempRoot;
     process.env.TAMANDUA_STATE_DIR = stateDir;
+    // No daemon is (or should be) reachable from these tests — drop the
+    // ambient control port so stopWorkflow's terminateRunWithDaemon can
+    // never reach a live daemon and always falls back in-process.
+    delete process.env.TAMANDUA_CONTROL_PORT;
 
     fs.mkdirSync(stateDir, { recursive: true });
     db = new DatabaseSync(dbPath);
@@ -748,12 +792,11 @@ describe("stopWorkflow run.canceled terminal event", () => {
   });
 
   afterEach(() => {
-    if (originalDbPath) process.env.TAMANDUA_DB_PATH = originalDbPath;
-    else delete process.env.TAMANDUA_DB_PATH;
-    if (originalHome) process.env.HOME = originalHome;
-    else delete process.env.HOME;
-    if (originalStateDir) process.env.TAMANDUA_STATE_DIR = originalStateDir;
-    else delete process.env.TAMANDUA_STATE_DIR;
+    // Restore to the module-scoped sticky temp env (NOT the operator's real
+    // env): stopWorkflow/deleteWorkflow/forceFailRun launch fire-and-forget
+    // continuations that resolve paths after this hook, and pointing them at
+    // the real ~/.tamandua trips the test-isolation guard.
+    applyStickyEnv();
     try { db.close(); } catch {}
     fs.rmSync(tempRoot, { recursive: true, force: true });
   });
@@ -977,21 +1020,19 @@ process.exit(0);
 describe("force-fail resume spurious-completed regression (FFRC)", () => {
   let tempRoot: string;
   let stateDir: string;
-  let originalDbPath: string | undefined;
-  let originalHome: string | undefined;
-  let originalStateDir: string | undefined;
   let db: DatabaseSync;
 
   beforeEach(() => {
-    originalDbPath = process.env.TAMANDUA_DB_PATH;
-    originalHome = process.env.HOME;
-    originalStateDir = process.env.TAMANDUA_STATE_DIR;
     tempRoot = tamanduaTempDir("tamandua-ffrc-");
     stateDir = path.join(tempRoot, "state");
     const dbPath = path.join(stateDir, "tamandua.db");
     process.env.TAMANDUA_DB_PATH = dbPath;
     process.env.HOME = tempRoot;
     process.env.TAMANDUA_STATE_DIR = stateDir;
+    // No daemon is (or should be) reachable from these tests — drop the
+    // ambient control port so stopWorkflow's terminateRunWithDaemon can
+    // never reach a live daemon and always falls back in-process.
+    delete process.env.TAMANDUA_CONTROL_PORT;
 
     fs.mkdirSync(stateDir, { recursive: true });
     db = new DatabaseSync(dbPath);
@@ -1047,12 +1088,11 @@ describe("force-fail resume spurious-completed regression (FFRC)", () => {
   });
 
   afterEach(() => {
-    if (originalDbPath) process.env.TAMANDUA_DB_PATH = originalDbPath;
-    else delete process.env.TAMANDUA_DB_PATH;
-    if (originalHome) process.env.HOME = originalHome;
-    else delete process.env.HOME;
-    if (originalStateDir) process.env.TAMANDUA_STATE_DIR = originalStateDir;
-    else delete process.env.TAMANDUA_STATE_DIR;
+    // Restore to the module-scoped sticky temp env (NOT the operator's real
+    // env): stopWorkflow/deleteWorkflow/forceFailRun launch fire-and-forget
+    // continuations that resolve paths after this hook, and pointing them at
+    // the real ~/.tamandua trips the test-isolation guard.
+    applyStickyEnv();
     try { db.close(); } catch {}
     fs.rmSync(tempRoot, { recursive: true, force: true });
   });
@@ -1336,5 +1376,135 @@ describe("RSPN instant-fail loop surfacing", () => {
     assert.match(stdout, /if:4/);
 
     try { fs.rmSync(env.root, { recursive: true, force: true }); } catch { /* cleanup */ }
+  });
+});
+
+// ── Late fire-and-forget continuations (sticky isolation env) ─────────
+// stopWorkflow's teardown + webhook continuations (scheduleRunCronTeardown
+// → teardownWorkflowCronsIfIdle, emitEvent → fireWebhook) resolve DB / log /
+// notify_url paths asynchronously, AFTER the triggering test's afterEach has
+// already run. Before the sticky env existed they resolved the REAL
+// ~/.tamandua and the guard threw — so the caller caught and SKIPPED the
+// write (the coverage blind spot this story closes). This test pins that the
+// writes now land in the sticky temp state: the teardown idle-check writes
+// "Workflow idle" to the sticky log, and the webhook's notify_url DB lookup
+// reaches the local mock server.
+describe("late teardown/webhook continuations land in sticky temp state", () => {
+  it("stopWorkflow's fire-and-forget teardown + webhook writes hit the sticky temp state", async () => {
+    applyStickyEnv();
+
+    // Local mock webhook receiver: records POSTs so the fire-and-forget
+    // webhook's notify_url lookup is observable.
+    let webhookHits = 0;
+    const webhookServer = http.createServer((req, res) => {
+      if (req.method === "POST" && req.url === "/notify") {
+        webhookHits++;
+        req.resume();
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      } else {
+        res.writeHead(404);
+        res.end();
+      }
+    });
+    await new Promise<void>((resolve) => webhookServer.listen(0, "127.0.0.1", resolve));
+    const webhookPort = (webhookServer.address() as { port: number }).port;
+
+    try {
+      // Seed the run into the STICKY DB (the env the continuations resolve).
+      const db = new DatabaseSync(stickyState.dbPath);
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS runs (
+          id TEXT PRIMARY KEY,
+          workflow_id TEXT NOT NULL DEFAULT 'test',
+          task TEXT NOT NULL DEFAULT 'test',
+          status TEXT NOT NULL DEFAULT 'running',
+          context TEXT NOT NULL DEFAULT '{}',
+          tokens_spent INTEGER NOT NULL DEFAULT 0,
+          worker_lost_count INTEGER NOT NULL DEFAULT 0,
+          scheduling_status TEXT,
+          notify_url TEXT,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS steps (
+          id TEXT PRIMARY KEY,
+          run_id TEXT NOT NULL,
+          step_id TEXT NOT NULL,
+          agent_id TEXT NOT NULL,
+          step_index INTEGER NOT NULL DEFAULT 0,
+          input_template TEXT NOT NULL DEFAULT '',
+          expects TEXT NOT NULL DEFAULT '',
+          status TEXT NOT NULL DEFAULT 'waiting',
+          output TEXT,
+          retry_count INTEGER DEFAULT 0,
+          max_retries INTEGER DEFAULT 4,
+          type TEXT NOT NULL DEFAULT 'single',
+          loop_config TEXT,
+          current_story_id TEXT,
+          abandoned_count INTEGER DEFAULT 0,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS stories (
+          id TEXT PRIMARY KEY,
+          run_id TEXT NOT NULL,
+          story_index INTEGER NOT NULL,
+          story_id TEXT NOT NULL,
+          title TEXT NOT NULL,
+          description TEXT NOT NULL DEFAULT '',
+          acceptance_criteria TEXT NOT NULL DEFAULT '[]',
+          status TEXT NOT NULL DEFAULT 'pending',
+          output TEXT,
+          retry_count INTEGER DEFAULT 0,
+          max_retries INTEGER DEFAULT 4,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS run_worktrees (
+          run_id TEXT PRIMARY KEY,
+          worktree_origin_repository TEXT NOT NULL,
+          worktree_origin_git_common_dir TEXT NOT NULL,
+          worktree_path TEXT NOT NULL,
+          worktree_origin_ref TEXT,
+          worktree_origin_sha TEXT,
+          original_branch TEXT,
+          status TEXT NOT NULL DEFAULT 'creating',
+          cleanup_policy TEXT NOT NULL DEFAULT 'remove_on_success',
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          removed_at TEXT,
+          error TEXT
+        );
+      `);
+      db.prepare(
+        "INSERT INTO runs (id, workflow_id, task, status, notify_url, created_at, updated_at) VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'))",
+      ).run("run-sticky-late", "wf", "late writes", "running", `http://127.0.0.1:${webhookPort}/notify`);
+      db.close();
+
+      const { stopWorkflow } = await import("../../dist/installer/status.js");
+      const result = await stopWorkflow("run-sticky-late");
+      assert.equal(result.ok, true);
+
+      // Bounded settle for the fire-and-forget continuations (module-loader
+      // hops fire after the synchronous stopWorkflow returns).
+      await sleep(500);
+
+      // 1. The run.canceled event landed in the sticky events dir.
+      const evtFile = path.join(stickyState.stateDir, "events", "run-sticky-late.jsonl");
+      assert.ok(fs.existsSync(evtFile), "run.canceled must land in the sticky events dir");
+
+      // 2. The teardown idle-check wrote to the sticky log — the late
+      //    getDb + logger write the guard used to skip.
+      const logFile = path.join(stickyState.stateDir, "tamandua.log");
+      assert.ok(fs.existsSync(logFile), "late teardown logger write must land in the sticky log");
+      const logContent = fs.readFileSync(logFile, "utf-8");
+      assert.match(logContent, /Workflow idle/, "teardown idle-check must have run against the sticky state");
+
+      // 3. The webhook's notify_url DB lookup reached the mock server — the
+      //    late fireWebhook getDb write the guard used to skip.
+      assert.ok(webhookHits > 0, "webhook must have fired from the sticky state notify_url lookup");
+    } finally {
+      await new Promise<void>((resolve) => webhookServer.close(() => resolve()));
+    }
   });
 });

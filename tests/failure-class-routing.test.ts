@@ -35,16 +35,28 @@ steps:
 `;
 
 describe("failure-class motor routing", () => {
+  let savedHome: string | undefined;
   let savedStateDir: string | undefined;
   let savedDbPath: string | undefined;
+  let savedControlPort: string | undefined;
   let isolationDir: string;
 
   before(() => {
+    savedHome = process.env.HOME;
     savedStateDir = process.env.TAMANDUA_STATE_DIR;
     savedDbPath = process.env.TAMANDUA_DB_PATH;
+    savedControlPort = process.env.TAMANDUA_CONTROL_PORT;
     isolationDir = tamanduaTempDir("tamandua-failure-class-routing-");
+    // HOME is required too: failStep's fire-and-forget rugpull relaunch
+    // (relaunchRunAfterRugpull → runWorkflow) goes through controlRequest,
+    // which resolves the daemon secret at HOME/.tamandua/daemon-secret when
+    // TAMANDUA_CONTROL_PORT is set — with the real HOME that trips the
+    // guard. Point HOME at the temp isolation dir and drop the ambient
+    // control port so the daemon can never be reached.
+    process.env.HOME = path.join(isolationDir, "home");
     process.env.TAMANDUA_STATE_DIR = isolationDir;
     process.env.TAMANDUA_DB_PATH = path.join(isolationDir, "tamandua.db");
+    delete process.env.TAMANDUA_CONTROL_PORT;
 
     const workflowDir = path.join(isolationDir, "workflows", "test-failure-class-routing");
     fs.mkdirSync(workflowDir, { recursive: true });
@@ -56,10 +68,14 @@ describe("failure-class motor routing", () => {
     // isolated state directory is still active.
     await new Promise<void>((resolve) => setImmediate(resolve));
     await new Promise<void>((resolve) => setImmediate(resolve));
-    if (savedStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
-    else process.env.TAMANDUA_STATE_DIR = savedStateDir;
-    if (savedDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
-    else process.env.TAMANDUA_DB_PATH = savedDbPath;
+    const restore = (name: string, value: string | undefined): void => {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    };
+    restore("HOME", savedHome);
+    restore("TAMANDUA_STATE_DIR", savedStateDir);
+    restore("TAMANDUA_DB_PATH", savedDbPath);
+    restore("TAMANDUA_CONTROL_PORT", savedControlPort);
     fs.rmSync(isolationDir, { recursive: true, force: true });
   });
 

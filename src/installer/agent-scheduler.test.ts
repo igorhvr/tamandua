@@ -63,6 +63,47 @@ function makeWorkflow(overrides: {
   };
 }
 
+// ── Test-isolation state env ────────────────────────────────────────
+// Scheduler code under test reads the run DB (getDb → TAMANDUA_DB_PATH,
+// else ~/.tamandua/tamandua.db) and logs through lib/logger (STATE_DIR).
+// Describes that don't set their own full env used to resolve the REAL
+// ~/.tamandua, trip the test-isolation guard, and silently skip the DB
+// reads/log writes (55 ledger violations). Isolate every test to a fresh
+// temp HOME / STATE_DIR / DB_PATH; restore the previous env in afterEach.
+let savedHome: string | undefined;
+let savedStateDir: string | undefined;
+let savedDbPath: string | undefined;
+let isolationRoot: string | null = null;
+
+beforeEach(() => {
+  savedHome = process.env.HOME;
+  savedStateDir = process.env.TAMANDUA_STATE_DIR;
+  savedDbPath = process.env.TAMANDUA_DB_PATH;
+  isolationRoot = tamanduaTempDir("tamandua-test-agent-scheduler-state-");
+  const stateDir = path.join(isolationRoot, ".tamandua");
+  fs.mkdirSync(stateDir, { recursive: true });
+  process.env.HOME = isolationRoot;
+  process.env.TAMANDUA_STATE_DIR = stateDir;
+  process.env.TAMANDUA_DB_PATH = path.join(stateDir, "tamandua.db");
+});
+
+afterEach(() => {
+  if (isolationRoot) {
+    try {
+      fs.rmSync(isolationRoot, { recursive: true, force: true });
+    } catch {
+      // best-effort cleanup
+    }
+    isolationRoot = null;
+  }
+  if (savedHome === undefined) delete process.env.HOME;
+  else process.env.HOME = savedHome;
+  if (savedStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
+  else process.env.TAMANDUA_STATE_DIR = savedStateDir;
+  if (savedDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
+  else process.env.TAMANDUA_DB_PATH = savedDbPath;
+});
+
 describe("reconciler run status teardown policy", () => {
   it("graces only naturally completed and failed runs", () => {
     const cases: Array<[string | undefined, number]> = [

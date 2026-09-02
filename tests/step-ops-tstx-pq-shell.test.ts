@@ -20,6 +20,8 @@ const repoRoot = path.resolve(__dirname, "..");
 describe("TSTX-PQ shell execution (POSIX quoting)", () => {
   const _savedStateDir = process.env.TAMANDUA_STATE_DIR;
   const _savedDbPath = process.env.TAMANDUA_DB_PATH;
+  const _savedHome = process.env.HOME;
+  const _savedControlPort = process.env.TAMANDUA_CONTROL_PORT;
   const th = createTempHome("tamandua-tstx-pq-shell-");
 
   let repoPath: string;
@@ -27,7 +29,14 @@ describe("TSTX-PQ shell execution (POSIX quoting)", () => {
   let sideEffectFile: string;
 
   before(() => {
+    // HOME is required too: step-ops teardown continuations resolve the
+    // daemon secret at HOME/.tamandua/daemon-secret through controlRequest
+    // when TAMANDUA_CONTROL_PORT is set — with the real HOME that tripped the
+    // guard. Point HOME at the temp home and pin CONTROL_PORT to a dead port
+    // so control-plane calls fail fast instead of reaching a live daemon.
+    process.env.HOME = th.homeDir;
     process.env.TAMANDUA_STATE_DIR = th.tamanduaDir;
+    process.env.TAMANDUA_CONTROL_PORT = "1";
     process.env.TAMANDUA_DB_PATH = path.join(th.tamanduaDir, "tamandua.db");
 
     // Create a temporary directory that will serve as our fake "repo" with
@@ -87,12 +96,22 @@ exit 0
     fs.chmodSync(fakeShim, 0o755);
   });
 
-  after(() => {
+  after(async () => {
+    // Teardown continuations (scheduleRunCronTeardown's import()-hop
+    // terminateRunWithDaemon) are fire-and-forget; drain a few event-loop
+    // turns while the temp env is still active so controlRequest resolves
+    // the temp daemon secret instead of the restored real one.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setImmediate(resolve));
     // Cleanup env
     if (_savedStateDir === undefined) delete process.env.TAMANDUA_STATE_DIR;
     else process.env.TAMANDUA_STATE_DIR = _savedStateDir;
     if (_savedDbPath === undefined) delete process.env.TAMANDUA_DB_PATH;
     else process.env.TAMANDUA_DB_PATH = _savedDbPath;
+    if (_savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = _savedHome;
+    if (_savedControlPort === undefined) delete process.env.TAMANDUA_CONTROL_PORT;
+    else process.env.TAMANDUA_CONTROL_PORT = _savedControlPort;
     // Cleanup temp files
     try { fs.unlinkSync(sideEffectFile); } catch { /* ok */ }
   });
