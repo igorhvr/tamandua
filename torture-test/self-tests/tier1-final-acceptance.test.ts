@@ -333,6 +333,12 @@ const allowed = [
   // authoring files.
   "torture-test/fixtures-src/",
   "torture-test/bin/verify-builder-determinism.test.sh",
+  // MJAV (US-001..US-007): the shared JDK discovery resolver
+  // (torture-test/lib/jdk-discovery.sh) is the Darwin-parity helper sourced
+  // by both W0.0's toolchain-java-maven gate and every mvnw-driven fixture
+  // builder — a NEW authoring surface (torture-test/lib/) added in the same
+  // story batch that created it, exactly like fixtures-src/ for MACP1.
+  "torture-test/lib/",
   // MACP2 (US-001): the impl-task task docs (portability evidence + resolution
   // decisions recorded in torture-test/impl-tasks/*.md, e.g.
   // MACP2-pycache-junk-portability.md) are part of the MACP2 authoring surface

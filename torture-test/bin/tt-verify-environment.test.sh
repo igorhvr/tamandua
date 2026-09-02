@@ -728,6 +728,26 @@ else
   fail "FULL (non-fast) run does not record capabilities.daemon-scripted === true"
 fi
 
+# US-004 AC1: the java+maven gate records the resolved JDK path (absolute)
+# and its resolution source in both the --json hostProfile and the
+# host-profile.json file (the FULL run above wrote it; --fast runs later
+# intentionally skip the resolver, so this is checked here, not after --fast).
+if echo "$json_output" | jq -e '.hostProfile.toolchains["java+maven"].resolvedJdk != null and (.hostProfile.toolchains["java+maven"].resolvedJdk | startswith("/"))' > /dev/null 2>&1; then
+  pass "US-004 AC1: hostProfile.toolchains['java+maven'].resolvedJdk is an absolute path"
+else
+  fail "US-004 AC1: hostProfile.toolchains['java+maven'].resolvedJdk missing or not absolute"
+fi
+jdk_source=$(echo "$json_output" | jq -r '.hostProfile.toolchains["java+maven"].jdkSource // ""')
+case "$jdk_source" in
+  java_home|mvn|path) pass "US-004 AC1: jdkSource = ${jdk_source} (valid)" ;;
+  *) fail "US-004 AC1: jdkSource = '${jdk_source}' (expected java_home|mvn|path)" ;;
+esac
+if jq -e '.toolchains["java+maven"].resolvedJdk != null and (.toolchains["java+maven"].resolvedJdk | startswith("/")) and (.toolchains["java+maven"].jdkSource == "java_home" or .toolchains["java+maven"].jdkSource == "mvn" or .toolchains["java+maven"].jdkSource == "path")' "${SCRIPT_DIR}/../var/w0/host-profile.json" > /dev/null 2>&1; then
+  pass "US-004 AC1: host-profile.json records resolvedJdk + jdkSource for java+maven"
+else
+  fail "US-004 AC1: host-profile.json missing resolvedJdk/jdkSource for java+maven"
+fi
+
 # Each toolchain entry has { present, buildPassed, testPassed, evidence }
 for tc in 'java+maven' 'rust/cargo' go python3 node; do
   if echo "$json_output" | jq -e ".hostProfile.toolchains.\"${tc}\"" > /dev/null 2>&1; then
@@ -775,6 +795,77 @@ for tc in 'java+maven' 'rust/cargo' go python3 node; do
     *) fail "hostProfile.toolchains['${tc}'].present = ${present_val} in --fast mode (expected true/false)" ;;
   esac
 done
+
+# ── Test: US-004 JDK resolver in java+maven gate (red-arm AC2) ─────────
+echo ""
+echo "--- Test: US-004 JDK resolver in java+maven gate (red-arm) ---"
+
+FAKE_JDK_BIN="$(mktemp -d "${TMPDIR:-/tmp}/tt-verify-jdk-fake.XXXXXX")"
+FAKE_JDK="$FAKE_JDK_BIN/fake-jdk"
+mkdir -p "$FAKE_JDK/bin"
+
+# Working fake JDK: bin/java exits 0 (the resolver verifies via `-version`).
+cat > "$FAKE_JDK/bin/java" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "-version" ]; then echo 'openjdk version "21.0.11"'; fi
+exit 0
+EOF
+chmod +x "$FAKE_JDK/bin/java"
+
+# Apple-style stub java on PATH: exits non-zero, so the resolver must NOT use it.
+cat > "$FAKE_JDK_BIN/java" <<'EOF'
+#!/usr/bin/env bash
+echo "stub java (unusable)" >&2
+exit 1
+EOF
+chmod +x "$FAKE_JDK_BIN/java"
+
+# Fake mvn: --version/-v print a banner with a runtime: line pointing at the
+# fake JDK; compile exits 0; exec:java prints OK.
+cat > "$FAKE_JDK_BIN/mvn" <<EOF
+#!/usr/bin/env bash
+case "\${1:-}" in
+  --version|-v|-version)
+    echo 'Apache Maven 3.9.16 (fake)'
+    echo 'Maven home: /nonexistent/maven'
+    echo 'Java version: 21.0.11, vendor: Azul Systems, Inc., runtime: $FAKE_JDK'
+    echo 'Default locale: en_US, platform encoding: UTF-8'
+    exit 0
+    ;;
+esac
+for a in "\$@"; do
+  case "\$a" in
+    exec:java) echo "OK"; exit 0 ;;
+    compile) exit 0 ;;
+  esac
+done
+exit 0
+EOF
+chmod +x "$FAKE_JDK_BIN/mvn"
+
+# Real binaries for the REQUIRED checks, plus sed/head for the resolver's
+# `mvn -v` runtime-line parse. cargo/go are left OFF the PATH so those
+# tier-2 probes fail fast (informational under --tier tier1).
+for bin_name in node npm python3 git bash which curl jq sqlite3 df true sh systemd-run systemctl nohup sed head; do
+  real_path="$(command -v "$bin_name" 2>/dev/null || true)"
+  if [ -n "$real_path" ]; then
+    ln -s "$real_path" "$FAKE_JDK_BIN/$bin_name"
+  fi
+done
+
+ac2_json=$(JAVA_HOME= PATH="$FAKE_JDK_BIN" "$TOOL" --tier tier1 --json 2>&1) && ac2_exit=$? || ac2_exit=$?
+if [ "$ac2_exit" -eq 0 ]; then
+  pass "US-004 red-arm: --tier tier1 --json exits 0 on the fake JDK host"
+else
+  fail "US-004 red-arm: --tier tier1 --json exited ${ac2_exit}, expected 0"
+fi
+if echo "$ac2_json" | jq -e --arg jdk "$FAKE_JDK" '.checks[] | select(.id == "toolchain-java-maven" and .result == "PASS")' > /dev/null 2>&1 \
+  && echo "$ac2_json" | jq -e --arg jdk "$FAKE_JDK" '.hostProfile.toolchains["java+maven"].resolvedJdk == $jdk and .hostProfile.toolchains["java+maven"].jdkSource == "mvn"' > /dev/null 2>&1; then
+  pass "US-004 red-arm: java+maven PASSes and resolvedJdk == mvn-reported JDK (source=mvn)"
+else
+  fail "US-004 red-arm: java+maven did not PASS with resolvedJdk == mvn-reported JDK"
+fi
+rm -rf -- "$FAKE_JDK_BIN"
 
 # ── Test 10: var/w0 directory exists after run ─────────────────────────
 echo ""
@@ -1402,10 +1493,21 @@ else
 fi
 
 for tc in toolchain-java-maven toolchain-rust-cargo toolchain-go; do
-  if echo "$t1_json" | jq -e ".checks[] | select(.id == \"${tc}\" and .required == false and .result == \"FAIL\" and (.evidence | contains(\"not found\")))" > /dev/null 2>&1; then
-    pass "T1-only host: ${tc} is required:false and FAILs with 'not found' evidence under tier1"
+  if [ "$tc" = "toolchain-java-maven" ]; then
+    # US-004: java+maven now resolves the JDK FIRST and fails closed with a
+    # remedy naming JAVA_HOME/nix when there is no usable JDK — the old
+    # 'mvn not found' evidence is only emitted when a JDK resolves but mvn
+    # itself is absent.
+    evidence_jq='(.evidence | contains("not found") or contains("JAVA_HOME"))'
+    evidence_label="JDK/maven remedy evidence"
   else
-    fail "T1-only host: ${tc} not required:false+FAIL('not found') under tier1"
+    evidence_jq='(.evidence | contains("not found"))'
+    evidence_label="'not found' evidence"
+  fi
+  if echo "$t1_json" | jq -e ".checks[] | select(.id == \"${tc}\" and .required == false and .result == \"FAIL\" and ${evidence_jq})" > /dev/null 2>&1; then
+    pass "T1-only host: ${tc} is required:false and FAILs with ${evidence_label} under tier1"
+  else
+    fail "T1-only host: ${tc} not required:false+FAIL(${evidence_label}) under tier1"
   fi
 done
 
@@ -1420,8 +1522,13 @@ done
 # host-profile honesty: the three absent toolchains record present=false with
 # 'not found' evidence even though they are informational under tier1
 for tc_key in 'java+maven' 'rust/cargo' go; do
-  if echo "$t1_json" | jq -e ".hostProfile.toolchains.\"${tc_key}\".present == false and (.hostProfile.toolchains.\"${tc_key}\".evidence | contains(\"not found\"))" > /dev/null 2>&1; then
-    pass "T1-only host: hostProfile.toolchains['${tc_key}'] records present=false ('not found')"
+  if [ "$tc_key" = "java+maven" ]; then
+    evidence_jq='(.hostProfile.toolchains."'"${tc_key}"'".evidence | contains("not found") or contains("JAVA_HOME"))'
+  else
+    evidence_jq='(.hostProfile.toolchains."'"${tc_key}"'".evidence | contains("not found"))'
+  fi
+  if echo "$t1_json" | jq -e ".hostProfile.toolchains.\"${tc_key}\".present == false and ${evidence_jq}" > /dev/null 2>&1; then
+    pass "T1-only host: hostProfile.toolchains['${tc_key}'] records honest absence"
   else
     fail "T1-only host: hostProfile.toolchains['${tc_key}'] missing honest absence record"
   fi
@@ -1454,6 +1561,15 @@ for tc in toolchain-java-maven toolchain-rust-cargo toolchain-go; do
     fail "T1-only host: ${tc} not required:true+FAIL under --tier tier2"
   fi
 done
+
+# US-004 AC3: with no java, no mvn runtime and no JAVA_HOME on the restricted
+# PATH, the java+maven check must fail closed with a remedy naming JAVA_HOME
+# and nix (not the old 'Install maven + JDK' one-liner).
+if echo "$t2_json" | jq -e '.checks[] | select(.id == "toolchain-java-maven" and .result == "FAIL" and (.remedy | contains("JAVA_HOME")) and (.remedy | contains("nix")))' > /dev/null 2>&1; then
+  pass "US-004 AC3: java+maven FAIL remedy names JAVA_HOME and nix (no java/mvn/JAVA_HOME)"
+else
+  fail "US-004 AC3: java+maven FAIL remedy missing JAVA_HOME/nix on the no-JDK host"
+fi
 
 def_json=$(PATH="$FAKE_BIN_DIR" "$TOOL" --json 2>&1) && def_exit=$? || def_exit=$?
 if [ "$def_exit" -ne 0 ]; then

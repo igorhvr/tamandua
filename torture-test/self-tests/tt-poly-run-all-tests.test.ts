@@ -208,43 +208,41 @@ describe("tt-poly run-all-tests script (US-007)", () => {
 
   // ── java/ suite ────────────────────────────────────────────────────
 
-  it("contains java/ suite section with JAVA_HOME detection", () => {
+  it("contains java/ suite section with shared JDK resolver", () => {
     assert.ok(
       scriptContent.includes("[java/] tt-poly java suite"),
       "should have java banner",
     );
     assert.ok(
-      scriptContent.includes('if [ -z "${JAVA_HOME:-}" ]'),
-      "should check JAVA_HOME is set",
+      scriptContent.includes(
+        'JDK_DISCOVERY="$REPO_ROOT/torture-test/lib/jdk-discovery.sh"',
+      ),
+      "should reference the shared JDK resolver",
     );
     assert.ok(
-      scriptContent.includes("JAVA_HOME is not set"),
-      "should report missing JAVA_HOME error",
-    );
-    assert.ok(
-      scriptContent.includes('if [ ! -d "$JAVA_HOME" ]'),
-      "should check JAVA_HOME directory exists",
-    );
-    assert.ok(
-      scriptContent.includes("JAVA_HOME ($JAVA_HOME) does not exist"),
-      "should report invalid JAVA_HOME error",
+      scriptContent.includes('if ! . "$JDK_DISCOVERY" >/dev/null'),
+      "should source the shared JDK resolver",
     );
     assert.ok(
       scriptContent.includes(
-        '(cd "$ROOT_DIR/java" && ./mvnw -q -B test)',
+        'if (cd "$ROOT_DIR/java" && ./mvnw -q -B -Dmaven.repo.local="$MAVEN_REPO_LOCAL" test)',
       ),
-      "should run mvnw test from java/ directory",
+      "should run mvnw test from java/ directory with the resolved JAVA_HOME",
+    );
+    assert.ok(
+      scriptContent.includes('MAVEN_REPO_LOCAL="$REPO_ROOT/torture-test/var/m2-repository"'),
+      "should keep maven.repo.local under torture-test/var",
     );
   });
 
-  it("java suite handles missing JAVA_HOME as failure", () => {
+  it("java suite fails closed when the JDK resolver fails", () => {
     assert.ok(
-      /fail_msg "java suite \(JAVA_HOME not set\)"/.test(scriptContent),
-      "should fail with JAVA_HOME not set message",
+      /fail_msg "java suite \(no working JDK\)"/.test(scriptContent),
+      "should fail with no-working-JDK message when the resolver fails closed",
     );
     assert.ok(
-      /fail_msg "java suite \(JAVA_HOME not found\)"/.test(scriptContent),
-      "should fail with JAVA_HOME not found message",
+      /fail_msg "java suite \(JDK resolver not found\)"/.test(scriptContent),
+      "should fail with resolver-not-found message when the resolver file is missing",
     );
   });
 

@@ -21,6 +21,20 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 VAR_DIR="$REPO_ROOT/torture-test/var"
 GOLDEN_DIR="$VAR_DIR/fixtures/golden"
 
+# Resolve and export a working JDK via the shared resolver before any
+# ./mvnw invocation below. On darwin PATH `java` is Apple's stub (exits
+# non-zero); the resolver falls through to the JDK nix maven bundles.
+JDK_DISCOVERY="$REPO_ROOT/torture-test/lib/jdk-discovery.sh"
+if [ -f "$JDK_DISCOVERY" ]; then
+    if ! . "$JDK_DISCOVERY" >/dev/null; then
+        echo "validate-e2e.sh: no working JDK found — see jdk-discovery remedy above" >&2
+        exit 1
+    fi
+else
+    echo "validate-e2e.sh: JDK resolver not found at $JDK_DISCOVERY" >&2
+    exit 1
+fi
+
 PASS=0
 FAIL=0
 
@@ -93,6 +107,8 @@ if [ "$MVN_EXIT" -eq 0 ]; then
     pass "Baseline test suite: GREEN ($TEST_COUNT tests)"
 else
     fail "Baseline test suite: GREEN" "baseline tests failed unexpectedly"
+    echo "    ── last lines of mvnw output ──" >&2
+    printf '%s\n' "$MVN_OUT" | tail -20 >&2
 fi
 
 # Verify test count is in expected range (131 baseline tests)

@@ -92,11 +92,19 @@ byte-known state and no scenario inherits a sibling's residue.
   on the bare PATH; `mvnw` needs a discoverable JDK, and the fixture's
   README documents the JAVA_HOME hint — a setup agent that reads the
   README succeeds, one that blindly runs `java -version` hits a realistic
-  mess. Record how agents cope. (The trap presumes a JDK exists but is
-  off-PATH; a host with no JDK at all — e.g. stock darwin, whose
-  `/usr/bin/java` is Apple's no-JDK stub — simply fails W0.0's tier gate
-  and tt-java lanes fall to `NOT_RUN (predicate)` until P0 provisions
-  one.)
+  mess. Record how agents cope.
+- **Darwin JDK resolution (operator note).** Apple ships a `java` stub at
+  `/usr/bin/java` — it prints "Unable to locate a Java Runtime" and exits
+  non-zero, so a stock darwin host has no working PATH `java`. The suite
+  resolves the JDK through one shared helper, `torture-test/lib/jdk-discovery.sh`,
+  used by both W0.0's `toolchain-java-maven` gate and every `mvnw`-driven
+  fixture builder, in this order: **JAVA_HOME** (only when `$JAVA_HOME/bin/java`
+  runs) → the **`mvn -v` runtime** JDK (parsed from its `runtime:` line and
+  verified via its `bin/java`) → a **working PATH java** (only when
+  `java -version` exits 0; Apple's stub is skipped). **nix maven alone is
+  sufficient**: nix `maven` bundles a Zulu JDK whose `runtime:` line the
+  resolver picks up, so a darwin operator needs neither a system JDK nor a
+  pre-set `JAVA_HOME`.
 - Junk probe: untracked `target/` (NOT gitignored).
 - Seeded: 4 bugs (`BUG-J1..J4`: off-by-one in rounding, null-deref on empty
   CSV, locale-dependent parse, comparator contract violation); 4-feature
