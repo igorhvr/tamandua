@@ -29,13 +29,19 @@ export GIT_COMMITTER_DATE='2025-01-15T10:00:00 +0000'
 # -------------------------------------------------------------------
 # JAVA_HOME / JDK discovery for Maven execution
 # -------------------------------------------------------------------
-# Honour JAVA_HOME if already set; otherwise mvnw auto-discovers it.
-# We export it so child processes (mvnw) can find the JDK.
-if [ -n "${JAVA_HOME:-}" ]; then
-    export JAVA_HOME
+# Resolve a working JDK through the shared resolver and export it so the
+# mvnw wrapper uses the SAME JDK the environment gate certifies. On darwin,
+# PATH `java` is Apple's stub (exits non-zero), so the resolver falls through
+# to the JDK nix maven bundles (parsed from `mvn -v`'s `runtime:` line).
+JDK_DISCOVERY="$REPO_ROOT/torture-test/lib/jdk-discovery.sh"
+if [ -f "$JDK_DISCOVERY" ]; then
+    if ! . "$JDK_DISCOVERY" >/dev/null; then
+        echo "build-golden.sh: no working JDK found — see jdk-discovery remedy above" >&2
+        exit 1
+    fi
 else
-    # mvnw uses its own discovery — leave unset and let it find java on PATH
-    :
+    echo "build-golden.sh: JDK resolver not found at $JDK_DISCOVERY" >&2
+    exit 1
 fi
 
 # Maven local repo cache under var/ to avoid polluting ~/.m2
@@ -306,6 +312,8 @@ for seed_id in "${PATCHED_SEEDS[@]}"; do
             echo "      RED (failures — ok)"
         else
             echo "      UNEXPECTED GREEN — BRK seed should fail!"
+            echo "      ── last lines of mvnw test output ──"
+            printf '%s\n' "$TEST_OUTPUT" | tail -20
             exit 1
         fi
     else

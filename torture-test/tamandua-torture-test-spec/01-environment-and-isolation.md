@@ -73,6 +73,7 @@ What the spec DOES own is host *adaptation*:
 | `/var` → `/private/var` realpath (darwin) | path-normalization scenarios W4.22, TSTX keying |
 | kernel hides other processes' env (darwin) | recorder/census must use cmdline/cwd/lsof evidence, never env |
 | slow process spawn (observed on darwin hosts) | serial-lane deadlines; W0.4 records per-suite durations and scales caps |
+| Apple ships a `/usr/bin/java` stub on darwin (`java -version` exits non-zero) | W0.0's `toolchain-java-maven` gate and every `mvnw`-driven fixture builder resolve the JDK via `torture-test/lib/jdk-discovery.sh` — JAVA_HOME → `mvn -v` runtime → working PATH java; nix maven alone is sufficient (its bundled Zulu JDK is the `mvn -v` runtime) |
 | multiple node runtimes coexisting (e.g. nix node 24 + a vendored v22) | W0.1 dual-runtime check, W4.23 runtime-swap scenario |
 | node via version-manager shims keyed on HOME (Volta: `~/.volta/bin/node` resolves per-HOME; nvm similar) | the TT spawn env overrides HOME, so shims die ("Node is not available", rc=126) — env scripts pin the REAL node binary dir on PATH + export VOLTA_HOME (incident: 21 daemon-control self-test failures, 2026-07-31) |
 

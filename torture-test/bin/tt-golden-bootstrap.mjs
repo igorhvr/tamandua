@@ -112,6 +112,17 @@ function refReason(category, message, extra = {}) {
   return { ok: false, reason: { category, message, ...extra } };
 }
 
+// Combine a command's stdout and stderr into a single diagnostic stream and
+// return the last `n` lines (newest last). Never prefers one stream over the
+// other: the old code preferred stderr over stdout (`stderr || stdout`), which
+// dropped every line of stdout whenever stderr carried even one byte, hiding
+// mvnw/build tails written to stdout (build-golden.sh captures `./mvnw ... 2>&1`,
+// so its failure tail arrives on stdout while its progress banner may touch stderr).
+export function failureTail(stdout, stderr, n) {
+  const parts = [String(stdout ?? ''), String(stderr ?? '')].filter((s) => s.length > 0);
+  return parts.join('\n').split(/\r?\n/).slice(-n);
+}
+
 function fixtureMetaOrReason(fixture, goldenDir) {
   if (typeof fixture !== 'string' || fixture === '') {
     return refReason('golden-fixture-unspecified', 'a --fixture name is required');
@@ -288,10 +299,9 @@ function buildGoldenBare({ fixture, barePath, hashFilePath, buildScriptPath }) {
       buildScript: buildScriptPath,
       exit_code: res.status,
       signal: res.signal ?? null,
-      tail: (res.stderr || res.stdout || '').toString().split(/\r?\n/).slice(-15),
+      tail: failureTail(res.stdout, res.stderr, 20),
     });
   }
-  const out = (res.stdout || '').toString() + (res.stderr || '').toString();
   if (!fs.existsSync(barePath)) {
     return refReason('golden-bare-missing-after-build', 'build finished but no bare repo was produced', {
       fixture, buildScript: buildScriptPath, bare: barePath,
@@ -299,7 +309,7 @@ function buildGoldenBare({ fixture, barePath, hashFilePath, buildScriptPath }) {
   }
   const verified = verifyBareAgainstLedger({ fixture, barePath, hashFilePath, baselineBranch: fixtureMetaOrReason(fixture).baselineBranch });
   if (!verified.ok) {
-    return { ...verified, reason: { ...verified.reason, built: true, build_tail: out.split(/\r?\n/).slice(-8) } };
+    return { ...verified, reason: { ...verified.reason, built: true, build_tail: failureTail(res.stdout, res.stderr, 8) } };
   }
   return { ...verified, built: true };
 }

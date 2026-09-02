@@ -554,6 +554,49 @@ function probeDir(name) {
   return path.join(W0_DIR, 'toolchain-probes', name);
 }
 
+/**
+ * US-004 — resolve a working JDK through the shared bash resolver
+ * (torture-test/lib/jdk-discovery.sh) and return its exported JAVA_HOME plus
+ * the resolution source. The resolver is sourced in a fresh bash exactly like
+ * the mvnw-driven fixture builders do (`. lib/jdk-discovery.sh`), so the gate
+ * and the builders agree on the JDK. On success the resolver prints
+ * `source=<java_home|mvn|path>` and exports JAVA_HOME; on failure it exits
+ * non-zero with a remedy naming JAVA_HOME and nix on stderr.
+ */
+function resolveJdk() {
+  const resolverPath = path.join(TT_ROOT, 'lib', 'jdk-discovery.sh');
+  const marker = 'RESOLVED_JAVA_HOME=';
+  const script = `. "$1"\nprintf '${marker}%s\\n' "\${JAVA_HOME:-}"\n`;
+  const result = spawnSync('bash', ['-c', script, 'bash', resolverPath], {
+    cwd: TT_ROOT,
+    env: process.env,
+    encoding: 'utf-8',
+    timeout: 30000,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  const stdout = result.stdout || '';
+  const stderr = (result.stderr || '').trim();
+  let source = '';
+  let javaHome = '';
+  for (const line of stdout.split(/\r?\n/)) {
+    if (line === 'source=java_home' || line === 'source=mvn' || line === 'source=path') {
+      source = line.slice('source='.length);
+    } else if (line.startsWith(marker)) {
+      javaHome = line.slice(marker.length);
+    }
+  }
+
+  const ok = result.status === 0 && javaHome !== '';
+  const fallbackRemedy = 'jdk-discovery: no working JDK found on this host. Remedy: export JAVA_HOME=/path/to/jdk (its bin/java must run) or install a JDK via nix.';
+  return {
+    ok,
+    javaHome: ok ? javaHome : null,
+    source: ok ? source : '',
+    remedy: ok ? null : (stderr || fallbackRemedy),
+  };
+}
+
 // --- java+maven ---
 registerCheck('toolchain-java-maven', 'java+maven toolchain build+test probe', 'REQUIRED', 'toolchains', async () => {
   if (OPT.fast) {
@@ -562,9 +605,24 @@ registerCheck('toolchain-java-maven', 'java+maven toolchain build+test probe', '
     return { result: 'SKIPPED', evidence: 'Toolchain build probe skipped (--fast)', remedy: null, skipReason: '--fast' };
   }
 
+  // US-004: resolve the SAME JDK the mvnw-driven fixture builders use, so a
+  // host that certifies this gate can actually build tt-java on darwin (where
+  // PATH `java` is Apple's stub and nix maven bundles its own Zulu JDK).
+  const jdk = resolveJdk();
+  if (!jdk.ok) {
+    recordHostProfile('toolchains', 'java+maven', {
+      present: false, buildPassed: false, testPassed: false,
+      resolvedJdk: null, jdkSource: null, evidence: jdk.remedy,
+    });
+    return { result: 'FAIL', evidence: jdk.remedy, remedy: jdk.remedy, skipReason: null };
+  }
+
   const ver = binaryPresent('mvn');
   if (!ver) {
-    recordHostProfile('toolchains', 'java+maven', { present: false, buildPassed: false, testPassed: false, evidence: 'mvn not found' });
+    recordHostProfile('toolchains', 'java+maven', {
+      present: false, buildPassed: false, testPassed: false,
+      resolvedJdk: jdk.javaHome, jdkSource: jdk.source, evidence: 'mvn not found',
+    });
     return { result: 'FAIL', evidence: 'mvn not found on PATH', remedy: 'Install maven + JDK >= 21 (https://maven.apache.org/)', skipReason: null };
   }
 
@@ -607,24 +665,25 @@ public class Hello {
 }
 `);
 
-    const build = spawnSync('mvn', ['-q', 'compile'], { cwd: dir, encoding: 'utf-8', timeout: 120000, stdio: ['ignore', 'pipe', 'pipe'] });
+    const jdkEnv = { ...process.env, JAVA_HOME: jdk.javaHome };
+    const build = spawnSync('mvn', ['-q', 'compile'], { cwd: dir, encoding: 'utf-8', timeout: 120000, stdio: ['ignore', 'pipe', 'pipe'], env: jdkEnv });
     if (build.status !== 0) {
       const err = build.stderr?.trim() || build.stdout?.trim() || `exit ${build.status}`;
-      recordHostProfile('toolchains', 'java+maven', { present: true, buildPassed: false, testPassed: false, evidence: err.substring(0, 200) });
+      recordHostProfile('toolchains', 'java+maven', { present: true, buildPassed: false, testPassed: false, resolvedJdk: jdk.javaHome, jdkSource: jdk.source, evidence: err.substring(0, 200) });
       return { result: 'FAIL', evidence: `maven build failed: ${err.substring(0, 150)}`, remedy: 'Check maven and JDK installation', skipReason: null };
     }
 
-    const testRun = spawnSync('mvn', ['-q', 'exec:java', '-Dexec.mainClass=tt.Hello'], { cwd: dir, encoding: 'utf-8', timeout: 30000, stdio: ['ignore', 'pipe', 'pipe'] });
+    const testRun = spawnSync('mvn', ['-q', 'exec:java', '-Dexec.mainClass=tt.Hello'], { cwd: dir, encoding: 'utf-8', timeout: 30000, stdio: ['ignore', 'pipe', 'pipe'], env: jdkEnv });
     if (testRun.status !== 0 || !testRun.stdout?.includes('OK')) {
       const err = testRun.stderr?.trim() || testRun.stdout?.trim() || `exit ${testRun.status}`;
-      recordHostProfile('toolchains', 'java+maven', { present: true, buildPassed: true, testPassed: false, evidence: err.substring(0, 200) });
+      recordHostProfile('toolchains', 'java+maven', { present: true, buildPassed: true, testPassed: false, resolvedJdk: jdk.javaHome, jdkSource: jdk.source, evidence: err.substring(0, 200) });
       return { result: 'FAIL', evidence: `maven run failed: ${err.substring(0, 150)}`, remedy: 'Check maven and JDK installation', skipReason: null };
     }
 
-    recordHostProfile('toolchains', 'java+maven', { present: true, buildPassed: true, testPassed: true, evidence: `${ver}` });
-    return { result: 'PASS', evidence: `maven build+test OK: ${ver}`, remedy: null, skipReason: null };
+    recordHostProfile('toolchains', 'java+maven', { present: true, buildPassed: true, testPassed: true, resolvedJdk: jdk.javaHome, jdkSource: jdk.source, evidence: `${ver}` });
+    return { result: 'PASS', evidence: `maven build+test OK: ${ver} (JDK: ${jdk.javaHome})`, remedy: null, skipReason: null };
   } catch (e) {
-    recordHostProfile('toolchains', 'java+maven', { present: true, buildPassed: false, testPassed: false, evidence: e.message });
+    recordHostProfile('toolchains', 'java+maven', { present: true, buildPassed: false, testPassed: false, resolvedJdk: jdk.javaHome, jdkSource: jdk.source, evidence: e.message });
     return { result: 'FAIL', evidence: `maven probe error: ${e.message}`.substring(0, 150), remedy: 'Check maven and JDK installation', skipReason: null };
   } finally {
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) { /* ok */ }

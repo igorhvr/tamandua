@@ -28,6 +28,18 @@ $JAVA_HOME/bin/java -version 2>&1
 If you attempt to run `./mvnw` without setting `JAVA_HOME`, the wrapper
 will fail with a "JAVA_HOME is not defined correctly" error.
 
+### Darwin operator note
+
+Apple ships a `java` stub at `/usr/bin/java` that prints "Unable to locate
+a Java Runtime" and exits non-zero — it is not a JDK. The torture-test
+suite does not rely on that stub: it resolves the JDK through the shared
+helper `torture-test/lib/jdk-discovery.sh`, in this order: **JAVA_HOME**
+(if `$JAVA_HOME/bin/java` runs) → the **`mvn -v` runtime** JDK (parsed from
+its `runtime:` line) → a **working PATH java** (only when `java -version`
+exits 0). **nix maven alone is sufficient** — nix `maven` bundles a Zulu JDK
+whose `runtime:` line the resolver picks up, so a darwin operator needs no
+separate JDK install or `JAVA_HOME` export.
+
 ### Test Command
 
 ```bash

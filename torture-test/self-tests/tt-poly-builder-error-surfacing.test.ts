@@ -113,6 +113,7 @@ const AUDIT_TARGETS: Array<{
       /main: FAILED — baseline suite is not green!/,
       /\+fix: FAILED — fix did not restore green!/,
       /\+fix: FAILED — VULN fix broke the suite!/,
+      /UNEXPECTED GREEN — BRK seed should fail!/,
     ],
   },
   {
@@ -168,7 +169,13 @@ const AUDIT_TARGETS: Array<{
   },
   {
     rel: "tt-java/validate-e2e.sh",
-    messages: [/test suite was RED/, /test suite still RED after fix/, /git apply -p4 failed/],
+    messages: [
+      /baseline tests failed unexpectedly/,
+      /test suite was GREEN/,
+      /test suite was RED/,
+      /test suite still RED after fix/,
+      /git apply -p4 failed/,
+    ],
   },
 ];
 
