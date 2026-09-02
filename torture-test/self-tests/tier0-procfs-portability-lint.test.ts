@@ -399,6 +399,11 @@ const ALLOWLIST: Record<string, AllowEntry> = {
     reason:
       "MACP6 task description doc — its '/proc' occurrence ('the GNU-ism/procfs lint pattern' in the task narrative) is prose referencing the existing lint gates; the doc performs no runtime procfs access.",
   },
+  "impl-tasks/MDUP-darwin-daemon-up-port-probe-recorder.md": {
+    category: "documentation",
+    reason:
+      "MDUP task description doc — its '/proc' occurrences ('port evidence reads /proc/net/tcp + /proc/<pid>/fd (linux-only)', 'never fail the recorder start on a /proc-less host') are prose in the task narrative describing the linux-only tt-recorder evidence and the darwin degradation plan; the doc performs no runtime procfs access.",
+  },
   "self-tests/tier0-gnu-portability-lint.test.ts": {
     category: "documentation",
     reason:

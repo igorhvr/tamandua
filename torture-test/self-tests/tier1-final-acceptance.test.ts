@@ -293,6 +293,20 @@ const allowed = [
   // surface — the schema-probe class extended from the SQL surface to the
   // suite-ledger row count (FRESH campaigns only, ensure-up --fresh).
   "torture-test/bin/tt-suite-probe.mjs",
+  // CRED-SURF (US-006): the key-value leak sweep (tt-key-leak-sweep.mjs)
+  // scans torture-test/var evidence/logs/audit for the enumerated API-key
+  // VALUES materialized in the contained home; its red-arm battery lives in
+  // self-tests/tier0-key-leak-sweep.test.ts (self-tests wholesale allowed).
+  "torture-test/bin/tt-key-leak-sweep.mjs",
+  // CRED-SURF (US-011): the aggregate battery gate re-synced the
+  // bug-fix-merge-worktree scripted scenario roster to the bundled workflow
+  // (WAVE-A added the conditional reviewer + auditor agents on main). The
+  // w4.35 tier0 reroute-matrix cells declare the pre-WAVE-A 6-agent roster,
+  // so their behaviors.json gained the reviewer (VERDICT: ACCEPT) + auditor
+  // (VERDICT: HONEST) canned entries (tokens 0) — an authoring-surface
+  // extension added in the same story that fixed the parity, exactly like
+  // the roster stories that created the other w4.* scenario cells.
+  "torture-test/scenarios/w4.35/",
   "torture-test/scenarios/lib/run-scripted-scenario",
   // MACP4 US-004: the four W2 scripted cells (scenarios/w2.21/run.mjs,
   // w2.23a/run.mjs, w2.23b/run.mjs, w2.23c/run.mjs) and the spawn env

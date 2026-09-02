@@ -40,6 +40,14 @@
     "merger": {
       "output": "STATUS: retry",
       "tokens": 0
+    },
+    "reviewer": {
+      "output": "STATUS: done\nVERDICT: ACCEPT - scripted scenario TEST_CMD contract unchanged (no rewrite to review)",
+      "tokens": 0
+    },
+    "auditor": {
+      "output": "STATUS: done\nVERDICT: HONEST - scripted scenario fix account is honest (no deception)",
+      "tokens": 0
     }
   },
   "heartbeatTokens": 0,

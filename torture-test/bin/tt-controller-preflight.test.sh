@@ -254,7 +254,7 @@ legs="$(grep '^CALL ' "$PFLOG" | sed -n 's/^CALL \([^ ]*\) .*/\1/p')"
 grep -q '^CALL tt-catalog-install args=--verify tt-shim-probe' "$PFLOG" || fail "AC1 pi workflow-spec leg did not verify tt-shim-probe: $(cat "$PFLOG")"
 [ "$(printf '%s\n' "$legs" | sed -n 5p)" = "tt-daemon-up" ] || fail "AC1 pi leg5 not daemon-up: $(cat "$PFLOG")"
 [ "$(printf '%s\n' "$legs" | sed -n 6p)" = "tt-daemon-up" ] || fail "AC1 pi leg6 (teardown) not daemon-up stop: $(cat "$PFLOG")"
-grep -q '^CALL tt-harness-auth-probe args=pi ' "$PFLOG" || fail "AC1 pi did not probe pi harness: $(cat "$PFLOG")"
+grep -q '^CALL tt-harness-auth-probe args=--spend pi ' "$PFLOG" || fail "AC1 pi did not probe pi harness with --spend: $(cat "$PFLOG")"
 grep -q '^CALL tt-daemon-up args=ensure-up --fresh' "$PFLOG" || fail "AC1 pi daemon-up did not thread ensure-up --fresh (fresh campaign): $(cat "$PFLOG")"
 pass "AC1 (pi): real pi selection runs provision->harness-auth->catalog->workflow-spec->daemon-up before cases"
 

@@ -12,9 +12,40 @@
 #        selection).
 #   AC6  (this file).
 #
-# All harness invocations use FAKE pi/hermes binaries (seam TAMANDUA_PI_BINARY /
-# TAMANDUA_HERMES_BINARY), so this self-test spends ZERO real tokens and starts
-# no daemon. Confined to temp dirs under ${TMPDIR:-/tmp} — never operator state.
+# Plus CRED-SURF US-002 credential-source reporting + fail-closed missing-key
+# naming (red-arm, fixture operator HOME via TT_OPERATOR_HOME, zero tokens):
+#   AC1  OK line reports `credential source: env` when the primary key is in
+#        the invoking env.
+#   AC2  OK line reports `credential source: hermes-dotenv` when the key is
+#        absent from env but present in the fixture operator ~/.hermes/.env.
+#   AC3  env unset + fixture .env absent → fail-closed `harness-auth-missing:
+#        <harness>` with DETAILS NAMING the missing key (no silent skip).
+#   AC4  existing fail-closed reasons unchanged; probe stays read-only +
+#        idempotent; key VALUES never appear in probe output; --help documents
+#        the credential-source reporting.
+#
+# Plus CRED-SURF US-004 real dsh answer leg behind --spend (red-arm e, zero
+# tokens — fake dsh binaries only):
+#   AC1  `--spend dsh` against a fake dsh exiting non-zero with a
+#        MISSING_CREDENTIAL-shaped stderr → probe exits non-zero with
+#        `harness-auth-missing: dsh` (DETAILS name the credential).
+#   AC2  `--spend dsh` against an answering fake (exit 0) → probe exits 0
+#        with an OK line carrying the credential source.
+#   AC3  without --spend, dsh stays presence-only: the fake dsh binary is NOT
+#        invoked and the log reports alpha-skipped (unchanged behavior).
+#   AC4  the dsh --spend invocation carries the sentinel prompt +
+#        `--profile headless` (a real answer leg, not --dump-default-config);
+#        DEEPSEEK_API_KEY resolved from the enumerated sources (env ->
+#        fixture operator ~/.hermes/.env) is exported into the invocation env
+#        (env-only transport — the VALUE never appears in argv/logs/output).
+#   AC5  pi/hermes answer legs are unaffected (always run, as today).
+#   AC6  `tt-harness-auth-probe --help` documents the real dsh --spend
+#        answer leg.
+#
+# All harness invocations use FAKE pi/hermes/dsh binaries (seams
+# TAMANDUA_PI_BINARY / TAMANDUA_HERMES_BINARY / TAMANDUA_DSH_BINARY), so this
+# self-test spends ZERO real tokens and starts no daemon. Confined to temp
+# dirs under ${TMPDIR:-/tmp} — never operator state.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -83,6 +114,25 @@ make_fake_harness() {
 #!/usr/bin/env bash
 if [ -n "$stderr_msg" ]; then printf '%s\n' "$stderr_msg" >&2; fi
 printf '%s\n' "\$(basename "\$0") \$*" >> "$INVOC_LOG"
+exit $exit_code
+FAKE
+  chmod +x "$FAKE_BIN/$name"
+}
+# make_fake_harness_env_mark: like make_fake_harness, plus a DEEPSEEK_API_KEY
+# env-marker line appended to INVOC_LOG (SET/UNSET) so red-arm tests can prove
+# the probe exports the resolved credential into the dsh invocation env
+# WITHOUT the fake ever printing the key VALUE (US-004).
+make_fake_harness_env_mark() {
+  local name="$1" exit_code="$2" stderr_msg="${3:-}"
+  cat > "$FAKE_BIN/$name" <<FAKE
+#!/usr/bin/env bash
+if [ -n "$stderr_msg" ]; then printf '%s\n' "$stderr_msg" >&2; fi
+printf '%s\n' "\$(basename "\$0") \$*" >> "$INVOC_LOG"
+if [ -n "\${DEEPSEEK_API_KEY:-}" ]; then
+  printf 'DEEPSEEK_API_KEY=SET\n' >> "$INVOC_LOG"
+else
+  printf 'DEEPSEEK_API_KEY=UNSET\n' >> "$INVOC_LOG"
+fi
 exit $exit_code
 FAKE
   chmod +x "$FAKE_BIN/$name"
@@ -443,20 +493,51 @@ else
   fail "missing distinct reason for absent dsh: $OUT"
 fi
 
-# ── Test 17 (US-002): dsh --spend runs the ALPHA answer self-check ──────
+# ── Test 17 (US-004): dsh --spend runs the REAL answer leg (env source) ──
 echo ""
-echo "--- Test: US-002 dsh --spend answer leg (alpha self-check) ---"
+echo "--- Test: US-004 dsh --spend real answer leg (answering fake, env credential) ---"
+make_fake_harness_env_mark fake-dsh-ok 0
 : > "$INVOC_LOG"
-OUT="$(TT_VAR="$TEST_VAR" TAMANDUA_DSH_BINARY="$FAKE_BIN/fake-dsh" "$TOOL" --spend dsh 2>&1)"; RC=$?
+OUT="$(DEEPSEEK_API_KEY=sk-test-env-dsh-000 TT_VAR="$TEST_VAR" TAMANDUA_DSH_BINARY="$FAKE_BIN/fake-dsh-ok" "$TOOL" --spend dsh 2>&1)"; RC=$?
 if [ "$RC" -eq 0 ]; then
-  pass "probe dsh --spend exits 0"
+  pass "probe dsh --spend exits 0 against an answering fake"
 else
   fail "probe dsh --spend did NOT exit 0 (rc=$RC): $OUT"
 fi
-if grep -q -- "--dump-default-config" "$INVOC_LOG"; then
-  pass "dsh --spend answer leg runs the zero-token --dump-default-config self-check"
+if printf '%s' "$OUT" | grep -q "OK: dsh can answer"; then
+  pass "dsh --spend OK line reported"
 else
-  fail "dsh --spend answer leg did not run: $(cat "$INVOC_LOG")"
+  fail "dsh --spend OK line missing: $OUT"
+fi
+if printf '%s' "$OUT" | grep -q "credential source: env"; then
+  pass "dsh --spend OK line reports the credential source (env)"
+else
+  fail "dsh --spend OK line missing credential source: $OUT"
+fi
+if grep -q -- "--profile headless" "$INVOC_LOG"; then
+  pass "dsh --spend answer leg invokes --profile headless"
+else
+  fail "dsh --spend answer leg did not invoke --profile headless: $(cat "$INVOC_LOG")"
+fi
+if grep -q "Reply with the single word OK and nothing else." "$INVOC_LOG"; then
+  pass "dsh --spend answer leg carries the trivial sentinel prompt (real answer leg)"
+else
+  fail "dsh --spend answer leg missing sentinel prompt: $(cat "$INVOC_LOG")"
+fi
+if grep -q -- "--dump-default-config" "$INVOC_LOG"; then
+  fail "dsh --spend answer leg still runs the old --dump-default-config self-check"
+else
+  pass "dsh --spend answer leg no longer runs --dump-default-config"
+fi
+if grep -q "DEEPSEEK_API_KEY=SET" "$INVOC_LOG"; then
+  pass "resolved DEEPSEEK_API_KEY is exported into the dsh invocation env (env source)"
+else
+  fail "DEEPSEEK_API_KEY not exported into the dsh invocation env: $(cat "$INVOC_LOG")"
+fi
+if printf '%s' "$OUT" | grep -q "sk-test-env-dsh-000\|sk-test-dotenv"; then
+  fail "key VALUE leaked into probe output: $OUT"
+else
+  pass "probe output contains no key values"
 fi
 
 # ── Test 18 (US-002): usage documents dsh, TAMANDUA_DSH_BINARY, --spend ──
@@ -466,6 +547,355 @@ if "$TOOL" --help | grep -q "harness-auth-missing: dsh" && "$TOOL" --help | grep
   pass "--help documents dsh reason + TAMANDUA_DSH_BINARY + --spend"
 else
   fail "--help does not document the dsh lane"
+fi
+
+# ── CRED-SURF US-002: credential-source reporting + fail-closed key naming ──
+#
+# Red-arm fixtures: a fixture OPERATOR home (TT_OPERATOR_HOME pin) with a fake
+# ~/.hermes/.env, and contained homes whose default provider maps to an
+# enumerated env var (pi: deepseek/openai; hermes: deepseek). All fake values
+# are sk-test-* — zero real tokens.
+echo ""
+echo "--- Setup: CRED-SURF US-002 fixtures ---"
+
+CRED_VAR="$(mktemp -d)"
+CRED_VAR_OPENAI="$(mktemp -d)"
+CRED_VAR_HERMES="$(mktemp -d)"
+CRED_OP="$(mktemp -d)"          # fixture operator HOME WITH ~/.hermes/.env
+CRED_OP_NOENV="$(mktemp -d)"    # fixture operator HOME WITHOUT ~/.hermes/.env
+cleanup_cred() { rm -rf "$CRED_VAR" "$CRED_VAR_OPENAI" "$CRED_VAR_HERMES" "$CRED_OP" "$CRED_OP_NOENV"; }
+trap 'cleanup_cred; cleanup_cases; cleanup_full_cases; cleanup_empty_cases; cleanup_corrupt_cases; cleanup' EXIT
+
+# provision_cred_home: contained home whose pi default provider is deepseek and
+# hermes default provider is openai-codex (the operator fixture shapes).
+provision_cred_home() {
+  local var="$1"
+  mkdir -p "$var/home/.pi/agent" "$var/home/.hermes"
+  printf '{"defaultProvider":"deepseek","defaultModel":"deepseek-v4-pro"}' > "$var/home/.pi/agent/settings.json"
+  printf '{"deepseek":{"type":"api_key","key":"sk-test-contained-deepseek"}}' > "$var/home/.pi/agent/auth.json"
+  printf 'model:\n  default: gpt-5.6-sol\n  provider: openai-codex\n' > "$var/home/.hermes/config.yaml"
+  printf '{"version":1}' > "$var/home/.hermes/auth.json"
+}
+# provision_cred_home_openai: pi default provider openai (env var OPENAI_API_KEY).
+provision_cred_home_openai() {
+  local var="$1"
+  provision_cred_home "$var"
+  printf '{"defaultProvider":"openai","defaultModel":"gpt-5"}' > "$var/home/.pi/agent/settings.json"
+  printf '{"openai":{"type":"api_key","key":"sk-test-contained-openai"}}' > "$var/home/.pi/agent/auth.json"
+}
+# provision_cred_home_hermes_deepseek: hermes default provider deepseek.
+provision_cred_home_hermes_deepseek() {
+  local var="$1"
+  mkdir -p "$var/home/.hermes"
+  printf 'model:\n  default: deepseek-v4-pro\n  provider: deepseek\n' > "$var/home/.hermes/config.yaml"
+  printf '{"version":1}' > "$var/home/.hermes/auth.json"
+}
+
+mkdir -p "$CRED_OP/.hermes"
+cat > "$CRED_OP/.hermes/.env" <<'ENV'
+DEEPSEEK_API_KEY=sk-test-dotenv-deepseek-111
+OPENAI_API_KEY=sk-test-dotenv-openai-222
+OTHER=sk-test-non-enumerated
+ENV
+
+make_fake_harness fake-dsh-fail 1 'MISSING_CREDENTIAL: Provider deepseek is set in config.yaml but no API key was found'
+make_fake_harness fake-hermes-fail 1 'no api key for provider'
+
+pass "CRED-SURF US-002 fixtures created"
+
+# ── CRED-SURF US-004: real dsh answer leg behind --spend (red-arm e) ──
+#
+# The dsh --spend answer leg is a REAL one-shot completion (`dsh --profile
+# headless` + the sentinel prompt) with DEEPSEEK_API_KEY resolved from the
+# enumerated sources (env -> fixture operator ~/.hermes/.env) exported into
+# the invocation env. A MISSING_CREDENTIAL-shaped failure fails closed;
+# without --spend the binary is never invoked (Test 15 above).
+echo ""
+echo "--- Setup: CRED-SURF US-004 dsh answer-leg fixtures ---"
+
+make_fake_harness_env_mark fake-dsh-ok-dotenv 0
+make_fake_harness_env_mark fake-dsh-missing 1 'MISSING_CREDENTIAL: Provider deepseek is set in config.yaml but no API key was found'
+
+# ── Test 19b (US-004): hermes-dotenv credential exported into the dsh env ──
+echo ""
+echo "--- Test: US-004 dsh --spend exports the hermes-dotenv credential ---"
+: > "$INVOC_LOG"
+OUT="$(env -u DEEPSEEK_API_KEY TT_OPERATOR_HOME="$CRED_OP" TT_VAR="$CRED_VAR" TAMANDUA_DSH_BINARY="$FAKE_BIN/fake-dsh-ok-dotenv" "$TOOL" --spend dsh 2>&1)"; RC=$?
+if [ "$RC" -eq 0 ]; then
+  pass "probe dsh --spend exits 0 (hermes-dotenv credential, answering fake)"
+else
+  fail "probe dsh --spend did NOT exit 0 (rc=$RC): $OUT"
+fi
+if printf '%s' "$OUT" | grep -q "credential source: hermes-dotenv"; then
+  pass "dsh --spend OK line reports 'credential source: hermes-dotenv'"
+else
+  fail "dsh --spend OK line missing hermes-dotenv source: $OUT"
+fi
+if grep -q "DEEPSEEK_API_KEY=SET" "$INVOC_LOG"; then
+  pass "the hermes-dotenv credential is exported into the dsh invocation env"
+else
+  fail "hermes-dotenv credential NOT exported into the dsh invocation env: $(cat "$INVOC_LOG")"
+fi
+if grep -q "sk-test-dotenv-deepseek-111" "$INVOC_LOG" || printf '%s' "$OUT" | grep -q "sk-test-dotenv-deepseek-111"; then
+  fail "key VALUE leaked into the invocation log / probe output"
+else
+  pass "no key VALUE in the invocation log or probe output (env-only transport)"
+fi
+
+# ── Test 19c (US-004 red-arm e / AC1): MISSING_CREDENTIAL → fail closed ──
+echo ""
+echo "--- Test: US-004 dsh --spend fails closed on MISSING_CREDENTIAL ---"
+: > "$INVOC_LOG"
+set +e
+OUT="$(env -u DEEPSEEK_API_KEY TT_OPERATOR_HOME="$CRED_OP_NOENV" TT_VAR="$CRED_VAR" TAMANDUA_DSH_BINARY="$FAKE_BIN/fake-dsh-missing" "$TOOL" --spend dsh 2>&1)"
+RC=$?
+set -e
+if [ "$RC" -ne 0 ]; then
+  pass "probe dsh --spend exits non-zero on a MISSING_CREDENTIAL-shaped failure"
+else
+  fail "probe dsh --spend did NOT exit non-zero on MISSING_CREDENTIAL: $OUT"
+fi
+if printf '%s' "$OUT" | grep -q "harness-auth-missing: dsh"; then
+  pass "distinct reason 'harness-auth-missing: dsh' on MISSING_CREDENTIAL"
+else
+  fail "missing 'harness-auth-missing: dsh': $OUT"
+fi
+if printf '%s' "$OUT" | grep -q "MISSING_CREDENTIAL"; then
+  pass "DETAILS carries the MISSING_CREDENTIAL-shaped stderr"
+else
+  fail "DETAILS missing the MISSING_CREDENTIAL stderr: $OUT"
+fi
+if printf '%s' "$OUT" | grep -q "DEEPSEEK_API_KEY"; then
+  pass "DETAILS NAMES the missing credential DEEPSEEK_API_KEY"
+else
+  fail "DETAILS does not name the credential: $OUT"
+fi
+if grep -q "DEEPSEEK_API_KEY=UNSET" "$INVOC_LOG"; then
+  pass "absent credential is NOT exported into the dsh invocation env"
+else
+  fail "absent credential marker missing: $(cat "$INVOC_LOG")"
+fi
+
+# ── Test 19d (US-004): --help documents the real dsh --spend answer leg ──
+echo ""
+echo "--- Test: US-004 --help documents the real dsh --spend answer leg ---"
+if "$TOOL" --help | grep -q -- "--profile headless" && "$TOOL" --help | grep -q "MISSING_CREDENTIAL"; then
+  pass "--help documents the real dsh --spend answer leg (--profile headless + MISSING_CREDENTIAL fail-closed)"
+else
+  fail "--help does not document the real dsh --spend answer leg"
+fi
+if "$TOOL" --help | grep -q "Reply with the single word OK and nothing else."; then
+  pass "--help documents the sentinel one-shot prompt"
+else
+  fail "--help missing the sentinel prompt documentation"
+fi
+if "$TOOL" --help | grep -q -- "--dump-default-config"; then
+  fail "--help still documents the removed --dump-default-config self-check"
+else
+  pass "--help no longer documents the --dump-default-config self-check"
+fi
+
+# ── Test 19 (US-002 AC1): OK line reports `credential source: env` ────
+echo ""
+echo "--- Test: US-002 pi credential source env ---"
+provision_cred_home "$CRED_VAR"
+: > "$INVOC_LOG"
+OUT="$(DEEPSEEK_API_KEY=sk-test-env-deepseek-000 TT_OPERATOR_HOME="$CRED_OP" TT_VAR="$CRED_VAR" TAMANDUA_PI_BINARY="$FAKE_BIN/fake-pi" "$TOOL" pi 2>&1)"; RC=$?
+if [ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q "credential source: env"; then
+  pass "pi OK line reports 'credential source: env' when the key is in the invoking env"
+else
+  fail "pi OK line missing 'credential source: env' (rc=$RC): $OUT"
+fi
+if printf '%s' "$OUT" | grep -q "hermes-dotenv"; then
+  fail "pi OK line wrongly reports hermes-dotenv when env is set: $OUT"
+else
+  pass "pi source is NOT hermes-dotenv when env is set"
+fi
+if printf '%s' "$OUT" | grep -q "sk-test-env-deepseek-000\|sk-test-dotenv"; then
+  fail "key VALUES leaked into probe output: $OUT"
+else
+  pass "probe output contains no key values"
+fi
+
+# ── Test 20 (US-002 AC1b): provider→env mapping beyond deepseek (openai) ──
+echo ""
+echo "--- Test: US-002 pi credential source env (openai default provider) ---"
+provision_cred_home_openai "$CRED_VAR_OPENAI"
+OUT="$(OPENAI_API_KEY=sk-test-env-openai-000 TT_OPERATOR_HOME="$CRED_OP" TT_VAR="$CRED_VAR_OPENAI" TAMANDUA_PI_BINARY="$FAKE_BIN/fake-pi" "$TOOL" pi 2>&1)"; RC=$?
+if [ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q "credential source: env"; then
+  pass "pi (defaultProvider openai) OK line reports 'credential source: env'"
+else
+  fail "pi openai OK line missing 'credential source: env' (rc=$RC): $OUT"
+fi
+if printf '%s' "$OUT" | grep -q "sk-test-env-openai-000\|sk-test-dotenv-openai-222"; then
+  fail "key VALUES leaked into probe output: $OUT"
+else
+  pass "openai probe output contains no key values"
+fi
+
+# ── Test 21 (US-002 AC2): OK line reports `credential source: hermes-dotenv` ──
+echo ""
+echo "--- Test: US-002 pi credential source hermes-dotenv ---"
+provision_cred_home "$CRED_VAR"
+OUT="$(env -u DEEPSEEK_API_KEY -u OPENAI_API_KEY TT_OPERATOR_HOME="$CRED_OP" TT_VAR="$CRED_VAR" TAMANDUA_PI_BINARY="$FAKE_BIN/fake-pi" "$TOOL" pi 2>&1)"; RC=$?
+if [ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q "credential source: hermes-dotenv"; then
+  pass "pi OK line reports 'credential source: hermes-dotenv' when env unset + fixture .env present"
+else
+  fail "pi OK line missing 'credential source: hermes-dotenv' (rc=$RC): $OUT"
+fi
+if printf '%s' "$OUT" | grep -q "credential source: env"; then
+  fail "pi OK line reports env when the key is absent from env: $OUT"
+else
+  pass "pi source is NOT env when the key is unset"
+fi
+if printf '%s' "$OUT" | grep -q "sk-test-dotenv-deepseek-111"; then
+  fail "dotenv key VALUE leaked into probe output: $OUT"
+else
+  pass "hermes-dotenv probe output contains no key values"
+fi
+
+# ── Test 22 (US-002 AC2b): dsh OK line (presence-only) reports the source ──
+echo ""
+echo "--- Test: US-002 dsh credential source hermes-dotenv (presence-only) ---"
+OUT="$(env -u DEEPSEEK_API_KEY TT_OPERATOR_HOME="$CRED_OP" TT_VAR="$CRED_VAR" TAMANDUA_DSH_BINARY="$FAKE_BIN/fake-dsh" "$TOOL" dsh 2>&1)"; RC=$?
+if [ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q "credential source: hermes-dotenv" && printf '%s' "$OUT" | grep -q "alpha-skipped"; then
+  pass "dsh OK line reports 'credential source: hermes-dotenv' + alpha-skipped"
+else
+  fail "dsh OK line missing source/alpha-skipped (rc=$RC): $OUT"
+fi
+
+# ── Test 23 (US-002 AC2c): hermes OK line reports the source ──────────
+echo ""
+echo "--- Test: US-002 hermes credential source hermes-dotenv ---"
+provision_cred_home_hermes_deepseek "$CRED_VAR_HERMES"
+OUT="$(env -u DEEPSEEK_API_KEY TT_OPERATOR_HOME="$CRED_OP" TT_VAR="$CRED_VAR_HERMES" TAMANDUA_HERMES_BINARY="$FAKE_BIN/fake-hermes" "$TOOL" hermes 2>&1)"; RC=$?
+if [ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q "credential source: hermes-dotenv"; then
+  pass "hermes OK line reports 'credential source: hermes-dotenv' (deepseek default)"
+else
+  fail "hermes OK line missing 'credential source: hermes-dotenv' (rc=$RC): $OUT"
+fi
+
+# ── Test 23b (US-002 AC1c): hermes OK line reports env when the key is set ──
+echo ""
+echo "--- Test: US-002 hermes credential source env ---"
+OUT="$(DEEPSEEK_API_KEY=sk-test-env-hermes-000 TT_OPERATOR_HOME="$CRED_OP" TT_VAR="$CRED_VAR_HERMES" TAMANDUA_HERMES_BINARY="$FAKE_BIN/fake-hermes" "$TOOL" hermes 2>&1)"; RC=$?
+if [ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q "credential source: env"; then
+  pass "hermes OK line reports 'credential source: env' (deepseek default)"
+else
+  fail "hermes OK line missing 'credential source: env' (rc=$RC): $OUT"
+fi
+if printf '%s' "$OUT" | grep -q "sk-test-env-hermes-000"; then
+  fail "hermes env key VALUE leaked into probe output: $OUT"
+else
+  pass "hermes env probe output contains no key values"
+fi
+
+# ── Test 24 (US-002 AC3 / red-arm b): absent + failing answer → DETAILS names key ──
+echo ""
+echo "--- Test: US-002 pi fail-closed NAMES the missing key (env unset + .env absent) ---"
+provision_cred_home "$CRED_VAR"
+set +e
+OUT="$(env -u DEEPSEEK_API_KEY -u OPENAI_API_KEY TT_OPERATOR_HOME="$CRED_OP_NOENV" TT_VAR="$CRED_VAR" TAMANDUA_PI_BINARY="$FAKE_BIN/fake-pi-fail" "$TOOL" pi 2>&1)"
+RC=$?
+set -e
+if [ "$RC" -ne 0 ]; then
+  pass "probe pi exits non-zero when credential absent + answer leg fails"
+else
+  fail "probe pi did NOT exit non-zero (absent credential + failing answer): $OUT"
+fi
+if printf '%s' "$OUT" | grep -q "harness-auth-missing: pi"; then
+  pass "distinct reason 'harness-auth-missing: pi' preserved"
+else
+  fail "missing 'harness-auth-missing: pi': $OUT"
+fi
+if printf '%s' "$OUT" | grep -q "DEEPSEEK_API_KEY"; then
+  pass "DETAILS NAMES the missing key DEEPSEEK_API_KEY"
+else
+  fail "DETAILS does not name the missing key: $OUT"
+fi
+
+# ── Test 25 (US-002 AC3b): dsh --spend absent → DETAILS names the key ──
+echo ""
+echo "--- Test: US-002 dsh --spend fail-closed NAMES the missing key ---"
+set +e
+OUT="$(env -u DEEPSEEK_API_KEY TT_OPERATOR_HOME="$CRED_OP_NOENV" TT_VAR="$CRED_VAR" TAMANDUA_DSH_BINARY="$FAKE_BIN/fake-dsh-fail" "$TOOL" --spend dsh 2>&1)"
+RC=$?
+set -e
+if [ "$RC" -ne 0 ]; then
+  pass "probe dsh --spend exits non-zero when credential absent + answer leg fails"
+else
+  fail "probe dsh --spend did NOT exit non-zero: $OUT"
+fi
+if printf '%s' "$OUT" | grep -q "harness-auth-missing: dsh"; then
+  pass "distinct reason 'harness-auth-missing: dsh' preserved"
+else
+  fail "missing 'harness-auth-missing: dsh': $OUT"
+fi
+if printf '%s' "$OUT" | grep -q "DEEPSEEK_API_KEY"; then
+  pass "dsh DETAILS NAMES the missing key DEEPSEEK_API_KEY"
+else
+  fail "dsh DETAILS does not name the missing key: $OUT"
+fi
+
+# ── Test 26 (US-002 AC3c): hermes absent → DETAILS names the key ──────
+echo ""
+echo "--- Test: US-002 hermes fail-closed NAMES the missing key ---"
+provision_cred_home_hermes_deepseek "$CRED_VAR_HERMES"
+set +e
+OUT="$(env -u DEEPSEEK_API_KEY TT_OPERATOR_HOME="$CRED_OP_NOENV" TT_VAR="$CRED_VAR_HERMES" TAMANDUA_HERMES_BINARY="$FAKE_BIN/fake-hermes-fail" "$TOOL" hermes 2>&1)"
+RC=$?
+set -e
+if [ "$RC" -ne 0 ]; then
+  pass "probe hermes exits non-zero when credential absent + answer leg fails"
+else
+  fail "probe hermes did NOT exit non-zero: $OUT"
+fi
+if printf '%s' "$OUT" | grep -q "harness-auth-missing: hermes"; then
+  pass "distinct reason 'harness-auth-missing: hermes' preserved"
+else
+  fail "missing 'harness-auth-missing: hermes': $OUT"
+fi
+if printf '%s' "$OUT" | grep -q "DEEPSEEK_API_KEY"; then
+  pass "hermes DETAILS NAMES the missing key DEEPSEEK_API_KEY"
+else
+  fail "hermes DETAILS does not name the missing key: $OUT"
+fi
+
+# ── Test 27 (US-002 AC1c): env wins over dotenv for the reported source ──
+echo ""
+echo "--- Test: US-002 env wins over hermes-dotenv ---"
+provision_cred_home "$CRED_VAR"
+OUT="$(DEEPSEEK_API_KEY=sk-test-env-deepseek-000 TT_OPERATOR_HOME="$CRED_OP" TT_VAR="$CRED_VAR" TAMANDUA_PI_BINARY="$FAKE_BIN/fake-pi" "$TOOL" pi 2>&1)"; RC=$?
+if [ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q "credential source: env"; then
+  pass "env wins: source=env even when the fixture .env also has the key"
+else
+  fail "env did NOT win over dotenv (rc=$RC): $OUT"
+fi
+
+# ── Test 28 (US-002 AC5): probe never writes to the operator fixture ──
+echo ""
+echo "--- Test: US-002 probe is read-only on the operator fixture ---"
+SNAP_OP_BEFORE="$(find "$CRED_OP" -type f -exec sha256sum {} \; 2>/dev/null | sort | sha256sum)"
+env -u DEEPSEEK_API_KEY TT_OPERATOR_HOME="$CRED_OP" TT_VAR="$CRED_VAR" TAMANDUA_PI_BINARY="$FAKE_BIN/fake-pi" "$TOOL" pi >/dev/null 2>&1
+SNAP_OP_AFTER="$(find "$CRED_OP" -type f -exec sha256sum {} \; 2>/dev/null | sort | sha256sum)"
+if [ "$SNAP_OP_BEFORE" = "$SNAP_OP_AFTER" ]; then
+  pass "probe is read-only (operator fixture unchanged)"
+else
+  fail "probe mutated the operator fixture"
+fi
+
+# ── Test 29 (US-002 AC6): --help documents credential-source reporting ──
+echo ""
+echo "--- Test: US-002 --help documents credential-source reporting ---"
+if "$TOOL" --help | grep -q "credential source"; then
+  pass "--help documents the credential-source reporting"
+else
+  fail "--help does not document the credential-source reporting"
+fi
+if "$TOOL" --help | grep -q "hermes-dotenv" && "$TOOL" --help | grep -q "TT_OPERATOR_HOME"; then
+  pass "--help documents the hermes-dotenv source + TT_OPERATOR_HOME seam"
+else
+  fail "--help does not document hermes-dotenv / TT_OPERATOR_HOME"
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────

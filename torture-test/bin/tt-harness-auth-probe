@@ -32,18 +32,24 @@
 #   2. ANSWER    — invoke the harness binary under the contained spawn env
 #                  with a trivial one-shot prompt. A non-zero exit (e.g. pi's
 #                  `No API key found for the selected model`, hermes's
-#                  missing-credential failure) fails closed. This is the
-#                  zero/near-zero-token "can actually answer" check: the
-#                  failure path never reaches the model (zero tokens); the
-#                  success path is a single tiny completion. dsh's answer leg
-#                  is ALPHA and SKIPPED unless --spend (a zero-token
-#                  `--dump-default-config` self-check — never a model
-#                  invocation).
+#                  missing-credential failure, dsh's MISSING_CREDENTIAL)
+#                  fails closed. This is the zero/near-zero-token "can
+#                  actually answer" check: the failure path never reaches the
+#                  model (zero tokens); the success path is a single tiny
+#                  completion. dsh's answer leg (Tier-2 lane, CRED-SURF
+#                  US-004) is SKIPPED unless --spend; under --spend it is a
+#                  REAL one-shot completion (`dsh --profile headless` with
+#                  the sentinel prompt) with DEEPSEEK_API_KEY resolved from
+#                  the enumerated sources (env -> operator ~/.hermes/.env)
+#                  exported into the invocation env.
 #
 # Fail-closed (non-zero exit + DISTINCT machine-parseable REASON on stderr):
 #   harness-auth-missing: pi       pi auth/config absent OR cannot answer
 #   harness-auth-missing: hermes   hermes auth/config absent OR cannot answer
 #   harness-auth-missing: dsh      dsh binary absent (fail-closed presence)
+#                                  OR cannot answer under --spend (real
+#                                  answer leg; MISSING_CREDENTIAL-shaped
+#                                  failure fails closed)
 #   manifest-unreadable: <name>    a required manifest cannot be read
 #   manifest-invalid: <name>: line <n>  a manifest line is not valid JSON
 #
@@ -51,10 +57,23 @@
 #   TT_VAR                  override torture-test/var root (default TT_DIR/var)
 #   TT_CASES_DIR            override the cases dir for --from-manifest
 #                           harness enumeration
+#   TT_OPERATOR_HOME        pin the OPERATOR home for the hermes-dotenv
+#                           credential-source resolution (test seam / explicit
+#                           pin; mirrors tt-provision-home)
 #   TAMANDUA_PI_BINARY      override the pi binary (mirrors the real harness
 #                           resolver precedence)
 #   TAMANDUA_HERMES_BINARY  override the hermes binary
 #   TAMANDUA_DSH_BINARY     override the dsh binary (Tier-2 dsh lane)
+#
+# CRED-SURF US-002 — credential-source reporting + fail-closed missing-key
+# naming: per probed harness the primary credential key is resolved from the
+# SAME enumerated sources as provisioning — the invoking environment first,
+# then the EXACT `KEY=VALUE` line from the operator's real ~/.hermes/.env
+# (via resolve_operator_home, read-only, never copied, never written). The
+# OK line reports `credential source: env | hermes-dotenv | absent`. When the
+# required credential resolves to ABSENT and the answer leg fails, the
+# fail-closed DETAILS NAME the missing key (e.g. DEEPSEEK_API_KEY) — a
+# silently-skipped key can never look green.
 #
 # Idempotent: the probe only READS the contained home and invokes the harness
 # one-shot; it never writes state and never starts a daemon.
@@ -96,6 +115,213 @@ resolve_contained_tt_home() {
     fi
   fi
   printf '%s' "$TT_VAR/home"
+}
+
+# ── CRED-SURF US-002 — credential-source resolution ──────────────────
+#
+# Each probed harness has a PRIMARY credential key (the env var pi/hermes/dsh
+# reads to resolve an API key for the default provider). Its VALUE is resolved
+# from the SAME enumerated sources as provisioning (tt-provision-home):
+#   1. invoking environment (wins)
+#   2. the EXACT `KEY=VALUE` line from the operator's real ~/.hermes/.env
+#      (read-only fallback for non-interactive shells on darwin)
+#   3. absent — recorded/reported, never silently skipped
+# Only the KEY NAME + SOURCE are ever reported — key VALUES never appear in
+# the probe's output, logs, or artifacts.
+
+# resolve_operator_home: the OPERATOR's real HOME — the read-only source for
+# the hermes-dotenv credential fallback. This must NOT be `$HOME`: the probe
+# may be invoked from a context where HOME is overridden (contained env). Same
+# priority as tt-provision-home: TT_OPERATOR_HOME pin → getent passwd → dscl →
+# $HOME fallback.
+resolve_operator_home() {
+  if [ -n "${TT_OPERATOR_HOME:-}" ]; then
+    printf '%s' "$TT_OPERATOR_HOME"
+    return 0
+  fi
+  local pw_home
+  pw_home="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6 || true)"
+  if [ -n "$pw_home" ]; then
+    printf '%s' "$pw_home"
+    return 0
+  fi
+  # macOS fallback: getent is absent; read the NFS home directory via dscl.
+  if command -v dscl >/dev/null 2>&1; then
+    pw_home="$(dscl . -read /Users/$(id -un) NFSHomeDirectory 2>/dev/null | awk '{print $2}' || true)"
+    if [ -n "$pw_home" ]; then
+      printf '%s' "$pw_home"
+      return 0
+    fi
+  fi
+  printf '%s' "${HOME:-}"
+}
+
+# OPERATOR_HOME (read-only hermes-dotenv source). Resolved once at top level
+# after resolve_operator_home is defined; the source functions read it as a
+# global. The probe NEVER writes under OPERATOR_HOME.
+OPERATOR_HOME="$(resolve_operator_home)"
+
+# read_hermes_dotenv_value: read EXACTLY the `KEY=VALUE` line for <envvar> from
+# the operator's real ~/.hermes/.env (read-only) and print its VALUE. Mirrors
+# tt-provision-home's read_hermes_dotenv_value: the file is NEVER copied, only
+# the enumerated `KEY=` line is read; comments/blank/non-enumerated lines are
+# ignored; nothing is ever written to the operator's HOME. A leading `export `
+# prefix and matching surrounding quotes are tolerated. Prints nothing
+# (absent) when the file or the key line is missing.
+read_hermes_dotenv_value() {
+  local envvar="$1" dotenv="$2"
+  [ -f "$dotenv" ] || return 0
+  local line val
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      ''|\#*) continue ;;
+    esac
+    case "$line" in
+      export[[:space:]]*)
+        line="${line#export}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        ;;
+    esac
+    case "$line" in
+      "${envvar}="*)
+        val="${line#${envvar}=}"
+        case "$val" in
+          '"'*'"') val="${val#\"}"; val="${val%\"}" ;;
+          "'"*"'") val="${val#\'}"; val="${val%\'}" ;;
+        esac
+        [ -n "$val" ] || return 0
+        printf '%s' "$val"
+        return 0
+        ;;
+    esac
+  done < "$dotenv"
+  return 0
+}
+
+# parse_pi_default_provider: print the `defaultProvider` from the contained pi
+# settings.json (read-only). Empty when the file is missing or unparsable.
+parse_pi_default_provider() {
+  local settings="$1"
+  [ -f "$settings" ] || return 0
+  node - "$settings" 2>/dev/null <<'NODE' || true
+'use strict';
+let s = {};
+try { s = JSON.parse(require('fs').readFileSync(process.argv[2], 'utf8')); } catch { s = {}; }
+process.stdout.write(typeof s.defaultProvider === 'string' ? s.defaultProvider : '');
+NODE
+}
+
+# parse_hermes_default_provider: print the default provider from the contained
+# hermes config.yaml `model:` block (read-only). Empty when the file is missing
+# or the block has no provider line.
+parse_hermes_default_provider() {
+  local cfg="$1"
+  [ -f "$cfg" ] || return 0
+  awk '
+    /^model:[[:space:]]*$/ { in_model = 1; next }
+    in_model && /^[[:space:]]+provider:[[:space:]]/ {
+      sub(/^[[:space:]]+provider:[[:space:]]*/, "");
+      sub(/[[:space:]]+$/, "");
+      print;
+      exit
+    }
+    in_model && /^[^[:space:]]/ { in_model = 0 }
+  ' "$cfg" 2>/dev/null || true
+}
+
+# provider_env_var_for: map a pi/hermes provider name to the env var that
+# carries its API key. Mirrors tt-provision-home's PI_ENV_API_KEY_MAP reversed
+# (env var -> pi provider name); providers with no enumerated env var (e.g.
+# hermes's OAuth-based openai-codex) print nothing.
+provider_env_var_for() {
+  local provider="$1"
+  case "$provider" in
+    anthropic)        printf 'ANTHROPIC_API_KEY' ;;
+    ant-ling)         printf 'ANT_LING_API_KEY' ;;
+    openai)           printf 'OPENAI_API_KEY' ;;
+    deepseek)         printf 'DEEPSEEK_API_KEY' ;;
+    nvidia)           printf 'NVIDIA_API_KEY' ;;
+    google)           printf 'GEMINI_API_KEY' ;;
+    mistral)          printf 'MISTRAL_API_KEY' ;;
+    groq)             printf 'GROQ_API_KEY' ;;
+    cerebras)         printf 'CEREBRAS_API_KEY' ;;
+    xai)              printf 'XAI_API_KEY' ;;
+    openrouter)       printf 'OPENROUTER_API_KEY' ;;
+    vercel-ai-gateway) printf 'AI_GATEWAY_API_KEY' ;;
+    zai)              printf 'ZAI_API_KEY' ;;
+    minimax)          printf 'MINIMAX_API_KEY' ;;
+    huggingface)      printf 'HF_TOKEN' ;;
+    fireworks)        printf 'FIREWORKS_API_KEY' ;;
+    together)         printf 'TOGETHER_API_KEY' ;;
+    kimi-coding)      printf 'KIMI_API_KEY' ;;
+    opencode)         printf 'OPENCODE_API_KEY' ;;
+    *) return 0 ;;
+  esac
+}
+
+# resolve_primary_credential_key: print the primary credential env var for
+# <harness> (dsh: DEEPSEEK_API_KEY; pi/hermes: the env var of the default
+# provider, read from the CONTAINED home's settings.json/config.yaml). Prints
+# nothing when the harness has no resolvable enumerated env var.
+resolve_primary_credential_key() {
+  local harness="$1" home="$2"
+  local provider key
+  case "$harness" in
+    dsh)
+      printf 'DEEPSEEK_API_KEY'
+      return 0
+      ;;
+    pi)
+      provider="$(parse_pi_default_provider "$home/.pi/agent/settings.json")"
+      ;;
+    hermes)
+      provider="$(parse_hermes_default_provider "$home/.hermes/config.yaml")"
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+  [ -n "$provider" ] || return 0
+  key="$(provider_env_var_for "$provider")"
+  [ -n "$key" ] && printf '%s' "$key"
+}
+
+# resolve_credential_source: print the SOURCE of <harness>'s primary credential
+# (env | hermes-dotenv | absent) using the same enumerated sources as
+# provisioning. Prints nothing when the harness has no resolvable env var.
+# Read-only: never writes to the operator HOME or anywhere else.
+resolve_credential_source() {
+  local harness="$1" home="$2"
+  local key
+  key="$(resolve_primary_credential_key "$harness" "$home")"
+  [ -n "$key" ] || return 0
+  if [ -n "${!key:-}" ]; then
+    printf 'env'
+    return 0
+  fi
+  local val
+  val="$(read_hermes_dotenv_value "$key" "$OPERATOR_HOME/.hermes/.env")"
+  if [ -n "$val" ]; then
+    printf 'hermes-dotenv'
+    return 0
+  fi
+  printf 'absent'
+}
+
+# resolve_credential_value: print the VALUE of <envvar> from the same
+# enumerated sources as provisioning — the invoking environment first, then
+# the EXACT `KEY=VALUE` line from the operator's real ~/.hermes/.env
+# (read-only; never copied, never written). Prints nothing when absent. The
+# returned VALUE is NEVER printed, logged, or placed on a command line: it is
+# transported to a harness subprocess ONLY via the invocation environment
+# (the two-env rule, CRED-SURF US-004 dsh answer leg).
+resolve_credential_value() {
+  local envvar="$1"
+  if [ -n "${!envvar:-}" ]; then
+    printf '%s' "${!envvar}"
+    return 0
+  fi
+  read_hermes_dotenv_value "$envvar" "$OPERATOR_HOME/.hermes/.env"
 }
 
 # resolve_harness_binary: print the absolute path of the harness binary for
@@ -160,9 +386,12 @@ present_files_for() {
 # spawn env. Returns the harness's exit code (captured by the caller).
 # The prompt is a single trivial completion — near-zero tokens on success,
 # zero tokens on the fail-fast auth-missing path.
-# dsh's answer leg is ALPHA (Tier-2 dsh lane) and runs ONLY under --spend: it
-# is a zero-token `--dump-default-config` self-check (never a model
-# invocation) proving the binary executes and the profile system composes.
+# dsh's answer leg (Tier-2 lane, CRED-SURF US-004) runs ONLY under --spend: a
+# REAL one-shot completion (`dsh --profile headless` with the sentinel
+# prompt — one tiny model generation), with DEEPSEEK_API_KEY resolved from
+# the enumerated sources (env -> operator ~/.hermes/.env) exported into the
+# invocation env. The key VALUE is transported via env only — never on the
+# command line, never logged, never in the probe's output.
 run_answer_check() {
   local harness="$1" home="$2" bin="$3"
   local prompt="Reply with the single word OK and nothing else."
@@ -171,10 +400,18 @@ run_answer_check() {
     _run_contained "$home" "$bin" \
       --print --no-tools --no-session --no-context-files "$prompt"
   elif [ "$harness" = "dsh" ]; then
-    # dsh is operator-directed (reads the operator's ~/.dsh), so the alpha
-    # answer leg runs under the CURRENT env, not the contained home; it never
-    # writes and never invokes a model.
-    "$bin" --dump-default-config
+    # dsh is operator-directed (reads the operator's ~/.dsh), so the answer
+    # leg runs under the CURRENT env, not the contained home; it never writes
+    # to the operator's ~/.dsh. US-004: a real one-shot answer leg — the
+    # resolved credential is exported into the invocation env (env-only
+    # transport; the VALUE never appears in argv, output, or logs).
+    local dval
+    dval="$(resolve_credential_value "DEEPSEEK_API_KEY")"
+    if [ -n "$dval" ]; then
+      env "DEEPSEEK_API_KEY=$dval" "$bin" --profile headless "$prompt"
+    else
+      "$bin" --profile headless "$prompt"
+    fi
   else
     _run_contained "$home" "$bin" -z "$prompt"
   fi
@@ -235,12 +472,22 @@ probe_harness() {
   fi
 
   # ── leg 3: answer check (can actually resolve a model + API key) ──
-  # dsh's answer leg is ALPHA (Tier-2 dsh lane) and SKIPPED by default: the
-  # dsh harness is operator-directed and a live dsh invocation is not yet a
+  # dsh's answer leg (CRED-SURF US-004) is SKIPPED by default: the dsh
+  # harness is operator-directed and a live dsh invocation is not yet a
   # stable near-zero-token corridor. It runs ONLY under --spend (explicit
-  # operator opt-in) — see run_answer_check for the alpha self-check shape.
+  # operator opt-in) as a REAL one-shot completion — see run_answer_check.
+  # CRED-SURF US-002: the OK line (both the alpha-skipped and the answered
+  # shapes) reports the primary credential's SOURCE (env | hermes-dotenv |
+  # absent); when the credential is ABSENT and the answer leg fails, the
+  # DETAILS NAME the missing key.
+  local csrc
+  csrc="$(resolve_credential_source "$harness" "$home")"
   if [ "$harness" = "dsh" ] && [ "${SPEND_ANSWER:-0}" != "1" ]; then
-    log "OK: $harness present (answer leg alpha-skipped; --spend to run)"
+    if [ -n "$csrc" ]; then
+      log "OK: $harness present (credential source: ${csrc}; answer leg alpha-skipped; --spend to run)"
+    else
+      log "OK: $harness present (answer leg alpha-skipped; --spend to run)"
+    fi
     return 0
   fi
   local err rc
@@ -251,12 +498,25 @@ probe_harness() {
   set -e
   if [ "$rc" -ne 0 ]; then
     echo "REASON: harness-auth-missing: $harness" >&2
-    echo "DETAILS: $harness could not answer: $(tail -c 500 "$err" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g')" >&2
+    if [ "$csrc" = "absent" ]; then
+      # CRED-SURF US-002: the required credential is absent from BOTH
+      # enumerated sources and the harness cannot answer — name the missing
+      # key so a silently-skipped key can never look green.
+      local ckey
+      ckey="$(resolve_primary_credential_key "$harness" "$home")"
+      echo "DETAILS: $harness could not answer and required credential ${ckey:-<unknown>} is absent (sources: invoking env, operator ~/.hermes/.env): $(tail -c 500 "$err" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g')" >&2
+    else
+      echo "DETAILS: $harness could not answer: $(tail -c 500 "$err" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g')" >&2
+    fi
     rm -f -- "$err"
     return 1
   fi
   rm -f -- "$err"
-  log "OK: $harness can answer"
+  if [ -n "$csrc" ]; then
+    log "OK: $harness can answer (credential source: ${csrc})"
+  else
+    log "OK: $harness can answer"
+  fi
   return 0
 }
 
@@ -328,23 +588,49 @@ answer, via:
      under ~/.dsh.
   2. ANSWER   — pi/hermes: a trivial one-shot harness invocation under the
      contained spawn env (near-zero tokens on success; zero tokens on the
-     fail-fast auth-missing path). dsh: SKIPPED by default (alpha; documented)
-     — runs ONLY with --spend, as a zero-token \`--dump-default-config\`
-     self-check. Never starts the real contained daemon.
+     fail-fast auth-missing path). dsh (Tier-2 lane, CRED-SURF US-004):
+     SKIPPED by default (presence-only; documented) — runs ONLY with --spend,
+     as a REAL one-shot completion (\`dsh --profile headless\` with the
+     trivial sentinel prompt
+     "Reply with the single word OK and nothing else."), with DEEPSEEK_API_KEY
+     resolved from the enumerated sources (env -> operator ~/.hermes/.env)
+     exported into the invocation env (the key VALUE is env-only transport —
+     never on a command line, never printed). A MISSING_CREDENTIAL-shaped
+     failure fails closed with harness-auth-missing: dsh. Never starts the
+     real contained daemon.
+
+Credential source (CRED-SURF US-002): for each probed harness, the primary
+credential key (dsh: DEEPSEEK_API_KEY; pi/hermes: the env var of the default
+provider from the contained settings.json/config.yaml) is resolved from the
+SAME enumerated sources as provisioning — the invoking environment first,
+then the EXACT \`KEY=VALUE\` line from the operator's real ~/.hermes/.env
+(read-only; never copied, never written). The OK line reports
+\`credential source: env | hermes-dotenv | absent\`. When the required
+credential resolves to ABSENT and the answer leg fails, the fail-closed
+DETAILS NAME the missing key (e.g. DEEPSEEK_API_KEY) — a silently-skipped key
+can never look green. Key VALUES never appear in the probe output.
 
 With no harness argument (or --from-manifest), the required harnesses are
 enumerated from the tier manifests (distinct real-case pi/hermes/dsh harnesses).
 
 Fail-closed reasons (non-zero exit, on stderr):
   harness-auth-missing: pi       pi auth/config absent OR cannot answer
+                                 (DETAILS name the missing credential key
+                                 when it is absent from env + ~/.hermes/.env)
   harness-auth-missing: hermes   hermes auth/config absent OR cannot answer
-  harness-auth-missing: dsh      dsh binary absent (fail-closed presence)
+  harness-auth-missing: dsh      dsh binary absent (fail-closed presence) OR
+                                 cannot answer under --spend (real answer
+                                 leg; a MISSING_CREDENTIAL-shaped failure
+                                 fails closed, DETAILS naming the credential)
   manifest-unreadable: <name>    a required manifest cannot be read
   manifest-invalid: <name>: line <n>  a manifest line is not valid JSON
 
 Env seams:
   TT_VAR                  override torture-test/var root (default TT_DIR/var)
   TT_CASES_DIR            override the cases dir for --from-manifest
+  TT_OPERATOR_HOME        pin the OPERATOR home for the hermes-dotenv
+                          credential-source resolution (test seam / explicit
+                          pin; mirrors tt-provision-home)
   TAMANDUA_PI_BINARY      override the pi binary
   TAMANDUA_HERMES_BINARY  override the hermes binary
   TAMANDUA_DSH_BINARY     override the dsh binary (Tier-2 dsh lane)
@@ -371,9 +657,10 @@ main() {
         from_manifest=1
         ;;
       --spend)
-        # dsh's ALPHA answer leg (Tier-2 dsh lane): a zero-token
-        # --dump-default-config self-check, run ONLY on explicit operator
-        # opt-in. pi/hermes answer legs are unaffected (always run).
+        # dsh's REAL answer leg (Tier-2 dsh lane, CRED-SURF US-004): a
+        # one-shot completion (`dsh --profile headless` + sentinel prompt,
+        # one tiny model generation), run ONLY on explicit operator opt-in.
+        # pi/hermes answer legs are unaffected (always run).
         SPEND_ANSWER=1
         ;;
       pi|hermes|dsh)

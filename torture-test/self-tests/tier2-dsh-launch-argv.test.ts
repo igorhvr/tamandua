@@ -293,10 +293,11 @@ exit 0
     assert.equal(res.status, 2,
       `preflight campaign must fail closed (vacuous-GREEN guard), not exit 0:\n${res.stdout}${res.stderr}`);
 
-    // The harness-auth leg must probe dsh for a dsh-only real selection.
+    // The harness-auth leg must probe dsh for a dsh-only real selection, with
+    // --spend so the REAL dsh answer leg runs during preflight (US-005).
     const log = fs.readFileSync(stubLog, "utf8");
-    assert.match(log, /CALL tt-harness-auth-probe args=dsh(\s|$)/,
-      `real-case preflight must probe dsh (got:\n${log})`);
+    assert.match(log, /CALL tt-harness-auth-probe args=--spend dsh(\s|$)/,
+      `real-case preflight must probe dsh with --spend (got:\n${log})`);
     assert.match(log, /CALL tt-provision-home /, "preflight must start with home-provision");
     assert.match(log, /CALL tt-catalog-install /, "preflight must run catalog-install");
     assert.match(log, /CALL tt-daemon-up args=ensure-up/, "preflight must run daemon-up ensure-up");

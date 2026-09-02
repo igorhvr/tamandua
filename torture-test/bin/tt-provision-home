@@ -28,6 +28,14 @@
 # surfaced. The enumerated set is documented in `usage` and in
 # torture-test/impl-tasks/E2.6-catalog-and-harness-credentials.md.
 #
+# CRED-SURF US-001 — hermes-dotenv enumerated fallback:
+# For each PI_ENV_API_KEY_MAP key NOT set in the invoking env (e.g. darwin
+# non-interactive shells whose keys live only in ~/.hermes/.env), the EXACT
+# `KEY=VALUE` line is read from the operator's real ~/.hermes/.env (read-only,
+# never copied wholesale, never written) and materialized identically to an
+# env-provided key. provision-audit.json records the per-key source:
+# env | hermes-dotenv | absent (absent is recorded, never silently skipped).
+#
 # Idempotent: safe to run repeatedly — second run is a no-op.
 # Follows spec 01 two-env rule: never mutates caller environment.
 set -euo pipefail
@@ -263,36 +271,127 @@ surface_hermes_files() {
   done
 }
 
-# surface_env_api_keys: materialize the operator's env-provided harness API
-# keys into the contained home so the contained daemon (started under `env -i`
-# by daemon-control — no operator env inherited) can still resolve a model +
+# read_hermes_dotenv_value: read EXACTLY the `KEY=VALUE` line for <envvar> from
+# the operator's real ~/.hermes/.env (read-only) and print its VALUE. The file
+# is NEVER copied; only the enumerated `KEY=` line is read; comments, blank
+# lines, and non-enumerated lines are ignored; nothing is ever written to the
+# operator's HOME. A leading `export ` prefix and matching surrounding quotes
+# (dotenv conventions) are tolerated; the printed value is the unquoted key.
+# Prints nothing (absent) when the file or the key line is missing.
+read_hermes_dotenv_value() {
+  local envvar="$1" dotenv="$2"
+  [ -f "$dotenv" ] || return 0
+  local line val
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      ''|\#*) continue ;;
+    esac
+    case "$line" in
+      export[[:space:]]*)
+        line="${line#export}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        ;;
+    esac
+    case "$line" in
+      "${envvar}="*)
+        val="${line#${envvar}=}"
+        case "$val" in
+          '"'*'"') val="${val#\"}"; val="${val%\"}" ;;
+          "'"*"'") val="${val#\'}"; val="${val%\'}" ;;
+        esac
+        [ -n "$val" ] || return 0
+        printf '%s' "$val"
+        return 0
+        ;;
+    esac
+  done < "$dotenv"
+  return 0
+}
+
+# write_audit_key_sources: regenerate the per-key credential-source records in
+# provision-audit.json (NDJSON). Key-source records are distinguished by their
+# leading `{"key":` shape; the rewrite records written by surface_minimal_file
+# are preserved verbatim. The block is deterministic (PI_ENV_API_KEY_MAP
+# order), so a repeat run with unchanged inputs produces a byte-identical
+# audit file (idempotency). Only KEY NAME + SOURCE are recorded — NEVER the
+# key value.
+write_audit_key_sources() {
+  local audit_file="$1" block="$2"
+  local tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/tt-provision-audit-keys.XXXXXX")"
+  if [ -f "$audit_file" ]; then
+    # Preserve rewrite records; drop any prior key-source block.
+    grep -v '^{"key":' "$audit_file" > "$tmp" 2>/dev/null || true
+  fi
+  printf '%s' "$block" >> "$tmp"
+  if [ -f "$audit_file" ] && cmp -s "$tmp" "$audit_file"; then
+    rm -f -- "$tmp"
+    return 0
+  fi
+  mv "$tmp" "$audit_file"
+  chmod 600 "$audit_file"
+  log "  Recorded per-key credential sources in $audit_file"
+}
+
+# surface_env_api_keys: materialize the operator's harness API keys into the
+# contained home so the contained daemon (started under `env -i` by
+# daemon-control — no operator env inherited) can still resolve a model +
 # API key. This is what fixes the E2.6 `No API key found for the selected
 # model` failures.
-#   pi:     merges the operator's ~/.pi/agent/auth.json base with any SET
-#           API-key env vars (pi auth.json format: {"<provider>":{"type":
-#           "api_key","key":"..."}}), writing 0600.
-#   hermes: writes the SET API-key env vars verbatim into ~/.hermes/.env
+#   pi:     merges the operator's ~/.pi/agent/auth.json base with any resolved
+#           API keys (pi auth.json format: {"<provider>":{"type":"api_key",
+#           "key":"..."}}), writing 0600.
+#   hermes: writes the resolved API keys verbatim into ~/.hermes/.env
 #           (dotenv KEY=VALUE format; hermes loads it via load_hermes_dotenv).
+# Per-key source resolution (CRED-SURF US-001), in priority order:
+#   env            — the key is SET in the invoking environment (wins)
+#   hermes-dotenv  — the EXACT `KEY=VALUE` line from the operator's real
+#                    ~/.hermes/.env (enumerated fallback for non-interactive
+#                    shells on darwin; read-only, never copied wholesale)
+#   absent         — neither source has the key (recorded, never silently
+#                    skipped)
+# Every enumerated PI_ENV_API_KEY_MAP key is recorded in provision-audit.json
+# with its source. Key VALUES are never written to the audit file, logs, or
+# any artifact.
 # Idempotent: only writes when the resulting content would change.
 surface_env_api_keys() {
   local home="$1"
+  local audit_file="$home/provision-audit.json"
+  local dotenv_file="$OPERATOR_HOME/.hermes/.env"
 
-  # Newline-separated ENVVAR=provider pairs (no secrets on the command line;
-  # values are read directly from the process env by the node helper).
-  local pairs="" entry envvar provider
+  # Resolve value + source per enumerated key in ONE deterministic pass
+  # (PI_ENV_API_KEY_MAP order). Values are held only in local variables and
+  # subprocess env — never on the command line, never in the audit.
+  local pairs="" new_env="" key_sources="" entry envvar provider val src
+  local node_env_args=()
   for entry in "${PI_ENV_API_KEY_MAP[@]}"; do
     envvar="${entry%%|*}"
     provider="${entry##*|}"
-    if [ -n "${!envvar:-}" ]; then
-      pairs="${pairs}${envvar}=${provider}"$'\n'
+    val="${!envvar:-}"
+    src="absent"
+    if [ -n "$val" ]; then
+      src="env"
+    else
+      val="$(read_hermes_dotenv_value "$envvar" "$dotenv_file")"
+      if [ -n "$val" ]; then
+        src="hermes-dotenv"
+        # Make the dotenv-sourced value visible to the pi auth.json merge
+        # subprocess ONLY — never exported into the caller env (two-env rule).
+        node_env_args+=("${envvar}=${val}")
+      fi
     fi
+    if [ -n "$val" ]; then
+      pairs="${pairs}${envvar}=${provider}"$'\n'
+      new_env="${new_env}${envvar}=${val}"$'\n'
+    fi
+    key_sources="${key_sources}{\"key\":\"${envvar}\",\"provider\":\"${provider}\",\"source\":\"${src}\"}"$'\n'
   done
 
-  # ── pi: merge operator auth.json + env keys into contained auth.json ──
+  # ── pi: merge operator auth.json + resolved keys into contained auth.json ──
   local pi_auth="$home/.pi/agent/auth.json"
   mkdir -p "$(dirname "$pi_auth")"
   local pi_src_auth="$OPERATOR_HOME/.pi/agent/auth.json"
-  node - "$pi_auth" "$pi_src_auth" "$pairs" <<'NODE'
+  env ${node_env_args[@]+"${node_env_args[@]}"} node - "$pi_auth" "$pi_src_auth" "$pairs" <<'NODE'
 'use strict';
 const fs = require('fs');
 const [authPath, srcAuthPath, pairsRaw] = process.argv.slice(2);
@@ -314,21 +413,13 @@ try { current = fs.readFileSync(authPath, 'utf8'); } catch { current = ''; }
 if (current !== out) {
   fs.writeFileSync(authPath, out, { mode: 0o600 });
   fs.chmodSync(authPath, 0o600);
-  process.stderr.write('[tt-provision-home] surfaced pi env API keys into ' + authPath + '\n');
+  process.stderr.write('[tt-provision-home] surfaced pi API keys into ' + authPath + '\n');
 }
 NODE
 
-  # ── hermes: write SET API-key env vars verbatim into ~/.hermes/.env ──
+  # ── hermes: write resolved KEY=VALUE lines into ~/.hermes/.env (0600) ──
   local hermes_env="$home/.hermes/.env"
   mkdir -p "$(dirname "$hermes_env")"
-  local new_env="" val
-  for entry in "${PI_ENV_API_KEY_MAP[@]}"; do
-    envvar="${entry%%|*}"
-    val="${!envvar:-}"
-    if [ -n "$val" ]; then
-      new_env="${new_env}${envvar}=${val}"$'\n'
-    fi
-  done
   local cur_env=""
   if [ -f "$hermes_env" ]; then
     cur_env="$(cat "$hermes_env")"
@@ -344,6 +435,9 @@ NODE
     chmod 600 "$hermes_env"
     log "  Surfaced operator API-key env vars into $hermes_env"
   fi
+
+  # ── audit: per-key credential source for EVERY enumerated key ──
+  write_audit_key_sources "$audit_file" "$key_sources"
 }
 
 # ── remove .ssh if it exists ─────────────────────────────────────────
@@ -511,6 +605,19 @@ Real TT_HOME gets (E2.6 US-004 — MINIMAL enumerated set, no whole-dir copy):
 Env-provided API keys (e.g. DEEPSEEK_API_KEY/OPENAI_API_KEY/ANTHROPIC_API_KEY)
 are materialized into the contained home (pi auth.json + hermes .env) because
 the contained daemon starts under env -i and never inherits the operator env.
+
+CRED-SURF US-001 — hermes-dotenv enumerated fallback: each enumerated
+PI_ENV_API_KEY_MAP key resolves from the FIRST available source:
+  env            — the key is SET in the invoking environment (wins)
+  hermes-dotenv  — the EXACT `KEY=VALUE` line from the operator's real
+                   ~/.hermes/.env (read-only fallback for non-interactive
+                   shells, e.g. darwin ssh/nohup/launchd; the file is never
+                   copied and non-enumerated lines are never read)
+  absent         — neither source has the key (recorded, never silently
+                   skipped)
+provision-audit.json records one NDJSON line per enumerated key:
+  {"key":"<ENV_VAR>","provider":"<provider>","source":"env|hermes-dotenv|absent"}
+Key VALUES are never written to the audit file, logs, or any artifact.
 
 Scripted TT_HOME gets:
   - .gitconfig only (same settings)

@@ -81,7 +81,7 @@ describe("W4.35 STATUS failed verdict matrix", () => {
         assert.equal(behaviors.heartbeatTokens, 0);
         assert.equal(behaviors.defaultTokens, 0);
         assert.deepEqual(Object.keys(behaviors.agents).sort(), [
-          "fixer", "investigator", "merger", "setup", "triager", "verifier",
+          "auditor", "fixer", "investigator", "merger", "reviewer", "setup", "triager", "verifier",
         ]);
         for (const behavior of Object.values<any>(behaviors.agents)) {
           for (const invocation of Array.isArray(behavior) ? behavior : [behavior]) {

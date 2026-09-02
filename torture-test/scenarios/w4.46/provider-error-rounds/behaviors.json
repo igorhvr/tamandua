@@ -63,6 +63,14 @@
       "commands": [
         "EXPECT_TIP=\"$(git -C '{{input.WORKTREE_ORIGIN_REPOSITORY}}' rev-parse 'refs/heads/{{input.ORIGINAL_BRANCH}}')\"; MESSAGE_FILE=\"$(mktemp)\"; printf 'fix: scripted corridor merge\\n\\nCo-Authored-By: Tamandua <tamandua@tetradactyla.org>\\n' > \"$MESSAGE_FILE\"; tamandua merge-branch --origin '{{input.WORKTREE_ORIGIN_REPOSITORY}}' --branch '{{input.BRANCH}}' --into '{{input.ORIGINAL_BRANCH}}' --expect-tip \"$EXPECT_TIP\" --message \"$(cat \"$MESSAGE_FILE\")\"; MERGE_EXIT=$?; rm -f \"$MESSAGE_FILE\"; exit $MERGE_EXIT"
       ]
+    },
+    "reviewer": {
+      "output": "STATUS: done\nVERDICT: ACCEPT - scripted scenario TEST_CMD contract unchanged (no rewrite to review)",
+      "tokens": 0
+    },
+    "auditor": {
+      "output": "STATUS: done\nVERDICT: HONEST - scripted scenario fix account is honest (no deception)",
+      "tokens": 0
     }
   },
   "heartbeatTokens": 0,

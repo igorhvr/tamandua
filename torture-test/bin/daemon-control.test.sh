@@ -443,6 +443,112 @@ else
   fail "tt-env-scripted.sh not found at expected path: $TT_ENV_SCRIPTED"
 fi
 
+# ── Test 9c: dsh credential surfacing into the contained REAL env
+#    (CRED-SURF US-003 — env -> hermes dotenv) ────────────────────────
+echo ""
+echo "--- Test: dsh credential surfacing into the contained real env (CRED-SURF US-003) ---"
+
+# red-arm fixture OPERATOR home (TT_DC_OPERATOR_HOME seam) — never the real
+# operator home. Carries a fake ~/.hermes/.env with fake sk-* values AND a
+# fake ~/.dsh layer that must stay untouched. The whole fixture is
+# snapshotted before/after: the seam is read-only (AC4: no ~/.dsh writes;
+# AC5: no writes under the operator home).
+US003_FIXTURE="$(mktemp -d)"
+us003_cleanup_fixture() { rm -rf "$US003_FIXTURE"; }
+trap us003_cleanup_fixture EXIT
+
+mkdir -p "$US003_FIXTURE/.hermes"
+printf 'DEEPSEEK_API_KEY=sk-hermes-dotenv-fixture\nOTHER=sk-not-enumerated\n# a comment line\n' > "$US003_FIXTURE/.hermes/.env"
+mkdir -p "$US003_FIXTURE/.dsh/profiles"
+printf 'headless:\n  provider: deepseek\n' > "$US003_FIXTURE/.dsh/profiles/headless.yml"
+
+# Fixture snapshot: every file's name + content hash. Must be byte-identical
+# after every env print (read-only seam — no ~/.dsh writes, no writes at all).
+US003_SNAP_BEFORE="$(find "$US003_FIXTURE" -type f -exec sha256sum {} \; 2>/dev/null | sort | sha256sum)"
+
+# AC1: caller env has DEEPSEEK_API_KEY -> contained env print (env_for_kind
+# real output) carries the ENV value (env wins, even over a DIFFERENT
+# fixture .env value).
+US003_ENV_OUT="$(DEEPSEEK_API_KEY="sk-env-wins-fixture" TT_DC_OPERATOR_HOME="$US003_FIXTURE" TT_DAEMON_CONTROL_ENV_PRINT=real "$TOOL" 2>/dev/null || true)"
+if printf '%s\n' "$US003_ENV_OUT" | grep -q "^DEEPSEEK_API_KEY=sk-env-wins-fixture$"; then
+  pass "AC1 env wins: contained real env print carries the caller-env DEEPSEEK_API_KEY value"
+else
+  fail "AC1 env wins: contained real env print must carry the caller-env DEEPSEEK_API_KEY (got: $(printf '%s\n' "$US003_ENV_OUT" | grep '^DEEPSEEK_API_KEY=' || echo none))"
+fi
+
+# AC2: env unset + fixture operator ~/.hermes/.env has the key -> contained
+# env print carries the hermes-dotenv value.
+US003_DOTENV_OUT="$(env -u DEEPSEEK_API_KEY TT_DC_OPERATOR_HOME="$US003_FIXTURE" TT_DAEMON_CONTROL_ENV_PRINT=real "$TOOL" 2>/dev/null || true)"
+if printf '%s\n' "$US003_DOTENV_OUT" | grep -q "^DEEPSEEK_API_KEY=sk-hermes-dotenv-fixture$"; then
+  pass "AC2 hermes-dotenv: contained real env print carries the fixture ~/.hermes/.env DEEPSEEK_API_KEY value"
+else
+  fail "AC2 hermes-dotenv: contained real env print must carry the fixture .env value (got: $(printf '%s\n' "$US003_DOTENV_OUT" | grep '^DEEPSEEK_API_KEY=' || echo none))"
+fi
+
+# The dotenv line is read EXACTLY (enumerated): non-enumerated lines and
+# comments in the fixture .env are never surfaced into the contained env.
+if printf '%s\n' "$US003_DOTENV_OUT" | grep -q "^OTHER="; then
+  fail "non-enumerated fixture .env lines must never be surfaced into the contained env"
+else
+  pass "non-enumerated fixture .env lines are never surfaced"
+fi
+
+# AC3: env unset + fixture .env absent -> the key is NOT exported and NO
+# error is raised for its absence (other keys still forwarded). Use a second
+# fixture with NO .hermes/.env; set ANTHROPIC_API_KEY in the caller env.
+US003_EMPTY_FIXTURE="$(mktemp -d)"
+us003_cleanup_empty() { rm -rf "$US003_EMPTY_FIXTURE"; }
+trap us003_cleanup_empty EXIT
+US003_ABSENT_OUT="$(env -u DEEPSEEK_API_KEY ANTHROPIC_API_KEY="sk-anthropic-forwarded" TT_DC_OPERATOR_HOME="$US003_EMPTY_FIXTURE" TT_DAEMON_CONTROL_ENV_PRINT=real "$TOOL" 2>/dev/null || true)"
+if ! printf '%s\n' "$US003_ABSENT_OUT" | grep -q "^DEEPSEEK_API_KEY="; then
+  pass "AC3 absent: DEEPSEEK_API_KEY is NOT exported when env unset and fixture .env absent (no error, no silent fake)"
+else
+  fail "AC3 absent: DEEPSEEK_API_KEY must NOT be exported when env unset and fixture .env absent (got: $(printf '%s\n' "$US003_ABSENT_OUT" | grep '^DEEPSEEK_API_KEY=' || echo none))"
+fi
+if printf '%s\n' "$US003_ABSENT_OUT" | grep -q "^ANTHROPIC_API_KEY=sk-anthropic-forwarded$"; then
+  pass "AC3 absent: other enumerated keys are still forwarded (ANTHROPIC_API_KEY from env)"
+else
+  fail "AC3 absent: other enumerated keys must still be forwarded (ANTHROPIC_API_KEY missing)"
+fi
+
+# AC4: the contained env never references or copies anything from the
+# operator's ~/.dsh — the fixture ~/.dsh directory (with a profile file)
+# must be byte-identical after the env prints. AC5: no writes land under
+# the (fixture) operator home at all.
+US003_SNAP_AFTER="$(find "$US003_FIXTURE" -type f -exec sha256sum {} \; 2>/dev/null | sort | sha256sum)"
+if [ "$US003_SNAP_BEFORE" = "$US003_SNAP_AFTER" ]; then
+  pass "AC4/AC5 fixture operator home read-only: ~/.dsh untouched, no writes under the operator home (sha256 snapshot identical)"
+else
+  fail "AC4/AC5 fixture operator home was MODIFIED by the env print seam (sha256 snapshot differs)!"
+fi
+
+# The scripted kind surfaces no credential lines (fake zero-token harnesses).
+US003_SCRIPTED_OUT="$(DEEPSEEK_API_KEY="sk-env-wins-fixture" TT_DC_OPERATOR_HOME="$US003_FIXTURE" TT_DAEMON_CONTROL_ENV_PRINT=scripted "$TOOL" 2>/dev/null || true)"
+if ! printf '%s\n' "$US003_SCRIPTED_OUT" | grep -q "^DEEPSEEK_API_KEY="; then
+  pass "scripted kind surfaces no credential lines (no keys for fake harnesses)"
+else
+  fail "scripted kind must not surface credential lines (got DEEPSEEK_API_KEY)"
+fi
+
+# The seam exits 0.
+set +e
+TT_DC_OPERATOR_HOME="$US003_FIXTURE" TT_DAEMON_CONTROL_ENV_PRINT=real "$TOOL" >/dev/null 2>&1
+US003_SEAM_RC=$?
+set -e
+if [ "$US003_SEAM_RC" -eq 0 ]; then
+  pass "TT_DAEMON_CONTROL_ENV_PRINT=real seam exits 0"
+else
+  fail "TT_DAEMON_CONTROL_ENV_PRINT=real seam exited non-zero (rc=$US003_SEAM_RC)"
+fi
+
+# Tool source contains no literal key values (hygiene: key VALUES must never
+# appear in committed artifacts).
+if grep -n "sk-hermes-dotenv-fixture\|sk-env-wins-fixture\|sk-anthropic-forwarded" "$TOOL" >/dev/null 2>&1; then
+  fail "daemon-control source must not contain literal credential VALUES"
+else
+  pass "daemon-control source contains no literal credential values"
+fi
+
 # ── Test 10: directory setup ─────────────────────────────────────────
 echo ""
 echo "--- Test: directory setup ---"

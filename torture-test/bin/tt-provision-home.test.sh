@@ -63,9 +63,15 @@ MOCK_HOME="$(mktemp -d)"
 TEST_VAR="$(mktemp -d)"
 ABSENT_HOME="$(mktemp -d)"
 ABSENT_VAR="$(mktemp -d)"
+FIX_HOME="$(mktemp -d)"
+FIX_VAR="$(mktemp -d)"
+FIX_VAR2="$(mktemp -d)"
+NOENV_HOME="$(mktemp -d)"
+NOENV_VAR="$(mktemp -d)"
 
 cleanup() {
-  rm -rf "$MOCK_HOME" "$TEST_VAR" "$ABSENT_HOME" "$ABSENT_VAR"
+  rm -rf "$MOCK_HOME" "$TEST_VAR" "$ABSENT_HOME" "$ABSENT_VAR" \
+    "$FIX_HOME" "$FIX_VAR" "$FIX_VAR2" "$NOENV_HOME" "$NOENV_VAR"
 }
 trap cleanup EXIT
 
@@ -354,6 +360,230 @@ if ! grep -q "missing surfaced file(s)" /tmp/tt-provision-absent.log && ! grep -
   pass "models.json not named missing in provisioning output"
 else
   fail "models.json named missing in provisioning output"
+fi
+
+# ── Test 12: hermes-dotenv enumerated fallback (CRED-SURF US-001) ─────
+echo ""
+echo "--- Test: hermes-dotenv fallback (fixture operator HOME) ---"
+
+# Every enumerated PI_ENV_API_KEY_MAP key, unset from the invoking env so the
+# fallback is deterministic regardless of the operator's real environment.
+# Derived from the tool's own map (never hand-maintained here).
+UNSET_ARGS=()
+UNSET_KEYS=0
+while IFS= read -r ev; do
+  if [ -n "$ev" ]; then
+    UNSET_ARGS+=(-u "$ev")
+    UNSET_KEYS=$((UNSET_KEYS + 1))
+  fi
+done < <(grep -oE '"[A-Z0-9_]+\|[a-z0-9-]+"' "$TOOL" | sed 's/"//g; s/|.*//' | sort -u)
+if [ "$UNSET_KEYS" -ge 19 ]; then
+  pass "derived $UNSET_KEYS enumerated keys to unset"
+else
+  fail "expected >=19 enumerated keys, derived $UNSET_KEYS"
+fi
+
+# Fixture operator HOME with a fake ~/.hermes/.env: one enumerated key
+# (DEEPSEEK_API_KEY, plain), one enumerated key with a QUOTED value
+# (OPENAI_API_KEY), one non-enumerated line (OTHER), and a comment — only the
+# two enumerated lines may ever be materialized.
+mkdir -p "$FIX_HOME/.pi/agent" "$FIX_HOME/.hermes"
+cat > "$FIX_HOME/.pi/agent/settings.json" <<JSON
+{"defaultProvider":"deepseek","agentDir":"${FIX_HOME}/.pi/agent"}
+JSON
+echo '{}' > "$FIX_HOME/.pi/agent/auth.json"
+cat > "$FIX_HOME/.hermes/config.yaml" <<YAML
+model:
+  default: gpt-5.6-sol
+YAML
+cat > "$FIX_HOME/.hermes/auth.json" <<JSON
+{"version":1}
+JSON
+cat > "$FIX_HOME/.hermes/.env" <<'ENV'
+# operator comment — must never be copied
+DEEPSEEK_API_KEY=sk-test-dotenv-deepseek
+OTHER=sk-test-non-enumerated
+OPENAI_API_KEY="sk-test-dotenv-openai-quoted"
+ENV
+
+FIX_REAL="$FIX_VAR/home"
+if HOME="$FIX_HOME" TT_OPERATOR_HOME="$FIX_HOME" TT_VAR="$FIX_VAR" \
+    env ${UNSET_ARGS[@]+"${UNSET_ARGS[@]}"} "$TOOL" >/tmp/tt-dotenv.log 2>&1; then
+  pass "hermes-dotenv fallback run exits 0"
+else
+  fail "hermes-dotenv fallback run did NOT exit 0"
+  cat /tmp/tt-dotenv.log >&2
+fi
+
+# (a) contained hermes .env gains the enumerated dotenv keys (unquoted).
+if grep -q '^DEEPSEEK_API_KEY=sk-test-dotenv-deepseek$' "$FIX_REAL/.hermes/.env"; then
+  pass "hermes .env gained DEEPSEEK_API_KEY from hermes-dotenv"
+else
+  fail "hermes .env missing dotenv DEEPSEEK_API_KEY: $(cat "$FIX_REAL/.hermes/.env")"
+fi
+if grep -q '^OPENAI_API_KEY=sk-test-dotenv-openai-quoted$' "$FIX_REAL/.hermes/.env"; then
+  pass "hermes .env gained OPENAI_API_KEY from hermes-dotenv (quotes stripped)"
+else
+  fail "hermes .env missing dotenv OPENAI_API_KEY"
+fi
+
+# (a) pi auth.json gains the deepseek provider with the dotenv value.
+if grep -q '"deepseek"' "$FIX_REAL/.pi/agent/auth.json" && grep -q 'sk-test-dotenv-deepseek' "$FIX_REAL/.pi/agent/auth.json"; then
+  pass "pi auth.json gained deepseek provider from hermes-dotenv"
+else
+  fail "pi auth.json missing dotenv deepseek provider: $(cat "$FIX_REAL/.pi/agent/auth.json")"
+fi
+
+# (a) audit records source=hermes-dotenv for the fallback keys.
+if grep -q '^{"key":"DEEPSEEK_API_KEY","provider":"deepseek","source":"hermes-dotenv"}' "$FIX_REAL/provision-audit.json"; then
+  pass "audit records DEEPSEEK_API_KEY source=hermes-dotenv"
+else
+  fail "audit missing hermes-dotenv source for DEEPSEEK_API_KEY"
+fi
+if grep -q '^{"key":"OPENAI_API_KEY","provider":"openai","source":"hermes-dotenv"}' "$FIX_REAL/provision-audit.json"; then
+  pass "audit records OPENAI_API_KEY source=hermes-dotenv"
+else
+  fail "audit missing hermes-dotenv source for OPENAI_API_KEY"
+fi
+
+# (d) non-enumerated lines + comments are NEVER copied — the contained .env is
+# byte-exact against the enumerated-only expected content (map order: OPENAI
+# precedes DEEPSEEK in PI_ENV_API_KEY_MAP).
+printf 'OPENAI_API_KEY=sk-test-dotenv-openai-quoted\nDEEPSEEK_API_KEY=sk-test-dotenv-deepseek\n' > /tmp/tt-env-expected
+if cmp -s /tmp/tt-env-expected "$FIX_REAL/.hermes/.env"; then
+  pass "contained hermes .env is byte-exact (enumerated-only, map order)"
+else
+  fail "contained hermes .env NOT byte-exact: $(cat "$FIX_REAL/.hermes/.env")"
+fi
+if grep -q 'OTHER' "$FIX_REAL/.hermes/.env"; then
+  fail "non-enumerated OTHER line WAS copied"
+else
+  pass "non-enumerated OTHER line NOT copied"
+fi
+if grep -q '^#' "$FIX_REAL/.hermes/.env"; then
+  fail "comment line WAS copied"
+else
+  pass "comment line NOT copied"
+fi
+if grep -rq 'sk-test-non-enumerated' "$FIX_REAL" 2>/dev/null; then
+  fail "non-enumerated value leaked into the contained home"
+else
+  pass "non-enumerated value absent from the contained home"
+fi
+
+# Key VALUES must never appear in the audit JSON (hygiene).
+if grep -q 'sk-test-dotenv-deepseek\|sk-test-dotenv-openai-quoted' "$FIX_REAL/provision-audit.json"; then
+  fail "key VALUES leaked into audit JSON"
+else
+  pass "audit JSON contains no key values"
+fi
+
+# (AC4) audit names EVERY enumerated key with a source (no silent skip).
+AUDIT_MISSING=0
+while IFS= read -r ev; do
+  [ -n "$ev" ] || continue
+  if grep -q "^{\"key\":\"${ev}\"" "$FIX_REAL/provision-audit.json"; then
+    pass "audit names ${ev}"
+  else
+    fail "audit missing ${ev}"
+    AUDIT_MISSING=1
+  fi
+done < <(grep -oE '"[A-Z0-9_]+\|[a-z0-9-]+"' "$TOOL" | sed 's/"//g; s/|.*//' | sort -u)
+[ "$AUDIT_MISSING" -eq 0 ] && pass "audit names EVERY enumerated key" || fail "audit silently skipped at least one key"
+
+# (AC5) idempotency: a second run leaves the contained home byte-identical.
+FIX_SNAP_BEFORE="$(find "$FIX_REAL" -type f -exec sha256sum {} \; | sort | sha256sum)"
+if HOME="$FIX_HOME" TT_OPERATOR_HOME="$FIX_HOME" TT_VAR="$FIX_VAR" \
+    env ${UNSET_ARGS[@]+"${UNSET_ARGS[@]}"} "$TOOL" >/tmp/tt-dotenv-2.log 2>&1; then
+  pass "hermes-dotenv second run exits 0"
+else
+  fail "hermes-dotenv second run did NOT exit 0"
+fi
+FIX_SNAP_AFTER="$(find "$FIX_REAL" -type f -exec sha256sum {} \; | sort | sha256sum)"
+if [ "$FIX_SNAP_BEFORE" = "$FIX_SNAP_AFTER" ]; then
+  pass "dotenv-fallback run idempotent (byte-identical after second run)"
+else
+  fail "dotenv-fallback run CHANGED the contained home on second run"
+fi
+
+# ── Test 13: env wins over hermes-dotenv (CRED-SURF red-arm c) ────────
+echo ""
+echo "--- Test: env wins over hermes-dotenv ---"
+
+FIX_REAL2="$FIX_VAR2/home"
+if HOME="$FIX_HOME" TT_OPERATOR_HOME="$FIX_HOME" TT_VAR="$FIX_VAR2" \
+    env ${UNSET_ARGS[@]+"${UNSET_ARGS[@]}"} DEEPSEEK_API_KEY="sk-test-env-deepseek" "$TOOL" >/tmp/tt-envwins.log 2>&1; then
+  pass "env-wins run exits 0"
+else
+  fail "env-wins run did NOT exit 0"
+  cat /tmp/tt-envwins.log >&2
+fi
+
+if grep -q '^DEEPSEEK_API_KEY=sk-test-env-deepseek$' "$FIX_REAL2/.hermes/.env"; then
+  pass "env value wins in hermes .env (env over hermes-dotenv)"
+else
+  fail "hermes .env missing the env value: $(cat "$FIX_REAL2/.hermes/.env")"
+fi
+if grep -q 'sk-test-dotenv-deepseek' "$FIX_REAL2/.hermes/.env"; then
+  fail "dotenv value leaked into hermes .env despite env being set"
+else
+  pass "dotenv value NOT used when env is set"
+fi
+if grep -q '^{"key":"DEEPSEEK_API_KEY","provider":"deepseek","source":"env"}' "$FIX_REAL2/provision-audit.json"; then
+  pass "audit records DEEPSEEK_API_KEY source=env (env wins)"
+else
+  fail "audit missing source=env for DEEPSEEK_API_KEY"
+fi
+
+# ── Test 14: env unset + .env absent → audit source=absent (CRED-SURF b) ─
+echo ""
+echo "--- Test: absent source recorded (no silent skip) ---"
+
+mkdir -p "$NOENV_HOME/.pi/agent" "$NOENV_HOME/.hermes"
+cat > "$NOENV_HOME/.pi/agent/settings.json" <<JSON
+{"defaultProvider":"deepseek","agentDir":"${NOENV_HOME}/.pi/agent"}
+JSON
+echo '{}' > "$NOENV_HOME/.pi/agent/auth.json"
+cat > "$NOENV_HOME/.hermes/config.yaml" <<YAML
+model:
+  default: gpt-5.6-sol
+YAML
+cat > "$NOENV_HOME/.hermes/auth.json" <<JSON
+{"version":1}
+JSON
+# NO ~/.hermes/.env — intentional.
+
+if HOME="$NOENV_HOME" TT_OPERATOR_HOME="$NOENV_HOME" TT_VAR="$NOENV_VAR" \
+    env ${UNSET_ARGS[@]+"${UNSET_ARGS[@]}"} "$TOOL" >/tmp/tt-absent.log 2>&1; then
+  pass "absent-.env run exits 0"
+else
+  fail "absent-.env run did NOT exit 0"
+  cat /tmp/tt-absent.log >&2
+fi
+if grep -q '^{"key":"DEEPSEEK_API_KEY","provider":"deepseek","source":"absent"}' "$NOENV_VAR/home/provision-audit.json"; then
+  pass "audit records DEEPSEEK_API_KEY source=absent (no silent skip)"
+else
+  fail "audit missing source=absent for DEEPSEEK_API_KEY"
+fi
+if grep -q '^DEEPSEEK_API_KEY=' "$NOENV_VAR/home/.hermes/.env" 2>/dev/null; then
+  fail "DEEPSEEK_API_KEY written despite absent source"
+else
+  pass "no DEEPSEEK_API_KEY line in contained .env when source absent"
+fi
+
+# ── Test 15: --help documents the hermes-dotenv fallback ───────────────
+echo ""
+echo "--- Test: --help documents the hermes-dotenv fallback ---"
+
+if "$TOOL" --help | grep -q "hermes-dotenv"; then
+  pass "--help documents the hermes-dotenv fallback"
+else
+  fail "--help does not document the hermes-dotenv fallback"
+fi
+if "$TOOL" --help | grep -q 'env|hermes-dotenv|absent'; then
+  pass "--help documents the audit source values env|hermes-dotenv|absent"
+else
+  fail "--help does not document the audit source values"
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────

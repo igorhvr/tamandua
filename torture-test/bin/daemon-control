@@ -139,6 +139,14 @@ PROD_PORTS="3334 3338 3339"
 # REAL_TAMANDUA_STATE (the production guard) and operator_bin_dirs (the S24
 # PATH reorder) correct on both platforms.
 resolve_operator_home() {
+  # CRED-SURF US-003 test seam: TT_DC_OPERATOR_HOME pins the OPERATOR home
+  # (mirrors the tt-provision-home TT_OPERATOR_HOME seam) so red-arm tests
+  # can point the hermes-dotenv credential source at a fixture with a fake
+  # ~/.hermes/.env. Unset in production = the real operator home.
+  if [ -n "${TT_DC_OPERATOR_HOME:-}" ]; then
+    printf '%s' "$TT_DC_OPERATOR_HOME"
+    return 0
+  fi
   local pw_home
   pw_home="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6 || true)"
   if [ -n "$pw_home" ]; then
@@ -166,6 +174,14 @@ resolve_operator_home() {
 
 _tt_operator_home="$(resolve_operator_home)"
 REAL_TAMANDUA_STATE="${_tt_operator_home:-${HOME}}/.tamandua"
+
+# CRED-SURF US-003: OPERATOR_HOME is the READ-ONLY hermes-dotenv credential
+# source for the contained REAL spawn env (env_for_kind below). Same
+# resolution as REAL_TAMANDUA_STATE — the operator's REAL home (never the
+# contained $HOME override), pinned by TT_DC_OPERATOR_HOME in red-arm tests.
+# The contained env never writes under OPERATOR_HOME; only the EXACT
+# enumerated `KEY=VALUE` line is read from OPERATOR_HOME/.hermes/.env.
+OPERATOR_HOME="$_tt_operator_home"
 
 # ── production guards ─────────────────────────────────────────────────
 
@@ -261,6 +277,107 @@ has_systemd_scope() {
 
 # ── env script application ───────────────────────────────────────────
 
+# CRED-SURF US-003 — enumerated harness API-key env map (env var name ->
+# provider name), identical to tt-provision-home's PI_ENV_API_KEY_MAP. The
+# contained REAL daemon is started under `env -i` (no operator env
+# inherited), so the enumerated keys are surfaced into the contained spawn
+# env (credential_env_lines below): the contained daemon AND its dsh workers
+# then resolve their credentials from the environment (dsh-llm-deepseek
+# default apiKeyEnv DEEPSEEK_API_KEY; dsh-credentials-local inherited-env
+# layer wins) — the tier-2 dsh lane's MISSING_CREDENTIAL abort is fixed.
+PI_ENV_API_KEY_MAP=(
+  "ANTHROPIC_API_KEY|anthropic"
+  "ANT_LING_API_KEY|ant-ling"
+  "OPENAI_API_KEY|openai"
+  "DEEPSEEK_API_KEY|deepseek"
+  "NVIDIA_API_KEY|nvidia"
+  "GEMINI_API_KEY|google"
+  "MISTRAL_API_KEY|mistral"
+  "GROQ_API_KEY|groq"
+  "CEREBRAS_API_KEY|cerebras"
+  "XAI_API_KEY|xai"
+  "OPENROUTER_API_KEY|openrouter"
+  "AI_GATEWAY_API_KEY|vercel-ai-gateway"
+  "ZAI_API_KEY|zai"
+  "MINIMAX_API_KEY|minimax"
+  "HF_TOKEN|huggingface"
+  "FIREWORKS_API_KEY|fireworks"
+  "TOGETHER_API_KEY|together"
+  "KIMI_API_KEY|kimi-coding"
+  "OPENCODE_API_KEY|opencode"
+)
+
+# read_hermes_dotenv_value: read EXACTLY the `KEY=VALUE` line for <envvar>
+# from the operator's real ~/.hermes/.env (read-only) and print its VALUE.
+# Mirrors tt-provision-home / tt-harness-auth-probe verbatim: the file is
+# NEVER copied, only the enumerated `KEY=` line is read; comments, blank
+# lines, and non-enumerated lines are ignored; nothing is ever written to
+# the operator's HOME. A leading `export ` prefix and matching surrounding
+# quotes (dotenv conventions) are tolerated; the printed value is the
+# unquoted key. Prints nothing (absent) when the file or the key line is
+# missing.
+read_hermes_dotenv_value() {
+  local envvar="$1" dotenv="$2"
+  [ -f "$dotenv" ] || return 0
+  local line val
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      ''|\#*) continue ;;
+    esac
+    case "$line" in
+      export[[:space:]]*)
+        line="${line#export}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        ;;
+    esac
+    case "$line" in
+      "${envvar}="*)
+        val="${line#${envvar}=}"
+        case "$val" in
+          '"'*'"') val="${val#\"}"; val="${val%\"}" ;;
+          "'"*"'") val="${val#\'}"; val="${val%\'}" ;;
+        esac
+        [ -n "$val" ] || return 0
+        printf '%s' "$val"
+        return 0
+        ;;
+    esac
+  done < "$dotenv"
+  return 0
+}
+
+# credential_env_lines: print the enumerated harness API-key KEY=VALUE lines
+# for the contained REAL spawn env (CRED-SURF US-003). Per-key resolution,
+# in priority order:
+#   env            — the key is SET in the CALLER environment (wins). This
+#                    precedence must be resolved HERE, in env_for_kind's
+#                    process, because the env scripts run under `env -i`
+#                    and never see the caller env.
+#   hermes-dotenv  — the EXACT `KEY=VALUE` line from the operator's real
+#                    ~/.hermes/.env (read-only enumerated fallback for
+#                    darwin non-interactive shells; never copied wholesale,
+#                    never written).
+#   absent         — the key is OMITTED (no error for its absence; the
+#                    other enumerated keys are still forwarded).
+# The values flow into the contained daemon's spawn env exclusively through
+# `env -i $(env_for_kind real) ...` composition (run_under_env / cmd_start)
+# — they are consumed internally, never logged, never written to provenance,
+# evidence, or audit files. Keys are surfaced ONLY for the real kind: the
+# scripted kind runs fake zero-token harnesses that need no credentials.
+credential_env_lines() {
+  local entry envvar val
+  for entry in "${PI_ENV_API_KEY_MAP[@]}"; do
+    envvar="${entry%%|*}"
+    val="${!envvar:-}"
+    if [ -z "$val" ]; then
+      val="$(read_hermes_dotenv_value "$envvar" "$OPERATOR_HOME/.hermes/.env")"
+    fi
+    if [ -n "$val" ]; then
+      printf '%s=%s\n' "$envvar" "$val"
+    fi
+  done
+}
+
 # env_for_kind: prints environment variables for the given kind
 # (real|scripted) as KEY=VALUE lines, suitable for `env $(...)` composition.
 # This NEVER sources into the caller shell.
@@ -286,6 +403,14 @@ env_for_kind() {
       printf '%s=%s\n' "$v" "$val"
     fi
   done
+  # CRED-SURF US-003: surface the enumerated harness API keys into the
+  # contained REAL env (env wins, else the operator's real ~/.hermes/.env
+  # line, else omitted). The env scripts run under `env -i` above, so the
+  # caller env is NOT visible to them — the env-wins precedence is resolved
+  # HERE, in the caller-visible env_for_kind.
+  if [ "$kind" = "real" ]; then
+    credential_env_lines
+  fi
 }
 
 # ── contained PATH reconstruction (S24 / US-006) ─────────────────────
@@ -583,6 +708,29 @@ Environment:
   Spawn env is applied ONLY to the tamandua process, never to the caller.
   - real:     torture-test/env/tt-env.sh
   - scripted: torture-test/env/tt-env-scripted.sh
+  CRED-SURF US-003 — dsh credential surfacing (real kind only): the
+    enumerated harness API keys (PI_ENV_API_KEY_MAP: DEEPSEEK_API_KEY and
+    the other pi/hermes provider keys) are surfaced into the contained REAL
+    spawn env as KEY=VALUE lines. Per-key resolution: the CALLER
+    environment wins, else the EXACT `KEY=VALUE` line is read from the
+    operator's real ~/.hermes/.env (read-only enumerated fallback for
+    darwin non-interactive shells), else the key is omitted (no error).
+    This is what lets the contained real daemon AND its dsh workers resolve
+    a DEEPSEEK credential (dsh-llm-deepseek default apiKeyEnv
+    DEEPSEEK_API_KEY; dsh-credentials-local inherited-env layer wins) — the
+    tier-2 dsh lane's MISSING_CREDENTIAL abort is fixed. The operator's
+    ~/.dsh is NEVER copied, sessions/ stays out, and nothing is ever
+    written under the operator's HOME. The scripted kind surfaces nothing
+    (fake zero-token harnesses need no credentials).
+  TT_DAEMON_CONTROL_ENV_PRINT=<real|scripted> (self-test seam, CRED-SURF
+    US-003): print the full contained spawn env for the kind (env script
+    lines + forwarded caller knobs + surfaced credential KEY=VALUE lines for
+    real) and exit — no daemon start, no guards, no writes.
+  TT_DC_OPERATOR_HOME=<dir> (self-test seam, CRED-SURF US-003): pin the
+    OPERATOR home used for the hermes-dotenv credential fallback (mirrors
+    tt-provision-home's TT_OPERATOR_HOME) so red-arm tests can point it at
+    a fixture with a fake ~/.hermes/.env. Unset in production = the real
+    operator home.
   TT_DAEMON_PORT_WAIT_SECONDS: bounded seconds cmd_start waits for the
     kind's fixed ports (scripted 5334/5338/5339, real 4334/4338/4339) to be
     free before launching (default 10) — concurrent worktrees serialize on
@@ -2038,6 +2186,26 @@ main() {
         ;;
       *)
         echo "daemon-control: invalid TT_DAEMON_CONTROL_CONTAINED_PATH '$TT_DAEMON_CONTROL_CONTAINED_PATH' (expected real|scripted)" >&2
+        exit 2
+        ;;
+    esac
+  fi
+
+  # CRED-SURF US-003 self-test seam: TT_DAEMON_CONTROL_ENV_PRINT=<kind>
+  # prints the full contained spawn env (env_for_kind output — env script
+  # lines + forwarded caller knobs + the surfaced credential KEY=VALUE lines
+  # for the real kind) and exits — no daemon start, no guards, no writes.
+  # Used by daemon-control.test.sh to exercise the dsh credential surfacing
+  # (env wins / hermes-dotenv fallback / absent omission) without starting
+  # a daemon.
+  if [ -n "${TT_DAEMON_CONTROL_ENV_PRINT:-}" ]; then
+    case "$TT_DAEMON_CONTROL_ENV_PRINT" in
+      real|scripted)
+        env_for_kind "$TT_DAEMON_CONTROL_ENV_PRINT"
+        exit 0
+        ;;
+      *)
+        echo "daemon-control: invalid TT_DAEMON_CONTROL_ENV_PRINT '$TT_DAEMON_CONTROL_ENV_PRINT' (expected real|scripted)" >&2
         exit 2
         ;;
     esac

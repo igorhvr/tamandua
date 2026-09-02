@@ -10558,7 +10558,11 @@ function runRealPreflight(campaignDir, state, manifest, fresh) {
   ];
   const requiredHarnesses = requiredHarnessesFor(manifest);
   if (requiredHarnesses.length > 0) {
-    legs.push({ label: 'harness-auth', script: PREFLIGHT_AUTH_PATH, args: requiredHarnesses, reason: 'harness-auth-missing' });
+    // US-005: the harness-auth leg invokes the probe with --spend so the dsh
+    // lane's REAL answer leg runs during preflight — a dead dsh lane
+    // (MISSING_CREDENTIAL) can never again pass preflight green. The probe
+    // parses --spend anywhere in argv.
+    legs.push({ label: 'harness-auth', script: PREFLIGHT_AUTH_PATH, args: ['--spend', ...requiredHarnesses], reason: 'harness-auth-missing' });
   }
   // S26 US-004: a FRESH campaign threads `ensure-up --fresh` so the
   // daemon-up leg ALSO verifies the contained suite_results ledger is empty
