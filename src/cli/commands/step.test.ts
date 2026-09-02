@@ -1211,3 +1211,112 @@ describe("US-013: --run-id prefix acceptance in step peek, claim, current", () =
     assert.match(stderrOutput, /step id/);
   });
 });
+
+describe("YSE US-005: step stories shows reset-on-resume stories distinctly", () => {
+  let tempDir: string;
+  let dbPath: string;
+  let db: DatabaseSync;
+  let originalDbPath: string | undefined;
+  let originalHome: string | undefined;
+  let originalStateDir: string | undefined;
+
+  beforeEach(() => {
+    originalDbPath = process.env.TAMANDUA_DB_PATH;
+    originalHome = process.env.HOME;
+    originalStateDir = process.env.TAMANDUA_STATE_DIR;
+
+    const setup = setupTempDb();
+    tempDir = setup.tempDir;
+    dbPath = setup.dbPath;
+    db = setup.db;
+
+    process.env.TAMANDUA_DB_PATH = dbPath;
+    process.env.HOME = tempDir;
+    process.env.TAMANDUA_STATE_DIR = path.join(tempDir, ".tamandua");
+  });
+
+  afterEach(() => {
+    if (originalDbPath) process.env.TAMANDUA_DB_PATH = originalDbPath;
+    else delete process.env.TAMANDUA_DB_PATH;
+    if (originalHome) process.env.HOME = originalHome;
+    else delete process.env.HOME;
+    if (originalStateDir) process.env.TAMANDUA_STATE_DIR = originalStateDir;
+    else delete process.env.TAMANDUA_STATE_DIR;
+
+    db.close();
+    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+  });
+
+  function seedStoryRun(
+    runId: string,
+    stories: Array<{ storyId: string; title: string; status: string; resumeResetCount: number }>,
+  ): void {
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context) VALUES (?, 'test', 'task', 'running', '{}')",
+    ).run(runId);
+    // The hand-rolled fixture stories table predates resume_reset_count —
+    // make sure the column exists before seeding reset counts.
+    const cols = db.prepare("PRAGMA table_info(stories)").all() as Array<{ name: string }>;
+    if (!cols.some((c) => c.name === "resume_reset_count")) {
+      db.exec("ALTER TABLE stories ADD COLUMN resume_reset_count INTEGER NOT NULL DEFAULT 0");
+    }
+    const insertStory = db.prepare(
+      `INSERT INTO stories (id, run_id, story_id, title, description, acceptance_criteria, status, retry_count, story_index, resume_reset_count, created_at, updated_at)
+       VALUES (?, ?, ?, ?, '', '[]', ?, 0, ?, ?, datetime('now'), datetime('now'))`,
+    );
+    stories.forEach((s, idx) => {
+      insertStory.run(crypto.randomUUID(), runId, s.storyId, s.title, s.status, idx, s.resumeResetCount);
+    });
+  }
+
+  async function captureStoriesOutput(runId: string): Promise<string> {
+    let output = "";
+    const origLog = console.log;
+    console.log = (...chunks: unknown[]) => {
+      output += chunks.map((c) => String(c)).join(" ") + "\n";
+    };
+    try {
+      await handleStep("step", ["step", "stories", runId], () => {});
+    } finally {
+      console.log = origLog;
+    }
+    return output;
+  }
+
+  it("step stories annotates a resume-reset story and leaves fresh pending stories plain", async () => {
+    const runId = crypto.randomUUID();
+    seedStoryRun(runId, [
+      { storyId: "US-001", title: "Fresh pending", status: "pending", resumeResetCount: 0 },
+      { storyId: "US-002", title: "Reset story", status: "pending", resumeResetCount: 1 },
+    ]);
+
+    const output = await captureStoriesOutput(runId);
+    const lines = output.trim().split("\n");
+    assert.equal(lines.length, 2, "one line per story");
+
+    // AC 4: same reset annotation as workflow status — shared display label
+    assert.match(lines[1], /US-002\s+\[pending \(reset on resume, 1 prior failure\)\]/);
+    assert.match(lines[1], /Reset story$/);
+    // Fresh pending story is shown plainly as pending with no annotation
+    assert.match(lines[0], /US-001\s+\[pending\]/);
+    assert.match(lines[0], /Fresh pending$/);
+    assert.ok(!lines[0].includes("reset on resume"), "fresh pending story must not carry the reset annotation");
+  });
+
+  it("step stories keeps done and running stories on their raw labels", async () => {
+    const runId = crypto.randomUUID();
+    seedStoryRun(runId, [
+      { storyId: "US-001", title: "Done story", status: "done", resumeResetCount: 1 },
+      { storyId: "US-002", title: "Running story", status: "running", resumeResetCount: 1 },
+    ]);
+
+    const output = await captureStoriesOutput(runId);
+    const lines = output.trim().split("\n");
+    assert.equal(lines.length, 2);
+    // Only pending + resumeResetCount > 0 gets the annotation; a done story
+    // that carries reset history still displays as plain done.
+    assert.match(lines[0], /US-001\s+\[done\s+\]/);
+    assert.match(lines[1], /US-002\s+\[running\]/);
+    assert.ok(!output.includes("reset on resume"), "no reset annotation for non-pending stories");
+  });
+});

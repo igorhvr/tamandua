@@ -1211,6 +1211,225 @@ describe("daemon control plane", { concurrency: 1 }, () => {
     db2.close();
   });
 
+  // ── PAUS US-003: plain resume cancels a pending drain ─────────────
+  // A run with a pending drain (pause --drain in progress) is status
+  // 'running' with scheduling_status 'draining_pause' and the pause_drain
+  // marker in its context. A plain resume must cancel that drain: flip the
+  // scheduling state, clear the marker atomically, emit
+  // run.drain_cancelled_by_resume before run.resumed, and (when admission
+  // succeeds) report drainCancelled: true to the caller.
+
+  it("POST /control/resume-run on a draining_pause run cancels the pending drain (marker cleared, audit event)", async (t) => {
+    if (!daemon) {
+      t.skip("daemon not started");
+      return;
+    }
+
+    const dbPath = path.join(tempHome, ".tamandua", "tamandua.db");
+    const { DatabaseSync } = await import("node:sqlite");
+    const db = new DatabaseSync(dbPath);
+    const runId = crypto.randomUUID();
+    const workflowId = "wf-drain-cancel-core";
+    const now = new Date().toISOString();
+    const context = JSON.stringify({
+      working_directory_for_harness: tempHome,
+      pause_drain: "true",
+      paused_by: "drain-operator@host (cli)",
+    });
+
+    // A mid-drain run: status still 'running', scheduling draining_pause,
+    // pause_drain marker set.
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, scheduling_status, created_at, updated_at) VALUES (?, ?, 'drain-cancel-core', 'running', ?, 0, 'draining_pause', ?, ?)",
+    ).run(runId, workflowId, context, now, now);
+    db.close();
+
+    const r = await jsonRequest(
+      "POST",
+      "/control/resume-run",
+      { runId, requestedBy: "resume-operator@host (cli)" },
+      secret,
+    );
+    // The workflow is not installed in this state dir, so admission may fail
+    // with 422 — but the drain cancellation itself happens before admission
+    // and must be observable either way.
+    assert.ok(r.status === 200 || r.status === 202 || r.status === 422,
+      `expected 200/202/422, got ${r.status}: ${JSON.stringify(r.body)}`);
+
+    // AC: the run leaves draining_pause and stays running.
+    const db2 = new DatabaseSync(dbPath);
+    const row = db2.prepare("SELECT status, scheduling_status, context FROM runs WHERE id = ?").get(runId) as { status: string; scheduling_status: string; context: string } | undefined;
+    assert.ok(row, "run should exist");
+    assert.equal(row.status, "running", "resume must leave the run running");
+    assert.notEqual(row.scheduling_status, "draining_pause",
+      "scheduling_status must no longer be draining_pause");
+
+    // AC: the pause_drain run-context marker is cleared; resume attribution is stored.
+    const ctx = JSON.parse(row.context);
+    assert.ok(!("pause_drain" in ctx), "pause_drain marker should be cleared by resume");
+    assert.equal(ctx.resumed_by, "resume-operator@host (cli)");
+
+    // AC: a run.drain_cancelled_by_resume event with the runId is written to
+    // the run's event stream, before run.resumed, and no drain-induced
+    // run.paused follows the resume.
+    const runEventsPath = path.join(tempHome, ".tamandua", "events", `${runId}.jsonl`);
+    assert.ok(fs.existsSync(runEventsPath), `expected events file at ${runEventsPath}`);
+    const runEventsRaw = fs.readFileSync(runEventsPath, "utf-8");
+    const runEvents = runEventsRaw.trim().split("\n").filter(Boolean).map((l: string) => JSON.parse(l));
+
+    const cancelIndex = runEvents.findIndex((e: any) => e.event === "run.drain_cancelled_by_resume");
+    assert.ok(cancelIndex >= 0, "expected a run.drain_cancelled_by_resume event");
+    const cancelEvent = runEvents[cancelIndex];
+    assert.equal(cancelEvent.runId, runId);
+    assert.equal(cancelEvent.workflowId, workflowId);
+    const cancelDetail = JSON.parse(cancelEvent.detail);
+    assert.equal(cancelDetail.requestedBy, "resume-operator@host (cli)");
+
+    const resumedIndex = runEvents.findIndex((e: any) => e.event === "run.resumed");
+    assert.ok(resumedIndex >= 0, "expected a run.resumed event");
+    assert.ok(cancelIndex < resumedIndex,
+      `run.drain_cancelled_by_resume (idx=${cancelIndex}) must precede run.resumed (idx=${resumedIndex})`);
+
+    const pausedAfterResume = runEvents.some((e: any, i: number) =>
+      e.event === "run.paused" && i > resumedIndex);
+    assert.equal(pausedAfterResume, false,
+      "no drain finalization may pause the run after a resume cancelled the drain");
+
+    // Cleanup
+    db2.prepare("DELETE FROM runs WHERE id = ?").run(runId);
+    db2.close();
+  });
+
+  it("POST /control/resume-run on a draining_pause run admits the run and reports drainCancelled true", async (t) => {
+    if (!daemon) {
+      t.skip("daemon not started");
+      return;
+    }
+
+    const stateDir = path.join(tempHome, ".tamandua");
+    const dbPath = path.join(stateDir, "tamandua.db");
+    const { DatabaseSync } = await import("node:sqlite");
+    const db = new DatabaseSync(dbPath);
+    const runId = crypto.randomUUID();
+    const workflowId = "feature-dev-merge";
+    const now = new Date().toISOString();
+    const context = JSON.stringify({
+      working_directory_for_harness: tempHome,
+      pause_drain: "true",
+    });
+
+    // Install the workflow so registration/admission can succeed.
+    const srcWorkflowDir = path.resolve(__dirname, "..", "..", "workflows", workflowId);
+    const dstWorkflowDir = path.join(stateDir, "workflows", workflowId);
+    fs.mkdirSync(path.dirname(dstWorkflowDir), { recursive: true });
+    fs.cpSync(srcWorkflowDir, dstWorkflowDir, { recursive: true });
+
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, scheduling_status, created_at, updated_at) VALUES (?, ?, 'drain-cancel-admit', 'running', ?, 0, 'draining_pause', ?, ?)",
+    ).run(runId, workflowId, context, now, now);
+    db.close();
+
+    try {
+      const r = await jsonRequest(
+        "POST",
+        "/control/resume-run",
+        { runId, requestedBy: "admit-operator" },
+        secret,
+      );
+      // AC 1: 2xx with drainCancelled true.
+      assert.ok(r.status === 200 || r.status === 202,
+        `expected 2xx admission, got ${r.status}: ${JSON.stringify(r.body)}`);
+      assert.equal(r.body.drainCancelled, true, "body must carry drainCancelled: true");
+      assert.equal(r.body.state, "active");
+
+      // AC: scheduling_status leaves draining_pause and the run is admitted.
+      const db2 = new DatabaseSync(dbPath);
+      const row = db2.prepare("SELECT status, scheduling_status, context FROM runs WHERE id = ?").get(runId) as { status: string; scheduling_status: string; context: string } | undefined;
+      assert.ok(row, "run should exist");
+      assert.equal(row.status, "running");
+      assert.equal(row.scheduling_status, "active", "run should be admitted (active) after resume");
+      const ctx = JSON.parse(row.context);
+      assert.ok(!("pause_drain" in ctx), "pause_drain marker should be cleared by resume");
+
+      // AC: run.drain_cancelled_by_resume event present with the runId.
+      const runEventsPath = path.join(stateDir, "events", `${runId}.jsonl`);
+      assert.ok(fs.existsSync(runEventsPath), `expected events file at ${runEventsPath}`);
+      const runEventsRaw = fs.readFileSync(runEventsPath, "utf-8");
+      const runEvents = runEventsRaw.trim().split("\n").filter(Boolean).map((l: string) => JSON.parse(l));
+      const cancelEvent = runEvents.find((e: any) => e.event === "run.drain_cancelled_by_resume");
+      assert.ok(cancelEvent, "expected a run.drain_cancelled_by_resume event");
+      assert.equal(cancelEvent.runId, runId);
+
+      // Clean the scheduler state the admission created before deleting the row.
+      if (daemon) {
+        const term = await jsonRequest("POST", "/control/terminate-run", { runId }, secret);
+        assert.equal(term.status, 200);
+      }
+      db2.prepare("DELETE FROM runs WHERE id = ?").run(runId);
+      db2.close();
+    } finally {
+      fs.rmSync(dstWorkflowDir, { recursive: true, force: true });
+    }
+  });
+
+  it("POST /control/resume-run on a paused run (no pending drain) emits no drain-cancel event or flag", async (t) => {
+    if (!daemon) {
+      t.skip("daemon not started");
+      return;
+    }
+
+    const dbPath = path.join(tempHome, ".tamandua", "tamandua.db");
+    const { DatabaseSync } = await import("node:sqlite");
+    const db = new DatabaseSync(dbPath);
+    const runId = crypto.randomUUID();
+    const workflowId = "wf-no-drain-resume";
+    const now = new Date().toISOString();
+    const context = JSON.stringify({
+      working_directory_for_harness: tempHome,
+      // A previously-completed drain leaves this historical marker behind, but
+      // the run is paused — there is no PENDING drain to cancel.
+      pause_drain: "true",
+    });
+
+    db.prepare(
+      "INSERT INTO runs (id, workflow_id, task, status, context, tokens_spent, scheduling_status, created_at, updated_at) VALUES (?, ?, 'no-drain-resume', 'paused', ?, 0, 'paused', ?, ?)",
+    ).run(runId, workflowId, context, now, now);
+    db.close();
+
+    const r = await jsonRequest(
+      "POST",
+      "/control/resume-run",
+      { runId, requestedBy: "plain-operator" },
+      secret,
+    );
+    assert.ok(r.status === 200 || r.status === 202 || r.status === 422,
+      `expected 200/202/422, got ${r.status}: ${JSON.stringify(r.body)}`);
+
+    // AC: no drainCancelled flag on success; no run.drain_cancelled_by_resume
+    // event in the run's stream.
+    if (r.status >= 200 && r.status < 300) {
+      assert.equal(r.body.drainCancelled, undefined,
+        "no-drain resume must not set drainCancelled");
+    }
+    const runEventsPath = path.join(tempHome, ".tamandua", "events", `${runId}.jsonl`);
+    assert.ok(fs.existsSync(runEventsPath), `expected events file at ${runEventsPath}`);
+    const runEventsRaw = fs.readFileSync(runEventsPath, "utf-8");
+    const runEvents = runEventsRaw.trim().split("\n").filter(Boolean).map((l: string) => JSON.parse(l));
+    assert.equal(
+      runEvents.some((e: any) => e.event === "run.drain_cancelled_by_resume"),
+      false,
+      "no-drain resume must not emit run.drain_cancelled_by_resume",
+    );
+    const resumedEvent = runEvents.find((e: any) => e.event === "run.resumed");
+    assert.ok(resumedEvent, "expected a run.resumed event for the plain resume");
+    assert.equal(resumedEvent.runId, runId);
+
+    // Cleanup
+    const db2 = new DatabaseSync(dbPath);
+    db2.prepare("DELETE FROM runs WHERE id = ?").run(runId);
+    db2.close();
+  });
+
   // ── Nudge endpoint tests ────────────────────────────────────────
 
   it("POST /control/nudge returns zero counts when no runs are running", async (t) => {

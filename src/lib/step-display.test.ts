@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { displayStepStatus } from "../../dist/lib/step-display.js";
-import type { StepDisplayInput } from "../../dist/lib/step-display.js";
+import { displayStepStatus, displayStoryStatus } from "../../dist/lib/step-display.js";
+import type { StepDisplayInput, StoryDisplayInput } from "../../dist/lib/step-display.js";
 
 describe("displayStepStatus", () => {
   describe("parked loop (type=loop, status=running, currentStoryId=null)", () => {
@@ -165,6 +165,45 @@ describe("displayStepStatus", () => {
         currentStoryId: "",
       };
       assert.strictEqual(displayStepStatus(input), "running");
+    });
+  });
+});
+
+describe("displayStoryStatus (YSE US-005)", () => {
+  describe("pending story reset on resume (resumeResetCount > 0)", () => {
+    it("returns the annotated label for 1 prior failure (singular)", () => {
+      const input: StoryDisplayInput = { status: "pending", resumeResetCount: 1 };
+      assert.strictEqual(displayStoryStatus(input), "pending (reset on resume, 1 prior failure)");
+    });
+
+    it("returns the annotated label for 2 prior failures (plural)", () => {
+      const input: StoryDisplayInput = { status: "pending", resumeResetCount: 2 };
+      assert.strictEqual(displayStoryStatus(input), "pending (reset on resume, 2 prior failures)");
+    });
+
+    it("matches the operator-facing annotation shape", () => {
+      const input: StoryDisplayInput = { status: "pending", resumeResetCount: 1 };
+      assert.match(displayStoryStatus(input), /reset on resume, 1 prior failure/);
+    });
+  });
+
+  describe("story never reset on resume (resumeResetCount 0 / absent)", () => {
+    it("returns plain pending for resumeResetCount 0", () => {
+      const input: StoryDisplayInput = { status: "pending", resumeResetCount: 0 };
+      assert.strictEqual(displayStoryStatus(input), "pending");
+    });
+
+    it("returns plain pending when resumeResetCount is absent", () => {
+      const input: StoryDisplayInput = { status: "pending" };
+      assert.strictEqual(displayStoryStatus(input), "pending");
+    });
+
+    it("returns raw status for other statuses even with resumeResetCount > 0", () => {
+      // The stored status is NEVER changed — only pending stories that a
+      // resume re-queued get the annotation label.
+      assert.strictEqual(displayStoryStatus({ status: "done", resumeResetCount: 1 }), "done");
+      assert.strictEqual(displayStoryStatus({ status: "running", resumeResetCount: 1 }), "running");
+      assert.strictEqual(displayStoryStatus({ status: "failed", resumeResetCount: 1 }), "failed");
     });
   });
 });

@@ -170,7 +170,7 @@ function getUsageText(): string {
     "tamandua workflow runs [--json]       List all workflow runs",
     "tamandua workflow pause <run-id>      Pause a running workflow",
     "tamandua workflow pause-all [--drain]  Pause all running workflows",
-    "tamandua workflow resume <run-id>     Resume a paused or failed run",
+    "tamandua workflow resume <run-id>     Resume paused/failed run; cancels a pending drain",
     "tamandua workflow resume-all           Resume all paused workflows",
     "tamandua workflow fail <run-id> --reason <text> [--force]",
     "                                      Force a running/paused run to failed status",

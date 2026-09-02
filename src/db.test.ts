@@ -401,6 +401,7 @@ describe("stories abandoned_count migration", () => {
       "id",
       "max_retries",
       "output",
+      "resume_reset_count",
       "retry_count",
       "run_id",
       "status",
@@ -449,6 +450,253 @@ describe("stories abandoned_count migration", () => {
     assert.ok(storyCols.has("id"), "stories.id should exist");
     assert.ok(storyCols.has("retry_count"), "stories.retry_count should exist");
     assert.ok(storyCols.has("status"), "stories.status should exist");
+  });
+});
+
+describe("YSE stories resume_reset_count migration", () => {
+  // YSE US-001: stories.resume_reset_count durably records how many times a
+  // workflow resume has re-queued a FAILED loop story back to pending. The
+  // column is INTEGER NOT NULL DEFAULT 0, added to the fresh-DDL CREATE TABLE
+  // AND via a guarded idempotent ALTER for pre-existing DBs, with
+  // SCHEMA_VERSION bumped (v7 → v8) so existing v7 installs actually run the
+  // migration (the WLST5.1 failure mode). Existing rows read back 0.
+
+  let origHome: string | undefined;
+  let origDbPath: string | undefined;
+
+  function distDir(): string {
+    return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "dist");
+  }
+
+  // Pre-YSE (v7) runs/steps/stories schema: identical to the current shape
+  // except stories lacks resume_reset_count.
+  const LEGACY_V7_DDL = `
+    CREATE TABLE runs (
+      id TEXT PRIMARY KEY,
+      run_number INTEGER,
+      workflow_id TEXT NOT NULL,
+      task TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'running',
+      context TEXT NOT NULL DEFAULT '{}',
+      tokens_spent INTEGER NOT NULL DEFAULT 0,
+      notify_url TEXT,
+      scheduling_status TEXT,
+      scheduling_requested_at TEXT,
+      scheduling_error TEXT,
+      worker_lost_count INTEGER NOT NULL DEFAULT 0,
+      ceiling_expiry_count INTEGER NOT NULL DEFAULT 0,
+      parent_run_id TEXT,
+      instant_fail_count INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE steps (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES runs(id),
+      step_id TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      step_index INTEGER NOT NULL,
+      input_template TEXT NOT NULL,
+      expects TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'waiting',
+      output TEXT,
+      retry_count INTEGER DEFAULT 0,
+      max_retries INTEGER DEFAULT 4,
+      type TEXT NOT NULL DEFAULT 'single',
+      loop_config TEXT,
+      current_story_id TEXT,
+      abandoned_count INTEGER DEFAULT 0,
+      claim_job_id TEXT,
+      claim_pid INTEGER,
+      claim_pgid INTEGER,
+      claim_updated_at TEXT,
+      reroute_count INTEGER DEFAULT 0,
+      terminal_reroute_count INTEGER DEFAULT 0,
+      ledger_concession_count INTEGER DEFAULT 0,
+      claim_invalidated_by TEXT,
+      conditional_condition TEXT,
+      auto_completed INTEGER NOT NULL DEFAULT 0,
+      auto_complete_reason TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE stories (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES runs(id),
+      story_index INTEGER NOT NULL,
+      story_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      acceptance_criteria TEXT NOT NULL DEFAULT '[]',
+      status TEXT NOT NULL DEFAULT 'pending',
+      output TEXT,
+      retry_count INTEGER DEFAULT 0,
+      max_retries INTEGER DEFAULT 4,
+      abandoned_count INTEGER DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    INSERT INTO runs (
+      id, run_number, workflow_id, task, status, context, tokens_spent,
+      worker_lost_count, ceiling_expiry_count, instant_fail_count,
+      created_at, updated_at
+    ) VALUES (
+      'legacy-run', 1, 'workflow', 'task', 'running', '{}', 0, 0, 0, 0,
+      '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+    );
+    INSERT INTO stories (
+      id, run_id, story_index, story_id, title, status, retry_count,
+      max_retries, abandoned_count, created_at, updated_at
+    ) VALUES
+      ('legacy-story-1', 'legacy-run', 0, 'US-001', 'Story one', 'done', 1, 4, 0,
+       '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'),
+      ('legacy-story-2', 'legacy-run', 1, 'US-002', 'Story two', 'pending', 0, 4, 0,
+       '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z');
+  `;
+
+  function runInSubprocess(
+    th: { homeDir: string },
+    dbPath: string,
+    script: string,
+  ): string {
+    return execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+      cwd: distDir(),
+      env: {
+        HOME: th.homeDir,
+        TAMANDUA_DB_PATH: dbPath,
+        TAMANDUA_TEST_GUARD: "1",
+        PATH: process.env.PATH ?? "",
+      },
+      encoding: "utf-8",
+    }).trim();
+  }
+
+  before(() => {
+    origHome = process.env.HOME;
+    origDbPath = process.env.TAMANDUA_DB_PATH;
+  });
+
+  after(() => {
+    if (origHome) {
+      process.env.HOME = origHome;
+    } else {
+      delete process.env.HOME;
+    }
+    if (origDbPath) {
+      process.env.TAMANDUA_DB_PATH = origDbPath;
+    } else {
+      delete process.env.TAMANDUA_DB_PATH;
+    }
+  });
+
+  it("fresh DB: stories table has resume_reset_count INTEGER NOT NULL DEFAULT 0", () => {
+    const th = createTempHome("tamandua-yse-fresh-");
+    const dbPath = path.join(th.root, "fresh.db");
+    const script = [
+      `import { getDb, SCHEMA_VERSION } from ${JSON.stringify(path.join(distDir(), "db.js"))};`,
+      "const db = getDb();",
+      'const col = db.prepare("PRAGMA table_info(stories)").all().find((c) => c.name === "resume_reset_count");',
+      'const ver = db.prepare("PRAGMA user_version").get();',
+      "console.log(JSON.stringify({ col, user_version: ver.user_version }));",
+    ].join("\n");
+
+    const result = runInSubprocess(th, dbPath, script);
+    const parsed = JSON.parse(result) as {
+      col?: { type: string; notnull: number; dflt_value: string | null };
+      user_version: number;
+    };
+
+    assert.equal(parsed.user_version, SCHEMA_VERSION,
+      `fresh DB should be stamped at ${SCHEMA_VERSION}`);
+    assert.ok(parsed.col, "resume_reset_count column should exist on a fresh DB");
+    assert.equal(parsed.col.type, "INTEGER", "resume_reset_count should be INTEGER");
+    assert.equal(parsed.col.notnull, 1, "resume_reset_count should be NOT NULL");
+    assert.equal(parsed.col.dflt_value, "0", "resume_reset_count should default to 0");
+  });
+
+  it("migrates a pre-YSE (v7) DB: adds resume_reset_count, pre-existing rows read back 0", () => {
+    const PRE_YSE_SCHEMA_VERSION = SCHEMA_VERSION - 1;
+
+    const th = createTempHome("tamandua-yse-migrate-");
+    const dbPath = path.join(th.root, "legacy.db");
+    const legacyDb = new DatabaseSync(dbPath);
+    legacyDb.exec(`
+      ${LEGACY_V7_DDL}
+      PRAGMA user_version = ${PRE_YSE_SCHEMA_VERSION};
+    `);
+    // Sanity: the legacy DB really is in the pre-YSE state (the exact broken
+    // state a real pre-v8 install carries: user_version at the pre-bump value
+    // with a stories table lacking the column).
+    const preCols = legacyDb.prepare("PRAGMA table_info(stories)").all() as Array<{ name: string }>;
+    assert.ok(preCols.some((c) => c.name === "abandoned_count"), "precondition: legacy stories has abandoned_count");
+    assert.ok(!preCols.some((c) => c.name === "resume_reset_count"), "precondition: legacy stories lacks resume_reset_count");
+    const preVer = legacyDb.prepare("PRAGMA user_version").get() as { user_version: number };
+    assert.equal(preVer.user_version, PRE_YSE_SCHEMA_VERSION, "precondition: user_version is the pre-bump version");
+    legacyDb.close();
+
+    // Spawn a fresh subprocess so getDb() runs migrate() from scratch on the legacy file.
+    const script = [
+      `import { getDb, SCHEMA_VERSION } from ${JSON.stringify(path.join(distDir(), "db.js"))};`,
+      "const db = getDb();",
+      'const col = db.prepare("PRAGMA table_info(stories)").all().find((c) => c.name === "resume_reset_count");',
+      'const ver = db.prepare("PRAGMA user_version").get();',
+      // SELECT exercising the new column — must not throw and must read 0.
+      'const rows = db.prepare("SELECT id, resume_reset_count FROM stories WHERE run_id = ? ORDER BY story_index ASC").all("legacy-run");',
+      "console.log(JSON.stringify({ col, user_version: ver.user_version, rows }));",
+    ].join("\n");
+
+    const result = runInSubprocess(th, dbPath, script);
+    const migrated = JSON.parse(result) as {
+      col?: { type: string; notnull: number; dflt_value: string | null };
+      user_version: number;
+      rows: Array<{ id: string; resume_reset_count: number }>;
+    };
+
+    assert.ok(migrated.col, "resume_reset_count column should be added by migration");
+    assert.equal(migrated.col.type, "INTEGER", "resume_reset_count should be INTEGER");
+    assert.equal(migrated.col.notnull, 1, "resume_reset_count should be NOT NULL");
+    assert.equal(migrated.col.dflt_value, "0", "resume_reset_count should default to 0");
+    assert.equal(migrated.user_version, SCHEMA_VERSION,
+      `legacy DB should be re-stamped to ${SCHEMA_VERSION} (not stuck at the pre-bump version)`);
+    assert.deepEqual(migrated.rows, [
+      { id: "legacy-story-1", resume_reset_count: 0 },
+      { id: "legacy-story-2", resume_reset_count: 0 },
+    ], "pre-existing story rows read back resume_reset_count = 0 after migration");
+  });
+
+  it("migration is idempotent: repeated migration does not duplicate the column", () => {
+    const PRE_YSE_SCHEMA_VERSION = SCHEMA_VERSION - 1;
+
+    const th = createTempHome("tamandua-yse-idempotent-");
+    const dbPath = path.join(th.root, "legacy.db");
+    const legacyDb = new DatabaseSync(dbPath);
+    legacyDb.exec(`
+      ${LEGACY_V7_DDL}
+      PRAGMA user_version = ${PRE_YSE_SCHEMA_VERSION};
+    `);
+    legacyDb.close();
+
+    const script = [
+      `import { getDb } from ${JSON.stringify(path.join(distDir(), "db.js"))};`,
+      "const db = getDb();",
+      'const count = db.prepare("PRAGMA table_info(stories)").all().filter((c) => c.name === "resume_reset_count").length;',
+      'const ver = db.prepare("PRAGMA user_version").get();',
+      "console.log(JSON.stringify({ count, user_version: ver.user_version }));",
+    ].join("\n");
+
+    // Migrate twice (two separate subprocesses) — second run must not error or duplicate.
+    const first = JSON.parse(runInSubprocess(th, dbPath, script)) as {
+      count: number;
+      user_version: number;
+    };
+    const second = JSON.parse(runInSubprocess(th, dbPath, script)) as {
+      count: number;
+      user_version: number;
+    };
+    assert.equal(first.count, 1, "resume_reset_count should appear exactly once after first migration");
+    assert.equal(second.count, 1, "resume_reset_count must not be duplicated by repeated migration");
+    assert.equal(second.user_version, SCHEMA_VERSION,
+      "repeated migration should keep user_version stamped at SCHEMA_VERSION");
   });
 });
 

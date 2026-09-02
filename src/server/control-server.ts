@@ -31,7 +31,7 @@ import { getDb } from "../db.js";
 import { emitEvent } from "../installer/events.js";
 import type { TamanduaEvent } from "../installer/events.js";
 import { validateRunHarnessForScheduling } from "../installer/run-harness.js";
-import { parseRunContext, setRunContextKey } from "../installer/step-ops.js";
+import { parseRunContext, setRunContextKey, removeRunContextKey } from "../installer/step-ops.js";
 
 export const DEFAULT_CONTROL_PORT = 3339;
 const DEFAULT_MAX_ACTIVE_TIMERS = 50;
@@ -1032,6 +1032,13 @@ async function handleResumeRun(runId: string, requestedBy = "unknown"): Promise<
   if (run.status === "running" && run.scheduling_status === "active") {
     return ok({ state: "active" });
   }
+  // PAUS US-003: a pending drain (pause --drain in progress) leaves the run
+  // status 'running' with scheduling_status 'draining_pause'. A plain resume
+  // must CANCEL that pending drain — clear the pause_drain marker atomically
+  // with the status flip, emit an audit event, and surface drainCancelled to
+  // callers — instead of silently dropping the marker so a later drain
+  // finalization could pause the run out from under the resume.
+  const cancelledDrain = run.scheduling_status === "draining_pause";
 
   logger.info("control-server: resume requested", { runId, requestedBy });
 
@@ -1063,6 +1070,13 @@ async function handleResumeRun(runId: string, requestedBy = "unknown"): Promise<
         "UPDATE runs SET status = 'running', scheduling_status = 'pending_register', scheduling_requested_at = ?, scheduling_error = NULL, updated_at = datetime('now') WHERE id = ?",
       )
       .run(new Date().toISOString(), runId);
+    if (cancelledDrain) {
+      // Cancel the pending drain in the same synchronous DB section as the
+      // status flip (no awaits between the UPDATE and this context rewrite),
+      // so the marker can never half-exist with scheduling_status already
+      // flipped out of draining_pause.
+      removeRunContextKey(runId, "pause_drain");
+    }
   } catch {
     /* best-effort */
   }
@@ -1082,6 +1096,17 @@ async function handleResumeRun(runId: string, requestedBy = "unknown"): Promise<
   // workflow_id we have.
   const wfId = run.workflow_id ||
     (getRun(runId)?.workflow_id ?? undefined);
+
+  // PAUS US-003: audit a cancelled pending drain before run.resumed.
+  if (cancelledDrain) {
+    emitEvent({
+      ts: new Date().toISOString(),
+      event: "run.drain_cancelled_by_resume",
+      runId,
+      workflowId: wfId,
+      detail: JSON.stringify({ requestedBy }),
+    });
+  }
 
   emitEvent({
     ts: new Date().toISOString(),
@@ -1114,7 +1139,19 @@ async function handleResumeRun(runId: string, requestedBy = "unknown"): Promise<
     });
   }
 
-  return handleRegisterRun(runId);
+  // PAUS US-003: extend the register result so callers can tell a pending
+  // drain was cancelled. Only draining_pause resumes carry the flag, and only
+  // on success (2xx) — a failed admission keeps its error body untouched.
+  const registered = await handleRegisterRun(runId);
+  if (
+    cancelledDrain
+    && registered.status >= 200
+    && registered.status < 300
+    && typeof registered.body.error === "undefined"
+  ) {
+    return ok({ ...registered.body, drainCancelled: true }, registered.status);
+  }
+  return registered;
 }
 
 async function handleNudge(): Promise<JsonResponse> {

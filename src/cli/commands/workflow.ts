@@ -24,6 +24,7 @@ import type { HarnessType } from "../../installer/types.js";
 import { printWorkflowAutoresearch } from "./autoresearch.js";
 import { handleWait, getWaitHelp } from "./wait.js";
 import { detectWrongPrefix, stripIdPrefix, prefixRunId, prefixStepId } from "../../lib/id-prefix.js";
+import { displayStoryStatus } from "../../lib/step-display.js";
 import { getInstantFailBackoffThreshold, getInstantFailWallThresholdMs } from "../../installer/instant-fail.js";
 
 export function getWorkflowListHelp(): string {
@@ -212,6 +213,9 @@ Output includes:
   Tokens       Total tokens spent
   Workspace    Workspace mode (only shown for worktree runs)
   Steps        Per-step listing with step ID, status icon, and agent role
+  Stories      Per-story listing with a status label; a story that a resume
+               re-queued from FAILED shows as "pending (reset on resume, N
+               prior failure[s])" while its stored status stays pending
   Red-ledger landing
                Ledger row, non-zero exit code, and suite timestamp when a
                default-mode merge landed over known red suite evidence
@@ -230,7 +234,8 @@ Options:
             worktreePath, worktreeOriginRef, steps array (stepId, stepIndex,
             agentRole, status, displayStatus, retryCount, abandonedCount, rerouteCount, claimPid,
             claimUpdatedAt, updatedAt), stories array (storyId, title, status,
-            abandonedCount), and optional redLedgerLanding evidence. Step outputs
+            resumeResetCount, priorFailureCount (when > 0), abandonedCount),
+            and optional redLedgerLanding evidence. Step outputs
             are NOT included.
 
 Examples:
@@ -298,21 +303,27 @@ export function getWorkflowResumeHelp(): string {
 
 Usage: tamandua workflow resume <run-id>
 
-Resumes a workflow run that is paused or has failed. The run-id accepts
-prefix matching.
+Resumes a workflow run that is paused, mid-drain, or has failed. The run-id
+accepts prefix matching.
 
 Behavior by status:
   paused    Connects to the daemon and resumes agent polling.
             The daemon must be running for this to work.
+  running   Resumable only while a pause --drain is still in progress
+            (scheduling draining_pause): the plain resume CANCELS the
+            pending drain and proceeds, printing a warning that a drain
+            was in progress and is being cancelled. Other running runs
+            are already active and do not need to be resumed.
   failed    Restarts the run from the failed step, creating a new run
             entry. The daemon is notified of the new run automatically.
+            For loop-over-stories runs, every FAILED story is re-queued
+            to pending with a fresh verification retry budget so the
+            loop can pick it up again and the run can complete.
   Other     Terminal runs (completed, canceled) cannot be resumed.
-            Runs with status "running" are already active and do not
-            need to be resumed.
 
 Examples:
   tamandua workflow resume run-abc12345   # Resume a paused run
-  tamandua workflow resume run-abc12345   # Re-start a failed run`;
+  tamandua workflow resume run-abc12345   # Cancel a pending drain / re-start a failed run`;
 }
 
 export function getWorkflowPauseAllHelp(): string {
@@ -572,15 +583,24 @@ export async function handleWorkflow(
     if (wrongPrefix) { process.stderr.write(`${wrongPrefix}\n`); process.exit(1); }
     let fullId: string;
     let runStatus: string;
+    let schedulingStatus: string | null | undefined;
     try {
       const detail = getWorkflowStatus(target);
       fullId = detail.id;
       runStatus = detail.status;
+      schedulingStatus = detail.schedulingStatus ?? null;
     } catch (err) {
       process.stderr.write(`${err instanceof Error ? err.message : String(err)}\n`);
       process.exit(1);
     }
-    if (runStatus === "paused") {
+    // PAUS US-004: a run mid-drain (pause --drain still in progress) keeps
+    // status 'running' with schedulingStatus 'draining_pause'. A plain
+    // resume must accept it and CANCEL the pending drain: the control plane
+    // flips the run and reports drainCancelled in the 2xx body. Runs that
+    // are simply paused follow the same daemon path; all other 'running'
+    // runs stay refused below.
+    const drainPending = runStatus === "running" && schedulingStatus === "draining_pause";
+    if (runStatus === "paused" || drainPending) {
       const response = await resumeRunWithDaemon(fullId, cliIdentity);
       if (response === null) {
         process.stderr.write("Daemon is unreachable. Is the daemon running? Try: tamandua daemon start\n");
@@ -590,6 +610,12 @@ export async function handleWorkflow(
         const errMsg = typeof response.body.error === "string" ? response.body.error : "Unknown error";
         process.stderr.write(`Failed to resume run: ${errMsg}\n`);
         process.exit(1);
+      }
+      // PAUS US-004: surface a cancelled pending drain as an operator
+      // warning. Only a resume that actually cancelled a drain carries the
+      // flag — a paused run whose drain already finished resumes without it.
+      if (drainPending && response.body && response.body.drainCancelled === true) {
+        process.stderr.write(`Warning: run run-${fullId.slice(0, 8)} had a pending drain in progress; plain resume cancels the drain.\n`);
       }
       console.log(`Resumed run run-${fullId.slice(0, 8)}.`);
       printNonDoneStepStates(fullId);
@@ -611,6 +637,10 @@ export async function handleWorkflow(
       }
       if (result.status === "not_found") { console.log(`No failed run found matching "${target}".`); return true; }
       console.log(`Resumed run run-${result.runId!.slice(0, 8)} (${result.workflowId}), restarting from step: ${result.stepId}`);
+      // YSE US-002: re-queue confirmation when resume reset FAILED stories.
+      if (result.resetCount !== undefined && result.resetCount > 0) {
+        console.log(`Reset ${result.resetCount} failed ${result.resetCount === 1 ? "story" : "stories"} to pending for resume.`);
+      }
       printNonDoneStepStates(result.runId!);
       return true;
     }
@@ -818,7 +848,13 @@ export async function handleWorkflow(
             storyId: s.storyId,
             title: s.title,
             status: s.status,
+            // YSE US-005: machine-readable reset-on-resume counters. status
+            // stays the RAW stored value; resumeResetCount (0 when the story
+            // was never reset) and priorFailureCount (only when > 0) expose
+            // the reset history.
+            resumeResetCount: s.resumeResetCount,
           };
+          if (s.resumeResetCount > 0) entry.priorFailureCount = s.resumeResetCount;
           if (s.abandonedCount !== undefined) entry.abandonedCount = s.abandonedCount;
           if (s.updatedAt !== undefined) entry.updatedAt = s.updatedAt;
           return entry;
@@ -835,6 +871,9 @@ export async function handleWorkflow(
           updatedAt: result.updatedAt,
           steps: jsonSteps,
         };
+        // PAUS US-004: surface the daemon-side scheduling state (e.g.
+        // draining_pause) machine-readably when it is set.
+        if (result.schedulingStatus) jsonOutput.schedulingStatus = result.schedulingStatus;
         if (jsonStories) jsonOutput.stories = jsonStories;
         if (result.redLedgerLanding) jsonOutput.redLedgerLanding = result.redLedgerLanding;
         if (result.workspace_mode === "worktree") {
@@ -883,6 +922,17 @@ export async function handleWorkflow(
         console.log(`${icon} ${prefixStepId(step.stepId)} (${step.agentId.split("_").slice(-1)[0]})`);
         if (step.status === "failed" && step.output) {
           console.log(`         ${step.output}`);
+        }
+      }
+      // YSE US-005: stories listing with the presentation-only display
+      // label. A story that a resume re-queued from FAILED shows as
+      // 'pending (reset on resume, N prior failure[s])' — the stored status
+      // stays 'pending', only the label differs.
+      if (result.stories && result.stories.length > 0) {
+        console.log(`Stories:`);
+        for (const story of result.stories) {
+          const label = displayStoryStatus({ status: story.status, resumeResetCount: story.resumeResetCount });
+          console.log(`  ${story.storyId} [${label}] ${story.title}`);
         }
       }
     } catch (err) {

@@ -816,8 +816,108 @@ export function getStories(runId: string): Story[] {
     retryCount: r.retry_count,
     maxRetries: r.max_retries,
     abandonedCount: r.abandoned_count ?? undefined,
+    resumeResetCount: r.resume_reset_count ?? 0,
     updatedAt: r.updated_at ?? undefined,
   }));
+}
+
+/**
+ * YSE US-002: re-queue every FAILED story of a loop-over-stories run as
+ * PENDING with a fresh verification retry budget on resume.
+ *
+ * Called from resumeWorkflow (src/installer/run.ts) when a failed run is
+ * resumed. A failed loop run (run #826 regression) leaves the story that
+ * exhausted its verification retries in 'failed' — plain resume never
+ * reset it, so once the remaining PENDING stories ran out the loop
+ * terminal-failed again with "Loop has failed stories and no pending
+ * stories". This helper returns those stories to the pool so the loop
+ * picks them up on the first claim after resume.
+ *
+ * Semantics (deterministic, DB-only — no daemon interaction):
+ *  - Locates the run's first loop-over-stories step (type='loop' AND
+ *    parsed loop_config.over === 'stories').
+ *  - Resets every story with status 'failed' for the run:
+ *    status → 'pending', retry_count → 0 (fresh verification retry
+ *    budget; max_retries stays unchanged), output → NULL (stale failure
+ *    text must not re-surface), resume_reset_count += 1.
+ *  - Emits one story.reset_for_resume event per reset carrying the loop
+ *    step's step_id, storyId/storyTitle, and priorFailures equal to the
+ *    post-increment resume_reset_count (1 on the first reset, 2 on the
+ *    second, ...). Failure history stays in the event stream; no new
+ *    audit table is needed.
+ *  - Stories already 'done' or 'pending' are never touched; a run with
+ *    no loop-over-stories step, or no failed stories, is a no-op.
+ *
+ * @returns the number of stories reset (0 when nothing was reset).
+ */
+export function resetFailedStoriesForResume(runId: string): { resetCount: number } {
+  const db = getDb();
+
+  // Legacy-DB guard: a DB whose steps table predates the loop_config column
+  // cannot contain a loop-over-stories step — resume must no-op there, not
+  // throw on an unknown column. (Product DBs always have the column.)
+  const stepCols = db.prepare("PRAGMA table_info(steps)").all() as Array<{ name: string }>;
+  if (!stepCols.some((c) => c.name === "loop_config")) return { resetCount: 0 };
+
+  // 1. Locate the run's loop-over-stories step (first by pipeline order).
+  const loopStep = db.prepare(
+    `SELECT step_id, loop_config FROM steps
+     WHERE run_id = ? AND type = 'loop' AND loop_config IS NOT NULL
+     ORDER BY step_index ASC LIMIT 1`,
+  ).get(runId) as { step_id: string; loop_config: string } | undefined;
+
+  let overStories = false;
+  if (loopStep) {
+    try {
+      const parsed = JSON.parse(loopStep.loop_config) as { over?: string };
+      overStories = parsed?.over === "stories";
+    } catch {
+      overStories = false; // malformed loop_config — treat as not a stories loop
+    }
+  }
+  if (!loopStep || !overStories) return { resetCount: 0 };
+
+  // 2. Failed stories for this run (deterministic story order).
+  const failedStories = db.prepare(
+    `SELECT id, story_id, title, resume_reset_count FROM stories
+     WHERE run_id = ? AND status = 'failed' ORDER BY story_index ASC`,
+  ).all(runId) as Array<{
+    id: string; story_id: string; title: string; resume_reset_count: number;
+  }>;
+
+  if (failedStories.length === 0) return { resetCount: 0 };
+
+  const workflowId = getWorkflowId(runId);
+  const resetOne = db.prepare(
+    `UPDATE stories
+     SET status = 'pending', retry_count = 0, output = NULL,
+         resume_reset_count = resume_reset_count + 1, updated_at = datetime('now')
+     WHERE id = ? AND status = 'failed'`,
+  );
+
+  let resetCount = 0;
+  for (const story of failedStories) {
+    const result = resetOne.run(story.id);
+    // Guard against a concurrent claim flipping the row between the SELECT
+    // and the UPDATE — only rows still 'failed' are reset.
+    if ((result.changes ?? 0) <= 0) continue;
+
+    const priorFailures = story.resume_reset_count + 1; // post-increment (1 on first reset)
+    resetCount += 1;
+    emitEvent({
+      ts: new Date().toISOString(),
+      event: "story.reset_for_resume",
+      runId,
+      workflowId,
+      stepId: loopStep.step_id,
+      storyId: story.story_id,
+      storyTitle: story.title,
+      priorFailures,
+      detail: `Story ${story.story_id} reset to pending for resume (prior failures: ${priorFailures})`,
+    });
+  }
+
+  return { resetCount };
 }
 
 /**
@@ -860,6 +960,7 @@ export function getCurrentStory(stepId: string): Story | null {
     output: row.output ?? undefined,
     retryCount: row.retry_count,
     maxRetries: row.max_retries,
+    resumeResetCount: row.resume_reset_count ?? 0,
   };
 }
 
@@ -2132,6 +2233,24 @@ export function setRunContextKey(runId: string, key: string, value: string): voi
   if (!run) return;
   const context: Record<string, string> = parseRunContext(runId, run.context);
   context[key] = value;
+  db.prepare("UPDATE runs SET context = ?, updated_at = datetime('now') WHERE id = ?").run(JSON.stringify(context), runId);
+}
+
+/**
+ * Remove a key from a run's context JSON field (a context rewrite that
+ * deletes instead of setting). No-op when the run is missing or the key is
+ * absent. Synchronous, like setRunContextKey, so callers can perform a
+ * status UPDATE and a marker clear with no await in between (PAUS US-003:
+ * a cancelled pending drain must never half-exist with the marker cleared
+ * but scheduling_status still 'draining_pause', or vice versa).
+ */
+export function removeRunContextKey(runId: string, key: string): void {
+  const db = getDb();
+  const run = db.prepare("SELECT context FROM runs WHERE id = ?").get(runId) as { context: string } | undefined;
+  if (!run) return;
+  const context: Record<string, string> = parseRunContext(runId, run.context);
+  if (!(key in context)) return;
+  delete context[key];
   db.prepare("UPDATE runs SET context = ?, updated_at = datetime('now') WHERE id = ?").run(JSON.stringify(context), runId);
 }
 

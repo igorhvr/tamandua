@@ -81,6 +81,11 @@ export type Story = {
   retryCount: number;
   maxRetries: number;
   abandonedCount?: number;
+  /** YSE: how many times a workflow resume has re-queued this story from
+   *  FAILED back to pending (stories.resume_reset_count). Equals the number
+   *  of prior failure episodes; 0/absent means the story has never been
+   *  reset on resume. */
+  resumeResetCount?: number;
   updatedAt?: string;
 };
 

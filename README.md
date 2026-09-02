@@ -560,7 +560,7 @@ If something isn't working as expected, start with the built-in diagnostic:
 | `tamandua workflow status <query>` | Check run status |
 | `tamandua workflow runs` | List all runs |
 | `tamandua workflow wait <selector...> [--all] [--timeout <dur>] [--json] [--quiet]` | Block until selected runs reach terminal status |
-| `tamandua workflow resume <run-id>` | Resume a failed or paused run |
+| `tamandua workflow resume <run-id>` | Resume a paused, failed, or drain-pending run (re-queues failed loop stories; a plain resume cancels a pending `pause --drain`) |
 | `tamandua workflow stop <run-id>` | Stop/cancel a running workflow |
 | `tamandua workflow cancel <run-id>` | Alias for stop — cancels a running workflow |
 | `tamandua workflow delete <run-id> [--force]` | Permanently delete a workflow run and associated data |

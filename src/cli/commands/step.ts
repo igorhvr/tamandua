@@ -24,6 +24,7 @@ import {
   validateExpects,
 } from "../../installer/step-ops.js";
 import { detectWrongPrefix, prefixRunId, prefixStepId, stripIdPrefix } from "../../lib/id-prefix.js";
+import { displayStoryStatus } from "../../lib/step-display.js";
 
 interface CompletionEvidenceStep {
   id: string;
@@ -234,7 +235,9 @@ Usage: tamandua step stories <run-id> [--json]
 
 step stories displays every story in the current story plan for a run,
 showing their status (pending, running, done, failed), title, and any
-retry counts.
+retry counts. A story that a resume re-queued from FAILED shows as
+"pending (reset on resume, N prior failure[s])" — its stored status stays
+pending; only the display label differs.
 
 Options:
   --json    Output a JSON object with runId and stories array for
@@ -244,6 +247,7 @@ Output format:
   US-001   [done   ] Story title here
   US-002   [running] Another story
   US-003   [pending] Upcoming story (retry 1)
+  US-004   [pending (reset on resume, 1 prior failure)] Requeued story
 
 Examples:
   tamandua step stories run-abc12345
@@ -653,7 +657,8 @@ export async function handleStep(group: string, args: string[]): Promise<boolean
       return true;
     }
     for (const story of stories) {
-      console.log(`${story.storyId.padEnd(8)} [${story.status.padEnd(7)}] ${story.title}${story.retryCount > 0 ? ` (retry ${story.retryCount})` : ""}`);
+      const label = displayStoryStatus({ status: story.status, resumeResetCount: story.resumeResetCount });
+      console.log(`${story.storyId.padEnd(8)} [${label.padEnd(7)}] ${story.title}${story.retryCount > 0 ? ` (retry ${story.retryCount})` : ""}`);
     }
     return true;
   }

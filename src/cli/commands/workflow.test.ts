@@ -718,4 +718,263 @@ Examples:
       assert.doesNotMatch(output, /Worker lost/);
     });
   });
+
+  // ══════════════════════════════════════════════════════════════════
+  // PAUS US-004: schedulingStatus exposure for drain-pending runs
+  // ══════════════════════════════════════════════════════════════════
+  // A run mid-drain (pause --drain in progress) keeps status 'running'
+  // with scheduling_status 'draining_pause'. getWorkflowStatus must expose
+  // that scheduling state so the CLI resume path can tell a drain-pending
+  // run (resumable, cancels the drain) from a plain active run (refused).
+
+  describe("PAUS US-004: schedulingStatus exposure (in-process with temp DB)", () => {
+    let tempDir: string;
+    let dbPath: string;
+    let db: DatabaseSync;
+    let originalDbPath: string | undefined;
+    let originalHome: string | undefined;
+    let originalStateDir: string | undefined;
+
+    beforeEach(() => {
+      originalDbPath = process.env.TAMANDUA_DB_PATH;
+      originalHome = process.env.HOME;
+      originalStateDir = process.env.TAMANDUA_STATE_DIR;
+
+      const setup = setupTempDb();
+      tempDir = setup.tempDir;
+      dbPath = setup.dbPath;
+      db = setup.db;
+
+      process.env.TAMANDUA_DB_PATH = dbPath;
+      process.env.HOME = tempDir;
+      process.env.TAMANDUA_STATE_DIR = join(tempDir, ".tamandua");
+    });
+
+    afterEach(() => {
+      if (originalDbPath) process.env.TAMANDUA_DB_PATH = originalDbPath;
+      else delete process.env.TAMANDUA_DB_PATH;
+      if (originalHome) process.env.HOME = originalHome;
+      else delete process.env.HOME;
+      if (originalStateDir) process.env.TAMANDUA_STATE_DIR = originalStateDir;
+      else delete process.env.TAMANDUA_STATE_DIR;
+
+      db.close();
+      try { rmSync(tempDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    });
+
+    function seedRun(runId: string, status: string, schedulingStatus: string | null): void {
+      db.prepare(
+        "INSERT INTO runs (id, workflow_id, task, status, context, scheduling_status) VALUES (?, 'test', 'task', ?, '{}', ?)",
+      ).run(runId, status, schedulingStatus);
+    }
+
+    async function captureStatusOutput(runId: string, extraArgs: string[] = []): Promise<string> {
+      let output = "";
+      const origLog = console.log;
+      console.log = (...chunks: unknown[]) => {
+        output += chunks.map((c) => String(c)).join(" ") + "\n";
+      };
+      try {
+        await handleWorkflow("workflow", ["workflow", "status", runId, ...extraArgs], () => {});
+      } finally {
+        console.log = origLog;
+      }
+      return output;
+    }
+
+    it("getWorkflowStatus exposes schedulingStatus 'draining_pause' for a mid-drain run", async () => {
+      const runId = crypto.randomUUID();
+      seedRun(runId, "running", "draining_pause");
+
+      const { getWorkflowStatus } = await import("../../../dist/installer/status.js");
+      const detail = getWorkflowStatus(`run-${runId}`);
+      assert.equal(detail.status, "running");
+      assert.equal(detail.schedulingStatus, "draining_pause");
+    });
+
+    it("getWorkflowStatus exposes schedulingStatus 'active' for a normally scheduled run", async () => {
+      const runId = crypto.randomUUID();
+      seedRun(runId, "running", "active");
+
+      const { getWorkflowStatus } = await import("../../../dist/installer/status.js");
+      const detail = getWorkflowStatus(`run-${runId}`);
+      assert.equal(detail.schedulingStatus, "active");
+    });
+
+    it("getWorkflowStatus schedulingStatus is null when the run has no scheduling state", async () => {
+      const runId = crypto.randomUUID();
+      seedRun(runId, "paused", null);
+
+      const { getWorkflowStatus } = await import("../../../dist/installer/status.js");
+      const detail = getWorkflowStatus(`run-${runId}`);
+      assert.equal(detail.schedulingStatus, null);
+    });
+
+    it("workflow status --json mirrors schedulingStatus for a drain-pending run", async () => {
+      const runId = crypto.randomUUID();
+      seedRun(runId, "running", "draining_pause");
+
+      const output = await captureStatusOutput(runId, ["--json"]);
+      const parsed = JSON.parse(output.trim());
+      assert.equal(parsed.status, "running");
+      assert.equal(parsed.schedulingStatus, "draining_pause");
+    });
+
+    it("workflow status --json omits schedulingStatus when no scheduling state is set", async () => {
+      const runId = crypto.randomUUID();
+      seedRun(runId, "paused", null);
+
+      const output = await captureStatusOutput(runId, ["--json"]);
+      const parsed = JSON.parse(output.trim());
+      assert.ok(!("schedulingStatus" in parsed), "no schedulingStatus key expected for a null scheduling run");
+    });
+  });
+
+  // ══════════════════════════════════════════════════════════════════
+  // YSE US-005: workflow status shows reset-on-resume stories distinctly
+  // ══════════════════════════════════════════════════════════════════
+  // A story that a resume re-queued from FAILED is stored with status
+  // 'pending' and stories.resume_reset_count > 0. The status text output
+  // must annotate it ('pending (reset on resume, N prior failure[s])')
+  // while leaving the stored status untouched; --json must carry
+  // machine-readable resumeResetCount / priorFailureCount.
+
+  describe("YSE US-005: reset-on-resume story display (in-process with temp DB)", () => {
+    let tempDir: string;
+    let dbPath: string;
+    let db: DatabaseSync;
+    let originalDbPath: string | undefined;
+    let originalHome: string | undefined;
+    let originalStateDir: string | undefined;
+
+    beforeEach(() => {
+      originalDbPath = process.env.TAMANDUA_DB_PATH;
+      originalHome = process.env.HOME;
+      originalStateDir = process.env.TAMANDUA_STATE_DIR;
+
+      const setup = setupTempDb();
+      tempDir = setup.tempDir;
+      dbPath = setup.dbPath;
+      db = setup.db;
+
+      process.env.TAMANDUA_DB_PATH = dbPath;
+      process.env.HOME = tempDir;
+      process.env.TAMANDUA_STATE_DIR = join(tempDir, ".tamandua");
+    });
+
+    afterEach(() => {
+      if (originalDbPath) process.env.TAMANDUA_DB_PATH = originalDbPath;
+      else delete process.env.TAMANDUA_DB_PATH;
+      if (originalHome) process.env.HOME = originalHome;
+      else delete process.env.HOME;
+      if (originalStateDir) process.env.TAMANDUA_STATE_DIR = originalStateDir;
+      else delete process.env.TAMANDUA_STATE_DIR;
+
+      db.close();
+      try { rmSync(tempDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    });
+
+    /** Add stories.resume_reset_count if the hand-rolled fixture table lacks it. */
+    function ensureResumeResetCount(): void {
+      const cols = db.prepare("PRAGMA table_info(stories)").all() as Array<{ name: string }>;
+      if (!cols.some((c) => c.name === "resume_reset_count")) {
+        db.exec("ALTER TABLE stories ADD COLUMN resume_reset_count INTEGER NOT NULL DEFAULT 0");
+      }
+    }
+
+    function seedStoryRun(
+      runId: string,
+      stories: Array<{ storyId: string; title: string; status: string; resumeResetCount: number }>,
+    ): void {
+      db.prepare(
+        "INSERT INTO runs (id, workflow_id, task, status, context) VALUES (?, 'test', 'task', 'running', '{}')",
+      ).run(runId);
+      ensureResumeResetCount();
+      const insertStory = db.prepare(
+        `INSERT INTO stories (id, run_id, story_id, title, description, acceptance_criteria, status, retry_count, story_index, resume_reset_count, created_at, updated_at)
+         VALUES (?, ?, ?, ?, '', '[]', ?, 0, ?, ?, datetime('now'), datetime('now'))`,
+      );
+      stories.forEach((s, idx) => {
+        insertStory.run(crypto.randomUUID(), runId, s.storyId, s.title, s.status, idx, s.resumeResetCount);
+      });
+    }
+
+    async function captureStatusOutput(runId: string, extraArgs: string[] = []): Promise<string> {
+      let output = "";
+      const origLog = console.log;
+      console.log = (...chunks: unknown[]) => {
+        output += chunks.map((c) => String(c)).join(" ") + "\n";
+      };
+      try {
+        await handleWorkflow("workflow", ["workflow", "status", runId, ...extraArgs], () => {});
+      } finally {
+        console.log = origLog;
+      }
+      return output;
+    }
+
+    it("getWorkflowStatus exposes resumeResetCount per story (0 for never-reset, 1 for reset)", async () => {
+      const runId = crypto.randomUUID();
+      seedStoryRun(runId, [
+        { storyId: "US-001", title: "Fresh story", status: "pending", resumeResetCount: 0 },
+        { storyId: "US-002", title: "Reset story", status: "pending", resumeResetCount: 1 },
+      ]);
+
+      const { getWorkflowStatus } = await import("../../../dist/installer/status.js");
+      const detail = getWorkflowStatus(`run-${runId}`);
+      const stories = detail.stories!;
+      assert.equal(stories.length, 2);
+      const fresh = stories.find((s) => s.storyId === "US-001")!;
+      const reset = stories.find((s) => s.storyId === "US-002")!;
+      assert.equal(fresh.resumeResetCount, 0);
+      assert.equal(reset.resumeResetCount, 1);
+      // stored status stays the raw value — never mutated for display
+      assert.equal(reset.status, "pending");
+    });
+
+    it("workflow status text annotates a reset story and leaves plain pending stories unannotated", async () => {
+      const runId = crypto.randomUUID();
+      seedStoryRun(runId, [
+        { storyId: "US-001", title: "Done story", status: "done", resumeResetCount: 0 },
+        { storyId: "US-002", title: "Fresh pending", status: "pending", resumeResetCount: 0 },
+        { storyId: "US-003", title: "Reset story", status: "pending", resumeResetCount: 1 },
+        { storyId: "US-004", title: "Twice reset story", status: "pending", resumeResetCount: 2 },
+      ]);
+
+      const output = await captureStatusOutput(runId);
+      assert.match(output, /^Stories:$/m);
+      // AC 1: reset-on-resume annotation with singular/plural prior failures
+      assert.match(output, /US-003 \[pending \(reset on resume, 1 prior failure\)\] Reset story/);
+      assert.match(output, /US-004 \[pending \(reset on resume, 2 prior failures\)\] Twice reset story/);
+      // AC 2: never-reset pending story shows plainly as pending — no annotation
+      assert.match(output, /US-002 \[pending\] Fresh pending/);
+      assert.match(output, /US-001 \[done\] Done story/);
+      assert.ok(!/US-002 .*reset on resume/.test(output), "fresh pending story must not carry the reset annotation");
+    });
+
+    it("workflow status --json carries resumeResetCount and priorFailureCount while status stays raw", async () => {
+      const runId = crypto.randomUUID();
+      seedStoryRun(runId, [
+        { storyId: "US-001", title: "Fresh pending", status: "pending", resumeResetCount: 0 },
+        { storyId: "US-002", title: "Reset story", status: "pending", resumeResetCount: 1 },
+      ]);
+
+      const output = await captureStatusOutput(runId, ["--json"]);
+      const parsed = JSON.parse(output.trim());
+      const stories = parsed.stories as Array<Record<string, unknown>>;
+      assert.equal(stories.length, 2);
+
+      const fresh = stories.find((s) => s.storyId === "US-001")!;
+      const reset = stories.find((s) => s.storyId === "US-002")!;
+
+      // Machine-readable counters
+      assert.equal(fresh.resumeResetCount, 0);
+      assert.equal("priorFailureCount" in fresh, false, "priorFailureCount omitted when resumeResetCount is 0");
+      assert.equal(reset.resumeResetCount, 1);
+      assert.equal(reset.priorFailureCount, 1);
+      // Raw stored status is preserved — never the display label
+      assert.equal(reset.status, "pending");
+      assert.ok(!String(reset.status).includes("reset on resume"));
+    });
+  });
 });

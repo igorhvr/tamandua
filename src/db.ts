@@ -22,7 +22,13 @@ import { LEDGER_RETENTION_MS } from "./suite/config.js";
 // condition-unset auto-completions from agent-reviewed runs), and
 // runs.test_cmd_established + runs.test_cmd_source (the current TEST_CMD
 // contract and its origin: 'launch' or a step id).
-export const SCHEMA_VERSION = 7;
+// v8: YSE US-001 added the guarded stories.resume_reset_count column (how many
+// times a workflow resume has re-queued a FAILED loop story back to pending —
+// distinguishes reset-on-resume stories from plain pending ones). The bump is
+// REQUIRED (see the WLST5.1 note below): adding the guarded ALTER without
+// bumping leaves existing DBs (user_version === 7) early-returning and
+// skipping the migration, so status SELECTs crash with "no such column".
+export const SCHEMA_VERSION = 8;
 
 // Counter for tests — increments each time migrate() runs the full DDL path.
 export let _migrateFullRuns = 0;
@@ -130,6 +136,7 @@ function migrate(db: DatabaseSync): void {
       output TEXT,
       retry_count INTEGER DEFAULT 0,
       max_retries INTEGER DEFAULT 4,
+      resume_reset_count INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -252,6 +259,18 @@ function migrate(db: DatabaseSync): void {
   const storyColNames = new Set(storyCols.map((c) => c.name));
   if (!storyColNames.has("abandoned_count")) {
     db.exec("ALTER TABLE stories ADD COLUMN abandoned_count INTEGER DEFAULT 0");
+  }
+
+  // ── YSE resume_reset_count for stories ──
+  // Counts how many times a workflow resume has re-queued a FAILED loop
+  // story back to pending (status 'failed' → 'pending' with a fresh retry
+  // budget). Lets status display distinguish a reset-on-resume story
+  // (pending, resume_reset_count > 0) from a plain pending one; the count
+  // of prior failure episodes equals the value (1 on the first reset), since
+  // FAILED stories are only ever re-queued by resume. NOT NULL DEFAULT 0 —
+  // existing rows read back 0 after migration.
+  if (!storyColNames.has("resume_reset_count")) {
+    db.exec("ALTER TABLE stories ADD COLUMN resume_reset_count INTEGER NOT NULL DEFAULT 0");
   }
 
   // ── ABND story_abandonments table ──

@@ -68,6 +68,13 @@ export interface TamanduaEvent {
    */
   finding?: string;
   abandonedCount?: number;
+  /**
+   * YSE US-002: how many failed episodes preceded a resume re-queue —
+   * equal to the story's post-increment stories.resume_reset_count (1 on
+   * the first reset, 2 on the second, ...). Present on
+   * story.reset_for_resume events.
+   */
+  priorFailures?: number;
   tokenDelta?: number;
   tokensSpent?: number;
   /**

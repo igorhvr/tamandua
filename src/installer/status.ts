@@ -37,6 +37,10 @@ export interface RunDetail extends RunInfo {
   runNumber?: number;
   steps: StepInfo[];
   stories?: StoryInfo[];
+  /** Daemon-side scheduling state (pending_register | active | queued |
+   *  paused | draining_pause | error | NULL). A run mid-drain keeps
+   *  status 'running' with schedulingStatus 'draining_pause'. */
+  schedulingStatus?: string | null;
   /** Harness selected for the run, resolved from context harness_type (default "pi"). */
   harnessType: HarnessType;
   workspace_mode?: string;
@@ -69,6 +73,10 @@ export interface StoryInfo {
   status: string;
   retryCount: number;
   abandonedCount?: number;
+  /** YSE: how many times a workflow resume has re-queued this story from
+   *  FAILED back to pending (stories.resume_reset_count). Equals the number
+   *  of prior failure episodes (0 = never reset on resume). */
+  resumeResetCount: number;
   updatedAt?: string;
 }
 
@@ -89,7 +97,7 @@ export function getWorkflowStatus(query: string): RunDetail {
   // Try exact id match first (original)
   let row = db
     .prepare(
-      "SELECT id, run_number, workflow_id, task, status, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count FROM runs WHERE id = ?",
+      "SELECT id, run_number, workflow_id, task, status, scheduling_status, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count FROM runs WHERE id = ?",
     )
     .get(query) as unknown as (RunRow & { run_number: number | null }) | undefined;
 
@@ -97,7 +105,7 @@ export function getWorkflowStatus(query: string): RunDetail {
   if (!row && useOriginal) {
     row = db
       .prepare(
-        "SELECT id, run_number, workflow_id, task, status, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count FROM runs WHERE id = ?",
+        "SELECT id, run_number, workflow_id, task, status, scheduling_status, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count FROM runs WHERE id = ?",
       )
       .get(stripped) as unknown as (RunRow & { run_number: number | null }) | undefined;
   }
@@ -106,7 +114,7 @@ export function getWorkflowStatus(query: string): RunDetail {
   if (!row) {
     let prefixRows = db
       .prepare(
-        "SELECT id, run_number, workflow_id, task, status, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count FROM runs WHERE id LIKE ?",
+        "SELECT id, run_number, workflow_id, task, status, scheduling_status, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count FROM runs WHERE id LIKE ?",
       )
       .all(`${query}%`) as unknown as (RunRow & { run_number: number | null })[];
 
@@ -114,7 +122,7 @@ export function getWorkflowStatus(query: string): RunDetail {
     if (prefixRows.length === 0 && useOriginal) {
       prefixRows = db
         .prepare(
-          "SELECT id, run_number, workflow_id, task, status, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count FROM runs WHERE id LIKE ?",
+          "SELECT id, run_number, workflow_id, task, status, scheduling_status, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count FROM runs WHERE id LIKE ?",
         )
         .all(`${stripped}%`) as unknown as (RunRow & { run_number: number | null })[];
     }
@@ -135,7 +143,7 @@ export function getWorkflowStatus(query: string): RunDetail {
       const num = Number(nMatch[1]);
       row = db
         .prepare(
-          "SELECT id, run_number, workflow_id, task, status, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count FROM runs WHERE run_number = ?",
+          "SELECT id, run_number, workflow_id, task, status, scheduling_status, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count FROM runs WHERE run_number = ?",
         )
         .get(num) as unknown as (RunRow & { run_number: number | null }) | undefined;
       if (!row) {
@@ -148,14 +156,14 @@ export function getWorkflowStatus(query: string): RunDetail {
   if (!row) {
     let taskRows = db
       .prepare(
-        "SELECT id, run_number, workflow_id, task, status, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count FROM runs WHERE task LIKE ?",
+        "SELECT id, run_number, workflow_id, task, status, scheduling_status, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count FROM runs WHERE task LIKE ?",
       )
       .all(`%${query}%`) as unknown as (RunRow & { run_number: number | null })[];
 
     if (taskRows.length === 0 && useOriginal) {
       taskRows = db
         .prepare(
-          "SELECT id, run_number, workflow_id, task, status, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count FROM runs WHERE task LIKE ?",
+          "SELECT id, run_number, workflow_id, task, status, scheduling_status, context, created_at, updated_at, tokens_spent, worker_lost_count, ceiling_expiry_count, instant_fail_count FROM runs WHERE task LIKE ?",
         )
         .all(`%${stripped}%`) as unknown as (RunRow & { run_number: number | null })[];
     }
@@ -526,6 +534,7 @@ interface RunRow {
   workflow_id: string;
   task: string;
   status: string;
+  scheduling_status: string | null;
   context: string;
   created_at: string;
   updated_at: string;
@@ -613,7 +622,7 @@ function buildRunDetail(
 
   const stories = db
     .prepare(
-      "SELECT story_id, title, status, retry_count, abandoned_count, updated_at FROM stories WHERE run_id = ? ORDER BY story_index ASC",
+      "SELECT story_id, title, status, retry_count, abandoned_count, resume_reset_count, updated_at FROM stories WHERE run_id = ? ORDER BY story_index ASC",
     )
     .all(row.id) as Array<{
       story_id: string;
@@ -621,6 +630,7 @@ function buildRunDetail(
       status: string;
       retry_count: number;
       abandoned_count: number;
+      resume_reset_count: number;
       updated_at: string | null;
     }>;
 
@@ -630,6 +640,7 @@ function buildRunDetail(
     status: s.status,
     retryCount: s.retry_count,
     abandonedCount: s.abandoned_count > 0 ? s.abandoned_count : undefined,
+    resumeResetCount: s.resume_reset_count ?? 0,
     updatedAt: s.updated_at ?? undefined,
   }));
 
@@ -675,6 +686,7 @@ function buildRunDetail(
     workflowId: row.workflow_id,
     task: row.task,
     status: row.status,
+    schedulingStatus: row.scheduling_status ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     stepSummary,

@@ -12,7 +12,7 @@ import {
   nudgeWithDaemon,
 } from "../server/control-client.js";
 import { emitEvent } from "./events.js";
-import { advancePipeline, scheduleRunCronTeardown } from "./step-ops.js";
+import { advancePipeline, resetFailedStoriesForResume, scheduleRunCronTeardown } from "./step-ops.js";
 import {
   RUN_CONTEXT_WORKING_DIRECTORY_FOR_HARNESS_KEY,
   validateRunHarnessForScheduling,
@@ -566,6 +566,8 @@ export interface ResumeResult {
   runId?: string;
   workflowId?: string;
   stepId?: string;
+  /** YSE US-002: number of FAILED stories re-queued to pending on this resume (0/absent when none). */
+  resetCount?: number;
 }
 
 export async function resumeWorkflow(runId: string): Promise<ResumeResult> {
@@ -617,6 +619,14 @@ export async function resumeWorkflow(runId: string): Promise<ResumeResult> {
     }
   }
 
+  // YSE US-002: re-queue every FAILED story of a loop-over-stories run as
+  // PENDING with a fresh verification retry budget (story.resume_reset_count
+  // records the prior-failure count). Runs without a loop-over-stories step
+  // or without failed stories are unaffected (resetCount = 0). Must run
+  // BEFORE the advancePipeline/pendingWork block below so a re-queued story
+  // is claimable on the first loop claim after resume.
+  const storyReset = resetFailedStoriesForResume(run.id);
+
   // Advance the pipeline ONLY when there is work to advance. An
   // interrupted/empty pipeline (e.g. every step already 'done') must never
   // be completed by advancePipeline's completion branch during resume — a
@@ -661,5 +671,5 @@ export async function resumeWorkflow(runId: string): Promise<ResumeResult> {
   // Same as runWorkflow: dispatch the re-pended step now, not on the sweep.
   nudgeWithDaemon().catch(() => {});
 
-  return { status: "resumed", runId: run.id, workflowId: run.workflow_id, stepId: restartStepId };
+  return { status: "resumed", runId: run.id, workflowId: run.workflow_id, stepId: restartStepId, resetCount: storyReset.resetCount };
 }

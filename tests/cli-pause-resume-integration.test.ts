@@ -577,6 +577,183 @@ describe("CLI pause/resume one run (integration)", { concurrency: 1 }, () => {
       }
     }
   });
+
+  // ── PAUS US-004: plain resume of a drain-pending run warns and cancels ──
+  // A run mid-drain (pause --drain in progress) keeps status 'running' with
+  // scheduling_status 'draining_pause'. `tamandua workflow resume` must
+  // accept it, cancel the pending drain through the control plane, and print
+  // an operator warning instead of refusing it as an already-running run.
+  it("plain resume of a drain-pending run cancels the drain, warns, and leaves the run running (PAUS US-004)", async (t) => {
+    if (!fs.existsSync(CLI_SCRIPT)) {
+      t.skip("CLI script not built — run npm run build first");
+      return;
+    }
+
+    const controlPort = await getAvailablePort();
+    const th = createTempHome("tamandua-drain-resume-");
+
+    // Copy the workflow directory so the daemon can admit the run after resume.
+    const srcWorkflowDir = path.resolve(__dirname, "..", "workflows", "feature-dev-merge");
+    const dstWorkflowDir = path.join(th.tamanduaDir, "workflows", "feature-dev-merge");
+    fs.mkdirSync(path.dirname(dstWorkflowDir), { recursive: true });
+    fs.cpSync(srcWorkflowDir, dstWorkflowDir, { recursive: true });
+
+    const dbPath = path.join(th.tamanduaDir, "tamandua.db");
+    const runId = crypto.randomUUID();
+    const steps: SeedStep[] = [
+      { stepId: "plan", agentId: "feature-dev-merge_planner" },
+      { stepId: "setup", agentId: "feature-dev-merge_setup" },
+    ];
+    // A mid-drain run: status 'running', scheduling 'draining_pause', with
+    // the pause_drain context marker set (historical pending-drain marker).
+    seedRunAndSteps(dbPath, runId, "feature-dev-merge", "running", "draining_pause", steps);
+    {
+      const db = new DatabaseSync(dbPath);
+      const row = db.prepare("SELECT context FROM runs WHERE id = ?").get(runId) as { context: string } | undefined;
+      const ctx = row ? JSON.parse(row.context) : {};
+      ctx.pause_drain = "true";
+      db.prepare("UPDATE runs SET context = ? WHERE id = ?").run(JSON.stringify(ctx), runId);
+      db.close();
+    }
+
+    let daemon: ChildProcess | undefined;
+    try {
+      daemon = spawn("node", [DAEMON_SCRIPT], {
+        env: cleanChildEnv({ HOME: th.homeDir,
+          TAMANDUA_CONTROL_PORT: String(controlPort), }),
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      daemon.stdout?.resume();
+      daemon.stderr?.resume();
+
+      await waitForControlUp(controlPort);
+
+      // AC: plain resume of the drain-pending run exits 0 and warns.
+      const resumeResult = await runCli(
+        ["workflow", "resume", runId],
+        { HOME: th.homeDir, TAMANDUA_CONTROL_PORT: String(controlPort) },
+      );
+      assert.equal(
+        resumeResult.exitCode, 0,
+        `Resume should succeed, got exit ${resumeResult.exitCode}, stderr: ${cleanStderr(resumeResult.stderr)}`,
+      );
+      assert.ok(
+        cleanStderr(resumeResult.stderr).includes("had a pending drain in progress; plain resume cancels the drain"),
+        `Expected the drain-cancel warning in stderr, got: ${cleanStderr(resumeResult.stderr)}`,
+      );
+      assert.ok(
+        resumeResult.stdout.includes("Resumed run"),
+        `Expected "Resumed run" in stdout, got: ${resumeResult.stdout}`,
+      );
+
+      // AC: the run leaves draining_pause and is admitted (running/active).
+      let row: { status: string; scheduling_status: string | null; context: string } | undefined;
+      const deadline = Date.now() + 10_000;
+      do {
+        const db = new DatabaseSync(dbPath);
+        row = db.prepare("SELECT status, scheduling_status, context FROM runs WHERE id = ?").get(runId) as
+          | { status: string; scheduling_status: string | null; context: string }
+          | undefined;
+        db.close();
+        if (row && row.scheduling_status === "active") break;
+        await sleep(150);
+      } while (Date.now() < deadline);
+
+      assert.ok(row, "run should still exist after resume");
+      assert.equal(row!.status, "running", `Run should stay running, got ${row!.status}`);
+      assert.notEqual(row!.scheduling_status, "draining_pause", "scheduling_status must leave draining_pause");
+      assert.equal(row!.scheduling_status, "active", "daemon should admit the run (active) after the resume");
+      const ctx = JSON.parse(row!.context) as Record<string, unknown>;
+      assert.ok(!("pause_drain" in ctx), "pause_drain marker should be cleared by resume");
+
+      // AC: the cancel is audited in the run's event stream.
+      const runEventsPath = path.join(th.tamanduaDir, "events", `${runId}.jsonl`);
+      assert.ok(fs.existsSync(runEventsPath), `expected events file at ${runEventsPath}`);
+      const runEventsRaw = fs.readFileSync(runEventsPath, "utf-8");
+      const runEvents = runEventsRaw.trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
+      const cancelEvent = runEvents.find((e: { event?: string }) => e.event === "run.drain_cancelled_by_resume");
+      assert.ok(cancelEvent, "expected a run.drain_cancelled_by_resume event");
+      assert.equal((cancelEvent as { runId?: string }).runId, runId);
+    } finally {
+      if (daemon && daemon.exitCode === null && daemon.pid) {
+        try { process.kill(daemon.pid, "SIGTERM"); } catch { /* ignore */ }
+      }
+    }
+  });
+
+  // ── PAUS US-004 control: a plain paused run resumes without the warning ──
+  it("plain resume of a paused run (no pending drain) prints no drain warning (PAUS US-004)", async (t) => {
+    if (!fs.existsSync(CLI_SCRIPT)) {
+      t.skip("CLI script not built — run npm run build first");
+      return;
+    }
+
+    const controlPort = await getAvailablePort();
+    const th = createTempHome("tamandua-drain-resume-control-");
+
+    const srcWorkflowDir = path.resolve(__dirname, "..", "workflows", "feature-dev-merge");
+    const dstWorkflowDir = path.join(th.tamanduaDir, "workflows", "feature-dev-merge");
+    fs.mkdirSync(path.dirname(dstWorkflowDir), { recursive: true });
+    fs.cpSync(srcWorkflowDir, dstWorkflowDir, { recursive: true });
+
+    const dbPath = path.join(th.tamanduaDir, "tamandua.db");
+    const runId = crypto.randomUUID();
+    const steps: SeedStep[] = [
+      { stepId: "plan", agentId: "feature-dev-merge_planner" },
+    ];
+    seedRunAndSteps(dbPath, runId, "feature-dev-merge", "paused", "paused", steps);
+
+    let daemon: ChildProcess | undefined;
+    try {
+      daemon = spawn("node", [DAEMON_SCRIPT], {
+        env: cleanChildEnv({ HOME: th.homeDir,
+          TAMANDUA_CONTROL_PORT: String(controlPort), }),
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      daemon.stdout?.resume();
+      daemon.stderr?.resume();
+
+      await waitForControlUp(controlPort);
+
+      const resumeResult = await runCli(
+        ["workflow", "resume", runId],
+        { HOME: th.homeDir, TAMANDUA_CONTROL_PORT: String(controlPort) },
+      );
+      assert.equal(
+        resumeResult.exitCode, 0,
+        `Resume should succeed, got exit ${resumeResult.exitCode}, stderr: ${cleanStderr(resumeResult.stderr)}`,
+      );
+      assert.ok(
+        resumeResult.stdout.includes("Resumed run"),
+        `Expected "Resumed run" in stdout, got: ${resumeResult.stdout}`,
+      );
+      assert.ok(
+        !cleanStderr(resumeResult.stderr).includes("pending drain"),
+        `Paused-run resume must not print the drain warning, got: ${cleanStderr(resumeResult.stderr)}`,
+      );
+
+      // AC: the run is running/admitted and no drain-cancel event was written.
+      const db = new DatabaseSync(dbPath);
+      const row = db.prepare("SELECT status, scheduling_status FROM runs WHERE id = ?").get(runId) as
+        | { status: string; scheduling_status: string | null }
+        | undefined;
+      db.close();
+      assert.ok(row, "run should still exist after resume");
+      assert.equal(row!.status, "running", `Run should be running, got ${row!.status}`);
+
+      const runEventsPath = path.join(th.tamanduaDir, "events", `${runId}.jsonl`);
+      if (fs.existsSync(runEventsPath)) {
+        const runEventsRaw = fs.readFileSync(runEventsPath, "utf-8");
+        const runEvents = runEventsRaw.trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
+        const cancelEvent = runEvents.find((e: { event?: string }) => e.event === "run.drain_cancelled_by_resume");
+        assert.equal(cancelEvent, undefined, "paused-run resume must not emit run.drain_cancelled_by_resume");
+      }
+    } finally {
+      if (daemon && daemon.exitCode === null && daemon.pid) {
+        try { process.kill(daemon.pid, "SIGTERM"); } catch { /* ignore */ }
+      }
+    }
+  });
 });
 
   // ── US-001: Regression test for stranded running step on pause→resume ──

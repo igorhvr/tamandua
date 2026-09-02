@@ -131,6 +131,7 @@ tests/mcp-lifecycle.test.ts
 tests/merge-event-identity.test.ts
 tests/multiline-output-parsing.test.ts
 tests/orphaned-step-recovery.test.ts
+tests/paus-drain-cancel-gate.test.ts
 tests/pause-kill-resume-regression.test.ts
 tests/pi-command-preview.test.ts
 tests/pi-token-saver.test.ts
@@ -138,6 +139,7 @@ tests/portability-lint.test.ts
 tests/reroute-count-column-migration.test.ts
 tests/reroute-paths.test.ts
 tests/resume-step-output.test.ts
+tests/resume-story-requeue.test.ts
 tests/run-terminal-token-events.test.ts
 tests/run-token-migration.test.ts
 tests/runner-scripts.test.ts
@@ -160,3 +162,4 @@ tests/work-round-token-attribution.test.ts
 tests/workflow-contract.test.ts
 tests/workflow-fail.test.ts
 tests/workflow-graph-simulation.test.ts
+tests/yse-resume-requeue-gate.test.ts
