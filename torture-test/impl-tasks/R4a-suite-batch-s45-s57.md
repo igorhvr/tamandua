@@ -36,6 +36,14 @@ suite-defects-didn-dres-2026-09-02, triage-decisions-2026-09-01 (item 6: W4.33d/
   classifies as infra with the holder pid/cmdline in the reason.
 - S57: golden validity includes a fixtures-src content hash in the .hashes ledger; drift ⇒ invalid (rebuilt under
   --rebuild-invalid, fail closed otherwise, naming the drifted fixture).
+- MCHA (darwin chaos/kill guard): `tt-chaos` refuses to signal on darwin — mac campaign #1 cells W4.09-pi, W4.09-hermes,
+  W4.10-kill-daemon and W4.48a all ended chaos-invocation-failed with exit 3 "GUARD_MISS: cannot read the process group
+  of daemon pid N (no procfs) — group disjointness from the caller cannot be verified, refusing to signal". Correct
+  fail-closed behavior, wrong evidence source: use the portable identity arm (`ps -o pgid=` for the process group,
+  lsof cwd + command line for ownership — the same darwin evidence tt-process-identity and daemon-control already use)
+  so the kill-harness / kill-daemon injections fire on darwin with the same disjointness guarantee. Also audit the
+  probe-sequence engine's seam actions for the same procfs dependence. Red-arm on linux via the existing
+  simulated-darwin seams (TT_DC_PLATFORM / TT_VERIFY_PLATFORM style); real validation happens on mac campaign #2.
 - MVPT (darwin env gate): `tt-verify-environment`'s port-ownership check returns "not TT-owned" on darwin by
   construction (explicit darwin branch, no evidence), so any contained daemon on 43xx/53xx fails the gate with
   "in use by non-TT process" (mac stage-2 attempt-2, 2026-09-02 17:1xZ, pids the main checkout's own provenance
