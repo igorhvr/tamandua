@@ -252,3 +252,57 @@ export async function withReservedPorts<T>(
     await Promise.all(handles.map((h) => h.close()));
   }
 }
+
+/**
+ * Recursively list every entry under `dir` as paths relative to `dir`.
+ *
+ * - Directories are listed too (they can be the thing keeping a parent busy).
+ * - Symlinks are listed as entries and NOT followed (avoids cycles).
+ * - Returns [] when `dir` does not exist.
+ * - Output is sorted lexicographically for deterministic assertions/diagnostics.
+ */
+export function listRemainingEntries(dir: string): string[] {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw err;
+  }
+
+  const out: string[] = [];
+  for (const entry of entries) {
+    out.push(entry.name);
+    if (entry.isDirectory()) {
+      for (const child of listRemainingEntries(path.join(dir, entry.name))) {
+        out.push(path.join(entry.name, child));
+      }
+    }
+  }
+  return out.sort();
+}
+
+/**
+ * Remove a test temp dir with the same retries as the historical teardown,
+ * but on failure throw an error that NAMES the entries still occupying the
+ * directory instead of surfacing a bare ENOTEMPTY. This turns a flaky
+ * teardown race into a diagnosable failure.
+ */
+export function removeTestTempDirWithDiagnostics(dir: string): void {
+  try {
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 15, retryDelay: 200 });
+  } catch (err: unknown) {
+    let remaining: string[] = [];
+    try {
+      remaining = listRemainingEntries(dir);
+    } catch {
+      // Preserve the original removal error if listing also fails.
+    }
+    const message = (err as Error)?.message ?? String(err);
+    const suffix =
+      remaining.length > 0 ? ` (remaining entries: ${remaining.join(", ")})` : "";
+    throw new Error(`Failed to remove test temp dir ${dir}: ${message}${suffix}`, {
+      cause: err as Error,
+    });
+  }
+}

@@ -85,7 +85,7 @@ describe("working-directory-for-harness", () => {
           import { runWorkflow } from "./dist/installer/run.js";
           import { getDb } from "./dist/db.js";
           import { shutdownAllCrons } from "./dist/installer/agent-scheduler.js";
-          import { stopDaemon } from "./dist/server/daemonctl.js";
+          import { stopDaemonFamily } from "./dist/server/daemonctl.js";
           import { readDaemonSecret, getControlPort } from "./dist/server/control-server.js";
           import http from "node:http";
 
@@ -130,8 +130,8 @@ describe("working-directory-for-harness", () => {
               jobAgentId: job?.agentId ?? null,
             }));
           } finally {
+            await stopDaemonFamily({ homeDir: process.env.HOME });
             shutdownAllCrons();
-            stopDaemon({ homeDir: process.env.HOME });
           }
         `,
         {
@@ -166,7 +166,7 @@ describe("working-directory-for-harness", () => {
           import { runWorkflow } from "./dist/installer/run.js";
           import { getDb } from "./dist/db.js";
           import { shutdownAllCrons } from "./dist/installer/agent-scheduler.js";
-          import { stopDaemon } from "./dist/server/daemonctl.js";
+          import { stopDaemonFamily } from "./dist/server/daemonctl.js";
 
           try {
             const started = await runWorkflow({
@@ -184,8 +184,8 @@ describe("working-directory-for-harness", () => {
               contextDir: context.working_directory_for_harness,
             }));
           } finally {
+            await stopDaemonFamily({ homeDir: process.env.HOME });
             shutdownAllCrons();
-            stopDaemon({ homeDir: process.env.HOME });
           }
         `,
         {
