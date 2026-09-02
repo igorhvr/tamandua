@@ -30,12 +30,15 @@
 # and records provenance with cgroupVerified=false.
 #
 # MACP4 US-001: the port liveness probes (wait_for_port/is_port_listening)
-# use a PORTABLE node net.connect probe (port_probe) — the old GNU-`timeout`
-# dependent `timeout 1 bash -c "echo >/dev/tcp/..."` probe is a linux-ism
-# (macOS ships no `timeout`), so every scripted start/status/stop failed on
-# Darwin. Node is already a hard runtime dependency (tt-process-identity),
-# so port_probe adds no new requirement and behaves identically on linux and
-# Darwin.
+# are SOURCED from the shared address-exact helper
+# (torture-test/lib/port-probe.sh) — a `node -e` net.connect to 127.0.0.1
+# with a bounded 1s in-process timeout. The old GNU-`timeout` dependent
+# `timeout 1 bash -c "echo >/dev/tcp/..."` probe is a linux-ism (macOS
+# ships no `timeout`), and the old 127.0.0.1-then-::1 fallback is replaced
+# by the helper's address-exact semantics, so every scripted
+# start/status/stop works on Darwin. Node is already a hard runtime
+# dependency (tt-process-identity), so the probe adds no new requirement
+# and behaves identically on linux and Darwin.
 #
 # MACP4 US-002 (Darwin identity/ownership + operator home):
 #   - Process-start identity: on linux the identity is /proc starttime
@@ -93,6 +96,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TT_DIR="$(dirname "$SCRIPT_DIR")"                        # torture-test/
 TT_REPO_ROOT="$(dirname "$TT_DIR")"                      # repo root
 export TT_ROOT="${TT_REPO_ROOT}/torture-test/var"
+
+# ── shared port-probe helper (MACP4 US-001) ──────────────────────────
+# The port liveness probes (port_probe / is_port_listening /
+# wait_for_port) are sourced from the shared address-exact helper —
+# a `node -e` net.connect to 127.0.0.1 with a bounded 1s in-process
+# timeout (no GNU `timeout`, no `localhost` hostname lookup, no ::1
+# fallback). daemon-control no longer carries an inline net.connect
+# probe body; the helper is the single canonical definition for the
+# whole suite (also sourced by tt-daemon-up).
+. "$TT_DIR/lib/port-probe.sh"
 
 # Process-start identity CLI (E3.C.1 US-001/US-004): the ONLY sanctioned
 # way to read/verify a pid's /proc starttime identity. Every signal
@@ -784,53 +797,14 @@ EOF
 }
 
 # ── start subcommand ─────────────────────────────────────────────────
-
-# port_probe: portable TCP-connect liveness probe (MACP4 US-001). Attempts
-# a bounded (1s) connect to $1 on the loopback addresses (127.0.0.1 first —
-# every TT daemon listener binds 127.0.0.1 by default — then ::1 for an
-# IPv6-only listener). Returns 0 when the port accepts a connection, 1
-# otherwise.
 #
-# WHY: the OLD probe `timeout 1 bash -c "echo >/dev/tcp/localhost/$port"`
-# depends on the GNU `timeout` utility, which macOS does not ship — every
-# scripted start/status/stop failed on Darwin ("timeout: command not
-# found", or a hang on a black-holed port). Node is already a hard runtime
-# dependency of daemon-control (tt-process-identity), so a node -e
-# net.connect probe adds no new requirement and behaves identically on
-# linux and Darwin (macOS ships /usr/bin/node via the harness stack).
-port_probe() {
-  local port="$1"
-  node -e '
-    const net = require("net");
-    const port = Number(process.argv[1]);
-    const hosts = ["127.0.0.1", "::1"];
-    let i = 0;
-    function attempt() {
-      if (i >= hosts.length) process.exit(1);
-      const host = hosts[i++];
-      const socket = net.connect({ host, port });
-      socket.setTimeout(1000, () => { socket.destroy(); attempt(); });
-      socket.once("connect", () => { socket.destroy(); process.exit(0); });
-      socket.once("error", () => { socket.destroy(); attempt(); });
-    }
-    attempt();
-  ' "$port" 2>/dev/null
-}
-
-# wait_for_port: poll until a TCP port is listening, up to a timeout in
-# seconds (default 10). Returns 0 if the port becomes available, 1 on timeout.
-wait_for_port() {
-  local port="$1"
-  local timeout="${2:-10}"
-  local deadline; deadline=$(($(date +%s) + timeout))
-  while [ "$(date +%s)" -lt "$deadline" ]; do
-    if port_probe "$port"; then
-      return 0
-    fi
-    sleep 0.5
-  done
-  return 1
-}
+# Port liveness probes (port_probe / wait_for_port / is_port_listening)
+# are provided by the shared address-exact helper sourced at the top of
+# this file (torture-test/lib/port-probe.sh — MACP4 US-001).
+# daemon-control no longer carries an inline node net.connect probe
+# body: the helper is the single source of truth, and its 127.0.0.1-only
+# semantics (no `localhost` hostname resolution, no ::1 fallback) apply
+# everywhere a port is checked.
 
 # verify_cgroup: check whether PID $1 lives under the expected systemd scope
 # unit name $2. Returns 0 if verified, 1 otherwise.
@@ -844,14 +818,6 @@ verify_cgroup() {
     return 0
   fi
   return 1
-}
-
-# is_port_listening: check if a TCP port is accepting connections.
-# Returns 0 if listening, 1 if not. Uses the portable port_probe
-# (MACP4 US-001) — no GNU-`timeout` dependency, so it works on Darwin.
-is_port_listening() {
-  local port="$1"
-  port_probe "$port"
 }
 
 # verify_process_tt_owned: check that a PID belongs to the TT environment.
@@ -1749,10 +1715,13 @@ cmd_stop() {
   for port in $prov_ports; do
     if [ -n "$port" ] && is_port_listening "$port"; then
       local lingering_pid
-      # PORTABLE pid extraction (MACP5 US-004): GNU grep's perl-regex `-P`
-      # (and `\K` / `\d`) is a GNU-ism — BSD grep has no -P. grep -Eo +
-      # sed prefix-strip preserves the exact first-pid semantics on both.
-      lingering_pid=$(ss -tlnp 2>/dev/null | grep ":$port " | grep -Eo 'pid=[0-9]+' | head -1 | sed 's/^pid=//' || true)
+      # PORTABLE pid extraction (MACP5 US-006): iproute2 `ss` (and its
+      # `pid=` output) is linux-only — macOS has no `ss`. lsof's
+      # `-iTCP:<port> -sTCP:LISTEN -t` prints the listener PID(s) portably
+      # (first wins), preserving the exact first-pid semantics on both
+      # platforms. The netstat fallback keeps the linux-only path for hosts
+      # without lsof.
+      lingering_pid=$(lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null | head -1 || true)
       if [ -z "$lingering_pid" ]; then
         lingering_pid=$(netstat -tlnp 2>/dev/null | grep ":$port " | awk '{print $NF}' | grep -Eo '[0-9]+' | head -1 || true)
       fi

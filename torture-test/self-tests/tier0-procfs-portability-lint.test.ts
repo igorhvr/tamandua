@@ -429,6 +429,21 @@ const ALLOWLIST: Record<string, AllowEntry> = {
     reason:
       "MACP3.1 US-009 landing-report pin — its '/proc' occurrences are prose in the header narrative and the acceptance-item names (portability fix, '/proc sweep completeness'); the test only reads the MACP3.1 salvage doc, no runtime procfs access.",
   },
+  "self-tests/tier1-tt-recorder-darwin-port-evidence.test.ts": {
+    category: "documentation",
+    reason:
+      "MACP5 US-005 darwin port-evidence pin — its '/proc' occurrences are prose in the header narrative and structural-assert regex literals pinning the unchanged linux /proc inode arm (no runtime procfs access; the procfs reads live inside the sourced tt-recorder tool, guarded by MACP3 US-003).",
+  },
+  "self-tests/tier1-tt-recorder-portable-start.test.ts": {
+    category: "documentation",
+    reason:
+      "MACP5 US-004 portable-start pin — its '/proc' occurrences are prose in the header narrative and structural-assert regex literals pinning _pid_cmdline's guarded linux /proc read (no runtime procfs access; the procfs reads live inside the sourced tt-recorder tool, guarded by MACP3 US-003).",
+  },
+  "self-tests/tier1-tt-daemon-up-adapters-bin-path.test.ts": {
+    category: "documentation",
+    reason:
+      "US-007 darwin behavioral proof pin — its '/proc' occurrences are prose in the header narrative and structural-assert regex literals pinning daemon_path_has_adapters_bin's retained linux /proc/<pid>/environ arm (no runtime procfs access; the procfs read lives inside the sourced tt-daemon-up tool, guarded by MACP3 US-003).",
+  },
 };
 
 // ── /proc hit detection ───────────────────────────────────────────────

@@ -2,10 +2,11 @@
 //
 // The mac's W2 cells broke on GNU-only shell constructs ("sed: 1: ... command
 // i expects \ followed by text" from GNU sed `i`/`-i` syntax, grep -P,
-// readlink -f, date %N, GNU coreutils timeout, setsid). This lint scans the
-// tracked torture-test SHELL surface (git ls-files; .sh extension or a bash
-// shebang on the first line) on comment- and single-quote-masked lines and
-// fails on any of the seven GNU-ism classes below, unless the file is
+// readlink -f, date %N, GNU coreutils timeout, setsid, iproute2 `ss`,
+// `/dev/tcp/` bash connects, GNU `stat -c`, GNU `date -d`). This lint scans
+// the tracked torture-test SHELL surface (git ls-files; .sh extension or a
+// bash shebang on the first line) on comment- and single-quote-masked lines
+// and fails on any of the eleven GNU-ism classes below, unless the file is
 // explicitly allowlisted as a linux-side-only tool OUTSIDE the scripted
 // scenario path. The bash32-compat lint (tier0-bash32-compat-lint.test.ts) is
 // the scan-surface precedent (collectShellFiles/maskLine); the procfs lint
@@ -211,7 +212,7 @@ function maskComments(line: string): string {
   return out.join("");
 }
 
-// ── GNU-ism pattern classes (the MACP5 US-005 list) ────────────────────
+// ── GNU-ism pattern classes (the MACP5 US-005 + US-006 list) ───────────
 
 interface GnuiClass {
   name: string;
@@ -231,7 +232,19 @@ interface GnuiClass {
  *  - the `timeout` class matches the GNU coreutils COMMAND with a numeric
  *    duration (optional s/m/h/d unit and optional GNU options); `--timeout`
  *    flags and `timeout_ms`-style variables never match (a `-` or `_` sits
- *    before the word, or no numeric duration follows). */
+ *    before the word, or no numeric duration follows).
+ *  - the `ss` class matches the iproute2 socket-stat COMMAND (`ss -tlnp`,
+ *    `ss -H`); `\bss` word boundaries keep `addresses`/`class -x`-style
+ *    tokens out. The darwin-capable alternative is `lsof -i` (or node).
+ *  - the `/dev/tcp/` class flags bash's host-resolution connect path literal
+ *    (`echo >/dev/tcp/localhost/$port`); the alternative is node net.connect
+ *    (see torture-test/lib/port-probe.sh).
+ *  - the `stat -c` class matches GNU stat's `-c`/`--format` (and combined
+ *    forms like `-Lc`); BSD `stat -f` and `wc -c` are NOT flagged (no `c`
+ *    in the flag position).
+ *  - the `date -d` class matches GNU date's `-d`/`--date` ONLY (`-d` with a
+ *    word boundary, so BSD `date -j`/`date -f` and GNU `date -Iseconds`
+ *    stay out of scope); the alternative is BSD `date -j` or node Date. */
 const GNU_ISM_CLASSES: GnuiClass[] = [
   { name: "sed -i (GNU in-place)", re: /\bsed\s+(?:-[a-zA-Z]*i|--in-place)(?=\s|$)/ },
   { name: "sed i\\ (GNU insert)", re: /\bsed\b[^|]*i\\/ },
@@ -240,6 +253,10 @@ const GNU_ISM_CLASSES: GnuiClass[] = [
   { name: "date %N (nanosecond)", re: /%N/ },
   { name: "GNU timeout cmd", re: /(^|[;&|(\s])timeout(\s+-{1,2}[^\s]+)*\s+[0-9]+[smhd]?/ },
   { name: "setsid cmd", re: /\bsetsid\b/ },
+  { name: "ss (iproute2 socket stat)", re: /\bss\s+-[a-zA-Z]/ },
+  { name: "/dev/tcp/ (bash connect)", re: /\/dev\/tcp\// },
+  { name: "stat -c (GNU format)", re: /\bstat\s+(?:-[a-zA-Z]*c[a-zA-Z]*\b|--format\b)/ },
+  { name: "date -d (GNU relative date)", re: /\bdate\s+--date\b|\bdate\s+-d\b/ },
 ];
 
 const GNU_ISM_CLASS_NAMES = GNU_ISM_CLASSES.map((c) => c.name);
@@ -275,13 +292,18 @@ const ALLOWLIST: Record<string, AllowEntry> = {
   // ── Linux-side-only tools / harnesses OUTSIDE the strict path ──────
   "torture-test/bin/daemon-control.test.sh": {
     reason:
-      "Linux-side-only test harness for bin/daemon-control (E3.C.1): runs only on the linux campaign host as a standalone bin/*.test.sh proof battery (./run-torture-test never invokes it, so it never executes on the Darwin campaign). Its setsid usages spawn decoy listeners / CLI stand-ins in their own session+group (pgid==pid, disjoint from the test ancestry) to prove the daemon-control PID/ancestry scans — setsid is util-linux-only (no macOS equivalent).",
-    allowedClasses: ["setsid cmd"],
+      "Linux-side-only test harness for bin/daemon-control (E3.C.1): runs only on the linux campaign host as a standalone bin/*.test.sh proof battery (./run-torture-test never invokes it, so it never executes on the Darwin campaign). Its setsid usages spawn decoy listeners / CLI stand-ins in their own session+group (pgid==pid, disjoint from the test ancestry) to prove the daemon-control PID/ancestry scans — setsid is util-linux-only (no macOS equivalent). Its `ss -tlnp` socket-stat records the production 33xx listeners before/after the campaign (iproute2 is linux-only).",
+    allowedClasses: ["setsid cmd", "ss (iproute2 socket stat)"],
+  },
+  "torture-test/bin/tt-bare-tier1-nohome-proof.test.sh": {
+    reason:
+      "Linux-side-only test harness (E2.5 US-007 bare --tier1 no-home proof): runs only on the linux campaign host as a standalone bin/*.test.sh proof battery (./run-torture-test never invokes it, so it never executes on the Darwin campaign). The /dev/tcp/ bash connect probes the 43xx ports to assert they stay free across the bare --tier1 run — a bash host-resolution connect with no macOS equivalent.",
+    allowedClasses: ["/dev/tcp/ (bash connect)"],
   },
   "torture-test/bin/tt-catalog-install.test.sh": {
     reason:
-      "Linux-side-only test harness for tt-catalog-install (E2.5 US-002): runs only on the linux campaign host as a standalone bin/*.test.sh proof battery (never on the Darwin campaign). The GNU-only sed -i in-place rewrite plants a deliberately stale .catalog-version.json stamp; confined to this linux-only harness (NOT the mac-reachable tt-provision-home class, which MACP5 US-004 made portable).",
-    allowedClasses: ["sed -i (GNU in-place)"],
+      "Linux-side-only test harness for tt-catalog-install (E2.5 US-002): runs only on the linux campaign host as a standalone bin/*.test.sh proof battery (never on the Darwin campaign). The GNU-only sed -i in-place rewrite plants a deliberately stale .catalog-version.json stamp; GNU stat -c '%Y' mtime hashes detect catalog churn — both confined to this linux-only harness (NOT the mac-reachable tt-provision-home class, which MACP5 US-004 made portable).",
+    allowedClasses: ["sed -i (GNU in-place)", "stat -c (GNU format)"],
   },
   "torture-test/bin/tt-chaos.test.sh": {
     reason:
@@ -290,48 +312,58 @@ const ALLOWLIST: Record<string, AllowEntry> = {
   },
   "torture-test/bin/tt-controller-idempotence.test.sh": {
     reason:
-      "Linux-side-only controller idempotence harness: runs real stub campaigns only on the linux campaign host (bin/*.test.sh battery, never on the Darwin campaign). The GNU-only sed -i in-place rewrite plants a deliberately stale catalog stamp; confined to this linux-only harness.",
-    allowedClasses: ["sed -i (GNU in-place)"],
+      "Linux-side-only controller idempotence harness: runs real stub campaigns only on the linux campaign host (bin/*.test.sh battery, never on the Darwin campaign). The GNU-only sed -i in-place rewrite plants a deliberately stale catalog stamp; GNU stat -c '%Y' hashes detect catalog churn and a /dev/tcp/ bash connect probes the real-daemon control port — all confined to this linux-only harness.",
+    allowedClasses: ["sed -i (GNU in-place)", "stat -c (GNU format)", "/dev/tcp/ (bash connect)"],
+  },
+  "torture-test/bin/tt-controller-preflight.test.sh": {
+    reason:
+      "Linux-side-only controller preflight wiring harness (E2.5 US-004): runs real stub campaigns only on the linux campaign host (bin/*.test.sh battery, never on the Darwin campaign). The /dev/tcp/ bash connect probes the contained real daemon's 4339 control port to assert it comes up and stops — a bash host-resolution connect with no macOS equivalent.",
+    allowedClasses: ["/dev/tcp/ (bash connect)"],
   },
   "torture-test/bin/tt-controller.test.sh": {
     reason:
       "Linux-side-only controller test harness: runs only on the linux campaign host (bin/*.test.sh battery). setsid spawns fake harnesses in their own session to test controller kill-ancestry / hostile-process detection — util-linux-only, no macOS equivalent.",
     allowedClasses: ["setsid cmd"],
   },
-  "torture-test/bin/tt-daemon-up": {
-    reason:
-      "Linux-side-only real-daemon preflight helper (E2.5 US-003): invoked only from real-case launches on the linux campaign host — real cells are predicate-excluded on Darwin (MACP5 US-004 reachability verdict). GNU timeout guards the /dev/tcp port probe; GNU coreutils timeout is not on macOS.",
-    allowedClasses: ["GNU timeout cmd"],
-  },
   "torture-test/bin/tt-daemon-up-schema.test.sh": {
     reason:
-      "Linux-side-only test harness for tt-daemon-up's port-probe schema: runs only on the linux campaign host (bin/*.test.sh battery, never on the Darwin campaign). GNU timeout guards the /dev/tcp port probes — util-linux-only.",
-    allowedClasses: ["GNU timeout cmd"],
+      "Linux-side-only test harness for tt-daemon-up's port-probe schema: runs only on the linux campaign host (bin/*.test.sh battery, never on the Darwin campaign). GNU timeout guards the /dev/tcp port probes — both util-linux/bash-only.",
+    allowedClasses: ["GNU timeout cmd", "/dev/tcp/ (bash connect)"],
   },
   "torture-test/bin/tt-daemon-up.test.sh": {
     reason:
-      "Linux-side-only test harness for tt-daemon-up: runs only on the linux campaign host (bin/*.test.sh battery, never on the Darwin campaign). GNU timeout guards the /dev/tcp port probes — util-linux-only.",
-    allowedClasses: ["GNU timeout cmd"],
+      "Linux-side-only test harness for tt-daemon-up: runs only on the linux campaign host (bin/*.test.sh battery, never on the Darwin campaign). GNU timeout guards the /dev/tcp port probes — both util-linux/bash-only.",
+    allowedClasses: ["GNU timeout cmd", "/dev/tcp/ (bash connect)"],
+  },
+  "torture-test/bin/tt-include-real-e2e-proof.test.sh": {
+    reason:
+      "Linux-side-only included-real e2e proof harness (E2.5 US-008): runs only on the linux campaign host as a standalone bin/*.test.sh proof battery (never on the Darwin campaign). The /dev/tcp/ bash connect probes the contained real daemon's control port 4339 during/after the included-real campaign — a bash host-resolution connect with no macOS equivalent.",
+    allowedClasses: ["/dev/tcp/ (bash connect)"],
   },
   "torture-test/bin/tt-kill-sentinel": {
     reason:
       "Linux-side-only kill-sentinel watchdog (E3.C.1): launched only from real-case cells on the linux campaign host (real cells are predicate-excluded on Darwin — MACP5 US-004 reachability verdict). date +%s%N (GNU nanosecond) seeds the sentinel token; BSD date has no %N.",
     allowedClasses: ["date %N (nanosecond)"],
   },
-  "torture-test/bin/tt-recorder": {
+  "torture-test/bin/tt-provision-home.test.sh": {
     reason:
-      "Linux-side-only recording tool: launched only from real-case cells on the linux campaign host (MACP5 US-004 reachability verdict). readlink -f canonicalizes TT_ROOT / resolves /proc/<pid>/cwd symlinks (linux-only procfs); setsid detaches the record loop into its own session — both GNU/Linux-only, no macOS equivalent.",
-    allowedClasses: ["readlink -f (canonicalize)", "setsid cmd"],
+      "Linux-side-only test harness for tt-provision-home (E2.6 US-004): runs only on the linux campaign host as a standalone bin/*.test.sh proof battery (never on the Darwin campaign). GNU stat -c '%a' (with a BSD stat -f '%Lp' fallback) asserts the surfaced pi auth.json mode is 0600; the GNU -c form is linux-side-only (the mac-reachable tt-provision-home TOOL is portable).",
+    allowedClasses: ["stat -c (GNU format)"],
   },
   "torture-test/bin/tt-recorder.test.sh": {
     reason:
-      "Linux-side-only test harness for tt-recorder: runs only on the linux campaign host (bin/*.test.sh battery, never on the Darwin campaign). GNU timeout bounds waits on recorder pids (timeout 2/3/5 wait ...); readlink -f canonicalizes TT_ROOT_VAR and resolves cwd realpaths (linux-only /proc) — both GNU/Linux-only.",
-    allowedClasses: ["GNU timeout cmd", "readlink -f (canonicalize)"],
+      "Linux-side-only test harness for tt-recorder: runs only on the linux campaign host (bin/*.test.sh battery, never on the Darwin campaign). GNU timeout bounds waits on recorder pids (timeout 2/3/5 wait ...); readlink -f canonicalizes TT_ROOT_VAR and resolves cwd realpaths (linux-only /proc); GNU stat -c%s reads recorder output/db sizes — all GNU/Linux-only.",
+    allowedClasses: ["GNU timeout cmd", "readlink -f (canonicalize)", "stat -c (GNU format)"],
   },
   "torture-test/bin/tt-run.test.sh": {
     reason:
       "Linux-side-only test harness for tt-run: runs only on the linux campaign host (bin/*.test.sh battery, never on the Darwin campaign). GNU timeout bounds the --tier2 campaign invocations (180s) — util-linux-only.",
     allowedClasses: ["GNU timeout cmd"],
+  },
+  "torture-test/bin/tt-verify-environment.test.sh": {
+    reason:
+      "Linux-side-only test harness for tt-verify-environment (US-001 scaffolding): runs only on the linux campaign host as a standalone bin/*.test.sh proof battery (never on the Darwin campaign). GNU stat -c %Y (with a BSD stat -f %m fallback) reads profile mtimes for the deterministic re-run assertion; the GNU -c form is linux-side-only.",
+    allowedClasses: ["stat -c (GNU format)"],
   },
   "torture-test/cases/hooks/run-w0.1": {
     reason:
@@ -345,8 +377,8 @@ const ALLOWLIST: Record<string, AllowEntry> = {
   },
   "torture-test/oracles/self-test/run.sh": {
     reason:
-      "Linux-side-only oracle self-test runner: the oracle battery runs only on the linux campaign host (never invoked by ./run-torture-test, so never on the Darwin campaign). setsid --wait isolates the watchdog / injection sub-processes in their own session (with GNU timeout as the kill-after backstop on the watchdog arm) — util-linux-only.",
-    allowedClasses: ["setsid cmd"],
+      "Linux-side-only oracle self-test runner: the oracle battery runs only on the linux campaign host (never invoked by ./run-torture-test, so never on the Darwin campaign). setsid --wait isolates the watchdog / injection sub-processes in their own session (with GNU timeout as the kill-after backstop on the watchdog arm) — util-linux-only. GNU stat -c/--format (and stat -Lc) reads the scope-file owner/identity during the fd/scope integrity check.",
+    allowedClasses: ["setsid cmd", "stat -c (GNU format)"],
   },
   "torture-test/probes/tt-rust/BUG-R3/probe.sh": {
     reason:
@@ -470,8 +502,15 @@ function liveContents(): Record<string, string> {
 
 // ── tests ──────────────────────────────────────────────────────────────
 
-describe("tier0 GNU-ism portability lint (MACP5 US-005)", () => {
-  it("hard gate: the tracked shell surface has zero unallowlisted GNU-isms (live tree, post-US-004)", () => {
+describe("tier0 GNU-ism portability lint (MACP5 US-005 + US-006)", () => {
+  const US006_CLASSES = [
+    "ss (iproute2 socket stat)",
+    "/dev/tcp/ (bash connect)",
+    "stat -c (GNU format)",
+    "date -d (GNU relative date)",
+  ];
+
+  it("hard gate: the tracked shell surface has zero unallowlisted GNU-isms (live tree, post-US-006)", () => {
     const violations = auditLiveTree();
     assert.deepEqual(
       violations,
@@ -535,6 +574,10 @@ describe("tier0 GNU-ism portability lint (MACP5 US-005)", () => {
       ["date %N (nanosecond)", 'tok="$(date +%s%N)"\n'],
       ["GNU timeout cmd", "timeout 15 cargo test\n"],
       ["setsid cmd", "setsid --wait bash run.sh &\n"],
+      ["ss (iproute2 socket stat)", "ss -tlnp 2>/dev/null\n"],
+      ["/dev/tcp/ (bash connect)", 'bash -c "echo >/dev/tcp/localhost/4339"\n'],
+      ["stat -c (GNU format)", 'size="$(stat -c%s \"$f\")"\n'],
+      ["date -d (GNU relative date)", 'when="$(date -d \"yesterday\")"\n'],
     ];
     for (const [cls, snippet] of cases) {
       const hits = scanContent(snippet);
@@ -558,6 +601,12 @@ describe("tier0 GNU-ism portability lint (MACP5 US-005)", () => {
       'y="$(readlink "$PWD")"',
       "grep -p pattern file",
       "echo 'timeout 5 cmd'",
+      "lsof -nP -iTCP:4339 -sTCP:LISTEN -t",
+      'node "$PORT_PROBE" 4339',
+      'z="$(stat -f%z \"$f\")"',
+      'n="$(wc -c < \"$f\")"',
+      'w="$(date -j -f \"%Y-%m-%d\" \"2020-01-01\" \"+%s\")"',
+      't="$(date +%s)"',
       "",
     ].join("\n");
     assert.deepEqual(
@@ -584,6 +633,76 @@ describe("tier0 GNU-ism portability lint (MACP5 US-005)", () => {
       [],
       `a comment mentioning sed i\\ must not trip the insert class: ${JSON.stringify(scanContent(snippet))}`,
     );
+  });
+
+  it("MUTATION: each US-006 class trips G1 when injected into a bin/* shell file (bin/* coverage)", () => {
+    const contents = liveContents();
+    const target = "torture-test/bin/tt-daemon-up"; // a live swept bin/* tool (non-strict, non-allowlisted)
+    assert.ok(target in contents, "tt-daemon-up must be in the scanned shell surface");
+    const offenders: Array<[string, string]> = [
+      ["ss (iproute2 socket stat)", "ss -tlnp 2>/dev/null\n"],
+      ["/dev/tcp/ (bash connect)", 'bash -c "echo >/dev/tcp/localhost/4339"\n'],
+      ["stat -c (GNU format)", 'size="$(stat -c%s \"$f\")"\n'],
+      ["date -d (GNU relative date)", 'when="$(date -d \"yesterday\")"\n'],
+    ];
+    for (const [cls, line] of offenders) {
+      const mutated = { ...contents };
+      mutated[target] += `\n# MUTATION\n${line}`;
+      const violations = auditAll(ALLOWLIST, mutated);
+      assert.ok(
+        violations.some((v) => v.includes(target) && v.includes(cls)),
+        `class ${cls} injected into a bin/* file must trip G1, got:\n${violations.join("\n") || "(none)"}`,
+      );
+    }
+  });
+
+  it("MUTATION: the old GNU `timeout 1 bash -c \"echo >/dev/tcp/localhost/$port\"` probe trips the timeout class in a bin/* file", () => {
+    const contents = liveContents();
+    const target = "torture-test/bin/tt-daemon-up";
+    assert.ok(target in contents, "tt-daemon-up must be in the scanned shell surface");
+    const mutated = { ...contents };
+    mutated[target] += '\nold_probe() { timeout 1 bash -c "echo >/dev/tcp/localhost/$port"; }\n';
+    const violations = auditAll(ALLOWLIST, mutated);
+    assert.ok(
+      violations.some((v) => v.includes(target) && v.includes("GNU timeout cmd")),
+      `the old GNU timeout//dev/tcp probe in a bin/* file must trip the timeout class, got:\n${violations.join("\n") || "(none)"}`,
+    );
+  });
+
+  it("GREEN PIN: the live swept tools (tt-daemon-up, tt-recorder, tt-provision-home, tt-harness-auth-probe) carry none of the US-006 classes", () => {
+    const swept = [
+      "torture-test/bin/tt-daemon-up",
+      "torture-test/bin/tt-recorder",
+      "torture-test/bin/tt-provision-home",
+      "torture-test/bin/tt-harness-auth-probe",
+    ];
+    for (const rel of swept) {
+      const src = fs.readFileSync(path.join(repoRoot, rel), "utf8");
+      const bad = scanContent(src).filter((h) => US006_CLASSES.includes(h.cls));
+      assert.deepEqual(
+        bad,
+        [],
+        `${rel} must be free of the US-006 classes, got: ${bad.map((h) => `${h.line}:${h.cls}`).join(", ") || "(none)"}`,
+      );
+    }
+  });
+
+  it("GREEN PIN: tt-controller's real-case preflight path tools carry none of the US-006 classes", () => {
+    const preflight = [
+      "torture-test/bin/tt-provision-home",
+      "torture-test/bin/tt-harness-auth-probe",
+      "torture-test/bin/tt-catalog-install",
+      "torture-test/bin/tt-daemon-up",
+    ];
+    for (const rel of preflight) {
+      const src = fs.readFileSync(path.join(repoRoot, rel), "utf8");
+      const bad = scanContent(src).filter((h) => US006_CLASSES.includes(h.cls));
+      assert.deepEqual(
+        bad,
+        [],
+        `${rel} (tt-controller real-case preflight) must be free of the US-006 classes, got: ${bad.map((h) => `${h.line}:${h.cls}`).join(", ") || "(none)"}`,
+      );
+    }
   });
 
   it("MUTATION: a GNU-ism added under env/ trips the strict gate even with an allowlist entry (strict-path escape)", () => {

@@ -75,6 +75,16 @@ TT_REPO_ROOT="$(dirname "$TT_DIR")"                      # repo root
 DC="$SCRIPT_DIR/daemon-control"
 TT_ENV_REAL="$TT_DIR/env/tt-env.sh"
 
+# Shared address-exact port probe (MDUP US-002). Source the SOURCE-ONLY
+# torture-test/lib/port-probe.sh helper (port_probe / is_port_listening /
+# wait_for_port): a `node -e` net.connect to 127.0.0.1:<port> with a bounded
+# 1s in-process timeout. No GNU coreutils `timeout`, no `localhost` hostname
+# lookup (which can resolve to ::1 on darwin while the daemon binds
+# 127.0.0.1) and no ::1 fallback — the probe is address-exact, so the 43xx
+# preflight/stop checks behave identically on linux and Darwin. Node is
+# already a hard runtime dependency (daemon-control / tt-process-identity).
+. "$TT_DIR/lib/port-probe.sh"
+
 # The three contained real-ports (spec 01 two-daemon architecture: 43xx).
 REAL_PORTS="4334 4338 4339"
 
@@ -103,13 +113,8 @@ resolve_contained_control_port() {
   printf '%s' "4339"
 }
 
-# is_port_listening: whether a TCP port is accepting connections.
-is_port_listening() {
-  local port="$1"
-  timeout 1 bash -c "echo >/dev/tcp/localhost/$port" 2>/dev/null
-}
-
-# ports_free: returns 0 iff all 43xx ports are free.
+# ports_free: returns 0 iff all 43xx ports are free. It calls the sourced
+# is_port_listening (port_probe → 127.0.0.1 node net.connect) per port.
 ports_free() {
   local p
   for p in $REAL_PORTS; do
@@ -145,18 +150,32 @@ daemon_pid() {
 
 # daemon_path_has_adapters_bin: whether the RUNNING contained daemon's PATH
 # already carries ADAPTERS_BIN_DIR. Reads the authoritative environment of the
-# started daemon process (/proc/<pid>/environ) — same source tt-daemon-up's
-# stop hygiene already trusts.
+# started daemon process — /proc/<pid>/environ on linux, `ps eww -p <pid>` on
+# Darwin (no procfs) — the same source tt-daemon-up's stop hygiene already
+# trusts.
 daemon_path_has_adapters_bin() {
   local pid
   pid="$(daemon_pid)"
   if [ -z "$pid" ]; then return 1; fi
-  local env_path
-  # linux-only /proc/<pid>/environ read (MACP3 US-003): guarded for Darwin
-  # by the explicit 2>/dev/null — on a /proc-less host env_path is empty and
-  # the function returns "adapters not on PATH" (conservative) instead of
-  # hard-failing.
-  env_path="$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep '^PATH=' | head -n1)"
+  local env_path platform
+  platform="${TT_DC_PLATFORM:-$(uname -s)}"
+  case "$platform" in
+    Darwin)
+      # /proc-less host (macOS): read the daemon's environment via BSD ps
+      # (`ps eww -p <pid>` prints the command followed by KEY=VALUE pairs,
+      # space-separated). No /proc dependency — the GNU-timeout era's
+      # 2>/dev/null-only degradation returned "adapters not on PATH" on
+      # every darwin ensure-up (a false negative), which is exactly the
+      # MDUP class this suite must never re-introduce.
+      env_path="$(ps eww -p "$pid" 2>/dev/null | tr ' ' '\n' | grep '^PATH=' | head -n1 || true)"
+      ;;
+    *)
+      # linux-only /proc/<pid>/environ read (MACP3 US-003): the daemon's
+      # authoritative NUL-separated environment. A missing environ (pid
+      # gone) leaves env_path empty and the caller fails closed.
+      env_path="$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep '^PATH=' | head -n1)"
+      ;;
+  esac
   env_path="${env_path#PATH=}"
   case ":$env_path:" in
     *":$ADAPTERS_BIN_DIR:"*) return 0 ;;
