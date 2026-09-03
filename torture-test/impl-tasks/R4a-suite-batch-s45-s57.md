@@ -56,6 +56,25 @@ suite-defects-didn-dres-2026-09-02, triage-decisions-2026-09-01 (item 6: W4.33d/
   compare (and keep the byte-level pin only where a case declares it, e.g. the W4.17 red tests, where a whitespace-only
   change is still reported as informational, never as FAIL). Add a fixture-backed self-test with a gofmt-realigned
   seeded test (additive feature test + realigned struct) expecting O8 PASS with O8_SEEDED_TEST_EXTENDED.
+- S61 (probe compensation on case termination): W4.47 on the mac was canceled at its wall cap before its
+  `restore_credentials` action fired, leaving the contained `$TT_HOME/.pi` copy invalidated for every later pi cell in
+  the campaign. Any probe op with a compensating counterpart (invalidate_credentials → restore_credentials, and any
+  future pair) must have its compensation executed by the controller when the case terminates for any reason
+  (deadline, cap, infra abort, controller shutdown) if the compensation has not run — recorded in probe-evidence as a
+  `compensation` entry with its own exit code. Self-test: cancel a case mid-sequence and assert the backup is consumed.
+- S62 (W4.47 trigger and cap calibration): `restore_credentials` armed on `event:step.running` can never fire under an
+  instant-fail loop (the product emits no step.running for rounds that exit before claiming), so the cell is
+  unpassable as designed. Re-arm the restore on a signal that exists (a daemon-log trigger on the instant-fail
+  classification for the run, or a time trigger after the first failed round) and size `caps.wall_min` to cover the
+  product's escalation horizon (K=3 then 30/60/120s backoffs to N=10 ≈ 12 min) so the cell can observe either the
+  legible escalation or the clean post-restore completion. Keep `expected_fast_failure`. The product-side defect this
+  exposed (IFLB: no relaunch after the backoff) is NOT in scope here — the cell must simply be able to observe it.
+- MDSH (dsh functional predicate): the W4.dsh-* cells ran on the mac although dsh cannot boot under the contained
+  daemon there ("dsh: plugin tree failed t…", while `dsh --profile headless --help` works under the interactive shell
+  with the contained HOME), so each idled to its cap as INCONCLUSIVE. tt-harness-auth-probe must include a dsh smoke
+  run under the daemon's exact environment (PATH/HOME as the contained daemon sees them) and the roster predicate must
+  mark dsh cells NOT_RUN (reason recorded) when it fails; capture the harness's full stderr in the probe evidence
+  (the product's log preview truncates it).
 - MCHA (darwin chaos/kill guard): `tt-chaos` refuses to signal on darwin — mac campaign #1 cells W4.09-pi, W4.09-hermes,
   W4.10-kill-daemon and W4.48a all ended chaos-invocation-failed with exit 3 "GUARD_MISS: cannot read the process group
   of daemon pid N (no procfs) — group disjointness from the caller cannot be verified, refusing to signal". Correct
